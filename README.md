@@ -27,19 +27,20 @@ The interpreter features a complete compilation pipeline: Lexer, Parser, SSA IR 
 
 #### PowerShell Execution Policy
 
-Windows may block PowerShell scripts by default. To run the setup script, you have two options:
+Windows may block PowerShell scripts by default. To enable script execution, choose one of these options:
 
-**Option 1: Run with bypass (recommended for first run)**
+**Option 1: Run scripts individually with bypass**
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
+powershell -ExecutionPolicy Bypass -File .\benchmark.ps1
 ```
+Note: You must use this syntax for each script you want to run.
 
-**Option 2: Set execution policy permanently for current user**
+**Option 2: Set execution policy permanently for current user (recommended)**
 ```powershell
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
-
-After running `setup.ps1`, all other PowerShell scripts in the project will be automatically unblocked.
+After this one-time setup, all local scripts will run without restrictions.
 
 #### Running the Setup
 
@@ -54,7 +55,6 @@ After running `setup.ps1`, all other PowerShell scripts in the project will be a
 This will:
 1. Download and install Free Pascal Compiler (FPC) 3.2.2 locally
 2. Compile SedaiBasic2 (`sb.exe`)
-3. Unblock all other PowerShell scripts in the project
 
 #### Setup Options
 
