@@ -1,0 +1,212 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <ProjectSession>
+    <PathDelim Value="\"/>
+    <Version Value="12"/>
+    <BuildModes Active="Debug"/>
+    <Units>
+      <Unit>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <IsPartOfProject Value="True"/>
+        <TopLine Value="503"/>
+        <CursorPos Y="514"/>
+        <UsageCount Value="37"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="SedaiBytecodeVM.pas"/>
+        <EditorIndex Value="1"/>
+        <TopLine Value="751"/>
+        <CursorPos X="12" Y="761"/>
+        <UsageCount Value="18"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaipackratparser.pas"/>
+        <UnitName Value="SedaiPackratParser"/>
+        <IsVisibleTab Value="True"/>
+        <EditorIndex Value="2"/>
+        <TopLine Value="984"/>
+        <CursorPos Y="1003"/>
+        <UsageCount Value="10"/>
+        <Loaded Value="True"/>
+      </Unit>
+    </Units>
+    <JumpHistory HistoryIndex="28">
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="495" TopLine="480"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="496" TopLine="480"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="296" TopLine="285"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="497" TopLine="486"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="513" TopLine="501"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="503" TopLine="499"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="506" Column="97" TopLine="499"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="504" TopLine="499"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="506" TopLine="499"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="509" TopLine="499"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="511" TopLine="505"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="513" TopLine="505"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="504" TopLine="493"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="506" TopLine="493"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="509" TopLine="493"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="511" TopLine="499"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="513" TopLine="499"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="518" TopLine="505"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="504" TopLine="493"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="506" TopLine="493"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="514" Column="5" TopLine="500"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="518" TopLine="505"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="511" Column="28" TopLine="502"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBytecodeVM.pas"/>
+        <Caret Line="733" Column="11" TopLine="680"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBytecodeVM.pas"/>
+        <Caret Line="1728" Column="9" TopLine="1710"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBytecodeVM.pas"/>
+        <Caret Line="3591" Column="9" TopLine="3573"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBasicVM.lpr"/>
+        <Caret Line="334" Column="31" TopLine="330"/>
+      </Position>
+      <Position>
+        <Filename Value="SedaiBytecodeVM.pas"/>
+        <Caret Line="761" Column="12" TopLine="751"/>
+      </Position>
+    </JumpHistory>
+    <RunParams>
+      <FormatVersion Value="2"/>
+      <Modes ActiveMode="default">
+        <Mode Name="default">
+          <local>
+            <CommandLineParams Value="&quot;C:\Progetti\Artiforge\SedaiBasic2\bas\STRESS.BAS&quot;"/>
+          </local>
+        </Mode>
+      </Modes>
+    </RunParams>
+    <HistoryLists>
+      <List Name="WorkingDirectory" Type="File" Count="1"/>
+      <List Name="LaunchingApplication" Type="File" Count="1">
+        <Item1 Value="C:\Windows\system32\cmd.exe /C ${TargetCmdLine}"/>
+      </List>
+      <List Name="CommandLineParameters" Count="3">
+        <Item1 Value="&quot;C:\Progetti\Artiforge\SedaiBasic2\bas\STRESS.BAS&quot;"/>
+        <Item2 Value=".\bas\STRESS.BAS"/>
+      </List>
+    </HistoryLists>
+  </ProjectSession>
+  <Debugging>
+    <BreakPoints>
+      <Item>
+        <Kind Value="bpkSource"/>
+        <WatchScope Value="wpsLocal"/>
+        <WatchKind Value="wpkWrite"/>
+        <Source Value="sedaisdl2graphicsoutput.pas"/>
+        <Line Value="1"/>
+      </Item>
+      <Item>
+        <Kind Value="bpkSource"/>
+        <WatchScope Value="wpsLocal"/>
+        <WatchKind Value="wpkWrite"/>
+        <Source Value="sedaisdl2graphicsoutput.pas"/>
+        <Line Value="650"/>
+      </Item>
+      <Item>
+        <Kind Value="bpkSource"/>
+        <WatchScope Value="wpsLocal"/>
+        <WatchKind Value="wpkWrite"/>
+        <Source Value="sedaiconsole.pas"/>
+        <Line Value="142"/>
+      </Item>
+      <Item>
+        <Kind Value="bpkSource"/>
+        <WatchScope Value="wpsLocal"/>
+        <WatchKind Value="wpkWrite"/>
+        <Source Value="sedainewconsole.pas"/>
+        <Line Value="1446"/>
+      </Item>
+      <Item>
+        <Kind Value="bpkSource"/>
+        <WatchScope Value="wpsLocal"/>
+        <WatchKind Value="wpkWrite"/>
+        <Source Value="sedainewconsole.pas"/>
+        <Line Value="1344"/>
+      </Item>
+    </BreakPoints>
+  </Debugging>
+</CONFIG>

@@ -1,0 +1,309 @@
+{*
+ * SedaiBasic - A BASIC interpreter with bytecode VM
+ * Copyright (C) 2025 Maurizio Cammalleri
+ *
+ * This program is dual-licensed:
+ *
+ * 1) For open source use: GNU General Public License version 3 (GPL-3.0-only)
+ *    You may redistribute and/or modify it under the terms of the GNU GPL v3
+ *    as published by the Free Software Foundation.
+ *    See <https://www.gnu.org/licenses/gpl-3.0.html>
+ *
+ * 2) For commercial/proprietary use: A separate commercial license is required.
+ *    Contact: maurizio.cammalleri@gmail.com for licensing inquiries.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ *}
+unit SedaiBasicKeywords;
+
+{$mode ObjFPC}{$H+}
+{$interfaces CORBA}
+{$codepage UTF8}
+
+{.$INCLUDE sedaibasic.inc}
+
+interface
+
+const
+  // OpCode groups by category
+  OPCODE_BASE_CONTROL_FLOW   = 10000; // IF, GOTO, GOSUB, etc.
+  OPCODE_BASE_LOOP           = 11000; // FOR, WHILE, DO, etc.
+  OPCODE_BASE_IO             = 12000; // PRINT, INPUT, etc.
+  OPCODE_BASE_VAR            = 13000; // LET, DIM, etc.
+  OPCODE_BASE_FUNCTION       = 14000; // ABS, INT, SQR, etc.
+  OPCODE_BASE_STRING         = 15000; // LEFT$, MID$, etc.
+  OPCODE_BASE_GRAPHICS       = 16000; // CIRCLE, BOX, etc.
+  OPCODE_BASE_SOUND          = 17000; // SOUND, PLAY, etc.
+  OPCODE_BASE_FILE           = 18000; // OPEN, CLOSE, etc.
+  OPCODE_BASE_SYSTEM         = 19000; // PEEK, POKE, etc.
+  OPCODE_BASE_EXTENSION      = 20000; // For future extensions
+  OPCODE_BASE_OPTIONS        = 30000;
+
+
+  // === KEYWORDS ===
+
+  // Control structures
+  kBEGIN   = 'BEGIN';
+  kBEND    = 'BEND';
+  kFOR     = 'FOR';
+  kNEXT    = 'NEXT';
+  kIF      = 'IF';
+  kTHEN    = 'THEN';
+  kELSE    = 'ELSE';
+  kDO      = 'DO';
+  kLOOP    = 'LOOP';
+  kWHILE   = 'WHILE';
+  kUNTIL   = 'UNTIL';
+  kEXIT    = 'EXIT';
+  kGOTO    = 'GOTO';
+  kGO_TO   = 'GO'; // GO + TO constraint
+  kGOSUB   = 'GOSUB';
+  kRETURN  = 'RETURN';
+  kON      = 'ON';
+  kSTEP    = 'STEP';
+  kTO      = 'TO';
+  kTRAP    = 'TRAP';
+  kCONT    = 'CONT';
+  kRESUME  = 'RESUME';
+  kSLEEP   = 'SLEEP';
+  kTROFF   = 'TROFF';
+  kTRON    = 'TRON';
+
+  // Variable operations
+  kCONST   = 'CONST';
+  kLET     = 'LET';
+  kDIM     = 'DIM';
+  kDEF     = 'DEF';
+  kFN      = 'FN';
+
+  // Input/output operations
+  kPRINT   = 'PRINT';
+  kINPUT   = 'INPUT';
+  kREAD    = 'READ';
+  kDATA    = 'DATA';
+  kRESTORE = 'RESTORE';
+  kPRINTN  = 'PRINT#';
+  kINPUTN  = 'INPUT#';
+  kGETKEY  = 'GETKEY';
+  kJOY     = 'JOY';
+  kPEN     = 'PEN';
+  kPOT     = 'POT';
+  kUSING   = 'USING'; // to use with PRINT, but could be used with other commands
+  kPUDEF   = 'PUDEF';
+  kST      = 'ST';
+  kSTASH   = 'STASH';
+  kSWAP    = 'SWAP';
+
+  // time
+  kTI      = 'TI';
+  kTIS     = 'TI$';
+
+  // File handling
+  kAPPEND  = 'APPEND';
+  kBLOAD   = 'BLOAD';
+  kBSAVE   = 'BSAVE';
+  kBOOT    = 'BOOT';
+  kCATALOG = 'CATALOG';
+  kOPEN    = 'OPEN';
+  kCLOSE   = 'CLOSE';
+  kGET     = 'GET';
+  { kPUT     = 'PUT'; // PUT is not a C128 command }
+  kDLOAD   = 'DLOAD';
+  kDSAVE   = 'DSAVE';
+  kVERIFY  = 'VERIFY';
+  kDIRECTORY = 'DIRECTORY';
+  kDOPEN   = 'DOPEN';
+  kDS      = 'DS';
+  kDSS     = 'DS$';
+  kDVERIFY = 'DVERIFY';
+  kDELETE  = 'DELETE';
+  kRENAME  = 'RENAME';
+  kDCLEAR  = 'DCLEAR';
+  kDCLOSE  = 'DCLOSE';
+  kCONCAT  = 'CONCAT';
+  kCOPY    = 'COPY';
+  kSCRATCH = 'SCRATCH';
+  kBACKUP  = 'BACKUP';
+  kRECORD  = 'RECORD';
+
+  // Memoria e sistema
+  kBANK	   = 'BANK';
+  kCLR     = 'CLR';
+  kPOKE    = 'POKE';
+  kPEEK    = 'PEEK';
+  kSYS     = 'SYS';
+  kWAIT    = 'WAIT';
+  kRUN     = 'RUN';
+  kNEW     = 'NEW';
+  kLIST    = 'LIST';
+  kSAVE    = 'SAVE';
+  kLOAD    = 'LOAD';
+  kSTOP    = 'STOP';
+  kFETCH   = 'FETCH';
+  kPOINTER = 'POINTER';
+  kRREG    = 'RREG';
+  kUSR     = 'USR';
+
+  // Matematica e funzioni
+  kABS     = 'ABS';
+  kATN     = 'ATN';
+  kATAN    = 'ATAN';      // SedaiBasic
+  kCOS     = 'COS';
+  kEXP     = 'EXP';
+  kFRE     = 'FRE';
+  kINT     = 'INT';
+  kLOG     = 'LOG';
+  kLN      = 'LN';
+  kLOG10   = 'LOG10';     // SedaiBasic
+  kLOG2    = 'LOG2';      // SedaiBasic
+  kMOD     = 'MOD';       // SedaiBasic
+  kRND     = 'RND';
+  kSGN     = 'SGN';
+  kSIN     = 'SIN';
+  kSQR     = 'SQR';
+  kTAN     = 'TAN';
+  kVAL     = 'VAL';
+  kDEC     = 'DEC';
+
+  // String functions
+  kASC     = 'ASC';
+  kCHAR    = 'CHAR';
+  kCHRS    = 'CHR$';
+  kHEXS    = 'HEX$';
+  kLEFTS   = 'LEFT$';
+  kMIDS    = 'MID$';
+  kRIGHTS  = 'RIGHT$';
+  kSPC     = 'SPC';
+  kSTRS    = 'STR$';
+  kTAB     = 'TAB';
+  kINSTR   = 'INSTR';
+  kLEN     = 'LEN';
+
+  // Grafica
+  kBOX     = 'BOX';
+  kBUMP    = 'BUMP';
+  kCOLOR   = 'COLOR';
+  kGRAPHIC = 'GRAPHIC';
+  kDRAW    = 'DRAW';
+  kCIRCLE  = 'CIRCLE';
+  kPAINT   = 'PAINT';
+  kLOCATE  = 'LOCATE';
+  kSCALE   = 'SCALE';
+  kWIDTH   = 'WIDTH';
+  kSPRITE  = 'SPRITE';
+  kCOLLISION = 'COLLISION';
+  kMOVSPR  = 'MOVSPR';
+  kSSHAPE  = 'SSHAPE';
+  kGSHAPE  = 'GSHAPE';
+  kRCLR    = 'RCLR';
+  kRDOT    = 'RDOT';
+  kRGR     = 'RGR';
+  kRSPCOLOR = 'RSPCOLOR';
+  kRSPPOS  = 'RSPPOS';
+  kRSPRITE = 'RSPRITE';
+  kSPRCOLOR = 'SPRCOLOR';
+  kSPRDEF  = 'SPRDEF';
+  kSPRSAV  = 'SPRSAV';
+
+  // Suono
+  kPLAY    = 'PLAY';
+  kTEMPO   = 'TEMPO';
+  kSOUND   = 'SOUND';
+  kVOL     = 'VOL';
+  kENVELOPE= 'ENVELOPE';
+  kFILTER  = 'FILTER';
+
+  // Altro
+  kAUTO    = 'AUTO';
+  kCMD     = 'CMD';
+  kREM     = 'REM'; // Commenti
+  kEND     = 'END';
+  kHELP    = 'HELP';
+  kFAST    = 'FAST';
+  kSLOW    = 'SLOW';
+  kMONITOR = 'MONITOR';
+  kHEADER  = 'HEADER';
+  kCOLLECT = 'COLLECT';
+  kKEY	   = 'KEY';
+  kEL      = 'EL';
+  kER      = 'ER';
+  kERRS    = 'ERR$';
+  kGETN    = 'GET#';
+  kGO64    = 'GO64';
+  kPOS     = 'POS';
+  kRENUMBER = 'RENUMBER';
+  kRWINDOW = 'RWINDOW';
+  kSCNCLR  = 'SCNCLR';
+  kWINDOW  = 'WINDOW';
+
+  // Operatori aritmetici
+  kPLUS  = '+';
+  kMINUS = '-';
+  kMULT  = '*';
+  kDIV   = '/';
+  kPOW   = '^';
+
+  // Operatori di confronto
+  kEQ    = '=';
+  kNEQ   = '<>';
+  kLT    = '<';
+  kGT    = '>';
+  kLEQ   = '<=';
+  kGEQ   = '>=';
+
+  // Operatori logici
+  kAND   = 'AND';
+  kOR    = 'OR';
+  kNOT   = 'NOT';
+  kXOR   = 'XOR';
+
+  // SedaiBasic Options
+  kEXPNOTATION = 'EXPNOTATION';
+
+
+  // === KEYWORD CATEGORIES ===
+
+  kcCodeBlockConstructs    = 'Code Block Constructs';
+  kcCommentsAndRemarks     = 'Comments and Remarks';
+  kcConditionalFlowControl = 'Conditional Flow Control';
+  kcData                   = 'Data';
+  kcDebug                  = 'Debug';
+  kcDelimiters             = 'Delimiters';
+  kcDOSCommands            = 'DOS Commands';
+  kcEnvironmentSetup       = 'Environment Setup';
+  kcErrorHandling          = 'Error Handling';
+  kcFileIO                 = 'File I/O';
+  kcGraphicsHandling       = 'Graphics Handling';
+  kcInputDevices           = 'Input Devices';
+  kcIO                     = 'I/O Handling';
+  kcJumpFlowControl        = 'Jump Flow Control';
+  kcLogicalOperators       = 'Logical Operators';
+  kcLoopConstructs         = 'Loop Constructs';
+  kcMachineLenguage        = 'Machine Language';
+  kcMathFunctions          = 'Math Functions';
+  kcMemoryHandling         = 'Memory Handling';
+  kcOperators              = 'Operators';
+  kcProcedures             = 'Procedures';
+  kcProgramEditing         = 'Program Editing';
+  kcProgramFlowControl     = 'Program Flow Control';
+  kcReservedVariables      = 'Reserved Variables';
+  kcShellCommands          = 'Shell Commands';
+  kcSoundHandling          = 'Sound Handling';
+  kcSpritesHandling        = 'Sprites Handling';
+  kcStdIO                  = 'Std I/O';
+  kcStringFunctions        = 'String Functions';
+  kcSystemHandling         = 'System Handling';
+  kcWhitespaceAndCtrlChar  = 'Whitespace and control chars';
+
+var
+  kLogicalOperatorsArray: array[1..4] of String = (kAND, kOR, kNOT, kXOR);
+
+implementation
+
+end.
+

@@ -1,0 +1,1839 @@
+{*
+ * SedaiBasic - A BASIC interpreter with bytecode VM
+ * Copyright (C) 2025 Maurizio Cammalleri
+ *
+ * This program is dual-licensed:
+ *
+ * 1) For open source use: GNU General Public License version 3 (GPL-3.0-only)
+ *    You may redistribute and/or modify it under the terms of the GNU GPL v3
+ *    as published by the Free Software Foundation.
+ *    See <https://www.gnu.org/licenses/gpl-3.0.html>
+ *
+ * 2) For commercial/proprietary use: A separate commercial license is required.
+ *    Contact: maurizio.cammalleri@gmail.com for licensing inquiries.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ *}
+unit SedaiSuperinstructions;
+
+{$mode ObjFPC}{$H+}
+{$I OptimizationFlags.inc}
+{$I DebugFlags.inc}
+
+{ Superinstruction optimization pass
+
+  Fuses common instruction sequences into single superinstructions.
+  This reduces dispatch overhead and improves cache utilization.
+
+  Patterns recognized (from real bytecode analysis of SIEVE.BAS):
+
+  1. Compare + JumpIfZero → Fused branch (VERY COMMON - ~15 occurrences)
+     Pattern: CmpLeInt R24, R0, R1 + JumpIfZero R24, 17
+     Becomes: BranchGtInt R0, R1, 17  (negated because JumpIfZero)
+     Saves: 1 instruction + 1 register
+
+  2. Arith + Copy → Fused arithmetic-to-dest (VERY COMMON - ~8 occurrences)
+     Pattern: AddInt R19, R0, R22 + CopyInt R0, R19
+     Becomes: AddIntTo R0, R22  (dest = dest + src)
+     Saves: 1 instruction + 1 register
+
+  3. LoadConst + Compare + JumpIfZero → Fused compare-zero-branch
+     Pattern: LoadConstInt R31, 0 + CmpEqInt R29, R30, R31 + JumpIfZero R29, 30
+     Becomes: BranchNeZeroInt R30, 30
+     Saves: 2 instructions + 2 registers
+
+  4. LoadConst + Arith → Fused constant arithmetic
+     Pattern: LoadConstInt R17, 1 + AddInt R3, R3, R17
+     Becomes: IncInt R3  (or AddIntConst R3, R3, 1)
+     Saves: 1 instruction + 1 register
+
+  Must run AFTER bytecode compilation, operates on TBytecodeProgram.
+}
+
+interface
+
+uses
+  Classes, SysUtils, SedaiBytecodeTypes;
+
+{ Extended bytecode opcodes for superinstructions }
+{ Values 100+ to avoid collision with base opcodes }
+const
+  // === Fused compare-and-branch (Int) ===
+  // Format: Src1, Src2, Immediate=target
+  // Semantics: if (Src1 op Src2) goto target
+  bcBranchEqInt = 100;      // if (r[src1] == r[src2]) goto target
+  bcBranchNeInt = 101;      // if (r[src1] != r[src2]) goto target
+  bcBranchLtInt = 102;      // if (r[src1] < r[src2]) goto target
+  bcBranchGtInt = 103;      // if (r[src1] > r[src2]) goto target
+  bcBranchLeInt = 104;      // if (r[src1] <= r[src2]) goto target
+  bcBranchGeInt = 105;      // if (r[src1] >= r[src2]) goto target
+
+  // === Fused compare-and-branch (Float) ===
+  bcBranchEqFloat = 110;
+  bcBranchNeFloat = 111;
+  bcBranchLtFloat = 112;
+  bcBranchGtFloat = 113;
+  bcBranchLeFloat = 114;
+  bcBranchGeFloat = 115;
+
+  // === Fused arithmetic-to-dest (Int) ===
+  // Format: Dest, Src1 (Dest = Dest op Src1)
+  // Very common pattern: AddInt Rtmp, Rdest, Rsrc + CopyInt Rdest, Rtmp
+  bcAddIntTo = 120;         // r[dest] = r[dest] + r[src1]
+  bcSubIntTo = 121;         // r[dest] = r[dest] - r[src1]
+  bcMulIntTo = 122;         // r[dest] = r[dest] * r[src1]
+
+  // === Fused arithmetic-to-dest (Float) ===
+  bcAddFloatTo = 130;       // r[dest] = r[dest] + r[src1]
+  bcSubFloatTo = 131;       // r[dest] = r[dest] - r[src1]
+  bcMulFloatTo = 132;       // r[dest] = r[dest] * r[src1]
+  bcDivFloatTo = 133;       // r[dest] = r[dest] / r[src1]
+
+  // === Fused constant arithmetic (Int) ===
+  // Format: Dest, Src1, Immediate=constant
+  // Pattern: LoadConstInt Rtmp, K + AddInt Rdest, Rsrc, Rtmp
+  bcAddIntConst = 140;      // r[dest] = r[src1] + immediate
+  bcSubIntConst = 141;      // r[dest] = r[src1] - immediate
+  bcMulIntConst = 142;      // r[dest] = r[src1] * immediate
+
+  // === Fused constant arithmetic (Float) ===
+  bcAddFloatConst = 150;    // r[dest] = r[src1] + immediate(as double)
+  bcSubFloatConst = 151;    // r[dest] = r[src1] - immediate(as double)
+  bcMulFloatConst = 152;    // r[dest] = r[src1] * immediate(as double)
+  bcDivFloatConst = 153;    // r[dest] = r[src1] / immediate(as double)
+
+  // === Fused compare-zero-and-branch (Int) ===
+  // Pattern: LoadConstInt R, 0 + CmpXx + JumpIfZero
+  bcBranchEqZeroInt = 160;  // if (r[src1] == 0) goto target
+  bcBranchNeZeroInt = 161;  // if (r[src1] != 0) goto target
+
+  // === Fused compare-zero-and-branch (Float) ===
+  bcBranchEqZeroFloat = 170;
+  bcBranchNeZeroFloat = 171;
+
+  // === Fused array-store-constant ===
+  // Pattern: LoadConstXxx Rtmp, K + ArrayStoreXxx ARR, idx, Rtmp
+  // Format: Src1=ArrayIndex, Src2=IndexReg, Immediate=ConstValue
+  bcArrayStoreIntConst = 180;     // ARR[idx] = immediate (int)
+  bcArrayStoreFloatConst = 181;   // ARR[idx] = immediate (as double)
+  bcArrayStoreStringConst = 182;  // ARR[idx] = string constant index
+
+  // === Fused loop increment-and-branch (Int) ===
+  // Pattern: AddIntTo Rdest, Rstep + Jump loopTop + BranchGtInt Rdest, Rlimit, exitTarget
+  // Fuses to: dest += step; if (dest <= limit) goto loopTop
+  // Format: Dest=counter, Src1=step, Src2=limit, Immediate=loopTop target
+  // NOTE: This replaces 3 instructions with 1, eliminating the Jump entirely
+  bcAddIntToBranchLe = 190;       // r[dest] += r[src1]; if (r[dest] <= r[src2]) goto target
+  bcAddIntToBranchLt = 191;       // r[dest] += r[src1]; if (r[dest] < r[src2]) goto target
+  bcSubIntToBranchGe = 192;       // r[dest] -= r[src1]; if (r[dest] >= r[src2]) goto target
+  bcSubIntToBranchGt = 193;       // r[dest] -= r[src1]; if (r[dest] > r[src2]) goto target
+
+  // === NEW: Fused Multiply-Add/Sub (FMA) - HIGH PRIORITY ===
+  // Pattern: MulFloat Rtmp, Ra, Rb + AddFloat Rdest, Rc, Rtmp => dest = c + a*b
+  // Pattern: MulFloat Rtmp, Ra, Rb + SubFloat Rdest, Rc, Rtmp => dest = c - a*b
+  // Format: Dest, Src1=a, Src2=b, Extra=c (extra operand stored in Immediate as register index)
+  bcMulAddFloat = 200;            // r[dest] = r[extra] + r[src1] * r[src2]
+  bcMulSubFloat = 201;            // r[dest] = r[extra] - r[src1] * r[src2]
+
+  // FMA with dest same as accumulator (very common pattern)
+  // Pattern: MulFloat Rtmp, Ra, Rb + AddFloatTo Rdest, Rtmp => dest += a*b
+  // Pattern: MulFloat Rtmp, Ra, Rb + SubFloatTo Rdest, Rtmp => dest -= a*b
+  bcMulAddToFloat = 202;          // r[dest] = r[dest] + r[src1] * r[src2]
+  bcMulSubToFloat = 203;          // r[dest] = r[dest] - r[src1] * r[src2]
+
+  // === NEW: Array Load + Arithmetic - HIGH PRIORITY ===
+  // Pattern: ArrayLoadFloat Rtmp, arr, idx + AddFloat Rdest, Racc, Rtmp => dest = acc + arr[idx]
+  // Format: Dest, Src1=arr_index, Src2=idx_reg, Extra=acc_reg
+  bcArrayLoadAddFloat = 210;      // r[dest] = r[extra] + arr[src1][r[src2]]
+  bcArrayLoadSubFloat = 211;      // r[dest] = r[extra] - arr[src1][r[src2]]
+
+  // Pattern: ArrayLoadFloat Rtmp, arr, idx + DivFloat Rdiv, Rtmp, Rdenom + AddFloat Rdest, Racc, Rdiv
+  // Very common in spectral-norm: sum = sum + u(i) / A(i,j)
+  // Format: Dest, Src1=arr_index, Src2=idx_reg, Extra encodes: acc_reg (low 16) + denom_reg (high 16)
+  bcArrayLoadDivAddFloat = 212;   // r[dest] = r[acc] + arr[src1][r[src2]] / r[denom]
+
+  // === NEW: Square-Sum pattern - MEDIUM PRIORITY ===
+  // Pattern: MulFloat Rsq, Rx, Rx (square) then AddFloat Rsum, Rsum, Rsq
+  // Very common in n-body for distance: dx*dx + dy*dy + dz*dz
+  // Format: Dest, Src1=x, Src2=y (dest = x*x + y*y)
+  bcSquareSumFloat = 220;         // r[dest] = r[src1]*r[src1] + r[src2]*r[src2]
+
+  // Add third square to existing sum
+  // Format: Dest, Src1=existing_sum, Src2=z (dest = sum + z*z)
+  bcAddSquareFloat = 221;         // r[dest] = r[src1] + r[src2]*r[src2]
+
+  // === NEW: Mul-Mul chain - MEDIUM PRIORITY ===
+  // Pattern: MulFloat Rtmp, Ra, Rb + MulFloat Rdest, Rtmp, Rc => dest = a*b*c
+  // Format: Dest, Src1=a, Src2=b, Extra=c
+  bcMulMulFloat = 230;            // r[dest] = r[src1] * r[src2] * r[extra]
+
+  // === NEW: Add-Sqrt - MEDIUM PRIORITY ===
+  // Pattern: AddFloat Rtmp, Ra, Rb + MathSqr Rdest, Rtmp => dest = sqrt(a+b)
+  // Format: Dest, Src1=a, Src2=b
+  bcAddSqrtFloat = 231;           // r[dest] = sqrt(r[src1] + r[src2])
+
+  // === NEW: Array Load + Branch - LOW PRIORITY ===
+  // Pattern: ArrayLoadInt Rtmp, arr, idx + BranchNeZeroInt Rtmp, target
+  // Format: Src1=arr_index, Src2=idx_reg, Immediate=target
+  bcArrayLoadIntBranchNZ = 240;   // if arr[src1][r[src2]] != 0 goto target
+  bcArrayLoadIntBranchZ = 241;    // if arr[src1][r[src2]] == 0 goto target
+
+  // === NEW: Array Swap (Int) - HIGH PRIORITY for fannkuch-redux ===
+  // Pattern: ArrayLoadInt Rtmp1, arr, idx1 + CopyInt Rsave, Rtmp1 +
+  //          ArrayLoadInt Rtmp2, arr, idx2 + ArrayStoreInt arr, idx1, Rtmp2 +
+  //          ArrayStoreInt arr, idx2, Rsave
+  // Fuses 5 instructions into 1!
+  // Format: Src1=arr_index, Src2=idx1_reg, Dest=idx2_reg
+  bcArraySwapInt = 250;           // swap arr[idx1] and arr[idx2]
+
+  // === NEW: Self-increment/decrement (Int) - HIGH PRIORITY ===
+  // Pattern: AddInt Rdest, Rdest, Rsrc  (when dest == src1)
+  // Very common in fannkuch-redux: I% = I% + 1, J% = J% - 1
+  // Format: Dest=register to modify, Src1=amount register
+  bcAddIntSelf = 251;             // r[dest] += r[src1]  (dest = dest + src1 when dest == first operand)
+  bcSubIntSelf = 252;             // r[dest] -= r[src1]  (dest = dest - src1 when dest == first operand)
+
+  // === NEW: Array Load to different register (Int) ===
+  // Pattern: ArrayLoadInt Rtmp, arr, idx + CopyInt Rdest, Rtmp
+  // Very common: load from array into a non-temporary register
+  // Format: Dest=final destination, Src1=arr_index, Src2=idx_reg
+  bcArrayLoadIntTo = 253;         // r[dest] = arr[src1][r[src2]]
+
+type
+  TSuperinstructionOptimizer = class
+  private
+    FProgram: TBytecodeProgram;
+    FFusedCount: Integer;
+
+    { Try to fuse instruction at index i with following instructions }
+    function TryFuseCompareAndBranch(Index: Integer): Boolean;
+    function TryFuseArithAndCopy(Index: Integer): Boolean;
+    function TryFuseConstantArithmetic(Index: Integer): Boolean;
+    function TryFuseCompareZeroAndBranch(Index: Integer): Boolean;
+    function TryFuseArrayStoreConst(Index: Integer): Boolean;
+    function TryFuseLoopIncrementAndBranch(Index: Integer): Boolean;
+
+    { NEW: FMA and advanced patterns }
+    function TryFuseMulAddFloat(Index: Integer): Boolean;
+    function TryFuseArrayLoadAddFloat(Index: Integer): Boolean;
+    function TryFuseSquareSumFloat(Index: Integer): Boolean;
+    function TryFuseMulMulFloat(Index: Integer): Boolean;
+    function TryFuseAddSqrtFloat(Index: Integer): Boolean;
+    function TryFuseArrayLoadBranchInt(Index: Integer): Boolean;
+
+    { NEW: Array swap and self-increment patterns for fannkuch-redux }
+    function TryFuseArraySwapInt(Index: Integer): Boolean;
+    function TryFuseAddIntSelf(Index: Integer): Boolean;
+    function TryFuseArrayLoadIntTo(Index: Integer): Boolean;
+
+    { Check if register is only used by the next instruction (temporary) }
+    function IsTemporaryResult(Index: Integer; Reg: Word): Boolean;
+
+    { Check if an instruction index is a jump target }
+    function IsJumpTarget(Index: Integer): Boolean;
+
+    { Make a NOP instruction }
+    procedure MakeNop(Index: Integer);
+
+  public
+    constructor Create(AProgram: TBytecodeProgram);
+    function Run: Integer;
+  end;
+
+function RunSuperinstructions(AProgram: TBytecodeProgram): Integer;
+
+implementation
+
+{$IFDEF DEBUG_SUPERINSTR}
+uses SedaiDebug;
+{$ENDIF}
+
+{ TSuperinstructionOptimizer }
+
+constructor TSuperinstructionOptimizer.Create(AProgram: TBytecodeProgram);
+begin
+  inherited Create;
+  FProgram := AProgram;
+  FFusedCount := 0;
+end;
+
+procedure TSuperinstructionOptimizer.MakeNop(Index: Integer);
+var
+  NopInstr: TBytecodeInstruction;
+begin
+  // IMPORTANT: Initialize entire record to zero to avoid garbage in uninitialized fields
+  FillChar(NopInstr, SizeOf(NopInstr), 0);
+  NopInstr.OpCode := Byte(bcNop);
+  // All other fields are already 0 from FillChar
+  FProgram.SetInstruction(Index, NopInstr);
+end;
+
+function TSuperinstructionOptimizer.IsJumpTarget(Index: Integer): Boolean;
+var
+  i: Integer;
+  Instr: TBytecodeInstruction;
+begin
+  // Check if any jump instruction targets this index
+  // Must handle both standard opcodes and superinstructions
+  Result := False;
+  for i := 0 to FProgram.GetInstructionCount - 1 do
+  begin
+    Instr := FProgram.GetInstruction(i);
+
+    // Check standard jump opcodes (must check OpCode directly to avoid enum range issues)
+    if Instr.OpCode < 100 then
+    begin
+      case TBytecodeOp(Instr.OpCode) of
+        bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall:
+          if Instr.Immediate = Index then
+          begin
+            Result := True;
+            Exit;
+          end;
+      end;
+    end
+    else
+    begin
+      // Check superinstruction branch opcodes (100-105, 110-115, 160-161, 170-171)
+      case Instr.OpCode of
+        100..105,   // BranchXxInt
+        110..115,   // BranchXxFloat
+        160, 161,   // BranchXxZeroInt
+        170, 171:   // BranchXxZeroFloat
+          if Instr.Immediate = Index then
+          begin
+            Result := True;
+            Exit;
+          end;
+      end;
+    end;
+  end;
+end;
+
+function TSuperinstructionOptimizer.IsTemporaryResult(Index: Integer; Reg: Word): Boolean;
+var
+  i: Integer;
+  Instr: TBytecodeInstruction;
+  IsControlFlow: Boolean;
+begin
+  // Check if the register defined at Index is ONLY used by Index+1
+  // For superinstruction fusion, we just need to know that:
+  // 1. The register is produced at Index
+  // 2. The register is consumed at Index+1
+  // 3. The register is not used elsewhere in the same basic block before redefinition
+  //
+  // We scan forward from Index+2 until we hit:
+  // - Control flow (end of basic block) -> register is temporary (safe to fuse)
+  // - Register reuse as source -> NOT temporary (can't fuse)
+  // - Register redefinition -> temporary (safe to fuse)
+
+  Result := True;  // Assume temporary until proven otherwise
+
+  for i := Index + 2 to FProgram.GetInstructionCount - 1 do
+  begin
+    Instr := FProgram.GetInstruction(i);
+
+    // Check if this register is used as source BEFORE checking control flow
+    // This catches the case where the jump itself uses the register
+    if (Instr.Src1 = Reg) or (Instr.Src2 = Reg) then
+    begin
+      Result := False;
+      Exit;
+    end;
+
+    // If it's redefined before being used again, it's safe (temporary)
+    if Instr.Dest = Reg then
+      Exit;  // Result remains True
+
+    // Check for control flow (end of basic block)
+    // Must handle both standard opcodes and superinstructions
+    IsControlFlow := False;
+    if Instr.OpCode < 100 then
+    begin
+      case TBytecodeOp(Instr.OpCode) of
+        bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcReturn, bcEnd, bcStop:
+          IsControlFlow := True;
+      end;
+    end
+    else
+    begin
+      // Superinstruction branches are also control flow
+      case Instr.OpCode of
+        100..105,   // BranchXxInt
+        110..115,   // BranchXxFloat
+        160, 161,   // BranchXxZeroInt
+        170, 171:   // BranchXxZeroFloat
+          IsControlFlow := True;
+      end;
+    end;
+
+    if IsControlFlow then
+      Exit;  // Result remains True - safe within this basic block
+  end;
+
+  // Reached end of program - register is temporary
+  // Result remains True
+end;
+
+function TSuperinstructionOptimizer.TryFuseCompareAndBranch(Index: Integer): Boolean;
+var
+  CmpInstr, JmpInstr, FusedInstr: TBytecodeInstruction;
+  CmpOp, JmpOp: TBytecodeOp;
+  FusedOpCode: Byte;
+  NegateCondition: Boolean;
+begin
+  Result := False;
+
+  if Index + 1 >= FProgram.GetInstructionCount then Exit;
+
+  CmpInstr := FProgram.GetInstruction(Index);
+  JmpInstr := FProgram.GetInstruction(Index + 1);
+
+  // Safety: both instructions must be standard opcodes (< 100)
+  if (CmpInstr.OpCode >= 100) or (JmpInstr.OpCode >= 100) then Exit;
+
+  CmpOp := TBytecodeOp(CmpInstr.OpCode);
+  JmpOp := TBytecodeOp(JmpInstr.OpCode);
+
+  // Check for comparison followed by conditional jump
+  if not (JmpOp in [bcJumpIfZero, bcJumpIfNotZero]) then Exit;
+
+  // Check if jump uses the comparison result
+  if JmpInstr.Src1 <> CmpInstr.Dest then Exit;
+
+  // SAFETY: Don't fuse if the second instruction is a jump target
+  if IsJumpTarget(Index + 1) then Exit;
+
+  // Check if comparison result is temporary
+  if not IsTemporaryResult(Index, CmpInstr.Dest) then Exit;
+
+  // JumpIfZero: jump when FALSE → negate the condition
+  // JumpIfNotZero: jump when TRUE → keep the condition
+  NegateCondition := (JmpOp = bcJumpIfZero);
+
+  // Determine the fused opcode
+  case CmpOp of
+    // Int comparisons
+    bcCmpEqInt: if NegateCondition then FusedOpCode := bcBranchNeInt else FusedOpCode := bcBranchEqInt;
+    bcCmpNeInt: if NegateCondition then FusedOpCode := bcBranchEqInt else FusedOpCode := bcBranchNeInt;
+    bcCmpLtInt: if NegateCondition then FusedOpCode := bcBranchGeInt else FusedOpCode := bcBranchLtInt;
+    bcCmpGtInt: if NegateCondition then FusedOpCode := bcBranchLeInt else FusedOpCode := bcBranchGtInt;
+    bcCmpLeInt: if NegateCondition then FusedOpCode := bcBranchGtInt else FusedOpCode := bcBranchLeInt;
+    bcCmpGeInt: if NegateCondition then FusedOpCode := bcBranchLtInt else FusedOpCode := bcBranchGeInt;
+
+    // Float comparisons
+    bcCmpEqFloat: if NegateCondition then FusedOpCode := bcBranchNeFloat else FusedOpCode := bcBranchEqFloat;
+    bcCmpNeFloat: if NegateCondition then FusedOpCode := bcBranchEqFloat else FusedOpCode := bcBranchNeFloat;
+    bcCmpLtFloat: if NegateCondition then FusedOpCode := bcBranchGeFloat else FusedOpCode := bcBranchLtFloat;
+    bcCmpGtFloat: if NegateCondition then FusedOpCode := bcBranchLeFloat else FusedOpCode := bcBranchGtFloat;
+    bcCmpLeFloat: if NegateCondition then FusedOpCode := bcBranchGtFloat else FusedOpCode := bcBranchLeFloat;
+    bcCmpGeFloat: if NegateCondition then FusedOpCode := bcBranchLtFloat else FusedOpCode := bcBranchGeFloat;
+  else
+    Exit;  // Not a comparison we can fuse
+  end;
+
+  // Create fused instruction - initialize to zero first
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := FusedOpCode;
+  FusedInstr.Dest := 0;
+  FusedInstr.Src1 := CmpInstr.Src1;
+  FusedInstr.Src2 := CmpInstr.Src2;
+  FusedInstr.Immediate := JmpInstr.Immediate;  // Jump target
+  FusedInstr.SourceLine := CmpInstr.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);
+  MakeNop(Index + 1);
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  // DEBUG: Log fusion details
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE CompareAndBranch @%d: opcode=%d Src1=%d Src2=%d Imm=%d',
+      [Index, FusedOpCode, FusedInstr.Src1, FusedInstr.Src2, FusedInstr.Immediate]));
+  {$ENDIF}
+
+  Inc(FFusedCount);
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.TryFuseArithAndCopy(Index: Integer): Boolean;
+var
+  ArithInstr, CopyInstr, FusedInstr: TBytecodeInstruction;
+  ArithOp, CopyOp: TBytecodeOp;
+  FusedOpCode: Byte;
+begin
+  Result := False;
+
+  if Index + 1 >= FProgram.GetInstructionCount then Exit;
+
+  ArithInstr := FProgram.GetInstruction(Index);
+  CopyInstr := FProgram.GetInstruction(Index + 1);
+
+  // Safety: both instructions must be standard opcodes (< 100)
+  if (ArithInstr.OpCode >= 100) or (CopyInstr.OpCode >= 100) then Exit;
+
+  ArithOp := TBytecodeOp(ArithInstr.OpCode);
+  CopyOp := TBytecodeOp(CopyInstr.OpCode);
+
+  // Check for arithmetic followed by copy
+  // Pattern: ArithXx Rtmp, Rdest, Rsrc + CopyXx Rdest, Rtmp
+  // This means: Rdest = Rdest op Rsrc (the copy moves result back to original dest)
+
+  // Check if copy source is arithmetic destination (temporary)
+  if CopyInstr.Src1 <> ArithInstr.Dest then Exit;
+
+  // Check if copy destination matches arithmetic Src1 (the accumulator pattern)
+  if CopyInstr.Dest <> ArithInstr.Src1 then Exit;
+
+  // SAFETY: Don't fuse if the second instruction is a jump target
+  if IsJumpTarget(Index + 1) then Exit;
+
+  // Check if arithmetic result is temporary
+  if not IsTemporaryResult(Index, ArithInstr.Dest) then Exit;
+
+  // Match Int arithmetic + CopyInt
+  if CopyOp = bcCopyInt then
+  begin
+    case ArithOp of
+      bcAddInt: FusedOpCode := bcAddIntTo;
+      bcSubInt: FusedOpCode := bcSubIntTo;
+      bcMulInt: FusedOpCode := bcMulIntTo;
+    else
+      Exit;
+    end;
+  end
+  // Match Float arithmetic + CopyFloat
+  else if CopyOp = bcCopyFloat then
+  begin
+    case ArithOp of
+      bcAddFloat: FusedOpCode := bcAddFloatTo;
+      bcSubFloat: FusedOpCode := bcSubFloatTo;
+      bcMulFloat: FusedOpCode := bcMulFloatTo;
+      bcDivFloat: FusedOpCode := bcDivFloatTo;
+    else
+      Exit;
+    end;
+  end
+  else
+    Exit;
+
+  // Create fused instruction: Dest = Dest op Src1
+  // (where Dest is the copy destination, Src1 is the "other" arithmetic operand)
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := FusedOpCode;
+  FusedInstr.Dest := CopyInstr.Dest;  // The accumulator register
+  FusedInstr.Src1 := ArithInstr.Src2; // The operand being added/mul/etc
+  FusedInstr.Src2 := 0;
+  FusedInstr.Immediate := 0;
+  FusedInstr.SourceLine := ArithInstr.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);
+  MakeNop(Index + 1);
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  // DEBUG: Log fusion details
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE ArithAndCopy @%d: opcode=%d Dest=%d Src1=%d',
+      [Index, FusedOpCode, FusedInstr.Dest, FusedInstr.Src1]));
+  {$ENDIF}
+
+  Inc(FFusedCount);
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.TryFuseConstantArithmetic(Index: Integer): Boolean;
+var
+  LoadInstr, ArithInstr, FusedInstr: TBytecodeInstruction;
+  LoadOp, ArithOp: TBytecodeOp;
+  FusedOpCode: Byte;
+  ConstReg: Word;
+begin
+  Result := False;
+
+  if Index + 1 >= FProgram.GetInstructionCount then Exit;
+
+  LoadInstr := FProgram.GetInstruction(Index);
+  ArithInstr := FProgram.GetInstruction(Index + 1);
+
+  // Safety: both instructions must be standard opcodes (< 100)
+  if (LoadInstr.OpCode >= 100) or (ArithInstr.OpCode >= 100) then Exit;
+
+  LoadOp := TBytecodeOp(LoadInstr.OpCode);
+  ArithOp := TBytecodeOp(ArithInstr.OpCode);
+
+  // Check for LoadConst followed by arithmetic using that constant
+  if not (LoadOp in [bcLoadConstInt, bcLoadConstFloat]) then Exit;
+
+  ConstReg := LoadInstr.Dest;
+
+  // Check if arithmetic uses the constant as Src2
+  if ArithInstr.Src2 <> ConstReg then Exit;
+
+  // SAFETY: Don't fuse if Src1 == Src2 (e.g., x + x from strength reduction)
+  // This pattern means the "constant" register is actually a variable being added to itself
+  if ArithInstr.Src1 = ConstReg then Exit;
+
+  // SAFETY: Don't fuse if the second instruction is a jump target
+  if IsJumpTarget(Index + 1) then Exit;
+
+  // Check if constant register is temporary
+  if not IsTemporaryResult(Index, ConstReg) then Exit;
+
+  // Match LoadConstInt + IntArith
+  if LoadOp = bcLoadConstInt then
+  begin
+    case ArithOp of
+      bcAddInt: FusedOpCode := bcAddIntConst;
+      bcSubInt: FusedOpCode := bcSubIntConst;
+      bcMulInt: FusedOpCode := bcMulIntConst;
+    else
+      Exit;
+    end;
+  end
+  // Match LoadConstFloat + FloatArith
+  else if LoadOp = bcLoadConstFloat then
+  begin
+    case ArithOp of
+      bcAddFloat: FusedOpCode := bcAddFloatConst;
+      bcSubFloat: FusedOpCode := bcSubFloatConst;
+      bcMulFloat: FusedOpCode := bcMulFloatConst;
+      bcDivFloat: FusedOpCode := bcDivFloatConst;
+    else
+      Exit;
+    end;
+  end
+  else
+    Exit;
+
+  // Create fused instruction: Dest = Src1 op Immediate
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := FusedOpCode;
+  FusedInstr.Dest := ArithInstr.Dest;
+  FusedInstr.Src1 := ArithInstr.Src1;
+  FusedInstr.Src2 := 0;
+  FusedInstr.Immediate := LoadInstr.Immediate;  // The constant
+  FusedInstr.SourceLine := ArithInstr.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);  // Replace Load with fused
+  MakeNop(Index + 1);  // Remove Arith
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  // DEBUG: Log fusion details
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE ConstantArith @%d: opcode=%d Dest=%d Src1=%d Imm=%d',
+      [Index, FusedOpCode, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Immediate]));
+  {$ENDIF}
+
+  Inc(FFusedCount);
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.TryFuseCompareZeroAndBranch(Index: Integer): Boolean;
+var
+  LoadInstr, CmpInstr, JmpInstr, FusedInstr: TBytecodeInstruction;
+  LoadOp, CmpOp, JmpOp: TBytecodeOp;
+  FusedOpCode: Byte;
+  ConstReg, CmpResultReg: Word;
+  IsFloat: Boolean;
+  NegateCondition: Boolean;
+begin
+  Result := False;
+
+  if Index + 2 >= FProgram.GetInstructionCount then Exit;
+
+  LoadInstr := FProgram.GetInstruction(Index);
+  CmpInstr := FProgram.GetInstruction(Index + 1);
+  JmpInstr := FProgram.GetInstruction(Index + 2);
+
+  // Safety: all instructions must be standard opcodes (< 100)
+  if (LoadInstr.OpCode >= 100) or (CmpInstr.OpCode >= 100) or (JmpInstr.OpCode >= 100) then Exit;
+
+  LoadOp := TBytecodeOp(LoadInstr.OpCode);
+  CmpOp := TBytecodeOp(CmpInstr.OpCode);
+  JmpOp := TBytecodeOp(JmpInstr.OpCode);
+
+  // Check for LoadConst 0 + CmpEq/CmpNe + JumpIfZero/NotZero
+  if not (LoadOp in [bcLoadConstInt, bcLoadConstFloat]) then Exit;
+  if LoadInstr.Immediate <> 0 then Exit;  // Must be zero constant
+
+  ConstReg := LoadInstr.Dest;
+  IsFloat := (LoadOp = bcLoadConstFloat);
+
+  // Check comparison uses the zero constant
+  if CmpInstr.Src2 <> ConstReg then Exit;
+
+  // Only handle equality comparisons with zero
+  if IsFloat then
+  begin
+    if not (CmpOp in [bcCmpEqFloat, bcCmpNeFloat]) then Exit;
+  end
+  else
+  begin
+    if not (CmpOp in [bcCmpEqInt, bcCmpNeInt]) then Exit;
+  end;
+
+  CmpResultReg := CmpInstr.Dest;
+
+  // Check jump uses comparison result
+  if not (JmpOp in [bcJumpIfZero, bcJumpIfNotZero]) then Exit;
+  if JmpInstr.Src1 <> CmpResultReg then Exit;
+
+  // SAFETY: Don't fuse if any of the following instructions is a jump target
+  if IsJumpTarget(Index + 1) then Exit;
+  if IsJumpTarget(Index + 2) then Exit;
+
+  // Check both temporary registers
+  if not IsTemporaryResult(Index, ConstReg) then Exit;
+  if not IsTemporaryResult(Index + 1, CmpResultReg) then Exit;
+
+  // Determine fused opcode
+  // CmpEq + JumpIfZero → branch if NOT equal to zero (BranchNeZero)
+  // CmpEq + JumpIfNotZero → branch if equal to zero (BranchEqZero)
+  // CmpNe + JumpIfZero → branch if NOT (not equal) = equal to zero (BranchEqZero)
+  // CmpNe + JumpIfNotZero → branch if not equal to zero (BranchNeZero)
+
+  NegateCondition := (JmpOp = bcJumpIfZero);
+
+  if IsFloat then
+  begin
+    if CmpOp = bcCmpEqFloat then
+    begin
+      if NegateCondition then FusedOpCode := bcBranchNeZeroFloat
+      else FusedOpCode := bcBranchEqZeroFloat;
+    end
+    else // CmpNeFloat
+    begin
+      if NegateCondition then FusedOpCode := bcBranchEqZeroFloat
+      else FusedOpCode := bcBranchNeZeroFloat;
+    end;
+  end
+  else
+  begin
+    if CmpOp = bcCmpEqInt then
+    begin
+      if NegateCondition then FusedOpCode := bcBranchNeZeroInt
+      else FusedOpCode := bcBranchEqZeroInt;
+    end
+    else // CmpNeInt
+    begin
+      if NegateCondition then FusedOpCode := bcBranchEqZeroInt
+      else FusedOpCode := bcBranchNeZeroInt;
+    end;
+  end;
+
+  // Create fused instruction: if (Src1 op 0) goto target
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := FusedOpCode;
+  FusedInstr.Dest := 0;
+  FusedInstr.Src1 := CmpInstr.Src1;  // The value being compared to zero
+  FusedInstr.Src2 := 0;
+  FusedInstr.Immediate := JmpInstr.Immediate;  // Jump target
+  FusedInstr.SourceLine := CmpInstr.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);
+  MakeNop(Index + 1);
+  MakeNop(Index + 2);
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  // DEBUG: Log fusion details
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE CompareZeroBranch @%d: opcode=%d Src1=%d Imm=%d',
+      [Index, FusedOpCode, FusedInstr.Src1, FusedInstr.Immediate]));
+  {$ENDIF}
+
+  Inc(FFusedCount, 2);  // Count as 2 fusions (eliminated 2 instructions)
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.TryFuseArrayStoreConst(Index: Integer): Boolean;
+var
+  LoadInstr, StoreInstr, FusedInstr: TBytecodeInstruction;
+  LoadOp, StoreOp: TBytecodeOp;
+  FusedOpCode: Byte;
+  ConstReg: Word;
+begin
+  { Pattern: LoadConstXxx Rtmp, K
+             ArrayStoreXxx ARR, idx, Rtmp
+     =>      ArrayStoreXxxConst ARR, idx, K
+
+     This is very common in SIEVE: flags(j) = 0 and flags(i) = 1 }
+
+  Result := False;
+
+  if Index + 1 >= FProgram.GetInstructionCount then Exit;
+
+  LoadInstr := FProgram.GetInstruction(Index);
+  StoreInstr := FProgram.GetInstruction(Index + 1);
+
+  // Safety: both instructions must be standard opcodes (< 100)
+  if (LoadInstr.OpCode >= 100) or (StoreInstr.OpCode >= 100) then Exit;
+
+  LoadOp := TBytecodeOp(LoadInstr.OpCode);
+  StoreOp := TBytecodeOp(StoreInstr.OpCode);
+
+  // Check for LoadConst followed by ArrayStore
+  if not (LoadOp in [bcLoadConstInt, bcLoadConstFloat, bcLoadConstString]) then Exit;
+
+  // Map ArrayStore types
+  case StoreOp of
+    bcArrayStoreInt: ;
+    bcArrayStoreFloat: ;
+    bcArrayStoreString: ;
+  else
+    Exit;
+  end;
+
+  ConstReg := LoadInstr.Dest;
+
+  // Check if ArrayStore uses the constant as value (Dest field in ArrayStore)
+  // ArrayStore format: Src1=ArrayIndex, Src2=IndexReg, Dest=ValueReg
+  if StoreInstr.Dest <> ConstReg then Exit;
+
+  // SAFETY: Don't fuse if the second instruction is a jump target
+  if IsJumpTarget(Index + 1) then Exit;
+
+  // Check if constant register is temporary (not used elsewhere)
+  if not IsTemporaryResult(Index, ConstReg) then Exit;
+
+  // Type matching: LoadConstInt -> ArrayStoreInt, etc.
+  case LoadOp of
+    bcLoadConstInt:
+      if StoreOp = bcArrayStoreInt then
+        FusedOpCode := bcArrayStoreIntConst
+      else
+        Exit;  // Type mismatch
+
+    bcLoadConstFloat:
+      if StoreOp = bcArrayStoreFloat then
+        FusedOpCode := bcArrayStoreFloatConst
+      else
+        Exit;  // Type mismatch
+
+    bcLoadConstString:
+      if StoreOp = bcArrayStoreString then
+        FusedOpCode := bcArrayStoreStringConst
+      else
+        Exit;  // Type mismatch
+  else
+    Exit;
+  end;
+
+  // Create fused instruction: ArrayStoreXxxConst ARR[idx] = immediate
+  // Format: Src1=ArrayIndex, Src2=IndexReg, Immediate=ConstValue
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := FusedOpCode;
+  FusedInstr.Dest := 0;  // Not used
+  FusedInstr.Src1 := StoreInstr.Src1;      // Array index
+  FusedInstr.Src2 := StoreInstr.Src2;      // Index register
+  FusedInstr.Immediate := LoadInstr.Immediate;  // Constant value
+  FusedInstr.SourceLine := StoreInstr.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);
+  MakeNop(Index + 1);
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE ArrayStoreConst @%d: opcode=%d Arr=%d Idx=%d Imm=%d',
+      [Index, FusedOpCode, FusedInstr.Src1, FusedInstr.Src2, FusedInstr.Immediate]));
+  {$ENDIF}
+
+  Inc(FFusedCount);
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.TryFuseLoopIncrementAndBranch(Index: Integer): Boolean;
+var
+  AddInstr, JumpInstr, BranchInstr, FusedInstr: TBytecodeInstruction;
+  JumpOp: TBytecodeOp;
+  FusedOpCode: Byte;
+  LoopTarget: Integer;
+  JumpIndex: Integer;
+  LoopBodyIndex: Integer;
+begin
+  { Pattern: AddIntTo Rdest, Rstep       ; counter += step
+             [NOP]*                       ; optional NOPs from previous fusions
+             Jump loopTop                 ; unconditional jump back to loop header
+
+     Where loopTop contains: BranchGtInt Rdest, Rlimit, exitTarget
+
+     The BranchGtInt at loopTop tests: if (counter > limit) goto exit
+     So the loop continues while counter <= limit.
+
+     Fused: AddIntToBranchLe Rdest, Rstep, Rlimit, loopBody
+            (dest += step; if dest <= limit goto loopBody)
+
+     Where loopBody = loopTop + 1 (skip the branch instruction)
+
+     This pattern occurs at the END of FOR loops where:
+     - AddIntTo increments the counter
+     - Jump goes back to the loop header (which has BranchGtInt) }
+
+  Result := False;
+
+  AddInstr := FProgram.GetInstruction(Index);
+
+  // Check for AddIntTo (superinstruction with opcode 120)
+  if AddInstr.OpCode <> bcAddIntTo then Exit;
+
+  // Find Jump instruction, skipping any NOPs
+  JumpIndex := Index + 1;
+  while JumpIndex < FProgram.GetInstructionCount do
+  begin
+    JumpInstr := FProgram.GetInstruction(JumpIndex);
+    if JumpInstr.OpCode <> Byte(bcNop) then
+      Break;
+    Inc(JumpIndex);
+  end;
+
+  // Need to have found a valid instruction
+  if JumpIndex >= FProgram.GetInstructionCount then Exit;
+
+  // Safety check on Jump
+  if JumpInstr.OpCode >= 100 then Exit;
+  JumpOp := TBytecodeOp(JumpInstr.OpCode);
+
+  // Check for unconditional Jump
+  if JumpOp <> bcJump then Exit;
+
+  // Get the loop header target from the Jump
+  LoopTarget := JumpInstr.Immediate;
+
+  // Validate loop target is within bounds
+  if (LoopTarget < 0) or (LoopTarget >= FProgram.GetInstructionCount) then Exit;
+
+  // Get the instruction at the loop header
+  BranchInstr := FProgram.GetInstruction(LoopTarget);
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('TryFuseLoop @%d: AddDest=%d JumpTarget=%d BranchOp=%d (expect %d) BranchSrc1=%d',
+      [Index, AddInstr.Dest, LoopTarget, BranchInstr.OpCode, bcBranchGtInt, BranchInstr.Src1]));
+  {$ENDIF}
+
+  // Check for BranchGtInt at the loop header
+  if BranchInstr.OpCode <> bcBranchGtInt then Exit;
+
+  // Check that BranchGtInt tests the same counter as AddIntTo increments
+  if BranchInstr.Src1 <> AddInstr.Dest then Exit;
+
+  // SAFETY: Don't fuse if Jump is a jump target itself
+  if IsJumpTarget(JumpIndex) then Exit;
+
+  // Find the first non-NOP instruction after BranchGtInt - that's the loop body
+  LoopBodyIndex := LoopTarget + 1;
+  while (LoopBodyIndex < FProgram.GetInstructionCount) and
+        (FProgram.GetInstruction(LoopBodyIndex).OpCode = Byte(bcNop)) do
+    Inc(LoopBodyIndex);
+
+  // Create fused instruction: dest += step; if (dest <= limit) goto loopBody
+  FusedOpCode := bcAddIntToBranchLe;
+
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := FusedOpCode;
+  FusedInstr.Dest := AddInstr.Dest;       // Counter register
+  FusedInstr.Src1 := AddInstr.Src1;       // Step register
+  FusedInstr.Src2 := BranchInstr.Src2;    // Limit register
+  FusedInstr.Immediate := LoopBodyIndex;  // Loop body (first non-NOP after branch)
+  FusedInstr.SourceLine := AddInstr.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);
+  MakeNop(JumpIndex);  // Remove Jump
+
+  // NOTE: We do NOT remove the BranchGtInt at LoopTarget because:
+  // 1. It's needed for the first iteration (entry from outside the loop)
+  // 2. Other code may jump to it
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE LoopIncrBranch @%d: Dest=%d Step=%d Limit=%d Target=%d',
+      [Index, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Src2, FusedInstr.Immediate]));
+  {$ENDIF}
+
+  Inc(FFusedCount);  // Saved 1 instruction (the Jump)
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.TryFuseMulAddFloat(Index: Integer): Boolean;
+var
+  MulInstr, AddInstr, FusedInstr: TBytecodeInstruction;
+  MulOp, AddOp: TBytecodeOp;
+  FusedOpCode: Byte;
+  MulDest: Word;
+begin
+  { Pattern 1: MulFloat Rtmp, Ra, Rb + AddFloat Rdest, Rc, Rtmp => bcMulAddFloat dest = c + a*b
+    Pattern 2: MulFloat Rtmp, Ra, Rb + SubFloat Rdest, Rc, Rtmp => bcMulSubFloat dest = c - a*b
+    Pattern 3: MulFloat Rtmp, Ra, Rb + AddFloatTo Rdest, Rtmp => bcMulAddToFloat dest += a*b
+    Pattern 4: MulFloat Rtmp, Ra, Rb + SubFloatTo Rdest, Rtmp => bcMulSubToFloat dest -= a*b }
+
+  Result := False;
+
+  if Index + 1 >= FProgram.GetInstructionCount then Exit;
+
+  MulInstr := FProgram.GetInstruction(Index);
+  AddInstr := FProgram.GetInstruction(Index + 1);
+
+  // First instruction must be MulFloat
+  if MulInstr.OpCode >= 100 then Exit;
+  MulOp := TBytecodeOp(MulInstr.OpCode);
+  if MulOp <> bcMulFloat then Exit;
+
+  MulDest := MulInstr.Dest;
+
+  // SAFETY: Don't fuse if second instruction is a jump target
+  if IsJumpTarget(Index + 1) then Exit;
+
+  // Check second instruction
+  if AddInstr.OpCode >= 100 then
+  begin
+    // Could be a superinstruction AddFloatTo (130) or SubFloatTo (131)
+    case AddInstr.OpCode of
+      130: // bcAddFloatTo: Dest += Src1
+        begin
+          // Check if AddFloatTo uses the mul result
+          if AddInstr.Src1 <> MulDest then Exit;
+          // Check if mul result is temporary
+          if not IsTemporaryResult(Index, MulDest) then Exit;
+
+          FusedOpCode := bcMulAddToFloat;
+
+          // Create: dest += a*b
+          FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+          FusedInstr.OpCode := FusedOpCode;
+          FusedInstr.Dest := AddInstr.Dest;     // Accumulator
+          FusedInstr.Src1 := MulInstr.Src1;     // a
+          FusedInstr.Src2 := MulInstr.Src2;     // b
+          FusedInstr.Immediate := 0;
+          FusedInstr.SourceLine := MulInstr.SourceLine;
+
+          FProgram.SetInstruction(Index, FusedInstr);
+          MakeNop(Index + 1);
+
+          {$IFDEF DEBUG_SUPERINSTR}
+          if DebugSuperinstr then
+            WriteLn(StdErr, Format('FUSE MulAddToFloat @%d: Dest=%d Src1=%d Src2=%d',
+              [Index, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Src2]));
+          {$ENDIF}
+
+          Inc(FFusedCount);
+          Result := True;
+          Exit;
+        end;
+
+      131: // bcSubFloatTo: Dest -= Src1
+        begin
+          // Check if SubFloatTo uses the mul result
+          if AddInstr.Src1 <> MulDest then Exit;
+          // Check if mul result is temporary
+          if not IsTemporaryResult(Index, MulDest) then Exit;
+
+          FusedOpCode := bcMulSubToFloat;
+
+          // Create: dest -= a*b
+          FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+          FusedInstr.OpCode := FusedOpCode;
+          FusedInstr.Dest := AddInstr.Dest;     // Accumulator
+          FusedInstr.Src1 := MulInstr.Src1;     // a
+          FusedInstr.Src2 := MulInstr.Src2;     // b
+          FusedInstr.Immediate := 0;
+          FusedInstr.SourceLine := MulInstr.SourceLine;
+
+          FProgram.SetInstruction(Index, FusedInstr);
+          MakeNop(Index + 1);
+
+          {$IFDEF DEBUG_SUPERINSTR}
+          if DebugSuperinstr then
+            WriteLn(StdErr, Format('FUSE MulSubToFloat @%d: Dest=%d Src1=%d Src2=%d',
+              [Index, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Src2]));
+          {$ENDIF}
+
+          Inc(FFusedCount);
+          Result := True;
+          Exit;
+        end;
+    else
+      Exit;
+    end;
+  end
+  else
+  begin
+    // Standard opcode
+    AddOp := TBytecodeOp(AddInstr.OpCode);
+
+    case AddOp of
+      bcAddFloat:
+        begin
+          // Check if AddFloat uses the mul result as Src2
+          if AddInstr.Src2 <> MulDest then Exit;
+          // Check if mul result is temporary
+          if not IsTemporaryResult(Index, MulDest) then Exit;
+
+          FusedOpCode := bcMulAddFloat;
+
+          // Create: dest = c + a*b (where c is AddInstr.Src1)
+          FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+          FusedInstr.OpCode := FusedOpCode;
+          FusedInstr.Dest := AddInstr.Dest;      // Result
+          FusedInstr.Src1 := MulInstr.Src1;      // a
+          FusedInstr.Src2 := MulInstr.Src2;      // b
+          FusedInstr.Immediate := AddInstr.Src1; // c (extra operand stored in Immediate)
+          FusedInstr.SourceLine := MulInstr.SourceLine;
+
+          FProgram.SetInstruction(Index, FusedInstr);
+          MakeNop(Index + 1);
+
+          {$IFDEF DEBUG_SUPERINSTR}
+          if DebugSuperinstr then
+            WriteLn(StdErr, Format('FUSE MulAddFloat @%d: Dest=%d a=%d b=%d c=%d',
+              [Index, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Src2, FusedInstr.Immediate]));
+          {$ENDIF}
+
+          Inc(FFusedCount);
+          Result := True;
+          Exit;
+        end;
+
+      bcSubFloat:
+        begin
+          // Check if SubFloat uses the mul result as Src2 (c - a*b)
+          if AddInstr.Src2 <> MulDest then Exit;
+          // Check if mul result is temporary
+          if not IsTemporaryResult(Index, MulDest) then Exit;
+
+          FusedOpCode := bcMulSubFloat;
+
+          // Create: dest = c - a*b (where c is AddInstr.Src1)
+          FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+          FusedInstr.OpCode := FusedOpCode;
+          FusedInstr.Dest := AddInstr.Dest;      // Result
+          FusedInstr.Src1 := MulInstr.Src1;      // a
+          FusedInstr.Src2 := MulInstr.Src2;      // b
+          FusedInstr.Immediate := AddInstr.Src1; // c (extra operand stored in Immediate)
+          FusedInstr.SourceLine := MulInstr.SourceLine;
+
+          FProgram.SetInstruction(Index, FusedInstr);
+          MakeNop(Index + 1);
+
+          {$IFDEF DEBUG_SUPERINSTR}
+          if DebugSuperinstr then
+            WriteLn(StdErr, Format('FUSE MulSubFloat @%d: Dest=%d a=%d b=%d c=%d',
+              [Index, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Src2, FusedInstr.Immediate]));
+          {$ENDIF}
+
+          Inc(FFusedCount);
+          Result := True;
+          Exit;
+        end;
+    end;
+  end;
+end;
+
+function TSuperinstructionOptimizer.TryFuseArrayLoadAddFloat(Index: Integer): Boolean;
+var
+  LoadInstr, AddInstr, FusedInstr: TBytecodeInstruction;
+  LoadOp, AddOp: TBytecodeOp;
+  FusedOpCode: Byte;
+  LoadDest: Word;
+begin
+  { Pattern: ArrayLoadFloat Rtmp, arr, idx + AddFloat Rdest, Racc, Rtmp => bcArrayLoadAddFloat
+            ArrayLoadFloat Rtmp, arr, idx + SubFloat Rdest, Racc, Rtmp => bcArrayLoadSubFloat }
+
+  Result := False;
+
+  if Index + 1 >= FProgram.GetInstructionCount then Exit;
+
+  LoadInstr := FProgram.GetInstruction(Index);
+  AddInstr := FProgram.GetInstruction(Index + 1);
+
+  // First instruction must be ArrayLoadFloat
+  if LoadInstr.OpCode >= 100 then Exit;
+  LoadOp := TBytecodeOp(LoadInstr.OpCode);
+  if LoadOp <> bcArrayLoadFloat then Exit;
+
+  LoadDest := LoadInstr.Dest;
+
+  // SAFETY: Don't fuse if second instruction is a jump target
+  if IsJumpTarget(Index + 1) then Exit;
+
+  // Check if load result is temporary
+  if not IsTemporaryResult(Index, LoadDest) then Exit;
+
+  // Check second instruction
+  if AddInstr.OpCode >= 100 then Exit;
+  AddOp := TBytecodeOp(AddInstr.OpCode);
+
+  case AddOp of
+    bcAddFloat:
+      begin
+        // Check if AddFloat uses the load result as Src2
+        if AddInstr.Src2 <> LoadDest then Exit;
+
+        FusedOpCode := bcArrayLoadAddFloat;
+
+        // Create: dest = acc + arr[idx]
+        FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+        FusedInstr.OpCode := FusedOpCode;
+        FusedInstr.Dest := AddInstr.Dest;       // Result
+        FusedInstr.Src1 := LoadInstr.Src1;      // Array index
+        FusedInstr.Src2 := LoadInstr.Src2;      // Index register
+        FusedInstr.Immediate := AddInstr.Src1;  // Accumulator register
+        FusedInstr.SourceLine := LoadInstr.SourceLine;
+
+        FProgram.SetInstruction(Index, FusedInstr);
+        MakeNop(Index + 1);
+
+        {$IFDEF DEBUG_SUPERINSTR}
+        if DebugSuperinstr then
+          WriteLn(StdErr, Format('FUSE ArrayLoadAddFloat @%d: Dest=%d Arr=%d Idx=%d Acc=%d',
+            [Index, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Src2, FusedInstr.Immediate]));
+        {$ENDIF}
+
+        Inc(FFusedCount);
+        Result := True;
+      end;
+
+    bcSubFloat:
+      begin
+        // Check if SubFloat uses the load result as Src2 (acc - arr[idx])
+        if AddInstr.Src2 <> LoadDest then Exit;
+
+        FusedOpCode := bcArrayLoadSubFloat;
+
+        // Create: dest = acc - arr[idx]
+        FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+        FusedInstr.OpCode := FusedOpCode;
+        FusedInstr.Dest := AddInstr.Dest;       // Result
+        FusedInstr.Src1 := LoadInstr.Src1;      // Array index
+        FusedInstr.Src2 := LoadInstr.Src2;      // Index register
+        FusedInstr.Immediate := AddInstr.Src1;  // Accumulator register
+        FusedInstr.SourceLine := LoadInstr.SourceLine;
+
+        FProgram.SetInstruction(Index, FusedInstr);
+        MakeNop(Index + 1);
+
+        {$IFDEF DEBUG_SUPERINSTR}
+        if DebugSuperinstr then
+          WriteLn(StdErr, Format('FUSE ArrayLoadSubFloat @%d: Dest=%d Arr=%d Idx=%d Acc=%d',
+            [Index, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Src2, FusedInstr.Immediate]));
+        {$ENDIF}
+
+        Inc(FFusedCount);
+        Result := True;
+      end;
+  end;
+end;
+
+function TSuperinstructionOptimizer.TryFuseSquareSumFloat(Index: Integer): Boolean;
+var
+  Mul1Instr, Mul2Instr, AddInstr, FusedInstr: TBytecodeInstruction;
+  Mul1Dest, Mul2Dest: Word;
+begin
+  { Pattern: MulFloat Rsq1, Rx, Rx + MulFloat Rsq2, Ry, Ry + AddFloat Rdest, Rsq1, Rsq2
+            => bcSquareSumFloat dest = x*x + y*y
+
+    Also: MulFloat Rsq, Rx, Rx + AddFloat Rdest, Rsum, Rsq
+          => bcAddSquareFloat dest = sum + x*x }
+
+  Result := False;
+
+  // First check for simple AddSquare pattern (2 instructions)
+  if Index + 1 >= FProgram.GetInstructionCount then Exit;
+
+  Mul1Instr := FProgram.GetInstruction(Index);
+  AddInstr := FProgram.GetInstruction(Index + 1);
+
+  // First instruction must be MulFloat
+  if Mul1Instr.OpCode >= 100 then Exit;
+  if TBytecodeOp(Mul1Instr.OpCode) <> bcMulFloat then Exit;
+
+  // Check if it's a square (Src1 == Src2)
+  if Mul1Instr.Src1 <> Mul1Instr.Src2 then Exit;
+
+  Mul1Dest := Mul1Instr.Dest;
+
+  // SAFETY: Don't fuse if second instruction is a jump target
+  if IsJumpTarget(Index + 1) then Exit;
+
+  // Check if mul result is temporary
+  if not IsTemporaryResult(Index, Mul1Dest) then Exit;
+
+  // Check second instruction - could be another MulFloat (square) or AddFloat
+  if AddInstr.OpCode >= 100 then Exit;
+
+  case TBytecodeOp(AddInstr.OpCode) of
+    bcAddFloat:
+      begin
+        // Pattern: sq + something
+        // If sq is in Src2, we have: dest = sum + sq => AddSquareFloat
+        if AddInstr.Src2 = Mul1Dest then
+        begin
+          // Create: dest = sum + x*x
+          FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+          FusedInstr.OpCode := bcAddSquareFloat;
+          FusedInstr.Dest := AddInstr.Dest;      // Result
+          FusedInstr.Src1 := AddInstr.Src1;      // Existing sum
+          FusedInstr.Src2 := Mul1Instr.Src1;     // x (value to square)
+          FusedInstr.SourceLine := Mul1Instr.SourceLine;
+
+          FProgram.SetInstruction(Index, FusedInstr);
+          MakeNop(Index + 1);
+
+          {$IFDEF DEBUG_SUPERINSTR}
+          if DebugSuperinstr then
+            WriteLn(StdErr, Format('FUSE AddSquareFloat @%d: Dest=%d Sum=%d X=%d',
+              [Index, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Src2]));
+          {$ENDIF}
+
+          Inc(FFusedCount);
+          Result := True;
+          Exit;
+        end;
+      end;
+
+    bcMulFloat:
+      begin
+        // Could be second square - check for 3-instruction pattern
+        if Index + 2 >= FProgram.GetInstructionCount then Exit;
+
+        Mul2Instr := AddInstr; // This is actually the second MulFloat
+        AddInstr := FProgram.GetInstruction(Index + 2);
+
+        // Check if second is also a square
+        if Mul2Instr.Src1 <> Mul2Instr.Src2 then Exit;
+
+        Mul2Dest := Mul2Instr.Dest;
+
+        // SAFETY: Don't fuse if third instruction is a jump target
+        if IsJumpTarget(Index + 2) then Exit;
+
+        // Check if both results are temporary
+        if not IsTemporaryResult(Index + 1, Mul2Dest) then Exit;
+
+        // Check third instruction is AddFloat that combines both squares
+        if AddInstr.OpCode >= 100 then Exit;
+        if TBytecodeOp(AddInstr.OpCode) <> bcAddFloat then Exit;
+
+        // Check if AddFloat uses both squares
+        if not ((AddInstr.Src1 = Mul1Dest) and (AddInstr.Src2 = Mul2Dest)) and
+           not ((AddInstr.Src1 = Mul2Dest) and (AddInstr.Src2 = Mul1Dest)) then Exit;
+
+        // Create: dest = x*x + y*y
+        FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+        FusedInstr.OpCode := bcSquareSumFloat;
+        FusedInstr.Dest := AddInstr.Dest;       // Result
+        FusedInstr.Src1 := Mul1Instr.Src1;      // x
+        FusedInstr.Src2 := Mul2Instr.Src1;      // y
+        FusedInstr.SourceLine := Mul1Instr.SourceLine;
+
+        FProgram.SetInstruction(Index, FusedInstr);
+        MakeNop(Index + 1);
+        MakeNop(Index + 2);
+
+        {$IFDEF DEBUG_SUPERINSTR}
+        if DebugSuperinstr then
+          WriteLn(StdErr, Format('FUSE SquareSumFloat @%d: Dest=%d X=%d Y=%d',
+            [Index, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Src2]));
+        {$ENDIF}
+
+        Inc(FFusedCount, 2);  // Saved 2 instructions
+        Result := True;
+      end;
+  end;
+end;
+
+function TSuperinstructionOptimizer.TryFuseMulMulFloat(Index: Integer): Boolean;
+var
+  Mul1Instr, Mul2Instr, FusedInstr: TBytecodeInstruction;
+  Mul1Dest: Word;
+begin
+  { Pattern: MulFloat Rtmp, Ra, Rb + MulFloat Rdest, Rtmp, Rc => bcMulMulFloat dest = a*b*c }
+
+  Result := False;
+
+  if Index + 1 >= FProgram.GetInstructionCount then Exit;
+
+  Mul1Instr := FProgram.GetInstruction(Index);
+  Mul2Instr := FProgram.GetInstruction(Index + 1);
+
+  // Both must be MulFloat
+  if Mul1Instr.OpCode >= 100 then Exit;
+  if TBytecodeOp(Mul1Instr.OpCode) <> bcMulFloat then Exit;
+
+  if Mul2Instr.OpCode >= 100 then Exit;
+  if TBytecodeOp(Mul2Instr.OpCode) <> bcMulFloat then Exit;
+
+  Mul1Dest := Mul1Instr.Dest;
+
+  // SAFETY: Don't fuse if second instruction is a jump target
+  if IsJumpTarget(Index + 1) then Exit;
+
+  // Check if first result is temporary
+  if not IsTemporaryResult(Index, Mul1Dest) then Exit;
+
+  // Check if second mul uses first result as Src1
+  if Mul2Instr.Src1 <> Mul1Dest then Exit;
+
+  // Create: dest = a*b*c
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := bcMulMulFloat;
+  FusedInstr.Dest := Mul2Instr.Dest;      // Result
+  FusedInstr.Src1 := Mul1Instr.Src1;      // a
+  FusedInstr.Src2 := Mul1Instr.Src2;      // b
+  FusedInstr.Immediate := Mul2Instr.Src2; // c
+  FusedInstr.SourceLine := Mul1Instr.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);
+  MakeNop(Index + 1);
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE MulMulFloat @%d: Dest=%d a=%d b=%d c=%d',
+      [Index, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Src2, FusedInstr.Immediate]));
+  {$ENDIF}
+
+  Inc(FFusedCount);
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.TryFuseAddSqrtFloat(Index: Integer): Boolean;
+var
+  AddInstr, SqrtInstr, FusedInstr: TBytecodeInstruction;
+  AddDest: Word;
+begin
+  { Pattern: AddFloat Rtmp, Ra, Rb + MathSqr Rdest, Rtmp => bcAddSqrtFloat dest = sqrt(a+b) }
+
+  Result := False;
+
+  if Index + 1 >= FProgram.GetInstructionCount then Exit;
+
+  AddInstr := FProgram.GetInstruction(Index);
+  SqrtInstr := FProgram.GetInstruction(Index + 1);
+
+  // First must be AddFloat
+  if AddInstr.OpCode >= 100 then Exit;
+  if TBytecodeOp(AddInstr.OpCode) <> bcAddFloat then Exit;
+
+  // Second must be MathSqr
+  if SqrtInstr.OpCode >= 100 then Exit;
+  if TBytecodeOp(SqrtInstr.OpCode) <> bcMathSqr then Exit;
+
+  AddDest := AddInstr.Dest;
+
+  // SAFETY: Don't fuse if second instruction is a jump target
+  if IsJumpTarget(Index + 1) then Exit;
+
+  // Check if add result is temporary
+  if not IsTemporaryResult(Index, AddDest) then Exit;
+
+  // Check if sqrt uses add result
+  if SqrtInstr.Src1 <> AddDest then Exit;
+
+  // Create: dest = sqrt(a+b)
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := bcAddSqrtFloat;
+  FusedInstr.Dest := SqrtInstr.Dest;     // Result
+  FusedInstr.Src1 := AddInstr.Src1;      // a
+  FusedInstr.Src2 := AddInstr.Src2;      // b
+  FusedInstr.SourceLine := AddInstr.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);
+  MakeNop(Index + 1);
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE AddSqrtFloat @%d: Dest=%d a=%d b=%d',
+      [Index, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Src2]));
+  {$ENDIF}
+
+  Inc(FFusedCount);
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.TryFuseArrayLoadBranchInt(Index: Integer): Boolean;
+var
+  LoadInstr, BranchInstr, FusedInstr: TBytecodeInstruction;
+  LoadDest: Word;
+  FusedOpCode: Byte;
+begin
+  { Pattern: ArrayLoadInt Rtmp, arr, idx + BranchNeZeroInt Rtmp, target => bcArrayLoadIntBranchNZ
+            ArrayLoadInt Rtmp, arr, idx + BranchEqZeroInt Rtmp, target => bcArrayLoadIntBranchZ }
+
+  Result := False;
+
+  if Index + 1 >= FProgram.GetInstructionCount then Exit;
+
+  LoadInstr := FProgram.GetInstruction(Index);
+  BranchInstr := FProgram.GetInstruction(Index + 1);
+
+  // First must be ArrayLoadInt
+  if LoadInstr.OpCode >= 100 then Exit;
+  if TBytecodeOp(LoadInstr.OpCode) <> bcArrayLoadInt then Exit;
+
+  LoadDest := LoadInstr.Dest;
+
+  // SAFETY: Don't fuse if second instruction is a jump target
+  if IsJumpTarget(Index + 1) then Exit;
+
+  // Check if load result is temporary
+  if not IsTemporaryResult(Index, LoadDest) then Exit;
+
+  // Check second instruction - must be BranchEqZeroInt or BranchNeZeroInt
+  case BranchInstr.OpCode of
+    161: // bcBranchNeZeroInt
+      begin
+        if BranchInstr.Src1 <> LoadDest then Exit;
+        FusedOpCode := bcArrayLoadIntBranchNZ;
+      end;
+    160: // bcBranchEqZeroInt
+      begin
+        if BranchInstr.Src1 <> LoadDest then Exit;
+        FusedOpCode := bcArrayLoadIntBranchZ;
+      end;
+  else
+    Exit;
+  end;
+
+  // Create fused instruction
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := FusedOpCode;
+  FusedInstr.Dest := 0;                    // Not used
+  FusedInstr.Src1 := LoadInstr.Src1;       // Array index
+  FusedInstr.Src2 := LoadInstr.Src2;       // Index register
+  FusedInstr.Immediate := BranchInstr.Immediate; // Branch target
+  FusedInstr.SourceLine := LoadInstr.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);
+  MakeNop(Index + 1);
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE ArrayLoadBranchInt @%d: Op=%d Arr=%d Idx=%d Target=%d',
+      [Index, FusedOpCode, FusedInstr.Src1, FusedInstr.Src2, FusedInstr.Immediate]));
+  {$ENDIF}
+
+  Inc(FFusedCount);
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.TryFuseArraySwapInt(Index: Integer): Boolean;
+var
+  Load1Instr, CopyInstr, Load2Instr, Store1Instr, Store2Instr, FusedInstr: TBytecodeInstruction;
+  Load1Dest, CopyDest, Load2Dest: Word;
+  ArrayIdx: Word;
+begin
+  { Pattern: ArrayLoadInt  Rtmp1, arr, idx1   ; tmp1 = arr[idx1]
+             CopyInt       Rsave, Rtmp1       ; save = tmp1
+             ArrayLoadInt  Rtmp2, arr, idx2   ; tmp2 = arr[idx2]
+             ArrayStoreInt arr, idx1, Rtmp2   ; arr[idx1] = tmp2
+             ArrayStoreInt arr, idx2, Rsave   ; arr[idx2] = save
+
+     Becomes: ArraySwapInt arr, idx1, idx2
+     Format: Src1=arr_index, Src2=idx1_reg, Dest=idx2_reg }
+
+  Result := False;
+
+  if Index + 4 >= FProgram.GetInstructionCount then Exit;
+
+  Load1Instr := FProgram.GetInstruction(Index);
+  CopyInstr := FProgram.GetInstruction(Index + 1);
+  Load2Instr := FProgram.GetInstruction(Index + 2);
+  Store1Instr := FProgram.GetInstruction(Index + 3);
+  Store2Instr := FProgram.GetInstruction(Index + 4);
+
+  // All must be standard opcodes (< 100)
+  if (Load1Instr.OpCode >= 100) or (CopyInstr.OpCode >= 100) or
+     (Load2Instr.OpCode >= 100) or (Store1Instr.OpCode >= 100) or
+     (Store2Instr.OpCode >= 100) then Exit;
+
+  // Check instruction types
+  if TBytecodeOp(Load1Instr.OpCode) <> bcArrayLoadInt then Exit;
+  if TBytecodeOp(CopyInstr.OpCode) <> bcCopyInt then Exit;
+  if TBytecodeOp(Load2Instr.OpCode) <> bcArrayLoadInt then Exit;
+  if TBytecodeOp(Store1Instr.OpCode) <> bcArrayStoreInt then Exit;
+  if TBytecodeOp(Store2Instr.OpCode) <> bcArrayStoreInt then Exit;
+
+  // Extract register destinations
+  Load1Dest := Load1Instr.Dest;
+  CopyDest := CopyInstr.Dest;
+  Load2Dest := Load2Instr.Dest;
+
+  // Get array index - all operations must be on the same array
+  ArrayIdx := Load1Instr.Src1;
+  if Load2Instr.Src1 <> ArrayIdx then Exit;
+  if Store1Instr.Src1 <> ArrayIdx then Exit;
+  if Store2Instr.Src1 <> ArrayIdx then Exit;
+
+  // Verify pattern: CopyInt saves Load1 result
+  if CopyInstr.Src1 <> Load1Dest then Exit;
+
+  // Verify Store1 stores Load2 result at idx1 position
+  if Store1Instr.Src2 <> Load1Instr.Src2 then Exit;  // Same index as Load1
+  if Store1Instr.Dest <> Load2Dest then Exit;        // Value from Load2
+
+  // Verify Store2 stores saved value at idx2 position
+  if Store2Instr.Src2 <> Load2Instr.Src2 then Exit;  // Same index as Load2
+  if Store2Instr.Dest <> CopyDest then Exit;          // Saved value
+
+  // SAFETY: Don't fuse if any instruction is a jump target
+  if IsJumpTarget(Index + 1) then Exit;
+  if IsJumpTarget(Index + 2) then Exit;
+  if IsJumpTarget(Index + 3) then Exit;
+  if IsJumpTarget(Index + 4) then Exit;
+
+  // Check temporaries
+  if not IsTemporaryResult(Index, Load1Dest) then Exit;
+  if not IsTemporaryResult(Index + 2, Load2Dest) then Exit;
+  // CopyDest (save) is used in Store2, which is Index+4, so we need a different check
+  // Actually CopyDest is NOT temporary - it's used later. But that's OK, we're replacing the whole pattern.
+
+  // Create fused instruction: ArraySwapInt arr, idx1, idx2
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := bcArraySwapInt;
+  FusedInstr.Src1 := ArrayIdx;              // Array index
+  FusedInstr.Src2 := Load1Instr.Src2;       // idx1 register
+  FusedInstr.Dest := Load2Instr.Src2;       // idx2 register
+  FusedInstr.Immediate := 0;
+  FusedInstr.SourceLine := Load1Instr.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);
+  MakeNop(Index + 1);
+  MakeNop(Index + 2);
+  MakeNop(Index + 3);
+  MakeNop(Index + 4);
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE ArraySwapInt @%d: Arr=%d Idx1=%d Idx2=%d',
+      [Index, FusedInstr.Src1, FusedInstr.Src2, FusedInstr.Dest]));
+  {$ENDIF}
+
+  Inc(FFusedCount, 4);  // Saved 4 instructions
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.TryFuseAddIntSelf(Index: Integer): Boolean;
+var
+  ArithInstr, FusedInstr: TBytecodeInstruction;
+  ArithOp: TBytecodeOp;
+  FusedOpCode: Byte;
+begin
+  { Pattern: AddInt Rdest, Rdest, Rsrc  (when dest == src1)
+             SubInt Rdest, Rdest, Rsrc  (when dest == src1)
+
+     Becomes: AddIntSelf Rdest, Rsrc   (dest += src)
+              SubIntSelf Rdest, Rsrc   (dest -= src)
+
+     This pattern is NOT caught by TryFuseArithAndCopy because there's no CopyInt after.
+     Very common in fannkuch-redux: I% = I% + C1%, J% = J% - C1% }
+
+  Result := False;
+
+  ArithInstr := FProgram.GetInstruction(Index);
+
+  // Must be standard opcode
+  if ArithInstr.OpCode >= 100 then Exit;
+
+  ArithOp := TBytecodeOp(ArithInstr.OpCode);
+
+  // Check for AddInt or SubInt where Dest == Src1 (self-modification)
+  case ArithOp of
+    bcAddInt:
+      begin
+        if ArithInstr.Dest <> ArithInstr.Src1 then Exit;
+        FusedOpCode := bcAddIntSelf;
+      end;
+    bcSubInt:
+      begin
+        if ArithInstr.Dest <> ArithInstr.Src1 then Exit;
+        FusedOpCode := bcSubIntSelf;
+      end;
+  else
+    Exit;
+  end;
+
+  // Create fused instruction: dest += src  or  dest -= src
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := FusedOpCode;
+  FusedInstr.Dest := ArithInstr.Dest;      // Register to modify
+  FusedInstr.Src1 := ArithInstr.Src2;      // Amount register
+  FusedInstr.Src2 := 0;
+  FusedInstr.Immediate := 0;
+  FusedInstr.SourceLine := ArithInstr.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE AddIntSelf @%d: Op=%d Dest=%d Src=%d',
+      [Index, FusedOpCode, FusedInstr.Dest, FusedInstr.Src1]));
+  {$ENDIF}
+
+  Inc(FFusedCount);
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.TryFuseArrayLoadIntTo(Index: Integer): Boolean;
+var
+  LoadInstr, CopyInstr, FusedInstr: TBytecodeInstruction;
+  LoadDest: Word;
+begin
+  { Pattern: ArrayLoadInt Rtmp, arr, idx + CopyInt Rdest, Rtmp
+     Becomes: ArrayLoadIntTo Rdest, arr, idx
+     Format: Dest=final destination, Src1=arr_index, Src2=idx_reg }
+
+  Result := False;
+
+  if Index + 1 >= FProgram.GetInstructionCount then Exit;
+
+  LoadInstr := FProgram.GetInstruction(Index);
+  CopyInstr := FProgram.GetInstruction(Index + 1);
+
+  // Both must be standard opcodes (< 100)
+  if (LoadInstr.OpCode >= 100) or (CopyInstr.OpCode >= 100) then Exit;
+
+  // Check instruction types
+  if TBytecodeOp(LoadInstr.OpCode) <> bcArrayLoadInt then Exit;
+  if TBytecodeOp(CopyInstr.OpCode) <> bcCopyInt then Exit;
+
+  LoadDest := LoadInstr.Dest;
+
+  // Check if CopyInt uses the ArrayLoadInt result
+  if CopyInstr.Src1 <> LoadDest then Exit;
+
+  // SAFETY: Don't fuse if second instruction is a jump target
+  if IsJumpTarget(Index + 1) then Exit;
+
+  // Check if load result is temporary
+  if not IsTemporaryResult(Index, LoadDest) then Exit;
+
+  // Create fused instruction: dest = arr[idx]
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := bcArrayLoadIntTo;
+  FusedInstr.Dest := CopyInstr.Dest;       // Final destination register
+  FusedInstr.Src1 := LoadInstr.Src1;       // Array index
+  FusedInstr.Src2 := LoadInstr.Src2;       // Index register
+  FusedInstr.Immediate := 0;
+  FusedInstr.SourceLine := LoadInstr.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);
+  MakeNop(Index + 1);
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE ArrayLoadIntTo @%d: Dest=%d Arr=%d Idx=%d',
+      [Index, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Src2]));
+  {$ENDIF}
+
+  Inc(FFusedCount);
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.Run: Integer;
+var
+  i, Pass: Integer;
+  Changed: Boolean;
+begin
+  {$IFDEF DISABLE_SUPERINSTRUCTIONS}
+  Result := 0;
+  Exit;
+  {$ENDIF}
+
+  FFusedCount := 0;
+  Pass := 0;
+
+  // Multiple passes until no more fusions possible
+  repeat
+    Inc(Pass);
+    Changed := False;
+    i := 0;
+    while i < FProgram.GetInstructionCount - 1 do
+    begin
+      // Skip NOPs
+      if TBytecodeOp(FProgram.GetInstruction(i).OpCode) = bcNop then
+      begin
+        Inc(i);
+        Continue;
+      end;
+
+      // Try TryFuseLoopIncrementAndBranch FIRST for AddIntTo (opcode 120)
+      // This allows fusing AddIntTo + Jump into AddIntToBranchLe
+      if FProgram.GetInstruction(i).OpCode = bcAddIntTo then
+      begin
+        if TryFuseLoopIncrementAndBranch(i) then
+          Changed := True;
+        Inc(i);
+        Continue;
+      end;
+
+      // Skip other superinstructions (can't fuse already-fused instructions)
+      if FProgram.GetInstruction(i).OpCode >= 100 then
+      begin
+        Inc(i);
+        Continue;
+      end;
+
+      // Try fusion patterns in order of priority
+      // (5-instruction patterns first, then 3-instruction, then 2-instruction)
+
+      // NEW: Array swap pattern (5 instructions) - HIGH PRIORITY for fannkuch-redux
+      if TryFuseArraySwapInt(i) then
+        Changed := True
+      else if TryFuseCompareZeroAndBranch(i) then
+        Changed := True
+      else if TryFuseCompareAndBranch(i) then
+        Changed := True
+      else if TryFuseArithAndCopy(i) then
+        Changed := True
+      else if TryFuseConstantArithmetic(i) then
+        Changed := True
+      {$IFNDEF DISABLE_ARRAYSTORECONST}
+      else if TryFuseArrayStoreConst(i) then
+        Changed := True
+      {$ENDIF}
+      // NEW: Self-increment/decrement patterns - HIGH PRIORITY for fannkuch-redux
+      else if TryFuseAddIntSelf(i) then
+        Changed := True
+      // NEW: Array load to register pattern
+      else if TryFuseArrayLoadIntTo(i) then
+        Changed := True
+      // NEW: FMA and advanced patterns
+      // NOTE: SquareSumFloat temporarily disabled - needs more work on pattern matching
+      //else if TryFuseSquareSumFloat(i) then   // 3-instruction pattern first
+      //  Changed := True
+      else if TryFuseMulAddFloat(i) then      // FMA patterns
+        Changed := True
+      else if TryFuseArrayLoadAddFloat(i) then
+        Changed := True
+      //else if TryFuseMulMulFloat(i) then
+      //  Changed := True
+      // NOTE: AddSqrtFloat temporarily disabled - conflicts with other patterns
+      //else if TryFuseAddSqrtFloat(i) then
+      //  Changed := True
+      // TEMPORARILY DISABLED - bug investigation
+      //else if TryFuseArrayLoadBranchInt(i) then
+      //  Changed := True
+      ;
+
+      Inc(i);
+    end;
+  until (not Changed) or (Pass > 10);  // Safety limit
+
+  Result := FFusedCount;
+end;
+
+function RunSuperinstructions(AProgram: TBytecodeProgram): Integer;
+var
+  Optimizer: TSuperinstructionOptimizer;
+begin
+  Optimizer := TSuperinstructionOptimizer.Create(AProgram);
+  try
+    Result := Optimizer.Run;
+  finally
+    Optimizer.Free;
+  end;
+end;
+
+end.
