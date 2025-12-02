@@ -25,7 +25,23 @@ The interpreter features a complete compilation pipeline: Lexer, Parser, SSA IR 
 
 ### Windows
 
-Run the setup script from PowerShell:
+#### PowerShell Execution Policy
+
+Windows may block PowerShell scripts by default. To run the setup script, you have two options:
+
+**Option 1: Run with bypass (recommended for first run)**
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+```
+
+**Option 2: Set execution policy permanently for current user**
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
+After running `setup.ps1`, all other PowerShell scripts in the project will be automatically unblocked.
+
+#### Running the Setup
 
 ```powershell
 # Full setup: download FPC and compile SedaiBasic2
@@ -38,6 +54,7 @@ Run the setup script from PowerShell:
 This will:
 1. Download and install Free Pascal Compiler (FPC) 3.2.2 locally
 2. Compile SedaiBasic2 (`sb.exe`)
+3. Unblock all other PowerShell scripts in the project
 
 #### Setup Options
 

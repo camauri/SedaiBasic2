@@ -463,6 +463,15 @@ function Invoke-Setup {
         }
     }
 
+    # Unblock all PowerShell scripts in the project
+    $scripts = Get-ChildItem -Path $ProjectRoot -Filter "*.ps1" -Recurse -ErrorAction SilentlyContinue
+    if ($scripts) {
+        foreach ($script in $scripts) {
+            Unblock-File -Path $script.FullName -ErrorAction SilentlyContinue
+        }
+        Show-Status "Unblocked $($scripts.Count) PowerShell script(s)" -Type "Success"
+    }
+
     # Done!
     $exePath = Join-Path $ProjectRoot "$BinDir\$OutputExe"
     $mode = if ($FpcOnly) { "fpc" } elseif ($BuildOnly) { "build" } else { "full" }
