@@ -59,6 +59,10 @@ $Script:SourceFile = "src\SedaiBasicVM.lpr"
 $Script:BinDir = "bin\$FpcArch"
 $Script:LibDir = "lib\$FpcArch"
 
+# Python runtime paths
+$Script:PythonDir = Join-Path $ProjectRoot "benchmarks\runtime\python"
+$Script:PythonExe = Join-Path $PythonDir "python.exe"
+
 # ============================================================================
 #  DISPLAY FUNCTIONS
 # ============================================================================
@@ -269,6 +273,51 @@ function Test-FpcInstallation {
     }
 }
 
+function Test-PythonInstallation {
+    if (!(Test-Path $PythonExe)) {
+        return $false
+    }
+
+    try {
+        $version = & $PythonExe --version 2>&1
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Install-Python {
+    $installScript = Join-Path $ProjectRoot "scripts\windows\install-python.ps1"
+
+    if (!(Test-Path $installScript)) {
+        Show-Status "Python install script not found: $installScript" -Type "Error"
+        return $false
+    }
+
+    Show-Status "Running Python installer..."
+
+    $params = @{}
+    if ($ForcePython) { $params["Force"] = $true }
+
+    & $installScript @params
+    $exitCode = $LASTEXITCODE
+
+    switch ($exitCode) {
+        0 {
+            Show-Status "Python installed successfully" -Type "Success"
+            return $true
+        }
+        5 {
+            Show-Status "Python already installed" -Type "Success"
+            return $true
+        }
+        default {
+            Show-Status "Python installation failed (exit code: $exitCode)" -Type "Error"
+            return $false
+        }
+    }
+}
+
 function Initialize-BuildDirs {
     $binPath = Join-Path $ProjectRoot $BinDir
     $libPath = Join-Path $ProjectRoot $LibDir
@@ -399,10 +448,12 @@ function Invoke-Setup {
     # Determine steps
     $doFpc = -not $BuildOnly
     $doBuild = -not $FpcOnly
+    $doPython = -not $FpcOnly  # Install Python runtime unless FpcOnly
 
     $totalSteps = 0
     if ($doFpc) { $totalSteps += 2 }  # Install + Verify
     if ($doBuild) { $totalSteps += 1 }  # Build
+    if ($doPython) { $totalSteps += 1 }  # Python runtime
 
     $currentStep = 0
 
@@ -460,6 +511,21 @@ function Invoke-Setup {
         if (!(Build-SedaiBasic)) {
             Show-Summary -Success $false
             return 1
+        }
+    }
+
+    # Step: Install Python runtime
+    if ($doPython) {
+        $currentStep++
+        Show-Step -Number $currentStep -Total $totalSteps -Title "Installing Python Runtime"
+
+        if (Test-PythonInstallation) {
+            Show-Status "Python 3.13 is already installed" -Type "Skip"
+        } else {
+            if (!(Install-Python)) {
+                Show-Status "Python installation failed (benchmarks will not work)" -Type "Warning"
+                # Don't fail the setup, just warn
+            }
         }
     }
 
