@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-    Downloads and installs Free Pascal 3.2.2 x86_64 for Windows
+    Downloads and installs Python 3.13 portable for Windows
 
 .DESCRIPTION
-    This script downloads FPC 3.2.2 from the SedaiBasic2-Deps repository
-    and extracts it to the fpc/ subfolder of the project root.
+    This script downloads Python 3.13 portable from the SedaiBasic2-Deps repository
+    and extracts it to the benchmarks/runtime/python subfolder of the project root.
 
     Exit codes:
         0 = Success
@@ -12,10 +12,10 @@
         2 = Extraction error
         3 = File corrupted (hash mismatch)
         4 = Insufficient disk space
-        5 = FPC already installed (skipped)
+        5 = Python already installed (skipped)
 
 .PARAMETER Force
-    Overwrite existing FPC installation
+    Overwrite existing Python installation
 
 .PARAMETER SkipVerify
     Skip SHA256 hash verification
@@ -24,10 +24,10 @@
     Minimal output (for use from other scripts)
 
 .EXAMPLE
-    .\install-fpc.ps1
+    .\install-python.ps1
 
 .EXAMPLE
-    .\install-fpc.ps1 -Force -Quiet
+    .\install-python.ps1 -Force -Quiet
 #>
 
 param(
@@ -45,20 +45,19 @@ $EXIT_DISK_SPACE = 4
 $EXIT_ALREADY_INSTALLED = 5
 
 # Configuration
-$FPC_VERSION = "3.2.2"
-$FPC_ARCH = "x86_64-win64"
-$DOWNLOAD_URL = "https://github.com/camauri/SedaiBasic2-Deps/releases/download/fpc-3.2.2-x86_64-win64/fpc-3.2.2-x86_64-win64.zip"
-$EXPECTED_HASH = "bb4fb67ac9f533bae15479307bac6eaaaae3b1799f7f8064bef04b430b8ae99a"
-$REQUIRED_SPACE_MB = 500  # Approximate space needed
+$PYTHON_VERSION = "3.13"
+$DOWNLOAD_URL = "https://github.com/camauri/SedaiBasic2-Deps/releases/download/python-3.13.5-win64/python.zip"
+$EXPECTED_HASH = "c96accb74322d7876e1d1d26c902f30bc3db233d7d2002de116a44e5b8940665"
+$REQUIRED_SPACE_MB = 100  # Approximate space needed
 
 # Determine paths
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = (Get-Item "$ScriptDir\..\..").FullName
-$FpcDir = Join-Path $ProjectRoot "fpc\$FPC_VERSION"
-$FpcExe = Join-Path $FpcDir "bin\x86_64-win64\fpc.exe"
-$FpcRootDir = Join-Path $ProjectRoot "fpc"
-$TempDir = Join-Path $env:TEMP "fpc-install"
-$ZipFile = Join-Path $TempDir "fpc-$FPC_VERSION-$FPC_ARCH.zip"
+$PythonDir = Join-Path $ProjectRoot "benchmarks\runtime\python"
+$PythonExe = Join-Path $PythonDir "python.exe"
+$RuntimeDir = Join-Path $ProjectRoot "benchmarks\runtime"
+$TempDir = Join-Path $env:TEMP "python-install"
+$ZipFile = Join-Path $TempDir "python-$PYTHON_VERSION-portable.zip"
 
 # Import utilities
 $UtilsPath = Join-Path $ScriptDir "..\lib\download-utils.ps1"
@@ -92,22 +91,22 @@ function Write-Error {
 }
 
 # Main installation logic
-function Install-FPC {
+function Install-Python {
     Write-Status "============================================" -Color Cyan
-    Write-Status "  Free Pascal $FPC_VERSION Installer" -Color Cyan
-    Write-Status "  Target: $FPC_ARCH" -Color Cyan
+    Write-Status "  Python $PYTHON_VERSION Portable Installer" -Color Cyan
+    Write-Status "  Target: x86_64-win64" -Color Cyan
     Write-Status "============================================" -Color Cyan
 
     # Step 1: Check if already installed
     Write-Step "Checking existing installation..."
 
-    if (Test-Path $FpcExe) {
+    if (Test-Path $PythonExe) {
         if ($Force) {
             Write-Status "Existing installation found. -Force specified, will reinstall." -Color Yellow
             Write-Status "Removing existing installation..." -Color Yellow
-            Remove-Item -Path $FpcRootDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path $PythonDir -Recurse -Force -ErrorAction SilentlyContinue
         } else {
-            Write-Success "FPC $FPC_VERSION already installed at: $FpcDir"
+            Write-Success "Python $PYTHON_VERSION already installed at: $PythonDir"
             Write-Status "Use -Force to reinstall." -Color Yellow
             return $EXIT_ALREADY_INSTALLED
         }
@@ -142,8 +141,13 @@ function Install-FPC {
         New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
     }
 
+    # Ensure runtime directory exists
+    if (!(Test-Path $RuntimeDir)) {
+        New-Item -ItemType Directory -Path $RuntimeDir -Force | Out-Null
+    }
+
     # Step 5: Download
-    Write-Step "Downloading FPC $FPC_VERSION..."
+    Write-Step "Downloading Python $PYTHON_VERSION..."
     Write-Status "URL: $DOWNLOAD_URL" -Color Gray
 
     $downloadResult = Get-FileWithProgress -Url $DOWNLOAD_URL -OutFile $ZipFile -Quiet:$Quiet
@@ -170,10 +174,10 @@ function Install-FPC {
         Write-Status "Hash verification skipped (-SkipVerify)" -Color Yellow
     }
 
-    # Step 7: Extract (zip contains fpc/3.2.2/... so extract to project root)
-    Write-Step "Extracting to: $FpcRootDir"
+    # Step 7: Extract
+    Write-Step "Extracting to: $PythonDir"
 
-    $extractResult = Expand-ArchiveWithProgress -Path $ZipFile -DestinationPath $ProjectRoot -Quiet:$Quiet
+    $extractResult = Expand-ArchiveWithProgress -Path $ZipFile -DestinationPath $RuntimeDir -Quiet:$Quiet
     if ($extractResult.Status -ne 0) {
         Write-Error $extractResult.Message
         return $EXIT_EXTRACTION_ERROR
@@ -183,25 +187,24 @@ function Install-FPC {
     # Step 8: Verify installation
     Write-Step "Verifying installation..."
 
-    if (!(Test-Path $FpcExe)) {
+    if (!(Test-Path $PythonExe)) {
         # Check if files are in a subdirectory
-        $possibleExe = Get-ChildItem -Path $FpcDir -Recurse -Filter "fpc.exe" | Select-Object -First 1
+        $possibleExe = Get-ChildItem -Path $RuntimeDir -Recurse -Filter "python.exe" | Select-Object -First 1
         if ($possibleExe) {
-            Write-Status "Found fpc.exe at: $($possibleExe.FullName)" -Color Gray
-            # Files might be nested, that's ok
-            $FpcExe = $possibleExe.FullName
+            Write-Status "Found python.exe at: $($possibleExe.FullName)" -Color Gray
+            $PythonExe = $possibleExe.FullName
         } else {
-            Write-Error "fpc.exe not found after extraction"
+            Write-Error "python.exe not found after extraction"
             return $EXIT_EXTRACTION_ERROR
         }
     }
 
-    # Test FPC works
+    # Test Python works
     try {
-        $version = & $FpcExe -iV 2>&1
-        Write-Success "FPC responds: $version"
+        $version = & $PythonExe --version 2>&1
+        Write-Success "Python responds: $version"
     } catch {
-        Write-Error "FPC installed but not responding: $_"
+        Write-Error "Python installed but not responding: $_"
         return $EXIT_EXTRACTION_ERROR
     }
 
@@ -212,14 +215,14 @@ function Install-FPC {
 
     # Done
     Write-Status "`n============================================" -Color Green
-    Write-Success "  FPC $FPC_VERSION installed successfully!"
-    Write-Status "  Location: $FpcDir" -Color Green
-    Write-Status "  Compiler: $FpcExe" -Color Green
+    Write-Success "  Python $PYTHON_VERSION installed successfully!"
+    Write-Status "  Location: $PythonDir" -Color Green
+    Write-Status "  Executable: $PythonExe" -Color Green
     Write-Status "============================================" -Color Green
 
     return $EXIT_SUCCESS
 }
 
 # Run installation
-$exitCode = Install-FPC
+$exitCode = Install-Python
 exit $exitCode
