@@ -531,13 +531,10 @@ begin
    PrintASTTree(Node.Child[i], Indent + 1, TokenList);
 end;
 
-{ Format time with smart scaling:
-  < 0.001ms (< 1µs):  nanoseconds
-  0.001-1ms:          microseconds with 2 decimals
-  1-60000ms:          milliseconds with 3 decimals
-  60000-120000ms:     milliseconds + (seconds in parentheses)
-  120000-300000ms:    seconds + (hh:mm:ss.nnn in parentheses)
-  > 300000ms:         hh:mm:ss.nnn directly
+{ Format time: always ms with 3 decimals, plus human-readable conversion in parentheses
+  < 1ms:        ms (with µs or ns conversion)
+  1-60000ms:    ms only (no parentheses needed)
+  > 60000ms:    ms (with hh:mm:ss.nnn conversion)
 }
 function FormatTimeEx(TimeMs: Double): string;
 var
@@ -547,47 +544,35 @@ var
 begin
   if TimeMs < 0.001 then
   begin
-    // Less than 1µs -> nanoseconds
+    // Less than 1µs -> show ns conversion
     TimeNs := TimeMs * 1000000.0;
-    Result := Format('%.0f ns', [TimeNs]);
+    Result := Format('%.3f ms (%.0f ns)', [TimeMs, TimeNs]);
   end
   else if TimeMs < 1.0 then
   begin
-    // 1µs to 1ms -> microseconds
+    // 1µs to 1ms -> show µs conversion
     TimeUs := TimeMs * 1000.0;
-    Result := Format('%.2f µs', [TimeUs]);
+    Result := Format('%.3f ms (%.2f µs)', [TimeMs, TimeUs]);
   end
   else if TimeMs < 60000.0 then
   begin
-    // 1ms to 60s -> milliseconds with 3 decimals
+    // 1ms to 60s -> milliseconds only (no conversion needed)
     Result := Format('%.3f ms', [TimeMs]);
-  end
-  else if TimeMs < 120000.0 then
-  begin
-    // 1-2 minutes -> ms + (seconds)
-    Seconds := TimeMs / 1000.0;
-    Result := Format('%.3f ms (%.2f seconds)', [TimeMs, Seconds]);
-  end
-  else if TimeMs < 300000.0 then
-  begin
-    // 2-5 minutes -> seconds + (hh:mm:ss.nnn)
-    Seconds := TimeMs / 1000.0;
-    Hours := Trunc(Seconds) div 3600;
-    Minutes := (Trunc(Seconds) mod 3600) div 60;
-    Secs := Trunc(Seconds) mod 60;
-    Millis := Round((Seconds - Trunc(Seconds)) * 1000);
-    Result := Format('%.2f seconds (%02d:%02d:%02d.%03d)',
-      [Seconds, Hours, Minutes, Secs, Millis]);
   end
   else
   begin
-    // > 5 minutes -> hh:mm:ss.nnn directly
+    // > 60s -> show hh:mm:ss.nnn conversion
     Seconds := TimeMs / 1000.0;
     Hours := Trunc(Seconds) div 3600;
     Minutes := (Trunc(Seconds) mod 3600) div 60;
     Secs := Trunc(Seconds) mod 60;
     Millis := Round((Seconds - Trunc(Seconds)) * 1000);
-    Result := Format('%02d:%02d:%02d.%03d', [Hours, Minutes, Secs, Millis]);
+    Result := Format('%.3f ms (%s:%s:%s.%s)',
+      [TimeMs,
+       FormatFloat('00', Hours),
+       FormatFloat('00', Minutes),
+       FormatFloat('00', Secs),
+       FormatFloat('000', Millis)]);
   end;
 end;
 

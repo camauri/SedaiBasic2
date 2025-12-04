@@ -9,6 +9,7 @@
     - spectral-norm
 
     Results are saved to BENCHMARKS.md
+    Run times are accumulated in a history file for cumulative statistics.
 
     Copyright (c) 2025 Maurizio Cammalleri
     Released under GNU GPL v3
@@ -20,7 +21,18 @@
     Quick test mode: use N values from source files instead of standard benchmark values
 
 .PARAMETER Runs
-    Number of runs per benchmark for averaging (default: 1)
+    Number of runs per benchmark in this session (default: 1)
+    Results are accumulated with previous runs for statistics.
+
+.PARAMETER ClearHistory
+    Clear all accumulated benchmark history and start fresh
+
+.PARAMETER Report
+    Generate markdown report from existing history without running benchmarks.
+    Exits with error if no history data exists.
+
+.PARAMETER Output
+    Custom output filename for the results (default: BENCHMARKS.md)
 
 .EXAMPLE
     .\benchmark.ps1
@@ -30,12 +42,24 @@
 
 .EXAMPLE
     .\benchmark.ps1 -Runs 3
+
+.EXAMPLE
+    .\benchmark.ps1 -ClearHistory
+
+.EXAMPLE
+    .\benchmark.ps1 -Report
+
+.EXAMPLE
+    .\benchmark.ps1 -Output "results.md"
 #>
 
 param(
     [switch]$Help,
     [switch]$Force,
     [switch]$Quick,
+    [switch]$ClearHistory,
+    [switch]$Report,
+    [string]$Output = "",
     [int]$Runs = 1
 )
 
@@ -45,8 +69,12 @@ param(
 
 $Script:ProjectRoot = $PSScriptRoot
 $Script:TempDir = Join-Path $ProjectRoot ".benchmark_temp"
+$Script:DataDir = Join-Path $ProjectRoot ".benchmark_data"
 $Script:StatusFile = Join-Path $TempDir "status.json"
-$Script:ResultsFile = Join-Path $ProjectRoot "BENCHMARKS.md"
+$Script:HistoryFile = Join-Path $DataDir "history.json"       # Permanent - cumulative data
+$Script:PendingFile = Join-Path $DataDir "pending.json"       # Permanent - incomplete session
+$Script:DefaultResultsFile = "BENCHMARKS.md"
+$Script:ResultsFile = Join-Path $ProjectRoot $DefaultResultsFile
 $Script:SbExe = Join-Path $ProjectRoot "bin\x86_64-win64\sb.exe"
 
 # Benchmark configurations
@@ -124,7 +152,20 @@ function Show-Help {
     Write-Host "    -Help           Show this help message"
     Write-Host "    -Force          Force re-run of all benchmarks, ignoring previous results"
     Write-Host "    -Quick          Use N values from source files (fast test mode)"
-    Write-Host "    -Runs <n>       Number of runs per benchmark for averaging (default: 1)"
+    Write-Host "    -Runs <n>       Number of runs per benchmark in this session (default: 1)"
+    Write-Host "    -ClearHistory   Clear accumulated benchmark history and start fresh"
+    Write-Host "    -Report         Generate report from existing history (no benchmark run)"
+    Write-Host "    -Output <file>  Custom output filename (default: BENCHMARKS.md)"
+    Write-Host ""
+    Write-Host "CUMULATIVE STATISTICS:" -ForegroundColor Yellow
+    Write-Host "    Each run is saved to a history file. Statistics (mean, median, stddev,"
+    Write-Host "    percentiles) are calculated using ALL accumulated runs over time."
+    Write-Host "    Run the benchmark multiple times to build reliable statistics."
+    Write-Host "    Runs are only added to history when ALL 3 benchmarks complete successfully."
+    Write-Host ""
+    Write-Host "SESSION RESUME:" -ForegroundColor Yellow
+    Write-Host "    If a session was interrupted, the next run will automatically resume"
+    Write-Host "    from where it left off, running only the incomplete benchmarks."
     Write-Host ""
     Write-Host "BENCHMARKS:" -ForegroundColor Yellow
     Write-Host "    fannkuch-redux  Indexed-access to tiny integer-sequence (N=12)"
@@ -135,13 +176,16 @@ function Show-Help {
     Write-Host "    Use -Quick to run with N values from source files instead."
     Write-Host ""
     Write-Host "EXAMPLES:" -ForegroundColor Yellow
-    Write-Host "    .\benchmark.ps1              # Run with standard N values"
-    Write-Host "    .\benchmark.ps1 -Quick       # Run with N from source files"
-    Write-Host "    .\benchmark.ps1 -Runs 3      # Run each benchmark 3 times"
-    Write-Host "    .\benchmark.ps1 -Force       # Re-run all, ignore cached results"
+    Write-Host "    .\benchmark.ps1                # Run once, accumulate results"
+    Write-Host "    .\benchmark.ps1 -Runs 3        # Run 3 times, accumulate results"
+    Write-Host "    .\benchmark.ps1 -Quick         # Run with N from source files"
+    Write-Host "    .\benchmark.ps1 -Force         # Re-run all, ignore cached session"
+    Write-Host "    .\benchmark.ps1 -ClearHistory  # Reset all accumulated data"
+    Write-Host "    .\benchmark.ps1 -Report        # Generate report from history only"
+    Write-Host "    .\benchmark.ps1 -Output out.md # Use custom output filename"
     Write-Host ""
     Write-Host "OUTPUT:" -ForegroundColor Yellow
-    Write-Host "    Results are saved to BENCHMARKS.md and displayed on screen."
+    Write-Host "    Results are saved to BENCHMARKS.md (or custom file) and displayed on screen."
     Write-Host ""
 }
 
@@ -277,6 +321,242 @@ function Save-BenchmarkStatus {
     $Status | ConvertTo-Json -Depth 10 | Set-Content $StatusFile -Encoding UTF8
 }
 
+# ============================================================================
+#  HISTORY MANAGEMENT (cumulative results)
+# ============================================================================
+
+function Get-BenchmarkHistory {
+    if (!(Test-Path $HistoryFile)) {
+        return @{}
+    }
+    try {
+        $content = Get-Content $HistoryFile -Raw
+        $json = $content | ConvertFrom-Json
+        $result = @{}
+        foreach ($prop in $json.PSObject.Properties) {
+            # Convert array of PSCustomObjects to array of hashtables
+            $runs = @()
+            foreach ($run in $prop.Value) {
+                $runs += @{
+                    Time = $run.Time
+                    Instructions = $run.Instructions
+                    N = $run.N
+                    Timestamp = $run.Timestamp
+                }
+            }
+            $result[$prop.Name] = $runs
+        }
+        return $result
+    } catch {
+        return @{}
+    }
+}
+
+function Save-BenchmarkHistory {
+    param([hashtable]$History)
+    $History | ConvertTo-Json -Depth 10 | Set-Content $HistoryFile -Encoding UTF8
+}
+
+function Add-RunToHistory {
+    param(
+        [string]$Name,
+        [int]$N,
+        [double]$Time,
+        [long]$Instructions
+    )
+
+    $history = Get-BenchmarkHistory
+    if (-not $history.ContainsKey($Name)) {
+        $history[$Name] = @()
+    }
+
+    # Add new run
+    $history[$Name] += @{
+        Time = $Time
+        Instructions = $Instructions
+        N = $N
+        Timestamp = (Get-Date).ToString("o")
+    }
+
+    Save-BenchmarkHistory $history
+    return $history[$Name].Count
+}
+
+function Get-HistoryTimes {
+    param(
+        [string]$Name,
+        [int]$N
+    )
+
+    $history = Get-BenchmarkHistory
+    if (-not $history.ContainsKey($Name)) {
+        return @()
+    }
+
+    # Filter by N value and extract times
+    $times = @()
+    foreach ($run in $history[$Name]) {
+        if ($run.N -eq $N) {
+            $times += $run.Time
+        }
+    }
+    return $times
+}
+
+function Clear-BenchmarkHistory {
+    param([string]$Name = $null)
+
+    if ($Name) {
+        $history = Get-BenchmarkHistory
+        if ($history.ContainsKey($Name)) {
+            $history.Remove($Name)
+            Save-BenchmarkHistory $history
+        }
+    } else {
+        if (Test-Path $HistoryFile) {
+            Remove-Item $HistoryFile -Force
+        }
+    }
+}
+
+# ============================================================================
+#  PENDING SESSION MANAGEMENT
+#  Runs are stored in pending until ALL 3 benchmarks complete successfully
+# ============================================================================
+
+function Get-PendingSession {
+    if (!(Test-Path $PendingFile)) {
+        return $null
+    }
+    try {
+        $content = Get-Content $PendingFile -Raw
+        $json = $content | ConvertFrom-Json
+        $result = @{
+            QuickMode = $json.QuickMode
+            Runs = $json.Runs
+            Completed = @{}
+            PendingRuns = @{}
+        }
+        # Convert Completed benchmarks
+        if ($json.Completed) {
+            foreach ($prop in $json.Completed.PSObject.Properties) {
+                $result.Completed[$prop.Name] = $prop.Value
+            }
+        }
+        # Convert PendingRuns (runs waiting to be committed to history)
+        if ($json.PendingRuns) {
+            foreach ($prop in $json.PendingRuns.PSObject.Properties) {
+                $runs = @()
+                foreach ($run in $prop.Value) {
+                    $runs += @{
+                        Time = $run.Time
+                        Instructions = $run.Instructions
+                        N = $run.N
+                        Timestamp = $run.Timestamp
+                    }
+                }
+                $result.PendingRuns[$prop.Name] = $runs
+            }
+        }
+        return $result
+    } catch {
+        return $null
+    }
+}
+
+function Save-PendingSession {
+    param([hashtable]$Session)
+    $Session | ConvertTo-Json -Depth 10 | Set-Content $PendingFile -Encoding UTF8
+}
+
+function Clear-PendingSession {
+    if (Test-Path $PendingFile) {
+        Remove-Item $PendingFile -Force
+    }
+}
+
+function Add-PendingRun {
+    param(
+        [string]$Name,
+        [int]$N,
+        [double]$Time,
+        [long]$Instructions,
+        [bool]$QuickMode,
+        [int]$RunCount
+    )
+
+    $session = Get-PendingSession
+    if (-not $session) {
+        $session = @{
+            QuickMode = $QuickMode
+            Runs = $RunCount
+            Completed = @{}
+            PendingRuns = @{}
+        }
+    }
+
+    # Initialize pending runs array for this benchmark if needed
+    if (-not $session.PendingRuns.ContainsKey($Name)) {
+        $session.PendingRuns[$Name] = @()
+    }
+
+    # Add the run to pending
+    $session.PendingRuns[$Name] += @{
+        Time = $Time
+        Instructions = $Instructions
+        N = $N
+        Timestamp = (Get-Date).ToString("o")
+    }
+
+    Save-PendingSession $session
+}
+
+function Set-PendingBenchmarkComplete {
+    param([string]$Name)
+
+    $session = Get-PendingSession
+    if ($session) {
+        $session.Completed[$Name] = $true
+        Save-PendingSession $session
+    }
+}
+
+function Test-SessionComplete {
+    param([hashtable]$Session)
+
+    if (-not $Session) { return $false }
+
+    # Check if all 3 benchmarks are marked as completed
+    $allComplete = $true
+    foreach ($bench in $Benchmarks) {
+        if (-not $Session.Completed.ContainsKey($bench.Name) -or -not $Session.Completed[$bench.Name]) {
+            $allComplete = $false
+            break
+        }
+    }
+    return $allComplete
+}
+
+function Commit-PendingToHistory {
+    # Move all pending runs to permanent history
+    $session = Get-PendingSession
+    if (-not $session) { return }
+
+    $history = Get-BenchmarkHistory
+
+    foreach ($benchName in $session.PendingRuns.Keys) {
+        if (-not $history.ContainsKey($benchName)) {
+            $history[$benchName] = @()
+        }
+        foreach ($run in $session.PendingRuns[$benchName]) {
+            $history[$benchName] += $run
+        }
+    }
+
+    Save-BenchmarkHistory $history
+    Clear-PendingSession
+}
+
 function Set-BenchmarkResult {
     param(
         [string]$Name,
@@ -402,9 +682,27 @@ function Run-SingleBenchmark {
         [string]$TempFile
     )
 
-    # Run with --stats to get execution statistics
-    $output = & $SbExe $TempFile --stats 2>&1 | Out-String
-    $exitCode = $LASTEXITCODE
+    # Simple and reliable: run process and capture output via cmd /c redirection
+    # This works correctly for long-running processes and allows CTRL+C interruption
+    $stdoutFile = Join-Path $TempDir "stdout_$([System.IO.Path]::GetRandomFileName()).txt"
+    $stderrFile = Join-Path $TempDir "stderr_$([System.IO.Path]::GetRandomFileName()).txt"
+
+    try {
+        # Use cmd /c to run with output redirection - this properly waits and captures output
+        $cmdArgs = "`"$SbExe`" `"$TempFile`" --stats > `"$stdoutFile`" 2> `"$stderrFile`""
+        $processResult = cmd /c $cmdArgs
+        $exitCode = $LASTEXITCODE
+
+        # Read captured output
+        $stdout = if (Test-Path $stdoutFile) { Get-Content $stdoutFile -Raw -ErrorAction SilentlyContinue } else { "" }
+        $stderr = if (Test-Path $stderrFile) { Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue } else { "" }
+        $output = "$stdout`n$stderr"
+    }
+    finally {
+        # Clean up temp files
+        if (Test-Path $stdoutFile) { Remove-Item $stdoutFile -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $stderrFile) { Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue }
+    }
 
     $result = @{
         Success = ($exitCode -eq 0)
@@ -416,18 +714,10 @@ function Run-SingleBenchmark {
     }
 
     if ($result.Success) {
-        # Parse execution time - format: "Execution time: <value> <unit>"
-        # Units: s = seconds, ms = milliseconds, ns = nanoseconds, anything else = microseconds
-        if ($output -match "Execution time:\s+([\d.]+)\s*(\S+)") {
-            $timeValue = [double]$Matches[1]
-            $timeUnit = $Matches[2]
-
-            switch -Regex ($timeUnit) {
-                "^s$"   { $result.ExecutionTime = $timeValue }                      # seconds
-                "^ms$"  { $result.ExecutionTime = $timeValue / 1000.0 }             # milliseconds
-                "^ns$"  { $result.ExecutionTime = $timeValue / 1000000000.0 }       # nanoseconds
-                default { $result.ExecutionTime = $timeValue / 1000000.0 }          # microseconds (µs, μs, etc.)
-            }
+        # Parse execution time - format is always: "X.XXX ms" or "X.XXX ms (human readable)"
+        # The value is always in milliseconds with 3 decimal places
+        if ($output -match "Execution time:\s+([\d.]+)\s+ms") {
+            $result.ExecutionTime = [double]$Matches[1] / 1000.0  # ms -> seconds
         }
 
         # Parse instruction count
@@ -454,10 +744,17 @@ function Run-Benchmark {
     $benchFile = Get-BenchmarkFile -Benchmark $Benchmark -QuickMode $QuickMode
     $currentN = Get-BenchmarkN -Benchmark $Benchmark -QuickMode $QuickMode
 
+    # Get existing history count (committed runs only)
+    $existingTimes = Get-HistoryTimes -Name $Benchmark.Name -N $currentN
+    $historyCount = $existingTimes.Count
+
     Show-Status "Running $($Benchmark.Name) (N=$currentN)..." -Type "Run"
     Write-Host "       $($Benchmark.Description)" -ForegroundColor DarkGray
+    if ($historyCount -gt 0) {
+        Write-Host "       Historical runs: $historyCount (committed)" -ForegroundColor DarkGray
+    }
 
-    $times = @()
+    $sessionTimes = @()
     $lastResult = $null
 
     for ($i = 1; $i -le $RunCount; $i++) {
@@ -473,8 +770,14 @@ function Run-Benchmark {
             return $false
         }
 
-        $times += $result.ExecutionTime
+        $sessionTimes += $result.ExecutionTime
         $lastResult = $result
+
+        # Add each run to PENDING (not history yet - will commit only if all 3 benchmarks complete)
+        # Skip pending/history in Quick mode - those are just test runs
+        if (-not $QuickMode) {
+            Add-PendingRun -Name $Benchmark.Name -N $currentN -Time $result.ExecutionTime -Instructions $result.Instructions -QuickMode $QuickMode -RunCount $RunCount
+        }
     }
 
     # Clear the progress line
@@ -482,28 +785,42 @@ function Run-Benchmark {
         Write-Host "`r                              `r" -NoNewline
     }
 
-    # Calculate statistics
-    $avgTime = ($times | Measure-Object -Average).Average
-    $minTime = ($times | Measure-Object -Minimum).Minimum
-    $maxTime = ($times | Measure-Object -Maximum).Maximum
-    $medianTime = Get-Median $times
-    $stdDev = Get-StdDev $times
-    $p90 = Get-Percentile $times 90
-    $p95 = Get-Percentile $times 95
-    $p99 = Get-Percentile $times 99
+    # Mark this benchmark as complete in pending session (skip in Quick mode)
+    if (-not $QuickMode) {
+        Set-PendingBenchmarkComplete -Name $Benchmark.Name
+    }
+
+    # For display purposes, use session times only (history times will be added after commit)
+    $avgTime = ($sessionTimes | Measure-Object -Average).Average
+    $minTime = ($sessionTimes | Measure-Object -Minimum).Minimum
+    $maxTime = ($sessionTimes | Measure-Object -Maximum).Maximum
+    $medianTime = Get-Median $sessionTimes
+    $stdDev = Get-StdDev $sessionTimes
+    $p90 = Get-Percentile $sessionTimes 90
+    $p95 = Get-Percentile $sessionTimes 95
+    $p99 = Get-Percentile $sessionTimes 99
 
     # Recalculate MIPS based on average time
     $avgMips = if ($avgTime -gt 0) { $lastResult.Instructions / $avgTime / 1000000 } else { 0 }
 
-    # Save result
+    # Save result with session statistics (for display)
     Set-BenchmarkResult -Name $Benchmark.Name -N $currentN -ExecutionTime $avgTime -Instructions $lastResult.Instructions -Mips $avgMips -Output $lastResult.Output -RunCount $RunCount -MinTime $minTime -MaxTime $maxTime -Median $medianTime -StdDev $stdDev -P90 $p90 -P95 $p95 -P99 $p99
 
-    $timeStr = "{0:F3}s" -f $avgTime
+    $timeStr = "{0:F3} ms" -f ($avgTime * 1000)
     if ($RunCount -gt 1) {
-        $timeStr += " (median: {0:F3}s, stddev: {1:F4}s)" -f $medianTime, $stdDev
+        $timeStr += " (median: {0:F3} ms, stddev: {1:F3} ms)" -f ($medianTime * 1000), ($stdDev * 1000)
     }
     $mipsStr = "{0:F2}" -f $avgMips
-    Show-Status "$($Benchmark.Name) completed in $timeStr ($mipsStr MIPS)" -Type "Success"
+
+    # Show pending status only in Standard mode (Quick mode doesn't save to history)
+    $pendingStr = ""
+    if (-not $QuickMode) {
+        $pendingStr = " [pending commit]"
+        if ($historyCount -gt 0) {
+            $pendingStr = " [+$RunCount pending, $historyCount committed]"
+        }
+    }
+    Show-Status "$($Benchmark.Name) completed in $timeStr ($mipsStr MIPS)$pendingStr" -Type "Success"
 
     return $true
 }
@@ -524,6 +841,16 @@ function Generate-Results {
     $date = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $modeStr = if ($QuickMode) { "Quick (N from source files)" } else { "Standard (Benchmarks Game N values)" }
 
+    # Calculate total runs from status (each benchmark may have different counts)
+    $totalRunsInfo = @()
+    foreach ($bench in $Benchmarks) {
+        $result = $status[$bench.Name]
+        if ($result -and $result.RunCount) {
+            $totalRunsInfo += "$($bench.Name): $($result.RunCount)"
+        }
+    }
+    $runsLine = if ($totalRunsInfo.Count -gt 0) { $totalRunsInfo -join ", " } else { "$RunCount" }
+
     $md = @"
 # SedaiBasic2 Benchmark Results
 
@@ -537,7 +864,7 @@ function Generate-Results {
 
 **Generated:** $date
 **Mode:** $modeStr
-**Runs per benchmark:** $RunCount
+**Total runs:** $runsLine
 
 ## System Information
 
@@ -562,7 +889,7 @@ function Generate-Results {
     foreach ($bench in $Benchmarks) {
         $result = $status[$bench.Name]
         if ($result -and $result.Completed) {
-            $time = "{0:F3} s" -f $result.ExecutionTime
+            $time = "{0:F3} ms" -f ($result.ExecutionTime * 1000)
             $instr = "{0:N0}" -f $result.Instructions
             $mips = "{0:F2}" -f $result.Mips
             $n = "{0:N0}" -f $result.N
@@ -574,25 +901,36 @@ function Generate-Results {
         }
     }
 
+    # Check if any benchmark has multiple runs
+    $hasMultipleRuns = $false
+    foreach ($bench in $Benchmarks) {
+        $result = $status[$bench.Name]
+        if ($result -and $result.RunCount -gt 1) {
+            $hasMultipleRuns = $true
+            break
+        }
+    }
+
     # Add timing details if multiple runs
-    if ($RunCount -gt 1) {
+    if ($hasMultipleRuns) {
         $md += @"
 
 
-### Statistical Analysis (Multiple Runs)
+### Statistical Analysis (Cumulative Runs)
 
-| Benchmark | Mean | Median | Std Dev | Min | Max |
-|-----------|-----:|-------:|--------:|----:|----:|
+| Benchmark | Runs | Mean | Median | Std Dev | Min | Max |
+|-----------|-----:|-----:|-------:|--------:|----:|----:|
 "@
         foreach ($bench in $Benchmarks) {
             $result = $status[$bench.Name]
             if ($result -and $result.Completed -and $result.RunCount -gt 1) {
-                $mean = "{0:F3} s" -f $result.ExecutionTime
-                $median = "{0:F3} s" -f $result.Median
-                $stddev = "{0:F4} s" -f $result.StdDev
-                $min = "{0:F3} s" -f $result.MinTime
-                $max = "{0:F3} s" -f $result.MaxTime
-                $md += "`n| $($bench.Name) | $mean | $median | $stddev | $min | $max |"
+                $runs = $result.RunCount
+                $mean = "{0:F3} ms" -f ($result.ExecutionTime * 1000)
+                $median = "{0:F3} ms" -f ($result.Median * 1000)
+                $stddev = "{0:F3} ms" -f ($result.StdDev * 1000)
+                $min = "{0:F3} ms" -f ($result.MinTime * 1000)
+                $max = "{0:F3} ms" -f ($result.MaxTime * 1000)
+                $md += "`n| $($bench.Name) | $runs | $mean | $median | $stddev | $min | $max |"
             }
         }
 
@@ -607,9 +945,9 @@ function Generate-Results {
         foreach ($bench in $Benchmarks) {
             $result = $status[$bench.Name]
             if ($result -and $result.Completed -and $result.RunCount -gt 1) {
-                $p90 = "{0:F3} s" -f $result.P90
-                $p95 = "{0:F3} s" -f $result.P95
-                $p99 = "{0:F3} s" -f $result.P99
+                $p90 = "{0:F3} ms" -f ($result.P90 * 1000)
+                $p95 = "{0:F3} ms" -f ($result.P95 * 1000)
+                $p99 = "{0:F3} ms" -f ($result.P99 * 1000)
                 $md += "`n| $($bench.Name) | $p90 | $p95 | $p99 |"
             }
         }
@@ -640,7 +978,8 @@ function Generate-Results {
 "@
 
     $md | Set-Content $ResultsFile -Encoding UTF8
-    Show-Status "Results saved to BENCHMARKS.md" -Type "Success"
+    $outputFileName = [System.IO.Path]::GetFileName($ResultsFile)
+    Show-Status "Results saved to $outputFileName" -Type "Success"
 
     # Display results on screen
     Write-Host ""
@@ -654,13 +993,13 @@ function Generate-Results {
     Write-Host ""
 
     # Display results table
-    Write-Host ("  {0,-18} {1,12} {2,14} {3,16} {4,12}" -f "Benchmark", "N", "Time (s)", "Instructions", "MIPS") -ForegroundColor Cyan
+    Write-Host ("  {0,-18} {1,12} {2,14} {3,16} {4,12}" -f "Benchmark", "N", "Time (ms)", "Instructions", "MIPS") -ForegroundColor Cyan
     Write-Host ("  {0,-18} {1,12} {2,14} {3,16} {4,12}" -f ("-" * 18), ("-" * 12), ("-" * 14), ("-" * 16), ("-" * 12)) -ForegroundColor DarkGray
 
     foreach ($bench in $Benchmarks) {
         $result = $status[$bench.Name]
         if ($result -and $result.Completed) {
-            $time = "{0:F3}" -f $result.ExecutionTime
+            $time = "{0:F3}" -f ($result.ExecutionTime * 1000)
             $instr = "{0:N0}" -f $result.Instructions
             $mips = "{0:F2}" -f $result.Mips
             $n = "{0:N0}" -f $result.N
@@ -672,38 +1011,39 @@ function Generate-Results {
         }
     }
 
-    # Display statistical analysis if multiple runs
-    if ($RunCount -gt 1) {
+    # Display statistical analysis if any benchmark has multiple runs
+    if ($hasMultipleRuns) {
         Write-Host ""
         Write-Host "  ============================================================" -ForegroundColor Cyan
-        Write-Host "  STATISTICAL ANALYSIS" -ForegroundColor Yellow
+        Write-Host "  STATISTICAL ANALYSIS (Cumulative Runs)" -ForegroundColor Yellow
         Write-Host "  ============================================================" -ForegroundColor Cyan
         Write-Host ""
-        Write-Host ("  {0,-18} {1,10} {2,10} {3,10} {4,10} {5,10}" -f "Benchmark", "Mean", "Median", "Std Dev", "Min", "Max") -ForegroundColor Cyan
-        Write-Host ("  {0,-18} {1,10} {2,10} {3,10} {4,10} {5,10}" -f ("-" * 18), ("-" * 10), ("-" * 10), ("-" * 10), ("-" * 10), ("-" * 10)) -ForegroundColor DarkGray
+        Write-Host ("  {0,-18} {1,6} {2,10} {3,10} {4,10} {5,10} {6,10}" -f "Benchmark", "Runs", "Mean(ms)", "Med(ms)", "StdDev", "Min(ms)", "Max(ms)") -ForegroundColor Cyan
+        Write-Host ("  {0,-18} {1,6} {2,10} {3,10} {4,10} {5,10} {6,10}" -f ("-" * 18), ("-" * 6), ("-" * 10), ("-" * 10), ("-" * 10), ("-" * 10), ("-" * 10)) -ForegroundColor DarkGray
 
         foreach ($bench in $Benchmarks) {
             $result = $status[$bench.Name]
             if ($result -and $result.Completed -and $result.RunCount -gt 1) {
-                $mean = "{0:F3}s" -f $result.ExecutionTime
-                $median = "{0:F3}s" -f $result.Median
-                $stddev = "{0:F4}s" -f $result.StdDev
-                $min = "{0:F3}s" -f $result.MinTime
-                $max = "{0:F3}s" -f $result.MaxTime
-                Write-Host ("  {0,-18} {1,10} {2,10} {3,10} {4,10} {5,10}" -f $bench.Name, $mean, $median, $stddev, $min, $max) -ForegroundColor White
+                $runs = $result.RunCount
+                $mean = "{0:F3}" -f ($result.ExecutionTime * 1000)
+                $median = "{0:F3}" -f ($result.Median * 1000)
+                $stddev = "{0:F3}" -f ($result.StdDev * 1000)
+                $min = "{0:F3}" -f ($result.MinTime * 1000)
+                $max = "{0:F3}" -f ($result.MaxTime * 1000)
+                Write-Host ("  {0,-18} {1,6} {2,10} {3,10} {4,10} {5,10} {6,10}" -f $bench.Name, $runs, $mean, $median, $stddev, $min, $max) -ForegroundColor White
             }
         }
 
         Write-Host ""
-        Write-Host ("  {0,-18} {1,10} {2,10} {3,10}" -f "Benchmark", "P90", "P95", "P99") -ForegroundColor Cyan
+        Write-Host ("  {0,-18} {1,10} {2,10} {3,10}" -f "Benchmark", "P90(ms)", "P95(ms)", "P99(ms)") -ForegroundColor Cyan
         Write-Host ("  {0,-18} {1,10} {2,10} {3,10}" -f ("-" * 18), ("-" * 10), ("-" * 10), ("-" * 10)) -ForegroundColor DarkGray
 
         foreach ($bench in $Benchmarks) {
             $result = $status[$bench.Name]
             if ($result -and $result.Completed -and $result.RunCount -gt 1) {
-                $p90 = "{0:F3}s" -f $result.P90
-                $p95 = "{0:F3}s" -f $result.P95
-                $p99 = "{0:F3}s" -f $result.P99
+                $p90 = "{0:F3}" -f ($result.P90 * 1000)
+                $p95 = "{0:F3}" -f ($result.P95 * 1000)
+                $p99 = "{0:F3}" -f ($result.P99 * 1000)
                 Write-Host ("  {0,-18} {1,10} {2,10} {3,10}" -f $bench.Name, $p90, $p95, $p99) -ForegroundColor White
             }
         }
@@ -719,9 +1059,124 @@ function Generate-Results {
 
 function Cleanup-TempDir {
     if (Test-Path $TempDir) {
-        Remove-Item -Path $TempDir -Recurse -Force -ErrorAction SilentlyContinue
+        # Remove contents but keep the directory
+        Get-ChildItem -Path $TempDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
         Show-Status "Temporary files cleaned up" -Type "Success"
     }
+}
+
+# ============================================================================
+#  REPORT GENERATION FROM HISTORY
+# ============================================================================
+
+function Get-HistoryStats {
+    param(
+        [string]$Name,
+        [int]$N
+    )
+
+    $times = Get-HistoryTimes -Name $Name -N $N
+    if ($times.Count -eq 0) {
+        return $null
+    }
+
+    # Get instructions from history
+    $history = Get-BenchmarkHistory
+    $instructions = 0
+    if ($history.ContainsKey($Name)) {
+        foreach ($run in $history[$Name]) {
+            if ($run.N -eq $N) {
+                $instructions = $run.Instructions
+                break
+            }
+        }
+    }
+
+    $avgTime = ($times | Measure-Object -Average).Average
+    $minTime = ($times | Measure-Object -Minimum).Minimum
+    $maxTime = ($times | Measure-Object -Maximum).Maximum
+    $medianTime = Get-Median $times
+    $stdDev = Get-StdDev $times
+    $p90 = Get-Percentile $times 90
+    $p95 = Get-Percentile $times 95
+    $p99 = Get-Percentile $times 99
+    $mips = if ($avgTime -gt 0 -and $instructions -gt 0) { $instructions / $avgTime / 1000000 } else { 0 }
+
+    return @{
+        RunCount = $times.Count
+        ExecutionTime = $avgTime
+        MinTime = $minTime
+        MaxTime = $maxTime
+        Median = $medianTime
+        StdDev = $stdDev
+        P90 = $p90
+        P95 = $p95
+        P99 = $p99
+        Instructions = $instructions
+        Mips = $mips
+        N = $N
+    }
+}
+
+function Generate-ReportFromHistory {
+    param(
+        [bool]$QuickMode
+    )
+
+    # Check if history exists
+    $history = Get-BenchmarkHistory
+    if ($history.Count -eq 0) {
+        Show-Status "No benchmark history found." -Type "Error"
+        Show-Status "Run benchmarks first to generate data." -Type "Info"
+        return $false
+    }
+
+    # Check which benchmarks have data
+    $hasData = $false
+    foreach ($bench in $Benchmarks) {
+        $currentN = Get-BenchmarkN -Benchmark $bench -QuickMode $QuickMode
+        $times = Get-HistoryTimes -Name $bench.Name -N $currentN
+        if ($times.Count -gt 0) {
+            $hasData = $true
+            break
+        }
+    }
+
+    if (-not $hasData) {
+        $modeStr = if ($QuickMode) { "Quick" } else { "Standard" }
+        Show-Status "No benchmark history found for $modeStr mode." -Type "Error"
+        Show-Status "Run benchmarks first to generate data." -Type "Info"
+        return $false
+    }
+
+    # Build status from history
+    $status = @{}
+    foreach ($bench in $Benchmarks) {
+        $currentN = Get-BenchmarkN -Benchmark $bench -QuickMode $QuickMode
+        $stats = Get-HistoryStats -Name $bench.Name -N $currentN
+        if ($stats) {
+            $status[$bench.Name] = @{
+                Completed = $true
+                N = $stats.N
+                ExecutionTime = $stats.ExecutionTime
+                Instructions = $stats.Instructions
+                Mips = $stats.Mips
+                RunCount = $stats.RunCount
+                MinTime = $stats.MinTime
+                MaxTime = $stats.MaxTime
+                Median = $stats.Median
+                StdDev = $stats.StdDev
+                P90 = $stats.P90
+                P95 = $stats.P95
+                P99 = $stats.P99
+            }
+        }
+    }
+
+    # Save to status file for Generate-Results to use
+    Save-BenchmarkStatus $status
+
+    return $true
 }
 
 # ============================================================================
@@ -735,6 +1190,66 @@ function Invoke-Benchmarks {
         return 0
     }
 
+    # Handle -ClearHistory parameter
+    if ($ClearHistory) {
+        Show-Banner
+        Clear-BenchmarkHistory
+        Clear-PendingSession
+        if (Test-Path $StatusFile) {
+            Remove-Item $StatusFile -Force
+        }
+        Show-Status "Benchmark history and pending session cleared" -Type "Success"
+        Write-Host ""
+        return 0
+    }
+
+    # Handle -Output parameter
+    if ($Output -ne "") {
+        if ([System.IO.Path]::IsPathRooted($Output)) {
+            $Script:ResultsFile = $Output
+        } else {
+            $Script:ResultsFile = Join-Path $ProjectRoot $Output
+        }
+    }
+
+    # Handle -Report parameter (generate report from existing history only)
+    if ($Report) {
+        Show-Banner
+        Write-Host "  Mode: REPORT ONLY (from existing history)" -ForegroundColor Yellow
+        Write-Host ""
+
+        # Create directories if needed
+        if (!(Test-Path $TempDir)) {
+            New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
+        }
+        if (!(Test-Path $DataDir)) {
+            New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+        }
+
+        if (!(Generate-ReportFromHistory -QuickMode $Quick)) {
+            return 1
+        }
+
+        $systemInfo = Get-SystemInfo
+        $status = Get-BenchmarkStatus
+
+        # Determine max run count for display
+        $maxRuns = 1
+        foreach ($bench in $Benchmarks) {
+            $result = $status[$bench.Name]
+            if ($result -and $result.RunCount -gt $maxRuns) {
+                $maxRuns = $result.RunCount
+            }
+        }
+
+        Generate-Results -SystemInfo $systemInfo -QuickMode $Quick -RunCount $maxRuns
+
+        $outputFileName = [System.IO.Path]::GetFileName($ResultsFile)
+        Show-Status "Report generated from history: $outputFileName" -Type "Success"
+        Write-Host ""
+        return 0
+    }
+
     Show-Banner
 
     # Show mode
@@ -744,7 +1259,7 @@ function Invoke-Benchmarks {
         Write-Host "  Mode: STANDARD (Benchmarks Game N values)" -ForegroundColor Green
     }
     if ($Runs -gt 1) {
-        Write-Host "  Runs: $Runs per benchmark (results will be averaged)" -ForegroundColor Cyan
+        Write-Host "  Runs: $Runs per benchmark (cumulative statistics)" -ForegroundColor Cyan
     }
     Write-Host ""
 
@@ -763,34 +1278,95 @@ function Invoke-Benchmarks {
     Write-Host "  RAM: $($systemInfo.RAM)" -ForegroundColor Gray
     Write-Host ""
 
-    # Create temp directory
+    # Create temp and data directories
     if (!(Test-Path $TempDir)) {
         New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
     }
+    if (!(Test-Path $DataDir)) {
+        New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+    }
 
-    # Clear status if Force flag is set
-    if ($Force -and (Test-Path $StatusFile)) {
-        Remove-Item $StatusFile -Force
-        Show-Status "Previous results cleared" -Type "Info"
+    # Check for pending session (incomplete previous run) - only in Standard mode
+    $pendingSession = $null
+    $resumingSession = $false
+
+    if (-not $Quick) {
+        $pendingSession = Get-PendingSession
+
+        if ($pendingSession -and -not $Force) {
+            # Check if pending session mode matches current mode
+            $pendingQuick = $pendingSession.QuickMode
+            if ($pendingQuick -eq $Quick) {
+                $resumingSession = $true
+                Show-Status "Found incomplete session from previous run" -Type "Warning"
+
+                # Count completed benchmarks in pending
+                $pendingCompleted = 0
+                foreach ($bench in $Benchmarks) {
+                    if ($pendingSession.Completed.ContainsKey($bench.Name) -and $pendingSession.Completed[$bench.Name]) {
+                        $pendingCompleted++
+                    }
+                }
+                Show-Status "Resuming: $pendingCompleted of $($Benchmarks.Count) benchmarks completed" -Type "Info"
+                Write-Host ""
+            } else {
+                # Mode mismatch - clear pending and start fresh
+                Show-Status "Previous session was in different mode, starting fresh" -Type "Info"
+                Clear-PendingSession
+                Write-Host ""
+            }
+        }
+    }
+
+    # Clear status and pending if Force flag is set
+    if ($Force) {
+        if (Test-Path $StatusFile) {
+            Remove-Item $StatusFile -Force
+        }
+        Clear-PendingSession
+        Show-Status "Previous session results cleared" -Type "Info"
     }
 
     # Load existing status
     $status = Get-BenchmarkStatus
 
-    # Check which benchmarks need to run
+    # Determine which benchmarks need to run
     $toRun = @()
-    foreach ($bench in $Benchmarks) {
-        $result = $status[$bench.Name]
-        if (!$result -or !$result.Completed) {
-            $toRun += $bench
+    if ($Quick) {
+        # Quick mode: always run all benchmarks (no history tracking)
+        $toRun = $Benchmarks
+    } elseif ($resumingSession) {
+        # Resume: run only benchmarks not completed in pending session
+        foreach ($bench in $Benchmarks) {
+            if (-not $pendingSession.Completed.ContainsKey($bench.Name) -or -not $pendingSession.Completed[$bench.Name]) {
+                $toRun += $bench
+            }
+        }
+    } else {
+        # Fresh start: check status file
+        # Also verify N matches current mode (status might be from Quick mode)
+        foreach ($bench in $Benchmarks) {
+            $result = $status[$bench.Name]
+            $expectedN = Get-BenchmarkN -Benchmark $bench -QuickMode $Quick
+            if (!$result -or !$result.Completed -or $result.N -ne $expectedN) {
+                $toRun += $bench
+            }
         }
     }
 
     if ($toRun.Count -eq 0) {
-        Show-Status "All benchmarks already completed!" -Type "Success"
-        Show-Status "Use -Force to re-run all benchmarks" -Type "Info"
+        if ($resumingSession) {
+            # All benchmarks in pending session are complete - commit to history
+            $session = Get-PendingSession
+            if (Test-SessionComplete -Session $session) {
+                Commit-PendingToHistory
+                Show-Status "All benchmarks completed! Runs committed to history." -Type "Success"
+            }
+        } else {
+            Show-Status "All benchmarks already completed!" -Type "Success"
+            Show-Status "Use -Force to re-run all benchmarks" -Type "Info"
+        }
         Generate-Results -SystemInfo $systemInfo -QuickMode $Quick -RunCount $Runs
-        Cleanup-TempDir
         return 0
     }
 
@@ -809,6 +1385,9 @@ function Invoke-Benchmarks {
     $response = Read-Host "  Press ENTER to continue or 'q' to quit"
     if ($response -eq 'q') {
         Show-Status "Benchmark cancelled by user" -Type "Warning"
+        if ($resumingSession) {
+            Show-Status "Pending session preserved for later resume" -Type "Info"
+        }
         return 0
     }
 
@@ -825,24 +1404,80 @@ function Invoke-Benchmarks {
         Write-Host ""
     }
 
+    # Check if ALL benchmarks are now complete
+    if ($Quick) {
+        # Quick mode: no history tracking, just show completion message
+        if ($failed -eq 0) {
+            Write-Host ""
+            Show-Status "All benchmarks completed successfully!" -Type "Success"
+            Show-Status "Quick mode: results NOT saved to history" -Type "Info"
+        } else {
+            Show-Status "$failed benchmark(s) failed" -Type "Warning"
+        }
+    } else {
+        # Standard mode: check pending session and commit to history
+        $session = Get-PendingSession
+        if ($failed -eq 0 -and (Test-SessionComplete -Session $session)) {
+            Write-Host ""
+            Show-Status "All 3 benchmarks completed successfully!" -Type "Success"
+            Show-Status "Committing runs to permanent history..." -Type "Info"
+            Commit-PendingToHistory
+
+            # Recalculate statistics using full history for final report
+            foreach ($bench in $Benchmarks) {
+                $currentN = Get-BenchmarkN -Benchmark $bench -QuickMode $Quick
+                $stats = Get-HistoryStats -Name $bench.Name -N $currentN
+                if ($stats) {
+                    Set-BenchmarkResult -Name $bench.Name -N $stats.N -ExecutionTime $stats.ExecutionTime -Instructions $stats.Instructions -Mips $stats.Mips -Output "" -RunCount $stats.RunCount -MinTime $stats.MinTime -MaxTime $stats.MaxTime -Median $stats.Median -StdDev $stats.StdDev -P90 $stats.P90 -P95 $stats.P95 -P99 $stats.P99
+                }
+            }
+
+            $totalRuns = 0
+            $history = Get-BenchmarkHistory
+            foreach ($bench in $Benchmarks) {
+                $currentN = Get-BenchmarkN -Benchmark $bench -QuickMode $Quick
+                $times = Get-HistoryTimes -Name $bench.Name -N $currentN
+                if ($times.Count -gt $totalRuns) { $totalRuns = $times.Count }
+            }
+            Show-Status "History now contains $totalRuns run(s) per benchmark" -Type "Success"
+        } else {
+            if ($failed -gt 0) {
+                Show-Status "$failed benchmark(s) failed" -Type "Warning"
+                Show-Status "Pending runs NOT committed to history" -Type "Warning"
+            } else {
+                Show-Status "Session incomplete - runs pending until all 3 benchmarks complete" -Type "Warning"
+            }
+        }
+    }
+
     # Generate results
     Write-Host ""
     Generate-Results -SystemInfo $systemInfo -QuickMode $Quick -RunCount $Runs
 
-    # Cleanup
-    Cleanup-TempDir
+    if ($Quick) {
+        # Quick mode: just show report saved message
+        if ($failed -eq 0) {
+            Write-Host ""
+            $outputFileName = [System.IO.Path]::GetFileName($ResultsFile)
+            Write-Host "  Report saved to: $outputFileName" -ForegroundColor Cyan
+            Write-Host ""
+        }
+    } else {
+        # Standard mode: clean up status file after successful session
+        if ($failed -eq 0 -and (Test-SessionComplete -Session $session)) {
+            Write-Host ""
+            $outputFileName = [System.IO.Path]::GetFileName($ResultsFile)
+            Write-Host "  Full report saved to: $outputFileName" -ForegroundColor Cyan
+            Write-Host ""
 
-    if ($failed -gt 0) {
-        Show-Status "$failed benchmark(s) failed" -Type "Warning"
-        return 1
+            # Clean up status file after successful session - next run should start fresh
+            if (Test-Path $StatusFile) {
+                Remove-Item $StatusFile -Force
+            }
+        }
     }
 
-    Write-Host ""
-    Write-Host "  All benchmarks completed successfully!" -ForegroundColor Green
-    Write-Host "  Full report saved to: BENCHMARKS.md" -ForegroundColor Cyan
-    Write-Host ""
-
-    return 0
+    return $(if ($failed -gt 0) { 1 } else { 0 })
 }
 
 # Entry point

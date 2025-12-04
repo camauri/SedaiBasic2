@@ -139,11 +139,20 @@ Run the benchmark suite to measure interpreter performance:
 # Quick test with N values from source files
 .\benchmark.ps1 -Quick
 
-# Run each benchmark 3 times and average results
+# Run 3 times in this session (results accumulate)
 .\benchmark.ps1 -Runs 3
 
-# Force re-run, ignoring cached results
+# Force re-run, ignoring cached session results
 .\benchmark.ps1 -Force
+
+# Clear all accumulated history and start fresh
+.\benchmark.ps1 -ClearHistory
+
+# Generate report from existing history (no benchmark run)
+.\benchmark.ps1 -Report
+
+# Use custom output filename
+.\benchmark.ps1 -Output "results.md"
 
 # Show help
 .\benchmark.ps1 -Help
@@ -157,9 +166,19 @@ The benchmark suite runs programs from [The Computer Language Benchmarks Game](h
 | n-body | Double-precision N-body simulation | 50,000,000 |
 | spectral-norm | Eigenvalue using the power method | 5,500 |
 
+#### Cumulative Statistics
+
+Each benchmark run is saved to a history file. Statistics (mean, median, standard deviation, percentiles) are calculated using **all accumulated runs** over time. This allows you to build reliable statistics by running the benchmark multiple times across different sessions, rather than requiring 20+ consecutive runs.
+
+**Important:** Runs are only committed to history when **all 3 benchmarks** complete successfully in a session. If a session is interrupted, runs remain pending and will not affect the cumulative statistics until the session is completed.
+
+#### Session Resume
+
+If a benchmark session is interrupted (e.g., user cancels or a benchmark fails), the next run will automatically detect the incomplete session and resume from where it left off, running only the remaining benchmarks.
+
 Use `-Quick` to run with N values from source files instead of standard values.
 
-Results are saved to `BENCHMARKS.md` and displayed on screen.
+Results are saved to `BENCHMARKS.md` (or custom file with `-Output`) and displayed on screen.
 
 ## License
 
