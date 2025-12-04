@@ -32,7 +32,7 @@ Windows may block PowerShell scripts by default. To enable script execution, cho
 **Option 1: Run scripts individually with bypass**
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
-powershell -ExecutionPolicy Bypass -File .\benchmark.ps1
+powershell -ExecutionPolicy Bypass -File .\benchmarks\benchmark.ps1
 ```
 Note: You must use this syntax for each script you want to run.
 
@@ -134,28 +134,28 @@ Run the benchmark suite to measure interpreter performance:
 
 ```powershell
 # Run benchmarks with standard N values (may take 10-30 minutes)
-.\benchmark.ps1
+.\benchmarks\benchmark.ps1
 
 # Quick test with N values from source files
-.\benchmark.ps1 -Quick
+.\benchmarks\benchmark.ps1 -Quick
 
 # Run 3 times in this session (results accumulate)
-.\benchmark.ps1 -Runs 3
+.\benchmarks\benchmark.ps1 -Runs 3
 
 # Force re-run, ignoring cached session results
-.\benchmark.ps1 -Force
+.\benchmarks\benchmark.ps1 -Force
 
 # Clear all accumulated history and start fresh
-.\benchmark.ps1 -ClearHistory
+.\benchmarks\benchmark.ps1 -ClearHistory
 
 # Generate report from existing history (no benchmark run)
-.\benchmark.ps1 -Report
+.\benchmarks\benchmark.ps1 -Report
 
 # Use custom output filename
-.\benchmark.ps1 -Output "results.md"
+.\benchmarks\benchmark.ps1 -Output "results.md"
 
 # Show help
-.\benchmark.ps1 -Help
+.\benchmarks\benchmark.ps1 -Help
 ```
 
 The benchmark suite runs programs from [The Computer Language Benchmarks Game](https://benchmarksgame-team.pages.debian.net/benchmarksgame/):
@@ -178,7 +178,7 @@ If a benchmark session is interrupted (e.g., user cancels or a benchmark fails),
 
 Use `-Quick` to run with N values from source files instead of standard values.
 
-Results are saved to `BENCHMARKS.md` (or custom file with `-Output`) and displayed on screen.
+Results are saved to `benchmarks/results/BENCHMARKS.md` (or custom file with `-Output`) and displayed on screen.
 
 ## License
 

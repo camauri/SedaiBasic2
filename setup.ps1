@@ -63,6 +63,10 @@ $Script:LibDir = "lib\$FpcArch"
 $Script:PythonDir = Join-Path $ProjectRoot "benchmarks\runtime\python"
 $Script:PythonExe = Join-Path $PythonDir "python.exe"
 
+# Lua runtime paths
+$Script:LuaDir = Join-Path $ProjectRoot "benchmarks\runtime\lua"
+$Script:LuaExe = Join-Path $LuaDir "lua54.exe"
+
 # ============================================================================
 #  DISPLAY FUNCTIONS
 # ============================================================================
@@ -318,14 +322,84 @@ function Install-Python {
     }
 }
 
+function Test-LuaInstallation {
+    if (!(Test-Path $LuaExe)) {
+        return $false
+    }
+
+    try {
+        $version = & $LuaExe -v 2>&1
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Install-Lua {
+    $installScript = Join-Path $ProjectRoot "scripts\windows\install-lua.ps1"
+
+    if (!(Test-Path $installScript)) {
+        Show-Status "Lua install script not found: $installScript" -Type "Error"
+        return $false
+    }
+
+    Show-Status "Running Lua installer..."
+
+    $params = @{}
+    if ($ForceLua) { $params["Force"] = $true }
+
+    & $installScript @params
+    $exitCode = $LASTEXITCODE
+
+    switch ($exitCode) {
+        0 {
+            Show-Status "Lua installed successfully" -Type "Success"
+            return $true
+        }
+        5 {
+            Show-Status "Lua already installed" -Type "Success"
+            return $true
+        }
+        default {
+            Show-Status "Lua installation failed (exit code: $exitCode)" -Type "Error"
+            return $false
+        }
+    }
+}
+
 function Initialize-BuildDirs {
     $binPath = Join-Path $ProjectRoot $BinDir
     $libPath = Join-Path $ProjectRoot $LibDir
+    $benchmarkDir = Join-Path $ProjectRoot "benchmarks"
+    $benchmarkTempDir = Join-Path $benchmarkDir ".temp"
+    $benchmarkHistoryDir = Join-Path $benchmarkDir ".history"
 
     if ($Clean) {
         Show-Status "Cleaning build directories..."
         if (Test-Path $binPath) { Remove-Item -Path $binPath -Recurse -Force -ErrorAction SilentlyContinue }
         if (Test-Path $libPath) { Remove-Item -Path $libPath -Recurse -Force -ErrorAction SilentlyContinue }
+
+        # Clean old benchmark hidden directories (current version)
+        if (Test-Path $benchmarkTempDir) {
+            Remove-Item -Path $benchmarkTempDir -Recurse -Force -ErrorAction SilentlyContinue
+            Show-Status "Removed: benchmarks\.temp"
+        }
+        if (Test-Path $benchmarkHistoryDir) {
+            Remove-Item -Path $benchmarkHistoryDir -Recurse -Force -ErrorAction SilentlyContinue
+            Show-Status "Removed: benchmarks\.history"
+        }
+
+        # Clean old benchmark hidden directories (legacy version - in project root)
+        $legacyTempDir = Join-Path $ProjectRoot ".benchmark_temp"
+        $legacyDataDir = Join-Path $ProjectRoot ".benchmark_data"
+        if (Test-Path $legacyTempDir) {
+            Remove-Item -Path $legacyTempDir -Recurse -Force -ErrorAction SilentlyContinue
+            Show-Status "Removed: .benchmark_temp (legacy)"
+        }
+        if (Test-Path $legacyDataDir) {
+            Remove-Item -Path $legacyDataDir -Recurse -Force -ErrorAction SilentlyContinue
+            Show-Status "Removed: .benchmark_data (legacy)"
+        }
     }
 
     if (!(Test-Path $binPath)) {
@@ -449,11 +523,13 @@ function Invoke-Setup {
     $doFpc = -not $BuildOnly
     $doBuild = -not $FpcOnly
     $doPython = -not $FpcOnly  # Install Python runtime unless FpcOnly
+    $doLua = -not $FpcOnly     # Install Lua runtime unless FpcOnly
 
     $totalSteps = 0
     if ($doFpc) { $totalSteps += 2 }  # Install + Verify
     if ($doBuild) { $totalSteps += 1 }  # Build
     if ($doPython) { $totalSteps += 1 }  # Python runtime
+    if ($doLua) { $totalSteps += 1 }    # Lua runtime
 
     $currentStep = 0
 
@@ -524,6 +600,21 @@ function Invoke-Setup {
         } else {
             if (!(Install-Python)) {
                 Show-Status "Python installation failed (benchmarks will not work)" -Type "Warning"
+                # Don't fail the setup, just warn
+            }
+        }
+    }
+
+    # Step: Install Lua runtime
+    if ($doLua) {
+        $currentStep++
+        Show-Step -Number $currentStep -Total $totalSteps -Title "Installing Lua Runtime"
+
+        if (Test-LuaInstallation) {
+            Show-Status "Lua 5.4 is already installed" -Type "Skip"
+        } else {
+            if (!(Install-Lua)) {
+                Show-Status "Lua installation failed (benchmarks will not work)" -Type "Warning"
                 # Don't fail the setup, just warn
             }
         }
