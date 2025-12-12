@@ -7,12 +7,11 @@
     and extracts it to the fpc/ subfolder of the project root.
 
     Exit codes:
-        0 = Success
+        0 = Success (install or fpc.cfg regeneration)
         1 = Network/download error
         2 = Extraction error
         3 = File corrupted (hash mismatch)
         4 = Insufficient disk space
-        5 = FPC already installed (skipped)
 
 .PARAMETER Force
     Overwrite existing FPC installation
@@ -42,7 +41,6 @@ $EXIT_NETWORK_ERROR = 1
 $EXIT_EXTRACTION_ERROR = 2
 $EXIT_HASH_MISMATCH = 3
 $EXIT_DISK_SPACE = 4
-$EXIT_ALREADY_INSTALLED = 5
 
 # Configuration
 $FPC_VERSION = "3.2.2"
@@ -101,6 +99,7 @@ function Install-FPC {
     # Step 1: Check if already installed
     Write-Step "Checking existing installation..."
 
+    $skipDownload = $false
     if (Test-Path $FpcExe) {
         if ($Force) {
             Write-Status "Existing installation found. -Force specified, will reinstall." -Color Yellow
@@ -108,111 +107,137 @@ function Install-FPC {
             Remove-Item -Path $FpcRootDir -Recurse -Force -ErrorAction SilentlyContinue
         } else {
             Write-Success "FPC $FPC_VERSION already installed at: $FpcDir"
-            Write-Status "Use -Force to reinstall." -Color Yellow
-            return $EXIT_ALREADY_INSTALLED
+            Write-Status "Regenerating fpc.cfg..." -Color Yellow
+            $skipDownload = $true
         }
     } else {
         Write-Status "No existing installation found." -Color Gray
     }
 
-    # Step 2: Check disk space
-    Write-Step "Checking disk space..."
+    if (-not $skipDownload) {
+        # Step 2: Check disk space
+        Write-Step "Checking disk space..."
 
-    $spaceCheck = Test-DiskSpace -Path $ProjectRoot -RequiredBytes ($REQUIRED_SPACE_MB * 1MB)
-    if ($spaceCheck.Status -ne 0) {
-        Write-Error $spaceCheck.Message
-        return $EXIT_DISK_SPACE
-    }
-    Write-Success $spaceCheck.Message
-
-    # Step 3: Check internet connection
-    Write-Step "Checking internet connection..."
-
-    $netCheck = Test-InternetConnection -TestUrl "https://github.com"
-    if ($netCheck.Status -ne 0) {
-        Write-Error $netCheck.Message
-        return $EXIT_NETWORK_ERROR
-    }
-    Write-Success $netCheck.Message
-
-    # Step 4: Create temp directory
-    Write-Step "Preparing download..."
-
-    if (!(Test-Path $TempDir)) {
-        New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
-    }
-
-    # Step 5: Download
-    Write-Step "Downloading FPC $FPC_VERSION..."
-    Write-Status "URL: $DOWNLOAD_URL" -Color Gray
-
-    $downloadResult = Get-FileWithProgress -Url $DOWNLOAD_URL -OutFile $ZipFile -Quiet:$Quiet
-    if ($downloadResult.Status -ne 0) {
-        Write-Error $downloadResult.Message
-        return $EXIT_NETWORK_ERROR
-    }
-
-    $sizeMB = [math]::Round($downloadResult.BytesDownloaded / 1MB, 2)
-    Write-Success "Download completed: $sizeMB MB"
-
-    # Step 6: Verify hash
-    if (!$SkipVerify) {
-        Write-Step "Verifying file integrity (SHA256)..."
-
-        $hashResult = Test-FileHash -FilePath $ZipFile -ExpectedHash $EXPECTED_HASH
-        if ($hashResult.Status -ne 0) {
-            Write-Error $hashResult.Message
-            Remove-Item $ZipFile -Force -ErrorAction SilentlyContinue
-            return $EXIT_HASH_MISMATCH
+        $spaceCheck = Test-DiskSpace -Path $ProjectRoot -RequiredBytes ($REQUIRED_SPACE_MB * 1MB)
+        if ($spaceCheck.Status -ne 0) {
+            Write-Error $spaceCheck.Message
+            return $EXIT_DISK_SPACE
         }
-        Write-Success $hashResult.Message
-    } else {
-        Write-Status "Hash verification skipped (-SkipVerify)" -Color Yellow
-    }
+        Write-Success $spaceCheck.Message
 
-    # Step 7: Extract (zip contains fpc/3.2.2/... so extract to project root)
-    Write-Step "Extracting to: $FpcRootDir"
+        # Step 3: Check internet connection
+        Write-Step "Checking internet connection..."
 
-    $extractResult = Expand-ArchiveWithProgress -Path $ZipFile -DestinationPath $ProjectRoot -Quiet:$Quiet
-    if ($extractResult.Status -ne 0) {
-        Write-Error $extractResult.Message
-        return $EXIT_EXTRACTION_ERROR
-    }
-    Write-Success $extractResult.Message
+        $netCheck = Test-InternetConnection -TestUrl "https://github.com"
+        if ($netCheck.Status -ne 0) {
+            Write-Error $netCheck.Message
+            return $EXIT_NETWORK_ERROR
+        }
+        Write-Success $netCheck.Message
 
-    # Step 8: Verify installation
-    Write-Step "Verifying installation..."
+        # Step 4: Create temp directory
+        Write-Step "Preparing download..."
 
-    if (!(Test-Path $FpcExe)) {
-        # Check if files are in a subdirectory
-        $possibleExe = Get-ChildItem -Path $FpcDir -Recurse -Filter "fpc.exe" | Select-Object -First 1
-        if ($possibleExe) {
-            Write-Status "Found fpc.exe at: $($possibleExe.FullName)" -Color Gray
-            # Files might be nested, that's ok
-            $FpcExe = $possibleExe.FullName
+        if (!(Test-Path $TempDir)) {
+            New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
+        }
+
+        # Step 5: Download
+        Write-Step "Downloading FPC $FPC_VERSION..."
+        Write-Status "URL: $DOWNLOAD_URL" -Color Gray
+
+        $downloadResult = Get-FileWithProgress -Url $DOWNLOAD_URL -OutFile $ZipFile -Quiet:$Quiet
+        if ($downloadResult.Status -ne 0) {
+            Write-Error $downloadResult.Message
+            return $EXIT_NETWORK_ERROR
+        }
+
+        $sizeMB = [math]::Round($downloadResult.BytesDownloaded / 1MB, 2)
+        Write-Success "Download completed: $sizeMB MB"
+
+        # Step 6: Verify hash
+        if (!$SkipVerify) {
+            Write-Step "Verifying file integrity (SHA256)..."
+
+            $hashResult = Test-FileHash -FilePath $ZipFile -ExpectedHash $EXPECTED_HASH
+            if ($hashResult.Status -ne 0) {
+                Write-Error $hashResult.Message
+                Remove-Item $ZipFile -Force -ErrorAction SilentlyContinue
+                return $EXIT_HASH_MISMATCH
+            }
+            Write-Success $hashResult.Message
         } else {
-            Write-Error "fpc.exe not found after extraction"
+            Write-Status "Hash verification skipped (-SkipVerify)" -Color Yellow
+        }
+
+        # Step 7: Extract (zip contains fpc/3.2.2/... so extract to project root)
+        Write-Step "Extracting to: $FpcRootDir"
+
+        $extractResult = Expand-ArchiveWithProgress -Path $ZipFile -DestinationPath $ProjectRoot -Quiet:$Quiet
+        if ($extractResult.Status -ne 0) {
+            Write-Error $extractResult.Message
+            return $EXIT_EXTRACTION_ERROR
+        }
+        Write-Success $extractResult.Message
+
+        # Step 8: Verify installation
+        Write-Step "Verifying installation..."
+
+        if (!(Test-Path $FpcExe)) {
+            # Check if files are in a subdirectory
+            $possibleExe = Get-ChildItem -Path $FpcDir -Recurse -Filter "fpc.exe" | Select-Object -First 1
+            if ($possibleExe) {
+                Write-Status "Found fpc.exe at: $($possibleExe.FullName)" -Color Gray
+                # Files might be nested, that's ok
+                $FpcExe = $possibleExe.FullName
+            } else {
+                Write-Error "fpc.exe not found after extraction"
+                return $EXIT_EXTRACTION_ERROR
+            }
+        }
+
+        # Test FPC works
+        try {
+            $version = & $FpcExe -iV 2>&1
+            Write-Success "FPC responds: $version"
+        } catch {
+            Write-Error "FPC installed but not responding: $_"
             return $EXIT_EXTRACTION_ERROR
         }
     }
 
-    # Test FPC works
-    try {
-        $version = & $FpcExe -iV 2>&1
-        Write-Success "FPC responds: $version"
-    } catch {
-        Write-Error "FPC installed but not responding: $_"
-        return $EXIT_EXTRACTION_ERROR
+    # Step 9: Generate fpc.cfg
+    Write-Step "Generating fpc.cfg..."
+
+    $fpcBinDir = Split-Path -Parent $FpcExe
+    $fpcmkcfg = Join-Path $fpcBinDir "fpcmkcfg.exe"
+    $fpcCfg = Join-Path $fpcBinDir "fpc.cfg"
+
+    if (Test-Path $fpcmkcfg) {
+        $cfgProcess = Start-Process -FilePath $fpcmkcfg -ArgumentList @('-d', "basepath=$FpcDir", '-o', $fpcCfg) -NoNewWindow -Wait -PassThru
+        if ($cfgProcess.ExitCode -eq 0) {
+            Write-Success "fpc.cfg generated successfully"
+        } else {
+            Write-Status "Warning: fpcmkcfg returned exit code $($cfgProcess.ExitCode)" -Color Yellow
+        }
+    } else {
+        Write-Status "Warning: fpcmkcfg not found, skipping fpc.cfg generation" -Color Yellow
     }
 
-    # Step 9: Cleanup
-    Write-Step "Cleaning up..."
-    Remove-Item $ZipFile -Force -ErrorAction SilentlyContinue
-    Write-Status "Temporary files removed." -Color Gray
+    # Step 10: Cleanup (only if we downloaded)
+    if (-not $skipDownload) {
+        Write-Step "Cleaning up..."
+        Remove-Item $ZipFile -Force -ErrorAction SilentlyContinue
+        Write-Status "Temporary files removed." -Color Gray
+    }
 
     # Done
     Write-Status "`n============================================" -Color Green
-    Write-Success "  FPC $FPC_VERSION installed successfully!"
+    if ($skipDownload) {
+        Write-Success "  fpc.cfg regenerated successfully!"
+    } else {
+        Write-Success "  FPC $FPC_VERSION installed successfully!"
+    }
     Write-Status "  Location: $FpcDir" -Color Green
     Write-Status "  Compiler: $FpcExe" -Color Green
     Write-Status "============================================" -Color Green
