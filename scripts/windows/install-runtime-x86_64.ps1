@@ -189,7 +189,7 @@ function Install-Runtime {
         "SDL2.dll",
         "SDL2_ttf.dll",
         "zlib1.dll",
-        "fonts\PixelOperatorMono8-Bold.ttf"
+        "font\PixelOperatorMono8-Bold.ttf"
     )
 
     $missingFiles = @()
