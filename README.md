@@ -11,6 +11,13 @@
   |____/ \___|\__,_|\__,_|_|____/ \__,_|___/_|\___|_____|
 ```
 
+## Documentation
+
+> **Note:** This README provides an overview. For detailed information, see:
+> - [BASIC.md](BASIC.md) - Complete list of BASIC commands with implementation status
+> - [CONSOLE.md](CONSOLE.md) - Keyboard shortcuts and graphics mode reference
+> - [ROADMAP.md](ROADMAP.md) - Future directions and project architecture
+
 ## What is SedaiBasic2?
 
 SedaiBasic2 is a modern reimplementation of Commodore BASIC v7. At the current stage of development, it supports the **Tiny BASIC** subset plus:
@@ -80,44 +87,81 @@ This will:
 ./setup.sh
 ```
 
+### Build System
+
+SedaiBasic2 includes cross-platform build scripts for compiling all targets.
+
+#### Build Targets
+
+| Target | Description | Output |
+|--------|-------------|--------|
+| sb | SedaiBasic VM (interpreter) | sb.exe |
+| sbc | SedaiBasic Compiler | sbc.exe |
+| sbd | SedaiBasic Disassembler | sbd.exe |
+| sbv | SedaiVision (SDL2 graphical) | sbv.exe |
+
+#### Windows (PowerShell)
+
+```powershell
+# Build all targets
+.\build.ps1
+
+# Build specific target
+.\build.ps1 -Target sb
+
+# Build with debug info
+.\build.ps1 -Debug
+
+# Clean and rebuild
+.\build.ps1 -Clean
+
+# Build for different platform
+.\build.ps1 -CPU x86_64 -OS win64
+```
+
+#### Linux/macOS (Bash)
+
+```bash
+# Build all targets
+./build.sh
+
+# Build specific target
+./build.sh sb
+
+# Build with debug info
+./build.sh --debug
+
+# Clean and rebuild
+./build.sh --clean
+```
+
 ### Manual Installation
 
 If you prefer to install Free Pascal separately:
 
 1. **Download FPC** from [https://www.freepascal.org/download.html](https://www.freepascal.org/download.html)
 2. **Install** following the instructions for your platform
-3. **Compile** SedaiBasic2 manually:
+3. **Compile** using the build scripts above, or manually:
 
 ```bash
-fpc -Px86_64 -Twin64 -MObjFPC -Scghi -CX -Si -O3 \
+# Example: compile sb (SedaiBasic VM)
+fpc -o"sb.exe" -Px86_64 -Twin64 -MObjFPC -O1 \
     -CpCOREAVX2 -OpCOREAVX2 -CfAVX2 \
     -OoREGVAR -OoCSE -OoDFA -OoFASTMATH -OoCONSTPROP \
-    -Xs -XX -Fusrc -FUlib/x86_64-win64 -FEbin/x86_64-win64 \
-    -osb.exe src/SedaiBasicVM.lpr
+    -Xs -XX -Fusrc -Fulib/x86_64-win64 -FUlib/x86_64-win64 \
+    -FEbin/x86_64-win64 src/SedaiBasicVM.lpr
 ```
 
-## Running BASIC Programs
+## Applications
 
-After setup, run a BASIC program with:
+SedaiBasic2 provides four applications for different use cases:
+
+### SedaiBasic VM (Command Line Interpreter)
+
+The main interpreter for running BASIC programs from the command line.
 
 ```bash
-# Windows
-.\bin\x86_64-win64\sb.exe program.bas
-
-# Linux
-./bin/x86_64-linux/sb program.bas
-```
-
-### Example
-
-```bash
-.\bin\x86_64-win64\sb.exe bas\SIEVE.BAS
-```
-
-### Command Line Options
-
-```
-sb.exe [options] <program.bas>
+sb [options] <program.bas>
 
 Options:
   --help              Show this help message
@@ -126,6 +170,130 @@ Options:
   --disasm            Show bytecode disassembly
   --no-exec           Compile only, do not execute (useful with --disasm)
   --stats             Show execution statistics
+```
+
+**Examples:**
+```bash
+# Run a program
+sb bas\SIEVE.BAS
+
+# Show disassembly without executing
+sb --disasm --no-exec program.bas
+
+# Run with execution statistics
+sb --stats program.bas
+```
+
+### SedaiBasic Compiler
+
+Compiles BASIC source code to bytecode without executing. Useful for syntax checking and pre-compilation.
+
+```bash
+sbc [options] <program.bas>
+
+Options:
+  --help              Show this help message
+  --output, -o        Output bytecode file (default: program.basc)
+  --verbose           Show compilation details
+```
+
+**Examples:**
+```bash
+# Compile a program
+sbc program.bas
+
+# Compile with custom output name
+sbc -o compiled.basc program.bas
+```
+
+### SedaiBasic Disassembler
+
+Disassembles compiled bytecode files (.basc) to human-readable format.
+
+```bash
+sbd [options] <program.basc>
+
+Options:
+  --help              Show this help message
+  --verbose           Show additional bytecode details
+```
+
+**Examples:**
+```bash
+# Disassemble a compiled file
+sbd compiled.basc
+```
+
+### SedaiVision (SDL2 Graphical Console)
+
+Interactive graphical interpreter with SDL2-based console emulating C64/C128 display modes.
+
+```bash
+sbv [options] [program.bas]
+
+Options:
+  --help              Show this help message
+  --fullscreen        Start in fullscreen mode
+  --mode <n>          Set initial graphics mode (0-11)
+```
+
+**Features:**
+- C64/C128 compatible text modes (40x25, 80x25, 80x50)
+- Bitmap and multicolor graphics modes
+- SDL2 dynamic resolution support
+- Scrollback buffer with keyboard navigation
+- Command history
+
+**Graphics Modes:**
+
+| Mode | Resolution | Description |
+|------|------------|-------------|
+| 0 | 320x200 | 40x25 text mode (C64/C128 compatible) |
+| 1 | 320x200 | Standard bitmap mode |
+| 2 | 320x200 | Split screen: bitmap + text |
+| 3 | 160x200 | Multicolor bitmap (double-width pixels) |
+| 4 | 160x200 | Split screen: multicolor + text |
+| 5 | 640x200 | 80x25 text mode (C128 compatible) |
+| 6 | 640x200 | 640x200 hires bitmap |
+| 7 | 640x200 | Split screen: 640x160 bitmap + 80x5 text |
+| 8 | 640x400 | 80x50 text mode |
+| 9 | 640x400 | 640x400 hires bitmap |
+| 10 | 640x400 | Split screen: 640x360 bitmap + 80x5 text |
+| 11 | Variable | SDL2 dynamic resolution (use GLIST for available modes) |
+
+See [CONSOLE.md](CONSOLE.md) for keyboard shortcuts and detailed graphics mode documentation.
+
+**Examples:**
+```bash
+# Start interactive console
+sbv
+
+# Run a program in graphical mode
+sbv program.bas
+
+# Start fullscreen
+sbv --fullscreen
+```
+
+## Running BASIC Programs
+
+After setup, run a BASIC program with:
+
+```bash
+# Windows (command line)
+.\bin\x86_64-win64\sb program.bas
+
+# Windows (graphical)
+.\bin\x86_64-win64\sbv program.bas
+
+# Linux
+./bin/x86_64-linux/sb program.bas
+```
+
+### Example
+
+```bash
+.\bin\x86_64-win64\sb bas\SIEVE.BAS
 ```
 
 ## Benchmarking

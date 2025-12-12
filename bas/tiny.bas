@@ -166,10 +166,10 @@
 1990 GOSUB 4000
 
 
-2500 PRINT "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-2505 PRINT "TEST COMPLETED SUCCESSFULLY!"
-2510 PRINT "ALL TINY BASIC FEATURES WERE TESTED!"
-2515 PRINT "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+2500 PRINT "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+2505 PRINT "!           TEST COMPLETED            !"
+2510 PRINT "! ALL TINY BASIC FEATURES WERE TESTED !"
+2515 PRINT "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 2520 PRINT:PRINT
 2525 END
 

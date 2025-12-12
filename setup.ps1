@@ -67,6 +67,14 @@ $Script:PythonExe = Join-Path $PythonDir "python.exe"
 $Script:LuaDir = Join-Path $ProjectRoot "benchmarks\runtime\lua"
 $Script:LuaExe = Join-Path $LuaDir "lua54.exe"
 
+# SDL2 for Pascal paths
+$Script:SDL2Dir = Join-Path $ProjectRoot "deps\sdl2"
+$Script:SDL2Marker = Join-Path $SDL2Dir "sdl2.pas"
+
+# Runtime paths (SDL2 DLLs, fonts, etc.)
+$Script:RuntimeDir = Join-Path $ProjectRoot "bin\$FpcArch"
+$Script:RuntimeMarker = Join-Path $RuntimeDir "SDL2.dll"
+
 # ============================================================================
 #  DISPLAY FUNCTIONS
 # ============================================================================
@@ -168,7 +176,6 @@ function Show-Status {
 function Show-Summary {
     param(
         [bool]$Success,
-        [string]$ExePath,
         [string]$Mode = "full"
     )
 
@@ -197,24 +204,20 @@ function Show-Summary {
                 Write-Host ""
                 Write-Host "  SedaiBasic2 has been compiled successfully." -ForegroundColor White
                 Write-Host ""
-                Write-Host "  Executable: " -NoNewline -ForegroundColor Gray
-                Write-Host $ExePath -ForegroundColor Yellow
+                Write-Host "  Output: " -NoNewline -ForegroundColor Gray
+                Write-Host "$BinDir\" -ForegroundColor Yellow
                 Write-Host ""
-                Write-Host "  Usage:" -ForegroundColor Gray
-                Write-Host "    .\$BinDir\$OutputExe program.bas" -ForegroundColor White
-                Write-Host "    .\$BinDir\$OutputExe --help" -ForegroundColor White
+                Write-Host "  See README.md for usage information." -ForegroundColor Gray
             }
             default {
                 Write-Host "  SETUP COMPLETED SUCCESSFULLY!" -ForegroundColor Green
                 Write-Host ""
                 Write-Host "  SedaiBasic2 has been built successfully." -ForegroundColor White
                 Write-Host ""
-                Write-Host "  Executable: " -NoNewline -ForegroundColor Gray
-                Write-Host $ExePath -ForegroundColor Yellow
+                Write-Host "  Output: " -NoNewline -ForegroundColor Gray
+                Write-Host "$BinDir\" -ForegroundColor Yellow
                 Write-Host ""
-                Write-Host "  Usage:" -ForegroundColor Gray
-                Write-Host "    .\$BinDir\$OutputExe program.bas" -ForegroundColor White
-                Write-Host "    .\$BinDir\$OutputExe --help" -ForegroundColor White
+                Write-Host "  See README.md for usage information." -ForegroundColor Gray
             }
         }
     } else {
@@ -367,6 +370,84 @@ function Install-Lua {
     }
 }
 
+function Test-SDL2Installation {
+    if (!(Test-Path $SDL2Marker)) {
+        return $false
+    }
+    return $true
+}
+
+function Install-SDL2 {
+    $installScript = Join-Path $ProjectRoot "scripts\windows\install-sdl2.ps1"
+
+    if (!(Test-Path $installScript)) {
+        Show-Status "SDL2 install script not found: $installScript" -Type "Error"
+        return $false
+    }
+
+    Show-Status "Running SDL2 installer..."
+
+    $params = @{}
+    if ($ForceSDL2) { $params["Force"] = $true }
+
+    & $installScript @params
+    $exitCode = $LASTEXITCODE
+
+    switch ($exitCode) {
+        0 {
+            Show-Status "SDL2 installed successfully" -Type "Success"
+            return $true
+        }
+        5 {
+            Show-Status "SDL2 already installed" -Type "Success"
+            return $true
+        }
+        default {
+            Show-Status "SDL2 installation failed (exit code: $exitCode)" -Type "Error"
+            return $false
+        }
+    }
+}
+
+function Test-RuntimeInstallation {
+    if (!(Test-Path $RuntimeMarker)) {
+        return $false
+    }
+    return $true
+}
+
+function Install-Runtime {
+    $installScript = Join-Path $ProjectRoot "scripts\windows\install-runtime-x86_64.ps1"
+
+    if (!(Test-Path $installScript)) {
+        Show-Status "Runtime install script not found: $installScript" -Type "Error"
+        return $false
+    }
+
+    Show-Status "Running Runtime installer..."
+
+    $params = @{}
+    if ($ForceRuntime) { $params["Force"] = $true }
+
+    & $installScript @params
+    $exitCode = $LASTEXITCODE
+
+    switch ($exitCode) {
+        0 {
+            Show-Status "Runtime installed successfully" -Type "Success"
+            return $true
+        }
+        5 {
+            Show-Status "Runtime already installed" -Type "Success"
+            return $true
+        }
+        default {
+            Show-Status "Runtime installation failed (exit code: $exitCode)" -Type "Error"
+            return $false
+        }
+    }
+}
+
 function Initialize-BuildDirs {
     $binPath = Join-Path $ProjectRoot $BinDir
     $libPath = Join-Path $ProjectRoot $LibDir
@@ -416,63 +497,25 @@ function Initialize-BuildDirs {
 }
 
 function Build-SedaiBasic {
-    $sourcePath = Join-Path $ProjectRoot $SourceFile
+    $buildScript = Join-Path $ProjectRoot "build.ps1"
 
-    if (!(Test-Path $sourcePath)) {
-        Show-Status "Source file not found: $SourceFile" -Type "Error"
+    if (!(Test-Path $buildScript)) {
+        Show-Status "Build script not found: $buildScript" -Type "Error"
         return $false
     }
 
-    Show-Status "Compiling SedaiBasic2..."
-    Show-Status "Source: $SourceFile"
-    Show-Status "Output: $BinDir\$OutputExe"
-
-    $compilerArgs = @(
-        "-o$OutputExe"
-        "-Px86_64"
-        "-Twin64"
-        "-MObjFPC"
-        "-Scghi"
-        "-CX"
-        "-Si"
-        "-O3"
-        "-CpCOREAVX2"
-        "-OpCOREAVX2"
-        "-CfAVX2"
-        "-OoREGVAR"
-        "-OoCSE"
-        "-OoDFA"
-        "-OoFASTMATH"
-        "-OoCONSTPROP"
-        "-Xs"
-        "-XX"
-        "-ve"           # Show only errors (suppress warnings)
-        "-Fusrc"
-        "-Fu$LibDir"
-        "-FU$LibDir"
-        "-FE$BinDir"
-        $SourceFile
-    )
+    Show-Status "Building SedaiBasic2 using build.ps1 -Clean..."
+    Show-Status "Targets: sb, sbc, sbd, sbv"
+    Show-Status "Output: $BinDir\"
 
     Push-Location $ProjectRoot
     try {
         Write-Host ""
-        $output = & $FpcExe @compilerArgs 2>&1
+
+        # Use build.ps1 -Clean to compile all targets
+        & $buildScript -Clean
         $exitCode = $LASTEXITCODE
 
-        # Show compiler output (filtered for important lines)
-        $output | ForEach-Object {
-            $line = $_
-            if ($line -match "Error|Fatal|Linking|lines compiled") {
-                if ($line -match "Error|Fatal") {
-                    Write-Host "      $line" -ForegroundColor Red
-                } elseif ($line -match "Linking") {
-                    Write-Host "      $line" -ForegroundColor Green
-                } elseif ($line -match "lines compiled") {
-                    Write-Host "      $line" -ForegroundColor Green
-                }
-            }
-        }
         Write-Host ""
 
         if ($exitCode -eq 0) {
@@ -522,14 +565,18 @@ function Invoke-Setup {
     # Determine steps
     $doFpc = -not $BuildOnly
     $doBuild = -not $FpcOnly
-    $doPython = -not $FpcOnly  # Install Python runtime unless FpcOnly
-    $doLua = -not $FpcOnly     # Install Lua runtime unless FpcOnly
+    $doSDL2 = -not $FpcOnly      # Install SDL2 bindings unless FpcOnly
+    $doRuntime = -not $FpcOnly   # Install runtime (SDL2 DLLs, fonts) unless FpcOnly
+    $doPython = -not $FpcOnly    # Install Python runtime unless FpcOnly
+    $doLua = -not $FpcOnly       # Install Lua runtime unless FpcOnly
 
     $totalSteps = 0
-    if ($doFpc) { $totalSteps += 2 }  # Install + Verify
-    if ($doBuild) { $totalSteps += 1 }  # Build
+    if ($doFpc) { $totalSteps += 2 }     # Install + Verify
+    if ($doSDL2) { $totalSteps += 1 }    # SDL2 bindings
+    if ($doRuntime) { $totalSteps += 1 } # Runtime (DLLs, fonts)
+    if ($doBuild) { $totalSteps += 1 }   # Build
     if ($doPython) { $totalSteps += 1 }  # Python runtime
-    if ($doLua) { $totalSteps += 1 }    # Lua runtime
+    if ($doLua) { $totalSteps += 1 }     # Lua runtime
 
     $currentStep = 0
 
@@ -561,6 +608,36 @@ function Invoke-Setup {
         $version = & $FpcExe -iV 2>&1
         Show-Status "FPC Version: $version" -Type "Success"
         Show-Status "Location: $FpcExe"
+    }
+
+    # Step: Install SDL2 for Pascal
+    if ($doSDL2) {
+        $currentStep++
+        Show-Step -Number $currentStep -Total $totalSteps -Title "Installing SDL2 for Pascal"
+
+        if (Test-SDL2Installation) {
+            Show-Status "SDL2 for Pascal is already installed" -Type "Skip"
+        } else {
+            if (!(Install-SDL2)) {
+                Show-Summary -Success $false
+                return 1
+            }
+        }
+    }
+
+    # Step: Install Runtime (SDL2 DLLs, fonts)
+    if ($doRuntime) {
+        $currentStep++
+        Show-Step -Number $currentStep -Total $totalSteps -Title "Installing Runtime (SDL2 DLLs, fonts)"
+
+        if (Test-RuntimeInstallation) {
+            Show-Status "Runtime is already installed" -Type "Skip"
+        } else {
+            if (!(Install-Runtime)) {
+                Show-Summary -Success $false
+                return 1
+            }
+        }
     }
 
     # Step: Build SedaiBasic2
@@ -621,9 +698,8 @@ function Invoke-Setup {
     }
 
     # Done!
-    $exePath = Join-Path $ProjectRoot "$BinDir\$OutputExe"
     $mode = if ($FpcOnly) { "fpc" } elseif ($BuildOnly) { "build" } else { "full" }
-    Show-Summary -Success $true -ExePath $exePath -Mode $mode
+    Show-Summary -Success $true -Mode $mode
 
     return 0
 }

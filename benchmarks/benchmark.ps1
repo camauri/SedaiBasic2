@@ -21,8 +21,9 @@
     Quick test mode: use N values from source files instead of standard benchmark values
 
 .PARAMETER Runs
-    Number of runs per benchmark in this session (default: 1)
-    Results are accumulated with previous runs for statistics.
+    Number of runs per benchmark (default: 1).
+    Clears history and runs fresh tests. Ignored if -Update or -Runtime is used
+    (in that case, runs are read from history).
 
 .PARAMETER ClearHistory
     Clear all accumulated benchmark history and start fresh
@@ -33,6 +34,15 @@
 
 .PARAMETER Output
     Custom output filename for the results (default: BENCHMARKS.md)
+
+.PARAMETER Update
+    Re-run specific benchmark(s) and replace their history data.
+    Accepts: fannkuch-redux, n-body, spectral-norm
+    Number of runs is read from history (or uses -Runs if history is empty).
+
+.PARAMETER Runtime
+    Run only specific runtime(s): sedai, python, lua
+    Number of runs is read from history (or uses -Runs if history is empty).
 
 .EXAMPLE
     .\benchmark.ps1
@@ -51,6 +61,18 @@
 
 .EXAMPLE
     .\benchmark.ps1 -Output "results.md"
+
+.EXAMPLE
+    .\benchmark.ps1 -Update fannkuch-redux
+
+.EXAMPLE
+    .\benchmark.ps1 -Update fannkuch-redux,spectral-norm
+
+.EXAMPLE
+    .\benchmark.ps1 -Runtime sedai
+
+.EXAMPLE
+    .\benchmark.ps1 -Update fannkuch-redux -Runtime sedai,lua
 #>
 
 param(
@@ -60,7 +82,9 @@ param(
     [switch]$ClearHistory,
     [switch]$Report,
     [string]$Output = "",
-    [int]$Runs = 1
+    [int]$Runs = 1,
+    [string[]]$Update = @(),
+    [string[]]$Runtime = @()
 )
 
 # ============================================================================
@@ -162,6 +186,45 @@ $Script:LuaBenchmarks = @(
     }
 )
 
+# Save original benchmark lists for report generation (before filtering)
+$Script:AllBenchmarks = $Script:Benchmarks
+$Script:AllPythonBenchmarks = $Script:PythonBenchmarks
+$Script:AllLuaBenchmarks = $Script:LuaBenchmarks
+
+# Filter benchmarks if -Update parameter is specified
+if ($Update.Count -gt 0) {
+    $validNames = $Script:Benchmarks | ForEach-Object { $_.Name }
+    $invalidNames = $Update | Where-Object { $_ -notin $validNames }
+    if ($invalidNames.Count -gt 0) {
+        Write-Host "ERROR: Unknown benchmark(s): $($invalidNames -join ', ')" -ForegroundColor Red
+        Write-Host "Valid names: $($validNames -join ', ')" -ForegroundColor Yellow
+        exit 1
+    }
+    $Script:Benchmarks = $Script:Benchmarks | Where-Object { $_.Name -in $Update }
+    $Script:PythonBenchmarks = $Script:PythonBenchmarks | Where-Object { $_.Name -in $Update }
+    $Script:LuaBenchmarks = $Script:LuaBenchmarks | Where-Object { $_.Name -in $Update }
+}
+
+# Runtime flags (default: all enabled)
+$Script:RunSedai = $true
+$Script:RunPython = $true
+$Script:RunLua = $true
+
+# Filter runtimes if -Runtime parameter is specified
+if ($Runtime.Count -gt 0) {
+    $validRuntimes = @("sedai", "python", "lua")
+    $normalizedRuntimes = $Runtime | ForEach-Object { $_.ToLower() }
+    $invalidRuntimes = $normalizedRuntimes | Where-Object { $_ -notin $validRuntimes }
+    if ($invalidRuntimes.Count -gt 0) {
+        Write-Host "ERROR: Unknown runtime(s): $($invalidRuntimes -join ', ')" -ForegroundColor Red
+        Write-Host "Valid runtimes: $($validRuntimes -join ', ')" -ForegroundColor Yellow
+        exit 1
+    }
+    $Script:RunSedai = "sedai" -in $normalizedRuntimes
+    $Script:RunPython = "python" -in $normalizedRuntimes
+    $Script:RunLua = "lua" -in $normalizedRuntimes
+}
+
 # Function to read N value from source file
 function Get-SourceN {
     param([hashtable]$Benchmark)
@@ -207,16 +270,19 @@ function Show-Help {
     Write-Host "    -Help           Show this help message"
     Write-Host "    -Force          Force re-run of all benchmarks, ignoring previous results"
     Write-Host "    -Quick          Use N values from source files (fast test mode)"
-    Write-Host "    -Runs <n>       Number of runs per benchmark in this session (default: 1)"
+    Write-Host "    -Runs <n>       Number of runs (clears history). Ignored with -Update/-Runtime"
     Write-Host "    -ClearHistory   Clear accumulated benchmark history and start fresh"
     Write-Host "    -Report         Generate report from existing history (no benchmark run)"
     Write-Host "    -Output <file>  Custom output filename (default: auto-generated)"
+    Write-Host "    -Update <names> Re-run specific benchmark(s), replacing history data"
+    Write-Host "                    Valid: fannkuch-redux, n-body, spectral-norm"
+    Write-Host "    -Runtime <rt>   Run only specific runtime(s): sedai, python, lua"
     Write-Host ""
-    Write-Host "CUMULATIVE STATISTICS:" -ForegroundColor Yellow
-    Write-Host "    Each run is saved to a history file. Statistics (mean, median, stddev,"
-    Write-Host "    percentiles) are calculated using ALL accumulated runs over time."
-    Write-Host "    Run the benchmark multiple times to build reliable statistics."
-    Write-Host "    Runs are only added to history when ALL 3 benchmarks complete successfully."
+    Write-Host "RUN COUNT BEHAVIOR:" -ForegroundColor Yellow
+    Write-Host "    - With -Runs only: clears history and runs N fresh tests for all benchmarks"
+    Write-Host "    - With -Update or -Runtime: reads run count from history (ignores -Runs)"
+    Write-Host "    - If history is empty with -Update/-Runtime: uses -Runs (default: 1)"
+    Write-Host "    - Misaligned run counts between runtimes: uses max and shows warning"
     Write-Host ""
     Write-Host "SESSION RESUME:" -ForegroundColor Yellow
     Write-Host "    If a session was interrupted, the next run will automatically resume"
@@ -231,14 +297,17 @@ function Show-Help {
     Write-Host "    Use -Quick to run with N values from source files instead."
     Write-Host ""
     Write-Host "EXAMPLES:" -ForegroundColor Yellow
-    Write-Host "    .\benchmark.ps1                 # Run once, accumulate results"
-    Write-Host "    .\benchmark.ps1 -Runs 3         # Run 3 times, accumulate results"
+    Write-Host "    .\benchmark.ps1                 # Run all benchmarks (uses history run count)"
+    Write-Host "    .\benchmark.ps1 -Runs 5         # Clear history, run 5 times for all"
     Write-Host "    .\benchmark.ps1 -Quick          # Run with N from source files"
-    Write-Host "    .\benchmark.ps1 -Quick -Runs 5  # Quick mode with 5 runs"
     Write-Host "    .\benchmark.ps1 -Force          # Re-run all, ignore cached session"
     Write-Host "    .\benchmark.ps1 -ClearHistory   # Reset all accumulated data"
     Write-Host "    .\benchmark.ps1 -Report         # Generate report from history only"
     Write-Host "    .\benchmark.ps1 -Output out.md  # Use custom output filename"
+    Write-Host "    .\benchmark.ps1 -Update fannkuch-redux            # Re-run single benchmark"
+    Write-Host "    .\benchmark.ps1 -Update fannkuch-redux,n-body     # Re-run multiple"
+    Write-Host "    .\benchmark.ps1 -Runtime sedai                    # Re-run all on SedaiBasic2"
+    Write-Host "    .\benchmark.ps1 -Update fannkuch-redux -Runtime sedai  # Combined"
     Write-Host ""
     Write-Host "OUTPUT:" -ForegroundColor Yellow
     Write-Host "    Results are saved to BENCHMARK_YYYY-MM-DD-SSSSS.md and displayed on screen."
@@ -442,6 +511,96 @@ function Get-BenchmarkHistory {
 function Save-BenchmarkHistory {
     param([hashtable]$History)
     $History | ConvertTo-Json -Depth 10 | Set-Content $HistoryFile -Encoding UTF8
+}
+
+function Get-HistoryRunCounts {
+    # Returns a hashtable with run counts per benchmark and runtime
+    # Also returns max runs per benchmark (for realignment)
+    # Keys: "benchmarkName" -> @{ Sedai=N; Python1t=N; PythonMt=N; Lua=N; Max=N }
+
+    $history = Get-BenchmarkHistory
+    $result = @{}
+
+    # All benchmark names
+    $benchNames = @("fannkuch-redux", "n-body", "spectral-norm")
+
+    foreach ($benchName in $benchNames) {
+        $counts = @{
+            Sedai = 0
+            Python1t = 0
+            PythonMt = 0
+            Lua = 0
+            Max = 0
+        }
+
+        # SedaiBasic2
+        if ($history.ContainsKey($benchName)) {
+            $counts.Sedai = $history[$benchName].Count
+        }
+
+        # Python single-thread
+        $py1tKey = "Python_$benchName-1t"
+        if ($history.ContainsKey($py1tKey)) {
+            $counts.Python1t = $history[$py1tKey].Count
+        }
+
+        # Python multi-thread
+        $pyMtKey = "Python_$benchName-mt"
+        if ($history.ContainsKey($pyMtKey)) {
+            $counts.PythonMt = $history[$pyMtKey].Count
+        }
+
+        # Lua
+        $luaKey = "Lua_$benchName"
+        if ($history.ContainsKey($luaKey)) {
+            $counts.Lua = $history[$luaKey].Count
+        }
+
+        # Calculate max
+        $counts.Max = [Math]::Max($counts.Sedai, [Math]::Max($counts.Python1t, [Math]::Max($counts.PythonMt, $counts.Lua)))
+
+        $result[$benchName] = $counts
+    }
+
+    return $result
+}
+
+function Get-GlobalMaxRuns {
+    # Returns the global max runs across all benchmarks
+    $counts = Get-HistoryRunCounts
+    $globalMax = 0
+    foreach ($benchName in $counts.Keys) {
+        if ($counts[$benchName].Max -gt $globalMax) {
+            $globalMax = $counts[$benchName].Max
+        }
+    }
+    return $globalMax
+}
+
+function Show-RunCountMisalignment {
+    param([hashtable]$Counts)
+
+    $hasWarning = $false
+    foreach ($benchName in $Counts.Keys) {
+        $c = $Counts[$benchName]
+        $values = @($c.Sedai, $c.Python1t, $c.PythonMt, $c.Lua) | Where-Object { $_ -gt 0 }
+        if ($values.Count -gt 1) {
+            $min = ($values | Measure-Object -Minimum).Minimum
+            $max = ($values | Measure-Object -Maximum).Maximum
+            if ($min -ne $max) {
+                if (-not $hasWarning) {
+                    Write-Host ""
+                    Write-Host "  WARNING: Run count misalignment detected!" -ForegroundColor Yellow
+                    $hasWarning = $true
+                }
+                Write-Host "    $benchName : Sedai=$($c.Sedai), Python1t=$($c.Python1t), PythonMt=$($c.PythonMt), Lua=$($c.Lua) (using max=$($c.Max))" -ForegroundColor Yellow
+            }
+        }
+    }
+    if ($hasWarning) {
+        Write-Host ""
+    }
+    return $hasWarning
 }
 
 function Add-RunToHistory {
@@ -1231,7 +1390,7 @@ function Generate-Results {
 
     # Calculate total runs from status (each benchmark may have different counts)
     $totalRunsInfo = @()
-    foreach ($bench in $Benchmarks) {
+    foreach ($bench in $Script:AllBenchmarks) {
         $result = $status[$bench.Name]
         if ($result -and $result.RunCount) {
             $totalRunsInfo += "$($bench.Name): $($result.RunCount)"
@@ -1274,7 +1433,7 @@ function Generate-Results {
 |-----------|--:|---------------:|-------------:|-------------:|
 "@
 
-    foreach ($bench in $Benchmarks) {
+    foreach ($bench in $Script:AllBenchmarks) {
         $result = $status[$bench.Name]
         if ($result -and $result.Completed) {
             $time = "{0:F3} ms" -f ($result.ExecutionTime * 1000)
@@ -1291,7 +1450,7 @@ function Generate-Results {
 
     # Check if any benchmark has Python results
     $hasPythonResults = $false
-    foreach ($bench in $Benchmarks) {
+    foreach ($bench in $Script:AllBenchmarks) {
         $result = $status[$bench.Name]
         if ($result -and ($result.PythonSingleTime -gt 0 -or $result.PythonMultiTime -gt 0)) {
             $hasPythonResults = $true
@@ -1309,7 +1468,7 @@ function Generate-Results {
 | Benchmark | SedaiBasic2 | Python (1T) | Speedup (1T) | Python (MT) | Speedup (MT) |
 |-----------|------------:|------------:|-------------:|------------:|-------------:|
 "@
-        foreach ($bench in $Benchmarks) {
+        foreach ($bench in $Script:AllBenchmarks) {
             $result = $status[$bench.Name]
             if ($result -and $result.Completed) {
                 $sbTime = "{0:F3} ms" -f ($result.ExecutionTime * 1000)
@@ -1324,7 +1483,7 @@ function Generate-Results {
 
     # Check if any benchmark has Lua results
     $hasLuaResults = $false
-    foreach ($bench in $Benchmarks) {
+    foreach ($bench in $Script:AllBenchmarks) {
         $result = $status[$bench.Name]
         if ($result -and $result.LuaTime -gt 0) {
             $hasLuaResults = $true
@@ -1342,7 +1501,7 @@ function Generate-Results {
 | Benchmark | SedaiBasic2 | Lua 5.4 | Speedup |
 |-----------|------------:|--------:|--------:|
 "@
-        foreach ($bench in $Benchmarks) {
+        foreach ($bench in $Script:AllBenchmarks) {
             $result = $status[$bench.Name]
             if ($result -and $result.Completed) {
                 $sbTime = "{0:F3} ms" -f ($result.ExecutionTime * 1000)
@@ -1355,7 +1514,7 @@ function Generate-Results {
 
     # Check if any benchmark has multiple runs
     $hasMultipleRuns = $false
-    foreach ($bench in $Benchmarks) {
+    foreach ($bench in $Script:AllBenchmarks) {
         $result = $status[$bench.Name]
         if ($result -and $result.RunCount -gt 1) {
             $hasMultipleRuns = $true
@@ -1373,7 +1532,7 @@ function Generate-Results {
 | Benchmark | Runs | Mean | Median | Std Dev | Min | Max |
 |-----------|-----:|-----:|-------:|--------:|----:|----:|
 "@
-        foreach ($bench in $Benchmarks) {
+        foreach ($bench in $Script:AllBenchmarks) {
             $result = $status[$bench.Name]
             if ($result -and $result.Completed -and $result.RunCount -gt 1) {
                 $runs = $result.RunCount
@@ -1394,7 +1553,7 @@ function Generate-Results {
 | Benchmark | P90 | P95 | P99 |
 |-----------|----:|----:|----:|
 "@
-        foreach ($bench in $Benchmarks) {
+        foreach ($bench in $Script:AllBenchmarks) {
             $result = $status[$bench.Name]
             if ($result -and $result.Completed -and $result.RunCount -gt 1) {
                 $p90 = "{0:F3} ms" -f ($result.P90 * 1000)
@@ -1855,8 +2014,33 @@ function Invoke-Benchmarks {
     } else {
         Write-Host "  Mode: STANDARD (Benchmarks Game N values)" -ForegroundColor Green
     }
-    if ($Runs -gt 1) {
-        Write-Host "  Runs: $Runs per benchmark (cumulative statistics)" -ForegroundColor Cyan
+
+    # Determine run count and mode
+    $Script:IsUpdateMode = ($Update.Count -gt 0) -or ($Runtime.Count -gt 0)
+    $Script:EffectiveRuns = $Runs
+
+    if ($Script:IsUpdateMode) {
+        # Update mode: read runs from history
+        $runCounts = Get-HistoryRunCounts
+        $globalMax = Get-GlobalMaxRuns
+
+        if ($globalMax -gt 0) {
+            $Script:EffectiveRuns = $globalMax
+            Write-Host "  Runs: $globalMax (from history)" -ForegroundColor Cyan
+            # Check for misalignment
+            Show-RunCountMisalignment -Counts $runCounts | Out-Null
+        } else {
+            # History empty, use -Runs parameter
+            Write-Host "  Runs: $Runs (history empty, using -Runs)" -ForegroundColor Cyan
+        }
+        Write-Host "  Update mode: results will REPLACE history for selected benchmarks/runtimes" -ForegroundColor Yellow
+    } else {
+        # Full mode with -Runs: clear history and run fresh
+        if ($Runs -gt 1) {
+            Write-Host "  Runs: $Runs per benchmark (will REPLACE history)" -ForegroundColor Cyan
+        } else {
+            Write-Host "  Runs: 1 per benchmark" -ForegroundColor Cyan
+        }
     }
     Write-Host ""
 
@@ -2001,22 +2185,71 @@ function Invoke-Benchmarks {
         return 0
     }
 
+    # Clear history as needed before running tests
+    if ($Script:IsUpdateMode) {
+        # Update mode: clear only selected benchmark/runtime combinations
+        $history = Get-BenchmarkHistory
+        $modified = $false
+
+        foreach ($bench in $toRun) {
+            # Clear SedaiBasic2 history for this benchmark if running sedai
+            if ($Script:RunSedai -and $history.ContainsKey($bench.Name)) {
+                $history.Remove($bench.Name)
+                $modified = $true
+            }
+            # Clear Python history for this benchmark if running python
+            if ($Script:RunPython) {
+                $py1tKey = "Python_$($bench.Name)-1t"
+                $pyMtKey = "Python_$($bench.Name)-mt"
+                if ($history.ContainsKey($py1tKey)) {
+                    $history.Remove($py1tKey)
+                    $modified = $true
+                }
+                if ($history.ContainsKey($pyMtKey)) {
+                    $history.Remove($pyMtKey)
+                    $modified = $true
+                }
+            }
+            # Clear Lua history for this benchmark if running lua
+            if ($Script:RunLua) {
+                $luaKey = "Lua_$($bench.Name)"
+                if ($history.ContainsKey($luaKey)) {
+                    $history.Remove($luaKey)
+                    $modified = $true
+                }
+            }
+        }
+
+        if ($modified) {
+            Save-BenchmarkHistory $history
+            Show-Status "Cleared history for selected benchmarks/runtimes" -Type "Info"
+        }
+    } else {
+        # Full mode: clear ALL history
+        Clear-BenchmarkHistory
+        Show-Status "Cleared all benchmark history" -Type "Info"
+    }
     Write-Host ""
-    Write-Host "  Starting SedaiBasic2 benchmarks..." -ForegroundColor Cyan
-    Write-Host ""
+
+    $failed = 0
 
     # Run SedaiBasic2 benchmarks
-    $failed = 0
-    foreach ($bench in $toRun) {
-        if (!(Run-Benchmark -Benchmark $bench -QuickMode $Quick -RunCount $Runs)) {
-            $failed++
-        }
+    if ($Script:RunSedai) {
         Write-Host ""
+        Write-Host "  Starting SedaiBasic2 benchmarks..." -ForegroundColor Cyan
+        Write-Host ""
+
+        foreach ($bench in $toRun) {
+            if (!(Run-Benchmark -Benchmark $bench -QuickMode $Quick -RunCount $Script:EffectiveRuns)) {
+                $failed++
+            }
+            Write-Host ""
+        }
     }
 
-    # Run Python benchmarks if available
+    # Run Python benchmarks if available and enabled
     $pythonAvailable = Test-Path $PythonExe
-    if ($pythonAvailable -and $failed -eq 0) {
+    if ($Script:RunPython -and $pythonAvailable -and $failed -eq 0) {
         Write-Host "  Starting Python benchmarks..." -ForegroundColor Cyan
         Write-Host ""
 
@@ -2040,16 +2273,16 @@ function Invoke-Benchmarks {
                 Write-Host "       $($pyBench.Description)" -ForegroundColor DarkGray
 
                 # Run each single-thread test individually to save to history
-                for ($i = 1; $i -le $Runs; $i++) {
-                    if ($Runs -gt 1) {
-                        Write-Host "`r       Run $i of $Runs...   " -ForegroundColor DarkGray -NoNewline
+                for ($i = 1; $i -le $Script:EffectiveRuns; $i++) {
+                    if ($Script:EffectiveRuns -gt 1) {
+                        Write-Host "`r       Run $i of $Script:EffectiveRuns...   " -ForegroundColor DarkGray -NoNewline
                     }
                     $singleResult = Run-SinglePythonBenchmark -ScriptPath (Join-Path $PyTestsDir $pyBench.PyScript) -N $currentN
                     if ($singleResult.Success) {
                         $singleTimes += $singleResult.ExecutionTime
                     }
                 }
-                if ($Runs -gt 1) {
+                if ($Script:EffectiveRuns -gt 1) {
                     Write-Host "`r                              `r" -NoNewline
                 }
 
@@ -2070,16 +2303,16 @@ function Invoke-Benchmarks {
                     Write-Host "       $($pyBench.Description)" -ForegroundColor DarkGray
 
                     # Run each multi-thread test individually to save to history
-                    for ($i = 1; $i -le $Runs; $i++) {
-                        if ($Runs -gt 1) {
-                            Write-Host "`r       Run $i of $Runs...   " -ForegroundColor DarkGray -NoNewline
+                    for ($i = 1; $i -le $Script:EffectiveRuns; $i++) {
+                        if ($Script:EffectiveRuns -gt 1) {
+                            Write-Host "`r       Run $i of $Script:EffectiveRuns...   " -ForegroundColor DarkGray -NoNewline
                         }
                         $multiResult = Run-SinglePythonBenchmark -ScriptPath (Join-Path $PyTestsDir $pyBench.PyScriptMulti) -N $currentN
                         if ($multiResult.Success) {
                             $multiTimes += $multiResult.ExecutionTime
                         }
                     }
-                    if ($Runs -gt 1) {
+                    if ($Script:EffectiveRuns -gt 1) {
                         Write-Host "`r                              `r" -NoNewline
                     }
 
@@ -2095,10 +2328,10 @@ function Invoke-Benchmarks {
                 }
 
                 # Save each Python run to pending
-                for ($i = 0; $i -lt $Runs; $i++) {
+                for ($i = 0; $i -lt $Script:EffectiveRuns; $i++) {
                     $timeSingle = if ($i -lt $singleTimes.Count) { $singleTimes[$i] } else { 0.0 }
                     $timeMulti = if ($i -lt $multiTimes.Count) { $multiTimes[$i] } else { 0.0 }
-                    Add-PendingPythonRun -Name $bench.Name -N $currentN -TimeSingle $timeSingle -TimeMulti $timeMulti -QuickMode $Quick -RunCount $Runs
+                    Add-PendingPythonRun -Name $bench.Name -N $currentN -TimeSingle $timeSingle -TimeMulti $timeMulti -QuickMode $Quick -RunCount $Script:EffectiveRuns
                 }
 
                 # Update status with Python times (averages for display)
@@ -2109,9 +2342,9 @@ function Invoke-Benchmarks {
         }
     }
 
-    # Run Lua benchmarks if available
+    # Run Lua benchmarks if available and enabled
     $luaAvailable = Test-Path $LuaExe
-    if ($luaAvailable -and $failed -eq 0) {
+    if ($Script:RunLua -and $luaAvailable -and $failed -eq 0) {
         Write-Host "  Starting Lua benchmarks..." -ForegroundColor Cyan
         Write-Host ""
 
@@ -2134,16 +2367,16 @@ function Invoke-Benchmarks {
                 Write-Host "       $($luaBench.Description)" -ForegroundColor DarkGray
 
                 # Run each test individually to save to history
-                for ($i = 1; $i -le $Runs; $i++) {
-                    if ($Runs -gt 1) {
-                        Write-Host "`r       Run $i of $Runs...   " -ForegroundColor DarkGray -NoNewline
+                for ($i = 1; $i -le $Script:EffectiveRuns; $i++) {
+                    if ($Script:EffectiveRuns -gt 1) {
+                        Write-Host "`r       Run $i of $Script:EffectiveRuns...   " -ForegroundColor DarkGray -NoNewline
                     }
                     $luaResult = Run-SingleLuaBenchmark -ScriptPath (Join-Path $LuaTestsDir $luaBench.LuaScript) -N $currentN
                     if ($luaResult.Success) {
                         $luaTimes += $luaResult.ExecutionTime
                     }
                 }
-                if ($Runs -gt 1) {
+                if ($Script:EffectiveRuns -gt 1) {
                     Write-Host "`r                              `r" -NoNewline
                 }
 
@@ -2158,9 +2391,9 @@ function Invoke-Benchmarks {
                 Write-Host ""
 
                 # Save each Lua run to pending
-                for ($i = 0; $i -lt $Runs; $i++) {
+                for ($i = 0; $i -lt $Script:EffectiveRuns; $i++) {
                     $time = if ($i -lt $luaTimes.Count) { $luaTimes[$i] } else { 0.0 }
-                    Add-PendingLuaRun -Name $bench.Name -N $currentN -Time $time -QuickMode $Quick -RunCount $Runs
+                    Add-PendingLuaRun -Name $bench.Name -N $currentN -Time $time -QuickMode $Quick -RunCount $Script:EffectiveRuns
                 }
 
                 # Update status with Lua time
@@ -2215,7 +2448,7 @@ function Invoke-Benchmarks {
 
     # Generate results
     Write-Host ""
-    Generate-Results -SystemInfo $systemInfo -QuickMode $Quick -RunCount $Runs
+    Generate-Results -SystemInfo $systemInfo -QuickMode $Quick -RunCount $Script:EffectiveRuns
 
     # Show report saved message and clean up after successful session
     if ($failed -eq 0 -and (Test-SessionComplete -Session $session)) {
