@@ -41,6 +41,8 @@
 unit SedaiConstPropAggressive;
 
 {$mode objfpc}{$H+}
+{$interfaces CORBA}
+{$codepage UTF8}
 {$I OptimizationFlags.inc}
 {$I DebugFlags.inc}
 

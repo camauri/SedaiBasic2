@@ -172,6 +172,13 @@ begin
     ssaPrintLn: Result := bcPrintLn;
     ssaPrintString: Result := bcPrintString;
     ssaPrintStringLn: Result := bcPrintStringLn;
+    ssaPrintInt: Result := bcPrintInt;
+    ssaPrintIntLn: Result := bcPrintIntLn;
+    ssaPrintComma: Result := bcPrintComma;
+    ssaPrintSemicolon: Result := bcPrintSemicolon;
+    ssaPrintTab: Result := bcPrintTab;
+    ssaPrintSpc: Result := bcPrintSpc;
+    ssaPrintNewLine: Result := bcPrintNewLine;
     ssaInput: Result := bcInput;
     ssaInputInt: Result := bcInputInt;
     ssaInputFloat: Result := bcInputFloat;
@@ -188,6 +195,19 @@ begin
     // to emit typed opcodes (bcArrayLoadInt/Float/String, bcArrayStoreInt/Float/String)
     ssaArrayLoad: Result := bcArrayLoad;  // Fallback - should use GetTypedArrayLoadOp
     ssaArrayStore: Result := bcArrayStore;  // Fallback - should use GetTypedArrayStoreOp
+    // Graphics operations
+    ssaGraphicRGBA: Result := bcGraphicRGBA;
+    ssaGraphicSetMode: Result := bcGraphicSetMode;
+    ssaGraphicBox: Result := bcGraphicBox;
+    ssaGraphicCircle: Result := bcGraphicCircle;
+    ssaGraphicDraw: Result := bcGraphicDraw;
+    ssaGraphicLocate: Result := bcGraphicLocate;
+    ssaGraphicRdot: Result := bcGraphicRdot;
+    ssaGraphicGetMode: Result := bcGraphicGetMode;
+    // System commands
+    ssaFast: Result := bcFast;
+    ssaSlow: Result := bcSlow;
+    ssaSleep: Result := bcSleep;
   else
     Result := bcNop;
   end;
@@ -296,10 +316,238 @@ var
   FloatVal: Double;
   BCIndex: Integer;
   ArrayIdx: Integer;
+  // For RGBA handling
+  ARegMapped, BRegMapped: Integer;
 begin
   // Skip NOP instructions - they are dead code from optimizations
   if Instr.OpCode = ssaNop then
     Exit;
+
+  // Special handling for RGBA - pack 4 register indices into bytecode format
+  if Instr.OpCode = ssaGraphicRGBA then
+  begin
+    BCOp := bcGraphicRGBA;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+    // Map destination register
+    if Instr.Dest.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
+    // Src1 = R register
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    // Src2 = G register
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    // Src3 = B register, A is stored in PhiSources[0]
+    // Pack both B and A register indices into Immediate: (B << 16) | A
+    if Instr.Src3.Kind = svkRegister then
+    begin
+      // B register comes from Src3
+      BRegMapped := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
+
+      // A register comes from PhiSources[0]
+      ARegMapped := 0;
+      if Length(Instr.PhiSources) > 0 then
+      begin
+        with Instr.PhiSources[0].Value do
+        begin
+          if Kind = svkRegister then
+            ARegMapped := MapSSARegisterToBytecode(RegType, RegIndex, Version);
+          WriteLn(StdErr, 'RGBA: B_bc=', BRegMapped, ' A_bc=', ARegMapped,
+            ' A_ssa(type=', Ord(RegType), ',idx=', RegIndex, ',ver=', Version, ')');
+        end;
+      end
+      else
+        WriteLn(StdErr, 'RGBA: B=', BRegMapped, ' NO PhiSources!');
+
+      BCInstr.Immediate := (BRegMapped shl 16) or ARegMapped;
+    end;
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for BOX - pack 8 parameters into bytecode format
+  // BOX color, x1, y1, x2, y2, angle, filled, fill_color
+  // SSA: Src1=color, Src2=x1, Src3=y1, PhiSources[0..4]=x2,y2,angle,filled,fill_color
+  if Instr.OpCode = ssaGraphicBox then
+  begin
+    BCOp := bcGraphicBox;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    // Src1 = color register
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    // Src2 = x1 register
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+
+    // Dest = y1 register (repurposed since BOX has no result)
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
+
+    // Pack additional params (x2, y2, angle, filled, fill_color) into Immediate
+    // Format: bits 0-11: x2, bits 12-23: y2, bits 24-35: angle, bits 36-39: filled, bits 40-51: fill_color
+    // But since Word max is 65535, we use 12 bits per register index
+    // Immediate is Int64, so we have 64 bits available
+    // Layout: x2(12) | y2(12) | angle(12) | filled(12) | fill_color(12) = 60 bits
+    if Length(Instr.PhiSources) >= 5 then
+    begin
+      BCInstr.Immediate := 0;
+      // x2 in bits 0-11
+      if Instr.PhiSources[0].Value.Kind = svkRegister then
+      begin
+        WriteLn('>>> BOX Compiler: x2 SSA=', Instr.PhiSources[0].Value.RegIndex, '_v', Instr.PhiSources[0].Value.Version,
+                ' -> BC=', MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+                  Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version));
+        BCInstr.Immediate := BCInstr.Immediate or
+          (Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+            Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFF);
+      end;
+      // y2 in bits 12-23
+      if Instr.PhiSources[1].Value.Kind = svkRegister then
+      begin
+        WriteLn('>>> BOX Compiler: y2 SSA=', Instr.PhiSources[1].Value.RegIndex, '_v', Instr.PhiSources[1].Value.Version,
+                ' -> BC=', MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
+                  Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version));
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
+            Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FFF) shl 12);
+      end;
+      // angle in bits 24-35
+      if Instr.PhiSources[2].Value.Kind = svkRegister then
+      begin
+        WriteLn('>>> BOX Compiler: angle SSA=', Instr.PhiSources[2].Value.RegIndex, '_v', Instr.PhiSources[2].Value.Version,
+                ' -> BC=', MapSSARegisterToBytecode(Instr.PhiSources[2].Value.RegType,
+                  Instr.PhiSources[2].Value.RegIndex, Instr.PhiSources[2].Value.Version));
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[2].Value.RegType,
+            Instr.PhiSources[2].Value.RegIndex, Instr.PhiSources[2].Value.Version)) and $FFF) shl 24);
+      end;
+      // filled in bits 36-47
+      if Instr.PhiSources[3].Value.Kind = svkRegister then
+      begin
+        WriteLn('>>> BOX Compiler: filled SSA=', Instr.PhiSources[3].Value.RegIndex, '_v', Instr.PhiSources[3].Value.Version,
+                ' -> BC=', MapSSARegisterToBytecode(Instr.PhiSources[3].Value.RegType,
+                  Instr.PhiSources[3].Value.RegIndex, Instr.PhiSources[3].Value.Version));
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[3].Value.RegType,
+            Instr.PhiSources[3].Value.RegIndex, Instr.PhiSources[3].Value.Version)) and $FFF) shl 36);
+      end;
+      // fill_color in bits 48-59
+      if Instr.PhiSources[4].Value.Kind = svkRegister then
+      begin
+        WriteLn('>>> BOX Compiler: fill_color SSA=', Instr.PhiSources[4].Value.RegIndex, '_v', Instr.PhiSources[4].Value.Version,
+                ' -> BC=', MapSSARegisterToBytecode(Instr.PhiSources[4].Value.RegType,
+                  Instr.PhiSources[4].Value.RegIndex, Instr.PhiSources[4].Value.Version));
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[4].Value.RegType,
+            Instr.PhiSources[4].Value.RegIndex, Instr.PhiSources[4].Value.Version)) and $FFF) shl 48);
+      end;
+    end;
+
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for CIRCLE - pack 9 parameters into bytecode format
+  // CIRCLE color, x, y, xr, yr, sa, ea, angle, inc
+  // SSA: Src1=color, Src2=x, Src3=y, PhiSources[0..5]=xr,yr,sa,ea,angle,inc
+  if Instr.OpCode = ssaGraphicCircle then
+  begin
+    BCOp := bcGraphicCircle;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    // Src1 = color register
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    // Src2 = x register
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+
+    // Dest = y register (repurposed since CIRCLE has no result)
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
+
+    // Pack additional params (xr, yr, sa, ea, angle, inc) into Immediate
+    // Layout: xr(10) | yr(10) | sa(10) | ea(10) | angle(10) | inc(10) = 60 bits
+    if Length(Instr.PhiSources) >= 6 then
+    begin
+      BCInstr.Immediate := 0;
+      // xr in bits 0-9
+      if Instr.PhiSources[0].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          (Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+            Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $3FF);
+      // yr in bits 10-19
+      if Instr.PhiSources[1].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
+            Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $3FF) shl 10);
+      // sa in bits 20-29
+      if Instr.PhiSources[2].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[2].Value.RegType,
+            Instr.PhiSources[2].Value.RegIndex, Instr.PhiSources[2].Value.Version)) and $3FF) shl 20);
+      // ea in bits 30-39
+      if Instr.PhiSources[3].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[3].Value.RegType,
+            Instr.PhiSources[3].Value.RegIndex, Instr.PhiSources[3].Value.Version)) and $3FF) shl 30);
+      // angle in bits 40-49
+      if Instr.PhiSources[4].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[4].Value.RegType,
+            Instr.PhiSources[4].Value.RegIndex, Instr.PhiSources[4].Value.Version)) and $3FF) shl 40);
+      // inc in bits 50-59
+      if Instr.PhiSources[5].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[5].Value.RegType,
+            Instr.PhiSources[5].Value.RegIndex, Instr.PhiSources[5].Value.Version)) and $3FF) shl 50);
+    end;
+
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for DRAW - pack mode into Immediate
+  // DRAW color, x, y with mode in PhiSources[0]
+  // SSA: Src1=color, Src2=x, Src3=y, PhiSources[0]=mode (0=move, 1=line, 2=dot)
+  if Instr.OpCode = ssaGraphicDraw then
+  begin
+    BCOp := bcGraphicDraw;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    // Src1 = color register
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    // Src2 = x register
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+
+    // Dest = y register (repurposed since DRAW has no result)
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
+
+    // Pack mode into Immediate
+    // mode: 0=move PC only, 1=draw line from PC to (x,y), 2=draw dot at (x,y)
+    if Length(Instr.PhiSources) >= 1 then
+    begin
+      if Instr.PhiSources[0].Value.Kind = svkConstInt then
+        BCInstr.Immediate := Instr.PhiSources[0].Value.ConstInt
+      else if Instr.PhiSources[0].Value.Kind = svkRegister then
+        BCInstr.Immediate := MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+          Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version) or $8000; // Flag bit to indicate register mode
+    end;
+
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
 
   // Special handling for array operations to emit typed opcodes
   if Instr.OpCode = ssaArrayLoad then
@@ -323,11 +571,20 @@ begin
   else
     BCOp := CompileSSAOpCode(Instr.OpCode);
 
+  // Debug: trace opcode compilation
+  if Instr.OpCode = ssaGraphicGetMode then
+    WriteLn('>>> BC Compiling ssaGraphicGetMode -> bcOp=', Ord(BCOp));
+
   BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
 
   // Map SSA values to bytecode operands
   if Instr.Dest.Kind = svkRegister then
-    BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version)
+  begin
+    BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
+    if Instr.OpCode = ssaLoadConstInt then
+      WriteLn('>>> BC LoadConstInt: SSA=', Instr.Dest.RegIndex, '_v', Instr.Dest.Version,
+              ' -> BC=', BCInstr.Dest, ' value=', Instr.Src1.ConstInt);
+  end
   else if Instr.Dest.Kind = svkLabel then
   begin
     // This is a jump - record for later resolution

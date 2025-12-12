@@ -22,6 +22,8 @@
 unit SedaiExceptionHelpers;
 
 {$mode ObjFPC}{$H+}
+{$interfaces CORBA}
+{$codepage UTF8}
 
 interface
 

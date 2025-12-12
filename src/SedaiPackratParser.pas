@@ -32,7 +32,7 @@ uses
   SedaiLexerTypes, SedaiLexerToken, SedaiTokenList, SedaiParserTypes,
   SedaiAST, SedaiParserContext, SedaiParserResults, SedaiParserErrors,
   SedaiPackratCore, SedaiExpressionParser, SedaiParserValidation,
-  SedaiExecutorTypes;
+  SedaiExecutorTypes, SedaiBasicKeywords;
 
 type
   { TPackratParser - Main BASIC Parser with Packrat memoization }
@@ -93,6 +93,8 @@ type
     function ParseGosubStatement: TASTNode;
     function ParseReturnStatement: TASTNode;
     function ParseEndStatement: TASTNode;
+    function ParseFastStatement: TASTNode;
+    function ParseSlowStatement: TASTNode;
     function ParseRemStatement: TASTNode;
     function ParseDimStatement: TASTNode;
     function ParseDefStatement: TASTNode;
@@ -1054,6 +1056,26 @@ begin
   DoNodeCreated(Result);
 end;
 
+function TPackratParser.ParseFastStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antFast, Token);
+  Context.Advance; // Consume FAST
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseSlowStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antSlow, Token);
+  Context.Advance; // Consume SLOW
+  DoNodeCreated(Result);
+end;
+
 function TPackratParser.ParseRemStatement: TASTNode;
 var
   Comment: string;
@@ -1112,9 +1134,15 @@ end;
 function TPackratParser.ParseClockStatement: TASTNode;
 var
   Token: TLexerToken;
+  NodeType: TASTNodeType;
 begin
   Token := Context.CurrentToken;
-  Result := TASTNode.Create(antStatement, Token);
+  // Distinguish FAST from SLOW by checking token value
+  if SameText(Token.Value, kFAST) then
+    NodeType := antFast
+  else
+    NodeType := antSlow;
+  Result := TASTNode.Create(NodeType, Token);
   Context.Advance; // Consume FAST/SLOW
   DoNodeCreated(Result);
 end;
@@ -1125,10 +1153,10 @@ var
   Param: TASTNode;
 begin
   Token := Context.CurrentToken;
-  Result := TASTNode.Create(antStatement, Token);
+  Result := TASTNode.Create(antSleep, Token);
   Context.Advance; // Consume SLEEP
 
-  // Parse optional parameter
+  // Parse required parameter (seconds to sleep)
   if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
   begin
     Param := ParseExpression;
@@ -1279,35 +1307,122 @@ function TPackratParser.ParseGraphicsStatement: TASTNode;
 var
   Token: TLexerToken;
   Param: TASTNode;
-  ParamCount: Integer;
+  ParamCount, MaxParams: Integer;
+  CmdName: string;
 begin
   Token := Context.CurrentToken;
-  if UpperCase(Token.Value) = 'GRAPHIC' then
+  CmdName := UpperCase(Token.Value);
+
+  // Select appropriate node type based on command
+  if CmdName = 'GRAPHIC' then
     Result := TASTNode.Create(antGraphics, Token)
+  else if CmdName = 'SCNCLR' then
+    Result := TASTNode.Create(antScnClr, Token)
+  else if CmdName = 'BOX' then
+    Result := TASTNode.Create(antBox, Token)
+  else if CmdName = 'CIRCLE' then
+    Result := TASTNode.Create(antCircle, Token)
+  else if CmdName = 'DRAW' then
+    Result := TASTNode.Create(antDraw, Token)
+  else if CmdName = 'LOCATE' then
+    Result := TASTNode.Create(antLocate, Token)
   else
     Result := TASTNode.Create(antStatement, Token);
+
   Context.Advance;
   ParamCount := 0;
 
-  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) and (ParamCount < 5) do
+  // CIRCLE has up to 9 parameters, BOX has up to 8, LOCATE has 2, SCNCLR has 1, other graphics commands have up to 5
+  if CmdName = 'CIRCLE' then
+    MaxParams := 9
+  else if CmdName = 'BOX' then
+    MaxParams := 8
+  else if CmdName = 'LOCATE' then
+    MaxParams := 2
+  else if CmdName = 'DRAW' then
+    MaxParams := 100  // DRAW can have many TO segments
+  else if CmdName = 'SCNCLR' then
+    MaxParams := 1  // SCNCLR [mode] - optional mode 0-11
+  else
+    MaxParams := 5;
+
+  // Special handling for DRAW: parse color, x1, y1 [TO x2, y2] ...
+  // Each segment (including TO keyword) is stored as children
+  if CmdName = 'DRAW' then
   begin
+    // Parse optional color (can be omitted but comma must remain)
     if Context.Check(ttSeparParam) then
     begin
+      // Color omitted, add nil placeholder
+      Result.AddChild(nil);
       Context.Advance;
-      Continue;
-    end;
-    Param := ParseExpression;
-    if Assigned(Param) then
-    begin
-      Result.AddChild(Param);
-      Inc(ParamCount);
     end
-    else
-      Break;
-    if Context.Check(ttSeparParam) then
-      Context.Advance
     else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
-      Break;
+    begin
+      Param := ParseExpression;
+      if Assigned(Param) then
+        Result.AddChild(Param);
+      if Context.Check(ttSeparParam) then
+        Context.Advance;
+    end;
+
+    // Parse x1, y1
+    while ParamCount < 2 do
+    begin
+      if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+        Break;
+      Param := ParseExpression;
+      if Assigned(Param) then
+      begin
+        Result.AddChild(Param);
+        Inc(ParamCount);
+      end
+      else
+        Break;
+      if Context.Check(ttSeparParam) then
+        Context.Advance;
+    end;
+
+    // Parse TO x2, y2 segments (can have multiple)
+    while Context.Check(ttLoopControl) and (UpperCase(Context.CurrentToken.Value) = 'TO') do
+    begin
+      Context.Advance; // consume TO
+      // Parse x, y coordinates
+      Param := ParseExpression;
+      if Assigned(Param) then
+        Result.AddChild(Param);
+      if Context.Check(ttSeparParam) then
+        Context.Advance;
+      Param := ParseExpression;
+      if Assigned(Param) then
+        Result.AddChild(Param);
+      if Context.Check(ttSeparParam) then
+        Context.Advance;
+    end;
+  end
+  else
+  begin
+    // Standard parsing for other graphics commands
+    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) and (ParamCount < MaxParams) do
+    begin
+      if Context.Check(ttSeparParam) then
+      begin
+        Context.Advance;
+        Continue;
+      end;
+      Param := ParseExpression;
+      if Assigned(Param) then
+      begin
+        Result.AddChild(Param);
+        Inc(ParamCount);
+      end
+      else
+        Break;
+      if Context.Check(ttSeparParam) then
+        Context.Advance
+      else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+        Break;
+    end;
   end;
   DoNodeCreated(Result);
 end;

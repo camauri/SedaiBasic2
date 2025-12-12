@@ -68,7 +68,7 @@ var
   Line: string;
 begin
   // Handle superinstructions (opcodes 100+) separately to avoid enum range issues
-  if Instr.OpCode >= 100 then
+  if Instr.OpCode >= 110 then
   begin
     case Instr.OpCode of
       // Fused compare-and-branch (Int) - opcodes 100-105
@@ -143,6 +143,14 @@ begin
       252: Line := Format('%4d: %-20s R%d, R%d', [Index, 'SubIntSelf', Instr.Dest, Instr.Src1]);
       // Array Load to register (Int) - opcode 253
       253: Line := Format('%4d: %-20s R%d, ARR[%d], idx=R%d', [Index, 'ArrayLoadIntTo', Instr.Dest, Instr.Src1, Instr.Src2]);
+      // Array Copy Element - opcode 254: arr_dest[idx] = arr_src[idx]
+      254: Line := Format('%4d: %-20s ARR[%d][R%d] = ARR[%d][R%d]', [Index, 'ArrayCopyElement', Instr.Dest, Instr.Src2, Instr.Src1, Instr.Src2]);
+      // Array Move Element - opcode 255: arr[dest_idx] = arr[src_idx]
+      255: Line := Format('%4d: %-20s ARR[%d][R%d] = ARR[%d][R%d]', [Index, 'ArrayMoveElement', Instr.Dest, Instr.Src2, Instr.Dest, Instr.Src1]);
+      // Array Reverse Range - opcode 156: reverse arr[start..end-1]
+      156: Line := Format('%4d: %-20s ARR[%d], R%d..R%d', [Index, 'ArrayReverseRange', Instr.Src1, Instr.Src2, Instr.Dest]);
+      // Array Shift Left - opcode 157: shift left arr[start..end]
+      157: Line := Format('%4d: %-20s ARR[%d], R%d..R%d', [Index, 'ArrayShiftLeft', Instr.Src1, Instr.Src2, Instr.Dest]);
     else
       Line := Format('%4d: (unknown superinstr opcode %d)', [Index, Instr.OpCode]);
     end;
@@ -196,8 +204,15 @@ begin
     bcJumpIfZero, bcJumpIfNotZero:
       Line := Line + Format('R%d, %d', [Instr.Src1, Instr.Immediate]);
 
-    bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn:
+    bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
+    bcPrintInt, bcPrintIntLn:
       Line := Line + Format('R%d', [Instr.Src1]);
+
+    bcPrintComma, bcPrintSemicolon, bcPrintNewLine:
+      ; // No operands
+
+    bcPrintTab, bcPrintSpc:
+      Line := Line + Format('%d', [Instr.Immediate]);
 
     bcInput, bcInputInt, bcInputFloat, bcInputString:
       Line := Line + Format('R%d', [Instr.Dest]);

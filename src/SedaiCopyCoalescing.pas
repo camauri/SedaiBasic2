@@ -50,6 +50,8 @@
 unit SedaiCopyCoalescing;
 
 {$mode objfpc}{$H+}
+{$interfaces CORBA}
+{$codepage UTF8}
 {$inline on}
 {$I OptimizationFlags.inc}
 {$I DebugFlags.inc}

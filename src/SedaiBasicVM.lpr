@@ -24,7 +24,6 @@ program SedaiBasicVM;
 {$mode objfpc}{$H+}
 {$interfaces CORBA}
 {$codepage UTF8}
-{$DEFINE ENABLE_INSTRUCTION_COUNTING}  // Must match define in SedaiBytecodeVM.pas
 
 // Include shared optimization flags
 {$I OptimizationFlags.inc}
@@ -57,292 +56,17 @@ uses
   // Profiler
   {$IFDEF ENABLE_PROFILER}SedaiProfiler,{$ENDIF}
   // Executor Context
-  SedaiExecutorContext, SedaiExecutorTypes, SedaiOutputInterface;
+  SedaiExecutorContext, SedaiExecutorTypes, SedaiOutputInterface,
+  // I/O Manager
+  SedaiIOManager, SedaiTerminalIO,
+  // Runner and Serializer (for .basc support)
+  SedaiRunner, SedaiBytecodeSerializer;
 
 // Include version information (must be after uses, contains const declarations)
 {$I Version.inc}
 
-type
-  { Simple console input for testing }
-  TConsoleInput = class(TInterfacedObject, IInputDevice)
-  public
-    function ReadLine(const Prompt: string = ''; IsCommand: Boolean = True;
-                     NumericOnly: Boolean = False; AllowDecimal: Boolean = True): string;
-    function ReadKey: Char;
-    function KeyPressed: Boolean;
-    function ShouldQuit: Boolean;
-    procedure ProcessEvents;
-    procedure Reset;
-  end;
-
-  { Simple console output for testing }
-  TConsoleOutput = class(TInterfacedObject, IOutputDevice)
-  public
-    function Initialize(const Title: string = ''; Width: Integer = 80; Height: Integer = 25): Boolean;
-    procedure Shutdown;
-    function IsInitialized: Boolean;
-    procedure Print(const Text: string; ClearBackground: Boolean = False);
-    procedure PrintLn(const Text: string; ClearBackground: Boolean = False);
-    procedure NewLine;
-    procedure Clear;
-    procedure SetCursor(X, Y: Integer);
-    procedure MoveCursor(DeltaX, DeltaY: Integer);
-    function GetCursorX: Integer;
-    function GetCursorY: Integer;
-    procedure ShowCursor(X, Y: Integer);
-    procedure HideCursor(X, Y: Integer);
-    procedure SetColors(Foreground, Background: TColor);
-    procedure Present;
-    procedure SetFullscreen(Enabled: Boolean);
-    function IsFullscreen: Boolean;
-    function ShouldQuit: Boolean;
-    function GetActualCols: Integer;
-    function GetActualRows: Integer;
-    procedure MarkPromptRow;
-    procedure OnUserInput;
-    function HandleScrollKeys(Key: Integer; Modifiers: Integer): Boolean;
-    procedure ProcessScrollInput;
-    function GetInScrollMode: Boolean;
-    function SetGraphicMode(Mode: TGraphicMode; ClearBuffer: Boolean = False; SplitLine: Integer = -1): Boolean;
-    function IsInGraphicsMode: Boolean;
-    procedure SetPixel(X, Y: Integer; RGB: UInt32); overload;
-    procedure SetPixel(X, Y: Integer; PaletteIndex: TPaletteIndex); overload;
-    function GetPixel(X, Y: Integer): UInt32;
-    procedure EnablePalette(Enable: Boolean);
-    function IsPaletteEnabled: Boolean;
-    procedure SetPaletteColor(Index: TPaletteIndex; RGB: UInt32);
-    function GetPaletteColor(Index: TPaletteIndex): UInt32;
-    procedure ResetPalette;
-  end;
-
-function TConsoleOutput.Initialize(const Title: string; Width: Integer; Height: Integer): Boolean;
-begin
-  Result := True;
-end;
-
-procedure TConsoleOutput.Shutdown;
-begin
-end;
-
-function TConsoleOutput.IsInitialized: Boolean;
-begin
-  Result := True;
-end;
-
-procedure TConsoleOutput.Print(const Text: string; ClearBackground: Boolean);
-begin
-  System.Write(Text);
-end;
-
-procedure TConsoleOutput.PrintLn(const Text: string; ClearBackground: Boolean);
-begin
-  WriteLn(Text);
-end;
-
-procedure TConsoleOutput.NewLine;
-begin
-  WriteLn;
-end;
-
-procedure TConsoleOutput.Clear;
-begin
-  // Not implemented for console
-end;
-
-procedure TConsoleOutput.SetCursor(X, Y: Integer);
-begin
-end;
-
-procedure TConsoleOutput.MoveCursor(DeltaX, DeltaY: Integer);
-begin
-end;
-
-function TConsoleOutput.GetCursorX: Integer;
-begin
-  Result := 0;
-end;
-
-function TConsoleOutput.GetCursorY: Integer;
-begin
-  Result := 0;
-end;
-
-procedure TConsoleOutput.ShowCursor(X, Y: Integer);
-begin
-end;
-
-procedure TConsoleOutput.HideCursor(X, Y: Integer);
-begin
-end;
-
-procedure TConsoleOutput.SetColors(Foreground, Background: TColor);
-begin
-end;
-
-procedure TConsoleOutput.Present;
-begin
-end;
-
-procedure TConsoleOutput.SetFullscreen(Enabled: Boolean);
-begin
-end;
-
-function TConsoleOutput.IsFullscreen: Boolean;
-begin
-  Result := False;
-end;
-
-function TConsoleOutput.ShouldQuit: Boolean;
-begin
-  Result := False;
-end;
-
-function TConsoleOutput.GetActualCols: Integer;
-begin
-  Result := 80;
-end;
-
-function TConsoleOutput.GetActualRows: Integer;
-begin
-  Result := 25;
-end;
-
-procedure TConsoleOutput.MarkPromptRow;
-begin
-end;
-
-procedure TConsoleOutput.OnUserInput;
-begin
-end;
-
-function TConsoleOutput.HandleScrollKeys(Key: Integer; Modifiers: Integer): Boolean;
-begin
-  Result := False;
-end;
-
-procedure TConsoleOutput.ProcessScrollInput;
-begin
-end;
-
-function TConsoleOutput.GetInScrollMode: Boolean;
-begin
-  Result := False;
-end;
-
-function TConsoleOutput.SetGraphicMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
-begin
-  Result := False;
-end;
-
-function TConsoleOutput.IsInGraphicsMode: Boolean;
-begin
-  Result := False;
-end;
-
-procedure TConsoleOutput.SetPixel(X, Y: Integer; RGB: UInt32);
-begin
-end;
-
-procedure TConsoleOutput.SetPixel(X, Y: Integer; PaletteIndex: TPaletteIndex);
-begin
-end;
-
-function TConsoleOutput.GetPixel(X, Y: Integer): UInt32;
-begin
-  Result := 0;
-end;
-
-procedure TConsoleOutput.EnablePalette(Enable: Boolean);
-begin
-end;
-
-function TConsoleOutput.IsPaletteEnabled: Boolean;
-begin
-  Result := False;
-end;
-
-procedure TConsoleOutput.SetPaletteColor(Index: TPaletteIndex; RGB: UInt32);
-begin
-end;
-
-function TConsoleOutput.GetPaletteColor(Index: TPaletteIndex): UInt32;
-begin
-  Result := 0;
-end;
-
-procedure TConsoleOutput.ResetPalette;
-begin
-end;
-
-// === CONSOLE INPUT IMPLEMENTATION ===
-
-function TConsoleInput.ReadLine(const Prompt: string; IsCommand: Boolean;
-                                NumericOnly: Boolean; AllowDecimal: Boolean): string;
-var
-  Input: string;
-  IsValid: Boolean;
-  TempFloat: Double;
-begin
-  repeat
-    IsValid := True;
-
-    // Display prompt
-    if Prompt <> '' then
-      System.Write(Prompt);
-
-    // Read input
-    System.ReadLn(Input);
-
-    // Validate if numeric only
-    if NumericOnly and (Input <> '') then
-    begin
-      // Check if valid number
-      if not TryStrToFloat(Input, TempFloat) then
-      begin
-        WriteLn('?SYNTAX ERROR - Number expected');
-        IsValid := False;
-      end
-      else if not AllowDecimal then
-      begin
-        // Check if it contains a decimal point
-        if Pos('.', Input) > 0 then
-        begin
-          WriteLn('?SYNTAX ERROR - Integer expected');
-          IsValid := False;
-        end;
-      end;
-    end;
-  until IsValid;
-
-  Result := Input;
-end;
-
-function TConsoleInput.ReadKey: Char;
-begin
-  Result := #0;
-  // Not implemented for simple console
-end;
-
-function TConsoleInput.KeyPressed: Boolean;
-begin
-  Result := False;
-  // Not implemented for simple console
-end;
-
-function TConsoleInput.ShouldQuit: Boolean;
-begin
-  Result := False;
-end;
-
-procedure TConsoleInput.ProcessEvents;
-begin
-  // Not needed for simple console
-end;
-
-procedure TConsoleInput.Reset;
-begin
-  // Not needed for simple console
-end;
+// Console I/O is now in SedaiTerminalIO unit
+// TTerminalController and TTerminalInput replace the old TConsoleOutput/TConsoleInput
 
 // === BUILT-IN FUNCTIONS ===
 
@@ -640,13 +364,18 @@ procedure PrintHelp;
 begin
   PrintVersion;
   WriteLn;
-  WriteLn('Usage: sb <source.bas> [options]');
+  WriteLn('Usage: sb <source.bas|program.basc> [options]');
+  WriteLn;
+  WriteLn('Supported file types:');
+  WriteLn('  .bas       BASIC source code (compiled at runtime)');
+  WriteLn('  .basc      Pre-compiled bytecode (faster startup)');
   WriteLn;
   WriteLn('Options:');
   WriteLn('  --help              Show this help message');
   WriteLn('  --verbose           Show loading, lexing, parsing, and VM execution info');
   WriteLn('  --dump-ast          Show AST structure after parsing');
-  WriteLn('  --disasm            Show bytecode disassembly');
+  WriteLn('  --disasm            Show bytecode disassembly (after superinstructions)');
+  WriteLn('  --disasm-pre        Show bytecode BEFORE superinstruction fusion');
   WriteLn('  --no-exec           Compile only, do not execute (useful with --disasm)');
   WriteLn('  --stats             Show execution statistics');
   WriteLn;
@@ -705,7 +434,7 @@ begin
 end;
 
 procedure TestBytecodeCompilation(const SourceFile: string;
-  OptVerbose, OptDumpAST, OptDisasm, OptStats, OptNoExec: Boolean
+  OptVerbose, OptDumpAST, OptDisasm, OptDisasmPre, OptStats, OptNoExec: Boolean
   {$IFDEF ENABLE_PROFILER}; OptProfile: Boolean; ProfileMode: string; ProfileExport: string{$ENDIF});
 var
   Source: TStringList;
@@ -1510,6 +1239,19 @@ begin
     {$ENDIF}
     {$ENDIF}
 
+    // === DISASSEMBLY BEFORE SUPERINSTRUCTIONS (Optional) ===
+    if OptDisasmPre then
+    begin
+      WriteLn('=== BYTECODE DISASSEMBLY (BEFORE SUPERINSTRUCTIONS) ===');
+      Disassembler := TBytecodeDisassembler.Create;
+      try
+        WriteLn(Disassembler.Disassemble(BytecodeProgram));
+      finally
+        Disassembler.Free;
+      end;
+      WriteLn;
+    end;
+
     // === SUPERINSTRUCTIONS ===
     // Fuses common instruction sequences into single superinstructions
     // Must run AFTER bytecode compilation and BEFORE VM execution
@@ -1637,8 +1379,11 @@ begin
       // Execute the program
       if OptVerbose then
         WriteLn('=== VIRTUAL MACHINE EXECUTION ===');
-      Output := TConsoleOutput.Create;
-      Input := TConsoleInput.Create;
+      // Use TIOManager to create I/O devices based on mode
+      // Default is terminal mode (pure console, no SDL2)
+      Output := TTerminalController.Create;
+      Input := TTerminalInput.Create;
+      Output.Initialize('SedaiBasic', 80, 25);
       VM := TBytecodeVM.Create;
     {$IFDEF ENABLE_PROFILER}
     Profiler := nil;
@@ -1781,9 +1526,216 @@ begin
   end;
 end;
 
+{ Execute a pre-compiled bytecode file (.basc) }
+procedure RunFromBytecode(const BytecodeFile: string;
+  OptVerbose, OptDisasm, OptStats, OptNoExec: Boolean
+  {$IFDEF ENABLE_PROFILER}; OptProfile: Boolean; ProfileMode: string; ProfileExport: string{$ENDIF});
+var
+  Serializer: TBytecodeSerializer;
+  BytecodeProgram: TBytecodeProgram;
+  VM: TBytecodeVM;
+  Disassembler: TBytecodeDisassembler;
+  Output: IOutputDevice;
+  Input: IInputDevice;
+  Timer: THiResTimer;
+  LoadTime, ExecuteTime: Double;
+  i: Integer;
+  ShowBanners: Boolean;
+  {$IFDEF ENABLE_PROFILER}
+  Profiler: TProfiler;
+  ProfMode: TProfilerMode;
+  ExportExt: string;
+  {$ENDIF}
+begin
+  ShowBanners := OptVerbose or OptDisasm or OptStats;
+
+  if ShowBanners then
+  begin
+    WriteLn('========================================');
+    PrintVersion;
+    WriteLn('========================================');
+    WriteLn;
+    WriteLn('Loading pre-compiled bytecode: ', BytecodeFile);
+  end;
+
+  // Load bytecode from file
+  Serializer := TBytecodeSerializer.Create;
+  try
+    Timer := CreateHiResTimer;
+    try
+      BytecodeProgram := Serializer.LoadFromFile(BytecodeFile);
+      LoadTime := Timer.ElapsedMilliseconds;
+    except
+      on E: Exception do
+      begin
+        WriteLn('ERROR loading bytecode: ', E.Message);
+        Exit;
+      end;
+    end;
+
+    if OptVerbose then
+    begin
+      WriteLn(Format('Bytecode loaded in %.2f ms', [LoadTime]));
+      WriteLn(Format('  Instructions: %d', [BytecodeProgram.GetInstructionCount]));
+      WriteLn(Format('  Variables: %d', [BytecodeProgram.GetVariableCount]));
+      WriteLn(Format('  String constants: %d', [BytecodeProgram.StringConstants.Count]));
+      WriteLn;
+    end;
+
+    // === DISASSEMBLY (Optional) ===
+    if OptDisasm then
+    begin
+      WriteLn('=== BYTECODE DISASSEMBLY ===');
+      Disassembler := TBytecodeDisassembler.Create;
+      try
+        WriteLn(Disassembler.Disassemble(BytecodeProgram));
+      finally
+        Disassembler.Free;
+      end;
+      WriteLn;
+    end;
+
+    // === VM EXECUTION ===
+    if OptNoExec then
+    begin
+      if OptVerbose then
+        WriteLn('=== SKIPPING VM EXECUTION (--no-exec) ===');
+      WriteLn('Bytecode loaded successfully.');
+      WriteLn('Instructions: ', BytecodeProgram.GetInstructionCount);
+      BytecodeProgram.Free;
+    end
+    else
+    begin
+      if OptVerbose then
+        WriteLn('=== VIRTUAL MACHINE EXECUTION ===');
+
+      Output := TTerminalController.Create;
+      Input := TTerminalInput.Create;
+      Output.Initialize('SedaiBasic', 80, 25);
+      VM := TBytecodeVM.Create;
+      {$IFDEF ENABLE_PROFILER}
+      Profiler := nil;
+      if OptProfile then
+      begin
+        if ProfileMode = 'sampling' then
+          ProfMode := pmSampling
+        else if ProfileMode = 'hybrid' then
+          ProfMode := pmHybrid
+        else if ProfileMode = 'instrumentation' then
+          ProfMode := pmInstrumentation
+        else
+        begin
+          WriteLn('WARNING: Unknown profiler mode "', ProfileMode, '", using sampling');
+          ProfMode := pmSampling;
+          ProfileMode := 'sampling';
+        end;
+
+        Profiler := TProfiler.Create(ProfMode);
+        VM.SetProfiler(Profiler);
+        if OptVerbose then
+          WriteLn('Profiler enabled (mode: ', ProfileMode, ')');
+      end;
+      {$ENDIF}
+      try
+        VM.SetOutputDevice(Output);
+        VM.SetInputDevice(Input);
+        VM.LoadProgram(BytecodeProgram);
+
+        try
+          Timer := CreateHiResTimer;
+          {$IFDEF ENABLE_PROFILER}
+          if OptProfile then
+            VM.Run
+          else
+            VM.RunFast;
+          {$ELSE}
+          VM.RunFast;
+          {$ENDIF}
+          ExecuteTime := Timer.ElapsedMilliseconds;
+        except
+          on E: Exception do
+          begin
+            Write('ERROR during VM execution at PC=', VM.PC);
+            if (VM.PC >= 0) and (VM.PC < BytecodeProgram.GetInstructionCount) then
+            begin
+              with BytecodeProgram.GetInstruction(VM.PC) do
+              begin
+                if SourceLine > 0 then
+                  WriteLn(' (BASIC LINE ', SourceLine, '): ', E.ClassName, ': ', E.Message)
+                else
+                  WriteLn(': ', E.ClassName, ': ', E.Message);
+                WriteLn('Failing instruction: ', BytecodeOpToString(TBytecodeOp(OpCode)),
+                        ' Dest=', Dest, ' Src1=', Src1, ' Src2=', Src2);
+              end;
+            end;
+            Exit;
+          end;
+        end;
+
+        if OptStats then
+        begin
+          WriteLn;
+          WriteLn('=== EXECUTION STATISTICS ===');
+          {$IFDEF ENABLE_INSTRUCTION_COUNTING}
+          WriteLn(Format('Instructions executed: %d', [VM.InstructionsExecuted]));
+          if ExecuteTime > 0 then
+            WriteLn(Format('Time per instruction:  %s', [FormatTime(ExecuteTime / VM.InstructionsExecuted)]));
+          {$ENDIF}
+          WriteLn(Format('Load time:       %s', [FormatTimeEx(LoadTime)]));
+          WriteLn(Format('Execution time:  %s', [FormatTimeEx(ExecuteTime)]));
+          WriteLn(Format('Total time:      %s', [FormatTimeEx(LoadTime + ExecuteTime)]));
+        end;
+
+        {$IFDEF ENABLE_PROFILER}
+        if OptProfile and Assigned(Profiler) then
+        begin
+          WriteLn;
+          Profiler.PrintReport;
+
+          if ProfileExport <> '' then
+          begin
+            ExportExt := LowerCase(ExtractFileExt(ProfileExport));
+            if ExportExt = '.json' then
+              Profiler.ExportJSON(ProfileExport)
+            else if ExportExt = '.csv' then
+              Profiler.ExportCSV(ProfileExport)
+            else if ExportExt = '.folded' then
+              Profiler.ExportFoldedFlameGraph(ProfileExport)
+            else
+            begin
+              WriteLn('WARNING: Unknown export format "', ExportExt, '", defaulting to JSON');
+              Profiler.ExportJSON(ProfileExport);
+            end;
+            WriteLn('Profile data exported to: ', ProfileExport);
+          end;
+        end;
+        {$ENDIF}
+      finally
+        {$IFDEF ENABLE_PROFILER}
+        Profiler.Free;
+        {$ENDIF}
+        VM.Free;
+        BytecodeProgram.Free;
+      end;
+    end;
+
+  finally
+    Serializer.Free;
+  end;
+
+  if ShowBanners then
+  begin
+    WriteLn;
+    WriteLn('========================================');
+    WriteLn('Execution complete!');
+    WriteLn('========================================');
+  end;
+end;
+
 var
   TestFile: string;
-  OptVerbose, OptDumpAST, OptDisasm, OptStats, OptHelp, OptNoExec: Boolean;
+  FileType: TSedaiFileType;
+  OptVerbose, OptDumpAST, OptDisasm, OptDisasmPre, OptStats, OptHelp, OptNoExec: Boolean;
   {$IFDEF ENABLE_PROFILER}
   OptProfile: Boolean;
   ProfileMode: string;
@@ -1815,6 +1767,7 @@ begin
     OptVerbose := False;
     OptDumpAST := False;
     OptDisasm := False;
+    OptDisasmPre := False;
     OptStats := False;
     OptHelp := False;
     OptNoExec := False;
@@ -1833,6 +1786,8 @@ begin
         OptDumpAST := True
       else if Param = '--disasm' then
         OptDisasm := True
+      else if Param = '--disasm-pre' then
+        OptDisasmPre := True
       else if Param = '--stats' then
         OptStats := True
       else if Param = '--no-exec' then
@@ -1864,8 +1819,43 @@ begin
       Exit;
     end;
 
-    TestBytecodeCompilation(TestFile, OptVerbose, OptDumpAST, OptDisasm, OptStats, OptNoExec
-      {$IFDEF ENABLE_PROFILER}, OptProfile, ProfileMode, ProfileExport{$ENDIF});
+    // Check if file exists
+    if not FileExists(TestFile) then
+    begin
+      WriteLn('ERROR: File not found: ', TestFile);
+      ExitCode := 1;
+      Exit;
+    end;
+
+    // Detect file type and run appropriate handler
+    FileType := TSedaiRunner.DetectFileType(TestFile);
+
+    case FileType of
+      sftSource:
+        // Compile and run .bas source file
+        TestBytecodeCompilation(TestFile, OptVerbose, OptDumpAST, OptDisasm, OptDisasmPre, OptStats, OptNoExec
+          {$IFDEF ENABLE_PROFILER}, OptProfile, ProfileMode, ProfileExport{$ENDIF});
+
+      sftBytecode:
+        begin
+          // Run pre-compiled .basc bytecode
+          // Note: --dump-ast and --disasm-pre are not applicable for bytecode
+          if OptDumpAST then
+            WriteLn('WARNING: --dump-ast not available for .basc files (no AST)');
+          if OptDisasmPre then
+            WriteLn('WARNING: --disasm-pre not available for .basc files (already optimized)');
+
+          RunFromBytecode(TestFile, OptVerbose, OptDisasm, OptStats, OptNoExec
+            {$IFDEF ENABLE_PROFILER}, OptProfile, ProfileMode, ProfileExport{$ENDIF});
+        end;
+
+      else
+        begin
+          WriteLn('ERROR: Unknown file type: ', TestFile);
+          WriteLn('Supported extensions: .bas (source), .basc (bytecode)');
+          ExitCode := 1;
+        end;
+    end;
 
   except
     on E: Exception do

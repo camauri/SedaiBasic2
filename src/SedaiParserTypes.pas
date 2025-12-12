@@ -67,6 +67,9 @@ type
     antReturn,            // RETURN statement
     antEnd,               // END statement
     antStop,              // STOP statement
+    antFast,              // FAST statement (C128 2MHz mode)
+    antSlow,              // SLOW statement (C128 1MHz mode)
+    antSleep,             // SLEEP statement (delay n seconds)
     antRem,               // REM statement
 
     // === CONTROL FLOW ===
@@ -108,6 +111,11 @@ type
     antSave,              // SAVE command
     antLoad,              // LOAD command
     antGraphics,          // GRAPHIC command
+    antScnClr,            // SCNCLR command (clear screen)
+    antBox,               // BOX command
+    antCircle,            // CIRCLE command
+    antDraw,              // DRAW command
+    antLocate,            // LOCATE command
 
     // === SPECIAL CONSTRUCTS ===
     antBlock,             // Block of statements

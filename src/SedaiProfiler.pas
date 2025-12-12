@@ -267,7 +267,7 @@ end;
 function TProfiler.EstimateCycles(OpCode: Byte): Integer;
 begin
   // These are rough estimates for a typical modern CPU
-  if OpCode >= 100 then
+  if OpCode >= 110 then
   begin
     // Superinstructions - generally more efficient than separate ops
     case OpCode of

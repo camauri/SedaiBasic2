@@ -911,7 +911,7 @@ begin
     Exit;
   end;
 
-  Result := TASTNode.CreateWithValue(antFunctionCall, Token.Value, Token);
+  Result := TASTNode.CreateWithValue(antGraphicsFunction, Token.Value, Token);
 
   // Consume opening parenthesis
   if not Context.Match(ttDelimParOpen) then

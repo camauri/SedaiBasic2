@@ -22,6 +22,8 @@
 unit SedaiArenaAllocator;
 
 {$mode objfpc}{$H+}
+{$interfaces CORBA}
+{$codepage UTF8}
 
 interface
 

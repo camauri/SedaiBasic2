@@ -22,6 +22,8 @@
 unit SedaiPeephole;
 
 {$mode ObjFPC}{$H+}
+{$interfaces CORBA}
+{$codepage UTF8}
 {$I OptimizationFlags.inc}
 {$I DebugFlags.inc}
 
@@ -145,7 +147,7 @@ begin
     end;
 
     // Also check for superinstruction branch opcodes (100+)
-    if Instr.OpCode >= 100 then
+    if Instr.OpCode >= 110 then
     begin
       // Superinstruction branches use Immediate for target
       Target := Instr.Immediate;

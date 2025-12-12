@@ -59,6 +59,8 @@
 unit SedaiDCE;
 
 {$mode objfpc}{$H+}
+{$interfaces CORBA}
+{$codepage UTF8}
 {$inline on}
 {$I DebugFlags.inc}
 
@@ -270,8 +272,8 @@ begin
     ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaReturn:
       Result := True;
 
-    // Program termination - always live
-    ssaEnd, ssaStop:
+    // Program termination and system state - always live
+    ssaEnd, ssaStop, ssaFast, ssaSlow, ssaSleep:
       Result := True;
 
     // Labels - always live (control flow targets)
@@ -284,7 +286,13 @@ begin
 
     // I/O operations - always live (visible side effects)
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
+    ssaPrintInt, ssaPrintIntLn,
+    ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
     ssaInput, ssaInputInt, ssaInputFloat, ssaInputString:
+      Result := True;
+
+    // Graphics operations - always live (visible side effects on screen)
+    ssaGraphicSetMode, ssaGraphicBox, ssaGraphicCircle, ssaGraphicDraw, ssaGraphicLocate:
       Result := True;
 
     // Function calls - always live (may have side effects)
@@ -440,6 +448,20 @@ begin
 
       if Instr.Src3.Kind = svkRegister then
         EnqueueDefiningInstruction(Instr.Src3.RegIndex, Instr.Src3.Version);
+
+      { For instructions that use PhiSources for extra operands (like ssaGraphicRGBA),
+        also mark those as live }
+      if Length(Instr.PhiSources) > 0 then
+      begin
+        for i := 0 to High(Instr.PhiSources) do
+        begin
+          if Instr.PhiSources[i].Value.Kind = svkRegister then
+            EnqueueDefiningInstruction(
+              Instr.PhiSources[i].Value.RegIndex,
+              Instr.PhiSources[i].Value.Version
+            );
+        end;
+      end;
     end;
   end;
 

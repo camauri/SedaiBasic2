@@ -116,6 +116,7 @@ const
   kDLOAD   = 'DLOAD';
   kDSAVE   = 'DSAVE';
   kVERIFY  = 'VERIFY';
+  kDIR     = 'DIR';
   kDIRECTORY = 'DIRECTORY';
   kDOPEN   = 'DOPEN';
   kDS      = 'DS';
@@ -144,6 +145,8 @@ const
   kSAVE    = 'SAVE';
   kLOAD    = 'LOAD';
   kSTOP    = 'STOP';
+  kFAST    = 'FAST';
+  kSLOW    = 'SLOW';
   kFETCH   = 'FETCH';
   kPOINTER = 'POINTER';
   kRREG    = 'RREG';
@@ -188,7 +191,10 @@ const
   kBOX     = 'BOX';
   kBUMP    = 'BUMP';
   kCOLOR   = 'COLOR';
+  kGLIST   = 'GLIST';    // List available SDL2 video modes
+  kMORE    = 'MORE';     // Paginate output (pipe modifier)
   kGRAPHIC = 'GRAPHIC';
+  kRGBA    = 'RGBA';     // Create 32-bit RGBA color value: RGBA(r, g, b, a)
   kDRAW    = 'DRAW';
   kCIRCLE  = 'CIRCLE';
   kPAINT   = 'PAINT';
@@ -224,8 +230,6 @@ const
   kREM     = 'REM'; // Commenti
   kEND     = 'END';
   kHELP    = 'HELP';
-  kFAST    = 'FAST';
-  kSLOW    = 'SLOW';
   kMONITOR = 'MONITOR';
   kHEADER  = 'HEADER';
   kCOLLECT = 'COLLECT';

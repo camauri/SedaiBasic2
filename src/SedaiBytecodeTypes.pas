@@ -64,11 +64,30 @@ type
     // Typed array operations (for register compaction and performance)
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
-    // I/O
+    // I/O - Print values
     bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
+    bcPrintInt, bcPrintIntLn,
+    // I/O - Print separators and formatting
+    bcPrintComma,      // Apply comma separator (TAB zone)
+    bcPrintSemicolon,  // Apply semicolon separator (concatenate)
+    bcPrintTab,        // TAB(n) - move to column n (Immediate = column)
+    bcPrintSpc,        // SPC(n) - print n spaces (Immediate = count)
+    bcPrintNewLine,    // Force newline
+    // I/O - Input
     bcInput, bcInputInt, bcInputFloat, bcInputString,
-    // System
-    bcEnd, bcStop, bcNop
+    // Graphics - MUST stay under opcode 100 (superinstructions start at 100)
+    bcGraphicRGBA,     // Create 32-bit RGBA color: Dest = RGBA(Src1, Src2, Src3, Immediate=alpha)
+    bcGraphicSetMode,  // Set graphics mode: GRAPHIC Src1(mode), Src2(clear), Immediate(param3)
+    bcGraphicBox,      // Draw box
+    bcGraphicCircle,   // Draw circle/ellipse/arc
+    bcGraphicDraw,     // Draw dot or line
+    bcGraphicLocate,   // Set pixel cursor position
+    bcGraphicRdot,     // Get pixel cursor position or color
+    bcGraphicGetMode,  // RGR - Get current graphics mode (0-11)
+    // System commands - keep at end but MUST be under opcode 100 (superinstructions start at 100)
+    bcEnd, bcStop, bcFast, bcSlow, bcSleep,
+    // NOP must be last regular opcode (before superinstructions at 100+)
+    bcNop
   );
 
   { Bytecode instruction encoding }
@@ -317,48 +336,67 @@ begin
 end;
 
 function OpcodeToString(OpCode: Byte): string;
+const
+  SUPERINSTR_BASE = 110;  // Superinstructions start at 110 (regular opcodes 0-109)
 begin
-  // Handle superinstructions (opcodes >= 100)
-  if OpCode >= 100 then
+  // Handle superinstructions (opcodes >= SUPERINSTR_BASE)
+  if OpCode >= SUPERINSTR_BASE then
   begin
     case OpCode of
-      100: Result := 'BranchEqInt';
-      101: Result := 'BranchNeInt';
-      102: Result := 'BranchLtInt';
-      103: Result := 'BranchGtInt';
-      104: Result := 'BranchLeInt';
-      105: Result := 'BranchGeInt';
-      110: Result := 'BranchEqFloat';
-      111: Result := 'BranchNeFloat';
-      112: Result := 'BranchLtFloat';
-      113: Result := 'BranchGtFloat';
-      114: Result := 'BranchLeFloat';
-      115: Result := 'BranchGeFloat';
-      120: Result := 'AddIntTo';
-      121: Result := 'SubIntTo';
-      122: Result := 'MulIntTo';
-      130: Result := 'AddFloatTo';
-      131: Result := 'SubFloatTo';
-      132: Result := 'MulFloatTo';
-      133: Result := 'DivFloatTo';
-      140: Result := 'AddIntConst';
-      141: Result := 'SubIntConst';
-      142: Result := 'MulIntConst';
-      150: Result := 'AddFloatConst';
-      151: Result := 'SubFloatConst';
-      152: Result := 'MulFloatConst';
-      153: Result := 'DivFloatConst';
-      160: Result := 'BranchEqZeroInt';
-      161: Result := 'BranchNeZeroInt';
-      170: Result := 'BranchEqZeroFlt';
-      171: Result := 'BranchNeZeroFlt';
-      180: Result := 'ArrayStoreIntConst';
-      181: Result := 'ArrayStoreFltConst';
-      182: Result := 'ArrayStoreStrConst';
-      190: Result := 'AddIntToBranchLe';
-      191: Result := 'AddIntToBranchLt';
-      192: Result := 'SubIntToBranchGe';
-      193: Result := 'SubIntToBranchGt';
+      110: Result := 'BranchEqInt';
+      111: Result := 'BranchNeInt';
+      112: Result := 'BranchLtInt';
+      113: Result := 'BranchGtInt';
+      114: Result := 'BranchLeInt';
+      115: Result := 'BranchGeInt';
+      120: Result := 'BranchEqFloat';
+      121: Result := 'BranchNeFloat';
+      122: Result := 'BranchLtFloat';
+      123: Result := 'BranchGtFloat';
+      124: Result := 'BranchLeFloat';
+      125: Result := 'BranchGeFloat';
+      130: Result := 'AddIntTo';
+      131: Result := 'SubIntTo';
+      132: Result := 'MulIntTo';
+      140: Result := 'AddFloatTo';
+      141: Result := 'SubFloatTo';
+      142: Result := 'MulFloatTo';
+      143: Result := 'DivFloatTo';
+      150: Result := 'AddIntConst';
+      151: Result := 'SubIntConst';
+      152: Result := 'MulIntConst';
+      160: Result := 'AddFloatConst';
+      161: Result := 'SubFloatConst';
+      162: Result := 'MulFloatConst';
+      163: Result := 'DivFloatConst';
+      170: Result := 'BranchEqZeroInt';
+      171: Result := 'BranchNeZeroInt';
+      180: Result := 'BranchEqZeroFlt';
+      181: Result := 'BranchNeZeroFlt';
+      190: Result := 'ArrayStoreIntConst';
+      191: Result := 'ArrayStoreFltConst';
+      192: Result := 'ArrayStoreStrConst';
+      200: Result := 'AddIntToBranchLe';
+      201: Result := 'AddIntToBranchLt';
+      202: Result := 'SubIntToBranchGe';
+      203: Result := 'SubIntToBranchGt';
+      // FMA and advanced float patterns
+      210: Result := 'MulAddFloat';
+      211: Result := 'MulSubFloat';
+      212: Result := 'MulAddToFloat';
+      213: Result := 'MulSubToFloat';
+      220: Result := 'ArrayLoadAddFloat';
+      221: Result := 'ArrayLoadSubFloat';
+      222: Result := 'ArrayLoadDivAddFloat';
+      230: Result := 'SquareSumFloat';
+      231: Result := 'AddSquareFloat';
+      240: Result := 'MulMulFloat';
+      241: Result := 'AddSqrtFloat';
+      250: Result := 'ArrayLoadIntBranchNZ';
+      251: Result := 'ArrayLoadIntBranchZ';
+      // Legacy superinstructions (mapped for compatibility)
+      166: Result := 'ArrayReverseRange';
+      167: Result := 'ArrayShiftLeft';
     else
       Result := Format('SuperInstr_%d', [OpCode]);
     end;

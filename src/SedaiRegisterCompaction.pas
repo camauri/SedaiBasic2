@@ -44,6 +44,8 @@
 unit SedaiRegisterCompaction;
 
 {$mode objfpc}{$H+}
+{$interfaces CORBA}
+{$codepage UTF8}
 {$inline on}
 {$I DebugFlags.inc}
 
@@ -176,8 +178,8 @@ var
 begin
   Op := Ord(OpCode);
 
-  // Handle superinstructions FIRST (opcodes >= 100) to avoid enum range issues
-  if Op >= 100 then
+  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
+  if Op >= 110 then
   begin
     case Op of
       // Fused arithmetic-to-dest (Int): Dest = Dest op Src1 (Dest is BOTH read and written)
@@ -189,7 +191,9 @@ begin
       // Self-increment/decrement (Int): Dest = Dest op Src1 (Dest is BOTH read and written)
       251, 252,  // bcAddIntSelf, bcSubIntSelf
       // Array Load to register (Int): Dest = arr[idx] (Dest is WRITTEN)
-      253:  // bcArrayLoadIntTo
+      253,  // bcArrayLoadIntTo
+      // Array Reverse/Shift: Dest is end index register (int) - READ only
+      156, 157:  // bcArrayReverseRange, bcArrayShiftLeft
         Result := True;
       // NOTE: Fused compare-and-branch (100-105) do NOT have a Dest register!
       // They only use Src1, Src2 for comparison and Immediate for jump target
@@ -217,8 +221,15 @@ begin
     // Input
     bcInputInt,
     // Typed array load (int) - Dest is WRITTEN
-    bcArrayLoadInt
+    bcArrayLoadInt,
+    // Graphics: Dest = RGBA result (int)
+    bcGraphicRGBA,
+    // Graphics: Dest = pixel cursor info (int)
+    bcGraphicRdot,
+    // Graphics: Dest = current graphic mode (int)
+    bcGraphicGetMode
     // NOTE: bcArrayStoreInt uses Dest as SOURCE (read), handled by DestReadIsIntReg
+    // NOTE: bcGraphicBox uses Dest as SOURCE (y1 coordinate), handled by DestReadIsIntReg
   ];
 end;
 
@@ -228,8 +239,8 @@ var
 begin
   Op := Ord(OpCode);
 
-  // Handle superinstructions FIRST (opcodes >= 100) to avoid enum range issues
-  if Op >= 100 then
+  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
+  if Op >= 110 then
   begin
     case Op of
       // Fused arithmetic-to-dest (Float): Dest = Dest op Src1 (Dest is BOTH read and written)
@@ -276,8 +287,8 @@ var
 begin
   Op := Ord(OpCode);
 
-  // Handle superinstructions FIRST (opcodes >= 100) to avoid enum range issues
-  if Op >= 100 then
+  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
+  if Op >= 110 then
   begin
     // No superinstructions currently have string Dest register
     Result := False;
@@ -302,8 +313,8 @@ var
 begin
   Op := Ord(OpCode);
 
-  // Handle superinstructions FIRST (opcodes >= 100) to avoid enum range issues
-  if Op >= 100 then
+  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
+  if Op >= 110 then
   begin
     case Op of
       // Fused arithmetic-to-dest (Int): Src1 is int operand
@@ -317,7 +328,9 @@ begin
       // Fused loop increment-and-branch (Int): Src1 is step register
       190, 191, 192, 193,  // bcAddIntToBranchLe..bcSubIntToBranchGt
       // Self-increment/decrement (Int): Src1 is the amount register
-      251, 252:  // bcAddIntSelf, bcSubIntSelf
+      251, 252,  // bcAddIntSelf, bcSubIntSelf
+      // NEW: Array Move Element: Src1 is source index register (int)
+      255:  // bcArrayMoveElement
         Result := True;
     else
       Result := False;
@@ -338,7 +351,12 @@ begin
     // Logical operations
     bcLogicalAnd, bcLogicalOr, bcLogicalNot,
     // String operations with int param
-    bcStrLeft, bcStrRight
+    bcStrLeft, bcStrRight,
+    // Print int value (Src1 is int register)
+    bcPrintInt, bcPrintIntLn,
+    // Graphics: Src1 = color (int) for bcGraphicBox, Src1 = mode (int) for bcGraphicSetMode
+    // Src1 = R (int) for bcGraphicRGBA, Src1 = which (int) for bcGraphicRdot/bcGraphicGetMode
+    bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA, bcGraphicRdot, bcGraphicGetMode
   ];
 end;
 
@@ -348,8 +366,8 @@ var
 begin
   Op := Ord(OpCode);
 
-  // Handle superinstructions FIRST (opcodes >= 100) to avoid enum range issues
-  if Op >= 100 then
+  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
+  if Op >= 110 then
   begin
     case Op of
       // Fused arithmetic-to-dest (Float): Src1 is float operand
@@ -395,8 +413,8 @@ var
 begin
   Op := Ord(OpCode);
 
-  // Handle superinstructions FIRST (opcodes >= 100) to avoid enum range issues
-  if Op >= 100 then
+  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
+  if Op >= 110 then
   begin
     case Op of
       // Fused compare-and-branch (Int): Src2 is second comparison operand
@@ -412,7 +430,11 @@ begin
       // NEW: Array Swap: Src2 is idx1 register (int)
       250,                 // bcArraySwapInt
       // NEW: Array Load to register: Src2 is int index register
-      253:                 // bcArrayLoadIntTo
+      253,                 // bcArrayLoadIntTo
+      // NEW: Array Copy/Move Element: Src2 is index register (int)
+      254, 255,            // bcArrayCopyElement, bcArrayMoveElement
+      // NEW: Array Reverse/Shift: Src2 is start index register (int)
+      156, 157:            // bcArrayReverseRange, bcArrayShiftLeft
         Result := True;
     else
       Result := False;
@@ -432,7 +454,10 @@ begin
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     // String operations with int second param
-    bcStrMid  // Mid$(str, start, length) - start is Src1, length is Src2
+    bcStrMid,  // Mid$(str, start, length) - start is Src1, length is Src2
+    // Graphics: Src2 = x1 (int) for bcGraphicBox, Src2 = clear (int) for bcGraphicSetMode
+    // Src2 = G (int) for bcGraphicRGBA
+    bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA
   ];
 end;
 
@@ -442,8 +467,8 @@ var
 begin
   Op := Ord(OpCode);
 
-  // Handle superinstructions FIRST (opcodes >= 100) to avoid enum range issues
-  if Op >= 100 then
+  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
+  if Op >= 110 then
   begin
     case Op of
       // Fused compare-and-branch (Float): Src2 is second comparison operand
@@ -476,8 +501,8 @@ var
 begin
   Op := Ord(OpCode);
 
-  // Handle superinstructions FIRST (opcodes >= 100) to avoid enum range issues
-  if Op >= 100 then
+  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
+  if Op >= 110 then
   begin
     // No superinstructions currently use Src1 as string register
     Result := False;
@@ -507,8 +532,8 @@ var
 begin
   Op := Ord(OpCode);
 
-  // Handle superinstructions FIRST (opcodes >= 100) to avoid enum range issues
-  if Op >= 100 then
+  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
+  if Op >= 110 then
   begin
     // No superinstructions currently use Src2 as string register
     Result := False;
@@ -533,7 +558,7 @@ begin
   Op := Ord(OpCode);
 
   // Handle superinstructions
-  if Op >= 100 then
+  if Op >= 110 then
   begin
     case Op of
       // ArraySwapInt: Dest = idx2 register (int) - READ, not written
@@ -546,7 +571,8 @@ begin
   end;
 
   // ArrayStoreInt: Dest = value register (int) - READ, not written
-  Result := OpCode = bcArrayStoreInt;
+  // bcGraphicBox: Dest = y1 register (int) - READ, not written
+  Result := OpCode in [bcArrayStoreInt, bcGraphicBox];
 end;
 
 function TRegisterCompactor.DestReadIsFloatReg(OpCode: TBytecodeOp): Boolean;
@@ -558,7 +584,7 @@ begin
   Op := Ord(OpCode);
 
   // No superinstructions currently read Dest as float (ArrayStoreFloatConst uses Immediate)
-  if Op >= 100 then
+  if Op >= 110 then
   begin
     Result := False;
     Exit;
@@ -577,7 +603,7 @@ begin
   Op := Ord(OpCode);
 
   // No superinstructions currently read Dest as string
-  if Op >= 100 then
+  if Op >= 110 then
   begin
     Result := False;
     Exit;
@@ -662,9 +688,9 @@ begin
   for i := 0 to FProgram.GetInstructionCount - 1 do
   begin
     Instr := FProgram.GetInstruction(i);
-    // IMPORTANT: For superinstructions (opcode >= 100), the cast to TBytecodeOp
+    // IMPORTANT: For superinstructions (opcode >= 110), the cast to TBytecodeOp
     // produces an out-of-range value. The Is*Reg functions handle this by
-    // checking Ord(OpCode) >= 100 first and using integer comparisons.
+    // checking Ord(OpCode) >= 110 first and using integer comparisons.
     OpCode := TBytecodeOp(Instr.OpCode);
 
     // Skip NOPs
@@ -707,6 +733,29 @@ begin
     // (for FMA and related superinstructions)
     if ImmediateIsFloatReg(OpCode) then
       MarkFloatRegUsed(Instr.Immediate);
+
+    // bcGraphicBox: Immediate contains 5 packed register indices
+    // Layout: x2(bits 0-11) | y2(12-23) | angle(24-35) | filled(36-47) | fill_color(48-59)
+    // x2, y2, filled, fill_color are int registers; angle is float register
+    if OpCode = bcGraphicBox then
+    begin
+      MarkIntRegUsed((Instr.Immediate) and $FFF);           // x2 - int
+      MarkIntRegUsed((Instr.Immediate shr 12) and $FFF);    // y2 - int
+      MarkFloatRegUsed((Instr.Immediate shr 24) and $FFF);  // angle - float
+      MarkIntRegUsed((Instr.Immediate shr 36) and $FFF);    // filled - int
+      MarkIntRegUsed((Instr.Immediate shr 48) and $FFF);    // fill_color - int
+    end;
+
+    // bcGraphicSetMode: Immediate = param3 register (int)
+    if OpCode = bcGraphicSetMode then
+      MarkIntRegUsed(Instr.Immediate);
+
+    // bcGraphicRGBA: Immediate = (B_reg << 16) | A_reg - two int registers
+    if OpCode = bcGraphicRGBA then
+    begin
+      MarkIntRegUsed(Instr.Immediate and $FFFF);           // A register
+      MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);  // B register
+    end;
 
     // bcArrayDim has no register operands (info is in metadata)
     // ArrayLoad: Dest is written, Src1 is array index (metadata), Src2 is int index register
@@ -778,6 +827,8 @@ var
   Instr: TBytecodeInstruction;
   OpCode: TBytecodeOp;
   Modified: Boolean;
+  NewImm: Int64;
+  OldReg, NewReg: Integer;
 begin
   for i := 0 to FProgram.GetInstructionCount - 1 do
   begin
@@ -912,6 +963,101 @@ begin
       if (Instr.Immediate < Length(FFloatRegMap)) and (FFloatRegMap[Instr.Immediate] >= 0) then
       begin
         Instr.Immediate := FFloatRegMap[Instr.Immediate];
+        Modified := True;
+      end;
+    end;
+
+    // bcGraphicBox: Immediate contains 5 packed register indices
+    // Layout: x2(bits 0-11) | y2(12-23) | angle(24-35) | filled(36-47) | fill_color(48-59)
+    // x2, y2, filled, fill_color are int registers; angle is float register
+    if OpCode = bcGraphicBox then
+    begin
+      NewImm := 0;
+
+      // x2 (bits 0-11) - int register
+      OldReg := (Instr.Immediate) and $FFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or (Int64(NewReg) and $FFF);
+
+      // y2 (bits 12-23) - int register
+      OldReg := (Instr.Immediate shr 12) and $FFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFF) shl 12);
+
+      // angle (bits 24-35) - float register
+      OldReg := (Instr.Immediate shr 24) and $FFF;
+      if (OldReg < Length(FFloatRegMap)) and (FFloatRegMap[OldReg] >= 0) then
+        NewReg := FFloatRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFF) shl 24);
+
+      // filled (bits 36-47) - int register
+      OldReg := (Instr.Immediate shr 36) and $FFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFF) shl 36);
+
+      // fill_color (bits 48-59) - int register
+      OldReg := (Instr.Immediate shr 48) and $FFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFF) shl 48);
+
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
+      end;
+    end;
+
+    // bcGraphicSetMode: Immediate = param3 register (int)
+    if OpCode = bcGraphicSetMode then
+    begin
+      OldReg := Instr.Immediate;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+      begin
+        NewReg := FIntRegMap[OldReg];
+        if NewReg <> OldReg then
+        begin
+          Instr.Immediate := NewReg;
+          Modified := True;
+        end;
+      end;
+    end;
+
+    // bcGraphicRGBA: Immediate = (B_reg << 16) | A_reg - two int registers
+    if OpCode = bcGraphicRGBA then
+    begin
+      // A register (bits 0-15)
+      OldReg := Instr.Immediate and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewReg and $FFFF;
+
+      // B register (bits 16-31)
+      OldReg := (Instr.Immediate shr 16) and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 16);
+
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
         Modified := True;
       end;
     end;

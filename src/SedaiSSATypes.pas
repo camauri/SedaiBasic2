@@ -79,8 +79,19 @@ type
     ssaLabel, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaCall, ssaReturn,
     ssaArrayLoad, ssaArrayStore, ssaArrayDim,
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
+    ssaPrintInt, ssaPrintIntLn,
+    ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
     ssaInput, ssaInputInt, ssaInputFloat, ssaInputString,
-    ssaEnd, ssaStop, ssaNop
+    // Graphics
+    ssaGraphicRGBA,    // Create 32-bit RGBA color value: dest = RGBA(r, g, b, a)
+    ssaGraphicSetMode, // Set graphics mode: GRAPHIC mode, clear, param3
+    ssaGraphicBox,     // Draw box
+    ssaGraphicCircle,  // Draw circle/ellipse/arc
+    ssaGraphicDraw,    // Draw dot or line
+    ssaGraphicLocate,  // Set pixel cursor position
+    ssaGraphicRdot,    // Get pixel cursor position or color
+    ssaGraphicGetMode, // RGR - Get current graphics mode (0-11)
+    ssaEnd, ssaStop, ssaFast, ssaSlow, ssaSleep, ssaNop
   );
 
   { PHI source: value from a specific predecessor block }

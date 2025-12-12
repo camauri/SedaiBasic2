@@ -45,6 +45,8 @@
 unit SedaiSSAConstruction;
 
 {$mode objfpc}{$H+}
+{$interfaces CORBA}
+{$codepage UTF8}
 {$inline on}
 {$I DebugFlags.inc}
 
@@ -939,6 +941,16 @@ begin
       begin
         VarKey := GetRegisterKey(Instr.Src3);
         Instr.Src3.Version := CurrentVersion(VarKey);
+      end;
+
+      // Rename PhiSources when used for extra operands (e.g., RGBA's A register)
+      for j := 0 to Length(Instr.PhiSources) - 1 do
+      begin
+        if Instr.PhiSources[j].Value.Kind = svkRegister then
+        begin
+          VarKey := GetRegisterKey(Instr.PhiSources[j].Value.RegType, Instr.PhiSources[j].Value.RegIndex);
+          Instr.PhiSources[j].Value.Version := CurrentVersion(VarKey);
+        end;
       end;
 
       // Rename DEFINITION (Dest) - UNLESS this instruction USES Dest as input!

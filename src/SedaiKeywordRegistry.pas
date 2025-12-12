@@ -752,8 +752,10 @@ begin
       Result[0] := DirectResult;
     end
     else
+    begin
       SetLength(Result, 0);
-      Exit;
+    end;
+    Exit;
   end;
 
   // Use trie search for complex cases
@@ -1714,6 +1716,7 @@ begin
  RegisterKeyword(kRCLR,    ttGraphicsFunction, 'Return color of color source',                     kcGraphicsHandling);
  RegisterKeyword(kRDOT,    ttGraphicsFunction, 'Return current position or color of pixel cursor', kcGraphicsHandling);
  RegisterKeyword(kRGR,     ttGraphicsFunction, 'Return current graphic mode',                      kcGraphicsHandling);
+ RegisterKeyword(kRGBA,    ttGraphicsFunction, 'Create 32-bit RGBA color value',                   kcGraphicsHandling);
  RegisterKeyword(kRWINDOW, ttGraphicsFunction, 'Return the size of the current window',            kcGraphicsHandling);
 
  // === SPRITES HANDLING (COMMANDS AND FUNCTIONS) ===

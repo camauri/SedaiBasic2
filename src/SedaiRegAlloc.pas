@@ -52,6 +52,8 @@
 unit SedaiRegAlloc;
 
 {$mode objfpc}{$H+}
+{$interfaces CORBA}
+{$codepage UTF8}
 {$inline on}
 {$I OptimizationFlags.inc}
 {$I DebugFlags.inc}
@@ -86,9 +88,10 @@ type
     VarName: string;           // BASIC variable name (e.g., "X", "I%", "S$")
     RegType: TSSARegisterType; // srtInt, srtFloat, srtString
     VirtualReg: Integer;       // Virtual register index
+    Version: Integer;          // SSA version (0 for unversioned, >0 for temporaries)
     UsageCount: Integer;       // Number of uses in the program
     PhysicalReg: Integer;      // Assigned physical register (-1 = not allocated)
-    constructor Create(const AName: string; ARegType: TSSARegisterType; AVirtReg: Integer);
+    constructor Create(const AName: string; ARegType: TSSARegisterType; AVirtReg, AVersion: Integer);
   end;
 
   { TLinearScanAllocator - Dual-mode register allocator }
@@ -183,12 +186,13 @@ end;
 
 { TVariableInfo }
 
-constructor TVariableInfo.Create(const AName: string; ARegType: TSSARegisterType; AVirtReg: Integer);
+constructor TVariableInfo.Create(const AName: string; ARegType: TSSARegisterType; AVirtReg, AVersion: Integer);
 begin
   inherited Create;
   VarName := AName;
   RegType := ARegType;
   VirtualReg := AVirtReg;
+  Version := AVersion;
   UsageCount := 0;
   PhysicalReg := -1;
 end;
@@ -291,7 +295,7 @@ procedure TLinearScanAllocator.ComputeLiveIntervals;
 var
   Block: TSSABasicBlock;
   Instr: TSSAInstruction;
-  i, j, Position: Integer;
+  i, j, k, Position: Integer;
   Interval: TLiveInterval;
 
   procedure UpdateInterval(const Val: TSSAValue; Pos: Integer);
@@ -328,6 +332,10 @@ begin
       // Update interval for destination (def)
       if Instr.Dest.Kind = svkRegister then
         UpdateInterval(Instr.Dest, Position);
+
+      // CRITICAL: Update intervals for PhiSources (used by BOX, RGBA, etc.)
+      for k := 0 to High(Instr.PhiSources) do
+        UpdateInterval(Instr.PhiSources[k].Value, Position);
     end;
   end;
 
@@ -482,7 +490,7 @@ procedure TLinearScanAllocator.RewriteProgram;
 var
   Block: TSSABasicBlock;
   Instr: TSSAInstruction;
-  i, j: Integer;
+  i, j, k: Integer;
 begin
   {$IFDEF DEBUG_REGALLOC}
   if DebugRegAlloc then
@@ -504,6 +512,11 @@ begin
 
       // Rewrite destination
       Instr.Dest := RewriteValue(Instr.Dest);
+
+      // CRITICAL: Rewrite PhiSources for instructions that use them for extra operands
+      // (e.g., ssaGraphicBox uses PhiSources[0..4] for x2, y2, angle, filled, fill_color)
+      for k := 0 to High(Instr.PhiSources) do
+        Instr.PhiSources[k].Value := RewriteValue(Instr.PhiSources[k].Value);
     end;
   end;
 end;
@@ -589,13 +602,13 @@ var
   var
     idx: Integer;
     Parts: TStringList;
-    RegTypeInt: Integer;
+    RegTypeInt, RegVer: Integer;
   begin
-    // Search for existing VarInfo
+    // Search for existing VarInfo (key now includes version)
     for idx := 0 to VarList.Count - 1 do
     begin
       VarInfo := TVariableInfo(VarList[idx]);
-      if (IntToStr(Ord(VarInfo.RegType)) + ':' + IntToStr(VarInfo.VirtualReg)) = Key then
+      if (IntToStr(Ord(VarInfo.RegType)) + ':' + IntToStr(VarInfo.VirtualReg) + ':' + IntToStr(VarInfo.Version)) = Key then
         Exit(VarInfo);
     end;
 
@@ -604,19 +617,20 @@ var
     try
       Parts.Delimiter := ':';
       Parts.DelimitedText := Key;
-      if Parts.Count = 2 then
+      if Parts.Count = 3 then
       begin
         RegTypeInt := StrToInt(Parts[0]);
         RegIndex := StrToInt(Parts[1]);
+        RegVer := StrToInt(Parts[2]);
         RegType := TSSARegisterType(RegTypeInt);
 
-        // CRITICAL FIX: DO NOT use VarRegMap - it's obsolete after optimizations
-        // (CopyProp, ConstProp, etc. rename registers but don't update VarRegMap)
-        // Instead, just treat each virtual register as a separate variable.
-        // The register index IS the variable identity in BASIC mode (Version=0).
-        VarName := 'r' + IntToStr(RegIndex);  // Simple name: r0, r1, r2, etc.
+        // Include version in name for debugging
+        if RegVer = 0 then
+          VarName := 'r' + IntToStr(RegIndex)
+        else
+          VarName := 'r' + IntToStr(RegIndex) + '_v' + IntToStr(RegVer);
 
-        Result := TVariableInfo.Create(VarName, RegType, RegIndex);
+        Result := TVariableInfo.Create(VarName, RegType, RegIndex, RegVer);
         VarList.Add(Result);
       end
       else
@@ -633,7 +647,8 @@ var
   begin
     if Val.Kind <> svkRegister then Exit;
 
-    Key := IntToStr(Ord(Val.RegType)) + ':' + IntToStr(Val.RegIndex);
+    // CRITICAL: Include Version in key to distinguish SSA versions
+    Key := IntToStr(Ord(Val.RegType)) + ':' + IntToStr(Val.RegIndex) + ':' + IntToStr(Val.Version);
     Info := FindOrCreateVarInfo(Key);
     if Assigned(Info) then
       Inc(Info.UsageCount);
@@ -657,6 +672,10 @@ begin
 
       // Count destination usage (definitions also count as "usage")
       CountUsage(Instr.Dest);
+
+      // CRITICAL: Count PhiSources usage (used by BOX, RGBA, etc.)
+      for k := 0 to High(Instr.PhiSources) do
+        CountUsage(Instr.PhiSources[k].Value);
     end;
   end;
 
@@ -702,8 +721,9 @@ begin
       VarInfo.PhysicalReg := PhysReg;
       {$IFDEF DEBUG_REGALLOC}
       if DebugRegAlloc then
-        WriteLn('[RegAlloc]   ', VarInfo.VarName, ' (',
-                IntToStr(Ord(VarInfo.RegType)), ':', VarInfo.VirtualReg,
+        WriteLn('[RegAlloc]   ', VarInfo.VarName, ' (type=',
+                IntToStr(Ord(VarInfo.RegType)), ', idx=', VarInfo.VirtualReg,
+                ', ver=', VarInfo.Version,
                 ') → R', PhysReg, ' (usage: ', VarInfo.UsageCount, ')');
       {$ENDIF}
     end
@@ -746,13 +766,21 @@ var
     if Val.Kind <> svkRegister then Exit;
 
     Found := False;
-    // Find variable info for this virtual register
+    // Find variable info for this virtual register (MUST match Version too!)
     for idx := 0 to VarList.Count - 1 do
     begin
       VarInfo := TVariableInfo(VarList[idx]);
-      if (VarInfo.RegType = Val.RegType) and (VarInfo.VirtualReg = Val.RegIndex) then
+      // CRITICAL: Match RegType, RegIndex AND Version
+      if (VarInfo.RegType = Val.RegType) and
+         (VarInfo.VirtualReg = Val.RegIndex) and
+         (VarInfo.Version = Val.Version) then
       begin
         Found := True;
+        {$IFDEF DEBUG_REGALLOC}
+        if DebugRegAlloc then
+          WriteLn('[RegAlloc] REWRITE r', Val.RegIndex, '_v', Val.Version,
+                  ' type=', Ord(Val.RegType), ' -> R', VarInfo.PhysicalReg);
+        {$ENDIF}
         // All variables now have PhysicalReg assigned (either physical reg 0-31
         // or spill slot 32+), so always rewrite
         Result.RegIndex := VarInfo.PhysicalReg;
@@ -810,6 +838,11 @@ begin
       Instr.Src2 := RewriteValueBASIC(Instr.Src2);
       Instr.Src3 := RewriteValueBASIC(Instr.Src3);
       Instr.Dest := RewriteValueBASIC(Instr.Dest);
+
+      // CRITICAL: Rewrite PhiSources for instructions that use them for extra operands
+      // (e.g., ssaGraphicBox uses PhiSources[0..4] for x2, y2, angle, filled, fill_color)
+      for k := 0 to High(Instr.PhiSources) do
+        Instr.PhiSources[k].Value := RewriteValueBASIC(Instr.PhiSources[k].Value);
     end;
   end;
 

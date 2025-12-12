@@ -31,7 +31,8 @@ interface
 
 uses
   Classes, SysUtils, Math, Variants,
-  SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes
+  SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
+  SedaiConsoleBehavior
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF};
 
 type
@@ -65,9 +66,15 @@ type
     FCallStackPtr: Integer;
     FOutputDevice: IOutputDevice;
     FInputDevice: IInputDevice;
+    FConsoleBehavior: TConsoleBehavior;
+    FOwnsConsoleBehavior: Boolean;
+    FCursorCol: Integer;  // Track cursor column for TAB zones
     FVarMap: TStringList;
     FArrays: array of TArrayStorage;
     FSwapTempInt: Int64;  // Temp variable for ArraySwapInt superinstruction
+    // Temp variables for ArrayReverseRange and ArrayShiftLeft
+    FStartIdx, FEndIdx, FArrIdxTmp, FLoopIdx: Integer;
+    FFirstVal: Int64;
     {$IFDEF ENABLE_INSTRUCTION_COUNTING}
     FInstructionsExecuted: Int64;
     {$ENDIF}
@@ -85,6 +92,9 @@ type
     procedure LoadProgram(Program_: TBytecodeProgram);
     procedure SetOutputDevice(Device: IOutputDevice);
     procedure SetInputDevice(Device: IInputDevice);
+    procedure SetConsoleBehavior(ABehavior: TConsoleBehavior; OwnsBehavior: Boolean = False);
+    procedure ApplyPreset(Preset: TConsolePreset);
+    function GetConsoleBehavior: TConsoleBehavior;
     procedure Run;
     procedure RunFast;  // Optimized execution loop - no profiler support
     procedure RunSwitchedGoto;  // Switched goto dispatch - best branch prediction
@@ -111,17 +121,23 @@ begin
   FPC := 0;
   FRunning := False;
   FCallStackPtr := 0;
+  FCursorCol := 0;
   {$IFDEF ENABLE_INSTRUCTION_COUNTING}
   FInstructionsExecuted := 0;
   {$ENDIF}
   SetLength(FCallStack, 256);
   FVarMap := TStringList.Create;
   FVarMap.Sorted := True;
+  // Create default console behavior (Commodore 64 style)
+  FConsoleBehavior := TConsolePresets.CreateCommodore64;
+  FOwnsConsoleBehavior := True;
   InitializeRegisters;
 end;
 
 destructor TBytecodeVM.Destroy;
 begin
+  if FOwnsConsoleBehavior and Assigned(FConsoleBehavior) then
+    FConsoleBehavior.Free;
   FVarMap.Free;
   inherited Destroy;
 end;
@@ -273,63 +289,63 @@ begin
   begin
     Instr := FProgram.GetInstruction(i);
 
-    // Handle superinstructions (opcode >= 100) separately
-    if Instr.OpCode >= 100 then
+    // Handle superinstructions (opcode >= 110) separately
+    if Instr.OpCode >= 110 then
     begin
       case Instr.OpCode of
         // Fused compare-and-branch (Int) - use IntRegs for Src1, Src2
-        100..105:  // bcBranchEqInt..bcBranchGeInt
+        110..115:  // bcBranchEqInt..bcBranchGeInt
         begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
         end;
         // Fused compare-and-branch (Float) - use FloatRegs for Src1, Src2
-        110..115:  // bcBranchEqFloat..bcBranchGeFloat
+        120..125:  // bcBranchEqFloat..bcBranchGeFloat
         begin
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
           if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;
         end;
         // Fused arithmetic-to-dest (Int) - use IntRegs for Dest, Src1
-        120..122:  // bcAddIntTo..bcMulIntTo
+        130..132:  // bcAddIntTo..bcMulIntTo
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
         // Fused arithmetic-to-dest (Float) - use FloatRegs for Dest, Src1
-        130..133:  // bcAddFloatTo..bcDivFloatTo
+        140..143:  // bcAddFloatTo..bcDivFloatTo
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
         end;
         // Fused constant arithmetic (Int) - use IntRegs for Dest, Src1
-        140..142:  // bcAddIntConst..bcMulIntConst
+        150..152:  // bcAddIntConst..bcMulIntConst
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
         // Fused constant arithmetic (Float) - use FloatRegs for Dest, Src1
-        150..153:  // bcAddFloatConst..bcDivFloatConst
+        160..163:  // bcAddFloatConst..bcDivFloatConst
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
         end;
         // Fused compare-zero-and-branch (Int) - use IntRegs for Src1
-        160, 161:  // bcBranchEqZeroInt, bcBranchNeZeroInt
+        170, 171:  // bcBranchEqZeroInt, bcBranchNeZeroInt
         begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
         // Fused compare-zero-and-branch (Float) - use FloatRegs for Src1
-        170, 171:  // bcBranchEqZeroFloat, bcBranchNeZeroFloat
+        180, 181:  // bcBranchEqZeroFloat, bcBranchNeZeroFloat
         begin
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
         end;
         // Fused array-store-constant - use IntRegs for Src2 (index register)
-        180, 181, 182:  // bcArrayStoreIntConst, bcArrayStoreFloatConst, bcArrayStoreStringConst
+        190, 191, 192:  // bcArrayStoreIntConst, bcArrayStoreFloatConst, bcArrayStoreStringConst
         begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
         end;
         // Fused loop increment-and-branch - use IntRegs for Dest, Src1, Src2
-        190, 191, 192, 193:  // bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt
+        200, 201, 202, 203:  // bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
@@ -337,14 +353,14 @@ begin
         end;
 
         // NEW: FMA (Fused Multiply-Add) - use FloatRegs for Dest, Src1, Src2, Immediate
-        200, 201:  // bcMulAddFloat, bcMulSubFloat
+        210, 211:  // bcMulAddFloat, bcMulSubFloat
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
           if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;
           if Instr.Immediate > MaxFloatReg then MaxFloatReg := Instr.Immediate;  // c register
         end;
-        202, 203:  // bcMulAddToFloat, bcMulSubToFloat
+        212, 213:  // bcMulAddToFloat, bcMulSubToFloat
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
@@ -352,13 +368,13 @@ begin
         end;
 
         // NEW: Array Load + Arithmetic - use FloatRegs for Dest, Immediate; IntRegs for Src2
-        210, 211:  // bcArrayLoadAddFloat, bcArrayLoadSubFloat
+        220, 221:  // bcArrayLoadAddFloat, bcArrayLoadSubFloat
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;  // index register
           if Instr.Immediate > MaxFloatReg then MaxFloatReg := Instr.Immediate;  // acc register
         end;
-        212:  // bcArrayLoadDivAddFloat - Immediate encodes two registers
+        222:  // bcArrayLoadDivAddFloat - Immediate encodes two registers
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
@@ -367,7 +383,7 @@ begin
         end;
 
         // NEW: Square-Sum patterns - use FloatRegs for Dest, Src1, Src2
-        220, 221:  // bcSquareSumFloat, bcAddSquareFloat
+        230, 231:  // bcSquareSumFloat, bcAddSquareFloat
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
@@ -375,7 +391,7 @@ begin
         end;
 
         // NEW: Mul-Mul - use FloatRegs for Dest, Src1, Src2, Immediate
-        230:  // bcMulMulFloat
+        240:  // bcMulMulFloat
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
@@ -384,7 +400,7 @@ begin
         end;
 
         // NEW: Add-Sqrt - use FloatRegs for Dest, Src1, Src2
-        231:  // bcAddSqrtFloat
+        241:  // bcAddSqrtFloat
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
@@ -392,7 +408,7 @@ begin
         end;
 
         // NEW: Array Load + Branch - use IntRegs for Src2
-        240, 241:  // bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ
+        250, 251:  // bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ
         begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;  // index register
         end;
@@ -586,6 +602,26 @@ begin
   FInputDevice := Device;
 end;
 
+procedure TBytecodeVM.SetConsoleBehavior(ABehavior: TConsoleBehavior; OwnsBehavior: Boolean);
+begin
+  if FOwnsConsoleBehavior and Assigned(FConsoleBehavior) then
+    FConsoleBehavior.Free;
+
+  FConsoleBehavior := ABehavior;
+  FOwnsConsoleBehavior := OwnsBehavior;
+end;
+
+procedure TBytecodeVM.ApplyPreset(Preset: TConsolePreset);
+begin
+  if Assigned(FConsoleBehavior) then
+    FConsoleBehavior.ApplyPreset(Preset);
+end;
+
+function TBytecodeVM.GetConsoleBehavior: TConsoleBehavior;
+begin
+  Result := FConsoleBehavior;
+end;
+
 procedure TBytecodeVM.Reset;
 begin
   FPC := 0;
@@ -615,14 +651,17 @@ end;
 procedure TBytecodeVM.ExecuteInstruction(const Instr: TBytecodeInstruction);
 var
   Op: TBytecodeOp;
-  InputStr: string;
+  InputStr, PrintStr: string;
   InputVal: Double;
   ArrayIdx, LinearIdx, i, j, ProdDims: Integer;
+  NextTabCol, TabIdx: Integer;
+  DrawMode: Integer;
   ArrInfo: TSSAArrayInfo;
+  SleepMs: Integer;  // For SLEEP command
 begin
-  // Handle superinstructions FIRST (opcode >= 100) to avoid enum range issues
+  // Handle superinstructions FIRST (opcode >= 110) to avoid enum range issues
   // Converting out-of-range values to TBytecodeOp causes undefined behavior!
-  if Instr.OpCode >= 100 then
+  if Instr.OpCode >= 110 then
   begin
     ExecuteSuperinstruction(Instr);
     Exit;
@@ -780,21 +819,149 @@ begin
     bcMathRnd: FFloatRegs[Instr.Dest] := Random;
     bcPrint:
       if Assigned(FOutputDevice) then
-        FOutputDevice.Print(FloatToStr(FFloatRegs[Instr.Src1]));
+      begin
+        // Print float with behavior formatting
+        PrintStr := FConsoleBehavior.FormatNumber(FFloatRegs[Instr.Src1]);
+        FOutputDevice.Print(PrintStr);
+        Inc(FCursorCol, Length(PrintStr));
+      end;
     bcPrintLn:
       if Assigned(FOutputDevice) then
       begin
-        FOutputDevice.Print(FloatToStr(FFloatRegs[Instr.Src1]));
+        PrintStr := FConsoleBehavior.FormatNumber(FFloatRegs[Instr.Src1]);
+        FOutputDevice.Print(PrintStr);
         FOutputDevice.NewLine;
+        FCursorCol := 0;
+      end;
+    bcPrintInt:
+      if Assigned(FOutputDevice) then
+      begin
+        // Print integer with behavior formatting
+        PrintStr := FConsoleBehavior.FormatNumber(FIntRegs[Instr.Src1]);
+        FOutputDevice.Print(PrintStr);
+        Inc(FCursorCol, Length(PrintStr));
+      end;
+    bcPrintIntLn:
+      if Assigned(FOutputDevice) then
+      begin
+        PrintStr := FConsoleBehavior.FormatNumber(FIntRegs[Instr.Src1]);
+        FOutputDevice.Print(PrintStr);
+        FOutputDevice.NewLine;
+        FCursorCol := 0;
       end;
     bcPrintString:
       if Assigned(FOutputDevice) then
-        FOutputDevice.Print(FStringRegs[Instr.Src1]);
+      begin
+        PrintStr := FConsoleBehavior.FormatString(FStringRegs[Instr.Src1]);
+        FOutputDevice.Print(PrintStr);
+        Inc(FCursorCol, Length(PrintStr));
+      end;
     bcPrintStringLn:
       if Assigned(FOutputDevice) then
       begin
-        FOutputDevice.Print(FStringRegs[Instr.Src1]);
+        PrintStr := FConsoleBehavior.FormatString(FStringRegs[Instr.Src1]);
+        FOutputDevice.Print(PrintStr);
         FOutputDevice.NewLine;
+        FCursorCol := 0;
+      end;
+    bcPrintComma:
+      if Assigned(FOutputDevice) then
+      begin
+        // Apply comma separator (TAB zone)
+        NextTabCol := FConsoleBehavior.GetNextTabPosition(FCursorCol);
+        if NextTabCol = 0 then
+        begin
+          // Wrap to next line
+          FOutputDevice.NewLine;
+          FCursorCol := 0;
+        end
+        else if FConsoleBehavior.CommaAction = caTabZone then
+        begin
+          // Print spaces to reach next TAB zone
+          while FCursorCol < NextTabCol do
+          begin
+            FOutputDevice.Print(' ');
+            Inc(FCursorCol);
+          end;
+        end
+        else if FConsoleBehavior.CommaAction = caFixedSpaces then
+        begin
+          for TabIdx := 1 to FConsoleBehavior.CommaSpaces do
+          begin
+            FOutputDevice.Print(' ');
+            Inc(FCursorCol);
+          end;
+        end
+        else if FConsoleBehavior.CommaAction = caNewLine then
+        begin
+          FOutputDevice.NewLine;
+          FCursorCol := 0;
+        end;
+        // caNoAction: do nothing
+      end;
+    bcPrintSemicolon:
+      if Assigned(FOutputDevice) then
+      begin
+        // Apply semicolon separator
+        case FConsoleBehavior.SemicolonAction of
+          saNoSpace: ; // Do nothing
+          saSpaceAfter:
+            begin
+              FOutputDevice.Print(' ');
+              Inc(FCursorCol);
+            end;
+          saSpaceBefore: ; // Handled by next print
+          saSpaceBoth:
+            begin
+              FOutputDevice.Print(' ');
+              Inc(FCursorCol);
+            end;
+        end;
+      end;
+    bcPrintTab:
+      if Assigned(FOutputDevice) then
+      begin
+        // TAB(n) - move to column n
+        NextTabCol := Instr.Immediate;
+        if NextTabCol < 1 then NextTabCol := 1;
+        Dec(NextTabCol);  // Convert to 0-based
+
+        if FCursorCol < NextTabCol then
+        begin
+          // Print spaces to reach column
+          while FCursorCol < NextTabCol do
+          begin
+            FOutputDevice.Print(' ');
+            Inc(FCursorCol);
+          end;
+        end
+        else if FCursorCol > NextTabCol then
+        begin
+          // Already past: go to next line and tab
+          FOutputDevice.NewLine;
+          FCursorCol := 0;
+          while FCursorCol < NextTabCol do
+          begin
+            FOutputDevice.Print(' ');
+            Inc(FCursorCol);
+          end;
+        end;
+      end;
+    bcPrintSpc:
+      if Assigned(FOutputDevice) then
+      begin
+        // SPC(n) - print n spaces
+        for TabIdx := 1 to Instr.Immediate do
+        begin
+          FOutputDevice.Print(' ');
+          Inc(FCursorCol);
+        end;
+      end;
+    bcPrintNewLine:
+      if Assigned(FOutputDevice) then
+      begin
+        FOutputDevice.NewLine;
+        FCursorCol := 0;
       end;
     bcInput:
       if Assigned(FInputDevice) then
@@ -1067,7 +1234,217 @@ begin
       {$ENDIF}
     end;
 
+    // Graphics operations
+    bcGraphicRGBA:
+    begin
+      // RGBA(r, g, b, a) - combine 4 int registers into a 32-bit RGBA color
+      // Bytecode format: Dest=result, Src1=R, Src2=G, Immediate=(B_reg << 16) | A_reg
+      // Result = (A << 24) | (R << 16) | (G << 8) | B
+      FIntRegs[Instr.Dest] :=
+        ((FIntRegs[Instr.Immediate and $FFFF] and $FF) shl 24) or        // A from low 16 bits of Immediate
+        ((FIntRegs[Instr.Src1] and $FF) shl 16) or                        // R
+        ((FIntRegs[Instr.Src2] and $FF) shl 8) or                         // G
+        (FIntRegs[(Instr.Immediate shr 16) and $FFFF] and $FF);           // B from high 16 bits of Immediate
+    end;
+    bcGraphicSetMode:
+    begin
+      // GRAPHIC mode, clear, param3
+      // Bytecode: Src1=mode register, Src2=clear register, Immediate=param3 register
+      // Mode is in FIntRegs[Src1], Clear is in FIntRegs[Src2], param3 in FIntRegs[Immediate]
+      WriteLn('>>> VM bcGraphicSetMode: FOutputDevice=', Assigned(FOutputDevice));
+      WriteLn('>>> VM: Src1=', Instr.Src1, ' Src2=', Instr.Src2, ' Immediate=', Instr.Immediate);
+      WriteLn('>>> VM: Mode=', FIntRegs[Instr.Src1], ' Clear=', FIntRegs[Instr.Src2]);
+      if Assigned(FOutputDevice) then
+      begin
+        WriteLn('>>> VM: Calling SetGraphicMode...');
+        FOutputDevice.SetGraphicMode(
+          TGraphicMode(FIntRegs[Instr.Src1] and $F),  // Mode 0-11 (was $7, now $F for extended modes)
+          FIntRegs[Instr.Src2] <> 0,                   // Clear flag
+          FIntRegs[Instr.Immediate and $FFFF]          // SplitLine/param3
+        );
+        WriteLn('>>> VM: SetGraphicMode returned');
+      end
+      else
+        WriteLn('>>> VM: FOutputDevice is NIL!');
+    end;
+    bcGraphicBox:
+    begin
+      // BOX color, x1, y1, x2, y2, angle, filled, fill_color
+      // Bytecode format: Src1=color, Src2=x1, Dest=y1
+      // Immediate encodes: x2(bits 0-11), y2(12-23), angle(24-35), filled(36-47), fill_color(48-59)
+      if Assigned(FOutputDevice) then
+      begin
+        // Extract register indices from Immediate field
+        // x2 = bits 0-11, y2 = bits 12-23, angle = bits 24-35
+        // filled = bits 36-47, fill_color = bits 48-59
+        // DrawBoxWithColor interprets color based on graphics mode:
+        // - Hires modes (1-2): 0=background, 1=foreground
+        // - SDL2 mode (7): direct RGBA value
+        WriteLn('>>> BOX: Src1(color reg)=', Instr.Src1, ' Src2(x1 reg)=', Instr.Src2, ' Dest(y1 reg)=', Instr.Dest);
+        WriteLn('>>> BOX: x2 reg=', (Instr.Immediate) and $FFF, ' y2 reg=', (Instr.Immediate shr 12) and $FFF);
+        WriteLn('>>> BOX: angle reg=', (Instr.Immediate shr 24) and $FFF, ' filled reg=', (Instr.Immediate shr 36) and $FFF);
+        WriteLn('>>> BOX VALUES: color=', FIntRegs[Instr.Src1], ' x1=', FIntRegs[Instr.Src2], ' y1=', FIntRegs[Instr.Dest]);
+        WriteLn('>>> BOX VALUES: x2=', FIntRegs[(Instr.Immediate) and $FFF], ' y2=', FIntRegs[(Instr.Immediate shr 12) and $FFF]);
+        WriteLn('>>> BOX VALUES: filled=', FIntRegs[(Instr.Immediate shr 36) and $FFF]);
+        FOutputDevice.DrawBoxWithColor(
+          FIntRegs[Instr.Src2],                              // x1
+          FIntRegs[Instr.Dest],                              // y1
+          FIntRegs[(Instr.Immediate) and $FFF],              // x2
+          FIntRegs[(Instr.Immediate shr 12) and $FFF],       // y2
+          UInt32(FIntRegs[Instr.Src1]),                      // color (interpreted by output device)
+          FFloatRegs[(Instr.Immediate shr 24) and $FFF],     // angle
+          FIntRegs[(Instr.Immediate shr 36) and $FFF] <> 0   // filled (non-zero = true)
+        );
+        // Update display after drawing
+        FOutputDevice.Present;
+      end;
+    end;
+    bcGraphicCircle:
+    begin
+      // CIRCLE color, x, y, xr, yr, sa, ea, angle, inc
+      // Bytecode format: Src1=color, Src2=x, Dest=y
+      // Immediate encodes: xr(bits 0-9), yr(10-19), sa(20-29), ea(30-39), angle(40-49), inc(50-59)
+      if Assigned(FOutputDevice) then
+      begin
+        FOutputDevice.DrawCircleWithColor(
+          FIntRegs[Instr.Src2],                              // x (center)
+          FIntRegs[Instr.Dest],                              // y (center)
+          FIntRegs[(Instr.Immediate) and $3FF],              // xr (x radius)
+          FIntRegs[(Instr.Immediate shr 10) and $3FF],       // yr (y radius)
+          UInt32(FIntRegs[Instr.Src1]),                      // color
+          FFloatRegs[(Instr.Immediate shr 20) and $3FF],     // sa (start angle)
+          FFloatRegs[(Instr.Immediate shr 30) and $3FF],     // ea (end angle)
+          FFloatRegs[(Instr.Immediate shr 40) and $3FF],     // angle (rotation)
+          FFloatRegs[(Instr.Immediate shr 50) and $3FF]      // inc (increment)
+        );
+        // Update display after drawing
+        FOutputDevice.Present;
+      end;
+    end;
+    bcGraphicDraw:
+    begin
+      // DRAW color, x, y with mode
+      // Bytecode format: Src1=color, Src2=x, Dest=y, Immediate=mode
+      // Mode: 0=move PC only, 1=draw line from PC to (x,y), 2=draw dot at (x,y)
+      if Assigned(FOutputDevice) then
+      begin
+        DrawMode := Instr.Immediate and $7FFF;  // Remove flag bit if present
+        case DrawMode of
+          0: // Move PC only (first point of DRAW, no line drawn)
+            FOutputDevice.SetPixelCursor(FIntRegs[Instr.Src2], FIntRegs[Instr.Dest]);
+          1: // Draw line from current PC to (x,y)
+            begin
+              FOutputDevice.DrawLine(
+                FOutputDevice.GetPixelCursorX,
+                FOutputDevice.GetPixelCursorY,
+                FIntRegs[Instr.Src2],
+                FIntRegs[Instr.Dest],
+                UInt32(FIntRegs[Instr.Src1])
+              );
+              FOutputDevice.SetPixelCursor(FIntRegs[Instr.Src2], FIntRegs[Instr.Dest]);
+            end;
+          2: // Draw single dot at (x,y)
+            begin
+              FOutputDevice.SetPixel(FIntRegs[Instr.Src2], FIntRegs[Instr.Dest], UInt32(FIntRegs[Instr.Src1]));
+              FOutputDevice.SetPixelCursor(FIntRegs[Instr.Src2], FIntRegs[Instr.Dest]);
+            end;
+        end;
+        FOutputDevice.Present;
+      end;
+    end;
+    bcGraphicLocate:
+    begin
+      // LOCATE x, y - set pixel cursor position
+      // Bytecode format: Src1=x, Src2=y
+      if Assigned(FOutputDevice) then
+        FOutputDevice.SetPixelCursor(FIntRegs[Instr.Src1], FIntRegs[Instr.Src2]);
+    end;
+    bcGraphicRdot:
+    begin
+      // RDOT(n) - get pixel cursor info
+      // Bytecode format: Dest=result, Src1=which (0=x, 1=y, 2=color at PC)
+      if Assigned(FOutputDevice) then
+      begin
+        case FIntRegs[Instr.Src1] of
+          0: FIntRegs[Instr.Dest] := FOutputDevice.GetPixelCursorX;
+          1: FIntRegs[Instr.Dest] := FOutputDevice.GetPixelCursorY;
+          2: FIntRegs[Instr.Dest] := Integer(FOutputDevice.GetPixel(
+               FOutputDevice.GetPixelCursorX, FOutputDevice.GetPixelCursorY));
+        else
+          FIntRegs[Instr.Dest] := 0;
+        end;
+      end
+      else
+        FIntRegs[Instr.Dest] := 0;
+    end;
+
+    bcGraphicGetMode:
+    begin
+      // RGR(n) - get graphics info
+      // n=0: current graphics mode (0-11)
+      // Future expansion: n=1..n for other info
+      WriteLn('>>> bcGraphicGetMode: FOutputDevice=', Assigned(FOutputDevice),
+              ' Src1=', Instr.Src1, ' Dest=', Instr.Dest);
+      if Assigned(FOutputDevice) then
+      begin
+        WriteLn('>>> bcGraphicGetMode: Src1Value=', FIntRegs[Instr.Src1]);
+        case FIntRegs[Instr.Src1] of
+          0: begin
+               FIntRegs[Instr.Dest] := Ord(FOutputDevice.GetGraphicMode);
+               WriteLn('>>> bcGraphicGetMode: Result=', FIntRegs[Instr.Dest]);
+             end;
+        else
+          FIntRegs[Instr.Dest] := 0;
+        end;
+      end
+      else
+        FIntRegs[Instr.Dest] := 0;
+    end;
+
     bcEnd, bcStop: FRunning := False;
+    bcFast: if Assigned(FOutputDevice) then FOutputDevice.SetFastMode(True);
+    bcSlow: if Assigned(FOutputDevice) then FOutputDevice.SetFastMode(False);
+    bcSleep:
+    begin
+      // SLEEP n - delay for n seconds
+      // Value can come from:
+      // 1. Immediate field (constant value from bytecode compiler)
+      // 2. Src1 register (variable/expression result)
+      // Clamp to 0..65535 as per C128 spec
+      if Instr.Immediate > 0 then
+        SleepMs := Instr.Immediate * 1000  // Constant in Immediate
+      else if Instr.Src1 < FFloatRegCount then
+        SleepMs := Trunc(FFloatRegs[Instr.Src1] * 1000)  // Register value
+      else
+        SleepMs := 1000; // Default 1 second
+      if SleepMs < 0 then SleepMs := 0;
+      if SleepMs > 65535000 then SleepMs := 65535000;
+      // Sleep in small increments to allow interrupt checking and SDL event processing
+      while (SleepMs > 0) and FRunning do
+      begin
+        if SleepMs > 50 then
+        begin
+          Sleep(50);
+          Dec(SleepMs, 50);
+        end
+        else
+        begin
+          Sleep(SleepMs);
+          SleepMs := 0;
+        end;
+        // Process SDL events to keep window responsive
+        if Assigned(FInputDevice) then
+        begin
+          FInputDevice.ProcessEvents;
+          // Check for CTRL+C (stop program) or CTRL+ALT+END (quit)
+          if FInputDevice.ShouldStop or FInputDevice.ShouldQuit then
+          begin
+            FRunning := False;
+            FInputDevice.ClearStopRequest;
+          end;
+        end;
+      end;
+    end;
     bcNop: ;
   end; // case Op (standard bytecode)
 end;
@@ -1075,7 +1452,7 @@ end;
 procedure TBytecodeVM.ExecuteSuperinstruction(const Instr: TBytecodeInstruction);
 begin
   // DEBUG: Validate register indices before access
-  if (Instr.OpCode >= 100) and (Instr.OpCode <= 182) then
+  if (Instr.OpCode >= 110) and (Instr.OpCode <= 182) then
   begin
     // Check Int register bounds for Int superinstructions
     if Instr.OpCode in [100..105, 120..122, 140..142, 160, 161] then
@@ -1310,6 +1687,50 @@ begin
     // Format: Dest=final destination, Src1=arr_index, Src2=idx_reg
     253: // bcArrayLoadIntTo: r[dest] = arr[src1][r[src2]]
       FIntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]];
+
+    // NEW: Array Copy Element - opcode 254
+    // Format: Dest=dest_arr_index, Src1=src_arr_index, Src2=idx_reg
+    254: // bcArrayCopyElement: arr_dest[idx] = arr_src[idx]
+      FArrays[Instr.Dest].IntData[FIntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]];
+
+    // NEW: Array Move Element - opcode 255
+    // Format: Dest=arr_index, Src1=src_idx_reg, Src2=dest_idx_reg
+    255: // bcArrayMoveElement: arr[dest_idx] = arr[src_idx]
+      FArrays[Instr.Dest].IntData[FIntRegs[Instr.Src2]] := FArrays[Instr.Dest].IntData[FIntRegs[Instr.Src1]];
+
+    // NEW: Array Reverse Range - opcode 156
+    // Format: Src1=arr_index, Src2=start_idx_reg, Dest=end_idx_reg
+    156: // bcArrayReverseRange: reverse arr[start..end-1] in-place
+      begin
+        FStartIdx := FIntRegs[Instr.Src2];
+        FEndIdx := FIntRegs[Instr.Dest] - 1;
+        FArrIdxTmp := Instr.Src1;
+        while FStartIdx < FEndIdx do
+        begin
+          FSwapTempInt := FArrays[FArrIdxTmp].IntData[FStartIdx];
+          FArrays[FArrIdxTmp].IntData[FStartIdx] := FArrays[FArrIdxTmp].IntData[FEndIdx];
+          FArrays[FArrIdxTmp].IntData[FEndIdx] := FSwapTempInt;
+          Inc(FStartIdx);
+          Dec(FEndIdx);
+        end;
+      end;
+
+    // NEW: Array Shift Left - opcode 157
+    // Format: Src1=arr_index, Src2=start_idx_reg, Dest=end_idx_reg
+    157: // bcArrayShiftLeft: shift left and rotate first to end+1
+      begin
+        FStartIdx := FIntRegs[Instr.Src2];
+        FEndIdx := FIntRegs[Instr.Dest];
+        FArrIdxTmp := Instr.Src1;
+        FFirstVal := FArrays[FArrIdxTmp].IntData[FStartIdx];
+        FLoopIdx := FStartIdx;
+        while FLoopIdx <= FEndIdx do
+        begin
+          FArrays[FArrIdxTmp].IntData[FLoopIdx] := FArrays[FArrIdxTmp].IntData[FLoopIdx + 1];
+          Inc(FLoopIdx);
+        end;
+        FArrays[FArrIdxTmp].IntData[FEndIdx + 1] := FFirstVal;
+      end;
   else
     raise Exception.CreateFmt('Unknown superinstruction opcode %d at PC=%d', [Instr.OpCode, FPC]);
   end; // case Instr.OpCode (superinstructions)
@@ -1339,7 +1760,7 @@ begin
   begin
     FProfiler.AfterInstruction(FPC, Instr.OpCode);
     // Track superinstructions
-    if Instr.OpCode >= 100 then
+    if Instr.OpCode >= 110 then
       FProfiler.OnSuperinstruction(Instr.OpCode, 1);
   end;
   {$ENDIF}
@@ -1369,6 +1790,10 @@ begin
   if Assigned(FProfiler) then
     FProfiler.Stop;
   {$ENDIF}
+
+  // Reset FAST mode when program ends (ensure screen is visible)
+  if Assigned(FOutputDevice) then
+    FOutputDevice.SetFastMode(False);
 end;
 
 { RunFast - Optimized execution loop
@@ -1389,10 +1814,15 @@ var
   IntRegs: PInt64;
   FloatRegs: PDouble;
   ArrayIdx, LinearIdx: Integer;
-  InputStr: string;
+  InputStr, PrintStr: string;
   InputVal: Double;
   i, ProdDims: Integer;
+  NextTabCol, TabIdx: Integer;
   ArrInfo: TSSAArrayInfo;
+  // Local vars for ArrayReverseRange and ArrayShiftLeft
+  ArrIdxW: Word;
+  LStartIdx, LEndIdx, LLoopIdx: Integer;
+  LFirstVal: Int64;
 begin
   if FProgram = nil then raise Exception.Create('No program loaded');
 
@@ -1421,7 +1851,7 @@ begin
     {$ENDIF}
 
     // Fast path: check for superinstructions first (most common in optimized code)
-    if Op >= 100 then
+    if Op >= 110 then
     begin
       case Op of
         // Fused loop increment-and-branch (most common in hot loops)
@@ -1596,6 +2026,46 @@ begin
 
         // NEW: Array Load to register (Int) - opcode 253
         253: begin IntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]]; Inc(CurPC); end; // bcArrayLoadIntTo
+
+        // NEW: Array Copy Element - opcode 254
+        254: begin FArrays[Instr.Dest].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]]; Inc(CurPC); end;
+
+        // NEW: Array Move Element - opcode 255
+        255: begin FArrays[Instr.Dest].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Dest].IntData[IntRegs[Instr.Src1]]; Inc(CurPC); end;
+
+        // NEW: Array Reverse Range - opcode 156
+        156: // bcArrayReverseRange
+          begin
+            LStartIdx := IntRegs[Instr.Src2];
+            LEndIdx := IntRegs[Instr.Dest] - 1;
+            ArrIdxW := Instr.Src1;
+            while LStartIdx < LEndIdx do
+            begin
+              FSwapTempInt := FArrays[ArrIdxW].IntData[LStartIdx];
+              FArrays[ArrIdxW].IntData[LStartIdx] := FArrays[ArrIdxW].IntData[LEndIdx];
+              FArrays[ArrIdxW].IntData[LEndIdx] := FSwapTempInt;
+              Inc(LStartIdx);
+              Dec(LEndIdx);
+            end;
+            Inc(CurPC);
+          end;
+
+        // NEW: Array Shift Left - opcode 157
+        157: // bcArrayShiftLeft
+          begin
+            LStartIdx := IntRegs[Instr.Src2];
+            LEndIdx := IntRegs[Instr.Dest];
+            ArrIdxW := Instr.Src1;
+            LFirstVal := FArrays[ArrIdxW].IntData[LStartIdx];
+            LLoopIdx := LStartIdx;
+            while LLoopIdx <= LEndIdx do
+            begin
+              FArrays[ArrIdxW].IntData[LLoopIdx] := FArrays[ArrIdxW].IntData[LLoopIdx + 1];
+              Inc(LLoopIdx);
+            end;
+            FArrays[ArrIdxW].IntData[LEndIdx + 1] := LFirstVal;
+            Inc(CurPC);
+          end;
       else
         raise Exception.CreateFmt('Unknown superinstruction opcode %d at CurPC=%d', [Op, CurPC]);
       end;
@@ -1784,30 +2254,162 @@ begin
         bcPrint:
           begin
             if Assigned(FOutputDevice) then
-              FOutputDevice.Print(FloatToStr(FloatRegs[Instr.Src1]));
+            begin
+              PrintStr := FConsoleBehavior.FormatNumber(FloatRegs[Instr.Src1]);
+              FOutputDevice.Print(PrintStr);
+              Inc(FCursorCol, Length(PrintStr));
+            end;
             Inc(CurPC);
           end;
         bcPrintLn:
           begin
             if Assigned(FOutputDevice) then
             begin
-              FOutputDevice.Print(FloatToStr(FloatRegs[Instr.Src1]));
+              PrintStr := FConsoleBehavior.FormatNumber(FloatRegs[Instr.Src1]);
+              FOutputDevice.Print(PrintStr);
               FOutputDevice.NewLine;
+              FCursorCol := 0;
+            end;
+            Inc(CurPC);
+          end;
+        bcPrintInt:
+          begin
+            if Assigned(FOutputDevice) then
+            begin
+              PrintStr := FConsoleBehavior.FormatNumber(IntRegs[Instr.Src1]);
+              FOutputDevice.Print(PrintStr);
+              Inc(FCursorCol, Length(PrintStr));
+            end;
+            Inc(CurPC);
+          end;
+        bcPrintIntLn:
+          begin
+            if Assigned(FOutputDevice) then
+            begin
+              PrintStr := FConsoleBehavior.FormatNumber(IntRegs[Instr.Src1]);
+              FOutputDevice.Print(PrintStr);
+              FOutputDevice.NewLine;
+              FCursorCol := 0;
             end;
             Inc(CurPC);
           end;
         bcPrintString:
           begin
             if Assigned(FOutputDevice) then
-              FOutputDevice.Print(FStringRegs[Instr.Src1]);
+            begin
+              PrintStr := FConsoleBehavior.FormatString(FStringRegs[Instr.Src1]);
+              FOutputDevice.Print(PrintStr);
+              Inc(FCursorCol, Length(PrintStr));
+            end;
             Inc(CurPC);
           end;
         bcPrintStringLn:
           begin
             if Assigned(FOutputDevice) then
             begin
-              FOutputDevice.Print(FStringRegs[Instr.Src1]);
+              PrintStr := FConsoleBehavior.FormatString(FStringRegs[Instr.Src1]);
+              FOutputDevice.Print(PrintStr);
               FOutputDevice.NewLine;
+              FCursorCol := 0;
+            end;
+            Inc(CurPC);
+          end;
+        bcPrintComma:
+          begin
+            if Assigned(FOutputDevice) then
+            begin
+              NextTabCol := FConsoleBehavior.GetNextTabPosition(FCursorCol);
+              if NextTabCol = 0 then
+              begin
+                FOutputDevice.NewLine;
+                FCursorCol := 0;
+              end
+              else if FConsoleBehavior.CommaAction = caTabZone then
+              begin
+                while FCursorCol < NextTabCol do
+                begin
+                  FOutputDevice.Print(' ');
+                  Inc(FCursorCol);
+                end;
+              end
+              else if FConsoleBehavior.CommaAction = caFixedSpaces then
+              begin
+                for TabIdx := 1 to FConsoleBehavior.CommaSpaces do
+                begin
+                  FOutputDevice.Print(' ');
+                  Inc(FCursorCol);
+                end;
+              end
+              else if FConsoleBehavior.CommaAction = caNewLine then
+              begin
+                FOutputDevice.NewLine;
+                FCursorCol := 0;
+              end;
+            end;
+            Inc(CurPC);
+          end;
+        bcPrintSemicolon:
+          begin
+            if Assigned(FOutputDevice) then
+            begin
+              case FConsoleBehavior.SemicolonAction of
+                saNoSpace: ;
+                saSpaceAfter, saSpaceBoth:
+                  begin
+                    FOutputDevice.Print(' ');
+                    Inc(FCursorCol);
+                  end;
+                saSpaceBefore: ;
+              end;
+            end;
+            Inc(CurPC);
+          end;
+        bcPrintTab:
+          begin
+            if Assigned(FOutputDevice) then
+            begin
+              NextTabCol := Instr.Immediate;
+              if NextTabCol < 1 then NextTabCol := 1;
+              Dec(NextTabCol);
+              if FCursorCol < NextTabCol then
+              begin
+                while FCursorCol < NextTabCol do
+                begin
+                  FOutputDevice.Print(' ');
+                  Inc(FCursorCol);
+                end;
+              end
+              else if FCursorCol > NextTabCol then
+              begin
+                FOutputDevice.NewLine;
+                FCursorCol := 0;
+                while FCursorCol < NextTabCol do
+                begin
+                  FOutputDevice.Print(' ');
+                  Inc(FCursorCol);
+                end;
+              end;
+            end;
+            Inc(CurPC);
+          end;
+        bcPrintSpc:
+          begin
+            if Assigned(FOutputDevice) then
+            begin
+              for TabIdx := 1 to Instr.Immediate do
+              begin
+                FOutputDevice.Print(' ');
+                Inc(FCursorCol);
+              end;
+            end;
+            Inc(CurPC);
+          end;
+        bcPrintNewLine:
+          begin
+            if Assigned(FOutputDevice) then
+            begin
+              FOutputDevice.NewLine;
+              FCursorCol := 0;
             end;
             Inc(CurPC);
           end;
@@ -1934,6 +2536,28 @@ begin
             Inc(CurPC);
           end;
 
+        // Graphics operations
+        bcGraphicRGBA:
+          begin
+            // RGBA(r, g, b, a) - combine 4 int registers into a 32-bit RGBA color
+            // Bytecode format: Dest=result, Src1=R, Src2=G, Immediate=(B_reg << 16) | A_reg
+            // Result = (A << 24) | (R << 16) | (G << 8) | B
+            IntRegs[Instr.Dest] :=
+              ((IntRegs[Instr.Immediate and $FFFF] and $FF) shl 24) or        // A from low 16 bits of Immediate
+              ((IntRegs[Instr.Src1] and $FF) shl 16) or                        // R
+              ((IntRegs[Instr.Src2] and $FF) shl 8) or                         // G
+              (IntRegs[(Instr.Immediate shr 16) and $FFFF] and $FF);           // B from high 16 bits of Immediate
+            Inc(CurPC);
+          end;
+        bcGraphicSetMode, bcGraphicBox, bcGraphicCircle, bcGraphicDraw,
+        bcGraphicLocate, bcGraphicRdot, bcGraphicGetMode:
+          begin
+            // Fall back to slow path for graphics commands that need output device
+            FPC := CurPC;
+            ExecuteInstruction(Instr);
+            CurPC := FPC + 1;
+          end;
+
         // Termination
         bcEnd, bcStop: Break;
         bcNop: Inc(CurPC);
@@ -1956,6 +2580,10 @@ begin
 
   FPC := CurPC;
   FRunning := False;
+
+  // Reset FAST mode when program ends (ensure screen is visible)
+  if Assigned(FOutputDevice) then
+    FOutputDevice.SetFastMode(False);
 end;
 
 { RunSwitchedGoto - Switched goto dispatch for better branch prediction
@@ -1984,7 +2612,11 @@ var
   InputVal: Double;
   i, ProdDims: Integer;
   ArrInfo: TSSAArrayInfo;
-
+  // Local vars for ArrayReverseRange and ArrayShiftLeft
+  ArrIdxW: Word;
+  LStartIdx, LEndIdx, LLoopIdx: Integer;
+  LFirstVal: Int64;
+  
 label
   // Dispatch label
   dispatch_next,
@@ -2000,6 +2632,7 @@ label
   lbl_s170, lbl_s171,
   lbl_s180, lbl_s181, lbl_s182,
   lbl_s190, lbl_s191, lbl_s192, lbl_s193,
+  lbl_s156, lbl_s157, lbl_s250, lbl_s251, lbl_s252, lbl_s253, lbl_s254, lbl_s255,
   // Standard opcode labels
   lbl_LoadConstInt, lbl_LoadConstFloat, lbl_LoadConstString,
   lbl_CopyInt, lbl_CopyFloat, lbl_CopyString,
@@ -2044,7 +2677,7 @@ begin
     Inc(FInstructionsExecuted);
     {$ENDIF}
     // Superinstructions first (most common in hot loops)
-    if Op >= 100 then
+    if Op >= 110 then
     begin
       case Op of
         190: goto lbl_s190;
@@ -2084,6 +2717,14 @@ begin
         180: goto lbl_s180;
         181: goto lbl_s181;
         182: goto lbl_s182;
+        156: goto lbl_s156;
+        157: goto lbl_s157;
+        250: goto lbl_s250;
+        251: goto lbl_s251;
+        252: goto lbl_s252;
+        253: goto lbl_s253;
+        254: goto lbl_s254;
+        255: goto lbl_s255;
       else
         goto lbl_Unknown;
       end;
@@ -2241,6 +2882,59 @@ begin
   lbl_s181: FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]] := Double(Pointer(@Instr.Immediate)^); Inc(CurPC); goto dispatch_next;
   lbl_s182: FArrays[Instr.Src1].StringData[IntRegs[Instr.Src2]] := FProgram.StringConstants[Instr.Immediate]; Inc(CurPC); goto dispatch_next;
 
+  // NEW: Array Swap (Int) - opcode 250
+  lbl_s250: // bcArraySwapInt: swap arr[idx1] and arr[idx2]
+    begin
+      FSwapTempInt := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]];
+      FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Dest]];
+      FArrays[Instr.Src1].IntData[IntRegs[Instr.Dest]] := FSwapTempInt;
+      Inc(CurPC);
+      goto dispatch_next;
+    end;
+
+  // NEW: Self-increment/decrement (Int) - opcodes 251-252
+  lbl_s251: Inc(IntRegs[Instr.Dest], IntRegs[Instr.Src1]); Inc(CurPC); goto dispatch_next; // bcAddIntSelf
+  lbl_s252: Dec(IntRegs[Instr.Dest], IntRegs[Instr.Src1]); Inc(CurPC); goto dispatch_next; // bcSubIntSelf
+
+  // NEW: Array superinstructions 253, 254, 255, 156, 157
+  lbl_s253: IntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]]; Inc(CurPC); goto dispatch_next;
+  lbl_s254: FArrays[Instr.Dest].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]]; Inc(CurPC); goto dispatch_next;
+  lbl_s255: FArrays[Instr.Dest].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Dest].IntData[IntRegs[Instr.Src1]]; Inc(CurPC); goto dispatch_next;
+
+  lbl_s156: // ArrayReverseRange
+    begin
+      LStartIdx := IntRegs[Instr.Src2];
+      LEndIdx := IntRegs[Instr.Dest] - 1;
+      ArrIdxW := Instr.Src1;
+      while LStartIdx < LEndIdx do
+      begin
+        FSwapTempInt := FArrays[ArrIdxW].IntData[LStartIdx];
+        FArrays[ArrIdxW].IntData[LStartIdx] := FArrays[ArrIdxW].IntData[LEndIdx];
+        FArrays[ArrIdxW].IntData[LEndIdx] := FSwapTempInt;
+        Inc(LStartIdx);
+        Dec(LEndIdx);
+      end;
+      Inc(CurPC);
+      goto dispatch_next;
+    end;
+
+  lbl_s157: // ArrayShiftLeft
+    begin
+      LStartIdx := IntRegs[Instr.Src2];
+      LEndIdx := IntRegs[Instr.Dest];
+      ArrIdxW := Instr.Src1;
+      LFirstVal := FArrays[ArrIdxW].IntData[LStartIdx];
+      LLoopIdx := LStartIdx;
+      while LLoopIdx <= LEndIdx do
+      begin
+        FArrays[ArrIdxW].IntData[LLoopIdx] := FArrays[ArrIdxW].IntData[LLoopIdx + 1];
+        Inc(LLoopIdx);
+      end;
+      FArrays[ArrIdxW].IntData[LEndIdx + 1] := LFirstVal;
+      Inc(CurPC);
+      goto dispatch_next;
+    end;
+
   // === STANDARD OPCODE HANDLERS ===
 
   lbl_LoadConstInt: IntRegs[Instr.Dest] := Instr.Immediate; Inc(CurPC); goto dispatch_next;
@@ -2350,10 +3044,10 @@ begin
 
   lbl_ArrayDim:
     begin
-      ArrayIdx := Instr.Dest;
+      ArrayIdx := Instr.Src1;
+      ArrInfo := FProgram.GetArray(ArrayIdx);
       if ArrayIdx >= Length(FArrays) then
         SetLength(FArrays, ArrayIdx + 1);
-      ArrInfo := FProgram.GetArray(ArrayIdx);
       FArrays[ArrayIdx].ElementType := Ord(ArrInfo.ElementType);
       FArrays[ArrayIdx].DimCount := ArrInfo.DimCount;
       SetLength(FArrays[ArrayIdx].Dimensions, ArrInfo.DimCount);
@@ -2436,6 +3130,10 @@ begin
 
   FPC := CurPC;
   FRunning := False;
+
+  // Reset FAST mode when program ends (ensure screen is visible)
+  if Assigned(FOutputDevice) then
+    FOutputDevice.SetFastMode(False);
 end;
 {$GOTO OFF}
 

@@ -89,7 +89,7 @@
 {.$DEFINE DEBUG_COPYPROP}
 {.$DEFINE DEBUG_COPYCOAL}
 {.$DEFINE DEBUG_PHIELIM}
-{.$DEFINE DEBUG_REGALLOC}
+{$DEFINE DEBUG_REGALLOC}
 {.$DEFINE DEBUG_PEEPHOLE}
 {.$DEFINE DEBUG_SUPERINSTR}
 {.$DEFINE DEBUG_DOMTREE}
@@ -97,6 +97,7 @@
 {.$DEFINE DEBUG_BYTECODE}
 {.$DEFINE DEBUG_VM}
 {.$DEFINE DEBUG_CLEANUP}
+{$DEFINE DEBUG_CONSOLE}     // Interactive console (SDL2) debug
 
 { ============================================================================
   AUTO-ENABLE ALL FLAGS WHEN DEBUG_ALL IS SET
@@ -121,6 +122,7 @@
   {$DEFINE DEBUG_BYTECODE}
   {$DEFINE DEBUG_VM}
   {$DEFINE DEBUG_CLEANUP}
+  {$DEFINE DEBUG_CONSOLE}
 {$ENDIF}
 
 { ============================================================================
@@ -188,6 +190,9 @@
 {$IFDEF DEBUG_CLEANUP}
   {$DEFINE ANY_DEBUG_ENABLED}
 {$ENDIF}
+{$IFDEF DEBUG_CONSOLE}
+  {$DEFINE ANY_DEBUG_ENABLED}
+{$ENDIF}
 
 { ============================================================================
   VM INSTRUMENTATION FLAGS
@@ -196,7 +201,7 @@
   Unlike debug flags, these don't require runtime parameters.
   ============================================================================ }
 
-{$DEFINE ENABLE_INSTRUCTION_COUNTING}  // Count total instructions executed
+{.$DEFINE ENABLE_INSTRUCTION_COUNTING}  // Count total instructions executed
                                         // Comment out for maximum performance
 
 {.$DEFINE DEBUG_FLOAT_CHECKS}          // Enable NaN/Infinity checks (slow!)

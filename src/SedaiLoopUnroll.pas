@@ -56,6 +56,8 @@
 unit SedaiLoopUnroll;
 
 {$mode objfpc}{$H+}
+{$interfaces CORBA}
+{$codepage UTF8}
 {$inline on}
 {$I DebugFlags.inc}
 {$I OptimizationFlags.inc}

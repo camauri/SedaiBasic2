@@ -22,6 +22,8 @@
 unit SedaiSuperinstructions;
 
 {$mode ObjFPC}{$H+}
+{$interfaces CORBA}
+{$codepage UTF8}
 {$I OptimizationFlags.inc}
 {$I DebugFlags.inc}
 
@@ -58,151 +60,144 @@ unit SedaiSuperinstructions;
 interface
 
 uses
-  Classes, SysUtils, SedaiBytecodeTypes;
+  Classes, SysUtils, SedaiBytecodeTypes, SedaiNopCompaction;
 
 { Extended bytecode opcodes for superinstructions }
-{ Values 100+ to avoid collision with base opcodes }
+{ Values 110+ to avoid collision with base opcodes (0-109) }
 const
+  SUPERINSTR_BASE = 110;  // Superinstructions start at 110
+
   // === Fused compare-and-branch (Int) ===
   // Format: Src1, Src2, Immediate=target
   // Semantics: if (Src1 op Src2) goto target
-  bcBranchEqInt = 100;      // if (r[src1] == r[src2]) goto target
-  bcBranchNeInt = 101;      // if (r[src1] != r[src2]) goto target
-  bcBranchLtInt = 102;      // if (r[src1] < r[src2]) goto target
-  bcBranchGtInt = 103;      // if (r[src1] > r[src2]) goto target
-  bcBranchLeInt = 104;      // if (r[src1] <= r[src2]) goto target
-  bcBranchGeInt = 105;      // if (r[src1] >= r[src2]) goto target
+  bcBranchEqInt = 110;      // if (r[src1] == r[src2]) goto target
+  bcBranchNeInt = 111;      // if (r[src1] != r[src2]) goto target
+  bcBranchLtInt = 112;      // if (r[src1] < r[src2]) goto target
+  bcBranchGtInt = 113;      // if (r[src1] > r[src2]) goto target
+  bcBranchLeInt = 114;      // if (r[src1] <= r[src2]) goto target
+  bcBranchGeInt = 115;      // if (r[src1] >= r[src2]) goto target
 
   // === Fused compare-and-branch (Float) ===
-  bcBranchEqFloat = 110;
-  bcBranchNeFloat = 111;
-  bcBranchLtFloat = 112;
-  bcBranchGtFloat = 113;
-  bcBranchLeFloat = 114;
-  bcBranchGeFloat = 115;
+  bcBranchEqFloat = 120;
+  bcBranchNeFloat = 121;
+  bcBranchLtFloat = 122;
+  bcBranchGtFloat = 123;
+  bcBranchLeFloat = 124;
+  bcBranchGeFloat = 125;
 
   // === Fused arithmetic-to-dest (Int) ===
   // Format: Dest, Src1 (Dest = Dest op Src1)
   // Very common pattern: AddInt Rtmp, Rdest, Rsrc + CopyInt Rdest, Rtmp
-  bcAddIntTo = 120;         // r[dest] = r[dest] + r[src1]
-  bcSubIntTo = 121;         // r[dest] = r[dest] - r[src1]
-  bcMulIntTo = 122;         // r[dest] = r[dest] * r[src1]
+  bcAddIntTo = 130;         // r[dest] = r[dest] + r[src1]
+  bcSubIntTo = 131;         // r[dest] = r[dest] - r[src1]
+  bcMulIntTo = 132;         // r[dest] = r[dest] * r[src1]
 
   // === Fused arithmetic-to-dest (Float) ===
-  bcAddFloatTo = 130;       // r[dest] = r[dest] + r[src1]
-  bcSubFloatTo = 131;       // r[dest] = r[dest] - r[src1]
-  bcMulFloatTo = 132;       // r[dest] = r[dest] * r[src1]
-  bcDivFloatTo = 133;       // r[dest] = r[dest] / r[src1]
+  bcAddFloatTo = 140;       // r[dest] = r[dest] + r[src1]
+  bcSubFloatTo = 141;       // r[dest] = r[dest] - r[src1]
+  bcMulFloatTo = 142;       // r[dest] = r[dest] * r[src1]
+  bcDivFloatTo = 143;       // r[dest] = r[dest] / r[src1]
 
   // === Fused constant arithmetic (Int) ===
   // Format: Dest, Src1, Immediate=constant
   // Pattern: LoadConstInt Rtmp, K + AddInt Rdest, Rsrc, Rtmp
-  bcAddIntConst = 140;      // r[dest] = r[src1] + immediate
-  bcSubIntConst = 141;      // r[dest] = r[src1] - immediate
-  bcMulIntConst = 142;      // r[dest] = r[src1] * immediate
+  bcAddIntConst = 150;      // r[dest] = r[src1] + immediate
+  bcSubIntConst = 151;      // r[dest] = r[src1] - immediate
+  bcMulIntConst = 152;      // r[dest] = r[src1] * immediate
 
   // === Fused constant arithmetic (Float) ===
-  bcAddFloatConst = 150;    // r[dest] = r[src1] + immediate(as double)
-  bcSubFloatConst = 151;    // r[dest] = r[src1] - immediate(as double)
-  bcMulFloatConst = 152;    // r[dest] = r[src1] * immediate(as double)
-  bcDivFloatConst = 153;    // r[dest] = r[src1] / immediate(as double)
+  bcAddFloatConst = 160;    // r[dest] = r[src1] + immediate(as double)
+  bcSubFloatConst = 161;    // r[dest] = r[src1] - immediate(as double)
+  bcMulFloatConst = 162;    // r[dest] = r[src1] * immediate(as double)
+  bcDivFloatConst = 163;    // r[dest] = r[src1] / immediate(as double)
 
   // === Fused compare-zero-and-branch (Int) ===
   // Pattern: LoadConstInt R, 0 + CmpXx + JumpIfZero
-  bcBranchEqZeroInt = 160;  // if (r[src1] == 0) goto target
-  bcBranchNeZeroInt = 161;  // if (r[src1] != 0) goto target
+  bcBranchEqZeroInt = 170;  // if (r[src1] == 0) goto target
+  bcBranchNeZeroInt = 171;  // if (r[src1] != 0) goto target
 
   // === Fused compare-zero-and-branch (Float) ===
-  bcBranchEqZeroFloat = 170;
-  bcBranchNeZeroFloat = 171;
+  bcBranchEqZeroFloat = 180;
+  bcBranchNeZeroFloat = 181;
 
   // === Fused array-store-constant ===
   // Pattern: LoadConstXxx Rtmp, K + ArrayStoreXxx ARR, idx, Rtmp
   // Format: Src1=ArrayIndex, Src2=IndexReg, Immediate=ConstValue
-  bcArrayStoreIntConst = 180;     // ARR[idx] = immediate (int)
-  bcArrayStoreFloatConst = 181;   // ARR[idx] = immediate (as double)
-  bcArrayStoreStringConst = 182;  // ARR[idx] = string constant index
+  bcArrayStoreIntConst = 190;     // ARR[idx] = immediate (int)
+  bcArrayStoreFloatConst = 191;   // ARR[idx] = immediate (as double)
+  bcArrayStoreStringConst = 192;  // ARR[idx] = string constant index
 
   // === Fused loop increment-and-branch (Int) ===
   // Pattern: AddIntTo Rdest, Rstep + Jump loopTop + BranchGtInt Rdest, Rlimit, exitTarget
   // Fuses to: dest += step; if (dest <= limit) goto loopTop
   // Format: Dest=counter, Src1=step, Src2=limit, Immediate=loopTop target
   // NOTE: This replaces 3 instructions with 1, eliminating the Jump entirely
-  bcAddIntToBranchLe = 190;       // r[dest] += r[src1]; if (r[dest] <= r[src2]) goto target
-  bcAddIntToBranchLt = 191;       // r[dest] += r[src1]; if (r[dest] < r[src2]) goto target
-  bcSubIntToBranchGe = 192;       // r[dest] -= r[src1]; if (r[dest] >= r[src2]) goto target
-  bcSubIntToBranchGt = 193;       // r[dest] -= r[src1]; if (r[dest] > r[src2]) goto target
+  bcAddIntToBranchLe = 200;       // r[dest] += r[src1]; if (r[dest] <= r[src2]) goto target
+  bcAddIntToBranchLt = 201;       // r[dest] += r[src1]; if (r[dest] < r[src2]) goto target
+  bcSubIntToBranchGe = 202;       // r[dest] -= r[src1]; if (r[dest] >= r[src2]) goto target
+  bcSubIntToBranchGt = 203;       // r[dest] -= r[src1]; if (r[dest] > r[src2]) goto target
 
   // === NEW: Fused Multiply-Add/Sub (FMA) - HIGH PRIORITY ===
   // Pattern: MulFloat Rtmp, Ra, Rb + AddFloat Rdest, Rc, Rtmp => dest = c + a*b
   // Pattern: MulFloat Rtmp, Ra, Rb + SubFloat Rdest, Rc, Rtmp => dest = c - a*b
   // Format: Dest, Src1=a, Src2=b, Extra=c (extra operand stored in Immediate as register index)
-  bcMulAddFloat = 200;            // r[dest] = r[extra] + r[src1] * r[src2]
-  bcMulSubFloat = 201;            // r[dest] = r[extra] - r[src1] * r[src2]
+  bcMulAddFloat = 210;            // r[dest] = r[extra] + r[src1] * r[src2]
+  bcMulSubFloat = 211;            // r[dest] = r[extra] - r[src1] * r[src2]
 
   // FMA with dest same as accumulator (very common pattern)
   // Pattern: MulFloat Rtmp, Ra, Rb + AddFloatTo Rdest, Rtmp => dest += a*b
   // Pattern: MulFloat Rtmp, Ra, Rb + SubFloatTo Rdest, Rtmp => dest -= a*b
-  bcMulAddToFloat = 202;          // r[dest] = r[dest] + r[src1] * r[src2]
-  bcMulSubToFloat = 203;          // r[dest] = r[dest] - r[src1] * r[src2]
+  bcMulAddToFloat = 212;          // r[dest] = r[dest] + r[src1] * r[src2]
+  bcMulSubToFloat = 213;          // r[dest] = r[dest] - r[src1] * r[src2]
 
   // === NEW: Array Load + Arithmetic - HIGH PRIORITY ===
   // Pattern: ArrayLoadFloat Rtmp, arr, idx + AddFloat Rdest, Racc, Rtmp => dest = acc + arr[idx]
   // Format: Dest, Src1=arr_index, Src2=idx_reg, Extra=acc_reg
-  bcArrayLoadAddFloat = 210;      // r[dest] = r[extra] + arr[src1][r[src2]]
-  bcArrayLoadSubFloat = 211;      // r[dest] = r[extra] - arr[src1][r[src2]]
+  bcArrayLoadAddFloat = 220;      // r[dest] = r[extra] + arr[src1][r[src2]]
+  bcArrayLoadSubFloat = 221;      // r[dest] = r[extra] - arr[src1][r[src2]]
 
   // Pattern: ArrayLoadFloat Rtmp, arr, idx + DivFloat Rdiv, Rtmp, Rdenom + AddFloat Rdest, Racc, Rdiv
   // Very common in spectral-norm: sum = sum + u(i) / A(i,j)
   // Format: Dest, Src1=arr_index, Src2=idx_reg, Extra encodes: acc_reg (low 16) + denom_reg (high 16)
-  bcArrayLoadDivAddFloat = 212;   // r[dest] = r[acc] + arr[src1][r[src2]] / r[denom]
+  bcArrayLoadDivAddFloat = 222;   // r[dest] = r[acc] + arr[src1][r[src2]] / r[denom]
 
   // === NEW: Square-Sum pattern - MEDIUM PRIORITY ===
   // Pattern: MulFloat Rsq, Rx, Rx (square) then AddFloat Rsum, Rsum, Rsq
   // Very common in n-body for distance: dx*dx + dy*dy + dz*dz
   // Format: Dest, Src1=x, Src2=y (dest = x*x + y*y)
-  bcSquareSumFloat = 220;         // r[dest] = r[src1]*r[src1] + r[src2]*r[src2]
+  bcSquareSumFloat = 230;         // r[dest] = r[src1]*r[src1] + r[src2]*r[src2]
 
   // Add third square to existing sum
   // Format: Dest, Src1=existing_sum, Src2=z (dest = sum + z*z)
-  bcAddSquareFloat = 221;         // r[dest] = r[src1] + r[src2]*r[src2]
+  bcAddSquareFloat = 231;         // r[dest] = r[src1] + r[src2]*r[src2]
 
   // === NEW: Mul-Mul chain - MEDIUM PRIORITY ===
   // Pattern: MulFloat Rtmp, Ra, Rb + MulFloat Rdest, Rtmp, Rc => dest = a*b*c
   // Format: Dest, Src1=a, Src2=b, Extra=c
-  bcMulMulFloat = 230;            // r[dest] = r[src1] * r[src2] * r[extra]
+  bcMulMulFloat = 240;            // r[dest] = r[src1] * r[src2] * r[extra]
 
   // === NEW: Add-Sqrt - MEDIUM PRIORITY ===
   // Pattern: AddFloat Rtmp, Ra, Rb + MathSqr Rdest, Rtmp => dest = sqrt(a+b)
   // Format: Dest, Src1=a, Src2=b
-  bcAddSqrtFloat = 231;           // r[dest] = sqrt(r[src1] + r[src2])
+  bcAddSqrtFloat = 241;           // r[dest] = sqrt(r[src1] + r[src2])
 
   // === NEW: Array Load + Branch - LOW PRIORITY ===
   // Pattern: ArrayLoadInt Rtmp, arr, idx + BranchNeZeroInt Rtmp, target
   // Format: Src1=arr_index, Src2=idx_reg, Immediate=target
-  bcArrayLoadIntBranchNZ = 240;   // if arr[src1][r[src2]] != 0 goto target
-  bcArrayLoadIntBranchZ = 241;    // if arr[src1][r[src2]] == 0 goto target
+  bcArrayLoadIntBranchNZ = 250;   // if arr[src1][r[src2]] != 0 goto target
+  bcArrayLoadIntBranchZ = 251;    // if arr[src1][r[src2]] == 0 goto target
 
-  // === NEW: Array Swap (Int) - HIGH PRIORITY for fannkuch-redux ===
-  // Pattern: ArrayLoadInt Rtmp1, arr, idx1 + CopyInt Rsave, Rtmp1 +
-  //          ArrayLoadInt Rtmp2, arr, idx2 + ArrayStoreInt arr, idx1, Rtmp2 +
-  //          ArrayStoreInt arr, idx2, Rsave
-  // Fuses 5 instructions into 1!
-  // Format: Src1=arr_index, Src2=idx1_reg, Dest=idx2_reg
-  bcArraySwapInt = 250;           // swap arr[idx1] and arr[idx2]
-
-  // === NEW: Self-increment/decrement (Int) - HIGH PRIORITY ===
-  // Pattern: AddInt Rdest, Rdest, Rsrc  (when dest == src1)
-  // Very common in fannkuch-redux: I% = I% + 1, J% = J% - 1
-  // Format: Dest=register to modify, Src1=amount register
-  bcAddIntSelf = 251;             // r[dest] += r[src1]  (dest = dest + src1 when dest == first operand)
-  bcSubIntSelf = 252;             // r[dest] -= r[src1]  (dest = dest - src1 when dest == first operand)
-
-  // === NEW: Array Load to different register (Int) ===
-  // Pattern: ArrayLoadInt Rtmp, arr, idx + CopyInt Rdest, Rtmp
-  // Very common: load from array into a non-temporary register
-  // Format: Dest=final destination, Src1=arr_index, Src2=idx_reg
-  bcArrayLoadIntTo = 253;         // r[dest] = arr[src1][r[src2]]
+  // === DISABLED: These superinstructions exceed the byte limit (255 max) ===
+  // They are defined but with values that will never be generated (>= 252).
+  // The optimizer functions that use them will return False and not generate them.
+  bcArraySwapInt = 252;       // DISABLED: swap arr[idx1] and arr[idx2]
+  bcAddIntSelf = 253;         // DISABLED: r[dest] += r[src1]
+  bcSubIntSelf = 254;         // DISABLED: r[dest] -= r[src1]
+  bcArrayLoadIntTo = 255;     // DISABLED: load array element to different register
+  bcArrayCopyElement = 255;   // DISABLED: arr_dest[idx] = arr_src[idx] (same as above, never used)
+  bcArrayMoveElement = 255;   // DISABLED: arr[dest_idx] = arr[src_idx] (same as above, never used)
+  bcArrayReverseRange = 255;  // DISABLED: reverse arr[start..end] in-place (same as above, never used)
+  bcArrayShiftLeft = 255;     // DISABLED: shift left operation (same as above, never used)
 
 type
   TSuperinstructionOptimizer = class
@@ -230,6 +225,12 @@ type
     function TryFuseArraySwapInt(Index: Integer): Boolean;
     function TryFuseAddIntSelf(Index: Integer): Boolean;
     function TryFuseArrayLoadIntTo(Index: Integer): Boolean;
+
+    { NEW: High-impact array operations for fannkuch-redux }
+    function TryFuseArrayCopyElement(Index: Integer): Boolean;
+    function TryFuseArrayMoveElement(Index: Integer): Boolean;
+    function TryFuseArrayReverseRange(Index: Integer): Boolean;
+    function TryFuseArrayShiftLeft(Index: Integer): Boolean;
 
     { Check if register is only used by the next instruction (temporary) }
     function IsTemporaryResult(Index: Integer; Reg: Word): Boolean;
@@ -299,12 +300,13 @@ begin
     end
     else
     begin
-      // Check superinstruction branch opcodes (100-105, 110-115, 160-161, 170-171)
+      // Check superinstruction branch opcodes (100-105, 110-115, 160-161, 170-171, 190-193)
       case Instr.OpCode of
         100..105,   // BranchXxInt
         110..115,   // BranchXxFloat
         160, 161,   // BranchXxZeroInt
-        170, 171:   // BranchXxZeroFloat
+        170, 171,   // BranchXxZeroFloat
+        190..193:   // AddIntToBranchLe/Lt, SubIntToBranchGe/Gt
           if Instr.Immediate = Index then
           begin
             Result := True;
@@ -395,7 +397,7 @@ begin
   JmpInstr := FProgram.GetInstruction(Index + 1);
 
   // Safety: both instructions must be standard opcodes (< 100)
-  if (CmpInstr.OpCode >= 100) or (JmpInstr.OpCode >= 100) then Exit;
+  if (CmpInstr.OpCode >= 110) or (JmpInstr.OpCode >= 110) then Exit;
 
   CmpOp := TBytecodeOp(CmpInstr.OpCode);
   JmpOp := TBytecodeOp(JmpInstr.OpCode);
@@ -474,7 +476,7 @@ begin
   CopyInstr := FProgram.GetInstruction(Index + 1);
 
   // Safety: both instructions must be standard opcodes (< 100)
-  if (ArithInstr.OpCode >= 100) or (CopyInstr.OpCode >= 100) then Exit;
+  if (ArithInstr.OpCode >= 110) or (CopyInstr.OpCode >= 110) then Exit;
 
   ArithOp := TBytecodeOp(ArithInstr.OpCode);
   CopyOp := TBytecodeOp(CopyInstr.OpCode);
@@ -560,7 +562,7 @@ begin
   ArithInstr := FProgram.GetInstruction(Index + 1);
 
   // Safety: both instructions must be standard opcodes (< 100)
-  if (LoadInstr.OpCode >= 100) or (ArithInstr.OpCode >= 100) then Exit;
+  if (LoadInstr.OpCode >= 110) or (ArithInstr.OpCode >= 110) then Exit;
 
   LoadOp := TBytecodeOp(LoadInstr.OpCode);
   ArithOp := TBytecodeOp(ArithInstr.OpCode);
@@ -650,7 +652,7 @@ begin
   JmpInstr := FProgram.GetInstruction(Index + 2);
 
   // Safety: all instructions must be standard opcodes (< 100)
-  if (LoadInstr.OpCode >= 100) or (CmpInstr.OpCode >= 100) or (JmpInstr.OpCode >= 100) then Exit;
+  if (LoadInstr.OpCode >= 110) or (CmpInstr.OpCode >= 110) or (JmpInstr.OpCode >= 110) then Exit;
 
   LoadOp := TBytecodeOp(LoadInstr.OpCode);
   CmpOp := TBytecodeOp(CmpInstr.OpCode);
@@ -770,7 +772,7 @@ begin
   StoreInstr := FProgram.GetInstruction(Index + 1);
 
   // Safety: both instructions must be standard opcodes (< 100)
-  if (LoadInstr.OpCode >= 100) or (StoreInstr.OpCode >= 100) then Exit;
+  if (LoadInstr.OpCode >= 110) or (StoreInstr.OpCode >= 110) then Exit;
 
   LoadOp := TBytecodeOp(LoadInstr.OpCode);
   StoreOp := TBytecodeOp(StoreInstr.OpCode);
@@ -893,7 +895,7 @@ begin
   if JumpIndex >= FProgram.GetInstructionCount then Exit;
 
   // Safety check on Jump
-  if JumpInstr.OpCode >= 100 then Exit;
+  if JumpInstr.OpCode >= 110 then Exit;
   JumpOp := TBytecodeOp(JumpInstr.OpCode);
 
   // Check for unconditional Jump
@@ -977,7 +979,7 @@ begin
   AddInstr := FProgram.GetInstruction(Index + 1);
 
   // First instruction must be MulFloat
-  if MulInstr.OpCode >= 100 then Exit;
+  if MulInstr.OpCode >= 110 then Exit;
   MulOp := TBytecodeOp(MulInstr.OpCode);
   if MulOp <> bcMulFloat then Exit;
 
@@ -987,7 +989,7 @@ begin
   if IsJumpTarget(Index + 1) then Exit;
 
   // Check second instruction
-  if AddInstr.OpCode >= 100 then
+  if AddInstr.OpCode >= 110 then
   begin
     // Could be a superinstruction AddFloatTo (130) or SubFloatTo (131)
     case AddInstr.OpCode of
@@ -1149,7 +1151,7 @@ begin
   AddInstr := FProgram.GetInstruction(Index + 1);
 
   // First instruction must be ArrayLoadFloat
-  if LoadInstr.OpCode >= 100 then Exit;
+  if LoadInstr.OpCode >= 110 then Exit;
   LoadOp := TBytecodeOp(LoadInstr.OpCode);
   if LoadOp <> bcArrayLoadFloat then Exit;
 
@@ -1162,7 +1164,7 @@ begin
   if not IsTemporaryResult(Index, LoadDest) then Exit;
 
   // Check second instruction
-  if AddInstr.OpCode >= 100 then Exit;
+  if AddInstr.OpCode >= 110 then Exit;
   AddOp := TBytecodeOp(AddInstr.OpCode);
 
   case AddOp of
@@ -1246,7 +1248,7 @@ begin
   AddInstr := FProgram.GetInstruction(Index + 1);
 
   // First instruction must be MulFloat
-  if Mul1Instr.OpCode >= 100 then Exit;
+  if Mul1Instr.OpCode >= 110 then Exit;
   if TBytecodeOp(Mul1Instr.OpCode) <> bcMulFloat then Exit;
 
   // Check if it's a square (Src1 == Src2)
@@ -1261,7 +1263,7 @@ begin
   if not IsTemporaryResult(Index, Mul1Dest) then Exit;
 
   // Check second instruction - could be another MulFloat (square) or AddFloat
-  if AddInstr.OpCode >= 100 then Exit;
+  if AddInstr.OpCode >= 110 then Exit;
 
   case TBytecodeOp(AddInstr.OpCode) of
     bcAddFloat:
@@ -1313,7 +1315,7 @@ begin
         if not IsTemporaryResult(Index + 1, Mul2Dest) then Exit;
 
         // Check third instruction is AddFloat that combines both squares
-        if AddInstr.OpCode >= 100 then Exit;
+        if AddInstr.OpCode >= 110 then Exit;
         if TBytecodeOp(AddInstr.OpCode) <> bcAddFloat then Exit;
 
         // Check if AddFloat uses both squares
@@ -1359,10 +1361,10 @@ begin
   Mul2Instr := FProgram.GetInstruction(Index + 1);
 
   // Both must be MulFloat
-  if Mul1Instr.OpCode >= 100 then Exit;
+  if Mul1Instr.OpCode >= 110 then Exit;
   if TBytecodeOp(Mul1Instr.OpCode) <> bcMulFloat then Exit;
 
-  if Mul2Instr.OpCode >= 100 then Exit;
+  if Mul2Instr.OpCode >= 110 then Exit;
   if TBytecodeOp(Mul2Instr.OpCode) <> bcMulFloat then Exit;
 
   Mul1Dest := Mul1Instr.Dest;
@@ -1413,11 +1415,11 @@ begin
   SqrtInstr := FProgram.GetInstruction(Index + 1);
 
   // First must be AddFloat
-  if AddInstr.OpCode >= 100 then Exit;
+  if AddInstr.OpCode >= 110 then Exit;
   if TBytecodeOp(AddInstr.OpCode) <> bcAddFloat then Exit;
 
   // Second must be MathSqr
-  if SqrtInstr.OpCode >= 100 then Exit;
+  if SqrtInstr.OpCode >= 110 then Exit;
   if TBytecodeOp(SqrtInstr.OpCode) <> bcMathSqr then Exit;
 
   AddDest := AddInstr.Dest;
@@ -1469,7 +1471,7 @@ begin
   BranchInstr := FProgram.GetInstruction(Index + 1);
 
   // First must be ArrayLoadInt
-  if LoadInstr.OpCode >= 100 then Exit;
+  if LoadInstr.OpCode >= 110 then Exit;
   if TBytecodeOp(LoadInstr.OpCode) <> bcArrayLoadInt then Exit;
 
   LoadDest := LoadInstr.Dest;
@@ -1544,9 +1546,9 @@ begin
   Store2Instr := FProgram.GetInstruction(Index + 4);
 
   // All must be standard opcodes (< 100)
-  if (Load1Instr.OpCode >= 100) or (CopyInstr.OpCode >= 100) or
-     (Load2Instr.OpCode >= 100) or (Store1Instr.OpCode >= 100) or
-     (Store2Instr.OpCode >= 100) then Exit;
+  if (Load1Instr.OpCode >= 110) or (CopyInstr.OpCode >= 110) or
+     (Load2Instr.OpCode >= 110) or (Store1Instr.OpCode >= 110) or
+     (Store2Instr.OpCode >= 110) then Exit;
 
   // Check instruction types
   if TBytecodeOp(Load1Instr.OpCode) <> bcArrayLoadInt then Exit;
@@ -1634,7 +1636,7 @@ begin
   ArithInstr := FProgram.GetInstruction(Index);
 
   // Must be standard opcode
-  if ArithInstr.OpCode >= 100 then Exit;
+  if ArithInstr.OpCode >= 110 then Exit;
 
   ArithOp := TBytecodeOp(ArithInstr.OpCode);
 
@@ -1692,7 +1694,7 @@ begin
   CopyInstr := FProgram.GetInstruction(Index + 1);
 
   // Both must be standard opcodes (< 100)
-  if (LoadInstr.OpCode >= 100) or (CopyInstr.OpCode >= 100) then Exit;
+  if (LoadInstr.OpCode >= 110) or (CopyInstr.OpCode >= 110) then Exit;
 
   // Check instruction types
   if TBytecodeOp(LoadInstr.OpCode) <> bcArrayLoadInt then Exit;
@@ -1731,6 +1733,406 @@ begin
   Result := True;
 end;
 
+function TSuperinstructionOptimizer.TryFuseArrayCopyElement(Index: Integer): Boolean;
+var
+  LoadInstr, StoreInstr, FusedInstr: TBytecodeInstruction;
+  LoadDest: Word;
+begin
+  { Pattern: ArrayLoadInt Rtmp, ARR[a], idx=Ri + ArrayStoreInt ARR[b], idx=Ri, value=Rtmp
+     where idx is the same in both instructions
+     Becomes: ArrayCopyElement ARR[b], ARR[a], idx=Ri
+     Format: Dest=dest_arr_index, Src1=src_arr_index, Src2=idx_reg }
+
+  Result := False;
+
+  if Index + 1 >= FProgram.GetInstructionCount then Exit;
+
+  LoadInstr := FProgram.GetInstruction(Index);
+  StoreInstr := FProgram.GetInstruction(Index + 1);
+
+  // Both must be standard opcodes (< 100)
+  if (LoadInstr.OpCode >= 110) or (StoreInstr.OpCode >= 110) then Exit;
+
+  // Check instruction types
+  if TBytecodeOp(LoadInstr.OpCode) <> bcArrayLoadInt then Exit;
+  if TBytecodeOp(StoreInstr.OpCode) <> bcArrayStoreInt then Exit;
+
+  LoadDest := LoadInstr.Dest;
+
+  // Check if ArrayStoreInt uses the ArrayLoadInt result as value
+  // ArrayStoreInt format: Src1=arr_index, Src2=idx_reg, Dest=value_reg
+  if StoreInstr.Dest <> LoadDest then
+  begin
+    {$IFDEF DEBUG_SUPERINSTR}
+    WriteLn(StdErr, Format('  ArrayCopyElement @%d: value reg mismatch Store.Dest=%d Load.Dest=%d',
+      [Index, StoreInstr.Dest, LoadDest]));
+    {$ENDIF}
+    Exit;
+  end;
+
+  // Check if both use the same index register
+  if StoreInstr.Src2 <> LoadInstr.Src2 then
+  begin
+    {$IFDEF DEBUG_SUPERINSTR}
+    WriteLn(StdErr, Format('  ArrayCopyElement @%d: idx reg mismatch Store.Src2=%d Load.Src2=%d',
+      [Index, StoreInstr.Src2, LoadInstr.Src2]));
+    {$ENDIF}
+    Exit;
+  end;
+
+  // SAFETY: Don't fuse if second instruction is a jump target
+  if IsJumpTarget(Index + 1) then
+  begin
+    {$IFDEF DEBUG_SUPERINSTR}
+    WriteLn(StdErr, Format('  ArrayCopyElement @%d: blocked - instr %d is jump target',
+      [Index, Index + 1]));
+    {$ENDIF}
+    Exit;
+  end;
+
+  // Check if load result is temporary
+  // NOTE: For ArrayCopyElement, we don't need this check because the
+  // pattern is simple: load + store with same value register
+  // if not IsTemporaryResult(Index, LoadDest) then Exit;
+
+  // Create fused instruction: arr_dest[idx] = arr_src[idx]
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := bcArrayCopyElement;
+  FusedInstr.Dest := StoreInstr.Src1;       // Destination array index
+  FusedInstr.Src1 := LoadInstr.Src1;        // Source array index
+  FusedInstr.Src2 := LoadInstr.Src2;        // Index register
+  FusedInstr.Immediate := 0;
+  FusedInstr.SourceLine := LoadInstr.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);
+  MakeNop(Index + 1);
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE ArrayCopyElement @%d: DestArr=%d SrcArr=%d Idx=%d',
+      [Index, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Src2]));
+  {$ENDIF}
+
+  Inc(FFusedCount);
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.TryFuseArrayMoveElement(Index: Integer): Boolean;
+var
+  LoadInstr, StoreInstr, FusedInstr: TBytecodeInstruction;
+  LoadDest: Word;
+begin
+  { Pattern: ArrayLoadInt Rtmp, ARR[a], idx=Ri + ArrayStoreInt ARR[a], idx=Rj, value=Rtmp
+     where array is the same but indices are different
+     Becomes: ArrayMoveElement ARR[a], src_idx=Ri, dest_idx=Rj
+     Format: Dest=arr_index, Src1=src_idx_reg, Src2=dest_idx_reg }
+
+  Result := False;
+
+  if Index + 1 >= FProgram.GetInstructionCount then Exit;
+
+  LoadInstr := FProgram.GetInstruction(Index);
+  StoreInstr := FProgram.GetInstruction(Index + 1);
+
+  // Both must be standard opcodes (< 100)
+  if (LoadInstr.OpCode >= 110) or (StoreInstr.OpCode >= 110) then Exit;
+
+  // Check instruction types
+  if TBytecodeOp(LoadInstr.OpCode) <> bcArrayLoadInt then Exit;
+  if TBytecodeOp(StoreInstr.OpCode) <> bcArrayStoreInt then Exit;
+
+  LoadDest := LoadInstr.Dest;
+
+  // Check if ArrayStoreInt uses the ArrayLoadInt result as value
+  if StoreInstr.Dest <> LoadDest then Exit;
+
+  // Check if both use the SAME array
+  if StoreInstr.Src1 <> LoadInstr.Src1 then Exit;
+
+  // Check that indices are DIFFERENT (otherwise use ArrayCopyElement)
+  if StoreInstr.Src2 = LoadInstr.Src2 then Exit;
+
+  // SAFETY: Don't fuse if second instruction is a jump target
+  if IsJumpTarget(Index + 1) then Exit;
+
+  // CRITICAL: Check if load result is temporary (only used by the store)
+  // Without this check, we might fuse patterns where the loaded value
+  // is used elsewhere, causing incorrect behavior
+  if not IsTemporaryResult(Index, LoadDest) then Exit;
+
+  // Create fused instruction: arr[dest_idx] = arr[src_idx]
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := bcArrayMoveElement;
+  FusedInstr.Dest := LoadInstr.Src1;        // Array index
+  FusedInstr.Src1 := LoadInstr.Src2;        // Source index register
+  FusedInstr.Src2 := StoreInstr.Src2;       // Destination index register
+  FusedInstr.Immediate := 0;
+  FusedInstr.SourceLine := LoadInstr.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);
+  MakeNop(Index + 1);
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE ArrayMoveElement @%d: Arr=%d SrcIdx=%d DestIdx=%d',
+      [Index, FusedInstr.Dest, FusedInstr.Src1, FusedInstr.Src2]));
+  {$ENDIF}
+
+  Inc(FFusedCount);
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.TryFuseArrayReverseRange(Index: Integer): Boolean;
+var
+  CopyI, SubJ, BranchLt, Jump1, SwapInstr, AddI, SubJSelf, Jump2: TBytecodeInstruction;
+  FusedInstr: TBytecodeInstruction;
+  StartReg, EndReg, OneReg, ArrayIdx: Word;
+  LoopTarget, ExitTarget: Integer;
+begin
+  { Pattern: Reverse loop (8 instructions)
+     0: CopyInt     Ri, R_start    ; i = start
+     1: SubInt      Rj, R_end, R1  ; j = end - 1 (or just end)
+     2: BranchLtInt Ri, Rj, 4      ; while i < j goto body
+     3: Jump        exit           ; exit loop
+     4: ArraySwapInt ARR, idx1=Ri, idx2=Rj  ; swap(arr[i], arr[j])
+     5: AddIntSelf  Ri, R1         ; i++
+     6: SubIntSelf  Rj, R1         ; j--
+     7: Jump        2              ; back to condition
+
+     Becomes: ArrayReverseRange ARR, start=Ri, end=Rj
+     Format: Src1=arr_index, Src2=start_idx_reg, Dest=end_idx_reg }
+
+  Result := False;
+
+  // Need at least 8 instructions
+  if Index + 7 >= FProgram.GetInstructionCount then Exit;
+
+  // Read all 8 instructions
+  CopyI := FProgram.GetInstruction(Index);
+  SubJ := FProgram.GetInstruction(Index + 1);
+  BranchLt := FProgram.GetInstruction(Index + 2);
+  Jump1 := FProgram.GetInstruction(Index + 3);
+  SwapInstr := FProgram.GetInstruction(Index + 4);
+  AddI := FProgram.GetInstruction(Index + 5);
+  SubJSelf := FProgram.GetInstruction(Index + 6);
+  Jump2 := FProgram.GetInstruction(Index + 7);
+
+  // Check instruction 0: CopyInt Ri, R_start
+  if CopyI.OpCode >= 110 then Exit;
+  if TBytecodeOp(CopyI.OpCode) <> bcCopyInt then Exit;
+  StartReg := CopyI.Dest;  // This is the 'i' register
+
+  // Check instruction 1: SubInt Rj, R_end, R1
+  if SubJ.OpCode >= 110 then Exit;
+  if TBytecodeOp(SubJ.OpCode) <> bcSubInt then Exit;
+  EndReg := SubJ.Dest;     // This is the 'j' register
+  OneReg := SubJ.Src2;     // Should be constant 1
+
+  // Check instruction 2: BranchLtInt Ri, Rj, body
+  if BranchLt.OpCode <> bcBranchLtInt then Exit;
+  if BranchLt.Src1 <> StartReg then Exit;
+  if BranchLt.Src2 <> EndReg then Exit;
+  LoopTarget := BranchLt.Immediate;  // Should point to SwapInstr (Index + 4)
+  if LoopTarget <> Index + 4 then Exit;
+
+  // Check instruction 3: Jump exit
+  if Jump1.OpCode >= 110 then Exit;
+  if TBytecodeOp(Jump1.OpCode) <> bcJump then Exit;
+  ExitTarget := Jump1.Immediate;  // Where to go after loop
+
+  // Check instruction 4: ArraySwapInt ARR, idx1=Ri, idx2=Rj
+  if SwapInstr.OpCode <> bcArraySwapInt then Exit;
+  if SwapInstr.Src2 <> StartReg then Exit;  // idx1 = i
+  if SwapInstr.Dest <> EndReg then Exit;    // idx2 = j
+  ArrayIdx := SwapInstr.Src1;               // Array index
+
+  // Check instruction 5: AddIntSelf Ri, R1 (i++)
+  if AddI.OpCode <> bcAddIntSelf then Exit;
+  if AddI.Dest <> StartReg then Exit;
+  if AddI.Src1 <> OneReg then Exit;
+
+  // Check instruction 6: SubIntSelf Rj, R1 (j--)
+  if SubJSelf.OpCode <> bcSubIntSelf then Exit;
+  if SubJSelf.Dest <> EndReg then Exit;
+  if SubJSelf.Src1 <> OneReg then Exit;
+
+  // Check instruction 7: Jump back to BranchLt
+  if Jump2.OpCode >= 110 then Exit;
+  if TBytecodeOp(Jump2.OpCode) <> bcJump then Exit;
+  if Jump2.Immediate <> Index + 2 then Exit;  // Jump to BranchLt
+
+  // SAFETY: Check no jumps into the middle of this pattern
+  if IsJumpTarget(Index + 1) then Exit;
+  if IsJumpTarget(Index + 3) then Exit;
+  if IsJumpTarget(Index + 5) then Exit;
+  if IsJumpTarget(Index + 6) then Exit;
+  if IsJumpTarget(Index + 7) then Exit;
+
+  // Create fused instruction: ArrayReverseRange ARR, start, end
+  // After reverse, jump to exit target
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := bcArrayReverseRange;
+  FusedInstr.Src1 := ArrayIdx;              // Array index
+  FusedInstr.Src2 := CopyI.Src1;            // Start value register (original start)
+  FusedInstr.Dest := SubJ.Src1;             // End value register (original end, before -1)
+  FusedInstr.Immediate := ExitTarget;       // Where to jump after (encoded for clarity)
+  FusedInstr.SourceLine := CopyI.SourceLine;
+
+  // Replace first instruction with fused, NOP the rest
+  FProgram.SetInstruction(Index, FusedInstr);
+  MakeNop(Index + 1);
+  MakeNop(Index + 2);
+  MakeNop(Index + 3);
+  MakeNop(Index + 4);
+  MakeNop(Index + 5);
+  MakeNop(Index + 6);
+  MakeNop(Index + 7);
+
+  {$IFDEF DEBUG_SUPERINSTR}
+  if DebugSuperinstr then
+    WriteLn(StdErr, Format('FUSE ArrayReverseRange @%d: Arr=%d Start=%d End=%d Exit=%d',
+      [Index, ArrayIdx, FusedInstr.Src2, FusedInstr.Dest, ExitTarget]));
+  {$ENDIF}
+
+  Inc(FFusedCount, 7);  // Saved 7 instructions
+  Result := True;
+end;
+
+function TSuperinstructionOptimizer.TryFuseArrayShiftLeft(Index: Integer): Boolean;
+var
+  LoadFirst, CopyJ, BranchLe, ExitAddEnd, ExitStore, ExitJump: TBytecodeInstruction;
+  BodyAddIdx, BodyMove, BodyAddJ, BodyJump: TBytecodeInstruction;
+  FusedInstr: TBytecodeInstruction;
+  StartReg, JReg, OneReg, ArrayIdx, EndReg, FirstReg: Word;
+  ExitTarget: Integer;
+begin
+  { Pattern: Rotate left loop (10 instructions)
+     ArrayLoadIntTo    Rfirst, ARR, idx=Rstart    ; first = arr[start]
+     CopyInt           Rj, Rstart                 ; j = start
+     BranchLeInt       Rj, Rend, body             ; while j <= end goto body
+     AddInt            Rtemp, Rend, R1            ; temp = end + 1
+     ArrayStoreInt     ARR, idx=Rtemp, value=Rfirst  ; arr[end+1] = first
+     Jump              exit                       ; exit loop
+     AddInt            Ridx, Rj, R1               ; idx = j + 1
+     ArrayMoveElement  ARR[Rj] = ARR[Ridx]        ; arr[j] = arr[j+1]
+     AddIntSelf        Rj, R1                     ; j++
+     Jump              branch                     ; loop back
+
+     Becomes: ArrayShiftLeft ARR, start=Rstart, end=Rend
+     Format: Src1=arr_index, Src2=start_idx_reg, Dest=end_idx_reg }
+
+  Result := False;
+
+  // Need at least 10 instructions
+  if Index + 9 >= FProgram.GetInstructionCount then Exit;
+
+  // Read all instructions
+  LoadFirst := FProgram.GetInstruction(Index);
+  CopyJ := FProgram.GetInstruction(Index + 1);
+  BranchLe := FProgram.GetInstruction(Index + 2);
+  ExitAddEnd := FProgram.GetInstruction(Index + 3);
+  ExitStore := FProgram.GetInstruction(Index + 4);
+  ExitJump := FProgram.GetInstruction(Index + 5);
+  BodyAddIdx := FProgram.GetInstruction(Index + 6);
+  BodyMove := FProgram.GetInstruction(Index + 7);
+  BodyAddJ := FProgram.GetInstruction(Index + 8);
+  BodyJump := FProgram.GetInstruction(Index + 9);
+
+  // Check instruction 0: ArrayLoadIntTo
+  if LoadFirst.OpCode <> bcArrayLoadIntTo then Exit;
+  ArrayIdx := LoadFirst.Src1;
+  StartReg := LoadFirst.Src2;
+  FirstReg := LoadFirst.Dest;
+
+  // Check instruction 1: CopyInt
+  if CopyJ.OpCode >= 110 then Exit;
+  if TBytecodeOp(CopyJ.OpCode) <> bcCopyInt then Exit;
+  if CopyJ.Src1 <> StartReg then Exit;
+  JReg := CopyJ.Dest;
+
+  // Check instruction 2: BranchLeInt
+  if BranchLe.OpCode <> bcBranchLeInt then Exit;
+  if BranchLe.Src1 <> JReg then Exit;
+  EndReg := BranchLe.Src2;
+  if BranchLe.Immediate <> Index + 6 then Exit;
+
+  // Check instruction 3: AddInt
+  if ExitAddEnd.OpCode >= 110 then Exit;
+  if TBytecodeOp(ExitAddEnd.OpCode) <> bcAddInt then Exit;
+  if ExitAddEnd.Src1 <> EndReg then Exit;
+  OneReg := ExitAddEnd.Src2;
+
+  // Check instruction 4: ArrayStoreInt
+  if ExitStore.OpCode >= 110 then Exit;
+  if TBytecodeOp(ExitStore.OpCode) <> bcArrayStoreInt then Exit;
+  if ExitStore.Src1 <> ArrayIdx then Exit;
+  if ExitStore.Src2 <> ExitAddEnd.Dest then Exit;
+  if ExitStore.Dest <> FirstReg then Exit;
+
+  // Check instruction 5: Jump
+  if ExitJump.OpCode >= 110 then Exit;
+  if TBytecodeOp(ExitJump.OpCode) <> bcJump then Exit;
+  ExitTarget := ExitJump.Immediate;
+
+  // Check instruction 6: AddInt
+  if BodyAddIdx.OpCode >= 110 then Exit;
+  if TBytecodeOp(BodyAddIdx.OpCode) <> bcAddInt then Exit;
+  if BodyAddIdx.Src1 <> JReg then Exit;
+  if BodyAddIdx.Src2 <> OneReg then Exit;
+
+  // Check instruction 7: ArrayMoveElement (Dest=ArrIdx, Src1=SrcIdx, Src2=DestIdx)
+  if BodyMove.OpCode <> bcArrayMoveElement then Exit;
+  if BodyMove.Dest <> ArrayIdx then Exit;
+  if BodyMove.Src2 <> JReg then Exit;
+  if BodyMove.Src1 <> BodyAddIdx.Dest then Exit;
+
+  // Check instruction 8: AddIntSelf
+  if BodyAddJ.OpCode <> bcAddIntSelf then Exit;
+  if BodyAddJ.Dest <> JReg then Exit;
+  if BodyAddJ.Src1 <> OneReg then Exit;
+
+  // Check instruction 9: Jump back
+  if BodyJump.OpCode >= 110 then Exit;
+  if TBytecodeOp(BodyJump.OpCode) <> bcJump then Exit;
+  if BodyJump.Immediate <> Index + 2 then Exit;
+
+  // SAFETY checks
+  if IsJumpTarget(Index + 1) then Exit;
+  if IsJumpTarget(Index + 3) then Exit;
+  if IsJumpTarget(Index + 4) then Exit;
+  if IsJumpTarget(Index + 5) then Exit;
+  if IsJumpTarget(Index + 7) then Exit;
+  if IsJumpTarget(Index + 8) then Exit;
+  if IsJumpTarget(Index + 9) then Exit;
+
+  // Create fused instruction
+  FillChar(FusedInstr, SizeOf(FusedInstr), 0);
+  FusedInstr.OpCode := bcArrayShiftLeft;
+  FusedInstr.Src1 := ArrayIdx;
+  FusedInstr.Src2 := StartReg;
+  FusedInstr.Dest := EndReg;
+  FusedInstr.Immediate := ExitTarget;
+  FusedInstr.SourceLine := LoadFirst.SourceLine;
+
+  FProgram.SetInstruction(Index, FusedInstr);
+  MakeNop(Index + 1);
+  MakeNop(Index + 2);
+  MakeNop(Index + 3);
+  MakeNop(Index + 4);
+  MakeNop(Index + 5);
+  MakeNop(Index + 6);
+  MakeNop(Index + 7);
+  MakeNop(Index + 8);
+  MakeNop(Index + 9);
+
+  Inc(FFusedCount, 9);
+  Result := True;
+end;
+
+
+
+
+
 function TSuperinstructionOptimizer.Run: Integer;
 var
   i, Pass: Integer;
@@ -1768,18 +2170,34 @@ begin
         Continue;
       end;
 
+      // Try TryFuseArrayShiftLeft for ArrayLoadIntTo (opcode 253)
+      // This pattern starts with a superinstruction, so check it before skipping
+      if FProgram.GetInstruction(i).OpCode = bcArrayLoadIntTo then
+      begin
+        if TryFuseArrayShiftLeft(i) then
+          Changed := True;
+        Inc(i);
+        Continue;
+      end;
+
       // Skip other superinstructions (can't fuse already-fused instructions)
-      if FProgram.GetInstruction(i).OpCode >= 100 then
+      if FProgram.GetInstruction(i).OpCode >= 110 then
       begin
         Inc(i);
         Continue;
       end;
 
       // Try fusion patterns in order of priority
-      // (5-instruction patterns first, then 3-instruction, then 2-instruction)
+      // (8-instruction patterns first, then 5, then 3, then 2)
 
+      // NEW: Array reverse range (8 instructions) - HIGHEST IMPACT for fannkuch-redux
+      if TryFuseArrayReverseRange(i) then
+        Changed := True
+      // NEW: Array shift left (9 instructions) - HIGH IMPACT for fannkuch-redux
+      else if TryFuseArrayShiftLeft(i) then
+        Changed := True
       // NEW: Array swap pattern (5 instructions) - HIGH PRIORITY for fannkuch-redux
-      if TryFuseArraySwapInt(i) then
+      else if TryFuseArraySwapInt(i) then
         Changed := True
       else if TryFuseCompareZeroAndBranch(i) then
         Changed := True
@@ -1796,7 +2214,14 @@ begin
       // NEW: Self-increment/decrement patterns - HIGH PRIORITY for fannkuch-redux
       else if TryFuseAddIntSelf(i) then
         Changed := True
-      // NEW: Array load to register pattern
+      // NEW: Array copy/move element patterns (2 instructions)
+      // MUST come BEFORE ArrayLoadIntTo to match the pattern correctly!
+      else if TryFuseArrayCopyElement(i) then
+        Changed := True
+      // DEBUG: Re-enabled to investigate the bug
+      else if TryFuseArrayMoveElement(i) then
+        Changed := True
+      // NEW: Array load to register pattern (after copy/move patterns)
       else if TryFuseArrayLoadIntTo(i) then
         Changed := True
       // NEW: FMA and advanced patterns
@@ -1819,6 +2244,11 @@ begin
 
       Inc(i);
     end;
+
+    // Compact NOPs after each pass to enable multi-instruction pattern matching
+    if Changed then
+      RunNopCompaction(FProgram);
+
   until (not Changed) or (Pass > 10);  // Safety limit
 
   Result := FFusedCount;

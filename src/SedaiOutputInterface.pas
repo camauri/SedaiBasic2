@@ -28,7 +28,7 @@ unit SedaiOutputInterface;
 interface
 
 uses
-  Classes, SysUtils;
+  Classes, SysUtils, SedaiGraphicsTypes;
 
 type
   TOutputType = (otSDL2, otFile, otStringList);
@@ -38,32 +38,28 @@ type
   end;
 
   TGraphicMode = (
-    gm40ColText = 0,        // 40x25 text mode
-    gmStandardBitmap = 1,   // 320x200 bitmap
-    gmSplitBitmap = 2,      // 320x160 bitmap + text
-    gmMulticolorBitmap = 3, // 160x200 multicolor (pixel doppi)
-    gmSplitMulticolor = 4,  // 160x160 multicolor + text
-    gm80ColText = 5,        // 80x25 text mode (640x200)
-    gm640x400_16col = 6,    // 80x50 text mode (640x400)
-    gm1440x896_true = 7,    // 180x112 text mode (1440x896)
-    gm320x240_true = 8,     // 320x240 truecolor (QVGA)
-    gm640x480_true = 9,     // 640x480 truecolor (VGA)
-    gm800x480_true = 10,    // 800x480 truecolor (WVGA)
-    gm800x600_true = 11,    // 800x600 truecolor (SVGA)
-    gm1024x600_true = 12,   // 1024x600 truecolor (WSVGA)
-    gm1024x768_true = 13,   // 1024x768 truecolor (XGA)
-    gm1280x720_true = 14,   // 1280x720 truecolor (HD 720)
-    gm1280x800_true = 15,   // 1280x800 truecolor (WXGA)
-    gm1280x1024_true = 16,  // 1280x1024 truecolor (SXGA)
-    gm1366x768_true = 17,   // 1366x768 truecolor (FWXGA)
-    gm1600x900_true = 18,   // 1600x900 truecolor (WSXGA)
-    gm1680x1050_true = 19,  // 1680x1050 truecolor (WSXGA+)
-    gm1920x1080_true = 20,  // 1920x1080 truecolor (HD1080)
-    gm2048x1080_true = 21,  // 2048x1080 truecolor (2K)
-    gm2560x1440_true = 22,  // 2560x1440 truecolor (WQHD)
-    gm2560x1600_true = 23,  // 2560x1600 truecolor (WQXGA)
-    gm3840x2160_true = 24,  // 3840x2160 truecolor (4K UHD)
-    gmCustom = 25           // Custom resolution
+    // C64/C128 compatible modes - 320x200 group (shared buffer)
+    gm40ColText = 0,        // GRAPHIC 0: 40x25 text mode (320x200)
+    gmStandardBitmap = 1,   // GRAPHIC 1: 320x200 hires bitmap
+    gmSplitBitmap = 2,      // GRAPHIC 2: 320x160 bitmap + 40x5 text
+
+    // Multicolor modes - 160x200 group (shared buffer)
+    gmMulticolorBitmap = 3, // GRAPHIC 3: 160x200 multicolor (pixel doppi)
+    gmSplitMulticolor = 4,  // GRAPHIC 4: 160x160 multicolor + 40x5 text
+
+    // 80-column modes - 640x200 group (shared buffer)
+    gm80ColText = 5,        // GRAPHIC 5: 80x25 text mode (640x200)
+    gm80ColBitmap = 6,      // GRAPHIC 6: 640x200 hires bitmap
+    gm80ColMixed = 7,       // GRAPHIC 7: 640x160 bitmap + 80x5 text
+
+    // Extended modes - 640x400 group (shared buffer)
+    gm80x50Text = 8,        // GRAPHIC 8: 80x50 text mode (640x400)
+    gm80x50Bitmap = 9,      // GRAPHIC 9: 640x400 hires bitmap
+    gm80x50Mixed = 10,      // GRAPHIC 10: 640x360 bitmap + 80x5 text
+
+    // Dynamic SDL2 mode (resolution from SDL2VideoModeEnumerator via GLIST)
+    // Syntax: GRAPHIC 11, clear, sdl2_mode_index
+    gmSDL2Dynamic = 11      // GRAPHIC 11: SDL2 dynamic mode, param3 = SDL2 mode index from GLIST
   );
 
   TPaletteIndex = 0..255;
@@ -117,6 +113,7 @@ type
     // Graphics support
     function SetGraphicMode(Mode: TGraphicMode; ClearBuffer: Boolean = False;
                            SplitLine: Integer = -1): Boolean;
+    function GetGraphicMode: TGraphicMode;
     function IsInGraphicsMode: Boolean;
 
     // Pixel operations
@@ -131,8 +128,46 @@ type
     function GetPaletteColor(Index: TPaletteIndex): UInt32;
     procedure ResetPalette;
 
+    // Shape drawing (extensible graphics)
+    // Simple version: uses current style state
+    procedure DrawBox(X1, Y1, X2, Y2: Integer; Angle: Double = 0);
+    // Full version: explicit style
+    procedure DrawBoxStyled(X1, Y1, X2, Y2: Integer; const Style: TShapeStyle; Angle: Double = 0);
+    // BASIC BOX command: color interpretation depends on graphics mode
+    // In hires modes (1-2): 0=background, 1=foreground (captured at mode switch)
+    // In SDL2 mode (7): color is RGBA value directly
+    // Filled: if True, fill the rectangle interior; if False, draw outline only
+    procedure DrawBoxWithColor(X1, Y1, X2, Y2: Integer; Color: UInt32; Angle: Double = 0; Filled: Boolean = False);
+    // BASIC CIRCLE command: draws ellipses, arcs, and polygons
+    // X, Y: center coordinates; XR, YR: x and y radii
+    // SA, EA: start and end angles in degrees (0-360)
+    // Angle: rotation in degrees clockwise; Inc: degrees between line segments
+    procedure DrawCircleWithColor(X, Y, XR, YR: Integer; Color: UInt32;
+                                  SA: Double = 0; EA: Double = 360;
+                                  Angle: Double = 0; Inc: Double = 2);
+    // BASIC DRAW command: draws lines from (X1,Y1) to (X2,Y2)
+    procedure DrawLine(X1, Y1, X2, Y2: Integer; Color: UInt32);
+
+    // Pixel Cursor (PC) - invisible cursor for DRAW/LOCATE/RDOT commands
+    procedure SetPixelCursor(X, Y: Integer);
+    function GetPixelCursorX: Integer;
+    function GetPixelCursorY: Integer;
+
+    // Style state management
+    procedure SetBorderStyle(const Style: TBorderStyle);
+    procedure SetFillStyle(const Style: TFillStyleDef);
+    function GetBorderStyle: TBorderStyle;
+    function GetFillStyle: TFillStyleDef;
+
+    // FAST mode (C128 2MHz mode emulation - shows black overlay)
+    procedure SetFastMode(Enabled: Boolean);
+    function GetFastMode: Boolean;
+    procedure SetFastModeAlpha(Alpha: Byte);
+    function GetFastModeAlpha: Byte;
+
     // Properties
     property InScrollMode: Boolean read GetInScrollMode;
+    property FastMode: Boolean read GetFastMode write SetFastMode;
   end;
 
   { IInputDevice - SOLO INPUT }
@@ -145,7 +180,9 @@ type
     function KeyPressed: Boolean;
 
     // Stato input
-    function ShouldQuit: Boolean;
+    function ShouldQuit: Boolean;       // CTRL+ALT+END: exit application
+    function ShouldStop: Boolean;       // CTRL+C: stop BASIC program
+    procedure ClearStopRequest;         // Clear stop flag after handling
     procedure ProcessEvents;
 
     // Reset

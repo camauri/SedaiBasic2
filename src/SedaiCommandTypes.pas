@@ -19,7 +19,7 @@
  *
  * SPDX-License-Identifier: GPL-3.0-only OR Commercial
  *}
-unit SedaiMemoryConfig;
+unit SedaiCommandTypes;
 
 {$mode ObjFPC}{$H+}
 {$interfaces CORBA}
@@ -27,20 +27,29 @@ unit SedaiMemoryConfig;
 
 interface
 
-const
-  // ===== MEMORY DETECTION LIMITS =====
-  MEMORY_MIN_MB = 64;              // Minimum detectable memory: 64MB
-  MEMORY_MAX_MB = 2048;            // Maximum memory to consider: 2GB
-  MEMORY_USAGE_PERCENT = 0.25;     // Use 25% of available memory
-  MEMORY_DEFAULT_MB = 512;         // Fallback if detection fails
+type
+  // === COMMAND CLASSIFICATION ===
+  TCommandType = (
+    ctImmediate,      // Execute immediately (PRINT 2+3, LIST, etc.)
+    ctProgramLine,    // Numbered line to store in program memory
+    ctSystemCommand   // System commands (may be added later)
+  );
 
-  // ===== TOKEN POOL LIMITS =====
-  POOL_MIN_TOKENS = 1000;          // Minimum pool size: 1K tokens
-  POOL_MAX_TOKENS = 100000;        // Maximum pool size: 100K tokens
-  POOL_OVERHEAD_BYTES = 64;        // Estimated object overhead per token
+  // === PIPE MODIFIER ===
+  TPipeModifier = (
+    pmNone,           // No pipe modifier
+    pmMore            // | MORE - paginate output
+  );
 
-  // ===== LINUX MEMORY DETECTION =====
-  LINUX_DEFAULT_MEMINFO_KB = 524288;  // 512MB in KB (fallback value)
+  // === INPUT PARSING RESULT ===
+  TInputParseResult = record
+    CommandType: TCommandType;
+    LineNumber: Integer;
+    Statement: string;
+    IsValid: Boolean;
+    ErrorMessage: string;
+    PipeModifier: TPipeModifier;  // Pipe modifier (e.g., | MORE)
+  end;
 
 implementation
 

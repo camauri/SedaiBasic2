@@ -22,6 +22,8 @@
 unit SedaiNopCompaction;
 
 {$mode ObjFPC}{$H+}
+{$interfaces CORBA}
+{$codepage UTF8}
 {$I OptimizationFlags.inc}
 {$I DebugFlags.inc}
 
@@ -120,13 +122,13 @@ begin
     bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall:
       Result := True;
   else
-    // Check superinstruction branch opcodes (values >= 100)
-    Result := (OpCode >= 100) and (OpCode <= 105)  // bcBranchEqInt..bcBranchGeInt
-           or (OpCode >= 110) and (OpCode <= 115)  // bcBranchEqFloat..bcBranchGeFloat
-           or (OpCode >= 160) and (OpCode <= 161)  // bcBranchEqZeroInt, bcBranchNeZeroInt
-           or (OpCode >= 170) and (OpCode <= 171)  // bcBranchEqZeroFloat, bcBranchNeZeroFloat
-           or (OpCode >= 190) and (OpCode <= 193)  // bcAddIntToBranchLe..bcSubIntToBranchGt
-           or (OpCode >= 240) and (OpCode <= 241); // bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ
+    // Check superinstruction branch opcodes (values >= 110)
+    Result := (OpCode >= 110) and (OpCode <= 115)  // bcBranchEqInt..bcBranchGeInt
+           or (OpCode >= 120) and (OpCode <= 125)  // bcBranchEqFloat..bcBranchGeFloat
+           or (OpCode >= 170) and (OpCode <= 171)  // bcBranchEqZeroInt, bcBranchNeZeroInt
+           or (OpCode >= 180) and (OpCode <= 181)  // bcBranchEqZeroFloat, bcBranchNeZeroFloat
+           or (OpCode >= 200) and (OpCode <= 203)  // bcAddIntToBranchLe..bcSubIntToBranchGt
+           or (OpCode >= 250) and (OpCode <= 251); // bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ
   end;
 end;
 
