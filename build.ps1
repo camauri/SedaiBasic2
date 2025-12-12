@@ -54,22 +54,13 @@ $Script:BinDir = Join-Path $ProjectRoot 'bin'
 
 # Detect FPC compiler
 function Find-FPC {
-    # Try common locations
-    $locations = @(
-        'C:\lazarus-3.6\fpc\3.2.2\bin\x86_64-win64\fpc.exe',
-        'C:\lazarus\fpc\3.2.2\bin\x86_64-win64\fpc.exe',
-        'C:\FPC\3.2.2\bin\x86_64-win64\fpc.exe',
-        '/usr/bin/fpc',
-        '/usr/local/bin/fpc'
-    )
-
-    foreach ($loc in $locations) {
-        if (Test-Path $loc) {
-            return $loc
-        }
+    # Project-local FPC (installed by setup.ps1) - always preferred
+    $localFpc = Join-Path $ProjectRoot 'fpc\3.2.2\bin\x86_64-win64\fpc.exe'
+    if (Test-Path $localFpc) {
+        return $localFpc
     }
 
-    # Try PATH
+    # Fallback to system PATH
     $fpc = Get-Command fpc -ErrorAction SilentlyContinue
     if ($fpc) {
         return $fpc.Source
