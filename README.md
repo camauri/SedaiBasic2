@@ -11,6 +11,15 @@
   |____/ \___|\__,_|\__,_|_|____/ \__,_|___/_|\___|_____|
 ```
 
+## ⚠️ Branch Information
+
+| Branch | Status | Description |
+|--------|--------|-------------|
+| **main** | [![Stable](https://img.shields.io/badge/status-stable-green.svg)]() | Preliminary release stable enough for benchmarks and Tiny BASIC testing |
+| **develop** | [![Development](https://img.shields.io/badge/status-development-orange.svg)]() | Active development branch - compiles successfully but may contain bugs |
+
+> **Recommended:** Use the `main` branch for testing and benchmarking. The `develop` branch contains the latest features but may have stability issues.
+
 ## Documentation
 
 > **Note:** This README provides an overview. For detailed information, see:
