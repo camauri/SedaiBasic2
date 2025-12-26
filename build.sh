@@ -62,14 +62,13 @@ detect_platform() {
 }
 
 find_fpc() {
-    # Project-local FPC (installed by setup.sh) - always preferred
-    local local_fpc="$SCRIPT_DIR/fpc/3.2.2/bin/$(detect_platform)/fpc"
-    if [[ -x "$local_fpc" ]]; then
-        echo "$local_fpc"
-        return 0
-    fi
-
-    # Fallback to system PATH
+    local locations=("/usr/bin/fpc" "/usr/local/bin/fpc" "/opt/fpc/bin/fpc")
+    for loc in "${locations[@]}"; do
+        if [[ -x "$loc" ]]; then
+            echo "$loc"
+            return 0
+        fi
+    done
     command -v fpc 2>/dev/null && return 0
     return 1
 }
