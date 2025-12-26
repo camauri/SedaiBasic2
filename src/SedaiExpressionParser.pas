@@ -30,7 +30,8 @@ interface
 uses
   Classes, SysUtils, Variants,
   SedaiLexerTypes, SedaiLexerToken, SedaiTokenList,
-  SedaiParserTypes, SedaiAST, SedaiParserContext, SedaiPackratCore;
+  SedaiParserTypes, SedaiAST, SedaiParserContext, SedaiPackratCore,
+  SedaiBasicKeywords;
 
 type
   { TExpressionParser - Streamlined Pratt-style expression parser }
@@ -69,6 +70,8 @@ type
     function ParseSpriteFunction(Token: TLexerToken): TASTNode;
     function ParseInputFunction(Token: TLexerToken): TASTNode;
     function ParseUsrFunction(Token: TLexerToken): TASTNode;
+    function ParseUserFunction(Token: TLexerToken): TASTNode;
+    function ParseSpecialVariable(Token: TLexerToken): TASTNode;
 
     // === INFIX PARSING FUNCTIONS ===
     function ParseBinaryOperator(Left: TASTNode; Token: TLexerToken): TASTNode;
@@ -101,6 +104,8 @@ function StaticParseGraphicsFunction(Parser: Pointer; Token: TLexerToken): TObje
 function StaticParseSpriteFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseInputFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseUsrFunction(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseUserFunction(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseSpecialVariable(Parser: Pointer; Token: TLexerToken): TObject;
 
 function StaticParseBinaryOperator(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
 function StaticParseAssignment(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
@@ -199,6 +204,16 @@ begin
   Result := TExpressionParser(Parser).ParseUsrFunction(Token);
 end;
 
+function StaticParseUserFunction(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseUserFunction(Token);
+end;
+
+function StaticParseSpecialVariable(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseSpecialVariable(Token);
+end;
+
 function StaticParseBinaryOperator(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseBinaryOperator(TASTNode(Left), Token);
@@ -289,6 +304,8 @@ begin
   Context.SetParseRule(ttSpriteFunction, MakePrefixRule(@StaticParseSpriteFunction, precCall));
   Context.SetParseRule(ttInputFunction, MakePrefixRule(@StaticParseInputFunction, precCall));
   Context.SetParseRule(ttUsrFunction, MakePrefixRule(@StaticParseUsrFunction, precCall));
+  Context.SetParseRule(ttProcedureStart, MakePrefixRule(@StaticParseUserFunction, precCall));
+  Context.SetParseRule(ttSpecialVariable, MakePrefixRule(@StaticParseSpecialVariable, precPrimary));
 
   // Unary operators (PREFIX only)
   Context.SetParseRule(ttOpAdd, MakePrefixRule(@StaticParseUnaryPlus, precUnary));
@@ -945,6 +962,7 @@ end;
 function TExpressionParser.ParseSpriteFunction(Token: TLexerToken): TASTNode;
 var
   Args: TASTNode;
+  FuncName: string;
 begin
   {$IFDEF DEBUG}
   LogVerbose(Format('ParseSpriteFunction: %s', [Token.Value]));
@@ -956,7 +974,24 @@ begin
     Exit;
   end;
 
-  Result := TASTNode.CreateWithValue(antFunctionCall, Token.Value, Token);
+  FuncName := UpperCase(Token.Value);
+  Result := TASTNode.CreateWithValue(antSpriteFunction, FuncName, Token);
+
+  // Set specific function type attribute for SSA generator
+  // BUMP(n) - returns collision bitmask for type n (1=sprite-sprite, 2=sprite-display)
+  // RSPCOLOR(n) - returns multicolor n (1=MC1, 2=MC2)
+  // RSPPOS(sprite, attr) - returns position/speed (0=X, 1=Y, 2=speed)
+  // RSPRITE(sprite, attr) - returns sprite attribute (0=enabled, 1=color, etc.)
+  if FuncName = kBUMP then
+    Result.Attributes.Values['sprite_func'] := 'BUMP'
+  else if FuncName = kRSPCOLOR then
+    Result.Attributes.Values['sprite_func'] := 'RSPCOLOR'
+  else if FuncName = kRSPPOS then
+    Result.Attributes.Values['sprite_func'] := 'RSPPOS'
+  else if FuncName = kRSPRITE then
+    Result.Attributes.Values['sprite_func'] := 'RSPRITE'
+  else
+    Result.Attributes.Values['sprite_func'] := FuncName;
 
   // Consume opening parenthesis
   if not Context.Match(ttDelimParOpen) then
@@ -1064,6 +1099,70 @@ begin
     Exit;
   end;
 
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseUserFunction(Token: TLexerToken): TASTNode;
+var
+  FnName: string;
+  Args: TASTNode;
+  NameNode: TASTNode;
+begin
+  // FN is already consumed, now we expect the function name (identifier)
+  // Format: FNname(arg)  or  FN name(arg)  depending on tokenizer
+
+  if not Context.Check(ttIdentifier) then
+  begin
+    HandleError('Expected function name after FN', Context.CurrentToken);
+    Result := nil;
+    Exit;
+  end;
+
+  FnName := Context.CurrentToken.Value;
+  Result := TASTNode.CreateWithValue(antUserFunction, 'FN' + FnName, Token);
+
+  // Add function name as first child
+  NameNode := TASTNode.CreateWithValue(antIdentifier, FnName, Context.CurrentToken);
+  Result.AddChild(NameNode);
+  Context.Advance; // Consume function name
+
+  // Expect opening parenthesis
+  if not Context.Match(ttDelimParOpen) then
+  begin
+    HandleError('Expected "(" after function name', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Parse argument (single expression for DEF FN functions)
+  if not Context.Check(ttDelimParClose) then
+  begin
+    Args := ParseExpression;
+    if Assigned(Args) then
+      Result.AddChild(Args);
+  end;
+
+  // Expect closing parenthesis
+  if not Context.Match(ttDelimParClose) then
+  begin
+    HandleError('Expected ")" after function argument', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseSpecialVariable(Token: TLexerToken): TASTNode;
+begin
+  {$IFDEF DEBUG}
+  LogVerbose(Format('ParseSpecialVariable: %s', [Token.Value]));
+  {$ENDIF}
+
+  // Special variables are simple value-returning expressions (no arguments)
+  Result := TASTNode.CreateWithValue(antSpecialVariable, UpperCase(Token.Value), Token);
   DoNodeCreated(Result);
 end;
 

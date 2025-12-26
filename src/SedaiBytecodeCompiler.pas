@@ -157,6 +157,24 @@ begin
     ssaCmpNeString: Result := bcCmpNeString;
     ssaCmpLtString: Result := bcCmpLtString;
     ssaCmpGtString: Result := bcCmpGtString;
+    // Logical operators
+    ssaLogicalAnd: Result := bcLogicalAnd;
+    ssaLogicalOr: Result := bcLogicalOr;
+    ssaLogicalXor: Result := bcLogicalXor;
+    ssaLogicalNot: Result := bcLogicalNot;
+    // String functions
+    ssaStrConcat: Result := bcStrConcat;
+    ssaStrLen: Result := bcStrLen;
+    ssaStrLeft: Result := bcStrLeft;
+    ssaStrRight: Result := bcStrRight;
+    ssaStrMid: Result := bcStrMid;
+    ssaStrAsc: Result := bcStrAsc;
+    ssaStrChr: Result := bcStrChr;
+    ssaStrStr: Result := bcStrStr;
+    ssaStrVal: Result := bcStrVal;
+    ssaStrHex: Result := bcStrHex;
+    ssaStrInstr: Result := bcStrInstr;
+    ssaStrErr: Result := bcStrErr;
     // Math functions
     ssaMathAbs: Result := bcMathAbs;
     ssaMathSgn: Result := bcMathSgn;
@@ -167,7 +185,11 @@ begin
     ssaMathTan: Result := bcMathTan;
     ssaMathExp: Result := bcMathExp;
     ssaMathLog: Result := bcMathLog;
+    ssaMathLog10: Result := bcMathLog10;
+    ssaMathLog2: Result := bcMathLog2;
+    ssaMathLogN: Result := bcMathLogN;
     ssaMathRnd: Result := bcMathRnd;
+    ssaStrDec: Result := bcStrDec;
     ssaPrint: Result := bcPrint;
     ssaPrintLn: Result := bcPrintLn;
     ssaPrintString: Result := bcPrintString;
@@ -184,6 +206,13 @@ begin
     ssaInputFloat: Result := bcInputFloat;
     ssaInputString: Result := bcInputString;
     ssaEnd: Result := bcEnd;
+    ssaStop: Result := bcStop;
+    ssaKey: Result := bcKey;
+    ssaTron: Result := bcTron;
+    ssaTroff: Result := bcTroff;
+    ssaTrap: Result := bcTrap;
+    ssaResume: Result := bcResume;
+    ssaResumeNext: Result := bcResumeNext;
     ssaJump: Result := bcJump;
     ssaJumpIfZero: Result := bcJumpIfZero;
     ssaJumpIfNotZero: Result := bcJumpIfNotZero;
@@ -204,10 +233,90 @@ begin
     ssaGraphicLocate: Result := bcGraphicLocate;
     ssaGraphicRdot: Result := bcGraphicRdot;
     ssaGraphicGetMode: Result := bcGraphicGetMode;
+    ssaGraphicColor: Result := bcGraphicColor;
+    ssaGraphicWidth: Result := bcGraphicWidth;
+    ssaGraphicScale: Result := bcGraphicScale;
+    ssaGraphicPaint: Result := bcGraphicPaint;
+    ssaGraphicWindow: Result := bcGraphicWindow;
+    ssaGraphicSShape: Result := bcGraphicSShape;
+    ssaGraphicGShape: Result := bcGraphicGShape;
+    ssaGraphicGList: Result := bcGraphicGList;
+    ssaGraphicPos: Result := bcGraphicPos;
+    ssaGraphicRclr: Result := bcGraphicRclr;
+    ssaGraphicRwindow: Result := bcGraphicRwindow;
     // System commands
     ssaFast: Result := bcFast;
     ssaSlow: Result := bcSlow;
     ssaSleep: Result := bcSleep;
+    ssaClear: Result := bcClear;
+    // Sound commands
+    ssaSoundVol: Result := bcSoundVol;
+    ssaSoundSound: Result := bcSoundSound;
+    ssaSoundEnvelope: Result := bcSoundEnvelope;
+    ssaSoundTempo: Result := bcSoundTempo;
+    ssaSoundPlay: Result := bcSoundPlay;
+    ssaSoundFilter: Result := bcSoundFilter;
+    // Special variables
+    ssaLoadTI: Result := bcLoadTI;
+    ssaLoadTIS: Result := bcLoadTIS;
+    ssaStoreTIS: Result := bcStoreTIS;
+    ssaLoadDTS: Result := bcLoadDTS;
+    ssaLoadEL: Result := bcLoadEL;
+    ssaLoadER: Result := bcLoadER;
+    ssaLoadERRS: Result := bcLoadERRS;
+    ssaFre: Result := bcFre;
+    // DATA/READ/RESTORE
+    ssaDataAdd: Result := bcDataAdd;
+    ssaDataRead: Result := bcDataReadFloat;  // Type-specific bytecode selected in CompileInstruction
+    ssaDataRestore: Result := bcDataRestore;
+    // Input commands
+    ssaGet: Result := bcGet;
+    ssaGetkey: Result := bcGetkey;
+    // Formatted output
+    ssaPrintUsing: Result := bcPrintUsing;
+    ssaPudef: Result := bcPudef;
+    ssaChar: Result := bcChar;
+    // File operations
+    ssaLoad: Result := bcLoad;
+    ssaSave: Result := bcSave;
+    ssaVerify: Result := bcVerify;
+    ssaBload: Result := bcBload;
+    ssaBsave: Result := bcBsave;
+    ssaBoot: Result := bcBoot;
+    // Disk file I/O
+    ssaDopen: Result := bcDopen;
+    ssaDclose: Result := bcDclose;
+    ssaOpen: Result := bcOpen;
+    ssaClose: Result := bcClose;
+    // Sprite commands
+    ssaSprite: Result := bcSprite;
+    ssaMovsprAbs: Result := bcMovsprAbs;
+    ssaMovsprRel: Result := bcMovsprRel;
+    ssaMovsprPolar: Result := bcMovsprPolar;
+    ssaMovsprAuto: Result := bcMovsprAuto;
+    ssaSprcolor: Result := bcSprcolor;
+    ssaSprsav: Result := bcSprsav;
+    ssaCollision: Result := bcCollision;
+    // Sprite functions
+    ssaBump: Result := bcBump;
+    ssaRspcolor: Result := bcRspcolor;
+    ssaRsppos: Result := bcRsppos;
+    ssaRsprite: Result := bcRsprite;
+    // System commands
+    ssaRun: Result := bcRun;
+    ssaList: Result := bcList;
+    ssaNew: Result := bcNew;
+    ssaDelete: Result := bcDelete;
+    ssaRenumber: Result := bcRenumber;
+    ssaCatalog: Result := bcCatalog;
+    // File management commands
+    ssaCopyFile: Result := bcCopyFile;
+    ssaScratch: Result := bcScratch;
+    ssaRenameFile: Result := bcRenameFile;
+    ssaConcat: Result := bcConcat;
+    ssaMkdir: Result := bcMkdir;
+    ssaChdir: Result := bcChdir;
+    ssaMoveFile: Result := bcMoveFile;
   else
     Result := bcNop;
   end;
@@ -549,6 +658,570 @@ begin
     Exit;
   end;
 
+  // Special handling for SOUND - pack 8 parameters into bytecode format
+  // SOUND voice, freq, duration [,dir, minfreq, sweeptime, waveform, pulsewidth]
+  // SSA: Src1=voice, Src2=freq, Src3=duration, PhiSources[0..4]=dir,minfreq,sweeptime,waveform,pw
+  if Instr.OpCode = ssaSoundSound then
+  begin
+    BCOp := bcSoundSound;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    // Src1 = voice register
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    // Src2 = freq register
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+
+    // Dest = duration register (repurposed since SOUND has no result)
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
+
+    // Pack additional params (dir, minfreq, sweeptime, waveform, pw) into Immediate
+    // Layout: dir(8) | minfreq(12) | sweeptime(12) | waveform(8) | pw(12) = 52 bits
+    BCInstr.Immediate := 0;
+    if Length(Instr.PhiSources) >= 1 then
+    begin
+      // dir in bits 0-7 (sweep direction: 0=up, 1=down, 2=oscillate)
+      if Instr.PhiSources[0].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          (Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+            Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FF);
+    end;
+    if Length(Instr.PhiSources) >= 2 then
+    begin
+      // minfreq in bits 8-19
+      if Instr.PhiSources[1].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
+            Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FFF) shl 8);
+    end;
+    if Length(Instr.PhiSources) >= 3 then
+    begin
+      // sweeptime in bits 20-31
+      if Instr.PhiSources[2].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[2].Value.RegType,
+            Instr.PhiSources[2].Value.RegIndex, Instr.PhiSources[2].Value.Version)) and $FFF) shl 20);
+    end;
+    if Length(Instr.PhiSources) >= 4 then
+    begin
+      // waveform in bits 32-39
+      if Instr.PhiSources[3].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[3].Value.RegType,
+            Instr.PhiSources[3].Value.RegIndex, Instr.PhiSources[3].Value.Version)) and $FF) shl 32);
+    end;
+    if Length(Instr.PhiSources) >= 5 then
+    begin
+      // pulsewidth in bits 40-51
+      if Instr.PhiSources[4].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[4].Value.RegType,
+            Instr.PhiSources[4].Value.RegIndex, Instr.PhiSources[4].Value.Version)) and $FFF) shl 40);
+    end;
+
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for ENVELOPE - pack 7 parameters into bytecode format
+  // ENVELOPE envelope# [,attack, decay, sustain, release, waveform, pulsewidth]
+  // SSA: Src1=envelope#, PhiSources[0..5]=attack,decay,sustain,release,waveform,pw
+  if Instr.OpCode = ssaSoundEnvelope then
+  begin
+    BCOp := bcSoundEnvelope;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    // Src1 = envelope number register
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    // Pack ADSR + waveform + pw into Immediate
+    // Layout: attack(8) | decay(8) | sustain(8) | release(8) | waveform(8) | pw(12) = 52 bits
+    BCInstr.Immediate := 0;
+    if Length(Instr.PhiSources) >= 1 then
+    begin
+      // attack in bits 0-7
+      if Instr.PhiSources[0].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          (Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+            Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FF);
+    end;
+    if Length(Instr.PhiSources) >= 2 then
+    begin
+      // decay in bits 8-15
+      if Instr.PhiSources[1].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
+            Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FF) shl 8);
+    end;
+    if Length(Instr.PhiSources) >= 3 then
+    begin
+      // sustain in bits 16-23
+      if Instr.PhiSources[2].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[2].Value.RegType,
+            Instr.PhiSources[2].Value.RegIndex, Instr.PhiSources[2].Value.Version)) and $FF) shl 16);
+    end;
+    if Length(Instr.PhiSources) >= 4 then
+    begin
+      // release in bits 24-31
+      if Instr.PhiSources[3].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[3].Value.RegType,
+            Instr.PhiSources[3].Value.RegIndex, Instr.PhiSources[3].Value.Version)) and $FF) shl 24);
+    end;
+    if Length(Instr.PhiSources) >= 5 then
+    begin
+      // waveform in bits 32-39
+      if Instr.PhiSources[4].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[4].Value.RegType,
+            Instr.PhiSources[4].Value.RegIndex, Instr.PhiSources[4].Value.Version)) and $FF) shl 32);
+    end;
+    if Length(Instr.PhiSources) >= 6 then
+    begin
+      // pulsewidth in bits 40-51
+      if Instr.PhiSources[5].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[5].Value.RegType,
+            Instr.PhiSources[5].Value.RegIndex, Instr.PhiSources[5].Value.Version)) and $FFF) shl 40);
+    end;
+
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for FILTER - pack 5 parameters into bytecode format
+  // FILTER cutoff, lowpass, bandpass, highpass, resonance
+  // SSA: Src1=cutoff, PhiSources[0..3]=lp,bp,hp,res
+  if Instr.OpCode = ssaSoundFilter then
+  begin
+    BCOp := bcSoundFilter;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    // Src1 = cutoff frequency register
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    // Pack filter params into Immediate
+    // Layout: lp(8) | bp(8) | hp(8) | resonance(8) = 32 bits
+    BCInstr.Immediate := 0;
+    if Length(Instr.PhiSources) >= 1 then
+    begin
+      // lowpass in bits 0-7
+      if Instr.PhiSources[0].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          (Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+            Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FF);
+    end;
+    if Length(Instr.PhiSources) >= 2 then
+    begin
+      // bandpass in bits 8-15
+      if Instr.PhiSources[1].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
+            Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FF) shl 8);
+    end;
+    if Length(Instr.PhiSources) >= 3 then
+    begin
+      // highpass in bits 16-23
+      if Instr.PhiSources[2].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[2].Value.RegType,
+            Instr.PhiSources[2].Value.RegIndex, Instr.PhiSources[2].Value.Version)) and $FF) shl 16);
+    end;
+    if Length(Instr.PhiSources) >= 4 then
+    begin
+      // resonance in bits 24-31
+      if Instr.PhiSources[3].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[3].Value.RegType,
+            Instr.PhiSources[3].Value.RegIndex, Instr.PhiSources[3].Value.Version)) and $FF) shl 24);
+    end;
+
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for PLAY - music string parameter only
+  // PLAY "music string" - voice is specified inside the string with Vn
+  // SSA: Src1=string register
+  if Instr.OpCode = ssaSoundPlay then
+  begin
+    BCOp := bcSoundPlay;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    // Src1 = string register containing music string
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for SPRITE - pack 7 parameters into bytecode format
+  // SPRITE n [,enabled] [,color] [,priority] [,scalex] [,scaley] [,mode]
+  // SSA: Src1=n, Src2=enabled, Src3=color, PhiSources[0..3]=priority,scalex,scaley,mode
+  if Instr.OpCode = ssaSprite then
+  begin
+    BCOp := bcSprite;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    // Src1 = sprite number register
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    // Src2 = enabled register
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+
+    // Dest = color register (repurposed since SPRITE has no result)
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
+
+    // Pack additional params (priority, scalex, scaley, mode) into Immediate
+    // Layout: priority(12) | scalex(12) | scaley(12) | mode(12) = 48 bits
+    BCInstr.Immediate := 0;
+    if Length(Instr.PhiSources) >= 1 then
+    begin
+      // priority in bits 0-11
+      if Instr.PhiSources[0].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          (Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+            Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFF);
+    end;
+    if Length(Instr.PhiSources) >= 2 then
+    begin
+      // scalex in bits 12-23
+      if Instr.PhiSources[1].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
+            Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FFF) shl 12);
+    end;
+    if Length(Instr.PhiSources) >= 3 then
+    begin
+      // scaley in bits 24-35
+      if Instr.PhiSources[2].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[2].Value.RegType,
+            Instr.PhiSources[2].Value.RegIndex, Instr.PhiSources[2].Value.Version)) and $FFF) shl 24);
+    end;
+    if Length(Instr.PhiSources) >= 4 then
+    begin
+      // mode in bits 36-47
+      if Instr.PhiSources[3].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[3].Value.RegType,
+            Instr.PhiSources[3].Value.RegIndex, Instr.PhiSources[3].Value.Version)) and $FFF) shl 36);
+    end;
+
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for PAINT - pack PhiSources[0]=mode into Immediate
+  if Instr.OpCode = ssaGraphicPaint then
+  begin
+    BCOp := bcGraphicPaint;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    // Src1 = color source register
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    // Src2 = x register
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+
+    // Dest = y register (repurposed)
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
+
+    // PhiSources[0] = mode
+    BCInstr.Immediate := 0;
+    if Length(Instr.PhiSources) >= 1 then
+    begin
+      if Instr.PhiSources[0].Value.Kind = svkRegister then
+        BCInstr.Immediate := MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+          Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)
+      else if Instr.PhiSources[0].Value.Kind = svkConstInt then
+        BCInstr.Immediate := Instr.PhiSources[0].Value.ConstInt;
+    end;
+
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for WINDOW - pack PhiSources[0]=row2, [1]=clear into Immediate
+  if Instr.OpCode = ssaGraphicWindow then
+  begin
+    BCOp := bcGraphicWindow;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    // Src1 = col1 register
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    // Src2 = row1 register
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+
+    // Dest = col2 register (repurposed)
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
+
+    // Pack row2 (bits 0-15) and clear (bits 16-31) into Immediate
+    BCInstr.Immediate := 0;
+    if Length(Instr.PhiSources) >= 1 then
+    begin
+      if Instr.PhiSources[0].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          (Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+            Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF);
+    end;
+    if Length(Instr.PhiSources) >= 2 then
+    begin
+      if Instr.PhiSources[1].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
+            Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FFFF) shl 16)
+      else if Instr.PhiSources[1].Value.Kind = svkConstInt then
+        BCInstr.Immediate := BCInstr.Immediate or ((Int64(Instr.PhiSources[1].Value.ConstInt) and $FFFF) shl 16);
+    end;
+
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for SSHAPE - pack PhiSources[0]=y2 into Immediate
+  if Instr.OpCode = ssaGraphicSShape then
+  begin
+    BCOp := bcGraphicSShape;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    // Dest = string variable (output) - store variable name index in string constants
+    if Instr.Dest.Kind = svkVariable then
+      BCInstr.Dest := FProgram.AddStringConstant(Instr.Dest.VarName);
+
+    // Src1 = x1 register
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    // Src2 = y1 register
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+
+    // Pack x2 (from Src3) and y2 (from PhiSources[0]) into Immediate
+    BCInstr.Immediate := 0;
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Immediate := BCInstr.Immediate or
+        (Int64(MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version)) and $FFFF)
+    else if Instr.Src3.Kind = svkConstInt then
+      BCInstr.Immediate := BCInstr.Immediate or (Int64(Instr.Src3.ConstInt) and $FFFF);
+
+    if Length(Instr.PhiSources) >= 1 then
+    begin
+      if Instr.PhiSources[0].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+            Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF) shl 16)
+      else if Instr.PhiSources[0].Value.Kind = svkConstInt then
+        BCInstr.Immediate := BCInstr.Immediate or ((Int64(Instr.PhiSources[0].Value.ConstInt) and $FFFF) shl 16);
+    end;
+
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for GSHAPE - pack PhiSources[0]=mode into Immediate
+  if Instr.OpCode = ssaGraphicGShape then
+  begin
+    BCOp := bcGraphicGShape;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    // Src1 = string variable (source) - store variable name index in string constants
+    if Instr.Src1.Kind = svkVariable then
+      BCInstr.Src1 := FProgram.AddStringConstant(Instr.Src1.VarName)
+    else if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    // Src2 = x register
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version)
+    else if Instr.Src2.Kind = svkConstInt then
+      BCInstr.Src2 := Instr.Src2.ConstInt;
+
+    // Dest = y register (repurposed)
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version)
+    else if Instr.Src3.Kind = svkConstInt then
+      BCInstr.Dest := Instr.Src3.ConstInt;
+
+    // PhiSources[0] = mode
+    BCInstr.Immediate := 0;
+    if Length(Instr.PhiSources) >= 1 then
+    begin
+      if Instr.PhiSources[0].Value.Kind = svkRegister then
+        BCInstr.Immediate := MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+          Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)
+      else if Instr.PhiSources[0].Value.Kind = svkConstInt then
+        BCInstr.Immediate := Instr.PhiSources[0].Value.ConstInt;
+    end;
+
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for DATA/READ/RESTORE
+  if Instr.OpCode = ssaDataAdd then
+  begin
+    // bcDataAdd stores value type and value in immediate
+    // Src1 contains the constant value
+    BCInstr := MakeBytecodeInstruction(bcDataAdd, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkConstInt then
+    begin
+      BCInstr.Src1 := Ord(srtInt);  // Type indicator
+      BCInstr.Immediate := Instr.Src1.ConstInt;
+    end
+    else if Instr.Src1.Kind = svkConstFloat then
+    begin
+      BCInstr.Src1 := Ord(srtFloat);  // Type indicator
+      FloatVal := Instr.Src1.ConstFloat;
+      BCInstr.Immediate := Int64(Pointer(@FloatVal)^);
+    end
+    else if Instr.Src1.Kind = svkConstString then
+    begin
+      BCInstr.Src1 := Ord(srtString);  // Type indicator
+      BCInstr.Immediate := FProgram.AddStringConstant(Instr.Src1.ConstString);
+    end;
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  if Instr.OpCode = ssaDataRead then
+  begin
+    // Dest = register to read into
+    // Src1 = type indicator (srtInt, srtFloat, srtString)
+    if Instr.Src1.Kind = svkConstInt then
+    begin
+      case TSSARegisterType(Instr.Src1.ConstInt) of
+        srtInt: BCOp := bcDataReadInt;
+        srtFloat: BCOp := bcDataReadFloat;
+        srtString: BCOp := bcDataReadString;
+      else
+        BCOp := bcDataReadFloat;  // Default
+      end;
+    end
+    else
+      BCOp := bcDataReadFloat;
+
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+    if Instr.Dest.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  if Instr.OpCode = ssaDataRestore then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcDataRestore, 0, 0, 0, 0);
+    // Src1 = line number (0 = beginning)
+    if Instr.Src1.Kind = svkConstInt then
+      BCInstr.Immediate := Instr.Src1.ConstInt;
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for GET and GETKEY
+  if Instr.OpCode in [ssaGet, ssaGetkey] then
+  begin
+    if Instr.OpCode = ssaGet then
+      BCOp := bcGet
+    else
+      BCOp := bcGetkey;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+    if Instr.Dest.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for PRINT USING
+  if Instr.OpCode = ssaPrintUsing then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcPrintUsing, 0, 0, 0, 0);
+    // Src1 = format string register
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    // Src2 = value register
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for PUDEF
+  if Instr.OpCode = ssaPudef then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcPudef, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version)
+    else if Instr.Src1.Kind = svkConstString then
+      BCInstr.Immediate := FProgram.AddStringConstant(Instr.Src1.ConstString);
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for CHAR - pack 5 parameters
+  if Instr.OpCode = ssaChar then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcChar, 0, 0, 0, 0);
+    // Src1 = mode, Src2 = col, Dest = row (repurposed)
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
+    // Pack text and reverse register indices in Immediate
+    BCInstr.Immediate := 0;
+    if Length(Instr.PhiSources) >= 1 then
+    begin
+      if Instr.PhiSources[0].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          (Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+            Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF);
+    end;
+    if Length(Instr.PhiSources) >= 2 then
+    begin
+      if Instr.PhiSources[1].Value.Kind = svkRegister then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
+            Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FFFF) shl 16);
+    end;
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
   // Special handling for array operations to emit typed opcodes
   if Instr.OpCode = ssaArrayLoad then
   begin
@@ -574,17 +1247,14 @@ begin
   // Debug: trace opcode compilation
   if Instr.OpCode = ssaGraphicGetMode then
     WriteLn('>>> BC Compiling ssaGraphicGetMode -> bcOp=', Ord(BCOp));
+  if (Instr.OpCode = ssaTron) or (Instr.OpCode = ssaTroff) then
+    WriteLn('[BC] Compiling ', Ord(Instr.OpCode), ' -> bcOp=', Ord(BCOp));
 
   BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
 
   // Map SSA values to bytecode operands
   if Instr.Dest.Kind = svkRegister then
-  begin
-    BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
-    if Instr.OpCode = ssaLoadConstInt then
-      WriteLn('>>> BC LoadConstInt: SSA=', Instr.Dest.RegIndex, '_v', Instr.Dest.Version,
-              ' -> BC=', BCInstr.Dest, ' value=', Instr.Src1.ConstInt);
-  end
+    BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version)
   else if Instr.Dest.Kind = svkLabel then
   begin
     // This is a jump - record for later resolution
@@ -630,9 +1300,13 @@ begin
     BCInstr.Src2 := 0;  // Default to R0 (will cause wrong results!)
   end;
 
-  // Handle Src3 (for multidimensional arrays)
+  // Handle Src3 (for multidimensional arrays and string function immediates)
   if Instr.Src3.Kind = svkRegister then
-    BCInstr.Immediate := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
+    BCInstr.Immediate := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version)
+  else if Instr.Src3.Kind = svkConstInt then
+    BCInstr.Immediate := Instr.Src3.ConstInt
+  else if Instr.Src3.Kind = svkConstFloat then
+    BCInstr.Immediate := Trunc(Instr.Src3.ConstFloat);
 
   // Copy source line number for error reporting
   BCInstr.SourceLine := Instr.SourceLine;

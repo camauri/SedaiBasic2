@@ -1654,8 +1654,10 @@ begin
  RegisterKeyword(kCOLLECT,   ttFileManagement, 'Free inaccessible disk space',             kcDOSCommands);
  RegisterKeyword(kCONCAT,    ttFileManagement, 'Attaches source file to destination file', kcDOSCommands);
  RegisterKeyword(kCOPY,      ttFileManagement, 'Copy file from drive to drive',            kcDOSCommands);
+ RegisterKeyword(kCP,        ttFileManagement, 'Copy file (alias for COPY)',               kcDOSCommands);
  RegisterKeyword(kDCLEAR,    ttFileOperation,  'Clear all open channels on disk drive',    kcDOSCommands);
  RegisterKeyword(kDCLOSE,    ttFileOperation,  'Close disk drive file(s)',                 kcDOSCommands);
+ RegisterKeyword(kDIR,       ttFileManagement, 'Display drive directory (alias)',          kcDOSCommands);
  RegisterKeyword(kDIRECTORY, ttFileManagement, 'Display drive directory',                  kcDOSCommands);
  RegisterKeyword(kDLOAD,     ttFileOperation,  'Load BASIC file',                          kcDOSCommands);
  RegisterKeyword(kDOPEN,     ttFileOperation,  'Open sequential file for r/w',             kcDOSCommands);
@@ -1669,6 +1671,13 @@ begin
  RegisterKeyword(kSAVE,      ttFileOperation,  'Save program',                             kcDOSCommands);
  RegisterKeyword(kSCRATCH,   ttFileManagement, 'Delete file from drive',                   kcDOSCommands);
  RegisterKeyword(kVERIFY,    ttFileOperation,  'Verify saved file or program',             kcDOSCommands);
+ // Extended file management commands (SedaiBasic)
+ RegisterKeyword(kMKDIR,     ttFileManagement, 'Create directory',                         kcDOSCommands);
+ RegisterKeyword(kMD,        ttFileManagement, 'Create directory (alias for MKDIR)',       kcDOSCommands);
+ RegisterKeyword(kCHDIR,     ttFileManagement, 'Change current directory',                 kcDOSCommands);
+ RegisterKeyword(kCD,        ttFileManagement, 'Change directory (alias for CHDIR)',       kcDOSCommands);
+ RegisterKeyword(kMOVE,      ttFileManagement, 'Move file to another location',            kcDOSCommands);
+ RegisterKeyword(kMV,        ttFileManagement, 'Move file (alias for MOVE)',               kcDOSCommands);
 
  // === STRING FUNCTIONS ===
  RegisterKeyword(kASC,    ttStringFunction, 'Return character code',                            kcStringFunctions);
@@ -1682,6 +1691,8 @@ begin
  RegisterKeyword(kSPC,    ttStringFunction, 'Skip spaces on context output',                    kcStringFunctions);
  RegisterKeyword(kSTRS,   ttStringFunction, 'Convert number to string',                         kcStringFunctions);
  RegisterKeyword(kTAB,    ttStringFunction, 'Move cursor forward string from the first column', kcStringFunctions);
+ RegisterKeyword(kDEC,    ttStringFunction, 'Convert hex string to decimal integer',            kcStringFunctions);
+ RegisterKeyword(kERRS,   ttStringFunction, 'Return error message for error code',               kcStringFunctions);
 
  // === MEMORY HANDLING (COMMANDS AND FUNCTIONS) ===
  // commands
@@ -1702,6 +1713,7 @@ begin
  RegisterKeyword(kCIRCLE,  ttGraphicsCommand,  'Draws circles, ellipses, arcs and polygons',       kcGraphicsHandling);
  RegisterKeyword(kCOLOR,   ttGraphicsCommand,  'Define colors for each screen area',               kcGraphicsHandling);
  RegisterKeyword(kDRAW,    ttGraphicsCommand,  'Draw dots, lines and shapes',                      kcGraphicsHandling);
+ RegisterKeyword(kGLIST,   ttGraphicsCommand,  'List available SDL2 video modes',                  kcGraphicsHandling);
  RegisterKeyword(kGRAPHIC, ttGraphicsCommand,  'Select a graphic mode',                            kcGraphicsHandling);
  RegisterKeyword(kGSHAPE,  ttGraphicsCommand,  'Retrieve shape from string variable',              kcGraphicsHandling);
  RegisterKeyword(kLOCATE,  ttGraphicsCommand,  'Position the bit map pixel cursor on the screen',  kcGraphicsHandling);
@@ -1746,13 +1758,14 @@ begin
  RegisterKeyword(kATN,   ttMathFunction, 'Return arctangent of argument',                            kcMathFunctions);
  RegisterKeyword(kATAN,  ttMathFunction, 'Return arctangent of argument',                            kcMathFunctions);
  RegisterKeyword(kCOS,   ttMathFunction, 'Return cosine of angle of x radians',                      kcMathFunctions);
- RegisterKeyword(kDEC,   ttMathFunction, 'Convert hex number string to decimal',                     kcMathFunctions);
+ // DEC is registered as ttStringFunction because it takes a string argument
  RegisterKeyword(kEXP,   ttMathFunction, 'Return value of e raised to the power x',                  kcMathFunctions);
  RegisterKeyword(kINT,   ttMathFunction, 'Convert float number to integer',                          kcMathFunctions);
  RegisterKeyword(kLN,    ttMathFunction, 'Return natural log of x',                                  kcMathFunctions);
  RegisterKeyword(kLOG,   ttMathFunction, 'Return natural log of x',                                  kcMathFunctions);
  RegisterKeyword(kLOG10, ttMathFunction, 'Return base 10 log of x',                                  kcMathFunctions);
  RegisterKeyword(kLOG2,  ttMathFunction, 'Return base 2 log of x',                                   kcMathFunctions);
+ RegisterKeyword(kLOGN,  ttMathFunction, 'Return base n log of x: LOGN(base, x)',                    kcMathFunctions);
  // MOD is now registered as binary operator (ttOpMod), not as function
  RegisterKeyword(kRND,   ttMathFunction, 'Return a random number from 0 (included) to 1 (excluded)', kcMathFunctions);
  RegisterKeyword(kSGN,   ttMathFunction, 'Return sign of argument',                                  kcMathFunctions);
@@ -1769,13 +1782,13 @@ begin
  RegisterKeyword(kST,  ttSpecialVariable, 'Get I/O status byte',           kcReservedVariables);
  RegisterKeyword(kTI,  ttSpecialVariable, 'Get time elapse from power on', kcReservedVariables);
  RegisterKeyword(kTIS, ttSpecialVariable, 'Get/set 24h clock',             kcReservedVariables);
+ RegisterKeyword(kDTS, ttSpecialVariable, 'Get current date YYYYMMDD',     kcReservedVariables);
 
   // === ERROR HANDLING (COMMANDS AND FUNCTIONS) ===
   // commands
   RegisterKeyword(kRESUME, ttErrorHandlingCommand,  'Resume from the given line after error', kcErrorHandling);
   RegisterKeyword(kTRAP,   ttErrorHandlingCommand,  'Detect error and go to the given line',  kcErrorHandling);
-  // functions
-  RegisterKeyword(kERRS,   ttErrorHandlingFunction, 'Print error message by id',              kcErrorHandling);
+  // functions - ERR$ is registered in STRING FUNCTIONS section
 
   // === DEBUG ===
   RegisterKeyword(kHELP,  ttDebugCommand,     'Highlight the line where the error occurred', kcDebug);
@@ -1790,6 +1803,7 @@ begin
   // === PROGRAM EDITING COMMANDS ===
   RegisterKeyword(kAUTO,     ttProgramEditing, 'Auto line numbering',                   kcProgramEditing);
   RegisterKeyword(kDELETE,   ttProgramEditing, 'Delete lines of a BASIC program',       kcProgramEditing);
+  RegisterKeyword(kEDIT,     ttProgramEditing, 'Edit a single program line',            kcProgramEditing);
   RegisterKeyword(kLIST,     ttProgramEditing, 'List the BASIC program lines',          kcProgramEditing);
   RegisterKeyword(kNEW,      ttProgramEditing, 'Erase program and clear all variables', kcProgramEditing);
   RegisterKeyword(kRENUMBER, ttProgramEditing, 'Renumber lines of the BASIC program',   kcProgramEditing);

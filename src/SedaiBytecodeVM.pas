@@ -30,12 +30,38 @@ unit SedaiBytecodeVM;
 interface
 
 uses
-  Classes, SysUtils, Math, Variants,
+  Classes, SysUtils, Math, Variants, StrUtils,
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
-  SedaiConsoleBehavior
-  {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF};
+  SedaiConsoleBehavior, SedaiDebugger, SedaiExecutorErrors
+  {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
+  {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioFoundation, SedaiAudioTypes{$ENDIF};
 
 type
+  { Forward declaration }
+  TBytecodeVM = class;
+
+  { Callback for file commands (LOAD, SAVE) executed from program }
+  TFileCommandEvent = procedure(Sender: TBytecodeVM; const Command, Filename: string;
+                                var Handled: Boolean) of object;
+
+  { Callback for disk file I/O commands (DOPEN, DCLOSE, etc.)
+    Handle: File handle (1-255 for numbers, or string identifier like "MYFILE")
+    Filename: Path to file (for DOPEN)
+    Mode: Access mode string ("R", "W", "RW", "A") with optional sharing ("R,EXCLUSIVE", etc.)
+    ErrorCode: 0 on success, non-zero on error }
+  TDiskFileEvent = procedure(Sender: TBytecodeVM; const Command: string;
+                             Handle: Integer; const HandleName, Filename, Mode: string;
+                             var ErrorCode: Integer) of object;
+
+  { Callback for file data I/O commands (GET#, INPUT#, PRINT#, CMD)
+    Handle: File handle number
+    Command: 'GET#', 'INPUT#', 'PRINT#', 'CMD'
+    Data: For PRINT#/CMD - data to write; For GET#/INPUT# - receives data read
+    ErrorCode: 0 on success, non-zero on error }
+  TFileDataEvent = procedure(Sender: TBytecodeVM; const Command: string;
+                             Handle: Integer; var Data: string;
+                             var ErrorCode: Integer) of object;
+
   { Array storage structure }
   TArrayStorage = record
     ElementType: Byte;        // 0=Int, 1=Float, 2=String (maps to TSSARegisterType)
@@ -55,13 +81,17 @@ type
     FStringRegs: array of string;
     FTempIntRegs: array of Int64;
     FTempFloatRegs: array of Double;
-    FTempStringRegs: array of string;
+    FTempFStringRegs: array of string;
     FIntRegCount: Integer;       // Current size of int register arrays
     FFloatRegCount: Integer;     // Current size of float register arrays
     FStringRegCount: Integer;    // Current size of string register arrays
     FProgram: TBytecodeProgram;
     FPC: Integer;
     FRunning: Boolean;
+    FStopped: Boolean;        // True if stopped by STOP command (can CONT)
+    FStoppedPC: Integer;      // PC to resume from when CONT is called
+    FTraceActive: Boolean;    // True = trace mode on (TRON), outputs line numbers
+    FLastSourceLine: Integer; // Last source line executed (for trace output)
     FCallStack: array of Integer;
     FCallStackPtr: Integer;
     FOutputDevice: IOutputDevice;
@@ -69,8 +99,29 @@ type
     FConsoleBehavior: TConsoleBehavior;
     FOwnsConsoleBehavior: Boolean;
     FCursorCol: Integer;  // Track cursor column for TAB zones
+    // Time tracking for TI and TI$
+    FStartTicks: QWord;     // Milliseconds since system start when VM started
+    FTimeOffset: Int64;     // TI$ offset in milliseconds from real time
+    // Function key definitions (1-8)
+    FFunctionKeys: array[1..8] of string;
     FVarMap: TStringList;
     FArrays: array of TArrayStorage;
+    // DATA pool for DATA/READ/RESTORE statements
+    FDataPool: array of Variant;
+    FDataIndex: Integer;  // Current read position in DATA pool
+    // PUDEF format characters (filler, comma, decimal, dollar)
+    FPudefFiller: Char;
+    FPudefComma: Char;
+    FPudefDecimal: Char;
+    FPudefDollar: Char;
+    // File command callback (LOAD, SAVE from program)
+    FOnFileCommand: TFileCommandEvent;
+    // Disk file I/O callback (DOPEN, DCLOSE, etc.)
+    FOnDiskFile: TDiskFileEvent;
+    // File data I/O callback (GET#, INPUT#, PRINT#, CMD)
+    FOnFileData: TFileDataEvent;
+    // Current CMD file handle (0 = screen, >0 = redirected to file)
+    FCmdHandle: Integer;
     FSwapTempInt: Int64;  // Temp variable for ArraySwapInt superinstruction
     // Temp variables for ArrayReverseRange and ArrayShiftLeft
     FStartIdx, FEndIdx, FArrIdxTmp, FLoopIdx: Integer;
@@ -81,11 +132,53 @@ type
     {$IFDEF ENABLE_PROFILER}
     FProfiler: TProfiler;
     {$ENDIF}
+    // Debugger support (always available, but only used in DEBUG_MODE via RunDebug)
+    FDebugger: TSedaiDebugger;
+    // Error state for EL, ER, ERR$ variables
+    FLastErrorLine: Integer;      // EL: Last error line number
+    FLastErrorCode: Integer;      // ER: Last error code
+    FLastErrorMessage: string;    // ERR$: Last error message (variable form)
+    // TRAP/RESUME error handling state
+    FTrapLine: Integer;           // Line to jump to on error (0 = no trap)
+    FTrapPC: Integer;             // PC to jump to on error (resolved from FTrapLine)
+    FResumePC: Integer;           // PC to resume from after RESUME
+    FInErrorHandler: Boolean;     // True if currently in error handler
+    {$IFDEF WITH_SEDAI_AUDIO}
+    FAudioInitialized: Boolean;
+    FAudioTempo: Integer;        // Current tempo (0-255, default 8)
+    FAudioEnvelopes: array[0..9] of record  // 10 envelope slots
+      Attack, Decay, Sustain, Release: Single;
+      Waveform: Integer;
+      PulseWidth: Single;
+    end;
+    procedure ExecutePlayString(const MusicStr: string);
+    procedure CooperativeSleep(Milliseconds: Integer);
+    {$ENDIF}
     procedure ExecuteInstruction(const Instr: TBytecodeInstruction);
     procedure ExecuteSuperinstruction(const Instr: TBytecodeInstruction);
+    // Group-specific dispatch handlers
+    procedure ExecuteStringOp(const Instr: TBytecodeInstruction);
+    procedure ExecuteMathOp(const Instr: TBytecodeInstruction);
+    procedure ExecuteArrayOp(const Instr: TBytecodeInstruction);
+    procedure ExecuteIOOp(const Instr: TBytecodeInstruction);
+    procedure ExecuteSpecialVarOp(const Instr: TBytecodeInstruction);
+    procedure ExecuteGraphicsOp(const Instr: TBytecodeInstruction);
+    procedure ExecuteSoundOp(const Instr: TBytecodeInstruction);
+    procedure ExecuteSpriteOp(const Instr: TBytecodeInstruction);
+    procedure ExecuteFileIOOp(const Instr: TBytecodeInstruction);
+    // File management operations (executed directly in VM)
+    procedure ExecuteCopyFile(const Src, Dest: string; Overwrite: Boolean);
+    procedure ExecuteScratch(const Pattern: string; Force: Boolean);
+    procedure ExecuteRenameFile(const OldName, NewName: string);
+    procedure ExecuteConcat(const Src, Dest: string);
+    procedure ExecuteMkdir(const Path: string);
+    procedure ExecuteChdir(const Path: string);
+    procedure ExecuteMoveFile(const Src, Dest: string);
     procedure InitializeRegisters;
+    procedure ClearAllVariables;
     procedure EnsureRegisterCapacity(RegType: TSSARegisterType; MinIndex: Integer);
     procedure CheckFloatValid(RegIndex: Integer; const OpName: string);
+    function FormatUsingString(const FormatStr: string; Value: Double): string;
   public
     constructor Create;
     destructor Destroy; override;
@@ -95,9 +188,10 @@ type
     procedure SetConsoleBehavior(ABehavior: TConsoleBehavior; OwnsBehavior: Boolean = False);
     procedure ApplyPreset(Preset: TConsolePreset);
     function GetConsoleBehavior: TConsoleBehavior;
-    procedure Run;
-    procedure RunFast;  // Optimized execution loop - no profiler support
-    procedure RunSwitchedGoto;  // Switched goto dispatch - best branch prediction
+    procedure Run;       // Default execution - calls RunFast
+    procedure RunFast;   // Optimized execution loop - no profiler/debug support
+    procedure RunDebug;  // Debug execution loop - TRON trace + profiler support
+    // procedure RunSwitchedGoto;  // Disabled - replaced by template-based approach
     procedure Step;
     procedure Reset;
     {$IFDEF ENABLE_INSTRUCTION_COUNTING}
@@ -110,11 +204,30 @@ type
     {$ENDIF}
     property PC: Integer read FPC;
     property Running: Boolean read FRunning;
+    property Stopped: Boolean read FStopped;  // True if program was stopped by STOP
+    procedure Continue;  // Resume execution after STOP (CONT command)
+    // Debugger support
+    procedure SetDebugger(ADebugger: TSedaiDebugger);
+    property Debugger: TSedaiDebugger read FDebugger write FDebugger;
+    property OnFileCommand: TFileCommandEvent read FOnFileCommand write FOnFileCommand;
+    property OnDiskFile: TDiskFileEvent read FOnDiskFile write FOnDiskFile;
+    property OnFileData: TFileDataEvent read FOnFileData write FOnFileData;
+    property CmdHandle: Integer read FCmdHandle;  // Current CMD output redirect handle
+    // Error state for EL, ER, ERR$ system variables
+    procedure SetErrorState(ALine, ACode: Integer; const AMessage: string);
+    procedure ClearErrorState;
+    property LastErrorLine: Integer read FLastErrorLine;
+    property LastErrorCode: Integer read FLastErrorCode;
+    property LastErrorMessage: string read FLastErrorMessage;
   end;
 
 implementation
 
 constructor TBytecodeVM.Create;
+{$IFDEF WITH_SEDAI_AUDIO}
+var
+  i: Integer;
+{$ENDIF}
 begin
   inherited Create;
   FProgram := nil;
@@ -122,6 +235,9 @@ begin
   FRunning := False;
   FCallStackPtr := 0;
   FCursorCol := 0;
+  // Initialize time tracking
+  FStartTicks := GetTickCount64;
+  FTimeOffset := 0;
   {$IFDEF ENABLE_INSTRUCTION_COUNTING}
   FInstructionsExecuted := 0;
   {$ENDIF}
@@ -131,11 +247,41 @@ begin
   // Create default console behavior (Commodore 64 style)
   FConsoleBehavior := TConsolePresets.CreateCommodore64;
   FOwnsConsoleBehavior := True;
+  // Initialize CMD handle (0 = output to screen)
+  FCmdHandle := 0;
+  // Initialize error state for EL, ER, ERR$
+  FLastErrorLine := 0;
+  FLastErrorCode := 0;
+  FLastErrorMessage := '';
+  // Initialize TRAP/RESUME state
+  FTrapLine := 0;
+  FTrapPC := -1;
+  FResumePC := -1;
+  FInErrorHandler := False;
   InitializeRegisters;
+  {$IFDEF WITH_SEDAI_AUDIO}
+  // Initialize audio subsystem
+  FAudioInitialized := InitAudio(16);  // 16 voices for BASIC programs
+  FAudioTempo := 8;  // Default tempo (C128 default)
+  // Initialize default envelopes
+  for i := 0 to 9 do
+  begin
+    FAudioEnvelopes[i].Attack := 0.01;
+    FAudioEnvelopes[i].Decay := 0.1;
+    FAudioEnvelopes[i].Sustain := 0.7;
+    FAudioEnvelopes[i].Release := 0.3;
+    FAudioEnvelopes[i].Waveform := 2;  // Sawtooth default
+    FAudioEnvelopes[i].PulseWidth := 0.5;
+  end;
+  {$ENDIF}
 end;
 
 destructor TBytecodeVM.Destroy;
 begin
+  {$IFDEF WITH_SEDAI_AUDIO}
+  if FAudioInitialized then
+    ShutdownAudio;
+  {$ENDIF}
   if FOwnsConsoleBehavior and Assigned(FConsoleBehavior) then
     FConsoleBehavior.Free;
   FVarMap.Free;
@@ -155,7 +301,7 @@ begin
   SetLength(FStringRegs, FStringRegCount);
   SetLength(FTempIntRegs, FIntRegCount);
   SetLength(FTempFloatRegs, FFloatRegCount);
-  SetLength(FTempStringRegs, FStringRegCount);
+  SetLength(FTempFStringRegs, FStringRegCount);
 
   for i := 0 to FIntRegCount - 1 do
   begin
@@ -172,9 +318,306 @@ begin
   for i := 0 to FStringRegCount - 1 do
   begin
     FStringRegs[i] := '';
-    FTempStringRegs[i] := '';
+    FTempFStringRegs[i] := '';
   end;
 end;
+
+procedure TBytecodeVM.ClearAllVariables;
+var i: Integer;
+begin
+  // Clear all registers (reset to default values)
+  for i := 0 to FIntRegCount - 1 do
+    FIntRegs[i] := 0;
+  for i := 0 to FFloatRegCount - 1 do
+    FFloatRegs[i] := 0.0;
+  for i := 0 to FStringRegCount - 1 do
+    FStringRegs[i] := '';
+  // Clear all arrays
+  for i := 0 to High(FArrays) do
+  begin
+    SetLength(FArrays[i].IntData, 0);
+    SetLength(FArrays[i].FloatData, 0);
+    SetLength(FArrays[i].StringData, 0);
+    FArrays[i].TotalSize := 0;
+  end;
+  SetLength(FArrays, 0);
+end;
+
+function TBytecodeVM.FormatUsingString(const FormatStr: string; Value: Double): string;
+var
+  i, HashCount, DecimalPos, CommaPos: Integer;
+  FloatDollar: Boolean;
+  IntPart, DecPart: Integer;
+  FormattedValue: string;
+begin
+  // Parse format string to extract format parameters
+  // Format: "#$######.##" where # = digit placeholder
+  HashCount := 0;
+  DecimalPos := 0;
+  CommaPos := 0;
+  FloatDollar := False;
+
+  for i := 1 to Length(FormatStr) do
+  begin
+    if FormatStr[i] = '#' then
+      Inc(HashCount)
+    else if (FormatStr[i] = '.') or (FormatStr[i] = FPudefDecimal) then
+    begin
+      if DecimalPos = 0 then DecimalPos := HashCount;
+    end
+    else if (FormatStr[i] = ',') or (FormatStr[i] = FPudefComma) then
+      CommaPos := HashCount
+    else if (FormatStr[i] = '$') or (FormatStr[i] = FPudefDollar) then
+      FloatDollar := (i > 1) and (FormatStr[i-1] = '#');
+  end;
+
+  // Calculate decimal places
+  DecPart := HashCount - DecimalPos;
+  if DecimalPos = 0 then
+    DecPart := 0;
+  IntPart := HashCount - DecPart;
+
+  // Format the value
+  if DecPart > 0 then
+    FormattedValue := Format('%*.*f', [HashCount + 1, DecPart, Value])
+  else
+    FormattedValue := Format('%*d', [IntPart, Trunc(Value)]);
+
+  // Replace decimal and comma characters based on PUDEF
+  if FPudefDecimal <> '.' then
+    FormattedValue := StringReplace(FormattedValue, '.', FPudefDecimal, [rfReplaceAll]);
+
+  // Add floating dollar sign if requested
+  if FloatDollar then
+    FormattedValue := FPudefDollar + FormattedValue;
+
+  Result := FormattedValue;
+end;
+
+{$IFDEF WITH_SEDAI_AUDIO}
+{ Cooperative sleep that processes SDL2 events to prevent "not responding" }
+procedure TBytecodeVM.CooperativeSleep(Milliseconds: Integer);
+const
+  SLICE_MS = 16;  // Process events every ~16ms (60 FPS)
+var
+  Remaining, SleepTime: Integer;
+begin
+  Remaining := Milliseconds;
+  while Remaining > 0 do
+  begin
+    // Determine sleep slice
+    if Remaining > SLICE_MS then
+      SleepTime := SLICE_MS
+    else
+      SleepTime := Remaining;
+
+    // Sleep for this slice
+    Sleep(SleepTime);
+    Dec(Remaining, SleepTime);
+
+    // Process SDL2 events to keep window responsive
+    if Assigned(FInputDevice) then
+      FInputDevice.ProcessEvents;
+
+    // Update display
+    if Assigned(FOutputDevice) then
+      FOutputDevice.Present;
+  end;
+end;
+
+procedure TBytecodeVM.ExecutePlayString(const MusicStr: string);
+{ Parse and execute C128 BASIC PLAY music string
+  Control characters:
+    Vn = Voice (1-3)
+    On = Octave (0-6, default 4)
+    Tn = Tune envelope (0-9)
+    Un = Volume (0-9, maps to 0-15)
+    Xn = Filter (0=off, 1=on)
+  Duration prefixes:
+    W = Whole, H = Half, Q = Quarter, I = Eighth, S = Sixteenth
+  Notes: C D E F G A B
+  Modifiers: # = sharp, $ = flat, . = dotted
+  Special: R = rest, M = wait for voices to finish
+}
+const
+  // Note frequencies for octave 4 (A4 = 440 Hz)
+  NoteFreqBase: array[0..11] of Single = (
+    261.63,  // C4
+    277.18,  // C#4
+    293.66,  // D4
+    311.13,  // D#4
+    329.63,  // E4
+    349.23,  // F4
+    369.99,  // F#4
+    392.00,  // G4
+    415.30,  // G#4
+    440.00,  // A4
+    466.16,  // A#4
+    493.88   // B4
+  );
+var
+  Pos, Len: Integer;
+  Ch: Char;
+  Voice, Octave, Envelope, Volume: Integer;
+  FilterOn: Boolean;
+  Duration: Integer;  // in jiffies (1/60 sec)
+  NoteIndex: Integer;
+  Freq: Single;
+  Sharp, Flat, Dotted: Boolean;
+  Preset: string;
+
+  function ParseNumber: Integer;
+  var
+    NumStr: string;
+  begin
+    NumStr := '';
+    while (Pos <= Len) and (MusicStr[Pos] in ['0'..'9']) do
+    begin
+      NumStr := NumStr + MusicStr[Pos];
+      Inc(Pos);
+    end;
+    if NumStr = '' then
+      Result := 0
+    else
+      Result := StrToIntDef(NumStr, 0);
+  end;
+
+  function GetWaveformPreset(WaveIdx: Integer): string;
+  begin
+    case WaveIdx of
+      0: Result := 'triangle';
+      1: Result := 'saw';
+      2: Result := 'square';
+      3: Result := 'sine';  // noise not directly available, use sine
+    else
+      Result := 'saw';
+    end;
+  end;
+
+begin
+  if MusicStr = '' then Exit;
+
+  // Defaults
+  Voice := 1;
+  Octave := 4;
+  Envelope := 0;
+  Volume := 9;
+  FilterOn := False;
+  Duration := 15;  // Quarter note default at tempo 8
+
+  Pos := 1;
+  Len := Length(MusicStr);
+
+  while Pos <= Len do
+  begin
+    Ch := UpCase(MusicStr[Pos]);
+    Inc(Pos);
+
+    case Ch of
+      ' ': ; // Skip spaces
+
+      'V': Voice := ParseNumber;  // Voice 1-3
+      'O': Octave := ParseNumber; // Octave 0-6
+      'T': Envelope := ParseNumber; // Envelope 0-9
+      'U': Volume := ParseNumber;   // Volume 0-9
+      'X': FilterOn := (ParseNumber = 1); // Filter on/off
+
+      // Duration prefixes
+      'W': Duration := 60;  // Whole note
+      'H': Duration := 30;  // Half note
+      'Q': Duration := 15;  // Quarter note
+      'I': Duration := 8;   // Eighth note
+      'S': Duration := 4;   // Sixteenth note
+
+      // Notes C D E F G A B
+      'C', 'D', 'E', 'F', 'G', 'A', 'B':
+      begin
+        // Map note letter to index
+        case Ch of
+          'C': NoteIndex := 0;
+          'D': NoteIndex := 2;
+          'E': NoteIndex := 4;
+          'F': NoteIndex := 5;
+          'G': NoteIndex := 7;
+          'A': NoteIndex := 9;
+          'B': NoteIndex := 11;
+        else
+          NoteIndex := 0;
+        end;
+
+        // Check for modifiers (look ahead)
+        Sharp := False;
+        Flat := False;
+        Dotted := False;
+
+        // Check previous character for modifiers (C128 puts them before note)
+        // Actually in C128 syntax, modifiers come BEFORE the note
+        // But we already consumed the note, so check what's next
+        while (Pos <= Len) and (MusicStr[Pos] in ['#', '$', '.']) do
+        begin
+          case MusicStr[Pos] of
+            '#': Sharp := True;
+            '$': Flat := True;
+            '.': Dotted := True;
+          end;
+          Inc(Pos);
+        end;
+
+        // Apply sharp/flat
+        if Sharp then Inc(NoteIndex);
+        if Flat then Dec(NoteIndex);
+        if NoteIndex < 0 then NoteIndex := 0;
+        if NoteIndex > 11 then NoteIndex := 11;
+
+        // Calculate frequency with octave adjustment
+        Freq := NoteFreqBase[NoteIndex] * Power(2, Octave - 4);
+
+        // Apply dotted duration
+        if Dotted then
+          Duration := (Duration * 3) div 2;
+
+        // Get waveform preset from envelope
+        if (Envelope >= 0) and (Envelope <= 9) then
+          Preset := GetWaveformPreset(FAudioEnvelopes[Envelope].Waveform)
+        else
+          Preset := 'saw';
+
+        // Play the note
+        if (Voice >= 1) and (Voice <= 16) then
+        begin
+          // Set ADSR from envelope
+          SetVoiceADSR(Voice - 1,
+            FAudioEnvelopes[Envelope].Attack,
+            FAudioEnvelopes[Envelope].Decay,
+            FAudioEnvelopes[Envelope].Sustain,
+            FAudioEnvelopes[Envelope].Release);
+
+          // Play the note
+          PlayOnVoice(Voice - 1, Freq, Preset);
+
+          // Wait for note duration (convert jiffies to milliseconds: 1 jiffy = 1/60 sec ≈ 16.67ms)
+          // Use cooperative sleep to keep SDL2 window responsive
+          CooperativeSleep(Duration * 1000 div 60);
+
+          // Stop the note (trigger release phase)
+          NoteOff(Voice - 1);
+        end;
+      end;
+
+      'R': // Rest - wait without playing
+      begin
+        CooperativeSleep(Duration * 1000 div 60);
+      end;
+
+      'M': ; // Wait for voices - not implemented yet
+
+      '#': ; // Sharp modifier (handled with note)
+      '$': ; // Flat modifier (handled with note)
+      '.': ; // Dotted modifier (handled with note)
+    end;
+  end;
+end;
+{$ENDIF}
 
 procedure TBytecodeVM.EnsureRegisterCapacity(RegType: TSSARegisterType; MinIndex: Integer);
 var
@@ -250,12 +693,12 @@ begin
                                     [MinIndex, MAX_REGISTER_SLOTS - 1]);
 
         SetLength(FStringRegs, NewSize);
-        SetLength(FTempStringRegs, NewSize);
+        SetLength(FTempFStringRegs, NewSize);
 
         for i := OldSize to NewSize - 1 do
         begin
           FStringRegs[i] := '';
-          FTempStringRegs[i] := '';
+          FTempFStringRegs[i] := '';
         end;
 
         FStringRegCount := NewSize;
@@ -289,92 +732,92 @@ begin
   begin
     Instr := FProgram.GetInstruction(i);
 
-    // Handle superinstructions (opcode >= 110) separately
-    if Instr.OpCode >= 110 then
+    // Handle superinstructions (opcode >= bcGroupSuper) separately
+    if Instr.OpCode >= bcGroupSuper then
     begin
       case Instr.OpCode of
         // Fused compare-and-branch (Int) - use IntRegs for Src1, Src2
-        110..115:  // bcBranchEqInt..bcBranchGeInt
+        bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt:
         begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
         end;
         // Fused compare-and-branch (Float) - use FloatRegs for Src1, Src2
-        120..125:  // bcBranchEqFloat..bcBranchGeFloat
+        bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat:
         begin
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
           if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;
         end;
         // Fused arithmetic-to-dest (Int) - use IntRegs for Dest, Src1
-        130..132:  // bcAddIntTo..bcMulIntTo
+        bcAddIntTo, bcSubIntTo, bcMulIntTo:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
         // Fused arithmetic-to-dest (Float) - use FloatRegs for Dest, Src1
-        140..143:  // bcAddFloatTo..bcDivFloatTo
+        bcAddFloatTo, bcSubFloatTo, bcMulFloatTo, bcDivFloatTo:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
         end;
         // Fused constant arithmetic (Int) - use IntRegs for Dest, Src1
-        150..152:  // bcAddIntConst..bcMulIntConst
+        bcAddIntConst, bcSubIntConst, bcMulIntConst:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
         // Fused constant arithmetic (Float) - use FloatRegs for Dest, Src1
-        160..163:  // bcAddFloatConst..bcDivFloatConst
+        bcAddFloatConst, bcSubFloatConst, bcMulFloatConst, bcDivFloatConst:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
         end;
         // Fused compare-zero-and-branch (Int) - use IntRegs for Src1
-        170, 171:  // bcBranchEqZeroInt, bcBranchNeZeroInt
+        bcBranchEqZeroInt, bcBranchNeZeroInt:
         begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
         // Fused compare-zero-and-branch (Float) - use FloatRegs for Src1
-        180, 181:  // bcBranchEqZeroFloat, bcBranchNeZeroFloat
+        bcBranchEqZeroFloat, bcBranchNeZeroFloat:
         begin
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
         end;
         // Fused array-store-constant - use IntRegs for Src2 (index register)
-        190, 191, 192:  // bcArrayStoreIntConst, bcArrayStoreFloatConst, bcArrayStoreStringConst
+        bcArrayStoreIntConst, bcArrayStoreFloatConst, bcArrayStoreStringConst:
         begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
         end;
         // Fused loop increment-and-branch - use IntRegs for Dest, Src1, Src2
-        200, 201, 202, 203:  // bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt
+        bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
         end;
 
-        // NEW: FMA (Fused Multiply-Add) - use FloatRegs for Dest, Src1, Src2, Immediate
-        210, 211:  // bcMulAddFloat, bcMulSubFloat
+        // FMA (Fused Multiply-Add) - use FloatRegs for Dest, Src1, Src2, Immediate
+        bcMulAddFloat, bcMulSubFloat:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
           if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;
           if Instr.Immediate > MaxFloatReg then MaxFloatReg := Instr.Immediate;  // c register
         end;
-        212, 213:  // bcMulAddToFloat, bcMulSubToFloat
+        bcMulAddToFloat, bcMulSubToFloat:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
           if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;
         end;
 
-        // NEW: Array Load + Arithmetic - use FloatRegs for Dest, Immediate; IntRegs for Src2
-        220, 221:  // bcArrayLoadAddFloat, bcArrayLoadSubFloat
+        // Array Load + Arithmetic - use FloatRegs for Dest, Immediate; IntRegs for Src2
+        bcArrayLoadAddFloat, bcArrayLoadSubFloat:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;  // index register
           if Instr.Immediate > MaxFloatReg then MaxFloatReg := Instr.Immediate;  // acc register
         end;
-        222:  // bcArrayLoadDivAddFloat - Immediate encodes two registers
+        bcArrayLoadDivAddFloat:  // Immediate encodes two registers
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
@@ -382,16 +825,16 @@ begin
           if ((Instr.Immediate shr 16) and $FFFF) > MaxFloatReg then MaxFloatReg := (Instr.Immediate shr 16) and $FFFF;
         end;
 
-        // NEW: Square-Sum patterns - use FloatRegs for Dest, Src1, Src2
-        230, 231:  // bcSquareSumFloat, bcAddSquareFloat
+        // Square-Sum patterns - use FloatRegs for Dest, Src1, Src2
+        bcSquareSumFloat, bcAddSquareFloat:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
           if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;
         end;
 
-        // NEW: Mul-Mul - use FloatRegs for Dest, Src1, Src2, Immediate
-        240:  // bcMulMulFloat
+        // Mul-Mul - use FloatRegs for Dest, Src1, Src2, Immediate
+        bcMulMulFloat:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
@@ -399,16 +842,16 @@ begin
           if Instr.Immediate > MaxFloatReg then MaxFloatReg := Instr.Immediate;
         end;
 
-        // NEW: Add-Sqrt - use FloatRegs for Dest, Src1, Src2
-        241:  // bcAddSqrtFloat
+        // Add-Sqrt - use FloatRegs for Dest, Src1, Src2
+        bcAddSqrtFloat:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
           if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;
         end;
 
-        // NEW: Array Load + Branch - use IntRegs for Src2
-        250, 251:  // bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ
+        // Array Load + Branch - use IntRegs for Src2
+        bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ:
         begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;  // index register
         end;
@@ -421,7 +864,7 @@ begin
         // Int dest, int sources
         bcLoadConstInt, bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
         bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
-        bcLogicalAnd, bcLogicalOr, bcLogicalNot,
+        bcLogicalAnd, bcLogicalOr, bcLogicalXor, bcLogicalNot,
         bcInputInt:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
@@ -632,6 +1075,14 @@ begin
   {$ENDIF}
   InitializeRegisters;
   FVarMap.Clear;
+  // Reset DATA pool
+  SetLength(FDataPool, 0);
+  FDataIndex := 0;
+  // Reset PUDEF to defaults
+  FPudefFiller := ' ';
+  FPudefComma := ',';
+  FPudefDecimal := '.';
+  FPudefDollar := '$';
 end;
 
 {$IFDEF ENABLE_INSTRUCTION_COUNTING}
@@ -648,27 +1099,52 @@ begin
 end;
 {$ENDIF}
 
+procedure TBytecodeVM.SetDebugger(ADebugger: TSedaiDebugger);
+begin
+  FDebugger := ADebugger;
+end;
+
+procedure TBytecodeVM.SetErrorState(ALine, ACode: Integer; const AMessage: string);
+begin
+  FLastErrorLine := ALine;
+  FLastErrorCode := ACode;
+  FLastErrorMessage := AMessage;
+end;
+
+procedure TBytecodeVM.ClearErrorState;
+begin
+  FLastErrorLine := 0;
+  FLastErrorCode := 0;
+  FLastErrorMessage := '';
+end;
+
 procedure TBytecodeVM.ExecuteInstruction(const Instr: TBytecodeInstruction);
 var
-  Op: TBytecodeOp;
-  InputStr, PrintStr: string;
-  InputVal: Double;
-  ArrayIdx, LinearIdx, i, j, ProdDims: Integer;
-  NextTabCol, TabIdx: Integer;
-  DrawMode: Integer;
-  ArrInfo: TSSAArrayInfo;
-  SleepMs: Integer;  // For SLEEP command
+  Group: Word;
+  SleepMs: Integer;
+  KeyNum, KeyIdx: Integer;
 begin
-  // Handle superinstructions FIRST (opcode >= 110) to avoid enum range issues
-  // Converting out-of-range values to TBytecodeOp causes undefined behavior!
-  if Instr.OpCode >= 110 then
-  begin
-    ExecuteSuperinstruction(Instr);
-    Exit;
+  // Two-level dispatch: extract group from high byte
+  Group := Instr.OpCode shr 8;
+
+  case Group of
+    0: ; // Core VM - fall through to inline dispatch below for performance
+    1: begin ExecuteStringOp(Instr); Exit; end;
+    2: begin ExecuteMathOp(Instr); Exit; end;
+    3: begin ExecuteArrayOp(Instr); Exit; end;
+    4: begin ExecuteIOOp(Instr); Exit; end;
+    5: begin ExecuteSpecialVarOp(Instr); Exit; end;
+    6: begin ExecuteFileIOOp(Instr); Exit; end;
+    7: begin ExecuteSpriteOp(Instr); Exit; end;
+    10: begin ExecuteGraphicsOp(Instr); Exit; end;
+    11: begin ExecuteSoundOp(Instr); Exit; end;
+    200..255: begin ExecuteSuperinstruction(Instr); Exit; end;
+  else
+    raise Exception.CreateFmt('Unknown opcode group %d at PC=%d', [Group, FPC]);
   end;
 
-  Op := TBytecodeOp(Instr.OpCode);
-  case Op of
+  // Group 0: Core VM operations - inline for performance
+  case Instr.OpCode of
     bcLoadConstInt: FIntRegs[Instr.Dest] := Instr.Immediate;
     bcLoadConstFloat: FFloatRegs[Instr.Dest] := Double(Pointer(@Instr.Immediate)^);
     bcLoadConstString:
@@ -767,117 +1243,1203 @@ begin
     bcCmpNeString: FIntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] <> FStringRegs[Instr.Src2]);
     bcCmpLtString: FIntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] < FStringRegs[Instr.Src2]);
     bcCmpGtString: FIntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] > FStringRegs[Instr.Src2]);
-    // Math functions
-    bcMathAbs: FFloatRegs[Instr.Dest] := Abs(FFloatRegs[Instr.Src1]);
-    bcMathSgn:
+    // Logical operators
+    bcLogicalAnd: FIntRegs[Instr.Dest] := FIntRegs[Instr.Src1] and FIntRegs[Instr.Src2];
+    bcLogicalOr: FIntRegs[Instr.Dest] := FIntRegs[Instr.Src1] or FIntRegs[Instr.Src2];
+    bcLogicalXor: FIntRegs[Instr.Dest] := FIntRegs[Instr.Src1] xor FIntRegs[Instr.Src2];
+    bcLogicalNot: FIntRegs[Instr.Dest] := Ord(FIntRegs[Instr.Src1] = 0);
+    // Control flow
+    bcJump: FPC := Instr.Immediate - 1;
+    bcJumpIfZero:
+      if FIntRegs[Instr.Src1] = 0 then FPC := Instr.Immediate - 1;
+    bcJumpIfNotZero:
+      if FIntRegs[Instr.Src1] <> 0 then FPC := Instr.Immediate - 1;
+    bcCall:
+      begin
+        FCallStack[FCallStackPtr] := FPC;
+        Inc(FCallStackPtr);
+        FPC := Instr.Immediate - 1;
+      end;
+    bcReturn:
+      if FCallStackPtr > 0 then
+      begin
+        Dec(FCallStackPtr);
+        FPC := FCallStack[FCallStackPtr];
+      end;
+    // System commands
+    bcEnd:
+      begin
+        FRunning := False;
+        FStopped := False;  // END clears stopped state
+      end;
+    bcStop:
+      begin
+        FRunning := False;
+        FStopped := True;             // Mark as stopped (can CONT)
+        FStoppedPC := FPC + 1;        // Save PC for resume (next instruction)
+        if Assigned(FOutputDevice) then
+        begin
+          FOutputDevice.Print('BREAK');
+          FOutputDevice.NewLine;
+        end;
+      end;
+    bcFast: if Assigned(FOutputDevice) then FOutputDevice.SetFastMode(True);
+    bcSlow: if Assigned(FOutputDevice) then FOutputDevice.SetFastMode(False);
+    bcSleep:
+      begin
+        if Instr.Immediate > 0 then
+          SleepMs := Instr.Immediate * 1000
+        else if Instr.Src1 < FFloatRegCount then
+          SleepMs := Trunc(FFloatRegs[Instr.Src1] * 1000)
+        else
+          SleepMs := 1000;
+        if SleepMs < 0 then SleepMs := 0;
+        if SleepMs > 65535000 then SleepMs := 65535000;
+        while (SleepMs > 0) and FRunning do
+        begin
+          if SleepMs > 50 then
+          begin
+            Sleep(50);
+            Dec(SleepMs, 50);
+          end
+          else
+          begin
+            Sleep(SleepMs);
+            SleepMs := 0;
+          end;
+          if Assigned(FInputDevice) then
+          begin
+            FInputDevice.ProcessEvents;
+            if FInputDevice.ShouldStop or FInputDevice.ShouldQuit then
+            begin
+              FRunning := False;
+              FInputDevice.ClearStopRequest;
+            end;
+          end;
+        end;
+      end;
+    bcKey:
+      begin
+        // KEY n, "text" - define function key
+        // KEY n - clear key definition
+        // KEY (-1) - list all keys
+        KeyNum := FIntRegs[Instr.Src1];
+        if KeyNum = -1 then
+        begin
+          // List all function key definitions
+          if Assigned(FOutputDevice) then
+          begin
+            for KeyIdx := 1 to 8 do
+            begin
+              FOutputDevice.Print('F' + IntToStr(KeyIdx) + ': "' + FFunctionKeys[KeyIdx] + '"');
+              FOutputDevice.NewLine;
+            end;
+          end;
+        end
+        else if (KeyNum >= 1) and (KeyNum <= 8) then
+        begin
+          // Define or clear function key
+          if Instr.Src2 < FStringRegCount then
+            FFunctionKeys[KeyNum] := FStringRegs[Instr.Src2]
+          else
+            FFunctionKeys[KeyNum] := '';  // Clear key
+        end;
+      end;
+    bcTron:
+      begin
+        // TRON - Enable trace mode
+        FTraceActive := True;
+        FLastSourceLine := 0;  // Reset last line
+      end;
+    bcTroff:
+      begin
+        // TROFF - Disable trace mode
+        FTraceActive := False;
+      end;
+    bcTrap:
+      begin
+        // TRAP linenum - Set error handler line
+        // Src1 = line number (0 to disable)
+        FTrapLine := FIntRegs[Instr.Src1];
+        if FTrapLine > 0 then
+        begin
+          // Resolve line number to PC
+          // For now, we store the line and resolve at error time
+          // using the program's line number map
+          FTrapPC := -1;  // Will be resolved when error occurs
+        end
+        else
+        begin
+          // Disable trap handler
+          FTrapLine := 0;
+          FTrapPC := -1;
+        end;
+      end;
+    bcResume:
+      begin
+        // RESUME - Resume at error line
+        if FInErrorHandler and (FResumePC >= 0) then
+        begin
+          FPC := FResumePC;
+          FInErrorHandler := False;
+          Exit;  // Don't increment PC
+        end;
+        // If not in error handler, just continue
+      end;
+    bcResumeNext:
+      begin
+        // RESUME NEXT - Resume at next instruction after error
+        if FInErrorHandler and (FResumePC >= 0) then
+        begin
+          // Find the next instruction after the error point
+          // For now, we just continue from current PC
+          FInErrorHandler := False;
+        end;
+        // If not in error handler, just continue
+      end;
+    bcNop: ;
+    bcClear: ClearAllVariables;
+    // DATA/READ/RESTORE
+    bcDataAdd:
+      begin
+        // Add value to DATA pool
+        // Src1 = type (0=Int, 1=Float, 2=String)
+        // Immediate = value (int/float bits, or string pool index)
+        SetLength(FDataPool, Length(FDataPool) + 1);
+        case TSSARegisterType(Instr.Src1) of
+          srtInt: FDataPool[High(FDataPool)] := Instr.Immediate;
+          srtFloat: FDataPool[High(FDataPool)] := Double(Pointer(@Instr.Immediate)^);
+          srtString: FDataPool[High(FDataPool)] := FProgram.StringConstants[Instr.Immediate];
+        end;
+      end;
+    bcDataReadInt:
+      begin
+        // Read next DATA value into int register
+        if FDataIndex < Length(FDataPool) then
+        begin
+          FIntRegs[Instr.Dest] := Int64(FDataPool[FDataIndex]);
+          Inc(FDataIndex);
+        end
+        else
+          raise Exception.Create('?OUT OF DATA ERROR');
+      end;
+    bcDataReadFloat:
+      begin
+        // Read next DATA value into float register
+        if FDataIndex < Length(FDataPool) then
+        begin
+          FFloatRegs[Instr.Dest] := Double(FDataPool[FDataIndex]);
+          Inc(FDataIndex);
+        end
+        else
+          raise Exception.Create('?OUT OF DATA ERROR');
+      end;
+    bcDataReadString:
+      begin
+        // Read next DATA value into string register
+        if FDataIndex < Length(FDataPool) then
+        begin
+          FStringRegs[Instr.Dest] := string(FDataPool[FDataIndex]);
+          Inc(FDataIndex);
+        end
+        else
+          raise Exception.Create('?OUT OF DATA ERROR');
+      end;
+    bcDataRestore:
+      begin
+        // Reset DATA pointer
+        // Immediate = line number (0 = beginning, ignored for now - line-specific restore not implemented)
+        FDataIndex := 0;
+      end;
+    // Input commands
+    bcGet:
+      begin
+        // GET A$ - non-blocking character input
+        // Returns empty string if no key pressed
+        if Assigned(FInputDevice) then
+        begin
+          FInputDevice.ProcessEvents;
+          FStringRegs[Instr.Dest] := FInputDevice.GetLastChar;
+        end
+        else
+          FStringRegs[Instr.Dest] := '';
+      end;
+    bcGetkey:
+      begin
+        // GETKEY A$ - blocking character input (waits for keypress)
+        if Assigned(FInputDevice) then
+        begin
+          repeat
+            FInputDevice.ProcessEvents;
+            if FInputDevice.ShouldStop or FInputDevice.ShouldQuit then
+            begin
+              FRunning := False;
+              FInputDevice.ClearStopRequest;
+              Break;
+            end;
+          until FInputDevice.HasChar;
+          FStringRegs[Instr.Dest] := FInputDevice.GetLastChar;
+        end
+        else
+          FStringRegs[Instr.Dest] := '';
+      end;
+    // Formatted output
+    bcPrintUsing:
+      begin
+        // PRINT USING format$; value
+        // Src1 = format string register, Src2 = value register
+        if Assigned(FOutputDevice) then
+        begin
+          // Apply format string to value
+          // This is a simplified implementation - full PRINT USING is more complex
+          FOutputDevice.Print(FormatUsingString(FStringRegs[Instr.Src1], FFloatRegs[Instr.Src2]));
+        end;
+      end;
+    bcPudef:
+      begin
+        // PUDEF " ,.$" - redefine PRINT USING format characters
+        // Immediate = string constant index, or Src1 = string register
+        if Instr.Src1 <> 0 then
+        begin
+          // String from register
+          if Length(FStringRegs[Instr.Src1]) >= 1 then
+            FPudefFiller := FStringRegs[Instr.Src1][1];
+          if Length(FStringRegs[Instr.Src1]) >= 2 then
+            FPudefComma := FStringRegs[Instr.Src1][2];
+          if Length(FStringRegs[Instr.Src1]) >= 3 then
+            FPudefDecimal := FStringRegs[Instr.Src1][3];
+          if Length(FStringRegs[Instr.Src1]) >= 4 then
+            FPudefDollar := FStringRegs[Instr.Src1][4];
+        end
+        else
+        begin
+          // String from constant pool
+          if (Instr.Immediate >= 0) and (Instr.Immediate < FProgram.StringConstants.Count) then
+          begin
+            if Length(FProgram.StringConstants[Instr.Immediate]) >= 1 then
+              FPudefFiller := FProgram.StringConstants[Instr.Immediate][1];
+            if Length(FProgram.StringConstants[Instr.Immediate]) >= 2 then
+              FPudefComma := FProgram.StringConstants[Instr.Immediate][2];
+            if Length(FProgram.StringConstants[Instr.Immediate]) >= 3 then
+              FPudefDecimal := FProgram.StringConstants[Instr.Immediate][3];
+            if Length(FProgram.StringConstants[Instr.Immediate]) >= 4 then
+              FPudefDollar := FProgram.StringConstants[Instr.Immediate][4];
+          end;
+        end;
+      end;
+    bcChar:
+      begin
+        // CHAR mode, col, row, "text" [,reverse]
+        // Src1 = mode, Src2 = col, Dest = row (repurposed)
+        // Immediate low 16 bits = text register, high 16 bits = reverse register
+        if Assigned(FOutputDevice) then
+        begin
+          // Output text at specified position
+          // This is a simplified implementation
+          FOutputDevice.SetCursor(Integer(FIntRegs[Instr.Src2]), Integer(FIntRegs[Instr.Dest]));
+          FOutputDevice.Print(FStringRegs[Instr.Immediate and $FFFF]);
+        end;
+      end;
+    bcLoad:
+      begin
+        // LOAD "filename" - Load and run program from file
+        // Src1 = string register with filename
+        if Assigned(FOnFileCommand) then
+        begin
+          FRunning := False;  // Stop current execution
+          FOnFileCommand(Self, 'LOAD', FStringRegs[Instr.Src1], FRunning);
+          // If Handled is set to True, execution continues; otherwise it stops
+        end
+        else
+          raise Exception.Create('LOAD command not supported: no handler assigned');
+      end;
+    bcSave:
+      begin
+        // SAVE "filename" - Save program to file
+        // Src1 = string register with filename
+        if Assigned(FOnFileCommand) then
+        begin
+          FRunning := True;  // Default: continue after SAVE
+          FOnFileCommand(Self, 'SAVE', FStringRegs[Instr.Src1], FRunning);
+        end
+        else
+          raise Exception.Create('SAVE command not supported: no handler assigned');
+      end;
+    bcVerify:
+      begin
+        // VERIFY "filename" - Verify program against file
+        if Assigned(FOnFileCommand) then
+        begin
+          FRunning := True;
+          FOnFileCommand(Self, 'VERIFY', FStringRegs[Instr.Src1], FRunning);
+        end
+        else
+          raise Exception.Create('VERIFY command not supported: no handler assigned');
+      end;
+    bcBload:
+      begin
+        // BLOAD "filename" - Load bytecode from file
+        if Assigned(FOnFileCommand) then
+        begin
+          FRunning := False;
+          FOnFileCommand(Self, 'BLOAD', FStringRegs[Instr.Src1], FRunning);
+        end
+        else
+          raise Exception.Create('BLOAD command not supported: no handler assigned');
+      end;
+    bcBsave:
+      begin
+        // BSAVE "filename" - Save bytecode to file
+        if Assigned(FOnFileCommand) then
+        begin
+          FRunning := True;
+          FOnFileCommand(Self, 'BSAVE', FStringRegs[Instr.Src1], FRunning);
+        end
+        else
+          raise Exception.Create('BSAVE command not supported: no handler assigned');
+      end;
+    bcBoot:
+      begin
+        // BOOT "filename" - Load and run bytecode
+        if Assigned(FOnFileCommand) then
+        begin
+          FRunning := False;
+          FOnFileCommand(Self, 'BOOT', FStringRegs[Instr.Src1], FRunning);
+        end
+        else
+          raise Exception.Create('BOOT command not supported: no handler assigned');
+      end;
+    bcRun:
+      begin
+        // RUN [linenum] - Run program
+        if Assigned(FOnFileCommand) then
+        begin
+          FRunning := False;
+          FOnFileCommand(Self, 'RUN', IntToStr(Instr.Immediate), FRunning);
+        end
+        else
+          raise Exception.Create('RUN command not supported: no handler assigned');
+      end;
+    bcList:
+      begin
+        // LIST [start-end] - List program
+        if Assigned(FOnFileCommand) then
+        begin
+          FRunning := True;
+          FOnFileCommand(Self, 'LIST', FStringRegs[Instr.Src1], FRunning);
+        end
+        else
+          raise Exception.Create('LIST command not supported: no handler assigned');
+      end;
+    bcNew:
+      begin
+        // NEW - Clear program
+        if Assigned(FOnFileCommand) then
+        begin
+          FRunning := False;
+          FOnFileCommand(Self, 'NEW', '', FRunning);
+        end
+        else
+          raise Exception.Create('NEW command not supported: no handler assigned');
+      end;
+    bcDelete:
+      begin
+        // DELETE [start[-end]] - Delete program lines
+        // Src1 = start line, Src2 = end line (same as start for single line)
+        // Special values: start=0 means from beginning, end=-1 means to end
+        if Assigned(FOnFileCommand) then
+        begin
+          FRunning := True;
+          // Format: "start-end" for range, "line" for single line
+          if FIntRegs[Instr.Src1] = FIntRegs[Instr.Src2] then
+            FOnFileCommand(Self, 'DELETE', IntToStr(FIntRegs[Instr.Src1]), FRunning)
+          else
+            FOnFileCommand(Self, 'DELETE', IntToStr(FIntRegs[Instr.Src1]) + '-' + IntToStr(FIntRegs[Instr.Src2]), FRunning);
+        end
+        else
+          raise Exception.Create('DELETE command not supported: no handler assigned');
+      end;
+    bcRenumber:
+      begin
+        // RENUMBER [new[,inc[,old]]] - Renumber program lines
+        // Src1 = new start line (default 10)
+        // Src2 = increment (default 10)
+        // Immediate = old start line (default 0 = first line)
+        if Assigned(FOnFileCommand) then
+        begin
+          FRunning := True;
+          // Format: "new,inc,old"
+          FOnFileCommand(Self, 'RENUMBER',
+            IntToStr(FIntRegs[Instr.Src1]) + ',' +
+            IntToStr(FIntRegs[Instr.Src2]) + ',' +
+            IntToStr(FIntRegs[Instr.Immediate and $FFFF]), FRunning);
+        end
+        else
+          raise Exception.Create('RENUMBER command not supported: no handler assigned');
+      end;
+    bcCatalog:
+      begin
+        // CATALOG/DIR - List directory (requires console callback)
+        if Assigned(FOnFileCommand) then
+        begin
+          FRunning := True;
+          FOnFileCommand(Self, 'CATALOG', FStringRegs[Instr.Src1], FRunning);
+        end
+        else
+          raise Exception.Create('CATALOG command not supported: no handler assigned');
+      end;
+
+    // === FILE MANAGEMENT COMMANDS (executed directly in VM) ===
+    bcCopyFile:
+      begin
+        // COPY "src", "dest" [, overwrite]
+        // Src1 = source path, Src2 = dest path, Dest = overwrite flag (int reg)
+        ExecuteCopyFile(FStringRegs[Instr.Src1], FStringRegs[Instr.Src2],
+                       FIntRegs[Instr.Dest] <> 0);
+      end;
+
+    bcScratch:
+      begin
+        // SCRATCH "pattern" [, force]
+        // Src1 = pattern, Src2 = force flag (int reg)
+        ExecuteScratch(FStringRegs[Instr.Src1], FIntRegs[Instr.Src2] <> 0);
+      end;
+
+    bcRenameFile:
+      begin
+        // RENAME "old", "new"
+        // Src1 = old name, Src2 = new name
+        ExecuteRenameFile(FStringRegs[Instr.Src1], FStringRegs[Instr.Src2]);
+      end;
+
+    bcConcat:
+      begin
+        // CONCAT "src", "dest"
+        // Src1 = source, Src2 = dest (append src to dest)
+        ExecuteConcat(FStringRegs[Instr.Src1], FStringRegs[Instr.Src2]);
+      end;
+
+    bcMkdir:
+      begin
+        // MKDIR "path"
+        // Src1 = path
+        ExecuteMkdir(FStringRegs[Instr.Src1]);
+      end;
+
+    bcChdir:
+      begin
+        // CHDIR "path"
+        // Src1 = path
+        ExecuteChdir(FStringRegs[Instr.Src1]);
+      end;
+
+    bcMoveFile:
+      begin
+        // MOVE "src", "dest"
+        // Src1 = source, Src2 = dest
+        ExecuteMoveFile(FStringRegs[Instr.Src1], FStringRegs[Instr.Src2]);
+      end;
+
+  end; // case Op (standard bytecode)
+end;
+
+procedure TBytecodeVM.ExecuteSuperinstruction(const Instr: TBytecodeInstruction);
+var
+  SubOp: Word;
+begin
+  // Superinstructions use sub-opcode (low byte) for dispatch
+  // Full opcode is 0xC800 + SubOp (group 200)
+  SubOp := Instr.OpCode and $FF;
+
+  case SubOp of
+    // Fused compare-and-branch (Int) - sub-opcodes 0-5
+    0: // bcBranchEqInt: if (r[src1] == r[src2]) goto target
+      if FIntRegs[Instr.Src1] = FIntRegs[Instr.Src2] then
+        FPC := Instr.Immediate - 1;
+    1: // bcBranchNeInt
+      if FIntRegs[Instr.Src1] <> FIntRegs[Instr.Src2] then
+        FPC := Instr.Immediate - 1;
+    2: // bcBranchLtInt
+      if FIntRegs[Instr.Src1] < FIntRegs[Instr.Src2] then
+        FPC := Instr.Immediate - 1;
+    3: // bcBranchGtInt
+      if FIntRegs[Instr.Src1] > FIntRegs[Instr.Src2] then
+        FPC := Instr.Immediate - 1;
+    4: // bcBranchLeInt
+      if FIntRegs[Instr.Src1] <= FIntRegs[Instr.Src2] then
+        FPC := Instr.Immediate - 1;
+    5: // bcBranchGeInt
+      if FIntRegs[Instr.Src1] >= FIntRegs[Instr.Src2] then
+        FPC := Instr.Immediate - 1;
+
+    // Fused compare-and-branch (Float) - sub-opcodes 10-15
+    10: // bcBranchEqFloat
+      if FFloatRegs[Instr.Src1] = FFloatRegs[Instr.Src2] then
+        FPC := Instr.Immediate - 1;
+    11: // bcBranchNeFloat
+      if FFloatRegs[Instr.Src1] <> FFloatRegs[Instr.Src2] then
+        FPC := Instr.Immediate - 1;
+    12: // bcBranchLtFloat
+      if FFloatRegs[Instr.Src1] < FFloatRegs[Instr.Src2] then
+        FPC := Instr.Immediate - 1;
+    13: // bcBranchGtFloat
+      if FFloatRegs[Instr.Src1] > FFloatRegs[Instr.Src2] then
+        FPC := Instr.Immediate - 1;
+    14: // bcBranchLeFloat
+      if FFloatRegs[Instr.Src1] <= FFloatRegs[Instr.Src2] then
+        FPC := Instr.Immediate - 1;
+    15: // bcBranchGeFloat
+      if FFloatRegs[Instr.Src1] >= FFloatRegs[Instr.Src2] then
+        FPC := Instr.Immediate - 1;
+
+    // Fused arithmetic-to-dest (Int) - sub-opcodes 20-22
+    20: // bcAddIntTo: r[dest] += r[src1]
+      FIntRegs[Instr.Dest] := FIntRegs[Instr.Dest] + FIntRegs[Instr.Src1];
+    21: // bcSubIntTo: r[dest] -= r[src1]
+      FIntRegs[Instr.Dest] := FIntRegs[Instr.Dest] - FIntRegs[Instr.Src1];
+    22: // bcMulIntTo: r[dest] *= r[src1]
+      FIntRegs[Instr.Dest] := FIntRegs[Instr.Dest] * FIntRegs[Instr.Src1];
+
+    // Fused arithmetic-to-dest (Float) - sub-opcodes 30-33
+    30: // bcAddFloatTo: r[dest] += r[src1]
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Dest] + FFloatRegs[Instr.Src1];
+    31: // bcSubFloatTo: r[dest] -= r[src1]
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Dest] - FFloatRegs[Instr.Src1];
+    32: // bcMulFloatTo: r[dest] *= r[src1]
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Dest] * FFloatRegs[Instr.Src1];
+    33: // bcDivFloatTo: r[dest] /= r[src1]
+      if FFloatRegs[Instr.Src1] <> 0.0 then
+        FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Dest] / FFloatRegs[Instr.Src1]
+      else
+        raise Exception.Create('Division by zero');
+
+    // Fused constant arithmetic (Int) - sub-opcodes 40-42
+    40: // bcAddIntConst: r[dest] = r[src1] + immediate
+      FIntRegs[Instr.Dest] := FIntRegs[Instr.Src1] + Instr.Immediate;
+    41: // bcSubIntConst: r[dest] = r[src1] - immediate
+      FIntRegs[Instr.Dest] := FIntRegs[Instr.Src1] - Instr.Immediate;
+    42: // bcMulIntConst: r[dest] = r[src1] * immediate
+      FIntRegs[Instr.Dest] := FIntRegs[Instr.Src1] * Instr.Immediate;
+
+    // Fused constant arithmetic (Float) - sub-opcodes 50-53
+    50: // bcAddFloatConst
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] + Double(Pointer(@Instr.Immediate)^);
+    51: // bcSubFloatConst
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] - Double(Pointer(@Instr.Immediate)^);
+    52: // bcMulFloatConst
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] * Double(Pointer(@Instr.Immediate)^);
+    53: // bcDivFloatConst
+      if Double(Pointer(@Instr.Immediate)^) <> 0.0 then
+        FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] / Double(Pointer(@Instr.Immediate)^)
+      else
+        raise Exception.Create('Division by zero');
+
+    // Fused compare-zero-and-branch (Int) - sub-opcodes 60-61
+    60: // bcBranchEqZeroInt
+      if FIntRegs[Instr.Src1] = 0 then
+        FPC := Instr.Immediate - 1;
+    61: // bcBranchNeZeroInt
+      if FIntRegs[Instr.Src1] <> 0 then
+        FPC := Instr.Immediate - 1;
+
+    // Fused compare-zero-and-branch (Float) - sub-opcodes 70-71
+    70: // bcBranchEqZeroFloat
+      if FFloatRegs[Instr.Src1] = 0.0 then
+        FPC := Instr.Immediate - 1;
+    71: // bcBranchNeZeroFloat
+      if FFloatRegs[Instr.Src1] <> 0.0 then
+        FPC := Instr.Immediate - 1;
+
+    // Fused array-store-constant - sub-opcodes 80-82
+    80: // bcArrayStoreIntConst
+      FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]] := Instr.Immediate;
+    81: // bcArrayStoreFloatConst
+      FArrays[Instr.Src1].FloatData[FIntRegs[Instr.Src2]] := Double(Pointer(@Instr.Immediate)^);
+    82: // bcArrayStoreStringConst
+      FArrays[Instr.Src1].StringData[FIntRegs[Instr.Src2]] := FProgram.StringConstants[Instr.Immediate];
+
+    // Fused loop increment-and-branch (Int) - sub-opcodes 90-93
+    90: // bcAddIntToBranchLe: r[dest] += r[src1]; if (r[dest] <= r[src2]) goto target
+      begin
+        Inc(FIntRegs[Instr.Dest], FIntRegs[Instr.Src1]);
+        if FIntRegs[Instr.Dest] <= FIntRegs[Instr.Src2] then
+          FPC := Instr.Immediate - 1;
+      end;
+    91: // bcAddIntToBranchLt: r[dest] += r[src1]; if (r[dest] < r[src2]) goto target
+      begin
+        Inc(FIntRegs[Instr.Dest], FIntRegs[Instr.Src1]);
+        if FIntRegs[Instr.Dest] < FIntRegs[Instr.Src2] then
+          FPC := Instr.Immediate - 1;
+      end;
+    92: // bcSubIntToBranchGe: r[dest] -= r[src1]; if (r[dest] >= r[src2]) goto target
+      begin
+        Dec(FIntRegs[Instr.Dest], FIntRegs[Instr.Src1]);
+        if FIntRegs[Instr.Dest] >= FIntRegs[Instr.Src2] then
+          FPC := Instr.Immediate - 1;
+      end;
+    93: // bcSubIntToBranchGt: r[dest] -= r[src1]; if (r[dest] > r[src2]) goto target
+      begin
+        Dec(FIntRegs[Instr.Dest], FIntRegs[Instr.Src1]);
+        if FIntRegs[Instr.Dest] > FIntRegs[Instr.Src2] then
+          FPC := Instr.Immediate - 1;
+      end;
+
+    // FMA (Fused Multiply-Add) - sub-opcodes 100-103
+    100: // bcMulAddFloat: dest = c + a*b
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Immediate] + FFloatRegs[Instr.Src1] * FFloatRegs[Instr.Src2];
+    101: // bcMulSubFloat: dest = c - a*b
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Immediate] - FFloatRegs[Instr.Src1] * FFloatRegs[Instr.Src2];
+    102: // bcMulAddToFloat: dest += a*b
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Dest] + FFloatRegs[Instr.Src1] * FFloatRegs[Instr.Src2];
+    103: // bcMulSubToFloat: dest -= a*b
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Dest] - FFloatRegs[Instr.Src1] * FFloatRegs[Instr.Src2];
+
+    // Array Load + Arithmetic - sub-opcodes 110-112
+    110: // bcArrayLoadAddFloat: dest = acc + arr[idx]
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Immediate] + FArrays[Instr.Src1].FloatData[FIntRegs[Instr.Src2]];
+    111: // bcArrayLoadSubFloat: dest = acc - arr[idx]
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Immediate] - FArrays[Instr.Src1].FloatData[FIntRegs[Instr.Src2]];
+    112: // bcArrayLoadDivAddFloat: dest = acc + arr[idx] / denom
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Immediate and $FFFF] +
+        FArrays[Instr.Src1].FloatData[FIntRegs[Instr.Src2]] / FFloatRegs[(Instr.Immediate shr 16) and $FFFF];
+
+    // Square-Sum patterns - sub-opcodes 120-121
+    120: // bcSquareSumFloat: dest = x*x + y*y
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] * FFloatRegs[Instr.Src1] +
+                                FFloatRegs[Instr.Src2] * FFloatRegs[Instr.Src2];
+    121: // bcAddSquareFloat: dest = sum + x*x
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] + FFloatRegs[Instr.Src2] * FFloatRegs[Instr.Src2];
+
+    // Mul-Mul and Add-Sqrt - sub-opcodes 130-131
+    130: // bcMulMulFloat: dest = a*b*c
+      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] * FFloatRegs[Instr.Src2] * FFloatRegs[Instr.Immediate];
+    131: // bcAddSqrtFloat: dest = sqrt(a+b)
+      FFloatRegs[Instr.Dest] := Sqrt(FFloatRegs[Instr.Src1] + FFloatRegs[Instr.Src2]);
+
+    // Array Load + Branch - sub-opcodes 140-141
+    140: // bcArrayLoadIntBranchNZ: if arr[idx] <> 0 goto target
+      if FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]] <> 0 then
+        FPC := Instr.Immediate - 1;
+    141: // bcArrayLoadIntBranchZ: if arr[idx] = 0 goto target
+      if FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]] = 0 then
+        FPC := Instr.Immediate - 1;
+
+    // Array Reverse Range - sub-opcode 156
+    156: // bcArrayReverseRange: reverse arr[start..end-1] in-place
+      begin
+        FStartIdx := FIntRegs[Instr.Src2];
+        FEndIdx := FIntRegs[Instr.Dest] - 1;
+        FArrIdxTmp := Instr.Src1;
+        while FStartIdx < FEndIdx do
+        begin
+          FSwapTempInt := FArrays[FArrIdxTmp].IntData[FStartIdx];
+          FArrays[FArrIdxTmp].IntData[FStartIdx] := FArrays[FArrIdxTmp].IntData[FEndIdx];
+          FArrays[FArrIdxTmp].IntData[FEndIdx] := FSwapTempInt;
+          Inc(FStartIdx);
+          Dec(FEndIdx);
+        end;
+      end;
+
+    // Array Shift Left - sub-opcode 157
+    157: // bcArrayShiftLeft: shift left and rotate first to end+1
+      begin
+        FStartIdx := FIntRegs[Instr.Src2];
+        FEndIdx := FIntRegs[Instr.Dest];
+        FArrIdxTmp := Instr.Src1;
+        FFirstVal := FArrays[FArrIdxTmp].IntData[FStartIdx];
+        FLoopIdx := FStartIdx;
+        while FLoopIdx <= FEndIdx do
+        begin
+          FArrays[FArrIdxTmp].IntData[FLoopIdx] := FArrays[FArrIdxTmp].IntData[FLoopIdx + 1];
+          Inc(FLoopIdx);
+        end;
+        FArrays[FArrIdxTmp].IntData[FEndIdx + 1] := FFirstVal;
+      end;
+
+    // Array Swap (Int) - sub-opcode 250
+    250: // bcArraySwapInt: swap arr[idx1] and arr[idx2]
+      begin
+        FSwapTempInt := FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]];
+        FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[FIntRegs[Instr.Dest]];
+        FArrays[Instr.Src1].IntData[FIntRegs[Instr.Dest]] := FSwapTempInt;
+      end;
+
+    // Self-increment/decrement (Int) - sub-opcodes 251-252
+    251: // bcAddIntSelf: r[dest] += r[src1]
+      Inc(FIntRegs[Instr.Dest], FIntRegs[Instr.Src1]);
+    252: // bcSubIntSelf: r[dest] -= r[src1]
+      Dec(FIntRegs[Instr.Dest], FIntRegs[Instr.Src1]);
+
+    // Array Load to register (Int) - sub-opcode 253
+    253: // bcArrayLoadIntTo: r[dest] = arr[src1][r[src2]]
+      FIntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]];
+
+    // Array Copy Element - sub-opcode 254
+    254: // bcArrayCopyElement: arr_dest[idx] = arr_src[idx]
+      FArrays[Instr.Dest].IntData[FIntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]];
+
+    // Array Move Element - sub-opcode 255
+    255: // bcArrayMoveElement: arr[dest_idx] = arr[src_idx]
+      FArrays[Instr.Dest].IntData[FIntRegs[Instr.Src2]] := FArrays[Instr.Dest].IntData[FIntRegs[Instr.Src1]];
+
+  else
+    raise Exception.CreateFmt('Unknown superinstruction sub-opcode %d (full: %d) at PC=%d',
+      [SubOp, Instr.OpCode, FPC]);
+  end;
+end;
+
+procedure TBytecodeVM.Step;
+var Instr: TBytecodeInstruction;
+begin
+  if (FProgram = nil) or (FPC >= FProgram.GetInstructionCount) then
+  begin
+    FRunning := False;
+    Exit;
+  end;
+  Instr := FProgram.GetInstruction(FPC);
+
+  // TRON trace output: print line number when it changes
+  // SourceLine > 0 only when compiled with TRON (debug mode) active
+  if (Instr.SourceLine > 0) and (Instr.SourceLine <> FLastSourceLine) then
+  begin
+    FLastSourceLine := Instr.SourceLine;
+    if Assigned(FOutputDevice) then
+      FOutputDevice.Print('[' + IntToStr(Instr.SourceLine) + ']');
+  end;
+
+  {$IFDEF ENABLE_PROFILER}
+  // Profiler: BeforeInstruction hook
+  if Assigned(FProfiler) and FProfiler.Enabled then
+    FProfiler.BeforeInstruction(FPC, Instr.OpCode);
+  {$ENDIF}
+
+  ExecuteInstruction(Instr);
+
+  {$IFDEF ENABLE_PROFILER}
+  // Profiler: AfterInstruction hook
+  if Assigned(FProfiler) and FProfiler.Enabled then
+  begin
+    FProfiler.AfterInstruction(FPC, Instr.OpCode);
+    // Track superinstructions
+    if Instr.OpCode >= bcGroupSuper then
+      FProfiler.OnSuperinstruction(Instr.OpCode, 1);
+  end;
+  {$ENDIF}
+
+  {$IFDEF ENABLE_INSTRUCTION_COUNTING}
+  Inc(FInstructionsExecuted);
+  {$ENDIF}
+  Inc(FPC);
+end;
+
+procedure TBytecodeVM.Run;
+begin
+  // Default execution: use fast mode
+  // If profiler is attached or debug needed, caller should use RunDebug
+  RunFast;
+end;
+
+{ RunFast - Optimized execution loop
+  - Direct pointer access to instruction array (no method calls)
+  - Inline dispatch (no procedure calls for each instruction)
+  - Range checking disabled in critical path
+  - No profiler/debug support for maximum speed }
+procedure TBytecodeVM.RunFast;
+{$I RunTemplate.inc}
+
+{ RunDebug - Debug execution loop
+  - Same as RunFast but with TRON trace and profiler support
+  - TROFF switches back to RunFast }
+{$DEFINE DEBUG_MODE}
+procedure TBytecodeVM.RunDebug;
+{$I RunTemplate.inc}
+{$UNDEF DEBUG_MODE}
+
+{ NOTE: Old RunFast/RunDebug code removed - now generated from RunTemplate.inc }
+
+{ NOTE: Old RunFast/RunSwitchedGoto code removed - now generated from RunTemplate.inc }
+
+{ ============================================================================
+  GROUP-SPECIFIC DISPATCH HANDLERS
+  These procedures handle opcodes from non-core groups (1-11, 200-255)
+  Each group has its own procedure for cleaner organization and better
+  instruction cache locality.
+  ============================================================================ }
+
+procedure TBytecodeVM.ExecuteStringOp(const Instr: TBytecodeInstruction);
+var
+  SubOp: Word;
+  Len, StartPos, Count: Integer;
+  S: string;
+begin
+  SubOp := Instr.OpCode and $FF;  // Extract sub-opcode (low byte)
+  case SubOp of
+    0: // bcStrConcat
+      FStringRegs[Instr.Dest] := FStringRegs[Instr.Src1] + FStringRegs[Instr.Src2];
+    1: // bcStrLen
+      FIntRegs[Instr.Dest] := Length(FStringRegs[Instr.Src1]);
+    2: // bcStrLeft
+      begin
+        Len := FIntRegs[Instr.Src2];
+        if Len < 0 then Len := 0;
+        FStringRegs[Instr.Dest] := Copy(FStringRegs[Instr.Src1], 1, Len);
+      end;
+    3: // bcStrRight
+      begin
+        Len := FIntRegs[Instr.Src2];
+        S := FStringRegs[Instr.Src1];
+        if Len < 0 then Len := 0;
+        if Len > Length(S) then Len := Length(S);
+        FStringRegs[Instr.Dest] := Copy(S, Length(S) - Len + 1, Len);
+      end;
+    4: // bcStrMid - MID$(s, start, len)
+      begin
+        // Src2 encodes start (low 16 bits) and len register (high 16 bits)
+        StartPos := FIntRegs[Instr.Src2 and $FFFF];
+        Count := FIntRegs[(Instr.Immediate) and $FFFF];
+        if StartPos < 1 then StartPos := 1;
+        if Count < 0 then Count := 0;
+        FStringRegs[Instr.Dest] := Copy(FStringRegs[Instr.Src1], StartPos, Count);
+      end;
+    5: // bcStrAsc
+      begin
+        S := FStringRegs[Instr.Src1];
+        if Length(S) > 0 then
+          FIntRegs[Instr.Dest] := Ord(S[1])
+        else
+          FIntRegs[Instr.Dest] := 0;
+      end;
+    6: // bcStrChr
+      FStringRegs[Instr.Dest] := Chr(FIntRegs[Instr.Src1] and $FF);
+    7: // bcStrStr - STR$(n)
+      FStringRegs[Instr.Dest] := FConsoleBehavior.FormatNumber(FFloatRegs[Instr.Src1]);
+    8: // bcStrVal - VAL(s)
+      begin
+        S := Trim(FStringRegs[Instr.Src1]);
+        if not TryStrToFloat(S, FFloatRegs[Instr.Dest]) then
+          FFloatRegs[Instr.Dest] := 0.0;
+      end;
+    9: // bcStrHex - HEX$(n)
+      FStringRegs[Instr.Dest] := IntToHex(FIntRegs[Instr.Src1] and $FFFF, 4);
+    10: // bcStrInstr - INSTR(haystack, needle [,start])
+      begin
+        // Src1 = haystack, Src2 = needle, Immediate = start position (1-based)
+        StartPos := 1;
+        if Instr.Immediate > 0 then
+          StartPos := FIntRegs[Instr.Immediate and $FFFF];
+        if StartPos < 1 then StartPos := 1;
+        FIntRegs[Instr.Dest] := Pos(FStringRegs[Instr.Src2],
+          Copy(FStringRegs[Instr.Src1], StartPos, MaxInt));
+        if FIntRegs[Instr.Dest] > 0 then
+          Inc(FIntRegs[Instr.Dest], StartPos - 1);
+      end;
+    11: // bcStrErr - ERR$(n)
+      FStringRegs[Instr.Dest] := SedaiExecutorErrors.GetErrorCodeDescription(FIntRegs[Instr.Src1]);
+  else
+    raise Exception.CreateFmt('Unknown string opcode %d at PC=%d', [Instr.OpCode, FPC]);
+  end;
+end;
+
+procedure TBytecodeVM.ExecuteMathOp(const Instr: TBytecodeInstruction);
+var
+  SubOp: Word;
+begin
+  SubOp := Instr.OpCode and $FF;
+  case SubOp of
+    0: // bcMathSin
+      FFloatRegs[Instr.Dest] := Sin(FFloatRegs[Instr.Src1]);
+    1: // bcMathCos
+      FFloatRegs[Instr.Dest] := Cos(FFloatRegs[Instr.Src1]);
+    2: // bcMathTan
+      FFloatRegs[Instr.Dest] := Tan(FFloatRegs[Instr.Src1]);
+    3: // bcMathAtn
+      FFloatRegs[Instr.Dest] := ArcTan(FFloatRegs[Instr.Src1]);
+    4: // bcMathLog
+      if FFloatRegs[Instr.Src1] > 0 then
+        FFloatRegs[Instr.Dest] := Ln(FFloatRegs[Instr.Src1])
+      else
+        raise Exception.Create('LOG of non-positive number');
+    5: // bcMathExp
+      FFloatRegs[Instr.Dest] := Exp(FFloatRegs[Instr.Src1]);
+    6: // bcMathSqr
+      begin
+        if FFloatRegs[Instr.Src1] < 0 then
+          raise Exception.CreateFmt('Square root of negative number: %.17e', [FFloatRegs[Instr.Src1]])
+        else
+          FFloatRegs[Instr.Dest] := Sqrt(FFloatRegs[Instr.Src1]);
+      end;
+    7: // bcMathAbs
+      FFloatRegs[Instr.Dest] := Abs(FFloatRegs[Instr.Src1]);
+    8: // bcMathSgn
       if FFloatRegs[Instr.Src1] > 0 then
         FFloatRegs[Instr.Dest] := 1
       else if FFloatRegs[Instr.Src1] < 0 then
         FFloatRegs[Instr.Dest] := -1
       else
         FFloatRegs[Instr.Dest] := 0;
-    bcMathInt: FFloatRegs[Instr.Dest] := Floor(FFloatRegs[Instr.Src1]);
-    bcMathSqr:
-      begin
-        if FFloatRegs[Instr.Src1] < 0 then
-        begin
-          {$IFDEF DEBUG_REGISTER_DUMP}
-          WriteLn(StdErr, 'Register dump at PC=', FPC, ' (MathSqr Src1=', Instr.Src1, ')');
-          WriteLn(StdErr, 'R[', Instr.Src1, '] = ', FFloatRegs[Instr.Src1]:0:17, ' ← NEGATIVE (ERROR)');
-          // Dump surrounding registers to check for corruption pattern
-          if Instr.Src1 >= 2 then
-            WriteLn(StdErr, 'R[', Instr.Src1-2, '] = ', FFloatRegs[Instr.Src1-2]:0:17);
-          if Instr.Src1 >= 1 then
-            WriteLn(StdErr, 'R[', Instr.Src1-1, '] = ', FFloatRegs[Instr.Src1-1]:0:17);
-          if Instr.Src1 + 1 < FFloatRegCount then
-            WriteLn(StdErr, 'R[', Instr.Src1+1, '] = ', FFloatRegs[Instr.Src1+1]:0:17);
-          if Instr.Src1 + 2 < FFloatRegCount then
-            WriteLn(StdErr, 'R[', Instr.Src1+2, '] = ', FFloatRegs[Instr.Src1+2]:0:17);
-          if Instr.Src1 + 3 < FFloatRegCount then
-            WriteLn(StdErr, 'R[', Instr.Src1+3, '] = ', FFloatRegs[Instr.Src1+3]:0:17);
-          if Instr.Src1 + 4 < FFloatRegCount then
-            WriteLn(StdErr, 'R[', Instr.Src1+4, '] = ', FFloatRegs[Instr.Src1+4]:0:17);
-          if Instr.Src1 + 5 < FFloatRegCount then
-            WriteLn(StdErr, 'R[', Instr.Src1+5, '] = ', FFloatRegs[Instr.Src1+5]:0:17);
-          if Instr.Src1 + 6 < FFloatRegCount then
-            WriteLn(StdErr, 'R[', Instr.Src1+6, '] = ', FFloatRegs[Instr.Src1+6]:0:17);
-          {$ENDIF}
-          raise Exception.CreateFmt('Square root of negative number: %.17e', [FFloatRegs[Instr.Src1]]);
-        end
-        else
-          FFloatRegs[Instr.Dest] := Sqrt(FFloatRegs[Instr.Src1]);
-      end;
-    bcMathSin: FFloatRegs[Instr.Dest] := Sin(FFloatRegs[Instr.Src1]);
-    bcMathCos: FFloatRegs[Instr.Dest] := Cos(FFloatRegs[Instr.Src1]);
-    bcMathTan: FFloatRegs[Instr.Dest] := Tan(FFloatRegs[Instr.Src1]);
-    bcMathExp: FFloatRegs[Instr.Dest] := Exp(FFloatRegs[Instr.Src1]);
-    bcMathLog:
+    9: // bcMathInt
+      FFloatRegs[Instr.Dest] := Floor(FFloatRegs[Instr.Src1]);
+    10: // bcMathRnd
+      FFloatRegs[Instr.Dest] := Random;
+    11: // bcMathLog10
       if FFloatRegs[Instr.Src1] > 0 then
-        FFloatRegs[Instr.Dest] := Ln(FFloatRegs[Instr.Src1])
+        FFloatRegs[Instr.Dest] := Log10(FFloatRegs[Instr.Src1])
       else
-        raise Exception.Create('LOG of non-positive number');
-    bcMathRnd: FFloatRegs[Instr.Dest] := Random;
-    bcPrint:
+        raise Exception.Create('?ILLEGAL QUANTITY ERROR: LOG10 of non-positive number');
+    12: // bcMathLog2
+      if FFloatRegs[Instr.Src1] > 0 then
+        FFloatRegs[Instr.Dest] := Log2(FFloatRegs[Instr.Src1])
+      else
+        raise Exception.Create('?ILLEGAL QUANTITY ERROR: LOG2 of non-positive number');
+    13: // bcMathLogN
+      begin
+        // LOGN(base, x) - Src1 = base, Src2 = x
+        if (FFloatRegs[Instr.Src1] > 0) and (FFloatRegs[Instr.Src1] <> 1) and (FFloatRegs[Instr.Src2] > 0) then
+          FFloatRegs[Instr.Dest] := LogN(FFloatRegs[Instr.Src1], FFloatRegs[Instr.Src2])
+        else if FFloatRegs[Instr.Src1] <= 0 then
+          raise Exception.Create('?ILLEGAL QUANTITY ERROR: LOGN base must be positive')
+        else if FFloatRegs[Instr.Src1] = 1 then
+          raise Exception.Create('?ILLEGAL QUANTITY ERROR: LOGN base cannot be 1')
+        else
+          raise Exception.Create('?ILLEGAL QUANTITY ERROR: LOGN of non-positive number');
+      end;
+    14: // bcStrDec - DEC(hexstring) - convert hex string to decimal integer
+      begin
+        // Src1 is string register, Dest is int register
+        // FStringRegs is used, result goes to FIntRegs
+        try
+          FIntRegs[Instr.Dest] := StrToInt64('$' + FStringRegs[Instr.Src1]);
+        except
+          on E: Exception do
+            raise Exception.CreateFmt('?ILLEGAL QUANTITY ERROR: Invalid hex string "%s"', [FStringRegs[Instr.Src1]]);
+        end;
+      end;
+  else
+    raise Exception.CreateFmt('Unknown math opcode %d at PC=%d', [Instr.OpCode, FPC]);
+  end;
+end;
+
+procedure TBytecodeVM.ExecuteArrayOp(const Instr: TBytecodeInstruction);
+var
+  SubOp: Word;
+  ArrayIdx, LinearIdx, i, ProdDims: Integer;
+  ArrInfo: TSSAArrayInfo;
+begin
+  SubOp := Instr.OpCode and $FF;
+  case SubOp of
+    0: // bcArrayLoad (generic, deprecated)
+      begin
+        ArrayIdx := Instr.Src1;
+        if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
+          raise Exception.CreateFmt('Array not allocated: %d', [ArrayIdx]);
+        LinearIdx := FIntRegs[Instr.Src2];
+        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
+          raise Exception.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
+        case FArrays[ArrayIdx].ElementType of
+          0: FIntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
+          1: FFloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
+          2: FStringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
+        end;
+      end;
+    1: // bcArrayStore (generic, deprecated)
+      begin
+        ArrayIdx := Instr.Src1;
+        if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
+          raise Exception.CreateFmt('Array not allocated: %d', [ArrayIdx]);
+        LinearIdx := FIntRegs[Instr.Src2];
+        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
+          raise Exception.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
+        case FArrays[ArrayIdx].ElementType of
+          0: FArrays[ArrayIdx].IntData[LinearIdx] := FIntRegs[Instr.Dest];
+          1: FArrays[ArrayIdx].FloatData[LinearIdx] := FFloatRegs[Instr.Dest];
+          2: FArrays[ArrayIdx].StringData[LinearIdx] := FStringRegs[Instr.Dest];
+        end;
+      end;
+    2: // bcArrayDim
+      begin
+        ArrayIdx := Instr.Src1;
+        if (ArrayIdx < 0) or (ArrayIdx >= FProgram.GetArrayCount) then
+          raise Exception.CreateFmt('Invalid array index: %d', [ArrayIdx]);
+        ArrInfo := FProgram.GetArray(ArrayIdx);
+        if ArrayIdx >= Length(FArrays) then
+          SetLength(FArrays, ArrayIdx + 1);
+        FArrays[ArrayIdx].ElementType := Byte(ArrInfo.ElementType);
+        FArrays[ArrayIdx].DimCount := ArrInfo.DimCount;
+        SetLength(FArrays[ArrayIdx].Dimensions, ArrInfo.DimCount);
+        for i := 0 to ArrInfo.DimCount - 1 do
+        begin
+          if ArrInfo.Dimensions[i] = 0 then
+          begin
+            if (i < Length(ArrInfo.DimRegisters)) and (ArrInfo.DimRegisters[i] >= 0) then
+            begin
+              case ArrInfo.DimRegTypes[i] of
+                srtInt: FArrays[ArrayIdx].Dimensions[i] := FIntRegs[ArrInfo.DimRegisters[i]] + 1;
+                srtFloat: FArrays[ArrayIdx].Dimensions[i] := Trunc(FFloatRegs[ArrInfo.DimRegisters[i]]) + 1;
+              else
+                raise Exception.CreateFmt('Invalid dimension register type for array %s', [ArrInfo.Name]);
+              end;
+            end
+            else
+              raise Exception.CreateFmt('Array %s has undefined variable dimension %d', [ArrInfo.Name, i]);
+          end
+          else
+            FArrays[ArrayIdx].Dimensions[i] := ArrInfo.Dimensions[i];
+        end;
+        ProdDims := 1;
+        for i := 0 to ArrInfo.DimCount - 1 do
+          ProdDims := ProdDims * FArrays[ArrayIdx].Dimensions[i];
+        FArrays[ArrayIdx].TotalSize := ProdDims;
+        case ArrInfo.ElementType of
+          srtInt:
+            begin
+              SetLength(FArrays[ArrayIdx].IntData, ProdDims);
+              for i := 0 to ProdDims - 1 do FArrays[ArrayIdx].IntData[i] := 0;
+            end;
+          srtFloat:
+            begin
+              SetLength(FArrays[ArrayIdx].FloatData, ProdDims);
+              for i := 0 to ProdDims - 1 do FArrays[ArrayIdx].FloatData[i] := 0.0;
+            end;
+          srtString:
+            begin
+              SetLength(FArrays[ArrayIdx].StringData, ProdDims);
+              for i := 0 to ProdDims - 1 do FArrays[ArrayIdx].StringData[i] := '';
+            end;
+        end;
+      end;
+    3: // bcArrayLoadInt
+      begin
+        ArrayIdx := Instr.Src1;
+        LinearIdx := FIntRegs[Instr.Src2];
+        FIntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
+        {$IFDEF ENABLE_PROFILER}
+        if Assigned(FProfiler) and FProfiler.Enabled then
+          FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
+        {$ENDIF}
+      end;
+    4: // bcArrayLoadFloat
+      begin
+        ArrayIdx := Instr.Src1;
+        LinearIdx := FIntRegs[Instr.Src2];
+        FFloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
+        {$IFDEF ENABLE_PROFILER}
+        if Assigned(FProfiler) and FProfiler.Enabled then
+          FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
+        {$ENDIF}
+      end;
+    5: // bcArrayLoadString
+      begin
+        ArrayIdx := Instr.Src1;
+        LinearIdx := FIntRegs[Instr.Src2];
+        FStringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
+        {$IFDEF ENABLE_PROFILER}
+        if Assigned(FProfiler) and FProfiler.Enabled then
+          FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
+        {$ENDIF}
+      end;
+    6: // bcArrayStoreInt
+      begin
+        ArrayIdx := Instr.Src1;
+        LinearIdx := FIntRegs[Instr.Src2];
+        FArrays[ArrayIdx].IntData[LinearIdx] := FIntRegs[Instr.Dest];
+        {$IFDEF ENABLE_PROFILER}
+        if Assigned(FProfiler) and FProfiler.Enabled then
+          FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
+        {$ENDIF}
+      end;
+    7: // bcArrayStoreFloat
+      begin
+        ArrayIdx := Instr.Src1;
+        LinearIdx := FIntRegs[Instr.Src2];
+        FArrays[ArrayIdx].FloatData[LinearIdx] := FFloatRegs[Instr.Dest];
+        {$IFDEF ENABLE_PROFILER}
+        if Assigned(FProfiler) and FProfiler.Enabled then
+          FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
+        {$ENDIF}
+      end;
+    8: // bcArrayStoreString
+      begin
+        ArrayIdx := Instr.Src1;
+        LinearIdx := FIntRegs[Instr.Src2];
+        FArrays[ArrayIdx].StringData[LinearIdx] := FStringRegs[Instr.Dest];
+        {$IFDEF ENABLE_PROFILER}
+        if Assigned(FProfiler) and FProfiler.Enabled then
+          FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
+        {$ENDIF}
+      end;
+  else
+    raise Exception.CreateFmt('Unknown array opcode %d at PC=%d', [Instr.OpCode, FPC]);
+  end;
+end;
+
+procedure TBytecodeVM.ExecuteIOOp(const Instr: TBytecodeInstruction);
+var
+  SubOp: Word;
+  PrintStr, InputStr: string;
+  InputVal: Double;
+  NextTabCol, TabIdx: Integer;
+begin
+  SubOp := Instr.OpCode and $FF;
+  case SubOp of
+    0: // bcPrint (float)
       if Assigned(FOutputDevice) then
       begin
-        // Print float with behavior formatting
         PrintStr := FConsoleBehavior.FormatNumber(FFloatRegs[Instr.Src1]);
         FOutputDevice.Print(PrintStr);
         Inc(FCursorCol, Length(PrintStr));
       end;
-    bcPrintLn:
+    1: // bcPrintLn (float)
       if Assigned(FOutputDevice) then
       begin
         PrintStr := FConsoleBehavior.FormatNumber(FFloatRegs[Instr.Src1]);
         FOutputDevice.Print(PrintStr);
         FOutputDevice.NewLine;
+        FOutputDevice.Present;
         FCursorCol := 0;
       end;
-    bcPrintInt:
-      if Assigned(FOutputDevice) then
-      begin
-        // Print integer with behavior formatting
-        PrintStr := FConsoleBehavior.FormatNumber(FIntRegs[Instr.Src1]);
-        FOutputDevice.Print(PrintStr);
-        Inc(FCursorCol, Length(PrintStr));
-      end;
-    bcPrintIntLn:
-      if Assigned(FOutputDevice) then
-      begin
-        PrintStr := FConsoleBehavior.FormatNumber(FIntRegs[Instr.Src1]);
-        FOutputDevice.Print(PrintStr);
-        FOutputDevice.NewLine;
-        FCursorCol := 0;
-      end;
-    bcPrintString:
+    2: // bcPrintString
       if Assigned(FOutputDevice) then
       begin
         PrintStr := FConsoleBehavior.FormatString(FStringRegs[Instr.Src1]);
         FOutputDevice.Print(PrintStr);
         Inc(FCursorCol, Length(PrintStr));
       end;
-    bcPrintStringLn:
+    3: // bcPrintStringLn
       if Assigned(FOutputDevice) then
       begin
         PrintStr := FConsoleBehavior.FormatString(FStringRegs[Instr.Src1]);
         FOutputDevice.Print(PrintStr);
         FOutputDevice.NewLine;
+        FOutputDevice.Present;
         FCursorCol := 0;
       end;
-    bcPrintComma:
+    4: // bcPrintInt
       if Assigned(FOutputDevice) then
       begin
-        // Apply comma separator (TAB zone)
+        PrintStr := FConsoleBehavior.FormatNumber(FIntRegs[Instr.Src1]);
+        FOutputDevice.Print(PrintStr);
+        Inc(FCursorCol, Length(PrintStr));
+      end;
+    5: // bcPrintIntLn
+      if Assigned(FOutputDevice) then
+      begin
+        PrintStr := FConsoleBehavior.FormatNumber(FIntRegs[Instr.Src1]);
+        FOutputDevice.Print(PrintStr);
+        FOutputDevice.NewLine;
+        FOutputDevice.Present;
+        FCursorCol := 0;
+      end;
+    6: // bcPrintComma
+      if Assigned(FOutputDevice) then
+      begin
         NextTabCol := FConsoleBehavior.GetNextTabPosition(FCursorCol);
         if NextTabCol = 0 then
         begin
-          // Wrap to next line
           FOutputDevice.NewLine;
           FCursorCol := 0;
         end
         else if FConsoleBehavior.CommaAction = caTabZone then
         begin
-          // Print spaces to reach next TAB zone
           while FCursorCol < NextTabCol do
           begin
             FOutputDevice.Print(' ');
@@ -897,38 +2459,28 @@ begin
           FOutputDevice.NewLine;
           FCursorCol := 0;
         end;
-        // caNoAction: do nothing
       end;
-    bcPrintSemicolon:
+    7: // bcPrintSemicolon
       if Assigned(FOutputDevice) then
       begin
-        // Apply semicolon separator
         case FConsoleBehavior.SemicolonAction of
-          saNoSpace: ; // Do nothing
-          saSpaceAfter:
+          saNoSpace: ;
+          saSpaceAfter, saSpaceBoth:
             begin
               FOutputDevice.Print(' ');
               Inc(FCursorCol);
             end;
-          saSpaceBefore: ; // Handled by next print
-          saSpaceBoth:
-            begin
-              FOutputDevice.Print(' ');
-              Inc(FCursorCol);
-            end;
+          saSpaceBefore: ;
         end;
       end;
-    bcPrintTab:
+    8: // bcPrintTab
       if Assigned(FOutputDevice) then
       begin
-        // TAB(n) - move to column n
-        NextTabCol := Instr.Immediate;
+        NextTabCol := FIntRegs[Instr.Src1];
         if NextTabCol < 1 then NextTabCol := 1;
-        Dec(NextTabCol);  // Convert to 0-based
-
+        Dec(NextTabCol);
         if FCursorCol < NextTabCol then
         begin
-          // Print spaces to reach column
           while FCursorCol < NextTabCol do
           begin
             FOutputDevice.Print(' ');
@@ -937,7 +2489,6 @@ begin
         end
         else if FCursorCol > NextTabCol then
         begin
-          // Already past: go to next line and tab
           FOutputDevice.NewLine;
           FCursorCol := 0;
           while FCursorCol < NextTabCol do
@@ -947,26 +2498,24 @@ begin
           end;
         end;
       end;
-    bcPrintSpc:
+    9: // bcPrintSpc
       if Assigned(FOutputDevice) then
       begin
-        // SPC(n) - print n spaces
-        for TabIdx := 1 to Instr.Immediate do
+        for TabIdx := 1 to FIntRegs[Instr.Src1] do
         begin
           FOutputDevice.Print(' ');
           Inc(FCursorCol);
         end;
       end;
-    bcPrintNewLine:
+    10: // bcPrintNewLine
       if Assigned(FOutputDevice) then
       begin
         FOutputDevice.NewLine;
         FCursorCol := 0;
       end;
-    bcInput:
+    11: // bcInput (generic float)
       if Assigned(FInputDevice) then
       begin
-        // Generic input (backward compatibility) - accepts float
         repeat
           InputStr := FInputDevice.ReadLine('', False, True, True);
           if TryStrToFloat(InputStr, InputVal) then
@@ -974,365 +2523,171 @@ begin
             FFloatRegs[Instr.Dest] := InputVal;
             Break;
           end
-          else
-          begin
-            if Assigned(FOutputDevice) then
-              FOutputDevice.Print('?Invalid number. Try again: ');
-          end;
+          else if Assigned(FOutputDevice) then
+            FOutputDevice.Print('?Invalid number. Try again: ');
         until False;
       end;
-    bcInputInt:
+    12: // bcInputInt
       if Assigned(FInputDevice) then
       begin
-        // Integer input - validates format and range
         repeat
-          InputStr := FInputDevice.ReadLine('', False, True, True);
-          InputStr := Trim(InputStr);
-
-          // Try to parse as float first (to handle scientific notation like 1.5e2)
+          InputStr := Trim(FInputDevice.ReadLine('', False, True, True));
           if TryStrToFloat(InputStr, InputVal) then
           begin
-            // Check if it's within Int64 range
             if (InputVal >= Low(Int64)) and (InputVal <= High(Int64)) then
             begin
               FIntRegs[Instr.Dest] := Trunc(InputVal);
               Break;
             end
-            else
-            begin
-              if Assigned(FOutputDevice) then
-                FOutputDevice.Print('?Number out of range. Try again: ');
-            end;
+            else if Assigned(FOutputDevice) then
+              FOutputDevice.Print('?Number out of range. Try again: ');
           end
-          else
-          begin
-            if Assigned(FOutputDevice) then
-              FOutputDevice.Print('?Invalid integer. Try again: ');
-          end;
+          else if Assigned(FOutputDevice) then
+            FOutputDevice.Print('?Invalid integer. Try again: ');
         until False;
       end;
-    bcInputFloat:
+    13: // bcInputFloat
       if Assigned(FInputDevice) then
       begin
-        // Float input - validates numeric format (including scientific notation)
         repeat
-          InputStr := FInputDevice.ReadLine('', False, True, True);
-          InputStr := Trim(InputStr);
-
+          InputStr := Trim(FInputDevice.ReadLine('', False, True, True));
           if TryStrToFloat(InputStr, InputVal) then
           begin
             FFloatRegs[Instr.Dest] := InputVal;
             Break;
           end
-          else
-          begin
-            if Assigned(FOutputDevice) then
-              FOutputDevice.Print('?Invalid number. Try again: ');
-          end;
+          else if Assigned(FOutputDevice) then
+            FOutputDevice.Print('?Invalid number. Try again: ');
         until False;
       end;
-    bcInputString:
+    14: // bcInputString
       if Assigned(FInputDevice) then
-      begin
         FStringRegs[Instr.Dest] := FInputDevice.ReadLine('', False, False, False);
-      end;
-    bcJump: FPC := Instr.Immediate - 1;
-    bcJumpIfZero:
-      if FIntRegs[Instr.Src1] = 0 then FPC := Instr.Immediate - 1;
-    bcJumpIfNotZero:
-      if FIntRegs[Instr.Src1] <> 0 then FPC := Instr.Immediate - 1;
-    bcCall:
-    begin
-      FCallStack[FCallStackPtr] := FPC;
-      Inc(FCallStackPtr);
-      FPC := Instr.Immediate - 1;
-    end;
-    bcReturn:
-      if FCallStackPtr > 0 then
+  else
+    raise Exception.CreateFmt('Unknown I/O opcode %d at PC=%d', [Instr.OpCode, FPC]);
+  end;
+end;
+
+procedure TBytecodeVM.ExecuteSpecialVarOp(const Instr: TBytecodeInstruction);
+var
+  SubOp: Word;
+  TimeCurrentTime: TDateTime;
+  TimeH, TimeM, TimeS, TimeMS: Word;
+  TimeStr: string;
+  TimeHH, TimeMM, TimeSS: Integer;
+  TimeTargetMs, TimeCurrentMs: Int64;
+  TimeCH, TimeCM, TimeCS, TimeCMS: Word;
+  DateY, DateM, DateD: Word;
+begin
+  SubOp := Instr.OpCode and $FF;
+  case SubOp of
+    0: // bcLoadTI - return jiffies (1/60 sec) since interpreter start
+      FIntRegs[Instr.Dest] := ((GetTickCount64 - FStartTicks) * 60) div 1000;
+    1: // bcLoadTIS - return current time as "HHMMSS" string
       begin
-        Dec(FCallStackPtr);
-        FPC := FCallStack[FCallStackPtr];
+        TimeCurrentTime := Now + (FTimeOffset / 86400000);
+        DecodeTime(TimeCurrentTime, TimeH, TimeM, TimeS, TimeMS);
+        FStringRegs[Instr.Dest] := Format('%.2d%.2d%.2d', [TimeH, TimeM, TimeS]);
       end;
-    // Array operations
-    bcArrayDim:
-    begin
-      // bcArrayDim: Instr.Src1 = ArrayIndex (index into metadata)
-      // Allocate array storage based on metadata
-      ArrayIdx := Instr.Src1;
-      if (ArrayIdx < 0) or (ArrayIdx >= FProgram.GetArrayCount) then
-        raise Exception.CreateFmt('Invalid array index: %d', [ArrayIdx]);
-
-      ArrInfo := FProgram.GetArray(ArrayIdx);
-
-      // Ensure FArrays is large enough
-      if ArrayIdx >= Length(FArrays) then
-        SetLength(FArrays, ArrayIdx + 1);
-
-      // Initialize array storage
-      FArrays[ArrayIdx].ElementType := Byte(ArrInfo.ElementType);
-      FArrays[ArrayIdx].DimCount := ArrInfo.DimCount;
-      SetLength(FArrays[ArrayIdx].Dimensions, ArrInfo.DimCount);
-
-      // Read dimensions - if 0, read from register (variable dimension)
-      for i := 0 to ArrInfo.DimCount - 1 do
+    2: // bcStoreTIS - set time offset
       begin
-        if ArrInfo.Dimensions[i] = 0 then
+        TimeStr := FStringRegs[Instr.Src1];
+        if Length(TimeStr) >= 6 then
         begin
-          // Variable dimension: read value from register and add +1 (BASIC [0..N] semantics)
-          if (i < Length(ArrInfo.DimRegisters)) and (ArrInfo.DimRegisters[i] >= 0) then
-          begin
-            case ArrInfo.DimRegTypes[i] of
-              srtInt:
-                FArrays[ArrayIdx].Dimensions[i] := FIntRegs[ArrInfo.DimRegisters[i]] + 1;
-              srtFloat:
-                FArrays[ArrayIdx].Dimensions[i] := Trunc(FFloatRegs[ArrInfo.DimRegisters[i]]) + 1;
-            else
-              raise Exception.CreateFmt('Invalid dimension register type for array %s', [ArrInfo.Name]);
-            end;
-          end
-          else
-            raise Exception.CreateFmt('Array %s has undefined variable dimension %d', [ArrInfo.Name, i]);
-        end
-        else
-          FArrays[ArrayIdx].Dimensions[i] := ArrInfo.Dimensions[i];
-      end;
-
-      // Calculate total size (product of all dimensions)
-      ProdDims := 1;
-      for i := 0 to ArrInfo.DimCount - 1 do
-        ProdDims := ProdDims * FArrays[ArrayIdx].Dimensions[i];
-      FArrays[ArrayIdx].TotalSize := ProdDims;
-
-      // Allocate storage based on element type
-      case ArrInfo.ElementType of
-        srtInt:
-        begin
-          SetLength(FArrays[ArrayIdx].IntData, ProdDims);
-          for i := 0 to ProdDims - 1 do
-            FArrays[ArrayIdx].IntData[i] := 0;
-        end;
-        srtFloat:
-        begin
-          SetLength(FArrays[ArrayIdx].FloatData, ProdDims);
-          for i := 0 to ProdDims - 1 do
-            FArrays[ArrayIdx].FloatData[i] := 0.0;
-        end;
-        srtString:
-        begin
-          SetLength(FArrays[ArrayIdx].StringData, ProdDims);
-          for i := 0 to ProdDims - 1 do
-            FArrays[ArrayIdx].StringData[i] := '';
+          TimeHH := StrToIntDef(Copy(TimeStr, 1, 2), 0);
+          TimeMM := StrToIntDef(Copy(TimeStr, 3, 2), 0);
+          TimeSS := StrToIntDef(Copy(TimeStr, 5, 2), 0);
+          if TimeHH > 23 then TimeHH := 23;
+          if TimeMM > 59 then TimeMM := 59;
+          if TimeSS > 59 then TimeSS := 59;
+          TimeTargetMs := (Int64(TimeHH) * 3600 + Int64(TimeMM) * 60 + Int64(TimeSS)) * 1000;
+          TimeCurrentTime := Now;
+          DecodeTime(TimeCurrentTime, TimeCH, TimeCM, TimeCS, TimeCMS);
+          TimeCurrentMs := (Int64(TimeCH) * 3600 + Int64(TimeCM) * 60 + Int64(TimeCS)) * 1000 + TimeCMS;
+          FTimeOffset := TimeTargetMs - TimeCurrentMs;
         end;
       end;
-    end;
-    bcArrayLoad:
-    begin
-      // bcArrayLoad: Dest = result register, Src1 = ArrayIndex, Src2 = linear index register
-      // Linear index is pre-computed by the SSA generator for all array dimensions
-      ArrayIdx := Instr.Src1;
-      if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
-        raise Exception.CreateFmt('Array not allocated: %d', [ArrayIdx]);
-
-      // Get pre-computed linear index from register
-      LinearIdx := FIntRegs[Instr.Src2];
-
-      // Bounds check
-      if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
-        raise Exception.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
-
-      // Load value into destination register
-      case FArrays[ArrayIdx].ElementType of
-        0: FIntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
-        1: FFloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
-        2: FStringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
+    3: // bcLoadDTS - return current date as "YYYYMMDD" string
+      begin
+        DecodeDate(Date, DateY, DateM, DateD);
+        FStringRegs[Instr.Dest] := Format('%.4d%.2d%.2d', [DateY, DateM, DateD]);
       end;
-    end;
-    bcArrayStore:
-    begin
-      // bcArrayStore: Dest = value register, Src1 = ArrayIndex, Src2 = linear index register
-      // Linear index is pre-computed by the SSA generator for all array dimensions
-      ArrayIdx := Instr.Src1;
-      if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
-        raise Exception.CreateFmt('Array not allocated: %d', [ArrayIdx]);
-
-      // Get pre-computed linear index from register
-      LinearIdx := FIntRegs[Instr.Src2];
-
-      // Bounds check
-      if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
-        raise Exception.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
-
-      // Store value from source register
-      case FArrays[ArrayIdx].ElementType of
-        0: FArrays[ArrayIdx].IntData[LinearIdx] := FIntRegs[Instr.Dest];
-        1: FArrays[ArrayIdx].FloatData[LinearIdx] := FFloatRegs[Instr.Dest];
-        2: FArrays[ArrayIdx].StringData[LinearIdx] := FStringRegs[Instr.Dest];
+    4: // bcFre - return available memory in bytes
+      begin
+        {$IFDEF WINDOWS}
+        FIntRegs[Instr.Dest] := GetFPCHeapStatus.CurrHeapFree;
+        {$ELSE}
+        FIntRegs[Instr.Dest] := GetFPCHeapStatus.CurrHeapFree;
+        {$ENDIF}
       end;
-    end;
+    5: // bcLoadEL - return last error line number
+      FIntRegs[Instr.Dest] := FLastErrorLine;
+    6: // bcLoadER - return last error code
+      FIntRegs[Instr.Dest] := FLastErrorCode;
+    7: // bcLoadERRS - return last error message (variable form)
+      FStringRegs[Instr.Dest] := FLastErrorMessage;
+  else
+    raise Exception.CreateFmt('Unknown special variable opcode %d at PC=%d', [Instr.OpCode, FPC]);
+  end;
+end;
 
-    // Typed array load operations - type is encoded in opcode, no runtime dispatch
-    bcArrayLoadInt:
-    begin
-      ArrayIdx := Instr.Src1;
-      LinearIdx := FIntRegs[Instr.Src2];
-      FIntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
-      {$IFDEF ENABLE_PROFILER}
-      if Assigned(FProfiler) and FProfiler.Enabled then
-        FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
-      {$ENDIF}
-    end;
-    bcArrayLoadFloat:
-    begin
-      ArrayIdx := Instr.Src1;
-      LinearIdx := FIntRegs[Instr.Src2];
-      FFloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
-      {$IFDEF ENABLE_PROFILER}
-      if Assigned(FProfiler) and FProfiler.Enabled then
-        FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
-      {$ENDIF}
-    end;
-    bcArrayLoadString:
-    begin
-      ArrayIdx := Instr.Src1;
-      LinearIdx := FIntRegs[Instr.Src2];
-      FStringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
-      {$IFDEF ENABLE_PROFILER}
-      if Assigned(FProfiler) and FProfiler.Enabled then
-        FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
-      {$ENDIF}
-    end;
-
-    // Typed array store operations - type is encoded in opcode, no runtime dispatch
-    bcArrayStoreInt:
-    begin
-      ArrayIdx := Instr.Src1;
-      LinearIdx := FIntRegs[Instr.Src2];
-      FArrays[ArrayIdx].IntData[LinearIdx] := FIntRegs[Instr.Dest];
-      {$IFDEF ENABLE_PROFILER}
-      if Assigned(FProfiler) and FProfiler.Enabled then
-        FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
-      {$ENDIF}
-    end;
-    bcArrayStoreFloat:
-    begin
-      ArrayIdx := Instr.Src1;
-      LinearIdx := FIntRegs[Instr.Src2];
-      FArrays[ArrayIdx].FloatData[LinearIdx] := FFloatRegs[Instr.Dest];
-      {$IFDEF ENABLE_PROFILER}
-      if Assigned(FProfiler) and FProfiler.Enabled then
-        FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
-      {$ENDIF}
-    end;
-    bcArrayStoreString:
-    begin
-      ArrayIdx := Instr.Src1;
-      LinearIdx := FIntRegs[Instr.Src2];
-      FArrays[ArrayIdx].StringData[LinearIdx] := FStringRegs[Instr.Dest];
-      {$IFDEF ENABLE_PROFILER}
-      if Assigned(FProfiler) and FProfiler.Enabled then
-        FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
-      {$ENDIF}
-    end;
-
-    // Graphics operations
-    bcGraphicRGBA:
-    begin
-      // RGBA(r, g, b, a) - combine 4 int registers into a 32-bit RGBA color
-      // Bytecode format: Dest=result, Src1=R, Src2=G, Immediate=(B_reg << 16) | A_reg
-      // Result = (A << 24) | (R << 16) | (G << 8) | B
+procedure TBytecodeVM.ExecuteGraphicsOp(const Instr: TBytecodeInstruction);
+var
+  SubOp: Word;
+  DrawMode: Integer;
+begin
+  SubOp := Instr.OpCode and $FF;
+  case SubOp of
+    0: // bcGraphicRGBA
       FIntRegs[Instr.Dest] :=
-        ((FIntRegs[Instr.Immediate and $FFFF] and $FF) shl 24) or        // A from low 16 bits of Immediate
-        ((FIntRegs[Instr.Src1] and $FF) shl 16) or                        // R
-        ((FIntRegs[Instr.Src2] and $FF) shl 8) or                         // G
-        (FIntRegs[(Instr.Immediate shr 16) and $FFFF] and $FF);           // B from high 16 bits of Immediate
-    end;
-    bcGraphicSetMode:
-    begin
-      // GRAPHIC mode, clear, param3
-      // Bytecode: Src1=mode register, Src2=clear register, Immediate=param3 register
-      // Mode is in FIntRegs[Src1], Clear is in FIntRegs[Src2], param3 in FIntRegs[Immediate]
-      WriteLn('>>> VM bcGraphicSetMode: FOutputDevice=', Assigned(FOutputDevice));
-      WriteLn('>>> VM: Src1=', Instr.Src1, ' Src2=', Instr.Src2, ' Immediate=', Instr.Immediate);
-      WriteLn('>>> VM: Mode=', FIntRegs[Instr.Src1], ' Clear=', FIntRegs[Instr.Src2]);
+        ((FIntRegs[Instr.Immediate and $FFFF] and $FF) shl 24) or
+        ((FIntRegs[Instr.Src1] and $FF) shl 16) or
+        ((FIntRegs[Instr.Src2] and $FF) shl 8) or
+        (FIntRegs[(Instr.Immediate shr 16) and $FFFF] and $FF);
+    1: // bcGraphicSetMode
       if Assigned(FOutputDevice) then
-      begin
-        WriteLn('>>> VM: Calling SetGraphicMode...');
         FOutputDevice.SetGraphicMode(
-          TGraphicMode(FIntRegs[Instr.Src1] and $F),  // Mode 0-11 (was $7, now $F for extended modes)
-          FIntRegs[Instr.Src2] <> 0,                   // Clear flag
-          FIntRegs[Instr.Immediate and $FFFF]          // SplitLine/param3
+          TGraphicMode(FIntRegs[Instr.Src1] and $F),
+          FIntRegs[Instr.Src2] <> 0,
+          FIntRegs[Instr.Immediate and $FFFF]
         );
-        WriteLn('>>> VM: SetGraphicMode returned');
-      end
-      else
-        WriteLn('>>> VM: FOutputDevice is NIL!');
-    end;
-    bcGraphicBox:
-    begin
-      // BOX color, x1, y1, x2, y2, angle, filled, fill_color
-      // Bytecode format: Src1=color, Src2=x1, Dest=y1
-      // Immediate encodes: x2(bits 0-11), y2(12-23), angle(24-35), filled(36-47), fill_color(48-59)
+    2: // bcGraphicBox
       if Assigned(FOutputDevice) then
       begin
-        // Extract register indices from Immediate field
-        // x2 = bits 0-11, y2 = bits 12-23, angle = bits 24-35
-        // filled = bits 36-47, fill_color = bits 48-59
-        // DrawBoxWithColor interprets color based on graphics mode:
-        // - Hires modes (1-2): 0=background, 1=foreground
-        // - SDL2 mode (7): direct RGBA value
-        WriteLn('>>> BOX: Src1(color reg)=', Instr.Src1, ' Src2(x1 reg)=', Instr.Src2, ' Dest(y1 reg)=', Instr.Dest);
-        WriteLn('>>> BOX: x2 reg=', (Instr.Immediate) and $FFF, ' y2 reg=', (Instr.Immediate shr 12) and $FFF);
-        WriteLn('>>> BOX: angle reg=', (Instr.Immediate shr 24) and $FFF, ' filled reg=', (Instr.Immediate shr 36) and $FFF);
-        WriteLn('>>> BOX VALUES: color=', FIntRegs[Instr.Src1], ' x1=', FIntRegs[Instr.Src2], ' y1=', FIntRegs[Instr.Dest]);
-        WriteLn('>>> BOX VALUES: x2=', FIntRegs[(Instr.Immediate) and $FFF], ' y2=', FIntRegs[(Instr.Immediate shr 12) and $FFF]);
-        WriteLn('>>> BOX VALUES: filled=', FIntRegs[(Instr.Immediate shr 36) and $FFF]);
         FOutputDevice.DrawBoxWithColor(
-          FIntRegs[Instr.Src2],                              // x1
-          FIntRegs[Instr.Dest],                              // y1
-          FIntRegs[(Instr.Immediate) and $FFF],              // x2
-          FIntRegs[(Instr.Immediate shr 12) and $FFF],       // y2
-          UInt32(FIntRegs[Instr.Src1]),                      // color (interpreted by output device)
-          FFloatRegs[(Instr.Immediate shr 24) and $FFF],     // angle
-          FIntRegs[(Instr.Immediate shr 36) and $FFF] <> 0   // filled (non-zero = true)
+          FIntRegs[Instr.Src2],
+          FIntRegs[Instr.Dest],
+          FIntRegs[(Instr.Immediate) and $FFF],
+          FIntRegs[(Instr.Immediate shr 12) and $FFF],
+          UInt32(FIntRegs[Instr.Src1]),
+          FFloatRegs[(Instr.Immediate shr 24) and $FFF],
+          FIntRegs[(Instr.Immediate shr 36) and $FFF] <> 0
         );
-        // Update display after drawing
         FOutputDevice.Present;
       end;
-    end;
-    bcGraphicCircle:
-    begin
-      // CIRCLE color, x, y, xr, yr, sa, ea, angle, inc
-      // Bytecode format: Src1=color, Src2=x, Dest=y
-      // Immediate encodes: xr(bits 0-9), yr(10-19), sa(20-29), ea(30-39), angle(40-49), inc(50-59)
+    3: // bcGraphicCircle
       if Assigned(FOutputDevice) then
       begin
         FOutputDevice.DrawCircleWithColor(
-          FIntRegs[Instr.Src2],                              // x (center)
-          FIntRegs[Instr.Dest],                              // y (center)
-          FIntRegs[(Instr.Immediate) and $3FF],              // xr (x radius)
-          FIntRegs[(Instr.Immediate shr 10) and $3FF],       // yr (y radius)
-          UInt32(FIntRegs[Instr.Src1]),                      // color
-          FFloatRegs[(Instr.Immediate shr 20) and $3FF],     // sa (start angle)
-          FFloatRegs[(Instr.Immediate shr 30) and $3FF],     // ea (end angle)
-          FFloatRegs[(Instr.Immediate shr 40) and $3FF],     // angle (rotation)
-          FFloatRegs[(Instr.Immediate shr 50) and $3FF]      // inc (increment)
+          FIntRegs[Instr.Src2],
+          FIntRegs[Instr.Dest],
+          FIntRegs[(Instr.Immediate) and $3FF],
+          FIntRegs[(Instr.Immediate shr 10) and $3FF],
+          UInt32(FIntRegs[Instr.Src1]),
+          FFloatRegs[(Instr.Immediate shr 20) and $3FF],
+          FFloatRegs[(Instr.Immediate shr 30) and $3FF],
+          FFloatRegs[(Instr.Immediate shr 40) and $3FF],
+          FFloatRegs[(Instr.Immediate shr 50) and $3FF]
         );
-        // Update display after drawing
         FOutputDevice.Present;
       end;
-    end;
-    bcGraphicDraw:
-    begin
-      // DRAW color, x, y with mode
-      // Bytecode format: Src1=color, Src2=x, Dest=y, Immediate=mode
-      // Mode: 0=move PC only, 1=draw line from PC to (x,y), 2=draw dot at (x,y)
+    4: // bcGraphicDraw
       if Assigned(FOutputDevice) then
       begin
-        DrawMode := Instr.Immediate and $7FFF;  // Remove flag bit if present
+        DrawMode := Instr.Immediate and $7FFF;
         case DrawMode of
-          0: // Move PC only (first point of DRAW, no line drawn)
-            FOutputDevice.SetPixelCursor(FIntRegs[Instr.Src2], FIntRegs[Instr.Dest]);
-          1: // Draw line from current PC to (x,y)
+          0: FOutputDevice.SetPixelCursor(FIntRegs[Instr.Src2], FIntRegs[Instr.Dest]);
+          1:
             begin
               FOutputDevice.DrawLine(
                 FOutputDevice.GetPixelCursorX,
@@ -1343,7 +2698,7 @@ begin
               );
               FOutputDevice.SetPixelCursor(FIntRegs[Instr.Src2], FIntRegs[Instr.Dest]);
             end;
-          2: // Draw single dot at (x,y)
+          2:
             begin
               FOutputDevice.SetPixel(FIntRegs[Instr.Src2], FIntRegs[Instr.Dest], UInt32(FIntRegs[Instr.Src1]));
               FOutputDevice.SetPixelCursor(FIntRegs[Instr.Src2], FIntRegs[Instr.Dest]);
@@ -1351,18 +2706,10 @@ begin
         end;
         FOutputDevice.Present;
       end;
-    end;
-    bcGraphicLocate:
-    begin
-      // LOCATE x, y - set pixel cursor position
-      // Bytecode format: Src1=x, Src2=y
+    5: // bcGraphicLocate
       if Assigned(FOutputDevice) then
         FOutputDevice.SetPixelCursor(FIntRegs[Instr.Src1], FIntRegs[Instr.Src2]);
-    end;
-    bcGraphicRdot:
-    begin
-      // RDOT(n) - get pixel cursor info
-      // Bytecode format: Dest=result, Src1=which (0=x, 1=y, 2=color at PC)
+    6: // bcGraphicRdot
       if Assigned(FOutputDevice) then
       begin
         case FIntRegs[Instr.Src1] of
@@ -1376,1765 +2723,742 @@ begin
       end
       else
         FIntRegs[Instr.Dest] := 0;
-    end;
-
-    bcGraphicGetMode:
-    begin
-      // RGR(n) - get graphics info
-      // n=0: current graphics mode (0-11)
-      // Future expansion: n=1..n for other info
-      WriteLn('>>> bcGraphicGetMode: FOutputDevice=', Assigned(FOutputDevice),
-              ' Src1=', Instr.Src1, ' Dest=', Instr.Dest);
+    7: // bcGraphicGetMode
       if Assigned(FOutputDevice) then
       begin
-        WriteLn('>>> bcGraphicGetMode: Src1Value=', FIntRegs[Instr.Src1]);
         case FIntRegs[Instr.Src1] of
-          0: begin
-               FIntRegs[Instr.Dest] := Ord(FOutputDevice.GetGraphicMode);
-               WriteLn('>>> bcGraphicGetMode: Result=', FIntRegs[Instr.Dest]);
-             end;
+          0: FIntRegs[Instr.Dest] := Ord(FOutputDevice.GetGraphicMode);
         else
           FIntRegs[Instr.Dest] := 0;
         end;
       end
       else
         FIntRegs[Instr.Dest] := 0;
-    end;
-
-    bcEnd, bcStop: FRunning := False;
-    bcFast: if Assigned(FOutputDevice) then FOutputDevice.SetFastMode(True);
-    bcSlow: if Assigned(FOutputDevice) then FOutputDevice.SetFastMode(False);
-    bcSleep:
-    begin
-      // SLEEP n - delay for n seconds
-      // Value can come from:
-      // 1. Immediate field (constant value from bytecode compiler)
-      // 2. Src1 register (variable/expression result)
-      // Clamp to 0..65535 as per C128 spec
-      if Instr.Immediate > 0 then
-        SleepMs := Instr.Immediate * 1000  // Constant in Immediate
-      else if Instr.Src1 < FFloatRegCount then
-        SleepMs := Trunc(FFloatRegs[Instr.Src1] * 1000)  // Register value
-      else
-        SleepMs := 1000; // Default 1 second
-      if SleepMs < 0 then SleepMs := 0;
-      if SleepMs > 65535000 then SleepMs := 65535000;
-      // Sleep in small increments to allow interrupt checking and SDL event processing
-      while (SleepMs > 0) and FRunning do
+    8: // bcGraphicColor - COLOR source, color
+      if Assigned(FOutputDevice) then
       begin
-        if SleepMs > 50 then
+        // Src1 = source (0-6), Src2 = color
+        FOutputDevice.SetColorSource(FIntRegs[Instr.Src1], FIntRegs[Instr.Src2]);
+      end;
+    9: // bcGraphicWidth - WIDTH n (1 or 2)
+      if Assigned(FOutputDevice) then
+      begin
+        FOutputDevice.SetLineWidth(FIntRegs[Instr.Src1]);
+      end;
+    10: // bcGraphicScale - SCALE n [,xmax, ymax]
+      if Assigned(FOutputDevice) then
+      begin
+        // Src1 = enable (0/1), Src2 = xmax, Dest = ymax
+        FOutputDevice.SetScale(FIntRegs[Instr.Src1] <> 0, FIntRegs[Instr.Src2], FIntRegs[Instr.Dest]);
+      end;
+    11: // bcGraphicPaint - PAINT source, x, y, mode
+      if Assigned(FOutputDevice) then
+      begin
+        // Src1 = source, Src2 = x, Dest = y, Immediate = mode
+        FOutputDevice.FloodFill(FIntRegs[Instr.Src1],
+          FFloatRegs[Instr.Src2], FFloatRegs[Instr.Dest], FIntRegs[Instr.Immediate and $FFFF]);
+      end;
+    12: // bcGraphicWindow - WINDOW col1, row1, col2, row2 [,clear]
+      if Assigned(FOutputDevice) then
+      begin
+        // Src1 = col1, Src2 = row1, Dest = col2
+        // Immediate bits 0-15 = row2 register, bits 16-31 = clear register
+        FOutputDevice.SetWindow(FIntRegs[Instr.Src1], FIntRegs[Instr.Src2],
+          FIntRegs[Instr.Dest], FIntRegs[Instr.Immediate and $FFFF],
+          FIntRegs[(Instr.Immediate shr 16) and $FFFF] <> 0);
+      end;
+    13: // bcGraphicSShape - SSHAPE A$, x1, y1 [,x2, y2]
+      if Assigned(FOutputDevice) then
+      begin
+        // Dest = string reg index, Src1 = x1, Src2 = y1
+        // Immediate bits 0-15 = x2, bits 16-31 = y2
+        FStringRegs[Instr.Dest] := FOutputDevice.SaveShape(
+          FFloatRegs[Instr.Src1], FFloatRegs[Instr.Src2],
+          FIntRegs[Instr.Immediate and $FFFF], FIntRegs[(Instr.Immediate shr 16) and $FFFF]);
+      end;
+    14: // bcGraphicGShape - GSHAPE A$, x, y [,mode]
+      if Assigned(FOutputDevice) then
+      begin
+        // Src1 = string reg index, Src2 = x, Dest = y, Immediate = mode
+        FOutputDevice.LoadShape(FStringRegs[Instr.Src1],
+          FFloatRegs[Instr.Src2], FFloatRegs[Instr.Dest], Instr.Immediate);
+        FOutputDevice.Present;
+      end;
+    15: // bcGraphicGList - GLIST
+      begin
+        // List SDL2 video modes
+        WriteLn('[GLIST] Listing SDL2 video modes...');
+        // TODO: Implement actual mode listing via FOutputDevice
+      end;
+    16: // bcGraphicPos - POS(x)
+      begin
+        // Return cursor column position
+        if Assigned(FOutputDevice) then
+          FIntRegs[Instr.Dest] := FOutputDevice.GetCursorX
+        else
+          FIntRegs[Instr.Dest] := 0;
+      end;
+    17: // bcGraphicRclr - RCLR(n)
+      if Assigned(FOutputDevice) then
+      begin
+        // Return color of source n
+        FIntRegs[Instr.Dest] := FOutputDevice.GetColorSource(FIntRegs[Instr.Src1]);
+      end
+      else
+        FIntRegs[Instr.Dest] := 0;
+    18: // bcGraphicRwindow - RWINDOW(n)
+      if Assigned(FOutputDevice) then
+      begin
+        // Return window info: 0=lines, 1=cols, 2=screen width
+        case FIntRegs[Instr.Src1] of
+          0: FIntRegs[Instr.Dest] := FOutputDevice.GetWindowLines;
+          1: FIntRegs[Instr.Dest] := FOutputDevice.GetWindowCols;
+          2: FIntRegs[Instr.Dest] := FOutputDevice.GetScreenWidth;
+        else
+          FIntRegs[Instr.Dest] := 0;
+        end;
+      end
+      else
+        FIntRegs[Instr.Dest] := 0;
+  else
+    raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, FPC]);
+  end;
+end;
+
+procedure TBytecodeVM.ExecuteSoundOp(const Instr: TBytecodeInstruction);
+var
+  SubOp: Word;
+begin
+  SubOp := Instr.OpCode and $FF;
+  case SubOp of
+    0: // bcSoundVol
+      {$IFDEF WITH_SEDAI_AUDIO}
+      if FAudioInitialized then
+        SetMasterVolume(FIntRegs[Instr.Src1] / 15.0);
+      {$ELSE}
+      ; // No audio support
+      {$ENDIF}
+    1: // bcSoundSound
+      {$IFDEF WITH_SEDAI_AUDIO}
+      if FAudioInitialized then
+      begin
+        case (Instr.Immediate shr 32) and $FF of
+          0: PlayOnVoice(FIntRegs[Instr.Src1], FFloatRegs[Instr.Src2], 'triangle');
+          1: PlayOnVoice(FIntRegs[Instr.Src1], FFloatRegs[Instr.Src2], 'saw');
+          2: PlayOnVoice(FIntRegs[Instr.Src1], FFloatRegs[Instr.Src2], 'square');
+          3: PlayOnVoice(FIntRegs[Instr.Src1], FFloatRegs[Instr.Src2], 'sine');
+        else
+          PlayOnVoice(FIntRegs[Instr.Src1], FFloatRegs[Instr.Src2], 'saw');
+        end;
+      end;
+      {$ELSE}
+      ; // No audio support
+      {$ENDIF}
+    2: // bcSoundEnvelope
+      {$IFDEF WITH_SEDAI_AUDIO}
+      if FAudioInitialized then
+        if (FIntRegs[Instr.Src1] >= 0) and (FIntRegs[Instr.Src1] <= 9) then
         begin
-          Sleep(50);
-          Dec(SleepMs, 50);
+          FAudioEnvelopes[FIntRegs[Instr.Src1]].Attack := ((Instr.Immediate) and $FF) / 15.0;
+          FAudioEnvelopes[FIntRegs[Instr.Src1]].Decay := ((Instr.Immediate shr 8) and $FF) / 15.0;
+          FAudioEnvelopes[FIntRegs[Instr.Src1]].Sustain := ((Instr.Immediate shr 16) and $FF) / 15.0;
+          FAudioEnvelopes[FIntRegs[Instr.Src1]].Release := ((Instr.Immediate shr 24) and $FF) / 15.0;
+          FAudioEnvelopes[FIntRegs[Instr.Src1]].Waveform := (Instr.Immediate shr 32) and $FF;
+          FAudioEnvelopes[FIntRegs[Instr.Src1]].PulseWidth := ((Instr.Immediate shr 40) and $FFF) / 4095.0;
+        end;
+      {$ELSE}
+      ; // No audio support
+      {$ENDIF}
+    3: // bcSoundTempo
+      {$IFDEF WITH_SEDAI_AUDIO}
+      if FAudioInitialized then
+      begin
+        FAudioTempo := FIntRegs[Instr.Src1];
+        if FAudioTempo < 1 then FAudioTempo := 1;
+        if FAudioTempo > 255 then FAudioTempo := 255;
+      end;
+      {$ELSE}
+      ; // No audio support
+      {$ENDIF}
+    4: // bcSoundPlay
+      {$IFDEF WITH_SEDAI_AUDIO}
+      if FAudioInitialized then
+        ExecutePlayString(FStringRegs[Instr.Src1]);
+      {$ELSE}
+      ; // No audio support
+      {$ENDIF}
+    5: // bcSoundFilter
+      {$IFDEF WITH_SEDAI_AUDIO}
+      if FAudioInitialized then
+        ; // TODO: Implement global filter
+      {$ELSE}
+      ; // No audio support
+      {$ENDIF}
+  else
+    raise Exception.CreateFmt('Unknown sound opcode %d at PC=%d', [Instr.OpCode, FPC]);
+  end;
+end;
+
+procedure TBytecodeVM.ExecuteSpriteOp(const Instr: TBytecodeInstruction);
+var
+  SubOp: Word;
+  SpriteNum, Enabled, Priority, Mode: Integer;
+  X, Y, ScaleX, ScaleY, Dist, Angle, Speed: Double;
+  Color, MC1, MC2: Integer;
+begin
+  { Group 7: Sprite operations (0x07xx)
+    Opcodes:
+      0 = SPRITE n [,enabled] [,color] [,priority] [,scalex] [,scaley] [,mode]
+      1 = MOVSPR n, x, y (absolute)
+      2 = MOVSPR n, +x, +y (relative)
+      3 = MOVSPR n, dist;angle (polar)
+      4 = MOVSPR n, angle#speed (auto)
+      5 = SPRCOLOR [mc1] [,mc2]
+      6 = SPRSAV src, dst
+      7 = COLLISION type [,line]
+      8 = BUMP(n)
+      9 = RSPCOLOR(n)
+      10 = RSPPOS(sprite, n)
+      11 = RSPRITE(sprite, n)
+
+    Register encoding:
+      SPRITE: Src1=n, Src2=enabled, Dest=color
+              Immediate bits: priority(12) | scalex(12) | scaley(12) | mode(12)
+      MOVSPR*: Src1=n, Src2=x/dist/angle, Src3=y/angle/speed (mapped to Dest)
+      SPRCOLOR: Src1=mc1, Src2=mc2
+      SPRSAV: Src1=src, Src2=dst
+      COLLISION: Src1=type, Src2=line
+  }
+
+  SubOp := Instr.OpCode and $FF;
+
+  case SubOp of
+    0: // bcSprite
+      begin
+        // SPRITE n [,enabled] [,color] [,priority] [,scalex] [,scaley] [,mode]
+        SpriteNum := Round(FFloatRegs[Instr.Src1]);
+        if (SpriteNum < 1) or (SpriteNum > 256) then Exit;
+
+        Enabled := 1;  // Default enabled
+        if Instr.Src2 <> 0 then
+          Enabled := Round(FFloatRegs[Instr.Src2]);
+
+        Color := 1;  // Default color
+        if Instr.Dest <> 0 then
+          Color := Round(FFloatRegs[Instr.Dest]);
+
+        Priority := (Instr.Immediate) and $FFF;
+        ScaleX := 1.0;
+        ScaleY := 1.0;
+        Mode := 0;
+
+        // TODO: When ISpriteManager is implemented, call:
+        // FSpriteManager.SetSprite(SpriteNum, Enabled, Color, Priority, ScaleX, ScaleY, Mode);
+        WriteLn('[SPRITE] n=', SpriteNum, ' enabled=', Enabled, ' color=', Color, ' priority=', Priority);
+      end;
+
+    1: // bcMovsprAbs
+      begin
+        // MOVSPR n, x, y (absolute position)
+        SpriteNum := Round(FFloatRegs[Instr.Src1]);
+        if (SpriteNum < 1) or (SpriteNum > 256) then Exit;
+        X := FFloatRegs[Instr.Src2];
+        Y := FFloatRegs[Instr.Dest];  // Dest is repurposed for y
+
+        // TODO: FSpriteManager.MoveSpriteAbs(SpriteNum, X, Y);
+        WriteLn('[MOVSPR ABS] n=', SpriteNum, ' x=', X:0:2, ' y=', Y:0:2);
+      end;
+
+    2: // bcMovsprRel
+      begin
+        // MOVSPR n, +x, +y (relative movement)
+        SpriteNum := Round(FFloatRegs[Instr.Src1]);
+        if (SpriteNum < 1) or (SpriteNum > 256) then Exit;
+        X := FFloatRegs[Instr.Src2];
+        Y := FFloatRegs[Instr.Dest];
+
+        // TODO: FSpriteManager.MoveSpriteRel(SpriteNum, X, Y);
+        WriteLn('[MOVSPR REL] n=', SpriteNum, ' dx=', X:0:2, ' dy=', Y:0:2);
+      end;
+
+    3: // bcMovsprPolar
+      begin
+        // MOVSPR n, dist;angle (polar movement)
+        SpriteNum := Round(FFloatRegs[Instr.Src1]);
+        if (SpriteNum < 1) or (SpriteNum > 256) then Exit;
+        Dist := FFloatRegs[Instr.Src2];
+        Angle := FFloatRegs[Instr.Dest];
+
+        // TODO: FSpriteManager.MoveSpritePolar(SpriteNum, Dist, Angle);
+        WriteLn('[MOVSPR POLAR] n=', SpriteNum, ' dist=', Dist:0:2, ' angle=', Angle:0:2);
+      end;
+
+    4: // bcMovsprAuto
+      begin
+        // MOVSPR n, angle#speed (automatic continuous movement)
+        SpriteNum := Round(FFloatRegs[Instr.Src1]);
+        if (SpriteNum < 1) or (SpriteNum > 256) then Exit;
+        Angle := FFloatRegs[Instr.Src2];
+        Speed := FFloatRegs[Instr.Dest];
+
+        // TODO: FSpriteManager.MoveSpriteAuto(SpriteNum, Angle, Speed);
+        WriteLn('[MOVSPR AUTO] n=', SpriteNum, ' angle=', Angle:0:2, ' speed=', Speed:0:2);
+      end;
+
+    5: // bcSprcolor
+      begin
+        // SPRCOLOR [mc1] [,mc2]
+        MC1 := 0;
+        MC2 := 0;
+        if Instr.Src1 <> 0 then
+          MC1 := Round(FFloatRegs[Instr.Src1]);
+        if Instr.Src2 <> 0 then
+          MC2 := Round(FFloatRegs[Instr.Src2]);
+
+        // TODO: FSpriteManager.SetSpriteMulticolors(MC1, MC2);
+        WriteLn('[SPRCOLOR] mc1=', MC1, ' mc2=', MC2);
+      end;
+
+    6: // bcSprsav
+      begin
+        // SPRSAV src, dst (save/load sprite data)
+        // TODO: Implement sprite data save/load
+        WriteLn('[SPRSAV] Not yet implemented');
+      end;
+
+    7: // bcCollision
+      begin
+        // COLLISION type [,line]
+        // TODO: FSpriteManager.SetCollisionHandler(Type, LineNumber);
+        WriteLn('[COLLISION] type=', FIntRegs[Instr.Src1]);
+      end;
+
+    8: // bcBump - function returning collision bitmask
+      begin
+        // BUMP(n) - returns collision bitmask
+        // TODO: Result := FSpriteManager.GetCollisionStatus(n);
+        FIntRegs[Instr.Dest] := 0;  // No collision for now
+      end;
+
+    9: // bcRspcolor - function returning multicolor value
+      begin
+        // RSPCOLOR(n) - returns multicolor n (1 or 2)
+        // TODO: Result := FSpriteManager.GetMulticolor(n);
+        FIntRegs[Instr.Dest] := 0;
+      end;
+
+    10: // bcRsppos - function returning sprite position/speed
+      begin
+        // RSPPOS(sprite, attr) - returns position/speed
+        // attr: 0=X, 1=Y, 2=speed
+        // TODO: Result := FSpriteManager.GetSpritePosition(sprite, attr);
+        FFloatRegs[Instr.Dest] := 0.0;
+      end;
+
+    11: // bcRsprite - function returning sprite attribute
+      begin
+        // RSPRITE(sprite, attr) - returns sprite attribute
+        // attr: 0=enabled, 1=color, 2=priority, 3=scalex, 4=scaley, 5=mode
+        // TODO: Result := FSpriteManager.GetSpriteAttribute(sprite, attr);
+        FIntRegs[Instr.Dest] := 0;
+      end;
+
+  else
+    raise Exception.CreateFmt('Unknown sprite opcode %d at PC=%d', [Instr.OpCode, FPC]);
+  end;
+end;
+
+procedure TBytecodeVM.ExecuteFileIOOp(const Instr: TBytecodeInstruction);
+var
+  SubOp: Word;
+  ErrorCode: Integer;
+  HandleNum: Integer;
+  HandleName, Filename, Mode, Data: string;
+begin
+  { Group 6: File I/O operations (0x06xx)
+    Opcodes:
+      0 = DOPEN #handle, "filename" [, mode$]
+      1 = DCLOSE #handle
+      2 = OPEN (legacy, maps to DOPEN)
+      3 = CLOSE (legacy, maps to DCLOSE)
+
+    Register encoding:
+      DOPEN: Dest = handle register (int), Src1 = filename register (string),
+             Src2 = mode register (string, optional), Immediate = handle name string index
+      DCLOSE: Dest = handle register (int), Immediate = handle name string index
+  }
+
+  SubOp := Instr.OpCode and $FF;
+  ErrorCode := 0;
+
+  case SubOp of
+    0, 2: // bcDopen, bcOpen
+      begin
+        // DOPEN #handle, "filename" [, mode$]
+        HandleNum := FIntRegs[Instr.Dest];
+        Filename := FStringRegs[Instr.Src1];
+
+        // Mode is optional, default to "R" (read)
+        if Instr.Src2 > 0 then
+          Mode := FStringRegs[Instr.Src2]
+        else
+          Mode := 'R';
+
+        // Handle name (for named handles like #MYFILE)
+        if (Instr.Immediate >= 0) and (Instr.Immediate < FProgram.StringConstants.Count) then
+          HandleName := FProgram.StringConstants[Instr.Immediate]
+        else
+          HandleName := '';
+
+        if Assigned(FOnDiskFile) then
+        begin
+          FOnDiskFile(Self, 'DOPEN', HandleNum, HandleName, Filename, Mode, ErrorCode);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('DOPEN error %d opening file: %s', [ErrorCode, Filename]);
+        end
+        else
+          raise Exception.Create('DOPEN command not supported: no handler assigned');
+      end;
+
+    1, 3: // bcDclose, bcClose
+      begin
+        // DCLOSE #handle
+        HandleNum := FIntRegs[Instr.Dest];
+
+        // Handle name (for named handles)
+        if (Instr.Immediate >= 0) and (Instr.Immediate < FProgram.StringConstants.Count) then
+          HandleName := FProgram.StringConstants[Instr.Immediate]
+        else
+          HandleName := '';
+
+        if Assigned(FOnDiskFile) then
+        begin
+          FOnDiskFile(Self, 'DCLOSE', HandleNum, HandleName, '', '', ErrorCode);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('DCLOSE error %d closing handle: %d', [ErrorCode, HandleNum]);
+        end
+        else
+          raise Exception.Create('DCLOSE command not supported: no handler assigned');
+      end;
+
+    4: // bcGetFile - GET# file, var
+      begin
+        { GET# file, var - Read one character from file
+          Dest = file handle register (int)
+          Src1 = variable register index to store result (string) }
+        HandleNum := FIntRegs[Instr.Dest];
+        if Assigned(FOnFileData) then
+        begin
+          Data := '';
+          FOnFileData(Self, 'GET#', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('GET# error %d reading from file: %d', [ErrorCode, HandleNum]);
+          // Store result in string register
+          if Instr.Src1 >= 0 then
+            FStringRegs[Instr.Src1] := Data;
+        end
+        else
+          raise Exception.Create('GET# command not supported: no handler assigned');
+      end;
+
+    5: // bcInputFile - INPUT# file, vars
+      begin
+        { INPUT# file, var - Read data from file
+          Dest = file handle register (int)
+          Src1 = variable register index to store result }
+        HandleNum := FIntRegs[Instr.Dest];
+        if Assigned(FOnFileData) then
+        begin
+          Data := '';
+          FOnFileData(Self, 'INPUT#', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('INPUT# error %d reading from file: %d', [ErrorCode, HandleNum]);
+          // Store result in string register
+          if Instr.Src1 >= 0 then
+            FStringRegs[Instr.Src1] := Data;
+        end
+        else
+          raise Exception.Create('INPUT# command not supported: no handler assigned');
+      end;
+
+    6: // bcPrintFile - PRINT# file, exprs
+      begin
+        { PRINT# file, data - Write data to file
+          Dest = file handle register (int)
+          Src1 = data register (string) }
+        HandleNum := FIntRegs[Instr.Dest];
+        Data := FStringRegs[Instr.Src1];
+        if Assigned(FOnFileData) then
+        begin
+          FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('PRINT# error %d writing to file: %d', [ErrorCode, HandleNum]);
+        end
+        else
+          raise Exception.Create('PRINT# command not supported: no handler assigned');
+      end;
+
+    7: // bcCmd - CMD file [, expr]
+      begin
+        { CMD file - Redirect output to file
+          Dest = file handle register (int)
+          When handle is 0 or PRINT# is called without data, output returns to screen }
+        HandleNum := FIntRegs[Instr.Dest];
+
+        // If PRINT# is called alone (empty data), restore output to screen
+        if (Instr.Src1 >= 0) and (FStringRegs[Instr.Src1] = '') then
+        begin
+          FCmdHandle := 0;  // Reset to screen
         end
         else
         begin
-          Sleep(SleepMs);
-          SleepMs := 0;
-        end;
-        // Process SDL events to keep window responsive
-        if Assigned(FInputDevice) then
-        begin
-          FInputDevice.ProcessEvents;
-          // Check for CTRL+C (stop program) or CTRL+ALT+END (quit)
-          if FInputDevice.ShouldStop or FInputDevice.ShouldQuit then
+          FCmdHandle := HandleNum;  // Redirect output to this file
+
+          // If there's initial data to write, send it
+          if (Instr.Src1 >= 0) and (FStringRegs[Instr.Src1] <> '') then
           begin
-            FRunning := False;
-            FInputDevice.ClearStopRequest;
+            Data := FStringRegs[Instr.Src1];
+            if Assigned(FOnFileData) then
+            begin
+              FOnFileData(Self, 'CMD', HandleNum, Data, ErrorCode);
+              if ErrorCode <> 0 then
+                raise Exception.CreateFmt('CMD error %d: %d', [ErrorCode, HandleNum]);
+            end;
           end;
         end;
-      end;
-    end;
-    bcNop: ;
-  end; // case Op (standard bytecode)
-end;
-
-procedure TBytecodeVM.ExecuteSuperinstruction(const Instr: TBytecodeInstruction);
-begin
-  // DEBUG: Validate register indices before access
-  if (Instr.OpCode >= 110) and (Instr.OpCode <= 182) then
-  begin
-    // Check Int register bounds for Int superinstructions
-    if Instr.OpCode in [100..105, 120..122, 140..142, 160, 161] then
-    begin
-      if Instr.Src1 >= FIntRegCount then
-        raise Exception.CreateFmt('Superinstr opcode %d: IntReg Src1=%d >= FIntRegCount=%d at PC=%d',
-          [Instr.OpCode, Instr.Src1, FIntRegCount, FPC]);
-      if (Instr.OpCode in [100..105]) and (Instr.Src2 >= FIntRegCount) then
-        raise Exception.CreateFmt('Superinstr opcode %d: IntReg Src2=%d >= FIntRegCount=%d at PC=%d',
-          [Instr.OpCode, Instr.Src2, FIntRegCount, FPC]);
-      if (Instr.OpCode in [120..122, 140..142]) and (Instr.Dest >= FIntRegCount) then
-        raise Exception.CreateFmt('Superinstr opcode %d: IntReg Dest=%d >= FIntRegCount=%d at PC=%d',
-          [Instr.OpCode, Instr.Dest, FIntRegCount, FPC]);
-    end
-    // Check ArrayStoreConst superinstructions (180-182) - Src2 is int index register
-    else if Instr.OpCode in [180..182] then
-    begin
-      if Instr.Src2 >= FIntRegCount then
-        raise Exception.CreateFmt('Superinstr opcode %d: IntReg Src2=%d >= FIntRegCount=%d at PC=%d',
-          [Instr.OpCode, Instr.Src2, FIntRegCount, FPC]);
-    end
-    // Check Float register bounds for Float superinstructions
-    else if Instr.OpCode in [110..115, 130..133, 150..153, 170, 171] then
-    begin
-      if Instr.Src1 >= FFloatRegCount then
-        raise Exception.CreateFmt('Superinstr opcode %d: FloatReg Src1=%d >= FFloatRegCount=%d at PC=%d',
-          [Instr.OpCode, Instr.Src1, FFloatRegCount, FPC]);
-      if (Instr.OpCode in [110..115]) and (Instr.Src2 >= FFloatRegCount) then
-        raise Exception.CreateFmt('Superinstr opcode %d: FloatReg Src2=%d >= FFloatRegCount=%d at PC=%d',
-          [Instr.OpCode, Instr.Src2, FFloatRegCount, FPC]);
-      if (Instr.OpCode in [130..133, 150..153]) and (Instr.Dest >= FFloatRegCount) then
-        raise Exception.CreateFmt('Superinstr opcode %d: FloatReg Dest=%d >= FFloatRegCount=%d at PC=%d',
-          [Instr.OpCode, Instr.Dest, FFloatRegCount, FPC]);
-    end;
-  end;
-
-  case Instr.OpCode of
-    // Fused compare-and-branch (Int) - opcodes 100-105
-    100: // bcBranchEqInt: if (r[src1] == r[src2]) goto target
-      if FIntRegs[Instr.Src1] = FIntRegs[Instr.Src2] then
-        FPC := Instr.Immediate - 1;  // -1 because Step will Inc(FPC)
-    101: // bcBranchNeInt
-      if FIntRegs[Instr.Src1] <> FIntRegs[Instr.Src2] then
-        FPC := Instr.Immediate - 1;
-    102: // bcBranchLtInt
-      if FIntRegs[Instr.Src1] < FIntRegs[Instr.Src2] then
-        FPC := Instr.Immediate - 1;
-    103: // bcBranchGtInt
-      if FIntRegs[Instr.Src1] > FIntRegs[Instr.Src2] then
-        FPC := Instr.Immediate - 1;
-    104: // bcBranchLeInt
-      if FIntRegs[Instr.Src1] <= FIntRegs[Instr.Src2] then
-        FPC := Instr.Immediate - 1;
-    105: // bcBranchGeInt
-      if FIntRegs[Instr.Src1] >= FIntRegs[Instr.Src2] then
-        FPC := Instr.Immediate - 1;
-
-    // Fused compare-and-branch (Float) - opcodes 110-115
-    110: // bcBranchEqFloat
-      if FFloatRegs[Instr.Src1] = FFloatRegs[Instr.Src2] then
-        FPC := Instr.Immediate - 1;
-    111: // bcBranchNeFloat
-      if FFloatRegs[Instr.Src1] <> FFloatRegs[Instr.Src2] then
-        FPC := Instr.Immediate - 1;
-    112: // bcBranchLtFloat
-      if FFloatRegs[Instr.Src1] < FFloatRegs[Instr.Src2] then
-        FPC := Instr.Immediate - 1;
-    113: // bcBranchGtFloat
-      if FFloatRegs[Instr.Src1] > FFloatRegs[Instr.Src2] then
-        FPC := Instr.Immediate - 1;
-    114: // bcBranchLeFloat
-      if FFloatRegs[Instr.Src1] <= FFloatRegs[Instr.Src2] then
-        FPC := Instr.Immediate - 1;
-    115: // bcBranchGeFloat
-      if FFloatRegs[Instr.Src1] >= FFloatRegs[Instr.Src2] then
-        FPC := Instr.Immediate - 1;
-
-    // Fused arithmetic-to-dest (Int) - opcodes 120-122
-    120: // bcAddIntTo: r[dest] += r[src1]
-      FIntRegs[Instr.Dest] := FIntRegs[Instr.Dest] + FIntRegs[Instr.Src1];
-    121: // bcSubIntTo: r[dest] -= r[src1]
-      FIntRegs[Instr.Dest] := FIntRegs[Instr.Dest] - FIntRegs[Instr.Src1];
-    122: // bcMulIntTo: r[dest] *= r[src1]
-      FIntRegs[Instr.Dest] := FIntRegs[Instr.Dest] * FIntRegs[Instr.Src1];
-
-    // Fused arithmetic-to-dest (Float) - opcodes 130-133
-    130: // bcAddFloatTo: r[dest] += r[src1]
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Dest] + FFloatRegs[Instr.Src1];
-    131: // bcSubFloatTo: r[dest] -= r[src1]
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Dest] - FFloatRegs[Instr.Src1];
-    132: // bcMulFloatTo: r[dest] *= r[src1]
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Dest] * FFloatRegs[Instr.Src1];
-    133: // bcDivFloatTo: r[dest] /= r[src1]
-      if FFloatRegs[Instr.Src1] <> 0.0 then
-        FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Dest] / FFloatRegs[Instr.Src1]
-      else
-        raise Exception.Create('Division by zero');
-
-    // Fused constant arithmetic (Int) - opcodes 140-142
-    140: // bcAddIntConst: r[dest] = r[src1] + immediate
-      FIntRegs[Instr.Dest] := FIntRegs[Instr.Src1] + Instr.Immediate;
-    141: // bcSubIntConst: r[dest] = r[src1] - immediate
-      FIntRegs[Instr.Dest] := FIntRegs[Instr.Src1] - Instr.Immediate;
-    142: // bcMulIntConst: r[dest] = r[src1] * immediate
-      FIntRegs[Instr.Dest] := FIntRegs[Instr.Src1] * Instr.Immediate;
-
-    // Fused constant arithmetic (Float) - opcodes 150-153
-    150: // bcAddFloatConst: r[dest] = r[src1] + immediate(as double)
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] + Double(Pointer(@Instr.Immediate)^);
-    151: // bcSubFloatConst: r[dest] = r[src1] - immediate(as double)
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] - Double(Pointer(@Instr.Immediate)^);
-    152: // bcMulFloatConst: r[dest] = r[src1] * immediate(as double)
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] * Double(Pointer(@Instr.Immediate)^);
-    153: // bcDivFloatConst: r[dest] = r[src1] / immediate(as double)
-      begin
-        if Double(Pointer(@Instr.Immediate)^) <> 0.0 then
-          FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] / Double(Pointer(@Instr.Immediate)^)
-        else
-          raise Exception.Create('Division by zero');
-      end;
-
-    // Fused compare-zero-and-branch (Int) - opcodes 160-161
-    160: // bcBranchEqZeroInt: if (r[src1] == 0) goto target
-      if FIntRegs[Instr.Src1] = 0 then
-        FPC := Instr.Immediate - 1;
-    161: // bcBranchNeZeroInt: if (r[src1] != 0) goto target
-      if FIntRegs[Instr.Src1] <> 0 then
-        FPC := Instr.Immediate - 1;
-
-    // Fused compare-zero-and-branch (Float) - opcodes 170-171
-    170: // bcBranchEqZeroFloat: if (r[src1] == 0.0) goto target
-      if FFloatRegs[Instr.Src1] = 0.0 then
-        FPC := Instr.Immediate - 1;
-    171: // bcBranchNeZeroFloat: if (r[src1] != 0.0) goto target
-      if FFloatRegs[Instr.Src1] <> 0.0 then
-        FPC := Instr.Immediate - 1;
-
-    // Fused array-store-constant - opcodes 180-182
-    // Format: Src1=ArrayIndex, Src2=IndexReg, Immediate=ConstValue
-    180: // bcArrayStoreIntConst: ARR[idx] = immediate (int)
-      FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]] := Instr.Immediate;
-    181: // bcArrayStoreFloatConst: ARR[idx] = immediate (as double)
-      FArrays[Instr.Src1].FloatData[FIntRegs[Instr.Src2]] := Double(Pointer(@Instr.Immediate)^);
-    182: // bcArrayStoreStringConst: ARR[idx] = string constant index
-      FArrays[Instr.Src1].StringData[FIntRegs[Instr.Src2]] := FProgram.StringConstants[Instr.Immediate];
-
-    // Fused loop increment-and-branch (Int) - opcodes 190-193
-    // Format: Dest=counter, Src1=step, Src2=limit, Immediate=loopTarget
-    190: // bcAddIntToBranchLe: r[dest] += r[src1]; if (r[dest] <= r[src2]) goto target
-      begin
-        Inc(FIntRegs[Instr.Dest], FIntRegs[Instr.Src1]);
-        if FIntRegs[Instr.Dest] <= FIntRegs[Instr.Src2] then
-          FPC := Instr.Immediate - 1;
-      end;
-    191: // bcAddIntToBranchLt: r[dest] += r[src1]; if (r[dest] < r[src2]) goto target
-      begin
-        Inc(FIntRegs[Instr.Dest], FIntRegs[Instr.Src1]);
-        if FIntRegs[Instr.Dest] < FIntRegs[Instr.Src2] then
-          FPC := Instr.Immediate - 1;
-      end;
-    192: // bcSubIntToBranchGe: r[dest] -= r[src1]; if (r[dest] >= r[src2]) goto target
-      begin
-        Dec(FIntRegs[Instr.Dest], FIntRegs[Instr.Src1]);
-        if FIntRegs[Instr.Dest] >= FIntRegs[Instr.Src2] then
-          FPC := Instr.Immediate - 1;
-      end;
-    193: // bcSubIntToBranchGt: r[dest] -= r[src1]; if (r[dest] > r[src2]) goto target
-      begin
-        Dec(FIntRegs[Instr.Dest], FIntRegs[Instr.Src1]);
-        if FIntRegs[Instr.Dest] > FIntRegs[Instr.Src2] then
-          FPC := Instr.Immediate - 1;
-      end;
-
-    // NEW: FMA (Fused Multiply-Add) - opcodes 200-203
-    200: // bcMulAddFloat: dest = c + a*b
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Immediate] + FFloatRegs[Instr.Src1] * FFloatRegs[Instr.Src2];
-    201: // bcMulSubFloat: dest = c - a*b
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Immediate] - FFloatRegs[Instr.Src1] * FFloatRegs[Instr.Src2];
-    202: // bcMulAddToFloat: dest += a*b
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Dest] + FFloatRegs[Instr.Src1] * FFloatRegs[Instr.Src2];
-    203: // bcMulSubToFloat: dest -= a*b
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Dest] - FFloatRegs[Instr.Src1] * FFloatRegs[Instr.Src2];
-
-    // NEW: Array Load + Arithmetic - opcodes 210-212
-    210: // bcArrayLoadAddFloat: dest = acc + arr[idx]
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Immediate] + FArrays[Instr.Src1].FloatData[FIntRegs[Instr.Src2]];
-    211: // bcArrayLoadSubFloat: dest = acc - arr[idx]
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Immediate] - FArrays[Instr.Src1].FloatData[FIntRegs[Instr.Src2]];
-    212: // bcArrayLoadDivAddFloat: dest = acc + arr[idx] / denom
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Immediate and $FFFF] +
-        FArrays[Instr.Src1].FloatData[FIntRegs[Instr.Src2]] / FFloatRegs[(Instr.Immediate shr 16) and $FFFF];
-
-    // NEW: Square-Sum patterns - opcodes 220-221
-    220: // bcSquareSumFloat: dest = x*x + y*y
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] * FFloatRegs[Instr.Src1] +
-                                FFloatRegs[Instr.Src2] * FFloatRegs[Instr.Src2];
-    221: // bcAddSquareFloat: dest = sum + x*x
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] + FFloatRegs[Instr.Src2] * FFloatRegs[Instr.Src2];
-
-    // NEW: Mul-Mul and Add-Sqrt - opcodes 230-231
-    230: // bcMulMulFloat: dest = a*b*c
-      FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] * FFloatRegs[Instr.Src2] * FFloatRegs[Instr.Immediate];
-    231: // bcAddSqrtFloat: dest = sqrt(a+b)
-      FFloatRegs[Instr.Dest] := Sqrt(FFloatRegs[Instr.Src1] + FFloatRegs[Instr.Src2]);
-
-    // NEW: Array Load + Branch - opcodes 240-241
-    240: // bcArrayLoadIntBranchNZ: if arr[idx] <> 0 goto target
-      if FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]] <> 0 then
-        FPC := Instr.Immediate - 1;
-    241: // bcArrayLoadIntBranchZ: if arr[idx] = 0 goto target
-      if FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]] = 0 then
-        FPC := Instr.Immediate - 1;
-
-    // NEW: Array Swap (Int) - opcode 250
-    // Format: Src1=arr_index, Src2=idx1_reg, Dest=idx2_reg
-    250: // bcArraySwapInt: swap arr[idx1] and arr[idx2]
-      begin
-        // Inline swap using FIntRegs indices directly
-        FSwapTempInt := FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]];
-        FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[FIntRegs[Instr.Dest]];
-        FArrays[Instr.Src1].IntData[FIntRegs[Instr.Dest]] := FSwapTempInt;
-      end;
-
-    // NEW: Self-increment/decrement (Int) - opcodes 251-252
-    // Format: Dest=register to modify, Src1=amount register
-    251: // bcAddIntSelf: r[dest] += r[src1]
-      Inc(FIntRegs[Instr.Dest], FIntRegs[Instr.Src1]);
-    252: // bcSubIntSelf: r[dest] -= r[src1]
-      Dec(FIntRegs[Instr.Dest], FIntRegs[Instr.Src1]);
-
-    // NEW: Array Load to register (Int) - opcode 253
-    // Format: Dest=final destination, Src1=arr_index, Src2=idx_reg
-    253: // bcArrayLoadIntTo: r[dest] = arr[src1][r[src2]]
-      FIntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]];
-
-    // NEW: Array Copy Element - opcode 254
-    // Format: Dest=dest_arr_index, Src1=src_arr_index, Src2=idx_reg
-    254: // bcArrayCopyElement: arr_dest[idx] = arr_src[idx]
-      FArrays[Instr.Dest].IntData[FIntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[FIntRegs[Instr.Src2]];
-
-    // NEW: Array Move Element - opcode 255
-    // Format: Dest=arr_index, Src1=src_idx_reg, Src2=dest_idx_reg
-    255: // bcArrayMoveElement: arr[dest_idx] = arr[src_idx]
-      FArrays[Instr.Dest].IntData[FIntRegs[Instr.Src2]] := FArrays[Instr.Dest].IntData[FIntRegs[Instr.Src1]];
-
-    // NEW: Array Reverse Range - opcode 156
-    // Format: Src1=arr_index, Src2=start_idx_reg, Dest=end_idx_reg
-    156: // bcArrayReverseRange: reverse arr[start..end-1] in-place
-      begin
-        FStartIdx := FIntRegs[Instr.Src2];
-        FEndIdx := FIntRegs[Instr.Dest] - 1;
-        FArrIdxTmp := Instr.Src1;
-        while FStartIdx < FEndIdx do
-        begin
-          FSwapTempInt := FArrays[FArrIdxTmp].IntData[FStartIdx];
-          FArrays[FArrIdxTmp].IntData[FStartIdx] := FArrays[FArrIdxTmp].IntData[FEndIdx];
-          FArrays[FArrIdxTmp].IntData[FEndIdx] := FSwapTempInt;
-          Inc(FStartIdx);
-          Dec(FEndIdx);
-        end;
-      end;
-
-    // NEW: Array Shift Left - opcode 157
-    // Format: Src1=arr_index, Src2=start_idx_reg, Dest=end_idx_reg
-    157: // bcArrayShiftLeft: shift left and rotate first to end+1
-      begin
-        FStartIdx := FIntRegs[Instr.Src2];
-        FEndIdx := FIntRegs[Instr.Dest];
-        FArrIdxTmp := Instr.Src1;
-        FFirstVal := FArrays[FArrIdxTmp].IntData[FStartIdx];
-        FLoopIdx := FStartIdx;
-        while FLoopIdx <= FEndIdx do
-        begin
-          FArrays[FArrIdxTmp].IntData[FLoopIdx] := FArrays[FArrIdxTmp].IntData[FLoopIdx + 1];
-          Inc(FLoopIdx);
-        end;
-        FArrays[FArrIdxTmp].IntData[FEndIdx + 1] := FFirstVal;
       end;
   else
-    raise Exception.CreateFmt('Unknown superinstruction opcode %d at PC=%d', [Instr.OpCode, FPC]);
-  end; // case Instr.OpCode (superinstructions)
+    raise Exception.CreateFmt('Unknown file I/O opcode %d at PC=%d', [Instr.OpCode, FPC]);
+  end;
 end;
 
-procedure TBytecodeVM.Step;
-var Instr: TBytecodeInstruction;
+{ ========== FILE MANAGEMENT COMMANDS (executed directly in VM) ========== }
+
+procedure TBytecodeVM.ExecuteCopyFile(const Src, Dest: string; Overwrite: Boolean);
+var
+  SrcStream, DstStream: TFileStream;
+  SearchRec: TSearchRec;
+  SrcDir, SrcPattern, SrcFullPath, DstFullPath: string;
+  HasWildcard: Boolean;
 begin
-  if (FProgram = nil) or (FPC >= FProgram.GetInstructionCount) then
+  // Check for wildcards in source
+  HasWildcard := (Pos('*', Src) > 0) or (Pos('?', Src) > 0);
+
+  // Extract directory and pattern
+  SrcDir := ExtractFilePath(Src);
+  if SrcDir = '' then
+    SrcDir := GetCurrentDir;
+  SrcPattern := ExtractFileName(Src);
+
+  if HasWildcard then
   begin
-    FRunning := False;
-    Exit;
-  end;
-  Instr := FProgram.GetInstruction(FPC);
+    // Wildcard copy - destination must be a directory
+    if not DirectoryExists(Dest) then
+      raise Exception.Create('?DESTINATION MUST BE A DIRECTORY FOR WILDCARDS');
 
-  {$IFDEF ENABLE_PROFILER}
-  // Profiler: BeforeInstruction hook
-  if Assigned(FProfiler) and FProfiler.Enabled then
-    FProfiler.BeforeInstruction(FPC, Instr.OpCode);
-  {$ENDIF}
+    if FindFirst(IncludeTrailingPathDelimiter(SrcDir) + SrcPattern,
+                 faAnyFile and not faDirectory, SearchRec) = 0 then
+    begin
+      try
+        repeat
+          SrcFullPath := IncludeTrailingPathDelimiter(SrcDir) + SearchRec.Name;
+          DstFullPath := IncludeTrailingPathDelimiter(Dest) + SearchRec.Name;
 
-  ExecuteInstruction(Instr);
+          // Check overwrite
+          if FileExists(DstFullPath) and not Overwrite then
+            Continue;
 
-  {$IFDEF ENABLE_PROFILER}
-  // Profiler: AfterInstruction hook
-  if Assigned(FProfiler) and FProfiler.Enabled then
+          // Copy file
+          SrcStream := TFileStream.Create(SrcFullPath, fmOpenRead or fmShareDenyWrite);
+          try
+            DstStream := TFileStream.Create(DstFullPath, fmCreate);
+            try
+              DstStream.CopyFrom(SrcStream, SrcStream.Size);
+            finally
+              DstStream.Free;
+            end;
+          finally
+            SrcStream.Free;
+          end;
+        until FindNext(SearchRec) <> 0;
+      finally
+        SysUtils.FindClose(SearchRec);
+      end;
+    end
+    else
+      raise Exception.Create('?FILE NOT FOUND');
+  end
+  else
   begin
-    FProfiler.AfterInstruction(FPC, Instr.OpCode);
-    // Track superinstructions
-    if Instr.OpCode >= 110 then
-      FProfiler.OnSuperinstruction(Instr.OpCode, 1);
-  end;
-  {$ENDIF}
+    // Single file copy
+    if not FileExists(Src) then
+      raise Exception.Create('?FILE NOT FOUND: ' + ExtractFileName(Src));
 
-  {$IFDEF ENABLE_INSTRUCTION_COUNTING}
-  Inc(FInstructionsExecuted);
-  {$ENDIF}
-  Inc(FPC);
+    // Determine destination
+    if DirectoryExists(Dest) then
+      DstFullPath := IncludeTrailingPathDelimiter(Dest) + ExtractFileName(Src)
+    else
+      DstFullPath := Dest;
+
+    // Check overwrite
+    if FileExists(DstFullPath) and not Overwrite then
+      raise Exception.Create('?FILE EXISTS: ' + ExtractFileName(DstFullPath));
+
+    // Copy file
+    SrcStream := TFileStream.Create(Src, fmOpenRead or fmShareDenyWrite);
+    try
+      DstStream := TFileStream.Create(DstFullPath, fmCreate);
+      try
+        DstStream.CopyFrom(SrcStream, SrcStream.Size);
+      finally
+        DstStream.Free;
+      end;
+    finally
+      SrcStream.Free;
+    end;
+  end;
 end;
 
-procedure TBytecodeVM.Run;
+procedure TBytecodeVM.ExecuteScratch(const Pattern: string; Force: Boolean);
+var
+  SearchRec: TSearchRec;
+  SrcDir, SrcPattern, FullPath: string;
 begin
-  if FProgram = nil then raise Exception.Create('No program loaded');
+  // Extract directory and pattern
+  SrcDir := ExtractFilePath(Pattern);
+  if SrcDir = '' then
+    SrcDir := GetCurrentDir;
+  SrcPattern := ExtractFileName(Pattern);
+
+  if FindFirst(IncludeTrailingPathDelimiter(SrcDir) + SrcPattern,
+               faAnyFile and not faDirectory, SearchRec) = 0 then
+  begin
+    try
+      repeat
+        FullPath := IncludeTrailingPathDelimiter(SrcDir) + SearchRec.Name;
+
+        // Delete file
+        if not SysUtils.DeleteFile(FullPath) then
+        begin
+          if not Force then
+            raise Exception.Create('?CANNOT DELETE: ' + SearchRec.Name);
+        end;
+      until FindNext(SearchRec) <> 0;
+    finally
+      SysUtils.FindClose(SearchRec);
+    end;
+  end
+  else
+  begin
+    if not Force then
+      raise Exception.Create('?FILE NOT FOUND');
+  end;
+end;
+
+procedure TBytecodeVM.ExecuteRenameFile(const OldName, NewName: string);
+begin
+  if not FileExists(OldName) then
+    raise Exception.Create('?FILE NOT FOUND: ' + ExtractFileName(OldName));
+
+  if FileExists(NewName) then
+    raise Exception.Create('?FILE EXISTS: ' + ExtractFileName(NewName));
+
+  if not SysUtils.RenameFile(OldName, NewName) then
+    raise Exception.Create('?CANNOT RENAME FILE');
+end;
+
+procedure TBytecodeVM.ExecuteConcat(const Src, Dest: string);
+var
+  SrcStream, DstStream: TFileStream;
+begin
+  // Source must exist
+  if not FileExists(Src) then
+    raise Exception.Create('?FILE NOT FOUND: ' + ExtractFileName(Src));
+
+  // Destination must exist (we append to it)
+  if not FileExists(Dest) then
+    raise Exception.Create('?FILE NOT FOUND: ' + ExtractFileName(Dest));
+
+  // Open source for reading
+  SrcStream := TFileStream.Create(Src, fmOpenRead or fmShareDenyWrite);
+  try
+    // Open destination for appending
+    DstStream := TFileStream.Create(Dest, fmOpenReadWrite or fmShareDenyWrite);
+    try
+      DstStream.Seek(0, soFromEnd);  // Move to end
+      DstStream.CopyFrom(SrcStream, SrcStream.Size);
+    finally
+      DstStream.Free;
+    end;
+  finally
+    SrcStream.Free;
+  end;
+end;
+
+procedure TBytecodeVM.ExecuteMkdir(const Path: string);
+begin
+  if DirectoryExists(Path) then
+    raise Exception.Create('?DIRECTORY EXISTS: ' + Path);
+
+  if not ForceDirectories(Path) then
+    raise Exception.Create('?CANNOT CREATE DIRECTORY: ' + Path);
+end;
+
+procedure TBytecodeVM.ExecuteChdir(const Path: string);
+begin
+  if not DirectoryExists(Path) then
+    raise Exception.Create('?DIRECTORY NOT FOUND: ' + Path);
+
+  if not SetCurrentDir(Path) then
+    raise Exception.Create('?CANNOT CHANGE DIRECTORY: ' + Path);
+end;
+
+procedure TBytecodeVM.ExecuteMoveFile(const Src, Dest: string);
+var
+  DstFullPath: string;
+begin
+  if not FileExists(Src) then
+    raise Exception.Create('?FILE NOT FOUND: ' + ExtractFileName(Src));
+
+  // Determine destination
+  if DirectoryExists(Dest) then
+    DstFullPath := IncludeTrailingPathDelimiter(Dest) + ExtractFileName(Src)
+  else
+    DstFullPath := Dest;
+
+  if FileExists(DstFullPath) then
+    raise Exception.Create('?FILE EXISTS: ' + ExtractFileName(DstFullPath));
+
+  // Try rename first (works if same volume)
+  if not SysUtils.RenameFile(Src, DstFullPath) then
+  begin
+    // If rename fails (different volumes), copy then delete
+    ExecuteCopyFile(Src, DstFullPath, False);
+    if not SysUtils.DeleteFile(Src) then
+      raise Exception.Create('?CANNOT DELETE SOURCE AFTER MOVE');
+  end;
+end;
+
+procedure TBytecodeVM.Continue;
+begin
+  if not FStopped then
+    raise Exception.Create('?CAN''T CONTINUE ERROR');
+  if FProgram = nil then
+    raise Exception.Create('?CAN''T CONTINUE ERROR');
+  if FStoppedPC >= FProgram.GetInstructionCount then
+    raise Exception.Create('?CAN''T CONTINUE ERROR');
+
+  // Resume execution from saved position
+  FPC := FStoppedPC;
   FRunning := True;
-  FPC := FProgram.EntryPoint;
+  FStopped := False;
 
-  {$IFDEF ENABLE_PROFILER}
-  // Start profiler if attached
-  if Assigned(FProfiler) then
-    FProfiler.Start;
-  {$ENDIF}
-
+  // Continue the execution loop
   while FRunning and (FPC < FProgram.GetInstructionCount) do Step;
 
-  {$IFDEF ENABLE_PROFILER}
-  // Stop profiler
-  if Assigned(FProfiler) then
-    FProfiler.Stop;
-  {$ENDIF}
-
-  // Reset FAST mode when program ends (ensure screen is visible)
+  // Reset FAST mode when program ends
   if Assigned(FOutputDevice) then
     FOutputDevice.SetFastMode(False);
 end;
-
-{ RunFast - Optimized execution loop
-  - Direct pointer access to instruction array (no method calls)
-  - Inline dispatch (no procedure calls for each instruction)
-  - Range checking disabled in critical path
-  - No profiler support for maximum speed }
-procedure TBytecodeVM.RunFast;
-type
-  PBytecodeInstruction = ^TBytecodeInstruction;
-var
-  Instructions: PBytecodeInstruction;
-  InstrCount: Integer;
-  CurPC: Integer;  // Current Program Counter (local for speed)
-  Instr: TBytecodeInstruction;
-  Op: Byte;
-  // Local copies of frequently accessed fields for better register allocation
-  IntRegs: PInt64;
-  FloatRegs: PDouble;
-  ArrayIdx, LinearIdx: Integer;
-  InputStr, PrintStr: string;
-  InputVal: Double;
-  i, ProdDims: Integer;
-  NextTabCol, TabIdx: Integer;
-  ArrInfo: TSSAArrayInfo;
-  // Local vars for ArrayReverseRange and ArrayShiftLeft
-  ArrIdxW: Word;
-  LStartIdx, LEndIdx, LLoopIdx: Integer;
-  LFirstVal: Int64;
-begin
-  if FProgram = nil then raise Exception.Create('No program loaded');
-
-  Instructions := PBytecodeInstruction(FProgram.GetInstructionsPtr);
-  if Instructions = nil then raise Exception.Create('Empty program');
-
-  InstrCount := FProgram.GetInstructionCount;
-  CurPC := FProgram.EntryPoint;
-
-  // Get direct pointers to register arrays
-  IntRegs := @FIntRegs[0];
-  FloatRegs := @FFloatRegs[0];
-
-  // Main execution loop - disable range checking for speed
-  {$PUSH}
-  {$R-}  // Range checking off
-  {$Q-}  // Overflow checking off
-
-  while CurPC < InstrCount do
-  begin
-    Instr := Instructions[CurPC];
-    Op := Instr.OpCode;
-
-    {$IFDEF ENABLE_INSTRUCTION_COUNTING}
-    Inc(FInstructionsExecuted);
-    {$ENDIF}
-
-    // Fast path: check for superinstructions first (most common in optimized code)
-    if Op >= 110 then
-    begin
-      case Op of
-        // Fused loop increment-and-branch (most common in hot loops)
-        190: // AddIntToBranchLe
-          begin
-            Inc(IntRegs[Instr.Dest], IntRegs[Instr.Src1]);
-            if IntRegs[Instr.Dest] <= IntRegs[Instr.Src2] then
-              CurPC := Instr.Immediate
-            else
-              Inc(CurPC);
-          end;
-        191: // AddIntToBranchLt
-          begin
-            Inc(IntRegs[Instr.Dest], IntRegs[Instr.Src1]);
-            if IntRegs[Instr.Dest] < IntRegs[Instr.Src2] then
-              CurPC := Instr.Immediate
-            else
-              Inc(CurPC);
-          end;
-        192: // SubIntToBranchGe
-          begin
-            Dec(IntRegs[Instr.Dest], IntRegs[Instr.Src1]);
-            if IntRegs[Instr.Dest] >= IntRegs[Instr.Src2] then
-              CurPC := Instr.Immediate
-            else
-              Inc(CurPC);
-          end;
-        193: // SubIntToBranchGt
-          begin
-            Dec(IntRegs[Instr.Dest], IntRegs[Instr.Src1]);
-            if IntRegs[Instr.Dest] > IntRegs[Instr.Src2] then
-              CurPC := Instr.Immediate
-            else
-              Inc(CurPC);
-          end;
-
-        // Fused compare-and-branch (Int)
-        100: if IntRegs[Instr.Src1] = IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);
-        101: if IntRegs[Instr.Src1] <> IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);
-        102: if IntRegs[Instr.Src1] < IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);
-        103: if IntRegs[Instr.Src1] > IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);
-        104: if IntRegs[Instr.Src1] <= IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);
-        105: if IntRegs[Instr.Src1] >= IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);
-
-        // Fused compare-and-branch (Float)
-        110: if FloatRegs[Instr.Src1] = FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);
-        111: if FloatRegs[Instr.Src1] <> FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);
-        112: if FloatRegs[Instr.Src1] < FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);
-        113: if FloatRegs[Instr.Src1] > FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);
-        114: if FloatRegs[Instr.Src1] <= FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);
-        115: if FloatRegs[Instr.Src1] >= FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);
-
-        // Fused arithmetic-to-dest (Int)
-        120: begin IntRegs[Instr.Dest] := IntRegs[Instr.Dest] + IntRegs[Instr.Src1]; Inc(CurPC); end;
-        121: begin IntRegs[Instr.Dest] := IntRegs[Instr.Dest] - IntRegs[Instr.Src1]; Inc(CurPC); end;
-        122: begin IntRegs[Instr.Dest] := IntRegs[Instr.Dest] * IntRegs[Instr.Src1]; Inc(CurPC); end;
-
-        // Fused arithmetic-to-dest (Float)
-        130: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] + FloatRegs[Instr.Src1]; Inc(CurPC); end;
-        131: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] - FloatRegs[Instr.Src1]; Inc(CurPC); end;
-        132: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] * FloatRegs[Instr.Src1]; Inc(CurPC); end;
-        133: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] / FloatRegs[Instr.Src1]; Inc(CurPC); end;
-
-        // Fused constant arithmetic (Int)
-        140: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] + Instr.Immediate; Inc(CurPC); end;
-        141: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] - Instr.Immediate; Inc(CurPC); end;
-        142: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] * Instr.Immediate; Inc(CurPC); end;
-
-        // Fused constant arithmetic (Float)
-        150: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] + Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end;
-        151: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] - Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end;
-        152: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end;
-        153: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end;
-
-        // Fused compare-zero-and-branch (Int)
-        160: if IntRegs[Instr.Src1] = 0 then CurPC := Instr.Immediate else Inc(CurPC);
-        161: if IntRegs[Instr.Src1] <> 0 then CurPC := Instr.Immediate else Inc(CurPC);
-
-        // Fused compare-zero-and-branch (Float)
-        170: if FloatRegs[Instr.Src1] = 0.0 then CurPC := Instr.Immediate else Inc(CurPC);
-        171: if FloatRegs[Instr.Src1] <> 0.0 then CurPC := Instr.Immediate else Inc(CurPC);
-
-        // Fused array-store-constant
-        180: begin FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] := Instr.Immediate; Inc(CurPC); end;
-        181: begin FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]] := Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end;
-        182: begin FArrays[Instr.Src1].StringData[IntRegs[Instr.Src2]] := FProgram.StringConstants[Instr.Immediate]; Inc(CurPC); end;
-
-        // NEW: FMA (Fused Multiply-Add) - opcodes 200-203
-        // Format: Dest, Src1=a, Src2=b, Immediate=c (extra register)
-        200: begin // bcMulAddFloat: dest = c + a*b
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate] + FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2];
-          Inc(CurPC);
-        end;
-        201: begin // bcMulSubFloat: dest = c - a*b
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate] - FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2];
-          Inc(CurPC);
-        end;
-        202: begin // bcMulAddToFloat: dest += a*b
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] + FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2];
-          Inc(CurPC);
-        end;
-        203: begin // bcMulSubToFloat: dest -= a*b
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] - FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2];
-          Inc(CurPC);
-        end;
-
-        // NEW: Array Load + Arithmetic - opcodes 210-212
-        // Format: Dest, Src1=arr_index, Src2=idx_reg, Immediate=acc_reg
-        210: begin // bcArrayLoadAddFloat: dest = acc + arr[idx]
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate] + FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]];
-          Inc(CurPC);
-        end;
-        211: begin // bcArrayLoadSubFloat: dest = acc - arr[idx]
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate] - FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]];
-          Inc(CurPC);
-        end;
-        212: begin // bcArrayLoadDivAddFloat: dest = acc + arr[idx] / denom
-          // Extra encodes: acc_reg (low 16) + denom_reg (high 16)
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate and $FFFF] +
-            FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]] / FloatRegs[(Instr.Immediate shr 16) and $FFFF];
-          Inc(CurPC);
-        end;
-
-        // NEW: Square-Sum patterns - opcodes 220-221
-        220: begin // bcSquareSumFloat: dest = x*x + y*y
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * FloatRegs[Instr.Src1] +
-                                   FloatRegs[Instr.Src2] * FloatRegs[Instr.Src2];
-          Inc(CurPC);
-        end;
-        221: begin // bcAddSquareFloat: dest = sum + x*x
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] + FloatRegs[Instr.Src2] * FloatRegs[Instr.Src2];
-          Inc(CurPC);
-        end;
-
-        // NEW: Mul-Mul and Add-Sqrt - opcodes 230-231
-        230: begin // bcMulMulFloat: dest = a*b*c
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2] * FloatRegs[Instr.Immediate];
-          Inc(CurPC);
-        end;
-        231: begin // bcAddSqrtFloat: dest = sqrt(a+b)
-          FloatRegs[Instr.Dest] := Sqrt(FloatRegs[Instr.Src1] + FloatRegs[Instr.Src2]);
-          Inc(CurPC);
-        end;
-
-        // NEW: Array Load + Branch - opcodes 240-241
-        240: // bcArrayLoadIntBranchNZ: if arr[idx] <> 0 goto target
-          if FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] <> 0 then
-            CurPC := Instr.Immediate
-          else
-            Inc(CurPC);
-        241: // bcArrayLoadIntBranchZ: if arr[idx] = 0 goto target
-          if FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] = 0 then
-            CurPC := Instr.Immediate
-          else
-            Inc(CurPC);
-
-        // NEW: Array Swap (Int) - opcode 250
-        // Format: Src1=arr_index, Src2=idx1_reg, Dest=idx2_reg
-        250: // bcArraySwapInt: swap arr[idx1] and arr[idx2]
-          begin
-            // Use class field FSwapTempInt as temp variable
-            FSwapTempInt := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]];
-            FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Dest]];
-            FArrays[Instr.Src1].IntData[IntRegs[Instr.Dest]] := FSwapTempInt;
-            Inc(CurPC);
-          end;
-
-        // NEW: Self-increment/decrement (Int) - opcodes 251-252
-        // Format: Dest=register to modify, Src1=amount register
-        251: begin Inc(IntRegs[Instr.Dest], IntRegs[Instr.Src1]); Inc(CurPC); end; // bcAddIntSelf
-        252: begin Dec(IntRegs[Instr.Dest], IntRegs[Instr.Src1]); Inc(CurPC); end; // bcSubIntSelf
-
-        // NEW: Array Load to register (Int) - opcode 253
-        253: begin IntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]]; Inc(CurPC); end; // bcArrayLoadIntTo
-
-        // NEW: Array Copy Element - opcode 254
-        254: begin FArrays[Instr.Dest].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]]; Inc(CurPC); end;
-
-        // NEW: Array Move Element - opcode 255
-        255: begin FArrays[Instr.Dest].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Dest].IntData[IntRegs[Instr.Src1]]; Inc(CurPC); end;
-
-        // NEW: Array Reverse Range - opcode 156
-        156: // bcArrayReverseRange
-          begin
-            LStartIdx := IntRegs[Instr.Src2];
-            LEndIdx := IntRegs[Instr.Dest] - 1;
-            ArrIdxW := Instr.Src1;
-            while LStartIdx < LEndIdx do
-            begin
-              FSwapTempInt := FArrays[ArrIdxW].IntData[LStartIdx];
-              FArrays[ArrIdxW].IntData[LStartIdx] := FArrays[ArrIdxW].IntData[LEndIdx];
-              FArrays[ArrIdxW].IntData[LEndIdx] := FSwapTempInt;
-              Inc(LStartIdx);
-              Dec(LEndIdx);
-            end;
-            Inc(CurPC);
-          end;
-
-        // NEW: Array Shift Left - opcode 157
-        157: // bcArrayShiftLeft
-          begin
-            LStartIdx := IntRegs[Instr.Src2];
-            LEndIdx := IntRegs[Instr.Dest];
-            ArrIdxW := Instr.Src1;
-            LFirstVal := FArrays[ArrIdxW].IntData[LStartIdx];
-            LLoopIdx := LStartIdx;
-            while LLoopIdx <= LEndIdx do
-            begin
-              FArrays[ArrIdxW].IntData[LLoopIdx] := FArrays[ArrIdxW].IntData[LLoopIdx + 1];
-              Inc(LLoopIdx);
-            end;
-            FArrays[ArrIdxW].IntData[LEndIdx + 1] := LFirstVal;
-            Inc(CurPC);
-          end;
-      else
-        raise Exception.CreateFmt('Unknown superinstruction opcode %d at CurPC=%d', [Op, CurPC]);
-      end;
-    end
-    else
-    begin
-      // Standard bytecode opcodes
-      case TBytecodeOp(Op) of
-        // Load constants - very common
-        bcLoadConstInt: begin IntRegs[Instr.Dest] := Instr.Immediate; Inc(CurPC); end;
-        bcLoadConstFloat: begin FloatRegs[Instr.Dest] := Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end;
-        bcLoadConstString: begin FStringRegs[Instr.Dest] := FProgram.StringConstants[Instr.Immediate]; Inc(CurPC); end;
-
-        // Copy operations
-        bcCopyInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1]; Inc(CurPC); end;
-        bcCopyFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1]; Inc(CurPC); end;
-        bcCopyString: begin FStringRegs[Instr.Dest] := FStringRegs[Instr.Src1]; Inc(CurPC); end;
-
-        // Integer arithmetic
-        bcAddInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] + IntRegs[Instr.Src2]; Inc(CurPC); end;
-        bcSubInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] - IntRegs[Instr.Src2]; Inc(CurPC); end;
-        bcMulInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] * IntRegs[Instr.Src2]; Inc(CurPC); end;
-        bcDivInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] div IntRegs[Instr.Src2]; Inc(CurPC); end;
-        bcModInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] mod IntRegs[Instr.Src2]; Inc(CurPC); end;
-        bcNegInt: begin IntRegs[Instr.Dest] := -IntRegs[Instr.Src1]; Inc(CurPC); end;
-
-        // Float arithmetic - critical for spectral-norm
-        bcAddFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] + FloatRegs[Instr.Src2]; Inc(CurPC); end;
-        bcSubFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] - FloatRegs[Instr.Src2]; Inc(CurPC); end;
-        bcMulFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2]; Inc(CurPC); end;
-        bcDivFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / FloatRegs[Instr.Src2]; Inc(CurPC); end;
-        bcPowFloat: begin FloatRegs[Instr.Dest] := Power(FloatRegs[Instr.Src1], FloatRegs[Instr.Src2]); Inc(CurPC); end;
-        bcNegFloat: begin FloatRegs[Instr.Dest] := -FloatRegs[Instr.Src1]; Inc(CurPC); end;
-
-        // Type conversions
-        bcIntToFloat: begin FloatRegs[Instr.Dest] := IntRegs[Instr.Src1]; Inc(CurPC); end;
-        bcFloatToInt: begin IntRegs[Instr.Dest] := Trunc(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-
-        // Integer comparisons
-        bcCmpEqInt: begin IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] = IntRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpNeInt: begin IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] <> IntRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpLtInt: begin IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] < IntRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpGtInt: begin IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] > IntRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpLeInt: begin IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] <= IntRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpGeInt: begin IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] >= IntRegs[Instr.Src2]); Inc(CurPC); end;
-
-        // Float comparisons
-        bcCmpEqFloat: begin IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] = FloatRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpNeFloat: begin IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] <> FloatRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpLtFloat: begin IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] < FloatRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpGtFloat: begin IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] > FloatRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpLeFloat: begin IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] <= FloatRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpGeFloat: begin IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] >= FloatRegs[Instr.Src2]); Inc(CurPC); end;
-
-        // String comparisons
-        bcCmpEqString: begin IntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] = FStringRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpNeString: begin IntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] <> FStringRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpLtString: begin IntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] < FStringRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpGtString: begin IntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] > FStringRegs[Instr.Src2]); Inc(CurPC); end;
-
-        // Math functions
-        bcMathAbs: begin FloatRegs[Instr.Dest] := Abs(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathSgn: begin
-          if FloatRegs[Instr.Src1] > 0 then FloatRegs[Instr.Dest] := 1
-          else if FloatRegs[Instr.Src1] < 0 then FloatRegs[Instr.Dest] := -1
-          else FloatRegs[Instr.Dest] := 0;
-          Inc(CurPC);
-        end;
-        bcMathInt: begin FloatRegs[Instr.Dest] := Floor(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathSqr: begin FloatRegs[Instr.Dest] := Sqrt(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathSin: begin FloatRegs[Instr.Dest] := Sin(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathCos: begin FloatRegs[Instr.Dest] := Cos(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathTan: begin FloatRegs[Instr.Dest] := Tan(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathExp: begin FloatRegs[Instr.Dest] := Exp(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathLog: begin FloatRegs[Instr.Dest] := Ln(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathRnd: begin FloatRegs[Instr.Dest] := Random; Inc(CurPC); end;
-        bcMathAtn: begin FloatRegs[Instr.Dest] := ArcTan(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-
-        // Control flow
-        bcJump: CurPC := Instr.Immediate;
-        bcJumpIfZero: if IntRegs[Instr.Src1] = 0 then CurPC := Instr.Immediate else Inc(CurPC);
-        bcJumpIfNotZero: if IntRegs[Instr.Src1] <> 0 then CurPC := Instr.Immediate else Inc(CurPC);
-        bcCall:
-          begin
-            FCallStack[FCallStackPtr] := CurPC + 1;
-            Inc(FCallStackPtr);
-            CurPC := Instr.Immediate;
-          end;
-        bcReturn:
-          begin
-            Dec(FCallStackPtr);
-            CurPC := FCallStack[FCallStackPtr];
-          end;
-
-        // Array operations - typed versions are faster
-        bcArrayLoadInt:
-          begin
-            FIntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]];
-            Inc(CurPC);
-          end;
-        bcArrayLoadFloat:
-          begin
-            FFloatRegs[Instr.Dest] := FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]];
-            Inc(CurPC);
-          end;
-        bcArrayLoadString:
-          begin
-            FStringRegs[Instr.Dest] := FArrays[Instr.Src1].StringData[IntRegs[Instr.Src2]];
-            Inc(CurPC);
-          end;
-        bcArrayStoreInt:
-          begin
-            FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] := IntRegs[Instr.Dest];
-            Inc(CurPC);
-          end;
-        bcArrayStoreFloat:
-          begin
-            FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]] := FloatRegs[Instr.Dest];
-            Inc(CurPC);
-          end;
-        bcArrayStoreString:
-          begin
-            FArrays[Instr.Src1].StringData[IntRegs[Instr.Src2]] := FStringRegs[Instr.Dest];
-            Inc(CurPC);
-          end;
-
-        // Array dimension (slow path - only at initialization)
-        bcArrayDim:
-          begin
-            ArrayIdx := Instr.Src1;
-            ArrInfo := FProgram.GetArray(ArrayIdx);
-            if ArrayIdx >= Length(FArrays) then
-              SetLength(FArrays, ArrayIdx + 1);
-            FArrays[ArrayIdx].ElementType := Byte(ArrInfo.ElementType);
-            FArrays[ArrayIdx].DimCount := ArrInfo.DimCount;
-            SetLength(FArrays[ArrayIdx].Dimensions, ArrInfo.DimCount);
-            for i := 0 to ArrInfo.DimCount - 1 do
-            begin
-              if ArrInfo.Dimensions[i] = 0 then
-              begin
-                case ArrInfo.DimRegTypes[i] of
-                  srtInt: FArrays[ArrayIdx].Dimensions[i] := IntRegs[ArrInfo.DimRegisters[i]] + 1;
-                  srtFloat: FArrays[ArrayIdx].Dimensions[i] := Trunc(FloatRegs[ArrInfo.DimRegisters[i]]) + 1;
-                end;
-              end
-              else
-                FArrays[ArrayIdx].Dimensions[i] := ArrInfo.Dimensions[i];
-            end;
-            ProdDims := 1;
-            for i := 0 to ArrInfo.DimCount - 1 do
-              ProdDims := ProdDims * FArrays[ArrayIdx].Dimensions[i];
-            FArrays[ArrayIdx].TotalSize := ProdDims;
-            case ArrInfo.ElementType of
-              srtInt: SetLength(FArrays[ArrayIdx].IntData, ProdDims);
-              srtFloat: SetLength(FArrays[ArrayIdx].FloatData, ProdDims);
-              srtString: SetLength(FArrays[ArrayIdx].StringData, ProdDims);
-            end;
-            Inc(CurPC);
-          end;
-
-        // Generic array load/store (slower - legacy)
-        bcArrayLoad:
-          begin
-            ArrayIdx := Instr.Src1;
-            LinearIdx := IntRegs[Instr.Src2];
-            case FArrays[ArrayIdx].ElementType of
-              0: FIntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
-              1: FFloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
-              2: FStringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
-            end;
-            Inc(CurPC);
-          end;
-        bcArrayStore:
-          begin
-            ArrayIdx := Instr.Src1;
-            LinearIdx := IntRegs[Instr.Src2];
-            case FArrays[ArrayIdx].ElementType of
-              0: FArrays[ArrayIdx].IntData[LinearIdx] := FIntRegs[Instr.Dest];
-              1: FArrays[ArrayIdx].FloatData[LinearIdx] := FFloatRegs[Instr.Dest];
-              2: FArrays[ArrayIdx].StringData[LinearIdx] := FStringRegs[Instr.Dest];
-            end;
-            Inc(CurPC);
-          end;
-
-        // I/O operations (slow path - not in hot loops)
-        bcPrint:
-          begin
-            if Assigned(FOutputDevice) then
-            begin
-              PrintStr := FConsoleBehavior.FormatNumber(FloatRegs[Instr.Src1]);
-              FOutputDevice.Print(PrintStr);
-              Inc(FCursorCol, Length(PrintStr));
-            end;
-            Inc(CurPC);
-          end;
-        bcPrintLn:
-          begin
-            if Assigned(FOutputDevice) then
-            begin
-              PrintStr := FConsoleBehavior.FormatNumber(FloatRegs[Instr.Src1]);
-              FOutputDevice.Print(PrintStr);
-              FOutputDevice.NewLine;
-              FCursorCol := 0;
-            end;
-            Inc(CurPC);
-          end;
-        bcPrintInt:
-          begin
-            if Assigned(FOutputDevice) then
-            begin
-              PrintStr := FConsoleBehavior.FormatNumber(IntRegs[Instr.Src1]);
-              FOutputDevice.Print(PrintStr);
-              Inc(FCursorCol, Length(PrintStr));
-            end;
-            Inc(CurPC);
-          end;
-        bcPrintIntLn:
-          begin
-            if Assigned(FOutputDevice) then
-            begin
-              PrintStr := FConsoleBehavior.FormatNumber(IntRegs[Instr.Src1]);
-              FOutputDevice.Print(PrintStr);
-              FOutputDevice.NewLine;
-              FCursorCol := 0;
-            end;
-            Inc(CurPC);
-          end;
-        bcPrintString:
-          begin
-            if Assigned(FOutputDevice) then
-            begin
-              PrintStr := FConsoleBehavior.FormatString(FStringRegs[Instr.Src1]);
-              FOutputDevice.Print(PrintStr);
-              Inc(FCursorCol, Length(PrintStr));
-            end;
-            Inc(CurPC);
-          end;
-        bcPrintStringLn:
-          begin
-            if Assigned(FOutputDevice) then
-            begin
-              PrintStr := FConsoleBehavior.FormatString(FStringRegs[Instr.Src1]);
-              FOutputDevice.Print(PrintStr);
-              FOutputDevice.NewLine;
-              FCursorCol := 0;
-            end;
-            Inc(CurPC);
-          end;
-        bcPrintComma:
-          begin
-            if Assigned(FOutputDevice) then
-            begin
-              NextTabCol := FConsoleBehavior.GetNextTabPosition(FCursorCol);
-              if NextTabCol = 0 then
-              begin
-                FOutputDevice.NewLine;
-                FCursorCol := 0;
-              end
-              else if FConsoleBehavior.CommaAction = caTabZone then
-              begin
-                while FCursorCol < NextTabCol do
-                begin
-                  FOutputDevice.Print(' ');
-                  Inc(FCursorCol);
-                end;
-              end
-              else if FConsoleBehavior.CommaAction = caFixedSpaces then
-              begin
-                for TabIdx := 1 to FConsoleBehavior.CommaSpaces do
-                begin
-                  FOutputDevice.Print(' ');
-                  Inc(FCursorCol);
-                end;
-              end
-              else if FConsoleBehavior.CommaAction = caNewLine then
-              begin
-                FOutputDevice.NewLine;
-                FCursorCol := 0;
-              end;
-            end;
-            Inc(CurPC);
-          end;
-        bcPrintSemicolon:
-          begin
-            if Assigned(FOutputDevice) then
-            begin
-              case FConsoleBehavior.SemicolonAction of
-                saNoSpace: ;
-                saSpaceAfter, saSpaceBoth:
-                  begin
-                    FOutputDevice.Print(' ');
-                    Inc(FCursorCol);
-                  end;
-                saSpaceBefore: ;
-              end;
-            end;
-            Inc(CurPC);
-          end;
-        bcPrintTab:
-          begin
-            if Assigned(FOutputDevice) then
-            begin
-              NextTabCol := Instr.Immediate;
-              if NextTabCol < 1 then NextTabCol := 1;
-              Dec(NextTabCol);
-              if FCursorCol < NextTabCol then
-              begin
-                while FCursorCol < NextTabCol do
-                begin
-                  FOutputDevice.Print(' ');
-                  Inc(FCursorCol);
-                end;
-              end
-              else if FCursorCol > NextTabCol then
-              begin
-                FOutputDevice.NewLine;
-                FCursorCol := 0;
-                while FCursorCol < NextTabCol do
-                begin
-                  FOutputDevice.Print(' ');
-                  Inc(FCursorCol);
-                end;
-              end;
-            end;
-            Inc(CurPC);
-          end;
-        bcPrintSpc:
-          begin
-            if Assigned(FOutputDevice) then
-            begin
-              for TabIdx := 1 to Instr.Immediate do
-              begin
-                FOutputDevice.Print(' ');
-                Inc(FCursorCol);
-              end;
-            end;
-            Inc(CurPC);
-          end;
-        bcPrintNewLine:
-          begin
-            if Assigned(FOutputDevice) then
-            begin
-              FOutputDevice.NewLine;
-              FCursorCol := 0;
-            end;
-            Inc(CurPC);
-          end;
-
-        bcInput:
-          begin
-            if Assigned(FInputDevice) then
-            begin
-              repeat
-                InputStr := FInputDevice.ReadLine('', False, True, True);
-                if TryStrToFloat(InputStr, InputVal) then
-                begin
-                  FloatRegs[Instr.Dest] := InputVal;
-                  Break;
-                end
-                else if Assigned(FOutputDevice) then
-                  FOutputDevice.Print('?Invalid number. Try again: ');
-              until False;
-            end;
-            Inc(CurPC);
-          end;
-        bcInputInt:
-          begin
-            if Assigned(FInputDevice) then
-            begin
-              repeat
-                InputStr := FInputDevice.ReadLine('', False, True, True);
-                if TryStrToInt64(Trim(InputStr), IntRegs[Instr.Dest]) then
-                  Break
-                else if Assigned(FOutputDevice) then
-                  FOutputDevice.Print('?Invalid integer. Try again: ');
-              until False;
-            end;
-            Inc(CurPC);
-          end;
-        bcInputFloat:
-          begin
-            if Assigned(FInputDevice) then
-            begin
-              repeat
-                InputStr := FInputDevice.ReadLine('', False, True, True);
-                if TryStrToFloat(Trim(InputStr), InputVal) then
-                begin
-                  FloatRegs[Instr.Dest] := InputVal;
-                  Break;
-                end
-                else if Assigned(FOutputDevice) then
-                  FOutputDevice.Print('?Invalid number. Try again: ');
-              until False;
-            end;
-            Inc(CurPC);
-          end;
-        bcInputString:
-          begin
-            if Assigned(FInputDevice) then
-              FStringRegs[Instr.Dest] := FInputDevice.ReadLine('', False, False, False);
-            Inc(CurPC);
-          end;
-
-        // String operations
-        bcStrConcat:
-          begin
-            FStringRegs[Instr.Dest] := FStringRegs[Instr.Src1] + FStringRegs[Instr.Src2];
-            Inc(CurPC);
-          end;
-        bcStrLen:
-          begin
-            IntRegs[Instr.Dest] := Length(FStringRegs[Instr.Src1]);
-            Inc(CurPC);
-          end;
-        bcStrLeft:
-          begin
-            FStringRegs[Instr.Dest] := LeftStr(FStringRegs[Instr.Src1], IntRegs[Instr.Src2]);
-            Inc(CurPC);
-          end;
-        bcStrRight:
-          begin
-            FStringRegs[Instr.Dest] := RightStr(FStringRegs[Instr.Src1], IntRegs[Instr.Src2]);
-            Inc(CurPC);
-          end;
-        bcStrMid:
-          begin
-            // Src1=string, Src2=start pos, Immediate=length
-            FStringRegs[Instr.Dest] := Copy(FStringRegs[Instr.Src1], IntRegs[Instr.Src2], Instr.Immediate);
-            Inc(CurPC);
-          end;
-
-        // Type conversions (string)
-        bcIntToString:
-          begin
-            FStringRegs[Instr.Dest] := IntToStr(IntRegs[Instr.Src1]);
-            Inc(CurPC);
-          end;
-        bcFloatToString:
-          begin
-            FStringRegs[Instr.Dest] := FloatToStr(FloatRegs[Instr.Src1]);
-            Inc(CurPC);
-          end;
-        bcStringToInt:
-          begin
-            IntRegs[Instr.Dest] := StrToInt64Def(FStringRegs[Instr.Src1], 0);
-            Inc(CurPC);
-          end;
-        bcStringToFloat:
-          begin
-            FloatRegs[Instr.Dest] := StrToFloatDef(FStringRegs[Instr.Src1], 0.0);
-            Inc(CurPC);
-          end;
-
-        // Logical operations
-        bcLogicalAnd:
-          begin
-            IntRegs[Instr.Dest] := Ord((IntRegs[Instr.Src1] <> 0) and (IntRegs[Instr.Src2] <> 0));
-            Inc(CurPC);
-          end;
-        bcLogicalOr:
-          begin
-            IntRegs[Instr.Dest] := Ord((IntRegs[Instr.Src1] <> 0) or (IntRegs[Instr.Src2] <> 0));
-            Inc(CurPC);
-          end;
-        bcLogicalNot:
-          begin
-            IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] = 0);
-            Inc(CurPC);
-          end;
-
-        // Graphics operations
-        bcGraphicRGBA:
-          begin
-            // RGBA(r, g, b, a) - combine 4 int registers into a 32-bit RGBA color
-            // Bytecode format: Dest=result, Src1=R, Src2=G, Immediate=(B_reg << 16) | A_reg
-            // Result = (A << 24) | (R << 16) | (G << 8) | B
-            IntRegs[Instr.Dest] :=
-              ((IntRegs[Instr.Immediate and $FFFF] and $FF) shl 24) or        // A from low 16 bits of Immediate
-              ((IntRegs[Instr.Src1] and $FF) shl 16) or                        // R
-              ((IntRegs[Instr.Src2] and $FF) shl 8) or                         // G
-              (IntRegs[(Instr.Immediate shr 16) and $FFFF] and $FF);           // B from high 16 bits of Immediate
-            Inc(CurPC);
-          end;
-        bcGraphicSetMode, bcGraphicBox, bcGraphicCircle, bcGraphicDraw,
-        bcGraphicLocate, bcGraphicRdot, bcGraphicGetMode:
-          begin
-            // Fall back to slow path for graphics commands that need output device
-            FPC := CurPC;
-            ExecuteInstruction(Instr);
-            CurPC := FPC + 1;
-          end;
-
-        // Termination
-        bcEnd, bcStop: Break;
-        bcNop: Inc(CurPC);
-
-        // Load/Store var (legacy - should not appear in optimized code)
-        bcLoadVar, bcStoreVar:
-          begin
-            // Fall back to slow path
-            FPC := CurPC;
-            ExecuteInstruction(Instr);
-            CurPC := FPC + 1;
-          end;
-      else
-        raise Exception.CreateFmt('Unknown opcode %d at CurPC=%d', [Op, CurPC]);
-      end;
-    end;
-  end;
-
-  {$POP}  // Restore range/overflow checking
-
-  FPC := CurPC;
-  FRunning := False;
-
-  // Reset FAST mode when program ends (ensure screen is visible)
-  if Assigned(FOutputDevice) then
-    FOutputDevice.SetFastMode(False);
-end;
-
-{ RunSwitchedGoto - Switched goto dispatch for better branch prediction
-
-  This technique duplicates the dispatch code after each instruction handler,
-  giving the CPU branch predictor separate prediction entries for each opcode.
-  This exploits instruction locality: after AddFloat usually comes another AddFloat
-  or ArrayLoad, and the predictor can learn these patterns.
-
-  Reference: https://bullno1.com/blog/switched-goto }
-
-{$GOTO ON}
-procedure TBytecodeVM.RunSwitchedGoto;
-type
-  PBytecodeInstruction = ^TBytecodeInstruction;
-var
-  Instructions: PBytecodeInstruction;
-  InstrCount: Integer;
-  CurPC: Integer;
-  Instr: TBytecodeInstruction;
-  Op: Byte;
-  IntRegs: PInt64;
-  FloatRegs: PDouble;
-  ArrayIdx: Integer;
-  InputStr: string;
-  InputVal: Double;
-  i, ProdDims: Integer;
-  ArrInfo: TSSAArrayInfo;
-  // Local vars for ArrayReverseRange and ArrayShiftLeft
-  ArrIdxW: Word;
-  LStartIdx, LEndIdx, LLoopIdx: Integer;
-  LFirstVal: Int64;
-  
-label
-  // Dispatch label
-  dispatch_next,
-  lbl_exit,
-  // Superinstruction labels (100+)
-  lbl_s100, lbl_s101, lbl_s102, lbl_s103, lbl_s104, lbl_s105,
-  lbl_s110, lbl_s111, lbl_s112, lbl_s113, lbl_s114, lbl_s115,
-  lbl_s120, lbl_s121, lbl_s122,
-  lbl_s130, lbl_s131, lbl_s132, lbl_s133,
-  lbl_s140, lbl_s141, lbl_s142,
-  lbl_s150, lbl_s151, lbl_s152, lbl_s153,
-  lbl_s160, lbl_s161,
-  lbl_s170, lbl_s171,
-  lbl_s180, lbl_s181, lbl_s182,
-  lbl_s190, lbl_s191, lbl_s192, lbl_s193,
-  lbl_s156, lbl_s157, lbl_s250, lbl_s251, lbl_s252, lbl_s253, lbl_s254, lbl_s255,
-  // Standard opcode labels
-  lbl_LoadConstInt, lbl_LoadConstFloat, lbl_LoadConstString,
-  lbl_CopyInt, lbl_CopyFloat, lbl_CopyString,
-  lbl_AddInt, lbl_SubInt, lbl_MulInt, lbl_DivInt, lbl_ModInt, lbl_NegInt,
-  lbl_AddFloat, lbl_SubFloat, lbl_MulFloat, lbl_DivFloat, lbl_PowFloat, lbl_NegFloat,
-  lbl_IntToFloat, lbl_FloatToInt,
-  lbl_CmpEqInt, lbl_CmpNeInt, lbl_CmpLtInt, lbl_CmpGtInt, lbl_CmpLeInt, lbl_CmpGeInt,
-  lbl_CmpEqFloat, lbl_CmpNeFloat, lbl_CmpLtFloat, lbl_CmpGtFloat, lbl_CmpLeFloat, lbl_CmpGeFloat,
-  lbl_MathAbs, lbl_MathSgn, lbl_MathInt, lbl_MathSqr, lbl_MathSin, lbl_MathCos,
-  lbl_MathTan, lbl_MathExp, lbl_MathLog, lbl_MathRnd, lbl_MathAtn,
-  lbl_Jump, lbl_JumpIfZero, lbl_JumpIfNotZero, lbl_Call, lbl_Return,
-  lbl_ArrayLoadFloat, lbl_ArrayStoreFloat, lbl_ArrayLoadInt, lbl_ArrayStoreInt, lbl_ArrayDim,
-  lbl_Print, lbl_PrintLn, lbl_PrintString, lbl_PrintStringLn,
-  lbl_End, lbl_Nop,
-  lbl_Unknown;
-
-begin
-  if FProgram = nil then raise Exception.Create('No program loaded');
-
-  Instructions := PBytecodeInstruction(FProgram.GetInstructionsPtr);
-  if Instructions = nil then raise Exception.Create('Empty program');
-
-  InstrCount := FProgram.GetInstructionCount;
-  CurPC := FProgram.EntryPoint;
-
-  IntRegs := @FIntRegs[0];
-  FloatRegs := @FFloatRegs[0];
-
-  {$PUSH}
-  {$R-}
-  {$Q-}
-
-  // Initial dispatch - jump to dispatch_next
-  goto dispatch_next;
-
-  // === DISPATCH POINT - This is where we decode and jump to the next instruction ===
-  dispatch_next:
-    if CurPC >= InstrCount then goto lbl_exit;
-    Instr := Instructions[CurPC];
-    Op := Instr.OpCode;
-    {$IFDEF ENABLE_INSTRUCTION_COUNTING}
-    Inc(FInstructionsExecuted);
-    {$ENDIF}
-    // Superinstructions first (most common in hot loops)
-    if Op >= 110 then
-    begin
-      case Op of
-        190: goto lbl_s190;
-        191: goto lbl_s191;
-        192: goto lbl_s192;
-        193: goto lbl_s193;
-        100: goto lbl_s100;
-        101: goto lbl_s101;
-        102: goto lbl_s102;
-        103: goto lbl_s103;
-        104: goto lbl_s104;
-        105: goto lbl_s105;
-        110: goto lbl_s110;
-        111: goto lbl_s111;
-        112: goto lbl_s112;
-        113: goto lbl_s113;
-        114: goto lbl_s114;
-        115: goto lbl_s115;
-        120: goto lbl_s120;
-        121: goto lbl_s121;
-        122: goto lbl_s122;
-        130: goto lbl_s130;
-        131: goto lbl_s131;
-        132: goto lbl_s132;
-        133: goto lbl_s133;
-        140: goto lbl_s140;
-        141: goto lbl_s141;
-        142: goto lbl_s142;
-        150: goto lbl_s150;
-        151: goto lbl_s151;
-        152: goto lbl_s152;
-        153: goto lbl_s153;
-        160: goto lbl_s160;
-        161: goto lbl_s161;
-        170: goto lbl_s170;
-        171: goto lbl_s171;
-        180: goto lbl_s180;
-        181: goto lbl_s181;
-        182: goto lbl_s182;
-        156: goto lbl_s156;
-        157: goto lbl_s157;
-        250: goto lbl_s250;
-        251: goto lbl_s251;
-        252: goto lbl_s252;
-        253: goto lbl_s253;
-        254: goto lbl_s254;
-        255: goto lbl_s255;
-      else
-        goto lbl_Unknown;
-      end;
-    end
-    else
-    begin
-      case TBytecodeOp(Op) of
-        bcLoadConstInt: goto lbl_LoadConstInt;
-        bcLoadConstFloat: goto lbl_LoadConstFloat;
-        bcLoadConstString: goto lbl_LoadConstString;
-        bcCopyInt: goto lbl_CopyInt;
-        bcCopyFloat: goto lbl_CopyFloat;
-        bcCopyString: goto lbl_CopyString;
-        bcAddInt: goto lbl_AddInt;
-        bcSubInt: goto lbl_SubInt;
-        bcMulInt: goto lbl_MulInt;
-        bcDivInt: goto lbl_DivInt;
-        bcModInt: goto lbl_ModInt;
-        bcNegInt: goto lbl_NegInt;
-        bcAddFloat: goto lbl_AddFloat;
-        bcSubFloat: goto lbl_SubFloat;
-        bcMulFloat: goto lbl_MulFloat;
-        bcDivFloat: goto lbl_DivFloat;
-        bcPowFloat: goto lbl_PowFloat;
-        bcNegFloat: goto lbl_NegFloat;
-        bcIntToFloat: goto lbl_IntToFloat;
-        bcFloatToInt: goto lbl_FloatToInt;
-        bcCmpEqInt: goto lbl_CmpEqInt;
-        bcCmpNeInt: goto lbl_CmpNeInt;
-        bcCmpLtInt: goto lbl_CmpLtInt;
-        bcCmpGtInt: goto lbl_CmpGtInt;
-        bcCmpLeInt: goto lbl_CmpLeInt;
-        bcCmpGeInt: goto lbl_CmpGeInt;
-        bcCmpEqFloat: goto lbl_CmpEqFloat;
-        bcCmpNeFloat: goto lbl_CmpNeFloat;
-        bcCmpLtFloat: goto lbl_CmpLtFloat;
-        bcCmpGtFloat: goto lbl_CmpGtFloat;
-        bcCmpLeFloat: goto lbl_CmpLeFloat;
-        bcCmpGeFloat: goto lbl_CmpGeFloat;
-        bcMathAbs: goto lbl_MathAbs;
-        bcMathSgn: goto lbl_MathSgn;
-        bcMathInt: goto lbl_MathInt;
-        bcMathSqr: goto lbl_MathSqr;
-        bcMathSin: goto lbl_MathSin;
-        bcMathCos: goto lbl_MathCos;
-        bcMathTan: goto lbl_MathTan;
-        bcMathExp: goto lbl_MathExp;
-        bcMathLog: goto lbl_MathLog;
-        bcMathRnd: goto lbl_MathRnd;
-        bcMathAtn: goto lbl_MathAtn;
-        bcJump: goto lbl_Jump;
-        bcJumpIfZero: goto lbl_JumpIfZero;
-        bcJumpIfNotZero: goto lbl_JumpIfNotZero;
-        bcCall: goto lbl_Call;
-        bcReturn: goto lbl_Return;
-        bcArrayLoadFloat: goto lbl_ArrayLoadFloat;
-        bcArrayStoreFloat: goto lbl_ArrayStoreFloat;
-        bcArrayLoadInt: goto lbl_ArrayLoadInt;
-        bcArrayStoreInt: goto lbl_ArrayStoreInt;
-        bcArrayDim: goto lbl_ArrayDim;
-        bcPrint: goto lbl_Print;
-        bcPrintLn: goto lbl_PrintLn;
-        bcPrintString: goto lbl_PrintString;
-        bcPrintStringLn: goto lbl_PrintStringLn;
-        bcEnd, bcStop: goto lbl_End;
-        bcNop: goto lbl_Nop;
-      else
-        goto lbl_Unknown;
-      end;
-    end;
-
-  // === SUPERINSTRUCTION HANDLERS ===
-
-  // Fused loop increment-and-branch (hottest instructions)
-  lbl_s190: // AddIntToBranchLe
-    Inc(IntRegs[Instr.Dest], IntRegs[Instr.Src1]);
-    if IntRegs[Instr.Dest] <= IntRegs[Instr.Src2] then
-      CurPC := Instr.Immediate
-    else
-      Inc(CurPC);
-    goto dispatch_next;
-
-  lbl_s191: // AddIntToBranchLt
-    Inc(IntRegs[Instr.Dest], IntRegs[Instr.Src1]);
-    if IntRegs[Instr.Dest] < IntRegs[Instr.Src2] then
-      CurPC := Instr.Immediate
-    else
-      Inc(CurPC);
-    goto dispatch_next;
-
-  lbl_s192: // SubIntToBranchGe
-    Dec(IntRegs[Instr.Dest], IntRegs[Instr.Src1]);
-    if IntRegs[Instr.Dest] >= IntRegs[Instr.Src2] then
-      CurPC := Instr.Immediate
-    else
-      Inc(CurPC);
-    goto dispatch_next;
-
-  lbl_s193: // SubIntToBranchGt
-    Dec(IntRegs[Instr.Dest], IntRegs[Instr.Src1]);
-    if IntRegs[Instr.Dest] > IntRegs[Instr.Src2] then
-      CurPC := Instr.Immediate
-    else
-      Inc(CurPC);
-    goto dispatch_next;
-
-  // Fused compare-and-branch Int
-  lbl_s100: if IntRegs[Instr.Src1] = IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-  lbl_s101: if IntRegs[Instr.Src1] <> IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-  lbl_s102: if IntRegs[Instr.Src1] < IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-  lbl_s103: if IntRegs[Instr.Src1] > IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-  lbl_s104: if IntRegs[Instr.Src1] <= IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-  lbl_s105: if IntRegs[Instr.Src1] >= IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-
-  // Fused compare-and-branch Float
-  lbl_s110: if FloatRegs[Instr.Src1] = FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-  lbl_s111: if FloatRegs[Instr.Src1] <> FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-  lbl_s112: if FloatRegs[Instr.Src1] < FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-  lbl_s113: if FloatRegs[Instr.Src1] > FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-  lbl_s114: if FloatRegs[Instr.Src1] <= FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-  lbl_s115: if FloatRegs[Instr.Src1] >= FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-
-  // Fused arithmetic-to-dest Int
-  lbl_s120: IntRegs[Instr.Dest] := IntRegs[Instr.Dest] + IntRegs[Instr.Src1]; Inc(CurPC); goto dispatch_next;
-  lbl_s121: IntRegs[Instr.Dest] := IntRegs[Instr.Dest] - IntRegs[Instr.Src1]; Inc(CurPC); goto dispatch_next;
-  lbl_s122: IntRegs[Instr.Dest] := IntRegs[Instr.Dest] * IntRegs[Instr.Src1]; Inc(CurPC); goto dispatch_next;
-
-  // Fused arithmetic-to-dest Float
-  lbl_s130: FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] + FloatRegs[Instr.Src1]; Inc(CurPC); goto dispatch_next;
-  lbl_s131: FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] - FloatRegs[Instr.Src1]; Inc(CurPC); goto dispatch_next;
-  lbl_s132: FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] * FloatRegs[Instr.Src1]; Inc(CurPC); goto dispatch_next;
-  lbl_s133: FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] / FloatRegs[Instr.Src1]; Inc(CurPC); goto dispatch_next;
-
-  // Fused constant arithmetic Int
-  lbl_s140: IntRegs[Instr.Dest] := IntRegs[Instr.Src1] + Instr.Immediate; Inc(CurPC); goto dispatch_next;
-  lbl_s141: IntRegs[Instr.Dest] := IntRegs[Instr.Src1] - Instr.Immediate; Inc(CurPC); goto dispatch_next;
-  lbl_s142: IntRegs[Instr.Dest] := IntRegs[Instr.Src1] * Instr.Immediate; Inc(CurPC); goto dispatch_next;
-
-  // Fused constant arithmetic Float
-  lbl_s150: FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] + Double(Pointer(@Instr.Immediate)^); Inc(CurPC); goto dispatch_next;
-  lbl_s151: FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] - Double(Pointer(@Instr.Immediate)^); Inc(CurPC); goto dispatch_next;
-  lbl_s152: FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * Double(Pointer(@Instr.Immediate)^); Inc(CurPC); goto dispatch_next;
-  lbl_s153: FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / Double(Pointer(@Instr.Immediate)^); Inc(CurPC); goto dispatch_next;
-
-  // Fused compare-zero-and-branch Int
-  lbl_s160: if IntRegs[Instr.Src1] = 0 then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-  lbl_s161: if IntRegs[Instr.Src1] <> 0 then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-
-  // Fused compare-zero-and-branch Float
-  lbl_s170: if FloatRegs[Instr.Src1] = 0.0 then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-  lbl_s171: if FloatRegs[Instr.Src1] <> 0.0 then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-
-  // Fused array-store-constant
-  lbl_s180: FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] := Instr.Immediate; Inc(CurPC); goto dispatch_next;
-  lbl_s181: FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]] := Double(Pointer(@Instr.Immediate)^); Inc(CurPC); goto dispatch_next;
-  lbl_s182: FArrays[Instr.Src1].StringData[IntRegs[Instr.Src2]] := FProgram.StringConstants[Instr.Immediate]; Inc(CurPC); goto dispatch_next;
-
-  // NEW: Array Swap (Int) - opcode 250
-  lbl_s250: // bcArraySwapInt: swap arr[idx1] and arr[idx2]
-    begin
-      FSwapTempInt := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]];
-      FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Dest]];
-      FArrays[Instr.Src1].IntData[IntRegs[Instr.Dest]] := FSwapTempInt;
-      Inc(CurPC);
-      goto dispatch_next;
-    end;
-
-  // NEW: Self-increment/decrement (Int) - opcodes 251-252
-  lbl_s251: Inc(IntRegs[Instr.Dest], IntRegs[Instr.Src1]); Inc(CurPC); goto dispatch_next; // bcAddIntSelf
-  lbl_s252: Dec(IntRegs[Instr.Dest], IntRegs[Instr.Src1]); Inc(CurPC); goto dispatch_next; // bcSubIntSelf
-
-  // NEW: Array superinstructions 253, 254, 255, 156, 157
-  lbl_s253: IntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]]; Inc(CurPC); goto dispatch_next;
-  lbl_s254: FArrays[Instr.Dest].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]]; Inc(CurPC); goto dispatch_next;
-  lbl_s255: FArrays[Instr.Dest].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Dest].IntData[IntRegs[Instr.Src1]]; Inc(CurPC); goto dispatch_next;
-
-  lbl_s156: // ArrayReverseRange
-    begin
-      LStartIdx := IntRegs[Instr.Src2];
-      LEndIdx := IntRegs[Instr.Dest] - 1;
-      ArrIdxW := Instr.Src1;
-      while LStartIdx < LEndIdx do
-      begin
-        FSwapTempInt := FArrays[ArrIdxW].IntData[LStartIdx];
-        FArrays[ArrIdxW].IntData[LStartIdx] := FArrays[ArrIdxW].IntData[LEndIdx];
-        FArrays[ArrIdxW].IntData[LEndIdx] := FSwapTempInt;
-        Inc(LStartIdx);
-        Dec(LEndIdx);
-      end;
-      Inc(CurPC);
-      goto dispatch_next;
-    end;
-
-  lbl_s157: // ArrayShiftLeft
-    begin
-      LStartIdx := IntRegs[Instr.Src2];
-      LEndIdx := IntRegs[Instr.Dest];
-      ArrIdxW := Instr.Src1;
-      LFirstVal := FArrays[ArrIdxW].IntData[LStartIdx];
-      LLoopIdx := LStartIdx;
-      while LLoopIdx <= LEndIdx do
-      begin
-        FArrays[ArrIdxW].IntData[LLoopIdx] := FArrays[ArrIdxW].IntData[LLoopIdx + 1];
-        Inc(LLoopIdx);
-      end;
-      FArrays[ArrIdxW].IntData[LEndIdx + 1] := LFirstVal;
-      Inc(CurPC);
-      goto dispatch_next;
-    end;
-
-  // === STANDARD OPCODE HANDLERS ===
-
-  lbl_LoadConstInt: IntRegs[Instr.Dest] := Instr.Immediate; Inc(CurPC); goto dispatch_next;
-  lbl_LoadConstFloat: FloatRegs[Instr.Dest] := Double(Pointer(@Instr.Immediate)^); Inc(CurPC); goto dispatch_next;
-  lbl_LoadConstString: FStringRegs[Instr.Dest] := FProgram.StringConstants[Instr.Immediate]; Inc(CurPC); goto dispatch_next;
-
-  lbl_CopyInt: IntRegs[Instr.Dest] := IntRegs[Instr.Src1]; Inc(CurPC); goto dispatch_next;
-  lbl_CopyFloat: FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1]; Inc(CurPC); goto dispatch_next;
-  lbl_CopyString: FStringRegs[Instr.Dest] := FStringRegs[Instr.Src1]; Inc(CurPC); goto dispatch_next;
-
-  // Integer arithmetic
-  lbl_AddInt: IntRegs[Instr.Dest] := IntRegs[Instr.Src1] + IntRegs[Instr.Src2]; Inc(CurPC); goto dispatch_next;
-  lbl_SubInt: IntRegs[Instr.Dest] := IntRegs[Instr.Src1] - IntRegs[Instr.Src2]; Inc(CurPC); goto dispatch_next;
-  lbl_MulInt: IntRegs[Instr.Dest] := IntRegs[Instr.Src1] * IntRegs[Instr.Src2]; Inc(CurPC); goto dispatch_next;
-  lbl_DivInt: IntRegs[Instr.Dest] := IntRegs[Instr.Src1] div IntRegs[Instr.Src2]; Inc(CurPC); goto dispatch_next;
-  lbl_ModInt: IntRegs[Instr.Dest] := IntRegs[Instr.Src1] mod IntRegs[Instr.Src2]; Inc(CurPC); goto dispatch_next;
-  lbl_NegInt: IntRegs[Instr.Dest] := -IntRegs[Instr.Src1]; Inc(CurPC); goto dispatch_next;
-
-  // Float arithmetic (hot path for numerical benchmarks)
-  lbl_AddFloat: FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] + FloatRegs[Instr.Src2]; Inc(CurPC); goto dispatch_next;
-  lbl_SubFloat: FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] - FloatRegs[Instr.Src2]; Inc(CurPC); goto dispatch_next;
-  lbl_MulFloat: FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2]; Inc(CurPC); goto dispatch_next;
-  lbl_DivFloat: FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / FloatRegs[Instr.Src2]; Inc(CurPC); goto dispatch_next;
-  lbl_PowFloat: FloatRegs[Instr.Dest] := Power(FloatRegs[Instr.Src1], FloatRegs[Instr.Src2]); Inc(CurPC); goto dispatch_next;
-  lbl_NegFloat: FloatRegs[Instr.Dest] := -FloatRegs[Instr.Src1]; Inc(CurPC); goto dispatch_next;
-
-  // Type conversions
-  lbl_IntToFloat: FloatRegs[Instr.Dest] := IntRegs[Instr.Src1]; Inc(CurPC); goto dispatch_next;
-  lbl_FloatToInt: IntRegs[Instr.Dest] := Trunc(FloatRegs[Instr.Src1]); Inc(CurPC); goto dispatch_next;
-
-  // Integer comparisons
-  lbl_CmpEqInt: IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] = IntRegs[Instr.Src2]); Inc(CurPC); goto dispatch_next;
-  lbl_CmpNeInt: IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] <> IntRegs[Instr.Src2]); Inc(CurPC); goto dispatch_next;
-  lbl_CmpLtInt: IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] < IntRegs[Instr.Src2]); Inc(CurPC); goto dispatch_next;
-  lbl_CmpGtInt: IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] > IntRegs[Instr.Src2]); Inc(CurPC); goto dispatch_next;
-  lbl_CmpLeInt: IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] <= IntRegs[Instr.Src2]); Inc(CurPC); goto dispatch_next;
-  lbl_CmpGeInt: IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] >= IntRegs[Instr.Src2]); Inc(CurPC); goto dispatch_next;
-
-  // Float comparisons
-  lbl_CmpEqFloat: IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] = FloatRegs[Instr.Src2]); Inc(CurPC); goto dispatch_next;
-  lbl_CmpNeFloat: IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] <> FloatRegs[Instr.Src2]); Inc(CurPC); goto dispatch_next;
-  lbl_CmpLtFloat: IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] < FloatRegs[Instr.Src2]); Inc(CurPC); goto dispatch_next;
-  lbl_CmpGtFloat: IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] > FloatRegs[Instr.Src2]); Inc(CurPC); goto dispatch_next;
-  lbl_CmpLeFloat: IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] <= FloatRegs[Instr.Src2]); Inc(CurPC); goto dispatch_next;
-  lbl_CmpGeFloat: IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] >= FloatRegs[Instr.Src2]); Inc(CurPC); goto dispatch_next;
-
-  // Math functions
-  lbl_MathAbs: FloatRegs[Instr.Dest] := Abs(FloatRegs[Instr.Src1]); Inc(CurPC); goto dispatch_next;
-  lbl_MathSgn:
-    begin
-      if FloatRegs[Instr.Src1] > 0 then FloatRegs[Instr.Dest] := 1
-      else if FloatRegs[Instr.Src1] < 0 then FloatRegs[Instr.Dest] := -1
-      else FloatRegs[Instr.Dest] := 0;
-      Inc(CurPC);
-      goto dispatch_next;
-    end;
-  lbl_MathInt: FloatRegs[Instr.Dest] := Floor(FloatRegs[Instr.Src1]); Inc(CurPC); goto dispatch_next;
-  lbl_MathSqr: FloatRegs[Instr.Dest] := Sqrt(FloatRegs[Instr.Src1]); Inc(CurPC); goto dispatch_next;
-  lbl_MathSin: FloatRegs[Instr.Dest] := Sin(FloatRegs[Instr.Src1]); Inc(CurPC); goto dispatch_next;
-  lbl_MathCos: FloatRegs[Instr.Dest] := Cos(FloatRegs[Instr.Src1]); Inc(CurPC); goto dispatch_next;
-  lbl_MathTan: FloatRegs[Instr.Dest] := Tan(FloatRegs[Instr.Src1]); Inc(CurPC); goto dispatch_next;
-  lbl_MathExp: FloatRegs[Instr.Dest] := Exp(FloatRegs[Instr.Src1]); Inc(CurPC); goto dispatch_next;
-  lbl_MathLog: FloatRegs[Instr.Dest] := Ln(FloatRegs[Instr.Src1]); Inc(CurPC); goto dispatch_next;
-  lbl_MathRnd: FloatRegs[Instr.Dest] := Random; Inc(CurPC); goto dispatch_next;
-  lbl_MathAtn: FloatRegs[Instr.Dest] := ArcTan(FloatRegs[Instr.Src1]); Inc(CurPC); goto dispatch_next;
-
-  // Control flow
-  lbl_Jump: CurPC := Instr.Immediate; goto dispatch_next;
-  lbl_JumpIfZero: if IntRegs[Instr.Src1] = 0 then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-  lbl_JumpIfNotZero: if IntRegs[Instr.Src1] <> 0 then CurPC := Instr.Immediate else Inc(CurPC); goto dispatch_next;
-
-  lbl_Call:
-    begin
-      FCallStack[FCallStackPtr] := CurPC + 1;
-      Inc(FCallStackPtr);
-      CurPC := Instr.Immediate;
-      goto dispatch_next;
-    end;
-
-  lbl_Return:
-    begin
-      Dec(FCallStackPtr);
-      CurPC := FCallStack[FCallStackPtr];
-      goto dispatch_next;
-    end;
-
-  // Array operations (hot path for numerical benchmarks)
-  lbl_ArrayLoadFloat:
-    FloatRegs[Instr.Dest] := FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]];
-    Inc(CurPC);
-    goto dispatch_next;
-
-  lbl_ArrayStoreFloat:
-    FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]] := FloatRegs[Instr.Dest];
-    Inc(CurPC);
-    goto dispatch_next;
-
-  lbl_ArrayLoadInt:
-    IntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]];
-    Inc(CurPC);
-    goto dispatch_next;
-
-  lbl_ArrayStoreInt:
-    FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] := IntRegs[Instr.Dest];
-    Inc(CurPC);
-    goto dispatch_next;
-
-  lbl_ArrayDim:
-    begin
-      ArrayIdx := Instr.Src1;
-      ArrInfo := FProgram.GetArray(ArrayIdx);
-      if ArrayIdx >= Length(FArrays) then
-        SetLength(FArrays, ArrayIdx + 1);
-      FArrays[ArrayIdx].ElementType := Ord(ArrInfo.ElementType);
-      FArrays[ArrayIdx].DimCount := ArrInfo.DimCount;
-      SetLength(FArrays[ArrayIdx].Dimensions, ArrInfo.DimCount);
-      for i := 0 to ArrInfo.DimCount - 1 do
-      begin
-        if ArrInfo.Dimensions[i] = 0 then
-        begin
-          case ArrInfo.DimRegTypes[i] of
-            srtInt: FArrays[ArrayIdx].Dimensions[i] := IntRegs[ArrInfo.DimRegisters[i]] + 1;
-            srtFloat: FArrays[ArrayIdx].Dimensions[i] := Trunc(FloatRegs[ArrInfo.DimRegisters[i]]) + 1;
-          end;
-        end
-        else
-          FArrays[ArrayIdx].Dimensions[i] := ArrInfo.Dimensions[i];
-      end;
-      ProdDims := 1;
-      for i := 0 to ArrInfo.DimCount - 1 do
-        ProdDims := ProdDims * FArrays[ArrayIdx].Dimensions[i];
-      FArrays[ArrayIdx].TotalSize := ProdDims;
-      case ArrInfo.ElementType of
-        srtInt: SetLength(FArrays[ArrayIdx].IntData, ProdDims);
-        srtFloat: SetLength(FArrays[ArrayIdx].FloatData, ProdDims);
-        srtString: SetLength(FArrays[ArrayIdx].StringData, ProdDims);
-      end;
-      Inc(CurPC);
-      goto dispatch_next;
-    end;
-
-  // I/O operations (slow path - not critical for benchmarks)
-  lbl_Print:
-    begin
-      if Assigned(FOutputDevice) then
-        FOutputDevice.Print(FloatToStr(FloatRegs[Instr.Src1]));
-      Inc(CurPC);
-      goto dispatch_next;
-    end;
-
-  lbl_PrintLn:
-    begin
-      if Assigned(FOutputDevice) then
-      begin
-        FOutputDevice.Print(FloatToStr(FloatRegs[Instr.Src1]));
-        FOutputDevice.NewLine;
-      end;
-      Inc(CurPC);
-      goto dispatch_next;
-    end;
-
-  lbl_PrintString:
-    begin
-      if Assigned(FOutputDevice) then
-        FOutputDevice.Print(FStringRegs[Instr.Src1]);
-      Inc(CurPC);
-      goto dispatch_next;
-    end;
-
-  lbl_PrintStringLn:
-    begin
-      if Assigned(FOutputDevice) then
-      begin
-        FOutputDevice.Print(FStringRegs[Instr.Src1]);
-        FOutputDevice.NewLine;
-      end;
-      Inc(CurPC);
-      goto dispatch_next;
-    end;
-
-  lbl_End:
-    goto lbl_exit;
-
-  lbl_Nop:
-    Inc(CurPC);
-    goto dispatch_next;
-
-  lbl_Unknown:
-    raise Exception.CreateFmt('Unknown opcode %d at PC=%d', [Op, CurPC]);
-
-  lbl_exit:
-  {$POP}
-
-  FPC := CurPC;
-  FRunning := False;
-
-  // Reset FAST mode when program ends (ensure screen is visible)
-  if Assigned(FOutputDevice) then
-    FOutputDevice.SetFastMode(False);
-end;
-{$GOTO OFF}
 
 end.

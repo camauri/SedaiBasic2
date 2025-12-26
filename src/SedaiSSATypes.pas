@@ -72,10 +72,13 @@ type
     ssaCmpEqInt, ssaCmpNeInt, ssaCmpLtInt, ssaCmpGtInt, ssaCmpLeInt, ssaCmpGeInt,
     ssaCmpEqFloat, ssaCmpNeFloat, ssaCmpLtFloat, ssaCmpGtFloat, ssaCmpLeFloat, ssaCmpGeFloat,
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
-    ssaLogicalAnd, ssaLogicalOr, ssaLogicalNot,
+    ssaLogicalAnd, ssaLogicalOr, ssaLogicalXor, ssaLogicalNot,
     ssaStrConcat, ssaStrLen, ssaStrLeft, ssaStrRight, ssaStrMid,
+    ssaStrAsc, ssaStrChr, ssaStrStr, ssaStrVal, ssaStrHex, ssaStrInstr, ssaStrErr,
     ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathLog, ssaMathExp,
     ssaMathSqr, ssaMathAbs, ssaMathSgn, ssaMathInt, ssaMathRnd,
+    ssaMathLog10, ssaMathLog2, ssaMathLogN,  // Additional log functions
+    ssaStrDec,  // DEC(hexstring) - convert hex string to decimal
     ssaLabel, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaCall, ssaReturn,
     ssaArrayLoad, ssaArrayStore, ssaArrayDim,
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
@@ -91,7 +94,97 @@ type
     ssaGraphicLocate,  // Set pixel cursor position
     ssaGraphicRdot,    // Get pixel cursor position or color
     ssaGraphicGetMode, // RGR - Get current graphics mode (0-11)
-    ssaEnd, ssaStop, ssaFast, ssaSlow, ssaSleep, ssaNop
+    ssaGraphicColor,   // COLOR source, color: Set color for screen area
+    ssaGraphicWidth,   // WIDTH n: Set line width (1 or 2)
+    ssaGraphicScale,   // SCALE n [,xmax, ymax]: Set coordinate scaling
+    ssaGraphicPaint,   // PAINT [source], x, y [,mode]: Flood fill area
+    ssaGraphicWindow,  // WINDOW col1, row1, col2, row2 [,clear]: Define text window
+    ssaGraphicSShape,  // SSHAPE A$, x1, y1 [,x2, y2]: Save bitmap area to string
+    ssaGraphicGShape,  // GSHAPE A$, x, y [,mode]: Load string to bitmap
+    ssaGraphicGList,   // GLIST: List SDL2 video modes
+    ssaGraphicPos,     // POS(x): Return cursor column position
+    ssaGraphicRclr,    // RCLR(n): Return color of source n
+    ssaGraphicRwindow, // RWINDOW(n): Return window size info
+    // Sound (SID-like)
+    ssaSoundVol,       // VOL n: Set master volume (0-15)
+    ssaSoundSound,     // SOUND vc,freq,dur[,dir,min,sv,wf,pw]: Play sound effect
+    ssaSoundEnvelope,  // ENVELOPE e[,a,d,s,r,wf,pw]: Define instrument envelope
+    ssaSoundTempo,     // TEMPO n: Set playback speed (0-255)
+    ssaSoundPlay,      // PLAY "string": Play music string
+    ssaSoundFilter,    // FILTER cf,lp,bp,hp,res: Set filter parameters
+    // Special variables (reserved system variables)
+    ssaLoadTI,         // TI: Load jiffies (1/60 sec) since interpreter start
+    ssaLoadTIS,        // TI$: Load current time as HHMMSS string
+    ssaStoreTIS,       // TI$ = "HHMMSS": Set time offset
+    ssaLoadDTS,        // DT$: Load current date as YYYYMMDD string
+    ssaLoadEL,         // EL: Load last error line number
+    ssaLoadER,         // ER: Load last error code
+    ssaLoadERRS,       // ERR$: Load last error message (variable, not function)
+    ssaFre,            // FRE(x): Return available memory in bytes
+    // Data handling
+    ssaDataAdd,        // Add value to DATA pool
+    ssaDataRead,       // Read next value from DATA pool into dest
+    ssaDataRestore,    // Reset DATA pointer to beginning
+    // Input commands
+    ssaGet,            // GET A$ (non-blocking character input)
+    ssaGetkey,         // GETKEY A$ (blocking character input)
+    // Formatted output
+    ssaPrintUsing,     // PRINT USING format$; values
+    ssaPudef,          // PUDEF format string (redefine PRINT USING symbols)
+    ssaChar,           // CHAR mode, col, row, text [,reverse]
+    // File operations
+    ssaLoad,           // LOAD "filename": Load program from file
+    ssaSave,           // SAVE "filename": Save program to file
+    ssaVerify,         // VERIFY "filename": Verify program against file
+    ssaBload,          // BLOAD "filename": Load bytecode from file
+    ssaBsave,          // BSAVE "filename": Save bytecode to file
+    ssaBoot,           // BOOT "filename": Load and run bytecode
+    // System commands (from program)
+    ssaRun,            // RUN [linenum]: Run program from beginning or line
+    ssaList,           // LIST [start-end]: List program lines
+    ssaNew,            // NEW: Clear program and variables
+    ssaDelete,         // DELETE [start[-end]]: Delete program lines
+    ssaRenumber,       // RENUMBER [new[,inc[,old]]]: Renumber program lines
+    ssaCatalog,        // CATALOG/DIR: List directory contents
+    // File management commands (executed directly in VM)
+    ssaCopyFile,       // COPY/CP "src","dest"[,overwrite]: Copy file
+    ssaScratch,        // SCRATCH "pattern"[,force]: Delete file(s)
+    ssaRenameFile,     // RENAME "old","new": Rename file
+    ssaConcat,         // CONCAT "src","dest": Concatenate files
+    ssaMkdir,          // MKDIR/MD "path": Create directory
+    ssaChdir,          // CHDIR/CD "path": Change current directory
+    ssaMoveFile,       // MOVE/MV "src","dest": Move file
+    // Disk file I/O
+    ssaDopen,          // DOPEN #handle, "filename" [, mode$]: Open disk file
+    ssaDclose,         // DCLOSE #handle: Close disk file
+    ssaOpen,           // OPEN (legacy C64/C128 style, maps to DOPEN)
+    ssaClose,          // CLOSE (legacy C64/C128 style, maps to DCLOSE)
+    ssaGetFile,        // GET# file, var: Get char from file
+    ssaInputFile,      // INPUT# file, vars: Input from file
+    ssaPrintFile,      // PRINT# file, exprs: Print to file
+    ssaCmd,            // CMD file [, expr]: Redirect output to file
+    // Sprite commands
+    ssaSprite,         // SPRITE n [,on] [,color] [,priority] [,xscale] [,yscale] [,mode]
+    ssaMovsprAbs,      // MOVSPR n, x, y: Position sprite at absolute coordinates
+    ssaMovsprRel,      // MOVSPR n, +x, +y: Move sprite relative to current position
+    ssaMovsprPolar,    // MOVSPR n, dist;angle: Move sprite by distance at angle
+    ssaMovsprAuto,     // MOVSPR n, angle#speed: Start automatic movement
+    ssaSprcolor,       // SPRCOLOR [mc1] [,mc2]: Set global multicolors
+    ssaSprsav,         // SPRSAV src, dst: Save/load/copy sprite data
+    ssaCollision,      // COLLISION type [,line]: Set collision handler
+    // Sprite functions (return values)
+    ssaBump,           // BUMP(n): Return collision bitmask
+    ssaRspcolor,       // RSPCOLOR(n): Return multicolor value
+    ssaRsppos,         // RSPPOS(sprite, n): Return position/speed
+    ssaRsprite,        // RSPRITE(sprite, n): Return sprite attribute
+    // Control flow
+    ssaEnd, ssaStop, ssaFast, ssaSlow, ssaSleep, ssaKey, ssaNop, ssaClear,
+    // Debug/Trace
+    ssaTron, ssaTroff,  // TRON/TROFF: Enable/disable trace mode
+    // Error handling
+    ssaTrap,            // TRAP linenum: Set error handler
+    ssaResume,          // RESUME: Continue after error at error line
+    ssaResumeNext       // RESUME NEXT: Continue after error at next statement
   );
 
   { PHI source: value from a specific predecessor block }

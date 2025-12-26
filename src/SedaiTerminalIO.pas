@@ -128,6 +128,19 @@ type
     function GetFastMode: Boolean;
     procedure SetFastModeAlpha(Alpha: Byte);
     function GetFastModeAlpha: Byte;
+
+    // Additional graphics interface methods (stubs)
+    procedure SetColorSource(Source, Color: Integer);
+    function GetColorSource(Source: Integer): Integer;
+    procedure SetLineWidth(Width: Integer);
+    procedure SetScale(Enabled: Boolean; XMax, YMax: Integer);
+    procedure FloodFill(Source: Integer; X, Y: Double; Mode: Integer);
+    procedure SetWindow(Col1, Row1, Col2, Row2: Integer; DoClear: Boolean);
+    function GetWindowLines: Integer;
+    function GetWindowCols: Integer;
+    function GetScreenWidth: Integer;
+    function SaveShape(X1, Y1, X2, Y2: Double): string;
+    procedure LoadShape(const Data: string; X, Y: Double; Mode: Integer);
   end;
 
   { TTerminalInput - Console input device (stdin) }
@@ -144,6 +157,8 @@ type
                      NumericOnly: Boolean = False; AllowDecimal: Boolean = True): string;
     function ReadKey: Char;
     function KeyPressed: Boolean;
+    function HasChar: Boolean;
+    function GetLastChar: string;
     function ShouldQuit: Boolean;
     function ShouldStop: Boolean;
     procedure ClearStopRequest;
@@ -454,6 +469,63 @@ begin
   Result := 255;
 end;
 
+// Additional graphics interface methods (stubs for terminal mode)
+
+procedure TTerminalController.SetColorSource(Source, Color: Integer);
+begin
+  // Not supported in terminal mode
+end;
+
+function TTerminalController.GetColorSource(Source: Integer): Integer;
+begin
+  Result := 0;
+end;
+
+procedure TTerminalController.SetLineWidth(Width: Integer);
+begin
+  // Not supported in terminal mode
+end;
+
+procedure TTerminalController.SetScale(Enabled: Boolean; XMax, YMax: Integer);
+begin
+  // Not supported in terminal mode
+end;
+
+procedure TTerminalController.FloodFill(Source: Integer; X, Y: Double; Mode: Integer);
+begin
+  // Not supported in terminal mode
+end;
+
+procedure TTerminalController.SetWindow(Col1, Row1, Col2, Row2: Integer; DoClear: Boolean);
+begin
+  // Not supported in terminal mode
+end;
+
+function TTerminalController.GetWindowLines: Integer;
+begin
+  Result := FRows;
+end;
+
+function TTerminalController.GetWindowCols: Integer;
+begin
+  Result := FCols;
+end;
+
+function TTerminalController.GetScreenWidth: Integer;
+begin
+  Result := FCols;
+end;
+
+function TTerminalController.SaveShape(X1, Y1, X2, Y2: Double): string;
+begin
+  Result := '';  // Not supported in terminal mode
+end;
+
+procedure TTerminalController.LoadShape(const Data: string; X, Y: Double; Mode: Integer);
+begin
+  // Not supported in terminal mode
+end;
+
 { ============================================================================
   TTerminalInput
   ============================================================================ }
@@ -515,6 +587,18 @@ end;
 function TTerminalInput.KeyPressed: Boolean;
 begin
   Result := False;
+  // Not implemented for simple console
+end;
+
+function TTerminalInput.HasChar: Boolean;
+begin
+  Result := False;
+  // Not implemented for simple console
+end;
+
+function TTerminalInput.GetLastChar: string;
+begin
+  Result := '';
   // Not implemented for simple console
 end;
 

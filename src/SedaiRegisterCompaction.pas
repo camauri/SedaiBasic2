@@ -173,38 +173,10 @@ begin
 end;
 
 function TRegisterCompactor.DestIsIntReg(OpCode: TBytecodeOp): Boolean;
-var
-  Op: Integer;
 begin
-  Op := Ord(OpCode);
-
-  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
-  if Op >= 110 then
-  begin
-    case Op of
-      // Fused arithmetic-to-dest (Int): Dest = Dest op Src1 (Dest is BOTH read and written)
-      120, 121, 122,  // bcAddIntTo, bcSubIntTo, bcMulIntTo
-      // Fused constant arithmetic (Int): Dest = Src1 op Immediate
-      140, 141, 142,  // bcAddIntConst, bcSubIntConst, bcMulIntConst
-      // Fused loop increment-and-branch (Int): Dest = counter (both read and written)
-      190, 191, 192, 193,  // bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt
-      // Self-increment/decrement (Int): Dest = Dest op Src1 (Dest is BOTH read and written)
-      251, 252,  // bcAddIntSelf, bcSubIntSelf
-      // Array Load to register (Int): Dest = arr[idx] (Dest is WRITTEN)
-      253,  // bcArrayLoadIntTo
-      // Array Reverse/Shift: Dest is end index register (int) - READ only
-      156, 157:  // bcArrayReverseRange, bcArrayShiftLeft
-        Result := True;
-      // NOTE: Fused compare-and-branch (100-105) do NOT have a Dest register!
-      // They only use Src1, Src2 for comparison and Immediate for jump target
-    else
-      Result := False;
-    end;
-    Exit;
-  end;
-
-  // Check base opcodes (values < 100, safe for enum set check)
-  Result := OpCode in [
+  // Using case statement instead of set because opcodes are now Word (>255)
+  case OpCode of
+    // === GROUP 0: Core VM operations ===
     // Integer operations
     bcLoadConstInt, bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
     bcModInt, bcNegInt,
@@ -213,133 +185,102 @@ begin
     bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat,
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
     // Logical operations (result is int 0/1)
-    bcLogicalAnd, bcLogicalOr, bcLogicalNot,
+    bcLogicalAnd, bcLogicalOr, bcLogicalXor, bcLogicalNot,
     // Conversions to int
     bcFloatToInt, bcStringToInt,
-    // String operations returning int
-    bcStrLen,
-    // Input
-    bcInputInt,
-    // Typed array load (int) - Dest is WRITTEN
-    bcArrayLoadInt,
-    // Graphics: Dest = RGBA result (int)
-    bcGraphicRGBA,
-    // Graphics: Dest = pixel cursor info (int)
-    bcGraphicRdot,
-    // Graphics: Dest = current graphic mode (int)
-    bcGraphicGetMode
+    // === GROUP 1: String operations ===
+    bcStrLen,      // String length returns int
+    // === GROUP 3: Array operations ===
+    bcArrayLoadInt,  // Typed array load (int) - Dest is WRITTEN
+    // === GROUP 4: I/O operations ===
+    bcInputInt,      // Input int
+    // === GROUP 10: Graphics ===
+    bcGraphicRGBA,    // Dest = RGBA result (int)
+    bcGraphicRdot,    // Dest = pixel cursor info (int)
+    bcGraphicGetMode, // Dest = current graphic mode (int)
+    // === SUPERINSTRUCTIONS ===
+    // Fused arithmetic-to-dest (Int): Dest = Dest op Src1
+    bcAddIntTo, bcSubIntTo, bcMulIntTo,
+    // Fused constant arithmetic (Int): Dest = Src1 op Immediate
+    bcAddIntConst, bcSubIntConst, bcMulIntConst,
+    // Fused loop increment-and-branch (Int): Dest = counter register
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt,
+    // Fused self-increment/decrement (Int): Dest = counter (R/W)
+    bcAddIntSelf, bcSubIntSelf,
+    // Fused array load to int: Dest = result
+    bcArrayLoadIntTo,
+    // DEC(hexstring) - result is int
+    bcStrDec:
+      Result := True;
     // NOTE: bcArrayStoreInt uses Dest as SOURCE (read), handled by DestReadIsIntReg
     // NOTE: bcGraphicBox uses Dest as SOURCE (y1 coordinate), handled by DestReadIsIntReg
-  ];
+    // NOTE: bcArraySwapInt uses Dest as idx2_reg (read), handled by DestReadIsIntReg
+    // NOTE: bcArrayShiftLeft/ReverseRange use Dest as end_idx (read), handled by DestReadIsIntReg
+  else
+    Result := False;
+  end;
 end;
 
 function TRegisterCompactor.DestIsFloatReg(OpCode: TBytecodeOp): Boolean;
-var
-  Op: Integer;
 begin
-  Op := Ord(OpCode);
-
-  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
-  if Op >= 110 then
-  begin
-    case Op of
-      // Fused arithmetic-to-dest (Float): Dest = Dest op Src1 (Dest is BOTH read and written)
-      130, 131, 132, 133,  // bcAddFloatTo, bcSubFloatTo, bcMulFloatTo, bcDivFloatTo
-      // Fused constant arithmetic (Float): Dest = Src1 op Immediate
-      150, 151, 152, 153,  // bcAddFloatConst, bcSubFloatConst, bcMulFloatConst, bcDivFloatConst
-      // NEW: FMA superinstructions - Dest is float
-      200, 201, 202, 203,  // bcMulAddFloat, bcMulSubFloat, bcMulAddToFloat, bcMulSubToFloat
-      // NEW: Array Load + Arithmetic - Dest is float
-      210, 211, 212,       // bcArrayLoadAddFloat, bcArrayLoadSubFloat, bcArrayLoadDivAddFloat
-      // NEW: Square-Sum patterns - Dest is float
-      220, 221,            // bcSquareSumFloat, bcAddSquareFloat
-      // NEW: Mul-Mul and Add-Sqrt - Dest is float
-      230, 231:            // bcMulMulFloat, bcAddSqrtFloat
-        Result := True;
-      // NOTE: Fused compare-and-branch (110-115) do NOT have a Dest register!
-    else
-      Result := False;
-    end;
-    Exit;
-  end;
-
-  // Check base opcodes (values < 100, safe for enum set check)
-  Result := OpCode in [
-    // Float operations
+  // Using case statement instead of set because opcodes are now Word (>255)
+  case OpCode of
+    // === GROUP 0: Core VM operations ===
     bcLoadConstFloat, bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat,
     bcNegFloat, bcPowFloat,
-    // Math functions
-    bcMathSqr, bcMathSin, bcMathCos, bcMathTan, bcMathAtn,
-    bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,
     // Conversion to float
     bcIntToFloat, bcStringToFloat,
-    // Input
+    // === GROUP 2: Math functions ===
+    bcMathSqr, bcMathSin, bcMathCos, bcMathTan, bcMathAtn,
+    bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,
+    bcMathLog10, bcMathLog2, bcMathLogN,
+    // === GROUP 3: Array operations ===
+    bcArrayLoadFloat,  // Typed array load (float) - Dest is WRITTEN
+    // === GROUP 4: I/O operations ===
     bcInputFloat,
-    // Typed array load (float) - Dest is WRITTEN
-    bcArrayLoadFloat
+    // === SUPERINSTRUCTIONS ===
+    // Fused arithmetic-to-dest (Float): Dest = Dest op Src1
+    bcAddFloatTo, bcSubFloatTo, bcMulFloatTo, bcDivFloatTo,
+    // Fused constant arithmetic (Float): Dest = Src1 op Immediate
+    bcAddFloatConst, bcSubFloatConst, bcMulFloatConst, bcDivFloatConst,
+    // Fused ArrayLoad + Arithmetic: Dest = acc op arr[idx]
+    bcArrayLoadAddFloat, bcArrayLoadSubFloat, bcArrayLoadDivAddFloat,
+    // Fused Multiply-Add (FMA): Dest = c op (a * b) or Dest op= a * b
+    bcMulAddFloat, bcMulSubFloat, bcMulAddToFloat, bcMulSubToFloat,
+    // Fused Square-Sum and Mul-Mul: Dest = x*x + y*y, dest = a*b*c, etc.
+    bcSquareSumFloat, bcAddSquareFloat, bcMulMulFloat, bcAddSqrtFloat:
+      Result := True;
     // NOTE: bcArrayStoreFloat uses Dest as SOURCE (read), handled by DestReadIsFloatReg
-  ];
+  else
+    Result := False;
+  end;
 end;
 
 function TRegisterCompactor.DestIsStringReg(OpCode: TBytecodeOp): Boolean;
-var
-  Op: Integer;
 begin
-  Op := Ord(OpCode);
-
-  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
-  if Op >= 110 then
-  begin
-    // No superinstructions currently have string Dest register
-    Result := False;
-    Exit;
-  end;
-
-  // Check base opcodes (values < 100, safe for enum set check)
-  Result := OpCode in [
-    bcLoadConstString, bcCopyString, bcStrConcat,
-    bcStrLeft, bcStrRight, bcStrMid,
+  // Using case statement instead of set because opcodes are now Word (>255)
+  case OpCode of
+    // === GROUP 0: Core VM operations ===
+    bcLoadConstString, bcCopyString,
     bcIntToString, bcFloatToString,
-    bcInputString,
-    // Typed array load (string) - Dest is WRITTEN
-    bcArrayLoadString
+    // === GROUP 1: String operations ===
+    bcStrConcat, bcStrLeft, bcStrRight, bcStrMid,
+    // === GROUP 3: Array operations ===
+    bcArrayLoadString,  // Typed array load (string) - Dest is WRITTEN
+    // === GROUP 4: I/O operations ===
+    bcInputString:
+      Result := True;
     // NOTE: bcArrayStoreString uses Dest as SOURCE (read), handled by DestReadIsStringReg
-  ];
+  else
+    Result := False;
+  end;
 end;
 
 function TRegisterCompactor.Src1IsIntReg(OpCode: TBytecodeOp): Boolean;
-var
-  Op: Integer;
 begin
-  Op := Ord(OpCode);
-
-  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
-  if Op >= 110 then
-  begin
-    case Op of
-      // Fused arithmetic-to-dest (Int): Src1 is int operand
-      120, 121, 122,  // bcAddIntTo, bcSubIntTo, bcMulIntTo
-      // Fused constant arithmetic (Int): Src1 is source register
-      140, 141, 142,  // bcAddIntConst, bcSubIntConst, bcMulIntConst
-      // Fused compare-and-branch (Int): Src1 is first comparison operand
-      100, 101, 102, 103, 104, 105,  // bcBranchEqInt..bcBranchGeInt
-      // Fused compare-zero-and-branch (Int): Src1 is the register being compared
-      160, 161,  // bcBranchEqZeroInt, bcBranchNeZeroInt
-      // Fused loop increment-and-branch (Int): Src1 is step register
-      190, 191, 192, 193,  // bcAddIntToBranchLe..bcSubIntToBranchGt
-      // Self-increment/decrement (Int): Src1 is the amount register
-      251, 252,  // bcAddIntSelf, bcSubIntSelf
-      // NEW: Array Move Element: Src1 is source index register (int)
-      255:  // bcArrayMoveElement
-        Result := True;
-    else
-      Result := False;
-    end;
-    Exit;
-  end;
-
-  // Check base opcodes (values < 100, safe for enum set check)
-  Result := OpCode in [
+  // Using case statement instead of set because opcodes are now Word (>255)
+  case OpCode of
+    // === GROUP 0: Core VM operations ===
     // Int arithmetic
     bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
     // Int comparisons
@@ -349,288 +290,233 @@ begin
     // Branch on int (comparison result)
     bcJumpIfZero, bcJumpIfNotZero,
     // Logical operations
-    bcLogicalAnd, bcLogicalOr, bcLogicalNot,
-    // String operations with int param
+    bcLogicalAnd, bcLogicalOr, bcLogicalXor, bcLogicalNot,
+    // === GROUP 1: String operations with int param ===
     bcStrLeft, bcStrRight,
-    // Print int value (Src1 is int register)
+    // === GROUP 4: I/O operations ===
     bcPrintInt, bcPrintIntLn,
-    // Graphics: Src1 = color (int) for bcGraphicBox, Src1 = mode (int) for bcGraphicSetMode
-    // Src1 = R (int) for bcGraphicRGBA, Src1 = which (int) for bcGraphicRdot/bcGraphicGetMode
-    bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA, bcGraphicRdot, bcGraphicGetMode
-  ];
+    // === GROUP 10: Graphics ===
+    bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA, bcGraphicRdot, bcGraphicGetMode,
+    // === SUPERINSTRUCTIONS ===
+    // Fused arithmetic-to-dest (Int): Src1 is int operand
+    bcAddIntTo, bcSubIntTo, bcMulIntTo,
+    // Fused constant arithmetic (Int): Src1 is source register
+    bcAddIntConst, bcSubIntConst, bcMulIntConst,
+    // Fused compare-and-branch (Int): Src1 is first comparison operand
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    // Fused compare-zero-and-branch (Int): Src1 is the register being compared
+    bcBranchEqZeroInt, bcBranchNeZeroInt,
+    // Fused loop increment-and-branch (Int): Src1 = step register
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt,
+    // Fused self-increment/decrement (Int): Src1 = step register
+    bcAddIntSelf, bcSubIntSelf,
+    // Fused array element operations: Src1 = src_idx_reg for MoveElement
+    bcArrayMoveElement:
+      Result := True;
+  else
+    Result := False;
+  end;
 end;
 
 function TRegisterCompactor.Src1IsFloatReg(OpCode: TBytecodeOp): Boolean;
-var
-  Op: Integer;
 begin
-  Op := Ord(OpCode);
-
-  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
-  if Op >= 110 then
-  begin
-    case Op of
-      // Fused arithmetic-to-dest (Float): Src1 is float operand
-      130, 131, 132, 133,  // bcAddFloatTo..bcDivFloatTo
-      // Fused constant arithmetic (Float): Src1 is source register
-      150, 151, 152, 153,  // bcAddFloatConst..bcDivFloatConst
-      // Fused compare-and-branch (Float): Src1 is first comparison operand
-      110, 111, 112, 113, 114, 115,  // bcBranchEqFloat..bcBranchGeFloat
-      // Fused compare-zero-and-branch (Float): Src1 is the register being compared
-      170, 171,  // bcBranchEqZeroFloat, bcBranchNeZeroFloat
-      // NEW: FMA superinstructions - Src1 is float multiplicand 'a'
-      200, 201, 202, 203,  // bcMulAddFloat, bcMulSubFloat, bcMulAddToFloat, bcMulSubToFloat
-      // NEW: Square-Sum patterns - Src1 is float
-      220, 221,            // bcSquareSumFloat, bcAddSquareFloat
-      // NEW: Mul-Mul and Add-Sqrt - Src1 is float
-      230, 231:            // bcMulMulFloat, bcAddSqrtFloat
-        Result := True;
-    else
-      Result := False;
-    end;
-    Exit;
-  end;
-
-  // Check base opcodes (values < 100, safe for enum set check)
-  Result := OpCode in [
+  // Using case statement instead of set because opcodes are now Word (>255)
+  case OpCode of
+    // === GROUP 0: Core VM operations ===
     // Float arithmetic
     bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcNegFloat, bcPowFloat,
     // Float comparisons
     bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat,
-    // Math functions
-    bcMathSqr, bcMathSin, bcMathCos, bcMathTan, bcMathAtn,
-    bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,
     // Conversion from float
     bcFloatToInt, bcFloatToString,
+    // === GROUP 2: Math functions ===
+    bcMathSqr, bcMathSin, bcMathCos, bcMathTan, bcMathAtn,
+    bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,
+    bcMathLog10, bcMathLog2, bcMathLogN,
+    // === GROUP 4: I/O operations ===
     // Print float value (bcPrint/bcPrintLn use float register in Src1)
-    bcPrint, bcPrintLn
-  ];
+    bcPrint, bcPrintLn,
+    // === SUPERINSTRUCTIONS ===
+    // Fused arithmetic-to-dest (Float): Src1 is float operand
+    bcAddFloatTo, bcSubFloatTo, bcMulFloatTo, bcDivFloatTo,
+    // Fused constant arithmetic (Float): Src1 is source register
+    bcAddFloatConst, bcSubFloatConst, bcMulFloatConst, bcDivFloatConst,
+    // Fused compare-and-branch (Float): Src1 is first comparison operand
+    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
+    // Fused compare-zero-and-branch (Float): Src1 is the register being compared
+    bcBranchEqZeroFloat, bcBranchNeZeroFloat,
+    // Fused Multiply-Add (FMA): Src1 is 'a' in (a * b)
+    bcMulAddFloat, bcMulSubFloat, bcMulAddToFloat, bcMulSubToFloat,
+    // Fused Square-Sum: Src1 is 'x' or 'sum'
+    bcSquareSumFloat, bcAddSquareFloat, bcMulMulFloat, bcAddSqrtFloat:
+      Result := True;
+  else
+    Result := False;
+  end;
 end;
 
 function TRegisterCompactor.Src2IsIntReg(OpCode: TBytecodeOp): Boolean;
-var
-  Op: Integer;
 begin
-  Op := Ord(OpCode);
-
-  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
-  if Op >= 110 then
-  begin
-    case Op of
-      // Fused compare-and-branch (Int): Src2 is second comparison operand
-      100, 101, 102, 103, 104, 105,  // bcBranchEqInt..bcBranchGeInt
-      // Fused array-store-constant: Src2 is the int index register
-      180, 181, 182,  // bcArrayStoreIntConst, bcArrayStoreFloatConst, bcArrayStoreStringConst
-      // Fused loop increment-and-branch (Int): Src2 is limit register
-      190, 191, 192, 193,  // bcAddIntToBranchLe..bcSubIntToBranchGt
-      // NEW: Array Load + Arithmetic: Src2 is int index register
-      210, 211, 212,       // bcArrayLoadAddFloat, bcArrayLoadSubFloat, bcArrayLoadDivAddFloat
-      // NEW: Array Load + Branch: Src2 is int index register
-      240, 241,            // bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ
-      // NEW: Array Swap: Src2 is idx1 register (int)
-      250,                 // bcArraySwapInt
-      // NEW: Array Load to register: Src2 is int index register
-      253,                 // bcArrayLoadIntTo
-      // NEW: Array Copy/Move Element: Src2 is index register (int)
-      254, 255,            // bcArrayCopyElement, bcArrayMoveElement
-      // NEW: Array Reverse/Shift: Src2 is start index register (int)
-      156, 157:            // bcArrayReverseRange, bcArrayShiftLeft
-        Result := True;
-    else
-      Result := False;
-    end;
-    Exit;
-  end;
-
-  // Check base opcodes (values < 100, safe for enum set check)
-  Result := OpCode in [
+  // Using case statement instead of set because opcodes are now Word (>255)
+  case OpCode of
+    // === GROUP 0: Core VM operations ===
     // Int arithmetic (second operand)
     bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt,
     // Int comparisons (second operand)
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt,
     // Logical operations (second operand)
-    bcLogicalAnd, bcLogicalOr,
-    // Typed array operations: Src2 is always int (linear index)
+    bcLogicalAnd, bcLogicalOr, bcLogicalXor,
+    // === GROUP 1: String operations with int second param ===
+    bcStrMid,  // Mid$(str, start, length) - start is Src1, length is Src2
+    // === GROUP 3: Typed array operations: Src2 is always int (linear index) ===
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
-    // String operations with int second param
-    bcStrMid,  // Mid$(str, start, length) - start is Src1, length is Src2
-    // Graphics: Src2 = x1 (int) for bcGraphicBox, Src2 = clear (int) for bcGraphicSetMode
-    // Src2 = G (int) for bcGraphicRGBA
-    bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA
-  ];
+    // === GROUP 10: Graphics ===
+    bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
+    // === SUPERINSTRUCTIONS ===
+    // Fused compare-and-branch (Int): Src2 is second comparison operand
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    // Fused array-store-constant: Src2 is the int index register
+    bcArrayStoreIntConst, bcArrayStoreFloatConst, bcArrayStoreStringConst,
+    // Fused loop increment-and-branch (Int): Src2 = limit register
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt,
+    // Fused ArrayLoad + Arithmetic: Src2 is the int index register
+    bcArrayLoadAddFloat, bcArrayLoadSubFloat, bcArrayLoadDivAddFloat,
+    // Fused ArrayLoad + Branch: Src2 is the int index register
+    bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ,
+    // Fused array element operations: Src2 = idx_reg for swap/copy/move, or start_idx for shift
+    bcArraySwapInt, bcArrayCopyElement, bcArrayMoveElement, bcArrayLoadIntTo,
+    bcArrayShiftLeft, bcArrayReverseRange:
+      Result := True;
+  else
+    Result := False;
+  end;
 end;
 
 function TRegisterCompactor.Src2IsFloatReg(OpCode: TBytecodeOp): Boolean;
-var
-  Op: Integer;
 begin
-  Op := Ord(OpCode);
-
-  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
-  if Op >= 110 then
-  begin
-    case Op of
-      // Fused compare-and-branch (Float): Src2 is second comparison operand
-      110, 111, 112, 113, 114, 115,  // bcBranchEqFloat..bcBranchGeFloat
-      // NEW: FMA superinstructions - Src2 is float multiplicand 'b'
-      200, 201, 202, 203,  // bcMulAddFloat, bcMulSubFloat, bcMulAddToFloat, bcMulSubToFloat
-      // NEW: Square-Sum patterns - Src2 is float
-      220, 221,            // bcSquareSumFloat, bcAddSquareFloat
-      // NEW: Mul-Mul and Add-Sqrt - Src2 is float
-      230, 231:            // bcMulMulFloat, bcAddSqrtFloat
-        Result := True;
-    else
-      Result := False;
-    end;
-    Exit;
-  end;
-
-  // Check base opcodes (values < 100, safe for enum set check)
-  Result := OpCode in [
+  // Using case statement instead of set because opcodes are now Word (>255)
+  case OpCode of
+    // === GROUP 0: Core VM operations ===
     // Float arithmetic (second operand)
     bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcPowFloat,
     // Float comparisons (second operand)
-    bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat
-  ];
+    bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat,
+    // === SUPERINSTRUCTIONS ===
+    // Fused compare-and-branch (Float): Src2 is second comparison operand
+    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
+    // Fused Multiply-Add (FMA): Src2 is 'b' in (a * b)
+    bcMulAddFloat, bcMulSubFloat, bcMulAddToFloat, bcMulSubToFloat,
+    // Fused Square-Sum: Src2 is 'y' or 'x' (square operand)
+    bcSquareSumFloat, bcAddSquareFloat, bcMulMulFloat, bcAddSqrtFloat,
+    // LOGN(base, x): Src2 is 'x' (the value)
+    bcMathLogN:
+      Result := True;
+  else
+    Result := False;
+  end;
 end;
 
 function TRegisterCompactor.Src1IsStringReg(OpCode: TBytecodeOp): Boolean;
-var
-  Op: Integer;
 begin
-  Op := Ord(OpCode);
-
-  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
-  if Op >= 110 then
-  begin
-    // No superinstructions currently use Src1 as string register
-    Result := False;
-    Exit;
-  end;
-
-  // Check base opcodes (values < 100, safe for enum set check)
-  Result := OpCode in [
-    // String copy (source)
+  // Using case statement instead of set because opcodes are now Word (>255)
+  case OpCode of
+    // === GROUP 0: Core VM operations ===
     bcCopyString,
-    // String concatenation (first operand)
-    bcStrConcat,
     // String comparison (first operand)
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
-    // String functions that take string as first param
-    bcStrLeft, bcStrRight, bcStrMid,
-    // String length (source)
-    bcStrLen,
-    // Print string (source)
-    bcPrintString, bcPrintStringLn
-  ];
+    // === GROUP 1: String operations ===
+    bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrLen,
+    // === GROUP 2: Math operations ===
+    bcStrDec,  // DEC(hexstring) - reads string, produces int
+    // === GROUP 4: I/O operations ===
+    bcPrintString, bcPrintStringLn:
+      Result := True;
+  else
+    Result := False;
+  end;
 end;
 
 function TRegisterCompactor.Src2IsStringReg(OpCode: TBytecodeOp): Boolean;
-var
-  Op: Integer;
 begin
-  Op := Ord(OpCode);
-
-  // Handle superinstructions FIRST (opcodes >= 110) to avoid enum range issues
-  if Op >= 110 then
-  begin
-    // No superinstructions currently use Src2 as string register
-    Result := False;
-    Exit;
-  end;
-
-  // Check base opcodes (values < 100, safe for enum set check)
-  Result := OpCode in [
-    // String concatenation (second operand)
-    bcStrConcat,
+  // Using case statement instead of set because opcodes are now Word (>255)
+  case OpCode of
+    // === GROUP 0: Core VM operations ===
     // String comparison (second operand)
-    bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString
-  ];
+    bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
+    // === GROUP 1: String operations ===
+    bcStrConcat:  // String concatenation (second operand)
+      Result := True;
+  else
+    Result := False;
+  end;
 end;
 
 function TRegisterCompactor.DestReadIsIntReg(OpCode: TBytecodeOp): Boolean;
-var
-  Op: Integer;
 begin
   { These opcodes use Dest as a SOURCE register (read, not write).
     This is critical for ArrayStore where Dest holds the VALUE to store. }
-  Op := Ord(OpCode);
-
-  // Handle superinstructions
-  if Op >= 110 then
-  begin
-    case Op of
-      // ArraySwapInt: Dest = idx2 register (int) - READ, not written
-      250:  // bcArraySwapInt
-        Result := True;
-    else
-      Result := False;
-    end;
-    Exit;
+  // Using case statement instead of set because opcodes are now Word (>255)
+  case OpCode of
+    // === GROUP 3: Array operations ===
+    bcArrayStoreInt,  // Dest = value register (int) - READ, not written
+    // === GROUP 10: Graphics ===
+    bcGraphicBox,     // Dest = y1 register (int) - READ, not written
+    // === SUPERINSTRUCTIONS ===
+    // Array swap: Dest = idx2_reg (int) - READ
+    bcArraySwapInt,
+    // Array shift/reverse: Dest = end_idx_reg (int) - READ
+    bcArrayShiftLeft, bcArrayReverseRange:
+      Result := True;
+  else
+    Result := False;
   end;
-
-  // ArrayStoreInt: Dest = value register (int) - READ, not written
-  // bcGraphicBox: Dest = y1 register (int) - READ, not written
-  Result := OpCode in [bcArrayStoreInt, bcGraphicBox];
 end;
 
 function TRegisterCompactor.DestReadIsFloatReg(OpCode: TBytecodeOp): Boolean;
-var
-  Op: Integer;
 begin
   { These opcodes use Dest as a SOURCE register (read, not write).
     This is critical for ArrayStore where Dest holds the VALUE to store. }
-  Op := Ord(OpCode);
-
-  // No superinstructions currently read Dest as float (ArrayStoreFloatConst uses Immediate)
-  if Op >= 110 then
-  begin
+  // Using case statement instead of set because opcodes are now Word (>255)
+  case OpCode of
+    // === GROUP 3: Array operations ===
+    bcArrayStoreFloat:  // Dest = value register (float) - READ, not written
+      Result := True;
+  else
     Result := False;
-    Exit;
   end;
-
-  // ArrayStoreFloat: Dest = value register (float) - READ, not written
-  Result := OpCode = bcArrayStoreFloat;
 end;
 
 function TRegisterCompactor.DestReadIsStringReg(OpCode: TBytecodeOp): Boolean;
-var
-  Op: Integer;
 begin
   { These opcodes use Dest as a SOURCE register (read, not write).
     This is critical for ArrayStore where Dest holds the VALUE to store. }
-  Op := Ord(OpCode);
-
-  // No superinstructions currently read Dest as string
-  if Op >= 110 then
-  begin
+  // Using case statement instead of set because opcodes are now Word (>255)
+  case OpCode of
+    // === GROUP 3: Array operations ===
+    bcArrayStoreString:  // Dest = value register (string) - READ, not written
+      Result := True;
+  else
     Result := False;
-    Exit;
   end;
-
-  // ArrayStoreString: Dest = value register (string) - READ, not written
-  Result := OpCode = bcArrayStoreString;
 end;
 
 function TRegisterCompactor.ImmediateIsFloatReg(OpCode: TBytecodeOp): Boolean;
-var
-  Op: Integer;
 begin
   { These superinstructions store a FLOAT REGISTER INDEX in the Immediate field
     instead of a constant value. The Immediate field needs to be remapped
-    during register compaction.
-
-    Layout for these opcodes:
-    - bcMulAddFloat (200):    dest = Immediate[c] + Src1[a] * Src2[b]
-    - bcMulSubFloat (201):    dest = Immediate[c] - Src1[a] * Src2[b]
-    - bcArrayLoadAddFloat (210): dest = Immediate[acc] + arr[Src1][Src2]
-    - bcArrayLoadSubFloat (211): dest = Immediate[acc] - arr[Src1][Src2]
-    - bcArrayLoadDivAddFloat (212): dest = Immediate[acc] + arr/denom (complex)
-    - bcMulMulFloat (230):    dest = Src1 * Src2 * Immediate[extra]
-  }
-  Op := Ord(OpCode);
-  Result := Op in [200, 201, 210, 211, 212, 230];
+    during register compaction. }
+  case OpCode of
+    // Fused ArrayLoad + Arithmetic: Immediate is the accumulator float register
+    bcArrayLoadAddFloat, bcArrayLoadSubFloat,
+    // Fused Multiply-Add (FMA): Immediate is 'c' in (c op a*b) - the accumulator
+    bcMulAddFloat, bcMulSubFloat,
+    // Fused Mul-Mul: Immediate is 'c' in (a*b*c)
+    bcMulMulFloat:
+      Result := True;
+  else
+    Result := False;
+  end;
 end;
 
 procedure TRegisterCompactor.MarkIntRegUsed(Reg: Integer);
@@ -755,6 +641,13 @@ begin
     begin
       MarkIntRegUsed(Instr.Immediate and $FFFF);           // A register
       MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);  // B register
+    end;
+
+    // bcArrayLoadDivAddFloat: Immediate = (denom_reg << 16) | acc_reg - two float registers
+    if OpCode = bcArrayLoadDivAddFloat then
+    begin
+      MarkFloatRegUsed(Instr.Immediate and $FFFF);           // acc register
+      MarkFloatRegUsed((Instr.Immediate shr 16) and $FFFF);  // denom register
     end;
 
     // bcArrayDim has no register operands (info is in metadata)
@@ -1051,6 +944,32 @@ begin
       OldReg := (Instr.Immediate shr 16) and $FFFF;
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
         NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 16);
+
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
+      end;
+    end;
+
+    // bcArrayLoadDivAddFloat: Immediate = (denom_reg << 16) | acc_reg - two float registers
+    if OpCode = bcArrayLoadDivAddFloat then
+    begin
+      // acc register (bits 0-15)
+      OldReg := Instr.Immediate and $FFFF;
+      if (OldReg < Length(FFloatRegMap)) and (FFloatRegMap[OldReg] >= 0) then
+        NewReg := FFloatRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewReg and $FFFF;
+
+      // denom register (bits 16-31)
+      OldReg := (Instr.Immediate shr 16) and $FFFF;
+      if (OldReg < Length(FFloatRegMap)) and (FFloatRegMap[OldReg] >= 0) then
+        NewReg := FFloatRegMap[OldReg]
       else
         NewReg := OldReg;
       NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 16);

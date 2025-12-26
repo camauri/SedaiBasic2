@@ -364,7 +364,7 @@ begin
       Result := True;
 
     // Logical operations (pure functions)
-    ssaLogicalAnd, ssaLogicalOr, ssaLogicalNot:
+    ssaLogicalAnd, ssaLogicalOr, ssaLogicalXor, ssaLogicalNot:
       Result := True;
 
     // String operations (pure functions)
@@ -373,7 +373,8 @@ begin
 
     // Math functions (pure functions)
     ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathLog, ssaMathExp,
-    ssaMathSqr, ssaMathAbs, ssaMathSgn, ssaMathInt:
+    ssaMathSqr, ssaMathAbs, ssaMathSgn, ssaMathInt,
+    ssaMathLog10, ssaMathLog2, ssaMathLogN:
       Result := True;
 
     // Constants - DO NOT value number!

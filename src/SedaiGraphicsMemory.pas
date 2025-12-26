@@ -109,6 +109,9 @@ type
     procedure SetPixel(X, Y: Integer; PaletteIndex: TPaletteIndex); overload;
     function GetPixel(X, Y: Integer): UInt32;
     function GetPixelIndex(X, Y: Integer): TPaletteIndex;
+    // Aliases for RGBA operations (same as SetPixel/GetPixel with UInt32)
+    procedure SetPixelRGBA(X, Y: Integer; RGBA: UInt32); inline;
+    function GetPixelRGBA(X, Y: Integer): UInt32; inline;
 
     procedure SetCurrentMode(Mode: TGraphicMode);
     procedure SetSplitLine(Line: Integer);
@@ -674,6 +677,16 @@ begin
     // Converts RGB to closest palette index
     Result := RGBToPaletteIndex(GetPixel(X, Y));
   end;
+end;
+
+procedure TGraphicsMemory.SetPixelRGBA(X, Y: Integer; RGBA: UInt32);
+begin
+  SetPixel(X, Y, RGBA);
+end;
+
+function TGraphicsMemory.GetPixelRGBA(X, Y: Integer): UInt32;
+begin
+  Result := GetPixel(X, Y);
 end;
 
 procedure TGraphicsMemory.SetCurrentMode(Mode: TGraphicMode);

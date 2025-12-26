@@ -35,36 +35,32 @@
 // Master switch: uncomment to disable ALL optimizations
 {.$DEFINE DISABLE_ALL_OPTIMIZATIONS}
 
-// GVN vs CSE: These are mutually exclusive! Only ONE can be active.
-// GVN (Global Value Numbering) is more powerful, so we disable CSE.
-{$DEFINE DISABLE_CSE}
-
 // Individual optimization flags (controlled by master switch)
 // Ordered by execution sequence in the optimization pipeline
 
-{.$IFDEF DISABLE_ALL_OPTIMIZATIONS}
-  {.$DEFINE DISABLE_CONSTANT_FOLDING}   // Skip constant folding in SSA generation
-  {.$DEFINE DISABLE_DBE}                // Skip dead block elimination
-  {.$DEFINE DISABLE_DOMINATOR_TREE}     // Skip dominator tree construction
-  {.$DEFINE DISABLE_SSA_CONSTRUCTION}   // Skip Semi-Pruned SSA construction (PHI + versioning)
-  {.$DEFINE DISABLE_GVN}                // Skip Global Value Numbering (mutually exclusive with CSE)
+{$IFDEF DISABLE_ALL_OPTIMIZATIONS}
+  {$DEFINE DISABLE_CONSTANT_FOLDING}   // Skip constant folding in SSA generation
+  {$DEFINE DISABLE_DBE}                // Skip dead block elimination
+  {$DEFINE DISABLE_DOMINATOR_TREE}     // Skip dominator tree construction
+  {$DEFINE DISABLE_SSA_CONSTRUCTION}   // Skip Semi-Pruned SSA construction (PHI + versioning)
+  {$DEFINE DISABLE_GVN}                // Skip Global Value Numbering (mutually exclusive with CSE)
   {$DEFINE DISABLE_CSE}                // Skip common subexpression elimination (mutually exclusive with GVN)
-  {.$DEFINE DISABLE_ALGEBRAIC}          // Skip algebraic simplification
-  {.$DEFINE DISABLE_STRENGTH_RED}       // Skip strength reduction
-  {.$DEFINE DISABLE_GOSUB_INLINE}       // Skip GOSUB inlining
-  {.$DEFINE DISABLE_CONST_PROP}         // Skip aggressive constant propagation
-  {.$DEFINE DISABLE_COPY_PROP}          // Skip copy propagation
-  {.$DEFINE DISABLE_LICM}               // Skip loop-invariant code motion
-  {.$DEFINE DISABLE_LOOP_UNROLL}        // Skip loop unrolling optimization
-  {.$DEFINE DISABLE_DCE}                // Skip dead code elimination (removes dead PHI, LoadConst, etc.)
-  {.$DEFINE DISABLE_PHI_ELIM}           // Skip PHI Elimination (converts PHI to Copy - MUST run after DCE)
-  {.$DEFINE DISABLE_COPY_COAL}          // Skip Copy Coalescing (removes redundant Copy instructions)
-  {.$DEFINE DISABLE_REG_ALLOC}          // Skip Register Allocation (leave SSA form with virtual registers)
-  {.$DEFINE DISABLE_PEEPHOLE}           // Skip peephole optimizations
-  {.$DEFINE DISABLE_SUPERINSTRUCTIONS}  // Skip Superinstruction generation
-  {.$DEFINE DISABLE_ARRAYSTORECONST}    // Skip ArrayStoreConst superinstruction fusion
-  {.$DEFINE DISABLE_NOP_COMPACTION}     // Skip NOP Compaction (removes NOPs after fusion)
-  {.$DEFINE DISABLE_PEEPHOLE_PASS2}     // Skip second peephole pass (redundant jump elimination)
-  {.$DEFINE DISABLE_REG_COMPACTION}     // Skip Register Compaction (post-bytecode)
-{.$ENDIF}
+  {$DEFINE DISABLE_ALGEBRAIC}          // Skip algebraic simplification
+  {$DEFINE DISABLE_STRENGTH_RED}       // Skip strength reduction
+  {$DEFINE DISABLE_GOSUB_INLINE}       // Skip GOSUB inlining
+  {$DEFINE DISABLE_CONST_PROP}         // Skip aggressive constant propagation
+  {$DEFINE DISABLE_COPY_PROP}          // Skip copy propagation
+  {$DEFINE DISABLE_LICM}               // Skip loop-invariant code motion
+  {$DEFINE DISABLE_LOOP_UNROLL}        // Skip loop unrolling optimization
+  {$DEFINE DISABLE_DCE}                // Skip dead code elimination (removes dead PHI, LoadConst, etc.)
+  {$DEFINE DISABLE_PHI_ELIM}           // Skip PHI Elimination (converts PHI to Copy - MUST run after DCE)
+  {$DEFINE DISABLE_COPY_COAL}          // Skip Copy Coalescing (removes redundant Copy instructions)
+  {$DEFINE DISABLE_REG_ALLOC}          // Skip Register Allocation (leave SSA form with virtual registers)
+  {$DEFINE DISABLE_PEEPHOLE}           // Skip peephole optimizations
+  {$DEFINE DISABLE_SUPERINSTRUCTIONS}  // Skip Superinstruction generation
+  {$DEFINE DISABLE_ARRAYSTORECONST}    // Skip ArrayStoreConst superinstruction fusion
+  {$DEFINE DISABLE_NOP_COMPACTION}     // Skip NOP Compaction (removes NOPs after fusion)
+  {$DEFINE DISABLE_PEEPHOLE_PASS2}     // Skip second peephole pass (redundant jump elimination)
+  {$DEFINE DISABLE_REG_COMPACTION}     // Skip Register Compaction (post-bytecode)
+{$ENDIF}
 

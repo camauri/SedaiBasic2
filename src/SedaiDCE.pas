@@ -273,7 +273,8 @@ begin
       Result := True;
 
     // Program termination and system state - always live
-    ssaEnd, ssaStop, ssaFast, ssaSlow, ssaSleep:
+    ssaEnd, ssaStop, ssaFast, ssaSlow, ssaSleep, ssaClear,
+    ssaTron, ssaTroff:  // TRON/TROFF switch VM execution mode (side effect)
       Result := True;
 
     // Labels - always live (control flow targets)
@@ -293,6 +294,10 @@ begin
 
     // Graphics operations - always live (visible side effects on screen)
     ssaGraphicSetMode, ssaGraphicBox, ssaGraphicCircle, ssaGraphicDraw, ssaGraphicLocate:
+      Result := True;
+
+    // Sound operations - always live (audible side effects)
+    ssaSoundVol, ssaSoundSound, ssaSoundEnvelope, ssaSoundTempo, ssaSoundPlay, ssaSoundFilter:
       Result := True;
 
     // Function calls - always live (may have side effects)

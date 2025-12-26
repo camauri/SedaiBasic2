@@ -62,142 +62,8 @@ interface
 uses
   Classes, SysUtils, SedaiBytecodeTypes, SedaiNopCompaction;
 
-{ Extended bytecode opcodes for superinstructions }
-{ Values 110+ to avoid collision with base opcodes (0-109) }
-const
-  SUPERINSTR_BASE = 110;  // Superinstructions start at 110
-
-  // === Fused compare-and-branch (Int) ===
-  // Format: Src1, Src2, Immediate=target
-  // Semantics: if (Src1 op Src2) goto target
-  bcBranchEqInt = 110;      // if (r[src1] == r[src2]) goto target
-  bcBranchNeInt = 111;      // if (r[src1] != r[src2]) goto target
-  bcBranchLtInt = 112;      // if (r[src1] < r[src2]) goto target
-  bcBranchGtInt = 113;      // if (r[src1] > r[src2]) goto target
-  bcBranchLeInt = 114;      // if (r[src1] <= r[src2]) goto target
-  bcBranchGeInt = 115;      // if (r[src1] >= r[src2]) goto target
-
-  // === Fused compare-and-branch (Float) ===
-  bcBranchEqFloat = 120;
-  bcBranchNeFloat = 121;
-  bcBranchLtFloat = 122;
-  bcBranchGtFloat = 123;
-  bcBranchLeFloat = 124;
-  bcBranchGeFloat = 125;
-
-  // === Fused arithmetic-to-dest (Int) ===
-  // Format: Dest, Src1 (Dest = Dest op Src1)
-  // Very common pattern: AddInt Rtmp, Rdest, Rsrc + CopyInt Rdest, Rtmp
-  bcAddIntTo = 130;         // r[dest] = r[dest] + r[src1]
-  bcSubIntTo = 131;         // r[dest] = r[dest] - r[src1]
-  bcMulIntTo = 132;         // r[dest] = r[dest] * r[src1]
-
-  // === Fused arithmetic-to-dest (Float) ===
-  bcAddFloatTo = 140;       // r[dest] = r[dest] + r[src1]
-  bcSubFloatTo = 141;       // r[dest] = r[dest] - r[src1]
-  bcMulFloatTo = 142;       // r[dest] = r[dest] * r[src1]
-  bcDivFloatTo = 143;       // r[dest] = r[dest] / r[src1]
-
-  // === Fused constant arithmetic (Int) ===
-  // Format: Dest, Src1, Immediate=constant
-  // Pattern: LoadConstInt Rtmp, K + AddInt Rdest, Rsrc, Rtmp
-  bcAddIntConst = 150;      // r[dest] = r[src1] + immediate
-  bcSubIntConst = 151;      // r[dest] = r[src1] - immediate
-  bcMulIntConst = 152;      // r[dest] = r[src1] * immediate
-
-  // === Fused constant arithmetic (Float) ===
-  bcAddFloatConst = 160;    // r[dest] = r[src1] + immediate(as double)
-  bcSubFloatConst = 161;    // r[dest] = r[src1] - immediate(as double)
-  bcMulFloatConst = 162;    // r[dest] = r[src1] * immediate(as double)
-  bcDivFloatConst = 163;    // r[dest] = r[src1] / immediate(as double)
-
-  // === Fused compare-zero-and-branch (Int) ===
-  // Pattern: LoadConstInt R, 0 + CmpXx + JumpIfZero
-  bcBranchEqZeroInt = 170;  // if (r[src1] == 0) goto target
-  bcBranchNeZeroInt = 171;  // if (r[src1] != 0) goto target
-
-  // === Fused compare-zero-and-branch (Float) ===
-  bcBranchEqZeroFloat = 180;
-  bcBranchNeZeroFloat = 181;
-
-  // === Fused array-store-constant ===
-  // Pattern: LoadConstXxx Rtmp, K + ArrayStoreXxx ARR, idx, Rtmp
-  // Format: Src1=ArrayIndex, Src2=IndexReg, Immediate=ConstValue
-  bcArrayStoreIntConst = 190;     // ARR[idx] = immediate (int)
-  bcArrayStoreFloatConst = 191;   // ARR[idx] = immediate (as double)
-  bcArrayStoreStringConst = 192;  // ARR[idx] = string constant index
-
-  // === Fused loop increment-and-branch (Int) ===
-  // Pattern: AddIntTo Rdest, Rstep + Jump loopTop + BranchGtInt Rdest, Rlimit, exitTarget
-  // Fuses to: dest += step; if (dest <= limit) goto loopTop
-  // Format: Dest=counter, Src1=step, Src2=limit, Immediate=loopTop target
-  // NOTE: This replaces 3 instructions with 1, eliminating the Jump entirely
-  bcAddIntToBranchLe = 200;       // r[dest] += r[src1]; if (r[dest] <= r[src2]) goto target
-  bcAddIntToBranchLt = 201;       // r[dest] += r[src1]; if (r[dest] < r[src2]) goto target
-  bcSubIntToBranchGe = 202;       // r[dest] -= r[src1]; if (r[dest] >= r[src2]) goto target
-  bcSubIntToBranchGt = 203;       // r[dest] -= r[src1]; if (r[dest] > r[src2]) goto target
-
-  // === NEW: Fused Multiply-Add/Sub (FMA) - HIGH PRIORITY ===
-  // Pattern: MulFloat Rtmp, Ra, Rb + AddFloat Rdest, Rc, Rtmp => dest = c + a*b
-  // Pattern: MulFloat Rtmp, Ra, Rb + SubFloat Rdest, Rc, Rtmp => dest = c - a*b
-  // Format: Dest, Src1=a, Src2=b, Extra=c (extra operand stored in Immediate as register index)
-  bcMulAddFloat = 210;            // r[dest] = r[extra] + r[src1] * r[src2]
-  bcMulSubFloat = 211;            // r[dest] = r[extra] - r[src1] * r[src2]
-
-  // FMA with dest same as accumulator (very common pattern)
-  // Pattern: MulFloat Rtmp, Ra, Rb + AddFloatTo Rdest, Rtmp => dest += a*b
-  // Pattern: MulFloat Rtmp, Ra, Rb + SubFloatTo Rdest, Rtmp => dest -= a*b
-  bcMulAddToFloat = 212;          // r[dest] = r[dest] + r[src1] * r[src2]
-  bcMulSubToFloat = 213;          // r[dest] = r[dest] - r[src1] * r[src2]
-
-  // === NEW: Array Load + Arithmetic - HIGH PRIORITY ===
-  // Pattern: ArrayLoadFloat Rtmp, arr, idx + AddFloat Rdest, Racc, Rtmp => dest = acc + arr[idx]
-  // Format: Dest, Src1=arr_index, Src2=idx_reg, Extra=acc_reg
-  bcArrayLoadAddFloat = 220;      // r[dest] = r[extra] + arr[src1][r[src2]]
-  bcArrayLoadSubFloat = 221;      // r[dest] = r[extra] - arr[src1][r[src2]]
-
-  // Pattern: ArrayLoadFloat Rtmp, arr, idx + DivFloat Rdiv, Rtmp, Rdenom + AddFloat Rdest, Racc, Rdiv
-  // Very common in spectral-norm: sum = sum + u(i) / A(i,j)
-  // Format: Dest, Src1=arr_index, Src2=idx_reg, Extra encodes: acc_reg (low 16) + denom_reg (high 16)
-  bcArrayLoadDivAddFloat = 222;   // r[dest] = r[acc] + arr[src1][r[src2]] / r[denom]
-
-  // === NEW: Square-Sum pattern - MEDIUM PRIORITY ===
-  // Pattern: MulFloat Rsq, Rx, Rx (square) then AddFloat Rsum, Rsum, Rsq
-  // Very common in n-body for distance: dx*dx + dy*dy + dz*dz
-  // Format: Dest, Src1=x, Src2=y (dest = x*x + y*y)
-  bcSquareSumFloat = 230;         // r[dest] = r[src1]*r[src1] + r[src2]*r[src2]
-
-  // Add third square to existing sum
-  // Format: Dest, Src1=existing_sum, Src2=z (dest = sum + z*z)
-  bcAddSquareFloat = 231;         // r[dest] = r[src1] + r[src2]*r[src2]
-
-  // === NEW: Mul-Mul chain - MEDIUM PRIORITY ===
-  // Pattern: MulFloat Rtmp, Ra, Rb + MulFloat Rdest, Rtmp, Rc => dest = a*b*c
-  // Format: Dest, Src1=a, Src2=b, Extra=c
-  bcMulMulFloat = 240;            // r[dest] = r[src1] * r[src2] * r[extra]
-
-  // === NEW: Add-Sqrt - MEDIUM PRIORITY ===
-  // Pattern: AddFloat Rtmp, Ra, Rb + MathSqr Rdest, Rtmp => dest = sqrt(a+b)
-  // Format: Dest, Src1=a, Src2=b
-  bcAddSqrtFloat = 241;           // r[dest] = sqrt(r[src1] + r[src2])
-
-  // === NEW: Array Load + Branch - LOW PRIORITY ===
-  // Pattern: ArrayLoadInt Rtmp, arr, idx + BranchNeZeroInt Rtmp, target
-  // Format: Src1=arr_index, Src2=idx_reg, Immediate=target
-  bcArrayLoadIntBranchNZ = 250;   // if arr[src1][r[src2]] != 0 goto target
-  bcArrayLoadIntBranchZ = 251;    // if arr[src1][r[src2]] == 0 goto target
-
-  // === DISABLED: These superinstructions exceed the byte limit (255 max) ===
-  // They are defined but with values that will never be generated (>= 252).
-  // The optimizer functions that use them will return False and not generate them.
-  bcArraySwapInt = 252;       // DISABLED: swap arr[idx1] and arr[idx2]
-  bcAddIntSelf = 253;         // DISABLED: r[dest] += r[src1]
-  bcSubIntSelf = 254;         // DISABLED: r[dest] -= r[src1]
-  bcArrayLoadIntTo = 255;     // DISABLED: load array element to different register
-  bcArrayCopyElement = 255;   // DISABLED: arr_dest[idx] = arr_src[idx] (same as above, never used)
-  bcArrayMoveElement = 255;   // DISABLED: arr[dest_idx] = arr[src_idx] (same as above, never used)
-  bcArrayReverseRange = 255;  // DISABLED: reverse arr[start..end] in-place (same as above, never used)
-  bcArrayShiftLeft = 255;     // DISABLED: shift left operation (same as above, never used)
+{ Superinstruction opcodes are now defined in SedaiBytecodeTypes.pas }
+{ All bcXxx constants are imported via the uses clause }
 
 type
   TSuperinstructionOptimizer = class
@@ -269,7 +135,7 @@ var
 begin
   // IMPORTANT: Initialize entire record to zero to avoid garbage in uninitialized fields
   FillChar(NopInstr, SizeOf(NopInstr), 0);
-  NopInstr.OpCode := Byte(bcNop);
+  NopInstr.OpCode := bcNop;
   // All other fields are already 0 from FillChar
   FProgram.SetInstruction(Index, NopInstr);
 end;
@@ -286,10 +152,10 @@ begin
   begin
     Instr := FProgram.GetInstruction(i);
 
-    // Check standard jump opcodes (must check OpCode directly to avoid enum range issues)
-    if Instr.OpCode < 100 then
+    // Check standard jump opcodes in Group 0 (Core)
+    if Instr.OpCode < bcGroupString then
     begin
-      case TBytecodeOp(Instr.OpCode) of
+      case Instr.OpCode of
         bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall:
           if Instr.Immediate = Index then
           begin
@@ -298,15 +164,15 @@ begin
           end;
       end;
     end
-    else
+    // Check superinstruction branch opcodes (Group 200+)
+    else if Instr.OpCode >= bcGroupSuper then
     begin
-      // Check superinstruction branch opcodes (100-105, 110-115, 160-161, 170-171, 190-193)
       case Instr.OpCode of
-        100..105,   // BranchXxInt
-        110..115,   // BranchXxFloat
-        160, 161,   // BranchXxZeroInt
-        170, 171,   // BranchXxZeroFloat
-        190..193:   // AddIntToBranchLe/Lt, SubIntToBranchGe/Gt
+        bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+        bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
+        bcBranchEqZeroInt, bcBranchNeZeroInt,
+        bcBranchEqZeroFloat, bcBranchNeZeroFloat,
+        bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt:
           if Instr.Immediate = Index then
           begin
             Result := True;
@@ -355,21 +221,22 @@ begin
     // Check for control flow (end of basic block)
     // Must handle both standard opcodes and superinstructions
     IsControlFlow := False;
-    if Instr.OpCode < 100 then
+    if Instr.OpCode < bcGroupString then
     begin
-      case TBytecodeOp(Instr.OpCode) of
+      // Standard control flow opcodes in Group 0
+      case Instr.OpCode of
         bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcReturn, bcEnd, bcStop:
           IsControlFlow := True;
       end;
     end
-    else
+    else if Instr.OpCode >= bcGroupSuper then
     begin
       // Superinstruction branches are also control flow
       case Instr.OpCode of
-        100..105,   // BranchXxInt
-        110..115,   // BranchXxFloat
-        160, 161,   // BranchXxZeroInt
-        170, 171:   // BranchXxZeroFloat
+        bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+        bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
+        bcBranchEqZeroInt, bcBranchNeZeroInt,
+        bcBranchEqZeroFloat, bcBranchNeZeroFloat:
           IsControlFlow := True;
       end;
     end;
@@ -386,7 +253,7 @@ function TSuperinstructionOptimizer.TryFuseCompareAndBranch(Index: Integer): Boo
 var
   CmpInstr, JmpInstr, FusedInstr: TBytecodeInstruction;
   CmpOp, JmpOp: TBytecodeOp;
-  FusedOpCode: Byte;
+  FusedOpCode: Word;
   NegateCondition: Boolean;
 begin
   Result := False;
@@ -397,7 +264,7 @@ begin
   JmpInstr := FProgram.GetInstruction(Index + 1);
 
   // Safety: both instructions must be standard opcodes (< 100)
-  if (CmpInstr.OpCode >= 110) or (JmpInstr.OpCode >= 110) then Exit;
+  if (CmpInstr.OpCode >= bcGroupSuper) or (JmpInstr.OpCode >= bcGroupSuper) then Exit;
 
   CmpOp := TBytecodeOp(CmpInstr.OpCode);
   JmpOp := TBytecodeOp(JmpInstr.OpCode);
@@ -466,7 +333,7 @@ function TSuperinstructionOptimizer.TryFuseArithAndCopy(Index: Integer): Boolean
 var
   ArithInstr, CopyInstr, FusedInstr: TBytecodeInstruction;
   ArithOp, CopyOp: TBytecodeOp;
-  FusedOpCode: Byte;
+  FusedOpCode: Word;
 begin
   Result := False;
 
@@ -476,7 +343,7 @@ begin
   CopyInstr := FProgram.GetInstruction(Index + 1);
 
   // Safety: both instructions must be standard opcodes (< 100)
-  if (ArithInstr.OpCode >= 110) or (CopyInstr.OpCode >= 110) then Exit;
+  if (ArithInstr.OpCode >= bcGroupSuper) or (CopyInstr.OpCode >= bcGroupSuper) then Exit;
 
   ArithOp := TBytecodeOp(ArithInstr.OpCode);
   CopyOp := TBytecodeOp(CopyInstr.OpCode);
@@ -551,7 +418,7 @@ function TSuperinstructionOptimizer.TryFuseConstantArithmetic(Index: Integer): B
 var
   LoadInstr, ArithInstr, FusedInstr: TBytecodeInstruction;
   LoadOp, ArithOp: TBytecodeOp;
-  FusedOpCode: Byte;
+  FusedOpCode: Word;
   ConstReg: Word;
 begin
   Result := False;
@@ -562,7 +429,7 @@ begin
   ArithInstr := FProgram.GetInstruction(Index + 1);
 
   // Safety: both instructions must be standard opcodes (< 100)
-  if (LoadInstr.OpCode >= 110) or (ArithInstr.OpCode >= 110) then Exit;
+  if (LoadInstr.OpCode >= bcGroupSuper) or (ArithInstr.OpCode >= bcGroupSuper) then Exit;
 
   LoadOp := TBytecodeOp(LoadInstr.OpCode);
   ArithOp := TBytecodeOp(ArithInstr.OpCode);
@@ -638,7 +505,7 @@ function TSuperinstructionOptimizer.TryFuseCompareZeroAndBranch(Index: Integer):
 var
   LoadInstr, CmpInstr, JmpInstr, FusedInstr: TBytecodeInstruction;
   LoadOp, CmpOp, JmpOp: TBytecodeOp;
-  FusedOpCode: Byte;
+  FusedOpCode: Word;
   ConstReg, CmpResultReg: Word;
   IsFloat: Boolean;
   NegateCondition: Boolean;
@@ -652,7 +519,7 @@ begin
   JmpInstr := FProgram.GetInstruction(Index + 2);
 
   // Safety: all instructions must be standard opcodes (< 100)
-  if (LoadInstr.OpCode >= 110) or (CmpInstr.OpCode >= 110) or (JmpInstr.OpCode >= 110) then Exit;
+  if (LoadInstr.OpCode >= bcGroupSuper) or (CmpInstr.OpCode >= bcGroupSuper) or (JmpInstr.OpCode >= bcGroupSuper) then Exit;
 
   LoadOp := TBytecodeOp(LoadInstr.OpCode);
   CmpOp := TBytecodeOp(CmpInstr.OpCode);
@@ -755,7 +622,7 @@ function TSuperinstructionOptimizer.TryFuseArrayStoreConst(Index: Integer): Bool
 var
   LoadInstr, StoreInstr, FusedInstr: TBytecodeInstruction;
   LoadOp, StoreOp: TBytecodeOp;
-  FusedOpCode: Byte;
+  FusedOpCode: Word;
   ConstReg: Word;
 begin
   { Pattern: LoadConstXxx Rtmp, K
@@ -772,7 +639,7 @@ begin
   StoreInstr := FProgram.GetInstruction(Index + 1);
 
   // Safety: both instructions must be standard opcodes (< 100)
-  if (LoadInstr.OpCode >= 110) or (StoreInstr.OpCode >= 110) then Exit;
+  if (LoadInstr.OpCode >= bcGroupSuper) or (StoreInstr.OpCode >= bcGroupSuper) then Exit;
 
   LoadOp := TBytecodeOp(LoadInstr.OpCode);
   StoreOp := TBytecodeOp(StoreInstr.OpCode);
@@ -851,7 +718,7 @@ function TSuperinstructionOptimizer.TryFuseLoopIncrementAndBranch(Index: Integer
 var
   AddInstr, JumpInstr, BranchInstr, FusedInstr: TBytecodeInstruction;
   JumpOp: TBytecodeOp;
-  FusedOpCode: Byte;
+  FusedOpCode: Word;
   LoopTarget: Integer;
   JumpIndex: Integer;
   LoopBodyIndex: Integer;
@@ -878,8 +745,16 @@ begin
 
   AddInstr := FProgram.GetInstruction(Index);
 
-  // Check for AddIntTo (superinstruction with opcode 120)
-  if AddInstr.OpCode <> bcAddIntTo then Exit;
+  // Check for AddIntTo (superinstruction) or AddInt (standard opcode)
+  // AddIntTo: Dest += Src1 (2 operands)
+  // AddInt: Dest = Src1 + Src2 (3 operands, but for loops use Dest = Dest + Step)
+  if (AddInstr.OpCode <> bcAddIntTo) and (AddInstr.OpCode <> bcAddInt) then Exit;
+
+  // For AddInt, we need Dest = Dest + Src (self-increment pattern)
+  if AddInstr.OpCode = bcAddInt then
+  begin
+    if AddInstr.Dest <> AddInstr.Src1 then Exit;  // Must be K% = K% + step
+  end;
 
   // Find Jump instruction, skipping any NOPs
   JumpIndex := Index + 1;
@@ -895,7 +770,7 @@ begin
   if JumpIndex >= FProgram.GetInstructionCount then Exit;
 
   // Safety check on Jump
-  if JumpInstr.OpCode >= 110 then Exit;
+  if JumpInstr.OpCode >= bcGroupSuper then Exit;
   JumpOp := TBytecodeOp(JumpInstr.OpCode);
 
   // Check for unconditional Jump
@@ -937,7 +812,12 @@ begin
   FillChar(FusedInstr, SizeOf(FusedInstr), 0);
   FusedInstr.OpCode := FusedOpCode;
   FusedInstr.Dest := AddInstr.Dest;       // Counter register
-  FusedInstr.Src1 := AddInstr.Src1;       // Step register
+  // For AddIntTo: Dest += Src1, so Src1 is step
+  // For AddInt: Dest = Src1 + Src2 where Dest=Src1, so Src2 is step
+  if AddInstr.OpCode = bcAddIntTo then
+    FusedInstr.Src1 := AddInstr.Src1       // Step register (AddIntTo format)
+  else
+    FusedInstr.Src1 := AddInstr.Src2;      // Step register (AddInt format: K%=K%+step)
   FusedInstr.Src2 := BranchInstr.Src2;    // Limit register
   FusedInstr.Immediate := LoopBodyIndex;  // Loop body (first non-NOP after branch)
   FusedInstr.SourceLine := AddInstr.SourceLine;
@@ -963,7 +843,7 @@ function TSuperinstructionOptimizer.TryFuseMulAddFloat(Index: Integer): Boolean;
 var
   MulInstr, AddInstr, FusedInstr: TBytecodeInstruction;
   MulOp, AddOp: TBytecodeOp;
-  FusedOpCode: Byte;
+  FusedOpCode: Word;
   MulDest: Word;
 begin
   { Pattern 1: MulFloat Rtmp, Ra, Rb + AddFloat Rdest, Rc, Rtmp => bcMulAddFloat dest = c + a*b
@@ -979,7 +859,7 @@ begin
   AddInstr := FProgram.GetInstruction(Index + 1);
 
   // First instruction must be MulFloat
-  if MulInstr.OpCode >= 110 then Exit;
+  if MulInstr.OpCode >= bcGroupSuper then Exit;
   MulOp := TBytecodeOp(MulInstr.OpCode);
   if MulOp <> bcMulFloat then Exit;
 
@@ -989,11 +869,11 @@ begin
   if IsJumpTarget(Index + 1) then Exit;
 
   // Check second instruction
-  if AddInstr.OpCode >= 110 then
+  if AddInstr.OpCode >= bcGroupSuper then
   begin
-    // Could be a superinstruction AddFloatTo (130) or SubFloatTo (131)
+    // Could be a superinstruction AddFloatTo or SubFloatTo
     case AddInstr.OpCode of
-      130: // bcAddFloatTo: Dest += Src1
+      bcAddFloatTo: // Dest += Src1
         begin
           // Check if AddFloatTo uses the mul result
           if AddInstr.Src1 <> MulDest then Exit;
@@ -1025,7 +905,7 @@ begin
           Exit;
         end;
 
-      131: // bcSubFloatTo: Dest -= Src1
+      bcSubFloatTo: // Dest -= Src1
         begin
           // Check if SubFloatTo uses the mul result
           if AddInstr.Src1 <> MulDest then Exit;
@@ -1137,7 +1017,7 @@ function TSuperinstructionOptimizer.TryFuseArrayLoadAddFloat(Index: Integer): Bo
 var
   LoadInstr, AddInstr, FusedInstr: TBytecodeInstruction;
   LoadOp, AddOp: TBytecodeOp;
-  FusedOpCode: Byte;
+  FusedOpCode: Word;
   LoadDest: Word;
 begin
   { Pattern: ArrayLoadFloat Rtmp, arr, idx + AddFloat Rdest, Racc, Rtmp => bcArrayLoadAddFloat
@@ -1151,7 +1031,7 @@ begin
   AddInstr := FProgram.GetInstruction(Index + 1);
 
   // First instruction must be ArrayLoadFloat
-  if LoadInstr.OpCode >= 110 then Exit;
+  if LoadInstr.OpCode >= bcGroupSuper then Exit;
   LoadOp := TBytecodeOp(LoadInstr.OpCode);
   if LoadOp <> bcArrayLoadFloat then Exit;
 
@@ -1164,7 +1044,7 @@ begin
   if not IsTemporaryResult(Index, LoadDest) then Exit;
 
   // Check second instruction
-  if AddInstr.OpCode >= 110 then Exit;
+  if AddInstr.OpCode >= bcGroupSuper then Exit;
   AddOp := TBytecodeOp(AddInstr.OpCode);
 
   case AddOp of
@@ -1248,7 +1128,7 @@ begin
   AddInstr := FProgram.GetInstruction(Index + 1);
 
   // First instruction must be MulFloat
-  if Mul1Instr.OpCode >= 110 then Exit;
+  if Mul1Instr.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(Mul1Instr.OpCode) <> bcMulFloat then Exit;
 
   // Check if it's a square (Src1 == Src2)
@@ -1263,7 +1143,7 @@ begin
   if not IsTemporaryResult(Index, Mul1Dest) then Exit;
 
   // Check second instruction - could be another MulFloat (square) or AddFloat
-  if AddInstr.OpCode >= 110 then Exit;
+  if AddInstr.OpCode >= bcGroupSuper then Exit;
 
   case TBytecodeOp(AddInstr.OpCode) of
     bcAddFloat:
@@ -1315,7 +1195,7 @@ begin
         if not IsTemporaryResult(Index + 1, Mul2Dest) then Exit;
 
         // Check third instruction is AddFloat that combines both squares
-        if AddInstr.OpCode >= 110 then Exit;
+        if AddInstr.OpCode >= bcGroupSuper then Exit;
         if TBytecodeOp(AddInstr.OpCode) <> bcAddFloat then Exit;
 
         // Check if AddFloat uses both squares
@@ -1361,10 +1241,10 @@ begin
   Mul2Instr := FProgram.GetInstruction(Index + 1);
 
   // Both must be MulFloat
-  if Mul1Instr.OpCode >= 110 then Exit;
+  if Mul1Instr.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(Mul1Instr.OpCode) <> bcMulFloat then Exit;
 
-  if Mul2Instr.OpCode >= 110 then Exit;
+  if Mul2Instr.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(Mul2Instr.OpCode) <> bcMulFloat then Exit;
 
   Mul1Dest := Mul1Instr.Dest;
@@ -1415,11 +1295,11 @@ begin
   SqrtInstr := FProgram.GetInstruction(Index + 1);
 
   // First must be AddFloat
-  if AddInstr.OpCode >= 110 then Exit;
+  if AddInstr.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(AddInstr.OpCode) <> bcAddFloat then Exit;
 
   // Second must be MathSqr
-  if SqrtInstr.OpCode >= 110 then Exit;
+  if SqrtInstr.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(SqrtInstr.OpCode) <> bcMathSqr then Exit;
 
   AddDest := AddInstr.Dest;
@@ -1458,7 +1338,7 @@ function TSuperinstructionOptimizer.TryFuseArrayLoadBranchInt(Index: Integer): B
 var
   LoadInstr, BranchInstr, FusedInstr: TBytecodeInstruction;
   LoadDest: Word;
-  FusedOpCode: Byte;
+  FusedOpCode: Word;
 begin
   { Pattern: ArrayLoadInt Rtmp, arr, idx + BranchNeZeroInt Rtmp, target => bcArrayLoadIntBranchNZ
             ArrayLoadInt Rtmp, arr, idx + BranchEqZeroInt Rtmp, target => bcArrayLoadIntBranchZ }
@@ -1471,7 +1351,7 @@ begin
   BranchInstr := FProgram.GetInstruction(Index + 1);
 
   // First must be ArrayLoadInt
-  if LoadInstr.OpCode >= 110 then Exit;
+  if LoadInstr.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(LoadInstr.OpCode) <> bcArrayLoadInt then Exit;
 
   LoadDest := LoadInstr.Dest;
@@ -1484,12 +1364,12 @@ begin
 
   // Check second instruction - must be BranchEqZeroInt or BranchNeZeroInt
   case BranchInstr.OpCode of
-    161: // bcBranchNeZeroInt
+    bcBranchNeZeroInt:
       begin
         if BranchInstr.Src1 <> LoadDest then Exit;
         FusedOpCode := bcArrayLoadIntBranchNZ;
       end;
-    160: // bcBranchEqZeroInt
+    bcBranchEqZeroInt:
       begin
         if BranchInstr.Src1 <> LoadDest then Exit;
         FusedOpCode := bcArrayLoadIntBranchZ;
@@ -1546,9 +1426,9 @@ begin
   Store2Instr := FProgram.GetInstruction(Index + 4);
 
   // All must be standard opcodes (< 100)
-  if (Load1Instr.OpCode >= 110) or (CopyInstr.OpCode >= 110) or
-     (Load2Instr.OpCode >= 110) or (Store1Instr.OpCode >= 110) or
-     (Store2Instr.OpCode >= 110) then Exit;
+  if (Load1Instr.OpCode >= bcGroupSuper) or (CopyInstr.OpCode >= bcGroupSuper) or
+     (Load2Instr.OpCode >= bcGroupSuper) or (Store1Instr.OpCode >= bcGroupSuper) or
+     (Store2Instr.OpCode >= bcGroupSuper) then Exit;
 
   // Check instruction types
   if TBytecodeOp(Load1Instr.OpCode) <> bcArrayLoadInt then Exit;
@@ -1620,7 +1500,7 @@ function TSuperinstructionOptimizer.TryFuseAddIntSelf(Index: Integer): Boolean;
 var
   ArithInstr, FusedInstr: TBytecodeInstruction;
   ArithOp: TBytecodeOp;
-  FusedOpCode: Byte;
+  FusedOpCode: Word;
 begin
   { Pattern: AddInt Rdest, Rdest, Rsrc  (when dest == src1)
              SubInt Rdest, Rdest, Rsrc  (when dest == src1)
@@ -1636,7 +1516,7 @@ begin
   ArithInstr := FProgram.GetInstruction(Index);
 
   // Must be standard opcode
-  if ArithInstr.OpCode >= 110 then Exit;
+  if ArithInstr.OpCode >= bcGroupSuper then Exit;
 
   ArithOp := TBytecodeOp(ArithInstr.OpCode);
 
@@ -1694,7 +1574,7 @@ begin
   CopyInstr := FProgram.GetInstruction(Index + 1);
 
   // Both must be standard opcodes (< 100)
-  if (LoadInstr.OpCode >= 110) or (CopyInstr.OpCode >= 110) then Exit;
+  if (LoadInstr.OpCode >= bcGroupSuper) or (CopyInstr.OpCode >= bcGroupSuper) then Exit;
 
   // Check instruction types
   if TBytecodeOp(LoadInstr.OpCode) <> bcArrayLoadInt then Exit;
@@ -1751,7 +1631,7 @@ begin
   StoreInstr := FProgram.GetInstruction(Index + 1);
 
   // Both must be standard opcodes (< 100)
-  if (LoadInstr.OpCode >= 110) or (StoreInstr.OpCode >= 110) then Exit;
+  if (LoadInstr.OpCode >= bcGroupSuper) or (StoreInstr.OpCode >= bcGroupSuper) then Exit;
 
   // Check instruction types
   if TBytecodeOp(LoadInstr.OpCode) <> bcArrayLoadInt then Exit;
@@ -1835,7 +1715,7 @@ begin
   StoreInstr := FProgram.GetInstruction(Index + 1);
 
   // Both must be standard opcodes (< 100)
-  if (LoadInstr.OpCode >= 110) or (StoreInstr.OpCode >= 110) then Exit;
+  if (LoadInstr.OpCode >= bcGroupSuper) or (StoreInstr.OpCode >= bcGroupSuper) then Exit;
 
   // Check instruction types
   if TBytecodeOp(LoadInstr.OpCode) <> bcArrayLoadInt then Exit;
@@ -1918,12 +1798,12 @@ begin
   Jump2 := FProgram.GetInstruction(Index + 7);
 
   // Check instruction 0: CopyInt Ri, R_start
-  if CopyI.OpCode >= 110 then Exit;
+  if CopyI.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(CopyI.OpCode) <> bcCopyInt then Exit;
   StartReg := CopyI.Dest;  // This is the 'i' register
 
   // Check instruction 1: SubInt Rj, R_end, R1
-  if SubJ.OpCode >= 110 then Exit;
+  if SubJ.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(SubJ.OpCode) <> bcSubInt then Exit;
   EndReg := SubJ.Dest;     // This is the 'j' register
   OneReg := SubJ.Src2;     // Should be constant 1
@@ -1936,7 +1816,7 @@ begin
   if LoopTarget <> Index + 4 then Exit;
 
   // Check instruction 3: Jump exit
-  if Jump1.OpCode >= 110 then Exit;
+  if Jump1.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(Jump1.OpCode) <> bcJump then Exit;
   ExitTarget := Jump1.Immediate;  // Where to go after loop
 
@@ -1957,7 +1837,7 @@ begin
   if SubJSelf.Src1 <> OneReg then Exit;
 
   // Check instruction 7: Jump back to BranchLt
-  if Jump2.OpCode >= 110 then Exit;
+  if Jump2.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(Jump2.OpCode) <> bcJump then Exit;
   if Jump2.Immediate <> Index + 2 then Exit;  // Jump to BranchLt
 
@@ -2045,7 +1925,7 @@ begin
   FirstReg := LoadFirst.Dest;
 
   // Check instruction 1: CopyInt
-  if CopyJ.OpCode >= 110 then Exit;
+  if CopyJ.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(CopyJ.OpCode) <> bcCopyInt then Exit;
   if CopyJ.Src1 <> StartReg then Exit;
   JReg := CopyJ.Dest;
@@ -2057,25 +1937,25 @@ begin
   if BranchLe.Immediate <> Index + 6 then Exit;
 
   // Check instruction 3: AddInt
-  if ExitAddEnd.OpCode >= 110 then Exit;
+  if ExitAddEnd.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(ExitAddEnd.OpCode) <> bcAddInt then Exit;
   if ExitAddEnd.Src1 <> EndReg then Exit;
   OneReg := ExitAddEnd.Src2;
 
   // Check instruction 4: ArrayStoreInt
-  if ExitStore.OpCode >= 110 then Exit;
+  if ExitStore.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(ExitStore.OpCode) <> bcArrayStoreInt then Exit;
   if ExitStore.Src1 <> ArrayIdx then Exit;
   if ExitStore.Src2 <> ExitAddEnd.Dest then Exit;
   if ExitStore.Dest <> FirstReg then Exit;
 
   // Check instruction 5: Jump
-  if ExitJump.OpCode >= 110 then Exit;
+  if ExitJump.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(ExitJump.OpCode) <> bcJump then Exit;
   ExitTarget := ExitJump.Immediate;
 
   // Check instruction 6: AddInt
-  if BodyAddIdx.OpCode >= 110 then Exit;
+  if BodyAddIdx.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(BodyAddIdx.OpCode) <> bcAddInt then Exit;
   if BodyAddIdx.Src1 <> JReg then Exit;
   if BodyAddIdx.Src2 <> OneReg then Exit;
@@ -2092,7 +1972,7 @@ begin
   if BodyAddJ.Src1 <> OneReg then Exit;
 
   // Check instruction 9: Jump back
-  if BodyJump.OpCode >= 110 then Exit;
+  if BodyJump.OpCode >= bcGroupSuper then Exit;
   if TBytecodeOp(BodyJump.OpCode) <> bcJump then Exit;
   if BodyJump.Immediate <> Index + 2 then Exit;
 
@@ -2160,14 +2040,18 @@ begin
         Continue;
       end;
 
-      // Try TryFuseLoopIncrementAndBranch FIRST for AddIntTo (opcode 120)
-      // This allows fusing AddIntTo + Jump into AddIntToBranchLe
-      if FProgram.GetInstruction(i).OpCode = bcAddIntTo then
+      // Try TryFuseLoopIncrementAndBranch FIRST for AddIntTo or AddInt
+      // This allows fusing (AddIntTo or AddInt) + Jump into AddIntToBranchLe
+      if (FProgram.GetInstruction(i).OpCode = bcAddIntTo) or
+         (FProgram.GetInstruction(i).OpCode = bcAddInt) then
       begin
         if TryFuseLoopIncrementAndBranch(i) then
+        begin
           Changed := True;
-        Inc(i);
-        Continue;
+          Inc(i);
+          Continue;  // Successfully fused, move to next instruction
+        end;
+        // If fusion failed, fall through to try other patterns
       end;
 
       // Try TryFuseArrayShiftLeft for ArrayLoadIntTo (opcode 253)
@@ -2181,7 +2065,7 @@ begin
       end;
 
       // Skip other superinstructions (can't fuse already-fused instructions)
-      if FProgram.GetInstruction(i).OpCode >= 110 then
+      if FProgram.GetInstruction(i).OpCode >= bcGroupSuper then
       begin
         Inc(i);
         Continue;
@@ -2211,35 +2095,24 @@ begin
       else if TryFuseArrayStoreConst(i) then
         Changed := True
       {$ENDIF}
-      // NEW: Self-increment/decrement patterns - HIGH PRIORITY for fannkuch-redux
       else if TryFuseAddIntSelf(i) then
         Changed := True
-      // NEW: Array copy/move element patterns (2 instructions)
-      // MUST come BEFORE ArrayLoadIntTo to match the pattern correctly!
       else if TryFuseArrayCopyElement(i) then
         Changed := True
-      // DEBUG: Re-enabled to investigate the bug
       else if TryFuseArrayMoveElement(i) then
         Changed := True
-      // NEW: Array load to register pattern (after copy/move patterns)
       else if TryFuseArrayLoadIntTo(i) then
         Changed := True
-      // NEW: FMA and advanced patterns
-      // NOTE: SquareSumFloat temporarily disabled - needs more work on pattern matching
-      //else if TryFuseSquareSumFloat(i) then   // 3-instruction pattern first
-      //  Changed := True
-      else if TryFuseMulAddFloat(i) then      // FMA patterns
+      else if TryFuseMulAddFloat(i) then
         Changed := True
       else if TryFuseArrayLoadAddFloat(i) then
         Changed := True
-      //else if TryFuseMulMulFloat(i) then
-      //  Changed := True
-      // NOTE: AddSqrtFloat temporarily disabled - conflicts with other patterns
-      //else if TryFuseAddSqrtFloat(i) then
-      //  Changed := True
-      // TEMPORARILY DISABLED - bug investigation
-      //else if TryFuseArrayLoadBranchInt(i) then
-      //  Changed := True
+      else if TryFuseMulMulFloat(i) then
+        Changed := True
+      else if TryFuseAddSqrtFloat(i) then
+        Changed := True
+      else if TryFuseArrayLoadBranchInt(i) then
+        Changed := True
       ;
 
       Inc(i);

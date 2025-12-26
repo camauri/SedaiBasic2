@@ -102,6 +102,7 @@ const
   // time
   kTI      = 'TI';
   kTIS     = 'TI$';
+  kDTS     = 'DT$';
 
   // File handling
   kAPPEND  = 'APPEND';
@@ -128,11 +129,18 @@ const
   kDCLOSE  = 'DCLOSE';
   kCONCAT  = 'CONCAT';
   kCOPY    = 'COPY';
+  kCP      = 'CP';           // Alias for COPY
   kSCRATCH = 'SCRATCH';
   kBACKUP  = 'BACKUP';
   kRECORD  = 'RECORD';
+  kMKDIR   = 'MKDIR';
+  kMD      = 'MD';           // Alias for MKDIR
+  kCHDIR   = 'CHDIR';
+  kCD      = 'CD';           // Alias for CHDIR
+  kMOVE    = 'MOVE';
+  kMV      = 'MV';           // Alias for MOVE
 
-  // Memoria e sistema
+  // Memory and system
   kBANK	   = 'BANK';
   kCLR     = 'CLR';
   kPOKE    = 'POKE';
@@ -142,6 +150,8 @@ const
   kRUN     = 'RUN';
   kNEW     = 'NEW';
   kLIST    = 'LIST';
+  kEDIT    = 'EDIT';     // Edit a single program line
+  kAUTO    = 'AUTO';     // Auto line numbering
   kSAVE    = 'SAVE';
   kLOAD    = 'LOAD';
   kSTOP    = 'STOP';
@@ -152,7 +162,7 @@ const
   kRREG    = 'RREG';
   kUSR     = 'USR';
 
-  // Matematica e funzioni
+  // Math and functions
   kABS     = 'ABS';
   kATN     = 'ATN';
   kATAN    = 'ATAN';      // SedaiBasic
@@ -164,6 +174,7 @@ const
   kLN      = 'LN';
   kLOG10   = 'LOG10';     // SedaiBasic
   kLOG2    = 'LOG2';      // SedaiBasic
+  kLOGN    = 'LOGN';      // SedaiBasic - LOGN(base, x)
   kMOD     = 'MOD';       // SedaiBasic
   kRND     = 'RND';
   kSGN     = 'SGN';
@@ -187,9 +198,8 @@ const
   kINSTR   = 'INSTR';
   kLEN     = 'LEN';
 
-  // Grafica
+  // Graphics
   kBOX     = 'BOX';
-  kBUMP    = 'BUMP';
   kCOLOR   = 'COLOR';
   kGLIST   = 'GLIST';    // List available SDL2 video modes
   kMORE    = 'MORE';     // Paginate output (pipe modifier)
@@ -201,22 +211,25 @@ const
   kLOCATE  = 'LOCATE';
   kSCALE   = 'SCALE';
   kWIDTH   = 'WIDTH';
-  kSPRITE  = 'SPRITE';
-  kCOLLISION = 'COLLISION';
-  kMOVSPR  = 'MOVSPR';
   kSSHAPE  = 'SSHAPE';
   kGSHAPE  = 'GSHAPE';
   kRCLR    = 'RCLR';
   kRDOT    = 'RDOT';
   kRGR     = 'RGR';
-  kRSPCOLOR = 'RSPCOLOR';
-  kRSPPOS  = 'RSPPOS';
-  kRSPRITE = 'RSPRITE';
-  kSPRCOLOR = 'SPRCOLOR';
-  kSPRDEF  = 'SPRDEF';
-  kSPRSAV  = 'SPRSAV';
 
-  // Suono
+  // Sprite
+  kSPRITE    = 'SPRITE';     // Set sprite attributes
+  kCOLLISION = 'COLLISION';  // Set collision handler
+  kMOVSPR    = 'MOVSPR';     // Move/position sprite
+  kSPRCOLOR  = 'SPRCOLOR';   // Set global sprite multicolors
+  kSPRDEF    = 'SPRDEF';     // Define sprite (editor)
+  kSPRSAV    = 'SPRSAV';     // Save/load sprite data
+  kBUMP      = 'BUMP';       // Return collision bitmask (function)
+  kRSPCOLOR  = 'RSPCOLOR';   // Return multicolor value (function)
+  kRSPPOS    = 'RSPPOS';     // Return sprite position/speed (function)
+  kRSPRITE   = 'RSPRITE';    // Return sprite attribute (function)
+
+  // Sound
   kPLAY    = 'PLAY';
   kTEMPO   = 'TEMPO';
   kSOUND   = 'SOUND';
@@ -224,10 +237,9 @@ const
   kENVELOPE= 'ENVELOPE';
   kFILTER  = 'FILTER';
 
-  // Altro
-  kAUTO    = 'AUTO';
+  // Other
   kCMD     = 'CMD';
-  kREM     = 'REM'; // Commenti
+  kREM     = 'REM'; // Comments
   kEND     = 'END';
   kHELP    = 'HELP';
   kMONITOR = 'MONITOR';
@@ -245,14 +257,14 @@ const
   kSCNCLR  = 'SCNCLR';
   kWINDOW  = 'WINDOW';
 
-  // Operatori aritmetici
+  // Arithmetic operators
   kPLUS  = '+';
   kMINUS = '-';
   kMULT  = '*';
   kDIV   = '/';
   kPOW   = '^';
 
-  // Operatori di confronto
+  // Comparison operators
   kEQ    = '=';
   kNEQ   = '<>';
   kLT    = '<';
@@ -260,7 +272,7 @@ const
   kLEQ   = '<=';
   kGEQ   = '>=';
 
-  // Operatori logici
+  // Logical operators
   kAND   = 'AND';
   kOR    = 'OR';
   kNOT   = 'NOT';

@@ -60,10 +60,19 @@ uses
   Classes, SysUtils, Math, TypInfo, SedaiBytecodeTypes, SedaiSSATypes;
 
 const
-  { Maximum opcode values }
-  MAX_STANDARD_OPCODE = 99;    // Standard bytecode opcodes 0-99
-  MAX_SUPERINSTR_OPCODE = 199; // Superinstructions 100-199
-  MAX_OPCODE = MAX_SUPERINSTR_OPCODE;
+  { Opcode groups for 2-byte encoding
+    Group = OpCode shr 8, SubOp = OpCode and $FF
+    Group 0 (0x00xx): Core VM operations (max ~60 opcodes)
+    Group 1 (0x01xx): String operations (max ~15)
+    Group 2 (0x02xx): Math functions (max ~15)
+    Group 3 (0x03xx): Array operations (max ~10)
+    Group 4 (0x04xx): I/O operations (max ~20)
+    Group 5 (0x05xx): Special variables (max ~10)
+    Group 10 (0x0Axx): Graphics (max ~20)
+    Group 11 (0x0Bxx): Sound (max ~10)
+    Groups 200-255 (0xC8xx+): Superinstructions (max ~100) }
+  MAX_OPCODE_GROUP = 255;       // Max group number (fits in high byte)
+  MAX_OPCODES_PER_GROUP = 100;  // Max opcodes per group (fits in low byte)
 
   { Default profiler settings }
   DEFAULT_SAMPLE_INTERVAL_US = 100;    // 100 microseconds
@@ -119,7 +128,7 @@ type
   { PC sample for sampling profiler }
   TPCSample = record
     PC: Integer;                // Program counter
-    OpCode: Byte;               // Opcode at PC
+    OpCode: Word;               // Opcode at PC (2-byte encoding)
     Timestamp: Int64;           // High-precision timestamp
   end;
 
@@ -143,8 +152,9 @@ type
     FEndTime: Int64;
     FTotalInstructions: Int64;
 
-    { Per-opcode statistics (indexed by opcode 0-199) }
-    FOpcodeStats: array[0..MAX_OPCODE] of TOpcodeStats;
+    { Per-opcode statistics (indexed by [group][subop])
+      Group 0-11: Core to Sound, Group 200+: Superinstructions }
+    FOpcodeStats: array[0..MAX_OPCODE_GROUP, 0..MAX_OPCODES_PER_GROUP-1] of TOpcodeStats;
 
     { Superinstruction-specific tracking }
     FSuperinstrCount: Integer;  // Total superinstructions executed
@@ -174,10 +184,12 @@ type
 
     { Helper methods }
     function GetCurrentTimestamp: Int64;
-    function EstimateCycles(OpCode: Byte): Integer;
-    procedure UpdateOpcodeStats(OpCode: Byte; Cycles: Int64);
+    function EstimateCycles(OpCode: Word): Integer;
+    procedure UpdateOpcodeStats(OpCode: Word; Cycles: Int64);
     function FindBasicBlockForPC(PC: Integer): Integer;
     procedure AnalyzeHotPaths;
+    function GetOpcodeGroup(OpCode: Word): Word; inline;
+    function GetOpcodeSubOp(OpCode: Word): Word; inline;
 
   public
     constructor Create(AMode: TProfilerMode = pmSampling);
@@ -190,14 +202,14 @@ type
     procedure SetEnabled(Value: Boolean);
 
     { Instrumentation hooks (called by VM) }
-    procedure BeforeInstruction(PC: Integer; OpCode: Byte);
-    procedure AfterInstruction(PC: Integer; OpCode: Byte);
-    procedure OnSuperinstruction(OpCode: Byte; InstructionsSaved: Integer);
+    procedure BeforeInstruction(PC: Integer; OpCode: Word);
+    procedure AfterInstruction(PC: Integer; OpCode: Word);
+    procedure OnSuperinstruction(OpCode: Word; InstructionsSaved: Integer);
     procedure OnArrayAccess(ArrayIdx: Integer; IsWrite: Boolean; LinearIndex: Integer);
     procedure OnBasicBlockEntry(BlockIndex: Integer);
 
     { Sampling hook (called periodically by VM or timer) }
-    procedure TakeSample(PC: Integer; OpCode: Byte);
+    procedure TakeSample(PC: Integer; OpCode: Word);
     function ShouldSample: Boolean;
 
     { Basic block mapping (called during compilation) }
@@ -208,7 +220,7 @@ type
     { Analysis }
     function GetTotalExecutionTime: Double;  // In seconds
     function GetInstructionsPerSecond: Double;
-    function GetOpcodePercentage(OpCode: Byte): Double;
+    function GetOpcodePercentage(OpCode: Word): Double;
     function GetTopOpcodes(Count: Integer): string;
     function GetTopBasicBlocks(Count: Integer): string;
     function GetHotPathCount: Integer;
@@ -247,6 +259,18 @@ implementation
 uses Windows;
 {$ENDIF}
 
+{ Opcode group/subop extraction }
+
+function TProfiler.GetOpcodeGroup(OpCode: Word): Word; inline;
+begin
+  Result := OpCode shr 8;  // High byte is the group number
+end;
+
+function TProfiler.GetOpcodeSubOp(OpCode: Word): Word; inline;
+begin
+  Result := OpCode and $FF;  // Low byte is the sub-opcode
+end;
+
 { High-precision timing }
 
 function TProfiler.GetCurrentTimestamp: Int64;
@@ -264,90 +288,131 @@ end;
 {$ENDIF}
 
 { Estimate CPU cycles for an opcode (rough approximation) }
-function TProfiler.EstimateCycles(OpCode: Byte): Integer;
+function TProfiler.EstimateCycles(OpCode: Word): Integer;
+var
+  Group, SubOp: Word;
 begin
   // These are rough estimates for a typical modern CPU
-  if OpCode >= 110 then
-  begin
-    // Superinstructions - generally more efficient than separate ops
-    case OpCode of
-      100..105: Result := 4;   // Fused compare-and-branch (Int)
-      110..115: Result := 5;   // Fused compare-and-branch (Float)
-      120..122: Result := 3;   // Fused arithmetic-to-dest (Int)
-      130..133: Result := 4;   // Fused arithmetic-to-dest (Float)
-      140..142: Result := 3;   // Fused constant arithmetic (Int)
-      150..153: Result := 4;   // Fused constant arithmetic (Float)
-      160..161: Result := 3;   // Fused compare-zero-branch (Int)
-      170..171: Result := 4;   // Fused compare-zero-branch (Float)
-      180..182: Result := 8;   // Fused array-store-const
-    else
-      Result := 5;
-    end;
-  end
+  Group := GetOpcodeGroup(OpCode);
+  SubOp := GetOpcodeSubOp(OpCode);
+
+  case Group of
+    0: // Core VM operations (Group 0)
+      case OpCode of
+        // Load constants - very fast
+        bcLoadConstInt, bcLoadConstFloat: Result := 1;
+        bcLoadConstString: Result := 3;
+
+        // Copy - very fast
+        bcCopyInt, bcCopyFloat: Result := 1;
+        bcCopyString: Result := 5;
+
+        // Integer arithmetic - fast
+        bcAddInt, bcSubInt, bcNegInt: Result := 2;
+        bcMulInt: Result := 3;
+        bcDivInt, bcModInt: Result := 20;  // Division is slow
+
+        // Float arithmetic - moderate
+        bcAddFloat, bcSubFloat, bcNegFloat: Result := 3;
+        bcMulFloat: Result := 4;
+        bcDivFloat: Result := 15;
+        bcPowFloat: Result := 30;
+
+        // Type conversions
+        bcIntToFloat, bcFloatToInt: Result := 2;
+
+        // Comparisons - fast
+        bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt: Result := 2;
+        bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpGtFloat, bcCmpLeFloat, bcCmpGeFloat: Result := 3;
+        bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString: Result := 10;
+
+        // Control flow
+        bcJump: Result := 2;
+        bcJumpIfZero, bcJumpIfNotZero: Result := 3;
+        bcCall, bcReturn: Result := 5;
+
+        // System
+        bcEnd, bcStop: Result := 1;
+        bcNop: Result := 0;
+      else
+        Result := 5;
+      end;
+
+    1: // String operations (Group 1)
+      case SubOp of
+        0: Result := 10;  // StrConcat
+        1: Result := 2;   // StrLen
+        2, 3, 4: Result := 8;  // Left, Right, Mid
+        5, 6: Result := 3;     // Asc, Chr
+        7: Result := 5;   // Str
+        8: Result := 10;  // Val
+        9: Result := 5;   // Hex
+        10: Result := 15; // Instr
+      else
+        Result := 5;
+      end;
+
+    2: // Math functions (Group 2)
+      case SubOp of
+        0, 1, 2, 3: Result := 50;  // Sin, Cos, Tan, Atn
+        4, 5: Result := 40;        // Log, Exp
+        6: Result := 20;           // Sqr
+        7, 8, 9: Result := 3;      // Abs, Sgn, Int
+        10: Result := 10;          // Rnd
+      else
+        Result := 5;
+      end;
+
+    3: // Array operations (Group 3)
+      case SubOp of
+        0, 1, 3, 4, 5: Result := 8;   // Load operations
+        6, 7, 8: Result := 10;        // Store operations
+        2: Result := 100;             // Dim (allocation)
+      else
+        Result := 8;
+      end;
+
+    4: // I/O operations (Group 4) - very slow (system call)
+      case SubOp of
+        0..10: Result := 1000;   // Print operations
+        11..14: Result := 10000; // Input operations
+      else
+        Result := 1000;
+      end;
+
+    5: // Special variables (Group 5)
+      Result := 10;  // Time operations
+
+    10: // Graphics (Group 10)
+      Result := 100;  // Graphics operations are moderately slow
+
+    11: // Sound (Group 11)
+      Result := 50;  // Sound operations
+
+    200..255: // Superinstructions (Groups 200+)
+      case SubOp of
+        0..5: Result := 4;    // Fused compare-and-branch (Int)
+        10..15: Result := 5;  // Fused compare-and-branch (Float)
+        20..22: Result := 3;  // Fused arithmetic-to-dest (Int)
+        30..33: Result := 4;  // Fused arithmetic-to-dest (Float)
+        40..42: Result := 3;  // Fused constant arithmetic (Int)
+        50..53: Result := 4;  // Fused constant arithmetic (Float)
+        60..61: Result := 3;  // Fused compare-zero-branch (Int)
+        70..71: Result := 4;  // Fused compare-zero-branch (Float)
+        80..82: Result := 8;  // Fused array-store-const
+      else
+        Result := 5;
+      end;
+
   else
-  begin
-    case TBytecodeOp(OpCode) of
-      // Load constants - very fast
-      bcLoadConstInt, bcLoadConstFloat: Result := 1;
-      bcLoadConstString: Result := 3;
-
-      // Copy - very fast
-      bcCopyInt, bcCopyFloat: Result := 1;
-      bcCopyString: Result := 5;
-
-      // Integer arithmetic - fast
-      bcAddInt, bcSubInt, bcNegInt: Result := 2;
-      bcMulInt: Result := 3;
-      bcDivInt, bcModInt: Result := 20;  // Division is slow
-
-      // Float arithmetic - moderate
-      bcAddFloat, bcSubFloat, bcNegFloat: Result := 3;
-      bcMulFloat: Result := 4;
-      bcDivFloat: Result := 15;
-      bcPowFloat: Result := 30;
-
-      // Type conversions
-      bcIntToFloat, bcFloatToInt: Result := 2;
-
-      // Comparisons - fast
-      bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt: Result := 2;
-      bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpGtFloat, bcCmpLeFloat, bcCmpGeFloat: Result := 3;
-      bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString: Result := 10;
-
-      // Math functions - slow
-      bcMathSin, bcMathCos, bcMathTan, bcMathAtn: Result := 50;
-      bcMathLog, bcMathExp: Result := 40;
-      bcMathSqr: Result := 20;
-      bcMathAbs, bcMathSgn, bcMathInt: Result := 3;
-      bcMathRnd: Result := 10;
-
-      // Control flow
-      bcJump: Result := 2;
-      bcJumpIfZero, bcJumpIfNotZero: Result := 3;
-      bcCall, bcReturn: Result := 5;
-
-      // Array operations - memory bound
-      bcArrayLoad, bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString: Result := 8;
-      bcArrayStore, bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString: Result := 10;
-      bcArrayDim: Result := 100;  // Allocation
-
-      // I/O - very slow (system call)
-      bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn: Result := 1000;
-      bcInput, bcInputInt, bcInputFloat, bcInputString: Result := 10000;
-
-      // System
-      bcEnd, bcStop: Result := 1;
-      bcNop: Result := 0;
-    else
-      Result := 5;
-    end;
+    Result := 5;  // Unknown group
   end;
 end;
 
 { Constructor }
 constructor TProfiler.Create(AMode: TProfilerMode);
 var
-  i: Integer;
+  g, s: Integer;
 begin
   inherited Create;
   FMode := AMode;
@@ -356,15 +421,16 @@ begin
   FSampleIntervalUs := DEFAULT_SAMPLE_INTERVAL_US;
   FHotspotThreshold := DEFAULT_HOTSPOT_THRESHOLD;
 
-  // Initialize opcode stats
-  for i := 0 to MAX_OPCODE do
-  begin
-    FOpcodeStats[i].ExecutionCount := 0;
-    FOpcodeStats[i].TotalCycles := 0;
-    FOpcodeStats[i].MinCycles := High(Int64);
-    FOpcodeStats[i].MaxCycles := 0;
-    FOpcodeStats[i].SampleCount := 0;
-  end;
+  // Initialize opcode stats for all groups and subops
+  for g := 0 to MAX_OPCODE_GROUP do
+    for s := 0 to MAX_OPCODES_PER_GROUP - 1 do
+    begin
+      FOpcodeStats[g, s].ExecutionCount := 0;
+      FOpcodeStats[g, s].TotalCycles := 0;
+      FOpcodeStats[g, s].MinCycles := High(Int64);
+      FOpcodeStats[g, s].MaxCycles := 0;
+      FOpcodeStats[g, s].SampleCount := 0;
+    end;
 
   // Initialize dynamic arrays
   FBasicBlockCount := 0;
@@ -418,17 +484,18 @@ end;
 
 procedure TProfiler.Reset;
 var
-  i: Integer;
+  g, s, i: Integer;
 begin
-  // Reset opcode stats
-  for i := 0 to MAX_OPCODE do
-  begin
-    FOpcodeStats[i].ExecutionCount := 0;
-    FOpcodeStats[i].TotalCycles := 0;
-    FOpcodeStats[i].MinCycles := High(Int64);
-    FOpcodeStats[i].MaxCycles := 0;
-    FOpcodeStats[i].SampleCount := 0;
-  end;
+  // Reset opcode stats for all groups
+  for g := 0 to MAX_OPCODE_GROUP do
+    for s := 0 to MAX_OPCODES_PER_GROUP - 1 do
+    begin
+      FOpcodeStats[g, s].ExecutionCount := 0;
+      FOpcodeStats[g, s].TotalCycles := 0;
+      FOpcodeStats[g, s].MinCycles := High(Int64);
+      FOpcodeStats[g, s].MaxCycles := 0;
+      FOpcodeStats[g, s].SampleCount := 0;
+    end;
 
   // Reset basic block stats
   for i := 0 to FBasicBlockCount - 1 do
@@ -469,7 +536,7 @@ end;
 
 { Instrumentation hooks }
 
-procedure TProfiler.BeforeInstruction(PC: Integer; OpCode: Byte);
+procedure TProfiler.BeforeInstruction(PC: Integer; OpCode: Word);
 var
   BlockIdx: Integer;
 begin
@@ -499,9 +566,10 @@ begin
   end;
 end;
 
-procedure TProfiler.AfterInstruction(PC: Integer; OpCode: Byte);
+procedure TProfiler.AfterInstruction(PC: Integer; OpCode: Word);
 var
   Cycles: Int64;
+  Group, SubOp: Word;
 begin
   if not FEnabled then Exit;
   if FMode = pmDisabled then Exit;
@@ -515,15 +583,18 @@ begin
     Exit;
 
   // Instrumentation and Hybrid modes: full per-opcode tracking
-  if OpCode <= MAX_OPCODE then
+  Group := GetOpcodeGroup(OpCode);
+  SubOp := GetOpcodeSubOp(OpCode);
+
+  if (Group <= MAX_OPCODE_GROUP) and (SubOp < MAX_OPCODES_PER_GROUP) then
   begin
-    Inc(FOpcodeStats[OpCode].ExecutionCount);
+    Inc(FOpcodeStats[Group, SubOp].ExecutionCount);
     Cycles := EstimateCycles(OpCode);
-    Inc(FOpcodeStats[OpCode].TotalCycles, Cycles);
+    Inc(FOpcodeStats[Group, SubOp].TotalCycles, Cycles);
   end;
 end;
 
-procedure TProfiler.OnSuperinstruction(OpCode: Byte; InstructionsSaved: Integer);
+procedure TProfiler.OnSuperinstruction(OpCode: Word; InstructionsSaved: Integer);
 begin
   if not FEnabled then Exit;
 
@@ -556,7 +627,9 @@ end;
 
 { Sampling methods }
 
-procedure TProfiler.TakeSample(PC: Integer; OpCode: Byte);
+procedure TProfiler.TakeSample(PC: Integer; OpCode: Word);
+var
+  Group, SubOp: Word;
 begin
   FPCSamples[FPCSampleIndex].PC := PC;
   FPCSamples[FPCSampleIndex].OpCode := OpCode;
@@ -566,8 +639,10 @@ begin
   Inc(FPCSampleCount);
 
   // Update opcode sample count
-  if OpCode <= MAX_OPCODE then
-    Inc(FOpcodeStats[OpCode].SampleCount);
+  Group := GetOpcodeGroup(OpCode);
+  SubOp := GetOpcodeSubOp(OpCode);
+  if (Group <= MAX_OPCODE_GROUP) and (SubOp < MAX_OPCODES_PER_GROUP) then
+    Inc(FOpcodeStats[Group, SubOp].SampleCount);
 
   // Update basic block sample count
   if FDetailLevel >= pdlStandard then
@@ -653,17 +728,22 @@ end;
 
 { Helper methods }
 
-procedure TProfiler.UpdateOpcodeStats(OpCode: Byte; Cycles: Int64);
+procedure TProfiler.UpdateOpcodeStats(OpCode: Word; Cycles: Int64);
+var
+  Group, SubOp: Word;
 begin
-  if OpCode > MAX_OPCODE then Exit;
+  Group := GetOpcodeGroup(OpCode);
+  SubOp := GetOpcodeSubOp(OpCode);
 
-  Inc(FOpcodeStats[OpCode].ExecutionCount);
-  Inc(FOpcodeStats[OpCode].TotalCycles, Cycles);
+  if (Group > MAX_OPCODE_GROUP) or (SubOp >= MAX_OPCODES_PER_GROUP) then Exit;
 
-  if Cycles < FOpcodeStats[OpCode].MinCycles then
-    FOpcodeStats[OpCode].MinCycles := Cycles;
-  if Cycles > FOpcodeStats[OpCode].MaxCycles then
-    FOpcodeStats[OpCode].MaxCycles := Cycles;
+  Inc(FOpcodeStats[Group, SubOp].ExecutionCount);
+  Inc(FOpcodeStats[Group, SubOp].TotalCycles, Cycles);
+
+  if Cycles < FOpcodeStats[Group, SubOp].MinCycles then
+    FOpcodeStats[Group, SubOp].MinCycles := Cycles;
+  if Cycles > FOpcodeStats[Group, SubOp].MaxCycles then
+    FOpcodeStats[Group, SubOp].MaxCycles := Cycles;
 end;
 
 function TProfiler.FindBasicBlockForPC(PC: Integer): Integer;
@@ -758,23 +838,28 @@ begin
     Result := 0;
 end;
 
-function TProfiler.GetOpcodePercentage(OpCode: Byte): Double;
+function TProfiler.GetOpcodePercentage(OpCode: Word): Double;
 var
   TotalCycles: Int64;
-  i: Integer;
+  g, s: Integer;
+  Group, SubOp: Word;
 begin
-  if OpCode > MAX_OPCODE then
+  Group := GetOpcodeGroup(OpCode);
+  SubOp := GetOpcodeSubOp(OpCode);
+
+  if (Group > MAX_OPCODE_GROUP) or (SubOp >= MAX_OPCODES_PER_GROUP) then
   begin
     Result := 0;
     Exit;
   end;
 
   TotalCycles := 0;
-  for i := 0 to MAX_OPCODE do
-    Inc(TotalCycles, FOpcodeStats[i].TotalCycles);
+  for g := 0 to MAX_OPCODE_GROUP do
+    for s := 0 to MAX_OPCODES_PER_GROUP - 1 do
+      Inc(TotalCycles, FOpcodeStats[g, s].TotalCycles);
 
   if TotalCycles > 0 then
-    Result := (FOpcodeStats[OpCode].TotalCycles / TotalCycles) * 100
+    Result := (FOpcodeStats[Group, SubOp].TotalCycles / TotalCycles) * 100
   else
     Result := 0;
 end;
@@ -782,53 +867,65 @@ end;
 function TProfiler.GetTopOpcodes(Count: Integer): string;
 type
   TOpcodeRank = record
-    OpCode: Byte;
+    OpCode: Word;      // Full 2-byte opcode
     Value: Int64;      // Cycles for instrumentation, samples for sampling
     ExecCount: Int64;  // Exec count or sample count
   end;
 var
   Ranks: array of TOpcodeRank;
-  i, j: Integer;
+  g, s, RankCount, i, j: Integer;
   Temp: TOpcodeRank;
   TotalValue: Int64;
   UseSampling: Boolean;
-  ValueLabel, CountLabel: string;
+  CountLabel: string;
+  OpCode: Word;
 begin
-  SetLength(Ranks, MAX_OPCODE + 1);
+  // Collect all non-zero opcodes into a dynamic array
+  SetLength(Ranks, 0);
+  RankCount := 0;
   TotalValue := 0;
   UseSampling := (FMode = pmSampling);
 
   if UseSampling then
-  begin
-    ValueLabel := 'Samples';
-    CountLabel := 'samples';
-  end
+    CountLabel := 'samples'
   else
-  begin
-    ValueLabel := 'Cycles';
     CountLabel := 'exec';
-  end;
 
-  // Collect stats based on mode
-  for i := 0 to MAX_OPCODE do
-  begin
-    Ranks[i].OpCode := i;
-    if UseSampling then
+  // Iterate over all groups and sub-opcodes
+  for g := 0 to MAX_OPCODE_GROUP do
+    for s := 0 to MAX_OPCODES_PER_GROUP - 1 do
     begin
-      Ranks[i].Value := FOpcodeStats[i].SampleCount;
-      Ranks[i].ExecCount := FOpcodeStats[i].SampleCount;
-    end
-    else
-    begin
-      Ranks[i].Value := FOpcodeStats[i].TotalCycles;
-      Ranks[i].ExecCount := FOpcodeStats[i].ExecutionCount;
+      // Skip unused opcodes
+      if UseSampling then
+      begin
+        if FOpcodeStats[g, s].SampleCount = 0 then Continue;
+      end
+      else
+      begin
+        if FOpcodeStats[g, s].ExecutionCount = 0 then Continue;
+      end;
+
+      // Add to ranks
+      SetLength(Ranks, RankCount + 1);
+      OpCode := (g shl 8) or s;  // Reconstruct full opcode
+      Ranks[RankCount].OpCode := OpCode;
+      if UseSampling then
+      begin
+        Ranks[RankCount].Value := FOpcodeStats[g, s].SampleCount;
+        Ranks[RankCount].ExecCount := FOpcodeStats[g, s].SampleCount;
+      end
+      else
+      begin
+        Ranks[RankCount].Value := FOpcodeStats[g, s].TotalCycles;
+        Ranks[RankCount].ExecCount := FOpcodeStats[g, s].ExecutionCount;
+      end;
+      Inc(TotalValue, Ranks[RankCount].Value);
+      Inc(RankCount);
     end;
-    Inc(TotalValue, Ranks[i].Value);
-  end;
 
   // Sort by value (bubble sort for simplicity)
-  for i := 0 to MAX_OPCODE - 1 do
-    for j := i + 1 to MAX_OPCODE do
+  for i := 0 to RankCount - 2 do
+    for j := i + 1 to RankCount - 1 do
       if Ranks[j].Value > Ranks[i].Value then
       begin
         Temp := Ranks[i];
@@ -838,7 +935,7 @@ begin
 
   // Build result string
   Result := '';
-  for i := 0 to Min(Count - 1, MAX_OPCODE) do
+  for i := 0 to Min(Count - 1, RankCount - 1) do
   begin
     if Ranks[i].Value = 0 then Continue;
 
@@ -998,12 +1095,14 @@ end;
 
 procedure TProfiler.PrintOpcodeTable;
 var
-  i: Integer;
+  g, s: Integer;
   TotalCycles: Int64;
+  OpCode: Word;
 begin
   TotalCycles := 0;
-  for i := 0 to MAX_OPCODE do
-    Inc(TotalCycles, FOpcodeStats[i].TotalCycles);
+  for g := 0 to MAX_OPCODE_GROUP do
+    for s := 0 to MAX_OPCODES_PER_GROUP - 1 do
+      Inc(TotalCycles, FOpcodeStats[g, s].TotalCycles);
 
   WriteLn('');
   WriteLn('Full Opcode Statistics:');
@@ -1011,17 +1110,19 @@ begin
     ['Opcode', 'Cycles', '%', 'Count', 'Cyc/Op']));
   WriteLn(StringOfChar('-', 75));
 
-  for i := 0 to MAX_OPCODE do
-  begin
-    if FOpcodeStats[i].ExecutionCount = 0 then Continue;
+  for g := 0 to MAX_OPCODE_GROUP do
+    for s := 0 to MAX_OPCODES_PER_GROUP - 1 do
+    begin
+      if FOpcodeStats[g, s].ExecutionCount = 0 then Continue;
 
-    WriteLn(Format('%-25s  %12d  %6.2f%%  %12d  %8.1f',
-      [OpcodeToString(i),
-       FOpcodeStats[i].TotalCycles,
-       IfThen(TotalCycles > 0, (FOpcodeStats[i].TotalCycles / TotalCycles) * 100, 0.0),
-       FOpcodeStats[i].ExecutionCount,
-       FOpcodeStats[i].TotalCycles / Max(1, FOpcodeStats[i].ExecutionCount)]));
-  end;
+      OpCode := (g shl 8) or s;
+      WriteLn(Format('%-25s  %12d  %6.2f%%  %12d  %8.1f',
+        [OpcodeToString(OpCode),
+         FOpcodeStats[g, s].TotalCycles,
+         IfThen(TotalCycles > 0, (FOpcodeStats[g, s].TotalCycles / TotalCycles) * 100, 0.0),
+         FOpcodeStats[g, s].ExecutionCount,
+         FOpcodeStats[g, s].TotalCycles / Max(1, FOpcodeStats[g, s].ExecutionCount)]));
+    end;
 end;
 
 procedure TProfiler.PrintBasicBlockTable;
@@ -1061,21 +1162,25 @@ end;
 
 procedure TProfiler.PrintSuperinstructionStats;
 var
-  i: Integer;
+  g, s: Integer;
+  OpCode: Word;
 begin
   WriteLn('');
   WriteLn('Superinstruction Statistics:');
   WriteLn(Format('%-25s  %12s  %7s', ['Superinstruction', 'Count', '%']));
   WriteLn(StringOfChar('-', 50));
 
-  for i := 100 to 199 do
-  begin
-    if FOpcodeStats[i].ExecutionCount = 0 then Continue;
+  // Superinstructions are in groups 200-255 (0xC8xx+)
+  for g := 200 to 255 do
+    for s := 0 to MAX_OPCODES_PER_GROUP - 1 do
+    begin
+      if FOpcodeStats[g, s].ExecutionCount = 0 then Continue;
 
-    WriteLn(Format('%-25s  %12d  %6.2f%%',
-      [OpcodeToString(i), FOpcodeStats[i].ExecutionCount,
-       IfThen(FSuperinstrCount > 0, (FOpcodeStats[i].ExecutionCount / FSuperinstrCount) * 100, 0.0)]));
-  end;
+      OpCode := (g shl 8) or s;
+      WriteLn(Format('%-25s  %12d  %6.2f%%',
+        [OpcodeToString(OpCode), FOpcodeStats[g, s].ExecutionCount,
+         IfThen(FSuperinstrCount > 0, (FOpcodeStats[g, s].ExecutionCount / FSuperinstrCount) * 100, 0.0)]));
+    end;
 end;
 
 procedure TProfiler.PrintArrayAccessStats;
@@ -1111,8 +1216,9 @@ end;
 procedure TProfiler.ExportJSON(const FileName: string);
 var
   F: TextFile;
-  i: Integer;
+  g, s, i: Integer;
   First: Boolean;
+  OpCode: Word;
 begin
   AssignFile(F, FileName);
   Rewrite(F);
@@ -1130,17 +1236,19 @@ begin
     // Opcode statistics
     WriteLn(F, '  "opcodes": [');
     First := True;
-    for i := 0 to MAX_OPCODE do
-    begin
-      if FOpcodeStats[i].ExecutionCount = 0 then Continue;
+    for g := 0 to MAX_OPCODE_GROUP do
+      for s := 0 to MAX_OPCODES_PER_GROUP - 1 do
+      begin
+        if FOpcodeStats[g, s].ExecutionCount = 0 then Continue;
 
-      if not First then WriteLn(F, ',');
-      First := False;
+        if not First then WriteLn(F, ',');
+        First := False;
 
-      Write(F, Format('    {"opcode": %d, "name": "%s", "count": %d, "cycles": %d, "samples": %d}',
-        [i, OpcodeToString(i), FOpcodeStats[i].ExecutionCount,
-         FOpcodeStats[i].TotalCycles, FOpcodeStats[i].SampleCount]));
-    end;
+        OpCode := (g shl 8) or s;
+        Write(F, Format('    {"opcode": %d, "name": "%s", "count": %d, "cycles": %d, "samples": %d}',
+          [OpCode, OpcodeToString(OpCode), FOpcodeStats[g, s].ExecutionCount,
+           FOpcodeStats[g, s].TotalCycles, FOpcodeStats[g, s].SampleCount]));
+      end;
     WriteLn(F);
     WriteLn(F, '  ],');
 
@@ -1187,8 +1295,9 @@ end;
 procedure TProfiler.ExportFoldedFlameGraph(const FileName: string);
 var
   F: TextFile;
-  i: Integer;
+  g, s, i: Integer;
   Stack: string;
+  OpCode: Word;
 begin
   { Folded format for Brendan Gregg's flamegraph.pl:
     Each line is: stack;stack;stack count
@@ -1211,13 +1320,15 @@ begin
     end;
 
     // Also export opcodes as leaf frames
-    for i := 0 to MAX_OPCODE do
-    begin
-      if FOpcodeStats[i].ExecutionCount = 0 then Continue;
+    for g := 0 to MAX_OPCODE_GROUP do
+      for s := 0 to MAX_OPCODES_PER_GROUP - 1 do
+      begin
+        if FOpcodeStats[g, s].ExecutionCount = 0 then Continue;
 
-      Stack := 'SedaiBasic;VM_Dispatch;' + OpcodeToString(i);
-      WriteLn(F, Format('%s %d', [Stack, FOpcodeStats[i].ExecutionCount]));
-    end;
+        OpCode := (g shl 8) or s;
+        Stack := 'SedaiBasic;VM_Dispatch;' + OpcodeToString(OpCode);
+        WriteLn(F, Format('%s %d', [Stack, FOpcodeStats[g, s].ExecutionCount]));
+      end;
   finally
     CloseFile(F);
   end;
@@ -1226,7 +1337,8 @@ end;
 procedure TProfiler.ExportCSV(const FileName: string);
 var
   F: TextFile;
-  i: Integer;
+  g, s: Integer;
+  OpCode: Word;
 begin
   AssignFile(F, FileName);
   Rewrite(F);
@@ -1235,15 +1347,17 @@ begin
     WriteLn(F, 'Opcode,Name,ExecutionCount,TotalCycles,SampleCount,AvgCyclesPerOp');
 
     // Data
-    for i := 0 to MAX_OPCODE do
-    begin
-      if FOpcodeStats[i].ExecutionCount = 0 then Continue;
+    for g := 0 to MAX_OPCODE_GROUP do
+      for s := 0 to MAX_OPCODES_PER_GROUP - 1 do
+      begin
+        if FOpcodeStats[g, s].ExecutionCount = 0 then Continue;
 
-      WriteLn(F, Format('%d,%s,%d,%d,%d,%.2f',
-        [i, OpcodeToString(i), FOpcodeStats[i].ExecutionCount,
-         FOpcodeStats[i].TotalCycles, FOpcodeStats[i].SampleCount,
-         FOpcodeStats[i].TotalCycles / Max(1, FOpcodeStats[i].ExecutionCount)]));
-    end;
+        OpCode := (g shl 8) or s;
+        WriteLn(F, Format('%d,%s,%d,%d,%d,%.2f',
+          [OpCode, OpcodeToString(OpCode), FOpcodeStats[g, s].ExecutionCount,
+           FOpcodeStats[g, s].TotalCycles, FOpcodeStats[g, s].SampleCount,
+           FOpcodeStats[g, s].TotalCycles / Max(1, FOpcodeStats[g, s].ExecutionCount)]));
+      end;
   finally
     CloseFile(F);
   end;

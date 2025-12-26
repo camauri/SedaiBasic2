@@ -51,6 +51,13 @@ type
     EndLabel: string;
   end;
 
+  { User-defined function info for DEF FN }
+  TUserFunctionDef = record
+    Name: string;           // Function name (without FN prefix)
+    ParamName: string;      // Parameter variable name
+    BodyNode: TASTNode;     // AST node for the function body expression
+  end;
+
   { SSA Generator - converts AST to SSA IR }
   TSSAGenerator = class
   private
@@ -61,6 +68,7 @@ type
     FLastResult: TSSAValue;    // Last expression result
     FVarMap: TStringList;      // Maps variable name to register index (stored as object)
     FLoopStack: array of TLoopInfo;  // Stack for nested loops
+    FUserFunctions: specialize TDictionary<string, TUserFunctionDef>;  // User-defined functions (DEF FN)
     FConstFloatRegs: specialize TDictionary<Integer, Double>;   // Maps float register to constant value
     FConstIntRegs: specialize TDictionary<Integer, Integer>;    // Maps int register to constant value
 
@@ -78,6 +86,9 @@ type
     procedure ProcessInput(Node: TASTNode);
     procedure ProcessDim(Node: TASTNode);
     procedure ProcessForLoop(Node: TASTNode);
+    procedure ProcessDoLoop(Node: TASTNode);
+    procedure ProcessBlock(Node: TASTNode);
+    procedure ProcessDefFn(Node: TASTNode);
     procedure ProcessNext(Node: TASTNode);
     procedure ProcessIfStatement(Node: TASTNode);
     procedure ProcessGoto(Node: TASTNode);
@@ -88,6 +99,68 @@ type
     procedure ProcessLocate(Node: TASTNode);
     procedure ProcessGraphics(Node: TASTNode);
     procedure ProcessScnClr(Node: TASTNode);
+    procedure ProcessColor(Node: TASTNode);
+    procedure ProcessWidth(Node: TASTNode);
+    procedure ProcessScale(Node: TASTNode);
+    procedure ProcessPaint(Node: TASTNode);
+    procedure ProcessWindow(Node: TASTNode);
+    procedure ProcessSShape(Node: TASTNode);
+    procedure ProcessGShape(Node: TASTNode);
+    procedure ProcessGList(Node: TASTNode);
+    // Sound commands
+    procedure ProcessVol(Node: TASTNode);
+    procedure ProcessSound(Node: TASTNode);
+    procedure ProcessEnvelope(Node: TASTNode);
+    procedure ProcessTempo(Node: TASTNode);
+    procedure ProcessPlay(Node: TASTNode);
+    procedure ProcessFilter(Node: TASTNode);
+    // DATA/READ/RESTORE
+    procedure ProcessData(Node: TASTNode);
+    procedure ProcessRead(Node: TASTNode);
+    procedure ProcessRestore(Node: TASTNode);
+    // Input commands
+    procedure ProcessGet(Node: TASTNode);
+    procedure ProcessGetkey(Node: TASTNode);
+    // Formatted output
+    procedure ProcessPrintUsing(Node: TASTNode);
+    procedure ProcessPudef(Node: TASTNode);
+    procedure ProcessChar(Node: TASTNode);
+    // File operations
+    procedure ProcessLoad(Node: TASTNode);
+    procedure ProcessSave(Node: TASTNode);
+    procedure ProcessVerify(Node: TASTNode);
+    procedure ProcessBload(Node: TASTNode);
+    procedure ProcessBsave(Node: TASTNode);
+    procedure ProcessBoot(Node: TASTNode);
+    // Disk file I/O
+    procedure ProcessDopen(Node: TASTNode);
+    procedure ProcessDclose(Node: TASTNode);
+    // File data I/O
+    procedure ProcessGetFile(Node: TASTNode);
+    procedure ProcessInputFile(Node: TASTNode);
+    procedure ProcessPrintFile(Node: TASTNode);
+    procedure ProcessCmd(Node: TASTNode);
+    // Sprite commands
+    procedure ProcessSprite(Node: TASTNode);
+    procedure ProcessMovspr(Node: TASTNode);
+    procedure ProcessSprcolor(Node: TASTNode);
+    procedure ProcessSprsav(Node: TASTNode);
+    procedure ProcessCollision(Node: TASTNode);
+    // System commands
+    procedure ProcessRun(Node: TASTNode);
+    procedure ProcessList(Node: TASTNode);
+    procedure ProcessNew(Node: TASTNode);
+    procedure ProcessDelete(Node: TASTNode);
+    procedure ProcessRenumber(Node: TASTNode);
+    procedure ProcessCatalog(Node: TASTNode);
+    // File management commands (executed directly in VM)
+    procedure ProcessCopyFile(Node: TASTNode);
+    procedure ProcessScratch(Node: TASTNode);
+    procedure ProcessRenameFile(Node: TASTNode);
+    procedure ProcessConcat(Node: TASTNode);
+    procedure ProcessMkdir(Node: TASTNode);
+    procedure ProcessChdir(Node: TASTNode);
+    procedure ProcessMoveFile(Node: TASTNode);
     procedure EmitInstruction(OpCode: TSSAOpCode; Dest, Src1, Src2, Src3: TSSAValue);
 
     // Constant register tracking helpers
@@ -98,6 +171,10 @@ type
 
     // Type conversion helpers
     function EnsureIntRegister(const Val: TSSAValue): TSSAValue;
+    function EnsureFloatRegister(const Val: TSSAValue): TSSAValue;
+    function EnsureStringRegister(const Val: TSSAValue): TSSAValue;
+    // Instruction emission with immediate
+    procedure EmitInstructionWithImmediate(Op: TSSAOpCode; const Dest, Src1, Src2: TSSAValue; ImmediateValue: Int64);
   public
     constructor Create;
     destructor Destroy; override;
@@ -123,6 +200,7 @@ begin
   FVarMap.Sorted := True;
   FVarMap.Duplicates := dupIgnore;
   SetLength(FLoopStack, 0);
+  FUserFunctions := specialize TDictionary<string, TUserFunctionDef>.Create;
   FConstFloatRegs := specialize TDictionary<Integer, Double>.Create;
   FConstIntRegs := specialize TDictionary<Integer, Integer>.Create;
 end;
@@ -130,6 +208,7 @@ end;
 destructor TSSAGenerator.Destroy;
 begin
   FVarMap.Free;
+  FUserFunctions.Free;
   FConstFloatRegs.Free;
   FConstIntRegs.Free;
   inherited Destroy;
@@ -247,14 +326,18 @@ begin
   // CRITICAL: After GOTO/RETURN, FCurrentBlock can be nil (block is terminated)
   // Don't emit instructions after block termination
   if not Assigned(FCurrentBlock) then
+  begin
+    WriteLn('DEBUG EmitInstruction: FCurrentBlock is NIL, skipping OpCode=', Ord(OpCode));
     Exit;
+  end;
 
   Instr := TSSAInstruction.Create(OpCode);
   Instr.Dest := Dest;
   Instr.Src1 := Src1;
   Instr.Src2 := Src2;
   Instr.Src3 := Src3;
-  Instr.SourceLine := FCurrentLineNumber;  // Track BASIC line number for error reporting
+  // Always emit SourceLine for error reporting and TRON trace
+  Instr.SourceLine := FCurrentLineNumber;
   FCurrentBlock.AddInstruction(Instr);
 end;
 
@@ -275,7 +358,7 @@ var
   Left, Right: TSSAValue;
   DestReg: Integer;
   OpCode: TSSAOpCode;
-  FuncName: string;
+  FuncName, VarName: string;
   ArgValue, ArgReg: TSSAValue;
   TempReg, IntReg: Integer;
   IntRegVal, TempVal: TSSAValue;
@@ -298,6 +381,11 @@ var
   RVal, GVal, BVal, AVal: TSSAValue;
   RGBAResult: Int64;
   RReg, GReg, BReg, AReg: TSSAValue;
+  // String function handling
+  Arg2Value, Arg3Value, Arg2Reg: TSSAValue;
+  // User function handling
+  FnDef: TUserFunctionDef;
+  OldParamValue: TSSAValue;
 begin
   if Node = nil then
   begin
@@ -323,6 +411,101 @@ begin
     begin
       // Return the register assigned to this variable
       Result := GetOrAllocateVariable(VarToStr(Node.Value));
+    end;
+
+    antSpecialVariable:
+    begin
+      // Handle special system variables: TI, TI$, DT$
+      VarName := UpperCase(VarToStr(Node.Value));
+      if VarName = 'TI' then
+      begin
+        // TI returns jiffies (1/60 sec) since interpreter start - integer
+        DestReg := FProgram.AllocRegister(srtInt);
+        Result := MakeSSARegister(srtInt, DestReg);
+        EmitInstruction(ssaLoadTI, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if VarName = 'TI$' then
+      begin
+        // TI$ returns current time as HHMMSS string
+        DestReg := FProgram.AllocRegister(srtString);
+        Result := MakeSSARegister(srtString, DestReg);
+        EmitInstruction(ssaLoadTIS, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if VarName = 'DT$' then
+      begin
+        // DT$ returns current date as YYYYMMDD string
+        DestReg := FProgram.AllocRegister(srtString);
+        Result := MakeSSARegister(srtString, DestReg);
+        EmitInstruction(ssaLoadDTS, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if VarName = 'EL' then
+      begin
+        // EL returns last error line number - integer
+        DestReg := FProgram.AllocRegister(srtInt);
+        Result := MakeSSARegister(srtInt, DestReg);
+        EmitInstruction(ssaLoadEL, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if VarName = 'ER' then
+      begin
+        // ER returns last error code - integer
+        DestReg := FProgram.AllocRegister(srtInt);
+        Result := MakeSSARegister(srtInt, DestReg);
+        EmitInstruction(ssaLoadER, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if VarName = 'ERR$' then
+      begin
+        // ERR$ (variable form) returns last error message - string
+        DestReg := FProgram.AllocRegister(srtString);
+        Result := MakeSSARegister(srtString, DestReg);
+        EmitInstruction(ssaLoadERRS, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+        Result := MakeSSAValue(svkNone);  // Unknown special variable
+    end;
+
+    antUserFunction:
+    begin
+      // Handle user-defined functions (FN)
+      // Child[0] = Function name (identifier)
+      // Child[1] = Argument expression
+      if Node.ChildCount >= 2 then
+      begin
+        // Get function name
+        FuncName := UpperCase(VarToStr(Node.GetChild(0).Value));
+
+        // Look up the function definition
+        if FUserFunctions.ContainsKey(FuncName) then
+        begin
+          FnDef := FUserFunctions[FuncName];
+
+          // Evaluate the argument
+          ProcessExpression(Node.GetChild(1), ArgValue);
+
+          // Convert argument to float if needed (DEF FN uses float math)
+          ArgReg := EnsureFloatRegister(ArgValue);
+
+          // Save the current value of the local parameter variable (if it exists)
+          // and bind the argument to it
+          OldParamValue := GetOrAllocateVariable(FnDef.ParamName);
+
+          // Store argument into the parameter variable by copying the register
+          EmitInstruction(ssaCopyFloat, OldParamValue, ArgReg,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+          // Evaluate the function body expression
+          ProcessExpression(FnDef.BodyNode, Result);
+
+          // Restore the old parameter value (optional - C128 doesn't do this)
+          // For now, we leave the parameter with its new value like C128 does
+        end
+        else
+        begin
+          // Function not defined - return 0
+          Result := MakeSSAConstFloat(0);
+        end;
+      end
+      else
+        Result := MakeSSAValue(svkNone);
     end;
 
     antParentheses:
@@ -652,6 +835,41 @@ begin
 
           EmitInstruction(OpCode, Result, Left, Right, MakeSSAValue(svkNone));
         end;
+
+        // Logical operators (AND, OR, XOR) - result is always Int (0 or 1)
+        ttLogicalAND, ttLogicalOR, ttLogicalXOR:
+        begin
+          // Logical operators always return integer 0 or 1
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+
+          // Convert operands to int if needed (for boolean evaluation)
+          if Left.RegType = srtFloat then
+          begin
+            TempReg := FProgram.AllocRegister(srtInt);
+            TempVal := MakeSSARegister(srtInt, TempReg);
+            EmitInstruction(ssaFloatToInt, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Left := TempVal;
+          end;
+          if Right.RegType = srtFloat then
+          begin
+            TempReg := FProgram.AllocRegister(srtInt);
+            TempVal := MakeSSARegister(srtInt, TempReg);
+            EmitInstruction(ssaFloatToInt, TempVal, Right, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Right := TempVal;
+          end;
+
+          case Node.Token.TokenType of
+            ttLogicalAND: OpCode := ssaLogicalAnd;
+            ttLogicalOR: OpCode := ssaLogicalOr;
+            ttLogicalXOR: OpCode := ssaLogicalXor;
+          else
+            OpCode := ssaLogicalAnd;
+          end;
+
+          EmitInstruction(OpCode, Result, Left, Right, MakeSSAValue(svkNone));
+        end;
+
       else
         // Arithmetic operators
         // SPECIAL CASE: Division always returns float (even for int/int)
@@ -883,6 +1101,239 @@ begin
           // Emit ssaGraphicGetMode: Dest=result, Src1=which
           EmitInstruction(ssaGraphicGetMode, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
+        // === SYSTEM FUNCTIONS ===
+        else if FuncName = 'FRE' then
+        begin
+          // FRE(x) returns available memory in bytes
+          // The argument is ignored (C64 compatibility - would select memory bank)
+          // We always return physical available memory
+
+          // Process argument (for syntax compatibility, but ignore value)
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+          // Argument is ignored - FRE always returns available RAM
+
+          // Allocate result register (integer - returns bytes as Int64)
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+
+          // Emit ssaFre: Dest=result
+          EmitInstruction(ssaFre, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        // === STRING FUNCTIONS ===
+        else if (FuncName = 'LEN') then
+        begin
+          // LEN(str) - returns integer length
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          else if ArgListNode <> nil then
+            ProcessExpression(ArgListNode, ArgValue)
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          ArgReg := EnsureStringRegister(ArgValue);
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaStrLen, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if (FuncName = 'ASC') then
+        begin
+          // ASC(str) - returns integer ASCII code of first char
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          else if ArgListNode <> nil then
+            ProcessExpression(ArgListNode, ArgValue)
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          ArgReg := EnsureStringRegister(ArgValue);
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaStrAsc, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if (FuncName = 'CHR$') then
+        begin
+          // CHR$(n) - returns string char from ASCII code
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          else if ArgListNode <> nil then
+            ProcessExpression(ArgListNode, ArgValue)
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          ArgReg := EnsureIntRegister(ArgValue);
+          DestReg := FProgram.AllocRegister(srtString);
+          Result := MakeSSARegister(srtString, DestReg);
+          EmitInstruction(ssaStrChr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if (FuncName = 'ERR$') then
+        begin
+          // ERR$(n) - returns error message for error code n
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          else if ArgListNode <> nil then
+            ProcessExpression(ArgListNode, ArgValue)
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          ArgReg := EnsureIntRegister(ArgValue);
+          DestReg := FProgram.AllocRegister(srtString);
+          Result := MakeSSARegister(srtString, DestReg);
+          EmitInstruction(ssaStrErr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if (FuncName = 'STR$') then
+        begin
+          // STR$(n) - returns string from number
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          else if ArgListNode <> nil then
+            ProcessExpression(ArgListNode, ArgValue)
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          ArgReg := EnsureFloatRegister(ArgValue);
+          DestReg := FProgram.AllocRegister(srtString);
+          Result := MakeSSARegister(srtString, DestReg);
+          EmitInstruction(ssaStrStr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if (FuncName = 'VAL') then
+        begin
+          // VAL(str) - returns float from string
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          else if ArgListNode <> nil then
+            ProcessExpression(ArgListNode, ArgValue)
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          ArgReg := EnsureStringRegister(ArgValue);
+          DestReg := FProgram.AllocRegister(srtFloat);
+          Result := MakeSSARegister(srtFloat, DestReg);
+          EmitInstruction(ssaStrVal, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if (FuncName = 'HEX$') then
+        begin
+          // HEX$(n) - returns 4-char hex string
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          else if ArgListNode <> nil then
+            ProcessExpression(ArgListNode, ArgValue)
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          ArgReg := EnsureIntRegister(ArgValue);
+          DestReg := FProgram.AllocRegister(srtString);
+          Result := MakeSSARegister(srtString, DestReg);
+          EmitInstruction(ssaStrHex, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if (FuncName = 'LEFT$') then
+        begin
+          // LEFT$(str, n) - returns leftmost n chars
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);  // string
+            ProcessExpression(ArgListNode.GetChild(1), Arg2Value); // count
+            ArgReg := EnsureStringRegister(ArgValue);
+            Arg2Reg := EnsureIntRegister(Arg2Value);
+            DestReg := FProgram.AllocRegister(srtString);
+            Result := MakeSSARegister(srtString, DestReg);
+            EmitInstruction(ssaStrLeft, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
+          end
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+        end
+        else if (FuncName = 'RIGHT$') then
+        begin
+          // RIGHT$(str, n) - returns rightmost n chars
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);  // string
+            ProcessExpression(ArgListNode.GetChild(1), Arg2Value); // count
+            ArgReg := EnsureStringRegister(ArgValue);
+            Arg2Reg := EnsureIntRegister(Arg2Value);
+            DestReg := FProgram.AllocRegister(srtString);
+            Result := MakeSSARegister(srtString, DestReg);
+            EmitInstruction(ssaStrRight, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
+          end
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+        end
+        else if (FuncName = 'MID$') then
+        begin
+          // MID$(str, start [,length]) - returns substring
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);  // string
+            ProcessExpression(ArgListNode.GetChild(1), Arg2Value); // start
+            ArgReg := EnsureStringRegister(ArgValue);
+            Arg2Reg := EnsureIntRegister(Arg2Value);
+            DestReg := FProgram.AllocRegister(srtString);
+            Result := MakeSSARegister(srtString, DestReg);
+            // Length is optional - use Immediate field
+            if ArgListNode.ChildCount >= 3 then
+            begin
+              ProcessExpression(ArgListNode.GetChild(2), Arg3Value);
+              // Put length in immediate (constant) or use special handling
+              if Arg3Value.Kind = svkConstInt then
+                EmitInstructionWithImmediate(ssaStrMid, Result, ArgReg, Arg2Reg, Arg3Value.ConstInt)
+              else if Arg3Value.Kind = svkConstFloat then
+                EmitInstructionWithImmediate(ssaStrMid, Result, ArgReg, Arg2Reg, Trunc(Arg3Value.ConstFloat))
+              else
+                EmitInstructionWithImmediate(ssaStrMid, Result, ArgReg, Arg2Reg, 255); // Max length
+            end
+            else
+              EmitInstructionWithImmediate(ssaStrMid, Result, ArgReg, Arg2Reg, 255); // Max length if not specified
+          end
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+        end
+        else if (FuncName = 'INSTR') then
+        begin
+          // INSTR(str1, str2 [,start]) - find str2 in str1, return position
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);  // str1
+            ProcessExpression(ArgListNode.GetChild(1), Arg2Value); // str2
+            ArgReg := EnsureStringRegister(ArgValue);
+            Arg2Reg := EnsureStringRegister(Arg2Value);
+            DestReg := FProgram.AllocRegister(srtInt);
+            Result := MakeSSARegister(srtInt, DestReg);
+            // Start position is optional
+            if ArgListNode.ChildCount >= 3 then
+            begin
+              ProcessExpression(ArgListNode.GetChild(2), Arg3Value);
+              if Arg3Value.Kind = svkConstInt then
+                EmitInstructionWithImmediate(ssaStrInstr, Result, ArgReg, Arg2Reg, Arg3Value.ConstInt)
+              else if Arg3Value.Kind = svkConstFloat then
+                EmitInstructionWithImmediate(ssaStrInstr, Result, ArgReg, Arg2Reg, Trunc(Arg3Value.ConstFloat))
+              else
+                EmitInstructionWithImmediate(ssaStrInstr, Result, ArgReg, Arg2Reg, 1); // Default start=1
+            end
+            else
+              EmitInstructionWithImmediate(ssaStrInstr, Result, ArgReg, Arg2Reg, 0); // 0 means use Pos (start from 1)
+          end
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+        end
+        else if (FuncName = 'DEC') then
+        begin
+          // DEC(hexstring) - converts hex string to decimal integer
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          else if ArgListNode <> nil then
+            ProcessExpression(ArgListNode, ArgValue)
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          ArgReg := EnsureStringRegister(ArgValue);
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaStrDec, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if (FuncName = 'LOGN') then
+        begin
+          // LOGN(base, x) - logarithm of x with base n
+          // Result = ln(x) / ln(base) using LogN function in Pascal
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);  // base
+            ProcessExpression(ArgListNode.GetChild(1), Arg2Value); // x
+            ArgReg := EnsureFloatRegister(ArgValue);
+            Arg2Reg := EnsureFloatRegister(Arg2Value);
+            DestReg := FProgram.AllocRegister(srtFloat);
+            Result := MakeSSARegister(srtFloat, DestReg);
+            EmitInstruction(ssaMathLogN, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
+          end
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+        end
         else
         begin
           // Standard math functions (single argument, float result)
@@ -946,16 +1397,23 @@ begin
             OpCode := ssaMathCos
           else if FuncName = 'TAN' then
             OpCode := ssaMathTan
-          else if FuncName = 'EXP' then
+          else if (FuncName = 'EXP') then
             OpCode := ssaMathExp
-          else if FuncName = 'LOG' then
+          else if (FuncName = 'LOG') or (FuncName = 'LN') then
             OpCode := ssaMathLog
+          else if FuncName = 'LOG10' then
+            OpCode := ssaMathLog10
+          else if FuncName = 'LOG2' then
+            OpCode := ssaMathLog2
+          else if (FuncName = 'ATN') or (FuncName = 'ATAN') then
+            OpCode := ssaMathAtn
           else if FuncName = 'RND' then
             OpCode := ssaMathRnd
           else
             OpCode := ssaNop;
 
-          EmitInstruction(OpCode, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          if OpCode <> ssaNop then
+            EmitInstruction(OpCode, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end;
       end
       else
@@ -1082,6 +1540,52 @@ begin
           Result := MakeSSARegister(srtInt, DestReg);
           WriteLn('>>> SSA RGR: Emitting ssaGraphicGetMode, DestReg=', DestReg, ' ArgReg=', ArgReg.RegIndex);
           EmitInstruction(ssaGraphicGetMode, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if FuncName = 'POS' then
+        begin
+          // POS(x) - return cursor column position
+          // Argument is a dummy, ignored
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaGraphicPos, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if FuncName = 'RCLR' then
+        begin
+          // RCLR(n) - return color of source n (0-6)
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+            ArgReg := EnsureIntRegister(ArgValue);
+          end
+          else
+          begin
+            TempReg := FProgram.AllocRegister(srtInt);
+            ArgReg := MakeSSARegister(srtInt, TempReg);
+            EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaGraphicRclr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if FuncName = 'RWINDOW' then
+        begin
+          // RWINDOW(n) - return window info (0=lines, 1=cols, 2=screen width)
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+            ArgReg := EnsureIntRegister(ArgValue);
+          end
+          else
+          begin
+            TempReg := FProgram.AllocRegister(srtInt);
+            ArgReg := MakeSSARegister(srtInt, TempReg);
+            EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaGraphicRwindow, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else
           Result := MakeSSAValue(svkNone);
@@ -1235,6 +1739,27 @@ begin
     Exit;
   end;
 
+  // Check if target is special variable (TI$ can be assigned)
+  if VarNode.NodeType = antSpecialVariable then
+  begin
+    VarName := UpperCase(VarToStr(VarNode.Value));
+    if VarName = 'TI$' then
+    begin
+      // TI$ = "HHMMSS" - set time offset
+      ProcessExpression(ExprNode, ExprValue);
+      // Ensure we have a string register
+      if ExprValue.Kind = svkConstString then
+      begin
+        VarReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaLoadConstString, VarReg, ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        ExprValue := VarReg;
+      end;
+      EmitInstruction(ssaStoreTIS, MakeSSAValue(svkNone), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    // DT$ and TI are read-only - ignore assignments
+    Exit;
+  end;
+
   if VarNode.NodeType <> antIdentifier then Exit;
   VarName := VarToStr(VarNode.Value);
 
@@ -1304,10 +1829,10 @@ end;
 procedure TSSAGenerator.ProcessPrint(Node: TASTNode);
 var
   i: Integer;
-  ExprValue, RegValue: TSSAValue;
+  ExprValue, RegValue, ArgValue, ArgReg: TSSAValue;
   DestReg: Integer;
-  Child: TASTNode;
-  SeparatorChar: string;
+  Child, ArgNode: TASTNode;
+  SeparatorChar, FuncName: string;
   EndsWithSeparator: Boolean;
 begin
   // Handle empty PRINT statement (just newline)
@@ -1338,6 +1863,38 @@ begin
         EmitInstruction(ssaPrintSemicolon, MakeSSAValue(svkNone),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       Continue;
+    end;
+
+    // Handle TAB(n) and SPC(n) as special PRINT formatting functions
+    // They are parsed as antFunctionCall nodes with function name TAB or SPC
+    if Child.NodeType = antFunctionCall then
+    begin
+      FuncName := UpperCase(VarToStr(Child.Value));
+      if (FuncName = 'TAB') or (FuncName = 'SPC') then
+      begin
+        // Get the argument (position/count)
+        if Child.ChildCount > 0 then
+        begin
+          ArgNode := Child.GetChild(0);
+          // Handle argument list node
+          if (ArgNode.NodeType = antArgumentList) and (ArgNode.ChildCount > 0) then
+            ProcessExpression(ArgNode.GetChild(0), ArgValue)
+          else
+            ProcessExpression(ArgNode, ArgValue);
+
+          // Ensure we have an integer register
+          ArgReg := EnsureIntRegister(ArgValue);
+
+          // Emit the appropriate instruction
+          if FuncName = 'TAB' then
+            EmitInstruction(ssaPrintTab, MakeSSAValue(svkNone), ArgReg,
+                           MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+          else // SPC
+            EmitInstruction(ssaPrintSpc, MakeSSAValue(svkNone), ArgReg,
+                           MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+        Continue;
+      end;
     end;
 
     ProcessExpression(Child, ExprValue);
@@ -2196,6 +2753,225 @@ begin
   FLoopStack[High(FLoopStack)] := LoopInfo;
 end;
 
+procedure TSSAGenerator.ProcessDoLoop(Node: TASTNode);
+var
+  BodyLabel, CondLabel, EndLabel: string;
+  ConditionNode, BodyNode: TASTNode;
+  CondValue: TSSAValue;
+  CmpReg: Integer;
+  PrevBlock, CondBlock, BodyBlock: TSSABasicBlock;
+  ConditionType: string;
+  ConditionPosition: string;
+  IsWhileLoop: Boolean;
+  HasCondition: Boolean;
+  i: Integer;
+begin
+  // DO/LOOP structure:
+  //   Child[0] = Body (block of statements)
+  //   Child[1] = Condition (optional)
+  //   Attributes: ConditionType = WHILE | UNTIL | ''
+  //   Attributes: ConditionPosition = TOP | BOTTOM | ''
+
+  if Node.ChildCount < 1 then Exit;
+
+  BodyNode := Node.GetChild(0);
+  ConditionNode := nil;
+  if Node.ChildCount > 1 then
+    ConditionNode := Node.GetChild(1);
+
+  ConditionType := Node.Attributes.Values['ConditionType'];
+  ConditionPosition := Node.Attributes.Values['ConditionPosition'];
+  IsWhileLoop := (ConditionType = 'WHILE');
+  HasCondition := (ConditionType <> '');
+
+  // Generate labels
+  BodyLabel := GenerateUniqueLabel('do_body');
+  CondLabel := GenerateUniqueLabel('do_cond');
+  EndLabel := GenerateUniqueLabel('do_end');
+
+  // Save current block for CFG construction
+  PrevBlock := FCurrentBlock;
+
+  if HasCondition and (ConditionPosition = 'TOP') then
+  begin
+    // DO WHILE/UNTIL condition - check condition BEFORE body
+    // Jump to condition check first
+    EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+    // Condition block
+    FCurrentBlock := FProgram.CreateBlock(CondLabel);
+    CondBlock := FCurrentBlock;
+
+    if Assigned(PrevBlock) then
+    begin
+      PrevBlock.AddSuccessor(CondBlock);
+      CondBlock.AddPredecessor(PrevBlock);
+    end;
+
+    // Evaluate condition
+    if Assigned(ConditionNode) then
+    begin
+      ProcessExpression(ConditionNode, CondValue);
+
+      // Ensure condition is in a register
+      if CondValue.Kind <> svkRegister then
+      begin
+        CmpReg := FProgram.AllocRegister(srtInt);
+        if CondValue.Kind = svkConstInt then
+          EmitInstruction(ssaLoadConstInt, MakeSSARegister(srtInt, CmpReg), CondValue,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else if CondValue.Kind = svkConstFloat then
+          EmitInstruction(ssaLoadConstFloat, MakeSSARegister(srtFloat, CmpReg), CondValue,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        CondValue := MakeSSARegister(srtInt, CmpReg);
+      end;
+
+      // WHILE: continue if condition TRUE, exit if FALSE
+      // UNTIL: continue if condition FALSE, exit if TRUE
+      if IsWhileLoop then
+        EmitInstruction(ssaJumpIfZero, MakeSSALabel(EndLabel), CondValue,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      else
+        EmitInstruction(ssaJumpIfNotZero, MakeSSALabel(EndLabel), CondValue,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+
+    // Body block
+    FCurrentBlock := FProgram.CreateBlock(BodyLabel);
+    BodyBlock := FCurrentBlock;
+
+    if Assigned(CondBlock) then
+    begin
+      CondBlock.AddSuccessor(BodyBlock);
+      BodyBlock.AddPredecessor(CondBlock);
+    end;
+
+    // Process body statements
+    if Assigned(BodyNode) then
+    begin
+      for i := 0 to BodyNode.ChildCount - 1 do
+        ProcessStatement(BodyNode.GetChild(i));
+    end;
+
+    // Jump back to condition check
+    EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+    // End block
+    FCurrentBlock := FProgram.CreateBlock(EndLabel);
+  end
+  else
+  begin
+    // DO ... LOOP [WHILE/UNTIL condition] - check condition AFTER body (or no condition)
+
+    // Jump to body (could also fall through)
+    EmitInstruction(ssaJump, MakeSSALabel(BodyLabel), MakeSSAValue(svkNone),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+    // Body block
+    FCurrentBlock := FProgram.CreateBlock(BodyLabel);
+    BodyBlock := FCurrentBlock;
+
+    if Assigned(PrevBlock) then
+    begin
+      PrevBlock.AddSuccessor(BodyBlock);
+      BodyBlock.AddPredecessor(PrevBlock);
+    end;
+
+    // Process body statements
+    if Assigned(BodyNode) then
+    begin
+      for i := 0 to BodyNode.ChildCount - 1 do
+        ProcessStatement(BodyNode.GetChild(i));
+    end;
+
+    if HasCondition and Assigned(ConditionNode) then
+    begin
+      // Evaluate condition at bottom
+      ProcessExpression(ConditionNode, CondValue);
+
+      // Ensure condition is in a register
+      if CondValue.Kind <> svkRegister then
+      begin
+        CmpReg := FProgram.AllocRegister(srtInt);
+        if CondValue.Kind = svkConstInt then
+          EmitInstruction(ssaLoadConstInt, MakeSSARegister(srtInt, CmpReg), CondValue,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else if CondValue.Kind = svkConstFloat then
+          EmitInstruction(ssaLoadConstFloat, MakeSSARegister(srtFloat, CmpReg), CondValue,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        CondValue := MakeSSARegister(srtInt, CmpReg);
+      end;
+
+      // WHILE: loop back if condition TRUE
+      // UNTIL: loop back if condition FALSE
+      if IsWhileLoop then
+        EmitInstruction(ssaJumpIfNotZero, MakeSSALabel(BodyLabel), CondValue,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      else
+        EmitInstruction(ssaJumpIfZero, MakeSSALabel(BodyLabel), CondValue,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+      // Fall through to end
+      FCurrentBlock := FProgram.CreateBlock(EndLabel);
+    end
+    else
+    begin
+      // Infinite loop: DO ... LOOP (no condition)
+      EmitInstruction(ssaJump, MakeSSALabel(BodyLabel), MakeSSAValue(svkNone),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+      // End label for potential EXIT statements
+      FCurrentBlock := FProgram.CreateBlock(EndLabel);
+    end;
+  end;
+end;
+
+procedure TSSAGenerator.ProcessBlock(Node: TASTNode);
+var
+  i: Integer;
+begin
+  // BEGIN/BEND block - simply process all child statements
+  for i := 0 to Node.ChildCount - 1 do
+    ProcessStatement(Node.GetChild(i));
+end;
+
+procedure TSSAGenerator.ProcessDefFn(Node: TASTNode);
+var
+  FnDef: TUserFunctionDef;
+  NameNode, ParamListNode, BodyNode: TASTNode;
+begin
+  // DEF FN structure:
+  //   Child[0] = Function name (identifier)
+  //   Child[1] = Parameter list (dimensions node with single param)
+  //   Child[2] = Body expression
+
+  if Node.ChildCount < 3 then Exit;
+
+  NameNode := Node.GetChild(0);
+  ParamListNode := Node.GetChild(1);
+  BodyNode := Node.GetChild(2);
+
+  // Get function name
+  FnDef.Name := UpperCase(VarToStr(NameNode.Value));
+
+  // Get parameter name (first child of param list)
+  if ParamListNode.ChildCount > 0 then
+    FnDef.ParamName := UpperCase(VarToStr(ParamListNode.GetChild(0).Value))
+  else
+    FnDef.ParamName := '';
+
+  // Store body node reference for later evaluation
+  FnDef.BodyNode := BodyNode;
+
+  // Register the function
+  FUserFunctions.AddOrSetValue(FnDef.Name, FnDef);
+
+  // DEF FN doesn't generate any runtime code - it just registers the function
+  // The function body is evaluated inline when FN is called
+end;
+
 procedure TSSAGenerator.ProcessNext(Node: TASTNode);
 var
   LoopInfo: TLoopInfo;
@@ -2353,9 +3129,10 @@ begin
   // FIX: Save the actual last block of THEN branch (might have changed due to nested control flow)
   ThenBlock := FCurrentBlock;
 
-  // Jump to end after THEN
-  EmitInstruction(ssaJump, MakeSSALabel(EndLabel), MakeSSAValue(svkNone),
-                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // Jump to end after THEN - but ONLY if the branch didn't already terminate (GOTO/RETURN/END)
+  if Assigned(FCurrentBlock) then
+    EmitInstruction(ssaJump, MakeSSALabel(EndLabel), MakeSSAValue(svkNone),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 
   // ELSE block (if present)
   if HasElse then
@@ -3116,6 +3893,2371 @@ begin
                  XReg, YReg, MakeSSAValue(svkNone));
 end;
 
+{ ProcessColor - Handle COLOR command for setting screen area colors
+  Syntax: COLOR source, color
+  Source: 0=background, 1=foreground, 2=multicolor1, 3=multicolor2,
+          4=border, 5=character, 6=80col-background
+}
+procedure TSSAGenerator.ProcessColor(Node: TASTNode);
+var
+  SourceVal, ColorVal: TSSAValue;
+  SourceReg, ColorReg: TSSAValue;
+  TempReg: Integer;
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 2 then
+  begin
+    WriteLn(StdErr, 'COLOR: requires source, color');
+    Exit;
+  end;
+
+  // Process source number
+  ProcessExpression(Node.GetChild(0), SourceVal);
+  if SourceVal.Kind = svkConstInt then
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    SourceReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, SourceReg, SourceVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if SourceVal.Kind = svkRegister then
+    SourceReg := SourceVal
+  else
+    SourceReg := MakeSSAValue(svkNone);
+
+  // Process color value
+  ProcessExpression(Node.GetChild(1), ColorVal);
+  if ColorVal.Kind = svkConstInt then
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    ColorReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, ColorReg, ColorVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if ColorVal.Kind = svkRegister then
+    ColorReg := ColorVal
+  else
+    ColorReg := MakeSSAValue(svkNone);
+
+  // Emit ssaGraphicColor: Src1=source, Src2=color
+  EmitInstruction(ssaGraphicColor, MakeSSAValue(svkNone),
+                 SourceReg, ColorReg, MakeSSAValue(svkNone));
+end;
+
+{ ProcessWidth - Handle WIDTH command for setting line width
+  Syntax: WIDTH n (1 or 2)
+}
+procedure TSSAGenerator.ProcessWidth(Node: TASTNode);
+var
+  WidthVal, WidthReg: TSSAValue;
+  TempReg: Integer;
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 1 then
+  begin
+    WriteLn(StdErr, 'WIDTH: requires width value');
+    Exit;
+  end;
+
+  ProcessExpression(Node.GetChild(0), WidthVal);
+  if WidthVal.Kind = svkConstInt then
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    WidthReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, WidthReg, WidthVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if WidthVal.Kind = svkRegister then
+    WidthReg := WidthVal
+  else
+    WidthReg := MakeSSAValue(svkNone);
+
+  // Emit ssaGraphicWidth: Src1=width
+  EmitInstruction(ssaGraphicWidth, MakeSSAValue(svkNone),
+                 WidthReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+{ ProcessScale - Handle SCALE command for coordinate scaling
+  Syntax: SCALE n [,xmax, ymax]
+  n=0: turn off, n=1: turn on with optional max coordinates
+}
+procedure TSSAGenerator.ProcessScale(Node: TASTNode);
+var
+  EnableVal, XMaxVal, YMaxVal: TSSAValue;
+  EnableReg, XMaxReg, YMaxReg: TSSAValue;
+  TempReg: Integer;
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 1 then
+  begin
+    WriteLn(StdErr, 'SCALE: requires enable flag');
+    Exit;
+  end;
+
+  // Process enable flag
+  ProcessExpression(Node.GetChild(0), EnableVal);
+  if EnableVal.Kind = svkConstInt then
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    EnableReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, EnableReg, EnableVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if EnableVal.Kind = svkRegister then
+    EnableReg := EnableVal
+  else
+    EnableReg := MakeSSAValue(svkNone);
+
+  // Process optional xmax
+  if Node.ChildCount > 1 then
+  begin
+    ProcessExpression(Node.GetChild(1), XMaxVal);
+    if XMaxVal.Kind = svkConstInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      XMaxReg := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, XMaxReg, XMaxVal,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if XMaxVal.Kind = svkRegister then
+      XMaxReg := XMaxVal
+    else
+      XMaxReg := MakeSSAValue(svkNone);
+  end
+  else
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    XMaxReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, XMaxReg, MakeSSAConstInt(1023),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Process optional ymax
+  if Node.ChildCount > 2 then
+  begin
+    ProcessExpression(Node.GetChild(2), YMaxVal);
+    if YMaxVal.Kind = svkConstInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      YMaxReg := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, YMaxReg, YMaxVal,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if YMaxVal.Kind = svkRegister then
+      YMaxReg := YMaxVal
+    else
+      YMaxReg := MakeSSAValue(svkNone);
+  end
+  else
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    YMaxReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, YMaxReg, MakeSSAConstInt(1023),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Emit ssaGraphicScale: Src1=enable, Src2=xmax, Src3=ymax
+  EmitInstruction(ssaGraphicScale, MakeSSAValue(svkNone),
+                 EnableReg, XMaxReg, YMaxReg);
+end;
+
+{ ProcessPaint - Handle PAINT command for flood fill
+  Syntax: PAINT [source], x, y [,mode]
+  source: 0-3 color source (optional, default=1)
+  x, y: starting coordinates
+  mode: 0=bounded by source, 1=bounded by non-background
+}
+procedure TSSAGenerator.ProcessPaint(Node: TASTNode);
+var
+  SourceVal, XVal, YVal, ModeVal: TSSAValue;
+  SourceReg, XReg, YReg, ModeReg: TSSAValue;
+  Instr: TSSAInstruction;
+  TempReg: Integer;
+
+  function MaterializeFloat(Val: TSSAValue): TSSAValue;
+  begin
+    if Val.Kind = svkConstFloat then
+    begin
+      TempReg := FProgram.AllocRegister(srtFloat);
+      Result := MakeSSARegister(srtFloat, TempReg);
+      EmitInstruction(ssaLoadConstFloat, Result, Val,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if Val.Kind = svkConstInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtFloat);
+      Result := MakeSSARegister(srtFloat, TempReg);
+      EmitInstruction(ssaLoadConstFloat, Result, MakeSSAConstFloat(Val.ConstInt),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if Val.Kind = svkRegister then
+      Result := Val
+    else
+      Result := MakeSSAValue(svkNone);
+  end;
+
+  function MaterializeInt(Val: TSSAValue): TSSAValue;
+  begin
+    if Val.Kind = svkConstInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      Result := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, Result, Val,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if Val.Kind = svkRegister then
+      Result := Val
+    else
+      Result := MakeSSAValue(svkNone);
+  end;
+
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 2 then
+  begin
+    WriteLn(StdErr, 'PAINT: requires at least x, y coordinates');
+    Exit;
+  end;
+
+  // PAINT can have 2, 3, or 4 params
+  // 2 params: x, y (source=1, mode=0)
+  // 3 params: source, x, y OR x, y, mode (ambiguous, assume source, x, y)
+  // 4 params: source, x, y, mode
+  if Node.ChildCount = 2 then
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    SourceReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, SourceReg, MakeSSAConstInt(1),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    ProcessExpression(Node.GetChild(0), XVal);
+    XReg := MaterializeFloat(XVal);
+    ProcessExpression(Node.GetChild(1), YVal);
+    YReg := MaterializeFloat(YVal);
+    TempReg := FProgram.AllocRegister(srtInt);
+    ModeReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, ModeReg, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if Node.ChildCount = 3 then
+  begin
+    ProcessExpression(Node.GetChild(0), SourceVal);
+    SourceReg := MaterializeInt(SourceVal);
+    ProcessExpression(Node.GetChild(1), XVal);
+    XReg := MaterializeFloat(XVal);
+    ProcessExpression(Node.GetChild(2), YVal);
+    YReg := MaterializeFloat(YVal);
+    TempReg := FProgram.AllocRegister(srtInt);
+    ModeReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, ModeReg, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+  begin
+    ProcessExpression(Node.GetChild(0), SourceVal);
+    SourceReg := MaterializeInt(SourceVal);
+    ProcessExpression(Node.GetChild(1), XVal);
+    XReg := MaterializeFloat(XVal);
+    ProcessExpression(Node.GetChild(2), YVal);
+    YReg := MaterializeFloat(YVal);
+    ProcessExpression(Node.GetChild(3), ModeVal);
+    ModeReg := MaterializeInt(ModeVal);
+  end;
+
+  // Emit ssaGraphicPaint: Src1=source, Src2=x, Src3=y, PhiSources[0]=mode
+  EmitInstruction(ssaGraphicPaint, MakeSSAValue(svkNone),
+                 SourceReg, XReg, YReg);
+  Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+  Instr.AddPhiSource(ModeReg, nil);
+end;
+
+{ ProcessWindow - Handle WINDOW command for text window definition
+  Syntax: WINDOW col1, row1, col2, row2 [,clear]
+}
+procedure TSSAGenerator.ProcessWindow(Node: TASTNode);
+var
+  Col1Val, Row1Val, Col2Val, Row2Val, ClearVal: TSSAValue;
+  Col1Reg, Row1Reg, Col2Reg, Row2Reg, ClearReg: TSSAValue;
+  Instr: TSSAInstruction;
+  TempReg: Integer;
+
+  function MaterializeInt(Val: TSSAValue): TSSAValue;
+  begin
+    if Val.Kind = svkConstInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      Result := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, Result, Val,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if Val.Kind = svkRegister then
+      Result := Val
+    else
+      Result := MakeSSAValue(svkNone);
+  end;
+
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 4 then
+  begin
+    WriteLn(StdErr, 'WINDOW: requires col1, row1, col2, row2');
+    Exit;
+  end;
+
+  ProcessExpression(Node.GetChild(0), Col1Val);
+  Col1Reg := MaterializeInt(Col1Val);
+  ProcessExpression(Node.GetChild(1), Row1Val);
+  Row1Reg := MaterializeInt(Row1Val);
+  ProcessExpression(Node.GetChild(2), Col2Val);
+  Col2Reg := MaterializeInt(Col2Val);
+  ProcessExpression(Node.GetChild(3), Row2Val);
+  Row2Reg := MaterializeInt(Row2Val);
+
+  // Optional clear flag
+  if Node.ChildCount > 4 then
+  begin
+    ProcessExpression(Node.GetChild(4), ClearVal);
+    ClearReg := MaterializeInt(ClearVal);
+  end
+  else
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    ClearReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, ClearReg, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Emit ssaGraphicWindow: Src1=col1, Src2=row1, Src3=col2, PhiSources[0]=row2, [1]=clear
+  EmitInstruction(ssaGraphicWindow, MakeSSAValue(svkNone),
+                 Col1Reg, Row1Reg, Col2Reg);
+  Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+  Instr.AddPhiSource(Row2Reg, nil);
+  Instr.AddPhiSource(ClearReg, nil);
+end;
+
+{ ProcessSShape - Handle SSHAPE command for saving bitmap to string
+  Syntax: SSHAPE A$, x1, y1 [,x2, y2]
+}
+procedure TSSAGenerator.ProcessSShape(Node: TASTNode);
+var
+  X1Val, Y1Val, X2Val, Y2Val: TSSAValue;
+  X1Reg, Y1Reg, X2Reg, Y2Reg: TSSAValue;
+  DestVar: TSSAValue;
+  Instr: TSSAInstruction;
+  TempReg: Integer;
+
+  function MaterializeFloat(Val: TSSAValue): TSSAValue;
+  begin
+    if Val.Kind = svkConstFloat then
+    begin
+      TempReg := FProgram.AllocRegister(srtFloat);
+      Result := MakeSSARegister(srtFloat, TempReg);
+      EmitInstruction(ssaLoadConstFloat, Result, Val,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if Val.Kind = svkConstInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtFloat);
+      Result := MakeSSARegister(srtFloat, TempReg);
+      EmitInstruction(ssaLoadConstFloat, Result, MakeSSAConstFloat(Val.ConstInt),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if Val.Kind = svkRegister then
+      Result := Val
+    else
+      Result := MakeSSAValue(svkNone);
+  end;
+
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 3 then
+  begin
+    WriteLn(StdErr, 'SSHAPE: requires string var, x1, y1');
+    Exit;
+  end;
+
+  // First child is the destination string variable
+  // We need the variable reference, not its value
+  if Node.GetChild(0).NodeType = antIdentifier then
+    DestVar := MakeSSAVariable(Node.GetChild(0).Value)
+  else
+  begin
+    WriteLn(StdErr, 'SSHAPE: first parameter must be a string variable');
+    Exit;
+  end;
+
+  ProcessExpression(Node.GetChild(1), X1Val);
+  X1Reg := MaterializeFloat(X1Val);
+  ProcessExpression(Node.GetChild(2), Y1Val);
+  Y1Reg := MaterializeFloat(Y1Val);
+
+  // Optional x2, y2
+  if Node.ChildCount > 3 then
+  begin
+    ProcessExpression(Node.GetChild(3), X2Val);
+    X2Reg := MaterializeFloat(X2Val);
+  end
+  else
+  begin
+    TempReg := FProgram.AllocRegister(srtFloat);
+    X2Reg := MakeSSARegister(srtFloat, TempReg);
+    EmitInstruction(ssaLoadConstFloat, X2Reg, MakeSSAConstFloat(-1),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  if Node.ChildCount > 4 then
+  begin
+    ProcessExpression(Node.GetChild(4), Y2Val);
+    Y2Reg := MaterializeFloat(Y2Val);
+  end
+  else
+  begin
+    TempReg := FProgram.AllocRegister(srtFloat);
+    Y2Reg := MakeSSARegister(srtFloat, TempReg);
+    EmitInstruction(ssaLoadConstFloat, Y2Reg, MakeSSAConstFloat(-1),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Emit ssaGraphicSShape: Dest=string var, Src1=x1, Src2=y1, Src3=x2, PhiSources[0]=y2
+  EmitInstruction(ssaGraphicSShape, DestVar, X1Reg, Y1Reg, X2Reg);
+  Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+  Instr.AddPhiSource(Y2Reg, nil);
+end;
+
+{ ProcessGShape - Handle GSHAPE command for loading string to bitmap
+  Syntax: GSHAPE A$, x, y [,mode]
+  mode: 0=as-is, 1=invert, 2=OR, 3=AND, 4=XOR
+}
+procedure TSSAGenerator.ProcessGShape(Node: TASTNode);
+var
+  XVal, YVal, ModeVal: TSSAValue;
+  SrcVar, XReg, YReg, ModeReg: TSSAValue;
+  Instr: TSSAInstruction;
+  TempReg: Integer;
+
+  function MaterializeFloat(Val: TSSAValue): TSSAValue;
+  begin
+    if Val.Kind = svkConstFloat then
+    begin
+      TempReg := FProgram.AllocRegister(srtFloat);
+      Result := MakeSSARegister(srtFloat, TempReg);
+      EmitInstruction(ssaLoadConstFloat, Result, Val,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if Val.Kind = svkConstInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtFloat);
+      Result := MakeSSARegister(srtFloat, TempReg);
+      EmitInstruction(ssaLoadConstFloat, Result, MakeSSAConstFloat(Val.ConstInt),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if Val.Kind = svkRegister then
+      Result := Val
+    else
+      Result := MakeSSAValue(svkNone);
+  end;
+
+  function MaterializeInt(Val: TSSAValue): TSSAValue;
+  begin
+    if Val.Kind = svkConstInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      Result := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, Result, Val,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if Val.Kind = svkRegister then
+      Result := Val
+    else
+      Result := MakeSSAValue(svkNone);
+  end;
+
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 1 then
+  begin
+    WriteLn(StdErr, 'GSHAPE: requires string variable');
+    Exit;
+  end;
+
+  // First child is the source string variable
+  ProcessExpression(Node.GetChild(0), SrcVar);
+
+  // Optional x, y coordinates (default to PC)
+  if Node.ChildCount > 1 then
+  begin
+    ProcessExpression(Node.GetChild(1), XVal);
+    XReg := MaterializeFloat(XVal);
+  end
+  else
+  begin
+    TempReg := FProgram.AllocRegister(srtFloat);
+    XReg := MakeSSARegister(srtFloat, TempReg);
+    EmitInstruction(ssaLoadConstFloat, XReg, MakeSSAConstFloat(-1),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  if Node.ChildCount > 2 then
+  begin
+    ProcessExpression(Node.GetChild(2), YVal);
+    YReg := MaterializeFloat(YVal);
+  end
+  else
+  begin
+    TempReg := FProgram.AllocRegister(srtFloat);
+    YReg := MakeSSARegister(srtFloat, TempReg);
+    EmitInstruction(ssaLoadConstFloat, YReg, MakeSSAConstFloat(-1),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Optional mode
+  if Node.ChildCount > 3 then
+  begin
+    ProcessExpression(Node.GetChild(3), ModeVal);
+    ModeReg := MaterializeInt(ModeVal);
+  end
+  else
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    ModeReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, ModeReg, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Emit ssaGraphicGShape: Src1=string, Src2=x, Src3=y, PhiSources[0]=mode
+  EmitInstruction(ssaGraphicGShape, MakeSSAValue(svkNone),
+                 SrcVar, XReg, YReg);
+  Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+  Instr.AddPhiSource(ModeReg, nil);
+end;
+
+{ ProcessGList - Handle GLIST command for listing SDL2 video modes }
+procedure TSSAGenerator.ProcessGList(Node: TASTNode);
+begin
+  if FCurrentBlock = nil then Exit;
+  // GLIST has no parameters
+  EmitInstruction(ssaGraphicGList, MakeSSAValue(svkNone),
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+{ ============================================================================
+  SOUND COMMANDS
+  ============================================================================ }
+
+{ ProcessVol - Handle VOL command for setting master volume
+  Syntax: VOL n (0-15)
+}
+procedure TSSAGenerator.ProcessVol(Node: TASTNode);
+var
+  TempReg: Integer;
+  VolVal, VolReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then
+    Exit;
+
+  if Node.ChildCount < 1 then
+  begin
+    WriteLn(StdErr, 'VOL: requires volume parameter (0-15)');
+    Exit;
+  end;
+
+  // Process volume expression
+  ProcessExpression(Node.GetChild(0), VolVal);
+
+  // Materialize to int register if needed
+  if VolVal.Kind = svkConstInt then
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    VolReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, VolReg, VolVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if VolVal.Kind = svkConstFloat then
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    VolReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, VolReg, MakeSSAConstInt(Trunc(VolVal.ConstFloat)),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if (VolVal.Kind = svkRegister) and (VolVal.RegType = srtFloat) then
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    VolReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaFloatToInt, VolReg, VolVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+    VolReg := VolVal;
+
+  // Emit ssaSoundVol: Src1 = volume (0-15)
+  EmitInstruction(ssaSoundVol, MakeSSAValue(svkNone),
+                 VolReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+{ ProcessSound - Handle SOUND command for sound effects
+  Syntax: SOUND vc, freq, dur [, dir [, min [, sv [, wf [, pw]]]]]
+  Parameters:
+    0: vc    - voice (1-3)
+    1: freq  - frequency (0-65535)
+    2: dur   - duration in 1/60 sec
+    3: dir   - sweep direction (0=up, 1=down, 2=oscillate) [optional]
+    4: min   - minimum frequency for sweep [optional]
+    5: sv    - step value for sweep [optional]
+    6: wf    - waveform (0=tri, 1=saw, 2=pulse, 3=noise) [optional]
+    7: pw    - pulse width (0-4095) [optional]
+}
+procedure TSSAGenerator.ProcessSound(Node: TASTNode);
+var
+  TempReg, i: Integer;
+  ParamVals: array[0..7] of TSSAValue;
+  ParamRegs: array[0..7] of TSSAValue;
+  Instr: TSSAInstruction;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  if Node.ChildCount < 3 then
+  begin
+    WriteLn(StdErr, 'SOUND: requires at least voice, frequency, duration');
+    Exit;
+  end;
+
+  // Initialize all params to none/zero
+  for i := 0 to 7 do
+    ParamVals[i] := MakeSSAValue(svkNone);
+
+  // Process available parameters
+  for i := 0 to Min(Node.ChildCount - 1, 7) do
+    ProcessExpression(Node.GetChild(i), ParamVals[i]);
+
+  // Materialize parameters to registers
+  for i := 0 to 7 do
+  begin
+    if ParamVals[i].Kind = svkNone then
+    begin
+      // Default value: 0
+      TempReg := FProgram.AllocRegister(srtInt);
+      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, ParamRegs[i], MakeSSAConstInt(0),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if ParamVals[i].Kind = svkConstInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, ParamRegs[i], ParamVals[i],
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if ParamVals[i].Kind = svkConstFloat then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, ParamRegs[i], MakeSSAConstInt(Trunc(ParamVals[i].ConstFloat)),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if (ParamVals[i].Kind = svkRegister) and (ParamVals[i].RegType = srtFloat) then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaFloatToInt, ParamRegs[i], ParamVals[i],
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+      ParamRegs[i] := ParamVals[i];
+  end;
+
+  // Emit ssaSoundSound: Src1=voice, Src2=freq, Src3=duration
+  // Additional params packed via PhiSources
+  Instr := TSSAInstruction.Create(ssaSoundSound);
+  Instr.Dest := MakeSSAValue(svkNone);
+  Instr.Src1 := ParamRegs[0];  // voice
+  Instr.Src2 := ParamRegs[1];  // freq
+  Instr.Src3 := ParamRegs[2];  // duration
+  Instr.SourceLine := Node.SourceLine;
+  // Pack remaining params as PhiSources
+  Instr.AddPhiSource(ParamRegs[3], nil);  // dir
+  Instr.AddPhiSource(ParamRegs[4], nil);  // min
+  Instr.AddPhiSource(ParamRegs[5], nil);  // sv
+  Instr.AddPhiSource(ParamRegs[6], nil);  // wf
+  Instr.AddPhiSource(ParamRegs[7], nil);  // pw
+  FCurrentBlock.AddInstruction(Instr);
+end;
+
+{ ProcessEnvelope - Handle ENVELOPE command for defining instruments
+  Syntax: ENVELOPE e[, a[, d[, s[, r[, wf[, pw]]]]]]
+  Parameters:
+    0: e   - envelope number (0-9)
+    1: a   - attack rate (0-15) [optional]
+    2: d   - decay rate (0-15) [optional]
+    3: s   - sustain level (0-15) [optional]
+    4: r   - release rate (0-15) [optional]
+    5: wf  - waveform (0-4) [optional]
+    6: pw  - pulse width (0-4095) [optional]
+}
+procedure TSSAGenerator.ProcessEnvelope(Node: TASTNode);
+var
+  TempReg, i: Integer;
+  ParamVals: array[0..6] of TSSAValue;
+  ParamRegs: array[0..6] of TSSAValue;
+  Instr: TSSAInstruction;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  if Node.ChildCount < 1 then
+  begin
+    WriteLn(StdErr, 'ENVELOPE: requires at least envelope number (0-9)');
+    Exit;
+  end;
+
+  // Initialize all params to none
+  for i := 0 to 6 do
+    ParamVals[i] := MakeSSAValue(svkNone);
+
+  // Process available parameters
+  for i := 0 to Min(Node.ChildCount - 1, 6) do
+    ProcessExpression(Node.GetChild(i), ParamVals[i]);
+
+  // Materialize parameters to registers
+  for i := 0 to 6 do
+  begin
+    if ParamVals[i].Kind = svkNone then
+    begin
+      // Default: use -1 to indicate "use predefined default"
+      TempReg := FProgram.AllocRegister(srtInt);
+      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, ParamRegs[i], MakeSSAConstInt(-1),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if ParamVals[i].Kind = svkConstInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, ParamRegs[i], ParamVals[i],
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if ParamVals[i].Kind = svkConstFloat then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, ParamRegs[i], MakeSSAConstInt(Trunc(ParamVals[i].ConstFloat)),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if (ParamVals[i].Kind = svkRegister) and (ParamVals[i].RegType = srtFloat) then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaFloatToInt, ParamRegs[i], ParamVals[i],
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+      ParamRegs[i] := ParamVals[i];
+  end;
+
+  // Emit ssaSoundEnvelope: Src1=envelope#
+  // ADSR + wf + pw packed via PhiSources
+  Instr := TSSAInstruction.Create(ssaSoundEnvelope);
+  Instr.Dest := MakeSSAValue(svkNone);
+  Instr.Src1 := ParamRegs[0];  // envelope number
+  Instr.Src2 := MakeSSAValue(svkNone);
+  Instr.Src3 := MakeSSAValue(svkNone);
+  Instr.SourceLine := Node.SourceLine;
+  // Pack ADSR + wf + pw as PhiSources
+  Instr.AddPhiSource(ParamRegs[1], nil);  // attack
+  Instr.AddPhiSource(ParamRegs[2], nil);  // decay
+  Instr.AddPhiSource(ParamRegs[3], nil);  // sustain
+  Instr.AddPhiSource(ParamRegs[4], nil);  // release
+  Instr.AddPhiSource(ParamRegs[5], nil);  // waveform
+  Instr.AddPhiSource(ParamRegs[6], nil);  // pulse width
+  FCurrentBlock.AddInstruction(Instr);
+end;
+
+{ ProcessTempo - Handle TEMPO command for setting playback speed
+  Syntax: TEMPO n (0-255)
+}
+procedure TSSAGenerator.ProcessTempo(Node: TASTNode);
+var
+  TempReg: Integer;
+  TempoVal, TempoReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  if Node.ChildCount < 1 then
+  begin
+    WriteLn(StdErr, 'TEMPO: requires tempo parameter (0-255)');
+    Exit;
+  end;
+
+  // Process tempo expression
+  ProcessExpression(Node.GetChild(0), TempoVal);
+
+  // Materialize to int register if needed
+  if TempoVal.Kind = svkConstInt then
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    TempoReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, TempoReg, TempoVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if TempoVal.Kind = svkConstFloat then
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    TempoReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, TempoReg, MakeSSAConstInt(Trunc(TempoVal.ConstFloat)),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if (TempoVal.Kind = svkRegister) and (TempoVal.RegType = srtFloat) then
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    TempoReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaFloatToInt, TempoReg, TempoVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+    TempoReg := TempoVal;
+
+  // Emit ssaSoundTempo: Src1 = tempo (0-255)
+  EmitInstruction(ssaSoundTempo, MakeSSAValue(svkNone),
+                 TempoReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+{ ProcessPlay - Handle PLAY command for playing music strings
+  Syntax: PLAY "music string"
+  The string contains notes (C,D,E,F,G,A,B), durations (W,H,Q,I,S),
+  control characters (V=voice, O=octave, T=envelope, U=volume, X=filter)
+}
+procedure TSSAGenerator.ProcessPlay(Node: TASTNode);
+var
+  TempReg: Integer;
+  StrVal, StrReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then
+    Exit;
+
+  if Node.ChildCount < 1 then
+  begin
+    WriteLn(StdErr, 'PLAY: requires music string parameter');
+    Exit;
+  end;
+
+  // Process string expression
+  ProcessExpression(Node.GetChild(0), StrVal);
+
+  // Handle different value types
+  if StrVal.Kind = svkConstString then
+  begin
+    TempReg := FProgram.AllocRegister(srtString);
+    StrReg := MakeSSARegister(srtString, TempReg);
+    EmitInstruction(ssaLoadConstString, StrReg, StrVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if (StrVal.Kind = svkRegister) and (StrVal.RegType = srtString) then
+    StrReg := StrVal
+  else
+  begin
+    WriteLn(StdErr, 'PLAY: parameter must be a string');
+    Exit;
+  end;
+
+  // Emit ssaSoundPlay: Src1 = string register
+  EmitInstruction(ssaSoundPlay, MakeSSAValue(svkNone),
+                 StrReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+{ ProcessFilter - Handle FILTER command for SID filter parameters
+  Syntax: FILTER cf, lp, bp, hp, res
+  Parameters:
+    0: cf  - cutoff frequency (0-2047)
+    1: lp  - low-pass filter (0=off, 1=on)
+    2: bp  - band-pass filter (0=off, 1=on)
+    3: hp  - high-pass filter (0=off, 1=on)
+    4: res - resonance (0-15)
+}
+procedure TSSAGenerator.ProcessFilter(Node: TASTNode);
+var
+  TempReg, i: Integer;
+  ParamVals: array[0..4] of TSSAValue;
+  ParamRegs: array[0..4] of TSSAValue;
+  Instr: TSSAInstruction;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  if Node.ChildCount < 5 then
+  begin
+    WriteLn(StdErr, 'FILTER: requires all 5 parameters (cf, lp, bp, hp, res)');
+    Exit;
+  end;
+
+  // Process all 5 parameters
+  for i := 0 to 4 do
+    ProcessExpression(Node.GetChild(i), ParamVals[i]);
+
+  // Materialize parameters to registers
+  for i := 0 to 4 do
+  begin
+    if ParamVals[i].Kind = svkConstInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, ParamRegs[i], ParamVals[i],
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if ParamVals[i].Kind = svkConstFloat then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, ParamRegs[i], MakeSSAConstInt(Trunc(ParamVals[i].ConstFloat)),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if (ParamVals[i].Kind = svkRegister) and (ParamVals[i].RegType = srtFloat) then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaFloatToInt, ParamRegs[i], ParamVals[i],
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+      ParamRegs[i] := ParamVals[i];
+  end;
+
+  // Emit ssaSoundFilter: Src1=cf, Src2=lp, Src3=bp
+  // hp and res packed via PhiSources
+  Instr := TSSAInstruction.Create(ssaSoundFilter);
+  Instr.Dest := MakeSSAValue(svkNone);
+  Instr.Src1 := ParamRegs[0];  // cutoff frequency
+  Instr.Src2 := ParamRegs[1];  // low-pass
+  Instr.Src3 := ParamRegs[2];  // band-pass
+  Instr.SourceLine := Node.SourceLine;
+  // Pack remaining params as PhiSources
+  Instr.AddPhiSource(ParamRegs[3], nil);  // high-pass
+  Instr.AddPhiSource(ParamRegs[4], nil);  // resonance
+  FCurrentBlock.AddInstruction(Instr);
+end;
+
+{ DATA/READ/RESTORE implementation }
+procedure TSSAGenerator.ProcessData(Node: TASTNode);
+var
+  i: Integer;
+  Child: TASTNode;
+  DataVal: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // Each child is a literal value to add to the DATA pool
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    Child := Node.GetChild(i);
+    if Child.NodeType = antLiteral then
+    begin
+      // Determine type of data and emit appropriate ssaDataAdd
+      if VarIsStr(Child.Value) then
+      begin
+        DataVal := MakeSSAConstString(string(Child.Value));
+        EmitInstruction(ssaDataAdd, MakeSSAValue(svkNone), DataVal,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if VarIsOrdinal(Child.Value) then
+      begin
+        DataVal := MakeSSAConstInt(Integer(Child.Value));
+        EmitInstruction(ssaDataAdd, MakeSSAValue(svkNone), DataVal,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+      begin
+        // Float
+        DataVal := MakeSSAConstFloat(Double(Child.Value));
+        EmitInstruction(ssaDataAdd, MakeSSAValue(svkNone), DataVal,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+    end;
+  end;
+end;
+
+procedure TSSAGenerator.ProcessRead(Node: TASTNode);
+var
+  i: Integer;
+  Child: TASTNode;
+  VarName: string;
+  DestReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // Each child is a variable to read into
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    Child := Node.GetChild(i);
+
+    if Child.NodeType = antIdentifier then
+    begin
+      VarName := string(Child.Value);
+      DestReg := GetOrAllocateVariable(VarName);
+
+      // Emit ssaDataRead with type hint from variable suffix
+      if VarName.EndsWith('$') then
+        EmitInstruction(ssaDataRead, DestReg, MakeSSAConstInt(Ord(srtString)),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      else if VarName.EndsWith('%') then
+        EmitInstruction(ssaDataRead, DestReg, MakeSSAConstInt(Ord(srtInt)),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      else
+        // Default to float
+        EmitInstruction(ssaDataRead, DestReg, MakeSSAConstInt(Ord(srtFloat)),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if Child.NodeType = antArrayAccess then
+    begin
+      // Array element - more complex, need to read into temp then store to array
+      // For now just emit a warning, can be implemented later
+      WriteLn(StdErr, '[SSA] READ into array elements not yet implemented');
+    end;
+  end;
+end;
+
+procedure TSSAGenerator.ProcessRestore(Node: TASTNode);
+var
+  LineVal: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  if Node.ChildCount > 0 then
+  begin
+    // RESTORE with line number
+    LineVal := MakeSSAConstInt(Integer(Node.GetChild(0).Value));
+    EmitInstruction(ssaDataRestore, MakeSSAValue(svkNone), LineVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+  begin
+    // RESTORE without line number - reset to beginning
+    EmitInstruction(ssaDataRestore, MakeSSAValue(svkNone), MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+{ Input commands implementation }
+procedure TSSAGenerator.ProcessGet(Node: TASTNode);
+var
+  VarName: string;
+  DestReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // GET A$ - non-blocking character input
+  // Child[0] = variable to store character
+  if Node.ChildCount > 0 then
+  begin
+    VarName := string(Node.GetChild(0).Value);
+    DestReg := GetOrAllocateVariable(VarName);
+    EmitInstruction(ssaGet, DestReg, MakeSSAValue(svkNone),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+procedure TSSAGenerator.ProcessGetkey(Node: TASTNode);
+var
+  VarName: string;
+  DestReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // GETKEY A$ - blocking character input (waits for keypress)
+  // Child[0] = variable to store character
+  if Node.ChildCount > 0 then
+  begin
+    VarName := string(Node.GetChild(0).Value);
+    DestReg := GetOrAllocateVariable(VarName);
+    EmitInstruction(ssaGetkey, DestReg, MakeSSAValue(svkNone),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+{ Formatted output implementation }
+procedure TSSAGenerator.ProcessPrintUsing(Node: TASTNode);
+var
+  i: Integer;
+  FormatVal, ValueVal: TSSAValue;
+  Instr: TSSAInstruction;
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 2 then Exit; // Need at least format and one value
+
+  // PRINT USING format$; value1, value2, ...
+  // Child[0] = format string
+  // Child[1..n] = values to print (may include separator nodes)
+  ProcessExpression(Node.GetChild(0), FormatVal);
+
+  // Emit one instruction per value
+  for i := 1 to Node.ChildCount - 1 do
+  begin
+    if Node.GetChild(i).NodeType = antSeparator then
+      Continue; // Skip separators
+
+    ProcessExpression(Node.GetChild(i), ValueVal);
+
+    // Emit PRINT USING with format and value
+    Instr := TSSAInstruction.Create(ssaPrintUsing);
+    Instr.Dest := MakeSSAValue(svkNone);
+    Instr.Src1 := FormatVal;  // Format string
+    Instr.Src2 := ValueVal;   // Value to format
+    Instr.Src3 := MakeSSAValue(svkNone);
+    Instr.SourceLine := Node.SourceLine;
+    FCurrentBlock.AddInstruction(Instr);
+  end;
+end;
+
+procedure TSSAGenerator.ProcessPudef(Node: TASTNode);
+var
+  FormatVal: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // PUDEF " ,.$" - redefine PRINT USING format characters
+  // Child[0] = format string (4 chars: filler, comma, decimal, dollar)
+  if Node.ChildCount > 0 then
+  begin
+    ProcessExpression(Node.GetChild(0), FormatVal);
+    EmitInstruction(ssaPudef, MakeSSAValue(svkNone), FormatVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+procedure TSSAGenerator.ProcessChar(Node: TASTNode);
+var
+  ModeVal, ColVal, RowVal, TextVal, ReverseVal: TSSAValue;
+  Instr: TSSAInstruction;
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 4 then Exit; // Need mode, col, row, text
+
+  // CHAR mode, col, row, "text" [,reverse]
+  ProcessExpression(Node.GetChild(0), ModeVal);
+  ProcessExpression(Node.GetChild(1), ColVal);
+  ProcessExpression(Node.GetChild(2), RowVal);
+  ProcessExpression(Node.GetChild(3), TextVal);
+
+  if Node.ChildCount > 4 then
+    ProcessExpression(Node.GetChild(4), ReverseVal)
+  else
+    ReverseVal := MakeSSAConstInt(0);
+
+  // Emit CHAR instruction with all parameters
+  Instr := TSSAInstruction.Create(ssaChar);
+  Instr.Dest := MakeSSAValue(svkNone);
+  Instr.Src1 := ModeVal;
+  Instr.Src2 := ColVal;
+  Instr.Src3 := RowVal;
+  Instr.SourceLine := Node.SourceLine;
+  // Pack text and reverse as PhiSources
+  Instr.AddPhiSource(TextVal, nil);
+  Instr.AddPhiSource(ReverseVal, nil);
+  FCurrentBlock.AddInstruction(Instr);
+end;
+
+procedure TSSAGenerator.ProcessLoad(Node: TASTNode);
+var
+  FilenameVal: TSSAValue;
+  FilenameReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // LOAD "filename"
+  // The filename is the first child (should be a string expression)
+  if Node.ChildCount > 0 then
+  begin
+    ProcessExpression(Node.GetChild(0), FilenameVal);
+    // Ensure we have a string register
+    FilenameReg := EnsureStringRegister(FilenameVal);
+  end
+  else
+  begin
+    // No filename provided - emit empty string
+    FilenameReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaLoadConstString, FilenameReg, MakeSSAConstString(''),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Emit LOAD instruction with filename in Src1
+  EmitInstruction(ssaLoad, MakeSSAValue(svkNone), FilenameReg,
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessSave(Node: TASTNode);
+var
+  FilenameVal: TSSAValue;
+  FilenameReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // SAVE "filename"
+  // The filename is the first child (should be a string expression)
+  if Node.ChildCount > 0 then
+  begin
+    ProcessExpression(Node.GetChild(0), FilenameVal);
+    // Ensure we have a string register
+    FilenameReg := EnsureStringRegister(FilenameVal);
+  end
+  else
+  begin
+    // No filename provided - emit empty string
+    FilenameReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaLoadConstString, FilenameReg, MakeSSAConstString(''),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Emit SAVE instruction with filename in Src1
+  EmitInstruction(ssaSave, MakeSSAValue(svkNone), FilenameReg,
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessVerify(Node: TASTNode);
+var
+  FilenameVal, FilenameReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // VERIFY "filename"
+  if Node.ChildCount > 0 then
+  begin
+    ProcessExpression(Node.GetChild(0), FilenameVal);
+    FilenameReg := EnsureStringRegister(FilenameVal);
+  end
+  else
+  begin
+    FilenameReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaLoadConstString, FilenameReg, MakeSSAConstString(''),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  EmitInstruction(ssaVerify, MakeSSAValue(svkNone), FilenameReg,
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessBload(Node: TASTNode);
+var
+  FilenameVal, FilenameReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // BLOAD "filename"
+  if Node.ChildCount > 0 then
+  begin
+    ProcessExpression(Node.GetChild(0), FilenameVal);
+    FilenameReg := EnsureStringRegister(FilenameVal);
+  end
+  else
+  begin
+    FilenameReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaLoadConstString, FilenameReg, MakeSSAConstString(''),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  EmitInstruction(ssaBload, MakeSSAValue(svkNone), FilenameReg,
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessBsave(Node: TASTNode);
+var
+  FilenameVal, FilenameReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // BSAVE "filename"
+  if Node.ChildCount > 0 then
+  begin
+    ProcessExpression(Node.GetChild(0), FilenameVal);
+    FilenameReg := EnsureStringRegister(FilenameVal);
+  end
+  else
+  begin
+    FilenameReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaLoadConstString, FilenameReg, MakeSSAConstString(''),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  EmitInstruction(ssaBsave, MakeSSAValue(svkNone), FilenameReg,
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessBoot(Node: TASTNode);
+var
+  FilenameVal, FilenameReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // BOOT "filename"
+  if Node.ChildCount > 0 then
+  begin
+    ProcessExpression(Node.GetChild(0), FilenameVal);
+    FilenameReg := EnsureStringRegister(FilenameVal);
+  end
+  else
+  begin
+    FilenameReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaLoadConstString, FilenameReg, MakeSSAConstString(''),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  EmitInstruction(ssaBoot, MakeSSAValue(svkNone), FilenameReg,
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessDopen(Node: TASTNode);
+var
+  HandleVal, FilenameVal, ModeVal: TSSAValue;
+  HandleReg, FilenameReg, ModeReg: TSSAValue;
+  HandleNameIdx: Integer;
+  HandleChild: TASTNode;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { DOPEN #handle, "filename" [, mode$]
+    AST structure:
+      Child 0: Handle (antLiteral for numeric, antIdentifier for named)
+      Child 1: Filename (string expression)
+      Child 2: Mode (optional string expression)
+
+    SSA encoding:
+      Dest = handle register (int)
+      Src1 = filename register (string)
+      Src2 = mode register (string, or 0 if not specified)
+      Immediate = handle name string constant index (for named handles) }
+
+  HandleNameIdx := -1;
+
+  // Parse handle (first child)
+  if Node.ChildCount > 0 then
+  begin
+    HandleChild := Node.GetChild(0);
+    if HandleChild.NodeType = antLiteral then
+    begin
+      // Numeric handle: #1, #2, etc.
+      ProcessExpression(HandleChild, HandleVal);
+      HandleReg := EnsureIntRegister(HandleVal);
+    end
+    else if HandleChild.NodeType = antIdentifier then
+    begin
+      // Named handle: #MYFILE - store name in string constants
+      HandleNameIdx := FProgram.AllocRegister(srtInt);  // Use as temporary identifier
+      // Create a temporary register to hold the handle number (will be assigned at runtime)
+      HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // Store handle name as string constant for runtime lookup
+      HandleNameIdx := FProgram.AllocRegister(srtString);
+    end
+    else
+    begin
+      // Fallback: treat as expression
+      ProcessExpression(HandleChild, HandleVal);
+      HandleReg := EnsureIntRegister(HandleVal);
+    end;
+  end
+  else
+  begin
+    // No handle - error, but provide default
+    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(1),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Parse filename (second child)
+  if Node.ChildCount > 1 then
+  begin
+    ProcessExpression(Node.GetChild(1), FilenameVal);
+    FilenameReg := EnsureStringRegister(FilenameVal);
+  end
+  else
+  begin
+    // No filename - emit empty string
+    FilenameReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaLoadConstString, FilenameReg, MakeSSAConstString(''),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Parse optional mode (third child)
+  if Node.ChildCount > 2 then
+  begin
+    ProcessExpression(Node.GetChild(2), ModeVal);
+    ModeReg := EnsureStringRegister(ModeVal);
+  end
+  else
+  begin
+    // Default mode: "R" (read)
+    ModeReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaLoadConstString, ModeReg, MakeSSAConstString('R'),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Emit DOPEN instruction
+  // Dest = handle, Src1 = filename, Src2 = mode
+  EmitInstruction(ssaDopen, HandleReg, FilenameReg, ModeReg, MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessDclose(Node: TASTNode);
+var
+  HandleVal: TSSAValue;
+  HandleReg: TSSAValue;
+  HandleChild: TASTNode;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { DCLOSE #handle
+    AST structure:
+      Child 0: Handle (antLiteral for numeric, antIdentifier for named)
+
+    SSA encoding:
+      Dest = handle register (int) }
+
+  // Parse handle (first child)
+  if Node.ChildCount > 0 then
+  begin
+    HandleChild := Node.GetChild(0);
+    if HandleChild.NodeType = antLiteral then
+    begin
+      // Numeric handle: #1, #2, etc.
+      ProcessExpression(HandleChild, HandleVal);
+      HandleReg := EnsureIntRegister(HandleVal);
+    end
+    else if HandleChild.NodeType = antIdentifier then
+    begin
+      // Named handle: #MYFILE - for now, treat as 0 (runtime will resolve)
+      HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+    begin
+      ProcessExpression(HandleChild, HandleVal);
+      HandleReg := EnsureIntRegister(HandleVal);
+    end;
+  end
+  else
+  begin
+    // No handle - close all? Use handle 0
+    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Emit DCLOSE instruction
+  EmitInstruction(ssaDclose, HandleReg, MakeSSAValue(svkNone),
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessGetFile(Node: TASTNode);
+var
+  HandleVal, HandleReg, VarReg: TSSAValue;
+  HandleChild, VarChild: TASTNode;
+  VarName: string;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { GET# handle, variable
+    AST structure:
+      Child 0: Handle (antLiteral for numeric, antIdentifier for named)
+      Child 1: Variable to store character
+
+    SSA encoding:
+      Dest = variable register (string)
+      Src1 = handle register (int) }
+
+  // Need at least 2 children (handle and variable)
+  if Node.ChildCount < 2 then Exit;
+
+  // Parse handle (first child)
+  HandleChild := Node.GetChild(0);
+  if HandleChild.NodeType = antLiteral then
+  begin
+    ProcessExpression(HandleChild, HandleVal);
+    HandleReg := EnsureIntRegister(HandleVal);
+  end
+  else if HandleChild.NodeType = antIdentifier then
+  begin
+    // Named handle - for now, treat as 0
+    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+  begin
+    ProcessExpression(HandleChild, HandleVal);
+    HandleReg := EnsureIntRegister(HandleVal);
+  end;
+
+  // Parse variable (second child)
+  VarChild := Node.GetChild(1);
+  VarName := string(VarChild.Value);
+  VarReg := GetOrAllocateVariable(VarName);
+
+  // Emit GET# instruction: Dest=variable, Src1=handle
+  EmitInstruction(ssaGetFile, VarReg, HandleReg,
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessInputFile(Node: TASTNode);
+var
+  HandleVal, HandleReg, VarReg: TSSAValue;
+  HandleChild, VarChild: TASTNode;
+  VarName: string;
+  i: Integer;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { INPUT# handle, var1 [, var2 ...]
+    AST structure:
+      Child 0: Handle (antLiteral for numeric, antIdentifier for named)
+      Child 1+: Variables to store input
+
+    SSA encoding:
+      For each variable:
+        Dest = variable register
+        Src1 = handle register (int) }
+
+  // Need at least 2 children (handle and at least one variable)
+  if Node.ChildCount < 2 then Exit;
+
+  // Parse handle (first child)
+  HandleChild := Node.GetChild(0);
+  if HandleChild.NodeType = antLiteral then
+  begin
+    ProcessExpression(HandleChild, HandleVal);
+    HandleReg := EnsureIntRegister(HandleVal);
+  end
+  else if HandleChild.NodeType = antIdentifier then
+  begin
+    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+  begin
+    ProcessExpression(HandleChild, HandleVal);
+    HandleReg := EnsureIntRegister(HandleVal);
+  end;
+
+  // Process each variable (children 1+)
+  for i := 1 to Node.ChildCount - 1 do
+  begin
+    VarChild := Node.GetChild(i);
+    if VarChild.NodeType = antIdentifier then
+    begin
+      VarName := string(VarChild.Value);
+      VarReg := GetOrAllocateVariable(VarName);
+      // Emit INPUT# instruction for each variable
+      EmitInstruction(ssaInputFile, VarReg, HandleReg,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    // Skip separators and other nodes
+  end;
+end;
+
+procedure TSSAGenerator.ProcessPrintFile(Node: TASTNode);
+var
+  HandleVal, HandleReg, ExprVal, ExprReg: TSSAValue;
+  HandleChild, Child: TASTNode;
+  i: Integer;
+  SeparatorChar: string;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { PRINT# handle [, expr1 [; expr2 ...]]
+    AST structure:
+      Child 0: Handle (antLiteral for numeric, antIdentifier for named)
+      Child 1+: Expressions and separators (like PRINT)
+
+    SSA encoding:
+      Uses ssaPrintFile for expressions with handle in Src2 }
+
+  // Need at least 1 child (handle)
+  if Node.ChildCount < 1 then Exit;
+
+  // Parse handle (first child)
+  HandleChild := Node.GetChild(0);
+  if HandleChild.NodeType = antLiteral then
+  begin
+    ProcessExpression(HandleChild, HandleVal);
+    HandleReg := EnsureIntRegister(HandleVal);
+  end
+  else if HandleChild.NodeType = antIdentifier then
+  begin
+    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+  begin
+    ProcessExpression(HandleChild, HandleVal);
+    HandleReg := EnsureIntRegister(HandleVal);
+  end;
+
+  // If only handle (no expressions), this is PRINT# with no data
+  // Used to reset CMD redirection
+  if Node.ChildCount = 1 then
+  begin
+    EmitInstruction(ssaPrintFile, MakeSSAValue(svkNone), HandleReg,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+
+  // Process each expression (children 1+)
+  for i := 1 to Node.ChildCount - 1 do
+  begin
+    Child := Node.GetChild(i);
+
+    // Handle separator nodes
+    if Child.NodeType = antSeparator then
+    begin
+      SeparatorChar := VarToStr(Child.Value);
+      // For file output, separators are handled similarly to screen
+      // Comma = tab, Semicolon = no separator
+      if SeparatorChar = ',' then
+        EmitInstruction(ssaPrintComma, MakeSSAValue(svkNone),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      else if SeparatorChar = ';' then
+        EmitInstruction(ssaPrintSemicolon, MakeSSAValue(svkNone),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Continue;
+    end;
+
+    // Process expression
+    ProcessExpression(Child, ExprVal);
+
+    // Emit PRINT# instruction with expression value and handle
+    // The handle is passed in Src2 so the VM knows which file to write to
+    if ExprVal.Kind in [svkConstFloat, svkConstInt] then
+    begin
+      ExprReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+      EmitInstruction(ssaLoadConstFloat, ExprReg, ExprVal,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaPrintFile, ExprReg, HandleReg,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if ExprVal.Kind = svkConstString then
+    begin
+      ExprReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaLoadConstString, ExprReg, ExprVal,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaPrintFile, ExprReg, HandleReg,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+    begin
+      EmitInstruction(ssaPrintFile, ExprVal, HandleReg,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+  end;
+
+  // Check if we need a newline at the end
+  // If the last child is not a separator, add newline
+  if (Node.ChildCount > 1) and (Node.GetChild(Node.ChildCount - 1).NodeType <> antSeparator) then
+  begin
+    EmitInstruction(ssaPrintNewLine, MakeSSAValue(svkNone),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+procedure TSSAGenerator.ProcessCmd(Node: TASTNode);
+var
+  HandleVal, HandleReg, ExprVal, ExprReg: TSSAValue;
+  HandleChild, Child: TASTNode;
+  i: Integer;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { CMD handle [, expression]
+    AST structure:
+      Child 0: Handle (antLiteral for numeric, antIdentifier for named)
+      Child 1+: Optional expression(s) to print after redirection starts
+
+    SSA encoding:
+      Dest = none
+      Src1 = handle register (int)
+      Src2 = optional expression to print }
+
+  // Need at least 1 child (handle)
+  if Node.ChildCount < 1 then Exit;
+
+  // Parse handle (first child)
+  HandleChild := Node.GetChild(0);
+  if HandleChild.NodeType = antLiteral then
+  begin
+    ProcessExpression(HandleChild, HandleVal);
+    HandleReg := EnsureIntRegister(HandleVal);
+  end
+  else if HandleChild.NodeType = antIdentifier then
+  begin
+    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+  begin
+    ProcessExpression(HandleChild, HandleVal);
+    HandleReg := EnsureIntRegister(HandleVal);
+  end;
+
+  // Emit CMD instruction to redirect output
+  EmitInstruction(ssaCmd, MakeSSAValue(svkNone), HandleReg,
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // Process optional expressions (children 1+)
+  for i := 1 to Node.ChildCount - 1 do
+  begin
+    Child := Node.GetChild(i);
+
+    // Skip separators
+    if Child.NodeType = antSeparator then
+      Continue;
+
+    // Process expression and print it
+    ProcessExpression(Child, ExprVal);
+
+    // Emit print instruction for the expression
+    // CMD uses regular PRINT since output is already redirected
+    if ExprVal.Kind in [svkConstFloat, svkConstInt] then
+    begin
+      ExprReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+      EmitInstruction(ssaLoadConstFloat, ExprReg, ExprVal,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaPrint, ExprReg, MakeSSAValue(svkNone),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if ExprVal.Kind = svkConstString then
+    begin
+      ExprReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaLoadConstString, ExprReg, ExprVal,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaPrintString, ExprReg, MakeSSAValue(svkNone),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if ExprVal.RegType = srtString then
+    begin
+      EmitInstruction(ssaPrintString, ExprVal, MakeSSAValue(svkNone),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+    begin
+      EmitInstruction(ssaPrint, ExprVal, MakeSSAValue(svkNone),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+  end;
+end;
+
+// ============================================================================
+// SPRITE COMMANDS SSA GENERATION
+// ============================================================================
+
+procedure TSSAGenerator.ProcessSprite(Node: TASTNode);
+var
+  ParamVal, ParamReg: TSSAValue;
+  ParamRegs: array[0..6] of TSSAValue;
+  i, ParamCount: Integer;
+  Instr: TSSAInstruction;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { SPRITE n [,enabled] [,color] [,priority] [,scalex] [,scaley] [,mode]
+    AST structure:
+      Child 0: Sprite number (1-256)
+      Child 1: Enabled (0/1) - optional
+      Child 2: Color - optional
+      Child 3: Priority (0=front, 1=back) - optional
+      Child 4: ScaleX - optional
+      Child 5: ScaleY - optional
+      Child 6: Mode (0=normal, 1=multicolor) - optional
+
+    SSA encoding:
+      ssaSprite: Src1=spriteNum, Src2=enabled, Src3=color
+      Additional params via PhiSources: priority, scalex, scaley, mode }
+
+  ParamCount := Node.ChildCount;
+  if ParamCount < 1 then Exit;
+
+  // Initialize all params to none
+  for i := 0 to 6 do
+    ParamRegs[i] := MakeSSAValue(svkNone);
+
+  // Process each parameter
+  for i := 0 to ParamCount - 1 do
+  begin
+    if i > 6 then Break;
+    ProcessExpression(Node.GetChild(i), ParamVal);
+    if ParamVal.Kind in [svkConstFloat, svkConstInt] then
+    begin
+      ParamReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+      EmitInstruction(ssaLoadConstFloat, ParamReg, ParamVal,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      ParamRegs[i] := ParamReg;
+    end
+    else
+      ParamRegs[i] := ParamVal;
+  end;
+
+  // Emit ssaSprite: Src1=n, Src2=enabled, Src3=color
+  // Additional params via PhiSources
+  Instr := TSSAInstruction.Create(ssaSprite);
+  Instr.Dest := MakeSSAValue(svkNone);
+  Instr.Src1 := ParamRegs[0];  // sprite number
+  Instr.Src2 := ParamRegs[1];  // enabled
+  Instr.Src3 := ParamRegs[2];  // color
+  Instr.SourceLine := Node.SourceLine;
+  // Pack additional params as PhiSources
+  Instr.AddPhiSource(ParamRegs[3], nil);  // priority
+  Instr.AddPhiSource(ParamRegs[4], nil);  // scalex
+  Instr.AddPhiSource(ParamRegs[5], nil);  // scaley
+  Instr.AddPhiSource(ParamRegs[6], nil);  // mode
+  FCurrentBlock.AddInstruction(Instr);
+end;
+
+procedure TSSAGenerator.ProcessMovspr(Node: TASTNode);
+var
+  ParamVal, ParamReg: TSSAValue;
+  ParamRegs: array[0..2] of TSSAValue;
+  MovsprMode: Integer;
+  ModeStr: string;
+  i, ParamCount: Integer;
+  OpCode: TSSAOpCode;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { MOVSPR n, x, y        (absolute mode 0)
+    MOVSPR n, +x, +y      (relative mode 1)
+    MOVSPR n, dist;angle  (polar mode 2)
+    MOVSPR n, angle#speed (auto mode 3)
+
+    AST structure:
+      Child 0: Sprite number
+      Child 1: X / distance / angle
+      Child 2: Y / angle / speed
+      Attribute 'movspr_mode': '0', '1', '2', or '3'
+
+    SSA encoding:
+      ssaMovsprAbs: Src1=n, Src2=x, Src3=y
+      ssaMovsprRel: Src1=n, Src2=dx, Src3=dy
+      ssaMovsprPolar: Src1=n, Src2=dist, Src3=angle
+      ssaMovsprAuto: Src1=n, Src2=angle, Src3=speed }
+
+  ParamCount := Node.ChildCount;
+  if ParamCount < 3 then Exit;
+
+  // Get MOVSPR mode from attribute
+  ModeStr := Node.Attributes.Values['movspr_mode'];
+  if ModeStr = '' then ModeStr := '0';
+  MovsprMode := StrToIntDef(ModeStr, 0);
+
+  // Initialize params
+  for i := 0 to 2 do
+    ParamRegs[i] := MakeSSAValue(svkNone);
+
+  // Process each parameter
+  for i := 0 to 2 do
+  begin
+    if i >= ParamCount then Break;
+    ProcessExpression(Node.GetChild(i), ParamVal);
+    if ParamVal.Kind in [svkConstFloat, svkConstInt] then
+    begin
+      ParamReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+      EmitInstruction(ssaLoadConstFloat, ParamReg, ParamVal,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      ParamRegs[i] := ParamReg;
+    end
+    else
+      ParamRegs[i] := ParamVal;
+  end;
+
+  // Select opcode based on mode
+  case MovsprMode of
+    0: OpCode := ssaMovsprAbs;
+    1: OpCode := ssaMovsprRel;
+    2: OpCode := ssaMovsprPolar;
+    3: OpCode := ssaMovsprAuto;
+  else
+    OpCode := ssaMovsprAbs;
+  end;
+
+  EmitInstruction(OpCode, MakeSSAValue(svkNone),
+                 ParamRegs[0], ParamRegs[1], ParamRegs[2]);
+end;
+
+procedure TSSAGenerator.ProcessSprcolor(Node: TASTNode);
+var
+  MC1Val, MC2Val, MC1Reg, MC2Reg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { SPRCOLOR [mc1] [,mc2]
+    AST structure:
+      Child 0: Multicolor 1 - optional
+      Child 1: Multicolor 2 - optional
+
+    SSA encoding:
+      ssaSprcolor: Src1=mc1, Src2=mc2 }
+
+  MC1Reg := MakeSSAValue(svkNone);
+  MC2Reg := MakeSSAValue(svkNone);
+
+  if Node.ChildCount > 0 then
+  begin
+    ProcessExpression(Node.GetChild(0), MC1Val);
+    if MC1Val.Kind in [svkConstFloat, svkConstInt] then
+    begin
+      MC1Reg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+      EmitInstruction(ssaLoadConstFloat, MC1Reg, MC1Val,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+      MC1Reg := MC1Val;
+  end;
+
+  if Node.ChildCount > 1 then
+  begin
+    ProcessExpression(Node.GetChild(1), MC2Val);
+    if MC2Val.Kind in [svkConstFloat, svkConstInt] then
+    begin
+      MC2Reg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+      EmitInstruction(ssaLoadConstFloat, MC2Reg, MC2Val,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+      MC2Reg := MC2Val;
+  end;
+
+  EmitInstruction(ssaSprcolor, MakeSSAValue(svkNone),
+                 MC1Reg, MC2Reg, MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessSprsav(Node: TASTNode);
+var
+  SrcVal, DstVal, SrcReg, DstReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { SPRSAV source, dest
+    AST structure:
+      Child 0: Source (sprite number or string variable)
+      Child 1: Destination (string variable or sprite number)
+
+    SSA encoding:
+      ssaSprsav: Src1=source, Src2=dest }
+
+  if Node.ChildCount < 2 then Exit;
+
+  ProcessExpression(Node.GetChild(0), SrcVal);
+  ProcessExpression(Node.GetChild(1), DstVal);
+
+  // Ensure registers
+  if SrcVal.Kind in [svkConstFloat, svkConstInt] then
+  begin
+    SrcReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaLoadConstFloat, SrcReg, SrcVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+    SrcReg := SrcVal;
+
+  if DstVal.Kind in [svkConstFloat, svkConstInt] then
+  begin
+    DstReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaLoadConstFloat, DstReg, DstVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+    DstReg := DstVal;
+
+  EmitInstruction(ssaSprsav, MakeSSAValue(svkNone),
+                 SrcReg, DstReg, MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessCollision(Node: TASTNode);
+var
+  TypeVal, LineVal, TypeReg, LineReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { COLLISION type [,line]
+    AST structure:
+      Child 0: Collision type (1=sprite-sprite, 2=sprite-display)
+      Child 1: Line number for GOSUB - optional (0 to disable)
+
+    SSA encoding:
+      ssaCollision: Src1=type, Src2=line }
+
+  if Node.ChildCount < 1 then Exit;
+
+  ProcessExpression(Node.GetChild(0), TypeVal);
+  if TypeVal.Kind in [svkConstFloat, svkConstInt] then
+  begin
+    TypeReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, TypeReg, TypeVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+    TypeReg := TypeVal;
+
+  LineReg := MakeSSAValue(svkNone);
+  if Node.ChildCount > 1 then
+  begin
+    ProcessExpression(Node.GetChild(1), LineVal);
+    if LineVal.Kind in [svkConstFloat, svkConstInt] then
+    begin
+      LineReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, LineReg, LineVal,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+      LineReg := LineVal;
+  end;
+
+  EmitInstruction(ssaCollision, MakeSSAValue(svkNone),
+                 TypeReg, LineReg, MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessRun(Node: TASTNode);
+var
+  LineNumVal: TSSAValue;
+  ImmediateVal: Integer;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // RUN [linenum]
+  ImmediateVal := 0;  // Default: run from beginning
+  if Node.ChildCount > 0 then
+  begin
+    ProcessExpression(Node.GetChild(0), LineNumVal);
+    // If it's a constant integer, extract the value
+    if LineNumVal.Kind = svkConstInt then
+      ImmediateVal := LineNumVal.ConstInt;
+  end;
+
+  // RUN uses Immediate for line number
+  EmitInstruction(ssaRun, MakeSSAValue(svkNone), MakeSSAConstInt(ImmediateVal),
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessList(Node: TASTNode);
+var
+  RangeVal, RangeReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // LIST [start[-end]]
+  if Node.ChildCount > 0 then
+  begin
+    ProcessExpression(Node.GetChild(0), RangeVal);
+    RangeReg := EnsureStringRegister(RangeVal);
+  end
+  else
+  begin
+    RangeReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaLoadConstString, RangeReg, MakeSSAConstString(''),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  EmitInstruction(ssaList, MakeSSAValue(svkNone), RangeReg,
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessNew(Node: TASTNode);
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // NEW - no parameters
+  EmitInstruction(ssaNew, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessDelete(Node: TASTNode);
+var
+  StartVal, EndVal, StartReg, EndReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // DELETE [start[-end]]
+  // Parser provides: 0 children = delete nothing
+  //                  1 child = single line delete
+  //                  2 children = range delete (start, end)
+  // Special values: start=0 means "from beginning", end=-1 means "to end"
+
+  if Node.ChildCount = 0 then
+  begin
+    // No parameters - error or do nothing
+    StartReg := MakeSSAConstInt(0);
+    EndReg := MakeSSAConstInt(0);
+  end
+  else if Node.ChildCount = 1 then
+  begin
+    // Single line: DELETE 100
+    ProcessExpression(Node.GetChild(0), StartVal);
+    StartReg := EnsureIntRegister(StartVal);
+    EndReg := StartReg; // Same line for start and end
+  end
+  else
+  begin
+    // Range: DELETE 10-50 or DELETE -100 or DELETE 100-
+    ProcessExpression(Node.GetChild(0), StartVal);
+    StartReg := EnsureIntRegister(StartVal);
+    ProcessExpression(Node.GetChild(1), EndVal);
+    EndReg := EnsureIntRegister(EndVal);
+  end;
+
+  EmitInstruction(ssaDelete, MakeSSAValue(svkNone), StartReg, EndReg,
+                 MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessRenumber(Node: TASTNode);
+var
+  NewStartVal, IncrementVal, OldStartVal: TSSAValue;
+  NewStartReg, IncrementReg, OldStartReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // RENUMBER [new_start [,increment [,old_start]]]
+  // Defaults: new_start=10, increment=10, old_start=first line
+
+  // Parse new starting line number (default 10)
+  if Node.ChildCount > 0 then
+  begin
+    ProcessExpression(Node.GetChild(0), NewStartVal);
+    NewStartReg := EnsureIntRegister(NewStartVal);
+  end
+  else
+  begin
+    NewStartReg := MakeSSAConstInt(10);
+  end;
+
+  // Parse increment (default 10)
+  if Node.ChildCount > 1 then
+  begin
+    ProcessExpression(Node.GetChild(1), IncrementVal);
+    IncrementReg := EnsureIntRegister(IncrementVal);
+  end
+  else
+  begin
+    IncrementReg := MakeSSAConstInt(10);
+  end;
+
+  // Parse old starting line number (default 0 = first line)
+  if Node.ChildCount > 2 then
+  begin
+    ProcessExpression(Node.GetChild(2), OldStartVal);
+    OldStartReg := EnsureIntRegister(OldStartVal);
+  end
+  else
+  begin
+    OldStartReg := MakeSSAConstInt(0);
+  end;
+
+  EmitInstruction(ssaRenumber, MakeSSAValue(svkNone), NewStartReg, IncrementReg,
+                 OldStartReg);
+end;
+
+procedure TSSAGenerator.ProcessCatalog(Node: TASTNode);
+var
+  PathVal, PathReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // CATALOG/DIR [path]
+  if Node.ChildCount > 0 then
+  begin
+    ProcessExpression(Node.GetChild(0), PathVal);
+    PathReg := EnsureStringRegister(PathVal);
+  end
+  else
+  begin
+    PathReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaLoadConstString, PathReg, MakeSSAConstString(''),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  EmitInstruction(ssaCatalog, MakeSSAValue(svkNone), PathReg,
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessCopyFile(Node: TASTNode);
+var
+  SrcVal, DstVal, OverwriteVal: TSSAValue;
+  SrcReg, DstReg, OverwriteReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // COPY "src", "dest" [, overwrite]
+  // Minimum 2 parameters: source and destination
+  if Node.ChildCount < 2 then
+  begin
+    raise Exception.Create('COPY requires source and destination parameters');
+  end;
+
+  // Process source path
+  ProcessExpression(Node.GetChild(0), SrcVal);
+  SrcReg := EnsureStringRegister(SrcVal);
+
+  // Process destination path
+  ProcessExpression(Node.GetChild(1), DstVal);
+  DstReg := EnsureStringRegister(DstVal);
+
+  // Process optional overwrite flag (default 0)
+  if Node.ChildCount > 2 then
+  begin
+    ProcessExpression(Node.GetChild(2), OverwriteVal);
+    OverwriteReg := EnsureIntRegister(OverwriteVal);
+  end
+  else
+  begin
+    OverwriteReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, OverwriteReg, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  EmitInstruction(ssaCopyFile, MakeSSAValue(svkNone), SrcReg, DstReg, OverwriteReg);
+end;
+
+procedure TSSAGenerator.ProcessScratch(Node: TASTNode);
+var
+  PatternVal, ForceVal: TSSAValue;
+  PatternReg, ForceReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // SCRATCH "pattern" [, force]
+  if Node.ChildCount < 1 then
+  begin
+    raise Exception.Create('SCRATCH requires a file pattern');
+  end;
+
+  // Process pattern
+  ProcessExpression(Node.GetChild(0), PatternVal);
+  PatternReg := EnsureStringRegister(PatternVal);
+
+  // Process optional force flag (default 0)
+  if Node.ChildCount > 1 then
+  begin
+    ProcessExpression(Node.GetChild(1), ForceVal);
+    ForceReg := EnsureIntRegister(ForceVal);
+  end
+  else
+  begin
+    ForceReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, ForceReg, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  EmitInstruction(ssaScratch, MakeSSAValue(svkNone), PatternReg, ForceReg,
+                 MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessRenameFile(Node: TASTNode);
+var
+  OldVal, NewVal: TSSAValue;
+  OldReg, NewReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // RENAME "old", "new"
+  if Node.ChildCount < 2 then
+  begin
+    raise Exception.Create('RENAME requires old and new filename');
+  end;
+
+  // Process old name
+  ProcessExpression(Node.GetChild(0), OldVal);
+  OldReg := EnsureStringRegister(OldVal);
+
+  // Process new name
+  ProcessExpression(Node.GetChild(1), NewVal);
+  NewReg := EnsureStringRegister(NewVal);
+
+  EmitInstruction(ssaRenameFile, MakeSSAValue(svkNone), OldReg, NewReg,
+                 MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessConcat(Node: TASTNode);
+var
+  SrcVal, DstVal: TSSAValue;
+  SrcReg, DstReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // CONCAT "src", "dest"
+  if Node.ChildCount < 2 then
+  begin
+    raise Exception.Create('CONCAT requires source and destination');
+  end;
+
+  // Process source path
+  ProcessExpression(Node.GetChild(0), SrcVal);
+  SrcReg := EnsureStringRegister(SrcVal);
+
+  // Process destination path
+  ProcessExpression(Node.GetChild(1), DstVal);
+  DstReg := EnsureStringRegister(DstVal);
+
+  EmitInstruction(ssaConcat, MakeSSAValue(svkNone), SrcReg, DstReg,
+                 MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessMkdir(Node: TASTNode);
+var
+  PathVal: TSSAValue;
+  PathReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // MKDIR "path"
+  if Node.ChildCount < 1 then
+  begin
+    raise Exception.Create('MKDIR requires a path');
+  end;
+
+  ProcessExpression(Node.GetChild(0), PathVal);
+  PathReg := EnsureStringRegister(PathVal);
+
+  EmitInstruction(ssaMkdir, MakeSSAValue(svkNone), PathReg,
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessChdir(Node: TASTNode);
+var
+  PathVal: TSSAValue;
+  PathReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // CHDIR "path"
+  if Node.ChildCount < 1 then
+  begin
+    raise Exception.Create('CHDIR requires a path');
+  end;
+
+  ProcessExpression(Node.GetChild(0), PathVal);
+  PathReg := EnsureStringRegister(PathVal);
+
+  EmitInstruction(ssaChdir, MakeSSAValue(svkNone), PathReg,
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessMoveFile(Node: TASTNode);
+var
+  SrcVal, DstVal: TSSAValue;
+  SrcReg, DstReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // MOVE "src", "dest"
+  if Node.ChildCount < 2 then
+  begin
+    raise Exception.Create('MOVE requires source and destination');
+  end;
+
+  // Process source path
+  ProcessExpression(Node.GetChild(0), SrcVal);
+  SrcReg := EnsureStringRegister(SrcVal);
+
+  // Process destination path
+  ProcessExpression(Node.GetChild(1), DstVal);
+  DstReg := EnsureStringRegister(DstVal);
+
+  EmitInstruction(ssaMoveFile, MakeSSAValue(svkNone), SrcReg, DstReg,
+                 MakeSSAValue(svkNone));
+end;
+
 { PHASE 3 TIER 3: Fix forward GOTO/GOSUB references and RETURN edges }
 procedure TSSAGenerator.FixForwardReferences;
 var
@@ -3236,6 +6378,8 @@ var
   i: Integer;
   PrevBlock, NewBlock: TSSABasicBlock;  // PHASE 3 TIER 3: CFG construction
   SecondsVal: TSSAValue;  // For SLEEP command
+  KeyNumVal, KeyTextVal, KeyNumReg, KeyTextReg: TSSAValue;  // For KEY command
+  ExprResult, LineNumReg: TSSAValue;  // For TRAP command
 begin
   if Node = nil then Exit;
 
@@ -3267,28 +6411,34 @@ begin
   case Node.NodeType of
     antLineNumber:
     begin
-      // When we encounter a line number node, create a new block for it
+      // When we encounter a line number node, check if block was already created
+      // by the parent antStatement processing (at lines 3671-3693)
       LineNum := Integer(Node.Value);
       LabelName := 'LINE_' + IntToStr(LineNum);
 
       // Track current line number for error reporting
       FCurrentLineNumber := LineNum;
 
-      // PHASE 3 TIER 3: Save previous block before creating new one
-      PrevBlock := FCurrentBlock;
-
-      FCurrentBlock := FProgram.CreateBlock(LabelName);
-      NewBlock := FCurrentBlock;
-
-      // PHASE 3 TIER 3: Add fall-through edge PrevBlock → NewBlock
-      if Assigned(PrevBlock) and Assigned(NewBlock) and (PrevBlock <> NewBlock) then
+      // Only create a new block if we're not already in a block with this label
+      // (The parent antStatement may have already created it)
+      if not Assigned(FCurrentBlock) or (FCurrentBlock.LabelName <> LabelName) then
       begin
-        PrevBlock.AddSuccessor(NewBlock);
-        NewBlock.AddPredecessor(PrevBlock);
-        {$IFDEF DEBUG_SSA}
-        if DebugSSA then
-          WriteLn('[SSA] Edge: ', PrevBlock.LabelName, ' → ', NewBlock.LabelName, ' (fall-through)');
-        {$ENDIF}
+        // PHASE 3 TIER 3: Save previous block before creating new one
+        PrevBlock := FCurrentBlock;
+
+        FCurrentBlock := FProgram.CreateBlock(LabelName);
+        NewBlock := FCurrentBlock;
+
+        // PHASE 3 TIER 3: Add fall-through edge PrevBlock → NewBlock
+        if Assigned(PrevBlock) and Assigned(NewBlock) and (PrevBlock <> NewBlock) then
+        begin
+          PrevBlock.AddSuccessor(NewBlock);
+          NewBlock.AddPredecessor(PrevBlock);
+          {$IFDEF DEBUG_SSA}
+          if DebugSSA then
+            WriteLn('[SSA] Edge: ', PrevBlock.LabelName, ' → ', NewBlock.LabelName, ' (fall-through)');
+          {$ENDIF}
+        end;
       end;
     end;
     antAssignment: ProcessAssignment(Node);
@@ -3302,7 +6452,10 @@ begin
     antPrint: ProcessPrint(Node);
     antInput: ProcessInput(Node);
     antDim: ProcessDim(Node);
+    antDef: ProcessDefFn(Node);
     antForLoop: ProcessForLoop(Node);
+    antDoLoop: ProcessDoLoop(Node);
+    antBlock: ProcessBlock(Node);
     antNext: ProcessNext(Node);
     antIf: ProcessIfStatement(Node);
     antGoto: ProcessGoto(Node);
@@ -3313,6 +6466,21 @@ begin
     antLocate: ProcessLocate(Node);
     antGraphics: ProcessGraphics(Node);
     antScnClr: ProcessScnClr(Node);
+    antColor: ProcessColor(Node);
+    antWidth: ProcessWidth(Node);
+    antScale: ProcessScale(Node);
+    antPaint: ProcessPaint(Node);
+    antWindow: ProcessWindow(Node);
+    antSShape: ProcessSShape(Node);
+    antGShape: ProcessGShape(Node);
+    antGList: ProcessGList(Node);
+    // Sound commands
+    antVol: ProcessVol(Node);
+    antSound: ProcessSound(Node);
+    antEnvelope: ProcessEnvelope(Node);
+    antTempo: ProcessTempo(Node);
+    antPlay: ProcessPlay(Node);
+    antFilter: ProcessFilter(Node);
     antReturn:
     begin
       EmitInstruction(ssaReturn, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
@@ -3325,6 +6493,13 @@ begin
       EmitInstruction(ssaEnd, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       // PHASE 3 TIER 3: END terminates the current block - no fall-through
+      FCurrentBlock := nil;
+    end;
+    antStop:
+    begin
+      EmitInstruction(ssaStop, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // PHASE 3 TIER 3: STOP terminates the current block - no fall-through
       FCurrentBlock := nil;
     end;
     antFast:
@@ -3353,6 +6528,133 @@ begin
         EmitInstruction(ssaSleep, MakeSSAValue(svkNone), MakeSSAConstInt(1),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
+    end;
+    antKey:
+    begin
+      // KEY [n, "text"] - define or list function keys
+      // No children = list all keys
+      // Child[0] = key number, Child[1] = key text
+      if Node.ChildCount >= 2 then
+      begin
+        // KEY n, "text" - define key
+        ProcessExpression(Node.GetChild(0), KeyNumVal);
+        ProcessExpression(Node.GetChild(1), KeyTextVal);
+        KeyNumReg := EnsureIntRegister(KeyNumVal);
+        KeyTextReg := EnsureStringRegister(KeyTextVal);
+        EmitInstruction(ssaKey, MakeSSAValue(svkNone), KeyNumReg, KeyTextReg, MakeSSAValue(svkNone));
+      end
+      else if Node.ChildCount = 1 then
+      begin
+        // KEY n - clear key definition
+        ProcessExpression(Node.GetChild(0), KeyNumVal);
+        KeyNumReg := EnsureIntRegister(KeyNumVal);
+        EmitInstruction(ssaKey, MakeSSAValue(svkNone), KeyNumReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+      begin
+        // KEY - list all keys (use -1 to indicate list mode)
+        EmitInstruction(ssaKey, MakeSSAValue(svkNone), MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+    end;
+    // Debug/Trace - these are RUNTIME instructions that switch between RunFast and RunDebug
+    // TRON switches to RunDebug (trace mode with line numbers)
+    // TROFF switches to RunFast (pure speed, no trace)
+    antTron:
+    begin
+      WriteLn('[SSA] DEBUG: Processing antTron at line ', FCurrentLineNumber);
+      EmitInstruction(ssaTron, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    antTroff:
+    begin
+      EmitInstruction(ssaTroff, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    // Error handling
+    antTrap:
+    begin
+      // TRAP linenum - set error handler line
+      // Child[0] = line number expression
+      if Node.ChildCount >= 1 then
+      begin
+        ProcessExpression(Node.GetChild(0), ExprResult);
+        LineNumReg := EnsureIntRegister(ExprResult);
+        EmitInstruction(ssaTrap, MakeSSAValue(svkNone), LineNumReg,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+      begin
+        // TRAP without line number - disable error handler
+        EmitInstruction(ssaTrap, MakeSSAValue(svkNone), MakeSSAConstInt(0),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+    end;
+    antResume:
+    begin
+      // RESUME - continue at error line
+      EmitInstruction(ssaResume, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    antResumeNext:
+    begin
+      // RESUME NEXT - continue at next statement after error
+      EmitInstruction(ssaResumeNext, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    // DATA/READ/RESTORE
+    antData: ProcessData(Node);
+    antRead: ProcessRead(Node);
+    antRestore: ProcessRestore(Node);
+    // Input commands
+    antGet: ProcessGet(Node);
+    antGetkey: ProcessGetkey(Node);
+    // Formatted output
+    antPrintUsing: ProcessPrintUsing(Node);
+    antPudef: ProcessPudef(Node);
+    antChar: ProcessChar(Node);
+    // File operations
+    antLoad: ProcessLoad(Node);
+    antSave: ProcessSave(Node);
+    antVerify: ProcessVerify(Node);
+    antBload: ProcessBload(Node);
+    antBsave: ProcessBsave(Node);
+    antBoot: ProcessBoot(Node);
+    // Disk file I/O
+    antDopen: ProcessDopen(Node);
+    antDclose: ProcessDclose(Node);
+    antOpen: ProcessDopen(Node);   // OPEN is alias for DOPEN
+    antClose: ProcessDclose(Node); // CLOSE is alias for DCLOSE
+    // File data I/O
+    antGetFile: ProcessGetFile(Node);
+    antInputFile: ProcessInputFile(Node);
+    antPrintFile: ProcessPrintFile(Node);
+    antCmd: ProcessCmd(Node);
+    // Sprite commands
+    antSprite: ProcessSprite(Node);
+    antMovspr: ProcessMovspr(Node);
+    antSprcolor: ProcessSprcolor(Node);
+    antSprsav: ProcessSprsav(Node);
+    antCollision: ProcessCollision(Node);
+    // System commands
+    antRun: ProcessRun(Node);
+    antList: ProcessList(Node);
+    antNew: ProcessNew(Node);
+    antDelete: ProcessDelete(Node);
+    antRenumber: ProcessRenumber(Node);
+    antCatalog: ProcessCatalog(Node);
+    // File management commands
+    antCopy: ProcessCopyFile(Node);
+    antScratch: ProcessScratch(Node);
+    antRenameFile: ProcessRenameFile(Node);
+    antConcat: ProcessConcat(Node);
+    antMkdir: ProcessMkdir(Node);
+    antChdir: ProcessChdir(Node);
+    antMove: ProcessMoveFile(Node);
+    antClear:
+    begin
+      // CLR - clear all variables
+      EmitInstruction(ssaClear, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
     antProgram, antStatement, antThen, antElse:
     begin
@@ -3503,6 +6805,102 @@ begin
     // For other kinds, return as-is
     Result := Val;
   end;
+end;
+
+function TSSAGenerator.EnsureFloatRegister(const Val: TSSAValue): TSSAValue;
+var
+  TempReg: Integer;
+  IntReg: Integer;
+  IntRegVal: TSSAValue;
+begin
+  // Ensure value is in a float register
+  case Val.Kind of
+    svkConstFloat:
+    begin
+      // Load constant into float register
+      TempReg := FProgram.AllocRegister(srtFloat);
+      Result := MakeSSARegister(srtFloat, TempReg);
+      EmitInstruction(ssaLoadConstFloat, Result, Val, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    svkConstInt:
+    begin
+      // Convert int constant to float: load int, then convert
+      IntReg := FProgram.AllocRegister(srtInt);
+      IntRegVal := MakeSSARegister(srtInt, IntReg);
+      EmitInstruction(ssaLoadConstInt, IntRegVal, Val, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      TempReg := FProgram.AllocRegister(srtFloat);
+      Result := MakeSSARegister(srtFloat, TempReg);
+      EmitInstruction(ssaIntToFloat, Result, IntRegVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    svkRegister:
+    begin
+      if Val.RegType = srtFloat then
+        // Already a float register
+        Result := Val
+      else if Val.RegType = srtInt then
+      begin
+        // Convert int register to float
+        TempReg := FProgram.AllocRegister(srtFloat);
+        Result := MakeSSARegister(srtFloat, TempReg);
+        EmitInstruction(ssaIntToFloat, Result, Val, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+        // String or other - return as-is (will likely cause error later)
+        Result := Val;
+    end;
+  else
+    // For other kinds, return as-is
+    Result := Val;
+  end;
+end;
+
+function TSSAGenerator.EnsureStringRegister(const Val: TSSAValue): TSSAValue;
+var
+  TempReg: Integer;
+begin
+  // Ensure value is in a string register
+  case Val.Kind of
+    svkConstString:
+    begin
+      // Load constant into string register
+      TempReg := FProgram.AllocRegister(srtString);
+      Result := MakeSSARegister(srtString, TempReg);
+      EmitInstruction(ssaLoadConstString, Result, Val, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    svkRegister:
+    begin
+      if Val.RegType = srtString then
+        // Already a string register
+        Result := Val
+      else if Val.RegType = srtFloat then
+      begin
+        // Convert float to string using STR$
+        TempReg := FProgram.AllocRegister(srtString);
+        Result := MakeSSARegister(srtString, TempReg);
+        EmitInstruction(ssaFloatToString, Result, Val, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if Val.RegType = srtInt then
+      begin
+        // Convert int to string using IntToString
+        TempReg := FProgram.AllocRegister(srtString);
+        Result := MakeSSARegister(srtString, TempReg);
+        EmitInstruction(ssaIntToString, Result, Val, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+        // Return as-is
+        Result := Val;
+    end;
+  else
+    // For other kinds, return as-is
+    Result := Val;
+  end;
+end;
+
+procedure TSSAGenerator.EmitInstructionWithImmediate(Op: TSSAOpCode; const Dest, Src1, Src2: TSSAValue; ImmediateValue: Int64);
+begin
+  // Create instruction with immediate value passed in Src3 as a constant integer
+  // This is used for functions like MID$ (length) and INSTR (start position)
+  EmitInstruction(Op, Dest, Src1, Src2, MakeSSAConstInt(ImmediateValue));
 end;
 
 end.

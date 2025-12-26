@@ -146,8 +146,8 @@ begin
       end;
     end;
 
-    // Also check for superinstruction branch opcodes (100+)
-    if Instr.OpCode >= 110 then
+    // Also check for superinstruction branch opcodes
+    if Instr.OpCode >= bcGroupSuper then
     begin
       // Superinstruction branches use Immediate for target
       Target := Instr.Immediate;
@@ -170,7 +170,7 @@ var
   NopInstr: TBytecodeInstruction;
 begin
   FillChar(NopInstr, SizeOf(NopInstr), 0);
-  NopInstr.OpCode := Byte(bcNop);
+  NopInstr.OpCode := bcNop;
   FProgram.SetInstruction(Index, NopInstr);
 end;
 

@@ -64,186 +64,278 @@ end;
 
 procedure TBytecodeDisassembler.DisassembleInstruction(Index: Integer; const Instr: TBytecodeInstruction);
 var
-  Op: TBytecodeOp;
+  Group: Word;
+  SubOp: Word;
   Line: string;
 begin
-  // Handle superinstructions (opcodes 100+) separately to avoid enum range issues
-  if Instr.OpCode >= 110 then
-  begin
-    case Instr.OpCode of
-      // Fused compare-and-branch (Int) - opcodes 100-105
-      100: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchEqInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      101: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchNeInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      102: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchLtInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      103: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchGtInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      104: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchLeInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      105: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchGeInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      // Fused compare-and-branch (Float) - opcodes 110-115
-      110: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchEqFloat', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      111: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchNeFloat', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      112: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchLtFloat', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      113: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchGtFloat', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      114: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchLeFloat', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      115: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchGeFloat', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      // Fused arithmetic-to-dest (Int) - opcodes 120-122
-      120: Line := Format('%4d: %-20s R%d, R%d', [Index, 'AddIntTo', Instr.Dest, Instr.Src1]);
-      121: Line := Format('%4d: %-20s R%d, R%d', [Index, 'SubIntTo', Instr.Dest, Instr.Src1]);
-      122: Line := Format('%4d: %-20s R%d, R%d', [Index, 'MulIntTo', Instr.Dest, Instr.Src1]);
-      // Fused arithmetic-to-dest (Float) - opcodes 130-133
-      130: Line := Format('%4d: %-20s R%d, R%d', [Index, 'AddFloatTo', Instr.Dest, Instr.Src1]);
-      131: Line := Format('%4d: %-20s R%d, R%d', [Index, 'SubFloatTo', Instr.Dest, Instr.Src1]);
-      132: Line := Format('%4d: %-20s R%d, R%d', [Index, 'MulFloatTo', Instr.Dest, Instr.Src1]);
-      133: Line := Format('%4d: %-20s R%d, R%d', [Index, 'DivFloatTo', Instr.Dest, Instr.Src1]);
-      // Fused constant arithmetic (Int) - opcodes 140-142
-      140: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'AddIntConst', Instr.Dest, Instr.Src1, Instr.Immediate]);
-      141: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'SubIntConst', Instr.Dest, Instr.Src1, Instr.Immediate]);
-      142: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'MulIntConst', Instr.Dest, Instr.Src1, Instr.Immediate]);
-      // Fused constant arithmetic (Float) - opcodes 150-153
-      150: Line := Format('%4d: %-20s R%d, R%d, %f', [Index, 'AddFloatConst', Instr.Dest, Instr.Src1, Double(Pointer(@Instr.Immediate)^)]);
-      151: Line := Format('%4d: %-20s R%d, R%d, %f', [Index, 'SubFloatConst', Instr.Dest, Instr.Src1, Double(Pointer(@Instr.Immediate)^)]);
-      152: Line := Format('%4d: %-20s R%d, R%d, %f', [Index, 'MulFloatConst', Instr.Dest, Instr.Src1, Double(Pointer(@Instr.Immediate)^)]);
-      153: Line := Format('%4d: %-20s R%d, R%d, %f', [Index, 'DivFloatConst', Instr.Dest, Instr.Src1, Double(Pointer(@Instr.Immediate)^)]);
-      // Fused compare-zero-and-branch (Int) - opcodes 160-161
-      160: Line := Format('%4d: %-20s R%d, %d', [Index, 'BranchEqZeroInt', Instr.Src1, Instr.Immediate]);
-      161: Line := Format('%4d: %-20s R%d, %d', [Index, 'BranchNeZeroInt', Instr.Src1, Instr.Immediate]);
-      // Fused compare-zero-and-branch (Float) - opcodes 170-171
-      170: Line := Format('%4d: %-20s R%d, %d', [Index, 'BranchEqZeroFlt', Instr.Src1, Instr.Immediate]);
-      171: Line := Format('%4d: %-20s R%d, %d', [Index, 'BranchNeZeroFlt', Instr.Src1, Instr.Immediate]);
-      // Fused array-store-constant - opcodes 180-182
-      180: Line := Format('%4d: %-20s ARR[%d], idx=IntR%d, %d', [Index, 'ArrayStoreIntConst', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      181: Line := Format('%4d: %-20s ARR[%d], idx=IntR%d, %f', [Index, 'ArrayStoreFltConst', Instr.Src1, Instr.Src2, Double(Pointer(@Instr.Immediate)^)]);
-      182: Line := Format('%4d: %-20s ARR[%d], idx=IntR%d, [%d]', [Index, 'ArrayStoreStrConst', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      // Fused loop increment-and-branch - opcodes 190-193
-      190: Line := Format('%4d: %-20s R%d, R%d, R%d, %d', [Index, 'AddIntToBranchLe', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-      191: Line := Format('%4d: %-20s R%d, R%d, R%d, %d', [Index, 'AddIntToBranchLt', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-      192: Line := Format('%4d: %-20s R%d, R%d, R%d, %d', [Index, 'SubIntToBranchGe', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-      193: Line := Format('%4d: %-20s R%d, R%d, R%d, %d', [Index, 'SubIntToBranchGt', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-      // FMA (Fused Multiply-Add) - opcodes 200-203
-      200: Line := Format('%4d: %-20s R%d, R%d, R%d, R%d', [Index, 'MulAddFloat', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-      201: Line := Format('%4d: %-20s R%d, R%d, R%d, R%d', [Index, 'MulSubFloat', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-      202: Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'MulAddToFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
-      203: Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'MulSubToFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
-      // Array Load + Arithmetic - opcodes 210-212
-      210: Line := Format('%4d: %-20s R%d, ARR[%d], idx=R%d, acc=R%d', [Index, 'ArrayLoadAddFloat', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-      211: Line := Format('%4d: %-20s R%d, ARR[%d], idx=R%d, acc=R%d', [Index, 'ArrayLoadSubFloat', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-      212: Line := Format('%4d: %-20s R%d, ARR[%d], idx=R%d, acc=R%d, denom=R%d', [Index, 'ArrayLoadDivAddFlt', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate and $FFFF, (Instr.Immediate shr 16) and $FFFF]);
-      // Square-Sum patterns - opcodes 220-221
-      220: Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'SquareSumFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
-      221: Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'AddSquareFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
-      // Mul-Mul and Add-Sqrt - opcodes 230-231
-      230: Line := Format('%4d: %-20s R%d, R%d, R%d, R%d', [Index, 'MulMulFloat', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-      231: Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'AddSqrtFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
-      // Array Load + Branch - opcodes 240-241
-      240: Line := Format('%4d: %-20s ARR[%d], idx=R%d, %d', [Index, 'ArrayLoadIntBrNZ', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      241: Line := Format('%4d: %-20s ARR[%d], idx=R%d, %d', [Index, 'ArrayLoadIntBrZ', Instr.Src1, Instr.Src2, Instr.Immediate]);
-      // Array Swap (Int) - opcode 250
-      250: Line := Format('%4d: %-20s ARR[%d], idx1=R%d, idx2=R%d', [Index, 'ArraySwapInt', Instr.Src1, Instr.Src2, Instr.Dest]);
-      // Self-increment/decrement (Int) - opcodes 251-252
-      251: Line := Format('%4d: %-20s R%d, R%d', [Index, 'AddIntSelf', Instr.Dest, Instr.Src1]);
-      252: Line := Format('%4d: %-20s R%d, R%d', [Index, 'SubIntSelf', Instr.Dest, Instr.Src1]);
-      // Array Load to register (Int) - opcode 253
-      253: Line := Format('%4d: %-20s R%d, ARR[%d], idx=R%d', [Index, 'ArrayLoadIntTo', Instr.Dest, Instr.Src1, Instr.Src2]);
-      // Array Copy Element - opcode 254: arr_dest[idx] = arr_src[idx]
-      254: Line := Format('%4d: %-20s ARR[%d][R%d] = ARR[%d][R%d]', [Index, 'ArrayCopyElement', Instr.Dest, Instr.Src2, Instr.Src1, Instr.Src2]);
-      // Array Move Element - opcode 255: arr[dest_idx] = arr[src_idx]
-      255: Line := Format('%4d: %-20s ARR[%d][R%d] = ARR[%d][R%d]', [Index, 'ArrayMoveElement', Instr.Dest, Instr.Src2, Instr.Dest, Instr.Src1]);
-      // Array Reverse Range - opcode 156: reverse arr[start..end-1]
-      156: Line := Format('%4d: %-20s ARR[%d], R%d..R%d', [Index, 'ArrayReverseRange', Instr.Src1, Instr.Src2, Instr.Dest]);
-      // Array Shift Left - opcode 157: shift left arr[start..end]
-      157: Line := Format('%4d: %-20s ARR[%d], R%d..R%d', [Index, 'ArrayShiftLeft', Instr.Src1, Instr.Src2, Instr.Dest]);
-    else
-      Line := Format('%4d: (unknown superinstr opcode %d)', [Index, Instr.OpCode]);
-    end;
-    FOutput.Add(Line);
-    Exit;
-  end;
+  // Two-level dispatch based on opcode groups (high byte)
+  Group := Instr.OpCode shr 8;
+  SubOp := Instr.OpCode and $FF;
 
-  Op := TBytecodeOp(Instr.OpCode);
-  Line := Format('%4d: %-20s', [Index, BytecodeOpToString(Op)]);
-
-  case Op of
+  case Instr.OpCode of
+    // === GROUP 0: CORE VM OPERATIONS (0x00xx) ===
     bcLoadConstInt:
-      Line := Line + Format('R%d, %d', [Instr.Dest, Instr.Immediate]);
-
+      Line := Format('%4d: %-20s R%d, %d', [Index, 'LoadConstInt', Instr.Dest, Instr.Immediate]);
     bcLoadConstFloat:
-      Line := Line + Format('R%d, %f', [Instr.Dest, Double(Pointer(@Instr.Immediate)^)]);
-
+      Line := Format('%4d: %-20s R%d, %.2f', [Index, 'LoadConstFloat', Instr.Dest, Double(Pointer(@Instr.Immediate)^)]);
     bcLoadConstString:
-      Line := Line + Format('R%d, [%d]', [Instr.Dest, Instr.Immediate]);
-
-    bcCopyInt, bcCopyFloat, bcCopyString:
-      Line := Line + Format('R%d, R%d', [Instr.Dest, Instr.Src1]);
-
-    bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt,
-    bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcPowFloat:
-      Line := Line + Format('R%d, R%d, R%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
-
-    bcNegInt, bcNegFloat:
-      Line := Line + Format('R%d, R%d', [Instr.Dest, Instr.Src1]);
-
-    bcIntToFloat, bcFloatToInt:
-      Line := Line + Format('R%d, R%d', [Instr.Dest, Instr.Src1]);
-
-    // Comparison operators
-    bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
-    bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpGtFloat, bcCmpLeFloat, bcCmpGeFloat,
+      Line := Format('%4d: %-20s R%d, [%d]', [Index, 'LoadConstString', Instr.Dest, Instr.Immediate]);
+    bcCopyInt:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'CopyInt', Instr.Dest, Instr.Src1]);
+    bcCopyFloat:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'CopyFloat', Instr.Dest, Instr.Src1]);
+    bcCopyString:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'CopyString', Instr.Dest, Instr.Src1]);
+    bcLoadVar:
+      Line := Format('%4d: %-20s R%d, var[%d]', [Index, 'LoadVar', Instr.Dest, Instr.Immediate]);
+    bcStoreVar:
+      Line := Format('%4d: %-20s var[%d], R%d', [Index, 'StoreVar', Instr.Immediate, Instr.Src1]);
+    bcAddInt:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'AddInt', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcSubInt:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'SubInt', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcMulInt:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'MulInt', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcDivInt:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'DivInt', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcModInt:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'ModInt', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcNegInt:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'NegInt', Instr.Dest, Instr.Src1]);
+    bcAddFloat:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'AddFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcSubFloat:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'SubFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcMulFloat:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'MulFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcDivFloat:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'DivFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcPowFloat:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'PowFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcNegFloat:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'NegFloat', Instr.Dest, Instr.Src1]);
+    bcIntToFloat:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'IntToFloat', Instr.Dest, Instr.Src1]);
+    bcFloatToInt:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'FloatToInt', Instr.Dest, Instr.Src1]);
+    bcIntToString:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'IntToString', Instr.Dest, Instr.Src1]);
+    bcFloatToString:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'FloatToString', Instr.Dest, Instr.Src1]);
+    bcStringToInt:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'StringToInt', Instr.Dest, Instr.Src1]);
+    bcStringToFloat:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'StringToFloat', Instr.Dest, Instr.Src1]);
+    bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'CmpInt', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpGtFloat, bcCmpLeFloat, bcCmpGeFloat:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'CmpFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString:
-      Line := Line + Format('R%d, R%d, R%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'CmpString', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcLogicalAnd:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'LogicalAnd', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcLogicalOr:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'LogicalOr', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcLogicalXor:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'LogicalXor', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcLogicalNot:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'LogicalNot', Instr.Dest, Instr.Src1]);
+    bcJump:
+      Line := Format('%4d: %-20s %d', [Index, 'Jump', Instr.Immediate]);
+    bcJumpIfZero:
+      Line := Format('%4d: %-20s R%d, %d', [Index, 'JumpIfZero', Instr.Src1, Instr.Immediate]);
+    bcJumpIfNotZero:
+      Line := Format('%4d: %-20s R%d, %d', [Index, 'JumpIfNotZero', Instr.Src1, Instr.Immediate]);
+    bcCall:
+      Line := Format('%4d: %-20s %d', [Index, 'Call', Instr.Immediate]);
+    bcReturn:
+      Line := Format('%4d: %-20s', [Index, 'Return']);
+    bcEnd:
+      Line := Format('%4d: %-20s', [Index, 'End']);
+    bcStop:
+      Line := Format('%4d: %-20s', [Index, 'Stop']);
+    bcFast:
+      Line := Format('%4d: %-20s', [Index, 'Fast']);
+    bcSlow:
+      Line := Format('%4d: %-20s', [Index, 'Slow']);
+    bcSleep:
+      Line := Format('%4d: %-20s %d', [Index, 'Sleep', Instr.Immediate]);
+    bcNop:
+      Line := Format('%4d: %-20s', [Index, 'Nop']);
 
-    // Math functions
-    bcMathAbs, bcMathSgn, bcMathInt, bcMathSqr,
-    bcMathSin, bcMathCos, bcMathTan, bcMathExp, bcMathLog:
-      Line := Line + Format('R%d, R%d', [Instr.Dest, Instr.Src1]);
+    // === GROUP 1: STRING OPERATIONS (0x01xx) ===
+    bcStrConcat:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrConcat', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcStrLen:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'StrLen', Instr.Dest, Instr.Src1]);
+    bcStrLeft:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrLeft', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcStrRight:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrRight', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcStrMid:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrMid', Instr.Dest, Instr.Src1, Instr.Src2]);
 
+    // === GROUP 2: MATH FUNCTIONS (0x02xx) ===
+    bcMathSin:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'MathSin', Instr.Dest, Instr.Src1]);
+    bcMathCos:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'MathCos', Instr.Dest, Instr.Src1]);
+    bcMathTan:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'MathTan', Instr.Dest, Instr.Src1]);
+    bcMathAtn:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'MathAtn', Instr.Dest, Instr.Src1]);
+    bcMathLog:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'MathLog', Instr.Dest, Instr.Src1]);
+    bcMathExp:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'MathExp', Instr.Dest, Instr.Src1]);
+    bcMathSqr:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'MathSqr', Instr.Dest, Instr.Src1]);
+    bcMathAbs:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'MathAbs', Instr.Dest, Instr.Src1]);
+    bcMathSgn:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'MathSgn', Instr.Dest, Instr.Src1]);
+    bcMathInt:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'MathInt', Instr.Dest, Instr.Src1]);
     bcMathRnd:
-      Line := Line + Format('R%d', [Instr.Dest]);
+      Line := Format('%4d: %-20s R%d', [Index, 'MathRnd', Instr.Dest]);
 
-    bcJump, bcCall:
-      Line := Line + Format('%d', [Instr.Immediate]);
-
-    bcJumpIfZero, bcJumpIfNotZero:
-      Line := Line + Format('R%d, %d', [Instr.Src1, Instr.Immediate]);
-
-    bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
-    bcPrintInt, bcPrintIntLn:
-      Line := Line + Format('R%d', [Instr.Src1]);
-
-    bcPrintComma, bcPrintSemicolon, bcPrintNewLine:
-      ; // No operands
-
-    bcPrintTab, bcPrintSpc:
-      Line := Line + Format('%d', [Instr.Immediate]);
-
-    bcInput, bcInputInt, bcInputFloat, bcInputString:
-      Line := Line + Format('R%d', [Instr.Dest]);
-
-    // Array operations
-    bcArrayDim:
-      Line := Line + Format('ARR[%d]', [Instr.Src1]);
-
+    // === GROUP 3: ARRAY OPERATIONS (0x03xx) ===
     bcArrayLoad:
-      Line := Line + Format('R%d, ARR[%d], idx=R%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
-
+      Line := Format('%4d: %-20s R%d, ARR[%d], R%d', [Index, 'ArrayLoad', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcArrayStore:
-      Line := Line + Format('ARR[%d], idx=R%d, value=R%d', [Instr.Src1, Instr.Src2, Instr.Dest]);
-
-    // Typed array operations
+      Line := Format('%4d: %-20s ARR[%d], R%d, R%d', [Index, 'ArrayStore', Instr.Src1, Instr.Src2, Instr.Dest]);
+    bcArrayDim:
+      Line := Format('%4d: %-20s ARR[%d]', [Index, 'ArrayDim', Instr.Src1]);
     bcArrayLoadInt:
-      Line := Line + Format('IntR%d, ARR[%d], idx=IntR%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
+      Line := Format('%4d: %-20s R%d, ARR[%d], R%d', [Index, 'ArrayLoadInt', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcArrayLoadFloat:
-      Line := Line + Format('FloatR%d, ARR[%d], idx=IntR%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
+      Line := Format('%4d: %-20s R%d, ARR[%d], R%d', [Index, 'ArrayLoadFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcArrayLoadString:
-      Line := Line + Format('StrR%d, ARR[%d], idx=IntR%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
+      Line := Format('%4d: %-20s R%d, ARR[%d], R%d', [Index, 'ArrayLoadString', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcArrayStoreInt:
-      Line := Line + Format('ARR[%d], idx=IntR%d, value=IntR%d', [Instr.Src1, Instr.Src2, Instr.Dest]);
+      Line := Format('%4d: %-20s ARR[%d], R%d, R%d', [Index, 'ArrayStoreInt', Instr.Src1, Instr.Src2, Instr.Dest]);
     bcArrayStoreFloat:
-      Line := Line + Format('ARR[%d], idx=IntR%d, value=FloatR%d', [Instr.Src1, Instr.Src2, Instr.Dest]);
+      Line := Format('%4d: %-20s ARR[%d], R%d, R%d', [Index, 'ArrayStoreFloat', Instr.Src1, Instr.Src2, Instr.Dest]);
     bcArrayStoreString:
-      Line := Line + Format('ARR[%d], idx=IntR%d, value=StrR%d', [Instr.Src1, Instr.Src2, Instr.Dest]);
+      Line := Format('%4d: %-20s ARR[%d], R%d, R%d', [Index, 'ArrayStoreString', Instr.Src1, Instr.Src2, Instr.Dest]);
 
-    bcEnd, bcStop, bcReturn, bcNop:
-      ; // No operands
+    // === GROUP 4: I/O OPERATIONS (0x04xx) ===
+    bcPrint:
+      Line := Format('%4d: %-20s R%d', [Index, 'Print', Instr.Src1]);
+    bcPrintLn:
+      Line := Format('%4d: %-20s R%d', [Index, 'PrintLn', Instr.Src1]);
+    bcPrintString:
+      Line := Format('%4d: %-20s R%d', [Index, 'PrintString', Instr.Src1]);
+    bcPrintStringLn:
+      Line := Format('%4d: %-20s R%d', [Index, 'PrintStringLn', Instr.Src1]);
+    bcPrintInt:
+      Line := Format('%4d: %-20s R%d', [Index, 'PrintInt', Instr.Src1]);
+    bcPrintIntLn:
+      Line := Format('%4d: %-20s R%d', [Index, 'PrintIntLn', Instr.Src1]);
+    bcPrintComma:
+      Line := Format('%4d: %-20s', [Index, 'PrintComma']);
+    bcPrintSemicolon:
+      Line := Format('%4d: %-20s', [Index, 'PrintSemicolon']);
+    bcPrintTab:
+      Line := Format('%4d: %-20s %d', [Index, 'PrintTab', Instr.Immediate]);
+    bcPrintSpc:
+      Line := Format('%4d: %-20s %d', [Index, 'PrintSpc', Instr.Immediate]);
+    bcPrintNewLine:
+      Line := Format('%4d: %-20s', [Index, 'PrintNewLine']);
+    bcInput:
+      Line := Format('%4d: %-20s R%d', [Index, 'Input', Instr.Dest]);
+    bcInputInt:
+      Line := Format('%4d: %-20s R%d', [Index, 'InputInt', Instr.Dest]);
+    bcInputFloat:
+      Line := Format('%4d: %-20s R%d', [Index, 'InputFloat', Instr.Dest]);
+    bcInputString:
+      Line := Format('%4d: %-20s R%d', [Index, 'InputString', Instr.Dest]);
+
+    // === GROUP 5: SPECIAL VARIABLES (0x05xx) ===
+    bcLoadTI:
+      Line := Format('%4d: %-20s R%d', [Index, 'LoadTI', Instr.Dest]);
+    bcLoadTIS:
+      Line := Format('%4d: %-20s R%d', [Index, 'LoadTI$', Instr.Dest]);
+    bcStoreTIS:
+      Line := Format('%4d: %-20s R%d', [Index, 'StoreTI$', Instr.Src1]);
+    bcLoadDTS:
+      Line := Format('%4d: %-20s R%d', [Index, 'LoadDT$', Instr.Dest]);
+
+    // === GROUP 10: GRAPHICS (0x0Axx) ===
+    bcGraphicRGBA:
+      Line := Format('%4d: %-20s R%d, R%d, R%d, R%d', [Index, 'GraphicRGBA', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcGraphicSetMode:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'GraphicSetMode', Instr.Src1, Instr.Src2]);
+    bcGraphicBox:
+      Line := Format('%4d: %-20s R%d, R%d, R%d, R%d', [Index, 'GraphicBox', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+
+    // === GROUP 11: SOUND (0x0Bxx) ===
+    bcSoundVol:
+      Line := Format('%4d: %-20s %d', [Index, 'SoundVol', Instr.Immediate]);
+    bcSoundSound:
+      Line := Format('%4d: %-20s', [Index, 'SoundSound']);
+    bcSoundEnvelope:
+      Line := Format('%4d: %-20s', [Index, 'SoundEnvelope']);
+    bcSoundTempo:
+      Line := Format('%4d: %-20s %d', [Index, 'SoundTempo', Instr.Immediate]);
+    bcSoundPlay:
+      Line := Format('%4d: %-20s R%d', [Index, 'SoundPlay', Instr.Src1]);
+    bcSoundFilter:
+      Line := Format('%4d: %-20s', [Index, 'SoundFilter']);
+
+    // === SUPERINSTRUCTIONS (0xC8xx+) ===
+    bcBranchEqInt: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchEqInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcBranchNeInt: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchNeInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcBranchLtInt: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchLtInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcBranchGtInt: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchGtInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcBranchLeInt: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchLeInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcBranchGeInt: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchGeInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcBranchEqFloat: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchEqFloat', Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcBranchNeFloat: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchNeFloat', Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcBranchLtFloat: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchLtFloat', Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcBranchGtFloat: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchGtFloat', Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcBranchLeFloat: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchLeFloat', Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcBranchGeFloat: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchGeFloat', Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcAddIntTo: Line := Format('%4d: %-20s R%d, R%d', [Index, 'AddIntTo', Instr.Dest, Instr.Src1]);
+    bcSubIntTo: Line := Format('%4d: %-20s R%d, R%d', [Index, 'SubIntTo', Instr.Dest, Instr.Src1]);
+    bcMulIntTo: Line := Format('%4d: %-20s R%d, R%d', [Index, 'MulIntTo', Instr.Dest, Instr.Src1]);
+    bcAddFloatTo: Line := Format('%4d: %-20s R%d, R%d', [Index, 'AddFloatTo', Instr.Dest, Instr.Src1]);
+    bcSubFloatTo: Line := Format('%4d: %-20s R%d, R%d', [Index, 'SubFloatTo', Instr.Dest, Instr.Src1]);
+    bcMulFloatTo: Line := Format('%4d: %-20s R%d, R%d', [Index, 'MulFloatTo', Instr.Dest, Instr.Src1]);
+    bcDivFloatTo: Line := Format('%4d: %-20s R%d, R%d', [Index, 'DivFloatTo', Instr.Dest, Instr.Src1]);
+    bcAddIntConst: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'AddIntConst', Instr.Dest, Instr.Src1, Instr.Immediate]);
+    bcSubIntConst: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'SubIntConst', Instr.Dest, Instr.Src1, Instr.Immediate]);
+    bcMulIntConst: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'MulIntConst', Instr.Dest, Instr.Src1, Instr.Immediate]);
+    bcAddFloatConst: Line := Format('%4d: %-20s R%d, R%d, %.2f', [Index, 'AddFloatConst', Instr.Dest, Instr.Src1, Double(Pointer(@Instr.Immediate)^)]);
+    bcSubFloatConst: Line := Format('%4d: %-20s R%d, R%d, %.2f', [Index, 'SubFloatConst', Instr.Dest, Instr.Src1, Double(Pointer(@Instr.Immediate)^)]);
+    bcMulFloatConst: Line := Format('%4d: %-20s R%d, R%d, %.2f', [Index, 'MulFloatConst', Instr.Dest, Instr.Src1, Double(Pointer(@Instr.Immediate)^)]);
+    bcDivFloatConst: Line := Format('%4d: %-20s R%d, R%d, %.2f', [Index, 'DivFloatConst', Instr.Dest, Instr.Src1, Double(Pointer(@Instr.Immediate)^)]);
+    bcBranchEqZeroInt: Line := Format('%4d: %-20s R%d, %d', [Index, 'BranchEqZeroInt', Instr.Src1, Instr.Immediate]);
+    bcBranchNeZeroInt: Line := Format('%4d: %-20s R%d, %d', [Index, 'BranchNeZeroInt', Instr.Src1, Instr.Immediate]);
+    bcBranchEqZeroFloat: Line := Format('%4d: %-20s R%d, %d', [Index, 'BranchEqZeroFlt', Instr.Src1, Instr.Immediate]);
+    bcBranchNeZeroFloat: Line := Format('%4d: %-20s R%d, %d', [Index, 'BranchNeZeroFlt', Instr.Src1, Instr.Immediate]);
+    bcArrayStoreIntConst: Line := Format('%4d: %-20s ARR[%d], R%d, %d', [Index, 'ArrStoreIntConst', Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcArrayStoreFloatConst: Line := Format('%4d: %-20s ARR[%d], R%d, %.2f', [Index, 'ArrStoreFltConst', Instr.Src1, Instr.Src2, Double(Pointer(@Instr.Immediate)^)]);
+    bcArrayStoreStringConst: Line := Format('%4d: %-20s ARR[%d], R%d, [%d]', [Index, 'ArrStoreStrConst', Instr.Src1, Instr.Src2, Instr.Immediate]);
+
+    // === SUPERINSTRUCTIONS (Group $C8) ===
+    // Fused loop increment-and-branch
+    bcAddIntToBranchLe: Line := Format('%4d: %-20s R%d, R%d, R%d, %d', [Index, 'AddIntToBranchLe', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcAddIntToBranchLt: Line := Format('%4d: %-20s R%d, R%d, R%d, %d', [Index, 'AddIntToBranchLt', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcSubIntToBranchGe: Line := Format('%4d: %-20s R%d, R%d, R%d, %d', [Index, 'SubIntToBranchGe', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcSubIntToBranchGt: Line := Format('%4d: %-20s R%d, R%d, R%d, %d', [Index, 'SubIntToBranchGt', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+
+    // Array Load + Arithmetic superinstructions
+    bcArrayLoadAddFloat: Line := Format('%4d: %-20s R%d = R%d + ARR[%d][R%d]', [Index, 'ArrLoadAddFlt', Instr.Dest, Instr.Immediate, Instr.Src1, Instr.Src2]);
+    bcArrayLoadSubFloat: Line := Format('%4d: %-20s R%d = R%d - ARR[%d][R%d]', [Index, 'ArrLoadSubFlt', Instr.Dest, Instr.Immediate, Instr.Src1, Instr.Src2]);
+
+  else
+    Line := Format('%4d: (unknown opcode $%04X, group=%d, sub=%d)', [Index, Instr.OpCode, Group, SubOp]);
   end;
+
+  // Append source line number if available (debug mode / TRON)
+  if Instr.SourceLine > 0 then
+    Line := Line + Format('  @L%d', [Instr.SourceLine]);
 
   FOutput.Add(Line);
 end;

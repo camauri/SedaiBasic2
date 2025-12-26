@@ -38,6 +38,7 @@ type
     antLiteral,           // Literal values (numbers, strings)
     antIdentifier,        // Variable names, labels
     antLineNumber,        // BASIC line numbers
+    antSpecialVariable,   // Special variables (TI, TI$, DT$, etc.)
 
     // === FUNCTIONS ===
 
@@ -48,6 +49,7 @@ type
     antSpriteFunction,
     antInputFunction,
     antUsrFunction,
+    antUserFunction,      // User-defined function call (FN)
 
     // === EXPRESSIONS ===
     antBinaryOp,          // Binary operations (+, -, *, /, =, <, >, etc.)
@@ -70,6 +72,12 @@ type
     antFast,              // FAST statement (C128 2MHz mode)
     antSlow,              // SLOW statement (C128 1MHz mode)
     antSleep,             // SLEEP statement (delay n seconds)
+    antKey,               // KEY statement (define/list function keys)
+    antTron,              // TRON statement (trace on - enable debug mode)
+    antTroff,             // TROFF statement (trace off - disable debug mode)
+    antTrap,              // TRAP statement (error handler: TRAP linenum)
+    antResume,            // RESUME statement (continue after error)
+    antResumeNext,        // RESUME NEXT statement (continue after error at next statement)
     antRem,               // REM statement
 
     // === CONTROL FLOW ===
@@ -95,12 +103,23 @@ type
     antConst,             // CONST statement
     antRead,              // READ statement
     antRestore,           // RESTORE statement
+    antClear,             // CLR statement (clear variables)
 
     // === I/O ===
     antOpen,              // OPEN statement
     antClose,             // CLOSE statement
-    antGet,               // GET statement
+    antDopen,             // DOPEN statement (disk file open)
+    antDclose,            // DCLOSE statement (disk file close)
+    antGet,               // GET statement (non-blocking character input)
+    antGetkey,            // GETKEY statement (blocking character input)
+    antGetFile,           // GET# statement (get char from file)
+    antInputFile,         // INPUT# statement (input from file)
+    antPrintFile,         // PRINT# statement (print to file)
+    antCmd,               // CMD statement (redirect output to file/device)
     antPut,               // PUT statement (if supported)
+    antPrintUsing,        // PRINT USING statement (formatted output)
+    antPudef,             // PUDEF statement (redefine PRINT USING symbols)
+    antChar,              // CHAR statement (display character at position)
 
     // === SYSTEM ===
     antPoke,              // POKE statement
@@ -110,12 +129,52 @@ type
     antList,              // LIST command
     antSave,              // SAVE command
     antLoad,              // LOAD command
+    antVerify,            // VERIFY command
+    antBload,             // BLOAD command (load bytecode)
+    antBsave,             // BSAVE command (save bytecode)
+    antBoot,              // BOOT command (load and run bytecode)
+    antCatalog,           // CATALOG/DIR command
+    antDelete,            // DELETE command (delete program lines)
+    antRenumber,          // RENUMBER command (renumber program lines)
+    antCopy,              // COPY/CP command (copy file)
+    antScratch,           // SCRATCH command (delete file)
+    antRenameFile,        // RENAME command (rename file)
+    antConcat,            // CONCAT command (concatenate files)
+    antMkdir,             // MKDIR/MD command (create directory)
+    antChdir,             // CHDIR/CD command (change directory)
+    antMove,              // MOVE/MV command (move file)
     antGraphics,          // GRAPHIC command
     antScnClr,            // SCNCLR command (clear screen)
     antBox,               // BOX command
     antCircle,            // CIRCLE command
     antDraw,              // DRAW command
     antLocate,            // LOCATE command
+    antColor,             // COLOR command (set screen area colors)
+    antWidth,             // WIDTH command (set line width)
+    antScale,             // SCALE command (coordinate scaling)
+    antPaint,             // PAINT command (flood fill)
+    antWindow,            // WINDOW command (define text window)
+    antSShape,            // SSHAPE command (save bitmap to string)
+    antGShape,            // GSHAPE command (load string to bitmap)
+    antGList,             // GLIST command (list SDL2 video modes)
+
+    // === SOUND ===
+    antVol,               // VOL command (set volume)
+    antSound,             // SOUND command (sound effects)
+    antEnvelope,          // ENVELOPE command (define instrument)
+    antTempo,             // TEMPO command (set playback speed)
+    antPlay,              // PLAY command (play music string)
+    antFilter,            // FILTER command (SID filter parameters)
+
+    // === SPRITE ===
+    antSprite,            // SPRITE command (set sprite properties)
+    antMovspr,            // MOVSPR command (move/position sprite)
+    antSprcolor,          // SPRCOLOR command (set global multicolors)
+    antSprsav,            // SPRSAV command (save/load sprite data)
+    antCollision,         // COLLISION command (set collision handler)
+    // Note: SPRDEF (sprite editor) will be added later
+    // Sprite functions (BUMP, RSPCOLOR, RSPPOS, RSPRITE) are handled
+    // via antSpriteFunction with function name in Value
 
     // === SPECIAL CONSTRUCTS ===
     antBlock,             // Block of statements
@@ -289,9 +348,12 @@ begin
     antStatement, antAssignment, antPrint, antInput, antGoto,
     antGosub, antReturn, antEnd, antStop, antRem, antIf,
     antThen, antElse, antForLoop, antWhileLoop, antDoLoop, antDim,
-    antDef, antData, antConst, antRead, antRestore, antOpen, antClose,
+    antDef, antData, antConst, antRead, antRestore, antClear,
+    antOpen, antClose, antDopen, antDclose,
     antGet, antPut, antPoke, antSys, antNew, antRun, antList,
-    antSave, antLoad, antBlock
+    antSave, antLoad, antVerify, antBload, antBsave, antBoot, antCatalog, antBlock,
+    // Sprite commands
+    antSprite, antMovspr, antSprcolor, antSprsav, antCollision
   ];
 end;
 

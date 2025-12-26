@@ -118,6 +118,8 @@ type
     function ReadLine(const Prompt: string = ''; IsCommand: Boolean = True; NumericOnly: Boolean = False; AllowDecimal: Boolean = True): string;
     function ReadKey: Char;
     function KeyPressed: Boolean;
+    function HasChar: Boolean;
+    function GetLastChar: string;
 
     // State management
     function ShouldQuit: Boolean;       // CTRL+ALT+END pressed - exit application
@@ -986,6 +988,23 @@ begin
         Result := True;
     end;
   end;
+end;
+
+function TSDL2InputDevice.HasChar: Boolean;
+begin
+  // For SDL2, this is equivalent to KeyPressed for non-blocking check
+  Result := KeyPressed;
+end;
+
+function TSDL2InputDevice.GetLastChar: string;
+var
+  Key: Char;
+begin
+  Key := ReadKey;
+  if Key <> #0 then
+    Result := Key
+  else
+    Result := '';
 end;
 
 function TSDL2InputDevice.ShouldQuit: Boolean;

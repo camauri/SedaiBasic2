@@ -29,7 +29,7 @@ unit SedaiNewConsole;
 interface
 
 uses
-  Classes, SysUtils, Variants, SDL2, SDL2_ttf, TypInfo,
+  Classes, SysUtils, Variants, Math, SDL2, SDL2_ttf, TypInfo,
   SedaiOutputInterface, SedaiGraphicsModes, SedaiGraphicsTypes,
   SedaiGraphicsMemory,
   SedaiProgramMemory, SedaiAST, SedaiParserTypes,
@@ -39,7 +39,7 @@ uses
   SedaiBytecodeSerializer, SedaiBytecodeCompiler,
   SedaiBytecodeDisassembler,
   SedaiSSATypes, SedaiSSA,
-  SedaiBasicKeywords;
+  SedaiBasicKeywords, SedaiDebugger;
 
 const
   SCROLLBACK_LINES = 1000;
@@ -110,6 +110,18 @@ type
     // Pixel Cursor (PC) - invisible cursor for DRAW/LOCATE/RDOT commands
     FPixelCursorX: Integer;
     FPixelCursorY: Integer;
+
+    // COLOR command - color sources (C128-compatible, 0-6)
+    FColorSources: array[0..6] of Integer;
+    // WIDTH command - line width (1 or 2)
+    FLineWidth: Integer;
+    // SCALE command - coordinate scaling
+    FScaleEnabled: Boolean;
+    FScaleXMax: Integer;
+    FScaleYMax: Integer;
+    // WINDOW command - text window boundaries
+    FWindowCol1, FWindowRow1: Integer;
+    FWindowCol2, FWindowRow2: Integer;
 
     // Persistent graphics memory (handles all classic mode buffers)
     FGraphicsMemory: TGraphicsMemory;
@@ -228,6 +240,24 @@ type
     procedure SetFillStyle(const Style: TFillStyleDef);
     function GetBorderStyle: TBorderStyle;
     function GetFillStyle: TFillStyleDef;
+
+    // COLOR command support
+    procedure SetColorSource(Source, Color: Integer);
+    function GetColorSource(Source: Integer): Integer;
+    // WIDTH command support
+    procedure SetLineWidth(Width: Integer);
+    // SCALE command support
+    procedure SetScale(Enabled: Boolean; XMax, YMax: Integer);
+    // PAINT command support
+    procedure FloodFill(Source: Integer; X, Y: Double; Mode: Integer);
+    // WINDOW command support
+    procedure SetWindow(Col1, Row1, Col2, Row2: Integer; DoClear: Boolean);
+    function GetWindowLines: Integer;
+    function GetWindowCols: Integer;
+    function GetScreenWidth: Integer;
+    // SSHAPE/GSHAPE command support
+    function SaveShape(X1, Y1, X2, Y2: Double): string;
+    procedure LoadShape(const Data: string; X, Y: Double; Mode: Integer);
 
     property CurrentMode: TGraphicMode read FCurrentMode;
     property ModeInfo: TGraphicModeInfo read FModeInfo;
@@ -425,6 +455,8 @@ type
     function ReadLine(const Prompt: string = ''; IsCommand: Boolean = True; NumericOnly: Boolean = False; AllowDecimal: Boolean = True): string;
     function ReadKey: Char;
     function KeyPressed: Boolean;
+    function HasChar: Boolean;           // Non-blocking character check
+    function GetLastChar: string;        // Get and consume last character
     function ShouldQuit: Boolean;
     function ShouldStop: Boolean;
     procedure ClearStopRequest;
@@ -434,7 +466,7 @@ type
     property StopRequested: Boolean read FStopRequested;
     property LastKeyDown: TSDL_KeyCode read FLastKeyDown;
     property LastChar: Char read FLastChar;
-    property HasChar: Boolean read FHasChar;
+    property CharAvailable: Boolean read FHasChar;
     property ShiftPressed: Boolean read FShiftPressed;
     property CtrlPressed: Boolean read FCtrlPressed;
     property AltPressed: Boolean read FAltPressed;
@@ -454,15 +486,20 @@ type
     procedure FillRect(X, Y, W, H: Integer; Color: TSDL_Color);
   end;
 
+  { Callback type for RenderScreen - avoids circular reference }
+  TRenderScreenProc = procedure of object;
+
   { TConsoleOutputAdapter - Adapter that writes to TextBuffer }
   { NOTE: Using TObject instead of TInterfacedObject because interfaces use CORBA mode (no refcount) }
   TConsoleOutputAdapter = class(TObject, IOutputDevice)
   private
     FTextBuffer: TTextBuffer;
     FVideoController: TVideoController;
+    FRenderScreenProc: TRenderScreenProc;  // Callback for RenderScreen
     FInitialized: Boolean;
   public
     constructor Create(ATextBuffer: TTextBuffer; AVideoController: TVideoController);
+    procedure SetRenderCallback(AProc: TRenderScreenProc);
     
     // IOutputDevice implementation
     function Initialize(const Title: string = ''; Width: Integer = 80; Height: Integer = 25): Boolean;
@@ -525,10 +562,28 @@ type
     function GetFastMode: Boolean;
     procedure SetFastModeAlpha(Alpha: Byte);
     function GetFastModeAlpha: Byte;
+
+    // COLOR command support - delegates to VideoController
+    procedure SetColorSource(Source, Color: Integer);
+    function GetColorSource(Source: Integer): Integer;
+    // WIDTH command support
+    procedure SetLineWidth(Width: Integer);
+    // SCALE command support
+    procedure SetScale(Enabled: Boolean; XMax, YMax: Integer);
+    // PAINT command support
+    procedure FloodFill(Source: Integer; X, Y: Double; Mode: Integer);
+    // WINDOW command support
+    procedure SetWindow(Col1, Row1, Col2, Row2: Integer; DoClear: Boolean);
+    function GetWindowLines: Integer;
+    function GetWindowCols: Integer;
+    function GetScreenWidth: Integer;
+    // SSHAPE/GSHAPE command support
+    function SaveShape(X1, Y1, X2, Y2: Double): string;
+    procedure LoadShape(const Data: string; X, Y: Double; Mode: Integer);
   end;
 
   { TSedaiNewConsole - Main console }
-  TSedaiNewConsole = class
+  TSedaiNewConsole = class(TObject)
   private
     FVideoController: TVideoController;
     FTextBuffer: TTextBuffer;
@@ -559,12 +614,34 @@ type
     FStartupFile: string;
     FAutoRun: Boolean;
 
+    // AUTO line numbering
+    FAutoLineNumber: Integer;     // Current auto line number (0 = disabled)
+    FAutoLineIncrement: Integer;  // Increment for auto line numbering
+
+    // Input buffer for AUTO and EDIT commands
+    FInputBuffer: string;         // Pre-filled input text
+    FInputPos: Integer;           // Cursor position in pre-filled input
+
+    // Debug mode (TRON/TROFF)
+    FDebugMode: Boolean;          // True = compile with debug info, trace execution
+    FTraceActive: Boolean;        // True = currently tracing (runtime flag)
+    FDebugger: TSedaiDebugger;    // Debugger instance for breakpoints and stepping
+
+    // Error tracking (EL, ER, ERR$)
+    FLastErrorLine: Integer;      // EL - line number where last error occurred (0 = none)
+    FLastErrorCode: Integer;      // ER - error code of last error (0 = none)
+    FLastErrorMessage: string;    // ERR$ - error message of last error
+
     procedure ShowSplashScreen;
     function GetSystemInfo: string;
     function GetArchitecture: string;
     function GetAvailableMemory: string;
     procedure ExecuteDirectCommand(const Command: string);
     procedure ExecuteConsoleCommand(AST: TASTNode);
+
+    // Debugger callbacks
+    procedure HandleDebuggerTrace(Sender: TObject; LineNumber: Integer);
+    procedure HandleDebuggerPause(Sender: TObject; LineNumber: Integer; const Reason: string);
     function ExecuteGLIST: TStringList;  // Returns output lines
     procedure DisplayWithMore(Lines: TStringList);
 
@@ -670,6 +747,29 @@ begin
   // FAST mode (C128 2MHz mode emulation) - default off, alpha 255 (opaque)
   FFastMode := False;
   FFastModeAlpha := 255;
+
+  // COLOR command - initialize color sources to default palette colors
+  FColorSources[0] := 12;  // Background (dark grey)
+  FColorSources[1] := 13;  // Foreground (light green)
+  FColorSources[2] := 1;   // Multicolor 1 (white)
+  FColorSources[3] := 2;   // Multicolor 2 (red)
+  FColorSources[4] := 13;  // Border (light green)
+  FColorSources[5] := 13;  // Character color (light green)
+  FColorSources[6] := 12;  // 80-column background
+
+  // WIDTH command - default line width
+  FLineWidth := 1;
+
+  // SCALE command - disabled by default
+  FScaleEnabled := False;
+  FScaleXMax := 320;
+  FScaleYMax := 200;
+
+  // WINDOW command - default to full screen (will be set in Initialize)
+  FWindowCol1 := 0;
+  FWindowRow1 := 0;
+  FWindowCol2 := 39;
+  FWindowRow2 := 24;
 
   // Create persistent graphics memory handler
   FGraphicsMemory := TGraphicsMemory.Create;
@@ -1679,6 +1779,343 @@ end;
 function TVideoController.GetFastModeAlpha: Byte;
 begin
   Result := FFastModeAlpha;
+end;
+
+// === COLOR command support ===
+procedure TVideoController.SetColorSource(Source, Color: Integer);
+begin
+  if (Source >= 0) and (Source <= 6) then
+  begin
+    FColorSources[Source] := Color;
+    // Update corresponding palette indices based on source
+    case Source of
+      0: FBackgroundIndex := Byte(Color);    // Background
+      1: FForegroundIndex := Byte(Color);    // Foreground
+      2: FMulticolorIndex1 := Byte(Color);   // Multicolor 1
+      3: FMulticolorIndex2 := Byte(Color);   // Multicolor 2
+      4: FBorderColorIndex := Byte(Color);   // Border
+      5: FTextColorIndex := Byte(Color);     // Character color
+      6: FScreenColorIndex := Byte(Color);   // 80-column background
+    end;
+  end;
+end;
+
+function TVideoController.GetColorSource(Source: Integer): Integer;
+begin
+  if (Source >= 0) and (Source <= 6) then
+    Result := FColorSources[Source]
+  else
+    Result := 0;
+end;
+
+// === WIDTH command support ===
+procedure TVideoController.SetLineWidth(Width: Integer);
+begin
+  if (Width >= 1) and (Width <= 2) then
+    FLineWidth := Width
+  else
+    FLineWidth := 1;
+end;
+
+// === SCALE command support ===
+procedure TVideoController.SetScale(Enabled: Boolean; XMax, YMax: Integer);
+begin
+  FScaleEnabled := Enabled;
+  if Enabled and (XMax > 0) and (YMax > 0) then
+  begin
+    FScaleXMax := XMax;
+    FScaleYMax := YMax;
+  end
+  else if not Enabled then
+  begin
+    // When disabled, reset to mode defaults
+    FScaleXMax := FModeInfo.NativeWidth;
+    FScaleYMax := FModeInfo.NativeHeight;
+  end;
+end;
+
+// === PAINT command support (flood fill) ===
+procedure TVideoController.FloodFill(Source: Integer; X, Y: Double; Mode: Integer);
+var
+  PixelX, PixelY: Integer;
+  TargetColor, FillColor: UInt32;
+  Stack: array of TPoint;
+  StackSize, StackCapacity: Integer;
+  CurX, CurY: Integer;
+  BufWidth, BufHeight: Integer;
+  PixelPtr: PByte;
+
+  procedure PushPixel(PX, PY: Integer);
+  begin
+    if StackSize >= StackCapacity then
+    begin
+      StackCapacity := StackCapacity * 2;
+      SetLength(Stack, StackCapacity);
+    end;
+    Stack[StackSize].X := PX;
+    Stack[StackSize].Y := PY;
+    Inc(StackSize);
+  end;
+
+  function PopPixel(out PX, PY: Integer): Boolean;
+  begin
+    if StackSize > 0 then
+    begin
+      Dec(StackSize);
+      PX := Stack[StackSize].X;
+      PY := Stack[StackSize].Y;
+      Result := True;
+    end
+    else
+      Result := False;
+  end;
+
+begin
+  if FGraphicsMemory = nil then Exit;
+  if not IsInGraphicsMode then Exit;
+
+  // Apply coordinate scaling if enabled
+  if FScaleEnabled then
+  begin
+    PixelX := Round(X * FModeInfo.NativeWidth / FScaleXMax);
+    PixelY := Round(Y * FModeInfo.NativeHeight / FScaleYMax);
+  end
+  else
+  begin
+    PixelX := Round(X);
+    PixelY := Round(Y);
+  end;
+
+  BufWidth := FModeInfo.NativeWidth;
+  BufHeight := FModeInfo.NativeHeight;
+
+  // Bounds check
+  if (PixelX < 0) or (PixelX >= BufWidth) or
+     (PixelY < 0) or (PixelY >= BufHeight) then Exit;
+
+  // Get fill color from source
+  if (Source >= 0) and (Source <= 6) then
+    FillColor := FPaletteManager.GetColor(FColorSources[Source])
+  else
+    FillColor := FPaletteManager.GetColor(FForegroundIndex);
+
+  // Get target color at seed point
+  TargetColor := FGraphicsMemory.GetPixelRGBA(PixelX, PixelY);
+
+  // Don't fill if colors are the same
+  if TargetColor = FillColor then Exit;
+
+  // Initialize stack for flood fill
+  StackCapacity := 1024;
+  SetLength(Stack, StackCapacity);
+  StackSize := 0;
+
+  // Seed the stack
+  PushPixel(PixelX, PixelY);
+
+  // Flood fill using stack-based algorithm
+  while PopPixel(CurX, CurY) do
+  begin
+    // Skip if out of bounds
+    if (CurX < 0) or (CurX >= BufWidth) or
+       (CurY < 0) or (CurY >= BufHeight) then Continue;
+
+    // Get current pixel color
+    if Mode = 0 then
+    begin
+      // Mode 0: Fill connected area of same color as seed
+      if FGraphicsMemory.GetPixelRGBA(CurX, CurY) <> TargetColor then Continue;
+    end
+    else
+    begin
+      // Mode 1: Fill until non-background color
+      if FGraphicsMemory.GetPixelRGBA(CurX, CurY) = FillColor then Continue;
+    end;
+
+    // Set pixel
+    FGraphicsMemory.SetPixelRGBA(CurX, CurY, FillColor);
+
+    // Add neighbors to stack
+    PushPixel(CurX + 1, CurY);
+    PushPixel(CurX - 1, CurY);
+    PushPixel(CurX, CurY + 1);
+    PushPixel(CurX, CurY - 1);
+  end;
+
+  // Sync to texture and present
+  SyncGraphicsBufferToTexture;
+  RenderGraphicsTexture;
+  Present;
+end;
+
+// === WINDOW command support ===
+procedure TVideoController.SetWindow(Col1, Row1, Col2, Row2: Integer; DoClear: Boolean);
+begin
+  // Validate and store window boundaries
+  FWindowCol1 := Max(0, Min(Col1, FModeInfo.TextCols - 1));
+  FWindowRow1 := Max(0, Min(Row1, FModeInfo.TextRows - 1));
+  FWindowCol2 := Max(FWindowCol1, Min(Col2, FModeInfo.TextCols - 1));
+  FWindowRow2 := Max(FWindowRow1, Min(Row2, FModeInfo.TextRows - 1));
+
+  // Clear window if requested
+  if DoClear then
+  begin
+    // TODO: Clear the text window area
+  end;
+end;
+
+function TVideoController.GetWindowLines: Integer;
+begin
+  Result := FWindowRow2 - FWindowRow1 + 1;
+end;
+
+function TVideoController.GetWindowCols: Integer;
+begin
+  Result := FWindowCol2 - FWindowCol1 + 1;
+end;
+
+function TVideoController.GetScreenWidth: Integer;
+begin
+  Result := FModeInfo.TextCols;
+end;
+
+// === SSHAPE command support (save bitmap area to string) ===
+function TVideoController.SaveShape(X1, Y1, X2, Y2: Double): string;
+var
+  PX1, PY1, PX2, PY2: Integer;
+  Width, Height: Integer;
+  X, Y: Integer;
+  Pixel: UInt32;
+  DataLen: Integer;
+begin
+  Result := '';
+  if FGraphicsMemory = nil then Exit;
+  if not IsInGraphicsMode then Exit;
+
+  // Apply coordinate scaling if enabled
+  if FScaleEnabled then
+  begin
+    PX1 := Round(X1 * FModeInfo.NativeWidth / FScaleXMax);
+    PY1 := Round(Y1 * FModeInfo.NativeHeight / FScaleYMax);
+    PX2 := Round(X2 * FModeInfo.NativeWidth / FScaleXMax);
+    PY2 := Round(Y2 * FModeInfo.NativeHeight / FScaleYMax);
+  end
+  else
+  begin
+    PX1 := Round(X1);
+    PY1 := Round(Y1);
+    PX2 := Round(X2);
+    PY2 := Round(Y2);
+  end;
+
+  // Ensure proper ordering
+  if PX1 > PX2 then begin X := PX1; PX1 := PX2; PX2 := X; end;
+  if PY1 > PY2 then begin Y := PY1; PY1 := PY2; PY2 := Y; end;
+
+  // Clamp to buffer bounds
+  PX1 := Max(0, PX1);
+  PY1 := Max(0, PY1);
+  PX2 := Min(FModeInfo.NativeWidth - 1, PX2);
+  PY2 := Min(FModeInfo.NativeHeight - 1, PY2);
+
+  Width := PX2 - PX1 + 1;
+  Height := PY2 - PY1 + 1;
+
+  if (Width <= 0) or (Height <= 0) then Exit;
+
+  // Format: 2 bytes width + 2 bytes height + RGBA data
+  DataLen := 4 + Width * Height * 4;
+  SetLength(Result, DataLen);
+
+  // Store dimensions (little-endian)
+  Result[1] := Chr(Width and $FF);
+  Result[2] := Chr((Width shr 8) and $FF);
+  Result[3] := Chr(Height and $FF);
+  Result[4] := Chr((Height shr 8) and $FF);
+
+  // Copy pixel data
+  for Y := 0 to Height - 1 do
+    for X := 0 to Width - 1 do
+    begin
+      Pixel := FGraphicsMemory.GetPixelRGBA(PX1 + X, PY1 + Y);
+      Result[5 + (Y * Width + X) * 4] := Chr((Pixel shr 24) and $FF);  // R
+      Result[6 + (Y * Width + X) * 4] := Chr((Pixel shr 16) and $FF);  // G
+      Result[7 + (Y * Width + X) * 4] := Chr((Pixel shr 8) and $FF);   // B
+      Result[8 + (Y * Width + X) * 4] := Chr(Pixel and $FF);           // A
+    end;
+end;
+
+// === GSHAPE command support (load string to bitmap) ===
+procedure TVideoController.LoadShape(const Data: string; X, Y: Double; Mode: Integer);
+var
+  PX, PY: Integer;
+  Width, Height: Integer;
+  SX, SY: Integer;
+  SrcPixel, DstPixel, NewPixel: UInt32;
+  DataIndex: Integer;
+begin
+  if FGraphicsMemory = nil then Exit;
+  if not IsInGraphicsMode then Exit;
+  if Length(Data) < 4 then Exit;
+
+  // Apply coordinate scaling if enabled
+  if FScaleEnabled then
+  begin
+    PX := Round(X * FModeInfo.NativeWidth / FScaleXMax);
+    PY := Round(Y * FModeInfo.NativeHeight / FScaleYMax);
+  end
+  else
+  begin
+    PX := Round(X);
+    PY := Round(Y);
+  end;
+
+  // Read dimensions from data
+  Width := Ord(Data[1]) or (Ord(Data[2]) shl 8);
+  Height := Ord(Data[3]) or (Ord(Data[4]) shl 8);
+
+  if Length(Data) < 4 + Width * Height * 4 then Exit;
+
+  // Copy pixel data with mode-specific blending
+  for SY := 0 to Height - 1 do
+    for SX := 0 to Width - 1 do
+    begin
+      // Bounds check
+      if (PX + SX < 0) or (PX + SX >= FModeInfo.NativeWidth) or
+         (PY + SY < 0) or (PY + SY >= FModeInfo.NativeHeight) then Continue;
+
+      DataIndex := 5 + (SY * Width + SX) * 4;
+      SrcPixel := (Ord(Data[DataIndex]) shl 24) or
+                  (Ord(Data[DataIndex + 1]) shl 16) or
+                  (Ord(Data[DataIndex + 2]) shl 8) or
+                  Ord(Data[DataIndex + 3]);
+
+      case Mode of
+        0: NewPixel := SrcPixel;  // As-is
+        1: NewPixel := not SrcPixel;  // Invert
+        2: begin  // OR
+             DstPixel := FGraphicsMemory.GetPixelRGBA(PX + SX, PY + SY);
+             NewPixel := SrcPixel or DstPixel;
+           end;
+        3: begin  // AND
+             DstPixel := FGraphicsMemory.GetPixelRGBA(PX + SX, PY + SY);
+             NewPixel := SrcPixel and DstPixel;
+           end;
+        4: begin  // XOR
+             DstPixel := FGraphicsMemory.GetPixelRGBA(PX + SX, PY + SY);
+             NewPixel := SrcPixel xor DstPixel;
+           end;
+        else
+          NewPixel := SrcPixel;
+      end;
+
+      FGraphicsMemory.SetPixelRGBA(PX + SX, PY + SY, NewPixel);
+    end;
+
+  // Sync to texture and present
+  SyncGraphicsBufferToTexture;
+  RenderGraphicsTexture;
+  Present;
 end;
 
 function TVideoController.SetGraphicMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
@@ -2974,7 +3411,13 @@ begin
   inherited Create;
   FTextBuffer := ATextBuffer;
   FVideoController := AVideoController;
+  FRenderScreenProc := nil;
   FInitialized := True;
+end;
+
+procedure TConsoleOutputAdapter.SetRenderCallback(AProc: TRenderScreenProc);
+begin
+  FRenderScreenProc := AProc;
 end;
 
 function TConsoleOutputAdapter.Initialize(const Title: string; Width, Height: Integer): Boolean;
@@ -3001,11 +3444,15 @@ procedure TConsoleOutputAdapter.PrintLn(const Text: string; ClearBackground: Boo
 begin
   FTextBuffer.PutString(Text);
   FTextBuffer.NewLine;
+  // Auto-present after newline for immediate display (like classic BASICs)
+  Present;
 end;
 
 procedure TConsoleOutputAdapter.NewLine;
 begin
   FTextBuffer.NewLine;
+  // Auto-present after newline for immediate display (like classic BASICs)
+  Present;
 end;
 
 procedure TConsoleOutputAdapter.Clear;
@@ -3062,7 +3509,10 @@ end;
 
 procedure TConsoleOutputAdapter.Present;
 begin
-  // Delegate to VideoController for graphics updates
+  // First render the TextBuffer content to screen via callback
+  if Assigned(FRenderScreenProc) then
+    FRenderScreenProc();
+  // Then present to display
   if Assigned(FVideoController) then
     FVideoController.Present;
 end;
@@ -3268,6 +3718,88 @@ begin
     Result := 255;
 end;
 
+// === COLOR command support ===
+procedure TConsoleOutputAdapter.SetColorSource(Source, Color: Integer);
+begin
+  if Assigned(FVideoController) then
+    FVideoController.SetColorSource(Source, Color);
+end;
+
+function TConsoleOutputAdapter.GetColorSource(Source: Integer): Integer;
+begin
+  if Assigned(FVideoController) then
+    Result := FVideoController.GetColorSource(Source)
+  else
+    Result := 0;
+end;
+
+// === WIDTH command support ===
+procedure TConsoleOutputAdapter.SetLineWidth(Width: Integer);
+begin
+  if Assigned(FVideoController) then
+    FVideoController.SetLineWidth(Width);
+end;
+
+// === SCALE command support ===
+procedure TConsoleOutputAdapter.SetScale(Enabled: Boolean; XMax, YMax: Integer);
+begin
+  if Assigned(FVideoController) then
+    FVideoController.SetScale(Enabled, XMax, YMax);
+end;
+
+// === PAINT command support ===
+procedure TConsoleOutputAdapter.FloodFill(Source: Integer; X, Y: Double; Mode: Integer);
+begin
+  if Assigned(FVideoController) then
+    FVideoController.FloodFill(Source, X, Y, Mode);
+end;
+
+// === WINDOW command support ===
+procedure TConsoleOutputAdapter.SetWindow(Col1, Row1, Col2, Row2: Integer; DoClear: Boolean);
+begin
+  if Assigned(FVideoController) then
+    FVideoController.SetWindow(Col1, Row1, Col2, Row2, DoClear);
+end;
+
+function TConsoleOutputAdapter.GetWindowLines: Integer;
+begin
+  if Assigned(FVideoController) then
+    Result := FVideoController.GetWindowLines
+  else
+    Result := 25;
+end;
+
+function TConsoleOutputAdapter.GetWindowCols: Integer;
+begin
+  if Assigned(FVideoController) then
+    Result := FVideoController.GetWindowCols
+  else
+    Result := 40;
+end;
+
+function TConsoleOutputAdapter.GetScreenWidth: Integer;
+begin
+  if Assigned(FVideoController) then
+    Result := FVideoController.GetScreenWidth
+  else
+    Result := 40;
+end;
+
+// === SSHAPE/GSHAPE command support ===
+function TConsoleOutputAdapter.SaveShape(X1, Y1, X2, Y2: Double): string;
+begin
+  if Assigned(FVideoController) then
+    Result := FVideoController.SaveShape(X1, Y1, X2, Y2)
+  else
+    Result := '';
+end;
+
+procedure TConsoleOutputAdapter.LoadShape(const Data: string; X, Y: Double; Mode: Integer);
+begin
+  if Assigned(FVideoController) then
+    FVideoController.LoadShape(Data, X, Y, Mode);
+end;
+
 procedure TConsoleOutputAdapter.DrawCircleWithColor(X, Y, XR, YR: Integer; Color: UInt32;
                                                    SA: Double; EA: Double; Angle: Double; Inc: Double);
 begin
@@ -3347,10 +3879,35 @@ begin
   // Initialize bytecode mode
   FBytecodeMode := False;
   FLoadedBytecode := nil;
+
+  // Initialize AUTO line numbering (disabled by default)
+  FAutoLineNumber := 0;
+  FAutoLineIncrement := 10;
+
+  // Initialize debug mode (disabled by default)
+  FDebugMode := False;
+  FTraceActive := False;
+  FDebugger := TSedaiDebugger.Create;
+  FDebugger.OnTrace := @HandleDebuggerTrace;
+  FDebugger.OnPause := @HandleDebuggerPause;
+  // Connect debugger to VM
+  FBytecodeVM.SetDebugger(FDebugger);
+
+  // Initialize error tracking
+  FLastErrorLine := 0;
+  FLastErrorCode := 0;
+  FLastErrorMessage := '';
 end;
 
 destructor TSedaiNewConsole.Destroy;
 begin
+  // Free debugger first (before VM)
+  if Assigned(FDebugger) then
+  begin
+    FDebugger.Free;
+    FDebugger := nil;
+  end;
+
   // Free VM components first
   if Assigned(FBytecodeVM) then
   begin
@@ -3485,6 +4042,33 @@ begin
   Result := 'RAM info unavailable';
 end;
 {$ENDIF}
+
+{ Debugger callback: trace output (prints line numbers during execution) }
+procedure TSedaiNewConsole.HandleDebuggerTrace(Sender: TObject; LineNumber: Integer);
+begin
+  if Assigned(FTextBuffer) then
+    FTextBuffer.PutString('[' + IntToStr(LineNumber) + ']');
+end;
+
+{ Debugger callback: pause (breakpoint hit or step completed) }
+procedure TSedaiNewConsole.HandleDebuggerPause(Sender: TObject; LineNumber: Integer; const Reason: string);
+begin
+  if Assigned(FTextBuffer) then
+  begin
+    FTextBuffer.NewLine;
+    FTextBuffer.PutString('BREAK AT LINE ' + IntToStr(LineNumber));
+    if Reason <> '' then
+      FTextBuffer.PutString(' (' + Reason + ')');
+    FTextBuffer.NewLine;
+    FTextBuffer.PutString('READY.');
+    FTextBuffer.NewLine;
+  end;
+  // Force screen update
+  RenderScreen;
+  UpdateCursor;
+  if Assigned(FVideoController) then
+    FVideoController.Present;
+end;
 
 procedure TSedaiNewConsole.ShowSplashScreen;
 var
@@ -3626,6 +4210,7 @@ begin
 
   // Create the adapter for output that writes to the TextBuffer
   FConsoleOutputAdapter := TConsoleOutputAdapter.Create(FTextBuffer, FVideoController);
+  FConsoleOutputAdapter.SetRenderCallback(@Self.RenderScreen);  // Set callback for RenderScreen calls
   {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: ConsoleOutputAdapter created');{$ENDIF}
 
   // Connect I/O devices to VM
@@ -3876,6 +4461,16 @@ begin
                 FProgramMemory.StoreLine(ParseResult.LineNumber, ParseResult.Statement);
                 {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: Program lines now: ', FProgramMemory.GetLineCount);{$ENDIF}
               end;
+
+              // AUTO mode: if active, prepare next line number
+              if FAutoLineNumber > 0 then
+              begin
+                // Advance to next line number
+                FAutoLineNumber := FAutoLineNumber + FAutoLineIncrement;
+                // Put it in the input buffer
+                FInputBuffer := IntToStr(FAutoLineNumber) + ' ';
+                FInputPos := Length(FInputBuffer);
+              end;
             end;
             // After inserting a line: no additional output, cursor already at new line
           end;
@@ -3903,7 +4498,13 @@ begin
                 try
                   FBytecodeVM.Reset;
                   FBytecodeVM.LoadProgram(BytecodeProgram);
-                  FBytecodeVM.Run;
+                  if FDebugMode then
+                  begin
+                    FDebugger.Reset;
+                    FBytecodeVM.RunDebug;
+                  end
+                  else
+                    FBytecodeVM.Run;
                 except
                   on E: Exception do
                   begin
@@ -3944,6 +4545,9 @@ begin
 
           if CmdWord = kRUN then
           begin
+            // RUN disables AUTO mode
+            FAutoLineNumber := 0;
+
             // Parse RUN argument: can be empty, line number, or filename
             Filename := Trim(Copy(ParseResult.Statement, Length(kRUN) + 1, MaxInt));
 
@@ -3987,7 +4591,13 @@ begin
                       try
                         FBytecodeVM.Reset;
                         FBytecodeVM.LoadProgram(BytecodeProgram);
-                        FBytecodeVM.Run;
+                        if FDebugMode then
+                        begin
+                          FDebugger.Reset;
+                          FBytecodeVM.RunDebug;
+                        end
+                        else
+                          FBytecodeVM.Run;
                       except
                         on E: Exception do
                         begin
@@ -4025,7 +4635,13 @@ begin
                 try
                   FBytecodeVM.Reset;
                   FBytecodeVM.LoadProgram(FLoadedBytecode);
-                  FBytecodeVM.Run;
+                  if FDebugMode then
+                  begin
+                    FDebugger.Reset;
+                    FBytecodeVM.RunDebug;
+                  end
+                  else
+                    FBytecodeVM.Run;
                 except
                   on E: Exception do
                   begin
@@ -4075,7 +4691,13 @@ begin
                       FBytecodeVM.Reset;
                       FBytecodeVM.LoadProgram(BytecodeProgram);
                       WriteLn('>>> RUN: Calling FBytecodeVM.Run...');
-                      FBytecodeVM.Run;
+                      if FDebugMode then
+                      begin
+                        FDebugger.Reset;
+                        FBytecodeVM.RunDebug;
+                      end
+                      else
+                        FBytecodeVM.Run;
                       WriteLn('>>> RUN: FBytecodeVM.Run completed');
                     except
                       on E: Exception do
@@ -4249,10 +4871,121 @@ begin
               Lines.Free;
             end;
           end
+          else if CmdWord = kEDIT then
+          begin
+            // EDIT n - Edit a single program line
+            if FBytecodeMode then
+            begin
+              FTextBuffer.PutString('?BYTECODE LOADED - NO SOURCE');
+              FTextBuffer.NewLine;
+            end
+            else
+            begin
+              Filename := Trim(Copy(ParseResult.Statement, Length(kEDIT) + 1, MaxInt));
+              if TryStrToInt(Filename, LineNum) then
+              begin
+                // Get the line content
+                Lines := FProgramMemory.GetLinesInRange(LineNum, LineNum);
+                try
+                  if (Lines <> nil) and (Lines.Count > 0) then
+                  begin
+                    // Put the line in the input buffer for editing
+                    FInputBuffer := Lines[0];
+                    FInputPos := Length(FInputBuffer);
+                    // Render immediately so user sees the line
+                    RenderScreen;
+                    UpdateCursor;
+                    FVideoController.Present;
+                  end
+                  else
+                  begin
+                    FTextBuffer.PutString('?LINE NOT FOUND');
+                    FTextBuffer.NewLine;
+                  end;
+                finally
+                  if Assigned(Lines) then
+                    Lines.Free;
+                end;
+              end
+              else
+              begin
+                FTextBuffer.PutString('?SYNTAX ERROR');
+                FTextBuffer.NewLine;
+              end;
+            end;
+          end
+          else if CmdWord = kAUTO then
+          begin
+            // AUTO [increment] - Enable/disable automatic line numbering
+            if FBytecodeMode then
+            begin
+              FTextBuffer.PutString('?BYTECODE LOADED - NO SOURCE');
+              FTextBuffer.NewLine;
+            end
+            else
+            begin
+              Filename := Trim(Copy(ParseResult.Statement, Length(kAUTO) + 1, MaxInt));
+              if Filename = '' then
+              begin
+                // AUTO without argument - turn off auto numbering
+                FAutoLineNumber := 0;
+                FTextBuffer.PutString('AUTO OFF');
+                FTextBuffer.NewLine;
+              end
+              else if TryStrToInt(Filename, LineNum) then
+              begin
+                if LineNum > 0 then
+                begin
+                  // Set increment and start from line 10 (or next available)
+                  FAutoLineIncrement := LineNum;
+                  // Find next available line number
+                  Lines := FProgramMemory.GetAllLines;
+                  try
+                    if (Lines <> nil) and (Lines.Count > 0) then
+                    begin
+                      // Get last line number and add increment
+                      // Lines are formatted as "linenum content"
+                      i := 0;
+                      for j := 0 to Lines.Count - 1 do
+                      begin
+                        if TryStrToInt(Copy(Lines[j], 1, Pos(' ', Lines[j]) - 1), LineNum) then
+                          if LineNum > i then
+                            i := LineNum;
+                      end;
+                      FAutoLineNumber := ((i div FAutoLineIncrement) + 1) * FAutoLineIncrement;
+                    end
+                    else
+                      FAutoLineNumber := FAutoLineIncrement;
+                  finally
+                    if Assigned(Lines) then
+                      Lines.Free;
+                  end;
+                  // Put the first line number in the input buffer
+                  FInputBuffer := IntToStr(FAutoLineNumber) + ' ';
+                  FInputPos := Length(FInputBuffer);
+                  RenderScreen;
+                  UpdateCursor;
+                  FVideoController.Present;
+                end
+                else
+                begin
+                  FTextBuffer.PutString('?ILLEGAL QUANTITY');
+                  FTextBuffer.NewLine;
+                end;
+              end
+              else
+              begin
+                FTextBuffer.PutString('?SYNTAX ERROR');
+                FTextBuffer.NewLine;
+              end;
+            end;
+          end
           else if CmdWord = kNEW then
           begin
             FProgramMemory.Clear;
             // Reset bytecode mode
+            // Also disable AUTO mode
+            FAutoLineNumber := 0;
             FBytecodeMode := False;
             if Assigned(FLoadedBytecode) then
             begin
@@ -4262,6 +4995,134 @@ begin
             FTextBuffer.NewLine;
             FTextBuffer.PutString('READY.');
             FTextBuffer.NewLine;
+          end
+          else if CmdWord = kCONT then
+          begin
+            // CONT - Continue execution after STOP
+            if FBytecodeVM.Stopped then
+            begin
+              try
+                FBytecodeVM.Continue;
+              except
+                on E: Exception do
+                begin
+                  FTextBuffer.PutString(E.Message);
+                  FTextBuffer.NewLine;
+                end;
+              end;
+              FTextBuffer.NewLine;
+              FTextBuffer.PutString('READY.');
+              FTextBuffer.NewLine;
+            end
+            else if FDebugger.IsPaused then
+            begin
+              // Resume from debugger pause
+              FDebugger.Continue;
+              FBytecodeVM.RunDebug;
+              FTextBuffer.NewLine;
+              FTextBuffer.PutString('READY.');
+              FTextBuffer.NewLine;
+            end
+            else
+            begin
+              FTextBuffer.PutString('?CAN''T CONTINUE ERROR');
+              FTextBuffer.NewLine;
+              FTextBuffer.PutString('READY.');
+              FTextBuffer.NewLine;
+            end;
+          end
+          else if CmdWord = kTRON then
+          begin
+            // TRON - Enable debug mode
+            FDebugMode := True;
+            FDebugger.Activate;
+            FTextBuffer.PutString('TRACE ON');
+            FTextBuffer.NewLine;
+            FTextBuffer.PutString('READY.');
+            FTextBuffer.NewLine;
+          end
+          else if CmdWord = kTROFF then
+          begin
+            // TROFF - Disable debug mode
+            FDebugMode := False;
+            FDebugger.Deactivate;
+            FTextBuffer.PutString('TRACE OFF');
+            FTextBuffer.NewLine;
+            FTextBuffer.PutString('READY.');
+            FTextBuffer.NewLine;
+          end
+          else if CmdWord = 'BREAK' then
+          begin
+            // BREAK n - Set breakpoint at line n
+            // BREAK - List breakpoints
+            Filename := Trim(Copy(ParseResult.Statement, 6, MaxInt));
+            if Filename = '' then
+            begin
+              // List breakpoints
+              if FDebugger.GetBreakpointCount = 0 then
+                FTextBuffer.PutString('NO BREAKPOINTS')
+              else
+              begin
+                FTextBuffer.PutString('BREAKPOINTS:');
+                FTextBuffer.NewLine;
+                for i := 0 to FDebugger.GetBreakpointCount - 1 do
+                begin
+                  FTextBuffer.PutString('  LINE ' + IntToStr(FDebugger.GetBreakpointLine(i)));
+                  FTextBuffer.NewLine;
+                end;
+              end;
+            end
+            else if TryStrToInt(Filename, LineNum) then
+            begin
+              FDebugger.SetBreakpoint(LineNum);
+              FTextBuffer.PutString('BREAKPOINT SET AT LINE ' + IntToStr(LineNum));
+            end
+            else
+            begin
+              FTextBuffer.PutString('?SYNTAX ERROR');
+            end;
+            FTextBuffer.NewLine;
+            FTextBuffer.PutString('READY.');
+            FTextBuffer.NewLine;
+          end
+          else if CmdWord = 'UNBREAK' then
+          begin
+            // UNBREAK n - Clear breakpoint at line n
+            // UNBREAK - Clear all breakpoints
+            Filename := Trim(Copy(ParseResult.Statement, 8, MaxInt));
+            if Filename = '' then
+            begin
+              FDebugger.ClearAllBreakpoints;
+              FTextBuffer.PutString('ALL BREAKPOINTS CLEARED');
+            end
+            else if TryStrToInt(Filename, LineNum) then
+            begin
+              FDebugger.ClearBreakpoint(LineNum);
+              FTextBuffer.PutString('BREAKPOINT CLEARED AT LINE ' + IntToStr(LineNum));
+            end
+            else
+            begin
+              FTextBuffer.PutString('?SYNTAX ERROR');
+            end;
+            FTextBuffer.NewLine;
+            FTextBuffer.PutString('READY.');
+            FTextBuffer.NewLine;
+          end
+          else if CmdWord = 'STEP' then
+          begin
+            // STEP - Step one line (only when paused)
+            if FDebugger.IsPaused then
+            begin
+              FDebugger.StepLine;
+              FBytecodeVM.RunDebug;
+            end
+            else
+            begin
+              FTextBuffer.PutString('?NOT IN DEBUG MODE');
+              FTextBuffer.NewLine;
+              FTextBuffer.PutString('READY.');
+              FTextBuffer.NewLine;
+            end;
           end
           else if (CmdWord = kLOAD) or (CmdWord = kDLOAD) then
           begin
@@ -4327,7 +5188,13 @@ begin
               try
                 FBytecodeVM.Reset;
                 FBytecodeVM.LoadProgram(FLoadedBytecode);
-                FBytecodeVM.Run;
+                if FDebugMode then
+                begin
+                  FDebugger.Reset;
+                  FBytecodeVM.RunDebug;
+                end
+                else
+                  FBytecodeVM.Run;
               except
                 on E: Exception do
                 begin
@@ -6418,7 +7285,23 @@ end;
 
 function TInputHandler.KeyPressed: Boolean;
 begin
-  Result := HasChar;
+  Result := FHasChar;
+end;
+
+function TInputHandler.HasChar: Boolean;
+begin
+  Result := FHasChar;
+end;
+
+function TInputHandler.GetLastChar: string;
+begin
+  if FHasChar then
+  begin
+    Result := FLastChar;
+    FHasChar := False;  // Consume the character
+  end
+  else
+    Result := '';
 end;
 
 function TInputHandler.ShouldQuit: Boolean;

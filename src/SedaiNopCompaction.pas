@@ -115,20 +115,29 @@ begin
   end;
 end;
 
-function IsJumpOrBranchOp(OpCode: Byte): Boolean;
+function IsJumpOrBranchOp(OpCode: Word): Boolean;
 begin
   // Check base bytecode jump instructions
-  case TBytecodeOp(OpCode) of
-    bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall:
+  case OpCode of
+    Ord(bcJump), Ord(bcJumpIfZero), Ord(bcJumpIfNotZero), Ord(bcCall):
+      Result := True;
+    // Fused compare-and-branch (Int)
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt:
+      Result := True;
+    // Fused compare-and-branch (Float)
+    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat:
+      Result := True;
+    // Fused compare-zero-and-branch
+    bcBranchEqZeroInt, bcBranchNeZeroInt, bcBranchEqZeroFloat, bcBranchNeZeroFloat:
+      Result := True;
+    // Fused loop increment-and-branch
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt:
+      Result := True;
+    // Array load and branch
+    bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ:
       Result := True;
   else
-    // Check superinstruction branch opcodes (values >= 110)
-    Result := (OpCode >= 110) and (OpCode <= 115)  // bcBranchEqInt..bcBranchGeInt
-           or (OpCode >= 120) and (OpCode <= 125)  // bcBranchEqFloat..bcBranchGeFloat
-           or (OpCode >= 170) and (OpCode <= 171)  // bcBranchEqZeroInt, bcBranchNeZeroInt
-           or (OpCode >= 180) and (OpCode <= 181)  // bcBranchEqZeroFloat, bcBranchNeZeroFloat
-           or (OpCode >= 200) and (OpCode <= 203)  // bcAddIntToBranchLe..bcSubIntToBranchGt
-           or (OpCode >= 250) and (OpCode <= 251); // bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ
+    Result := False;
   end;
 end;
 

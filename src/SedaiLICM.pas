@@ -556,12 +556,13 @@ begin
       Result := True;
 
     // Logical - safe
-    ssaLogicalAnd, ssaLogicalOr, ssaLogicalNot:
+    ssaLogicalAnd, ssaLogicalOr, ssaLogicalXor, ssaLogicalNot:
       Result := True;
 
     // Math functions - safe
     ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathLog, ssaMathExp,
-    ssaMathSqr, ssaMathAbs, ssaMathSgn, ssaMathInt:
+    ssaMathSqr, ssaMathAbs, ssaMathSgn, ssaMathInt,
+    ssaMathLog10, ssaMathLog2, ssaMathLogN:
       Result := True;
 
     // Load constant - safe but usually not worth hoisting

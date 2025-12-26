@@ -28,7 +28,7 @@ unit SedaiOutputInterface;
 interface
 
 uses
-  Classes, SysUtils, SedaiGraphicsTypes;
+  Classes, SysUtils, SedaiGraphicsTypes, SedaiSpriteTypes;
 
 type
   TOutputType = (otSDL2, otFile, otStringList);
@@ -153,6 +153,29 @@ type
     function GetPixelCursorX: Integer;
     function GetPixelCursorY: Integer;
 
+    // Color sources (C128-compatible, 0-6)
+    procedure SetColorSource(Source, Color: Integer);
+    function GetColorSource(Source: Integer): Integer;
+
+    // Line width (1 or 2)
+    procedure SetLineWidth(Width: Integer);
+
+    // Coordinate scaling
+    procedure SetScale(Enabled: Boolean; XMax, YMax: Integer);
+
+    // Flood fill
+    procedure FloodFill(Source: Integer; X, Y: Double; Mode: Integer);
+
+    // Text window
+    procedure SetWindow(Col1, Row1, Col2, Row2: Integer; DoClear: Boolean);
+    function GetWindowLines: Integer;
+    function GetWindowCols: Integer;
+    function GetScreenWidth: Integer;
+
+    // Shape save/load
+    function SaveShape(X1, Y1, X2, Y2: Double): string;
+    procedure LoadShape(const Data: string; X, Y: Double; Mode: Integer);
+
     // Style state management
     procedure SetBorderStyle(const Style: TBorderStyle);
     procedure SetFillStyle(const Style: TFillStyleDef);
@@ -179,6 +202,10 @@ type
     function ReadKey: Char;
     function KeyPressed: Boolean;
 
+    // Non-blocking character input (for GET command)
+    function HasChar: Boolean;          // Returns true if a character is available
+    function GetLastChar: string;       // Returns the last character pressed (or empty string)
+
     // Stato input
     function ShouldQuit: Boolean;       // CTRL+ALT+END: exit application
     function ShouldStop: Boolean;       // CTRL+C: stop BASIC program
@@ -187,6 +214,129 @@ type
 
     // Reset
     procedure Reset;
+  end;
+
+  { ISpriteManager - Sprite management interface
+    Based on Commodore 128 BASIC 7.0 sprite system with modern extensions.
+    Supports up to MAX_SPRITES sprites with variable dimensions,
+    automatic movement, and collision detection. }
+  ISpriteManager = interface
+    ['{SPRITE-MGR-0001-0001-000000000001}']
+
+    // === Basic Sprite Commands ===
+
+    // SPRITE n [,on/off] [,color] [,priority] [,x-exp] [,y-exp] [,mode]
+    // Sets sprite properties. Pass -1 for parameters to keep current value.
+    procedure SetSprite(Num: Integer; Enabled: Integer; const Color: TSpriteColor;
+                        Priority: Integer; ScaleX, ScaleY: Double;
+                        MulticolorMode: Integer);
+
+    // MOVSPR n, x, y - Position sprite at absolute coordinates
+    procedure MoveSpriteAbs(Num: Integer; X, Y: Double);
+
+    // MOVSPR n, +/-x, +/-y - Move sprite relative to current position
+    procedure MoveSpriteRel(Num: Integer; DX, DY: Double);
+
+    // MOVSPR n, distance;angle - Move sprite by distance at angle (one-time)
+    procedure MoveSpritePolar(Num: Integer; Distance: Double; Angle: Double);
+
+    // MOVSPR n, angle#speed - Start automatic continuous movement
+    // Speed 0 stops movement
+    procedure MoveSpriteAuto(Num: Integer; Angle: Double; Speed: Double);
+
+    // SPRCOLOR [mc1] [,mc2] - Set global multicolors for all sprites
+    // Pass color with Index=255 to keep current value
+    procedure SetSpriteMulticolors(const MC1, MC2: TSpriteColor);
+
+    // SPRSAV sprite, string$ - Save sprite data to string
+    procedure SaveSpriteToString(Num: Integer; out Data: string);
+
+    // SPRSAV string$, sprite - Load sprite data from string
+    procedure LoadSpriteFromString(const Data: string; Num: Integer);
+
+    // SPRSAV sprite1, sprite2 - Copy sprite data between sprites
+    procedure CopySpriteToSprite(SrcNum, DstNum: Integer);
+
+    // COLLISION type, line - Set collision handler
+    // type: 1=sprite-sprite, 2=sprite-display, 3=lightpen
+    // line: BASIC line number for GOSUB (-1 to disable)
+    procedure SetCollisionHandler(CollisionType: Integer; LineNumber: Integer);
+
+    // === Sprite Query Functions ===
+
+    // BUMP(n) - Return collision bitmask
+    // n=1: sprite-to-sprite collisions
+    // n=2: sprite-to-display collisions
+    // Returns bitmask where bit N-1 corresponds to sprite N
+    // Reading clears the collision flags
+    function GetCollisionStatus(CollisionType: Integer): Cardinal;
+
+    // RSPCOLOR(n) - Return global multicolor value
+    // n=1: multicolor 1, n=2: multicolor 2
+    function GetMulticolor(N: Integer): TSpriteColor;
+
+    // RSPPOS(sprite, n) - Return sprite position/speed
+    // n=0: X position, n=1: Y position, n=2: speed
+    function GetSpritePosition(Num, Attr: Integer): Double;
+
+    // RSPRITE(sprite, n) - Return sprite attribute
+    // n=0: enabled, n=1: color, n=2: priority,
+    // n=3: x-expand, n=4: y-expand, n=5: multicolor mode
+    function GetSpriteAttribute(Num, Attr: Integer): Integer;
+
+    // === Sprite Data Management (Modern Extensions) ===
+
+    // Set sprite dimensions (default is 24x21 for C128 compatibility)
+    procedure SetSpriteSize(Num: Integer; Width, Height: Integer);
+
+    // Get sprite dimensions
+    function GetSpriteWidth(Num: Integer): Integer;
+    function GetSpriteHeight(Num: Integer): Integer;
+
+    // Set sprite image data directly
+    procedure SetSpriteData(Num: Integer; const Data: TBytes);
+
+    // Get sprite image data
+    function GetSpriteData(Num: Integer): TBytes;
+
+    // === Update and Rendering ===
+
+    // Update all sprites (called each frame)
+    // - Updates positions for sprites with automatic movement
+    // - Checks for collisions
+    // - Queues collision events
+    // DeltaTime: time since last frame in seconds
+    procedure UpdateSprites(DeltaTime: Double);
+
+    // Check if there are pending collision events
+    function HasPendingCollision: Boolean;
+
+    // Get next collision event (returns False if none pending)
+    function GetNextCollision(out Event: TCollisionEvent): Boolean;
+
+    // Render all enabled sprites to the display
+    // Should be called after UpdateSprites and before Present
+    procedure RenderSprites;
+
+    // === Configuration ===
+
+    // Set whether colors are indexed (palette) or RGBA
+    // This is typically set based on graphics mode
+    procedure SetIndexedColorMode(Indexed: Boolean);
+    function GetIndexedColorMode: Boolean;
+
+    // Enable/disable pixel-perfect collision detection
+    // When disabled, uses faster bounding-box detection
+    procedure SetPixelPerfectCollision(Enabled: Boolean);
+    function GetPixelPerfectCollision: Boolean;
+
+    // === Initialization ===
+
+    // Reset all sprites to default state
+    procedure ResetAllSprites;
+
+    // Get sprite info (for debugging/inspection)
+    function GetSpriteInfo(Num: Integer): TSpriteInfo;
   end;
 
 implementation

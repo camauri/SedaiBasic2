@@ -175,6 +175,7 @@ begin
     // Math functions (pure and deterministic)
     ssaMathAbs, ssaMathSgn, ssaMathInt, ssaMathSqr,
     ssaMathSin, ssaMathCos, ssaMathTan, ssaMathExp, ssaMathLog,
+    ssaMathLog10, ssaMathLog2, ssaMathLogN,
 
     // Array loads (pure if indices are same - we check this separately)
     ssaArrayLoad
