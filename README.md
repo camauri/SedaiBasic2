@@ -1,646 +1,365 @@
-# Sedai Audio Foundation
+# SedaiBasic2 Interpreter with VM
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Maurizio%20Cammalleri-0077B5?logo=linkedin)](https://www.linkedin.com/in/maurizio-cammalleri-80a89a11/)
 [![Substack](https://img.shields.io/badge/Substack-Maurizio%20Cammalleri-FF6719?logo=substack)](https://cammalleri.substack.com/)
 
-> **DISCLAIMER**: This library is in advanced development stage but **not yet ready for any use**. The API is unstable, many features are incomplete or broken, and there are known bugs. However, we encourage you to try it out and report any bugs or suggest improvements! Your feedback is valuable to help us improve the library.
-
-A professional-grade, modular audio synthesis and MIDI playback library written in Free Pascal.
-
-## Overview
-
-Sedai Audio Foundation provides a comprehensive audio synthesis framework with:
-
-- **3 Independent Synthesis Engines**: Classic (Subtractive), FM, and Wavetable
-- **Real-time MIDI Playback**: Standard MIDI file support with 16-channel polyphony
-- **Audio Effects**: Delay, Reverb, Chorus, Flanger, Distortion
-- **Advanced Filters**: 6 filter types with multi-pole cascading
-- **40+ Built-in Presets**: Ready-to-use sounds for all synthesis types
-- **Cross-Platform**: Works on Linux and Windows via SDL2
-
----
-
-## Technologies
-
-### Core Technologies
-
-| Technology | Version | Purpose |
-|------------|---------|---------|
-| **Free Pascal** | 3.0.4+ | Primary programming language |
-| **SDL2** | 2.0+ | Cross-platform audio device access |
-| **Lazarus** | Optional | IDE support |
-
-### Audio Technologies
-
-| Component | Technology |
-|-----------|------------|
-| **Sample Rate** | 44100 Hz (CD quality) |
-| **Bit Depth** | 32-bit floating point internal processing |
-| **Buffer Size** | 1024 samples (~23ms latency) |
-| **Voice Polyphony** | 32-128 voices (configurable) |
-
-### Synthesis Technologies
-
-| Engine | Description |
-|--------|-------------|
-| **Classic/Subtractive** | Analog-style synthesis with oscillators, filters, LFO |
-| **FM (Frequency Modulation)** | DX7-style 6-operator FM synthesis |
-| **Wavetable** | Modern wavetable synthesis with morphing |
-| **Additive** | Harmonic spectrum synthesis |
-
-### Signal Processing
-
-| Technology | Description |
-|------------|-------------|
-| **ADSR Envelopes** | 4-stage envelopes with 4 curve types (Linear, Exponential, Logarithmic, S-Curve) |
-| **Biquad Filters** | Low-pass, High-pass, Band-pass, Notch, Allpass, Peaking |
-| **Multi-pole Filters** | 12dB, 24dB, 48dB per octave cascaded filters |
-| **Audio Effects** | Delay, Reverb, Chorus, Flanger, Distortion |
-| **Stereo Processing** | Panning, stereo width control |
-
-### MIDI Technologies
-
-| Component | Description |
-|-----------|-------------|
-| **MIDI Parser** | Standard MIDI File (SMF) Format 0 and 1 |
-| **MIDI Sequencer** | Real-time event scheduling with tempo control |
-| **Channel Support** | 16 MIDI channels with per-channel configuration |
-| **Controllers** | Pitch bend, modulation wheel, velocity |
-
-### Wavetable Formats
-
-| Format | Extension | Description |
-|--------|-----------|-------------|
-| **Serum** | .wav | 2048 samples per frame, industry standard |
-| **Vital** | .wav | Serum-compatible format |
-| **Surge/SurgeXT** | .wt | Native Surge wavetable format |
-| **Generic WAV** | .wav | Standard audio files |
-
-### Platforms
-
-| Platform | Compiler Target | Status |
-|----------|-----------------|--------|
-| **Windows 10/11** | x86_64-win64, i386-win32 | Supported |
-| **Linux** | x86_64-linux, i386-linux | Supported |
-| **macOS** | x86_64-darwin, aarch64-darwin | Planned |
-
----
-
-## Architecture
-
-### Layer Structure
-
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Layer 5: Applications & Demos                          │
-│  audiotest.lpr, demo_*.pas                              │
-├─────────────────────────────────────────────────────────┤
-│  Layer 4: High-Level API                                │
-│  SedaiAudioFoundation, SedaiMIDIFoundation              │
-├─────────────────────────────────────────────────────────┤
-│  Layer 3: Integration                                   │
-│  SedaiAudioChip (SDL2), SedaiSynthesisEngine            │
-├─────────────────────────────────────────────────────────┤
-│  Layer 2: Synthesis Engines                             │
-│  SedaiClassicProcessor, SedaiFMProcessor,               │
-│  SedaiWavetableProcessor                                │
-├─────────────────────────────────────────────────────────┤
-│  Layer 1: Foundation                                    │
-│  SedaiAudioTypes, SedaiADSRProcessor, SedaiWaveGenerator│
-│  SedaiFilters, SedaiAudioEffects, SedaiMIDITypes        │
-└─────────────────────────────────────────────────────────┘
+   ____           _       _ ____            _      ____
+  / ___|  ___  __| | __ _(_) __ )  __ _ ___(_) ___|___ \
+  \___ \ / _ \/ _` |/ _` | |  _ \ / _` / __| |/ __| __) |
+   ___) |  __/ (_| | (_| | | |_) | (_| \__ \ | (__ / __/
+  |____/ \___|\__,_|\__,_|_|____/ \__,_|___/_|\___|_____|
 ```
 
-### Module Overview
+## Documentation
 
-| Module | Description |
-|--------|-------------|
-| **SedaiAudioTypes** | Core types: TWaveType, TADSR, TStereoSample |
-| **SedaiAudioFoundation** | Main public API for synthesis and playback |
-| **SedaiAudioChip** | SDL2 audio device management |
-| **SedaiSynthesisEngine** | Voice allocation and routing |
-| **SedaiClassicProcessor** | Subtractive synthesis (3 oscillators, filters, LFO) |
-| **SedaiFMProcessor** | FM synthesis (6 operators, 5 algorithms) |
-| **SedaiWavetableProcessor** | Wavetable synthesis (4 oscillators, morphing) |
-| **SedaiADSRProcessor** | Envelope generator (4 curve types) |
-| **SedaiWaveGenerator** | Basic waveform generation |
-| **SedaiFilters** | Biquad and multi-pole filters |
-| **SedaiAudioEffects** | Delay, Reverb, Chorus, Flanger, Distortion |
-| **SedaiStereoProcessor** | Stereo panning and width |
-| **SedaiMIDIParser** | Standard MIDI file parser |
-| **SedaiMIDISequencer** | Real-time MIDI playback |
-| **SedaiMIDIFoundation** | High-level MIDI API |
-| **SedaiWavetableLoader** | Multi-format wavetable loader |
+> **Note:** This README provides an overview. For detailed information, see:
+> - [BASIC.md](BASIC.md) - Complete list of BASIC commands with implementation status
+> - [CONSOLE.md](CONSOLE.md) - Keyboard shortcuts and graphics mode reference
+> - [ROADMAP.md](ROADMAP.md) - Future directions and project architecture
 
----
+## What is SedaiBasic2?
 
-## Synthesis Engines
+SedaiBasic2 is a modern reimplementation of Commodore BASIC v7. At the current stage of development, it supports the **Tiny BASIC** subset plus:
 
-### Classic (Subtractive) Synthesis
+- Multi-dimensional arrays
+- Integer type variables (suffix `%`)
+- High-performance register-based bytecode VM
 
-- Up to 3 oscillators per voice
-- 5 waveform types: Sine, Square, Sawtooth, Triangle, Noise
-- Subtractive filter with resonance
-- LFO modulation (pitch, filter, amplitude)
-- Per-oscillator ADSR envelopes
+The interpreter features a complete compilation pipeline: Lexer, Parser, SSA IR optimizer, and bytecode compiler targeting a fast register-based virtual machine.
 
-**Presets**: sine, square, saw, triangle, lead, bass, pad, strings, brass, organ, pluck, synthkeys, warmbass
-
-### FM Synthesis
-
-- 6 operators (DX7-style)
-- 5 algorithms: Simple, Stack, Parallel, Feedback, Complex
-- Per-operator ADSR envelopes
-- Operator feedback control
-- Modulation depth scaling
-
-**Presets**: epiano, brass, bell, organ, lead, bass, choir, fmstrings, fmpad, marimba, flute, churchbell
-
-### Wavetable Synthesis
-
-- Up to 4 oscillators per voice
-- Real-time wavetable morphing with interpolation
-- Multiple mix modes: Add, Multiply, Ring Modulation
-- Support for external wavetable formats
-
-**Presets**: serum, wasp, ppg, vocal, metallic, glass, organ, evolving, digitalchaos
-
-**Supported Wavetable Formats**: Serum (.wav, 2048 samples/frame), Vital (.wav), Surge/SurgeXT (.wt), Generic WAV
-
----
-
-## MIDI Support
-
-- Standard MIDI file format 0/1 parsing
-- 16-channel support with per-channel configuration
-- Real-time tempo control
-- Pitch bend and modulation wheel support
-- Velocity-sensitive playback
-- General MIDI program mapping to wavetable types
-
----
-
-## System Requirements
-
-### Compiler
-
-- **Free Pascal** 3.0.4 or higher
-- **Lazarus** (optional, for IDE support)
-
-### Dependencies
-
-- **SDL2** (Simple DirectMedia Layer 2)
-
-### Operating Systems
-
-- Linux (Ubuntu, Debian, Fedora, Arch)
-- Windows 10/11
-
----
-
-## Installation
-
-### Linux (Debian/Ubuntu)
-
-```bash
-sudo apt install fpc fp-units-base fp-units-rtl libsdl2-dev
-```
-
-### Linux (Fedora/RHEL)
-
-```bash
-sudo dnf install fpc SDL2-devel
-```
-
-### Linux (Arch)
-
-```bash
-sudo pacman -S fpc sdl2
-```
+## Setup
 
 ### Windows
 
-1. Download and install [Free Pascal](https://www.freepascal.org/download.html)
-2. Download [SDL2 Development Libraries](https://github.com/libsdl-org/SDL/releases)
-3. Place `SDL2.dll` in the project directory or system PATH
+#### PowerShell Execution Policy
 
----
+Windows may block PowerShell scripts by default. To enable script execution, choose one of these options:
 
-## Building
+**Option 1: Run scripts individually with bypass**
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+powershell -ExecutionPolicy Bypass -File .\benchmarks\benchmark.ps1
+```
+Note: You must use this syntax for each script you want to run.
 
-### Using Build Scripts
+**Option 2: Set execution policy permanently for current user (recommended)**
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+After this one-time setup, all local scripts will run without restrictions.
 
-The project includes cross-platform build scripts that support custom compiler paths.
+#### Running the Setup
 
-#### Linux
-
-```bash
-# Make script executable (first time only)
-chmod +x build.sh
-
-# Build with system FPC
-./build.sh
-
-# Build with custom FPC path
-./build.sh --fpc /path/to/fpc
-
-# Build only demos
-./build.sh --demos-only
-
-# Clean build artifacts
-./build.sh --clean
+```powershell
+# Full setup: download FPC and compile SedaiBasic2
+.\setup.ps1
 
 # Show help
-./build.sh --help
+.\setup.ps1 -Help
 ```
+
+This will:
+1. Download and install Free Pascal Compiler (FPC) 3.2.2 locally
+2. Compile SedaiBasic2 (`sb.exe`)
+
+#### Setup Options
+
+```powershell
+# Only download and install FPC (do not compile)
+.\setup.ps1 -FpcOnly
+
+# Only compile SedaiBasic2 (FPC must already be installed)
+.\setup.ps1 -BuildOnly
+
+# Force FPC reinstallation
+.\setup.ps1 -ForceFpc
+
+# Clean build directories and recompile
+.\setup.ps1 -Clean
+```
+
+### Linux
+
+> **Note:** Linux support is currently under development.
+
+```bash
+./setup.sh
+```
+
+### Build System
+
+SedaiBasic2 includes cross-platform build scripts for compiling all targets.
+
+#### Build Targets
+
+| Target | Description | Output |
+|--------|-------------|--------|
+| sb | SedaiBasic VM (interpreter) | sb.exe |
+| sbc | SedaiBasic Compiler | sbc.exe |
+| sbd | SedaiBasic Disassembler | sbd.exe |
+| sbv | SedaiVision (SDL2 graphical) | sbv.exe |
 
 #### Windows (PowerShell)
 
 ```powershell
-# Build with system FPC
+# Build all targets
 .\build.ps1
 
-# Build with custom FPC path
-.\build.ps1 -FpcPath "C:\FPC\3.2.2\bin\i386-win32\fpc.exe"
+# Build specific target
+.\build.ps1 -Target sb
 
-# Build only demos
-.\build.ps1 -DemosOnly
+# Build with debug info
+.\build.ps1 -Debug
 
-# Clean build artifacts
+# Clean and rebuild
 .\build.ps1 -Clean
 
+# Build for different platform
+.\build.ps1 -CPU x86_64 -OS win64
+```
+
+#### Linux/macOS (Bash)
+
+```bash
+# Build all targets
+./build.sh
+
+# Build specific target
+./build.sh sb
+
+# Build with debug info
+./build.sh --debug
+
+# Clean and rebuild
+./build.sh --clean
+```
+
+### Manual Installation
+
+If you prefer to install Free Pascal separately:
+
+1. **Download FPC** from [https://www.freepascal.org/download.html](https://www.freepascal.org/download.html)
+2. **Install** following the instructions for your platform
+3. **Compile** using the build scripts above, or manually:
+
+```bash
+# Example: compile sb (SedaiBasic VM)
+fpc -o"sb.exe" -Px86_64 -Twin64 -MObjFPC -O1 \
+    -CpCOREAVX2 -OpCOREAVX2 -CfAVX2 \
+    -OoREGVAR -OoCSE -OoDFA -OoFASTMATH -OoCONSTPROP \
+    -Xs -XX -Fusrc -Fulib/x86_64-win64 -FUlib/x86_64-win64 \
+    -FEbin/x86_64-win64 src/SedaiBasicVM.lpr
+```
+
+## Applications
+
+SedaiBasic2 provides four applications for different use cases:
+
+### SedaiBasic VM (Command Line Interpreter)
+
+The main interpreter for running BASIC programs from the command line.
+
+```bash
+sb [options] <program.bas>
+
+Options:
+  --help              Show this help message
+  --verbose           Show loading, lexing, parsing, and VM execution info
+  --dump-ast          Show AST structure after parsing
+  --disasm            Show bytecode disassembly
+  --no-exec           Compile only, do not execute (useful with --disasm)
+  --stats             Show execution statistics
+```
+
+**Examples:**
+```bash
+# Run a program
+sb bas\SIEVE.BAS
+
+# Show disassembly without executing
+sb --disasm --no-exec program.bas
+
+# Run with execution statistics
+sb --stats program.bas
+```
+
+### SedaiBasic Compiler
+
+Compiles BASIC source code to bytecode without executing. Useful for syntax checking and pre-compilation.
+
+```bash
+sbc [options] <program.bas>
+
+Options:
+  --help              Show this help message
+  --output, -o        Output bytecode file (default: program.basc)
+  --verbose           Show compilation details
+```
+
+**Examples:**
+```bash
+# Compile a program
+sbc program.bas
+
+# Compile with custom output name
+sbc -o compiled.basc program.bas
+```
+
+### SedaiBasic Disassembler
+
+Disassembles compiled bytecode files (.basc) to human-readable format.
+
+```bash
+sbd [options] <program.basc>
+
+Options:
+  --help              Show this help message
+  --verbose           Show additional bytecode details
+```
+
+**Examples:**
+```bash
+# Disassemble a compiled file
+sbd compiled.basc
+```
+
+### SedaiVision (SDL2 Graphical Console)
+
+Interactive graphical interpreter with SDL2-based console emulating C64/C128 display modes.
+
+```bash
+sbv [options] [program.bas]
+
+Options:
+  --help              Show this help message
+  --fullscreen        Start in fullscreen mode
+  --mode <n>          Set initial graphics mode (0-11)
+```
+
+**Features:**
+- C64/C128 compatible text modes (40x25, 80x25, 80x50)
+- Bitmap and multicolor graphics modes
+- SDL2 dynamic resolution support
+- Scrollback buffer with keyboard navigation
+- Command history
+
+**Graphics Modes:**
+
+| Mode | Resolution | Description |
+|------|------------|-------------|
+| 0 | 320x200 | 40x25 text mode (C64/C128 compatible) |
+| 1 | 320x200 | Standard bitmap mode |
+| 2 | 320x200 | Split screen: bitmap + text |
+| 3 | 160x200 | Multicolor bitmap (double-width pixels) |
+| 4 | 160x200 | Split screen: multicolor + text |
+| 5 | 640x200 | 80x25 text mode (C128 compatible) |
+| 6 | 640x200 | 640x200 hires bitmap |
+| 7 | 640x200 | Split screen: 640x160 bitmap + 80x5 text |
+| 8 | 640x400 | 80x50 text mode |
+| 9 | 640x400 | 640x400 hires bitmap |
+| 10 | 640x400 | Split screen: 640x360 bitmap + 80x5 text |
+| 11 | Variable | SDL2 dynamic resolution (use GLIST for available modes) |
+
+See [CONSOLE.md](CONSOLE.md) for keyboard shortcuts and detailed graphics mode documentation.
+
+**Examples:**
+```bash
+# Start interactive console
+sbv
+
+# Run a program in graphical mode
+sbv program.bas
+
+# Start fullscreen
+sbv --fullscreen
+```
+
+## Running BASIC Programs
+
+After setup, run a BASIC program with:
+
+```bash
+# Windows (command line)
+.\bin\x86_64-win64\sb program.bas
+
+# Windows (graphical)
+.\bin\x86_64-win64\sbv program.bas
+
+# Linux
+./bin/x86_64-linux/sb program.bas
+```
+
+### Example
+
+```bash
+.\bin\x86_64-win64\sb bas\SIEVE.BAS
+```
+
+## Benchmarking
+
+Run the benchmark suite to measure interpreter performance:
+
+```powershell
+# Run benchmarks with standard N values (may take 10-30 minutes)
+.\benchmarks\benchmark.ps1
+
+# Quick test with N values from source files
+.\benchmarks\benchmark.ps1 -Quick
+
+# Run 3 times in this session (results accumulate)
+.\benchmarks\benchmark.ps1 -Runs 3
+
+# Force re-run, ignoring cached session results
+.\benchmarks\benchmark.ps1 -Force
+
+# Clear all accumulated history and start fresh
+.\benchmarks\benchmark.ps1 -ClearHistory
+
+# Generate report from existing history (no benchmark run)
+.\benchmarks\benchmark.ps1 -Report
+
+# Use custom output filename
+.\benchmarks\benchmark.ps1 -Output "results.md"
+
 # Show help
-.\build.ps1 -Help
+.\benchmarks\benchmark.ps1 -Help
 ```
 
-#### Windows (Command Prompt)
+The benchmark suite runs programs from [The Computer Language Benchmarks Game](https://benchmarksgame-team.pages.debian.net/benchmarksgame/):
 
-```batch
-REM Build with system FPC
-build.bat
+| Benchmark | Description | N (standard) |
+|-----------|-------------|--------------|
+| fannkuch-redux | Indexed-access to tiny integer-sequence | 12 |
+| n-body | Double-precision N-body simulation | 50,000,000 |
+| spectral-norm | Eigenvalue using the power method | 5,500 |
 
-REM Build with custom FPC path
-build.bat --fpc "C:\FPC\3.2.2\bin\i386-win32\fpc.exe"
+#### Cumulative Statistics
 
-REM Build only demos
-build.bat --demos-only
+Each benchmark run is saved to a history file. Statistics (mean, median, standard deviation, percentiles) are calculated using **all accumulated runs** over time. This allows you to build reliable statistics by running the benchmark multiple times across different sessions, rather than requiring 20+ consecutive runs.
 
-REM Clean build artifacts
-build.bat --clean
-```
+**Important:** Runs are only committed to history when **all 3 benchmarks** complete successfully in a session. If a session is interrupted, runs remain pending and will not affect the cumulative statistics until the session is completed.
 
-### Manual Compilation
+#### Session Resume
 
-```bash
-# Compile main test program
-fpc -Mdelphi audiotest.lpr
+If a benchmark session is interrupted (e.g., user cancels or a benchmark fails), the next run will automatically detect the incomplete session and resume from where it left off, running only the remaining benchmarks.
 
-# Compile individual demos
-fpc -Mdelphi demo_presets.pas
-fpc -Mdelphi demo_midi_player.pas
-fpc -Mdelphi demo_filters_effects.pas
-fpc -Mdelphi demo_additive.pas
-```
+Use `-Quick` to run with N values from source files instead of standard values.
 
----
-
-## Demo Programs
-
-### audiotest
-
-The main test program with a comprehensive menu system.
-
-```bash
-./audiotest
-```
-
-**Features**:
-- Classic, FM, and Wavetable synthesis tests
-- MIDI file loading and playback
-- Channel mapping configuration
-- Tempo control
-- System status display
-
-### demo_presets
-
-Demonstrates all built-in synthesis presets.
-
-```bash
-./demo_presets
-```
-
-**Menu Options**:
-1. Classic Synthesis Presets (6 presets)
-2. FM Synthesis Presets (6 presets)
-3. Wavetable Presets (6 presets)
-4. Synthesis Engines Comparison
-5. Full Demo (all presets)
-
-### demo_midi_player
-
-Interactive MIDI file player with real-time controls.
-
-```bash
-./demo_midi_player
-```
-
-**Controls**:
-- `P` - Play/Pause
-- `S` - Stop
-- `+`/`-` - Volume control
-- `F`/`L` - Faster/Slower tempo
-- `I` - File info
-- `C` - Channel info
-- `T` - Playback status
-- `M` - Load another file
-- `Q` - Quit
-
-**Note**: Place a `.mid` file in the application directory or provide the full path when prompted.
-
-### demo_filters_effects
-
-Tests audio filters and effects processing.
-
-```bash
-./demo_filters_effects
-```
-
-**Tests**:
-- Biquad filters (LP, HP, BP, Notch, Allpass, Peaking)
-- Multi-pole filters (12dB, 24dB, 48dB/octave)
-- Effects (Delay, Reverb, Chorus, Flanger, Distortion)
-
-**Note**: This demo does NOT require audio output - it tests mathematical correctness.
-
-### demo_additive
-
-Demonstrates additive synthesis with harmonic control.
-
-```bash
-./demo_additive
-```
-
-**Features**:
-- Pure tone and complex wave generation
-- 6 harmonic spectrum presets
-- Harmonic vs. inharmonic synthesis comparison
-- Custom spectrum creation
-- ADSR envelope visualization
-
-**Note**: This demo does NOT require audio output.
-
----
-
-## Quick Start
-
-### Basic Usage
-
-```pascal
-program MyAudioApp;
-
-uses
-  SedaiAudioFoundation;
-
-begin
-  // Initialize audio system
-  if InitAudio(32) then  // 32 voices
-  begin
-    SetMasterVolume(0.7);
-
-    // Play a simple sine wave
-    PlaySine(440.0);  // A4 note
-    Sleep(1000);
-
-    // Play a wavetable preset
-    PlaySerum(261.63);  // C4 note
-    Sleep(1000);
-
-    // Play FM piano
-    PlayEPiano(329.63);  // E4 note
-    Sleep(1000);
-
-    StopAll;
-    ShutdownAudio;
-  end;
-end.
-```
-
-### MIDI Playback
-
-```pascal
-program MyMIDIPlayer;
-
-uses
-  SedaiAudioFoundation, SedaiMIDIFoundation;
-
-begin
-  if InitAudio(64) and InitMidi then
-  begin
-    SetMasterVolume(0.7);
-    SetupMidiGeneralMidi;
-
-    if LoadMidiFile('song.mid') then
-    begin
-      MidiPlay;
-
-      while IsMidiPlaying do
-        Sleep(100);
-
-      MidiStop;
-    end;
-
-    ShutdownMidi;
-    ShutdownAudio;
-  end;
-end.
-```
-
-### Advanced Voice Control
-
-```pascal
-var
-  VoiceIndex: Integer;
-begin
-  // Get voice index for advanced control
-  VoiceIndex := PlayWavetableAdv(440.0, 'serum');
-
-  if VoiceIndex >= 0 then
-  begin
-    SetVoicePan(VoiceIndex, -0.5);  // Pan left
-    Sleep(2000);
-    NoteOff(VoiceIndex);  // Release with ADSR
-  end;
-end;
-```
-
----
-
-## API Reference
-
-### Audio Initialization
-
-| Function | Description |
-|----------|-------------|
-| `InitAudio(VoiceCount)` | Initialize audio system with specified voice count |
-| `ShutdownAudio` | Shutdown audio system |
-| `SetMasterVolume(Volume)` | Set master volume (0.0-1.0) |
-| `GetMasterVolume` | Get current master volume |
-| `GetActiveVoices` | Get number of currently active voices |
-| `GetMaxVoices` | Get maximum voice count |
-| `GetSampleRate` | Get audio sample rate |
-| `PrintStatus` | Print voice status information |
-
-### Classic Synthesis
-
-| Function | Description |
-|----------|-------------|
-| `PlaySine(Freq)` | Play sine wave |
-| `PlaySquare(Freq)` | Play square wave |
-| `PlaySaw(Freq)` | Play sawtooth wave |
-| `PlayTriangle(Freq)` | Play triangle wave |
-| `PlayLead(Freq)` | Play lead preset |
-| `PlayBass(Freq)` | Play bass preset |
-| `PlayPad(Freq)` | Play pad preset |
-| `PlayClassic(Freq, Preset)` | Play classic preset |
-| `PlayClassicAdv(Freq, Preset)` | Play and return voice index |
-
-### FM Synthesis
-
-| Function | Description |
-|----------|-------------|
-| `PlayEPiano(Freq)` | Play electric piano |
-| `PlayFMBrass(Freq)` | Play FM brass |
-| `PlayFMBell(Freq)` | Play FM bell |
-| `PlayFMOrgan(Freq)` | Play FM organ |
-| `PlayFMLead(Freq)` | Play FM lead |
-| `PlayFMBass(Freq)` | Play FM bass |
-| `PlayFM(Freq, Preset)` | Play FM preset |
-| `PlayFMAdv(Freq, Preset)` | Play and return voice index |
-
-### Wavetable Synthesis
-
-| Function | Description |
-|----------|-------------|
-| `PlaySerum(Freq)` | Play Serum-style wavetable |
-| `PlayWasp(Freq)` | Play WASP-style wavetable |
-| `PlayPPG(Freq)` | Play PPG-style wavetable |
-| `PlayWavetable(Freq, Type)` | Play wavetable preset |
-| `PlayWavetableAdv(Freq, Type)` | Play and return voice index |
-
-### Voice Control
-
-| Function | Description |
-|----------|-------------|
-| `NoteOff(VoiceIndex)` | Release note (starts ADSR release) |
-| `NoteRelease(VoiceIndex)` | Alternative release function |
-| `SetVoicePan(VoiceIndex, Pan)` | Set voice pan (-1.0 to 1.0) |
-| `StopAll` | Stop all voices immediately |
-| `SmoothStopAll(FadeMs)` | Fade out all voices |
-
-### MIDI Voice Management
-
-| Function | Description |
-|----------|-------------|
-| `MidiAllocateVoice` | Allocate a MIDI voice, returns index or -1 |
-| `MidiIsVoiceActive(Index)` | Check if voice is active |
-| `MidiGetFreeVoiceCount` | Get number of available voices |
-| `MidiVoiceOn(Index)` | Start playing allocated voice |
-| `MidiVoiceOff(Index)` | Stop voice (ADSR release) |
-| `MidiReleaseVoice(Index)` | Stop and deallocate voice |
-| `MidiReleaseAllVoices` | Release all MIDI voices |
-
-### MIDI Voice Configuration
-
-| Function | Description |
-|----------|-------------|
-| `MidiSetVoiceFrequency(Index, Freq)` | Set voice frequency in Hz |
-| `MidiSetVoiceAmplitude(Index, Amp)` | Set amplitude (0.0-1.0) |
-| `MidiSetVoiceWavetable(Index, Type)` | Set wavetable preset |
-| `MidiSetVoicePan(Index, Pan)` | Set pan (-1.0 to 1.0) |
-| `MidiGetVoiceFrequency(Index)` | Get current frequency |
-| `MidiGetVoiceAmplitude(Index)` | Get current amplitude |
-| `MidiGetVoiceWavetable(Index)` | Get current wavetable |
-| `MidiGetVoicePan(Index)` | Get current pan |
-
-### MIDI Utility Functions
-
-| Function | Description |
-|----------|-------------|
-| `MidiNoteToFreq(Note)` | Convert MIDI note (0-127) to frequency Hz |
-| `MidiFreqToNote(Freq)` | Convert frequency to MIDI note |
-| `MidiVelocityToAmp(Velocity)` | Convert velocity (0-127) to amplitude |
-| `MidiAmpToVelocity(Amp)` | Convert amplitude to velocity |
-| `MidiPanToSedai(Pan)` | Convert MIDI pan (0-127) to Sedai (-1 to 1) |
-| `SedaiPanToMidi(Pan)` | Convert Sedai pan to MIDI pan |
-| `MidiNoteToName(Note)` | Get note name (e.g., "C4", "A#3") |
-| `MidiNoteToOctave(Note)` | Get octave number |
-
-### MIDI-Optimized Playback
-
-| Function | Description |
-|----------|-------------|
-| `PlayWavetableMidi(Freq, Type, Amp)` | Play with MIDI voice allocation |
-| `PlayMidiNote(Note, Velocity, Type)` | Play by MIDI note number |
-
-### MIDI File Playback
-
-| Function | Description |
-|----------|-------------|
-| `InitMidi` | Initialize MIDI system |
-| `ShutdownMidi` | Shutdown MIDI system |
-| `LoadMidiFile(Filename)` | Load a MIDI file |
-| `MidiPlay` | Start playback |
-| `MidiPause` | Pause playback |
-| `MidiStop` | Stop playback |
-| `IsMidiPlaying` | Check if playing |
-| `GetMidiProgress` | Get playback progress (0-100%) |
-| `SetMidiTempo(Percent)` | Set tempo (1.0 = normal) |
-| `SetupMidiGeneralMidi` | Apply General MIDI mapping |
-
-### Musical Helpers
-
-| Function | Description |
-|----------|-------------|
-| `PlayChordClassic(Note1, Note2, Note3, Preset)` | Play a classic chord |
-| `PlayChordFM(Note1, Note2, Note3, Preset)` | Play an FM chord |
-| `PlayChordWavetable(Note1, Note2, Note3, Preset)` | Play a wavetable chord |
-| `PlayScaleClassic(BaseFreq, Preset)` | Play a classic scale |
-| `PlayScaleFM(BaseFreq, Preset)` | Play an FM scale |
-| `PlayScaleWavetable(BaseFreq, Preset)` | Play a wavetable scale |
-
----
-
-## Code Metrics
-
-- **Total Lines**: ~11,500 lines of Pascal code
-- **Source Files**: 25 files (22 units + 3 programs)
-- **Dependencies**: SDL2 only
-- **Voice Polyphony**: 32 default (configurable up to 128)
-- **Sample Rate**: 44100 Hz
-- **Audio Buffer**: 1024 samples
-
----
+Results are saved to `benchmarks/results/BENCHMARKS.md` (or custom file with `-Output`) and displayed on screen.
 
 ## License
 
-This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
+Copyright (C) 2025 Maurizio Cammalleri
 
-You are free to use, modify, and distribute this software under the terms of the GPL-3.0 license. See the [LICENSE](LICENSE) file for details.
+This program is free software: you can redistribute it and/or modify it under the terms of the **GNU General Public License v3** as published by the Free Software Foundation.
+
+See the [LICENSE](LICENSE) file for the complete license text.
 
 ### Commercial Licensing
 
-For commercial use or proprietary licensing options, please contact the author:
+For commercial licensing inquiries, please contact the author:
 
 **Maurizio Cammalleri**
 Email: maurizio.cammalleri@gmail.com
-
----
-
-## Contributing
-
-For bug reports or suggestions, please open an issue on the project repository.
-
----
-
-**Enjoy Sedai Audio Foundation!**
