@@ -1,0 +1,123 @@
+#
+# Universal fpc.cfg for SedaiBasic2 project
+# Uses $BASEPATH to find FPC installation automatically
+#
+
+# ----------------------
+# Defines (preprocessor)
+# ----------------------
+
+#IFDEF RELEASE
+  -O2
+  -Xs
+#ENDIF
+
+#IFDEF DEBUG
+  -gl
+  -Crtoi
+#ELSE
+  -Xs
+#ENDIF
+
+#ifdef darwin
+-ap
+#endif
+
+# ----------------
+# Parsing switches
+# ----------------
+
+# Allow goto, inline, C-operators
+-Sgic
+
+# -----------------------
+# Set Filenames and Paths
+# -----------------------
+
+# $BASEPATH = directory containing fpc.exe (e.g. C:\lazarus-3.2\fpc\3.2.2\bin\x86_64-win64)
+# We need to go up 2 levels to get to the FPC root (e.g. C:\lazarus-3.2\fpc\3.2.2)
+
+# Search for unicode binary files
+#ifndef VER2
+-FM/unicode/
+#endif
+
+# Search for i8086 subdirectory first
+#ifdef cpui8086
+-Fu$BASEPATH/../../units/$fpctarget/$fpcsubarch-$fpcmemorymodel
+-Fu$BASEPATH/../../units/$fpctarget/$fpcsubarch-$fpcmemorymodel/*
+-Fu$BASEPATH/../../units/$fpctarget/$fpcsubarch-$fpcmemorymodel/rtl
+#endif
+
+# Searchpath for units - relative to FPC bin directory
+-Fu$BASEPATH/../../units/$fpctarget
+-Fu$BASEPATH/../../units/$fpctarget/*
+-Fu$BASEPATH/../../units/$fpctarget/rtl
+
+# Apache modules
+#IFDEF FPCAPACHE_1_3
+-Fu$BASEPATH/../../units/$fpctarget/httpd13/
+#ELSE
+#IFDEF FPCAPACHE_2_0
+-Fu$BASEPATH/../../units/$fpctarget/httpd20
+#ELSE
+-Fu$BASEPATH/../../units/$fpctarget/httpd22
+#ENDIF
+#ENDIF
+
+# Searchpath for fppkg user-specific packages
+-Fu$LOCAL_APPDATA/FreePascal/fppkg/units/$FPCTARGET/*
+
+# Searchpath for tools
+-FD$BASEPATH
+
+# Searchpath for libraries
+-Fl$BASEPATH/../../lib/$FPCTARGET
+
+# Cross-compiling support
+#IFNDEF CPUI386
+#IFNDEF CPUAMD64
+#DEFINE NEEDCROSSBINUTILS
+#ENDIF
+#ENDIF
+
+#IFNDEF Win64
+#DEFINE NEEDCROSSBINUTILS
+#ENDIF
+
+#ifdef cpujvm
+#undef NEEDCROSSBINUTILS
+#endif
+
+#ifdef android
+#undef NEEDCROSSBINUTILS
+#endif
+
+#ifdef cpui8086
+#undef NEEDCROSSBINUTILS
+#endif
+
+#IFDEF FPC_CROSSCOMPILING
+#IFDEF NEEDCROSSBINUTILS
+  -XP$FPCTARGET-
+#ENDIF
+#ENDIF
+
+# -------------
+# Linking
+# -------------
+
+#ifdef cpui8086
+-CX
+-XX
+#endif
+
+# -------------
+# Miscellaneous
+# -------------
+
+# FPC logo
+-l
+
+# Display Info, Warnings and Notes
+-viwn
