@@ -23,7 +23,7 @@
 
 .PARAMETER WithSedaiAudio
     SedaiAudioFoundation integration:
-    - '' (empty/default): auto-detect in deps/ then C:\Progetti\Artiforge\SedaiAudioFoundation
+    - '' (empty/default): auto-detect in deps/ then ..\SedaiAudioFoundation
     - 'no': disable audio support
     - <path>: use specified path to SedaiAudioFoundation
     Audio is enabled for sb and sbv targets only.
@@ -133,7 +133,7 @@ function Find-SedaiAudio {
     }
 
     # Auto-detect: check default development path
-    $defaultPath = 'C:\Progetti\Artiforge\SedaiAudioFoundation'
+    $defaultPath = '..\SedaiAudioFoundation'
     if (Test-Path (Join-Path $defaultPath 'src\sedaiaudiofoundation.pas')) {
         return @{ Enabled = $true; Path = $defaultPath; Reason = "Found at default: $defaultPath" }
     }
