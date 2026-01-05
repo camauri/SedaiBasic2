@@ -1,0 +1,3328 @@
+{*
+ * SedaiBasic - A BASIC interpreter with bytecode VM
+ * Copyright (C) 2025 Maurizio Cammalleri
+ *
+ * This program is dual-licensed:
+ *
+ * 1) For open source use: GNU General Public License version 3 (GPL-3.0-only)
+ *    You may redistribute and/or modify it under the terms of the GNU GPL v3
+ *    as published by the Free Software Foundation.
+ *    See <https://www.gnu.org/licenses/gpl-3.0.html>
+ *
+ * 2) For commercial/proprietary use: A separate commercial license is required.
+ *    Contact: maurizio.cammalleri@gmail.com for licensing inquiries.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ *}
+unit SedaiPackratParser;
+
+{$mode ObjFPC}{$H+}
+{$interfaces CORBA}
+{$codepage UTF8}
+
+interface
+
+uses
+  Classes, SysUtils, DateUtils,
+  SedaiLexerTypes, SedaiLexerToken, SedaiTokenList, SedaiParserTypes,
+  SedaiAST, SedaiParserContext, SedaiParserResults, SedaiParserErrors,
+  SedaiPackratCore, SedaiExpressionParser, SedaiParserValidation,
+  SedaiExecutorTypes, SedaiBasicKeywords;
+
+type
+  { TPackratParser - Main BASIC Parser with Packrat memoization }
+  TPackratParser = class(TPackratCore)
+  private
+    FExpressionParser: TExpressionParser;
+    FStartTime: TDateTime;
+    FOptions: TParserOptions;
+    FValidationStacks: TParserValidationStacks;
+
+    // options & configuration
+    function DefaultParserOptions: TParserOptions;
+    function GetOptions: TParserOptions;
+    function ParseArrayAccess: TASTNode;
+    function ParseArrayDeclaration: TASTNode;
+
+    // Helper methods for block parsing
+    function ParseBlockUntil(EndTokens: array of TTokenType): TASTNode;
+    function FindMatchingNext: Integer;
+    function FindMatchingEnd(StartToken: TTokenType): Integer;
+    function ParseDimensionList: TASTNode;
+    procedure SetOptions(AValue: TParserOptions);
+
+  protected
+    procedure DoParsingStarted; virtual;
+    procedure DoParsingFinished(Result: TParsingResult); virtual;
+
+  public
+    constructor Create;
+    destructor Destroy; override;
+
+    property Options: TParserOptions read GetOptions write SetOptions;
+
+    // === CONTEXT MANAGEMENT OVERRIDE ===
+    procedure SetContext(AContext: TParserContext); override;
+
+    // === MAIN PARSING INTERFACE ===
+    function Parse(TokenList: TTokenList): TParsingResult;
+    function ParseExpression(TokenList: TTokenList): TParsingResult; overload;
+
+    // === CORE PARSING METHODS ===
+    function ParseProgram: TASTNode;
+    function ParseStatement: TASTNode;
+
+    function ParseAssignmentStatement: TASTNode;
+
+    // === STATEMENT PARSING (Packrat memoized) ===
+    function ParsePrintStatement: TASTNode;
+    function ParseInputStatement: TASTNode;
+    function ParseGetStatement: TASTNode;
+    function ParseGetkeyStatement: TASTNode;
+    function ParsePudefStatement: TASTNode;
+    function ParseCharStatement: TASTNode;
+    function ParseIOStatement: TASTNode;
+    function ParseLetStatement: TASTNode;
+    function ParseIfStatement: TASTNode;
+    function ParseThenStatement: TASTNode;
+    function ParseElseStatement: TASTNode;
+    function ParseForStatement: TASTNode;
+    function ParseDoStatement: TASTNode;
+    function ParseGotoStatement: TASTNode;
+    function ParseGosubStatement: TASTNode;
+    function ParseReturnStatement: TASTNode;
+    function ParseEndStatement: TASTNode;
+    function ParseFastStatement: TASTNode;
+    function ParseSlowStatement: TASTNode;
+    function ParseRemStatement: TASTNode;
+    function ParseDimStatement: TASTNode;
+    function ParseDefStatement: TASTNode;
+    function ParseFnStatement: TASTNode;
+    function ParseConstStatement: TASTNode;
+    function ParseDataStatement: TASTNode;
+    function ParseReadStatement: TASTNode;
+    function ParseRestoreStatement: TASTNode;
+    function ParseClearStatement: TASTNode;
+    function ParseStopStatement: TASTNode;
+    function ParseKeyStatement: TASTNode;
+    function ParseContStatement: TASTNode;
+    function ParseRunStatement: TASTNode;
+    function ParseClockStatement: TASTNode;
+    function ParseSleepStatement: TASTNode;
+    function ParseWaitStatement: TASTNode;
+    function ParseProgramEditingStatement: TASTNode;
+    function ParseLoopStatement: TASTNode;
+    function ParseLoopEndStatement: TASTNode;
+    function ParseLoopControlStatement: TASTNode;
+    function ParseJumpStatement: TASTNode;
+    function ParseConditionalJumpStatement: TASTNode;
+    function ParseWhileStatement: TASTNode;
+    function ParseOnStatement: TASTNode;
+    function ParseBlockStatement: TASTNode;
+    function ParseBlockEndStatement: TASTNode;
+    function ParseMemoryStatement: TASTNode;
+    function ParseGraphicsStatement: TASTNode;
+    function ParseSpriteStatement: TASTNode;
+    function ParseSoundStatement: TASTNode;
+    function ParseFileOperationStatement: TASTNode;
+    function ParseFileManagementStatement: TASTNode;
+    function ParseFileInputStatement: TASTNode;
+    function ParseFileOutputStatement: TASTNode;
+    function ParseErrorHandlingStatement: TASTNode;
+    function ParseDebugStatement: TASTNode;
+    function ParseTracingStatement: TASTNode;
+    function ParseMonitorStatement: TASTNode;
+    function ParseSysStatement: TASTNode;
+    function ParseUsrStatement: TASTNode;
+    function ParseDirectiveStatement: TASTNode;
+
+    // === EXPRESSION DELEGATION ===
+    function ParseExpression: TASTNode; inline;
+    function ParseExpressionList(Delimiter: TTokenType = ttSeparParam): TASTNode; inline;
+    function ParseArgumentList: TASTNode; inline;
+
+    function ParseExpressionStatement: TASTNode;
+
+    // === UTILITY PARSING ===
+    function ParseStatementList: TASTNode;
+
+    // === VALIDATION ===
+    function ValidateProgram: Boolean;
+    property ValidationStacks: TParserValidationStacks read FValidationStacks;
+
+    // === PROPERTIES ===
+    property ExpressionParser: TExpressionParser read FExpressionParser;
+  end;
+
+// === FACTORY FUNCTIONS ===
+function CreatePackratParser: TPackratParser;
+
+implementation
+
+uses
+  Math, StrUtils, TypInfo;
+
+{ TPackratParser }
+
+constructor TPackratParser.Create;
+begin
+  inherited Create;
+  FExpressionParser := TExpressionParser.Create;
+  FOptions := DefaultParserOptions;
+
+  // === TIER 1: Enable adaptive memoization for BASIC (linear programs) ===
+  // Most BASIC programs are linear with simple control flow
+  // Only complex expressions and nested structures need memoization
+  MemoizationMode := mmAdaptive;
+  MemoizationThreshold := 3;  // Cache after 3 recursion levels
+end;
+
+destructor TPackratParser.Destroy;
+begin
+  if Assigned(FValidationStacks) then
+    FValidationStacks.Free;
+
+  if Assigned(FExpressionParser) then
+    FExpressionParser.Free;
+
+  inherited Destroy;
+end;
+
+procedure TPackratParser.SetContext(AContext: TParserContext);
+begin
+  inherited SetContext(AContext);
+
+  if Assigned(FValidationStacks) then
+    FValidationStacks.Free;
+  FValidationStacks := TParserValidationStacks.Create(AContext);
+
+  if Assigned(FExpressionParser) then
+    FExpressionParser.SetContext(AContext);
+end;
+
+// === MAIN PARSING METHODS ===
+
+function TPackratParser.Parse(TokenList: TTokenList): TParsingResult;
+var
+  i: Integer;
+begin
+  FStartTime := Now;
+  Result := TParsingResult.Create;
+
+  try
+    // Initialize context
+    SetContext(TParserContext.Create(TokenList));
+    {$IFDEF DEBUG}
+    Context.DebugMode := DebugMode;
+    {$ENDIF}
+
+    DoParsingStarted;
+
+    // Parse the program
+    Result.AST := Memoize('Program', @ParseProgram);
+
+    // *** VALIDATE ALL CONSTRUCTS CLOSED ***
+    if Assigned(Result.AST) then
+      Result.Success := ValidateProgram and not Context.HasErrors
+    else
+      Result.Success := False;
+
+    Result.TokensConsumed := Context.CurrentIndex;
+    Result.ParsingTime := MilliSecondsBetween(Now, FStartTime);
+
+    // Copy errors to result
+    if Context.HasErrors then
+    begin
+      for i := 0 to Context.Errors.Count - 1 do
+        Result.AddError(TParserError(Context.Errors[i]));
+    end;
+
+    DoParsingFinished(Result);
+
+  except
+    on E: Exception do
+    begin
+      Result.Success := False;
+      if Assigned(Context.CurrentToken) then
+        Result.AddError(TParserError.Create('Internal parser error: ' + E.Message, Context.CurrentToken))
+      else
+        Result.AddError(TParserError.Create('Internal parser error at unknown position: ' + E.Message, nil));
+    end;
+  end;
+end;
+
+function TPackratParser.ParseExpression(TokenList: TTokenList): TParsingResult;
+var
+  i: Integer;
+begin
+  FStartTime := Now;
+  Result := TParsingResult.Create;
+
+  try
+    // Initialize context
+    SetContext(TParserContext.Create(TokenList));
+    {$IFDEF DEBUG}
+    Context.DebugMode := DebugMode;
+    {$ENDIF}
+
+    // Parse single expression using expression parser
+    Result.AST := FExpressionParser.ParseExpression();
+    Result.Success := Assigned(Result.AST) and not Context.HasErrors;
+    Result.TokensConsumed := Context.CurrentIndex;
+    Result.ParsingTime := MilliSecondsBetween(Now, FStartTime);
+
+    // Copy errors
+    if Context.HasErrors then
+    begin
+      for i := 0 to Context.Errors.Count - 1 do
+        Result.AddError(TParserError(Context.Errors[i]));
+    end;
+
+  except
+    on E: Exception do
+    begin
+      Result.Success := False;
+      Result.AddError(TParserError.Create('Expression parser error: ' + E.Message, Context.CurrentToken));
+    end;
+  end;
+end;
+
+// === CORE PARSING METHODS ===
+
+function TPackratParser.ParseProgram: TASTNode;
+var
+ Token: TLexerToken;
+ LineNumber: TASTNode;
+ Statement: TASTNode;
+ LineNum: Integer;
+begin
+ Result := TASTNode.Create(antProgram);
+
+ while not Context.IsAtEnd do
+ begin
+   Token := Context.CurrentToken;
+
+   // Skip end-of-line tokens, MA prima fai Pop degli IF completati
+   if Context.Match(ttEndOfLine) then
+   begin
+     // *** Pop IF completati a fine riga (solo se non hanno blocchi attivi) ***
+     if FValidationStacks.HasActiveIf and FValidationStacks.CanPopIfAtEOL then
+     begin
+       FValidationStacks.PopIf;
+     end;
+     Continue;
+   end;
+
+   // Stop at end of file
+   if Context.Check(ttEndOfFile) then
+     Break;
+
+   // Parse line number if present
+   if Context.Check(ttLineNumber) then
+   begin
+     try
+       LineNum := StrToInt(Token.Value);
+     except
+       LineNum := 0; // Fallback per valori non validi
+     end;
+     LineNumber := TASTNode.CreateWithValue(antLineNumber, Token.Value, Token);
+
+     Result.AddChild(LineNumber);
+     Context.Advance; // Consume line number
+   end;
+
+   // Parse ALL statements on this line (separated by :)
+   while not Context.CheckAny([ttEndOfLine, ttEndOfFile]) do
+   begin
+     Token := Context.CurrentToken;
+
+     // *** IMPORTANTE: Skip statement separators (:) PRIMA di chiamare ParseStatement ***
+     if Context.Check(ttSeparStmt) then
+     begin
+       Context.Advance; // Consume ":"
+       Continue; // Continue to next statement on same line
+     end;
+
+     Statement := Memoize('Statement', @ParseStatement);
+
+     if Assigned(Statement) then
+     begin
+       Result.AddChild(Statement);
+     end
+     else
+     begin
+       // Se ParseStatement restituisce nil (es. ha skippato un separatore),
+       // continua senza errore
+       if Context.CurrentToken.Value = Token.Value then
+       begin
+         Context.Advance; // Evita loop infinito
+       end;
+     end;
+   end;
+ end;
+
+ DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseStatement: TASTNode;
+var
+  Token: TLexerToken;
+  ErrorToken: TLexerToken;
+  SavedIndex: integer;
+begin
+  Result := nil;
+
+  if not HasValidContext or Context.IsAtEnd then
+    Exit;
+
+  Token := Context.CurrentToken;
+  if not Assigned(Token) then
+    Exit;
+
+ // Skip statement separators (:)
+ if Token.TokenType = ttSeparStmt then
+ begin
+   Context.Advance; // Consume ":"
+   Result := nil;   // Return nil = no statement created
+   Exit;
+ end;
+
+ // Skip other separators without creating nodes
+ if Token.TokenType = ttSeparParam then
+ begin
+   Context.Advance; // Consume ","
+   Result := nil;   // Return nil = no statement created
+   Exit;
+ end;
+
+ // Route to appropriate statement parser based on keyword
+ case Token.TokenType of
+    // === I/O COMMANDS ===
+    ttOutputCommand:
+    begin
+      // Dispatch based on specific keyword
+      case UpperCase(Token.Value) of
+        kPRINT: Result := Memoize('PrintStatement', @ParsePrintStatement);
+        kCHAR: Result := Memoize('CharStatement', @ParseCharStatement);
+        kPUDEF: Result := Memoize('PudefStatement', @ParsePudefStatement);
+        kUSING: Result := Memoize('PrintStatement', @ParsePrintStatement); // USING alone - handle in PRINT
+      else
+        Result := Memoize('PrintStatement', @ParsePrintStatement);
+      end;
+    end;
+    ttInputCommand:
+    begin
+      // Dispatch based on specific keyword
+      case UpperCase(Token.Value) of
+        kINPUT: Result := Memoize('InputStatement', @ParseInputStatement);
+        kGET: Result := Memoize('GetStatement', @ParseGetStatement);
+        kGETKEY: Result := Memoize('GetkeyStatement', @ParseGetkeyStatement);
+      else
+        Result := Memoize('InputStatement', @ParseInputStatement);
+      end;
+    end;
+    ttIOCommand: Result := Memoize('IOStatement', @ParseIOStatement);
+
+    // === DATA HANDLING ===
+    ttDataAssignment: Result := Memoize('LetStatement', @ParseLetStatement);
+    ttDataDeclaration: Result := Memoize('DimStatement', @ParseDimStatement);
+    ttConstant: Result := Memoize('ConstStatement', @ParseConstStatement);
+    ttDataConstant: Result := Memoize('DataStatement', @ParseDataStatement);
+    ttDataRead: Result := Memoize('ReadStatement', @ParseReadStatement);
+    ttDataClear: Result := Memoize('ClearStatement', @ParseClearStatement);
+
+    // === FLOW CONTROL ===
+    ttConditionalIf: Result := Memoize('IfStatement', @ParseIfStatement);
+    ttConditionalThen: Result := Memoize('ThenStatement', @ParseThenStatement);
+    ttConditionalElse: Result := Memoize('ElseStatement', @ParseElseStatement);
+    ttLoopBlockStart: Result := Memoize('LoopStatement', @ParseLoopStatement);
+    ttLoopBlockEnd: Result := Memoize('LoopEndStatement', @ParseLoopEndStatement);
+    ttLoopControl: Result := Memoize('LoopControlStatement', @ParseLoopControlStatement);
+    ttJumpGoto: Result := Memoize('GotoStatement', @ParseGotoStatement);
+    ttJumpGosub: Result := Memoize('GosubStatement', @ParseGosubStatement);
+    ttJumpKeyword:
+    begin
+      //WriteLn('>>> DEBUG: Found ttJumpKeyword="', Token.Value, '"');
+      if UpperCase(Token.Value) = 'GOTO' then
+        Result := Memoize('GotoStatement', @ParseGotoStatement)
+      else
+        Result := Memoize('JumpStatement', @ParseJumpStatement);
+      //WriteLn('>>> DEBUG: Jump statement result=', Assigned(Result));
+    end;
+    ttJumpReturn: Result := Memoize('ReturnStatement', @ParseReturnStatement);
+    ttJumpConditional: Result := Memoize('ConditionalJumpStatement', @ParseConditionalJumpStatement);
+
+    // === PROGRAM CONTROL ===
+    ttProgramEnd:
+      begin
+        //WriteLn('>>> DEBUG: Found ttProgramEnd, calling ParseEndStatement');
+        Result := Memoize('EndStatement', @ParseEndStatement);
+        //WriteLn('>>> DEBUG: ParseEndStatement result=', Assigned(Result));
+      end;
+    ttProgramStop: Result := Memoize('StopStatement', @ParseStopStatement);
+    ttProgramRun: Result := Memoize('RunStatement', @ParseRunStatement);
+    ttProgramCont: Result := Memoize('ContStatement', @ParseContStatement);
+    ttProgramClock: Result := Memoize('ClockStatement', @ParseClockStatement);
+    ttProgramSleep: Result := Memoize('SleepStatement', @ParseSleepStatement);
+    ttProgramWait: Result := Memoize('WaitStatement', @ParseWaitStatement);
+    ttProgramEditing: Result := Memoize('ProgramEditingStatement', @ParseProgramEditingStatement);
+
+    // === BLOCK CONSTRUCTS ===
+    ttBlockBegin: Result := Memoize('BlockStatement', @ParseBlockStatement);
+    ttBlockEnd: Result := Memoize('BlockEndStatement', @ParseBlockEndStatement);
+
+    // === COMMENTS ===
+    ttCommentRemark: Result := Memoize('RemStatement', @ParseRemStatement);
+
+    // === PROCEDURES ===
+    ttProcedureDefine: Result := Memoize('DefStatement', @ParseDefStatement);
+    ttProcedureStart: Result := Memoize('FnStatement', @ParseFnStatement);
+
+    // === MEMORY COMMANDS ===
+    ttMemoryCommand: Result := Memoize('MemoryStatement', @ParseMemoryStatement);
+
+    // === GRAPHICS COMMANDS ===
+    ttGraphicsCommand: Result := Memoize('GraphicsStatement', @ParseGraphicsStatement);
+
+    // === SPRITE COMMANDS ===
+    ttSpriteCommand: Result := Memoize('SpriteStatement', @ParseSpriteStatement);
+    ttSpriteFunction: Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+
+    // === SOUND COMMANDS ===
+    ttSoundCommand: Result := Memoize('SoundStatement', @ParseSoundStatement);
+
+    // === FILE OPERATIONS ===
+    ttFileOperation: Result := Memoize('FileOperationStatement', @ParseFileOperationStatement);
+    ttFileManagement: Result := Memoize('FileManagementStatement', @ParseFileManagementStatement);
+    ttFileInputCommand: Result := Memoize('FileInputStatement', @ParseFileInputStatement);
+    ttFileOutputCommand: Result := Memoize('FileOutputStatement', @ParseFileOutputStatement);
+
+    // === ERROR HANDLING ===
+    ttErrorHandlingCommand: Result := Memoize('ErrorHandlingStatement', @ParseErrorHandlingStatement);
+
+    // === DEBUG ===
+    ttDebugCommand: Result := Memoize('DebugStatement', @ParseDebugStatement);
+    ttDebugTracingMode: Result := Memoize('TracingStatement', @ParseTracingStatement);
+
+    // === MACHINE LANGUAGE ===
+    ttMonitor: Result := Memoize('MonitorStatement', @ParseMonitorStatement);
+    ttSysCommand: Result := Memoize('SysStatement', @ParseSysStatement);
+    ttUsrFunction: Result := Memoize('UsrStatement', @ParseUsrStatement);
+
+    // === SYSTEM HANDLING ===
+    ttKeyDefine: Result := Memoize('KeyStatement', @ParseKeyStatement);
+
+    // === DIRECTIVES ===
+    ttDirective: Result := Memoize('DirectiveStatement', @ParseDirectiveStatement);
+
+    // === INPUT FUNCTIONS ===
+    ttInputFunction: Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+
+    // === LITERALS AND PRIMITIVES ===
+    ttStringLiteral: Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+    ttNumber,
+    ttInteger,
+    ttFloat: Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+
+    // === DELIMITERS (when used as standalone expressions) ===
+    ttDelimParOpen,
+    ttDelimParClose: Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+
+    // === BITWISE OPERATORS ===
+    ttBitwiseAND,
+    ttBitwiseOR,
+    ttBitwiseXOR,
+    ttBitwiseNOT: Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+
+    // === IDENTIFIERS ===
+    ttIdentifier:
+      begin
+        // Prova SEMPRE assignment prima per identifier
+        SavedIndex := Context.CurrentIndex;
+
+        Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
+
+        if not Assigned(Result) then
+        begin
+          // Assignment fallito, riprova come expression
+          Context.CurrentIndex := SavedIndex;
+          Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+        end;
+      end;
+
+    else
+    begin
+      ErrorToken := Context.CurrentToken;  // ← errore sul TOKEN CORRENTE, non quello catturato all'inizio
+      //WriteLn('DEBUG: ERROR on token "', ErrorToken.Value, '" at line=', ErrorToken.Line);
+      HandleError(Format('Unexpected token in statement: "%s"', [ErrorToken.Value]), ErrorToken);
+      Result := nil;
+    end;
+  end;
+end;
+
+function TPackratParser.ParseAssignmentStatement: TASTNode;
+var
+ LeftSide, Expression: TASTNode;
+ Token: TLexerToken;
+ SavedToken: TLexerToken;
+begin
+ Token := Context.CurrentToken;
+
+  // Parse left side - can be A or A(i)
+  if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
+    (Context.PeekNext.TokenType = ttDelimParOpen) then
+  begin
+    // It's array access A(i) - use expression parser
+    LeftSide := FExpressionParser.ParseExpression(precCall);
+  end
+  else if Context.Check(ttIdentifier) then
+  begin
+    // *** SAVE THE TOKEN BEFORE ADVANCING ***
+    SavedToken := Context.CurrentToken;
+    LeftSide := TASTNode.CreateWithValue(antIdentifier, UpperCase(Token.Value), Token);
+    Context.Advance; // Consume identifier
+    //WriteLn('DEBUG: Consumed identifier, next token: "', Context.CurrentToken.Value, '"');
+  end
+  else
+  begin
+    HandleError('Expected variable name in assignment', Context.CurrentToken);  // ← Token corrente
+    Result := nil;
+    Exit;
+  end;
+
+  // Expect =
+  //WriteLn('DEBUG: Looking for =, current token: "', Context.CurrentToken.Value, '" type=', Ord(Context.CurrentToken.TokenType));
+  if not Context.Match(ttOpEq) then
+  begin
+    //WriteLn('DEBUG: NO = found! Generating error!');
+    // *** USA IL TOKEN SALVATO, NON IL CORRENTE ***
+    HandleError('Expected "=" in assignment', SavedToken);
+    if Assigned(LeftSide) then
+      LeftSide.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Parse right-hand expression
+  Expression := FExpressionParser.ParseExpression;
+  if not Assigned(Expression) then
+  begin
+    if Assigned(LeftSide) then
+      LeftSide.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  Result := TASTNode.Create(antAssignment);
+  Result.AddChild(LeftSide);
+  Result.AddChild(Expression);
+  DoNodeCreated(Result);
+end;
+
+// === STATEMENT PARSING METHODS ===
+
+function TPackratParser.ParsePrintStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Expr, FormatNode: TASTNode;
+  SeparatorNode: TASTNode;
+  IsUsingFormat: Boolean;
+begin
+  Token := Context.CurrentToken;
+  IsUsingFormat := False;
+
+  // Check if this is PRINT USING
+  if UpperCase(Token.Value) = kUSING then
+  begin
+    // Standalone USING - create PRINT USING node
+    Result := TASTNode.Create(antPrintUsing, Token);
+    Context.Advance; // Consume USING
+    IsUsingFormat := True;
+  end
+  else
+  begin
+    Result := TASTNode.Create(antPrint, Token);
+    Context.Advance; // Consume PRINT
+
+    // Check for USING keyword after PRINT
+    if Context.Check(ttOutputCommand) and (UpperCase(Context.CurrentToken.Value) = kUSING) then
+    begin
+      Result.Free;
+      Result := TASTNode.Create(antPrintUsing, Token);
+      Context.Advance; // Consume USING
+      IsUsingFormat := True;
+    end;
+  end;
+
+  // For PRINT USING, first parameter is format string
+  if IsUsingFormat then
+  begin
+    // Parse format string
+    FormatNode := ParseExpression;
+    if Assigned(FormatNode) then
+      Result.AddChild(FormatNode)
+    else
+    begin
+      HandleError('Expected format string after USING', Token);
+      Exit;
+    end;
+
+    // Expect semicolon separator before values
+    if Context.Check(ttSeparOutput) then
+      Context.Advance  // Consume semicolon
+    else if Context.Check(ttSeparParam) then
+      Context.Advance; // Also accept comma
+  end;
+
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  begin
+    // Parse expression
+    Expr := ParseExpression;
+    if Assigned(Expr) then
+      Result.AddChild(Expr)
+    else
+      Break;
+
+    // Check for PRINT separators (comma or semicolon)
+    if Context.CheckAny([ttSeparParam, ttSeparOutput]) then
+    begin
+      // Create separator node with actual separator value
+      SeparatorNode := TASTNode.CreateWithValue(antSeparator, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(SeparatorNode);
+      Context.Advance; // Consume separator
+
+      // If separator is at end of line, exit
+      if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+        Break;
+    end
+    else
+      Break;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseInputStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Expr: TASTNode;
+  SeparatorNode: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antInput, Token);
+  Context.Advance; // Consume INPUT
+
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  begin
+    // Parse expression (prompt string or variable)
+    Expr := ParseExpression;
+    if Assigned(Expr) then
+      Result.AddChild(Expr)
+    else
+      Break;
+
+    // Check for INPUT separators (comma or semicolon)
+    if Context.CheckAny([ttSeparParam, ttSeparOutput]) then
+    begin
+      // Create separator node with actual separator value
+      SeparatorNode := TASTNode.CreateWithValue(antSeparator, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(SeparatorNode);
+      Context.Advance; // Consume separator
+
+      // If separator is at end of line, exit
+      if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+        Break;
+    end
+    else
+      Break;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseGetStatement: TASTNode;
+var
+  Token: TLexerToken;
+  VarNode: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antGet, Token);
+  Context.Advance; // Consume GET
+
+  // GET requires a single string variable
+  // Format: GET A$
+  if Context.Check(ttIdentifier) then
+  begin
+    VarNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+    Result.AddChild(VarNode);
+    Context.Advance;
+  end
+  else
+    HandleError('Expected variable after GET', Token);
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseGetkeyStatement: TASTNode;
+var
+  Token: TLexerToken;
+  VarNode: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antGetkey, Token);
+  Context.Advance; // Consume GETKEY
+
+  // GETKEY requires a single string variable
+  // Format: GETKEY A$
+  if Context.Check(ttIdentifier) then
+  begin
+    VarNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+    Result.AddChild(VarNode);
+    Context.Advance;
+  end
+  else
+    HandleError('Expected variable after GETKEY', Token);
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParsePudefStatement: TASTNode;
+var
+  Token: TLexerToken;
+  FormatNode: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antPudef, Token);
+  Context.Advance; // Consume PUDEF
+
+  // PUDEF requires a string with 4 character positions
+  // Format: PUDEF " ,.$" where positions are: filler, comma, decimal, dollar
+  if Context.Check(ttStringLiteral) then
+  begin
+    FormatNode := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+    Result.AddChild(FormatNode);
+    Context.Advance;
+  end
+  else
+    HandleError('Expected format string after PUDEF', Token);
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseCharStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Expr: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antChar, Token);
+  Context.Advance; // Consume CHAR
+
+  // CHAR mode, col, row, "text" [,reverse]
+  // Parse comma-separated parameters
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  begin
+    Expr := ParseExpression;
+    if Assigned(Expr) then
+      Result.AddChild(Expr)
+    else
+      Break;
+
+    if Context.Check(ttSeparParam) then
+      Context.Advance
+    else
+      Break;
+  end;
+
+  if Result.ChildCount < 4 then
+    HandleError('CHAR requires at least 4 parameters: mode, col, row, text', Token);
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseLetStatement: TASTNode;
+var
+  Assignment: TASTNode;
+  SavedToken: TLexerToken;
+begin
+  SavedToken := Context.CurrentToken;
+  Context.Advance; // Consume LET (if present)
+
+  // Parse assignment expression
+  Assignment := ParseAssignmentStatement;
+  if Assigned(Assignment) and (Assignment.NodeType = antAssignment) then
+    Result := Assignment
+  else
+  begin
+    HandleError('Expected assignment after LET', SavedToken);
+    Result := nil;
+  end;
+end;
+
+function TPackratParser.ParseIfStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Condition: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antIf, Token);
+  Context.Advance; // Consume IF
+
+  // Parse condition
+  Condition := ParseExpression;
+  if not Assigned(Condition) then
+  begin
+    HandleError('Expected condition after IF', Token);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+  Result.AddChild(Condition);
+
+  // *** PUSH ONTO IF STACK ***
+  FValidationStacks.PushIf(Result, Context.CurrentIndex);
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseThenStatement: TASTNode;
+var
+ Token: TLexerToken;
+ Statement: TASTNode;
+ HasBeginBlock: Boolean;
+ CurrentIf: TIfStackEntry;
+ ThenNode: TASTNode;
+ GotoNode: TASTNode;
+begin
+ Token := Context.CurrentToken;
+ // *** VALIDATE THEN ***
+ if not FValidationStacks.ValidateThen then
+ begin
+   Result := nil;
+   Exit;
+ end;
+ ThenNode := TASTNode.Create(antThen, Token);
+ Context.Advance; // Consume THEN
+
+ // *** FIX CRITICO: Aggiungi THEN come figlio dell'IF corrente ***
+ CurrentIf := FValidationStacks.GetCurrentIf;
+ if Assigned(CurrentIf.IfNode) then
+ begin
+   CurrentIf.IfNode.AddChild(ThenNode);
+ end;
+
+ // *** ASSOCIATE WITH CURRENT IF ***
+ FValidationStacks.SetThenForCurrentIf(ThenNode);
+
+ // *** FIX: THEN <numero> → THEN GOTO <numero> ***
+ if Context.Check(ttNumber) or Context.Check(ttLineNumber) then
+ begin
+   // THEN seguito da numero = GOTO implicito
+   GotoNode := TASTNode.Create(antGoto);
+   Statement := ParseExpression; // Il numero di riga
+   if Assigned(Statement) then
+     GotoNode.AddChild(Statement);
+   ThenNode.AddChild(GotoNode);
+
+   DoNodeCreated(ThenNode);
+   Result := nil;
+   Exit;
+ end;
+
+ // *** Check if the first statement is BEGIN ***
+ HasBeginBlock := Context.Check(ttBlockBegin);
+ if HasBeginBlock then
+   FValidationStacks.SetThenBlockForCurrentIf;
+
+ // *** Parse THEN statements until : ELSE or EOL ***
+ while not Context.CheckAny([ttEndOfLine, ttEndOfFile]) do
+ begin
+   // *** CHECK FOR : ELSE SEQUENCE ***
+   if Context.Check(ttSeparStmt) then
+   begin
+     // Look ahead for ELSE after :
+     if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttConditionalElse) then
+     begin
+       // Found : ELSE - STOP parsing THEN statements
+       Break;
+     end
+     else
+     begin
+       // Just a : separator between statements in THEN - SKIP and continue
+       Context.Advance; // Consume :
+       Continue;
+     end;
+   end;
+
+   // Parse statement and add to THEN
+   Statement := ParseStatement;
+   if Assigned(Statement) then
+   begin
+     ThenNode.AddChild(Statement);
+   end
+   else
+     Break;
+ end;
+
+ DoNodeCreated(ThenNode);
+ // *** FIX: DON'T return the node to avoid duplication ***
+ Result := nil;
+end;
+
+function TPackratParser.ParseElseStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Statement: TASTNode;
+  HasBeginBlock: Boolean;
+  CurrentIf: TIfStackEntry;
+  ElseNode: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  // *** VALIDATE ELSE ***
+  if not FValidationStacks.ValidateElse then
+  begin
+    Result := nil;
+    Exit;
+  end;
+  ElseNode := TASTNode.Create(antElse, Token);
+  Context.Advance; // Consume ELSE
+
+  // *** FIX CRITICO: Aggiungi ELSE come figlio dell'IF corrente ***
+  CurrentIf := FValidationStacks.GetCurrentIf;
+  if Assigned(CurrentIf.IfNode) then
+  begin
+    CurrentIf.IfNode.AddChild(ElseNode);
+    //WriteLn('DEBUG: ELSE added as child to IF - IF now has ', CurrentIf.IfNode.ChildCount, ' children');
+  end;
+
+  // *** Check if the first statement is BEGIN ***
+  HasBeginBlock := Context.Check(ttBlockBegin);
+  if HasBeginBlock then
+    FValidationStacks.SetElseBlockForCurrentIf;
+
+  // *** Parse ELSE statements until EOL ***
+  while not Context.CheckAny([ttEndOfLine, ttEndOfFile]) do
+  begin
+    if Context.Check(ttSeparStmt) then
+    begin
+      Context.Advance; // Consume : and continue
+      Continue;
+    end;
+
+    // Parse statement and add to ELSE
+    Statement := ParseStatement;
+    if Assigned(Statement) then
+    begin
+      ElseNode.AddChild(Statement);
+      //WriteLn('DEBUG: Added statement to ELSE: ', NodeTypeToString(Statement.NodeType));
+    end
+    else
+      Break;
+  end;
+
+  //WriteLn('DEBUG: ELSE completed with ', ElseNode.ChildCount, ' child statements');
+  DoNodeCreated(ElseNode);
+
+  // *** FIX: DON'T return the node to avoid duplication ***
+  Result := nil;
+end;
+
+function TPackratParser.ParseForStatement: TASTNode;
+var
+  Variable, StartExpr, EndExpr, StepExpr: TASTNode;
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antForLoop, Token);
+  Context.Advance; // Consume FOR
+
+  // *** PUSH ONTO LOOP STACK ***
+  FValidationStacks.PushLoop(ttLoopBlockStart, Result, 'FOR', 'NEXT', Context.CurrentIndex);
+
+  // Parse: variable = start TO end [STEP step]
+  if not Context.Check(ttIdentifier) then
+  begin
+    HandleError('Expected variable name after FOR', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  Variable := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+  Context.Advance;
+  Result.AddChild(Variable);
+
+  if not Context.Match(ttOpEq) and not Context.Match(ttDataAssignment) then
+  begin
+    HandleError('Expected "=" after FOR variable', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  StartExpr := ParseExpression;
+  if not Assigned(StartExpr) then
+  begin
+    HandleError('Expected start value in FOR statement', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+  Result.AddChild(StartExpr);
+
+  if not (Context.Check(ttLoopControl) and (UpperCase(Context.CurrentToken.Value) = 'TO')) then
+  begin
+    HandleError('Expected "TO" in FOR statement', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+  Context.Advance; // Consume TO
+
+  EndExpr := ParseExpression;
+  if not Assigned(EndExpr) then
+  begin
+    HandleError('Expected end value in FOR statement', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+  Result.AddChild(EndExpr);
+
+  // Optional STEP
+  if Context.Check(ttLoopControl) and (UpperCase(Context.CurrentToken.Value) = 'STEP') then
+  begin
+    Context.Advance; // Consume STEP
+    StepExpr := ParseExpression;
+    if Assigned(StepExpr) then
+      Result.AddChild(StepExpr);
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseDoStatement: TASTNode;
+var
+  Body: TASTNode;
+  EndIndex: Integer;
+  Token, CondToken: TLexerToken;
+  Condition: TASTNode;
+  ConditionType: string;
+  ConditionPosition: string;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antDoLoop, Token);
+  Context.Advance; // Consume DO
+
+  ConditionType := '';
+  ConditionPosition := '';
+  Condition := nil;
+
+  // Check for condition immediately after DO (DO UNTIL expr / DO WHILE expr)
+  if Context.Check(ttLoopControl) then
+  begin
+    CondToken := Context.CurrentToken;
+    ConditionType := UpperCase(CondToken.Value);
+    ConditionPosition := 'TOP';
+    Context.Advance; // Consume WHILE or UNTIL
+
+    // Parse the condition expression
+    Condition := ParseExpression;
+  end;
+
+  // Find matching LOOP
+  EndIndex := FindMatchingEnd(ttLoopBlockStart);
+  if EndIndex = -1 then
+  begin
+    HandleError('DO statement without matching LOOP', Token);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Parse body until LOOP
+  Body := ParseBlockUntil([ttLoopBlockEnd]);
+  if Assigned(Body) then
+    Result.AddChild(Body);
+
+  // Consume LOOP
+  if Context.Match(ttLoopBlockEnd) and (UpperCase(Context.PreviousToken.Value) = 'LOOP') then
+  begin
+    // Check for condition after LOOP (LOOP UNTIL expr / LOOP WHILE expr)
+    // Only if we don't already have a top condition
+    if (ConditionType = '') and Context.Check(ttLoopControl) then
+    begin
+      CondToken := Context.CurrentToken;
+      ConditionType := UpperCase(CondToken.Value);
+      ConditionPosition := 'BOTTOM';
+      Context.Advance; // Consume WHILE or UNTIL
+
+      Condition := ParseExpression;
+    end;
+  end;
+
+  // Add condition as second child (if present)
+  if Assigned(Condition) then
+    Result.AddChild(Condition);
+
+  // Store condition metadata in attributes
+  Result.Attributes.Values['ConditionType'] := ConditionType;
+  Result.Attributes.Values['ConditionPosition'] := ConditionPosition;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseGotoStatement: TASTNode;
+var
+  Target: TASTNode;
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antGoto, Token);
+  Context.Advance; // Consume GOTO
+
+  Target := ParseExpression;
+  if Assigned(Target) then
+    Result.AddChild(Target);
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseGosubStatement: TASTNode;
+var
+  Target: TASTNode;
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antGosub, Token);
+  Context.Advance; // Consume GOSUB
+
+  // *** PUSH ONTO GOSUB STACK ***
+  //if not Assigned(FValidationStacks) and Assigned(Context) then
+  //  FValidationStacks := TParserValidationStacks.Create(Context);
+  //if Assigned(FValidationStacks) then
+  //  FValidationStacks.PushGosub(Result, Context.CurrentIndex);
+
+  Target := ParseExpression;
+  if Assigned(Target) then
+    Result.AddChild(Target);
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseReturnStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+
+  //if not Assigned(FValidationStacks) and Assigned(Context) then
+  //  FValidationStacks := TParserValidationStacks.Create(Context);
+  //
+  //// *** VALIDATE RETURN ***
+  //if not FValidationStacks.ValidateReturn then
+  //begin
+  //  Result := nil;
+  //  Exit;
+  //end;
+
+  Result := TASTNode.Create(antReturn, Token);
+  Context.Advance; // Consume RETURN
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseEndStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antEnd, Token);
+  Context.Advance; // Consume END
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseFastStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antFast, Token);
+  Context.Advance; // Consume FAST
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseSlowStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antSlow, Token);
+  Context.Advance; // Consume SLOW
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseRemStatement: TASTNode;
+var
+  Comment: string;
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Context.Advance; // Consume REM
+
+  // If comments are disabled, ignore everything and return nil
+  if not FOptions.IncludeComments then
+  begin
+    // Consume everything until end of line but don't create AST nodes
+    while not Context.CheckAny([ttEndOfLine, ttEndOfFile]) do
+      Context.Advance;
+    Result := nil;
+    Exit;
+  end;
+
+  // If comments are enabled, create the node as before
+  Result := TASTNode.Create(antRem, Token);
+
+  // Consume rest of line as comment
+  Comment := '';
+  while not Context.CheckAny([ttEndOfLine, ttEndOfFile]) do
+  begin
+    Comment := Comment + Context.CurrentToken.Value + ' ';
+    Context.Advance;
+  end;
+
+  Result.Value := Trim(Comment);
+  DoNodeCreated(Result);
+end;
+
+// === ADDITIONAL STATEMENT IMPLEMENTATIONS ===
+
+function TPackratParser.ParseIOStatement: TASTNode;
+var
+  Token: TLexerToken;
+  HandleNode, Expr: TASTNode;
+  CmdName: string;
+begin
+  Token := Context.CurrentToken;
+  CmdName := UpperCase(Token.Value);
+
+  // Handle CMD command specifically
+  if CmdName = kCMD then
+  begin
+    Result := TASTNode.Create(antCmd, Token);
+    Context.Advance; // Consume CMD
+
+    // CMD file [, write list]
+    // Parse file handle: #number or expression
+    if Context.Check(ttFileHandlePrefix) then
+      Context.Advance;  // Consume #
+
+    // Parse handle (number or expression)
+    if Context.Check(ttNumber) or Context.Check(ttInteger) then
+    begin
+      HandleNode := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(HandleNode);
+      Context.Advance;
+    end
+    else if Context.Check(ttIdentifier) then
+    begin
+      HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(HandleNode);
+      Context.Advance;
+    end
+    else
+    begin
+      // Parse as expression
+      HandleNode := ParseExpression;
+      if Assigned(HandleNode) then
+        Result.AddChild(HandleNode)
+      else
+      begin
+        HandleError('Expected file handle after CMD', Token);
+        Exit;
+      end;
+    end;
+
+    // Optional comma and write list
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance; // Consume comma
+
+      // Parse expressions to write (print list)
+      while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+      begin
+        Expr := ParseExpression;
+        if Assigned(Expr) then
+          Result.AddChild(Expr)
+        else
+          Break;
+
+        // Check for separator
+        if Context.Check(ttSeparParam) or Context.Check(ttSeparOutput) then
+          Context.Advance
+        else
+          Break;
+      end;
+    end;
+
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // Generic IO command handling
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance; // Consume IO command
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseContStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance; // Consume CONT
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseClockStatement: TASTNode;
+var
+  Token: TLexerToken;
+  NodeType: TASTNodeType;
+begin
+  Token := Context.CurrentToken;
+  // Distinguish FAST from SLOW by checking token value
+  if SameText(Token.Value, kFAST) then
+    NodeType := antFast
+  else
+    NodeType := antSlow;
+  Result := TASTNode.Create(NodeType, Token);
+  Context.Advance; // Consume FAST/SLOW
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseSleepStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Param: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antSleep, Token);
+  Context.Advance; // Consume SLEEP
+
+  // Parse required parameter (seconds to sleep)
+  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+  begin
+    Param := ParseExpression;
+    if Assigned(Param) then
+      Result.AddChild(Param);
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseWaitStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Condition: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance; // Consume WAIT
+
+  // Parse condition
+  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+  begin
+    Condition := ParseExpression;
+    if Assigned(Condition) then
+      Result.AddChild(Condition);
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseFnStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance; // Consume FN
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseLoopEndStatement: TASTNode;
+var
+  Token: TLexerToken;
+  EndKeyword: string;
+begin
+  Token := Context.CurrentToken;
+  EndKeyword := UpperCase(Token.Value);
+
+  // *** VALIDATE LOOP END ***
+  if not FValidationStacks.ValidateLoopEnd(EndKeyword) then
+  begin
+    Result := nil;
+    Exit;
+  end;
+
+  Result := TASTNode.Create(antNext, Token);
+  Context.Advance; // Consume NEXT/LOOP/WEND
+
+  // Optional variable after NEXT
+  if (EndKeyword = 'NEXT') and Context.Check(ttIdentifier) then
+    Context.Advance; // Consume variable name
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseLoopControlStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance; // Consume TO/STEP/WHILE/UNTIL
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseConditionalJumpStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance; // Consume ON
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseBlockStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antBlock, Token);
+  Context.Advance; // Consume BEGIN
+
+  // *** PUSH ONTO BLOCK STACK ***
+  FValidationStacks.PushBlock(ttBlockBegin, Result, 'END', Context.CurrentIndex);
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseBlockEndStatement: TASTNode;
+var
+  Token: TLexerToken;
+  EndKeyword: string;
+begin
+  Token := Context.CurrentToken;
+  EndKeyword := UpperCase(Token.Value);
+
+  // *** VALIDATE BLOCK END ***
+  if not FValidationStacks.ValidateBlockEnd(EndKeyword) then
+  begin
+    Result := nil;
+    Exit;
+  end;
+
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance; // Consume END/BEND
+
+  // *** Check if this BEND closes an IF/THEN/ELSE block ***
+  if FValidationStacks.HasActiveIf and FValidationStacks.CanPopIfAtEOL then
+  begin
+    FValidationStacks.PopIf;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseMemoryStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Params: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance; // Consume memory command
+
+  // Parse parameters as single expression list
+  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+  begin
+    Params := ParseExpressionList(ttSeparParam);
+    if Assigned(Params) then
+      Result.AddChild(Params);
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseGraphicsStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Param: TASTNode;
+  ParamCount, MaxParams: Integer;
+  CmdName: string;
+begin
+  Token := Context.CurrentToken;
+  CmdName := UpperCase(Token.Value);
+
+  // Select appropriate node type based on command
+  if CmdName = 'GRAPHIC' then
+    Result := TASTNode.Create(antGraphics, Token)
+  else if CmdName = 'SCNCLR' then
+    Result := TASTNode.Create(antScnClr, Token)
+  else if CmdName = 'BOX' then
+    Result := TASTNode.Create(antBox, Token)
+  else if CmdName = 'CIRCLE' then
+    Result := TASTNode.Create(antCircle, Token)
+  else if CmdName = 'DRAW' then
+    Result := TASTNode.Create(antDraw, Token)
+  else if CmdName = 'LOCATE' then
+    Result := TASTNode.Create(antLocate, Token)
+  else if CmdName = 'COLOR' then
+    Result := TASTNode.Create(antColor, Token)
+  else if CmdName = 'WIDTH' then
+    Result := TASTNode.Create(antWidth, Token)
+  else if CmdName = 'SCALE' then
+    Result := TASTNode.Create(antScale, Token)
+  else if CmdName = 'PAINT' then
+    Result := TASTNode.Create(antPaint, Token)
+  else if CmdName = 'WINDOW' then
+    Result := TASTNode.Create(antWindow, Token)
+  else if CmdName = 'SSHAPE' then
+    Result := TASTNode.Create(antSShape, Token)
+  else if CmdName = 'GSHAPE' then
+    Result := TASTNode.Create(antGShape, Token)
+  else if CmdName = 'GLIST' then
+    Result := TASTNode.Create(antGList, Token)
+  else
+    Result := TASTNode.Create(antStatement, Token);
+
+  Context.Advance;
+  ParamCount := 0;
+
+  // Set max parameters based on command
+  if CmdName = 'CIRCLE' then
+    MaxParams := 9
+  else if CmdName = 'BOX' then
+    MaxParams := 8
+  else if CmdName = 'LOCATE' then
+    MaxParams := 2
+  else if CmdName = 'DRAW' then
+    MaxParams := 100  // DRAW can have many TO segments
+  else if CmdName = 'SCNCLR' then
+    MaxParams := 1  // SCNCLR [mode] - optional mode 0-11
+  else if CmdName = 'COLOR' then
+    MaxParams := 2  // COLOR source, color
+  else if CmdName = 'WIDTH' then
+    MaxParams := 1  // WIDTH n
+  else if CmdName = 'SCALE' then
+    MaxParams := 3  // SCALE n [,xmax, ymax]
+  else if CmdName = 'PAINT' then
+    MaxParams := 4  // PAINT [source], x, y [,mode]
+  else if CmdName = 'WINDOW' then
+    MaxParams := 5  // WINDOW col1, row1, col2, row2 [,clear]
+  else if CmdName = 'SSHAPE' then
+    MaxParams := 5  // SSHAPE A$, x1, y1 [,x2, y2]
+  else if CmdName = 'GSHAPE' then
+    MaxParams := 4  // GSHAPE A$, x, y [,mode]
+  else if CmdName = 'GLIST' then
+    MaxParams := 0  // GLIST (no parameters)
+  else
+    MaxParams := 5;
+
+  // Special handling for DRAW: parse color, x1, y1 [TO x2, y2] ...
+  // Each segment (including TO keyword) is stored as children
+  if CmdName = 'DRAW' then
+  begin
+    // Parse optional color (can be omitted but comma must remain)
+    if Context.Check(ttSeparParam) then
+    begin
+      // Color omitted, add nil placeholder
+      Result.AddChild(nil);
+      Context.Advance;
+    end
+    else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+    begin
+      Param := ParseExpression;
+      if Assigned(Param) then
+        Result.AddChild(Param);
+      if Context.Check(ttSeparParam) then
+        Context.Advance;
+    end;
+
+    // Parse x1, y1
+    while ParamCount < 2 do
+    begin
+      if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+        Break;
+      Param := ParseExpression;
+      if Assigned(Param) then
+      begin
+        Result.AddChild(Param);
+        Inc(ParamCount);
+      end
+      else
+        Break;
+      if Context.Check(ttSeparParam) then
+        Context.Advance;
+    end;
+
+    // Parse TO x2, y2 segments (can have multiple)
+    while Context.Check(ttLoopControl) and (UpperCase(Context.CurrentToken.Value) = 'TO') do
+    begin
+      Context.Advance; // consume TO
+      // Parse x, y coordinates
+      Param := ParseExpression;
+      if Assigned(Param) then
+        Result.AddChild(Param);
+      if Context.Check(ttSeparParam) then
+        Context.Advance;
+      Param := ParseExpression;
+      if Assigned(Param) then
+        Result.AddChild(Param);
+      if Context.Check(ttSeparParam) then
+        Context.Advance;
+    end;
+  end
+  else
+  begin
+    // Standard parsing for other graphics commands
+    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) and (ParamCount < MaxParams) do
+    begin
+      if Context.Check(ttSeparParam) then
+      begin
+        Context.Advance;
+        Continue;
+      end;
+      Param := ParseExpression;
+      if Assigned(Param) then
+      begin
+        Result.AddChild(Param);
+        Inc(ParamCount);
+      end
+      else
+        Break;
+      if Context.Check(ttSeparParam) then
+        Context.Advance
+      else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+        Break;
+    end;
+  end;
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseSpriteStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Param: TASTNode;
+  CmdName: string;
+  ParamCount, MaxParams: Integer;
+  MovsprMode: Integer;  // 0=abs, 1=rel, 2=polar, 3=auto
+begin
+  Token := Context.CurrentToken;
+  CmdName := UpperCase(Token.Value);
+  MovsprMode := 0;
+
+  // Select appropriate node type based on command
+  if CmdName = kSPRITE then
+    Result := TASTNode.Create(antSprite, Token)
+  else if CmdName = kMOVSPR then
+    Result := TASTNode.Create(antMovspr, Token)
+  else if CmdName = kSPRCOLOR then
+    Result := TASTNode.Create(antSprcolor, Token)
+  else if CmdName = kSPRSAV then
+    Result := TASTNode.Create(antSprsav, Token)
+  else if CmdName = kCOLLISION then
+    Result := TASTNode.Create(antCollision, Token)
+  else if CmdName = kSPRDEF then
+    Result := TASTNode.Create(antStatement, Token)  // SPRDEF deferred - placeholder
+  else
+    Result := TASTNode.Create(antStatement, Token);
+
+  Context.Advance;
+  ParamCount := 0;
+
+  // Set max parameters based on command
+  // SPRITE: 7 (n, enabled, color, priority, scalex, scaley, mode)
+  // MOVSPR: 3 (n, x/dist/angle, y/angle/speed) - determined by delimiter
+  // SPRCOLOR: 2 (mc1, mc2)
+  // SPRSAV: 2 (source, dest)
+  // COLLISION: 2 (type, line)
+  if CmdName = kSPRITE then
+    MaxParams := 7
+  else if CmdName = kMOVSPR then
+    MaxParams := 3
+  else if CmdName = kSPRCOLOR then
+    MaxParams := 2
+  else if CmdName = kSPRSAV then
+    MaxParams := 2
+  else if CmdName = kCOLLISION then
+    MaxParams := 2
+  else
+    MaxParams := 10;
+
+  // Parse parameters
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) and (ParamCount < MaxParams) do
+  begin
+    // Handle comma separator
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;
+      Continue;
+    end;
+
+    // MOVSPR special handling: detect +/- for relative mode before parsing expression
+    if (CmdName = kMOVSPR) and (ParamCount = 1) then
+    begin
+      // Check for + or - prefix indicating relative movement
+      if Context.Check(ttOpAdd) then
+      begin
+        MovsprMode := 1;  // Relative mode
+        // Store mode marker in node
+        Result.Attributes.Values['movspr_mode'] := '1';
+      end
+      else if Context.Check(ttOpSub) then
+      begin
+        MovsprMode := 1;  // Relative mode (negative will be in expression)
+        Result.Attributes.Values['movspr_mode'] := '1';
+      end;
+    end;
+
+    Param := ParseExpression;
+    if Assigned(Param) then
+    begin
+      Result.AddChild(Param);
+      Inc(ParamCount);
+    end
+    else
+      Break;
+
+    // MOVSPR special handling: detect ; for polar mode or # for auto mode
+    if (CmdName = kMOVSPR) and (ParamCount = 2) then
+    begin
+      if Context.Check(ttSeparOutput) then  // ; semicolon
+      begin
+        MovsprMode := 2;  // Polar mode: distance;angle
+        Result.Attributes.Values['movspr_mode'] := '2';
+        Context.Advance;
+        Continue;
+      end
+      else if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+      begin
+        MovsprMode := 3;  // Auto mode: angle#speed
+        Result.Attributes.Values['movspr_mode'] := '3';
+        Context.Advance;
+        Continue;
+      end;
+    end;
+
+    if Context.Check(ttSeparParam) then
+      Context.Advance
+    else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttSeparOutput, ttFileHandlePrefix]) then
+      Break;
+  end;
+
+  // Set default mode for MOVSPR if not explicitly set
+  if (CmdName = kMOVSPR) and (Result.Attributes.Values['movspr_mode'] = '') then
+    Result.Attributes.Values['movspr_mode'] := '0';  // Absolute mode
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseSoundStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Param: TASTNode;
+  ParamCount, MaxParams: Integer;
+  CmdName: string;
+begin
+  Token := Context.CurrentToken;
+  CmdName := UpperCase(Token.Value);
+
+  // Select appropriate node type based on command
+  if CmdName = 'VOL' then
+    Result := TASTNode.Create(antVol, Token)
+  else if CmdName = 'SOUND' then
+    Result := TASTNode.Create(antSound, Token)
+  else if CmdName = 'ENVELOPE' then
+    Result := TASTNode.Create(antEnvelope, Token)
+  else if CmdName = 'TEMPO' then
+    Result := TASTNode.Create(antTempo, Token)
+  else if CmdName = 'PLAY' then
+    Result := TASTNode.Create(antPlay, Token)
+  else if CmdName = 'FILTER' then
+    Result := TASTNode.Create(antFilter, Token)
+  else
+    Result := TASTNode.Create(antStatement, Token);
+
+  Context.Advance;
+  ParamCount := 0;
+
+  // Set max parameters based on command
+  // VOL: 1 (volume 0-15)
+  // TEMPO: 1 (tempo 0-255)
+  // SOUND: 8 (vc, freq, dur, dir, min, sv, wf, pw)
+  // ENVELOPE: 7 (e, a, d, s, r, wf, pw)
+  // FILTER: 5 (cf, lp, bp, hp, res)
+  // PLAY: 1 (string with control characters)
+  if CmdName = 'VOL' then
+    MaxParams := 1
+  else if CmdName = 'TEMPO' then
+    MaxParams := 1
+  else if CmdName = 'SOUND' then
+    MaxParams := 8
+  else if CmdName = 'ENVELOPE' then
+    MaxParams := 7
+  else if CmdName = 'FILTER' then
+    MaxParams := 5
+  else if CmdName = 'PLAY' then
+    MaxParams := 1  // Single string argument
+  else
+    MaxParams := 10;
+
+  // Parse parameters
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) and (ParamCount < MaxParams) do
+  begin
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;
+      Continue;
+    end;
+    Param := ParseExpression;
+    if Assigned(Param) then
+    begin
+      Result.AddChild(Param);
+      Inc(ParamCount);
+    end
+    else
+      Break;
+    if Context.Check(ttSeparParam) then
+      Context.Advance
+    else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+      Break;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseFileOperationStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Param, HandleNode: TASTNode;
+  CmdName: string;
+begin
+  Token := Context.CurrentToken;
+  CmdName := UpperCase(Token.Value);
+
+  // Recognize file operation commands
+  case CmdName of
+    'LOAD', 'DLOAD': Result := TASTNode.Create(antLoad, Token);
+    'SAVE', 'DSAVE': Result := TASTNode.Create(antSave, Token);
+    'VERIFY', 'DVERIFY': Result := TASTNode.Create(antVerify, Token);
+    'BLOAD': Result := TASTNode.Create(antBload, Token);
+    'BSAVE': Result := TASTNode.Create(antBsave, Token);
+    'BOOT': Result := TASTNode.Create(antBoot, Token);
+    // Disk file I/O with handle
+    'DOPEN', 'OPEN': Result := TASTNode.Create(antDopen, Token);
+    'DCLOSE', 'CLOSE': Result := TASTNode.Create(antDclose, Token);
+  else
+    Result := TASTNode.Create(antStatement, Token); // Other file commands
+  end;
+
+  Context.Advance; // Consume file operation command
+
+  // Special handling for DOPEN/OPEN and DCLOSE/CLOSE
+  if (CmdName = 'DOPEN') or (CmdName = 'OPEN') or (CmdName = 'DCLOSE') or (CmdName = 'CLOSE') then
+  begin
+    // Parse file handle: #number or #identifier
+    // Syntax: DOPEN #1, "filename" [, mode$]
+    //         DOPEN #MYFILE, "filename" [, mode$]
+    //         DCLOSE #1
+    //         DCLOSE #MYFILE
+
+    // Expect # prefix
+    if Context.Check(ttFileHandlePrefix) then
+      Context.Advance  // Consume #
+    else if Context.CurrentToken.Value = '#' then
+      Context.Advance; // Handle # as separate token if needed
+
+    // Parse handle (number or identifier)
+    if Context.Check(ttNumber) or Context.Check(ttInteger) then
+    begin
+      // Numeric handle: #1, #2, etc.
+      HandleNode := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(HandleNode);
+      Context.Advance;
+    end
+    else if Context.Check(ttIdentifier) then
+    begin
+      // Named handle: #MYFILE, #DATA, etc.
+      HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(HandleNode);
+      Context.Advance;
+    end
+    else
+    begin
+      HandleError('Expected file handle after #', Token);
+      Exit;
+    end;
+
+    // For DOPEN/OPEN, parse filename and optional mode
+    if (CmdName = 'DOPEN') or (CmdName = 'OPEN') then
+    begin
+      // Expect comma separator
+      if Context.Check(ttSeparParam) then
+        Context.Advance;
+
+      // Parse filename (required)
+      Param := ParseExpression;
+      if Assigned(Param) then
+        Result.AddChild(Param)
+      else
+      begin
+        HandleError('Expected filename after handle', Token);
+        Exit;
+      end;
+
+      // Parse optional mode parameter
+      if Context.Check(ttSeparParam) then
+      begin
+        Context.Advance;
+        Param := ParseExpression;
+        if Assigned(Param) then
+          Result.AddChild(Param);
+      end;
+    end;
+    // DCLOSE/CLOSE only needs the handle, already parsed
+
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // Parse ALL parameters until end of statement (for other file commands)
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  begin
+    // Skip commas
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;
+      Continue;
+    end;
+
+    Param := ParseExpression;
+    if Assigned(Param) then
+      Result.AddChild(Param)
+    else
+      Break;
+
+    // Handle comma separator
+    if Context.Check(ttSeparParam) then
+      Context.Advance
+    else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+      Break;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseFileManagementStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Params: TASTNode;
+  CmdName: string;
+begin
+  Token := Context.CurrentToken;
+  CmdName := UpperCase(Token.Value);
+
+  // Recognize file management commands
+  case CmdName of
+    'CATALOG', 'DIR', 'DIRECTORY': Result := TASTNode.Create(antCatalog, Token);
+    'COPY', 'CP': Result := TASTNode.Create(antCopy, Token);
+    'SCRATCH': Result := TASTNode.Create(antScratch, Token);
+    'RENAME': Result := TASTNode.Create(antRenameFile, Token);
+    'CONCAT': Result := TASTNode.Create(antConcat, Token);
+    'MKDIR', 'MD': Result := TASTNode.Create(antMkdir, Token);
+    'CHDIR', 'CD': Result := TASTNode.Create(antChdir, Token);
+    'MOVE', 'MV': Result := TASTNode.Create(antMove, Token);
+  else
+    Result := TASTNode.Create(antStatement, Token);
+  end;
+
+  Context.Advance; // Consume file management command
+
+  // Parse parameters
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  begin
+    Params := ParseExpression;
+    if Assigned(Params) then
+      Result.AddChild(Params)
+    else
+      Break;
+
+    // Handle comma separator
+    if Context.Check(ttSeparParam) then
+      Context.Advance
+    else
+      Break;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseFileInputStatement: TASTNode;
+var
+  Token: TLexerToken;
+  HandleNode, VarNode: TASTNode;
+  CmdName: string;
+begin
+  Token := Context.CurrentToken;
+  CmdName := UpperCase(Token.Value);
+
+  // Handle GET# and INPUT# commands
+  if CmdName = kGETN then
+  begin
+    // GET# file, variable
+    // Syntax: GET#1, A$ or GET# 1, A$
+    Result := TASTNode.Create(antGetFile, Token);
+    Context.Advance; // Consume GET#
+
+    // Parse file handle
+    if Context.Check(ttFileHandlePrefix) then
+      Context.Advance;  // Consume # if present (shouldn't be after GET# but handle it)
+
+    if Context.Check(ttNumber) or Context.Check(ttInteger) then
+    begin
+      HandleNode := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(HandleNode);
+      Context.Advance;
+    end
+    else if Context.Check(ttIdentifier) then
+    begin
+      HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(HandleNode);
+      Context.Advance;
+    end
+    else
+    begin
+      HandleError('Expected file handle after GET#', Token);
+      Exit;
+    end;
+
+    // Expect comma
+    if Context.Check(ttSeparParam) then
+      Context.Advance;
+
+    // Parse variable (single variable for GET#)
+    if Context.Check(ttIdentifier) then
+    begin
+      VarNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(VarNode);
+      Context.Advance;
+    end
+    else
+    begin
+      HandleError('Expected variable after GET# handle', Token);
+      Exit;
+    end;
+
+    DoNodeCreated(Result);
+    Exit;
+  end
+  else if CmdName = kINPUTN then
+  begin
+    // INPUT# file, variable [, variable ...]
+    // Syntax: INPUT#1, A$, B, C
+    Result := TASTNode.Create(antInputFile, Token);
+    Context.Advance; // Consume INPUT#
+
+    // Parse file handle
+    if Context.Check(ttFileHandlePrefix) then
+      Context.Advance;
+
+    if Context.Check(ttNumber) or Context.Check(ttInteger) then
+    begin
+      HandleNode := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(HandleNode);
+      Context.Advance;
+    end
+    else if Context.Check(ttIdentifier) then
+    begin
+      HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(HandleNode);
+      Context.Advance;
+    end
+    else
+    begin
+      HandleError('Expected file handle after INPUT#', Token);
+      Exit;
+    end;
+
+    // Expect comma
+    if Context.Check(ttSeparParam) then
+      Context.Advance;
+
+    // Parse variable list
+    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+    begin
+      if Context.Check(ttIdentifier) then
+      begin
+        VarNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+        Result.AddChild(VarNode);
+        Context.Advance;
+      end
+      else
+        Break;
+
+      // Handle comma separator
+      if Context.Check(ttSeparParam) then
+        Context.Advance
+      else
+        Break;
+    end;
+
+    if Result.ChildCount < 2 then
+      HandleError('Expected at least one variable after INPUT# handle', Token);
+
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // Generic file input command handling (fallback)
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance;
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseFileOutputStatement: TASTNode;
+var
+  Token: TLexerToken;
+  HandleNode, Expr: TASTNode;
+  SeparatorNode: TASTNode;
+  CmdName: string;
+begin
+  Token := Context.CurrentToken;
+  CmdName := UpperCase(Token.Value);
+
+  // Handle PRINT# command
+  if CmdName = kPRINTN then
+  begin
+    // PRINT# file [, print list]
+    // Syntax: PRINT#1, "Hello"; A$
+    // Note: PRINT# alone (no data) can be used to close CMD redirection
+    Result := TASTNode.Create(antPrintFile, Token);
+    Context.Advance; // Consume PRINT#
+
+    // Parse file handle
+    if Context.Check(ttFileHandlePrefix) then
+      Context.Advance;
+
+    if Context.Check(ttNumber) or Context.Check(ttInteger) then
+    begin
+      HandleNode := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(HandleNode);
+      Context.Advance;
+    end
+    else if Context.Check(ttIdentifier) then
+    begin
+      HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(HandleNode);
+      Context.Advance;
+    end
+    else
+    begin
+      HandleError('Expected file handle after PRINT#', Token);
+      Exit;
+    end;
+
+    // Optional comma and print list
+    // PRINT# without additional parameters is valid (used to reset CMD)
+    if Context.Check(ttSeparParam) or Context.Check(ttSeparOutput) then
+    begin
+      Context.Advance; // Consume separator
+
+      // Parse expressions (like PRINT statement)
+      while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+      begin
+        Expr := ParseExpression;
+        if Assigned(Expr) then
+          Result.AddChild(Expr)
+        else
+          Break;
+
+        // Check for PRINT separators (comma or semicolon)
+        if Context.CheckAny([ttSeparParam, ttSeparOutput]) then
+        begin
+          // Create separator node with actual separator value
+          SeparatorNode := TASTNode.CreateWithValue(antSeparator, Context.CurrentToken.Value, Context.CurrentToken);
+          Result.AddChild(SeparatorNode);
+          Context.Advance; // Consume separator
+
+          // If separator is at end of line, exit
+          if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+            Break;
+        end
+        else
+          Break;
+      end;
+    end;
+
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // Generic file output command handling (fallback)
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance;
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseErrorHandlingStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Command: string;
+  LineNumNode: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Command := UpperCase(Token.Value);
+
+  if Command = 'TRAP' then
+  begin
+    // TRAP linenum - set error handler line
+    Result := TASTNode.Create(antTrap, Token);
+    Context.Advance; // Consume TRAP
+
+    // Parse the target line number expression
+    LineNumNode := ParseExpression;
+    if Assigned(LineNumNode) then
+      Result.AddChild(LineNumNode);
+  end
+  else if Command = 'RESUME' then
+  begin
+    Context.Advance; // Consume RESUME
+
+    // Check for NEXT keyword
+    if Context.Check(ttLoopBlockEnd) and (UpperCase(Context.CurrentToken.Value) = 'NEXT') then
+    begin
+      Result := TASTNode.Create(antResumeNext, Token);
+      Context.Advance; // Consume NEXT
+    end
+    else
+    begin
+      Result := TASTNode.Create(antResume, Token);
+    end;
+  end
+  else
+  begin
+    // Unknown error handling command - create generic statement
+    Result := TASTNode.Create(antStatement, Token);
+    Context.Advance;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseDebugStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance; // Consume debug command
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseTracingStatement: TASTNode;
+var
+  Token: TLexerToken;
+  NodeType: TASTNodeType;
+begin
+  Token := Context.CurrentToken;
+  // Determine if TRON or TROFF based on token value
+  if UpperCase(Token.Value) = 'TRON' then
+    NodeType := antTron
+  else
+    NodeType := antTroff;
+  Result := TASTNode.Create(NodeType, Token);
+  Context.Advance; // Consume TRON/TROFF
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseMonitorStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance; // Consume MONITOR
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseSysStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Address: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance; // Consume SYS
+
+  // Parse address parameter
+  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+  begin
+    Address := ParseExpression;
+    if Assigned(Address) then
+      Result.AddChild(Address);
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseUsrStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Address: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antUsrFunction, Token);
+  Context.Advance; // Consume USR
+
+  // Expect opening parenthesis
+  if not Context.Match(ttDelimParOpen) then
+  begin
+    HandleError('Expected "(" after USR', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Parse address parameter
+  Address := ParseExpression;
+  if Assigned(Address) then
+    Result.AddChild(Address)
+  else
+  begin
+    HandleError('Expected address parameter for USR', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Expect closing parenthesis
+  if not Context.Match(ttDelimParClose) then
+  begin
+    HandleError('Expected ")" after USR address', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseKeyStatement: TASTNode;
+var
+  Token: TLexerToken;
+  KeyNumExpr, KeyTextExpr: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antKey, Token);
+  Context.Advance; // Consume KEY
+
+  // KEY without arguments lists all key definitions
+  // KEY n, "text" defines function key n
+  if not Context.IsAtEnd and not Context.Check(ttEndOfLine) and not Context.Check(ttSeparStmt) then
+  begin
+    // Parse key number
+    KeyNumExpr := ParseExpression;
+    if Assigned(KeyNumExpr) then
+      Result.AddChild(KeyNumExpr);
+
+    // Expect comma and text
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance; // Consume comma
+      KeyTextExpr := ParseExpression;
+      if Assigned(KeyTextExpr) then
+        Result.AddChild(KeyTextExpr);
+    end;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseDirectiveStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance; // Consume directive
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseExpressionStatement: TASTNode;
+begin
+  // Parse as expression, could be assignment or function call
+  Result := ParseExpression;
+end;
+
+// === STUB IMPLEMENTATIONS ===
+
+function TPackratParser.ParseArrayDeclaration: TASTNode;
+var
+  VarName: TASTNode;
+  Dimensions: TASTNode;
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+
+  // Parse variable name
+  if not Context.Check(ttIdentifier) then
+  begin
+    HandleError('Expected variable name in array declaration', Token);
+    Result := nil;
+    Exit;
+  end;
+
+  VarName := TASTNode.CreateWithValue(antIdentifier, UpperCase(Token.Value), Token);
+  Context.Advance;
+
+  // Expect opening parenthesis
+  if not Context.Match(ttDelimParOpen) then
+  begin
+    HandleError('Expected "(" after array name', Context.CurrentToken);
+    VarName.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Parse dimensions
+  Dimensions := ParseDimensionList;
+  if not Assigned(Dimensions) then
+  begin
+    HandleError('Expected dimension list', Context.CurrentToken);
+    VarName.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Expect closing parenthesis
+  if not Context.Match(ttDelimParClose) then
+  begin
+    HandleError('Expected ")" after dimension list', Context.CurrentToken);
+    VarName.Free;
+    Dimensions.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Create array declaration node
+  Result := TASTNode.Create(antArrayDecl, Token);
+  Result.AddChild(VarName);
+  Result.AddChild(Dimensions);
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseDimensionList: TASTNode;
+var
+  Dimension: TASTNode;
+begin
+  Result := TASTNode.Create(antDimensions);
+
+  repeat
+    Dimension := ParseExpression;
+    if Assigned(Dimension) then
+      Result.AddChild(Dimension)
+    else
+      Break;
+
+    // Check for comma separator
+    if Context.Check(ttSeparParam) then
+      Context.Advance // Consume comma
+    else
+      Break; // No more dimensions
+
+  until Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]);
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseArrayAccess: TASTNode;
+var
+  ArrayName: TASTNode;
+  Indices: TASTNode;
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+
+  // Parse array name
+  if not Context.Check(ttIdentifier) then
+  begin
+    Result := nil;
+    Exit;
+  end;
+
+  ArrayName := TASTNode.CreateWithValue(antIdentifier, Token.Value, Token);
+  Context.Advance;
+
+  // Expect opening parenthesis
+  if not Context.Match(ttDelimParOpen) then
+  begin
+    // Not an array access, just return the identifier
+    Result := ArrayName;
+    Exit;
+  end;
+
+  // Parse index expressions
+  Indices := ParseExpressionList(ttSeparParam);
+  if not Assigned(Indices) then
+  begin
+    HandleError('Expected index expression', Context.CurrentToken);
+    ArrayName.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Expect closing parenthesis
+  if not Context.Match(ttDelimParClose) then
+  begin
+    HandleError('Expected ")" after array indices', Context.CurrentToken);
+    ArrayName.Free;
+    Indices.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Create array access node
+  Result := TASTNode.Create(antArrayAccess, Token);
+  Result.AddChild(ArrayName);
+  Result.AddChild(Indices);
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseDimStatement: TASTNode;
+var
+  Token: TLexerToken;
+  ArrayDecl: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antDim, Token);
+  Context.Advance; // Consume DIM
+
+  // Parse array declarations separated by commas
+  repeat
+    ArrayDecl := ParseArrayDeclaration;
+    if Assigned(ArrayDecl) then
+      Result.AddChild(ArrayDecl)
+    else
+    begin
+      HandleError('Expected array declaration after DIM', Context.CurrentToken);
+      Break;
+    end;
+
+    // Check for comma separator
+    if Context.Check(ttSeparParam) then
+      Context.Advance // Consume comma
+    else
+      Break; // No more array declarations
+
+  until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]);
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseDefStatement: TASTNode;
+var
+  Token, FnToken: TLexerToken;
+  FnName: string;
+  ParamNode, ExprNode, NameNode, ParamListNode: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antDef, Token);
+  Context.Advance; // Consume DEF
+
+  // Expect FN followed by function name
+  // Format: DEF FNname(param) = expression
+  // The FN keyword should be next
+  if not Context.Check(ttProcedureStart) then
+  begin
+    HandleError('Expected FN after DEF', Token);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  FnToken := Context.CurrentToken;
+  Context.Advance; // Consume FN
+
+  // Now expect the function name (identifier starting with letters after FN)
+  // In BASIC, it's written as FNEG, FNAA etc - where FN is separate keyword
+  // But the actual name follows immediately or is the next identifier
+  if not Context.Check(ttIdentifier) then
+  begin
+    HandleError('Expected function name after DEF FN', FnToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Create function name node
+  FnName := Context.CurrentToken.Value;
+  NameNode := TASTNode.CreateWithValue(antIdentifier, FnName, Context.CurrentToken);
+  Result.AddChild(NameNode);
+  Context.Advance; // Consume function name
+
+  // Expect opening parenthesis for parameter
+  if not Context.Match(ttDelimParOpen) then
+  begin
+    HandleError('Expected ( after function name', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Parse parameter (single variable name)
+  ParamListNode := TASTNode.Create(antDimensions, nil); // Reuse dimensions for param list
+  if Context.Check(ttIdentifier) then
+  begin
+    ParamNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+    ParamListNode.AddChild(ParamNode);
+    Context.Advance; // Consume parameter name
+  end;
+  Result.AddChild(ParamListNode);
+
+  // Expect closing parenthesis
+  if not Context.Match(ttDelimParClose) then
+  begin
+    HandleError('Expected ) after parameter', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Expect = sign
+  if not Context.Match(ttOpEq) then
+  begin
+    HandleError('Expected = after parameter list', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Parse the function body expression
+  ExprNode := ParseExpression;
+  if Assigned(ExprNode) then
+    Result.AddChild(ExprNode)
+  else
+  begin
+    HandleError('Expected expression after =', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseConstStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Assignment: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antConst, Token);
+  Context.Advance; // Consume CONST
+
+  // Parse assignment expression (name = value)
+  Assignment := ParseAssignmentStatement;
+  if Assigned(Assignment) and (Assignment.NodeType = antAssignment) then
+    Result.AddChild(Assignment)
+  else
+  begin
+    HandleError('Expected assignment after CONST', Token);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseDataStatement: TASTNode;
+var
+  Token: TLexerToken;
+  DataItem: TASTNode;
+begin
+  Token := Context.CurrentToken;
+
+  // Check if this is actually RESTORE (both DATA and RESTORE use ttDataConstant)
+  if SameText(Token.Value, 'RESTORE') then
+  begin
+    Result := ParseRestoreStatement;
+    Exit;
+  end;
+
+  Result := TASTNode.Create(antData, Token);
+  Context.Advance; // Consume DATA
+
+  // Parse comma-separated list of data items (literals only - no expressions)
+  // Format: DATA 5,12,1,34,18 or DATA "hello","world" or DATA COMMODORE,128
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  begin
+    // Parse data item - can be number, string, or unquoted identifier (treated as string)
+    if Context.Check(ttNumber) or Context.Check(ttInteger) or Context.Check(ttFloat) then
+    begin
+      DataItem := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(DataItem);
+      Context.Advance;
+    end
+    else if Context.Check(ttStringLiteral) then
+    begin
+      DataItem := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(DataItem);
+      Context.Advance;
+    end
+    else if Context.Check(ttIdentifier) then
+    begin
+      // Unquoted identifier in DATA is treated as string literal
+      DataItem := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(DataItem);
+      Context.Advance;
+    end
+    else if Context.Check(ttOpSub) then
+    begin
+      // Handle negative numbers: -5, -12.5
+      Context.Advance; // Consume -
+      if Context.Check(ttNumber) or Context.Check(ttInteger) or Context.Check(ttFloat) then
+      begin
+        DataItem := TASTNode.CreateWithValue(antLiteral, -Double(Context.CurrentToken.Value), Context.CurrentToken);
+        Result.AddChild(DataItem);
+        Context.Advance;
+      end;
+    end
+    else
+      Break;
+
+    // Check for comma separator
+    if Context.Check(ttSeparParam) then
+      Context.Advance // Consume comma and continue
+    else
+      Break; // No more items
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseReadStatement: TASTNode;
+var
+  Token: TLexerToken;
+  VarNode: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antRead, Token);
+  Context.Advance; // Consume READ
+
+  // Parse comma-separated list of variables
+  // Format: READ X or READ A$,B,C or READ A(I),B$
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  begin
+    if Context.Check(ttIdentifier) then
+    begin
+      // Check if it's an array access
+      if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+      begin
+        VarNode := ParseArrayAccess;
+      end
+      else
+      begin
+        // Simple variable
+        VarNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+        Context.Advance;
+      end;
+      Result.AddChild(VarNode);
+    end
+    else
+      Break;
+
+    // Check for comma separator
+    if Context.Check(ttSeparParam) then
+      Context.Advance // Consume comma and continue
+    else
+      Break;
+  end;
+
+  if Result.ChildCount = 0 then
+    HandleError('Expected at least one variable in READ statement', Token);
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseRestoreStatement: TASTNode;
+var
+  Token: TLexerToken;
+  LineNode: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antRestore, Token);
+  Context.Advance; // Consume RESTORE
+
+  // Optional line number: RESTORE or RESTORE 100
+  if Context.Check(ttNumber) or Context.Check(ttInteger) then
+  begin
+    LineNode := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+    Result.AddChild(LineNode);
+    Context.Advance;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseClearStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antClear, Token);
+  Context.Advance; // Consume CLR
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseStopStatement: TASTNode;
+var
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antStop, Token);
+  Context.Advance; // Consume STOP
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseRunStatement: TASTNode;
+var
+  Token: TLexerToken;
+  LineNumber: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antRun, Token);
+  Context.Advance; // Consume RUN
+
+  // Optional line number parameter
+  if Context.Check(ttLineNumber) or Context.Check(ttInteger) then
+  begin
+    LineNumber := ParseExpression;
+    if Assigned(LineNumber) then
+      Result.AddChild(LineNumber);
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseProgramEditingStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Param: TASTNode;
+  CmdName: string;
+begin
+  Token := Context.CurrentToken;
+  CmdName := UpperCase(Token.Value);
+
+  // Recognize specific program editing commands
+  case CmdName of
+    'LIST': Result := TASTNode.Create(antList, Token);
+    'NEW': Result := TASTNode.Create(antNew, Token);
+    'DELETE': Result := TASTNode.Create(antDelete, Token);
+    'RENUMBER': Result := TASTNode.Create(antRenumber, Token);
+  else
+    Result := TASTNode.Create(antStatement, Token);
+  end;
+
+  Context.Advance; // Consume command
+
+  // Special handling for DELETE: parse line range (e.g., 10-50, -100, 100-)
+  if CmdName = 'DELETE' then
+  begin
+    // Check for leading minus (DELETE -100 means delete up to line 100)
+    if Context.Check(ttOpSub) then
+    begin
+      Context.Advance; // Consume '-'
+      // Create a node with value 0 for start (meaning "from beginning")
+      Param := TASTNode.Create(antLiteral, Context.CurrentToken);
+      Param.Value := 0;
+      Result.AddChild(Param);
+      // Parse end line number
+      if Context.Check(ttNumber) then
+      begin
+        Param := TASTNode.Create(antLiteral, Context.CurrentToken);
+        Param.Value := StrToIntDef(Context.CurrentToken.Value, 0);
+        Result.AddChild(Param);
+        Context.Advance;
+      end;
+    end
+    else if Context.Check(ttNumber) then
+    begin
+      // Parse start line number
+      Param := TASTNode.Create(antLiteral, Context.CurrentToken);
+      Param.Value := StrToIntDef(Context.CurrentToken.Value, 0);
+      Result.AddChild(Param);
+      Context.Advance;
+      // Check for range separator '-'
+      if Context.Check(ttOpSub) then
+      begin
+        Context.Advance; // Consume '-'
+        // Check if there's an end number or just trailing '-' (DELETE 100-)
+        if Context.Check(ttNumber) then
+        begin
+          Param := TASTNode.Create(antLiteral, Context.CurrentToken);
+          Param.Value := StrToIntDef(Context.CurrentToken.Value, 0);
+          Result.AddChild(Param);
+          Context.Advance;
+        end
+        else
+        begin
+          // DELETE 100- means delete from 100 to end, use -1 as marker
+          Param := TASTNode.Create(antLiteral, Context.CurrentToken);
+          Param.Value := -1;
+          Result.AddChild(Param);
+        end;
+      end;
+      // If no '-', it's a single line delete (only start child exists)
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // Parse ALL parameters until end of statement (for LIST, RENUMBER, etc.)
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  begin
+    // Skip commas between parameters
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;
+      Continue;
+    end;
+
+    Param := ParseExpression;
+    if Assigned(Param) then
+      Result.AddChild(Param)
+    else
+      Break;
+
+    // Handle comma separator
+    if Context.Check(ttSeparParam) then
+      Context.Advance
+    else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+      Break;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseLoopStatement: TASTNode;
+var
+ Token: TLexerToken;
+begin
+ Token := Context.CurrentToken;
+
+ // Determine loop type based on keyword
+ if UpperCase(Token.Value) = 'FOR' then
+   Result := ParseForStatement
+ else if UpperCase(Token.Value) = 'DO' then
+   Result := ParseDoStatement
+ else if UpperCase(Token.Value) = 'WHILE' then
+   Result := ParseWhileStatement
+ else
+ begin
+   HandleError(Format('Unknown loop type: "%s"', [Context.CurrentToken.Value]), Context.CurrentToken);
+   Result := nil;
+ end;
+end;
+
+function TPackratParser.ParseJumpStatement: TASTNode;
+var
+ Token: TLexerToken;
+begin
+ Token := Context.CurrentToken;
+
+ // Determine jump type based on keyword
+ if UpperCase(Token.Value) = 'GOTO' then
+   Result := ParseGotoStatement
+ else if UpperCase(Token.Value) = 'GOSUB' then
+   Result := ParseGosubStatement
+ else if UpperCase(Token.Value) = 'ON' then
+   Result := ParseOnStatement
+ else
+ begin
+   HandleError(Format('Unknown jump type: "%s"', [Context.CurrentToken.Value]), Context.CurrentToken);
+   Result := nil;
+ end;
+end;
+
+function TPackratParser.ParseWhileStatement: TASTNode;
+var
+  Condition, Body: TASTNode;
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antWhileLoop, Token);
+  Context.Advance; // Consume WHILE
+
+  // Parse condition
+  Condition := ParseExpression;
+  if not Assigned(Condition) then
+  begin
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+  Result.AddChild(Condition);
+
+  // Parse body until matching WEND or END WHILE
+  Body := ParseBlockUntil([ttLoopBlockEnd]);
+  if Assigned(Body) then
+    Result.AddChild(Body);
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseOnStatement: TASTNode;
+var
+  Expression, Target: TASTNode;
+  Token: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antStatement, Token);
+  Context.Advance; // Consume ON
+
+  // Parse expression
+  Expression := ParseExpression;
+  if Assigned(Expression) then
+    Result.AddChild(Expression);
+
+  // Expect GOTO or GOSUB
+  if Context.Match(ttJumpKeyword) then
+  begin
+    // Parse target list
+    Target := ParseExpressionList(ttSeparParam);
+    if Assigned(Target) then
+      Result.AddChild(Target);
+  end
+  else
+  begin
+    HandleError('Expected GOTO or GOSUB after ON expression', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+// === HELPER METHODS FOR BLOCK PARSING ===
+
+function TPackratParser.DefaultParserOptions: TParserOptions;
+begin
+  Result.IncludeComments := False;        // REM ignorati per performance
+  Result.IncludeLineNumbers := True;      // Line numbers utili per debug
+  Result.OptimizeAST := True;             // Ottimizzazioni attive
+  Result.StrictMode := True;              // Parsing rigoroso
+  Result.ArrayIndexMode := aimMaxIndex;   // Commodore BASIC style by default
+end;
+
+function TPackratParser.GetOptions: TParserOptions;
+begin
+  Result := FOptions;
+end;
+
+procedure TPackratParser.SetOptions(AValue: TParserOptions);
+begin
+  FOptions := AValue;
+end;
+
+function TPackratParser.ParseBlockUntil(EndTokens: array of TTokenType): TASTNode;
+var
+  Statement: TASTNode;
+  Token: TLexerToken;
+  i: Integer;
+  Found: Boolean;
+begin
+  Result := TASTNode.Create(antBlock);
+
+  while not Context.IsAtEnd do
+  begin
+    Token := Context.CurrentToken;
+
+    // Check if we hit an end token
+    Found := False;
+    for i := Low(EndTokens) to High(EndTokens) do
+    begin
+      if Token.TokenType = EndTokens[i] then
+      begin
+        Found := True;
+        Break;
+      end;
+    end;
+
+    if Found then
+      Break;
+
+    // Skip line numbers and EOL - they remain at root level
+    if Context.Match(ttLineNumber) or Context.Match(ttEndOfLine) then
+      Continue;
+
+    // Parse statement within block
+    Statement := ParseStatement;
+    if Assigned(Statement) then
+      Result.AddChild(Statement)
+    else
+      Break;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.FindMatchingNext: Integer;
+var
+  i, NestedLevel: Integer;
+  Token: TLexerToken;
+begin
+  Result := -1;
+  NestedLevel := 0;
+
+  for i := Context.CurrentIndex to Context.TokenList.Count - 1 do
+  begin
+    Token := TLexerToken(Context.TokenList[i]);
+    if not Assigned(Token) or (Token.TokenType = ttEndOfFile) then
+      Break;
+
+    if (Token.TokenType = ttLoopBlockStart) and (UpperCase(Token.Value) = 'FOR') then
+      Inc(NestedLevel)
+    else if (Token.TokenType = ttLoopBlockEnd) and (UpperCase(Token.Value) = 'NEXT') then
+    begin
+      if NestedLevel = 0 then
+      begin
+        Result := i;
+        Break;
+      end
+      else
+        Dec(NestedLevel);
+    end;
+  end;
+end;
+
+function TPackratParser.FindMatchingEnd(StartToken: TTokenType): Integer;
+var
+  i, NestedLevel: Integer;
+  Token: TLexerToken;
+  StartKeyword, EndKeyword: string;
+begin
+  Result := -1;
+  NestedLevel := 0;
+
+  // Determine what end token we're looking for
+  case StartToken of
+    ttLoopBlockStart: EndKeyword := 'LOOP';
+    ttBlockBegin: EndKeyword := 'END';
+    else Exit;
+  end;
+
+  StartKeyword := Context.CurrentToken.Value;
+
+  for i := Context.CurrentIndex to Context.TokenList.Count - 1 do
+  begin
+    Token := TLexerToken(Context.TokenList[i]);
+    if not Assigned(Token) or (Token.TokenType = ttEndOfFile) then
+      Break;
+
+    if (Token.TokenType = StartToken) and (UpperCase(Token.Value) = UpperCase(StartKeyword)) then
+      Inc(NestedLevel)
+    else if (UpperCase(Token.Value) = EndKeyword) then
+    begin
+      if NestedLevel = 0 then
+      begin
+        Result := i;
+        Break;
+      end
+      else
+        Dec(NestedLevel);
+    end;
+  end;
+end;
+
+// === EXPRESSION DELEGATION ===
+
+function TPackratParser.ParseExpression: TASTNode;
+begin
+  if Assigned(FExpressionParser) then
+    Result := FExpressionParser.ParseExpression()
+  else
+    Result := nil;
+end;
+
+function TPackratParser.ParseExpressionList(Delimiter: TTokenType): TASTNode;
+begin
+  if Assigned(FExpressionParser) then
+    Result := FExpressionParser.ParseExpressionList(Delimiter)
+  else
+    Result := nil;
+end;
+
+function TPackratParser.ParseArgumentList: TASTNode;
+begin
+  if Assigned(FExpressionParser) then
+    Result := FExpressionParser.ParseArgumentList()
+  else
+    Result := nil;
+end;
+
+// === UTILITY PARSING ===
+
+function TPackratParser.ParseStatementList: TASTNode;
+var
+ Statement: TASTNode;
+begin
+ Result := TASTNode.Create(antBlock);
+
+ repeat
+   Statement := ParseStatement;
+   if Assigned(Statement) then
+     Result.AddChild(Statement)
+   else
+     Break;
+
+ until not Context.Match(ttSeparStmt);
+
+ DoNodeCreated(Result);
+end;
+
+function TPackratParser.ValidateProgram: Boolean;
+begin
+  Result := FValidationStacks.ValidateAllClosed;
+end;
+
+// === VIRTUAL EVENT METHODS ===
+
+procedure TPackratParser.DoParsingStarted;
+begin
+  // Override in subclasses
+end;
+
+procedure TPackratParser.DoParsingFinished(Result: TParsingResult);
+begin
+  // Override in subclasses
+end;
+
+// === FACTORY FUNCTIONS ===
+
+function CreatePackratParser: TPackratParser;
+begin
+  Result := TPackratParser.Create;
+end;
+
+end.

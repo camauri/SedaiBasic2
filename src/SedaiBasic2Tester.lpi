@@ -1,0 +1,373 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <ProjectOptions>
+    <Version Value="12"/>
+    <PathDelim Value="\"/>
+    <General>
+      <Flags>
+        <MainUnitHasCreateFormStatements Value="False"/>
+        <MainUnitHasTitleStatement Value="False"/>
+        <MainUnitHasScaledStatement Value="False"/>
+      </Flags>
+      <SessionStorage Value="InProjectDir"/>
+      <Title Value="SedaiBasic2Tester"/>
+      <UseAppBundle Value="False"/>
+      <ResourceType Value="res"/>
+    </General>
+    <BuildModes>
+      <Item Name="Default" Default="True"/>
+      <Item Name="Debug">
+        <CompilerOptions>
+          <Version Value="11"/>
+          <PathDelim Value="\"/>
+          <Target>
+            <Filename Value="SedaiBasic2Tester"/>
+          </Target>
+          <SearchPaths>
+            <IncludeFiles Value="$(ProjOutDir)"/>
+            <Libraries Value="..\SDL2"/>
+            <OtherUnitFiles Value="..\SDL2"/>
+            <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
+          </SearchPaths>
+          <Parsing>
+            <SyntaxOptions>
+              <IncludeAssertionCode Value="True"/>
+            </SyntaxOptions>
+          </Parsing>
+          <CodeGeneration>
+            <Checks>
+              <IOChecks Value="True"/>
+              <RangeChecks Value="True"/>
+              <OverflowChecks Value="True"/>
+              <StackChecks Value="True"/>
+            </Checks>
+            <VerifyObjMethodCallValidity Value="True"/>
+          </CodeGeneration>
+          <Linking>
+            <Debugging>
+              <DebugInfoType Value="dsDwarf3"/>
+              <UseHeaptrc Value="True"/>
+              <TrashVariables Value="True"/>
+              <UseExternalDbgSyms Value="True"/>
+            </Debugging>
+          </Linking>
+        </CompilerOptions>
+      </Item>
+      <Item Name="Release">
+        <CompilerOptions>
+          <Version Value="11"/>
+          <PathDelim Value="\"/>
+          <Target>
+            <Filename Value="SedaiBasic2Tester"/>
+          </Target>
+          <SearchPaths>
+            <IncludeFiles Value="$(ProjOutDir)"/>
+            <Libraries Value="..\SDL2"/>
+            <OtherUnitFiles Value="..\SDL2"/>
+            <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
+          </SearchPaths>
+          <CodeGeneration>
+            <SmartLinkUnit Value="True"/>
+            <Optimizations>
+              <OptimizationLevel Value="3"/>
+            </Optimizations>
+          </CodeGeneration>
+          <Linking>
+            <Debugging>
+              <GenerateDebugInfo Value="False"/>
+              <RunWithoutDebug Value="True"/>
+            </Debugging>
+            <LinkSmart Value="True"/>
+          </Linking>
+        </CompilerOptions>
+      </Item>
+    </BuildModes>
+    <PublishOptions>
+      <Version Value="2"/>
+      <UseFileFilters Value="True"/>
+    </PublishOptions>
+    <RunParams>
+      <FormatVersion Value="2"/>
+    </RunParams>
+    <Units>
+      <Unit>
+        <Filename Value="SedaiBasic2Tester.lpr"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedailexerfsm.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiLexerFSM"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaibasickeywords.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiBasicKeywords"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedailexertypes.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiLexerTypes"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedailexertoken.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiLexerToken"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaitokenlist.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiTokenList"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaikeywordregistry.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiKeywordRegistry"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaikeywordtypes.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiKeywordTypes"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaikeywordcategory.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiKeywordCategory"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaikeywordtrie.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiKeywordTrie"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaikeywordutils.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiKeywordUtils"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaikeywordbase.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiKeywordBase"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaipackratparser.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiPackratParser"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiparsertypes.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiParserTypes"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiast.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiAST"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiparsererrors.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiParserErrors"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiparserresults.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiParserResults"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiparsercontext.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiParserContext"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaipackratcore.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiPackratCore"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiexpressionparser.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiExpressionParser"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaimemoryutils.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiMemoryUtils"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaimemoryconfig.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiMemoryConfig"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedailogging.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiLogging"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiexceptionhelpers.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiExceptionHelpers"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaigraphicsconfig.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiGraphicsConfig"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaidatetimeutils.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiDateTimeUtils"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiexecutor.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiExecutor"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiexecutorerrors.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiExecutorErrors"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiexecutortypes.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiExecutorTypes"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiexecutionresult.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiExecutionResult"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiconsole.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiConsole"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaisprite.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiSprite"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaievents.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiEvents"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiexecutorcontext.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiExecutorContext"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaicommandtypes.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiCommandTypes"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaicommandrouter.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiCommandRouter"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiprogrammemory.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiProgramMemory"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaioutputinterface.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiOutputInterface"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaisdl2output.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiSDL2Output"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaioutputfactory.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiOutputFactory"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaisdl2input.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiSDL2Input"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiparservalidation.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiParserValidation"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaisdl2graphicsoutput.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiSDL2GraphicsOutput"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaigraphicsmemory.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiGraphicsMemory"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaigraphicsmodes.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiGraphicsModes"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaibytecodetypes.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiBytecodeTypes"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaibytecodecompiler.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiBytecodeCompiler"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaibytecodevm.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiBytecodeVM"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaibytecodedisassembler.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiBytecodeDisassembler"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sedaiexecutordualmode.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="SedaiExecutorDualMode"/>
+      </Unit>
+    </Units>
+  </ProjectOptions>
+  <CompilerOptions>
+    <Version Value="11"/>
+    <PathDelim Value="\"/>
+    <Target>
+      <Filename Value="SedaiBasic2Tester"/>
+    </Target>
+    <SearchPaths>
+      <IncludeFiles Value="$(ProjOutDir)"/>
+      <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
+    </SearchPaths>
+    <Linking>
+      <Debugging>
+        <DebugInfoType Value="dsDwarf3"/>
+      </Debugging>
+    </Linking>
+  </CompilerOptions>
+  <Debugging>
+    <Exceptions>
+      <Item>
+        <Name Value="EAbort"/>
+      </Item>
+      <Item>
+        <Name Value="ECodetoolError"/>
+      </Item>
+      <Item>
+        <Name Value="EFOpenError"/>
+      </Item>
+    </Exceptions>
+  </Debugging>
+</CONFIG>

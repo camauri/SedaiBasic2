@@ -1,0 +1,78 @@
+# Free Pascal / Lazarus gitignore
+
+# Compiled files
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.o
+*.ppu
+*.compiled
+
+# Lazarus backup files
+backup/
+*.bak
+*.~*
+*~
+
+# Build directories
+lib/
+*.res
+*.or
+
+# Directories
+.artiforge/
+.claude/
+.vscode/
+_archive/
+bin/
+assets/
+deps/
+/distrib/
+/distrib.bak/
+/distrib.old/
+/docs/
+/job/
+/presentation/
+
+# Files
+fpmake.pp
+presentation.zip
+README_AI.md
+ChangeLog.md
+
+# Lazarus session files
+*.lps
+
+# Debug files
+*.dbg
+
+# IDE specific
+*.layout
+*.local
+
+# OS specific
+.DS_Store
+Thumbs.db
+desktop.ini
+# File speciale Windows
+nul
+
+# Test output
+*.log
+nul
+
+# File troppo grandi per GitHub
+temp_disasm.txt
+job/log/txt/step_output.txt
+
+# Benchmark temp and data
+.benchmark_temp/
+.benchmark_data/
+
+# SDL2 dependencies (if included)
+# Uncomment if SDL2 libs are not to be tracked
+# *.dll
+# *.so
+# *.dylib
