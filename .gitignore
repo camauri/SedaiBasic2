@@ -17,7 +17,7 @@ backup/
 *~
 
 # Build directories
-lib/
+/lib/
 *.res
 *.or
 
