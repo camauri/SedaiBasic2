@@ -236,16 +236,44 @@ var
   GSIDEvoInstance: TSedaiSIDEvo = nil;
 
 // SAF audio callback - stereo float output
+var
+  GCallbackCount: Integer = 0;
+  GLastSamplePrinted: Boolean = False;
+  GMaxSampleSeen: Single = 0;
+  GTotalSamples: Int64 = 0;  // For test tone phase
+  GTestToneEnabled: Boolean = False;  // Set to True to test audio output
+
 procedure SAFAudioCallback(AOutput: PSingle; AFrameCount: Integer; AUserData: Pointer);
 var
   I: Integer;
   Sample: Single;
+  Phase: Single;
 begin
+  Inc(GCallbackCount);
+
+  // TEST MODE: Generate a 440 Hz sine wave to verify audio output works
+  if GTestToneEnabled then
+  begin
+    for I := 0 to AFrameCount - 1 do
+    begin
+      Phase := (GTotalSamples + I) * 440.0 * 2.0 * Pi / 44100.0;
+      Sample := Sin(Phase) * 0.3;  // 30% volume
+      AOutput[I * 2] := Sample;      // Left
+      AOutput[I * 2 + 1] := Sample;  // Right
+    end;
+    Inc(GTotalSamples, AFrameCount);
+    Exit;
+  end;
+
   if not Assigned(GSIDEvoInstance) then
   begin
     // Silence (stereo interleaved)
     for I := 0 to AFrameCount * 2 - 1 do
       AOutput[I] := 0.0;
+    {$IFDEF DEBUG_AUDIO}
+    if (GCallbackCount mod 100) = 1 then
+      WriteLn('[DEBUG_AUDIO] Callback #', GCallbackCount, ' - NO SIDEvo instance!');
+    {$ENDIF}
     Exit;
   end;
 
@@ -253,6 +281,13 @@ begin
   for I := 0 to AFrameCount - 1 do
   begin
     Sample := GSIDEvoInstance.GenerateSample;
+    {$IFDEF DEBUG_AUDIO}
+    // Track max sample for debug
+    if Abs(Sample) > GMaxSampleSeen then
+      GMaxSampleSeen := Abs(Sample);
+    {$ENDIF}
+    // Amplify signal (SIDEvo ReSID-exact output is normalized but quiet)
+    Sample := Sample * 3.0;
     // Clamp to valid range
     if Sample > 1.0 then Sample := 1.0;
     if Sample < -1.0 then Sample := -1.0;
@@ -260,6 +295,12 @@ begin
     AOutput[I * 2] := Sample;      // Left
     AOutput[I * 2 + 1] := Sample;  // Right
   end;
+
+  {$IFDEF DEBUG_AUDIO}
+  if (GCallbackCount mod 100) = 1 then
+    WriteLn('[DEBUG_AUDIO] Callback #', GCallbackCount, ' frames=', AFrameCount,
+            ' MaxSample=', GMaxSampleSeen:0:6, ' MasterVol=', GSIDEvoInstance.MasterVolume:0:2);
+  {$ENDIF}
 end;
 {$ENDIF}
 
@@ -312,6 +353,9 @@ begin
   GSIDEvoInstance := FSIDEvo;
 
   // Create and configure SAF audio backend
+  {$IFDEF DEBUG_AUDIO}
+  WriteLn('[DEBUG_AUDIO] Creating TSedaiAudioBackend...');
+  {$ENDIF}
   FAudioBackend := TSedaiAudioBackend.Create;
   FAudioBackend.SetSampleRate(AUDIO_SAMPLE_RATE);
   FAudioBackend.SetDesiredBufferSize(AUDIO_BUFFER_SIZE);
@@ -319,15 +363,29 @@ begin
   FAudioBackend.SetCallback(@SAFAudioCallback, nil);
   FAudioBackend.SetMode(bmCallback);
 
+  {$IFDEF DEBUG_AUDIO}
+  WriteLn('[DEBUG_AUDIO] Calling FAudioBackend.Initialize...');
+  {$ENDIF}
   if FAudioBackend.Initialize then
   begin
-    FAudioInitialized := True;
-    FAudioBackend.Start;
     {$IFDEF DEBUG_AUDIO}
-    WriteLn('[DEBUG_AUDIO] SAF Audio initialized OK');
-    WriteLn('[DEBUG_AUDIO]   Sample rate: ', FAudioBackend.SampleRate);
-    WriteLn('[DEBUG_AUDIO]   Buffer size: ', FAudioBackend.BufferSize);
+    WriteLn('[DEBUG_AUDIO] Initialize OK, calling Start...');
     {$ENDIF}
+    if FAudioBackend.Start then
+    begin
+      FAudioInitialized := True;
+      {$IFDEF DEBUG_AUDIO}
+      WriteLn('[DEBUG_AUDIO] SAF Audio initialized and started OK');
+      WriteLn('[DEBUG_AUDIO]   Sample rate: ', FAudioBackend.SampleRate);
+      WriteLn('[DEBUG_AUDIO]   Buffer size: ', FAudioBackend.BufferSize);
+      WriteLn('[DEBUG_AUDIO]   Mode: bmCallback');
+      {$ENDIF}
+    end
+    {$IFDEF DEBUG_AUDIO}
+    else
+      WriteLn('[DEBUG_AUDIO] FAudioBackend.Start FAILED')
+    {$ENDIF}
+    ;
   end
   {$IFDEF DEBUG_AUDIO}
   else
@@ -336,6 +394,18 @@ begin
   ;
 
   FAudioTempo := 8;  // Default tempo (C128 default)
+
+  // Initialize default envelopes with piano-like ADSR values
+  // Envelope 0 (T0) is the default instrument
+  for i := 0 to 9 do
+  begin
+    FAudioEnvelopes[i].Attack := 0.01;    // Quick attack (10ms)
+    FAudioEnvelopes[i].Decay := 0.1;      // Short decay (100ms)
+    FAudioEnvelopes[i].Sustain := 0.7;    // 70% sustain level
+    FAudioEnvelopes[i].Release := 0.2;    // Medium release (200ms)
+    FAudioEnvelopes[i].Waveform := 1;     // Sawtooth (good default)
+    FAudioEnvelopes[i].PulseWidth := 0.5; // 50% duty cycle for pulse
+  end;
   {$ENDIF}
 end;
 
@@ -503,7 +573,7 @@ procedure TBytecodeVM.ExecutePlayString(const MusicStr: string);
     Vn = Voice (1-3)
     On = Octave (0-6, default 4)
     Tn = Tune envelope (0-9)
-    Un = Volume (0-9, maps to 0-15)
+    Un = Volume (0-15, same as VOL command)
     Xn = Filter (0=off, 1=on)
   Duration prefixes:
     W = Whole, H = Half, Q = Quarter, I = Eighth, S = Sixteenth
@@ -573,7 +643,7 @@ begin
   Voice := 1;
   Octave := 4;
   Envelope := 0;
-  Volume := 9;
+  Volume := 15;  // Max volume (0-15 like VOL command)
   FilterOn := False;
   Duration := 15;  // Quarter note default at tempo 8
 
@@ -591,7 +661,7 @@ begin
       'V': Voice := ParseNumber;  // Voice 1-3
       'O': Octave := ParseNumber; // Octave 0-6
       'T': Envelope := ParseNumber; // Envelope 0-9
-      'U': Volume := ParseNumber;   // Volume 0-9
+      'U': Volume := ParseNumber;   // Volume 0-15
       'X': FilterOn := (ParseNumber = 1); // Filter on/off
 
       // Duration prefixes
@@ -649,7 +719,7 @@ begin
           Duration := (Duration * 3) div 2;
 
         // Play the note using SIDEvo
-        if (Voice >= 1) and (Voice <= 8) and Assigned(FSIDEvo) then
+        if (Voice >= 1) and (Voice <= 8) and Assigned(FSIDEvo) and Assigned(FAudioBackend) then
         begin
           // Get waveform from envelope
           if (Envelope >= 0) and (Envelope <= 9) then
@@ -658,25 +728,31 @@ begin
             Waveform := SIDEVO_WAVE_SAWTOOTH;
 
           {$IFDEF DEBUG_AUDIO}
-          WriteLn('[DEBUG_AUDIO] FSIDEvo.SetFrequencyHz(', Voice - 1, ', ', Freq:0:2, ') Waveform=', Waveform, ' Vol=', Volume);
+          WriteLn('[DEBUG_AUDIO] PLAY NOTE: V', Voice, ' ', Freq:0:1, 'Hz Wave=', Waveform);
           {$ENDIF}
 
-          // Configure voice
-          FSIDEvo.SetFrequencyHz(Voice - 1, Freq);
-          FSIDEvo.SetWaveform(Voice - 1, Waveform);
-          FSIDEvo.SetVoiceVolume(Voice - 1, Volume / 9.0);
+          // Lock audio to prevent race conditions with callback
+          FAudioBackend.Lock;
+          try
+            // Configure voice
+            FSIDEvo.SetFrequencyHz(Voice - 1, Freq);
+            FSIDEvo.SetWaveform(Voice - 1, Waveform);
+            FSIDEvo.SetVoiceVolume(Voice - 1, Volume / 15.0);
 
-          // Set ADSR from envelope (SIDEvo uses 0.0-1.0 for times in seconds)
-          FSIDEvo.SetADSR(Voice - 1,
-            FAudioEnvelopes[Envelope].Attack,
-            FAudioEnvelopes[Envelope].Decay,
-            FAudioEnvelopes[Envelope].Sustain,
-            FAudioEnvelopes[Envelope].Release);
+            // Set ADSR from envelope (SIDEvo uses 0.0-1.0 for level ratios)
+            FSIDEvo.SetADSR(Voice - 1,
+              FAudioEnvelopes[Envelope].Attack,
+              FAudioEnvelopes[Envelope].Decay,
+              FAudioEnvelopes[Envelope].Sustain,
+              FAudioEnvelopes[Envelope].Release);
 
-          // Trigger note (gate on)
-          FSIDEvo.GateOn(Voice - 1);
+            // Trigger note (gate on)
+            FSIDEvo.GateOn(Voice - 1);
+          finally
+            FAudioBackend.Unlock;
+          end;
 
-          // Wait for note duration
+          // Wait for note duration (outside lock to allow callback to run)
           {$IFDEF DEBUG_AUDIO}
           WriteLn('[DEBUG_AUDIO] Sleeping for ', Duration * 1000 * 8 div (60 * FAudioTempo), ' ms (tempo=', FAudioTempo, ')');
           {$ENDIF}
@@ -686,7 +762,12 @@ begin
           {$IFDEF DEBUG_AUDIO}
           WriteLn('[DEBUG_AUDIO] FSIDEvo.GateOff(', Voice - 1, ')');
           {$ENDIF}
-          FSIDEvo.GateOff(Voice - 1);
+          FAudioBackend.Lock;
+          try
+            FSIDEvo.GateOff(Voice - 1);
+          finally
+            FAudioBackend.Unlock;
+          end;
         end;
       end;
 
@@ -2928,40 +3009,65 @@ end;
 procedure TBytecodeVM.ExecuteSoundOp(const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
+  {$IFDEF WITH_SEDAI_AUDIO}
+  VoiceIdx: Integer;
+  DurationMs: Integer;
+  {$ENDIF}
 begin
   SubOp := Instr.OpCode and $FF;
   case SubOp of
     0: // bcSoundVol
       {$IFDEF WITH_SEDAI_AUDIO}
-      if FAudioInitialized and Assigned(FSIDEvo) then
-        FSIDEvo.SetMasterVolume(FIntRegs[Instr.Src1] / 15.0);
+      if FAudioInitialized and Assigned(FSIDEvo) and Assigned(FAudioBackend) then
+      begin
+        FAudioBackend.Lock;
+        try
+          FSIDEvo.SetMasterVolume(FIntRegs[Instr.Src1] / 15.0);
+        finally
+          FAudioBackend.Unlock;
+        end;
+      end;
       {$ELSE}
       ; // No audio support
       {$ENDIF}
     1: // bcSoundSound
       {$IFDEF WITH_SEDAI_AUDIO}
-      if FAudioInitialized and Assigned(FSIDEvo) then
+      if FAudioInitialized and Assigned(FSIDEvo) and Assigned(FAudioBackend) then
       begin
         // SOUND voice, freq, duration [,dir, minfreq, sweeptime, waveform, pulsewidth]
         // Src1 = voice (int), Src2 = freq (int, SID frequency 0-65535), Dest = duration (int in jiffies)
         // Immediate bits 32-39 = waveform (0=triangle, 1=saw, 2=pulse, 3=noise)
-        // Convert SID frequency to Hz: SID_value * PAL_clock / 16777216
-        // Simplified: SID_value * 0.0596 (for PAL 985248 Hz clock)
-        FSIDEvo.SetFrequencyHz(FIntRegs[Instr.Src1] - 1, FIntRegs[Instr.Src2] * 0.0596);
-        case (Instr.Immediate shr 32) and $FF of
-          0: FSIDEvo.SetWaveform(FIntRegs[Instr.Src1] - 1, SIDEVO_WAVE_TRIANGLE);
-          1: FSIDEvo.SetWaveform(FIntRegs[Instr.Src1] - 1, SIDEVO_WAVE_SAWTOOTH);
-          2: FSIDEvo.SetWaveform(FIntRegs[Instr.Src1] - 1, SIDEVO_WAVE_PULSE);
-          3: FSIDEvo.SetWaveform(FIntRegs[Instr.Src1] - 1, SIDEVO_WAVE_NOISE);
-        else
-          FSIDEvo.SetWaveform(FIntRegs[Instr.Src1] - 1, SIDEVO_WAVE_SAWTOOTH);
+        VoiceIdx := FIntRegs[Instr.Src1] - 1;
+        DurationMs := FIntRegs[Instr.Dest] * 1000 div 60;
+
+        FAudioBackend.Lock;
+        try
+          // Convert SID frequency to Hz: SID_value * PAL_clock / 16777216
+          // Simplified: SID_value * 0.0596 (for PAL 985248 Hz clock)
+          FSIDEvo.SetFrequencyHz(VoiceIdx, FIntRegs[Instr.Src2] * 0.0596);
+          case (Instr.Immediate shr 32) and $FF of
+            0: FSIDEvo.SetWaveform(VoiceIdx, SIDEVO_WAVE_TRIANGLE);
+            1: FSIDEvo.SetWaveform(VoiceIdx, SIDEVO_WAVE_SAWTOOTH);
+            2: FSIDEvo.SetWaveform(VoiceIdx, SIDEVO_WAVE_PULSE);
+            3: FSIDEvo.SetWaveform(VoiceIdx, SIDEVO_WAVE_NOISE);
+          else
+            FSIDEvo.SetWaveform(VoiceIdx, SIDEVO_WAVE_SAWTOOTH);
+          end;
+          FSIDEvo.GateOn(VoiceIdx);
+        finally
+          FAudioBackend.Unlock;
         end;
-        FSIDEvo.GateOn(FIntRegs[Instr.Src1] - 1);
-        // Wait for duration (convert jiffies to ms: 1 jiffy = 1/60 sec)
-        if FIntRegs[Instr.Dest] > 0 then
+
+        // Wait for duration (outside lock to allow callback to run)
+        if DurationMs > 0 then
         begin
-          CooperativeSleep(FIntRegs[Instr.Dest] * 1000 div 60);
-          FSIDEvo.GateOff(FIntRegs[Instr.Src1] - 1);
+          CooperativeSleep(DurationMs);
+          FAudioBackend.Lock;
+          try
+            FSIDEvo.GateOff(VoiceIdx);
+          finally
+            FAudioBackend.Unlock;
+          end;
         end;
       end;
       {$ELSE}
@@ -3007,24 +3113,29 @@ begin
       {$ENDIF}
     5: // bcSoundFilter
       {$IFDEF WITH_SEDAI_AUDIO}
-      if FAudioInitialized and Assigned(FSIDEvo) then
+      if FAudioInitialized and Assigned(FSIDEvo) and Assigned(FAudioBackend) then
       begin
-        // FILTER cutoff, lowpass, bandpass, highpass, resonance
-        // Src1 = cutoff frequency register (float)
-        // Src2 = lowpass register (int 0/1)
-        // Dest = bandpass register (int 0/1)
-        // Immediate bits 0-7 = highpass register index (int 0/1)
-        // Immediate bits 8-15 = resonance register index (int 0-15)
-        // Set filter mode (LP, BP, HP as booleans)
-        FSIDEvo.SetFilterMode(
-          FIntRegs[Instr.Src2] <> 0,                    // lowpass
-          FIntRegs[Instr.Dest] <> 0,                    // bandpass
-          FIntRegs[Instr.Immediate and $FF] <> 0       // highpass
-        );
-        // Set cutoff: convert Hz (0-20000) to 11-bit value (0-2047)
-        FSIDEvo.SetFilterCutoff(Round(FFloatRegs[Instr.Src1] / 20000.0 * 2047));
-        // Set resonance: 0-15 range
-        FSIDEvo.SetFilterResonance(FIntRegs[(Instr.Immediate shr 8) and $FF] and $0F);
+        FAudioBackend.Lock;
+        try
+          // FILTER cutoff, lowpass, bandpass, highpass, resonance
+          // Src1 = cutoff frequency register (float)
+          // Src2 = lowpass register (int 0/1)
+          // Dest = bandpass register (int 0/1)
+          // Immediate bits 0-7 = highpass register index (int 0/1)
+          // Immediate bits 8-15 = resonance register index (int 0-15)
+          // Set filter mode (LP, BP, HP as booleans)
+          FSIDEvo.SetFilterMode(
+            FIntRegs[Instr.Src2] <> 0,                    // lowpass
+            FIntRegs[Instr.Dest] <> 0,                    // bandpass
+            FIntRegs[Instr.Immediate and $FF] <> 0       // highpass
+          );
+          // Set cutoff: convert Hz (0-20000) to 11-bit value (0-2047)
+          FSIDEvo.SetFilterCutoff(Round(FFloatRegs[Instr.Src1] / 20000.0 * 2047));
+          // Set resonance: 0-15 range
+          FSIDEvo.SetFilterResonance(FIntRegs[(Instr.Immediate shr 8) and $FF] and $0F);
+        finally
+          FAudioBackend.Unlock;
+        end;
       end;
       {$ELSE}
       ; // No audio support

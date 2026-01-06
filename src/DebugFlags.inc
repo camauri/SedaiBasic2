@@ -98,7 +98,7 @@
 {.$DEFINE DEBUG_VM}
 {.$DEFINE DEBUG_CLEANUP}
 {$DEFINE DEBUG_CONSOLE}     // Interactive console (SDL2) debug
-{$DEFINE DEBUG_AUDIO}       // Audio subsystem debug (WITH_SEDAI_AUDIO required)
+{.$DEFINE DEBUG_AUDIO}      // Audio subsystem debug (WITH_SEDAI_AUDIO required)
 
 { ============================================================================
   AUTO-ENABLE ALL FLAGS WHEN DEBUG_ALL IS SET
