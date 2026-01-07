@@ -36,6 +36,8 @@ var
   ArrIdxW: Word;
   LStartIdx, LEndIdx, LLoopIdx: Integer;
   LFirstVal: Int64;
+  // Local copy of TrueValue for comparison operators
+  TrueVal: Int64;
 begin
   if FProgram = nil then raise Exception.Create('No program loaded');
 
@@ -49,6 +51,8 @@ begin
   // Get direct pointers to register arrays
   IntRegs := @FIntRegs[0];
   FloatRegs := @FFloatRegs[0];
+  // Local copy of TrueValue for comparison operators
+  TrueVal := FTrueValue;
 
   {$IFDEF DEBUG_MODE}
   {$IFDEF ENABLE_PROFILER}
@@ -63,6 +67,7 @@ begin
   {$R-}  // Range checking off
   {$Q-}  // Overflow checking off
 
+  try
   while FRunning and (CurPC < InstrCount) do
   begin
     Instr := Instructions[CurPC];
@@ -135,7 +140,12 @@ begin
         30: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] + FloatRegs[Instr.Src1]; Inc(CurPC); end; // bcAddFloatTo
         31: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] - FloatRegs[Instr.Src1]; Inc(CurPC); end; // bcSubFloatTo
         32: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] * FloatRegs[Instr.Src1]; Inc(CurPC); end; // bcMulFloatTo
-        33: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] / FloatRegs[Instr.Src1]; Inc(CurPC); end; // bcDivFloatTo
+        33: begin // bcDivFloatTo
+          if FloatRegs[Instr.Src1] = 0 then
+            raise EZeroDivide.Create('Division by zero');
+          FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] / FloatRegs[Instr.Src1];
+          Inc(CurPC);
+        end;
 
         // Fused constant arithmetic (Int) - sub-opcodes 40-42
         40: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] + Instr.Immediate; Inc(CurPC); end; // bcAddIntConst
@@ -146,7 +156,12 @@ begin
         50: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] + Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end; // bcAddFloatConst
         51: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] - Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end; // bcSubFloatConst
         52: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end; // bcMulFloatConst
-        53: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end; // bcDivFloatConst
+        53: begin // bcDivFloatConst
+          if Double(Pointer(@Instr.Immediate)^) = 0 then
+            raise EZeroDivide.Create('Division by zero');
+          FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / Double(Pointer(@Instr.Immediate)^);
+          Inc(CurPC);
+        end;
 
         // Fused compare-zero-and-branch (Int) - sub-opcodes 60-61
         60: if IntRegs[Instr.Src1] = 0 then CurPC := Instr.Immediate else Inc(CurPC);  // bcBranchEqZeroInt
@@ -226,6 +241,8 @@ begin
         end;
         112: begin // bcArrayLoadDivAddFloat: dest = acc + arr[idx] / denom
           // Extra encodes: acc_reg (low 16) + denom_reg (high 16)
+          if FloatRegs[(Instr.Immediate shr 16) and $FFFF] = 0 then
+            raise EZeroDivide.Create('Division by zero');
           FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate and $FFFF] +
             FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]] / FloatRegs[(Instr.Immediate shr 16) and $FFFF];
           Inc(CurPC);
@@ -354,15 +371,30 @@ begin
         bcAddInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] + IntRegs[Instr.Src2]; Inc(CurPC); end;
         bcSubInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] - IntRegs[Instr.Src2]; Inc(CurPC); end;
         bcMulInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] * IntRegs[Instr.Src2]; Inc(CurPC); end;
-        bcDivInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] div IntRegs[Instr.Src2]; Inc(CurPC); end;
-        bcModInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] mod IntRegs[Instr.Src2]; Inc(CurPC); end;
+        bcDivInt: begin
+          if IntRegs[Instr.Src2] = 0 then
+            raise EDivByZero.Create('Integer division by zero');
+          IntRegs[Instr.Dest] := IntRegs[Instr.Src1] div IntRegs[Instr.Src2];
+          Inc(CurPC);
+        end;
+        bcModInt: begin
+          if IntRegs[Instr.Src2] = 0 then
+            raise EDivByZero.Create('Integer modulo by zero');
+          IntRegs[Instr.Dest] := IntRegs[Instr.Src1] mod IntRegs[Instr.Src2];
+          Inc(CurPC);
+        end;
         bcNegInt: begin IntRegs[Instr.Dest] := -IntRegs[Instr.Src1]; Inc(CurPC); end;
 
         // Float arithmetic - critical for spectral-norm
         bcAddFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] + FloatRegs[Instr.Src2]; Inc(CurPC); end;
         bcSubFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] - FloatRegs[Instr.Src2]; Inc(CurPC); end;
         bcMulFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2]; Inc(CurPC); end;
-        bcDivFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / FloatRegs[Instr.Src2]; Inc(CurPC); end;
+        bcDivFloat: begin
+          if FloatRegs[Instr.Src2] = 0 then
+            raise EZeroDivide.Create('Division by zero');
+          FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / FloatRegs[Instr.Src2];
+          Inc(CurPC);
+        end;
         bcPowFloat: begin FloatRegs[Instr.Dest] := Power(FloatRegs[Instr.Src1], FloatRegs[Instr.Src2]); Inc(CurPC); end;
         bcNegFloat: begin FloatRegs[Instr.Dest] := -FloatRegs[Instr.Src1]; Inc(CurPC); end;
 
@@ -370,27 +402,27 @@ begin
         bcIntToFloat: begin FloatRegs[Instr.Dest] := IntRegs[Instr.Src1]; Inc(CurPC); end;
         bcFloatToInt: begin IntRegs[Instr.Dest] := Trunc(FloatRegs[Instr.Src1]); Inc(CurPC); end;
 
-        // Integer comparisons
-        bcCmpEqInt: begin IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] = IntRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpNeInt: begin IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] <> IntRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpLtInt: begin IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] < IntRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpGtInt: begin IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] > IntRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpLeInt: begin IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] <= IntRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpGeInt: begin IntRegs[Instr.Dest] := Ord(IntRegs[Instr.Src1] >= IntRegs[Instr.Src2]); Inc(CurPC); end;
+        // Integer comparisons (use TrueVal for TRUE, 0 for FALSE)
+        bcCmpEqInt: begin if IntRegs[Instr.Src1] = IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpNeInt: begin if IntRegs[Instr.Src1] <> IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpLtInt: begin if IntRegs[Instr.Src1] < IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpGtInt: begin if IntRegs[Instr.Src1] > IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpLeInt: begin if IntRegs[Instr.Src1] <= IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpGeInt: begin if IntRegs[Instr.Src1] >= IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
 
-        // Float comparisons
-        bcCmpEqFloat: begin IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] = FloatRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpNeFloat: begin IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] <> FloatRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpLtFloat: begin IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] < FloatRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpGtFloat: begin IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] > FloatRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpLeFloat: begin IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] <= FloatRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpGeFloat: begin IntRegs[Instr.Dest] := Ord(FloatRegs[Instr.Src1] >= FloatRegs[Instr.Src2]); Inc(CurPC); end;
+        // Float comparisons (use TrueVal for TRUE, 0 for FALSE)
+        bcCmpEqFloat: begin if FloatRegs[Instr.Src1] = FloatRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpNeFloat: begin if FloatRegs[Instr.Src1] <> FloatRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpLtFloat: begin if FloatRegs[Instr.Src1] < FloatRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpGtFloat: begin if FloatRegs[Instr.Src1] > FloatRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpLeFloat: begin if FloatRegs[Instr.Src1] <= FloatRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpGeFloat: begin if FloatRegs[Instr.Src1] >= FloatRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
 
-        // String comparisons
-        bcCmpEqString: begin IntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] = FStringRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpNeString: begin IntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] <> FStringRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpLtString: begin IntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] < FStringRegs[Instr.Src2]); Inc(CurPC); end;
-        bcCmpGtString: begin IntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] > FStringRegs[Instr.Src2]); Inc(CurPC); end;
+        // String comparisons (use TrueVal for TRUE, 0 for FALSE)
+        bcCmpEqString: begin if FStringRegs[Instr.Src1] = FStringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpNeString: begin if FStringRegs[Instr.Src1] <> FStringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpLtString: begin if FStringRegs[Instr.Src1] < FStringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpGtString: begin if FStringRegs[Instr.Src1] > FStringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
 
         // Math functions
         bcMathAbs: begin FloatRegs[Instr.Dest] := Abs(FloatRegs[Instr.Src1]); Inc(CurPC); end;
@@ -650,6 +682,63 @@ begin
     end;
     {$ENDIF}
     {$ENDIF}
+  end;
+  except
+    on E: Exception do
+    begin
+      // Check if a TRAP handler is set
+      if FTrapLine > 0 then
+      begin
+        // Save error info for EL, ER, ERR$ variables
+        FLastErrorLine := Instr.SourceLine;
+        FResumePC := CurPC;  // Save PC for RESUME
+        FInErrorHandler := True;
+
+        // Map FPC exception types to BASIC error codes
+        if E is EDivByZero then
+          FLastErrorCode := ERR_DIVISION_BY_ZERO
+        else if E is EZeroDivide then
+          FLastErrorCode := ERR_DIVISION_BY_ZERO
+        else if E is EOverflow then
+          FLastErrorCode := ERR_OVERFLOW
+        else if E is EUnderflow then
+          FLastErrorCode := ERR_UNDERFLOW
+        else if E is EInvalidOp then
+          FLastErrorCode := ERR_DOMAIN
+        else if E is ERangeError then
+          FLastErrorCode := ERR_BAD_SUBSCRIPT
+        else
+          FLastErrorCode := ERR_INTERNAL;
+
+        FLastErrorMessage := E.Message;
+
+        // Find PC for trap line number
+        FTrapPC := FProgram.FindPCForLine(FTrapLine);
+        if FTrapPC >= 0 then
+        begin
+          // Jump to error handler
+          CurPC := FTrapPC;
+          FPC := CurPC;
+          // Continue execution from trap handler
+          FRunning := True;
+          {$IFDEF DEBUG_MODE}
+          RunDebug;
+          {$ELSE}
+          RunFast;
+          {$ENDIF}
+          Exit;
+        end
+        else
+        begin
+          // Trap line not found - re-raise
+          FInErrorHandler := False;
+          raise;
+        end;
+      end
+      else
+        // No TRAP set - re-raise exception
+        raise;
+    end;
   end;
 
   {$POP}  // Restore range/overflow checking

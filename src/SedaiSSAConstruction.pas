@@ -909,13 +909,19 @@ begin
       if Instr.OpCode <> ssaPhi then Break;  // PHI is always at the beginning
 
       VarKey := GetRegisterKey(Instr.Dest);
-      NewVer := NewVersion(VarKey);
-      Instr.Dest.Version := NewVer;
-      PushVersion(VarKey, NewVer);
 
-      // Track for backtracking ONLY if scoped semantics
-      if not FGlobalVariableSemantics then
+      // With global variable semantics, PHI dests also use Version=0
+      if FGlobalVariableSemantics then
+      begin
+        Instr.Dest.Version := 0;
+      end
+      else
+      begin
+        NewVer := NewVersion(VarKey);
+        Instr.Dest.Version := NewVer;
+        PushVersion(VarKey, NewVer);
         SavedVersions.Add(VarKey);
+      end;
     end;
 
     // STEP 2: Process normal instructions
@@ -970,15 +976,19 @@ begin
           // DEFINE Dest with new version (normal case)
           VarKey := GetRegisterKey(Instr.Dest);
 
-          // CRITICAL: Always call NewVersion to get a unique version number
-          // even if stack is not empty (backtracking from sibling blocks)
-          NewVer := NewVersion(VarKey);
-          Instr.Dest.Version := NewVer;
-          PushVersion(VarKey, NewVer);
-
-          // Track for backtracking ONLY if scoped semantics
-          if not FGlobalVariableSemantics then
+          // With global variable semantics, all definitions use Version=0
+          // (BASIC variables are global, no SSA versioning needed)
+          if FGlobalVariableSemantics then
+            Instr.Dest.Version := 0
+          else
+          begin
+            // CRITICAL: Always call NewVersion to get a unique version number
+            // even if stack is not empty (backtracking from sibling blocks)
+            NewVer := NewVersion(VarKey);
+            Instr.Dest.Version := NewVer;
+            PushVersion(VarKey, NewVer);
             SavedVersions.Add(VarKey);
+          end;
         end;
       end;
     end;

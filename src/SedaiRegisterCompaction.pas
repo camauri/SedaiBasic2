@@ -196,6 +196,7 @@ begin
     bcArrayLoadInt,  // Typed array load (int) - Dest is WRITTEN
     // === GROUP 4: I/O operations ===
     bcInputInt,      // Input int
+    bcDataReadInt,   // Read next DATA value into int register
     // === GROUP 10: Graphics ===
     bcGraphicRGBA,    // Dest = RGBA result (int)
     bcGraphicRdot,    // Dest = pixel cursor info (int)
@@ -242,6 +243,7 @@ begin
     bcArrayLoadFloat,  // Typed array load (float) - Dest is WRITTEN
     // === GROUP 4: I/O operations ===
     bcInputFloat,
+    bcDataReadFloat,   // Read next DATA value into float register
     // === SUPERINSTRUCTIONS ===
     // Fused arithmetic-to-dest (Float): Dest = Dest op Src1
     bcAddFloatTo, bcSubFloatTo, bcMulFloatTo, bcDivFloatTo,
@@ -275,7 +277,8 @@ begin
     // === GROUP 3: Array operations ===
     bcArrayLoadString,  // Typed array load (string) - Dest is WRITTEN
     // === GROUP 4: I/O operations ===
-    bcInputString:
+    bcInputString,
+    bcDataReadString:  // Read next DATA value into string register
       Result := True;
     // NOTE: bcArrayStoreString uses Dest as SOURCE (read), handled by DestReadIsStringReg
   else

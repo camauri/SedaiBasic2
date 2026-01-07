@@ -132,6 +132,10 @@ begin
   WriteLn('SDL2 Graphical Console');
 end;
 
+var
+  // Global option for TRUE value in comparisons (-1 = Commodore BASIC, 1 = modern BASIC)
+  OptTrueValue: Int64 = -1;
+
 { Print help information }
 procedure PrintHelp;
 begin
@@ -165,6 +169,9 @@ begin
   WriteLn('  --no-exec            Compile only, do not execute');
   WriteLn('  --stats              Show execution statistics');
   WriteLn('  --fullscreen         Start in fullscreen mode');
+  WriteLn('  --true-value=N       Set TRUE value for comparisons (-1 or 1, default: -1)');
+  WriteLn('                         -1 = Commodore BASIC style (default)');
+  WriteLn('                          1 = Modern BASIC style');
   WriteLn;
   WriteLn('Examples:');
   WriteLn('  sbv                            Start interactive mode');
@@ -326,6 +333,7 @@ begin
         try
           VM.SetOutputDevice(Output);
           VM.SetInputDevice(Input);
+          VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
           VM.LoadProgram(BytecodeProgram);
 
           try
@@ -479,6 +487,7 @@ begin
     OptNoExec := False;
     OptFullscreen := False;
     OptAutoRun := False;
+    OptTrueValue := -1;  // Default: Commodore BASIC style (TRUE = -1)
     {$IFDEF ENABLE_PROFILER}
     OptProfile := False;
     ProfileMode := 'sampling';
@@ -538,6 +547,16 @@ begin
       else if Pos('--profile-export=', LowerCase(Param)) = 1 then
         ProfileExport := Copy(Param, 18, Length(Param))
       {$ENDIF}
+      else if Pos('--true-value=', LowerCase(Param)) = 1 then
+      begin
+        // Parse TRUE value: -1 (Commodore BASIC) or 1 (modern BASIC)
+        OptTrueValue := StrToInt64Def(Copy(Param, 14, Length(Param)), -1);
+        if (OptTrueValue <> -1) and (OptTrueValue <> 1) then
+        begin
+          WriteLn('WARNING: --true-value must be -1 or 1, using default -1');
+          OptTrueValue := -1;
+        end;
+      end
       else if (Pos('--', Param) <> 1) and (TestFile = '') then
         TestFile := Param;  // Use original case for filename
     end;

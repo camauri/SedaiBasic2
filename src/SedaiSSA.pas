@@ -202,6 +202,7 @@ begin
   FVarMap := TStringList.Create;
   FVarMap.Sorted := True;
   FVarMap.Duplicates := dupIgnore;
+  FVarMap.CaseSensitive := False;  // BASIC is case-insensitive
   SetLength(FLoopStack, 0);
   FUserFunctions := specialize TDictionary<string, TUserFunctionDef>.Create;
   FConstFloatRegs := specialize TDictionary<Integer, Double>.Create;
@@ -315,6 +316,19 @@ begin
         GetOrAllocateVariable(VarName);
       end;
     end;
+
+    antRead:
+    begin
+      // READ variables - each child is a variable to read into
+      for i := 0 to Node.ChildCount - 1 do
+      begin
+        if Node.GetChild(i).NodeType = antIdentifier then
+        begin
+          VarName := VarToStr(Node.GetChild(i).Value);
+          GetOrAllocateVariable(VarName);
+        end;
+      end;
+    end;
   end;
 
   // Recursively scan all children
@@ -359,10 +373,7 @@ begin
   // CRITICAL: After GOTO/RETURN, FCurrentBlock can be nil (block is terminated)
   // Don't emit instructions after block termination
   if not Assigned(FCurrentBlock) then
-  begin
-    WriteLn('DEBUG EmitInstruction: FCurrentBlock is NIL, skipping OpCode=', Ord(OpCode));
     Exit;
-  end;
 
   Instr := TSSAInstruction.Create(OpCode);
   Instr.Dest := Dest;
@@ -443,7 +454,8 @@ begin
     antIdentifier:
     begin
       // Return the register assigned to this variable
-      Result := GetOrAllocateVariable(VarToStr(Node.Value));
+      VarName := VarToStr(Node.Value);
+      Result := GetOrAllocateVariable(VarName);
     end;
 
     antSpecialVariable:
@@ -552,54 +564,88 @@ begin
 
     antUnaryOp:
     begin
-      // Handle unary operators (currently just negation)
+      // Handle unary operators (negation and NOT)
       if Node.ChildCount > 0 then
       begin
         ProcessExpression(Node.GetChild(0), Left);
 
-        // ALWAYS fold negation of constants (this is basic code generation, not optimization)
-        // Generating "LoadConst + Neg + Copy" for "-1.16" is wasteful even in unoptimized code
-        if Left.Kind = svkConstFloat then
+        // Check if this is NOT (bitwise) or negation (-)
+        if Node.Token.TokenType = ttBitwiseNOT then
         begin
-          // Negate float constant at compile time
-          Result := MakeSSAConstFloat(-Left.ConstFloat);
-        end
-        else if Left.Kind = svkConstInt then
-        begin
-          // Negate int constant at compile time
-          Result := MakeSSAConstInt(-Left.ConstInt);
-        end
-        else
-        begin
-          // When constant folding disabled, must materialize constants first
-          if Left.Kind = svkConstFloat then
+          // Bitwise NOT - always works with integers
+          // Fold constant at compile time
+          if Left.Kind = svkConstInt then
           begin
-            TempReg := FProgram.AllocRegister(srtFloat);
-            TempVal := MakeSSARegister(srtFloat, TempReg);
-            EmitInstruction(ssaLoadConstFloat, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-            Left := TempVal;
+            Result := MakeSSAConstInt(not Left.ConstInt);
           end
-          else if Left.Kind = svkConstInt then
+          else if Left.Kind = svkConstFloat then
           begin
-            TempReg := FProgram.AllocRegister(srtInt);
-            TempVal := MakeSSARegister(srtInt, TempReg);
-            EmitInstruction(ssaLoadConstInt, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-            Left := TempVal;
-          end;
-
-          // Now apply negation to register
-          if Left.RegType = srtFloat then
-          begin
-            DestReg := FProgram.AllocRegister(srtFloat);
-            Result := MakeSSARegister(srtFloat, DestReg);
-            EmitInstruction(ssaNegFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            // Convert float constant to int, then NOT
+            Result := MakeSSAConstInt(not Trunc(Left.ConstFloat));
           end
           else
           begin
-            // Int register
+            // Convert float to int if needed
+            if Left.RegType = srtFloat then
+            begin
+              TempReg := FProgram.AllocRegister(srtInt);
+              TempVal := MakeSSARegister(srtInt, TempReg);
+              EmitInstruction(ssaFloatToInt, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              Left := TempVal;
+            end;
+            // Apply bitwise NOT
             DestReg := FProgram.AllocRegister(srtInt);
             Result := MakeSSARegister(srtInt, DestReg);
-            EmitInstruction(ssaNegInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitInstruction(ssaBitwiseNot, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+        end
+        else
+        begin
+          // Negation (-)
+          // ALWAYS fold negation of constants (this is basic code generation, not optimization)
+          // Generating "LoadConst + Neg + Copy" for "-1.16" is wasteful even in unoptimized code
+          if Left.Kind = svkConstFloat then
+          begin
+            // Negate float constant at compile time
+            Result := MakeSSAConstFloat(-Left.ConstFloat);
+          end
+          else if Left.Kind = svkConstInt then
+          begin
+            // Negate int constant at compile time
+            Result := MakeSSAConstInt(-Left.ConstInt);
+          end
+          else
+          begin
+            // When constant folding disabled, must materialize constants first
+            if Left.Kind = svkConstFloat then
+            begin
+              TempReg := FProgram.AllocRegister(srtFloat);
+              TempVal := MakeSSARegister(srtFloat, TempReg);
+              EmitInstruction(ssaLoadConstFloat, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              Left := TempVal;
+            end
+            else if Left.Kind = svkConstInt then
+            begin
+              TempReg := FProgram.AllocRegister(srtInt);
+              TempVal := MakeSSARegister(srtInt, TempReg);
+              EmitInstruction(ssaLoadConstInt, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              Left := TempVal;
+            end;
+
+            // Now apply negation to register
+            if Left.RegType = srtFloat then
+            begin
+              DestReg := FProgram.AllocRegister(srtFloat);
+              Result := MakeSSARegister(srtFloat, DestReg);
+              EmitInstruction(ssaNegFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            end
+            else
+            begin
+              // Int register
+              DestReg := FProgram.AllocRegister(srtInt);
+              Result := MakeSSARegister(srtInt, DestReg);
+              EmitInstruction(ssaNegInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            end;
           end;
         end;
       end
@@ -928,6 +974,30 @@ begin
           DestReg := FProgram.AllocRegister(srtFloat);
           Result := MakeSSARegister(srtFloat, DestReg);
           OpCode := ssaDivFloat;
+        end
+        // SPECIAL CASE: MOD always works with integers
+        else if Node.Token.TokenType = ttOpMod then
+        begin
+          // Convert both operands to int if needed (truncate floats)
+          if Left.RegType = srtFloat then
+          begin
+            TempReg := FProgram.AllocRegister(srtInt);
+            TempVal := MakeSSARegister(srtInt, TempReg);
+            EmitInstruction(ssaFloatToInt, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Left := TempVal;
+          end;
+          if Right.RegType = srtFloat then
+          begin
+            TempReg := FProgram.AllocRegister(srtInt);
+            TempVal := MakeSSARegister(srtInt, TempReg);
+            EmitInstruction(ssaFloatToInt, TempVal, Right, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Right := TempVal;
+          end;
+
+          // Result is always int for MOD
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          OpCode := ssaModInt;
         end
         // Determine result type and allocate register (use hint if compatible)
         else if (Left.RegType = srtFloat) or (Right.RegType = srtFloat) then
@@ -2795,6 +2865,7 @@ var
   IsWhileLoop: Boolean;
   HasCondition: Boolean;
   i: Integer;
+  LoopInfo: TLoopInfo;
 begin
   // DO/LOOP structure:
   //   Child[0] = Body (block of statements)
@@ -2818,6 +2889,20 @@ begin
   BodyLabel := GenerateUniqueLabel('do_body');
   CondLabel := GenerateUniqueLabel('do_cond');
   EndLabel := GenerateUniqueLabel('do_end');
+
+  // Push loop info for EXIT support
+  LoopInfo.VarName := '';  // DO loops don't have a loop variable
+  LoopInfo.VarReg := MakeSSAValue(svkNone);
+  LoopInfo.EndValue := MakeSSAValue(svkNone);
+  LoopInfo.StepValue := MakeSSAValue(svkNone);
+  LoopInfo.StepIsNegative := False;
+  LoopInfo.NeedRuntimeCheck := False;
+  LoopInfo.CondLabel := CondLabel;
+  LoopInfo.CondLabelGE := '';
+  LoopInfo.BodyLabel := BodyLabel;
+  LoopInfo.EndLabel := EndLabel;
+  SetLength(FLoopStack, Length(FLoopStack) + 1);
+  FLoopStack[High(FLoopStack)] := LoopInfo;
 
   // Save current block for CFG construction
   PrevBlock := FCurrentBlock;
@@ -2956,6 +3041,9 @@ begin
       FCurrentBlock := FProgram.CreateBlock(EndLabel);
     end;
   end;
+
+  // Pop loop info from stack
+  SetLength(FLoopStack, Length(FLoopStack) - 1);
 end;
 
 procedure TSSAGenerator.ProcessBlock(Node: TASTNode);
@@ -3426,9 +3514,14 @@ begin
       TargetBlock.AddPredecessor(FCurrentBlock);
     end;
 
-    // Create next check block
+    // Create next check block for the next iteration
     FCurrentBlock := FProgram.CreateBlock(NextLabel);
   end;
+
+  // The last ON_GOSUB_NEXT block is now current but empty
+  // Add a jump to EndLabel so it has a proper successor (fall-through case)
+  EmitInstruction(ssaJump, MakeSSALabel(EndLabel), MakeSSAValue(svkNone),
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 
   // Fall-through case (selector out of range) - create end block
   FCurrentBlock := FProgram.CreateBlock(EndLabel);
@@ -4996,7 +5089,8 @@ var
   Child: TASTNode;
   DataVal: TSSAValue;
 begin
-  if FCurrentBlock = nil then Exit;
+  // Note: No FCurrentBlock check here - DATA statements just add values
+  // to the DATA pool and don't need a current block
 
   // Each child is a literal value to add to the DATA pool
   for i := 0 to Node.ChildCount - 1 do
@@ -5044,7 +5138,7 @@ begin
 
     if Child.NodeType = antIdentifier then
     begin
-      VarName := string(Child.Value);
+      VarName := VarToStr(Child.Value);
       DestReg := GetOrAllocateVariable(VarName);
 
       // Emit ssaDataRead with type hint from variable suffix
@@ -6439,8 +6533,8 @@ begin
     begin
       Instr := Block.Instructions[j];
 
-      // Check for GOTO or GOSUB with label operand
-      if (Instr.OpCode in [ssaJump, ssaCall]) and (Instr.Dest.Kind = svkLabel) then
+      // Check for GOTO, GOSUB, or conditional jumps (ON GOTO/GOSUB) with label operand
+      if (Instr.OpCode in [ssaJump, ssaCall, ssaJumpIfZero, ssaJumpIfNotZero]) and (Instr.Dest.Kind = svkLabel) then
       begin
         TargetLabel := Instr.Dest.LabelName;
         TargetBlock := FProgram.FindBlock(TargetLabel);
@@ -6644,10 +6738,34 @@ begin
     antFilter: ProcessFilter(Node);
     antReturn:
     begin
-      EmitInstruction(ssaReturn, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      // PHASE 3 TIER 3: RETURN terminates the current block - no fall-through
-      FCurrentBlock := nil;
+      // Check if this is EXIT (not RETURN) - EXIT should jump to loop end
+      if Assigned(Node.Token) and (UpperCase(Node.Token.Value) = 'EXIT') then
+      begin
+        // EXIT statement - jump to end of current loop
+        if Length(FLoopStack) > 0 then
+        begin
+          // Jump to loop's EndLabel
+          EmitInstruction(ssaJump, MakeSSALabel(FLoopStack[High(FLoopStack)].EndLabel),
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          FCurrentBlock := nil;
+        end
+        else
+        begin
+          // EXIT outside loop - treat as END (or could be error)
+          WriteLn(StdErr, 'Warning: EXIT outside loop at line ', FCurrentLineNumber);
+          EmitInstruction(ssaEnd, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          FCurrentBlock := nil;
+        end;
+      end
+      else
+      begin
+        // Normal RETURN statement
+        EmitInstruction(ssaReturn, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // PHASE 3 TIER 3: RETURN terminates the current block - no fall-through
+        FCurrentBlock := nil;
+      end;
     end;
     antEnd:
     begin
@@ -6722,7 +6840,6 @@ begin
     // TROFF switches to RunFast (pure speed, no trace)
     antTron:
     begin
-      WriteLn('[SSA] DEBUG: Processing antTron at line ', FCurrentLineNumber);
       EmitInstruction(ssaTron, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;

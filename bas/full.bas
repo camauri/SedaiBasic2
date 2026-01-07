@@ -6,6 +6,7 @@
 60 PRINT "THIS TEST COVERS ALL IMPLEMENTED COMMANDS"
 70 PRINT
 80 GOSUB 9000
+90 REM GOTO 2400
 
 100 REM ========================================
 110 REM *** ARITHMETIC OPERATORS TEST ***
@@ -41,8 +42,8 @@
 510 REM *** LOGICAL OPERATORS TEST ***
 520 REM ========================================
 530 PRINT "TESTING LOGICAL OPERATORS"
-540 LET T = 1: LET F = 0
-550 PRINT "T = "; T; " (TRUE), F = "; F; " (FALSE)"
+540 LET T = -1: LET F = 0
+550 PRINT "T = "; T; " (TRUE=-1), F = "; F; " (FALSE=0)"
 560 PRINT "T AND T = "; T AND T
 570 PRINT "T AND F = "; T AND F
 580 PRINT "T OR F = "; T OR F
@@ -57,7 +58,7 @@
 700 REM ========================================
 710 REM *** FLOW CONTROL - IF/THEN/ELSE ***
 720 REM ========================================
-730 PRINT "TESTING IF/THEN/ELSE"
+730 PRINT "TESTING IF/THEN/ELSE (N = 42)"
 740 LET N = 42
 750 IF N > 0 THEN PRINT "N IS POSITIVE"
 760 IF N < 0 THEN PRINT "N IS NEGATIVE" ELSE PRINT "N IS NOT NEGATIVE"

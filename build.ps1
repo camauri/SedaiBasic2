@@ -28,6 +28,13 @@
     - <path>: use specified path to SedaiAudioFoundation
     Audio is enabled for sb and sbv targets only.
 
+.PARAMETER DebugFlags
+    Comma-separated list of debug flags to enable at compile time.
+    Examples: 'REGALLOC', 'SSA,REGALLOC', 'ALL'
+    Available flags: SSA, GVN, CSE, DCE, LICM, ALGEBRAIC, STRENGTH, CONSTPROP,
+                     COPYPROP, COPYCOAL, PHIELIM, REGALLOC, PEEPHOLE, SUPERINSTR,
+                     DOMTREE, DBE, BYTECODE, VM, CLEANUP, CONSOLE, AUDIO, ALL
+
 .EXAMPLE
     .\build.ps1                    # Build all targets (release)
     .\build.ps1 -Target sb         # Build only sb
@@ -35,6 +42,8 @@
     .\build.ps1 -Clean             # Clean and rebuild
     .\build.ps1 -WithSedaiAudio no                    # Build without audio support
     .\build.ps1 -WithSedaiAudio C:\path\to\audio      # Use specific audio path
+    .\build.ps1 -Target sb -DebugFlags REGALLOC       # Build sb with register allocator debug
+    .\build.ps1 -Target sb -DebugFlags SSA,REGALLOC   # Build sb with multiple debug flags
 
 .NOTES
     Copyright (c) 2025 Maurizio Cammalleri
@@ -57,7 +66,14 @@ param(
 
     # SedaiAudio integration
     # Values: '' (auto-detect), 'no' (disabled), or path to SedaiAudioFoundation
-    [string]$WithSedaiAudio = ''
+    [string]$WithSedaiAudio = '',
+
+    # Debug flags - comma-separated list of debug flags to enable
+    # Examples: 'REGALLOC', 'SSA,REGALLOC', 'ALL'
+    # Available: SSA, GVN, CSE, DCE, LICM, ALGEBRAIC, STRENGTH, CONSTPROP,
+    #            COPYPROP, COPYCOAL, PHIELIM, REGALLOC, PEEPHOLE, SUPERINSTR,
+    #            DOMTREE, DBE, BYTECODE, VM, CLEANUP, CONSOLE, AUDIO, ALL
+    [string]$DebugFlags = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -202,7 +218,8 @@ function Build-Target {
         [bool]$IsDebug,
         [string[]]$ExtraUnitPaths = @(),
         [bool]$WithAudio = $false,
-        [string]$AudioPath = ''
+        [string]$AudioPath = '',
+        [string[]]$DebugDefines = @()
     )
 
     $srcPath = Join-Path $SrcDir $LprFile
@@ -273,6 +290,11 @@ function Build-Target {
     # Extra unit paths
     foreach ($extraPath in $ExtraUnitPaths) {
         $opts += "-Fu$extraPath"
+    }
+
+    # Debug defines (from -DebugFlags parameter)
+    foreach ($define in $DebugDefines) {
+        $opts += "-d$define"
     }
 
     # SedaiAudio integration
@@ -427,6 +449,21 @@ $buildTargets = if ($Target -eq 'all') { @('sb', 'sbc', 'sbd', 'sbv') } else { @
 $success = 0
 $failed = 0
 
+# Parse debug flags into defines
+$debugDefines = @()
+if ($DebugFlags -and $DebugFlags -ne '') {
+    $flags = $DebugFlags.ToUpper() -split ','
+    foreach ($flag in $flags) {
+        $flag = $flag.Trim()
+        if ($flag -eq 'ALL') {
+            $debugDefines += 'DEBUG_ALL'
+        } else {
+            $debugDefines += "DEBUG_$flag"
+        }
+    }
+    Write-Host "Debug flags: $($debugDefines -join ', ')" -ForegroundColor Magenta
+}
+
 Write-Host "Building Targets..." -ForegroundColor Cyan
 Write-Host "===================" -ForegroundColor Cyan
 
@@ -440,7 +477,8 @@ foreach ($t in $buildTargets) {
         -FPC $fpc -PlatformDir $platformDir `
         -TargetCPU $CPU -TargetOS $OS `
         -IsDebug $Debug -ExtraUnitPaths $info.ExtraPaths `
-        -WithAudio $useAudio -AudioPath $SedaiAudioPath
+        -WithAudio $useAudio -AudioPath $SedaiAudioPath `
+        -DebugDefines $debugDefines
 
     if ($result) { $success++ } else { $failed++ }
 }

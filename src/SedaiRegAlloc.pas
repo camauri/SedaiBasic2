@@ -644,11 +644,13 @@ var
   var
     Key: string;
     Info: TVariableInfo;
+    OldCount: Integer;
   begin
     if Val.Kind <> svkRegister then Exit;
 
     // CRITICAL: Include Version in key to distinguish SSA versions
     Key := IntToStr(Ord(Val.RegType)) + ':' + IntToStr(Val.RegIndex) + ':' + IntToStr(Val.Version);
+    OldCount := VarList.Count;
     Info := FindOrCreateVarInfo(Key);
     if Assigned(Info) then
       Inc(Info.UsageCount);
@@ -776,11 +778,6 @@ var
          (VarInfo.Version = Val.Version) then
       begin
         Found := True;
-        {$IFDEF DEBUG_REGALLOC}
-        if DebugRegAlloc then
-          WriteLn('[RegAlloc] REWRITE r', Val.RegIndex, '_v', Val.Version,
-                  ' type=', Ord(Val.RegType), ' -> R', VarInfo.PhysicalReg);
-        {$ENDIF}
         // All variables now have PhysicalReg assigned (either physical reg 0-31
         // or spill slot 32+), so always rewrite
         Result.RegIndex := VarInfo.PhysicalReg;
@@ -788,15 +785,6 @@ var
         Exit;
       end;
     end;
-
-    // WARNING: Virtual register not found in allocation table!
-    {$IFDEF DEBUG_REGALLOC}
-    if not Found and DebugRegAlloc then
-    begin
-      WriteLn('[RegAlloc] WARNING: r', Val.RegIndex, '_v', Val.Version,
-              ' type=', Ord(Val.RegType), ' NOT FOUND in allocation table!');
-    end;
-    {$ENDIF}
   end;
 
   function RewriteDimRegister(VirtReg: Integer; RegType: TSSARegisterType): Integer;

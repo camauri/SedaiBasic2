@@ -139,6 +139,7 @@ type
     FLastErrorLine: Integer;      // EL: Last error line number
     FLastErrorCode: Integer;      // ER: Last error code
     FLastErrorMessage: string;    // ERR$: Last error message (variable form)
+    FTrueValue: Int64;            // TRUE value: -1 (Commodore BASIC) or 1 (modern BASIC)
     // TRAP/RESUME error handling state
     FTrapLine: Integer;           // Line to jump to on error (0 = no trap)
     FTrapPC: Integer;             // PC to jump to on error (resolved from FTrapLine)
@@ -222,6 +223,9 @@ type
     property LastErrorLine: Integer read FLastErrorLine;
     property LastErrorCode: Integer read FLastErrorCode;
     property LastErrorMessage: string read FLastErrorMessage;
+    // TRUE value for comparisons (-1 = Commodore BASIC, 1 = modern BASIC)
+    procedure SetTrueValue(AValue: Int64);
+    property TrueValue: Int64 read FTrueValue write FTrueValue;
   end;
 
 implementation
@@ -334,6 +338,8 @@ begin
   FLastErrorLine := 0;
   FLastErrorCode := 0;
   FLastErrorMessage := '';
+  // Initialize TRUE value (default: -1 for Commodore BASIC compatibility)
+  FTrueValue := -1;
   // Initialize TRAP/RESUME state
   FTrapLine := 0;
   FTrapPC := -1;
@@ -1285,6 +1291,11 @@ begin
   FLastErrorMessage := '';
 end;
 
+procedure TBytecodeVM.SetTrueValue(AValue: Int64);
+begin
+  FTrueValue := AValue;
+end;
+
 procedure TBytecodeVM.ExecuteInstruction(const Instr: TBytecodeInstruction);
 var
   Group: Word;
@@ -1391,25 +1402,25 @@ begin
     bcNegFloat: FFloatRegs[Instr.Dest] := -FFloatRegs[Instr.Src1];
     bcIntToFloat: FFloatRegs[Instr.Dest] := FIntRegs[Instr.Src1];
     bcFloatToInt: FIntRegs[Instr.Dest] := Trunc(FFloatRegs[Instr.Src1]);
-    // Comparison operators - Int
-    bcCmpEqInt: FIntRegs[Instr.Dest] := Ord(FIntRegs[Instr.Src1] = FIntRegs[Instr.Src2]);
-    bcCmpNeInt: FIntRegs[Instr.Dest] := Ord(FIntRegs[Instr.Src1] <> FIntRegs[Instr.Src2]);
-    bcCmpLtInt: FIntRegs[Instr.Dest] := Ord(FIntRegs[Instr.Src1] < FIntRegs[Instr.Src2]);
-    bcCmpGtInt: FIntRegs[Instr.Dest] := Ord(FIntRegs[Instr.Src1] > FIntRegs[Instr.Src2]);
-    bcCmpLeInt: FIntRegs[Instr.Dest] := Ord(FIntRegs[Instr.Src1] <= FIntRegs[Instr.Src2]);
-    bcCmpGeInt: FIntRegs[Instr.Dest] := Ord(FIntRegs[Instr.Src1] >= FIntRegs[Instr.Src2]);
-    // Comparison operators - Float
-    bcCmpEqFloat: FIntRegs[Instr.Dest] := Ord(FFloatRegs[Instr.Src1] = FFloatRegs[Instr.Src2]);
-    bcCmpNeFloat: FIntRegs[Instr.Dest] := Ord(FFloatRegs[Instr.Src1] <> FFloatRegs[Instr.Src2]);
-    bcCmpLtFloat: FIntRegs[Instr.Dest] := Ord(FFloatRegs[Instr.Src1] < FFloatRegs[Instr.Src2]);
-    bcCmpGtFloat: FIntRegs[Instr.Dest] := Ord(FFloatRegs[Instr.Src1] > FFloatRegs[Instr.Src2]);
-    bcCmpLeFloat: FIntRegs[Instr.Dest] := Ord(FFloatRegs[Instr.Src1] <= FFloatRegs[Instr.Src2]);
-    bcCmpGeFloat: FIntRegs[Instr.Dest] := Ord(FFloatRegs[Instr.Src1] >= FFloatRegs[Instr.Src2]);
-    // Comparison operators - String
-    bcCmpEqString: FIntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] = FStringRegs[Instr.Src2]);
-    bcCmpNeString: FIntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] <> FStringRegs[Instr.Src2]);
-    bcCmpLtString: FIntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] < FStringRegs[Instr.Src2]);
-    bcCmpGtString: FIntRegs[Instr.Dest] := Ord(FStringRegs[Instr.Src1] > FStringRegs[Instr.Src2]);
+    // Comparison operators - Int (use FTrueValue for TRUE, 0 for FALSE)
+    bcCmpEqInt: if FIntRegs[Instr.Src1] = FIntRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    bcCmpNeInt: if FIntRegs[Instr.Src1] <> FIntRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    bcCmpLtInt: if FIntRegs[Instr.Src1] < FIntRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    bcCmpGtInt: if FIntRegs[Instr.Src1] > FIntRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    bcCmpLeInt: if FIntRegs[Instr.Src1] <= FIntRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    bcCmpGeInt: if FIntRegs[Instr.Src1] >= FIntRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    // Comparison operators - Float (use FTrueValue for TRUE, 0 for FALSE)
+    bcCmpEqFloat: if FFloatRegs[Instr.Src1] = FFloatRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    bcCmpNeFloat: if FFloatRegs[Instr.Src1] <> FFloatRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    bcCmpLtFloat: if FFloatRegs[Instr.Src1] < FFloatRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    bcCmpGtFloat: if FFloatRegs[Instr.Src1] > FFloatRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    bcCmpLeFloat: if FFloatRegs[Instr.Src1] <= FFloatRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    bcCmpGeFloat: if FFloatRegs[Instr.Src1] >= FFloatRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    // Comparison operators - String (use FTrueValue for TRUE, 0 for FALSE)
+    bcCmpEqString: if FStringRegs[Instr.Src1] = FStringRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    bcCmpNeString: if FStringRegs[Instr.Src1] <> FStringRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    bcCmpLtString: if FStringRegs[Instr.Src1] < FStringRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
+    bcCmpGtString: if FStringRegs[Instr.Src1] > FStringRegs[Instr.Src2] then FIntRegs[Instr.Dest] := FTrueValue else FIntRegs[Instr.Dest] := 0;
     // Bitwise operators
     bcBitwiseAnd: FIntRegs[Instr.Dest] := FIntRegs[Instr.Src1] and FIntRegs[Instr.Src2];
     bcBitwiseOr: FIntRegs[Instr.Dest] := FIntRegs[Instr.Src1] or FIntRegs[Instr.Src2];
@@ -1574,9 +1585,12 @@ begin
         // Immediate = value (int/float bits, or string pool index)
         SetLength(FDataPool, Length(FDataPool) + 1);
         case TSSARegisterType(Instr.Src1) of
-          srtInt: FDataPool[High(FDataPool)] := Instr.Immediate;
-          srtFloat: FDataPool[High(FDataPool)] := Double(Pointer(@Instr.Immediate)^);
-          srtString: FDataPool[High(FDataPool)] := FProgram.StringConstants[Instr.Immediate];
+          srtInt:
+            FDataPool[High(FDataPool)] := Instr.Immediate;
+          srtFloat:
+            FDataPool[High(FDataPool)] := Double(Pointer(@Instr.Immediate)^);
+          srtString:
+            FDataPool[High(FDataPool)] := FProgram.StringConstants[Instr.Immediate];
         end;
       end;
     bcDataReadInt:
@@ -1584,7 +1598,8 @@ begin
         // Read next DATA value into int register
         if FDataIndex < Length(FDataPool) then
         begin
-          FIntRegs[Instr.Dest] := Int64(FDataPool[FDataIndex]);
+          // Use VarAsType for proper Variant to Int64 conversion
+          FIntRegs[Instr.Dest] := VarAsType(FDataPool[FDataIndex], varInt64);
           Inc(FDataIndex);
         end
         else
@@ -1595,7 +1610,8 @@ begin
         // Read next DATA value into float register
         if FDataIndex < Length(FDataPool) then
         begin
-          FFloatRegs[Instr.Dest] := Double(FDataPool[FDataIndex]);
+          // Use VarAsType for proper Variant to Double conversion
+          FFloatRegs[Instr.Dest] := VarAsType(FDataPool[FDataIndex], varDouble);
           Inc(FDataIndex);
         end
         else

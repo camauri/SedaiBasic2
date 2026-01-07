@@ -455,6 +455,7 @@ type
     function GetArray(Index: Integer): TSSAArrayInfo;
     function GetArrayCount: Integer;
     function GetInstructionsPtr: Pointer;  // Direct access for fast VM loop
+    function FindPCForLine(LineNum: Integer): Integer;  // Find PC for BASIC line number
     property StringConstants: TStringList read FStringConstants;
     property EntryPoint: Integer read FEntryPoint write FEntryPoint;
   end;
@@ -638,6 +639,22 @@ begin
     Result := @FInstructions[0]
   else
     Result := nil;
+end;
+
+function TBytecodeProgram.FindPCForLine(LineNum: Integer): Integer;
+var
+  i: Integer;
+begin
+  // Scan instructions to find the first one with matching source line
+  for i := 0 to High(FInstructions) do
+  begin
+    if FInstructions[i].SourceLine = LineNum then
+    begin
+      Result := i;
+      Exit;
+    end;
+  end;
+  Result := -1;  // Line not found
 end;
 
 function BytecodeOpToString(Op: TBytecodeOp): string;

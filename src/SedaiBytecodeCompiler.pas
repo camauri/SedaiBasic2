@@ -1333,7 +1333,9 @@ begin
       BCInstr := FProgram.GetInstruction(Fixup.BCInstrIndex);
       BCInstr.Immediate := TargetAddr;
       FProgram.SetInstruction(Fixup.BCInstrIndex, BCInstr);
-    end;
+    end
+    else
+      WriteLn('[DEBUG ResolveLabels] LABEL NOT FOUND: "', Fixup.TargetLabel, '"');
   end;
 end;
 

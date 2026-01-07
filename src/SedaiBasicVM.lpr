@@ -351,6 +351,10 @@ begin
   {$ENDIF}
 end;
 
+var
+  // Global option for TRUE value in comparisons (-1 = Commodore BASIC, 1 = modern BASIC)
+  OptTrueValue: Int64 = -1;
+
 { Print version banner }
 procedure PrintVersion;
 begin
@@ -378,6 +382,9 @@ begin
   WriteLn('  --disasm-pre        Show bytecode BEFORE superinstruction fusion');
   WriteLn('  --no-exec           Compile only, do not execute (useful with --disasm)');
   WriteLn('  --stats             Show execution statistics');
+  WriteLn('  --true-value=N      Set TRUE value for comparisons (-1 or 1, default: -1)');
+  WriteLn('                        -1 = Commodore BASIC style (default)');
+  WriteLn('                         1 = Modern BASIC style');
   WriteLn;
   {$IFDEF ANY_DEBUG_ENABLED}
   WriteLn('Debug options (compile-time flags enabled in DebugFlags.inc):');
@@ -1415,6 +1422,7 @@ begin
     try
       VM.SetOutputDevice(Output);
       VM.SetInputDevice(Input);
+      VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
       VM.LoadProgram(BytecodeProgram);
 
       try
@@ -1639,6 +1647,7 @@ begin
       try
         VM.SetOutputDevice(Output);
         VM.SetInputDevice(Input);
+        VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
         VM.LoadProgram(BytecodeProgram);
 
         try
@@ -1771,6 +1780,7 @@ begin
     OptStats := False;
     OptHelp := False;
     OptNoExec := False;
+    OptTrueValue := -1;  // Default: Commodore BASIC style (TRUE = -1)
     {$IFDEF ENABLE_PROFILER}
     OptProfile := False;
     ProfileMode := 'sampling';  // Default to low-overhead sampling
@@ -1808,6 +1818,16 @@ begin
       else if Pos('--profile-export=', Param) = 1 then
         ProfileExport := Copy(ParamStr(i), 18, Length(ParamStr(i)))  // Use original case for filename
       {$ENDIF}
+      else if Pos('--true-value=', Param) = 1 then
+      begin
+        // Parse TRUE value: -1 (Commodore BASIC) or 1 (modern BASIC)
+        OptTrueValue := StrToInt64Def(Copy(Param, 14, Length(Param)), -1);
+        if (OptTrueValue <> -1) and (OptTrueValue <> 1) then
+        begin
+          WriteLn('WARNING: --true-value must be -1 or 1, using default -1');
+          OptTrueValue := -1;
+        end;
+      end
       else if (Pos('--', Param) <> 1) and (TestFile = '') then
         TestFile := ParamStr(i);  // Use original case for filename
     end;

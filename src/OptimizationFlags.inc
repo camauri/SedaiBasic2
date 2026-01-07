@@ -34,7 +34,7 @@
 
 // Master switch: uncomment to disable ALL optimizations
 {.$DEFINE DISABLE_ALL_OPTIMIZATIONS}
-
+   
 // Individual optimization flags (controlled by master switch)
 // Ordered by execution sequence in the optimization pipeline
 
