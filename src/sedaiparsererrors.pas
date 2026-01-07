@@ -42,6 +42,8 @@ type
     FPosition: Integer;
     FErrorType: string;
     FSeverity: Integer; // 0=Info, 1=Warning, 2=Error, 3=Fatal
+    FBasicLineNumber: Integer; // BASIC line number (0 = not set)
+    FSourceLine: string; // Source line content for display
 
   public
     constructor Create(const AMessage: string; AToken: TLexerToken); overload;
@@ -62,6 +64,8 @@ type
     property Position: Integer read FPosition write FPosition;
     property ErrorType: string read FErrorType write FErrorType;
     property Severity: Integer read FSeverity write FSeverity;
+    property BasicLineNumber: Integer read FBasicLineNumber write FBasicLineNumber;
+    property SourceLine: string read FSourceLine write FSourceLine;
   end;
 
   { TParserErrorList - Collection of parser errors }
@@ -149,6 +153,8 @@ begin
   end;
   FErrorType := 'Syntax Error';
   FSeverity := SEVERITY_ERROR;
+  FBasicLineNumber := 0;
+  FSourceLine := '';
 end;
 
 constructor TParserError.Create(const AMessage: string; ALine, AColumn, APosition: Integer);
@@ -161,6 +167,8 @@ begin
   FPosition := APosition;
   FErrorType := 'Syntax Error';
   FSeverity := SEVERITY_ERROR;
+  FBasicLineNumber := 0;
+  FSourceLine := '';
 end;
 
 constructor TParserError.CreateWithSeverity(const AMessage: string; AToken: TLexerToken; ASeverity: Integer);
@@ -178,7 +186,16 @@ end;
 
 function TParserError.ToString: string;
 begin
-  Result := Format('%s at %s: %s', [FErrorType, GetLocationString, FMessage]);
+  // Include BASIC line number if available
+  if FBasicLineNumber > 0 then
+  begin
+    Result := Format('%s at %d (%s): %s', [FErrorType, FBasicLineNumber, GetLocationString, FMessage]);
+    // Add source line if available (already includes line number)
+    if FSourceLine <> '' then
+      Result := Result + LineEnding + FSourceLine;
+  end
+  else
+    Result := Format('%s at %s: %s', [FErrorType, GetLocationString, FMessage]);
 end;
 
 function TParserError.GetLocationString: string;

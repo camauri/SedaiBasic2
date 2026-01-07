@@ -93,9 +93,11 @@ type
     function HasActiveIf: Boolean;
     procedure SetThenForCurrentIf(ThenNode: TASTNode);
     procedure SetElseForCurrentIf;
-    procedure SetThenBlockForCurrentIf;     // *** AGGIUNTO ***
-    procedure SetElseBlockForCurrentIf;     // *** AGGIUNTO ***
-    function CanPopIfAtEOL: Boolean;        // *** AGGIUNTO ***
+    procedure SetThenBlockForCurrentIf;
+    procedure SetElseBlockForCurrentIf;
+    procedure ClearThenBlockForCurrentIf;
+    procedure ClearElseBlockForCurrentIf;
+    function CanPopIfAtEOL: Boolean;
     function ValidateElse: Boolean;  // ELSE senza THEN
     function ValidateThen: Boolean;  // THEN senza IF
 
@@ -218,6 +220,18 @@ procedure TParserValidationStacks.SetElseBlockForCurrentIf;
 begin
   if Length(FIfStack) > 0 then
     FIfStack[High(FIfStack)].HasElseBlock := True;
+end;
+
+procedure TParserValidationStacks.ClearThenBlockForCurrentIf;
+begin
+  if Length(FIfStack) > 0 then
+    FIfStack[High(FIfStack)].HasThenBlock := False;
+end;
+
+procedure TParserValidationStacks.ClearElseBlockForCurrentIf;
+begin
+  if Length(FIfStack) > 0 then
+    FIfStack[High(FIfStack)].HasElseBlock := False;
 end;
 
 function TParserValidationStacks.CanPopIfAtEOL: Boolean;

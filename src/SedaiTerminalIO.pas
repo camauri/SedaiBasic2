@@ -608,88 +608,38 @@ var
   Input: string;
   IsValid: Boolean;
   TempFloat: Double;
-  {$IFDEF WINDOWS}
-  LineMode: DWORD;
-  {$ENDIF}
 begin
-  {$IFDEF WINDOWS}
-  // Enable line input mode for ReadLine
-  if FConsoleHandle <> INVALID_HANDLE_VALUE then
-  begin
-    LineMode := ENABLE_LINE_INPUT or ENABLE_ECHO_INPUT or ENABLE_PROCESSED_INPUT;
-    SetConsoleMode(FConsoleHandle, LineMode);
-  end;
-  {$ENDIF}
+  repeat
+    IsValid := True;
+    Input := '';
 
-  try
-    repeat
-      IsValid := True;
-      Input := '';
+    // Display prompt
+    if Prompt <> '' then
+      System.Write(Prompt);
 
-      // Display prompt
-      if Prompt <> '' then
-        System.Write(Prompt);
+    // Simple blocking ReadLn
+    System.ReadLn(Input);
 
-      // Check for pending CTRL+C before reading
-      {$IFDEF WINDOWS}
-      if GCtrlCPressed then
+    // Validate if numeric only
+    if NumericOnly and (Input <> '') then
+    begin
+      if not TryStrToFloat(Input, TempFloat) then
       begin
-        GCtrlCPressed := False;
-        FShouldStop := True;
-        System.WriteLn;
-        Result := '';
-        Exit;
-      end;
-      {$ENDIF}
-
-      // Read input line
-      try
-        System.ReadLn(Input);
-      except
-        // Handle CTRL+C during ReadLn
-        FShouldStop := True;
-        Result := '';
-        Exit;
-      end;
-
-      // Check for CTRL+C after reading
-      {$IFDEF WINDOWS}
-      if GCtrlCPressed then
+        System.WriteLn('?SYNTAX ERROR - Number expected');
+        IsValid := False;
+      end
+      else if not AllowDecimal then
       begin
-        GCtrlCPressed := False;
-        FShouldStop := True;
-        Result := '';
-        Exit;
-      end;
-      {$ENDIF}
-
-      // Validate if numeric only
-      if NumericOnly and (Input <> '') then
-      begin
-        if not TryStrToFloat(Input, TempFloat) then
+        if Pos('.', Input) > 0 then
         begin
-          System.WriteLn('?SYNTAX ERROR - Number expected');
+          System.WriteLn('?SYNTAX ERROR - Integer expected');
           IsValid := False;
-        end
-        else if not AllowDecimal then
-        begin
-          if Pos('.', Input) > 0 then
-          begin
-            System.WriteLn('?SYNTAX ERROR - Integer expected');
-            IsValid := False;
-          end;
         end;
       end;
-    until IsValid;
+    end;
+  until IsValid;
 
-    Result := Input;
-  finally
-    {$IFDEF WINDOWS}
-    // Restore console mode for character input
-    if FConsoleHandle <> INVALID_HANDLE_VALUE then
-      SetConsoleMode(FConsoleHandle, FOldConsoleMode);
-    {$ENDIF}
-  end;
+  Result := Input;
 end;
 
 function TTerminalInput.ReadKey: Char;

@@ -2699,6 +2699,13 @@ begin
       begin
         repeat
           InputStr := FInputDevice.ReadLine('', False, True, True);
+          // Check for CTRL+END stop request
+          if FInputDevice.ShouldStop then
+          begin
+            FRunning := False;
+            FInputDevice.ClearStopRequest;
+            Break;
+          end;
           if TryStrToFloat(InputStr, InputVal) then
           begin
             FFloatRegs[Instr.Dest] := InputVal;
@@ -2713,6 +2720,13 @@ begin
       begin
         repeat
           InputStr := Trim(FInputDevice.ReadLine('', False, True, True));
+          // Check for CTRL+END stop request
+          if FInputDevice.ShouldStop then
+          begin
+            FRunning := False;
+            FInputDevice.ClearStopRequest;
+            Break;
+          end;
           if TryStrToFloat(InputStr, InputVal) then
           begin
             if (InputVal >= Low(Int64)) and (InputVal <= High(Int64)) then
@@ -2732,6 +2746,13 @@ begin
       begin
         repeat
           InputStr := Trim(FInputDevice.ReadLine('', False, True, True));
+          // Check for CTRL+END stop request
+          if FInputDevice.ShouldStop then
+          begin
+            FRunning := False;
+            FInputDevice.ClearStopRequest;
+            Break;
+          end;
           if TryStrToFloat(InputStr, InputVal) then
           begin
             FFloatRegs[Instr.Dest] := InputVal;
@@ -2743,7 +2764,17 @@ begin
       end;
     14: // bcInputString
       if Assigned(FInputDevice) then
+      begin
         FStringRegs[Instr.Dest] := FInputDevice.ReadLine('', False, False, False);
+        // Check for CTRL+END stop request
+        WriteLn('[DEBUG VM] After ReadLine, ShouldStop=', FInputDevice.ShouldStop);
+        if FInputDevice.ShouldStop then
+        begin
+          WriteLn('[DEBUG VM] Setting FRunning := False');
+          FRunning := False;
+          FInputDevice.ClearStopRequest;
+        end;
+      end;
   else
     raise Exception.CreateFmt('Unknown I/O opcode %d at PC=%d', [Instr.OpCode, FPC]);
   end;

@@ -63,7 +63,7 @@ begin
   {$R-}  // Range checking off
   {$Q-}  // Overflow checking off
 
-  while CurPC < InstrCount do
+  while FRunning and (CurPC < InstrCount) do
   begin
     Instr := Instructions[CurPC];
     Op := Instr.OpCode;
@@ -332,7 +332,7 @@ begin
         1: begin FPC := CurPC; ExecuteStringOp(Instr); CurPC := FPC + 1; end;
         2: begin FPC := CurPC; ExecuteMathOp(Instr); CurPC := FPC + 1; end;
         3: begin FPC := CurPC; ExecuteArrayOp(Instr); CurPC := FPC + 1; end;
-        4: begin FPC := CurPC; ExecuteIOOp(Instr); CurPC := FPC + 1; end;
+        4: begin FPC := CurPC; ExecuteIOOp(Instr); if not FRunning then Break; CurPC := FPC + 1; end;
         5: begin FPC := CurPC; ExecuteSpecialVarOp(Instr); CurPC := FPC + 1; end;
         6: begin FPC := CurPC; ExecuteFileIOOp(Instr); CurPC := FPC + 1; end;
         7: begin FPC := CurPC; ExecuteSpriteOp(Instr); CurPC := FPC + 1; end;

@@ -606,6 +606,11 @@ begin
 end;
 
 function TExpressionParser.ParseIdentifier(Token: TLexerToken): TASTNode;
+var
+  IdentName: string;
+  FnName: string;
+  Args: TASTNode;
+  NameNode: TASTNode;
 begin
   {$IFDEF DEBUG}
   LogVerbose(Format('ParseIdentifier: %s', [Token.Value]));
@@ -617,9 +622,49 @@ begin
     Exit;
   end;
 
-  // *** FIX: Don't decide here! Let infix parsing handle ( ***
-  // Simply create an identifier node - if there's a (, it will be handled by infix parsing
-  Result := CreateIdentifierNode(UpperCase(Token.Value), Token);
+  IdentName := UpperCase(Token.Value);
+
+  // Check if this is a user-defined function call (FNxxx followed by parenthesis)
+  // This handles the case where FNSQ(5) is tokenized as a single identifier
+  if (Length(IdentName) > 2) and (Copy(IdentName, 1, 2) = 'FN') and
+     Context.Check(ttDelimParOpen) then
+  begin
+    // Extract function name (part after FN)
+    FnName := Copy(IdentName, 3, Length(IdentName) - 2);
+
+    // Create user function node
+    Result := TASTNode.CreateWithValue(antUserFunction, IdentName, Token);
+
+    // Add function name as first child
+    NameNode := TASTNode.CreateWithValue(antIdentifier, FnName, Token);
+    Result.AddChild(NameNode);
+
+    // Consume opening parenthesis
+    Context.Advance;
+
+    // Parse argument (single expression for DEF FN functions)
+    if not Context.Check(ttDelimParClose) then
+    begin
+      Args := ParseExpression;
+      if Assigned(Args) then
+        Result.AddChild(Args);
+    end;
+
+    // Expect closing parenthesis
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" after function argument', Context.CurrentToken);
+      Result.Free;
+      Result := nil;
+      Exit;
+    end;
+
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // Regular identifier - let infix parsing handle ( if present
+  Result := CreateIdentifierNode(IdentName, Token);
   DoNodeCreated(Result);
 end;
 

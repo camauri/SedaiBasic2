@@ -56,6 +56,9 @@ type
     function ParseDimensionList: TASTNode;
     procedure SetOptions(AValue: TParserOptions);
 
+    // Helper for error reporting
+    function BuildSourceLine(AContext: TParserContext): string;
+
   protected
     procedure DoParsingStarted; virtual;
     procedure DoParsingFinished(Result: TParsingResult); virtual;
@@ -331,6 +334,9 @@ begin
        LineNum := 0; // Fallback per valori non validi
      end;
      LineNumber := TASTNode.CreateWithValue(antLineNumber, Token.Value, Token);
+
+     // Track BASIC line number for error reporting
+     Context.SetCurrentBasicLine(LineNum, BuildSourceLine(Context));
 
      Result.AddChild(LineNumber);
      Context.Advance; // Consume line number
@@ -1119,6 +1125,10 @@ begin
   Result := TASTNode.Create(antDoLoop, Token);
   Context.Advance; // Consume DO
 
+  // NOTE: DO/LOOP is handled internally by ParseDoStatement using FindMatchingEnd
+  // and ParseBlockUntil, so we don't use the validation stack for this.
+  // The LOOP is consumed directly by this function.
+
   ConditionType := '';
   ConditionPosition := '';
   Condition := nil;
@@ -1491,11 +1501,70 @@ end;
 
 function TPackratParser.ParseConditionalJumpStatement: TASTNode;
 var
-  Token: TLexerToken;
+  Expression, TargetList, TargetNode: TASTNode;
+  Token, JumpToken: TLexerToken;
+  IsGosub: Boolean;
 begin
   Token := Context.CurrentToken;
-  Result := TASTNode.Create(antStatement, Token);
   Context.Advance; // Consume ON
+
+  // Parse expression (the selector value)
+  Expression := ParseExpression;
+  if not Assigned(Expression) then
+  begin
+    HandleError('Expected expression after ON', Token);
+    Result := nil;
+    Exit;
+  end;
+
+  // Expect GOTO or GOSUB
+  if not Context.CheckAny([ttJumpGoto, ttJumpGosub]) then
+  begin
+    HandleError('Expected GOTO or GOSUB after ON expression', Context.CurrentToken);
+    Expression.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  JumpToken := Context.CurrentToken;
+  IsGosub := (JumpToken.TokenType = ttJumpGosub);
+  Context.Advance; // Consume GOTO/GOSUB
+
+  // Create appropriate node type
+  if IsGosub then
+    Result := TASTNode.Create(antOnGosub, Token)
+  else
+    Result := TASTNode.Create(antOnGoto, Token);
+
+  Result.AddChild(Expression);
+
+  // Parse list of target line numbers
+  TargetList := TASTNode.Create(antExpressionList, JumpToken);
+
+  // Parse first target (required)
+  TargetNode := ParseExpression;
+  if Assigned(TargetNode) then
+    TargetList.AddChild(TargetNode)
+  else
+  begin
+    HandleError('Expected line number after GOTO/GOSUB', Context.CurrentToken);
+    TargetList.Free;
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Parse additional targets separated by comma
+  while Context.Match(ttSeparParam) do
+  begin
+    TargetNode := ParseExpression;
+    if Assigned(TargetNode) then
+      TargetList.AddChild(TargetNode)
+    else
+      Break;
+  end;
+
+  Result.AddChild(TargetList);
   DoNodeCreated(Result);
 end;
 
@@ -1508,7 +1577,7 @@ begin
   Context.Advance; // Consume BEGIN
 
   // *** PUSH ONTO BLOCK STACK ***
-  FValidationStacks.PushBlock(ttBlockBegin, Result, 'END', Context.CurrentIndex);
+  FValidationStacks.PushBlock(ttBlockBegin, Result, 'BEND', Context.CurrentIndex);
 
   DoNodeCreated(Result);
 end;
@@ -1531,10 +1600,16 @@ begin
   Result := TASTNode.Create(antStatement, Token);
   Context.Advance; // Consume END/BEND
 
-  // *** Check if this BEND closes an IF/THEN/ELSE block ***
-  if FValidationStacks.HasActiveIf and FValidationStacks.CanPopIfAtEOL then
+  // *** BEND closes the BEGIN block, so clear the block flags for IF ***
+  if FValidationStacks.HasActiveIf then
   begin
-    FValidationStacks.PopIf;
+    // Clear the block flags since BEGIN/BEND block is now closed
+    FValidationStacks.ClearThenBlockForCurrentIf;
+    FValidationStacks.ClearElseBlockForCurrentIf;
+
+    // Now check if IF can be closed
+    if FValidationStacks.CanPopIfAtEOL then
+      FValidationStacks.PopIf;
   end;
 
   DoNodeCreated(Result);
@@ -2648,36 +2723,56 @@ begin
   Result := TASTNode.Create(antDef, Token);
   Context.Advance; // Consume DEF
 
-  // Expect FN followed by function name
   // Format: DEF FNname(param) = expression
-  // The FN keyword should be next
-  if not Context.Check(ttProcedureStart) then
-  begin
-    HandleError('Expected FN after DEF', Token);
-    Result.Free;
-    Result := nil;
-    Exit;
-  end;
+  // Two syntaxes supported:
+  // 1. DEF FN NAME(X) = ... (FN as separate keyword)
+  // 2. DEF FNNAME(X) = ...  (FNNAME as single identifier)
 
-  FnToken := Context.CurrentToken;
-  Context.Advance; // Consume FN
-
-  // Now expect the function name (identifier starting with letters after FN)
-  // In BASIC, it's written as FNEG, FNAA etc - where FN is separate keyword
-  // But the actual name follows immediately or is the next identifier
-  if not Context.Check(ttIdentifier) then
+  if Context.Check(ttProcedureStart) then
   begin
-    HandleError('Expected function name after DEF FN', FnToken);
+    // Syntax 1: FN is a separate keyword
+    FnToken := Context.CurrentToken;
+    Context.Advance; // Consume FN
+
+    if not Context.Check(ttIdentifier) then
+    begin
+      HandleError('Expected function name after DEF FN', FnToken);
+      Result.Free;
+      Result := nil;
+      Exit;
+    end;
+
+    FnName := Context.CurrentToken.Value;
+  end
+  else if Context.Check(ttIdentifier) then
+  begin
+    // Syntax 2: FNNAME as single identifier (e.g., FNSQ, FNDB)
+    FnName := Context.CurrentToken.Value;
+
+    // Validate that it starts with FN
+    if (Length(FnName) < 3) or (UpperCase(Copy(FnName, 1, 2)) <> 'FN') then
+    begin
+      HandleError('Expected FN or FNname after DEF', Token);
+      Result.Free;
+      Result := nil;
+      Exit;
+    end;
+
+    // Extract the actual function name part (after FN)
+    FnName := Copy(FnName, 3, Length(FnName) - 2);
+  end
+  else
+  begin
+    HandleError('Expected FN or FNname after DEF', Token);
     Result.Free;
     Result := nil;
     Exit;
   end;
 
   // Create function name node
-  FnName := Context.CurrentToken.Value;
   NameNode := TASTNode.CreateWithValue(antIdentifier, FnName, Context.CurrentToken);
   Result.AddChild(NameNode);
-  Context.Advance; // Consume function name
+  Context.Advance; // Consume function name (or FNNAME identifier)
 
   // Expect opening parenthesis for parameter
   if not Context.Match(ttDelimParOpen) then
@@ -3145,12 +3240,37 @@ begin
   FOptions := AValue;
 end;
 
+function TPackratParser.BuildSourceLine(AContext: TParserContext): string;
+var
+  StartIndex, i: Integer;
+  Token: TLexerToken;
+begin
+  // Build source line from tokens until end of line
+  Result := '';
+  StartIndex := AContext.CurrentIndex;
+
+  // Scan tokens until EOL
+  i := StartIndex;
+  while i < AContext.TokenList.Count do
+  begin
+    Token := AContext.TokenList.GetTokenDirect(i);
+    if not Assigned(Token) or (Token.TokenType in [ttEndOfLine, ttEndOfFile]) then
+      Break;
+
+    if Result <> '' then
+      Result := Result + ' ';
+    Result := Result + Token.Value;
+    Inc(i);
+  end;
+end;
+
 function TPackratParser.ParseBlockUntil(EndTokens: array of TTokenType): TASTNode;
 var
   Statement: TASTNode;
   Token: TLexerToken;
   i: Integer;
   Found: Boolean;
+  StartIndex: Integer;
 begin
   Result := TASTNode.Create(antBlock);
 
@@ -3174,14 +3294,40 @@ begin
 
     // Skip line numbers and EOL - they remain at root level
     if Context.Match(ttLineNumber) or Context.Match(ttEndOfLine) then
+    begin
+      // After skipping line number, re-check for end tokens
+      Token := Context.CurrentToken;
+      if Assigned(Token) then
+      begin
+        for i := Low(EndTokens) to High(EndTokens) do
+        begin
+          if Token.TokenType = EndTokens[i] then
+          begin
+            Found := True;
+            Break;
+          end;
+        end;
+        if Found then
+          Break;
+      end;
       Continue;
+    end;
 
     // Parse statement within block
+    // Remember position to detect if parsing made progress
+    StartIndex := Context.CurrentIndex;
     Statement := ParseStatement;
     if Assigned(Statement) then
       Result.AddChild(Statement)
     else
-      Break;
+    begin
+      // ParseStatement returned nil - this is OK if it consumed tokens
+      // (e.g., THEN/ELSE which add themselves to parent IF)
+      // Only break if no progress was made (stuck on same token)
+      if Context.CurrentIndex = StartIndex then
+        Break;
+      // Otherwise, continue - the statement was handled internally
+    end;
   end;
 
   DoNodeCreated(Result);

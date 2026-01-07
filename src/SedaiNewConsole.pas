@@ -3323,8 +3323,8 @@ begin
           // CTRL+ALT+END: Exit SedaiVision completely
           if (FLastKeyDown = SDLK_END) and FCtrlPressed and FAltPressed then
             FQuitRequested := True
-          // CTRL+C: Stop BASIC program (but don't exit)
-          else if (FLastKeyDown = SDLK_c) and FCtrlPressed and (not FAltPressed) then
+          // CTRL+END: Stop BASIC program (but don't exit)
+          else if (FLastKeyDown = SDLK_END) and FCtrlPressed and (not FAltPressed) then
             FStopRequested := True;
         end;
 
@@ -7169,10 +7169,12 @@ var
   Done: Boolean;
   Ch: Char;
   IsValidChar: Boolean;
+  KeyMod: UInt16;
+  CtrlDown, AltDown: Boolean;
 begin
   InputBuffer := '';
   Done := False;
-  
+
   // Mostra il prompt se fornito
   if Prompt <> '' then
   begin
@@ -7185,20 +7187,40 @@ begin
       FVideoController.Present;
     end;
   end;
-  
+
+  WriteLn('[DEBUG] ReadLine ENTERED, Prompt="', Prompt, '"');
   while not Done and not FQuitRequested do
   begin
     while SDL_PollEvent(@Event) = 1 do
     begin
+      // DEBUG: log all events
+      if Event.type_ = SDL_KEYDOWN then
+        WriteLn('[DEBUG] SDL_KEYDOWN: sym=', Event.key.keysym.sym, ' mod=', Event.key.keysym.mod_);
+
       case Event.type_ of
         SDL_QUITEV:
           begin
             FQuitRequested := True;
             Done := True;
           end;
-          
+
         SDL_KEYDOWN:
           begin
+            // Get modifier state using SDL_GetModState for reliable detection
+            KeyMod := SDL_GetModState;
+            CtrlDown := (KeyMod and KMOD_CTRL) <> 0;
+            AltDown := (KeyMod and KMOD_ALT) <> 0;
+
+            // DEBUG: Test if END key is recognized at all (without CTRL)
+            WriteLn('[DEBUG] sym=', Event.key.keysym.sym, ' SDLK_END=', SDLK_END, ' scancode=', Event.key.keysym.scancode, ' SDL_SCANCODE_END=', SDL_SCANCODE_END);
+            // Test: stop on END key alone (no CTRL required)
+            if (Event.key.keysym.scancode = SDL_SCANCODE_END) then
+            begin
+              WriteLn('[DEBUG] END key detected! Stopping program.');
+              FStopRequested := True;
+              Done := True;
+            end
+            else
             case Event.key.keysym.sym of
               SDLK_RETURN, SDLK_KP_ENTER:
                 begin
@@ -7206,7 +7228,7 @@ begin
                   FTextBuffer.NewLine;
                   Done := True;
                 end;
-                
+
               SDLK_BACKSPACE:
                 begin
                   if Length(InputBuffer) > 0 then
@@ -7215,7 +7237,7 @@ begin
                     FTextBuffer.DeleteChar;  // Rimuovi visivamente il carattere
                   end;
                 end;
-                
+
               SDLK_ESCAPE:
                 begin
                   // Cancella tutto l'input

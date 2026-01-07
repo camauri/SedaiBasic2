@@ -49,6 +49,10 @@ type
     // Performance tracking (minimal)
     FNodesCreated: Integer;
 
+    // BASIC line number tracking
+    FCurrentBasicLineNumber: Integer;
+    FCurrentBasicSourceLine: string;
+
   public
     constructor Create(ATokenList: TTokenList);
     destructor Destroy; override;
@@ -106,6 +110,9 @@ type
     // === MINIMAL DEBUG ===
     function GetDebugInfo: string;
 
+    // === BASIC LINE NUMBER TRACKING ===
+    procedure SetCurrentBasicLine(LineNumber: Integer; const SourceLine: string);
+
     // === PROPERTIES ===
     property TokenList: TTokenList read FTokenList;
     property CurrentIndex: Integer read FCurrentIndex write FCurrentIndex;
@@ -118,6 +125,8 @@ type
     property RecursionDepth: Integer read FRecursionDepth;
     property MaxRecursionLimit: Integer read FMaxRecursionLimit write FMaxRecursionLimit;
     property NodesCreated: Integer read FNodesCreated;
+    property CurrentBasicLineNumber: Integer read FCurrentBasicLineNumber;
+    property CurrentBasicSourceLine: string read FCurrentBasicSourceLine;
   end;
 
   { TParserPositionGuard - Helper for automatic position restore
@@ -173,6 +182,8 @@ begin
   FRecursionDepth := 0;
   FMaxRecursionLimit := 1000; // Default limit
   FNodesCreated := 0;
+  FCurrentBasicLineNumber := 0;
+  FCurrentBasicSourceLine := '';
 
   // Initialize parse rules array
   for TokenType := Low(TTokenType) to High(TTokenType) do
@@ -355,8 +366,16 @@ end;
 // === ERROR HANDLING ===
 
 procedure TParserContext.AddError(const Message: string; Token: TLexerToken);
+var
+  ErrorIndex: Integer;
 begin
-  FErrors.AddError(Message, Token);
+  ErrorIndex := FErrors.AddError(Message, Token);
+  // Set BASIC line number if tracked
+  if (ErrorIndex >= 0) and (FCurrentBasicLineNumber > 0) then
+  begin
+    FErrors[ErrorIndex].BasicLineNumber := FCurrentBasicLineNumber;
+    FErrors[ErrorIndex].SourceLine := FCurrentBasicSourceLine;
+  end;
   {$IFDEF DEBUG}
   if FDebugMode then
     WriteLn('PARSER ERROR: ', Message);
@@ -364,8 +383,16 @@ begin
 end;
 
 procedure TParserContext.AddError(const Message: string; Line, Column, Position: Integer);
+var
+  ErrorIndex: Integer;
 begin
-  FErrors.AddError(Message, Line, Column, Position);
+  ErrorIndex := FErrors.AddError(Message, Line, Column, Position);
+  // Set BASIC line number if tracked
+  if (ErrorIndex >= 0) and (FCurrentBasicLineNumber > 0) then
+  begin
+    FErrors[ErrorIndex].BasicLineNumber := FCurrentBasicLineNumber;
+    FErrors[ErrorIndex].SourceLine := FCurrentBasicSourceLine;
+  end;
   {$IFDEF DEBUG}
   if FDebugMode then
     WriteLn('PARSER ERROR: ', Message);
@@ -496,11 +523,19 @@ var
 begin
   Token := GetCurrentToken;
   if Assigned(Token) then
-    Result := Format('Context: Index=%d, Token=%s, Line=%d, Column=%d, Recursion=%d, Errors=%d',
-      [FCurrentIndex, Token.Value, Token.Line, Token.Column, FRecursionDepth, FErrors.Count])
+    Result := Format('Context: Index=%d, Token=%s, Line=%d, Column=%d, Recursion=%d, Errors=%d, BasicLine=%d',
+      [FCurrentIndex, Token.Value, Token.Line, Token.Column, FRecursionDepth, FErrors.Count, FCurrentBasicLineNumber])
   else
-    Result := Format('Context: Index=%d, Token=<EOF>, Recursion=%d, Errors=%d',
-      [FCurrentIndex, FRecursionDepth, FErrors.Count]);
+    Result := Format('Context: Index=%d, Token=<EOF>, Recursion=%d, Errors=%d, BasicLine=%d',
+      [FCurrentIndex, FRecursionDepth, FErrors.Count, FCurrentBasicLineNumber]);
+end;
+
+// === BASIC LINE NUMBER TRACKING ===
+
+procedure TParserContext.SetCurrentBasicLine(LineNumber: Integer; const SourceLine: string);
+begin
+  FCurrentBasicLineNumber := LineNumber;
+  FCurrentBasicSourceLine := SourceLine;
 end;
 
 { TParserPositionGuard }

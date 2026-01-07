@@ -66,6 +66,8 @@ type
     antInput,             // INPUT statement
     antGoto,              // GOTO statement
     antGosub,             // GOSUB statement
+    antOnGoto,            // ON...GOTO statement
+    antOnGosub,           // ON...GOSUB statement
     antReturn,            // RETURN statement
     antEnd,               // END statement
     antStop,              // STOP statement
@@ -346,7 +348,7 @@ function IsStatementNode(NodeType: TASTNodeType): Boolean;
 begin
   Result := NodeType in [
     antStatement, antAssignment, antPrint, antInput, antGoto,
-    antGosub, antReturn, antEnd, antStop, antRem, antIf,
+    antGosub, antOnGoto, antOnGosub, antReturn, antEnd, antStop, antRem, antIf,
     antThen, antElse, antForLoop, antWhileLoop, antDoLoop, antDim,
     antDef, antData, antConst, antRead, antRestore, antClear,
     antOpen, antClose, antDopen, antDclose,

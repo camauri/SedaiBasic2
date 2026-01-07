@@ -789,12 +789,15 @@ begin
 
   while SDL_PollEvent(@Event) <> 0 do
   begin
+    WriteLn('[DEBUG ProcessScrollEvents] Got event type=', Event.type_);
     case Event.type_ of
       SDL_KEYDOWN:
       begin
+        WriteLn('[DEBUG ProcessScrollEvents] KEYDOWN sym=', Event.key.keysym.sym);
         if FOutputDevice.HandleScrollKeys(Event.key.keysym.sym, Event.key.keysym.mod_) then
         begin
           // Scroll event handled - don't reprocess
+          WriteLn('[DEBUG ProcessScrollEvents] Scroll key handled');
         end
         else
         begin
@@ -840,9 +843,13 @@ end;
 procedure TSDL2InputDevice.ProcessInputEvents;
 var
   Event: TSDL_Event;
+  CtrlPressed, AltPressed: Boolean;
 begin
   while SDL_PollEvent(@Event) <> 0 do
   begin
+    // DEBUG: Log all events
+    WriteLn('[DEBUG ProcessInputEvents] Event type=', Event.type_, ' SDL_KEYDOWN=', SDL_KEYDOWN);
+
     case Event.type_ of
       SDL_QUITEV:
       begin
@@ -857,7 +864,24 @@ begin
 
       SDL_KEYDOWN:
       begin
-        HandleKeyDown(Event.key.keysym.sym, Event.key.keysym.mod_);
+        CtrlPressed := (Event.key.keysym.mod_ and KMOD_CTRL) <> 0;
+        AltPressed := (Event.key.keysym.mod_ and KMOD_ALT) <> 0;
+
+        // CTRL+ALT+END: Exit SedaiVision completely
+        if (Event.key.keysym.sym = SDLK_END) and CtrlPressed and AltPressed then
+        begin
+          FQuitRequested := True;
+          FInputActive := False;
+        end
+        // TEST: Q key alone stops program (temporary for debugging)
+        else if (Event.key.keysym.sym = SDLK_q) then
+        begin
+          WriteLn('[DEBUG sedaisdl2input] Q detected! Setting FStopRequested := True');
+          FStopRequested := True;
+          FInputActive := False;  // Cancel current INPUT
+        end
+        else
+          HandleKeyDown(Event.key.keysym.sym, Event.key.keysym.mod_);
       end;
     end;
   end;
@@ -902,6 +926,7 @@ begin
 
   SDL_StartTextInput;
   try
+    WriteLn('[DEBUG ReadLine] Entering main loop');
     while FInputActive and not FQuitRequested do
     begin
       ProcessScrollEvents;
@@ -910,6 +935,7 @@ begin
       UpdateDisplay;
       SDL_Delay(16);
     end;
+    WriteLn('[DEBUG ReadLine] Exited main loop, FInputActive=', FInputActive, ' FQuitRequested=', FQuitRequested);
   finally
     SDL_StopTextInput;
     FInputActive := False;
@@ -1140,8 +1166,8 @@ begin
           begin
             FQuitRequested := True;
           end
-          // CTRL+C: Stop BASIC program (but don't exit)
-          else if (Event.key.keysym.sym = SDLK_c) and CtrlPressed and (not AltPressed) then
+          // CTRL+END: Stop BASIC program (but don't exit)
+          else if (Event.key.keysym.sym = SDLK_END) and CtrlPressed and (not AltPressed) then
           begin
             FStopRequested := True;
           end
@@ -1203,6 +1229,8 @@ function TSDL2InputDevice.ShouldStop: Boolean;
 begin
   ProcessEvents;
   Result := FStopRequested;
+  if Result then
+    WriteLn('[DEBUG sedaisdl2input] ShouldStop returning TRUE');
 end;
 
 procedure TSDL2InputDevice.ClearStopRequest;

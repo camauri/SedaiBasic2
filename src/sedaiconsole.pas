@@ -1385,8 +1385,8 @@ begin
           // CTRL+ALT+END: Exit SedaiVision completely
           if (FLastKeyDown = SDLK_END) and FCtrlPressed and FAltPressed then
             FQuitRequested := True
-          // CTRL+C: Stop BASIC program (but don't exit)
-          else if (FLastKeyDown = SDLK_c) and FCtrlPressed and (not FAltPressed) then
+          // CTRL+END: Stop BASIC program (but don't exit)
+          else if (FLastKeyDown = SDLK_END) and FCtrlPressed and (not FAltPressed) then
             FStopRequested := True;
         end;
 
@@ -2690,6 +2690,24 @@ begin
           
         SDL_KEYDOWN:
           begin
+            // Check for CTRL+END to stop program even during INPUT
+            if (Event.key.keysym.sym = SDLK_END) and
+               ((Event.key.keysym.mod_ and KMOD_CTRL) <> 0) then
+            begin
+              if (Event.key.keysym.mod_ and KMOD_ALT) <> 0 then
+              begin
+                // CTRL+ALT+END: Exit completely
+                FQuitRequested := True;
+                Done := True;
+              end
+              else
+              begin
+                // CTRL+END: Stop BASIC program
+                FStopRequested := True;
+                Done := True;
+              end;
+            end
+            else
             case Event.key.keysym.sym of
               SDLK_RETURN, SDLK_KP_ENTER:
                 begin
@@ -2706,7 +2724,7 @@ begin
                     FTextBuffer.DeleteChar;  // Visually remove character
                   end;
                 end;
-                
+
               SDLK_ESCAPE:
                 begin
                   // Clear all input

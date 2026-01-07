@@ -94,6 +94,8 @@ type
     procedure ProcessIfStatement(Node: TASTNode);
     procedure ProcessGoto(Node: TASTNode);
     procedure ProcessGosub(Node: TASTNode);
+    procedure ProcessOnGoto(Node: TASTNode);
+    procedure ProcessOnGosub(Node: TASTNode);
     procedure ProcessBox(Node: TASTNode);
     procedure ProcessCircle(Node: TASTNode);
     procedure ProcessDraw(Node: TASTNode);
@@ -3304,6 +3306,134 @@ begin
   // continues after RETURN. Variables flow via the RETURN edge (LINE_9030 → LINE_760).
 end;
 
+{ ProcessOnGoto - Handle ON expr GOTO line1, line2, ... statement
+  Evaluates the expression and jumps to the corresponding line number.
+  If expression = 1, jump to line1; if = 2, jump to line2; etc.
+  If out of range (< 1 or > number of targets), fall through to next statement.
+}
+procedure TSSAGenerator.ProcessOnGoto(Node: TASTNode);
+var
+  SelectorNode, TargetListNode, TargetNode: TASTNode;
+  SelectorValue, SelectorReg, TempReg, CmpReg: TSSAValue;
+  i, TempRegNum, CmpRegNum: Integer;
+  LabelName, EndLabel: string;
+  TargetBlock: TSSABasicBlock;
+begin
+  if Node.ChildCount < 2 then Exit;
+
+  SelectorNode := Node.GetChild(0);       // Expression (selector value)
+  TargetListNode := Node.GetChild(1);     // List of target line numbers
+
+  // Evaluate selector expression
+  ProcessExpression(SelectorNode, SelectorValue);
+  SelectorReg := EnsureIntRegister(SelectorValue);
+
+  // Create end label for fall-through case
+  EndLabel := GenerateUniqueLabel('ON_GOTO_END');
+
+  // Generate conditional jumps for each target
+  for i := 0 to TargetListNode.ChildCount - 1 do
+  begin
+    TargetNode := TargetListNode.GetChild(i);
+    LabelName := 'LINE_' + VarToStr(TargetNode.Value);
+
+    // Compare selector with (i + 1)
+    TempRegNum := FProgram.AllocRegister(srtInt);
+    TempReg := MakeSSARegister(srtInt, TempRegNum);
+    EmitInstruction(ssaLoadConstInt, TempReg,
+                   MakeSSAConstInt(i + 1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+    // If selector = (i+1), jump to target
+    CmpRegNum := FProgram.AllocRegister(srtInt);
+    CmpReg := MakeSSARegister(srtInt, CmpRegNum);
+    EmitInstruction(ssaCmpEqInt, CmpReg,
+                   SelectorReg, TempReg,
+                   MakeSSAValue(svkNone));
+    EmitInstruction(ssaJumpIfNotZero, MakeSSALabel(LabelName),
+                   CmpReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+    // Connect CFG edge
+    TargetBlock := FProgram.FindBlock(LabelName);
+    if Assigned(TargetBlock) and Assigned(FCurrentBlock) then
+    begin
+      FCurrentBlock.AddSuccessor(TargetBlock);
+      TargetBlock.AddPredecessor(FCurrentBlock);
+    end;
+  end;
+
+  // Fall-through case (selector out of range) - create end block
+  FCurrentBlock := FProgram.CreateBlock(EndLabel);
+end;
+
+{ ProcessOnGosub - Handle ON expr GOSUB line1, line2, ... statement
+  Similar to ON GOTO but calls subroutine instead of jumping.
+}
+procedure TSSAGenerator.ProcessOnGosub(Node: TASTNode);
+var
+  SelectorNode, TargetListNode, TargetNode: TASTNode;
+  SelectorValue, SelectorReg, TempReg, CmpReg: TSSAValue;
+  i, TempRegNum, CmpRegNum: Integer;
+  LabelName, NextLabel, EndLabel: string;
+  TargetBlock: TSSABasicBlock;
+begin
+  if Node.ChildCount < 2 then Exit;
+
+  SelectorNode := Node.GetChild(0);       // Expression (selector value)
+  TargetListNode := Node.GetChild(1);     // List of target line numbers
+
+  // Evaluate selector expression
+  ProcessExpression(SelectorNode, SelectorValue);
+  SelectorReg := EnsureIntRegister(SelectorValue);
+
+  // Create end label for fall-through case
+  EndLabel := GenerateUniqueLabel('ON_GOSUB_END');
+
+  // Generate conditional calls for each target
+  for i := 0 to TargetListNode.ChildCount - 1 do
+  begin
+    TargetNode := TargetListNode.GetChild(i);
+    LabelName := 'LINE_' + VarToStr(TargetNode.Value);
+    NextLabel := GenerateUniqueLabel('ON_GOSUB_NEXT');
+
+    // Compare selector with (i + 1)
+    TempRegNum := FProgram.AllocRegister(srtInt);
+    TempReg := MakeSSARegister(srtInt, TempRegNum);
+    EmitInstruction(ssaLoadConstInt, TempReg,
+                   MakeSSAConstInt(i + 1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+    // If selector <> (i+1), skip to next check
+    CmpRegNum := FProgram.AllocRegister(srtInt);
+    CmpReg := MakeSSARegister(srtInt, CmpRegNum);
+    EmitInstruction(ssaCmpEqInt, CmpReg,
+                   SelectorReg, TempReg,
+                   MakeSSAValue(svkNone));
+    EmitInstruction(ssaJumpIfZero, MakeSSALabel(NextLabel),
+                   CmpReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+    // Call subroutine
+    EmitInstruction(ssaCall, MakeSSALabel(LabelName), MakeSSAValue(svkNone),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+    // Jump to end after call returns
+    EmitInstruction(ssaJump, MakeSSALabel(EndLabel), MakeSSAValue(svkNone),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+    // Connect CFG edge
+    TargetBlock := FProgram.FindBlock(LabelName);
+    if Assigned(TargetBlock) and Assigned(FCurrentBlock) then
+    begin
+      FCurrentBlock.AddSuccessor(TargetBlock);
+      TargetBlock.AddPredecessor(FCurrentBlock);
+    end;
+
+    // Create next check block
+    FCurrentBlock := FProgram.CreateBlock(NextLabel);
+  end;
+
+  // Fall-through case (selector out of range) - create end block
+  FCurrentBlock := FProgram.CreateBlock(EndLabel);
+end;
+
 { ProcessGraphics - Handle GRAPHIC command for setting graphics mode
   Syntax: GRAPHIC mode [, clear [, param3]]
   Parameters:
@@ -6489,6 +6619,8 @@ begin
     antIf: ProcessIfStatement(Node);
     antGoto: ProcessGoto(Node);
     antGosub: ProcessGosub(Node);
+    antOnGoto: ProcessOnGoto(Node);
+    antOnGosub: ProcessOnGosub(Node);
     antBox: ProcessBox(Node);
     antCircle: ProcessCircle(Node);
     antDraw: ProcessDraw(Node);

@@ -810,6 +810,13 @@ begin
         end;
     end;
   end;
+
+  // Check for CTRL+END stop request after input completes
+  if Assigned(FInput) and FInput.ShouldStop then
+  begin
+    FBreakRequested := True;
+    FInput.ClearStopRequest;
+  end;
 end;
 
 // === BUILT-IN FUNCTIONS ===

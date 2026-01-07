@@ -163,6 +163,8 @@ type
     procedure ExecuteDoLoop(DoNode: TASTNode);
     procedure ExecuteGotoStatement(GotoNode: TASTNode);
     procedure ExecuteGosubStatement(GosubNode: TASTNode);
+    procedure ExecuteOnGotoStatement(OnGotoNode: TASTNode);
+    procedure ExecuteOnGosubStatement(OnGosubNode: TASTNode);
     procedure ExecuteGraphicsStatement(Node: TASTNode);
     procedure ExecuteReturnStatement(ReturnNode: TASTNode);
     procedure ExecuteRunStatement(RunNode: TASTNode);
@@ -919,6 +921,8 @@ begin
     antDoLoop: ExecuteDoLoop(StmtNode);
     antGoto: ExecuteGotoStatement(StmtNode);
     antGosub: ExecuteGosubStatement(StmtNode);
+    antOnGoto: ExecuteOnGotoStatement(StmtNode);
+    antOnGosub: ExecuteOnGosubStatement(StmtNode);
     antReturn: ExecuteReturnStatement(StmtNode);
     antRun: ExecuteRunStatement(StmtNode);
     antEnd: ExecuteEndStatement(StmtNode);
@@ -1276,6 +1280,70 @@ begin
     RaiseRuntimeError('GOSUB requires a line number');
 
   LineNum := VarToInt(EvaluateExpression(GosubNode.Child[0]));
+  CallSubroutine(LineNum);
+end;
+
+procedure TSedaiExecutor.ExecuteOnGotoStatement(OnGotoNode: TASTNode);
+var
+  SelectorValue: Variant;
+  Selector, LineNum, TargetIndex: Integer;
+  TargetList: TASTNode;
+begin
+  // ON expr GOTO line1, line2, line3, ...
+  // Child[0] = expression (selector)
+  // Child[1] = expression list (target line numbers)
+  if OnGotoNode.ChildCount < 2 then
+    RaiseRuntimeError('ON GOTO requires expression and target list');
+
+  // Evaluate selector (1-based index)
+  SelectorValue := EvaluateExpression(OnGotoNode.Child[0]);
+  Selector := VarToInt(SelectorValue);
+
+  // Get target list
+  TargetList := OnGotoNode.Child[1];
+
+  // If selector is out of range, continue to next statement (no jump)
+  if (Selector < 1) or (Selector > TargetList.ChildCount) then
+    Exit;
+
+  // Get the target line number at position (Selector - 1)
+  LineNum := VarToInt(EvaluateExpression(TargetList.Child[Selector - 1]));
+
+  // Jump to target
+  TargetIndex := FindLineNumber(LineNum);
+  if TargetIndex < 0 then
+    RaiseRuntimeError(Format('Line number %d not found', [LineNum]));
+
+  FProgramCounter := TargetIndex;
+end;
+
+procedure TSedaiExecutor.ExecuteOnGosubStatement(OnGosubNode: TASTNode);
+var
+  SelectorValue: Variant;
+  Selector, LineNum: Integer;
+  TargetList: TASTNode;
+begin
+  // ON expr GOSUB line1, line2, line3, ...
+  // Child[0] = expression (selector)
+  // Child[1] = expression list (target line numbers)
+  if OnGosubNode.ChildCount < 2 then
+    RaiseRuntimeError('ON GOSUB requires expression and target list');
+
+  // Evaluate selector (1-based index)
+  SelectorValue := EvaluateExpression(OnGosubNode.Child[0]);
+  Selector := VarToInt(SelectorValue);
+
+  // Get target list
+  TargetList := OnGosubNode.Child[1];
+
+  // If selector is out of range, continue to next statement (no jump)
+  if (Selector < 1) or (Selector > TargetList.ChildCount) then
+    Exit;
+
+  // Get the target line number at position (Selector - 1)
+  LineNum := VarToInt(EvaluateExpression(TargetList.Child[Selector - 1]));
+
+  // Call subroutine at target
   CallSubroutine(LineNum);
 end;
 

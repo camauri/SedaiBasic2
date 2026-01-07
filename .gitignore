@@ -37,10 +37,12 @@ deps/
 /presentation/
 
 # Files
+*.ini
 fpmake.pp
 presentation.zip
 README_AI.md
 ChangeLog.md
+SedaiBasic2Tester.*
 
 # Lazarus session files
 *.lps
