@@ -7188,15 +7188,10 @@ begin
     end;
   end;
 
-  WriteLn('[DEBUG] ReadLine ENTERED, Prompt="', Prompt, '"');
   while not Done and not FQuitRequested do
   begin
     while SDL_PollEvent(@Event) = 1 do
     begin
-      // DEBUG: log all events
-      if Event.type_ = SDL_KEYDOWN then
-        WriteLn('[DEBUG] SDL_KEYDOWN: sym=', Event.key.keysym.sym, ' mod=', Event.key.keysym.mod_);
-
       case Event.type_ of
         SDL_QUITEV:
           begin
@@ -7211,12 +7206,9 @@ begin
             CtrlDown := (KeyMod and KMOD_CTRL) <> 0;
             AltDown := (KeyMod and KMOD_ALT) <> 0;
 
-            // DEBUG: Test if END key is recognized at all (without CTRL)
-            WriteLn('[DEBUG] sym=', Event.key.keysym.sym, ' SDLK_END=', SDLK_END, ' scancode=', Event.key.keysym.scancode, ' SDL_SCANCODE_END=', SDL_SCANCODE_END);
-            // Test: stop on END key alone (no CTRL required)
+            // END key stops the program
             if (Event.key.keysym.scancode = SDL_SCANCODE_END) then
             begin
-              WriteLn('[DEBUG] END key detected! Stopping program.');
               FStopRequested := True;
               Done := True;
             end

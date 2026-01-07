@@ -608,7 +608,19 @@ var
   Input: string;
   IsValid: Boolean;
   TempFloat: Double;
+  {$IFDEF WINDOWS}
+  NormalMode: DWORD;
+  {$ENDIF}
 begin
+  {$IFDEF WINDOWS}
+  // Ensure console is in normal line input mode with echo
+  if FConsoleHandle <> INVALID_HANDLE_VALUE then
+  begin
+    NormalMode := ENABLE_LINE_INPUT or ENABLE_ECHO_INPUT or ENABLE_PROCESSED_INPUT;
+    SetConsoleMode(FConsoleHandle, NormalMode);
+  end;
+  {$ENDIF}
+
   repeat
     IsValid := True;
     Input := '';

@@ -2766,11 +2766,8 @@ begin
       if Assigned(FInputDevice) then
       begin
         FStringRegs[Instr.Dest] := FInputDevice.ReadLine('', False, False, False);
-        // Check for CTRL+END stop request
-        WriteLn('[DEBUG VM] After ReadLine, ShouldStop=', FInputDevice.ShouldStop);
         if FInputDevice.ShouldStop then
         begin
-          WriteLn('[DEBUG VM] Setting FRunning := False');
           FRunning := False;
           FInputDevice.ClearStopRequest;
         end;
