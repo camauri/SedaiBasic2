@@ -924,7 +924,7 @@ begin
     Exit;
   end;
 
-  WriteLn;
+  //WriteLn;
   // BASIC has global variable semantics (modifications in GOSUB persist after RETURN)
   SSAConstr := TSSAConstruction.Create(Self, TDominatorTree(FDomTreeObj), True);
   try
@@ -932,7 +932,7 @@ begin
   finally
     SSAConstr.Free;
   end;
-  WriteLn;
+  //WriteLn;
 end;
 
 procedure TSSAProgram.RunPhiElimination;
