@@ -506,9 +506,6 @@ begin
       // x2 in bits 0-11
       if Instr.PhiSources[0].Value.Kind = svkRegister then
       begin
-        WriteLn('>>> BOX Compiler: x2 SSA=', Instr.PhiSources[0].Value.RegIndex, '_v', Instr.PhiSources[0].Value.Version,
-                ' -> BC=', MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
-                  Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version));
         BCInstr.Immediate := BCInstr.Immediate or
           (Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
             Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFF);
@@ -516,9 +513,6 @@ begin
       // y2 in bits 12-23
       if Instr.PhiSources[1].Value.Kind = svkRegister then
       begin
-        WriteLn('>>> BOX Compiler: y2 SSA=', Instr.PhiSources[1].Value.RegIndex, '_v', Instr.PhiSources[1].Value.Version,
-                ' -> BC=', MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
-                  Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version));
         BCInstr.Immediate := BCInstr.Immediate or
           ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
             Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FFF) shl 12);
@@ -526,9 +520,6 @@ begin
       // angle in bits 24-35
       if Instr.PhiSources[2].Value.Kind = svkRegister then
       begin
-        WriteLn('>>> BOX Compiler: angle SSA=', Instr.PhiSources[2].Value.RegIndex, '_v', Instr.PhiSources[2].Value.Version,
-                ' -> BC=', MapSSARegisterToBytecode(Instr.PhiSources[2].Value.RegType,
-                  Instr.PhiSources[2].Value.RegIndex, Instr.PhiSources[2].Value.Version));
         BCInstr.Immediate := BCInstr.Immediate or
           ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[2].Value.RegType,
             Instr.PhiSources[2].Value.RegIndex, Instr.PhiSources[2].Value.Version)) and $FFF) shl 24);
@@ -536,9 +527,6 @@ begin
       // filled in bits 36-47
       if Instr.PhiSources[3].Value.Kind = svkRegister then
       begin
-        WriteLn('>>> BOX Compiler: filled SSA=', Instr.PhiSources[3].Value.RegIndex, '_v', Instr.PhiSources[3].Value.Version,
-                ' -> BC=', MapSSARegisterToBytecode(Instr.PhiSources[3].Value.RegType,
-                  Instr.PhiSources[3].Value.RegIndex, Instr.PhiSources[3].Value.Version));
         BCInstr.Immediate := BCInstr.Immediate or
           ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[3].Value.RegType,
             Instr.PhiSources[3].Value.RegIndex, Instr.PhiSources[3].Value.Version)) and $FFF) shl 36);
@@ -546,9 +534,6 @@ begin
       // fill_color in bits 48-59
       if Instr.PhiSources[4].Value.Kind = svkRegister then
       begin
-        WriteLn('>>> BOX Compiler: fill_color SSA=', Instr.PhiSources[4].Value.RegIndex, '_v', Instr.PhiSources[4].Value.Version,
-                ' -> BC=', MapSSARegisterToBytecode(Instr.PhiSources[4].Value.RegType,
-                  Instr.PhiSources[4].Value.RegIndex, Instr.PhiSources[4].Value.Version));
         BCInstr.Immediate := BCInstr.Immediate or
           ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[4].Value.RegType,
             Instr.PhiSources[4].Value.RegIndex, Instr.PhiSources[4].Value.Version)) and $FFF) shl 48);
@@ -1282,10 +1267,6 @@ begin
       WriteLn('[BC] PrintInt: Src1=', SSARegisterTypeToString(Instr.Src1.RegType), '[', Instr.Src1.RegIndex, ']_v', Instr.Src1.Version);
   end;
   {$ENDIF}
-  if Instr.OpCode = ssaGraphicGetMode then
-    WriteLn('>>> BC Compiling ssaGraphicGetMode -> bcOp=', Ord(BCOp));
-  if (Instr.OpCode = ssaTron) or (Instr.OpCode = ssaTroff) then
-    WriteLn('[BC] Compiling ', Ord(Instr.OpCode), ' -> bcOp=', Ord(BCOp));
 
   BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
 
@@ -1383,9 +1364,7 @@ begin
       BCInstr := FProgram.GetInstruction(Fixup.BCInstrIndex);
       BCInstr.Immediate := TargetAddr;
       FProgram.SetInstruction(Fixup.BCInstrIndex, BCInstr);
-    end
-    else
-      WriteLn('[DEBUG ResolveLabels] LABEL NOT FOUND: "', Fixup.TargetLabel, '"');
+    end;
   end;
 end;
 

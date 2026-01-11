@@ -190,8 +190,6 @@ begin
 
   // Copy to main palette
   Move(FDefaultC64Palette[0], FPalette[0], 16 * SizeOf(UInt32));
-
-  WriteLn('>>> InitC64Palette: Palette[11]=$', IntToHex(FPalette[11], 8), ' Palette[13]=$', IntToHex(FPalette[13], 8));
 end;
 
 procedure TGraphicsMemory.InitExtendedPalette;
@@ -627,10 +625,6 @@ var
 begin
   if not ValidateCoordinates(X, Y) then
     Exit;
-
-  // Debug: log first pixel only
-  if (X = 20) and (Y = 20) then
-    WriteLn('>>> SetPixel(Index): X=', X, ' Y=', Y, ' Index=', PaletteIndex, ' Palette[', PaletteIndex, ']=$', IntToHex(FPalette[PaletteIndex], 8));
 
   // Save index in color buffer if in palette mode
   if FState.PaletteMode and Assigned(FColorBuffer) then

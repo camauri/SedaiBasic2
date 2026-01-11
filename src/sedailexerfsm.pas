@@ -2923,7 +2923,6 @@ end;
 procedure SetGlobalDebugMode(Enabled: Boolean);
 begin
   GlobalDebugMode := Enabled;
-  WriteLn('Global debug mode: ', BoolToStr(Enabled, True));
 end;
 
 function GetGlobalLexerStatistics: string;

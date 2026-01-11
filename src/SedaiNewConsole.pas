@@ -1125,12 +1125,8 @@ begin
     Exit;
   end;
 
-  // DEBUG: Verify actual window resolution
+  // Get actual window resolution
   SDL_GetWindowSize(FWindow, @ActualW, @ActualH);
-  WriteLn('DEBUG CreateWindow: Requested=', RequestedW, 'x', RequestedH,
-          ' Selected=', FWindowWidth, 'x', FWindowHeight,
-          ' Actual=', ActualW, 'x', ActualH,
-          ' Fullscreen=', FFullscreen);
 
   // Update with actual values
   FWindowWidth := ActualW;
@@ -1179,12 +1175,6 @@ begin
     FViewportY := (FWindowHeight - ScaledHeight) div 2;
     FViewportWidth := ScaledWidth;
     FViewportHeight := ScaledHeight;
-
-    WriteLn('DEBUG CalculateViewport (Fullscreen): Window=', FWindowWidth, 'x', FWindowHeight,
-            ' ScaleX=', ScaleX, ' ScaleY=', ScaleY, ' → Scale=', Scale,
-            ' FontSize=', FFontSize,
-            ' Viewport=', FViewportWidth, 'x', FViewportHeight,
-            ' Position=(', FViewportX, ',', FViewportY, ')');
   end
   else
   begin
@@ -1194,9 +1184,6 @@ begin
     FViewportHeight := FModeInfo.NativeHeight;
     FViewportX := (FWindowWidth - FViewportWidth) div 2;
     FViewportY := (FWindowHeight - FViewportHeight) div 2;
-    WriteLn('DEBUG CalculateViewport (Windowed): Window=', FWindowWidth, 'x', FWindowHeight,
-            ' Viewport=', FViewportWidth, 'x', FViewportHeight,
-            ' Position=(', FViewportX, ',', FViewportY, ')');
   end;
 end;
 
@@ -1310,17 +1297,6 @@ begin
   
   {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: Initialization complete');{$ENDIF}
   FInitialized := True;
-
-  // DEBUG: Print window, viewport and font information
-  WriteLn('=== DEBUG INFO ===');
-  WriteLn('Window Resolution: ', FWindowWidth, 'x', FWindowHeight);
-  WriteLn('Viewport Resolution: ', FViewportWidth, 'x', FViewportHeight);
-  WriteLn('Viewport Position: (', FViewportX, ', ', FViewportY, ')');
-  WriteLn('Font Size Requested: ', FFontSize);
-  WriteLn('Font Metrics: CharWidth=', FCharWidth, ' CharHeight=', FCharHeight);
-  WriteLn('Expected Grid: 80x50 chars');
-  WriteLn('Calculated Grid: ', FViewportWidth div FCharWidth, 'x', FViewportHeight div FCharHeight, ' chars');
-  WriteLn('==================');
 
   Result := True;
   FInitialized := True;
@@ -2128,11 +2104,8 @@ var
 begin
   Result := False;
 
-  WriteLn('>>> SetGraphicMode CALLED: Mode=', Ord(Mode), ' ClearBuffer=', ClearBuffer, ' SplitLine=', SplitLine);
-
   // Get mode info
   NewModeInfo := GRAPHICS_MODES[Mode];
-  WriteLn('>>> Mode info: Name=', NewModeInfo.Name, ' NativeRes=', NewModeInfo.NativeWidth, 'x', NewModeInfo.NativeHeight);
 
   // Use user-provided SplitLine, or DefaultSplitLine if -1
   if SplitLine < 0 then
@@ -2140,61 +2113,38 @@ begin
   else
     FSplitLine := SplitLine;
 
-  // Classic modes use palette indices, mode 11 uses RGBA
-  // FForegroundIndex/FBackgroundIndex are set to defaults (13/12)
-  // and can be changed via COLOR command
-  WriteLn('>>> Hires indices: FG=', FForegroundIndex, ' BG=', FBackgroundIndex);
-
   // Update mode info
   FCurrentMode := Mode;
   FModeInfo := NewModeInfo;
-  WriteLn('>>> FCurrentMode set to ', Ord(FCurrentMode));
 
   // For classic modes (0-10), use persistent buffers
   if Mode <> gmSDL2Dynamic then
   begin
-    WriteLn('>>> Allocating buffers for classic mode...');
     // Allocate or switch to the buffer for this mode
     // AllocateBuffers returns True if buffer was newly created
     PaletteMode := NewModeInfo.PaletteType = ptC64_16;
     BufferIsNew := FGraphicsMemory.AllocateBuffers(NewModeInfo.NativeWidth, NewModeInfo.NativeHeight, PaletteMode, Mode);
-    WriteLn('>>> Buffers allocated. GraphicsBuffer=', IntToHex(PtrUInt(FGraphicsMemory.GraphicsBuffer), 16), ' BufferIsNew=', BufferIsNew);
 
     // Clear the buffer if:
     // 1. Explicitly requested (ClearBuffer=True), OR
     // 2. Buffer was just created (first time entering this mode)
     if ClearBuffer or BufferIsNew then
-    begin
-      WriteLn('>>> Clearing buffer with BG index ', FBackgroundIndex, ' (ClearBuffer=', ClearBuffer, ', BufferIsNew=', BufferIsNew, ')');
       FGraphicsMemory.ClearCurrentModeWithIndex(FBackgroundIndex);
-    end;
 
     // Create/recreate texture for this resolution
-    WriteLn('>>> Creating graphics texture...');
     CreateGraphicsTexture;
-    WriteLn('>>> Texture created: ', FGraphicsTexture <> nil);
   end;
 
   // Clear the border
-  WriteLn('>>> Clearing border...');
   ClearBorder;
 
   // In graphics mode, render the graphics buffer; in text mode, clear viewport
-  WriteLn('>>> IsInGraphicsMode=', IsInGraphicsMode);
   if IsInGraphicsMode then
-  begin
-    WriteLn('>>> Rendering graphics texture...');
-    RenderGraphicsTexture;
-  end
+    RenderGraphicsTexture
   else
-  begin
-    WriteLn('>>> Clearing viewport (text mode)...');
     ClearViewport;
-  end;
 
-  WriteLn('>>> Presenting...');
   Present;
-  WriteLn('>>> SetGraphicMode DONE');
   Result := True;
 end;
 
@@ -2288,8 +2238,6 @@ var
   ActualIndex: TPaletteIndex;  // Use TPaletteIndex (0..255) to force correct SetPixel overload
   UseIndex: Boolean;
 begin
-  WriteLn('>>> DrawBoxWithColor: X1=', X1, ' Y1=', Y1, ' X2=', X2, ' Y2=', Y2, ' Color=', Color, ' Filled=', Filled);
-  WriteLn('>>> DrawBoxWithColor: ModeInfo.NativeWidth=', FModeInfo.NativeWidth, ' NativeHeight=', FModeInfo.NativeHeight);
   if FGraphicsMemory = nil then Exit;
 
   // For classic modes (0-10), use palette indices directly
@@ -2312,9 +2260,6 @@ begin
       else
         ActualIndex := FForegroundIndex;
     end;
-    WriteLn('>>> DrawBoxWithColor: Classic mode, Color=', Color, ' ActualIndex=', ActualIndex,
-            ' (FG=', FForegroundIndex, ' BG=', FBackgroundIndex,
-            ' MC1=', FMulticolorIndex1, ' MC2=', FMulticolorIndex2, ')');
   end;
 
   // Normalize coordinates
@@ -3565,13 +3510,11 @@ end;
 
 function TConsoleOutputAdapter.SetGraphicMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
 begin
-  WriteLn('>>> TConsoleOutputAdapter.SetGraphicMode: Mode=', Ord(Mode), ' FVideoController=', Assigned(FVideoController));
   // Delegate to VideoController
   if Assigned(FVideoController) then
     Result := FVideoController.SetGraphicMode(Mode, ClearBuffer, SplitLine)
   else
     Result := False;
-  WriteLn('>>> TConsoleOutputAdapter.SetGraphicMode result=', Result);
 end;
 
 function TConsoleOutputAdapter.GetGraphicMode: TGraphicMode;
@@ -4654,12 +4597,10 @@ begin
               end
               else if FProgramMemory.GetLineCount > 0 then
               begin
-                WriteLn('>>> RUN: FProgramMemory.GetLineCount = ', FProgramMemory.GetLineCount);
                 // Get the program source from memory and compile it
                 Lines := FProgramMemory.GetAllLines;
                 try
                   ProgramSource := Lines.Text;
-                  WriteLn('>>> RUN: ProgramSource = ', ProgramSource);
                 finally
                   Lines.Free;
                 end;
@@ -4667,13 +4608,10 @@ begin
                 BytecodeProgram := nil;
                 try
                   // Compile the full program
-                  WriteLn('>>> RUN: Compiling program...');
                   BytecodeProgram := FImmediateCompiler.CompileProgram(ProgramSource);
-                  WriteLn('>>> RUN: Compilation done. BytecodeProgram=', Assigned(BytecodeProgram));
 
                   if not Assigned(BytecodeProgram) then
                   begin
-                    WriteLn('>>> RUN: Compilation FAILED: ', FImmediateCompiler.LastError);
                     {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: Program compilation error: ', FImmediateCompiler.LastError);{$ENDIF}
                     FTextBuffer.PutString('?SYNTAX ERROR IN PROGRAM');
                     FTextBuffer.NewLine;
@@ -4681,18 +4619,9 @@ begin
                   else
                   begin
                     // Execute via VM
-                    WriteLn('>>> RUN: Executing via VM...');
-                    WriteLn('>>> RUN: BytecodeProgram.GetInstructionCount = ', BytecodeProgram.GetInstructionCount);
-
-                    // DEBUG: Disassemble bytecode before execution
-                    WriteLn('>>> RUN: === DISASSEMBLY ===');
-                    WriteLn(TBytecodeDisassembler.Create.Disassemble(BytecodeProgram));
-                    WriteLn('>>> RUN: === END DISASSEMBLY ===');
-
                     try
                       FBytecodeVM.Reset;
                       FBytecodeVM.LoadProgram(BytecodeProgram);
-                      WriteLn('>>> RUN: Calling FBytecodeVM.Run...');
                       if FDebugMode then
                       begin
                         FDebugger.Reset;
@@ -4700,11 +4629,9 @@ begin
                       end
                       else
                         FBytecodeVM.Run;
-                      WriteLn('>>> RUN: FBytecodeVM.Run completed');
                     except
                       on E: Exception do
                       begin
-                        WriteLn('>>> RUN: Exception: ', E.Message);
                         FTextBuffer.PutString('?ERROR IN PROGRAM: ' + E.Message);
                         FTextBuffer.NewLine;
                       end;

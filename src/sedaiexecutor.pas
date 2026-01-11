@@ -1427,9 +1427,6 @@ begin
     Exit;
   end;
 
-  WriteLn('DEBUG: TSedaiExecutor.ExecuteRunStatement called. ProgramMemory assigned=',
-    BoolToStr(Assigned(FProgramMemory), True), ' LineCount=', FProgramMemory.GetLineCount);
-
   try
     try
       // Build AST from program memory - may raise parse exceptions

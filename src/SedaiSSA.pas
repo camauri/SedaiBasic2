@@ -1638,7 +1638,6 @@ begin
           end;
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
-          WriteLn('>>> SSA RGR: Emitting ssaGraphicGetMode, DestReg=', DestReg, ' ArgReg=', ArgReg.RegIndex);
           EmitInstruction(ssaGraphicGetMode, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else if FuncName = 'POS' then
@@ -3745,9 +3744,6 @@ begin
     begin
       TempReg := FProgram.AllocRegister(srtInt);
       ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
-      WriteLn('>>> BOX SSA: param[', i, '] ConstInt=', ParamValues[i].ConstInt,
-              ' -> allocated SSA reg ', TempReg,
-              ' ParamRegs[', i, '].RegIndex=', ParamRegs[i].RegIndex);
       EmitInstruction(ssaLoadConstInt, ParamRegs[i], ParamValues[i],
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end
@@ -3755,15 +3751,11 @@ begin
     begin
       TempReg := FProgram.AllocRegister(srtFloat);
       ParamRegs[i] := MakeSSARegister(srtFloat, TempReg);
-      WriteLn('>>> BOX SSA: param[', i, '] ConstFloat -> allocated SSA reg ', TempReg);
       EmitInstruction(ssaLoadConstFloat, ParamRegs[i], ParamValues[i],
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end
     else if ParamValues[i].Kind = svkRegister then
-    begin
-      ParamRegs[i] := ParamValues[i];
-      WriteLn('>>> BOX SSA: param[', i, '] already register ', ParamValues[i].RegIndex);
-    end
+      ParamRegs[i] := ParamValues[i]
     else
       ParamRegs[i] := MakeSSAValue(svkNone);
   end;
@@ -3774,7 +3766,6 @@ begin
   begin
     TempReg := FProgram.AllocRegister(srtFloat);
     ParamRegs[5] := MakeSSARegister(srtFloat, TempReg);
-    WriteLn('>>> BOX SSA: param[5] angle default -> allocated SSA float reg ', TempReg);
     EmitInstruction(ssaLoadConstFloat, ParamRegs[5], MakeSSAConstFloat(0.0),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
@@ -3784,7 +3775,6 @@ begin
   begin
     TempReg := FProgram.AllocRegister(srtInt);
     ParamRegs[6] := MakeSSARegister(srtInt, TempReg);
-    WriteLn('>>> BOX SSA: param[6] filled default -> allocated SSA int reg ', TempReg);
     EmitInstruction(ssaLoadConstInt, ParamRegs[6], MakeSSAConstInt(0),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
@@ -3801,9 +3791,6 @@ begin
 
   // Add remaining parameters as PhiSources
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
-  WriteLn('>>> BOX SSA PhiSources: x2=', ParamRegs[3].RegIndex, ' y2=', ParamRegs[4].RegIndex,
-          ' angle=', ParamRegs[5].RegIndex, ' filled=', ParamRegs[6].RegIndex,
-          ' fill_color=', ParamRegs[7].RegIndex);
   Instr.AddPhiSource(ParamRegs[3], nil);  // x2
   Instr.AddPhiSource(ParamRegs[4], nil);  // y2
   Instr.AddPhiSource(ParamRegs[5], nil);  // angle

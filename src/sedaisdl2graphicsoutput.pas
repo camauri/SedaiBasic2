@@ -334,14 +334,8 @@ begin
      // Capture current foreground/background colors for hires mode color interpretation
      // Color 1 = foreground, Color 0 = background
      // Use inherited FForegroundColor/FBackgroundColor from TSDL2OutputDevice
-     WriteLn('>>> SetGraphicMode(mtBitmap): FForegroundColor RGB=(',
-             FForegroundColor.R, ',', FForegroundColor.G, ',', FForegroundColor.B, ')');
-     WriteLn('>>> SetGraphicMode(mtBitmap): FBackgroundColor RGB=(',
-             FBackgroundColor.R, ',', FBackgroundColor.G, ',', FBackgroundColor.B, ')');
      FHiresForegroundRGBA := RGBA(FForegroundColor.R, FForegroundColor.G, FForegroundColor.B, 255);
      FHiresBackgroundRGBA := RGBA(FBackgroundColor.R, FBackgroundColor.G, FBackgroundColor.B, 255);
-     WriteLn('>>> SetGraphicMode(mtBitmap): FHiresForegroundRGBA=$', IntToHex(FHiresForegroundRGBA, 8));
-     WriteLn('>>> SetGraphicMode(mtBitmap): FHiresBackgroundRGBA=$', IntToHex(FHiresBackgroundRGBA, 8));
      if IsInitialized then
      begin
        inherited HideCursor(inherited GetCursorX, inherited GetCursorY);
@@ -911,20 +905,15 @@ var
   Style: TShapeStyle;
   ActualColor: UInt32;
 begin
-  WriteLn('>>> DrawBoxWithColor: FCurrentMode=', Ord(FCurrentMode), ' Color=', Color);
-  WriteLn('>>> DrawBoxWithColor: FHiresForegroundRGBA=$', IntToHex(FHiresForegroundRGBA, 8),
-          ' FHiresBackgroundRGBA=$', IntToHex(FHiresBackgroundRGBA, 8));
   // Interpret color based on current graphics mode
   case FCurrentMode of
     gmStandardBitmap, gmSplitBitmap:  // Hires modes (GRAPHIC 1, 2)
     begin
       // In hires mode: 0 = background color, 1 = foreground color
-      WriteLn('>>> DrawBoxWithColor: Hires mode detected');
       if Color = 0 then
         ActualColor := FHiresBackgroundRGBA
       else
         ActualColor := FHiresForegroundRGBA;
-      WriteLn('>>> DrawBoxWithColor: ActualColor=$', IntToHex(ActualColor, 8));
     end;
     gmMulticolorBitmap, gmSplitMulticolor:  // Multicolor modes (GRAPHIC 3, 4)
     begin

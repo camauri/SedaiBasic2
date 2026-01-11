@@ -3152,9 +3152,7 @@ begin
       end;
     15: // bcGraphicGList - GLIST
       begin
-        // List SDL2 video modes
-        WriteLn('[GLIST] Listing SDL2 video modes...');
-        // TODO: Implement actual mode listing via FOutputDevice
+        // List SDL2 video modes - TODO: Implement actual mode listing via FOutputDevice
       end;
     16: // bcGraphicPos - POS(x)
       begin
@@ -3383,7 +3381,6 @@ begin
 
         // TODO: When ISpriteManager is implemented, call:
         // FSpriteManager.SetSprite(SpriteNum, Enabled, Color, Priority, ScaleX, ScaleY, Mode);
-        WriteLn('[SPRITE] n=', SpriteNum, ' enabled=', Enabled, ' color=', Color, ' priority=', Priority);
       end;
 
     1: // bcMovsprAbs
@@ -3395,7 +3392,6 @@ begin
         Y := FFloatRegs[Instr.Dest];  // Dest is repurposed for y
 
         // TODO: FSpriteManager.MoveSpriteAbs(SpriteNum, X, Y);
-        WriteLn('[MOVSPR ABS] n=', SpriteNum, ' x=', X:0:2, ' y=', Y:0:2);
       end;
 
     2: // bcMovsprRel
@@ -3407,7 +3403,6 @@ begin
         Y := FFloatRegs[Instr.Dest];
 
         // TODO: FSpriteManager.MoveSpriteRel(SpriteNum, X, Y);
-        WriteLn('[MOVSPR REL] n=', SpriteNum, ' dx=', X:0:2, ' dy=', Y:0:2);
       end;
 
     3: // bcMovsprPolar
@@ -3419,7 +3414,6 @@ begin
         Angle := FFloatRegs[Instr.Dest];
 
         // TODO: FSpriteManager.MoveSpritePolar(SpriteNum, Dist, Angle);
-        WriteLn('[MOVSPR POLAR] n=', SpriteNum, ' dist=', Dist:0:2, ' angle=', Angle:0:2);
       end;
 
     4: // bcMovsprAuto
@@ -3431,7 +3425,6 @@ begin
         Speed := FFloatRegs[Instr.Dest];
 
         // TODO: FSpriteManager.MoveSpriteAuto(SpriteNum, Angle, Speed);
-        WriteLn('[MOVSPR AUTO] n=', SpriteNum, ' angle=', Angle:0:2, ' speed=', Speed:0:2);
       end;
 
     5: // bcSprcolor
@@ -3445,21 +3438,18 @@ begin
           MC2 := Round(FFloatRegs[Instr.Src2]);
 
         // TODO: FSpriteManager.SetSpriteMulticolors(MC1, MC2);
-        WriteLn('[SPRCOLOR] mc1=', MC1, ' mc2=', MC2);
       end;
 
     6: // bcSprsav
       begin
         // SPRSAV src, dst (save/load sprite data)
         // TODO: Implement sprite data save/load
-        WriteLn('[SPRSAV] Not yet implemented');
       end;
 
     7: // bcCollision
       begin
         // COLLISION type [,line]
         // TODO: FSpriteManager.SetCollisionHandler(Type, LineNumber);
-        WriteLn('[COLLISION] type=', FIntRegs[Instr.Src1]);
       end;
 
     8: // bcBump - function returning collision bitmask
