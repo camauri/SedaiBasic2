@@ -220,5 +220,5 @@
   - InsertPhi: PHI function insertion
   - Rename: Variable renaming
   ============================================================================ }
-{$DEFINE DEBUG_SSA_TIMING}
+{.$DEFINE DEBUG_SSA_TIMING}
 
