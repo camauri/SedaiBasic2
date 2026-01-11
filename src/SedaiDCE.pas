@@ -274,7 +274,8 @@ begin
 
     // Program termination and system state - always live
     ssaEnd, ssaStop, ssaFast, ssaSlow, ssaSleep, ssaClear,
-    ssaTron, ssaTroff:  // TRON/TROFF switch VM execution mode (side effect)
+    ssaTron, ssaTroff,  // TRON/TROFF switch VM execution mode (side effect)
+    ssaTrap, ssaResume, ssaResumeNext:  // Error handling (side effect on VM state)
       Result := True;
 
     // Labels - always live (control flow targets)
@@ -289,7 +290,8 @@ begin
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
     ssaPrintInt, ssaPrintIntLn,
     ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
-    ssaInput, ssaInputInt, ssaInputFloat, ssaInputString:
+    ssaInput, ssaInputInt, ssaInputFloat, ssaInputString,
+    ssaPrintUsing, ssaPudef:
       Result := True;
 
     // DATA/READ/RESTORE - always live (affects DATA pool state)

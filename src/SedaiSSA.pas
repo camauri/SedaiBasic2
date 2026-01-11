@@ -3019,16 +3019,26 @@ begin
         CondValue := MakeSSARegister(srtInt, CmpReg);
       end;
 
-      // WHILE: loop back if condition TRUE
-      // UNTIL: loop back if condition FALSE
+      // WHILE: loop back if condition TRUE, exit if FALSE
+      // UNTIL: loop back if condition FALSE, exit if TRUE
       if IsWhileLoop then
+      begin
         EmitInstruction(ssaJumpIfNotZero, MakeSSALabel(BodyLabel), CondValue,
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // Explicit jump to end when condition is FALSE
+        EmitInstruction(ssaJump, MakeSSALabel(EndLabel), MakeSSAValue(svkNone),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
       else
+      begin
         EmitInstruction(ssaJumpIfZero, MakeSSALabel(BodyLabel), CondValue,
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // Explicit jump to end when condition is TRUE
+        EmitInstruction(ssaJump, MakeSSALabel(EndLabel), MakeSSAValue(svkNone),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
 
-      // Fall through to end
+      // End block - code after the loop continues here
       FCurrentBlock := FProgram.CreateBlock(EndLabel);
     end
     else
@@ -5225,7 +5235,9 @@ procedure TSSAGenerator.ProcessPrintUsing(Node: TASTNode);
 var
   i: Integer;
   FormatVal, ValueVal: TSSAValue;
+  FormatReg, ValueReg: TSSAValue;
   Instr: TSSAInstruction;
+  EndsWithSeparator: Boolean;
 begin
   if FCurrentBlock = nil then Exit;
   if Node.ChildCount < 2 then Exit; // Need at least format and one value
@@ -5234,6 +5246,12 @@ begin
   // Child[0] = format string
   // Child[1..n] = values to print (may include separator nodes)
   ProcessExpression(Node.GetChild(0), FormatVal);
+  // Ensure format is in a string register (constants need to be loaded)
+  FormatReg := EnsureStringRegister(FormatVal);
+
+  // Check if statement ends with separator (suppress newline)
+  EndsWithSeparator := (Node.ChildCount > 1) and
+                       (Node.GetChild(Node.ChildCount - 1).NodeType = antSeparator);
 
   // Emit one instruction per value
   for i := 1 to Node.ChildCount - 1 do
@@ -5242,16 +5260,23 @@ begin
       Continue; // Skip separators
 
     ProcessExpression(Node.GetChild(i), ValueVal);
+    // Ensure value is in a float register (constants need to be loaded)
+    ValueReg := EnsureFloatRegister(ValueVal);
 
-    // Emit PRINT USING with format and value
+    // Emit PRINT USING with format and value (both must be registers)
     Instr := TSSAInstruction.Create(ssaPrintUsing);
     Instr.Dest := MakeSSAValue(svkNone);
-    Instr.Src1 := FormatVal;  // Format string
-    Instr.Src2 := ValueVal;   // Value to format
+    Instr.Src1 := FormatReg;  // Format string register
+    Instr.Src2 := ValueReg;   // Value register
     Instr.Src3 := MakeSSAValue(svkNone);
     Instr.SourceLine := Node.SourceLine;
     FCurrentBlock.AddInstruction(Instr);
   end;
+
+  // Add newline unless statement ends with separator (; or ,)
+  if not EndsWithSeparator then
+    EmitInstruction(ssaPrintNewLine, MakeSSAValue(svkNone),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.ProcessPudef(Node: TASTNode);
@@ -6853,12 +6878,20 @@ begin
     begin
       // TRAP linenum - set error handler line
       // Child[0] = line number expression
+      // NOTE: Pass constant directly to avoid SSA versioning issues
       if Node.ChildCount >= 1 then
       begin
         ProcessExpression(Node.GetChild(0), ExprResult);
-        LineNumReg := EnsureIntRegister(ExprResult);
-        EmitInstruction(ssaTrap, MakeSSAValue(svkNone), LineNumReg,
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // If it's a constant, pass it directly; otherwise use register
+        if ExprResult.Kind = svkConstInt then
+          EmitInstruction(ssaTrap, MakeSSAValue(svkNone), ExprResult,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else
+        begin
+          LineNumReg := EnsureIntRegister(ExprResult);
+          EmitInstruction(ssaTrap, MakeSSAValue(svkNone), LineNumReg,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
       end
       else
       begin
@@ -6869,9 +6902,21 @@ begin
     end;
     antResume:
     begin
-      // RESUME - continue at error line
-      EmitInstruction(ssaResume, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // RESUME [line] - continue at error line or specified line
+      if Node.ChildCount > 0 then
+      begin
+        // RESUME <line> - jump to specific line
+        ProcessExpression(Node.GetChild(0), ExprResult);
+        LineNumReg := EnsureIntRegister(ExprResult);
+        EmitInstruction(ssaResume, MakeSSAValue(svkNone), LineNumReg,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+      begin
+        // Plain RESUME - continue at error line (Src1 = svkNone means use FResumePC)
+        EmitInstruction(ssaResume, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
     end;
     antResumeNext:
     begin

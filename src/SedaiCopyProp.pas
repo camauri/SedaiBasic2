@@ -169,50 +169,36 @@ procedure TCopyPropagation.PropagateCopies;
 var
   Block: TSSABasicBlock;
   Instr: TSSAInstruction;
-  NewInstr: TSSAInstruction;
   i, j: Integer;
   ReplacedVal: TSSAValue;
-  Changed: Boolean;
 begin
-  // Simple single-pass propagation
-  // For each instruction, try to replace register operands with copy sources
-
   for i := 0 to FProgram.Blocks.Count - 1 do
   begin
     Block := FProgram.Blocks[i];
     for j := 0 to Block.Instructions.Count - 1 do
     begin
       Instr := Block.Instructions[j];
-      Changed := False;
-      NewInstr := Instr.Clone;
 
-      // Try to replace Src1
+      // Try to replace Src1 in-place
       if TryReplaceCopy(Instr.Src1, Block, j, ReplacedVal) then
       begin
-        NewInstr.Src1 := ReplacedVal;
-        Changed := True;
+        Instr.Src1 := ReplacedVal;
         Inc(FReplacements);
       end;
 
-      // Try to replace Src2
+      // Try to replace Src2 in-place
       if TryReplaceCopy(Instr.Src2, Block, j, ReplacedVal) then
       begin
-        NewInstr.Src2 := ReplacedVal;
-        Changed := True;
+        Instr.Src2 := ReplacedVal;
         Inc(FReplacements);
       end;
 
-      // Try to replace Src3
+      // Try to replace Src3 in-place
       if TryReplaceCopy(Instr.Src3, Block, j, ReplacedVal) then
       begin
-        NewInstr.Src3 := ReplacedVal;
-        Changed := True;
+        Instr.Src3 := ReplacedVal;
         Inc(FReplacements);
       end;
-
-      // Update instruction if any source was changed
-      if Changed then
-        Block.Instructions[j] := NewInstr;
     end;
   end;
 end;

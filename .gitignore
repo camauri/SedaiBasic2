@@ -43,6 +43,7 @@ presentation.zip
 README_AI.md
 ChangeLog.md
 SedaiBasic2Tester.*
+/bas/test*.bas
 
 # Lazarus session files
 *.lps
@@ -63,6 +64,8 @@ nul
 
 # Test output
 *.log
+debug_log.txt
+log.txt
 nul
 
 # File troppo grandi per GitHub

@@ -609,6 +609,28 @@ begin
   PreNum := 0;
   InitialDFS(FEntry, PreNum);
 
+  // Step 1b: Include any blocks not reachable via DFS (e.g. TRAP handlers)
+  // These blocks have no predecessors but must be included for programs with TRAP
+  for Block in Prog.Blocks do
+  begin
+    Node := GetNode(Block);
+    if Node.Preorder < 0 then  // Not yet visited via DFS
+    begin
+      {$IFDEF DEBUG_DOMTREE}
+      if DebugDomTree then
+        WriteLn('[DominatorTree] Adding unreachable block to preorder list: ', Block.LabelName);
+      {$ENDIF}
+      // Add as secondary entry (idom = itself like entry)
+      Node.Preorder := PreNum;
+      Inc(PreNum);
+      Node.Idom := Block;  // Self as idom (like entry)
+      SetNode(Block, Node);
+      FPreorderList.Add(Block);
+      // Also DFS from this block to include its successors
+      InitialDFS(Block, PreNum);
+    end;
+  end;
+
   {$IFDEF DEBUG_DOMTREE}
   if DebugDomTree then
     WriteLn(Format('[DominatorTree] DFS collected %d reachable blocks', [FPreorderList.Count]));
@@ -833,7 +855,9 @@ var
   SeenSuccs: TFPList;    // Temp list for duplicate check
   i, j, k: Integer;
   LastInstr: TSSAInstruction;
+  Instr: TSSAInstruction;
   Found: Boolean;
+  HasTrap: Boolean;
 
   procedure SetError(ErrType: TCFGValidationError; ErrBlock: TSSABasicBlock; const Msg: string);
   begin
@@ -887,12 +911,58 @@ begin
     WriteLn('[ValidateCFG] Entry block: ', Entry.LabelName);
   {$ENDIF}
 
+  { Check if program contains TRAP instructions - if so, allow blocks without predecessors
+    because TRAP handlers are invoked dynamically and not reachable via static CFG }
+  HasTrap := False;
+  for i := 0 to Prog.Blocks.Count - 1 do
+  begin
+    Block := Prog.Blocks[i];
+    for j := 0 to Block.Instructions.Count - 1 do
+    begin
+      Instr := Block.Instructions[j];
+      if Instr.OpCode = ssaTrap then
+      begin
+        HasTrap := True;
+        Break;
+      end;
+    end;
+    if HasTrap then Break;
+  end;
+
+  {$IFDEF DEBUG_DOMTREE}
+  if DebugDomTree and HasTrap then
+    WriteLn('[ValidateCFG] Program contains TRAP - allowing blocks without predecessors');
+  {$ENDIF}
+
   { ===== CHECK 2: Single entry (no other blocks with zero predecessors) ===== }
+  { Exception: blocks marked as TRAP handlers (prefixed with _trap_handler_) are
+    allowed as secondary entry points because they are invoked dynamically.
+    Also skip this check entirely if program contains TRAP instructions. }
   for i := 1 to Prog.Blocks.Count - 1 do
   begin
     Block := Prog.Blocks[i];
     if Assigned(Block) and (Block.Predecessors.Count = 0) then
     begin
+      // If program has TRAP, allow all blocks without predecessors
+      if HasTrap then
+      begin
+        {$IFDEF DEBUG_DOMTREE}
+        if DebugDomTree then
+          WriteLn('[ValidateCFG] Allowing block without predecessors (TRAP in program): ', Block.LabelName);
+        {$ENDIF}
+        Continue;
+      end;
+
+      // Allow TRAP handler blocks as exception entry points
+      if Block.LabelName.StartsWith('_trap_handler_') then
+      begin
+        {$IFDEF DEBUG_DOMTREE}
+        if DebugDomTree then
+          WriteLn('[ValidateCFG] Allowing TRAP handler block without predecessors: ', Block.LabelName);
+        {$ENDIF}
+        Continue;
+      end;
+
       SetError(cfgErrMultipleEntries, Block,
         Format('Multiple entry points: Block "%s" has no predecessors (only entry should have none)',
           [Block.LabelName]));
@@ -1096,8 +1166,9 @@ begin
 
     { Valid terminators }
     { Note: ssaCall (GOSUB) has 2 successors: call target + return point }
+    { Note: ssaTrap can have 2 successors: normal flow + error handler }
     if not (LastInstr.OpCode in [ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
-                                  ssaReturn, ssaEnd, ssaStop, ssaCall]) then
+                                  ssaReturn, ssaEnd, ssaStop, ssaCall, ssaTrap]) then
     begin
       { Block doesn't end with terminator - must have exactly 1 successor (fallthrough) }
       if Block.Successors.Count > 1 then

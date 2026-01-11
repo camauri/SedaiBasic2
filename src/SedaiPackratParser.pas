@@ -2386,8 +2386,17 @@ begin
       Result := TASTNode.Create(antResumeNext, Token);
       Context.Advance; // Consume NEXT
     end
+    // Check for line number (RESUME <line>)
+    else if Context.Check(ttNumber) then
+    begin
+      Result := TASTNode.Create(antResume, Token);
+      LineNumNode := ParseExpression;
+      if Assigned(LineNumNode) then
+        Result.AddChild(LineNumNode);
+    end
     else
     begin
+      // Plain RESUME - resume at error line
       Result := TASTNode.Create(antResume, Token);
     end;
   end

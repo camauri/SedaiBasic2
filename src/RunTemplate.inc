@@ -38,6 +38,8 @@ var
   LFirstVal: Int64;
   // Local copy of TrueValue for comparison operators
   TrueVal: Int64;
+  // Flag for TRAP handler jump (can't use goto from except block)
+  TrapTriggered: Boolean;
 begin
   if FProgram = nil then raise Exception.Create('No program loaded');
 
@@ -67,8 +69,10 @@ begin
   {$R-}  // Range checking off
   {$Q-}  // Overflow checking off
 
-  try
-  while FRunning and (CurPC < InstrCount) do
+  repeat
+    TrapTriggered := False;
+    try
+    while FRunning and (CurPC < InstrCount) do
   begin
     Instr := Instructions[CurPC];
     Op := Instr.OpCode;
@@ -141,7 +145,7 @@ begin
         31: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] - FloatRegs[Instr.Src1]; Inc(CurPC); end; // bcSubFloatTo
         32: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] * FloatRegs[Instr.Src1]; Inc(CurPC); end; // bcMulFloatTo
         33: begin // bcDivFloatTo
-          if FloatRegs[Instr.Src1] = 0 then
+          if Abs(FloatRegs[Instr.Src1]) < 1e-300 then
             raise EZeroDivide.Create('Division by zero');
           FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] / FloatRegs[Instr.Src1];
           Inc(CurPC);
@@ -157,7 +161,7 @@ begin
         51: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] - Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end; // bcSubFloatConst
         52: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end; // bcMulFloatConst
         53: begin // bcDivFloatConst
-          if Double(Pointer(@Instr.Immediate)^) = 0 then
+          if Abs(Double(Pointer(@Instr.Immediate)^)) < 1e-300 then
             raise EZeroDivide.Create('Division by zero');
           FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / Double(Pointer(@Instr.Immediate)^);
           Inc(CurPC);
@@ -241,7 +245,7 @@ begin
         end;
         112: begin // bcArrayLoadDivAddFloat: dest = acc + arr[idx] / denom
           // Extra encodes: acc_reg (low 16) + denom_reg (high 16)
-          if FloatRegs[(Instr.Immediate shr 16) and $FFFF] = 0 then
+          if Abs(FloatRegs[(Instr.Immediate shr 16) and $FFFF]) < 1e-300 then
             raise EZeroDivide.Create('Division by zero');
           FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate and $FFFF] +
             FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]] / FloatRegs[(Instr.Immediate shr 16) and $FFFF];
@@ -390,7 +394,7 @@ begin
         bcSubFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] - FloatRegs[Instr.Src2]; Inc(CurPC); end;
         bcMulFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2]; Inc(CurPC); end;
         bcDivFloat: begin
-          if FloatRegs[Instr.Src2] = 0 then
+          if FloatRegs[Instr.Src2] = 0.0 then
             raise EZeroDivide.Create('Division by zero');
           FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / FloatRegs[Instr.Src2];
           Inc(CurPC);
@@ -654,6 +658,83 @@ begin
             CurPC := FPC + 1;
           end;
 
+        // System commands - fall back to slow path
+        bcFast, bcSlow, bcSleep, bcKey:
+          begin
+            FPC := CurPC;
+            ExecuteInstruction(Instr);
+            CurPC := FPC + 1;
+          end;
+
+        // Error handling
+        bcTrap:
+          begin
+            // TRAP linenum - Set error handler line
+            // If Immediate >= 0, use it directly (constant line number)
+            // If Immediate = -1, use register R[Src1] (variable line number)
+            if Instr.Immediate >= 0 then
+              FTrapLine := Instr.Immediate
+            else
+              FTrapLine := IntRegs[Instr.Src1];
+            if FTrapLine > 0 then
+              FTrapPC := -1  // Will be resolved when error occurs
+            else
+            begin
+              // TRAP 0 - Disable trap handler
+              FTrapLine := 0;
+              FTrapPC := -1;
+            end;
+            Inc(CurPC);
+          end;
+        bcResume:
+          begin
+            // RESUME [line] - Resume at error line or specified line
+            if FInErrorHandler then
+            begin
+              // Check if Src1 contains a line number (non-zero register = line number)
+              if Instr.Src1 <> 0 then
+              begin
+                // RESUME <line> - jump to specified line
+                CurPC := FProgram.FindPCForLine(IntRegs[Instr.Src1]);
+                if CurPC < 0 then
+                  CurPC := InstrCount;  // Line not found - end program
+              end
+              else if FResumePC >= 0 then
+              begin
+                // Plain RESUME - jump back to error line
+                CurPC := FResumePC;
+              end
+              else
+              begin
+                Inc(CurPC);
+                FInErrorHandler := False;
+                System.Continue;
+              end;
+              FInErrorHandler := False;
+              // NOTE: Must use System.Continue to get loop control, NOT Self.Continue method!
+              System.Continue;  // Jump to resume PC immediately
+            end
+            else
+              Inc(CurPC);
+          end;
+        bcResumeNext:
+          begin
+            // RESUME NEXT - Resume at next BASIC line after the one that caused the error
+            if FInErrorHandler and (FLastErrorLine > 0) then
+            begin
+              // Find the first instruction of the NEXT BASIC line after the error line
+              // This is the correct semantics: RESUME NEXT skips to the next BASIC statement
+              CurPC := FProgram.FindPCAfterLine(FLastErrorLine);
+              if CurPC < 0 then
+                CurPC := InstrCount;  // No more lines - end program
+              FInErrorHandler := False;
+              // NOTE: Must use System.Continue to get loop control, NOT Self.Continue method!
+              System.Continue;  // Jump to new PC immediately
+            end
+            else
+              Inc(CurPC);
+          end;
+
         // File and system operations - fall back to slow path
         bcLoad, bcSave, bcVerify, bcBload, bcBsave, bcBoot,
         bcRun, bcList, bcNew, bcCatalog:
@@ -686,8 +767,9 @@ begin
   except
     on E: Exception do
     begin
-      // Check if a TRAP handler is set
-      if FTrapLine > 0 then
+      // Check if a TRAP handler is set and we're not already in an error handler
+      // (to prevent infinite recursion if exception occurs during error handling)
+      if (FTrapLine > 0) and (not FInErrorHandler) then
       begin
         // Save error info for EL, ER, ERR$ variables
         FLastErrorLine := Instr.SourceLine;
@@ -716,17 +798,11 @@ begin
         FTrapPC := FProgram.FindPCForLine(FTrapLine);
         if FTrapPC >= 0 then
         begin
-          // Jump to error handler
+          // Jump to error handler - set flag to re-enter loop
           CurPC := FTrapPC;
           FPC := CurPC;
-          // Continue execution from trap handler
           FRunning := True;
-          {$IFDEF DEBUG_MODE}
-          RunDebug;
-          {$ELSE}
-          RunFast;
-          {$ENDIF}
-          Exit;
+          TrapTriggered := True;  // Will restart the loop
         end
         else
         begin
@@ -740,6 +816,7 @@ begin
         raise;
     end;
   end;
+  until not TrapTriggered;  // Restart loop if TRAP handler was triggered
 
   {$POP}  // Restore range/overflow checking
 

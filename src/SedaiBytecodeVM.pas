@@ -202,6 +202,7 @@ type
     function GetInstructionsExecuted: Int64;
     property InstructionsExecuted: Int64 read FInstructionsExecuted;
     {$ENDIF}
+    function FindPCForSourceLine(SourceLine: Integer): Integer;
     {$IFDEF ENABLE_PROFILER}
     procedure SetProfiler(AProfiler: TProfiler);
     property Profiler: TProfiler read FProfiler write FProfiler;
@@ -493,53 +494,143 @@ end;
 
 function TBytecodeVM.FormatUsingString(const FormatStr: string; Value: Double): string;
 var
-  i, HashCount, DecimalPos, CommaPos: Integer;
-  FloatDollar: Boolean;
-  IntPart, DecPart: Integer;
-  FormattedValue: string;
+  i, j, TotalWidth, IntDigits, DecDigits: Integer;
+  HasDollar, FloatDollar, HasCommas, IsNegative: Boolean;
+  IntPart, FormattedInt, FormattedDec: string;
+  AbsValue: Double;
+  DollarChar, DecimalChar, FillerChar: Char;
 begin
-  // Parse format string to extract format parameters
-  // Format: "#$######.##" where # = digit placeholder
-  HashCount := 0;
-  DecimalPos := 0;
-  CommaPos := 0;
-  FloatDollar := False;
+  // PUDEF characters: FPudefFiller, FPudefComma, FPudefDecimal, FPudefDollar
+  DollarChar := FPudefDollar;
+  DecimalChar := FPudefDecimal;
+  FillerChar := FPudefFiller;
 
-  for i := 1 to Length(FormatStr) do
+  // Parse format string
+  // Format examples: "######.##", "#$####.##" (floating $), "###,###.##" (with commas)
+  TotalWidth := 0;
+  IntDigits := 0;
+  DecDigits := 0;
+  HasDollar := False;
+  FloatDollar := False;
+  HasCommas := False;
+
+  // Count format characters
+  i := 1;
+  while i <= Length(FormatStr) do
   begin
-    if FormatStr[i] = '#' then
-      Inc(HashCount)
-    else if (FormatStr[i] = '.') or (FormatStr[i] = FPudefDecimal) then
-    begin
-      if DecimalPos = 0 then DecimalPos := HashCount;
-    end
-    else if (FormatStr[i] = ',') or (FormatStr[i] = FPudefComma) then
-      CommaPos := HashCount
-    else if (FormatStr[i] = '$') or (FormatStr[i] = FPudefDollar) then
-      FloatDollar := (i > 1) and (FormatStr[i-1] = '#');
+    case FormatStr[i] of
+      '#': begin
+        Inc(TotalWidth);
+        Inc(IntDigits);
+      end;
+      '$': begin
+        HasDollar := True;
+        // Floating dollar if preceded by #
+        if (i > 1) and (FormatStr[i-1] = '#') then
+        begin
+          FloatDollar := True;
+          Dec(IntDigits); // One # is for dollar position
+        end;
+      end;
+      '.': begin
+        // Count decimal digits after the dot
+        DecDigits := 0;
+        j := i + 1;
+        while (j <= Length(FormatStr)) and (FormatStr[j] = '#') do
+        begin
+          Inc(DecDigits);
+          Inc(j);
+        end;
+        IntDigits := IntDigits;  // IntDigits already counted
+        i := j - 1;  // Skip to end of decimals
+      end;
+      ',': HasCommas := True;
+    end;
+    Inc(i);
   end;
 
-  // Calculate decimal places
-  DecPart := HashCount - DecimalPos;
-  if DecimalPos = 0 then
-    DecPart := 0;
-  IntPart := HashCount - DecPart;
+  // Handle sign
+  IsNegative := Value < 0;
+  AbsValue := Abs(Value);
 
-  // Format the value
-  if DecPart > 0 then
-    FormattedValue := Format('%*.*f', [HashCount + 1, DecPart, Value])
+  // Format decimal part
+  if DecDigits > 0 then
+  begin
+    FormattedDec := Format('%.*f', [DecDigits, Frac(AbsValue)]);
+    // Remove leading "0." from decimal part
+    if Length(FormattedDec) > 2 then
+      FormattedDec := Copy(FormattedDec, 3, Length(FormattedDec) - 2)
+    else
+      FormattedDec := StringOfChar('0', DecDigits);
+  end
   else
-    FormattedValue := Format('%*d', [IntPart, Trunc(Value)]);
+    FormattedDec := '';
 
-  // Replace decimal and comma characters based on PUDEF
-  if FPudefDecimal <> '.' then
-    FormattedValue := StringReplace(FormattedValue, '.', FPudefDecimal, [rfReplaceAll]);
+  // Format integer part
+  IntPart := IntToStr(Trunc(AbsValue));
 
-  // Add floating dollar sign if requested
+  // Add thousand separators if requested
+  if HasCommas then
+  begin
+    FormattedInt := '';
+    j := 0;
+    for i := Length(IntPart) downto 1 do
+    begin
+      if (j > 0) and (j mod 3 = 0) then
+        FormattedInt := FPudefComma + FormattedInt;
+      FormattedInt := IntPart[i] + FormattedInt;
+      Inc(j);
+    end;
+  end
+  else
+    FormattedInt := IntPart;
+
+  // Build result
+  if DecDigits > 0 then
+    Result := FormattedInt + DecimalChar + FormattedDec
+  else
+    Result := FormattedInt;
+
+  // Add negative sign if needed
+  if IsNegative then
+    Result := '-' + Result;
+
+  // Calculate target width (IntDigits + decimal point + DecDigits)
+  if DecDigits > 0 then
+    TotalWidth := IntDigits + 1 + DecDigits
+  else
+    TotalWidth := IntDigits;
+
+  // Handle floating dollar: dollar takes one position
   if FloatDollar then
-    FormattedValue := FPudefDollar + FormattedValue;
+    Inc(TotalWidth);
 
-  Result := FormattedValue;
+  // Pad to width with filler
+  if Length(Result) < TotalWidth then
+    Result := StringOfChar(FillerChar, TotalWidth - Length(Result)) + Result;
+
+  // Insert floating dollar sign (replaces leftmost filler)
+  if FloatDollar then
+  begin
+    // Find first non-filler position
+    for i := 1 to Length(Result) do
+    begin
+      if Result[i] <> FillerChar then
+      begin
+        // Insert dollar just before first digit
+        if i > 1 then
+          Result[i-1] := DollarChar
+        else
+          Result := DollarChar + Result;
+        Break;
+      end;
+    end;
+  end
+  else if HasDollar and not FloatDollar then
+  begin
+    // Fixed dollar at start
+    Result := DollarChar + Result;
+  end;
 end;
 
 {$IFDEF WITH_SEDAI_AUDIO}
@@ -1265,6 +1356,25 @@ begin
 end;
 {$ENDIF}
 
+function TBytecodeVM.FindPCForSourceLine(SourceLine: Integer): Integer;
+var
+  i: Integer;
+begin
+  // Find the first instruction with the given source line
+  Result := -1;
+  for i := 0 to FProgram.GetInstructionCount - 1 do
+  begin
+    if FProgram.GetInstruction(i).SourceLine = SourceLine then
+    begin
+      Result := i;
+      Exit;
+    end;
+  end;
+  // If exact line not found, return 0 (start of program)
+  if Result < 0 then
+    Result := 0;
+end;
+
 {$IFDEF ENABLE_PROFILER}
 procedure TBytecodeVM.SetProfiler(AProfiler: TProfiler);
 begin
@@ -1388,7 +1498,7 @@ begin
       end;
     bcDivFloat:
       begin
-        if FFloatRegs[Instr.Src2] <> 0.0 then
+        if Abs(FFloatRegs[Instr.Src2]) >= 1e-300 then
         begin
           FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] / FFloatRegs[Instr.Src2];
           {$IFDEF DEBUG_FLOAT_CHECKS}
@@ -1396,7 +1506,7 @@ begin
           {$ENDIF}
         end
         else
-          raise Exception.Create('Division by zero');
+          raise EZeroDivide.Create('Division by zero');
       end;
     bcPowFloat: FFloatRegs[Instr.Dest] := Power(FFloatRegs[Instr.Src1], FFloatRegs[Instr.Src2]);
     bcNegFloat: FFloatRegs[Instr.Dest] := -FFloatRegs[Instr.Src1];
@@ -1537,8 +1647,12 @@ begin
     bcTrap:
       begin
         // TRAP linenum - Set error handler line
-        // Src1 = line number (0 to disable)
-        FTrapLine := FIntRegs[Instr.Src1];
+        // If Immediate >= 0, use it directly (constant line number)
+        // If Immediate = -1, use register R[Src1] (variable line number)
+        if Instr.Immediate >= 0 then
+          FTrapLine := Instr.Immediate
+        else
+          FTrapLine := FIntRegs[Instr.Src1];
         if FTrapLine > 0 then
         begin
           // Resolve line number to PC
@@ -1555,10 +1669,24 @@ begin
       end;
     bcResume:
       begin
-        // RESUME - Resume at error line
-        if FInErrorHandler and (FResumePC >= 0) then
+        // RESUME [line] - Resume at error line or specified line
+        if FInErrorHandler then
         begin
-          FPC := FResumePC;
+          if Instr.Immediate > 0 then
+          begin
+            // RESUME <line> with constant line number in Immediate
+            FPC := FindPCForSourceLine(Instr.Immediate);
+          end
+          else if Instr.Src1 > 0 then
+          begin
+            // RESUME <line> with line number in register
+            FPC := FindPCForSourceLine(FIntRegs[Instr.Src1]);
+          end
+          else if FResumePC >= 0 then
+          begin
+            // Plain RESUME - resume at error line
+            FPC := FResumePC;
+          end;
           FInErrorHandler := False;
           Exit;  // Don't increment PC
         end;
@@ -1569,9 +1697,10 @@ begin
         // RESUME NEXT - Resume at next instruction after error
         if FInErrorHandler and (FResumePC >= 0) then
         begin
-          // Find the next instruction after the error point
-          // For now, we just continue from current PC
+          // Jump to the instruction AFTER the one that caused the error
+          FPC := FResumePC + 1;
           FInErrorHandler := False;
+          Exit;  // Don't increment PC - we already set it
         end;
         // If not in error handler, just continue
       end;
@@ -2316,8 +2445,14 @@ begin
         if not TryStrToFloat(S, FFloatRegs[Instr.Dest]) then
           FFloatRegs[Instr.Dest] := 0.0;
       end;
-    9: // bcStrHex - HEX$(n)
-      FStringRegs[Instr.Dest] := IntToHex(FIntRegs[Instr.Src1] and $FFFF, 4);
+    9: // bcStrHex - HEX$(n) - full INT64 range, no leading zeros
+      begin
+        S := IntToHex(FIntRegs[Instr.Src1], 1);  // Minimum 1 digit
+        // IntToHex with digits=1 still pads, so trim leading zeros
+        while (Length(S) > 1) and (S[1] = '0') do
+          Delete(S, 1, 1);
+        FStringRegs[Instr.Dest] := S;
+      end;
     10: // bcStrInstr - INSTR(haystack, needle [,start])
       begin
         // Src1 = haystack, Src2 = needle, Immediate = start position (1-based)
@@ -2428,10 +2563,10 @@ begin
       begin
         ArrayIdx := Instr.Src1;
         if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
-          raise Exception.CreateFmt('Array not allocated: %d', [ArrayIdx]);
+          raise ERangeError.CreateFmt('Array not allocated: %d', [ArrayIdx]);
         LinearIdx := FIntRegs[Instr.Src2];
         if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
-          raise Exception.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
+          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
         case FArrays[ArrayIdx].ElementType of
           0: FIntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
           1: FFloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
@@ -2442,10 +2577,10 @@ begin
       begin
         ArrayIdx := Instr.Src1;
         if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
-          raise Exception.CreateFmt('Array not allocated: %d', [ArrayIdx]);
+          raise ERangeError.CreateFmt('Array not allocated: %d', [ArrayIdx]);
         LinearIdx := FIntRegs[Instr.Src2];
         if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
-          raise Exception.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
+          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
         case FArrays[ArrayIdx].ElementType of
           0: FArrays[ArrayIdx].IntData[LinearIdx] := FIntRegs[Instr.Dest];
           1: FArrays[ArrayIdx].FloatData[LinearIdx] := FFloatRegs[Instr.Dest];
@@ -2508,6 +2643,8 @@ begin
       begin
         ArrayIdx := Instr.Src1;
         LinearIdx := FIntRegs[Instr.Src2];
+        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
+          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
         FIntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
         {$IFDEF ENABLE_PROFILER}
         if Assigned(FProfiler) and FProfiler.Enabled then
@@ -2518,6 +2655,8 @@ begin
       begin
         ArrayIdx := Instr.Src1;
         LinearIdx := FIntRegs[Instr.Src2];
+        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
+          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
         FFloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
         {$IFDEF ENABLE_PROFILER}
         if Assigned(FProfiler) and FProfiler.Enabled then
@@ -2528,6 +2667,8 @@ begin
       begin
         ArrayIdx := Instr.Src1;
         LinearIdx := FIntRegs[Instr.Src2];
+        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
+          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
         FStringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
         {$IFDEF ENABLE_PROFILER}
         if Assigned(FProfiler) and FProfiler.Enabled then
@@ -2538,6 +2679,8 @@ begin
       begin
         ArrayIdx := Instr.Src1;
         LinearIdx := FIntRegs[Instr.Src2];
+        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
+          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
         FArrays[ArrayIdx].IntData[LinearIdx] := FIntRegs[Instr.Dest];
         {$IFDEF ENABLE_PROFILER}
         if Assigned(FProfiler) and FProfiler.Enabled then
@@ -2548,6 +2691,8 @@ begin
       begin
         ArrayIdx := Instr.Src1;
         LinearIdx := FIntRegs[Instr.Src2];
+        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
+          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
         FArrays[ArrayIdx].FloatData[LinearIdx] := FFloatRegs[Instr.Dest];
         {$IFDEF ENABLE_PROFILER}
         if Assigned(FProfiler) and FProfiler.Enabled then
@@ -2558,6 +2703,8 @@ begin
       begin
         ArrayIdx := Instr.Src1;
         LinearIdx := FIntRegs[Instr.Src2];
+        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
+          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
         FArrays[ArrayIdx].StringData[LinearIdx] := FStringRegs[Instr.Dest];
         {$IFDEF ENABLE_PROFILER}
         if Assigned(FProfiler) and FProfiler.Enabled then
@@ -2673,35 +2820,29 @@ begin
     8: // bcPrintTab
       if Assigned(FOutputDevice) then
       begin
+        // TAB(n) positions cursor at column n (0-indexed)
+        // TAB(0) = first column, TAB(20) = 21st column
+        // If cursor is already at or past column n, do nothing (no wrap)
         NextTabCol := FIntRegs[Instr.Src1];
-        if NextTabCol < 1 then NextTabCol := 1;
-        Dec(NextTabCol);
-        if FCursorCol < NextTabCol then
+        if NextTabCol < 0 then NextTabCol := 0;
+        // Only move forward if we're before the target column
+        while FCursorCol < NextTabCol do
         begin
-          while FCursorCol < NextTabCol do
-          begin
-            FOutputDevice.Print(' ');
-            Inc(FCursorCol);
-          end;
-        end
-        else if FCursorCol > NextTabCol then
-        begin
-          FOutputDevice.NewLine;
-          FCursorCol := 0;
-          while FCursorCol < NextTabCol do
-          begin
-            FOutputDevice.Print(' ');
-            Inc(FCursorCol);
-          end;
+          FOutputDevice.Print(' ');
+          Inc(FCursorCol);
         end;
+        // If FCursorCol >= NextTabCol, do nothing (as per C128 behavior)
       end;
     9: // bcPrintSpc
       if Assigned(FOutputDevice) then
       begin
-        for TabIdx := 1 to FIntRegs[Instr.Src1] do
+        // Src1 = register containing space count (always a register from SSA)
+        TabIdx := FIntRegs[Instr.Src1];
+        while TabIdx > 0 do
         begin
           FOutputDevice.Print(' ');
           Inc(FCursorCol);
+          Dec(TabIdx);
         end;
       end;
     10: // bcPrintNewLine
@@ -3017,11 +3158,9 @@ begin
       end;
     16: // bcGraphicPos - POS(x)
       begin
-        // Return cursor column position
-        if Assigned(FOutputDevice) then
-          FIntRegs[Instr.Dest] := FOutputDevice.GetCursorX
-        else
-          FIntRegs[Instr.Dest] := 0;
+        // Return cursor column position (0-indexed, consistent with TAB)
+        // Use FCursorCol which is tracked by the VM during PRINT operations
+        FIntRegs[Instr.Dest] := FCursorCol;
       end;
     17: // bcGraphicRclr - RCLR(n)
       if Assigned(FOutputDevice) then

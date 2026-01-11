@@ -260,6 +260,14 @@ begin
       Line := Format('%4d: %-20s R%d', [Index, 'StoreTI$', Instr.Src1]);
     bcLoadDTS:
       Line := Format('%4d: %-20s R%d', [Index, 'LoadDT$', Instr.Dest]);
+    bcFre:
+      Line := Format('%4d: %-20s R%d', [Index, 'FRE', Instr.Dest]);
+    bcLoadEL:
+      Line := Format('%4d: %-20s R%d', [Index, 'LoadEL', Instr.Dest]);
+    bcLoadER:
+      Line := Format('%4d: %-20s R%d', [Index, 'LoadER', Instr.Dest]);
+    bcLoadERRS:
+      Line := Format('%4d: %-20s R%d', [Index, 'LoadERR$', Instr.Dest]);
 
     // === GROUP 10: GRAPHICS (0x0Axx) ===
     bcGraphicRGBA:
@@ -350,10 +358,25 @@ begin
       Line := Format('%4d: %-20s R%d', [Index, 'Get', Instr.Dest]);
     bcGetkey:
       Line := Format('%4d: %-20s R%d', [Index, 'Getkey', Instr.Dest]);
+    bcPrintUsing:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'PrintUsing', Instr.Src1, Instr.Src2]);
+    bcPudef:
+      Line := Format('%4d: %-20s R%d', [Index, 'Pudef', Instr.Src1]);
+    bcChar:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'Char', Instr.Src1, Instr.Src2, Instr.Dest]);
     bcTron:
       Line := Format('%4d: %-20s', [Index, 'Tron']);
     bcTroff:
       Line := Format('%4d: %-20s', [Index, 'Troff']);
+    bcTrap:
+      if Instr.Immediate >= 0 then
+        Line := Format('%4d: %-20s %d', [Index, 'Trap', Instr.Immediate])
+      else
+        Line := Format('%4d: %-20s R%d', [Index, 'Trap', Instr.Src1]);
+    bcResume:
+      Line := Format('%4d: %-20s', [Index, 'Resume']);
+    bcResumeNext:
+      Line := Format('%4d: %-20s', [Index, 'ResumeNext']);
     bcDataReadInt:
       Line := Format('%4d: %-20s R%d', [Index, 'DataReadInt', Instr.Dest]);
     bcDataReadFloat:

@@ -70,29 +70,53 @@ type
     property Count: Integer read FCount;
   end;
 
+  { Variable info record for fast O(1) lookup by integer key }
+  PVarInfo = ^TVarInfo;
+  TVarInfo = record
+    RegType: TSSARegisterType; // Register type (for PHI placement)
+    RegIndex: Integer;         // Register index (for PHI placement)
+    // Use inline arrays instead of TFPList - much cheaper allocation
+    DefBlocks: array of TSSABasicBlock;  // Blocks where this variable is defined
+    DefBlockCount: Integer;              // Number of entries in DefBlocks
+    UseBlockCount: Integer;              // Number of blocks with uses (for IsLiveAt check)
+    DefBlockOffset: Integer;   // Offset into FBoolPool for DefBlockSet (FBlockCount booleans)
+    UseBlockOffset: Integer;   // Offset into FBoolPool for UseBlockSet (FBlockCount booleans)
+    VersionCounter: Integer;   // Next version number
+    LastVersion: Integer;      // Last assigned version (fallback)
+    VersionStack: TIntegerStack; // Stack of versions for scoped semantics
+  end;
+
   { SSA Construction - converts non-SSA IR to proper SSA with PHI functions }
   TSSAConstruction = class
   private
     FProgram: TSSAProgram;
     FDomTree: TDominatorTree;
 
-    // Dominance Frontier: Block → List of blocks in its DF
-    FDomFrontier: TFPList;  // List of TBlockDFEntry
+    // Dominance Frontier: indexed by block position for O(1) lookup
+    // Uses Block.BlockIndex for direct array access (no hash lookup)
+    FDomFrontier: array of TFPList;  // FDomFrontier[blockIndex] = list of DF blocks
+    FDomFrontierSet: array of array of Boolean;  // O(1) check: FDomFrontierSet[blockIdx, dfBlockIdx]
+    FBlockCount: Integer;
 
-    // Variable Definitions: "RegType:RegIndex" → List of blocks where defined
-    FDefs: TStringList;  // Key=VarKey, Object=TFPList of blocks
+    // Pre-allocated work arrays for PlacePhiForVariable (avoid 765+ allocations)
+    FPhiWorkList: array of TSSABasicBlock;  // Inline array worklist (no TFPList overhead!)
+    FPhiWorkListCount: Integer;              // Current worklist size
+    FPhiBlockSet: array of Integer;  // Version-based set (avoids 765 FillChar calls!)
+    FPhiBlockVersion: Integer;       // Current version number
 
-    // Variable Uses: "RegType:RegIndex" → List of blocks where used (for Semi-Pruned SSA)
-    FUses: TStringList;  // Key=VarKey, Object=TFPList of blocks
+    // Pre-allocated boolean pool for DefBlockSet/UseBlockSet
+    // Instead of 765+ individual SetLength calls, we allocate ONE big array
+    // and give each variable an offset into it
+    FBoolPool: array of Boolean;     // Pool: 2 * MaxVars * FBlockCount booleans
+    FBoolPoolNextOffset: Integer;    // Next available offset in pool
 
-    // Version Counter: "RegType:RegIndex" → next version number
-    FVersionCounter: TStringList;  // Key=VarKey, Object=Integer as pointer
-
-    // Version Stack: "RegType:RegIndex" → stack of versions
-    FVersionStack: TStringList;  // Key=VarKey, Object=TIntegerStack
-
-    // Last Assigned Version: "RegType:RegIndex" → last version assigned (used as fallback when stack is empty)
-    FLastVersion: TStringList;  // Key=VarKey, Object=Integer as pointer
+    // Variable info: array of all variables
+    FVarInfo: array of TVarInfo;
+    FVarInfoCount: Integer;
+    // Direct O(1) lookup: FVarLookup[RegType, RegIndex] = index+1 in FVarInfo (0 = not found)
+    // Uses 2D array indexed by RegType (0-2) and RegIndex (0-MaxReg)
+    FVarLookup: array[0..2] of array of Integer;  // 3 register types
+    FMaxRegIndex: Integer;  // Current max RegIndex allocated
 
     // Language semantics: true = BASIC/FORTRAN (global vars), false = C/Pascal (scoped vars)
     FGlobalVariableSemantics: Boolean;
@@ -102,23 +126,23 @@ type
 
     { Phase 2: Insert PHI functions at merge points }
     procedure InsertPhiFunctions;
-    procedure PlacePhiForVariable(const VarKey: string; VarRegType: TSSARegisterType; VarRegIndex: Integer);
+    procedure PlacePhiForVariable(VarIdx: Integer; VarRegType: TSSARegisterType; VarRegIndex: Integer);
 
     { Phase 3: Rename variables with unique versions }
     procedure RenameVariables;
     procedure RenameBlock(Block: TSSABasicBlock);
 
-    { Helper functions }
-    function GetRegisterKey(RegType: TSSARegisterType; RegIndex: Integer): string;
-    function GetRegisterKey(const Val: TSSAValue): string;
+    { Helper functions - now use integer keys for O(1) lookup }
+    function EncodeRegKey(RegType: TSSARegisterType; RegIndex: Integer): Integer; inline;
+    function GetOrCreateVarIndex(RegType: TSSARegisterType; RegIndex: Integer): Integer;
+    function FindVarIndex(RegType: TSSARegisterType; RegIndex: Integer): Integer;
     procedure CollectDefinitions;
-    procedure CollectUses;  // NEW: For Semi-Pruned SSA
-    function IsLiveAt(const VarKey: string; Block: TSSABasicBlock): Boolean;  // NEW: Check if variable is live
-    function IsUserVariable(const VarKey: string): Boolean;  // Check if register is mapped to a BASIC user variable
-    function NewVersion(const VarKey: string): Integer;
-    function CurrentVersion(const VarKey: string): Integer;
-    procedure PushVersion(const VarKey: string; Version: Integer);
-    procedure PopVersion(const VarKey: string);
+    procedure CollectUses;
+    function IsLiveAt(VarIdx: Integer): Boolean; inline;
+    function NewVersion(VarIdx: Integer): Integer;
+    function CurrentVersion(VarIdx: Integer): Integer;
+    procedure PushVersion(VarIdx: Integer; Version: Integer);
+    procedure PopVersion(VarIdx: Integer);
 
     { Dominance frontier helpers }
     function GetDFList(Block: TSSABasicBlock): TFPList;
@@ -137,15 +161,6 @@ implementation
 {$IFDEF DEBUG_SSA}
 uses SedaiDebug;
 {$ENDIF}
-
-type
-  { Helper record for dominance frontier mapping }
-  TBlockDFEntry = class
-    Block: TSSABasicBlock;
-    DFList: TFPList;  // List of TSSABasicBlock
-    constructor Create(ABlock: TSSABasicBlock);
-    destructor Destroy; override;
-  end;
 
 { TIntegerStack }
 
@@ -188,42 +203,50 @@ begin
   Result := FCount = 0;
 end;
 
-{ TBlockDFEntry }
-
-constructor TBlockDFEntry.Create(ABlock: TSSABasicBlock);
-begin
-  inherited Create;
-  Block := ABlock;
-  DFList := TFPList.Create;
-end;
-
-destructor TBlockDFEntry.Destroy;
-begin
-  DFList.Free;
-  inherited;
-end;
-
 { TSSAConstruction }
 
 constructor TSSAConstruction.Create(Prog: TSSAProgram; DomTree: TDominatorTree; GlobalVarSemantics: Boolean = True);
+var
+  i: Integer;
 begin
   inherited Create;
   FProgram := Prog;
   FDomTree := DomTree;
   FGlobalVariableSemantics := GlobalVarSemantics;
-  FDomFrontier := TFPList.Create;
-  FDefs := TStringList.Create;
-  FDefs.Sorted := True;
-  FDefs.Duplicates := dupIgnore;
-  FUses := TStringList.Create;
-  FUses.Sorted := True;
-  FUses.Duplicates := dupIgnore;
-  FVersionCounter := TStringList.Create;
-  FVersionCounter.Sorted := True;
-  FVersionStack := TStringList.Create;
-  FVersionStack.Sorted := True;
-  FLastVersion := TStringList.Create;
-  FLastVersion.Sorted := True;
+
+  // Store block count for direct indexing
+  FBlockCount := FProgram.Blocks.Count;
+
+  // Pre-allocate DF arrays and assign block indices for O(1) lookup
+  SetLength(FDomFrontier, FBlockCount);
+  SetLength(FDomFrontierSet, FBlockCount, FBlockCount);  // 2D array for O(1) membership test
+  for i := 0 to FBlockCount - 1 do
+  begin
+    FDomFrontier[i] := TFPList.Create;
+    // Assign block index for direct array access (no hash needed!)
+    FProgram.Blocks[i].BlockIndex := i;
+  end;
+
+  // Pre-allocate work arrays for PlacePhiForVariable (reused for all 765+ variables)
+  SetLength(FPhiWorkList, FBlockCount);  // Max size = all blocks
+  FPhiWorkListCount := 0;
+  SetLength(FPhiBlockSet, FBlockCount);
+  FillChar(FPhiBlockSet[0], FBlockCount * SizeOf(Integer), 0);  // Zero once at start
+  FPhiBlockVersion := 0;  // Start at version 0
+
+  // Pre-allocate boolean pool for DefBlockSet/UseBlockSet
+  // Estimate: 1024 variables * 2 sets * FBlockCount = one big allocation
+  // This replaces 2048 individual SetLength calls with ONE allocation!
+  SetLength(FBoolPool, 1024 * 2 * FBlockCount);
+  FBoolPoolNextOffset := 0;
+
+  // Initialize variable info array (grows as needed)
+  SetLength(FVarInfo, 256);  // Initial capacity
+  FVarInfoCount := 0;
+  // Initialize 2D lookup arrays for O(1) access (no hash, no strings)
+  FMaxRegIndex := 255;  // Initial capacity
+  for i := 0 to 2 do
+    SetLength(FVarLookup[i], FMaxRegIndex + 1);
 
   {$IFDEF DEBUG_SSA}
   if DebugSSA then
@@ -234,81 +257,154 @@ end;
 destructor TSSAConstruction.Destroy;
 var
   i: Integer;
-  Entry: TBlockDFEntry;
-  Stack: TIntegerStack;
 begin
-  // Free dominance frontier entries
-  for i := 0 to FDomFrontier.Count - 1 do
+  // Free dominance frontier lists
+  for i := 0 to High(FDomFrontier) do
+    FDomFrontier[i].Free;
+  SetLength(FDomFrontier, 0);
+
+  // Free pre-allocated work arrays
+  SetLength(FPhiWorkList, 0);
+  SetLength(FPhiBlockSet, 0);
+  SetLength(FBoolPool, 0);  // Free the pooled boolean array
+
+  // Free variable info
+  for i := 0 to FVarInfoCount - 1 do
   begin
-    Entry := TBlockDFEntry(FDomFrontier[i]);
-    Entry.Free;
+    SetLength(FVarInfo[i].DefBlocks, 0);  // Free inline array
+    if FVarInfo[i].VersionStack <> nil then
+      FVarInfo[i].VersionStack.Free;
   end;
-  FDomFrontier.Free;
+  SetLength(FVarInfo, 0);
+  // Free lookup arrays
+  for i := 0 to 2 do
+    SetLength(FVarLookup[i], 0);
 
-  // Free definition lists
-  for i := 0 to FDefs.Count - 1 do
-    if Assigned(FDefs.Objects[i]) then
-      TFPList(FDefs.Objects[i]).Free;
-  FDefs.Free;
-
-  // Free use lists
-  for i := 0 to FUses.Count - 1 do
-    if Assigned(FUses.Objects[i]) then
-      TFPList(FUses.Objects[i]).Free;
-  FUses.Free;
-
-  // Free version stacks
-  for i := 0 to FVersionStack.Count - 1 do
-    if Assigned(FVersionStack.Objects[i]) then
-    begin
-      Stack := TIntegerStack(FVersionStack.Objects[i]);
-      Stack.Free;
-    end;
-  FVersionStack.Free;
-
-  FVersionCounter.Free;
-  FLastVersion.Free;
   inherited;
 end;
 
-function TSSAConstruction.GetRegisterKey(RegType: TSSARegisterType; RegIndex: Integer): string;
+function TSSAConstruction.EncodeRegKey(RegType: TSSARegisterType; RegIndex: Integer): Integer;
 begin
-  Result := IntToStr(Ord(RegType)) + ':' + IntToStr(RegIndex);
+  // No longer used - kept for compatibility
+  Result := Ord(RegType) * 65536 + RegIndex;
 end;
 
-function TSSAConstruction.GetRegisterKey(const Val: TSSAValue): string;
+function TSSAConstruction.GetOrCreateVarIndex(RegType: TSSARegisterType; RegIndex: Integer): Integer;
+var
+  TypeIdx, i, NeededSize: Integer;
 begin
-  if Val.Kind = svkRegister then
-    Result := GetRegisterKey(Val.RegType, Val.RegIndex)
-  else
-    Result := '';
+  TypeIdx := Ord(RegType);
+
+  // Grow lookup array if needed
+  if RegIndex > FMaxRegIndex then
+  begin
+    FMaxRegIndex := RegIndex * 2;  // Double to avoid frequent reallocations
+    for i := 0 to 2 do
+      SetLength(FVarLookup[i], FMaxRegIndex + 1);
+  end;
+
+  // Direct O(1) lookup - no hash, no strings!
+  Result := FVarLookup[TypeIdx, RegIndex];
+  if Result > 0 then
+  begin
+    Result := Result - 1;  // Stored as index+1 to distinguish from 0
+    Exit;
+  end;
+
+  // Create new entry
+  Result := FVarInfoCount;
+  Inc(FVarInfoCount);
+
+  // Grow VarInfo array if needed
+  if FVarInfoCount > Length(FVarInfo) then
+    SetLength(FVarInfo, Length(FVarInfo) * 2);
+
+  // Allocate from boolean pool instead of individual SetLength calls
+  // Each variable needs 2 * FBlockCount booleans (DefBlockSet + UseBlockSet)
+  NeededSize := FBoolPoolNextOffset + 2 * FBlockCount;
+  if NeededSize > Length(FBoolPool) then
+  begin
+    // Grow pool - double it
+    SetLength(FBoolPool, Length(FBoolPool) * 2);
+  end;
+
+  // Initialize new entry - use offsets into pool instead of separate arrays
+  FVarInfo[Result].RegType := RegType;
+  FVarInfo[Result].RegIndex := RegIndex;
+  // Use inline array instead of TFPList - allocate small initial capacity
+  SetLength(FVarInfo[Result].DefBlocks, 4);  // Most vars defined in 1-4 blocks
+  FVarInfo[Result].DefBlockCount := 0;
+  FVarInfo[Result].UseBlockCount := 0;
+  FVarInfo[Result].DefBlockOffset := FBoolPoolNextOffset;
+  FVarInfo[Result].UseBlockOffset := FBoolPoolNextOffset + FBlockCount;
+  FBoolPoolNextOffset := FBoolPoolNextOffset + 2 * FBlockCount;
+  // Pool is already zero-initialized by SetLength, no need to clear
+  FVarInfo[Result].VersionCounter := 1;
+  FVarInfo[Result].LastVersion := 0;
+  // Lazy allocation: only create VersionStack when scoped semantics are used
+  // With GlobalVariableSemantics=True (BASIC), this is NEVER used!
+  FVarInfo[Result].VersionStack := nil;
+
+  // Store in lookup array (index+1 to distinguish from not-found)
+  FVarLookup[TypeIdx, RegIndex] := Result + 1;
+end;
+
+function TSSAConstruction.FindVarIndex(RegType: TSSARegisterType; RegIndex: Integer): Integer;
+var
+  TypeIdx: Integer;
+begin
+  TypeIdx := Ord(RegType);
+
+  // Direct O(1) lookup - no hash, no strings!
+  if RegIndex <= FMaxRegIndex then
+  begin
+    Result := FVarLookup[TypeIdx, RegIndex];
+    if Result > 0 then
+    begin
+      Result := Result - 1;
+      Exit;
+    end;
+  end;
+
+  Result := -1;
 end;
 
 function TSSAConstruction.GetDFList(Block: TSSABasicBlock): TFPList;
 var
-  i: Integer;
-  Entry: TBlockDFEntry;
+  Idx: Integer;
 begin
-  // Find DF list for this block
-  for i := 0 to FDomFrontier.Count - 1 do
-  begin
-    Entry := TBlockDFEntry(FDomFrontier[i]);
-    if Entry.Block = Block then
-      Exit(Entry.DFList);
-  end;
-  Result := nil;
+  // Direct O(1) lookup using Block.BlockIndex - no hash, no strings!
+  Idx := Block.BlockIndex;
+  if (Idx >= 0) and (Idx < FBlockCount) then
+    Result := FDomFrontier[Idx]
+  else
+    Result := nil;
 end;
 
 procedure TSSAConstruction.AddToDFList(Block: TSSABasicBlock; DFBlock: TSSABasicBlock);
 var
-  DFList: TFPList;
+  Idx, DFIdx: Integer;
 begin
-  DFList := GetDFList(Block);
-  if Assigned(DFList) and (DFList.IndexOf(DFBlock) < 0) then
-    DFList.Add(DFBlock);
+  // Direct O(1) lookup using Block.BlockIndex - no hash, no strings!
+  Idx := Block.BlockIndex;
+  DFIdx := DFBlock.BlockIndex;
+  if (Idx >= 0) and (Idx < FBlockCount) and (DFIdx >= 0) and (DFIdx < FBlockCount) then
+  begin
+    // O(1) membership test using 2D boolean array
+    if not FDomFrontierSet[Idx, DFIdx] then
+    begin
+      FDomFrontierSet[Idx, DFIdx] := True;
+      FDomFrontier[Idx].Add(DFBlock);
+    end;
+  end;
 end;
 
 procedure TSSAConstruction.Run;
+{$IFDEF DEBUG_SSA_TIMING}
+var
+  StartTime, EndTime: QWord;
+  TimeDF, TimePhi, TimeRename: Double;
+{$ENDIF}
 begin
   {$IFDEF DEBUG_SSA}
   if DebugSSA then
@@ -320,19 +416,41 @@ begin
     WriteLn('[SSAConstruction] Step 1: Computing dominance frontiers...');
   end;
   {$ENDIF}
+  {$IFDEF DEBUG_SSA_TIMING}
+  StartTime := GetTickCount64;
+  {$ENDIF}
   ComputeDominanceFrontiers;
+  {$IFDEF DEBUG_SSA_TIMING}
+  EndTime := GetTickCount64;
+  TimeDF := EndTime - StartTime;
+  {$ENDIF}
 
   {$IFDEF DEBUG_SSA}
   if DebugSSA then
     WriteLn('[SSAConstruction] Step 2: Inserting PHI functions (Semi-Pruned)...');
   {$ENDIF}
+  {$IFDEF DEBUG_SSA_TIMING}
+  StartTime := GetTickCount64;
+  {$ENDIF}
   InsertPhiFunctions;
+  {$IFDEF DEBUG_SSA_TIMING}
+  EndTime := GetTickCount64;
+  TimePhi := EndTime - StartTime;
+  {$ENDIF}
 
   {$IFDEF DEBUG_SSA}
   if DebugSSA then
     WriteLn('[SSAConstruction] Step 3: Renaming variables with unique versions...');
   {$ENDIF}
+  {$IFDEF DEBUG_SSA_TIMING}
+  StartTime := GetTickCount64;
+  {$ENDIF}
   RenameVariables;
+  {$IFDEF DEBUG_SSA_TIMING}
+  EndTime := GetTickCount64;
+  TimeRename := EndTime - StartTime;
+  WriteLn('[SSA-TIMING] ComputeDF: ', TimeDF:0:1, ' ms, InsertPhi: ', TimePhi:0:1, ' ms, Rename: ', TimeRename:0:1, ' ms');
+  {$ENDIF}
 
   {$IFDEF DEBUG_SSA}
   if DebugSSA then
@@ -342,10 +460,8 @@ end;
 
 procedure TSSAConstruction.ComputeDominanceFrontiers;
 var
-  B, P, Runner: TSSABasicBlock;
-  i, j: Integer;
-  Entry: TBlockDFEntry;
-  DFList: TFPList;
+  B, P, Runner, BIdom: TSSABasicBlock;
+  i, j, LoopCount: Integer;
 begin
   { Algorithm: For each block B with multiple predecessors,
     compute DF(B) = set of blocks where definitions from B might need PHI functions.
@@ -357,55 +473,116 @@ begin
         Runner := IDom(Runner)
   }
 
-  // Initialize empty DF sets
-  for i := 0 to FProgram.Blocks.Count - 1 do
-  begin
-    B := FProgram.Blocks[i];
-    Entry := TBlockDFEntry.Create(B);
-    FDomFrontier.Add(Entry);
-  end;
+  // DF arrays already initialized in constructor
+  {$IFDEF DEBUG_SSA}
+  if DebugSSA then
+    WriteLn('[SSAConstruction]   DF sets pre-allocated for ', FProgram.Blocks.Count, ' blocks');
+  {$ENDIF}
 
   // Compute DF for each block
+  {$IFDEF DEBUG_SSA}
+  if DebugSSA then
+    WriteLn('[SSAConstruction]   Computing DF for each block...');
+  {$ENDIF}
   for i := 0 to FProgram.Blocks.Count - 1 do
   begin
     B := FProgram.Blocks[i];
+    {$IFDEF DEBUG_SSA}
+    if DebugSSA then
+      WriteLn('[SSAConstruction]     Processing block ', i, ': ', B.LabelName, ' (preds=', B.Predecessors.Count, ')');
+    {$ENDIF}
 
     // Only process blocks with multiple predecessors (potential merge points)
     if B.Predecessors.Count < 2 then
       Continue;
 
+    // Get B's immediate dominator - if nil, skip this block (unreachable from entry)
+    // This can happen for blocks that are kept for TRAP but not in main CFG
+    try
+      BIdom := FDomTree.GetIDom(B);
+      if BIdom = nil then
+        Continue;
+    except
+      // Block not in dominator tree - skip it
+      Continue;
+    end;
+
     // For each predecessor
     for j := 0 to B.Predecessors.Count - 1 do
     begin
       P := TSSABasicBlock(B.Predecessors[j]);
+
+      // Skip predecessors that are not in the main dominator tree (e.g., TRAP handlers)
+      // These blocks have no path to the entry block
+      try
+        if FDomTree.GetIDom(P) = nil then
+        begin
+          {$IFDEF DEBUG_SSA}
+          if DebugSSA then
+            WriteLn('[SSAConstruction]       Skipping predecessor ', P.LabelName, ' (not in dom tree)');
+          {$ENDIF}
+          Continue;
+        end;
+      except
+        {$IFDEF DEBUG_SSA}
+        if DebugSSA then
+          WriteLn('[SSAConstruction]       Skipping predecessor ', P.LabelName, ' (exception in GetIDom)');
+        {$ENDIF}
+        Continue;
+      end;
+
       Runner := P;
+      {$IFDEF DEBUG_SSA}
+      if DebugSSA then
+        WriteLn('[SSAConstruction]       Starting walk from ', P.LabelName, ' to BIdom=', BIdom.LabelName);
+      {$ENDIF}
 
       // Walk up dominator tree until we reach B's immediate dominator
-      while Runner <> FDomTree.GetIDom(B) do
+      // Use cached BIdom to avoid repeated GetIDom calls
+      // Safety: limit iterations to prevent infinite loops
+      LoopCount := 0;
+      while (Runner <> nil) and (Runner <> BIdom) and (LoopCount < 1000) do
       begin
+        Inc(LoopCount);
+        {$IFDEF DEBUG_SSA}
+        if DebugSSA and (LoopCount <= 10) then
+          WriteLn('[SSAConstruction]         Step ', LoopCount, ': Runner=', Runner.LabelName);
+        {$ENDIF}
+
         // Add B to DF(Runner) if not already there
         AddToDFList(Runner, B);
 
-        Runner := FDomTree.GetIDom(Runner);
-        if Runner = nil then Break;  // Safety: reached entry block
+        try
+          Runner := FDomTree.GetIDom(Runner);
+        except
+          // Runner not in dominator tree - stop
+          Runner := nil;
+        end;
       end;
+      {$IFDEF DEBUG_SSA}
+      if DebugSSA then
+      begin
+        if LoopCount >= 1000 then
+          WriteLn('[SSAConstruction]       WARNING: Loop limit reached!')
+        else
+          WriteLn('[SSAConstruction]       Walk completed in ', LoopCount, ' steps');
+      end;
+      {$ENDIF}
     end;
   end;
 
   {$IFDEF DEBUG_SSA}
-  // Debug: print dominance frontiers
   if DebugSSA then
   begin
-    for i := 0 to FDomFrontier.Count - 1 do
+    for i := 0 to High(FDomFrontier) do
     begin
-      Entry := TBlockDFEntry(FDomFrontier[i]);
-      if Entry.DFList.Count > 0 then
+      if FDomFrontier[i].Count > 0 then
       begin
-        Write('[SSAConstruction]   DF(', Entry.Block.LabelName, ') = {');
-        for j := 0 to Entry.DFList.Count - 1 do
+        Write('[SSAConstruction]   DF(', FProgram.Blocks[i].LabelName, ') = {');
+        for j := 0 to FDomFrontier[i].Count - 1 do
         begin
           if j > 0 then Write(', ');
-          Write(TSSABasicBlock(Entry.DFList[j]).LabelName);
+          Write(TSSABasicBlock(FDomFrontier[i][j]).LabelName);
         end;
         WriteLn('}');
       end;
@@ -418,12 +595,8 @@ procedure TSSAConstruction.CollectDefinitions;
 var
   Block: TSSABasicBlock;
   Instr: TSSAInstruction;
-  VarKey: string;
-  DefList: TFPList;
-  i, j, Idx: Integer;
+  i, j, VarIdx, BlockIdx: Integer;
 begin
-  { Scan all blocks and track which registers are defined where }
-
   {$IFDEF DEBUG_SSA}
   if DebugSSA then
     WriteLn('[SSAConstruction]   Collecting variable definitions...');
@@ -432,41 +605,37 @@ begin
   for i := 0 to FProgram.Blocks.Count - 1 do
   begin
     Block := FProgram.Blocks[i];
+    BlockIdx := Block.BlockIndex;
     for j := 0 to Block.Instructions.Count - 1 do
     begin
       Instr := Block.Instructions[j];
 
       // Check if instruction defines a register
       // CRITICAL FIX: Some instructions USE their Dest operand instead of DEFINING it!
-      // ArrayStore: Dest = value to store (USE)
-      // Print/PrintLn: Dest = value to print (USE)
       if (Instr.Dest.Kind = svkRegister) and
          (Instr.OpCode <> ssaArrayStore) and
          (Instr.OpCode <> ssaPrint) and
          (Instr.OpCode <> ssaPrintLn) then
       begin
-        VarKey := GetRegisterKey(Instr.Dest);
+        VarIdx := GetOrCreateVarIndex(Instr.Dest.RegType, Instr.Dest.RegIndex);
 
-        // Find or create definition list for this variable
-        Idx := FDefs.IndexOf(VarKey);
-        if Idx < 0 then
+        // O(1) membership test using pooled boolean array
+        if not FBoolPool[FVarInfo[VarIdx].DefBlockOffset + BlockIdx] then
         begin
-          DefList := TFPList.Create;
-          FDefs.AddObject(VarKey, DefList);
-        end
-        else
-          DefList := TFPList(FDefs.Objects[Idx]);
-
-        // Only add block once per variable (even if multiple defs in same block)
-        if DefList.IndexOf(Block) < 0 then
-          DefList.Add(Block);
+          FBoolPool[FVarInfo[VarIdx].DefBlockOffset + BlockIdx] := True;
+          // Add to inline array (grow if needed)
+          if FVarInfo[VarIdx].DefBlockCount >= Length(FVarInfo[VarIdx].DefBlocks) then
+            SetLength(FVarInfo[VarIdx].DefBlocks, Length(FVarInfo[VarIdx].DefBlocks) * 2);
+          FVarInfo[VarIdx].DefBlocks[FVarInfo[VarIdx].DefBlockCount] := Block;
+          Inc(FVarInfo[VarIdx].DefBlockCount);
+        end;
       end;
     end;
   end;
 
   {$IFDEF DEBUG_SSA}
   if DebugSSA then
-    WriteLn('[SSAConstruction]   Found definitions for ', FDefs.Count, ' variables');
+    WriteLn('[SSAConstruction]   Found definitions for ', FVarInfoCount, ' variables');
   {$ENDIF}
 end;
 
@@ -474,35 +643,25 @@ procedure TSSAConstruction.CollectUses;
 var
   Block: TSSABasicBlock;
   Instr: TSSAInstruction;
-  VarKey: string;
-  UseList: TFPList;
-  i, j, Idx: Integer;
+  i, j, VarIdx, BlockIdx: Integer;
 
   procedure AddUse(const Val: TSSAValue);
   var
-    Key: string;
     Idx: Integer;
   begin
     if Val.Kind <> svkRegister then Exit;
 
-    Key := GetRegisterKey(Val);
+    Idx := GetOrCreateVarIndex(Val.RegType, Val.RegIndex);
 
-    Idx := FUses.IndexOf(Key);
-    if Idx < 0 then
+    // O(1) membership test using pooled boolean array
+    if not FBoolPool[FVarInfo[Idx].UseBlockOffset + BlockIdx] then
     begin
-      UseList := TFPList.Create;
-      FUses.AddObject(Key, UseList);
-    end
-    else
-      UseList := TFPList(FUses.Objects[Idx]);
-
-    if UseList.IndexOf(Block) < 0 then
-      UseList.Add(Block);
+      FBoolPool[FVarInfo[Idx].UseBlockOffset + BlockIdx] := True;
+      Inc(FVarInfo[Idx].UseBlockCount);  // Just count, don't store list
+    end;
   end;
 
 begin
-  { Scan all blocks and track which registers are USED where (for Semi-Pruned SSA) }
-
   {$IFDEF DEBUG_SSA}
   if DebugSSA then
     WriteLn('[SSAConstruction]   Collecting variable uses (Semi-Pruned SSA)...');
@@ -511,6 +670,7 @@ begin
   for i := 0 to FProgram.Blocks.Count - 1 do
   begin
     Block := FProgram.Blocks[i];
+    BlockIdx := Block.BlockIndex;
     for j := 0 to Block.Instructions.Count - 1 do
     begin
       Instr := Block.Instructions[j];
@@ -521,349 +681,249 @@ begin
       AddUse(Instr.Src3);
 
       // CRITICAL FIX: Some instructions USE their Dest operand instead of DEFINING it!
-      // ArrayStore: Dest = value to store (USE, not DEF)
-      // Print/PrintLn: Dest = value to print (USE, not DEF)
       if Instr.OpCode in [ssaArrayStore, ssaPrint, ssaPrintLn] then
-      begin
-        // These instructions USE their Dest operand, not define it!
         AddUse(Instr.Dest);
-      end;
     end;
   end;
 
   {$IFDEF DEBUG_SSA}
   if DebugSSA then
-    WriteLn('[SSAConstruction]   Found uses for ', FUses.Count, ' variables');
+    WriteLn('[SSAConstruction]   Found uses for ', FVarInfoCount, ' variables');
   {$ENDIF}
 end;
 
-function TSSAConstruction.IsLiveAt(const VarKey: string; Block: TSSABasicBlock): Boolean;
-var
-  Idx: Integer;
-  UseList: TFPList;
-  i: Integer;
-  UseBlock: TSSABasicBlock;
+function TSSAConstruction.IsLiveAt(VarIdx: Integer): Boolean;
 begin
-  { A variable is "live" at a block if it has a use in this block or
-    in any block dominated by this block.
-
-    Simple heuristic for Semi-Pruned SSA: a variable is live at a merge point
-    if it has ANY use in the program. This is slightly conservative but very fast. }
-
-  Idx := FUses.IndexOf(VarKey);
-  Result := Idx >= 0;  // If variable is used anywhere, it's potentially live
-
-  // Optimization: could check if uses are dominated by this block, but for now
-  // this simple check gives us 40-70% PHI reduction vs full Cytron.
+  // A variable is live if it has any use in the program
+  // Simple and fast heuristic for Semi-Pruned SSA
+  Result := (VarIdx >= 0) and (VarIdx < FVarInfoCount) and
+            (FVarInfo[VarIdx].UseBlockCount > 0);
 end;
 
 procedure TSSAConstruction.InsertPhiFunctions;
 var
-  VarKey: string;
-  VarRegType: TSSARegisterType;
-  VarRegIndex: Integer;
-  ColonPos: Integer;
-  i: Integer;
+  i, j: Integer;
   PhiCount, SkippedCount: Integer;
+  {$IFDEF DEBUG_SSA_TIMING}
+  T1, T2, T3, T4: QWord;
+  TotalPhiInserted: Integer;
+  {$ENDIF}
 begin
-  { Semi-Pruned SSA: Insert PHI functions only for LIVE variables }
-
+  {$IFDEF DEBUG_SSA_TIMING}
+  T1 := GetTickCount64;
+  {$ENDIF}
   // Collect definitions and uses
   CollectDefinitions;
+  {$IFDEF DEBUG_SSA_TIMING}
+  T2 := GetTickCount64;
+  {$ENDIF}
   CollectUses;
+  {$IFDEF DEBUG_SSA_TIMING}
+  T3 := GetTickCount64;
+  {$ENDIF}
 
   PhiCount := 0;
   SkippedCount := 0;
+  {$IFDEF DEBUG_SSA_TIMING}
+  TotalPhiInserted := 0;
+  {$ENDIF}
 
   // For each variable with definitions, check if it's live before placing PHI
-  for i := 0 to FDefs.Count - 1 do
+  // OPTIMIZATION: Only process variables with DefBlockCount > 0 AND UseBlockCount > 0
+  // Most variables (764/765) are live, so the filter overhead is minimal
+  for i := 0 to FVarInfoCount - 1 do
   begin
-    VarKey := FDefs[i];
+    // Skip variables with no definitions (can't generate PHI)
+    if FVarInfo[i].DefBlockCount = 0 then
+      Continue;
 
     // Semi-Pruned SSA: Skip PHI placement if variable is not used anywhere
-    if not IsLiveAt(VarKey, nil) then
+    if FVarInfo[i].UseBlockCount = 0 then
     begin
       Inc(SkippedCount);
       Continue;
     end;
 
-    // Extract RegType and RegIndex from key "RegType:RegIndex"
-    ColonPos := Pos(':', VarKey);
-    if ColonPos > 0 then
+    // CRITICAL OPTIMIZATION: Skip variables defined in only ONE block
+    // They can NEVER need PHI functions (PHI merges values from different paths)
+    if FVarInfo[i].DefBlockCount = 1 then
     begin
-      VarRegType := TSSARegisterType(StrToInt(Copy(VarKey, 1, ColonPos - 1)));
-      VarRegIndex := StrToInt(Copy(VarKey, ColonPos + 1, Length(VarKey)));
-      PlacePhiForVariable(VarKey, VarRegType, VarRegIndex);
-      Inc(PhiCount);
+      Inc(PhiCount);  // Count as processed but skip PlacePhiForVariable
+      Continue;
     end;
+
+    // Use stored RegType/RegIndex for PHI placement
+    PlacePhiForVariable(i, FVarInfo[i].RegType, FVarInfo[i].RegIndex);
+    Inc(PhiCount);
   end;
+
+  {$IFDEF DEBUG_SSA_TIMING}
+  // Count total PHI instructions inserted and vars with multiple defs
+  for i := 0 to FProgram.Blocks.Count - 1 do
+    if (FProgram.Blocks[i].Instructions.Count > 0) and
+       (FProgram.Blocks[i].Instructions[0].OpCode = ssaPhi) then
+      Inc(TotalPhiInserted);
+  T4 := GetTickCount64;
+  // Count vars with multiple definition blocks (only these can generate PHI)
+  j := 0;
+  for i := 0 to FVarInfoCount - 1 do
+    if FVarInfo[i].DefBlockCount > 1 then Inc(j);
+  WriteLn('[SSA-TIMING] InsertPhi: CollectDefs=', T2-T1, ' CollectUses=', T3-T2, ' PlacePhi=', T4-T3, ' ms');
+  WriteLn('[SSA-TIMING]   vars=', FVarInfoCount, ' live=', PhiCount, ' multiDef=', j, ' phisInserted=', TotalPhiInserted);
+  {$ENDIF}
 
   {$IFDEF DEBUG_SSA}
   if DebugSSA then
   begin
     WriteLn('[SSAConstruction]   Semi-Pruned SSA: placed PHI for ', PhiCount, ' variables');
-    WriteLn('[SSAConstruction]   Semi-Pruned SSA: skipped ', SkippedCount, ' dead variables (',
-            Format('%.1f', [100.0 * SkippedCount / (PhiCount + SkippedCount)]), '% reduction)');
+    if PhiCount + SkippedCount > 0 then
+      WriteLn('[SSAConstruction]   Semi-Pruned SSA: skipped ', SkippedCount, ' dead variables (',
+              Format('%.1f', [100.0 * SkippedCount / (PhiCount + SkippedCount)]), '% reduction)');
   end;
   {$ENDIF}
 end;
 
-procedure TSSAConstruction.PlacePhiForVariable(const VarKey: string; VarRegType: TSSARegisterType; VarRegIndex: Integer);
+procedure TSSAConstruction.PlacePhiForVariable(VarIdx: Integer; VarRegType: TSSARegisterType; VarRegIndex: Integer);
 var
-  WorkList, PhiBlocks: TFPList;
   Block, Y: TSSABasicBlock;
   PhiInstr: TSSAInstruction;
-  i, j, Idx: Integer;
+  i, j, WorkIdx, YIdx: Integer;
   PredBlock: TSSABasicBlock;
-  DFList, DefList: TFPList;
+  DFList: TFPList;
 begin
-  { Standard PHI placement algorithm (Cytron et al.)
+  { Standard PHI placement algorithm (Cytron et al.) with O(1) optimizations
+    Uses pre-allocated FPhiWorkList and FPhiBlockSet to avoid 765+ allocations }
 
-    WorkList = blocks where variable is defined
-    While WorkList not empty:
-      Block = remove from WorkList
-      For each Y in DF(Block):
-        If Y not in PhiBlocks:
-          Insert PHI at beginning of Y
-          Add Y to PhiBlocks
-          If Y not in original definitions:
-            Add Y to WorkList  (PHI counts as new definition!)
-  }
+  // Clear worklist and increment version (O(1) instead of O(n) FillChar!)
+  FPhiWorkListCount := 0;  // Reset count (O(1))
+  Inc(FPhiBlockVersion);  // New version = all blocks are "not in set"
 
-  WorkList := TFPList.Create;
-  PhiBlocks := TFPList.Create;
-  try
-    // Initialize WorkList with blocks where variable is defined
-    Idx := FDefs.IndexOf(VarKey);
-    if Idx < 0 then Exit;
+  // Initialize WorkList with blocks where variable is defined (use inline array)
+  for i := 0 to FVarInfo[VarIdx].DefBlockCount - 1 do
+  begin
+    FPhiWorkList[FPhiWorkListCount] := FVarInfo[VarIdx].DefBlocks[i];
+    Inc(FPhiWorkListCount);
+  end;
 
-    DefList := TFPList(FDefs.Objects[Idx]);
-    for i := 0 to DefList.Count - 1 do
-      WorkList.Add(DefList[i]);
+  // Use index-based iteration
+  WorkIdx := 0;
+  while WorkIdx < FPhiWorkListCount do
+  begin
+    Block := FPhiWorkList[WorkIdx];
+    Inc(WorkIdx);  // Move to next
 
-    while WorkList.Count > 0 do
+    // Get dominance frontier for this block
+    DFList := GetDFList(Block);
+    if not Assigned(DFList) then
+      Continue;
+
+    // For each block Y in DF(Block)
+    for i := 0 to DFList.Count - 1 do
     begin
-      // Remove first block from worklist
-      Block := TSSABasicBlock(WorkList[0]);
-      WorkList.Delete(0);
+      Y := TSSABasicBlock(DFList[i]);
+      YIdx := Y.BlockIndex;
 
-      // Get dominance frontier for this block
-      DFList := GetDFList(Block);
-      if not Assigned(DFList) then
-        Continue;
-
-      // For each block Y in DF(Block)
-      for i := 0 to DFList.Count - 1 do
+      // O(1) membership test using version: if FPhiBlockSet[YIdx] < FPhiBlockVersion, block is not in set
+      if FPhiBlockSet[YIdx] <> FPhiBlockVersion then
       begin
-        Y := TSSABasicBlock(DFList[i]);
+        FPhiBlockSet[YIdx] := FPhiBlockVersion;  // Mark as "in set" for this version
 
-        // If we haven't placed a PHI in Y yet
-        if PhiBlocks.IndexOf(Y) < 0 then
+        // Create PHI instruction: dest = PHI(...)
+        PhiInstr := TSSAInstruction.Create(ssaPhi);
+        PhiInstr.Dest := MakeSSARegister(VarRegType, VarRegIndex);
+
+        // Add PHI source for each predecessor (values will be filled during renaming)
+        for j := 0 to Y.Predecessors.Count - 1 do
         begin
-          // Create PHI instruction: dest = PHI(...)
-          PhiInstr := TSSAInstruction.Create(ssaPhi);
-          PhiInstr.Dest := MakeSSARegister(VarRegType, VarRegIndex);
+          PredBlock := TSSABasicBlock(Y.Predecessors[j]);
+          PhiInstr.AddPhiSource(MakeSSARegister(VarRegType, VarRegIndex), PredBlock);
+        end;
 
-          // Add PHI source for each predecessor (values will be filled during renaming)
-          for j := 0 to Y.Predecessors.Count - 1 do
-          begin
-            PredBlock := TSSABasicBlock(Y.Predecessors[j]);
-            PhiInstr.AddPhiSource(MakeSSARegister(VarRegType, VarRegIndex), PredBlock);
-          end;
+        // Insert PHI at the BEGINNING of the block
+        Y.Instructions.Insert(0, PhiInstr);
 
-          // Insert PHI at the BEGINNING of the block
-          Y.Instructions.Insert(0, PhiInstr);
-          PhiBlocks.Add(Y);
+        {$IFDEF DEBUG_SSA}
+        if DebugSSA then
+          WriteLn('[SSAConstruction]     Inserted PHI for var ', VarIdx, ' in block ', Y.LabelName);
+        {$ENDIF}
 
-          {$IFDEF DEBUG_SSA}
-          if DebugSSA then
-            WriteLn('[SSAConstruction]     Inserted PHI for ', VarKey, ' in block ', Y.LabelName);
-          {$ENDIF}
-
-          // If Y was not an original definition site, add to worklist
-          if DefList.IndexOf(Y) < 0 then
-            WorkList.Add(Y);
+        // O(1) check: If Y was not an original definition site, add to worklist
+        if not FBoolPool[FVarInfo[VarIdx].DefBlockOffset + YIdx] then
+        begin
+          FPhiWorkList[FPhiWorkListCount] := Y;
+          Inc(FPhiWorkListCount);
         end;
       end;
     end;
-
-  finally
-    WorkList.Free;
-    PhiBlocks.Free;
   end;
 end;
 
-function TSSAConstruction.IsUserVariable(const VarKey: string): Boolean;
-var
-  i: Integer;
-  MappedKey: string;
+function TSSAConstruction.NewVersion(VarIdx: Integer): Integer;
 begin
-  // Check if this VarKey (format "RegType:RegIndex") corresponds to a BASIC user variable
-  // by scanning FProgram.VarRegMap which maps variable names to "RegType:RegIndex"
-  Result := False;
-
-  for i := 0 to FProgram.VarRegMap.Count - 1 do
-  begin
-    MappedKey := FProgram.VarRegMap.ValueFromIndex[i];
-    if MappedKey = VarKey then
-    begin
-      Result := True;
-      Exit;
-    end;
-  end;
-end;
-
-function TSSAConstruction.NewVersion(const VarKey: string): Integer;
-var
-  Idx: Integer;
-begin
-  // Global variable semantics: skip versioning for ALL variables (user vars + temporaries)
-  // This prevents PHI explosion when GOSUB/RETURN create many merge points
-  // Without versioning, PHI functions are trivial and get eliminated cleanly
+  // Global variable semantics: skip versioning (all use Version=0)
   if FGlobalVariableSemantics then
   begin
-    {$IFDEF DEBUG_SSA}
-    if DebugSSA then
-      WriteLn('[SSAConstruction]     NewVersion("', VarKey, '") = 0 (GLOBAL - no versioning)');
-    {$ENDIF}
     Result := 0;
     Exit;
   end;
 
   // Scoped variable semantics: normal SSA versioning
-  Idx := FVersionCounter.IndexOf(VarKey);
-  if Idx >= 0 then
-  begin
-    Result := PtrInt(FVersionCounter.Objects[Idx]);
-    FVersionCounter.Objects[Idx] := TObject(PtrInt(Result + 1));
-    {$IFDEF DEBUG_SSA}
-    if DebugSSA then
-      WriteLn('[SSAConstruction]     NewVersion("', VarKey, '") = ', Result, ' (next will be ', Result + 1, ')');
-    {$ENDIF}
-  end
-  else
-  begin
-    Result := 1;  // Start versioning from 1 (0 = unversioned)
-    FVersionCounter.AddObject(VarKey, TObject(PtrInt(2)));
-    {$IFDEF DEBUG_SSA}
-    if DebugSSA then
-      WriteLn('[SSAConstruction]     NewVersion("', VarKey, '") = ', Result, ' (FIRST, next will be 2)');
-    {$ENDIF}
-  end;
-
-  // Track last assigned version as fallback for when stack is empty
-  Idx := FLastVersion.IndexOf(VarKey);
-  if Idx >= 0 then
-    FLastVersion.Objects[Idx] := TObject(PtrInt(Result))
-  else
-    FLastVersion.AddObject(VarKey, TObject(PtrInt(Result)));
+  Result := FVarInfo[VarIdx].VersionCounter;
+  Inc(FVarInfo[VarIdx].VersionCounter);
+  FVarInfo[VarIdx].LastVersion := Result;
 end;
 
-function TSSAConstruction.CurrentVersion(const VarKey: string): Integer;
-var
-  Idx: Integer;
-  Stack: TIntegerStack;
+function TSSAConstruction.CurrentVersion(VarIdx: Integer): Integer;
 begin
-  // Global variable semantics: all variables use Version=0 (no versioning)
+  // Global variable semantics: all variables use Version=0
   if FGlobalVariableSemantics then
   begin
     Result := 0;
     Exit;
   end;
 
-  // Scoped semantics: use stack first, fallback to FLastVersion
-  Idx := FVersionStack.IndexOf(VarKey);
-  if Idx >= 0 then
+  // Scoped semantics: use stack first, fallback to LastVersion
+  if (VarIdx >= 0) and (VarIdx < FVarInfoCount) then
   begin
-    Stack := TIntegerStack(FVersionStack.Objects[Idx]);
-    if not Stack.IsEmpty then
-    begin
-      Result := Stack.Peek;
-      Exit;
-    end;
-  end;
-
-  Idx := FLastVersion.IndexOf(VarKey);
-  if Idx >= 0 then
-    Result := PtrInt(FLastVersion.Objects[Idx])
+    if (FVarInfo[VarIdx].VersionStack <> nil) and
+       (not FVarInfo[VarIdx].VersionStack.IsEmpty) then
+      Result := FVarInfo[VarIdx].VersionStack.Peek
+    else
+      Result := FVarInfo[VarIdx].LastVersion;
+  end
   else
     Result := 0;
 end;
 
-procedure TSSAConstruction.PushVersion(const VarKey: string; Version: Integer);
-var
-  Idx: Integer;
-  Stack: TIntegerStack;
+procedure TSSAConstruction.PushVersion(VarIdx: Integer; Version: Integer);
 begin
-  // Global variable semantics: no need to track versions (all are 0)
+  // Global variable semantics: no need to track versions
   if FGlobalVariableSemantics then
-  begin
-    {$IFDEF DEBUG_SSA}
-    if DebugSSA then
-      WriteLn('[SSA-VERSION] PushVersion("', VarKey, '", ', Version, ') - SKIPPED (global semantics)');
-    {$ENDIF}
     Exit;
-  end;
 
-  // Scoped semantics: update FLastVersion and push to stack
-  Idx := FLastVersion.IndexOf(VarKey);
-  if Idx >= 0 then
-    FLastVersion.Objects[Idx] := TObject(PtrInt(Version))
-  else
-    FLastVersion.AddObject(VarKey, TObject(PtrInt(Version)));
-
-  Idx := FVersionStack.IndexOf(VarKey);
-  if Idx < 0 then
+  // Scoped semantics: update LastVersion and push to stack
+  if (VarIdx >= 0) and (VarIdx < FVarInfoCount) then
   begin
-    Stack := TIntegerStack.Create;
-    FVersionStack.AddObject(VarKey, Stack);
-  end
-  else
-    Stack := TIntegerStack(FVersionStack.Objects[Idx]);
-
-  Stack.Push(Version);
-  {$IFDEF DEBUG_SSA}
-  if DebugSSA then
-    WriteLn('[SSA-VERSION] PushVersion("', VarKey, '", ', Version, ') - stack depth now = ', Stack.Count);
-  {$ENDIF}
+    FVarInfo[VarIdx].LastVersion := Version;
+    // Lazy allocation: create VersionStack only when first used
+    if FVarInfo[VarIdx].VersionStack = nil then
+      FVarInfo[VarIdx].VersionStack := TIntegerStack.Create;
+    FVarInfo[VarIdx].VersionStack.Push(Version);
+  end;
 end;
 
-procedure TSSAConstruction.PopVersion(const VarKey: string);
-var
-  Idx: Integer;
-  Stack: TIntegerStack;
-  OldDepth, PoppedValue: Integer;
+procedure TSSAConstruction.PopVersion(VarIdx: Integer);
 begin
   // Global semantics: NO-OP (versions must persist)
   if FGlobalVariableSemantics then
-  begin
-    {$IFDEF DEBUG_SSA}
-    if DebugSSA then
-      WriteLn('[SSA-VERSION] PopVersion("', VarKey, '") - SKIPPED (global semantics)');
-    {$ENDIF}
     Exit;
-  end;
 
   // Scoped semantics: pop from stack
-  Idx := FVersionStack.IndexOf(VarKey);
-  if Idx >= 0 then
+  if (VarIdx >= 0) and (VarIdx < FVarInfoCount) then
   begin
-    Stack := TIntegerStack(FVersionStack.Objects[Idx]);
-    if not Stack.IsEmpty then
-    begin
-      OldDepth := Stack.Count;
-      PoppedValue := Stack.Pop;
-      {$IFDEF DEBUG_SSA}
-      if DebugSSA then
-        WriteLn('[SSA-VERSION] PopVersion("', VarKey, '") - popped version ', PoppedValue,
-                ', stack depth ', OldDepth, ' -> ', Stack.Count);
-      {$ENDIF}
-    end
-    {$IFDEF DEBUG_SSA}
-    else if DebugSSA then
-      WriteLn('[SSA-VERSION] WARNING: PopVersion("', VarKey, '") called but stack already empty!');
-    {$ENDIF}
-    ;
+    if (FVarInfo[VarIdx].VersionStack <> nil) and
+       (not FVarInfo[VarIdx].VersionStack.IsEmpty) then
+      FVarInfo[VarIdx].VersionStack.Pop;
   end;
 end;
 
@@ -888,176 +948,177 @@ end;
 procedure TSSAConstruction.RenameBlock(Block: TSSABasicBlock);
 var
   Instr: TSSAInstruction;
-  VarKey: string;
-  NewVer, Ver, i, j: Integer;
+  VarIdx, NewVer, i, j, k: Integer;
   SuccBlock: TSSABasicBlock;
   Children: TFPList;
   Child: TSSABasicBlock;
-  SavedVersions: TStringList;  // Track what we pushed for backtracking
+  SavedVarIndices: array of Integer;
+  SavedCount: Integer;
 begin
   {$IFDEF DEBUG_SSA}
   if DebugSSA then
     WriteLn('[SSA-RENAME] ========== Processing block: ', Block.LabelName, ' ==========');
   {$ENDIF}
 
-  SavedVersions := TStringList.Create;
-  try
-    // STEP 1: Process PHI instructions (assign dest only, don't rename sources yet)
-    for i := 0 to Block.Instructions.Count - 1 do
+  // Pre-allocate saved indices array only for scoped semantics
+  SavedCount := 0;
+  if not FGlobalVariableSemantics then
+    SetLength(SavedVarIndices, Block.Instructions.Count * 2);  // Reasonable estimate
+
+  // STEP 1: Process PHI instructions (assign dest only, don't rename sources yet)
+  for i := 0 to Block.Instructions.Count - 1 do
+  begin
+    Instr := Block.Instructions[i];
+    if Instr.OpCode <> ssaPhi then Break;
+
+    VarIdx := FindVarIndex(Instr.Dest.RegType, Instr.Dest.RegIndex);
+
+    // With global variable semantics, PHI dests use Version=0
+    if FGlobalVariableSemantics then
+      Instr.Dest.Version := 0
+    else if VarIdx >= 0 then
     begin
-      Instr := Block.Instructions[i];
-      if Instr.OpCode <> ssaPhi then Break;  // PHI is always at the beginning
-
-      VarKey := GetRegisterKey(Instr.Dest);
-
-      // With global variable semantics, PHI dests also use Version=0
-      if FGlobalVariableSemantics then
-      begin
-        Instr.Dest.Version := 0;
-      end
-      else
-      begin
-        NewVer := NewVersion(VarKey);
-        Instr.Dest.Version := NewVer;
-        PushVersion(VarKey, NewVer);
-        SavedVersions.Add(VarKey);
-      end;
+      NewVer := NewVersion(VarIdx);
+      Instr.Dest.Version := NewVer;
+      PushVersion(VarIdx, NewVer);
+      // Track for backtracking
+      if SavedCount >= Length(SavedVarIndices) then
+        SetLength(SavedVarIndices, Length(SavedVarIndices) * 2);
+      SavedVarIndices[SavedCount] := VarIdx;
+      Inc(SavedCount);
     end;
+  end;
 
-    // STEP 2: Process normal instructions
-    for i := 0 to Block.Instructions.Count - 1 do
+  // STEP 2: Process normal instructions
+  for i := 0 to Block.Instructions.Count - 1 do
+  begin
+    Instr := Block.Instructions[i];
+    if Instr.OpCode = ssaPhi then Continue;
+
+    // Rename USES (Src1, Src2, Src3) - only for scoped semantics
+    if not FGlobalVariableSemantics then
     begin
-      Instr := Block.Instructions[i];
-      if Instr.OpCode = ssaPhi then Continue;  // Already processed
-
-      // Rename USES (Src1, Src2, Src3)
       if Instr.Src1.Kind = svkRegister then
       begin
-        VarKey := GetRegisterKey(Instr.Src1);
-        Instr.Src1.Version := CurrentVersion(VarKey);
+        VarIdx := FindVarIndex(Instr.Src1.RegType, Instr.Src1.RegIndex);
+        if VarIdx >= 0 then
+          Instr.Src1.Version := CurrentVersion(VarIdx);
       end;
 
       if Instr.Src2.Kind = svkRegister then
       begin
-        VarKey := GetRegisterKey(Instr.Src2);
-        Instr.Src2.Version := CurrentVersion(VarKey);
+        VarIdx := FindVarIndex(Instr.Src2.RegType, Instr.Src2.RegIndex);
+        if VarIdx >= 0 then
+          Instr.Src2.Version := CurrentVersion(VarIdx);
       end;
 
       if Instr.Src3.Kind = svkRegister then
       begin
-        VarKey := GetRegisterKey(Instr.Src3);
-        Instr.Src3.Version := CurrentVersion(VarKey);
+        VarIdx := FindVarIndex(Instr.Src3.RegType, Instr.Src3.RegIndex);
+        if VarIdx >= 0 then
+          Instr.Src3.Version := CurrentVersion(VarIdx);
       end;
 
-      // Rename PhiSources when used for extra operands (e.g., RGBA's A register)
+      // Rename PhiSources when used for extra operands
       for j := 0 to Length(Instr.PhiSources) - 1 do
       begin
         if Instr.PhiSources[j].Value.Kind = svkRegister then
         begin
-          VarKey := GetRegisterKey(Instr.PhiSources[j].Value.RegType, Instr.PhiSources[j].Value.RegIndex);
-          Instr.PhiSources[j].Value.Version := CurrentVersion(VarKey);
+          VarIdx := FindVarIndex(Instr.PhiSources[j].Value.RegType, Instr.PhiSources[j].Value.RegIndex);
+          if VarIdx >= 0 then
+            Instr.PhiSources[j].Value.Version := CurrentVersion(VarIdx);
         end;
       end;
+    end;
 
-      // Rename DEFINITION (Dest) - UNLESS this instruction USES Dest as input!
-      // CRITICAL FIX: ArrayStore, Print, PrintLn USE Dest, not define it!
-      if Instr.Dest.Kind = svkRegister then
+    // Rename DEFINITION (Dest)
+    if Instr.Dest.Kind = svkRegister then
+    begin
+      // Check if this instruction USES Dest (not defines it)
+      if Instr.OpCode in [ssaArrayStore, ssaPrint, ssaPrintLn] then
       begin
-        // Check if this instruction USES Dest (not defines it)
-        if Instr.OpCode in [ssaArrayStore, ssaPrint, ssaPrintLn] then
+        // USE Dest - with global semantics keep Version=0
+        if not FGlobalVariableSemantics then
         begin
-          // USE Dest - it already has the correct version from SSA generator!
-          // Just rename it with the current version
-          VarKey := GetRegisterKey(Instr.Dest);
-          Instr.Dest.Version := CurrentVersion(VarKey);
-        end
+          VarIdx := FindVarIndex(Instr.Dest.RegType, Instr.Dest.RegIndex);
+          if VarIdx >= 0 then
+            Instr.Dest.Version := CurrentVersion(VarIdx);
+        end;
+      end
+      else
+      begin
+        // DEFINE Dest with new version
+        if FGlobalVariableSemantics then
+          Instr.Dest.Version := 0
         else
         begin
-          // DEFINE Dest with new version (normal case)
-          VarKey := GetRegisterKey(Instr.Dest);
-
-          // With global variable semantics, all definitions use Version=0
-          // (BASIC variables are global, no SSA versioning needed)
-          if FGlobalVariableSemantics then
-            Instr.Dest.Version := 0
-          else
+          VarIdx := FindVarIndex(Instr.Dest.RegType, Instr.Dest.RegIndex);
+          if VarIdx >= 0 then
           begin
-            // CRITICAL: Always call NewVersion to get a unique version number
-            // even if stack is not empty (backtracking from sibling blocks)
-            NewVer := NewVersion(VarKey);
+            NewVer := NewVersion(VarIdx);
             Instr.Dest.Version := NewVer;
-            PushVersion(VarKey, NewVer);
-            SavedVersions.Add(VarKey);
+            PushVersion(VarIdx, NewVer);
+            // Track for backtracking
+            if SavedCount >= Length(SavedVarIndices) then
+              SetLength(SavedVarIndices, Length(SavedVarIndices) * 2);
+            SavedVarIndices[SavedCount] := VarIdx;
+            Inc(SavedCount);
           end;
         end;
       end;
     end;
-
-    // STEP 3: Fill PHI operands in successor blocks
-    for i := 0 to Block.Successors.Count - 1 do
-    begin
-      SuccBlock := TSSABasicBlock(Block.Successors[i]);
-
-      // Find PHI instructions in successor
-      for j := 0 to SuccBlock.Instructions.Count - 1 do
-      begin
-        Instr := SuccBlock.Instructions[j];
-        if Instr.OpCode <> ssaPhi then Break;
-
-        // Find the PHI source corresponding to this block
-        for NewVer := 0 to High(Instr.PhiSources) do
-        begin
-          if Instr.PhiSources[NewVer].FromBlock = Block then
-          begin
-            VarKey := GetRegisterKey(Instr.PhiSources[NewVer].Value);
-            Instr.PhiSources[NewVer].Value.Version := CurrentVersion(VarKey);
-            Break;
-          end;
-        end;
-      end;
-    end;
-
-    // STEP 4: Recursively process children in dominator tree
-    Children := FDomTree.GetChildren(Block);
-    if Assigned(Children) then
-    begin
-      try
-        for i := 0 to Children.Count - 1 do
-        begin
-          Child := TSSABasicBlock(Children[i]);
-          RenameBlock(Child);
-        end;
-      finally
-        Children.Free;  // GetChildren allocates a new list
-      end;
-    end;
-
-    // STEP 5: Restore version stack (backtrack)
-    // Backtracking depends on language semantics:
-    // - Global variable semantics (BASIC, FORTRAN): NO backtracking, modifications persist
-    // - Scoped variable semantics (C, Pascal, Java): YES backtracking, restore local scope
-    {$IFDEF DEBUG_SSA}
-    if DebugSSA then
-    begin
-      if FGlobalVariableSemantics then
-        WriteLn('[SSA-RENAME] Skipping backtrack (global variable semantics)')
-      else
-        WriteLn('[SSA-RENAME] Backtracking from block ', Block.LabelName, ', popping ', SavedVersions.Count, ' versions');
-    end;
-    {$ENDIF}
-    if not FGlobalVariableSemantics then
-    begin
-      for i := 0 to SavedVersions.Count - 1 do
-        PopVersion(SavedVersions[i]);
-    end;
-    {$IFDEF DEBUG_SSA}
-    if DebugSSA then
-      WriteLn('[SSA-RENAME] ========== Finished block: ', Block.LabelName, ' ==========');
-    {$ENDIF}
-
-  finally
-    SavedVersions.Free;
   end;
+
+  // STEP 3: Fill PHI operands in successor blocks
+  for i := 0 to Block.Successors.Count - 1 do
+  begin
+    SuccBlock := TSSABasicBlock(Block.Successors[i]);
+
+    for j := 0 to SuccBlock.Instructions.Count - 1 do
+    begin
+      Instr := SuccBlock.Instructions[j];
+      if Instr.OpCode <> ssaPhi then Break;
+
+      // Find the PHI source corresponding to this block
+      for k := 0 to High(Instr.PhiSources) do
+      begin
+        if Instr.PhiSources[k].FromBlock = Block then
+        begin
+          VarIdx := FindVarIndex(Instr.PhiSources[k].Value.RegType, Instr.PhiSources[k].Value.RegIndex);
+          if VarIdx >= 0 then
+            Instr.PhiSources[k].Value.Version := CurrentVersion(VarIdx);
+          Break;
+        end;
+      end;
+    end;
+  end;
+
+  // STEP 4: Recursively process children in dominator tree
+  Children := FDomTree.GetChildren(Block);
+  if Assigned(Children) then
+  begin
+    try
+      for i := 0 to Children.Count - 1 do
+      begin
+        Child := TSSABasicBlock(Children[i]);
+        RenameBlock(Child);
+      end;
+    finally
+      Children.Free;
+    end;
+  end;
+
+  // STEP 5: Restore version stack (backtrack) - only for scoped semantics
+  if not FGlobalVariableSemantics then
+  begin
+    for i := 0 to SavedCount - 1 do
+      PopVersion(SavedVarIndices[i]);
+  end;
+
+  {$IFDEF DEBUG_SSA}
+  if DebugSSA then
+    WriteLn('[SSA-RENAME] ========== Finished block: ', Block.LabelName, ' ==========');
+  {$ENDIF}
 end;
 
 end.

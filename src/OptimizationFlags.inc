@@ -64,3 +64,4 @@
   {$DEFINE DISABLE_REG_COMPACTION}     // Skip Register Compaction (post-bytecode)
 {$ENDIF}
 
+{.$DEFINE DISABLE_REG_COMPACTION}

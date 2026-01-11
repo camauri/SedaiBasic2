@@ -591,94 +591,62 @@ end;
 procedure TLinearScanAllocator.ComputeVariableUsage(out VarList: TObjectList);
 var
   i, j, k: Integer;
-  VarName, VarKey: string;
+  VarName: string;
   Block: TSSABasicBlock;
   Instr: TSSAInstruction;
   VarInfo: TVariableInfo;
-  RegType: TSSARegisterType;
-  RegIndex: Integer;
+  VarIndex: TFPHashList;
 
-  function FindOrCreateVarInfo(const Key: string): TVariableInfo;
-  var
-    idx: Integer;
-    Parts: TStringList;
-    RegTypeInt, RegVer: Integer;
-  begin
-    // Search for existing VarInfo (key now includes version)
-    for idx := 0 to VarList.Count - 1 do
-    begin
-      VarInfo := TVariableInfo(VarList[idx]);
-      if (IntToStr(Ord(VarInfo.RegType)) + ':' + IntToStr(VarInfo.VirtualReg) + ':' + IntToStr(VarInfo.Version)) = Key then
-        Exit(VarInfo);
-    end;
-
-    // Create new VarInfo
-    Parts := TStringList.Create;
-    try
-      Parts.Delimiter := ':';
-      Parts.DelimitedText := Key;
-      if Parts.Count = 3 then
-      begin
-        RegTypeInt := StrToInt(Parts[0]);
-        RegIndex := StrToInt(Parts[1]);
-        RegVer := StrToInt(Parts[2]);
-        RegType := TSSARegisterType(RegTypeInt);
-
-        // Include version in name for debugging
-        if RegVer = 0 then
-          VarName := 'r' + IntToStr(RegIndex)
-        else
-          VarName := 'r' + IntToStr(RegIndex) + '_v' + IntToStr(RegVer);
-
-        Result := TVariableInfo.Create(VarName, RegType, RegIndex, RegVer);
-        VarList.Add(Result);
-      end
-      else
-        Result := nil;
-    finally
-      Parts.Free;
-    end;
-  end;
-
-  procedure CountUsage(const Val: TSSAValue);
+  function FindOrCreateVarInfo(RegType: TSSARegisterType; RegIdx, RegVer: Integer): TVariableInfo;
   var
     Key: string;
+    Ptr: Pointer;
+  begin
+    Key := IntToStr(Ord(RegType)) + ':' + IntToStr(RegIdx) + ':' + IntToStr(RegVer);
+    Ptr := VarIndex.Find(Key);
+    if Ptr <> nil then
+      Exit(TVariableInfo(Ptr));
+
+    if RegVer = 0 then
+      VarName := 'r' + IntToStr(RegIdx)
+    else
+      VarName := 'r' + IntToStr(RegIdx) + '_v' + IntToStr(RegVer);
+
+    Result := TVariableInfo.Create(VarName, RegType, RegIdx, RegVer);
+    VarList.Add(Result);
+    VarIndex.Add(Key, Result);
+  end;
+
+  procedure CountUsage(const Val: TSSAValue); inline;
+  var
     Info: TVariableInfo;
-    OldCount: Integer;
   begin
     if Val.Kind <> svkRegister then Exit;
-
-    // CRITICAL: Include Version in key to distinguish SSA versions
-    Key := IntToStr(Ord(Val.RegType)) + ':' + IntToStr(Val.RegIndex) + ':' + IntToStr(Val.Version);
-    OldCount := VarList.Count;
-    Info := FindOrCreateVarInfo(Key);
+    Info := FindOrCreateVarInfo(Val.RegType, Val.RegIndex, Val.Version);
     if Assigned(Info) then
       Inc(Info.UsageCount);
   end;
 
 begin
-  VarList := TObjectList.Create(True);  // Owns TVariableInfo objects
-
-  // Scan all instructions and count register usage
-  for i := 0 to FProgram.Blocks.Count - 1 do
-  begin
-    Block := FProgram.Blocks[i];
-    for j := 0 to Block.Instructions.Count - 1 do
+  VarList := TObjectList.Create(True);
+  VarIndex := TFPHashList.Create;
+  try
+    for i := 0 to FProgram.Blocks.Count - 1 do
     begin
-      Instr := Block.Instructions[j];
-
-      // Count source operand usage
-      CountUsage(Instr.Src1);
-      CountUsage(Instr.Src2);
-      CountUsage(Instr.Src3);
-
-      // Count destination usage (definitions also count as "usage")
-      CountUsage(Instr.Dest);
-
-      // CRITICAL: Count PhiSources usage (used by BOX, RGBA, etc.)
-      for k := 0 to High(Instr.PhiSources) do
-        CountUsage(Instr.PhiSources[k].Value);
+      Block := FProgram.Blocks[i];
+      for j := 0 to Block.Instructions.Count - 1 do
+      begin
+        Instr := Block.Instructions[j];
+        CountUsage(Instr.Src1);
+        CountUsage(Instr.Src2);
+        CountUsage(Instr.Src3);
+        CountUsage(Instr.Dest);
+        for k := 0 to High(Instr.PhiSources) do
+          CountUsage(Instr.PhiSources[k].Value);
+      end;
     end;
+  finally
+    VarIndex.Free;
   end;
 
   {$IFDEF DEBUG_REGALLOC}
@@ -756,117 +724,91 @@ var
   ArrInfo: TSSAArrayInfo;
   NewDimRegs: array of Integer;
   NewDimRegTypes: array of TSSARegisterType;
-  FoundReg: Boolean;
+  VarIndex: TFPHashList;
 
   function RewriteValueBASIC(const Val: TSSAValue): TSSAValue;
   var
-    idx: Integer;
-    Found: Boolean;
+    Key: string;
+    Ptr: Pointer;
   begin
     Result := Val;
-
     if Val.Kind <> svkRegister then Exit;
 
-    Found := False;
-    // Find variable info for this virtual register (MUST match Version too!)
-    for idx := 0 to VarList.Count - 1 do
+    Key := IntToStr(Ord(Val.RegType)) + ':' + IntToStr(Val.RegIndex) + ':' + IntToStr(Val.Version);
+    Ptr := VarIndex.Find(Key);
+    if Ptr <> nil then
     begin
-      VarInfo := TVariableInfo(VarList[idx]);
-      // CRITICAL: Match RegType, RegIndex AND Version
-      if (VarInfo.RegType = Val.RegType) and
-         (VarInfo.VirtualReg = Val.RegIndex) and
-         (VarInfo.Version = Val.Version) then
-      begin
-        Found := True;
-        // All variables now have PhysicalReg assigned (either physical reg 0-31
-        // or spill slot 32+), so always rewrite
-        Result.RegIndex := VarInfo.PhysicalReg;
-        Result.Version := 0;  // Physical registers have no version
-        Exit;
-      end;
+      VarInfo := TVariableInfo(Ptr);
+      Result.RegIndex := VarInfo.PhysicalReg;
+      Result.Version := 0;
     end;
   end;
 
   function RewriteDimRegister(VirtReg: Integer; RegType: TSSARegisterType): Integer;
   var
-    idx: Integer;
+    Key: string;
+    Ptr: Pointer;
   begin
-    Result := VirtReg;  // Default: keep original if not found
-    for idx := 0 to VarList.Count - 1 do
-    begin
-      VarInfo := TVariableInfo(VarList[idx]);
-      if (VarInfo.RegType = RegType) and (VarInfo.VirtualReg = VirtReg) then
-      begin
-        Result := VarInfo.PhysicalReg;
-        Exit;
-      end;
-    end;
-    {$IFDEF DEBUG_REGALLOC}
-    if DebugRegAlloc then
-      WriteLn('[RegAlloc] WARNING: DimRegister r', VirtReg, ' type=', Ord(RegType), ' NOT FOUND!');
-    {$ENDIF}
+    Result := VirtReg;
+    Key := IntToStr(Ord(RegType)) + ':' + IntToStr(VirtReg) + ':0';
+    Ptr := VarIndex.Find(Key);
+    if Ptr <> nil then
+      Result := TVariableInfo(Ptr).PhysicalReg;
   end;
 
 begin
-  {$IFDEF DEBUG_REGALLOC}
-  if DebugRegAlloc then
-    WriteLn('[RegAlloc] Rewriting program with physical registers...');
-  {$ENDIF}
-
-  // Rewrite instructions in all blocks
-  for i := 0 to FProgram.Blocks.Count - 1 do
-  begin
-    Block := FProgram.Blocks[i];
-    for j := 0 to Block.Instructions.Count - 1 do
+  // Build hash index for O(1) lookup
+  VarIndex := TFPHashList.Create;
+  try
+    for i := 0 to VarList.Count - 1 do
     begin
-      Instr := Block.Instructions[j];
-
-      // Rewrite all register references
-      Instr.Src1 := RewriteValueBASIC(Instr.Src1);
-      Instr.Src2 := RewriteValueBASIC(Instr.Src2);
-      Instr.Src3 := RewriteValueBASIC(Instr.Src3);
-      Instr.Dest := RewriteValueBASIC(Instr.Dest);
-
-      // CRITICAL: Rewrite PhiSources for instructions that use them for extra operands
-      // (e.g., ssaGraphicBox uses PhiSources[0..4] for x2, y2, angle, filled, fill_color)
-      for k := 0 to High(Instr.PhiSources) do
-        Instr.PhiSources[k].Value := RewriteValueBASIC(Instr.PhiSources[k].Value);
+      VarInfo := TVariableInfo(VarList[i]);
+      VarIndex.Add(IntToStr(Ord(VarInfo.RegType)) + ':' + IntToStr(VarInfo.VirtualReg) + ':' + IntToStr(VarInfo.Version), VarInfo);
     end;
-  end;
 
-  // CRITICAL: Rewrite DimRegisters in array declarations
-  // Arrays with variable dimensions (DIM A(N%)) store the register index
-  // that holds the dimension value. These must be rewritten to physical registers.
-  for i := 0 to FProgram.GetArrayCount - 1 do
-  begin
-    ArrInfo := FProgram.GetArray(i);
-    if Length(ArrInfo.DimRegisters) > 0 then
+    for i := 0 to FProgram.Blocks.Count - 1 do
     begin
-      SetLength(NewDimRegs, Length(ArrInfo.DimRegisters));
-      SetLength(NewDimRegTypes, Length(ArrInfo.DimRegTypes));
-
-      for d := 0 to High(ArrInfo.DimRegisters) do
+      Block := FProgram.Blocks[i];
+      for j := 0 to Block.Instructions.Count - 1 do
       begin
-        if ArrInfo.DimRegisters[d] >= 0 then
-        begin
-          NewDimRegs[d] := RewriteDimRegister(ArrInfo.DimRegisters[d], ArrInfo.DimRegTypes[d]);
-          NewDimRegTypes[d] := ArrInfo.DimRegTypes[d];
-          {$IFDEF DEBUG_REGALLOC}
-          if DebugRegAlloc then
-            WriteLn('[RegAlloc] Array ', ArrInfo.Name, ' dim[', d, ']: r',
-                    ArrInfo.DimRegisters[d], ' → R', NewDimRegs[d]);
-          {$ENDIF}
-        end
-        else
-        begin
-          NewDimRegs[d] := ArrInfo.DimRegisters[d];
-          NewDimRegTypes[d] := ArrInfo.DimRegTypes[d];
-        end;
+        Instr := Block.Instructions[j];
+        Instr.Src1 := RewriteValueBASIC(Instr.Src1);
+        Instr.Src2 := RewriteValueBASIC(Instr.Src2);
+        Instr.Src3 := RewriteValueBASIC(Instr.Src3);
+        Instr.Dest := RewriteValueBASIC(Instr.Dest);
+        for k := 0 to High(Instr.PhiSources) do
+          Instr.PhiSources[k].Value := RewriteValueBASIC(Instr.PhiSources[k].Value);
       end;
-
-      // Update the array info with new physical registers
-      FProgram.SetArrayDimRegisters(i, NewDimRegs, NewDimRegTypes);
     end;
+
+    // Rewrite DimRegisters in array declarations
+    for i := 0 to FProgram.GetArrayCount - 1 do
+    begin
+      ArrInfo := FProgram.GetArray(i);
+      if Length(ArrInfo.DimRegisters) > 0 then
+      begin
+        SetLength(NewDimRegs, Length(ArrInfo.DimRegisters));
+        SetLength(NewDimRegTypes, Length(ArrInfo.DimRegTypes));
+
+        for d := 0 to High(ArrInfo.DimRegisters) do
+        begin
+          if ArrInfo.DimRegisters[d] >= 0 then
+          begin
+            NewDimRegs[d] := RewriteDimRegister(ArrInfo.DimRegisters[d], ArrInfo.DimRegTypes[d]);
+            NewDimRegTypes[d] := ArrInfo.DimRegTypes[d];
+          end
+          else
+          begin
+            NewDimRegs[d] := ArrInfo.DimRegisters[d];
+            NewDimRegTypes[d] := ArrInfo.DimRegTypes[d];
+          end;
+        end;
+
+        FProgram.SetArrayDimRegisters(i, NewDimRegs, NewDimRegTypes);
+      end;
+    end;
+  finally
+    VarIndex.Free;
   end;
 end;
 

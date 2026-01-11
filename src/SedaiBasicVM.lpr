@@ -458,7 +458,12 @@ var
   Output: IOutputDevice;
   Input: IInputDevice;
   Timer: THiResTimer;
-  SSATime, CompileTime, ExecuteTime: Double;
+  SSATime, OptTime, CompileTime, ExecuteTime: Double;
+  // Per-pass timing (when OptStats is enabled)
+  TimeDBE, TimeDomTree, TimeSSAConstr, TimeGVN, TimeCSE, TimeAlgebraic: Double;
+  TimeStrength, TimeGosubInline, TimeConstProp, TimeCopyProp, TimeLICM: Double;
+  TimeLoopUnroll, TimeDCE, TimePhiElim, TimeCopyCoal, TimeRegAlloc: Double;
+  PassTimer: THiResTimer;
   i, removed: Integer;
   ShowBanners: Boolean;
   {$IFDEF ENABLE_PROFILER}
@@ -638,6 +643,14 @@ begin
       end;
       {$ENDIF}
 
+      // Start optimization timer
+      Timer := CreateHiResTimer;
+      // Initialize per-pass timers
+      TimeDBE := 0; TimeDomTree := 0; TimeSSAConstr := 0; TimeGVN := 0;
+      TimeCSE := 0; TimeAlgebraic := 0; TimeStrength := 0; TimeGosubInline := 0;
+      TimeConstProp := 0; TimeCopyProp := 0; TimeLICM := 0; TimeLoopUnroll := 0;
+      TimeDCE := 0; TimePhiElim := 0; TimeCopyCoal := 0; TimeRegAlloc := 0;
+
       {$IFNDEF DISABLE_DBE}
       // DEAD BLOCK ELIMINATION - Remove unreachable blocks BEFORE dominator tree
       // CRITICAL: Must run BEFORE dominator tree because dominator tree requires
@@ -649,6 +662,7 @@ begin
         WriteLn('=== DEAD BLOCK ELIMINATION ===');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         SSAProgram.RunDBE;
       except
@@ -658,6 +672,7 @@ begin
           WriteLn('Continuing...');
         end;
       end;
+      if OptStats then TimeDBE := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_DBE}
       if DebugDBE then
@@ -679,6 +694,7 @@ begin
         WriteLn('=== DOMINATOR TREE CONSTRUCTION ===');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         SSAProgram.BuildDominatorTree;
       except
@@ -689,9 +705,11 @@ begin
           Exit;
         end;
       end;
+      if OptStats then TimeDomTree := PassTimer.ElapsedMilliseconds;
 
       // PHASE 3: Semi-Pruned SSA Construction with versioning
       {$IFNDEF DISABLE_SSA_CONSTRUCTION}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         SSAProgram.RunSSAConstruction;
       except
@@ -702,6 +720,7 @@ begin
           Exit;
         end;
       end;
+      if OptStats then TimeSSAConstr := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_SSA}
       if DebugSSA then
@@ -734,6 +753,7 @@ begin
         WriteLn('=== GLOBAL VALUE NUMBERING ===');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         SSAProgram.RunGVN;
       except
@@ -743,6 +763,7 @@ begin
           WriteLn('Continuing with unoptimized SSA...');
         end;
       end;
+      if OptStats then TimeGVN := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_GVN}
       if DebugGVN then
@@ -774,6 +795,7 @@ begin
         WriteLn('=== COMMON SUBEXPRESSION ELIMINATION ===');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         SSAProgram.RunCSE;
       except
@@ -783,6 +805,7 @@ begin
           WriteLn('Continuing...');
         end;
       end;
+      if OptStats then TimeCSE := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_CSE}
       if DebugCSE then
@@ -813,6 +836,7 @@ begin
         WriteLn('=== ALGEBRAIC SIMPLIFICATION ===');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         SSAProgram.RunAlgebraic;
       except
@@ -822,6 +846,7 @@ begin
           WriteLn('Continuing...');
         end;
       end;
+      if OptStats then TimeAlgebraic := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_ALGEBRAIC}
       if DebugAlgebraic then
@@ -842,6 +867,7 @@ begin
         WriteLn('=== STRENGTH REDUCTION ===');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         SSAProgram.RunStrengthReduction;
       except
@@ -851,6 +877,7 @@ begin
           WriteLn('Continuing...');
         end;
       end;
+      if OptStats then TimeStrength := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_STRENGTH}
       if DebugStrength then
@@ -871,6 +898,7 @@ begin
         WriteLn('=== GOSUB INLINING ===');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         SSAProgram.RunGosubInlining;
       except
@@ -880,6 +908,7 @@ begin
           WriteLn('Continuing...');
         end;
       end;
+      if OptStats then TimeGosubInline := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_SSA}
       if DebugSSA then
@@ -902,6 +931,7 @@ begin
         WriteLn('=== CONSTANT PROPAGATION ===');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         SSAProgram.RunConstProp;
       except
@@ -911,6 +941,7 @@ begin
           WriteLn('Continuing...');
         end;
       end;
+      if OptStats then TimeConstProp := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_CONSTPROP}
       if DebugConstProp then
@@ -931,6 +962,7 @@ begin
         WriteLn('=== COPY PROPAGATION ===');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         SSAProgram.RunCopyProp;
       except
@@ -940,6 +972,7 @@ begin
           WriteLn('Continuing...');
         end;
       end;
+      if OptStats then TimeCopyProp := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_COPYPROP}
       if DebugCopyProp then
@@ -960,6 +993,7 @@ begin
         WriteLn('=== LOOP-INVARIANT CODE MOTION ===');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         SSAProgram.RunLICM;
       except
@@ -969,6 +1003,7 @@ begin
           WriteLn('Continuing...');
         end;
       end;
+      if OptStats then TimeLICM := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_LICM}
       if DebugLICM then
@@ -991,6 +1026,7 @@ begin
         WriteLn('[UNROLL] Rebuilding dominator tree (LICM may have modified CFG)...');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         // Rebuild dominator tree to include any blocks added by LICM
         SSAProgram.ClearDomTree;
@@ -1003,6 +1039,7 @@ begin
           WriteLn('Continuing...');
         end;
       end;
+      if OptStats then TimeLoopUnroll := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_SSA}
       if DebugSSA then
@@ -1024,6 +1061,7 @@ begin
         WriteLn('=== DEAD CODE ELIMINATION ===');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         SSAProgram.RunDCE;
       except
@@ -1033,6 +1071,7 @@ begin
           WriteLn('Continuing...');
         end;
       end;
+      if OptStats then TimeDCE := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_DCE}
       if DebugDCE then
@@ -1056,6 +1095,7 @@ begin
         WriteLn('=== PHI ELIMINATION ===');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         SSAProgram.RunPhiElimination;
       except
@@ -1066,6 +1106,7 @@ begin
           Exit;
         end;
       end;
+      if OptStats then TimePhiElim := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_PHIELIM}
       if DebugPhiElim then
@@ -1098,6 +1139,7 @@ begin
         WriteLn('=== COPY COALESCING ===');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       try
         SSAProgram.RunCopyCoalescing;
       except
@@ -1107,6 +1149,7 @@ begin
           WriteLn('Continuing...');
         end;
       end;
+      if OptStats then TimeCopyCoal := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_COPYCOAL}
       if DebugCopyCoal then
@@ -1130,6 +1173,7 @@ begin
         WriteLn('=== REGISTER ALLOCATION ===');
       end;
       {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
       RegAlloc := TLinearScanAllocator.Create(SSAProgram);
       try
         try
@@ -1149,6 +1193,7 @@ begin
       finally
         RegAlloc.Free;
       end;
+      if OptStats then TimeRegAlloc := PassTimer.ElapsedMilliseconds;
       {$ELSE}
       {$IFDEF DEBUG_REGALLOC}
       if DebugRegAlloc then
@@ -1159,6 +1204,9 @@ begin
       end;
       {$ENDIF}
       {$ENDIF}
+
+      // End optimization timer
+      OptTime := Timer.ElapsedMilliseconds;
 
     finally
       SSAGen.Free;
@@ -1375,6 +1423,32 @@ begin
         WriteLn('=== SKIPPING VM EXECUTION (--no-exec) ===');
       WriteLn('Compilation completed successfully.');
       WriteLn('Instructions: ', BytecodeProgram.GetInstructionCount);
+      if OptStats then
+      begin
+        WriteLn;
+        WriteLn('=== COMPILATION STATISTICS ===');
+        WriteLn(Format('SSA generation:   %s', [FormatTimeEx(SSATime)]));
+        WriteLn(Format('Optimizations:    %s', [FormatTimeEx(OptTime)]));
+        WriteLn('  Per-pass breakdown:');
+        WriteLn(Format('    DBE:           %8.3f ms', [TimeDBE]));
+        WriteLn(Format('    Dom Tree:      %8.3f ms', [TimeDomTree]));
+        WriteLn(Format('    SSA Constr:    %8.3f ms', [TimeSSAConstr]));
+        WriteLn(Format('    GVN:           %8.3f ms', [TimeGVN]));
+        WriteLn(Format('    CSE:           %8.3f ms', [TimeCSE]));
+        WriteLn(Format('    Algebraic:     %8.3f ms', [TimeAlgebraic]));
+        WriteLn(Format('    Strength:      %8.3f ms', [TimeStrength]));
+        WriteLn(Format('    GOSUB Inline:  %8.3f ms', [TimeGosubInline]));
+        WriteLn(Format('    Const Prop:    %8.3f ms', [TimeConstProp]));
+        WriteLn(Format('    Copy Prop:     %8.3f ms', [TimeCopyProp]));
+        WriteLn(Format('    LICM:          %8.3f ms', [TimeLICM]));
+        WriteLn(Format('    Loop Unroll:   %8.3f ms', [TimeLoopUnroll]));
+        WriteLn(Format('    DCE:           %8.3f ms', [TimeDCE]));
+        WriteLn(Format('    PHI Elim:      %8.3f ms', [TimePhiElim]));
+        WriteLn(Format('    Copy Coal:     %8.3f ms', [TimeCopyCoal]));
+        WriteLn(Format('    Reg Alloc:     %8.3f ms', [TimeRegAlloc]));
+        WriteLn(Format('Compilation time: %s', [FormatTimeEx(CompileTime)]));
+        WriteLn(Format('Total time:       %s', [FormatTimeEx(SSATime + OptTime + CompileTime)]));
+      end;
       // Cleanup without VM
       BytecodeProgram.Free;
       SSAProgram.Free;
@@ -1477,9 +1551,27 @@ begin
           WriteLn(Format('Time per instruction:  %s', [FormatTime(ExecuteTime / VM.InstructionsExecuted)]));
         {$ENDIF}
         WriteLn(Format('SSA generation:   %s', [FormatTimeEx(SSATime)]));
+        WriteLn(Format('Optimizations:    %s', [FormatTimeEx(OptTime)]));
+        WriteLn('  Per-pass breakdown:');
+        WriteLn(Format('    DBE:           %8.3f ms', [TimeDBE]));
+        WriteLn(Format('    Dom Tree:      %8.3f ms', [TimeDomTree]));
+        WriteLn(Format('    SSA Constr:    %8.3f ms', [TimeSSAConstr]));
+        WriteLn(Format('    GVN:           %8.3f ms', [TimeGVN]));
+        WriteLn(Format('    CSE:           %8.3f ms', [TimeCSE]));
+        WriteLn(Format('    Algebraic:     %8.3f ms', [TimeAlgebraic]));
+        WriteLn(Format('    Strength:      %8.3f ms', [TimeStrength]));
+        WriteLn(Format('    GOSUB Inline:  %8.3f ms', [TimeGosubInline]));
+        WriteLn(Format('    Const Prop:    %8.3f ms', [TimeConstProp]));
+        WriteLn(Format('    Copy Prop:     %8.3f ms', [TimeCopyProp]));
+        WriteLn(Format('    LICM:          %8.3f ms', [TimeLICM]));
+        WriteLn(Format('    Loop Unroll:   %8.3f ms', [TimeLoopUnroll]));
+        WriteLn(Format('    DCE:           %8.3f ms', [TimeDCE]));
+        WriteLn(Format('    PHI Elim:      %8.3f ms', [TimePhiElim]));
+        WriteLn(Format('    Copy Coal:     %8.3f ms', [TimeCopyCoal]));
+        WriteLn(Format('    Reg Alloc:     %8.3f ms', [TimeRegAlloc]));
         WriteLn(Format('Compilation time: %s', [FormatTimeEx(CompileTime)]));
         WriteLn(Format('Execution time:   %s', [FormatTimeEx(ExecuteTime)]));
-        WriteLn(Format('Total time:       %s', [FormatTimeEx(SSATime + CompileTime + ExecuteTime)]));
+        WriteLn(Format('Total time:       %s', [FormatTimeEx(SSATime + OptTime + CompileTime + ExecuteTime)]));
       end;
 
       {$IFDEF ENABLE_PROFILER}

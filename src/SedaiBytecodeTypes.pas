@@ -63,6 +63,31 @@ type
   { Bytecode Opcode - 2-byte encoding for extensibility }
   TBytecodeOp = Word;
 
+{ ============================================================================
+  IMPORTANT: WHEN ADDING A NEW OPCODE
+
+  You MUST also update SedaiRegisterCompaction.pas to handle the new opcode!
+
+  For each new opcode, add it to the appropriate function(s):
+    - DestIsIntReg()     - if Dest is written as INT
+    - DestIsFloatReg()   - if Dest is written as FLOAT
+    - DestIsStringReg()  - if Dest is written as STRING
+    - DestReadIsIntReg() - if Dest is READ as INT (e.g. ArrayStore value)
+    - DestReadIsFloatReg() - if Dest is READ as FLOAT
+    - DestReadIsStringReg() - if Dest is READ as STRING
+    - Src1IsIntReg()     - if Src1 is INT
+    - Src1IsFloatReg()   - if Src1 is FLOAT
+    - Src1IsStringReg()  - if Src1 is STRING
+    - Src2IsIntReg()     - if Src2 is INT
+    - Src2IsFloatReg()   - if Src2 is FLOAT
+    - Src2IsStringReg()  - if Src2 is STRING
+    - ImmediateIsFloatReg() - if Immediate contains float register index
+    - Special handling in RewriteInstructions() for packed Immediate fields
+
+  Failure to do this will cause register mismatch bugs when optimizations
+  are enabled (the register compaction pass won't remap registers correctly).
+  ============================================================================ }
+
 const
   // === GROUP 0: CORE VM OPERATIONS (0x00xx) ===
   // Load constants
@@ -456,6 +481,7 @@ type
     function GetArrayCount: Integer;
     function GetInstructionsPtr: Pointer;  // Direct access for fast VM loop
     function FindPCForLine(LineNum: Integer): Integer;  // Find PC for BASIC line number
+    function FindPCAfterLine(LineNum: Integer): Integer;  // Find PC for first instruction AFTER given line
     property StringConstants: TStringList read FStringConstants;
     property EntryPoint: Integer read FEntryPoint write FEntryPoint;
   end;
@@ -644,6 +670,7 @@ end;
 function TBytecodeProgram.FindPCForLine(LineNum: Integer): Integer;
 var
   i: Integer;
+  BestPC, BestLine: Integer;
 begin
   // Scan instructions to find the first one with matching source line
   for i := 0 to High(FInstructions) do
@@ -654,7 +681,42 @@ begin
       Exit;
     end;
   end;
-  Result := -1;  // Line not found
+  // Exact match not found - find instruction with MINIMUM SourceLine > LineNum
+  // (handles REM statements and other non-code lines)
+  // Instructions are not ordered by SourceLine, so we must scan all
+  BestPC := -1;
+  BestLine := MaxInt;
+  for i := 0 to High(FInstructions) do
+  begin
+    if (FInstructions[i].SourceLine > LineNum) and
+       (FInstructions[i].SourceLine < BestLine) then
+    begin
+      BestLine := FInstructions[i].SourceLine;
+      BestPC := i;
+    end;
+  end;
+  Result := BestPC;
+end;
+
+function TBytecodeProgram.FindPCAfterLine(LineNum: Integer): Integer;
+var
+  i: Integer;
+  BestPC, BestLine: Integer;
+begin
+  // Find the first instruction with SourceLine > LineNum
+  // This is used by RESUME NEXT to skip to the next BASIC line
+  BestPC := -1;
+  BestLine := MaxInt;
+  for i := 0 to High(FInstructions) do
+  begin
+    if (FInstructions[i].SourceLine > LineNum) and
+       (FInstructions[i].SourceLine < BestLine) then
+    begin
+      BestLine := FInstructions[i].SourceLine;
+      BestPC := i;
+    end;
+  end;
+  Result := BestPC;
 end;
 
 function BytecodeOpToString(Op: TBytecodeOp): string;

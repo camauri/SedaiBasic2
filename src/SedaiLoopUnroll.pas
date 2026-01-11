@@ -92,7 +92,9 @@ type
     FUnrollFactor: Integer;      // How many times to duplicate (default: 2)
     FMaxBodySize: Integer;       // Max instructions in loop body to unroll
     FUnrolledCount: Integer;     // Number of loops unrolled
-    FDominatorMap: TFPHashList;  // Maps block -> immediate dominator
+    // O(1) lookup using BlockIndex instead of string hash
+    FDominatorMap: array of TSSABasicBlock;  // FDominatorMap[blockIndex] = idom block
+    FBlockCount: Integer;
 
     { Build dominator map from program's dominator tree }
     procedure BuildDominatorMap;
@@ -194,12 +196,13 @@ begin
   FUnrollFactor := 2;       // Conservative: 2x unrolling
   FMaxBodySize := 30;       // Allow slightly larger loops
   FUnrolledCount := 0;
-  FDominatorMap := TFPHashList.Create;
+  FBlockCount := FProgram.Blocks.Count;
+  SetLength(FDominatorMap, FBlockCount);
 end;
 
 destructor TLoopUnroller.Destroy;
 begin
-  FDominatorMap.Free;
+  SetLength(FDominatorMap, 0);
   inherited;
 end;
 
@@ -209,27 +212,26 @@ var
   i: Integer;
   Block, IdomBlock: TSSABasicBlock;
 begin
-  FDominatorMap.Clear;
+  // Initialize all entries to nil
+  FillChar(FDominatorMap[0], FBlockCount * SizeOf(TSSABasicBlock), 0);
 
   if not Assigned(FProgram.GetDomTree) then
-  begin
-    {$IFDEF DEBUG_SSA}
-    WriteLn('[UNROLL] ERROR: Dominator tree not available');
-    {$ENDIF}
     Exit;
-  end;
 
   DomTree := TDominatorTree(FProgram.GetDomTree);
 
-  for i := 0 to FProgram.Blocks.Count - 1 do
+  for i := 0 to FBlockCount - 1 do
   begin
     Block := FProgram.Blocks[i];
-    try
-      IdomBlock := DomTree.GetIdom(Block);
-      if IdomBlock <> nil then
-        FDominatorMap.Add(Format('%p', [Pointer(Block)]), Pointer(IdomBlock));
-    except
-      // Block may not be in dominator tree - skip it
+    // Use BlockIndex for O(1) lookup instead of string hash
+    if (Block.BlockIndex >= 0) and (Block.BlockIndex < FBlockCount) then
+    begin
+      try
+        IdomBlock := DomTree.GetIdom(Block);
+        FDominatorMap[Block.BlockIndex] := IdomBlock;  // nil is OK
+      except
+        FDominatorMap[Block.BlockIndex] := nil;
+      end;
     end;
   end;
 end;
@@ -237,23 +239,26 @@ end;
 function TLoopUnroller.IsBackEdge(From, Target: TSSABasicBlock): Boolean;
 var
   Current: TSSABasicBlock;
-  Idx: Integer;
+  LoopCount: Integer;
 begin
-  // A back-edge is an edge where Target dominates From
+  // Back-edge: From dominates Target (Target is ancestor in dominator tree)
+  // Walk up the dominator tree from From to see if we reach Target
   Result := False;
   Current := From;
+  LoopCount := 0;
 
-  while Current <> nil do
+  while (Current <> nil) and (LoopCount < 1000) do
   begin
+    Inc(LoopCount);
     if Current = Target then
     begin
       Result := True;
       Exit;
     end;
-    Idx := FDominatorMap.FindIndexOf(Format('%p', [Pointer(Current)]));
-    if Idx < 0 then
+    // O(1) lookup using BlockIndex instead of string hash
+    if (Current.BlockIndex < 0) or (Current.BlockIndex >= FBlockCount) then
       Break;
-    Current := TSSABasicBlock(FDominatorMap.Items[Idx]);
+    Current := FDominatorMap[Current.BlockIndex];
   end;
 end;
 

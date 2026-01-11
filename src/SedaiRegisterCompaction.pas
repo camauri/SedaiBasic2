@@ -197,10 +197,22 @@ begin
     // === GROUP 4: I/O operations ===
     bcInputInt,      // Input int
     bcDataReadInt,   // Read next DATA value into int register
+    // === GROUP 5: Special variables ===
+    bcLoadTI,         // TI: jiffies since start (int)
+    bcLoadEL,         // EL: last error line number (int)
+    bcLoadER,         // ER: last error code (int)
+    bcFre,            // FRE: available memory (int)
+    // === GROUP 7: Sprite functions ===
+    bcBump,           // BUMP(n): collision bitmask (int)
+    bcRspcolor,       // RSPCOLOR(n): multicolor value (int)
+    bcRsprite,        // RSPRITE(sprite, attr): sprite attribute (int)
     // === GROUP 10: Graphics ===
     bcGraphicRGBA,    // Dest = RGBA result (int)
     bcGraphicRdot,    // Dest = pixel cursor info (int)
     bcGraphicGetMode, // Dest = current graphic mode (int)
+    bcGraphicPos,     // POS(x): cursor column position (int)
+    bcGraphicRclr,    // RCLR(n): color of source (int)
+    bcGraphicRwindow, // RWINDOW(n): window info (int)
     // === SUPERINSTRUCTIONS ===
     // Fused arithmetic-to-dest (Int): Dest = Dest op Src1
     bcAddIntTo, bcSubIntTo, bcMulIntTo,
@@ -244,6 +256,8 @@ begin
     // === GROUP 4: I/O operations ===
     bcInputFloat,
     bcDataReadFloat,   // Read next DATA value into float register
+    // === GROUP 7: Sprite functions ===
+    bcRsppos,          // RSPPOS(sprite, attr): position/speed (float)
     // === SUPERINSTRUCTIONS ===
     // Fused arithmetic-to-dest (Float): Dest = Dest op Src1
     bcAddFloatTo, bcSubFloatTo, bcMulFloatTo, bcDivFloatTo,
@@ -278,7 +292,13 @@ begin
     bcArrayLoadString,  // Typed array load (string) - Dest is WRITTEN
     // === GROUP 4: I/O operations ===
     bcInputString,
-    bcDataReadString:  // Read next DATA value into string register
+    bcDataReadString,  // Read next DATA value into string register
+    // === GROUP 5: Special variables ===
+    bcLoadTIS,         // TI$: current time HHMMSS (string)
+    bcLoadDTS,         // DT$: current date YYYYMMDD (string)
+    bcLoadERRS,        // ERR$: last error message (string)
+    // === GROUP 10: Graphics ===
+    bcGraphicSShape:   // SSHAPE A$, x1, y1: capture screen area to string
       Result := True;
     // NOTE: bcArrayStoreString uses Dest as SOURCE (read), handled by DestReadIsStringReg
   else
@@ -299,12 +319,15 @@ begin
     bcIntToFloat, bcIntToString,
     // Branch on int (comparison result)
     bcJumpIfZero, bcJumpIfNotZero,
+    // Error handling - RESUME <line> reads line number from Src1
+    bcResume,
     // Bitwise operations
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot,
     // === GROUP 1: String operations with int param ===
     bcStrChr, bcStrHex, bcStrErr,
     // === GROUP 4: I/O operations ===
     bcPrintInt, bcPrintIntLn,
+    bcPrintTab, bcPrintSpc,  // TAB(n) and SPC(n) - Src1 = count register
     // === GROUP 6: Sound operations ===
     bcSoundVol,       // Src1 = volume (int 0-15)
     bcSoundSound,     // Src1 = voice number (int)
@@ -434,7 +457,9 @@ begin
     // LOGN(base, x): Src2 is 'x' (the value)
     bcMathLogN,
     // === GROUP 6: Sound operations ===
-    bcSoundSound:  // Src2 = frequency (float)
+    bcSoundSound,  // Src2 = frequency (float)
+    // === GROUP 4: I/O operations ===
+    bcPrintUsing:  // PRINT USING - Src2 = value (float)
       Result := True;
   else
     Result := False;
@@ -457,8 +482,13 @@ begin
     bcStrDec,  // DEC(hexstring) - reads string, produces int
     // === GROUP 4: I/O operations ===
     bcPrintString, bcPrintStringLn,
+    bcPrintUsing,  // PRINT USING - Src1 = format string
+    // === GROUP 5: Special variables ===
+    bcStoreTIS,  // TI$ = value - reads string from Src1
     // === GROUP 6: Sound operations ===
-    bcSoundPlay:  // Src1 = music string
+    bcSoundPlay,  // Src1 = music string
+    // === GROUP 10: Graphics ===
+    bcGraphicGShape:  // GSHAPE A$, x, y: A$ is string in Src1
       Result := True;
   else
     Result := False;

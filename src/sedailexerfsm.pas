@@ -1305,8 +1305,14 @@ begin
 end;
 
 function TLexerFSM.ProcessString: TLexerToken;
+var
+  S: string;
 begin
   Result := CreateToken(ttStringLiteral);
+  // Remove surrounding quotes from string value
+  S := Result.Value;
+  if (Length(S) >= 2) and (S[1] = '"') and (S[Length(S)] = '"') then
+    Result.Value := Copy(S, 2, Length(S) - 2);
 end;
 
 function TLexerFSM.ProcessComment: TLexerToken;

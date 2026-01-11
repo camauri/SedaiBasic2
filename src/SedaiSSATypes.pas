@@ -213,6 +213,7 @@ type
     FInstructions: TSSAInstructionList;
     FLabel: string;
     FPredecessors, FSuccessors: TFPList;
+    FBlockIndex: Integer;  // Index in program's block list (for fast O(1) lookup in SSA construction)
   public
     constructor Create(const ALabel: string);
     destructor Destroy; override;
@@ -223,6 +224,7 @@ type
     property LabelName: string read FLabel write FLabel;
     property Predecessors: TFPList read FPredecessors;
     property Successors: TFPList read FSuccessors;
+    property BlockIndex: Integer read FBlockIndex write FBlockIndex;
   end;
 
   TSSABasicBlockList = specialize TFPGObjectList<TSSABasicBlock>;
@@ -308,7 +310,7 @@ implementation
 uses TypInfo, SedaiDominators, SedaiSSAConstruction, SedaiPhiElimination, SedaiGVN, SedaiCSE, SedaiCopyProp,
      SedaiAlgebraic, SedaiStrengthReduction, SedaiGosubInlining, SedaiConstProp, SedaiConstPropAggressive,
      SedaiDBE, SedaiDCE, SedaiLICM, SedaiLoopUnroll, SedaiCopyCoalescing
-     {$IF DEFINED(DEBUG_CLEANUP) OR DEFINED(DEBUG_DOMTREE) OR DEFINED(DEBUG_GVN) OR DEFINED(DEBUG_CSE) OR DEFINED(DEBUG_COPYPROP) OR DEFINED(DEBUG_ALGEBRAIC) OR DEFINED(DEBUG_STRENGTH) OR DEFINED(DEBUG_CONSTPROP) OR DEFINED(DEBUG_DBE) OR DEFINED(DEBUG_DCE) OR DEFINED(DEBUG_LICM) OR DEFINED(DEBUG_COPYCOAL)}, SedaiDebug{$ENDIF};
+     {$IF DEFINED(DEBUG_CLEANUP) OR DEFINED(DEBUG_DOMTREE) OR DEFINED(DEBUG_GVN) OR DEFINED(DEBUG_CSE) OR DEFINED(DEBUG_COPYPROP) OR DEFINED(DEBUG_ALGEBRAIC) OR DEFINED(DEBUG_STRENGTH) OR DEFINED(DEBUG_CONSTPROP) OR DEFINED(DEBUG_DBE) OR DEFINED(DEBUG_DCE) OR DEFINED(DEBUG_LICM) OR DEFINED(DEBUG_COPYCOAL) OR DEFINED(DEBUG_SSA)}, SedaiDebug{$ENDIF};
 
 constructor TSSAInstruction.Create(AOpCode: TSSAOpCode);
 begin
@@ -389,6 +391,7 @@ begin
   FPredecessors := TFPList.Create;
   FSuccessors := TFPList.Create;
   FLabel := ALabel;
+  FBlockIndex := -1;  // Will be set by SSA construction
 end;
 
 destructor TSSABasicBlock.Destroy;
@@ -806,8 +809,12 @@ end;
 function TSSAProgram.GetDomTree: TObject;
 begin
   { PHASE 3 TIER 2: Return dominator tree as TObject to avoid circular dependency.
-    Caller must cast to TDominatorTree after including SedaiDominators in uses. }
-  Result := FDomTreeObj;
+    Caller must cast to TDominatorTree after including SedaiDominators in uses.
+    Returns nil if dominator tree was not built (e.g., program contains TRAP). }
+  if FDomTreeValid then
+    Result := FDomTreeObj
+  else
+    Result := nil;
 end;
 
 procedure TSSAProgram.ClearDomTree;
@@ -825,8 +832,6 @@ procedure TSSAProgram.BuildDominatorTree;
 var
   LogFile: TextFile;
   LogPath: string;
-  Block: TSSABasicBlock;
-  i: Integer;
 begin
   { PHASE 3 TIER 2: Build dominator tree for optimization passes.
 
@@ -841,6 +846,10 @@ begin
     {$ENDIF}
     Exit;
   end;
+
+  // NOTE: Programs with TRAP have unreachable blocks (error handlers), but
+  // SedaiDominators.pas now handles these correctly by treating them as
+  // secondary entry points. So we can build dominator tree for all programs.
 
   try
     {$IFDEF DEBUG_DOMTREE}
@@ -905,6 +914,13 @@ begin
   if not Assigned(FDomTreeObj) then
   begin
     WriteLn('[TSSAProgram] ERROR: Dominator tree not built - call BuildDominatorTree first!');
+    Exit;
+  end;
+
+  // Skip SSA construction if dominator tree is not valid
+  if not FDomTreeValid then
+  begin
+    WriteLn('[TSSAProgram] Skipping SSA construction (dominator tree not valid)');
     Exit;
   end;
 

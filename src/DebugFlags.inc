@@ -212,3 +212,13 @@
 {.$DEFINE DEBUG_FLOAT_CHECKS}          // Enable NaN/Infinity checks (slow!)
 {.$DEFINE DEBUG_REGISTER_DUMP}         // Dump register values on error (very slow!)
 
+{ ============================================================================
+  SSA CONSTRUCTION TIMING
+
+  Uncomment to see internal timing breakdown of SSA Construction phases:
+  - ComputeDF: Dominance Frontier computation
+  - InsertPhi: PHI function insertion
+  - Rename: Variable renaming
+  ============================================================================ }
+{$DEFINE DEBUG_SSA_TIMING}
+

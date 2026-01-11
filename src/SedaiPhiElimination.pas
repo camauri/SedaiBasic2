@@ -194,6 +194,12 @@ begin
     for j := 0 to High(Instr.PhiSources) do
     begin
       PhiSource := Instr.PhiSources[j];
+
+      // FAST PATH: Skip invalid PHI sources BEFORE doing any expensive work
+      // This happens when the PHI source FromBlock is incorrect due to nested control flow
+      if (PhiSource.Value.Kind = svkRegister) and (PhiSource.Value.Version = 0) then
+        Continue;
+
       PredBlock := PhiSource.FromBlock;
 
       if not Assigned(PredBlock) then
@@ -228,22 +234,6 @@ begin
       CopyInstr := TSSAInstruction.Create(CopyOpCode);
       CopyInstr.Dest := Instr.Dest;      // PHI destination (e.g., R0_3)
       CopyInstr.Src1 := PhiSource.Value; // PHI source from this predecessor (e.g., R0_1)
-      CopyInstr.Comment := Format('PHI copy from %s', [PredBlock.LabelName]);
-
-      // CRITICAL: Skip this copy if the source value has Version=0 (unversioned)
-      // This happens when the PHI source FromBlock is incorrect due to nested control flow
-      if (CopyInstr.Src1.Kind = svkRegister) and (CopyInstr.Src1.Version = 0) then
-      begin
-        {$IFDEF DEBUG_PHIELIM}
-        if DebugPhiElim then
-          WriteLn(Format('[PhiElim] WARNING: Skipping invalid PHI copy in block %s: %s = %s (source unversioned)',
-            [PredBlock.LabelName,
-             SSAValueToString(CopyInstr.Dest),
-             SSAValueToString(CopyInstr.Src1)]));
-        {$ENDIF}
-        CopyInstr.Free;
-        Continue;
-      end;
 
       {$IFDEF DEBUG_PHIELIM}
       // DEBUG: Log the PHI copy being inserted

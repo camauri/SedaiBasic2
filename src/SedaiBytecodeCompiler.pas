@@ -387,7 +387,7 @@ begin
     Result := RegIndex;
     {$IFDEF DEBUG_BYTECODE}
     if DebugBytecode then
-      WriteLn('[BytecodeCompiler] Map SSA R', RegIndex, '_v0 (UNVERSIONED) -> Bytecode R', Result);
+      WriteLn('[BytecodeCompiler] Map SSA ', SSARegisterTypeToString(RegType), '[', RegIndex, ']_v0 (UNVERSIONED) -> Bytecode R', Result);
     {$ENDIF}
     Exit;
   end;
@@ -1214,6 +1214,40 @@ begin
     Exit;
   end;
 
+  // Special handling for TRAP - use constant directly in Immediate to avoid SSA versioning issues
+  if Instr.OpCode = ssaTrap then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcTrap, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkConstInt then
+    begin
+      // TRAP with constant line number - store in Immediate
+      BCInstr.Immediate := Instr.Src1.ConstInt;
+      BCInstr.Src1 := 0;  // Flag: use Immediate instead of register
+    end
+    else if Instr.Src1.Kind = svkRegister then
+    begin
+      // TRAP with variable line number (rare) - use register
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+      BCInstr.Immediate := -1;  // Flag: use Src1 register
+    end;
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
+  // Special handling for RESUME - same issue with register mapping
+  if Instr.OpCode = ssaResume then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcResume, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version)
+    else if Instr.Src1.Kind = svkConstInt then
+      BCInstr.Immediate := Instr.Src1.ConstInt;
+    BCInstr.SourceLine := Instr.SourceLine;
+    FProgram.AddInstruction(BCInstr);
+    Exit;
+  end;
+
   // Special handling for array operations to emit typed opcodes
   if Instr.OpCode = ssaArrayLoad then
   begin
@@ -1237,6 +1271,17 @@ begin
     BCOp := CompileSSAOpCode(Instr.OpCode);
 
   // Debug: trace opcode compilation
+  {$IFDEF DEBUG_BYTECODE}
+  if DebugBytecode then
+  begin
+    if Instr.OpCode = ssaLoadEL then
+      WriteLn('[BC] LoadEL: Dest=', SSARegisterTypeToString(Instr.Dest.RegType), '[', Instr.Dest.RegIndex, ']_v', Instr.Dest.Version);
+    if Instr.OpCode = ssaLoadER then
+      WriteLn('[BC] LoadER: Dest=', SSARegisterTypeToString(Instr.Dest.RegType), '[', Instr.Dest.RegIndex, ']_v', Instr.Dest.Version);
+    if Instr.OpCode = ssaPrintInt then
+      WriteLn('[BC] PrintInt: Src1=', SSARegisterTypeToString(Instr.Src1.RegType), '[', Instr.Src1.RegIndex, ']_v', Instr.Src1.Version);
+  end;
+  {$ENDIF}
   if Instr.OpCode = ssaGraphicGetMode then
     WriteLn('>>> BC Compiling ssaGraphicGetMode -> bcOp=', Ord(BCOp));
   if (Instr.OpCode = ssaTron) or (Instr.OpCode = ssaTroff) then
@@ -1302,6 +1347,11 @@ begin
 
   // Copy source line number for error reporting
   BCInstr.SourceLine := Instr.SourceLine;
+
+  {$IFDEF DEBUG_BYTECODE}
+  if DebugBytecode and (Instr.OpCode in [ssaPrintInt, ssaLoadEL, ssaLoadER]) then
+    WriteLn('[BC] Final instruction: Op=', Ord(BCOp), ' Dest=', BCInstr.Dest, ' Src1=', BCInstr.Src1, ' Src2=', BCInstr.Src2, ' @L', BCInstr.SourceLine);
+  {$ENDIF}
 
   // Add instruction and record index for jump fixup if needed
   BCIndex := FProgram.GetInstructionCount;
