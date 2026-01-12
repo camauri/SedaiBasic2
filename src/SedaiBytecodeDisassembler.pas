@@ -391,8 +391,9 @@ begin
   end;
 
   // Append source line number if available (debug mode / TRON)
-  if Instr.SourceLine > 0 then
-    Line := Line + Format('  @L%d', [Instr.SourceLine]);
+  // Now using Source Map instead of per-instruction SourceLine field
+  if (FProgram <> nil) and (FProgram.GetSourceLine(Index) > 0) then
+    Line := Line + Format('  @L%d', [FProgram.GetSourceLine(Index)]);
 
   FOutput.Add(Line);
 end;

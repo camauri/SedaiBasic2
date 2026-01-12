@@ -465,6 +465,7 @@ var
   TimeLoopUnroll, TimeDCE, TimePhiElim, TimeCopyCoal, TimeRegAlloc: Double;
   PassTimer: THiResTimer;
   i, removed: Integer;
+  ErrorSourceLine: Integer;
   ShowBanners: Boolean;
   {$IFDEF ENABLE_PROFILER}
   Profiler: TProfiler;
@@ -1516,10 +1517,11 @@ begin
           Write('ERROR during VM execution at PC=', VM.PC);
           if (VM.PC >= 0) and (VM.PC < BytecodeProgram.GetInstructionCount) then
           begin
+            ErrorSourceLine := BytecodeProgram.GetSourceLine(VM.PC);
             with BytecodeProgram.GetInstruction(VM.PC) do
             begin
-              if SourceLine > 0 then
-                WriteLn(' (BASIC LINE ', SourceLine, '): ', E.ClassName, ': ', E.Message)
+              if ErrorSourceLine > 0 then
+                WriteLn(' (BASIC LINE ', ErrorSourceLine, '): ', E.ClassName, ': ', E.Message)
               else
                 WriteLn(': ', E.ClassName, ': ', E.Message);
               WriteLn('Failing instruction: ', BytecodeOpToString(TBytecodeOp(OpCode)),
@@ -1640,6 +1642,7 @@ var
   Timer: THiResTimer;
   LoadTime, ExecuteTime: Double;
   i: Integer;
+  ErrorSourceLine: Integer;
   ShowBanners: Boolean;
   {$IFDEF ENABLE_PROFILER}
   Profiler: TProfiler;
@@ -1759,10 +1762,11 @@ begin
             Write('ERROR during VM execution at PC=', VM.PC);
             if (VM.PC >= 0) and (VM.PC < BytecodeProgram.GetInstructionCount) then
             begin
+              ErrorSourceLine := BytecodeProgram.GetSourceLine(VM.PC);
               with BytecodeProgram.GetInstruction(VM.PC) do
               begin
-                if SourceLine > 0 then
-                  WriteLn(' (BASIC LINE ', SourceLine, '): ', E.ClassName, ': ', E.Message)
+                if ErrorSourceLine > 0 then
+                  WriteLn(' (BASIC LINE ', ErrorSourceLine, '): ', E.ClassName, ': ', E.Message)
                 else
                   WriteLn(': ', E.ClassName, ': ', E.Message);
                 WriteLn('Failing instruction: ', BytecodeOpToString(TBytecodeOp(OpCode)),

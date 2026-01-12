@@ -313,7 +313,7 @@ begin
   FusedInstr.Src1 := CmpInstr.Src1;
   FusedInstr.Src2 := CmpInstr.Src2;
   FusedInstr.Immediate := JmpInstr.Immediate;  // Jump target
-  FusedInstr.SourceLine := CmpInstr.SourceLine;
+  // SourceLine now managed via Source Map (unchanged by superinstruction fusion)
 
   FProgram.SetInstruction(Index, FusedInstr);
   MakeNop(Index + 1);
@@ -398,7 +398,7 @@ begin
   FusedInstr.Src1 := ArithInstr.Src2; // The operand being added/mul/etc
   FusedInstr.Src2 := 0;
   FusedInstr.Immediate := 0;
-  FusedInstr.SourceLine := ArithInstr.SourceLine;
+  // SourceLine now managed via Source Map
 
   FProgram.SetInstruction(Index, FusedInstr);
   MakeNop(Index + 1);
@@ -485,7 +485,7 @@ begin
   FusedInstr.Src1 := ArithInstr.Src1;
   FusedInstr.Src2 := 0;
   FusedInstr.Immediate := LoadInstr.Immediate;  // The constant
-  FusedInstr.SourceLine := ArithInstr.SourceLine;
+  // SourceLine now managed via Source Map
 
   FProgram.SetInstruction(Index, FusedInstr);  // Replace Load with fused
   MakeNop(Index + 1);  // Remove Arith
@@ -601,7 +601,7 @@ begin
   FusedInstr.Src1 := CmpInstr.Src1;  // The value being compared to zero
   FusedInstr.Src2 := 0;
   FusedInstr.Immediate := JmpInstr.Immediate;  // Jump target
-  FusedInstr.SourceLine := CmpInstr.SourceLine;
+  // SourceLine now managed via Source Map (unchanged by superinstruction fusion)
 
   FProgram.SetInstruction(Index, FusedInstr);
   MakeNop(Index + 1);
@@ -699,7 +699,7 @@ begin
   FusedInstr.Src1 := StoreInstr.Src1;      // Array index
   FusedInstr.Src2 := StoreInstr.Src2;      // Index register
   FusedInstr.Immediate := LoadInstr.Immediate;  // Constant value
-  FusedInstr.SourceLine := StoreInstr.SourceLine;
+  // SourceLine now managed via Source Map
 
   FProgram.SetInstruction(Index, FusedInstr);
   MakeNop(Index + 1);
@@ -820,7 +820,7 @@ begin
     FusedInstr.Src1 := AddInstr.Src2;      // Step register (AddInt format: K%=K%+step)
   FusedInstr.Src2 := BranchInstr.Src2;    // Limit register
   FusedInstr.Immediate := LoopBodyIndex;  // Loop body (first non-NOP after branch)
-  FusedInstr.SourceLine := AddInstr.SourceLine;
+  // SourceLine now managed via Source Map
 
   FProgram.SetInstruction(Index, FusedInstr);
   MakeNop(JumpIndex);  // Remove Jump
@@ -889,7 +889,7 @@ begin
           FusedInstr.Src1 := MulInstr.Src1;     // a
           FusedInstr.Src2 := MulInstr.Src2;     // b
           FusedInstr.Immediate := 0;
-          FusedInstr.SourceLine := MulInstr.SourceLine;
+          // SourceLine now managed via Source Map
 
           FProgram.SetInstruction(Index, FusedInstr);
           MakeNop(Index + 1);
@@ -921,7 +921,7 @@ begin
           FusedInstr.Src1 := MulInstr.Src1;     // a
           FusedInstr.Src2 := MulInstr.Src2;     // b
           FusedInstr.Immediate := 0;
-          FusedInstr.SourceLine := MulInstr.SourceLine;
+          // SourceLine now managed via Source Map
 
           FProgram.SetInstruction(Index, FusedInstr);
           MakeNop(Index + 1);
@@ -962,7 +962,7 @@ begin
           FusedInstr.Src1 := MulInstr.Src1;      // a
           FusedInstr.Src2 := MulInstr.Src2;      // b
           FusedInstr.Immediate := AddInstr.Src1; // c (extra operand stored in Immediate)
-          FusedInstr.SourceLine := MulInstr.SourceLine;
+          // SourceLine now managed via Source Map
 
           FProgram.SetInstruction(Index, FusedInstr);
           MakeNop(Index + 1);
@@ -994,7 +994,7 @@ begin
           FusedInstr.Src1 := MulInstr.Src1;      // a
           FusedInstr.Src2 := MulInstr.Src2;      // b
           FusedInstr.Immediate := AddInstr.Src1; // c (extra operand stored in Immediate)
-          FusedInstr.SourceLine := MulInstr.SourceLine;
+          // SourceLine now managed via Source Map
 
           FProgram.SetInstruction(Index, FusedInstr);
           MakeNop(Index + 1);
@@ -1062,7 +1062,7 @@ begin
         FusedInstr.Src1 := LoadInstr.Src1;      // Array index
         FusedInstr.Src2 := LoadInstr.Src2;      // Index register
         FusedInstr.Immediate := AddInstr.Src1;  // Accumulator register
-        FusedInstr.SourceLine := LoadInstr.SourceLine;
+        // SourceLine now managed via Source Map
 
         FProgram.SetInstruction(Index, FusedInstr);
         MakeNop(Index + 1);
@@ -1091,7 +1091,7 @@ begin
         FusedInstr.Src1 := LoadInstr.Src1;      // Array index
         FusedInstr.Src2 := LoadInstr.Src2;      // Index register
         FusedInstr.Immediate := AddInstr.Src1;  // Accumulator register
-        FusedInstr.SourceLine := LoadInstr.SourceLine;
+        // SourceLine now managed via Source Map
 
         FProgram.SetInstruction(Index, FusedInstr);
         MakeNop(Index + 1);
@@ -1158,7 +1158,7 @@ begin
           FusedInstr.Dest := AddInstr.Dest;      // Result
           FusedInstr.Src1 := AddInstr.Src1;      // Existing sum
           FusedInstr.Src2 := Mul1Instr.Src1;     // x (value to square)
-          FusedInstr.SourceLine := Mul1Instr.SourceLine;
+          // SourceLine now managed via Source Map
 
           FProgram.SetInstruction(Index, FusedInstr);
           MakeNop(Index + 1);
@@ -1208,7 +1208,7 @@ begin
         FusedInstr.Dest := AddInstr.Dest;       // Result
         FusedInstr.Src1 := Mul1Instr.Src1;      // x
         FusedInstr.Src2 := Mul2Instr.Src1;      // y
-        FusedInstr.SourceLine := Mul1Instr.SourceLine;
+        // SourceLine now managed via Source Map
 
         FProgram.SetInstruction(Index, FusedInstr);
         MakeNop(Index + 1);
@@ -1265,7 +1265,7 @@ begin
   FusedInstr.Src1 := Mul1Instr.Src1;      // a
   FusedInstr.Src2 := Mul1Instr.Src2;      // b
   FusedInstr.Immediate := Mul2Instr.Src2; // c
-  FusedInstr.SourceLine := Mul1Instr.SourceLine;
+  // SourceLine now managed via Source Map
 
   FProgram.SetInstruction(Index, FusedInstr);
   MakeNop(Index + 1);
@@ -1319,7 +1319,7 @@ begin
   FusedInstr.Dest := SqrtInstr.Dest;     // Result
   FusedInstr.Src1 := AddInstr.Src1;      // a
   FusedInstr.Src2 := AddInstr.Src2;      // b
-  FusedInstr.SourceLine := AddInstr.SourceLine;
+  // SourceLine now managed via Source Map
 
   FProgram.SetInstruction(Index, FusedInstr);
   MakeNop(Index + 1);
@@ -1385,7 +1385,7 @@ begin
   FusedInstr.Src1 := LoadInstr.Src1;       // Array index
   FusedInstr.Src2 := LoadInstr.Src2;       // Index register
   FusedInstr.Immediate := BranchInstr.Immediate; // Branch target
-  FusedInstr.SourceLine := LoadInstr.SourceLine;
+  // SourceLine now managed via Source Map
 
   FProgram.SetInstruction(Index, FusedInstr);
   MakeNop(Index + 1);
@@ -1478,7 +1478,7 @@ begin
   FusedInstr.Src2 := Load1Instr.Src2;       // idx1 register
   FusedInstr.Dest := Load2Instr.Src2;       // idx2 register
   FusedInstr.Immediate := 0;
-  FusedInstr.SourceLine := Load1Instr.SourceLine;
+  // SourceLine now managed via Source Map
 
   FProgram.SetInstruction(Index, FusedInstr);
   MakeNop(Index + 1);
@@ -1543,7 +1543,7 @@ begin
   FusedInstr.Src1 := ArithInstr.Src2;      // Amount register
   FusedInstr.Src2 := 0;
   FusedInstr.Immediate := 0;
-  FusedInstr.SourceLine := ArithInstr.SourceLine;
+  // SourceLine now managed via Source Map
 
   FProgram.SetInstruction(Index, FusedInstr);
 
@@ -1598,7 +1598,7 @@ begin
   FusedInstr.Src1 := LoadInstr.Src1;       // Array index
   FusedInstr.Src2 := LoadInstr.Src2;       // Index register
   FusedInstr.Immediate := 0;
-  FusedInstr.SourceLine := LoadInstr.SourceLine;
+  // SourceLine now managed via Source Map
 
   FProgram.SetInstruction(Index, FusedInstr);
   MakeNop(Index + 1);
@@ -1685,7 +1685,7 @@ begin
   FusedInstr.Src1 := LoadInstr.Src1;        // Source array index
   FusedInstr.Src2 := LoadInstr.Src2;        // Index register
   FusedInstr.Immediate := 0;
-  FusedInstr.SourceLine := LoadInstr.SourceLine;
+  // SourceLine now managed via Source Map
 
   FProgram.SetInstruction(Index, FusedInstr);
   MakeNop(Index + 1);
@@ -1750,7 +1750,7 @@ begin
   FusedInstr.Src1 := LoadInstr.Src2;        // Source index register
   FusedInstr.Src2 := StoreInstr.Src2;       // Destination index register
   FusedInstr.Immediate := 0;
-  FusedInstr.SourceLine := LoadInstr.SourceLine;
+  // SourceLine now managed via Source Map
 
   FProgram.SetInstruction(Index, FusedInstr);
   MakeNop(Index + 1);
@@ -1859,7 +1859,7 @@ begin
   FusedInstr.Src2 := CopyI.Src1;            // Start value register (original start)
   FusedInstr.Dest := SubJ.Src1;             // End value register (original end, before -1)
   FusedInstr.Immediate := ExitTarget;       // Where to jump after (encoded for clarity)
-  FusedInstr.SourceLine := CopyI.SourceLine;
+  // SourceLine now managed via Source Map
 
   // Replace first instruction with fused, NOP the rest
   FProgram.SetInstruction(Index, FusedInstr);
@@ -1995,7 +1995,7 @@ begin
   FusedInstr.Src2 := StartReg;
   FusedInstr.Dest := EndReg;
   FusedInstr.Immediate := ExitTarget;
-  FusedInstr.SourceLine := LoadFirst.SourceLine;
+  // SourceLine now managed via Source Map
 
   FProgram.SetInstruction(Index, FusedInstr);
   MakeNop(Index + 1);

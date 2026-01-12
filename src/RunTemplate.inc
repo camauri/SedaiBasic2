@@ -40,6 +40,9 @@ var
   TrueVal: Int64;
   // Flag for TRAP handler jump (can't use goto from except block)
   TrapTriggered: Boolean;
+  {$IFDEF DEBUG_MODE}
+  CurSourceLine: Integer;  // Current source line from Source Map
+  {$ENDIF}
 begin
   if FProgram = nil then raise Exception.Create('No program loaded');
 
@@ -80,10 +83,12 @@ begin
 
     {$IFDEF DEBUG_MODE}
     // Debugger integration: check for breakpoints and stepping
-    if Assigned(FDebugger) and FDebugger.IsActive and (Instr.SourceLine > 0) then
+    // SourceLine now retrieved from Source Map
+    CurSourceLine := FProgram.GetSourceLine(CurPC);
+    if Assigned(FDebugger) and FDebugger.IsActive and (CurSourceLine > 0) then
     begin
       // Notify debugger of line change (handles trace output internally)
-      FDebugger.NotifyLineChange(Instr.SourceLine);
+      FDebugger.NotifyLineChange(CurSourceLine);
 
       // Check if debugger wants to pause (breakpoint or step)
       if FDebugger.IsPaused then
@@ -94,12 +99,12 @@ begin
         Break;
       end;
     end
-    else if FTraceActive and (Instr.SourceLine > 0) and (Instr.SourceLine <> FLastSourceLine) then
+    else if FTraceActive and (CurSourceLine > 0) and (CurSourceLine <> FLastSourceLine) then
     begin
       // Legacy TRON trace output (when no debugger attached)
-      FLastSourceLine := Instr.SourceLine;
+      FLastSourceLine := CurSourceLine;
       if Assigned(FOutputDevice) then
-        FOutputDevice.Print('[' + IntToStr(Instr.SourceLine) + ']');
+        FOutputDevice.Print('[' + IntToStr(CurSourceLine) + ']');
     end;
 
     {$IFDEF ENABLE_PROFILER}
@@ -772,7 +777,7 @@ begin
       if (FTrapLine > 0) and (not FInErrorHandler) then
       begin
         // Save error info for EL, ER, ERR$ variables
-        FLastErrorLine := Instr.SourceLine;
+        FLastErrorLine := FProgram.GetSourceLine(CurPC);
         FResumePC := CurPC;  // Save PC for RESUME
         FInErrorHandler := True;
 
@@ -796,6 +801,7 @@ begin
 
         // Find PC for trap line number
         FTrapPC := FProgram.FindPCForLine(FTrapLine);
+
         if FTrapPC >= 0 then
         begin
           // Jump to error handler - set flag to re-enter loop
@@ -812,8 +818,10 @@ begin
         end;
       end
       else
+      begin
         // No TRAP set - re-raise exception
         raise;
+      end;
     end;
   end;
   until not TrapTriggered;  // Restart loop if TRAP handler was triggered

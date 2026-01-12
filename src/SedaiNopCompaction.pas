@@ -212,7 +212,8 @@ begin
   end;
 
   // Replace program instructions with compacted array
-  FProgram.ClearInstructions;
+  // Use ClearInstructionsOnly to preserve label lines (for TRAP/RESUME)
+  FProgram.ClearInstructionsOnly;
   for i := 0 to NewCount - 1 do
     FProgram.AddInstruction(NewInstructions[i]);
 end;
@@ -231,7 +232,13 @@ begin
   // Step 2: Adjust all jump targets
   AdjustJumpTargets;
 
-  // Step 3: Compact the instruction array
+  // Step 3: Adjust label lines (for TRAP/RESUME targets)
+  FProgram.AdjustLabelLines(FIndexMap);
+
+  // Step 4: Adjust source map (for RESUME NEXT and GetSourceLine)
+  FProgram.AdjustSourceMap(FIndexMap);
+
+  // Step 5: Compact the instruction array
   CompactInstructions;
 
   Result := FNopCount;

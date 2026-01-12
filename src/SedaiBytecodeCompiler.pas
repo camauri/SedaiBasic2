@@ -470,8 +470,7 @@ begin
 
       BCInstr.Immediate := (BRegMapped shl 16) or ARegMapped;
     end;
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -540,8 +539,7 @@ begin
       end;
     end;
 
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -602,8 +600,7 @@ begin
             Instr.PhiSources[5].Value.RegIndex, Instr.PhiSources[5].Value.Version)) and $3FF) shl 50);
     end;
 
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -638,8 +635,7 @@ begin
           Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version) or $8000; // Flag bit to indicate register mode
     end;
 
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -707,8 +703,7 @@ begin
             Instr.PhiSources[4].Value.RegIndex, Instr.PhiSources[4].Value.Version)) and $FFF) shl 40);
     end;
 
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -776,8 +771,7 @@ begin
             Instr.PhiSources[5].Value.RegIndex, Instr.PhiSources[5].Value.Version)) and $FFF) shl 40);
     end;
 
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -821,8 +815,7 @@ begin
             Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FF) shl 8);
     end;
 
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -838,8 +831,7 @@ begin
     if Instr.Src1.Kind = svkRegister then
       BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
 
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -899,8 +891,7 @@ begin
             Instr.PhiSources[3].Value.RegIndex, Instr.PhiSources[3].Value.Version)) and $FFF) shl 36);
     end;
 
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -933,8 +924,7 @@ begin
         BCInstr.Immediate := Instr.PhiSources[0].Value.ConstInt;
     end;
 
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -975,8 +965,7 @@ begin
         BCInstr.Immediate := BCInstr.Immediate or ((Int64(Instr.PhiSources[1].Value.ConstInt) and $FFFF) shl 16);
     end;
 
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -1016,8 +1005,7 @@ begin
         BCInstr.Immediate := BCInstr.Immediate or ((Int64(Instr.PhiSources[0].Value.ConstInt) and $FFFF) shl 16);
     end;
 
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -1056,8 +1044,7 @@ begin
         BCInstr.Immediate := Instr.PhiSources[0].Value.ConstInt;
     end;
 
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -1083,8 +1070,7 @@ begin
       BCInstr.Src1 := Ord(srtString);  // Type indicator
       BCInstr.Immediate := FProgram.AddStringConstant(Instr.Src1.ConstString);
     end;
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -1108,8 +1094,7 @@ begin
     BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
     if Instr.Dest.Kind = svkRegister then
       BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -1119,8 +1104,7 @@ begin
     // Src1 = line number (0 = beginning)
     if Instr.Src1.Kind = svkConstInt then
       BCInstr.Immediate := Instr.Src1.ConstInt;
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -1134,8 +1118,7 @@ begin
     BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
     if Instr.Dest.Kind = svkRegister then
       BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -1149,8 +1132,7 @@ begin
     // Src2 = value register
     if Instr.Src2.Kind = svkRegister then
       BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -1162,8 +1144,7 @@ begin
       BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version)
     else if Instr.Src1.Kind = svkConstString then
       BCInstr.Immediate := FProgram.AddStringConstant(Instr.Src1.ConstString);
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -1194,8 +1175,7 @@ begin
           ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
             Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FFFF) shl 16);
     end;
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -1215,8 +1195,7 @@ begin
       BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
       BCInstr.Immediate := -1;  // Flag: use Src1 register
     end;
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -1228,8 +1207,7 @@ begin
       BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version)
     else if Instr.Src1.Kind = svkConstInt then
       BCInstr.Immediate := Instr.Src1.ConstInt;
-    BCInstr.SourceLine := Instr.SourceLine;
-    FProgram.AddInstruction(BCInstr);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
 
@@ -1326,17 +1304,14 @@ begin
   else if Instr.Src3.Kind = svkConstFloat then
     BCInstr.Immediate := Trunc(Instr.Src3.ConstFloat);
 
-  // Copy source line number for error reporting
-  BCInstr.SourceLine := Instr.SourceLine;
-
   {$IFDEF DEBUG_BYTECODE}
   if DebugBytecode and (Instr.OpCode in [ssaPrintInt, ssaLoadEL, ssaLoadER]) then
-    WriteLn('[BC] Final instruction: Op=', Ord(BCOp), ' Dest=', BCInstr.Dest, ' Src1=', BCInstr.Src1, ' Src2=', BCInstr.Src2, ' @L', BCInstr.SourceLine);
+    WriteLn('[BC] Final instruction: Op=', Ord(BCOp), ' Dest=', BCInstr.Dest, ' Src1=', BCInstr.Src1, ' Src2=', BCInstr.Src2, ' @L', Instr.SourceLine);
   {$ENDIF}
 
   // Add instruction and record index for jump fixup if needed
   BCIndex := FProgram.GetInstructionCount;
-  FProgram.AddInstruction(BCInstr);
+  FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
 
   // If this is a jump with a label, add to fixup list
   if (Instr.OpCode in [ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaCall]) and
@@ -1438,6 +1413,18 @@ begin
       Instr := Block.Instructions[j];
       if Instr.OpCode <> ssaLabel then
         CompileInstruction(Instr);
+    end;
+  end;
+
+  // Register block labels in Source Map for blocks that map to existing PCs
+  // This allows FindPCForLine to find REM lines and other non-code lines
+  for i := 0 to FLabelMap.Count - 1 do
+  begin
+    if Copy(FLabelMap[i], 1, 5) = 'LINE_' then
+    begin
+      j := StrToIntDef(Copy(FLabelMap[i], 6, Length(FLabelMap[i]) - 5), 0);
+      if j > 0 then
+        FProgram.AddLabelLine(j, PtrInt(FLabelMap.Objects[i]));
     end;
   end;
 

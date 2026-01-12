@@ -180,6 +180,7 @@ var
   Header: TBascHeader;
   i, j: Integer;
   Instr: TBytecodeInstruction;
+  SourceLine: Integer;  // Retrieved from Source Map
   VarInfo: TVariableInfo;
   ArrInfo: TSSAArrayInfo;
   RegType: Byte;
@@ -258,18 +259,19 @@ begin
     end;
   end;
 
-  // Write instructions (packed format with source line)
+  // Write instructions (packed format with source line from Source Map)
   for i := 0 to Program_.GetInstructionCount - 1 do
   begin
     try
       Instr := Program_.GetInstruction(i);
+      SourceLine := Program_.GetSourceLine(i);  // Get from Source Map
       // Write each field separately for portability
       Stream.WriteBuffer(Instr.OpCode, SizeOf(Instr.OpCode));
       Stream.WriteBuffer(Instr.Dest, SizeOf(Instr.Dest));
       Stream.WriteBuffer(Instr.Src1, SizeOf(Instr.Src1));
       Stream.WriteBuffer(Instr.Src2, SizeOf(Instr.Src2));
       Stream.WriteBuffer(Instr.Immediate, SizeOf(Instr.Immediate));
-      Stream.WriteBuffer(Instr.SourceLine, SizeOf(Instr.SourceLine));
+      Stream.WriteBuffer(SourceLine, SizeOf(SourceLine));  // Write source line from map
     except
       on E: Exception do
         raise EBytecodeSerializerError.CreateFmt('Error writing instruction %d: %s', [i, E.Message]);
@@ -305,6 +307,7 @@ var
   Header: TBascHeader;
   i, j: Integer;
   Instr: TBytecodeInstruction;
+  SourceLine: Integer;  // Read from file, stored in Source Map
   VarInfo: TVariableInfo;
   ArrInfo: TSSAArrayInfo;
   StrConst: string;
@@ -366,7 +369,7 @@ begin
       Result.AddArrayInfo(ArrInfo);
     end;
 
-    // Read instructions
+    // Read instructions (SourceLine is now stored in Source Map, not in instruction)
     for i := 0 to Header.InstructionCount - 1 do
     begin
       FillChar(Instr, SizeOf(Instr), 0);
@@ -375,8 +378,8 @@ begin
       Stream.ReadBuffer(Instr.Src1, SizeOf(Instr.Src1));
       Stream.ReadBuffer(Instr.Src2, SizeOf(Instr.Src2));
       Stream.ReadBuffer(Instr.Immediate, SizeOf(Instr.Immediate));
-      Stream.ReadBuffer(Instr.SourceLine, SizeOf(Instr.SourceLine));
-      Result.AddInstruction(Instr);
+      Stream.ReadBuffer(SourceLine, SizeOf(SourceLine));  // Read from file
+      Result.AddInstructionWithLine(Instr, SourceLine);   // Store in Source Map
     end;
 
     // Validate checksum

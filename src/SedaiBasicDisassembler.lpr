@@ -463,7 +463,7 @@ begin
                Instr.Src1,
                Instr.Src2,
                FormatImmediate(Instr.OpCode, Instr.Immediate),
-               Instr.SourceLine,
+               BytecodeProgram.GetSourceLine(i),  // SourceLine now from Source Map
                OpcodeToString(Instr.OpCode)]);
           end
           else

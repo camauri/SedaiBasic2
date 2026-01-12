@@ -420,14 +420,21 @@ const
 
 type
 
-  { Bytecode instruction encoding }
+  { Source map entry - maps PC range to BASIC source line }
+  TSourceMapEntry = packed record
+    StartPC: Integer;       // First instruction of range
+    EndPC: Integer;         // Last instruction of range (inclusive)
+    SourceLine: Integer;    // BASIC source line number
+  end;
+
+  { Bytecode instruction encoding - 16 bytes (was 20 bytes)
+    SourceLine moved to separate TSourceMap for better cache efficiency }
   TBytecodeInstruction = packed record
     OpCode: Word;           // Opcode (TBytecodeOp) - 2 bytes for group.opcode encoding
     Dest: Word;             // Destination register index (2 bytes, 0-65535)
     Src1: Word;             // Source 1 register index (2 bytes, 0-65535)
     Src2: Word;             // Source 2 register index (2 bytes, 0-65535)
     Immediate: Int64;       // Immediate value (for constants, jump offsets, etc)
-    SourceLine: Integer;    // BASIC source line number (0 if unknown)
   end;
 
   { Variable info for runtime }
@@ -455,6 +462,12 @@ type
     property Names[Index: Integer]: string read GetName; default;
   end;
 
+  { Label line entry - maps BASIC line number to PC (for REM and other non-code lines) }
+  TLabelLineEntry = packed record
+    LineNum: Integer;
+    PC: Integer;
+  end;
+
   { Bytecode program - compiled bytecode ready for VM }
   TBytecodeProgram = class
   private
@@ -463,10 +476,18 @@ type
     FArrays: array of TSSAArrayInfo;
     FStringConstants: TStringList;
     FEntryPoint: Integer;
+    // Source map: separate from instructions for cache efficiency
+    FSourceMap: array of TSourceMapEntry;
+    FSourceMapCount: Integer;
+    FLastSourceLine: Integer;  // For building source map incrementally
+    // Label lines: map BASIC line numbers to PC (for REM and jump targets)
+    FLabelLines: array of TLabelLineEntry;
+    FLabelLineCount: Integer;
   public
     constructor Create;
     destructor Destroy; override;
     procedure AddInstruction(const Instr: TBytecodeInstruction);
+    procedure AddInstructionWithLine(const Instr: TBytecodeInstruction; SourceLine: Integer);
     procedure SetInstruction(Index: Integer; const Instr: TBytecodeInstruction);
     procedure ClearInstructions;
     procedure AddVariable(const VarInfo: TVariableInfo);
@@ -482,6 +503,14 @@ type
     function GetInstructionsPtr: Pointer;  // Direct access for fast VM loop
     function FindPCForLine(LineNum: Integer): Integer;  // Find PC for BASIC line number
     function FindPCAfterLine(LineNum: Integer): Integer;  // Find PC for first instruction AFTER given line
+    // Source map API - transparent replacement for SourceLine field
+    procedure SetSourceLine(PC: Integer; Line: Integer);
+    function GetSourceLine(PC: Integer): Integer;
+    // Label lines API - for REM and other non-code lines that can be jump targets
+    procedure AddLabelLine(LineNum: Integer; PC: Integer);
+    procedure AdjustLabelLines(const IndexMap: array of Integer);  // Adjust PCs after NOP compaction
+    procedure AdjustSourceMap(const IndexMap: array of Integer);   // Adjust source map PCs after NOP compaction
+    procedure ClearInstructionsOnly;  // Clear only instructions, preserve label lines and source map
     property StringConstants: TStringList read FStringConstants;
     property EntryPoint: Integer read FEntryPoint write FEntryPoint;
   end;
@@ -558,6 +587,11 @@ begin
   inherited Create;
   SetLength(FInstructions, 0);
   SetLength(FVariables, 0);
+  SetLength(FSourceMap, 0);
+  FSourceMapCount := 0;
+  FLastSourceLine := -1;
+  SetLength(FLabelLines, 0);
+  FLabelLineCount := 0;
   FStringConstants := TStringList.Create;
   FStringConstants.CaseSensitive := True;  // IMPORTANT: "n" and "N" are different!
   FEntryPoint := 0;
@@ -578,6 +612,15 @@ begin
   FInstructions[Len] := Instr;
 end;
 
+procedure TBytecodeProgram.AddInstructionWithLine(const Instr: TBytecodeInstruction; SourceLine: Integer);
+var
+  PC: Integer;
+begin
+  PC := Length(FInstructions);
+  AddInstruction(Instr);
+  SetSourceLine(PC, SourceLine);
+end;
+
 procedure TBytecodeProgram.SetInstruction(Index: Integer; const Instr: TBytecodeInstruction);
 begin
   if (Index >= 0) and (Index < Length(FInstructions)) then
@@ -587,6 +630,11 @@ end;
 procedure TBytecodeProgram.ClearInstructions;
 begin
   SetLength(FInstructions, 0);
+  SetLength(FSourceMap, 0);
+  FSourceMapCount := 0;
+  FLastSourceLine := -1;
+  SetLength(FLabelLines, 0);
+  FLabelLineCount := 0;
 end;
 
 procedure TBytecodeProgram.AddVariable(const VarInfo: TVariableInfo);
@@ -667,32 +715,199 @@ begin
     Result := nil;
 end;
 
+procedure TBytecodeProgram.SetSourceLine(PC: Integer; Line: Integer);
+begin
+  // Build source map incrementally: if same line as previous, extend range
+  // Otherwise, start a new range
+  if Line = FLastSourceLine then
+  begin
+    // Extend current range
+    if FSourceMapCount > 0 then
+      FSourceMap[FSourceMapCount - 1].EndPC := PC;
+  end
+  else
+  begin
+    // Start new range
+    if FSourceMapCount >= Length(FSourceMap) then
+      SetLength(FSourceMap, FSourceMapCount + 256);  // Grow in chunks
+    FSourceMap[FSourceMapCount].StartPC := PC;
+    FSourceMap[FSourceMapCount].EndPC := PC;
+    FSourceMap[FSourceMapCount].SourceLine := Line;
+    Inc(FSourceMapCount);
+    FLastSourceLine := Line;
+  end;
+end;
+
+function TBytecodeProgram.GetSourceLine(PC: Integer): Integer;
+var
+  Lo, Hi, Mid: Integer;
+begin
+  // Binary search in source map
+  if FSourceMapCount = 0 then
+    Exit(0);
+
+  Lo := 0;
+  Hi := FSourceMapCount - 1;
+  while Lo <= Hi do
+  begin
+    Mid := (Lo + Hi) div 2;
+    if PC < FSourceMap[Mid].StartPC then
+      Hi := Mid - 1
+    else if PC > FSourceMap[Mid].EndPC then
+      Lo := Mid + 1
+    else
+      Exit(FSourceMap[Mid].SourceLine);
+  end;
+  Result := 0;  // Not found
+end;
+
+procedure TBytecodeProgram.AddLabelLine(LineNum: Integer; PC: Integer);
+begin
+  // Add a label line entry that maps a BASIC line number to a PC.
+  // This is used for REM statements and other non-code lines that can be
+  // targets of GOTO, GOSUB, TRAP, RESUME, RESTORE etc.
+  if FLabelLineCount >= Length(FLabelLines) then
+    SetLength(FLabelLines, FLabelLineCount + 256);
+  FLabelLines[FLabelLineCount].LineNum := LineNum;
+  FLabelLines[FLabelLineCount].PC := PC;
+  Inc(FLabelLineCount);
+end;
+
+procedure TBytecodeProgram.AdjustLabelLines(const IndexMap: array of Integer);
+var
+  i: Integer;
+  OldPC, NewPC: Integer;
+begin
+  // Adjust all label line PCs using the index map from NOP compaction
+  for i := 0 to FLabelLineCount - 1 do
+  begin
+    OldPC := FLabelLines[i].PC;
+    if (OldPC >= 0) and (OldPC < Length(IndexMap)) then
+    begin
+      NewPC := IndexMap[OldPC];
+      // If target was a NOP, scan forward to find next valid instruction
+      if NewPC = -1 then
+      begin
+        while (OldPC < Length(IndexMap)) and (IndexMap[OldPC] = -1) do
+          Inc(OldPC);
+        if OldPC < Length(IndexMap) then
+          NewPC := IndexMap[OldPC]
+        else
+          NewPC := 0;  // Fallback to start
+      end;
+      FLabelLines[i].PC := NewPC;
+    end;
+  end;
+end;
+
+procedure TBytecodeProgram.AdjustSourceMap(const IndexMap: array of Integer);
+var
+  i: Integer;
+  OldStartPC, OldEndPC, NewStartPC, NewEndPC: Integer;
+  WriteIdx: Integer;
+begin
+  // Adjust all source map PCs using the index map from NOP compaction
+  // This is needed for FindPCAfterLine (RESUME NEXT) and GetSourceLine to work correctly
+  WriteIdx := 0;
+  for i := 0 to FSourceMapCount - 1 do
+  begin
+    OldStartPC := FSourceMap[i].StartPC;
+    OldEndPC := FSourceMap[i].EndPC;
+
+    // Adjust StartPC
+    if (OldStartPC >= 0) and (OldStartPC < Length(IndexMap)) then
+    begin
+      NewStartPC := IndexMap[OldStartPC];
+      // If target was a NOP, scan forward to find next valid instruction
+      if NewStartPC = -1 then
+      begin
+        while (OldStartPC < Length(IndexMap)) and (IndexMap[OldStartPC] = -1) do
+          Inc(OldStartPC);
+        if OldStartPC < Length(IndexMap) then
+          NewStartPC := IndexMap[OldStartPC]
+        else
+          Continue;  // Skip this entry entirely if no valid PC found
+      end;
+    end
+    else
+      Continue;  // Skip invalid entries
+
+    // Adjust EndPC
+    if (OldEndPC >= 0) and (OldEndPC < Length(IndexMap)) then
+    begin
+      NewEndPC := IndexMap[OldEndPC];
+      // If target was a NOP, scan backward to find previous valid instruction
+      if NewEndPC = -1 then
+      begin
+        while (OldEndPC >= 0) and (IndexMap[OldEndPC] = -1) do
+          Dec(OldEndPC);
+        if OldEndPC >= 0 then
+          NewEndPC := IndexMap[OldEndPC]
+        else
+          NewEndPC := NewStartPC;  // Fallback to start
+      end;
+    end
+    else
+      NewEndPC := NewStartPC;
+
+    // Keep entry if it has valid PC range
+    if NewStartPC <= NewEndPC then
+    begin
+      FSourceMap[WriteIdx].StartPC := NewStartPC;
+      FSourceMap[WriteIdx].EndPC := NewEndPC;
+      FSourceMap[WriteIdx].SourceLine := FSourceMap[i].SourceLine;
+      Inc(WriteIdx);
+    end;
+  end;
+  FSourceMapCount := WriteIdx;
+end;
+
+procedure TBytecodeProgram.ClearInstructionsOnly;
+begin
+  // Clear only the instruction array, preserving label lines
+  // (which contain BASIC line->PC mappings needed by TRAP/RESUME)
+  SetLength(FInstructions, 0);
+  // Note: We do NOT clear FLabelLines or FSourceMap here
+  // as they will be adjusted by the NOP compaction pass
+end;
+
 function TBytecodeProgram.FindPCForLine(LineNum: Integer): Integer;
 var
   i: Integer;
   BestPC, BestLine: Integer;
 begin
-  // Scan instructions to find the first one with matching source line
-  for i := 0 to High(FInstructions) do
+  // First check label lines (for REM and other non-code lines)
+  // This is the primary lookup for GOTO/GOSUB/TRAP targets
+  for i := 0 to FLabelLineCount - 1 do
   begin
-    if FInstructions[i].SourceLine = LineNum then
+    if FLabelLines[i].LineNum = LineNum then
     begin
-      Result := i;
+      Result := FLabelLines[i].PC;
       Exit;
     end;
   end;
-  // Exact match not found - find instruction with MINIMUM SourceLine > LineNum
-  // (handles REM statements and other non-code lines)
-  // Instructions are not ordered by SourceLine, so we must scan all
+
+  // Then scan source map to find the first PC with matching source line
+  for i := 0 to FSourceMapCount - 1 do
+  begin
+    if FSourceMap[i].SourceLine = LineNum then
+    begin
+      Result := FSourceMap[i].StartPC;
+      Exit;
+    end;
+  end;
+
+  // Exact match not found in either - find entry with MINIMUM SourceLine > LineNum
+  // This fallback handles lines that don't have a block (shouldn't happen normally)
   BestPC := -1;
   BestLine := MaxInt;
-  for i := 0 to High(FInstructions) do
+  for i := 0 to FSourceMapCount - 1 do
   begin
-    if (FInstructions[i].SourceLine > LineNum) and
-       (FInstructions[i].SourceLine < BestLine) then
+    if (FSourceMap[i].SourceLine > LineNum) and
+       (FSourceMap[i].SourceLine < BestLine) then
     begin
-      BestLine := FInstructions[i].SourceLine;
-      BestPC := i;
+      BestLine := FSourceMap[i].SourceLine;
+      BestPC := FSourceMap[i].StartPC;
     end;
   end;
   Result := BestPC;
@@ -703,17 +918,17 @@ var
   i: Integer;
   BestPC, BestLine: Integer;
 begin
-  // Find the first instruction with SourceLine > LineNum
+  // Find the first PC with SourceLine > LineNum
   // This is used by RESUME NEXT to skip to the next BASIC line
   BestPC := -1;
   BestLine := MaxInt;
-  for i := 0 to High(FInstructions) do
+  for i := 0 to FSourceMapCount - 1 do
   begin
-    if (FInstructions[i].SourceLine > LineNum) and
-       (FInstructions[i].SourceLine < BestLine) then
+    if (FSourceMap[i].SourceLine > LineNum) and
+       (FSourceMap[i].SourceLine < BestLine) then
     begin
-      BestLine := FInstructions[i].SourceLine;
-      BestPC := i;
+      BestLine := FSourceMap[i].SourceLine;
+      BestPC := FSourceMap[i].StartPC;
     end;
   end;
   Result := BestPC;
@@ -959,7 +1174,7 @@ begin
   Result.Src1 := Src1;
   Result.Src2 := Src2;
   Result.Immediate := Immediate;
-  Result.SourceLine := 0;  // Will be set by bytecode compiler from SSA instruction
+  // Note: SourceLine is now managed separately via TBytecodeProgram.SetSourceLine
 end;
 
 end.

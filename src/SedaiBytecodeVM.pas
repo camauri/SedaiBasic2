@@ -1357,19 +1357,9 @@ end;
 {$ENDIF}
 
 function TBytecodeVM.FindPCForSourceLine(SourceLine: Integer): Integer;
-var
-  i: Integer;
 begin
-  // Find the first instruction with the given source line
-  Result := -1;
-  for i := 0 to FProgram.GetInstructionCount - 1 do
-  begin
-    if FProgram.GetInstruction(i).SourceLine = SourceLine then
-    begin
-      Result := i;
-      Exit;
-    end;
-  end;
+  // Delegate to TBytecodeProgram's Source Map implementation
+  Result := FProgram.FindPCForLine(SourceLine);
   // If exact line not found, return 0 (start of program)
   if Result < 0 then
     Result := 0;
@@ -2314,7 +2304,9 @@ begin
 end;
 
 procedure TBytecodeVM.Step;
-var Instr: TBytecodeInstruction;
+var
+  Instr: TBytecodeInstruction;
+  CurrentSourceLine: Integer;
 begin
   if (FProgram = nil) or (FPC >= FProgram.GetInstructionCount) then
   begin
@@ -2325,11 +2317,12 @@ begin
 
   // TRON trace output: print line number when it changes
   // SourceLine > 0 only when compiled with TRON (debug mode) active
-  if (Instr.SourceLine > 0) and (Instr.SourceLine <> FLastSourceLine) then
+  CurrentSourceLine := FProgram.GetSourceLine(FPC);
+  if (CurrentSourceLine > 0) and (CurrentSourceLine <> FLastSourceLine) then
   begin
-    FLastSourceLine := Instr.SourceLine;
+    FLastSourceLine := CurrentSourceLine;
     if Assigned(FOutputDevice) then
-      FOutputDevice.Print('[' + IntToStr(Instr.SourceLine) + ']');
+      FOutputDevice.Print('[' + IntToStr(CurrentSourceLine) + ']');
   end;
 
   {$IFDEF ENABLE_PROFILER}
