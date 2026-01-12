@@ -76,8 +76,12 @@ job/log/txt/step_output.txt
 .benchmark_temp/
 .benchmark_data/
 
+# Documentation (generated, not tracked)
+JAVA_VS_SEDAI.md
+
 # SDL2 dependencies (if included)
 # Uncomment if SDL2 libs are not to be tracked
 # *.dll
 # *.so
 # *.dylib
+test_out.txt
