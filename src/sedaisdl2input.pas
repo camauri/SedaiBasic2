@@ -965,7 +965,7 @@ begin
         begin
           if Length(Event.text.text) > 0 then
           begin
-            Result := Event.text.text[1];
+            Result := Event.text.text[0];
             Done := True;
           end;
         end;
@@ -1023,7 +1023,7 @@ begin
         // Normal text characters come through here
         if Length(Event.text.text) > 0 then
         begin
-          FPendingChar := Event.text.text[1];
+          FPendingChar := Event.text.text[0];
           FHasPendingChar := True;
           Result := True;
           Exit;
@@ -1118,7 +1118,9 @@ end;
 
 procedure TSDL2InputDevice.DisableTextInput;
 begin
-  SDL_StopTextInput;
+  // Do NOT call SDL_StopTextInput - we want text input to remain active
+  // so that alphanumeric keys continue to generate SDL_TEXTINPUT events
+  // SDL_StopTextInput;
 end;
 
 procedure TSDL2InputDevice.ProcessEvents;
@@ -1142,7 +1144,7 @@ begin
           // Save text input for GETKEY
           if (not FHasPendingChar) and (Length(Event.text.text) > 0) then
           begin
-            FPendingChar := Event.text.text[1];
+            FPendingChar := Event.text.text[0];
             FHasPendingChar := True;
           end;
         end;

@@ -895,6 +895,141 @@ begin
             FHasPendingChar := True;
             Exit;
           end;
+          VK_DELETE:
+          begin
+            FPendingChar := #127;
+            FHasPendingChar := True;
+            Exit;
+          end;
+          // Cursor keys - use same codes as TProgramInputHandler
+          VK_UP:
+          begin
+            FPendingChar := #1;   // SOH - Cursor UP
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_DOWN:
+          begin
+            FPendingChar := #2;   // STX - Cursor DOWN
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_LEFT:
+          begin
+            FPendingChar := #3;   // ETX - Cursor LEFT
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_RIGHT:
+          begin
+            FPendingChar := #4;   // EOT - Cursor RIGHT
+            FHasPendingChar := True;
+            Exit;
+          end;
+          // Navigation keys
+          VK_HOME:
+          begin
+            FPendingChar := #5;   // ENQ - HOME
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_END:
+          begin
+            FPendingChar := #6;   // ACK - END
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_PRIOR:  // Page Up
+          begin
+            FPendingChar := #11;  // VT - PAGE UP
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_NEXT:   // Page Down
+          begin
+            FPendingChar := #12;  // FF - PAGE DOWN
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_INSERT:
+          begin
+            FPendingChar := #14;  // SO - INSERT
+            FHasPendingChar := True;
+            Exit;
+          end;
+          // Function keys F1-F12 (codes 128-139)
+          VK_F1:
+          begin
+            FPendingChar := #128;
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_F2:
+          begin
+            FPendingChar := #129;
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_F3:
+          begin
+            FPendingChar := #130;
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_F4:
+          begin
+            FPendingChar := #131;
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_F5:
+          begin
+            FPendingChar := #132;
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_F6:
+          begin
+            FPendingChar := #133;
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_F7:
+          begin
+            FPendingChar := #134;
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_F8:
+          begin
+            FPendingChar := #135;
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_F9:
+          begin
+            FPendingChar := #136;
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_F10:
+          begin
+            FPendingChar := #137;
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_F11:
+          begin
+            FPendingChar := #138;
+            FHasPendingChar := True;
+            Exit;
+          end;
+          VK_F12:
+          begin
+            FPendingChar := #139;
+            FHasPendingChar := True;
+            Exit;
+          end;
         end;
       end;
     end;

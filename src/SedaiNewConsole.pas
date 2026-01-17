@@ -497,6 +497,50 @@ type
     property AltPressed: Boolean read FAltPressed;
   end;
 
+  { TProgramInputHandler - Dedicated input handler for BASIC program execution
+    This class handles input ONLY during VM execution (GETKEY, GET, INPUT).
+    It has its own event loop that does NOT interfere with console input.
+    Key differences from TInputHandler:
+    - Does NOT call ClearFlags at start of ProcessEvents (preserves pending chars)
+    - Does NOT call SDL_StopTextInput in DisableTextInput (keeps text input active)
+    - Has dedicated handling for special keys (ESC=BREAK, function keys, etc.)
+  }
+  TProgramInputHandler = class(TObject, IInputDevice)
+  private
+    FQuitRequested: Boolean;
+    FStopRequested: Boolean;
+    FLastChar: string;           // UTF-8 string for multi-byte chars
+    FHasChar: Boolean;
+    FShiftPressed: Boolean;
+    FCtrlPressed: Boolean;
+    FAltPressed: Boolean;
+    FVideoController: TVideoController;
+    FTextInputActive: Boolean;   // Track SDL text input state
+  public
+    constructor Create(AVideoController: TVideoController);
+    destructor Destroy; override;
+
+    // IInputDevice implementation
+    function ReadLine(const Prompt: string = ''; IsCommand: Boolean = True; NumericOnly: Boolean = False; AllowDecimal: Boolean = True): string;
+    function ReadKey: Char;
+    function KeyPressed: Boolean;
+    function HasChar: Boolean;
+    function GetLastChar: string;
+    procedure EnableTextInput;
+    procedure DisableTextInput;
+    function ShouldQuit: Boolean;
+    function ShouldStop: Boolean;
+    procedure ClearStopRequest;
+    procedure ProcessEvents;
+    procedure Reset;
+
+    property QuitRequested: Boolean read FQuitRequested;
+    property StopRequested: Boolean read FStopRequested;
+    property ShiftPressed: Boolean read FShiftPressed;
+    property CtrlPressed: Boolean read FCtrlPressed;
+    property AltPressed: Boolean read FAltPressed;
+  end;
+
   { TGraphicEngine - Graphics rendering }
   TGraphicEngine = class
   private
@@ -618,6 +662,7 @@ type
     FTextBuffer: TTextBuffer;
     FGraphicEngine: TGraphicEngine;
     FInputHandler: TInputHandler;
+    FProgramInputHandler: TProgramInputHandler;  // Dedicated input for VM execution
     FConsoleOutputAdapter: TConsoleOutputAdapter;
     FRunning: Boolean;
     FCursorVisible: Boolean;
@@ -4406,6 +4451,7 @@ begin
   FTextBuffer := TTextBuffer.Create(25, 40);  // Create TextBuffer immediately
   FGraphicEngine := nil;
   FInputHandler := TInputHandler.Create(FTextBuffer, FVideoController, Self);  // Passa i riferimenti + console
+  FProgramInputHandler := TProgramInputHandler.Create(FVideoController);  // Dedicated input for VM
   FRunning := False;
   FCursorVisible := True;
   FLastCursorBlink := 0;
@@ -4421,7 +4467,8 @@ begin
   // Initialize VM-based execution
   FBytecodeVM := TBytecodeVM.Create;
   FBytecodeVM.SetOutputDevice(FVideoController);
-  FBytecodeVM.SetInputDevice(FInputHandler);
+  // Use dedicated program input handler for VM (NOT the console input handler)
+  FBytecodeVM.SetInputDevice(FProgramInputHandler);
 
   FImmediateCompiler := TImmediateCompiler.Create;
 
@@ -4515,6 +4562,12 @@ begin
   begin
     FInputHandler.Free;
     FInputHandler := nil;
+  end;
+
+  if Assigned(FProgramInputHandler) then
+  begin
+    FProgramInputHandler.Free;
+    FProgramInputHandler := nil;
   end;
 
   if Assigned(FVideoController) then
@@ -4770,8 +4823,9 @@ begin
   begin
     // VM uses console output adapter to write to TextBuffer
     FBytecodeVM.SetOutputDevice(FConsoleOutputAdapter);
-    FBytecodeVM.SetInputDevice(FInputHandler);
-    {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: BytecodeVM configured with ConsoleOutputAdapter');{$ENDIF}
+    // Use dedicated program input handler for VM (NOT the console input handler)
+    FBytecodeVM.SetInputDevice(FProgramInputHandler);
+    {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: BytecodeVM configured with ConsoleOutputAdapter and ProgramInputHandler');{$ENDIF}
   end;
 
   {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: SedaiNewConsole initialization complete');{$ENDIF}
@@ -8190,6 +8244,455 @@ begin
   ClearFlags;
   FQuitRequested := False;
   FStopRequested := False;
+end;
+
+{ ============================================================================
+  TProgramInputHandler - Dedicated input handler for BASIC program execution
+  ============================================================================ }
+
+constructor TProgramInputHandler.Create(AVideoController: TVideoController);
+begin
+  inherited Create;
+  FVideoController := AVideoController;
+  FQuitRequested := False;
+  FStopRequested := False;
+  FLastChar := '';
+  FHasChar := False;
+  FShiftPressed := False;
+  FCtrlPressed := False;
+  FAltPressed := False;
+  FTextInputActive := False;
+end;
+
+destructor TProgramInputHandler.Destroy;
+begin
+  if FTextInputActive then
+    SDL_StopTextInput;
+  inherited Destroy;
+end;
+
+procedure TProgramInputHandler.EnableTextInput;
+begin
+  if not FTextInputActive then
+  begin
+    SDL_StartTextInput;
+    FTextInputActive := True;
+  end;
+end;
+
+procedure TProgramInputHandler.DisableTextInput;
+begin
+  // IMPORTANT: Do NOT call SDL_StopTextInput here!
+  // We want text input to remain active for the console after program ends.
+  // Just mark our internal state as inactive.
+  FTextInputActive := False;
+end;
+
+procedure TProgramInputHandler.ProcessEvents;
+var
+  Event: TSDL_Event;
+  KeySym: Integer;
+  KeyMod: Word;
+begin
+  // IMPORTANT: Do NOT clear FHasChar/FLastChar here!
+  // This is the key difference from TInputHandler.ProcessEvents.
+  // We only consume the character when GetLastChar is called.
+
+  // If we already have a pending char, don't read more events
+  if FHasChar then
+    Exit;
+
+  while SDL_PollEvent(@Event) <> 0 do
+  begin
+    case Event.type_ of
+      SDL_QUITEV:
+      begin
+        FQuitRequested := True;
+        Exit;
+      end;
+
+      SDL_KEYDOWN:
+      begin
+        KeySym := Event.key.keysym.sym;
+        KeyMod := Event.key.keysym.mod_;
+
+        // Update modifier state
+        FShiftPressed := (KeyMod and KMOD_SHIFT) <> 0;
+        FCtrlPressed := (KeyMod and KMOD_CTRL) <> 0;
+        FAltPressed := (KeyMod and KMOD_ALT) <> 0;
+
+        // CTRL+ALT+END: Exit SedaiVision completely
+        if (KeySym = SDLK_END) and FCtrlPressed and FAltPressed then
+        begin
+          FQuitRequested := True;
+          Exit;
+        end;
+
+        // CTRL+END or ESC: Stop BASIC program (BREAK)
+        if ((KeySym = SDLK_END) and FCtrlPressed and (not FAltPressed)) or
+           (KeySym = SDLK_ESCAPE) then
+        begin
+          FStopRequested := True;
+          // Also set character for ESC so program can detect it
+          if KeySym = SDLK_ESCAPE then
+          begin
+            FLastChar := #27;
+            FHasChar := True;
+          end;
+          Exit;
+        end;
+
+        // Handle special keys that don't generate SDL_TEXTINPUT
+        case KeySym of
+          SDLK_RETURN, SDLK_KP_ENTER:
+          begin
+            FLastChar := #13;
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_BACKSPACE:
+          begin
+            FLastChar := #8;
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_DELETE:
+          begin
+            FLastChar := #127;
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_TAB:
+          begin
+            FLastChar := #9;
+            FHasChar := True;
+            Exit;
+          end;
+          // Cursor keys - use control codes compatible with C128 BASIC
+          SDLK_UP:
+          begin
+            FLastChar := #1;   // SOH - Cursor UP
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_DOWN:
+          begin
+            FLastChar := #2;   // STX - Cursor DOWN
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_LEFT:
+          begin
+            FLastChar := #3;   // ETX - Cursor LEFT
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_RIGHT:
+          begin
+            FLastChar := #4;   // EOT - Cursor RIGHT
+            FHasChar := True;
+            Exit;
+          end;
+          // Navigation keys
+          SDLK_HOME:
+          begin
+            FLastChar := #5;   // ENQ - HOME
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_END:
+          begin
+            // Only if not CTRL (CTRL+END is stop program)
+            if not FCtrlPressed then
+            begin
+              FLastChar := #6;   // ACK - END
+              FHasChar := True;
+              Exit;
+            end;
+          end;
+          SDLK_PAGEUP:
+          begin
+            FLastChar := #11;  // VT - PAGE UP
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_PAGEDOWN:
+          begin
+            FLastChar := #12;  // FF - PAGE DOWN
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_INSERT:
+          begin
+            FLastChar := #14;  // SO - INSERT
+            FHasChar := True;
+            Exit;
+          end;
+          // Function keys F1-F12 (codes 128-139)
+          SDLK_F1:
+          begin
+            FLastChar := #128;
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_F2:
+          begin
+            FLastChar := #129;
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_F3:
+          begin
+            FLastChar := #130;
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_F4:
+          begin
+            FLastChar := #131;
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_F5:
+          begin
+            FLastChar := #132;
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_F6:
+          begin
+            FLastChar := #133;
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_F7:
+          begin
+            FLastChar := #134;
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_F8:
+          begin
+            FLastChar := #135;
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_F9:
+          begin
+            FLastChar := #136;
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_F10:
+          begin
+            FLastChar := #137;
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_F11:
+          begin
+            FLastChar := #138;
+            FHasChar := True;
+            Exit;
+          end;
+          SDLK_F12:
+          begin
+            FLastChar := #139;
+            FHasChar := True;
+            Exit;
+          end;
+        end;
+        // Other keys will come through SDL_TEXTINPUT
+      end;
+
+      SDL_KEYUP:
+      begin
+        // Update modifier state on key release
+        FShiftPressed := (Event.key.keysym.mod_ and KMOD_SHIFT) <> 0;
+        FCtrlPressed := (Event.key.keysym.mod_ and KMOD_CTRL) <> 0;
+        FAltPressed := (Event.key.keysym.mod_ and KMOD_ALT) <> 0;
+      end;
+
+      SDL_TEXTINPUT:
+      begin
+        // Normal text characters come through here
+        if Length(Event.text.text) > 0 then
+        begin
+          FLastChar := Event.text.text;  // Full UTF-8 string
+          FHasChar := True;
+          Exit;
+        end;
+      end;
+    end;
+  end;
+end;
+
+function TProgramInputHandler.HasChar: Boolean;
+begin
+  if not FHasChar then
+    ProcessEvents;
+  Result := FHasChar;
+end;
+
+function TProgramInputHandler.GetLastChar: string;
+begin
+  if not FHasChar then
+    ProcessEvents;
+
+  if FHasChar then
+  begin
+    Result := FLastChar;
+    FHasChar := False;
+    FLastChar := '';
+  end
+  else
+    Result := '';
+end;
+
+function TProgramInputHandler.ReadKey: Char;
+begin
+  // Wait for a key press
+  EnableTextInput;
+  try
+    while not FHasChar and not FQuitRequested and not FStopRequested do
+    begin
+      ProcessEvents;
+      if not FHasChar then
+        SDL_Delay(10);
+    end;
+
+    if FHasChar then
+    begin
+      if Length(FLastChar) > 0 then
+        Result := FLastChar[1]
+      else
+        Result := #0;
+      FHasChar := False;
+      FLastChar := '';
+    end
+    else
+      Result := #0;
+  finally
+    DisableTextInput;
+  end;
+end;
+
+function TProgramInputHandler.KeyPressed: Boolean;
+begin
+  ProcessEvents;
+  Result := FHasChar;
+end;
+
+function TProgramInputHandler.ReadLine(const Prompt: string; IsCommand: Boolean;
+  NumericOnly: Boolean; AllowDecimal: Boolean): string;
+var
+  InputBuffer: string;
+  Ch: Char;
+  Done: Boolean;
+begin
+  InputBuffer := '';
+  Done := False;
+
+  // Display prompt
+  if (Prompt <> '') and Assigned(FVideoController) then
+  begin
+    FVideoController.Print(Prompt);
+    FVideoController.Present;
+  end;
+
+  EnableTextInput;
+  try
+    while not Done and not FQuitRequested and not FStopRequested do
+    begin
+      ProcessEvents;
+
+      if FHasChar then
+      begin
+        if Length(FLastChar) > 0 then
+          Ch := FLastChar[1]
+        else
+          Ch := #0;
+        FHasChar := False;
+        FLastChar := '';
+
+        case Ch of
+          #13:  // ENTER
+          begin
+            Done := True;
+            if Assigned(FVideoController) then
+            begin
+              FVideoController.NewLine;
+              FVideoController.Present;
+            end;
+          end;
+          #8:   // BACKSPACE
+          begin
+            if Length(InputBuffer) > 0 then
+            begin
+              Delete(InputBuffer, Length(InputBuffer), 1);
+              // Visual feedback
+              if Assigned(FVideoController) then
+              begin
+                FVideoController.MoveCursor(-1, 0);
+                FVideoController.Print(' ');
+                FVideoController.MoveCursor(-1, 0);
+                FVideoController.Present;
+              end;
+            end;
+          end;
+          #27:  // ESC - break input
+          begin
+            FStopRequested := True;
+            Done := True;
+          end;
+        else
+          if Ch >= ' ' then
+          begin
+            InputBuffer := InputBuffer + Ch;
+            if Assigned(FVideoController) then
+            begin
+              FVideoController.Print(Ch);
+              FVideoController.Present;
+            end;
+          end;
+        end;
+      end
+      else
+        SDL_Delay(10);
+    end;
+  finally
+    DisableTextInput;
+  end;
+
+  Result := InputBuffer;
+end;
+
+function TProgramInputHandler.ShouldQuit: Boolean;
+begin
+  ProcessEvents;
+  Result := FQuitRequested;
+end;
+
+function TProgramInputHandler.ShouldStop: Boolean;
+begin
+  ProcessEvents;
+  Result := FStopRequested;
+end;
+
+procedure TProgramInputHandler.ClearStopRequest;
+begin
+  FStopRequested := False;
+end;
+
+procedure TProgramInputHandler.Reset;
+begin
+  FQuitRequested := False;
+  FStopRequested := False;
+  FLastChar := '';
+  FHasChar := False;
+  FShiftPressed := False;
+  FCtrlPressed := False;
+  FAltPressed := False;
 end;
 
 end.
