@@ -370,6 +370,12 @@ type
     FCurrentBGIndex: Byte;
     FCurrentReverse: Boolean;
 
+    // Window boundaries (WINDOW command) - coordinates within FCells
+    FWindowCol1: Integer;  // Left edge of window (0-based)
+    FWindowRow1: Integer;  // Top edge of window (0-based)
+    FWindowCol2: Integer;  // Right edge of window (inclusive)
+    FWindowRow2: Integer;  // Bottom edge of window (inclusive)
+
     procedure AddToScrollback(Row: Integer);
     function CellsToString(Row: Integer): string;  // Convert cell row to string (for scrollback)
 
@@ -416,6 +422,13 @@ type
     function GetViewLine(Index: Integer): string;  // Get line considering view offset
     function IsInScrollbackMode: Boolean;
 
+    // Window management (WINDOW command)
+    procedure SetWindow(Col1, Row1, Col2, Row2: Integer);
+    procedure ResetWindow;  // Reset to full screen
+    procedure ClearWindow;  // Clear only within current window
+    function GetWindowLines: Integer;  // RWINDOW(0)
+    function GetWindowCols: Integer;   // RWINDOW(1)
+
     // Current text color properties
     property CurrentFGIndex: Byte read FCurrentFGIndex write FCurrentFGIndex;
     property CurrentBGIndex: Byte read FCurrentBGIndex write FCurrentBGIndex;
@@ -426,6 +439,10 @@ type
     property Rows: Integer read FRows;
     property Cols: Integer read FCols;
     property ViewOffset: Integer read FViewOffset;
+    property WindowCol1: Integer read FWindowCol1;
+    property WindowRow1: Integer read FWindowRow1;
+    property WindowCol2: Integer read FWindowCol2;
+    property WindowRow2: Integer read FWindowRow2;
     function GetScrollbackCount: Integer;
   end;
 
@@ -2979,6 +2996,12 @@ begin
   FCurrentBGIndex := DEFAULT_BG_INDEX;
   FCurrentReverse := False;
 
+  // Initialize window to full screen
+  FWindowCol1 := 0;
+  FWindowRow1 := 0;
+  FWindowCol2 := Cols - 1;
+  FWindowRow2 := Rows - 1;
+
   // Initialize scrollback with ring buffer
   FScrollbackBuffer := TScrollbackRingBuffer.Create(SCROLLBACK_CAPACITY);
   FViewOffset := 0;
@@ -3003,8 +3026,57 @@ begin
       FCells[r][c].BGIndex := FCurrentBGIndex;
       FCells[r][c].Reverse := FCurrentReverse;
     end;
-  FCursorX := 0;
-  FCursorY := 0;
+  // Position cursor at top-left of window
+  FCursorX := FWindowCol1;
+  FCursorY := FWindowRow1;
+end;
+
+procedure TTextBuffer.SetWindow(Col1, Row1, Col2, Row2: Integer);
+begin
+  // Validate and clamp window boundaries
+  FWindowCol1 := Max(0, Min(Col1, FCols - 1));
+  FWindowRow1 := Max(0, Min(Row1, FRows - 1));
+  FWindowCol2 := Max(FWindowCol1, Min(Col2, FCols - 1));
+  FWindowRow2 := Max(FWindowRow1, Min(Row2, FRows - 1));
+  // Position cursor at top-left of new window
+  FCursorX := FWindowCol1;
+  FCursorY := FWindowRow1;
+end;
+
+procedure TTextBuffer.ResetWindow;
+begin
+  FWindowCol1 := 0;
+  FWindowRow1 := 0;
+  FWindowCol2 := FCols - 1;
+  FWindowRow2 := FRows - 1;
+end;
+
+procedure TTextBuffer.ClearWindow;
+var
+  r, c: Integer;
+begin
+  // Clear only within current window boundaries
+  for r := FWindowRow1 to FWindowRow2 do
+    for c := FWindowCol1 to FWindowCol2 do
+    begin
+      FCells[r][c].Ch := ' ';
+      FCells[r][c].FGIndex := FCurrentFGIndex;
+      FCells[r][c].BGIndex := FCurrentBGIndex;
+      FCells[r][c].Reverse := FCurrentReverse;
+    end;
+  // Position cursor at top-left of window
+  FCursorX := FWindowCol1;
+  FCursorY := FWindowRow1;
+end;
+
+function TTextBuffer.GetWindowLines: Integer;
+begin
+  Result := FWindowRow2 - FWindowRow1 + 1;
+end;
+
+function TTextBuffer.GetWindowCols: Integer;
+begin
+  Result := FWindowCol2 - FWindowCol1 + 1;
 end;
 
 function TTextBuffer.CellsToString(Row: Integer): string;
@@ -3045,19 +3117,22 @@ end;
 
 procedure TTextBuffer.PutChar(Ch: Char);
 begin
-  if FCursorY >= FRows then
+  // Handle scroll if cursor beyond window bottom
+  if FCursorY > FWindowRow2 then
   begin
     ScrollUp;
-    FCursorY := FRows - 1;
+    FCursorY := FWindowRow2;
   end;
 
+  // Handle CR as newline
   if Ch = #13 then
   begin
     NewLine;
     Exit;
   end;
 
-  if FCursorX < FCols then
+  // Write character within window bounds
+  if FCursorX <= FWindowCol2 then
   begin
     // Write character with current color attributes
     FCells[FCursorY][FCursorX].Ch := Ch;
@@ -3067,7 +3142,8 @@ begin
     Inc(FCursorX);
   end;
 
-  if FCursorX >= FCols then
+  // Wrap to next line if past window right edge
+  if FCursorX > FWindowCol2 then
     NewLine;
 end;
 
@@ -3106,12 +3182,14 @@ end;
 
 procedure TTextBuffer.NewLine;
 begin
-  FCursorX := 0;
+  // Move cursor to left edge of window
+  FCursorX := FWindowCol1;
   Inc(FCursorY);
-  if FCursorY >= FRows then
+  // Scroll within window if cursor went past bottom
+  if FCursorY > FWindowRow2 then
   begin
     ScrollUp;
-    FCursorY := FRows - 1;
+    FCursorY := FWindowRow2;
   end;
 end;
 
@@ -3153,28 +3231,29 @@ procedure TTextBuffer.ScrollUp;
 var
   r, c: Integer;
 begin
-  // Save the top line to scrollback buffer before scrolling
+  // When scrolling within a window, only scroll the window content
+  // Save the top line of the window to scrollback buffer before scrolling
   // Ring buffer handles overflow automatically (O(1) operation)
   {$IFDEF DEBUG_CONSOLE}
-  WriteLn('[DEBUG] ScrollUp: Adding line to scrollback: "', CellsToString(0), '" Count before=', FScrollbackBuffer.Count);
+  WriteLn('[DEBUG] ScrollUp: Adding line to scrollback: "', CellsToString(FWindowRow1), '" Count before=', FScrollbackBuffer.Count);
   {$ENDIF}
-  AddToScrollback(0);
+  AddToScrollback(FWindowRow1);
   {$IFDEF DEBUG_CONSOLE}
   WriteLn('[DEBUG] ScrollUp: Count after=', FScrollbackBuffer.Count);
   {$ENDIF}
 
-  // Scroll up - move all rows up by one
-  for r := 0 to FRows - 2 do
-    for c := 0 to FCols - 1 do
+  // Scroll up within window - move rows up by one
+  for r := FWindowRow1 to FWindowRow2 - 1 do
+    for c := FWindowCol1 to FWindowCol2 do
       FCells[r][c] := FCells[r + 1][c];
 
-  // Clear the bottom row
-  for c := 0 to FCols - 1 do
+  // Clear the bottom row of the window
+  for c := FWindowCol1 to FWindowCol2 do
   begin
-    FCells[FRows - 1][c].Ch := ' ';
-    FCells[FRows - 1][c].FGIndex := FCurrentFGIndex;
-    FCells[FRows - 1][c].BGIndex := FCurrentBGIndex;
-    FCells[FRows - 1][c].Reverse := FCurrentReverse;
+    FCells[FWindowRow2][c].Ch := ' ';
+    FCells[FWindowRow2][c].FGIndex := FCurrentFGIndex;
+    FCells[FWindowRow2][c].BGIndex := FCurrentBGIndex;
+    FCells[FWindowRow2][c].Reverse := FCurrentReverse;
   end;
 
   // If we were viewing scrollback, adjust offset to maintain view position
@@ -3878,7 +3957,11 @@ end;
 
 procedure TConsoleOutputAdapter.ClearScreen(Mode: Integer);
 begin
-  // Delegate to VideoController
+  // Always clear the text buffer - it's used across all modes for text overlay
+  if Assigned(FTextBuffer) then
+    FTextBuffer.Clear;
+
+  // Also delegate to VideoController for graphics buffer
   if Assigned(FVideoController) then
     FVideoController.ClearScreen(Mode);
 end;
@@ -4073,22 +4156,32 @@ end;
 // === WINDOW command support ===
 procedure TConsoleOutputAdapter.SetWindow(Col1, Row1, Col2, Row2: Integer; DoClear: Boolean);
 begin
+  // Set window in TextBuffer (controls text output)
+  if Assigned(FTextBuffer) then
+  begin
+    FTextBuffer.SetWindow(Col1, Row1, Col2, Row2);
+    if DoClear then
+      FTextBuffer.ClearWindow;
+  end;
+  // Also set in VideoController (for compatibility)
   if Assigned(FVideoController) then
     FVideoController.SetWindow(Col1, Row1, Col2, Row2, DoClear);
 end;
 
 function TConsoleOutputAdapter.GetWindowLines: Integer;
 begin
-  if Assigned(FVideoController) then
-    Result := FVideoController.GetWindowLines
+  // Use TextBuffer's window info
+  if Assigned(FTextBuffer) then
+    Result := FTextBuffer.GetWindowLines
   else
     Result := 25;
 end;
 
 function TConsoleOutputAdapter.GetWindowCols: Integer;
 begin
-  if Assigned(FVideoController) then
-    Result := FVideoController.GetWindowCols
+  // Use TextBuffer's window info
+  if Assigned(FTextBuffer) then
+    Result := FTextBuffer.GetWindowCols
   else
     Result := 40;
 end;
