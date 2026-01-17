@@ -3690,142 +3690,142 @@ begin
             // CTRL+END: Stop BASIC program (but don't exit)
             else if (FLastKeyDown = SDLK_END) and FCtrlPressed and (not FAltPressed) then
               FStopRequested := True
-            // Handle special keys for GETKEY (convert to C128-compatible PETSCII codes)
+            // Handle special keys for GETKEY (Unicode-compatible codes)
             else if not FHasChar then
             begin
               case FLastKeyDown of
                 SDLK_RETURN, SDLK_KP_ENTER:
                 begin
-                  FLastChar := #13;  // CR
+                  FLastChar := #13;  // CR (standard ASCII)
                   FHasChar := True;
                 end;
                 SDLK_ESCAPE:
                 begin
-                  FLastChar := #27;  // ESC
+                  FLastChar := #27;  // ESC (standard ASCII)
                   FHasChar := True;
                 end;
                 SDLK_BACKSPACE:
                 begin
-                  FLastChar := #20;  // DEL (C128)
+                  FLastChar := #8;   // BS (standard ASCII backspace)
                   FHasChar := True;
                 end;
                 SDLK_DELETE:
                 begin
-                  FLastChar := #148; // INSERT (C128)
+                  FLastChar := #127; // DEL (standard ASCII delete)
                   FHasChar := True;
                 end;
                 SDLK_TAB:
                 begin
-                  FLastChar := #9;   // TAB
+                  FLastChar := #9;   // HT (standard ASCII tab)
                   FHasChar := True;
                 end;
                 SDLK_UP:
                 begin
-                  FLastChar := #145; // Cursor UP
+                  FLastChar := #1;   // SOH - Cursor UP
                   FHasChar := True;
                 end;
                 SDLK_DOWN:
                 begin
-                  FLastChar := #17;  // Cursor DOWN
+                  FLastChar := #2;   // STX - Cursor DOWN
                   FHasChar := True;
                 end;
                 SDLK_LEFT:
                 begin
-                  FLastChar := #157; // Cursor LEFT
+                  FLastChar := #3;   // ETX - Cursor LEFT
                   FHasChar := True;
                 end;
                 SDLK_RIGHT:
                 begin
-                  FLastChar := #29;  // Cursor RIGHT
+                  FLastChar := #4;   // EOT - Cursor RIGHT
                   FHasChar := True;
                 end;
                 SDLK_HOME:
                 begin
-                  FLastChar := #19;  // HOME
+                  FLastChar := #5;   // ENQ - HOME
                   FHasChar := True;
                 end;
                 SDLK_END:
                 begin
                   if not FCtrlPressed then
                   begin
-                    FLastChar := #4;   // END
+                    FLastChar := #6;   // ACK - END
                     FHasChar := True;
                   end;
                 end;
                 SDLK_PAGEUP:
                 begin
-                  FLastChar := #11;  // PAGE UP
+                  FLastChar := #11;  // VT - PAGE UP
                   FHasChar := True;
                 end;
                 SDLK_PAGEDOWN:
                 begin
-                  FLastChar := #12;  // PAGE DOWN
+                  FLastChar := #12;  // FF - PAGE DOWN
                   FHasChar := True;
                 end;
                 SDLK_INSERT:
                 begin
-                  FLastChar := #148; // INSERT
+                  FLastChar := #14;  // SO - INSERT
                   FHasChar := True;
                 end;
-                // Function keys (C128 codes)
+                // Function keys (codes 128-139)
                 SDLK_F1:
                 begin
-                  FLastChar := #133;
+                  FLastChar := #128;
                   FHasChar := True;
                 end;
                 SDLK_F2:
                 begin
-                  FLastChar := #137;
+                  FLastChar := #129;
                   FHasChar := True;
                 end;
                 SDLK_F3:
                 begin
-                  FLastChar := #134;
+                  FLastChar := #130;
                   FHasChar := True;
                 end;
                 SDLK_F4:
                 begin
-                  FLastChar := #138;
+                  FLastChar := #131;
                   FHasChar := True;
                 end;
                 SDLK_F5:
                 begin
-                  FLastChar := #135;
+                  FLastChar := #132;
                   FHasChar := True;
                 end;
                 SDLK_F6:
                 begin
-                  FLastChar := #139;
+                  FLastChar := #133;
                   FHasChar := True;
                 end;
                 SDLK_F7:
                 begin
-                  FLastChar := #136;
+                  FLastChar := #134;
                   FHasChar := True;
                 end;
                 SDLK_F8:
                 begin
-                  FLastChar := #140;
+                  FLastChar := #135;
                   FHasChar := True;
                 end;
                 SDLK_F9:
                 begin
-                  FLastChar := #141;
+                  FLastChar := #136;
                   FHasChar := True;
                 end;
                 SDLK_F10:
                 begin
-                  FLastChar := #142;
+                  FLastChar := #137;
                   FHasChar := True;
                 end;
                 SDLK_F11:
                 begin
-                  FLastChar := #143;
+                  FLastChar := #138;
                   FHasChar := True;
                 end;
                 SDLK_F12:
                 begin
-                  FLastChar := #144;
+                  FLastChar := #139;
                   FHasChar := True;
                 end;
               end;
