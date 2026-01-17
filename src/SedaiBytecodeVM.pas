@@ -63,6 +63,9 @@ type
                              Handle: Integer; var Data: string;
                              var ErrorCode: Integer) of object;
 
+  { Event poll callback for keeping UI responsive during VM execution }
+  TEventPollCallback = function: Boolean of object;
+
   { Array storage structure }
   TArrayStorage = record
     ElementType: Byte;        // 0=Int, 1=Float, 2=String (maps to TSSARegisterType)
@@ -124,6 +127,9 @@ type
     // Current CMD file handle (0 = screen, >0 = redirected to file)
     FCmdHandle: Integer;
     FSwapTempInt: Int64;  // Temp variable for ArraySwapInt superinstruction
+    // Event polling callback for UI responsiveness
+    FEventPollCallback: TEventPollCallback;
+    FEventPollInterval: Integer;
     // Temp variables for ArrayReverseRange and ArrayShiftLeft
     FStartIdx, FEndIdx, FArrIdxTmp, FLoopIdx: Integer;
     FFirstVal: Int64;
@@ -335,6 +341,9 @@ begin
   FOwnsConsoleBehavior := True;
   // Initialize CMD handle (0 = output to screen)
   FCmdHandle := 0;
+  // Initialize event polling (nil = disabled)
+  FEventPollCallback := nil;
+  FEventPollInterval := 10000;  // Poll every 10000 instructions by default
   // Initialize error state for EL, ER, ERR$
   FLastErrorLine := 0;
   FLastErrorCode := 0;
@@ -1282,6 +1291,74 @@ begin
 
         // ArrayLoad: Dest is result, Src2 is index (int)
         // Note: bcArrayLoadInt/Float/String already handled above
+
+        // Graphics operations with multiple registers packed in Immediate
+        // bcGraphicBox: Src1=color(int), Src2=x1(int), Dest=y1(int)
+        // Immediate: x2(12) | y2(12) | angle(12) | filled(12) | fill_color(12)
+        bcGraphicBox:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // color
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // x1
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // y1
+          if (Instr.Immediate and $FFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFF;  // x2
+          if ((Instr.Immediate shr 12) and $FFF) > MaxIntReg then MaxIntReg := (Instr.Immediate shr 12) and $FFF;  // y2
+          if ((Instr.Immediate shr 24) and $FFF) > MaxFloatReg then MaxFloatReg := (Instr.Immediate shr 24) and $FFF;  // angle (float)
+          if ((Instr.Immediate shr 36) and $FFF) > MaxIntReg then MaxIntReg := (Instr.Immediate shr 36) and $FFF;  // filled
+        end;
+
+        // bcGraphicCircle: Src1=color(int), Src2=x(int), Dest=y(int)
+        // Immediate: xr(10) | yr(10) | sa(10) | ea(10) | angle(10) | inc(10) = 60 bits
+        bcGraphicCircle:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // color
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // x
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // y
+          if (Instr.Immediate and $3FF) > MaxIntReg then MaxIntReg := Instr.Immediate and $3FF;  // xr
+          if ((Instr.Immediate shr 10) and $3FF) > MaxIntReg then MaxIntReg := (Instr.Immediate shr 10) and $3FF;  // yr
+          if ((Instr.Immediate shr 20) and $3FF) > MaxFloatReg then MaxFloatReg := (Instr.Immediate shr 20) and $3FF;  // sa (float)
+          if ((Instr.Immediate shr 30) and $3FF) > MaxFloatReg then MaxFloatReg := (Instr.Immediate shr 30) and $3FF;  // ea (float)
+          if ((Instr.Immediate shr 40) and $3FF) > MaxFloatReg then MaxFloatReg := (Instr.Immediate shr 40) and $3FF;  // angle (float)
+          if ((Instr.Immediate shr 50) and $3FF) > MaxFloatReg then MaxFloatReg := (Instr.Immediate shr 50) and $3FF;  // inc (float)
+        end;
+
+        // bcGraphicPaint: Src1=source(int), Src2=x(int), Dest=y(int), Immediate=mode(int)
+        bcGraphicPaint:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // source
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // x
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // y
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;  // mode
+        end;
+
+        // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
+        // Immediate bits 0-15 = row2 register(int), bits 16-31 = clear register(int)
+        bcGraphicWindow:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // col1
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // row1
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // col2
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;  // row2
+          if ((Instr.Immediate shr 16) and $FFFF) > MaxIntReg then MaxIntReg := (Instr.Immediate shr 16) and $FFFF;  // clear
+        end;
+
+        // bcGraphicSShape: Dest=string reg, Src1=x1(int), Src2=y1(int)
+        // Immediate bits 0-15 = x2 register(int), bits 16-31 = y2 register(int)
+        bcGraphicSShape:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;   // result string
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // x1
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // y1
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;  // x2
+          if ((Instr.Immediate shr 16) and $FFFF) > MaxIntReg then MaxIntReg := (Instr.Immediate shr 16) and $FFFF;  // y2
+        end;
+
+        // bcGraphicGShape: Src1=string reg, Src2=x(int), Dest=y(int), Immediate=mode
+        bcGraphicGShape:
+        begin
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;   // shape string
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // x
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // y
+        end;
       end;
     end;
   end;
@@ -3074,8 +3151,8 @@ begin
         case FIntRegs[Instr.Src1] of
           0: FIntRegs[Instr.Dest] := FOutputDevice.GetPixelCursorX;
           1: FIntRegs[Instr.Dest] := FOutputDevice.GetPixelCursorY;
-          2: FIntRegs[Instr.Dest] := Integer(FOutputDevice.GetPixel(
-               FOutputDevice.GetPixelCursorX, FOutputDevice.GetPixelCursorY));
+          2: FIntRegs[Instr.Dest] := FOutputDevice.GetPixelIndex(
+               FOutputDevice.GetPixelCursorX, FOutputDevice.GetPixelCursorY);
         else
           FIntRegs[Instr.Dest] := 0;
         end;
@@ -3114,8 +3191,9 @@ begin
       if Assigned(FOutputDevice) then
       begin
         // Src1 = source, Src2 = x, Dest = y, Immediate = mode
+        // All parameters are INT registers
         FOutputDevice.FloodFill(FIntRegs[Instr.Src1],
-          FFloatRegs[Instr.Src2], FFloatRegs[Instr.Dest], FIntRegs[Instr.Immediate and $FFFF]);
+          FIntRegs[Instr.Src2], FIntRegs[Instr.Dest], FIntRegs[Instr.Immediate and $FFFF]);
       end;
     12: // bcGraphicWindow - WINDOW col1, row1, col2, row2 [,clear]
       if Assigned(FOutputDevice) then
@@ -3129,18 +3207,18 @@ begin
     13: // bcGraphicSShape - SSHAPE A$, x1, y1 [,x2, y2]
       if Assigned(FOutputDevice) then
       begin
-        // Dest = string reg index, Src1 = x1, Src2 = y1
-        // Immediate bits 0-15 = x2, bits 16-31 = y2
+        // Dest = string reg index, Src1 = x1, Src2 = y1 (INT)
+        // Immediate bits 0-15 = x2, bits 16-31 = y2 (INT)
         FStringRegs[Instr.Dest] := FOutputDevice.SaveShape(
-          FFloatRegs[Instr.Src1], FFloatRegs[Instr.Src2],
+          FIntRegs[Instr.Src1], FIntRegs[Instr.Src2],
           FIntRegs[Instr.Immediate and $FFFF], FIntRegs[(Instr.Immediate shr 16) and $FFFF]);
       end;
     14: // bcGraphicGShape - GSHAPE A$, x, y [,mode]
       if Assigned(FOutputDevice) then
       begin
-        // Src1 = string reg index, Src2 = x, Dest = y, Immediate = mode
+        // Src1 = string reg index, Src2 = x, Dest = y (INT), Immediate = mode
         FOutputDevice.LoadShape(FStringRegs[Instr.Src1],
-          FFloatRegs[Instr.Src2], FFloatRegs[Instr.Dest], Instr.Immediate);
+          FIntRegs[Instr.Src2], FIntRegs[Instr.Dest], Instr.Immediate);
         FOutputDevice.Present;
       end;
     15: // bcGraphicGList - GLIST
@@ -3157,7 +3235,7 @@ begin
       if Assigned(FOutputDevice) then
       begin
         // Return color of source n
-        FIntRegs[Instr.Dest] := FOutputDevice.GetColorSource(FIntRegs[Instr.Src1]);
+        FIntRegs[Instr.Dest] := FOutputDevice.GetColorSourceDirect(FIntRegs[Instr.Src1]);
       end
       else
         FIntRegs[Instr.Dest] := 0;
@@ -3175,6 +3253,17 @@ begin
       end
       else
         FIntRegs[Instr.Dest] := 0;
+    19: // bcSetColor - SETCOLOR source, color
+      if Assigned(FOutputDevice) then
+        FOutputDevice.SetColorSource(FIntRegs[Instr.Src1], FIntRegs[Instr.Src2]);
+    20: // bcGetColor - GETCOLOR(source)
+      if Assigned(FOutputDevice) then
+        FIntRegs[Instr.Dest] := FOutputDevice.GetColorSourceDirect(FIntRegs[Instr.Src1])
+      else
+        FIntRegs[Instr.Dest] := 0;
+    21: // bcScnClr - SCNCLR [mode]
+      if Assigned(FOutputDevice) then
+        FOutputDevice.ClearScreen(FIntRegs[Instr.Src1]);
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, FPC]);
   end;

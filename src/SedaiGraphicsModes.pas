@@ -80,7 +80,8 @@ type
     procedure LoadC64Palette;
     procedure LoadC64PaletteVICE;
     procedure LoadVGAPalette;
-    procedure LoadDefaultPalette;
+    procedure LoadDefaultPalette; overload;
+    procedure LoadDefaultPalette(NewPaletteType: TPaletteType); overload;
     procedure LoadPredefinedPalette(PaletteID: Integer);
 
     procedure SetColor(Index: Integer; R, G, B: Byte); overload;
@@ -286,6 +287,12 @@ begin
     ptTrueColor: ; // Non serve palette per true color
   end;
   FModified := False;
+end;
+
+procedure TPaletteManager.LoadDefaultPalette(NewPaletteType: TPaletteType);
+begin
+  FPaletteType := NewPaletteType;
+  LoadDefaultPalette;
 end;
 
 procedure TPaletteManager.LoadC64Palette;

@@ -88,6 +88,13 @@ begin
   FSystemCommands.Add(kBLOAD);
   FSystemCommands.Add(kBSAVE);
   FSystemCommands.Add(kBOOT);
+  // Program editing
+  FSystemCommands.Add(kEDIT);
+  FSystemCommands.Add(kAUTO);
+  // History management
+  FSystemCommands.Add(kHLOAD);
+  FSystemCommands.Add(kHSAVE);
+  FSystemCommands.Add(kHCLEAR);
 end;
 
 destructor TCommandRouter.Destroy;

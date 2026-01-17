@@ -115,11 +115,13 @@ type
                            SplitLine: Integer = -1): Boolean;
     function GetGraphicMode: TGraphicMode;
     function IsInGraphicsMode: Boolean;
+    procedure ClearScreen(Mode: Integer);  // SCNCLR: -1=current, 0-5=specific mode
 
     // Pixel operations
     procedure SetPixel(X, Y: Integer; RGB: UInt32); overload;
     procedure SetPixel(X, Y: Integer; PaletteIndex: TPaletteIndex); overload;
     function GetPixel(X, Y: Integer): UInt32;
+    function GetPixelIndex(X, Y: Integer): TPaletteIndex;  // Returns palette index at coordinates
 
     // Palette management
     procedure EnablePalette(Enable: Boolean);
@@ -153,9 +155,10 @@ type
     function GetPixelCursorX: Integer;
     function GetPixelCursorY: Integer;
 
-    // Color sources (C128-compatible, 0-6)
-    procedure SetColorSource(Source, Color: Integer);
-    function GetColorSource(Source: Integer): Integer;
+    // Color sources (C128-compatible, source 0-6, color 0-255)
+    procedure SetColorSource(Source, Color: Integer);  // COLOR command (0-255, palette wraps)
+    procedure SetColorSourceDirect(Source, Color: Integer); // SETCOLOR (0-255)
+    function GetColorSourceDirect(Source: Integer): Integer; // RCLR/GETCOLOR return 0-based
 
     // Line width (1 or 2)
     procedure SetLineWidth(Width: Integer);

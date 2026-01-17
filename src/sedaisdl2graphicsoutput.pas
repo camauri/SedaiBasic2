@@ -31,7 +31,7 @@ uses
   Classes, SysUtils, Math, StrUtils,
   SDL2, SDL2_ttf,
   SedaiOutputInterface, SedaiGraphicsModes,
-  SedaiSDL2Output, SedaiGraphicsMemory;
+  SedaiSDL2Output, SedaiGraphicsMemory, SedaiGraphicsPrimitives;
 
 type
   TDisplayMode = (dmWindowed, dmFullscreenNative, dmFullscreenOptimal);
@@ -848,63 +848,32 @@ end;
 procedure TSDL2GraphicsOutputDevice.DrawBoxStyled(X1, Y1, X2, Y2: Integer;
   const Style: TShapeStyle; Angle: Double);
 var
-  MinX, MinY, MaxX, MaxY: Integer;
-  X, Y: Integer;
-  BorderColor, FillColor: UInt32;
+  BorderColor: UInt32;
+  Filled: Boolean;
+  LineWidth: Integer;
 begin
-  // In graphics mode, we draw into the graphics memory buffer using SetPixel
-  // This ensures the box appears in the graphics layer, not directly on the renderer
-
-  // For now, only support non-rotated boxes (rotation would require more complex math)
-  // TODO: Add rotation support for graphics memory drawing
-
-  // Normalize coordinates
-  MinX := Min(X1, X2);
-  MaxX := Max(X1, X2);
-  MinY := Min(Y1, Y2);
-  MaxY := Max(Y1, Y2);
-
-  // Clamp to graphics buffer bounds
-  if MinX < 0 then MinX := 0;
-  if MinY < 0 then MinY := 0;
-  if MaxX >= FCurrentModeInfo.NativeWidth then MaxX := FCurrentModeInfo.NativeWidth - 1;
-  if MaxY >= FCurrentModeInfo.NativeHeight then MaxY := FCurrentModeInfo.NativeHeight - 1;
+  // Use shared graphics primitive for correct clipping and rotation support
+  if FGraphicsMemory = nil then Exit;
 
   BorderColor := Style.Border.Color;
-  FillColor := Style.Fill.Color;
+  Filled := (Style.Fill.Style <> fsNone);
+  LineWidth := Style.Border.Width;
+  if LineWidth <= 0 then LineWidth := 1;
 
-  // Draw fill first (if any)
-  if Style.Fill.Style <> fsNone then
-  begin
-    for Y := MinY + 1 to MaxY - 1 do
-      for X := MinX + 1 to MaxX - 1 do
-        FGraphicsMemory.SetPixel(X, Y, FillColor);
-  end;
-
-  // Draw border (if any)
-  if (Style.Border.LineStyle <> blsNone) and (Style.Border.Width > 0) then
-  begin
-    // Top and bottom edges
-    for X := MinX to MaxX do
-    begin
-      FGraphicsMemory.SetPixel(X, MinY, BorderColor);
-      FGraphicsMemory.SetPixel(X, MaxY, BorderColor);
-    end;
-    // Left and right edges
-    for Y := MinY to MaxY do
-    begin
-      FGraphicsMemory.SetPixel(MinX, Y, BorderColor);
-      FGraphicsMemory.SetPixel(MaxX, Y, BorderColor);
-    end;
-  end;
+  // Use shared primitive - draws into graphics memory with proper clipping
+  // Color is RGBA value, UseIndex = False for RGBA modes
+  DrawBoxToMemory(FGraphicsMemory, X1, Y1, X2, Y2,
+                  BorderColor, False, Filled, LineWidth, Angle,
+                  FCurrentModeInfo.NativeWidth, FCurrentModeInfo.NativeHeight);
 end;
 
 procedure TSDL2GraphicsOutputDevice.DrawBoxWithColor(X1, Y1, X2, Y2: Integer;
   Color: UInt32; Angle: Double; Filled: Boolean);
 var
-  Style: TShapeStyle;
   ActualColor: UInt32;
 begin
+  if FGraphicsMemory = nil then Exit;
+
   // Interpret color based on current graphics mode
   case FCurrentMode of
     gmStandardBitmap, gmSplitBitmap:  // Hires modes (GRAPHIC 1, 2)
@@ -933,21 +902,10 @@ begin
     end;
   end;
 
-  // Create style with the resolved color
-  Style.Border := MakeDefaultBorderStyle(ActualColor, 1);
-  if Filled then
-  begin
-    Style.Fill := MakeDefaultFillStyle(ActualColor);
-    Style.Fill.Style := fsSolid;
-  end
-  else
-  begin
-    Style.Fill := MakeDefaultFillStyle(clTransparent);
-    Style.Fill.Style := fsNone;
-  end;
-
-  // Call our local DrawBoxStyled that draws into graphics memory
-  DrawBoxStyled(X1, Y1, X2, Y2, Style, Angle);
+  // Use shared primitive - draws into graphics memory with proper clipping and rotation
+  DrawBoxToMemory(FGraphicsMemory, X1, Y1, X2, Y2,
+                  ActualColor, False, Filled, 1, Angle,
+                  FCurrentModeInfo.NativeWidth, FCurrentModeInfo.NativeHeight);
 end;
 
 end.

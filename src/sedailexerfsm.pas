@@ -1008,7 +1008,8 @@ end;
 procedure TLexerFSM.TokenBufferAdd(C: Char);
 begin
   if FTokenLength >= MAX_TOKEN_LENGTH then
-    raise Exception.CreateFmt('Token too long (max %d chars)', [MAX_TOKEN_LENGTH]);
+    raise Exception.CreateFmt('Token too long at line %d (max %d chars) - possible unterminated string',
+      [FCurrentLine, MAX_TOKEN_LENGTH]);
 
   FTokenBuffer[FTokenLength] := C;
   Inc(FTokenLength);

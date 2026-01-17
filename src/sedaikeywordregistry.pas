@@ -1712,6 +1712,7 @@ begin
  RegisterKeyword(kBOX,     ttGraphicsCommand,  'Draw a box',                                       kcGraphicsHandling);
  RegisterKeyword(kCIRCLE,  ttGraphicsCommand,  'Draws circles, ellipses, arcs and polygons',       kcGraphicsHandling);
  RegisterKeyword(kCOLOR,   ttGraphicsCommand,  'Define colors for each screen area',               kcGraphicsHandling);
+ RegisterKeyword(kSETCOLOR, ttGraphicsCommand, 'Set color for screen area (0-based index)',        kcGraphicsHandling);
  RegisterKeyword(kDRAW,    ttGraphicsCommand,  'Draw dots, lines and shapes',                      kcGraphicsHandling);
  RegisterKeyword(kGLIST,   ttGraphicsCommand,  'List available SDL2 video modes',                  kcGraphicsHandling);
  RegisterKeyword(kGRAPHIC, ttGraphicsCommand,  'Select a graphic mode',                            kcGraphicsHandling);
@@ -1722,14 +1723,15 @@ begin
  RegisterKeyword(kSCNCLR,  ttGraphicsCommand,  'Clear screen',                                     kcGraphicsHandling);
  RegisterKeyword(kSSHAPE,  ttGraphicsCommand,  'Save shapes to string variable',                   kcGraphicsHandling);
  RegisterKeyword(kWIDTH,   ttGraphicsCommand,  'Set the width of drawn lines',                     kcGraphicsHandling);
- RegisterKeyword(kWINDOW,  ttGraphicsCommand,  'Defines a screen window',                          kcGraphicsHandling);
+ RegisterKeyword(kWINDOW,  ttOutputCommand,    'Defines a text screen window',                     kcStdIO);
  // functions
- RegisterKeyword(kPOS,     ttGraphicsFunction, 'Return the current cursor column position',        kcGraphicsHandling);
+ RegisterKeyword(kGETCOLOR, ttGraphicsFunction, 'Return color index for screen area (0-based)',    kcGraphicsHandling);
+ RegisterKeyword(kPOS,     ttInputFunction,    'Return the current cursor column position',        kcStdIO);
  RegisterKeyword(kRCLR,    ttGraphicsFunction, 'Return color of color source',                     kcGraphicsHandling);
  RegisterKeyword(kRDOT,    ttGraphicsFunction, 'Return current position or color of pixel cursor', kcGraphicsHandling);
  RegisterKeyword(kRGR,     ttGraphicsFunction, 'Return current graphic mode',                      kcGraphicsHandling);
  RegisterKeyword(kRGBA,    ttGraphicsFunction, 'Create 32-bit RGBA color value',                   kcGraphicsHandling);
- RegisterKeyword(kRWINDOW, ttGraphicsFunction, 'Return the size of the current window',            kcGraphicsHandling);
+ RegisterKeyword(kRWINDOW, ttInputFunction,    'Return the size of the current text window',       kcStdIO);
 
  // === SPRITES HANDLING (COMMANDS AND FUNCTIONS) ===
  // commands
@@ -1804,6 +1806,9 @@ begin
   RegisterKeyword(kAUTO,     ttProgramEditing, 'Auto line numbering',                   kcProgramEditing);
   RegisterKeyword(kDELETE,   ttProgramEditing, 'Delete lines of a BASIC program',       kcProgramEditing);
   RegisterKeyword(kEDIT,     ttProgramEditing, 'Edit a single program line',            kcProgramEditing);
+  RegisterKeyword(kHCLEAR,   ttProgramEditing, 'Clear current history',                 kcProgramEditing);
+  RegisterKeyword(kHLOAD,    ttProgramEditing, 'Load history from file',                kcProgramEditing);
+  RegisterKeyword(kHSAVE,    ttProgramEditing, 'Save history to file',                  kcProgramEditing);
   RegisterKeyword(kLIST,     ttProgramEditing, 'List the BASIC program lines',          kcProgramEditing);
   RegisterKeyword(kNEW,      ttProgramEditing, 'Erase program and clear all variables', kcProgramEditing);
   RegisterKeyword(kRENUMBER, ttProgramEditing, 'Renumber lines of the BASIC program',   kcProgramEditing);

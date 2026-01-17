@@ -35,6 +35,7 @@ deps/
 /docs/
 /job/
 /presentation/
+/temp/
 
 # Files
 *.ini
@@ -78,6 +79,7 @@ job/log/txt/step_output.txt
 
 # Documentation (generated, not tracked)
 JAVA_VS_SEDAI.md
+VM_EVOLUTION.md
 
 # SDL2 dependencies (if included)
 # Uncomment if SDL2 libs are not to be tracked

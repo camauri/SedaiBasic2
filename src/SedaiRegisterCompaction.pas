@@ -213,6 +213,7 @@ begin
     bcGraphicPos,     // POS(x): cursor column position (int)
     bcGraphicRclr,    // RCLR(n): color of source (int)
     bcGraphicRwindow, // RWINDOW(n): window info (int)
+    bcGetColor,       // GETCOLOR(source): color value (int)
     // === SUPERINSTRUCTIONS ===
     // Fused arithmetic-to-dest (Int): Dest = Dest op Src1
     bcAddIntTo, bcSubIntTo, bcMulIntTo,
@@ -335,6 +336,18 @@ begin
     bcSoundTempo,     // Src1 = tempo value (int)
     // === GROUP 10: Graphics ===
     bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA, bcGraphicRdot, bcGraphicGetMode,
+    bcGraphicWindow,  // Src1 = col1 register (int)
+    bcGraphicCircle,  // Src1 = color register (int)
+    bcGraphicPaint,   // Src1 = source register (int)
+    bcGraphicSShape,  // Src1 = x1 coordinate (int)
+    bcGraphicColor,   // Src1 = source register (int)
+    bcGraphicWidth,   // Src1 = width value (int)
+    bcGraphicScale,   // Src1 = enable flag (int)
+    bcGraphicRclr,    // Src1 = color source index (int)
+    bcGraphicRwindow, // Src1 = info type (int)
+    bcScnClr,         // Src1 = mode register (int)
+    bcSetColor,       // Src1 = source register (int)
+    bcGetColor,       // Src1 = source index (int)
     // === SUPERINSTRUCTIONS ===
     // Fused arithmetic-to-dest (Int): Src1 is int operand
     bcAddIntTo, bcSubIntTo, bcMulIntTo,
@@ -416,6 +429,14 @@ begin
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     // === GROUP 10: Graphics ===
     bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
+    bcGraphicWindow,  // Src2 = row1 register (int)
+    bcGraphicCircle,  // Src2 = x register (int)
+    bcGraphicScale,   // Src2 = xmax register (int)
+    bcGraphicColor,   // Src2 = color value (int)
+    bcGraphicPaint,   // Src2 = x coordinate (int)
+    bcGraphicSShape,  // Src2 = y1 coordinate (int)
+    bcGraphicGShape,  // Src2 = x coordinate (int)
+    bcSetColor,       // Src2 = color value (int)
     // === SUPERINSTRUCTIONS ===
     // Fused compare-and-branch (Int): Src2 is second comparison operand
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
@@ -521,6 +542,11 @@ begin
     bcArrayStoreInt,  // Dest = value register (int) - READ, not written
     // === GROUP 10: Graphics ===
     bcGraphicBox,     // Dest = y1 register (int) - READ, not written
+    bcGraphicWindow,  // Dest = col2 register (int) - READ, not written
+    bcGraphicCircle,  // Dest = y register (int) - READ, not written
+    bcGraphicScale,   // Dest = ymax register (int) - READ, not written
+    bcGraphicPaint,   // Dest = y coordinate (int) - READ, not written
+    bcGraphicGShape,  // Dest = y coordinate (int) - READ, not written
     // === GROUP 11: Sound ===
     bcSoundSound,     // Dest = duration register (int) - READ, not written
     // === SUPERINSTRUCTIONS ===
@@ -716,6 +742,61 @@ begin
     if OpCode = bcStrMid then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
+    // bcGraphicWindow: Src1=col1, Src2=row1, Dest=col2, Immediate = (clear_reg << 16) | row2_reg
+    // All 5 parameters are int registers
+    if OpCode = bcGraphicWindow then
+    begin
+      MarkIntRegUsed(Instr.Src1);              // col1
+      MarkIntRegUsed(Instr.Src2);              // row1
+      MarkIntRegUsed(Instr.Dest);              // col2
+      MarkIntRegUsed(Instr.Immediate and $FFFF);           // row2 (bits 0-15)
+      MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);  // clear (bits 16-31)
+    end;
+
+    // bcGraphicCircle: Src1=color(int), Src2=x(int), Dest=y(int)
+    // Immediate: xr(10) | yr(10) | sa(10) | ea(10) | angle(10) | inc(10) = 60 bits
+    // xr, yr are int registers; sa, ea, angle, inc are float registers
+    if OpCode = bcGraphicCircle then
+    begin
+      MarkIntRegUsed(Instr.Src1);                          // color - int
+      MarkIntRegUsed(Instr.Src2);                          // x - int
+      MarkIntRegUsed(Instr.Dest);                          // y - int
+      MarkIntRegUsed((Instr.Immediate) and $3FF);          // xr - int
+      MarkIntRegUsed((Instr.Immediate shr 10) and $3FF);   // yr - int
+      MarkFloatRegUsed((Instr.Immediate shr 20) and $3FF); // sa - float
+      MarkFloatRegUsed((Instr.Immediate shr 30) and $3FF); // ea - float
+      MarkFloatRegUsed((Instr.Immediate shr 40) and $3FF); // angle - float
+      MarkFloatRegUsed((Instr.Immediate shr 50) and $3FF); // inc - float
+    end;
+
+    // bcGraphicPaint: Src1=source(int), Src2=x(int), Dest=y(int), Immediate = mode(int)
+    if OpCode = bcGraphicPaint then
+    begin
+      MarkIntRegUsed(Instr.Src1);               // source - int
+      MarkIntRegUsed(Instr.Src2);               // x - int
+      MarkIntRegUsed(Instr.Dest);               // y - int
+      MarkIntRegUsed(Instr.Immediate and $FFFF);// mode - int
+    end;
+
+    // bcGraphicSShape: Dest=string reg, Src1=x1(int), Src2=y1(int)
+    // Immediate bits 0-15 = x2 register(int), bits 16-31 = y2 register(int)
+    if OpCode = bcGraphicSShape then
+    begin
+      MarkStringRegUsed(Instr.Dest);                       // result string
+      MarkIntRegUsed(Instr.Src1);                          // x1 - int
+      MarkIntRegUsed(Instr.Src2);                          // y1 - int
+      MarkIntRegUsed(Instr.Immediate and $FFFF);           // x2 - int
+      MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);  // y2 - int
+    end;
+
+    // bcGraphicGShape: Src1=string reg, Src2=x(int), Dest=y(int), Immediate=mode (value, not reg)
+    if OpCode = bcGraphicGShape then
+    begin
+      MarkStringRegUsed(Instr.Src1);            // shape string
+      MarkIntRegUsed(Instr.Src2);               // x - int
+      MarkIntRegUsed(Instr.Dest);               // y - int
+    end;
+
     // bcSoundFilter: Immediate contains hp_reg(8) | res_reg(8)
     if OpCode = bcSoundFilter then
     begin
@@ -742,10 +823,25 @@ end;
 procedure TRegisterCompactor.BuildMappings;
 var
   i: Integer;
+  VarRegCount: Integer;
 begin
+  // CRITICAL FIX: Get the count of BASIC variable registers from program metadata
+  // Variable registers (0..VarRegCount-1) must be preserved with identity mapping
+  // because they may be read without explicit write instructions in the bytecode
+  VarRegCount := FProgram.GetIntVarRegCount;
+
   // Build compact mapping for int registers
+  // First, preserve variable registers (0..VarRegCount-1) with identity mapping
   FNewIntRegCount := 0;
-  for i := 0 to FMaxOldIntReg do
+  for i := 0 to VarRegCount - 1 do
+  begin
+    FIntRegMap[i] := i;  // Identity mapping for variable registers
+    if i >= FNewIntRegCount then
+      FNewIntRegCount := i + 1;
+  end;
+
+  // Then map remaining used registers
+  for i := VarRegCount to FMaxOldIntReg do
   begin
     if FIntRegMap[i] >= 0 then  // Was marked as used
     begin
@@ -755,8 +851,17 @@ begin
   end;
 
   // Build compact mapping for float registers
+  // First, preserve variable registers with identity mapping
+  VarRegCount := FProgram.GetFloatVarRegCount;
   FNewFloatRegCount := 0;
-  for i := 0 to FMaxOldFloatReg do
+  for i := 0 to VarRegCount - 1 do
+  begin
+    FFloatRegMap[i] := i;  // Identity mapping for variable registers
+    if i >= FNewFloatRegCount then
+      FNewFloatRegCount := i + 1;
+  end;
+  // Then map remaining used registers
+  for i := VarRegCount to FMaxOldFloatReg do
   begin
     if FFloatRegMap[i] >= 0 then
     begin
@@ -766,8 +871,17 @@ begin
   end;
 
   // Build compact mapping for string registers
+  // First, preserve variable registers with identity mapping
+  VarRegCount := FProgram.GetStringVarRegCount;
   FNewStringRegCount := 0;
-  for i := 0 to FMaxOldStringReg do
+  for i := 0 to VarRegCount - 1 do
+  begin
+    FStringRegMap[i] := i;  // Identity mapping for variable registers
+    if i >= FNewStringRegCount then
+      FNewStringRegCount := i + 1;
+  end;
+  // Then map remaining used registers
+  for i := VarRegCount to FMaxOldStringReg do
   begin
     if FStringRegMap[i] >= 0 then
     begin
@@ -1067,6 +1181,136 @@ begin
           Instr.Immediate := NewReg and $FFFF;
           Modified := True;
         end;
+      end;
+    end;
+
+    // bcGraphicWindow: Src1=col1, Src2=row1, Dest=col2, Immediate = (clear_reg << 16) | row2_reg
+    // All 5 parameters are int registers. Src1/Src2/Dest are handled above, now handle Immediate.
+    if OpCode = bcGraphicWindow then
+    begin
+      // row2 register (bits 0-15)
+      OldReg := Instr.Immediate and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewReg and $FFFF;
+
+      // clear register (bits 16-31)
+      OldReg := (Instr.Immediate shr 16) and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 16);
+
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
+      end;
+    end;
+
+    // bcGraphicCircle: Immediate contains 6 packed register indices
+    // Layout: xr(bits 0-9) | yr(10-19) | sa(20-29) | ea(30-39) | angle(40-49) | inc(50-59)
+    // xr, yr are int registers; sa, ea, angle, inc are float registers
+    if OpCode = bcGraphicCircle then
+    begin
+      NewImm := 0;
+
+      // xr - int (bits 0-9)
+      OldReg := Instr.Immediate and $3FF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewReg and $3FF;
+
+      // yr - int (bits 10-19)
+      OldReg := (Instr.Immediate shr 10) and $3FF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $3FF) shl 10);
+
+      // sa - float (bits 20-29)
+      OldReg := (Instr.Immediate shr 20) and $3FF;
+      if (OldReg < Length(FFloatRegMap)) and (FFloatRegMap[OldReg] >= 0) then
+        NewReg := FFloatRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $3FF) shl 20);
+
+      // ea - float (bits 30-39)
+      OldReg := (Instr.Immediate shr 30) and $3FF;
+      if (OldReg < Length(FFloatRegMap)) and (FFloatRegMap[OldReg] >= 0) then
+        NewReg := FFloatRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $3FF) shl 30);
+
+      // angle - float (bits 40-49)
+      OldReg := (Instr.Immediate shr 40) and $3FF;
+      if (OldReg < Length(FFloatRegMap)) and (FFloatRegMap[OldReg] >= 0) then
+        NewReg := FFloatRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $3FF) shl 40);
+
+      // inc - float (bits 50-59)
+      OldReg := (Instr.Immediate shr 50) and $3FF;
+      if (OldReg < Length(FFloatRegMap)) and (FFloatRegMap[OldReg] >= 0) then
+        NewReg := FFloatRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $3FF) shl 50);
+
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
+      end;
+    end;
+
+    // bcGraphicPaint: Immediate = mode register (int)
+    if OpCode = bcGraphicPaint then
+    begin
+      OldReg := Instr.Immediate and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+      begin
+        NewReg := FIntRegMap[OldReg];
+        if NewReg <> OldReg then
+        begin
+          Instr.Immediate := NewReg and $FFFF;
+          Modified := True;
+        end;
+      end;
+    end;
+
+    // bcGraphicSShape: Immediate = (y2_reg << 16) | x2_reg - two int registers
+    if OpCode = bcGraphicSShape then
+    begin
+      // x2 register (bits 0-15)
+      OldReg := Instr.Immediate and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewReg and $FFFF;
+
+      // y2 register (bits 16-31)
+      OldReg := (Instr.Immediate shr 16) and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 16);
+
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
       end;
     end;
 

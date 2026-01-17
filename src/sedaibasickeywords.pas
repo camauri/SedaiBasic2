@@ -154,6 +154,9 @@ const
   kAUTO    = 'AUTO';     // Auto line numbering
   kSAVE    = 'SAVE';
   kLOAD    = 'LOAD';
+  kHLOAD   = 'HLOAD';    // Load history from file
+  kHSAVE   = 'HSAVE';    // Save history to file
+  kHCLEAR  = 'HCLEAR';   // Clear current history
   kSTOP    = 'STOP';
   kFAST    = 'FAST';
   kSLOW    = 'SLOW';
@@ -201,6 +204,8 @@ const
   // Graphics
   kBOX     = 'BOX';
   kCOLOR   = 'COLOR';
+  kSETCOLOR = 'SETCOLOR';  // SETCOLOR(source, color) - set color (0-255)
+  kGETCOLOR = 'GETCOLOR';  // GETCOLOR(source) - return color index (0-255)
   kGLIST   = 'GLIST';    // List available SDL2 video modes
   kMORE    = 'MORE';     // Paginate output (pipe modifier)
   kGRAPHIC = 'GRAPHIC';

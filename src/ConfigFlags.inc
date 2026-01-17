@@ -31,7 +31,7 @@
   AUDIO SUPPORT
   ============================================================================ }
 
-{$DEFINE WITH_SEDAI_AUDIO}             // Enable Sedai Audio Foundation support
+{.$DEFINE WITH_SEDAI_AUDIO}            // Enable Sedai Audio Foundation support
                                         // Provides SID emulation and audio synthesis
                                         // Requires SAF library paths in compiler search path
 

@@ -102,9 +102,11 @@ type
     function SetGraphicMode(Mode: TGraphicMode; ClearBuffer: Boolean = False; SplitLine: Integer = -1): Boolean;
     function GetGraphicMode: TGraphicMode;
     function IsInGraphicsMode: Boolean;
+    procedure ClearScreen(Mode: Integer);
     procedure SetPixel(X, Y: Integer; RGB: UInt32); overload;
     procedure SetPixel(X, Y: Integer; PaletteIndex: TPaletteIndex); overload;
     function GetPixel(X, Y: Integer): UInt32;
+    function GetPixelIndex(X, Y: Integer): TPaletteIndex;
     procedure EnablePalette(Enable: Boolean);
     function IsPaletteEnabled: Boolean;
     procedure SetPaletteColor(Index: TPaletteIndex; RGB: UInt32);
@@ -135,7 +137,8 @@ type
 
     // Additional graphics interface methods (stubs)
     procedure SetColorSource(Source, Color: Integer);
-    function GetColorSource(Source: Integer): Integer;
+    procedure SetColorSourceDirect(Source, Color: Integer);
+    function GetColorSourceDirect(Source: Integer): Integer;  // RCLR/GETCOLOR
     procedure SetLineWidth(Width: Integer);
     procedure SetScale(Enabled: Boolean; XMax, YMax: Integer);
     procedure FloodFill(Source: Integer; X, Y: Double; Mode: Integer);
@@ -376,6 +379,12 @@ begin
   Result := False;
 end;
 
+procedure TTerminalController.ClearScreen(Mode: Integer);
+begin
+  // In terminal mode, just clear the screen
+  Clear;
+end;
+
 procedure TTerminalController.SetPixel(X, Y: Integer; RGB: UInt32);
 begin
   // Not supported in terminal mode
@@ -387,6 +396,11 @@ begin
 end;
 
 function TTerminalController.GetPixel(X, Y: Integer): UInt32;
+begin
+  Result := 0;
+end;
+
+function TTerminalController.GetPixelIndex(X, Y: Integer): TPaletteIndex;
 begin
   Result := 0;
 end;
@@ -507,7 +521,12 @@ begin
   // Not supported in terminal mode
 end;
 
-function TTerminalController.GetColorSource(Source: Integer): Integer;
+procedure TTerminalController.SetColorSourceDirect(Source, Color: Integer);
+begin
+  // Not supported in terminal mode
+end;
+
+function TTerminalController.GetColorSourceDirect(Source: Integer): Integer;
 begin
   Result := 0;
 end;

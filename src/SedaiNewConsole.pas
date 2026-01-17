@@ -31,7 +31,7 @@ interface
 uses
   Classes, SysUtils, Variants, Math, SDL2, SDL2_ttf, TypInfo,
   SedaiOutputInterface, SedaiGraphicsModes, SedaiGraphicsTypes,
-  SedaiGraphicsMemory,
+  SedaiGraphicsMemory, SedaiGraphicsPrimitives,
   SedaiProgramMemory, SedaiAST, SedaiParserTypes,
   SedaiCommandRouter, SedaiCommandTypes,
   SedaiSDL2VideoModes,
@@ -214,9 +214,11 @@ type
     function SetGraphicMode(Mode: TGraphicMode; ClearBuffer: Boolean = False; SplitLine: Integer = -1): Boolean;
     function GetGraphicMode: TGraphicMode;
     function IsInGraphicsMode: Boolean;
+    procedure ClearScreen(Mode: Integer);
     procedure SetPixel(X, Y: Integer; RGB: UInt32); overload;
     procedure SetPixel(X, Y: Integer; PaletteIndex: TPaletteIndex); overload;
     function GetPixel(X, Y: Integer): UInt32;
+    function GetPixelIndex(X, Y: Integer): TPaletteIndex;
     procedure EnablePalette(Enable: Boolean);
     function IsPaletteEnabled: Boolean;
     procedure SetPaletteColor(Index: TPaletteIndex; RGB: UInt32);
@@ -243,7 +245,9 @@ type
 
     // COLOR command support
     procedure SetColorSource(Source, Color: Integer);
+    procedure SetColorSourceDirect(Source, Color: Integer);
     function GetColorSource(Source: Integer): Integer;
+    function GetColorSourceDirect(Source: Integer): Integer;
     // WIDTH command support
     procedure SetLineWidth(Width: Integer);
     // SCALE command support
@@ -377,6 +381,7 @@ type
     procedure PutChar(Ch: Char);
     procedure InsertChar(Ch: Char);  // Insert mode: shifts chars right
     procedure PutString(const S: string);
+    procedure PutStringNoWrap(const S: string);  // Put string without wrapping to next line
     procedure NewLine;
     procedure DeleteChar;  // Backspace: delete char before cursor
     procedure DeleteCharAtCursor;  // Delete: delete char at cursor
@@ -450,6 +455,7 @@ type
 
     procedure ProcessEvents;
     procedure ClearFlags;
+    procedure ClearLastKeyDown;  // Clear last key to prevent repeat issues
 
     // IInputDevice implementation
     function ReadLine(const Prompt: string = ''; IsCommand: Boolean = True; NumericOnly: Boolean = False; AllowDecimal: Boolean = True): string;
@@ -532,9 +538,11 @@ type
     function SetGraphicMode(Mode: TGraphicMode; ClearBuffer: Boolean = False; SplitLine: Integer = -1): Boolean;
     function GetGraphicMode: TGraphicMode;
     function IsInGraphicsMode: Boolean;
+    procedure ClearScreen(Mode: Integer);
     procedure SetPixel(X, Y: Integer; RGB: UInt32); overload;
     procedure SetPixel(X, Y: Integer; PaletteIndex: TPaletteIndex); overload;
     function GetPixel(X, Y: Integer): UInt32;
+    function GetPixelIndex(X, Y: Integer): TPaletteIndex;
     procedure EnablePalette(Enable: Boolean);
     function IsPaletteEnabled: Boolean;
     procedure SetPaletteColor(Index: TPaletteIndex; RGB: UInt32);
@@ -567,7 +575,9 @@ type
 
     // COLOR command support - delegates to VideoController
     procedure SetColorSource(Source, Color: Integer);
+    procedure SetColorSourceDirect(Source, Color: Integer);
     function GetColorSource(Source: Integer): Integer;
+    function GetColorSourceDirect(Source: Integer): Integer;
     // WIDTH command support
     procedure SetLineWidth(Width: Integer);
     // SCALE command support
@@ -598,6 +608,7 @@ type
     FInputHistory: array of string;
     FHistoryCount: Integer;
     FHistoryPos: Integer;
+    FHistoryFile: string;    // Custom history file path
     FCtrlCEnabled: Boolean;  // If True, CTRL+C exits from the console
 
     // Components for command management
@@ -623,6 +634,9 @@ type
     // Input buffer for AUTO and EDIT commands
     FInputBuffer: string;         // Pre-filled input text
     FInputPos: Integer;           // Cursor position in pre-filled input
+
+    // User input tracking - tracks if user actually typed something (not system output)
+    FUserHasTyped: Boolean;       // True if user typed/edited since last ENTER
 
     // Debug mode (TRON/TROFF)
     FDebugMode: Boolean;          // True = compile with debug info, trace execution
@@ -662,6 +676,11 @@ type
     function AskYesNo(const Prompt: string): Boolean;
     function AskYesNoAll(const Prompt: string; var OverwriteAll: Boolean): Boolean;
 
+    // History file support
+    function GetHistoryFilePath: string;
+    procedure LoadHistory;
+    procedure SaveHistory;
+
   public
     constructor Create;
     destructor Destroy; override;
@@ -674,6 +693,8 @@ type
 
     // Startup file support (passed via command line)
     procedure SetStartupFile(const AFileName: string; AAutoRun: Boolean);
+    // History file support
+    procedure SetHistoryFile(const AFileName: string);
 
     property CtrlCEnabled: Boolean read FCtrlCEnabled write FCtrlCEnabled;
   end;
@@ -1344,7 +1365,7 @@ var
   ViewportRect: TSDL_Rect;
   LocalBGColor: TSDL_Color;
 begin
-  // Fills the viewport with the screen color (not the drawing background!)
+  // Fills the viewport with the background color (source 0)
   ViewportRect.x := FViewportX;
   ViewportRect.y := FViewportY;
   ViewportRect.w := FViewportWidth;
@@ -1354,7 +1375,7 @@ begin
   if FCurrentMode = gmSDL2Dynamic then
     LocalBGColor := FBGColorSDL2
   else
-    LocalBGColor := PaletteIndexToSDLColor(FScreenColorIndex);
+    LocalBGColor := PaletteIndexToSDLColor(FBackgroundIndex);
 
   SDL_SetRenderDrawColor(FRenderer, LocalBGColor.r, LocalBGColor.g, LocalBGColor.b, LocalBGColor.a);
   SDL_RenderFillRect(FRenderer, @ViewportRect);
@@ -1761,25 +1782,51 @@ end;
 
 // === COLOR command support ===
 procedure TVideoController.SetColorSource(Source, Color: Integer);
+var
+  PaletteIndex: Integer;
 begin
   if (Source >= 0) and (Source <= 6) then
   begin
-    FColorSources[Source] := Color;
+    // C128 COLOR command uses 1-based colors (1-16 for standard palette)
+    // Convert to 0-based palette index: Color 1 = Black (index 0), etc.
+    PaletteIndex := Color - 1;
+    if PaletteIndex < 0 then PaletteIndex := 0;
+    if PaletteIndex > 255 then PaletteIndex := 255;
+
+    FColorSources[Source] := PaletteIndex;
     // Update corresponding palette indices based on source
     case Source of
-      0: FBackgroundIndex := Byte(Color);    // Background
-      1: FForegroundIndex := Byte(Color);    // Foreground
-      2: FMulticolorIndex1 := Byte(Color);   // Multicolor 1
-      3: FMulticolorIndex2 := Byte(Color);   // Multicolor 2
-      4: FBorderColorIndex := Byte(Color);   // Border
-      5: FTextColorIndex := Byte(Color);     // Character color
-      6: FScreenColorIndex := Byte(Color);   // 80-column background
+      0: FBackgroundIndex := Byte(PaletteIndex);    // Background
+      1: FForegroundIndex := Byte(PaletteIndex);    // Foreground
+      2: FMulticolorIndex1 := Byte(PaletteIndex);   // Multicolor 1
+      3: FMulticolorIndex2 := Byte(PaletteIndex);   // Multicolor 2
+      4: FBorderColorIndex := Byte(PaletteIndex);   // Border
+      5: FTextColorIndex := Byte(PaletteIndex);     // Character color
+      6: FScreenColorIndex := Byte(PaletteIndex);   // 80-column background
     end;
+
   end;
 end;
 
 function TVideoController.GetColorSource(Source: Integer): Integer;
 begin
+  // Return 1-based color (inverse of SetColorSource)
+  if (Source >= 0) and (Source <= 6) then
+    Result := FColorSources[Source] + 1
+  else
+    Result := 1;  // Default to color 1 (Black)
+end;
+
+procedure TVideoController.SetColorSourceDirect(Source, Color: Integer);
+begin
+  // SETCOLOR: Sets color source directly (0-255)
+  if (Source >= 0) and (Source <= 6) then
+    FColorSources[Source] := Color and $FF;
+end;
+
+function TVideoController.GetColorSourceDirect(Source: Integer): Integer;
+begin
+  // RCLR/GETCOLOR: Returns color source (0-based)
   if (Source >= 0) and (Source <= 6) then
     Result := FColorSources[Source]
   else
@@ -1789,24 +1836,63 @@ end;
 // === WIDTH command support ===
 procedure TVideoController.SetLineWidth(Width: Integer);
 begin
-  if (Width >= 1) and (Width <= 2) then
+  // Allow values from 1 to 65535 (2^16-1)
+  if (Width >= 1) and (Width <= 65535) then
     FLineWidth := Width
+  else if Width < 1 then
+    FLineWidth := 1
   else
-    FLineWidth := 1;
+    FLineWidth := 65535;
 end;
 
 // === SCALE command support ===
+// Commodore 128 SCALE defaults per documentation:
+// - Hires modes (320x200): default 1023x1023
+// - Multicolor modes (160x200): default 2047x1023
+// - Non-Commodore modes: default NativeWidth-1 x NativeHeight-1
+// Max value is 2^32-1 (extended from C128's 32767)
 procedure TVideoController.SetScale(Enabled: Boolean; XMax, YMax: Integer);
+var
+  DefaultXMax, DefaultYMax: Integer;
 begin
   FScaleEnabled := Enabled;
-  if Enabled and (XMax > 0) and (YMax > 0) then
+
+  if Enabled then
   begin
-    FScaleXMax := XMax;
-    FScaleYMax := YMax;
+    // Determine C128-compatible defaults based on mode resolution
+    if (FModeInfo.NativeWidth = 320) and (FModeInfo.NativeHeight = 200) then
+    begin
+      // Hires C128 modes (GRAPHIC 0, 1, 2): default 1023x1023
+      DefaultXMax := 1023;
+      DefaultYMax := 1023;
+    end
+    else if (FModeInfo.NativeWidth = 160) and (FModeInfo.NativeHeight = 200) then
+    begin
+      // Multicolor C128 modes (GRAPHIC 3, 4): default 2047x1023
+      DefaultXMax := 2047;
+      DefaultYMax := 1023;
+    end
+    else
+    begin
+      // Non-Commodore modes: use NativeWidth-1 x NativeHeight-1
+      DefaultXMax := FModeInfo.NativeWidth - 1;
+      DefaultYMax := FModeInfo.NativeHeight - 1;
+    end;
+
+    // Use provided values or fall back to defaults
+    if XMax > 0 then
+      FScaleXMax := XMax
+    else
+      FScaleXMax := DefaultXMax;
+
+    if YMax > 0 then
+      FScaleYMax := YMax
+    else
+      FScaleYMax := DefaultYMax;
   end
-  else if not Enabled then
+  else
   begin
-    // When disabled, reset to mode defaults
+    // When disabled, reset to native resolution (no scaling)
     FScaleXMax := FModeInfo.NativeWidth;
     FScaleYMax := FModeInfo.NativeHeight;
   end;
@@ -1817,11 +1903,11 @@ procedure TVideoController.FloodFill(Source: Integer; X, Y: Double; Mode: Intege
 var
   PixelX, PixelY: Integer;
   TargetColor, FillColor: UInt32;
+  FillIndex: Byte;
   Stack: array of TPoint;
   StackSize, StackCapacity: Integer;
   CurX, CurY: Integer;
   BufWidth, BufHeight: Integer;
-  PixelPtr: PByte;
 
   procedure PushPixel(PX, PY: Integer);
   begin
@@ -1871,11 +1957,14 @@ begin
   if (PixelX < 0) or (PixelX >= BufWidth) or
      (PixelY < 0) or (PixelY >= BufHeight) then Exit;
 
-  // Get fill color from source
+  // Get fill color index from source (use palette index directly)
   if (Source >= 0) and (Source <= 6) then
-    FillColor := FPaletteManager.GetColor(FColorSources[Source])
+    FillIndex := Byte(FColorSources[Source])
   else
-    FillColor := FPaletteManager.GetColor(FForegroundIndex);
+    FillIndex := FForegroundIndex;
+
+  // Get fill color RGB from graphics memory palette (for comparison)
+  FillColor := FGraphicsMemory.GetPaletteColor(FillIndex);
 
   // Get target color at seed point
   TargetColor := FGraphicsMemory.GetPixelRGBA(PixelX, PixelY);
@@ -1910,8 +1999,8 @@ begin
       if FGraphicsMemory.GetPixelRGBA(CurX, CurY) = FillColor then Continue;
     end;
 
-    // Set pixel
-    FGraphicsMemory.SetPixelRGBA(CurX, CurY, FillColor);
+    // Set pixel using palette index directly (avoids RGB->index conversion issues)
+    FGraphicsMemory.SetPixel(CurX, CurY, FillIndex);
 
     // Add neighbors to stack
     PushPixel(CurX + 1, CurY);
@@ -2135,6 +2224,16 @@ begin
     CreateGraphicsTexture;
   end;
 
+  // Update palette manager if palette type changed
+  if Assigned(FPaletteManager) and (FPaletteManager.PaletteType <> NewModeInfo.PaletteType) then
+    FPaletteManager.LoadDefaultPalette(NewModeInfo.PaletteType);
+
+  // Per Commodore documentation: "The GRAPHIC command turns scaling off"
+  // GRAPHIC (something) is equivalent to GRAPHIC...: SCALE 0
+  FScaleEnabled := False;
+  FScaleXMax := FModeInfo.NativeWidth;
+  FScaleYMax := FModeInfo.NativeHeight;
+
   // Clear the border
   ClearBorder;
 
@@ -2166,24 +2265,131 @@ begin
   ];
 end;
 
-procedure TVideoController.SetPixel(X, Y: Integer; RGB: UInt32);
+procedure TVideoController.ClearScreen(Mode: Integer);
+var
+  SavedMode: TGraphicMode;
 begin
-  if FGraphicsMemory <> nil then
-    FGraphicsMemory.SetPixel(X, Y, RGB);
+  // SCNCLR: -1 = clear current mode, 0-5 = clear specific mode buffer
+  if FGraphicsMemory = nil then Exit;
+
+  if Mode = -1 then
+  begin
+    // Clear current mode with background color
+    FGraphicsMemory.ClearCurrentModeWithIndex(FBackgroundIndex);
+  end
+  else if (Mode >= 0) and (Mode <= 11) then
+  begin
+    // Clear specific mode buffer by temporarily switching
+    SavedMode := FCurrentMode;
+    FGraphicsMemory.SwitchToMode(TGraphicMode(Mode), True);
+    FGraphicsMemory.ClearCurrentModeWithIndex(FBackgroundIndex);
+    FGraphicsMemory.SwitchToMode(SavedMode, True);
+  end;
+end;
+
+procedure TVideoController.SetPixel(X, Y: Integer; RGB: UInt32);
+var
+  ScaledX, ScaledY: Integer;
+begin
+  if FGraphicsMemory = nil then Exit;
+
+  // Apply coordinate scaling if enabled
+  if FScaleEnabled then
+  begin
+    ScaledX := Round(X * FModeInfo.NativeWidth / FScaleXMax);
+    ScaledY := Round(Y * FModeInfo.NativeHeight / FScaleYMax);
+  end
+  else
+  begin
+    ScaledX := X;
+    ScaledY := Y;
+  end;
+
+  FGraphicsMemory.SetPixel(ScaledX, ScaledY, RGB);
 end;
 
 procedure TVideoController.SetPixel(X, Y: Integer; PaletteIndex: TPaletteIndex);
+var
+  ScaledX, ScaledY: Integer;
 begin
-  if FGraphicsMemory <> nil then
-    FGraphicsMemory.SetPixel(X, Y, PaletteIndex);
+  if FGraphicsMemory = nil then Exit;
+
+  // Apply coordinate scaling if enabled
+  if FScaleEnabled then
+  begin
+    ScaledX := Round(X * FModeInfo.NativeWidth / FScaleXMax);
+    ScaledY := Round(Y * FModeInfo.NativeHeight / FScaleYMax);
+  end
+  else
+  begin
+    ScaledX := X;
+    ScaledY := Y;
+  end;
+
+  FGraphicsMemory.SetPixel(ScaledX, ScaledY, PaletteIndex);
 end;
 
 function TVideoController.GetPixel(X, Y: Integer): UInt32;
+var
+  ScaledX, ScaledY: Integer;
 begin
-  if FGraphicsMemory <> nil then
-    Result := FGraphicsMemory.GetPixel(X, Y)
-  else
+  if FGraphicsMemory = nil then
+  begin
     Result := 0;
+    Exit;
+  end;
+
+  // Apply coordinate scaling if enabled
+  if FScaleEnabled then
+  begin
+    ScaledX := Round(X * FModeInfo.NativeWidth / FScaleXMax);
+    ScaledY := Round(Y * FModeInfo.NativeHeight / FScaleYMax);
+  end
+  else
+  begin
+    ScaledX := X;
+    ScaledY := Y;
+  end;
+
+  Result := FGraphicsMemory.GetPixel(ScaledX, ScaledY);
+end;
+
+function TVideoController.GetPixelIndex(X, Y: Integer): TPaletteIndex;
+var
+  PalIndex: TPaletteIndex;
+  ScaledX, ScaledY: Integer;
+begin
+  // RDOT(2) should return the color SOURCE (0-3), not the palette index
+  // Compare pixel's palette index with color sources to determine which one matches
+  Result := 0;  // Default to background source
+  if FGraphicsMemory = nil then Exit;
+
+  // Apply coordinate scaling if enabled
+  if FScaleEnabled then
+  begin
+    ScaledX := Round(X * FModeInfo.NativeWidth / FScaleXMax);
+    ScaledY := Round(Y * FModeInfo.NativeHeight / FScaleYMax);
+  end
+  else
+  begin
+    ScaledX := X;
+    ScaledY := Y;
+  end;
+
+  PalIndex := FGraphicsMemory.GetPixelIndex(ScaledX, ScaledY);
+
+  // Check which color source this palette index matches
+  if PalIndex = FForegroundIndex then
+    Result := 1
+  else if PalIndex = FMulticolorIndex1 then
+    Result := 2
+  else if PalIndex = FMulticolorIndex2 then
+    Result := 3
+  else if PalIndex = FBackgroundIndex then
+    Result := 0
+  else
+    // No match - return the raw palette index for non-standard colors
+    Result := PalIndex;
 end;
 
 procedure TVideoController.EnablePalette(Enable: Boolean);
@@ -2237,8 +2443,25 @@ var
   X, Y: Integer;
   ActualIndex: TPaletteIndex;  // Use TPaletteIndex (0..255) to force correct SetPixel overload
   UseIndex: Boolean;
+  ScaledX1, ScaledY1, ScaledX2, ScaledY2: Integer;
 begin
   if FGraphicsMemory = nil then Exit;
+
+  // Apply coordinate scaling if enabled
+  if FScaleEnabled then
+  begin
+    ScaledX1 := Round(X1 * FModeInfo.NativeWidth / FScaleXMax);
+    ScaledY1 := Round(Y1 * FModeInfo.NativeHeight / FScaleYMax);
+    ScaledX2 := Round(X2 * FModeInfo.NativeWidth / FScaleXMax);
+    ScaledY2 := Round(Y2 * FModeInfo.NativeHeight / FScaleYMax);
+  end
+  else
+  begin
+    ScaledX1 := X1;
+    ScaledY1 := Y1;
+    ScaledX2 := X2;
+    ScaledY2 := Y2;
+  end;
 
   // For classic modes (0-10), use palette indices directly
   // For mode 11 (SDL2 dynamic), use RGBA values
@@ -2262,11 +2485,11 @@ begin
     end;
   end;
 
-  // Normalize coordinates
-  if X1 < X2 then begin MinX := X1; MaxX := X2; end
-  else begin MinX := X2; MaxX := X1; end;
-  if Y1 < Y2 then begin MinY := Y1; MaxY := Y2; end
-  else begin MinY := Y2; MaxY := Y1; end;
+  // Normalize coordinates (using scaled values)
+  if ScaledX1 < ScaledX2 then begin MinX := ScaledX1; MaxX := ScaledX2; end
+  else begin MinX := ScaledX2; MaxX := ScaledX1; end;
+  if ScaledY1 < ScaledY2 then begin MinY := ScaledY1; MaxY := ScaledY2; end
+  else begin MinY := ScaledY2; MaxY := ScaledY1; end;
 
   // Clip to mode resolution
   if MinX < 0 then MinX := 0;
@@ -2341,8 +2564,25 @@ var
   PrevX, PrevY, CurrX, CurrY: Integer;
   Px, Py, Rx, Ry: Double;
   FirstPoint: Boolean;
+  ScaledX, ScaledY, ScaledXR, ScaledYR: Integer;
 begin
   if FGraphicsMemory = nil then Exit;
+
+  // Apply coordinate scaling if enabled
+  if FScaleEnabled then
+  begin
+    ScaledX := Round(X * FModeInfo.NativeWidth / FScaleXMax);
+    ScaledY := Round(Y * FModeInfo.NativeHeight / FScaleYMax);
+    ScaledXR := Round(XR * FModeInfo.NativeWidth / FScaleXMax);
+    ScaledYR := Round(YR * FModeInfo.NativeHeight / FScaleYMax);
+  end
+  else
+  begin
+    ScaledX := X;
+    ScaledY := Y;
+    ScaledXR := XR;
+    ScaledYR := YR;
+  end;
 
   // For classic modes (0-10), use palette indices directly
   // For mode 11 (SDL2 dynamic), use RGBA values
@@ -2385,17 +2625,20 @@ begin
 
   while CurrentAngle <= EndAngle + 0.001 do  // Small epsilon for floating point
   begin
-    // Calculate point on ellipse (angles in degrees, convert to radians)
-    Px := XR * Cos(CurrentAngle * Pi / 180.0);
-    Py := YR * Sin(CurrentAngle * Pi / 180.0);
+    // Calculate point on ellipse - C128 convention:
+    // 0°/360° = 12 o'clock (top), 90° = 3 o'clock (right),
+    // 180° = 6 o'clock (bottom), 270° = 9 o'clock (left)
+    // Drawing proceeds clockwise from start to end angle
+    Px := ScaledXR * Sin(CurrentAngle * Pi / 180.0);   // 0°->0, 90°->R, 180°->0, 270°->-R
+    Py := -ScaledYR * Cos(CurrentAngle * Pi / 180.0);  // 0°->-R (top), 90°->0, 180°->R (bottom)
 
     // Apply rotation
     Rx := Px * CosRot - Py * SinRot;
     Ry := Px * SinRot + Py * CosRot;
 
-    // Translate to center
-    CurrX := X + Round(Rx);
-    CurrY := Y + Round(Ry);
+    // Translate to center (using scaled coordinates)
+    CurrX := ScaledX + Round(Rx);
+    CurrY := ScaledY + Round(Ry);
 
     // Clip to screen bounds
     if (CurrX >= 0) and (CurrX < FModeInfo.NativeWidth) and
@@ -2406,11 +2649,13 @@ begin
         DrawLineInternal(PrevX, PrevY, CurrX, CurrY, UseIndex, ActualIndex, Color)
       else
       begin
-        // First point - just plot the pixel
+        // First point - plot with line width
         if UseIndex then
-          FGraphicsMemory.SetPixel(CurrX, CurrY, ActualIndex)
+          SedaiGraphicsPrimitives.DrawThickPixel(FGraphicsMemory, CurrX, CurrY,
+            ActualIndex, True, FLineWidth, FModeInfo.NativeWidth, FModeInfo.NativeHeight)
         else
-          FGraphicsMemory.SetPixel(CurrX, CurrY, Color);
+          SedaiGraphicsPrimitives.DrawThickPixel(FGraphicsMemory, CurrX, CurrY,
+            Color, False, FLineWidth, FModeInfo.NativeWidth, FModeInfo.NativeHeight);
       end;
     end;
 
@@ -2429,7 +2674,14 @@ procedure TVideoController.DrawLineInternal(X1, Y1, X2, Y2: Integer;
                                             UseIndex: Boolean; PalIndex: TPaletteIndex; RGBAColor: UInt32);
 var
   Dx, Dy, Sx, Sy, Err, E2: Integer;
+  Color: UInt32;
 begin
+  // Prepare color value for DrawThickPixel
+  if UseIndex then
+    Color := PalIndex
+  else
+    Color := RGBAColor;
+
   // Bresenham's line algorithm
   Dx := Abs(X2 - X1);
   Dy := Abs(Y2 - Y1);
@@ -2439,15 +2691,9 @@ begin
 
   while True do
   begin
-    // Plot pixel if in bounds
-    if (X1 >= 0) and (X1 < FModeInfo.NativeWidth) and
-       (Y1 >= 0) and (Y1 < FModeInfo.NativeHeight) then
-    begin
-      if UseIndex then
-        FGraphicsMemory.SetPixel(X1, Y1, PalIndex)
-      else
-        FGraphicsMemory.SetPixel(X1, Y1, RGBAColor);
-    end;
+    // Plot pixel with line width
+    SedaiGraphicsPrimitives.DrawThickPixel(FGraphicsMemory, X1, Y1, Color, UseIndex,
+      FLineWidth, FModeInfo.NativeWidth, FModeInfo.NativeHeight);
 
     if (X1 = X2) and (Y1 = Y2) then Break;
 
@@ -2466,15 +2712,69 @@ begin
 end;
 
 procedure TVideoController.DrawLine(X1, Y1, X2, Y2: Integer; Color: UInt32);
+var
+  ActualIndex: TPaletteIndex;
+  UseIndex: Boolean;
+  ScaledX1, ScaledY1, ScaledX2, ScaledY2: Integer;
 begin
-  // Use DrawLineInternal with RGBA color
-  DrawLineInternal(X1, Y1, X2, Y2, False, 0, Color);
+  if FGraphicsMemory = nil then Exit;
+
+  // Apply coordinate scaling if enabled
+  if FScaleEnabled then
+  begin
+    ScaledX1 := Round(X1 * FModeInfo.NativeWidth / FScaleXMax);
+    ScaledY1 := Round(Y1 * FModeInfo.NativeHeight / FScaleYMax);
+    ScaledX2 := Round(X2 * FModeInfo.NativeWidth / FScaleXMax);
+    ScaledY2 := Round(Y2 * FModeInfo.NativeHeight / FScaleYMax);
+  end
+  else
+  begin
+    ScaledX1 := X1;
+    ScaledY1 := Y1;
+    ScaledX2 := X2;
+    ScaledY2 := Y2;
+  end;
+
+  // For classic modes (0-10), use palette indices directly
+  // For mode 11 (SDL2 dynamic), use RGBA values
+  UseIndex := (FCurrentMode <> gmSDL2Dynamic);
+
+  if UseIndex then
+  begin
+    // Classic modes (0-10): Color parameter selects which palette index to use
+    case Color of
+      0: ActualIndex := FBackgroundIndex;
+      1: ActualIndex := FForegroundIndex;
+      2: ActualIndex := FMulticolorIndex1;
+      3: ActualIndex := FMulticolorIndex2;
+    else
+      if Color < 256 then
+        ActualIndex := TPaletteIndex(Color)
+      else
+        ActualIndex := FForegroundIndex;
+    end;
+    DrawLineInternal(ScaledX1, ScaledY1, ScaledX2, ScaledY2, True, ActualIndex, 0);
+  end
+  else
+    DrawLineInternal(ScaledX1, ScaledY1, ScaledX2, ScaledY2, False, 0, Color);
+
+  RenderGraphicsTexture;
+  Present;
 end;
 
 procedure TVideoController.SetPixelCursor(X, Y: Integer);
 begin
-  FPixelCursorX := X;
-  FPixelCursorY := Y;
+  // Apply coordinate scaling if enabled
+  if FScaleEnabled then
+  begin
+    FPixelCursorX := Round(X * FModeInfo.NativeWidth / FScaleXMax);
+    FPixelCursorY := Round(Y * FModeInfo.NativeHeight / FScaleYMax);
+  end
+  else
+  begin
+    FPixelCursorX := X;
+    FPixelCursorY := Y;
+  end;
 end;
 
 function TVideoController.GetPixelCursorX: Integer;
@@ -2777,6 +3077,31 @@ var
 begin
   for i := 1 to Length(S) do
     PutChar(S[i]);
+end;
+
+procedure TTextBuffer.PutStringNoWrap(const S: string);
+var
+  i: Integer;
+  Ch: Char;
+begin
+  // Put string without wrapping - used for history display
+  // Stops at end of line, ignores CR/LF
+  for i := 1 to Length(S) do
+  begin
+    Ch := S[i];
+    // Skip CR and LF
+    if (Ch = #13) or (Ch = #10) then
+      Continue;
+    // Stop if we reach end of line
+    if FCursorX >= FCols then
+      Break;
+    // Write character
+    FCells[FCursorY][FCursorX].Ch := Ch;
+    FCells[FCursorY][FCursorX].FGIndex := FCurrentFGIndex;
+    FCells[FCursorY][FCursorX].BGIndex := FCurrentBGIndex;
+    FCells[FCursorY][FCursorX].Reverse := FCurrentReverse;
+    Inc(FCursorX);
+  end;
 end;
 
 procedure TTextBuffer.NewLine;
@@ -3244,6 +3569,11 @@ begin
   FHasChar := False;
 end;
 
+procedure TInputHandler.ClearLastKeyDown;
+begin
+  FLastKeyDown := SDLK_UNKNOWN;
+end;
+
 procedure TInputHandler.ProcessEvents;
 var
   Event: TSDL_Event;
@@ -3258,19 +3588,30 @@ begin
 
       SDL_KEYDOWN:
         begin
-          FLastKeyDown := Event.key.keysym.sym;
-          FLastKeyMod := Event.key.keysym.mod_;
+          // Ignore key repeat events for most keys to prevent unwanted command execution
+          // BUT allow repeat for navigation and editing keys
+          if (Event.key.repeat_ = 0) or
+             (Event.key.keysym.sym = SDLK_UP) or
+             (Event.key.keysym.sym = SDLK_DOWN) or
+             (Event.key.keysym.sym = SDLK_LEFT) or
+             (Event.key.keysym.sym = SDLK_RIGHT) or
+             (Event.key.keysym.sym = SDLK_BACKSPACE) or
+             (Event.key.keysym.sym = SDLK_DELETE) then
+          begin
+            FLastKeyDown := Event.key.keysym.sym;
+            FLastKeyMod := Event.key.keysym.mod_;
 
-          FShiftPressed := (FLastKeyMod and KMOD_SHIFT) <> 0;
-          FCtrlPressed := (FLastKeyMod and KMOD_CTRL) <> 0;
-          FAltPressed := (FLastKeyMod and KMOD_ALT) <> 0;
+            FShiftPressed := (FLastKeyMod and KMOD_SHIFT) <> 0;
+            FCtrlPressed := (FLastKeyMod and KMOD_CTRL) <> 0;
+            FAltPressed := (FLastKeyMod and KMOD_ALT) <> 0;
 
-          // CTRL+ALT+END: Exit SedaiVision completely
-          if (FLastKeyDown = SDLK_END) and FCtrlPressed and FAltPressed then
-            FQuitRequested := True
-          // CTRL+END: Stop BASIC program (but don't exit)
-          else if (FLastKeyDown = SDLK_END) and FCtrlPressed and (not FAltPressed) then
-            FStopRequested := True;
+            // CTRL+ALT+END: Exit SedaiVision completely
+            if (FLastKeyDown = SDLK_END) and FCtrlPressed and FAltPressed then
+              FQuitRequested := True
+            // CTRL+END: Stop BASIC program (but don't exit)
+            else if (FLastKeyDown = SDLK_END) and FCtrlPressed and (not FAltPressed) then
+              FStopRequested := True;
+          end;
         end;
 
       SDL_KEYUP:
@@ -3535,6 +3876,13 @@ begin
     Result := False;
 end;
 
+procedure TConsoleOutputAdapter.ClearScreen(Mode: Integer);
+begin
+  // Delegate to VideoController
+  if Assigned(FVideoController) then
+    FVideoController.ClearScreen(Mode);
+end;
+
 procedure TConsoleOutputAdapter.SetPixel(X, Y: Integer; RGB: UInt32);
 begin
   // Delegate to VideoController for graphics operations
@@ -3554,6 +3902,15 @@ begin
   // Delegate to VideoController for graphics operations
   if Assigned(FVideoController) then
     Result := FVideoController.GetPixel(X, Y)
+  else
+    Result := 0;
+end;
+
+function TConsoleOutputAdapter.GetPixelIndex(X, Y: Integer): TPaletteIndex;
+begin
+  // Delegate to VideoController for graphics operations
+  if Assigned(FVideoController) then
+    Result := FVideoController.GetPixelIndex(X, Y)
   else
     Result := 0;
 end;
@@ -3674,6 +4031,20 @@ function TConsoleOutputAdapter.GetColorSource(Source: Integer): Integer;
 begin
   if Assigned(FVideoController) then
     Result := FVideoController.GetColorSource(Source)
+  else
+    Result := 0;
+end;
+
+procedure TConsoleOutputAdapter.SetColorSourceDirect(Source, Color: Integer);
+begin
+  if Assigned(FVideoController) then
+    FVideoController.SetColorSourceDirect(Source, Color);
+end;
+
+function TConsoleOutputAdapter.GetColorSourceDirect(Source: Integer): Integer;
+begin
+  if Assigned(FVideoController) then
+    Result := FVideoController.GetColorSourceDirect(Source)
   else
     Result := 0;
 end;
@@ -3846,6 +4217,9 @@ end;
 
 destructor TSedaiNewConsole.Destroy;
 begin
+  // Save command history to file
+  SaveHistory;
+
   // Free debugger first (before VM)
   if Assigned(FDebugger) then
   begin
@@ -4168,6 +4542,10 @@ begin
   end;
 
   {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: SedaiNewConsole initialization complete');{$ENDIF}
+
+  // Load command history from file
+  LoadHistory;
+
   Result := True;
 end;
 
@@ -4338,6 +4716,8 @@ var
   ScratchPattern: string;
   ScratchForce: Boolean;
   RenameOld, RenameNew: string;
+  HistDir, HistPath: string;
+  F: TextFile;
 begin
   TrimmedCmd := Trim(Command);
 
@@ -4351,23 +4731,10 @@ begin
   // DEBUG: show the command in clear text before parsing
   {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: Processing raw command: ', TrimmedCmd);{$ENDIF}
   ParseResult := FCommandRouter.ParseInput(TrimmedCmd);
-  
-  // Add to history ONLY if it's not a program line
-  if ParseResult.CommandType <> ctProgramLine then
-  begin
-    if FHistoryCount < INPUT_HISTORY_SIZE then
-    begin
-      FInputHistory[FHistoryCount] := Command;
-      Inc(FHistoryCount);
-    end
-    else
-    begin
-      // Shift history
-      Move(FInputHistory[1], FInputHistory[0], (INPUT_HISTORY_SIZE - 1) * SizeOf(string));
-      FInputHistory[INPUT_HISTORY_SIZE - 1] := Command;
-    end;
-  end;
-  FHistoryPos := -1;
+
+  // NOTE: History is now managed in the Run loop, tracking actual user keystrokes
+  // This ensures only user-typed commands are saved, not system output
+
   {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: Command type: ', GetEnumName(TypeInfo(TCommandType), Ord(ParseResult.CommandType)));{$ENDIF}
 
   if not ParseResult.IsValid then
@@ -4412,9 +4779,10 @@ begin
               begin
                 // Advance to next line number
                 FAutoLineNumber := FAutoLineNumber + FAutoLineIncrement;
-                // Put it in the input buffer
-                FInputBuffer := IntToStr(FAutoLineNumber) + ' ';
-                FInputPos := Length(FInputBuffer);
+                // Put it in the text buffer and mark as user input
+                Statement := IntToStr(FAutoLineNumber) + ' ';
+                FTextBuffer.PutString(Statement);
+                FUserHasTyped := True;
               end;
             end;
             // After inserting a line: no additional output, cursor already at new line
@@ -4813,27 +5181,27 @@ begin
               Filename := Trim(Copy(ParseResult.Statement, Length(kEDIT) + 1, MaxInt));
               if TryStrToInt(Filename, LineNum) then
               begin
-                // Get the line content
-                Lines := FProgramMemory.GetLinesInRange(LineNum, LineNum);
-                try
-                  if (Lines <> nil) and (Lines.Count > 0) then
-                  begin
-                    // Put the line in the input buffer for editing
-                    FInputBuffer := Lines[0];
-                    FInputPos := Length(FInputBuffer);
-                    // Render immediately so user sees the line
-                    RenderScreen;
-                    UpdateCursor;
-                    FVideoController.Present;
-                  end
-                  else
-                  begin
-                    FTextBuffer.PutString('?LINE NOT FOUND');
-                    FTextBuffer.NewLine;
-                  end;
-                finally
-                  if Assigned(Lines) then
-                    Lines.Free;
+                // Get the line content using GetLineText for efficiency
+                Statement := FProgramMemory.GetLineText(LineNum);
+                if Statement <> '' then
+                begin
+                  // Build full line with line number
+                  Statement := IntToStr(LineNum) + ' ' + Statement;
+                  // Put the line in the text buffer for editing (no READY. prompt)
+                  FTextBuffer.PutString(Statement);
+                  // Mark as user input so it gets saved to history when ENTER is pressed
+                  FUserHasTyped := True;
+                  // Render immediately so user sees the line
+                  RenderScreen;
+                  UpdateCursor;
+                  FVideoController.Present;
+                  // Don't print READY. - user is editing
+                  Exit;
+                end
+                else
+                begin
+                  FTextBuffer.PutString('?LINE NOT FOUND');
+                  FTextBuffer.NewLine;
                 end;
               end
               else
@@ -4889,9 +5257,10 @@ begin
                     if Assigned(Lines) then
                       Lines.Free;
                   end;
-                  // Put the first line number in the input buffer
-                  FInputBuffer := IntToStr(FAutoLineNumber) + ' ';
-                  FInputPos := Length(FInputBuffer);
+                  // Put the first line number in the text buffer and mark as user input
+                  Statement := IntToStr(FAutoLineNumber) + ' ';
+                  FTextBuffer.PutString(Statement);
+                  FUserHasTyped := True;
                   RenderScreen;
                   UpdateCursor;
                   FVideoController.Present;
@@ -5379,6 +5748,173 @@ begin
 
               if (RenameOld <> '') and (RenameNew <> '') then
                 ExecuteRename(RenameOld, RenameNew);
+            end;
+          end
+          else if CmdWord = kHLOAD then
+          begin
+            // HLOAD - Load history from file
+            Filename := ExtractFilename(ParseResult.Statement);
+            if Filename = '' then
+            begin
+              FTextBuffer.PutString('?MISSING FILENAME');
+              FTextBuffer.NewLine;
+            end
+            else
+            begin
+              // Resolve path
+              if (Length(Filename) < 2) or (Filename[2] <> ':') then
+                Filename := IncludeTrailingPathDelimiter(GetCurrentDir) + Filename;
+
+              if FileExists(Filename) then
+              begin
+                // Load history from file, replacing current history
+                FHistoryFile := Filename;
+                FHistoryCount := 0;
+                LoadHistory;
+                FTextBuffer.PutString('HISTORY LOADED');
+                FTextBuffer.NewLine;
+              end
+              else
+              begin
+                // File doesn't exist - ask if user wants to create it
+                if AskYesNo('FILE NOT FOUND. CREATE? (Y/N) ') then
+                begin
+                  // Create empty file and set as history file
+                  try
+                    ForceDirectories(ExtractFilePath(Filename));
+                    AssignFile(F, Filename);
+                    Rewrite(F);
+                    CloseFile(F);
+                    FHistoryFile := Filename;
+                    FHistoryCount := 0;
+                    FTextBuffer.PutString('HISTORY FILE CREATED');
+                    FTextBuffer.NewLine;
+                  except
+                    on E: Exception do
+                    begin
+                      FTextBuffer.PutString('?CANNOT CREATE FILE');
+                      FTextBuffer.NewLine;
+                    end;
+                  end;
+                end
+                else
+                begin
+                  FTextBuffer.PutString('CANCELLED');
+                  FTextBuffer.NewLine;
+                end;
+              end;
+            end;
+          end
+          else if CmdWord = kHSAVE then
+          begin
+            // HSAVE - Save history to file
+            Filename := ExtractFilename(ParseResult.Statement);
+            if Filename = '' then
+            begin
+              FTextBuffer.PutString('?MISSING FILENAME');
+              FTextBuffer.NewLine;
+            end
+            else
+            begin
+              // Resolve path
+              if (Length(Filename) < 2) or (Filename[2] <> ':') then
+                Filename := IncludeTrailingPathDelimiter(GetCurrentDir) + Filename;
+
+              // Check if directory exists
+              HistDir := ExtractFilePath(Filename);
+              if (HistDir <> '') and not DirectoryExists(HistDir) then
+              begin
+                if AskYesNo('PATH NOT FOUND. CREATE? (Y/N) ') then
+                begin
+                  try
+                    ForceDirectories(HistDir);
+                  except
+                    FTextBuffer.PutString('?CANNOT CREATE PATH');
+                    FTextBuffer.NewLine;
+                    HistDir := ''; // Signal failure
+                  end;
+                end
+                else
+                begin
+                  FTextBuffer.PutString('CANCELLED');
+                  FTextBuffer.NewLine;
+                  HistDir := ''; // Signal cancelled
+                end;
+              end;
+
+              // Proceed if path exists or was created
+              if (HistDir = '') or DirectoryExists(HistDir) then
+              begin
+                // Check if file exists
+                if FileExists(Filename) then
+                begin
+                  if not AskYesNo('FILE EXISTS. OVERWRITE? (Y/N) ') then
+                  begin
+                    FTextBuffer.PutString('CANCELLED');
+                    FTextBuffer.NewLine;
+                    Filename := ''; // Signal cancelled
+                  end;
+                end;
+
+                if Filename <> '' then
+                begin
+                  try
+                    AssignFile(F, Filename);
+                    Rewrite(F);
+                    try
+                      for i := 0 to FHistoryCount - 1 do
+                        WriteLn(F, FInputHistory[i]);
+                    finally
+                      CloseFile(F);
+                    end;
+                    FHistoryFile := Filename;
+                    FTextBuffer.PutString('HISTORY SAVED');
+                    FTextBuffer.NewLine;
+                  except
+                    on E: Exception do
+                    begin
+                      FTextBuffer.PutString('?CANNOT SAVE FILE');
+                      FTextBuffer.NewLine;
+                    end;
+                  end;
+                end;
+              end;
+            end;
+          end
+          else if CmdWord = kHCLEAR then
+          begin
+            // HCLEAR - Clear history with confirmation
+            if FHistoryCount = 0 then
+            begin
+              FTextBuffer.PutString('HISTORY ALREADY EMPTY');
+              FTextBuffer.NewLine;
+            end
+            else if AskYesNo('CLEAR HISTORY? (Y/N) ') then
+            begin
+              // Clear memory
+              FHistoryCount := 0;
+              FHistoryPos := -1;
+
+              // Truncate file if it exists
+              HistPath := GetHistoryFilePath;
+              if (HistPath <> '') and FileExists(HistPath) then
+              begin
+                try
+                  AssignFile(F, HistPath);
+                  Rewrite(F);
+                  CloseFile(F);
+                except
+                  // Ignore errors truncating file
+                end;
+              end;
+
+              FTextBuffer.PutString('HISTORY CLEARED');
+              FTextBuffer.NewLine;
+            end
+            else
+            begin
+              FTextBuffer.PutString('CANCELLED');
+              FTextBuffer.NewLine;
             end;
           end
           else
@@ -6807,6 +7343,104 @@ begin
   FAutoRun := AAutoRun;
 end;
 
+procedure TSedaiNewConsole.SetHistoryFile(const AFileName: string);
+begin
+  FHistoryFile := AFileName;
+end;
+
+function TSedaiNewConsole.GetHistoryFilePath: string;
+var
+  HomeDir: string;
+begin
+  // If custom path set, use it
+  if FHistoryFile <> '' then
+  begin
+    Result := FHistoryFile;
+    Exit;
+  end;
+
+  // Default: ~/.sedai/.sbv_history
+  {$IFDEF WINDOWS}
+  HomeDir := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  if HomeDir = '' then
+    HomeDir := SysUtils.GetEnvironmentVariable('HOMEDRIVE') + SysUtils.GetEnvironmentVariable('HOMEPATH');
+  {$ELSE}
+  HomeDir := SysUtils.GetEnvironmentVariable('HOME');
+  {$ENDIF}
+
+  if HomeDir <> '' then
+    Result := IncludeTrailingPathDelimiter(HomeDir) + '.sedai' + PathDelim + '.sbv_history'
+  else
+    Result := '';
+end;
+
+procedure TSedaiNewConsole.LoadHistory;
+var
+  HistPath: string;
+  F: TextFile;
+  Line: string;
+begin
+  HistPath := GetHistoryFilePath;
+  if (HistPath = '') or (not FileExists(HistPath)) then
+    Exit;
+
+  try
+    AssignFile(F, HistPath);
+    Reset(F);
+    try
+      FHistoryCount := 0;
+      while (not Eof(F)) and (FHistoryCount < INPUT_HISTORY_SIZE) do
+      begin
+        ReadLn(F, Line);
+        if Line <> '' then
+        begin
+          FInputHistory[FHistoryCount] := Line;
+          Inc(FHistoryCount);
+        end;
+      end;
+    finally
+      CloseFile(F);
+    end;
+  except
+    // Silently ignore errors loading history
+  end;
+end;
+
+procedure TSedaiNewConsole.SaveHistory;
+var
+  HistPath, HistDir: string;
+  F: TextFile;
+  i: Integer;
+begin
+  HistPath := GetHistoryFilePath;
+  if HistPath = '' then
+    Exit;
+
+  // Create directory if needed
+  HistDir := ExtractFilePath(HistPath);
+  if (HistDir <> '') and (not DirectoryExists(HistDir)) then
+  begin
+    try
+      ForceDirectories(HistDir);
+    except
+      Exit; // Can't create directory, skip saving
+    end;
+  end;
+
+  try
+    AssignFile(F, HistPath);
+    Rewrite(F);
+    try
+      for i := 0 to FHistoryCount - 1 do
+        WriteLn(F, FInputHistory[i]);
+    finally
+      CloseFile(F);
+    end;
+  except
+    // Silently ignore errors saving history
+  end;
+end;
+
 procedure TSedaiNewConsole.Run;
 var
   CurrentLine: string;
@@ -6877,9 +7511,29 @@ begin
       // If in scrollback mode, return to end first
       if FTextBuffer.IsInScrollbackMode then
         FTextBuffer.ScrollToEnd;
+      // Get current line content from text buffer
       CurrentLine := FTextBuffer.GetCurrentLine;
       FTextBuffer.NewLine;  // Va a capo dopo l'input
+      // Process the command
       ProcessCommand(CurrentLine);
+      // Add to history ONLY if user actually typed/edited something
+      if FUserHasTyped and (Trim(CurrentLine) <> '') then
+      begin
+        if FHistoryCount < INPUT_HISTORY_SIZE then
+        begin
+          FInputHistory[FHistoryCount] := CurrentLine;
+          Inc(FHistoryCount);
+        end
+        else
+        begin
+          // Shift history
+          Move(FInputHistory[1], FInputHistory[0], (INPUT_HISTORY_SIZE - 1) * SizeOf(string));
+          FInputHistory[INPUT_HISTORY_SIZE - 1] := CurrentLine;
+        end;
+        SaveHistory;
+      end;
+      FHistoryPos := -1;
+      FUserHasTyped := False;  // Reset for next input
     end
     else if FInputHandler.LastKeyDown = SDLK_BACKSPACE then
     begin
@@ -6887,6 +7541,7 @@ begin
       if FTextBuffer.IsInScrollbackMode then
         FTextBuffer.ScrollToEnd;
       FTextBuffer.DeleteChar;
+      FUserHasTyped := True;  // User modified the line
     end
     else if FInputHandler.LastKeyDown = SDLK_UP then
     begin
@@ -6897,10 +7552,18 @@ begin
       if (FHistoryCount > 0) and (FHistoryPos < FHistoryCount - 1) then
       begin
         Inc(FHistoryPos);
-        // Cancella la riga corrente
-        FTextBuffer.ClearCurrentLine;
-        // Inserisce il comando dalla history
-        FTextBuffer.PutString(FInputHistory[FHistoryCount - 1 - FHistoryPos]);
+        // Bounds check before accessing history array
+        if (FHistoryPos >= 0) and (FHistoryCount - 1 - FHistoryPos >= 0) and
+           (FHistoryCount - 1 - FHistoryPos < INPUT_HISTORY_SIZE) then
+        begin
+          // Cancella la riga corrente
+          FTextBuffer.ClearCurrentLine;
+          // Inserisce il comando dalla history (troncato alla larghezza della riga)
+          FTextBuffer.PutStringNoWrap(FInputHistory[FHistoryCount - 1 - FHistoryPos]);
+          FUserHasTyped := True;  // User selected from history = intent to execute
+        end
+        else
+          Dec(FHistoryPos);  // Rollback if out of bounds
       end;
     end
     else if FInputHandler.LastKeyDown = SDLK_DOWN then
@@ -6912,16 +7575,25 @@ begin
       if FHistoryPos > 0 then
       begin
         Dec(FHistoryPos);
-        // Cancella la riga corrente
-        FTextBuffer.ClearCurrentLine;
-        // Inserisce il comando dalla history
-        FTextBuffer.PutString(FInputHistory[FHistoryCount - 1 - FHistoryPos]);
+        // Bounds check before accessing history array
+        if (FHistoryPos >= 0) and (FHistoryCount - 1 - FHistoryPos >= 0) and
+           (FHistoryCount - 1 - FHistoryPos < INPUT_HISTORY_SIZE) then
+        begin
+          // Cancella la riga corrente
+          FTextBuffer.ClearCurrentLine;
+          // Inserisce il comando dalla history (troncato alla larghezza della riga)
+          FTextBuffer.PutStringNoWrap(FInputHistory[FHistoryCount - 1 - FHistoryPos]);
+          FUserHasTyped := True;  // User selected from history = intent to execute
+        end
+        else
+          Inc(FHistoryPos);  // Rollback if out of bounds
       end
       else if FHistoryPos = 0 then
       begin
         FHistoryPos := -1;
         // Cancella la riga corrente
         FTextBuffer.ClearCurrentLine;
+        FUserHasTyped := False;  // Line cleared, no user input
       end;
     end
     else if (FInputHandler.LastKeyDown = SDLK_PAGEUP) and FInputHandler.CtrlPressed then
@@ -6979,6 +7651,7 @@ begin
       if FTextBuffer.IsInScrollbackMode then
         FTextBuffer.ScrollToEnd;
       FTextBuffer.DeleteToLineStart;
+      FUserHasTyped := True;
     end
     // Ctrl+End: delete to line end
     else if (FInputHandler.LastKeyDown = SDLK_END) and FInputHandler.CtrlPressed and not FInputHandler.ShiftPressed then
@@ -6986,6 +7659,7 @@ begin
       if FTextBuffer.IsInScrollbackMode then
         FTextBuffer.ScrollToEnd;
       FTextBuffer.DeleteToLineEnd;
+      FUserHasTyped := True;
     end
     // Ctrl+Delete: delete word right
     else if (FInputHandler.LastKeyDown = SDLK_DELETE) and FInputHandler.CtrlPressed then
@@ -6993,6 +7667,7 @@ begin
       if FTextBuffer.IsInScrollbackMode then
         FTextBuffer.ScrollToEnd;
       FTextBuffer.DeleteWordRight;
+      FUserHasTyped := True;
     end
     // Ctrl+Backspace: delete word left
     else if (FInputHandler.LastKeyDown = SDLK_BACKSPACE) and FInputHandler.CtrlPressed then
@@ -7000,6 +7675,7 @@ begin
       if FTextBuffer.IsInScrollbackMode then
         FTextBuffer.ScrollToEnd;
       FTextBuffer.DeleteWordLeft;
+      FUserHasTyped := True;
     end
     // Ctrl+A: go to line start (readline style)
     else if (FInputHandler.LastKeyDown = SDLK_a) and FInputHandler.CtrlPressed then
@@ -7021,6 +7697,7 @@ begin
       if FTextBuffer.IsInScrollbackMode then
         FTextBuffer.ScrollToEnd;
       FTextBuffer.DeleteToLineEnd;
+      FUserHasTyped := True;
     end
     // Ctrl+U: delete entire line (readline style)
     else if (FInputHandler.LastKeyDown = SDLK_u) and FInputHandler.CtrlPressed then
@@ -7028,6 +7705,7 @@ begin
       if FTextBuffer.IsInScrollbackMode then
         FTextBuffer.ScrollToEnd;
       FTextBuffer.DeleteEntireLine;
+      FUserHasTyped := True;
     end
     // Cursor movement keys (without Shift or Ctrl)
     else if (FInputHandler.LastKeyDown = SDLK_LEFT) and not FInputHandler.ShiftPressed and not FInputHandler.CtrlPressed then
@@ -7059,6 +7737,7 @@ begin
       if FTextBuffer.IsInScrollbackMode then
         FTextBuffer.ScrollToEnd;
       FTextBuffer.DeleteCharAtCursor;
+      FUserHasTyped := True;
     end
     // Debug: check if PgUp is pressed at all
     else if FInputHandler.LastKeyDown = SDLK_PAGEUP then
@@ -7076,6 +7755,7 @@ begin
         FTextBuffer.ScrollToEnd;
       // Use InsertChar for proper insert mode (shifts chars right)
       FTextBuffer.InsertChar(FInputHandler.LastChar);
+      FUserHasTyped := True;  // User typed a character
     end;
 
     // Render

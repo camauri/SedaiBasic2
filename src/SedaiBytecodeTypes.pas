@@ -311,7 +311,9 @@ const
   bcGraphicLocate   = bcGroupGraphics + 5;
   bcGraphicRdot     = bcGroupGraphics + 6;
   bcGraphicGetMode  = bcGroupGraphics + 7;
-  bcGraphicColor    = bcGroupGraphics + 8;   // COLOR source, color
+  bcGraphicColor    = bcGroupGraphics + 8;   // COLOR source, color (1-based)
+  bcSetColor        = bcGroupGraphics + 19;  // SETCOLOR source, color (0-based)
+  bcGetColor        = bcGroupGraphics + 20;  // GETCOLOR(source) (0-based)
   bcGraphicWidth    = bcGroupGraphics + 9;   // WIDTH n
   bcGraphicScale    = bcGroupGraphics + 10;  // SCALE n [,xmax, ymax]
   bcGraphicPaint    = bcGroupGraphics + 11;  // PAINT [source], x, y [,mode]
@@ -322,6 +324,7 @@ const
   bcGraphicPos      = bcGroupGraphics + 16;  // POS(x)
   bcGraphicRclr     = bcGroupGraphics + 17;  // RCLR(n)
   bcGraphicRwindow  = bcGroupGraphics + 18;  // RWINDOW(n)
+  bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
   bcSoundVol        = bcGroupSound + 0;
@@ -483,6 +486,10 @@ type
     // Label lines: map BASIC line numbers to PC (for REM and jump targets)
     FLabelLines: array of TLabelLineEntry;
     FLabelLineCount: Integer;
+    // Variable register counts - for Register Compaction to preserve variable registers
+    FIntVarRegCount: Integer;
+    FFloatVarRegCount: Integer;
+    FStringVarRegCount: Integer;
   public
     constructor Create;
     destructor Destroy; override;
@@ -511,6 +518,11 @@ type
     procedure AdjustLabelLines(const IndexMap: array of Integer);  // Adjust PCs after NOP compaction
     procedure AdjustSourceMap(const IndexMap: array of Integer);   // Adjust source map PCs after NOP compaction
     procedure ClearInstructionsOnly;  // Clear only instructions, preserve label lines and source map
+    // Variable register counts for Register Compaction
+    procedure SetVarRegCounts(IntCount, FloatCount, StringCount: Integer);
+    function GetIntVarRegCount: Integer;
+    function GetFloatVarRegCount: Integer;
+    function GetStringVarRegCount: Integer;
     property StringConstants: TStringList read FStringConstants;
     property EntryPoint: Integer read FEntryPoint write FEntryPoint;
   end;
@@ -869,6 +881,28 @@ begin
   SetLength(FInstructions, 0);
   // Note: We do NOT clear FLabelLines or FSourceMap here
   // as they will be adjusted by the NOP compaction pass
+end;
+
+procedure TBytecodeProgram.SetVarRegCounts(IntCount, FloatCount, StringCount: Integer);
+begin
+  FIntVarRegCount := IntCount;
+  FFloatVarRegCount := FloatCount;
+  FStringVarRegCount := StringCount;
+end;
+
+function TBytecodeProgram.GetIntVarRegCount: Integer;
+begin
+  Result := FIntVarRegCount;
+end;
+
+function TBytecodeProgram.GetFloatVarRegCount: Integer;
+begin
+  Result := FFloatVarRegCount;
+end;
+
+function TBytecodeProgram.GetStringVarRegCount: Integer;
+begin
+  Result := FStringVarRegCount;
 end;
 
 function TBytecodeProgram.FindPCForLine(LineNum: Integer): Integer;

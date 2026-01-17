@@ -40,6 +40,8 @@ var
   TrueVal: Int64;
   // Flag for TRAP handler jump (can't use goto from except block)
   TrapTriggered: Boolean;
+  // Event polling counter
+  EventPollCounter: Integer;
   {$IFDEF DEBUG_MODE}
   CurSourceLine: Integer;  // Current source line from Source Map
   {$ENDIF}
@@ -58,6 +60,8 @@ begin
   FloatRegs := @FFloatRegs[0];
   // Local copy of TrueValue for comparison operators
   TrueVal := FTrueValue;
+  // Initialize event polling counter
+  EventPollCounter := 0;
 
   {$IFDEF DEBUG_MODE}
   {$IFDEF ENABLE_PROFILER}
@@ -117,6 +121,21 @@ begin
     {$IFDEF ENABLE_INSTRUCTION_COUNTING}
     Inc(FInstructionsExecuted);
     {$ENDIF}
+
+    // Periodic event polling via callback - keeps UI responsive
+    if Assigned(FEventPollCallback) then
+    begin
+      Inc(EventPollCounter);
+      if EventPollCounter >= FEventPollInterval then
+      begin
+        EventPollCounter := 0;
+        if FEventPollCallback() then
+        begin
+          FRunning := False;
+          Break;
+        end;
+      end;
+    end;
 
     // Two-level dispatch: first check group, then sub-opcode
     // Superinstructions are in group $C8+ (bcGroupSuper = $C800)

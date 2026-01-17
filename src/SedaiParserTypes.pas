@@ -152,6 +152,7 @@ type
     antDraw,              // DRAW command
     antLocate,            // LOCATE command
     antColor,             // COLOR command (set screen area colors)
+    antSetColor,          // SETCOLOR command (set screen area colors, 0-based)
     antWidth,             // WIDTH command (set line width)
     antScale,             // SCALE command (coordinate scaling)
     antPaint,             // PAINT command (flood fill)

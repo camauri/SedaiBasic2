@@ -94,7 +94,9 @@ type
     ssaGraphicLocate,  // Set pixel cursor position
     ssaGraphicRdot,    // Get pixel cursor position or color
     ssaGraphicGetMode, // RGR - Get current graphics mode (0-11)
-    ssaGraphicColor,   // COLOR source, color: Set color for screen area
+    ssaGraphicColor,   // COLOR source, color: Set color for screen area (0-255)
+    ssaSetColor,       // SETCOLOR source, color: Set color for screen area (0-based)
+    ssaGetColor,       // GETCOLOR(source): Return color index (0-based)
     ssaGraphicWidth,   // WIDTH n: Set line width (1 or 2)
     ssaGraphicScale,   // SCALE n [,xmax, ymax]: Set coordinate scaling
     ssaGraphicPaint,   // PAINT [source], x, y [,mode]: Flood fill area
@@ -102,6 +104,7 @@ type
     ssaGraphicSShape,  // SSHAPE A$, x1, y1 [,x2, y2]: Save bitmap area to string
     ssaGraphicGShape,  // GSHAPE A$, x, y [,mode]: Load string to bitmap
     ssaGraphicGList,   // GLIST: List SDL2 video modes
+    ssaScnClr,         // SCNCLR [mode]: Clear screen (text or graphics)
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n
     ssaGraphicRwindow, // RWINDOW(n): Return window size info

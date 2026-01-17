@@ -234,6 +234,8 @@ begin
     ssaGraphicRdot: Result := bcGraphicRdot;
     ssaGraphicGetMode: Result := bcGraphicGetMode;
     ssaGraphicColor: Result := bcGraphicColor;
+    ssaSetColor: Result := bcSetColor;
+    ssaGetColor: Result := bcGetColor;
     ssaGraphicWidth: Result := bcGraphicWidth;
     ssaGraphicScale: Result := bcGraphicScale;
     ssaGraphicPaint: Result := bcGraphicPaint;
@@ -241,6 +243,7 @@ begin
     ssaGraphicSShape: Result := bcGraphicSShape;
     ssaGraphicGShape: Result := bcGraphicGShape;
     ssaGraphicGList: Result := bcGraphicGList;
+    ssaScnClr: Result := bcScnClr;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;
     ssaGraphicRwindow: Result := bcGraphicRwindow;
@@ -895,6 +898,28 @@ begin
     Exit;
   end;
 
+  // Special handling for SCALE - map Src3 to Dest (not Immediate)
+  if Instr.OpCode = ssaGraphicScale then
+  begin
+    BCOp := bcGraphicScale;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    // Src1 = enable flag register
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    // Src2 = xmax register
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+
+    // Dest = ymax register (from Src3)
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
+
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
   // Special handling for PAINT - pack PhiSources[0]=mode into Immediate
   if Instr.OpCode = ssaGraphicPaint then
   begin
@@ -975,9 +1000,9 @@ begin
     BCOp := bcGraphicSShape;
     BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
 
-    // Dest = string variable (output) - store variable name index in string constants
-    if Instr.Dest.Kind = svkVariable then
-      BCInstr.Dest := FProgram.AddStringConstant(Instr.Dest.VarName);
+    // Dest = string register (output) - now using register instead of variable reference
+    if Instr.Dest.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
 
     // Src1 = x1 register
     if Instr.Src1.Kind = svkRegister then
@@ -1349,11 +1374,36 @@ var
   Instr: TSSAInstruction;
   i, j, BCReg: Integer;
   RegType: TSSARegisterType;
+  IntVarCount, FloatVarCount, StringVarCount: Integer;
+  VarRegStr: string;
+  ColonPos: Integer;
 begin
   FProgram := TBytecodeProgram.Create;
   FSSAProgram := SSAProgram;  // Store reference for array metadata lookup
   FLabelMap.Clear;
   SetLength(FJumpFixups, 0);
+
+  // Find max variable register index for each type from VarRegMap
+  // VarRegMap values are "RegType:RegIndex" - we need max index + 1 per type
+  // This ensures all variable registers are preserved with identity mapping
+  IntVarCount := 0;
+  FloatVarCount := 0;
+  StringVarCount := 0;
+  for i := 0 to SSAProgram.VarRegMap.Count - 1 do
+  begin
+    VarRegStr := SSAProgram.VarRegMap.ValueFromIndex[i];
+    ColonPos := Pos(':', VarRegStr);
+    if ColonPos > 0 then
+    begin
+      j := StrToIntDef(Copy(VarRegStr, ColonPos + 1, Length(VarRegStr)), -1);  // RegIndex
+      case StrToIntDef(Copy(VarRegStr, 1, ColonPos - 1), -1) of
+        Ord(srtInt): if j + 1 > IntVarCount then IntVarCount := j + 1;
+        Ord(srtFloat): if j + 1 > FloatVarCount then FloatVarCount := j + 1;
+        Ord(srtString): if j + 1 > StringVarCount then StringVarCount := j + 1;
+      end;
+    end;
+  end;
+  FProgram.SetVarRegCounts(IntVarCount, FloatVarCount, StringVarCount);
 
   // Initialize max register tracking and register mapping
   for RegType := Low(TSSARegisterType) to High(TSSARegisterType) do

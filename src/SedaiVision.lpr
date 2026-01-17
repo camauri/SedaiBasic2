@@ -169,6 +169,7 @@ begin
   WriteLn('  --no-exec            Compile only, do not execute');
   WriteLn('  --stats              Show execution statistics');
   WriteLn('  --fullscreen         Start in fullscreen mode');
+  WriteLn('  --history-file=PATH  Use custom history file (default: ~/.sedai/.sbv_history)');
   WriteLn('  --true-value=N       Set TRUE value for comparisons (-1 or 1, default: -1)');
   WriteLn('                         -1 = Commodore BASIC style (default)');
   WriteLn('                          1 = Modern BASIC style');
@@ -421,12 +422,17 @@ begin
 end;
 
 { Run interactive mode - splash screen, READY., blinking cursor }
-procedure RunInteractiveMode(OptFullscreen: Boolean; const StartupFile: string = ''; AutoRun: Boolean = False);
+procedure RunInteractiveMode(OptFullscreen: Boolean; const StartupFile: string = '';
+  AutoRun: Boolean = False; const HistoryFile: string = '');
 var
   Console: TSedaiNewConsole;
 begin
   Console := TSedaiNewConsole.Create;
   try
+    // Set custom history file before Initialize (which calls LoadHistory)
+    if HistoryFile <> '' then
+      Console.SetHistoryFile(HistoryFile);
+
     // Initialize with 80x50 text mode (GRAPHIC 8)
     if not Console.Initialize(gm80x50Text, OptFullscreen) then
     begin
@@ -451,6 +457,10 @@ var
   IOMode: TIOMode;
   ModeStr: string;
   OptVerbose, OptDisasm, OptStats, OptHelp, OptNoExec, OptFullscreen, OptAutoRun: Boolean;
+  OptHistoryFile: string;
+  HistoryDir: string;
+  HistoryResponse: string;
+  HistoryF: TextFile;
   {$IFDEF ENABLE_PROFILER}
   OptProfile: Boolean;
   ProfileMode: string;
@@ -487,6 +497,7 @@ begin
     OptNoExec := False;
     OptFullscreen := False;
     OptAutoRun := False;
+    OptHistoryFile := '';  // Use default path
     OptTrueValue := -1;  // Default: Commodore BASIC style (TRUE = -1)
     {$IFDEF ENABLE_PROFILER}
     OptProfile := False;
@@ -494,7 +505,8 @@ begin
     ProfileExport := '';
     {$ENDIF}
 
-    for i := 1 to ParamCount do
+    i := 1;
+    while i <= ParamCount do
     begin
       Param := ParamStr(i);
 
@@ -557,8 +569,23 @@ begin
           OptTrueValue := -1;
         end;
       end
+      else if Pos('--history-file=', LowerCase(Param)) = 1 then
+        OptHistoryFile := Copy(Param, 16, Length(Param))
+      else if LowerCase(Param) = '--history-file' then
+      begin
+        // Next parameter is the history file path
+        if i < ParamCount then
+        begin
+          Inc(i);
+          OptHistoryFile := ParamStr(i);
+        end
+        else
+          WriteLn('WARNING: --history-file requires a path argument');
+      end
       else if (Pos('--', Param) <> 1) and (TestFile = '') then
         TestFile := Param;  // Use original case for filename
+
+      Inc(i);
     end;
 
     // Show help if requested
@@ -568,10 +595,61 @@ begin
       Exit;
     end;
 
+    // Validate and create history file path if custom path specified
+    if OptHistoryFile <> '' then
+    begin
+      HistoryDir := ExtractFilePath(OptHistoryFile);
+      if HistoryDir <> '' then
+      begin
+        // Check if directory exists
+        if not DirectoryExists(HistoryDir) then
+        begin
+          Write('History directory does not exist: ', HistoryDir);
+          WriteLn;
+          Write('Create it? (Y/N): ');
+          ReadLn(HistoryResponse);
+          if (LowerCase(HistoryResponse) = 'y') or (LowerCase(HistoryResponse) = 'yes') then
+          begin
+            if ForceDirectories(HistoryDir) then
+              WriteLn('Directory created: ', HistoryDir)
+            else
+            begin
+              WriteLn('ERROR: Failed to create directory: ', HistoryDir);
+              WriteLn('Using default history path.');
+              OptHistoryFile := '';  // Fallback to default
+            end;
+          end
+          else
+          begin
+            WriteLn('Using default history path.');
+            OptHistoryFile := '';  // Fallback to default
+          end;
+        end;
+      end;
+
+      // If directory exists (or was created), create empty file if needed
+      if (OptHistoryFile <> '') and not FileExists(OptHistoryFile) then
+      begin
+        try
+          AssignFile(HistoryF, OptHistoryFile);
+          Rewrite(HistoryF);
+          CloseFile(HistoryF);
+          WriteLn('Created empty history file: ', OptHistoryFile);
+        except
+          on E: Exception do
+          begin
+            WriteLn('WARNING: Could not create history file: ', E.Message);
+            WriteLn('Using default history path.');
+            OptHistoryFile := '';  // Fallback to default
+          end;
+        end;
+      end;
+    end;
+
     // No file specified -> interactive mode without startup file
     if TestFile = '' then
     begin
-      RunInteractiveMode(OptFullscreen);
+      RunInteractiveMode(OptFullscreen, '', False, OptHistoryFile);
       Exit;
     end;
 
@@ -585,7 +663,7 @@ begin
 
     // Run interactive mode with startup file
     // This loads the file and optionally auto-runs it
-    RunInteractiveMode(OptFullscreen, TestFile, OptAutoRun);
+    RunInteractiveMode(OptFullscreen, TestFile, OptAutoRun, OptHistoryFile);
 
   except
     on E: Exception do

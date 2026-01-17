@@ -103,6 +103,7 @@ type
     procedure ProcessGraphics(Node: TASTNode);
     procedure ProcessScnClr(Node: TASTNode);
     procedure ProcessColor(Node: TASTNode);
+    procedure ProcessSetColor(Node: TASTNode);
     procedure ProcessWidth(Node: TASTNode);
     procedure ProcessScale(Node: TASTNode);
     procedure ProcessPaint(Node: TASTNode);
@@ -1652,7 +1653,7 @@ begin
         end
         else if FuncName = 'RCLR' then
         begin
-          // RCLR(n) - return color of source n (0-6)
+          // RCLR(n) - return color of source n (0-6), 0-based result
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
           begin
             ProcessExpression(ArgListNode.GetChild(0), ArgValue);
@@ -1667,6 +1668,24 @@ begin
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
           EmitInstruction(ssaGraphicRclr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if FuncName = 'GETCOLOR' then
+        begin
+          // GETCOLOR(n) - return color of source n (0-6), 0-based result
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+            ArgReg := EnsureIntRegister(ArgValue);
+          end
+          else
+          begin
+            TempReg := FProgram.AllocRegister(srtInt);
+            ArgReg := MakeSSARegister(srtInt, TempReg);
+            EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaGetColor, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else if FuncName = 'RWINDOW' then
         begin
@@ -1685,6 +1704,55 @@ begin
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
           EmitInstruction(ssaGraphicRwindow, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else
+          Result := MakeSSAValue(svkNone);
+      end
+      else
+        Result := MakeSSAValue(svkNone);
+    end;
+
+    antInputFunction:
+    begin
+      // Handle input functions: RWINDOW, POS, etc.
+      if Node.ChildCount > 0 then
+      begin
+        FuncName := UpperCase(VarToStr(Node.Value));
+        ArgListNode := Node.GetChild(0);
+
+        if FuncName = 'RWINDOW' then
+        begin
+          // RWINDOW(n) - return window info (0=lines, 1=cols, 2=screen width)
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+            ArgReg := EnsureIntRegister(ArgValue);
+          end
+          else
+          begin
+            TempReg := FProgram.AllocRegister(srtInt);
+            ArgReg := MakeSSARegister(srtInt, TempReg);
+            EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaGraphicRwindow, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if FuncName = 'POS' then
+        begin
+          // POS(x) - return cursor column position (argument is ignored, C128 compatibility)
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+          begin
+            // Process argument but ignore it (C128 compatibility)
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+          end;
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          // POS uses dummy arg of 0
+          TempReg := FProgram.AllocRegister(srtInt);
+          ArgReg := MakeSSARegister(srtInt, TempReg);
+          EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          EmitInstruction(ssaGraphicPos, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else
           Result := MakeSSAValue(svkNone);
@@ -3537,13 +3605,18 @@ begin
 end;
 
 { ProcessGraphics - Handle GRAPHIC command for setting graphics mode
-  Syntax: GRAPHIC mode [, clear [, param3]]
+  Syntax: GRAPHIC [mode [, clear [, param3]]]
   Parameters:
-    0: mode   - graphics mode (0-7)
+    0: mode   - graphics mode (0-11), optional, default 8 (gm80x50Text)
     1: clear  - clear screen (0 or 1), optional, default 0
-    2: param3 - additional parameter for mode 7 (SDL2 mode index), optional
+    2: param3 - additional parameter for mode 11 (SDL2 mode index), optional
+
+  Mode validation is done at runtime in the VM to support variables/expressions.
+  Invalid modes (< 0 or > 11) will raise ?ILLEGAL QUANTITY ERROR.
 }
 procedure TSSAGenerator.ProcessGraphics(Node: TASTNode);
+const
+  DEFAULT_GRAPHIC_MODE = 8;  // gm80x50Text - 80x50 text mode
 var
   i, TempReg: Integer;
   ParamValues: array[0..2] of TSSAValue;
@@ -3559,37 +3632,55 @@ begin
 
   // Get parameter count
   ParamCount := Node.ChildCount;
+
+  // GRAPHIC without parameters: use default mode
   if ParamCount < 1 then
   begin
-    WriteLn(StdErr, 'GRAPHIC: requires at least 1 parameter (mode)');
-    Exit;
-  end;
-
-  // Evaluate each parameter expression
-  for i := 0 to Min(ParamCount - 1, 2) do
+    TempReg := FProgram.AllocRegister(srtInt);
+    ParamRegs[0] := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, ParamRegs[0], MakeSSAConstInt(DEFAULT_GRAPHIC_MODE),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
   begin
-    ProcessExpression(Node.GetChild(i), ParamValues[i]);
+    // Evaluate each parameter expression (supports variables, expressions, functions)
+    for i := 0 to Min(ParamCount - 1, 2) do
+    begin
+      ProcessExpression(Node.GetChild(i), ParamValues[i]);
 
-    // Materialize constants into registers
-    if ParamValues[i].Kind = svkConstInt then
-    begin
-      TempReg := FProgram.AllocRegister(srtInt);
-      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaLoadConstInt, ParamRegs[i], ParamValues[i],
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    end
-    else if ParamValues[i].Kind = svkConstFloat then
-    begin
-      // Convert float to int for mode parameter
-      TempReg := FProgram.AllocRegister(srtInt);
-      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaLoadConstInt, ParamRegs[i], MakeSSAConstInt(Trunc(ParamValues[i].ConstFloat)),
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    end
-    else if ParamValues[i].Kind = svkRegister then
-      ParamRegs[i] := ParamValues[i]
-    else
-      ParamRegs[i] := MakeSSAValue(svkNone);
+      // Materialize constants into registers or convert to int as needed
+      if ParamValues[i].Kind = svkConstInt then
+      begin
+        TempReg := FProgram.AllocRegister(srtInt);
+        ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+        EmitInstruction(ssaLoadConstInt, ParamRegs[i], ParamValues[i],
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if ParamValues[i].Kind = svkConstFloat then
+      begin
+        // Convert float constant to int for mode parameter
+        TempReg := FProgram.AllocRegister(srtInt);
+        ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+        EmitInstruction(ssaLoadConstInt, ParamRegs[i], MakeSSAConstInt(Trunc(ParamValues[i].ConstFloat)),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if ParamValues[i].Kind = svkRegister then
+      begin
+        // Check if register is float - if so, convert to int
+        if ParamValues[i].RegType = srtFloat then
+        begin
+          TempReg := FProgram.AllocRegister(srtInt);
+          ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+          EmitInstruction(ssaFloatToInt, ParamRegs[i], ParamValues[i],
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else
+          // Int register - use directly
+          ParamRegs[i] := ParamValues[i];
+      end
+      else
+        ParamRegs[i] := MakeSSAValue(svkNone);
+    end;
   end;
 
   // Set defaults for optional parameters
@@ -3620,16 +3711,16 @@ end;
 
 { ProcessScnClr - Handle SCNCLR command (Screen Clear)
   Syntax: SCNCLR [mode]
-  If mode is specified (0-11), clears that mode's buffer
-  If mode is omitted, clears the current mode's buffer
+  If mode is specified (0-5), clears that mode's screen
+  If mode is omitted (-1), clears the current mode's screen
 
-  Implemented as: GRAPHIC current_mode, 1  (or GRAPHIC specified_mode, 1)
-  where 1 means "clear buffer"
+  Text modes (0, 5): Clear text buffer and scrollback, cursor to 0,0
+  Graphics modes (1-4): Clear graphics buffer with background color
 }
 procedure TSSAGenerator.ProcessScnClr(Node: TASTNode);
 var
-  ModeVal, ModeReg, ClearReg, Param3Reg: TSSAValue;
-  TempReg, DestReg: Integer;
+  ModeVal, ModeReg: TSSAValue;
+  TempReg: Integer;
 begin
   if FCurrentBlock = nil then Exit;
 
@@ -3638,64 +3729,20 @@ begin
   begin
     // Mode specified - use it
     ProcessExpression(Node.GetChild(0), ModeVal);
-
-    // Materialize to int register
-    if ModeVal.Kind = svkConstInt then
-    begin
-      TempReg := FProgram.AllocRegister(srtInt);
-      ModeReg := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaLoadConstInt, ModeReg, ModeVal,
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    end
-    else if ModeVal.Kind = svkConstFloat then
-    begin
-      TempReg := FProgram.AllocRegister(srtInt);
-      ModeReg := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaLoadConstInt, ModeReg, MakeSSAConstInt(Trunc(ModeVal.ConstFloat)),
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    end
-    else if (ModeVal.Kind = svkRegister) and (ModeVal.RegType = srtFloat) then
-    begin
-      TempReg := FProgram.AllocRegister(srtInt);
-      ModeReg := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaFloatToInt, ModeReg, ModeVal,
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    end
-    else
-      ModeReg := ModeVal;
+    ModeReg := EnsureIntRegister(ModeVal);
   end
   else
   begin
-    // No mode specified - use RGR(0) to get current mode
-    // First emit ssaGraphicGetMode to get current mode
+    // No mode specified - use -1 to indicate current mode
     TempReg := FProgram.AllocRegister(srtInt);
-    DestReg := FProgram.AllocRegister(srtInt);
-    ModeReg := MakeSSARegister(srtInt, DestReg);
-
-    // Load 0 as argument for RGR
-    EmitInstruction(ssaLoadConstInt, MakeSSARegister(srtInt, TempReg),
-                   MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-
-    // Get current mode
-    EmitInstruction(ssaGraphicGetMode, ModeReg, MakeSSARegister(srtInt, TempReg),
+    ModeReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, ModeReg, MakeSSAConstInt(-1),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
-  // Clear flag = 1 (always clear)
-  TempReg := FProgram.AllocRegister(srtInt);
-  ClearReg := MakeSSARegister(srtInt, TempReg);
-  EmitInstruction(ssaLoadConstInt, ClearReg, MakeSSAConstInt(1),
-                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-
-  // Param3 = 0 (no special parameter)
-  TempReg := FProgram.AllocRegister(srtInt);
-  Param3Reg := MakeSSARegister(srtInt, TempReg);
-  EmitInstruction(ssaLoadConstInt, Param3Reg, MakeSSAConstInt(0),
-                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-
-  // Emit ssaGraphicSetMode: mode, 1 (clear), 0 (param3)
-  EmitInstruction(ssaGraphicSetMode, MakeSSAValue(svkNone),
-                 ModeReg, ClearReg, Param3Reg);
+  // Emit ssaScnClr with mode (-1 = current, 0-5 = specific)
+  EmitInstruction(ssaScnClr, MakeSSAValue(svkNone),
+                 ModeReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
 { ProcessBox - Handle BOX command for drawing rectangles
@@ -3749,10 +3796,24 @@ begin
     end
     else if ParamValues[i].Kind = svkConstFloat then
     begin
-      TempReg := FProgram.AllocRegister(srtFloat);
-      ParamRegs[i] := MakeSSARegister(srtFloat, TempReg);
-      EmitInstruction(ssaLoadConstFloat, ParamRegs[i], ParamValues[i],
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // Parameters 0-4 (color, x1, y1, x2, y2) and 6-7 (filled, fill_color) must be int
+      // Only parameter 5 (angle) should be float
+      if i = 5 then
+      begin
+        TempReg := FProgram.AllocRegister(srtFloat);
+        ParamRegs[i] := MakeSSARegister(srtFloat, TempReg);
+        EmitInstruction(ssaLoadConstFloat, ParamRegs[i], ParamValues[i],
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+      begin
+        // Convert float constant to int for coordinate/color parameters
+        TempReg := FProgram.AllocRegister(srtInt);
+        ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+        EmitInstruction(ssaLoadConstInt, ParamRegs[i],
+                       MakeSSAConstInt(Trunc(ParamValues[i].ConstFloat)),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
     end
     else if ParamValues[i].Kind = svkRegister then
       ParamRegs[i] := ParamValues[i]
@@ -3760,14 +3821,34 @@ begin
       ParamRegs[i] := MakeSSAValue(svkNone);
   end;
 
+  // Convert float registers to int for parameters 0-4, 6-7 (VM expects int for coordinates)
+  for i := 0 to 4 do
+  begin
+    if (ParamRegs[i].Kind = svkRegister) and (ParamRegs[i].RegType = srtFloat) then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      EmitInstruction(ssaFloatToInt, MakeSSARegister(srtInt, TempReg),
+                     ParamRegs[i], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+    end;
+  end;
+
   // Set defaults for optional parameters
-  // angle defaults to 0
+  // angle defaults to 0 - MUST be float for VM compatibility
   if (ParamCount < 6) or (ParamRegs[5].Kind = svkNone) then
   begin
     TempReg := FProgram.AllocRegister(srtFloat);
     ParamRegs[5] := MakeSSARegister(srtFloat, TempReg);
     EmitInstruction(ssaLoadConstFloat, ParamRegs[5], MakeSSAConstFloat(0.0),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if ParamRegs[5].RegType = srtInt then
+  begin
+    // Convert int angle to float - VM expects float register
+    TempReg := FProgram.AllocRegister(srtFloat);
+    EmitInstruction(ssaIntToFloat, MakeSSARegister(srtFloat, TempReg),
+                   ParamRegs[5], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    ParamRegs[5] := MakeSSARegister(srtFloat, TempReg);
   end;
 
   // filled defaults to 0 (outline only)
@@ -3777,11 +3858,27 @@ begin
     ParamRegs[6] := MakeSSARegister(srtInt, TempReg);
     EmitInstruction(ssaLoadConstInt, ParamRegs[6], MakeSSAConstInt(0),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if (ParamRegs[6].Kind = svkRegister) and (ParamRegs[6].RegType = srtFloat) then
+  begin
+    // Convert float to int for filled parameter
+    TempReg := FProgram.AllocRegister(srtInt);
+    EmitInstruction(ssaFloatToInt, MakeSSARegister(srtInt, TempReg),
+                   ParamRegs[6], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    ParamRegs[6] := MakeSSARegister(srtInt, TempReg);
   end;
 
   // fill_color defaults to border color (ParamRegs[0])
   if (ParamCount < 8) or (ParamRegs[7].Kind = svkNone) then
-    ParamRegs[7] := ParamRegs[0];
+    ParamRegs[7] := ParamRegs[0]
+  else if (ParamRegs[7].Kind = svkRegister) and (ParamRegs[7].RegType = srtFloat) then
+  begin
+    // Convert float to int for fill_color parameter
+    TempReg := FProgram.AllocRegister(srtInt);
+    EmitInstruction(ssaFloatToInt, MakeSSARegister(srtInt, TempReg),
+                   ParamRegs[7], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    ParamRegs[7] := MakeSSARegister(srtInt, TempReg);
+  end;
 
   // Emit ssaGraphicBox instruction
   // We use Dest=None (no result), Src1=color, Src2=x1, Src3=y1
@@ -3840,25 +3937,73 @@ begin
   begin
     ProcessExpression(Node.GetChild(i), ParamValues[i]);
 
-    // Materialize constants into registers
-    if ParamValues[i].Kind = svkConstInt then
+    // Parameters 5-8 (sa, ea, angle, inc) must be float registers
+    // Parameters 0-4 (color, x, y, xr, yr) are integers
+    if i >= 5 then
     begin
-      TempReg := FProgram.AllocRegister(srtInt);
-      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaLoadConstInt, ParamRegs[i], ParamValues[i],
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // Force float for angle parameters
+      if ParamValues[i].Kind = svkConstInt then
+      begin
+        // Convert int constant to float constant
+        TempReg := FProgram.AllocRegister(srtFloat);
+        ParamRegs[i] := MakeSSARegister(srtFloat, TempReg);
+        EmitInstruction(ssaLoadConstFloat, ParamRegs[i],
+                       MakeSSAConstFloat(ParamValues[i].ConstInt),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if ParamValues[i].Kind = svkConstFloat then
+      begin
+        TempReg := FProgram.AllocRegister(srtFloat);
+        ParamRegs[i] := MakeSSARegister(srtFloat, TempReg);
+        EmitInstruction(ssaLoadConstFloat, ParamRegs[i], ParamValues[i],
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if ParamValues[i].Kind = svkRegister then
+      begin
+        // Convert int register to float if needed
+        if ParamValues[i].RegType = srtInt then
+          ParamRegs[i] := EnsureFloatRegister(ParamValues[i])
+        else
+          ParamRegs[i] := ParamValues[i];
+      end
+      else
+        ParamRegs[i] := MakeSSAValue(svkNone);
     end
-    else if ParamValues[i].Kind = svkConstFloat then
-    begin
-      TempReg := FProgram.AllocRegister(srtFloat);
-      ParamRegs[i] := MakeSSARegister(srtFloat, TempReg);
-      EmitInstruction(ssaLoadConstFloat, ParamRegs[i], ParamValues[i],
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    end
-    else if ParamValues[i].Kind = svkRegister then
-      ParamRegs[i] := ParamValues[i]
     else
-      ParamRegs[i] := MakeSSAValue(svkNone);
+    begin
+      // Integer parameters (color, x, y, xr, yr)
+      if ParamValues[i].Kind = svkConstInt then
+      begin
+        TempReg := FProgram.AllocRegister(srtInt);
+        ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+        EmitInstruction(ssaLoadConstInt, ParamRegs[i], ParamValues[i],
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if ParamValues[i].Kind = svkConstFloat then
+      begin
+        // Convert float constant to int for coordinate params
+        TempReg := FProgram.AllocRegister(srtInt);
+        ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+        EmitInstruction(ssaLoadConstInt, ParamRegs[i],
+                       MakeSSAConstInt(Round(ParamValues[i].ConstFloat)),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if ParamValues[i].Kind = svkRegister then
+      begin
+        // Convert float register to int if needed (VM expects int for coordinates)
+        if ParamValues[i].RegType = srtFloat then
+        begin
+          TempReg := FProgram.AllocRegister(srtInt);
+          EmitInstruction(ssaFloatToInt, MakeSSARegister(srtInt, TempReg),
+                         ParamValues[i], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+        end
+        else
+          ParamRegs[i] := ParamValues[i];
+      end
+      else
+        ParamRegs[i] := MakeSSAValue(svkNone);
+    end;
   end;
 
   // Set defaults for optional parameters
@@ -4192,6 +4337,58 @@ begin
                  SourceReg, ColorReg, MakeSSAValue(svkNone));
 end;
 
+{ ProcessSetColor - Handle SETCOLOR command for setting screen area colors (0-based)
+  Syntax: SETCOLOR source, color
+  Source: 0=background, 1=foreground, 2=multicolor1, 3=multicolor2,
+          4=border, 5=character, 6=80col-background
+  Color: 0-15 (standard palette) or 0-255 (extended palette)
+}
+procedure TSSAGenerator.ProcessSetColor(Node: TASTNode);
+var
+  SourceVal, ColorVal: TSSAValue;
+  SourceReg, ColorReg: TSSAValue;
+  TempReg: Integer;
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 2 then
+  begin
+    WriteLn(StdErr, 'SETCOLOR: requires source, color');
+    Exit;
+  end;
+
+  // Process source number
+  ProcessExpression(Node.GetChild(0), SourceVal);
+  if SourceVal.Kind = svkConstInt then
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    SourceReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, SourceReg, SourceVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if SourceVal.Kind = svkRegister then
+    SourceReg := SourceVal
+  else
+    SourceReg := MakeSSAValue(svkNone);
+
+  // Process color value
+  ProcessExpression(Node.GetChild(1), ColorVal);
+  if ColorVal.Kind = svkConstInt then
+  begin
+    TempReg := FProgram.AllocRegister(srtInt);
+    ColorReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, ColorReg, ColorVal,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if ColorVal.Kind = svkRegister then
+    ColorReg := ColorVal
+  else
+    ColorReg := MakeSSAValue(svkNone);
+
+  // Emit ssaSetColor: Src1=source, Src2=color (0-based, no conversion)
+  EmitInstruction(ssaSetColor, MakeSSAValue(svkNone),
+                 SourceReg, ColorReg, MakeSSAValue(svkNone));
+end;
+
 { ProcessWidth - Handle WIDTH command for setting line width
   Syntax: WIDTH n (1 or 2)
 }
@@ -4274,9 +4471,10 @@ begin
   end
   else
   begin
+    // Pass 0 to indicate "use C128 default" (1023 for hi-res, 2047 for multicolor)
     TempReg := FProgram.AllocRegister(srtInt);
     XMaxReg := MakeSSARegister(srtInt, TempReg);
-    EmitInstruction(ssaLoadConstInt, XMaxReg, MakeSSAConstInt(1023),
+    EmitInstruction(ssaLoadConstInt, XMaxReg, MakeSSAConstInt(0),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
@@ -4298,9 +4496,10 @@ begin
   end
   else
   begin
+    // Pass 0 to indicate "use C128 default" (1023 for all modes)
     TempReg := FProgram.AllocRegister(srtInt);
     YMaxReg := MakeSSARegister(srtInt, TempReg);
-    EmitInstruction(ssaLoadConstInt, YMaxReg, MakeSSAConstInt(1023),
+    EmitInstruction(ssaLoadConstInt, YMaxReg, MakeSSAConstInt(0),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
@@ -4322,28 +4521,6 @@ var
   Instr: TSSAInstruction;
   TempReg: Integer;
 
-  function MaterializeFloat(Val: TSSAValue): TSSAValue;
-  begin
-    if Val.Kind = svkConstFloat then
-    begin
-      TempReg := FProgram.AllocRegister(srtFloat);
-      Result := MakeSSARegister(srtFloat, TempReg);
-      EmitInstruction(ssaLoadConstFloat, Result, Val,
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    end
-    else if Val.Kind = svkConstInt then
-    begin
-      TempReg := FProgram.AllocRegister(srtFloat);
-      Result := MakeSSARegister(srtFloat, TempReg);
-      EmitInstruction(ssaLoadConstFloat, Result, MakeSSAConstFloat(Val.ConstInt),
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    end
-    else if Val.Kind = svkRegister then
-      Result := Val
-    else
-      Result := MakeSSAValue(svkNone);
-  end;
-
   function MaterializeInt(Val: TSSAValue): TSSAValue;
   begin
     if Val.Kind = svkConstInt then
@@ -4353,8 +4530,27 @@ var
       EmitInstruction(ssaLoadConstInt, Result, Val,
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end
+    else if Val.Kind = svkConstFloat then
+    begin
+      // Convert float constant to int
+      TempReg := FProgram.AllocRegister(srtInt);
+      Result := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(Trunc(Val.ConstFloat)),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
     else if Val.Kind = svkRegister then
-      Result := Val
+    begin
+      // Convert float register to int if needed
+      if Val.RegType = srtFloat then
+      begin
+        TempReg := FProgram.AllocRegister(srtInt);
+        Result := MakeSSARegister(srtInt, TempReg);
+        EmitInstruction(ssaFloatToInt, Result, Val,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+        Result := Val;
+    end
     else
       Result := MakeSSAValue(svkNone);
   end;
@@ -4378,9 +4574,9 @@ begin
     EmitInstruction(ssaLoadConstInt, SourceReg, MakeSSAConstInt(1),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     ProcessExpression(Node.GetChild(0), XVal);
-    XReg := MaterializeFloat(XVal);
+    XReg := MaterializeInt(XVal);
     ProcessExpression(Node.GetChild(1), YVal);
-    YReg := MaterializeFloat(YVal);
+    YReg := MaterializeInt(YVal);
     TempReg := FProgram.AllocRegister(srtInt);
     ModeReg := MakeSSARegister(srtInt, TempReg);
     EmitInstruction(ssaLoadConstInt, ModeReg, MakeSSAConstInt(0),
@@ -4391,9 +4587,9 @@ begin
     ProcessExpression(Node.GetChild(0), SourceVal);
     SourceReg := MaterializeInt(SourceVal);
     ProcessExpression(Node.GetChild(1), XVal);
-    XReg := MaterializeFloat(XVal);
+    XReg := MaterializeInt(XVal);
     ProcessExpression(Node.GetChild(2), YVal);
-    YReg := MaterializeFloat(YVal);
+    YReg := MaterializeInt(YVal);
     TempReg := FProgram.AllocRegister(srtInt);
     ModeReg := MakeSSARegister(srtInt, TempReg);
     EmitInstruction(ssaLoadConstInt, ModeReg, MakeSSAConstInt(0),
@@ -4404,9 +4600,9 @@ begin
     ProcessExpression(Node.GetChild(0), SourceVal);
     SourceReg := MaterializeInt(SourceVal);
     ProcessExpression(Node.GetChild(1), XVal);
-    XReg := MaterializeFloat(XVal);
+    XReg := MaterializeInt(XVal);
     ProcessExpression(Node.GetChild(2), YVal);
-    YReg := MaterializeFloat(YVal);
+    YReg := MaterializeInt(YVal);
     ProcessExpression(Node.GetChild(3), ModeVal);
     ModeReg := MaterializeInt(ModeVal);
   end;
@@ -4437,8 +4633,29 @@ var
       EmitInstruction(ssaLoadConstInt, Result, Val,
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end
+    else if Val.Kind = svkConstFloat then
+    begin
+      // Convert float constant to int
+      TempReg := FProgram.AllocRegister(srtInt);
+      Result := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(Trunc(Val.ConstFloat)),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
     else if Val.Kind = svkRegister then
-      Result := Val
+    begin
+      if Val.RegType = srtInt then
+        Result := Val  // Already int, use as-is
+      else if Val.RegType = srtFloat then
+      begin
+        // Convert float register to int register
+        TempReg := FProgram.AllocRegister(srtInt);
+        Result := MakeSSARegister(srtInt, TempReg);
+        EmitInstruction(ssaFloatToInt, Result, Val,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+        Result := MakeSSAValue(svkNone);  // String - invalid
+    end
     else
       Result := MakeSSAValue(svkNone);
   end;
@@ -4493,24 +4710,36 @@ var
   Instr: TSSAInstruction;
   TempReg: Integer;
 
-  function MaterializeFloat(Val: TSSAValue): TSSAValue;
+  function MaterializeInt(Val: TSSAValue): TSSAValue;
   begin
-    if Val.Kind = svkConstFloat then
+    if Val.Kind = svkConstInt then
     begin
-      TempReg := FProgram.AllocRegister(srtFloat);
-      Result := MakeSSARegister(srtFloat, TempReg);
-      EmitInstruction(ssaLoadConstFloat, Result, Val,
+      TempReg := FProgram.AllocRegister(srtInt);
+      Result := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, Result, Val,
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end
-    else if Val.Kind = svkConstInt then
+    else if Val.Kind = svkConstFloat then
     begin
-      TempReg := FProgram.AllocRegister(srtFloat);
-      Result := MakeSSARegister(srtFloat, TempReg);
-      EmitInstruction(ssaLoadConstFloat, Result, MakeSSAConstFloat(Val.ConstInt),
+      // Convert float constant to int
+      TempReg := FProgram.AllocRegister(srtInt);
+      Result := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(Trunc(Val.ConstFloat)),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end
     else if Val.Kind = svkRegister then
-      Result := Val
+    begin
+      // Convert float register to int if needed
+      if Val.RegType = srtFloat then
+      begin
+        TempReg := FProgram.AllocRegister(srtInt);
+        Result := MakeSSARegister(srtInt, TempReg);
+        EmitInstruction(ssaFloatToInt, Result, Val,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+        Result := Val;
+    end
     else
       Result := MakeSSAValue(svkNone);
   end;
@@ -4524,9 +4753,9 @@ begin
   end;
 
   // First child is the destination string variable
-  // We need the variable reference, not its value
+  // Get the register associated with this variable (like ProcessAssignment does)
   if Node.GetChild(0).NodeType = antIdentifier then
-    DestVar := MakeSSAVariable(Node.GetChild(0).Value)
+    DestVar := GetOrAllocateVariable(VarToStr(Node.GetChild(0).Value))
   else
   begin
     WriteLn(StdErr, 'SSHAPE: first parameter must be a string variable');
@@ -4534,34 +4763,34 @@ begin
   end;
 
   ProcessExpression(Node.GetChild(1), X1Val);
-  X1Reg := MaterializeFloat(X1Val);
+  X1Reg := MaterializeInt(X1Val);
   ProcessExpression(Node.GetChild(2), Y1Val);
-  Y1Reg := MaterializeFloat(Y1Val);
+  Y1Reg := MaterializeInt(Y1Val);
 
   // Optional x2, y2
   if Node.ChildCount > 3 then
   begin
     ProcessExpression(Node.GetChild(3), X2Val);
-    X2Reg := MaterializeFloat(X2Val);
+    X2Reg := MaterializeInt(X2Val);
   end
   else
   begin
-    TempReg := FProgram.AllocRegister(srtFloat);
-    X2Reg := MakeSSARegister(srtFloat, TempReg);
-    EmitInstruction(ssaLoadConstFloat, X2Reg, MakeSSAConstFloat(-1),
+    TempReg := FProgram.AllocRegister(srtInt);
+    X2Reg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, X2Reg, MakeSSAConstInt(-1),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
   if Node.ChildCount > 4 then
   begin
     ProcessExpression(Node.GetChild(4), Y2Val);
-    Y2Reg := MaterializeFloat(Y2Val);
+    Y2Reg := MaterializeInt(Y2Val);
   end
   else
   begin
-    TempReg := FProgram.AllocRegister(srtFloat);
-    Y2Reg := MakeSSARegister(srtFloat, TempReg);
-    EmitInstruction(ssaLoadConstFloat, Y2Reg, MakeSSAConstFloat(-1),
+    TempReg := FProgram.AllocRegister(srtInt);
+    Y2Reg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, Y2Reg, MakeSSAConstInt(-1),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
@@ -4582,28 +4811,6 @@ var
   Instr: TSSAInstruction;
   TempReg: Integer;
 
-  function MaterializeFloat(Val: TSSAValue): TSSAValue;
-  begin
-    if Val.Kind = svkConstFloat then
-    begin
-      TempReg := FProgram.AllocRegister(srtFloat);
-      Result := MakeSSARegister(srtFloat, TempReg);
-      EmitInstruction(ssaLoadConstFloat, Result, Val,
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    end
-    else if Val.Kind = svkConstInt then
-    begin
-      TempReg := FProgram.AllocRegister(srtFloat);
-      Result := MakeSSARegister(srtFloat, TempReg);
-      EmitInstruction(ssaLoadConstFloat, Result, MakeSSAConstFloat(Val.ConstInt),
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    end
-    else if Val.Kind = svkRegister then
-      Result := Val
-    else
-      Result := MakeSSAValue(svkNone);
-  end;
-
   function MaterializeInt(Val: TSSAValue): TSSAValue;
   begin
     if Val.Kind = svkConstInt then
@@ -4613,8 +4820,27 @@ var
       EmitInstruction(ssaLoadConstInt, Result, Val,
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end
+    else if Val.Kind = svkConstFloat then
+    begin
+      // Convert float constant to int
+      TempReg := FProgram.AllocRegister(srtInt);
+      Result := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(Trunc(Val.ConstFloat)),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
     else if Val.Kind = svkRegister then
-      Result := Val
+    begin
+      // Convert float register to int if needed
+      if Val.RegType = srtFloat then
+      begin
+        TempReg := FProgram.AllocRegister(srtInt);
+        Result := MakeSSARegister(srtInt, TempReg);
+        EmitInstruction(ssaFloatToInt, Result, Val,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+        Result := Val;
+    end
     else
       Result := MakeSSAValue(svkNone);
   end;
@@ -4634,26 +4860,26 @@ begin
   if Node.ChildCount > 1 then
   begin
     ProcessExpression(Node.GetChild(1), XVal);
-    XReg := MaterializeFloat(XVal);
+    XReg := MaterializeInt(XVal);
   end
   else
   begin
-    TempReg := FProgram.AllocRegister(srtFloat);
-    XReg := MakeSSARegister(srtFloat, TempReg);
-    EmitInstruction(ssaLoadConstFloat, XReg, MakeSSAConstFloat(-1),
+    TempReg := FProgram.AllocRegister(srtInt);
+    XReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, XReg, MakeSSAConstInt(-1),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
   if Node.ChildCount > 2 then
   begin
     ProcessExpression(Node.GetChild(2), YVal);
-    YReg := MaterializeFloat(YVal);
+    YReg := MaterializeInt(YVal);
   end
   else
   begin
-    TempReg := FProgram.AllocRegister(srtFloat);
-    YReg := MakeSSARegister(srtFloat, TempReg);
-    EmitInstruction(ssaLoadConstFloat, YReg, MakeSSAConstFloat(-1),
+    TempReg := FProgram.AllocRegister(srtInt);
+    YReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, YReg, MakeSSAConstInt(-1),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
@@ -6734,6 +6960,7 @@ begin
     antGraphics: ProcessGraphics(Node);
     antScnClr: ProcessScnClr(Node);
     antColor: ProcessColor(Node);
+    antSetColor: ProcessSetColor(Node);
     antWidth: ProcessWidth(Node);
     antScale: ProcessScale(Node);
     antPaint: ProcessPaint(Node);

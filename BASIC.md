@@ -2,10 +2,10 @@
 
 ## Implementation Progress
 
-**168 / 195 commands implemented (86%)**
+**173 / 200 commands implemented (87%)**
 
 ```
-[███████████████████████████████████████████·····] 86%
+[███████████████████████████████████████████·····] 87%
 ```
 
 Legend: ✓ = Implemented | ✗ = Not implemented
@@ -198,13 +198,15 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `PEEK` | ✗ | Return content of specific RAM location |
 | `POINTER` | ✗ | Return the address of a variable name |
 
-## Graphics Management (19/19 - 100%)
+## Graphics Management (21/21 - 100%)
 
 | Command/Function | Status | Description |
 |------------------|--------|-------------|
 | `BOX` | ✓ | Draw a box |
 | `CIRCLE` | ✓ | Draws circles, ellipses, arcs and polygons |
-| `COLOR` | ✓ | Define colors for each screen area |
+| `COLOR` | ✓ | Define colors for each screen area (0-255, palette wraps every 16) |
+| `SETCOLOR` | ✓ | Set color for screen area (0-255, uses parentheses) |
+| `GETCOLOR` | ✓ | Return color index for screen area (0-255) |
 | `DRAW` | ✓ | Draw dots, lines and shapes |
 | `GLIST` | ✓ | List available SDL2 video modes |
 | `GRAPHIC` | ✓ | Select a graphic mode |
@@ -217,7 +219,7 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `WIDTH` | ✓ | Set the width of drawn lines |
 | `WINDOW` | ✓ | Defines a screen window |
 | `POS` | ✓ | Return the current cursor column position |
-| `RCLR` | ✓ | Return color of color source |
+| `RCLR` | ✓ | Return color of color source (0-255) |
 | `RDOT` | ✓ | Return current position or color of pixel cursor |
 | `RGR` | ✓ | Return current graphic mode |
 | `RWINDOW` | ✓ | Return the size of the current window |
@@ -308,13 +310,16 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `SYS` | ✗ | Execute ML subroutine |
 | `USR` | ✗ | Call user-defined ML subfunction |
 
-## Program Editing (6/6 - 100%)
+## Program Editing (9/9 - 100%)
 
 | Command | Status | Description |
 |---------|--------|-------------|
 | `AUTO` | ✓ | Auto line numbering (AUTO inc to enable, AUTO to disable) |
 | `DELETE` | ✓ | Delete lines of a BASIC program (DELETE n, DELETE n-m, DELETE -n, DELETE n-) |
 | `EDIT` | ✓ | Edit a single program line (EDIT n) |
+| `HCLEAR` | ✓ | Clear command history (prompts for confirmation) |
+| `HLOAD` | ✓ | Load command history from file (HLOAD "filename") |
+| `HSAVE` | ✓ | Save command history to file (HSAVE "filename") |
 | `LIST` | ✓ | List the BASIC program lines (LIST, LIST n, LIST n-, LIST -n, LIST n-m) |
 | `NEW` | ✓ | Erase program and clear all variables |
 | `RENUMBER` | ✓ | Renumber lines of the BASIC program (RENUMBER [new[,inc[,old]]]) |

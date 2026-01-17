@@ -417,6 +417,7 @@ begin
         kCHAR: Result := Memoize('CharStatement', @ParseCharStatement);
         kPUDEF: Result := Memoize('PudefStatement', @ParsePudefStatement);
         kUSING: Result := Memoize('PrintStatement', @ParsePrintStatement); // USING alone - handle in PRINT
+        kWINDOW: Result := Memoize('GraphicsStatement', @ParseGraphicsStatement);
       else
         Result := Memoize('PrintStatement', @ParsePrintStatement);
       end;
@@ -561,6 +562,22 @@ begin
         end;
       end;
 
+    // === SPECIAL VARIABLES (TI$, etc.) ===
+    ttSpecialVariable:
+      begin
+        // Special variables like TI$ can be assigned (TI$="120000")
+        SavedIndex := Context.CurrentIndex;
+
+        Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
+
+        if not Assigned(Result) then
+        begin
+          // Assignment fallito, riprova come expression (e.g., PRINT TI$)
+          Context.CurrentIndex := SavedIndex;
+          Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+        end;
+      end;
+
     else
     begin
       ErrorToken := Context.CurrentToken;  // ← errore sul TOKEN CORRENTE, non quello catturato all'inizio
@@ -579,7 +596,7 @@ var
 begin
  Token := Context.CurrentToken;
 
-  // Parse left side - can be A or A(i)
+  // Parse left side - can be A or A(i) or special variable (TI$)
   if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
     (Context.PeekNext.TokenType = ttDelimParOpen) then
   begin
@@ -593,6 +610,13 @@ begin
     LeftSide := TASTNode.CreateWithValue(antIdentifier, UpperCase(Token.Value), Token);
     Context.Advance; // Consume identifier
     //WriteLn('DEBUG: Consumed identifier, next token: "', Context.CurrentToken.Value, '"');
+  end
+  else if Context.Check(ttSpecialVariable) then
+  begin
+    // Special variable like TI$ - can be assigned
+    SavedToken := Context.CurrentToken;
+    LeftSide := TASTNode.CreateWithValue(antSpecialVariable, UpperCase(Token.Value), Token);
+    Context.Advance; // Consume special variable
   end
   else
   begin
@@ -1660,6 +1684,8 @@ begin
     Result := TASTNode.Create(antLocate, Token)
   else if CmdName = 'COLOR' then
     Result := TASTNode.Create(antColor, Token)
+  else if CmdName = 'SETCOLOR' then
+    Result := TASTNode.Create(antSetColor, Token)
   else if CmdName = 'WIDTH' then
     Result := TASTNode.Create(antWidth, Token)
   else if CmdName = 'SCALE' then
@@ -1693,6 +1719,8 @@ begin
     MaxParams := 1  // SCNCLR [mode] - optional mode 0-11
   else if CmdName = 'COLOR' then
     MaxParams := 2  // COLOR source, color
+  else if CmdName = 'SETCOLOR' then
+    MaxParams := 2  // SETCOLOR source, color (0-based)
   else if CmdName = 'WIDTH' then
     MaxParams := 1  // WIDTH n
   else if CmdName = 'SCALE' then
@@ -1764,13 +1792,48 @@ begin
         Context.Advance;
     end;
   end
+  else if CmdName = 'SETCOLOR' then
+  begin
+    // SETCOLOR(source, color) - requires parentheses like a function call
+    if not Context.Match(ttDelimParOpen) then
+    begin
+      HandleError('Expected ( after SETCOLOR', Context.CurrentToken);
+      Result.Free;
+      Result := nil;
+      Exit;
+    end;
+    // Parse source parameter
+    Param := ParseExpression;
+    if Assigned(Param) then
+      Result.AddChild(Param);
+    // Expect comma
+    if Context.Check(ttSeparParam) then
+      Context.Advance;
+    // Parse color parameter
+    Param := ParseExpression;
+    if Assigned(Param) then
+      Result.AddChild(Param);
+    // Expect closing parenthesis
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ) after SETCOLOR parameters', Context.CurrentToken);
+      Result.Free;
+      Result := nil;
+      Exit;
+    end;
+  end
   else
   begin
     // Standard parsing for other graphics commands
+    // Handle optional parameters: empty params (,,) add nil placeholder
     while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) and (ParamCount < MaxParams) do
     begin
+      // Check for empty parameter (comma without expression)
       if Context.Check(ttSeparParam) then
       begin
+        // Add nil placeholder for omitted parameter
+        Result.AddChild(nil);
+        Inc(ParamCount);
         Context.Advance;
         Continue;
       end;
@@ -2906,7 +2969,7 @@ begin
       Context.Advance; // Consume -
       if Context.Check(ttNumber) or Context.Check(ttInteger) or Context.Check(ttFloat) then
       begin
-        DataItem := TASTNode.CreateWithValue(antLiteral, -Double(Context.CurrentToken.Value), Context.CurrentToken);
+        DataItem := TASTNode.CreateWithValue(antLiteral, -StrToFloat(Context.CurrentToken.Value), Context.CurrentToken);
         Result.AddChild(DataItem);
         Context.Advance;
       end;
