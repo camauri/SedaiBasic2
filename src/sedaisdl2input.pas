@@ -1163,33 +1163,153 @@ begin
             FStopRequested := True;
           end
           // Save special keys for GETKEY (only if no pending char)
+          // Uses C128-compatible PETSCII codes where applicable
           else if not FHasPendingChar then
           begin
             KeySym := Event.key.keysym.sym;
             case KeySym of
+              // Basic control keys
               SDLK_RETURN, SDLK_KP_ENTER:
               begin
-                FPendingChar := #13;
+                FPendingChar := #13;  // CR
                 FHasPendingChar := True;
               end;
               SDLK_ESCAPE:
               begin
-                FPendingChar := #27;
+                FPendingChar := #27;  // ESC (C128: RUN/STOP)
                 FHasPendingChar := True;
               end;
               SDLK_BACKSPACE:
               begin
-                FPendingChar := #8;
+                FPendingChar := #20;  // DEL (C128 INST/DEL = CHR$(20))
+                FHasPendingChar := True;
+              end;
+              SDLK_DELETE:
+              begin
+                FPendingChar := #148; // C128 INSERT = CHR$(148)
                 FHasPendingChar := True;
               end;
               SDLK_TAB:
               begin
-                FPendingChar := #9;
+                FPendingChar := #9;   // TAB
                 FHasPendingChar := True;
               end;
               SDLK_SPACE:
               begin
                 FPendingChar := ' ';
+                FHasPendingChar := True;
+              end;
+              // Cursor keys (C128 PETSCII codes)
+              SDLK_UP:
+              begin
+                FPendingChar := #145; // Cursor UP = CHR$(145)
+                FHasPendingChar := True;
+              end;
+              SDLK_DOWN:
+              begin
+                FPendingChar := #17;  // Cursor DOWN = CHR$(17)
+                FHasPendingChar := True;
+              end;
+              SDLK_LEFT:
+              begin
+                FPendingChar := #157; // Cursor LEFT = CHR$(157)
+                FHasPendingChar := True;
+              end;
+              SDLK_RIGHT:
+              begin
+                FPendingChar := #29;  // Cursor RIGHT = CHR$(29)
+                FHasPendingChar := True;
+              end;
+              // Navigation keys
+              SDLK_HOME:
+              begin
+                FPendingChar := #19;  // HOME = CHR$(19)
+                FHasPendingChar := True;
+              end;
+              SDLK_END:
+              begin
+                // Only if not CTRL+END (which is stop program)
+                if not CtrlPressed then
+                begin
+                  FPendingChar := #4;   // END (not standard C128, use CHR$(4))
+                  FHasPendingChar := True;
+                end;
+              end;
+              SDLK_PAGEUP:
+              begin
+                FPendingChar := #11;  // PAGE UP (not standard C128, use CHR$(11))
+                FHasPendingChar := True;
+              end;
+              SDLK_PAGEDOWN:
+              begin
+                FPendingChar := #12;  // PAGE DOWN (not standard C128, use CHR$(12))
+                FHasPendingChar := True;
+              end;
+              SDLK_INSERT:
+              begin
+                FPendingChar := #148; // INSERT = CHR$(148)
+                FHasPendingChar := True;
+              end;
+              // Function keys (C128 codes: F1=133, F2=137, F3=134, F4=138, F5=135, F6=139, F7=136, F8=140)
+              SDLK_F1:
+              begin
+                FPendingChar := #133; // F1 = CHR$(133)
+                FHasPendingChar := True;
+              end;
+              SDLK_F2:
+              begin
+                FPendingChar := #137; // F2 = CHR$(137)
+                FHasPendingChar := True;
+              end;
+              SDLK_F3:
+              begin
+                FPendingChar := #134; // F3 = CHR$(134)
+                FHasPendingChar := True;
+              end;
+              SDLK_F4:
+              begin
+                FPendingChar := #138; // F4 = CHR$(138)
+                FHasPendingChar := True;
+              end;
+              SDLK_F5:
+              begin
+                FPendingChar := #135; // F5 = CHR$(135)
+                FHasPendingChar := True;
+              end;
+              SDLK_F6:
+              begin
+                FPendingChar := #139; // F6 = CHR$(139)
+                FHasPendingChar := True;
+              end;
+              SDLK_F7:
+              begin
+                FPendingChar := #136; // F7 = CHR$(136)
+                FHasPendingChar := True;
+              end;
+              SDLK_F8:
+              begin
+                FPendingChar := #140; // F8 = CHR$(140)
+                FHasPendingChar := True;
+              end;
+              // Extended function keys (not on C128, use sequential codes)
+              SDLK_F9:
+              begin
+                FPendingChar := #141; // F9 = CHR$(141)
+                FHasPendingChar := True;
+              end;
+              SDLK_F10:
+              begin
+                FPendingChar := #142; // F10 = CHR$(142)
+                FHasPendingChar := True;
+              end;
+              SDLK_F11:
+              begin
+                FPendingChar := #143; // F11 = CHR$(143)
+                FHasPendingChar := True;
+              end;
+              SDLK_F12:
+              begin
+                FPendingChar := #144; // F12 = CHR$(144)
                 FHasPendingChar := True;
               end;
             end;
