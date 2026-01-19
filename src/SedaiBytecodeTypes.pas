@@ -275,6 +275,9 @@ const
   bcLoadEL          = bcGroupSpecial + 5;   // EL: last error line number
   bcLoadER          = bcGroupSpecial + 6;   // ER: last error code
   bcLoadERRS        = bcGroupSpecial + 7;   // ERR$: last error message (variable)
+  // Memory operations
+  bcPeek            = bcGroupSpecial + 8;   // PEEK(address): read from memory-mapped location
+  bcPoke            = bcGroupSpecial + 9;   // POKE address, value: write to memory-mapped location
 
   // === GROUP 6: FILE I/O (0x06xx) ===
   bcDopen           = bcGroupFileIO + 0;    // DOPEN #handle, "filename" [, mode$]

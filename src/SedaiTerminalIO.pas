@@ -148,6 +148,11 @@ type
     function GetScreenWidth: Integer;
     function SaveShape(X1, Y1, X2, Y2: Double): string;
     procedure LoadShape(const Data: string; X, Y: Double; Mode: Integer);
+    // Screen memory access (stubs - not supported in terminal mode)
+    function GetCharAt(Col, Row: Integer): Byte;
+    procedure SetCharAt(Col, Row: Integer; Ch: Byte);
+    function GetColorAt(Col, Row: Integer): Byte;
+    procedure SetColorAt(Col, Row: Integer; Color: Byte);
   end;
 
   { TTerminalInput - Console input device (stdin) }
@@ -572,6 +577,26 @@ begin
 end;
 
 procedure TTerminalController.LoadShape(const Data: string; X, Y: Double; Mode: Integer);
+begin
+  // Not supported in terminal mode
+end;
+
+function TTerminalController.GetCharAt(Col, Row: Integer): Byte;
+begin
+  Result := 0;  // Not supported in terminal mode
+end;
+
+procedure TTerminalController.SetCharAt(Col, Row: Integer; Ch: Byte);
+begin
+  // Not supported in terminal mode
+end;
+
+function TTerminalController.GetColorAt(Col, Row: Integer): Byte;
+begin
+  Result := 0;  // Not supported in terminal mode
+end;
+
+procedure TTerminalController.SetColorAt(Col, Row: Integer; Color: Byte);
 begin
   // Not supported in terminal mode
 end;

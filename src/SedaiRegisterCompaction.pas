@@ -202,6 +202,7 @@ begin
     bcLoadEL,         // EL: last error line number (int)
     bcLoadER,         // ER: last error code (int)
     bcFre,            // FRE: available memory (int)
+    bcPeek,           // PEEK(address): read from memory (int)
     // === GROUP 7: Sprite functions ===
     bcBump,           // BUMP(n): collision bitmask (int)
     bcRspcolor,       // RSPCOLOR(n): multicolor value (int)
@@ -326,6 +327,9 @@ begin
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot,
     // === GROUP 1: String operations with int param ===
     bcStrChr, bcStrHex, bcStrErr,
+    // === GROUP 5: Memory operations ===
+    bcPeek,           // PEEK(address): Src1 = address (int)
+    bcPoke,           // POKE address, value: Src1 = address (int)
     // === GROUP 4: I/O operations ===
     bcPrintInt, bcPrintIntLn,
     bcPrintTab, bcPrintSpc,  // TAB(n) and SPC(n) - Src1 = count register
@@ -421,6 +425,8 @@ begin
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt,
     // Bitwise operations (second operand)
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor,
+    // === GROUP 5: Memory operations ===
+    bcPoke,           // POKE address, value: Src2 = value (int)
     // === GROUP 1: String operations with int second param ===
     bcStrLeft, bcStrRight,  // LEFT$/RIGHT$(str, len) - len is Src2 (int)
     bcStrMid,  // Mid$(str, start, length) - start is Src1, length is Src2

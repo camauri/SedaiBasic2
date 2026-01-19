@@ -2,10 +2,10 @@
 
 ## Implementation Progress
 
-**173 / 200 commands implemented (87%)**
+**175 / 200 commands implemented (88%)**
 
 ```
-[███████████████████████████████████████████·····] 87%
+[████████████████████████████████████████████····] 88%
 ```
 
 Legend: ✓ = Implemented | ✗ = Not implemented
@@ -184,18 +184,18 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `STR$` | ✓ | Convert number to string |
 | `TAB` | ✓ | Move cursor forward string from the first column |
 
-## Memory Management (1/9 - 11%)
+## Memory Management (3/9 - 33%)
 
 | Command/Function | Status | Description |
 |------------------|--------|-------------|
 | `BANK` | ✗ | Select RAM bank (0-15) |
 | `FETCH` | ✗ | Get data from expansion RAM |
-| `POKE` | ✗ | Set content of specific RAM location |
+| `POKE` | ✓ | Set content of memory-mapped location |
 | `RREG` | ✗ | Read contents of accumulator and registers |
 | `STASH` | ✗ | Move content of host RAM to expansion RAM |
 | `SWAP` | ✗ | Swap content of host RAM to expansion RAM |
 | `FRE` | ✓ | Return RAM bytes free (FRE(0)) |
-| `PEEK` | ✗ | Return content of specific RAM location |
+| `PEEK` | ✓ | Return content of memory-mapped location |
 | `POINTER` | ✗ | Return the address of a variable name |
 
 ## Graphics Management (21/21 - 100%)

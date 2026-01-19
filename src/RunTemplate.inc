@@ -611,7 +611,7 @@ begin
         // NOTE: Sound operations (bcSound*) are now handled by Group 11 (ExecuteSoundOp)
 
         // Special variables - fall back to slow path
-        bcLoadTI, bcLoadTIS, bcStoreTIS, bcLoadDTS, bcFre:
+        bcLoadTI, bcLoadTIS, bcStoreTIS, bcLoadDTS, bcFre, bcPeek, bcPoke:
           begin
             FPC := CurPC;
             ExecuteInstruction(Instr);

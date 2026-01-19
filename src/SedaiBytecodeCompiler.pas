@@ -268,6 +268,9 @@ begin
     ssaLoadER: Result := bcLoadER;
     ssaLoadERRS: Result := bcLoadERRS;
     ssaFre: Result := bcFre;
+    // Memory operations
+    ssaPeek: Result := bcPeek;
+    ssaPoke: Result := bcPoke;
     // DATA/READ/RESTORE
     ssaDataAdd: Result := bcDataAdd;
     ssaDataRead: Result := bcDataReadFloat;  // Type-specific bytecode selected in CompileInstruction

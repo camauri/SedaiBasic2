@@ -39,7 +39,8 @@ uses
   SedaiBytecodeSerializer, SedaiBytecodeCompiler,
   SedaiBytecodeDisassembler,
   SedaiSSATypes, SedaiSSA,
-  SedaiBasicKeywords, SedaiDebugger;
+  SedaiBasicKeywords, SedaiDebugger,
+  SedaiMemoryMapper, SedaiC128MemoryMapper;
 
 const
   SCROLLBACK_LINES = 1000;
@@ -259,6 +260,11 @@ type
     function GetWindowLines: Integer;
     function GetWindowCols: Integer;
     function GetScreenWidth: Integer;
+    // Screen memory access (PEEK/POKE compatibility - only for C128 text modes)
+    function GetCharAt(Col, Row: Integer): Byte;
+    procedure SetCharAt(Col, Row: Integer; Ch: Byte);
+    function GetColorAt(Col, Row: Integer): Byte;
+    procedure SetColorAt(Col, Row: Integer; Color: Byte);
     // SSHAPE/GSHAPE command support
     function SaveShape(X1, Y1, X2, Y2: Double): string;
     procedure LoadShape(const Data: string; X, Y: Double; Mode: Integer);
@@ -413,6 +419,11 @@ type
     function GetCurrentLine: string;
     function GetCharAtCursor: Char;  // Returns char under cursor (or space)
     function GetCell(Row, Col: Integer): TTextCell;  // Get cell with color attributes
+    procedure SetCell(Row, Col: Integer; const Cell: TTextCell);  // Set cell with color attributes
+    function GetCharAt(Col, Row: Integer): Byte;  // Get character at position (PETSCII)
+    procedure SetCharAt(Col, Row: Integer; Ch: Byte);  // Set character at position (PETSCII)
+    function GetColorAt(Col, Row: Integer): Byte;  // Get foreground color at position
+    procedure SetColorAt(Col, Row: Integer; Color: Byte);  // Set foreground color at position
 
     // Scrollback navigation
     procedure ScrollViewUp(NumLines: Integer = 1);
@@ -650,6 +661,11 @@ type
     function GetWindowLines: Integer;
     function GetWindowCols: Integer;
     function GetScreenWidth: Integer;
+    // Screen memory access (PEEK/POKE compatibility - only for C128 text modes)
+    function GetCharAt(Col, Row: Integer): Byte;
+    procedure SetCharAt(Col, Row: Integer; Ch: Byte);
+    function GetColorAt(Col, Row: Integer): Byte;
+    procedure SetColorAt(Col, Row: Integer; Color: Byte);
     // SSHAPE/GSHAPE command support
     function SaveShape(X1, Y1, X2, Y2: Double): string;
     procedure LoadShape(const Data: string; X, Y: Double; Mode: Integer);
@@ -1880,10 +1896,25 @@ begin
 end;
 
 procedure TVideoController.SetColorSourceDirect(Source, Color: Integer);
+var
+  PaletteIndex: Integer;
 begin
   // SETCOLOR: Sets color source directly (0-255)
   if (Source >= 0) and (Source <= 6) then
-    FColorSources[Source] := Color and $FF;
+  begin
+    PaletteIndex := Color and $FF;
+    FColorSources[Source] := PaletteIndex;
+    // Update corresponding palette indices based on source
+    case Source of
+      0: FBackgroundIndex := Byte(PaletteIndex);    // Background
+      1: FForegroundIndex := Byte(PaletteIndex);    // Foreground
+      2: FMulticolorIndex1 := Byte(PaletteIndex);   // Multicolor 1
+      3: FMulticolorIndex2 := Byte(PaletteIndex);   // Multicolor 2
+      4: FBorderColorIndex := Byte(PaletteIndex);   // Border
+      5: FTextColorIndex := Byte(PaletteIndex);     // Character color
+      6: FScreenColorIndex := Byte(PaletteIndex);   // 80-column background
+    end;
+  end;
 end;
 
 function TVideoController.GetColorSourceDirect(Source: Integer): Integer;
@@ -2106,6 +2137,32 @@ end;
 function TVideoController.GetScreenWidth: Integer;
 begin
   Result := FModeInfo.TextCols;
+end;
+
+// === Screen memory access (PEEK/POKE compatibility) ===
+// TVideoController doesn't have direct TextBuffer access.
+// These are stubs - actual implementation is in TConsoleOutputAdapter.
+
+function TVideoController.GetCharAt(Col, Row: Integer): Byte;
+begin
+  // Stub - handled by TConsoleOutputAdapter
+  Result := 32; // Space
+end;
+
+procedure TVideoController.SetCharAt(Col, Row: Integer; Ch: Byte);
+begin
+  // Stub - handled by TConsoleOutputAdapter
+end;
+
+function TVideoController.GetColorAt(Col, Row: Integer): Byte;
+begin
+  // Stub - handled by TConsoleOutputAdapter
+  Result := 0;
+end;
+
+procedure TVideoController.SetColorAt(Col, Row: Integer; Color: Byte);
+begin
+  // Stub - handled by TConsoleOutputAdapter
 end;
 
 // === SSHAPE command support (save bitmap area to string) ===
@@ -3158,6 +3215,44 @@ begin
     Result.BGIndex := FCurrentBGIndex;
     Result.Reverse := False;
   end;
+end;
+
+procedure TTextBuffer.SetCell(Row, Col: Integer; const Cell: TTextCell);
+begin
+  if (Row >= 0) and (Row < FRows) and (Col >= 0) and (Col < FCols) then
+    FCells[Row][Col] := Cell;
+end;
+
+function TTextBuffer.GetCharAt(Col, Row: Integer): Byte;
+begin
+  // Col, Row are 0-based (converted from screen memory address)
+  if (Row >= 0) and (Row < FRows) and (Col >= 0) and (Col < FCols) then
+    Result := Ord(FCells[Row][Col].Ch)
+  else
+    Result := 32; // Space for out-of-bounds
+end;
+
+procedure TTextBuffer.SetCharAt(Col, Row: Integer; Ch: Byte);
+begin
+  // Col, Row are 0-based (converted from screen memory address)
+  if (Row >= 0) and (Row < FRows) and (Col >= 0) and (Col < FCols) then
+    FCells[Row][Col].Ch := Chr(Ch);
+end;
+
+function TTextBuffer.GetColorAt(Col, Row: Integer): Byte;
+begin
+  // Returns foreground color at position
+  if (Row >= 0) and (Row < FRows) and (Col >= 0) and (Col < FCols) then
+    Result := FCells[Row][Col].FGIndex
+  else
+    Result := FCurrentFGIndex;
+end;
+
+procedure TTextBuffer.SetColorAt(Col, Row: Integer; Color: Byte);
+begin
+  // Sets foreground color at position
+  if (Row >= 0) and (Row < FRows) and (Col >= 0) and (Col < FCols) then
+    FCells[Row][Col].FGIndex := Color and $0F;
 end;
 
 procedure TTextBuffer.PutChar(Ch: Char);
@@ -4379,6 +4474,38 @@ begin
     Result := 40;
 end;
 
+// === Screen memory access (PEEK/POKE compatibility) ===
+// Memory is always accessible - the graphics mode only affects display.
+// This maps to the 40x25 text buffer used by GRAPHIC 0, 2, 4.
+
+function TConsoleOutputAdapter.GetCharAt(Col, Row: Integer): Byte;
+begin
+  if Assigned(FTextBuffer) then
+    Result := FTextBuffer.GetCharAt(Col, Row)
+  else
+    Result := 32; // Space
+end;
+
+procedure TConsoleOutputAdapter.SetCharAt(Col, Row: Integer; Ch: Byte);
+begin
+  if Assigned(FTextBuffer) then
+    FTextBuffer.SetCharAt(Col, Row, Ch);
+end;
+
+function TConsoleOutputAdapter.GetColorAt(Col, Row: Integer): Byte;
+begin
+  if Assigned(FTextBuffer) then
+    Result := FTextBuffer.GetColorAt(Col, Row)
+  else
+    Result := 0;
+end;
+
+procedure TConsoleOutputAdapter.SetColorAt(Col, Row: Integer; Color: Byte);
+begin
+  if Assigned(FTextBuffer) then
+    FTextBuffer.SetColorAt(Col, Row, Color);
+end;
+
 // === SSHAPE/GSHAPE command support ===
 function TConsoleOutputAdapter.SaveShape(X1, Y1, X2, Y2: Double): string;
 begin
@@ -4469,6 +4596,8 @@ begin
   FBytecodeVM.SetOutputDevice(FVideoController);
   // Use dedicated program input handler for VM (NOT the console input handler)
   FBytecodeVM.SetInputDevice(FProgramInputHandler);
+  // Create and set memory mapper for PEEK/POKE support
+  FBytecodeVM.SetMemoryMapper(TC128MemoryMapper.Create(FVideoController, nil));
 
   FImmediateCompiler := TImmediateCompiler.Create;
 
@@ -7697,10 +7826,11 @@ procedure TSedaiNewConsole.SaveHistory;
 var
   HistPath, HistDir: string;
   F: TextFile;
-  i: Integer;
 begin
   HistPath := GetHistoryFilePath;
   if HistPath = '' then
+    Exit;
+  if FHistoryCount = 0 then
     Exit;
 
   // Create directory if needed
@@ -7716,10 +7846,14 @@ begin
 
   try
     AssignFile(F, HistPath);
-    Rewrite(F);
+    // Append only the last command for efficiency
+    if FileExists(HistPath) then
+      Append(F)
+    else
+      Rewrite(F);
     try
-      for i := 0 to FHistoryCount - 1 do
-        WriteLn(F, FInputHistory[i]);
+      // Write only the last entry (the one just added)
+      WriteLn(F, FInputHistory[FHistoryCount - 1]);
     finally
       CloseFile(F);
     end;

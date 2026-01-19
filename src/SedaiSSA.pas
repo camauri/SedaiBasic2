@@ -1224,6 +1224,26 @@ begin
           // Emit ssaFre: Dest=result
           EmitInstruction(ssaFre, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
+        else if FuncName = 'PEEK' then
+        begin
+          // PEEK(address) returns value at memory-mapped address
+          // Process the address argument
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          else if ArgListNode <> nil then
+            ProcessExpression(ArgListNode, ArgValue)
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          // Ensure address is an integer register
+          ArgReg := EnsureIntRegister(ArgValue);
+
+          // Allocate result register (integer - returns byte value 0-255)
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+
+          // Emit ssaPeek: Dest=result, Src1=address
+          EmitInstruction(ssaPeek, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
         // === STRING FUNCTIONS ===
         else if (FuncName = 'LEN') then
         begin
@@ -6870,6 +6890,7 @@ var
   SecondsVal: TSSAValue;  // For SLEEP command
   KeyNumVal, KeyTextVal, KeyNumReg, KeyTextReg: TSSAValue;  // For KEY command
   ExprResult, LineNumReg: TSSAValue;  // For TRAP command
+  AddrVal, AddrReg, ValueReg: TSSAValue;  // For POKE command
 begin
   if Node = nil then Exit;
 
@@ -7192,6 +7213,20 @@ begin
       // CLR - clear all variables
       EmitInstruction(ssaClear, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    antPoke:
+    begin
+      // POKE address, value - write value to memory-mapped address
+      // Child[0] = address expression, Child[1] = value expression
+      if Node.ChildCount >= 2 then
+      begin
+        ProcessExpression(Node.GetChild(0), AddrVal);
+        ProcessExpression(Node.GetChild(1), ExprResult);
+        AddrReg := EnsureIntRegister(AddrVal);
+        ValueReg := EnsureIntRegister(ExprResult);
+        // Emit ssaPoke: Src1=address, Src2=value
+        EmitInstruction(ssaPoke, MakeSSAValue(svkNone), AddrReg, ValueReg, MakeSSAValue(svkNone));
+      end;
     end;
     antProgram, antStatement, antThen, antElse:
     begin

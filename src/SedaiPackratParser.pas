@@ -1642,18 +1642,44 @@ end;
 function TPackratParser.ParseMemoryStatement: TASTNode;
 var
   Token: TLexerToken;
-  Params: TASTNode;
+  CmdName: string;
+  Param1, Param2: TASTNode;
 begin
   Token := Context.CurrentToken;
-  Result := TASTNode.Create(antStatement, Token);
-  Context.Advance; // Consume memory command
+  CmdName := UpperCase(Token.Value);
 
-  // Parse parameters as single expression list
-  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+  // Select appropriate node type based on command
+  if CmdName = 'POKE' then
   begin
-    Params := ParseExpressionList(ttSeparParam);
-    if Assigned(Params) then
-      Result.AddChild(Params);
+    Result := TASTNode.Create(antPoke, Token);
+    Context.Advance; // Consume POKE
+
+    // POKE address, value - parse two parameters
+    Param1 := ParseExpression;
+    if Assigned(Param1) then
+      Result.AddChild(Param1);
+
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance; // Consume comma
+      Param2 := ParseExpression;
+      if Assigned(Param2) then
+        Result.AddChild(Param2);
+    end;
+  end
+  else
+  begin
+    // Other memory commands (BANK, FETCH, etc.) - use generic handling
+    Result := TASTNode.Create(antStatement, Token);
+    Context.Advance; // Consume memory command
+
+    // Parse parameters as single expression list
+    if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+    begin
+      Param1 := ParseExpressionList(ttSeparParam);
+      if Assigned(Param1) then
+        Result.AddChild(Param1);
+    end;
   end;
 
   DoNodeCreated(Result);

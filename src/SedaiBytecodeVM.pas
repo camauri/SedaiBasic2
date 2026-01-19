@@ -33,7 +33,8 @@ interface
 uses
   Classes, SysUtils, Math, Variants, StrUtils,
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
-  SedaiConsoleBehavior, SedaiDebugger, SedaiExecutorErrors
+  SedaiConsoleBehavior, SedaiDebugger, SedaiExecutorErrors,
+  SedaiMemoryMapper
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
   {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioTypes, SedaiAudioBackend, SedaiSIDEvo{$ENDIF};
 
@@ -100,6 +101,7 @@ type
     FCallStackPtr: Integer;
     FOutputDevice: IOutputDevice;
     FInputDevice: IInputDevice;
+    FMemoryMapper: IMemoryMapper;  // Memory-mapped PEEK/POKE support
     FConsoleBehavior: TConsoleBehavior;
     FOwnsConsoleBehavior: Boolean;
     FCursorCol: Integer;  // Track cursor column for TAB zones
@@ -195,6 +197,7 @@ type
     procedure LoadProgram(Program_: TBytecodeProgram);
     procedure SetOutputDevice(Device: IOutputDevice);
     procedure SetInputDevice(Device: IInputDevice);
+    procedure SetMemoryMapper(Mapper: IMemoryMapper);
     procedure SetConsoleBehavior(ABehavior: TConsoleBehavior; OwnsBehavior: Boolean = False);
     procedure ApplyPreset(Preset: TConsolePreset);
     function GetConsoleBehavior: TConsoleBehavior;
@@ -1384,6 +1387,11 @@ end;
 procedure TBytecodeVM.SetInputDevice(Device: IInputDevice);
 begin
   FInputDevice := Device;
+end;
+
+procedure TBytecodeVM.SetMemoryMapper(Mapper: IMemoryMapper);
+begin
+  FMemoryMapper := Mapper;
 end;
 
 procedure TBytecodeVM.SetConsoleBehavior(ABehavior: TConsoleBehavior; OwnsBehavior: Boolean);
@@ -3062,6 +3070,19 @@ begin
       FIntRegs[Instr.Dest] := FLastErrorCode;
     7: // bcLoadERRS - return last error message (variable form)
       FStringRegs[Instr.Dest] := FLastErrorMessage;
+    8: // bcPeek - read from memory-mapped location
+      begin
+        if Assigned(FMemoryMapper) then
+          FIntRegs[Instr.Dest] := FMemoryMapper.Peek(FIntRegs[Instr.Src1])
+        else
+          FIntRegs[Instr.Dest] := 0;  // No memory mapper = return 0
+      end;
+    9: // bcPoke - write to memory-mapped location
+      begin
+        if Assigned(FMemoryMapper) then
+          FMemoryMapper.Poke(FIntRegs[Instr.Src1], FIntRegs[Instr.Src2]);
+        // If no memory mapper, silently ignore (like real hardware)
+      end;
   else
     raise Exception.CreateFmt('Unknown special variable opcode %d at PC=%d', [Instr.OpCode, FPC]);
   end;

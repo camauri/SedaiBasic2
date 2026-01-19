@@ -124,6 +124,9 @@ type
     ssaLoadER,         // ER: Load last error code
     ssaLoadERRS,       // ERR$: Load last error message (variable, not function)
     ssaFre,            // FRE(x): Return available memory in bytes
+    // Memory operations
+    ssaPeek,           // PEEK(address): Read from memory-mapped location
+    ssaPoke,           // POKE address, value: Write to memory-mapped location
     // Data handling
     ssaDataAdd,        // Add value to DATA pool
     ssaDataRead,       // Read next value from DATA pool into dest

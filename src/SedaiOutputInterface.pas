@@ -175,6 +175,12 @@ type
     function GetWindowCols: Integer;
     function GetScreenWidth: Integer;
 
+    // Screen memory access (for PEEK/POKE compatibility)
+    function GetCharAt(Col, Row: Integer): Byte;      // Read character at position (PETSCII)
+    procedure SetCharAt(Col, Row: Integer; Ch: Byte); // Write character at position (PETSCII)
+    function GetColorAt(Col, Row: Integer): Byte;     // Read color at position
+    procedure SetColorAt(Col, Row: Integer; Color: Byte); // Write color at position
+
     // Shape save/load
     function SaveShape(X1, Y1, X2, Y2: Double): string;
     procedure LoadShape(const Data: string; X, Y: Double; Mode: Integer);

@@ -88,7 +88,9 @@ uses
   // Runner and Serializer (for .basc support)
   SedaiRunner, SedaiBytecodeSerializer,
   // Interactive console
-  SedaiGraphicsModes, SedaiNewConsole;
+  SedaiGraphicsModes, SedaiNewConsole,
+  // Memory mapper for PEEK/POKE
+  SedaiMemoryMapper, SedaiC128MemoryMapper;
 
 // Include version information (must be after uses, contains const declarations)
 {$I Version.inc}
@@ -334,6 +336,8 @@ begin
         try
           VM.SetOutputDevice(Output);
           VM.SetInputDevice(Input);
+          // Create and set memory mapper for PEEK/POKE support
+          VM.SetMemoryMapper(TC128MemoryMapper.Create(Output, nil));
           VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
           VM.LoadProgram(BytecodeProgram);
 
