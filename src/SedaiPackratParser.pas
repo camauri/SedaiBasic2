@@ -1726,6 +1726,10 @@ begin
     Result := TASTNode.Create(antGShape, Token)
   else if CmdName = 'GLIST' then
     Result := TASTNode.Create(antGList, Token)
+  else if CmdName = 'PLOAD' then
+    Result := TASTNode.Create(antPLoad, Token)
+  else if CmdName = 'PSAVE' then
+    Result := TASTNode.Create(antPSave, Token)
   else
     Result := TASTNode.Create(antStatement, Token);
 
@@ -1761,6 +1765,10 @@ begin
     MaxParams := 4  // GSHAPE A$, x, y [,mode]
   else if CmdName = 'GLIST' then
     MaxParams := 0  // GLIST (no parameters)
+  else if CmdName = 'PLOAD' then
+    MaxParams := 1  // PLOAD "filename"
+  else if CmdName = 'PSAVE' then
+    MaxParams := 1  // PSAVE "filename"
   else
     MaxParams := 5;
 

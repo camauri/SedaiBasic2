@@ -302,7 +302,7 @@ begin
     // Graphics operations - always live (visible side effects on screen)
     ssaGraphicSetMode, ssaGraphicBox, ssaGraphicCircle, ssaGraphicDraw, ssaGraphicLocate,
     ssaGraphicColor, ssaSetColor, ssaGraphicWidth, ssaGraphicScale, ssaGraphicPaint, ssaGraphicWindow,
-    ssaGraphicSShape, ssaGraphicGShape, ssaGraphicGList, ssaScnClr:
+    ssaGraphicSShape, ssaGraphicGShape, ssaGraphicGList, ssaPLoad, ssaPSave, ssaScnClr:
       Result := True;
 
     // Sound operations - always live (audible side effects)

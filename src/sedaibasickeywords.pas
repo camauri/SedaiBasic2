@@ -206,6 +206,8 @@ const
   kCOLOR   = 'COLOR';
   kSETCOLOR = 'SETCOLOR';  // SETCOLOR(source, color) - set color (0-255)
   kGETCOLOR = 'GETCOLOR';  // GETCOLOR(source) - return color index (0-255)
+  kPLOAD   = 'PLOAD';    // PLOAD "filename" - Load palette from JSON file
+  kPSAVE   = 'PSAVE';    // PSAVE "filename" - Save palette to JSON file
   kGLIST   = 'GLIST';    // List available SDL2 video modes
   kMORE    = 'MORE';     // Paginate output (pipe modifier)
   kGRAPHIC = 'GRAPHIC';

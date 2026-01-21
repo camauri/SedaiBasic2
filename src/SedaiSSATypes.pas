@@ -104,6 +104,8 @@ type
     ssaGraphicSShape,  // SSHAPE A$, x1, y1 [,x2, y2]: Save bitmap area to string
     ssaGraphicGShape,  // GSHAPE A$, x, y [,mode]: Load string to bitmap
     ssaGraphicGList,   // GLIST: List SDL2 video modes
+    ssaPLoad,          // PLOAD "filename": Load palette from JSON file
+    ssaPSave,          // PSAVE "filename": Save palette to JSON file
     ssaScnClr,         // SCNCLR [mode]: Clear screen (text or graphics)
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n

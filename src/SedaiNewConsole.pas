@@ -223,8 +223,12 @@ type
     procedure EnablePalette(Enable: Boolean);
     function IsPaletteEnabled: Boolean;
     procedure SetPaletteColor(Index: TPaletteIndex; RGB: UInt32);
+    procedure SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
     function GetPaletteColor(Index: TPaletteIndex): UInt32;
     procedure ResetPalette;
+    function LoadPaletteFromJSON(const FileName: string): Boolean;
+    function SavePaletteToJSON(const FileName: string): Boolean;
+    function GetLastPaletteError: string;
 
     // Shape drawing (stubs - not supported in this implementation)
     procedure DrawBox(X1, Y1, X2, Y2: Integer; Angle: Double = 0);
@@ -618,8 +622,12 @@ type
     procedure EnablePalette(Enable: Boolean);
     function IsPaletteEnabled: Boolean;
     procedure SetPaletteColor(Index: TPaletteIndex; RGB: UInt32);
+    procedure SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
     function GetPaletteColor(Index: TPaletteIndex): UInt32;
     procedure ResetPalette;
+    function LoadPaletteFromJSON(const FileName: string): Boolean;
+    function SavePaletteToJSON(const FileName: string): Boolean;
+    function GetLastPaletteError: string;
 
     // Shape drawing (stubs - not supported in this implementation)
     procedure DrawBox(X1, Y1, X2, Y2: Integer; Angle: Double = 0);
@@ -2545,6 +2553,36 @@ begin
     FGraphicsMemory.ResetPalette;
 end;
 
+procedure TVideoController.SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
+begin
+  if FGraphicsMemory <> nil then
+    FGraphicsMemory.SetPaletteColorRGBA(Index, R, G, B, A);
+end;
+
+function TVideoController.LoadPaletteFromJSON(const FileName: string): Boolean;
+begin
+  if FGraphicsMemory <> nil then
+    Result := FGraphicsMemory.LoadPaletteFromJSON(FileName)
+  else
+    Result := False;
+end;
+
+function TVideoController.SavePaletteToJSON(const FileName: string): Boolean;
+begin
+  if FGraphicsMemory <> nil then
+    Result := FGraphicsMemory.SavePaletteToJSON(FileName)
+  else
+    Result := False;
+end;
+
+function TVideoController.GetLastPaletteError: string;
+begin
+  if FGraphicsMemory <> nil then
+    Result := FGraphicsMemory.GetLastPaletteError
+  else
+    Result := 'Graphics memory not initialized';
+end;
+
 // Shape drawing stubs - TVideoController
 procedure TVideoController.DrawBox(X1, Y1, X2, Y2: Integer; Angle: Double);
 begin
@@ -4315,6 +4353,40 @@ begin
   // Delegate to VideoController for graphics operations
   if Assigned(FVideoController) then
     FVideoController.ResetPalette;
+end;
+
+procedure TConsoleOutputAdapter.SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
+begin
+  // Delegate to VideoController for graphics operations
+  if Assigned(FVideoController) then
+    FVideoController.SetPaletteColorRGBA(Index, R, G, B, A);
+end;
+
+function TConsoleOutputAdapter.LoadPaletteFromJSON(const FileName: string): Boolean;
+begin
+  // Delegate to VideoController for graphics operations
+  if Assigned(FVideoController) then
+    Result := FVideoController.LoadPaletteFromJSON(FileName)
+  else
+    Result := False;
+end;
+
+function TConsoleOutputAdapter.SavePaletteToJSON(const FileName: string): Boolean;
+begin
+  // Delegate to VideoController for graphics operations
+  if Assigned(FVideoController) then
+    Result := FVideoController.SavePaletteToJSON(FileName)
+  else
+    Result := False;
+end;
+
+function TConsoleOutputAdapter.GetLastPaletteError: string;
+begin
+  // Delegate to VideoController for graphics operations
+  if Assigned(FVideoController) then
+    Result := FVideoController.GetLastPaletteError
+  else
+    Result := 'Video controller not initialized';
 end;
 
 // Shape drawing stubs - TConsoleOutputAdapter

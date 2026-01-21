@@ -111,6 +111,8 @@ type
     procedure ProcessSShape(Node: TASTNode);
     procedure ProcessGShape(Node: TASTNode);
     procedure ProcessGList(Node: TASTNode);
+    procedure ProcessPLoad(Node: TASTNode);
+    procedure ProcessPSave(Node: TASTNode);
     // Sound commands
     procedure ProcessVol(Node: TASTNode);
     procedure ProcessSound(Node: TASTNode);
@@ -4357,56 +4359,63 @@ begin
                  SourceReg, ColorReg, MakeSSAValue(svkNone));
 end;
 
-{ ProcessSetColor - Handle SETCOLOR command for setting screen area colors (0-based)
-  Syntax: SETCOLOR source, color
-  Source: 0=background, 1=foreground, 2=multicolor1, 3=multicolor2,
-          4=border, 5=character, 6=80col-background
-  Color: 0-15 (standard palette) or 0-255 (extended palette)
+{ ProcessSetColor - Handle SETCOLOR command for modifying palette entries
+  Syntax: SETCOLOR index, R, G, B [, A]
+  Index: 0-255 (palette entry index)
+  R, G, B: 0-255 (color components)
+  A: 0-255 (alpha, optional, defaults to 255)
 }
 procedure TSSAGenerator.ProcessSetColor(Node: TASTNode);
 var
-  SourceVal, ColorVal: TSSAValue;
-  SourceReg, ColorReg: TSSAValue;
+  IndexVal, RVal, GVal, BVal, AVal: TSSAValue;
+  IndexReg, RReg, GReg, BReg, AReg: TSSAValue;
   TempReg: Integer;
+  Instr: TSSAInstruction;
 begin
   if FCurrentBlock = nil then Exit;
-  if Node.ChildCount < 2 then
+  if Node.ChildCount < 4 then
   begin
-    WriteLn(StdErr, 'SETCOLOR: requires source, color');
+    WriteLn(StdErr, 'SETCOLOR: requires index, R, G, B [, A]');
     Exit;
   end;
 
-  // Process source number
-  ProcessExpression(Node.GetChild(0), SourceVal);
-  if SourceVal.Kind = svkConstInt then
-  begin
-    TempReg := FProgram.AllocRegister(srtInt);
-    SourceReg := MakeSSARegister(srtInt, TempReg);
-    EmitInstruction(ssaLoadConstInt, SourceReg, SourceVal,
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-  end
-  else if SourceVal.Kind = svkRegister then
-    SourceReg := SourceVal
-  else
-    SourceReg := MakeSSAValue(svkNone);
+  // Process palette index
+  ProcessExpression(Node.GetChild(0), IndexVal);
+  IndexReg := EnsureIntRegister(IndexVal);
 
-  // Process color value
-  ProcessExpression(Node.GetChild(1), ColorVal);
-  if ColorVal.Kind = svkConstInt then
-  begin
-    TempReg := FProgram.AllocRegister(srtInt);
-    ColorReg := MakeSSARegister(srtInt, TempReg);
-    EmitInstruction(ssaLoadConstInt, ColorReg, ColorVal,
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-  end
-  else if ColorVal.Kind = svkRegister then
-    ColorReg := ColorVal
-  else
-    ColorReg := MakeSSAValue(svkNone);
+  // Process R component
+  ProcessExpression(Node.GetChild(1), RVal);
+  RReg := EnsureIntRegister(RVal);
 
-  // Emit ssaSetColor: Src1=source, Src2=color (0-based, no conversion)
-  EmitInstruction(ssaSetColor, MakeSSAValue(svkNone),
-                 SourceReg, ColorReg, MakeSSAValue(svkNone));
+  // Process G component
+  ProcessExpression(Node.GetChild(2), GVal);
+  GReg := EnsureIntRegister(GVal);
+
+  // Process B component
+  ProcessExpression(Node.GetChild(3), BVal);
+  BReg := EnsureIntRegister(BVal);
+
+  // Process optional A (alpha) component - defaults to 255
+  if Node.ChildCount >= 5 then
+  begin
+    ProcessExpression(Node.GetChild(4), AVal);
+    AReg := EnsureIntRegister(AVal);
+  end
+  else
+  begin
+    // Default alpha = 255
+    TempReg := FProgram.AllocRegister(srtInt);
+    AReg := MakeSSARegister(srtInt, TempReg);
+    EmitInstruction(ssaLoadConstInt, AReg, MakeSSAConstInt(255),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Emit ssaSetColor: Src1=index, Src2=R, Dest=G (packed in Immediate with B and A)
+  // We use Immediate to store additional values: low word = B, high word = A
+  EmitInstruction(ssaSetColor, GReg, IndexReg, RReg, BReg);
+  // Add alpha as phi source to the last instruction
+  Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+  Instr.AddPhiSource(AReg, nil);
 end;
 
 { ProcessWidth - Handle WIDTH command for setting line width
@@ -4931,6 +4940,54 @@ begin
   // GLIST has no parameters
   EmitInstruction(ssaGraphicGList, MakeSSAValue(svkNone),
                  MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+{ ProcessPLoad - Handle PLOAD command for loading palette from JSON file
+  Syntax: PLOAD "filename"
+}
+procedure TSSAGenerator.ProcessPLoad(Node: TASTNode);
+var
+  FileNameVal, FileNameReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  if Node.ChildCount < 1 then
+  begin
+    WriteLn(StdErr, 'PLOAD requires a filename');
+    Exit;
+  end;
+
+  // Get filename string
+  ProcessExpression(Node.GetChild(0), FileNameVal);
+  FileNameReg := EnsureStringRegister(FileNameVal);
+
+  // Emit PLOAD instruction
+  EmitInstruction(ssaPLoad, MakeSSAValue(svkNone),
+                 FileNameReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+{ ProcessPSave - Handle PSAVE command for saving palette to JSON file
+  Syntax: PSAVE "filename"
+}
+procedure TSSAGenerator.ProcessPSave(Node: TASTNode);
+var
+  FileNameVal, FileNameReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  if Node.ChildCount < 1 then
+  begin
+    WriteLn(StdErr, 'PSAVE requires a filename');
+    Exit;
+  end;
+
+  // Get filename string
+  ProcessExpression(Node.GetChild(0), FileNameVal);
+  FileNameReg := EnsureStringRegister(FileNameVal);
+
+  // Emit PSAVE instruction
+  EmitInstruction(ssaPSave, MakeSSAValue(svkNone),
+                 FileNameReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
 { ============================================================================
@@ -6989,6 +7046,8 @@ begin
     antSShape: ProcessSShape(Node);
     antGShape: ProcessGShape(Node);
     antGList: ProcessGList(Node);
+    antPLoad: ProcessPLoad(Node);
+    antPSave: ProcessPSave(Node);
     // Sound commands
     antVol: ProcessVol(Node);
     antSound: ProcessSound(Node);

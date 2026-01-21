@@ -127,8 +127,14 @@ type
     procedure EnablePalette(Enable: Boolean);
     function IsPaletteEnabled: Boolean;
     procedure SetPaletteColor(Index: TPaletteIndex; RGB: UInt32);
+    procedure SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
     function GetPaletteColor(Index: TPaletteIndex): UInt32;
     procedure ResetPalette;
+
+    // Palette file operations (JSON format)
+    function LoadPaletteFromJSON(const FileName: string): Boolean;
+    function SavePaletteToJSON(const FileName: string): Boolean;
+    function GetLastPaletteError: string;
 
     // Shape drawing (extensible graphics)
     // Simple version: uses current style state

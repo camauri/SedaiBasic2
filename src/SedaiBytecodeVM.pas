@@ -1362,6 +1362,29 @@ begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // x
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // y
         end;
+
+        // bcSetColor: Src1=index(int), Src2=R(int), Dest=G(int)
+        // Immediate: B(12) | A(12)
+        bcSetColor:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // palette index
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // R
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // G
+          if (Instr.Immediate and $FFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFF;  // B
+          if ((Instr.Immediate shr 12) and $FFF) > MaxIntReg then MaxIntReg := (Instr.Immediate shr 12) and $FFF;  // A
+        end;
+
+        // bcPLoad: Src1=filename string reg
+        bcPLoad:
+        begin
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;   // filename
+        end;
+
+        // bcPSave: Src1=filename string reg
+        bcPSave:
+        begin
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;   // filename
+        end;
       end;
     end;
   end;
@@ -3274,17 +3297,49 @@ begin
       end
       else
         FIntRegs[Instr.Dest] := 0;
-    19: // bcSetColor - SETCOLOR source, color
+    19: // bcSetColor - SETCOLOR index, R, G, B [, A]
       if Assigned(FOutputDevice) then
-        FOutputDevice.SetColorSource(FIntRegs[Instr.Src1], FIntRegs[Instr.Src2]);
-    20: // bcGetColor - GETCOLOR(source)
+      begin
+        // Src1=index, Src2=R, Dest=G, Immediate: B(12) | A(12)
+        FOutputDevice.SetPaletteColorRGBA(
+          FIntRegs[Instr.Src1],                              // index
+          Byte(FIntRegs[Instr.Src2]),                        // R
+          Byte(FIntRegs[Instr.Dest]),                        // G
+          Byte(FIntRegs[Instr.Immediate and $FFF]),          // B
+          Byte(FIntRegs[(Instr.Immediate shr 12) and $FFF])  // A
+        );
+      end;
+    20: // bcGetColor - GETCOLOR(index)
+      // Returns RGBA value from palette at given index (0-255)
       if Assigned(FOutputDevice) then
-        FIntRegs[Instr.Dest] := FOutputDevice.GetColorSourceDirect(FIntRegs[Instr.Src1])
+        FIntRegs[Instr.Dest] := Int64(FOutputDevice.GetPaletteColor(FIntRegs[Instr.Src1]))
       else
         FIntRegs[Instr.Dest] := 0;
     21: // bcScnClr - SCNCLR [mode]
       if Assigned(FOutputDevice) then
         FOutputDevice.ClearScreen(FIntRegs[Instr.Src1]);
+    22: // bcPLoad - PLOAD "filename"
+      if Assigned(FOutputDevice) then
+      begin
+        if not FOutputDevice.LoadPaletteFromJSON(FStringRegs[Instr.Src1]) then
+        begin
+          // Set error state for BASIC error handling
+          FLastErrorMessage := FOutputDevice.GetLastPaletteError;
+          FLastErrorCode := 100;  // Palette error code
+          FLastErrorLine := FProgram.GetSourceLine(FPC);
+        end;
+      end;
+    23: // bcPSave - PSAVE "filename"
+      if Assigned(FOutputDevice) then
+      begin
+        if not FOutputDevice.SavePaletteToJSON(FStringRegs[Instr.Src1]) then
+        begin
+          // Set error state for BASIC error handling
+          FLastErrorMessage := FOutputDevice.GetLastPaletteError;
+          FLastErrorCode := 101;  // Palette save error code
+          FLastErrorLine := FProgram.GetSourceLine(FPC);
+        end;
+      end;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, FPC]);
   end;

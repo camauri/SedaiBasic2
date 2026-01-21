@@ -515,7 +515,9 @@ begin
     // === GROUP 6: Sound operations ===
     bcSoundPlay,  // Src1 = music string
     // === GROUP 10: Graphics ===
-    bcGraphicGShape:  // GSHAPE A$, x, y: A$ is string in Src1
+    bcGraphicGShape,  // GSHAPE A$, x, y: A$ is string in Src1
+    bcPLoad,          // PLOAD "filename": Src1 = filename string
+    bcPSave:          // PSAVE "filename": Src1 = filename string
       Result := True;
   else
     Result := False;

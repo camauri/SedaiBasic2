@@ -28,7 +28,7 @@ unit SedaiGraphicsMemory;
 interface
 
 uses
-  Classes, SysUtils, Math,
+  Classes, SysUtils, Math, fpjson, jsonparser,
   SedaiOutputInterface, SedaiGraphicsConfig, SedaiLogging;
 
 type
@@ -69,6 +69,7 @@ type
     FState: TGraphicsState;
     FPalette: array[0..255] of UInt32;
     FDefaultC64Palette: array[0..15] of UInt32;
+    FLastPaletteError: string;
 
     procedure InitC64Palette;
     procedure InitExtendedPalette;
@@ -100,10 +101,16 @@ type
     procedure EnablePalette(Enable: Boolean);
     function IsPaletteEnabled: Boolean;
     procedure SetPaletteColor(Index: TPaletteIndex; RGB: UInt32);
+    procedure SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
     function GetPaletteColor(Index: TPaletteIndex): UInt32;
     procedure ResetPalette;
     function PaletteToRGB(Index: TPaletteIndex): UInt32;
     function RGBToPaletteIndex(RGB: UInt32): TPaletteIndex;
+
+    // Palette file operations (JSON format)
+    function LoadPaletteFromJSON(const FileName: string): Boolean;
+    function SavePaletteToJSON(const FileName: string): Boolean;
+    function GetLastPaletteError: string;
 
     procedure SetPixel(X, Y: Integer; RGB: UInt32); overload;
     procedure SetPixel(X, Y: Integer; PaletteIndex: TPaletteIndex); overload;
@@ -524,9 +531,198 @@ begin
   FPalette[Index] := RGB or $FF000000; // Forza alpha = 255
 end;
 
+procedure TGraphicsMemory.SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
+begin
+  // Store as RGBA (R in high byte for SDL2 compatibility)
+  FPalette[Index] := (R shl 24) or (G shl 16) or (B shl 8) or A;
+end;
+
 function TGraphicsMemory.GetPaletteColor(Index: TPaletteIndex): UInt32;
 begin
   Result := FPalette[Index];
+end;
+
+function TGraphicsMemory.GetLastPaletteError: string;
+begin
+  Result := FLastPaletteError;
+end;
+
+function TGraphicsMemory.LoadPaletteFromJSON(const FileName: string): Boolean;
+var
+  JSONData: TJSONData;
+  JSONObject: TJSONObject;
+  ColorsArray: TJSONArray;
+  ColorObj: TJSONObject;
+  FileContent: TStringList;
+  BackupPalette: array[0..255] of UInt32;
+  i, Index, R, G, B, A: Integer;
+begin
+  Result := False;
+  FLastPaletteError := '';
+
+  // Check if file exists
+  if not FileExists(FileName) then
+  begin
+    FLastPaletteError := 'FILE NOT FOUND';
+    Exit;
+  end;
+
+  // Backup current palette for rollback on error
+  Move(FPalette[0], BackupPalette[0], 256 * SizeOf(UInt32));
+
+  FileContent := TStringList.Create;
+  try
+    try
+      FileContent.LoadFromFile(FileName);
+      JSONData := GetJSON(FileContent.Text);
+    except
+      on E: Exception do
+      begin
+        FLastPaletteError := 'PALETTE LOAD ERROR';
+        Logger.Error('LoadPaletteFromJSON: JSON parse error: ' + E.Message);
+        Exit;
+      end;
+    end;
+
+    try
+      if not (JSONData is TJSONObject) then
+      begin
+        FLastPaletteError := 'PALETTE LOAD ERROR';
+        Logger.Error('LoadPaletteFromJSON: JSON root is not an object');
+        Exit;
+      end;
+
+      JSONObject := TJSONObject(JSONData);
+
+      // Check for required "colors" array
+      if JSONObject.Find('colors') = nil then
+      begin
+        FLastPaletteError := 'PALETTE LOAD ERROR';
+        Logger.Error('LoadPaletteFromJSON: Missing "colors" array');
+        Exit;
+      end;
+
+      if not (JSONObject.Find('colors') is TJSONArray) then
+      begin
+        FLastPaletteError := 'PALETTE LOAD ERROR';
+        Logger.Error('LoadPaletteFromJSON: "colors" is not an array');
+        Exit;
+      end;
+
+      ColorsArray := TJSONArray(JSONObject.Find('colors'));
+
+      // Parse each color entry
+      for i := 0 to ColorsArray.Count - 1 do
+      begin
+        if not (ColorsArray.Items[i] is TJSONObject) then
+          Continue;
+
+        ColorObj := TJSONObject(ColorsArray.Items[i]);
+
+        // Get required fields
+        if ColorObj.Find('index') = nil then
+          Continue;
+
+        Index := ColorObj.Integers['index'];
+        if (Index < 0) or (Index > 255) then
+        begin
+          FLastPaletteError := Format('PALETTE COLOR ERROR ON %d', [i]);
+          Move(BackupPalette[0], FPalette[0], 256 * SizeOf(UInt32));
+          Exit;
+        end;
+
+        // Get color components (with defaults)
+        R := 0; G := 0; B := 0; A := 255;
+        if ColorObj.Find('r') <> nil then R := ColorObj.Integers['r'];
+        if ColorObj.Find('g') <> nil then G := ColorObj.Integers['g'];
+        if ColorObj.Find('b') <> nil then B := ColorObj.Integers['b'];
+        if ColorObj.Find('a') <> nil then A := ColorObj.Integers['a'];
+
+        // Validate ranges
+        if (R < 0) or (R > 255) or (G < 0) or (G > 255) or
+           (B < 0) or (B > 255) or (A < 0) or (A > 255) then
+        begin
+          FLastPaletteError := Format('PALETTE COLOR ERROR ON %d', [i]);
+          Move(BackupPalette[0], FPalette[0], 256 * SizeOf(UInt32));
+          Exit;
+        end;
+
+        // Store color (RGBA format)
+        FPalette[Index] := (Byte(R) shl 24) or (Byte(G) shl 16) or (Byte(B) shl 8) or Byte(A);
+      end;
+
+      Result := True;
+      Logger.Info(Format('LoadPaletteFromJSON: Loaded %d colors from %s', [ColorsArray.Count, FileName]));
+
+    finally
+      JSONData.Free;
+    end;
+  finally
+    FileContent.Free;
+  end;
+end;
+
+function TGraphicsMemory.SavePaletteToJSON(const FileName: string): Boolean;
+var
+  JSONObject, ColorObj: TJSONObject;
+  ColorsArray: TJSONArray;
+  FileContent: TStringList;
+  i: Integer;
+  R, G, B, A: Byte;
+begin
+  Result := False;
+  FLastPaletteError := '';
+
+  JSONObject := TJSONObject.Create;
+  try
+    // Add metadata
+    JSONObject.Add('name', 'SedaiBasic Palette');
+    JSONObject.Add('version', '1.0');
+    JSONObject.Add('format', 'RGBA');
+
+    // Create colors array
+    ColorsArray := TJSONArray.Create;
+    JSONObject.Add('colors', ColorsArray);
+
+    for i := 0 to 255 do
+    begin
+      // Extract RGBA components
+      R := (FPalette[i] shr 24) and $FF;
+      G := (FPalette[i] shr 16) and $FF;
+      B := (FPalette[i] shr 8) and $FF;
+      A := FPalette[i] and $FF;
+
+      ColorObj := TJSONObject.Create;
+      ColorObj.Add('index', i);
+      ColorObj.Add('r', R);
+      ColorObj.Add('g', G);
+      ColorObj.Add('b', B);
+      ColorObj.Add('a', A);
+      ColorsArray.Add(ColorObj);
+    end;
+
+    // Write to file
+    FileContent := TStringList.Create;
+    try
+      FileContent.Text := JSONObject.FormatJSON;
+      try
+        FileContent.SaveToFile(FileName);
+        Result := True;
+        Logger.Info(Format('SavePaletteToJSON: Saved 256 colors to %s', [FileName]));
+      except
+        on E: Exception do
+        begin
+          FLastPaletteError := 'FILE WRITE ERROR';
+          Logger.Error('SavePaletteToJSON: Write error: ' + E.Message);
+        end;
+      end;
+    finally
+      FileContent.Free;
+    end;
+
+  finally
+    JSONObject.Free;
+  end;
 end;
 
 procedure TGraphicsMemory.ResetPalette;

@@ -234,8 +234,14 @@ type
     procedure EnablePalette(Enable: Boolean); virtual;
     function IsPaletteEnabled: Boolean; virtual;
     procedure SetPaletteColor(Index: TPaletteIndex; RGB: UInt32); virtual;
+    procedure SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255); virtual;
     function GetPaletteColor(Index: TPaletteIndex): UInt32; virtual;
     procedure ResetPalette; virtual;
+
+    // Palette file operations (JSON format)
+    function LoadPaletteFromJSON(const FileName: string): Boolean; virtual;
+    function SavePaletteToJSON(const FileName: string): Boolean; virtual;
+    function GetLastPaletteError: string; virtual;
 
     // Shape drawing (IOutputDevice interface)
     procedure DrawBox(X1, Y1, X2, Y2: Integer; Angle: Double = 0); virtual;
@@ -1944,6 +1950,11 @@ begin
   // Base device doesn't support palette
 end;
 
+procedure TSDL2OutputDevice.SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
+begin
+  // Base device doesn't support palette
+end;
+
 function TSDL2OutputDevice.GetPaletteColor(Index: TPaletteIndex): UInt32;
 begin
   Result := 0;
@@ -1952,6 +1963,21 @@ end;
 procedure TSDL2OutputDevice.ResetPalette;
 begin
   // Base device doesn't support palette
+end;
+
+function TSDL2OutputDevice.LoadPaletteFromJSON(const FileName: string): Boolean;
+begin
+  Result := False;  // Base device doesn't support palette
+end;
+
+function TSDL2OutputDevice.SavePaletteToJSON(const FileName: string): Boolean;
+begin
+  Result := False;  // Base device doesn't support palette
+end;
+
+function TSDL2OutputDevice.GetLastPaletteError: string;
+begin
+  Result := 'PALETTE NOT SUPPORTED';
 end;
 
 procedure TSDL2OutputDevice.SetCenteredViewport(UseViewport: Boolean;

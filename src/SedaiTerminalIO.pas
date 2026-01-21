@@ -110,8 +110,12 @@ type
     procedure EnablePalette(Enable: Boolean);
     function IsPaletteEnabled: Boolean;
     procedure SetPaletteColor(Index: TPaletteIndex; RGB: UInt32);
+    procedure SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
     function GetPaletteColor(Index: TPaletteIndex): UInt32;
     procedure ResetPalette;
+    function LoadPaletteFromJSON(const FileName: string): Boolean;
+    function SavePaletteToJSON(const FileName: string): Boolean;
+    function GetLastPaletteError: string;
 
     // Shape drawing (stubs - not supported in terminal mode)
     procedure DrawBox(X1, Y1, X2, Y2: Integer; Angle: Double = 0);
@@ -433,6 +437,26 @@ end;
 procedure TTerminalController.ResetPalette;
 begin
   // Not supported in terminal mode
+end;
+
+procedure TTerminalController.SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
+begin
+  // Not supported in terminal mode
+end;
+
+function TTerminalController.LoadPaletteFromJSON(const FileName: string): Boolean;
+begin
+  Result := False;  // Not supported in terminal mode
+end;
+
+function TTerminalController.SavePaletteToJSON(const FileName: string): Boolean;
+begin
+  Result := False;  // Not supported in terminal mode
+end;
+
+function TTerminalController.GetLastPaletteError: string;
+begin
+  Result := 'Palette operations not supported in terminal mode';
 end;
 
 // Shape drawing stubs - not supported in terminal mode

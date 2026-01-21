@@ -1721,6 +1721,8 @@ begin
  RegisterKeyword(kPAINT,   ttGraphicsCommand,  'Fill area with color',                             kcGraphicsHandling);
  RegisterKeyword(kSCALE,   ttGraphicsCommand,  'Alter scaling in graphics mode',                   kcGraphicsHandling);
  RegisterKeyword(kSCNCLR,  ttGraphicsCommand,  'Clear screen',                                     kcGraphicsHandling);
+ RegisterKeyword(kPLOAD,   ttGraphicsCommand,  'Load palette from JSON file',                      kcGraphicsHandling);
+ RegisterKeyword(kPSAVE,   ttGraphicsCommand,  'Save palette to JSON file',                        kcGraphicsHandling);
  RegisterKeyword(kSSHAPE,  ttGraphicsCommand,  'Save shapes to string variable',                   kcGraphicsHandling);
  RegisterKeyword(kWIDTH,   ttGraphicsCommand,  'Set the width of drawn lines',                     kcGraphicsHandling);
  RegisterKeyword(kWINDOW,  ttOutputCommand,    'Defines a text screen window',                     kcStdIO);

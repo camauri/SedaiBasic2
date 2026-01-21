@@ -114,8 +114,14 @@ type
     procedure EnablePalette(Enable: Boolean); override;
     function IsPaletteEnabled: Boolean; override;
     procedure SetPaletteColor(Index: TPaletteIndex; RGB: UInt32); override;
+    procedure SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255); override;
     function GetPaletteColor(Index: TPaletteIndex): UInt32; override;
     procedure ResetPalette; override;
+
+    // Palette file operations (JSON format)
+    function LoadPaletteFromJSON(const FileName: string): Boolean; override;
+    function SavePaletteToJSON(const FileName: string): Boolean; override;
+    function GetLastPaletteError: string; override;
 
     // Override DrawBoxStyled to draw into graphics memory instead of renderer
     procedure DrawBoxStyled(X1, Y1, X2, Y2: Integer; const Style: TShapeStyle; Angle: Double = 0); override;
@@ -551,6 +557,16 @@ begin
   FGraphicsMemory.SetPaletteColor(Index, RGB);
 end;
 
+procedure TSDL2GraphicsOutputDevice.SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
+var
+  RGB: UInt32;
+begin
+  // Store as RGBA format (R in high byte)
+  RGB := (R shl 24) or (G shl 16) or (B shl 8) or A;
+  FPaletteManager.SetColor(Index, RGB);
+  FGraphicsMemory.SetPaletteColor(Index, RGB);
+end;
+
 function TSDL2GraphicsOutputDevice.GetPaletteColor(Index: TPaletteIndex): UInt32;
 begin
   Result := FPaletteManager.GetColor(Index);
@@ -560,6 +576,23 @@ procedure TSDL2GraphicsOutputDevice.ResetPalette;
 begin
   FPaletteManager.LoadDefaultPalette;
   ApplyPaletteToMemory;
+end;
+
+function TSDL2GraphicsOutputDevice.LoadPaletteFromJSON(const FileName: string): Boolean;
+begin
+  Result := FGraphicsMemory.LoadPaletteFromJSON(FileName);
+  if Result then
+    ApplyPaletteToMemory;
+end;
+
+function TSDL2GraphicsOutputDevice.SavePaletteToJSON(const FileName: string): Boolean;
+begin
+  Result := FGraphicsMemory.SavePaletteToJSON(FileName);
+end;
+
+function TSDL2GraphicsOutputDevice.GetLastPaletteError: string;
+begin
+  Result := FGraphicsMemory.GetLastPaletteError;
 end;
 
 procedure TSDL2GraphicsOutputDevice.SetDisplayPreferences(DisplayMode: TDisplayMode;

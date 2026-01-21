@@ -2,7 +2,7 @@
 
 ## Implementation Progress
 
-**175 / 200 commands implemented (88%)**
+**177 / 202 commands implemented (88%)**
 
 ```
 [████████████████████████████████████████████····] 88%
@@ -198,15 +198,17 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `PEEK` | ✓ | Return content of memory-mapped location |
 | `POINTER` | ✗ | Return the address of a variable name |
 
-## Graphics Management (21/21 - 100%)
+## Graphics Management (23/23 - 100%)
 
 | Command/Function | Status | Description |
 |------------------|--------|-------------|
 | `BOX` | ✓ | Draw a box |
 | `CIRCLE` | ✓ | Draws circles, ellipses, arcs and polygons |
 | `COLOR` | ✓ | Define colors for each screen area (0-255, palette wraps every 16) |
-| `SETCOLOR` | ✓ | Set color for screen area (0-255, uses parentheses) |
-| `GETCOLOR` | ✓ | Return color index for screen area (0-255) |
+| `SETCOLOR` | ✓ | Modify palette entry with RGBA values |
+| `GETCOLOR` | ✓ | Read palette entry as RGBA value |
+| `PLOAD` | ✓ | Load palette from JSON file |
+| `PSAVE` | ✓ | Save palette to JSON file |
 | `DRAW` | ✓ | Draw dots, lines and shapes |
 | `GLIST` | ✓ | List available SDL2 video modes |
 | `GRAPHIC` | ✓ | Select a graphic mode |

@@ -160,6 +160,8 @@ type
     antSShape,            // SSHAPE command (save bitmap to string)
     antGShape,            // GSHAPE command (load string to bitmap)
     antGList,             // GLIST command (list SDL2 video modes)
+    antPLoad,             // PLOAD command (load palette from JSON file)
+    antPSave,             // PSAVE command (save palette to JSON file)
 
     // === SOUND ===
     antVol,               // VOL command (set volume)

@@ -327,6 +327,8 @@ const
   bcGraphicPos      = bcGroupGraphics + 16;  // POS(x)
   bcGraphicRclr     = bcGroupGraphics + 17;  // RCLR(n)
   bcGraphicRwindow  = bcGroupGraphics + 18;  // RWINDOW(n)
+  bcPLoad           = bcGroupGraphics + 22;  // PLOAD "filename" - Load palette from JSON
+  bcPSave           = bcGroupGraphics + 23;  // PSAVE "filename" - Save palette to JSON
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1139,6 +1141,22 @@ begin
         5: Result := 'GraphicLocate';
         6: Result := 'GraphicRdot';
         7: Result := 'GraphicGetMode';
+        8: Result := 'GraphicColor';
+        9: Result := 'SetColor';
+        10: Result := 'GetColor';
+        11: Result := 'GraphicWidth';
+        12: Result := 'GraphicScale';
+        13: Result := 'GraphicPaint';
+        14: Result := 'GraphicWindow';
+        15: Result := 'GraphicSShape';
+        16: Result := 'GraphicGShape';
+        17: Result := 'GraphicGList';
+        18: Result := 'GraphicPos';
+        19: Result := 'GraphicRclr';
+        20: Result := 'GraphicRwindow';
+        21: Result := 'ScnClr';
+        22: Result := 'PLoad';
+        23: Result := 'PSave';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

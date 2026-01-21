@@ -243,6 +243,8 @@ begin
     ssaGraphicSShape: Result := bcGraphicSShape;
     ssaGraphicGShape: Result := bcGraphicGShape;
     ssaGraphicGList: Result := bcGraphicGList;
+    ssaPLoad: Result := bcPLoad;
+    ssaPSave: Result := bcPSave;
     ssaScnClr: Result := bcScnClr;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;
@@ -605,6 +607,44 @@ begin
           ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[5].Value.RegType,
             Instr.PhiSources[5].Value.RegIndex, Instr.PhiSources[5].Value.Version)) and $3FF) shl 50);
     end;
+
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // Special handling for SETCOLOR - pack 5 parameters into bytecode format
+  // SETCOLOR index, R, G, B [, A]
+  // SSA: Src1=index, Src2=R, Dest=G, Src3=B, PhiSources[0]=A
+  if Instr.OpCode = ssaSetColor then
+  begin
+    BCOp := bcSetColor;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    // Src1 = palette index register
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    // Src2 = R register
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+
+    // Dest = G register (repurposed since SETCOLOR has no result)
+    if Instr.Dest.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
+
+    // Pack B and A into Immediate
+    // Layout: B(12) | A(12) = 24 bits
+    BCInstr.Immediate := 0;
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Immediate := BCInstr.Immediate or
+        (Int64(MapSSARegisterToBytecode(Instr.Src3.RegType,
+          Instr.Src3.RegIndex, Instr.Src3.Version)) and $FFF);
+
+    // A in bits 12-23
+    if (Length(Instr.PhiSources) >= 1) and (Instr.PhiSources[0].Value.Kind = svkRegister) then
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+          Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFF) shl 12);
 
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
