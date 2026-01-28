@@ -1,0 +1,7 @@
+10 SETHEADER "Content-Type", "text/html; charset=utf-8"
+20 PRINT "<html><body>"
+30 PRINT "<h1>Hello, World!</h1>"
+40 NAME$ = GET$("name")
+50 IF NAME$ <> "" THEN PRINT "<h2>Hello "; NAME$; "!</h2>"
+60 IF NAME$ = "" THEN PRINT "<p>Add ?name=YourName to the URL.</p>"
+70 PRINT "</body></html>"

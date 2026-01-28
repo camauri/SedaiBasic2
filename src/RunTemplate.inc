@@ -381,6 +381,9 @@ begin
         5: begin FPC := CurPC; ExecuteSpecialVarOp(Instr); CurPC := FPC + 1; end;
         6: begin FPC := CurPC; ExecuteFileIOOp(Instr); CurPC := FPC + 1; end;
         7: begin FPC := CurPC; ExecuteSpriteOp(Instr); CurPC := FPC + 1; end;
+        {$IFDEF WEB_MODE}
+        8: begin FPC := CurPC; ExecuteWebOp(Instr); CurPC := FPC + 1; end;
+        {$ENDIF}
         10: begin FPC := CurPC; ExecuteGraphicsOp(Instr); CurPC := FPC + 1; end;
         11: begin FPC := CurPC; ExecuteSoundOp(Instr); CurPC := FPC + 1; end;
         0: // Core VM operations - inline for performance

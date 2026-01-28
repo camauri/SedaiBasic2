@@ -55,7 +55,24 @@ const
   bcGroupSpecial    = $0500;  // Group 5: Special variables
   bcGroupFileIO     = $0600;  // Group 6: File I/O
   bcGroupSprite     = $0700;  // Group 7: Sprite operations
+  bcGroupWeb        = $0800;  // Group 8: Web operations (WEB_MODE only)
   bcGroupGraphics   = $0A00;  // Group 10: Graphics
+
+  // === GROUP 8: WEB OPERATIONS (0x08xx) - WEB_MODE only ===
+  {$IFDEF WEB_MODE}
+  bcWebGetParam     = bcGroupWeb + $01;  // GET$("nome") - HTML-escaped
+  bcWebPostParam    = bcGroupWeb + $02;  // POST$("nome") - HTML-escaped
+  bcWebGetRaw       = bcGroupWeb + $03;  // GETRAW$("nome") - raw, unsanitized
+  bcWebPostRaw      = bcGroupWeb + $04;  // POSTRAW$("nome") - raw, unsanitized
+  bcWebHtmlEncode   = bcGroupWeb + $05;  // HTML$(s) - escape HTML entities
+  bcWebUrlEncode    = bcGroupWeb + $06;  // URL$(s) - URL encode
+  bcWebMethod       = bcGroupWeb + $07;  // METHOD$ - "GET" or "POST"
+  bcWebPath         = bcGroupWeb + $08;  // PATH$ - requested path
+  bcWebQuery        = bcGroupWeb + $09;  // QUERY$ - full query string
+  bcWebHeader       = bcGroupWeb + $0A;  // HEADER$("nome") - request header
+  bcWebSetHeader    = bcGroupWeb + $0B;  // SETHEADER "name", "value"
+  bcWebStatus       = bcGroupWeb + $0C;  // STATUS code - set HTTP status
+  {$ENDIF}
   bcGroupSound      = $0B00;  // Group 11: Sound
   bcGroupSuper      = $C800;  // Group 200+: Superinstructions
 
@@ -1130,6 +1147,23 @@ begin
         7: Result := 'Cmd';
       else
         Result := Format('FileIO_%d', [SubOp]);
+      end;
+    8: // Web (WEB_MODE only)
+      case SubOp of
+        $01: Result := 'WebGetParam';
+        $02: Result := 'WebPostParam';
+        $03: Result := 'WebGetRaw';
+        $04: Result := 'WebPostRaw';
+        $05: Result := 'WebHtmlEncode';
+        $06: Result := 'WebUrlEncode';
+        $07: Result := 'WebMethod';
+        $08: Result := 'WebPath';
+        $09: Result := 'WebQuery';
+        $0A: Result := 'WebHeader';
+        $0B: Result := 'WebSetHeader';
+        $0C: Result := 'WebStatus';
+      else
+        Result := Format('Web_%d', [SubOp]);
       end;
     10: // Graphics
       case SubOp of

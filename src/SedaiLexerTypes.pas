@@ -203,6 +203,11 @@ type
     ttSoundCommand,           // ENVELOPE, FILTER, PLAY, SOUND, etc.
     ttSoundFunction,          // not used
 
+    // === WEB HANDLING (COMMANDS AND FUNCTIONS) - WEB_MODE only ===
+    ttWebCommand,             // SETHEADER, STATUS
+    ttWebFunction,            // GET$, POST$, HTML$, URL$, HEADER$, GETRAW$, POSTRAW$
+    ttWebVariable,            // METHOD$, PATH$, QUERY$
+
     // === MATH FUNCTIONS ===
     ttMathFunction,           // SIN, COS, TAN, etc.
 

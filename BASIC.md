@@ -940,3 +940,45 @@ STEP
 3. **Trace Output**: When trace is active, each executed line displays `[linenum]` before execution.
 
 4. **Resuming**: After a breakpoint, use STEP to execute line-by-line, or CONT to continue until the next breakpoint.
+
+---
+
+## Web BASIC Instructions (sbw.exe only)
+
+> **Note:** These instructions are **only available** in the Web Server version (`sbw.exe`).
+> They are **not recognized** in the console (`sb.exe`) or Vision (`sbv.exe`) versions.
+> Conversely, graphics, audio, and sprite instructions are **not available** in `sbw.exe`.
+
+See [WEB_BASIC.md](WEB_BASIC.md) for complete documentation.
+
+### Input Functions
+
+| Command | Status | Description |
+|---------|--------|-------------|
+| `GET$("name")` | Planned | Return HTML-escaped query parameter (safe) |
+| `POST$("name")` | Planned | Return HTML-escaped POST parameter (safe) |
+| `GETRAW$("name")` | Planned | Return raw query parameter (unsafe) |
+| `POSTRAW$("name")` | Planned | Return raw POST parameter (unsafe) |
+
+### Encoding Functions
+
+| Command | Status | Description |
+|---------|--------|-------------|
+| `HTML$(s)` | Planned | Escape HTML entities |
+| `URL$(s)` | Planned | URL encode string |
+
+### HTTP Environment
+
+| Command | Status | Description |
+|---------|--------|-------------|
+| `METHOD$` | Planned | Return HTTP method ("GET" or "POST") |
+| `PATH$` | Planned | Return requested path |
+| `QUERY$` | Planned | Return full query string |
+| `HEADER$("name")` | Planned | Return HTTP request header |
+
+### Response Control
+
+| Command | Status | Description |
+|---------|--------|-------------|
+| `SETHEADER name, value` | Planned | Set HTTP response header |
+| `STATUS code` | Planned | Set HTTP response status code |

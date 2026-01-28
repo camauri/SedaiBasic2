@@ -50,6 +50,11 @@ type
     antInputFunction,
     antUsrFunction,
     antUserFunction,      // User-defined function call (FN)
+    {$IFDEF WEB_MODE}
+    antWebFunction,       // Web functions: GET$, POST$, HTML$, URL$, HEADER$, GETRAW$, POSTRAW$
+    antWebVariable,       // Web variables: METHOD$, PATH$, QUERY$
+    antWebCommand,        // Web commands: SETHEADER, STATUS
+    {$ENDIF}
 
     // === EXPRESSIONS ===
     antBinaryOp,          // Binary operations (+, -, *, /, =, <, >, etc.)

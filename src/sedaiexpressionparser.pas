@@ -72,6 +72,10 @@ type
     function ParseUsrFunction(Token: TLexerToken): TASTNode;
     function ParseUserFunction(Token: TLexerToken): TASTNode;
     function ParseSpecialVariable(Token: TLexerToken): TASTNode;
+    {$IFDEF WEB_MODE}
+    function ParseWebFunction(Token: TLexerToken): TASTNode;
+    function ParseWebVariable(Token: TLexerToken): TASTNode;
+    {$ENDIF}
 
     // === INFIX PARSING FUNCTIONS ===
     function ParseBinaryOperator(Left: TASTNode; Token: TLexerToken): TASTNode;
@@ -106,6 +110,10 @@ function StaticParseInputFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseUsrFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseUserFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseSpecialVariable(Parser: Pointer; Token: TLexerToken): TObject;
+{$IFDEF WEB_MODE}
+function StaticParseWebFunction(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseWebVariable(Parser: Pointer; Token: TLexerToken): TObject;
+{$ENDIF}
 
 function StaticParseBinaryOperator(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
 function StaticParseAssignment(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
@@ -214,6 +222,18 @@ begin
   Result := TExpressionParser(Parser).ParseSpecialVariable(Token);
 end;
 
+{$IFDEF WEB_MODE}
+function StaticParseWebFunction(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseWebFunction(Token);
+end;
+
+function StaticParseWebVariable(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseWebVariable(Token);
+end;
+{$ENDIF}
+
 function StaticParseBinaryOperator(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseBinaryOperator(TASTNode(Left), Token);
@@ -306,6 +326,12 @@ begin
   Context.SetParseRule(ttUsrFunction, MakePrefixRule(@StaticParseUsrFunction, precCall));
   Context.SetParseRule(ttProcedureStart, MakePrefixRule(@StaticParseUserFunction, precCall));
   Context.SetParseRule(ttSpecialVariable, MakePrefixRule(@StaticParseSpecialVariable, precPrimary));
+
+  {$IFDEF WEB_MODE}
+  // Web functions and variables
+  Context.SetParseRule(ttWebFunction, MakePrefixRule(@StaticParseWebFunction, precCall));
+  Context.SetParseRule(ttWebVariable, MakePrefixRule(@StaticParseWebVariable, precPrimary));
+  {$ENDIF}
 
   // Unary operators (PREFIX only)
   Context.SetParseRule(ttOpAdd, MakePrefixRule(@StaticParseUnaryPlus, precUnary));
@@ -1359,6 +1385,67 @@ begin
   Result := CreateBinaryOpNode(ttOpPow, Left, Right, Token);
   DoNodeCreated(Result);
 end;
+
+{$IFDEF WEB_MODE}
+// === WEB PARSING FUNCTIONS ===
+
+function TExpressionParser.ParseWebFunction(Token: TLexerToken): TASTNode;
+var
+  Args: TASTNode;
+begin
+  {$IFDEF DEBUG}
+  LogVerbose(Format('ParseWebFunction: %s', [Token.Value]));
+  {$ENDIF}
+
+  if not HasValidContext then
+  begin
+    Result := nil;
+    Exit;
+  end;
+
+  // Web functions: GET$, POST$, GETRAW$, POSTRAW$, HTML$, URL$, HEADER$
+  Result := TASTNode.CreateWithValue(antWebFunction, UpperCase(Token.Value), Token);
+
+  // Consume opening parenthesis
+  if not Context.Match(ttDelimParOpen) then
+  begin
+    HandleError('Expected "(" after web function', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  // Parse arguments if any
+  if not Context.Check(ttDelimParClose) then
+  begin
+    Args := ParseArgumentList;
+    if Assigned(Args) then
+      Result.AddChild(Args);
+  end;
+
+  // Consume closing parenthesis
+  if not Context.Match(ttDelimParClose) then
+  begin
+    HandleError('Expected ")" after web function arguments', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseWebVariable(Token: TLexerToken): TASTNode;
+begin
+  {$IFDEF DEBUG}
+  LogVerbose(Format('ParseWebVariable: %s', [Token.Value]));
+  {$ENDIF}
+
+  // Web variables: METHOD$, PATH$, QUERY$ - no arguments, just value
+  Result := TASTNode.CreateWithValue(antWebVariable, UpperCase(Token.Value), Token);
+  DoNodeCreated(Result);
+end;
+{$ENDIF}
 
 // === UTILITY PARSING ===
 

@@ -1707,7 +1707,9 @@ begin
  RegisterKeyword(kPEEK,    ttMemoryFunction, 'Return content of specific RAM location',    kcMemoryHandling);
  RegisterKeyword(kPOINTER, ttMemoryFunction, 'Return the address of a variable name',      kcMemoryHandling);
 
+ {$IFNDEF WEB_MODE}
  // === GRAPHICS HANDLING (COMMANDS AND FUNCTION) ===
+ // Note: These keywords are NOT available in WEB_MODE (sbw.exe)
  // commands
  RegisterKeyword(kBOX,     ttGraphicsCommand,  'Draw a box',                                       kcGraphicsHandling);
  RegisterKeyword(kCIRCLE,  ttGraphicsCommand,  'Draws circles, ellipses, arcs and polygons',       kcGraphicsHandling);
@@ -1736,6 +1738,7 @@ begin
  RegisterKeyword(kRWINDOW, ttInputFunction,    'Return the size of the current text window',       kcStdIO);
 
  // === SPRITES HANDLING (COMMANDS AND FUNCTIONS) ===
+ // Note: These keywords are NOT available in WEB_MODE (sbw.exe)
  // commands
  RegisterKeyword(kCOLLISION, ttSpriteCommand,  'Define handling for sprite collision interrupt',              kcSpritesHandling);
  RegisterKeyword(kSPRITE,    ttSpriteCommand,  'Set sprite properties',                                       kcSpritesHandling);
@@ -1750,12 +1753,35 @@ begin
  RegisterKeyword(kRSPRITE,   ttSpriteFunction, 'Return sprite characteristics',                               kcSpritesHandling);
 
  // === SOUND HANDLING (COMMANDS AND FUNCTIONS) ===
+ // Note: These keywords are NOT available in WEB_MODE (sbw.exe)
  RegisterKeyword(kENVELOPE, ttSoundCommand, 'Define a musical instrument envelope',       kcSoundHandling);
  RegisterKeyword(kFILTER,   ttSoundCommand, 'Define sound (SID chip) filter parameters',  kcSoundHandling);
  RegisterKeyword(kPLAY,     ttSoundCommand, 'Define and play musical notes and elements', kcSoundHandling);
  RegisterKeyword(kSOUND,    ttSoundCommand, 'Outputs sound effects and musical notes',    kcSoundHandling);
  RegisterKeyword(kTEMPO,    ttSoundCommand, 'Define the speed of the song being played',  kcSoundHandling);
  RegisterKeyword(kVOL,      ttSoundCommand, 'Define output level of sound',               kcSoundHandling);
+ {$ENDIF}
+
+ {$IFDEF WEB_MODE}
+ // === WEB HANDLING (COMMANDS AND FUNCTIONS) ===
+ // Note: These keywords are ONLY available in WEB_MODE (sbw.exe)
+ // Input functions (HTML-escaped by default for security)
+ RegisterKeyword(kGETS,     ttWebFunction,  'Return HTML-escaped query string parameter',  kcWebHandling);
+ RegisterKeyword(kPOSTS,    ttWebFunction,  'Return HTML-escaped POST parameter',          kcWebHandling);
+ RegisterKeyword(kGETRAWS,  ttWebFunction,  'Return raw query string parameter (unsafe)',  kcWebHandling);
+ RegisterKeyword(kPOSTRAWS, ttWebFunction,  'Return raw POST parameter (unsafe)',          kcWebHandling);
+ // Encoding functions
+ RegisterKeyword(kHTMLS,    ttWebFunction,  'Escape HTML entities in string',              kcWebHandling);
+ RegisterKeyword(kURLS,     ttWebFunction,  'URL encode string',                           kcWebHandling);
+ // Environment variables
+ RegisterKeyword(kMETHODS,  ttWebVariable,  'Return HTTP method (GET or POST)',            kcWebHandling);
+ RegisterKeyword(kPATHS,    ttWebVariable,  'Return requested path',                       kcWebHandling);
+ RegisterKeyword(kQUERYS,   ttWebVariable,  'Return full query string',                    kcWebHandling);
+ RegisterKeyword(kHEADERS,  ttWebFunction,  'Return HTTP request header value',            kcWebHandling);
+ // Response control
+ RegisterKeyword(kSETHEADER, ttWebCommand,  'Set HTTP response header',                    kcWebHandling);
+ RegisterKeyword(kSTATUS,   ttWebCommand,   'Set HTTP response status code',               kcWebHandling);
+ {$ENDIF}
 
  // === MATH FUNCTIONS ===
  RegisterKeyword(kABS,   ttMathFunction, 'Return absolute value',                                    kcMathFunctions);

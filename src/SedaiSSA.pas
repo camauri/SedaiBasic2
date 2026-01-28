@@ -167,6 +167,9 @@ type
     procedure ProcessMkdir(Node: TASTNode);
     procedure ProcessChdir(Node: TASTNode);
     procedure ProcessMoveFile(Node: TASTNode);
+    {$IFDEF WEB_MODE}
+    procedure ProcessWebCommand(Node: TASTNode);
+    {$ENDIF}
     procedure EmitInstruction(OpCode: TSSAOpCode; Dest, Src1, Src2, Src3: TSSAValue);
 
     // Constant register tracking helpers
@@ -1903,6 +1906,72 @@ begin
         // Dest, ArrayRef, LinearIndex, None
         EmitInstruction(ssaArrayLoad, Result, ArrayRef, LinearIndex, MakeSSAValue(svkNone));
     end;
+
+    {$IFDEF WEB_MODE}
+    antWebVariable:
+    begin
+      // Web variables: METHOD$, PATH$, QUERY$ - no arguments
+      FuncName := UpperCase(VarToStr(Node.Value));
+      DestReg := FProgram.AllocRegister(srtString);
+      Result := MakeSSARegister(srtString, DestReg);
+
+      if FuncName = 'METHOD$' then
+        EmitInstruction(ssaWebMethod, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      else if FuncName = 'PATH$' then
+        EmitInstruction(ssaWebPath, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      else if FuncName = 'QUERY$' then
+        EmitInstruction(ssaWebQuery, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      else
+        Result := MakeSSAValue(svkNone);
+    end;
+
+    antWebFunction:
+    begin
+      // Web functions: GET$, POST$, GETRAW$, POSTRAW$, HTML$, URL$, HEADER$
+      FuncName := UpperCase(VarToStr(Node.Value));
+
+      if Node.ChildCount > 0 then
+      begin
+        ArgListNode := Node.GetChild(0);
+
+        // Functions with 1 argument: GET$, POST$, GETRAW$, POSTRAW$, HTML$, URL$, HEADER$
+        if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+        begin
+          ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+          ArgReg := EnsureStringRegister(ArgValue);
+        end
+        else
+        begin
+          // Empty string as default
+          TempReg := FProgram.AllocRegister(srtString);
+          ArgReg := MakeSSARegister(srtString, TempReg);
+          EmitInstruction(ssaLoadConstString, ArgReg, MakeSSAConstString(''), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+
+        DestReg := FProgram.AllocRegister(srtString);
+        Result := MakeSSARegister(srtString, DestReg);
+
+        if FuncName = 'GET$' then
+          EmitInstruction(ssaWebGetParam, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else if FuncName = 'POST$' then
+          EmitInstruction(ssaWebPostParam, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else if FuncName = 'GETRAW$' then
+          EmitInstruction(ssaWebGetRaw, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else if FuncName = 'POSTRAW$' then
+          EmitInstruction(ssaWebPostRaw, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else if FuncName = 'HTML$' then
+          EmitInstruction(ssaWebHtmlEncode, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else if FuncName = 'URL$' then
+          EmitInstruction(ssaWebUrlEncode, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else if FuncName = 'HEADER$' then
+          EmitInstruction(ssaWebHeader, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else
+          Result := MakeSSAValue(svkNone);
+      end
+      else
+        Result := MakeSSAValue(svkNone);
+    end;
+    {$ENDIF}
 
   else
     Result := MakeSSAValue(svkNone);
@@ -6825,6 +6894,58 @@ begin
                  MakeSSAValue(svkNone));
 end;
 
+{$IFDEF WEB_MODE}
+procedure TSSAGenerator.ProcessWebCommand(Node: TASTNode);
+var
+  CmdName: string;
+  NameVal, ValueVal, StatusVal: TSSAValue;
+  NameReg, ValueReg, StatusReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  CmdName := UpperCase(VarToStr(Node.Value));
+
+  // SETHEADER name, value
+  if CmdName = 'SETHEADER' then
+  begin
+    if Node.ChildCount < 2 then
+    begin
+      raise Exception.Create('SETHEADER requires name and value');
+    end;
+
+    // Process header name
+    ProcessExpression(Node.GetChild(0), NameVal);
+    NameReg := EnsureStringRegister(NameVal);
+
+    // Process header value
+    ProcessExpression(Node.GetChild(1), ValueVal);
+    ValueReg := EnsureStringRegister(ValueVal);
+
+    EmitInstruction(ssaWebSetHeader, MakeSSAValue(svkNone), NameReg, ValueReg,
+                   MakeSSAValue(svkNone));
+  end
+  // STATUS code
+  else if CmdName = 'STATUS' then
+  begin
+    if Node.ChildCount < 1 then
+    begin
+      raise Exception.Create('STATUS requires code');
+    end;
+
+    // Process status code
+    ProcessExpression(Node.GetChild(0), StatusVal);
+    StatusReg := EnsureIntRegister(StatusVal);
+
+    EmitInstruction(ssaWebStatus, MakeSSAValue(svkNone), StatusReg,
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+  begin
+    raise Exception.CreateFmt('Unknown web command: %s', [CmdName]);
+  end;
+end;
+{$ENDIF}
+
 { PHASE 3 TIER 3: Fix forward GOTO/GOSUB references and RETURN edges }
 procedure TSSAGenerator.FixForwardReferences;
 var
@@ -7293,6 +7414,13 @@ begin
       for i := 0 to Node.ChildCount - 1 do
         ProcessStatement(Node.GetChild(i));
     end;
+    {$IFDEF WEB_MODE}
+    antWebCommand:
+    begin
+      // Web commands: SETHEADER, STATUS
+      ProcessWebCommand(Node);
+    end;
+    {$ENDIF}
   else
     // Unhandled node type - still process children in case they contain statements
     // This ensures that nested statements are not silently dropped

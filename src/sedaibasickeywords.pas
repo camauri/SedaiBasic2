@@ -288,6 +288,27 @@ const
   // SedaiBasic Options
   kEXPNOTATION = 'EXPNOTATION';
 
+  // Web keywords (WEB_MODE only)
+  {$IFDEF WEB_MODE}
+  kGETS     = 'GET$';      // GET$("nome") - HTML-escaped query parameter
+  kPOSTS    = 'POST$';     // POST$("nome") - HTML-escaped POST parameter
+  kGETRAWS  = 'GETRAW$';   // GETRAW$("nome") - raw query parameter
+  kPOSTRAWS = 'POSTRAW$';  // POSTRAW$("nome") - raw POST parameter
+  kHTMLS    = 'HTML$';     // HTML$(s) - escape HTML entities
+  kURLS     = 'URL$';      // URL$(s) - URL encode
+  kMETHODS  = 'METHOD$';   // METHOD$ - "GET" or "POST"
+  kPATHS    = 'PATH$';     // PATH$ - requested path
+  kQUERYS   = 'QUERY$';    // QUERY$ - full query string
+  kHEADERS  = 'HEADER$';   // HEADER$("nome") - request header
+  kSETHEADER = 'SETHEADER'; // SETHEADER "name", "value"
+  kSTATUS   = 'STATUS';    // STATUS code - set HTTP status
+  {$ENDIF}
+
+  // Web keyword category
+  {$IFDEF WEB_MODE}
+  kcWebHandling = 'Web Handling';
+  {$ENDIF}
+
 
   // === KEYWORD CATEGORIES ===
 

@@ -143,6 +143,9 @@ type
     function ParseSysStatement: TASTNode;
     function ParseUsrStatement: TASTNode;
     function ParseDirectiveStatement: TASTNode;
+    {$IFDEF WEB_MODE}
+    function ParseWebStatement: TASTNode;
+    {$ENDIF}
 
     // === EXPRESSION DELEGATION ===
     function ParseExpression: TASTNode; inline;
@@ -577,6 +580,11 @@ begin
           Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
         end;
       end;
+
+    {$IFDEF WEB_MODE}
+    // === WEB COMMANDS ===
+    ttWebCommand: Result := Memoize('WebStatement', @ParseWebStatement);
+    {$ENDIF}
 
     else
     begin
@@ -2645,6 +2653,86 @@ begin
   Context.Advance; // Consume directive
   DoNodeCreated(Result);
 end;
+
+{$IFDEF WEB_MODE}
+function TPackratParser.ParseWebStatement: TASTNode;
+var
+  Token: TLexerToken;
+  NameExpr, ValueExpr, StatusExpr: TASTNode;
+  KeywordUpper: string;
+begin
+  Token := Context.CurrentToken;
+  KeywordUpper := UpperCase(Token.Value);
+
+  // SETHEADER name, value
+  if KeywordUpper = kSETHEADER then
+  begin
+    Result := TASTNode.Create(antWebCommand, Token);
+    Result.Value := kSETHEADER;
+    Context.Advance; // Consume SETHEADER
+
+    // Parse header name (string expression)
+    NameExpr := ParseExpression;
+    if not Assigned(NameExpr) then
+    begin
+      HandleError('Expected header name after SETHEADER', Context.CurrentToken);
+      Result.Free;
+      Result := nil;
+      Exit;
+    end;
+    Result.AddChild(NameExpr);
+
+    // Expect comma
+    if not Context.Match(ttSeparParam) then
+    begin
+      HandleError('Expected "," after header name', Context.CurrentToken);
+      Result.Free;
+      Result := nil;
+      Exit;
+    end;
+
+    // Parse header value (string expression)
+    ValueExpr := ParseExpression;
+    if not Assigned(ValueExpr) then
+    begin
+      HandleError('Expected header value after ","', Context.CurrentToken);
+      Result.Free;
+      Result := nil;
+      Exit;
+    end;
+    Result.AddChild(ValueExpr);
+
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // STATUS code
+  if KeywordUpper = kSTATUS then
+  begin
+    Result := TASTNode.Create(antWebCommand, Token);
+    Result.Value := kSTATUS;
+    Context.Advance; // Consume STATUS
+
+    // Parse status code (numeric expression)
+    StatusExpr := ParseExpression;
+    if not Assigned(StatusExpr) then
+    begin
+      HandleError('Expected status code after STATUS', Context.CurrentToken);
+      Result.Free;
+      Result := nil;
+      Exit;
+    end;
+    Result.AddChild(StatusExpr);
+
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // Unknown web command
+  HandleError(Format('Unknown web command: %s', [Token.Value]), Token);
+  Result := nil;
+end;
+{$ENDIF}
 
 function TPackratParser.ParseExpressionStatement: TASTNode;
 begin

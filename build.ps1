@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-    Build SedaiBasic projects (sb, sbc, sbd, sbv)
+    Build SedaiBasic projects (sb, sbc, sbd, sbv, sbw)
 
 .DESCRIPTION
     Cross-platform build script for SedaiBasic.
     Uses direct fpc calls with optimized settings.
 
 .PARAMETER Target
-    Which target to build: all, sb, sbc, sbd, sbv (default: all)
+    Which target to build: all, sb, sbc, sbd, sbv, sbw (default: all)
 
 .PARAMETER Debug
     Build with debug info instead of release optimizations
@@ -51,7 +51,7 @@
 #>
 
 param(
-    [ValidateSet('all', 'sb', 'sbc', 'sbd', 'sbv')]
+    [ValidateSet('all', 'sb', 'sbc', 'sbd', 'sbv', 'sbw')]
     [string]$Target = 'all',
 
     [switch]$Debug,
@@ -219,7 +219,8 @@ function Build-Target {
         [string[]]$ExtraUnitPaths = @(),
         [bool]$WithAudio = $false,
         [string]$AudioPath = '',
-        [string[]]$DebugDefines = @()
+        [string[]]$DebugDefines = @(),
+        [bool]$IsWeb = $false
     )
 
     $srcPath = Join-Path $SrcDir $LprFile
@@ -228,8 +229,9 @@ function Build-Target {
         return $false
     }
 
-    # Create output directories
-    $libPath = Join-Path $LibDir $PlatformDir
+    # Create output directories - use separate lib directory for WEB_MODE
+    $libSubDir = if ($IsWeb) { "$PlatformDir-web" } else { $PlatformDir }
+    $libPath = Join-Path $LibDir $libSubDir
     $binPath = Join-Path $BinDir $PlatformDir
 
     if (-not (Test-Path $libPath)) { New-Item -ItemType Directory -Path $libPath -Force | Out-Null }
@@ -281,10 +283,10 @@ function Build-Target {
         $opts += '-Co'
     }
 
-    # Paths
+    # Paths - $libSubDir already set above for WEB_MODE separation
     $opts += "-Fusrc"
-    $opts += "-Fulib\$PlatformDir"
-    $opts += "-FUlib\$PlatformDir"
+    $opts += "-Fulib\$libSubDir"
+    $opts += "-FUlib\$libSubDir"
     $opts += "-FEbin\$PlatformDir"
 
     # Extra unit paths
@@ -295,6 +297,11 @@ function Build-Target {
     # Debug defines (from -DebugFlags parameter)
     foreach ($define in $DebugDefines) {
         $opts += "-d$define"
+    }
+
+    # Web mode (sbw target)
+    if ($IsWeb) {
+        $opts += '-dWEB_MODE'
     }
 
     # SedaiAudio integration
@@ -365,12 +372,19 @@ function Clean-Build {
 
     Write-Host "Cleaning build artifacts..." -ForegroundColor Yellow
 
-    $libPath = Join-Path $LibDir $PlatformDir
-    $binPath = Join-Path $BinDir $PlatformDir
+    $libPath = Join-Path $Script:LibDir $PlatformDir
+    $libWebPath = Join-Path $Script:LibDir "$PlatformDir-web"
+    $binPath = Join-Path $Script:BinDir $PlatformDir
 
     if (Test-Path $libPath) {
-        Remove-Item -Path "$libPath\*" -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Path $libPath -File | Remove-Item -Force -ErrorAction SilentlyContinue
         Write-Host "  Cleaned: $libPath" -ForegroundColor Gray
+    }
+
+    # Clean web mode lib directory
+    if (Test-Path $libWebPath) {
+        Get-ChildItem -Path $libWebPath -File | Remove-Item -Force -ErrorAction SilentlyContinue
+        Write-Host "  Cleaned: $libWebPath" -ForegroundColor Gray
     }
 
     # Don't delete executables, just .ppu/.o files
@@ -431,10 +445,11 @@ if ($Clean) {
 # SDL2 path for sbv: use config if set, otherwise default
 $sdl2PathForTargets = if ($UserConfig.SDL2Path) { $UserConfig.SDL2Path } else { '.\deps\sdl2' }
 $targets = @{
-    'sb'  = @{ Lpr = 'SedaiBasicVM.lpr';           Output = 'sb';  ExtraPaths = @(); SupportsAudio = $true }
-    'sbc' = @{ Lpr = 'SedaiBasicCompiler.lpr';     Output = 'sbc'; ExtraPaths = @(); SupportsAudio = $false }
-    'sbd' = @{ Lpr = 'SedaiBasicDisassembler.lpr'; Output = 'sbd'; ExtraPaths = @(); SupportsAudio = $false }
-    'sbv' = @{ Lpr = 'SedaiVision.lpr';            Output = 'sbv'; ExtraPaths = @($sdl2PathForTargets); SupportsAudio = $true }
+    'sb'  = @{ Lpr = 'SedaiBasicVM.lpr';           Output = 'sb';  ExtraPaths = @(); SupportsAudio = $true;  IsWeb = $false }
+    'sbc' = @{ Lpr = 'SedaiBasicCompiler.lpr';     Output = 'sbc'; ExtraPaths = @(); SupportsAudio = $false; IsWeb = $false }
+    'sbd' = @{ Lpr = 'SedaiBasicDisassembler.lpr'; Output = 'sbd'; ExtraPaths = @(); SupportsAudio = $false; IsWeb = $false }
+    'sbv' = @{ Lpr = 'SedaiVision.lpr';            Output = 'sbv'; ExtraPaths = @($sdl2PathForTargets); SupportsAudio = $true; IsWeb = $false }
+    'sbw' = @{ Lpr = 'SedaiBasicWeb.lpr';          Output = 'sbw'; ExtraPaths = @(); SupportsAudio = $false; IsWeb = $true }
 }
 
 # Add .exe extension on Windows
@@ -445,7 +460,7 @@ if ($OS -match 'win') {
 }
 
 # Build targets
-$buildTargets = if ($Target -eq 'all') { @('sb', 'sbc', 'sbd', 'sbv') } else { @($Target) }
+$buildTargets = if ($Target -eq 'all') { @('sb', 'sbc', 'sbd', 'sbv', 'sbw') } else { @($Target) }
 $success = 0
 $failed = 0
 
@@ -478,7 +493,7 @@ foreach ($t in $buildTargets) {
         -TargetCPU $CPU -TargetOS $OS `
         -IsDebug $Debug -ExtraUnitPaths $info.ExtraPaths `
         -WithAudio $useAudio -AudioPath $SedaiAudioPath `
-        -DebugDefines $debugDefines
+        -DebugDefines $debugDefines -IsWeb $info.IsWeb
 
     if ($result) { $success++ } else { $failed++ }
 }

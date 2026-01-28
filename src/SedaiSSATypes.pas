@@ -192,7 +192,23 @@ type
     // Error handling
     ssaTrap,            // TRAP linenum: Set error handler
     ssaResume,          // RESUME: Continue after error at error line
-    ssaResumeNext       // RESUME NEXT: Continue after error at next statement
+    ssaResumeNext,      // RESUME NEXT: Continue after error at next statement
+    // Web operations (WEB_MODE only)
+    {$IFDEF WEB_MODE}
+    ssaWebGetParam,     // GET$("nome") - HTML-escaped parameter
+    ssaWebPostParam,    // POST$("nome") - HTML-escaped parameter
+    ssaWebGetRaw,       // GETRAW$("nome") - raw, unsanitized parameter
+    ssaWebPostRaw,      // POSTRAW$("nome") - raw, unsanitized parameter
+    ssaWebHtmlEncode,   // HTML$(s) - escape HTML entities
+    ssaWebUrlEncode,    // URL$(s) - URL encode string
+    ssaWebMethod,       // METHOD$ - "GET" or "POST"
+    ssaWebPath,         // PATH$ - requested path
+    ssaWebQuery,        // QUERY$ - full query string
+    ssaWebHeader,       // HEADER$("nome") - request header value
+    ssaWebSetHeader,    // SETHEADER "name", "value"
+    ssaWebStatus,       // STATUS code - set HTTP status code
+    {$ENDIF}
+    ssaDummy            // Placeholder to avoid trailing comma issues
   );
 
   { PHI source: value from a specific predecessor block }

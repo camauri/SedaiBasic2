@@ -325,6 +325,21 @@ begin
     ssaMkdir: Result := bcMkdir;
     ssaChdir: Result := bcChdir;
     ssaMoveFile: Result := bcMoveFile;
+    {$IFDEF WEB_MODE}
+    // Web operations
+    ssaWebGetParam: Result := bcWebGetParam;
+    ssaWebPostParam: Result := bcWebPostParam;
+    ssaWebGetRaw: Result := bcWebGetRaw;
+    ssaWebPostRaw: Result := bcWebPostRaw;
+    ssaWebHtmlEncode: Result := bcWebHtmlEncode;
+    ssaWebUrlEncode: Result := bcWebUrlEncode;
+    ssaWebMethod: Result := bcWebMethod;
+    ssaWebPath: Result := bcWebPath;
+    ssaWebQuery: Result := bcWebQuery;
+    ssaWebHeader: Result := bcWebHeader;
+    ssaWebSetHeader: Result := bcWebSetHeader;
+    ssaWebStatus: Result := bcWebStatus;
+    {$ENDIF}
   else
     Result := bcNop;
   end;

@@ -36,7 +36,8 @@ uses
   SedaiConsoleBehavior, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
-  {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioTypes, SedaiAudioBackend, SedaiSIDEvo{$ENDIF};
+  {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioTypes, SedaiAudioBackend, SedaiSIDEvo{$ENDIF}
+  {$IFDEF WEB_MODE}, SedaiWebIO{$ENDIF};
 
 type
   { Forward declaration }
@@ -153,6 +154,9 @@ type
     FTrapPC: Integer;             // PC to jump to on error (resolved from FTrapLine)
     FResumePC: Integer;           // PC to resume from after RESUME
     FInErrorHandler: Boolean;     // True if currently in error handler
+    {$IFDEF WEB_MODE}
+    FWebContext: TObject;         // TWebContext for web mode (forward reference)
+    {$ENDIF}
     {$IFDEF WITH_SEDAI_AUDIO}
     FAudioInitialized: Boolean;
     FAudioBackend: TSedaiAudioBackend;   // SAF audio backend
@@ -178,6 +182,9 @@ type
     procedure ExecuteSoundOp(const Instr: TBytecodeInstruction);
     procedure ExecuteSpriteOp(const Instr: TBytecodeInstruction);
     procedure ExecuteFileIOOp(const Instr: TBytecodeInstruction);
+    {$IFDEF WEB_MODE}
+    procedure ExecuteWebOp(const Instr: TBytecodeInstruction);
+    {$ENDIF}
     // File management operations (executed directly in VM)
     procedure ExecuteCopyFile(const Src, Dest: string; Overwrite: Boolean);
     procedure ExecuteScratch(const Pattern: string; Force: Boolean);
@@ -227,6 +234,9 @@ type
     property OnDiskFile: TDiskFileEvent read FOnDiskFile write FOnDiskFile;
     property OnFileData: TFileDataEvent read FOnFileData write FOnFileData;
     property CmdHandle: Integer read FCmdHandle;  // Current CMD output redirect handle
+    {$IFDEF WEB_MODE}
+    procedure SetWebContext(AContext: TObject);
+    {$ENDIF}
     // Error state for EL, ER, ERR$ system variables
     procedure SetErrorState(ALine, ACode: Integer; const AMessage: string);
     procedure ClearErrorState;
@@ -1522,6 +1532,9 @@ begin
     5: begin ExecuteSpecialVarOp(Instr); Exit; end;
     6: begin ExecuteFileIOOp(Instr); Exit; end;
     7: begin ExecuteSpriteOp(Instr); Exit; end;
+    {$IFDEF WEB_MODE}
+    8: begin ExecuteWebOp(Instr); Exit; end;
+    {$ENDIF}
     10: begin ExecuteGraphicsOp(Instr); Exit; end;
     11: begin ExecuteSoundOp(Instr); Exit; end;
     200..255: begin ExecuteSuperinstruction(Instr); Exit; end;
@@ -4037,5 +4050,114 @@ begin
   if Assigned(FOutputDevice) then
     FOutputDevice.SetFastMode(False);
 end;
+
+{$IFDEF WEB_MODE}
+procedure TBytecodeVM.SetWebContext(AContext: TObject);
+begin
+  FWebContext := AContext;
+end;
+
+procedure TBytecodeVM.ExecuteWebOp(const Instr: TBytecodeInstruction);
+var
+  SubOp: Word;
+  ParamName, Value: string;
+  WebCtx: TWebContext;
+begin
+  { Group 8: Web operations (0x08xx) - WEB_MODE only
+    Opcodes:
+      $01 = GET$("name")      - HTML-escaped query parameter
+      $02 = POST$("name")     - HTML-escaped POST parameter
+      $03 = GETRAW$("name")   - raw query parameter
+      $04 = POSTRAW$("name")  - raw POST parameter
+      $05 = HTML$(s)          - escape HTML entities
+      $06 = URL$(s)           - URL encode
+      $07 = METHOD$           - "GET" or "POST"
+      $08 = PATH$             - requested path
+      $09 = QUERY$            - full query string
+      $0A = HEADER$("name")   - request header
+      $0B = SETHEADER         - set response header
+      $0C = STATUS            - set HTTP status code
+  }
+
+  if not Assigned(FWebContext) then
+    raise Exception.Create('Web context not initialized');
+
+  WebCtx := TWebContext(FWebContext);
+  SubOp := Instr.OpCode and $FF;
+
+  case SubOp of
+    $01: // bcWebGetParam - GET$("name")
+      begin
+        ParamName := FStringRegs[Instr.Src1];
+        FStringRegs[Instr.Dest] := WebCtx.GetParam(ParamName);
+      end;
+
+    $02: // bcWebPostParam - POST$("name")
+      begin
+        ParamName := FStringRegs[Instr.Src1];
+        FStringRegs[Instr.Dest] := WebCtx.PostParam(ParamName);
+      end;
+
+    $03: // bcWebGetRaw - GETRAW$("name")
+      begin
+        ParamName := FStringRegs[Instr.Src1];
+        FStringRegs[Instr.Dest] := WebCtx.GetParamRaw(ParamName);
+      end;
+
+    $04: // bcWebPostRaw - POSTRAW$("name")
+      begin
+        ParamName := FStringRegs[Instr.Src1];
+        FStringRegs[Instr.Dest] := WebCtx.PostParamRaw(ParamName);
+      end;
+
+    $05: // bcWebHtmlEncode - HTML$(s)
+      begin
+        Value := FStringRegs[Instr.Src1];
+        FStringRegs[Instr.Dest] := HtmlEncode(Value);
+      end;
+
+    $06: // bcWebUrlEncode - URL$(s)
+      begin
+        Value := FStringRegs[Instr.Src1];
+        FStringRegs[Instr.Dest] := UrlEncode(Value);
+      end;
+
+    $07: // bcWebMethod - METHOD$
+      begin
+        FStringRegs[Instr.Dest] := WebCtx.Method;
+      end;
+
+    $08: // bcWebPath - PATH$
+      begin
+        FStringRegs[Instr.Dest] := WebCtx.Path;
+      end;
+
+    $09: // bcWebQuery - QUERY$
+      begin
+        FStringRegs[Instr.Dest] := WebCtx.QueryString;
+      end;
+
+    $0A: // bcWebHeader - HEADER$("name")
+      begin
+        ParamName := FStringRegs[Instr.Src1];
+        FStringRegs[Instr.Dest] := WebCtx.GetHeader(ParamName);
+      end;
+
+    $0B: // bcWebSetHeader - SETHEADER name, value
+      begin
+        ParamName := FStringRegs[Instr.Src1];
+        Value := FStringRegs[Instr.Src2];
+        WebCtx.SetResponseHeader(ParamName, Value);
+      end;
+
+    $0C: // bcWebStatus - STATUS code
+      begin
+        WebCtx.ResponseStatus := FIntRegs[Instr.Src1];
+      end;
+  else
+    raise Exception.CreateFmt('Unknown web opcode $%x at PC=%d', [SubOp, FPC]);
+  end;
+end;
+{$ENDIF}
 
 end.
