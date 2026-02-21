@@ -94,8 +94,8 @@ type
       FDefMap: specialize TDictionary<Int64, TDefLocation>;
       FWorklist: specialize TQueue<TWorkItem>;
 
-    { Encode (RegIndex, Version) into single Int64 key }
-    function MakeDefKey(RegIndex, Version: Integer): Int64; inline;
+    { Encode (RegType, RegIndex, Version) into single Int64 key }
+    function MakeDefKey(RegType: TSSARegisterType; RegIndex, Version: Integer): Int64; inline;
 
     { Build def→location map for all versioned registers }
     procedure BuildDefMap;
@@ -110,7 +110,7 @@ type
     procedure ProcessWorklist;
 
     { Add defining instruction of a register use to worklist }
-    procedure EnqueueDefiningInstruction(RegIndex, Version: Integer);
+    procedure EnqueueDefiningInstruction(RegType: TSSARegisterType; RegIndex, Version: Integer);
 
     { Remove dead instructions from all blocks }
     procedure RemoveDeadInstructions;
@@ -147,12 +147,13 @@ begin
   inherited;
 end;
 
-function TDeadCodeElimination.MakeDefKey(RegIndex, Version: Integer): Int64;
+function TDeadCodeElimination.MakeDefKey(RegType: TSSARegisterType; RegIndex, Version: Integer): Int64;
 begin
-  { Encode (RegIndex, Version) into single Int64 key.
+  { Encode (RegType, RegIndex, Version) into single Int64 key.
     Supports up to 1M versions per register (plenty for any program).
-    Key = RegIndex * 1000000 + Version }
-  Result := Int64(RegIndex) * 1000000 + Int64(Version);
+    Key = RegType * 1000000000000 + RegIndex * 1000000 + Version
+    This ensures that I0_v1 and S0_v1 have different keys. }
+  Result := Int64(Ord(RegType)) * 1000000000000 + Int64(RegIndex) * 1000000 + Int64(Version);
 end;
 
 function TDeadCodeElimination.Run: Integer;
@@ -223,7 +224,7 @@ begin
       begin
         DefLoc.BlockIdx := i;
         DefLoc.InstrIdx := j;
-        Key := MakeDefKey(Instr.Dest.RegIndex, Instr.Dest.Version);
+        Key := MakeDefKey(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
 
         // In SSA, this should never overwrite (each version defined once)
         if FDefMap.ContainsKey(Key) then
@@ -275,7 +276,8 @@ begin
     // Program termination and system state - always live
     ssaEnd, ssaStop, ssaFast, ssaSlow, ssaSleep, ssaClear,
     ssaTron, ssaTroff,  // TRON/TROFF switch VM execution mode (side effect)
-    ssaTrap, ssaResume, ssaResumeNext:  // Error handling (side effect on VM state)
+    ssaTrap, ssaResume, ssaResumeNext,  // Error handling (side effect on VM state)
+    ssaKey:  // KEY command - prints key list or modifies function key state
       Result := True;
 
     // Labels - always live (control flow targets)
@@ -346,17 +348,17 @@ begin
   FWorklist.Enqueue(WorkItem);
 end;
 
-procedure TDeadCodeElimination.EnqueueDefiningInstruction(RegIndex, Version: Integer);
+procedure TDeadCodeElimination.EnqueueDefiningInstruction(RegType: TSSARegisterType; RegIndex, Version: Integer);
 var
   Key: Int64;
   DefLoc: TDefLocation;
 begin
-  { Find the instruction that defines (RegIndex, Version) and enqueue it.
+  { Find the instruction that defines (RegType, RegIndex, Version) and enqueue it.
 
     This is the core of backward liveness propagation:
     "If X uses R_v, then the instruction defining R_v is live" }
 
-  Key := MakeDefKey(RegIndex, Version);
+  Key := MakeDefKey(RegType, RegIndex, Version);
 
   if FDefMap.TryGetValue(Key, DefLoc) then
     MarkLiveAndEnqueue(DefLoc.BlockIdx, DefLoc.InstrIdx)
@@ -365,8 +367,8 @@ begin
     // This should never happen in well-formed SSA
     {$IFDEF DEBUG_DCE}
     if DebugDCE then
-      WriteLn('[DCE] WARNING: Use of undefined register: RegIndex=', RegIndex,
-              ' Version=', Version);
+      WriteLn('[DCE] WARNING: Use of undefined register: ',
+              SSARegisterTypeToString(RegType), '[', RegIndex, ']_', Version);
     {$ENDIF}
     FSSACorrupted := True;
   end;
@@ -445,6 +447,7 @@ begin
       begin
         if Instr.PhiSources[i].Value.Kind = svkRegister then
           EnqueueDefiningInstruction(
+            Instr.PhiSources[i].Value.RegType,
             Instr.PhiSources[i].Value.RegIndex,
             Instr.PhiSources[i].Value.Version
           );
@@ -455,13 +458,13 @@ begin
       { Regular instruction: mark all register operands' definitions as live }
 
       if Instr.Src1.Kind = svkRegister then
-        EnqueueDefiningInstruction(Instr.Src1.RegIndex, Instr.Src1.Version);
+        EnqueueDefiningInstruction(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
 
       if Instr.Src2.Kind = svkRegister then
-        EnqueueDefiningInstruction(Instr.Src2.RegIndex, Instr.Src2.Version);
+        EnqueueDefiningInstruction(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
 
       if Instr.Src3.Kind = svkRegister then
-        EnqueueDefiningInstruction(Instr.Src3.RegIndex, Instr.Src3.Version);
+        EnqueueDefiningInstruction(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
 
       { For instructions that use PhiSources for extra operands (like ssaGraphicRGBA),
         also mark those as live }
@@ -471,6 +474,7 @@ begin
         begin
           if Instr.PhiSources[i].Value.Kind = svkRegister then
             EnqueueDefiningInstruction(
+              Instr.PhiSources[i].Value.RegType,
               Instr.PhiSources[i].Value.RegIndex,
               Instr.PhiSources[i].Value.Version
             );

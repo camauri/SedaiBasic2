@@ -37,7 +37,7 @@ uses
 
 const
   SCROLLBACK_LINES = 1000;
-  INPUT_HISTORY_SIZE = 100;
+  INPUT_HISTORY_SIZE = 4096;  // Same as PowerShell default
   CURSOR_BLINK_MS = 500;  // C64 cursor timing (verified)
 
   // Default colors - C128 style
@@ -2263,8 +2263,10 @@ begin
     end
     else
     begin
-      // Shift history
-      Move(FInputHistory[1], FInputHistory[0], (INPUT_HISTORY_SIZE - 1) * SizeOf(string));
+      // Shift history - use proper string assignment (NOT Move!)
+      // Move() on strings only copies pointers, corrupting reference counts
+      for i := 0 to INPUT_HISTORY_SIZE - 2 do
+        FInputHistory[i] := FInputHistory[i + 1];
       FInputHistory[INPUT_HISTORY_SIZE - 1] := Command;
     end;
   end;

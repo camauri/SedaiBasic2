@@ -44,7 +44,7 @@ uses
 
 const
   SCROLLBACK_LINES = 1000;
-  INPUT_HISTORY_SIZE = 100;
+  INPUT_HISTORY_SIZE = 4096;  // Same as PowerShell default
   CURSOR_BLINK_MS = 500;  // C64 cursor timing (verified)
 
   // Default colors - C128 style (RGB values for SDL2 mode 11)
@@ -530,9 +530,10 @@ type
     FCtrlPressed: Boolean;
     FAltPressed: Boolean;
     FVideoController: TVideoController;
+    FOutputDevice: IOutputDevice;  // Output device for synchronized I/O
     FTextInputActive: Boolean;   // Track SDL text input state
   public
-    constructor Create(AVideoController: TVideoController);
+    constructor Create(AVideoController: TVideoController; AOutputDevice: IOutputDevice = nil);
     destructor Destroy; override;
 
     // IInputDevice implementation
@@ -548,6 +549,7 @@ type
     procedure ClearStopRequest;
     procedure ProcessEvents;
     procedure Reset;
+    procedure SetOutputDevice(AOutputDevice: IOutputDevice);
 
     property QuitRequested: Boolean read FQuitRequested;
     property StopRequested: Boolean read FStopRequested;
@@ -703,6 +705,7 @@ type
 
     // VM-based execution (replaces TSedaiExecutor)
     FBytecodeVM: TBytecodeVM;
+    FMemoryMapper: TObject;  // Memory mapper for VM (owned, freed in destructor)
     FImmediateCompiler: TImmediateCompiler;
 
     // Bytecode mode - when BLOAD is used instead of LOAD
@@ -766,6 +769,7 @@ type
     function GetHistoryFilePath: string;
     procedure LoadHistory;
     procedure SaveHistory;
+    procedure SaveHistoryFull;  // Rewrites entire history file
 
   public
     constructor Create;
@@ -783,6 +787,8 @@ type
     procedure SetHistoryFile(const AFileName: string);
 
     property CtrlCEnabled: Boolean read FCtrlCEnabled write FCtrlCEnabled;
+    // Function key definition (for console expansion)
+    function GetFunctionKeyDefinition(KeyNum: Integer): string;
   end;
 
 implementation
@@ -4669,7 +4675,8 @@ begin
   // Use dedicated program input handler for VM (NOT the console input handler)
   FBytecodeVM.SetInputDevice(FProgramInputHandler);
   // Create and set memory mapper for PEEK/POKE support
-  FBytecodeVM.SetMemoryMapper(TC128MemoryMapper.Create(FVideoController, nil));
+  FMemoryMapper := TC128MemoryMapper.Create(FVideoController, nil);
+  FBytecodeVM.SetMemoryMapper(FMemoryMapper as IMemoryMapper);
 
   FImmediateCompiler := TImmediateCompiler.Create;
 
@@ -4701,18 +4708,32 @@ begin
   // Save command history to file
   SaveHistory;
 
-  // Free debugger first (before VM)
+  // Clear debugger from VM and free debugger
+  if Assigned(FBytecodeVM) then
+    FBytecodeVM.SetDebugger(nil);
   if Assigned(FDebugger) then
   begin
+    FDebugger.OnTrace := nil;
+    FDebugger.OnPause := nil;
     FDebugger.Free;
     FDebugger := nil;
   end;
 
-  // Free VM components first
+  // Clear VM references to I/O devices and memory mapper before freeing
   if Assigned(FBytecodeVM) then
   begin
+    FBytecodeVM.SetOutputDevice(nil);
+    FBytecodeVM.SetInputDevice(nil);
+    FBytecodeVM.SetMemoryMapper(nil);  // Clear reference before freeing mapper
     FBytecodeVM.Free;
     FBytecodeVM := nil;
+  end;
+
+  // Free memory mapper (after VM no longer references it)
+  if Assigned(FMemoryMapper) then
+  begin
+    FMemoryMapper.Free;
+    FMemoryMapper := nil;
   end;
 
   if Assigned(FImmediateCompiler) then
@@ -4740,9 +4761,15 @@ begin
     FCommandRouter := nil;
   end;
 
-  // Other components
+  // Clear output device reference in ProgramInputHandler before freeing ConsoleOutputAdapter
+  // to avoid dangling pointer
+  if Assigned(FProgramInputHandler) then
+    FProgramInputHandler.SetOutputDevice(nil);
+
+  // Other components - clear callback before freeing to avoid calling freed methods
   if Assigned(FConsoleOutputAdapter) then
   begin
+    FConsoleOutputAdapter.SetRenderCallback(nil);
     FConsoleOutputAdapter.Free;
     FConsoleOutputAdapter := nil;
   end;
@@ -4778,6 +4805,15 @@ begin
   end;
 
   inherited Destroy;
+end;
+
+function TSedaiNewConsole.GetFunctionKeyDefinition(KeyNum: Integer): string;
+begin
+  // Get function key definition from VM
+  if Assigned(FBytecodeVM) then
+    Result := FBytecodeVM.GetFunctionKey(KeyNum)
+  else
+    Result := '';
 end;
 
 function TSedaiNewConsole.GetSystemInfo: string;
@@ -5018,6 +5054,10 @@ begin
   FConsoleOutputAdapter := TConsoleOutputAdapter.Create(FTextBuffer, FVideoController);
   FConsoleOutputAdapter.SetRenderCallback(@Self.RenderScreen);  // Set callback for RenderScreen calls
   {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: ConsoleOutputAdapter created');{$ENDIF}
+
+  // Set output device on program input handler for synchronized I/O
+  if Assigned(FProgramInputHandler) then
+    FProgramInputHandler.SetOutputDevice(FConsoleOutputAdapter);
 
   // Connect I/O devices to VM
   if Assigned(FBytecodeVM) then
@@ -5334,6 +5374,10 @@ begin
               end;
             end;
           finally
+            // Clear VM's reference to the program before freeing it
+            // to avoid dangling pointer access violations on shutdown
+            if Assigned(FBytecodeVM) then
+              FBytecodeVM.ClearProgram;
             if Assigned(BytecodeProgram) then
               BytecodeProgram.Free;
           end;
@@ -5408,6 +5452,9 @@ begin
                       end;
                     end;
                   finally
+                    // Clear VM's reference before freeing
+                    if Assigned(FBytecodeVM) then
+                      FBytecodeVM.ClearProgram;
                     if Assigned(BytecodeProgram) then
                       BytecodeProgram.Free;
                   end;
@@ -5494,6 +5541,9 @@ begin
                     end;
                   end;
                 finally
+                  // Clear VM's reference before freeing
+                  if Assigned(FBytecodeVM) then
+                    FBytecodeVM.ClearProgram;
                   if Assigned(BytecodeProgram) then
                     BytecodeProgram.Free;
                 end;
@@ -7934,10 +7984,49 @@ begin
   end;
 end;
 
+procedure TSedaiNewConsole.SaveHistoryFull;
+var
+  HistPath, HistDir: string;
+  F: TextFile;
+  i: Integer;
+begin
+  HistPath := GetHistoryFilePath;
+  if HistPath = '' then
+    Exit;
+  if FHistoryCount = 0 then
+    Exit;
+
+  // Create directory if needed
+  HistDir := ExtractFilePath(HistPath);
+  if (HistDir <> '') and (not DirectoryExists(HistDir)) then
+  begin
+    try
+      ForceDirectories(HistDir);
+    except
+      Exit;
+    end;
+  end;
+
+  try
+    AssignFile(F, HistPath);
+    Rewrite(F);  // Always rewrite the entire file
+    try
+      for i := 0 to FHistoryCount - 1 do
+        WriteLn(F, FInputHistory[i]);
+    finally
+      CloseFile(F);
+    end;
+  except
+    // Silently ignore errors saving history
+  end;
+end;
+
 procedure TSedaiNewConsole.Run;
 var
   CurrentLine: string;
   FileExt: string;
+  FkDef: string;  // Function key definition
+  i: Integer;     // For history shift loop
 begin
   FRunning := True;
 
@@ -7998,6 +8087,34 @@ begin
       Continue;
     end;
 
+    // Function keys F1-F12: expand to defined string (check FIRST, before other input)
+    if FInputHandler.HasChar and (Ord(FInputHandler.LastChar) >= 128) and (Ord(FInputHandler.LastChar) <= 139) then
+    begin
+      if FTextBuffer.IsInScrollbackMode then
+        FTextBuffer.ScrollToEnd;
+      // Get function key definition (F1=#128 -> index 1, etc.)
+      FkDef := GetFunctionKeyDefinition(Ord(FInputHandler.LastChar) - 127);
+      if FkDef <> '' then
+      begin
+        // Check for CHR$(13) at end for auto-execute (C128 convention)
+        if (Length(FkDef) > 0) and (FkDef[Length(FkDef)] = #13) then
+        begin
+          Delete(FkDef, Length(FkDef), 1);
+          FTextBuffer.PutString(FkDef);
+          FTextBuffer.NewLine;
+          ProcessCommand(FkDef);
+          FUserHasTyped := False;
+        end
+        else
+        begin
+          FTextBuffer.PutString(FkDef);
+          FUserHasTyped := True;
+        end;
+      end;
+      FInputHandler.ClearFlags;
+      Continue;
+    end;
+
     // Handle input
     if FInputHandler.LastKeyDown = SDLK_RETURN then
     begin
@@ -8016,14 +8133,18 @@ begin
         begin
           FInputHistory[FHistoryCount] := CurrentLine;
           Inc(FHistoryCount);
+          SaveHistory;
         end
         else
         begin
-          // Shift history
-          Move(FInputHistory[1], FInputHistory[0], (INPUT_HISTORY_SIZE - 1) * SizeOf(string));
+          // Shift history - use proper string assignment (NOT Move!)
+          // Move() on strings only copies pointers, corrupting reference counts
+          for i := 0 to INPUT_HISTORY_SIZE - 2 do
+            FInputHistory[i] := FInputHistory[i + 1];
           FInputHistory[INPUT_HISTORY_SIZE - 1] := CurrentLine;
+          // Rewrite entire history file to prevent infinite growth
+          SaveHistoryFull;
         end;
-        SaveHistory;
       end;
       FHistoryPos := -1;
       FUserHasTyped := False;  // Reset for next input
@@ -8271,6 +8392,8 @@ var
   IsValidChar: Boolean;
   KeyMod: UInt16;
   CtrlDown, AltDown: Boolean;
+  FkDef: string;
+  FkIdx: Integer;
 begin
   InputBuffer := '';
   Done := False;
@@ -8339,6 +8462,57 @@ begin
                     FTextBuffer.DeleteChar;
                   end;
                   Done := True;
+                end;
+
+              // Function keys F1-F12: expand to defined string
+              SDLK_F1, SDLK_F2, SDLK_F3, SDLK_F4,
+              SDLK_F5, SDLK_F6, SDLK_F7, SDLK_F8,
+              SDLK_F9, SDLK_F10, SDLK_F11, SDLK_F12:
+                begin
+                  // Get function key number (F1=1, F2=2, etc.)
+                  case Event.key.keysym.sym of
+                    SDLK_F1: FkIdx := 1;
+                    SDLK_F2: FkIdx := 2;
+                    SDLK_F3: FkIdx := 3;
+                    SDLK_F4: FkIdx := 4;
+                    SDLK_F5: FkIdx := 5;
+                    SDLK_F6: FkIdx := 6;
+                    SDLK_F7: FkIdx := 7;
+                    SDLK_F8: FkIdx := 8;
+                    SDLK_F9: FkIdx := 9;
+                    SDLK_F10: FkIdx := 10;
+                    SDLK_F11: FkIdx := 11;
+                    SDLK_F12: FkIdx := 12;
+                  else
+                    FkIdx := 0;
+                  end;
+
+                  // Get function key definition from console
+                  if (FkIdx > 0) and Assigned(FConsole) then
+                  begin
+                    FkDef := FConsole.GetFunctionKeyDefinition(FkIdx);
+                    if FkDef <> '' then
+                    begin
+                      // Check for CHR$(13) at end for auto-execute (C128 convention)
+                      if (Length(FkDef) > 0) and (FkDef[Length(FkDef)] = #13) then
+                      begin
+                        // Remove the CHR$(13) from the string
+                        Delete(FkDef, Length(FkDef), 1);
+                        // Insert into input buffer and echo to screen
+                        InputBuffer := InputBuffer + FkDef;
+                        FTextBuffer.PutString(FkDef);
+                        // Auto-execute by going to new line
+                        FTextBuffer.NewLine;
+                        Done := True;
+                      end
+                      else
+                      begin
+                        // Just insert the definition (no auto-execute)
+                        InputBuffer := InputBuffer + FkDef;
+                        FTextBuffer.PutString(FkDef);
+                      end;
+                    end;
+                  end;
                 end;
             end;
           end;
@@ -8456,10 +8630,11 @@ end;
   TProgramInputHandler - Dedicated input handler for BASIC program execution
   ============================================================================ }
 
-constructor TProgramInputHandler.Create(AVideoController: TVideoController);
+constructor TProgramInputHandler.Create(AVideoController: TVideoController; AOutputDevice: IOutputDevice);
 begin
   inherited Create;
   FVideoController := AVideoController;
+  FOutputDevice := AOutputDevice;
   FQuitRequested := False;
   FStopRequested := False;
   FLastChar := '';
@@ -8799,11 +8974,26 @@ begin
   InputBuffer := '';
   Done := False;
 
-  // Display prompt
-  if (Prompt <> '') and Assigned(FVideoController) then
-  begin
-    FVideoController.Print(Prompt);
+  // Flush any buffered output before waiting for input
+  // This ensures PRINT statements before INPUT are displayed immediately
+  if Assigned(FOutputDevice) then
+    FOutputDevice.Present
+  else if Assigned(FVideoController) then
     FVideoController.Present;
+
+  // Display prompt - use OutputDevice if available for proper TextBuffer sync
+  if (Prompt <> '') then
+  begin
+    if Assigned(FOutputDevice) then
+    begin
+      FOutputDevice.Print(Prompt);
+      FOutputDevice.Present;
+    end
+    else if Assigned(FVideoController) then
+    begin
+      FVideoController.Print(Prompt);
+      FVideoController.Present;
+    end;
   end;
 
   EnableTextInput;
@@ -8825,7 +9015,12 @@ begin
           #13:  // ENTER
           begin
             Done := True;
-            if Assigned(FVideoController) then
+            if Assigned(FOutputDevice) then
+            begin
+              FOutputDevice.NewLine;
+              FOutputDevice.Present;
+            end
+            else if Assigned(FVideoController) then
             begin
               FVideoController.NewLine;
               FVideoController.Present;
@@ -8836,8 +9031,15 @@ begin
             if Length(InputBuffer) > 0 then
             begin
               Delete(InputBuffer, Length(InputBuffer), 1);
-              // Visual feedback
-              if Assigned(FVideoController) then
+              // Visual feedback - use OutputDevice if available
+              if Assigned(FOutputDevice) then
+              begin
+                FOutputDevice.MoveCursor(-1, 0);
+                FOutputDevice.Print(' ');
+                FOutputDevice.MoveCursor(-1, 0);
+                FOutputDevice.Present;
+              end
+              else if Assigned(FVideoController) then
               begin
                 FVideoController.MoveCursor(-1, 0);
                 FVideoController.Print(' ');
@@ -8855,7 +9057,12 @@ begin
           if Ch >= ' ' then
           begin
             InputBuffer := InputBuffer + Ch;
-            if Assigned(FVideoController) then
+            if Assigned(FOutputDevice) then
+            begin
+              FOutputDevice.Print(Ch);
+              FOutputDevice.Present;
+            end
+            else if Assigned(FVideoController) then
             begin
               FVideoController.Print(Ch);
               FVideoController.Present;
@@ -8899,6 +9106,11 @@ begin
   FShiftPressed := False;
   FCtrlPressed := False;
   FAltPressed := False;
+end;
+
+procedure TProgramInputHandler.SetOutputDevice(AOutputDevice: IOutputDevice);
+begin
+  FOutputDevice := AOutputDevice;
 end;
 
 end.

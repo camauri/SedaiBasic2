@@ -956,9 +956,18 @@ begin
         end;
 
       else
+        // SPECIAL CASE: String concatenation (string + string or string + any)
+        if (Node.Token.TokenType = ttOpAdd) and
+           ((Left.RegType = srtString) or (Right.RegType = srtString)) then
+        begin
+          // String concatenation
+          DestReg := FProgram.AllocRegister(srtString);
+          Result := MakeSSARegister(srtString, DestReg);
+          EmitInstruction(ssaStrConcat, Result, Left, Right, MakeSSAValue(svkNone));
+        end
         // Arithmetic operators
         // SPECIAL CASE: Division always returns float (even for int/int)
-        if Node.Token.TokenType = ttOpDiv then
+        else if Node.Token.TokenType = ttOpDiv then
         begin
           // Convert both operands to float if needed
           if Left.RegType = srtInt then
@@ -7271,8 +7280,10 @@ begin
       end
       else
       begin
-        // KEY - list all keys (use -1 to indicate list mode)
-        EmitInstruction(ssaKey, MakeSSAValue(svkNone), MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // KEY - list all keys (0 = list mode, valid keys are 1-12)
+        KeyNumReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, KeyNumReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitInstruction(ssaKey, MakeSSAValue(svkNone), KeyNumReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
     end;
     // Debug/Trace - these are RUNTIME instructions that switch between RunFast and RunDebug

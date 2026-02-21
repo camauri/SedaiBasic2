@@ -109,8 +109,8 @@ type
     // Time tracking for TI and TI$
     FStartTicks: QWord;     // Milliseconds since system start when VM started
     FTimeOffset: Int64;     // TI$ offset in milliseconds from real time
-    // Function key definitions (1-8)
-    FFunctionKeys: array[1..8] of string;
+    // Function key definitions (1-12)
+    FFunctionKeys: array[1..12] of string;
     FVarMap: TStringList;
     FArrays: array of TArrayStorage;
     // DATA pool for DATA/READ/RESTORE statements
@@ -202,6 +202,7 @@ type
     constructor Create;
     destructor Destroy; override;
     procedure LoadProgram(Program_: TBytecodeProgram);
+    procedure ClearProgram;  // Clear program reference (use before freeing the program externally)
     procedure SetOutputDevice(Device: IOutputDevice);
     procedure SetInputDevice(Device: IInputDevice);
     procedure SetMemoryMapper(Mapper: IMemoryMapper);
@@ -246,6 +247,8 @@ type
     // TRUE value for comparisons (-1 = Commodore BASIC, 1 = modern BASIC)
     procedure SetTrueValue(AValue: Int64);
     property TrueValue: Int64 read FTrueValue write FTrueValue;
+    // Function key definitions (for console expansion)
+    function GetFunctionKey(KeyNum: Integer): string;
   end;
 
 implementation
@@ -457,6 +460,15 @@ begin
     FConsoleBehavior.Free;
   FVarMap.Free;
   inherited Destroy;
+end;
+
+function TBytecodeVM.GetFunctionKey(KeyNum: Integer): string;
+begin
+  // Return function key definition (1-12 are valid)
+  if (KeyNum >= 1) and (KeyNum <= 12) then
+    Result := FFunctionKeys[KeyNum]
+  else
+    Result := '';
 end;
 
 procedure TBytecodeVM.InitializeRegisters;
@@ -1266,11 +1278,40 @@ begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;  // index is int
         end;
 
-        // String Src1 (source)
-        bcStrLen:
+        // String Src1 (source) -> int Dest
+        bcStrLen, bcStrAsc, bcStrDec:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+        end;
+
+        // Int Src1 -> String Dest (CHR$, HEX$, ERR$)
+        bcStrChr, bcStrHex, bcStrErr:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
+
+        // Float Src1 -> String Dest (STR$)
+        bcStrStr:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+          if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
+        end;
+
+        // String Src1 -> Float Dest (VAL)
+        bcStrVal:
+        begin
+          if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+        end;
+
+        // INSTR(haystack$, needle$[, start]) -> int Dest
+        bcStrInstr:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;  // haystack
+          if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;  // needle
         end;
 
         // Print/PrintLn: float in Src1
@@ -1395,6 +1436,13 @@ begin
         begin
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;   // filename
         end;
+
+        // bcKey: Src1=key number (int), Src2=key text (string, optional)
+        bcKey:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;         // key number
+          if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;   // key text (optional)
+        end;
       end;
     end;
   end;
@@ -1410,6 +1458,13 @@ begin
   if MaxStringReg >= 0 then
     EnsureRegisterCapacity(srtString, MaxStringReg);
 
+end;
+
+procedure TBytecodeVM.ClearProgram;
+begin
+  // Clear the program reference to avoid dangling pointers
+  // Call this BEFORE freeing a program that was loaded externally
+  FProgram := nil;
 end;
 
 procedure TBytecodeVM.SetOutputDevice(Device: IOutputDevice);
@@ -1518,7 +1573,10 @@ procedure TBytecodeVM.ExecuteInstruction(const Instr: TBytecodeInstruction);
 var
   Group: Word;
   SleepMs: Integer;
-  KeyNum, KeyIdx: Integer;
+  KeyNum, KeyIdx, CharIdx: Integer;
+  KeyText: string;
+  Ch: Char;
+  InQuotes: Boolean;
 begin
   // Two-level dispatch: extract group from high byte
   Group := Instr.OpCode shr 8;
@@ -1721,21 +1779,58 @@ begin
       begin
         // KEY n, "text" - define function key
         // KEY n - clear key definition
-        // KEY (-1) - list all keys
+        // KEY (0) - list all keys (valid keys are 1-12)
         KeyNum := FIntRegs[Instr.Src1];
-        if KeyNum = -1 then
+        if KeyNum = 0 then
         begin
           // List all function key definitions
           if Assigned(FOutputDevice) then
           begin
-            for KeyIdx := 1 to 8 do
+            for KeyIdx := 1 to 12 do
             begin
-              FOutputDevice.Print('F' + IntToStr(KeyIdx) + ': "' + FFunctionKeys[KeyIdx] + '"');
+              // Format as proper BASIC concatenation: "TEXT"+CHR$(n)
+              KeyText := '';
+              InQuotes := False;
+              for CharIdx := 1 to Length(FFunctionKeys[KeyIdx]) do
+              begin
+                Ch := FFunctionKeys[KeyIdx][CharIdx];
+                if Ord(Ch) < 32 then
+                begin
+                  // Control character - close quotes if open, add +CHR$(n)
+                  if InQuotes then
+                  begin
+                    KeyText := KeyText + '"';
+                    InQuotes := False;
+                  end;
+                  if KeyText <> '' then
+                    KeyText := KeyText + '+';
+                  KeyText := KeyText + 'CHR$(' + IntToStr(Ord(Ch)) + ')';
+                end
+                else
+                begin
+                  // Normal character - open quotes if needed
+                  if not InQuotes then
+                  begin
+                    if KeyText <> '' then
+                      KeyText := KeyText + '+';
+                    KeyText := KeyText + '"';
+                    InQuotes := True;
+                  end;
+                  KeyText := KeyText + Ch;
+                end;
+              end;
+              // Close quotes if still open
+              if InQuotes then
+                KeyText := KeyText + '"';
+              // Show "" for undefined keys
+              if KeyText = '' then
+                KeyText := '""';
+              FOutputDevice.Print('F' + IntToStr(KeyIdx) + ': ' + KeyText);
               FOutputDevice.NewLine;
             end;
           end;
         end
-        else if (KeyNum >= 1) and (KeyNum <= 8) then
+        else if (KeyNum >= 1) and (KeyNum <= 12) then
         begin
           // Define or clear function key
           if Instr.Src2 < FStringRegCount then

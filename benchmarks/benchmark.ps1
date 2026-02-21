@@ -131,7 +131,7 @@ $Script:ConfigurationComplete = $false  # Set to true after user completes setup
 $Script:Benchmarks = @(
     @{
         Name = "fannkuch-redux"
-        Source = "bas\fannkuch-redux.bas"
+        Source = "bas\07_benchmarks\fannkuch-redux.bas"
         NPattern = "N%\s*=\s*(\d+)"
         NReplace = "N% = {0}"
         StandardN = 12
@@ -139,7 +139,7 @@ $Script:Benchmarks = @(
     },
     @{
         Name = "n-body"
-        Source = "bas\n-body.bas"
+        Source = "bas\07_benchmarks\n-body.bas"
         NPattern = "N%\s*=\s*(\d+)"
         NReplace = "N%={0}"
         StandardN = 50000000
@@ -147,7 +147,7 @@ $Script:Benchmarks = @(
     },
     @{
         Name = "spectral-norm"
-        Source = "bas\spectral-norm.bas"
+        Source = "bas\07_benchmarks\spectral-norm.bas"
         NPattern = "N%\s*=\s*(\d+)"
         NReplace = "N% = {0}"
         StandardN = 5500
