@@ -94,6 +94,10 @@ type
     FBGColorSDL2: TSDL_Color;
     FFGColorSDL2: TSDL_Color;
 
+    // Palette color cache (avoids repeated lookups during rendering)
+    FPaletteCache: array[0..255] of TSDL_Color;
+    FPaletteCacheValid: Boolean;
+
     // Classic modes (0-10) palette indices for drawing
     FForegroundIndex: Byte;
     FBackgroundIndex: Byte;
@@ -183,7 +187,7 @@ type
     procedure ClearViewport;    // Clears viewport with BG color
     procedure Present;
     procedure RenderText(ATextBuffer: TTextBuffer);  // Renders the text buffer
-    
+
     // IOutputDevice implementation
     function Initialize(const Title: string = ''; Width: Integer = 80; Height: Integer = 25): Boolean;
     procedure Shutdown;
@@ -192,6 +196,7 @@ type
     procedure PrintLn(const Text: string; ClearBackground: Boolean = False);
     procedure NewLine;
     procedure Clear;
+    procedure ResetPrintState;
     procedure SetCursor(X, Y: Integer);
     procedure MoveCursor(DeltaX, DeltaY: Integer);
     function GetCursorX: Integer;
@@ -394,6 +399,7 @@ type
     destructor Destroy; override;
 
     procedure Clear;
+    procedure ResetPrintState;  // Reset reverse mode after PRINT (C128 behavior)
     procedure PutChar(Ch: Char);
     procedure InsertChar(Ch: Char);  // Insert mode: shifts chars right
     procedure PutString(const S: string);
@@ -586,7 +592,7 @@ type
   public
     constructor Create(ATextBuffer: TTextBuffer; AVideoController: TVideoController);
     procedure SetRenderCallback(AProc: TRenderScreenProc);
-    
+
     // IOutputDevice implementation
     function Initialize(const Title: string = ''; Width: Integer = 80; Height: Integer = 25): Boolean;
     procedure Shutdown;
@@ -595,6 +601,7 @@ type
     procedure PrintLn(const Text: string; ClearBackground: Boolean = False);
     procedure NewLine;
     procedure Clear;
+    procedure ResetPrintState;
     procedure SetCursor(X, Y: Integer);
     procedure MoveCursor(DeltaX, DeltaY: Integer);
     function GetCursorX: Integer;
@@ -859,6 +866,9 @@ begin
   // Default text rendering flags
   FReverseActive := False;
 
+  // Palette cache - will be filled on first use
+  FPaletteCacheValid := False;
+
   // FAST mode (C128 2MHz mode emulation) - default off, alpha 255 (opaque)
   FFastMode := False;
   FFastModeAlpha := 255;
@@ -979,27 +989,42 @@ begin
 end;
 
 // Convert palette index to SDL_Color (for border/text rendering in classic modes)
+// Uses cached values for performance during text rendering
 function TVideoController.PaletteIndexToSDLColor(Index: Byte): TSDL_Color;
 var
   PaletteColor: UInt32;
+  i: Integer;
 begin
-  if FGraphicsMemory <> nil then
+  // Build cache if not valid
+  if not FPaletteCacheValid then
   begin
-    PaletteColor := FGraphicsMemory.Palette[Index];
-    // Palette format is $AABBGGRR (see sedaigraphicsconfig.pas)
-    Result.r := PaletteColor and $FF;
-    Result.g := (PaletteColor shr 8) and $FF;
-    Result.b := (PaletteColor shr 16) and $FF;
-    Result.a := 255;
-  end
-  else
-  begin
-    // Fallback to black if no graphics memory
-    Result.r := 0;
-    Result.g := 0;
-    Result.b := 0;
-    Result.a := 255;
+    if FGraphicsMemory <> nil then
+    begin
+      for i := 0 to 255 do
+      begin
+        PaletteColor := FGraphicsMemory.Palette[i];
+        // Palette format is $AABBGGRR (see sedaigraphicsconfig.pas)
+        FPaletteCache[i].r := PaletteColor and $FF;
+        FPaletteCache[i].g := (PaletteColor shr 8) and $FF;
+        FPaletteCache[i].b := (PaletteColor shr 16) and $FF;
+        FPaletteCache[i].a := 255;
+      end;
+    end
+    else
+    begin
+      // Fallback to black if no graphics memory
+      for i := 0 to 255 do
+      begin
+        FPaletteCache[i].r := 0;
+        FPaletteCache[i].g := 0;
+        FPaletteCache[i].b := 0;
+        FPaletteCache[i].a := 255;
+      end;
+    end;
+    FPaletteCacheValid := True;
   end;
+
+  Result := FPaletteCache[Index];
 end;
 
 // Get current foreground color (auto-selects based on mode)
@@ -1517,7 +1542,7 @@ begin
     begin
       Cell := ATextBuffer.GetCell(Row, Col);
 
-      // Skip spaces with default background (optimization)
+      // Skip spaces (optimization) - original fast path
       if Cell.Ch = ' ' then
       begin
         RenderX := RenderX + FCharWidth;
@@ -1536,17 +1561,9 @@ begin
         EffectiveBG := Cell.BGIndex;
       end;
 
-      // Get SDL colors
-      if FCurrentMode = gmSDL2Dynamic then
-      begin
-        CellTextColor := FFGColorSDL2;
-        CellBGColor := FBGColorSDL2;
-      end
-      else
-      begin
-        CellTextColor := PaletteIndexToSDLColor(EffectiveFG);
-        CellBGColor := PaletteIndexToSDLColor(EffectiveBG);
-      end;
+      // Get SDL colors from per-cell palette indices (supports PETSCII color codes)
+      CellTextColor := PaletteIndexToSDLColor(EffectiveFG);
+      CellBGColor := PaletteIndexToSDLColor(EffectiveBG);
 
       // Draw background if different from screen color
       if EffectiveBG <> FScreenColorIndex then
@@ -1740,6 +1757,12 @@ begin
   ClearViewport;
   FCursorX := 0;
   FCursorY := 0;
+end;
+
+procedure TVideoController.ResetPrintState;
+begin
+  // TVideoController doesn't own the text buffer - the reset is handled
+  // by TConsoleOutputAdapter which delegates to TTextBuffer.ResetPrintState
 end;
 
 procedure TVideoController.SetCursor(X, Y: Integer);
@@ -2542,7 +2565,10 @@ end;
 procedure TVideoController.SetPaletteColor(Index: TPaletteIndex; RGB: UInt32);
 begin
   if FGraphicsMemory <> nil then
+  begin
     FGraphicsMemory.SetPaletteColor(Index, RGB);
+    FPaletteCacheValid := False;  // Invalidate cache
+  end;
 end;
 
 function TVideoController.GetPaletteColor(Index: TPaletteIndex): UInt32;
@@ -2556,19 +2582,29 @@ end;
 procedure TVideoController.ResetPalette;
 begin
   if FGraphicsMemory <> nil then
+  begin
     FGraphicsMemory.ResetPalette;
+    FPaletteCacheValid := False;  // Invalidate cache
+  end;
 end;
 
 procedure TVideoController.SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
 begin
   if FGraphicsMemory <> nil then
+  begin
     FGraphicsMemory.SetPaletteColorRGBA(Index, R, G, B, A);
+    FPaletteCacheValid := False;  // Invalidate cache
+  end;
 end;
 
 function TVideoController.LoadPaletteFromJSON(const FileName: string): Boolean;
 begin
   if FGraphicsMemory <> nil then
-    Result := FGraphicsMemory.LoadPaletteFromJSON(FileName)
+  begin
+    Result := FGraphicsMemory.LoadPaletteFromJSON(FileName);
+    if Result then
+      FPaletteCacheValid := False;  // Invalidate cache on successful load
+  end
   else
     Result := False;
 end;
@@ -3177,6 +3213,13 @@ begin
   FCursorY := FWindowRow1;
 end;
 
+procedure TTextBuffer.ResetPrintState;
+begin
+  // Reset reverse mode after PRINT statement (C128 behavior)
+  // On C128, reverse mode only affects the current PRINT statement
+  FCurrentReverse := False;
+end;
+
 procedure TTextBuffer.SetWindow(Col1, Row1, Col2, Row2: Integer);
 begin
   // Validate and clamp window boundaries
@@ -3300,6 +3343,8 @@ begin
 end;
 
 procedure TTextBuffer.PutChar(Ch: Char);
+var
+  Code: Byte;
 begin
   // Handle scroll if cursor beyond window bottom
   if FCursorY > FWindowRow2 then
@@ -3308,12 +3353,67 @@ begin
     FCursorY := FWindowRow2;
   end;
 
-  // Handle CR as newline
-  if Ch = #13 then
-  begin
-    NewLine;
-    Exit;
+  Code := Ord(Ch);
+
+  // Handle PETSCII control characters
+  case Code of
+    13: // CR - newline
+    begin
+      NewLine;
+      Exit;
+    end;
+
+    // === PETSCII Control Characters ===
+    147: // CHR$(147) = Clear screen (SHIFT+CLR/HOME)
+    begin
+      Clear;
+      Exit;
+    end;
+
+    18: // CHR$(18) = Reverse ON (RVS ON)
+    begin
+      FCurrentReverse := True;
+      Exit;
+    end;
+
+    146: // CHR$(146) = Reverse OFF (RVS OFF)
+    begin
+      FCurrentReverse := False;
+      Exit;
+    end;
+
+    // === PETSCII Color Codes (C64/C128 compatible) ===
+    // Map to C64 palette indices (0-15)
+    5:   begin FCurrentFGIndex := 1;  Exit; end;  // White
+    28:  begin FCurrentFGIndex := 2;  Exit; end;  // Red
+    30:  begin FCurrentFGIndex := 5;  Exit; end;  // Green
+    31:  begin FCurrentFGIndex := 6;  Exit; end;  // Blue
+    144: begin FCurrentFGIndex := 0;  Exit; end;  // Black
+    129: begin FCurrentFGIndex := 8;  Exit; end;  // Orange
+    149: begin FCurrentFGIndex := 9;  Exit; end;  // Brown
+    150: begin FCurrentFGIndex := 10; Exit; end;  // Light Red/Pink
+    151: begin FCurrentFGIndex := 11; Exit; end;  // Dark Gray
+    152: begin FCurrentFGIndex := 12; Exit; end;  // Medium Gray
+    153: begin FCurrentFGIndex := 13; Exit; end;  // Light Green
+    154: begin FCurrentFGIndex := 14; Exit; end;  // Light Blue
+    155: begin FCurrentFGIndex := 15; Exit; end;  // Light Gray
+    156: begin FCurrentFGIndex := 4;  Exit; end;  // Purple
+    158: begin FCurrentFGIndex := 7;  Exit; end;  // Yellow
+    159: begin FCurrentFGIndex := 3;  Exit; end;  // Cyan
+
+    // === Ignored PETSCII codes (cursor movement - not applicable in shell mode) ===
+    17, 145: Exit;  // Cursor down/up
+    29, 157: Exit;  // Cursor right/left
+    19: Exit;       // Home (CLR/HOME without SHIFT)
+    148: Exit;      // Insert mode toggle
+    20: Exit;       // Delete (handled by input, not print)
   end;
+
+  // Only print printable characters (skip control chars that weren't handled)
+  if Code < 32 then
+    Exit;
+  if (Code >= 128) and (Code < 160) then
+    Exit;
 
   // Write character within window bounds
   if FCursorX <= FWindowCol2 then
@@ -4149,6 +4249,13 @@ end;
 procedure TConsoleOutputAdapter.Clear;
 begin
   FTextBuffer.Clear;
+end;
+
+procedure TConsoleOutputAdapter.ResetPrintState;
+begin
+  // Reset reverse mode after PRINT statement (C128 behavior)
+  if Assigned(FTextBuffer) then
+    FTextBuffer.ResetPrintState;
 end;
 
 procedure TConsoleOutputAdapter.SetCursor(X, Y: Integer);
@@ -5079,8 +5186,6 @@ end;
 
 procedure TSedaiNewConsole.RenderScreen;
 var
-  i, RenderX, RenderY: Integer;
-  Line: string;
   PrevCursorX, PrevCursorY: Integer;
 begin
   // In graphics mode, render the graphics texture and present
@@ -5100,24 +5205,15 @@ begin
   // Prima disegna il bordo (finestra con colore FG)
   FVideoController.ClearBorder;
 
-  // Poi disegna il viewport (con colore BG)
-  FVideoController.ClearViewport;
-
-  // Renderizza il testo nel viewport
-  RenderX := FVideoController.ViewportX;
-  RenderY := FVideoController.ViewportY;
-
-  for i := 0 to FTextBuffer.Rows - 1 do
-  begin
-    Line := FTextBuffer.GetViewLine(i);
-    if Line <> '' then
-      FGraphicEngine.DrawText(RenderX, RenderY, Line, FVideoController.FGColor);
-    RenderY := RenderY + FVideoController.CharHeight;
-  end;
+  // Renderizza il testo nel viewport con supporto per colori per-cella e reverse
+  FVideoController.RenderText(FTextBuffer);
 
   // Restore cursor position
   FTextBuffer.CursorX := PrevCursorX;
   FTextBuffer.CursorY := PrevCursorY;
+
+  // Draw blinking cursor (always update during render for INPUT)
+  UpdateCursor;
 end;
 
 procedure TSedaiNewConsole.UpdateCursor;
@@ -5152,14 +5248,15 @@ begin
     // Get character at cursor position (space if beyond line end)
     CurrentChar := FTextBuffer.GetCharAtCursor;
 
-    // Draw cursor as filled rectangle with FG color (reverse video background)
+    // Draw cursor as filled rectangle with current text FG color (follows PETSCII color codes)
     FGraphicEngine.FillRect(CursorX, CursorY,
                            FVideoController.CharWidth,
                            FVideoController.CharHeight,
-                           FVideoController.FGColor);
+                           FVideoController.PaletteIndexToSDLColor(FTextBuffer.CurrentFGIndex));
 
     // Draw the character in reverse (BG color on FG background)
-    FGraphicEngine.DrawChar(CursorX, CursorY, CurrentChar, FVideoController.BGColor);
+    FGraphicEngine.DrawChar(CursorX, CursorY, CurrentChar,
+                           FVideoController.PaletteIndexToSDLColor(FTextBuffer.CurrentBGIndex));
   end;
 end;
 
@@ -5338,6 +5435,8 @@ begin
                 // Execute the compiled bytecode
                 try
                   FBytecodeVM.Reset;
+                  if Assigned(FProgramInputHandler) then
+                    FProgramInputHandler.Reset;  // Clear any pending input state
                   FBytecodeVM.LoadProgram(BytecodeProgram);
                   if FDebugMode then
                   begin
@@ -5435,6 +5534,8 @@ begin
                     begin
                       try
                         FBytecodeVM.Reset;
+                        if Assigned(FProgramInputHandler) then
+                          FProgramInputHandler.Reset;  // Clear any pending input state
                         FBytecodeVM.LoadProgram(BytecodeProgram);
                         if FDebugMode then
                         begin
@@ -5482,6 +5583,8 @@ begin
                 // Run loaded bytecode directly
                 try
                   FBytecodeVM.Reset;
+                  if Assigned(FProgramInputHandler) then
+                    FProgramInputHandler.Reset;  // Clear any pending input state
                   FBytecodeVM.LoadProgram(FLoadedBytecode);
                   if FDebugMode then
                   begin
@@ -5524,6 +5627,8 @@ begin
                     // Execute via VM
                     try
                       FBytecodeVM.Reset;
+                      if Assigned(FProgramInputHandler) then
+                        FProgramInputHandler.Reset;  // Clear any pending input state
                       FBytecodeVM.LoadProgram(BytecodeProgram);
                       if FDebugMode then
                       begin
@@ -6023,6 +6128,8 @@ begin
             begin
               try
                 FBytecodeVM.Reset;
+                if Assigned(FProgramInputHandler) then
+                  FProgramInputHandler.Reset;  // Clear any pending input state
                 FBytecodeVM.LoadProgram(FLoadedBytecode);
                 if FDebugMode then
                 begin
@@ -9056,6 +9163,22 @@ begin
         else
           if Ch >= ' ' then
           begin
+            // Check if character is valid based on NumericOnly/AllowDecimal
+            if NumericOnly then
+            begin
+              // Numeric mode: accept only digits, sign, decimal point (if allowed)
+              if (Ch >= '0') and (Ch <= '9') then
+                // digit ok
+              else if (Ch = '-') and (Length(InputBuffer) = 0) then
+                // Negative sign only at the beginning
+              else if (Ch = '+') and (Length(InputBuffer) = 0) then
+                // Positive sign only at the beginning
+              else if AllowDecimal and (Ch = '.') and (Pos('.', InputBuffer) = 0) then
+                // Decimal point only if allowed and not already present
+              else
+                Continue;  // Skip invalid character
+            end;
+
             InputBuffer := InputBuffer + Ch;
             if Assigned(FOutputDevice) then
             begin
@@ -9071,7 +9194,14 @@ begin
         end;
       end
       else
+      begin
+        // Update screen to show blinking cursor while waiting for input
+        if Assigned(FOutputDevice) then
+          FOutputDevice.Present
+        else if Assigned(FVideoController) then
+          FVideoController.Present;
         SDL_Delay(10);
+      end;
     end;
   finally
     DisableTextInput;

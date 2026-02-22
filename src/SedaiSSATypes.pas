@@ -84,6 +84,7 @@ type
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
     ssaPrintInt, ssaPrintIntLn,
     ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
+    ssaPrintEnd,   // Reset reverse mode after PRINT statement (C128 behavior)
     ssaInput, ssaInputInt, ssaInputFloat, ssaInputString,
     // Graphics
     ssaGraphicRGBA,    // Create 32-bit RGBA color value: dest = RGBA(r, g, b, a)

@@ -335,6 +335,16 @@ begin
         end;
       end;
     end;
+
+    antGet, antGetkey:
+    begin
+      // GET/GETKEY variable - must be pre-allocated like other input commands
+      if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antIdentifier) then
+      begin
+        VarName := VarToStr(Node.GetChild(0).Value);
+        GetOrAllocateVariable(VarName);
+      end;
+    end;
   end;
 
   // Recursively scan all children
@@ -2107,6 +2117,9 @@ begin
   begin
     EmitInstruction(ssaPrintNewLine, MakeSSAValue(svkNone),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // Reset reverse mode after PRINT (C128 behavior)
+    EmitInstruction(ssaPrintEnd, MakeSSAValue(svkNone),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
   end;
 
@@ -2218,6 +2231,10 @@ begin
   if not EndsWithSeparator then
     EmitInstruction(ssaPrintNewLine, MakeSSAValue(svkNone),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // Reset reverse mode after PRINT (C128 behavior: reverse only affects current PRINT)
+  EmitInstruction(ssaPrintEnd, MakeSSAValue(svkNone),
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.ProcessInput(Node: TASTNode);
@@ -2228,16 +2245,27 @@ var
   PromptReg, VarReg: TSSAValue;
   PromptRegIdx: Integer;
   VarName: string;
+  VarNames: array of string;
+  VarCount: Integer;
+  IsMultiple: Boolean;
 begin
-  // INPUT has structure: optional prompt string, separator, variable name
+  // INPUT has structure: optional prompt string, separator, variable names
   // Examples:
-  // INPUT "Enter value: "; N    -> prompt + variable
-  // INPUT N                      -> no prompt, just variable
+  // INPUT "Enter value: "; N    -> prompt + single variable
+  // INPUT N                      -> no prompt, single variable
+  // INPUT A, B, C                -> no prompt, multiple variables
+  // INPUT "Values"; A, B, C      -> prompt + multiple variables
+  //
+  // Commodore 128 behavior:
+  // - Single variable: "? " on same line, cursor waits
+  // - Multiple variables: each "?" on separate line, starting from NEXT line
+  // - Prompt is printed before the "?" (on same line for single, then newline for multiple)
 
   PromptStr := '';
-  VarName := '';
+  SetLength(VarNames, 0);
+  VarCount := 0;
 
-  // Scan children to find prompt (if any) and variable name
+  // Scan children to find prompt (if any) and all variable names
   for i := 0 to Node.ChildCount - 1 do
   begin
     Child := Node.GetChild(i);
@@ -2250,8 +2278,10 @@ begin
       end;
       antIdentifier:
       begin
-        // This is the variable to store input
-        VarName := VarToStr(Child.Value);
+        // This is a variable to store input - collect all of them
+        Inc(VarCount);
+        SetLength(VarNames, VarCount);
+        VarNames[VarCount - 1] := VarToStr(Child.Value);
       end;
       antSeparator:
         // Skip separators
@@ -2259,36 +2289,65 @@ begin
     end;
   end;
 
-  // If we don't have a variable name, nothing to do
-  if VarName = '' then Exit;
+  // If we don't have any variable names, nothing to do
+  if VarCount = 0 then Exit;
 
-  // Get or allocate register for the target variable
-  VarReg := GetOrAllocateVariable(VarName);
+  IsMultiple := (VarCount > 1);
 
-  // If there's a prompt, emit instruction to print it first
+  // If there's a prompt, load it into a register (to be used by INPUT instruction)
+  // The prompt is NOT printed separately - INPUT instruction handles it for retry support
   if PromptStr <> '' then
   begin
     PromptRegIdx := FProgram.AllocRegister(srtString);
     PromptReg := MakeSSARegister(srtString, PromptRegIdx);
     EmitInstruction(ssaLoadConstString, PromptReg, MakeSSAConstString(PromptStr),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), PromptReg,
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-  end;
+  end
+  else
+    PromptReg := MakeSSAValue(svkNone);
 
-  // Emit INPUT instruction based on variable type
-  // Dest = variable register where input will be stored
-  // No source operands needed - INPUT reads from stdin
-  case VarReg.RegType of
-    srtInt:
-      EmitInstruction(ssaInputInt, VarReg, MakeSSAValue(svkNone),
+  // Process each variable
+  for i := 0 to VarCount - 1 do
+  begin
+    VarName := VarNames[i];
+
+    // Get or allocate register for the target variable
+    VarReg := GetOrAllocateVariable(VarName);
+
+    // For multiple variables: newline only BEFORE the FIRST "?"
+    // After first input, ReadLine already moves to new line after ENTER
+    if IsMultiple and (i = 0) then
+    begin
+      EmitInstruction(ssaPrintNewLine, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    srtFloat:
-      EmitInstruction(ssaInputFloat, VarReg, MakeSSAValue(svkNone),
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    srtString:
-      EmitInstruction(ssaInputString, VarReg, MakeSSAValue(svkNone),
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+
+    // Emit INPUT instruction based on variable type
+    // Src1 contains the prompt register (for retry support), only for FIRST variable
+    // The INPUT instruction itself will print prompt + "? "
+    case VarReg.RegType of
+      srtInt:
+        if i = 0 then
+          EmitInstruction(ssaInputInt, VarReg, PromptReg,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else
+          EmitInstruction(ssaInputInt, VarReg, MakeSSAValue(svkNone),
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      srtFloat:
+        if i = 0 then
+          EmitInstruction(ssaInputFloat, VarReg, PromptReg,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else
+          EmitInstruction(ssaInputFloat, VarReg, MakeSSAValue(svkNone),
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      srtString:
+        if i = 0 then
+          EmitInstruction(ssaInputString, VarReg, PromptReg,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else
+          EmitInstruction(ssaInputString, VarReg, MakeSSAValue(svkNone),
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
   end;
 end;
 
@@ -5645,6 +5704,10 @@ begin
   if not EndsWithSeparator then
     EmitInstruction(ssaPrintNewLine, MakeSSAValue(svkNone),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // Reset reverse mode after PRINT USING (C128 behavior)
+  EmitInstruction(ssaPrintEnd, MakeSSAValue(svkNone),
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.ProcessPudef(Node: TASTNode);

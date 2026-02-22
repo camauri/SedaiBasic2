@@ -193,6 +193,7 @@ type
     procedure PrintLn(const Text: string; ClearBackground: Boolean = False);
     procedure NewLine;
     procedure Clear; virtual;
+    procedure ResetPrintState;
 
     // Cursor/position control
     procedure SetCursor(X, Y: Integer);
@@ -1673,6 +1674,11 @@ begin
   // *** RESET SCROLL MODE ***
   FInScrollMode := False;
   FScrollOffset := 0;
+end;
+
+procedure TSDL2OutputDevice.ResetPrintState;
+begin
+  // This output device doesn't support reverse mode, so nothing to reset
 end;
 
 procedure TSDL2OutputDevice.SetCursor(X, Y: Integer);

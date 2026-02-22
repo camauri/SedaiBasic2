@@ -201,6 +201,7 @@ begin
     ssaPrintTab: Result := bcPrintTab;
     ssaPrintSpc: Result := bcPrintSpc;
     ssaPrintNewLine: Result := bcPrintNewLine;
+    ssaPrintEnd: Result := bcPrintEnd;
     ssaInput: Result := bcInput;
     ssaInputInt: Result := bcInputInt;
     ssaInputFloat: Result := bcInputFloat;

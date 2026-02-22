@@ -72,6 +72,7 @@ type
     procedure PrintLn(const Text: string; ClearBackground: Boolean = False);
     procedure NewLine;
     procedure Clear;
+    procedure ResetPrintState;
 
     procedure SetCursor(X, Y: Integer);
     procedure MoveCursor(DeltaX, DeltaY: Integer);
@@ -276,6 +277,11 @@ begin
   {$ENDIF}
   FCursorX := 0;
   FCursorY := 0;
+end;
+
+procedure TTerminalController.ResetPrintState;
+begin
+  // Terminal doesn't support PETSCII reverse mode, nothing to reset
 end;
 
 procedure TTerminalController.SetCursor(X, Y: Integer);

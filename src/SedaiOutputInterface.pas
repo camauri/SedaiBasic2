@@ -79,6 +79,7 @@ type
     procedure PrintLn(const Text: string; ClearBackground: Boolean = False);
     procedure NewLine;
     procedure Clear;
+    procedure ResetPrintState;  // Reset reverse mode after PRINT (C128 behavior)
 
     // Cursor/position control
     procedure SetCursor(X, Y: Integer);

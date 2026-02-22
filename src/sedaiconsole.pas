@@ -101,7 +101,7 @@ type
     procedure ClearViewport;    // Clear viewport with BG color
     procedure Present;
     procedure RenderText(ATextBuffer: TTextBuffer);  // Render text buffer
-    
+
     // IOutputDevice implementation
     function Initialize(const Title: string = ''; Width: Integer = 80; Height: Integer = 25): Boolean;
     procedure Shutdown;
@@ -110,6 +110,7 @@ type
     procedure PrintLn(const Text: string; ClearBackground: Boolean = False);
     procedure NewLine;
     procedure Clear;
+    procedure ResetPrintState;
     procedure SetCursor(X, Y: Integer);
     procedure MoveCursor(DeltaX, DeltaY: Integer);
     function GetCursorX: Integer;
@@ -277,7 +278,7 @@ type
     FInitialized: Boolean;
   public
     constructor Create(ATextBuffer: TTextBuffer; AVideoController: TVideoController);
-    
+
     // IOutputDevice implementation
     function Initialize(const Title: string = ''; Width: Integer = 80; Height: Integer = 25): Boolean;
     procedure Shutdown;
@@ -286,6 +287,7 @@ type
     procedure PrintLn(const Text: string; ClearBackground: Boolean = False);
     procedure NewLine;
     procedure Clear;
+    procedure ResetPrintState;
     procedure SetCursor(X, Y: Integer);
     procedure MoveCursor(DeltaX, DeltaY: Integer);
     function GetCursorX: Integer;
@@ -1028,6 +1030,11 @@ begin
   FCursorY := 0;
 end;
 
+procedure TVideoController.ResetPrintState;
+begin
+  // This older implementation doesn't track reverse state, nothing to reset
+end;
+
 procedure TVideoController.SetCursor(X, Y: Integer);
 begin
   FCursorX := X;
@@ -1512,6 +1519,11 @@ end;
 procedure TConsoleOutputAdapter.Clear;
 begin
   FTextBuffer.Clear;
+end;
+
+procedure TConsoleOutputAdapter.ResetPrintState;
+begin
+  // This older implementation doesn't track reverse state, nothing to reset
 end;
 
 procedure TConsoleOutputAdapter.SetCursor(X, Y: Integer);

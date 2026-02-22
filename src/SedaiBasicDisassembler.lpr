@@ -288,7 +288,7 @@ begin
     bcPrintInt, bcPrintIntLn:
       Result := Format('R%d', [Instr.Src1]);
 
-    bcPrintComma, bcPrintSemicolon, bcPrintNewLine:
+    bcPrintComma, bcPrintSemicolon, bcPrintNewLine, bcPrintEnd:
       Result := '';  // No operands
 
     bcPrintTab, bcPrintSpc:

@@ -982,3 +982,77 @@ See [WEB_BASIC.md](WEB_BASIC.md) for complete documentation.
 |---------|--------|-------------|
 | `SETHEADER name, value` | Planned | Set HTTP response header |
 | `STATUS code` | Planned | Set HTTP response status code |
+
+---
+
+## Appendix A: PETSCII Control Characters
+
+SedaiBasic supports a subset of PETSCII control characters for compatibility with Commodore 64/128 programs. These are activated when printing via `PRINT CHR$(code)`.
+
+> **Note:** SedaiBasic operates in shell mode (like Bash/PowerShell), not full-screen mode like the C128. Cursor movement codes are ignored.
+
+### Screen Control
+
+| CHR$ | Code | Action |
+|------|------|--------|
+| 147 | $93 | Clear screen (equivalent to `SCNCLR`) |
+| 13 | $0D | Carriage return / newline |
+
+### Reverse Video
+
+| CHR$ | Code | Action |
+|------|------|--------|
+| 18 | $12 | Reverse ON - subsequent text printed with fg/bg swapped |
+| 146 | $92 | Reverse OFF - return to normal text |
+
+**Example:**
+```basic
+PRINT CHR$(18);"HIGHLIGHTED";CHR$(146);" normal"
+```
+
+### Foreground Color Codes
+
+| CHR$ | Code | Color | Palette Index |
+|------|------|-------|---------------|
+| 144 | $90 | Black | 0 |
+| 5 | $05 | White | 1 |
+| 28 | $1C | Red | 2 |
+| 159 | $9F | Cyan | 3 |
+| 156 | $9C | Purple | 4 |
+| 30 | $1E | Green | 5 |
+| 31 | $1F | Blue | 6 |
+| 158 | $9E | Yellow | 7 |
+| 129 | $81 | Orange | 8 |
+| 149 | $95 | Brown | 9 |
+| 150 | $96 | Light Red | 10 |
+| 151 | $97 | Dark Gray | 11 |
+| 152 | $98 | Medium Gray | 12 |
+| 153 | $99 | Light Green | 13 |
+| 154 | $9A | Light Blue | 14 |
+| 155 | $9B | Light Gray | 15 |
+
+**Example:**
+```basic
+PRINT CHR$(28);"Red text";CHR$(5);" White text"
+```
+
+### Ignored Codes (Shell Mode)
+
+The following PETSCII codes are silently ignored because they require full-screen cursor control, which is not available in shell mode:
+
+| CHR$ | Code | Original Function |
+|------|------|-------------------|
+| 17 | $11 | Cursor down |
+| 145 | $91 | Cursor up |
+| 29 | $1D | Cursor right |
+| 157 | $9D | Cursor left |
+| 19 | $13 | Home (cursor to top-left) |
+| 148 | $94 | Insert mode toggle |
+| 20 | $14 | Delete character |
+
+### Compatibility Notes
+
+- Use `SCNCLR` instead of `PRINT CHR$(147)` for clearer code
+- Use `COLOR` command for more control over foreground/background colors
+- Reverse mode affects all text until explicitly turned off
+- Color changes persist until changed again or screen is cleared

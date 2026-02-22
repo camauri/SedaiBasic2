@@ -149,6 +149,7 @@ type
     FLastErrorCode: Integer;      // ER: Last error code
     FLastErrorMessage: string;    // ERR$: Last error message (variable form)
     FTrueValue: Int64;            // TRUE value: -1 (Commodore BASIC) or 1 (modern BASIC)
+    FC128InputMode: Boolean;      // True = C128 mode (accept all, show ?REDO), False = input mask (reject invalid chars)
     // TRAP/RESUME error handling state
     FTrapLine: Integer;           // Line to jump to on error (0 = no trap)
     FTrapPC: Integer;             // PC to jump to on error (resolved from FTrapLine)
@@ -247,6 +248,8 @@ type
     // TRUE value for comparisons (-1 = Commodore BASIC, 1 = modern BASIC)
     procedure SetTrueValue(AValue: Int64);
     property TrueValue: Int64 read FTrueValue write FTrueValue;
+    // C128 INPUT mode: True = accept all then show ?REDO FROM START, False = input mask
+    property C128InputMode: Boolean read FC128InputMode write FC128InputMode;
     // Function key definitions (for console expansion)
     function GetFunctionKey(KeyNum: Integer): string;
   end;
@@ -1162,12 +1165,18 @@ begin
         // Int dest, int sources
         bcLoadConstInt, bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
         bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
-        bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot,
-        bcInputInt:
+        bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+        end;
+
+        // InputInt: int Dest (result), string Src1 (prompt, optional)
+        bcInputInt:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;  // prompt is string
         end;
 
         // FloatToInt: int Dest, float Src1
@@ -1217,12 +1226,18 @@ begin
         bcLoadConstFloat, bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat,
         bcPowFloat, bcNegFloat,
         bcMathAbs, bcMathSgn, bcMathInt, bcMathSqr, bcMathSin, bcMathCos, bcMathTan,
-        bcMathExp, bcMathLog, bcMathAtn, bcMathRnd,
-        bcInputFloat:
+        bcMathExp, bcMathLog, bcMathAtn, bcMathRnd:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
           if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;
+        end;
+
+        // InputFloat/Input: float Dest (result), string Src1 (prompt, optional)
+        bcInput, bcInputFloat:
+        begin
+          if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;  // prompt is string
         end;
 
         // Type conversions with mixed register types
@@ -1255,6 +1270,12 @@ begin
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
           if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;
+        end;
+
+        // GET/GETKEY: string Dest (character result)
+        bcGet, bcGetkey:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
         end;
 
         // IntToString: string Dest, int Src1
@@ -2000,6 +2021,9 @@ begin
               end;
               if FInputDevice.HasChar then
                 Break;  // Got a character, exit loop
+              // Update screen to show blinking cursor while waiting
+              if Assigned(FOutputDevice) then
+                FOutputDevice.Present;
               Sleep(10);  // Prevent busy-wait
             until False;
             // Only read character if we didn't exit due to CTRL+C
@@ -3060,13 +3084,23 @@ begin
         FOutputDevice.NewLine;
         FCursorCol := 0;
       end;
-    11: // bcInput (generic float)
+    11: // bcPrintEnd - Reset reverse mode after PRINT (C128 behavior)
+      if Assigned(FOutputDevice) then
+        FOutputDevice.ResetPrintState;
+    12: // bcInput (generic float)
       if Assigned(FInputDevice) then
       begin
+        // Print initial prompt (from Src1 register if set) + "? "
+        if Assigned(FOutputDevice) then
+        begin
+          if (Instr.Src1 > 0) and (Instr.Src1 < Length(FStringRegs)) then
+            FOutputDevice.Print(FStringRegs[Instr.Src1]);
+        end;
         repeat
-          InputStr := FInputDevice.ReadLine('', False, True, True);
-          // Check for CTRL+END stop request
-          if FInputDevice.ShouldStop then
+          // C128 mode: accept all, validate after; Mask mode: filter invalid chars
+          InputStr := FInputDevice.ReadLine('? ', False, not FC128InputMode, True);
+          // Check for CTRL+END stop request or window close
+          if FInputDevice.ShouldStop or FInputDevice.ShouldQuit then
           begin
             FRunning := False;
             FInputDevice.ClearStopRequest;
@@ -3078,16 +3112,29 @@ begin
             Break;
           end
           else if Assigned(FOutputDevice) then
-            FOutputDevice.Print('?Invalid number. Try again: ');
+          begin
+            FOutputDevice.Print('?REDO FROM START');
+            FOutputDevice.NewLine;
+            // Reprint prompt for retry
+            if (Instr.Src1 > 0) and (Instr.Src1 < Length(FStringRegs)) then
+              FOutputDevice.Print(FStringRegs[Instr.Src1]);
+          end;
         until False;
       end;
-    12: // bcInputInt
+    13: // bcInputInt
       if Assigned(FInputDevice) then
       begin
+        // Print initial prompt (from Src1 register if set) + "? "
+        if Assigned(FOutputDevice) then
+        begin
+          if (Instr.Src1 > 0) and (Instr.Src1 < Length(FStringRegs)) then
+            FOutputDevice.Print(FStringRegs[Instr.Src1]);
+        end;
         repeat
-          InputStr := Trim(FInputDevice.ReadLine('', False, True, True));
-          // Check for CTRL+END stop request
-          if FInputDevice.ShouldStop then
+          // C128 mode: accept all, validate after; Mask mode: filter invalid chars (no decimal for int)
+          InputStr := Trim(FInputDevice.ReadLine('? ', False, not FC128InputMode, False));
+          // Check for CTRL+END stop request or window close
+          if FInputDevice.ShouldStop or FInputDevice.ShouldQuit then
           begin
             FRunning := False;
             FInputDevice.ClearStopRequest;
@@ -3101,19 +3148,38 @@ begin
               Break;
             end
             else if Assigned(FOutputDevice) then
-              FOutputDevice.Print('?Number out of range. Try again: ');
+            begin
+              FOutputDevice.Print('?REDO FROM START');
+              FOutputDevice.NewLine;
+              // Reprint prompt for retry
+              if (Instr.Src1 > 0) and (Instr.Src1 < Length(FStringRegs)) then
+                FOutputDevice.Print(FStringRegs[Instr.Src1]);
+            end;
           end
           else if Assigned(FOutputDevice) then
-            FOutputDevice.Print('?Invalid integer. Try again: ');
+          begin
+            FOutputDevice.Print('?REDO FROM START');
+            FOutputDevice.NewLine;
+            // Reprint prompt for retry
+            if (Instr.Src1 > 0) and (Instr.Src1 < Length(FStringRegs)) then
+              FOutputDevice.Print(FStringRegs[Instr.Src1]);
+          end;
         until False;
       end;
-    13: // bcInputFloat
+    14: // bcInputFloat
       if Assigned(FInputDevice) then
       begin
+        // Print initial prompt (from Src1 register if set) + "? "
+        if Assigned(FOutputDevice) then
+        begin
+          if (Instr.Src1 > 0) and (Instr.Src1 < Length(FStringRegs)) then
+            FOutputDevice.Print(FStringRegs[Instr.Src1]);
+        end;
         repeat
-          InputStr := Trim(FInputDevice.ReadLine('', False, True, True));
-          // Check for CTRL+END stop request
-          if FInputDevice.ShouldStop then
+          // C128 mode: accept all, validate after; Mask mode: filter invalid chars
+          InputStr := Trim(FInputDevice.ReadLine('? ', False, not FC128InputMode, True));
+          // Check for CTRL+END stop request or window close
+          if FInputDevice.ShouldStop or FInputDevice.ShouldQuit then
           begin
             FRunning := False;
             FInputDevice.ClearStopRequest;
@@ -3125,13 +3191,25 @@ begin
             Break;
           end
           else if Assigned(FOutputDevice) then
-            FOutputDevice.Print('?Invalid number. Try again: ');
+          begin
+            FOutputDevice.Print('?REDO FROM START');
+            FOutputDevice.NewLine;
+            // Reprint prompt for retry
+            if (Instr.Src1 > 0) and (Instr.Src1 < Length(FStringRegs)) then
+              FOutputDevice.Print(FStringRegs[Instr.Src1]);
+          end;
         until False;
       end;
-    14: // bcInputString
+    15: // bcInputString
       if Assigned(FInputDevice) then
       begin
-        FStringRegs[Instr.Dest] := FInputDevice.ReadLine('', False, False, False);
+        // Print prompt (from Src1 register if set) + "? "
+        if Assigned(FOutputDevice) then
+        begin
+          if (Instr.Src1 > 0) and (Instr.Src1 < Length(FStringRegs)) then
+            FOutputDevice.Print(FStringRegs[Instr.Src1]);
+        end;
+        FStringRegs[Instr.Dest] := FInputDevice.ReadLine('? ', False, False, False);
         if FInputDevice.ShouldStop then
         begin
           FRunning := False;

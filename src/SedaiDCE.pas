@@ -293,7 +293,9 @@ begin
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
     ssaPrintInt, ssaPrintIntLn,
     ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
+    ssaPrintEnd,  // Reset reverse mode - affects display state
     ssaInput, ssaInputInt, ssaInputFloat, ssaInputString,
+    ssaGet, ssaGetkey,  // GET/GETKEY wait for input - side effects!
     ssaPrintUsing, ssaPudef:
       Result := True;
 

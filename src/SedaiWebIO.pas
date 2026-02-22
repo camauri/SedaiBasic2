@@ -102,6 +102,7 @@ type
     procedure PrintLn(const Text: string; ClearBackground: Boolean = False);
     procedure NewLine;
     procedure Clear;
+    procedure ResetPrintState;
 
     procedure SetCursor(X, Y: Integer);
     procedure MoveCursor(DeltaX, DeltaY: Integer);
@@ -536,6 +537,11 @@ end;
 procedure TWebOutput.Clear;
 begin
   FContent.Clear;
+end;
+
+procedure TWebOutput.ResetPrintState;
+begin
+  // Web output doesn't support PETSCII reverse mode, nothing to reset
 end;
 
 procedure TWebOutput.SetCursor(X, Y: Integer);

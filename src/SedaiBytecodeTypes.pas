@@ -277,11 +277,12 @@ const
   bcPrintTab        = bcGroupIO + 8;
   bcPrintSpc        = bcGroupIO + 9;
   bcPrintNewLine    = bcGroupIO + 10;
+  bcPrintEnd        = bcGroupIO + 11;  // Reset reverse mode after PRINT (C128 behavior)
   // Input
-  bcInput           = bcGroupIO + 11;
-  bcInputInt        = bcGroupIO + 12;
-  bcInputFloat      = bcGroupIO + 13;
-  bcInputString     = bcGroupIO + 14;
+  bcInput           = bcGroupIO + 12;
+  bcInputInt        = bcGroupIO + 13;
+  bcInputFloat      = bcGroupIO + 14;
+  bcInputString     = bcGroupIO + 15;
 
   // === GROUP 5: SPECIAL VARIABLES (0x05xx) ===
   bcLoadTI          = bcGroupSpecial + 0;   // TI: jiffies since start

@@ -242,6 +242,8 @@ begin
       Line := Format('%4d: %-20s %d', [Index, 'PrintSpc', Instr.Immediate]);
     bcPrintNewLine:
       Line := Format('%4d: %-20s', [Index, 'PrintNewLine']);
+    bcPrintEnd:
+      Line := Format('%4d: %-20s', [Index, 'PrintEnd']);
     bcInput:
       Line := Format('%4d: %-20s R%d', [Index, 'Input', Instr.Dest]);
     bcInputInt:
