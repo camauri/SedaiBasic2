@@ -132,6 +132,10 @@ type
     FGraphicsMemory: TGraphicsMemory;
     // SDL2 texture for rendering the graphics buffer
     FGraphicsTexture: PSDL_Texture;
+    // SDL2 texture for persistent text rendering (dirty tracking optimization)
+    FTextTexture: PSDL_Texture;
+    FTextTextureDirty: Boolean;  // True when texture needs full rebuild
+    FLastBorderColorIndex: Byte; // Track border color changes
     // Track if SDL was successfully initialized (for cleanup)
     FSDLInitialized: Boolean;
 
@@ -146,6 +150,8 @@ type
     procedure CreateGraphicsTexture;
     procedure DestroyGraphicsTexture;
     procedure SyncGraphicsBufferToTexture;
+    procedure CreateTextTexture;
+    procedure DestroyTextTexture;
 
     // Getters/setters for drawing palette indices
     function GetForegroundIndex: Byte;
@@ -336,12 +342,30 @@ type
     function ColorToSDLColor(const Color: TColor): TSDL_Color;
   end;
 
-  { TTextCell - Single character cell with color attributes }
+  { TCharInfo - Character with position and color (sparse storage)
+    Note: Row position is implicit (index of containing TTextRow)
+    Only Col needs to be stored for sparse character positioning }
+  TCharInfo = record
+    Col: Byte;          // Column position (0-79), only X needed - Y is row index
+    Ch: Char;           // The character
+    FGIndex: Byte;      // Foreground color (palette index)
+    BGIndex: Byte;      // Background color (palette index)
+  end;
+
+  { TTextRow - Single row with sparse character storage }
+  TTextRow = record
+    Chars: array[0..79] of TCharInfo;  // Fixed size array for max 80 chars
+    Count: Integer;                     // Actual character count in this row
+    Dirty: Boolean;                     // Row needs redraw
+  end;
+
+  { TTextCell - Single character cell with color attributes (LEGACY - being phased out) }
   TTextCell = record
     Ch: Char;           // The character
     FGIndex: Byte;      // Foreground color (palette index)
     BGIndex: Byte;      // Background color (palette index)
-    Reverse: Boolean;   // Reverse video flag for this cell
+    Reverse: Boolean;   // Reverse video flag for this cell (DEPRECATED - use global state)
+    Dirty: Boolean;     // True if cell needs redrawing
   end;
   PTextCell = ^TTextCell;
 
@@ -384,6 +408,14 @@ type
     FCurrentFGIndex: Byte;
     FCurrentBGIndex: Byte;
     FCurrentReverse: Boolean;
+
+    // Dirty tracking for efficient rendering
+    FRowDirty: array of Boolean;   // Per-row dirty flags
+    FAllDirty: Boolean;            // True = redraw everything
+
+    // View window for hardware-like scrolling (scroll = shift view, not data)
+    FFirstVisibleRow: Integer;     // Which buffer row is at screen top (for hardware scroll)
+    FTotalBufferRows: Integer;     // Total rows in logical buffer (>= visible rows)
 
     // Window boundaries (WINDOW command) - coordinates within FCells
     FWindowCol1: Integer;  // Left edge of window (0-based)
@@ -450,6 +482,13 @@ type
     function GetWindowLines: Integer;  // RWINDOW(0)
     function GetWindowCols: Integer;   // RWINDOW(1)
 
+    // Dirty tracking methods for efficient rendering
+    procedure MarkRowDirty(Row: Integer);       // Mark single row for redraw
+    procedure MarkAllDirty;                     // Mark entire buffer for redraw
+    procedure ClearDirtyFlags;                  // Clear all dirty flags after render
+    function IsRowDirty(Row: Integer): Boolean; // Check if row needs redraw
+    function NeedsRedraw: Boolean;              // Check if any content needs redraw
+
     // Current text color properties
     property CurrentFGIndex: Byte read FCurrentFGIndex write FCurrentFGIndex;
     property CurrentBGIndex: Byte read FCurrentBGIndex write FCurrentBGIndex;
@@ -464,6 +503,7 @@ type
     property WindowRow1: Integer read FWindowRow1;
     property WindowCol2: Integer read FWindowCol2;
     property WindowRow2: Integer read FWindowRow2;
+    property AllDirty: Boolean read FAllDirty;  // True if full redraw needed
     function GetScrollbackCount: Integer;
   end;
 
@@ -787,6 +827,7 @@ type
     procedure ProcessCommand(const Command: string);
     procedure RenderScreen;
     procedure UpdateCursor;
+    function CheckCursorBlink: Boolean;  // Returns true if cursor state changed
 
     // Startup file support (passed via command line)
     procedure SetStartupFile(const AFileName: string; AAutoRun: Boolean);
@@ -837,6 +878,9 @@ begin
   FPaletteManager := nil;
   FGraphicsMemory := nil;
   FGraphicsTexture := nil;
+  FTextTexture := nil;
+  FTextTextureDirty := True;
+  FLastBorderColorIndex := 255;  // Force initial border draw
   FSDLInitialized := False;
   FFullscreen := False;
   FVSync := True;
@@ -1106,6 +1150,10 @@ begin
     FPaletteManager.Free;
     FPaletteManager := nil;
   end;
+
+  // Destroy textures before renderer
+  DestroyTextTexture;
+  DestroyGraphicsTexture;
 
   if Assigned(FRenderer) then
   begin
@@ -1431,8 +1479,11 @@ begin
 
   FPaletteManager := TPaletteManager.Create(FModeInfo.PaletteType);
 
+  // Create persistent text texture for dirty tracking optimization
+  CreateTextTexture;
+
   ClearBorder;
-  
+
   {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: Initialization complete');{$ENDIF}
   FInitialized := True;
 
@@ -1522,89 +1573,212 @@ var
   Row, Col, RenderX, RenderY: Integer;
   Cell: TTextCell;
   Surface: PSDL_Surface;
-  Texture: PSDL_Texture;
-  DestRect, CellBGRect: TSDL_Rect;
-  CellTextColor, CellBGColor: TSDL_Color;
+  CharTexture: PSDL_Texture;
+  DestRect, CellBGRect, RowBGRect, ViewportRect: TSDL_Rect;
+  CellTextColor, CellBGColor, ScreenBG, BorderColor: TSDL_Color;
   CharStr: string;
   EffectiveFG, EffectiveBG: Byte;
+  NeedTextureUpdate, BorderChanged: Boolean;
 begin
   if not Assigned(ATextBuffer) or not Assigned(FFont) then Exit;
 
-  // Clears the viewport with screen color
-  ClearViewport;
-
-  // Render each cell with its own colors
-  RenderY := FViewportY;
-  for Row := 0 to ATextBuffer.Rows - 1 do
+  // Check if texture exists
+  if FTextTexture = nil then
   begin
-    RenderX := FViewportX;
-    for Col := 0 to ATextBuffer.Cols - 1 do
+    CreateTextTexture;
+    if FTextTexture = nil then Exit;
+  end;
+
+  // Check if border color changed
+  BorderChanged := FBorderColorIndex <> FLastBorderColorIndex;
+
+  // Determine if we need to update the texture
+  NeedTextureUpdate := FTextTextureDirty or BorderChanged or ATextBuffer.NeedsRedraw;
+
+  if NeedTextureUpdate then
+  begin
+    // Set render target to text texture
+    SDL_SetRenderTarget(FRenderer, FTextTexture);
+
+    // Get colors
+    ScreenBG := PaletteIndexToSDLColor(FBackgroundIndex);
+    BorderColor := PaletteIndexToSDLColor(FBorderColorIndex);
+
+    // Full redraw if AllDirty, texture just created, or border color changed
+    if FTextTextureDirty or BorderChanged or ATextBuffer.AllDirty then
     begin
-      Cell := ATextBuffer.GetCell(Row, Col);
+      // Fill entire texture with border color
+      SDL_SetRenderDrawColor(FRenderer, BorderColor.r, BorderColor.g, BorderColor.b, 255);
+      SDL_RenderClear(FRenderer);
 
-      // Skip spaces (optimization) - original fast path
-      if Cell.Ch = ' ' then
-      begin
-        RenderX := RenderX + FCharWidth;
-        Continue;
-      end;
+      // Fill viewport area with background color
+      ViewportRect.x := FViewportX;
+      ViewportRect.y := FViewportY;
+      ViewportRect.w := FViewportWidth;
+      ViewportRect.h := FViewportHeight;
+      SDL_SetRenderDrawColor(FRenderer, ScreenBG.r, ScreenBG.g, ScreenBG.b, 255);
+      SDL_RenderFillRect(FRenderer, @ViewportRect);
 
-      // Get effective colors (swap if reverse)
-      if Cell.Reverse then
+      // Render ALL cells (at viewport offset)
+      RenderY := FViewportY;
+      for Row := 0 to ATextBuffer.Rows - 1 do
       begin
-        EffectiveFG := Cell.BGIndex;
-        EffectiveBG := Cell.FGIndex;
-      end
-      else
-      begin
-        EffectiveFG := Cell.FGIndex;
-        EffectiveBG := Cell.BGIndex;
-      end;
+        RenderX := FViewportX;
+        for Col := 0 to ATextBuffer.Cols - 1 do
+        begin
+          Cell := ATextBuffer.GetCell(Row, Col);
 
-      // Get SDL colors from per-cell palette indices (supports PETSCII color codes)
-      CellTextColor := PaletteIndexToSDLColor(EffectiveFG);
-      CellBGColor := PaletteIndexToSDLColor(EffectiveBG);
-
-      // Draw background if different from screen color
-      if EffectiveBG <> FScreenColorIndex then
-      begin
-        CellBGRect.x := RenderX;
-        CellBGRect.y := RenderY;
-        CellBGRect.w := FCharWidth;
-        CellBGRect.h := FCharHeight;
-        SDL_SetRenderDrawColor(FRenderer, CellBGColor.r, CellBGColor.g, CellBGColor.b, 255);
-        SDL_RenderFillRect(FRenderer, @CellBGRect);
-      end;
-
-      // Render character
-      CharStr := Cell.Ch;
-      Surface := TTF_RenderUTF8_Solid(FFont, PChar(CharStr), CellTextColor);
-      if Assigned(Surface) then
-      begin
-        try
-          Texture := SDL_CreateTextureFromSurface(FRenderer, Surface);
-          if Assigned(Texture) then
+          // Skip spaces (background already cleared)
+          if Cell.Ch <> ' ' then
           begin
-            try
-              DestRect.x := RenderX;
-              DestRect.y := RenderY;
-              DestRect.w := Surface^.w;
-              DestRect.h := Surface^.h;
-              SDL_RenderCopy(FRenderer, Texture, nil, @DestRect);
-            finally
-              SDL_DestroyTexture(Texture);
+            // Get effective colors (swap if reverse)
+            if Cell.Reverse then
+            begin
+              EffectiveFG := Cell.BGIndex;
+              EffectiveBG := Cell.FGIndex;
+            end
+            else
+            begin
+              EffectiveFG := Cell.FGIndex;
+              EffectiveBG := Cell.BGIndex;
+            end;
+
+            CellTextColor := PaletteIndexToSDLColor(EffectiveFG);
+            CellBGColor := PaletteIndexToSDLColor(EffectiveBG);
+
+            // Draw cell background if different from screen background
+            if EffectiveBG <> FBackgroundIndex then
+            begin
+              CellBGRect.x := RenderX;
+              CellBGRect.y := RenderY;
+              CellBGRect.w := FCharWidth;
+              CellBGRect.h := FCharHeight;
+              SDL_SetRenderDrawColor(FRenderer, CellBGColor.r, CellBGColor.g, CellBGColor.b, 255);
+              SDL_RenderFillRect(FRenderer, @CellBGRect);
+            end;
+
+            // Render character
+            CharStr := Cell.Ch;
+            Surface := TTF_RenderUTF8_Solid(FFont, PChar(CharStr), CellTextColor);
+            if Assigned(Surface) then
+            begin
+              try
+                CharTexture := SDL_CreateTextureFromSurface(FRenderer, Surface);
+                if Assigned(CharTexture) then
+                begin
+                  try
+                    DestRect.x := RenderX;
+                    DestRect.y := RenderY;
+                    DestRect.w := Surface^.w;
+                    DestRect.h := Surface^.h;
+                    SDL_RenderCopy(FRenderer, CharTexture, nil, @DestRect);
+                  finally
+                    SDL_DestroyTexture(CharTexture);
+                  end;
+                end;
+              finally
+                SDL_FreeSurface(Surface);
+              end;
             end;
           end;
-        finally
-          SDL_FreeSurface(Surface);
+
+          RenderX := RenderX + FCharWidth;
         end;
+        RenderY := RenderY + FCharHeight;
       end;
 
-      RenderX := RenderX + FCharWidth;
+      FTextTextureDirty := False;
+      FLastBorderColorIndex := FBorderColorIndex;
+    end
+    else
+    begin
+      // Partial update: only render dirty rows (at viewport offset)
+      RenderY := FViewportY;
+      for Row := 0 to ATextBuffer.Rows - 1 do
+      begin
+        if ATextBuffer.IsRowDirty(Row) then
+        begin
+          // Clear row background
+          RowBGRect.x := FViewportX;
+          RowBGRect.y := RenderY;
+          RowBGRect.w := ATextBuffer.Cols * FCharWidth;
+          RowBGRect.h := FCharHeight;
+          SDL_SetRenderDrawColor(FRenderer, ScreenBG.r, ScreenBG.g, ScreenBG.b, 255);
+          SDL_RenderFillRect(FRenderer, @RowBGRect);
+
+          // Render all cells in this row
+          RenderX := FViewportX;
+          for Col := 0 to ATextBuffer.Cols - 1 do
+          begin
+            Cell := ATextBuffer.GetCell(Row, Col);
+
+            if Cell.Ch <> ' ' then
+            begin
+              if Cell.Reverse then
+              begin
+                EffectiveFG := Cell.BGIndex;
+                EffectiveBG := Cell.FGIndex;
+              end
+              else
+              begin
+                EffectiveFG := Cell.FGIndex;
+                EffectiveBG := Cell.BGIndex;
+              end;
+
+              CellTextColor := PaletteIndexToSDLColor(EffectiveFG);
+              CellBGColor := PaletteIndexToSDLColor(EffectiveBG);
+
+              if EffectiveBG <> FBackgroundIndex then
+              begin
+                CellBGRect.x := RenderX;
+                CellBGRect.y := RenderY;
+                CellBGRect.w := FCharWidth;
+                CellBGRect.h := FCharHeight;
+                SDL_SetRenderDrawColor(FRenderer, CellBGColor.r, CellBGColor.g, CellBGColor.b, 255);
+                SDL_RenderFillRect(FRenderer, @CellBGRect);
+              end;
+
+              CharStr := Cell.Ch;
+              Surface := TTF_RenderUTF8_Solid(FFont, PChar(CharStr), CellTextColor);
+              if Assigned(Surface) then
+              begin
+                try
+                  CharTexture := SDL_CreateTextureFromSurface(FRenderer, Surface);
+                  if Assigned(CharTexture) then
+                  begin
+                    try
+                      DestRect.x := RenderX;
+                      DestRect.y := RenderY;
+                      DestRect.w := Surface^.w;
+                      DestRect.h := Surface^.h;
+                      SDL_RenderCopy(FRenderer, CharTexture, nil, @DestRect);
+                    finally
+                      SDL_DestroyTexture(CharTexture);
+                    end;
+                  end;
+                finally
+                  SDL_FreeSurface(Surface);
+                end;
+              end;
+            end;
+
+            RenderX := RenderX + FCharWidth;
+          end;
+        end;
+
+        RenderY := RenderY + FCharHeight;
+      end;
     end;
 
-    RenderY := RenderY + FCharHeight;
+    // Clear dirty flags
+    ATextBuffer.ClearDirtyFlags;
+
+    // Reset render target to screen
+    SDL_SetRenderTarget(FRenderer, nil);
   end;
+
+  // Blit full texture to screen (every frame - fast operation)
+  SDL_RenderCopy(FRenderer, FTextTexture, nil, nil);
 end;
 
 procedure TVideoController.SetFullscreen(Enabled: Boolean);
@@ -3038,6 +3212,37 @@ begin
   end;
 end;
 
+procedure TVideoController.CreateTextTexture;
+begin
+  if FRenderer = nil then Exit;
+
+  // Destroy existing texture if any
+  DestroyTextTexture;
+
+  // Create render target texture for full window (includes border)
+  FTextTexture := SDL_CreateTexture(
+    FRenderer,
+    SDL_PIXELFORMAT_RGBA8888,
+    SDL_TEXTUREACCESS_TARGET,  // Render target, not streaming
+    FWindowWidth,
+    FWindowHeight
+  );
+
+  if FTextTexture = nil then
+    WriteLn('ERROR: Failed to create text texture: ', SDL_GetError)
+  else
+    FTextTextureDirty := True;  // Force initial full render
+end;
+
+procedure TVideoController.DestroyTextTexture;
+begin
+  if FTextTexture <> nil then
+  begin
+    SDL_DestroyTexture(FTextTexture);
+    FTextTexture := nil;
+  end;
+end;
+
 procedure TVideoController.SyncGraphicsBufferToTexture;
 var
   Pixels: Pointer;
@@ -3168,7 +3373,14 @@ begin
       FCells[r][c].FGIndex := DEFAULT_FG_INDEX;
       FCells[r][c].BGIndex := DEFAULT_BG_INDEX;
       FCells[r][c].Reverse := False;
+      FCells[r][c].Dirty := False;
     end;
+
+  // Allocate row dirty flags
+  SetLength(FRowDirty, Rows);
+  for r := 0 to Rows - 1 do
+    FRowDirty[r] := False;
+  FAllDirty := True;  // First render draws everything
 
   FCursorX := 0;
   FCursorY := 0;
@@ -3211,6 +3423,8 @@ begin
   // Position cursor at top-left of window
   FCursorX := FWindowCol1;
   FCursorY := FWindowRow1;
+  // Mark everything for redraw
+  MarkAllDirty;
 end;
 
 procedure TTextBuffer.ResetPrintState;
@@ -3246,6 +3460,7 @@ var
 begin
   // Clear only within current window boundaries
   for r := FWindowRow1 to FWindowRow2 do
+  begin
     for c := FWindowCol1 to FWindowCol2 do
     begin
       FCells[r][c].Ch := ' ';
@@ -3253,6 +3468,9 @@ begin
       FCells[r][c].BGIndex := FCurrentBGIndex;
       FCells[r][c].Reverse := FCurrentReverse;
     end;
+    // Mark each affected row dirty
+    MarkRowDirty(r);
+  end;
   // Position cursor at top-left of window
   FCursorX := FWindowCol1;
   FCursorY := FWindowRow1;
@@ -3307,7 +3525,11 @@ end;
 procedure TTextBuffer.SetCell(Row, Col: Integer; const Cell: TTextCell);
 begin
   if (Row >= 0) and (Row < FRows) and (Col >= 0) and (Col < FCols) then
+  begin
     FCells[Row][Col] := Cell;
+    FCells[Row][Col].Dirty := True;
+    MarkRowDirty(Row);
+  end;
 end;
 
 function TTextBuffer.GetCharAt(Col, Row: Integer): Byte;
@@ -3323,7 +3545,11 @@ procedure TTextBuffer.SetCharAt(Col, Row: Integer; Ch: Byte);
 begin
   // Col, Row are 0-based (converted from screen memory address)
   if (Row >= 0) and (Row < FRows) and (Col >= 0) and (Col < FCols) then
+  begin
     FCells[Row][Col].Ch := Chr(Ch);
+    FCells[Row][Col].Dirty := True;
+    MarkRowDirty(Row);
+  end;
 end;
 
 function TTextBuffer.GetColorAt(Col, Row: Integer): Byte;
@@ -3339,7 +3565,11 @@ procedure TTextBuffer.SetColorAt(Col, Row: Integer; Color: Byte);
 begin
   // Sets foreground color at position
   if (Row >= 0) and (Row < FRows) and (Col >= 0) and (Col < FCols) then
+  begin
     FCells[Row][Col].FGIndex := Color and $0F;
+    FCells[Row][Col].Dirty := True;
+    MarkRowDirty(Row);
+  end;
 end;
 
 procedure TTextBuffer.PutChar(Ch: Char);
@@ -3423,6 +3653,8 @@ begin
     FCells[FCursorY][FCursorX].FGIndex := FCurrentFGIndex;
     FCells[FCursorY][FCursorX].BGIndex := FCurrentBGIndex;
     FCells[FCursorY][FCursorX].Reverse := FCurrentReverse;
+    FCells[FCursorY][FCursorX].Dirty := True;  // Mark cell dirty
+    MarkRowDirty(FCursorY);  // Mark row dirty (to know which rows to check)
     Inc(FCursorX);
   end;
 
@@ -3443,9 +3675,11 @@ procedure TTextBuffer.PutStringNoWrap(const S: string);
 var
   i: Integer;
   Ch: Char;
+  WroteChars: Boolean;
 begin
   // Put string without wrapping - used for history display
   // Stops at end of line, ignores CR/LF
+  WroteChars := False;
   for i := 1 to Length(S) do
   begin
     Ch := S[i];
@@ -3461,7 +3695,11 @@ begin
     FCells[FCursorY][FCursorX].BGIndex := FCurrentBGIndex;
     FCells[FCursorY][FCursorX].Reverse := FCurrentReverse;
     Inc(FCursorX);
+    WroteChars := True;
   end;
+  // Mark row dirty if we wrote anything
+  if WroteChars then
+    MarkRowDirty(FCursorY);
 end;
 
 procedure TTextBuffer.NewLine;
@@ -3485,14 +3723,19 @@ begin
   if FCursorX > 0 then
   begin
     Dec(FCursorX);
-    // Shift cells left from cursor position
+    // Shift cells left from cursor position and mark dirty
     for c := FCursorX to FCols - 2 do
+    begin
       FCells[FCursorY][c] := FCells[FCursorY][c + 1];
+      FCells[FCursorY][c].Dirty := True;
+    end;
     // Clear last cell
     FCells[FCursorY][FCols - 1].Ch := ' ';
     FCells[FCursorY][FCols - 1].FGIndex := FCurrentFGIndex;
     FCells[FCursorY][FCols - 1].BGIndex := FCurrentBGIndex;
     FCells[FCursorY][FCols - 1].Reverse := FCurrentReverse;
+    FCells[FCursorY][FCols - 1].Dirty := True;
+    MarkRowDirty(FCursorY);
   end;
 end;
 
@@ -3501,14 +3744,19 @@ var
   c: Integer;
 begin
   // Delete key: delete character AT cursor and shift left
-  // Shift cells left from cursor position
+  // Shift cells left from cursor position and mark dirty
   for c := FCursorX to FCols - 2 do
+  begin
     FCells[FCursorY][c] := FCells[FCursorY][c + 1];
+    FCells[FCursorY][c].Dirty := True;
+  end;
   // Clear last cell
   FCells[FCursorY][FCols - 1].Ch := ' ';
   FCells[FCursorY][FCols - 1].FGIndex := FCurrentFGIndex;
   FCells[FCursorY][FCols - 1].BGIndex := FCurrentBGIndex;
   FCells[FCursorY][FCols - 1].Reverse := FCurrentReverse;
+  FCells[FCursorY][FCols - 1].Dirty := True;
+  MarkRowDirty(FCursorY);
 end;
 
 procedure TTextBuffer.ScrollUp;
@@ -3540,6 +3788,10 @@ begin
     FCells[FWindowRow2][c].Reverse := FCurrentReverse;
   end;
 
+  // Mark all window rows dirty (TODO: implement hardware scroll to avoid full redraw)
+  for r := FWindowRow1 to FWindowRow2 do
+    MarkRowDirty(r);
+
   // If we were viewing scrollback, adjust offset to maintain view position
   if FViewOffset > 0 then
     Inc(FViewOffset);
@@ -3555,6 +3807,64 @@ begin
   Result := FScrollbackBuffer.Count;
 end;
 
+// === Dirty tracking methods ===
+
+procedure TTextBuffer.MarkRowDirty(Row: Integer);
+begin
+  if (Row >= 0) and (Row < FRows) then
+    FRowDirty[Row] := True;
+end;
+
+procedure TTextBuffer.MarkAllDirty;
+begin
+  FAllDirty := True;
+end;
+
+procedure TTextBuffer.ClearDirtyFlags;
+var
+  r, c: Integer;
+begin
+  FAllDirty := False;
+  for r := 0 to FRows - 1 do
+  begin
+    if FRowDirty[r] then
+    begin
+      // Clear per-cell dirty flags only for dirty rows (optimization)
+      for c := 0 to FCols - 1 do
+        FCells[r][c].Dirty := False;
+      FRowDirty[r] := False;
+    end;
+  end;
+end;
+
+function TTextBuffer.IsRowDirty(Row: Integer): Boolean;
+begin
+  if FAllDirty then
+    Result := True
+  else if (Row >= 0) and (Row < FRows) then
+    Result := FRowDirty[Row]
+  else
+    Result := False;
+end;
+
+function TTextBuffer.NeedsRedraw: Boolean;
+var
+  r: Integer;
+begin
+  if FAllDirty then
+  begin
+    Result := True;
+    Exit;
+  end;
+  for r := 0 to FRows - 1 do
+    if FRowDirty[r] then
+    begin
+      Result := True;
+      Exit;
+    end;
+  Result := False;
+end;
+
 procedure TTextBuffer.ClearCurrentLine;
 var
   c: Integer;
@@ -3567,6 +3877,8 @@ begin
     FCells[FCursorY][c].BGIndex := FCurrentBGIndex;
     FCells[FCursorY][c].Reverse := FCurrentReverse;
   end;
+  // Mark row dirty
+  MarkRowDirty(FCursorY);
   // Returns the cursor to the beginning of the line
   FCursorX := 0;
 end;
@@ -3611,15 +3923,20 @@ begin
 
   if FCursorX < FCols then
   begin
-    // Shift cells right from cursor position
+    // Shift cells right from cursor position and mark dirty
     for c := FCols - 1 downto FCursorX + 1 do
+    begin
       FCells[FCursorY][c] := FCells[FCursorY][c - 1];
+      FCells[FCursorY][c].Dirty := True;
+    end;
 
     // Insert character at cursor position with current colors
     FCells[FCursorY][FCursorX].Ch := Ch;
     FCells[FCursorY][FCursorX].FGIndex := FCurrentFGIndex;
     FCells[FCursorY][FCursorX].BGIndex := FCurrentBGIndex;
     FCells[FCursorY][FCursorX].Reverse := FCurrentReverse;
+    FCells[FCursorY][FCursorX].Dirty := True;
+    MarkRowDirty(FCursorY);
     Inc(FCursorX);
   end;
 
@@ -3725,6 +4042,8 @@ begin
     FCells[FCursorY][c].BGIndex := FCurrentBGIndex;
     FCells[FCursorY][c].Reverse := FCurrentReverse;
   end;
+  // Mark row dirty
+  MarkRowDirty(FCursorY);
   FCursorX := 0;
 end;
 
@@ -3740,6 +4059,8 @@ begin
     FCells[FCursorY][c].BGIndex := FCurrentBGIndex;
     FCells[FCursorY][c].Reverse := FCurrentReverse;
   end;
+  // Mark row dirty
+  MarkRowDirty(FCursorY);
 end;
 
 procedure TTextBuffer.DeleteWordRight;
@@ -3779,6 +4100,8 @@ begin
     FCells[FCursorY][c].BGIndex := FCurrentBGIndex;
     FCells[FCursorY][c].Reverse := FCurrentReverse;
   end;
+  // Mark row dirty
+  MarkRowDirty(FCursorY);
 end;
 
 procedure TTextBuffer.DeleteWordLeft;
@@ -3810,6 +4133,8 @@ begin
     FCells[FCursorY][c].BGIndex := FCurrentBGIndex;
     FCells[FCursorY][c].Reverse := FCurrentReverse;
   end;
+  // Mark row dirty
+  MarkRowDirty(FCursorY);
   FCursorX := StartPos;
 end;
 
@@ -3825,6 +4150,8 @@ begin
     FCells[FCursorY][c].BGIndex := FCurrentBGIndex;
     FCells[FCursorY][c].Reverse := FCurrentReverse;
   end;
+  // Mark row dirty
+  MarkRowDirty(FCursorY);
   FCursorX := 0;
 end;
 
@@ -5202,10 +5529,7 @@ begin
   PrevCursorX := FTextBuffer.CursorX;
   PrevCursorY := FTextBuffer.CursorY;
 
-  // Prima disegna il bordo (finestra con colore FG)
-  FVideoController.ClearBorder;
-
-  // Renderizza il testo nel viewport con supporto per colori per-cella e reverse
+  // RenderText blits full-window texture (includes border) - no need for ClearBorder
   FVideoController.RenderText(FTextBuffer);
 
   // Restore cursor position
@@ -5216,9 +5540,24 @@ begin
   UpdateCursor;
 end;
 
-procedure TSedaiNewConsole.UpdateCursor;
+function TSedaiNewConsole.CheckCursorBlink: Boolean;
 var
   CurrentTime: Cardinal;
+begin
+  Result := False;
+  CurrentTime := SDL_GetTicks;
+
+  // Toggle cursor visibility every 500ms (C64 timing)
+  if CurrentTime - FLastCursorBlink >= CURSOR_BLINK_MS then
+  begin
+    FCursorVisible := not FCursorVisible;
+    FLastCursorBlink := CurrentTime;
+    Result := True;  // Cursor state changed
+  end;
+end;
+
+procedure TSedaiNewConsole.UpdateCursor;
+var
   CursorX, CursorY: Integer;
   CurrentChar: Char;
 begin
@@ -5229,15 +5568,6 @@ begin
   // Don't show cursor when viewing scrollback
   if FTextBuffer.IsInScrollbackMode then
     Exit;
-
-  CurrentTime := SDL_GetTicks;
-
-  // Toggle cursor visibility every 500ms (C64 timing)
-  if CurrentTime - FLastCursorBlink >= CURSOR_BLINK_MS then
-  begin
-    FCursorVisible := not FCursorVisible;
-    FLastCursorBlink := CurrentTime;
-  end;
 
   if FCursorVisible then
   begin
@@ -6627,12 +6957,14 @@ begin
     end;
 
     RenderScreen;
+    FVideoController.Present;
 
     // If more lines remain, show "-- MORE --" and wait for key
     if i < Lines.Count then
     begin
       FTextBuffer.PutString('-- MORE --');
       RenderScreen;
+      FVideoController.Present;
 
       // Flush any pending events
       while SDL_PollEvent(@Event) <> 0 do
@@ -8479,12 +8811,15 @@ begin
       FUserHasTyped := True;  // User typed a character
     end;
 
-    // Render
-    RenderScreen;
-    UpdateCursor;
-    FVideoController.Present;
+    // Render only when needed (text changed OR cursor blink changed)
+    if FTextBuffer.NeedsRedraw or CheckCursorBlink then
+    begin
+      RenderScreen;
+      UpdateCursor;
+      FVideoController.Present;
+    end;
 
-    SDL_Delay(16); // ~60 FPS
+    SDL_Delay(16); // 60 FPS
   end;
 end;
 
