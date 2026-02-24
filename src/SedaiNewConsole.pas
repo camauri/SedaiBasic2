@@ -793,6 +793,9 @@ type
     FLastErrorCode: Integer;      // ER - error code of last error (0 = none)
     FLastErrorMessage: string;    // ERR$ - error message of last error
 
+    // Deferred rendering during VM execution
+    FLastVMRenderTick: UInt32;
+
     // File I/O for DOPEN/DCLOSE/PRINT#/INPUT#/GET#
     FFileHandles: array[1..15] of TFileStream;  // Open file handles (BASIC uses 1-15)
     FFileNames: array[1..15] of string;         // Filenames for open handles
@@ -839,6 +842,11 @@ type
     procedure LoadHistory;
     procedure SaveHistory;
     procedure SaveHistoryFull;  // Rewrites entire history file
+
+    // Deferred rendering during VM execution
+    function HandleVMEventPoll: Boolean;
+    procedure BeginVMExecution;
+    procedure EndVMExecution;
 
   public
     constructor Create;
@@ -1713,6 +1721,9 @@ begin
 
       FTextTextureDirty := False;
       FLastBorderColorIndex := FBorderColorIndex;
+      // Full redraw makes any pending hardware scroll irrelevant
+      ATextBuffer.ScrollPending := False;
+      ATextBuffer.ScrollDirection := 0;
     end
     else
     begin
@@ -3539,6 +3550,9 @@ begin
   // Position cursor at top-left of window
   FCursorX := FWindowCol1;
   FCursorY := FWindowRow1;
+  // Clear any pending hardware scroll (irrelevant after clear)
+  FScrollPending := False;
+  FScrollDirection := 0;
   // Mark everything for redraw
   MarkAllDirty;
 end;
@@ -3929,8 +3943,22 @@ begin
     FCells[FWindowRow2][c].Reverse := FCurrentReverse;
   end;
 
-  // Full redraw after scroll (hardware scroll disabled - needs debugging)
-  FAllDirty := True;
+  // Hardware scroll: use texture shift for single scroll, AllDirty for multiple
+  if (FWindowCol1 = 0) and (FWindowRow1 = 0) and
+     (FWindowCol2 = FCols - 1) and (FWindowRow2 = FRows - 1) and
+     (not FScrollPending) then
+  begin
+    // Single scroll on full screen - use hardware scroll
+    FScrollPending := True;
+    FScrollDirection := 1;
+    MarkRowDirty(FWindowRow2);
+  end
+  else
+  begin
+    // Multiple scrolls or partial window - full redraw
+    FScrollPending := False;
+    FAllDirty := True;
+  end;
 
   // If we were viewing scrollback, adjust offset to maintain view position
   if FViewOffset > 0 then
@@ -4712,21 +4740,20 @@ end;
 procedure TConsoleOutputAdapter.Print(const Text: string; ClearBackground: Boolean);
 begin
   FTextBuffer.PutString(Text);
+  // Present removed - rendering is handled by the periodic render callback
 end;
 
 procedure TConsoleOutputAdapter.PrintLn(const Text: string; ClearBackground: Boolean);
 begin
   FTextBuffer.PutString(Text);
   FTextBuffer.NewLine;
-  // Auto-present after newline for immediate display (like classic BASICs)
-  Present;
+  // Present removed - rendering is handled by the periodic render callback
 end;
 
 procedure TConsoleOutputAdapter.NewLine;
 begin
   FTextBuffer.NewLine;
-  // Auto-present after newline for immediate display (like classic BASICs)
-  Present;
+  // Present removed - rendering is handled by the periodic render callback
 end;
 
 procedure TConsoleOutputAdapter.Clear;
@@ -5947,6 +5974,7 @@ begin
               else
               begin
                 // Execute the compiled bytecode
+                BeginVMExecution;
                 try
                   FBytecodeVM.Reset;
                   if Assigned(FProgramInputHandler) then
@@ -5967,6 +5995,7 @@ begin
                     FTextBuffer.NewLine;
                   end;
                 end;
+                EndVMExecution;
               end;
 
               // READY dopo comando immediato
@@ -6078,6 +6107,7 @@ begin
                     end
                     else
                     begin
+                      BeginVMExecution;
                       try
                         FBytecodeVM.Reset;
                         if Assigned(FProgramInputHandler) then
@@ -6097,6 +6127,7 @@ begin
                           FTextBuffer.NewLine;
                         end;
                       end;
+                      EndVMExecution;
                     end;
                   finally
                     // Clear VM's reference before freeing
@@ -6127,6 +6158,7 @@ begin
               else if FBytecodeMode and Assigned(FLoadedBytecode) then
               begin
                 // Run loaded bytecode directly
+                BeginVMExecution;
                 try
                   FBytecodeVM.Reset;
                   if Assigned(FProgramInputHandler) then
@@ -6146,6 +6178,7 @@ begin
                     FTextBuffer.NewLine;
                   end;
                 end;
+                EndVMExecution;
               end
               else if FProgramMemory.GetLineCount > 0 then
               begin
@@ -6204,6 +6237,7 @@ begin
                   else
                   begin
                     // Execute via VM
+                    BeginVMExecution;
                     try
                       FBytecodeVM.Reset;
                       if Assigned(FProgramInputHandler) then
@@ -6223,6 +6257,7 @@ begin
                         FTextBuffer.NewLine;
                       end;
                     end;
+                    EndVMExecution;
                   end;
                 finally
                   // Clear VM's reference before freeing
@@ -6560,7 +6595,12 @@ begin
             begin
               // Resume from debugger pause
               FDebugger.Continue;
-              FBytecodeVM.RunDebug;
+              BeginVMExecution;
+              try
+                FBytecodeVM.RunDebug;
+              finally
+                EndVMExecution;
+              end;
               FTextBuffer.NewLine;
               FTextBuffer.PutString('READY.');
               FTextBuffer.NewLine;
@@ -6656,7 +6696,12 @@ begin
             if FDebugger.IsPaused then
             begin
               FDebugger.StepLine;
-              FBytecodeVM.RunDebug;
+              BeginVMExecution;
+              try
+                FBytecodeVM.RunDebug;
+              finally
+                EndVMExecution;
+              end;
             end
             else
             begin
@@ -6731,6 +6776,7 @@ begin
             // If load succeeded (FBytecodeMode is true), run it
             if FBytecodeMode and Assigned(FLoadedBytecode) then
             begin
+              BeginVMExecution;
               try
                 FBytecodeVM.Reset;
                 if Assigned(FProgramInputHandler) then
@@ -6750,6 +6796,7 @@ begin
                   FTextBuffer.NewLine;
                 end;
               end;
+              EndVMExecution;
             end;
           end
           else if (CmdWord = kCATALOG) or (CmdWord = kDIR) or (CmdWord = kDIRECTORY) then
@@ -8987,6 +9034,62 @@ begin
     end;
   except
     // Silently ignore errors saving history
+  end;
+end;
+
+{ Deferred rendering: periodic render callback during VM execution }
+
+function TSedaiNewConsole.HandleVMEventPoll: Boolean;
+var
+  Now: UInt32;
+begin
+  Result := False;
+
+  // Process SDL events (CTRL+C, window close)
+  if Assigned(FProgramInputHandler) then
+  begin
+    FProgramInputHandler.ProcessEvents;
+    if FProgramInputHandler.QuitRequested then
+    begin
+      Result := True;
+      Exit;
+    end;
+    if FProgramInputHandler.StopRequested then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+
+  // Periodic rendering (~60 FPS)
+  Now := SDL_GetTicks;
+  if (Now - FLastVMRenderTick) >= 16 then
+  begin
+    FLastVMRenderTick := Now;
+    if FTextBuffer.NeedsRedraw then
+    begin
+      RenderScreen;
+      UpdateCursor;
+      FVideoController.Present;
+    end;
+  end;
+end;
+
+procedure TSedaiNewConsole.BeginVMExecution;
+begin
+  FLastVMRenderTick := SDL_GetTicks;
+  FBytecodeVM.EventPollCallback := @HandleVMEventPoll;
+end;
+
+procedure TSedaiNewConsole.EndVMExecution;
+begin
+  FBytecodeVM.EventPollCallback := nil;
+  // Final render to show the last state
+  if FTextBuffer.NeedsRedraw then
+  begin
+    RenderScreen;
+    UpdateCursor;
+    FVideoController.Present;
   end;
 end;
 

@@ -47,11 +47,11 @@
 630 PRINT "TEST 3: SETCOLOR (Palette Modification)"
 640 PRINT "------------------------------"
 650 REM Save original color 0
-660 OR = GETCOLOR(0, 0)  : REM Red
-670 OG = GETCOLOR(0, 1)  : REM Green
-680 OB = GETCOLOR(0, 2)  : REM Blue
-690 OA = GETCOLOR(0, 3)  : REM Alpha
-700 PRINT "Original color 0: R=";OR;" G=";OG;" B=";OB;" A=";OA
+660 ORIGR = GETCOLOR(0, 0)  : REM Red
+670 ORIGG = GETCOLOR(0, 1)  : REM Green
+680 ORIGB = GETCOLOR(0, 2)  : REM Blue
+690 ORIGA = GETCOLOR(0, 3)  : REM Alpha
+700 PRINT "Original color 0: R=";ORIGR;" G=";ORIGG;" B=";ORIGB;" A=";ORIGA
 710 REM Modify palette entry 0
 720 SETCOLOR 0, 0, 255    : REM Red component
 730 SETCOLOR 0, 1, 128    : REM Green component
@@ -67,10 +67,10 @@
 830 TN$ = "SETCOLOR Green": EX = 128: AC = NG: GOSUB 9500
 840 TN$ = "SETCOLOR Blue": EX = 64: AC = NB: GOSUB 9500
 850 REM Restore original
-860 SETCOLOR 0, 0, OR
-870 SETCOLOR 0, 1, OG
-880 SETCOLOR 0, 2, OB
-890 SETCOLOR 0, 3, OA
+860 SETCOLOR 0, 0, ORIGR
+870 SETCOLOR 0, 1, ORIGG
+880 SETCOLOR 0, 2, ORIGB
+890 SETCOLOR 0, 3, ORIGA
 900 PRINT
 
 1000 REM =============================================

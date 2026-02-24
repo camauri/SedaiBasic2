@@ -252,6 +252,9 @@ type
     property C128InputMode: Boolean read FC128InputMode write FC128InputMode;
     // Function key definitions (for console expansion)
     function GetFunctionKey(KeyNum: Integer): string;
+    // Event polling callback (for deferred rendering during VM execution)
+    property EventPollCallback: TEventPollCallback read FEventPollCallback write FEventPollCallback;
+    property EventPollInterval: Integer read FEventPollInterval write FEventPollInterval;
   end;
 
 implementation
@@ -1541,6 +1544,15 @@ begin
   FPudefComma := ',';
   FPudefDecimal := '.';
   FPudefDollar := '$';
+  // Reset TRAP/RESUME error handling state
+  FTrapLine := 0;
+  FTrapPC := -1;
+  FResumePC := -1;
+  FInErrorHandler := False;
+  // Reset error state for EL, ER, ERR$
+  FLastErrorLine := 0;
+  FLastErrorCode := 0;
+  FLastErrorMessage := '';
 end;
 
 {$IFDEF ENABLE_INSTRUCTION_COUNTING}
