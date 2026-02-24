@@ -800,6 +800,9 @@ type
     FLastErrorCode: Integer;      // ER - error code of last error (0 = none)
     FLastErrorMessage: string;    // ERR$ - error message of last error
 
+    // READY. prompt tracking - ensures every command shows READY. exactly once
+    FReadyPrinted: Boolean;
+
     // Deferred rendering during VM execution
     FLastVMRenderTick: UInt32;
 
@@ -833,6 +836,7 @@ type
     procedure ExecuteVerify(const Filename: string);
     procedure ExecuteBLoad(const Filename: string);
     procedure ExecuteBSave(const Filename: string);
+    procedure PrintReady;  // Prints READY. if not already printed during current command
     function AskYesNo(const Prompt: string): Boolean;
     function AskYesNoAll(const Prompt: string; var OverwriteAll: Boolean): Boolean;
 
@@ -5621,7 +5625,7 @@ begin
     if Reason <> '' then
       FTextBuffer.PutString(' (' + Reason + ')');
     FTextBuffer.NewLine;
-    FTextBuffer.PutString('READY.');
+    FTextBuffer.PutString('READY.'); FReadyPrinted := True;
     FTextBuffer.NewLine;
   end;
   // Force screen update
@@ -5728,7 +5732,7 @@ begin
   // After splash: empty line + READY. + cursor on next line
   FTextBuffer.NewLine;  // Riga vuota
   FTextBuffer.CursorX := 0;
-  FTextBuffer.PutString('READY.');
+  FTextBuffer.PutString('READY.'); FReadyPrinted := True;
   FTextBuffer.NewLine;  // Cursore sulla riga successiva
   FTextBuffer.CursorX := 0;
 
@@ -5937,6 +5941,18 @@ begin
   end;
 end;
 
+{ PrintReady - prints READY. prompt if not already printed during current command.
+  Called as safety net at end of ProcessCommand to ensure every command shows READY. }
+procedure TSedaiNewConsole.PrintReady;
+begin
+  if not FReadyPrinted then
+  begin
+    FTextBuffer.PutString('READY.');
+    FTextBuffer.NewLine;
+    FReadyPrinted := True;
+  end;
+end;
+
 procedure TSedaiNewConsole.ProcessCommand(const Command: string);
 var
   TrimmedCmd: string;
@@ -5960,6 +5976,7 @@ var
   F: TextFile;
 begin
   TrimmedCmd := Trim(Command);
+  FReadyPrinted := False;
 
   if TrimmedCmd = '' then
   begin
@@ -5982,7 +5999,7 @@ begin
     FTextBuffer.PutString('?SYNTAX ERROR');
     FTextBuffer.NewLine;
     FTextBuffer.NewLine;
-    FTextBuffer.PutString('READY.');
+    FTextBuffer.PutString('READY.'); FReadyPrinted := True;
     FTextBuffer.NewLine;
     Exit;
   end;
@@ -5996,7 +6013,7 @@ begin
           begin
             FTextBuffer.PutString('?BYTECODE LOADED - NEW TO CLEAR');
             FTextBuffer.NewLine;
-            FTextBuffer.PutString('READY.');
+            FTextBuffer.PutString('READY.'); FReadyPrinted := True;
             FTextBuffer.NewLine;
           end
           else
@@ -6081,7 +6098,7 @@ begin
 
               // READY dopo comando immediato
               FTextBuffer.NewLine;
-              FTextBuffer.PutString('READY.');
+              FTextBuffer.PutString('READY.'); FReadyPrinted := True;
               FTextBuffer.NewLine;
 
             except
@@ -6094,7 +6111,7 @@ begin
                 FTextBuffer.PutString(E.Message);
                 FTextBuffer.NewLine;
                 FTextBuffer.NewLine;
-                FTextBuffer.PutString('READY.');
+                FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                 FTextBuffer.NewLine;
               end;
             end;
@@ -6130,7 +6147,7 @@ begin
               begin
                 FTextBuffer.PutString('?MISSING FILENAME');
                 FTextBuffer.NewLine;
-                FTextBuffer.PutString('READY.');
+                FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                 FTextBuffer.NewLine;
               end
               else
@@ -6167,7 +6184,7 @@ begin
                         FTextBuffer.PutString('?' + FImmediateCompiler.LastError);
                       FTextBuffer.NewLine;
                       // Show READY. then line ready for editing
-                      FTextBuffer.PutString('READY.');
+                      FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                       FTextBuffer.NewLine;
                       if FImmediateCompiler.LastErrorLine > 0 then
                       begin
@@ -6218,7 +6235,7 @@ begin
                       BytecodeProgram.Free;
                   end;
                   FTextBuffer.NewLine;
-                  FTextBuffer.PutString('READY.');
+                  FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                   FTextBuffer.NewLine;
                 end;
                 // else: ExecuteLoad already printed error and READY.
@@ -6233,7 +6250,7 @@ begin
                 // RUN line# - not yet implemented (would need bytecode line mapping)
                 FTextBuffer.PutString('?RUN FROM LINE NOT YET IMPLEMENTED');
                 FTextBuffer.NewLine;
-                FTextBuffer.PutString('READY.');
+                FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                 FTextBuffer.NewLine;
               end
               else if FBytecodeMode and Assigned(FLoadedBytecode) then
@@ -6294,7 +6311,7 @@ begin
                       FTextBuffer.PutString('?' + FImmediateCompiler.LastError);
                     FTextBuffer.NewLine;
                     // Show READY. then line with error for editing
-                    FTextBuffer.PutString('READY.');
+                    FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                     FTextBuffer.NewLine;
                     if FImmediateCompiler.LastErrorLine > 0 then
                     begin
@@ -6359,7 +6376,7 @@ begin
 
               // After RUN: empty line + READY
               FTextBuffer.NewLine;
-              FTextBuffer.PutString('READY.');
+              FTextBuffer.PutString('READY.'); FReadyPrinted := True;
               FTextBuffer.NewLine;
 
               // Force refresh of text display
@@ -6375,7 +6392,7 @@ begin
             begin
               FTextBuffer.PutString('?BYTECODE LOADED - NO SOURCE');
               FTextBuffer.NewLine;
-              FTextBuffer.PutString('READY.');
+              FTextBuffer.PutString('READY.'); FReadyPrinted := True;
               FTextBuffer.NewLine;
             end
             else
@@ -6405,7 +6422,7 @@ begin
                 begin
                   FTextBuffer.PutString('?SYNTAX ERROR');
                   FTextBuffer.NewLine;
-                  FTextBuffer.PutString('READY.');
+                  FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                   FTextBuffer.NewLine;
                   Lines := nil;
                 end;
@@ -6419,7 +6436,7 @@ begin
                 begin
                   FTextBuffer.PutString('?SYNTAX ERROR');
                   FTextBuffer.NewLine;
-                  FTextBuffer.PutString('READY.');
+                  FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                   FTextBuffer.NewLine;
                   Lines := nil;
                 end;
@@ -6433,7 +6450,7 @@ begin
                 begin
                   FTextBuffer.PutString('?SYNTAX ERROR');
                   FTextBuffer.NewLine;
-                  FTextBuffer.PutString('READY.');
+                  FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                   FTextBuffer.NewLine;
                   Lines := nil;
                 end;
@@ -6450,7 +6467,7 @@ begin
                 begin
                   FTextBuffer.PutString('?SYNTAX ERROR');
                   FTextBuffer.NewLine;
-                  FTextBuffer.PutString('READY.');
+                  FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                   FTextBuffer.NewLine;
                   Lines := nil;
                 end;
@@ -6523,7 +6540,7 @@ begin
             begin
               FTextBuffer.PutString('?BYTECODE LOADED - NO SOURCE');
               FTextBuffer.NewLine;
-              FTextBuffer.PutString('READY.');
+              FTextBuffer.PutString('READY.'); FReadyPrinted := True;
               FTextBuffer.NewLine;
             end
             else
@@ -6552,7 +6569,7 @@ begin
                 begin
                   FTextBuffer.PutString('?LINE NOT FOUND');
                   FTextBuffer.NewLine;
-                  FTextBuffer.PutString('READY.');
+                  FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                   FTextBuffer.NewLine;
                 end;
               end
@@ -6560,7 +6577,7 @@ begin
               begin
                 FTextBuffer.PutString('?SYNTAX ERROR');
                 FTextBuffer.NewLine;
-                FTextBuffer.PutString('READY.');
+                FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                 FTextBuffer.NewLine;
               end;
             end;
@@ -6572,15 +6589,15 @@ begin
             begin
               FTextBuffer.PutString('?BYTECODE LOADED - NO SOURCE');
               FTextBuffer.NewLine;
-              FTextBuffer.PutString('READY.');
+              FTextBuffer.PutString('READY.'); FReadyPrinted := True;
               FTextBuffer.NewLine;
             end
             else
             begin
               Filename := Trim(Copy(ParseResult.Statement, Length(kAUTO) + 1, MaxInt));
-              if Filename = '' then
+              if (Filename = '') or (UpperCase(Filename) = 'OFF') then
               begin
-                // AUTO without argument - turn off auto numbering
+                // AUTO or AUTO OFF - turn off auto numbering
                 FAutoLineNumber := 0;
                 FTextBuffer.PutString('AUTO OFF');
                 FTextBuffer.NewLine;
@@ -6617,6 +6634,7 @@ begin
                   Statement := IntToStr(FAutoLineNumber) + ' ';
                   FTextBuffer.PutString(Statement);
                   FUserHasTyped := True;
+                  FReadyPrinted := True;  // Suppress READY. - user is entering lines
                   RenderScreen;
                   UpdateCursor;
                   FVideoController.Present;
@@ -6625,7 +6643,7 @@ begin
                 begin
                   FTextBuffer.PutString('?ILLEGAL QUANTITY');
                   FTextBuffer.NewLine;
-                  FTextBuffer.PutString('READY.');
+                  FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                   FTextBuffer.NewLine;
                 end;
               end
@@ -6633,7 +6651,7 @@ begin
               begin
                 FTextBuffer.PutString('?SYNTAX ERROR');
                 FTextBuffer.NewLine;
-                FTextBuffer.PutString('READY.');
+                FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                 FTextBuffer.NewLine;
               end;
             end;
@@ -6651,7 +6669,7 @@ begin
               FLoadedBytecode := nil;
             end;
             FTextBuffer.NewLine;
-            FTextBuffer.PutString('READY.');
+            FTextBuffer.PutString('READY.'); FReadyPrinted := True;
             FTextBuffer.NewLine;
           end
           else if CmdWord = kCONT then
@@ -6669,7 +6687,7 @@ begin
                 end;
               end;
               FTextBuffer.NewLine;
-              FTextBuffer.PutString('READY.');
+              FTextBuffer.PutString('READY.'); FReadyPrinted := True;
               FTextBuffer.NewLine;
             end
             else if FDebugger.IsPaused then
@@ -6683,14 +6701,14 @@ begin
                 EndVMExecution;
               end;
               FTextBuffer.NewLine;
-              FTextBuffer.PutString('READY.');
+              FTextBuffer.PutString('READY.'); FReadyPrinted := True;
               FTextBuffer.NewLine;
             end
             else
             begin
               FTextBuffer.PutString('?CAN''T CONTINUE ERROR');
               FTextBuffer.NewLine;
-              FTextBuffer.PutString('READY.');
+              FTextBuffer.PutString('READY.'); FReadyPrinted := True;
               FTextBuffer.NewLine;
             end;
           end
@@ -6701,7 +6719,7 @@ begin
             FDebugger.Activate;
             FTextBuffer.PutString('TRACE ON');
             FTextBuffer.NewLine;
-            FTextBuffer.PutString('READY.');
+            FTextBuffer.PutString('READY.'); FReadyPrinted := True;
             FTextBuffer.NewLine;
           end
           else if CmdWord = kTROFF then
@@ -6711,7 +6729,7 @@ begin
             FDebugger.Deactivate;
             FTextBuffer.PutString('TRACE OFF');
             FTextBuffer.NewLine;
-            FTextBuffer.PutString('READY.');
+            FTextBuffer.PutString('READY.'); FReadyPrinted := True;
             FTextBuffer.NewLine;
           end
           else if CmdWord = 'BREAK' then
@@ -6745,7 +6763,7 @@ begin
               FTextBuffer.PutString('?SYNTAX ERROR');
             end;
             FTextBuffer.NewLine;
-            FTextBuffer.PutString('READY.');
+            FTextBuffer.PutString('READY.'); FReadyPrinted := True;
             FTextBuffer.NewLine;
           end
           else if CmdWord = 'UNBREAK' then
@@ -6768,7 +6786,7 @@ begin
               FTextBuffer.PutString('?SYNTAX ERROR');
             end;
             FTextBuffer.NewLine;
-            FTextBuffer.PutString('READY.');
+            FTextBuffer.PutString('READY.'); FReadyPrinted := True;
             FTextBuffer.NewLine;
           end
           else if CmdWord = 'STEP' then
@@ -6788,7 +6806,7 @@ begin
             begin
               FTextBuffer.PutString('?NOT IN DEBUG MODE');
               FTextBuffer.NewLine;
-              FTextBuffer.PutString('READY.');
+              FTextBuffer.PutString('READY.'); FReadyPrinted := True;
               FTextBuffer.NewLine;
             end;
           end
@@ -6812,7 +6830,7 @@ begin
             begin
               FTextBuffer.PutString('?BYTECODE LOADED - USE BSAVE');
               FTextBuffer.NewLine;
-              FTextBuffer.PutString('READY.');
+              FTextBuffer.PutString('READY.'); FReadyPrinted := True;
               FTextBuffer.NewLine;
             end
             else
@@ -6828,7 +6846,7 @@ begin
             begin
               FTextBuffer.PutString('?BYTECODE LOADED');
               FTextBuffer.NewLine;
-              FTextBuffer.PutString('READY.');
+              FTextBuffer.PutString('READY.'); FReadyPrinted := True;
               FTextBuffer.NewLine;
             end
             else
@@ -6878,6 +6896,8 @@ begin
                 end;
               end;
               EndVMExecution;
+              FTextBuffer.NewLine;
+              FReadyPrinted := False;  // Need new READY. after program execution
             end;
           end
           else if (CmdWord = kCATALOG) or (CmdWord = kDIR) or (CmdWord = kDIRECTORY) then
@@ -6913,7 +6933,7 @@ begin
             begin
               FTextBuffer.PutString('?MISSING SOURCE AND DESTINATION');
               FTextBuffer.NewLine;
-              FTextBuffer.PutString('READY.');
+              FTextBuffer.PutString('READY.'); FReadyPrinted := True;
               FTextBuffer.NewLine;
             end
             else
@@ -7010,7 +7030,7 @@ begin
             begin
               FTextBuffer.PutString('?MISSING FILE PATTERN');
               FTextBuffer.NewLine;
-              FTextBuffer.PutString('READY.');
+              FTextBuffer.PutString('READY.'); FReadyPrinted := True;
               FTextBuffer.NewLine;
             end
             else
@@ -7028,7 +7048,7 @@ begin
                 begin
                   FTextBuffer.PutString('?MISSING CLOSING QUOTE');
                   FTextBuffer.NewLine;
-                  FTextBuffer.PutString('READY.');
+                  FTextBuffer.PutString('READY.'); FReadyPrinted := True;
                   FTextBuffer.NewLine;
                 end;
               end
@@ -7317,17 +7337,23 @@ begin
             // Unknown system command
             FTextBuffer.PutString('?UNKNOWN COMMAND');
             FTextBuffer.NewLine;
-            FTextBuffer.PutString('READY.');
+            FTextBuffer.PutString('READY.'); FReadyPrinted := True;
             FTextBuffer.NewLine;
           end;
+
         end;
     end;
+
+    // Safety net: ensure READY. is printed after every system command
+    if (ParseResult.CommandType = ctSystemCommand) and not FReadyPrinted then
+      PrintReady;
 
   except
     on E: Exception do
     begin
       FTextBuffer.PutString('?ERROR: ' + E.Message);
       FTextBuffer.NewLine;
+      PrintReady;
     end;
   end;
 end;
@@ -7637,7 +7663,7 @@ begin
   begin
     FTextBuffer.PutString('?FILE NOT FOUND');
     FTextBuffer.NewLine;
-    FTextBuffer.PutString('READY.');
+    FTextBuffer.PutString('READY.'); FReadyPrinted := True;
     FTextBuffer.NewLine;
     Exit;
   end;
@@ -7651,7 +7677,7 @@ begin
       begin
         FTextBuffer.PutString('?FILE OPEN ERROR');
         FTextBuffer.NewLine;
-        FTextBuffer.PutString('READY.');
+        FTextBuffer.PutString('READY.'); FReadyPrinted := True;
         FTextBuffer.NewLine;
         Exit;
       end;
@@ -7659,7 +7685,7 @@ begin
       begin
         FTextBuffer.PutString('?FILE READ ERROR');
         FTextBuffer.NewLine;
-        FTextBuffer.PutString('READY.');
+        FTextBuffer.PutString('READY.'); FReadyPrinted := True;
         FTextBuffer.NewLine;
         Exit;
       end;
@@ -7667,7 +7693,7 @@ begin
       begin
         FTextBuffer.PutString('?I/O ERROR: ' + E.Message);
         FTextBuffer.NewLine;
-        FTextBuffer.PutString('READY.');
+        FTextBuffer.PutString('READY.'); FReadyPrinted := True;
         FTextBuffer.NewLine;
         Exit;
       end;
@@ -7704,7 +7730,7 @@ begin
       end;
     end;
 
-    FTextBuffer.PutString('READY.');
+    FTextBuffer.PutString('READY.'); FReadyPrinted := True;
     FTextBuffer.NewLine;
 
   finally
@@ -7757,28 +7783,28 @@ begin
   try
     try
       FileContent.SaveToFile(Filename);
-      FTextBuffer.PutString('READY.');
+      FTextBuffer.PutString('READY.'); FReadyPrinted := True;
       FTextBuffer.NewLine;
     except
       on E: EFCreateError do
       begin
         FTextBuffer.PutString('?FILE CREATE ERROR');
         FTextBuffer.NewLine;
-        FTextBuffer.PutString('READY.');
+        FTextBuffer.PutString('READY.'); FReadyPrinted := True;
         FTextBuffer.NewLine;
       end;
       on E: EWriteError do
       begin
         FTextBuffer.PutString('?FILE WRITE ERROR');
         FTextBuffer.NewLine;
-        FTextBuffer.PutString('READY.');
+        FTextBuffer.PutString('READY.'); FReadyPrinted := True;
         FTextBuffer.NewLine;
       end;
       on E: Exception do
       begin
         FTextBuffer.PutString('?I/O ERROR: ' + E.Message);
         FTextBuffer.NewLine;
-        FTextBuffer.PutString('READY.');
+        FTextBuffer.PutString('READY.'); FReadyPrinted := True;
         FTextBuffer.NewLine;
       end;
     end;
@@ -8388,7 +8414,7 @@ begin
       FLoadedBytecode := Serializer.LoadFromFile(Filename);
       FBytecodeMode := True;
 
-      FTextBuffer.PutString('READY.');
+      FTextBuffer.PutString('READY.'); FReadyPrinted := True;
       FTextBuffer.NewLine;
     except
       on E: EFOpenError do
@@ -8485,7 +8511,7 @@ begin
     try
       try
         Serializer.SaveToFile(FLoadedBytecode, Filename);
-        FTextBuffer.PutString('READY.');
+        FTextBuffer.PutString('READY.'); FReadyPrinted := True;
         FTextBuffer.NewLine;
       except
         on E: EFCreateError do
@@ -8593,7 +8619,7 @@ begin
 
       Serializer.SaveToFile(BytecodeProgram, Filename);
 
-      FTextBuffer.PutString('READY.');
+      FTextBuffer.PutString('READY.'); FReadyPrinted := True;
       FTextBuffer.NewLine;
 
       BytecodeProgram.Free;
