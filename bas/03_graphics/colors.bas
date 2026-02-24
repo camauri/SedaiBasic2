@@ -1,187 +1,256 @@
-10 REM =============================================
-20 REM  SedaiBasic Color/Palette Test Suite
-30 REM  Tests: COLOR, SETCOLOR, GETCOLOR, PLOAD, PSAVE
-40 REM  Run with sbv.exe (requires SDL2 graphics)
-50 REM =============================================
-
-100 REM === INITIALIZATION ===
-110 GRAPHIC 1  : REM Bitmap mode
-120 SCNCLR
-130 PRINT "=== COLOR/PALETTE TEST SUITE ==="
-140 PRINT
-150 TP% = 0 : TF% = 0
-
-200 REM =============================================
-210 REM  TEST 1: COLOR Command (Source/Index)
-220 REM =============================================
-230 PRINT "TEST 1: COLOR Command"
-240 PRINT "------------------------------"
-250 REM COLOR source, index - Sets color source
-260 COLOR 0, 6   : REM Background = blue
-270 COLOR 1, 14  : REM Foreground = light blue
-280 C0 = RCLR(0) : REM Read back
-290 C1 = RCLR(1)
-300 TN$ = "Background color": EX = 6: AC = C0: GOSUB 9500
-310 TN$ = "Foreground color": EX = 14: AC = C1: GOSUB 9500
-320 PRINT
-
-400 REM =============================================
-410 REM  TEST 2: RCLR Function
-420 REM =============================================
-430 PRINT "TEST 2: RCLR (Read Color Source)"
-440 PRINT "------------------------------"
-450 COLOR 2, 2   : REM Multicolor 1 = red
-460 COLOR 3, 5   : REM Multicolor 2 = green
-470 COLOR 4, 0   : REM Border = black
-480 R2 = RCLR(2)
-490 R3 = RCLR(3)
-500 R4 = RCLR(4)
-510 TN$ = "Multicolor 1": EX = 2: AC = R2: GOSUB 9500
-520 TN$ = "Multicolor 2": EX = 5: AC = R3: GOSUB 9500
-530 TN$ = "Border color": EX = 0: AC = R4: GOSUB 9500
-540 PRINT
-
-600 REM =============================================
-610 REM  TEST 3: SETCOLOR (Modify Palette)
-620 REM =============================================
-630 PRINT "TEST 3: SETCOLOR (Palette Modification)"
-640 PRINT "------------------------------"
-650 REM Save original color 0
-660 ORIGR = GETCOLOR(0, 0)  : REM Red
-670 ORIGG = GETCOLOR(0, 1)  : REM Green
-680 ORIGB = GETCOLOR(0, 2)  : REM Blue
-690 ORIGA = GETCOLOR(0, 3)  : REM Alpha
-700 PRINT "Original color 0: R=";ORIGR;" G=";ORIGG;" B=";ORIGB;" A=";ORIGA
-710 REM Modify palette entry 0
-720 SETCOLOR 0, 0, 255    : REM Red component
-730 SETCOLOR 0, 1, 128    : REM Green component
-740 SETCOLOR 0, 2, 64     : REM Blue component
-750 SETCOLOR 0, 3, 255    : REM Alpha component
-760 REM Read back
-770 NR = GETCOLOR(0, 0)
-780 NG = GETCOLOR(0, 1)
-790 NB = GETCOLOR(0, 2)
-800 NA = GETCOLOR(0, 3)
-810 PRINT "Modified color 0: R=";NR;" G=";NG;" B=";NB;" A=";NA
-820 TN$ = "SETCOLOR Red": EX = 255: AC = NR: GOSUB 9500
-830 TN$ = "SETCOLOR Green": EX = 128: AC = NG: GOSUB 9500
-840 TN$ = "SETCOLOR Blue": EX = 64: AC = NB: GOSUB 9500
-850 REM Restore original
-860 SETCOLOR 0, 0, ORIGR
-870 SETCOLOR 0, 1, ORIGG
-880 SETCOLOR 0, 2, ORIGB
-890 SETCOLOR 0, 3, ORIGA
-900 PRINT
-
-1000 REM =============================================
-1010 REM  TEST 4: GETCOLOR Function
-1020 REM =============================================
-1030 PRINT "TEST 4: GETCOLOR (Read Palette)"
-1040 PRINT "------------------------------"
-1050 REM Read standard C64 colors
-1060 PRINT "C64 Standard Palette:"
-1070 FOR I = 0 TO 15
-1080   R = GETCOLOR(I, 0)
-1090   G = GETCOLOR(I, 1)
-1100   B = GETCOLOR(I, 2)
-1110   PRINT "  Color "; I; ": R=";R;" G=";G;" B=";B
-1120 NEXT I
-1130 TP% = TP% + 1
-1140 PRINT
-
-1200 REM =============================================
-1210 REM  TEST 5: PSAVE/PLOAD (Palette Files)
-1220 REM =============================================
-1230 PRINT "TEST 5: PSAVE/PLOAD (Palette Files)"
-1240 PRINT "------------------------------"
-1250 REM Modify a color
-1260 SETCOLOR 15, 0, 100
-1270 SETCOLOR 15, 1, 150
-1280 SETCOLOR 15, 2, 200
-1290 REM Save palette
-1300 PSAVE "test_palette.json"
-1310 PRINT "Palette saved to test_palette.json"
-1320 REM Modify color again
-1330 SETCOLOR 15, 0, 0
-1340 SETCOLOR 15, 1, 0
-1350 SETCOLOR 15, 2, 0
-1360 REM Load palette back
-1370 PLOAD "test_palette.json"
-1380 PRINT "Palette loaded from test_palette.json"
-1390 REM Verify
-1400 LR = GETCOLOR(15, 0)
-1410 LG = GETCOLOR(15, 1)
-1420 LB = GETCOLOR(15, 2)
-1430 PRINT "Color 15 after load: R=";LR;" G=";LG;" B=";LB
-1440 TN$ = "PLOAD Red": EX = 100: AC = LR: GOSUB 9500
-1450 TN$ = "PLOAD Green": EX = 150: AC = LG: GOSUB 9500
-1460 TN$ = "PLOAD Blue": EX = 200: AC = LB: GOSUB 9500
-1470 REM Cleanup
-1480 SCRATCH "test_palette.json"
-1490 PRINT
-
-1600 REM =============================================
-1610 REM  TEST 6: Color Cycling Demo
-1620 REM =============================================
-1630 PRINT "TEST 6: Color Cycling Demo"
-1640 PRINT "------------------------------"
-1650 PRINT "Press any key to see color cycling..."
-1660 GETKEY K$
-1670 REM Draw some colored boxes
-1680 FOR C = 1 TO 15
-1690   COLOR 1, C
-1700   BOX 1, C*15, 150, C*15+10, 180, 0, 1
-1710 NEXT C
-1720 REM Cycle border color
-1730 FOR I = 1 TO 30
-1740   COLOR 4, I MOD 16
-1750   SLEEP 0.1
-1760 NEXT I
-1770 TP% = TP% + 1
-1780 PRINT "  Color cycling complete!"
-1790 PRINT
-
-2000 REM =============================================
-2010 REM  TEST 7: Visual Color Test
-2020 REM =============================================
-2030 PRINT "TEST 7: Visual Color Palette"
-2040 PRINT "------------------------------"
-2050 PRINT "Drawing 16-color palette grid..."
-2060 REM Draw color boxes
-2070 FOR C = 0 TO 15
-2080   X = (C MOD 4) * 60 + 40
-2090   Y = INT(C / 4) * 30 + 50
-2100   COLOR 1, C
-2110   BOX 1, X, Y, X+50, Y+20, 0, 1
-2120 NEXT C
-2130 TP% = TP% + 1
-2140 SLEEP 2
-2150 PRINT
-
-3000 REM =============================================
-3010 REM  FINAL RESULTS
-3020 REM =============================================
-3030 SCNCLR
-3040 PRINT "========================================="
-3050 PRINT "         TEST RESULTS SUMMARY"
-3060 PRINT "========================================="
-3070 PRINT
-3080 PRINT "Tests passed: "; TP%
-3090 PRINT "Tests failed: "; TF%
-3100 PRINT
-3110 IF TF% = 0 THEN PRINT "ALL TESTS PASSED!"
-3120 IF TF% > 0 THEN PRINT "SOME TESTS FAILED"
-3130 PRINT
-3140 PRINT "Press any key to exit..."
-3150 GETKEY K$
-3160 GRAPHIC 0
-3170 END
-
-9500 REM *** Assert numeric equality ***
-9510 IF EX = AC THEN GOTO 9560
-9520 PRINT "  [FAIL] "; TN$; " expected "; EX; " got "; AC
-9530 TF% = TF% + 1
-9540 RETURN
-9560 PRINT "  [PASS] "; TN$
-9570 TP% = TP% + 1
-9580 RETURN
+10 REM === SedaiBasic Color & Palette Demo ===
+20 REM Demonstrates palette capabilities
+100 REM ======== Page 1: Introduction ========
+110 SCNCLR
+120 PRINT "============================================"
+130 PRINT "     SedaiBasic Color & Palette Demo"
+140 PRINT "============================================"
+150 PRINT
+160 PRINT "This program demonstrates the color palette"
+170 PRINT "capabilities of SedaiBasic."
+180 PRINT
+190 PRINT "Demo pages:"
+200 PRINT "  1. The 16 standard C64 colors"
+210 PRINT "  2. Full 256-color default palette"
+220 PRINT "  3. Color wheel: 16 hues x 16 brightness"
+230 PRINT "  4. Standard VGA 256-color palette"
+240 PRINT "  5. Smooth rainbow gradient (256 colors)"
+250 PRINT
+260 PRINT "Press any key to begin..."
+270 GETKEY K$
+300 REM ======== Page 2: 16 C64 Colors ========
+310 SCNCLR
+320 PRINT "Page 1: The 16 Standard C64 Colors"
+330 PRINT "-----------------------------------"
+340 PRINT "The classic Commodore 64/128 palette"
+350 PRINT "displayed as a 4x4 grid of filled boxes."
+360 PRINT
+370 PRINT "Press any key to view..."
+380 GETKEY K$
+390 GRAPHIC 1
+395 FAST
+400 COLOR 0, 12 : SCNCLR : REM dark grey background
+405 REM Map sources 0-3 to palette 0-3 for correct BOX colors
+406 COLOR 0, 1 : COLOR 1, 2 : COLOR 2, 3 : COLOR 3, 4
+410 FOR I = 0 TO 15
+420 RW = INT(I / 4) : CL = I - RW * 4
+430 X1 = 10 + CL * 75 : Y1 = 10 + RW * 45
+440 X2 = X1 + 68 : Y2 = Y1 + 38
+450 BOX I, X1, Y1, X2, Y2, 0, 1
+460 NEXT I
+465 SLOW
+470 GETKEY K$
+480 GRAPHIC 0
+485 GOSUB 8500 : REM restore text colors
+500 REM ======== Page 3: 256 Default Palette ========
+510 SCNCLR
+520 PRINT "Page 2: Full 256-Color Palette (Default)"
+530 PRINT "----------------------------------------"
+540 PRINT "The default palette has 256 entries:"
+550 PRINT "  Entries 0-15:   standard C64 colors"
+560 PRINT "  Entries 16-255: repeat modulo 16"
+570 PRINT
+580 PRINT "16x16 grid: each row repeats the same"
+590 PRINT "16 base colors (modulo pattern)."
+600 PRINT
+610 PRINT "Press any key to view..."
+620 GETKEY K$
+630 GRAPHIC 9
+635 FAST
+640 COLOR 0, 12 : SCNCLR : REM dark grey background
+645 COLOR 0, 1 : COLOR 1, 2 : COLOR 2, 3 : COLOR 3, 4
+650 GOSUB 9000
+655 SLOW
+660 GETKEY K$
+670 GRAPHIC 0
+675 GOSUB 8500 : REM restore text colors
+700 REM ======== Page 4: Color Wheel ========
+710 SCNCLR
+720 PRINT "Page 3: Color Wheel"
+730 PRINT "-------------------"
+740 PRINT "256 entries = 16 hues x 16 brightness:"
+750 PRINT "  Columns = hues around the color wheel"
+760 PRINT "  Rows    = dark (top) to bright (bottom)"
+770 PRINT
+780 PRINT "Full spectrum from red through yellow,"
+790 PRINT "green, cyan, blue, magenta and back."
+800 PRINT
+810 PRINT "Press any key to view..."
+820 GETKEY K$
+830 GRAPHIC 9
+835 FAST
+840 REM Build color wheel: 16 hues x 16 brightness
+850 FOR C = 0 TO 15
+860 HH = C * 22.5 : VL = 255
+870 GOSUB 9200 : REM get HR, HG, HB
+880 FOR L = 0 TO 15
+890 E = C * 16 + L
+900 BF = L + 1
+910 R = INT(HR * BF / 16)
+920 G = INT(HG * BF / 16)
+930 B = INT(HB * BF / 16)
+940 SETCOLOR E, R, G, B
+950 NEXT L
+960 NEXT C
+970 COLOR 0, 1 : SCNCLR : REM black background
+975 COLOR 1, 2 : COLOR 2, 3 : COLOR 3, 4
+980 BW = 36 : BH = 22 : GP = 2
+985 SX = INT((640 - 16 * BW - 15 * GP) / 2)
+990 SY = INT((400 - 16 * BH - 15 * GP) / 2)
+1000 FOR C = 0 TO 15
+1010 FOR L = 0 TO 15
+1020 E = C * 16 + L
+1030 X1 = SX + C * (BW + GP) : Y1 = SY + L * (BH + GP)
+1040 X2 = X1 + BW - 1 : Y2 = Y1 + BH - 1
+1050 BOX E, X1, Y1, X2, Y2, 0, 1
+1060 NEXT L
+1070 NEXT C
+1075 SLOW
+1080 GETKEY K$
+1090 GRAPHIC 0
+1095 PRST : REM reset palette to C64 default
+1098 GOSUB 8500 : REM restore text colors
+1100 REM ======== Page 5: VGA 256-Color Palette ========
+1110 SCNCLR
+1120 PRINT "Page 4: Standard VGA 256-Color Palette"
+1130 PRINT "--------------------------------------"
+1140 PRINT "The classic VGA Mode 13h palette:"
+1150 PRINT "  Entries 0-15:   16 EGA base colors"
+1160 PRINT "  Entries 16-31:  16-step greyscale ramp"
+1170 PRINT "  Entries 32-247: 3 rings x 12 hues x 6 sat"
+1180 PRINT "  Entries 248-255: black"
+1190 PRINT
+1200 PRINT "Press any key to view..."
+1210 GETKEY K$
+1220 GRAPHIC 9
+1225 FAST
+1230 REM Build VGA palette: 16 EGA colors
+1235 RESTORE 9700
+1240 FOR I = 0 TO 15
+1245 READ R, G, B
+1250 SETCOLOR I, R, G, B
+1255 NEXT I
+1260 REM Greyscale ramp 16-31
+1270 FOR I = 16 TO 31
+1280 GV = INT((I - 16) * 255 / 15)
+1290 SETCOLOR I, GV, GV, GV
+1295 NEXT I
+1300 REM 3 rings x 12 hues x 6 saturations (32-247)
+1310 FOR I = 32 TO 247
+1315 J = I - 32
+1320 RG = INT(J / 72)
+1325 PS = J - RG * 72
+1330 HU = INT(PS / 6)
+1335 ST = PS - HU * 6
+1340 IF RG = 0 THEN MX = 255
+1345 IF RG = 1 THEN MX = 180
+1350 IF RG = 2 THEN MX = 126
+1355 HH = HU * 30 : VL = MX
+1360 GOSUB 9200 : REM get HR, HG, HB at full saturation
+1365 REM Desaturate: interpolate toward grey (MX,MX,MX)
+1370 R = INT(HR + (MX - HR) * ST / 5)
+1375 G = INT(HG + (MX - HG) * ST / 5)
+1380 B = INT(HB + (MX - HB) * ST / 5)
+1385 SETCOLOR I, R, G, B
+1390 NEXT I
+1392 REM Entries 248-255: black
+1394 FOR I = 248 TO 255
+1396 SETCOLOR I, 0, 0, 0
+1398 NEXT I
+1400 COLOR 0, 1 : SCNCLR : REM black background
+1405 COLOR 1, 2 : COLOR 2, 3 : COLOR 3, 4
+1410 GOSUB 9000
+1415 SLOW
+1420 GETKEY K$
+1430 GRAPHIC 0
+1435 PRST : REM reset palette to C64 default
+1440 GOSUB 8500 : REM restore text colors
+1500 REM ======== Page 6: Rainbow Gradient ========
+1510 SCNCLR
+1520 PRINT "Page 5: Smooth Rainbow Gradient"
+1530 PRINT "-------------------------------"
+1540 PRINT "All 256 palette entries create a smooth"
+1550 PRINT "rainbow spectrum across the full screen."
+1560 PRINT
+1570 PRINT "Each of the 256 vertical bars uses a"
+1580 PRINT "unique color from red through violet."
+1590 PRINT
+1600 PRINT "Press any key to view..."
+1610 GETKEY K$
+1620 GRAPHIC 9
+1625 FAST
+1630 REM Build full rainbow palette (entries 0-255)
+1640 FOR I = 0 TO 255
+1650 HH = I * 360 / 256
+1660 VL = 255
+1670 GOSUB 9200 : REM get HR, HG, HB
+1680 SETCOLOR I, HR, HG, HB
+1690 NEXT I
+1700 COLOR 0, 1 : SCNCLR : REM black background
+1705 COLOR 1, 2 : COLOR 2, 3 : COLOR 3, 4
+1710 REM Draw 256 vertical bars across 640 pixels
+1720 BW = 2
+1730 SX = INT((640 - 256 * BW) / 2)
+1740 FOR I = 0 TO 255
+1750 X1 = SX + I * BW : X2 = X1 + BW - 1
+1760 BOX I, X1, 20, X2, 380, 0, 1
+1770 NEXT I
+1780 SLOW
+1790 GETKEY K$
+1800 GRAPHIC 0
+1805 PRST : REM reset palette to C64 default
+1810 GOSUB 8500 : REM restore text colors
+1900 REM ======== Exit ========
+1910 SCNCLR
+1920 PRINT "============================================"
+1930 PRINT "     Color & Palette Demo Complete!"
+1940 PRINT "============================================"
+1950 PRINT
+1960 PRINT "The palette has been restored to defaults."
+1970 PRINT
+1980 PRINT "Thank you for watching!"
+1990 END
+8500 REM --- Restore text-mode color sources ---
+8510 COLOR 0, 12 : COLOR 1, 14 : COLOR 4, 14
+8520 RETURN
+9000 REM --- Draw 16x16 color grid (640x400) ---
+9010 BW = 36 : BH = 22 : GP = 2
+9020 SX = INT((640 - 16 * BW - 15 * GP) / 2)
+9030 SY = INT((400 - 16 * BH - 15 * GP) / 2)
+9040 FOR I = 0 TO 255
+9050 RW = INT(I / 16) : CL = I - RW * 16
+9060 X1 = SX + CL * (BW + GP) : Y1 = SY + RW * (BH + GP)
+9070 X2 = X1 + BW - 1 : Y2 = Y1 + BH - 1
+9080 BOX I, X1, Y1, X2, Y2, 0, 1
+9090 NEXT I
+9100 RETURN
+9200 REM --- HSV to RGB (S=1) subroutine ---
+9210 REM Input: HH (hue 0-360), VL (max value)
+9220 REM Output: HR, HG, HB
+9230 SC = INT(HH / 60)
+9240 FF = HH / 60 - SC
+9250 IF SC = 0 THEN HR = VL : HG = INT(FF * VL) : HB = 0
+9260 IF SC = 1 THEN HR = INT((1 - FF) * VL) : HG = VL : HB = 0
+9270 IF SC = 2 THEN HR = 0 : HG = VL : HB = INT(FF * VL)
+9280 IF SC = 3 THEN HR = 0 : HG = INT((1 - FF) * VL) : HB = VL
+9290 IF SC = 4 THEN HR = INT(FF * VL) : HG = 0 : HB = VL
+9300 IF SC = 5 THEN HR = VL : HG = 0 : HB = INT((1 - FF) * VL)
+9310 IF SC >= 6 THEN HR = VL : HG = 0 : HB = 0
+9320 RETURN
+9700 REM === VGA/EGA 16 Standard Colors ===
+9710 DATA 0, 0, 0
+9720 DATA 0, 0, 170
+9730 DATA 0, 170, 0
+9740 DATA 0, 170, 170
+9750 DATA 170, 0, 0
+9760 DATA 170, 0, 170
+9770 DATA 170, 85, 0
+9780 DATA 170, 170, 170
+9790 DATA 85, 85, 85
+9800 DATA 85, 85, 255
+9810 DATA 85, 255, 85
+9820 DATA 85, 255, 255
+9830 DATA 255, 85, 85
+9840 DATA 255, 85, 255
+9850 DATA 255, 255, 85
+9860 DATA 255, 255, 255

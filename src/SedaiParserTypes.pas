@@ -170,6 +170,7 @@ type
     antGList,             // GLIST command (list SDL2 video modes)
     antPLoad,             // PLOAD command (load palette from JSON file)
     antPSave,             // PSAVE command (save palette to JSON file)
+    antPRst,              // PRST command (reset palette to default)
 
     // === SOUND ===
     antVol,               // VOL command (set volume)

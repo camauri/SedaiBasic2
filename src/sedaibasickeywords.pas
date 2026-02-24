@@ -211,6 +211,7 @@ const
   kGETCOLOR = 'GETCOLOR';  // GETCOLOR(source) - return color index (0-255)
   kPLOAD   = 'PLOAD';    // PLOAD "filename" - Load palette from JSON file
   kPSAVE   = 'PSAVE';    // PSAVE "filename" - Save palette to JSON file
+  kPRST    = 'PRST';     // PRST - Reset palette to C64 default
   kGLIST   = 'GLIST';    // List available SDL2 video modes
   kMORE    = 'MORE';     // Paginate output (pipe modifier)
   kGRAPHIC = 'GRAPHIC';

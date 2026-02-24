@@ -1725,6 +1725,7 @@ begin
  RegisterKeyword(kSCNCLR,  ttGraphicsCommand,  'Clear screen',                                     kcGraphicsHandling);
  RegisterKeyword(kPLOAD,   ttGraphicsCommand,  'Load palette from JSON file',                      kcGraphicsHandling);
  RegisterKeyword(kPSAVE,   ttGraphicsCommand,  'Save palette to JSON file',                        kcGraphicsHandling);
+ RegisterKeyword(kPRST,    ttGraphicsCommand,  'Reset palette to C64 default',                     kcGraphicsHandling);
  RegisterKeyword(kSSHAPE,  ttGraphicsCommand,  'Save shapes to string variable',                   kcGraphicsHandling);
  RegisterKeyword(kWIDTH,   ttGraphicsCommand,  'Set the width of drawn lines',                     kcGraphicsHandling);
  RegisterKeyword(kWINDOW,  ttOutputCommand,    'Defines a text screen window',                     kcStdIO);

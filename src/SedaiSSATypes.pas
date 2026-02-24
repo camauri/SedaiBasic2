@@ -107,6 +107,7 @@ type
     ssaGraphicGList,   // GLIST: List SDL2 video modes
     ssaPLoad,          // PLOAD "filename": Load palette from JSON file
     ssaPSave,          // PSAVE "filename": Save palette to JSON file
+    ssaPRst,           // PRST: Reset palette to default
     ssaScnClr,         // SCNCLR [mode]: Clear screen (text or graphics)
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n

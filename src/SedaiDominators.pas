@@ -963,6 +963,17 @@ begin
         Continue;
       end;
 
+      // Allow empty blocks (e.g. DATA-only or REM-only lines after RETURN/END)
+      // These are dead code that contains no instructions and can be safely ignored
+      if Block.Instructions.Count = 0 then
+      begin
+        {$IFDEF DEBUG_DOMTREE}
+        if DebugDomTree then
+          WriteLn('[ValidateCFG] Allowing empty block without predecessors (DATA/REM): ', Block.LabelName);
+        {$ENDIF}
+        Continue;
+      end;
+
       SetError(cfgErrMultipleEntries, Block,
         Format('Multiple entry points: Block "%s" has no predecessors (only entry should have none)',
           [Block.LabelName]));
@@ -1144,6 +1155,12 @@ begin
 
     if Block.Instructions.Count = 0 then
     begin
+      { Empty block with no predecessors (not entry) is dead code - e.g. DATA/REM after RETURN/END }
+      if (Block <> Entry) and (Block.Predecessors.Count = 0) then
+        Continue;
+      { Empty block at end of dead chain (no successors) is also dead code }
+      if Block.Successors.Count = 0 then
+        Continue;
       { Empty block - only valid if it has exactly one successor (fallthrough) }
       if Block.Successors.Count <> 1 then
       begin

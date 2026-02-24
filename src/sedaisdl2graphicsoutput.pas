@@ -559,12 +559,12 @@ end;
 
 procedure TSDL2GraphicsOutputDevice.SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
 var
-  RGB: UInt32;
+  ABGR: UInt32;
 begin
-  // Store as RGBA format (R in high byte)
-  RGB := (R shl 24) or (G shl 16) or (B shl 8) or A;
-  FPaletteManager.SetColor(Index, RGB);
-  FGraphicsMemory.SetPaletteColor(Index, RGB);
+  // Store as ABGR ($AABBGGRR) to match SDL_PIXELFORMAT_ABGR8888 and C64 palette format
+  ABGR := (A shl 24) or (B shl 16) or (G shl 8) or R;
+  FPaletteManager.SetColor(Index, ABGR);
+  FGraphicsMemory.SetPaletteColor(Index, ABGR);
 end;
 
 function TSDL2GraphicsOutputDevice.GetPaletteColor(Index: TPaletteIndex): UInt32;

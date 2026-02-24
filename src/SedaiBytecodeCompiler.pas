@@ -246,6 +246,7 @@ begin
     ssaGraphicGList: Result := bcGraphicGList;
     ssaPLoad: Result := bcPLoad;
     ssaPSave: Result := bcPSave;
+    ssaPRst: Result := bcPRst;
     ssaScnClr: Result := bcScnClr;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;

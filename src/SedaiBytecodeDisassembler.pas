@@ -280,6 +280,26 @@ begin
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'GraphicSetMode', Instr.Src1, Instr.Src2]);
     bcGraphicBox:
       Line := Format('%4d: %-20s R%d, R%d, R%d, R%d', [Index, 'GraphicBox', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcGraphicCircle:
+      Line := Format('%4d: %-20s R%d, R%d, R%d, R%d', [Index, 'GraphicCircle', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcGraphicDraw:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'GraphicDraw', Instr.Src1, Instr.Src2]);
+    bcGraphicLocate:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'GraphicLocate', Instr.Src1, Instr.Src2]);
+    bcGraphicColor:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'GraphicColor', Instr.Src1, Instr.Src2]);
+    bcSetColor:
+      Line := Format('%4d: %-20s Dest=%d Src1=R%d Src2=R%d Imm=%d', [Index, 'SetColor', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcGetColor:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'GetColor', Instr.Dest, Instr.Src1]);
+    bcScnClr:
+      Line := Format('%4d: %-20s R%d', [Index, 'ScnClr', Instr.Src1]);
+    bcPLoad:
+      Line := Format('%4d: %-20s R%d', [Index, 'PLoad', Instr.Src1]);
+    bcPSave:
+      Line := Format('%4d: %-20s R%d', [Index, 'PSave', Instr.Src1]);
+    bcPRst:
+      Line := Format('%4d: %-20s', [Index, 'PRst']);
 
     // === GROUP 11: SOUND (0x0Bxx) ===
     bcSoundVol:
@@ -341,6 +361,12 @@ begin
     bcArrayLoadAddFloat: Line := Format('%4d: %-20s R%d = R%d + ARR[%d][R%d]', [Index, 'ArrLoadAddFlt', Instr.Dest, Instr.Immediate, Instr.Src1, Instr.Src2]);
     bcArrayLoadSubFloat: Line := Format('%4d: %-20s R%d = R%d - ARR[%d][R%d]', [Index, 'ArrLoadSubFlt', Instr.Dest, Instr.Immediate, Instr.Src1, Instr.Src2]);
 
+    // FMA superinstructions
+    bcMulAddFloat: Line := Format('%4d: %-20s R%d = R%d * R%d + R%d', [Index, 'MulAddFloat', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcMulSubFloat: Line := Format('%4d: %-20s R%d = R%d * R%d - R%d', [Index, 'MulSubFloat', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcMulAddToFloat: Line := Format('%4d: %-20s R%d += R%d * R%d', [Index, 'MulAddToFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcMulSubToFloat: Line := Format('%4d: %-20s R%d -= R%d * R%d', [Index, 'MulSubToFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
+
   // === GROUP 1: STRING OPERATIONS (0x01xx) - additional ===
     bcStrAsc:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'StrAsc', Instr.Dest, Instr.Src1]);
@@ -381,6 +407,8 @@ begin
       Line := Format('%4d: %-20s', [Index, 'Resume']);
     bcResumeNext:
       Line := Format('%4d: %-20s', [Index, 'ResumeNext']);
+    bcDataAdd:
+      Line := Format('%4d: %-20s type=%d, Imm=%d', [Index, 'DataAdd', Instr.Src1, Instr.Immediate]);
     bcDataReadInt:
       Line := Format('%4d: %-20s R%d', [Index, 'DataReadInt', Instr.Dest]);
     bcDataReadFloat:
@@ -390,8 +418,9 @@ begin
     bcDataRestore:
       Line := Format('%4d: %-20s %d', [Index, 'DataRestore', Instr.Immediate]);
   else
-    Line := Format('%4d: (unknown opcode $%04X, group=%d, sub=%d) Dest=%d Src1=%d Src2=%d Imm=%d',
-      [Index, Instr.OpCode, Group, SubOp, Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    // Use BytecodeOpToString for any unhandled opcode instead of "unknown"
+    Line := Format('%4d: %-20s Dest=%d Src1=%d Src2=%d Imm=%d',
+      [Index, BytecodeOpToString(Instr.OpCode), Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
   end;
 
   // Append source line number if available (debug mode / TRON)

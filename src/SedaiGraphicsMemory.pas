@@ -533,8 +533,8 @@ end;
 
 procedure TGraphicsMemory.SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
 begin
-  // Store as RGBA (R in high byte for SDL2 compatibility)
-  FPalette[Index] := (R shl 24) or (G shl 16) or (B shl 8) or A;
+  // Store as ABGR ($AABBGGRR) to match C64 default palette and SDL_PIXELFORMAT_ABGR8888
+  FPalette[Index] := (A shl 24) or (B shl 16) or (G shl 8) or R;
 end;
 
 function TGraphicsMemory.GetPaletteColor(Index: TPaletteIndex): UInt32;
@@ -647,8 +647,8 @@ begin
           Exit;
         end;
 
-        // Store color (RGBA format)
-        FPalette[Index] := (Byte(R) shl 24) or (Byte(G) shl 16) or (Byte(B) shl 8) or Byte(A);
+        // Store color as ABGR ($AABBGGRR)
+        FPalette[Index] := (Byte(A) shl 24) or (Byte(B) shl 16) or (Byte(G) shl 8) or Byte(R);
       end;
 
       Result := True;
@@ -686,11 +686,11 @@ begin
 
     for i := 0 to 255 do
     begin
-      // Extract RGBA components
-      R := (FPalette[i] shr 24) and $FF;
-      G := (FPalette[i] shr 16) and $FF;
-      B := (FPalette[i] shr 8) and $FF;
-      A := FPalette[i] and $FF;
+      // Extract ABGR components ($AABBGGRR)
+      R := FPalette[i] and $FF;
+      G := (FPalette[i] shr 8) and $FF;
+      B := (FPalette[i] shr 16) and $FF;
+      A := (FPalette[i] shr 24) and $FF;
 
       ColorObj := TJSONObject.Create;
       ColorObj.Add('index', i);

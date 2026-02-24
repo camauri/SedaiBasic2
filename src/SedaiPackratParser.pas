@@ -1738,6 +1738,8 @@ begin
     Result := TASTNode.Create(antPLoad, Token)
   else if CmdName = 'PSAVE' then
     Result := TASTNode.Create(antPSave, Token)
+  else if CmdName = 'PRST' then
+    Result := TASTNode.Create(antPRst, Token)
   else
     Result := TASTNode.Create(antStatement, Token);
 
@@ -1758,7 +1760,7 @@ begin
   else if CmdName = 'COLOR' then
     MaxParams := 2  // COLOR source, color
   else if CmdName = 'SETCOLOR' then
-    MaxParams := 2  // SETCOLOR source, color (0-based)
+    MaxParams := 5  // SETCOLOR index, R, G, B [, A]
   else if CmdName = 'WIDTH' then
     MaxParams := 1  // WIDTH n
   else if CmdName = 'SCALE' then
@@ -1777,6 +1779,8 @@ begin
     MaxParams := 1  // PLOAD "filename"
   else if CmdName = 'PSAVE' then
     MaxParams := 1  // PSAVE "filename"
+  else if CmdName = 'PRST' then
+    MaxParams := 0  // PRST (no parameters)
   else
     MaxParams := 5;
 
@@ -1834,36 +1838,7 @@ begin
         Context.Advance;
     end;
   end
-  else if CmdName = 'SETCOLOR' then
-  begin
-    // SETCOLOR(source, color) - requires parentheses like a function call
-    if not Context.Match(ttDelimParOpen) then
-    begin
-      HandleError('Expected ( after SETCOLOR', Context.CurrentToken);
-      Result.Free;
-      Result := nil;
-      Exit;
-    end;
-    // Parse source parameter
-    Param := ParseExpression;
-    if Assigned(Param) then
-      Result.AddChild(Param);
-    // Expect comma
-    if Context.Check(ttSeparParam) then
-      Context.Advance;
-    // Parse color parameter
-    Param := ParseExpression;
-    if Assigned(Param) then
-      Result.AddChild(Param);
-    // Expect closing parenthesis
-    if not Context.Match(ttDelimParClose) then
-    begin
-      HandleError('Expected ) after SETCOLOR parameters', Context.CurrentToken);
-      Result.Free;
-      Result := nil;
-      Exit;
-    end;
-  end
+  // SETCOLOR uses standard parameter parsing (index, R, G, B [, A])
   else
   begin
     // Standard parsing for other graphics commands

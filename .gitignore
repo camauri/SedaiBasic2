@@ -42,6 +42,7 @@ deps/
 fpmake.pp
 presentation.zip
 README_AI.md
+CLAUDE.md
 ChangeLog.md
 SedaiBasic2Tester.*
 /bas/test*.bas

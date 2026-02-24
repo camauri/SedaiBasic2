@@ -356,6 +356,7 @@ const
   bcGraphicRwindow  = bcGroupGraphics + 18;  // RWINDOW(n)
   bcPLoad           = bcGroupGraphics + 22;  // PLOAD "filename" - Load palette from JSON
   bcPSave           = bcGroupGraphics + 23;  // PSAVE "filename" - Save palette to JSON
+  bcPRst            = bcGroupGraphics + 24;  // PRST - Reset palette to C64 default
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1066,7 +1067,43 @@ begin
         53: Result := 'Fast';
         54: Result := 'Slow';
         55: Result := 'Sleep';
-        56: Result := 'Nop';
+        56: Result := 'Key';
+        57: Result := 'Nop';
+        58: Result := 'Clear';
+        59: Result := 'Tron';
+        60: Result := 'Troff';
+        61: Result := 'DataAdd';
+        62: Result := 'DataReadInt';
+        63: Result := 'DataReadFloat';
+        64: Result := 'DataReadString';
+        65: Result := 'DataRestore';
+        66: Result := 'Get';
+        67: Result := 'Getkey';
+        68: Result := 'PrintUsing';
+        69: Result := 'Pudef';
+        70: Result := 'Char';
+        71: Result := 'Load';
+        72: Result := 'Save';
+        73: Result := 'Verify';
+        74: Result := 'Bload';
+        75: Result := 'Bsave';
+        76: Result := 'Boot';
+        77: Result := 'Run';
+        78: Result := 'List';
+        79: Result := 'New';
+        80: Result := 'Delete';
+        81: Result := 'Renumber';
+        82: Result := 'Catalog';
+        83: Result := 'CopyFile';
+        84: Result := 'Scratch';
+        85: Result := 'RenameFile';
+        86: Result := 'Concat';
+        87: Result := 'Mkdir';
+        88: Result := 'Chdir';
+        89: Result := 'MoveFile';
+        90: Result := 'Trap';
+        91: Result := 'Resume';
+        92: Result := 'ResumeNext';
       else
         Result := Format('Core_%d', [SubOp]);
       end;
@@ -1129,10 +1166,11 @@ begin
         8: Result := 'PrintTab';
         9: Result := 'PrintSpc';
         10: Result := 'PrintNewLine';
-        11: Result := 'Input';
-        12: Result := 'InputInt';
-        13: Result := 'InputFloat';
-        14: Result := 'InputString';
+        11: Result := 'PrintEnd';
+        12: Result := 'Input';
+        13: Result := 'InputInt';
+        14: Result := 'InputFloat';
+        15: Result := 'InputString';
       else
         Result := Format('IO_%d', [SubOp]);
       end;
@@ -1192,21 +1230,22 @@ begin
         6: Result := 'GraphicRdot';
         7: Result := 'GraphicGetMode';
         8: Result := 'GraphicColor';
-        9: Result := 'SetColor';
-        10: Result := 'GetColor';
-        11: Result := 'GraphicWidth';
-        12: Result := 'GraphicScale';
-        13: Result := 'GraphicPaint';
-        14: Result := 'GraphicWindow';
-        15: Result := 'GraphicSShape';
-        16: Result := 'GraphicGShape';
-        17: Result := 'GraphicGList';
-        18: Result := 'GraphicPos';
-        19: Result := 'GraphicRclr';
-        20: Result := 'GraphicRwindow';
+        9: Result := 'GraphicWidth';
+        10: Result := 'GraphicScale';
+        11: Result := 'GraphicPaint';
+        12: Result := 'GraphicWindow';
+        13: Result := 'GraphicSShape';
+        14: Result := 'GraphicGShape';
+        15: Result := 'GraphicGList';
+        16: Result := 'GraphicPos';
+        17: Result := 'GraphicRclr';
+        18: Result := 'GraphicRwindow';
+        19: Result := 'SetColor';
+        20: Result := 'GetColor';
         21: Result := 'ScnClr';
         22: Result := 'PLoad';
         23: Result := 'PSave';
+        24: Result := 'PRst';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;
@@ -1256,6 +1295,31 @@ begin
         80: Result := 'ArrayStoreIntConst';
         81: Result := 'ArrayStoreFloatConst';
         82: Result := 'ArrayStoreStringConst';
+        90: Result := 'AddIntToBranchLe';
+        91: Result := 'AddIntToBranchLt';
+        92: Result := 'SubIntToBranchGe';
+        93: Result := 'SubIntToBranchGt';
+        100: Result := 'MulAddFloat';
+        101: Result := 'MulSubFloat';
+        102: Result := 'MulAddToFloat';
+        103: Result := 'MulSubToFloat';
+        110: Result := 'ArrayLoadAddFloat';
+        111: Result := 'ArrayLoadSubFloat';
+        112: Result := 'ArrayLoadDivAddFloat';
+        120: Result := 'SquareSumFloat';
+        121: Result := 'AddSquareFloat';
+        130: Result := 'MulMulFloat';
+        131: Result := 'AddSqrtFloat';
+        140: Result := 'ArrayLoadIntBranchNZ';
+        141: Result := 'ArrayLoadIntBranchZ';
+        156: Result := 'ArrayReverseRange';
+        157: Result := 'ArrayShiftLeft';
+        250: Result := 'ArraySwapInt';
+        251: Result := 'AddIntSelf';
+        252: Result := 'SubIntSelf';
+        253: Result := 'ArrayLoadIntTo';
+        254: Result := 'ArrayCopyElement';
+        255: Result := 'ArrayMoveElement';
       else
         Result := Format('Super_%d', [SubOp]);
       end;

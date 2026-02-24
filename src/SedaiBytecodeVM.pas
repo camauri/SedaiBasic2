@@ -3579,6 +3579,9 @@ begin
           FLastErrorLine := FProgram.GetSourceLine(FPC);
         end;
       end;
+    24: // bcPRst - PRST (reset palette to C64 default)
+      if Assigned(FOutputDevice) then
+        FOutputDevice.ResetPalette;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, FPC]);
   end;

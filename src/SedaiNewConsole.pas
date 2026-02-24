@@ -59,6 +59,9 @@ const
   DEFAULT_BG_INDEX = 11;  // Dark Grey (#818181)
   DEFAULT_FG_INDEX = 13;  // Light Green (#DBFF9E)
 
+  // Sentinel: cell uses the global background color (no per-cell override)
+  BG_USE_DEFAULT = 255;
+
   DEFAULT_FONT_PATHS: array[0..0] of string = (
     'font\PixelOperatorMono8-Bold.ttf'
   );
@@ -485,6 +488,10 @@ type
     procedure ClearWindow;  // Clear only within current window
     function GetWindowLines: Integer;  // RWINDOW(0)
     function GetWindowCols: Integer;   // RWINDOW(1)
+
+    // Color management
+    procedure ReplaceBGIndex(OldIndex, NewIndex: Byte);  // Replace background in all cells
+    procedure ReplaceFGIndex(OldIndex, NewIndex: Byte);  // Replace foreground in all cells
 
     // Dirty tracking methods for efficient rendering
     procedure MarkRowDirty(Row: Integer);       // Mark single row for redraw
@@ -948,14 +955,14 @@ begin
   FFastMode := False;
   FFastModeAlpha := 255;
 
-  // COLOR command - initialize color sources to default palette colors
-  FColorSources[0] := 12;  // Background (dark grey)
-  FColorSources[1] := 13;  // Foreground (light green)
-  FColorSources[2] := 1;   // Multicolor 1 (white)
-  FColorSources[3] := 2;   // Multicolor 2 (red)
-  FColorSources[4] := 13;  // Border (light green)
-  FColorSources[5] := 13;  // Character color (light green)
-  FColorSources[6] := 12;  // 80-column background
+  // COLOR command - initialize color sources (must match FxxxIndex values above)
+  FColorSources[0] := FBackgroundIndex;    // Background (11 = Dark Grey)
+  FColorSources[1] := FForegroundIndex;    // Foreground (13 = Light Green)
+  FColorSources[2] := FMulticolorIndex1;   // Multicolor 1 (1 = White)
+  FColorSources[3] := FMulticolorIndex2;   // Multicolor 2 (2 = Red)
+  FColorSources[4] := FBorderColorIndex;   // Border (13 = Light Green)
+  FColorSources[5] := FTextColorIndex;     // Character color (13 = Light Green)
+  FColorSources[6] := FScreenColorIndex;   // 80-column background (11 = Dark Grey)
 
   // WIDTH command - default line width
   FLineWidth := 1;
@@ -1666,21 +1673,25 @@ begin
             // Get effective colors (swap if reverse)
             if Cell.Reverse then
             begin
-              EffectiveFG := Cell.BGIndex;
+              // Reverse: visual FG = cell BG, visual BG = cell FG
+              if Cell.BGIndex = BG_USE_DEFAULT then
+                EffectiveFG := FBackgroundIndex  // Resolve default to actual BG color
+              else
+                EffectiveFG := Cell.BGIndex;
               EffectiveBG := Cell.FGIndex;
             end
             else
             begin
               EffectiveFG := Cell.FGIndex;
-              EffectiveBG := Cell.BGIndex;
+              EffectiveBG := Cell.BGIndex;  // May be BG_USE_DEFAULT
             end;
 
             CellTextColor := PaletteIndexToSDLColor(EffectiveFG);
-            CellBGColor := PaletteIndexToSDLColor(EffectiveBG);
 
-            // Draw cell background if different from screen background
-            if EffectiveBG <> FBackgroundIndex then
+            // Draw cell background only if cell has explicit override (not BG_USE_DEFAULT)
+            if EffectiveBG <> BG_USE_DEFAULT then
             begin
+              CellBGColor := PaletteIndexToSDLColor(EffectiveBG);
               CellBGRect.x := RenderX;
               CellBGRect.y := RenderY;
               CellBGRect.w := FCharWidth;
@@ -1825,7 +1836,10 @@ begin
             begin
               if Cell.Reverse then
               begin
-                EffectiveFG := Cell.BGIndex;
+                if Cell.BGIndex = BG_USE_DEFAULT then
+                  EffectiveFG := FBackgroundIndex
+                else
+                  EffectiveFG := Cell.BGIndex;
                 EffectiveBG := Cell.FGIndex;
               end
               else
@@ -1835,10 +1849,10 @@ begin
               end;
 
               CellTextColor := PaletteIndexToSDLColor(EffectiveFG);
-              CellBGColor := PaletteIndexToSDLColor(EffectiveBG);
 
-              if EffectiveBG <> FBackgroundIndex then
+              if EffectiveBG <> BG_USE_DEFAULT then
               begin
+                CellBGColor := PaletteIndexToSDLColor(EffectiveBG);
                 CellBGRect.x := RenderX;
                 CellBGRect.y := RenderY;
                 CellBGRect.w := FCharWidth;
@@ -2673,6 +2687,9 @@ begin
   FScaleXMax := FModeInfo.NativeWidth;
   FScaleYMax := FModeInfo.NativeHeight;
 
+  // Invalidate palette cache so ClearBorder/ClearViewport use fresh values
+  FPaletteCacheValid := False;
+
   // Clear the border
   ClearBorder;
 
@@ -3496,7 +3513,7 @@ begin
     begin
       FCells[r][c].Ch := ' ';
       FCells[r][c].FGIndex := DEFAULT_FG_INDEX;
-      FCells[r][c].BGIndex := DEFAULT_BG_INDEX;
+      FCells[r][c].BGIndex := BG_USE_DEFAULT;
       FCells[r][c].Reverse := False;
       FCells[r][c].Dirty := False;
     end;
@@ -3514,7 +3531,7 @@ begin
 
   // Default text colors
   FCurrentFGIndex := DEFAULT_FG_INDEX;
-  FCurrentBGIndex := DEFAULT_BG_INDEX;
+  FCurrentBGIndex := BG_USE_DEFAULT;  // Cells use global background by default
   FCurrentReverse := False;
 
   // Initialize window to full screen
@@ -3685,6 +3702,52 @@ begin
     FCells[Row][Col].Dirty := True;
     MarkRowDirty(Row);
   end;
+end;
+
+procedure TTextBuffer.ReplaceBGIndex(OldIndex, NewIndex: Byte);
+var
+  r, c: Integer;
+begin
+  for r := 0 to FRows - 1 do
+    for c := 0 to FCols - 1 do
+      if FCells[r][c].Reverse then
+      begin
+        // Reversed cell: visual background is FGIndex
+        if FCells[r][c].FGIndex = OldIndex then
+          FCells[r][c].FGIndex := NewIndex;
+      end
+      else
+      begin
+        if FCells[r][c].BGIndex = OldIndex then
+          FCells[r][c].BGIndex := NewIndex;
+      end;
+  // Only update current BG if it matched the old background
+  if FCurrentBGIndex = OldIndex then
+    FCurrentBGIndex := NewIndex;
+  MarkAllDirty;
+end;
+
+procedure TTextBuffer.ReplaceFGIndex(OldIndex, NewIndex: Byte);
+var
+  r, c: Integer;
+begin
+  for r := 0 to FRows - 1 do
+    for c := 0 to FCols - 1 do
+      if FCells[r][c].Reverse then
+      begin
+        // Reversed cell: visual foreground is BGIndex
+        if FCells[r][c].BGIndex = OldIndex then
+          FCells[r][c].BGIndex := NewIndex;
+      end
+      else
+      begin
+        if FCells[r][c].FGIndex = OldIndex then
+          FCells[r][c].FGIndex := NewIndex;
+      end;
+  // Only update current FG if it matched the old foreground
+  if FCurrentFGIndex = OldIndex then
+    FCurrentFGIndex := NewIndex;
+  MarkAllDirty;
 end;
 
 function TTextBuffer.GetCharAt(Col, Row: Integer): Byte;
@@ -5087,7 +5150,18 @@ end;
 procedure TConsoleOutputAdapter.SetColorSource(Source, Color: Integer);
 begin
   if Assigned(FVideoController) then
+  begin
     FVideoController.SetColorSource(Source, Color);
+    // Sync TextBuffer current FG so new text uses the updated foreground
+    if Assigned(FTextBuffer) and (Source = 1) then
+      FTextBuffer.CurrentFGIndex := Byte(FVideoController.GetColorSourceDirect(1));
+    // Background: no buffer changes needed - cells use BG_USE_DEFAULT sentinel,
+    // renderer resolves it to FBackgroundIndex at draw time
+    // Force full redraw when background or border changes
+    if Source in [0, 4] then
+      if Assigned(FTextBuffer) then
+        FTextBuffer.MarkAllDirty;
+  end;
 end;
 
 function TConsoleOutputAdapter.GetColorSource(Source: Integer): Integer;
@@ -5101,7 +5175,14 @@ end;
 procedure TConsoleOutputAdapter.SetColorSourceDirect(Source, Color: Integer);
 begin
   if Assigned(FVideoController) then
+  begin
     FVideoController.SetColorSourceDirect(Source, Color);
+    if Assigned(FTextBuffer) and (Source = 1) then
+      FTextBuffer.CurrentFGIndex := Byte(FVideoController.GetColorSourceDirect(1));
+    if Source in [0, 4] then
+      if Assigned(FTextBuffer) then
+        FTextBuffer.MarkAllDirty;
+  end;
 end;
 
 function TConsoleOutputAdapter.GetColorSourceDirect(Source: Integer): Integer;

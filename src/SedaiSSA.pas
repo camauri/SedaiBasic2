@@ -113,6 +113,7 @@ type
     procedure ProcessGList(Node: TASTNode);
     procedure ProcessPLoad(Node: TASTNode);
     procedure ProcessPSave(Node: TASTNode);
+    procedure ProcessPRst(Node: TASTNode);
     // Sound commands
     procedure ProcessVol(Node: TASTNode);
     procedure ProcessSound(Node: TASTNode);
@@ -5154,6 +5155,17 @@ begin
                  FileNameReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
+{ ProcessPRst - Handle PRST command for resetting palette to C64 default
+  Syntax: PRST
+}
+procedure TSSAGenerator.ProcessPRst(Node: TASTNode);
+begin
+  if FCurrentBlock = nil then Exit;
+  // PRST has no parameters - just emit the instruction
+  EmitInstruction(ssaPRst, MakeSSAValue(svkNone),
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
 { ============================================================================
   SOUND COMMANDS
   ============================================================================ }
@@ -7541,6 +7553,7 @@ begin
     antGList: ProcessGList(Node);
     antPLoad: ProcessPLoad(Node);
     antPSave: ProcessPSave(Node);
+    antPRst: ProcessPRst(Node);
     // Sound commands
     antVol: ProcessVol(Node);
     antSound: ProcessSound(Node);
