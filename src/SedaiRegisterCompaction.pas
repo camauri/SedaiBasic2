@@ -122,6 +122,10 @@ type
       stores the 'c' register (accumulator) instead of a constant }
     function ImmediateIsFloatReg(OpCode: TBytecodeOp): Boolean;
 
+    { Check if opcode uses Immediate field as string register index
+      This is needed for DOPEN where Immediate stores the mode string register }
+    function ImmediateIsStringReg(OpCode: TBytecodeOp): Boolean;
+
     { Mark a register as used }
     procedure MarkIntRegUsed(Reg: Integer);
     procedure MarkFloatRegUsed(Reg: Integer);
@@ -197,6 +201,8 @@ begin
     // === GROUP 4: I/O operations ===
     bcInputInt,      // Input int
     bcDataReadInt,   // Read next DATA value into int register
+    // === GROUP 6: File I/O operations ===
+    bcInputFileInt,  // INPUT# file, int var
     // === GROUP 5: Special variables ===
     bcLoadTI,         // TI: jiffies since start (int)
     bcLoadEL,         // EL: last error line number (int)
@@ -258,6 +264,8 @@ begin
     // === GROUP 4: I/O operations ===
     bcInputFloat,
     bcDataReadFloat,   // Read next DATA value into float register
+    // === GROUP 6: File I/O operations ===
+    bcInputFileFloat,  // INPUT# file, float var
     // === GROUP 7: Sprite functions ===
     bcRsppos,          // RSPPOS(sprite, attr): position/speed (float)
     // === SUPERINSTRUCTIONS ===
@@ -298,9 +306,13 @@ begin
     // === GROUP 5: Special variables ===
     bcLoadTIS,         // TI$: current time HHMMSS (string)
     bcLoadDTS,         // DT$: current date YYYYMMDD (string)
+    bcLoadCWDS,        // CWD$: current working directory (string)
     bcLoadERRS,        // ERR$: last error message (string)
     // === GROUP 10: Graphics ===
-    bcGraphicSShape:   // SSHAPE A$, x1, y1: capture screen area to string
+    bcGraphicSShape,   // SSHAPE A$, x1, y1: capture screen area to string
+    // === GROUP 6: File I/O operations ===
+    bcGetFile,         // GET# - Dest = char read (string)
+    bcInputFile:       // INPUT# - Dest = line read (string)
       Result := True;
     // NOTE: bcArrayStoreString uses Dest as SOURCE (read), handled by DestReadIsStringReg
   else
@@ -366,7 +378,13 @@ begin
     // Fused self-increment/decrement (Int): Src1 = step register
     bcAddIntSelf, bcSubIntSelf,
     // Fused array element operations: Src1 = src_idx_reg for MoveElement
-    bcArrayMoveElement:
+    bcArrayMoveElement,
+    // === GROUP 6: File I/O operations ===
+    bcDopen, bcDclose, bcOpen, bcClose,  // Src1 = handle (int)
+    bcGetFile, bcInputFile, bcPrintFile,     // Src1 = handle (int)
+    bcInputFileFloat, bcInputFileInt,        // Src1 = handle (int)
+    bcPrintFileFloat, bcPrintFileInt,        // Src1 = handle (int)
+    bcCmd, bcAppend, bcRecord:               // Src1 = handle (int)
       Result := True;
   else
     Result := False;
@@ -458,7 +476,9 @@ begin
     bcArraySwapInt, bcArrayCopyElement, bcArrayMoveElement, bcArrayLoadIntTo,
     bcArrayShiftLeft, bcArrayReverseRange,
     // === GROUP 11: Sound ===
-    bcSoundFilter:  // Src2 = lowpass (int 0/1)
+    bcSoundFilter,  // Src2 = lowpass (int 0/1)
+    // === GROUP 6: File I/O operations ===
+    bcRecord:       // Src2 = position (int)
       Result := True;
   else
     Result := False;
@@ -533,7 +553,10 @@ begin
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
     // === GROUP 1: String operations ===
     bcStrConcat,  // String concatenation (second operand)
-    bcStrInstr:   // INSTR(haystack, needle) - needle is Src2
+    bcStrInstr,   // INSTR(haystack, needle) - needle is Src2
+    // === GROUP 6: File I/O operations ===
+    bcDopen, bcOpen,  // Src2 = filename (string)
+    bcAppend:         // Src2 = data (string)
       Result := True;
   else
     Result := False;
@@ -561,7 +584,9 @@ begin
     // Array swap: Dest = idx2_reg (int) - READ
     bcArraySwapInt,
     // Array shift/reverse: Dest = end_idx_reg (int) - READ
-    bcArrayShiftLeft, bcArrayReverseRange:
+    bcArrayShiftLeft, bcArrayReverseRange,
+    // === GROUP 6: File I/O operations ===
+    bcPrintFileInt:      // Dest = value register (int) - READ, not written
       Result := True;
   else
     Result := False;
@@ -575,7 +600,9 @@ begin
   // Using case statement instead of set because opcodes are now Word (>255)
   case OpCode of
     // === GROUP 3: Array operations ===
-    bcArrayStoreFloat:  // Dest = value register (float) - READ, not written
+    bcArrayStoreFloat,   // Dest = value register (float) - READ, not written
+    // === GROUP 6: File I/O operations ===
+    bcPrintFileFloat:    // Dest = value register (float) - READ, not written
       Result := True;
   else
     Result := False;
@@ -589,7 +616,9 @@ begin
   // Using case statement instead of set because opcodes are now Word (>255)
   case OpCode of
     // === GROUP 3: Array operations ===
-    bcArrayStoreString:  // Dest = value register (string) - READ, not written
+    bcArrayStoreString,  // Dest = value register (string) - READ, not written
+    // === GROUP 6: File I/O operations ===
+    bcPrintFile:         // Dest = data register (string) - READ, not written
       Result := True;
   else
     Result := False;
@@ -608,6 +637,20 @@ begin
     bcMulAddFloat, bcMulSubFloat,
     // Fused Mul-Mul: Immediate is 'c' in (a*b*c)
     bcMulMulFloat:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+function TRegisterCompactor.ImmediateIsStringReg(OpCode: TBytecodeOp): Boolean;
+begin
+  { These opcodes store a STRING REGISTER INDEX in the Immediate field
+    instead of a constant value. The Immediate field needs to be remapped
+    during register compaction. }
+  case OpCode of
+    // DOPEN: Immediate = mode string register
+    bcDopen, bcOpen:
       Result := True;
   else
     Result := False;
@@ -714,6 +757,11 @@ begin
     // (for FMA and related superinstructions)
     if ImmediateIsFloatReg(OpCode) then
       MarkFloatRegUsed(Instr.Immediate);
+
+    // Check Immediate field when it contains a string register index
+    // (for DOPEN mode parameter)
+    if ImmediateIsStringReg(OpCode) then
+      MarkStringRegUsed(Instr.Immediate);
 
     // bcGraphicBox: Immediate contains 5 packed register indices
     // Layout: x2(bits 0-11) | y2(12-23) | angle(24-35) | filled(36-47) | fill_color(48-59)
@@ -1051,6 +1099,17 @@ begin
       if (Instr.Immediate < Length(FFloatRegMap)) and (FFloatRegMap[Instr.Immediate] >= 0) then
       begin
         Instr.Immediate := FFloatRegMap[Instr.Immediate];
+        Modified := True;
+      end;
+    end;
+
+    // Remap Immediate field when it contains a string register index
+    // (for DOPEN mode parameter)
+    if ImmediateIsStringReg(OpCode) then
+    begin
+      if (Instr.Immediate < Length(FStringRegMap)) and (FStringRegMap[Instr.Immediate] >= 0) then
+      begin
+        Instr.Immediate := FStringRegMap[Instr.Immediate];
         Modified := True;
       end;
     end;

@@ -67,7 +67,10 @@ type
   { TImmediateCompiler - Lightweight compiler for immediate commands }
   TImmediateCompiler = class
   private
-    FLastError: string;
+    FLastError: string;           // Brief error (for ?SYNTAX ERROR IN <line>)
+    FLastErrorLine: Integer;      // BASIC line number where error occurred
+    FLastErrorColumn: Integer;    // Column where error occurred
+    FLastErrorVerbose: string;    // Verbose error details (for OPTION VERBOSE)
     FVerbose: Boolean;
   public
     constructor Create;
@@ -82,6 +85,9 @@ type
     function CompileProgram(const Source: string): TBytecodeProgram;
 
     property LastError: string read FLastError;
+    property LastErrorLine: Integer read FLastErrorLine;
+    property LastErrorColumn: Integer read FLastErrorColumn;
+    property LastErrorVerbose: string read FLastErrorVerbose;
     property Verbose: Boolean read FVerbose write FVerbose;
   end;
 
@@ -92,7 +98,7 @@ implementation
 
 uses
   SedaiLexerFSM, SedaiLexerTypes, SedaiTokenList,
-  SedaiParserTypes, SedaiParserResults, SedaiPackratParser,
+  SedaiParserTypes, SedaiParserResults, SedaiParserErrors, SedaiPackratParser,
   SedaiSSATypes, SedaiSSA,
   SedaiBytecodeCompiler,
   SedaiRegAlloc,
@@ -106,7 +112,18 @@ constructor TImmediateCompiler.Create;
 begin
   inherited Create;
   FLastError := '';
+  FLastErrorLine := 0;
+  FLastErrorColumn := 0;
+  FLastErrorVerbose := '';
   FVerbose := False;
+end;
+
+procedure ClearErrorState(var LastError: string; var LastErrorLine, LastErrorColumn: Integer; var LastErrorVerbose: string);
+begin
+  LastError := '';
+  LastErrorLine := 0;
+  LastErrorColumn := 0;
+  LastErrorVerbose := '';
 end;
 
 function TImmediateCompiler.CompileStatement(const Statement: string): TBytecodeProgram;
@@ -119,9 +136,10 @@ var
   SSAProgram: TSSAProgram;
   Compiler: TBytecodeCompiler;
   RegAlloc: TLinearScanAllocator;
+  ParseError: TParserError;
 begin
   Result := nil;
-  FLastError := '';
+  ClearErrorState(FLastError, FLastErrorLine, FLastErrorColumn, FLastErrorVerbose);
 
   if Trim(Statement) = '' then
   begin
@@ -141,13 +159,14 @@ begin
       TokenList := Lexer.ScanAllTokensFast;
       if not Assigned(TokenList) or (TokenList.Count = 0) then
       begin
-        FLastError := 'No tokens produced';
+        FLastError := 'SYNTAX ERROR';
         Exit;
       end;
     except
       on E: Exception do
       begin
-        FLastError := Format('Lexer error: %s', [E.Message]);
+        FLastError := 'SYNTAX ERROR';
+        FLastErrorVerbose := 'Lexer error: ' + E.Message;
         Exit;
       end;
     end;
@@ -161,16 +180,28 @@ begin
         if not ParserResult.Success then
         begin
           if ParserResult.Errors.Count > 0 then
-            FLastError := Format('Parse error: %s', [ParserResult.Errors[0].ToString])
+          begin
+            ParseError := ParserResult.Errors[0];
+            // Extract line/column for C128-style error format
+            if ParseError.BasicLineNumber > 0 then
+              FLastErrorLine := ParseError.BasicLineNumber
+            else
+              FLastErrorLine := ParseError.Line;
+            FLastErrorColumn := ParseError.Column;
+            FLastError := 'SYNTAX ERROR';
+            // Use ToString for complete error with positions (line:col)
+            FLastErrorVerbose := ParseError.ToString;
+          end
           else
-            FLastError := 'Parse error: unknown';
+            FLastError := 'SYNTAX ERROR';
           ParserResult.Free;
           Exit;
         end;
       except
         on E: Exception do
         begin
-          FLastError := Format('Parser error: %s', [E.Message]);
+          FLastError := 'SYNTAX ERROR';
+          FLastErrorVerbose := E.Message;
           Exit;
         end;
       end;
@@ -362,13 +393,14 @@ var
   SSAProgram: TSSAProgram;
   Compiler: TBytecodeCompiler;
   RegAlloc: TLinearScanAllocator;
+  ParseError: TParserError;
 begin
   Result := nil;
-  FLastError := '';
+  ClearErrorState(FLastError, FLastErrorLine, FLastErrorColumn, FLastErrorVerbose);
 
   if Trim(Source) = '' then
   begin
-    FLastError := 'Empty source';
+    FLastError := 'SYNTAX ERROR';
     Exit;
   end;
 
@@ -384,14 +416,15 @@ begin
       TokenList := Lexer.ScanAllTokensFast;
       if not Assigned(TokenList) or (TokenList.Count = 0) then
       begin
-        FLastError := 'No tokens produced';
+        FLastError := 'SYNTAX ERROR';
         Exit;
       end;
 
     except
       on E: Exception do
       begin
-        FLastError := Format('Lexer error: %s', [E.Message]);
+        FLastError := 'SYNTAX ERROR';
+        FLastErrorVerbose := 'Lexer error: ' + E.Message;
         Exit;
       end;
     end;
@@ -405,16 +438,28 @@ begin
         if not ParserResult.Success then
         begin
           if ParserResult.Errors.Count > 0 then
-            FLastError := Format('Parse error: %s', [ParserResult.Errors[0].ToString])
+          begin
+            ParseError := ParserResult.Errors[0];
+            // Extract line/column for C128-style error format
+            if ParseError.BasicLineNumber > 0 then
+              FLastErrorLine := ParseError.BasicLineNumber
+            else
+              FLastErrorLine := ParseError.Line;
+            FLastErrorColumn := ParseError.Column;
+            FLastError := 'SYNTAX ERROR';
+            // Use ToString for complete error with positions (line:col)
+            FLastErrorVerbose := ParseError.ToString;
+          end
           else
-            FLastError := 'Parse error: unknown';
+            FLastError := 'SYNTAX ERROR';
           ParserResult.Free;
           Exit;
         end;
       except
         on E: Exception do
         begin
-          FLastError := Format('Parser error: %s', [E.Message]);
+          FLastError := 'SYNTAX ERROR';
+          FLastErrorVerbose := E.Message;
           Exit;
         end;
       end;

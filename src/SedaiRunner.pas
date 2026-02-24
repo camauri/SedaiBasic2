@@ -71,6 +71,7 @@ type
   private
     FVerbose: Boolean;
     FLastError: string;
+    FSkipSuperinstructions: Boolean;
 
     function CompileSource(const SourceFile: string): TBytecodeProgram;
     function LoadBytecode(const BytecodeFile: string): TBytecodeProgram;
@@ -90,6 +91,7 @@ type
     { Properties }
     property Verbose: Boolean read FVerbose write FVerbose;
     property LastError: string read FLastError;
+    property SkipSuperinstructions: Boolean read FSkipSuperinstructions write FSkipSuperinstructions;
   end;
 
   { Exception for runner errors }
@@ -453,7 +455,8 @@ begin
           {$ENDIF}
 
           {$IFNDEF DISABLE_SUPERINSTRUCTIONS}
-          try RunSuperinstructions(Result); except end;
+          if not FSkipSuperinstructions then
+            try RunSuperinstructions(Result); except end;
           {$ENDIF}
 
           {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}

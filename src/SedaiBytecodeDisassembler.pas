@@ -270,6 +270,8 @@ begin
       Line := Format('%4d: %-20s R%d', [Index, 'LoadER', Instr.Dest]);
     bcLoadERRS:
       Line := Format('%4d: %-20s R%d', [Index, 'LoadERR$', Instr.Dest]);
+    bcLoadCWDS:
+      Line := Format('%4d: %-20s R%d', [Index, 'LoadCWD$', Instr.Dest]);
 
     // === GROUP 10: GRAPHICS (0x0Axx) ===
     bcGraphicRGBA:

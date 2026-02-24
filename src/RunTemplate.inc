@@ -764,7 +764,9 @@ begin
 
         // File and system operations - fall back to slow path
         bcLoad, bcSave, bcVerify, bcBload, bcBsave, bcBoot,
-        bcRun, bcList, bcNew, bcCatalog:
+        bcRun, bcList, bcNew, bcCatalog,
+        // File management commands
+        bcCopyFile, bcScratch, bcRenameFile, bcConcat, bcMkdir, bcChdir, bcMoveFile:
           begin
             FPC := CurPC;
             ExecuteInstruction(Instr);

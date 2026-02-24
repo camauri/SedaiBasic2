@@ -167,8 +167,10 @@ begin
   WriteLn('  --help               Show this help message');
   WriteLn('  --autorun            Auto-run program after loading (interactive mode)');
   WriteLn('  --verbose            Show loading, lexing, parsing, and VM execution info');
-  WriteLn('  --disasm             Show bytecode disassembly');
-  WriteLn('  --no-exec            Compile only, do not execute');
+  WriteLn('  --dump-ast           Show AST structure after parsing');
+  WriteLn('  --disasm             Show bytecode disassembly (after superinstructions)');
+  WriteLn('  --disasm-pre         Show bytecode BEFORE superinstruction fusion');
+  WriteLn('  --no-exec            Compile only, do not execute (useful with --disasm)');
   WriteLn('  --stats              Show execution statistics');
   WriteLn('  --fullscreen         Start in fullscreen mode');
   WriteLn('  --history-file=PATH  Use custom history file (default: ~/.sedai/.sbv_history)');
@@ -187,7 +189,7 @@ end;
 
 { Run BASIC program with SDL2 output }
 procedure RunWithSDL2(const FileName: string;
-  IOMode: TIOMode; OptVerbose, OptDisasm, OptStats, OptNoExec, OptFullscreen: Boolean
+  IOMode: TIOMode; OptVerbose, OptDumpAST, OptDisasm, OptDisasmPre, OptStats, OptNoExec, OptFullscreen: Boolean
   {$IFDEF ENABLE_PROFILER}; OptProfile: Boolean; ProfileMode: string; ProfileExport: string{$ENDIF});
 var
   Runner: TSedaiRunner;
@@ -207,7 +209,7 @@ var
   ExportExt: string;
   {$ENDIF}
 begin
-  ShowBanners := OptVerbose or OptDisasm or OptStats;
+  ShowBanners := OptVerbose or OptDumpAST or OptDisasm or OptDisasmPre or OptStats;
 
   if ShowBanners then
   begin
@@ -224,6 +226,8 @@ begin
   Runner := TSedaiRunner.Create;
   try
     Runner.Verbose := OptVerbose;
+    // Skip superinstructions for --disasm-pre (show pre-fusion bytecode)
+    Runner.SkipSuperinstructions := OptDisasmPre;
 
     Timer := CreateHiResTimer;
     try
@@ -265,8 +269,28 @@ begin
       WriteLn;
     end;
 
+    // === AST DUMP (Optional) ===
+    if OptDumpAST then
+    begin
+      WriteLn('=== AST DUMP ===');
+      WriteLn('NOTE: AST dump requires internal compiler access.');
+      WriteLn('Use interactive mode with VERBOSE option for AST inspection.');
+      WriteLn;
+    end;
+
     // === DISASSEMBLY (Optional) ===
-    if OptDisasm then
+    if OptDisasmPre then
+    begin
+      WriteLn('=== BYTECODE DISASSEMBLY (PRE-SUPERINSTRUCTIONS) ===');
+      Disassembler := TBytecodeDisassembler.Create;
+      try
+        WriteLn(Disassembler.Disassemble(BytecodeProgram));
+      finally
+        Disassembler.Free;
+      end;
+      WriteLn;
+    end
+    else if OptDisasm then
     begin
       WriteLn('=== BYTECODE DISASSEMBLY ===');
       Disassembler := TBytecodeDisassembler.Create;
@@ -308,6 +332,10 @@ begin
         // Initialize display
         Output.Initialize('SedaiBasic Vision',
           IOManager.ConsoleWidth, IOManager.ConsoleHeight);
+
+        // Apply fullscreen if requested
+        if OptFullscreen then
+          Output.SetFullscreen(True);
 
         VM := TBytecodeVM.Create;
         {$IFDEF ENABLE_PROFILER}
@@ -460,7 +488,7 @@ var
   TestFile: string;
   IOMode: TIOMode;
   ModeStr: string;
-  OptVerbose, OptDisasm, OptStats, OptHelp, OptNoExec, OptFullscreen, OptAutoRun: Boolean;
+  OptVerbose, OptDumpAST, OptDisasm, OptDisasmPre, OptStats, OptHelp, OptNoExec, OptFullscreen, OptAutoRun: Boolean;
   OptHistoryFile: string;
   HistoryDir: string;
   HistoryResponse: string;
@@ -495,7 +523,9 @@ begin
     TestFile := '';
     IOMode := ioRetroText;  // Default to retro text mode
     OptVerbose := False;
+    OptDumpAST := False;
     OptDisasm := False;
+    OptDisasmPre := False;
     OptStats := False;
     OptHelp := False;
     OptNoExec := False;
@@ -518,6 +548,10 @@ begin
         OptVerbose := True
       else if LowerCase(Param) = '--disasm' then
         OptDisasm := True
+      else if LowerCase(Param) = '--disasm-pre' then
+        OptDisasmPre := True
+      else if LowerCase(Param) = '--dump-ast' then
+        OptDumpAST := True
       else if LowerCase(Param) = '--stats' then
         OptStats := True
       else if LowerCase(Param) = '--no-exec' then
@@ -665,9 +699,18 @@ begin
       Exit;
     end;
 
-    // Run interactive mode with startup file
-    // This loads the file and optionally auto-runs it
-    RunInteractiveMode(OptFullscreen, TestFile, OptAutoRun, OptHistoryFile);
+    // If disasm/dump options are set, run non-interactively and show output
+    if OptDisasm or OptDisasmPre or OptDumpAST or OptNoExec then
+    begin
+      RunWithSDL2(TestFile, IOMode, OptVerbose, OptDumpAST, OptDisasm, OptDisasmPre, OptStats, OptNoExec, OptFullscreen
+        {$IFDEF ENABLE_PROFILER}, OptProfile, ProfileMode, ProfileExport{$ENDIF});
+    end
+    else
+    begin
+      // Run interactive mode with startup file
+      // This loads the file and optionally auto-runs it
+      RunInteractiveMode(OptFullscreen, TestFile, OptAutoRun, OptHistoryFile);
+    end;
 
   except
     on E: Exception do

@@ -303,6 +303,15 @@ begin
     ssaDataAdd, ssaDataRead, ssaDataRestore:
       Result := True;
 
+    // File I/O operations - always live (side effects on file system)
+    ssaDopen, ssaDclose, ssaOpen, ssaClose,
+    ssaGetFile, ssaInputFile, ssaPrintFile, ssaPrintFileNewLine,
+    ssaCmd, ssaAppend, ssaDclear, ssaRecord,
+    // File management commands
+    ssaLoad, ssaSave, ssaVerify, ssaBload, ssaBsave, ssaBoot,
+    ssaScratch, ssaCopyFile, ssaRenameFile, ssaMkdir, ssaChdir, ssaMoveFile, ssaConcat:
+      Result := True;
+
     // Graphics operations - always live (visible side effects on screen)
     ssaGraphicSetMode, ssaGraphicBox, ssaGraphicCircle, ssaGraphicDraw, ssaGraphicLocate,
     ssaGraphicColor, ssaSetColor, ssaGraphicWidth, ssaGraphicScale, ssaGraphicPaint, ssaGraphicWindow,

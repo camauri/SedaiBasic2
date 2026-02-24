@@ -1813,6 +1813,7 @@ begin
  RegisterKeyword(kTI,  ttSpecialVariable, 'Get time elapse from power on', kcReservedVariables);
  RegisterKeyword(kTIS, ttSpecialVariable, 'Get/set 24h clock',             kcReservedVariables);
  RegisterKeyword(kDTS, ttSpecialVariable, 'Get current date YYYYMMDD',     kcReservedVariables);
+ RegisterKeyword(kCWDS, ttSpecialVariable, 'Get current working directory', kcReservedVariables);
 
   // === ERROR HANDLING (COMMANDS AND FUNCTIONS) ===
   // commands

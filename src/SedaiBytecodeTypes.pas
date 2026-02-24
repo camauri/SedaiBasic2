@@ -296,6 +296,7 @@ const
   // Memory operations
   bcPeek            = bcGroupSpecial + 8;   // PEEK(address): read from memory-mapped location
   bcPoke            = bcGroupSpecial + 9;   // POKE address, value: write to memory-mapped location
+  bcLoadCWDS        = bcGroupSpecial + 10;  // CWD$: current working directory
 
   // === GROUP 6: FILE I/O (0x06xx) ===
   bcDopen           = bcGroupFileIO + 0;    // DOPEN #handle, "filename" [, mode$]
@@ -306,6 +307,14 @@ const
   bcInputFile       = bcGroupFileIO + 5;    // INPUT# file, vars
   bcPrintFile       = bcGroupFileIO + 6;    // PRINT# file, exprs
   bcCmd             = bcGroupFileIO + 7;    // CMD file [, expr]
+  bcAppend          = bcGroupFileIO + 8;    // APPEND #handle, data
+  bcDclear          = bcGroupFileIO + 9;    // DCLEAR - close all file handles
+  bcRecord          = bcGroupFileIO + 10;   // RECORD #handle, position
+  bcPrintFileNewLine = bcGroupFileIO + 11;  // PRINT# newline: Write CR to file
+  bcPrintFileFloat  = bcGroupFileIO + 12;   // PRINT# file, float expr
+  bcPrintFileInt    = bcGroupFileIO + 13;   // PRINT# file, int expr
+  bcInputFileFloat  = bcGroupFileIO + 14;   // INPUT# file, float var
+  bcInputFileInt    = bcGroupFileIO + 15;   // INPUT# file, int var
 
   // === GROUP 7: SPRITE OPERATIONS (0x07xx) ===
   // Sprite commands
@@ -1146,6 +1155,12 @@ begin
         5: Result := 'InputFile';
         6: Result := 'PrintFile';
         7: Result := 'Cmd';
+        8: Result := 'Append';
+        9: Result := 'Dclear';
+        10: Result := 'Record';
+        11: Result := 'PrintFileNewLine';
+        12: Result := 'PrintFileFloat';
+        13: Result := 'PrintFileInt';
       else
         Result := Format('FileIO_%d', [SubOp]);
       end;

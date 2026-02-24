@@ -117,6 +117,9 @@ type
     antClose,             // CLOSE statement
     antDopen,             // DOPEN statement (disk file open)
     antDclose,            // DCLOSE statement (disk file close)
+    antAppend,            // APPEND statement (append to file)
+    antDclear,            // DCLEAR statement (close all file handles)
+    antRecord,            // RECORD statement (seek file position)
     antGet,               // GET statement (non-blocking character input)
     antGetkey,            // GETKEY statement (blocking character input)
     antGetFile,           // GET# statement (get char from file)
@@ -359,7 +362,7 @@ begin
     antGosub, antOnGoto, antOnGosub, antReturn, antEnd, antStop, antRem, antIf,
     antThen, antElse, antForLoop, antWhileLoop, antDoLoop, antDim,
     antDef, antData, antConst, antRead, antRestore, antClear,
-    antOpen, antClose, antDopen, antDclose,
+    antOpen, antClose, antDopen, antDclose, antAppend, antDclear, antRecord,
     antGet, antPut, antPoke, antSys, antNew, antRun, antList,
     antSave, antLoad, antVerify, antBload, antBsave, antBoot, antCatalog, antBlock,
     // Sprite commands

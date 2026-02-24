@@ -188,7 +188,7 @@ type
     {$ENDIF}
     // File management operations (executed directly in VM)
     procedure ExecuteCopyFile(const Src, Dest: string; Overwrite: Boolean);
-    procedure ExecuteScratch(const Pattern: string; Force: Boolean);
+    procedure ExecuteScratch(const Pattern: string; Force: Boolean; Silent: Boolean = False);
     procedure ExecuteRenameFile(const OldName, NewName: string);
     procedure ExecuteConcat(const Src, Dest: string);
     procedure ExecuteMkdir(const Path: string);
@@ -2255,9 +2255,11 @@ begin
 
     bcScratch:
       begin
-        // SCRATCH "pattern" [, force]
-        // Src1 = pattern, Src2 = force flag (int reg)
-        ExecuteScratch(FStringRegs[Instr.Src1], FIntRegs[Instr.Src2] <> 0);
+        // SCRATCH "pattern" [, flags]
+        // Src1 = pattern, Src2 = flags (int reg): 1 = silent, 2 = force, 3 = both
+        ExecuteScratch(FStringRegs[Instr.Src1],
+          (FIntRegs[Instr.Src2] and 2) <> 0,  // force (bit 1)
+          (FIntRegs[Instr.Src2] and 1) <> 0); // silent (bit 0)
       end;
 
     bcRenameFile:
@@ -2952,59 +2954,92 @@ end;
 procedure TBytecodeVM.ExecuteIOOp(const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
-  PrintStr, InputStr: string;
+  PrintStr, InputStr, CmdNewLine: string;
   InputVal: Double;
   NextTabCol, TabIdx: Integer;
+  CmdErr: Integer;  // Error code for CMD-redirected output
 begin
+  CmdErr := 0;
+  CmdNewLine := #13;  // CR for file newlines
   SubOp := Instr.OpCode and $FF;
   case SubOp of
     0: // bcPrint (float)
-      if Assigned(FOutputDevice) then
       begin
         PrintStr := FConsoleBehavior.FormatNumber(FFloatRegs[Instr.Src1]);
-        FOutputDevice.Print(PrintStr);
-        Inc(FCursorCol, Length(PrintStr));
+        if (FCmdHandle > 0) and Assigned(FOnFileData) then
+          FOnFileData(Self, 'PRINT#', FCmdHandle, PrintStr, CmdErr)
+        else if Assigned(FOutputDevice) then
+        begin
+          FOutputDevice.Print(PrintStr);
+          Inc(FCursorCol, Length(PrintStr));
+        end;
       end;
     1: // bcPrintLn (float)
-      if Assigned(FOutputDevice) then
       begin
         PrintStr := FConsoleBehavior.FormatNumber(FFloatRegs[Instr.Src1]);
-        FOutputDevice.Print(PrintStr);
-        FOutputDevice.NewLine;
-        FOutputDevice.Present;
-        FCursorCol := 0;
+        if (FCmdHandle > 0) and Assigned(FOnFileData) then
+        begin
+          FOnFileData(Self, 'PRINT#', FCmdHandle, PrintStr, CmdErr);
+          FOnFileData(Self, 'PRINT#', FCmdHandle, CmdNewLine, CmdErr);
+        end
+        else if Assigned(FOutputDevice) then
+        begin
+          FOutputDevice.Print(PrintStr);
+          FOutputDevice.NewLine;  // NewLine already calls Present
+          FCursorCol := 0;
+        end;
       end;
     2: // bcPrintString
-      if Assigned(FOutputDevice) then
       begin
         PrintStr := FConsoleBehavior.FormatString(FStringRegs[Instr.Src1]);
-        FOutputDevice.Print(PrintStr);
-        Inc(FCursorCol, Length(PrintStr));
+        if (FCmdHandle > 0) and Assigned(FOnFileData) then
+          FOnFileData(Self, 'PRINT#', FCmdHandle, PrintStr, CmdErr)
+        else if Assigned(FOutputDevice) then
+        begin
+          FOutputDevice.Print(PrintStr);
+          Inc(FCursorCol, Length(PrintStr));
+        end;
       end;
     3: // bcPrintStringLn
-      if Assigned(FOutputDevice) then
       begin
         PrintStr := FConsoleBehavior.FormatString(FStringRegs[Instr.Src1]);
-        FOutputDevice.Print(PrintStr);
-        FOutputDevice.NewLine;
-        FOutputDevice.Present;
-        FCursorCol := 0;
+        if (FCmdHandle > 0) and Assigned(FOnFileData) then
+        begin
+          FOnFileData(Self, 'PRINT#', FCmdHandle, PrintStr, CmdErr);
+          FOnFileData(Self, 'PRINT#', FCmdHandle, CmdNewLine, CmdErr);
+        end
+        else if Assigned(FOutputDevice) then
+        begin
+          FOutputDevice.Print(PrintStr);
+          FOutputDevice.NewLine;  // NewLine already calls Present
+          FCursorCol := 0;
+        end;
       end;
     4: // bcPrintInt
-      if Assigned(FOutputDevice) then
       begin
         PrintStr := FConsoleBehavior.FormatNumber(FIntRegs[Instr.Src1]);
-        FOutputDevice.Print(PrintStr);
-        Inc(FCursorCol, Length(PrintStr));
+        if (FCmdHandle > 0) and Assigned(FOnFileData) then
+          FOnFileData(Self, 'PRINT#', FCmdHandle, PrintStr, CmdErr)
+        else if Assigned(FOutputDevice) then
+        begin
+          FOutputDevice.Print(PrintStr);
+          Inc(FCursorCol, Length(PrintStr));
+        end;
       end;
     5: // bcPrintIntLn
-      if Assigned(FOutputDevice) then
       begin
         PrintStr := FConsoleBehavior.FormatNumber(FIntRegs[Instr.Src1]);
-        FOutputDevice.Print(PrintStr);
-        FOutputDevice.NewLine;
-        FOutputDevice.Present;
-        FCursorCol := 0;
+        if (FCmdHandle > 0) and Assigned(FOnFileData) then
+        begin
+          FOnFileData(Self, 'PRINT#', FCmdHandle, PrintStr, CmdErr);
+          FOnFileData(Self, 'PRINT#', FCmdHandle, CmdNewLine, CmdErr);
+        end
+        else if Assigned(FOutputDevice) then
+        begin
+          FOutputDevice.Print(PrintStr);
+          FOutputDevice.NewLine;  // NewLine already calls Present
+          FCursorCol := 0;
+        end;
       end;
     6: // bcPrintComma
       if Assigned(FOutputDevice) then
@@ -3079,10 +3114,14 @@ begin
         end;
       end;
     10: // bcPrintNewLine
-      if Assigned(FOutputDevice) then
       begin
-        FOutputDevice.NewLine;
-        FCursorCol := 0;
+        if (FCmdHandle > 0) and Assigned(FOnFileData) then
+          FOnFileData(Self, 'PRINT#', FCmdHandle, CmdNewLine, CmdErr)
+        else if Assigned(FOutputDevice) then
+        begin
+          FOutputDevice.NewLine;
+          FCursorCol := 0;
+        end;
       end;
     11: // bcPrintEnd - Reset reverse mode after PRINT (C128 behavior)
       if Assigned(FOutputDevice) then
@@ -3292,6 +3331,8 @@ begin
           FMemoryMapper.Poke(FIntRegs[Instr.Src1], FIntRegs[Instr.Src2]);
         // If no memory mapper, silently ignore (like real hardware)
       end;
+    10: // bcLoadCWDS - return current working directory
+      FStringRegs[Instr.Dest] := GetCurrentDir;
   else
     raise Exception.CreateFmt('Unknown special variable opcode %d at PC=%d', [Instr.OpCode, FPC]);
   end;
@@ -3844,11 +3885,16 @@ begin
       1 = DCLOSE #handle
       2 = OPEN (legacy, maps to DOPEN)
       3 = CLOSE (legacy, maps to DCLOSE)
+      8 = APPEND #handle, data
+      9 = DCLEAR
+      10 = RECORD #handle, position
 
-    Register encoding:
-      DOPEN: Dest = handle register (int), Src1 = filename register (string),
-             Src2 = mode register (string, optional), Immediate = handle name string index
-      DCLOSE: Dest = handle register (int), Immediate = handle name string index
+    Register encoding (handle in Src1, not Dest, to avoid SSA versioning issues):
+      DOPEN: Src1 = handle register (int), Src2 = filename register (string),
+             Immediate = mode register (string, optional)
+      DCLOSE: Src1 = handle register (int)
+      APPEND: Src1 = handle register (int), Src2 = data register (string)
+      RECORD: Src1 = handle register (int), Src2 = position register (int)
   }
 
   SubOp := Instr.OpCode and $FF;
@@ -3858,20 +3904,18 @@ begin
     0, 2: // bcDopen, bcOpen
       begin
         // DOPEN #handle, "filename" [, mode$]
-        HandleNum := FIntRegs[Instr.Dest];
-        Filename := FStringRegs[Instr.Src1];
+        // Src1 = handle, Src2 = filename, Immediate = mode register (or 0)
+        HandleNum := FIntRegs[Instr.Src1];
+        Filename := FStringRegs[Instr.Src2];
 
         // Mode is optional, default to "R" (read)
-        if Instr.Src2 > 0 then
-          Mode := FStringRegs[Instr.Src2]
+        if Instr.Immediate > 0 then
+          Mode := FStringRegs[Instr.Immediate]
         else
           Mode := 'R';
 
-        // Handle name (for named handles like #MYFILE)
-        if (Instr.Immediate >= 0) and (Instr.Immediate < FProgram.StringConstants.Count) then
-          HandleName := FProgram.StringConstants[Instr.Immediate]
-        else
-          HandleName := '';
+        // Named handles not currently used, clear handle name
+        HandleName := '';
 
         if Assigned(FOnDiskFile) then
         begin
@@ -3886,19 +3930,18 @@ begin
     1, 3: // bcDclose, bcClose
       begin
         // DCLOSE #handle
-        HandleNum := FIntRegs[Instr.Dest];
-
-        // Handle name (for named handles)
-        if (Instr.Immediate >= 0) and (Instr.Immediate < FProgram.StringConstants.Count) then
-          HandleName := FProgram.StringConstants[Instr.Immediate]
-        else
-          HandleName := '';
+        // Src1 = handle
+        HandleNum := FIntRegs[Instr.Src1];
+        HandleName := '';
 
         if Assigned(FOnDiskFile) then
         begin
           FOnDiskFile(Self, 'DCLOSE', HandleNum, HandleName, '', '', ErrorCode);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('DCLOSE error %d closing handle: %d', [ErrorCode, HandleNum]);
+          // Reset CMD redirection if closing the CMD output file
+          if FCmdHandle = HandleNum then
+            FCmdHandle := 0;
         end
         else
           raise Exception.Create('DCLOSE command not supported: no handler assigned');
@@ -3907,9 +3950,9 @@ begin
     4: // bcGetFile - GET# file, var
       begin
         { GET# file, var - Read one character from file
-          Dest = file handle register (int)
-          Src1 = variable register index to store result (string) }
-        HandleNum := FIntRegs[Instr.Dest];
+          Dest = variable register index to store result (string)
+          Src1 = file handle register (int) }
+        HandleNum := FIntRegs[Instr.Src1];
         if Assigned(FOnFileData) then
         begin
           Data := '';
@@ -3917,8 +3960,8 @@ begin
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('GET# error %d reading from file: %d', [ErrorCode, HandleNum]);
           // Store result in string register
-          if Instr.Src1 >= 0 then
-            FStringRegs[Instr.Src1] := Data;
+          if Instr.Dest >= 0 then
+            FStringRegs[Instr.Dest] := Data;
         end
         else
           raise Exception.Create('GET# command not supported: no handler assigned');
@@ -3927,9 +3970,9 @@ begin
     5: // bcInputFile - INPUT# file, vars
       begin
         { INPUT# file, var - Read data from file
-          Dest = file handle register (int)
-          Src1 = variable register index to store result }
-        HandleNum := FIntRegs[Instr.Dest];
+          Dest = variable register index to store result
+          Src1 = file handle register (int) }
+        HandleNum := FIntRegs[Instr.Src1];
         if Assigned(FOnFileData) then
         begin
           Data := '';
@@ -3937,8 +3980,8 @@ begin
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('INPUT# error %d reading from file: %d', [ErrorCode, HandleNum]);
           // Store result in string register
-          if Instr.Src1 >= 0 then
-            FStringRegs[Instr.Src1] := Data;
+          if Instr.Dest >= 0 then
+            FStringRegs[Instr.Dest] := Data;
         end
         else
           raise Exception.Create('INPUT# command not supported: no handler assigned');
@@ -3947,10 +3990,15 @@ begin
     6: // bcPrintFile - PRINT# file, exprs
       begin
         { PRINT# file, data - Write data to file
-          Dest = file handle register (int)
-          Src1 = data register (string) }
-        HandleNum := FIntRegs[Instr.Dest];
-        Data := FStringRegs[Instr.Src1];
+          Dest = data register (expression to print)
+          Src1 = file handle register (int) }
+        HandleNum := FIntRegs[Instr.Src1];
+        // Data can be in Dest (float converted to string, or string directly)
+        // Need to handle different register types
+        if Instr.Dest >= 0 then
+          Data := FStringRegs[Instr.Dest]
+        else
+          Data := '';
         if Assigned(FOnFileData) then
         begin
           FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);
@@ -3964,32 +4012,164 @@ begin
     7: // bcCmd - CMD file [, expr]
       begin
         { CMD file - Redirect output to file
-          Dest = file handle register (int)
-          When handle is 0 or PRINT# is called without data, output returns to screen }
-        HandleNum := FIntRegs[Instr.Dest];
+          Src1 = file handle register (int)
+          When handle is 0, output returns to screen }
+        HandleNum := FIntRegs[Instr.Src1];
 
-        // If PRINT# is called alone (empty data), restore output to screen
-        if (Instr.Src1 >= 0) and (FStringRegs[Instr.Src1] = '') then
+        // Set output redirection
+        if HandleNum = 0 then
+          FCmdHandle := 0  // Reset to screen
+        else
+          FCmdHandle := HandleNum;  // Redirect output to this file
+      end;
+
+    8: // bcAppend - APPEND #handle, data
+      begin
+        { APPEND #handle, data - Append string data to open file
+          Src1 = file handle register (int)
+          Src2 = data string register }
+        HandleNum := FIntRegs[Instr.Src1];
+        if Instr.Src2 >= 0 then
+          Data := FStringRegs[Instr.Src2]
+        else
+          Data := '';
+
+        if Assigned(FOnFileData) then
         begin
-          FCmdHandle := 0;  // Reset to screen
+          FOnFileData(Self, 'APPEND', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('APPEND error %d writing to file: %d', [ErrorCode, HandleNum]);
         end
         else
-        begin
-          FCmdHandle := HandleNum;  // Redirect output to this file
-
-          // If there's initial data to write, send it
-          if (Instr.Src1 >= 0) and (FStringRegs[Instr.Src1] <> '') then
-          begin
-            Data := FStringRegs[Instr.Src1];
-            if Assigned(FOnFileData) then
-            begin
-              FOnFileData(Self, 'CMD', HandleNum, Data, ErrorCode);
-              if ErrorCode <> 0 then
-                raise Exception.CreateFmt('CMD error %d: %d', [ErrorCode, HandleNum]);
-            end;
-          end;
-        end;
+          raise Exception.Create('APPEND command not supported: no handler assigned');
       end;
+
+    9: // bcDclear - DCLEAR (close all file handles)
+      begin
+        { DCLEAR - Close all open file handles
+          No parameters }
+        if Assigned(FOnDiskFile) then
+        begin
+          // Use handle 0 as signal to close all handles
+          FOnDiskFile(Self, 'DCLEAR', 0, '', '', '', ErrorCode);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('DCLEAR error %d', [ErrorCode]);
+        end
+        else
+          raise Exception.Create('DCLEAR command not supported: no handler assigned');
+      end;
+
+    10: // bcRecord - RECORD #handle, position
+      begin
+        { RECORD #handle, position - Seek to byte position in file
+          Src1 = file handle register (int)
+          Src2 = position register (int) }
+        HandleNum := FIntRegs[Instr.Src1];
+        if Instr.Src2 >= 0 then
+          Data := IntToStr(FIntRegs[Instr.Src2])  // Pass position as string
+        else
+          Data := '0';
+
+        if Assigned(FOnFileData) then
+        begin
+          FOnFileData(Self, 'RECORD', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('RECORD error %d seeking in file: %d', [ErrorCode, HandleNum]);
+        end
+        else
+          raise Exception.Create('RECORD command not supported: no handler assigned');
+      end;
+
+    11: // bcPrintFileNewLine - Write CR (newline) to file
+      begin
+        { PRINT# newline - Write CHR$(13) to file
+          Src1 = file handle register (int) }
+        HandleNum := FIntRegs[Instr.Src1];
+        Data := #13;  // Carriage return (C128 BASIC behavior)
+        if Assigned(FOnFileData) then
+        begin
+          FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('PRINT# newline error %d writing to file: %d', [ErrorCode, HandleNum]);
+        end
+        else
+          raise Exception.Create('PRINT# newline not supported: no handler assigned');
+      end;
+
+    12: // bcPrintFileFloat - PRINT# file, float expr
+      begin
+        { PRINT# file, float - Write float value to file
+          Dest = float register (value to print)
+          Src1 = file handle register (int) }
+        HandleNum := FIntRegs[Instr.Src1];
+        Data := FConsoleBehavior.FormatNumber(FFloatRegs[Instr.Dest]);
+        if Assigned(FOnFileData) then
+        begin
+          FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('PRINT# error %d writing float to file: %d', [ErrorCode, HandleNum]);
+        end
+        else
+          raise Exception.Create('PRINT# command not supported: no handler assigned');
+      end;
+
+    13: // bcPrintFileInt - PRINT# file, int expr
+      begin
+        { PRINT# file, int - Write integer value to file
+          Dest = int register (value to print)
+          Src1 = file handle register (int) }
+        HandleNum := FIntRegs[Instr.Src1];
+        Data := FConsoleBehavior.FormatNumber(FIntRegs[Instr.Dest]);
+        if Assigned(FOnFileData) then
+        begin
+          FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('PRINT# error %d writing int to file: %d', [ErrorCode, HandleNum]);
+        end
+        else
+          raise Exception.Create('PRINT# command not supported: no handler assigned');
+      end;
+
+    14: // bcInputFileFloat - INPUT# file, float var
+      begin
+        { INPUT# file, float - Read float value from file
+          Dest = float register (variable to store result)
+          Src1 = file handle register (int) }
+        HandleNum := FIntRegs[Instr.Src1];
+        if Assigned(FOnFileData) then
+        begin
+          Data := '';
+          FOnFileData(Self, 'INPUT#', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('INPUT# error %d reading from file: %d', [ErrorCode, HandleNum]);
+          // Convert string to float and store in float register
+          if Instr.Dest >= 0 then
+            FFloatRegs[Instr.Dest] := StrToFloatDef(Trim(Data), 0.0);
+        end
+        else
+          raise Exception.Create('INPUT# command not supported: no handler assigned');
+      end;
+
+    15: // bcInputFileInt - INPUT# file, int var
+      begin
+        { INPUT# file, int - Read integer value from file
+          Dest = int register (variable to store result)
+          Src1 = file handle register (int) }
+        HandleNum := FIntRegs[Instr.Src1];
+        if Assigned(FOnFileData) then
+        begin
+          Data := '';
+          FOnFileData(Self, 'INPUT#', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('INPUT# error %d reading from file: %d', [ErrorCode, HandleNum]);
+          // Convert string to integer and store in int register
+          if Instr.Dest >= 0 then
+            FIntRegs[Instr.Dest] := StrToIntDef(Trim(Data), 0);
+        end
+        else
+          raise Exception.Create('INPUT# command not supported: no handler assigned');
+      end;
+
   else
     raise Exception.CreateFmt('Unknown file I/O opcode %d at PC=%d', [Instr.OpCode, FPC]);
   end;
@@ -4082,7 +4262,7 @@ begin
   end;
 end;
 
-procedure TBytecodeVM.ExecuteScratch(const Pattern: string; Force: Boolean);
+procedure TBytecodeVM.ExecuteScratch(const Pattern: string; Force: Boolean; Silent: Boolean);
 var
   SearchRec: TSearchRec;
   SrcDir, SrcPattern, FullPath: string;
@@ -4113,7 +4293,8 @@ begin
   end
   else
   begin
-    if not Force then
+    // Only raise error if not Silent
+    if not Silent then
       raise Exception.Create('?FILE NOT FOUND');
   end;
 end;

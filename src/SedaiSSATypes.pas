@@ -123,6 +123,7 @@ type
     ssaLoadTIS,        // TI$: Load current time as HHMMSS string
     ssaStoreTIS,       // TI$ = "HHMMSS": Set time offset
     ssaLoadDTS,        // DT$: Load current date as YYYYMMDD string
+    ssaLoadCWDS,       // CWD$: Load current working directory
     ssaLoadEL,         // EL: Load last error line number
     ssaLoadER,         // ER: Load last error code
     ssaLoadERRS,       // ERR$: Load last error message (variable, not function)
@@ -172,6 +173,10 @@ type
     ssaInputFile,      // INPUT# file, vars: Input from file
     ssaPrintFile,      // PRINT# file, exprs: Print to file
     ssaCmd,            // CMD file [, expr]: Redirect output to file
+    ssaAppend,         // APPEND #handle, data: Append data to file
+    ssaDclear,         // DCLEAR: Close all open file handles
+    ssaRecord,         // RECORD #handle, position: Seek to position in file
+    ssaPrintFileNewLine, // PRINT# newline: Write CR to file (handle in Src1)
     // Sprite commands
     ssaSprite,         // SPRITE n [,on] [,color] [,priority] [,xscale] [,yscale] [,mode]
     ssaMovsprAbs,      // MOVSPR n, x, y: Position sprite at absolute coordinates

@@ -146,6 +146,9 @@ type
     procedure ProcessInputFile(Node: TASTNode);
     procedure ProcessPrintFile(Node: TASTNode);
     procedure ProcessCmd(Node: TASTNode);
+    procedure ProcessAppend(Node: TASTNode);
+    procedure ProcessDclear(Node: TASTNode);
+    procedure ProcessRecord(Node: TASTNode);
     // Sprite commands
     procedure ProcessSprite(Node: TASTNode);
     procedure ProcessMovspr(Node: TASTNode);
@@ -425,6 +428,8 @@ var
   ArgListNode: TASTNode;
   TempFloat: Double;
   TempInt: Integer;
+  TempStr: string;
+  ValCode: Integer;
   // Array access variables
   ArrName: string;
   ArrayIdx: Integer;
@@ -464,7 +469,22 @@ begin
           Result := MakeSSAConstFloat(Double(Node.Value));
       end
       else
-        Result := MakeSSAConstString(VarToStr(Node.Value));
+      begin
+        // Try to convert string to number (handles cases like file handle "1")
+        TempStr := VarToStr(Node.Value);
+        TempFloat := 0;
+        Val(TempStr, TempFloat, ValCode);
+        if ValCode = 0 then
+        begin
+          // Successfully parsed as number
+          if Frac(TempFloat) = 0 then
+            Result := MakeSSAConstInt(Int64(Trunc(TempFloat)))
+          else
+            Result := MakeSSAConstFloat(TempFloat);
+        end
+        else
+          Result := MakeSSAConstString(TempStr);
+      end;
     end;
 
     antIdentifier:
@@ -498,6 +518,13 @@ begin
         DestReg := FProgram.AllocRegister(srtString);
         Result := MakeSSARegister(srtString, DestReg);
         EmitInstruction(ssaLoadDTS, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if VarName = 'CWD$' then
+      begin
+        // CWD$ returns current working directory
+        DestReg := FProgram.AllocRegister(srtString);
+        Result := MakeSSARegister(srtString, DestReg);
+        EmitInstruction(ssaLoadCWDS, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
       else if VarName = 'EL' then
       begin
@@ -5912,6 +5939,8 @@ var
   HandleReg, FilenameReg, ModeReg: TSSAValue;
   HandleNameIdx: Integer;
   HandleChild: TASTNode;
+  HandleStr: string;
+  HandleNum: Integer;
 begin
   if FCurrentBlock = nil then Exit;
 
@@ -5921,11 +5950,11 @@ begin
       Child 1: Filename (string expression)
       Child 2: Mode (optional string expression)
 
-    SSA encoding:
-      Dest = handle register (int)
-      Src1 = filename register (string)
-      Src2 = mode register (string, or 0 if not specified)
-      Immediate = handle name string constant index (for named handles) }
+    SSA encoding (handle in Src1, not Dest, to avoid SSA versioning issues):
+      Dest = none (no output)
+      Src1 = handle register (int)
+      Src2 = filename register (string)
+      Src3 = mode register (string, or svkNone if not specified) }
 
   HandleNameIdx := -1;
 
@@ -5941,14 +5970,29 @@ begin
     end
     else if HandleChild.NodeType = antIdentifier then
     begin
-      // Named handle: #MYFILE - store name in string constants
-      HandleNameIdx := FProgram.AllocRegister(srtInt);  // Use as temporary identifier
-      // Create a temporary register to hold the handle number (will be assigned at runtime)
-      HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      // Store handle name as string constant for runtime lookup
-      HandleNameIdx := FProgram.AllocRegister(srtString);
+      // Check if this is a "#N" style handle (lexer merged # and number)
+      // e.g., "#1", "#2" tokenized as single identifier
+      HandleStr := VarToStr(HandleChild.Value);
+      if (Length(HandleStr) > 1) and (HandleStr[1] = '#') and
+         (HandleStr[2] in ['0'..'9']) then
+      begin
+        // Extract numeric handle from "#N" format
+        HandleNum := StrToIntDef(Copy(HandleStr, 2, Length(HandleStr) - 1), 1);
+        HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+      begin
+        // Named handle: #MYFILE - store name in string constants
+        HandleNameIdx := FProgram.AllocRegister(srtInt);  // Use as temporary identifier
+        // Create a temporary register to hold the handle number (will be assigned at runtime)
+        HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // Store handle name as string constant for runtime lookup
+        HandleNameIdx := FProgram.AllocRegister(srtString);
+      end;
     end
     else
     begin
@@ -5994,8 +6038,8 @@ begin
   end;
 
   // Emit DOPEN instruction
-  // Dest = handle, Src1 = filename, Src2 = mode
-  EmitInstruction(ssaDopen, HandleReg, FilenameReg, ModeReg, MakeSSAValue(svkNone));
+  // Dest = none, Src1 = handle, Src2 = filename, Src3 = mode
+  EmitInstruction(ssaDopen, MakeSSAValue(svkNone), HandleReg, FilenameReg, ModeReg);
 end;
 
 procedure TSSAGenerator.ProcessDclose(Node: TASTNode);
@@ -6003,6 +6047,8 @@ var
   HandleVal: TSSAValue;
   HandleReg: TSSAValue;
   HandleChild: TASTNode;
+  HandleStr: string;
+  HandleNum: Integer;
 begin
   if FCurrentBlock = nil then Exit;
 
@@ -6010,8 +6056,9 @@ begin
     AST structure:
       Child 0: Handle (antLiteral for numeric, antIdentifier for named)
 
-    SSA encoding:
-      Dest = handle register (int) }
+    SSA encoding (handle in Src1, not Dest, to avoid SSA versioning issues):
+      Dest = none
+      Src1 = handle register (int) }
 
   // Parse handle (first child)
   if Node.ChildCount > 0 then
@@ -6025,10 +6072,24 @@ begin
     end
     else if HandleChild.NodeType = antIdentifier then
     begin
-      // Named handle: #MYFILE - for now, treat as 0 (runtime will resolve)
-      HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // Check if this is a "#N" style handle (lexer merged # and number)
+      HandleStr := VarToStr(HandleChild.Value);
+      if (Length(HandleStr) > 1) and (HandleStr[1] = '#') and
+         (HandleStr[2] in ['0'..'9']) then
+      begin
+        // Extract numeric handle from "#N" format
+        HandleNum := StrToIntDef(Copy(HandleStr, 2, Length(HandleStr) - 1), 1);
+        HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+      begin
+        // Named handle: #MYFILE - for now, treat as 0 (runtime will resolve)
+        HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
     end
     else
     begin
@@ -6045,8 +6106,184 @@ begin
   end;
 
   // Emit DCLOSE instruction
-  EmitInstruction(ssaDclose, HandleReg, MakeSSAValue(svkNone),
+  // Dest = none, Src1 = handle
+  EmitInstruction(ssaDclose, MakeSSAValue(svkNone), HandleReg,
                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessAppend(Node: TASTNode);
+var
+  HandleVal, DataVal: TSSAValue;
+  HandleReg, DataReg: TSSAValue;
+  HandleChild: TASTNode;
+  HandleStr: string;
+  HandleNum: Integer;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { APPEND #handle, data
+    AST structure:
+      Child 0: Handle (antLiteral for numeric, antIdentifier for named)
+      Child 1: Data expression to append
+
+    SSA encoding (handle in Src1, not Dest, to avoid SSA versioning issues):
+      Dest = none
+      Src1 = handle register (int)
+      Src2 = data register (string) }
+
+  // Parse handle (first child)
+  if Node.ChildCount > 0 then
+  begin
+    HandleChild := Node.GetChild(0);
+    if HandleChild.NodeType = antLiteral then
+    begin
+      ProcessExpression(HandleChild, HandleVal);
+      HandleReg := EnsureIntRegister(HandleVal);
+    end
+    else if HandleChild.NodeType = antIdentifier then
+    begin
+      // Check if this is a "#N" style handle (lexer merged # and number)
+      HandleStr := VarToStr(HandleChild.Value);
+      if (Length(HandleStr) > 1) and (HandleStr[1] = '#') and
+         (HandleStr[2] in ['0'..'9']) then
+      begin
+        HandleNum := StrToIntDef(Copy(HandleStr, 2, Length(HandleStr) - 1), 1);
+        HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+      begin
+        HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+    end
+    else
+    begin
+      ProcessExpression(HandleChild, HandleVal);
+      HandleReg := EnsureIntRegister(HandleVal);
+    end;
+  end
+  else
+  begin
+    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(1),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Parse data expression (second child)
+  if Node.ChildCount > 1 then
+  begin
+    ProcessExpression(Node.GetChild(1), DataVal);
+    DataReg := EnsureStringRegister(DataVal);
+  end
+  else
+  begin
+    DataReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaLoadConstString, DataReg, MakeSSAConstString(''),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Emit APPEND instruction
+  // Dest = none, Src1 = handle, Src2 = data
+  EmitInstruction(ssaAppend, MakeSSAValue(svkNone), HandleReg, DataReg,
+                 MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessDclear(Node: TASTNode);
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { DCLEAR - close all open file handles
+    No parameters needed
+
+    SSA encoding:
+      No operands, just the instruction }
+
+  EmitInstruction(ssaDclear, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessRecord(Node: TASTNode);
+var
+  HandleVal, PosVal: TSSAValue;
+  HandleReg, PosReg: TSSAValue;
+  HandleChild: TASTNode;
+  HandleStr: string;
+  HandleNum: Integer;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { RECORD #handle, position
+    AST structure:
+      Child 0: Handle (antLiteral for numeric, antIdentifier for named)
+      Child 1: Position expression (byte offset)
+
+    SSA encoding (handle in Src1, not Dest, to avoid SSA versioning issues):
+      Dest = none
+      Src1 = handle register (int)
+      Src2 = position register (int) }
+
+  // Parse handle (first child)
+  if Node.ChildCount > 0 then
+  begin
+    HandleChild := Node.GetChild(0);
+    if HandleChild.NodeType = antLiteral then
+    begin
+      ProcessExpression(HandleChild, HandleVal);
+      HandleReg := EnsureIntRegister(HandleVal);
+    end
+    else if HandleChild.NodeType = antIdentifier then
+    begin
+      // Check if this is a "#N" style handle (lexer merged # and number)
+      HandleStr := VarToStr(HandleChild.Value);
+      if (Length(HandleStr) > 1) and (HandleStr[1] = '#') and
+         (HandleStr[2] in ['0'..'9']) then
+      begin
+        HandleNum := StrToIntDef(Copy(HandleStr, 2, Length(HandleStr) - 1), 1);
+        HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+      begin
+        HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+    end
+    else
+    begin
+      ProcessExpression(HandleChild, HandleVal);
+      HandleReg := EnsureIntRegister(HandleVal);
+    end;
+  end
+  else
+  begin
+    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(1),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Parse position expression (second child)
+  if Node.ChildCount > 1 then
+  begin
+    ProcessExpression(Node.GetChild(1), PosVal);
+    PosReg := EnsureIntRegister(PosVal);
+  end
+  else
+  begin
+    // Default position: 0 (beginning of file)
+    PosReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, PosReg, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // Emit RECORD instruction
+  // Dest = none, Src1 = handle, Src2 = position
+  EmitInstruction(ssaRecord, MakeSSAValue(svkNone), HandleReg, PosReg,
+                 MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.ProcessGetFile(Node: TASTNode);
@@ -6054,6 +6291,8 @@ var
   HandleVal, HandleReg, VarReg: TSSAValue;
   HandleChild, VarChild: TASTNode;
   VarName: string;
+  HandleStr: string;
+  HandleNum: Integer;
 begin
   if FCurrentBlock = nil then Exit;
 
@@ -6078,10 +6317,23 @@ begin
   end
   else if HandleChild.NodeType = antIdentifier then
   begin
-    // Named handle - for now, treat as 0
-    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // Check if this is a "#N" style handle (lexer merged # and number)
+    HandleStr := VarToStr(HandleChild.Value);
+    if (Length(HandleStr) > 1) and (HandleStr[1] = '#') and
+       (HandleStr[2] in ['0'..'9']) then
+    begin
+      HandleNum := StrToIntDef(Copy(HandleStr, 2, Length(HandleStr) - 1), 1);
+      HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+    begin
+      // Named handle - for now, treat as 0
+      HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
   end
   else
   begin
@@ -6105,6 +6357,8 @@ var
   HandleChild, VarChild: TASTNode;
   VarName: string;
   i: Integer;
+  HandleStr: string;
+  HandleNum: Integer;
 begin
   if FCurrentBlock = nil then Exit;
 
@@ -6130,9 +6384,22 @@ begin
   end
   else if HandleChild.NodeType = antIdentifier then
   begin
-    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // Check if this is a "#N" style handle (lexer merged # and number)
+    HandleStr := VarToStr(HandleChild.Value);
+    if (Length(HandleStr) > 1) and (HandleStr[1] = '#') and
+       (HandleStr[2] in ['0'..'9']) then
+    begin
+      HandleNum := StrToIntDef(Copy(HandleStr, 2, Length(HandleStr) - 1), 1);
+      HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+    begin
+      HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
   end
   else
   begin
@@ -6162,6 +6429,8 @@ var
   HandleChild, Child: TASTNode;
   i: Integer;
   SeparatorChar: string;
+  HandleStr: string;
+  HandleNum: Integer;
 begin
   if FCurrentBlock = nil then Exit;
 
@@ -6185,9 +6454,22 @@ begin
   end
   else if HandleChild.NodeType = antIdentifier then
   begin
-    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // Check if this is a "#N" style handle (lexer merged # and number)
+    HandleStr := VarToStr(HandleChild.Value);
+    if (Length(HandleStr) > 1) and (HandleStr[1] = '#') and
+       (HandleStr[2] in ['0'..'9']) then
+    begin
+      HandleNum := StrToIntDef(Copy(HandleStr, 2, Length(HandleStr) - 1), 1);
+      HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+    begin
+      HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
   end
   else
   begin
@@ -6196,10 +6478,10 @@ begin
   end;
 
   // If only handle (no expressions), this is PRINT# with no data
-  // Used to reset CMD redirection
+  // Should write just a newline to the file (like empty PRINT on screen)
   if Node.ChildCount = 1 then
   begin
-    EmitInstruction(ssaPrintFile, MakeSSAValue(svkNone), HandleReg,
+    EmitInstruction(ssaPrintFileNewLine, MakeSSAValue(svkNone), HandleReg,
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
   end;
@@ -6228,7 +6510,7 @@ begin
     ProcessExpression(Child, ExprVal);
 
     // Emit PRINT# instruction with expression value and handle
-    // The handle is passed in Src2 so the VM knows which file to write to
+    // Dest = value to print, Src1 = file handle
     if ExprVal.Kind in [svkConstFloat, svkConstInt] then
     begin
       ExprReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
@@ -6247,17 +6529,19 @@ begin
     end
     else
     begin
+      // Variable or expression - emit directly (type is preserved in register)
       EmitInstruction(ssaPrintFile, ExprVal, HandleReg,
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
   end;
 
   // Check if we need a newline at the end
-  // If the last child is not a separator, add newline
+  // If the last child is not a separator, add newline TO THE FILE (not screen)
   if (Node.ChildCount > 1) and (Node.GetChild(Node.ChildCount - 1).NodeType <> antSeparator) then
   begin
-    EmitInstruction(ssaPrintNewLine, MakeSSAValue(svkNone),
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // Use ssaPrintFileNewLine with handle in Src1 to write CR to the file
+    EmitInstruction(ssaPrintFileNewLine, MakeSSAValue(svkNone),
+                   HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 end;
 
@@ -6266,6 +6550,8 @@ var
   HandleVal, HandleReg, ExprVal, ExprReg: TSSAValue;
   HandleChild, Child: TASTNode;
   i: Integer;
+  HandleStr: string;
+  HandleNum: Integer;
 begin
   if FCurrentBlock = nil then Exit;
 
@@ -6291,9 +6577,22 @@ begin
   end
   else if HandleChild.NodeType = antIdentifier then
   begin
-    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // Check if this is a "#N" style handle (lexer merged # and number)
+    HandleStr := VarToStr(HandleChild.Value);
+    if (Length(HandleStr) > 1) and (HandleStr[1] = '#') and
+       (HandleStr[2] in ['0'..'9']) then
+    begin
+      HandleNum := StrToIntDef(Copy(HandleStr, 2, Length(HandleStr) - 1), 1);
+      HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+    begin
+      HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
   end
   else
   begin
@@ -6819,12 +7118,13 @@ end;
 
 procedure TSSAGenerator.ProcessScratch(Node: TASTNode);
 var
-  PatternVal, ForceVal: TSSAValue;
-  PatternReg, ForceReg: TSSAValue;
+  PatternVal, FlagsVal: TSSAValue;
+  PatternReg, FlagsReg: TSSAValue;
 begin
   if FCurrentBlock = nil then Exit;
 
-  // SCRATCH "pattern" [, force]
+  // SCRATCH "pattern" [, flags]
+  // flags: 1 = silent (no ?FILE NOT FOUND), 2 = force (no confirmation), 3 = both
   if Node.ChildCount < 1 then
   begin
     raise Exception.Create('SCRATCH requires a file pattern');
@@ -6834,20 +7134,20 @@ begin
   ProcessExpression(Node.GetChild(0), PatternVal);
   PatternReg := EnsureStringRegister(PatternVal);
 
-  // Process optional force flag (default 0)
+  // Process optional flags (default 0)
   if Node.ChildCount > 1 then
   begin
-    ProcessExpression(Node.GetChild(1), ForceVal);
-    ForceReg := EnsureIntRegister(ForceVal);
+    ProcessExpression(Node.GetChild(1), FlagsVal);
+    FlagsReg := EnsureIntRegister(FlagsVal);
   end
   else
   begin
-    ForceReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, ForceReg, MakeSSAConstInt(0),
+    FlagsReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, FlagsReg, MakeSSAConstInt(0),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
-  EmitInstruction(ssaScratch, MakeSSAValue(svkNone), PatternReg, ForceReg,
+  EmitInstruction(ssaScratch, MakeSSAValue(svkNone), PatternReg, FlagsReg,
                  MakeSSAValue(svkNone));
 end;
 
@@ -7441,6 +7741,9 @@ begin
     antInputFile: ProcessInputFile(Node);
     antPrintFile: ProcessPrintFile(Node);
     antCmd: ProcessCmd(Node);
+    antAppend: ProcessAppend(Node);
+    antDclear: ProcessDclear(Node);
+    antRecord: ProcessRecord(Node);
     // Sprite commands
     antSprite: ProcessSprite(Node);
     antMovspr: ProcessMovspr(Node);

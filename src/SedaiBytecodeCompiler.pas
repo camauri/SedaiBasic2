@@ -267,6 +267,7 @@ begin
     ssaLoadTIS: Result := bcLoadTIS;
     ssaStoreTIS: Result := bcStoreTIS;
     ssaLoadDTS: Result := bcLoadDTS;
+    ssaLoadCWDS: Result := bcLoadCWDS;
     ssaLoadEL: Result := bcLoadEL;
     ssaLoadER: Result := bcLoadER;
     ssaLoadERRS: Result := bcLoadERRS;
@@ -297,6 +298,15 @@ begin
     ssaDclose: Result := bcDclose;
     ssaOpen: Result := bcOpen;
     ssaClose: Result := bcClose;
+    ssaAppend: Result := bcAppend;
+    ssaDclear: Result := bcDclear;
+    ssaRecord: Result := bcRecord;
+    // File data I/O
+    ssaGetFile: Result := bcGetFile;
+    ssaInputFile: Result := bcInputFile;
+    ssaPrintFile: Result := bcPrintFile;
+    ssaPrintFileNewLine: Result := bcPrintFileNewLine;
+    ssaCmd: Result := bcCmd;
     // Sprite commands
     ssaSprite: Result := bcSprite;
     ssaMovsprAbs: Result := bcMovsprAbs;
@@ -1192,6 +1202,50 @@ begin
     Exit;
   end;
 
+  // Special handling for PRINT# - select type-specific opcode based on register type
+  if Instr.OpCode = ssaPrintFile then
+  begin
+    // Dest = value to print, Src1 = file handle
+    if Instr.Dest.Kind = svkRegister then
+    begin
+      case Instr.Dest.RegType of
+        srtInt: BCOp := bcPrintFileInt;
+        srtFloat: BCOp := bcPrintFileFloat;
+        srtString: BCOp := bcPrintFile;
+      else
+        BCOp := bcPrintFile;
+      end;
+      BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
+      if Instr.Src1.Kind = svkRegister then
+        BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+      FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+      Exit;
+    end;
+  end;
+
+  // Special handling for INPUT# - select type-specific opcode based on variable type
+  if Instr.OpCode = ssaInputFile then
+  begin
+    // Dest = variable to store result, Src1 = file handle
+    if Instr.Dest.Kind = svkRegister then
+    begin
+      case Instr.Dest.RegType of
+        srtInt: BCOp := bcInputFileInt;
+        srtFloat: BCOp := bcInputFileFloat;
+        srtString: BCOp := bcInputFile;
+      else
+        BCOp := bcInputFile;
+      end;
+      BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
+      if Instr.Src1.Kind = svkRegister then
+        BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+      FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+      Exit;
+    end;
+  end;
+
   // Special handling for GET and GETKEY
   if Instr.OpCode in [ssaGet, ssaGetkey] then
   begin
@@ -1349,7 +1403,16 @@ begin
   else if Instr.Src1.Kind = svkArrayRef then
     BCInstr.Src1 := Instr.Src1.ArrayIndex  // Array reference stores array index
   else if Instr.Src1.Kind = svkConstInt then
-    BCInstr.Immediate := Instr.Src1.ConstInt
+  begin
+    // For ssaLoadConstFloat with integer constant, convert to float first
+    if Instr.OpCode = ssaLoadConstFloat then
+    begin
+      FloatVal := Instr.Src1.ConstInt;  // Convert int to float
+      BCInstr.Immediate := Int64(Pointer(@FloatVal)^);
+    end
+    else
+      BCInstr.Immediate := Instr.Src1.ConstInt;
+  end
   else if Instr.Src1.Kind = svkConstFloat then
   begin
     FloatVal := Instr.Src1.ConstFloat;

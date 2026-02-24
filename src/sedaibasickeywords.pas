@@ -104,6 +104,9 @@ const
   kTIS     = 'TI$';
   kDTS     = 'DT$';
 
+  // filesystem
+  kCWDS    = 'CWD$';
+
   // File handling
   kAPPEND  = 'APPEND';
   kBLOAD   = 'BLOAD';

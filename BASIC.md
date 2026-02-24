@@ -133,11 +133,11 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 |---------|--------|-------------|
 | `CMD` | ✓ | Redirect screen output to file |
 
-## DOS Commands (23/29 - 79%)
+## DOS Commands (26/29 - 90%)
 
 | Command | Status | Description |
 |---------|--------|-------------|
-| `APPEND` | ✗ | Append data to sequential file |
+| `APPEND` | ✓ | Append data to sequential file |
 | `BACKUP` | ✗ | Copy disk content to another disk |
 | `BLOAD` | ✓ | Load bytecode file (.basc) |
 | `BOOT` | ✓ | Load and execute bytecode file (BLOAD + RUN) |
@@ -148,7 +148,7 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `CHDIR` | ✓ | Change current directory (alias: CD) |
 | `CONCAT` | ✓ | Concatenate files - append source to destination |
 | `COPY` | ✓ | Copy file(s) with wildcard support (alias: CP) |
-| `DCLEAR` | ✗ | Clear all open channels on disk drive |
+| `DCLEAR` | ✓ | Clear all open channels on disk drive |
 | `DCLOSE` | ✓ | Close disk file |
 | `DIR` | ✓ | Display drive directory (alias for DIRECTORY) |
 | `DIRECTORY` | ✓ | Display drive directory |
@@ -159,7 +159,7 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `HEADER` | ✗ | Formats a diskette |
 | `LOAD` | ✓ | Load program |
 | `OPEN` | ✓ | Open file for input/output (alias for DOPEN) |
-| `RECORD` | ✗ | Position relative file pointer |
+| `RECORD` | ✓ | Position relative file pointer |
 | `MKDIR` | ✓ | Create directory (alias: MD) |
 | `MOVE` | ✓ | Move file (alias: MV) |
 | `RENAME` | ✓ | Rename file (RENAME oldname newname) |
@@ -280,6 +280,7 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 |----------|--------|-------------|
 | `DS` | ✗ | Get disk status code |
 | `DS$` | ✗ | Get disk status message |
+| `CWD$` | ✓ | Get current working directory (read-only) |
 | `DT$` | ✓ | Get current date (YYYYMMDD format, read-only) |
 | `EL` | ✓ | Return last error line |
 | `ER` | ✓ | Return last error code |
@@ -424,6 +425,82 @@ CLOSE #handle
 ```
 
 **Note:** CLOSE is an alias for DCLOSE. Both commands have identical behavior.
+
+### APPEND - Append Data to File
+
+Appends string data to an open file.
+
+**Syntax:**
+```basic
+APPEND #handle, expression
+```
+
+**Parameters:**
+- `handle` - File handle number (1-15) previously opened with DOPEN/OPEN
+- `expression` - String expression to append to the file
+
+**Examples:**
+```basic
+10 DOPEN #1, "log.txt", "A"
+20 APPEND #1, "New log entry"
+30 APPEND #1, CHR$(13) + CHR$(10)
+40 DCLOSE #1
+```
+
+**Notes:**
+- APPEND is functionally similar to PRINT# but provides a clearer semantic for appending data
+- The file should be opened in append mode ("A") or write mode ("W")
+
+### DCLEAR - Close All File Handles
+
+Closes all open file handles at once.
+
+**Syntax:**
+```basic
+DCLEAR
+```
+
+**Examples:**
+```basic
+10 DOPEN #1, "file1.txt", "R"
+20 DOPEN #2, "file2.txt", "W"
+30 REM ... work with files ...
+40 DCLEAR
+50 REM All files are now closed
+```
+
+**Notes:**
+- Useful for cleanup or error recovery
+- Equivalent to calling DCLOSE for each open handle
+
+### RECORD - Seek File Position
+
+Positions the file pointer to a specific byte offset within an open file.
+
+**Syntax:**
+```basic
+RECORD #handle, position
+```
+
+**Parameters:**
+- `handle` - File handle number (1-15) previously opened with DOPEN/OPEN
+- `position` - Byte offset from the beginning of the file (0-based)
+
+**Examples:**
+```basic
+10 DOPEN #1, "data.bin", "RW"
+20 RECORD #1, 100
+30 INPUT# 1, A$
+40 PRINT "Data at position 100: "; A$
+50 RECORD #1, 0
+60 REM Back to beginning
+70 DCLOSE #1
+```
+
+**Notes:**
+- Position 0 is the beginning of the file
+- The file must be opened in a mode that supports seeking (typically "R", "RW")
+- Use LOF() function to get the file length before seeking
 
 ### GET# - Get Character from File
 

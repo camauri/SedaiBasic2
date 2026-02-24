@@ -134,6 +134,7 @@ type
     FGraphicsTexture: PSDL_Texture;
     // SDL2 texture for persistent text rendering (dirty tracking optimization)
     FTextTexture: PSDL_Texture;
+    FScrollTexture: PSDL_Texture;  // Scratch texture for hardware scroll
     FTextTextureDirty: Boolean;  // True when texture needs full rebuild
     FLastBorderColorIndex: Byte; // Track border color changes
     // Track if SDL was successfully initialized (for cleanup)
@@ -412,6 +413,7 @@ type
     // Dirty tracking for efficient rendering
     FRowDirty: array of Boolean;   // Per-row dirty flags
     FAllDirty: Boolean;            // True = redraw everything
+    FScrollPending: Boolean;       // True = hardware scroll needed (shift texture up)
 
     // View window for hardware-like scrolling (scroll = shift view, not data)
     FFirstVisibleRow: Integer;     // Which buffer row is at screen top (for hardware scroll)
@@ -461,6 +463,7 @@ type
     function GetCurrentLine: string;
     function GetCharAtCursor: Char;  // Returns char under cursor (or space)
     function GetCell(Row, Col: Integer): TTextCell;  // Get cell with color attributes
+    function GetViewCell(Row, Col: Integer): TTextCell;  // Get cell considering scrollback offset
     procedure SetCell(Row, Col: Integer; const Cell: TTextCell);  // Set cell with color attributes
     function GetCharAt(Col, Row: Integer): Byte;  // Get character at position (PETSCII)
     procedure SetCharAt(Col, Row: Integer; Ch: Byte);  // Set character at position (PETSCII)
@@ -504,6 +507,7 @@ type
     property WindowCol2: Integer read FWindowCol2;
     property WindowRow2: Integer read FWindowRow2;
     property AllDirty: Boolean read FAllDirty;  // True if full redraw needed
+    property ScrollPending: Boolean read FScrollPending write FScrollPending;  // Hardware scroll needed
     function GetScrollbackCount: Integer;
   end;
 
@@ -629,9 +633,12 @@ type
     FVideoController: TVideoController;
     FRenderScreenProc: TRenderScreenProc;  // Callback for RenderScreen
     FInitialized: Boolean;
+    FSuppressPresent: Boolean;  // When true, skip Present calls (for batch output)
   public
     constructor Create(ATextBuffer: TTextBuffer; AVideoController: TVideoController);
     procedure SetRenderCallback(AProc: TRenderScreenProc);
+    procedure BeginBatchOutput;  // Suppress Present calls for batch output
+    procedure EndBatchOutput;    // Resume Present calls and render once
 
     // IOutputDevice implementation
     function Initialize(const Title: string = ''; Width: Integer = 80; Height: Integer = 25): Boolean;
@@ -784,6 +791,11 @@ type
     FLastErrorCode: Integer;      // ER - error code of last error (0 = none)
     FLastErrorMessage: string;    // ERR$ - error message of last error
 
+    // File I/O for DOPEN/DCLOSE/PRINT#/INPUT#/GET#
+    FFileHandles: array[1..15] of TFileStream;  // Open file handles (BASIC uses 1-15)
+    FFileNames: array[1..15] of string;         // Filenames for open handles
+    FFileModes: array[1..15] of string;         // Access mode for open handles
+
     procedure ShowSplashScreen;
     function GetSystemInfo: string;
     function GetArchitecture: string;
@@ -804,13 +816,21 @@ type
     procedure ExecuteSave(const Filename: string);
     function ExecuteDirectory(const Pattern: string): TStringList;
     procedure ExecuteCopy(const Source, Dest: string; Overwrite: Boolean);
-    procedure ExecuteScratch(const Pattern: string; Force: Boolean);
+    procedure ExecuteScratch(const Pattern: string; Force: Boolean; Silent: Boolean = False);
     procedure ExecuteRename(const OldName, NewName: string);
     procedure ExecuteVerify(const Filename: string);
     procedure ExecuteBLoad(const Filename: string);
     procedure ExecuteBSave(const Filename: string);
     function AskYesNo(const Prompt: string): Boolean;
     function AskYesNoAll(const Prompt: string; var OverwriteAll: Boolean): Boolean;
+
+    // Disk file I/O handlers for VM (DOPEN/DCLOSE/GET#/INPUT#/PRINT#)
+    procedure HandleDiskFile(Sender: TBytecodeVM; const Command: string;
+      Handle: Integer; const HandleName, Filename, Mode: string;
+      var ErrorCode: Integer);
+    procedure HandleFileData(Sender: TBytecodeVM; const Command: string;
+      Handle: Integer; var Data: string; var ErrorCode: Integer);
+    procedure CloseAllFileHandles;
 
     // History file support
     function GetHistoryFilePath: string;
@@ -879,6 +899,7 @@ begin
   FGraphicsMemory := nil;
   FGraphicsTexture := nil;
   FTextTexture := nil;
+  FScrollTexture := nil;
   FTextTextureDirty := True;
   FLastBorderColorIndex := 255;  // Force initial border draw
   FSDLInitialized := False;
@@ -1575,6 +1596,7 @@ var
   Surface: PSDL_Surface;
   CharTexture: PSDL_Texture;
   DestRect, CellBGRect, RowBGRect, ViewportRect: TSDL_Rect;
+  ScrollSrcRect, ScrollDstRect: TSDL_Rect;  // For hardware scroll
   CellTextColor, CellBGColor, ScreenBG, BorderColor: TSDL_Color;
   CharStr: string;
   EffectiveFG, EffectiveBG: Byte;
@@ -1626,7 +1648,7 @@ begin
         RenderX := FViewportX;
         for Col := 0 to ATextBuffer.Cols - 1 do
         begin
-          Cell := ATextBuffer.GetCell(Row, Col);
+          Cell := ATextBuffer.GetViewCell(Row, Col);
 
           // Skip spaces (background already cleared)
           if Cell.Ch <> ' ' then
@@ -1692,6 +1714,45 @@ begin
     end
     else
     begin
+      // Set render target to text texture for partial update
+      SDL_SetRenderTarget(FRenderer, FTextTexture);
+
+      // Hardware scroll: if scroll pending, shift texture content up by one row
+      if ATextBuffer.ScrollPending and Assigned(FScrollTexture) then
+      begin
+        // Step 1: Copy viewport from main texture to scratch (excluding top row)
+        ScrollSrcRect.x := FViewportX;
+        ScrollSrcRect.y := FViewportY + FCharHeight;  // Start from row 1
+        ScrollSrcRect.w := FViewportWidth;
+        ScrollSrcRect.h := FViewportHeight - FCharHeight;
+        ScrollDstRect.x := 0;
+        ScrollDstRect.y := 0;
+        ScrollDstRect.w := FViewportWidth;
+        ScrollDstRect.h := FViewportHeight - FCharHeight;
+        // Copy to scratch texture
+        SDL_SetRenderTarget(FRenderer, FScrollTexture);
+        SDL_RenderCopy(FRenderer, FTextTexture, @ScrollSrcRect, @ScrollDstRect);
+
+        // Step 2: Copy back from scratch to main texture at offset 0
+        SDL_SetRenderTarget(FRenderer, FTextTexture);
+        ScrollSrcRect.x := 0;
+        ScrollSrcRect.y := 0;
+        ScrollDstRect.x := FViewportX;
+        ScrollDstRect.y := FViewportY;
+        SDL_RenderCopy(FRenderer, FScrollTexture, @ScrollSrcRect, @ScrollDstRect);
+
+        // Step 3: Clear the bottom row (will be redrawn by partial update)
+        RowBGRect.x := FViewportX;
+        RowBGRect.y := FViewportY + FViewportHeight - FCharHeight;
+        RowBGRect.w := FViewportWidth;
+        RowBGRect.h := FCharHeight;
+        SDL_SetRenderDrawColor(FRenderer, ScreenBG.r, ScreenBG.g, ScreenBG.b, 255);
+        SDL_RenderFillRect(FRenderer, @RowBGRect);
+
+        // Reset scroll flag
+        ATextBuffer.ScrollPending := False;
+      end;
+
       // Partial update: only render dirty rows (at viewport offset)
       RenderY := FViewportY;
       for Row := 0 to ATextBuffer.Rows - 1 do
@@ -1710,7 +1771,7 @@ begin
           RenderX := FViewportX;
           for Col := 0 to ATextBuffer.Cols - 1 do
           begin
-            Cell := ATextBuffer.GetCell(Row, Col);
+            Cell := ATextBuffer.GetViewCell(Row, Col);
 
             if Cell.Ch <> ' ' then
             begin
@@ -3232,10 +3293,26 @@ begin
     WriteLn('ERROR: Failed to create text texture: ', SDL_GetError)
   else
     FTextTextureDirty := True;  // Force initial full render
+
+  // Create scroll scratch texture (same size as viewport area)
+  FScrollTexture := SDL_CreateTexture(
+    FRenderer,
+    SDL_PIXELFORMAT_RGBA8888,
+    SDL_TEXTUREACCESS_TARGET,
+    FViewportWidth,
+    FViewportHeight
+  );
+  if FScrollTexture = nil then
+    WriteLn('WARNING: Failed to create scroll texture: ', SDL_GetError);
 end;
 
 procedure TVideoController.DestroyTextTexture;
 begin
+  if FScrollTexture <> nil then
+  begin
+    SDL_DestroyTexture(FScrollTexture);
+    FScrollTexture := nil;
+  end;
   if FTextTexture <> nil then
   begin
     SDL_DestroyTexture(FTextTexture);
@@ -3356,7 +3433,7 @@ end;
 
 constructor TTextBuffer.Create(Rows, Cols: Integer);
 const
-  SCROLLBACK_CAPACITY = 2500;  // 100 pages @25 rows or 50 pages @50 rows
+  SCROLLBACK_CAPACITY = 10000;  // ~400 pages @25 rows (like PowerShell/Bash)
 var
   r, c: Integer;
 begin
@@ -3381,6 +3458,7 @@ begin
   for r := 0 to Rows - 1 do
     FRowDirty[r] := False;
   FAllDirty := True;  // First render draws everything
+  FScrollPending := False;
 
   FCursorX := 0;
   FCursorY := 0;
@@ -3520,6 +3598,31 @@ begin
     Result.BGIndex := FCurrentBGIndex;
     Result.Reverse := False;
   end;
+end;
+
+function TTextBuffer.GetViewCell(Row, Col: Integer): TTextCell;
+var
+  Line: string;
+begin
+  // If not in scrollback mode, use normal GetCell
+  if FViewOffset = 0 then
+  begin
+    Result := GetCell(Row, Col);
+    Exit;
+  end;
+
+  // In scrollback mode, get line from scrollback buffer
+  Line := GetViewLine(Row);
+  if (Col >= 0) and (Col < Length(Line)) then
+    Result.Ch := Line[Col + 1]
+  else
+    Result.Ch := ' ';
+
+  // Use default colors for scrollback (no color info stored)
+  Result.FGIndex := FCurrentFGIndex;
+  Result.BGIndex := FCurrentBGIndex;
+  Result.Reverse := False;
+  Result.Dirty := False;
 end;
 
 procedure TTextBuffer.SetCell(Row, Col: Integer; const Cell: TTextCell);
@@ -3788,9 +3891,9 @@ begin
     FCells[FWindowRow2][c].Reverse := FCurrentReverse;
   end;
 
-  // Mark all window rows dirty (TODO: implement hardware scroll to avoid full redraw)
-  for r := FWindowRow1 to FWindowRow2 do
-    MarkRowDirty(r);
+  // Mark all rows dirty for full redraw after scroll
+  // Hardware scroll optimization disabled for now - needs debugging
+  FAllDirty := True;
 
   // If we were viewing scrollback, adjust offset to maintain view position
   if FViewOffset > 0 then
@@ -4172,6 +4275,7 @@ begin
   {$IFDEF DEBUG_CONSOLE}
   WriteLn('[DEBUG] ScrollViewUp: NewOffset=', FViewOffset);
   {$ENDIF}
+  MarkAllDirty;
 end;
 
 procedure TTextBuffer.ScrollViewDown(NumLines: Integer);
@@ -4179,11 +4283,13 @@ begin
   FViewOffset := FViewOffset - NumLines;
   if FViewOffset < 0 then
     FViewOffset := 0;
+  MarkAllDirty;
 end;
 
 procedure TTextBuffer.ScrollToEnd;
 begin
   FViewOffset := 0;
+  MarkAllDirty;
 end;
 
 procedure TTextBuffer.ScrollToStart;
@@ -4531,11 +4637,24 @@ begin
   FVideoController := AVideoController;
   FRenderScreenProc := nil;
   FInitialized := True;
+  FSuppressPresent := False;
 end;
 
 procedure TConsoleOutputAdapter.SetRenderCallback(AProc: TRenderScreenProc);
 begin
   FRenderScreenProc := AProc;
+end;
+
+procedure TConsoleOutputAdapter.BeginBatchOutput;
+begin
+  FSuppressPresent := True;
+end;
+
+procedure TConsoleOutputAdapter.EndBatchOutput;
+begin
+  FSuppressPresent := False;
+  // Render once at the end of batch
+  Present;
 end;
 
 function TConsoleOutputAdapter.Initialize(const Title: string; Width, Height: Integer): Boolean;
@@ -4634,6 +4753,9 @@ end;
 
 procedure TConsoleOutputAdapter.Present;
 begin
+  // Skip rendering during batch output (reduces slowdowns during I/O operations)
+  if FSuppressPresent then
+    Exit;
   // First render the TextBuffer content to screen via callback
   if Assigned(FRenderScreenProc) then
     FRenderScreenProc();
@@ -4869,6 +4991,8 @@ end;
 
 procedure TConsoleOutputAdapter.SetFastMode(Enabled: Boolean);
 begin
+  // FAST mode now also suppresses Present calls for better performance
+  FSuppressPresent := Enabled;
   if Assigned(FVideoController) then
     FVideoController.SetFastMode(Enabled);
 end;
@@ -5084,6 +5208,8 @@ end;
 { TSedaiNewConsole }
 
 constructor TSedaiNewConsole.Create;
+var
+  I: Integer;
 begin
   inherited Create;
   FVideoController := TVideoController.Create;
@@ -5111,6 +5237,9 @@ begin
   // Create and set memory mapper for PEEK/POKE support
   FMemoryMapper := TC128MemoryMapper.Create(FVideoController, nil);
   FBytecodeVM.SetMemoryMapper(FMemoryMapper as IMemoryMapper);
+  // Set disk file I/O handlers for DOPEN/DCLOSE/PRINT#/INPUT#/GET#
+  FBytecodeVM.OnDiskFile := @HandleDiskFile;
+  FBytecodeVM.OnFileData := @HandleFileData;
 
   FImmediateCompiler := TImmediateCompiler.Create;
 
@@ -5135,10 +5264,21 @@ begin
   FLastErrorLine := 0;
   FLastErrorCode := 0;
   FLastErrorMessage := '';
+
+  // Initialize file handles (all closed)
+  for I := 1 to 15 do
+  begin
+    FFileHandles[I] := nil;
+    FFileNames[I] := '';
+    FFileModes[I] := '';
+  end;
 end;
 
 destructor TSedaiNewConsole.Destroy;
 begin
+  // Close all open file handles
+  CloseAllFileHandles;
+
   // Save command history to file
   SaveHistory;
 
@@ -5669,7 +5809,7 @@ var
   CopySrc, CopyDst: string;
   CopyOverwrite: Boolean;
   ScratchPattern: string;
-  ScratchForce: Boolean;
+  ScratchForce, ScratchSilent: Boolean;
   RenameOld, RenameNew: string;
   HistDir, HistPath: string;
   F: TextFile;
@@ -5710,6 +5850,8 @@ begin
           if FBytecodeMode then
           begin
             FTextBuffer.PutString('?BYTECODE LOADED - NEW TO CLEAR');
+            FTextBuffer.NewLine;
+            FTextBuffer.PutString('READY.');
             FTextBuffer.NewLine;
           end
           else
@@ -5756,8 +5898,13 @@ begin
               if not Assigned(BytecodeProgram) then
               begin
                 // Compilation failed - show error
+                // Note: LastErrorVerbose preserved for future OPTION command
                 {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: Compilation error: ', FImmediateCompiler.LastError);{$ENDIF}
-                FTextBuffer.PutString('?SYNTAX ERROR');
+                if FImmediateCompiler.LastErrorColumn > 0 then
+                  FTextBuffer.PutString(Format('?%s AT COLUMN %d',
+                    [FImmediateCompiler.LastError, FImmediateCompiler.LastErrorColumn]))
+                else
+                  FTextBuffer.PutString('?' + FImmediateCompiler.LastError);
                 FTextBuffer.NewLine;
               end
               else
@@ -5793,9 +5940,11 @@ begin
             except
               on E: Exception do
               begin
-                // Catch any unexpected exceptions
+                // Catch any unexpected exceptions - show error message
                 {$IFDEF DEBUG_CONSOLE}WriteLn('ERROR: Exception in immediate command: ', E.ClassName, ' - ', E.Message);{$ENDIF}
                 FTextBuffer.PutString('?SYNTAX ERROR');
+                FTextBuffer.NewLine;
+                FTextBuffer.PutString(E.Message);
                 FTextBuffer.NewLine;
                 FTextBuffer.NewLine;
                 FTextBuffer.PutString('READY.');
@@ -5857,8 +6006,38 @@ begin
                     BytecodeProgram := FImmediateCompiler.CompileProgram(ProgramSource);
                     if not Assigned(BytecodeProgram) then
                     begin
-                      FTextBuffer.PutString('?SYNTAX ERROR IN PROGRAM');
+                      // ?SYNTAX ERROR IN <line> (<line>:<col>)
+                      if FImmediateCompiler.LastErrorLine > 0 then
+                      begin
+                        if FImmediateCompiler.LastErrorColumn > 0 then
+                          FTextBuffer.PutString(Format('?%s IN %d (%d:%d)',
+                            [FImmediateCompiler.LastError, FImmediateCompiler.LastErrorLine,
+                             FImmediateCompiler.LastErrorLine, FImmediateCompiler.LastErrorColumn]))
+                        else
+                          FTextBuffer.PutString(Format('?%s IN %d', [FImmediateCompiler.LastError, FImmediateCompiler.LastErrorLine]));
+                      end
+                      else
+                        FTextBuffer.PutString('?' + FImmediateCompiler.LastError);
                       FTextBuffer.NewLine;
+                      // Show READY. then line ready for editing
+                      FTextBuffer.PutString('READY.');
+                      FTextBuffer.NewLine;
+                      if FImmediateCompiler.LastErrorLine > 0 then
+                      begin
+                        Statement := FProgramMemory.GetLineText(FImmediateCompiler.LastErrorLine);
+                        if Statement <> '' then
+                        begin
+                          Statement := IntToStr(FImmediateCompiler.LastErrorLine) + ' ' + Statement;
+                          FTextBuffer.PutString(Statement);
+                          if FImmediateCompiler.LastErrorColumn > 0 then
+                            FTextBuffer.CursorX := FImmediateCompiler.LastErrorColumn - 1;
+                          FUserHasTyped := True;
+                          RenderScreen;
+                          UpdateCursor;
+                          FVideoController.Present;
+                          Exit;
+                        end;
+                      end;
                     end
                     else
                     begin
@@ -5949,8 +6128,41 @@ begin
                   if not Assigned(BytecodeProgram) then
                   begin
                     {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: Program compilation error: ', FImmediateCompiler.LastError);{$ENDIF}
-                    FTextBuffer.PutString('?SYNTAX ERROR IN PROGRAM');
+                    // ?SYNTAX ERROR IN <line> (<line>:<col>)
+                    // Note: LastErrorVerbose preserved for future OPTION command
+                    if FImmediateCompiler.LastErrorLine > 0 then
+                    begin
+                      if FImmediateCompiler.LastErrorColumn > 0 then
+                        FTextBuffer.PutString(Format('?%s IN %d (%d:%d)',
+                          [FImmediateCompiler.LastError, FImmediateCompiler.LastErrorLine,
+                           FImmediateCompiler.LastErrorLine, FImmediateCompiler.LastErrorColumn]))
+                      else
+                        FTextBuffer.PutString(Format('?%s IN %d', [FImmediateCompiler.LastError, FImmediateCompiler.LastErrorLine]));
+                    end
+                    else
+                      FTextBuffer.PutString('?' + FImmediateCompiler.LastError);
                     FTextBuffer.NewLine;
+                    // Show READY. then line with error for editing
+                    FTextBuffer.PutString('READY.');
+                    FTextBuffer.NewLine;
+                    if FImmediateCompiler.LastErrorLine > 0 then
+                    begin
+                      Statement := FProgramMemory.GetLineText(FImmediateCompiler.LastErrorLine);
+                      if Statement <> '' then
+                      begin
+                        // Build full line with line number and put it at prompt
+                        Statement := IntToStr(FImmediateCompiler.LastErrorLine) + ' ' + Statement;
+                        FTextBuffer.PutString(Statement);
+                        // Position cursor at error column (accounting for line number prefix)
+                        if FImmediateCompiler.LastErrorColumn > 0 then
+                          FTextBuffer.CursorX := FImmediateCompiler.LastErrorColumn - 1;
+                        FUserHasTyped := True;
+                        RenderScreen;
+                        UpdateCursor;
+                        FVideoController.Present;
+                        Exit;
+                      end;
+                    end;
                   end
                   else
                   begin
@@ -6010,6 +6222,8 @@ begin
             begin
               FTextBuffer.PutString('?BYTECODE LOADED - NO SOURCE');
               FTextBuffer.NewLine;
+              FTextBuffer.PutString('READY.');
+              FTextBuffer.NewLine;
             end
             else
             begin
@@ -6038,6 +6252,8 @@ begin
                 begin
                   FTextBuffer.PutString('?SYNTAX ERROR');
                   FTextBuffer.NewLine;
+                  FTextBuffer.PutString('READY.');
+                  FTextBuffer.NewLine;
                   Lines := nil;
                 end;
               end
@@ -6050,6 +6266,8 @@ begin
                 begin
                   FTextBuffer.PutString('?SYNTAX ERROR');
                   FTextBuffer.NewLine;
+                  FTextBuffer.PutString('READY.');
+                  FTextBuffer.NewLine;
                   Lines := nil;
                 end;
               end
@@ -6061,6 +6279,8 @@ begin
                 else
                 begin
                   FTextBuffer.PutString('?SYNTAX ERROR');
+                  FTextBuffer.NewLine;
+                  FTextBuffer.PutString('READY.');
                   FTextBuffer.NewLine;
                   Lines := nil;
                 end;
@@ -6076,6 +6296,8 @@ begin
                 else
                 begin
                   FTextBuffer.PutString('?SYNTAX ERROR');
+                  FTextBuffer.NewLine;
+                  FTextBuffer.PutString('READY.');
                   FTextBuffer.NewLine;
                   Lines := nil;
                 end;
@@ -6148,6 +6370,8 @@ begin
             begin
               FTextBuffer.PutString('?BYTECODE LOADED - NO SOURCE');
               FTextBuffer.NewLine;
+              FTextBuffer.PutString('READY.');
+              FTextBuffer.NewLine;
             end
             else
             begin
@@ -6175,11 +6399,15 @@ begin
                 begin
                   FTextBuffer.PutString('?LINE NOT FOUND');
                   FTextBuffer.NewLine;
+                  FTextBuffer.PutString('READY.');
+                  FTextBuffer.NewLine;
                 end;
               end
               else
               begin
                 FTextBuffer.PutString('?SYNTAX ERROR');
+                FTextBuffer.NewLine;
+                FTextBuffer.PutString('READY.');
                 FTextBuffer.NewLine;
               end;
             end;
@@ -6190,6 +6418,8 @@ begin
             if FBytecodeMode then
             begin
               FTextBuffer.PutString('?BYTECODE LOADED - NO SOURCE');
+              FTextBuffer.NewLine;
+              FTextBuffer.PutString('READY.');
               FTextBuffer.NewLine;
             end
             else
@@ -6242,11 +6472,15 @@ begin
                 begin
                   FTextBuffer.PutString('?ILLEGAL QUANTITY');
                   FTextBuffer.NewLine;
+                  FTextBuffer.PutString('READY.');
+                  FTextBuffer.NewLine;
                 end;
               end
               else
               begin
                 FTextBuffer.PutString('?SYNTAX ERROR');
+                FTextBuffer.NewLine;
+                FTextBuffer.PutString('READY.');
                 FTextBuffer.NewLine;
               end;
             end;
@@ -6415,6 +6649,8 @@ begin
             begin
               FTextBuffer.PutString('?BYTECODE LOADED - USE BSAVE');
               FTextBuffer.NewLine;
+              FTextBuffer.PutString('READY.');
+              FTextBuffer.NewLine;
             end
             else
             begin
@@ -6428,6 +6664,8 @@ begin
             if FBytecodeMode then
             begin
               FTextBuffer.PutString('?BYTECODE LOADED');
+              FTextBuffer.NewLine;
+              FTextBuffer.PutString('READY.');
               FTextBuffer.NewLine;
             end
             else
@@ -6509,6 +6747,8 @@ begin
             if Statement = '' then
             begin
               FTextBuffer.PutString('?MISSING SOURCE AND DESTINATION');
+              FTextBuffer.NewLine;
+              FTextBuffer.PutString('READY.');
               FTextBuffer.NewLine;
             end
             else
@@ -6594,14 +6834,18 @@ begin
           end
           else if CmdWord = kSCRATCH then
           begin
-            // SCRATCH command - format: SCRATCH pattern [FORCE]
+            // SCRATCH command - format: SCRATCH pattern[,1] [FORCE]
+            // ,1 = silent mode (suppress ?FILE NOT FOUND)
             Statement := Trim(Copy(ParseResult.Statement, Length(kSCRATCH) + 1, MaxInt));
             ScratchPattern := '';
             ScratchForce := False;
+            ScratchSilent := False;
 
             if Statement = '' then
             begin
               FTextBuffer.PutString('?MISSING FILE PATTERN');
+              FTextBuffer.NewLine;
+              FTextBuffer.PutString('READY.');
               FTextBuffer.NewLine;
             end
             else
@@ -6619,12 +6863,17 @@ begin
                 begin
                   FTextBuffer.PutString('?MISSING CLOSING QUOTE');
                   FTextBuffer.NewLine;
+                  FTextBuffer.PutString('READY.');
+                  FTextBuffer.NewLine;
                 end;
               end
               else
               begin
-                // Unquoted - find space (for FORCE flag)
+                // Unquoted - find space or comma
                 j := Pos(' ', Statement);
+                i := Pos(',', Statement);
+                if (i > 0) and ((j = 0) or (i < j)) then
+                  j := i;  // Comma comes first
                 if j > 0 then
                 begin
                   ScratchPattern := Copy(Statement, 1, j - 1);
@@ -6637,12 +6886,18 @@ begin
                 end;
               end;
 
-              // Check for FORCE flag
+              // Check for ,1 (silent) and FORCE flags
+              // Statement now contains remaining text after pattern
+              if (Statement <> '') and (Statement[1] = '1') then
+              begin
+                ScratchSilent := True;
+                Statement := Trim(Copy(Statement, 2, MaxInt));
+              end;
               if UpperCase(Trim(Statement)) = 'FORCE' then
                 ScratchForce := True;
 
               if ScratchPattern <> '' then
-                ExecuteScratch(ScratchPattern, ScratchForce);
+                ExecuteScratch(ScratchPattern, ScratchForce, ScratchSilent);
             end;
           end
           else if CmdWord = kRENAME then
@@ -6897,9 +7152,9 @@ begin
             // Unknown system command
             FTextBuffer.PutString('?UNKNOWN COMMAND');
             FTextBuffer.NewLine;
+            FTextBuffer.PutString('READY.');
+            FTextBuffer.NewLine;
           end;
-
-          // Note: LIST doesn't show READY, only RUN and NEW do
         end;
     end;
 
@@ -7649,7 +7904,7 @@ begin
   end;
 end;
 
-procedure TSedaiNewConsole.ExecuteScratch(const Pattern: string; Force: Boolean);
+procedure TSedaiNewConsole.ExecuteScratch(const Pattern: string; Force: Boolean; Silent: Boolean);
 var
   SearchRec: TSearchRec;
   SrcPath, SrcPattern, SrcDir: string;
@@ -7763,8 +8018,12 @@ begin
   end
   else
   begin
-    FTextBuffer.PutString('?FILE NOT FOUND');
-    FTextBuffer.NewLine;
+    // Only show error if not in silent mode
+    if not Silent then
+    begin
+      FTextBuffer.PutString('?FILE NOT FOUND');
+      FTextBuffer.NewLine;
+    end;
   end;
 end;
 
@@ -8203,6 +8462,240 @@ begin
     Serializer.Free;
     Compiler.Free;
     SSAGen.Free;
+  end;
+end;
+
+procedure TSedaiNewConsole.HandleDiskFile(Sender: TBytecodeVM; const Command: string;
+  Handle: Integer; const HandleName, Filename, Mode: string;
+  var ErrorCode: Integer);
+var
+  FileMode: Word;
+  FullPath: string;
+begin
+  ErrorCode := 0;
+
+  // DCLEAR uses Handle=0 as signal to close all handles - handle it first
+  if Command = 'DCLEAR' then
+  begin
+    CloseAllFileHandles;
+    Exit;
+  end;
+
+  // Validate handle range for other commands
+  if (Handle < 1) or (Handle > 15) then
+  begin
+    ErrorCode := 64;  // FILE NOT OPEN error
+    Exit;
+  end;
+
+  if Command = 'DOPEN' then
+  begin
+    // Close existing handle if open
+    if Assigned(FFileHandles[Handle]) then
+    begin
+      FFileHandles[Handle].Free;
+      FFileHandles[Handle] := nil;
+      FFileNames[Handle] := '';
+      FFileModes[Handle] := '';
+    end;
+
+    // Resolve path
+    FullPath := Filename;
+    if not FileExists(FullPath) then
+    begin
+      // For write/append modes, we can create the file
+      if (Pos('W', UpperCase(Mode)) > 0) or (Pos('A', UpperCase(Mode)) > 0) then
+      begin
+        // File will be created
+      end
+      else
+      begin
+        ErrorCode := 62;  // FILE NOT FOUND
+        Exit;
+      end;
+    end;
+
+    // Determine file mode
+    if Pos('W', UpperCase(Mode)) > 0 then
+      FileMode := fmCreate
+    else if Pos('A', UpperCase(Mode)) > 0 then
+    begin
+      if FileExists(FullPath) then
+        FileMode := fmOpenReadWrite
+      else
+        FileMode := fmCreate;
+    end
+    else // Read mode (default)
+      FileMode := fmOpenRead or fmShareDenyNone;
+
+    try
+      FFileHandles[Handle] := TFileStream.Create(FullPath, FileMode);
+      FFileNames[Handle] := FullPath;
+      FFileModes[Handle] := UpperCase(Mode);
+
+      // For append mode, seek to end
+      if Pos('A', FFileModes[Handle]) > 0 then
+        FFileHandles[Handle].Seek(0, soEnd);
+    except
+      on E: EFOpenError do
+      begin
+        ErrorCode := 62;  // FILE NOT FOUND
+        FFileHandles[Handle] := nil;
+      end;
+      on E: EFCreateError do
+      begin
+        ErrorCode := 26;  // FILE CREATION ERROR
+        FFileHandles[Handle] := nil;
+      end;
+      on E: Exception do
+      begin
+        ErrorCode := 70;  // DISK ERROR
+        FFileHandles[Handle] := nil;
+      end;
+    end;
+  end
+  else if Command = 'DCLOSE' then
+  begin
+    if Assigned(FFileHandles[Handle]) then
+    begin
+      FFileHandles[Handle].Free;
+      FFileHandles[Handle] := nil;
+      FFileNames[Handle] := '';
+      FFileModes[Handle] := '';
+    end;
+    // Closing a non-open handle is not an error in C128 BASIC
+  end;
+end;
+
+procedure TSedaiNewConsole.HandleFileData(Sender: TBytecodeVM; const Command: string;
+  Handle: Integer; var Data: string; var ErrorCode: Integer);
+var
+  BytesRead: Integer;
+  Ch: Byte;
+  Line: string;
+begin
+  ErrorCode := 0;
+
+  // Validate handle range
+  if (Handle < 1) or (Handle > 15) then
+  begin
+    ErrorCode := 64;  // FILE NOT OPEN error
+    Exit;
+  end;
+
+  if not Assigned(FFileHandles[Handle]) then
+  begin
+    ErrorCode := 64;  // FILE NOT OPEN
+    Exit;
+  end;
+
+  if Command = 'GET#' then
+  begin
+    // Read one character
+    BytesRead := FFileHandles[Handle].Read(Ch, 1);
+    if BytesRead > 0 then
+      Data := Chr(Ch)
+    else
+      Data := '';  // EOF returns empty string
+  end
+  else if Command = 'INPUT#' then
+  begin
+    // Check for EOF before reading
+    if FFileHandles[Handle].Position >= FFileHandles[Handle].Size then
+    begin
+      ErrorCode := 62;  // FILE DATA ERROR - EOF reached
+      Data := '';
+      Exit;
+    end;
+    // Read a line (until CR, LF, or comma)
+    Line := '';
+    while FFileHandles[Handle].Position < FFileHandles[Handle].Size do
+    begin
+      FFileHandles[Handle].Read(Ch, 1);
+      if Ch in [10, 13] then  // LF or CR
+      begin
+        // Skip following LF after CR (Windows line endings)
+        if (Ch = 13) and (FFileHandles[Handle].Position < FFileHandles[Handle].Size) then
+        begin
+          FFileHandles[Handle].Read(Ch, 1);
+          if Ch <> 10 then
+            FFileHandles[Handle].Seek(-1, soCurrent);  // Put back non-LF
+        end;
+        Break;
+      end
+      else if Ch = Ord(',') then
+      begin
+        Break;  // Comma also terminates INPUT#
+      end
+      else
+        Line := Line + Chr(Ch);
+    end;
+    Data := Line;
+  end
+  else if Command = 'PRINT#' then
+  begin
+    // Write data to file
+    if Length(Data) > 0 then
+    begin
+      try
+        FFileHandles[Handle].Write(Data[1], Length(Data));
+      except
+        ErrorCode := 25;  // WRITE ERROR
+      end;
+    end;
+  end
+  else if Command = 'CMD' then
+  begin
+    // CMD redirects output - similar to PRINT#
+    if Length(Data) > 0 then
+    begin
+      try
+        FFileHandles[Handle].Write(Data[1], Length(Data));
+      except
+        ErrorCode := 25;  // WRITE ERROR
+      end;
+    end;
+  end
+  else if Command = 'APPEND' then
+  begin
+    // APPEND - write data to file (same as PRINT# but named differently for clarity)
+    if Length(Data) > 0 then
+    begin
+      try
+        FFileHandles[Handle].Write(Data[1], Length(Data));
+      except
+        ErrorCode := 25;  // WRITE ERROR
+      end;
+    end;
+  end
+  else if Command = 'RECORD' then
+  begin
+    // RECORD - seek to position in file
+    // Data contains the position as a string
+    try
+      FFileHandles[Handle].Position := StrToInt64(Data);
+    except
+      on E: EConvertError do
+        ErrorCode := 63;  // ILLEGAL QUANTITY
+      on E: Exception do
+        ErrorCode := 70;  // DISK ERROR
+    end;
+  end;
+end;
+
+procedure TSedaiNewConsole.CloseAllFileHandles;
+var
+  I: Integer;
+begin
+  for I := 1 to 15 do
+  begin
+    if Assigned(FFileHandles[I]) then
+    begin
+      FFileHandles[I].Free;
+      FFileHandles[I] := nil;
+      FFileNames[I] := '';
+      FFileModes[I] := '';
+    end;
   end;
 end;
 
@@ -8801,8 +9294,9 @@ begin
     begin
       {$IFDEF DEBUG_CONSOLE}WriteLn('[DEBUG] PgDown pressed, ShiftPressed=', FInputHandler.ShiftPressed, ' CtrlPressed=', FInputHandler.CtrlPressed);{$ENDIF}
     end
-    else if FInputHandler.HasChar then
+    else if FInputHandler.HasChar and (FInputHandler.LastChar >= ' ') then
     begin
+      // Only insert printable characters (>= space). Skip control chars like ESC (#27)
       // Exit scrollback mode if active - any typed character returns to prompt
       if FTextBuffer.IsInScrollbackMode then
         FTextBuffer.ScrollToEnd;

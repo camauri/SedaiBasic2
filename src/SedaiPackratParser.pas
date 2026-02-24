@@ -1365,7 +1365,7 @@ begin
     // Parse handle (number or expression)
     if Context.Check(ttNumber) or Context.Check(ttInteger) then
     begin
-      HandleNode := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+      HandleNode := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
       Result.AddChild(HandleNode);
       Context.Advance;
     end
@@ -2110,6 +2110,9 @@ begin
     // Disk file I/O with handle
     'DOPEN', 'OPEN': Result := TASTNode.Create(antDopen, Token);
     'DCLOSE', 'CLOSE': Result := TASTNode.Create(antDclose, Token);
+    'APPEND': Result := TASTNode.Create(antAppend, Token);
+    'DCLEAR': Result := TASTNode.Create(antDclear, Token);
+    'RECORD': Result := TASTNode.Create(antRecord, Token);
   else
     Result := TASTNode.Create(antStatement, Token); // Other file commands
   end;
@@ -2134,8 +2137,8 @@ begin
     // Parse handle (number or identifier)
     if Context.Check(ttNumber) or Context.Check(ttInteger) then
     begin
-      // Numeric handle: #1, #2, etc.
-      HandleNode := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+      // Numeric handle: #1, #2, etc. - convert string to integer for proper SSA handling
+      HandleNode := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
       Result.AddChild(HandleNode);
       Context.Advance;
     end
@@ -2179,6 +2182,102 @@ begin
       end;
     end;
     // DCLOSE/CLOSE only needs the handle, already parsed
+
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // Special handling for APPEND (append data to file)
+  // Syntax: APPEND #handle, expression
+  if CmdName = 'APPEND' then
+  begin
+    // Expect # prefix
+    if Context.Check(ttFileHandlePrefix) then
+      Context.Advance
+    else if Context.CurrentToken.Value = '#' then
+      Context.Advance;
+
+    // Parse handle
+    if Context.Check(ttNumber) or Context.Check(ttInteger) then
+    begin
+      HandleNode := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
+      Result.AddChild(HandleNode);
+      Context.Advance;
+    end
+    else if Context.Check(ttIdentifier) then
+    begin
+      HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(HandleNode);
+      Context.Advance;
+    end
+    else
+    begin
+      HandleError('Expected file handle after #', Token);
+      Exit;
+    end;
+
+    // Parse comma and data expression
+    if Context.Check(ttSeparParam) then
+      Context.Advance;
+
+    Param := ParseExpression;
+    if Assigned(Param) then
+      Result.AddChild(Param);
+
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // Special handling for DCLEAR (close all channels)
+  // Syntax: DCLEAR
+  if CmdName = 'DCLEAR' then
+  begin
+    // No parameters needed
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // Special handling for RECORD (seek file position)
+  // Syntax: RECORD #handle, position
+  if CmdName = 'RECORD' then
+  begin
+    // Expect # prefix
+    if Context.Check(ttFileHandlePrefix) then
+      Context.Advance
+    else if Context.CurrentToken.Value = '#' then
+      Context.Advance;
+
+    // Parse handle
+    if Context.Check(ttNumber) or Context.Check(ttInteger) then
+    begin
+      HandleNode := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
+      Result.AddChild(HandleNode);
+      Context.Advance;
+    end
+    else if Context.Check(ttIdentifier) then
+    begin
+      HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(HandleNode);
+      Context.Advance;
+    end
+    else
+    begin
+      HandleError('Expected file handle after #', Token);
+      Exit;
+    end;
+
+    // Parse comma and position expression
+    if Context.Check(ttSeparParam) then
+      Context.Advance;
+
+    Param := ParseExpression;
+    if Assigned(Param) then
+      Result.AddChild(Param)
+    else
+    begin
+      HandleError('Expected position after handle', Token);
+      Exit;
+    end;
 
     DoNodeCreated(Result);
     Exit;
@@ -2277,7 +2376,7 @@ begin
 
     if Context.Check(ttNumber) or Context.Check(ttInteger) then
     begin
-      HandleNode := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+      HandleNode := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
       Result.AddChild(HandleNode);
       Context.Advance;
     end
@@ -2326,7 +2425,7 @@ begin
 
     if Context.Check(ttNumber) or Context.Check(ttInteger) then
     begin
-      HandleNode := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+      HandleNode := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
       Result.AddChild(HandleNode);
       Context.Advance;
     end
@@ -2403,7 +2502,7 @@ begin
 
     if Context.Check(ttNumber) or Context.Check(ttInteger) then
     begin
-      HandleNode := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+      HandleNode := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
       Result.AddChild(HandleNode);
       Context.Advance;
     end
