@@ -413,7 +413,8 @@ type
     // Dirty tracking for efficient rendering
     FRowDirty: array of Boolean;   // Per-row dirty flags
     FAllDirty: Boolean;            // True = redraw everything
-    FScrollPending: Boolean;       // True = hardware scroll needed (shift texture up)
+    FScrollPending: Boolean;       // True = hardware scroll needed
+    FScrollDirection: Integer;     // +1 = scroll up (new lines), -1 = scroll down (scrollback)
 
     // View window for hardware-like scrolling (scroll = shift view, not data)
     FFirstVisibleRow: Integer;     // Which buffer row is at screen top (for hardware scroll)
@@ -508,6 +509,7 @@ type
     property WindowRow2: Integer read FWindowRow2;
     property AllDirty: Boolean read FAllDirty;  // True if full redraw needed
     property ScrollPending: Boolean read FScrollPending write FScrollPending;  // Hardware scroll needed
+    property ScrollDirection: Integer read FScrollDirection write FScrollDirection;  // +1=up, -1=down
     function GetScrollbackCount: Integer;
   end;
 
@@ -1717,40 +1719,75 @@ begin
       // Set render target to text texture for partial update
       SDL_SetRenderTarget(FRenderer, FTextTexture);
 
-      // Hardware scroll: if scroll pending, shift texture content up by one row
+      // Hardware scroll: if scroll pending, shift texture content by one row
       if ATextBuffer.ScrollPending and Assigned(FScrollTexture) then
       begin
-        // Step 1: Copy viewport from main texture to scratch (excluding top row)
-        ScrollSrcRect.x := FViewportX;
-        ScrollSrcRect.y := FViewportY + FCharHeight;  // Start from row 1
-        ScrollSrcRect.w := FViewportWidth;
-        ScrollSrcRect.h := FViewportHeight - FCharHeight;
-        ScrollDstRect.x := 0;
-        ScrollDstRect.y := 0;
-        ScrollDstRect.w := FViewportWidth;
-        ScrollDstRect.h := FViewportHeight - FCharHeight;
-        // Copy to scratch texture
-        SDL_SetRenderTarget(FRenderer, FScrollTexture);
-        SDL_RenderCopy(FRenderer, FTextTexture, @ScrollSrcRect, @ScrollDstRect);
+        if ATextBuffer.ScrollDirection > 0 then
+        begin
+          // Scroll UP: content moves up, new line appears at bottom
+          // Step 1: Copy viewport (excluding top row) to scratch
+          ScrollSrcRect.x := FViewportX;
+          ScrollSrcRect.y := FViewportY + FCharHeight;  // Start from row 1
+          ScrollSrcRect.w := FViewportWidth;
+          ScrollSrcRect.h := FViewportHeight - FCharHeight;
+          ScrollDstRect.x := 0;
+          ScrollDstRect.y := 0;
+          ScrollDstRect.w := FViewportWidth;
+          ScrollDstRect.h := FViewportHeight - FCharHeight;
+          SDL_SetRenderTarget(FRenderer, FScrollTexture);
+          SDL_RenderCopy(FRenderer, FTextTexture, @ScrollSrcRect, @ScrollDstRect);
 
-        // Step 2: Copy back from scratch to main texture at offset 0
-        SDL_SetRenderTarget(FRenderer, FTextTexture);
-        ScrollSrcRect.x := 0;
-        ScrollSrcRect.y := 0;
-        ScrollDstRect.x := FViewportX;
-        ScrollDstRect.y := FViewportY;
-        SDL_RenderCopy(FRenderer, FScrollTexture, @ScrollSrcRect, @ScrollDstRect);
+          // Step 2: Copy from scratch to main texture at top
+          SDL_SetRenderTarget(FRenderer, FTextTexture);
+          ScrollSrcRect.x := 0;
+          ScrollSrcRect.y := 0;
+          ScrollDstRect.x := FViewportX;
+          ScrollDstRect.y := FViewportY;
+          SDL_RenderCopy(FRenderer, FScrollTexture, @ScrollSrcRect, @ScrollDstRect);
 
-        // Step 3: Clear the bottom row (will be redrawn by partial update)
-        RowBGRect.x := FViewportX;
-        RowBGRect.y := FViewportY + FViewportHeight - FCharHeight;
-        RowBGRect.w := FViewportWidth;
-        RowBGRect.h := FCharHeight;
-        SDL_SetRenderDrawColor(FRenderer, ScreenBG.r, ScreenBG.g, ScreenBG.b, 255);
-        SDL_RenderFillRect(FRenderer, @RowBGRect);
+          // Step 3: Clear bottom row
+          RowBGRect.x := FViewportX;
+          RowBGRect.y := FViewportY + FViewportHeight - FCharHeight;
+          RowBGRect.w := FViewportWidth;
+          RowBGRect.h := FCharHeight;
+          SDL_SetRenderDrawColor(FRenderer, ScreenBG.r, ScreenBG.g, ScreenBG.b, 255);
+          SDL_RenderFillRect(FRenderer, @RowBGRect);
+        end
+        else
+        begin
+          // Scroll DOWN: content moves down, new line appears at top
+          // Step 1: Copy viewport (excluding bottom row) to scratch
+          ScrollSrcRect.x := FViewportX;
+          ScrollSrcRect.y := FViewportY;  // Start from row 0
+          ScrollSrcRect.w := FViewportWidth;
+          ScrollSrcRect.h := FViewportHeight - FCharHeight;
+          ScrollDstRect.x := 0;
+          ScrollDstRect.y := 0;
+          ScrollDstRect.w := FViewportWidth;
+          ScrollDstRect.h := FViewportHeight - FCharHeight;
+          SDL_SetRenderTarget(FRenderer, FScrollTexture);
+          SDL_RenderCopy(FRenderer, FTextTexture, @ScrollSrcRect, @ScrollDstRect);
+
+          // Step 2: Copy from scratch to main texture shifted down
+          SDL_SetRenderTarget(FRenderer, FTextTexture);
+          ScrollSrcRect.x := 0;
+          ScrollSrcRect.y := 0;
+          ScrollDstRect.x := FViewportX;
+          ScrollDstRect.y := FViewportY + FCharHeight;  // Offset down by one row
+          SDL_RenderCopy(FRenderer, FScrollTexture, @ScrollSrcRect, @ScrollDstRect);
+
+          // Step 3: Clear top row
+          RowBGRect.x := FViewportX;
+          RowBGRect.y := FViewportY;
+          RowBGRect.w := FViewportWidth;
+          RowBGRect.h := FCharHeight;
+          SDL_SetRenderDrawColor(FRenderer, ScreenBG.r, ScreenBG.g, ScreenBG.b, 255);
+          SDL_RenderFillRect(FRenderer, @RowBGRect);
+        end;
 
         // Reset scroll flag
         ATextBuffer.ScrollPending := False;
+        ATextBuffer.ScrollDirection := 0;
       end;
 
       // Partial update: only render dirty rows (at viewport offset)
@@ -3459,6 +3496,7 @@ begin
     FRowDirty[r] := False;
   FAllDirty := True;  // First render draws everything
   FScrollPending := False;
+  FScrollDirection := 0;
 
   FCursorX := 0;
   FCursorY := 0;
@@ -3891,8 +3929,7 @@ begin
     FCells[FWindowRow2][c].Reverse := FCurrentReverse;
   end;
 
-  // Mark all rows dirty for full redraw after scroll
-  // Hardware scroll optimization disabled for now - needs debugging
+  // Full redraw after scroll (hardware scroll disabled - needs debugging)
   FAllDirty := True;
 
   // If we were viewing scrollback, adjust offset to maintain view position
