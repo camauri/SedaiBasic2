@@ -20,8 +20,8 @@
 210 PRINT "Eat the food (*) to grow and score!"
 220 PRINT "Speed increases as you eat more."
 230 PRINT "Don't hit the walls or yourself!"
-240 PRINT
-250 INPUT "Press ENTER to start..."; DUMMY$
+240 PRINT: PRINT "Press any key to start..."
+250 GETKEY DUMMY$
 
 300 REM =============================================
 310 REM  NEW GAME SETUP (restart target)
