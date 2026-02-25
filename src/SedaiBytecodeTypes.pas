@@ -221,6 +221,7 @@ const
   bcResume          = bcGroupCore + 91;  // RESUME: Continue after error at error line
   bcResumeNext      = bcGroupCore + 92;  // RESUME NEXT: Continue after error at next statement
   bcModFloat        = bcGroupCore + 93;  // Float modulo (A - Floor(A/B) * B)
+  bcFrame           = bcGroupCore + 94;  // FRAME [fps]: Wait for frame sync (default 60fps)
 
   // === GROUP 1: STRING OPERATIONS (0x01xx) ===
   bcStrConcat       = bcGroupString + 0;
@@ -1106,6 +1107,7 @@ begin
         91: Result := 'Resume';
         92: Result := 'ResumeNext';
         93: Result := 'ModFloat';
+        94: Result := 'Frame';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

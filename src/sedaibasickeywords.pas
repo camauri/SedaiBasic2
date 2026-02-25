@@ -71,6 +71,7 @@ const
   kCONT    = 'CONT';
   kRESUME  = 'RESUME';
   kSLEEP   = 'SLEEP';
+  kFRAME   = 'FRAME';
   kTROFF   = 'TROFF';
   kTRON    = 'TRON';
 

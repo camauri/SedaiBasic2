@@ -1591,6 +1591,7 @@ begin
  RegisterKeyword(kFAST,  ttProgramClock, 'Set fast speed clock',            kcProgramFlowControl);
  RegisterKeyword(kRUN,   ttProgramRun,   'Execute program',                 kcProgramFlowControl);
  RegisterKeyword(kSLEEP, ttProgramSleep, 'Delay program for given seconds', kcProgramFlowControl);
+ RegisterKeyword(kFRAME, ttProgramFrame, 'Wait for frame sync (default 60fps)', kcProgramFlowControl);
  RegisterKeyword(kSLOW,  ttProgramClock, 'Set slow speed clock',            kcProgramFlowControl);
  RegisterKeyword(kSTOP,  ttProgramStop,  'Halt program execution',          kcProgramFlowControl);
  RegisterKeyword(kWAIT,  ttProgramWait,  'Pause until condition satisfied', kcProgramFlowControl);

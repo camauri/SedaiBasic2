@@ -138,6 +138,7 @@ type
     ttProgramEnd,             // END
     ttProgramRun,             // RUN
     ttProgramSleep,           // SLEEP
+    ttProgramFrame,           // FRAME
     ttProgramStop,            // STOP
     ttProgramWait,            // WAIT
 

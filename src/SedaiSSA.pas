@@ -2713,6 +2713,8 @@ var
   ArrayRef: TSSAValue;
   TotalElements: Int64;
   HasVariableDims: Boolean;
+  DimInstr: TSSAInstruction;
+  VarDimCount: Integer;
 const
   MAX_ARRAY_ELEMENTS = 125000000;  // 125M elements max (~1GB for 500x500x500 matrix)
 begin
@@ -2840,6 +2842,31 @@ begin
     ArrayRef := MakeSSAArrayRef(ArrayIdx, ElementType);
     EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+    // CRITICAL: Attach variable dimension registers as PhiSources on the
+    // ssaArrayDim instruction so that DCE can see them as dependencies.
+    // Without this, DCE may eliminate the definitions of dimension registers
+    // (they are only referenced through metadata, not through Src1/Src2/Src3),
+    // causing the array to be allocated with wrong sizes at runtime.
+    if HasVariableDims and Assigned(FCurrentBlock) then
+    begin
+      DimInstr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+      VarDimCount := 0;
+      for i := 0 to DimCount - 1 do
+        if DimValues[i].Kind = svkRegister then
+          Inc(VarDimCount);
+      SetLength(DimInstr.PhiSources, VarDimCount);
+      VarDimCount := 0;
+      for i := 0 to DimCount - 1 do
+      begin
+        if DimValues[i].Kind = svkRegister then
+        begin
+          DimInstr.PhiSources[VarDimCount].Value := DimValues[i];
+          DimInstr.PhiSources[VarDimCount].FromBlock := nil;
+          Inc(VarDimCount);
+        end;
+      end;
+    end;
   end;
 end;
 
@@ -5888,13 +5915,23 @@ begin
   if Node.ChildCount < 4 then Exit; // Need mode, col, row, text
 
   // CHAR mode, col, row, "text" [,reverse]
+  // All parameters MUST be materialized into registers because the bytecode
+  // compiler only maps svkRegister operands. Constants (svkConstInt/svkConstString)
+  // would be silently dropped, leaving register index 0 in the bytecode.
   ProcessExpression(Node.GetChild(0), ModeVal);
+  ModeVal := EnsureIntRegister(ModeVal);
   ProcessExpression(Node.GetChild(1), ColVal);
+  ColVal := EnsureIntRegister(ColVal);
   ProcessExpression(Node.GetChild(2), RowVal);
+  RowVal := EnsureIntRegister(RowVal);
   ProcessExpression(Node.GetChild(3), TextVal);
+  TextVal := EnsureStringRegister(TextVal);
 
   if Node.ChildCount > 4 then
-    ProcessExpression(Node.GetChild(4), ReverseVal)
+  begin
+    ProcessExpression(Node.GetChild(4), ReverseVal);
+    ReverseVal := EnsureIntRegister(ReverseVal);
+  end
   else
     ReverseVal := MakeSSAConstInt(0);
 
@@ -7564,6 +7601,7 @@ var
   i: Integer;
   PrevBlock, NewBlock: TSSABasicBlock;  // PHASE 3 TIER 3: CFG construction
   SecondsVal: TSSAValue;  // For SLEEP command
+  FPSReg: TSSAValue;  // For FRAME command
   KeyNumVal, KeyTextVal, KeyNumReg, KeyTextReg: TSSAValue;  // For KEY command
   ExprResult, LineNumReg: TSSAValue;  // For TRAP command
   AddrVal, AddrReg, ValueReg: TSSAValue;  // For POKE command
@@ -7744,6 +7782,25 @@ begin
       begin
         // SLEEP without parameter - default to 1 second
         EmitInstruction(ssaSleep, MakeSSAValue(svkNone), MakeSSAConstInt(1),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+    end;
+    antFrame:
+    begin
+      // FRAME [fps] - wait for frame sync
+      // Child[0] = optional FPS expression (default 60)
+      if Node.ChildCount > 0 then
+      begin
+        ProcessExpression(Node.GetChild(0), SecondsVal);
+        FPSReg := EnsureIntRegister(SecondsVal);
+        EmitInstruction(ssaFrame, MakeSSAValue(svkNone), FPSReg,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+      begin
+        // FRAME without parameter - default to 60 fps
+        FPSReg := EnsureIntRegister(MakeSSAConstInt(60));
+        EmitInstruction(ssaFrame, MakeSSAValue(svkNone), FPSReg,
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
     end;

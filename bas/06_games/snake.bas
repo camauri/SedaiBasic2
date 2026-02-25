@@ -1,52 +1,57 @@
 10 REM =============================================
 20 REM  SNAKE GAME - SedaiBasic
-30 REM  Classic snake game with game loop
-40 REM  Controls: W/A/S/D or Arrow Keys
+30 REM  80x50 text mode, 76x46 centered field
+40 REM  Controls: Arrow Keys or W/A/S/D
 50 REM  Run with sbv.exe for best experience
 60 REM =============================================
 
-100 REM === INITIALIZATION ===
-110 SCNCLR
-120 PRINT "=== SNAKE GAME ==="
-130 PRINT
-140 PRINT "Controls:"
-150 PRINT "  W or UP    - Move up"
-160 PRINT "  S or DOWN  - Move down"
-170 PRINT "  A or LEFT  - Move left"
-180 PRINT "  D or RIGHT - Move right"
-190 PRINT "  Q          - Quit game"
+100 REM === ONE-TIME INITIALIZATION ===
+110 GRAPHIC 8
+115 HISCORE = 0
+120 DIM SX(200), SY(200)
+125 DIM FOODX(20), FOODY(20)
+130 SCNCLR
+140 PRINT "=== SNAKE GAME ==="
+150 PRINT
+160 PRINT "Controls:"
+170 PRINT "  Arrow Keys - Move snake"
+180 PRINT "  Q          - Quit game"
 200 PRINT
-210 PRINT "Eat the food (*) to grow!"
-220 PRINT "Don't hit the walls or yourself!"
-230 PRINT
-240 INPUT "Press ENTER to start..."; DUMMY$
+210 PRINT "Eat the food (*) to grow and score!"
+220 PRINT "Speed increases as you eat more."
+230 PRINT "Don't hit the walls or yourself!"
+240 PRINT
+250 INPUT "Press ENTER to start..."; DUMMY$
 
-300 REM === GAME CONSTANTS ===
-310 FIELDW = 30   : REM Field width
-320 FIELDH = 15   : REM Field height
-330 MAXLEN = 100  : REM Max snake length
-340 SPEED = 0.15  : REM Game speed (seconds per move)
-
-400 REM === ARRAYS ===
-410 DIM SX(MAXLEN), SY(MAXLEN)  : REM Snake body positions
+300 REM =============================================
+310 REM  NEW GAME SETUP (restart target)
+320 REM =============================================
+330 FIELDW = 76    : REM Field width (playable cols 1-76)
+340 FIELDH = 46    : REM Field height (playable rows 1-46)
+350 MAXLEN = 200   : REM Max snake length
+355 MAXFOOD = 10   : REM Max food items on field
+360 OX = 1         : REM X offset for centering
+370 OY = 1         : REM Y offset for centering
+380 BASEFPS = 8    : REM Starting speed
+390 MAXFPS = 20    : REM Max speed
 
 500 REM === INITIAL STATE ===
-510 SLEN = 3      : REM Snake length
-520 HEADX = 15    : REM Head X position
-530 HEADY = 7     : REM Head Y position
-540 DX = 1        : REM Direction X (1=right, -1=left, 0=none)
-550 DY = 0        : REM Direction Y (1=down, -1=up, 0=none)
-560 SCORE = 0     : REM Player score
-570 GAMEOVER = 0  : REM Game over flag
+510 SLEN = 3
+520 HEADX = 38     : REM Center X of field
+530 HEADY = 23     : REM Center Y of field
+540 DX = 1 : DY = 0
+550 SCORE = 0 : GAMEOVER = 0
+560 NFOOD = 1 : FOODSEATEN = 0
+570 FPS = BASEFPS
 
 600 REM === INITIALIZE SNAKE BODY ===
 610 FOR I = 0 TO SLEN - 1
-620 SX(I) = HEADX - I
-630 SY(I) = HEADY
-640 NEXT I
+620 SX(I) = HEADX - I : SY(I) = HEADY
+630 NEXT I
 
-700 REM === PLACE FIRST FOOD ===
-710 GOSUB 5000
+700 REM === PLACE INITIAL FOOD ===
+710 CURFOOD = 0
+720 GOSUB 5000
 
 800 REM === DRAW INITIAL SCREEN ===
 810 GOSUB 4000
@@ -55,23 +60,16 @@
 1010 REM  MAIN GAME LOOP
 1020 REM =============================================
 1030 IF GAMEOVER = 1 THEN GOTO 3000
+1035 GET K$
 
-1100 REM === GET INPUT (Non-blocking) ===
-1110 GET K$
-1120 IF K$ = "" THEN GOTO 1200
-
-1130 REM === PROCESS INPUT ===
-1140 K = ASC(K$)
-1150 REM W or Up arrow
-1160 IF K$ = "W" OR K$ = "w" OR K = 145 THEN IF DY <> 1 THEN DX = 0: DY = -1
-1170 REM S or Down arrow
-1180 IF K$ = "S" OR K$ = "s" OR K = 17 THEN IF DY <> -1 THEN DX = 0: DY = 1
-1190 REM A or Left arrow
-1200 IF K$ = "A" OR K$ = "a" OR K = 157 THEN IF DX <> 1 THEN DX = -1: DY = 0
-1210 REM D or Right arrow
-1220 IF K$ = "D" OR K$ = "d" OR K = 29 THEN IF DX <> -1 THEN DX = 1: DY = 0
-1230 REM Q to quit
-1240 IF K$ = "Q" OR K$ = "q" THEN GAMEOVER = 1: GOTO 3000
+1100 REM === PROCESS INPUT ===
+1110 IF K$ = "" THEN GOTO 1300
+1120 K = ASC(K$)
+1130 IF K$ = "W" OR K$ = "w" OR K = 1 THEN IF DY <> 1 THEN DX = 0: DY = -1
+1140 IF K$ = "S" OR K$ = "s" OR K = 2 THEN IF DY <> -1 THEN DX = 0: DY = 1
+1150 IF K$ = "A" OR K$ = "a" OR K = 3 THEN IF DX <> 1 THEN DX = -1: DY = 0
+1160 IF K$ = "D" OR K$ = "d" OR K = 4 THEN IF DX <> -1 THEN DX = 1: DY = 0
+1170 IF K$ = "Q" OR K$ = "q" THEN GAMEOVER = 1: GOTO 3000
 
 1300 REM === CALCULATE NEW HEAD POSITION ===
 1310 NEWX = SX(0) + DX
@@ -87,96 +85,116 @@
 1530 NEXT I
 
 1600 REM === CHECK FOOD COLLISION ===
-1610 ATEFOOD = 0
-1620 IF NEWX = FOODX AND NEWY = FOODY THEN BEGIN
-1630   ATEFOOD = 1
-1640   SCORE = SCORE + 10
-1650   IF SLEN < MAXLEN THEN SLEN = SLEN + 1
-1660   GOSUB 5000  : REM Place new food
-1670 BEND
+1610 ATEFOOD = 0 : ATEINDEX = -1
+1620 FOR J = 0 TO NFOOD - 1
+1630 IF ATEFOOD = 0 AND NEWX = FOODX(J) AND NEWY = FOODY(J) THEN ATEFOOD = 1: ATEINDEX = J
+1640 NEXT J
+1650 IF ATEFOOD = 0 THEN GOTO 1800
+1660 SCORE = SCORE + 10
+1670 FOODSEATEN = FOODSEATEN + 1
+1680 IF SLEN < MAXLEN THEN SLEN = SLEN + 1
+1690 REM Replace eaten food with new one
+1700 CURFOOD = ATEINDEX
+1710 GOSUB 5000
+1720 REM Add more food every 5 eaten
+1730 IF NFOOD < MAXFOOD THEN BEGIN
+1740   IF FOODSEATEN MOD 5 = 0 THEN BEGIN
+1750     CURFOOD = NFOOD
+1760     NFOOD = NFOOD + 1
+1770     GOSUB 5000
+1780   BEND
+1790 BEND
+1795 REM Update speed
+1796 FPS = BASEFPS + INT(FOODSEATEN / 3)
+1797 IF FPS > MAXFPS THEN FPS = MAXFPS
 
-1700 REM === MOVE SNAKE ===
-1710 REM Erase tail (unless we ate food)
-1720 IF ATEFOOD = 0 THEN BEGIN
-1730   TAILX = SX(SLEN - 1)
-1740   TAILY = SY(SLEN - 1)
-1750   CHAR 0, TAILX, TAILY + 2, " "
-1760 BEND
-1770 REM Shift body segments
-1780 FOR I = SLEN - 1 TO 1 STEP -1
-1790   SX(I) = SX(I - 1)
-1800   SY(I) = SY(I - 1)
-1810 NEXT I
-1820 REM Set new head position
-1830 SX(0) = NEWX
-1840 SY(0) = NEWY
+1800 REM === MOVE SNAKE ===
+1810 IF ATEFOOD = 0 THEN BEGIN
+1820   TAILX = SX(SLEN - 1) : TAILY = SY(SLEN - 1)
+1830   CHAR 0, TAILX + OX, TAILY + OY, " "
+1840 BEND
+1850 FOR I = SLEN - 1 TO 1 STEP -1
+1860   SX(I) = SX(I - 1) : SY(I) = SY(I - 1)
+1870 NEXT I
+1880 SX(0) = NEWX : SY(0) = NEWY
 
 1900 REM === DRAW HEAD ===
-1910 CHAR 0, NEWX, NEWY + 2, "@"
+1910 CHAR 0, NEWX + OX, NEWY + OY, "@"
 
-2000 REM === UPDATE SCORE ===
-2010 CHAR 0, 1, 1, "SCORE: "
-2020 CHAR 0, 8, 1, STR$(SCORE)
+2000 REM === UPDATE SCORE DISPLAY ===
+2010 IF SCORE > HISCORE THEN HISCORE = SCORE
+2020 CHAR 0, 2, 0, "SCORE:       "
+2030 CHAR 0, 9, 0, STR$(SCORE)
+2040 CHAR 0, 56, 0, "HI-SCORE:       "
+2050 CHAR 0, 66, 0, STR$(HISCORE)
 
-2100 REM === DELAY FOR GAME SPEED ===
-2110 SLEEP SPEED
-
-2200 REM === LOOP ===
-2210 GOTO 1030
+2200 REM === FRAME SYNC AND LOOP ===
+2210 FRAME FPS
+2220 GOTO 1030
 
 3000 REM =============================================
 3010 REM  GAME OVER
 3020 REM =============================================
-3030 CHAR 0, 10, 10, "*** GAME OVER ***"
-3040 CHAR 0, 10, 12, "Final Score: "
-3050 CHAR 0, 23, 12, STR$(SCORE)
-3060 CHAR 0, 10, 14, "Press any key..."
-3070 GETKEY K$
-3080 SCNCLR
-3090 PRINT "Thanks for playing SNAKE!"
-3100 PRINT "Final score: "; SCORE
-3110 PRINT
-3120 INPUT "Play again? (Y/N): "; PA$
-3130 IF PA$ = "Y" OR PA$ = "y" THEN RUN
-3140 END
+3030 IF SCORE > HISCORE THEN HISCORE = SCORE
+3040 CHAR 0, 31, 20, "*** GAME OVER ***"
+3050 CHAR 0, 30, 22, "Score:      "
+3060 CHAR 0, 37, 22, STR$(SCORE)
+3070 CHAR 0, 30, 24, "High Score: "
+3080 CHAR 0, 42, 24, STR$(HISCORE)
+3090 CHAR 0, 30, 26, "Play again? (Y/N)"
+3100 GETKEY PA$
+3110 IF PA$ = "Y" OR PA$ = "y" THEN GOTO 300
+3120 IF PA$ <> "N" AND PA$ <> "n" THEN GOTO 3100
+3130 SCNCLR
+3140 PRINT "Thanks for playing SNAKE!"
+3150 PRINT "High score: "; HISCORE
+3160 END
 
 4000 REM =============================================
-4010 REM  DRAW GAME FIELD
+4010 REM  DRAW GAME FIELD (76x46 centered on 80x50)
 4020 REM =============================================
 4030 SCNCLR
-4040 REM Draw score area
-4050 CHAR 0, 1, 1, "SCORE: 0"
-4060 REM Draw top border
-4070 FOR X = 0 TO FIELDW + 1
-4080 CHAR 0, X, 2, "#"
-4090 NEXT X
-4100 REM Draw side borders
-4110 FOR Y = 1 TO FIELDH
-4120 CHAR 0, 0, Y + 2, "#"
-4130 CHAR 0, FIELDW + 1, Y + 2, "#"
-4140 NEXT Y
-4150 REM Draw bottom border
-4160 FOR X = 0 TO FIELDW + 1
-4170 CHAR 0, X, FIELDH + 3, "#"
-4180 NEXT X
-4190 REM Draw initial snake
-4200 FOR I = 0 TO SLEN - 1
-4210 IF I = 0 THEN CH$ = "@" ELSE CH$ = "O"
-4220 CHAR 0, SX(I), SY(I) + 2, CH$
-4230 NEXT I
-4240 REM Draw food
-4250 CHAR 0, FOODX, FOODY + 2, "*"
-4260 RETURN
+4040 REM Score/HI header on row 0
+4050 CHAR 0, 2, 0, "SCORE: 0"
+4060 CHAR 0, 56, 0, "HI-SCORE: "
+4070 CHAR 0, 66, 0, STR$(HISCORE)
+4080 REM Top border (row 1, cols 1-78)
+4090 FOR X = 1 TO 78
+4100 CHAR 0, X, 1, "#"
+4110 NEXT X
+4120 REM Side borders (rows 2-47)
+4130 FOR Y = 2 TO 47
+4140 CHAR 0, 1, Y, "#"
+4150 CHAR 0, 78, Y, "#"
+4160 NEXT Y
+4170 REM Bottom border (row 48, cols 1-78)
+4180 FOR X = 1 TO 78
+4190 CHAR 0, X, 48, "#"
+4200 NEXT X
+4210 REM Draw initial snake
+4220 FOR I = 0 TO SLEN - 1
+4230 IF I = 0 THEN CH$ = "@" ELSE CH$ = "O"
+4240 CHAR 0, SX(I) + OX, SY(I) + OY, CH$
+4250 NEXT I
+4260 REM Draw all food items
+4270 FOR J = 0 TO NFOOD - 1
+4280 CHAR 0, FOODX(J) + OX, FOODY(J) + OY, "*"
+4290 NEXT J
+4300 RETURN
 
 5000 REM =============================================
-5010 REM  PLACE FOOD AT RANDOM POSITION
+5010 REM  PLACE FOOD AT INDEX CURFOOD
 5020 REM =============================================
-5030 FOODX = INT(RND(1) * FIELDW) + 1
-5040 FOODY = INT(RND(1) * FIELDH) + 1
+5030 FOODX(CURFOOD) = INT(RND(1) * FIELDW) + 1
+5040 FOODY(CURFOOD) = INT(RND(1) * FIELDH) + 1
 5050 REM Check not on snake
 5060 FOR I = 0 TO SLEN - 1
-5070 IF FOODX = SX(I) AND FOODY = SY(I) THEN GOTO 5030
+5070 IF FOODX(CURFOOD) = SX(I) AND FOODY(CURFOOD) = SY(I) THEN GOTO 5030
 5080 NEXT I
-5090 REM Draw food
-5100 CHAR 0, FOODX, FOODY + 2, "*"
-5110 RETURN
+5090 REM Check not on other food
+5100 FOR I = 0 TO NFOOD - 1
+5110 IF I <> CURFOOD AND FOODX(CURFOOD) = FOODX(I) AND FOODY(CURFOOD) = FOODY(I) THEN GOTO 5030
+5120 NEXT I
+5130 REM Draw food
+5140 CHAR 0, FOODX(CURFOOD) + OX, FOODY(CURFOOD) + OY, "*"
+5150 RETURN

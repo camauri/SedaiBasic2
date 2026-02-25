@@ -109,6 +109,7 @@ type
     // Time tracking for TI and TI$
     FStartTicks: QWord;     // Milliseconds since system start when VM started
     FTimeOffset: Int64;     // TI$ offset in milliseconds from real time
+    FLastFrameTick: QWord;  // Last FRAME sync tick for drift-free timing
     // Function key definitions (1-12)
     FFunctionKeys: array[1..12] of string;
     FVarMap: TStringList;
@@ -355,6 +356,7 @@ begin
   // Initialize time tracking
   FStartTicks := GetTickCount64;
   FTimeOffset := 0;
+  FLastFrameTick := 0;
   {$IFDEF ENABLE_INSTRUCTION_COUNTING}
   FInstructionsExecuted := 0;
   {$ENDIF}
@@ -1230,7 +1232,7 @@ begin
 
         // Float dest, float sources
         bcLoadConstFloat, bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat,
-        bcPowFloat, bcNegFloat,
+        bcModFloat, bcPowFloat, bcNegFloat,
         bcMathAbs, bcMathSgn, bcMathInt, bcMathSqr, bcMathSin, bcMathCos, bcMathTan,
         bcMathExp, bcMathLog, bcMathAtn, bcMathRnd:
         begin
@@ -1619,6 +1621,8 @@ procedure TBytecodeVM.ExecuteInstruction(const Instr: TBytecodeInstruction);
 var
   Group: Word;
   SleepMs: Integer;
+  FrameFPS, FrameTimeMs, WaitMs, ChunkMs: Integer;
+  NowTick, TargetTick: QWord;
   KeyNum, KeyIdx, CharIdx: Integer;
   KeyText: string;
   Ch: Char;
@@ -1832,6 +1836,59 @@ begin
             end;
           end;
         end;
+      end;
+    bcFrame:
+      begin
+        // FRAME [fps] - wait for frame sync (default 60fps)
+        FrameFPS := FIntRegs[Instr.Src1];
+        if FrameFPS < 1 then FrameFPS := 1;
+        if FrameFPS > 1000 then FrameFPS := 1000;
+        FrameTimeMs := 1000 div FrameFPS;
+
+        NowTick := GetTickCount64;
+        if FLastFrameTick = 0 then
+          FLastFrameTick := NowTick;
+
+        // Calculate remaining wait time
+        TargetTick := FLastFrameTick + QWord(FrameTimeMs);
+        if NowTick < TargetTick then
+        begin
+          WaitMs := Integer(TargetTick - NowTick);
+          // Sleep in 16ms chunks, calling EventPollCallback each chunk
+          while (WaitMs > 0) and FRunning do
+          begin
+            ChunkMs := WaitMs;
+            if ChunkMs > 16 then ChunkMs := 16;
+            Sleep(ChunkMs);
+            Dec(WaitMs, ChunkMs);
+            if Assigned(FEventPollCallback) then
+              FEventPollCallback()
+            else begin
+              if Assigned(FOutputDevice) then FOutputDevice.Present;
+              if Assigned(FInputDevice) then begin
+                FInputDevice.ProcessEvents;
+                if FInputDevice.ShouldStop or FInputDevice.ShouldQuit then begin
+                  FRunning := False;
+                  FInputDevice.ClearStopRequest;
+                end;
+              end;
+            end;
+          end;
+        end
+        else begin
+          // Frame overrun - still call EventPoll once for rendering
+          if Assigned(FEventPollCallback) then
+            FEventPollCallback()
+          else if Assigned(FOutputDevice) then
+            FOutputDevice.Present;
+        end;
+
+        // Use target-based timing to prevent drift
+        FLastFrameTick := FLastFrameTick + QWord(FrameTimeMs);
+        // Guard against large drift (e.g. after breakpoint)
+        NowTick := GetTickCount64;
+        if FLastFrameTick + QWord(FrameTimeMs) < NowTick then
+          FLastFrameTick := NowTick;
       end;
     bcKey:
       begin

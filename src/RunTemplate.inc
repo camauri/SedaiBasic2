@@ -426,6 +426,12 @@ begin
           FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / FloatRegs[Instr.Src2];
           Inc(CurPC);
         end;
+        bcModFloat: begin
+          if FloatRegs[Instr.Src2] = 0.0 then
+            raise EZeroDivide.Create('Float modulo by zero');
+          FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] - Floor(FloatRegs[Instr.Src1] / FloatRegs[Instr.Src2]) * FloatRegs[Instr.Src2];
+          Inc(CurPC);
+        end;
         bcPowFloat: begin FloatRegs[Instr.Dest] := Power(FloatRegs[Instr.Src1], FloatRegs[Instr.Src2]); Inc(CurPC); end;
         bcNegFloat: begin FloatRegs[Instr.Dest] := -FloatRegs[Instr.Src1]; Inc(CurPC); end;
 
@@ -686,7 +692,7 @@ begin
           end;
 
         // System commands - fall back to slow path
-        bcFast, bcSlow, bcSleep, bcKey:
+        bcFast, bcSlow, bcSleep, bcKey, bcFrame:
           begin
             FPC := CurPC;
             ExecuteInstruction(Instr);

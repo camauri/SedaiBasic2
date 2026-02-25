@@ -59,6 +59,11 @@ type
     // Helper for error reporting
     function BuildSourceLine(AContext: TParserContext): string;
 
+    // Helper: peek ahead for ELSE on the next line (for multi-line BEGIN/BEND support)
+    function PeekForElseOnNextLine: Boolean;
+    // Helper: pop completed IFs at EOL, with ELSE lookahead for block IFs
+    procedure PopCompletedIfsAtEOL;
+
   protected
     procedure DoParsingStarted; virtual;
     procedure DoParsingFinished(Result: TParsingResult); virtual;
@@ -117,6 +122,7 @@ type
     function ParseRunStatement: TASTNode;
     function ParseClockStatement: TASTNode;
     function ParseSleepStatement: TASTNode;
+    function ParseFrameStatement: TASTNode;
     function ParseWaitStatement: TASTNode;
     function ParseProgramEditingStatement: TASTNode;
     function ParseLoopStatement: TASTNode;
@@ -316,11 +322,8 @@ begin
    // Skip end-of-line tokens, MA prima fai Pop degli IF completati
    if Context.Match(ttEndOfLine) then
    begin
-     // *** Pop IF completati a fine riga (solo se non hanno blocchi attivi) ***
-     if FValidationStacks.HasActiveIf and FValidationStacks.CanPopIfAtEOL then
-     begin
-       FValidationStacks.PopIf;
-     end;
+     // Pop completed IFs (with ELSE lookahead for multi-line BEGIN/BEND blocks)
+     PopCompletedIfsAtEOL;
      Continue;
    end;
 
@@ -479,6 +482,7 @@ begin
     ttProgramCont: Result := Memoize('ContStatement', @ParseContStatement);
     ttProgramClock: Result := Memoize('ClockStatement', @ParseClockStatement);
     ttProgramSleep: Result := Memoize('SleepStatement', @ParseSleepStatement);
+    ttProgramFrame: Result := Memoize('FrameStatement', @ParseFrameStatement);
     ttProgramWait: Result := Memoize('WaitStatement', @ParseWaitStatement);
     ttProgramEditing: Result := Memoize('ProgramEditingStatement', @ParseProgramEditingStatement);
 
@@ -1466,6 +1470,26 @@ begin
   DoNodeCreated(Result);
 end;
 
+function TPackratParser.ParseFrameStatement: TASTNode;
+var
+  Token: TLexerToken;
+  Param: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antFrame, Token);
+  Context.Advance; // Consume FRAME
+
+  // Parse optional FPS parameter (default 60 if omitted)
+  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+  begin
+    Param := ParseExpression;
+    if Assigned(Param) then
+      Result.AddChild(Param);
+  end;
+
+  DoNodeCreated(Result);
+end;
+
 function TPackratParser.ParseWaitStatement: TASTNode;
 var
   Token: TLexerToken;
@@ -1603,6 +1627,10 @@ end;
 function TPackratParser.ParseBlockStatement: TASTNode;
 var
   Token: TLexerToken;
+  Statement: TASTNode;
+  LineNum: Integer;
+  LineNumNode: TASTNode;
+  EndKeyword: string;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antBlock, Token);
@@ -1610,6 +1638,78 @@ begin
 
   // *** PUSH ONTO BLOCK STACK ***
   FValidationStacks.PushBlock(ttBlockBegin, Result, 'BEND', Context.CurrentIndex);
+
+  // *** Parse all statements between BEGIN and BEND ***
+  while not Context.Check(ttEndOfFile) do
+  begin
+    // Skip end-of-line tokens
+    if Context.Match(ttEndOfLine) then
+    begin
+      // Inside a block, only pop simple single-line IFs (not those with
+      // active BEGIN blocks).  Do NOT call PopCompletedIfsAtEOL here — its
+      // force-clear logic would prematurely pop the outer IF that owns
+      // this block, before we even reach BEND.
+      while FValidationStacks.HasActiveIf and FValidationStacks.CanPopIfAtEOL do
+        FValidationStacks.PopIf;
+      Continue;
+    end;
+
+    // Skip statement separators (:)
+    if Context.Check(ttSeparStmt) then
+    begin
+      Context.Advance;
+      Continue;
+    end;
+
+    // Check for BEND - end of block
+    if Context.Check(ttBlockEnd) then
+    begin
+      EndKeyword := UpperCase(Context.CurrentToken.Value);
+
+      // Validate and pop block stack
+      FValidationStacks.ValidateBlockEnd(EndKeyword);
+      Context.Advance; // Consume BEND
+
+      // For ELSE blocks: clear the flag so the IF can be popped.
+      // For THEN blocks: keep HasThenBlock set so the IF stays on the
+      // stack, allowing ELSE on a subsequent line. PopCompletedIfsAtEOL
+      // will peek for ELSE and pop when appropriate.
+      if FValidationStacks.HasActiveIf then
+      begin
+        if FValidationStacks.GetCurrentIf.HasElse then
+          FValidationStacks.ClearElseBlockForCurrentIf;
+        // Don't clear HasThenBlock — IF stays alive for possible ELSE
+      end;
+
+      Break;
+    end;
+
+    // Handle line numbers inside the block
+    if Context.Check(ttLineNumber) then
+    begin
+      Token := Context.CurrentToken;
+      try
+        LineNum := StrToInt(Token.Value);
+      except
+        LineNum := 0;
+      end;
+      LineNumNode := TASTNode.CreateWithValue(antLineNumber, Token.Value, Token);
+
+      // Track BASIC line number for error reporting
+      Context.SetCurrentBasicLine(LineNum, BuildSourceLine(Context));
+
+      Result.AddChild(LineNumNode);
+      Context.Advance; // Consume line number
+      Continue;
+    end;
+
+    // Parse statement and add to block
+    Statement := ParseStatement;
+    if Assigned(Statement) then
+      Result.AddChild(Statement)
+    else
+      Break;
+  end;
 
   DoNodeCreated(Result);
 end;
@@ -3529,6 +3629,67 @@ begin
       Result := Result + ' ';
     Result := Result + Token.Value;
     Inc(i);
+  end;
+end;
+
+function TPackratParser.PeekForElseOnNextLine: Boolean;
+var
+  SavedIndex: Integer;
+begin
+  // Peek ahead past EOLs and line numbers to see if ELSE follows.
+  // Used after THEN BEGIN...BEND to allow ELSE on a different BASIC line.
+  Result := False;
+  Context.SavePosition(SavedIndex);
+  try
+    // Skip past any EOL tokens (blank lines)
+    while Context.Check(ttEndOfLine) do
+      Context.Advance;
+    // Skip line number if present
+    if Context.Check(ttLineNumber) then
+      Context.Advance;
+    // Skip statement separators
+    while Context.Check(ttSeparStmt) do
+      Context.Advance;
+    // Check if we're at ELSE
+    Result := Context.Check(ttConditionalElse);
+  finally
+    Context.RestorePosition(SavedIndex);
+  end;
+end;
+
+procedure TPackratParser.PopCompletedIfsAtEOL;
+var
+  CurrentIfEntry: TIfStackEntry;
+begin
+  // Pop completed IFs at end of line.
+  // For IFs with completed THEN blocks (BEGIN...BEND), peek ahead for ELSE
+  // on the next line before popping.
+  while FValidationStacks.HasActiveIf do
+  begin
+    if FValidationStacks.CanPopIfAtEOL then
+      FValidationStacks.PopIf
+    else
+    begin
+      // Can't pop — check if it's a completed THEN block waiting for ELSE
+      CurrentIfEntry := FValidationStacks.GetCurrentIf;
+      if CurrentIfEntry.HasThenBlock and not CurrentIfEntry.HasElse then
+      begin
+        // THEN had a BEGIN block. Peek for ELSE on the next line.
+        if PeekForElseOnNextLine then
+          Break  // ELSE is coming — keep IF on stack
+        else
+        begin
+          // No ELSE coming — clear block flag and pop
+          FValidationStacks.ClearThenBlockForCurrentIf;
+          if FValidationStacks.CanPopIfAtEOL then
+            FValidationStacks.PopIf
+          else
+            Break;
+        end;
+      end
+      else
+        Break; // Can't pop for other reasons (active block, etc.)
+    end;
   end;
 end;
 

@@ -193,7 +193,7 @@ type
     ssaRsppos,         // RSPPOS(sprite, n): Return position/speed
     ssaRsprite,        // RSPRITE(sprite, n): Return sprite attribute
     // Control flow
-    ssaEnd, ssaStop, ssaFast, ssaSlow, ssaSleep, ssaKey, ssaNop, ssaClear,
+    ssaEnd, ssaStop, ssaFast, ssaSlow, ssaSleep, ssaFrame, ssaKey, ssaNop, ssaClear,
     // Debug/Trace
     ssaTron, ssaTroff,  // TRON/TROFF: Enable/disable trace mode
     // Error handling

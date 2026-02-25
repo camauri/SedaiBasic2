@@ -256,6 +256,7 @@ begin
     ssaFast: Result := bcFast;
     ssaSlow: Result := bcSlow;
     ssaSleep: Result := bcSleep;
+    ssaFrame: Result := bcFrame;
     ssaClear: Result := bcClear;
     // Sound commands
     ssaSoundVol: Result := bcSoundVol;

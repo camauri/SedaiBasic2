@@ -160,6 +160,8 @@ begin
       Line := Format('%4d: %-20s', [Index, 'Slow']);
     bcSleep:
       Line := Format('%4d: %-20s %d', [Index, 'Sleep', Instr.Immediate]);
+    bcFrame:
+      Line := Format('%4d: %-20s R%d', [Index, 'Frame', Instr.Src1]);
     bcNop:
       Line := Format('%4d: %-20s', [Index, 'Nop']);
 

@@ -274,7 +274,7 @@ begin
       Result := True;
 
     // Program termination and system state - always live
-    ssaEnd, ssaStop, ssaFast, ssaSlow, ssaSleep, ssaClear,
+    ssaEnd, ssaStop, ssaFast, ssaSlow, ssaSleep, ssaFrame, ssaClear,
     ssaTron, ssaTroff,  // TRON/TROFF switch VM execution mode (side effect)
     ssaTrap, ssaResume, ssaResumeNext,  // Error handling (side effect on VM state)
     ssaKey:  // KEY command - prints key list or modifies function key state
@@ -313,6 +313,7 @@ begin
       Result := True;
 
     // Graphics operations - always live (visible side effects on screen)
+    ssaChar,  // CHAR mode, col, row, text - writes to screen
     ssaGraphicSetMode, ssaGraphicBox, ssaGraphicCircle, ssaGraphicDraw, ssaGraphicLocate,
     ssaGraphicColor, ssaSetColor, ssaGraphicWidth, ssaGraphicScale, ssaGraphicPaint, ssaGraphicWindow,
     ssaGraphicSShape, ssaGraphicGShape, ssaGraphicGList, ssaPLoad, ssaPSave, ssaPRst, ssaScnClr:

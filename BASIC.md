@@ -2,10 +2,10 @@
 
 ## Implementation Progress
 
-**177 / 202 commands implemented (88%)**
+**183 / 205 commands implemented (89%)**
 
 ```
-[████████████████████████████████████████████····] 88%
+[████████████████████████████████████████████·····] 89%
 ```
 
 Legend: ✓ = Implemented | ✗ = Not implemented
@@ -55,13 +55,14 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `ON` | ✓ | Conditional jump |
 | `RETURN` | ✓ | Return from jump |
 
-## Flow Control - Program Execution (7/8 - 88%)
+## Flow Control - Program Execution (8/9 - 89%)
 
 | Command | Status | Description |
 |---------|--------|-------------|
 | `CONT` | ✓ | Continue program execution after STOP |
 | `END` | ✓ | Ends program execution |
 | `FAST` | ✓ | Set fast speed clock (shows black overlay) |
+| `FRAME` | ✓ | Wait for frame sync (FRAME for 60fps, FRAME n for n fps) |
 | `RUN` | ✓ | Execute program (RUN, RUN "filename") |
 | `SLEEP` | ✓ | Delay program for n seconds (0 < n < 65536, interruptible with CTRL+C) |
 | `SLOW` | ✓ | Set slow speed clock (hides black overlay) |
@@ -198,7 +199,7 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `PEEK` | ✓ | Return content of memory-mapped location |
 | `POINTER` | ✗ | Return the address of a variable name |
 
-## Graphics Management (23/23 - 100%)
+## Graphics Management (24/24 - 100%)
 
 | Command/Function | Status | Description |
 |------------------|--------|-------------|
@@ -209,6 +210,7 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `GETCOLOR` | ✓ | Read palette entry as RGBA value |
 | `PLOAD` | ✓ | Load palette from JSON file |
 | `PSAVE` | ✓ | Save palette to JSON file |
+| `PRST` | ✓ | Reset palette to C64 default colors |
 | `DRAW` | ✓ | Draw dots, lines and shapes |
 | `GLIST` | ✓ | List available SDL2 video modes |
 | `GRAPHIC` | ✓ | Select a graphic mode |
@@ -274,7 +276,7 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `TAN` | ✓ | Return tangent of argument |
 | `VAL` | ✓ | Return the numeric value of a number string |
 
-## Reserved Variables (5/8 - 63%)
+## Reserved Variables (6/9 - 67%)
 
 | Variable | Status | Description |
 |----------|--------|-------------|

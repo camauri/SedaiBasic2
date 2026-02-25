@@ -67,6 +67,8 @@ const
   );
 
 type
+  TCursorEnableCallback = procedure(Enable: Boolean) of object;
+
   { Forward declarations }
   TTextBuffer = class;
 
@@ -590,6 +592,7 @@ type
     FVideoController: TVideoController;
     FOutputDevice: IOutputDevice;  // Output device for synchronized I/O
     FTextInputActive: Boolean;   // Track SDL text input state
+    FOnCursorEnable: TCursorEnableCallback;  // Cursor toggle callback
   public
     constructor Create(AVideoController: TVideoController; AOutputDevice: IOutputDevice = nil);
     destructor Destroy; override;
@@ -602,6 +605,7 @@ type
     function GetLastChar: string;
     procedure EnableTextInput;
     procedure DisableTextInput;
+    procedure SetCursorCallback(ACallback: TCursorEnableCallback);
     function ShouldQuit: Boolean;
     function ShouldStop: Boolean;
     procedure ClearStopRequest;
@@ -754,6 +758,7 @@ type
     FConsoleOutputAdapter: TConsoleOutputAdapter;
     FRunning: Boolean;
     FCursorVisible: Boolean;
+    FCursorEnabled: Boolean;       // False = cursor suppressed (during VM execution)
     FLastCursorBlink: Cardinal;
     FInputHistory: array of string;
     FHistoryCount: Integer;
@@ -858,6 +863,7 @@ type
     function HandleVMEventPoll: Boolean;
     procedure BeginVMExecution;
     procedure EndVMExecution;
+    procedure SetCursorEnabled(Enable: Boolean);
 
   public
     constructor Create;
@@ -5366,8 +5372,10 @@ begin
   FGraphicEngine := nil;
   FInputHandler := TInputHandler.Create(FTextBuffer, FVideoController, Self);  // Passa i riferimenti + console
   FProgramInputHandler := TProgramInputHandler.Create(FVideoController);  // Dedicated input for VM
+  FProgramInputHandler.SetCursorCallback(@SetCursorEnabled);  // Wire cursor toggle for INPUT
   FRunning := False;
   FCursorVisible := True;
+  FCursorEnabled := True;  // Cursor visible by default (REPL mode)
   FLastCursorBlink := 0;
   SetLength(FInputHistory, INPUT_HISTORY_SIZE);
   FHistoryCount := 0;
@@ -5880,6 +5888,10 @@ var
   CursorX, CursorY: Integer;
   CurrentChar: Char;
 begin
+  // Don't show cursor when suppressed (during VM execution, except INPUT)
+  if not FCursorEnabled then
+    Exit;
+
   // Don't show cursor in bitmap graphics mode
   if FVideoController.ModeInfo.ModeType = mtBitmap then
     Exit;
@@ -9228,6 +9240,7 @@ end;
 
 procedure TSedaiNewConsole.BeginVMExecution;
 begin
+  FCursorEnabled := False;  // Hide cursor during program execution
   FLastVMRenderTick := SDL_GetTicks;
   FBytecodeVM.EventPollCallback := @HandleVMEventPoll;
 end;
@@ -9235,10 +9248,22 @@ end;
 procedure TSedaiNewConsole.EndVMExecution;
 begin
   FBytecodeVM.EventPollCallback := nil;
+  FCursorEnabled := True;  // Restore cursor for REPL
   // Final render to show the last state (including sprites via RenderScreen)
   RenderScreen;
   UpdateCursor;
   FVideoController.Present;
+end;
+
+procedure TSedaiNewConsole.SetCursorEnabled(Enable: Boolean);
+begin
+  FCursorEnabled := Enable;
+  if Enable then
+  begin
+    // Reset blink state so cursor appears immediately
+    FCursorVisible := True;
+    FLastCursorBlink := SDL_GetTicks;
+  end;
 end;
 
 procedure TSedaiNewConsole.Run;
@@ -10198,6 +10223,10 @@ begin
   InputBuffer := '';
   Done := False;
 
+  // Enable cursor during INPUT
+  if Assigned(FOnCursorEnable) then
+    FOnCursorEnable(True);
+
   // Flush any buffered output before waiting for input
   // This ensures PRINT statements before INPUT are displayed immediately
   if Assigned(FOutputDevice) then
@@ -10322,6 +10351,9 @@ begin
     end;
   finally
     DisableTextInput;
+    // Hide cursor again after INPUT completes
+    if Assigned(FOnCursorEnable) then
+      FOnCursorEnable(False);
   end;
 
   Result := InputBuffer;
@@ -10358,6 +10390,11 @@ end;
 procedure TProgramInputHandler.SetOutputDevice(AOutputDevice: IOutputDevice);
 begin
   FOutputDevice := AOutputDevice;
+end;
+
+procedure TProgramInputHandler.SetCursorCallback(ACallback: TCursorEnableCallback);
+begin
+  FOnCursorEnable := ACallback;
 end;
 
 end.
