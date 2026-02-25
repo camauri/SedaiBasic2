@@ -782,6 +782,14 @@ begin
     TokenType := ttNumber;
   end;
 
+  // Special chars (#, $, %, @) after number = end number (e.g. MOVSPR 3, 45#2)
+  with FTransitionTable[lsInNumber, ccUnderscore] do
+  begin
+    NextState := lsAccept;
+    Action := laLookAhead;
+    TokenType := ttNumber;
+  end;
+
   // ===== IN DECIMAL NUMBER =====
   with FTransitionTable[lsInNumberDecimal, ccDigit] do
   begin
@@ -827,6 +835,14 @@ begin
   end;
 
   with FTransitionTable[lsInNumberDecimal, ccNewline] do
+  begin
+    NextState := lsAccept;
+    Action := laLookAhead;
+    TokenType := ttNumber;
+  end;
+
+  // Special chars (#, $, %, @) after decimal number = end number
+  with FTransitionTable[lsInNumberDecimal, ccUnderscore] do
   begin
     NextState := lsAccept;
     Action := laLookAhead;
@@ -1957,6 +1973,20 @@ begin
           end;
 
           Result := ProcessString;
+          {$IFDEF DEBUG}
+          if FDebugMode then
+            FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
+          {$ENDIF}
+          Exit;
+        end;
+
+      // === HASH - FILE HANDLE PREFIX / MOVSPR SEPARATOR ===
+      '#':
+        begin
+          ResetToken;
+          TokenBufferAdd(CurrentChar);
+          AdvanceChar;
+          Result := CreateToken(ttFileHandlePrefix);
           {$IFDEF DEBUG}
           if FDebugMode then
             FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);

@@ -69,6 +69,7 @@ type
   private
     FLastError: string;           // Brief error (for ?SYNTAX ERROR IN <line>)
     FLastErrorLine: Integer;      // BASIC line number where error occurred
+    FLastErrorFileLine: Integer;  // Source file line number where error occurred
     FLastErrorColumn: Integer;    // Column where error occurred
     FLastErrorVerbose: string;    // Verbose error details (for OPTION VERBOSE)
     FVerbose: Boolean;
@@ -86,6 +87,7 @@ type
 
     property LastError: string read FLastError;
     property LastErrorLine: Integer read FLastErrorLine;
+    property LastErrorFileLine: Integer read FLastErrorFileLine;
     property LastErrorColumn: Integer read FLastErrorColumn;
     property LastErrorVerbose: string read FLastErrorVerbose;
     property Verbose: Boolean read FVerbose write FVerbose;
@@ -140,6 +142,7 @@ var
 begin
   Result := nil;
   ClearErrorState(FLastError, FLastErrorLine, FLastErrorColumn, FLastErrorVerbose);
+  FLastErrorFileLine := 0;
 
   if Trim(Statement) = '' then
   begin
@@ -187,6 +190,7 @@ begin
               FLastErrorLine := ParseError.BasicLineNumber
             else
               FLastErrorLine := ParseError.Line;
+            FLastErrorFileLine := ParseError.Line;  // Always store file line
             FLastErrorColumn := ParseError.Column;
             FLastError := 'SYNTAX ERROR';
             // Use ToString for complete error with positions (line:col)
@@ -397,6 +401,7 @@ var
 begin
   Result := nil;
   ClearErrorState(FLastError, FLastErrorLine, FLastErrorColumn, FLastErrorVerbose);
+  FLastErrorFileLine := 0;
 
   if Trim(Source) = '' then
   begin
@@ -445,6 +450,7 @@ begin
               FLastErrorLine := ParseError.BasicLineNumber
             else
               FLastErrorLine := ParseError.Line;
+            FLastErrorFileLine := ParseError.Line;  // Always store file line
             FLastErrorColumn := ParseError.Column;
             FLastError := 'SYNTAX ERROR';
             // Use ToString for complete error with positions (line:col)

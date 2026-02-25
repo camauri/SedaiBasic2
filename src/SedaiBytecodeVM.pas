@@ -34,7 +34,7 @@ uses
   Classes, SysUtils, Math, Variants, StrUtils,
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
   SedaiConsoleBehavior, SedaiDebugger, SedaiExecutorErrors,
-  SedaiMemoryMapper
+  SedaiMemoryMapper, SedaiSpriteTypes
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
   {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioTypes, SedaiAudioBackend, SedaiSIDEvo{$ENDIF}
   {$IFDEF WEB_MODE}, SedaiWebIO{$ENDIF};
@@ -129,6 +129,8 @@ type
     FOnFileData: TFileDataEvent;
     // Current CMD file handle (0 = screen, >0 = redirected to file)
     FCmdHandle: Integer;
+    // Sprite manager (nil in CLI mode — sprite commands become no-ops)
+    FSpriteManager: ISpriteManager;
     FSwapTempInt: Int64;  // Temp variable for ArraySwapInt superinstruction
     // Event polling callback for UI responsiveness
     FEventPollCallback: TEventPollCallback;
@@ -207,6 +209,7 @@ type
     procedure SetOutputDevice(Device: IOutputDevice);
     procedure SetInputDevice(Device: IInputDevice);
     procedure SetMemoryMapper(Mapper: IMemoryMapper);
+    procedure SetSpriteManager(Manager: ISpriteManager);
     procedure SetConsoleBehavior(ABehavior: TConsoleBehavior; OwnsBehavior: Boolean = False);
     procedure ApplyPreset(Preset: TConsolePreset);
     function GetConsoleBehavior: TConsoleBehavior;
@@ -1506,6 +1509,11 @@ begin
   FMemoryMapper := Mapper;
 end;
 
+procedure TBytecodeVM.SetSpriteManager(Manager: ISpriteManager);
+begin
+  FSpriteManager := Manager;
+end;
+
 procedure TBytecodeVM.SetConsoleBehavior(ABehavior: TConsoleBehavior; OwnsBehavior: Boolean);
 begin
   if FOwnsConsoleBehavior and Assigned(FConsoleBehavior) then
@@ -1527,6 +1535,8 @@ begin
 end;
 
 procedure TBytecodeVM.Reset;
+var
+  i: Integer;
 begin
   FPC := 0;
   FRunning := False;
@@ -1553,6 +1563,9 @@ begin
   FLastErrorLine := 0;
   FLastErrorCode := 0;
   FLastErrorMessage := '';
+  // Reset sprite state
+  if Assigned(FSpriteManager) then
+    FSpriteManager.ResetAllSprites;
 end;
 
 {$IFDEF ENABLE_INSTRUCTION_COUNTING}
@@ -1666,6 +1679,10 @@ begin
       if FIntRegs[Instr.Src2] <> 0 then
         FIntRegs[Instr.Dest] := FIntRegs[Instr.Src1] mod FIntRegs[Instr.Src2]
       else raise Exception.Create('Modulo by zero');
+    bcModFloat:
+      if FFloatRegs[Instr.Src2] <> 0.0 then
+        FFloatRegs[Instr.Dest] := FFloatRegs[Instr.Src1] - Floor(FFloatRegs[Instr.Src1] / FFloatRegs[Instr.Src2]) * FFloatRegs[Instr.Src2]
+      else raise Exception.Create('Float modulo by zero');
     bcNegInt: FIntRegs[Instr.Dest] := -FIntRegs[Instr.Src1];
     bcAddFloat:
       begin
@@ -1787,23 +1804,31 @@ begin
         if SleepMs > 65535000 then SleepMs := 65535000;
         while (SleepMs > 0) and FRunning do
         begin
-          if SleepMs > 50 then
+          if SleepMs > 16 then
           begin
-            Sleep(50);
-            Dec(SleepMs, 50);
+            Sleep(16);
+            Dec(SleepMs, 16);
           end
           else
           begin
             Sleep(SleepMs);
             SleepMs := 0;
           end;
-          if Assigned(FInputDevice) then
+          // Process events and render a frame during sleep
+          if Assigned(FEventPollCallback) then
+            FEventPollCallback()
+          else
           begin
-            FInputDevice.ProcessEvents;
-            if FInputDevice.ShouldStop or FInputDevice.ShouldQuit then
+            if Assigned(FOutputDevice) then
+              FOutputDevice.Present;
+            if Assigned(FInputDevice) then
             begin
-              FRunning := False;
-              FInputDevice.ClearStopRequest;
+              FInputDevice.ProcessEvents;
+              if FInputDevice.ShouldStop or FInputDevice.ShouldQuit then
+              begin
+                FRunning := False;
+                FInputDevice.ClearStopRequest;
+              end;
             end;
           end;
         end;
@@ -2033,8 +2058,16 @@ begin
               end;
               if FInputDevice.HasChar then
                 Break;  // Got a character, exit loop
-              // Update screen to show blinking cursor while waiting
-              if Assigned(FOutputDevice) then
+              // Use event poll callback for full rendering (sprites, cursor, etc.)
+              if Assigned(FEventPollCallback) then
+              begin
+                if FEventPollCallback() then
+                begin
+                  FRunning := False;
+                  Break;
+                end;
+              end
+              else if Assigned(FOutputDevice) then
                 FOutputDevice.Present;
               Sleep(10);  // Prevent busy-wait
             until False;
@@ -3382,7 +3415,6 @@ begin
           FFloatRegs[(Instr.Immediate shr 24) and $FFF],
           FIntRegs[(Instr.Immediate shr 36) and $FFF] <> 0
         );
-        FOutputDevice.Present;
       end;
     3: // bcGraphicCircle
       if Assigned(FOutputDevice) then
@@ -3398,7 +3430,6 @@ begin
           FFloatRegs[(Instr.Immediate shr 40) and $3FF],
           FFloatRegs[(Instr.Immediate shr 50) and $3FF]
         );
-        FOutputDevice.Present;
       end;
     4: // bcGraphicDraw
       if Assigned(FOutputDevice) then
@@ -3423,7 +3454,6 @@ begin
               FOutputDevice.SetPixelCursor(FIntRegs[Instr.Src2], FIntRegs[Instr.Dest]);
             end;
         end;
-        FOutputDevice.Present;
       end;
     5: // bcGraphicLocate
       if Assigned(FOutputDevice) then
@@ -3502,7 +3532,6 @@ begin
         // Src1 = string reg index, Src2 = x, Dest = y (INT), Immediate = mode
         FOutputDevice.LoadShape(FStringRegs[Instr.Src1],
           FIntRegs[Instr.Src2], FIntRegs[Instr.Dest], Instr.Immediate);
-        FOutputDevice.Present;
       end;
     15: // bcGraphicGList - GLIST
       begin
@@ -3730,156 +3759,162 @@ procedure TBytecodeVM.ExecuteSpriteOp(const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
   SpriteNum, Enabled, Priority, Mode: Integer;
-  X, Y, ScaleX, ScaleY, Dist, Angle, Speed: Double;
-  Color, MC1, MC2: Integer;
+  X, Y, ScaleX, ScaleY, Angle, Speed: Double;
+  Color: Integer;
+  SprColor, MC1Color, MC2Color: TSpriteColor;
+  SaveStr: string;
 begin
-  { Group 7: Sprite operations (0x07xx)
-    Opcodes:
-      0 = SPRITE n [,enabled] [,color] [,priority] [,scalex] [,scaley] [,mode]
-      1 = MOVSPR n, x, y (absolute)
-      2 = MOVSPR n, +x, +y (relative)
-      3 = MOVSPR n, dist;angle (polar)
-      4 = MOVSPR n, angle#speed (auto)
-      5 = SPRCOLOR [mc1] [,mc2]
-      6 = SPRSAV src, dst
-      7 = COLLISION type [,line]
-      8 = BUMP(n)
-      9 = RSPCOLOR(n)
-      10 = RSPPOS(sprite, n)
-      11 = RSPRITE(sprite, n)
-
-    Register encoding:
-      SPRITE: Src1=n, Src2=enabled, Dest=color
-              Immediate bits: priority(12) | scalex(12) | scaley(12) | mode(12)
-      MOVSPR*: Src1=n, Src2=x/dist/angle, Src3=y/angle/speed (mapped to Dest)
-      SPRCOLOR: Src1=mc1, Src2=mc2
-      SPRSAV: Src1=src, Src2=dst
-      COLLISION: Src1=type, Src2=line
-  }
+  { Group 7: Sprite operations (0x07xx) — delegated to ISpriteManager }
 
   SubOp := Instr.OpCode and $FF;
 
   case SubOp of
     0: // bcSprite
       begin
-        // SPRITE n [,enabled] [,color] [,priority] [,scalex] [,scaley] [,mode]
         SpriteNum := Round(FFloatRegs[Instr.Src1]);
         if (SpriteNum < 1) or (SpriteNum > 256) then Exit;
 
-        Enabled := 1;  // Default enabled
+        Enabled := 1;
         if Instr.Src2 <> 0 then
           Enabled := Round(FFloatRegs[Instr.Src2]);
 
-        Color := 1;  // Default color
+        Color := 1;
         if Instr.Dest <> 0 then
           Color := Round(FFloatRegs[Instr.Dest]);
 
-        Priority := (Instr.Immediate) and $FFF;
+        Priority := 0;
         ScaleX := 1.0;
         ScaleY := 1.0;
         Mode := 0;
 
-        // TODO: When ISpriteManager is implemented, call:
-        // FSpriteManager.SetSprite(SpriteNum, Enabled, Color, Priority, ScaleX, ScaleY, Mode);
+        if (Instr.Immediate and $FFF) <> 0 then
+          Priority := Round(FFloatRegs[Instr.Immediate and $FFF]);
+        if ((Instr.Immediate shr 12) and $FFF) <> 0 then
+          ScaleX := FFloatRegs[(Instr.Immediate shr 12) and $FFF];
+        if ((Instr.Immediate shr 24) and $FFF) <> 0 then
+          ScaleY := FFloatRegs[(Instr.Immediate shr 24) and $FFF];
+        if ((Instr.Immediate shr 36) and $FFF) <> 0 then
+          Mode := Round(FFloatRegs[(Instr.Immediate shr 36) and $FFF]);
+
+        if Assigned(FSpriteManager) then
+        begin
+          SprColor := MakeIndexedColor(Byte(Color));
+          FSpriteManager.SetSprite(SpriteNum, Enabled, SprColor,
+            Priority, ScaleX, ScaleY, Mode);
+        end;
       end;
 
     1: // bcMovsprAbs
       begin
-        // MOVSPR n, x, y (absolute position)
-        SpriteNum := Round(FFloatRegs[Instr.Src1]);
-        if (SpriteNum < 1) or (SpriteNum > 256) then Exit;
-        X := FFloatRegs[Instr.Src2];
-        Y := FFloatRegs[Instr.Dest];  // Dest is repurposed for y
-
-        // TODO: FSpriteManager.MoveSpriteAbs(SpriteNum, X, Y);
-      end;
-
-    2: // bcMovsprRel
-      begin
-        // MOVSPR n, +x, +y (relative movement)
         SpriteNum := Round(FFloatRegs[Instr.Src1]);
         if (SpriteNum < 1) or (SpriteNum > 256) then Exit;
         X := FFloatRegs[Instr.Src2];
         Y := FFloatRegs[Instr.Dest];
+        if Assigned(FSpriteManager) then
+          FSpriteManager.MoveSpriteAbs(SpriteNum, X, Y);
+      end;
 
-        // TODO: FSpriteManager.MoveSpriteRel(SpriteNum, X, Y);
+    2: // bcMovsprRel
+      begin
+        SpriteNum := Round(FFloatRegs[Instr.Src1]);
+        if (SpriteNum < 1) or (SpriteNum > 256) then Exit;
+        X := FFloatRegs[Instr.Src2];
+        Y := FFloatRegs[Instr.Dest];
+        if Assigned(FSpriteManager) then
+          FSpriteManager.MoveSpriteRel(SpriteNum, X, Y);
       end;
 
     3: // bcMovsprPolar
       begin
-        // MOVSPR n, dist;angle (polar movement)
         SpriteNum := Round(FFloatRegs[Instr.Src1]);
         if (SpriteNum < 1) or (SpriteNum > 256) then Exit;
-        Dist := FFloatRegs[Instr.Src2];
+        X := FFloatRegs[Instr.Src2];  // Distance
         Angle := FFloatRegs[Instr.Dest];
-
-        // TODO: FSpriteManager.MoveSpritePolar(SpriteNum, Dist, Angle);
+        if Assigned(FSpriteManager) then
+          FSpriteManager.MoveSpritePolar(SpriteNum, X, Angle);
       end;
 
     4: // bcMovsprAuto
       begin
-        // MOVSPR n, angle#speed (automatic continuous movement)
         SpriteNum := Round(FFloatRegs[Instr.Src1]);
         if (SpriteNum < 1) or (SpriteNum > 256) then Exit;
         Angle := FFloatRegs[Instr.Src2];
         Speed := FFloatRegs[Instr.Dest];
-
-        // TODO: FSpriteManager.MoveSpriteAuto(SpriteNum, Angle, Speed);
+        if Assigned(FSpriteManager) then
+          FSpriteManager.MoveSpriteAuto(SpriteNum, Angle, Speed);
       end;
 
     5: // bcSprcolor
       begin
-        // SPRCOLOR [mc1] [,mc2]
-        MC1 := 0;
-        MC2 := 0;
-        if Instr.Src1 <> 0 then
-          MC1 := Round(FFloatRegs[Instr.Src1]);
-        if Instr.Src2 <> 0 then
-          MC2 := Round(FFloatRegs[Instr.Src2]);
-
-        // TODO: FSpriteManager.SetSpriteMulticolors(MC1, MC2);
+        if Assigned(FSpriteManager) then
+        begin
+          if Instr.Src1 <> 0 then
+            MC1Color := MakeIndexedColor(Byte(Round(FFloatRegs[Instr.Src1])))
+          else
+            MC1Color := MakeIndexedColor(255);  // 255 = keep current
+          if Instr.Src2 <> 0 then
+            MC2Color := MakeIndexedColor(Byte(Round(FFloatRegs[Instr.Src2])))
+          else
+            MC2Color := MakeIndexedColor(255);
+          FSpriteManager.SetSpriteMulticolors(MC1Color, MC2Color);
+        end;
       end;
 
     6: // bcSprsav
       begin
-        // SPRSAV src, dst (save/load sprite data)
-        // TODO: Implement sprite data save/load
+        SpriteNum := Round(FFloatRegs[Instr.Src1]);
+        if Assigned(FSpriteManager) then
+        begin
+          if (SpriteNum >= 1) and (SpriteNum <= 256) then
+          begin
+            FSpriteManager.SaveSpriteToString(SpriteNum, SaveStr);
+            FStringRegs[Instr.Src2] := SaveStr;
+          end;
+        end;
       end;
 
     7: // bcCollision
       begin
-        // COLLISION type [,line]
-        // TODO: FSpriteManager.SetCollisionHandler(Type, LineNumber);
+        if Assigned(FSpriteManager) then
+          FSpriteManager.SetCollisionHandler(
+            Round(FFloatRegs[Instr.Src1]),
+            Round(FFloatRegs[Instr.Src2]));
       end;
 
-    8: // bcBump - function returning collision bitmask
+    8: // bcBump
       begin
-        // BUMP(n) - returns collision bitmask
-        // TODO: Result := FSpriteManager.GetCollisionStatus(n);
-        FIntRegs[Instr.Dest] := 0;  // No collision for now
+        if Assigned(FSpriteManager) then
+          FFloatRegs[Instr.Dest] := FSpriteManager.GetCollisionStatus(
+            FIntRegs[Instr.Src1])
+        else
+          FFloatRegs[Instr.Dest] := 0;
       end;
 
-    9: // bcRspcolor - function returning multicolor value
+    9: // bcRspcolor
       begin
-        // RSPCOLOR(n) - returns multicolor n (1 or 2)
-        // TODO: Result := FSpriteManager.GetMulticolor(n);
-        FIntRegs[Instr.Dest] := 0;
+        if Assigned(FSpriteManager) then
+          FFloatRegs[Instr.Dest] := SpriteColorToInt(
+            FSpriteManager.GetMulticolor(FIntRegs[Instr.Src1]))
+        else
+          FFloatRegs[Instr.Dest] := 0;
       end;
 
-    10: // bcRsppos - function returning sprite position/speed
+    10: // bcRsppos
       begin
-        // RSPPOS(sprite, attr) - returns position/speed
-        // attr: 0=X, 1=Y, 2=speed
-        // TODO: Result := FSpriteManager.GetSpritePosition(sprite, attr);
-        FFloatRegs[Instr.Dest] := 0.0;
+        if Assigned(FSpriteManager) then
+          FFloatRegs[Instr.Dest] := FSpriteManager.GetSpritePosition(
+            FIntRegs[Instr.Src1], FIntRegs[Instr.Src2])
+        else
+          FFloatRegs[Instr.Dest] := 0;
       end;
 
-    11: // bcRsprite - function returning sprite attribute
+    11: // bcRsprite
       begin
-        // RSPRITE(sprite, attr) - returns sprite attribute
-        // attr: 0=enabled, 1=color, 2=priority, 3=scalex, 4=scaley, 5=mode
-        // TODO: Result := FSpriteManager.GetSpriteAttribute(sprite, attr);
-        FIntRegs[Instr.Dest] := 0;
+        if Assigned(FSpriteManager) then
+          FFloatRegs[Instr.Dest] := FSpriteManager.GetSpriteAttribute(
+            FIntRegs[Instr.Src1], FIntRegs[Instr.Src2])
+        else
+          FFloatRegs[Instr.Dest] := 0;
       end;
 
   else

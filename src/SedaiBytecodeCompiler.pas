@@ -131,6 +131,7 @@ begin
     ssaMulInt: Result := bcMulInt;
     ssaDivInt: Result := bcDivInt;
     ssaModInt: Result := bcModInt;
+    ssaModFloat: Result := bcModFloat;
     ssaNegInt: Result := bcNegInt;
     ssaAddFloat: Result := bcAddFloat;
     ssaSubFloat: Result := bcSubFloat;
@@ -963,6 +964,27 @@ begin
           ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[3].Value.RegType,
             Instr.PhiSources[3].Value.RegIndex, Instr.PhiSources[3].Value.Version)) and $FFF) shl 36);
     end;
+
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // Special handling for MOVSPR - map Src3 to Dest (not Immediate)
+  // MOVSPR has 3 float operands: Src1=spriteNum, Src2=x/dist/angle, Src3=y/angle/speed
+  // Src3 must go to Dest since there is no return value
+  if Instr.OpCode in [ssaMovsprAbs, ssaMovsprRel, ssaMovsprPolar, ssaMovsprAuto] then
+  begin
+    BCOp := CompileSSAOpCode(Instr.OpCode);
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
 
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;

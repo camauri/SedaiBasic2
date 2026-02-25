@@ -66,7 +66,7 @@ type
     ssaCopyInt, ssaCopyFloat, ssaCopyString,
     ssaLoadVar, ssaStoreVar,
     ssaAddInt, ssaSubInt, ssaMulInt, ssaDivInt, ssaModInt, ssaNegInt,
-    ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat, ssaPowFloat, ssaNegFloat,
+    ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat, ssaModFloat, ssaPowFloat, ssaNegFloat,
     ssaIntToFloat, ssaFloatToInt, ssaIntToString, ssaFloatToString,
     ssaStringToInt, ssaStringToFloat,
     ssaCmpEqInt, ssaCmpNeInt, ssaCmpLtInt, ssaCmpGtInt, ssaCmpLeInt, ssaCmpGeInt,

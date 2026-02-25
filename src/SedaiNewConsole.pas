@@ -40,7 +40,7 @@ uses
   SedaiBytecodeDisassembler,
   SedaiSSATypes, SedaiSSA,
   SedaiBasicKeywords, SedaiDebugger,
-  SedaiMemoryMapper, SedaiC128MemoryMapper;
+  SedaiMemoryMapper, SedaiC128MemoryMapper, SedaiSpriteEngine;
 
 const
   SCROLLBACK_LINES = 1000;
@@ -179,10 +179,9 @@ type
     function GetReverseActive: Boolean;
     procedure SetReverseActive(Value: Boolean);
 
-    // Get SDL_Color from palette index (for border/text rendering)
-    function PaletteIndexToSDLColor(Index: Byte): TSDL_Color;
-
   public
+    // Get SDL_Color from palette index (for border/text/sprite rendering)
+    function PaletteIndexToSDLColor(Index: Byte): TSDL_Color;
     // Public method for rendering graphics buffer to screen
     procedure RenderGraphicsTexture;
     constructor Create;
@@ -769,6 +768,7 @@ type
     // VM-based execution (replaces TSedaiExecutor)
     FBytecodeVM: TBytecodeVM;
     FMemoryMapper: TObject;  // Memory mapper for VM (owned, freed in destructor)
+    FSpriteEngine: TC128SpriteEngine;  // Sprite rendering engine (owned)
     FImmediateCompiler: TImmediateCompiler;
 
     // Bytecode mode - when BLOAD is used instead of LOAD
@@ -5383,8 +5383,12 @@ begin
   FBytecodeVM.SetOutputDevice(FVideoController);
   // Use dedicated program input handler for VM (NOT the console input handler)
   FBytecodeVM.SetInputDevice(FProgramInputHandler);
+  // Create sprite engine with SDL2 renderer and palette resolver
+  FSpriteEngine := TC128SpriteEngine.Create(FVideoController.Renderer,
+    @FVideoController.PaletteIndexToSDLColor);
+  FBytecodeVM.SetSpriteManager(FSpriteEngine as ISpriteManager);
   // Create and set memory mapper for PEEK/POKE support
-  FMemoryMapper := TC128MemoryMapper.Create(FVideoController, nil);
+  FMemoryMapper := TC128MemoryMapper.Create(FVideoController, FSpriteEngine as ISpriteManager);
   FBytecodeVM.SetMemoryMapper(FMemoryMapper as IMemoryMapper);
   // Set disk file I/O handlers for DOPEN/DCLOSE/PRINT#/INPUT#/GET#
   FBytecodeVM.OnDiskFile := @HandleDiskFile;
@@ -5445,6 +5449,7 @@ begin
   // Clear VM references to I/O devices and memory mapper before freeing
   if Assigned(FBytecodeVM) then
   begin
+    FBytecodeVM.SetSpriteManager(nil);  // Clear sprite manager reference
     FBytecodeVM.SetOutputDevice(nil);
     FBytecodeVM.SetInputDevice(nil);
     FBytecodeVM.SetMemoryMapper(nil);  // Clear reference before freeing mapper
@@ -5457,6 +5462,13 @@ begin
   begin
     FMemoryMapper.Free;
     FMemoryMapper := nil;
+  end;
+
+  // Free sprite engine (after mapper and VM no longer reference it)
+  if Assigned(FSpriteEngine) then
+  begin
+    FSpriteEngine.Free;
+    FSpriteEngine := nil;
   end;
 
   if Assigned(FImmediateCompiler) then
@@ -5770,6 +5782,10 @@ begin
   end;
   {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: TextBuffer created with ', FVideoController.ModeInfo.TextRows, ' rows x ', FVideoController.ModeInfo.TextCols, ' cols');{$ENDIF}
 
+  // Now that SDL renderer exists, connect it to the sprite engine
+  if Assigned(FSpriteEngine) then
+    FSpriteEngine.SetRenderer(FVideoController.Renderer);
+
   FGraphicEngine := TGraphicEngine.Create(FVideoController);
   {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: GraphicEngine created');{$ENDIF}
 
@@ -5804,13 +5820,19 @@ procedure TSedaiNewConsole.RenderScreen;
 var
   PrevCursorX, PrevCursorY: Integer;
 begin
-  // In graphics mode, render the graphics texture and present
+  // In graphics mode, render the graphics texture (caller handles Present)
   if FVideoController.IsInGraphicsMode then
   begin
     // Clear and render the graphics buffer to screen
     FVideoController.ClearBorder;
     FVideoController.RenderGraphicsTexture;
-    FVideoController.Present;
+    // Render sprites on top of graphics (clipped to viewport)
+    if Assigned(FSpriteEngine) then
+    begin
+      FSpriteEngine.SetViewportOffset(FVideoController.ViewportX, FVideoController.ViewportY,
+        FVideoController.ViewportWidth, FVideoController.ViewportHeight);
+      FSpriteEngine.RenderSprites;
+    end;
     Exit;
   end;
 
@@ -5820,6 +5842,14 @@ begin
 
   // RenderText blits full-window texture (includes border) - no need for ClearBorder
   FVideoController.RenderText(FTextBuffer);
+
+  // Render sprites on top of text (clipped to viewport)
+  if Assigned(FSpriteEngine) then
+  begin
+    FSpriteEngine.SetViewportOffset(FVideoController.ViewportX, FVideoController.ViewportY,
+      FVideoController.ViewportWidth, FVideoController.ViewportHeight);
+    FSpriteEngine.RenderSprites;
+  end;
 
   // Restore cursor position
   FTextBuffer.CursorX := PrevCursorX;
@@ -6170,10 +6200,15 @@ begin
                     BytecodeProgram := FImmediateCompiler.CompileProgram(ProgramSource);
                     if not Assigned(BytecodeProgram) then
                     begin
-                      // ?SYNTAX ERROR IN <line> (<line>:<col>)
+                      // ?SYNTAX ERROR IN <basicline> (<fileline>:<col>)
                       if FImmediateCompiler.LastErrorLine > 0 then
                       begin
-                        if FImmediateCompiler.LastErrorColumn > 0 then
+                        if (FImmediateCompiler.LastErrorColumn > 0) and
+                           (FImmediateCompiler.LastErrorFileLine > 0) then
+                          FTextBuffer.PutString(Format('?%s IN %d (%d:%d)',
+                            [FImmediateCompiler.LastError, FImmediateCompiler.LastErrorLine,
+                             FImmediateCompiler.LastErrorFileLine, FImmediateCompiler.LastErrorColumn]))
+                        else if FImmediateCompiler.LastErrorColumn > 0 then
                           FTextBuffer.PutString(Format('?%s IN %d (%d:%d)',
                             [FImmediateCompiler.LastError, FImmediateCompiler.LastErrorLine,
                              FImmediateCompiler.LastErrorLine, FImmediateCompiler.LastErrorColumn]))
@@ -6296,11 +6331,16 @@ begin
                   if not Assigned(BytecodeProgram) then
                   begin
                     {$IFDEF DEBUG_CONSOLE}WriteLn('DEBUG: Program compilation error: ', FImmediateCompiler.LastError);{$ENDIF}
-                    // ?SYNTAX ERROR IN <line> (<line>:<col>)
+                    // ?SYNTAX ERROR IN <basicline> (<fileline>:<col>)
                     // Note: LastErrorVerbose preserved for future OPTION command
                     if FImmediateCompiler.LastErrorLine > 0 then
                     begin
-                      if FImmediateCompiler.LastErrorColumn > 0 then
+                      if (FImmediateCompiler.LastErrorColumn > 0) and
+                         (FImmediateCompiler.LastErrorFileLine > 0) then
+                        FTextBuffer.PutString(Format('?%s IN %d (%d:%d)',
+                          [FImmediateCompiler.LastError, FImmediateCompiler.LastErrorLine,
+                           FImmediateCompiler.LastErrorFileLine, FImmediateCompiler.LastErrorColumn]))
+                      else if FImmediateCompiler.LastErrorColumn > 0 then
                         FTextBuffer.PutString(Format('?%s IN %d (%d:%d)',
                           [FImmediateCompiler.LastError, FImmediateCompiler.LastErrorLine,
                            FImmediateCompiler.LastErrorLine, FImmediateCompiler.LastErrorColumn]))
@@ -9172,10 +9212,14 @@ begin
   Now := SDL_GetTicks;
   if (Now - FLastVMRenderTick) >= 16 then
   begin
+    // Update sprite auto-movement
+    if Assigned(FSpriteEngine) then
+      FSpriteEngine.UpdateSprites((Now - FLastVMRenderTick) / 1000.0);
     FLastVMRenderTick := Now;
-    if FTextBuffer.NeedsRedraw then
+    // Render when text changed or sprites are active
+    if FTextBuffer.NeedsRedraw or Assigned(FSpriteEngine) then
     begin
-      RenderScreen;
+      RenderScreen;  // includes sprite rendering
       UpdateCursor;
       FVideoController.Present;
     end;
@@ -9191,13 +9235,10 @@ end;
 procedure TSedaiNewConsole.EndVMExecution;
 begin
   FBytecodeVM.EventPollCallback := nil;
-  // Final render to show the last state
-  if FTextBuffer.NeedsRedraw then
-  begin
-    RenderScreen;
-    UpdateCursor;
-    FVideoController.Present;
-  end;
+  // Final render to show the last state (including sprites via RenderScreen)
+  RenderScreen;
+  UpdateCursor;
+  FVideoController.Present;
 end;
 
 procedure TSedaiNewConsole.Run;

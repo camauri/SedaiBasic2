@@ -220,6 +220,7 @@ const
   bcTrap            = bcGroupCore + 90;  // TRAP linenum: Set error handler line
   bcResume          = bcGroupCore + 91;  // RESUME: Continue after error at error line
   bcResumeNext      = bcGroupCore + 92;  // RESUME NEXT: Continue after error at next statement
+  bcModFloat        = bcGroupCore + 93;  // Float modulo (A - Floor(A/B) * B)
 
   // === GROUP 1: STRING OPERATIONS (0x01xx) ===
   bcStrConcat       = bcGroupString + 0;
@@ -1104,6 +1105,7 @@ begin
         90: Result := 'Trap';
         91: Result := 'Resume';
         92: Result := 'ResumeNext';
+        93: Result := 'ModFloat';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

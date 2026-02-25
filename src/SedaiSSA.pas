@@ -643,6 +643,11 @@ begin
             EmitInstruction(ssaBitwiseNot, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           end;
         end
+        else if Node.Token.TokenType = ttOpAdd then
+        begin
+          // Unary plus - just return the operand unchanged
+          Result := Left;
+        end
         else
         begin
           // Negation (-)
@@ -1028,29 +1033,37 @@ begin
           Result := MakeSSARegister(srtFloat, DestReg);
           OpCode := ssaDivFloat;
         end
-        // SPECIAL CASE: MOD always works with integers
+        // MOD: float if any operand is float, otherwise integer
         else if Node.Token.TokenType = ttOpMod then
         begin
-          // Convert both operands to int if needed (truncate floats)
-          if Left.RegType = srtFloat then
+          if (Left.RegType = srtFloat) or (Right.RegType = srtFloat) then
           begin
-            TempReg := FProgram.AllocRegister(srtInt);
-            TempVal := MakeSSARegister(srtInt, TempReg);
-            EmitInstruction(ssaFloatToInt, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-            Left := TempVal;
-          end;
-          if Right.RegType = srtFloat then
+            // Float MOD: convert int operands to float if needed
+            if Left.RegType = srtInt then
+            begin
+              TempReg := FProgram.AllocRegister(srtFloat);
+              TempVal := MakeSSARegister(srtFloat, TempReg);
+              EmitInstruction(ssaIntToFloat, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              Left := TempVal;
+            end;
+            if Right.RegType = srtInt then
+            begin
+              TempReg := FProgram.AllocRegister(srtFloat);
+              TempVal := MakeSSARegister(srtFloat, TempReg);
+              EmitInstruction(ssaIntToFloat, TempVal, Right, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              Right := TempVal;
+            end;
+            DestReg := FProgram.AllocRegister(srtFloat);
+            Result := MakeSSARegister(srtFloat, DestReg);
+            OpCode := ssaModFloat;
+          end
+          else
           begin
-            TempReg := FProgram.AllocRegister(srtInt);
-            TempVal := MakeSSARegister(srtInt, TempReg);
-            EmitInstruction(ssaFloatToInt, TempVal, Right, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-            Right := TempVal;
+            // Integer MOD: both operands are already int
+            DestReg := FProgram.AllocRegister(srtInt);
+            Result := MakeSSARegister(srtInt, DestReg);
+            OpCode := ssaModInt;
           end;
-
-          // Result is always int for MOD
-          DestReg := FProgram.AllocRegister(srtInt);
-          Result := MakeSSARegister(srtInt, DestReg);
-          OpCode := ssaModInt;
         end
         // Determine result type and allocate register (use hint if compatible)
         else if (Left.RegType = srtFloat) or (Right.RegType = srtFloat) then
@@ -1828,6 +1841,107 @@ begin
         end
         else
           Result := MakeSSAValue(svkNone);
+      end
+      else
+        Result := MakeSSAValue(svkNone);
+    end;
+
+    antSpriteFunction:
+    begin
+      // Handle sprite query functions: BUMP, RSPCOLOR, RSPPOS, RSPRITE
+      // AST structure: antSpriteFunction with Value=FuncName
+      //   Child 0: antArgumentList with 1-2 args
+      // All return float values (BASIC variables are float by default)
+      FuncName := Node.Attributes.Values['sprite_func'];
+      if FuncName = '' then
+        FuncName := UpperCase(VarToStr(Node.Value));
+
+      if Node.ChildCount > 0 then
+        ArgListNode := Node.GetChild(0)
+      else
+        ArgListNode := nil;
+
+      if FuncName = 'BUMP' then
+      begin
+        // BUMP(n) - n: 1=sprite-sprite, 2=sprite-background
+        if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+        begin
+          ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+          ArgReg := EnsureIntRegister(ArgValue);
+        end
+        else
+        begin
+          TempReg := FProgram.AllocRegister(srtInt);
+          ArgReg := MakeSSARegister(srtInt, TempReg);
+          EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+        DestReg := FProgram.AllocRegister(srtFloat);
+        Result := MakeSSARegister(srtFloat, DestReg);
+        EmitInstruction(ssaBump, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if FuncName = 'RSPCOLOR' then
+      begin
+        // RSPCOLOR(n) - n: 1=MC1, 2=MC2
+        if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+        begin
+          ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+          ArgReg := EnsureIntRegister(ArgValue);
+        end
+        else
+        begin
+          TempReg := FProgram.AllocRegister(srtInt);
+          ArgReg := MakeSSARegister(srtInt, TempReg);
+          EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+        DestReg := FProgram.AllocRegister(srtFloat);
+        Result := MakeSSARegister(srtFloat, DestReg);
+        EmitInstruction(ssaRspcolor, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if FuncName = 'RSPPOS' then
+      begin
+        // RSPPOS(sprite, attr) - attr: 0=X, 1=Y, 2=speed
+        if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+        begin
+          ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+          ArgReg := EnsureIntRegister(ArgValue);
+          ProcessExpression(ArgListNode.GetChild(1), Arg2Value);
+          Arg2Reg := EnsureIntRegister(Arg2Value);
+        end
+        else
+        begin
+          TempReg := FProgram.AllocRegister(srtInt);
+          ArgReg := MakeSSARegister(srtInt, TempReg);
+          EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          TempReg := FProgram.AllocRegister(srtInt);
+          Arg2Reg := MakeSSARegister(srtInt, TempReg);
+          EmitInstruction(ssaLoadConstInt, Arg2Reg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+        DestReg := FProgram.AllocRegister(srtFloat);
+        Result := MakeSSARegister(srtFloat, DestReg);
+        EmitInstruction(ssaRsppos, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
+      end
+      else if FuncName = 'RSPRITE' then
+      begin
+        // RSPRITE(sprite, attr) - attr: 0=enabled, 1=color, 2=priority, 3=scalex, 4=scaley, 5=mode
+        if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+        begin
+          ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+          ArgReg := EnsureIntRegister(ArgValue);
+          ProcessExpression(ArgListNode.GetChild(1), Arg2Value);
+          Arg2Reg := EnsureIntRegister(Arg2Value);
+        end
+        else
+        begin
+          TempReg := FProgram.AllocRegister(srtInt);
+          ArgReg := MakeSSARegister(srtInt, TempReg);
+          EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          TempReg := FProgram.AllocRegister(srtInt);
+          Arg2Reg := MakeSSARegister(srtInt, TempReg);
+          EmitInstruction(ssaLoadConstInt, Arg2Reg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+        DestReg := FProgram.AllocRegister(srtFloat);
+        Result := MakeSSARegister(srtFloat, DestReg);
+        EmitInstruction(ssaRsprite, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
       end
       else
         Result := MakeSSAValue(svkNone);

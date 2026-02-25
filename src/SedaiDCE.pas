@@ -318,6 +318,11 @@ begin
     ssaGraphicSShape, ssaGraphicGShape, ssaGraphicGList, ssaPLoad, ssaPSave, ssaPRst, ssaScnClr:
       Result := True;
 
+    // Sprite operations - always live (modify sprite state)
+    ssaSprite, ssaMovsprAbs, ssaMovsprRel, ssaMovsprPolar, ssaMovsprAuto,
+    ssaSprcolor, ssaSprsav, ssaCollision:
+      Result := True;
+
     // Sound operations - always live (audible side effects)
     ssaSoundVol, ssaSoundSound, ssaSoundEnvelope, ssaSoundTempo, ssaSoundPlay, ssaSoundFilter:
       Result := True;
