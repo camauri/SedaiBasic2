@@ -56,15 +56,15 @@
 630 PRINT "TEST 3: Cursor Position (211=col, 214=row)"
 640 PRINT "------------------------------"
 650 OC = PEEK(211)
-660 OR = PEEK(214)
-670 PRINT "Cursor at col "; OC; ", row "; OR
+660 OW = PEEK(214)
+670 PRINT "Cursor at col "; OC; ", row "; OW
 680 POKE 211, 20
 690 POKE 214, 10
 700 NC = PEEK(211)
 710 NR = PEEK(214)
 720 PRINT "After POKE: col "; NC; ", row "; NR
 730 POKE 211, OC
-740 POKE 214, OR
+740 POKE 214, OW
 750 TN$ = "Cursor col POKE": EX = 20: AC = NC: GOSUB 9500
 760 TN$ = "Cursor row POKE": EX = 10: AC = NR: GOSUB 9500
 770 PRINT
