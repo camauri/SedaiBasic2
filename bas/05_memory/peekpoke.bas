@@ -99,33 +99,15 @@
 1160 PRINT
 
 1200 REM =============================================
-1210 REM  TEST 6: Screen Memory (1024-2023)
-1220 REM =============================================
-1230 PRINT "TEST 6: Screen Memory Direct Access"
-1240 PRINT "------------------------------"
-1250 REM Read character at position (0,0)
-1260 SC = PEEK(1024)
-1270 PRINT "Char at (0,0): "; SC; " = '"; CHR$(SC); "'"
-1280 REM Write a character
-1290 POKE 1064, 1  : REM 'A' at position 40 (row 1, col 0)
-1300 RC = PEEK(1064)
-1310 TN$ = "Screen memory write": EX = 1: AC = RC: GOSUB 9500
-1320 POKE 1064, 32 : REM Clear it
-1330 PRINT
-
-1400 REM =============================================
-1410 REM  TEST 7: Color RAM (55296-56295)
-1420 REM =============================================
-1430 PRINT "TEST 7: Color RAM Direct Access"
-1440 PRINT "------------------------------"
-1450 REM Read color at position (0,0)
-1460 CC = PEEK(55296)
-1470 PRINT "Color at (0,0): "; CC
-1480 REM Write a color at position 40 (row 1, col 0)
-1490 POKE 55336, 2  : REM Red color
-1500 RCC = PEEK(55336)
-1510 TN$ = "Color RAM write": EX = 2: AC = RCC: GOSUB 9500
-1520 PRINT
+1210 REM  TEST 6-7: Screen Memory / Color RAM
+1220 REM  SKIPPED - requires original 40-col C128 mode
+1230 REM  (screen mem at 1024-2023 and color RAM at
+1240 REM   55296-56295 assume 40-col layout)
+1250 REM =============================================
+1260 PRINT "TEST 6-7: Screen/Color RAM Direct Access"
+1270 PRINT "------------------------------"
+1280 PRINT "  [SKIP] Requires 40-col C128 text mode"
+1290 PRINT
 
 1600 REM =============================================
 1610 REM  TEST 8: SID Volume (54296)
