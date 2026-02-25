@@ -781,6 +781,12 @@ var
 begin
   if MusicStr = '' then Exit;
 
+  // Flush display so any preceding PRINT is visible before blocking on playback
+  if Assigned(FInputDevice) then
+    FInputDevice.ProcessEvents;
+  if Assigned(FOutputDevice) then
+    FOutputDevice.Present;
+
   // Defaults
   Voice := 1;
   Octave := 4;
@@ -881,12 +887,25 @@ begin
             FSIDEvo.SetWaveform(Voice - 1, Waveform);
             FSIDEvo.SetVoiceVolume(Voice - 1, Volume / 15.0);
 
+            // Set pulse width if pulse waveform
+            if Waveform = SIDEVO_WAVE_PULSE then
+              FSIDEvo.SetPulseWidth(Voice - 1, FAudioEnvelopes[Envelope].PulseWidth);
+
             // Set ADSR from envelope (SIDEvo uses 0.0-1.0 for level ratios)
             FSIDEvo.SetADSR(Voice - 1,
               FAudioEnvelopes[Envelope].Attack,
               FAudioEnvelopes[Envelope].Decay,
               FAudioEnvelopes[Envelope].Sustain,
               FAudioEnvelopes[Envelope].Release);
+
+            // Route voice through filter if enabled
+            if FilterOn then
+              FSIDEvo.SetFilterVoiceRouting(Voice = 1, Voice = 2, Voice = 3, False)
+            else
+              FSIDEvo.SetFilterVoiceRouting(False, False, False, False);
+
+            // Reset envelope to avoid ADSR delay bug (Sustain=15 -> $FF wrap -> HoldZero)
+            FSIDEvo.ResetVoiceEnvelope(Voice - 1);
 
             // Trigger note (gate on)
             FSIDEvo.GateOn(Voice - 1);
@@ -3679,6 +3698,11 @@ var
   {$IFDEF WITH_SEDAI_AUDIO}
   VoiceIdx: Integer;
   DurationMs: Integer;
+  Dir, WaveformIdx, PulseWidthVal: Integer;
+  MinFreq, SweepSpeed: Integer;
+  CurrentFreq, StartFreq: Integer;
+  Remaining, SleepStep: Integer;
+  SweepUp: Boolean;
   {$ENDIF}
 begin
   SubOp := Instr.OpCode and $FF;
@@ -3707,28 +3731,107 @@ begin
         VoiceIdx := FIntRegs[Instr.Src1] - 1;
         DurationMs := FIntRegs[Instr.Dest] * 1000 div 60;
 
+        // Extract optional params from register indices in Immediate
+        // Layout: dir(8) | minfreq(12) | sweeptime(12) | waveform(8) | pw(12)
+        Dir := FIntRegs[(Instr.Immediate) and $FF];
+        MinFreq := FIntRegs[(Instr.Immediate shr 8) and $FFF];
+        SweepSpeed := FIntRegs[(Instr.Immediate shr 20) and $FFF];
+        WaveformIdx := FIntRegs[(Instr.Immediate shr 32) and $FF];
+        PulseWidthVal := FIntRegs[(Instr.Immediate shr 40) and $FFF];
+
         FAudioBackend.Lock;
         try
+          // Reset envelope state machine to avoid the ADSR delay bug:
+          // When Sustain=15 ($FF), rapid retrigger causes Inc($FF)->$00 wrap
+          // which triggers HoldZero, permanently silencing the voice.
+          FSIDEvo.ResetVoiceEnvelope(VoiceIdx);
+
           // Convert SID frequency to Hz: SID_value * PAL_clock / 16777216
           // Simplified: SID_value * 0.0596 (for PAL 985248 Hz clock)
           FSIDEvo.SetFrequencyHz(VoiceIdx, FIntRegs[Instr.Src2] * 0.0596);
-          case (Instr.Immediate shr 32) and $FF of
+          case WaveformIdx of
             0: FSIDEvo.SetWaveform(VoiceIdx, SIDEVO_WAVE_TRIANGLE);
             1: FSIDEvo.SetWaveform(VoiceIdx, SIDEVO_WAVE_SAWTOOTH);
-            2: FSIDEvo.SetWaveform(VoiceIdx, SIDEVO_WAVE_PULSE);
+            2: begin
+                 FSIDEvo.SetWaveform(VoiceIdx, SIDEVO_WAVE_PULSE);
+                 if PulseWidthVal > 0 then
+                   FSIDEvo.SetPulseWidth(VoiceIdx, PulseWidthVal / 4095.0)
+                 else
+                   FSIDEvo.SetPulseWidth(VoiceIdx, 0.5);
+               end;
             3: FSIDEvo.SetWaveform(VoiceIdx, SIDEVO_WAVE_NOISE);
           else
             FSIDEvo.SetWaveform(VoiceIdx, SIDEVO_WAVE_SAWTOOTH);
           end;
+          // Default ADSR for SOUND: instant on, full sustain, instant off
+          FSIDEvo.SetADSR(VoiceIdx, 0.0, 0.0, 1.0, 0.0);
+          // Ensure full voice volume (PLAY may have changed it via Un)
+          FSIDEvo.SetVoiceVolume(VoiceIdx, 1.0);
           FSIDEvo.GateOn(VoiceIdx);
         finally
           FAudioBackend.Unlock;
         end;
 
+        // Flush pending display output before blocking on sound duration
+        if Assigned(FInputDevice) then
+          FInputDevice.ProcessEvents;
+        if Assigned(FOutputDevice) then
+          FOutputDevice.Present;
+
         // Wait for duration (outside lock to allow callback to run)
         if DurationMs > 0 then
         begin
-          CooperativeSleep(DurationMs);
+          // Frequency sweep if sweep params are set
+          if (SweepSpeed > 0) and (Dir in [0, 1, 2]) then
+          begin
+            StartFreq := FIntRegs[Instr.Src2];
+            CurrentFreq := StartFreq;
+            SweepUp := True;  // For oscillate mode
+            Remaining := DurationMs;
+            while Remaining > 0 do
+            begin
+              SleepStep := Remaining;
+              if SleepStep > 16 then SleepStep := 16;  // ~1 jiffy per step
+              CooperativeSleep(SleepStep);
+              Dec(Remaining, SleepStep);
+              case Dir of
+                0: begin // Sweep up
+                     CurrentFreq := CurrentFreq + SweepSpeed;
+                     if CurrentFreq > 65535 then CurrentFreq := 65535;
+                   end;
+                1: begin // Sweep down
+                     CurrentFreq := CurrentFreq - SweepSpeed;
+                     if CurrentFreq < 0 then CurrentFreq := 0;
+                   end;
+                2: begin // Oscillate between MinFreq and StartFreq
+                     if SweepUp then
+                     begin
+                       CurrentFreq := CurrentFreq + SweepSpeed;
+                       if CurrentFreq >= StartFreq then
+                       begin
+                         CurrentFreq := StartFreq;
+                         SweepUp := False;
+                       end;
+                     end else begin
+                       CurrentFreq := CurrentFreq - SweepSpeed;
+                       if CurrentFreq <= MinFreq then
+                       begin
+                         CurrentFreq := MinFreq;
+                         SweepUp := True;
+                       end;
+                     end;
+                   end;
+              end;
+              FAudioBackend.Lock;
+              try
+                FSIDEvo.SetFrequencyHz(VoiceIdx, CurrentFreq * 0.0596);
+              finally
+                FAudioBackend.Unlock;
+              end;
+            end;
+          end else
+            CooperativeSleep(DurationMs);
+
           FAudioBackend.Lock;
           try
             FSIDEvo.GateOff(VoiceIdx);
@@ -3745,12 +3848,12 @@ begin
       if FAudioInitialized then
         if (FIntRegs[Instr.Src1] >= 0) and (FIntRegs[Instr.Src1] <= 9) then
         begin
-          FAudioEnvelopes[FIntRegs[Instr.Src1]].Attack := ((Instr.Immediate) and $FF) / 15.0;
-          FAudioEnvelopes[FIntRegs[Instr.Src1]].Decay := ((Instr.Immediate shr 8) and $FF) / 15.0;
-          FAudioEnvelopes[FIntRegs[Instr.Src1]].Sustain := ((Instr.Immediate shr 16) and $FF) / 15.0;
-          FAudioEnvelopes[FIntRegs[Instr.Src1]].Release := ((Instr.Immediate shr 24) and $FF) / 15.0;
-          FAudioEnvelopes[FIntRegs[Instr.Src1]].Waveform := (Instr.Immediate shr 32) and $FF;
-          FAudioEnvelopes[FIntRegs[Instr.Src1]].PulseWidth := ((Instr.Immediate shr 40) and $FFF) / 4095.0;
+          FAudioEnvelopes[FIntRegs[Instr.Src1]].Attack := FIntRegs[(Instr.Immediate) and $FF] / 15.0;
+          FAudioEnvelopes[FIntRegs[Instr.Src1]].Decay := FIntRegs[(Instr.Immediate shr 8) and $FF] / 15.0;
+          FAudioEnvelopes[FIntRegs[Instr.Src1]].Sustain := FIntRegs[(Instr.Immediate shr 16) and $FF] / 15.0;
+          FAudioEnvelopes[FIntRegs[Instr.Src1]].Release := FIntRegs[(Instr.Immediate shr 24) and $FF] / 15.0;
+          FAudioEnvelopes[FIntRegs[Instr.Src1]].Waveform := FIntRegs[(Instr.Immediate shr 32) and $FF];
+          FAudioEnvelopes[FIntRegs[Instr.Src1]].PulseWidth := FIntRegs[(Instr.Immediate shr 40) and $FFF] / 4095.0;
         end;
       {$ELSE}
       ; // No audio support

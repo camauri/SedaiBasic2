@@ -477,6 +477,7 @@ begin
     bcArrayShiftLeft, bcArrayReverseRange,
     // === GROUP 11: Sound ===
     bcSoundFilter,  // Src2 = lowpass (int 0/1)
+    bcSoundSound,   // Src2 = frequency (int)
     // === GROUP 6: File I/O operations ===
     bcRecord:       // Src2 = position (int)
       Result := True;
@@ -503,8 +504,6 @@ begin
     bcSquareSumFloat, bcAddSquareFloat, bcMulMulFloat, bcAddSqrtFloat,
     // LOGN(base, x): Src2 is 'x' (the value)
     bcMathLogN,
-    // === GROUP 6: Sound operations ===
-    bcSoundSound,  // Src2 = frequency (float)
     // === GROUP 4: I/O operations ===
     bcPrintUsing:  // PRINT USING - Src2 = value (float)
       Result := True;
@@ -858,6 +857,27 @@ begin
     begin
       MarkIntRegUsed(Instr.Immediate and $FF);           // hp register
       MarkIntRegUsed((Instr.Immediate shr 8) and $FF);   // resonance register
+    end;
+
+    // bcSoundSound: Immediate contains dir(8) | minfreq(12) | sweeptime(12) | waveform(8) | pw(12)
+    if OpCode = bcSoundSound then
+    begin
+      MarkIntRegUsed((Instr.Immediate) and $FF);           // dir register
+      MarkIntRegUsed((Instr.Immediate shr 8) and $FFF);    // minfreq register
+      MarkIntRegUsed((Instr.Immediate shr 20) and $FFF);   // sweeptime register
+      MarkIntRegUsed((Instr.Immediate shr 32) and $FF);    // waveform register
+      MarkIntRegUsed((Instr.Immediate shr 40) and $FFF);   // pulsewidth register
+    end;
+
+    // bcSoundEnvelope: Immediate contains attack(8) | decay(8) | sustain(8) | release(8) | waveform(8) | pw(12)
+    if OpCode = bcSoundEnvelope then
+    begin
+      MarkIntRegUsed((Instr.Immediate) and $FF);           // attack register
+      MarkIntRegUsed((Instr.Immediate shr 8) and $FF);     // decay register
+      MarkIntRegUsed((Instr.Immediate shr 16) and $FF);    // sustain register
+      MarkIntRegUsed((Instr.Immediate shr 24) and $FF);    // release register
+      MarkIntRegUsed((Instr.Immediate shr 32) and $FF);    // waveform register
+      MarkIntRegUsed((Instr.Immediate shr 40) and $FFF);   // pulsewidth register
     end;
 
     // bcArrayDim has no register operands (info is in metadata)
@@ -1399,6 +1419,118 @@ begin
       else
         NewReg := OldReg;
       NewImm := NewImm or ((Int64(NewReg) and $FF) shl 8);
+
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
+      end;
+    end;
+
+    // bcSoundSound: Immediate contains dir(8) | minfreq(12) | sweeptime(12) | waveform(8) | pw(12)
+    if OpCode = bcSoundSound then
+    begin
+      NewImm := 0;
+
+      // dir (bits 0-7) - int register
+      OldReg := (Instr.Immediate) and $FF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or (Int64(NewReg) and $FF);
+
+      // minfreq (bits 8-19) - int register
+      OldReg := (Instr.Immediate shr 8) and $FFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFF) shl 8);
+
+      // sweeptime (bits 20-31) - int register
+      OldReg := (Instr.Immediate shr 20) and $FFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFF) shl 20);
+
+      // waveform (bits 32-39) - int register
+      OldReg := (Instr.Immediate shr 32) and $FF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FF) shl 32);
+
+      // pulsewidth (bits 40-51) - int register
+      OldReg := (Instr.Immediate shr 40) and $FFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFF) shl 40);
+
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
+      end;
+    end;
+
+    // bcSoundEnvelope: Immediate contains attack(8) | decay(8) | sustain(8) | release(8) | waveform(8) | pw(12)
+    if OpCode = bcSoundEnvelope then
+    begin
+      NewImm := 0;
+
+      // attack (bits 0-7) - int register
+      OldReg := (Instr.Immediate) and $FF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or (Int64(NewReg) and $FF);
+
+      // decay (bits 8-15) - int register
+      OldReg := (Instr.Immediate shr 8) and $FF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FF) shl 8);
+
+      // sustain (bits 16-23) - int register
+      OldReg := (Instr.Immediate shr 16) and $FF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FF) shl 16);
+
+      // release (bits 24-31) - int register
+      OldReg := (Instr.Immediate shr 24) and $FF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FF) shl 24);
+
+      // waveform (bits 32-39) - int register
+      OldReg := (Instr.Immediate shr 32) and $FF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FF) shl 32);
+
+      // pulsewidth (bits 40-51) - int register
+      OldReg := (Instr.Immediate shr 40) and $FFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+        NewReg := FIntRegMap[OldReg]
+      else
+        NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFF) shl 40);
 
       if NewImm <> Instr.Immediate then
       begin

@@ -324,7 +324,8 @@ end;
 
 procedure TTerminalController.Present;
 begin
-  // Terminal output is immediate, no buffering
+  // Flush stdout so text appears before blocking operations (e.g. SOUND, PLAY)
+  Flush(System.Output);
 end;
 
 procedure TTerminalController.SetFullscreen(Enabled: Boolean);

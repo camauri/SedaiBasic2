@@ -171,13 +171,14 @@
 2150 print "Expected: 3 beeps at different pitches"
 2160 print "          LOW beep -> MEDIUM beep -> HIGH beep"
 2170 print
+2175 vol 15
 2180 gosub 5000
-2190 print "  Low frequency (2048)..."
-2200 sound 1,2048,60
+2190 print "  Low frequency (4096)..."
+2200 sound 1,4096,60
 2210 print "  Medium frequency (8192)..."
 2220 sound 1,8192,60
-2230 print "  High frequency (32768)..."
-2240 sound 1,32768,60
+2230 print "  High frequency (16384)..."
+2240 sound 1,16384,60
 2250 print
 2260 print "Did you hear 3 beeps: LOW -> MEDIUM -> HIGH?"
 2270 gosub 5100
@@ -190,20 +191,20 @@
 2420 rem =============================================
 2430 total% = total% + 1
 2440 print "TEST 9: SOUND - Waveforms"
-2450 print "Expected: 4 DIFFERENT timbres (same pitch)"
-2460 print "  Triangle=smooth, Saw=buzzy, Pulse=hollow, Noise=static"
+2450 print "Expected: 4 DIFFERENT timbres"
+2460 print "  1=Noise, 2=Pulse, 3=Triangle, 4=Sawtooth"
 2470 print
 2480 gosub 5000
-2490 print "  Triangle (smooth, mellow)..."
-2500 sound 1,8192,90,0,0,0,0,0
-2510 print "  Sawtooth (bright, buzzy)..."
-2520 sound 1,8192,90,0,0,0,1,0
-2530 print "  Pulse (hollow, synth-like)..."
-2540 sound 1,8192,90,0,0,0,2,2048
-2550 print "  Noise (static, hissing)..."
-2560 sound 1,8192,90,0,0,0,3,0
+2490 print "  1. Noise (static hiss)..."
+2500 sound 1,8192,90,0,0,0,3,0
+2510 print "  2. Pulse 50% (hollow square)..."
+2520 sound 1,8192,90,0,0,0,2,2048
+2530 print "  3. Triangle (smooth mellow)..."
+2540 sound 1,8192,90,0,0,0,0,0
+2550 print "  4. Sawtooth (bright buzzy)..."
+2560 sound 1,8192,90,0,0,0,1,0
 2570 print
-2580 print "Did you hear 4 DIFFERENT sound qualities?"
+2580 print "Which sounds did you hear (1/2/3/4)?"
 2590 gosub 5100
 2600 if r$ = "R" then 2440
 2610 if r$ = "Y" then passed% = passed% + 1 : else failed% = failed% + 1
@@ -271,10 +272,10 @@
 3380 gosub 5000
 3390 tempo 10
 3400 print "  WITHOUT filter (bright, clear)..."
-3410 play "v1 o5 t0 u8 x0 cdefgab"
+3410 play "v1 o4 t0 u8 x0 cdefgab"
 3420 print "  WITH low-pass filter (muffled, dull)..."
-3430 filter 800,1,0,0,12
-3440 play "v1 o5 t0 u8 x1 cdefgab"
+3430 filter 1000,1,0,0,0
+3440 play "v1 o4 t0 u8 x1 cdefgab"
 3450 print
 3460 print "Did second scale sound MORE MUFFLED?"
 3470 gosub 5100
@@ -295,7 +296,7 @@
 3700 print "  WITHOUT filter (full sound)..."
 3710 play "v1 o3 t0 u8 x0 cdefgab"
 3720 print "  WITH high-pass filter (thin, tinny)..."
-3730 filter 1500,0,0,1,10
+3730 filter 8000,0,0,1,0
 3740 play "v1 o3 t0 u8 x1 cdefgab"
 3750 print
 3760 print "Did second scale sound THINNER/TINNY?"
