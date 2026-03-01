@@ -371,6 +371,7 @@ begin
       Lexer.SetRequireSpacesBetweenTokens(True);
       Lexer.SetCaseSensitive(False);
       Lexer.Source := Source.Text;
+      Lexer.PreScanOptions;
       TokenList := Lexer.ScanAllTokensFast;
     except
       on E: Exception do

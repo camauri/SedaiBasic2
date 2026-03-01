@@ -122,23 +122,24 @@
 1510 rem  TEST 6: ENVELOPE - Custom instrument
 1520 rem =============================================
 1530 total% = total% + 1
-1540 print "TEST 6: ENVELOPE - Custom Instrument"
-1550 print "Expected: First=default piano, Second=organ-like"
-1560 print "          Organ should sound more sustained"
+1540 print "TEST 6: ENVELOPE - Piano vs Organ"
+1550 print "Expected: First=piano (notes fade out)"
+1560 print "          Second=organ (notes sustain fully)"
 1570 print
 1580 gosub 5000
-1590 tempo 10
-1600 print "  Default piano (T0)..."
-1610 play "t0 cdefg"
-1620 print "  Custom organ: ENVELOPE 1,0,0,15,0,1 (sustained)"
-1630 envelope 1,0,0,15,0,1
-1640 play "t1 cdefg"
-1650 print
-1660 print "Did second sound more SUSTAINED than first?"
-1670 gosub 5100
-1680 if r$ = "R" then 1540
-1690 if r$ = "Y" then passed% = passed% + 1 : else failed% = failed% + 1
-1700 print
+1590 tempo 8
+1600 print "  Piano (A=0 D=9 S=0 R=9 - fading notes)..."
+1610 envelope 0,0,9,0,9,1
+1620 play "t0 cdefg"
+1630 print "  Organ (A=0 D=0 S=15 R=0 - sustained notes)..."
+1640 envelope 1,0,0,15,0,1
+1650 play "t1 cdefg"
+1660 print
+1670 print "Did piano FADE while organ SUSTAINED?"
+1680 gosub 5100
+1690 if r$ = "R" then 1540
+1700 if r$ = "Y" then passed% = passed% + 1 : else failed% = failed% + 1
+1710 print
 
 1800 rem =============================================
 1810 rem  TEST 7: PLAY - Volume control (Un)

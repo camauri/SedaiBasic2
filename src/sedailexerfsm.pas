@@ -222,6 +222,7 @@ type
     procedure SetHasLineNumbers(Value: Boolean);
     procedure SetRequireSpacesBetweenTokens(Value: Boolean);
     procedure SetCaseSensitive(Value: Boolean);
+    procedure PreScanOptions;
 
     // === DEBUGGING ===
     {$IFDEF DEBUG}
@@ -1285,6 +1286,7 @@ function TLexerFSM.ProcessIdentifier: TLexerToken;
 var
   Match: TKeywordMatchResult;
   TokenText: string;
+  OrigLen, Rewind: Integer;
 begin
   Result := nil;
 
@@ -1301,7 +1303,19 @@ begin
   Match := ResolveKeyword(TokenText);
 
   if Match.Found then
-    Result := CreateToken(Match.KeywordInfo.TokenType, Match.KeywordInfo)
+  begin
+    // Spaceless mode: rewind cursor if keyword is prefix of longer token
+    if (Match.MatchType = mtPrefix) and (not FLexerOptions.RequireSpacesBetweenTokens) then
+    begin
+      OrigLen := FTokenLength;
+      Rewind := OrigLen - Match.MatchedLength;
+      FTokenLength := Match.MatchedLength;
+      FCurrentPosition := FCurrentPosition - Rewind;
+      FCurrentColumn := FCurrentColumn - Rewind;
+      FLastTokenLength := -1; // Invalidate cache
+    end;
+    Result := CreateToken(Match.KeywordInfo.TokenType, Match.KeywordInfo);
+  end
   else
     Result := CreateToken(ttIdentifier);
 end;
@@ -1416,7 +1430,10 @@ begin
   Options := CreateDefaultSearchOptions;
   Options.CaseSensitive := FLexerOptions.CaseSensitive;
   Options.AllowPartialMatch := not FLexerOptions.RequireSpacesBetweenTokens;
-  Options.MaxResults := 1; // We only want the best match
+  if Options.AllowPartialMatch then
+    Options.MaxResults := 0  // No limit - need all matches for longest selection
+  else
+    Options.MaxResults := 1;
 
   Result := FKeywordRegistry.FindKeyword(Text, Options);
 
@@ -2601,6 +2618,49 @@ begin
   LogDebug(Format('CaseSensitive set to %s', [BoolToStr(Value, True)]));
   {$ENDIF}
 
+end;
+
+procedure TLexerFSM.PreScanOptions;
+var
+  i, Len: Integer;
+  Line: string;
+  P: Integer;
+  UpperLine: string;
+begin
+  // Pre-scan source for OPTION directives that affect lexing
+  // Must be called AFTER setting Source and BEFORE ScanAllTokensFast
+  if System.Length(FSource) = 0 then Exit;
+
+  i := 1;
+  Len := System.Length(FSource);
+  while i <= Len do
+  begin
+    // Extract line
+    P := i;
+    while (i <= Len) and (FSource[i] <> #10) and (FSource[i] <> #13) do
+      Inc(i);
+    Line := Trim(Copy(FSource, P, i - P));
+    // Skip line endings
+    if (i <= Len) and (FSource[i] = #13) then Inc(i);
+    if (i <= Len) and (FSource[i] = #10) then Inc(i);
+
+    // Skip optional line number
+    P := 1;
+    while (P <= System.Length(Line)) and (Line[P] >= '0') and (Line[P] <= '9') do
+      Inc(P);
+    while (P <= System.Length(Line)) and (Line[P] = ' ') do
+      Inc(P);
+
+    // Check if line starts with OPTION
+    UpperLine := UpperCase(Copy(Line, P, System.Length(Line) - P + 1));
+    if Pos(kOPTION, UpperLine) = 1 then
+    begin
+      if Pos(kOPTION + ' ' + kOPTION_SPACELESS, UpperLine) = 1 then
+        FLexerOptions.RequireSpacesBetweenTokens := False
+      else if Pos(kOPTION + ' ' + kOPTION_STRICT, UpperLine) = 1 then
+        FLexerOptions.RequireSpacesBetweenTokens := True;
+    end;
+  end;
 end;
 
 

@@ -544,6 +544,7 @@ begin
       Lexer.SetRequireSpacesBetweenTokens(True);
       Lexer.SetCaseSensitive(False);
       Lexer.Source := Source.Text;
+      Lexer.PreScanOptions;
 
       try
         Timer := CreateHiResTimer;

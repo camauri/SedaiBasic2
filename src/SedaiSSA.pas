@@ -5658,31 +5658,65 @@ begin
     ProcessExpression(Node.GetChild(i), ParamVals[i]);
 
   // Materialize parameters to registers
+  // Parameter 0 (cutoff frequency) must be a FLOAT register (VM reads FFloatRegs)
+  // Parameters 1-4 (lp, bp, hp, res) must be INT registers (VM reads FIntRegs)
   for i := 0 to 4 do
   begin
-    if ParamVals[i].Kind = svkConstInt then
+    if i = 0 then
     begin
-      TempReg := FProgram.AllocRegister(srtInt);
-      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaLoadConstInt, ParamRegs[i], ParamVals[i],
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    end
-    else if ParamVals[i].Kind = svkConstFloat then
-    begin
-      TempReg := FProgram.AllocRegister(srtInt);
-      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaLoadConstInt, ParamRegs[i], MakeSSAConstInt(Trunc(ParamVals[i].ConstFloat)),
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    end
-    else if (ParamVals[i].Kind = svkRegister) and (ParamVals[i].RegType = srtFloat) then
-    begin
-      TempReg := FProgram.AllocRegister(srtInt);
-      ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaFloatToInt, ParamRegs[i], ParamVals[i],
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // Cutoff frequency -> float register
+      if ParamVals[i].Kind = svkConstInt then
+      begin
+        TempReg := FProgram.AllocRegister(srtFloat);
+        ParamRegs[i] := MakeSSARegister(srtFloat, TempReg);
+        EmitInstruction(ssaLoadConstFloat, ParamRegs[i],
+                       MakeSSAConstFloat(Double(ParamVals[i].ConstInt)),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if ParamVals[i].Kind = svkConstFloat then
+      begin
+        TempReg := FProgram.AllocRegister(srtFloat);
+        ParamRegs[i] := MakeSSARegister(srtFloat, TempReg);
+        EmitInstruction(ssaLoadConstFloat, ParamRegs[i], ParamVals[i],
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if (ParamVals[i].Kind = svkRegister) and (ParamVals[i].RegType = srtInt) then
+      begin
+        TempReg := FProgram.AllocRegister(srtFloat);
+        ParamRegs[i] := MakeSSARegister(srtFloat, TempReg);
+        EmitInstruction(ssaIntToFloat, ParamRegs[i], ParamVals[i],
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+        ParamRegs[i] := ParamVals[i];  // Already a float register
     end
     else
-      ParamRegs[i] := ParamVals[i];
+    begin
+      // Parameters 1-4 -> int registers
+      if ParamVals[i].Kind = svkConstInt then
+      begin
+        TempReg := FProgram.AllocRegister(srtInt);
+        ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+        EmitInstruction(ssaLoadConstInt, ParamRegs[i], ParamVals[i],
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if ParamVals[i].Kind = svkConstFloat then
+      begin
+        TempReg := FProgram.AllocRegister(srtInt);
+        ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+        EmitInstruction(ssaLoadConstInt, ParamRegs[i], MakeSSAConstInt(Trunc(ParamVals[i].ConstFloat)),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if (ParamVals[i].Kind = svkRegister) and (ParamVals[i].RegType = srtFloat) then
+      begin
+        TempReg := FProgram.AllocRegister(srtInt);
+        ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
+        EmitInstruction(ssaFloatToInt, ParamRegs[i], ParamVals[i],
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+        ParamRegs[i] := ParamVals[i];
+    end;
   end;
 
   // Emit ssaSoundFilter: Src1=cf, Src2=lp, Src3=bp

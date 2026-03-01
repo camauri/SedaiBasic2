@@ -748,6 +748,7 @@ var
   NoteIndex: Integer;
   Freq: Single;
   Sharp, Flat, Dotted: Boolean;
+  NextSharp, NextFlat, NextDotted: Boolean;  // C128 prefix modifiers
   Waveform: Word;
 
   function ParseNumber: Integer;
@@ -793,6 +794,9 @@ begin
   Envelope := 0;
   Volume := 15;  // Max volume (0-15 like VOL command)
   FilterOn := False;
+  NextSharp := False;
+  NextFlat := False;
+  NextDotted := False;
   Duration := 15;  // Quarter note default at tempo 8
 
   Pos := 1;
@@ -835,14 +839,15 @@ begin
           NoteIndex := 0;
         end;
 
-        // Check for modifiers (look ahead)
-        Sharp := False;
-        Flat := False;
-        Dotted := False;
+        // Apply prefix modifiers (C128: #/$/. can precede the note, e.g. s#d = sixteenth D-sharp)
+        Sharp := NextSharp;
+        Flat := NextFlat;
+        Dotted := NextDotted;
+        NextSharp := False;
+        NextFlat := False;
+        NextDotted := False;
 
-        // Check previous character for modifiers (C128 puts them before note)
-        // Actually in C128 syntax, modifiers come BEFORE the note
-        // But we already consumed the note, so check what's next
+        // Also check for post-note modifiers (look ahead)
         while (Pos <= Len) and (MusicStr[Pos] in ['#', '$', '.']) do
         begin
           case MusicStr[Pos] of
@@ -939,9 +944,9 @@ begin
 
       'M': ; // Wait for voices - not implemented yet
 
-      '#': ; // Sharp modifier (handled with note)
-      '$': ; // Flat modifier (handled with note)
-      '.': ; // Dotted modifier (handled with note)
+      '#': NextSharp := True;   // C128 prefix sharp (applied to next note)
+      '$': NextFlat := True;    // C128 prefix flat (applied to next note)
+      '.': NextDotted := True;  // C128 prefix dotted (applied to next note)
     end;
   end;
 end;

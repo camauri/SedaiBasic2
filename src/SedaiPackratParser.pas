@@ -743,7 +743,14 @@ begin
         Break;
     end
     else
-      Break;
+    begin
+      // Commodore BASIC implicit semicolon: PRINT "text"expr = PRINT "text";expr
+      // If not at end of statement, insert implicit semicolon and continue
+      if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+        Break;
+      SeparatorNode := TASTNode.CreateWithValue(antSeparator, ';', Context.CurrentToken);
+      Result.AddChild(SeparatorNode);
+    end;
   end;
 
   DoNodeCreated(Result);
@@ -2824,7 +2831,15 @@ var
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antStatement, Token);
-  Context.Advance; // Consume directive
+  Context.Advance; // Consume directive keyword
+
+  // OPTION directive: consume option name argument
+  if Assigned(Token.KeywordInfo) and (Token.KeywordInfo.Keyword = kOPTION) then
+  begin
+    if Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttIdentifier) then
+      Context.Advance;
+  end;
+
   DoNodeCreated(Result);
 end;
 

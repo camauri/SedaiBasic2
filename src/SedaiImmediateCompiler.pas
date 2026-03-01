@@ -416,6 +416,7 @@ begin
     Lexer.SetRequireSpacesBetweenTokens(True);
     Lexer.SetCaseSensitive(False);
     Lexer.Source := Source;
+    Lexer.PreScanOptions;
 
     try
       TokenList := Lexer.ScanAllTokensFast;

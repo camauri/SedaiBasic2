@@ -291,6 +291,9 @@ const
   kXOR   = 'XOR';
 
   // SedaiBasic Options
+  kOPTION = 'OPTION';
+  kOPTION_SPACELESS = 'SPACELESS';
+  kOPTION_STRICT = 'STRICT';
   kEXPNOTATION = 'EXPNOTATION';
 
   // Web keywords (WEB_MODE only)

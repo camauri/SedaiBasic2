@@ -484,6 +484,7 @@ type
     function IsInScrollbackMode: Boolean;
 
     // Window management (WINDOW command)
+    procedure Resize(NewRows, NewCols: Integer);  // Resize buffer for mode switch
     procedure SetWindow(Col1, Row1, Col2, Row2: Integer);
     procedure ResetWindow;  // Reset to full screen
     procedure ClearWindow;  // Clear only within current window
@@ -1382,43 +1383,42 @@ end;
 
 procedure TVideoController.CalculateViewportAndFont;
 var
-  ScaleX, ScaleY, Scale: Integer;
+  ScaleX, ScaleY, RawScale, FontStep, Scale: Integer;
   ScaledWidth, ScaledHeight: Integer;
   BaseFontSize: Integer;
 begin
+  // Guard against modes with no native resolution (SDL2 dynamic)
+  if (FModeInfo.NativeWidth = 0) or (FModeInfo.NativeHeight = 0) then
+    Exit;
+
   // Calculate base font size from native viewport and text grid
-  // Font = NativeWidth / TextCols = NativeHeight / TextRows
-  BaseFontSize := FModeInfo.NativeWidth div FModeInfo.TextCols;
-
-  if FFullscreen then
-  begin
-    // In fullscreen, calculate integer scaling based on physical resolution
-    ScaleX := FWindowWidth div FModeInfo.NativeWidth;
-    ScaleY := FWindowHeight div FModeInfo.NativeHeight;
-    Scale := Min(ScaleX, ScaleY);
-
-    // Scale the font
-    FFontSize := BaseFontSize * Scale;
-
-    // Calculate scaled viewport dimensions
-    ScaledWidth := FModeInfo.NativeWidth * Scale;
-    ScaledHeight := FModeInfo.NativeHeight * Scale;
-
-    // Center the scaled viewport in the physical window
-    FViewportX := (FWindowWidth - ScaledWidth) div 2;
-    FViewportY := (FWindowHeight - ScaledHeight) div 2;
-    FViewportWidth := ScaledWidth;
-    FViewportHeight := ScaledHeight;
-  end
+  if FModeInfo.TextCols > 0 then
+    BaseFontSize := FModeInfo.NativeWidth div FModeInfo.TextCols
   else
-  begin
-    // In windowed mode, use native viewport and base font
-    FFontSize := BaseFontSize;
-    FViewportWidth := FModeInfo.NativeWidth;
-    FViewportHeight := FModeInfo.NativeHeight;
-    FViewportX := (FWindowWidth - FViewportWidth) div 2;
-    FViewportY := (FWindowHeight - FViewportHeight) div 2;
-  end;
+    BaseFontSize := 8;  // Default for pure bitmap modes (no text grid)
+
+  // Integer scaling to fill the window while maintaining aspect ratio
+  // Same logic for both windowed and fullscreen — SDL handles pixel scaling
+  ScaleX := FWindowWidth div FModeInfo.NativeWidth;
+  ScaleY := FWindowHeight div FModeInfo.NativeHeight;
+  RawScale := Min(ScaleX, ScaleY);
+  if RawScale < 1 then RawScale := 1;
+
+  // Round scale so that font size is a multiple of 8
+  // FontStep = minimum scale increment for font-multiple-of-8 constraint
+  FontStep := 8 div BaseFontSize;
+  Scale := (RawScale div FontStep) * FontStep;
+  if Scale < 1 then Scale := RawScale;  // Window too small for constraint, use raw
+
+  FFontSize := BaseFontSize * Scale;
+  ScaledWidth := FModeInfo.NativeWidth * Scale;
+  ScaledHeight := FModeInfo.NativeHeight * Scale;
+
+  // Center the scaled viewport in the window
+  FViewportX := (FWindowWidth - ScaledWidth) div 2;
+  FViewportY := (FWindowHeight - ScaledHeight) div 2;
+  FViewportWidth := ScaledWidth;
+  FViewportHeight := ScaledHeight;
 end;
 
 function TVideoController.TryLoadFont(const FontPath: string; Size: Integer): Boolean;
@@ -1654,7 +1654,7 @@ begin
     BorderColor := PaletteIndexToSDLColor(FBorderColorIndex);
 
     // Full redraw if AllDirty, texture just created, or border color changed
-    if FTextTextureDirty or BorderChanged or ATextBuffer.AllDirty then
+    if FTextTextureDirty or BorderChanged or ATextBuffer.AllDirty or (FModeInfo.ModeType = mtMixed) then
     begin
       // Fill entire texture with border color
       SDL_SetRenderDrawColor(FRenderer, BorderColor.r, BorderColor.g, BorderColor.b, 255);
@@ -1665,11 +1665,20 @@ begin
       ViewportRect.y := FViewportY;
       ViewportRect.w := FViewportWidth;
       ViewportRect.h := FViewportHeight;
+      // For mixed modes, only fill the text area at bottom (graphics covers the top)
+      if FModeInfo.ModeType = mtMixed then
+      begin
+        ViewportRect.y := FViewportY + FViewportHeight - (FModeInfo.TextRows * FCharHeight);
+        ViewportRect.h := FModeInfo.TextRows * FCharHeight;
+      end;
       SDL_SetRenderDrawColor(FRenderer, ScreenBG.r, ScreenBG.g, ScreenBG.b, 255);
       SDL_RenderFillRect(FRenderer, @ViewportRect);
 
       // Render ALL cells (at viewport offset)
       RenderY := FViewportY;
+      // For mixed modes, text starts at the bottom of the viewport
+      if FModeInfo.ModeType = mtMixed then
+        RenderY := FViewportY + FViewportHeight - (FModeInfo.TextRows * FCharHeight);
       for Row := 0 to ATextBuffer.Rows - 1 do
       begin
         RenderX := FViewportX;
@@ -1910,8 +1919,18 @@ begin
     SDL_SetRenderTarget(FRenderer, nil);
   end;
 
-  // Blit full texture to screen (every frame - fast operation)
-  SDL_RenderCopy(FRenderer, FTextTexture, nil, nil);
+  // Blit texture to screen (every frame - fast operation)
+  if FModeInfo.ModeType = mtMixed then
+  begin
+    // For mixed modes, only blit the text area portion (don't cover graphics)
+    ScrollSrcRect.x := FViewportX;
+    ScrollSrcRect.y := FViewportY + FViewportHeight - (FModeInfo.TextRows * FCharHeight);
+    ScrollSrcRect.w := FViewportWidth;
+    ScrollSrcRect.h := FModeInfo.TextRows * FCharHeight;
+    SDL_RenderCopy(FRenderer, FTextTexture, @ScrollSrcRect, @ScrollSrcRect);
+  end
+  else
+    SDL_RenderCopy(FRenderer, FTextTexture, nil, nil);
 end;
 
 procedure TVideoController.SetFullscreen(Enabled: Boolean);
@@ -2390,6 +2409,10 @@ begin
   BufWidth := FModeInfo.NativeWidth;
   BufHeight := FModeInfo.NativeHeight;
 
+  // In split screen mode, clip flood fill to visible graphics area only
+  if (FModeInfo.ModeType = mtMixed) and (FModeInfo.TextCols > 0) then
+    BufHeight := FModeInfo.NativeHeight - FModeInfo.TextRows * (FModeInfo.NativeWidth div FModeInfo.TextCols);
+
   // Bounds check
   if (PixelX < 0) or (PixelX >= BufWidth) or
      (PixelY < 0) or (PixelY >= BufHeight) then Exit;
@@ -2668,6 +2691,25 @@ begin
   // Update mode info
   FCurrentMode := Mode;
   FModeInfo := NewModeInfo;
+
+  // Window size never changes after init — only the viewport is recalculated
+  // to fit the new mode's native resolution within the existing window
+  CalculateViewportAndFont;
+
+  // Reload font at new size for text/mixed modes
+  if NewModeInfo.ModeType in [mtText, mtMixed] then
+  begin
+    if Assigned(FFont) then
+    begin
+      TTF_CloseFont(FFont);
+      FFont := nil;
+    end;
+    LoadFontWithSize(FFontSize);
+  end;
+
+  // Recreate text texture for new viewport/window dimensions
+  if NewModeInfo.ModeType in [mtText, mtMixed] then
+    CreateTextTexture;
 
   // For classic modes (0-10), use persistent buffers
   if Mode <> gmSDL2Dynamic then
@@ -3149,23 +3191,21 @@ begin
     CurrX := ScaledX + Round(Rx);
     CurrY := ScaledY + Round(Ry);
 
-    // Clip to screen bounds
-    if (CurrX >= 0) and (CurrX < FModeInfo.NativeWidth) and
-       (CurrY >= 0) and (CurrY < FModeInfo.NativeHeight) then
+    // Draw segment — per-pixel clipping is handled by SetPixelSafe inside
+    // DrawLineInternal/DrawThickPixel, so we always draw even when vertices
+    // are out of bounds. Skipping entire segments creates gaps in circles
+    // near screen edges, allowing flood fill to leak through.
+    if not FirstPoint then
+      DrawLineInternal(PrevX, PrevY, CurrX, CurrY, UseIndex, ActualIndex, Color)
+    else
     begin
-      // Draw line from previous point to current point (Bresenham's algorithm)
-      if not FirstPoint then
-        DrawLineInternal(PrevX, PrevY, CurrX, CurrY, UseIndex, ActualIndex, Color)
+      // First point - plot with line width (SetPixelSafe clips if OOB)
+      if UseIndex then
+        SedaiGraphicsPrimitives.DrawThickPixel(FGraphicsMemory, CurrX, CurrY,
+          ActualIndex, True, FLineWidth, FModeInfo.NativeWidth, FModeInfo.NativeHeight)
       else
-      begin
-        // First point - plot with line width
-        if UseIndex then
-          SedaiGraphicsPrimitives.DrawThickPixel(FGraphicsMemory, CurrX, CurrY,
-            ActualIndex, True, FLineWidth, FModeInfo.NativeWidth, FModeInfo.NativeHeight)
-        else
-          SedaiGraphicsPrimitives.DrawThickPixel(FGraphicsMemory, CurrX, CurrY,
-            Color, False, FLineWidth, FModeInfo.NativeWidth, FModeInfo.NativeHeight);
-      end;
+        SedaiGraphicsPrimitives.DrawThickPixel(FGraphicsMemory, CurrX, CurrY,
+          Color, False, FLineWidth, FModeInfo.NativeWidth, FModeInfo.NativeHeight);
     end;
 
     PrevX := CurrX;
@@ -3435,7 +3475,8 @@ end;
 
 procedure TVideoController.RenderGraphicsTexture;
 var
-  DestRect: TSDL_Rect;
+  SrcRect, DestRect: TSDL_Rect;
+  NativeCharH, GraphicsNativeH: Integer;
 begin
   if FGraphicsTexture = nil then Exit;
 
@@ -3448,8 +3489,20 @@ begin
   DestRect.w := FViewportWidth;
   DestRect.h := FViewportHeight;
 
-  // Render the texture
-  SDL_RenderCopy(FRenderer, FGraphicsTexture, nil, @DestRect);
+  // For mixed modes, clip graphics to top portion (text area is at bottom)
+  if FModeInfo.ModeType = mtMixed then
+  begin
+    NativeCharH := FModeInfo.NativeWidth div FModeInfo.TextCols;
+    GraphicsNativeH := FModeInfo.NativeHeight - (FModeInfo.TextRows * NativeCharH);
+    SrcRect.x := 0;
+    SrcRect.y := 0;
+    SrcRect.w := FModeInfo.NativeWidth;
+    SrcRect.h := GraphicsNativeH;
+    DestRect.h := FViewportHeight - (FModeInfo.TextRows * FCharHeight);
+    SDL_RenderCopy(FRenderer, FGraphicsTexture, @SrcRect, @DestRect);
+  end
+  else
+    SDL_RenderCopy(FRenderer, FGraphicsTexture, nil, @DestRect);
 end;
 
 { TScrollbackRingBuffer }
@@ -3552,6 +3605,43 @@ begin
 
   // Initialize scrollback with ring buffer
   FScrollbackBuffer := TScrollbackRingBuffer.Create(SCROLLBACK_CAPACITY);
+  FViewOffset := 0;
+end;
+
+procedure TTextBuffer.Resize(NewRows, NewCols: Integer);
+var
+  r, c: Integer;
+begin
+  if (NewRows = FRows) and (NewCols = FCols) then Exit;
+
+  FRows := NewRows;
+  FCols := NewCols;
+
+  // Reallocate cells
+  SetLength(FCells, NewRows, NewCols);
+  for r := 0 to NewRows - 1 do
+    for c := 0 to NewCols - 1 do
+    begin
+      FCells[r][c].Ch := ' ';
+      FCells[r][c].FGIndex := FCurrentFGIndex;
+      FCells[r][c].BGIndex := BG_USE_DEFAULT;
+      FCells[r][c].Reverse := False;
+      FCells[r][c].Dirty := False;
+    end;
+
+  // Reallocate dirty flags
+  SetLength(FRowDirty, NewRows);
+  for r := 0 to NewRows - 1 do
+    FRowDirty[r] := False;
+  FAllDirty := True;
+
+  // Reset cursor and window
+  FCursorX := 0;
+  FCursorY := 0;
+  FWindowCol1 := 0;
+  FWindowRow1 := 0;
+  FWindowCol2 := NewCols - 1;
+  FWindowRow2 := NewRows - 1;
   FViewOffset := 0;
 end;
 
@@ -3859,10 +3949,28 @@ begin
     158: begin FCurrentFGIndex := 7;  Exit; end;  // Yellow
     159: begin FCurrentFGIndex := 3;  Exit; end;  // Cyan
 
-    // === Ignored PETSCII codes (cursor movement - not applicable in shell mode) ===
-    17, 145: Exit;  // Cursor down/up
-    29, 157: Exit;  // Cursor right/left
-    19: Exit;       // Home (CLR/HOME without SHIFT)
+    // === PETSCII Cursor Movement ===
+    17: begin  // Cursor down
+      if FCursorY < FWindowRow2 then Inc(FCursorY);
+      Exit;
+    end;
+    145: begin  // Cursor up
+      if FCursorY > FWindowRow1 then Dec(FCursorY);
+      Exit;
+    end;
+    29: begin  // Cursor right
+      if FCursorX < FWindowCol2 then Inc(FCursorX);
+      Exit;
+    end;
+    157: begin  // Cursor left
+      if FCursorX > FWindowCol1 then Dec(FCursorX);
+      Exit;
+    end;
+    19: begin  // Home (CLR/HOME without SHIFT)
+      FCursorX := FWindowCol1;
+      FCursorY := FWindowRow1;
+      Exit;
+    end;
     148: Exit;      // Insert mode toggle
     20: Exit;       // Delete (handled by input, not print)
   end;
@@ -4946,10 +5054,18 @@ begin
 end;
 
 function TConsoleOutputAdapter.SetGraphicMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
+var
+  NewModeInfo: TGraphicModeInfo;
 begin
   // Delegate to VideoController
   if Assigned(FVideoController) then
-    Result := FVideoController.SetGraphicMode(Mode, ClearBuffer, SplitLine)
+  begin
+    Result := FVideoController.SetGraphicMode(Mode, ClearBuffer, SplitLine);
+    // Resize text buffer to match new mode's text dimensions
+    NewModeInfo := FVideoController.ModeInfo;
+    if NewModeInfo.ModeType in [mtText, mtMixed] then
+      FTextBuffer.Resize(NewModeInfo.TextRows, NewModeInfo.TextCols);
+  end
   else
     Result := False;
 end;
@@ -5834,6 +5950,18 @@ begin
     // Clear and render the graphics buffer to screen
     FVideoController.ClearBorder;
     FVideoController.RenderGraphicsTexture;
+
+    // For mixed modes (split screen), also render text at the bottom
+    if FVideoController.ModeInfo.ModeType = mtMixed then
+    begin
+      PrevCursorX := FTextBuffer.CursorX;
+      PrevCursorY := FTextBuffer.CursorY;
+      FVideoController.RenderText(FTextBuffer);
+      FTextBuffer.CursorX := PrevCursorX;
+      FTextBuffer.CursorY := PrevCursorY;
+      UpdateCursor;
+    end;
+
     // Render sprites on top of graphics (clipped to viewport)
     if Assigned(FSpriteEngine) then
     begin
@@ -5905,6 +6033,11 @@ begin
     // Calculate cursor position in viewport
     CursorX := FVideoController.ViewportX + (FTextBuffer.CursorX * FVideoController.CharWidth);
     CursorY := FVideoController.ViewportY + (FTextBuffer.CursorY * FVideoController.CharHeight);
+    // For mixed modes, offset cursor to text area at bottom of viewport
+    if FVideoController.ModeInfo.ModeType = mtMixed then
+      CursorY := FVideoController.ViewportY + FVideoController.ViewportHeight
+                 - (FVideoController.ModeInfo.TextRows * FVideoController.CharHeight)
+                 + (FTextBuffer.CursorY * FVideoController.CharHeight);
 
     // Get character at cursor position (space if beyond line end)
     CurrentChar := FTextBuffer.GetCharAtCursor;

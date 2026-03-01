@@ -276,6 +276,7 @@ begin
 
   try
     FProgramLexer.Source := ProgramText;
+    FProgramLexer.PreScanOptions;
     TokenList := FProgramLexer.ScanAllTokensFast;
 
     if not Assigned(TokenList) or (TokenList.Count = 0) then

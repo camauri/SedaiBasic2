@@ -729,8 +729,8 @@ begin
 
   if Length(Matches) > 0 then
   begin
-    // Return the best match (highest confidence)
-    Result := Matches[0];
+    // Return the longest match (greedy) - last in array since SearchTrie adds in traversal order
+    Result := Matches[Length(Matches) - 1];
   end;
 end;
 
@@ -1856,6 +1856,7 @@ begin
   RegisterKeyword(kKEY, ttKeyDefine, 'Define/list function key assignment', kcSystemHandling);
 
   // === ENVIRONMENT SETUP DIRECTIVES ===
+  RegisterKeyword(kOPTION, ttDirective, 'Set compiler/runtime options', kcEnvironmentSetup);
   RegisterKeyword(kEXPNOTATION, ttDirective, 'Setup Directives', kcEnvironmentSetup);
 
   // === SYNTAX CONSTRAINTS ===
