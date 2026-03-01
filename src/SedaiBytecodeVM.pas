@@ -742,7 +742,7 @@ const
 var
   Pos, Len: Integer;
   Ch: Char;
-  Voice, Octave, Envelope, Volume: Integer;
+  Voice, Octave, Envelope: Integer;
   FilterOn: Boolean;
   Duration: Integer;  // in jiffies (1/60 sec)
   NoteIndex: Integer;
@@ -750,6 +750,8 @@ var
   Sharp, Flat, Dotted: Boolean;
   NextSharp, NextFlat, NextDotted: Boolean;  // C128 prefix modifiers
   Waveform: Word;
+  SavedMasterVolume: Single;
+  AutoVolume: Boolean;
 
   function ParseNumber: Integer;
   var
@@ -788,16 +790,29 @@ begin
   if Assigned(FOutputDevice) then
     FOutputDevice.Present;
 
+  // Auto-set master volume if zero (C128: PLAY enables audio automatically)
+  AutoVolume := False;
+  SavedMasterVolume := FSIDEvo.MasterVolume;
+  if SavedMasterVolume = 0.0 then
+  begin
+    AutoVolume := True;
+    FAudioBackend.Lock;
+    try
+      FSIDEvo.SetMasterVolume(8.0 / 15.0);  // VOL 8 equivalent
+    finally
+      FAudioBackend.Unlock;
+    end;
+  end;
+
   // Defaults
   Voice := 1;
   Octave := 4;
   Envelope := 0;
-  Volume := 15;  // Max volume (0-15 like VOL command)
   FilterOn := False;
   NextSharp := False;
   NextFlat := False;
   NextDotted := False;
-  Duration := 15;  // Quarter note default at tempo 8
+  Duration := 24;  // Quarter note default (C128: 24 jiffies)
 
   Pos := 1;
   Len := Length(MusicStr);
@@ -813,15 +828,22 @@ begin
       'V': Voice := ParseNumber;  // Voice 1-3
       'O': Octave := ParseNumber; // Octave 0-6
       'T': Envelope := ParseNumber; // Envelope 0-9
-      'U': Volume := ParseNumber;   // Volume 0-15
+      'U': begin  // Volume 0-15 (C128: sets master volume, not per-voice)
+        FAudioBackend.Lock;
+        try
+          FSIDEvo.SetMasterVolume(ParseNumber / 15.0);
+        finally
+          FAudioBackend.Unlock;
+        end;
+      end;
       'X': FilterOn := (ParseNumber = 1); // Filter on/off
 
-      // Duration prefixes
-      'W': Duration := 60;  // Whole note
-      'H': Duration := 30;  // Half note
-      'Q': Duration := 15;  // Quarter note
-      'I': Duration := 8;   // Eighth note
-      'S': Duration := 4;   // Sixteenth note
+      // Duration prefixes (C128 jiffies: W=96, H=48, Q=24, I=12, S=6)
+      'W': Duration := 96;  // Whole note
+      'H': Duration := 48;  // Half note
+      'Q': Duration := 24;  // Quarter note
+      'I': Duration := 12;  // Eighth note
+      'S': Duration := 6;   // Sixteenth note
 
       // Notes C D E F G A B
       'C', 'D', 'E', 'F', 'G', 'A', 'B':
@@ -890,7 +912,6 @@ begin
             // Configure voice
             FSIDEvo.SetFrequencyHz(Voice - 1, Freq);
             FSIDEvo.SetWaveform(Voice - 1, Waveform);
-            FSIDEvo.SetVoiceVolume(Voice - 1, Volume / 15.0);
 
             // Set pulse width if pulse waveform
             if Waveform = SIDEVO_WAVE_PULSE then
@@ -920,9 +941,9 @@ begin
 
           // Wait for note duration (outside lock to allow callback to run)
           {$IFDEF DEBUG_AUDIO}
-          WriteLn('[DEBUG_AUDIO] Sleeping for ', Duration * 1000 * 8 div (60 * FAudioTempo), ' ms (tempo=', FAudioTempo, ')');
+          WriteLn('[DEBUG_AUDIO] Sleeping for ', Duration * 1000 * 16 div (60 * FAudioTempo), ' ms (tempo=', FAudioTempo, ')');
           {$ENDIF}
-          CooperativeSleep(Duration * 1000 * 8 div (60 * FAudioTempo));
+          CooperativeSleep(Duration * 1000 * 16 div (60 * FAudioTempo));
 
           // Stop the note (gate off - triggers release phase)
           {$IFDEF DEBUG_AUDIO}
@@ -939,7 +960,7 @@ begin
 
       'R': // Rest - wait without playing
       begin
-        CooperativeSleep(Duration * 1000 * 8 div (60 * FAudioTempo));
+        CooperativeSleep(Duration * 1000 * 16 div (60 * FAudioTempo));
       end;
 
       'M': ; // Wait for voices - not implemented yet
@@ -947,6 +968,17 @@ begin
       '#': NextSharp := True;   // C128 prefix sharp (applied to next note)
       '$': NextFlat := True;    // C128 prefix flat (applied to next note)
       '.': NextDotted := True;  // C128 prefix dotted (applied to next note)
+    end;
+  end;
+
+  // Restore master volume to 0 if we auto-set it
+  if AutoVolume then
+  begin
+    FAudioBackend.Lock;
+    try
+      FSIDEvo.SetMasterVolume(0.0);
+    finally
+      FAudioBackend.Unlock;
     end;
   end;
 end;
@@ -1302,6 +1334,12 @@ begin
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
           if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;
+        end;
+
+        // PLAY: string Src1 (music string)
+        bcSoundPlay:
+        begin
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
         end;
 
         // GET/GETKEY: string Dest (character result)

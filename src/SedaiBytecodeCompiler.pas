@@ -457,11 +457,12 @@ end;
 
 procedure TBytecodeCompiler.CompileInstruction(Instr: TSSAInstruction);
 var
-  BCInstr: TBytecodeInstruction;
+  BCInstr, BCPreInstr: TBytecodeInstruction;
   BCOp: TBytecodeOp;
   FloatVal: Double;
   BCIndex: Integer;
   ArrayIdx: Integer;
+  TempRegIdx: Integer;
   // For RGBA handling
   ARegMapped, BRegMapped: Integer;
 begin
@@ -896,15 +897,24 @@ begin
 
   // Special handling for PLAY - music string parameter only
   // PLAY "music string" - voice is specified inside the string with Vn
-  // SSA: Src1=string register
+  // SSA: Src1=string register (may become svkConstString after ConstProp)
   if Instr.OpCode = ssaSoundPlay then
   begin
     BCOp := bcSoundPlay;
     BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
 
-    // Src1 = string register containing music string
     if Instr.Src1.Kind = svkRegister then
-      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version)
+    else if Instr.Src1.Kind = svkConstString then
+    begin
+      // ConstProp replaced register with constant string — materialize it
+      TempRegIdx := FNextBytecodeReg[srtString];
+      Inc(FNextBytecodeReg[srtString]);
+      BCPreInstr := MakeBytecodeInstruction(bcLoadConstString, TempRegIdx, 0, 0,
+        FProgram.AddStringConstant(Instr.Src1.ConstString));
+      FProgram.AddInstructionWithLine(BCPreInstr, Instr.SourceLine);
+      BCInstr.Src1 := TempRegIdx;
+    end;
 
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
