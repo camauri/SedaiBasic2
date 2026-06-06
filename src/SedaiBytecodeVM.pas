@@ -689,6 +689,10 @@ begin
   Remaining := Milliseconds;
   while Remaining > 0 do
   begin
+    // Stop/quit requested (e.g. CTRL+END or window close during playback): bail out.
+    if not FRunning then
+      Exit;
+
     // Determine sleep slice
     if Remaining > SLICE_MS then
       SleepTime := SLICE_MS
@@ -699,13 +703,26 @@ begin
     Sleep(SleepTime);
     Dec(Remaining, SleepTime);
 
-    // Process SDL2 events to keep window responsive
-    if Assigned(FInputDevice) then
-      FInputDevice.ProcessEvents;
-
-    // Update display
-    if Assigned(FOutputDevice) then
-      FOutputDevice.Present;
+    // Run the FULL event/render cycle each slice — not just raw event polling —
+    // so audio playback (PLAY/SOUND, which block on note durations via this sleep)
+    // stays cooperative with keyboard I/O and rendering: fullscreen toggle (CTRL+F),
+    // render-target reset (ALT+TAB), sprite auto-movement and stop/quit all work
+    // while a sound is playing. Falls back to bare polling if no callback is set.
+    if Assigned(FEventPollCallback) then
+    begin
+      if FEventPollCallback() then
+      begin
+        FRunning := False;  // stop/quit requested: abort the wait
+        Exit;
+      end;
+    end
+    else
+    begin
+      if Assigned(FInputDevice) then
+        FInputDevice.ProcessEvents;
+      if Assigned(FOutputDevice) then
+        FOutputDevice.Present;
+    end;
   end;
 end;
 

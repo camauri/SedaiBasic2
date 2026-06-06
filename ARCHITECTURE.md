@@ -1145,7 +1145,7 @@ SedaiBasic emulates key aspects of the Commodore 128 for compatibility:
 |------|-------------|
 | `SedaiGraphicsModes.pas` | Graphics mode handling |
 | `SedaiGraphicsPrimitives.pas` | Drawing primitives |
-| `sedaisprite.pas` | Sprite system |
+| `SedaiSpriteEngine.pas` | Sprite system (TC128SpriteEngine, auto-move 60fps) |
 | `SedaiSpriteTypes.pas` | Sprite types |
 | `SedaiC128MemoryMapper.pas` | C128 memory emulation |
 | `sedaisdl2graphicsoutput.pas` | SDL2 graphics backend |

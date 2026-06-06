@@ -56,10 +56,12 @@ When viewing scrollback (not at current line):
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+C` | Stop running BASIC program |
+| `Pause/Break` | Stop (BREAK) running BASIC program — the `Pausa/Interr` key, with or without Ctrl. Works in any state (loops, audio, GET/GETKEY, INPUT) |
 | `Ctrl+Alt+End` | Exit SedaiVision |
-| `Ctrl+F` | Toggle fullscreen mode |
+| `Ctrl+F` | Toggle fullscreen mode (also while a program is running) |
 | `Enter` | Execute command / New line |
+
+> **Break key:** the `Pause/Break` key (`Pausa/Interr` on Italian keyboards) stops a running program, with or without Ctrl. In the graphical build (`sbv`) Ctrl is not required because Windows reports `Ctrl+Pause` (the "Break" variant) inconsistently to SDL2. In the console build (`sb`) the native Windows `CTRL_BREAK_EVENT` is used (`Ctrl+Break`), and that build also honours `Ctrl+C` so it never kills the interpreter process. `Esc` is **not** a break key — it is delivered to the program as `CHR$(27)` and free for program use.
 
 ## Cursor Display
 

@@ -146,7 +146,7 @@ type
     FSDLInitialized: Boolean;
 
     function InitializeSDL: Boolean;
-    procedure CleanupSDL;
+    procedure CleanupSDL(FullShutdown: Boolean = True);
     function CreateWindowAndRenderer: Boolean;
     procedure CalculateViewportAndFont;
     function LoadFontWithSize(Size: Integer): Boolean;
@@ -198,6 +198,7 @@ type
     procedure ClearViewport;    // Clears viewport with BG color
     procedure Present;
     procedure RenderText(ATextBuffer: TTextBuffer);  // Renders the text buffer
+    procedure ForceTextureRebuild;  // Recreate render-target text texture after a device/target reset
 
     // IOutputDevice implementation
     function Initialize(const Title: string = ''; Width: Integer = 80; Height: Integer = 25): Boolean;
@@ -594,6 +595,8 @@ type
     FOutputDevice: IOutputDevice;  // Output device for synchronized I/O
     FTextInputActive: Boolean;   // Track SDL text input state
     FOnCursorEnable: TCursorEnableCallback;  // Cursor toggle callback
+    FRenderResetPending: Boolean;  // Set when SDL render targets are reset (ALT+TAB)
+    FToggleFullscreenRequested: Boolean;  // Set on CTRL+F while a program is running
   public
     constructor Create(AVideoController: TVideoController; AOutputDevice: IOutputDevice = nil);
     destructor Destroy; override;
@@ -619,6 +622,8 @@ type
     property ShiftPressed: Boolean read FShiftPressed;
     property CtrlPressed: Boolean read FCtrlPressed;
     property AltPressed: Boolean read FAltPressed;
+    property RenderResetPending: Boolean read FRenderResetPending write FRenderResetPending;
+    property ToggleFullscreenRequested: Boolean read FToggleFullscreenRequested write FToggleFullscreenRequested;
   end;
 
   { TGraphicEngine - Graphics rendering }
@@ -875,6 +880,8 @@ type
     procedure ProcessCommand(const Command: string);
     procedure RenderScreen;
     procedure UpdateCursor;
+    procedure RefreshDisplay;  // Rebuild lost render targets and repaint (focus regain / ALT+TAB)
+    procedure ToggleFullscreen;  // Toggle fullscreen and reconnect renderer-dependent subsystems
     function CheckCursorBlink: Boolean;  // Returns true if cursor state changed
 
     // Startup file support (passed via command line)
@@ -1155,6 +1162,16 @@ end;
 
 function TVideoController.InitializeSDL: Boolean;
 begin
+  // When SDL is already up (e.g. a fullscreen/mode switch that destroys only the
+  // window/renderer) skip re-init: re-calling SDL_Init/TTF_Init is unnecessary, and
+  // the matching CleanupSDL(False) deliberately avoids SDL_Quit so the SAF audio
+  // subsystem keeps running across the toggle.
+  if FSDLInitialized then
+  begin
+    Result := True;
+    Exit;
+  end;
+
   Result := False;
 
   if SDL_Init(SDL_INIT_VIDEO) < 0 then
@@ -1182,7 +1199,7 @@ begin
   Result := True;
 end;
 
-procedure TVideoController.CleanupSDL;
+procedure TVideoController.CleanupSDL(FullShutdown: Boolean);
 begin
   // Only cleanup if SDL was initialized
   if not FSDLInitialized then
@@ -1216,9 +1233,15 @@ begin
     FWindow := nil;
   end;
 
-  TTF_Quit;
-  SDL_Quit;
-  FSDLInitialized := False;
+  // Only tear down the whole SDL library on a real shutdown. A fullscreen/mode
+  // switch (CleanupSDL(False)) must keep SDL alive — SDL_Quit would also stop the
+  // SAF audio subsystem, silencing audio after toggling fullscreen.
+  if FullShutdown then
+  begin
+    TTF_Quit;
+    SDL_Quit;
+    FSDLInitialized := False;
+  end;
 end;
 
 function TVideoController.CreateWindowAndRenderer: Boolean;
@@ -1540,9 +1563,41 @@ begin
 end;
 
 function TVideoController.SetMode(Mode: TGraphicMode): Boolean;
+var
+  SavedPalette: TPaletteArray;
+  PreservePalette: Boolean;
 begin
-  CleanupSDL;
+  // CleanupSDL frees FPaletteManager and Initialize recreates a fresh default one.
+  // Preserve a customized palette across the renderer rebuild when the target mode
+  // uses the same palette type (a fullscreen toggle keeps the same mode), otherwise
+  // PRST/SETCOLOR/PLOAD customizations would be lost on every CTRL+F.
+  PreservePalette := Assigned(FPaletteManager) and
+                     (GRAPHICS_MODES[Mode].PaletteType = FPaletteManager.PaletteType);
+  if PreservePalette then
+    FPaletteManager.SavePalette(SavedPalette);
+
+  // Light cleanup: destroy only window/renderer/textures, keep SDL (and SAF audio)
+  // alive — a full SDL_Quit here would silence audio after a fullscreen toggle.
+  CleanupSDL(False);
   Result := Initialize(Mode, FFullscreen);
+
+  if Result and PreservePalette and Assigned(FPaletteManager) then
+    FPaletteManager.RestorePalette(SavedPalette);
+end;
+
+procedure TVideoController.ForceTextureRebuild;
+begin
+  if FRenderer = nil then Exit;
+  // Recreate the persistent render-target text texture and force a full redraw.
+  // On Windows (Direct3D) ALT+TAB / minimize triggers SDL_RENDER_TARGETS_RESET and
+  // the render-target contents are lost; dirty-tracking would otherwise keep blitting
+  // a now-black texture. CreateTextTexture also sets FTextTextureDirty := True.
+  CreateTextTexture;
+  // In classic graphics modes the graphics texture was destroyed (SetMode/device
+  // reset) but its CPU buffer (FGraphicsMemory) survives — recreate it so the next
+  // SyncGraphicsBufferToTexture repaints the bitmap instead of leaving it black.
+  if (FCurrentMode <> gmSDL2Dynamic) and IsInGraphicsMode then
+    CreateGraphicsTexture;
 end;
 
 procedure TVideoController.ToggleFullscreen;
@@ -4808,6 +4863,25 @@ begin
           FLastChar := Char(Event.text.text[0]);
           FHasChar := True;
         end;
+
+      // The renderer's targets were reset (Windows D3D loses render-target
+      // textures on ALT+TAB / minimize) — rebuild and repaint, else black screen.
+      SDL_RENDER_TARGETS_RESET, SDL_RENDER_DEVICE_RESET:
+        if Assigned(FConsole) then
+          FConsole.RefreshDisplay;
+
+      // Window regained focus / was restored / exposed: force a full repaint.
+      SDL_WINDOWEVENT:
+        begin
+          case Event.window.event of
+            SDL_WINDOWEVENT_FOCUS_GAINED,
+            SDL_WINDOWEVENT_RESTORED,
+            SDL_WINDOWEVENT_EXPOSED,
+            SDL_WINDOWEVENT_SHOWN:
+              if Assigned(FConsole) then
+                FConsole.RefreshDisplay;
+          end;
+        end;
     end;
   end;
 end;
@@ -5993,6 +6067,39 @@ begin
 
   // Draw blinking cursor (always update during render for INPUT)
   UpdateCursor;
+end;
+
+procedure TSedaiNewConsole.RefreshDisplay;
+begin
+  // Rebuild render targets lost on focus regain / device reset (ALT+TAB on
+  // Windows D3D), then repaint the full screen so the console is not left black.
+  FVideoController.ForceTextureRebuild;
+  RenderScreen;
+  UpdateCursor;
+  FVideoController.Present;
+end;
+
+procedure TSedaiNewConsole.ToggleFullscreen;
+begin
+  // SetMode (inside ToggleFullscreen) destroys and recreates the SDL renderer,
+  // window and textures. Reconnect everything that caches the renderer, else the
+  // sprite engine keeps a freed renderer and its per-frame clip operations corrupt
+  // rendering (intermittently hiding the cursor), and the graphics texture stays
+  // black. Shared by the REPL loop and HandleVMEventPoll so CTRL+F also works
+  // while a program is running.
+  FVideoController.ToggleFullscreen;
+  FVideoController.ForceTextureRebuild;
+  if Assigned(FSpriteEngine) then
+    FSpriteEngine.SetRenderer(FVideoController.Renderer);
+
+  // Force the cursor visible so the first post-toggle frame shows it regardless of
+  // the blink phase (UpdateCursor still suppresses it while a program is running).
+  FCursorVisible := True;
+  FLastCursorBlink := SDL_GetTicks;
+
+  RenderScreen;
+  UpdateCursor;
+  FVideoController.Present;
 end;
 
 function TSedaiNewConsole.CheckCursorBlink: Boolean;
@@ -9343,6 +9450,11 @@ begin
     FProgramInputHandler.ProcessEvents;
     if FProgramInputHandler.QuitRequested then
     begin
+      // CTRL+ALT+END during execution: quit sbv with a single press. Result:=True
+      // stops the VM; FRunning:=False makes the REPL loop exit once control returns,
+      // otherwise the quit flag (on the program input handler) is never seen by the
+      // REPL loop, which only checks FInputHandler — so the app wouldn't close.
+      FRunning := False;
       Result := True;
       Exit;
     end;
@@ -9351,6 +9463,22 @@ begin
       Result := True;
       Exit;
     end;
+  end;
+
+  // A render-target reset (ALT+TAB on Windows D3D) lost the persistent text
+  // texture; rebuild it and repaint so a running program isn't left black.
+  if Assigned(FProgramInputHandler) and FProgramInputHandler.RenderResetPending then
+  begin
+    FProgramInputHandler.RenderResetPending := False;
+    RefreshDisplay;
+  end;
+
+  // CTRL+F pressed during program execution: toggle fullscreen now.
+  if Assigned(FProgramInputHandler) and FProgramInputHandler.ToggleFullscreenRequested then
+  begin
+    FProgramInputHandler.ToggleFullscreenRequested := False;
+    ToggleFullscreen;
+    FLastVMRenderTick := SDL_GetTicks;  // avoid an immediate double render this tick
   end;
 
   // Periodic rendering (~60 FPS)
@@ -9454,13 +9582,7 @@ begin
     // CTRL+F per toggle fullscreen
     if (FInputHandler.LastKeyDown = SDLK_f) and FInputHandler.CtrlPressed then
     begin
-      FVideoController.ToggleFullscreen;
-
-      // Re-render after mode change
-      RenderScreen;
-      UpdateCursor;
-      FVideoController.Present;
-
+      ToggleFullscreen;
       FInputHandler.ClearFlags;
       Continue;
     end;
@@ -10074,6 +10196,20 @@ begin
         Exit;
       end;
 
+      // Render targets reset / window restored (ALT+TAB on Windows D3D): flag a
+      // rebuild; HandleVMEventPoll repaints so a running program isn't left black.
+      SDL_RENDER_TARGETS_RESET, SDL_RENDER_DEVICE_RESET:
+        FRenderResetPending := True;
+
+      SDL_WINDOWEVENT:
+        case Event.window.event of
+          SDL_WINDOWEVENT_FOCUS_GAINED,
+          SDL_WINDOWEVENT_RESTORED,
+          SDL_WINDOWEVENT_EXPOSED,
+          SDL_WINDOWEVENT_SHOWN:
+            FRenderResetPending := True;
+        end;
+
       SDL_KEYDOWN:
       begin
         KeySym := Event.key.keysym.sym;
@@ -10091,17 +10227,34 @@ begin
           Exit;
         end;
 
-        // CTRL+END or ESC: Stop BASIC program (BREAK)
-        if ((KeySym = SDLK_END) and FCtrlPressed and (not FAltPressed)) or
-           (KeySym = SDLK_ESCAPE) then
+        // PAUSE/BREAK key ("Pausa/Interr" on IT keyboards) = stop the running BASIC
+        // program. Matched with OR without Ctrl: on Windows, Ctrl+Pause is the "Break"
+        // variant and SDL2 reports it inconsistently (the Ctrl modifier may be absent
+        // and the code may arrive as PAUSE or CANCEL), so requiring Ctrl is unreliable.
+        // The Pause/Break key is otherwise unused by BASIC programs, so a bare press is
+        // safe. Mirrors the console build, whose handler breaks on CTRL_BREAK_EVENT.
+        if (Event.key.keysym.scancode = SDL_SCANCODE_PAUSE) or
+           (Event.key.keysym.scancode = SDL_SCANCODE_CANCEL) or
+           (KeySym = SDLK_PAUSE) or (KeySym = SDLK_CANCEL) then
         begin
           FStopRequested := True;
-          // Also set character for ESC so program can detect it
-          if KeySym = SDLK_ESCAPE then
-          begin
-            FLastChar := #27;
-            FHasChar := True;
-          end;
+          Exit;
+        end;
+
+        // ESC is NOT a break key — keep it free for program use. Deliver it to the
+        // program as CHR$(27) (ESC produces no SDL_TEXTINPUT event of its own).
+        if KeySym = SDLK_ESCAPE then
+        begin
+          FLastChar := #27;
+          FHasChar := True;
+          Exit;
+        end;
+
+        // CTRL+F: toggle fullscreen even while a program is running
+        // (consumed by HandleVMEventPoll, which owns the console/renderer).
+        if (KeySym = SDLK_f) and FCtrlPressed and (not FAltPressed) then
+        begin
+          FToggleFullscreenRequested := True;
           Exit;
         end;
 
@@ -10165,7 +10318,7 @@ begin
           end;
           SDLK_END:
           begin
-            // Only if not CTRL (CTRL+END is stop program)
+            // Deliver END only without CTRL (CTRL+END is reserved for editing/quit combos)
             if not FCtrlPressed then
             begin
               FLastChar := #6;   // ACK - END
