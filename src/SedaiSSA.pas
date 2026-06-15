@@ -156,6 +156,9 @@ type
     procedure ProcessSprcolor(Node: TASTNode);
     procedure ProcessSprsav(Node: TASTNode);
     procedure ProcessCollision(Node: TASTNode);
+    procedure ProcessSprdef(Node: TASTNode);
+    procedure ProcessSprsave(Node: TASTNode);
+    procedure ProcessSprload(Node: TASTNode);
     // System commands
     procedure ProcessRun(Node: TASTNode);
     procedure ProcessList(Node: TASTNode);
@@ -922,12 +925,17 @@ begin
           // Determine comparison type based on operand types
           if (Left.RegType = srtString) or (Right.RegType = srtString) then
           begin
-            // String comparison
+            // String comparison. There are no Le/Ge string opcodes, so synthesise
+            // them: A<=B == NOT(A>B), A>=B == NOT(A<B). The comparison is emitted
+            // with the Gt/Lt opcode here and the result is inverted just after the
+            // shared emit below.
             case Node.Token.TokenType of
               ttOpEq: OpCode := ssaCmpEqString;
               ttOpNeq: OpCode := ssaCmpNeString;
               ttOpLt: OpCode := ssaCmpLtString;
               ttOpGt: OpCode := ssaCmpGtString;
+              ttOpLe: OpCode := ssaCmpGtString;   // inverted below
+              ttOpGe: OpCode := ssaCmpLtString;   // inverted below
             else
               OpCode := ssaCmpEqString;
             end;
@@ -961,7 +969,22 @@ begin
             end;
           end;
 
-          EmitInstruction(OpCode, Result, Left, Right, MakeSSAValue(svkNone));
+          if ((Left.RegType = srtString) or (Right.RegType = srtString)) and
+             ((Node.Token.TokenType = ttOpLe) or (Node.Token.TokenType = ttOpGe)) then
+          begin
+            // String <= / >= : emit the Gt/Lt comparison into a temp, then set
+            // Result := (temp = 0) to invert it. Each register is written once (SSA).
+            TempReg := FProgram.AllocRegister(srtInt);
+            TempVal := MakeSSARegister(srtInt, TempReg);
+            EmitInstruction(OpCode, TempVal, Left, Right, MakeSSAValue(svkNone));
+            IntReg := FProgram.AllocRegister(srtInt);
+            IntRegVal := MakeSSARegister(srtInt, IntReg);
+            EmitInstruction(ssaLoadConstInt, IntRegVal, MakeSSAConstInt(0),
+                           MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitInstruction(ssaCmpEqInt, Result, TempVal, IntRegVal, MakeSSAValue(svkNone));
+          end
+          else
+            EmitInstruction(OpCode, Result, Left, Right, MakeSSAValue(svkNone));
         end;
 
         // Bitwise operators (AND, OR, XOR) - result is always Int
@@ -7113,6 +7136,90 @@ begin
                  TypeReg, LineReg, MakeSSAValue(svkNone));
 end;
 
+procedure TSSAGenerator.ProcessSprdef(Node: TASTNode);
+var
+  NumVal, NumReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  { SPRDEF [n]
+    AST structure:
+      Child 0: Sprite number (1-8) - optional, defaults to 1
+    SSA encoding:
+      ssaSpriteDef: Src1 = sprite number (float register, like other sprite ops) }
+
+  if Node.ChildCount >= 1 then
+  begin
+    ProcessExpression(Node.GetChild(0), NumVal);
+    if NumVal.Kind in [svkConstFloat, svkConstInt] then
+    begin
+      NumReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+      EmitInstruction(ssaLoadConstFloat, NumReg, NumVal,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+      NumReg := NumVal;
+  end
+  else
+  begin
+    // No argument: default to sprite 1
+    NumReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaLoadConstFloat, NumReg, MakeSSAConstFloat(1.0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  EmitInstruction(ssaSpriteDef, MakeSSAValue(svkNone),
+                 NumReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessSprsave(Node: TASTNode);
+var
+  FileNameVal, FileNameReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 1 then Exit;  { SPRSAVE "filename" }
+
+  ProcessExpression(Node.GetChild(0), FileNameVal);
+  FileNameReg := EnsureStringRegister(FileNameVal);
+
+  EmitInstruction(ssaSprsave, MakeSSAValue(svkNone),
+                 FileNameReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessSprload(Node: TASTNode);
+var
+  FileNameVal, FileNameReg, FlagVal, FlagReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 1 then Exit;  { SPRLOAD "filename" [, usefilecolors] }
+
+  ProcessExpression(Node.GetChild(0), FileNameVal);
+  FileNameReg := EnsureStringRegister(FileNameVal);
+
+  // Optional 2nd arg = "use file colours" flag (int register, default 0).
+  if Node.ChildCount >= 2 then
+  begin
+    ProcessExpression(Node.GetChild(1), FlagVal);
+    if FlagVal.Kind in [svkConstFloat, svkConstInt] then
+    begin
+      FlagReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, FlagReg, FlagVal,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+      FlagReg := FlagVal;
+  end
+  else
+  begin
+    FlagReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, FlagReg, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  EmitInstruction(ssaSprload, MakeSSAValue(svkNone),
+                 FileNameReg, FlagReg, MakeSSAValue(svkNone));
+end;
+
 procedure TSSAGenerator.ProcessRun(Node: TASTNode);
 var
   LineNumVal: TSSAValue;
@@ -7968,6 +8075,9 @@ begin
     antSprcolor: ProcessSprcolor(Node);
     antSprsav: ProcessSprsav(Node);
     antCollision: ProcessCollision(Node);
+    antSprdef: ProcessSprdef(Node);
+    antSprsave: ProcessSprsave(Node);
+    antSprload: ProcessSprload(Node);
     // System commands
     antRun: ProcessRun(Node);
     antList: ProcessList(Node);

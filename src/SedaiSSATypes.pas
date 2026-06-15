@@ -215,6 +215,11 @@ type
     ssaWebSetHeader,    // SETHEADER "name", "value"
     ssaWebStatus,       // STATUS code - set HTTP status code
     {$ENDIF}
+    // Appended at the end so inserting new ops never shifts existing ordinals
+    // (keeps incremental builds consistent across units).
+    ssaSpriteDef,      // SPRDEF [n]: Enter the interactive sprite editor (sbv only)
+    ssaSprsave,        // SPRSAVE "file": save all sprites to a JSON file
+    ssaSprload,        // SPRLOAD "file": load all sprites from a JSON file
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 

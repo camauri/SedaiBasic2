@@ -2002,7 +2002,11 @@ begin
   else if CmdName = kCOLLISION then
     Result := TASTNode.Create(antCollision, Token)
   else if CmdName = kSPRDEF then
-    Result := TASTNode.Create(antStatement, Token)  // SPRDEF deferred - placeholder
+    Result := TASTNode.Create(antSprdef, Token)  // SPRDEF: interactive sprite editor
+  else if CmdName = kSPRSAVE then
+    Result := TASTNode.Create(antSprsave, Token)  // SPRSAVE "file"
+  else if CmdName = kSPRLOAD then
+    Result := TASTNode.Create(antSprload, Token)  // SPRLOAD "file"
   else
     Result := TASTNode.Create(antStatement, Token);
 
@@ -2025,6 +2029,12 @@ begin
     MaxParams := 2
   else if CmdName = kCOLLISION then
     MaxParams := 2
+  else if CmdName = kSPRDEF then
+    MaxParams := 1   // SPRDEF [n]: optional sprite number
+  else if CmdName = kSPRSAVE then
+    MaxParams := 1   // SPRSAVE "filename"
+  else if CmdName = kSPRLOAD then
+    MaxParams := 2   // SPRLOAD "filename" [, usefilecolors]
   else
     MaxParams := 10;
 

@@ -1748,6 +1748,8 @@ begin
  RegisterKeyword(kSPRCOLOR,  ttSpriteCommand,  'Set multicolor 1 and/or multicolor 2 colors for all sprites', kcSpritesHandling);
  RegisterKeyword(kSPRDEF,    ttSpriteCommand,  'Enter the SPRite DEFinition mode',                            kcSpritesHandling);
  RegisterKeyword(kSPRSAV,    ttSpriteCommand,  'Store a sprite data from a text string or vice versa',        kcSpritesHandling);
+ RegisterKeyword(kSPRSAVE,   ttSpriteCommand,  'Save all sprite definitions to a JSON file',                  kcSpritesHandling);
+ RegisterKeyword(kSPRLOAD,   ttSpriteCommand,  'Load all sprite definitions from a JSON file',                kcSpritesHandling);
  // functions
  RegisterKeyword(kBUMP,      ttSpriteFunction, 'Return sprite collision information',                         kcSpritesHandling);
  RegisterKeyword(kRSPCOLOR,  ttSpriteFunction, 'Return sprite multicolor values',                             kcSpritesHandling);

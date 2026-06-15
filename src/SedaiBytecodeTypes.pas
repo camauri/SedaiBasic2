@@ -333,6 +333,9 @@ const
   bcRspcolor        = bcGroupSprite + 9;    // RSPCOLOR(n): Return multicolor value
   bcRsppos          = bcGroupSprite + 10;   // RSPPOS(sprite, n): Return position/speed
   bcRsprite         = bcGroupSprite + 11;   // RSPRITE(sprite, n): Return sprite attribute
+  bcSpriteDef       = bcGroupSprite + 12;   // SPRDEF [n]: Enter interactive sprite editor (sbv)
+  bcSprSaveFile     = bcGroupSprite + 13;   // SPRSAVE "file": save all sprites to JSON
+  bcSprLoadFile     = bcGroupSprite + 14;   // SPRLOAD "file": load all sprites from JSON
 
   // === GROUP 10: GRAPHICS (0x0Axx) ===
   bcGraphicRGBA     = bcGroupGraphics + 0;
@@ -1205,6 +1208,26 @@ begin
         13: Result := 'PrintFileInt';
       else
         Result := Format('FileIO_%d', [SubOp]);
+      end;
+    7: // Sprite operations
+      case SubOp of
+        0: Result := 'Sprite';
+        1: Result := 'MovsprAbs';
+        2: Result := 'MovsprRel';
+        3: Result := 'MovsprPolar';
+        4: Result := 'MovsprAuto';
+        5: Result := 'Sprcolor';
+        6: Result := 'Sprsav';
+        7: Result := 'Collision';
+        8: Result := 'Bump';
+        9: Result := 'Rspcolor';
+        10: Result := 'Rsppos';
+        11: Result := 'Rsprite';
+        12: Result := 'SpriteDef';
+        13: Result := 'SprSaveFile';
+        14: Result := 'SprLoadFile';
+      else
+        Result := Format('Sprite_%d', [SubOp]);
       end;
     8: // Web (WEB_MODE only)
       case SubOp of

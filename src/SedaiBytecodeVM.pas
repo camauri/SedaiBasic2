@@ -68,6 +68,10 @@ type
   { Event poll callback for keeping UI responsive during VM execution }
   TEventPollCallback = function: Boolean of object;
 
+  { SPRDEF callback: runs the modal sprite editor for the given sprite number.
+    Returns True if the VM should stop (e.g. the window was closed). }
+  TSpriteEditorCallback = function(SpriteNum: Integer): Boolean of object;
+
   { Array storage structure }
   TArrayStorage = record
     ElementType: Byte;        // 0=Int, 1=Float, 2=String (maps to TSSARegisterType)
@@ -136,6 +140,8 @@ type
     // Event polling callback for UI responsiveness
     FEventPollCallback: TEventPollCallback;
     FEventPollInterval: Integer;
+    // SPRDEF modal sprite editor callback (set by the SDL console; nil elsewhere)
+    FSpriteEditorCallback: TSpriteEditorCallback;
     // Temp variables for ArrayReverseRange and ArrayShiftLeft
     FStartIdx, FEndIdx, FArrIdxTmp, FLoopIdx: Integer;
     FFirstVal: Int64;
@@ -259,6 +265,8 @@ type
     // Event polling callback (for deferred rendering during VM execution)
     property EventPollCallback: TEventPollCallback read FEventPollCallback write FEventPollCallback;
     property EventPollInterval: Integer read FEventPollInterval write FEventPollInterval;
+    // SPRDEF modal sprite editor callback (set by the SDL console; nil = no-op)
+    property SpriteEditorCallback: TSpriteEditorCallback read FSpriteEditorCallback write FSpriteEditorCallback;
   end;
 
 implementation
@@ -370,6 +378,7 @@ begin
   FCmdHandle := 0;
   // Initialize event polling (nil = disabled)
   FEventPollCallback := nil;
+  FSpriteEditorCallback := nil;
   FEventPollInterval := 10000;  // Poll every 10000 instructions by default
   // Initialize error state for EL, ER, ERR$
   FLastErrorLine := 0;
@@ -1543,6 +1552,19 @@ begin
         bcPSave:
         begin
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;   // filename
+        end;
+
+        // bcSprSaveFile: Src1=filename string reg
+        bcSprSaveFile:
+        begin
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;   // filename
+        end;
+
+        // bcSprLoadFile: Src1=filename string reg, Src2=usefilecolors int reg
+        bcSprLoadFile:
+        begin
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;   // filename
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;         // flag
         end;
 
         // bcKey: Src1=key number (int), Src2=key text (string, optional)
@@ -4136,6 +4158,24 @@ begin
         else
           FFloatRegs[Instr.Dest] := 0;
       end;
+
+    12: // bcSpriteDef - SPRDEF [n]: enter the interactive sprite editor (sbv)
+      begin
+        // The editor is a modal console operation, so it is provided as a callback
+        // (set by the SDL console); other front-ends leave it nil = no-op.
+        if Assigned(FSpriteEditorCallback) then
+          if FSpriteEditorCallback(Round(FFloatRegs[Instr.Src1])) then
+            FRunning := False;  // editor requested quit (window closed)
+      end;
+
+    13: // bcSprSaveFile - SPRSAVE "file": save all sprites to a JSON file
+      if Assigned(FSpriteManager) then
+        FSpriteManager.SaveSpritesToJSON(FStringRegs[Instr.Src1]);
+
+    14: // bcSprLoadFile - SPRLOAD "file" [,usefilecolors]: load sprites from JSON
+      if Assigned(FSpriteManager) then
+        // Src2 = "use file colours" flag (int reg, 0 by default).
+        FSpriteManager.LoadSpritesFromJSON(FStringRegs[Instr.Src1], FIntRegs[Instr.Src2] <> 0);
 
   else
     raise Exception.CreateFmt('Unknown sprite opcode %d at PC=%d', [Instr.OpCode, FPC]);

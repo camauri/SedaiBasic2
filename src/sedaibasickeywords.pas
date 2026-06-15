@@ -235,7 +235,9 @@ const
   kMOVSPR    = 'MOVSPR';     // Move/position sprite
   kSPRCOLOR  = 'SPRCOLOR';   // Set global sprite multicolors
   kSPRDEF    = 'SPRDEF';     // Define sprite (editor)
-  kSPRSAV    = 'SPRSAV';     // Save/load sprite data
+  kSPRSAV    = 'SPRSAV';     // Save/load sprite data (to/from string)
+  kSPRSAVE   = 'SPRSAVE';    // Save all sprites to a JSON file
+  kSPRLOAD   = 'SPRLOAD';    // Load all sprites from a JSON file
   kBUMP      = 'BUMP';       // Return collision bitmask (function)
   kRSPCOLOR  = 'RSPCOLOR';   // Return multicolor value (function)
   kRSPPOS    = 'RSPPOS';     // Return sprite position/speed (function)

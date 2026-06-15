@@ -40,7 +40,7 @@
 460 NEXT I
 465 SLOW
 470 GETKEY K$
-480 GRAPHIC 0
+480 GRAPHIC 8
 485 GOSUB 8500 : REM restore text colors
 500 REM ======== Page 3: 256 Default Palette ========
 510 SCNCLR
@@ -62,7 +62,7 @@
 650 GOSUB 9000
 655 SLOW
 660 GETKEY K$
-670 GRAPHIC 0
+670 GRAPHIC 8
 675 GOSUB 8500 : REM restore text colors
 700 REM ======== Page 4: Color Wheel ========
 710 SCNCLR
@@ -107,7 +107,7 @@
 1070 NEXT C
 1075 SLOW
 1080 GETKEY K$
-1090 GRAPHIC 0
+1090 GRAPHIC 8
 1095 PRST : REM reset palette to C64 default
 1098 GOSUB 8500 : REM restore text colors
 1100 REM ======== Page 5: VGA 256-Color Palette ========
@@ -162,7 +162,7 @@
 1410 GOSUB 9000
 1415 SLOW
 1420 GETKEY K$
-1430 GRAPHIC 0
+1430 GRAPHIC 8
 1435 PRST : REM reset palette to C64 default
 1440 GOSUB 8500 : REM restore text colors
 1500 REM ======== Page 6: Rainbow Gradient ========
@@ -197,7 +197,7 @@
 1770 NEXT I
 1780 SLOW
 1790 GETKEY K$
-1800 GRAPHIC 0
+1800 GRAPHIC 8
 1805 PRST : REM reset palette to C64 default
 1810 GOSUB 8500 : REM restore text colors
 1900 REM ======== Exit ========

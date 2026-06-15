@@ -319,6 +319,9 @@ begin
     ssaSprcolor: Result := bcSprcolor;
     ssaSprsav: Result := bcSprsav;
     ssaCollision: Result := bcCollision;
+    ssaSpriteDef: Result := bcSpriteDef;
+    ssaSprsave: Result := bcSprSaveFile;
+    ssaSprload: Result := bcSprLoadFile;
     // Sprite functions
     ssaBump: Result := bcBump;
     ssaRspcolor: Result := bcRspcolor;

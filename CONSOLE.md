@@ -121,6 +121,35 @@ The `GLIST` output shows:
 - `*` = native desktop resolution
 - `+` = same aspect ratio as desktop
 
+## Sprite Editor (SPRDEF)
+
+`SPRDEF [n]` opens an interactive, modal sprite editor (graphical build `sbv` only). It
+shows a magnified 24×21 grid (12×21 in multicolor) with row/column rulers and a live
+cursor position below the grid, plus a 1:1 preview. Edits are committed to the sprite on
+`RETURN`/`CTRL+S`/sprite switch; `ESC` discards them.
+
+| Key | Action |
+|-----|--------|
+| `Arrows` | Move the cursor (steps of 2 columns in multicolor) |
+| `SPACE` | Paint: hi-res toggles the pixel on/off; multicolor cycles it 0→1→2→3→0 |
+| `0` | Erase the pixel under the cursor |
+| `1`–`8` | Switch the sprite being edited (each sprite keeps its own state and undo history) |
+| `M` | Toggle hi-res ↔ multicolor (asks `Y/N`; the grid is cleared on switch) |
+| `X` / `Y` | Toggle horizontal / vertical expand (the sprite's only historical resize) |
+| `C` | Cycle the palette colour under the cursor (sprite colour, or MC1/MC2 in multicolor) |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo — independent history per sprite |
+| `Ctrl+C` / `Ctrl+V` | Copy / paste: the selection if any, otherwise the whole shape |
+| `Shift+Arrows` | Rectangular selection (`Shift+Ctrl+Arrows` adds a rectangle to it) |
+| `Ctrl+Space` | Toggle a single pixel in the selection |
+| `DEL` | Clear the whole grid |
+| `Ctrl+S` / `Ctrl+L` | Save / load all sprites to/from a file (filename typed below the grid) |
+| `RETURN` | Save the sprite and exit the editor |
+| `ESC` | Cancel and exit (discard changes) |
+
+Sprite files use the `.spr` extension (JSON content) and default to the running program's
+folder. See `SPRSAVE`/`SPRLOAD` in `BASIC.md`; `SPRLOAD "file",1` restores the file's
+colours, while the default keeps the program's current colours.
+
 ## Notes
 
 - All editing operations work on the current input line only

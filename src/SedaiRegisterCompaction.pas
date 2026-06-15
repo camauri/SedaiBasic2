@@ -425,7 +425,9 @@ begin
     // Fused Square-Sum: Src1 is 'x' or 'sum'
     bcSquareSumFloat, bcAddSquareFloat, bcMulMulFloat, bcAddSqrtFloat,
     // === GROUP 11: Sound ===
-    bcSoundFilter:  // Src1 = cutoff frequency (float)
+    bcSoundFilter,  // Src1 = cutoff frequency (float)
+    // === GROUP 7: Sprite ===
+    bcSpriteDef:    // SPRDEF [n]: Src1 = sprite number (float)
       Result := True;
   else
     Result := False;
@@ -478,6 +480,8 @@ begin
     // === GROUP 11: Sound ===
     bcSoundFilter,  // Src2 = lowpass (int 0/1)
     bcSoundSound,   // Src2 = frequency (int)
+    // === GROUP 7: Sprite ===
+    bcSprLoadFile,  // SPRLOAD: Src2 = usefilecolors flag (int)
     // === GROUP 6: File I/O operations ===
     bcRecord:       // Src2 = position (int)
       Result := True;
@@ -536,7 +540,10 @@ begin
     // === GROUP 10: Graphics ===
     bcGraphicGShape,  // GSHAPE A$, x, y: A$ is string in Src1
     bcPLoad,          // PLOAD "filename": Src1 = filename string
-    bcPSave:          // PSAVE "filename": Src1 = filename string
+    bcPSave,          // PSAVE "filename": Src1 = filename string
+    // === GROUP 7: Sprite ===
+    bcSprSaveFile,    // SPRSAVE "file": Src1 = filename string
+    bcSprLoadFile:    // SPRLOAD "file": Src1 = filename string
       Result := True;
   else
     Result := False;

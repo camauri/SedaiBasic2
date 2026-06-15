@@ -2,7 +2,7 @@
 
 ## Implementation Progress
 
-**183 / 205 commands implemented (89%)**
+**186 / 207 commands implemented (90%)**
 
 ```
 [████████████████████████████████████████████·····] 89%
@@ -236,8 +236,10 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `SPRITE` | ✓ | Set sprite properties |
 | `MOVSPR` | ✓ | Position or move sprite on the screen |
 | `SPRCOLOR` | ✓ | Set multicolor 1 and/or multicolor 2 colors for all sprites |
-| `SPRDEF` | ✗ | Enter the SPRite DEFinition mode |
+| `SPRDEF` | ✓ | Enter the SPRite DEFinition mode (interactive sprite editor, sbv only) |
 | `SPRSAV` | ✓ | Store a sprite data from a text string or vice versa |
+| `SPRSAVE` | ✓ | Save all sprite definitions to a JSON file (SedaiBasic extension) |
+| `SPRLOAD` | ✓ | Load all sprite definitions from a file: `SPRLOAD "file"[,usefilecolors]` (1 = use the file's colours; default 0 = keep current colours) (SedaiBasic extension) |
 | `BUMP` | ✓ | Return sprite collision information |
 | `RSPCOLOR` | ✓ | Return sprite multicolor values |
 | `RSPPOS` | ✓ | Return the speed and position values of a sprite |

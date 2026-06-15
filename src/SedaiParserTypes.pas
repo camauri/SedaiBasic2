@@ -187,7 +187,6 @@ type
     antSprcolor,          // SPRCOLOR command (set global multicolors)
     antSprsav,            // SPRSAV command (save/load sprite data)
     antCollision,         // COLLISION command (set collision handler)
-    // Note: SPRDEF (sprite editor) will be added later
     // Sprite functions (BUMP, RSPCOLOR, RSPPOS, RSPRITE) are handled
     // via antSpriteFunction with function name in Value
 
@@ -199,7 +198,13 @@ type
 
     // === ERROR HANDLING ===
     antError,             // Error node
-    antUnknown            // Unknown construct
+    antUnknown,           // Unknown construct
+
+    // Appended at the end so inserting new node types never shifts existing
+    // ordinals (keeps incremental builds consistent across units).
+    antSprdef,            // SPRDEF command (interactive sprite editor)
+    antSprsave,           // SPRSAVE command (save all sprites to JSON file)
+    antSprload            // SPRLOAD command (load all sprites from JSON file)
   );
 
   // === PRECEDENCE LEVELS FOR PRATT PARSER ===
@@ -368,7 +373,8 @@ begin
     antGet, antPut, antPoke, antSys, antNew, antRun, antList,
     antSave, antLoad, antVerify, antBload, antBsave, antBoot, antCatalog, antBlock,
     // Sprite commands
-    antSprite, antMovspr, antSprcolor, antSprsav, antCollision
+    antSprite, antMovspr, antSprcolor, antSprsav, antCollision, antSprdef,
+    antSprsave, antSprload
   ];
 end;
 

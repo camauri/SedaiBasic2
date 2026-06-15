@@ -40,7 +40,7 @@ uses
   SedaiBytecodeDisassembler,
   SedaiSSATypes, SedaiSSA,
   SedaiBasicKeywords, SedaiDebugger,
-  SedaiMemoryMapper, SedaiC128MemoryMapper, SedaiSpriteEngine;
+  SedaiMemoryMapper, SedaiC128MemoryMapper, SedaiSpriteEngine, SedaiSpriteTypes;
 
 const
   SCROLLBACK_LINES = 1000;
@@ -186,6 +186,10 @@ type
     function PaletteIndexToSDLColor(Index: Byte): TSDL_Color;
     // Public method for rendering graphics buffer to screen
     procedure RenderGraphicsTexture;
+    // Throttled present used by drawing primitives: renders/presents the graphics
+    // buffer at most ~60fps so incremental drawing stays visible (progressive) while
+    // tight loops don't stall once per shape on vsync. See MaybePresentGraphics body.
+    procedure MaybePresentGraphics;
     constructor Create;
     destructor Destroy; override;
 
@@ -336,6 +340,7 @@ type
     FShouldQuit: Boolean;
     FFastMode: Boolean;
     FFastModeAlpha: Byte;
+    FLastGfxPresentTick: UInt32;  // wall-clock throttle for MaybePresentGraphics
 
     // FAST mode (C128 2MHz mode emulation)
     procedure SetFastMode(Enabled: Boolean);
@@ -871,6 +876,9 @@ type
     procedure EndVMExecution;
     procedure SetCursorEnabled(Enable: Boolean);
 
+    // SPRDEF: modal interactive sprite editor (wired to FBytecodeVM.SpriteEditorCallback)
+    function RunSpriteEditor(SpriteNum: Integer): Boolean;
+
   public
     constructor Create;
     destructor Destroy; override;
@@ -972,6 +980,9 @@ begin
   // FAST mode (C128 2MHz mode emulation) - default off, alpha 255 (opaque)
   FFastMode := False;
   FFastModeAlpha := 255;
+
+  // Throttle for MaybePresentGraphics (0 = present on first draw)
+  FLastGfxPresentTick := 0;
 
   // COLOR command - initialize color sources (must match FxxxIndex values above)
   FColorSources[0] := FBackgroundIndex;    // Background (11 = Dark Grey)
@@ -2524,10 +2535,7 @@ begin
     PushPixel(CurX, CurY - 1);
   end;
 
-  // Sync to texture and present
-  SyncGraphicsBufferToTexture;
-  RenderGraphicsTexture;
-  Present;
+  MaybePresentGraphics;  // throttled ~60fps present (see DrawBoxWithColor)
 end;
 
 // === WINDOW command support ===
@@ -2720,10 +2728,7 @@ begin
       FGraphicsMemory.SetPixelRGBA(PX + SX, PY + SY, NewPixel);
     end;
 
-  // Sync to texture and present
-  SyncGraphicsBufferToTexture;
-  RenderGraphicsTexture;
-  Present;
+  MaybePresentGraphics;  // throttled ~60fps present (see DrawBoxWithColor)
 end;
 
 function TVideoController.SetGraphicMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
@@ -3155,9 +3160,9 @@ begin
     end;
   end;
 
-  // Sync to texture and render
-  RenderGraphicsTexture;
-  Present;
+  // Throttled present (~60fps): keeps incremental drawing visible without one
+  // blocking vsync present per shape. See MaybePresentGraphics.
+  MaybePresentGraphics;
 end;
 
 procedure TVideoController.DrawCircleWithColor(X, Y, XR, YR: Integer; Color: UInt32;
@@ -3269,9 +3274,7 @@ begin
     CurrentAngle := CurrentAngle + Inc;
   end;
 
-  // Sync to texture and render
-  RenderGraphicsTexture;
-  Present;
+  MaybePresentGraphics;  // throttled ~60fps present (see DrawBoxWithColor)
 end;
 
 procedure TVideoController.DrawLineInternal(X1, Y1, X2, Y2: Integer;
@@ -3362,8 +3365,7 @@ begin
   else
     DrawLineInternal(ScaledX1, ScaledY1, ScaledX2, ScaledY2, False, 0, Color);
 
-  RenderGraphicsTexture;
-  Present;
+  MaybePresentGraphics;  // throttled ~60fps present (see DrawBoxWithColor)
 end;
 
 procedure TVideoController.SetPixelCursor(X, Y: Integer);
@@ -3558,6 +3560,31 @@ begin
   end
   else
     SDL_RenderCopy(FRenderer, FGraphicsTexture, nil, @DestRect);
+end;
+
+// Throttled present for drawing primitives (BOX/CIRCLE/DRAW/PAINT/GSHAPE).
+// Drawing writes only the CPU buffer; this flushes it to screen at most ~60fps.
+//  - A tight loop drawing many shapes coalesces into a few presents instead of one
+//    blocking vsync present per shape (which made 256 boxes take ~4s).
+//  - Slow/animated drawing still updates progressively (you see it draw), because a
+//    present happens every time >=16ms of wall-clock have elapsed.
+// The end-of-execution render (EndVMExecution) and the VM event-poll render guarantee
+// the final/intermediate frames are shown even when the throttle skips a present here.
+procedure TVideoController.MaybePresentGraphics;
+begin
+  if FGraphicsTexture = nil then Exit;
+  // Unsigned wrap-safe elapsed check; also presents on the first call (tick 0).
+  if (FLastGfxPresentTick = 0) or ((SDL_GetTicks - FLastGfxPresentTick) >= 16) then
+  begin
+    RenderGraphicsTexture;
+    Present;  // with PRESENTVSYNC this BLOCKS ~16ms until the next vblank
+    // Stamp the marker AFTER the present: the vsync wait is consumed inside Present,
+    // so if we used a timestamp read before it, the elapsed time would already be
+    // ~16ms and every subsequent shape would present+block again (defeating the
+    // throttle -> 256 boxes back to ~4s). Reading the clock here means the next
+    // 16ms window is measured from real drawing, so fast loops coalesce.
+    FLastGfxPresentTick := SDL_GetTicks;
+  end;
 end;
 
 { TScrollbackRingBuffer }
@@ -6039,6 +6066,8 @@ begin
     // Render sprites on top of graphics (clipped to viewport)
     if Assigned(FSpriteEngine) then
     begin
+      FSpriteEngine.SetNativeResolution(FVideoController.ModeInfo.NativeWidth,
+        FVideoController.ModeInfo.NativeHeight);
       FSpriteEngine.SetViewportOffset(FVideoController.ViewportX, FVideoController.ViewportY,
         FVideoController.ViewportWidth, FVideoController.ViewportHeight);
       FSpriteEngine.RenderSprites;
@@ -6056,6 +6085,8 @@ begin
   // Render sprites on top of text (clipped to viewport)
   if Assigned(FSpriteEngine) then
   begin
+    FSpriteEngine.SetNativeResolution(FVideoController.ModeInfo.NativeWidth,
+      FVideoController.ModeInfo.NativeHeight);
     FSpriteEngine.SetViewportOffset(FVideoController.ViewportX, FVideoController.ViewportY,
       FVideoController.ViewportWidth, FVideoController.ViewportHeight);
     FSpriteEngine.RenderSprites;
@@ -9294,6 +9325,9 @@ procedure TSedaiNewConsole.SetStartupFile(const AFileName: string; AAutoRun: Boo
 begin
   FStartupFile := AFileName;
   FAutoRun := AAutoRun;
+  // Sprite files (SPRSAVE/SPRLOAD and the editor) default to the program's folder.
+  if Assigned(FSpriteEngine) then
+    FSpriteEngine.SetBaseDir(ExtractFilePath(AFileName));
 end;
 
 procedure TSedaiNewConsole.SetHistoryFile(const AFileName: string);
@@ -9504,13 +9538,749 @@ begin
   FCursorEnabled := False;  // Hide cursor during program execution
   FLastVMRenderTick := SDL_GetTicks;
   FBytecodeVM.EventPollCallback := @HandleVMEventPoll;
+  FBytecodeVM.SpriteEditorCallback := @RunSpriteEditor;
 end;
 
 procedure TSedaiNewConsole.EndVMExecution;
 begin
   FBytecodeVM.EventPollCallback := nil;
+  FBytecodeVM.SpriteEditorCallback := nil;
   FCursorEnabled := True;  // Restore cursor for REPL
   // Final render to show the last state (including sprites via RenderScreen)
+  RenderScreen;
+  UpdateCursor;
+  FVideoController.Present;
+end;
+
+// SPRDEF: modal interactive sprite editor. Takes over the SDL window with a magnified
+// 24x21 grid, lets the user paint the shape (hi-res or multicolor), toggle expand and
+// pick the sprite color, then writes the result back into the sprite via the engine.
+// Returns True only if the window was closed (so the VM should stop).
+function TSedaiNewConsole.RunSpriteEditor(SpriteNum: Integer): Boolean;
+const
+  SPR_W = 24;
+  SPR_H = 21;
+  MAXUNDO = 30;   // per-sprite undo/redo depth
+type
+  TGridSnap = array[0..SPR_H - 1, 0..SPR_W - 1] of Byte;
+var
+  Grid: TGridSnap;  // 0..3 colour codes
+  // Per-sprite undo/redo stacks (independent history for each of the 8 sprites).
+  Undo, Redo: array[1..8] of array of TGridSnap;
+  Info: TSpriteInfo;
+  CX, CY: Integer;
+  Multicolor, ExpandX, ExpandY: Boolean;
+  SprColIdx, MC1Idx, MC2Idx: Byte;
+  Running, ConfirmSwitch, ClipValid, HasAnchor, IsShiftArrow, OverwritePending: Boolean;
+  // Shape clipboard: a region of values + a mask of which cells are real.
+  Clip: array[0..SPR_H - 1, 0..SPR_W - 1] of Byte;
+  ClipSel: array[0..SPR_H - 1, 0..SPR_W - 1] of Boolean;
+  ClipW, ClipH: Integer;
+  // Selection mask (+ base for additive drags) and the rectangle anchor.
+  Sel, BaseSel: array[0..SPR_H - 1, 0..SPR_W - 1] of Boolean;
+  SelAnchorX, SelAnchorY: Integer;
+  Event: TSDL_Event;
+  Sym: TSDL_KeyCode;
+  Mods: Word;
+  InputMode: Integer;   // 0=none, 1=save filename, 2=load filename
+  InputText: string;    // filename being typed (shown below the grid)
+  LastFile: string;     // last saved/loaded name (shown + re-proposed on save)
+
+  function ClampByte16(V: Integer): Byte;
+  begin
+    Result := ((V mod 16) + 16) mod 16;
+  end;
+
+  // Filename normalized to the .spr extension (matches the engine), for FileExists.
+  function NormSpr(const S: string): string;
+  begin
+    if LowerCase(ExtractFileExt(S)) <> '.spr' then Result := S + '.spr' else Result := S;
+  end;
+
+  // Cycle the palette index of the colour UNDER the cursor: in multicolor the
+  // pixel value selects which colour (1=MC1, 3=MC2, else the sprite colour); in
+  // hi-res it is always the sprite colour.
+  procedure CycleColor(Delta: Integer);
+  var
+    V: Byte;
+  begin
+    if not Multicolor then
+      SprColIdx := ClampByte16(SprColIdx + Delta)
+    else
+    begin
+      V := Grid[CY, CX];
+      if V = 1 then MC1Idx := ClampByte16(MC1Idx + Delta)
+      else if V = 3 then MC2Idx := ClampByte16(MC2Idx + Delta)
+      else SprColIdx := ClampByte16(SprColIdx + Delta);
+    end;
+  end;
+
+  function GridIsEmpty: Boolean;
+  var
+    R2, C2: Integer;
+  begin
+    Result := True;
+    for R2 := 0 to SPR_H - 1 do
+      for C2 := 0 to SPR_W - 1 do
+        if Grid[R2, C2] <> 0 then
+        begin
+          Result := False;
+          Exit;
+        end;
+  end;
+
+  procedure UnpackFromSprite;
+  var
+    Row, ByteCol, Bit, P, Idx, V: Integer;
+    D: TBytes;
+  begin
+    D := FSpriteEngine.GetSpriteData(SpriteNum);
+    for Row := 0 to SPR_H - 1 do
+      for ByteCol := 0 to 2 do
+      begin
+        Idx := Row * 3 + ByteCol;
+        if Idx >= Length(D) then
+        begin
+          for Bit := 0 to 7 do
+            Grid[Row, ByteCol * 8 + Bit] := 0;
+          Continue;
+        end;
+        if Multicolor then
+          for P := 0 to 3 do
+          begin
+            V := (D[Idx] shr (6 - P * 2)) and 3;
+            Grid[Row, ByteCol * 8 + P * 2] := V;
+            Grid[Row, ByteCol * 8 + P * 2 + 1] := V;
+          end
+        else
+          for Bit := 0 to 7 do
+            Grid[Row, ByteCol * 8 + Bit] := (D[Idx] shr (7 - Bit)) and 1;
+      end;
+  end;
+
+  procedure PackToSprite;
+  var
+    Row, ByteCol, Bit, P, B: Integer;
+    D: TBytes;
+    ScX, ScY: Double;
+  begin
+    SetLength(D, 63);
+    for Row := 0 to SPR_H - 1 do
+      for ByteCol := 0 to 2 do
+      begin
+        B := 0;
+        if Multicolor then
+          for P := 0 to 3 do
+            B := B or ((Grid[Row, ByteCol * 8 + P * 2] and 3) shl (6 - P * 2))
+        else
+          for Bit := 0 to 7 do
+            if Grid[Row, ByteCol * 8 + Bit] <> 0 then
+              B := B or (1 shl (7 - Bit));
+        D[Row * 3 + ByteCol] := Byte(B);
+      end;
+    FSpriteEngine.SetSpriteData(SpriteNum, D);
+
+    // Apply colour / multicolor / expand (keep enabled & priority unchanged: -1).
+    if ExpandX then ScX := 2.0 else ScX := 1.0;
+    if ExpandY then ScY := 2.0 else ScY := 1.0;
+    FSpriteEngine.SetSprite(SpriteNum, -1, MakeIndexedColor(SprColIdx), -1,
+      ScX, ScY, Ord(Multicolor));
+    if Multicolor then
+      FSpriteEngine.SetSpriteMulticolors(MakeIndexedColor(MC1Idx), MakeIndexedColor(MC2Idx));
+  end;
+
+  procedure SetCell(V: Byte);
+  begin
+    Grid[CY, CX] := V;
+    if Multicolor then
+      Grid[CY, CX xor 1] := V;   // paint both halves of the multicolor pair
+  end;
+
+  function CellColor(V: Byte): TSDL_Color;
+  begin
+    if Multicolor then
+      case V of
+        1: Result := FVideoController.PaletteIndexToSDLColor(MC1Idx);
+        2: Result := FVideoController.PaletteIndexToSDLColor(SprColIdx);
+        3: Result := FVideoController.PaletteIndexToSDLColor(MC2Idx);
+      else
+        begin Result.r := 32; Result.g := 32; Result.b := 32; Result.a := 255; end;
+      end
+    else if V <> 0 then
+      Result := FVideoController.PaletteIndexToSDLColor(SprColIdx)
+    else
+      begin Result.r := 32; Result.g := 32; Result.b := 32; Result.a := 255; end;
+  end;
+
+  procedure DrawStr(X, Y: Integer; const S: string);
+  var
+    Surf: PSDL_Surface;
+    Tex: PSDL_Texture;
+    Dst: TSDL_Rect;
+    White: TSDL_Color;
+  begin
+    if (S = '') or (FVideoController.Font = nil) then Exit;
+    White.r := 220; White.g := 220; White.b := 220; White.a := 255;
+    Surf := TTF_RenderUTF8_Blended(FVideoController.Font, PChar(S), White);
+    if Surf = nil then Exit;
+    Tex := SDL_CreateTextureFromSurface(FVideoController.Renderer, Surf);
+    if Tex <> nil then
+    begin
+      Dst.x := X; Dst.y := Y; Dst.w := Surf^.w; Dst.h := Surf^.h;
+      SDL_RenderCopy(FVideoController.Renderer, Tex, nil, @Dst);
+      SDL_DestroyTexture(Tex);
+    end;
+    SDL_FreeSurface(Surf);
+  end;
+
+  procedure DrawEditor;
+  var
+    R: PSDL_Renderer;
+    WW, WH, Cell, GX, GY, Row, Col, PvX, PvY, PvS, PairLeft, CurW, LogCol: Integer;
+    Rect: TSDL_Rect;
+    C: TSDL_Color;
+    ModeStr: string;
+  begin
+    R := FVideoController.Renderer;
+    if R = nil then Exit;
+    SDL_GetRendererOutputSize(R, @WW, @WH);
+
+    SDL_SetRenderDrawColor(R, 0, 0, 0, 255);
+    SDL_RenderClear(R);
+
+    Cell := (WW * 60 div 100) div SPR_W;
+    if ((WH * 82 div 100) div SPR_H) < Cell then Cell := (WH * 82 div 100) div SPR_H;
+    if Cell < 6 then Cell := 6;
+
+    GX := 38;   // leave room on the left for row numbers
+    GY := (WH - Cell * SPR_H) div 2;
+    if GY < 28 then GY := 28;   // leave room on top for column numbers
+
+    // Grid cells. In multicolor the horizontal resolution is halved: 12 logical
+    // columns of double-width pixels (bit pairs), so draw 12 wide cells; in hi-res
+    // draw the full 24 columns.
+    if Multicolor then
+      for Row := 0 to SPR_H - 1 do
+        for Col := 0 to 11 do
+        begin
+          C := CellColor(Grid[Row, Col * 2]);
+          SDL_SetRenderDrawColor(R, C.r, C.g, C.b, 255);
+          Rect.x := GX + Col * 2 * Cell; Rect.y := GY + Row * Cell;
+          Rect.w := 2 * Cell - 1; Rect.h := Cell - 1;
+          SDL_RenderFillRect(R, @Rect);
+        end
+    else
+      for Row := 0 to SPR_H - 1 do
+        for Col := 0 to SPR_W - 1 do
+        begin
+          C := CellColor(Grid[Row, Col]);
+          SDL_SetRenderDrawColor(R, C.r, C.g, C.b, 255);
+          Rect.x := GX + Col * Cell; Rect.y := GY + Row * Cell;
+          Rect.w := Cell - 1; Rect.h := Cell - 1;
+          SDL_RenderFillRect(R, @Rect);
+        end;
+
+    // Column ruler (logical columns: 0-11 in multicolor, 0-23 in hi-res)
+    if Multicolor then
+    begin
+      Col := 0;
+      while Col <= 11 do
+      begin
+        DrawStr(GX + Col * 2 * Cell + 1, GY - 20, IntToStr(Col));
+        Col := Col + 2;
+      end;
+    end
+    else
+    begin
+      Col := 0;
+      while Col <= SPR_W - 1 do
+      begin
+        DrawStr(GX + Col * Cell + 1, GY - 20, IntToStr(Col));
+        Col := Col + 4;
+      end;
+    end;
+    // Row ruler (0-20 in both modes)
+    Row := 0;
+    while Row <= SPR_H - 1 do
+    begin
+      DrawStr(GX - 26, GY + Row * Cell - 2, IntToStr(Row));
+      Row := Row + 4;
+    end;
+
+    // Selection overlay: cyan outline on selected cells (one outline per pair in
+    // multicolor, since the two halves share the selection state).
+    SDL_SetRenderDrawColor(R, 0, 255, 255, 255);
+    for Row := 0 to SPR_H - 1 do
+      for Col := 0 to SPR_W - 1 do
+        if Sel[Row, Col] and not (Multicolor and ((Col and 1) = 1)) then
+        begin
+          Rect.x := GX + Col * Cell; Rect.y := GY + Row * Cell;
+          if Multicolor then Rect.w := 2 * Cell - 1 else Rect.w := Cell - 1;
+          Rect.h := Cell - 1;
+          SDL_RenderDrawRect(R, @Rect);
+        end;
+
+    // Cursor (spans the whole pair in multicolor). Drawn as a white outer + black
+    // inner double outline so it stays visible against ANY cell colour (a single
+    // colour disappears on a matching pixel, e.g. a yellow cursor on yellow).
+    if Multicolor then begin PairLeft := CX and (not 1); CurW := 2 * Cell; end
+    else begin PairLeft := CX; CurW := Cell; end;
+    Rect.x := GX + PairLeft * Cell; Rect.y := GY + CY * Cell;
+    Rect.w := CurW; Rect.h := Cell;
+    SDL_SetRenderDrawColor(R, 255, 255, 255, 255);   // white outer ring
+    SDL_RenderDrawRect(R, @Rect);
+    Rect.x := Rect.x + 1; Rect.y := Rect.y + 1;
+    Rect.w := Rect.w - 2; Rect.h := Rect.h - 2;
+    if (Rect.w > 0) and (Rect.h > 0) then
+    begin
+      SDL_SetRenderDrawColor(R, 0, 0, 0, 255);       // black inner ring
+      SDL_RenderDrawRect(R, @Rect);
+    end;
+
+    // Prominent cursor coordinates right under the grid (the cursor itself can be
+    // hard to spot, so always show where it is). Logical column: 0-11 in multicolor.
+    // Line below the grid: filename input field while saving/loading, else the
+    // live cursor coordinates (the filename has the whole width, so any length fits).
+    if OverwritePending then
+      DrawStr(GX, GY + SPR_H * Cell + 6, 'OVERWRITE ' + NormSpr(InputText) + ' ?  Y/N')
+    else if InputMode = 1 then
+      DrawStr(GX, GY + SPR_H * Cell + 6, 'SAVE FILE: ' + InputText + '_')
+    else if InputMode = 2 then
+      DrawStr(GX, GY + SPR_H * Cell + 6, 'LOAD FILE: ' + InputText + '_')
+    else
+    begin
+      if Multicolor then LogCol := CX div 2 else LogCol := CX;
+      if LastFile <> '' then
+        DrawStr(GX, GY + SPR_H * Cell + 6, Format('COL %d   ROW %d    FILE: %s', [LogCol, CY, LastFile]))
+      else
+        DrawStr(GX, GY + SPR_H * Cell + 6, Format('COL %d   ROW %d', [LogCol, CY]));
+    end;
+
+    // Mode-switch confirmation prompt (switching hi-res<->multicolor clears the sprite)
+    if ConfirmSwitch then
+      DrawStr(GX, GY + SPR_H * Cell + 26, 'SWITCH HI-RES/MULTICOLOR? CLEARS SPRITE - Y/N');
+
+    // 1:1-ish preview to the right of the grid
+    PvS := 3;
+    PvX := GX + SPR_W * Cell + 30;
+    PvY := GY;
+    for Row := 0 to SPR_H - 1 do
+      for Col := 0 to SPR_W - 1 do
+        if Grid[Row, Col] <> 0 then
+        begin
+          C := CellColor(Grid[Row, Col]);
+          SDL_SetRenderDrawColor(R, C.r, C.g, C.b, 255);
+          Rect.x := PvX + Col * PvS; Rect.y := PvY + Row * PvS;
+          Rect.w := PvS; Rect.h := PvS;
+          SDL_RenderFillRect(R, @Rect);
+        end;
+
+    // Status + help
+    if Multicolor then ModeStr := 'MULTICOLOR' else ModeStr := 'HI-RES';
+    DrawStr(PvX, PvY + SPR_H * PvS + 16,
+      Format('SPRDEF  sprite %d   %s   color %d', [SpriteNum, ModeStr, SprColIdx]));
+    DrawStr(PvX, PvY + SPR_H * PvS + 38,
+      Format('cursor:  col %d   row %d', [LogCol, CY]));
+    DrawStr(PvX, PvY + SPR_H * PvS + 60,
+      Format('expand X:%s  Y:%s', [BoolToStr(ExpandX, 'on', 'off'), BoolToStr(ExpandY, 'on', 'off')]));
+    DrawStr(PvX, PvY + SPR_H * PvS + 92, 'Arrows: move   SPACE: paint/cycle');
+    DrawStr(PvX, PvY + SPR_H * PvS + 112, '0: erase  1-8: sprite  Ctrl+C/V copy/paste');
+    DrawStr(PvX, PvY + SPR_H * PvS + 132, 'M: hi-res/MC (clears)   X/Y: expand   C: colour');
+    DrawStr(PvX, PvY + SPR_H * PvS + 152, 'DEL: clear   RETURN: save&exit   ESC: cancel');
+    DrawStr(PvX, PvY + SPR_H * PvS + 172, 'Ctrl+S/L: save/load file (.spr)');
+    DrawStr(PvX, PvY + SPR_H * PvS + 192, 'Shift+arrows: select  (+Ctrl: add area)');
+    DrawStr(PvX, PvY + SPR_H * PvS + 212, 'Ctrl+Space: toggle pixel in selection');
+    DrawStr(PvX, PvY + SPR_H * PvS + 232, 'Ctrl+Z/Y: undo / redo (per sprite)');
+
+    SDL_RenderPresent(R);
+  end;
+
+  procedure ClearGrid;
+  var Row, Col: Integer;
+  begin
+    for Row := 0 to SPR_H - 1 do
+      for Col := 0 to SPR_W - 1 do
+        Grid[Row, Col] := 0;
+  end;
+
+  procedure ClearSelection;
+  var Row, Col: Integer;
+  begin
+    HasAnchor := False;
+    for Row := 0 to SPR_H - 1 do
+      for Col := 0 to SPR_W - 1 do
+        Sel[Row, Col] := False;
+  end;
+
+  function SelEmpty: Boolean;
+  var Row, Col: Integer;
+  begin
+    Result := True;
+    for Row := 0 to SPR_H - 1 do
+      for Col := 0 to SPR_W - 1 do
+        if Sel[Row, Col] then begin Result := False; Exit; end;
+  end;
+
+  // Begin a rectangular drag at the cursor. AddMode keeps the existing selection
+  // (the new rectangle is added to it); otherwise the selection is replaced.
+  procedure StartDrag(AddMode: Boolean);
+  var Row, Col: Integer;
+  begin
+    SelAnchorX := CX; SelAnchorY := CY;
+    for Row := 0 to SPR_H - 1 do
+      for Col := 0 to SPR_W - 1 do
+        if AddMode then BaseSel[Row, Col] := Sel[Row, Col] else BaseSel[Row, Col] := False;
+    HasAnchor := True;
+  end;
+
+  // Selection = base mask OR the rectangle from the anchor to the cursor.
+  procedure ApplyDragRect;
+  var Row, Col, X1, Y1, X2, Y2: Integer;
+  begin
+    if SelAnchorX < CX then begin X1 := SelAnchorX; X2 := CX; end else begin X1 := CX; X2 := SelAnchorX; end;
+    if SelAnchorY < CY then begin Y1 := SelAnchorY; Y2 := CY; end else begin Y1 := CY; Y2 := SelAnchorY; end;
+    for Row := 0 to SPR_H - 1 do
+      for Col := 0 to SPR_W - 1 do
+        Sel[Row, Col] := BaseSel[Row, Col] or
+          ((Col >= X1) and (Col <= X2) and (Row >= Y1) and (Row <= Y2));
+  end;
+
+  // Copy the selected region (or the whole shape if nothing is selected) to the
+  // clipboard, keeping a mask so a non-rectangular selection pastes correctly.
+  procedure CopyShape;
+  var Row, Col, X1, Y1, X2, Y2: Integer;
+  begin
+    if SelEmpty then
+    begin
+      ClipW := SPR_W; ClipH := SPR_H;
+      for Row := 0 to SPR_H - 1 do
+        for Col := 0 to SPR_W - 1 do
+        begin Clip[Row, Col] := Grid[Row, Col]; ClipSel[Row, Col] := True; end;
+    end
+    else
+    begin
+      X1 := SPR_W; Y1 := SPR_H; X2 := -1; Y2 := -1;
+      for Row := 0 to SPR_H - 1 do
+        for Col := 0 to SPR_W - 1 do
+          if Sel[Row, Col] then
+          begin
+            if Col < X1 then X1 := Col;
+            if Col > X2 then X2 := Col;
+            if Row < Y1 then Y1 := Row;
+            if Row > Y2 then Y2 := Row;
+          end;
+      ClipW := X2 - X1 + 1; ClipH := Y2 - Y1 + 1;
+      for Row := 0 to ClipH - 1 do
+        for Col := 0 to ClipW - 1 do
+        begin
+          Clip[Row, Col] := Grid[Y1 + Row, X1 + Col];
+          ClipSel[Row, Col] := Sel[Y1 + Row, X1 + Col];
+        end;
+    end;
+    ClipValid := True;
+  end;
+
+  // Paste the clipboard (only the masked cells). A whole-sprite copy pastes at the
+  // top-left (replace the sprite); a smaller region pastes at the cursor.
+  procedure PasteShape;
+  var Row, Col, OX, OY: Integer;
+  begin
+    if not ClipValid then Exit;
+    if (ClipW = SPR_W) and (ClipH = SPR_H) then
+    begin OX := 0; OY := 0; end
+    else
+    begin OX := CX; OY := CY; end;
+    for Row := 0 to ClipH - 1 do
+      for Col := 0 to ClipW - 1 do
+        if ClipSel[Row, Col] and (OY + Row <= SPR_H - 1) and (OX + Col <= SPR_W - 1) then
+          Grid[OY + Row, OX + Col] := Clip[Row, Col];
+  end;
+
+  // Per-sprite undo/redo. PushUndo is called before each grid-changing action.
+  procedure PushUndo;
+  var N: Integer;
+  begin
+    N := Length(Undo[SpriteNum]);
+    if N >= MAXUNDO then
+    begin
+      if N > 1 then
+        Move(Undo[SpriteNum][1], Undo[SpriteNum][0], (N - 1) * SizeOf(TGridSnap));
+      SetLength(Undo[SpriteNum], N - 1);
+      N := N - 1;
+    end;
+    SetLength(Undo[SpriteNum], N + 1);
+    Undo[SpriteNum][N] := Grid;
+    SetLength(Redo[SpriteNum], 0);   // a new edit invalidates the redo stack
+  end;
+
+  procedure DoUndo;
+  var N: Integer;
+  begin
+    N := Length(Undo[SpriteNum]);
+    if N = 0 then Exit;
+    SetLength(Redo[SpriteNum], Length(Redo[SpriteNum]) + 1);
+    Redo[SpriteNum][High(Redo[SpriteNum])] := Grid;
+    Grid := Undo[SpriteNum][N - 1];
+    SetLength(Undo[SpriteNum], N - 1);
+    ClearSelection;
+  end;
+
+  procedure DoRedo;
+  var N: Integer;
+  begin
+    N := Length(Redo[SpriteNum]);
+    if N = 0 then Exit;
+    SetLength(Undo[SpriteNum], Length(Undo[SpriteNum]) + 1);
+    Undo[SpriteNum][High(Undo[SpriteNum])] := Grid;
+    Grid := Redo[SpriteNum][N - 1];
+    SetLength(Redo[SpriteNum], N - 1);
+    ClearSelection;
+  end;
+
+  procedure ClearAllUndo;
+  var K: Integer;
+  begin
+    for K := 1 to 8 do
+    begin
+      SetLength(Undo[K], 0);
+      SetLength(Redo[K], 0);
+    end;
+  end;
+
+  procedure NormalizePairs;
+  var Row, Col: Integer;
+  begin
+    // After switching to multicolor make both halves of each pair equal.
+    for Row := 0 to SPR_H - 1 do
+      for Col := 0 to SPR_W - 1 do
+        if (Col and 1) = 1 then
+          Grid[Row, Col] := Grid[Row, Col - 1];
+  end;
+
+  // Load the editing state for the current SpriteNum (also used when switching
+  // sprites with the 1-8 keys). Resets the cursor and unpacks the shape.
+  procedure LoadSpriteState;
+  begin
+    Info := FSpriteEngine.GetSpriteInfo(SpriteNum);
+    Multicolor := Info.MulticolorMode;
+    ExpandX := Info.ScaleX >= 1.5;
+    ExpandY := Info.ScaleY >= 1.5;
+    if Info.Color.Mode = scmIndexed then SprColIdx := Info.Color.Index else SprColIdx := 1;
+    MC1Idx := 0; MC2Idx := 0;
+    if FSpriteEngine.GetMulticolor(RSPCOLOR_MC1).Mode = scmIndexed then
+      MC1Idx := FSpriteEngine.GetMulticolor(RSPCOLOR_MC1).Index;
+    if FSpriteEngine.GetMulticolor(RSPCOLOR_MC2).Mode = scmIndexed then
+      MC2Idx := FSpriteEngine.GetMulticolor(RSPCOLOR_MC2).Index;
+    if SprColIdx = 0 then SprColIdx := 1;        // a visible default
+    if MC1Idx = 0 then MC1Idx := 10;
+    if MC2Idx = 0 then MC2Idx := 12;
+    CX := 0; CY := 0;
+    UnpackFromSprite;
+    ClearSelection;   // a different sprite: drop any active selection
+    // Empty AND colourless sprite: start with a white pen. Do NOT override a
+    // colour the sprite already carries (that would whiten a green sprite, etc.).
+    if GridIsEmpty and (SprColIdx = 0) then SprColIdx := 1;
+  end;
+
+begin
+  Result := False;
+  if (SpriteNum < 1) or (SpriteNum > 8) then SpriteNum := 1;
+
+  LoadSpriteState;
+
+  Running := True;
+  ConfirmSwitch := False;
+  ClipValid := False;
+  ClipW := 0; ClipH := 0;
+  ClearSelection;
+  InputMode := 0;
+  InputText := '';
+  LastFile := '';
+  OverwritePending := False;
+  SDL_StartTextInput;   // so the filename field receives SDL_TEXTINPUT events
+  DrawEditor;
+  while Running do
+  begin
+    while SDL_PollEvent(@Event) <> 0 do
+    begin
+      case Event.type_ of
+        SDL_QUITEV:
+          begin
+            Result := True;   // window closed: tell the VM to stop
+            Running := False;
+          end;
+        SDL_TEXTINPUT:
+          // While typing a filename, accept printable characters (not during the
+          // overwrite Y/N prompt).
+          if (InputMode <> 0) and (not OverwritePending) and
+             (Ord(Event.text.text[0]) >= 32) and (Length(InputText) < 48) then
+            InputText := InputText + Char(Event.text.text[0]);
+        SDL_KEYDOWN:
+          begin
+            Sym := Event.key.keysym.sym;
+            Mods := Event.key.keysym.mod_;
+            IsShiftArrow := ((Mods and KMOD_SHIFT) <> 0) and
+              ((Sym = SDLK_LEFT) or (Sym = SDLK_RIGHT) or (Sym = SDLK_UP) or (Sym = SDLK_DOWN));
+            if InputMode <> 0 then
+            begin
+              if OverwritePending then
+              begin
+                // Confirm overwriting a different, existing file.
+                if Sym = SDLK_y then
+                begin
+                  PackToSprite;
+                  FSpriteEngine.SaveSpritesToJSON(InputText);
+                  LastFile := InputText;
+                  OverwritePending := False;
+                  InputMode := 0;
+                end
+                else if (Sym = SDLK_n) or (Sym = SDLK_ESCAPE) then
+                  OverwritePending := False;   // back to editing the name
+              end
+              // Filename entry: Enter executes, ESC cancels, Backspace deletes.
+              else if (Sym = SDLK_RETURN) or (Sym = SDLK_KP_ENTER) then
+              begin
+                if InputText = '' then
+                  InputMode := 0
+                else if InputMode = 1 then
+                begin
+                  // Ask before overwriting a DIFFERENT existing file; re-saving the
+                  // current working file just overwrites it silently.
+                  if (InputText <> LastFile) and FileExists(FSpriteEngine.ResolveSpriteFile(InputText)) then
+                    OverwritePending := True
+                  else
+                  begin
+                    PackToSprite;   // commit current edits so they are saved
+                    FSpriteEngine.SaveSpritesToJSON(InputText);
+                    LastFile := InputText;
+                    InputMode := 0;
+                  end;
+                end
+                else
+                begin
+                  FSpriteEngine.LoadSpritesFromJSON(InputText, True);  // editor: use file colours
+                  LoadSpriteState;   // reflect the loaded sprite in the editor
+                  ClearAllUndo;      // loaded data invalidates the undo history
+                  LastFile := InputText;
+                  InputMode := 0;
+                end;
+              end
+              else if Sym = SDLK_ESCAPE then
+                begin InputMode := 0; OverwritePending := False; end
+              else if Sym = SDLK_BACKSPACE then
+                if Length(InputText) > 0 then Delete(InputText, Length(InputText), 1);
+            end
+            else if ConfirmSwitch then
+            begin
+              // Awaiting Y/N: switching hi-res<->multicolor clears the sprite, so
+              // confirm first (the bit reinterpretation would otherwise garble it).
+              if Sym = SDLK_y then
+              begin
+                Multicolor := not Multicolor;
+                ClearGrid;
+                if Multicolor then CX := CX and (not 1);
+                ConfirmSwitch := False;
+              end
+              else if (Sym = SDLK_n) or (Sym = SDLK_ESCAPE) then
+                ConfirmSwitch := False;
+            end
+            else if IsShiftArrow then
+            begin
+              // SHIFT+arrows: rectangular selection. With CTRL also held, the new
+              // rectangle is ADDED to the current selection.
+              if not HasAnchor then StartDrag((Mods and KMOD_CTRL) <> 0);
+              if Sym = SDLK_LEFT then
+                begin if Multicolor then begin if CX >= 2 then CX := CX - 2; end else if CX > 0 then Dec(CX); end
+              else if Sym = SDLK_RIGHT then
+                begin if Multicolor then begin if CX <= SPR_W - 3 then CX := CX + 2; end else if CX < SPR_W - 1 then Inc(CX); end
+              else if Sym = SDLK_UP then begin if CY > 0 then Dec(CY); end
+              else if Sym = SDLK_DOWN then begin if CY < SPR_H - 1 then Inc(CY); end;
+              ApplyDragRect;
+            end
+            else if ((Mods and KMOD_CTRL) <> 0) and (Sym = SDLK_SPACE) then
+            begin
+              // CTRL+SPACE: toggle the pixel under the cursor in the selection.
+              Sel[CY, CX] := not Sel[CY, CX];
+              if Multicolor then Sel[CY, CX xor 1] := Sel[CY, CX];
+            end
+            else if ((Mods and KMOD_CTRL) <> 0) and (Sym = SDLK_c) then
+              CopyShape    // CTRL+C: copy selection (or whole shape if none)
+            else if ((Mods and KMOD_CTRL) <> 0) and (Sym = SDLK_v) then
+              begin PushUndo; PasteShape; end   // CTRL+V: paste the copied shape
+            else if ((Mods and KMOD_CTRL) <> 0) and (Sym = SDLK_z) then
+              DoUndo       // CTRL+Z: undo (per sprite)
+            else if ((Mods and KMOD_CTRL) <> 0) and (Sym = SDLK_y) then
+              DoRedo       // CTRL+Y: redo (per sprite)
+            else if ((Mods and KMOD_CTRL) <> 0) and (Sym = SDLK_s) then
+              begin InputMode := 1; InputText := LastFile; OverwritePending := False; end   // CTRL+S: save (proposes last name)
+            else if ((Mods and KMOD_CTRL) <> 0) and (Sym = SDLK_l) then
+              begin InputMode := 2; InputText := LastFile; OverwritePending := False; end   // CTRL+L: load (proposes last name)
+            else if Sym = SDLK_LEFT then
+              begin
+                if Multicolor then begin if CX >= 2 then CX := CX - 2; end
+                else if CX > 0 then Dec(CX);
+              end
+            else if Sym = SDLK_RIGHT then
+              begin
+                if Multicolor then begin if CX <= SPR_W - 3 then CX := CX + 2; end
+                else if CX < SPR_W - 1 then Inc(CX);
+              end
+            else if Sym = SDLK_UP then
+              begin if CY > 0 then Dec(CY); end
+            else if Sym = SDLK_DOWN then
+              begin if CY < SPR_H - 1 then Inc(CY); end
+            else if Sym = SDLK_SPACE then
+              begin
+                PushUndo;
+                // Hi-res: toggle on/off. Multicolor: cycle 0->1->2->3->0.
+                if Multicolor then
+                  SetCell((Grid[CY, CX] + 1) and 3)
+                else if Grid[CY, CX] <> 0 then SetCell(0)
+                else SetCell(1);
+              end
+            else if Sym = SDLK_0 then
+              begin PushUndo; SetCell(0); end   // erase the pixel under the cursor
+            else if (Sym >= SDLK_1) and (Sym <= SDLK_8) then
+              begin
+                // Select sprite 1-8: save the current one, then load the chosen one.
+                PackToSprite;
+                SpriteNum := Integer(Sym) - Integer(SDLK_1) + 1;
+                LoadSpriteState;
+              end
+            else if Sym = SDLK_m then
+              ConfirmSwitch := True   // ask before clearing & switching mode
+            else if Sym = SDLK_x then
+              ExpandX := not ExpandX
+            else if Sym = SDLK_y then
+              ExpandY := not ExpandY
+            else if Sym = SDLK_c then
+              CycleColor(1)
+            else if Sym = SDLK_LEFTBRACKET then
+              CycleColor(-1)
+            else if Sym = SDLK_RIGHTBRACKET then
+              CycleColor(1)
+            else if Sym = SDLK_DELETE then
+              begin PushUndo; ClearGrid; end
+            else if (Sym = SDLK_RETURN) or (Sym = SDLK_KP_ENTER) then
+              begin PackToSprite; Running := False; end
+            else if Sym = SDLK_ESCAPE then
+              Running := False;   // cancel without saving
+
+            // Any key that is not a SHIFT+arrow ends the rectangle drag, so the
+            // next SHIFT+arrow begins a fresh anchor.
+            if not IsShiftArrow then HasAnchor := False;
+          end;
+      end;
+    end;
+    if Running then
+    begin
+      DrawEditor;
+      SDL_Delay(16);
+    end;
+  end;
+
+  // Repaint the program's screen so the editor view is not left on screen.
+  FLastVMRenderTick := SDL_GetTicks;
   RenderScreen;
   UpdateCursor;
   FVideoController.Present;

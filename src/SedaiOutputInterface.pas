@@ -274,6 +274,12 @@ type
     // SPRSAV string$, sprite - Load sprite data from string
     procedure LoadSpriteFromString(const Data: string; Num: Integer);
 
+    // SPRSAVE / SPRLOAD "file" - save/load all sprites to/from a JSON file.
+    // LoadColors=False keeps the current sprite colours (program-controlled);
+    // True restores the colours saved in the file.
+    function SaveSpritesToJSON(const FileName: string): Boolean;
+    function LoadSpritesFromJSON(const FileName: string; LoadColors: Boolean): Boolean;
+
     // SPRSAV sprite1, sprite2 - Copy sprite data between sprites
     procedure CopySpriteToSprite(SrcNum, DstNum: Integer);
 

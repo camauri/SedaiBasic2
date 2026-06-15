@@ -670,7 +670,7 @@ const
 
 #### Groups 6-11: Domain-Specific
 - **File I/O**: `bcDopen`, `bcDclose`, `bcGetFile`, `bcInputFile`, `bcPrintFile`, `bcCmd`
-- **Sprites**: `bcSprite`, `bcMovspr*`, `bcSprcolor`, `bcSprsav`, `bcCollision`, `bcBump`, `bcRsp*`
+- **Sprites**: `bcSprite`, `bcMovspr*`, `bcSprcolor`, `bcSprsav`, `bcCollision`, `bcBump`, `bcRsp*`, `bcSpriteDef` (SPRDEF editor), `bcSprSaveFile`/`bcSprLoadFile` (SPRSAVE/SPRLOAD)
 - **Graphics**: `bcGraphic*`, `bcSetColor`, `bcGetColor`, `bcPLoad`, `bcPSave`, `bcScnClr`
 - **Sound**: `bcSoundVol`, `bcSoundSound`, `bcSoundEnvelope`, `bcSoundTempo`, `bcSoundPlay`, `bcSoundFilter`
 
@@ -1095,6 +1095,9 @@ SedaiBasic emulates key aspects of the Commodore 128 for compatibility:
 - **Fractional sprite scaling** (0.1x - 10.0x)
 - **RGBA colors** with alpha transparency
 - **JSON palette files** (PLOAD/PSAVE)
+- **Interactive sprite editor** (`SPRDEF`, sbv only) with hi-res/multicolor, expand,
+  per-sprite undo/redo, region copy/paste and area/pixel selection
+- **Sprite definition files** (`SPRSAVE`/`SPRLOAD`, `.spr` JSON; `SPRLOAD "f",1` restores file colours)
 
 ---
 

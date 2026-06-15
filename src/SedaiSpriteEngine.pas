@@ -17,7 +17,8 @@ unit SedaiSpriteEngine;
 interface
 
 uses
-  SysUtils, Math, SDL2, SedaiSpriteTypes, SedaiOutputInterface;
+  SysUtils, Classes, fpjson, jsonparser,
+  SDL2, Math, SedaiSpriteTypes, SedaiOutputInterface;
 
 type
   TPaletteResolverFunc = function(Index: Byte): TSDL_Color of object;
@@ -37,9 +38,12 @@ type
     FPaletteResolver: TPaletteResolverFunc;
     FViewportX, FViewportY: Integer;
     FViewportW, FViewportH: Integer;
+    FNativeW, FNativeH: Integer;   // graphic mode native resolution for coord mapping
+    FBaseDir: string;              // folder of the running program (for sprite files)
 
     procedure EnsureSpriteTexture(Num: Integer);
     function ResolveSpriteColor(const Color: TSpriteColor): TSDL_Color;
+    function PackSpriteColor(const Color: TSpriteColor): UInt32;
   public
     constructor Create(ARenderer: PSDL_Renderer; APaletteResolver: TPaletteResolverFunc);
     destructor Destroy; override;
@@ -49,6 +53,8 @@ type
     // Viewport rect — sprite (0,0) maps to top-left of viewport, clipped to bounds
     procedure SetViewportOffset(X, Y: Integer); overload;
     procedure SetViewportOffset(X, Y, W, H: Integer); overload;
+    // Native resolution of the current graphic mode (for sprite coord/size mapping)
+    procedure SetNativeResolution(W, H: Integer);
 
     // ISpriteManager implementation
     procedure SetSprite(Num: Integer; Enabled: Integer; const Color: TSpriteColor;
@@ -59,6 +65,13 @@ type
     procedure MoveSpritePolar(Num: Integer; Distance: Double; Angle: Double);
     procedure MoveSpriteAuto(Num: Integer; Angle: Double; Speed: Double);
     procedure SetSpriteMulticolors(const MC1, MC2: TSpriteColor);
+    // Save / load all sprites (1-8) + global multicolors to/from a JSON file
+    function SaveSpritesToJSON(const FileName: string): Boolean;
+    function LoadSpritesFromJSON(const FileName: string; LoadColors: Boolean): Boolean;
+    // Base folder for sprite files (the running program's folder) + resolver:
+    // adds the .spr extension and, if no directory is given, the base folder.
+    procedure SetBaseDir(const Dir: string);
+    function ResolveSpriteFile(const FileName: string): string;
     procedure SaveSpriteToString(Num: Integer; out Data: string);
     procedure LoadSpriteFromString(const Data: string; Num: Integer);
     procedure CopySpriteToSprite(SrcNum, DstNum: Integer);
@@ -101,6 +114,8 @@ begin
   FDisplayCollisionMask := 0;
   FViewportX := 0;
   FViewportY := 0;
+  FNativeW := 0;   // 0 = no scaling until the console reports the mode resolution
+  FNativeH := 0;
 
   for I := 1 to MAX_SPRITES do
   begin
@@ -132,10 +147,21 @@ begin
   inherited Destroy;
 end;
 
+// Pack a TSpriteColor into an ABGR8888 texel ($AABBGGRR in memory, little-endian).
+function TC128SpriteEngine.PackSpriteColor(const Color: TSpriteColor): UInt32;
+var
+  SC: TSDL_Color;
+begin
+  SC := ResolveSpriteColor(Color);
+  Result := UInt32(SC.r) or (UInt32(SC.g) shl 8) or
+            (UInt32(SC.b) shl 16) or (UInt32(SC.a) shl 24);
+end;
+
 procedure TC128SpriteEngine.EnsureSpriteTexture(Num: Integer);
 var
-  W, H, I: Integer;
+  W, H, I, Row, Col, Stride, ByteIdx, BitPos, PairVal: Integer;
   Pixels: array of UInt32;
+  ColMC1, ColSpr, ColMC2: UInt32;
 begin
   if not FSpriteTextureDirty[Num] then Exit;
 
@@ -155,10 +181,55 @@ begin
 
   SDL_SetTextureBlendMode(FSpriteTextures[Num], SDL_BLENDMODE_BLEND);
 
-  // Fill with white pixels — color modulation applies the actual color
   SetLength(Pixels, W * H);
-  for I := 0 to W * H - 1 do
-    Pixels[I] := $FFFFFFFF;
+  Stride := (W + 7) div 8;   // bytes per row (3 for the standard 24-wide sprite)
+
+  if Length(FSprites[Num].Data) < Stride * H then
+  begin
+    // No (or truncated) shape data: keep the legacy solid-rectangle look so a sprite
+    // enabled without a defined shape is still visible. Color via modulation.
+    for I := 0 to W * H - 1 do
+      Pixels[I] := $FFFFFFFF;
+  end
+  else if FSprites[Num].MulticolorMode then
+  begin
+    // Multicolor: horizontal pixels pair up (2 texels per logical pixel). Each bit
+    // pair selects: 00=transparent, 01=multicolor1, 10=sprite color, 11=multicolor2.
+    // Colors are baked here; RenderSprites disables modulation for multicolor sprites.
+    ColMC1 := PackSpriteColor(FMulticolors.Multicolor1);
+    ColSpr := PackSpriteColor(FSprites[Num].Color);
+    ColMC2 := PackSpriteColor(FMulticolors.Multicolor2);
+    for Row := 0 to H - 1 do
+      for Col := 0 to W - 1 do
+      begin
+        ByteIdx := Row * Stride + (Col div 8);
+        BitPos := 6 - ((Col div 2) mod 4) * 2;   // pair position within the byte
+        PairVal := (FSprites[Num].Data[ByteIdx] shr BitPos) and 3;
+        case PairVal of
+          1: Pixels[Row * W + Col] := ColMC1;
+          2: Pixels[Row * W + Col] := ColSpr;
+          3: Pixels[Row * W + Col] := ColMC2;
+        else
+          Pixels[Row * W + Col] := 0;            // 0 = transparent
+        end;
+      end;
+  end
+  else
+  begin
+    // Hi-res: 1 bit per pixel, MSB = leftmost. Set bit = opaque (color via
+    // modulation in RenderSprites), clear bit = transparent.
+    for Row := 0 to H - 1 do
+      for Col := 0 to W - 1 do
+      begin
+        ByteIdx := Row * Stride + (Col div 8);
+        BitPos := 7 - (Col mod 8);
+        if ((FSprites[Num].Data[ByteIdx] shr BitPos) and 1) = 1 then
+          Pixels[Row * W + Col] := $FFFFFFFF
+        else
+          Pixels[Row * W + Col] := 0;
+      end;
+  end;
+
   SDL_UpdateTexture(FSpriteTextures[Num], nil, @Pixels[0], W * SizeOf(UInt32));
 
   FSpriteTextureDirty[Num] := False;
@@ -209,6 +280,10 @@ begin
 
   if MulticolorMode >= 0 then
     FSprites[Num].MulticolorMode := MulticolorMode <> 0;
+
+  // Color / multicolor-mode affect the baked texture (hi-res tint is by modulation,
+  // but a multicolor sprite bakes its colors into the texels). Rebuild to be safe.
+  FSpriteTextureDirty[Num] := True;
 end;
 
 procedure TC128SpriteEngine.MoveSpriteAbs(Num: Integer; X, Y: Double);
@@ -241,12 +316,19 @@ begin
 end;
 
 procedure TC128SpriteEngine.SetSpriteMulticolors(const MC1, MC2: TSpriteColor);
+var
+  I: Integer;
 begin
   // Index 255 means "keep current value"
   if not ((MC1.Mode = scmIndexed) and (MC1.Index = 255)) then
     FMulticolors.Multicolor1 := MC1;
   if not ((MC2.Mode = scmIndexed) and (MC2.Index = 255)) then
     FMulticolors.Multicolor2 := MC2;
+
+  // The shared multicolors are baked into every multicolor sprite's texture.
+  for I := 1 to MAX_SPRITES do
+    if FSprites[I].MulticolorMode then
+      FSpriteTextureDirty[I] := True;
 end;
 
 procedure TC128SpriteEngine.SaveSpriteToString(Num: Integer; out Data: string);
@@ -467,6 +549,12 @@ begin
   FViewportH := H;
 end;
 
+procedure TC128SpriteEngine.SetNativeResolution(W, H: Integer);
+begin
+  FNativeW := W;
+  FNativeH := H;
+end;
+
 procedure TC128SpriteEngine.RenderSprites;
 var
   I: Integer;
@@ -474,6 +562,7 @@ var
   DestRect: TSDL_Rect;
   ClipRect, OldClip: TSDL_Rect;
   HadClip: Boolean;
+  ScaleFx, ScaleFy: Double;
 begin
   if FRenderer = nil then Exit;
 
@@ -491,22 +580,42 @@ begin
     SDL_RenderSetClipRect(FRenderer, @ClipRect);
   end;
 
-  for I := 1 to MAX_SPRITES do
+  // Sprite coordinates and sizes are expressed in the graphic mode's NATIVE
+  // resolution; map them to the (scaled) viewport so a sprite at x=0..NativeW-1
+  // spans the whole display instead of only the top-left window pixels.
+  ScaleFx := 1.0;
+  ScaleFy := 1.0;
+  if (FNativeW > 0) and (FViewportW > 0) then ScaleFx := FViewportW / FNativeW;
+  if (FNativeH > 0) and (FViewportH > 0) then ScaleFy := FViewportH / FNativeH;
+
+  // Render highest number first so lower-numbered sprites end up on top, matching
+  // the C128/VIC-II sprite-to-sprite priority (sprite 1 is in front of sprite 2...).
+  for I := MAX_SPRITES downto 1 do
   begin
     if not FSprites[I].Enabled then Continue;
 
     EnsureSpriteTexture(I);
     if FSpriteTextures[I] = nil then Continue;
 
-    SDLColor := ResolveSpriteColor(FSprites[I].Color);
-    SDL_SetTextureColorMod(FSpriteTextures[I], SDLColor.r, SDLColor.g, SDLColor.b);
-    SDL_SetTextureAlphaMod(FSpriteTextures[I], SDLColor.a);
+    if FSprites[I].MulticolorMode then
+    begin
+      // Multicolor textures hold real per-pixel colors already; don't tint them.
+      SDL_SetTextureColorMod(FSpriteTextures[I], 255, 255, 255);
+      SDL_SetTextureAlphaMod(FSpriteTextures[I], 255);
+    end
+    else
+    begin
+      SDLColor := ResolveSpriteColor(FSprites[I].Color);
+      SDL_SetTextureColorMod(FSpriteTextures[I], SDLColor.r, SDLColor.g, SDLColor.b);
+      SDL_SetTextureAlphaMod(FSpriteTextures[I], SDLColor.a);
+    end;
 
-    // Offset by viewport position so sprite (0,0) = top-left of display area
-    DestRect.x := FViewportX + Round(FSprites[I].X);
-    DestRect.y := FViewportY + Round(FSprites[I].Y);
-    DestRect.w := Round(FSprites[I].Width * FSprites[I].ScaleX);
-    DestRect.h := Round(FSprites[I].Height * FSprites[I].ScaleY);
+    // Offset by viewport position so sprite (0,0) = top-left of display area,
+    // scaling native sprite coords/size into viewport pixels.
+    DestRect.x := FViewportX + Round(FSprites[I].X * ScaleFx);
+    DestRect.y := FViewportY + Round(FSprites[I].Y * ScaleFy);
+    DestRect.w := Round(FSprites[I].Width * FSprites[I].ScaleX * ScaleFx);
+    DestRect.h := Round(FSprites[I].Height * FSprites[I].ScaleY * ScaleFy);
 
     SDL_RenderCopy(FRenderer, FSpriteTextures[I], nil, @DestRect);
   end;
@@ -571,6 +680,144 @@ begin
     InitSpriteInfo(Result)
   else
     Result := FSprites[Num];
+end;
+
+procedure TC128SpriteEngine.SetBaseDir(const Dir: string);
+begin
+  if Dir = '' then FBaseDir := '' else FBaseDir := IncludeTrailingPathDelimiter(Dir);
+end;
+
+function TC128SpriteEngine.ResolveSpriteFile(const FileName: string): string;
+begin
+  Result := FileName;
+  if LowerCase(ExtractFileExt(Result)) <> '.spr' then Result := Result + '.spr';
+  // No directory component: place it next to the running program.
+  if (ExtractFilePath(Result) = '') and (FBaseDir <> '') then
+    Result := FBaseDir + Result;
+end;
+
+function TC128SpriteEngine.SaveSpritesToJSON(const FileName: string): Boolean;
+var
+  Root, SprObj: TJSONObject;
+  Arr, DataArr: TJSONArray;
+  I, J: Integer;
+  SL: TStringList;
+  Fn: string;
+begin
+  Result := False;
+  Fn := ResolveSpriteFile(FileName);   // adds .spr + program folder if needed
+  Root := TJSONObject.Create;
+  try
+    Root.Add('version', 1);
+    Root.Add('multicolor1', Integer(SpriteColorToInt(FMulticolors.Multicolor1)));
+    Root.Add('multicolor2', Integer(SpriteColorToInt(FMulticolors.Multicolor2)));
+    Arr := TJSONArray.Create;
+    // Save the 8 BASIC-accessible sprites with their full state.
+    for I := 1 to 8 do
+    begin
+      SprObj := TJSONObject.Create;
+      SprObj.Add('num', I);
+      SprObj.Add('enabled', Ord(FSprites[I].Enabled));
+      SprObj.Add('color', Integer(SpriteColorToInt(FSprites[I].Color)));
+      SprObj.Add('priority', FSprites[I].Priority);
+      // Expand factor is an integer (1 or 2); store it as such (no float noise).
+      SprObj.Add('scalex', Round(FSprites[I].ScaleX));
+      SprObj.Add('scaley', Round(FSprites[I].ScaleY));
+      SprObj.Add('multicolor', Ord(FSprites[I].MulticolorMode));
+      DataArr := TJSONArray.Create;
+      for J := 0 to Length(FSprites[I].Data) - 1 do
+        DataArr.Add(Integer(FSprites[I].Data[J]));
+      SprObj.Add('data', DataArr);
+      Arr.Add(SprObj);
+    end;
+    Root.Add('sprites', Arr);
+
+    SL := TStringList.Create;
+    try
+      SL.Text := Root.FormatJSON;
+      try
+        SL.SaveToFile(Fn);
+        Result := True;
+      except
+        Result := False;
+      end;
+    finally
+      SL.Free;
+    end;
+  finally
+    Root.Free;
+  end;
+end;
+
+function TC128SpriteEngine.LoadSpritesFromJSON(const FileName: string; LoadColors: Boolean): Boolean;
+var
+  JData: TJSONData;
+  Root, SprObj: TJSONObject;
+  Arr, DataArr: TJSONArray;
+  SL: TStringList;
+  I, J, Num: Integer;
+  B: TBytes;
+  Fn: string;
+begin
+  Result := False;
+  Fn := ResolveSpriteFile(FileName);   // adds .spr + program folder if needed
+  if not FileExists(Fn) then Exit;
+
+  SL := TStringList.Create;
+  JData := nil;
+  try
+    try
+      SL.LoadFromFile(Fn);
+      JData := GetJSON(SL.Text);
+    except
+      JData := nil;
+    end;
+  finally
+    SL.Free;
+  end;
+  if (JData = nil) then Exit;
+
+  try
+    if JData.JSONType <> jtObject then Exit;
+    Root := TJSONObject(JData);
+
+    if LoadColors then
+    begin
+      FMulticolors.Multicolor1 := MakeIndexedColor(Byte(Root.Get('multicolor1', 0)));
+      FMulticolors.Multicolor2 := MakeIndexedColor(Byte(Root.Get('multicolor2', 0)));
+    end;
+
+    Arr := Root.Get('sprites', TJSONArray(nil));
+    if Arr <> nil then
+      for I := 0 to Arr.Count - 1 do
+      begin
+        if Arr.Items[I].JSONType <> jtObject then Continue;
+        SprObj := TJSONObject(Arr.Items[I]);
+        Num := SprObj.Get('num', 0);
+        if (Num < 1) or (Num > MAX_SPRITES) then Continue;
+
+        FSprites[Num].Enabled := SprObj.Get('enabled', 0) <> 0;
+        if LoadColors then
+          FSprites[Num].Color := MakeIndexedColor(Byte(SprObj.Get('color', 1)));
+        FSprites[Num].Priority := SprObj.Get('priority', 0);
+        FSprites[Num].ScaleX := SprObj.Get('scalex', 1);   // integer expand factor
+        FSprites[Num].ScaleY := SprObj.Get('scaley', 1);
+        FSprites[Num].MulticolorMode := SprObj.Get('multicolor', 0) <> 0;
+
+        DataArr := SprObj.Get('data', TJSONArray(nil));
+        if DataArr <> nil then
+        begin
+          SetLength(B, DataArr.Count);
+          for J := 0 to DataArr.Count - 1 do
+            B[J] := Byte(DataArr.Integers[J]);
+          FSprites[Num].Data := B;
+        end;
+        FSpriteTextureDirty[Num] := True;
+      end;
+    Result := True;
+  finally
+    JData.Free;
+  end;
 end;
 
 end.
