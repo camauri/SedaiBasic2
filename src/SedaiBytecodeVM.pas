@@ -1567,6 +1567,21 @@ begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;         // flag
         end;
 
+        // bcSprSize: Src1=n, Src2=w, Dest=h (all float regs)
+        bcSprSize:
+        begin
+          if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;     // sprite number
+          if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;     // width
+          if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;     // height
+        end;
+
+        // bcSprForm: Src1=n, Src2=format (float regs)
+        bcSprForm:
+        begin
+          if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;     // sprite number
+          if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;     // format
+        end;
+
         // bcKey: Src1=key number (int), Src2=key text (string, optional)
         bcKey:
         begin
@@ -4000,7 +4015,7 @@ end;
 procedure TBytecodeVM.ExecuteSpriteOp(const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
-  SpriteNum, Enabled, Priority, Mode: Integer;
+  SpriteNum, Enabled, Priority, Mode, SprW, SprH: Integer;
   X, Y, ScaleX, ScaleY, Angle, Speed: Double;
   Color: Integer;
   SprColor, MC1Color, MC2Color: TSpriteColor;
@@ -4176,6 +4191,26 @@ begin
       if Assigned(FSpriteManager) then
         // Src2 = "use file colours" flag (int reg, 0 by default).
         FSpriteManager.LoadSpritesFromJSON(FStringRegs[Instr.Src1], FIntRegs[Instr.Src2] <> 0);
+
+    15: // bcSprSize - SPRSIZE n, w, h (Src1=n, Src2=w, Dest=h; float regs)
+      begin
+        SpriteNum := Round(FFloatRegs[Instr.Src1]);
+        if (SpriteNum >= 1) and (SpriteNum <= 256) and Assigned(FSpriteManager) then
+        begin
+          SprW := Round(FFloatRegs[Instr.Src2]);
+          SprH := Round(FFloatRegs[Instr.Dest]);
+          if SprW < 1 then SprW := 1 else if SprW > 256 then SprW := 256;
+          if SprH < 1 then SprH := 1 else if SprH > 256 then SprH := 256;
+          FSpriteManager.SetSpriteSize(SpriteNum, SprW, SprH);
+        end;
+      end;
+
+    16: // bcSprForm - SPRFORM n, format (Src1=n, Src2=format; float regs)
+      begin
+        SpriteNum := Round(FFloatRegs[Instr.Src1]);
+        if (SpriteNum >= 1) and (SpriteNum <= 256) and Assigned(FSpriteManager) then
+          FSpriteManager.SetSpriteFormat(SpriteNum, Round(FFloatRegs[Instr.Src2]));
+      end;
 
   else
     raise Exception.CreateFmt('Unknown sprite opcode %d at PC=%d', [Instr.OpCode, FPC]);

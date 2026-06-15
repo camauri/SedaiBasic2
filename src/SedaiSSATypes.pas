@@ -220,6 +220,8 @@ type
     ssaSpriteDef,      // SPRDEF [n]: Enter the interactive sprite editor (sbv only)
     ssaSprsave,        // SPRSAVE "file": save all sprites to a JSON file
     ssaSprload,        // SPRLOAD "file": load all sprites from a JSON file
+    ssaSprsize,        // SPRSIZE n, w, h: set sprite dimensions
+    ssaSprform,        // SPRFORM n, format: set sprite data format
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 

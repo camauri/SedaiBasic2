@@ -314,6 +314,7 @@ type
 
     // Set sprite dimensions (default is 24x21 for C128 compatibility)
     procedure SetSpriteSize(Num: Integer; Width, Height: Integer);
+    procedure SetSpriteFormat(Num: Integer; Format: Integer);
 
     // Get sprite dimensions
     function GetSpriteWidth(Num: Integer): Integer;

@@ -322,6 +322,8 @@ begin
     ssaSpriteDef: Result := bcSpriteDef;
     ssaSprsave: Result := bcSprSaveFile;
     ssaSprload: Result := bcSprLoadFile;
+    ssaSprsize: Result := bcSprSize;
+    ssaSprform: Result := bcSprForm;
     // Sprite functions
     ssaBump: Result := bcBump;
     ssaRspcolor: Result := bcRspcolor;

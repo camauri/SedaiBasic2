@@ -159,6 +159,8 @@ type
     procedure ProcessSprdef(Node: TASTNode);
     procedure ProcessSprsave(Node: TASTNode);
     procedure ProcessSprload(Node: TASTNode);
+    procedure ProcessSprsize(Node: TASTNode);
+    procedure ProcessSprform(Node: TASTNode);
     // System commands
     procedure ProcessRun(Node: TASTNode);
     procedure ProcessList(Node: TASTNode);
@@ -7220,6 +7222,53 @@ begin
                  FileNameReg, FlagReg, MakeSSAValue(svkNone));
 end;
 
+procedure TSSAGenerator.ProcessSprsize(Node: TASTNode);
+var
+  V, R: array[0..2] of TSSAValue;
+  I: Integer;
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 3 then Exit;  { SPRSIZE n, width, height }
+  for I := 0 to 2 do
+  begin
+    ProcessExpression(Node.GetChild(I), V[I]);
+    if V[I].Kind in [svkConstFloat, svkConstInt] then
+    begin
+      R[I] := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+      EmitInstruction(ssaLoadConstFloat, R[I], V[I], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+      R[I] := V[I];
+  end;
+  // Dest=height, Src1=sprite number, Src2=width (the three regs the generic emitter maps).
+  EmitInstruction(ssaSprsize, R[2], R[0], R[1], MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessSprform(Node: TASTNode);
+var
+  NumVal, NumReg, FmtVal, FmtReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 2 then Exit;  { SPRFORM n, format }
+  ProcessExpression(Node.GetChild(0), NumVal);
+  if NumVal.Kind in [svkConstFloat, svkConstInt] then
+  begin
+    NumReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaLoadConstFloat, NumReg, NumVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+    NumReg := NumVal;
+  ProcessExpression(Node.GetChild(1), FmtVal);
+  if FmtVal.Kind in [svkConstFloat, svkConstInt] then
+  begin
+    FmtReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaLoadConstFloat, FmtReg, FmtVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+    FmtReg := FmtVal;
+  EmitInstruction(ssaSprform, MakeSSAValue(svkNone), NumReg, FmtReg, MakeSSAValue(svkNone));
+end;
+
 procedure TSSAGenerator.ProcessRun(Node: TASTNode);
 var
   LineNumVal: TSSAValue;
@@ -8078,6 +8127,8 @@ begin
     antSprdef: ProcessSprdef(Node);
     antSprsave: ProcessSprsave(Node);
     antSprload: ProcessSprload(Node);
+    antSprsize: ProcessSprsize(Node);
+    antSprform: ProcessSprform(Node);
     // System commands
     antRun: ProcessRun(Node);
     antList: ProcessList(Node);

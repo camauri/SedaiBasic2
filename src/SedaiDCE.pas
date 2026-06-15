@@ -321,7 +321,8 @@ begin
 
     // Sprite operations - always live (modify sprite state)
     ssaSprite, ssaMovsprAbs, ssaMovsprRel, ssaMovsprPolar, ssaMovsprAuto,
-    ssaSprcolor, ssaSprsav, ssaCollision, ssaSpriteDef, ssaSprsave, ssaSprload:
+    ssaSprcolor, ssaSprsav, ssaCollision, ssaSpriteDef, ssaSprsave, ssaSprload,
+    ssaSprsize, ssaSprform:
       Result := True;
 
     // Sound operations - always live (audible side effects)

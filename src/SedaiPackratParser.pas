@@ -2007,6 +2007,10 @@ begin
     Result := TASTNode.Create(antSprsave, Token)  // SPRSAVE "file"
   else if CmdName = kSPRLOAD then
     Result := TASTNode.Create(antSprload, Token)  // SPRLOAD "file"
+  else if CmdName = kSPRSIZE then
+    Result := TASTNode.Create(antSprsize, Token)  // SPRSIZE n, w, h
+  else if CmdName = kSPRFORM then
+    Result := TASTNode.Create(antSprform, Token)  // SPRFORM n, format
   else
     Result := TASTNode.Create(antStatement, Token);
 
@@ -2035,6 +2039,10 @@ begin
     MaxParams := 1   // SPRSAVE "filename"
   else if CmdName = kSPRLOAD then
     MaxParams := 2   // SPRLOAD "filename" [, usefilecolors]
+  else if CmdName = kSPRSIZE then
+    MaxParams := 3   // SPRSIZE n, width, height
+  else if CmdName = kSPRFORM then
+    MaxParams := 2   // SPRFORM n, format
   else
     MaxParams := 10;
 

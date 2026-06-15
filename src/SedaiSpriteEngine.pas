@@ -81,6 +81,7 @@ type
     function GetSpritePosition(Num, Attr: Integer): Double;
     function GetSpriteAttribute(Num, Attr: Integer): Integer;
     procedure SetSpriteSize(Num: Integer; Width, Height: Integer);
+    procedure SetSpriteFormat(Num: Integer; Format: Integer);
     function GetSpriteWidth(Num: Integer): Integer;
     function GetSpriteHeight(Num: Integer): Integer;
     procedure SetSpriteData(Num: Integer; const Data: TBytes);
@@ -159,9 +160,10 @@ end;
 
 procedure TC128SpriteEngine.EnsureSpriteTexture(Num: Integer);
 var
-  W, H, I, Row, Col, Stride, ByteIdx, BitPos, PairVal: Integer;
+  W, H, I, Row, Col, Stride, ByteIdx, BitPos, PairVal, Fmt, NeededLen: Integer;
   Pixels: array of UInt32;
   ColMC1, ColSpr, ColMC2: UInt32;
+  ColorLUT: array[0..255] of UInt32;
 begin
   if not FSpriteTextureDirty[Num] then Exit;
 
@@ -182,16 +184,33 @@ begin
   SDL_SetTextureBlendMode(FSpriteTextures[Num], SDL_BLENDMODE_BLEND);
 
   SetLength(Pixels, W * H);
-  Stride := (W + 7) div 8;   // bytes per row (3 for the standard 24-wide sprite)
+  Stride := (W + 7) div 8;   // bytes per row for 1bpp
 
-  if Length(FSprites[Num].Data) < Stride * H then
+  // Effective format: explicit Format, or legacy MulticolorMode if Format still 0.
+  Fmt := FSprites[Num].Format;
+  if (Fmt = SPRFMT_HIRES) and FSprites[Num].MulticolorMode then Fmt := SPRFMT_MULTICOLOR;
+
+  if Fmt = SPRFMT_FULLCOLOR then NeededLen := W * H else NeededLen := Stride * H;
+
+  if Length(FSprites[Num].Data) < NeededLen then
   begin
     // No (or truncated) shape data: keep the legacy solid-rectangle look so a sprite
     // enabled without a defined shape is still visible. Color via modulation.
     for I := 0 to W * H - 1 do
       Pixels[I] := $FFFFFFFF;
   end
-  else if FSprites[Num].MulticolorMode then
+  else if Fmt = SPRFMT_FULLCOLOR then
+  begin
+    // Full-color: 1 byte/pixel = palette index (0 = transparent). Colours baked via
+    // a 256-entry LUT so the whole sprite needs only 256 palette lookups.
+    ColorLUT[0] := 0;
+    for I := 1 to 255 do
+      ColorLUT[I] := PackSpriteColor(MakeIndexedColor(Byte(I)));
+    for Row := 0 to H - 1 do
+      for Col := 0 to W - 1 do
+        Pixels[Row * W + Col] := ColorLUT[FSprites[Num].Data[Row * W + Col]];
+  end
+  else if Fmt = SPRFMT_MULTICOLOR then
   begin
     // Multicolor: horizontal pixels pair up (2 texels per logical pixel). Each bit
     // pair selects: 00=transparent, 01=multicolor1, 10=sprite color, 11=multicolor2.
@@ -437,9 +456,22 @@ begin
     RSPRITE_EXPAND_X: Result := Round(FSprites[Num].ScaleX);
     RSPRITE_EXPAND_Y: Result := Round(FSprites[Num].ScaleY);
     RSPRITE_MULTICOLOR: Result := Ord(FSprites[Num].MulticolorMode);
+    RSPRITE_FORMAT: Result := FSprites[Num].Format;
+    RSPRITE_WIDTH: Result := FSprites[Num].Width;
+    RSPRITE_HEIGHT: Result := FSprites[Num].Height;
   else
     Result := 0;
   end;
+end;
+
+procedure TC128SpriteEngine.SetSpriteFormat(Num: Integer; Format: Integer);
+begin
+  if (Num < 1) or (Num > MAX_SPRITES) then Exit;
+  if (Format < SPRFMT_HIRES) or (Format > SPRFMT_FULLCOLOR) then Exit;
+  FSprites[Num].Format := Format;
+  // Keep the legacy MulticolorMode flag in sync for formats 0/1.
+  FSprites[Num].MulticolorMode := (Format = SPRFMT_MULTICOLOR);
+  FSpriteTextureDirty[Num] := True;
 end;
 
 procedure TC128SpriteEngine.SetSpriteSize(Num: Integer; Width, Height: Integer);
@@ -597,9 +629,11 @@ begin
     EnsureSpriteTexture(I);
     if FSpriteTextures[I] = nil then Continue;
 
-    if FSprites[I].MulticolorMode then
+    if FSprites[I].MulticolorMode or (FSprites[I].Format = SPRFMT_MULTICOLOR)
+       or (FSprites[I].Format = SPRFMT_FULLCOLOR) then
     begin
-      // Multicolor textures hold real per-pixel colors already; don't tint them.
+      // Multicolor / full-color textures hold real per-pixel colours already; the
+      // baked texels must not be tinted, so modulate with white.
       SDL_SetTextureColorMod(FSpriteTextures[I], 255, 255, 255);
       SDL_SetTextureAlphaMod(FSpriteTextures[I], 255);
     end
@@ -724,6 +758,9 @@ begin
       SprObj.Add('scalex', Round(FSprites[I].ScaleX));
       SprObj.Add('scaley', Round(FSprites[I].ScaleY));
       SprObj.Add('multicolor', Ord(FSprites[I].MulticolorMode));
+      SprObj.Add('format', FSprites[I].Format);
+      SprObj.Add('width', FSprites[I].Width);
+      SprObj.Add('height', FSprites[I].Height);
       DataArr := TJSONArray.Create;
       for J := 0 to Length(FSprites[I].Data) - 1 do
         DataArr.Add(Integer(FSprites[I].Data[J]));
@@ -803,6 +840,10 @@ begin
         FSprites[Num].ScaleX := SprObj.Get('scalex', 1);   // integer expand factor
         FSprites[Num].ScaleY := SprObj.Get('scaley', 1);
         FSprites[Num].MulticolorMode := SprObj.Get('multicolor', 0) <> 0;
+        // New fields (retro-compat: old files default to hi-res 24x21).
+        FSprites[Num].Format := SprObj.Get('format', 0);
+        FSprites[Num].Width := SprObj.Get('width', DEFAULT_SPRITE_WIDTH);
+        FSprites[Num].Height := SprObj.Get('height', DEFAULT_SPRITE_HEIGHT);
 
         DataArr := SprObj.Get('data', TJSONArray(nil));
         if DataArr <> nil then

@@ -427,7 +427,9 @@ begin
     // === GROUP 11: Sound ===
     bcSoundFilter,  // Src1 = cutoff frequency (float)
     // === GROUP 7: Sprite ===
-    bcSpriteDef:    // SPRDEF [n]: Src1 = sprite number (float)
+    bcSpriteDef,    // SPRDEF [n]: Src1 = sprite number (float)
+    bcSprSize,      // SPRSIZE: Src1 = sprite number (float)
+    bcSprForm:      // SPRFORM: Src1 = sprite number (float)
       Result := True;
   else
     Result := False;
@@ -509,7 +511,10 @@ begin
     // LOGN(base, x): Src2 is 'x' (the value)
     bcMathLogN,
     // === GROUP 4: I/O operations ===
-    bcPrintUsing:  // PRINT USING - Src2 = value (float)
+    bcPrintUsing,  // PRINT USING - Src2 = value (float)
+    // === GROUP 7: Sprite ===
+    bcSprSize,     // SPRSIZE: Src2 = width (float)
+    bcSprForm:     // SPRFORM: Src2 = format (float)
       Result := True;
   else
     Result := False;
@@ -608,7 +613,9 @@ begin
     // === GROUP 3: Array operations ===
     bcArrayStoreFloat,   // Dest = value register (float) - READ, not written
     // === GROUP 6: File I/O operations ===
-    bcPrintFileFloat:    // Dest = value register (float) - READ, not written
+    bcPrintFileFloat,    // Dest = value register (float) - READ, not written
+    // === GROUP 7: Sprite ===
+    bcSprSize:           // SPRSIZE: Dest = height (float) - READ, not written
       Result := True;
   else
     Result := False;

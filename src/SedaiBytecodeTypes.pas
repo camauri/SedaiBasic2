@@ -336,6 +336,8 @@ const
   bcSpriteDef       = bcGroupSprite + 12;   // SPRDEF [n]: Enter interactive sprite editor (sbv)
   bcSprSaveFile     = bcGroupSprite + 13;   // SPRSAVE "file": save all sprites to JSON
   bcSprLoadFile     = bcGroupSprite + 14;   // SPRLOAD "file": load all sprites from JSON
+  bcSprSize         = bcGroupSprite + 15;   // SPRSIZE n, w, h: set sprite dimensions
+  bcSprForm         = bcGroupSprite + 16;   // SPRFORM n, format: set sprite data format
 
   // === GROUP 10: GRAPHICS (0x0Axx) ===
   bcGraphicRGBA     = bcGroupGraphics + 0;
@@ -1226,6 +1228,8 @@ begin
         12: Result := 'SpriteDef';
         13: Result := 'SprSaveFile';
         14: Result := 'SprLoadFile';
+        15: Result := 'SprSize';
+        16: Result := 'SprForm';
       else
         Result := Format('Sprite_%d', [SubOp]);
       end;

@@ -204,7 +204,9 @@ type
     // ordinals (keeps incremental builds consistent across units).
     antSprdef,            // SPRDEF command (interactive sprite editor)
     antSprsave,           // SPRSAVE command (save all sprites to JSON file)
-    antSprload            // SPRLOAD command (load all sprites from JSON file)
+    antSprload,           // SPRLOAD command (load all sprites from JSON file)
+    antSprsize,           // SPRSIZE command (set sprite dimensions)
+    antSprform            // SPRFORM command (set sprite data format)
   );
 
   // === PRECEDENCE LEVELS FOR PRATT PARSER ===
@@ -374,7 +376,7 @@ begin
     antSave, antLoad, antVerify, antBload, antBsave, antBoot, antCatalog, antBlock,
     // Sprite commands
     antSprite, antMovspr, antSprcolor, antSprsav, antCollision, antSprdef,
-    antSprsave, antSprload
+    antSprsave, antSprload, antSprsize, antSprform
   ];
 end;
 

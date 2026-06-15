@@ -40,7 +40,8 @@ uses
   SedaiBytecodeDisassembler,
   SedaiSSATypes, SedaiSSA,
   SedaiBasicKeywords, SedaiDebugger,
-  SedaiMemoryMapper, SedaiC128MemoryMapper, SedaiSpriteEngine, SedaiSpriteTypes;
+  SedaiMemoryMapper, SedaiC128MemoryMapper, SedaiSpriteEngine, SedaiSpriteTypes,
+  SedaiUIWidgets;
 
 const
   SCROLLBACK_LINES = 1000;
@@ -9558,33 +9559,78 @@ end;
 // Returns True only if the window was closed (so the VM should stop).
 function TSedaiNewConsole.RunSpriteEditor(SpriteNum: Integer): Boolean;
 const
-  SPR_W = 24;
-  SPR_H = 21;
-  MAXUNDO = 30;   // per-sprite undo/redo depth
+  MAXUNDO = 30;        // per-sprite undo/redo depth
+  MAX_DIM = 256;       // hard cap on either sprite dimension
+  PRESET_COUNT = 8;
+  // Deferred widget actions (need helpers declared after DrawEditor, so the
+  // widget records the action and the main loop performs it).
+  uaNone = 0;
+  uaPreset = 1;        // UiArg = preset index 1..PRESET_COUNT
+  uaFmtApply = 2;      // apply the pending format change (clears the grid)
+  uaFmtCancel = 3;     // cancel the pending format change
+  uaSizeApply = 4;     // apply the typed W x H size fields
+const
+  // Size presets (C128 default + SNES/console-style squares & tall shapes).
+  PresetW: array[1..PRESET_COUNT] of Integer = (24,  8, 16, 32, 64, 16, 32, 48);
+  PresetH: array[1..PRESET_COUNT] of Integer = (21,  8, 16, 32, 64, 32, 64, 42);
+  PresetNm: array[1..PRESET_COUNT] of string = (
+    'C128 24x21', '8x8', '16x16', '32x32', '64x64', '16x32', '32x64', '48x42');
 type
-  TGridSnap = array[0..SPR_H - 1, 0..SPR_W - 1] of Byte;
+  // Undo/redo snapshot: grid contents plus the size/format they belong to
+  // (both size and format can change during an editing session).
+  TGridSnap = record
+    W, H, Fmt: Integer;
+    Data: TBytes;        // flattened H*W cell values
+  end;
 var
-  Grid: TGridSnap;  // 0..3 colour codes
+  // Current grid dimensions and data format (0=hi-res, 1=multicolor, 2=full-color).
+  GW, GH, Fmt: Integer;
+  Grid: array of array of Byte;   // [row][col] cell values (meaning depends on Fmt)
   // Per-sprite undo/redo stacks (independent history for each of the 8 sprites).
   Undo, Redo: array[1..8] of array of TGridSnap;
   Info: TSpriteInfo;
   CX, CY: Integer;
-  Multicolor, ExpandX, ExpandY: Boolean;
+  Multicolor, FullColor, ExpandX, ExpandY: Boolean;
   SprColIdx, MC1Idx, MC2Idx: Byte;
+  PenIdx: Byte;     // full-color pen: palette index 0..255 (0 = transparent)
+  MulPen: Byte;     // multicolor mouse pen value 1..3
   Running, ConfirmSwitch, ClipValid, HasAnchor, IsShiftArrow, OverwritePending: Boolean;
   // Shape clipboard: a region of values + a mask of which cells are real.
-  Clip: array[0..SPR_H - 1, 0..SPR_W - 1] of Byte;
-  ClipSel: array[0..SPR_H - 1, 0..SPR_W - 1] of Boolean;
+  Clip: array of array of Byte;
+  ClipSel: array of array of Boolean;
   ClipW, ClipH: Integer;
   // Selection mask (+ base for additive drags) and the rectangle anchor.
-  Sel, BaseSel: array[0..SPR_H - 1, 0..SPR_W - 1] of Boolean;
+  Sel, BaseSel: array of array of Boolean;
   SelAnchorX, SelAnchorY: Integer;
   Event: TSDL_Event;
   Sym: TSDL_KeyCode;
   Mods: Word;
-  InputMode: Integer;   // 0=none, 1=save filename, 2=load filename
-  InputText: string;    // filename being typed (shown below the grid)
+  // InputMode: 0=none, 1=save filename, 2=load filename, 3=size preset menu,
+  // 4=free size entry (WxH typed)
+  InputMode: Integer;
+  InputText: string;    // filename / size being typed (shown below the grid)
   LastFile: string;     // last saved/loaded name (shown + re-proposed on save)
+  // Layout captured by the last DrawEditor pass, used to hit-test mouse clicks.
+  LGX, LGY, LCell: Integer;          // grid origin + cell size (pixels)
+  LViewCol, LViewRow: Integer;       // top-left visible cell (scroll position)
+  LViewW, LViewH: Integer;           // drawn grid viewport size (pixels)
+  LSwatchX, LSwatchY: Integer;       // pen colour swatch position (anchors the pop-up)
+  LPalX, LPalY, LPalCell: Integer;   // palette picker origin + swatch size
+  LPalShown: Boolean;                // palette picker drawn this frame (full-color)
+  MouseDrawing: Boolean;             // a mouse button is held over the grid
+  MouseErase: Boolean;               // current mouse stroke erases (right button)
+  ShowHelp: Boolean;                 // full-screen help overlay is visible
+  MX, MY, NW, NH, KSel: Integer;     // scratch (mouse coords / parsed size / preset)
+  // Immediate-mode widget panel (right column).
+  Ui: TSedaiUI;
+  UiMouseX, UiMouseY: Integer;       // last known mouse position (for hover/click)
+  UiClick: Boolean;                  // left button pressed this frame (for widgets)
+  UiAction, UiArg: Integer;          // deferred widget action handled after DrawEditor
+  PendingFmt: Integer;               // format the pending confirm will switch to
+  SavedMsg: Boolean;                 // show 'SAVED' until the next edit
+  SizeFocus: Integer;                // editable size field: 0 none, 1 = W, 2 = H
+  SizeWStr, SizeHStr: string;        // the W / H size fields being shown / typed
+  ColorPopup: Boolean;               // modal colour-picker pop-up is open
 
   function ClampByte16(V: Integer): Byte;
   begin
@@ -9597,14 +9643,31 @@ var
     if LowerCase(ExtractFileExt(S)) <> '.spr' then Result := S + '.spr' else Result := S;
   end;
 
-  // Cycle the palette index of the colour UNDER the cursor: in multicolor the
-  // pixel value selects which colour (1=MC1, 3=MC2, else the sprite colour); in
-  // hi-res it is always the sprite colour.
+  // Keep the legacy Multicolor / FullColor booleans in sync with Fmt.
+  procedure SyncFmtFlags;
+  begin
+    Multicolor := (Fmt = SPRFMT_MULTICOLOR);
+    FullColor := (Fmt = SPRFMT_FULLCOLOR);
+  end;
+
+  // (Re)allocate the grid + selection buffers to the current GW x GH.
+  procedure AllocBuffers;
+  begin
+    SetLength(Grid, GH, GW);
+    SetLength(Sel, GH, GW);
+    SetLength(BaseSel, GH, GW);
+  end;
+
+  // Cycle the pen colour. Full-color: move the palette pen over 0..255. Hi-res:
+  // the sprite colour. Multicolor: the colour the pixel UNDER the cursor selects
+  // (1=MC1, 3=MC2, else the sprite colour).
   procedure CycleColor(Delta: Integer);
   var
     V: Byte;
   begin
-    if not Multicolor then
+    if FullColor then
+      PenIdx := Byte((((Integer(PenIdx) + Delta) mod 256) + 256) mod 256)
+    else if not Multicolor then
       SprColIdx := ClampByte16(SprColIdx + Delta)
     else
     begin
@@ -9620,8 +9683,8 @@ var
     R2, C2: Integer;
   begin
     Result := True;
-    for R2 := 0 to SPR_H - 1 do
-      for C2 := 0 to SPR_W - 1 do
+    for R2 := 0 to GH - 1 do
+      for C2 := 0 to GW - 1 do
         if Grid[R2, C2] <> 0 then
         begin
           Result := False;
@@ -9629,58 +9692,83 @@ var
         end;
   end;
 
+  // Decode the sprite's bytes into the grid per current Fmt/size. Byte layout
+  // matches the engine's EnsureSpriteTexture: stride = ceil(GW/8) bytes/row for
+  // hi-res & multicolor; full-color is 1 byte/pixel (GW*GH).
   procedure UnpackFromSprite;
   var
-    Row, ByteCol, Bit, P, Idx, V: Integer;
+    Row, Col, Stride, ByteIdx, BitPos, V: Integer;
     D: TBytes;
   begin
     D := FSpriteEngine.GetSpriteData(SpriteNum);
-    for Row := 0 to SPR_H - 1 do
-      for ByteCol := 0 to 2 do
+    Stride := (GW + 7) div 8;
+    for Row := 0 to GH - 1 do
+      for Col := 0 to GW - 1 do
       begin
-        Idx := Row * 3 + ByteCol;
-        if Idx >= Length(D) then
+        if FullColor then
         begin
-          for Bit := 0 to 7 do
-            Grid[Row, ByteCol * 8 + Bit] := 0;
-          Continue;
-        end;
-        if Multicolor then
-          for P := 0 to 3 do
-          begin
-            V := (D[Idx] shr (6 - P * 2)) and 3;
-            Grid[Row, ByteCol * 8 + P * 2] := V;
-            Grid[Row, ByteCol * 8 + P * 2 + 1] := V;
-          end
+          ByteIdx := Row * GW + Col;
+          if ByteIdx < Length(D) then Grid[Row, Col] := D[ByteIdx]
+          else Grid[Row, Col] := 0;
+        end
+        else if Multicolor then
+        begin
+          ByteIdx := Row * Stride + (Col div 8);
+          BitPos := 6 - ((Col div 2) mod 4) * 2;
+          if ByteIdx < Length(D) then V := (D[ByteIdx] shr BitPos) and 3 else V := 0;
+          Grid[Row, Col] := V;
+        end
         else
-          for Bit := 0 to 7 do
-            Grid[Row, ByteCol * 8 + Bit] := (D[Idx] shr (7 - Bit)) and 1;
+        begin
+          ByteIdx := Row * Stride + (Col div 8);
+          BitPos := 7 - (Col mod 8);
+          if ByteIdx < Length(D) then Grid[Row, Col] := (D[ByteIdx] shr BitPos) and 1
+          else Grid[Row, Col] := 0;
+        end;
       end;
   end;
 
   procedure PackToSprite;
   var
-    Row, ByteCol, Bit, P, B: Integer;
+    Row, Col, Stride, ByteIdx, BitPos, MCVal: Integer;
     D: TBytes;
     ScX, ScY: Double;
   begin
-    SetLength(D, 63);
-    for Row := 0 to SPR_H - 1 do
-      for ByteCol := 0 to 2 do
-      begin
-        B := 0;
-        if Multicolor then
-          for P := 0 to 3 do
-            B := B or ((Grid[Row, ByteCol * 8 + P * 2] and 3) shl (6 - P * 2))
-        else
-          for Bit := 0 to 7 do
-            if Grid[Row, ByteCol * 8 + Bit] <> 0 then
-              B := B or (1 shl (7 - Bit));
-        D[Row * 3 + ByteCol] := Byte(B);
-      end;
+    if FullColor then
+    begin
+      SetLength(D, GW * GH);
+      for Row := 0 to GH - 1 do
+        for Col := 0 to GW - 1 do
+          D[Row * GW + Col] := Grid[Row, Col];
+    end
+    else
+    begin
+      Stride := (GW + 7) div 8;
+      SetLength(D, Stride * GH);
+      for ByteIdx := 0 to Length(D) - 1 do D[ByteIdx] := 0;
+      for Row := 0 to GH - 1 do
+        for Col := 0 to GW - 1 do
+        begin
+          ByteIdx := Row * Stride + (Col div 8);
+          if Multicolor then
+          begin
+            // Both halves of a pair share the value; read the even half.
+            MCVal := Grid[Row, Col and (not 1)] and 3;
+            BitPos := 6 - ((Col div 2) mod 4) * 2;
+            D[ByteIdx] := Byte(D[ByteIdx] or (MCVal shl BitPos));
+          end
+          else if Grid[Row, Col] <> 0 then
+          begin
+            BitPos := 7 - (Col mod 8);
+            D[ByteIdx] := Byte(D[ByteIdx] or (1 shl BitPos));
+          end;
+        end;
+    end;
+    FSpriteEngine.SetSpriteSize(SpriteNum, GW, GH);
+    FSpriteEngine.SetSpriteFormat(SpriteNum, Fmt);
     FSpriteEngine.SetSpriteData(SpriteNum, D);
 
-    // Apply colour / multicolor / expand (keep enabled & priority unchanged: -1).
+    // Apply colour / expand (keep enabled & priority unchanged: -1).
     if ExpandX then ScX := 2.0 else ScX := 1.0;
     if ExpandY then ScY := 2.0 else ScY := 1.0;
     FSpriteEngine.SetSprite(SpriteNum, -1, MakeIndexedColor(SprColIdx), -1,
@@ -9692,13 +9780,18 @@ var
   procedure SetCell(V: Byte);
   begin
     Grid[CY, CX] := V;
-    if Multicolor then
+    if Multicolor and ((CX xor 1) < GW) then
       Grid[CY, CX xor 1] := V;   // paint both halves of the multicolor pair
   end;
 
   function CellColor(V: Byte): TSDL_Color;
   begin
-    if Multicolor then
+    if FullColor then
+    begin
+      if V <> 0 then Result := FVideoController.PaletteIndexToSDLColor(V)
+      else begin Result.r := 32; Result.g := 32; Result.b := 32; Result.a := 255; end;
+    end
+    else if Multicolor then
       case V of
         1: Result := FVideoController.PaletteIndexToSDLColor(MC1Idx);
         2: Result := FVideoController.PaletteIndexToSDLColor(SprColIdx);
@@ -9733,164 +9826,395 @@ var
     SDL_FreeSurface(Surf);
   end;
 
+  // Full-screen help overlay (toggled with H / F1). The line pitch auto-fits the
+  // window height so the text never runs off the bottom of the screen.
+  procedure DrawHelp;
+  const
+    HELP: array[0..27] of string = (
+      'SPRDEF - SPRITE EDITOR HELP',
+      'The right-hand panel has clickable controls; the keys below still work.',
+      '',
+      'Arrows        move the cursor (the view scrolls to follow on big sprites)',
+      'SPACE         paint: hi-res toggle / MC cycle / full-color pen',
+      '0             erase the pixel under the cursor',
+      'DEL           clear the whole grid',
+      'C  [  ]       step the pen colour ([Pick...] opens the palette pop-up)',
+      '1-8           switch the sprite being edited',
+      '',
+      'CHANGE SIZE (1..255)',
+      '  presets       click a size button in the panel (24x21 .. 48x42)',
+      '  custom        click a W/H field or press S, type a number, RETURN',
+      'M / radios    cycle / pick format: hi-res / multicolor / full-color',
+      'X   Y         toggle horizontal / vertical expand (panel checkboxes)',
+      '',
+      'MOUSE         L paint   R erase   MID move cursor (no paint)',
+      '              drag to draw a stroke (one undo per stroke)',
+      '              full-color: click the palette to pick the pen',
+      'P             cycle the multicolor mouse pen',
+      '',
+      'Shift+Arrows  rectangular selection (+Ctrl adds an area)',
+      'Ctrl+Space    toggle a pixel in the selection',
+      'Ctrl+C / V    copy / paste shape',
+      'Ctrl+Z / Y    undo / redo (per sprite)',
+      'Ctrl+S / L    save / load all sprites to a .spr file',
+      'RETURN save (commit, no exit)    ESC exit    Save commits to the sprite',
+      'Press H / F1 / ESC to close this help');
+  var
+    R: PSDL_Renderer;
+    WW, WH, HX, Y, DY, I: Integer;
+  begin
+    R := FVideoController.Renderer;
+    if R = nil then Exit;
+    SDL_GetRendererOutputSize(R, @WW, @WH);
+    SDL_SetRenderDrawColor(R, 0, 0, 0, 255);
+    SDL_RenderClear(R);
+
+    HX := 48;
+    DY := (WH - 64) div Length(HELP);
+    if DY > 22 then DY := 22;
+    if DY < 12 then DY := 12;
+    Y := 32;
+    for I := 0 to High(HELP) do
+    begin
+      if HELP[I] <> '' then DrawStr(HX, Y, HELP[I]);
+      Y := Y + DY;
+    end;
+
+    SDL_RenderPresent(R);
+  end;
+
   procedure DrawEditor;
   var
     R: PSDL_Renderer;
     WW, WH, Cell, GX, GY, Row, Col, PvX, PvY, PvS, PairLeft, CurW, LogCol: Integer;
+    Ci, K, HelpY, Py, RH, RStep, RUnit: Integer;
+    GVX, GVY, GVW, GVH, VisCols, VisRows, PvW, PvH: Integer;
+    PopX, PopY, PopW, PopH, CurIdx: Integer;
     Rect: TSDL_Rect;
     C: TSDL_Color;
     ModeStr: string;
   begin
     R := FVideoController.Renderer;
     if R = nil then Exit;
+
+    if ShowHelp then begin DrawHelp; Exit; end;
+
     SDL_GetRendererOutputSize(R, @WW, @WH);
 
     SDL_SetRenderDrawColor(R, 0, 0, 0, 255);
     SDL_RenderClear(R);
 
-    Cell := (WW * 60 div 100) div SPR_W;
-    if ((WH * 82 div 100) div SPR_H) < Cell then Cell := (WH * 82 div 100) div SPR_H;
+    LPalShown := False;
+
+    // === Grid viewport (fixed region; scrolls to follow the cursor) ===========
+    // A fixed right-hand column holds the command panel (so it never goes
+    // off-screen); the grid lives in a viewport on the left that scrolls when the
+    // sprite is bigger than fits at a usable cell size.
+    PvX := WW - 280;                 // command panel left edge (fixed)
+    GVX := 38; GVY := 30;
+    GVW := PvX - GVX - 16;           // viewport width (gap before the panel)
+    if GVW < 80 then GVW := 80;
+    GVH := WH - GVY - 40;            // leave room at the bottom for the coords line
+    if GVH < 80 then GVH := 80;
+
+    // Cell size: fit the sprite, clamped to a usable range; below the minimum the
+    // viewport scrolls instead of shrinking the cells to nothing.
+    Cell := GVW div GW;
+    if (GVH div GH) < Cell then Cell := GVH div GH;
+    if Cell > 24 then Cell := 24;
     if Cell < 6 then Cell := 6;
 
-    GX := 38;   // leave room on the left for row numbers
-    GY := (WH - Cell * SPR_H) div 2;
-    if GY < 28 then GY := 28;   // leave room on top for column numbers
+    VisCols := GVW div Cell; if VisCols > GW then VisCols := GW; if VisCols < 1 then VisCols := 1;
+    VisRows := GVH div Cell; if VisRows > GH then VisRows := GH; if VisRows < 1 then VisRows := 1;
 
-    // Grid cells. In multicolor the horizontal resolution is halved: 12 logical
-    // columns of double-width pixels (bit pairs), so draw 12 wide cells; in hi-res
-    // draw the full 24 columns.
-    if Multicolor then
-      for Row := 0 to SPR_H - 1 do
-        for Col := 0 to 11 do
-        begin
-          C := CellColor(Grid[Row, Col * 2]);
-          SDL_SetRenderDrawColor(R, C.r, C.g, C.b, 255);
-          Rect.x := GX + Col * 2 * Cell; Rect.y := GY + Row * Cell;
-          Rect.w := 2 * Cell - 1; Rect.h := Cell - 1;
-          SDL_RenderFillRect(R, @Rect);
-        end
-    else
-      for Row := 0 to SPR_H - 1 do
-        for Col := 0 to SPR_W - 1 do
-        begin
-          C := CellColor(Grid[Row, Col]);
-          SDL_SetRenderDrawColor(R, C.r, C.g, C.b, 255);
-          Rect.x := GX + Col * Cell; Rect.y := GY + Row * Cell;
-          Rect.w := Cell - 1; Rect.h := Cell - 1;
-          SDL_RenderFillRect(R, @Rect);
-        end;
+    // Scroll so the cursor stays inside the visible window.
+    if CX < LViewCol then LViewCol := CX;
+    if CX > LViewCol + VisCols - 1 then LViewCol := CX - VisCols + 1;
+    if CY < LViewRow then LViewRow := CY;
+    if CY > LViewRow + VisRows - 1 then LViewRow := CY - VisRows + 1;
+    if LViewCol > GW - VisCols then LViewCol := GW - VisCols;
+    if LViewCol < 0 then LViewCol := 0;
+    if LViewRow > GH - VisRows then LViewRow := GH - VisRows;
+    if LViewRow < 0 then LViewRow := 0;
+    if Multicolor then LViewCol := LViewCol and (not 1);
 
-    // Column ruler (logical columns: 0-11 in multicolor, 0-23 in hi-res)
-    if Multicolor then
-    begin
-      Col := 0;
-      while Col <= 11 do
+    LViewW := VisCols * Cell;
+    LViewH := VisRows * Cell;
+    GX := GVX + (GVW - LViewW) div 2;   // centre the visible grid in the viewport
+    GY := GVY + (GVH - LViewH) div 2;
+    if GX < GVX then GX := GVX;
+    if GY < GVY then GY := GVY;
+    LGX := GX; LGY := GY; LCell := Cell;
+
+    // Cells (visible window only). One Cell per physical column; in multicolor the
+    // two halves of a pair share the same value, so this also draws the
+    // double-width look correctly.
+    for Row := LViewRow to LViewRow + VisRows - 1 do
+      for Col := LViewCol to LViewCol + VisCols - 1 do
       begin
-        DrawStr(GX + Col * 2 * Cell + 1, GY - 20, IntToStr(Col));
-        Col := Col + 2;
+        C := CellColor(Grid[Row, Col]);
+        SDL_SetRenderDrawColor(R, C.r, C.g, C.b, 255);
+        Rect.x := GX + (Col - LViewCol) * Cell; Rect.y := GY + (Row - LViewRow) * Cell;
+        Rect.w := Cell - 1; Rect.h := Cell - 1;
+        SDL_RenderFillRect(R, @Rect);
       end;
-    end
-    else
+
+    // Rulers — always shown, labelled in multiples of 5 (0, 5, 10, 15 ...). The
+    // step grows as cells shrink so the numbers stay readable on big (scrolling)
+    // sprites. In multicolor the label is the logical column (0..GW/2), so the
+    // physical step is doubled to keep the labels on multiples of 5.
+    if Multicolor then RUnit := 10 else RUnit := 5;
+    RStep := RUnit;
+    while RStep * Cell < 36 do RStep := RStep + RUnit;
+    Col := (LViewCol div RStep) * RStep;
+    if Col < LViewCol then Col := Col + RStep;
+    while Col <= LViewCol + VisCols - 1 do
     begin
-      Col := 0;
-      while Col <= SPR_W - 1 do
-      begin
-        DrawStr(GX + Col * Cell + 1, GY - 20, IntToStr(Col));
-        Col := Col + 4;
-      end;
+      if Multicolor then DrawStr(GX + (Col - LViewCol) * Cell + 1, GY - 20, IntToStr(Col div 2))
+      else DrawStr(GX + (Col - LViewCol) * Cell + 1, GY - 20, IntToStr(Col));
+      Col := Col + RStep;
     end;
-    // Row ruler (0-20 in both modes)
-    Row := 0;
-    while Row <= SPR_H - 1 do
+    RStep := 5;
+    while RStep * Cell < 36 do RStep := RStep + 5;
+    Row := (LViewRow div RStep) * RStep;
+    if Row < LViewRow then Row := Row + RStep;
+    while Row <= LViewRow + VisRows - 1 do
     begin
-      DrawStr(GX - 26, GY + Row * Cell - 2, IntToStr(Row));
-      Row := Row + 4;
+      DrawStr(GX - 26, GY + (Row - LViewRow) * Cell - 2, IntToStr(Row));
+      Row := Row + RStep;
     end;
 
-    // Selection overlay: cyan outline on selected cells (one outline per pair in
-    // multicolor, since the two halves share the selection state).
+    // Selection overlay (visible cells).
     SDL_SetRenderDrawColor(R, 0, 255, 255, 255);
-    for Row := 0 to SPR_H - 1 do
-      for Col := 0 to SPR_W - 1 do
-        if Sel[Row, Col] and not (Multicolor and ((Col and 1) = 1)) then
+    for Row := LViewRow to LViewRow + VisRows - 1 do
+      for Col := LViewCol to LViewCol + VisCols - 1 do
+        if Sel[Row, Col] then
         begin
-          Rect.x := GX + Col * Cell; Rect.y := GY + Row * Cell;
-          if Multicolor then Rect.w := 2 * Cell - 1 else Rect.w := Cell - 1;
-          Rect.h := Cell - 1;
+          Rect.x := GX + (Col - LViewCol) * Cell; Rect.y := GY + (Row - LViewRow) * Cell;
+          Rect.w := Cell - 1; Rect.h := Cell - 1;
           SDL_RenderDrawRect(R, @Rect);
         end;
 
-    // Cursor (spans the whole pair in multicolor). Drawn as a white outer + black
-    // inner double outline so it stays visible against ANY cell colour (a single
-    // colour disappears on a matching pixel, e.g. a yellow cursor on yellow).
+    // Cursor (spans the pair in multicolor) — only if it is inside the window.
     if Multicolor then begin PairLeft := CX and (not 1); CurW := 2 * Cell; end
     else begin PairLeft := CX; CurW := Cell; end;
-    Rect.x := GX + PairLeft * Cell; Rect.y := GY + CY * Cell;
-    Rect.w := CurW; Rect.h := Cell;
-    SDL_SetRenderDrawColor(R, 255, 255, 255, 255);   // white outer ring
-    SDL_RenderDrawRect(R, @Rect);
-    Rect.x := Rect.x + 1; Rect.y := Rect.y + 1;
-    Rect.w := Rect.w - 2; Rect.h := Rect.h - 2;
-    if (Rect.w > 0) and (Rect.h > 0) then
+    if (PairLeft >= LViewCol) and (PairLeft < LViewCol + VisCols) and
+       (CY >= LViewRow) and (CY < LViewRow + VisRows) then
     begin
-      SDL_SetRenderDrawColor(R, 0, 0, 0, 255);       // black inner ring
+      Rect.x := GX + (PairLeft - LViewCol) * Cell; Rect.y := GY + (CY - LViewRow) * Cell;
+      Rect.w := CurW; Rect.h := Cell;
+      SDL_SetRenderDrawColor(R, 255, 255, 255, 255);   // white outer ring
       SDL_RenderDrawRect(R, @Rect);
+      Rect.x := Rect.x + 1; Rect.y := Rect.y + 1;
+      Rect.w := Rect.w - 2; Rect.h := Rect.h - 2;
+      if (Rect.w > 0) and (Rect.h > 0) then
+      begin
+        SDL_SetRenderDrawColor(R, 0, 0, 0, 255);       // black inner ring
+        SDL_RenderDrawRect(R, @Rect);
+      end;
     end;
 
-    // Prominent cursor coordinates right under the grid (the cursor itself can be
-    // hard to spot, so always show where it is). Logical column: 0-11 in multicolor.
-    // Line below the grid: filename input field while saving/loading, else the
-    // live cursor coordinates (the filename has the whole width, so any length fits).
+    if Multicolor then LogCol := CX div 2 else LogCol := CX;
+    HelpY := GVY + GVH;
+
+    // Line below the grid: filename / size input field, else live cursor coords.
     if OverwritePending then
-      DrawStr(GX, GY + SPR_H * Cell + 6, 'OVERWRITE ' + NormSpr(InputText) + ' ?  Y/N')
+      DrawStr(GX, HelpY + 6, 'OVERWRITE ' + NormSpr(InputText) + ' ?  Y/N')
     else if InputMode = 1 then
-      DrawStr(GX, GY + SPR_H * Cell + 6, 'SAVE FILE: ' + InputText + '_')
+      DrawStr(GX, HelpY + 6, 'SAVE FILE: ' + InputText + '_')
     else if InputMode = 2 then
-      DrawStr(GX, GY + SPR_H * Cell + 6, 'LOAD FILE: ' + InputText + '_')
+      DrawStr(GX, HelpY + 6, 'LOAD FILE: ' + InputText + '_')
+    else if InputMode = 4 then
+      DrawStr(GX, HelpY + 6, 'SIZE WxH: ' + InputText + '_   (e.g. 32x32)')
+    else if LastFile <> '' then
+      DrawStr(GX, HelpY + 6, Format('COL %d   ROW %d    FILE: %s', [LogCol, CY, LastFile]))
+    else
+      DrawStr(GX, HelpY + 6, Format('COL %d   ROW %d', [LogCol, CY]));
+
+    // Format-change confirmation prompt (the size menu lives in the right column).
+    if ConfirmSwitch then
+      DrawStr(GX, HelpY + 26, 'CHANGE FORMAT? THIS CLEARS THE SPRITE - Y/N');
+
+    // Shape preview in the panel column: a fixed thumbnail (<= 80px) that scales
+    // small sprites up and SUB-SAMPLES big ones, so its height never pushes the
+    // command panel off the bottom of the screen.
+    PvY := GVY;
+    if (GW <= 80) and (GH <= 80) then
+    begin
+      PvS := 80 div GW; if (80 div GH) < PvS then PvS := 80 div GH;
+      if PvS < 1 then PvS := 1;
+      if PvS > 4 then PvS := 4;
+      for Row := 0 to GH - 1 do
+        for Col := 0 to GW - 1 do
+          if Grid[Row, Col] <> 0 then
+          begin
+            C := CellColor(Grid[Row, Col]);
+            SDL_SetRenderDrawColor(R, C.r, C.g, C.b, 255);
+            Rect.x := PvX + Col * PvS; Rect.y := PvY + Row * PvS;
+            Rect.w := PvS; Rect.h := PvS;
+            SDL_RenderFillRect(R, @Rect);
+          end;
+      PvW := GW * PvS; PvH := GH * PvS;
+    end
     else
     begin
-      if Multicolor then LogCol := CX div 2 else LogCol := CX;
-      if LastFile <> '' then
-        DrawStr(GX, GY + SPR_H * Cell + 6, Format('COL %d   ROW %d    FILE: %s', [LogCol, CY, LastFile]))
-      else
-        DrawStr(GX, GY + SPR_H * Cell + 6, Format('COL %d   ROW %d', [LogCol, CY]));
+      PvW := 80; PvH := 80;
+      for Row := 0 to 79 do
+        for Col := 0 to 79 do
+          if Grid[(Row * GH) div 80, (Col * GW) div 80] <> 0 then
+          begin
+            C := CellColor(Grid[(Row * GH) div 80, (Col * GW) div 80]);
+            SDL_SetRenderDrawColor(R, C.r, C.g, C.b, 255);
+            Rect.x := PvX + Col; Rect.y := PvY + Row;
+            Rect.w := 1; Rect.h := 1;
+            SDL_RenderFillRect(R, @Rect);
+          end;
     end;
 
-    // Mode-switch confirmation prompt (switching hi-res<->multicolor clears the sprite)
+    // Status header
+    if FullColor then ModeStr := 'FULL-COLOR'
+    else if Multicolor then ModeStr := 'MULTICOLOR'
+    else ModeStr := 'HI-RES';
+
+    // === Immediate-mode widget panel (right column) ===========================
+    // Uniform layout: Py is the CENTRE Y of the current row, RH the row pitch; a
+    // fixed 8px gap separates groups. Deferred actions (resize/format) go through
+    // UiAction. The keyboard shortcuts keep working in parallel. While the colour
+    // pop-up is open the panel must NOT consume the click (mask UiClick).
+    RH := Ui.RowHeight;
+    Py := PvY + PvH + 16 + RH div 2;
+    Ui.BeginFrame(UiMouseX, UiMouseY, UiClick and (not ColorPopup));
+    UiAction := uaNone;
+
+    // Header: name on the left, HELP at the right edge (no overlap with the mode).
+    Ui.Caption(PvX, Py, Format('SPRDEF  sprite %d', [SpriteNum]));
+    if Ui.Button(PvX + 208, Py - 11, 52, 22, 'HELP') then ShowHelp := True;
+    Py := Py + RH;
+    if SavedMsg then
+      Ui.Caption(PvX, Py, Format('%s   %dx%d   cursor %d,%d   *SAVED*', [ModeStr, GW, GH, LogCol, CY]))
+    else
+      Ui.Caption(PvX, Py, Format('%s   %dx%d   cursor %d,%d', [ModeStr, GW, GH, LogCol, CY]));
+    Py := Py + RH + 8;
+
+    // Format (real radio buttons)
+    Ui.Caption(PvX, Py, 'Format');
+    if Ui.Radio(PvX + 72, Py, 'Hi-res', Fmt = SPRFMT_HIRES) and (Fmt <> SPRFMT_HIRES) then
+      begin PendingFmt := SPRFMT_HIRES; ConfirmSwitch := True; end;
+    if Ui.Radio(PvX + 162, Py, 'Multicolor', Fmt = SPRFMT_MULTICOLOR) and (Fmt <> SPRFMT_MULTICOLOR) then
+      begin PendingFmt := SPRFMT_MULTICOLOR; ConfirmSwitch := True; end;
+    Py := Py + RH;
+    if Ui.Radio(PvX + 72, Py, 'Full-color (256)', Fmt = SPRFMT_FULLCOLOR) and (Fmt <> SPRFMT_FULLCOLOR) then
+      begin PendingFmt := SPRFMT_FULLCOLOR; ConfirmSwitch := True; end;
+    Py := Py + RH + 8;
+
+    // Expand
+    Ui.Caption(PvX, Py, 'Expand');
+    Ui.Checkbox(PvX + 72, Py, 'X', ExpandX);
+    Ui.Checkbox(PvX + 122, Py, 'Y', ExpandY);
+    Py := Py + RH + 8;
+
+    // Pen: [<] number [>] swatch [Pick...]
+    if FullColor then CurIdx := PenIdx else CurIdx := SprColIdx;
+    Ui.Caption(PvX, Py, 'Pen');
+    if Ui.Button(PvX + 72, Py - 11, 26, 22, '<') then CycleColor(-1);
+    Ui.CaptionC(PvX + 100, Py, 40, IntToStr(CurIdx));
+    if Ui.Button(PvX + 142, Py - 11, 26, 22, '>') then CycleColor(1);
+    C := FVideoController.PaletteIndexToSDLColor(CurIdx);
+    LSwatchX := PvX + 174; LSwatchY := Py - 10;   // remember: the pop-up anchors here
+    Rect.x := LSwatchX; Rect.y := LSwatchY; Rect.w := 20; Rect.h := 20;
+    SDL_SetRenderDrawColor(R, C.r, C.g, C.b, 255); SDL_RenderFillRect(R, @Rect);
+    SDL_SetRenderDrawColor(R, 200, 200, 200, 255); SDL_RenderDrawRect(R, @Rect);
+    if Ui.Button(PvX + 202, Py - 11, 58, 22, 'Pick...') then ColorPopup := True;
+    Py := Py + RH + 8;
+
+    // Size: W/H integer fields (right-aligned, 1..255) + Set
+    if SizeFocus = 0 then begin SizeWStr := IntToStr(GW); SizeHStr := IntToStr(GH); end;
+    Ui.Caption(PvX, Py, 'Size');
+    Ui.Caption(PvX + 50, Py, 'W');
+    if Ui.Field(PvX + 66, Py - 11, 44, 22, SizeWStr, SizeFocus = 1, True) then SizeFocus := 1;
+    Ui.Caption(PvX + 120, Py, 'H');
+    if Ui.Field(PvX + 136, Py - 11, 44, 22, SizeHStr, SizeFocus = 2, True) then SizeFocus := 2;
+    if Ui.Button(PvX + 188, Py - 11, 50, 22, 'Set') then UiAction := uaSizeApply;
+    Py := Py + RH;
+
+    // Preset buttons: 4 per row, pitch 66, width 62 -> the row spans 3*66+62 = 260px.
+    // The button pairs below match that span (126 + 8 gap + 126).
+    for K := 1 to PRESET_COUNT do
+      if Ui.Button(PvX + ((K - 1) mod 4) * 66, Py - 10 + ((K - 1) div 4) * 24, 62, 20,
+                   Format('%dx%d', [PresetW[K], PresetH[K]])) then
+        begin UiAction := uaPreset; UiArg := K; end;
+    Py := Py + 24 + RH + 8;
+
+    // Save / Exit
+    if Ui.Button(PvX, Py - 12, 126, 24, 'Save (Return)') then begin PackToSprite; SavedMsg := True; end;
+    if Ui.Button(PvX + 134, Py - 12, 126, 24, 'Exit (Esc)') then Running := False;
+    Py := Py + RH + 8;
+    if Ui.Button(PvX, Py - 11, 126, 22, 'Save file...') then
+      begin InputMode := 1; InputText := LastFile; OverwritePending := False; end;
+    if Ui.Button(PvX + 134, Py - 11, 126, 22, 'Load file...') then
+      begin InputMode := 2; InputText := LastFile; OverwritePending := False; end;
+    Py := Py + RH + 8;
+
+    // Inline confirm for a format change (also answerable with Y/N on the keyboard)
     if ConfirmSwitch then
-      DrawStr(GX, GY + SPR_H * Cell + 26, 'SWITCH HI-RES/MULTICOLOR? CLEARS SPRITE - Y/N');
+    begin
+      Ui.Caption(PvX, Py, 'Clear sprite & change format?');
+      Py := Py + RH;
+      if Ui.Button(PvX, Py - 11, 64, 22, 'Yes') then UiAction := uaFmtApply;
+      if Ui.Button(PvX + 72, Py - 11, 64, 22, 'No') then UiAction := uaFmtCancel;
+      Py := Py + RH;
+    end;
 
-    // 1:1-ish preview to the right of the grid
-    PvS := 3;
-    PvX := GX + SPR_W * Cell + 30;
-    PvY := GY;
-    for Row := 0 to SPR_H - 1 do
-      for Col := 0 to SPR_W - 1 do
-        if Grid[Row, Col] <> 0 then
-        begin
-          C := CellColor(Grid[Row, Col]);
-          SDL_SetRenderDrawColor(R, C.r, C.g, C.b, 255);
-          Rect.x := PvX + Col * PvS; Rect.y := PvY + Row * PvS;
-          Rect.w := PvS; Rect.h := PvS;
-          SDL_RenderFillRect(R, @Rect);
-        end;
+    Ui.Caption(PvX, Py, 'H / F1 = help   (keys still work)');
 
-    // Status + help
-    if Multicolor then ModeStr := 'MULTICOLOR' else ModeStr := 'HI-RES';
-    DrawStr(PvX, PvY + SPR_H * PvS + 16,
-      Format('SPRDEF  sprite %d   %s   color %d', [SpriteNum, ModeStr, SprColIdx]));
-    DrawStr(PvX, PvY + SPR_H * PvS + 38,
-      Format('cursor:  col %d   row %d', [LogCol, CY]));
-    DrawStr(PvX, PvY + SPR_H * PvS + 60,
-      Format('expand X:%s  Y:%s', [BoolToStr(ExpandX, 'on', 'off'), BoolToStr(ExpandY, 'on', 'off')]));
-    DrawStr(PvX, PvY + SPR_H * PvS + 92, 'Arrows: move   SPACE: paint/cycle');
-    DrawStr(PvX, PvY + SPR_H * PvS + 112, '0: erase  1-8: sprite  Ctrl+C/V copy/paste');
-    DrawStr(PvX, PvY + SPR_H * PvS + 132, 'M: hi-res/MC (clears)   X/Y: expand   C: colour');
-    DrawStr(PvX, PvY + SPR_H * PvS + 152, 'DEL: clear   RETURN: save&exit   ESC: cancel');
-    DrawStr(PvX, PvY + SPR_H * PvS + 172, 'Ctrl+S/L: save/load file (.spr)');
-    DrawStr(PvX, PvY + SPR_H * PvS + 192, 'Shift+arrows: select  (+Ctrl: add area)');
-    DrawStr(PvX, PvY + SPR_H * PvS + 212, 'Ctrl+Space: toggle pixel in selection');
-    DrawStr(PvX, PvY + SPR_H * PvS + 232, 'Ctrl+Z/Y: undo / redo (per sprite)');
+    Ui.EndFrame;
+
+    // ---- Colour pop-up (modal): 16x16 palette swatches, anchored beside the pen
+    // swatch. The palette is centred in the window with a uniform margin; the
+    // current colour gets a thick, high-contrast marker.
+    LPalShown := False;
+    if ColorPopup then
+    begin
+      LPalCell := 18;
+      PopW := 16 * LPalCell + 16;       // 8px uniform margin on each side
+      PopH := 16 * LPalCell + 16;
+      // Anchor to the left of the pen swatch; clamp inside the screen.
+      PopX := LSwatchX - PopW - 8;
+      if PopX < 6 then PopX := LSwatchX + 28;
+      PopY := LSwatchY - 8;
+      if PopX + PopW > WW - 6 then PopX := WW - 6 - PopW;
+      if PopY + PopH > WH - 6 then PopY := WH - 6 - PopH;
+      if PopX < 6 then PopX := 6;
+      if PopY < 6 then PopY := 6;
+      Rect.x := PopX; Rect.y := PopY; Rect.w := PopW; Rect.h := PopH;
+      SDL_SetRenderDrawColor(R, 20, 20, 28, 255); SDL_RenderFillRect(R, @Rect);
+      SDL_SetRenderDrawColor(R, 180, 180, 210, 255); SDL_RenderDrawRect(R, @Rect);
+      LPalX := PopX + 8;
+      LPalY := PopY + 8;
+      LPalShown := True;
+      for Ci := 0 to 255 do
+      begin
+        C := FVideoController.PaletteIndexToSDLColor(Ci);
+        SDL_SetRenderDrawColor(R, C.r, C.g, C.b, 255);
+        Rect.x := LPalX + (Ci mod 16) * LPalCell;
+        Rect.y := LPalY + (Ci div 16) * LPalCell;
+        Rect.w := LPalCell - 1; Rect.h := LPalCell - 1;
+        SDL_RenderFillRect(R, @Rect);
+      end;
+      // Evident selection marker: a 2px white frame with a black inner edge so it
+      // stands out against any swatch colour.
+      if FullColor then CurIdx := PenIdx else CurIdx := SprColIdx;
+      PopX := LPalX + (CurIdx mod 16) * LPalCell;   // reuse PopX/PopY as swatch x/y
+      PopY := LPalY + (CurIdx div 16) * LPalCell;
+      SDL_SetRenderDrawColor(R, 0, 0, 0, 255);
+      Rect.x := PopX - 1; Rect.y := PopY - 1; Rect.w := LPalCell + 1; Rect.h := LPalCell + 1;
+      SDL_RenderDrawRect(R, @Rect);
+      SDL_SetRenderDrawColor(R, 255, 255, 255, 255);
+      Rect.x := PopX - 2; Rect.y := PopY - 2; Rect.w := LPalCell + 3; Rect.h := LPalCell + 3;
+      SDL_RenderDrawRect(R, @Rect);
+      Rect.x := PopX - 3; Rect.y := PopY - 3; Rect.w := LPalCell + 5; Rect.h := LPalCell + 5;
+      SDL_RenderDrawRect(R, @Rect);
+    end;
 
     SDL_RenderPresent(R);
   end;
@@ -9898,8 +10222,8 @@ var
   procedure ClearGrid;
   var Row, Col: Integer;
   begin
-    for Row := 0 to SPR_H - 1 do
-      for Col := 0 to SPR_W - 1 do
+    for Row := 0 to GH - 1 do
+      for Col := 0 to GW - 1 do
         Grid[Row, Col] := 0;
   end;
 
@@ -9907,8 +10231,8 @@ var
   var Row, Col: Integer;
   begin
     HasAnchor := False;
-    for Row := 0 to SPR_H - 1 do
-      for Col := 0 to SPR_W - 1 do
+    for Row := 0 to GH - 1 do
+      for Col := 0 to GW - 1 do
         Sel[Row, Col] := False;
   end;
 
@@ -9916,8 +10240,8 @@ var
   var Row, Col: Integer;
   begin
     Result := True;
-    for Row := 0 to SPR_H - 1 do
-      for Col := 0 to SPR_W - 1 do
+    for Row := 0 to GH - 1 do
+      for Col := 0 to GW - 1 do
         if Sel[Row, Col] then begin Result := False; Exit; end;
   end;
 
@@ -9927,8 +10251,8 @@ var
   var Row, Col: Integer;
   begin
     SelAnchorX := CX; SelAnchorY := CY;
-    for Row := 0 to SPR_H - 1 do
-      for Col := 0 to SPR_W - 1 do
+    for Row := 0 to GH - 1 do
+      for Col := 0 to GW - 1 do
         if AddMode then BaseSel[Row, Col] := Sel[Row, Col] else BaseSel[Row, Col] := False;
     HasAnchor := True;
   end;
@@ -9939,8 +10263,8 @@ var
   begin
     if SelAnchorX < CX then begin X1 := SelAnchorX; X2 := CX; end else begin X1 := CX; X2 := SelAnchorX; end;
     if SelAnchorY < CY then begin Y1 := SelAnchorY; Y2 := CY; end else begin Y1 := CY; Y2 := SelAnchorY; end;
-    for Row := 0 to SPR_H - 1 do
-      for Col := 0 to SPR_W - 1 do
+    for Row := 0 to GH - 1 do
+      for Col := 0 to GW - 1 do
         Sel[Row, Col] := BaseSel[Row, Col] or
           ((Col >= X1) and (Col <= X2) and (Row >= Y1) and (Row <= Y2));
   end;
@@ -9950,18 +10274,20 @@ var
   procedure CopyShape;
   var Row, Col, X1, Y1, X2, Y2: Integer;
   begin
+    SetLength(Clip, GH, GW);
+    SetLength(ClipSel, GH, GW);
     if SelEmpty then
     begin
-      ClipW := SPR_W; ClipH := SPR_H;
-      for Row := 0 to SPR_H - 1 do
-        for Col := 0 to SPR_W - 1 do
+      ClipW := GW; ClipH := GH;
+      for Row := 0 to GH - 1 do
+        for Col := 0 to GW - 1 do
         begin Clip[Row, Col] := Grid[Row, Col]; ClipSel[Row, Col] := True; end;
     end
     else
     begin
-      X1 := SPR_W; Y1 := SPR_H; X2 := -1; Y2 := -1;
-      for Row := 0 to SPR_H - 1 do
-        for Col := 0 to SPR_W - 1 do
+      X1 := GW; Y1 := GH; X2 := -1; Y2 := -1;
+      for Row := 0 to GH - 1 do
+        for Col := 0 to GW - 1 do
           if Sel[Row, Col] then
           begin
             if Col < X1 then X1 := Col;
@@ -9986,30 +10312,71 @@ var
   var Row, Col, OX, OY: Integer;
   begin
     if not ClipValid then Exit;
-    if (ClipW = SPR_W) and (ClipH = SPR_H) then
+    if (ClipW = GW) and (ClipH = GH) then
     begin OX := 0; OY := 0; end
     else
     begin OX := CX; OY := CY; end;
     for Row := 0 to ClipH - 1 do
       for Col := 0 to ClipW - 1 do
-        if ClipSel[Row, Col] and (OY + Row <= SPR_H - 1) and (OX + Col <= SPR_W - 1) then
+        if ClipSel[Row, Col] and (OY + Row <= GH - 1) and (OX + Col <= GW - 1) then
           Grid[OY + Row, OX + Col] := Clip[Row, Col];
+  end;
+
+  // Flatten the current grid to a row-major byte buffer (GW*GH).
+  function GridToBytes: TBytes;
+  var Row, Col, I: Integer;
+  begin
+    SetLength(Result, GW * GH);
+    I := 0;
+    for Row := 0 to GH - 1 do
+      for Col := 0 to GW - 1 do
+      begin Result[I] := Grid[Row, Col]; Inc(I); end;
+  end;
+
+  // Snapshot the grid together with its current size and format.
+  function MakeSnap: TGridSnap;
+  begin
+    Result.W := GW; Result.H := GH; Result.Fmt := Fmt;
+    Result.Data := GridToBytes;
+  end;
+
+  // Restore a snapshot: re-size the buffers and decode the flattened cells. Size
+  // and format can differ from the current ones (resize/format change are undoable).
+  procedure ApplySnap(const S: TGridSnap);
+  var Row, Col, I: Integer;
+  begin
+    GW := S.W; GH := S.H; Fmt := S.Fmt;
+    SyncFmtFlags;
+    AllocBuffers;
+    I := 0;
+    for Row := 0 to GH - 1 do
+      for Col := 0 to GW - 1 do
+      begin
+        if I < Length(S.Data) then Grid[Row, Col] := S.Data[I] else Grid[Row, Col] := 0;
+        Inc(I);
+      end;
+    if CX >= GW then CX := GW - 1;
+    if CY >= GH then CY := GH - 1;
+    if CX < 0 then CX := 0;
+    if CY < 0 then CY := 0;
   end;
 
   // Per-sprite undo/redo. PushUndo is called before each grid-changing action.
   procedure PushUndo;
-  var N: Integer;
+  var N, I: Integer;
   begin
+    SavedMsg := False;   // any edit invalidates the 'SAVED' indicator
     N := Length(Undo[SpriteNum]);
     if N >= MAXUNDO then
     begin
-      if N > 1 then
-        Move(Undo[SpriteNum][1], Undo[SpriteNum][0], (N - 1) * SizeOf(TGridSnap));
+      // Drop the oldest entry (records hold a managed TBytes, so shift by
+      // assignment, not Move, to keep reference counts correct).
+      for I := 0 to N - 2 do Undo[SpriteNum][I] := Undo[SpriteNum][I + 1];
       SetLength(Undo[SpriteNum], N - 1);
       N := N - 1;
     end;
     SetLength(Undo[SpriteNum], N + 1);
-    Undo[SpriteNum][N] := Grid;
+    Undo[SpriteNum][N] := MakeSnap;
     SetLength(Redo[SpriteNum], 0);   // a new edit invalidates the redo stack
   end;
 
@@ -10019,8 +10386,8 @@ var
     N := Length(Undo[SpriteNum]);
     if N = 0 then Exit;
     SetLength(Redo[SpriteNum], Length(Redo[SpriteNum]) + 1);
-    Redo[SpriteNum][High(Redo[SpriteNum])] := Grid;
-    Grid := Undo[SpriteNum][N - 1];
+    Redo[SpriteNum][High(Redo[SpriteNum])] := MakeSnap;
+    ApplySnap(Undo[SpriteNum][N - 1]);
     SetLength(Undo[SpriteNum], N - 1);
     ClearSelection;
   end;
@@ -10031,8 +10398,8 @@ var
     N := Length(Redo[SpriteNum]);
     if N = 0 then Exit;
     SetLength(Undo[SpriteNum], Length(Undo[SpriteNum]) + 1);
-    Undo[SpriteNum][High(Undo[SpriteNum])] := Grid;
-    Grid := Redo[SpriteNum][N - 1];
+    Undo[SpriteNum][High(Undo[SpriteNum])] := MakeSnap;
+    ApplySnap(Redo[SpriteNum][N - 1]);
     SetLength(Redo[SpriteNum], N - 1);
     ClearSelection;
   end;
@@ -10051,8 +10418,8 @@ var
   var Row, Col: Integer;
   begin
     // After switching to multicolor make both halves of each pair equal.
-    for Row := 0 to SPR_H - 1 do
-      for Col := 0 to SPR_W - 1 do
+    for Row := 0 to GH - 1 do
+      for Col := 0 to GW - 1 do
         if (Col and 1) = 1 then
           Grid[Row, Col] := Grid[Row, Col - 1];
   end;
@@ -10062,7 +10429,17 @@ var
   procedure LoadSpriteState;
   begin
     Info := FSpriteEngine.GetSpriteInfo(SpriteNum);
-    Multicolor := Info.MulticolorMode;
+    Fmt := Info.Format;
+    if (Fmt < SPRFMT_HIRES) or (Fmt > SPRFMT_FULLCOLOR) then Fmt := SPRFMT_HIRES;
+    // Legacy sprites may carry MulticolorMode while Format is still 0.
+    if (Fmt = SPRFMT_HIRES) and Info.MulticolorMode then Fmt := SPRFMT_MULTICOLOR;
+    SyncFmtFlags;
+    GW := Info.Width; GH := Info.Height;
+    if GW < 1 then GW := DEFAULT_SPRITE_WIDTH;
+    if GH < 1 then GH := DEFAULT_SPRITE_HEIGHT;
+    if GW > MAX_DIM then GW := MAX_DIM;
+    if GH > MAX_DIM then GH := MAX_DIM;
+    AllocBuffers;
     ExpandX := Info.ScaleX >= 1.5;
     ExpandY := Info.ScaleY >= 1.5;
     if Info.Color.Mode = scmIndexed then SprColIdx := Info.Color.Index else SprColIdx := 1;
@@ -10082,9 +10459,87 @@ var
     if GridIsEmpty and (SprColIdx = 0) then SprColIdx := 1;
   end;
 
+  // Resize the editing grid to NewW x NewH, preserving the overlapping top-left
+  // region. Used by the size presets and the free-size entry.
+  procedure ResizeGrid(NewW, NewH: Integer);
+  var Old: TBytes; OldW, OldH, Row, Col: Integer;
+  begin
+    if NewW < 1 then NewW := 1; if NewW > MAX_DIM then NewW := MAX_DIM;
+    if NewH < 1 then NewH := 1; if NewH > MAX_DIM then NewH := MAX_DIM;
+    if (NewW = GW) and (NewH = GH) then Exit;
+    PushUndo;                       // the resize itself is undoable
+    Old := GridToBytes; OldW := GW; OldH := GH;
+    GW := NewW; GH := NewH;
+    AllocBuffers;
+    for Row := 0 to GH - 1 do
+      for Col := 0 to GW - 1 do
+        if (Row < OldH) and (Col < OldW) then Grid[Row, Col] := Old[Row * OldW + Col]
+        else Grid[Row, Col] := 0;
+    if CX >= GW then CX := GW - 1;
+    if CY >= GH then CY := GH - 1;
+    ClearSelection;
+  end;
+
+  // Paint the cell currently under the cursor with the active pen (Erase=True
+  // clears it to transparent). Shared by the keyboard and the mouse.
+  procedure PaintCurrent(Erase: Boolean);
+  begin
+    if Erase then begin SetCell(0); Exit; end;
+    if FullColor then SetCell(PenIdx)
+    else if Multicolor then SetCell(MulPen)
+    else SetCell(1);
+  end;
+
+  // Map a mouse pixel position to a grid cell, honouring the scroll offset.
+  // Returns False if outside the visible grid viewport.
+  function MouseToCell(MX, MY: Integer; out Cx2, Cy2: Integer): Boolean;
+  begin
+    Result := False;
+    if LCell <= 0 then Exit;
+    if (MX < LGX) or (MY < LGY) or (MX >= LGX + LViewW) or (MY >= LGY + LViewH) then Exit;
+    Cx2 := (MX - LGX) div LCell + LViewCol;
+    Cy2 := (MY - LGY) div LCell + LViewRow;
+    if (Cx2 < 0) or (Cx2 >= GW) or (Cy2 < 0) or (Cy2 >= GH) then Exit;
+    Result := True;
+  end;
+
+  // If the mouse is over a palette swatch, set the active pen colour (the
+  // full-color pen index, or the sprite colour for hi-res/multicolor) and return
+  // True. Used by the colour pop-up.
+  function MouseToPalette(MX, MY: Integer): Boolean;
+  var Col, Row: Integer;
+  begin
+    Result := False;
+    if not LPalShown or (LPalCell <= 0) then Exit;
+    if (MX < LPalX) or (MY < LPalY) then Exit;
+    Col := (MX - LPalX) div LPalCell;
+    Row := (MY - LPalY) div LPalCell;
+    if (Col < 0) or (Col > 15) or (Row < 0) or (Row > 15) then Exit;
+    if FullColor then PenIdx := Byte(Row * 16 + Col)
+    else SprColIdx := Byte(Row * 16 + Col);
+    Result := True;
+  end;
+
+  // Parse a free size entry like "32x32", "40,32" or "16 24" into NewW/NewH.
+  function ParseSize(const S: string; out NewW, NewH: Integer): Boolean;
+  var I, P: Integer;
+  begin
+    Result := False;
+    P := 0;
+    for I := 1 to Length(S) do
+      if S[I] in ['x', 'X', ',', ' ', '*'] then begin P := I; Break; end;
+    if P = 0 then Exit;
+    NewW := StrToIntDef(Trim(Copy(S, 1, P - 1)), 0);
+    NewH := StrToIntDef(Trim(Copy(S, P + 1, Length(S) - P)), 0);
+    Result := (NewW > 0) and (NewH > 0);
+  end;
+
 begin
   Result := False;
   if (SpriteNum < 1) or (SpriteNum > 8) then SpriteNum := 1;
+  PenIdx := 1;     // visible full-color default (palette index 1)
+  MulPen := 2;     // multicolor mouse pen = sprite colour
+  CX := 0; CY := 0;
 
   LoadSpriteState;
 
@@ -10097,6 +10552,16 @@ begin
   InputText := '';
   LastFile := '';
   OverwritePending := False;
+  MouseDrawing := False;
+  MouseErase := False;
+  ShowHelp := False;
+  LPalShown := False; LPalCell := 0; LCell := 0;
+  LViewCol := 0; LViewRow := 0; LViewW := 0; LViewH := 0;
+  UiMouseX := 0; UiMouseY := 0; UiClick := False;
+  UiAction := uaNone; UiArg := 0; PendingFmt := SPRFMT_HIRES;
+  SavedMsg := False; SizeFocus := 0; ColorPopup := False;
+  SizeWStr := IntToStr(GW); SizeHStr := IntToStr(GH);
+  Ui := TSedaiUI.Create(FVideoController.Renderer, FVideoController.Font);
   SDL_StartTextInput;   // so the filename field receives SDL_TEXTINPUT events
   DrawEditor;
   while Running do
@@ -10110,18 +10575,144 @@ begin
             Running := False;
           end;
         SDL_TEXTINPUT:
-          // While typing a filename, accept printable characters (not during the
-          // overwrite Y/N prompt).
-          if (InputMode <> 0) and (not OverwritePending) and
-             (Ord(Event.text.text[0]) >= 32) and (Length(InputText) < 48) then
+          // A focused size field takes digits only (max 3); otherwise a filename
+          // field (1/2) takes printable characters (not during the overwrite prompt).
+          if SizeFocus <> 0 then
+          begin
+            if Event.text.text[0] in ['0'..'9'] then
+            begin
+              if (SizeFocus = 1) and (Length(SizeWStr) < 3) then
+                SizeWStr := SizeWStr + Char(Event.text.text[0])
+              else if (SizeFocus = 2) and (Length(SizeHStr) < 3) then
+                SizeHStr := SizeHStr + Char(Event.text.text[0]);
+            end;
+          end
+          else if ((InputMode = 1) or (InputMode = 2)) and (not OverwritePending) and
+                  (Ord(Event.text.text[0]) >= 32) and (Length(InputText) < 48) then
             InputText := InputText + Char(Event.text.text[0]);
+        SDL_MOUSEBUTTONDOWN:
+          // The left-button edge feeds the widget panel (UiClick). The colour pop-up
+          // captures clicks while open; otherwise the grid paints (L) / erases (R) /
+          // middle just moves the cursor.
+          begin
+            MX := Event.button.x; MY := Event.button.y;
+            UiMouseX := MX; UiMouseY := MY;
+            if Event.button.button = SDL_BUTTON_LEFT then UiClick := True;
+            if ColorPopup then
+            begin
+              // Left click picks the swatch under the cursor (if any); any click closes.
+              if Event.button.button = SDL_BUTTON_LEFT then MouseToPalette(MX, MY);
+              ColorPopup := False;
+              UiClick := False;   // don't let this click also hit a panel widget
+            end
+            else if (InputMode = 0) and (not ShowHelp) and (not ConfirmSwitch) and (SizeFocus = 0) then
+            begin
+              if MouseToCell(MX, MY, NW, NH) then
+              begin
+                CX := NW; CY := NH;
+                if Multicolor then CX := CX and (not 1);
+                if Event.button.button = SDL_BUTTON_MIDDLE then
+                  MouseDrawing := False   // middle button: reposition the cursor only
+                else
+                begin
+                  MouseErase := (Event.button.button = SDL_BUTTON_RIGHT);
+                  MouseDrawing := True;
+                  PushUndo;               // one undo entry per mouse stroke
+                  PaintCurrent(MouseErase);
+                end;
+              end;
+            end;
+          end;
+        SDL_MOUSEBUTTONUP:
+          MouseDrawing := False;
+        SDL_MOUSEMOTION:
+          begin
+            UiMouseX := Event.motion.x; UiMouseY := Event.motion.y;
+            // Continue the current stroke while a button is held over the grid.
+            if MouseDrawing and (InputMode = 0) and (not ConfirmSwitch) and (not ShowHelp)
+               and (SizeFocus = 0) and (not ColorPopup) then
+              if MouseToCell(Event.motion.x, Event.motion.y, NW, NH) then
+              begin
+                CX := NW; CY := NH;
+                if Multicolor then CX := CX and (not 1);
+                PaintCurrent(MouseErase);
+              end;
+          end;
         SDL_KEYDOWN:
           begin
             Sym := Event.key.keysym.sym;
             Mods := Event.key.keysym.mod_;
             IsShiftArrow := ((Mods and KMOD_SHIFT) <> 0) and
               ((Sym = SDLK_LEFT) or (Sym = SDLK_RIGHT) or (Sym = SDLK_UP) or (Sym = SDLK_DOWN));
-            if InputMode <> 0 then
+            if ColorPopup then
+            begin
+              // While the colour pop-up is open, ESC cancels it; ignore other keys.
+              if Sym = SDLK_ESCAPE then ColorPopup := False;
+            end
+            else if ShowHelp then
+            begin
+              // Any of H / F1 / ESC closes the help overlay; ignore other keys so
+              // the help can't accidentally edit the sprite.
+              if (Sym = SDLK_h) or (Sym = SDLK_F1) or (Sym = SDLK_ESCAPE) then
+                ShowHelp := False;
+            end
+            else if SizeFocus <> 0 then
+            begin
+              // Editing a W/H size field (digits come via SDL_TEXTINPUT). TAB swaps
+              // field, RETURN applies, ESC cancels, Backspace deletes.
+              if (Sym = SDLK_RETURN) or (Sym = SDLK_KP_ENTER) then
+              begin
+                NW := StrToIntDef(SizeWStr, GW);
+                NH := StrToIntDef(SizeHStr, GH);
+                if NW < 1 then NW := 1 else if NW > 255 then NW := 255;
+                if NH < 1 then NH := 1 else if NH > 255 then NH := 255;
+                ResizeGrid(NW, NH);
+                SizeFocus := 0;
+              end
+              else if Sym = SDLK_ESCAPE then
+                SizeFocus := 0
+              else if Sym = SDLK_TAB then
+                begin if SizeFocus = 1 then SizeFocus := 2 else SizeFocus := 1; end
+              else if Sym = SDLK_BACKSPACE then
+              begin
+                if (SizeFocus = 1) and (Length(SizeWStr) > 0) then
+                  Delete(SizeWStr, Length(SizeWStr), 1)
+                else if (SizeFocus = 2) and (Length(SizeHStr) > 0) then
+                  Delete(SizeHStr, Length(SizeHStr), 1);
+              end;
+            end
+            else if InputMode = 3 then
+            begin
+              // Size preset menu: 1-8 apply a preset, RETURN switches to free
+              // entry, ESC cancels.
+              if (Sym >= SDLK_1) and (Sym <= SDLK_8) then
+              begin
+                KSel := Integer(Sym) - Integer(SDLK_1) + 1;
+                if KSel <= PRESET_COUNT then
+                begin
+                  ResizeGrid(PresetW[KSel], PresetH[KSel]);
+                  InputMode := 0;
+                end;
+              end
+              else if (Sym = SDLK_RETURN) or (Sym = SDLK_KP_ENTER) then
+                begin InputMode := 4; InputText := ''; end
+              else if Sym = SDLK_ESCAPE then
+                InputMode := 0;
+            end
+            else if InputMode = 4 then
+            begin
+              // Free size entry: type WxH, RETURN applies, ESC cancels.
+              if (Sym = SDLK_RETURN) or (Sym = SDLK_KP_ENTER) then
+              begin
+                if ParseSize(InputText, NW, NH) then ResizeGrid(NW, NH);
+                InputMode := 0; InputText := '';
+              end
+              else if Sym = SDLK_ESCAPE then
+                begin InputMode := 0; InputText := ''; end
+              else if Sym = SDLK_BACKSPACE then
+                if Length(InputText) > 0 then Delete(InputText, Length(InputText), 1);
+            end
+            else if InputMode <> 0 then
             begin
               if OverwritePending then
               begin
@@ -10172,13 +10763,15 @@ begin
             end
             else if ConfirmSwitch then
             begin
-              // Awaiting Y/N: switching hi-res<->multicolor clears the sprite, so
-              // confirm first (the bit reinterpretation would otherwise garble it).
+              // Awaiting Y/N: changing the format reinterprets the bits, so clear &
+              // confirm first. PendingFmt is the target (set by M or a format radio).
               if Sym = SDLK_y then
               begin
-                Multicolor := not Multicolor;
+                PushUndo;
+                Fmt := PendingFmt;
+                SyncFmtFlags;
                 ClearGrid;
-                if Multicolor then CX := CX and (not 1);
+                if Multicolor and ((CX and 1) = 1) then CX := CX and (not 1);
                 ConfirmSwitch := False;
               end
               else if (Sym = SDLK_n) or (Sym = SDLK_ESCAPE) then
@@ -10192,9 +10785,9 @@ begin
               if Sym = SDLK_LEFT then
                 begin if Multicolor then begin if CX >= 2 then CX := CX - 2; end else if CX > 0 then Dec(CX); end
               else if Sym = SDLK_RIGHT then
-                begin if Multicolor then begin if CX <= SPR_W - 3 then CX := CX + 2; end else if CX < SPR_W - 1 then Inc(CX); end
+                begin if Multicolor then begin if CX <= GW - 3 then CX := CX + 2; end else if CX < GW - 1 then Inc(CX); end
               else if Sym = SDLK_UP then begin if CY > 0 then Dec(CY); end
-              else if Sym = SDLK_DOWN then begin if CY < SPR_H - 1 then Inc(CY); end;
+              else if Sym = SDLK_DOWN then begin if CY < GH - 1 then Inc(CY); end;
               ApplyDragRect;
             end
             else if ((Mods and KMOD_CTRL) <> 0) and (Sym = SDLK_SPACE) then
@@ -10222,18 +10815,24 @@ begin
               end
             else if Sym = SDLK_RIGHT then
               begin
-                if Multicolor then begin if CX <= SPR_W - 3 then CX := CX + 2; end
-                else if CX < SPR_W - 1 then Inc(CX);
+                if Multicolor then begin if CX <= GW - 3 then CX := CX + 2; end
+                else if CX < GW - 1 then Inc(CX);
               end
             else if Sym = SDLK_UP then
               begin if CY > 0 then Dec(CY); end
             else if Sym = SDLK_DOWN then
-              begin if CY < SPR_H - 1 then Inc(CY); end
+              begin if CY < GH - 1 then Inc(CY); end
             else if Sym = SDLK_SPACE then
               begin
                 PushUndo;
-                // Hi-res: toggle on/off. Multicolor: cycle 0->1->2->3->0.
-                if Multicolor then
+                // Full-color: paint the pen (toggle off if it already matches).
+                // Multicolor: cycle 0->1->2->3->0. Hi-res: toggle on/off.
+                if FullColor then
+                begin
+                  if (Grid[CY, CX] = PenIdx) and (PenIdx <> 0) then SetCell(0)
+                  else SetCell(PenIdx);
+                end
+                else if Multicolor then
                   SetCell((Grid[CY, CX] + 1) and 3)
                 else if Grid[CY, CX] <> 0 then SetCell(0)
                 else SetCell(1);
@@ -10247,8 +10846,14 @@ begin
                 SpriteNum := Integer(Sym) - Integer(SDLK_1) + 1;
                 LoadSpriteState;
               end
+            else if (Sym = SDLK_h) or (Sym = SDLK_F1) then
+              ShowHelp := True   // H / F1: show the help overlay
             else if Sym = SDLK_m then
-              ConfirmSwitch := True   // ask before clearing & switching mode
+              begin PendingFmt := (Fmt + 1) mod 3; ConfirmSwitch := True; end   // M: next format (confirm)
+            else if Sym = SDLK_s then
+              SizeFocus := 1   // S: focus the W size field (presets are panel buttons)
+            else if Sym = SDLK_p then
+              MulPen := Byte((MulPen mod 3) + 1)   // P: cycle multicolor mouse pen
             else if Sym = SDLK_x then
               ExpandX := not ExpandX
             else if Sym = SDLK_y then
@@ -10262,9 +10867,9 @@ begin
             else if Sym = SDLK_DELETE then
               begin PushUndo; ClearGrid; end
             else if (Sym = SDLK_RETURN) or (Sym = SDLK_KP_ENTER) then
-              begin PackToSprite; Running := False; end
+              begin PackToSprite; SavedMsg := True; end   // RETURN: save (commit) WITHOUT exiting
             else if Sym = SDLK_ESCAPE then
-              Running := False;   // cancel without saving
+              Running := False;   // ESC: exit the editor
 
             // Any key that is not a SHIFT+arrow ends the rectangle drag, so the
             // next SHIFT+arrow begins a fresh anchor.
@@ -10275,9 +10880,37 @@ begin
     if Running then
     begin
       DrawEditor;
+      // Perform deferred widget actions (these need helpers declared after
+      // DrawEditor, so the panel records them and we run them here).
+      case UiAction of
+        uaPreset: ResizeGrid(PresetW[UiArg], PresetH[UiArg]);
+        uaSizeApply:
+          begin
+            NW := StrToIntDef(SizeWStr, GW);
+            NH := StrToIntDef(SizeHStr, GH);
+            if NW < 1 then NW := 1 else if NW > 255 then NW := 255;
+            if NH < 1 then NH := 1 else if NH > 255 then NH := 255;
+            ResizeGrid(NW, NH);
+            SizeFocus := 0;
+          end;
+        uaFmtApply:
+          begin
+            PushUndo;
+            Fmt := PendingFmt;
+            SyncFmtFlags;
+            ClearGrid;
+            if Multicolor and ((CX and 1) = 1) then CX := CX and (not 1);
+            ConfirmSwitch := False;
+          end;
+        uaFmtCancel: ConfirmSwitch := False;
+      end;
+      UiAction := uaNone;
+      UiClick := False;   // consume the click; don't reuse it next frame
       SDL_Delay(16);
     end;
   end;
+
+  Ui.Free;
 
   // Repaint the program's screen so the editor view is not left on screen.
   FLastVMRenderTick := SDL_GetTicks;

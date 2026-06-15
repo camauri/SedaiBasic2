@@ -28,6 +28,12 @@ const
   DEFAULT_SPRITE_WIDTH = 24;
   DEFAULT_SPRITE_HEIGHT = 21;
   DEFAULT_SPRITE_DATA_SIZE = 63;  // 24x21 / 8 * 3 = 63 bytes
+  MAX_SPRITE_DIM = 256;           // max width/height for arbitrary-size sprites
+
+  // Sprite data formats
+  SPRFMT_HIRES = 0;       // 1bpp: 1 colour + transparent (C128 hi-res)
+  SPRFMT_MULTICOLOR = 1;  // 2bpp: 3 colours + transparent, half horizontal res (C128)
+  SPRFMT_FULLCOLOR = 2;   // 8bpp: 1 byte/pixel = palette index 0-255 (0 = transparent)
 
   // Collision types (C128 compatible)
   COLLISION_SPRITE_SPRITE = 1;   // Sprite-to-sprite collision
@@ -47,6 +53,9 @@ const
   RSPRITE_EXPAND_X = 3;     // Horizontal expansion
   RSPRITE_EXPAND_Y = 4;     // Vertical expansion
   RSPRITE_MULTICOLOR = 5;   // Multicolor mode
+  RSPRITE_FORMAT = 6;       // Data format (0=hi-res, 1=multicolor, 2=full-color)
+  RSPRITE_WIDTH = 7;        // Width in pixels
+  RSPRITE_HEIGHT = 8;       // Height in pixels
 
   // RSPPOS attribute indices (C128 compatible)
   RSPPOS_X = 0;             // Current X position
@@ -91,7 +100,8 @@ type
     Color: TSpriteColor;          // Primary sprite color
     Priority: Integer;            // 0=in front of display, 1=behind display
     ScaleX, ScaleY: Double;       // Scale factors (1.0=normal, 2.0=double)
-    MulticolorMode: Boolean;      // Multicolor mode enabled
+    MulticolorMode: Boolean;      // Multicolor mode enabled (legacy; see Format)
+    Format: Integer;              // 0=hi-res(1bpp), 1=multicolor(2bpp), 2=full-color(8bpp)
 
     // Dimensions and image data
     Width, Height: Integer;       // Sprite dimensions in pixels
@@ -203,6 +213,7 @@ begin
   Sprite.ScaleX := 1.0;
   Sprite.ScaleY := 1.0;
   Sprite.MulticolorMode := False;
+  Sprite.Format := SPRFMT_HIRES;
   Sprite.Width := DEFAULT_SPRITE_WIDTH;
   Sprite.Height := DEFAULT_SPRITE_HEIGHT;
   SetLength(Sprite.Data, 0);

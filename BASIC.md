@@ -2,7 +2,7 @@
 
 ## Implementation Progress
 
-**186 / 207 commands implemented (90%)**
+**188 / 209 commands implemented (90%)**
 
 ```
 [█████████████████████████████████████████████····] 90%
@@ -228,7 +228,7 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `RGR` | ✓ | Return current graphic mode |
 | `RWINDOW` | ✓ | Return the size of the current window |
 
-## Sprite Management (12/12 - 100%)
+## Sprite Management (14/14 - 100%)
 
 | Command/Function | Status | Description |
 |------------------|--------|-------------|
@@ -240,6 +240,8 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `SPRSAV` | ✓ | Store a sprite data from a text string or vice versa |
 | `SPRSAVE` | ✓ | Save all sprite definitions to a JSON file (SedaiBasic extension) |
 | `SPRLOAD` | ✓ | Load all sprite definitions from a file: `SPRLOAD "file"[,usefilecolors]` (1 = use the file's colours; default 0 = keep current colours) (SedaiBasic extension) |
+| `SPRSIZE` | ✓ | Set sprite dimensions: `SPRSIZE n, width, height` (1..256 each; default 24×21 C128). SNES/console-style presets supported (SedaiBasic extension) |
+| `SPRFORM` | ✓ | Set sprite data format: `SPRFORM n, format` (0 = hi-res, 1 = multicolor, 2 = full-color 256-palette/8bpp) (SedaiBasic extension) |
 | `BUMP` | ✓ | Return sprite collision information |
 | `RSPCOLOR` | ✓ | Return sprite multicolor values |
 | `RSPPOS` | ✓ | Return the speed and position values of a sprite |
