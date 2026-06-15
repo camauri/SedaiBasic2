@@ -5,7 +5,7 @@
 **186 / 207 commands implemented (90%)**
 
 ```
-[████████████████████████████████████████████·····] 89%
+[█████████████████████████████████████████████····] 90%
 ```
 
 Legend: ✓ = Implemented | ✗ = Not implemented
@@ -228,7 +228,7 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `RGR` | ✓ | Return current graphic mode |
 | `RWINDOW` | ✓ | Return the size of the current window |
 
-## Sprite Management (9/10 - 90%)
+## Sprite Management (12/12 - 100%)
 
 | Command/Function | Status | Description |
 |------------------|--------|-------------|
