@@ -1574,6 +1574,9 @@ begin
 
  // === FLOW CONTROL - CONDITIONAL ===
  RegisterKeyword(kELSE, ttConditionalElse, 'ELSE statement', kcConditionalFlowControl);
+ // ELSEIF shares the ELSE token; the block-IF parser tells them apart by keyword
+ // value and lowers ELSEIF to a nested IF inside an ELSE.
+ RegisterKeyword(kELSEIF, ttConditionalElse, 'ELSEIF statement', kcConditionalFlowControl);
  RegisterKeyword(kIF,   ttConditionalIf,   'IF statement',   kcConditionalFlowControl);
  RegisterKeyword(kTHEN, ttConditionalThen, 'THEN statement', kcConditionalFlowControl);
 

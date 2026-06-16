@@ -100,8 +100,11 @@ type
     function ParseThenStatement: TASTNode;
     function ParseElseStatement: TASTNode;
     // Collect statements of a block-IF THEN/ELSE body (multi-line, FreeBASIC/QB
-    // style) into Parent, stopping at ELSE / ENDIF / end-of-file.
+    // style) into Parent, stopping at ELSE / ELSEIF / ENDIF / end-of-file.
     procedure ParseBlockIfBody(Parent: TASTNode);
+    // Parse the ELSEIF*/ELSE? tail of a block IF into IfNode (ELSEIF lowers to a
+    // nested IF inside an ELSE). Leaves the closing ENDIF for the caller.
+    procedure ParseBlockElseChain(IfNode: TASTNode);
     function ParseForStatement: TASTNode;
     function ParseDoStatement: TASTNode;
     function ParseGotoStatement: TASTNode;
@@ -950,8 +953,6 @@ var
  CurrentIf: TIfStackEntry;
  ThenNode: TASTNode;
  GotoNode: TASTNode;
- ElseNode: TASTNode;
- ElseTok: TLexerToken;
 begin
  Token := Context.CurrentToken;
  // *** VALIDATE THEN ***
@@ -993,17 +994,8 @@ begin
  //     here (so nesting just recurses); the IF is popped when ENDIF is consumed. ***
  if Context.CheckAny([ttEndOfLine]) then
  begin
-   ParseBlockIfBody(ThenNode);               // THEN body, up to ELSE / ENDIF / EOF
-   if Context.Check(ttConditionalElse) then
-   begin
-     ElseTok := Context.CurrentToken;
-     Context.Advance;                        // consume ELSE
-     ElseNode := TASTNode.Create(antElse, ElseTok);
-     if Assigned(CurrentIf.IfNode) then
-       CurrentIf.IfNode.AddChild(ElseNode);
-     ParseBlockIfBody(ElseNode);             // ELSE body, up to ENDIF / EOF
-     DoNodeCreated(ElseNode);
-   end;
+   ParseBlockIfBody(ThenNode);               // THEN body, up to ELSE/ELSEIF/ENDIF/EOF
+   ParseBlockElseChain(CurrentIf.IfNode);    // ELSEIF* / ELSE? tail
    if Context.Check(ttBlockEnd) then
      Context.Advance;                        // consume ENDIF
    if FValidationStacks.HasActiveIf then
@@ -1085,6 +1077,45 @@ begin
       Parent.AddChild(Statement)
     else if Context.CurrentIndex = PrevIdx then
       Break;                                            // no node and no progress
+  end;
+end;
+
+procedure TPackratParser.ParseBlockElseChain(IfNode: TASTNode);
+var
+  Tok: TLexerToken;
+  ElseNode, NestedIf, NestedThen, Cond: TASTNode;
+begin
+  // Current token is ELSE / ELSEIF (both ttConditionalElse) or ENDIF/EOF (nothing
+  // to do). ELSEIF lowers to:  ELSE { IF cond THEN <body> <further chain> }, so a
+  // single trailing ENDIF closes the whole chain (consumed by the caller).
+  if not Context.Check(ttConditionalElse) then Exit;
+  Tok := Context.CurrentToken;
+
+  if UpperCase(Tok.Value) = kELSEIF then
+  begin
+    Context.Advance;                                   // consume ELSEIF
+    ElseNode := TASTNode.Create(antElse, Tok);
+    if Assigned(IfNode) then IfNode.AddChild(ElseNode);
+    NestedIf := TASTNode.Create(antIf, Tok);
+    ElseNode.AddChild(NestedIf);
+    Cond := ParseExpression;                           // the ELSEIF condition
+    if Assigned(Cond) then NestedIf.AddChild(Cond);
+    if Context.Check(ttConditionalThen) then
+      Context.Advance;                                 // consume THEN
+    NestedThen := TASTNode.Create(antThen, Tok);
+    NestedIf.AddChild(NestedThen);
+    ParseBlockIfBody(NestedThen);                      // body up to ELSE/ELSEIF/ENDIF
+    ParseBlockElseChain(NestedIf);                     // recurse for further ELSEIF/ELSE
+    DoNodeCreated(NestedIf);
+    DoNodeCreated(ElseNode);
+  end
+  else
+  begin
+    Context.Advance;                                   // consume plain ELSE
+    ElseNode := TASTNode.Create(antElse, Tok);
+    if Assigned(IfNode) then IfNode.AddChild(ElseNode);
+    ParseBlockIfBody(ElseNode);                        // ELSE body up to ENDIF
+    DoNodeCreated(ElseNode);
   end;
 end;
 
