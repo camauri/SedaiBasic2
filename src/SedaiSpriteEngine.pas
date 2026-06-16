@@ -44,6 +44,8 @@ type
     procedure EnsureSpriteTexture(Num: Integer);
     function ResolveSpriteColor(const Color: TSpriteColor): TSDL_Color;
     function PackSpriteColor(const Color: TSpriteColor): UInt32;
+    // Fill a sprite's per-sprite palette from the current global palette.
+    procedure SeedSpritePalette(Num: Integer);
   public
     constructor Create(ARenderer: PSDL_Renderer; APaletteResolver: TPaletteResolverFunc);
     destructor Destroy; override;
@@ -82,6 +84,15 @@ type
     function GetSpriteAttribute(Num, Attr: Integer): Integer;
     procedure SetSpriteSize(Num: Integer; Width, Height: Integer);
     procedure SetSpriteFormat(Num: Integer; Format: Integer);
+    // Per-sprite palette (full-color sprites). A non-custom sprite resolves indices
+    // through the global palette; the first edit seeds the palette from the global
+    // one and flips it to custom. Entries are ABGR8888 ($AABBGGRR); index 0 stays
+    // transparent regardless of its stored colour.
+    function IsSpritePaletteCustom(Num: Integer): Boolean;
+    function GetSpritePaletteEntry(Num: Integer; Idx: Byte): UInt32;
+    procedure SetSpritePaletteEntry(Num: Integer; Idx: Byte; ColorABGR: UInt32);
+    procedure SetSpritePaletteAll(Num: Integer; const Pal: array of UInt32);
+    procedure ResetSpritePalette(Num: Integer);
     function GetSpriteWidth(Num: Integer): Integer;
     function GetSpriteHeight(Num: Integer): Integer;
     procedure SetSpriteData(Num: Integer; const Data: TBytes);
@@ -202,10 +213,15 @@ begin
   else if Fmt = SPRFMT_FULLCOLOR then
   begin
     // Full-color: 1 byte/pixel = palette index (0 = transparent). Colours baked via
-    // a 256-entry LUT so the whole sprite needs only 256 palette lookups.
+    // a 256-entry LUT so the whole sprite needs only 256 palette lookups. A custom
+    // sprite resolves through its own palette; otherwise through the global one.
     ColorLUT[0] := 0;
-    for I := 1 to 255 do
-      ColorLUT[I] := PackSpriteColor(MakeIndexedColor(Byte(I)));
+    if FSprites[Num].PaletteCustom then
+      for I := 1 to 255 do
+        ColorLUT[I] := FSprites[Num].Palette[I]
+    else
+      for I := 1 to 255 do
+        ColorLUT[I] := PackSpriteColor(MakeIndexedColor(Byte(I)));
     for Row := 0 to H - 1 do
       for Col := 0 to W - 1 do
         Pixels[Row * W + Col] := ColorLUT[FSprites[Num].Data[Row * W + Col]];
@@ -485,6 +501,67 @@ begin
   end;
 end;
 
+procedure TC128SpriteEngine.SeedSpritePalette(Num: Integer);
+var
+  I: Integer;
+begin
+  if (Num < 1) or (Num > MAX_SPRITES) then Exit;
+  // Capture the current global palette so an edit starts from the colours the
+  // sprite already shows (rather than from garbage/black entries).
+  for I := 0 to 255 do
+    FSprites[Num].Palette[I] := PackSpriteColor(MakeIndexedColor(Byte(I)));
+end;
+
+function TC128SpriteEngine.IsSpritePaletteCustom(Num: Integer): Boolean;
+begin
+  if (Num < 1) or (Num > MAX_SPRITES) then
+    Result := False
+  else
+    Result := FSprites[Num].PaletteCustom;
+end;
+
+function TC128SpriteEngine.GetSpritePaletteEntry(Num: Integer; Idx: Byte): UInt32;
+begin
+  if (Num < 1) or (Num > MAX_SPRITES) then
+    Result := 0
+  else if FSprites[Num].PaletteCustom then
+    Result := FSprites[Num].Palette[Idx]
+  else
+    Result := PackSpriteColor(MakeIndexedColor(Idx));   // effective = global palette
+end;
+
+procedure TC128SpriteEngine.SetSpritePaletteEntry(Num: Integer; Idx: Byte; ColorABGR: UInt32);
+begin
+  if (Num < 1) or (Num > MAX_SPRITES) then Exit;
+  if not FSprites[Num].PaletteCustom then
+  begin
+    SeedSpritePalette(Num);              // keep the other entries as they look now
+    FSprites[Num].PaletteCustom := True;
+  end;
+  FSprites[Num].Palette[Idx] := ColorABGR;
+  FSpriteTextureDirty[Num] := True;
+end;
+
+procedure TC128SpriteEngine.SetSpritePaletteAll(Num: Integer; const Pal: array of UInt32);
+var
+  I, N: Integer;
+begin
+  if (Num < 1) or (Num > MAX_SPRITES) then Exit;
+  N := Length(Pal);
+  if N > 256 then N := 256;
+  for I := 0 to N - 1 do
+    FSprites[Num].Palette[I] := Pal[I];
+  FSprites[Num].PaletteCustom := True;
+  FSpriteTextureDirty[Num] := True;
+end;
+
+procedure TC128SpriteEngine.ResetSpritePalette(Num: Integer);
+begin
+  if (Num < 1) or (Num > MAX_SPRITES) then Exit;
+  FSprites[Num].PaletteCustom := False;   // back to the global palette
+  FSpriteTextureDirty[Num] := True;
+end;
+
 function TC128SpriteEngine.GetSpriteWidth(Num: Integer): Integer;
 begin
   if (Num < 1) or (Num > MAX_SPRITES) then
@@ -733,7 +810,7 @@ end;
 function TC128SpriteEngine.SaveSpritesToJSON(const FileName: string): Boolean;
 var
   Root, SprObj: TJSONObject;
-  Arr, DataArr: TJSONArray;
+  Arr, DataArr, PalArr: TJSONArray;
   I, J: Integer;
   SL: TStringList;
   Fn: string;
@@ -765,6 +842,17 @@ begin
       for J := 0 to Length(FSprites[I].Data) - 1 do
         DataArr.Add(Integer(FSprites[I].Data[J]));
       SprObj.Add('data', DataArr);
+      // Per-sprite palette: only stored when customised (retro-compat: absent =
+      // resolve through the global palette). ABGR values need 32 bits, so they go
+      // out as Int64 (an opaque colour like $FF... overflows a signed Int32).
+      if FSprites[I].PaletteCustom then
+      begin
+        SprObj.Add('palettecustom', 1);
+        PalArr := TJSONArray.Create;
+        for J := 0 to 255 do
+          PalArr.Add(Int64(FSprites[I].Palette[J]));
+        SprObj.Add('palette', PalArr);
+      end;
       Arr.Add(SprObj);
     end;
     Root.Add('sprites', Arr);
@@ -790,7 +878,7 @@ function TC128SpriteEngine.LoadSpritesFromJSON(const FileName: string; LoadColor
 var
   JData: TJSONData;
   Root, SprObj: TJSONObject;
-  Arr, DataArr: TJSONArray;
+  Arr, DataArr, PalArr: TJSONArray;
   SL: TStringList;
   I, J, Num: Integer;
   B: TBytes;
@@ -853,6 +941,19 @@ begin
             B[J] := Byte(DataArr.Integers[J]);
           FSprites[Num].Data := B;
         end;
+
+        // Per-sprite palette (retro-compat: absent => non-custom = global palette).
+        PalArr := SprObj.Get('palette', TJSONArray(nil));
+        if (SprObj.Get('palettecustom', 0) <> 0) and (PalArr <> nil) then
+        begin
+          FSprites[Num].PaletteCustom := True;
+          for J := 0 to PalArr.Count - 1 do
+            if J <= 255 then
+              FSprites[Num].Palette[J] := UInt32(PalArr.Items[J].AsInt64);
+        end
+        else
+          FSprites[Num].PaletteCustom := False;
+
         FSpriteTextureDirty[Num] := True;
       end;
     Result := True;

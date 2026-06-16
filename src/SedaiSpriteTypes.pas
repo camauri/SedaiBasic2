@@ -107,6 +107,14 @@ type
     Width, Height: Integer;       // Sprite dimensions in pixels
     Data: TBytes;                 // Sprite image data
 
+    // Per-sprite palette (SNES/GBA-style): full-color (8bpp) sprites resolve their
+    // pixel indices through this 256-entry palette instead of the global one.
+    // ABGR8888 ($AABBGGRR) to match SDL_PIXELFORMAT_ABGR8888 and the global palette.
+    // PaletteCustom = False keeps the legacy behaviour (resolve via the global palette);
+    // it flips to True once the program/editor customises this sprite's palette.
+    Palette: array[0..255] of UInt32;
+    PaletteCustom: Boolean;
+
     // Automatic motion
     Motion: TSpriteMotion;
 
@@ -204,6 +212,8 @@ begin
 end;
 
 procedure InitSpriteInfo(var Sprite: TSpriteInfo);
+var
+  I: Integer;
 begin
   Sprite.Enabled := False;
   Sprite.X := 0;
@@ -217,6 +227,12 @@ begin
   Sprite.Width := DEFAULT_SPRITE_WIDTH;
   Sprite.Height := DEFAULT_SPRITE_HEIGHT;
   SetLength(Sprite.Data, 0);
+  // Default palette: an opaque grayscale ramp. It is only used once the sprite
+  // becomes custom (PaletteCustom = True); until then the engine resolves indices
+  // through the global palette, so this is just a sane non-garbage starting point.
+  Sprite.PaletteCustom := False;
+  for I := 0 to 255 do
+    Sprite.Palette[I] := $FF000000 or (UInt32(I) shl 16) or (UInt32(I) shl 8) or UInt32(I);
   Sprite.Motion.Active := False;
   Sprite.Motion.Angle := 0;
   Sprite.Motion.Speed := 0;

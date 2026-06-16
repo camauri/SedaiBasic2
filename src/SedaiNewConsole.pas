@@ -9631,6 +9631,16 @@ var
   SizeFocus: Integer;                // editable size field: 0 none, 1 = W, 2 = H
   SizeWStr, SizeHStr: string;        // the W / H size fields being shown / typed
   ColorPopup: Boolean;               // modal colour-picker pop-up is open
+  // Per-sprite working palette (full-color). Seeded from the engine when a sprite
+  // is loaded; edited via the pop-up; pushed back to the engine on commit so each
+  // sprite carries its own palette (SNES/GBA-style). EdPalCustom tracks whether it
+  // differs from the global palette (only then is it stored).
+  EdPal: array[0..255] of UInt32;    // ABGR8888 ($AABBGGRR)
+  EdPalCustom: Boolean;
+  // Pop-up layout captured by DrawEditor, used to hit-test pop-up clicks.
+  LPopX, LPopY, LPopW, LPopH: Integer;       // pop-up outer rect
+  LPalRgbX, LPalRgbY, LPalRgbBtn: Integer;   // RGB stepper block origin + button size
+  LPalPreX, LPalPreY, LPalPreW, LPalPreH: Integer; // preset/reset button row geometry
 
   function ClampByte16(V: Integer): Byte;
   begin
@@ -9775,6 +9785,11 @@ var
       ScX, ScY, Ord(Multicolor));
     if Multicolor then
       FSpriteEngine.SetSpriteMulticolors(MakeIndexedColor(MC1Idx), MakeIndexedColor(MC2Idx));
+
+    // Commit this sprite's per-sprite palette (full-color). If it was never edited
+    // away from the global palette, keep it non-custom so it tracks SETCOLOR/PLOAD.
+    if EdPalCustom then FSpriteEngine.SetSpritePaletteAll(SpriteNum, EdPal)
+    else FSpriteEngine.ResetSpritePalette(SpriteNum);
   end;
 
   procedure SetCell(V: Byte);
@@ -9784,11 +9799,101 @@ var
       Grid[CY, CX xor 1] := V;   // paint both halves of the multicolor pair
   end;
 
+  // ABGR8888 ($AABBGGRR) -> TSDL_Color, for the working full-color palette.
+  function ABGRToSDL(C: UInt32): TSDL_Color;
+  begin
+    Result.r := C and $FF;
+    Result.g := (C shr 8) and $FF;
+    Result.b := (C shr 16) and $FF;
+    Result.a := 255;
+  end;
+
+  // Pack R,G,B into an opaque ABGR8888 texel (alpha forced to 255).
+  function RGBToABGR(Rr, Gg, Bb: Integer): UInt32;
+  begin
+    Result := $FF000000 or (UInt32(Bb and $FF) shl 16) or
+              (UInt32(Gg and $FF) shl 8) or UInt32(Rr and $FF);
+  end;
+
+  // Set one working-palette entry and mark the palette as customised.
+  procedure SetEdPalEntry(Idx: Byte; C: UInt32);
+  begin
+    EdPal[Idx] := C;
+    EdPalCustom := True;
+  end;
+
+  // Nudge one channel (0=R,1=G,2=B) of the current pen colour by Delta, clamped.
+  procedure AdjustPenChannel(Channel, Delta: Integer);
+  var
+    Rr, Gg, Bb: Integer;
+    C: UInt32;
+  begin
+    C := EdPal[PenIdx];
+    Rr := C and $FF; Gg := (C shr 8) and $FF; Bb := (C shr 16) and $FF;
+    case Channel of
+      0: Rr := Rr + Delta;
+      1: Gg := Gg + Delta;
+      2: Bb := Bb + Delta;
+    end;
+    if Rr < 0 then Rr := 0 else if Rr > 255 then Rr := 255;
+    if Gg < 0 then Gg := 0 else if Gg > 255 then Gg := 255;
+    if Bb < 0 then Bb := 0 else if Bb > 255 then Bb := 255;
+    SetEdPalEntry(PenIdx, RGBToABGR(Rr, Gg, Bb));
+  end;
+
+  // Load a preset into the working palette. Kind: 0=C64-16 (repeated), 1=VGA-256,
+  // 2=grayscale ramp, 3=reset to the program's global palette.
+  procedure LoadPalettePreset(Kind: Integer);
+  var
+    I, Rr, Gg, Bb, H: Integer;
+    SC: TSDL_Color;
+  begin
+    case Kind of
+      0:  // C64 16-colour palette, repeated across 0..255 (entry 0 stays transparent)
+        for I := 0 to 255 do
+        begin
+          SC := FVideoController.PaletteIndexToSDLColor(Byte(I and 15));
+          EdPal[I] := RGBToABGR(SC.r, SC.g, SC.b);
+        end;
+      1:  // Classic VGA-style 6x6x6 colour cube + grayscale tail
+        for I := 0 to 255 do
+        begin
+          if I < 216 then
+          begin
+            Rr := ((I div 36) mod 6) * 51;
+            Gg := ((I div 6) mod 6) * 51;
+            Bb := (I mod 6) * 51;
+          end
+          else
+          begin
+            H := ((I - 216) * 255) div 39;
+            Rr := H; Gg := H; Bb := H;
+          end;
+          EdPal[I] := RGBToABGR(Rr, Gg, Bb);
+        end;
+      2:  // Linear grayscale ramp
+        for I := 0 to 255 do
+          EdPal[I] := RGBToABGR(I, I, I);
+    end;
+    if Kind = 3 then
+    begin
+      // Reset: re-seed from the program's global palette and drop the custom flag.
+      for I := 0 to 255 do
+      begin
+        SC := FVideoController.PaletteIndexToSDLColor(Byte(I));
+        EdPal[I] := RGBToABGR(SC.r, SC.g, SC.b);
+      end;
+      EdPalCustom := False;
+    end
+    else
+      EdPalCustom := True;
+  end;
+
   function CellColor(V: Byte): TSDL_Color;
   begin
     if FullColor then
     begin
-      if V <> 0 then Result := FVideoController.PaletteIndexToSDLColor(V)
+      if V <> 0 then Result := ABGRToSDL(EdPal[V])
       else begin Result.r := 32; Result.g := 32; Result.b := 32; Result.a := 255; end;
     end
     else if Multicolor then
@@ -9838,7 +9943,7 @@ var
       'SPACE         paint: hi-res toggle / MC cycle / full-color pen',
       '0             erase the pixel under the cursor',
       'DEL           clear the whole grid',
-      'C  [  ]       step the pen colour ([Pick...] opens the palette pop-up)',
+      'C  [  ]       step the pen colour ([Pick...] = palette + RGB/preset editor)',
       '1-8           switch the sprite being edited',
       '',
       'CHANGE SIZE (1..255)',
@@ -9849,7 +9954,7 @@ var
       '',
       'MOUSE         L paint   R erase   MID move cursor (no paint)',
       '              drag to draw a stroke (one undo per stroke)',
-      '              full-color: click the palette to pick the pen',
+      '              full-color: pop-up = THIS sprite''s palette (per-sprite);',
       'P             cycle the multicolor mouse pen',
       '',
       'Shift+Arrows  rectangular selection (+Ctrl adds an area)',
@@ -9890,9 +9995,21 @@ var
     Ci, K, HelpY, Py, RH, RStep, RUnit: Integer;
     GVX, GVY, GVW, GVH, VisCols, VisRows, PvW, PvH: Integer;
     PopX, PopY, PopW, PopH, CurIdx: Integer;
+    Ch, Bx, By, Vv, ExtraH, GridBot: Integer;
     Rect: TSDL_Rect;
     C: TSDL_Color;
-    ModeStr: string;
+    ModeStr, ChLbl: string;
+
+    // Draw a small labelled button inside the pop-up (rendering only; clicks are
+    // hit-tested separately in PopupClick).
+    procedure PopBtn(Bx2, By2, Bw, Bh: Integer; const Cap: string);
+    var Rc: TSDL_Rect;
+    begin
+      Rc.x := Bx2; Rc.y := By2; Rc.w := Bw; Rc.h := Bh;
+      SDL_SetRenderDrawColor(R, 60, 60, 78, 255); SDL_RenderFillRect(R, @Rc);
+      SDL_SetRenderDrawColor(R, 150, 150, 175, 255); SDL_RenderDrawRect(R, @Rc);
+      DrawStr(Bx2 + 5, By2 + 2, Cap);
+    end;
   begin
     R := FVideoController.Renderer;
     if R = nil then Exit;
@@ -10119,7 +10236,8 @@ var
     if Ui.Button(PvX + 72, Py - 11, 26, 22, '<') then CycleColor(-1);
     Ui.CaptionC(PvX + 100, Py, 40, IntToStr(CurIdx));
     if Ui.Button(PvX + 142, Py - 11, 26, 22, '>') then CycleColor(1);
-    C := FVideoController.PaletteIndexToSDLColor(CurIdx);
+    if FullColor then C := ABGRToSDL(EdPal[CurIdx])
+    else C := FVideoController.PaletteIndexToSDLColor(CurIdx);
     LSwatchX := PvX + 174; LSwatchY := Py - 10;   // remember: the pop-up anchors here
     Rect.x := LSwatchX; Rect.y := LSwatchY; Rect.w := 20; Rect.h := 20;
     SDL_SetRenderDrawColor(R, C.r, C.g, C.b, 255); SDL_RenderFillRect(R, @Rect);
@@ -10170,14 +10288,18 @@ var
     Ui.EndFrame;
 
     // ---- Colour pop-up (modal): 16x16 palette swatches, anchored beside the pen
-    // swatch. The palette is centred in the window with a uniform margin; the
-    // current colour gets a thick, high-contrast marker.
+    // swatch. For full-color sprites the pop-up shows THIS sprite's palette (EdPal)
+    // and adds an RGB editor + preset buttons so each sprite owns its colours.
+    // Hi-res / multicolor sprites use the global palette, so the picker just shows
+    // it and picks the sprite colour index.
     LPalShown := False;
     if ColorPopup then
     begin
       LPalCell := 18;
+      // Extra panel height (RGB steppers + preset row + close) only in full-color.
+      if FullColor then ExtraH := 3 * 26 + 8 + 26 + 8 + 26 + 8 else ExtraH := 0;
       PopW := 16 * LPalCell + 16;       // 8px uniform margin on each side
-      PopH := 16 * LPalCell + 16;
+      PopH := 16 * LPalCell + 16 + ExtraH;
       // Anchor to the left of the pen swatch; clamp inside the screen.
       PopX := LSwatchX - PopW - 8;
       if PopX < 6 then PopX := LSwatchX + 28;
@@ -10186,6 +10308,7 @@ var
       if PopY + PopH > WH - 6 then PopY := WH - 6 - PopH;
       if PopX < 6 then PopX := 6;
       if PopY < 6 then PopY := 6;
+      LPopX := PopX; LPopY := PopY; LPopW := PopW; LPopH := PopH;
       Rect.x := PopX; Rect.y := PopY; Rect.w := PopW; Rect.h := PopH;
       SDL_SetRenderDrawColor(R, 20, 20, 28, 255); SDL_RenderFillRect(R, @Rect);
       SDL_SetRenderDrawColor(R, 180, 180, 210, 255); SDL_RenderDrawRect(R, @Rect);
@@ -10194,7 +10317,8 @@ var
       LPalShown := True;
       for Ci := 0 to 255 do
       begin
-        C := FVideoController.PaletteIndexToSDLColor(Ci);
+        if FullColor then C := ABGRToSDL(EdPal[Ci])
+        else C := FVideoController.PaletteIndexToSDLColor(Ci);
         SDL_SetRenderDrawColor(R, C.r, C.g, C.b, 255);
         Rect.x := LPalX + (Ci mod 16) * LPalCell;
         Rect.y := LPalY + (Ci div 16) * LPalCell;
@@ -10204,16 +10328,53 @@ var
       // Evident selection marker: a 2px white frame with a black inner edge so it
       // stands out against any swatch colour.
       if FullColor then CurIdx := PenIdx else CurIdx := SprColIdx;
-      PopX := LPalX + (CurIdx mod 16) * LPalCell;   // reuse PopX/PopY as swatch x/y
-      PopY := LPalY + (CurIdx div 16) * LPalCell;
+      Bx := LPalX + (CurIdx mod 16) * LPalCell;
+      By := LPalY + (CurIdx div 16) * LPalCell;
       SDL_SetRenderDrawColor(R, 0, 0, 0, 255);
-      Rect.x := PopX - 1; Rect.y := PopY - 1; Rect.w := LPalCell + 1; Rect.h := LPalCell + 1;
+      Rect.x := Bx - 1; Rect.y := By - 1; Rect.w := LPalCell + 1; Rect.h := LPalCell + 1;
       SDL_RenderDrawRect(R, @Rect);
       SDL_SetRenderDrawColor(R, 255, 255, 255, 255);
-      Rect.x := PopX - 2; Rect.y := PopY - 2; Rect.w := LPalCell + 3; Rect.h := LPalCell + 3;
+      Rect.x := Bx - 2; Rect.y := By - 2; Rect.w := LPalCell + 3; Rect.h := LPalCell + 3;
       SDL_RenderDrawRect(R, @Rect);
-      Rect.x := PopX - 3; Rect.y := PopY - 3; Rect.w := LPalCell + 5; Rect.h := LPalCell + 5;
+      Rect.x := Bx - 3; Rect.y := By - 3; Rect.w := LPalCell + 5; Rect.h := LPalCell + 5;
       SDL_RenderDrawRect(R, @Rect);
+
+      // Full-color: RGB editor for the current pen entry + palette presets.
+      if FullColor then
+      begin
+        GridBot := LPalY + 16 * LPalCell;
+        LPalRgbBtn := 22;
+        LPalRgbX := PopX + 8;
+        LPalRgbY := GridBot + 8;
+        // Current entry preview swatch (right of the RGB rows).
+        C := ABGRToSDL(EdPal[PenIdx]);
+        Rect.x := LPalRgbX + 168; Rect.y := LPalRgbY; Rect.w := 3 * 26 + 18; Rect.h := 3 * 26 - 4;
+        SDL_SetRenderDrawColor(R, C.r, C.g, C.b, 255); SDL_RenderFillRect(R, @Rect);
+        SDL_SetRenderDrawColor(R, 180, 180, 200, 255); SDL_RenderDrawRect(R, @Rect);
+        for Ch := 0 to 2 do
+        begin
+          By := LPalRgbY + Ch * 26;
+          case Ch of
+            0: Vv := EdPal[PenIdx] and $FF;
+            1: Vv := (EdPal[PenIdx] shr 8) and $FF;
+          else Vv := (EdPal[PenIdx] shr 16) and $FF;
+          end;
+          if Ch = 0 then ChLbl := 'R' else if Ch = 1 then ChLbl := 'G' else ChLbl := 'B';
+          DrawStr(LPalRgbX, By + 2, ChLbl);
+          PopBtn(LPalRgbX + 18, By, LPalRgbBtn, LPalRgbBtn, '-');
+          DrawStr(LPalRgbX + 48, By + 2, Format('%3d', [Vv]));
+          PopBtn(LPalRgbX + 96, By, LPalRgbBtn, LPalRgbBtn, '+');
+        end;
+        // Preset buttons: C64 / VGA / Gray / Reset.
+        LPalPreX := PopX + 8; LPalPreY := GridBot + 8 + 3 * 26 + 8;
+        LPalPreW := 66; LPalPreH := 22;
+        PopBtn(LPalPreX,             LPalPreY, LPalPreW, LPalPreH, 'C64');
+        PopBtn(LPalPreX + 70,        LPalPreY, LPalPreW, LPalPreH, 'VGA');
+        PopBtn(LPalPreX + 140,       LPalPreY, LPalPreW, LPalPreH, 'Gray');
+        PopBtn(LPalPreX + 210,       LPalPreY, LPalPreW, LPalPreH, 'Reset');
+        // Close button (full-width-ish) on the last row.
+        PopBtn(PopX + 8, LPalPreY + 26, PopW - 16, 22, 'Close');
+      end;
     end;
 
     SDL_RenderPresent(R);
@@ -10427,6 +10588,8 @@ var
   // Load the editing state for the current SpriteNum (also used when switching
   // sprites with the 1-8 keys). Resets the cursor and unpacks the shape.
   procedure LoadSpriteState;
+  var
+    PI: Integer;
   begin
     Info := FSpriteEngine.GetSpriteInfo(SpriteNum);
     Fmt := Info.Format;
@@ -10451,6 +10614,11 @@ var
     if SprColIdx = 0 then SprColIdx := 1;        // a visible default
     if MC1Idx = 0 then MC1Idx := 10;
     if MC2Idx = 0 then MC2Idx := 12;
+    // Seed the working full-color palette from the engine's effective palette for
+    // this sprite (its own if custom, otherwise the global one).
+    EdPalCustom := FSpriteEngine.IsSpritePaletteCustom(SpriteNum);
+    for PI := 0 to 255 do
+      EdPal[PI] := FSpriteEngine.GetSpritePaletteEntry(SpriteNum, Byte(PI));
     CX := 0; CY := 0;
     UnpackFromSprite;
     ClearSelection;   // a different sprite: drop any active selection
@@ -10520,6 +10688,43 @@ var
     Result := True;
   end;
 
+  // Handle a left click inside the colour pop-up. Returns True if the click landed
+  // inside the pop-up (it stays open), False if it fell outside (caller closes it).
+  // Routes the click to the swatch grid, the RGB steppers, the preset buttons or
+  // the Close button.
+  function PopupClick(MX, MY: Integer): Boolean;
+  var Cc, By2: Integer;
+  begin
+    Result := True;
+    if (MX < LPopX) or (MY < LPopY) or (MX >= LPopX + LPopW) or (MY >= LPopY + LPopH) then
+    begin Result := False; Exit; end;
+    if MouseToPalette(MX, MY) then Exit;     // picked a swatch
+    if not FullColor then Exit;              // hi-res / multicolor: swatch grid only
+    // RGB steppers: [-] at +18, [+] at +96, each LPalRgbBtn wide.
+    for Cc := 0 to 2 do
+    begin
+      By2 := LPalRgbY + Cc * 26;
+      if (MY >= By2) and (MY < By2 + LPalRgbBtn) then
+      begin
+        if (MX >= LPalRgbX + 18) and (MX < LPalRgbX + 18 + LPalRgbBtn) then
+          begin AdjustPenChannel(Cc, -16); Exit; end;
+        if (MX >= LPalRgbX + 96) and (MX < LPalRgbX + 96 + LPalRgbBtn) then
+          begin AdjustPenChannel(Cc, 16); Exit; end;
+      end;
+    end;
+    // Preset buttons row.
+    if (MY >= LPalPreY) and (MY < LPalPreY + LPalPreH) then
+    begin
+      if (MX >= LPalPreX)       and (MX < LPalPreX + LPalPreW)       then begin LoadPalettePreset(0); Exit; end;
+      if (MX >= LPalPreX + 70)  and (MX < LPalPreX + 70 + LPalPreW)  then begin LoadPalettePreset(1); Exit; end;
+      if (MX >= LPalPreX + 140) and (MX < LPalPreX + 140 + LPalPreW) then begin LoadPalettePreset(2); Exit; end;
+      if (MX >= LPalPreX + 210) and (MX < LPalPreX + 210 + LPalPreW) then begin LoadPalettePreset(3); Exit; end;
+    end;
+    // Close button (row below the presets).
+    if (MY >= LPalPreY + 26) and (MY < LPalPreY + 26 + 22) then
+      ColorPopup := False;
+  end;
+
   // Parse a free size entry like "32x32", "40,32" or "16 24" into NewW/NewH.
   function ParseSize(const S: string; out NewW, NewH: Integer): Boolean;
   var I, P: Integer;
@@ -10556,6 +10761,9 @@ begin
   MouseErase := False;
   ShowHelp := False;
   LPalShown := False; LPalCell := 0; LCell := 0;
+  LPopX := 0; LPopY := 0; LPopW := 0; LPopH := 0;
+  LPalRgbX := 0; LPalRgbY := 0; LPalRgbBtn := 22;
+  LPalPreX := 0; LPalPreY := 0; LPalPreW := 0; LPalPreH := 0;
   LViewCol := 0; LViewRow := 0; LViewW := 0; LViewH := 0;
   UiMouseX := 0; UiMouseY := 0; UiClick := False;
   UiAction := uaNone; UiArg := 0; PendingFmt := SPRFMT_HIRES;
@@ -10600,9 +10808,14 @@ begin
             if Event.button.button = SDL_BUTTON_LEFT then UiClick := True;
             if ColorPopup then
             begin
-              // Left click picks the swatch under the cursor (if any); any click closes.
-              if Event.button.button = SDL_BUTTON_LEFT then MouseToPalette(MX, MY);
-              ColorPopup := False;
+              // Inside the pop-up: route the click (swatch / RGB / preset / close);
+              // a click outside the pop-up, or any non-left button, closes it.
+              if Event.button.button = SDL_BUTTON_LEFT then
+              begin
+                if not PopupClick(MX, MY) then ColorPopup := False;
+              end
+              else
+                ColorPopup := False;
               UiClick := False;   // don't let this click also hit a panel widget
             end
             else if (InputMode = 0) and (not ShowHelp) and (not ConfirmSwitch) and (SizeFocus = 0) then
