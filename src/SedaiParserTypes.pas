@@ -38,6 +38,7 @@ type
     antLiteral,           // Literal values (numbers, strings)
     antIdentifier,        // Variable names, labels
     antLineNumber,        // BASIC line numbers
+    antLabel,             // Named label definition ("name:") for GOTO/GOSUB targets
     antSpecialVariable,   // Special variables (TI, TI$, DT$, etc.)
 
     // === FUNCTIONS ===

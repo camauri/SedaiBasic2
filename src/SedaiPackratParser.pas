@@ -562,16 +562,29 @@ begin
     // === IDENTIFIERS ===
     ttIdentifier:
       begin
-        // Prova SEMPRE assignment prima per identifier
-        SavedIndex := Context.CurrentIndex;
-
-        Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
-
-        if not Assigned(Result) then
+        // Named label "name:" (FreeBASIC/QB): an identifier immediately followed by
+        // ':' defines a GOTO/GOSUB target. (Assignments are "name = ...", calls are
+        // "name(...)"/"name arg", so the ':' is unambiguous here.)
+        if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttSeparStmt) then
         begin
-          // Assignment fallito, riprova come expression
-          Context.CurrentIndex := SavedIndex;
-          Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+          Result := TASTNode.CreateWithValue(antLabel, Token.Value, Token);
+          Context.Advance;   // consume the identifier
+          Context.Advance;   // consume ':'
+          DoNodeCreated(Result);
+        end
+        else
+        begin
+          // Prova SEMPRE assignment prima per identifier
+          SavedIndex := Context.CurrentIndex;
+
+          Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
+
+          if not Assigned(Result) then
+          begin
+            // Assignment fallito, riprova come expression
+            Context.CurrentIndex := SavedIndex;
+            Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+          end;
         end;
       end;
 

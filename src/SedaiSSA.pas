@@ -95,6 +95,9 @@ type
     procedure ProcessGoto(Node: TASTNode);
     procedure ProcessGosub(Node: TASTNode);
     procedure ProcessOnGoto(Node: TASTNode);
+    // Block label for a GOTO/GOSUB target: 'LABEL_<NAME>' for a named label
+    // (identifier, case-insensitive), 'LINE_<n>' for a classic line number.
+    function JumpLabelName(LabelNode: TASTNode): string;
     procedure ProcessOnGosub(Node: TASTNode);
     procedure ProcessBox(Node: TASTNode);
     procedure ProcessCircle(Node: TASTNode);
@@ -3757,6 +3760,14 @@ begin
   end;
 end;
 
+function TSSAGenerator.JumpLabelName(LabelNode: TASTNode): string;
+begin
+  if LabelNode.NodeType = antIdentifier then
+    Result := 'LABEL_' + UpperCase(VarToStr(LabelNode.Value))   // named label (case-insensitive)
+  else
+    Result := 'LINE_' + VarToStr(LabelNode.Value);              // classic line number
+end;
+
 procedure TSSAGenerator.ProcessGoto(Node: TASTNode);
 var
   LabelNode: TASTNode;
@@ -3765,7 +3776,7 @@ var
 begin
   if Node.ChildCount = 0 then Exit;
   LabelNode := Node.GetChild(0);
-  LabelName := 'LINE_' + VarToStr(LabelNode.Value);
+  LabelName := JumpLabelName(LabelNode);
 
   // PHASE 3 TIER 3: Save current block before jump
   SourceBlock := FCurrentBlock;
@@ -3798,7 +3809,7 @@ var
 begin
   if Node.ChildCount = 0 then Exit;
   LabelNode := Node.GetChild(0);
-  LabelName := 'LINE_' + VarToStr(LabelNode.Value);
+  LabelName := JumpLabelName(LabelNode);
 
   // PHASE 3 TIER 3: Save current block before call
   SourceBlock := FCurrentBlock;
@@ -3853,7 +3864,7 @@ begin
   for i := 0 to TargetListNode.ChildCount - 1 do
   begin
     TargetNode := TargetListNode.GetChild(i);
-    LabelName := 'LINE_' + VarToStr(TargetNode.Value);
+    LabelName := JumpLabelName(TargetNode);
 
     // Compare selector with (i + 1)
     TempRegNum := FProgram.AllocRegister(srtInt);
@@ -3910,7 +3921,7 @@ begin
   for i := 0 to TargetListNode.ChildCount - 1 do
   begin
     TargetNode := TargetListNode.GetChild(i);
-    LabelName := 'LINE_' + VarToStr(TargetNode.Value);
+    LabelName := JumpLabelName(TargetNode);
     NextLabel := GenerateUniqueLabel('ON_GOSUB_NEXT');
 
     // Compare selector with (i + 1)
@@ -7854,6 +7865,24 @@ begin
           if DebugSSA then
             WriteLn('[SSA] Edge: ', PrevBlock.LabelName, ' → ', NewBlock.LabelName, ' (fall-through)');
           {$ENDIF}
+        end;
+      end;
+    end;
+    antLabel:
+    begin
+      // Named label "name:" — start a new basic block 'LABEL_<NAME>' (the GOTO/GOSUB
+      // target), with a fall-through edge from the previous block. Mirrors the
+      // antLineNumber handling above (case-insensitive name).
+      LabelName := 'LABEL_' + UpperCase(VarToStr(Node.Value));
+      if not Assigned(FCurrentBlock) or (FCurrentBlock.LabelName <> LabelName) then
+      begin
+        PrevBlock := FCurrentBlock;
+        FCurrentBlock := FProgram.GetOrCreateBlock(LabelName);
+        NewBlock := FCurrentBlock;
+        if Assigned(PrevBlock) and Assigned(NewBlock) and (PrevBlock <> NewBlock) then
+        begin
+          PrevBlock.AddSuccessor(NewBlock);
+          NewBlock.AddPredecessor(PrevBlock);
         end;
       end;
     end;
