@@ -248,6 +248,7 @@ type
     procedure SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
     function GetPaletteColor(Index: TPaletteIndex): UInt32;
     procedure ResetPalette;
+    procedure LoadPalettePreset(PresetId: Integer);
     function LoadPaletteFromJSON(const FileName: string): Boolean;
     function SavePaletteToJSON(const FileName: string): Boolean;
     function GetLastPaletteError: string;
@@ -705,6 +706,7 @@ type
     procedure SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
     function GetPaletteColor(Index: TPaletteIndex): UInt32;
     procedure ResetPalette;
+    procedure LoadPalettePreset(PresetId: Integer);
     function LoadPaletteFromJSON(const FileName: string): Boolean;
     function SavePaletteToJSON(const FileName: string): Boolean;
     function GetLastPaletteError: string;
@@ -3001,6 +3003,15 @@ begin
   end;
 end;
 
+procedure TVideoController.LoadPalettePreset(PresetId: Integer);
+begin
+  if FGraphicsMemory <> nil then
+  begin
+    FGraphicsMemory.LoadPalettePreset(PresetId);
+    FPaletteCacheValid := False;  // Invalidate cache so the new colours show
+  end;
+end;
+
 procedure TVideoController.SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
 begin
   if FGraphicsMemory <> nil then
@@ -5270,6 +5281,12 @@ begin
   // Delegate to VideoController for graphics operations
   if Assigned(FVideoController) then
     FVideoController.ResetPalette;
+end;
+
+procedure TConsoleOutputAdapter.LoadPalettePreset(PresetId: Integer);
+begin
+  if Assigned(FVideoController) then
+    FVideoController.LoadPalettePreset(PresetId);
 end;
 
 procedure TConsoleOutputAdapter.SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
@@ -9569,12 +9586,16 @@ const
   uaFmtApply = 2;      // apply the pending format change (clears the grid)
   uaFmtCancel = 3;     // cancel the pending format change
   uaSizeApply = 4;     // apply the typed W x H size fields
+  uaGoto = 5;          // switch to sprite UiArg (deferred: needs LoadSpriteState)
 const
   // Size presets (C128 default + SNES/console-style squares & tall shapes).
   PresetW: array[1..PRESET_COUNT] of Integer = (24,  8, 16, 32, 64, 16, 32, 48);
   PresetH: array[1..PRESET_COUNT] of Integer = (21,  8, 16, 32, 64, 32, 64, 42);
   PresetNm: array[1..PRESET_COUNT] of string = (
     'C128 24x21', '8x8', '16x16', '32x32', '64x64', '16x32', '32x64', '48x42');
+  // Built-in global palette models (TGraphicsMemory.LoadPalettePreset ids).
+  PAL_COUNT = 4;
+  PalNm: array[0..PAL_COUNT - 1] of string = ('C64/C128', 'Wheel', 'Greyscale', 'Rainbow');
 type
   // Undo/redo snapshot: grid contents plus the size/format they belong to
   // (both size and format can change during an editing session).
@@ -9586,8 +9607,8 @@ var
   // Current grid dimensions and data format (0=hi-res, 1=multicolor, 2=full-color).
   GW, GH, Fmt: Integer;
   Grid: array of array of Byte;   // [row][col] cell values (meaning depends on Fmt)
-  // Per-sprite undo/redo stacks (independent history for each of the 8 sprites).
-  Undo, Redo: array[1..8] of array of TGridSnap;
+  // Per-sprite undo/redo stacks (independent history per sprite; lazy-allocated).
+  Undo, Redo: array[1..MAX_SPRITES] of array of TGridSnap;
   Info: TSpriteInfo;
   CX, CY: Integer;
   Multicolor, FullColor, ExpandX, ExpandY: Boolean;
@@ -9630,6 +9651,11 @@ var
   SavedMsg: Boolean;                 // show 'SAVED' until the next edit
   SizeFocus: Integer;                // editable size field: 0 none, 1 = W, 2 = H
   SizeWStr, SizeHStr: string;        // the W / H size fields being shown / typed
+  GotoFocus: Boolean;                // the "go to sprite" field has keyboard focus
+  GotoStr: string;                   // the sprite number being typed in the Go field
+  PalPreset: Integer;                // selected global palette model (0..PAL_COUNT-1)
+  LPalSelX, LPalSelY, LPalSelW: Integer;  // palette-model selector row geometry (pop-up)
+  PalI: Integer;                     // scratch index for palette snapshot/restore
   ColorPopup: Boolean;               // modal colour-picker pop-up is open
   // Per-sprite working palette (full-color). Seeded from the engine when a sprite
   // is loaded; edited via the pop-up; pushed back to the engine on commit so each
@@ -9637,6 +9663,9 @@ var
   // differs from the global palette (only then is it stored).
   EdPal: array[0..255] of UInt32;    // ABGR8888 ($AABBGGRR)
   EdPalCustom: Boolean;
+  // Snapshot of the program's GLOBAL palette on entry, restored on exit so the
+  // editor's palette-model preview does not leave the program's screen recoloured.
+  SavedPal: array[0..255] of UInt32;
   // Pop-up layout captured by DrawEditor, used to hit-test pop-up clicks.
   LPopX, LPopY, LPopW, LPopH: Integer;       // pop-up outer rect
   LPalRgbX, LPalRgbY, LPalRgbBtn: Integer;   // RGB stepper block origin + button size
@@ -9889,6 +9918,21 @@ var
       EdPalCustom := True;
   end;
 
+  // Apply a built-in GLOBAL palette model (0..PAL_COUNT-1). This overwrites the
+  // program's palette (the editor's choice wins) and persists after exit. For a
+  // non-custom full-color sprite, refresh the working palette so the preview
+  // follows the new model.
+  procedure ApplyPalettePreset(Id: Integer);
+  var PI: Integer;
+  begin
+    Id := ((Id mod PAL_COUNT) + PAL_COUNT) mod PAL_COUNT;   // wrap 0..PAL_COUNT-1
+    PalPreset := Id;
+    FVideoController.LoadPalettePreset(Id);
+    if not EdPalCustom then
+      for PI := 0 to 255 do
+        EdPal[PI] := FSpriteEngine.GetSpritePaletteEntry(SpriteNum, Byte(PI));
+  end;
+
   function CellColor(V: Byte): TSDL_Color;
   begin
     if FullColor then
@@ -9931,6 +9975,29 @@ var
     SDL_FreeSurface(Surf);
   end;
 
+  // Draw a string left-aligned at X but vertically CENTRED on CenterY (used so
+  // pop-up button captions sit in the middle of their box, not at the top).
+  procedure DrawStrC(X, CenterY: Integer; const S: string);
+  var
+    Surf: PSDL_Surface;
+    Tex: PSDL_Texture;
+    Dst: TSDL_Rect;
+    White: TSDL_Color;
+  begin
+    if (S = '') or (FVideoController.Font = nil) then Exit;
+    White.r := 220; White.g := 220; White.b := 220; White.a := 255;
+    Surf := TTF_RenderUTF8_Blended(FVideoController.Font, PChar(S), White);
+    if Surf = nil then Exit;
+    Tex := SDL_CreateTextureFromSurface(FVideoController.Renderer, Surf);
+    if Tex <> nil then
+    begin
+      Dst.x := X; Dst.y := CenterY - Surf^.h div 2; Dst.w := Surf^.w; Dst.h := Surf^.h;
+      SDL_RenderCopy(FVideoController.Renderer, Tex, nil, @Dst);
+      SDL_DestroyTexture(Tex);
+    end;
+    SDL_FreeSurface(Surf);
+  end;
+
   // Full-screen help overlay (toggled with H / F1). The line pitch auto-fits the
   // window height so the text never runs off the bottom of the screen.
   procedure DrawHelp;
@@ -9943,9 +10010,9 @@ var
       'SPACE         paint: hi-res toggle / MC cycle / full-color pen',
       '0             erase the pixel under the cursor',
       'DEL           clear the whole grid',
-      'C  [  ]       step the pen colour ([Pick...] = palette + RGB/preset editor)',
-      '1-8           switch the sprite being edited',
-      '',
+      'C  [  ]       step pen colour; [Pick...] pop-up: < > picks palette model',
+      'SPRITE        < > / PgUp PgDn = prev/next, Home/End = first/last,',
+      '              1-8 = quick-pick, Go field = jump to number (1..512)',
       'CHANGE SIZE (1..255)',
       '  presets       click a size button in the panel (24x21 .. 48x42)',
       '  custom        click a W/H field or press S, type a number, RETURN',
@@ -10008,7 +10075,7 @@ var
       Rc.x := Bx2; Rc.y := By2; Rc.w := Bw; Rc.h := Bh;
       SDL_SetRenderDrawColor(R, 60, 60, 78, 255); SDL_RenderFillRect(R, @Rc);
       SDL_SetRenderDrawColor(R, 150, 150, 175, 255); SDL_RenderDrawRect(R, @Rc);
-      DrawStr(Bx2 + 5, By2 + 2, Cap);
+      DrawStrC(Bx2 + 5, By2 + Bh div 2, Cap);   // caption centred in the box
     end;
   begin
     R := FVideoController.Renderer;
@@ -10213,6 +10280,19 @@ var
       Ui.Caption(PvX, Py, Format('%s   %dx%d   cursor %d,%d', [ModeStr, GW, GH, LogCol, CY]));
     Py := Py + RH + 8;
 
+    // Sprite selector: [<] N/MAX [>]  Go [____]  (also PgUp/PgDn, Home/End keys).
+    Ui.Caption(PvX, Py, 'Sprite');
+    if Ui.Button(PvX + 72, Py - 11, 26, 22, '<') then
+      begin UiAction := uaGoto; UiArg := SpriteNum - 1; end;
+    Ui.CaptionC(PvX + 100, Py, 56, Format('%d/%d', [SpriteNum, MAX_SPRITES]));
+    if Ui.Button(PvX + 158, Py - 11, 26, 22, '>') then
+      begin UiAction := uaGoto; UiArg := SpriteNum + 1; end;
+    Ui.Caption(PvX + 190, Py, 'Go');
+    if not GotoFocus then GotoStr := '';   // the jump field is blank unless focused
+    if Ui.Field(PvX + 212, Py - 11, 46, 22, GotoStr, GotoFocus, False) then
+      begin GotoFocus := True; SizeFocus := 0; GotoStr := ''; end;
+    Py := Py + RH + 8;
+
     // Format (real radio buttons)
     Ui.Caption(PvX, Py, 'Format');
     if Ui.Radio(PvX + 72, Py, 'Hi-res', Fmt = SPRFMT_HIRES) and (Fmt <> SPRFMT_HIRES) then
@@ -10249,9 +10329,9 @@ var
     if SizeFocus = 0 then begin SizeWStr := IntToStr(GW); SizeHStr := IntToStr(GH); end;
     Ui.Caption(PvX, Py, 'Size');
     Ui.Caption(PvX + 50, Py, 'W');
-    if Ui.Field(PvX + 66, Py - 11, 44, 22, SizeWStr, SizeFocus = 1, True) then SizeFocus := 1;
+    if Ui.Field(PvX + 66, Py - 11, 44, 22, SizeWStr, SizeFocus = 1, True) then begin SizeFocus := 1; GotoFocus := False; end;
     Ui.Caption(PvX + 120, Py, 'H');
-    if Ui.Field(PvX + 136, Py - 11, 44, 22, SizeHStr, SizeFocus = 2, True) then SizeFocus := 2;
+    if Ui.Field(PvX + 136, Py - 11, 44, 22, SizeHStr, SizeFocus = 2, True) then begin SizeFocus := 2; GotoFocus := False; end;
     if Ui.Button(PvX + 188, Py - 11, 50, 22, 'Set') then UiAction := uaSizeApply;
     Py := Py + RH;
 
@@ -10298,6 +10378,7 @@ var
       LPalCell := 18;
       // Extra panel height (RGB steppers + preset row + close) only in full-color.
       if FullColor then ExtraH := 3 * 26 + 8 + 26 + 8 + 26 + 8 else ExtraH := 0;
+      ExtraH := ExtraH + 28;            // top row: global palette-model selector
       PopW := 16 * LPalCell + 16;       // 8px uniform margin on each side
       PopH := 16 * LPalCell + 16 + ExtraH;
       // Anchor to the left of the pen swatch; clamp inside the screen.
@@ -10312,8 +10393,15 @@ var
       Rect.x := PopX; Rect.y := PopY; Rect.w := PopW; Rect.h := PopH;
       SDL_SetRenderDrawColor(R, 20, 20, 28, 255); SDL_RenderFillRect(R, @Rect);
       SDL_SetRenderDrawColor(R, 180, 180, 210, 255); SDL_RenderDrawRect(R, @Rect);
+
+      // Top row: global palette-model selector  [<]  name  [>]
+      LPalSelX := PopX + 8; LPalSelY := PopY + 8; LPalSelW := 24;
+      PopBtn(LPalSelX, LPalSelY, LPalSelW, 22, '<');
+      PopBtn(PopX + PopW - 32, LPalSelY, LPalSelW, 22, '>');
+      DrawStrC(PopX + 40, LPalSelY + 11, 'Palette: ' + PalNm[PalPreset]);
+
       LPalX := PopX + 8;
-      LPalY := PopY + 8;
+      LPalY := PopY + 8 + 28;           // grid sits below the selector row
       LPalShown := True;
       for Ci := 0 to 255 do
       begin
@@ -10360,9 +10448,9 @@ var
           else Vv := (EdPal[PenIdx] shr 16) and $FF;
           end;
           if Ch = 0 then ChLbl := 'R' else if Ch = 1 then ChLbl := 'G' else ChLbl := 'B';
-          DrawStr(LPalRgbX, By + 2, ChLbl);
+          DrawStrC(LPalRgbX, By + LPalRgbBtn div 2, ChLbl);
           PopBtn(LPalRgbX + 18, By, LPalRgbBtn, LPalRgbBtn, '-');
-          DrawStr(LPalRgbX + 48, By + 2, Format('%3d', [Vv]));
+          DrawStrC(LPalRgbX + 48, By + LPalRgbBtn div 2, Format('%3d', [Vv]));
           PopBtn(LPalRgbX + 96, By, LPalRgbBtn, LPalRgbBtn, '+');
         end;
         // Preset buttons: C64 / VGA / Gray / Reset.
@@ -10568,7 +10656,7 @@ var
   procedure ClearAllUndo;
   var K: Integer;
   begin
-    for K := 1 to 8 do
+    for K := 1 to MAX_SPRITES do
     begin
       SetLength(Undo[K], 0);
       SetLength(Redo[K], 0);
@@ -10625,6 +10713,19 @@ var
     // Empty AND colourless sprite: start with a white pen. Do NOT override a
     // colour the sprite already carries (that would whiten a green sprite, etc.).
     if GridIsEmpty and (SprColIdx = 0) then SprColIdx := 1;
+  end;
+
+  // Switch the editor to sprite N (1..MAX_SPRITES): commit the current sprite,
+  // then load the new one. Shared by the < / > buttons, the Go field, the page /
+  // home / end keys and the 1-8 quick-select keys.
+  procedure GoToSprite(N: Integer);
+  begin
+    if N < 1 then N := 1;
+    if N > MAX_SPRITES then N := MAX_SPRITES;
+    if N = SpriteNum then Exit;
+    PackToSprite;        // save the sprite we are leaving
+    SpriteNum := N;
+    LoadSpriteState;     // load the chosen sprite
   end;
 
   // Resize the editing grid to NewW x NewH, preserving the overlapping top-left
@@ -10698,6 +10799,14 @@ var
     Result := True;
     if (MX < LPopX) or (MY < LPopY) or (MX >= LPopX + LPopW) or (MY >= LPopY + LPopH) then
     begin Result := False; Exit; end;
+    // Palette-model selector row (top): [<] cycles back, [>] forward (both modes).
+    if (MY >= LPalSelY) and (MY < LPalSelY + 22) then
+    begin
+      if (MX >= LPalSelX) and (MX < LPalSelX + LPalSelW) then
+        begin ApplyPalettePreset(PalPreset - 1); Exit; end;
+      if (MX >= LPopX + LPopW - 32) and (MX < LPopX + LPopW - 8) then
+        begin ApplyPalettePreset(PalPreset + 1); Exit; end;
+    end;
     if MouseToPalette(MX, MY) then Exit;     // picked a swatch
     if not FullColor then Exit;              // hi-res / multicolor: swatch grid only
     // RGB steppers: [-] at +18, [+] at +96, each LPalRgbBtn wide.
@@ -10741,7 +10850,7 @@ var
 
 begin
   Result := False;
-  if (SpriteNum < 1) or (SpriteNum > 8) then SpriteNum := 1;
+  if (SpriteNum < 1) or (SpriteNum > MAX_SPRITES) then SpriteNum := 1;
   PenIdx := 1;     // visible full-color default (palette index 1)
   MulPen := 2;     // multicolor mouse pen = sprite colour
   CX := 0; CY := 0;
@@ -10768,7 +10877,13 @@ begin
   UiMouseX := 0; UiMouseY := 0; UiClick := False;
   UiAction := uaNone; UiArg := 0; PendingFmt := SPRFMT_HIRES;
   SavedMsg := False; SizeFocus := 0; ColorPopup := False;
+  GotoFocus := False; GotoStr := '';
+  PalPreset := 0; LPalSelX := 0; LPalSelY := 0; LPalSelW := 0;
   SizeWStr := IntToStr(GW); SizeHStr := IntToStr(GH);
+  // Snapshot the program's global palette so we can restore it on exit (the
+  // palette-model selector overwrites it only as an editing preview).
+  for PalI := 0 to 255 do
+    SavedPal[PalI] := FVideoController.GetPaletteColor(PalI);
   Ui := TSedaiUI.Create(FVideoController.Renderer, FVideoController.Font);
   SDL_StartTextInput;   // so the filename field receives SDL_TEXTINPUT events
   DrawEditor;
@@ -10783,9 +10898,14 @@ begin
             Running := False;
           end;
         SDL_TEXTINPUT:
-          // A focused size field takes digits only (max 3); otherwise a filename
-          // field (1/2) takes printable characters (not during the overwrite prompt).
-          if SizeFocus <> 0 then
+          // A focused size / go-to field takes digits only (max 3); otherwise a
+          // filename field (1/2) takes printable chars (not during overwrite prompt).
+          if GotoFocus then
+          begin
+            if (Event.text.text[0] in ['0'..'9']) and (Length(GotoStr) < 3) then
+              GotoStr := GotoStr + Char(Event.text.text[0]);
+          end
+          else if SizeFocus <> 0 then
           begin
             if Event.text.text[0] in ['0'..'9'] then
             begin
@@ -10818,7 +10938,7 @@ begin
                 ColorPopup := False;
               UiClick := False;   // don't let this click also hit a panel widget
             end
-            else if (InputMode = 0) and (not ShowHelp) and (not ConfirmSwitch) and (SizeFocus = 0) then
+            else if (InputMode = 0) and (not ShowHelp) and (not ConfirmSwitch) and (SizeFocus = 0) and (not GotoFocus) then
             begin
               if MouseToCell(MX, MY, NW, NH) then
               begin
@@ -10843,7 +10963,7 @@ begin
             UiMouseX := Event.motion.x; UiMouseY := Event.motion.y;
             // Continue the current stroke while a button is held over the grid.
             if MouseDrawing and (InputMode = 0) and (not ConfirmSwitch) and (not ShowHelp)
-               and (SizeFocus = 0) and (not ColorPopup) then
+               and (SizeFocus = 0) and (not GotoFocus) and (not ColorPopup) then
               if MouseToCell(Event.motion.x, Event.motion.y, NW, NH) then
               begin
                 CX := NW; CY := NH;
@@ -10868,6 +10988,20 @@ begin
               // the help can't accidentally edit the sprite.
               if (Sym = SDLK_h) or (Sym = SDLK_F1) or (Sym = SDLK_ESCAPE) then
                 ShowHelp := False;
+            end
+            else if GotoFocus then
+            begin
+              // Editing the "go to sprite" field (digits come via SDL_TEXTINPUT).
+              // RETURN jumps to that sprite, ESC cancels, Backspace deletes.
+              if (Sym = SDLK_RETURN) or (Sym = SDLK_KP_ENTER) then
+              begin
+                if GotoStr <> '' then GoToSprite(StrToIntDef(GotoStr, SpriteNum));
+                GotoFocus := False; GotoStr := '';
+              end
+              else if Sym = SDLK_ESCAPE then
+                begin GotoFocus := False; GotoStr := ''; end
+              else if Sym = SDLK_BACKSPACE then
+                begin if Length(GotoStr) > 0 then Delete(GotoStr, Length(GotoStr), 1); end;
             end
             else if SizeFocus <> 0 then
             begin
@@ -11053,18 +11187,22 @@ begin
             else if Sym = SDLK_0 then
               begin PushUndo; SetCell(0); end   // erase the pixel under the cursor
             else if (Sym >= SDLK_1) and (Sym <= SDLK_8) then
-              begin
-                // Select sprite 1-8: save the current one, then load the chosen one.
-                PackToSprite;
-                SpriteNum := Integer(Sym) - Integer(SDLK_1) + 1;
-                LoadSpriteState;
-              end
+              // 1-8 quick-select the first eight sprites (commit current, load chosen)
+              GoToSprite(Integer(Sym) - Integer(SDLK_1) + 1)
+            else if Sym = SDLK_PAGEDOWN then
+              GoToSprite(SpriteNum + 1)    // next sprite
+            else if Sym = SDLK_PAGEUP then
+              GoToSprite(SpriteNum - 1)    // previous sprite
+            else if Sym = SDLK_HOME then
+              GoToSprite(1)                // first sprite
+            else if Sym = SDLK_END then
+              GoToSprite(MAX_SPRITES)      // last sprite
             else if (Sym = SDLK_h) or (Sym = SDLK_F1) then
               ShowHelp := True   // H / F1: show the help overlay
             else if Sym = SDLK_m then
               begin PendingFmt := (Fmt + 1) mod 3; ConfirmSwitch := True; end   // M: next format (confirm)
             else if Sym = SDLK_s then
-              SizeFocus := 1   // S: focus the W size field (presets are panel buttons)
+              begin SizeFocus := 1; GotoFocus := False; end   // S: focus the W size field
             else if Sym = SDLK_p then
               MulPen := Byte((MulPen mod 3) + 1)   // P: cycle multicolor mouse pen
             else if Sym = SDLK_x then
@@ -11096,6 +11234,7 @@ begin
       // Perform deferred widget actions (these need helpers declared after
       // DrawEditor, so the panel records them and we run them here).
       case UiAction of
+        uaGoto: GoToSprite(UiArg);
         uaPreset: ResizeGrid(PresetW[UiArg], PresetH[UiArg]);
         uaSizeApply:
           begin
@@ -11124,6 +11263,11 @@ begin
   end;
 
   Ui.Free;
+
+  // Restore the program's global palette (the palette-model selector is only an
+  // editing preview; without this the program's screen stays recoloured on exit).
+  for PalI := 0 to 255 do
+    FVideoController.SetPaletteColor(PalI, SavedPal[PalI]);
 
   // Repaint the program's screen so the editor view is not left on screen.
   FLastVMRenderTick := SDL_GetTicks;

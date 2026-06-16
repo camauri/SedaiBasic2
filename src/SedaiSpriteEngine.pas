@@ -823,9 +823,13 @@ begin
     Root.Add('multicolor1', Integer(SpriteColorToInt(FMulticolors.Multicolor1)));
     Root.Add('multicolor2', Integer(SpriteColorToInt(FMulticolors.Multicolor2)));
     Arr := TJSONArray.Create;
-    // Save the 8 BASIC-accessible sprites with their full state.
-    for I := 1 to 8 do
+    // Save every sprite that is in use, plus the classic 1-8 always (retro-compat).
+    // A sprite past 8 is skipped only if it is disabled AND has no shape data, so
+    // files stay small while any edited high-numbered sprite is persisted.
+    for I := 1 to MAX_SPRITES do
     begin
+      if (I > 8) and (not FSprites[I].Enabled) and (Length(FSprites[I].Data) = 0) then
+        Continue;
       SprObj := TJSONObject.Create;
       SprObj.Add('num', I);
       SprObj.Add('enabled', Ord(FSprites[I].Enabled));

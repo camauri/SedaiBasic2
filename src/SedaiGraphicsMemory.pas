@@ -104,6 +104,10 @@ type
     procedure SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
     function GetPaletteColor(Index: TPaletteIndex): UInt32;
     procedure ResetPalette;
+    // Load a built-in palette model into all 256 entries (ABGR). Models:
+    //   0 = C64/C128 Commodore (default, repeated)   2 = greyscale ramp
+    //   1 = colour wheel (16 hues x 16 brightness)    3 = rainbow (HSV 256)
+    procedure LoadPalettePreset(PresetId: Integer);
     function PaletteToRGB(Index: TPaletteIndex): UInt32;
     function RGBToPaletteIndex(RGB: UInt32): TPaletteIndex;
 
@@ -736,6 +740,63 @@ begin
   for i := 16 to 255 do
   begin
     FPalette[i] := FDefaultC64Palette[i mod 16];
+  end;
+end;
+
+procedure TGraphicsMemory.LoadPalettePreset(PresetId: Integer);
+var
+  i, c, l: Integer;
+  hue, vl, bf: Double;
+  hr, hg, hb, r, g, b: Integer;
+
+  // HSV (S=1) -> RGB. Hue in degrees, V the max channel value (0..255).
+  procedure HSV(H, V: Double; out Rr, Gg, Bb: Integer);
+  var Seg: Integer; Frac: Double;
+  begin
+    Seg := Trunc(H / 60);
+    Frac := H / 60 - Seg;
+    case Seg of
+      0: begin Rr := Round(V);            Gg := Round(Frac * V);       Bb := 0; end;
+      1: begin Rr := Round((1 - Frac)*V); Gg := Round(V);              Bb := 0; end;
+      2: begin Rr := 0;                   Gg := Round(V);              Bb := Round(Frac * V); end;
+      3: begin Rr := 0;                   Gg := Round((1 - Frac)*V);   Bb := Round(V); end;
+      4: begin Rr := Round(Frac * V);     Gg := 0;                     Bb := Round(V); end;
+      5: begin Rr := Round(V);            Gg := 0;                     Bb := Round((1 - Frac)*V); end;
+    else   begin Rr := Round(V);          Gg := 0;                     Bb := 0; end;
+    end;
+  end;
+
+  // Pack R,G,B into an opaque ABGR8888 entry ($AABBGGRR), matching FPalette.
+  function ABGR(Rr, Gg, Bb: Integer): UInt32;
+  begin
+    Result := UInt32($FF000000) or (UInt32(Bb and $FF) shl 16) or
+              (UInt32(Gg and $FF) shl 8) or UInt32(Rr and $FF);
+  end;
+
+begin
+  case PresetId of
+    1:  // Colour wheel: 16 hues across the columns, 16 brightness steps down rows.
+      for c := 0 to 15 do
+      begin
+        hue := c * 22.5; vl := 255;
+        HSV(hue, vl, hr, hg, hb);
+        for l := 0 to 15 do
+        begin
+          bf := (l + 1) / 16;
+          FPalette[c * 16 + l] := ABGR(Round(hr * bf), Round(hg * bf), Round(hb * bf));
+        end;
+      end;
+    2:  // Greyscale ramp 0..255.
+      for i := 0 to 255 do
+        FPalette[i] := ABGR(i, i, i);
+    3:  // Rainbow: full HSV hue sweep over the 256 entries.
+      for i := 0 to 255 do
+      begin
+        HSV(i * 360 / 256, 255, r, g, b);
+        FPalette[i] := ABGR(r, g, b);
+      end;
+  else
+    ResetPalette;   // 0 (or unknown) = C64/C128 Commodore default
   end;
 end;
 

@@ -22,7 +22,7 @@ uses
 
 const
   // Maximum number of sprites (configurable)
-  MAX_SPRITES = 256;
+  MAX_SPRITES = 512;
 
   // Default sprite dimensions (C128 compatible)
   DEFAULT_SPRITE_WIDTH = 24;
