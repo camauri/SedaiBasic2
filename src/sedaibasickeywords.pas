@@ -55,6 +55,8 @@ const
   kIF      = 'IF';
   kTHEN    = 'THEN';
   kELSE    = 'ELSE';
+  kELSEIF  = 'ELSEIF';   // FreeBASIC/QB block-IF else-if
+  kENDIF   = 'ENDIF';    // FreeBASIC block-IF terminator (also "END IF" two-word, later)
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';

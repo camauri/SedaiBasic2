@@ -99,6 +99,9 @@ type
     function ParseIfStatement: TASTNode;
     function ParseThenStatement: TASTNode;
     function ParseElseStatement: TASTNode;
+    // Collect statements of a block-IF THEN/ELSE body (multi-line, FreeBASIC/QB
+    // style) into Parent, stopping at ELSE / ENDIF / end-of-file.
+    procedure ParseBlockIfBody(Parent: TASTNode);
     function ParseForStatement: TASTNode;
     function ParseDoStatement: TASTNode;
     function ParseGotoStatement: TASTNode;
@@ -947,6 +950,8 @@ var
  CurrentIf: TIfStackEntry;
  ThenNode: TASTNode;
  GotoNode: TASTNode;
+ ElseNode: TASTNode;
+ ElseTok: TLexerToken;
 begin
  Token := Context.CurrentToken;
  // *** VALIDATE THEN ***
@@ -978,6 +983,31 @@ begin
      GotoNode.AddChild(Statement);
    ThenNode.AddChild(GotoNode);
 
+   DoNodeCreated(ThenNode);
+   Result := nil;
+   Exit;
+ end;
+
+ // *** FreeBASIC/QuickBASIC block IF: "IF cond THEN" with nothing after THEN (end of
+ //     line) opens a multi-line block, closed by ELSE / ENDIF. Parsed self-contained
+ //     here (so nesting just recurses); the IF is popped when ENDIF is consumed. ***
+ if Context.CheckAny([ttEndOfLine]) then
+ begin
+   ParseBlockIfBody(ThenNode);               // THEN body, up to ELSE / ENDIF / EOF
+   if Context.Check(ttConditionalElse) then
+   begin
+     ElseTok := Context.CurrentToken;
+     Context.Advance;                        // consume ELSE
+     ElseNode := TASTNode.Create(antElse, ElseTok);
+     if Assigned(CurrentIf.IfNode) then
+       CurrentIf.IfNode.AddChild(ElseNode);
+     ParseBlockIfBody(ElseNode);             // ELSE body, up to ENDIF / EOF
+     DoNodeCreated(ElseNode);
+   end;
+   if Context.Check(ttBlockEnd) then
+     Context.Advance;                        // consume ENDIF
+   if FValidationStacks.HasActiveIf then
+     FValidationStacks.PopIf;                // the block IF is now closed
    DoNodeCreated(ThenNode);
    Result := nil;
    Exit;
@@ -1027,6 +1057,35 @@ begin
  DoNodeCreated(ThenNode);
  // *** FIX: DON'T return the node to avoid duplication ***
  Result := nil;
+end;
+
+procedure TPackratParser.ParseBlockIfBody(Parent: TASTNode);
+var
+  Statement: TASTNode;
+  PrevIdx: Integer;
+begin
+  // Collect statements across lines into Parent until ELSE / ENDIF (ttBlockEnd) /
+  // end-of-file. A nested block IF is parsed by ParseStatement -> ParseThenStatement,
+  // which consumes its own ENDIF, so only this body's own ELSE/ENDIF stops us here.
+  while not Context.Check(ttEndOfFile) do
+  begin
+    if Context.Match(ttEndOfLine) then Continue;       // skip line breaks
+    if Context.Check(ttSeparStmt) then
+    begin
+      Context.Advance;                                  // skip ':' separators
+      Continue;
+    end;
+    if Context.Check(ttConditionalElse) or Context.Check(ttBlockEnd) then
+      Break;                                            // ELSE / ENDIF ends this body
+    PrevIdx := Context.CurrentIndex;
+    Statement := ParseStatement;
+    // NB: many statement handlers (THEN/ELSE) return nil on SUCCESS (they attach to
+    // their parent). So nil is not "stop" — only stop if no progress was made.
+    if Assigned(Statement) then
+      Parent.AddChild(Statement)
+    else if Context.CurrentIndex = PrevIdx then
+      Break;                                            // no node and no progress
+  end;
 end;
 
 function TPackratParser.ParseElseStatement: TASTNode;

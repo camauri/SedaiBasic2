@@ -1609,6 +1609,8 @@ begin
  // === CODE BLOCK CONSTRUCTS ===
  RegisterKeyword(kBEGIN, ttBlockBegin, 'Starts code block', kcCodeBlockConstructs);
  RegisterKeyword(kBEND,  ttBlockEnd,   'Ends code block',   kcCodeBlockConstructs);
+ // FreeBASIC/QB block IF: ENDIF closes a THEN/ELSE block (treated like BEND).
+ RegisterKeyword(kENDIF, ttBlockEnd,   'Ends a block IF',   kcCodeBlockConstructs);
 
  // === PROCEDURES HANDLING ===
  RegisterKeyword(kDEF, ttProcedureDefine, 'Define function', kcProcedures);
