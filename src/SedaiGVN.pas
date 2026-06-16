@@ -386,9 +386,16 @@ begin
     ssaLoadConstInt, ssaLoadConstFloat, ssaLoadConstString:
       Result := False;
 
-    // Copy operations (can be eliminated)
+    // Copy operations - DO NOT value number!
+    // Many distinct BASIC variables are initialised from the same source (e.g.
+    // SIGN%=C1%, FLIPS%=C1%, I%=C1%). Each lowers to "X = Copy C1", all with the
+    // same value hash. Inter-block GVN would rewrite the later ones as copies of
+    // the first (X2 = Copy X1), and Copy Coalescing then merges those *distinct*
+    // variables into one register -> they alias and corrupt each other when one is
+    // later reassigned. Copies carry no real computation, so value-numbering them
+    // buys nothing; Copy Propagation / Coalescing already handle genuine copies.
     ssaCopyInt, ssaCopyFloat, ssaCopyString:
-      Result := True;
+      Result := False;
 
     // Array loads (pure if no intervening stores)
     ssaArrayLoad:
@@ -550,8 +557,6 @@ end;
 function TGVNPass.Run(Prog: TSSAProgram): Integer;
 var
   DomTreeObj: TObject;
-  i: Integer;
-  Block: TSSABasicBlock;
 begin
   {$IFDEF DEBUG_GVN}
   if DebugGVN then
@@ -588,26 +593,20 @@ begin
   try
     FScopedTable.FInitialStackDepth := 0;  // Track initial depth
 
-    { STEP 4: Preorder traversal with scope management
+    { STEP 4: Inter-block GVN via dominator-tree DFS with scope inheritance.
 
-      For each block in preorder:
-      1. Push new scope (entering dominator subtree)
-      2. Process all instructions in block
-      3. Pop scope (exiting dominator subtree)
+      TraverseDomTree recurses the dominator tree from the entry block, pushing a
+      scope on entry and popping it after the whole subtree is processed. A value
+      computed in block A is therefore visible (in scope) exactly while processing
+      the blocks A dominates — i.e. it can only be reused where A's definition is
+      guaranteed to have executed. This makes cross-block reuse safe by dominance.
 
-      NOTE: This conservative approach limits inter-block GVN but ensures
-      correctness. For full inter-block GVN, we would need to use
-      TraverseDomTree which does DFS with proper scope inheritance.
-      However, that requires careful handling of the dominator tree structure. }
+      The entry block is preorder index 0 (root of the dominator tree). Unreachable
+      blocks are not in the dominator tree and are simply not visited (DBE removes
+      them earlier anyway). }
 
-    for i := 0 to FDomTree.GetPreorderCount - 1 do
-    begin
-      Block := FDomTree.GetPreorderBlock(i);
-
-      FScopedTable.PushScope;
-      ProcessBlock(Block);
-      FScopedTable.PopScope;
-    end;
+    if FDomTree.GetPreorderCount > 0 then
+      TraverseDomTree(FDomTree.GetPreorderBlock(0));
 
     // STEP 5 REQUIREMENT: Verify stack integrity
     {$IFDEF DEBUG_GVN}

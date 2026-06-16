@@ -65,3 +65,14 @@
 {$ENDIF}
 
 {.$DEFINE DISABLE_REG_COMPACTION}
+
+// GVN / CSE are mutually exclusive in the pipeline gating: GVN runs only when
+// DISABLE_CSE is defined, CSE runs only when DISABLE_GVN is defined. With NEITHER
+// defined (the current state) the gating runs NEITHER, so no SSA redundancy pass
+// runs. GVN itself is correct (inter-block, dominator-scoped) and verified against
+// the regression corpus, but it is left OFF for now pending a rework of how it fits
+// the pipeline (on the current line-per-block CFG it finds little, and it conflicts
+// with the array loop-idiom superinstructions). To toggle:
+//   - GVN on:  uncomment {$DEFINE DISABLE_CSE} below.
+//   - CSE on:  define DISABLE_GVN instead.
+{.$DEFINE DISABLE_CSE}
