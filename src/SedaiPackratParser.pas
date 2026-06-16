@@ -721,7 +721,7 @@ begin
       Context.Advance; // Also accept comma
   end;
 
-  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
     // Parse expression
     Expr := ParseExpression;
@@ -739,14 +739,14 @@ begin
       Context.Advance; // Consume separator
 
       // If separator is at end of line, exit
-      if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+      if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
         Break;
     end
     else
     begin
       // Commodore BASIC implicit semicolon: PRINT "text"expr = PRINT "text";expr
       // If not at end of statement, insert implicit semicolon and continue
-      if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+      if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
         Break;
       SeparatorNode := TASTNode.CreateWithValue(antSeparator, ';', Context.CurrentToken);
       Result.AddChild(SeparatorNode);
@@ -766,7 +766,7 @@ begin
   Result := TASTNode.Create(antInput, Token);
   Context.Advance; // Consume INPUT
 
-  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
     // Parse expression (prompt string or variable)
     Expr := ParseExpression;
@@ -784,7 +784,7 @@ begin
       Context.Advance; // Consume separator
 
       // If separator is at end of line, exit
-      if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+      if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
         Break;
     end
     else
@@ -874,7 +874,7 @@ begin
 
   // CHAR mode, col, row, "text" [,reverse]
   // Parse comma-separated parameters
-  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
     Expr := ParseExpression;
     if Assigned(Expr) then
@@ -988,9 +988,15 @@ begin
  if HasBeginBlock then
    FValidationStacks.SetThenBlockForCurrentIf;
 
- // *** Parse THEN statements until : ELSE or EOL ***
+ // *** Parse THEN statements until ELSE / : ELSE or EOL ***
  while not Context.CheckAny([ttEndOfLine, ttEndOfFile]) do
  begin
+   // *** ELSE ends the THEN clause. Accept it both directly ("THEN x ELSE y")
+   //     and after a separator ("THEN x : ELSE y") — BASIC v7 wrote the colon,
+   //     but we tolerate either form. ***
+   if Context.Check(ttConditionalElse) then
+     Break;
+
    // *** CHECK FOR : ELSE SEQUENCE ***
    if Context.Check(ttSeparStmt) then
    begin
@@ -1405,7 +1411,7 @@ begin
       Context.Advance; // Consume comma
 
       // Parse expressions to write (print list)
-      while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+      while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
       begin
         Expr := ParseExpression;
         if Assigned(Expr) then
@@ -1467,7 +1473,7 @@ begin
   Context.Advance; // Consume SLEEP
 
   // Parse required parameter (seconds to sleep)
-  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
   begin
     Param := ParseExpression;
     if Assigned(Param) then
@@ -1487,7 +1493,7 @@ begin
   Context.Advance; // Consume FRAME
 
   // Parse optional FPS parameter (default 60 if omitted)
-  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
   begin
     Param := ParseExpression;
     if Assigned(Param) then
@@ -1507,7 +1513,7 @@ begin
   Context.Advance; // Consume WAIT
 
   // Parse condition
-  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
   begin
     Condition := ParseExpression;
     if Assigned(Condition) then
@@ -1789,7 +1795,7 @@ begin
     Context.Advance; // Consume memory command
 
     // Parse parameters as single expression list
-    if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+    if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
     begin
       Param1 := ParseExpressionList(ttSeparParam);
       if Assigned(Param1) then
@@ -1902,7 +1908,7 @@ begin
       Result.AddChild(nil);
       Context.Advance;
     end
-    else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+    else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
     begin
       Param := ParseExpression;
       if Assigned(Param) then
@@ -1914,7 +1920,7 @@ begin
     // Parse x1, y1
     while ParamCount < 2 do
     begin
-      if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+      if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
         Break;
       Param := ParseExpression;
       if Assigned(Param) then
@@ -1950,7 +1956,7 @@ begin
   begin
     // Standard parsing for other graphics commands
     // Handle optional parameters: empty params (,,) add nil placeholder
-    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) and (ParamCount < MaxParams) do
+    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) and (ParamCount < MaxParams) do
     begin
       // Check for empty parameter (comma without expression)
       if Context.Check(ttSeparParam) then
@@ -1971,7 +1977,7 @@ begin
         Break;
       if Context.Check(ttSeparParam) then
         Context.Advance
-      else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+      else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
         Break;
     end;
   end;
@@ -2047,7 +2053,7 @@ begin
     MaxParams := 10;
 
   // Parse parameters
-  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) and (ParamCount < MaxParams) do
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) and (ParamCount < MaxParams) do
   begin
     // Handle comma separator
     if Context.Check(ttSeparParam) then
@@ -2166,7 +2172,7 @@ begin
     MaxParams := 10;
 
   // Parse parameters
-  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) and (ParamCount < MaxParams) do
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) and (ParamCount < MaxParams) do
   begin
     if Context.Check(ttSeparParam) then
     begin
@@ -2183,7 +2189,7 @@ begin
       Break;
     if Context.Check(ttSeparParam) then
       Context.Advance
-    else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+    else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
       Break;
   end;
 
@@ -2384,7 +2390,7 @@ begin
   end;
 
   // Parse ALL parameters until end of statement (for other file commands)
-  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
     // Skip commas
     if Context.Check(ttSeparParam) then
@@ -2402,7 +2408,7 @@ begin
     // Handle comma separator
     if Context.Check(ttSeparParam) then
       Context.Advance
-    else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+    else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
       Break;
   end;
 
@@ -2435,7 +2441,7 @@ begin
   Context.Advance; // Consume file management command
 
   // Parse parameters
-  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
     Params := ParseExpression;
     if Assigned(Params) then
@@ -2546,7 +2552,7 @@ begin
       Context.Advance;
 
     // Parse variable list
-    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
     begin
       if Context.Check(ttIdentifier) then
       begin
@@ -2625,7 +2631,7 @@ begin
       Context.Advance; // Consume separator
 
       // Parse expressions (like PRINT statement)
-      while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+      while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
       begin
         Expr := ParseExpression;
         if Assigned(Expr) then
@@ -2642,7 +2648,7 @@ begin
           Context.Advance; // Consume separator
 
           // If separator is at end of line, exit
-          if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+          if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
             Break;
         end
         else
@@ -2760,7 +2766,7 @@ begin
   Context.Advance; // Consume SYS
 
   // Parse address parameter
-  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
   begin
     Address := ParseExpression;
     if Assigned(Address) then
@@ -3109,7 +3115,7 @@ begin
     else
       Break; // No more array declarations
 
-  until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]);
+  until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
 
   DoNodeCreated(Result);
 end;
@@ -3270,7 +3276,7 @@ begin
 
   // Parse comma-separated list of data items (literals only - no expressions)
   // Format: DATA 5,12,1,34,18 or DATA "hello","world" or DATA COMMODORE,128
-  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
     // Parse data item - can be number, string, or unquoted identifier (treated as string)
     if Context.Check(ttNumber) or Context.Check(ttInteger) or Context.Check(ttFloat) then
@@ -3327,7 +3333,7 @@ begin
 
   // Parse comma-separated list of variables
   // Format: READ X or READ A$,B,C or READ A(I),B$
-  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
     if Context.Check(ttIdentifier) then
     begin
@@ -3495,7 +3501,7 @@ begin
   end;
 
   // Parse ALL parameters until end of statement (for LIST, RENUMBER, etc.)
-  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
     // Skip commas between parameters
     if Context.Check(ttSeparParam) then
@@ -3513,7 +3519,7 @@ begin
     // Handle comma separator
     if Context.Check(ttSeparParam) then
       Context.Advance
-    else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+    else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
       Break;
   end;
 
