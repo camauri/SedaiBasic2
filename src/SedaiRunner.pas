@@ -82,6 +82,11 @@ type
     { Detect file type from extension }
     class function DetectFileType(const FileName: string): TSedaiFileType;
 
+    { True if the source uses classic line numbers (a logical line begins with an
+      integer). Used to auto-select the dialect at LOAD: line numbers => classic,
+      otherwise FreeBASIC/Modern. }
+    class function SourceHasLineNumbers(const Source: string): Boolean;
+
     { Load program from file (auto-detects type) }
     function Load(const FileName: string): TBytecodeProgram;
 
@@ -136,12 +141,49 @@ var
   Ext: string;
 begin
   Ext := LowerCase(ExtractFileExt(FileName));
-  if (Ext = '.bas') or (Ext = '.fb') or (Ext = '.fbas') then
-    Result := sftSource     // .fb/.fbas = FreeBASIC dialect (no line numbers)
+  if (Ext = '.bas') then
+    Result := sftSource
   else if (Ext = '.basc') then
     Result := sftBytecode
   else
     Result := sftUnknown;
+end;
+
+class function TSedaiRunner.SourceHasLineNumbers(const Source: string): Boolean;
+var
+  Lines: TStringList;
+  i: Integer;
+  Line, Prev: string;
+begin
+  // Heuristic: the program uses line numbers iff some logical line begins with an
+  // integer. A modern (FreeBASIC) statement never starts a line with a bare number;
+  // a classic line is "<number> <statement>". FreeBASIC line-continuation lines
+  // (previous line ends with '_') are skipped so a wrapped numeric operand is not
+  // mistaken for a line number.
+  Result := False;
+  Lines := TStringList.Create;
+  try
+    Lines.Text := Source;
+    Prev := '';
+    for i := 0 to Lines.Count - 1 do
+    begin
+      Line := TrimLeft(Lines[i]);
+      if Line = '' then Continue;
+      if (Prev <> '') and (Prev[Length(Prev)] = '_') then
+      begin
+        Prev := TrimRight(Line);   // continuation line: not a statement start
+        Continue;
+      end;
+      if (Line[1] >= '0') and (Line[1] <= '9') then
+      begin
+        Result := True;
+        Exit;
+      end;
+      Prev := TrimRight(Line);
+    end;
+  finally
+    Lines.Free;
+  end;
 end;
 
 function TSedaiRunner.Load(const FileName: string): TBytecodeProgram;
@@ -248,13 +290,10 @@ begin
     end;
 
     // === LEXING ===
-    // FreeBASIC/Modern dialect: no line numbers. Selected by the FreeBasicMode
-    // property (CLI flag) or a .fb/.fbas source extension. Otherwise classic BASIC
-    // with optional line numbers. Spaces-between-tokens and case-insensitivity hold
-    // in both dialects.
-    UseFreeBasic := FFreeBasicMode or
-      (LowerCase(ExtractFileExt(SourceFile)) = '.fb') or
-      (LowerCase(ExtractFileExt(SourceFile)) = '.fbas');
+    // Dialect auto-selected at LOAD by content: a program with line numbers is
+    // classic; otherwise FreeBASIC/Modern (no line numbers). FreeBasicMode forces
+    // Modern. Spaces-between-tokens and case-insensitivity hold in both dialects.
+    UseFreeBasic := FFreeBasicMode or (not SourceHasLineNumbers(Source.Text));
     Lexer := TLexerFSM.Create;
     try
       Lexer.SetHasLineNumbers(not UseFreeBasic);
