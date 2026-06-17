@@ -10,6 +10,27 @@
 
 Legend: ✓ = Implemented | ✗ = Not implemented
 
+> The tables below cover the **classic Commodore BASIC v7** front-end. SedaiBasic also has a
+> **structured / FreeBASIC-style** mode — see the next section.
+
+## Structured / FreeBASIC mode (language evolution, 2026-06)
+
+A modern, structured dialect (FreeBASIC/QuickBASIC-style) coexists with classic BASIC v7. **The
+dialect is auto-detected at load by content**: a program that uses **line numbers** runs as classic;
+otherwise it runs as **FreeBASIC/Modern** (no line numbers). Keywords and identifiers are
+case-insensitive in both.
+
+| Construct | Status | Notes |
+|---|---|---|
+| Block `IF cond THEN` ⏎ … `ELSEIF` … `ELSE` … `END IF`/`ENDIF` | ✓ | both `END IF` (two words) and `ENDIF` |
+| `SELECT CASE expr` / `CASE v`, `CASE v1, v2` / `CASE ELSE` / `END SELECT` | ✓ | lowered to a nested IF chain |
+| Named labels `name:` as `GOTO`/`GOSUB` targets | ✓ | case-insensitive; coexist with numeric line targets |
+| `FOR…NEXT`, `DO…LOOP [UNTIL/WHILE]` without line numbers | ✓ | already worked |
+| `SUB` / `FUNCTION` (declaration parsing) | ◑ | parsed into AST; execution (call frames) is **in progress** (M2) |
+| `WHILE…WEND` as a standalone loop | ✗ | use `DO…LOOP`; `WHILE` is currently the `DO/LOOP WHILE` modifier |
+
+Single-line `IF cond THEN x [ : ] ELSE y` is also accepted (with or without the colon) in classic mode.
+
 ## Operators (12/12 - 100%)
 
 | Command | Status | Description |
