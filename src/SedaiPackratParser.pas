@@ -105,6 +105,9 @@ type
     // Parse the ELSEIF*/ELSE? tail of a block IF into IfNode (ELSEIF lowers to a
     // nested IF inside an ELSE). Leaves the closing ENDIF for the caller.
     procedure ParseBlockElseChain(IfNode: TASTNode);
+    // Block-IF terminator: ENDIF (one word) or END IF (two words, QuickBASIC).
+    function AtBlockIfTerminator: Boolean;
+    procedure ConsumeBlockIfTerminator;
     function ParseForStatement: TASTNode;
     function ParseDoStatement: TASTNode;
     function ParseGotoStatement: TASTNode;
@@ -1009,8 +1012,7 @@ begin
  begin
    ParseBlockIfBody(ThenNode);               // THEN body, up to ELSE/ELSEIF/ENDIF/EOF
    ParseBlockElseChain(CurrentIf.IfNode);    // ELSEIF* / ELSE? tail
-   if Context.Check(ttBlockEnd) then
-     Context.Advance;                        // consume ENDIF
+   ConsumeBlockIfTerminator;                 // consume ENDIF or END IF
    if FValidationStacks.HasActiveIf then
      FValidationStacks.PopIf;                // the block IF is now closed
    DoNodeCreated(ThenNode);
@@ -1080,8 +1082,8 @@ begin
       Context.Advance;                                  // skip ':' separators
       Continue;
     end;
-    if Context.Check(ttConditionalElse) or Context.Check(ttBlockEnd) then
-      Break;                                            // ELSE / ENDIF ends this body
+    if Context.Check(ttConditionalElse) or AtBlockIfTerminator then
+      Break;                                            // ELSE / ENDIF / END IF ends this body
     PrevIdx := Context.CurrentIndex;
     Statement := ParseStatement;
     // NB: many statement handlers (THEN/ELSE) return nil on SUCCESS (they attach to
@@ -1129,6 +1131,27 @@ begin
     if Assigned(IfNode) then IfNode.AddChild(ElseNode);
     ParseBlockIfBody(ElseNode);                        // ELSE body up to ENDIF
     DoNodeCreated(ElseNode);
+  end;
+end;
+
+function TPackratParser.AtBlockIfTerminator: Boolean;
+begin
+  // ENDIF (one word) or the QuickBASIC two-word "END IF" (END immediately followed
+  // by IF). A bare END (end-of-program) is NOT a terminator.
+  Result := Context.Check(ttBlockEnd) or
+    (Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+     (Context.PeekNext.TokenType = ttConditionalIf));
+end;
+
+procedure TPackratParser.ConsumeBlockIfTerminator;
+begin
+  if Context.Check(ttBlockEnd) then
+    Context.Advance                                    // ENDIF
+  else if Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+          (Context.PeekNext.TokenType = ttConditionalIf) then
+  begin
+    Context.Advance;                                   // END
+    Context.Advance;                                   // IF
   end;
 end;
 
