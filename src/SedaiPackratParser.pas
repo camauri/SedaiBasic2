@@ -115,6 +115,11 @@ type
     procedure ParseCaseBody(Parent: TASTNode);
     function AtEndSelect: Boolean;
     procedure ConsumeEndSelect;
+    // SUB / FUNCTION declaration (FreeBASIC/QB). Body up to END SUB / END FUNCTION.
+    function ParseProcedureDecl: TASTNode;
+    procedure ParseProcedureBody(Parent: TASTNode);
+    function AtEndProcedure: Boolean;
+    procedure ConsumeEndProcedure;
     function ParseForStatement: TASTNode;
     function ParseDoStatement: TASTNode;
     function ParseGotoStatement: TASTNode;
@@ -512,7 +517,11 @@ begin
 
     // === PROCEDURES ===
     ttProcedureDefine: Result := Memoize('DefStatement', @ParseDefStatement);
-    ttProcedureStart: Result := Memoize('FnStatement', @ParseFnStatement);
+    ttProcedureStart:
+      if (UpperCase(Token.Value) = kSUB) or (UpperCase(Token.Value) = kFUNCTION) then
+        Result := Memoize('ProcedureDecl', @ParseProcedureDecl)
+      else
+        Result := Memoize('FnStatement', @ParseFnStatement);
 
     // === MEMORY COMMANDS ===
     ttMemoryCommand: Result := Memoize('MemoryStatement', @ParseMemoryStatement);
@@ -1177,6 +1186,91 @@ begin
     Context.Advance;   // END
     Context.Advance;   // SELECT
   end;
+end;
+
+function TPackratParser.AtEndProcedure: Boolean;
+begin
+  // END SUB / END FUNCTION (END is ttProgramEnd, SUB/FUNCTION is ttProcedureStart).
+  Result := Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+            (Context.PeekNext.TokenType = ttProcedureStart);
+end;
+
+procedure TPackratParser.ConsumeEndProcedure;
+begin
+  if AtEndProcedure then
+  begin
+    Context.Advance;   // END
+    Context.Advance;   // SUB / FUNCTION
+  end;
+end;
+
+procedure TPackratParser.ParseProcedureBody(Parent: TASTNode);
+var
+  Statement: TASTNode;
+  PrevIdx: Integer;
+begin
+  while not Context.Check(ttEndOfFile) do
+  begin
+    if Context.Match(ttEndOfLine) then Continue;
+    if Context.Check(ttSeparStmt) then begin Context.Advance; Continue; end;
+    if AtEndProcedure then Break;
+    PrevIdx := Context.CurrentIndex;
+    Statement := ParseStatement;
+    if Assigned(Statement) then
+      Parent.AddChild(Statement)
+    else if Context.CurrentIndex = PrevIdx then
+      Break;
+  end;
+end;
+
+function TPackratParser.ParseProcedureDecl: TASTNode;
+var
+  Token, NameTok: TLexerToken;
+  Kind: string;
+  NameNode, ParamList, ParamNode: TASTNode;
+begin
+  // SUB|FUNCTION name [ ( param [, param ...] ) ] [AS type] <body> END SUB|FUNCTION
+  // v1: bare identifier params (BYVAL/BYREF and AS-type are a later refinement).
+  Token := Context.CurrentToken;
+  Kind := UpperCase(Token.Value);                 // 'SUB' or 'FUNCTION'
+  Context.Advance;                                // consume SUB / FUNCTION
+  Result := TASTNode.CreateWithValue(antProcedureDecl, Kind, Token);
+
+  if Context.Check(ttIdentifier) then
+  begin
+    NameTok := Context.CurrentToken;
+    NameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
+    Context.Advance;
+    Result.AddChild(NameNode);
+  end;
+
+  ParamList := TASTNode.Create(antParameterList, Token);
+  if Context.Check(ttDelimParOpen) then
+  begin
+    Context.Advance;                              // (
+    while (not Context.Check(ttDelimParClose)) and (not Context.Check(ttEndOfFile)) and
+          (not Context.Check(ttEndOfLine)) do
+    begin
+      if Context.Check(ttIdentifier) then
+      begin
+        ParamNode := TASTNode.CreateWithValue(antIdentifier,
+                       UpperCase(Context.CurrentToken.Value), Context.CurrentToken);
+        ParamList.AddChild(ParamNode);
+        Context.Advance;
+      end
+      else
+        Context.Advance;                          // skip unexpected token (defensive)
+      if Context.Check(ttSeparParam) then
+        Context.Advance;                          // ,
+    end;
+    if Context.Check(ttDelimParClose) then
+      Context.Advance;                            // )
+  end;
+  Result.AddChild(ParamList);
+
+  ParseProcedureBody(Result);                     // statements up to END SUB/FUNCTION
+  ConsumeEndProcedure;
+  DoNodeCreated(Result);
 end;
 
 // Build the condition for a CASE clause: "(sel = v1) OR (sel = v2) OR ...", where

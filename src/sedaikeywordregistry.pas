@@ -1581,6 +1581,8 @@ begin
  RegisterKeyword(kTHEN, ttConditionalThen, 'THEN statement', kcConditionalFlowControl);
  RegisterKeyword(kSELECT, ttSelectCase, 'SELECT CASE statement', kcConditionalFlowControl);
  RegisterKeyword(kCASE,   ttCaseClause, 'CASE clause',           kcConditionalFlowControl);
+ RegisterKeyword(kSUB,      ttProcedureStart, 'SUB procedure',      kcProcedures);
+ RegisterKeyword(kFUNCTION, ttProcedureStart, 'FUNCTION procedure', kcProcedures);
 
  // === FLOW CONTROL - JUMP RELATED STATEMENTS ===
  RegisterKeyword(kEXIT,   ttJumpReturn,      'Exit statement',   kcJumpFlowControl);

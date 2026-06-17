@@ -7868,6 +7868,11 @@ begin
         end;
       end;
     end;
+    antProcedureDecl:
+      // SUB / FUNCTION declaration. A procedure body is NOT lowered inline (it is
+      // not executed at the point of definition); real lowering with call frames is
+      // M2 increment 3. For now, skip it so module-level code runs unaffected.
+      ;
     antLabel:
     begin
       // Named label "name:" — start a new basic block 'LABEL_<NAME>' (the GOTO/GOSUB

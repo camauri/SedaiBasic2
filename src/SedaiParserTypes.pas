@@ -39,6 +39,7 @@ type
     antIdentifier,        // Variable names, labels
     antLineNumber,        // BASIC line numbers
     antLabel,             // Named label definition ("name:") for GOTO/GOSUB targets
+    antProcedureDecl,     // SUB / FUNCTION declaration (value = 'SUB' | 'FUNCTION')
     antSpecialVariable,   // Special variables (TI, TI$, DT$, etc.)
 
     // === FUNCTIONS ===

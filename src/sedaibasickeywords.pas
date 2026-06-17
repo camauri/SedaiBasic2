@@ -59,6 +59,8 @@ const
   kENDIF   = 'ENDIF';    // FreeBASIC block-IF terminator (also "END IF" two-word, later)
   kSELECT  = 'SELECT';   // SELECT CASE
   kCASE    = 'CASE';     // CASE / CASE ELSE
+  kSUB     = 'SUB';      // SUB procedure
+  kFUNCTION = 'FUNCTION';// FUNCTION procedure
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';
