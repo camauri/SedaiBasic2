@@ -540,7 +540,11 @@ begin
       WriteLn('=== LEXING ===');
     Lexer := TLexerFSM.Create;
     try
-      Lexer.SetHasLineNumbers(True);
+      // FreeBASIC/Modern dialect (no line numbers) is selected by a .fb/.fbas
+      // source extension; classic .bas keeps line numbers (optional).
+      Lexer.SetHasLineNumbers(
+        not ((LowerCase(ExtractFileExt(SourceFile)) = '.fb') or
+             (LowerCase(ExtractFileExt(SourceFile)) = '.fbas')));
       Lexer.SetRequireSpacesBetweenTokens(True);
       Lexer.SetCaseSensitive(False);
       Lexer.Source := Source.Text;

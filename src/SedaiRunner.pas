@@ -72,6 +72,7 @@ type
     FVerbose: Boolean;
     FLastError: string;
     FSkipSuperinstructions: Boolean;
+    FFreeBasicMode: Boolean;   // FreeBASIC/Modern dialect: no line numbers
 
     function CompileSource(const SourceFile: string): TBytecodeProgram;
     function LoadBytecode(const BytecodeFile: string): TBytecodeProgram;
@@ -92,6 +93,9 @@ type
     property Verbose: Boolean read FVerbose write FVerbose;
     property LastError: string read FLastError;
     property SkipSuperinstructions: Boolean read FSkipSuperinstructions write FSkipSuperinstructions;
+    // FreeBASIC/Modern dialect (no line numbers). Also auto-enabled by a .fb/.fbas
+    // source extension. Default False = classic BASIC (line numbers optional).
+    property FreeBasicMode: Boolean read FFreeBasicMode write FFreeBasicMode;
   end;
 
   { Exception for runner errors }
@@ -132,8 +136,8 @@ var
   Ext: string;
 begin
   Ext := LowerCase(ExtractFileExt(FileName));
-  if (Ext = '.bas') then
-    Result := sftSource
+  if (Ext = '.bas') or (Ext = '.fb') or (Ext = '.fbas') then
+    Result := sftSource     // .fb/.fbas = FreeBASIC dialect (no line numbers)
   else if (Ext = '.basc') then
     Result := sftBytecode
   else
@@ -214,6 +218,7 @@ var
   SSAProgram: TSSAProgram;
   Compiler: TBytecodeCompiler;
   i, removed: Integer;
+  UseFreeBasic: Boolean;
   {$IFNDEF DISABLE_REG_ALLOC}
   RegAlloc: TLinearScanAllocator;
   {$ENDIF}
@@ -243,9 +248,16 @@ begin
     end;
 
     // === LEXING ===
+    // FreeBASIC/Modern dialect: no line numbers. Selected by the FreeBasicMode
+    // property (CLI flag) or a .fb/.fbas source extension. Otherwise classic BASIC
+    // with optional line numbers. Spaces-between-tokens and case-insensitivity hold
+    // in both dialects.
+    UseFreeBasic := FFreeBasicMode or
+      (LowerCase(ExtractFileExt(SourceFile)) = '.fb') or
+      (LowerCase(ExtractFileExt(SourceFile)) = '.fbas');
     Lexer := TLexerFSM.Create;
     try
-      Lexer.SetHasLineNumbers(True);
+      Lexer.SetHasLineNumbers(not UseFreeBasic);
       Lexer.SetRequireSpacesBetweenTokens(True);
       Lexer.SetCaseSensitive(False);
       Lexer.Source := Source.Text;
