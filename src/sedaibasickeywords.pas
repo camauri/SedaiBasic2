@@ -57,6 +57,8 @@ const
   kELSE    = 'ELSE';
   kELSEIF  = 'ELSEIF';   // FreeBASIC/QB block-IF else-if
   kENDIF   = 'ENDIF';    // FreeBASIC block-IF terminator (also "END IF" two-word, later)
+  kSELECT  = 'SELECT';   // SELECT CASE
+  kCASE    = 'CASE';     // CASE / CASE ELSE
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';

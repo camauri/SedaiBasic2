@@ -1579,6 +1579,8 @@ begin
  RegisterKeyword(kELSEIF, ttConditionalElse, 'ELSEIF statement', kcConditionalFlowControl);
  RegisterKeyword(kIF,   ttConditionalIf,   'IF statement',   kcConditionalFlowControl);
  RegisterKeyword(kTHEN, ttConditionalThen, 'THEN statement', kcConditionalFlowControl);
+ RegisterKeyword(kSELECT, ttSelectCase, 'SELECT CASE statement', kcConditionalFlowControl);
+ RegisterKeyword(kCASE,   ttCaseClause, 'CASE clause',           kcConditionalFlowControl);
 
  // === FLOW CONTROL - JUMP RELATED STATEMENTS ===
  RegisterKeyword(kEXIT,   ttJumpReturn,      'Exit statement',   kcJumpFlowControl);

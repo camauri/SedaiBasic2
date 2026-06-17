@@ -108,6 +108,13 @@ type
     // Block-IF terminator: ENDIF (one word) or END IF (two words, QuickBASIC).
     function AtBlockIfTerminator: Boolean;
     procedure ConsumeBlockIfTerminator;
+    // SELECT CASE (FreeBASIC/QB), desugared to a nested IF/ELSEIF/ELSE chain whose
+    // conditions clone the selector expression.
+    function ParseSelectCase: TASTNode;
+    function ParseCaseCondition(Selector: TASTNode): TASTNode;
+    procedure ParseCaseBody(Parent: TASTNode);
+    function AtEndSelect: Boolean;
+    procedure ConsumeEndSelect;
     function ParseForStatement: TASTNode;
     function ParseDoStatement: TASTNode;
     function ParseGotoStatement: TASTNode;
@@ -462,6 +469,7 @@ begin
     ttConditionalIf: Result := Memoize('IfStatement', @ParseIfStatement);
     ttConditionalThen: Result := Memoize('ThenStatement', @ParseThenStatement);
     ttConditionalElse: Result := Memoize('ElseStatement', @ParseElseStatement);
+    ttSelectCase: Result := Memoize('SelectCase', @ParseSelectCase);
     ttLoopBlockStart: Result := Memoize('LoopStatement', @ParseLoopStatement);
     ttLoopBlockEnd: Result := Memoize('LoopEndStatement', @ParseLoopEndStatement);
     ttLoopControl: Result := Memoize('LoopControlStatement', @ParseLoopControlStatement);
@@ -1153,6 +1161,139 @@ begin
     Context.Advance;                                   // END
     Context.Advance;                                   // IF
   end;
+end;
+
+function TPackratParser.AtEndSelect: Boolean;
+begin
+  // END SELECT (two words). END is ttProgramEnd, SELECT is ttSelectCase.
+  Result := Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+            (Context.PeekNext.TokenType = ttSelectCase);
+end;
+
+procedure TPackratParser.ConsumeEndSelect;
+begin
+  if AtEndSelect then
+  begin
+    Context.Advance;   // END
+    Context.Advance;   // SELECT
+  end;
+end;
+
+// Build the condition for a CASE clause: "(sel = v1) OR (sel = v2) OR ...", where
+// each 'sel' is a fresh clone of the SELECT selector (so it isn't shared in the AST).
+function TPackratParser.ParseCaseCondition(Selector: TASTNode): TASTNode;
+var
+  ValueExpr, Cmp: TASTNode;
+begin
+  Result := nil;
+  repeat
+    ValueExpr := FExpressionParser.ParseExpression;
+    if not Assigned(ValueExpr) then Break;
+    // NB: SSA lowering reads the operator from Node.Token.TokenType, so the binary
+    // op needs a real token of that type (not nil).
+    Cmp := CreateBinaryOpNode(ttOpEq, Selector.Clone, ValueExpr,
+                              TLexerToken.CreateSimple(ttOpEq, '='));     // sel = value
+    if Result = nil then
+      Result := Cmp
+    else
+      Result := CreateBinaryOpNode(ttBitwiseOR, Result, Cmp,
+                                   TLexerToken.CreateSimple(ttBitwiseOR, 'OR'));  // OR chain
+    if Context.Check(ttSeparParam) then
+      Context.Advance      // consume ',' and parse the next value
+    else
+      Break;
+  until False;
+end;
+
+// Collect the statements of a CASE body into Parent, until the next CASE, END
+// SELECT or end-of-file. (Like ParseBlockIfBody: a nil statement is not a stop.)
+procedure TPackratParser.ParseCaseBody(Parent: TASTNode);
+var
+  Statement: TASTNode;
+  PrevIdx: Integer;
+begin
+  while not Context.Check(ttEndOfFile) do
+  begin
+    if Context.Match(ttEndOfLine) then Continue;
+    if Context.Check(ttSeparStmt) then begin Context.Advance; Continue; end;
+    if Context.Check(ttCaseClause) or AtEndSelect then Break;
+    PrevIdx := Context.CurrentIndex;
+    Statement := ParseStatement;
+    if Assigned(Statement) then
+      Parent.AddChild(Statement)
+    else if Context.CurrentIndex = PrevIdx then
+      Break;
+  end;
+end;
+
+function TPackratParser.ParseSelectCase: TASTNode;
+var
+  Token: TLexerToken;
+  Selector, RootIf, PrevIf, CurIf, ThenNode, ElseNode, Cond, BlockNode: TASTNode;
+  IsFirst: Boolean;
+begin
+  // SELECT CASE <selector> / CASE <values> ... / [CASE ELSE ...] / END SELECT
+  // Desugared to a nested IF/ELSEIF/ELSE chain (conditions clone the selector).
+  Token := Context.CurrentToken;
+  Context.Advance;                                  // consume SELECT
+  if Context.Check(ttCaseClause) then Context.Advance;   // consume CASE
+  Selector := ParseExpression;
+
+  RootIf := nil; PrevIf := nil; IsFirst := True;
+  while (not Context.Check(ttEndOfFile)) and (not AtEndSelect) do
+  begin
+    if Context.Match(ttEndOfLine) then Continue;
+    if Context.Check(ttSeparStmt) then begin Context.Advance; Continue; end;
+    if not Context.Check(ttCaseClause) then Break;   // unexpected token
+    Context.Advance;                                 // consume CASE
+
+    if Context.Check(ttConditionalElse) then
+    begin
+      // CASE ELSE — the default branch; closes the chain.
+      Context.Advance;                               // consume ELSE
+      if Assigned(PrevIf) then
+      begin
+        ElseNode := TASTNode.Create(antElse, Token);
+        ParseCaseBody(ElseNode);
+        PrevIf.AddChild(ElseNode);
+      end
+      else
+      begin
+        // SELECT with only CASE ELSE: the body always runs (wrap in a block).
+        BlockNode := TASTNode.Create(antBlock, Token);
+        ParseCaseBody(BlockNode);
+        RootIf := BlockNode;
+      end;
+      Break;
+    end
+    else
+    begin
+      // CASE value [, value ...]
+      Cond := ParseCaseCondition(Selector);
+      ThenNode := TASTNode.Create(antThen, Token);
+      ParseCaseBody(ThenNode);
+      CurIf := TASTNode.Create(antIf, Token);
+      CurIf.AddChild(Cond);
+      CurIf.AddChild(ThenNode);
+      if IsFirst then
+      begin
+        RootIf := CurIf;
+        IsFirst := False;
+      end
+      else
+      begin
+        ElseNode := TASTNode.Create(antElse, Token);
+        ElseNode.AddChild(CurIf);                    // ELSEIF = nested IF in ELSE
+        PrevIf.AddChild(ElseNode);
+      end;
+      PrevIf := CurIf;
+    end;
+  end;
+
+  ConsumeEndSelect;
+  if Assigned(Selector) then Selector.Free;          // only clones were used
+  Result := RootIf;                                  // nil if there were no clauses
+  if Assigned(Result) then DoNodeCreated(Result);
 end;
 
 function TPackratParser.ParseElseStatement: TASTNode;

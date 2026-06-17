@@ -123,6 +123,8 @@ type
     ttConditionalEnd,         // ENDIF, ENDCASE, ENDSWITCH
     ttConditionalIf,          // IF
     ttConditionalThen,        // THEN, DO (in conditional context)
+    ttSelectCase,             // SELECT (CASE)
+    ttCaseClause,             // CASE
 
     // === FLOW CONTROL - JUMP RELATED STATEMENTS ===
     ttJumpGoto,                // GOTO
