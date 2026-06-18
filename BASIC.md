@@ -1187,7 +1187,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `ENUM...END ENUM` | ✗ | User defined enumeration of values |
-| `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar fields (int/float/string), `DIM v AS T`, `v.field`. Member procedures, nested UDT, arrays-of-UDT deferred |
+| `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, record params, `v.a.b` chained access, FUNCTION-returns-UDT, WITH. Member procedures (OOP) deferred to M4 |
 | `CLASS...END CLASS` | ✗ | Not implemented. Keyword reserved. |
 | `UNION...END UNION` | ✗ | User defined structure of overlapping data |
 | `EXTENDS` | ✗ | Extends an user defined type to derive another |
@@ -1205,7 +1205,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `THIS` | ✗ | Built-in, hidden, parameter passed to non-static member procedures to access the user defined type instance |
 | `BASE (member access)` | ✗ | Built-in, hidden, variable to access the base user defined type instance in derived user defined types |
 | `Type Alias` | ✗ | Declares a user defined type from other user defined or standard data types |
-| `WITH` | ✗ | Compound statement to access the data and members of a user defined type |
+| `WITH` | ✓ | `WITH rec` ... `END WITH`: leading `.field` resolves against the record (M3.2) |
 
 ##### Member Procedures
 
