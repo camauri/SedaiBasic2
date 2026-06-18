@@ -89,12 +89,15 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `BEGIN` | ✓ | Starts code block |
 | `BEND` | ✓ | Ends code block |
 
-## Procedures (2/2 - 100%)
+## Procedures (5/5 - 100%)
 
 | Command | Status | Description |
 |---------|--------|-------------|
 | `DEF` | ✓ | Define function (DEF FNname(var) = expression) |
 | `FN` | ✓ | Function call (FNname(value)) |
+| `SUB` | ✓ | Structured SUB procedure (FreeBASIC/QB): params (ByVal), locals, recursion. `END SUB` |
+| `FUNCTION` | ✓ | Structured FUNCTION: params, return via `fname=expr` or `RETURN expr`, recursion. `END FUNCTION` |
+| `CALL` | ✓ | Invoke a SUB: `CALL name(args)` (or `CALL name args`); `EXIT SUB`/`EXIT FUNCTION` for early return |
 
 ## Data Management (7/7 - 100%)
 
@@ -1139,3 +1142,1303 @@ The following PETSCII codes are silently ignored because they require full-scree
 - Use `COLOR` command for more control over foreground/background colors
 - Reverse mode affects all text until explicitly turned off
 - Color changes persist until changed again or screen is cleared
+
+---
+
+# FreeBASIC Keyword Reference & Implementation Status
+
+> **Scope.** SedaiBasic is evolving toward a FreeBASIC-style language (see
+> `job/docs/SEDAIBASIC_EVOLUTION.md`). This section catalogues the **complete FreeBASIC keyword
+> set**, organized exactly as in the official FreeBASIC manual
+> ([DocToc](https://www.freebasic.net/wiki/DocToc)), together with SedaiBasic's current support.
+> Sourced from the FreeBASIC wiki (Language Documentation + Runtime Library Reference), June 2026.
+>
+> **Legend.** ✓ = the keyword name is a **recognized SedaiBasic command** (the Commodore BASIC v7
+> core plus the M1/M2 structured subset: block `IF`/`ELSEIF`/`END IF`, `SELECT CASE`, `FOR`/`NEXT`,
+> `DO`/`LOOP`, named labels, `SUB`/`FUNCTION`/`CALL`/`EXIT`/`RETURN`). ✗ = not implemented.
+> Note: a ✓ marks name recognition — exact semantics may still differ from FreeBASIC (e.g. FB's OOP
+> `TYPE`, pointers, threading, and preprocessor are not present). This is a forward-looking gap map,
+> not a claim of FreeBASIC compatibility.
+>
+> **Coverage (FreeBASIC-keyword overlap):** Language **93/363**, Runtime Library **72/280**,
+> total **165/643**.
+
+## Language Documentation
+
+### Variables and Data Types
+
+#### Variable Declarations
+
+| Keyword | Status | Description |
+|---|---|---|
+| `DIM` | ✓ | Declares a variable at the current scope. |
+| `CONST` | ✓ | Declares a non-modifiable variable. |
+| `SCOPE` | ✗ | Begins a new scope block. |
+| `STATIC` | ✗ | Declares variables in a procedure that retain their value between calls. |
+| `SHARED` | ✗ | Used with Dim allows variables to be visible throughout a module. |
+| `VAR` | ✗ | Declares variables where the data type is implied from an initializer. |
+| `BYREF (variables)` | ✗ | Used with Dim or Static or Var allows to declare references. |
+
+#### User Defined Types
+
+##### Declarations
+
+| Keyword | Status | Description |
+|---|---|---|
+| `ENUM...END ENUM` | ✗ | User defined enumeration of values |
+| `TYPE...END TYPE` | ✗ | User defined structure of non overlapping data and member procedures |
+| `CLASS...END CLASS` | ✗ | Not implemented. Keyword reserved. |
+| `UNION...END UNION` | ✗ | User defined structure of overlapping data |
+| `EXTENDS` | ✗ | Extends an user defined type to derive another |
+| `EXTENDS WSTRING` | ✗ | Extends an user defined type to inherits Wstring behavior |
+| `EXTENDS ZSTRING` | ✗ | Extends an user defined type to inherits Zstring behavior |
+| `IMPLEMENTS` | ✗ | Not implemented. Keyword reserved. |
+| `FIELD` | ✗ | Specifies field alignment within a user defined type |
+| `OBJECT` | ✗ | Built-in type providing run-time type information |
+
+##### Referencing
+
+| Keyword | Status | Description |
+|---|---|---|
+| `Temporary Types` | ✗ | Creates a temporary copy of a user defined type |
+| `THIS` | ✗ | Built-in, hidden, parameter passed to non-static member procedures to access the user defined type instance |
+| `BASE (member access)` | ✗ | Built-in, hidden, variable to access the base user defined type instance in derived user defined types |
+| `Type Alias` | ✗ | Declares a user defined type from other user defined or standard data types |
+| `WITH` | ✗ | Compound statement to access the data and members of a user defined type |
+
+##### Member Procedures
+
+| Keyword | Status | Description |
+|---|---|---|
+| `BASE (initialization)` | ✗ | Specifies an initializer for the base user defined type in derived user defined type constructors |
+| `CONSTRUCTOR` | ✗ | Declares or defines a member procedure that is automatically called when a user defined type is created |
+| `DESTRUCTOR` | ✗ | Declares or defines a member procedure that is automatically called when a user defined type is destroyed or goes out of scope |
+| `FUNCTION` | ✓ | Declares or defines a member procedure returning a value |
+| `OPERATOR` | ✗ | Declares or defines an overloaded operator |
+| `OVERRIDE` | ✗ | Member method attribute that specifies that the method is expected to override a virtual method in the base user defined type |
+| `PROPERTY` | ✗ | Declares or defines property member procedures for a user defined type |
+| `SUB` | ✓ | Declare or defines a member procedure |
+| `STATIC (Member)` | ✗ | Declares or defines a member procedure or variable is static |
+| `VIRTUAL` | ✗ | Member method attribute that declares that a member must have an implementation |
+| `ABSTRACT` | ✗ | Member method attribute that declares that a member must be implemented in a derived user defined type |
+| `CONST (Member)` | ✓ | Member method attribute that declares or defines that the method is readonly and does not modify the user defined types's data |
+
+##### Member Access Control
+
+| Keyword | Status | Description |
+|---|---|---|
+| `PUBLIC: (Access Control)` | ✗ | Data and members in a user defined type have public visibility |
+| `PRIVATE: (Access Control)` | ✗ | Data and members in a user defined type have private visibility |
+| `PROTECTED: (Access Control)` | ✗ | Data and members in a user defined type have protected visibility |
+
+#### Standard Data Types
+
+##### Integer types
+
+| Keyword | Status | Description |
+|---|---|---|
+| `BYTE and UBYTE` | ✗ | 8-bit wide data types that store integer values. |
+| `SHORT and USHORT` | ✗ | 16-bit wide data types that store integer values. |
+| `LONG and ULONG` | ✗ | 32-bit wide data types that store integer values. |
+| `INTEGER and UINTEGER` | ✗ | 32-bit or 64-bit wide data types that store integer values. |
+| `LONGINT and ULONGINT` | ✗ | 64-bit wide data types that store integer values. |
+
+##### Floating-point types
+
+| Keyword | Status | Description |
+|---|---|---|
+| `SINGLE` | ✗ | 32-bit wide data types that store real number values. |
+| `DOUBLE` | ✗ | 64-bit wide data types that store real number values. |
+
+##### Boolean types
+
+| Keyword | Status | Description |
+|---|---|---|
+| `BOOLEAN` | ✗ | 1-bit wide data types that store boolean values. |
+
+##### Procedure Types
+
+| Keyword | Status | Description |
+|---|---|---|
+| `FUNCTION Pointer` | ✓ | Types that store a pointer to a function procedure |
+| `SUB Pointer` | ✓ | Types that store a pointer to a sub procedure |
+
+##### Data Type Modifiers
+
+| Keyword | Status | Description |
+|---|---|---|
+| `CONST` | ✓ | Specifies a read only type. |
+| `POINTER and PTR (Shortcut for 'POINTER')` | ✓ | Modifies types to be pointer types. |
+| `UNSIGNED` | ✗ | Specifies an unsigned integer type. |
+| `ALIAS (Modifier)` | ✗ | Modifies how a datatype is linked with other languages (Name mangling). |
+
+##### String types
+
+| Keyword | Status | Description |
+|---|---|---|
+| `STRING` | ✗ | Fixed-length and variable-length strings with built-in memory management. |
+| `ZSTRING` | ✗ | Fixed-length and variable-length null-terminated strings. |
+| `WSTRING` | ✗ | Fixed-length and variable-length null-terminated strings of wide characters. |
+
+##### Class types
+
+| Keyword | Status | Description |
+|---|---|---|
+| `OBJECT` | ✗ | Super class providing run-time type information |
+
+#### Converting Between Data Types
+
+##### Generic conversions
+
+| Keyword | Status | Description |
+|---|---|---|
+| `CAST and CPTR` | ✗ | Converts expressions between different types. |
+
+##### Conversions to integral types
+
+| Keyword | Status | Description |
+|---|---|---|
+| `CBYTE and CUBYTE` | ✗ | Converts numeric expressions to 8-bit values. |
+| `CSHORT and CUSHORT` | ✗ | Converts numeric expressions to 16-bit values. |
+| `CLNG and CULNG` | ✗ | Converts numeric expressions to 32-bit values. |
+| `CINT and CUINT` | ✗ | Converts numeric expressions to 32-bit or 64-bit values. |
+| `CLNGINT and CULNGINT` | ✗ | Converts numeric expressions to 64-bit values. |
+| `CSIGN` | ✗ | Converts a numeric expression to a signed-type value. |
+| `CUNSG` | ✗ | Converts a numeric expression to an unsigned-type value. |
+
+##### Conversions to floating-point types
+
+| Keyword | Status | Description |
+|---|---|---|
+| `CSNG and CDBL` | ✗ | Converts a numeric or string expression to floating-point values. |
+
+##### Conversions to/from string types
+
+| Keyword | Status | Description |
+|---|---|---|
+| `STR and WSTR` | ✗ | Converts numeric expressions or booleans to their string representation. |
+| `VAL` | ✓ | Converts a numeric string expression to a floating-point value. |
+| `VALINT and VALUINT` | ✗ | Converts numeric string expressions to integer values. |
+| `VALLNG and VALULNG` | ✗ | Converts numeric string expressions to long values. |
+
+##### Conversion to boolean types
+
+| Keyword | Status | Description |
+|---|---|---|
+| `CBOOL` | ✗ | Converts a numeric or string expression to a boolean value. |
+
+### Operators
+
+#### Assignment Operators
+
+| Keyword | Status | Description |
+|---|---|---|
+| `= (Assignment)` | ✓ |  |
+| `&= (Concatenate and Assign)` | ✗ |  |
+| `+= (Add and Assign)` | ✗ |  |
+| `-= (Subtract and Assign)` | ✗ |  |
+| `*= (Multiply and Assign)` | ✗ |  |
+| `/= (Divide and Assign)` | ✗ |  |
+| `\= (Integer Divide and Assign)` | ✗ |  |
+| `^= (Exponentiate and Assign)` | ✗ |  |
+| `MOD= (Modulus and Assign)` | ✗ |  |
+| `AND= (Conjunction and Assign)` | ✗ |  |
+| `EQV= (Equivalence and Assign)` | ✗ |  |
+| `IMP= (Implication and Assign)` | ✗ |  |
+| `OR= (Inclusive Disjunction and Assign)` | ✗ |  |
+| `XOR= (Exclusive Disjunction and Assign)` | ✗ |  |
+| `SHL= (Shift Left and Assign)` | ✗ |  |
+| `SHR= (Shift Right and Assign)` | ✗ |  |
+| `LET (Assign)` | ✓ |  |
+| `LET() (Assignment)` | ✓ |  |
+
+#### Type Cast Operators
+
+| Keyword | Status | Description |
+|---|---|---|
+| `CAST (operator)` | ✗ |  |
+| `CPTR` | ✗ |  |
+
+#### Arithmetic Operators
+
+| Keyword | Status | Description |
+|---|---|---|
+| `+ (Add)` | ✓ |  |
+| `- (Subtract)` | ✓ |  |
+| `* (Multiply)` | ✓ |  |
+| `/ (Divide)` | ✓ |  |
+| `\ (Integer divide)` | ✗ |  |
+| `^ (Exponentiate)` | ✓ |  |
+| `MOD (Modulus)` | ✓ |  |
+| `- (Negate)` | ✓ |  |
+| `SHL (Shift left)` | ✗ |  |
+| `SHR (Shift right)` | ✗ |  |
+
+#### Indexing Operators
+
+| Keyword | Status | Description |
+|---|---|---|
+| `() (Array index)` | ✗ |  |
+| `[] (String index)` | ✗ |  |
+| `[] (Pointer index)` | ✗ |  |
+
+#### String Operators
+
+| Keyword | Status | Description |
+|---|---|---|
+| `+ (String concatenation)` | ✓ |  |
+| `& (String concatenation with conversion)` | ✗ |  |
+| `STRPTR (String pointer)` | ✗ |  |
+
+#### Relational Operators
+
+| Keyword | Status | Description |
+|---|---|---|
+| `= (Equal)` | ✓ |  |
+| `<> (Not equal)` | ✓ |  |
+| `< (Less than)` | ✓ |  |
+| `<= (Less than or equal)` | ✓ |  |
+| `>= (Greater than or equal)` | ✓ |  |
+| `> (Greater than)` | ✓ |  |
+
+#### Bitwise Operators
+
+| Keyword | Status | Description |
+|---|---|---|
+| `AND (Conjunction)` | ✓ |  |
+| `EQV (Equivalence)` | ✗ |  |
+| `IMP (Implication)` | ✗ |  |
+| `NOT (Complement)` | ✓ |  |
+| `OR (Inclusive Disjunction)` | ✓ |  |
+| `XOR (Exclusive Disjunction)` | ✓ |  |
+
+#### Short Circuit Operators
+
+| Keyword | Status | Description |
+|---|---|---|
+| `ANDALSO (Short Circuit Conjunction)` | ✗ |  |
+| `ORELSE (Short Circuit Inclusive Disjunction)` | ✗ |  |
+
+#### Preprocessor Operators
+
+| Keyword | Status | Description |
+|---|---|---|
+| `# (Argument stringize)` | ✗ |  |
+| `## (Argument concatenation)` | ✗ |  |
+| `! (Escaped String Literal)` | ✗ |  |
+| `$ (Non-Escaped String Literal)` | ✗ |  |
+
+#### Pointer Operators
+
+| Keyword | Status | Description |
+|---|---|---|
+| `@ (Address of)` | ✗ |  |
+| `* (Value of)` | ✓ |  |
+| `VARPTR (Variable pointer)` | ✗ |  |
+| `PROCPTR (Procedure pointer and vtable index)` | ✗ |  |
+
+#### Type or Class Operators
+
+| Keyword | Status | Description |
+|---|---|---|
+| `. (Member access)` | ✗ |  |
+| `-> (Pointer to member access)` | ✗ |  |
+| `IS (Run-time type information operator)` | ✗ |  |
+
+#### Memory Operators
+
+| Keyword | Status | Description |
+|---|---|---|
+| `New Expression` | ✓ |  |
+| `New Overload` | ✓ |  |
+| `Placement New` | ✗ |  |
+| `Delete Statement` | ✓ |  |
+| `Delete Overload` | ✓ |  |
+
+#### Iteration Operators
+
+| Keyword | Status | Description |
+|---|---|---|
+| `For` | ✓ |  |
+| `Next` | ✓ |  |
+| `Step` | ✓ |  |
+
+### Statements
+
+#### Control Flow
+
+##### Transferring Statements
+
+| Keyword | Status | Description |
+|---|---|---|
+| `GOTO` | ✓ | Transfers execution to another point in code defined by a text label. |
+| `GOSUB` | ✓ | Temporarily transfers execution to another point in code, defined by a text label. |
+| `ON GOTO` | ✓ | Transfers execution to one of a number of points in code defined by text labels, based on the value of an expression. |
+| `ON GOSUB` | ✓ | Temporarily transfers execution to one of a number of points in code defined by text labels, based on the value of an expression. |
+| `RETURN (from procedure)` | ✓ | Returns from a procedure returning a value. |
+| `RETURN (from Gosub)` | ✓ | Returns from a call using Gosub. |
+| `EXIT SUB, EXIT FUNCTION, EXIT OPERATOR,` | ✓ |  |
+| `EXIT CONSTRUCTOR, EXIT DESTRUCTOR and EXIT PROPERTY` | ✓ | Prematurely leaves a procedure code block. |
+
+##### Branching Statements
+
+| Keyword | Status | Description |
+|---|---|---|
+| `IF..END IF` | ✓ | Executes a block of statements if a condition is met. |
+| `..ELSE IF..` | ✓ | Executes a block of code if a condition is met and all previous conditions weren't met. |
+| `..ELSE..` | ✓ | Executes a block of code if all previous conditions weren't met. |
+| `SELECT..END SELECT` | ✓ | Executes one of a number of statement blocks using a set of conditions. |
+| `..CASE..` | ✓ | Executes a block of code if a condition is met. |
+| `..CASE ELSE..` | ✓ | Executes a block of code if all previous conditions weren't met. |
+| `EXIT SELECT` | ✓ | Prematurely breaks out of a SELECT..END SELECT statement. |
+
+##### Looping Statements
+
+| Keyword | Status | Description |
+|---|---|---|
+| `WHILE..WEND (or 'WHILE...END WHILE')` | ✓ | Executes a block of statements while a condition is met. |
+| `FOR..NEXT` | ✓ | Executes a block of statements while an iterator is less than or greater than an expression. |
+| `DO..LOOP` | ✓ | Executes a block of statements while or until a condition is met. |
+| `CONTINUE WHILE, CONTINUE FOR and CONTINUE DO` | ✗ | Prematurely re-enters a loop. |
+| `EXIT WHILE, EXIT FOR and EXIT DO` | ✓ | Prematurely breaks out of a loop. |
+
+#### Procedures
+
+##### Declaration
+
+| Keyword | Status | Description |
+|---|---|---|
+| `Declare` | ✗ | Declares a module-level or member procedure. |
+| `Sub` | ✓ | Specifies a procedure that does not return an argument. |
+| `Function` | ✓ | Specifies a procedure that returns an argument. |
+| `Overload` | ✗ | Specifies that the procedure name can be used in other procedure declarations. |
+| `Static` | ✗ | Specifies static storage for all variables and objects in the procedure body. |
+| `Const (Member)` | ✓ | Specifies a const member procedure in user-defined type definitions. |
+| `Static (Member)` | ✗ | Specifies a static member procedure in user-defined type definitions. |
+
+##### Linkage
+
+| Keyword | Status | Description |
+|---|---|---|
+| `Public` | ✗ | Specifies external linkage for a procedure. |
+| `Private` | ✗ | Specifies internal linkage for a procedure. |
+| `Alias` | ✗ | Specifies an alternate external name for a procedure. |
+| `Export` | ✗ | Specifies a procedure is to be exported from a shared library. |
+| `Lib` | ✗ | Specifies automatic loading of a library. |
+
+##### Calling conventions
+
+| Keyword | Status | Description |
+|---|---|---|
+| `Stdcall` | ✗ | Specifies the standard calling convention for BASIC languages, including FreeBASIC. |
+| `Cdecl` | ✗ | Specifies the standard calling convention in the C and C++ languages. |
+| `Pascal` | ✗ | Specifies the standard calling convention in the Fortran, Pascal and Microsoft QuickBASIC/QBasic languages. |
+| `Fastcall` | ✗ | Specifies the fastcall calling convention for 32-bit procedures. |
+| `Thiscall` | ✗ | Specifies the thiscall calling convention for 32-bit member procedures. |
+
+##### Parameter passing conventions
+
+| Keyword | Status | Description |
+|---|---|---|
+| `Byref` | ✗ | Specifies passing an argument by reference. |
+| `Byval` | ✗ | Specifies passing an argument by value. |
+| `Any` | ✗ | Disables type-checking on arguments. |
+
+##### Variadic Procedures
+
+| Keyword | Status | Description |
+|---|---|---|
+| `... (Ellipsis)` | ✗ | Indicates a variadic procedure in a declaration. |
+| `VA_FIRST` | ✗ | Macro to obtain the argument list in a variadic procedure. |
+| `VA_ARG` | ✗ | Macro to obtain the current argument in a variadic procedure. |
+| `VA_NEXT` | ✗ | Macro to move to the next argument in a variadic procedure. |
+
+##### Automatic execution
+
+| Keyword | Status | Description |
+|---|---|---|
+| `Constructor (Module)` | ✗ | Indicates a procedure is to be executed before module-level code. |
+| `Destructor (Module)` | ✗ | Indicates a procedure is to be executed after module-level code. |
+
+##### Miscellaneous
+
+| Keyword | Status | Description |
+|---|---|---|
+| `Byref (function results)` | ✗ | Specifies that a function returns by reference rather than by value. |
+| `Call` | ✓ | Invokes a procedure. |
+| `Naked` | ✗ | Specifies that a function body is not to be given any prolog/epilog code |
+
+#### Modularizing
+
+| Keyword | Status | Description |
+|---|---|---|
+| `COMMON` | ✗ |  |
+| `DYLIBFREE` | ✗ |  |
+| `DYLIBLOAD` | ✗ |  |
+| `DYLIBSYMBOL` | ✗ |  |
+| `EXPORT` | ✗ |  |
+| `EXTERN` | ✗ |  |
+| `EXTERN...END EXTERN` | ✗ |  |
+| `IMPORT` | ✗ |  |
+| `NAMESPACE` | ✗ |  |
+| `PRIVATE` | ✗ |  |
+| `PUBLIC` | ✗ |  |
+| `USING (Namespaces)` | ✓ |  |
+
+### Other
+
+#### Preprocessor
+
+##### Conditional Compilation
+
+| Keyword | Status | Description |
+|---|---|---|
+| `#IF` | ✗ | Compiles the following code block based on a condition. |
+| `#IFDEF` | ✗ | Compiles the following code block if a symbol is defined. |
+| `#IFNDEF` | ✗ | Compiles the following code block if a symbol is not defined. |
+| `#ELSEIF` | ✗ | Compiles the following code block if a condition is true and the previous conditions was false. |
+| `#ELSEIFDEF` | ✗ | Compiles the following code block if a symbol is defined and the previous conditions was false. |
+| `#ELSEIFNDEF` | ✗ | Compiles the following code block if a symbol is not defined and the previous conditions was false. |
+| `#ELSE` | ✗ | Compiles the following code block if previous conditions were false. |
+| `#ENDIF` | ✗ | Signifies the end of a code block. |
+| `DEFINED` | ✗ | Returns "-1" if a symbol is defined, otherwise "0". |
+
+##### Text Replacement
+
+| Keyword | Status | Description |
+|---|---|---|
+| `#DEFINE` | ✗ | Creates a single-line text-replacement macro. |
+| `#MACRO and #ENDMACRO` | ✗ | Creates a multi-line text-replacement macro. |
+| `#UNDEF` | ✗ | Undefines a symbol. |
+| `# Preprocessor stringize` | ✗ | Converts text into a string literal. |
+| `## Preprocessor concatenate` | ✗ | Concatenates two pieces of text. |
+| `! Escaped String Literal` | ✗ | Indicates string literal immediately following must be processed for escape sequences. |
+| `$ Non-Escaped String Literal` | ✗ | Indicates string literal immediately following must not be processed for escape sequences. |
+
+##### File Directives
+
+| Keyword | Status | Description |
+|---|---|---|
+| `#INCLUDE` | ✗ | Inserts text from a file. |
+| `#INCLIB` | ✗ | Includes a library in the linking processes. |
+| `#LIBPATH` | ✗ | Includes a path to search for libraries in the linking process. |
+
+##### Control Directives
+
+| Keyword | Status | Description |
+|---|---|---|
+| `#PRAGMA` | ✗ | Sets compiling options. |
+| `#PRAGMA RESERVE` | ✗ | Reserves symbol name. |
+| `#CMDLINE` | ✗ | Sets compiler command options from source. |
+| `#LANG` | ✗ | Sets dialect from source. |
+| `#PRINT` | ✗ | Outputs a messages to standard output while compiling. |
+| `#ERROR` | ✗ | Outputs a messages to standard output and stops compilation. |
+| `#ASSERT` | ✗ | Stops compilation with an error message if a given condition is false. |
+| `#LINE` | ✗ | Sets the current line number and file name. |
+
+##### Metacommands
+
+| Keyword | Status | Description |
+|---|---|---|
+| `'$INCLUDE` | ✗ | Alternate form of the #INCLUDE directive. |
+| `'$DYNAMIC` | ✗ | Alternate form of the OPTION DYNAMIC statement. |
+| `'$STATIC` | ✗ | Alternate form of the OPTION STATIC statement. |
+| `'$LANG` | ✗ | Alternate form of the #lang directive. |
+
+#### Meta-statements
+
+##### Metacommands
+
+##### Compiler Options
+
+##### Set Default Datatypes
+
+| Keyword | Status | Description |
+|---|---|---|
+| `DEFLONGINT` | ✗ |  |
+| `DEFULONGINT` | ✗ |  |
+
+#### Intrinsic Defines
+
+##### Platform Information
+
+| Keyword | Status | Description |
+|---|---|---|
+| `__FB_WIN32__` | ✗ | Defined if compiling for Windows. |
+| `__FB_LINUX__` | ✗ | Defined if compiling for Linux. |
+| `__FB_DOS__` | ✗ | Defined if compiling for DOS. |
+| `__FB_CYGWIN__` | ✗ | Defined if compiling for Cygwin. |
+| `__FB_FREEBSD__` | ✗ | Defined if compiling for FreeBSD. |
+| `__FB_NETBSD__` | ✗ | Defined if compiling for NetBSD. |
+| `__FB_OPENBSD__` | ✗ | Defined if compiling for OpenBSD. |
+| `__FB_DARWIN__` | ✗ | Defined if compiling for Darwin. |
+| `__FB_XBOX__` | ✗ | Defined if compiling for Xbox. |
+| `__FB_BIGENDIAN__` | ✗ | Defined if compiling on a system using big-endian byte-order. |
+| `__FB_PCOS__` | ✗ | Defined if compiling for a common PC OS (e.g. DOS, Windows, OS/2). |
+| `__FB_UNIX__` | ✗ | Defined if compiling for a Unix-like OS. |
+| `__FB_64BIT__` | ✗ | Defined if compiling for a 64bit target. |
+| `__FB_ARM__` | ✗ | Defined if compiling for the ARM architecture. |
+| `__FB_PPC__` | ✗ | Defined if compiling for the PowerPC architecture. |
+| `__FB_X86__` | ✗ | Defined if compiling for the X86 / X86_64 architecture. |
+| `__FB_JS__` | ✗ | Defined if compiling for emscripten target. |
+| `__FB_ANDROID__` | ✗ | Defined if compiling for android target. |
+
+##### Version Information
+
+| Keyword | Status | Description |
+|---|---|---|
+| `__FB_VERSION__` | ✗ | Defined as a string literal of the compiler version. |
+| `__FB_VER_MAJOR__` | ✗ | Defined as an integral literal of the compiler major version number. |
+| `__FB_VER_MINOR__` | ✗ | Defined as an integral literal of the compiler minor version number. |
+| `__FB_VER_PATCH__` | ✗ | Defined as an integral literal of the compiler patch number. |
+| `__FB_MIN_VERSION__` | ✗ | Macro to check for a minimum compiler version. |
+| `__FB_BUILD_DATE__` | ✗ | Defined as a string literal of the compiler build date in "mm-dd-yyyy" format. |
+| `__FB_BUILD_DATE_ISO__` | ✗ | Defined as a string literal of the compiler build date in "yyyy-mm-dd" format. |
+| `__FB_SIGNATURE__` | ✗ | Defined as a string literal of the compiler signature. |
+| `__FB_BUILD_SHA1__` | ✗ | Defined as a string literal of the compiler's source revision sha-1. |
+| `__FB_BUILD_FORK_ID__` | ✗ | Defined as a string literal of the custom defined project fork identifier name. |
+
+##### Command-line switches
+
+| Keyword | Status | Description |
+|---|---|---|
+| `__FB_ASM__` | ✗ | Defined to either "intel" or "att" depending on -asm. |
+| `__FB_BACKEND__` | ✗ | Defined to either "gas" or "gcc" depending on -gen. |
+| `__FB_GCC__` | ✗ | True (-1) if -gen gcc is used, false (0) otherwise. |
+| `__FB_OPTIMIZE__` | ✗ | Defined to the optimization level depending on -O. |
+| `__FB_GUI__` | ✗ | True (-1) if the "-s gui" switch was used, false (0) otherwise. |
+| `__FB_MAIN__` | ✗ | Defined if compiling a module with an entry point. |
+| `__FB_DEBUG__` | ✗ | True (-1) if the "-g" switch was used, false (0) otherwise. |
+| `__FB_ERR__` | ✗ | Zero (0) if neither the "-e", "-ex" or "-exx" switches were used. |
+| `__FB_FPMODE__` | ✗ | Defined as "fast" if compiling for fast SSE math, "precise" otherwise. |
+| `__FB_FPU__` | ✗ | Defined as "sse" if compiling for SSE floating point unit, or "x87" for normal x87 floating-point unit. |
+| `__FB_LANG__` | ✗ | Defined to a string literal of the "-lang" dialect used. |
+| `__FB_MT__` | ✗ | True (-1) if the "-mt" switch was used, false (0) otherwise. |
+| `__FB_OUT_DLL__` | ✗ | True (-1) in a module being compiled and linked into a shared library, false (0) otherwise. |
+| `__FB_OUT_EXE__` | ✗ | True (-1) in a module being compiled and linked into an executable, false (0) otherwise. |
+| `__FB_OUT_LIB__` | ✗ | True (-1) in a module being compiled and linked into a static library, zero (0) otherwise. |
+| `__FB_OUT_OBJ__` | ✗ | True (-1) in a module being compiled only, zero (0) otherwise. |
+| `__FB_PROFILE__` | ✗ | Set to an integer to indicate the profiling method. |
+| `__FB_SSE__` | ✗ | Defined if compiling for SSE floating point unit. |
+| `__FB_VECTORIZE__` | ✗ | Defined as the level of automatic vectorization (0 to 2) |
+
+##### Environment Information
+
+| Keyword | Status | Description |
+|---|---|---|
+| `__FB_ARGC__` | ✗ | Defined as an integer literal of the number of command-line arguments passed to the program. |
+| `__FB_ARGV__` | ✗ | Defined as a Zstring Ptr Ptr to the command line arguments passed to the program. |
+| `__DATE__` | ✗ | Defined as a string literal of the compilation date in "mm-dd-yyyy" format. |
+| `__DATE_ISO__` | ✗ | Defined as a string literal of the compilation date in "yyyy-mm-dd" format. |
+| `__TIME__` | ✗ | Defined as a string literal of the compilation time. |
+| `__PATH__` | ✗ | Defined as a string literal of the absolute path of the module. |
+
+##### Context-specific Information
+
+| Keyword | Status | Description |
+|---|---|---|
+| `__FILE__ and __FILE_NQ__` | ✗ | Defined as the name of the module. |
+| `__FUNCTION__ and __FUNCTION_NQ__` | ✗ | Defined as the name of the procedure where it's used. |
+| `__LINE__` | ✗ | Defined as an integer literal of the line of the module where it's used. |
+| `__FB_OPTION_BYVAL__` | ✗ | True (-1) if parameters are declared by value by default, zero (0) otherwise. |
+| `__FB_OPTION_DYNAMIC__` | ✗ | True (-1) if all arrays are variable-length, zero (0) otherwise. |
+| `__FB_OPTION_ESCAPE__` | ✗ | True (-1) if string literals are processed for escape sequences, zero (0) otherwise. |
+| `__FB_OPTION_GOSUB__` | ✗ | True (-1) if gosub support is enabled, zero (0) otherwise. |
+| `__FB_OPTION_EXPLICIT__` | ✗ | True (-1) if variables and objects need to be explicitly declared, zero (0) otherwise. |
+| `__FB_OPTION_PRIVATE__` | ✗ | True (-1) if all procedures are private by default, zero (0) otherwise. |
+| `__FB_OPTION_PROFILE__` | ✗ | True (-1) if profiling code is generated, zero (0) otherwise. |
+
+##### Basic-macros
+
+| Keyword | Status | Description |
+|---|---|---|
+| `__FB_ARG_COUNT__` | ✗ | Counts the number of arguments in an argument list. |
+| `__FB_ARG_EXTRACT__` | ✗ | Returns nth argument from an argument list. |
+| `__FB_ARG_LEFTOF__` | ✗ | Returns left token based on separator. |
+| `__FB_ARG_LISTEXPAND__` | ✗ | Expands a macro one or more time on an argument list |
+| `__FB_ARG_RIGHTOF__` | ✗ | Returns right token based on separator. |
+| `__FB_EVAL__` | ✗ | Evaluates an argument (expression) at compile time. |
+| `__FB_IIF__` | ✗ | Returns an expression depending on the result of a comparison expression evaluated at compile time. |
+| `__FB_JOIN__` | ✗ | Joins two token arguments together as one. |
+| `__FB_QUERY_SYMBOL__` | ✗ | Queries a fbc's symbol internals. |
+| `__FB_QUOTE__` | ✗ | Converts the argument to a string. |
+| `__FB_UNIQUEID__` | ✗ | Gets the identifier at the top of a stack. |
+| `__FB_UNIQUEID_POP__` | ✗ | Pops an identifier off of a stack. |
+| `__FB_UNIQUEID_PUSH__` | ✗ | Pushes a new unique identifier on to a stack. |
+| `__FB_UNQUOTE__` | ✗ | Takes a literal string and converts it back to tokens. |
+
+##### Constants
+
+| Keyword | Status | Description |
+|---|---|---|
+| `FALSE and TRUE` | ✗ | Intrinsic constants for the Boolean data type. |
+
+#### Error Handling
+
+| Keyword | Status | Description |
+|---|---|---|
+| `Err` | ✗ |  |
+
+##### Default error handling
+
+| Keyword | Status | Description |
+|---|---|---|
+| `Open` | ✓ |  |
+| `Put #` | ✓ |  |
+
+##### QuickBASIC-like error handling
+
+| Keyword | Status | Description |
+|---|---|---|
+| `On Error` | ✓ |  |
+| `On Error Goto 0 disables the error handling. If an error handling routine is not set when an error occurs, the program will stop and send the console an error message. Aborting program due to runtime error 2 (file not found) The error handler routine can be at the end of the program, as in QB. The On Local Error` | ✓ |  |
+| `Sub` | ✓ |  |
+| `Function` | ✓ |  |
+| `Resume` | ✓ |  |
+| `Resume Next` | ✓ |  |
+
+##### Error codes
+
+| Keyword | Status | Description |
+|---|---|---|
+| `Error` | ✗ |  |
+
+##### 'On [Local] Error Goto' statement use
+
+| Keyword | Status | Description |
+|---|---|---|
+| `Error` | ✗ |  |
+| `Error` | ✗ |  |
+| `Local` | ✗ |  |
+| `Local` | ✗ |  |
+| `Local` | ✗ |  |
+| `Resume` | ✓ |  |
+| `Resume Next` | ✓ |  |
+| `__FB_ERR__` | ✗ |  |
+
+#### Miscellaneous Keywords
+
+##### Data
+
+| Keyword | Status | Description |
+|---|---|---|
+| `DATA` | ✓ |  |
+| `READ` | ✓ |  |
+| `RESTORE` | ✓ |  |
+
+##### Debugging
+
+| Keyword | Status | Description |
+|---|---|---|
+| `ASSERT` | ✗ |  |
+| `ASSERTWARN` | ✗ |  |
+| `STOP` | ✓ |  |
+
+##### Hardware Access
+
+| Keyword | Status | Description |
+|---|---|---|
+| `INP` | ✗ |  |
+| `LPRINT` | ✗ |  |
+| `LPOS` | ✗ |  |
+| `OUT` | ✗ |  |
+| `WAIT` | ✓ |  |
+
+##### Operating System
+
+| Keyword | Status | Description |
+|---|---|---|
+| `BEEP` | ✗ |  |
+| `SLEEP` | ✓ |  |
+| `END (Statement)` | ✓ |  |
+
+##### Stub Pages
+
+| Keyword | Status | Description |
+|---|---|---|
+| `AS` | ✗ |  |
+| `FOR` | ✓ |  |
+| `TO` | ✓ |  |
+| `IS` | ✗ |  |
+| `STEP` | ✓ |  |
+
+##### Control Flow
+
+| Keyword | Status | Description |
+|---|---|---|
+| `DO` | ✓ |  |
+| `END IF` | ✓ |  |
+| `IIF` | ✗ |  |
+| `LOOP` | ✓ |  |
+| `NEXT` | ✓ |  |
+| `THEN` | ✓ |  |
+| `UNTIL` | ✓ |  |
+| `WEND (or 'END WHILE')` | ✗ |  |
+| `WHILE` | ✓ |  |
+
+##### Uncategorized
+
+| Keyword | Status | Description |
+|---|---|---|
+| `END (Block)` | ✓ |  |
+| `OFFSETOF` | ✗ |  |
+| `SIZEOF` | ✗ |  |
+| `TYPEOF` | ✗ |  |
+| `LET` | ✓ |  |
+| `REM` | ✓ |  |
+| `OPTION()` | ✓ |  |
+
+## Runtime Library Reference
+
+### Array Functions
+
+#### Defining Arrays
+
+| Keyword | Status | Description |
+|---|---|---|
+| `OPTION DYNAMIC` | ✓ | Forces arrays to be defined as variable-length arrays. |
+| `'$DYNAMIC` | ✗ | Alternate form of the OPTION DYNAMIC statement. |
+| `OPTION STATIC` | ✓ | Reverts a previous OPTION DYNAMIC command. |
+| `'$STATIC` | ✗ | Alternate form of the OPTION STATIC statement. |
+| `DIM` | ✓ | Defines any type of array. |
+| `REDIM` | ✗ | Defines and resizes variable-length arrays. |
+| `PRESERVE` | ✗ | Preserves array contents when used with REDIM. |
+
+#### Clearing Array Data
+
+| Keyword | Status | Description |
+|---|---|---|
+| `ERASE` | ✗ | Destroys variable-length array elements and initializes fixed-length array elements. |
+
+#### Retrieving Array Size
+
+| Keyword | Status | Description |
+|---|---|---|
+| `ARRAYLEN` | ✗ | Returns the total number of array elements. |
+| `ARRAYSIZE` | ✗ | Returns the total array size (in bytes). |
+| `LBOUND` | ✗ | Returns the lower bound of an array's dimension. |
+| `UBOUND` | ✗ | Returns the upper bound of an array's dimension. |
+
+#### Retrieving Array Descriptor
+
+| Keyword | Status | Description |
+|---|---|---|
+| `Array[Const]DescriptorPtr` | ✗ | Returns a [constant] pointer to array's descriptor (FBARRAY). |
+
+### Bit Manipulation
+
+| Keyword | Status | Description |
+|---|---|---|
+| `Uinteger` | ✗ |  |
+
+#### Byte Manipulation Macros
+
+| Keyword | Status | Description |
+|---|---|---|
+| `LOBYTE` | ✗ | Gets the least significant byte (LSB, or lo-byte) value of an Uinteger value. |
+| `HIBYTE` | ✗ | Gets the most significant byte (MSB, or hi-byte) value of the least significant word (LSW, or lo-word) of an Uinteger value. |
+| `LOWORD` | ✗ | Gets the least significant word (LSW, or lo-word) value of an Uinteger value. |
+| `HIWORD` | ✗ | Gets the most significant word (LSW, or hi-word) value of an Uinteger value. |
+
+#### Bit Manipulation Macros
+
+| Keyword | Status | Description |
+|---|---|---|
+| `BIT` | ✗ | Gets the state of an individual bit in an integer value. |
+| `BITRESET` | ✗ | Gets the value of an integer with a specified bit cleared. |
+| `BITSET` | ✗ | Gets the value of an integer with a specified bit set. |
+
+### Console Functions
+
+#### Configuring the Console
+
+| Keyword | Status | Description |
+|---|---|---|
+| `CLS` | ✗ | Clears the entire screen or text viewport. |
+| `WIDTH` | ✓ | Sets or returns the number of rows and columns of the console display. |
+| `VIEW PRINT` | ✗ | Sets the printable area of the console screen. |
+
+#### Cursor Color and Positioning
+
+| Keyword | Status | Description |
+|---|---|---|
+| `COLOR` | ✓ | Changes the foreground and background color of text to be written. |
+| `CSRLIN` | ✗ | Returns the row position of the cursor. |
+| `POS` | ✓ | Returns the column position of the cursor. |
+| `LOCATE` | ✓ | Sets the row and column position of the cursor and its visibility. |
+| `SCREEN (Console)` | ✗ | Gets the character or color attribute at a given location. |
+
+#### Writing Text to the Console
+
+| Keyword | Status | Description |
+|---|---|---|
+| `PRINT` | ✓ |  |
+| `? (Shortcut for 'PRINT')` | ✗ | Writes text to the console. |
+| `PRINT USING` | ✓ |  |
+| `? USING (Shortcut for 'PRINT USING')` | ✗ | Writes formatted text to the console. |
+| `WRITE` | ✗ | Writes a list of items to the console. |
+| `SPC` | ✓ | Skips a number of spaces when writing text. |
+| `TAB` | ✓ | Skips to a certain column when writing text. |
+
+### Date and Time Functions
+
+#### VisualBasic compatible procedures
+
+| Keyword | Status | Description |
+|---|---|---|
+| `NOW` | ✗ | Gets a date serial of the current date and time. |
+| `DATESERIAL` | ✗ | Gets the date serial representation of a date. |
+| `TIMESERIAL` | ✗ | Gets the date serial representation of a time. |
+| `DATEVALUE` | ✗ | Gets the date serial representation of a date expressed as a string. |
+| `TIMEVALUE` | ✗ | Gets the date serial representation of a time expressed as a string. |
+| `SECOND` | ✗ | Gets the seconds of the hour from a date serial. |
+| `MINUTE` | ✗ | Gets the minutes of the hour from a date serial. |
+| `HOUR` | ✗ | Gets the hour of the day from a date serial. |
+| `DAY` | ✗ | Gets the day of the month from a date serial. |
+| `WEEKDAY` | ✗ | Gets the day of the week from a date serial. |
+| `MONTH` | ✗ | Gets the month of the year from a date serial. |
+| `YEAR` | ✗ | Gets the year from a date serial. |
+| `DATEPART` | ✗ | Gets a time interval from a date serial. |
+| `DATEADD` | ✗ | Gets the result of a time interval added to a date serial. |
+| `DATEDIFF` | ✗ | Gets a time interval between two date serials. |
+| `ISDATE` | ✗ | Tests if a String can be converted to a date serial. |
+| `MONTHNAME` | ✗ | Gets the month name of its integer representation. |
+| `WEEKDAYNAME` | ✗ | Gets the weekday name of its integer representation. |
+
+#### Date and time procedures
+
+| Keyword | Status | Description |
+|---|---|---|
+| `DATE` | ✗ | Gets the string representation of the current system date. |
+| `TIME` | ✗ | Gets the string representation of the current system time. |
+| `SETDATE` | ✗ | Sets the current system date. |
+| `SETTIME` | ✗ | Sets the current system time. |
+| `TIMER` | ✗ | Gets a counter expressed in seconds. |
+
+### Error Handling Functions
+
+#### Determining Errors
+
+| Keyword | Status | Description |
+|---|---|---|
+| `ERL` | ✗ | Gets the line in source code where the error occurred. |
+| `ERFN` | ✗ | Gets the name of the function where the error occurred. |
+| `ERMN` | ✗ | Gets the name of the source file where the error occurred. |
+| `ERR` | ✗ | Gets the error number of the last error that occurred. |
+| `ERROR` | ✗ | Generates an error using an error number. |
+
+#### Handling Errors
+
+| Keyword | Status | Description |
+|---|---|---|
+| `ON ERROR` | ✓ | Sets a global error handler using a label. |
+| `ON LOCAL ERROR` | ✓ | Sets a local error handler using a label. |
+| `RESUME` | ✓ | Resumes execution at the line where the error occurred. |
+| `RESUME NEXT` | ✓ | Resumes execution at the line after where the error occurred. |
+
+### File I/O Functions
+
+#### Opening Files or Devices
+
+| Keyword | Status | Description |
+|---|---|---|
+| `FREEFILE` | ✗ | Gets an available file number that can be used to read or write from files or devices. |
+| `OPEN` | ✓ | Binds a file number to a physical file to provide reading and writing capabilities. |
+| `OPEN COM` | ✓ | Binds a file number to a communications port. |
+| `OPEN CONS` | ✓ | Binds a file number to the standard input and output streams. |
+| `OPEN ERR` | ✓ | Binds a file number to the standard input and error streams. |
+| `OPEN LPT` | ✓ | Binds a file number to a printer device. |
+| `OPEN PIPE` | ✓ | Binds a file number to the input and output streams of a process. |
+| `OPEN SCRN` | ✓ | Binds a file number directly to the console. |
+| `CLOSE` | ✓ | Unbinds a file number from a file or device. |
+| `RESET` | ✗ | Unbinds all active file numbers. |
+| `INPUT (File Mode)` | ✓ | Text data can be read from the file. |
+| `OUTPUT` | ✗ | Text data can be written to the file. |
+| `APPEND` | ✓ | Text data is added to the end of a file when output. |
+| `BINARY` | ✗ | Arbitrary data can be read from or written to the file. |
+| `RANDOM` | ✗ | Blocks of data of certain size can be read from and written to the file. |
+| `ACCESS` | ✗ | An overview of file access privileges. |
+| `READ (File Access)` | ✓ | Binary data can only be read from the file. |
+| `WRITE (File Access)` | ✗ | Binary data can only be written to the file. |
+| `READ WRITE(File Access)` | ✓ | Binary data can be read from and written to the file. |
+| `ENCODING` | ✗ | Specifies the character encoding of a file. |
+
+#### Reading from and Writing to Files or Devices
+
+| Keyword | Status | Description |
+|---|---|---|
+| `INPUT #` | ✓ | Reads a list of values from a file or device. |
+| `WRITE #` | ✗ | Writes a list of values to a file or device. |
+| `INPUT()` | ✓ | Reads a number of characters from a file or device. |
+| `WINPUT()` | ✗ | Reads a number of wide characters from a file or device. |
+| `LINE INPUT #` | ✗ | Reads a line of text from a file or device. |
+| `PRINT #` | ✓ |  |
+| `? # (Shortcut for 'PRINT #')` | ✗ | Writes text data to a file or device. |
+| `PUT #` | ✓ | Writes arbitrary data to a file or device. |
+| `GET #` | ✓ | Reads arbitrary data from a file or device. |
+
+#### File Position and other Info
+
+| Keyword | Status | Description |
+|---|---|---|
+| `LOF` | ✗ | Gets the length (in bytes) of a file. |
+| `LOC` | ✗ | Gets the file position of the last read or write operation. |
+| `EOF` | ✗ | Returns true if all of the data has been read from a file. |
+| `SEEK (Statement)` | ✗ | Sets the file position of the next read or write operation. |
+| `SEEK (Function)` | ✗ | Gets the file position of the next read or write operation. |
+| `LOCK` | ✗ | Restricts read or write access to a file or portion of a file. |
+| `UNLOCK` | ✗ | Remove read or write restrictions from a previous Lock command. |
+
+### Mathematical Functions
+
+#### Algebraic Procedures
+
+| Keyword | Status | Description |
+|---|---|---|
+| `ABS` | ✓ | Returns the absolute value of a number. |
+| `EXP` | ✓ | Returns e raised to some power. |
+| `LOG` | ✓ | Returns the natural logarithm of a number. |
+| `SQR` | ✓ | Returns the square root of a number. |
+| `FIX` | ✗ | Returns the integer part of a number. |
+| `FRAC` | ✗ | Returns the fractional part of a number. |
+| `INT` | ✓ | Returns the largest integer less than or equal to a number. |
+| `SGN` | ✓ | Returns the sign of a number. |
+
+#### Trigonometric Procedures
+
+| Keyword | Status | Description |
+|---|---|---|
+| `SIN` | ✓ | Returns the sine of an angle. |
+| `ASIN` | ✗ | Returns the arcsine of a number. |
+| `COS` | ✓ | Returns the cosine of an angle. |
+| `ACOS` | ✗ | Returns the arccosine of a number. |
+| `TAN` | ✓ | Returns the tangent of an angle. |
+| `ATN` | ✓ | Returns the arctangent of a number. |
+| `ATAN2` | ✗ | Returns the arctangent of the ratio between two numbers. |
+
+#### Miscellaneous Procedures
+
+| Keyword | Status | Description |
+|---|---|---|
+| `RANDOMIZE` | ✗ | Seeds the random number generator used by Rnd. |
+| `RND` | ✓ | Returns a random Double in the range [0, 1). |
+
+### Memory Functions
+
+#### Working with Dynamic Memory
+
+| Keyword | Status | Description |
+|---|---|---|
+| `ALLOCATE` | ✗ | Reserves a number of bytes of uninitialized memory and returns the address. |
+| `CALLOCATE` | ✗ | Reserves a number of bytes of initialized (zeroed) memory and returns the address. |
+| `REALLOCATE` | ✗ | Changes the size of reserved memory. |
+| `DEALLOCATE` | ✗ | Returns reserved memory back to the system. |
+
+#### Miscellaneous Procedures
+
+| Keyword | Status | Description |
+|---|---|---|
+| `PEEK` | ✓ | Reads some type of value from an address. |
+| `POKE` | ✓ | Writes some type of value to an address. |
+| `CLEAR` | ✗ | Clears data in an array with a specified value. |
+| `FB_MEMCOPY` | ✗ | Copies a block of memory from a location to another. (memory areas must not overlap) |
+| `FB_MEMCOPYCLEAR` | ✗ | Copies the first part of a block of memory from a location to another and clears the rest. (memory areas must not overlap) |
+| `FB_MEMMOVE` | ✗ | Copies a block of memory from a location to another. (memory areas may overlap) |
+| `SWAP` | ✓ | Exchange the contents of two variables. |
+| `SADD` | ✗ | Returns the address for the data in a zstring/wstring variable. |
+
+### Operating System Functions
+
+#### Working with Files
+
+| Keyword | Status | Description |
+|---|---|---|
+| `EXEC and CHAIN` | ✗ | Temporarily transfers control to another program. |
+| `RUN` | ✓ | Transfers control to another program. |
+| `KILL` | ✗ | Deletes an existing file. |
+| `NAME` | ✗ | Renames an existing file. |
+
+#### File Properties
+
+| Keyword | Status | Description |
+|---|---|---|
+| `FILEATTR` | ✗ | Gets information about a file bound to a file number. |
+| `FILECOPY` | ✗ | Copies a file. |
+| `FILEDATETIME` | ✗ | Gets the last modified date and time of a file. |
+| `FILEEXISTS` | ✗ | Tests for the existence of a file. |
+| `FILELEN` | ✗ | Gets the length (in bytes) of a file. |
+| `FILESETEOF` | ✗ | Sets the length of an open file bound to a file number. |
+| `FILEFLUSH` | ✗ | Flushes application or system buffers for an open file bound to a file number. |
+
+#### Working with Directories
+
+| Keyword | Status | Description |
+|---|---|---|
+| `CURDIR` | ✗ | Gets the current working directory. |
+| `CHDIR` | ✓ | Sets the current working directory. |
+| `DIR` | ✓ | Gets the names of files or directories matching certain attributes. |
+| `EXEPATH` | ✗ | Gets the directory of the current running program. |
+| `MKDIR` | ✓ | Creates a new directory. |
+| `RMDIR` | ✗ | Deletes an existing directory. |
+
+#### System Procedures
+
+| Keyword | Status | Description |
+|---|---|---|
+| `FRE` | ✓ | Gets the amount of free memory (in bytes) available. |
+| `COMMAND` | ✗ | Gets the command-line parameters passed to the program. |
+| `ENVIRON` | ✗ | Gets the value of an environment variable. |
+| `ISREDIRECTED` | ✗ | Checks whether stdin or stdout is redirected to a file or not. |
+| `SETENVIRON` | ✗ | Sets the value of an environment variable. |
+| `SHELL` | ✗ | Sends a command to the system command interpreter. |
+| `SYSTEM` | ✗ | Closes all open files and exits the program. |
+
+### String Functions
+
+#### Creating Strings
+
+| Keyword | Status | Description |
+|---|---|---|
+| `STRING` | ✗ | Standard data type: 8 bit character string. |
+| `STRING (Function)` | ✗ | Returns a String of multiple characters. |
+| `ZSTRING` | ✗ | Standard data type: null terminated 8 bit character string. |
+| `WSTRING` | ✗ | Standard data type: wide character string. |
+| `WSTRING (Function)` | ✗ | Returns a WString of multiple characters. |
+| `SPACE` | ✗ | Returns a String consisting of spaces. |
+| `WSPACE` | ✗ | Returns a WString consisting of spaces. |
+| `LEN` | ✓ | Returns the length of a string in characters. |
+
+#### Character Conversion
+
+| Keyword | Status | Description |
+|---|---|---|
+| `ASC` | ✓ | Returns an Integer representation of an character. |
+| `CHR` | ✗ | Returns a string of one or more characters from their ASCII Integer representation. |
+| `WCHR` | ✗ | Returns a WString of one or more characters from their Unicode Integer representation. |
+
+#### Numeric/Boolean to String Conversions
+
+| Keyword | Status | Description |
+|---|---|---|
+| `BIN` | ✗ | Returns a binary String representation of an integral value. |
+| `WBIN` | ✗ | Returns a binary WString representation of an integral value. |
+| `HEX` | ✗ | Returns a hexadecimal String representation of an integral value. |
+| `WHEX` | ✗ | Returns a hexadecimal WString representation of an integral value. |
+| `OCT` | ✗ | Returns an octal String representation of an integral value. |
+| `WOCT` | ✗ | Returns an octal WString representation of an integral value. |
+| `STR` | ✗ | Returns the String representation of numeric value or boolean. |
+| `WSTR` | ✗ | Returns the WString representation of numeric value. |
+| `FORMAT` | ✗ | Returns a formatted String representation of a Double. |
+
+#### String to Numeric Conversions
+
+| Keyword | Status | Description |
+|---|---|---|
+| `VAL` | ✓ | Returns the Double conversion of a numeric string. |
+| `VALINT` | ✗ | Returns the Integer conversion of a numeric string. |
+| `VALLNG` | ✗ | Returns the Long conversion of a numeric string. |
+| `VALUINT` | ✗ | Returns the uInteger conversion of a numeric string. |
+| `VALULNG` | ✗ | Returns the ULong conversion of a numeric string. |
+
+#### Numeric Serialization
+
+| Keyword | Status | Description |
+|---|---|---|
+| `MKD` | ✗ | Returns an eight character String representation of a Double. |
+| `MKI` | ✗ | Returns a four character String representation of a Integer. |
+| `MKL` | ✗ | Returns a four character String representation of a Long. |
+| `MKLONGINT` | ✗ | Returns an eight character String representation of a Longint. |
+| `MKS` | ✗ | Returns a four character String representation of a Single. |
+| `MKSHORT` | ✗ | Returns a two character String representation of a Short. |
+| `CVD` | ✗ | Returns a Double representation of an eight character String. |
+| `CVI` | ✗ | Returns an Integer representation of a four character String. |
+| `CVL` | ✗ | Returns a Long representation of a four character String. |
+| `CVLONGINT` | ✗ | Returns a Longint representation of an eight character String. |
+| `CVS` | ✗ | Returns a Single representation of a four character String. |
+| `CVSHORT` | ✗ | Returns a Short representation of a two character String. |
+
+#### Working with Substrings
+
+| Keyword | Status | Description |
+|---|---|---|
+| `LEFT` | ✗ | Returns a substring of the leftmost characters in a string. |
+| `MID (Function)` | ✗ | Returns a substring of a string. |
+| `RIGHT` | ✗ | Returns a substring of the rightmost characters in a string. |
+| `LCASE` | ✗ | Returns a copy of a string converted to lowercase alpha characters. |
+| `UCASE` | ✗ | Returns a copy of a string converted to uppercase alpha characters. |
+| `LTRIM` | ✗ | Removes surrounding substrings or characters on the left side of a string. |
+| `RTRIM` | ✗ | Removes surrounding substrings or characters on the right side of a string. |
+| `TRIM` | ✗ | Removes surrounding substrings or characters on the left and right side of a string. |
+| `INSTR` | ✓ | Returns the first occurrence of a substring or character within a string. |
+| `INSTRREV` | ✗ | Returns the last occurrence of a substring or character within a string. |
+| `MID (Statement)` | ✗ | Copies a substring to a substring of a string. |
+| `LSET` | ✗ | Left-justifies a string. |
+| `RSET` | ✗ | Right-justifies a string. |
+
+### Threading Support Functions
+
+#### Threads
+
+| Keyword | Status | Description |
+|---|---|---|
+| `THREADCALL` | ✗ | Starts a procedure with parameters in a separate thread of execution. |
+| `THREADCREATE` | ✗ | Starts a procedure in a separate thread of execution. |
+| `THREADWAIT` | ✗ | Waits for a thread to finish and releases the thread handle. |
+| `THREADDETACH` | ✗ | Releases a thread handle without waiting for the thread to finish. |
+| `THREADSELF` | ✗ | Returns the thread handle of the current thread. |
+
+#### Mutexes
+
+| Keyword | Status | Description |
+|---|---|---|
+| `MUTEXCREATE` | ✗ | Creates a mutex. |
+| `MUTEXLOCK` | ✗ | Acquires a lock on a mutex. |
+| `MUTEXUNLOCK` | ✗ | Releases a lock on a mutex. |
+| `MUTEXDESTROY` | ✗ | Destroys a mutex that is no longer needed. |
+
+#### Conditional Variables
+
+| Keyword | Status | Description |
+|---|---|---|
+| `CONDCREATE` | ✗ | Creates a conditional variable. |
+| `CONDWAIT` | ✗ | Pauses execution of a threaded procedure. |
+| `CONDSIGNAL` | ✗ | Resumes execution of a threaded procedure waiting for a conditional. |
+| `CONDBROADCAST` | ✗ | Resumes all threaded procedures waiting for a conditional. |
+| `CONDDESTROY` | ✗ | Destroys a conditional variable that is no longer needed. |
+
+### User Input Functions
+
+#### Reading values from the keyboard buffer
+
+| Keyword | Status | Description |
+|---|---|---|
+| `INPUT` | ✓ | Reads values from the keyboard buffer. |
+| `LINE INPUT` | ✗ | Reads a line of text from the keyboard buffer. |
+| `INPUT()` | ✓ | Reads a number of characters from the keyboard buffer, file or device. |
+| `WINPUT()` | ✗ | Reads a number of wide characters from the keyboard buffer, file or device. |
+
+#### Reading keys from the keyboard buffer
+
+| Keyword | Status | Description |
+|---|---|---|
+| `INKEY` | ✗ | Gets the first key, if any, waiting in the keyboard buffer. |
+| `GETKEY` | ✓ | Gets and waits for the first key in the keyboard buffer. |
+
+#### Detecting key status by keyboard scancode
+
+| Keyword | Status | Description |
+|---|---|---|
+| `MULTIKEY` | ✗ | Detects the status of a key by its scancode. |
+
+### Graphics - 2D Drawing
+
+#### Working with Color
+
+| Keyword | Status | Description |
+|---|---|---|
+| `COLOR` | ✓ | Sets the foreground and background color to use with the drawing procedures. |
+| `PALETTE` | ✗ | Gets or sets color table information in paletted modes. |
+| `RGB` | ✗ | Returns a color value for hi/truecolor modes. |
+| `RGBA` | ✓ | Returns a color value including alpha (transparency) for hi/truecolor modes. |
+| `POINT` | ✗ | Gets a pixel value from an image buffer or screen. |
+
+#### Drawing to Image Buffers
+
+| Keyword | Status | Description |
+|---|---|---|
+| `PSET and PRESET` | ✗ | Plots a single pixel on an image buffer or screen. |
+| `LINE (GRAPHICS)` | ✗ | Plots a line of pixels on an image buffer or screen. |
+| `CIRCLE` | ✓ | Plots circles and ellipses on an image buffer or screen. |
+| `DRAW` | ✓ | Draws in a sequence of commands on an image buffer or screen. |
+| `DRAW STRING` | ✓ | Writes text to an image buffer or screen. |
+| `PAINT` | ✓ | Fills an area with color on an image buffer or screen. |
+
+#### Image Buffer Creation
+
+| Keyword | Status | Description |
+|---|---|---|
+| `GET (GRAPHICS)` | ✓ | Creates an image buffer from a portion of another image buffer or screen. |
+| `IMAGECREATE` | ✗ | Creates an image buffer of a certain size and pixel depth. |
+| `IMAGEDESTROY` | ✗ | Frees an image buffer resource. |
+| `IMAGECONVERTROW` | ✗ | Converts a row of pixels in an image buffer to a different color depth. |
+| `IMAGEINFO` | ✗ | Retrieves useful information about an image buffer |
+| `BLOAD` | ✓ | Creates an image buffer from a file. |
+| `BSAVE` | ✓ | Saves an image buffer to a file. |
+
+#### Blitting Image Buffers
+
+| Keyword | Status | Description |
+|---|---|---|
+| `PUT (GRAPHICS)` | ✓ | Blits an image buffer to another image buffer or screen. |
+| `ADD` | ✗ | Saturated addition of the source and target components. |
+| `ALPHA` | ✗ | Blend using a uniform transparency or the image buffer's alpha channel. |
+| `AND (Graphics Put)` | ✓ | Combine the source and target components using a bitwise And |
+| `OR` | ✓ | Combine the source and target components using a bitwise Or |
+| `PSET` | ✗ | Directly copy pixel colors from the source to the destination. |
+| `TRANS` | ✗ | Pixels matching the transparent mask color are not blitted. |
+| `CUSTOM` | ✗ | Allows a custom blending procedure to be used. |
+| `XOR` | ✓ | Combine the source and target components using a bitwise Xor |
+
+### Graphics - User Input
+
+#### Mouse and Joystick Input
+
+| Keyword | Status | Description |
+|---|---|---|
+| `GETMOUSE` | ✗ | Gets button and axis information for the mouse. |
+| `SETMOUSE` | ✗ | Sets position and visibility of the mouse cursor. |
+| `GETJOYSTICK` | ✗ | Gets button and axis information for gaming devices. |
+| `STICK` | ✗ | Gets axis position for gaming devices. |
+| `STRIG` | ✗ | Gets button state for gaming devices. |
+
+#### Keyboard Input
+
+| Keyword | Status | Description |
+|---|---|---|
+| `MULTIKEY` | ✗ | Gets key information for the keyboard. |
+
+### Graphics - Screen
+
+#### Working with screen modes
+
+| Keyword | Status | Description |
+|---|---|---|
+| `SCREENLIST` | ✗ | Gets the available fullscreen resolutions. |
+| `SCREEN (Graphics) and SCREENRES` | ✗ | Sets a new graphics display mode. |
+| `SCREENINFO` | ✗ | Gets information about the system desktop or current display mode. |
+| `SCREENCONTROL` | ✗ | Gets or sets internal graphics library settings. |
+| `SCREENEVENT` | ✗ | Gets system events. |
+| `SCREENGLPROC` | ✗ | Returns the address of an OpenGL procedure. |
+| `WINDOWTITLE` | ✗ | Sets the running program's window caption. |
+
+#### Working with pages
+
+| Keyword | Status | Description |
+|---|---|---|
+| `CLS` | ✗ | Clears the entire screen or viewport. |
+| `SCREENSET` | ✗ | Sets the current work and visible pages. |
+| `SCREENCOPY and PCOPY and FLIP` | ✗ | Copies pixel data from one page to another. |
+| `SCREENSYNC` | ✗ | Waits for the vertical refresh of the monitor. |
+
+#### Working video memory
+
+| Keyword | Status | Description |
+|---|---|---|
+| `SCREENPTR` | ✗ | Gets the address of the working page's framebuffer. |
+| `SCREENLOCK` | ✗ | Locks the current working page's framebuffer for direct access. |
+| `SCREENUNLOCK` | ✗ | Reverts a previous ScreenLock command. |
+
+#### Screen Metrics
+
+| Keyword | Status | Description |
+|---|---|---|
+| `VIEW (GRAPHICS)` | ✗ | Sets a clipping region for all drawing and blitting procedures. |
+| `WINDOW` | ✓ | Sets a new coordinate mapping for the current viewport. |
+| `PMAP` | ✗ | Converts coordinates between physical and view mappings. |
+| `POINTCOORD` | ✗ | Queries Draw's pen position. |
+
+#### Screen Data Types
+
+| Keyword | Status | Description |
+|---|---|---|
+| `EVENT` | ✗ | Data type for ScreenEvent function. |
