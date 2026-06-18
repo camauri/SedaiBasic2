@@ -1213,7 +1213,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `BASE (initialization)` | ✗ | Specifies an initializer for the base user defined type in derived user defined type constructors |
-| `CONSTRUCTOR` | ◐ | Member procedure auto-called when an instance is created. M4.4a: `CONSTRUCTOR Type()` runs at `DIM v AS T` (nested members first, then the object); inherited if the subtype has none. Parameterised ctors / `NEW` / base-chaining deferred (M4.4b+) |
+| `CONSTRUCTOR` | ◐ | Member procedure auto-called when an instance is created. M4.4a: `CONSTRUCTOR Type()` runs at `DIM v AS T` (nested members first, then the object); inherited if the subtype has none. M4.4b: parameterised `DIM v AS T(args)`. Overloading / `NEW` / base-chaining deferred (M4.4c) |
 | `DESTRUCTOR` | ✗ | Declares or defines a member procedure that is automatically called when a user defined type is destroyed or goes out of scope |
 | `FUNCTION` | ✓ | Declares or defines a member procedure returning a value |
 | `OPERATOR` | ✗ | Declares or defines an overloaded operator |
