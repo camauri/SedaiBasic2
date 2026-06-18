@@ -528,7 +528,7 @@ begin
     ttProcedureDefine: Result := Memoize('DefStatement', @ParseDefStatement);
     ttProcedureStart:
       if (UpperCase(Token.Value) = kSUB) or (UpperCase(Token.Value) = kFUNCTION) or
-         (UpperCase(Token.Value) = kCONSTRUCTOR) then
+         (UpperCase(Token.Value) = kCONSTRUCTOR) or (UpperCase(Token.Value) = kDESTRUCTOR) then
         Result := Memoize('ProcedureDecl', @ParseProcedureDecl)
       else
         Result := Memoize('FnStatement', @ParseFnStatement);
@@ -1305,12 +1305,13 @@ begin
     NameTok := Context.CurrentToken;
     QualName := UpperCase(NameTok.Value);
     Context.Advance;
-    if Kind = kCONSTRUCTOR then
+    if (Kind = kCONSTRUCTOR) or (Kind = kDESTRUCTOR) then
     begin
-      // CONSTRUCTOR Type(...) — the identifier is the owner type; the method is "Type.CONSTRUCTOR"
-      // with an implicit THIS AS Type. Auto-called when an instance is allocated (M4.4).
+      // CONSTRUCTOR/DESTRUCTOR Type(...) — the identifier is the owner type; the method is
+      // "Type.CONSTRUCTOR" / "Type.DESTRUCTOR" with an implicit THIS AS Type. Auto-called at
+      // instance allocation (M4.4) / scope exit (V5).
       MethodType := QualName;
-      QualName := MethodType + '.' + kCONSTRUCTOR;
+      QualName := MethodType + '.' + Kind;
     end
     else if Context.Check(ttOpDot) then
     begin

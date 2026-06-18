@@ -101,6 +101,7 @@ type
     FCurrentProcIsFunction: Boolean;
     FCurrentProcRetRecType: string;   // V3: UDT type the current FUNCTION returns by value (else '')
     FCurrentResultHandle: TSSAValue;  // V3: register holding the caller's result-instance handle
+    FCurrentProcLocalRecs: TStringList;  // V5: "VARNAME|TYPENAME" of the proc's DIM'd local UDTs
     FCurrentThisType: string;   // M4.1: owner UDT type while lowering a method body (THIS's type)
     // UDT/record support (M3)
     FUDTs: array of TUDTType;            // declared record types
@@ -143,6 +144,9 @@ type
     procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer);  // alloc nested records
     procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
                                   ArgsNode: TASTNode = nil);  // M4.4 (ArgsNode: M4.4b ctor args)
+    procedure EmitDestructorCall(const HandleVal: TSSAValue; const TypeName: string);  // V5
+    procedure CollectLocalRecordVars(Node: TASTNode);  // V5: gather a proc body's DIM'd local UDTs
+    procedure EmitFrameDestructors;                     // V5: dtor calls for the current frame
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
     procedure EmitUserFunctionCall(const Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
@@ -333,6 +337,7 @@ begin
   FNeededDispatchers := TStringList.Create;
   FNeededDispatchers.Duplicates := dupIgnore;
   FNeededDispatchers.Sorted := True;
+  FCurrentProcLocalRecs := TStringList.Create;
 end;
 
 destructor TSSAGenerator.Destroy;
@@ -347,6 +352,7 @@ begin
   FVarExplicitType.Free;
   FArrayRecordType.Free;
   FNeededDispatchers.Free;
+  FCurrentProcLocalRecs.Free;
   inherited Destroy;
 end;
 
@@ -8501,6 +8507,65 @@ begin
   EmitCallSubLabel(ProcedureLabelName(Lbl));
 end;
 
+procedure TSSAGenerator.EmitDestructorCall(const HandleVal: TSSAValue; const TypeName: string);
+// V5: if TypeName (or an ancestor) declares a DESTRUCTOR, call it on the instance (THIS handle in
+// int transfer slot 0). Destructors take no arguments. Emitted at scope exit, before the records
+// are reclaimed (V2), so the body still sees valid storage.
+var
+  Lbl: string;
+begin
+  Lbl := ResolveMethodLabel(TypeName, 'DESTRUCTOR');
+  if Lbl = '' then Exit;
+  EmitXferStore(srtInt, 0, HandleVal);
+  EmitCallSubLabel(ProcedureLabelName(Lbl));
+end;
+
+procedure TSSAGenerator.CollectLocalRecordVars(Node: TASTNode);
+// V5: recursively gather the DIM'd UDT (record) variables in a procedure body, in textual order,
+// as "VARNAME|TYPENAME" entries in FCurrentProcLocalRecs (used to emit destructor calls at exit).
+var
+  k, c: Integer;
+  Decl: TASTNode;
+  VName, TName: string;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType = antDim then
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(k);
+      if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 2) and
+         (Decl.GetChild(1).NodeType = antIdentifier) then          // DIM v AS T (typed scalar)
+      begin
+        TName := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        if FindUDT(TName) >= 0 then
+        begin
+          VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+          FCurrentProcLocalRecs.Add(VName + '|' + TName);
+        end;
+      end;
+    end;
+  for c := 0 to Node.ChildCount - 1 do
+    CollectLocalRecordVars(Node.GetChild(c));   // recurse into nested blocks (IF/FOR/...)
+end;
+
+procedure TSSAGenerator.EmitFrameDestructors;
+// V5: emit destructor calls for the current procedure's DIM'd local UDTs, in reverse construction
+// order, on each frame-exit path. Each acts on the variable's current instance handle.
+var
+  i, bar: Integer;
+  VName, TName: string;
+begin
+  if (FCurrentProcLocalRecs = nil) or (FCurrentProcLocalRecs.Count = 0) then Exit;
+  for i := FCurrentProcLocalRecs.Count - 1 downto 0 do
+  begin
+    bar := Pos('|', FCurrentProcLocalRecs[i]);
+    if bar <= 0 then Continue;
+    VName := Copy(FCurrentProcLocalRecs[i], 1, bar - 1);
+    TName := Copy(FCurrentProcLocalRecs[i], bar + 1, MaxInt);
+    EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+  end;
+end;
+
 procedure TSSAGenerator.EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);
 // Value-semantics copy (FreeBASIC): copy each field of the source instance into the destination
 // instance (which already owns its own storage). Nested-UDT members are copied recursively (deep
@@ -8978,6 +9043,8 @@ begin
     FCurrentProcRetType := GetVariableType(Name);
     FCurrentProcRetRecType := VarRecordTypeName(Name);   // V3: '' unless it returns a UDT by value
     FCurrentResultHandle := MakeSSAValue(svkNone);
+    FCurrentProcLocalRecs.Clear;                          // V5: gather DIM'd local UDTs for dtors
+    CollectLocalRecordVars(Proc);
     // Method body (M4.1): the owner type (before the '.') is THIS's type while lowering here.
     if Pos('.', Name) > 0 then
       FCurrentThisType := Copy(Name, 1, Pos('.', Name) - 1)
@@ -9033,6 +9100,7 @@ begin
     // Guarantee a trailing return frame (covers a fall-off-the-end body).
     if not Assigned(FCurrentBlock) then
       FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel(LabelName + '_END'));
+    EmitFrameDestructors;   // V5: destroy local UDTs on the fall-through exit path
     EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     FCurrentBlock := nil;   // procedure body terminated
@@ -9041,6 +9109,7 @@ begin
     FCurrentThisType := '';
     FCurrentProcRetRecType := '';
     FCurrentResultHandle := MakeSSAValue(svkNone);
+    FCurrentProcLocalRecs.Clear;
   end;
 end;
 
@@ -9207,6 +9276,7 @@ begin
         // EXIT SUB / EXIT FUNCTION inside a procedure -> frame return.
         if FInProcedure and ((Pos('SUB', ExitKind) > 0) or (Pos('FUNCTION', ExitKind) > 0)) then
         begin
+          EmitFrameDestructors;   // V5
           EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           FCurrentBlock := nil;
@@ -9221,6 +9291,7 @@ begin
         else if FInProcedure then
         begin
           // Bare EXIT inside a procedure with no enclosing loop -> frame return.
+          EmitFrameDestructors;   // V5
           EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           FCurrentBlock := nil;
@@ -9247,6 +9318,7 @@ begin
           else
             EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, RetVal);
         end;
+        EmitFrameDestructors;   // V5: destroy local UDTs before returning
         EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         FCurrentBlock := nil;

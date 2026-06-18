@@ -1584,6 +1584,7 @@ begin
  RegisterKeyword(kSUB,      ttProcedureStart, 'SUB procedure',      kcProcedures);
  RegisterKeyword(kFUNCTION, ttProcedureStart, 'FUNCTION procedure', kcProcedures);
  RegisterKeyword(kCONSTRUCTOR, ttProcedureStart, 'TYPE constructor', kcProcedures);
+ RegisterKeyword(kDESTRUCTOR,  ttProcedureStart, 'TYPE destructor',  kcProcedures);
  RegisterKeyword(kBYVAL,    ttParamMode,      'Pass by value',      kcProcedures);
  RegisterKeyword(kBYREF,    ttParamMode,      'Pass by reference',  kcProcedures);
  RegisterKeyword(kCALL,     ttCallSub,        'Call a SUB',         kcProcedures);
