@@ -668,8 +668,11 @@ var
  LeftSide, Expression: TASTNode;
  Token: TLexerToken;
  SavedToken: TLexerToken;
+ LhsIsExpr: Boolean;   // LHS built by the expression parser (member/array): may be a call stmt
 begin
  Token := Context.CurrentToken;
+ SavedToken := Token;   // default (member/array LHS branches don't set it; avoids nil on error)
+ LhsIsExpr := False;
 
   // Parse left side - can be A or A(i) or special variable (TI$)
   if Context.Check(ttOpDot) then
@@ -677,6 +680,7 @@ begin
     // Leading '.field = ...' inside a WITH block (M3.2): the expression parser's prefix rule
     // resolves it against the current WITH object.
     LeftSide := FExpressionParser.ParseExpression(precCall);
+    LhsIsExpr := True;
   end
   else if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
     ((Context.PeekNext.TokenType = ttDelimParOpen) or
@@ -685,6 +689,7 @@ begin
     // Array access A(i) or member access rec.field - use the expression parser to build
     // the full target (antArrayAccess / antMemberAccess); it stops before '=' (lower prec).
     LeftSide := FExpressionParser.ParseExpression(precCall);
+    LhsIsExpr := True;
   end
   else if Context.Check(ttIdentifier) then
   begin
@@ -712,6 +717,15 @@ begin
   //WriteLn('DEBUG: Looking for =, current token: "', Context.CurrentToken.Value, '" type=', Ord(Context.CurrentToken.TokenType));
   if not Context.Match(ttOpEq) then
   begin
+    // No '=': if the LHS came from the expression parser (member/array access) it is not an
+    // assignment but a call/expression statement (e.g. obj.method(args)) — return nil quietly
+    // so the caller falls back to an expression statement, without recording a syntax error.
+    if LhsIsExpr then
+    begin
+      if Assigned(LeftSide) then LeftSide.Free;
+      Result := nil;
+      Exit;
+    end;
     //WriteLn('DEBUG: NO = found! Generating error!');
     // *** USA IL TOKEN SALVATO, NON IL CORRENTE ***
     HandleError('Expected "=" in assignment', SavedToken);
@@ -1258,25 +1272,49 @@ end;
 function TPackratParser.ParseProcedureDecl: TASTNode;
 var
   Token, NameTok: TLexerToken;
-  Kind: string;
-  NameNode, ParamList, ParamNode: TASTNode;
+  Kind, MethodType, QualName: string;
+  NameNode, ParamList, ParamNode, ThisNode: TASTNode;
 begin
-  // SUB|FUNCTION name [ ( param [, param ...] ) ] [AS type] <body> END SUB|FUNCTION
-  // v1: bare identifier params (BYVAL/BYREF and AS-type are a later refinement).
+  // SUB|FUNCTION name [ ( params ) ] [AS type] <body> END SUB|FUNCTION
+  // Method form (M4.1): SUB|FUNCTION Type.method(...) — qualified name "TYPE.METHOD" with an
+  // implicit first parameter THIS AS Type (the instance handle).
   Token := Context.CurrentToken;
   Kind := UpperCase(Token.Value);                 // 'SUB' or 'FUNCTION'
   Context.Advance;                                // consume SUB / FUNCTION
   Result := TASTNode.CreateWithValue(antProcedureDecl, Kind, Token);
 
+  MethodType := '';
   if Context.Check(ttIdentifier) then
   begin
     NameTok := Context.CurrentToken;
-    NameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
+    QualName := UpperCase(NameTok.Value);
     Context.Advance;
+    if Context.Check(ttOpDot) then
+    begin
+      // Type.method — a method of an existing TYPE. The method name may be a reserved word
+      // (e.g. SCALE, LEN), so accept any alphabetic token here.
+      Context.Advance;                            // consume '.'
+      if Context.Check(ttIdentifier) or
+         ((Length(Context.CurrentToken.Value) > 0) and
+          (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
+      begin
+        MethodType := QualName;
+        QualName := MethodType + '.' + UpperCase(Context.CurrentToken.Value);
+        Context.Advance;                          // method name
+      end;
+    end;
+    NameNode := TASTNode.CreateWithValue(antIdentifier, QualName, NameTok);
     Result.AddChild(NameNode);
   end;
 
   ParamList := TASTNode.Create(antParameterList, Token);
+  // Implicit THIS parameter for methods: THIS AS <Type> (record handle), first in the list.
+  if MethodType <> '' then
+  begin
+    ThisNode := TASTNode.CreateWithValue(antIdentifier, 'THIS', Token);
+    ThisNode.AddChild(TASTNode.CreateWithValue(antIdentifier, MethodType, Token));
+    ParamList.AddChild(ThisNode);
+  end;
   if Context.Check(ttDelimParOpen) then
   begin
     Context.Advance;                              // (

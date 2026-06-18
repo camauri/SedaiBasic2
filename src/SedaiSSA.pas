@@ -96,6 +96,7 @@ type
     FCurrentProcName: string;
     FCurrentProcRetType: TSSARegisterType;
     FCurrentProcIsFunction: Boolean;
+    FCurrentThisType: string;   // M4.1: owner UDT type while lowering a method body (THIS's type)
     // UDT/record support (M3)
     FUDTs: array of TUDTType;            // declared record types
     FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
@@ -137,6 +138,10 @@ type
     // handle register and UDT type name. False if it is not a record object.
     function ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
                                  out TypeName: string): Boolean;
+    // OOP (M4.1): UDT type name of an object expression (no code emitted); method dispatch.
+    function ObjectTypeName(ObjNode: TASTNode): string;
+    procedure ProcessMethodCall(ObjNode: TASTNode; const MethodLabel: string;
+                                ArgsNode: TASTNode; out Result: TSSAValue);
     // Map parameter at Index (within ParamList) to its transfer-bank type and per-bank slot.
     function ParamBankAndSlot(ParamList: TASTNode; Index: Integer; out RT: TSSARegisterType): Integer;
     procedure EmitXferStore(RT: TSSARegisterType; Slot: Integer; const Val: TSSAValue);
@@ -529,6 +534,8 @@ var
   OpCode: TSSAOpCode;
   FuncName, VarName: string;
   FuncRetType: TSSARegisterType;  // M2: user FUNCTION return type
+  MethodObjNode: TASTNode;        // M4.1: object of a method call
+  MethodOwnerType, MethodLabelName: string;  // M4.1
   ArgValue, ArgReg: TSSAValue;
   TempReg, IntReg: Integer;
   IntRegVal, TempVal: TSSAValue;
@@ -2102,6 +2109,23 @@ begin
           Exit;
         end;
 
+        // Method call obj.method(args) (M4.1): child0 is a member access whose field is a
+        // method of the object's type. Pass the object as the implicit THIS argument.
+        if Node.GetChild(0).NodeType = antMemberAccess then
+        begin
+          MethodObjNode := Node.GetChild(0).GetChild(0);
+          MethodOwnerType := ObjectTypeName(MethodObjNode);
+          if MethodOwnerType <> '' then
+          begin
+            MethodLabelName := MethodOwnerType + '.' + UpperCase(VarToStr(Node.GetChild(0).Value));
+            if FProcDecls.ContainsKey(MethodLabelName) then
+            begin
+              ProcessMethodCall(MethodObjNode, MethodLabelName, Node.GetChild(1), Result);
+              Exit;
+            end;
+          end;
+        end;
+
         // First child is array name
         if Node.GetChild(0).NodeType <> antIdentifier then
         begin
@@ -2345,9 +2369,14 @@ begin
   VarName := VarToStr(VarNode.Value);
 
   // FUNCTION result (M2): "fname = expr" inside a FUNCTION body sets the return value.
+  // Also accepts the unqualified method name inside a FUNCTION method (M4.1): for a method
+  // PT.SUM, "SUM = expr" works (the qualified "PT.SUM = expr" would parse as member access).
   // Evaluate the expression and stage it into the result transfer slot (delivered to the
   // caller on bcReturnSub). QB semantics: execution continues; the actual return is at END.
-  if FInProcedure and FCurrentProcIsFunction and (UpperCase(VarName) = FCurrentProcName) then
+  if FInProcedure and FCurrentProcIsFunction and
+     ((UpperCase(VarName) = FCurrentProcName) or
+      (Pos('.', FCurrentProcName) > 0) and
+      (UpperCase(VarName) = Copy(FCurrentProcName, Pos('.', FCurrentProcName) + 1, MaxInt))) then
   begin
     ProcessExpression(ExprNode, ExprValue);
     EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, ExprValue);
@@ -8217,6 +8246,10 @@ end;
 function TSSAGenerator.VarRecordTypeName(const VarName: string): string;
 // Returns the UDT type name of a record variable, or '' if it isn't a record variable.
 begin
+  // THIS is method-local: its type is the owner of the method currently being lowered, not the
+  // single global "THIS" entry (which different methods would otherwise overwrite).
+  if (FCurrentThisType <> '') and (UpperCase(VarName) = 'THIS') then
+    Exit(FCurrentThisType);
   if FVarRecordType.IndexOfName(UpperCase(VarName)) < 0 then
     Result := ''
   else
@@ -8245,6 +8278,71 @@ begin
       EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal,
                       NestedHandle, MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
     end;
+end;
+
+function TSSAGenerator.ObjectTypeName(ObjNode: TASTNode): string;
+// The UDT type name of an object expression, without emitting any code. Empty if not a record.
+var
+  ArrName, ParentType, NestedT: string;
+  Bank: TSSARegisterType;
+  Slot: Integer;
+begin
+  Result := '';
+  if ObjNode = nil then Exit;
+  if ObjNode.NodeType = antIdentifier then
+    Result := VarRecordTypeName(VarToStr(ObjNode.Value))
+  else if ObjNode.NodeType = antArrayAccess then
+  begin
+    if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0).NodeType = antIdentifier) then
+    begin
+      ArrName := UpperCase(VarToStr(ObjNode.GetChild(0).Value));
+      if FArrayRecordType.IndexOfName(ArrName) >= 0 then
+        Result := FArrayRecordType.Values[ArrName];
+    end;
+  end
+  else if ObjNode.NodeType = antMemberAccess then
+  begin
+    ParentType := ObjectTypeName(ObjNode.GetChild(0));
+    if UDTFieldBankSlot(FindUDT(ParentType), VarToStr(ObjNode.Value), Bank, Slot, NestedT) then
+      Result := NestedT;
+  end;
+end;
+
+procedure TSSAGenerator.ProcessMethodCall(ObjNode: TASTNode; const MethodLabel: string;
+  ArgsNode: TASTNode; out Result: TSSAValue);
+// Lower obj.method(args): call the procedure named <Type>.<method> passing the object handle as
+// the implicit THIS first argument, then the declared args. Read the result for a FUNCTION method.
+var
+  TmpArgs: TASTNode;
+  i: Integer;
+  Decl: TASTNode;
+  RT: TSSARegisterType;
+  DestVal: TSSAValue;
+  IsFunc: Boolean;
+begin
+  Result := MakeSSAValue(svkNone);
+  // Build an argument list with the object (THIS) prepended.
+  TmpArgs := TASTNode.Create(antArgumentList, ObjNode.Token);
+  try
+    TmpArgs.AddChild(ObjNode.Clone);
+    if Assigned(ArgsNode) then
+      for i := 0 to ArgsNode.ChildCount - 1 do
+        TmpArgs.AddChild(ArgsNode.GetChild(i).Clone);
+    EmitProcedureCall(MethodLabel, TmpArgs);
+  finally
+    TmpArgs.Free;
+  end;
+
+  IsFunc := False;
+  if FProcDecls.TryGetValue(MethodLabel, Decl) and Assigned(Decl) then
+    IsFunc := UpperCase(VarToStr(Decl.Value)) = 'FUNCTION';
+  if IsFunc then
+  begin
+    RT := GetVariableType(MethodLabel);   // method return bank (record handle => int)
+    DestVal := MakeSSARegister(RT, FProgram.AllocRegister(RT));
+    EmitXferLoad(RT, XFER_RESULT_SLOT, DestVal);
+    Result := DestVal;
+  end;
 end;
 
 function TSSAGenerator.ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
@@ -8292,9 +8390,10 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);
-// Lower a record field read "obj.field" to ssaRecordLoad<bank>(dest, handle, slot).
+// Lower a record field read "obj.field" to ssaRecordLoad<bank>(dest, handle, slot). If the
+// member is not a field but a (no-arg) method of the object's type, lower a method call.
 var
-  TypeName, NestedT: string;
+  TypeName, NestedT, MethodLbl: string;
   UDTIdx, Slot: Integer;
   Bank: TSSARegisterType;
   HandleVal, DestVal: TSSAValue;
@@ -8302,9 +8401,18 @@ var
 begin
   Result := MakeSSAValue(svkNone);
   if Node.ChildCount < 1 then Exit;
-  if not ResolveRecordObject(Node.GetChild(0), HandleVal, TypeName) then Exit;
+  TypeName := ObjectTypeName(Node.GetChild(0));
+  if TypeName = '' then Exit;
   UDTIdx := FindUDT(TypeName);
-  if not UDTFieldBankSlot(UDTIdx, VarToStr(Node.Value), Bank, Slot, NestedT) then Exit;
+  if not UDTFieldBankSlot(UDTIdx, VarToStr(Node.Value), Bank, Slot, NestedT) then
+  begin
+    // Not a field — try a no-argument method call obj.method (M4.1).
+    MethodLbl := TypeName + '.' + UpperCase(VarToStr(Node.Value));
+    if FProcDecls.ContainsKey(MethodLbl) then
+      ProcessMethodCall(Node.GetChild(0), MethodLbl, nil, Result);
+    Exit;
+  end;
+  if not ResolveRecordObject(Node.GetChild(0), HandleVal, TypeName) then Exit;
 
   DestVal := MakeSSARegister(Bank, FProgram.AllocRegister(Bank));
   case Bank of
@@ -8532,6 +8640,11 @@ begin
     FCurrentProcName := Name;
     FCurrentProcIsFunction := (UpperCase(VarToStr(Proc.Value)) = 'FUNCTION');
     FCurrentProcRetType := GetVariableType(Name);
+    // Method body (M4.1): the owner type (before the '.') is THIS's type while lowering here.
+    if Pos('.', Name) > 0 then
+      FCurrentThisType := Copy(Name, 1, Pos('.', Name) - 1)
+    else
+      FCurrentThisType := '';
 
     // Entry block for the procedure body.
     FCurrentBlock := FProgram.GetOrCreateBlock(LabelName);
@@ -8561,6 +8674,7 @@ begin
     FCurrentBlock := nil;   // procedure body terminated
     FInProcedure := False;
     FCurrentProcName := '';
+    FCurrentThisType := '';
   end;
 end;
 
@@ -8650,6 +8764,10 @@ begin
       ProcessProcedureCall(Node);
     antTypeDecl:
       ;  // UDT declaration: registered in the pre-scan (RegisterUDTs); nothing to emit here.
+    antMemberAccess, antArrayAccess, antFunctionCall:
+      // Statement-level call for side effects (e.g. obj.method(args), or a function/array
+      // expression used as a statement). Lower as an expression and discard the result.
+      ProcessExpression(Node, RetVal);
     antLabel:
     begin
       // Named label "name:" — start a new basic block 'LABEL_<NAME>' (the GOTO/GOSUB
