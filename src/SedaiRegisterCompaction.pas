@@ -184,6 +184,8 @@ begin
     bcXferLoadInt,
     // UDT/record (M3): RecordNew writes the handle (int); RecordLoadInt writes an int field.
     bcRecordNew, bcRecordLoadInt,
+    // OOP (M4.3): RecordTypeId writes the runtime type-id (int).
+    bcRecordTypeId,
     // === GROUP 0: Core VM operations ===
     // Integer operations
     bcLoadConstInt, bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -341,6 +343,8 @@ begin
     // UDT/record (M3): Src1 is the record HANDLE (always an int register) for all field ops.
     bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString,
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString,
+    bcRecordTypeId,   // OOP (M4.3): Src1 = handle
+
     // === GROUP 0: Core VM operations ===
     // Int arithmetic
     bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,

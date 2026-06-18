@@ -230,6 +230,7 @@ begin
     ssaXferLoadString: Result := bcXferLoadString;
     ssaRecordNew: Result := bcRecordNew;
     ssaRecordNewArray: Result := bcRecordNewArray;
+    ssaRecordTypeId: Result := bcRecordTypeId;
     ssaRecordLoadInt: Result := bcRecordLoadInt;
     ssaRecordLoadFloat: Result := bcRecordLoadFloat;
     ssaRecordLoadString: Result := bcRecordLoadString;

@@ -166,6 +166,8 @@ begin
       Line := Format('%4d: %-20s [R%d].fld%d <- R%d', [Index, 'RecordStore', Instr.Src1, Instr.Immediate, Instr.Src2]);
     bcRecordNewArray:
       Line := Format('%4d: %-20s ARR[%d] fill records', [Index, 'RecordNewArray', Instr.Src1]);
+    bcRecordTypeId:
+      Line := Format('%4d: %-20s R%d = typeid[R%d]', [Index, 'RecordTypeId', Instr.Dest, Instr.Src1]);
     bcEnd:
       Line := Format('%4d: %-20s', [Index, 'End']);
     bcStop:

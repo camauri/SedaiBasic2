@@ -86,6 +86,7 @@ type
   { UDT/record instance storage (M3): a heap block of typed slot arrays, referenced by a
     handle (its index in the VM record heap). Per-bank slot counts come from bcRecordNew. }
   TRecordStorage = record
+    TypeId: Integer;          // M4.3: runtime UDT type id (for virtual dispatch); -1 if untyped
     IntData: array of Int64;
     FloatData: array of Double;
     StringData: array of string;
@@ -237,7 +238,7 @@ type
     procedure EnsureRegisterCapacity(RegType: TSSARegisterType; MinIndex: Integer);
     procedure FramePush;   // bcCallSub: snapshot whole register banks
     procedure FramePop;    // bcReturnSub: restore whole register banks
-    function AllocRecord(IntC, FloatC, StrC: Integer): Integer;  // M3: new record instance -> handle
+    function AllocRecord(IntC, FloatC, StrC, TypeId: Integer): Integer;  // M3: new record instance -> handle
     procedure RecordNewArrayInit(ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
     procedure CheckFloatValid(RegIndex: Integer; const OpName: string);
     function FormatUsingString(const FormatStr: string; Value: Double): string;
@@ -1094,11 +1095,12 @@ begin
     FStringRegs[i] := FFrameSaveStr[FFrameSaveStrTop + i];
 end;
 
-function TBytecodeVM.AllocRecord(IntC, FloatC, StrC: Integer): Integer;
+function TBytecodeVM.AllocRecord(IntC, FloatC, StrC, TypeId: Integer): Integer;
 // Allocate a record instance (heap block of typed slot arrays) and return its handle.
 begin
   if FRecordCount >= Length(FRecords) then
     SetLength(FRecords, (FRecordCount + 1) * 2);
+  FRecords[FRecordCount].TypeId := TypeId;
   SetLength(FRecords[FRecordCount].IntData, IntC);
   SetLength(FRecords[FRecordCount].FloatData, FloatC);
   SetLength(FRecords[FRecordCount].StringData, StrC);
@@ -1108,15 +1110,16 @@ end;
 
 procedure TBytecodeVM.RecordNewArrayInit(ArrayId: Integer; PackedCounts: Int64);
 // Eager-allocate one record instance per element of the (int handle) array and store the
-// handles. PackedCounts = intCount | floatCount<<16 | strCount<<32.
+// handles. PackedCounts = intCount | floatCount<<16 | strCount<<32 | typeId<<48.
 var
-  k, IntC, FloatC, StrC: Integer;
+  k, IntC, FloatC, StrC, TypeId: Integer;
 begin
   IntC := PackedCounts and $FFFF;
   FloatC := (PackedCounts shr 16) and $FFFF;
   StrC := (PackedCounts shr 32) and $FFFF;
+  TypeId := (PackedCounts shr 48) and $FFFF;
   for k := 0 to FArrays[ArrayId].TotalSize - 1 do
-    FArrays[ArrayId].IntData[k] := AllocRecord(IntC, FloatC, StrC);
+    FArrays[ArrayId].IntData[k] := AllocRecord(IntC, FloatC, StrC, TypeId);
 end;
 
 procedure TBytecodeVM.EnsureRegisterCapacity(RegType: TSSARegisterType; MinIndex: Integer);
@@ -2032,7 +2035,8 @@ begin
     bcXferLoadString:  FStringRegs[Instr.Dest] := FXferStr[Instr.Immediate];
     // UDT/record heap (M3)
     bcRecordNew:
-      FIntRegs[Instr.Dest] := AllocRecord(Instr.Src1, Instr.Src2, Instr.Immediate);
+      FIntRegs[Instr.Dest] := AllocRecord(Instr.Src1, Instr.Src2,
+                                          Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
     bcRecordNewArray:
       RecordNewArrayInit(Instr.Src1, Instr.Immediate);  // Src1=array id; Imm=packed slot counts
     bcRecordLoadInt:    FIntRegs[Instr.Dest] := FRecords[FIntRegs[Instr.Src1]].IntData[Instr.Immediate];
@@ -2041,6 +2045,7 @@ begin
     bcRecordStoreInt:   FRecords[FIntRegs[Instr.Src1]].IntData[Instr.Immediate] := FIntRegs[Instr.Src2];
     bcRecordStoreFloat: FRecords[FIntRegs[Instr.Src1]].FloatData[Instr.Immediate] := FFloatRegs[Instr.Src2];
     bcRecordStoreString:FRecords[FIntRegs[Instr.Src1]].StringData[Instr.Immediate] := FStringRegs[Instr.Src2];
+    bcRecordTypeId:     FIntRegs[Instr.Dest] := FRecords[FIntRegs[Instr.Src1]].TypeId;
     // System commands
     bcEnd:
       begin

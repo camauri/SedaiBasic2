@@ -249,6 +249,8 @@ const
   // Array-of-UDT eager init (M3.1): allocate one record per element of an int (handle) array
   // and store the handles. Src1=array id; Immediate packs slot counts (int|float<<16|str<<32).
   bcRecordNewArray   = bcGroupCore + 110;
+  // OOP virtual dispatch (M4.3): read an instance's runtime type-id (handle -> type-id).
+  bcRecordTypeId     = bcGroupCore + 111;  // Dest=int reg; Src1=handle reg
 
   // === GROUP 1: STRING OPERATIONS (0x01xx) ===
   bcStrConcat       = bcGroupString + 0;
@@ -1214,6 +1216,7 @@ begin
         108: Result := 'RecordStoreFloat';
         109: Result := 'RecordStoreString';
         110: Result := 'RecordNewArray';
+        111: Result := 'RecordTypeId';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

@@ -537,7 +537,8 @@ begin
         // UDT/record heap (M3)
         bcRecordNew:
           begin
-            FIntRegs[Instr.Dest] := AllocRecord(Instr.Src1, Instr.Src2, Instr.Immediate);
+            FIntRegs[Instr.Dest] := AllocRecord(Instr.Src1, Instr.Src2,
+                                      Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
             Inc(CurPC);
           end;
         bcRecordNewArray:
@@ -557,6 +558,8 @@ begin
           begin FRecords[FIntRegs[Instr.Src1]].FloatData[Instr.Immediate] := FFloatRegs[Instr.Src2]; Inc(CurPC); end;
         bcRecordStoreString:
           begin FRecords[FIntRegs[Instr.Src1]].StringData[Instr.Immediate] := FStringRegs[Instr.Src2]; Inc(CurPC); end;
+        bcRecordTypeId:
+          begin FIntRegs[Instr.Dest] := FRecords[FIntRegs[Instr.Src1]].TypeId; Inc(CurPC); end;
 
         // Array operations - typed versions are faster
         bcArrayLoadInt:

@@ -87,7 +87,7 @@ type
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString,
     // UDT/record heap (M3): allocate a record (Dest=handle, Src1/2/3=const slot counts) and
     // load/store a field (Dest or Src2 = value, Src1 = handle, Src3 = const slot index).
-    ssaRecordNew, ssaRecordNewArray,
+    ssaRecordNew, ssaRecordNewArray, ssaRecordTypeId,
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString,
     ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
 

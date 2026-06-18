@@ -296,6 +296,8 @@ begin
       Result := Format('[R%d].fld%d <- R%d', [Instr.Src1, Instr.Immediate, Instr.Src2]);
     bcRecordNewArray:
       Result := Format('ARR[%d] fill records', [Instr.Src1]);
+    bcRecordTypeId:
+      Result := Format('R%d = typeid[R%d]', [Instr.Dest, Instr.Src1]);
 
     bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
     bcPrintInt, bcPrintIntLn:

@@ -105,6 +105,7 @@ type
     FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
+    FNeededDispatchers: TStringList;     // M4.3: "TYPE|METHOD" pairs needing a virtual dispatcher
 
     function GenerateUniqueLabel(const Prefix: string): string;
     function GetVariableType(const VarName: string): TSSARegisterType;
@@ -120,6 +121,12 @@ type
     procedure ProcessProcedureCall(Node: TASTNode);
     // Stage arguments into transfer slots and emit ssaCallSub (shared by CALL and FUNCTION).
     procedure EmitProcedureCall(const Name: string; ArgListNode: TASTNode);
+    procedure StageCallArgs(const ParamOwnerName: string; ArgListNode: TASTNode);  // args -> xfer
+    procedure EmitCallSubLabel(const LabelName: string);  // ssaCallSub(label) + block split
+    // OOP virtual dispatch (M4.3)
+    function IsSubtypeOf(const U, T: string): Boolean;
+    function MethodNeedsDispatch(const TypeName, MethNm: string): Boolean;
+    procedure GenerateDispatchers;
     procedure LowerDeferredProcedures;
     function ProcedureLabelName(const Name: string): string;
     // UDT/record support (M3)
@@ -145,7 +152,7 @@ type
                                  out TypeName: string): Boolean;
     // OOP (M4.1): UDT type name of an object expression (no code emitted); method dispatch.
     function ObjectTypeName(ObjNode: TASTNode): string;
-    procedure ProcessMethodCall(ObjNode: TASTNode; const MethodLabel: string;
+    procedure ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
                                 ArgsNode: TASTNode; out Result: TSSAValue);
     // Map parameter at Index (within ParamList) to its transfer-bank type and per-bank slot.
     function ParamBankAndSlot(ParamList: TASTNode; Index: Integer; out RT: TSSARegisterType): Integer;
@@ -314,6 +321,9 @@ begin
   FVarExplicitType.CaseSensitive := False;
   FArrayRecordType := TStringList.Create;
   FArrayRecordType.CaseSensitive := False;
+  FNeededDispatchers := TStringList.Create;
+  FNeededDispatchers.Duplicates := dupIgnore;
+  FNeededDispatchers.Sorted := True;
 end;
 
 destructor TSSAGenerator.Destroy;
@@ -327,6 +337,7 @@ begin
   FVarRecordType.Free;
   FVarExplicitType.Free;
   FArrayRecordType.Free;
+  FNeededDispatchers.Free;
   inherited Destroy;
 end;
 
@@ -2125,7 +2136,8 @@ begin
             MethodLabelName := ResolveMethodLabel(MethodOwnerType, VarToStr(Node.GetChild(0).Value));
             if MethodLabelName <> '' then
             begin
-              ProcessMethodCall(MethodObjNode, MethodLabelName, Node.GetChild(1), Result);
+              ProcessMethodCall(MethodObjNode, MethodOwnerType, VarToStr(Node.GetChild(0).Value),
+                                Node.GetChild(1), Result);
               Exit;
             end;
           end;
@@ -2969,7 +2981,7 @@ begin
         EmitInstruction(ssaRecordNew, RecHandleVal,
                         MakeSSAConstInt(FUDTs[RecUDTIdx].NInt),
                         MakeSSAConstInt(FUDTs[RecUDTIdx].NFloat),
-                        MakeSSAConstInt(FUDTs[RecUDTIdx].NStr));
+                        MakeSSAConstInt(FUDTs[RecUDTIdx].NStr or (Int64(RecUDTIdx) shl 32)));  // Imm: strCount | typeId<<32
         EmitRecordInit(RecHandleVal, RecUDTIdx);  // allocate any nested-UDT field instances
       end;
       Continue;
@@ -3112,7 +3124,8 @@ begin
     begin
       RecPacked := (Int64(FUDTs[RecArrUDTIdx].NInt) and $FFFF)
                 or ((Int64(FUDTs[RecArrUDTIdx].NFloat) and $FFFF) shl 16)
-                or ((Int64(FUDTs[RecArrUDTIdx].NStr) and $FFFF) shl 32);
+                or ((Int64(FUDTs[RecArrUDTIdx].NStr) and $FFFF) shl 32)
+                or ((Int64(RecArrUDTIdx) and $FFFF) shl 48);   // typeId for stamping each element
       EmitInstruction(ssaRecordNewArray, MakeSSAValue(svkNone),
                       MakeSSAArrayRef(ArrayIdx, srtInt), MakeSSAConstInt(RecPacked),
                       MakeSSAValue(svkNone));
@@ -8209,6 +8222,101 @@ begin
   end;
 end;
 
+function TSSAGenerator.IsSubtypeOf(const U, T: string): Boolean;
+// True if U is T or a (transitive) subtype of T.
+var
+  cur, tu: string;
+  idx, guard: Integer;
+begin
+  Result := False;
+  cur := UpperCase(U); tu := UpperCase(T);
+  guard := 0;
+  while (cur <> '') and (guard < 64) do
+  begin
+    if cur = tu then Exit(True);
+    idx := FindUDT(cur);
+    if idx < 0 then Break;
+    cur := FUDTs[idx].Parent;
+    Inc(guard);
+  end;
+end;
+
+function TSSAGenerator.MethodNeedsDispatch(const TypeName, MethNm: string): Boolean;
+// True if a call on static type TypeName to MethNm is polymorphic: some subtype of TypeName
+// has its own override of MethNm that differs from TypeName's static resolution.
+var
+  baseLbl, m: string;
+  i: Integer;
+begin
+  Result := False;
+  baseLbl := ResolveMethodLabel(TypeName, MethNm);
+  if baseLbl = '' then Exit;
+  m := UpperCase(MethNm);
+  for i := 0 to High(FUDTs) do
+    if IsSubtypeOf(FUDTs[i].Name, TypeName) and
+       FProcDecls.ContainsKey(FUDTs[i].Name + '.' + m) and
+       (FUDTs[i].Name + '.' + m <> baseLbl) then
+      Exit(True);
+end;
+
+procedure TSSAGenerator.GenerateDispatchers;
+// Synthesize a virtual-dispatch procedure for each needed (type, method). The dispatcher reads
+// THIS's runtime type-id and bcCallSub's the concrete override (args are already staged in the
+// transfer registers by the call site, and the result is delivered there too — so the dispatcher
+// only forwards). All calls are static (label) bcCallSubs, keeping the CFG well-formed.
+var
+  d, i: Integer;
+  T, m, BaseLbl, DispLbl, ULbl, CallLabel, NextLabel: string;
+  HReg, TReg, UidReg, CmpReg: TSSAValue;
+begin
+  for d := 0 to FNeededDispatchers.Count - 1 do
+  begin
+    T := Copy(FNeededDispatchers[d], 1, Pos('|', FNeededDispatchers[d]) - 1);
+    m := Copy(FNeededDispatchers[d], Pos('|', FNeededDispatchers[d]) + 1, MaxInt);
+    BaseLbl := ResolveMethodLabel(T, m);
+    if BaseLbl = '' then Continue;
+    DispLbl := ProcedureLabelName('VDISP.' + T + '.' + m);
+
+    FCurrentBlock := FProgram.GetOrCreateBlock(DispLbl);
+    // THIS handle = int transfer slot 0 (THIS is always parameter 0); read its runtime type-id.
+    HReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaXferLoadInt, HReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(0));
+    TReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordTypeId, TReg, HReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+    // One test per concrete override in T's subtree: if type-id matches, tail-call it and return.
+    for i := 0 to High(FUDTs) do
+      if IsSubtypeOf(FUDTs[i].Name, T) and FProcDecls.ContainsKey(FUDTs[i].Name + '.' + m) then
+      begin
+        ULbl := ProcedureLabelName(FUDTs[i].Name + '.' + m);
+        UidReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, UidReg, MakeSSAConstInt(i), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        CmpReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaCmpEqInt, CmpReg, TReg, UidReg, MakeSSAValue(svkNone));  // CmpReg = (tid = i)
+        CallLabel := GenerateUniqueLabel('vdcall');
+        NextLabel := GenerateUniqueLabel('vdnext');
+        // if not equal (CmpReg = 0) jump to the next test; else fall through to the call block.
+        EmitInstruction(ssaJumpIfZero, MakeSSALabel(NextLabel), CmpReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // Call block (equal): tail-call the override, then return (result already in xfer slot).
+        FProgram.GetOrCreateBlock(CallLabel);
+        if Assigned(FCurrentBlock) and (FCurrentBlock.Successors.IndexOf(FProgram.FindBlock(CallLabel)) = -1) then
+        begin
+          FCurrentBlock.AddSuccessor(FProgram.FindBlock(CallLabel));
+          FProgram.FindBlock(CallLabel).AddPredecessor(FCurrentBlock);
+        end;
+        FCurrentBlock := FProgram.FindBlock(CallLabel);
+        EmitCallSubLabel(ULbl);
+        EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        FCurrentBlock := FProgram.GetOrCreateBlock(NextLabel);  // continue with the next test
+      end;
+
+    // Default: no subtype matched — call the statically resolved base method, then return.
+    EmitCallSubLabel(ProcedureLabelName(BaseLbl));
+    EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    FCurrentBlock := nil;
+  end;
+end;
+
 procedure TSSAGenerator.RegisterRecordVars(Node: TASTNode);
 // Pre-scan DIM..AS declarations: record-typed vars hold an int handle (FVarRecordType),
 // builtin-typed vars get an explicit bank (FVarExplicitType). Runs before variable
@@ -8325,7 +8433,7 @@ begin
       EmitInstruction(ssaRecordNew, NestedHandle,
                       MakeSSAConstInt(FUDTs[NestedUDT].NInt),
                       MakeSSAConstInt(FUDTs[NestedUDT].NFloat),
-                      MakeSSAConstInt(FUDTs[NestedUDT].NStr));
+                      MakeSSAConstInt(FUDTs[NestedUDT].NStr or (Int64(NestedUDT) shl 32)));
       EmitRecordInit(NestedHandle, NestedUDT);   // deeper nesting
       EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal,
                       NestedHandle, MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
@@ -8360,19 +8468,24 @@ begin
   end;
 end;
 
-procedure TSSAGenerator.ProcessMethodCall(ObjNode: TASTNode; const MethodLabel: string;
+procedure TSSAGenerator.ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
   ArgsNode: TASTNode; out Result: TSSAValue);
-// Lower obj.method(args): call the procedure named <Type>.<method> passing the object handle as
-// the implicit THIS first argument, then the declared args. Read the result for a FUNCTION method.
+// Lower obj.method(args): pass the object handle as the implicit THIS first argument, then the
+// declared args. A monomorphic call goes straight to the resolved method; a polymorphic one goes
+// through a generated virtual dispatcher (chosen by the instance's runtime type-id). Read the
+// result for a FUNCTION method.
 var
-  TmpArgs: TASTNode;
+  TmpArgs, Decl: TASTNode;
   i: Integer;
-  Decl: TASTNode;
   RT: TSSARegisterType;
   DestVal: TSSAValue;
   IsFunc: Boolean;
+  MethodLabel: string;
 begin
   Result := MakeSSAValue(svkNone);
+  MethodLabel := ResolveMethodLabel(ObjType, MethNm);   // static (base) target
+  if MethodLabel = '' then Exit;
+
   // Build an argument list with the object (THIS) prepended.
   TmpArgs := TASTNode.Create(antArgumentList, ObjNode.Token);
   try
@@ -8380,7 +8493,15 @@ begin
     if Assigned(ArgsNode) then
       for i := 0 to ArgsNode.ChildCount - 1 do
         TmpArgs.AddChild(ArgsNode.GetChild(i).Clone);
-    EmitProcedureCall(MethodLabel, TmpArgs);
+    if MethodNeedsDispatch(ObjType, MethNm) then
+    begin
+      // Polymorphic: stage per the base signature, then call the virtual dispatcher.
+      StageCallArgs(MethodLabel, TmpArgs);
+      FNeededDispatchers.Add(UpperCase(ObjType) + '|' + UpperCase(MethNm));
+      EmitCallSubLabel(ProcedureLabelName('VDISP.' + UpperCase(ObjType) + '.' + UpperCase(MethNm)));
+    end
+    else
+      EmitProcedureCall(MethodLabel, TmpArgs);   // monomorphic: direct static call
   finally
     TmpArgs.Free;
   end;
@@ -8461,7 +8582,7 @@ begin
     // Not a field — try a no-argument method call obj.method (M4.1), walking inheritance (M4.2).
     MethodLbl := ResolveMethodLabel(TypeName, VarToStr(Node.Value));
     if MethodLbl <> '' then
-      ProcessMethodCall(Node.GetChild(0), MethodLbl, nil, Result);
+      ProcessMethodCall(Node.GetChild(0), TypeName, VarToStr(Node.Value), nil, Result);
     Exit;
   end;
   if not ResolveRecordObject(Node.GetChild(0), HandleVal, TypeName) then Exit;
@@ -8591,28 +8712,19 @@ begin
   EmitInstruction(Op, DestReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
 end;
 
-procedure TSSAGenerator.EmitProcedureCall(const Name: string; ArgListNode: TASTNode);
+procedure TSSAGenerator.StageCallArgs(const ParamOwnerName: string; ArgListNode: TASTNode);
 // Evaluate each argument, coerce to the parameter's type, and stage it into the matching
-// transfer slot BEFORE the call; the callee prologue copies the slots into its parameter
-// registers. The target label may be a forward reference (bodies are lowered later).
+// transfer slot. The parameter layout is taken from ParamOwnerName's declaration (so a
+// virtual call stages per the base method's signature; the override has the same signature).
 var
-  LabelName: string;
   Decl, ParamList, ArgExpr: TASTNode;
   i, NArgs, Slot: Integer;
   RT: TSSARegisterType;
   ArgVal: TSSAValue;
-  CallBlock, ContBlock, ProcEntry: TSSABasicBlock;
 begin
-  LabelName := ProcedureLabelName(Name);
-  if not Assigned(FCurrentBlock) then
-    FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('call'));
-
   ParamList := nil;
-  if FProcDecls.TryGetValue(Name, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
+  if FProcDecls.TryGetValue(ParamOwnerName, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
     ParamList := Decl.GetChild(1);
-
-  // The argument list is antArgumentList (CALL) or antExpressionList (FUNCTION call parsed
-  // as A(...) — array-like syntax); both simply hold the argument expressions as children.
   if Assigned(ArgListNode) and
      (ArgListNode.NodeType in [antArgumentList, antExpressionList]) and Assigned(ParamList) then
   begin
@@ -8626,14 +8738,19 @@ begin
       EmitXferStore(RT, Slot, ArgVal);
     end;
   end;
+end;
 
+procedure TSSAGenerator.EmitCallSubLabel(const LabelName: string);
+// Emit ssaCallSub(label) and split the block (like GOSUB): the call block ends with ssaCallSub
+// and gets two successors — the procedure entry and a fresh return-point block — so the
+// procedure block has a predecessor and the dominator tree stays well-formed.
+var
+  CallBlock, ContBlock, ProcEntry: TSSABasicBlock;
+begin
+  if not Assigned(FCurrentBlock) then
+    FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('call'));
   EmitInstruction(ssaCallSub, MakeSSALabel(LabelName), MakeSSAValue(svkNone),
                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-
-  // Split the block at the call (like GOSUB): the call block ends with ssaCallSub and gets
-  // two successors — the procedure entry (the call) and a fresh return-point block (where
-  // execution resumes). This keeps the procedure block reachable with a single entry, so
-  // the dominator tree stays well-formed. The bytecode lays the return block right after.
   CallBlock := FCurrentBlock;
   ContBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('aftercall'));
   if Assigned(CallBlock) then
@@ -8643,8 +8760,6 @@ begin
       CallBlock.AddSuccessor(ContBlock);
       ContBlock.AddPredecessor(CallBlock);
     end;
-    // Edge to the procedure entry (may be a forward reference; FixForwardReferences also
-    // connects it). Connect here when the target already exists (e.g. recursive calls).
     ProcEntry := FProgram.FindBlock(LabelName);
     if Assigned(ProcEntry) and (CallBlock.Successors.IndexOf(ProcEntry) = -1) then
     begin
@@ -8653,6 +8768,15 @@ begin
     end;
   end;
   FCurrentBlock := ContBlock;
+end;
+
+procedure TSSAGenerator.EmitProcedureCall(const Name: string; ArgListNode: TASTNode);
+// Static call: stage args then ssaCallSub to the named procedure.
+begin
+  if not Assigned(FCurrentBlock) then
+    FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('call'));
+  StageCallArgs(Name, ArgListNode);
+  EmitCallSubLabel(ProcedureLabelName(Name));
 end;
 
 procedure TSSAGenerator.ProcessProcedureCall(Node: TASTNode);
@@ -9255,6 +9379,9 @@ begin
 
   // Lower SUB/FUNCTION bodies into their own block region (after the module END).
   LowerDeferredProcedures;
+
+  // M4.3: synthesize virtual-dispatch procedures for every polymorphic (type, method) used.
+  GenerateDispatchers;
 
   // PHASE 3 TIER 3: Fix forward GOTO/GOSUB references (now that all blocks exist,
   // including procedure bodies).
