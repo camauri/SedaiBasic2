@@ -1190,7 +1190,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, record params, `v.a.b`, FUNCTION-returns-UDT, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. Inheritance/virtual/NEW deferred (M4.2+) |
 | `CLASS...END CLASS` | ✗ | Not implemented. Keyword reserved. |
 | `UNION...END UNION` | ✗ | User defined structure of overlapping data |
-| `EXTENDS` | ✗ | Extends an user defined type to derive another |
+| `EXTENDS` | ◐ | Single inheritance `TYPE Child EXTENDS Parent` (M4.2): inherited fields (prefix layout) + methods + reference polymorphism. Virtual dispatch deferred (M4.3) |
 | `EXTENDS WSTRING` | ✗ | Extends an user defined type to inherits Wstring behavior |
 | `EXTENDS ZSTRING` | ✗ | Extends an user defined type to inherits Zstring behavior |
 | `IMPLEMENTS` | ✗ | Not implemented. Keyword reserved. |
