@@ -1188,10 +1188,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `ENUM...END ENUM` | ✗ | User defined enumeration of values |
-| `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, record params, `v.a.b`, FUNCTION-returns-UDT, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. Inheritance/virtual/NEW deferred (M4.2+) |
+| `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, record params, `v.a.b`, FUNCTION-returns-UDT, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: single inheritance `EXTENDS`. M4.3: virtual dispatch (runtime type-id). `NEW`/ctor/dtor deferred (M4.4) |
 | `CLASS...END CLASS` | ✗ | Not implemented. Keyword reserved. |
 | `UNION...END UNION` | ✗ | User defined structure of overlapping data |
-| `EXTENDS` | ◐ | Single inheritance `TYPE Child EXTENDS Parent` (M4.2): inherited fields (prefix layout) + methods + reference polymorphism. Virtual dispatch deferred (M4.3) |
+| `EXTENDS` | ◐ | Single inheritance `TYPE Child EXTENDS Parent` (M4.2): inherited fields (prefix layout) + methods + reference polymorphism. M4.3: virtual dispatch — an overridden method is selected by the instance's runtime type even through a base-typed variable (runtime type-id + dispatcher procedures). `NEW`/ctor/dtor deferred (M4.4) |
 | `EXTENDS WSTRING` | ✗ | Extends an user defined type to inherits Wstring behavior |
 | `EXTENDS ZSTRING` | ✗ | Extends an user defined type to inherits Zstring behavior |
 | `IMPLEMENTS` | ✗ | Not implemented. Keyword reserved. |
