@@ -162,6 +162,7 @@ type
     ttCallSub,                // CALL (statement-level SUB invocation)
     ttTypeDecl,               // TYPE (UDT/record declaration; END TYPE terminates)
     ttAsType,                 // AS (type annotation: DIM x AS t, field AS t)
+    ttWithBlock,              // WITH (with-block; END WITH terminates; .field => with-object.field)
 
     // === DATA HANDLING ===
     ttDataAssignment,         // LET, SET, :=
@@ -357,7 +358,7 @@ const
   KEYWORD_TOKENS: TTokenTypeSet = [
     ttKeyword, ttLoopBlockStart, ttLoopBlockEnd,
     ttBlockBegin, ttBlockEnd, ttProcedureStart, ttProcedureEnd, ttCallSub,
-    ttTypeDecl, ttAsType,
+    ttTypeDecl, ttAsType, ttWithBlock,
     ttJumpKeyword, ttDataDeclaration, ttDataAssignment, ttCommentRemark,
     ttBitwiseOperator
   ];

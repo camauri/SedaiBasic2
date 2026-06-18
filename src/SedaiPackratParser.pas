@@ -125,6 +125,9 @@ type
     function ParseTypeDecl: TASTNode;
     function AtEndType: Boolean;
     procedure ConsumeEndType;
+    // WITH obj / ... / END WITH : a leading '.field' resolves against obj. Parse-time desugar.
+    function ParseWith: TASTNode;
+    function AtEndWith: Boolean;
     procedure ConsumeEndProcedure;
     function ParseForStatement: TASTNode;
     function ParseDoStatement: TASTNode;
@@ -530,6 +533,7 @@ begin
         Result := Memoize('FnStatement', @ParseFnStatement);
     ttCallSub: Result := Memoize('CallStatement', @ParseCallStatement);
     ttTypeDecl: Result := Memoize('TypeDecl', @ParseTypeDecl);
+    ttWithBlock: Result := ParseWith;
 
     // === MEMORY COMMANDS ===
     ttMemoryCommand: Result := Memoize('MemoryStatement', @ParseMemoryStatement);
@@ -616,6 +620,18 @@ begin
         end;
       end;
 
+    // === WITH leading-dot member (".field = ..." inside a WITH block, M3.2) ===
+    ttOpDot:
+      begin
+        SavedIndex := Context.CurrentIndex;
+        Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
+        if not Assigned(Result) then
+        begin
+          Context.CurrentIndex := SavedIndex;
+          Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+        end;
+      end;
+
     // === SPECIAL VARIABLES (TI$, etc.) ===
     ttSpecialVariable:
       begin
@@ -656,7 +672,13 @@ begin
  Token := Context.CurrentToken;
 
   // Parse left side - can be A or A(i) or special variable (TI$)
-  if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
+  if Context.Check(ttOpDot) then
+  begin
+    // Leading '.field = ...' inside a WITH block (M3.2): the expression parser's prefix rule
+    // resolves it against the current WITH object.
+    LeftSide := FExpressionParser.ParseExpression(precCall);
+  end
+  else if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
     ((Context.PeekNext.TokenType = ttDelimParOpen) or
      (Context.PeekNext.TokenType = ttOpDot)) then
   begin
@@ -1288,6 +1310,20 @@ begin
     if Context.Check(ttDelimParClose) then
       Context.Advance;                            // )
   end;
+
+  // FUNCTION return type: "FUNCTION name(...) AS rettype" (M3.2). Attach the type as a child
+  // of the name node so the pre-scan can type the function name (UDT handle / builtin bank).
+  if (Kind = kFUNCTION) and Context.Check(ttAsType) and Assigned(NameNode) then
+  begin
+    Context.Advance;                              // AS
+    if Context.Check(ttIdentifier) then
+    begin
+      NameNode.AddChild(TASTNode.CreateWithValue(antIdentifier,
+                   UpperCase(Context.CurrentToken.Value), Context.CurrentToken));
+      Context.Advance;                            // rettype
+    end;
+  end;
+
   Result.AddChild(ParamList);
 
   ParseProcedureBody(Result);                     // statements up to END SUB/FUNCTION
@@ -1353,6 +1389,56 @@ begin
   end;
 end;
 
+function TPackratParser.AtEndWith: Boolean;
+begin
+  // END WITH  (END is ttProgramEnd, WITH is ttWithBlock)
+  Result := Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+            (Context.PeekNext.TokenType = ttWithBlock);
+end;
+
+function TPackratParser.ParseWith: TASTNode;
+// WITH obj <newline> ... <newline> END WITH. Parse-time desugar: while parsing the body, the
+// expression parser substitutes the (cloned) object for any leading '.field'. The body is
+// returned as an antBlock — WITH itself emits nothing.
+var
+  Token: TLexerToken;
+  ObjExpr, Stmt, PrevWith: TASTNode;
+  PrevIdx: Integer;
+begin
+  Token := Context.CurrentToken;
+  Context.Advance;                                  // consume WITH
+  ObjExpr := FExpressionParser.ParseExpression;
+  Result := TASTNode.Create(antBlock, Token);
+  if not Assigned(ObjExpr) then
+  begin
+    if AtEndWith then begin Context.Advance; Context.Advance; end;
+    Exit;
+  end;
+
+  PrevWith := FExpressionParser.WithObject;         // support nested WITH
+  FExpressionParser.WithObject := ObjExpr;
+  while not Context.Check(ttEndOfFile) do
+  begin
+    if Context.Match(ttEndOfLine) then Continue;
+    if Context.Check(ttSeparStmt) then begin Context.Advance; Continue; end;
+    if AtEndWith then Break;
+    PrevIdx := Context.CurrentIndex;
+    Stmt := ParseStatement;
+    if Assigned(Stmt) then
+      Result.AddChild(Stmt)
+    else if Context.CurrentIndex = PrevIdx then
+      Break;
+  end;
+  FExpressionParser.WithObject := PrevWith;         // restore outer WITH (or nil)
+
+  if AtEndWith then
+  begin
+    Context.Advance;   // END
+    Context.Advance;   // WITH
+  end;
+  DoNodeCreated(Result);
+end;
+
 function TPackratParser.ParseTypeDecl: TASTNode;
 var
   Token, NameTok, FieldTok, TypeTok: TLexerToken;
@@ -1376,7 +1462,11 @@ begin
     if Context.Check(ttSeparStmt) then begin Context.Advance; Continue; end;
     if AtEndType then Break;
     PrevIdx := Context.CurrentIndex;
-    if Context.Check(ttIdentifier) then
+    // A field name may be an identifier or a reserved word (e.g. LEN, TYPE, NAME): accept any
+    // alphabetic token as the field name here.
+    if Context.Check(ttIdentifier) or
+       ((Length(Context.CurrentToken.Value) > 0) and
+        (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
     begin
       FieldTok := Context.CurrentToken;
       Context.Advance;                              // field name
@@ -1384,7 +1474,9 @@ begin
       if Context.Check(ttAsType) then
       begin
         Context.Advance;                            // AS
-        if Context.Check(ttIdentifier) then
+        if Context.Check(ttIdentifier) or
+           ((Length(Context.CurrentToken.Value) > 0) and
+            (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
         begin
           TypeTok := Context.CurrentToken;
           Context.Advance;                          // type name

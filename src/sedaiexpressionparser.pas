@@ -45,6 +45,10 @@ type
     {$ENDIF}
 
   public
+    // Current WITH-block object (M3.2): a leading '.field' resolves against this (cloned).
+    // nil when not inside a WITH; set/restored by the statement parser's ParseWith.
+    WithObject: TASTNode;
+
     constructor Create;
     procedure SetContext(AContext: TParserContext);
 
@@ -82,6 +86,7 @@ type
     function ParseAssignment(Left: TASTNode; Token: TLexerToken): TASTNode;
     function ParseArrayAccess(Left: TASTNode; Token: TLexerToken): TASTNode;
     function ParseMemberAccess(Left: TASTNode; Token: TLexerToken): TASTNode; // record.field
+    function ParseWithMember(Token: TLexerToken): TASTNode; // leading '.field' inside WITH
     function ParsePower(Left: TASTNode; Token: TLexerToken): TASTNode; // Right-associative
 
     // === UTILITY PARSING ===
@@ -120,6 +125,7 @@ function StaticParseBinaryOperator(Parser: Pointer; Left: TObject; Token: TLexer
 function StaticParseAssignment(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
 function StaticParseArrayAccess(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
 function StaticParseMemberAccess(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
+function StaticParseWithMember(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParsePower(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
 
 function StaticParseCommaDebug(Parser: Pointer; Token: TLexerToken): TObject;
@@ -256,6 +262,11 @@ begin
   Result := TExpressionParser(Parser).ParseMemberAccess(TASTNode(Left), Token);
 end;
 
+function StaticParseWithMember(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseWithMember(Token);
+end;
+
 function StaticParsePower(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParsePower(TASTNode(Left), Token);
@@ -390,8 +401,11 @@ begin
   // Array access con parentesi quadre (se supportato)
   Context.SetParseRule(ttDelimBrackOpen, MakeInfixRule(@StaticParseArrayAccess, precCall));
 
-  // Member access (record.field) — high precedence postfix, like call/index
-  Context.SetParseRule(ttOpDot, MakeInfixRule(@StaticParseMemberAccess, precCall));
+  // Member access (record.field) — high precedence postfix (infix), like call/index. The
+  // prefix slot handles a leading '.field' inside a WITH block.
+  Rule := MakeInfixRule(@StaticParseMemberAccess, precCall);
+  Rule.Prefix := @StaticParseWithMember;
+  Context.SetParseRule(ttOpDot, Rule);
 
   {$IFDEF DEBUG}
   LogDebug('Pratt expression rules initialized successfully');
@@ -1383,16 +1397,43 @@ var
   FieldName: string;
 begin
   if not HasValidContext then Exit(nil);
-  if not Context.Check(ttIdentifier) then
+  // A field name follows '.' unambiguously, so accept any alphabetic token here — including
+  // reserved words (LEN, TYPE, NAME, ...) that would otherwise lex as keywords.
+  FieldName := UpperCase(VarToStr(Context.CurrentToken.Value));
+  if (FieldName = '') or not (FieldName[1] in ['A'..'Z', '_']) then
   begin
     HandleError('Expected field name after "."', Context.CurrentToken);
     Result := Left;
     Exit;
   end;
-  FieldName := UpperCase(VarToStr(Context.CurrentToken.Value));
   Context.Advance;   // consume field name
   Result := TASTNode.CreateWithValue(antMemberAccess, FieldName, Token);
   Result.AddChild(Left);
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseWithMember(Token: TLexerToken): TASTNode;
+// Leading '.field' inside a WITH block (M3.2): resolves to <with-object>.field. The '.' has
+// already been consumed (prefix rule). Builds antMemberAccess(field, clone of the WITH object).
+var
+  FieldName: string;
+begin
+  if (WithObject = nil) or not HasValidContext then
+  begin
+    HandleError('"." with no object (outside a WITH block)', Token);
+    Result := nil;
+    Exit;
+  end;
+  FieldName := UpperCase(VarToStr(Context.CurrentToken.Value));
+  if (FieldName = '') or not (FieldName[1] in ['A'..'Z', '_']) then
+  begin
+    HandleError('Expected field name after "."', Context.CurrentToken);
+    Result := nil;
+    Exit;
+  end;
+  Context.Advance;   // consume field name
+  Result := TASTNode.CreateWithValue(antMemberAccess, FieldName, Token);
+  Result.AddChild(WithObject.Clone);
   DoNodeCreated(Result);
 end;
 

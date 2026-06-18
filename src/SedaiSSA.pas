@@ -63,6 +63,7 @@ type
     Name: string;
     Bank: TSSARegisterType;
     Slot: Integer;          // index within that bank's slot array of the instance
+    NestedType: string;     // UDT type name if this field is itself a record (else ''); held as an int handle
   end;
   TUDTType = record
     Name: string;
@@ -118,13 +119,17 @@ type
     procedure LowerDeferredProcedures;
     function ProcedureLabelName(const Name: string): string;
     // UDT/record support (M3)
-    procedure RegisterUDTs(Node: TASTNode);        // pre-scan TYPE declarations
+    procedure RegisterUDTs(Node: TASTNode);        // pre-scan TYPE declarations (2 passes)
+    procedure CollectUDTNames(Node: TASTNode);     // pass 1: register type names (empty)
+    procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
     function VarRecordTypeName(const VarName: string): string;    // '' if not a record var
+    procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer);  // alloc nested records
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
-                              out Bank: TSSARegisterType; out Slot: Integer): Boolean;
+                              out Bank: TSSARegisterType; out Slot: Integer;
+                              out NestedType: string): Boolean;
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
@@ -2931,6 +2936,7 @@ begin
                         MakeSSAConstInt(FUDTs[RecUDTIdx].NInt),
                         MakeSSAConstInt(FUDTs[RecUDTIdx].NFloat),
                         MakeSSAConstInt(FUDTs[RecUDTIdx].NStr));
+        EmitRecordInit(RecHandleVal, RecUDTIdx);  // allocate any nested-UDT field instances
       end;
       Continue;
     end;
@@ -8017,12 +8023,13 @@ begin
 end;
 
 function TSSAGenerator.UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
-  out Bank: TSSARegisterType; out Slot: Integer): Boolean;
+  out Bank: TSSARegisterType; out Slot: Integer; out NestedType: string): Boolean;
 var
   i: Integer;
   F: string;
 begin
   Result := False;
+  NestedType := '';
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   F := UpperCase(FieldName);
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
@@ -8030,58 +8037,95 @@ begin
     begin
       Bank := FUDTs[UDTIdx].Fields[i].Bank;
       Slot := FUDTs[UDTIdx].Fields[i].Slot;
+      NestedType := FUDTs[UDTIdx].Fields[i].NestedType;
       Exit(True);
     end;
 end;
 
 procedure TSSAGenerator.RegisterUDTs(Node: TASTNode);
-// Build the record-type registry from TYPE declarations. Each field gets a (bank, slot)
-// assigned by walking fields in order, counting per bank.
+// Two passes so a TYPE may reference another TYPE declared later (forward reference).
+begin
+  CollectUDTNames(Node);   // pass 1: all type names known
+  FillUDTFields(Node);     // pass 2: resolve fields (incl. nested-UDT fields)
+end;
+
+procedure TSSAGenerator.CollectUDTNames(Node: TASTNode);
 var
-  i, j, n: Integer;
-  FieldNode, TypeNode: TASTNode;
-  U: TUDTType;
-  Bank: TSSARegisterType;
-  cInt, cFloat, cStr: Integer;
+  i, n: Integer;
+  Name: string;
 begin
   if Node = nil then Exit;
   if Node.NodeType = antTypeDecl then
   begin
-    U.Name := UpperCase(VarToStr(Node.Value));
-    SetLength(U.Fields, 0);
+    Name := UpperCase(VarToStr(Node.Value));
+    if FindUDT(Name) < 0 then
+    begin
+      n := Length(FUDTs);
+      SetLength(FUDTs, n + 1);
+      FUDTs[n].Name := Name;
+      SetLength(FUDTs[n].Fields, 0);
+      FUDTs[n].NInt := 0; FUDTs[n].NFloat := 0; FUDTs[n].NStr := 0;
+    end;
+    Exit;
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectUDTNames(Node.GetChild(i));
+end;
+
+procedure TSSAGenerator.FillUDTFields(Node: TASTNode);
+// Assign each field a (bank, slot), walking fields in order and counting per bank. A field
+// whose type is itself a UDT is stored as an int handle (Bank=srtInt) with NestedType set.
+var
+  i, j, n, Idx: Integer;
+  FieldNode, TypeNode: TASTNode;
+  Bank: TSSARegisterType;
+  cInt, cFloat, cStr: Integer;
+  TypeName, FieldName, NestedT: string;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType = antTypeDecl then
+  begin
+    Idx := FindUDT(UpperCase(VarToStr(Node.Value)));
+    if Idx < 0 then Exit;
+    if Length(FUDTs[Idx].Fields) > 0 then Exit;  // already filled
     cInt := 0; cFloat := 0; cStr := 0;
     for j := 0 to Node.ChildCount - 1 do
     begin
       FieldNode := Node.GetChild(j);
       if FieldNode.NodeType <> antIdentifier then Continue;
+      FieldName := VarToStr(FieldNode.Value);
       TypeNode := nil;
       if FieldNode.ChildCount > 0 then TypeNode := FieldNode.GetChild(0);
-      if Assigned(TypeNode) then
-        Bank := TypeNameToBank(VarToStr(TypeNode.Value), VarToStr(FieldNode.Value))
+      TypeName := '';
+      if Assigned(TypeNode) then TypeName := UpperCase(VarToStr(TypeNode.Value));
+      NestedT := '';
+      if (TypeName <> '') and (FindUDT(TypeName) >= 0) then
+      begin
+        // Nested record field: stored as an int handle to the nested instance.
+        Bank := srtInt;
+        NestedT := TypeName;
+      end
+      else if TypeName <> '' then
+        Bank := TypeNameToBank(TypeName, FieldName)
       else
-        Bank := GetVariableType(VarToStr(FieldNode.Value));
-      n := Length(U.Fields);
-      SetLength(U.Fields, n + 1);
-      U.Fields[n].Name := UpperCase(VarToStr(FieldNode.Value));
-      U.Fields[n].Bank := Bank;
+        Bank := GetVariableType(FieldName);
+      n := Length(FUDTs[Idx].Fields);
+      SetLength(FUDTs[Idx].Fields, n + 1);
+      FUDTs[Idx].Fields[n].Name := UpperCase(FieldName);
+      FUDTs[Idx].Fields[n].Bank := Bank;
+      FUDTs[Idx].Fields[n].NestedType := NestedT;
       case Bank of
-        srtFloat:  begin U.Fields[n].Slot := cFloat; Inc(cFloat); end;
-        srtString: begin U.Fields[n].Slot := cStr;   Inc(cStr);   end;
+        srtFloat:  begin FUDTs[Idx].Fields[n].Slot := cFloat; Inc(cFloat); end;
+        srtString: begin FUDTs[Idx].Fields[n].Slot := cStr;   Inc(cStr);   end;
       else
-        begin U.Fields[n].Slot := cInt; Inc(cInt); end;
+        begin FUDTs[Idx].Fields[n].Slot := cInt; Inc(cInt); end;
       end;
     end;
-    U.NInt := cInt; U.NFloat := cFloat; U.NStr := cStr;
-    if FindUDT(U.Name) < 0 then
-    begin
-      n := Length(FUDTs);
-      SetLength(FUDTs, n + 1);
-      FUDTs[n] := U;
-    end;
-    Exit;  // do not recurse into a type body
+    FUDTs[Idx].NInt := cInt; FUDTs[Idx].NFloat := cFloat; FUDTs[Idx].NStr := cStr;
+    Exit;
   end;
   for i := 0 to Node.ChildCount - 1 do
-    RegisterUDTs(Node.GetChild(i));
+    FillUDTFields(Node.GetChild(i));
 end;
 
 procedure TSSAGenerator.RegisterRecordVars(Node: TASTNode);
@@ -8117,6 +8161,15 @@ begin
   end;
   if Node.NodeType = antProcedureDecl then
   begin
+    // FUNCTION return type (M3.2): the name node (child 0) may carry a type child
+    // ("FUNCTION f(...) AS rettype") — type the function name so its result slot is correct.
+    if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) and
+       (Node.GetChild(0).ChildCount >= 1) and (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+    begin
+      VarName := UpperCase(VarToStr(Node.GetChild(0).Value));
+      TypeName := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
+      if TypeName <> '' then RegisterTypedVar(VarName, TypeName);
+    end;
     // Record-typed (or explicit-typed) parameters: "param AS type" (M3.1). The parameter
     // node is antIdentifier(param) with a child antIdentifier(type).
     for k := 0 to Node.ChildCount - 1 do
@@ -8170,10 +8223,37 @@ begin
     Result := FVarRecordType.Values[UpperCase(VarName)];
 end;
 
+procedure TSSAGenerator.EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer);
+// After a record instance is allocated, recursively allocate one instance for each nested-UDT
+// field and link its handle into the parent's int slot (so a.b.c works without manual init).
+var
+  i, NestedUDT: Integer;
+  NestedHandle: TSSAValue;
+begin
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if FUDTs[UDTIdx].Fields[i].NestedType <> '' then
+    begin
+      NestedUDT := FindUDT(FUDTs[UDTIdx].Fields[i].NestedType);
+      if NestedUDT < 0 then Continue;
+      NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordNew, NestedHandle,
+                      MakeSSAConstInt(FUDTs[NestedUDT].NInt),
+                      MakeSSAConstInt(FUDTs[NestedUDT].NFloat),
+                      MakeSSAConstInt(FUDTs[NestedUDT].NStr));
+      EmitRecordInit(NestedHandle, NestedUDT);   // deeper nesting
+      EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal,
+                      NestedHandle, MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+    end;
+end;
+
 function TSSAGenerator.ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
   out TypeName: string): Boolean;
 var
-  ArrName: string;
+  ArrName, ParentType, NestedT: string;
+  ParentHandle, NestedHandle: TSSAValue;
+  ParentUDT, Slot: Integer;
+  Bank: TSSARegisterType;
 begin
   Result := False;
   TypeName := '';
@@ -8194,13 +8274,27 @@ begin
     TypeName := FArrayRecordType.Values[ArrName];
     ProcessExpression(ObjNode, HandleVal);
     Result := True;
+  end
+  else if ObjNode.NodeType = antMemberAccess then
+  begin
+    // Chained access (a.b.c): the parent (a.b) is itself a nested-UDT field; load its handle.
+    if not ResolveRecordObject(ObjNode.GetChild(0), ParentHandle, ParentType) then Exit;
+    ParentUDT := FindUDT(ParentType);
+    if not UDTFieldBankSlot(ParentUDT, VarToStr(ObjNode.Value), Bank, Slot, NestedT) then Exit;
+    if NestedT = '' then Exit;   // parent.field is not itself a record
+    NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordLoadInt, NestedHandle, ParentHandle,
+                    MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+    HandleVal := NestedHandle;
+    TypeName := NestedT;
+    Result := True;
   end;
 end;
 
 procedure TSSAGenerator.ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);
 // Lower a record field read "obj.field" to ssaRecordLoad<bank>(dest, handle, slot).
 var
-  TypeName: string;
+  TypeName, NestedT: string;
   UDTIdx, Slot: Integer;
   Bank: TSSARegisterType;
   HandleVal, DestVal: TSSAValue;
@@ -8210,7 +8304,7 @@ begin
   if Node.ChildCount < 1 then Exit;
   if not ResolveRecordObject(Node.GetChild(0), HandleVal, TypeName) then Exit;
   UDTIdx := FindUDT(TypeName);
-  if not UDTFieldBankSlot(UDTIdx, VarToStr(Node.Value), Bank, Slot) then Exit;
+  if not UDTFieldBankSlot(UDTIdx, VarToStr(Node.Value), Bank, Slot, NestedT) then Exit;
 
   DestVal := MakeSSARegister(Bank, FProgram.AllocRegister(Bank));
   case Bank of
@@ -8226,7 +8320,7 @@ end;
 procedure TSSAGenerator.ProcessMemberStore(MemberNode, ExprNode: TASTNode);
 // Lower "obj.field = expr" to ssaRecordStore<bank>(handle, value, slot).
 var
-  TypeName: string;
+  TypeName, NestedT: string;
   UDTIdx, Slot: Integer;
   Bank: TSSARegisterType;
   HandleVal, ExprVal: TSSAValue;
@@ -8237,7 +8331,7 @@ begin
   // side effects; both are emitted before the store.
   if not ResolveRecordObject(MemberNode.GetChild(0), HandleVal, TypeName) then Exit;
   UDTIdx := FindUDT(TypeName);
-  if not UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot) then Exit;
+  if not UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot, NestedT) then Exit;
 
   ProcessExpression(ExprNode, ExprVal);
   case Bank of

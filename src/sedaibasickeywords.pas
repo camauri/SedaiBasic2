@@ -64,6 +64,7 @@ const
   kCALL    = 'CALL';     // CALL: statement-level SUB invocation (QB/FB)
   kTYPE    = 'TYPE';     // TYPE ... END TYPE: user-defined type (record/UDT)
   kAS      = 'AS';       // AS: type annotation (DIM x AS t, field AS t)
+  kWITH    = 'WITH';     // WITH ... END WITH: with-block (.field => withobject.field)
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';
