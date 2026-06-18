@@ -500,6 +500,40 @@ begin
             {$ENDIF}
             CurPC := FCallStack[FCallStackPtr];
           end;
+        // SUB/FUNCTION call frames (M2): like bcCall/bcReturn but snapshot/restore the
+        // register banks so the callee has its own locals and recursion works.
+        bcCallSub:
+          begin
+            FramePush;
+            FCallStack[FCallStackPtr] := CurPC + 1;
+            Inc(FCallStackPtr);
+            {$IFDEF DEBUG_MODE}
+            if Assigned(FDebugger) then FDebugger.NotifyCall;
+            {$ENDIF}
+            CurPC := Instr.Immediate;
+          end;
+        bcReturnSub:
+          begin
+            Dec(FCallStackPtr);
+            {$IFDEF DEBUG_MODE}
+            if Assigned(FDebugger) then FDebugger.NotifyReturn;
+            {$ENDIF}
+            CurPC := FCallStack[FCallStackPtr];
+            FramePop;
+          end;
+        // Transfer registers (M2): move a value to/from the non-saved transfer banks.
+        bcXferStoreInt:
+          begin FXferInt[Instr.Immediate] := FIntRegs[Instr.Src1]; Inc(CurPC); end;
+        bcXferStoreFloat:
+          begin FXferFloat[Instr.Immediate] := FFloatRegs[Instr.Src1]; Inc(CurPC); end;
+        bcXferStoreString:
+          begin FXferStr[Instr.Immediate] := FStringRegs[Instr.Src1]; Inc(CurPC); end;
+        bcXferLoadInt:
+          begin FIntRegs[Instr.Dest] := FXferInt[Instr.Immediate]; Inc(CurPC); end;
+        bcXferLoadFloat:
+          begin FFloatRegs[Instr.Dest] := FXferFloat[Instr.Immediate]; Inc(CurPC); end;
+        bcXferLoadString:
+          begin FStringRegs[Instr.Dest] := FXferStr[Instr.Immediate]; Inc(CurPC); end;
 
         // Array operations - typed versions are faster
         bcArrayLoadInt:

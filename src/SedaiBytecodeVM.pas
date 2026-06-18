@@ -104,6 +104,22 @@ type
     FLastSourceLine: Integer; // Last source line executed (for trace output)
     FCallStack: array of Integer;
     FCallStackPtr: Integer;
+    // SUB/FUNCTION call frames (M2): flat per-bank save stacks. bcCallSub snapshots the
+    // whole register banks [0, count) onto these stacks; bcReturnSub restores them. This
+    // makes a procedure body free to reuse any registers and makes recursion work, at the
+    // cost of an O(regCount) copy per call (per-procedure save sizes are a later optimization).
+    FFrameSaveInt: array of Int64;
+    FFrameSaveFloat: array of Double;
+    FFrameSaveStr: array of string;
+    FFrameSaveIntTop: Integer;
+    FFrameSaveFloatTop: Integer;
+    FFrameSaveStrTop: Integer;
+    // Transfer registers (M2): per-bank banks that are NEVER snapshot/restored, so they
+    // carry arguments (caller->callee param slots) and the result (callee->caller) across
+    // the bcCallSub/bcReturnSub frame save/restore. Indexed by a small per-bank slot.
+    FXferInt: array of Int64;
+    FXferFloat: array of Double;
+    FXferStr: array of string;
     FOutputDevice: IOutputDevice;
     FInputDevice: IInputDevice;
     FMemoryMapper: IMemoryMapper;  // Memory-mapped PEEK/POKE support
@@ -206,6 +222,8 @@ type
     procedure InitializeRegisters;
     procedure ClearAllVariables;
     procedure EnsureRegisterCapacity(RegType: TSSARegisterType; MinIndex: Integer);
+    procedure FramePush;   // bcCallSub: snapshot whole register banks
+    procedure FramePop;    // bcReturnSub: restore whole register banks
     procedure CheckFloatValid(RegIndex: Integer; const OpName: string);
     function FormatUsingString(const FormatStr: string; Value: Double): string;
   public
@@ -360,6 +378,9 @@ begin
   FPC := 0;
   FRunning := False;
   FCallStackPtr := 0;
+  FFrameSaveIntTop := 0;
+  FFrameSaveFloatTop := 0;
+  FFrameSaveStrTop := 0;
   FCursorCol := 0;
   // Initialize time tracking
   FStartTicks := GetTickCount64;
@@ -369,6 +390,11 @@ begin
   FInstructionsExecuted := 0;
   {$ENDIF}
   SetLength(FCallStack, 256);
+  // Transfer-register banks (M2): fixed capacity is plenty (slots = per-bank parameter
+  // counts of a single call, which is small).
+  SetLength(FXferInt, 256);
+  SetLength(FXferFloat, 256);
+  SetLength(FXferStr, 256);
   FVarMap := TStringList.Create;
   FVarMap.Sorted := True;
   // Create default console behavior (Commodore 64 style)
@@ -1009,6 +1035,47 @@ begin
   end;
 end;
 {$ENDIF}
+
+procedure TBytecodeVM.FramePush;
+// Snapshot the whole register banks onto the flat per-bank save stacks (one frame).
+// Counts are invariant during a run (banks are sized before execution), so bcReturnSub
+// pops exactly the same number of slots.
+var
+  i: Integer;
+begin
+  // Grow save stacks if needed (defensive; usually sized once).
+  if FFrameSaveIntTop + FIntRegCount > Length(FFrameSaveInt) then
+    SetLength(FFrameSaveInt, FFrameSaveIntTop + FIntRegCount + 256);
+  if FFrameSaveFloatTop + FFloatRegCount > Length(FFrameSaveFloat) then
+    SetLength(FFrameSaveFloat, FFrameSaveFloatTop + FFloatRegCount + 256);
+  if FFrameSaveStrTop + FStringRegCount > Length(FFrameSaveStr) then
+    SetLength(FFrameSaveStr, FFrameSaveStrTop + FStringRegCount + 256);
+  for i := 0 to FIntRegCount - 1 do
+    FFrameSaveInt[FFrameSaveIntTop + i] := FIntRegs[i];
+  Inc(FFrameSaveIntTop, FIntRegCount);
+  for i := 0 to FFloatRegCount - 1 do
+    FFrameSaveFloat[FFrameSaveFloatTop + i] := FFloatRegs[i];
+  Inc(FFrameSaveFloatTop, FFloatRegCount);
+  for i := 0 to FStringRegCount - 1 do
+    FFrameSaveStr[FFrameSaveStrTop + i] := FStringRegs[i];
+  Inc(FFrameSaveStrTop, FStringRegCount);
+end;
+
+procedure TBytecodeVM.FramePop;
+// Restore the whole register banks from the top frame on the save stacks.
+var
+  i: Integer;
+begin
+  Dec(FFrameSaveIntTop, FIntRegCount);
+  for i := 0 to FIntRegCount - 1 do
+    FIntRegs[i] := FFrameSaveInt[FFrameSaveIntTop + i];
+  Dec(FFrameSaveFloatTop, FFloatRegCount);
+  for i := 0 to FFloatRegCount - 1 do
+    FFloatRegs[i] := FFrameSaveFloat[FFrameSaveFloatTop + i];
+  Dec(FFrameSaveStrTop, FStringRegCount);
+  for i := 0 to FStringRegCount - 1 do
+    FStringRegs[i] := FFrameSaveStr[FFrameSaveStrTop + i];
+end;
 
 procedure TBytecodeVM.EnsureRegisterCapacity(RegType: TSSARegisterType; MinIndex: Integer);
 var
@@ -1659,6 +1726,9 @@ begin
   FPC := 0;
   FRunning := False;
   FCallStackPtr := 0;
+  FFrameSaveIntTop := 0;
+  FFrameSaveFloatTop := 0;
+  FFrameSaveStrTop := 0;
   {$IFDEF ENABLE_INSTRUCTION_COUNTING}
   FInstructionsExecuted := 0;
   {$ENDIF}
@@ -1893,6 +1963,29 @@ begin
         Dec(FCallStackPtr);
         FPC := FCallStack[FCallStackPtr];
       end;
+    // SUB/FUNCTION call frames (M2): like bcCall/bcReturn but snapshot/restore the
+    // register banks so the callee has its own locals and recursion works.
+    bcCallSub:
+      begin
+        FramePush;
+        FCallStack[FCallStackPtr] := FPC;
+        Inc(FCallStackPtr);
+        FPC := Instr.Immediate - 1;
+      end;
+    bcReturnSub:
+      if FCallStackPtr > 0 then
+      begin
+        Dec(FCallStackPtr);
+        FPC := FCallStack[FCallStackPtr];
+        FramePop;
+      end;
+    // Transfer registers (M2): move a value to/from the non-saved transfer banks.
+    bcXferStoreInt:    FXferInt[Instr.Immediate] := FIntRegs[Instr.Src1];
+    bcXferStoreFloat:  FXferFloat[Instr.Immediate] := FFloatRegs[Instr.Src1];
+    bcXferStoreString: FXferStr[Instr.Immediate] := FStringRegs[Instr.Src1];
+    bcXferLoadInt:     FIntRegs[Instr.Dest] := FXferInt[Instr.Immediate];
+    bcXferLoadFloat:   FFloatRegs[Instr.Dest] := FXferFloat[Instr.Immediate];
+    bcXferLoadString:  FStringRegs[Instr.Dest] := FXferStr[Instr.Immediate];
     // System commands
     bcEnd:
       begin

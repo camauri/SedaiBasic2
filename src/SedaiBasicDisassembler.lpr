@@ -278,11 +278,16 @@ begin
     bcMathRnd:
       Result := Format('R%d', [Instr.Dest]);
 
-    bcJump, bcCall:
+    bcJump, bcCall, bcCallSub:
       Result := Format('%d', [Instr.Immediate]);
 
     bcJumpIfZero, bcJumpIfNotZero:
       Result := Format('R%d, %d', [Instr.Src1, Instr.Immediate]);
+
+    bcXferStoreInt, bcXferStoreFloat, bcXferStoreString:
+      Result := Format('R%d -> X%d', [Instr.Src1, Instr.Immediate]);
+    bcXferLoadInt, bcXferLoadFloat, bcXferLoadString:
+      Result := Format('R%d <- X%d', [Instr.Dest, Instr.Immediate]);
 
     bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
     bcPrintInt, bcPrintIntLn:
@@ -321,7 +326,7 @@ begin
     bcArrayStoreString:
       Result := Format('ARR[%d], idx=IntR%d, value=StrR%d', [Instr.Src1, Instr.Src2, Instr.Dest]);
 
-    bcEnd, bcStop, bcReturn, bcNop:
+    bcEnd, bcStop, bcReturn, bcReturnSub, bcNop:
       Result := '';  // No operands
   end;
 end;

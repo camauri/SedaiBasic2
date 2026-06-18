@@ -61,6 +61,7 @@ const
   kCASE    = 'CASE';     // CASE / CASE ELSE
   kSUB     = 'SUB';      // SUB procedure
   kFUNCTION = 'FUNCTION';// FUNCTION procedure
+  kCALL    = 'CALL';     // CALL: statement-level SUB invocation (QB/FB)
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';

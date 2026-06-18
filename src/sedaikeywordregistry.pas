@@ -1583,6 +1583,7 @@ begin
  RegisterKeyword(kCASE,   ttCaseClause, 'CASE clause',           kcConditionalFlowControl);
  RegisterKeyword(kSUB,      ttProcedureStart, 'SUB procedure',      kcProcedures);
  RegisterKeyword(kFUNCTION, ttProcedureStart, 'FUNCTION procedure', kcProcedures);
+ RegisterKeyword(kCALL,     ttCallSub,        'Call a SUB',         kcProcedures);
 
  // === FLOW CONTROL - JUMP RELATED STATEMENTS ===
  RegisterKeyword(kEXIT,   ttJumpReturn,      'Exit statement',   kcJumpFlowControl);

@@ -270,7 +270,11 @@ begin
 
   case Instr.OpCode of
     // Control flow - always live (affect program execution)
-    ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaReturn:
+    ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaReturn,
+    ssaCallSub, ssaReturnSub,
+    // Transfer-register moves carry args/result across the call; never elide them.
+    ssaXferStoreInt, ssaXferStoreFloat, ssaXferStoreString,
+    ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString:
       Result := True;
 
     // Program termination and system state - always live

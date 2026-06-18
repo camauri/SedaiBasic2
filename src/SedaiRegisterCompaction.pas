@@ -180,6 +180,8 @@ function TRegisterCompactor.DestIsIntReg(OpCode: TBytecodeOp): Boolean;
 begin
   // Using case statement instead of set because opcodes are now Word (>255)
   case OpCode of
+    // SUB/FUNCTION transfer-register load (M2): Dest is the int register written.
+    bcXferLoadInt,
     // === GROUP 0: Core VM operations ===
     // Integer operations
     bcLoadConstInt, bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -248,6 +250,8 @@ function TRegisterCompactor.DestIsFloatReg(OpCode: TBytecodeOp): Boolean;
 begin
   // Using case statement instead of set because opcodes are now Word (>255)
   case OpCode of
+    // SUB/FUNCTION transfer-register load (M2): Dest is the float register written.
+    bcXferLoadFloat,
     // === GROUP 0: Core VM operations ===
     bcLoadConstFloat, bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat,
     bcNegFloat, bcPowFloat,
@@ -290,6 +294,8 @@ function TRegisterCompactor.DestIsStringReg(OpCode: TBytecodeOp): Boolean;
 begin
   // Using case statement instead of set because opcodes are now Word (>255)
   case OpCode of
+    // SUB/FUNCTION transfer-register load (M2): Dest is the string register written.
+    bcXferLoadString,
     // === GROUP 0: Core VM operations ===
     bcLoadConstString, bcCopyString,
     bcIntToString, bcFloatToString,
@@ -324,6 +330,8 @@ function TRegisterCompactor.Src1IsIntReg(OpCode: TBytecodeOp): Boolean;
 begin
   // Using case statement instead of set because opcodes are now Word (>255)
   case OpCode of
+    // SUB/FUNCTION transfer-register store (M2): Src1 is the int register read.
+    bcXferStoreInt,
     // === GROUP 0: Core VM operations ===
     // Int arithmetic
     bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
@@ -395,6 +403,8 @@ function TRegisterCompactor.Src1IsFloatReg(OpCode: TBytecodeOp): Boolean;
 begin
   // Using case statement instead of set because opcodes are now Word (>255)
   case OpCode of
+    // SUB/FUNCTION transfer-register store (M2): Src1 is the float register read.
+    bcXferStoreFloat,
     // === GROUP 0: Core VM operations ===
     // Float arithmetic
     bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcNegFloat, bcPowFloat,
@@ -525,6 +535,8 @@ function TRegisterCompactor.Src1IsStringReg(OpCode: TBytecodeOp): Boolean;
 begin
   // Using case statement instead of set because opcodes are now Word (>255)
   case OpCode of
+    // SUB/FUNCTION transfer-register store (M2): Src1 is the string register read.
+    bcXferStoreString,
     // === GROUP 0: Core VM operations ===
     bcCopyString,
     // String comparison (first operand)

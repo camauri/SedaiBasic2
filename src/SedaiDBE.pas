@@ -357,6 +357,9 @@ begin
     WriteLn('[DBE] Starting reachability DFS from entry block (index ', EntryIdx, ')');
   {$ENDIF}
   DFS(EntryIdx);
+  // SUB/FUNCTION entry blocks (M2) are reached via the ssaCallSub CFG edge from their call
+  // sites, so DFS from entry already covers called procedures; uncalled ones are correctly
+  // eliminated as dead code.
 end;
 
 procedure TDeadBlockElimination.DFS(BlockIdx: Integer);

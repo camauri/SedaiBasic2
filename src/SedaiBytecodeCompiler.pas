@@ -220,6 +220,14 @@ begin
     ssaJumpIfNotZero: Result := bcJumpIfNotZero;
     ssaCall: Result := bcCall;
     ssaReturn: Result := bcReturn;
+    ssaCallSub: Result := bcCallSub;
+    ssaReturnSub: Result := bcReturnSub;
+    ssaXferStoreInt: Result := bcXferStoreInt;
+    ssaXferStoreFloat: Result := bcXferStoreFloat;
+    ssaXferStoreString: Result := bcXferStoreString;
+    ssaXferLoadInt: Result := bcXferLoadInt;
+    ssaXferLoadFloat: Result := bcXferLoadFloat;
+    ssaXferLoadString: Result := bcXferLoadString;
     // Array operations
     ssaArrayDim: Result := bcArrayDim;
     // ssaArrayLoad and ssaArrayStore are handled specially in CompileInstruction
@@ -1499,8 +1507,9 @@ begin
   BCIndex := FProgram.GetInstructionCount;
   FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
 
-  // If this is a jump with a label, add to fixup list
-  if (Instr.OpCode in [ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaCall]) and
+  // If this is a jump with a label, add to fixup list. ssaCallSub carries the
+  // procedure entry label in Dest, resolved to the entry PC like ssaCall.
+  if (Instr.OpCode in [ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaCall, ssaCallSub]) and
      (Instr.Dest.Kind = svkLabel) then
   begin
     AddJumpFixup(BCIndex, Instr.Dest.LabelName);

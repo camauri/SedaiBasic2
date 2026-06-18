@@ -138,7 +138,7 @@ begin
     Instr := FProgram.GetInstruction(i);
 
     case TBytecodeOp(Instr.OpCode) of
-      bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall:
+      bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcCallSub:
       begin
         Target := Instr.Immediate;
         if (Target >= 0) and (Target < FProgram.GetInstructionCount) then

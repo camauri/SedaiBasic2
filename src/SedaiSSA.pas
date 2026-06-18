@@ -71,6 +71,18 @@ type
     FUserFunctions: specialize TDictionary<string, TUserFunctionDef>;  // User-defined functions (DEF FN)
     FConstFloatRegs: specialize TDictionary<Integer, Double>;   // Maps float register to constant value
     FConstIntRegs: specialize TDictionary<Integer, Integer>;    // Maps int register to constant value
+    // SUB/FUNCTION declarations (M2). Bodies are NOT lowered at their definition point
+    // (they must not run as part of module flow); they are collected here and lowered
+    // after the module's END, each into its own block region reachable only via ssaCallSub.
+    FDeferredProcs: array of TASTNode;
+    FProcedureNames: TStringList;  // UPPERCASE names of declared SUB/FUNCTION (call resolution)
+    FProcDecls: specialize TDictionary<string, TASTNode>;  // name -> antProcedureDecl (param info)
+    // Context while lowering a procedure body (M2): used to lower "fname = expr" / RETURN expr
+    // (FUNCTION result) and EXIT SUB/FUNCTION / RETURN to a frame return.
+    FInProcedure: Boolean;
+    FCurrentProcName: string;
+    FCurrentProcRetType: TSSARegisterType;
+    FCurrentProcIsFunction: Boolean;
 
     function GenerateUniqueLabel(const Prefix: string): string;
     function GetVariableType(const VarName: string): TSSARegisterType;
@@ -78,6 +90,20 @@ type
     procedure PreAllocateVariables(Node: TASTNode);  // Pre-scan AST to allocate all variable registers
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
     procedure ProcessStatement(Node: TASTNode);
+    // SUB/FUNCTION (M2): pre-scan the AST to register all declarations up front (so CALL
+    // sites resolve parameter info even for procedures defined later); collect a declaration
+    // for deferred lowering; lower a CALL site; lower all bodies after the module END.
+    procedure PreCollectProcedures(Node: TASTNode);
+    procedure CollectProcedureDecl(Node: TASTNode);
+    procedure ProcessProcedureCall(Node: TASTNode);
+    // Stage arguments into transfer slots and emit ssaCallSub (shared by CALL and FUNCTION).
+    procedure EmitProcedureCall(const Name: string; ArgListNode: TASTNode);
+    procedure LowerDeferredProcedures;
+    function ProcedureLabelName(const Name: string): string;
+    // Map parameter at Index (within ParamList) to its transfer-bank type and per-bank slot.
+    function ParamBankAndSlot(ParamList: TASTNode; Index: Integer; out RT: TSSARegisterType): Integer;
+    procedure EmitXferStore(RT: TSSARegisterType; Slot: Integer; const Val: TSSAValue);
+    procedure EmitXferLoad(RT: TSSARegisterType; Slot: Integer; const DestReg: TSSAValue);
     procedure FixForwardReferences;  // PHASE 3 TIER 3: Fix forward GOTO/GOSUB references
     procedure ProcessExpression(Node: TASTNode; out Result: TSSAValue); overload;
     procedure ProcessExpression(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue); overload;
@@ -209,6 +235,11 @@ implementation
 uses SedaiDebug;
 {$ENDIF}
 
+const
+  // Transfer-register slot reserved for a FUNCTION's return value (per bank). Kept well
+  // above any parameter slot count so it never collides with an argument slot.
+  XFER_RESULT_SLOT = 255;
+
 constructor TSSAGenerator.Create;
 begin
   inherited Create;
@@ -225,6 +256,10 @@ begin
   FUserFunctions := specialize TDictionary<string, TUserFunctionDef>.Create;
   FConstFloatRegs := specialize TDictionary<Integer, Double>.Create;
   FConstIntRegs := specialize TDictionary<Integer, Integer>.Create;
+  SetLength(FDeferredProcs, 0);
+  FProcedureNames := TStringList.Create;
+  FProcedureNames.CaseSensitive := False;
+  FProcDecls := specialize TDictionary<string, TASTNode>.Create;
 end;
 
 destructor TSSAGenerator.Destroy;
@@ -233,6 +268,8 @@ begin
   FUserFunctions.Free;
   FConstFloatRegs.Free;
   FConstIntRegs.Free;
+  FProcedureNames.Free;
+  FProcDecls.Free;
   inherited Destroy;
 end;
 
@@ -431,6 +468,7 @@ var
   DestReg: Integer;
   OpCode: TSSAOpCode;
   FuncName, VarName: string;
+  FuncRetType: TSSARegisterType;  // M2: user FUNCTION return type
   ArgValue, ArgReg: TSSAValue;
   TempReg, IntReg: Integer;
   IntRegVal, TempVal: TSSAValue;
@@ -1150,6 +1188,18 @@ begin
       begin
         FuncName := UpperCase(VarToStr(Node.Value));
         ArgListNode := Node.GetChild(0);
+
+        // User-defined FUNCTION (M2): stage args, call, read the result transfer slot into
+        // a fresh register of the function's return type (by name suffix).
+        if FProcedureNames.IndexOf(FuncName) >= 0 then
+        begin
+          EmitProcedureCall(FuncName, ArgListNode);
+          FuncRetType := GetVariableType(FuncName);
+          DestReg := FProgram.AllocRegister(FuncRetType);
+          Result := MakeSSARegister(FuncRetType, DestReg);
+          EmitXferLoad(FuncRetType, XFER_RESULT_SLOT, Result);
+          Exit;
+        end;
 
         // Handle RGBA function specially (4 integer args -> 1 integer result)
         if FuncName = 'RGBA' then
@@ -1996,6 +2046,19 @@ begin
         end;
 
         ArrName := VarToStr(Node.GetChild(0).Value);
+
+        // User-defined FUNCTION (M2): "name(args)" parses as array access, but if the name
+        // is a declared FUNCTION it is a call. Stage args, call, read the result slot.
+        if FProcedureNames.IndexOf(UpperCase(ArrName)) >= 0 then
+        begin
+          EmitProcedureCall(UpperCase(ArrName), Node.GetChild(1));
+          FuncRetType := GetVariableType(ArrName);
+          DestReg := FProgram.AllocRegister(FuncRetType);
+          Result := MakeSSARegister(FuncRetType, DestReg);
+          EmitXferLoad(FuncRetType, XFER_RESULT_SLOT, Result);
+          Exit;
+        end;
+
         ArrayIdx := FProgram.FindArray(ArrName);
         if ArrayIdx < 0 then
           raise Exception.CreateFmt('Array not declared: %s', [ArrName]);
@@ -2209,6 +2272,16 @@ begin
 
   if VarNode.NodeType <> antIdentifier then Exit;
   VarName := VarToStr(VarNode.Value);
+
+  // FUNCTION result (M2): "fname = expr" inside a FUNCTION body sets the return value.
+  // Evaluate the expression and stage it into the result transfer slot (delivered to the
+  // caller on bcReturnSub). QB semantics: execution continues; the actual return is at END.
+  if FInProcedure and FCurrentProcIsFunction and (UpperCase(VarName) = FCurrentProcName) then
+  begin
+    ProcessExpression(ExprNode, ExprValue);
+    EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, ExprValue);
+    Exit;
+  end;
 
   // Get or allocate register for this variable
   VarReg := GetOrAllocateVariable(VarName);
@@ -7705,8 +7778,11 @@ begin
     begin
       Instr := Block.Instructions[j];
 
-      // Check for GOTO, GOSUB, or conditional jumps (ON GOTO/GOSUB) with label operand
-      if (Instr.OpCode in [ssaJump, ssaCall, ssaJumpIfZero, ssaJumpIfNotZero]) and (Instr.Dest.Kind = svkLabel) then
+      // Check for GOTO, GOSUB, SUB/FUNCTION call, or conditional jumps with a label operand.
+      // ssaCallSub mirrors ssaCall (GOSUB): it terminates its block with two successors
+      // (procedure entry + return point), so the procedure block gets a predecessor and is
+      // reachable from entry (clean single-entry CFG for the dominator tree).
+      if (Instr.OpCode in [ssaJump, ssaCall, ssaCallSub, ssaJumpIfZero, ssaJumpIfNotZero]) and (Instr.Dest.Kind = svkLabel) then
       begin
         TargetLabel := Instr.Dest.LabelName;
         TargetBlock := FProgram.FindBlock(TargetLabel);
@@ -7795,6 +7871,232 @@ begin
   end;
 end;
 
+function TSSAGenerator.ProcedureLabelName(const Name: string): string;
+begin
+  Result := 'PROC_' + UpperCase(Name);
+end;
+
+procedure TSSAGenerator.CollectProcedureDecl(Node: TASTNode);
+// Record a SUB/FUNCTION declaration for deferred lowering (see LowerDeferredProcedures).
+// AST layout: child 0 = name (antIdentifier), child 1 = antParameterList, rest = body.
+var
+  NameNode: TASTNode;
+  Name: string;
+  n: Integer;
+begin
+  if Node.ChildCount = 0 then Exit;
+  NameNode := Node.GetChild(0);
+  if NameNode.NodeType <> antIdentifier then Exit;
+  Name := UpperCase(VarToStr(NameNode.Value));
+  if FProcDecls.ContainsKey(Name) then Exit;  // already registered by the pre-scan
+  n := Length(FDeferredProcs);
+  SetLength(FDeferredProcs, n + 1);
+  FDeferredProcs[n] := Node;
+  if FProcedureNames.IndexOf(Name) < 0 then
+    FProcedureNames.Add(Name);
+  FProcDecls.AddOrSetValue(Name, Node);
+end;
+
+procedure TSSAGenerator.PreCollectProcedures(Node: TASTNode);
+// Pre-scan: register every SUB/FUNCTION declaration before the main walk, so a CALL placed
+// before the procedure definition still resolves its parameter types/slots.
+var
+  i: Integer;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType = antProcedureDecl then
+    CollectProcedureDecl(Node);
+  for i := 0 to Node.ChildCount - 1 do
+    PreCollectProcedures(Node.GetChild(i));
+end;
+
+function TSSAGenerator.ParamBankAndSlot(ParamList: TASTNode; Index: Integer;
+  out RT: TSSARegisterType): Integer;
+// Walk parameters [0..Index] counting per bank; the slot is the running count for the
+// bank of the Index-th parameter. Caller and callee call this with the SAME param list,
+// so they agree on slot assignment. Parameter type is taken from the BASIC name suffix.
+var
+  i, cInt, cFloat, cStr: Integer;
+  t: TSSARegisterType;
+begin
+  cInt := 0; cFloat := 0; cStr := 0;
+  Result := 0; RT := srtInt;
+  for i := 0 to Index do
+  begin
+    if i >= ParamList.ChildCount then Break;
+    t := GetVariableType(VarToStr(ParamList.GetChild(i).Value));
+    RT := t;
+    case t of
+      srtFloat:  begin Result := cFloat; Inc(cFloat); end;
+      srtString: begin Result := cStr;   Inc(cStr);   end;
+    else
+      begin Result := cInt; Inc(cInt); end;
+    end;
+  end;
+end;
+
+procedure TSSAGenerator.EmitXferStore(RT: TSSARegisterType; Slot: Integer; const Val: TSSAValue);
+// Stage a value into a transfer-register slot (Src1=value reg, Src3=const slot -> Immediate).
+var
+  Op: TSSAOpCode;
+  V: TSSAValue;
+begin
+  case RT of
+    srtFloat:  begin Op := ssaXferStoreFloat;  V := EnsureFloatRegister(Val); end;
+    srtString: begin Op := ssaXferStoreString; V := EnsureStringRegister(Val); end;
+  else
+    begin Op := ssaXferStoreInt; V := EnsureIntRegister(Val); end;
+  end;
+  EmitInstruction(Op, MakeSSAValue(svkNone), V, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+end;
+
+procedure TSSAGenerator.EmitXferLoad(RT: TSSARegisterType; Slot: Integer; const DestReg: TSSAValue);
+// Load a transfer-register slot into a register (Dest=reg, Src3=const slot -> Immediate).
+var
+  Op: TSSAOpCode;
+begin
+  case RT of
+    srtFloat:  Op := ssaXferLoadFloat;
+    srtString: Op := ssaXferLoadString;
+  else
+    Op := ssaXferLoadInt;
+  end;
+  EmitInstruction(Op, DestReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+end;
+
+procedure TSSAGenerator.EmitProcedureCall(const Name: string; ArgListNode: TASTNode);
+// Evaluate each argument, coerce to the parameter's type, and stage it into the matching
+// transfer slot BEFORE the call; the callee prologue copies the slots into its parameter
+// registers. The target label may be a forward reference (bodies are lowered later).
+var
+  LabelName: string;
+  Decl, ParamList, ArgExpr: TASTNode;
+  i, NArgs, Slot: Integer;
+  RT: TSSARegisterType;
+  ArgVal: TSSAValue;
+  CallBlock, ContBlock, ProcEntry: TSSABasicBlock;
+begin
+  LabelName := ProcedureLabelName(Name);
+  if not Assigned(FCurrentBlock) then
+    FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('call'));
+
+  ParamList := nil;
+  if FProcDecls.TryGetValue(Name, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
+    ParamList := Decl.GetChild(1);
+
+  // The argument list is antArgumentList (CALL) or antExpressionList (FUNCTION call parsed
+  // as A(...) — array-like syntax); both simply hold the argument expressions as children.
+  if Assigned(ArgListNode) and
+     (ArgListNode.NodeType in [antArgumentList, antExpressionList]) and Assigned(ParamList) then
+  begin
+    NArgs := ArgListNode.ChildCount;
+    if NArgs > ParamList.ChildCount then NArgs := ParamList.ChildCount;
+    for i := 0 to NArgs - 1 do
+    begin
+      ArgExpr := ArgListNode.GetChild(i);
+      ProcessExpression(ArgExpr, ArgVal);
+      Slot := ParamBankAndSlot(ParamList, i, RT);
+      EmitXferStore(RT, Slot, ArgVal);
+    end;
+  end;
+
+  EmitInstruction(ssaCallSub, MakeSSALabel(LabelName), MakeSSAValue(svkNone),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // Split the block at the call (like GOSUB): the call block ends with ssaCallSub and gets
+  // two successors — the procedure entry (the call) and a fresh return-point block (where
+  // execution resumes). This keeps the procedure block reachable with a single entry, so
+  // the dominator tree stays well-formed. The bytecode lays the return block right after.
+  CallBlock := FCurrentBlock;
+  ContBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('aftercall'));
+  if Assigned(CallBlock) then
+  begin
+    if CallBlock.Successors.IndexOf(ContBlock) = -1 then
+    begin
+      CallBlock.AddSuccessor(ContBlock);
+      ContBlock.AddPredecessor(CallBlock);
+    end;
+    // Edge to the procedure entry (may be a forward reference; FixForwardReferences also
+    // connects it). Connect here when the target already exists (e.g. recursive calls).
+    ProcEntry := FProgram.FindBlock(LabelName);
+    if Assigned(ProcEntry) and (CallBlock.Successors.IndexOf(ProcEntry) = -1) then
+    begin
+      CallBlock.AddSuccessor(ProcEntry);
+      ProcEntry.AddPredecessor(CallBlock);
+    end;
+  end;
+  FCurrentBlock := ContBlock;
+end;
+
+procedure TSSAGenerator.ProcessProcedureCall(Node: TASTNode);
+// Lower a statement-level CALL: stage args + ssaCallSub. Execution resumes in the
+// return-point block created by EmitProcedureCall.
+var
+  ArgList: TASTNode;
+begin
+  ArgList := nil;
+  if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antArgumentList) then
+    ArgList := Node.GetChild(0);
+  EmitProcedureCall(UpperCase(VarToStr(Node.Value)), ArgList);
+end;
+
+procedure TSSAGenerator.LowerDeferredProcedures;
+// Lower every collected SUB/FUNCTION body into its own block region. Must be called AFTER
+// the module END is emitted so procedure blocks sit beyond it (never reached by fall-through;
+// only via ssaCallSub). Each body ends with ssaReturnSub.
+var
+  i, j, Slot: Integer;
+  Proc, NameNode, ParamList: TASTNode;
+  Name, LabelName: string;
+  RT: TSSARegisterType;
+  ParamReg: TSSAValue;
+begin
+  for i := 0 to High(FDeferredProcs) do
+  begin
+    Proc := FDeferredProcs[i];
+    if Proc.ChildCount = 0 then Continue;
+    NameNode := Proc.GetChild(0);
+    if NameNode.NodeType <> antIdentifier then Continue;
+    Name := UpperCase(VarToStr(NameNode.Value));
+    LabelName := ProcedureLabelName(Name);
+
+    // Establish procedure context (for "fname = expr" results, RETURN, EXIT SUB/FUNCTION).
+    FInProcedure := True;
+    FCurrentProcName := Name;
+    FCurrentProcIsFunction := (UpperCase(VarToStr(Proc.Value)) = 'FUNCTION');
+    FCurrentProcRetType := GetVariableType(Name);
+
+    // Entry block for the procedure body.
+    FCurrentBlock := FProgram.GetOrCreateBlock(LabelName);
+
+    // Prologue: copy each parameter from its transfer slot into the parameter register
+    // (the callee's local for that name). Child 1 = antParameterList.
+    if (Proc.ChildCount >= 2) and (Proc.GetChild(1).NodeType = antParameterList) then
+    begin
+      ParamList := Proc.GetChild(1);
+      for j := 0 to ParamList.ChildCount - 1 do
+      begin
+        ParamReg := GetOrAllocateVariable(VarToStr(ParamList.GetChild(j).Value));
+        Slot := ParamBankAndSlot(ParamList, j, RT);
+        EmitXferLoad(RT, Slot, ParamReg);
+      end;
+    end;
+
+    // Body statements begin at child index 2 (0 = name, 1 = antParameterList).
+    for j := 2 to Proc.ChildCount - 1 do
+      ProcessStatement(Proc.GetChild(j));
+
+    // Guarantee a trailing return frame (covers a fall-off-the-end body).
+    if not Assigned(FCurrentBlock) then
+      FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel(LabelName + '_END'));
+    EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    FCurrentBlock := nil;   // procedure body terminated
+    FInProcedure := False;
+    FCurrentProcName := '';
+  end;
+end;
+
 procedure TSSAGenerator.ProcessStatement(Node: TASTNode);
 var
   LineNum: Integer;
@@ -7806,6 +8108,9 @@ var
   KeyNumVal, KeyTextVal, KeyNumReg, KeyTextReg: TSSAValue;  // For KEY command
   ExprResult, LineNumReg: TSSAValue;  // For TRAP command
   AddrVal, AddrReg, ValueReg: TSSAValue;  // For POKE command
+  ExitKind: string;       // M2: EXIT/RETURN kind
+  IsExitStmt: Boolean;    // M2
+  RetVal: TSSAValue;      // M2: RETURN expr / FUNCTION result
 begin
   if Node = nil then Exit;
 
@@ -7869,10 +8174,13 @@ begin
       end;
     end;
     antProcedureDecl:
-      // SUB / FUNCTION declaration. A procedure body is NOT lowered inline (it is
-      // not executed at the point of definition); real lowering with call frames is
-      // M2 increment 3. For now, skip it so module-level code runs unaffected.
-      ;
+      // SUB / FUNCTION declaration. The body is NOT lowered inline (it must not run as
+      // part of module flow); it is deferred and lowered after the module END (see
+      // Generate / LowerDeferredProcedures), each into its own block region reachable
+      // only via ssaCallSub.
+      CollectProcedureDecl(Node);
+    antProcedureCall:
+      ProcessProcedureCall(Node);
     antLabel:
     begin
       // Named label "name:" — start a new basic block 'LABEL_<NAME>' (the GOTO/GOSUB
@@ -7939,29 +8247,56 @@ begin
     antFilter: ProcessFilter(Node);
     antReturn:
     begin
-      // Check if this is EXIT (not RETURN) - EXIT should jump to loop end
-      if Assigned(Node.Token) and (UpperCase(Node.Token.Value) = 'EXIT') then
+      ExitKind := UpperCase(VarToStr(Node.Value));   // 'EXIT[ kind]' or 'RETURN'
+      IsExitStmt := Assigned(Node.Token) and (UpperCase(Node.Token.Value) = 'EXIT');
+      if IsExitStmt then
       begin
-        // EXIT statement - jump to end of current loop
-        if Length(FLoopStack) > 0 then
+        // EXIT SUB / EXIT FUNCTION inside a procedure -> frame return.
+        if FInProcedure and ((Pos('SUB', ExitKind) > 0) or (Pos('FUNCTION', ExitKind) > 0)) then
         begin
-          // Jump to loop's EndLabel
+          EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          FCurrentBlock := nil;
+        end
+        else if Length(FLoopStack) > 0 then
+        begin
+          // EXIT FOR/DO/WHILE - jump to the current loop's EndLabel
           EmitInstruction(ssaJump, MakeSSALabel(FLoopStack[High(FLoopStack)].EndLabel),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           FCurrentBlock := nil;
         end
+        else if FInProcedure then
+        begin
+          // Bare EXIT inside a procedure with no enclosing loop -> frame return.
+          EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          FCurrentBlock := nil;
+        end
         else
         begin
-          // EXIT outside loop - treat as END (or could be error)
+          // EXIT outside loop at module level - treat as END (or could be error)
           WriteLn(StdErr, 'Warning: EXIT outside loop at line ', FCurrentLineNumber);
           EmitInstruction(ssaEnd, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           FCurrentBlock := nil;
         end;
       end
+      else if FInProcedure then
+      begin
+        // RETURN inside a procedure -> frame return. RETURN expr (FreeBASIC) inside a
+        // FUNCTION also stages the result.
+        if (Node.ChildCount > 0) and FCurrentProcIsFunction then
+        begin
+          ProcessExpression(Node.GetChild(0), RetVal);
+          EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, RetVal);
+        end;
+        EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        FCurrentBlock := nil;
+      end
       else
       begin
-        // Normal RETURN statement
+        // Normal RETURN statement (GOSUB return)
         EmitInstruction(ssaReturn, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         // PHASE 3 TIER 3: RETURN terminates the current block - no fall-through
@@ -8250,13 +8585,16 @@ begin
   // so READ can access them regardless of their position in the source
   PreProcessData(AST);
 
-  // Process AST (DATA statements will be skipped since they're already processed)
+  // PRE-COLLECT SUB/FUNCTION DECLARATIONS so CALL sites can resolve parameter info even
+  // for procedures defined later in the source (forward references).
+  PreCollectProcedures(AST);
+
+  // Process AST (DATA statements will be skipped since they're already processed).
+  // SUB/FUNCTION declarations are collected (not lowered) during this walk.
   ProcessStatement(AST);
 
-  // PHASE 3 TIER 3: Fix forward GOTO/GOSUB references
-  FixForwardReferences;
-
-  // Add END if not present - check the LAST block in the program, not current block
+  // Add END to the LAST MODULE block, BEFORE procedure bodies are appended, so module
+  // flow halts at END and never falls through into the procedure region.
   if FProgram.Blocks.Count > 0 then
   begin
     LastBlock := FProgram.Blocks[FProgram.Blocks.Count - 1];
@@ -8269,6 +8607,13 @@ begin
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
   end;
+
+  // Lower SUB/FUNCTION bodies into their own block region (after the module END).
+  LowerDeferredProcedures;
+
+  // PHASE 3 TIER 3: Fix forward GOTO/GOSUB references (now that all blocks exist,
+  // including procedure bodies).
+  FixForwardReferences;
 
   Result := FProgram;
 end;

@@ -158,6 +158,7 @@ type
     ttProcedureDefine,        // DEF (FN)
     ttProcedureEnd,           // ENDPROCEDURE, ENDFUNCTION
     ttProcedureStart,         // PROCEDURE, FUNCTION, DEF, SUB
+    ttCallSub,                // CALL (statement-level SUB invocation)
 
     // === DATA HANDLING ===
     ttDataAssignment,         // LET, SET, :=
@@ -352,7 +353,7 @@ const
   // Tokens representing keywords
   KEYWORD_TOKENS: TTokenTypeSet = [
     ttKeyword, ttLoopBlockStart, ttLoopBlockEnd,
-    ttBlockBegin, ttBlockEnd, ttProcedureStart, ttProcedureEnd,
+    ttBlockBegin, ttBlockEnd, ttProcedureStart, ttProcedureEnd, ttCallSub,
     ttJumpKeyword, ttDataDeclaration, ttDataAssignment, ttCommentRemark,
     ttBitwiseOperator
   ];

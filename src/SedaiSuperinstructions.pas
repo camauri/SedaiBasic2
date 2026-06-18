@@ -156,7 +156,7 @@ begin
     if Instr.OpCode < bcGroupString then
     begin
       case Instr.OpCode of
-        bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall:
+        bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcCallSub:
           if Instr.Immediate = Index then
           begin
             Result := True;
@@ -225,7 +225,8 @@ begin
     begin
       // Standard control flow opcodes in Group 0
       case Instr.OpCode of
-        bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcReturn, bcEnd, bcStop:
+        bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcReturn, bcEnd, bcStop,
+        bcCallSub, bcReturnSub:
           IsControlFlow := True;
       end;
     end

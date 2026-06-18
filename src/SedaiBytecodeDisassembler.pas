@@ -150,6 +150,14 @@ begin
       Line := Format('%4d: %-20s %d', [Index, 'Call', Instr.Immediate]);
     bcReturn:
       Line := Format('%4d: %-20s', [Index, 'Return']);
+    bcCallSub:
+      Line := Format('%4d: %-20s %d', [Index, 'CallSub', Instr.Immediate]);
+    bcReturnSub:
+      Line := Format('%4d: %-20s', [Index, 'ReturnSub']);
+    bcXferStoreInt, bcXferStoreFloat, bcXferStoreString:
+      Line := Format('%4d: %-20s R%d -> X%d', [Index, 'XferStore', Instr.Src1, Instr.Immediate]);
+    bcXferLoadInt, bcXferLoadFloat, bcXferLoadString:
+      Line := Format('%4d: %-20s R%d <- X%d', [Index, 'XferLoad', Instr.Dest, Instr.Immediate]);
     bcEnd:
       Line := Format('%4d: %-20s', [Index, 'End']);
     bcStop:

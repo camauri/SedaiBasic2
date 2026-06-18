@@ -119,6 +119,8 @@ type
     function ParseProcedureDecl: TASTNode;
     procedure ParseProcedureBody(Parent: TASTNode);
     function AtEndProcedure: Boolean;
+    // CALL name [ ( args ) ] : statement-level SUB invocation.
+    function ParseCallStatement: TASTNode;
     procedure ConsumeEndProcedure;
     function ParseForStatement: TASTNode;
     function ParseDoStatement: TASTNode;
@@ -522,6 +524,7 @@ begin
         Result := Memoize('ProcedureDecl', @ParseProcedureDecl)
       else
         Result := Memoize('FnStatement', @ParseFnStatement);
+    ttCallSub: Result := Memoize('CallStatement', @ParseCallStatement);
 
     // === MEMORY COMMANDS ===
     ttMemoryCommand: Result := Memoize('MemoryStatement', @ParseMemoryStatement);
@@ -1273,6 +1276,48 @@ begin
   DoNodeCreated(Result);
 end;
 
+function TPackratParser.ParseCallStatement: TASTNode;
+var
+  Token, NameTok: TLexerToken;
+  ArgList, ArgExpr: TASTNode;
+  HasParens: Boolean;
+begin
+  // CALL name [ ( arg [, arg ...] ) ]  — QB/FB statement-level SUB invocation.
+  // Also accepts unparenthesised args ("CALL name a, b"). The arguments are kept in
+  // an antArgumentList child; SSA lowering wires them through the transfer registers.
+  Token := Context.CurrentToken;
+  Context.Advance;                                // consume CALL
+  Result := nil;
+  if not Context.Check(ttIdentifier) then
+    Exit;                                         // malformed CALL: nothing to call
+  NameTok := Context.CurrentToken;
+  Result := TASTNode.CreateWithValue(antProcedureCall, UpperCase(NameTok.Value), NameTok);
+  Context.Advance;                                // consume name
+
+  ArgList := TASTNode.Create(antArgumentList, Token);
+  Result.AddChild(ArgList);
+
+  HasParens := Context.Check(ttDelimParOpen);
+  if HasParens then Context.Advance;              // (
+  // Parse a comma-separated argument list (empty is fine).
+  if not (Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or
+          Context.Check(ttSeparStmt) or Context.Check(ttDelimParClose)) then
+  begin
+    repeat
+      ArgExpr := FExpressionParser.ParseExpression;
+      if not Assigned(ArgExpr) then Break;
+      ArgList.AddChild(ArgExpr);
+      if Context.Check(ttSeparParam) then
+        Context.Advance                           // ,
+      else
+        Break;
+    until False;
+  end;
+  if HasParens and Context.Check(ttDelimParClose) then
+    Context.Advance;                              // )
+  DoNodeCreated(Result);
+end;
+
 // Build the condition for a CASE clause: "(sel = v1) OR (sel = v2) OR ...", where
 // each 'sel' is a fresh clone of the SELECT selector (so it isn't shared in the AST).
 function TPackratParser.ParseCaseCondition(Selector: TASTNode): TASTNode;
@@ -1636,22 +1681,40 @@ end;
 
 function TPackratParser.ParseReturnStatement: TASTNode;
 var
-  Token: TLexerToken;
+  Token, KindTok: TLexerToken;
+  IsExit: Boolean;
+  ExprNode: TASTNode;
 begin
   Token := Context.CurrentToken;
-
-  //if not Assigned(FValidationStacks) and Assigned(Context) then
-  //  FValidationStacks := TParserValidationStacks.Create(Context);
-  //
-  //// *** VALIDATE RETURN ***
-  //if not FValidationStacks.ValidateReturn then
-  //begin
-  //  Result := nil;
-  //  Exit;
-  //end;
-
+  IsExit := UpperCase(Token.Value) = 'EXIT';
   Result := TASTNode.Create(antReturn, Token);
-  Context.Advance; // Consume RETURN
+  Context.Advance; // consume EXIT / RETURN
+
+  if IsExit then
+  begin
+    // EXIT [SUB|FUNCTION|FOR|DO|WHILE|LOOP]. Capture the kind word (if any) in the node
+    // value so SSA can route EXIT SUB/FUNCTION to a frame return vs a loop exit.
+    if not (Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt)) then
+    begin
+      KindTok := Context.CurrentToken;
+      Result.Value := 'EXIT ' + UpperCase(KindTok.Value);
+      Context.Advance;   // consume the kind keyword (SUB/FUNCTION/FOR/...)
+    end
+    else
+      Result.Value := 'EXIT';
+  end
+  else
+  begin
+    // RETURN [expr]: a bare RETURN ends a GOSUB / procedure; RETURN expr (FreeBASIC) also
+    // delivers a FUNCTION result. Parse a trailing expression if present on this line.
+    Result.Value := 'RETURN';
+    if not (Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt)) then
+    begin
+      ExprNode := FExpressionParser.ParseExpression;
+      if Assigned(ExprNode) then
+        Result.AddChild(ExprNode);
+    end;
+  end;
   DoNodeCreated(Result);
 end;
 

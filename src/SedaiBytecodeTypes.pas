@@ -222,6 +222,20 @@ const
   bcResumeNext      = bcGroupCore + 92;  // RESUME NEXT: Continue after error at next statement
   bcModFloat        = bcGroupCore + 93;  // Float modulo (A - Floor(A/B) * B)
   bcFrame           = bcGroupCore + 94;  // FRAME [fps]: Wait for frame sync (default 60fps)
+  // SUB/FUNCTION call frames (M2). v1: Immediate = procedure entry PC (resolved via the
+  // procedure label, like bcCall). The VM snapshots/restores the whole register banks
+  // around the call; arguments and the result travel via the transfer registers (bcXfer*).
+  bcCallSub         = bcGroupCore + 95;  // Call a SUB/FUNCTION: save frame, pass args, jump
+  bcReturnSub       = bcGroupCore + 96;  // Return from SUB/FUNCTION: deliver result, restore frame
+  // Argument/result transfer registers (M2): separate VM-side banks, never saved/restored,
+  // so they carry args (caller->callee) and the result (callee->caller) across the frame
+  // save/restore. Store: Src1=value reg, Immediate=slot. Load: Dest=reg, Immediate=slot.
+  bcXferStoreInt    = bcGroupCore + 97;
+  bcXferStoreFloat  = bcGroupCore + 98;
+  bcXferStoreString = bcGroupCore + 99;
+  bcXferLoadInt     = bcGroupCore + 100;
+  bcXferLoadFloat   = bcGroupCore + 101;
+  bcXferLoadString  = bcGroupCore + 102;
 
   // === GROUP 1: STRING OPERATIONS (0x01xx) ===
   bcStrConcat       = bcGroupString + 0;
@@ -511,6 +525,21 @@ type
     PC: Integer;
   end;
 
+  { Procedure descriptor (M2) - one per SUB/FUNCTION. The bcCallSub opcode carries the
+    index into this table in its Immediate; the VM reads the entry PC and the per-bank
+    save sizes (how many registers [0, SaveSize) to snapshot/restore around the call,
+    so the procedure body may freely reuse those registers and recursion works). Arguments
+    and the result travel through the separate transfer registers (see bcXfer* opcodes),
+    so the descriptor needs no parameter-slot table. SaveSize values are computed after
+    register allocation/compaction by scanning each procedure's final instruction range. }
+  TProcDescriptor = record
+    Name: string;            // procedure name (UPPERCASE), for call resolution/diagnostics
+    EntryPC: Integer;        // first instruction of the procedure body
+    SaveSizeInt: Integer;    // snapshot/restore registers [0, SaveSizeInt) in the int bank
+    SaveSizeFloat: Integer;  // ... float bank
+    SaveSizeString: Integer; // ... string bank
+  end;
+
   { Bytecode program - compiled bytecode ready for VM }
   TBytecodeProgram = class
   private
@@ -530,6 +559,8 @@ type
     FIntVarRegCount: Integer;
     FFloatVarRegCount: Integer;
     FStringVarRegCount: Integer;
+    // Procedure descriptor table (M2): one entry per SUB/FUNCTION, indexed by bcCallSub.
+    FProcedures: array of TProcDescriptor;
   public
     constructor Create;
     destructor Destroy; override;
@@ -563,6 +594,12 @@ type
     function GetIntVarRegCount: Integer;
     function GetFloatVarRegCount: Integer;
     function GetStringVarRegCount: Integer;
+    // Procedure descriptor table (M2)
+    function AddProcedure(const Proc: TProcDescriptor): Integer;  // returns index
+    procedure SetProcedure(Index: Integer; const Proc: TProcDescriptor);
+    function GetProcedure(Index: Integer): TProcDescriptor;
+    function GetProcedureCount: Integer;
+    function FindProcedure(const Name: string): Integer;  // -1 if not found
     property StringConstants: TStringList read FStringConstants;
     property EntryPoint: Integer read FEntryPoint write FEntryPoint;
   end;
@@ -945,6 +982,41 @@ begin
   Result := FStringVarRegCount;
 end;
 
+function TBytecodeProgram.AddProcedure(const Proc: TProcDescriptor): Integer;
+begin
+  Result := Length(FProcedures);
+  SetLength(FProcedures, Result + 1);
+  FProcedures[Result] := Proc;
+end;
+
+procedure TBytecodeProgram.SetProcedure(Index: Integer; const Proc: TProcDescriptor);
+begin
+  if (Index >= 0) and (Index < Length(FProcedures)) then
+    FProcedures[Index] := Proc;
+end;
+
+function TBytecodeProgram.GetProcedure(Index: Integer): TProcDescriptor;
+begin
+  Result := FProcedures[Index];
+end;
+
+function TBytecodeProgram.GetProcedureCount: Integer;
+begin
+  Result := Length(FProcedures);
+end;
+
+function TBytecodeProgram.FindProcedure(const Name: string): Integer;
+var
+  i: Integer;
+  Upper: string;
+begin
+  Upper := UpperCase(Name);
+  for i := 0 to High(FProcedures) do
+    if UpperCase(FProcedures[i].Name) = Upper then
+      Exit(i);
+  Result := -1;
+end;
+
 function TBytecodeProgram.FindPCForLine(LineNum: Integer): Integer;
 var
   i: Integer;
@@ -1113,6 +1185,14 @@ begin
         92: Result := 'ResumeNext';
         93: Result := 'ModFloat';
         94: Result := 'Frame';
+        95: Result := 'CallSub';
+        96: Result := 'ReturnSub';
+        97: Result := 'XferStoreInt';
+        98: Result := 'XferStoreFloat';
+        99: Result := 'XferStoreString';
+        100: Result := 'XferLoadInt';
+        101: Result := 'XferLoadFloat';
+        102: Result := 'XferLoadString';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

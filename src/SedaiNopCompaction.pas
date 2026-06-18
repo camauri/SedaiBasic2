@@ -119,7 +119,7 @@ function IsJumpOrBranchOp(OpCode: Word): Boolean;
 begin
   // Check base bytecode jump instructions
   case OpCode of
-    Ord(bcJump), Ord(bcJumpIfZero), Ord(bcJumpIfNotZero), Ord(bcCall):
+    Ord(bcJump), Ord(bcJumpIfZero), Ord(bcJumpIfNotZero), Ord(bcCall), Ord(bcCallSub):
       Result := True;
     // Fused compare-and-branch (Int)
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt:

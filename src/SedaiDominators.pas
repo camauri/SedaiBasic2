@@ -963,6 +963,17 @@ begin
         Continue;
       end;
 
+      // Allow SUB/FUNCTION entry blocks as secondary entry points (M2): they are invoked
+      // via bcCallSub (not a static CFG edge), like dynamically-invoked TRAP handlers.
+      if Block.LabelName.StartsWith('PROC_') then
+      begin
+        {$IFDEF DEBUG_DOMTREE}
+        if DebugDomTree then
+          WriteLn('[ValidateCFG] Allowing procedure entry block without predecessors: ', Block.LabelName);
+        {$ENDIF}
+        Continue;
+      end;
+
       // Allow empty blocks (e.g. DATA-only or REM-only lines after RETURN/END)
       // These are dead code that contains no instructions and can be safely ignored
       if Block.Instructions.Count = 0 then
@@ -1183,9 +1194,12 @@ begin
 
     { Valid terminators }
     { Note: ssaCall (GOSUB) has 2 successors: call target + return point }
+    { Note: ssaCallSub (M2) likewise: procedure entry + return point }
     { Note: ssaTrap can have 2 successors: normal flow + error handler }
+    { Note: ssaReturnSub (M2) ends a SUB/FUNCTION body (0 successors) }
     if not (LastInstr.OpCode in [ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
-                                  ssaReturn, ssaEnd, ssaStop, ssaCall, ssaTrap]) then
+                                  ssaReturn, ssaEnd, ssaStop, ssaCall, ssaTrap,
+                                  ssaCallSub, ssaReturnSub]) then
     begin
       { Block doesn't end with terminator - must have exactly 1 successor (fallthrough) }
       if Block.Successors.Count > 1 then
