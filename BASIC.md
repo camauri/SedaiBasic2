@@ -1154,14 +1154,15 @@ The following PETSCII codes are silently ignored because they require full-scree
 > Sourced from the FreeBASIC wiki (Language Documentation + Runtime Library Reference), June 2026.
 >
 > **Legend.** ✓ = the keyword name is a **recognized SedaiBasic command** (the Commodore BASIC v7
-> core plus the M1/M2 structured subset: block `IF`/`ELSEIF`/`END IF`, `SELECT CASE`, `FOR`/`NEXT`,
-> `DO`/`LOOP`, named labels, `SUB`/`FUNCTION`/`CALL`/`EXIT`/`RETURN`). ✗ = not implemented.
+> core plus the M1/M2/M3 structured subset: block `IF`/`ELSEIF`/`END IF`, `SELECT CASE`, `FOR`/`NEXT`,
+> `DO`/`LOOP`, named labels, `SUB`/`FUNCTION`/`CALL`/`EXIT`/`RETURN`, `TYPE`/`AS`/`.` records).
+> ◐ = partially implemented (see note). ✗ = not implemented.
 > Note: a ✓ marks name recognition — exact semantics may still differ from FreeBASIC (e.g. FB's OOP
 > `TYPE`, pointers, threading, and preprocessor are not present). This is a forward-looking gap map,
 > not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC-keyword overlap):** Language **93/363**, Runtime Library **72/280**,
-> total **165/643**.
+> **Coverage (FreeBASIC-keyword overlap):** Language ~**95/363**, Runtime Library **72/280**,
+> total ~**167/643** (M3 adds `AS`, member-access `.`, and `TYPE` ◐).
 
 ## Language Documentation
 
@@ -1186,7 +1187,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `ENUM...END ENUM` | ✗ | User defined enumeration of values |
-| `TYPE...END TYPE` | ✗ | User defined structure of non overlapping data and member procedures |
+| `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar fields (int/float/string), `DIM v AS T`, `v.field`. Member procedures, nested UDT, arrays-of-UDT deferred |
 | `CLASS...END CLASS` | ✗ | Not implemented. Keyword reserved. |
 | `UNION...END UNION` | ✗ | User defined structure of overlapping data |
 | `EXTENDS` | ✗ | Extends an user defined type to derive another |
@@ -1441,7 +1442,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `. (Member access)` | ✗ |  |
+| `. (Member access)` | ✓ | Record field access `rec.field` (M3) |
 | `-> (Pointer to member access)` | ✗ |  |
 | `IS (Run-time type information operator)` | ✗ |  |
 
@@ -1856,7 +1857,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `AS` | ✗ |  |
+| `AS` | ✓ | Type annotation: `DIM v AS type`, `field AS type` (M3) |
 | `FOR` | ✓ |  |
 | `TO` | ✓ |  |
 | `IS` | ✗ |  |
