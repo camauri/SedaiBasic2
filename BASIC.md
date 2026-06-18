@@ -336,11 +336,12 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `NEW` | ✓ | Erase program and clear all variables |
 | `RENUMBER` | ✓ | Renumber lines of the BASIC program (RENUMBER [new[,inc[,old]]]) |
 
-## Comments (1/1 - 100%)
+## Comments (2/2 - 100%)
 
 | Command | Status | Description |
 |---------|--------|-------------|
 | `REM` | ✓ | Starts a comment or remark |
+| `'` | ✓ | Apostrophe line comment (FreeBASIC/QBasic style); not a string delimiter (only `"` delimits strings) |
 
 ## Special Input Devices (0/3 - 0%)
 
