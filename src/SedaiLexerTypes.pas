@@ -164,6 +164,7 @@ type
     ttAsType,                 // AS (type annotation: DIM x AS t, field AS t)
     ttWithBlock,              // WITH (with-block; END WITH terminates; .field => with-object.field)
     ttExtends,                // EXTENDS (TYPE Child EXTENDS Parent: single inheritance)
+    ttParamMode,              // BYVAL / BYREF (parameter passing convention)
 
     // === DATA HANDLING ===
     ttDataAssignment,         // LET, SET, :=
@@ -359,7 +360,7 @@ const
   KEYWORD_TOKENS: TTokenTypeSet = [
     ttKeyword, ttLoopBlockStart, ttLoopBlockEnd,
     ttBlockBegin, ttBlockEnd, ttProcedureStart, ttProcedureEnd, ttCallSub,
-    ttTypeDecl, ttAsType, ttWithBlock, ttExtends,
+    ttTypeDecl, ttAsType, ttWithBlock, ttExtends, ttParamMode,
     ttJumpKeyword, ttDataDeclaration, ttDataAssignment, ttCommentRemark,
     ttBitwiseOperator
   ];

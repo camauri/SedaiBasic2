@@ -8956,11 +8956,11 @@ procedure TSSAGenerator.LowerDeferredProcedures;
 // the module END is emitted so procedure blocks sit beyond it (never reached by fall-through;
 // only via ssaCallSub). Each body ends with ssaReturnSub.
 var
-  i, j, Slot: Integer;
-  Proc, NameNode, ParamList: TASTNode;
+  i, j, Slot, PUDT: Integer;
+  Proc, NameNode, ParamList, ParamNodeJ: TASTNode;
   Name, LabelName: string;
   RT: TSSARegisterType;
-  ParamReg: TSSAValue;
+  ParamReg, LcHandle: TSSAValue;
 begin
   for i := 0 to High(FDeferredProcs) do
   begin
@@ -8994,9 +8994,28 @@ begin
       ParamList := Proc.GetChild(1);
       for j := 0 to ParamList.ChildCount - 1 do
       begin
-        ParamReg := GetOrAllocateVariable(VarToStr(ParamList.GetChild(j).Value));
+        ParamNodeJ := ParamList.GetChild(j);
+        ParamReg := GetOrAllocateVariable(VarToStr(ParamNodeJ.Value));
         Slot := ParamBankAndSlot(ParamList, j, RT);
         EmitXferLoad(RT, Slot, ParamReg);
+        // V4: a BYVAL UDT parameter gets its own copy (the caller passed a handle = BYREF default,
+        // so copy the caller's record into a fresh local instance that the body mutates instead).
+        // The local copy lives in the callee frame and is reclaimed at frame exit (V2).
+        if (ParamNodeJ.Attributes.Values['BYVAL'] = '1') and (ParamNodeJ.ChildCount >= 1) then
+        begin
+          PUDT := FindUDT(UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value)));
+          if PUDT >= 0 then
+          begin
+            LcHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaRecordNew, LcHandle,
+                            MakeSSAConstInt(FUDTs[PUDT].NInt), MakeSSAConstInt(FUDTs[PUDT].NFloat),
+                            MakeSSAConstInt(FUDTs[PUDT].NStr or (Int64(PUDT) shl 32)));
+            EmitRecordInit(LcHandle, PUDT);
+            EmitRecordCopy(LcHandle, ParamReg, PUDT);              // copy caller's record in
+            EmitInstruction(ssaCopyInt, ParamReg, LcHandle,        // param var := local copy handle
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+        end;
       end;
     end;
     // V3: a FUNCTION returning a UDT by value receives the caller-allocated result instance handle

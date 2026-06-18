@@ -67,6 +67,8 @@ const
   kWITH    = 'WITH';     // WITH ... END WITH: with-block (.field => withobject.field)
   kEXTENDS = 'EXTENDS';  // TYPE Child EXTENDS Parent: single inheritance
   kCONSTRUCTOR = 'CONSTRUCTOR'; // CONSTRUCTOR Type(...): auto-called at instance allocation (M4.4)
+  kBYVAL   = 'BYVAL';    // BYVAL: pass parameter by value (copy)
+  kBYREF   = 'BYREF';    // BYREF: pass parameter by reference (alias) — the default
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';

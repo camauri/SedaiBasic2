@@ -1273,7 +1273,7 @@ end;
 function TPackratParser.ParseProcedureDecl: TASTNode;
 var
   Token, NameTok: TLexerToken;
-  Kind, MethodType, QualName: string;
+  Kind, MethodType, QualName, ParamMode: string;
   NameNode, ParamList, ParamNode, ThisNode: TASTNode;
 begin
   // SUB|FUNCTION name [ ( params ) ] [AS type] <body> END SUB|FUNCTION
@@ -1344,10 +1344,19 @@ begin
     while (not Context.Check(ttDelimParClose)) and (not Context.Check(ttEndOfFile)) and
           (not Context.Check(ttEndOfLine)) do
     begin
+      // Optional passing convention (V4): BYVAL (copy) or BYREF (alias, the default) before the
+      // parameter name. Recorded on the param node as the 'BYVAL' attribute for the SSA prologue.
+      ParamMode := '';
+      if Context.Check(ttParamMode) then
+      begin
+        ParamMode := UpperCase(Context.CurrentToken.Value);
+        Context.Advance;
+      end;
       if Context.Check(ttIdentifier) then
       begin
         ParamNode := TASTNode.CreateWithValue(antIdentifier,
                        UpperCase(Context.CurrentToken.Value), Context.CurrentToken);
+        if ParamMode = kBYVAL then ParamNode.Attributes.Values['BYVAL'] := '1';
         Context.Advance;
         // Optional "AS typename" (M3.1): attach the type as a child antIdentifier so the
         // SSA pre-scan can type the parameter (record handle / explicit builtin bank).
