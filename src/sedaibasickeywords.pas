@@ -65,6 +65,7 @@ const
   kTYPE    = 'TYPE';     // TYPE ... END TYPE: user-defined type (record/UDT)
   kAS      = 'AS';       // AS: type annotation (DIM x AS t, field AS t)
   kWITH    = 'WITH';     // WITH ... END WITH: with-block (.field => withobject.field)
+  kEXTENDS = 'EXTENDS';  // TYPE Child EXTENDS Parent: single inheritance
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';

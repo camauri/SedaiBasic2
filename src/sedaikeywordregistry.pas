@@ -1587,6 +1587,7 @@ begin
  RegisterKeyword(kTYPE,     ttTypeDecl,       'User-defined type',  kcProcedures);
  RegisterKeyword(kAS,       ttAsType,         'Type annotation',    kcProcedures);
  RegisterKeyword(kWITH,     ttWithBlock,      'With block',         kcCodeBlockConstructs);
+ RegisterKeyword(kEXTENDS,  ttExtends,        'Type inheritance',   kcProcedures);
 
  // === FLOW CONTROL - JUMP RELATED STATEMENTS ===
  RegisterKeyword(kEXIT,   ttJumpReturn,      'Exit statement',   kcJumpFlowControl);

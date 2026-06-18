@@ -1494,6 +1494,17 @@ begin
   Result := TASTNode.CreateWithValue(antTypeDecl, UpperCase(NameTok.Value), NameTok);
   Context.Advance;                                  // consume type name
 
+  // Optional single inheritance: TYPE Child EXTENDS Parent (M4.2). Stored as an attribute.
+  if Context.Check(ttExtends) then
+  begin
+    Context.Advance;                                // consume EXTENDS
+    if Context.Check(ttIdentifier) then
+    begin
+      Result.Attributes.Values['EXTENDS'] := UpperCase(Context.CurrentToken.Value);
+      Context.Advance;                              // parent type name
+    end;
+  end;
+
   while not Context.Check(ttEndOfFile) do
   begin
     if Context.Match(ttEndOfLine) then Continue;

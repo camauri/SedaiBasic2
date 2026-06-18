@@ -163,6 +163,7 @@ type
     ttTypeDecl,               // TYPE (UDT/record declaration; END TYPE terminates)
     ttAsType,                 // AS (type annotation: DIM x AS t, field AS t)
     ttWithBlock,              // WITH (with-block; END WITH terminates; .field => with-object.field)
+    ttExtends,                // EXTENDS (TYPE Child EXTENDS Parent: single inheritance)
 
     // === DATA HANDLING ===
     ttDataAssignment,         // LET, SET, :=
@@ -358,7 +359,7 @@ const
   KEYWORD_TOKENS: TTokenTypeSet = [
     ttKeyword, ttLoopBlockStart, ttLoopBlockEnd,
     ttBlockBegin, ttBlockEnd, ttProcedureStart, ttProcedureEnd, ttCallSub,
-    ttTypeDecl, ttAsType, ttWithBlock,
+    ttTypeDecl, ttAsType, ttWithBlock, ttExtends,
     ttJumpKeyword, ttDataDeclaration, ttDataAssignment, ttCommentRemark,
     ttBitwiseOperator
   ];

@@ -69,6 +69,9 @@ type
     Name: string;
     Fields: array of TUDTField;
     NInt, NFloat, NStr: Integer;   // per-bank slot counts (for bcRecordNew)
+    Parent: string;                // M4.2: base type name (EXTENDS), or '' — single inheritance
+    Node: TASTNode;                // the antTypeDecl (to fill fields on demand, parent-first)
+    Filled: Boolean;               // M4.2: fields resolved (cycle-safe fill guard)
   end;
 
   { SSA Generator - converts AST to SSA IR }
@@ -123,6 +126,8 @@ type
     procedure RegisterUDTs(Node: TASTNode);        // pre-scan TYPE declarations (2 passes)
     procedure CollectUDTNames(Node: TASTNode);     // pass 1: register type names (empty)
     procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
+    procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
+    function ResolveMethodLabel(const TypeName, MethNm: string): string;  // walk inheritance
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
     function VarRecordTypeName(const VarName: string): string;    // '' if not a record var
@@ -2117,8 +2122,8 @@ begin
           MethodOwnerType := ObjectTypeName(MethodObjNode);
           if MethodOwnerType <> '' then
           begin
-            MethodLabelName := MethodOwnerType + '.' + UpperCase(VarToStr(Node.GetChild(0).Value));
-            if FProcDecls.ContainsKey(MethodLabelName) then
+            MethodLabelName := ResolveMethodLabel(MethodOwnerType, VarToStr(Node.GetChild(0).Value));
+            if MethodLabelName <> '' then
             begin
               ProcessMethodCall(MethodObjNode, MethodLabelName, Node.GetChild(1), Result);
               Exit;
@@ -8094,6 +8099,9 @@ begin
       FUDTs[n].Name := Name;
       SetLength(FUDTs[n].Fields, 0);
       FUDTs[n].NInt := 0; FUDTs[n].NFloat := 0; FUDTs[n].NStr := 0;
+      FUDTs[n].Parent := UpperCase(Node.Attributes.Values['EXTENDS']);  // '' if none (M4.2)
+      FUDTs[n].Node := Node;
+      FUDTs[n].Filled := False;
     end;
     Exit;
   end;
@@ -8101,26 +8109,45 @@ begin
     CollectUDTNames(Node.GetChild(i));
 end;
 
-procedure TSSAGenerator.FillUDTFields(Node: TASTNode);
-// Assign each field a (bank, slot), walking fields in order and counting per bank. A field
-// whose type is itself a UDT is stored as an int handle (Bank=srtInt) with NestedType set.
+procedure TSSAGenerator.FillOneUDT(Idx: Integer);
+// Resolve one type's field layout. With EXTENDS, the parent is filled first and its fields are
+// copied at the same (bank, slot); the child's own fields are appended (prefix layout), so code
+// expecting the parent works on a child handle. Cycle-safe via the Filled guard.
 var
-  i, j, n, Idx: Integer;
+  j, n, PIdx: Integer;
   FieldNode, TypeNode: TASTNode;
   Bank: TSSARegisterType;
   cInt, cFloat, cStr: Integer;
   TypeName, FieldName, NestedT: string;
 begin
-  if Node = nil then Exit;
-  if Node.NodeType = antTypeDecl then
+  if (Idx < 0) or (Idx > High(FUDTs)) then Exit;
+  if FUDTs[Idx].Filled then Exit;
+  FUDTs[Idx].Filled := True;   // set before recursing to break any EXTENDS cycle
+
+  cInt := 0; cFloat := 0; cStr := 0;
+  SetLength(FUDTs[Idx].Fields, 0);
+  // Inherit the parent's fields first (same banks/slots), continuing the per-bank counters.
+  if FUDTs[Idx].Parent <> '' then
   begin
-    Idx := FindUDT(UpperCase(VarToStr(Node.Value)));
-    if Idx < 0 then Exit;
-    if Length(FUDTs[Idx].Fields) > 0 then Exit;  // already filled
-    cInt := 0; cFloat := 0; cStr := 0;
-    for j := 0 to Node.ChildCount - 1 do
+    PIdx := FindUDT(FUDTs[Idx].Parent);
+    if PIdx >= 0 then
     begin
-      FieldNode := Node.GetChild(j);
+      FillOneUDT(PIdx);
+      for j := 0 to High(FUDTs[PIdx].Fields) do
+      begin
+        n := Length(FUDTs[Idx].Fields);
+        SetLength(FUDTs[Idx].Fields, n + 1);
+        FUDTs[Idx].Fields[n] := FUDTs[PIdx].Fields[j];
+      end;
+      cInt := FUDTs[PIdx].NInt; cFloat := FUDTs[PIdx].NFloat; cStr := FUDTs[PIdx].NStr;
+    end;
+  end;
+
+  // Append this type's own fields.
+  if Assigned(FUDTs[Idx].Node) then
+    for j := 0 to FUDTs[Idx].Node.ChildCount - 1 do
+    begin
+      FieldNode := FUDTs[Idx].Node.GetChild(j);
       if FieldNode.NodeType <> antIdentifier then Continue;
       FieldName := VarToStr(FieldNode.Value);
       TypeNode := nil;
@@ -8130,8 +8157,7 @@ begin
       NestedT := '';
       if (TypeName <> '') and (FindUDT(TypeName) >= 0) then
       begin
-        // Nested record field: stored as an int handle to the nested instance.
-        Bank := srtInt;
+        Bank := srtInt;        // nested record field: int handle to the nested instance
         NestedT := TypeName;
       end
       else if TypeName <> '' then
@@ -8150,11 +8176,37 @@ begin
         begin FUDTs[Idx].Fields[n].Slot := cInt; Inc(cInt); end;
       end;
     end;
-    FUDTs[Idx].NInt := cInt; FUDTs[Idx].NFloat := cFloat; FUDTs[Idx].NStr := cStr;
-    Exit;
+  FUDTs[Idx].NInt := cInt; FUDTs[Idx].NFloat := cFloat; FUDTs[Idx].NStr := cStr;
+end;
+
+procedure TSSAGenerator.FillUDTFields(Node: TASTNode);
+// Resolve all registered types' fields (parent-first via FillOneUDT). Node is unused now that
+// each type carries its decl node, but kept for the call shape.
+var
+  i: Integer;
+begin
+  for i := 0 to High(FUDTs) do
+    FillOneUDT(i);
+end;
+
+function TSSAGenerator.ResolveMethodLabel(const TypeName, MethNm: string): string;
+// Find a method by walking up the inheritance chain: Child.method, then Parent.method, ...
+var
+  T, Lbl: string;
+  Idx, Guard: Integer;
+begin
+  Result := '';
+  T := UpperCase(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    Lbl := T + '.' + UpperCase(MethNm);
+    if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
   end;
-  for i := 0 to Node.ChildCount - 1 do
-    FillUDTFields(Node.GetChild(i));
 end;
 
 procedure TSSAGenerator.RegisterRecordVars(Node: TASTNode);
@@ -8406,9 +8458,9 @@ begin
   UDTIdx := FindUDT(TypeName);
   if not UDTFieldBankSlot(UDTIdx, VarToStr(Node.Value), Bank, Slot, NestedT) then
   begin
-    // Not a field — try a no-argument method call obj.method (M4.1).
-    MethodLbl := TypeName + '.' + UpperCase(VarToStr(Node.Value));
-    if FProcDecls.ContainsKey(MethodLbl) then
+    // Not a field — try a no-argument method call obj.method (M4.1), walking inheritance (M4.2).
+    MethodLbl := ResolveMethodLabel(TypeName, VarToStr(Node.Value));
+    if MethodLbl <> '' then
       ProcessMethodCall(Node.GetChild(0), MethodLbl, nil, Result);
     Exit;
   end;
