@@ -404,7 +404,7 @@ begin
   FCharConfig.Separators := [',', ';', ':'];
   FCharConfig.Whitespace := [' ', #9];
   FCharConfig.Newlines := [#10, #13];
-  FCharConfig.Quotes := ['"', ''''];
+  FCharConfig.Quotes := ['"'];   // only " delimits strings (BASIC v7 / FreeBASIC); ' is a comment
   FCharConfig.SpecialChars := ['_', '$', '%', '#', '@'];
   FCharConfig.DotChars := ['.'];
 
@@ -1957,39 +1957,24 @@ begin
 
       '''':
         begin
+          // Apostrophe = line comment (FreeBASIC/QBasic style). NOT a string delimiter — in
+          // both BASIC v7 (only ") and FreeBASIC, ' is never a string quote (that is Free
+          // Pascal's convention). Skip to end of line; the comment token is discarded by the
+          // parser like REM. (Text is not buffered, so a long comment can't overflow the token.)
           ResetToken;
-          TokenBufferAdd(CurrentChar); // Opening quote
-          AdvanceChar;
-
-          // Fast string loop
+          AdvanceChar;                 // consume the apostrophe
           CurrentChar := GetCurrentChar;
-          while (CurrentChar <> #0) and (CurrentChar <> '''') do
+          while (CurrentChar <> #0) and (CurrentChar <> #10) and (CurrentChar <> #13) do
           begin
-            if CurrentChar = '\' then
-            begin
-              TokenBufferAdd(CurrentChar);
-              AdvanceChar;
-              if GetCurrentChar <> #0 then
-              begin
-                TokenBufferAdd(GetCurrentChar);
-                AdvanceChar;
-              end;
-            end
-            else
-            begin
-              TokenBufferAdd(CurrentChar);
-              AdvanceChar;
-            end;
+            AdvanceChar;
             CurrentChar := GetCurrentChar;
           end;
 
-          if CurrentChar = '''' then
-          begin
-            TokenBufferAdd(CurrentChar); // Closing quote
-            AdvanceChar;
-          end;
-
-          Result := ProcessString;
+          // Emit end-of-line: the comment runs to the line end, so to the parser the line
+          // simply ends here (the real newline that follows yields a second, harmless EOL that
+          // statement/program loops skip). This keeps comments fully transparent everywhere
+          // (after a statement's arguments, inside bodies, etc.).
+          Result := ProcessNewline;
           {$IFDEF DEBUG}
           if FDebugMode then
             FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
