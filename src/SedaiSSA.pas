@@ -99,6 +99,8 @@ type
     FCurrentProcName: string;
     FCurrentProcRetType: TSSARegisterType;
     FCurrentProcIsFunction: Boolean;
+    FCurrentProcRetRecType: string;   // V3: UDT type the current FUNCTION returns by value (else '')
+    FCurrentResultHandle: TSSAValue;  // V3: register holding the caller's result-instance handle
     FCurrentThisType: string;   // M4.1: owner UDT type while lowering a method body (THIS's type)
     // UDT/record support (M3)
     FUDTs: array of TUDTType;            // declared record types
@@ -142,6 +144,7 @@ type
     procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
                                   ArgsNode: TASTNode = nil);  // M4.4 (ArgsNode: M4.4b ctor args)
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
+    procedure EmitUserFunctionCall(const Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
                               out Bank: TSSARegisterType; out Slot: Integer;
@@ -296,6 +299,9 @@ const
   // Transfer-register slot reserved for a FUNCTION's return value (per bank). Kept well
   // above any parameter slot count so it never collides with an argument slot.
   XFER_RESULT_SLOT = 255;
+  // Int transfer slot carrying the caller-allocated result-instance handle for a FUNCTION that
+  // returns a UDT by value (V3 return-by-value): the callee copies its return value into it.
+  XFER_RESULT_HANDLE_SLOT = 254;
 
 constructor TSSAGenerator.Create;
 begin
@@ -1275,15 +1281,11 @@ begin
         FuncName := UpperCase(VarToStr(Node.Value));
         ArgListNode := Node.GetChild(0);
 
-        // User-defined FUNCTION (M2): stage args, call, read the result transfer slot into
-        // a fresh register of the function's return type (by name suffix).
+        // User-defined FUNCTION (M2): stage args, call, read the result (scalar via transfer slot,
+        // or UDT by value via V3 return-by-value — see EmitUserFunctionCall).
         if FProcedureNames.IndexOf(FuncName) >= 0 then
         begin
-          EmitProcedureCall(FuncName, ArgListNode);
-          FuncRetType := GetVariableType(FuncName);
-          DestReg := FProgram.AllocRegister(FuncRetType);
-          Result := MakeSSARegister(FuncRetType, DestReg);
-          EmitXferLoad(FuncRetType, XFER_RESULT_SLOT, Result);
+          EmitUserFunctionCall(FuncName, ArgListNode, Result);
           Exit;
         end;
 
@@ -2159,11 +2161,7 @@ begin
         // is a declared FUNCTION it is a call. Stage args, call, read the result slot.
         if FProcedureNames.IndexOf(UpperCase(ArrName)) >= 0 then
         begin
-          EmitProcedureCall(UpperCase(ArrName), Node.GetChild(1));
-          FuncRetType := GetVariableType(ArrName);
-          DestReg := FProgram.AllocRegister(FuncRetType);
-          Result := MakeSSARegister(FuncRetType, DestReg);
-          EmitXferLoad(FuncRetType, XFER_RESULT_SLOT, Result);
+          EmitUserFunctionCall(UpperCase(ArrName), Node.GetChild(1), Result);
           Exit;
         end;
 
@@ -2399,7 +2397,12 @@ begin
       (UpperCase(VarName) = Copy(FCurrentProcName, Pos('.', FCurrentProcName) + 1, MaxInt))) then
   begin
     ProcessExpression(ExprNode, ExprValue);
-    EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, ExprValue);
+    // V3: a UDT result is copied (by value) into the caller-allocated result instance; a scalar
+    // result is staged into the result transfer slot as before.
+    if FCurrentProcRetRecType <> '' then
+      EmitRecordCopy(FCurrentResultHandle, ExprValue, FindUDT(FCurrentProcRetRecType))
+    else
+      EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, ExprValue);
     Exit;
   end;
 
@@ -8541,6 +8544,43 @@ begin
   end;
 end;
 
+procedure TSSAGenerator.EmitUserFunctionCall(const Name: string; ArgsNode: TASTNode;
+  out Result: TSSAValue);
+// Lower a call to a user FUNCTION/SUB and produce its result value. A scalar result is read from
+// the result transfer slot as before. A UDT result uses V3 return-by-value: the caller allocates
+// the result instance HERE (so it lives in the caller's frame and survives the callee's frame-
+// record reclamation), passes its handle in XFER_RESULT_HANDLE_SLOT, and the callee copies the
+// return value into it. Ordering matters: allocate the result instance, stage the arguments
+// (nested calls reuse the reserved slots and must finish first), then stage our result handle.
+var
+  FuncRetType: TSSARegisterType;
+  RecType: string;
+  UDTIdx: Integer;
+  RcHandle: TSSAValue;
+begin
+  RecType := VarRecordTypeName(Name);
+  if RecType <> '' then
+  begin
+    UDTIdx := FindUDT(RecType);
+    RcHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordNew, RcHandle,
+                    MakeSSAConstInt(FUDTs[UDTIdx].NInt), MakeSSAConstInt(FUDTs[UDTIdx].NFloat),
+                    MakeSSAConstInt(FUDTs[UDTIdx].NStr or (Int64(UDTIdx) shl 32)));
+    EmitRecordInit(RcHandle, UDTIdx);                 // allocate nested-UDT members (no ctor calls)
+    StageCallArgs(Name, ArgsNode);                    // evaluate args first (inner calls finish)
+    EmitXferStore(srtInt, XFER_RESULT_HANDLE_SLOT, RcHandle);
+    EmitCallSubLabel(ProcedureLabelName(Name));
+    Result := RcHandle;
+  end
+  else
+  begin
+    EmitProcedureCall(Name, ArgsNode);
+    FuncRetType := GetVariableType(Name);
+    Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
+    EmitXferLoad(FuncRetType, XFER_RESULT_SLOT, Result);
+  end;
+end;
+
 function TSSAGenerator.ObjectTypeName(ObjNode: TASTNode): string;
 // The UDT type name of an object expression, without emitting any code. Empty if not a record.
 var
@@ -8577,15 +8617,16 @@ procedure TSSAGenerator.ProcessMethodCall(ObjNode: TASTNode; const ObjType, Meth
 // result for a FUNCTION method.
 var
   TmpArgs, Decl: TASTNode;
-  i: Integer;
+  i, UDTIdx: Integer;
   RT: TSSARegisterType;
-  DestVal: TSSAValue;
+  DestVal, RcHandle: TSSAValue;
   IsFunc: Boolean;
-  MethodLabel: string;
+  MethodLabel, RetRecType: string;
 begin
   Result := MakeSSAValue(svkNone);
   MethodLabel := ResolveMethodLabel(ObjType, MethNm);   // static (base) target
   if MethodLabel = '' then Exit;
+  RetRecType := VarRecordTypeName(MethodLabel);          // V3: '' unless it returns a UDT by value
 
   // Build an argument list with the object (THIS) prepended.
   TmpArgs := TASTNode.Create(antArgumentList, ObjNode.Token);
@@ -8594,19 +8635,37 @@ begin
     if Assigned(ArgsNode) then
       for i := 0 to ArgsNode.ChildCount - 1 do
         TmpArgs.AddChild(ArgsNode.GetChild(i).Clone);
+    // V3 return-by-value: allocate the result instance (caller frame) before staging args; the
+    // method copies its return value into it (the handle flows in XFER_RESULT_HANDLE_SLOT).
+    if RetRecType <> '' then
+    begin
+      UDTIdx := FindUDT(RetRecType);
+      RcHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordNew, RcHandle,
+                      MakeSSAConstInt(FUDTs[UDTIdx].NInt), MakeSSAConstInt(FUDTs[UDTIdx].NFloat),
+                      MakeSSAConstInt(FUDTs[UDTIdx].NStr or (Int64(UDTIdx) shl 32)));
+      EmitRecordInit(RcHandle, UDTIdx);
+    end;
+    StageCallArgs(MethodLabel, TmpArgs);                 // THIS + declared args (base signature)
+    if RetRecType <> '' then
+      EmitXferStore(srtInt, XFER_RESULT_HANDLE_SLOT, RcHandle);
     if MethodNeedsDispatch(ObjType, MethNm) then
     begin
-      // Polymorphic: stage per the base signature, then call the virtual dispatcher.
-      StageCallArgs(MethodLabel, TmpArgs);
+      // Polymorphic: call the virtual dispatcher (it forwards the staged args + result handle).
       FNeededDispatchers.Add(UpperCase(ObjType) + '|' + UpperCase(MethNm));
       EmitCallSubLabel(ProcedureLabelName('VDISP.' + UpperCase(ObjType) + '.' + UpperCase(MethNm)));
     end
     else
-      EmitProcedureCall(MethodLabel, TmpArgs);   // monomorphic: direct static call
+      EmitCallSubLabel(ProcedureLabelName(MethodLabel));  // monomorphic: direct static call
   finally
     TmpArgs.Free;
   end;
 
+  if RetRecType <> '' then
+  begin
+    Result := RcHandle;   // UDT result: the caller-allocated copy
+    Exit;
+  end;
   IsFunc := False;
   if FProcDecls.TryGetValue(MethodLabel, Decl) and Assigned(Decl) then
     IsFunc := UpperCase(VarToStr(Decl.Value)) = 'FUNCTION';
@@ -8917,6 +8976,8 @@ begin
     FCurrentProcName := Name;
     FCurrentProcIsFunction := (UpperCase(VarToStr(Proc.Value)) = 'FUNCTION');
     FCurrentProcRetType := GetVariableType(Name);
+    FCurrentProcRetRecType := VarRecordTypeName(Name);   // V3: '' unless it returns a UDT by value
+    FCurrentResultHandle := MakeSSAValue(svkNone);
     // Method body (M4.1): the owner type (before the '.') is THIS's type while lowering here.
     if Pos('.', Name) > 0 then
       FCurrentThisType := Copy(Name, 1, Pos('.', Name) - 1)
@@ -8938,6 +8999,13 @@ begin
         EmitXferLoad(RT, Slot, ParamReg);
       end;
     end;
+    // V3: a FUNCTION returning a UDT by value receives the caller-allocated result instance handle
+    // in a reserved int transfer slot; the return paths copy the value into it.
+    if FCurrentProcRetRecType <> '' then
+    begin
+      FCurrentResultHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitXferLoad(srtInt, XFER_RESULT_HANDLE_SLOT, FCurrentResultHandle);
+    end;
 
     // Body statements begin at child index 2 (0 = name, 1 = antParameterList).
     for j := 2 to Proc.ChildCount - 1 do
@@ -8952,6 +9020,8 @@ begin
     FInProcedure := False;
     FCurrentProcName := '';
     FCurrentThisType := '';
+    FCurrentProcRetRecType := '';
+    FCurrentResultHandle := MakeSSAValue(svkNone);
   end;
 end;
 
@@ -9152,7 +9222,11 @@ begin
         if (Node.ChildCount > 0) and FCurrentProcIsFunction then
         begin
           ProcessExpression(Node.GetChild(0), RetVal);
-          EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, RetVal);
+          // V3: UDT result copied by value into the caller's result instance; scalar via xfer slot.
+          if FCurrentProcRetRecType <> '' then
+            EmitRecordCopy(FCurrentResultHandle, RetVal, FindUDT(FCurrentProcRetRecType))
+          else
+            EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, RetVal);
         end;
         EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));

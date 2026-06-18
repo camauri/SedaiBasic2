@@ -123,6 +123,12 @@ type
     FFrameSaveIntTop: Integer;
     FFrameSaveFloatTop: Integer;
     FFrameSaveStrTop: Integer;
+    // Record reclamation (RAII, V2): the FRecordCount high-water mark captured at each frame entry.
+    // On frame exit the records allocated within the frame (locals/temporaries) are released by
+    // rolling FRecordCount back to the saved mark. Safe under value semantics: no handle escapes
+    // a frame (assignment copies; a UDT return is copied into a caller-allocated instance).
+    FFrameRecBase: array of Integer;
+    FFrameRecBaseTop: Integer;
     // Transfer registers (M2): per-bank banks that are NEVER snapshot/restored, so they
     // carry arguments (caller->callee param slots) and the result (callee->caller) across
     // the bcCallSub/bcReturnSub frame save/restore. Indexed by a small per-bank slot.
@@ -397,6 +403,7 @@ begin
   FFrameSaveIntTop := 0;
   FFrameSaveFloatTop := 0;
   FFrameSaveStrTop := 0;
+  FFrameRecBaseTop := 0;
   SetLength(FRecords, 0);
   FRecordCount := 0;
   FCursorCol := 0;
@@ -1077,6 +1084,11 @@ begin
   for i := 0 to FStringRegCount - 1 do
     FFrameSaveStr[FFrameSaveStrTop + i] := FStringRegs[i];
   Inc(FFrameSaveStrTop, FStringRegCount);
+  // RAII (V2): remember where this frame's record allocations begin.
+  if FFrameRecBaseTop >= Length(FFrameRecBase) then
+    SetLength(FFrameRecBase, FFrameRecBaseTop + 256);
+  FFrameRecBase[FFrameRecBaseTop] := FRecordCount;
+  Inc(FFrameRecBaseTop);
 end;
 
 procedure TBytecodeVM.FramePop;
@@ -1093,6 +1105,15 @@ begin
   Dec(FFrameSaveStrTop, FStringRegCount);
   for i := 0 to FStringRegCount - 1 do
     FStringRegs[i] := FFrameSaveStr[FFrameSaveStrTop + i];
+  // RAII (V2): release the records this frame allocated (locals/temporaries) by rolling the
+  // high-water mark back. Slots become reusable by the next AllocRecord. A UDT result has already
+  // been copied into the caller-allocated instance (which lives below this frame's mark).
+  if FFrameRecBaseTop > 0 then
+  begin
+    Dec(FFrameRecBaseTop);
+    if FFrameRecBase[FFrameRecBaseTop] < FRecordCount then
+      FRecordCount := FFrameRecBase[FFrameRecBaseTop];
+  end;
 end;
 
 function TBytecodeVM.AllocRecord(IntC, FloatC, StrC, TypeId: Integer): Integer;
@@ -1774,6 +1795,7 @@ begin
   FFrameSaveIntTop := 0;
   FFrameSaveFloatTop := 0;
   FFrameSaveStrTop := 0;
+  FFrameRecBaseTop := 0;
   SetLength(FRecords, 0);
   FRecordCount := 0;
   {$IFDEF ENABLE_INSTRUCTION_COUNTING}
