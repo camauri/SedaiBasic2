@@ -527,7 +527,8 @@ begin
     // === PROCEDURES ===
     ttProcedureDefine: Result := Memoize('DefStatement', @ParseDefStatement);
     ttProcedureStart:
-      if (UpperCase(Token.Value) = kSUB) or (UpperCase(Token.Value) = kFUNCTION) then
+      if (UpperCase(Token.Value) = kSUB) or (UpperCase(Token.Value) = kFUNCTION) or
+         (UpperCase(Token.Value) = kCONSTRUCTOR) then
         Result := Memoize('ProcedureDecl', @ParseProcedureDecl)
       else
         Result := Memoize('FnStatement', @ParseFnStatement);
@@ -1289,7 +1290,14 @@ begin
     NameTok := Context.CurrentToken;
     QualName := UpperCase(NameTok.Value);
     Context.Advance;
-    if Context.Check(ttOpDot) then
+    if Kind = kCONSTRUCTOR then
+    begin
+      // CONSTRUCTOR Type(...) — the identifier is the owner type; the method is "Type.CONSTRUCTOR"
+      // with an implicit THIS AS Type. Auto-called when an instance is allocated (M4.4).
+      MethodType := QualName;
+      QualName := MethodType + '.' + kCONSTRUCTOR;
+    end
+    else if Context.Check(ttOpDot) then
     begin
       // Type.method — a method of an existing TYPE. The method name may be a reserved word
       // (e.g. SCALE, LEN), so accept any alphabetic token here.

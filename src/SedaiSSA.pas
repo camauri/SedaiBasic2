@@ -139,6 +139,7 @@ type
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
     function VarRecordTypeName(const VarName: string): string;    // '' if not a record var
     procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer);  // alloc nested records
+    procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string);  // M4.4
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
                               out Bank: TSSARegisterType; out Slot: Integer;
@@ -2983,6 +2984,7 @@ begin
                         MakeSSAConstInt(FUDTs[RecUDTIdx].NFloat),
                         MakeSSAConstInt(FUDTs[RecUDTIdx].NStr or (Int64(RecUDTIdx) shl 32)));  // Imm: strCount | typeId<<32
         EmitRecordInit(RecHandleVal, RecUDTIdx);  // allocate any nested-UDT field instances
+        EmitConstructorCall(RecHandleVal, RecTypeName);  // M4.4: run the constructor (if any)
       end;
       Continue;
     end;
@@ -8435,9 +8437,24 @@ begin
                       MakeSSAConstInt(FUDTs[NestedUDT].NFloat),
                       MakeSSAConstInt(FUDTs[NestedUDT].NStr or (Int64(NestedUDT) shl 32)));
       EmitRecordInit(NestedHandle, NestedUDT);   // deeper nesting
+      EmitConstructorCall(NestedHandle, FUDTs[NestedUDT].Name);  // M4.4: construct the nested member
       EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal,
                       NestedHandle, MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
     end;
+end;
+
+procedure TSSAGenerator.EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string);
+// M4.4: if TypeName (or an ancestor) declares a CONSTRUCTOR, call it on the just-allocated instance.
+// The constructor is a SUB whose implicit THIS is the instance handle, so we stage the handle into
+// the int transfer slot 0 (THIS is parameter 0) and bcCallSub the resolved label. No virtual
+// dispatch: at allocation the runtime type equals the static type, so the most-derived ctor is exact.
+var
+  Lbl: string;
+begin
+  Lbl := ResolveMethodLabel(TypeName, 'CONSTRUCTOR');
+  if Lbl = '' then Exit;
+  EmitXferStore(srtInt, 0, HandleVal);              // THIS handle -> int xfer slot 0
+  EmitCallSubLabel(ProcedureLabelName(Lbl));
 end;
 
 function TSSAGenerator.ObjectTypeName(ObjNode: TASTNode): string;

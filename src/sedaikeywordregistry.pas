@@ -1583,6 +1583,7 @@ begin
  RegisterKeyword(kCASE,   ttCaseClause, 'CASE clause',           kcConditionalFlowControl);
  RegisterKeyword(kSUB,      ttProcedureStart, 'SUB procedure',      kcProcedures);
  RegisterKeyword(kFUNCTION, ttProcedureStart, 'FUNCTION procedure', kcProcedures);
+ RegisterKeyword(kCONSTRUCTOR, ttProcedureStart, 'TYPE constructor', kcProcedures);
  RegisterKeyword(kCALL,     ttCallSub,        'Call a SUB',         kcProcedures);
  RegisterKeyword(kTYPE,     ttTypeDecl,       'User-defined type',  kcProcedures);
  RegisterKeyword(kAS,       ttAsType,         'Type annotation',    kcProcedures);

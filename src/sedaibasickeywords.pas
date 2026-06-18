@@ -66,6 +66,7 @@ const
   kAS      = 'AS';       // AS: type annotation (DIM x AS t, field AS t)
   kWITH    = 'WITH';     // WITH ... END WITH: with-block (.field => withobject.field)
   kEXTENDS = 'EXTENDS';  // TYPE Child EXTENDS Parent: single inheritance
+  kCONSTRUCTOR = 'CONSTRUCTOR'; // CONSTRUCTOR Type(...): auto-called at instance allocation (M4.4)
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';
