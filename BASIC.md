@@ -1214,7 +1214,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `BASE (initialization)` | ✗ | Specifies an initializer for the base user defined type in derived user defined type constructors |
 | `CONSTRUCTOR` | ◐ | Member procedure auto-called when an instance is created. M4.4a: `CONSTRUCTOR Type()` runs at `DIM v AS T` (nested members first, then the object); inherited if the subtype has none. M4.4b: parameterised `DIM v AS T(args)`. Overloading / `NEW` / base-chaining deferred (M4.4c) |
-| `DESTRUCTOR` | ✗ | Declares or defines a member procedure that is automatically called when a user defined type is destroyed or goes out of scope |
+| `DESTRUCTOR` | ◐ | Member procedure auto-called when an instance goes out of scope. V5: `DESTRUCTOR Type()` runs for a procedure's DIM'd local UDTs at every exit path, in reverse construction order. Globals / nested members / BYVAL-param copies deferred |
 | `FUNCTION` | ✓ | Declares or defines a member procedure returning a value |
 | `OPERATOR` | ✗ | Declares or defines an overloaded operator |
 | `OVERRIDE` | ✗ | Member method attribute that specifies that the method is expected to override a virtual method in the base user defined type |
