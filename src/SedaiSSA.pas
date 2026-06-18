@@ -141,6 +141,7 @@ type
     procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer);  // alloc nested records
     procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
                                   ArgsNode: TASTNode = nil);  // M4.4 (ArgsNode: M4.4b ctor args)
+    procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
                               out Bank: TSSARegisterType; out Slot: Integer;
@@ -2340,8 +2341,8 @@ end;
 procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
 var
   VarNode, ExprNode: TASTNode;
-  VarName: string;
-  ExprValue, VarReg: TSSAValue;
+  VarName, LhsRecType, RhsRecType: string;
+  ExprValue, VarReg, SrcRecHandle: TSSAValue;
   CopyOp: TSSAOpCode;
 begin
   if Node.ChildCount < 2 then Exit;
@@ -2399,6 +2400,18 @@ begin
   begin
     ProcessExpression(ExprNode, ExprValue);
     EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, ExprValue);
+    Exit;
+  end;
+
+  // Value-semantics record assignment (FreeBASIC): "a = b" between UDT variables copies b's fields
+  // into a's own instance (memberwise, recursive for nested UDTs) — it does NOT alias the handle.
+  // The source may be a record var, array element or member access (ResolveRecordObject handles
+  // those); a function-call source returning a UDT is covered later (return-by-value increment).
+  LhsRecType := VarRecordTypeName(VarName);
+  if (LhsRecType <> '') and ResolveRecordObject(ExprNode, SrcRecHandle, RhsRecType) then
+  begin
+    VarReg := GetOrAllocateVariable(VarName);          // a's handle (own instance from its DIM)
+    EmitRecordCopy(VarReg, SrcRecHandle, FindUDT(LhsRecType));
     Exit;
   end;
 
@@ -8483,6 +8496,49 @@ begin
     end;
   end;
   EmitCallSubLabel(ProcedureLabelName(Lbl));
+end;
+
+procedure TSSAGenerator.EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);
+// Value-semantics copy (FreeBASIC): copy each field of the source instance into the destination
+// instance (which already owns its own storage). Nested-UDT members are copied recursively (deep
+// copy into the destination's existing nested instance), so the result shares no handles with the
+// source. Using UDTIdx's field set (the static LHS type) gives correct slicing when the source is a
+// subtype: only the LHS type's prefix fields are copied.
+var
+  i, NestedUDT, Slot: Integer;
+  Bank: TSSARegisterType;
+  Tmp, DNest, SNest: TSSAValue;
+  LoadOp, StoreOp: TSSAOpCode;
+begin
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  begin
+    Slot := FUDTs[UDTIdx].Fields[i].Slot;
+    if FUDTs[UDTIdx].Fields[i].NestedType <> '' then
+    begin
+      // Nested record member: load both handles (int slot), deep-copy into the destination's own.
+      NestedUDT := FindUDT(FUDTs[UDTIdx].Fields[i].NestedType);
+      if NestedUDT < 0 then Continue;
+      DNest := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordLoadInt, DNest, DestHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+      SNest := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordLoadInt, SNest, SrcHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+      EmitRecordCopy(DNest, SNest, NestedUDT);
+    end
+    else
+    begin
+      Bank := FUDTs[UDTIdx].Fields[i].Bank;
+      case Bank of
+        srtFloat:  begin LoadOp := ssaRecordLoadFloat;  StoreOp := ssaRecordStoreFloat;  end;
+        srtString: begin LoadOp := ssaRecordLoadString; StoreOp := ssaRecordStoreString; end;
+      else
+        begin LoadOp := ssaRecordLoadInt; StoreOp := ssaRecordStoreInt; end;
+      end;
+      Tmp := MakeSSARegister(Bank, FProgram.AllocRegister(Bank));
+      EmitInstruction(LoadOp, Tmp, SrcHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+      EmitInstruction(StoreOp, MakeSSAValue(svkNone), DestHandle, Tmp, MakeSSAConstInt(Slot));
+    end;
+  end;
 end;
 
 function TSSAGenerator.ObjectTypeName(ObjNode: TASTNode): string;
