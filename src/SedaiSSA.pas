@@ -99,6 +99,7 @@ type
     FUDTs: array of TUDTType;            // declared record types
     FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
+    FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
 
     function GenerateUniqueLabel(const Prefix: string): string;
     function GetVariableType(const VarName: string): TSSARegisterType;
@@ -119,12 +120,18 @@ type
     // UDT/record support (M3)
     procedure RegisterUDTs(Node: TASTNode);        // pre-scan TYPE declarations
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
+    procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
+    function VarRecordTypeName(const VarName: string): string;    // '' if not a record var
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
                               out Bank: TSSARegisterType; out Slot: Integer): Boolean;
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
+    // Resolve a member-access object (a record variable or an array-of-UDT element) to its
+    // handle register and UDT type name. False if it is not a record object.
+    function ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
+                                 out TypeName: string): Boolean;
     // Map parameter at Index (within ParamList) to its transfer-bank type and per-bank slot.
     function ParamBankAndSlot(ParamList: TASTNode; Index: Integer; out RT: TSSARegisterType): Integer;
     procedure EmitXferStore(RT: TSSARegisterType; Slot: Integer; const Val: TSSAValue);
@@ -290,6 +297,8 @@ begin
   FVarRecordType.CaseSensitive := False;
   FVarExplicitType := TStringList.Create;
   FVarExplicitType.CaseSensitive := False;
+  FArrayRecordType := TStringList.Create;
+  FArrayRecordType.CaseSensitive := False;
 end;
 
 destructor TSSAGenerator.Destroy;
@@ -302,6 +311,7 @@ begin
   FProcDecls.Free;
   FVarRecordType.Free;
   FVarExplicitType.Free;
+  FArrayRecordType.Free;
   inherited Destroy;
 end;
 
@@ -2875,6 +2885,8 @@ var
   RecTypeName: string;     // M3: DIM..AS type name
   RecUDTIdx: Integer;      // M3
   RecHandleVal: TSSAValue; // M3
+  RecArrUDTIdx: Integer;   // M3.1: array-of-UDT element type index (-1 if not)
+  RecPacked: Int64;        // M3.1: packed slot counts for bcRecordNewArray
 const
   MAX_ARRAY_ELEMENTS = 125000000;  // 125M elements max (~1GB for 500x500x500 matrix)
 begin
@@ -2923,8 +2935,16 @@ begin
       Continue;
     end;
 
-    // Determine element type from array name suffix
-    ElementType := GetVariableType(ArrName);
+    // Array of UDT (M3.1): "DIM name(dims) AS udt" — child[2] is the element type. Such an
+    // array stores record handles, so its element type is int.
+    RecArrUDTIdx := -1;
+    if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType = antIdentifier) then
+      RecArrUDTIdx := FindUDT(UpperCase(VarToStr(ArrayDeclNode.GetChild(2).Value)));
+    if RecArrUDTIdx >= 0 then
+      ElementType := srtInt
+    else
+      // Determine element type from array name suffix
+      ElementType := GetVariableType(ArrName);
 
     // Validate dimensions node
     if DimsNode.NodeType <> antDimensions then
@@ -3044,6 +3064,18 @@ begin
           Inc(VarDimCount);
         end;
       end;
+    end;
+
+    // Array of UDT (M3.1): now that the int-handle array is dimensioned, eagerly allocate
+    // one record instance per element and store the handles (bcRecordNewArray).
+    if RecArrUDTIdx >= 0 then
+    begin
+      RecPacked := (Int64(FUDTs[RecArrUDTIdx].NInt) and $FFFF)
+                or ((Int64(FUDTs[RecArrUDTIdx].NFloat) and $FFFF) shl 16)
+                or ((Int64(FUDTs[RecArrUDTIdx].NStr) and $FFFF) shl 32);
+      EmitInstruction(ssaRecordNewArray, MakeSSAValue(svkNone),
+                      MakeSSAArrayRef(ArrayIdx, srtInt), MakeSSAConstInt(RecPacked),
+                      MakeSSAValue(svkNone));
     end;
   end;
 end;
@@ -8058,9 +8090,8 @@ procedure TSSAGenerator.RegisterRecordVars(Node: TASTNode);
 // pre-allocation so the handle/explicit type is honoured.
 var
   i, k: Integer;
-  Decl, VarNameNode, TypeNode: TASTNode;
+  Decl, ParamList, ParamNode: TASTNode;
   VarName, TypeName: string;
-  Bank: TSSARegisterType;
 begin
   if Node = nil then Exit;
   if Node.NodeType = antDim then
@@ -8068,38 +8099,108 @@ begin
     for k := 0 to Node.ChildCount - 1 do
     begin
       Decl := Node.GetChild(k);
-      if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount = 2) and
-         (Decl.GetChild(1).NodeType = antIdentifier) then
+      if Decl.NodeType <> antArrayDecl then Continue;
+      // DIM name AS type  -> typed scalar (child[1] = antIdentifier type)
+      if (Decl.ChildCount = 2) and (Decl.GetChild(1).NodeType = antIdentifier) then
+        RegisterTypedVar(UpperCase(VarToStr(Decl.GetChild(0).Value)),
+                         UpperCase(VarToStr(Decl.GetChild(1).Value)))
+      // DIM name(dims) AS type  -> array of UDT (child[2] = antIdentifier type): record the
+      // element type; the array itself is an int (handle) array.
+      else if (Decl.ChildCount >= 3) and (Decl.GetChild(2).NodeType = antIdentifier) then
       begin
-        VarNameNode := Decl.GetChild(0);
-        TypeNode := Decl.GetChild(1);
-        VarName := UpperCase(VarToStr(VarNameNode.Value));
-        TypeName := UpperCase(VarToStr(TypeNode.Value));
+        TypeName := UpperCase(VarToStr(Decl.GetChild(2).Value));
         if FindUDT(TypeName) >= 0 then
-        begin
-          FVarRecordType.Values[VarName] := TypeName;   // record var -> type name
-          if FVarExplicitType.IndexOf(VarName) < 0 then
-            FVarExplicitType.AddObject(VarName, TObject(PtrInt(Ord(srtInt))));  // handle is int
-        end
-        else
-        begin
-          Bank := TypeNameToBank(TypeName, VarName);
-          if FVarExplicitType.IndexOf(VarName) < 0 then
-            FVarExplicitType.AddObject(VarName, TObject(PtrInt(Ord(Bank))));
-        end;
+          FArrayRecordType.Values[UpperCase(VarToStr(Decl.GetChild(0).Value))] := TypeName;
       end;
     end;
     Exit;
+  end;
+  if Node.NodeType = antProcedureDecl then
+  begin
+    // Record-typed (or explicit-typed) parameters: "param AS type" (M3.1). The parameter
+    // node is antIdentifier(param) with a child antIdentifier(type).
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      ParamList := Node.GetChild(k);
+      if ParamList.NodeType <> antParameterList then Continue;
+      for i := 0 to ParamList.ChildCount - 1 do
+      begin
+        ParamNode := ParamList.GetChild(i);
+        if (ParamNode.NodeType = antIdentifier) and (ParamNode.ChildCount >= 1) and
+           (ParamNode.GetChild(0).NodeType = antIdentifier) then
+        begin
+          VarName := UpperCase(VarToStr(ParamNode.Value));
+          TypeName := UpperCase(VarToStr(ParamNode.GetChild(0).Value));
+          if TypeName <> '' then RegisterTypedVar(VarName, TypeName);
+        end;
+      end;
+    end;
+    // fall through to recurse into the body (local DIMs etc.)
   end;
   for i := 0 to Node.ChildCount - 1 do
     RegisterRecordVars(Node.GetChild(i));
 end;
 
+procedure TSSAGenerator.RegisterTypedVar(const VarName, TypeName: string);
+// Record-typed var -> int handle (+ FVarRecordType); builtin-typed -> explicit bank.
+var
+  Bank: TSSARegisterType;
+begin
+  if VarName = '' then Exit;
+  if FindUDT(TypeName) >= 0 then
+  begin
+    FVarRecordType.Values[VarName] := TypeName;
+    if FVarExplicitType.IndexOf(VarName) < 0 then
+      FVarExplicitType.AddObject(VarName, TObject(PtrInt(Ord(srtInt))));  // handle is int
+  end
+  else
+  begin
+    Bank := TypeNameToBank(TypeName, VarName);
+    if FVarExplicitType.IndexOf(VarName) < 0 then
+      FVarExplicitType.AddObject(VarName, TObject(PtrInt(Ord(Bank))));
+  end;
+end;
+
+function TSSAGenerator.VarRecordTypeName(const VarName: string): string;
+// Returns the UDT type name of a record variable, or '' if it isn't a record variable.
+begin
+  if FVarRecordType.IndexOfName(UpperCase(VarName)) < 0 then
+    Result := ''
+  else
+    Result := FVarRecordType.Values[UpperCase(VarName)];
+end;
+
+function TSSAGenerator.ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
+  out TypeName: string): Boolean;
+var
+  ArrName: string;
+begin
+  Result := False;
+  TypeName := '';
+  if ObjNode.NodeType = antIdentifier then
+  begin
+    // Record variable (or record-typed parameter): handle is the variable's int register.
+    TypeName := VarRecordTypeName(VarToStr(ObjNode.Value));
+    if TypeName = '' then Exit;
+    HandleVal := GetOrAllocateVariable(UpperCase(VarToStr(ObjNode.Value)));
+    Result := True;
+  end
+  else if ObjNode.NodeType = antArrayAccess then
+  begin
+    // Array-of-UDT element: arr(i) evaluates to the element's record handle (int).
+    if (ObjNode.ChildCount < 1) or (ObjNode.GetChild(0).NodeType <> antIdentifier) then Exit;
+    ArrName := UpperCase(VarToStr(ObjNode.GetChild(0).Value));
+    if FArrayRecordType.IndexOfName(ArrName) < 0 then Exit;
+    TypeName := FArrayRecordType.Values[ArrName];
+    ProcessExpression(ObjNode, HandleVal);
+    Result := True;
+  end;
+end;
+
 procedure TSSAGenerator.ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);
 // Lower a record field read "obj.field" to ssaRecordLoad<bank>(dest, handle, slot).
 var
-  ObjNode: TASTNode;
-  ObjName, TypeName: string;
+  TypeName: string;
   UDTIdx, Slot: Integer;
   Bank: TSSARegisterType;
   HandleVal, DestVal: TSSAValue;
@@ -8107,15 +8208,10 @@ var
 begin
   Result := MakeSSAValue(svkNone);
   if Node.ChildCount < 1 then Exit;
-  ObjNode := Node.GetChild(0);
-  if ObjNode.NodeType <> antIdentifier then Exit;  // v1: object must be a simple variable
-  ObjName := UpperCase(VarToStr(ObjNode.Value));
-  if FVarRecordType.IndexOfName(ObjName) < 0 then Exit; // not a record variable
-  TypeName := FVarRecordType.Values[ObjName];
+  if not ResolveRecordObject(Node.GetChild(0), HandleVal, TypeName) then Exit;
   UDTIdx := FindUDT(TypeName);
   if not UDTFieldBankSlot(UDTIdx, VarToStr(Node.Value), Bank, Slot) then Exit;
 
-  HandleVal := GetOrAllocateVariable(ObjName);   // int register holding the handle
   DestVal := MakeSSARegister(Bank, FProgram.AllocRegister(Bank));
   case Bank of
     srtFloat:  Op := ssaRecordLoadFloat;
@@ -8130,19 +8226,16 @@ end;
 procedure TSSAGenerator.ProcessMemberStore(MemberNode, ExprNode: TASTNode);
 // Lower "obj.field = expr" to ssaRecordStore<bank>(handle, value, slot).
 var
-  ObjNode: TASTNode;
-  ObjName, TypeName: string;
+  TypeName: string;
   UDTIdx, Slot: Integer;
   Bank: TSSARegisterType;
   HandleVal, ExprVal: TSSAValue;
   Op: TSSAOpCode;
 begin
   if MemberNode.ChildCount < 1 then Exit;
-  ObjNode := MemberNode.GetChild(0);
-  if ObjNode.NodeType <> antIdentifier then Exit;
-  ObjName := UpperCase(VarToStr(ObjNode.Value));
-  if FVarRecordType.IndexOfName(ObjName) < 0 then Exit;
-  TypeName := FVarRecordType.Values[ObjName];
+  // Evaluate the RHS first, then resolve the target (object handle). Order matters only for
+  // side effects; both are emitted before the store.
+  if not ResolveRecordObject(MemberNode.GetChild(0), HandleVal, TypeName) then Exit;
   UDTIdx := FindUDT(TypeName);
   if not UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot) then Exit;
 
@@ -8153,7 +8246,6 @@ begin
   else
     begin ExprVal := EnsureIntRegister(ExprVal); Op := ssaRecordStoreInt; end;
   end;
-  HandleVal := GetOrAllocateVariable(ObjName);
   EmitInstruction(Op, MakeSSAValue(svkNone), HandleVal, ExprVal, MakeSSAConstInt(Slot));
 end;
 

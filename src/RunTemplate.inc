@@ -537,13 +537,12 @@ begin
         // UDT/record heap (M3)
         bcRecordNew:
           begin
-            if FRecordCount >= Length(FRecords) then
-              SetLength(FRecords, (FRecordCount + 1) * 2);
-            SetLength(FRecords[FRecordCount].IntData, Instr.Src1);
-            SetLength(FRecords[FRecordCount].FloatData, Instr.Src2);
-            SetLength(FRecords[FRecordCount].StringData, Instr.Immediate);
-            FIntRegs[Instr.Dest] := FRecordCount;
-            Inc(FRecordCount);
+            FIntRegs[Instr.Dest] := AllocRecord(Instr.Src1, Instr.Src2, Instr.Immediate);
+            Inc(CurPC);
+          end;
+        bcRecordNewArray:
+          begin
+            RecordNewArrayInit(Instr.Src1, Instr.Immediate);
             Inc(CurPC);
           end;
         bcRecordLoadInt:

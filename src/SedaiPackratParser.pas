@@ -1265,8 +1265,20 @@ begin
       begin
         ParamNode := TASTNode.CreateWithValue(antIdentifier,
                        UpperCase(Context.CurrentToken.Value), Context.CurrentToken);
-        ParamList.AddChild(ParamNode);
         Context.Advance;
+        // Optional "AS typename" (M3.1): attach the type as a child antIdentifier so the
+        // SSA pre-scan can type the parameter (record handle / explicit builtin bank).
+        if Context.Check(ttAsType) then
+        begin
+          Context.Advance;                        // AS
+          if Context.Check(ttIdentifier) then
+          begin
+            ParamNode.AddChild(TASTNode.CreateWithValue(antIdentifier,
+                         UpperCase(Context.CurrentToken.Value), Context.CurrentToken));
+            Context.Advance;                      // typename
+          end;
+        end;
+        ParamList.AddChild(ParamNode);
       end
       else
         Context.Advance;                          // skip unexpected token (defensive)
@@ -3504,6 +3516,19 @@ begin
   Result := TASTNode.Create(antArrayDecl, Token);
   Result.AddChild(VarName);
   Result.AddChild(Dimensions);
+
+  // Optional "AS typename" (M3.1): array of UDT (or explicitly-typed array). Attached as a
+  // 3rd child antIdentifier(typename); SSA treats a UDT element type as an int handle array.
+  if Context.Check(ttAsType) then
+  begin
+    Context.Advance;                                // AS
+    if Context.Check(ttIdentifier) then
+    begin
+      Result.AddChild(TASTNode.CreateWithValue(antIdentifier,
+                   UpperCase(Context.CurrentToken.Value), Context.CurrentToken));
+      Context.Advance;                              // typename
+    end;
+  end;
 
   DoNodeCreated(Result);
 end;

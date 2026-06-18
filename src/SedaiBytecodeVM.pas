@@ -237,6 +237,8 @@ type
     procedure EnsureRegisterCapacity(RegType: TSSARegisterType; MinIndex: Integer);
     procedure FramePush;   // bcCallSub: snapshot whole register banks
     procedure FramePop;    // bcReturnSub: restore whole register banks
+    function AllocRecord(IntC, FloatC, StrC: Integer): Integer;  // M3: new record instance -> handle
+    procedure RecordNewArrayInit(ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
     procedure CheckFloatValid(RegIndex: Integer; const OpName: string);
     function FormatUsingString(const FormatStr: string; Value: Double): string;
   public
@@ -1090,6 +1092,31 @@ begin
   Dec(FFrameSaveStrTop, FStringRegCount);
   for i := 0 to FStringRegCount - 1 do
     FStringRegs[i] := FFrameSaveStr[FFrameSaveStrTop + i];
+end;
+
+function TBytecodeVM.AllocRecord(IntC, FloatC, StrC: Integer): Integer;
+// Allocate a record instance (heap block of typed slot arrays) and return its handle.
+begin
+  if FRecordCount >= Length(FRecords) then
+    SetLength(FRecords, (FRecordCount + 1) * 2);
+  SetLength(FRecords[FRecordCount].IntData, IntC);
+  SetLength(FRecords[FRecordCount].FloatData, FloatC);
+  SetLength(FRecords[FRecordCount].StringData, StrC);
+  Result := FRecordCount;
+  Inc(FRecordCount);
+end;
+
+procedure TBytecodeVM.RecordNewArrayInit(ArrayId: Integer; PackedCounts: Int64);
+// Eager-allocate one record instance per element of the (int handle) array and store the
+// handles. PackedCounts = intCount | floatCount<<16 | strCount<<32.
+var
+  k, IntC, FloatC, StrC: Integer;
+begin
+  IntC := PackedCounts and $FFFF;
+  FloatC := (PackedCounts shr 16) and $FFFF;
+  StrC := (PackedCounts shr 32) and $FFFF;
+  for k := 0 to FArrays[ArrayId].TotalSize - 1 do
+    FArrays[ArrayId].IntData[k] := AllocRecord(IntC, FloatC, StrC);
 end;
 
 procedure TBytecodeVM.EnsureRegisterCapacity(RegType: TSSARegisterType; MinIndex: Integer);
@@ -2005,15 +2032,9 @@ begin
     bcXferLoadString:  FStringRegs[Instr.Dest] := FXferStr[Instr.Immediate];
     // UDT/record heap (M3)
     bcRecordNew:
-      begin
-        if FRecordCount >= Length(FRecords) then
-          SetLength(FRecords, (FRecordCount + 1) * 2);
-        SetLength(FRecords[FRecordCount].IntData, Instr.Src1);
-        SetLength(FRecords[FRecordCount].FloatData, Instr.Src2);
-        SetLength(FRecords[FRecordCount].StringData, Instr.Immediate);
-        FIntRegs[Instr.Dest] := FRecordCount;
-        Inc(FRecordCount);
-      end;
+      FIntRegs[Instr.Dest] := AllocRecord(Instr.Src1, Instr.Src2, Instr.Immediate);
+    bcRecordNewArray:
+      RecordNewArrayInit(Instr.Src1, Instr.Immediate);  // Src1=array id; Imm=packed slot counts
     bcRecordLoadInt:    FIntRegs[Instr.Dest] := FRecords[FIntRegs[Instr.Src1]].IntData[Instr.Immediate];
     bcRecordLoadFloat:  FFloatRegs[Instr.Dest] := FRecords[FIntRegs[Instr.Src1]].FloatData[Instr.Immediate];
     bcRecordLoadString: FStringRegs[Instr.Dest] := FRecords[FIntRegs[Instr.Src1]].StringData[Instr.Immediate];

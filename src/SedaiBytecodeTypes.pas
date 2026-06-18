@@ -246,6 +246,9 @@ const
   bcRecordStoreInt   = bcGroupCore + 107;  // Src1=handle; Src2=int value; Imm=slot
   bcRecordStoreFloat = bcGroupCore + 108;  // Src1=handle; Src2=float value; Imm=slot
   bcRecordStoreString= bcGroupCore + 109;  // Src1=handle; Src2=string value; Imm=slot
+  // Array-of-UDT eager init (M3.1): allocate one record per element of an int (handle) array
+  // and store the handles. Src1=array id; Immediate packs slot counts (int|float<<16|str<<32).
+  bcRecordNewArray   = bcGroupCore + 110;
 
   // === GROUP 1: STRING OPERATIONS (0x01xx) ===
   bcStrConcat       = bcGroupString + 0;
@@ -1210,6 +1213,7 @@ begin
         107: Result := 'RecordStoreInt';
         108: Result := 'RecordStoreFloat';
         109: Result := 'RecordStoreString';
+        110: Result := 'RecordNewArray';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

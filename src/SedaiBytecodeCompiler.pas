@@ -229,6 +229,7 @@ begin
     ssaXferLoadFloat: Result := bcXferLoadFloat;
     ssaXferLoadString: Result := bcXferLoadString;
     ssaRecordNew: Result := bcRecordNew;
+    ssaRecordNewArray: Result := bcRecordNewArray;
     ssaRecordLoadInt: Result := bcRecordLoadInt;
     ssaRecordLoadFloat: Result := bcRecordLoadFloat;
     ssaRecordLoadString: Result := bcRecordLoadString;
@@ -1514,6 +1515,10 @@ begin
     BCInstr.Src2 := Word(Instr.Src2.ConstInt);
     BCInstr.Immediate := Instr.Src3.ConstInt;
   end;
+  // ssaRecordNewArray (M3.1): Src1 = array id (from svkArrayRef, already mapped above);
+  // the packed slot counts are carried as a const in Src2 -> Immediate.
+  if Instr.OpCode = ssaRecordNewArray then
+    BCInstr.Immediate := Instr.Src2.ConstInt;
 
   {$IFDEF DEBUG_BYTECODE}
   if DebugBytecode and (Instr.OpCode in [ssaPrintInt, ssaLoadEL, ssaLoadER]) then

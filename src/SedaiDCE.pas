@@ -277,7 +277,7 @@ begin
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString,
     // UDT/record heap ops (M3): allocation and field stores mutate heap state; field loads
     // are kept conservatively (cheap, and a record's handle must stay live).
-    ssaRecordNew,
+    ssaRecordNew, ssaRecordNewArray,
     ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString:
       Result := True;
