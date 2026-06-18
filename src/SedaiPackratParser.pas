@@ -1285,6 +1285,21 @@ begin
   Result := TASTNode.CreateWithValue(antProcedureDecl, Kind, Token);
 
   MethodType := '';
+  // The procedure/owner name must be a plain identifier. A reserved word here (e.g. a graphics
+  // keyword such as CIRCLE/BOX/LINE used as a type name) is malformed: report a clean error and
+  // skip the body up to its END, so the parser terminates instead of derailing on a misaligned
+  // token stream. (The method name *after* the dot may be a reserved word — handled below.)
+  if not Context.Check(ttIdentifier) then
+  begin
+    HandleError(Format('Expected a name after %s, but found the reserved word "%s"',
+                       [Kind, Context.CurrentToken.Value]), Context.CurrentToken);
+    while not Context.Check(ttEndOfFile) do
+    begin
+      if AtEndProcedure then begin ConsumeEndProcedure; Break; end;
+      Context.Advance;
+    end;
+    Exit;
+  end;
   if Context.Check(ttIdentifier) then
   begin
     NameTok := Context.CurrentToken;
@@ -1497,7 +1512,15 @@ begin
   Token := Context.CurrentToken;
   Context.Advance;                                  // consume TYPE
   Result := nil;
-  if not Context.Check(ttIdentifier) then Exit;     // malformed
+  // The type name must be a plain identifier; a reserved word (e.g. the graphics keyword
+  // CIRCLE/BOX/LINE) is not a valid type name — report it cleanly instead of silently bailing
+  // and leaving the stream misaligned (which can derail later parsing).
+  if not Context.Check(ttIdentifier) then
+  begin
+    HandleError(Format('"%s" is a reserved word and cannot be used as a type name',
+                       [Context.CurrentToken.Value]), Context.CurrentToken);
+    Exit;
+  end;
   NameTok := Context.CurrentToken;
   Result := TASTNode.CreateWithValue(antTypeDecl, UpperCase(NameTok.Value), NameTok);
   Context.Advance;                                  // consume type name
