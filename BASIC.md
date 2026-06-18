@@ -1187,7 +1187,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `ENUM...END ENUM` | ✗ | User defined enumeration of values |
-| `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, record params, `v.a.b` chained access, FUNCTION-returns-UDT, WITH. Member procedures (OOP) deferred to M4 |
+| `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, record params, `v.a.b`, FUNCTION-returns-UDT, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. Inheritance/virtual/NEW deferred (M4.2+) |
 | `CLASS...END CLASS` | ✗ | Not implemented. Keyword reserved. |
 | `UNION...END UNION` | ✗ | User defined structure of overlapping data |
 | `EXTENDS` | ✗ | Extends an user defined type to derive another |
