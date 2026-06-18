@@ -236,6 +236,16 @@ const
   bcXferLoadInt     = bcGroupCore + 100;
   bcXferLoadFloat   = bcGroupCore + 101;
   bcXferLoadString  = bcGroupCore + 102;
+  // UDT/record heap (M3). A record instance is a heap block of typed slot arrays; a handle
+  // (index into the VM record heap) lives in an int register. bcRecordNew carries the per-bank
+  // slot counts in Src1/Src2/Immediate; field access uses (handle reg, slot immediate).
+  bcRecordNew        = bcGroupCore + 103;  // Dest=handle; Src1=intCount, Src2=floatCount, Imm=strCount
+  bcRecordLoadInt    = bcGroupCore + 104;  // Dest=int reg; Src1=handle; Imm=slot
+  bcRecordLoadFloat  = bcGroupCore + 105;  // Dest=float reg; Src1=handle; Imm=slot
+  bcRecordLoadString = bcGroupCore + 106;  // Dest=string reg; Src1=handle; Imm=slot
+  bcRecordStoreInt   = bcGroupCore + 107;  // Src1=handle; Src2=int value; Imm=slot
+  bcRecordStoreFloat = bcGroupCore + 108;  // Src1=handle; Src2=float value; Imm=slot
+  bcRecordStoreString= bcGroupCore + 109;  // Src1=handle; Src2=string value; Imm=slot
 
   // === GROUP 1: STRING OPERATIONS (0x01xx) ===
   bcStrConcat       = bcGroupString + 0;
@@ -1193,6 +1203,13 @@ begin
         100: Result := 'XferLoadInt';
         101: Result := 'XferLoadFloat';
         102: Result := 'XferLoadString';
+        103: Result := 'RecordNew';
+        104: Result := 'RecordLoadInt';
+        105: Result := 'RecordLoadFloat';
+        106: Result := 'RecordLoadString';
+        107: Result := 'RecordStoreInt';
+        108: Result := 'RecordStoreFloat';
+        109: Result := 'RecordStoreString';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

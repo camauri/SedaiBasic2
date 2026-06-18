@@ -81,6 +81,7 @@ type
     function ParseBinaryOperator(Left: TASTNode; Token: TLexerToken): TASTNode;
     function ParseAssignment(Left: TASTNode; Token: TLexerToken): TASTNode;
     function ParseArrayAccess(Left: TASTNode; Token: TLexerToken): TASTNode;
+    function ParseMemberAccess(Left: TASTNode; Token: TLexerToken): TASTNode; // record.field
     function ParsePower(Left: TASTNode; Token: TLexerToken): TASTNode; // Right-associative
 
     // === UTILITY PARSING ===
@@ -118,6 +119,7 @@ function StaticParseWebVariable(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseBinaryOperator(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
 function StaticParseAssignment(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
 function StaticParseArrayAccess(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
+function StaticParseMemberAccess(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
 function StaticParsePower(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
 
 function StaticParseCommaDebug(Parser: Pointer; Token: TLexerToken): TObject;
@@ -247,6 +249,11 @@ end;
 function StaticParseArrayAccess(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseArrayAccess(TASTNode(Left), Token);
+end;
+
+function StaticParseMemberAccess(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseMemberAccess(TASTNode(Left), Token);
 end;
 
 function StaticParsePower(Parser: Pointer; Left: TObject; Token: TLexerToken): TObject;
@@ -382,6 +389,9 @@ begin
 
   // Array access con parentesi quadre (se supportato)
   Context.SetParseRule(ttDelimBrackOpen, MakeInfixRule(@StaticParseArrayAccess, precCall));
+
+  // Member access (record.field) — high precedence postfix, like call/index
+  Context.SetParseRule(ttOpDot, MakeInfixRule(@StaticParseMemberAccess, precCall));
 
   {$IFDEF DEBUG}
   LogDebug('Pratt expression rules initialized successfully');
@@ -1362,6 +1372,27 @@ begin
   Result := TASTNode.Create(antArrayAccess, Token);
   Result.AddChild(Left);
   Result.AddChild(Indices);
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseMemberAccess(Left: TASTNode; Token: TLexerToken): TASTNode;
+// record.field — the '.' operator has already been consumed by the Pratt loop. Read the
+// field name and build antMemberAccess(value=fieldName, child0=object expr). Chaining
+// (a.b.c) works because Left may itself be an antMemberAccess.
+var
+  FieldName: string;
+begin
+  if not HasValidContext then Exit(nil);
+  if not Context.Check(ttIdentifier) then
+  begin
+    HandleError('Expected field name after "."', Context.CurrentToken);
+    Result := Left;
+    Exit;
+  end;
+  FieldName := UpperCase(VarToStr(Context.CurrentToken.Value));
+  Context.Advance;   // consume field name
+  Result := TASTNode.CreateWithValue(antMemberAccess, FieldName, Token);
+  Result.AddChild(Left);
   DoNodeCreated(Result);
 end;
 

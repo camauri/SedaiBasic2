@@ -121,6 +121,10 @@ type
     function AtEndProcedure: Boolean;
     // CALL name [ ( args ) ] : statement-level SUB invocation.
     function ParseCallStatement: TASTNode;
+    // TYPE name / field AS type / ... / END TYPE : user-defined type (record/UDT).
+    function ParseTypeDecl: TASTNode;
+    function AtEndType: Boolean;
+    procedure ConsumeEndType;
     procedure ConsumeEndProcedure;
     function ParseForStatement: TASTNode;
     function ParseDoStatement: TASTNode;
@@ -525,6 +529,7 @@ begin
       else
         Result := Memoize('FnStatement', @ParseFnStatement);
     ttCallSub: Result := Memoize('CallStatement', @ParseCallStatement);
+    ttTypeDecl: Result := Memoize('TypeDecl', @ParseTypeDecl);
 
     // === MEMORY COMMANDS ===
     ttMemoryCommand: Result := Memoize('MemoryStatement', @ParseMemoryStatement);
@@ -652,9 +657,11 @@ begin
 
   // Parse left side - can be A or A(i) or special variable (TI$)
   if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
-    (Context.PeekNext.TokenType = ttDelimParOpen) then
+    ((Context.PeekNext.TokenType = ttDelimParOpen) or
+     (Context.PeekNext.TokenType = ttOpDot)) then
   begin
-    // It's array access A(i) - use expression parser
+    // Array access A(i) or member access rec.field - use the expression parser to build
+    // the full target (antArrayAccess / antMemberAccess); it stops before '=' (lower prec).
     LeftSide := FExpressionParser.ParseExpression(precCall);
   end
   else if Context.Check(ttIdentifier) then
@@ -1315,6 +1322,72 @@ begin
   end;
   if HasParens and Context.Check(ttDelimParClose) then
     Context.Advance;                              // )
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.AtEndType: Boolean;
+begin
+  // END TYPE  (END is ttProgramEnd, TYPE is ttTypeDecl)
+  Result := Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+            (Context.PeekNext.TokenType = ttTypeDecl);
+end;
+
+procedure TPackratParser.ConsumeEndType;
+begin
+  if AtEndType then
+  begin
+    Context.Advance;   // END
+    Context.Advance;   // TYPE
+  end;
+end;
+
+function TPackratParser.ParseTypeDecl: TASTNode;
+var
+  Token, NameTok, FieldTok, TypeTok: TLexerToken;
+  FieldNode, TypeNode: TASTNode;
+  PrevIdx: Integer;
+begin
+  // TYPE name <newline> field AS type <newline> ... END TYPE
+  // Each field node is antIdentifier(fieldName) with one child antIdentifier(typeName).
+  // An empty type name child means "infer from the field's name suffix" (SSA side).
+  Token := Context.CurrentToken;
+  Context.Advance;                                  // consume TYPE
+  Result := nil;
+  if not Context.Check(ttIdentifier) then Exit;     // malformed
+  NameTok := Context.CurrentToken;
+  Result := TASTNode.CreateWithValue(antTypeDecl, UpperCase(NameTok.Value), NameTok);
+  Context.Advance;                                  // consume type name
+
+  while not Context.Check(ttEndOfFile) do
+  begin
+    if Context.Match(ttEndOfLine) then Continue;
+    if Context.Check(ttSeparStmt) then begin Context.Advance; Continue; end;
+    if AtEndType then Break;
+    PrevIdx := Context.CurrentIndex;
+    if Context.Check(ttIdentifier) then
+    begin
+      FieldTok := Context.CurrentToken;
+      Context.Advance;                              // field name
+      TypeTok := TLexerToken.CreateSimple(ttIdentifier, '');  // empty => infer by suffix
+      if Context.Check(ttAsType) then
+      begin
+        Context.Advance;                            // AS
+        if Context.Check(ttIdentifier) then
+        begin
+          TypeTok := Context.CurrentToken;
+          Context.Advance;                          // type name
+        end;
+      end;
+      FieldNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(FieldTok.Value), FieldTok);
+      TypeNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(TypeTok.Value), FieldTok);
+      FieldNode.AddChild(TypeNode);
+      Result.AddChild(FieldNode);
+    end
+    else
+      Context.Advance;                              // skip unexpected token (defensive)
+    if Context.CurrentIndex = PrevIdx then Break;   // no progress guard
+  end;
+  ConsumeEndType;
   DoNodeCreated(Result);
 end;
 
@@ -3515,29 +3588,56 @@ end;
 
 function TPackratParser.ParseDimStatement: TASTNode;
 var
-  Token: TLexerToken;
-  ArrayDecl: TASTNode;
+  Token, NameTok, TypeTok: TLexerToken;
+  ArrayDecl, VarNameNode, TypeNode: TASTNode;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
   Context.Advance; // Consume DIM
 
-  // Parse array declarations separated by commas
+  // Parse declarations separated by commas. Each is either:
+  //   name AS typename   -> typed scalar (UDT record or explicit builtin type)
+  //   name ( dims )      -> array (classic)
   repeat
-    ArrayDecl := ParseArrayDeclaration;
-    if Assigned(ArrayDecl) then
-      Result.AddChild(ArrayDecl)
+    if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttAsType) then
+    begin
+      // "name AS typename"
+      NameTok := Context.CurrentToken;
+      Context.Advance;                       // name
+      Context.Advance;                       // AS
+      if not Context.Check(ttIdentifier) then
+      begin
+        HandleError('Expected type name after AS', Context.CurrentToken);
+        Break;
+      end;
+      TypeTok := Context.CurrentToken;
+      Context.Advance;                       // typename
+      ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
+      VarNameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
+      TypeNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(TypeTok.Value), TypeTok);
+      ArrayDecl.AddChild(VarNameNode);
+      ArrayDecl.AddChild(TypeNode);          // child[1] is antIdentifier (type) => typed scalar
+      DoNodeCreated(ArrayDecl);
+      Result.AddChild(ArrayDecl);
+    end
     else
     begin
-      HandleError('Expected array declaration after DIM', Context.CurrentToken);
-      Break;
+      ArrayDecl := ParseArrayDeclaration;
+      if Assigned(ArrayDecl) then
+        Result.AddChild(ArrayDecl)
+      else
+      begin
+        HandleError('Expected array declaration after DIM', Context.CurrentToken);
+        Break;
+      end;
     end;
 
     // Check for comma separator
     if Context.Check(ttSeparParam) then
       Context.Advance // Consume comma
     else
-      Break; // No more array declarations
+      Break; // No more declarations
 
   until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
 

@@ -85,6 +85,7 @@ type
     ttOpDiv,                 // /
     ttOpPow,                 // ^
     ttOpMod,                 // MOD
+    ttOpDot,                 // . (member access: record.field)
 
     // === COMPARISON OPERATORS ===
     ttOpEq,                  // =
@@ -159,6 +160,8 @@ type
     ttProcedureEnd,           // ENDPROCEDURE, ENDFUNCTION
     ttProcedureStart,         // PROCEDURE, FUNCTION, DEF, SUB
     ttCallSub,                // CALL (statement-level SUB invocation)
+    ttTypeDecl,               // TYPE (UDT/record declaration; END TYPE terminates)
+    ttAsType,                 // AS (type annotation: DIM x AS t, field AS t)
 
     // === DATA HANDLING ===
     ttDataAssignment,         // LET, SET, :=
@@ -354,6 +357,7 @@ const
   KEYWORD_TOKENS: TTokenTypeSet = [
     ttKeyword, ttLoopBlockStart, ttLoopBlockEnd,
     ttBlockBegin, ttBlockEnd, ttProcedureStart, ttProcedureEnd, ttCallSub,
+    ttTypeDecl, ttAsType,
     ttJumpKeyword, ttDataDeclaration, ttDataAssignment, ttCommentRemark,
     ttBitwiseOperator
   ];

@@ -41,6 +41,8 @@ type
     antLabel,             // Named label definition ("name:") for GOTO/GOSUB targets
     antProcedureDecl,     // SUB / FUNCTION declaration (value = 'SUB' | 'FUNCTION')
     antProcedureCall,     // CALL name(args): statement-level SUB invocation (value = name)
+    antTypeDecl,          // TYPE name ... END TYPE (UDT/record): value=name, children=fields (antIdentifier, value=field name, with a type tag)
+    antMemberAccess,      // record.field : child0 = object expr, value = field name
     antSpecialVariable,   // Special variables (TI, TI$, DT$, etc.)
 
     // === FUNCTIONS ===

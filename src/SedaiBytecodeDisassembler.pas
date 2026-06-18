@@ -158,6 +158,12 @@ begin
       Line := Format('%4d: %-20s R%d -> X%d', [Index, 'XferStore', Instr.Src1, Instr.Immediate]);
     bcXferLoadInt, bcXferLoadFloat, bcXferLoadString:
       Line := Format('%4d: %-20s R%d <- X%d', [Index, 'XferLoad', Instr.Dest, Instr.Immediate]);
+    bcRecordNew:
+      Line := Format('%4d: %-20s R%d = rec(i%d,f%d,s%d)', [Index, 'RecordNew', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString:
+      Line := Format('%4d: %-20s R%d <- [R%d].fld%d', [Index, 'RecordLoad', Instr.Dest, Instr.Src1, Instr.Immediate]);
+    bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString:
+      Line := Format('%4d: %-20s [R%d].fld%d <- R%d', [Index, 'RecordStore', Instr.Src1, Instr.Immediate, Instr.Src2]);
     bcEnd:
       Line := Format('%4d: %-20s', [Index, 'End']);
     bcStop:

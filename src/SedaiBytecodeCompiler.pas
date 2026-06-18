@@ -228,6 +228,13 @@ begin
     ssaXferLoadInt: Result := bcXferLoadInt;
     ssaXferLoadFloat: Result := bcXferLoadFloat;
     ssaXferLoadString: Result := bcXferLoadString;
+    ssaRecordNew: Result := bcRecordNew;
+    ssaRecordLoadInt: Result := bcRecordLoadInt;
+    ssaRecordLoadFloat: Result := bcRecordLoadFloat;
+    ssaRecordLoadString: Result := bcRecordLoadString;
+    ssaRecordStoreInt: Result := bcRecordStoreInt;
+    ssaRecordStoreFloat: Result := bcRecordStoreFloat;
+    ssaRecordStoreString: Result := bcRecordStoreString;
     // Array operations
     ssaArrayDim: Result := bcArrayDim;
     // ssaArrayLoad and ssaArrayStore are handled specially in CompileInstruction
@@ -1497,6 +1504,16 @@ begin
     BCInstr.Immediate := Instr.Src3.ConstInt
   else if Instr.Src3.Kind = svkConstFloat then
     BCInstr.Immediate := Trunc(Instr.Src3.ConstFloat);
+
+  // ssaRecordNew (M3): the three operands are compile-time slot counts (int/float/string),
+  // not registers. Override the generic mapping so they land in Src1/Src2/Immediate directly
+  // (Dest stays the mapped handle register).
+  if Instr.OpCode = ssaRecordNew then
+  begin
+    BCInstr.Src1 := Word(Instr.Src1.ConstInt);
+    BCInstr.Src2 := Word(Instr.Src2.ConstInt);
+    BCInstr.Immediate := Instr.Src3.ConstInt;
+  end;
 
   {$IFDEF DEBUG_BYTECODE}
   if DebugBytecode and (Instr.OpCode in [ssaPrintInt, ssaLoadEL, ssaLoadER]) then

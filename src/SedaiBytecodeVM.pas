@@ -83,6 +83,14 @@ type
     StringData: array of string;
   end;
 
+  { UDT/record instance storage (M3): a heap block of typed slot arrays, referenced by a
+    handle (its index in the VM record heap). Per-bank slot counts come from bcRecordNew. }
+  TRecordStorage = record
+    IntData: array of Int64;
+    FloatData: array of Double;
+    StringData: array of string;
+  end;
+
   { Bytecode VM - register-based virtual machine }
   TBytecodeVM = class
   private
@@ -134,6 +142,11 @@ type
     FFunctionKeys: array[1..12] of string;
     FVarMap: TStringList;
     FArrays: array of TArrayStorage;
+    // UDT/record heap (M3): instances allocated by bcRecordNew; a handle is an index here.
+    // v1 has no reclamation (instances live until program reset) — acceptable for module-scope
+    // DIM; refcount/free is a documented future step.
+    FRecords: array of TRecordStorage;
+    FRecordCount: Integer;
     // DATA pool for DATA/READ/RESTORE statements
     FDataPool: array of Variant;
     FDataIndex: Integer;  // Current read position in DATA pool
@@ -381,6 +394,8 @@ begin
   FFrameSaveIntTop := 0;
   FFrameSaveFloatTop := 0;
   FFrameSaveStrTop := 0;
+  SetLength(FRecords, 0);
+  FRecordCount := 0;
   FCursorCol := 0;
   // Initialize time tracking
   FStartTicks := GetTickCount64;
@@ -1729,6 +1744,8 @@ begin
   FFrameSaveIntTop := 0;
   FFrameSaveFloatTop := 0;
   FFrameSaveStrTop := 0;
+  SetLength(FRecords, 0);
+  FRecordCount := 0;
   {$IFDEF ENABLE_INSTRUCTION_COUNTING}
   FInstructionsExecuted := 0;
   {$ENDIF}
@@ -1986,6 +2003,23 @@ begin
     bcXferLoadInt:     FIntRegs[Instr.Dest] := FXferInt[Instr.Immediate];
     bcXferLoadFloat:   FFloatRegs[Instr.Dest] := FXferFloat[Instr.Immediate];
     bcXferLoadString:  FStringRegs[Instr.Dest] := FXferStr[Instr.Immediate];
+    // UDT/record heap (M3)
+    bcRecordNew:
+      begin
+        if FRecordCount >= Length(FRecords) then
+          SetLength(FRecords, (FRecordCount + 1) * 2);
+        SetLength(FRecords[FRecordCount].IntData, Instr.Src1);
+        SetLength(FRecords[FRecordCount].FloatData, Instr.Src2);
+        SetLength(FRecords[FRecordCount].StringData, Instr.Immediate);
+        FIntRegs[Instr.Dest] := FRecordCount;
+        Inc(FRecordCount);
+      end;
+    bcRecordLoadInt:    FIntRegs[Instr.Dest] := FRecords[FIntRegs[Instr.Src1]].IntData[Instr.Immediate];
+    bcRecordLoadFloat:  FFloatRegs[Instr.Dest] := FRecords[FIntRegs[Instr.Src1]].FloatData[Instr.Immediate];
+    bcRecordLoadString: FStringRegs[Instr.Dest] := FRecords[FIntRegs[Instr.Src1]].StringData[Instr.Immediate];
+    bcRecordStoreInt:   FRecords[FIntRegs[Instr.Src1]].IntData[Instr.Immediate] := FIntRegs[Instr.Src2];
+    bcRecordStoreFloat: FRecords[FIntRegs[Instr.Src1]].FloatData[Instr.Immediate] := FFloatRegs[Instr.Src2];
+    bcRecordStoreString:FRecords[FIntRegs[Instr.Src1]].StringData[Instr.Immediate] := FStringRegs[Instr.Src2];
     // System commands
     bcEnd:
       begin

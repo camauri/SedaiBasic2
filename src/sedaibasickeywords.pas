@@ -62,6 +62,8 @@ const
   kSUB     = 'SUB';      // SUB procedure
   kFUNCTION = 'FUNCTION';// FUNCTION procedure
   kCALL    = 'CALL';     // CALL: statement-level SUB invocation (QB/FB)
+  kTYPE    = 'TYPE';     // TYPE ... END TYPE: user-defined type (record/UDT)
+  kAS      = 'AS';       // AS: type annotation (DIM x AS t, field AS t)
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';

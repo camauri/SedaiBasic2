@@ -58,6 +58,18 @@ type
     BodyNode: TASTNode;     // AST node for the function body expression
   end;
 
+  { UDT/record type info (M3). Each field maps to a (bank, slot) within the record block. }
+  TUDTField = record
+    Name: string;
+    Bank: TSSARegisterType;
+    Slot: Integer;          // index within that bank's slot array of the instance
+  end;
+  TUDTType = record
+    Name: string;
+    Fields: array of TUDTField;
+    NInt, NFloat, NStr: Integer;   // per-bank slot counts (for bcRecordNew)
+  end;
+
   { SSA Generator - converts AST to SSA IR }
   TSSAGenerator = class
   private
@@ -83,6 +95,10 @@ type
     FCurrentProcName: string;
     FCurrentProcRetType: TSSARegisterType;
     FCurrentProcIsFunction: Boolean;
+    // UDT/record support (M3)
+    FUDTs: array of TUDTType;            // declared record types
+    FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
+    FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
 
     function GenerateUniqueLabel(const Prefix: string): string;
     function GetVariableType(const VarName: string): TSSARegisterType;
@@ -100,6 +116,15 @@ type
     procedure EmitProcedureCall(const Name: string; ArgListNode: TASTNode);
     procedure LowerDeferredProcedures;
     function ProcedureLabelName(const Name: string): string;
+    // UDT/record support (M3)
+    procedure RegisterUDTs(Node: TASTNode);        // pre-scan TYPE declarations
+    procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
+    function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
+    function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
+                              out Bank: TSSARegisterType; out Slot: Integer): Boolean;
+    function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
+    procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
+    procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
     // Map parameter at Index (within ParamList) to its transfer-bank type and per-bank slot.
     function ParamBankAndSlot(ParamList: TASTNode; Index: Integer; out RT: TSSARegisterType): Integer;
     procedure EmitXferStore(RT: TSSARegisterType; Slot: Integer; const Val: TSSAValue);
@@ -260,6 +285,11 @@ begin
   FProcedureNames := TStringList.Create;
   FProcedureNames.CaseSensitive := False;
   FProcDecls := specialize TDictionary<string, TASTNode>.Create;
+  SetLength(FUDTs, 0);
+  FVarRecordType := TStringList.Create;
+  FVarRecordType.CaseSensitive := False;
+  FVarExplicitType := TStringList.Create;
+  FVarExplicitType.CaseSensitive := False;
 end;
 
 destructor TSSAGenerator.Destroy;
@@ -270,6 +300,8 @@ begin
   FConstIntRegs.Free;
   FProcedureNames.Free;
   FProcDecls.Free;
+  FVarRecordType.Free;
+  FVarExplicitType.Free;
   inherited Destroy;
 end;
 
@@ -282,8 +314,17 @@ end;
 function TSSAGenerator.GetVariableType(const VarName: string): TSSARegisterType;
 var
   LastChar: Char;
+  Idx: Integer;
 begin
   if Length(VarName) = 0 then Exit(srtFloat);
+  // Explicit type from DIM..AS (M3) wins over the name-suffix convention (record vars are
+  // int handles; builtin-typed vars use their declared bank).
+  if Assigned(FVarExplicitType) then
+  begin
+    Idx := FVarExplicitType.IndexOf(UpperCase(VarName));
+    if Idx >= 0 then
+      Exit(TSSARegisterType(PtrInt(FVarExplicitType.Objects[Idx])));
+  end;
   LastChar := VarName[Length(VarName)];
   if LastChar = '$' then
     Result := srtString
@@ -333,6 +374,10 @@ var
   VarName: string;
 begin
   if Node = nil then Exit;
+
+  // TYPE declarations (M3) contain field/type identifiers that are NOT variables — don't
+  // descend into them (would otherwise allocate bogus registers for field/type names).
+  if Node.NodeType = antTypeDecl then Exit;
 
   case Node.NodeType of
     antAssignment:
@@ -2025,6 +2070,10 @@ begin
         Result := MakeSSAValue(svkNone);
     end;
 
+    antMemberAccess:
+      // Record field read: obj.field (M3)
+      ProcessMemberAccess(Node, Result);
+
     antArrayAccess:
     begin
       // Array element access: A(5) or M(I,J)
@@ -2241,6 +2290,13 @@ begin
 
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
+
+  // Record field store: obj.field = expr (M3)
+  if VarNode.NodeType = antMemberAccess then
+  begin
+    ProcessMemberStore(VarNode, ExprNode);
+    Exit;
+  end;
 
   // Check if target is array access (array store)
   if VarNode.NodeType = antArrayAccess then
@@ -2816,6 +2872,9 @@ var
   HasVariableDims: Boolean;
   DimInstr: TSSAInstruction;
   VarDimCount: Integer;
+  RecTypeName: string;     // M3: DIM..AS type name
+  RecUDTIdx: Integer;      // M3
+  RecHandleVal: TSSAValue; // M3
 const
   MAX_ARRAY_ELEMENTS = 125000000;  // 125M elements max (~1GB for 500x500x500 matrix)
 begin
@@ -2845,6 +2904,24 @@ begin
 
     ArrName := VarToStr(ArrayDeclNode.GetChild(0).Value);
     DimsNode := ArrayDeclNode.GetChild(1);
+
+    // Typed scalar declaration (M3): "DIM name AS typename" — child[1] is an antIdentifier
+    // (the type), not antDimensions. A UDT type allocates a record instance and stores its
+    // handle in the variable; a builtin type needs no allocation (type already recorded).
+    if DimsNode.NodeType = antIdentifier then
+    begin
+      RecTypeName := UpperCase(VarToStr(DimsNode.Value));
+      RecUDTIdx := FindUDT(RecTypeName);
+      if RecUDTIdx >= 0 then
+      begin
+        RecHandleVal := GetOrAllocateVariable(UpperCase(ArrName));
+        EmitInstruction(ssaRecordNew, RecHandleVal,
+                        MakeSSAConstInt(FUDTs[RecUDTIdx].NInt),
+                        MakeSSAConstInt(FUDTs[RecUDTIdx].NFloat),
+                        MakeSSAConstInt(FUDTs[RecUDTIdx].NStr));
+      end;
+      Continue;
+    end;
 
     // Determine element type from array name suffix
     ElementType := GetVariableType(ArrName);
@@ -7876,6 +7953,210 @@ begin
   Result := 'PROC_' + UpperCase(Name);
 end;
 
+function TSSAGenerator.TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
+// Map a declared field/var type name to a register bank. Empty type => infer by name suffix.
+var
+  T: string;
+begin
+  T := UpperCase(TypeName);
+  if T = '' then
+    Exit(GetVariableType(FieldName));
+  if (T = 'INTEGER') or (T = 'LONG') or (T = 'SHORT') or (T = 'BYTE') or
+     (T = 'UBYTE') or (T = 'USHORT') or (T = 'UINTEGER') or (T = 'ULONG') or
+     (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'BOOLEAN') then
+    Result := srtInt
+  else if (T = 'SINGLE') or (T = 'DOUBLE') then
+    Result := srtFloat
+  else if (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then
+    Result := srtString
+  else
+    Result := GetVariableType(FieldName);  // unknown (e.g. nested UDT, deferred): fall back to suffix
+end;
+
+function TSSAGenerator.FindUDT(const TypeName: string): Integer;
+var
+  i: Integer;
+  U: string;
+begin
+  U := UpperCase(TypeName);
+  for i := 0 to High(FUDTs) do
+    if FUDTs[i].Name = U then Exit(i);
+  Result := -1;
+end;
+
+function TSSAGenerator.UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
+  out Bank: TSSARegisterType; out Slot: Integer): Boolean;
+var
+  i: Integer;
+  F: string;
+begin
+  Result := False;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if FUDTs[UDTIdx].Fields[i].Name = F then
+    begin
+      Bank := FUDTs[UDTIdx].Fields[i].Bank;
+      Slot := FUDTs[UDTIdx].Fields[i].Slot;
+      Exit(True);
+    end;
+end;
+
+procedure TSSAGenerator.RegisterUDTs(Node: TASTNode);
+// Build the record-type registry from TYPE declarations. Each field gets a (bank, slot)
+// assigned by walking fields in order, counting per bank.
+var
+  i, j, n: Integer;
+  FieldNode, TypeNode: TASTNode;
+  U: TUDTType;
+  Bank: TSSARegisterType;
+  cInt, cFloat, cStr: Integer;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType = antTypeDecl then
+  begin
+    U.Name := UpperCase(VarToStr(Node.Value));
+    SetLength(U.Fields, 0);
+    cInt := 0; cFloat := 0; cStr := 0;
+    for j := 0 to Node.ChildCount - 1 do
+    begin
+      FieldNode := Node.GetChild(j);
+      if FieldNode.NodeType <> antIdentifier then Continue;
+      TypeNode := nil;
+      if FieldNode.ChildCount > 0 then TypeNode := FieldNode.GetChild(0);
+      if Assigned(TypeNode) then
+        Bank := TypeNameToBank(VarToStr(TypeNode.Value), VarToStr(FieldNode.Value))
+      else
+        Bank := GetVariableType(VarToStr(FieldNode.Value));
+      n := Length(U.Fields);
+      SetLength(U.Fields, n + 1);
+      U.Fields[n].Name := UpperCase(VarToStr(FieldNode.Value));
+      U.Fields[n].Bank := Bank;
+      case Bank of
+        srtFloat:  begin U.Fields[n].Slot := cFloat; Inc(cFloat); end;
+        srtString: begin U.Fields[n].Slot := cStr;   Inc(cStr);   end;
+      else
+        begin U.Fields[n].Slot := cInt; Inc(cInt); end;
+      end;
+    end;
+    U.NInt := cInt; U.NFloat := cFloat; U.NStr := cStr;
+    if FindUDT(U.Name) < 0 then
+    begin
+      n := Length(FUDTs);
+      SetLength(FUDTs, n + 1);
+      FUDTs[n] := U;
+    end;
+    Exit;  // do not recurse into a type body
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    RegisterUDTs(Node.GetChild(i));
+end;
+
+procedure TSSAGenerator.RegisterRecordVars(Node: TASTNode);
+// Pre-scan DIM..AS declarations: record-typed vars hold an int handle (FVarRecordType),
+// builtin-typed vars get an explicit bank (FVarExplicitType). Runs before variable
+// pre-allocation so the handle/explicit type is honoured.
+var
+  i, k: Integer;
+  Decl, VarNameNode, TypeNode: TASTNode;
+  VarName, TypeName: string;
+  Bank: TSSARegisterType;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType = antDim then
+  begin
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(k);
+      if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount = 2) and
+         (Decl.GetChild(1).NodeType = antIdentifier) then
+      begin
+        VarNameNode := Decl.GetChild(0);
+        TypeNode := Decl.GetChild(1);
+        VarName := UpperCase(VarToStr(VarNameNode.Value));
+        TypeName := UpperCase(VarToStr(TypeNode.Value));
+        if FindUDT(TypeName) >= 0 then
+        begin
+          FVarRecordType.Values[VarName] := TypeName;   // record var -> type name
+          if FVarExplicitType.IndexOf(VarName) < 0 then
+            FVarExplicitType.AddObject(VarName, TObject(PtrInt(Ord(srtInt))));  // handle is int
+        end
+        else
+        begin
+          Bank := TypeNameToBank(TypeName, VarName);
+          if FVarExplicitType.IndexOf(VarName) < 0 then
+            FVarExplicitType.AddObject(VarName, TObject(PtrInt(Ord(Bank))));
+        end;
+      end;
+    end;
+    Exit;
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    RegisterRecordVars(Node.GetChild(i));
+end;
+
+procedure TSSAGenerator.ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);
+// Lower a record field read "obj.field" to ssaRecordLoad<bank>(dest, handle, slot).
+var
+  ObjNode: TASTNode;
+  ObjName, TypeName: string;
+  UDTIdx, Slot: Integer;
+  Bank: TSSARegisterType;
+  HandleVal, DestVal: TSSAValue;
+  Op: TSSAOpCode;
+begin
+  Result := MakeSSAValue(svkNone);
+  if Node.ChildCount < 1 then Exit;
+  ObjNode := Node.GetChild(0);
+  if ObjNode.NodeType <> antIdentifier then Exit;  // v1: object must be a simple variable
+  ObjName := UpperCase(VarToStr(ObjNode.Value));
+  if FVarRecordType.IndexOfName(ObjName) < 0 then Exit; // not a record variable
+  TypeName := FVarRecordType.Values[ObjName];
+  UDTIdx := FindUDT(TypeName);
+  if not UDTFieldBankSlot(UDTIdx, VarToStr(Node.Value), Bank, Slot) then Exit;
+
+  HandleVal := GetOrAllocateVariable(ObjName);   // int register holding the handle
+  DestVal := MakeSSARegister(Bank, FProgram.AllocRegister(Bank));
+  case Bank of
+    srtFloat:  Op := ssaRecordLoadFloat;
+    srtString: Op := ssaRecordLoadString;
+  else
+    Op := ssaRecordLoadInt;
+  end;
+  EmitInstruction(Op, DestVal, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+  Result := DestVal;
+end;
+
+procedure TSSAGenerator.ProcessMemberStore(MemberNode, ExprNode: TASTNode);
+// Lower "obj.field = expr" to ssaRecordStore<bank>(handle, value, slot).
+var
+  ObjNode: TASTNode;
+  ObjName, TypeName: string;
+  UDTIdx, Slot: Integer;
+  Bank: TSSARegisterType;
+  HandleVal, ExprVal: TSSAValue;
+  Op: TSSAOpCode;
+begin
+  if MemberNode.ChildCount < 1 then Exit;
+  ObjNode := MemberNode.GetChild(0);
+  if ObjNode.NodeType <> antIdentifier then Exit;
+  ObjName := UpperCase(VarToStr(ObjNode.Value));
+  if FVarRecordType.IndexOfName(ObjName) < 0 then Exit;
+  TypeName := FVarRecordType.Values[ObjName];
+  UDTIdx := FindUDT(TypeName);
+  if not UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot) then Exit;
+
+  ProcessExpression(ExprNode, ExprVal);
+  case Bank of
+    srtFloat:  begin ExprVal := EnsureFloatRegister(ExprVal);  Op := ssaRecordStoreFloat; end;
+    srtString: begin ExprVal := EnsureStringRegister(ExprVal); Op := ssaRecordStoreString; end;
+  else
+    begin ExprVal := EnsureIntRegister(ExprVal); Op := ssaRecordStoreInt; end;
+  end;
+  HandleVal := GetOrAllocateVariable(ObjName);
+  EmitInstruction(Op, MakeSSAValue(svkNone), HandleVal, ExprVal, MakeSSAConstInt(Slot));
+end;
+
 procedure TSSAGenerator.CollectProcedureDecl(Node: TASTNode);
 // Record a SUB/FUNCTION declaration for deferred lowering (see LowerDeferredProcedures).
 // AST layout: child 0 = name (antIdentifier), child 1 = antParameterList, rest = body.
@@ -8181,6 +8462,8 @@ begin
       CollectProcedureDecl(Node);
     antProcedureCall:
       ProcessProcedureCall(Node);
+    antTypeDecl:
+      ;  // UDT declaration: registered in the pre-scan (RegisterUDTs); nothing to emit here.
     antLabel:
     begin
       // Named label "name:" — start a new basic block 'LABEL_<NAME>' (the GOTO/GOSUB
@@ -8571,6 +8854,12 @@ begin
   if DebugSSA then
     WriteLn('[SSA] Pre-allocating variable registers...');
   {$ENDIF}
+  // UDT/record types (M3): register TYPE declarations and DIM..AS variable types BEFORE
+  // variable pre-allocation, so record vars are allocated as int handles and DIM..AS builtin
+  // vars use their declared bank.
+  RegisterUDTs(AST);
+  RegisterRecordVars(AST);
+
   PreAllocateVariables(AST);
   {$IFDEF DEBUG_SSA}
   if DebugSSA then

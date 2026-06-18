@@ -636,7 +636,7 @@ begin
   begin
     NextState := lsAccept;
     Action := laStartToken;
-    TokenType := ttOperator;
+    TokenType := ttOpDot;   // member-access operator '.'
   end;
 
   with FTransitionTable[lsInitial, ccOther] do
@@ -1908,7 +1908,7 @@ begin
           if ParseNumberDigits then  // ← If finds digits, it's a number
             Result := ProcessNumber
           else
-            Result := CreateToken(ttOperator);  // ← Otherwise it's an operator
+            Result := CreateToken(ttOpDot);  // ← Otherwise it's the member-access operator '.'
           Exit;
         end;
 

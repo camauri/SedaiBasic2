@@ -288,6 +288,12 @@ begin
       Result := Format('R%d -> X%d', [Instr.Src1, Instr.Immediate]);
     bcXferLoadInt, bcXferLoadFloat, bcXferLoadString:
       Result := Format('R%d <- X%d', [Instr.Dest, Instr.Immediate]);
+    bcRecordNew:
+      Result := Format('R%d = rec(i%d,f%d,s%d)', [Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString:
+      Result := Format('R%d <- [R%d].fld%d', [Instr.Dest, Instr.Src1, Instr.Immediate]);
+    bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString:
+      Result := Format('[R%d].fld%d <- R%d', [Instr.Src1, Instr.Immediate, Instr.Src2]);
 
     bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
     bcPrintInt, bcPrintIntLn:

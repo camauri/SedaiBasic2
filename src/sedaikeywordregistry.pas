@@ -1584,6 +1584,8 @@ begin
  RegisterKeyword(kSUB,      ttProcedureStart, 'SUB procedure',      kcProcedures);
  RegisterKeyword(kFUNCTION, ttProcedureStart, 'FUNCTION procedure', kcProcedures);
  RegisterKeyword(kCALL,     ttCallSub,        'Call a SUB',         kcProcedures);
+ RegisterKeyword(kTYPE,     ttTypeDecl,       'User-defined type',  kcProcedures);
+ RegisterKeyword(kAS,       ttAsType,         'Type annotation',    kcProcedures);
 
  // === FLOW CONTROL - JUMP RELATED STATEMENTS ===
  RegisterKeyword(kEXIT,   ttJumpReturn,      'Exit statement',   kcJumpFlowControl);

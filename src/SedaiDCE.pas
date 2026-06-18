@@ -274,7 +274,12 @@ begin
     ssaCallSub, ssaReturnSub,
     // Transfer-register moves carry args/result across the call; never elide them.
     ssaXferStoreInt, ssaXferStoreFloat, ssaXferStoreString,
-    ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString:
+    ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString,
+    // UDT/record heap ops (M3): allocation and field stores mutate heap state; field loads
+    // are kept conservatively (cheap, and a record's handle must stay live).
+    ssaRecordNew,
+    ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
+    ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString:
       Result := True;
 
     // Program termination and system state - always live

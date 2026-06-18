@@ -182,6 +182,8 @@ begin
   case OpCode of
     // SUB/FUNCTION transfer-register load (M2): Dest is the int register written.
     bcXferLoadInt,
+    // UDT/record (M3): RecordNew writes the handle (int); RecordLoadInt writes an int field.
+    bcRecordNew, bcRecordLoadInt,
     // === GROUP 0: Core VM operations ===
     // Integer operations
     bcLoadConstInt, bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -252,6 +254,8 @@ begin
   case OpCode of
     // SUB/FUNCTION transfer-register load (M2): Dest is the float register written.
     bcXferLoadFloat,
+    // UDT/record (M3): RecordLoadFloat writes a float field into Dest.
+    bcRecordLoadFloat,
     // === GROUP 0: Core VM operations ===
     bcLoadConstFloat, bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat,
     bcNegFloat, bcPowFloat,
@@ -296,6 +300,8 @@ begin
   case OpCode of
     // SUB/FUNCTION transfer-register load (M2): Dest is the string register written.
     bcXferLoadString,
+    // UDT/record (M3): RecordLoadString writes a string field into Dest.
+    bcRecordLoadString,
     // === GROUP 0: Core VM operations ===
     bcLoadConstString, bcCopyString,
     bcIntToString, bcFloatToString,
@@ -332,6 +338,9 @@ begin
   case OpCode of
     // SUB/FUNCTION transfer-register store (M2): Src1 is the int register read.
     bcXferStoreInt,
+    // UDT/record (M3): Src1 is the record HANDLE (always an int register) for all field ops.
+    bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString,
+    bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString,
     // === GROUP 0: Core VM operations ===
     // Int arithmetic
     bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
@@ -450,6 +459,8 @@ function TRegisterCompactor.Src2IsIntReg(OpCode: TBytecodeOp): Boolean;
 begin
   // Using case statement instead of set because opcodes are now Word (>255)
   case OpCode of
+    // UDT/record (M3): RecordStoreInt's Src2 is the int value being written.
+    bcRecordStoreInt,
     // === GROUP 0: Core VM operations ===
     // Int arithmetic (second operand)
     bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt,
@@ -506,6 +517,8 @@ function TRegisterCompactor.Src2IsFloatReg(OpCode: TBytecodeOp): Boolean;
 begin
   // Using case statement instead of set because opcodes are now Word (>255)
   case OpCode of
+    // UDT/record (M3): RecordStoreFloat's Src2 is the float value being written.
+    bcRecordStoreFloat,
     // === GROUP 0: Core VM operations ===
     // Float arithmetic (second operand)
     bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcPowFloat,
@@ -571,6 +584,8 @@ function TRegisterCompactor.Src2IsStringReg(OpCode: TBytecodeOp): Boolean;
 begin
   // Using case statement instead of set because opcodes are now Word (>255)
   case OpCode of
+    // UDT/record (M3): RecordStoreString's Src2 is the string value being written.
+    bcRecordStoreString,
     // === GROUP 0: Core VM operations ===
     // String comparison (second operand)
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,

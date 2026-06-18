@@ -534,6 +534,30 @@ begin
           begin FFloatRegs[Instr.Dest] := FXferFloat[Instr.Immediate]; Inc(CurPC); end;
         bcXferLoadString:
           begin FStringRegs[Instr.Dest] := FXferStr[Instr.Immediate]; Inc(CurPC); end;
+        // UDT/record heap (M3)
+        bcRecordNew:
+          begin
+            if FRecordCount >= Length(FRecords) then
+              SetLength(FRecords, (FRecordCount + 1) * 2);
+            SetLength(FRecords[FRecordCount].IntData, Instr.Src1);
+            SetLength(FRecords[FRecordCount].FloatData, Instr.Src2);
+            SetLength(FRecords[FRecordCount].StringData, Instr.Immediate);
+            FIntRegs[Instr.Dest] := FRecordCount;
+            Inc(FRecordCount);
+            Inc(CurPC);
+          end;
+        bcRecordLoadInt:
+          begin FIntRegs[Instr.Dest] := FRecords[FIntRegs[Instr.Src1]].IntData[Instr.Immediate]; Inc(CurPC); end;
+        bcRecordLoadFloat:
+          begin FFloatRegs[Instr.Dest] := FRecords[FIntRegs[Instr.Src1]].FloatData[Instr.Immediate]; Inc(CurPC); end;
+        bcRecordLoadString:
+          begin FStringRegs[Instr.Dest] := FRecords[FIntRegs[Instr.Src1]].StringData[Instr.Immediate]; Inc(CurPC); end;
+        bcRecordStoreInt:
+          begin FRecords[FIntRegs[Instr.Src1]].IntData[Instr.Immediate] := FIntRegs[Instr.Src2]; Inc(CurPC); end;
+        bcRecordStoreFloat:
+          begin FRecords[FIntRegs[Instr.Src1]].FloatData[Instr.Immediate] := FFloatRegs[Instr.Src2]; Inc(CurPC); end;
+        bcRecordStoreString:
+          begin FRecords[FIntRegs[Instr.Src1]].StringData[Instr.Immediate] := FStringRegs[Instr.Src2]; Inc(CurPC); end;
 
         // Array operations - typed versions are faster
         bcArrayLoadInt:
