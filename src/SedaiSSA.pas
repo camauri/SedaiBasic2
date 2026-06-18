@@ -139,7 +139,8 @@ type
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
     function VarRecordTypeName(const VarName: string): string;    // '' if not a record var
     procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer);  // alloc nested records
-    procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string);  // M4.4
+    procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
+                                  ArgsNode: TASTNode = nil);  // M4.4 (ArgsNode: M4.4b ctor args)
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
                               out Bank: TSSARegisterType; out Slot: Integer;
@@ -2984,7 +2985,13 @@ begin
                         MakeSSAConstInt(FUDTs[RecUDTIdx].NFloat),
                         MakeSSAConstInt(FUDTs[RecUDTIdx].NStr or (Int64(RecUDTIdx) shl 32)));  // Imm: strCount | typeId<<32
         EmitRecordInit(RecHandleVal, RecUDTIdx);  // allocate any nested-UDT field instances
-        EmitConstructorCall(RecHandleVal, RecTypeName);  // M4.4: run the constructor (if any)
+        // M4.4: run the constructor (if any). M4.4b: a "DIM v AS T(args)" attaches the ctor
+        // argument list as child[2] (antArgumentList).
+        if (ArrayDeclNode.ChildCount >= 3) and
+           (ArrayDeclNode.GetChild(2).NodeType = antArgumentList) then
+          EmitConstructorCall(RecHandleVal, RecTypeName, ArrayDeclNode.GetChild(2))
+        else
+          EmitConstructorCall(RecHandleVal, RecTypeName);
       end;
       Continue;
     end;
@@ -8335,8 +8342,10 @@ begin
     begin
       Decl := Node.GetChild(k);
       if Decl.NodeType <> antArrayDecl then Continue;
-      // DIM name AS type  -> typed scalar (child[1] = antIdentifier type)
-      if (Decl.ChildCount = 2) and (Decl.GetChild(1).NodeType = antIdentifier) then
+      // DIM name AS type  -> typed scalar (child[1] = antIdentifier type). M4.4b: a parameterised
+      // "DIM v AS T(args)" also has child[2] = antArgumentList, so accept ChildCount >= 2 here
+      // (the array-of-UDT case has child[1] = antDimensions, not antIdentifier, so no overlap).
+      if (Decl.ChildCount >= 2) and (Decl.GetChild(1).NodeType = antIdentifier) then
         RegisterTypedVar(UpperCase(VarToStr(Decl.GetChild(0).Value)),
                          UpperCase(VarToStr(Decl.GetChild(1).Value)))
       // DIM name(dims) AS type  -> array of UDT (child[2] = antIdentifier type): record the
@@ -8443,17 +8452,36 @@ begin
     end;
 end;
 
-procedure TSSAGenerator.EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string);
+procedure TSSAGenerator.EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
+  ArgsNode: TASTNode);
 // M4.4: if TypeName (or an ancestor) declares a CONSTRUCTOR, call it on the just-allocated instance.
 // The constructor is a SUB whose implicit THIS is the instance handle, so we stage the handle into
 // the int transfer slot 0 (THIS is parameter 0) and bcCallSub the resolved label. No virtual
 // dispatch: at allocation the runtime type equals the static type, so the most-derived ctor is exact.
+// M4.4b: ArgsNode (DIM v AS T(args)) supplies the constructor arguments — staged into the declared
+// parameter slots that follow THIS.
 var
   Lbl: string;
+  Decl, ParamList: TASTNode;
+  i, Slot: Integer;
+  RT: TSSARegisterType;
+  ArgVal: TSSAValue;
 begin
   Lbl := ResolveMethodLabel(TypeName, 'CONSTRUCTOR');
   if Lbl = '' then Exit;
   EmitXferStore(srtInt, 0, HandleVal);              // THIS handle -> int xfer slot 0
+  if Assigned(ArgsNode) and FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and
+     (Decl.ChildCount >= 2) then
+  begin
+    ParamList := Decl.GetChild(1);                  // includes the implicit THIS at index 0
+    for i := 0 to ArgsNode.ChildCount - 1 do
+    begin
+      if i + 1 >= ParamList.ChildCount then Break;  // ignore surplus args (no overloading yet)
+      ProcessExpression(ArgsNode.GetChild(i), ArgVal);
+      Slot := ParamBankAndSlot(ParamList, i + 1, RT);  // +1: skip the implicit THIS parameter
+      EmitXferStore(RT, Slot, ArgVal);
+    end;
+  end;
   EmitCallSubLabel(ProcedureLabelName(Lbl));
 end;
 

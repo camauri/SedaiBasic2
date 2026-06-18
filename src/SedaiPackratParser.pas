@@ -3786,7 +3786,7 @@ end;
 function TPackratParser.ParseDimStatement: TASTNode;
 var
   Token, NameTok, TypeTok: TLexerToken;
-  ArrayDecl, VarNameNode, TypeNode: TASTNode;
+  ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr: TASTNode;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
@@ -3815,6 +3815,22 @@ begin
       TypeNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(TypeTok.Value), TypeTok);
       ArrayDecl.AddChild(VarNameNode);
       ArrayDecl.AddChild(TypeNode);          // child[1] is antIdentifier (type) => typed scalar
+      // Optional parameterised construction (M4.4b): "DIM v AS T(args)" — attach the constructor
+      // argument list as child[2]; SSA stages these and calls T's matching CONSTRUCTOR.
+      if Context.Check(ttDelimParOpen) then
+      begin
+        Context.Advance;                     // (
+        CtorArgs := TASTNode.Create(antArgumentList, Context.CurrentToken);
+        if not Context.Check(ttDelimParClose) then
+          repeat
+            ArgExpr := FExpressionParser.ParseExpression;
+            if not Assigned(ArgExpr) then Break;
+            CtorArgs.AddChild(ArgExpr);
+            if Context.Check(ttSeparParam) then Context.Advance else Break;
+          until Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]);
+        if Context.Check(ttDelimParClose) then Context.Advance;   // )
+        ArrayDecl.AddChild(CtorArgs);        // child[2] = antArgumentList (ctor args)
+      end;
       DoNodeCreated(ArrayDecl);
       Result.AddChild(ArrayDecl);
     end
