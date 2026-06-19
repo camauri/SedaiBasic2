@@ -118,6 +118,9 @@ type
     { Check if value is a constant float }
     function GetConstFloat(const Val: TSSAValue; out ConstVal: Double): Boolean;
 
+    { True if the register is NOT a single never-reassigned constant (e.g. a loop accumulator). }
+    function RegisterReassignedNonConst(const Val: TSSAValue): Boolean;
+
     { Check if integer is power of 2, return log2 if yes }
     function IsPowerOfTwo(N: Int64; out Log2: Integer): Boolean;
 
@@ -249,6 +252,40 @@ begin
   Result := FReductions;
 end;
 
+function TStrengthReduction.RegisterReassignedNonConst(const Val: TSSAValue): Boolean;
+// A register may be treated as a compile-time constant by GetConstInt/GetConstFloat ONLY if it is
+// written exactly once, by a constant load (or a copy/int->float that those resolvers chase). A
+// register that is also written by an arithmetic instruction — typically a loop accumulator like
+// `C = 0 : ... : C = C + K` — is NOT constant; reporting its initial 0 as a constant made strength
+// reduction turn `B * C` into `IV * 0` (a zero-stride accumulator), miscompiling the result. This
+// returns True for such registers so the const resolvers reject them.
+var
+  i, j, defs: Integer;
+  Block: TSSABasicBlock;
+  Instr: TSSAInstruction;
+begin
+  Result := False;
+  if Val.Kind <> svkRegister then Exit;
+  defs := 0;
+  for i := 0 to FProgram.Blocks.Count - 1 do
+  begin
+    Block := FProgram.Blocks[i];
+    for j := 0 to Block.Instructions.Count - 1 do
+    begin
+      Instr := Block.Instructions[j];
+      if (Instr.Dest.Kind = svkRegister) and
+         (Instr.Dest.RegType = Val.RegType) and (Instr.Dest.RegIndex = Val.RegIndex) then
+      begin
+        Inc(defs);
+        if not (Instr.OpCode in [ssaLoadConstInt, ssaLoadConstFloat,
+                                 ssaCopyInt, ssaCopyFloat, ssaIntToFloat]) then
+          Exit(True);   // computed (e.g. Add/Mul) -> not a constant
+      end;
+    end;
+  end;
+  Result := (defs <> 1);   // 0 defs (unknown) or >1 def (reassigned / merged) -> not a safe constant
+end;
+
 function TStrengthReduction.GetConstInt(const Val: TSSAValue; out ConstVal: Int64): Boolean;
 var
   Block: TSSABasicBlock;
@@ -269,6 +306,7 @@ begin
   // Check if it's a register loaded with a constant
   if Val.Kind = svkRegister then
   begin
+    if RegisterReassignedNonConst(Val) then Exit;   // accumulator / computed reg -> not constant
     {$IFDEF DEBUG_STRENGTH}
     if DebugStrength then
       WriteLn('[StrengthRed] GetConstInt: Looking for INT[', Val.RegIndex, '] (RegType=', Ord(Val.RegType), ')');
@@ -387,6 +425,7 @@ begin
   // Check if it's a register loaded with a constant
   if Val.Kind = svkRegister then
   begin
+    if RegisterReassignedNonConst(Val) then Exit;   // accumulator / computed reg -> not constant
     {$IFDEF DEBUG_STRENGTH}
     if DebugStrength then
       WriteLn('[StrengthRed] GetConstFloat: Searching for register F', Val.RegIndex, ' in LoadConst instructions...');
