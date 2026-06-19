@@ -99,6 +99,23 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `FUNCTION` | ✓ | Structured FUNCTION: params, return via `fname=expr` or `RETURN expr`, recursion. `END FUNCTION` |
 | `CALL` | ✓ | Invoke a SUB: `CALL name(args)` (or `CALL name args`); `EXIT SUB`/`EXIT FUNCTION` for early return |
 
+## Variable Scope
+
+The dialect is chosen at LOAD by content: a program that uses **line numbers is CLASSIC** (Commodore
+BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.fbas` extension forces MODERN.
+
+- **CLASSIC**: every variable is global by name (v7 semantics) — unchanged.
+- **MODERN**: lexical scope. Only **explicit declarations** are scoped; implicit (never-`DIM`'d)
+  variables remain global-by-name at procedure/module level (so classic-style code keeps working).
+  - A plain module-level `DIM` is **not** visible inside a `SUB`/`FUNCTION`. Use `DIM SHARED` to make it
+    visible (a UDT instance is shared by its handle; arrays live in global storage), or pass it as a
+    parameter. A UDT/array follows the same rule as a scalar.
+  - A `DIM` inside a block (`IF`/`ELSE` branch, `FOR`/`DO`/`WHILE` body, `BEGIN`/`BEND`) is **block-local**:
+    it shadows an outer same-name variable for the rest of the block and is destroyed (UDT destructor
+    runs) at the block end. `EXIT`/`RETURN` unwind block-local objects innermost-first before the frame.
+- Not yet implemented (future work): a block-scoped `FOR` counter via `FOR i AS <type>` syntax;
+  scoping of array names by block; an `OPTION` to auto-share module variables into procedures.
+
 ## Data Management (7/7 - 100%)
 
 | Command | Status | Description |
