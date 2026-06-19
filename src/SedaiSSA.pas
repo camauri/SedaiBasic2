@@ -140,6 +140,7 @@ type
     procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
     function ResolveMethodLabel(const TypeName, MethNm: string): string;  // walk inheritance
+    function ResolveConstructorLabel(const TypeName: string; ArgCount: Integer): string;  // M4.4d: by arity
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
     function VarRecordTypeName(const VarName: string): string;    // '' if not a record var
@@ -8261,6 +8262,29 @@ begin
   end;
 end;
 
+function TSSAGenerator.ResolveConstructorLabel(const TypeName: string; ArgCount: Integer): string;
+// M4.4d: find a constructor by arity, walking up the inheritance chain. Each CONSTRUCTOR's label
+// encodes its explicit-parameter count as "TYPE.CONSTRUCTOR#<n>" (arity-based overloading), so a
+// DIM with N arguments resolves to the matching N-parameter ctor (a subtype with no matching-arity
+// ctor inherits the parent's). Same-arity/different-type overloading is a later refinement.
+var
+  T, Lbl: string;
+  Idx, Guard: Integer;
+begin
+  Result := '';
+  T := UpperCase(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    Lbl := T + '.CONSTRUCTOR#' + IntToStr(ArgCount);
+    if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
 function TSSAGenerator.IsSubtypeOf(const U, T: string): Boolean;
 // True if U is T or a (transitive) subtype of T.
 var
@@ -8490,14 +8514,17 @@ procedure TSSAGenerator.EmitConstructorCall(const HandleVal: TSSAValue; const Ty
 // dispatch: at allocation the runtime type equals the static type, so the most-derived ctor is exact.
 // M4.4b: ArgsNode (DIM v AS T(args)) supplies the constructor arguments — staged into the declared
 // parameter slots that follow THIS.
+// M4.4d: constructors are overloaded by arity — the ctor whose explicit-parameter count equals the
+// number of arguments is selected (ResolveConstructorLabel).
 var
   Lbl: string;
   Decl, ParamList: TASTNode;
-  i, Slot: Integer;
+  i, Slot, ArgCount: Integer;
   RT: TSSARegisterType;
   ArgVal: TSSAValue;
 begin
-  Lbl := ResolveMethodLabel(TypeName, 'CONSTRUCTOR');
+  if Assigned(ArgsNode) then ArgCount := ArgsNode.ChildCount else ArgCount := 0;
+  Lbl := ResolveConstructorLabel(TypeName, ArgCount);
   if Lbl = '' then Exit;
   EmitXferStore(srtInt, 0, HandleVal);              // THIS handle -> int xfer slot 0
   if Assigned(ArgsNode) and FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and
@@ -8506,7 +8533,7 @@ begin
     ParamList := Decl.GetChild(1);                  // includes the implicit THIS at index 0
     for i := 0 to ArgsNode.ChildCount - 1 do
     begin
-      if i + 1 >= ParamList.ChildCount then Break;  // ignore surplus args (no overloading yet)
+      if i + 1 >= ParamList.ChildCount then Break;  // defensive: arity already matched the resolution
       ProcessExpression(ArgsNode.GetChild(i), ArgVal);
       Slot := ParamBankAndSlot(ParamList, i + 1, RT);  // +1: skip the implicit THIS parameter
       EmitXferStore(RT, Slot, ArgVal);
@@ -9112,9 +9139,9 @@ procedure TSSAGenerator.LowerDeferredProcedures;
 // the module END is emitted so procedure blocks sit beyond it (never reached by fall-through;
 // only via ssaCallSub). Each body ends with ssaReturnSub.
 var
-  i, j, Slot, PUDT: Integer;
+  i, j, Slot, PUDT, OwnerUDT: Integer;
   Proc, NameNode, ParamList, ParamNodeJ: TASTNode;
-  Name, LabelName: string;
+  Name, LabelName, ParentType: string;
   RT: TSSARegisterType;
   ParamReg, LcHandle: TSSAValue;
 begin
@@ -9186,6 +9213,21 @@ begin
     begin
       FCurrentResultHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitXferLoad(srtInt, XFER_RESULT_HANDLE_SLOT, FCurrentResultHandle);
+    end;
+
+    // M4.4d: base-constructor auto-chaining. If this is a constructor and its owner type has a
+    // parent with a default (#0) constructor, run that base ctor on THIS before the body — the
+    // parent's own prologue chains further up the inheritance chain. Inherited fields sit at the
+    // same prefix slots, so the base ctor initialises them before the child overrides/extends them.
+    if (Pos('.CONSTRUCTOR#', Name) > 0) and (FCurrentThisType <> '') then
+    begin
+      OwnerUDT := FindUDT(FCurrentThisType);
+      if OwnerUDT >= 0 then
+      begin
+        ParentType := FUDTs[OwnerUDT].Parent;
+        if (ParentType <> '') and (ResolveConstructorLabel(ParentType, 0) <> '') then
+          EmitConstructorCall(GetOrAllocateVariable('THIS'), ParentType, nil);
+      end;
     end;
 
     // Body statements begin at child index 2 (0 = name, 1 = antParameterList).

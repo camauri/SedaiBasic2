@@ -1395,6 +1395,12 @@ begin
     end;
   end;
 
+  // Arity-based constructor overloading (M4.4d): encode the explicit-parameter count in the label
+  // (THIS excluded) so multiple CONSTRUCTORs of the same type get distinct procedure labels, e.g.
+  // "TYPE.CONSTRUCTOR#0", "TYPE.CONSTRUCTOR#2". The call site resolves by argument count.
+  if (Kind = kCONSTRUCTOR) and Assigned(NameNode) then
+    NameNode.Value := QualName + '#' + IntToStr(ParamList.ChildCount - 1);
+
   Result.AddChild(ParamList);
 
   ParseProcedureBody(Result);                     // statements up to END SUB/FUNCTION
