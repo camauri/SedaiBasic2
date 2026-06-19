@@ -36,6 +36,13 @@ const
   MIN_REGISTER_SLOTS = 256;      // Initial allocation size (backward compatible)
   MAX_REGISTER_SLOTS = 65536;    // Maximum registers per type (2^16)
 
+var
+  // Runtime master switch for the SSA optimization passes (the `--no-opt` CLI flag clears it). The
+  // structural passes (SSA construction, dominator tree, PHI elimination) ignore it and always run;
+  // only the value-optimization passes early-out when it is False. Used by the differential test
+  // harness to compare optimized vs unoptimized output of the same program.
+  GSSAOptimizationsEnabled: Boolean = True;
+
 type
   TSSARegisterType = (srtInt, srtFloat, srtString);
 
@@ -1012,6 +1019,7 @@ function TSSAProgram.RunGVN: Integer;
 var
   GVNPass: TGVNPass;
 begin
+  if not GSSAOptimizationsEnabled then Exit(0);
   { PHASE 3 TIER 2: Run Global Value Numbering optimization
 
     This pass eliminates redundant computations by identifying equivalent
@@ -1050,6 +1058,7 @@ function TSSAProgram.RunCSE: Integer;
 var
   CSE: TCommonSubexpressionElimination;
 begin
+  if not GSSAOptimizationsEnabled then Exit(0);
   { Common subexpression elimination - eliminates redundant computations }
 
   Result := 0;
@@ -1075,6 +1084,7 @@ function TSSAProgram.RunCopyProp: Integer;
 var
   CopyProp: TCopyPropagation;
 begin
+  if not GSSAOptimizationsEnabled then Exit(0);
   { Copy propagation - eliminates redundant register copies }
 
   Result := 0;
@@ -1100,6 +1110,7 @@ function TSSAProgram.RunAlgebraic: Integer;
 var
   Algebraic: TAlgebraicSimplification;
 begin
+  if not GSSAOptimizationsEnabled then Exit(0);
   Result := 0;
   {$IFDEF DEBUG_ALGEBRAIC}
   if DebugAlgebraic then
@@ -1121,6 +1132,7 @@ function TSSAProgram.RunStrengthReduction: Integer;
 var
   StrengthRed: TStrengthReduction;
 begin
+  if not GSSAOptimizationsEnabled then Exit(0);
   Result := 0;
   {$IFDEF DEBUG_STRENGTH}
   if DebugStrength then
@@ -1142,6 +1154,7 @@ function TSSAProgram.RunGosubInlining: Integer;
 var
   Inliner: TGosubInlining;
 begin
+  if not GSSAOptimizationsEnabled then Exit(0);
   Result := 0;
   {$IFDEF DEBUG_SSA}
   if DebugSSA then
@@ -1163,6 +1176,7 @@ function TSSAProgram.RunConstProp: Integer;
 var
   ConstProp: TSimpleConstProp;
 begin
+  if not GSSAOptimizationsEnabled then Exit(0);
   { Simple constant propagation - identifies single-assignment constants
     and propagates their values to enable folding }
 
@@ -1189,6 +1203,7 @@ function TSSAProgram.RunAggressiveConstProp(Level: Integer): Integer;
 var
   AggressiveCP: TAggressiveConstProp;
 begin
+  if not GSSAOptimizationsEnabled then Exit(0);
   { SSA-aware constant propagation using versioned registers
     Level parameter is kept for compatibility but unused (SSA makes this simple) }
 
@@ -1215,6 +1230,7 @@ function TSSAProgram.RunDBE: Integer;
 var
   DBE: TDeadBlockElimination;
 begin
+  if not GSSAOptimizationsEnabled then Exit(0);
   { Dead block elimination - removes unreachable blocks before dominator tree construction }
 
   Result := 0;
@@ -1240,6 +1256,7 @@ function TSSAProgram.RunDCE: Integer;
 var
   DCE: TDeadCodeElimination;
 begin
+  if not GSSAOptimizationsEnabled then Exit(0);
   { Dead code elimination - removes unused instructions to reduce bytecode size }
 
   Result := 0;
@@ -1265,6 +1282,7 @@ function TSSAProgram.RunLICM: Integer;
 var
   LICM: TLoopInvariantCodeMotion;
 begin
+  if not GSSAOptimizationsEnabled then Exit(0);
   { Loop-Invariant Code Motion - moves loop-invariant computations outside loops }
 
   Result := 0;
@@ -1290,6 +1308,7 @@ function TSSAProgram.RunLoopUnrolling: Integer;
 var
   Unroller: TLoopUnroller;
 begin
+  if not GSSAOptimizationsEnabled then Exit(0);
   { Loop Unrolling - duplicates loop bodies to reduce overhead }
 
   Result := 0;
@@ -1313,6 +1332,7 @@ function TSSAProgram.RunCopyCoalescing: Integer;
 var
   CopyCoal: TCopyCoalescing;
 begin
+  if not GSSAOptimizationsEnabled then Exit(0);
   { Copy Coalescing - eliminates redundant Copy instructions from PHI Elimination }
 
   Result := 0;

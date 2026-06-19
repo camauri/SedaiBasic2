@@ -381,6 +381,7 @@ begin
   WriteLn('  --disasm            Show bytecode disassembly (after superinstructions)');
   WriteLn('  --disasm-pre        Show bytecode BEFORE superinstruction fusion');
   WriteLn('  --no-exec           Compile only, do not execute (useful with --disasm)');
+  WriteLn('  --no-opt            Skip the SSA/bytecode optimization passes (differential testing)');
   WriteLn('  --stats             Show execution statistics');
   WriteLn('  --true-value=N      Set TRUE value for comparisons (-1 or 1, default: -1)');
   WriteLn('                        -1 = Commodore BASIC style (default)');
@@ -1271,7 +1272,7 @@ begin
       WriteLn('=== PEEPHOLE OPTIMIZATION ===');
     {$ENDIF}
     try
-      RunPeephole(BytecodeProgram);
+      if GSSAOptimizationsEnabled then RunPeephole(BytecodeProgram);
       {$IFDEF DEBUG_PEEPHOLE}
       if DebugPeephole then
         WriteLn(Format('  Instructions after peephole: %d', [BytecodeProgram.GetInstructionCount]));
@@ -1320,7 +1321,7 @@ begin
       WriteLn('=== SUPERINSTRUCTIONS ===');
     {$ENDIF}
     try
-      RunSuperinstructions(BytecodeProgram);
+      if GSSAOptimizationsEnabled then RunSuperinstructions(BytecodeProgram);
       {$IFDEF DEBUG_SUPERINSTR}
       if DebugSuperinstr then
         WriteLn(Format('  Instructions after fusion: %d', [BytecodeProgram.GetInstructionCount]));
@@ -1370,7 +1371,7 @@ begin
     {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
     {$IFNDEF DISABLE_PEEPHOLE}
     try
-      RunPeephole(BytecodeProgram);
+      if GSSAOptimizationsEnabled then RunPeephole(BytecodeProgram);
       // Run NOP compaction again to remove any new NOPs
       {$IFNDEF DISABLE_NOP_COMPACTION}
       RunNopCompaction(BytecodeProgram);
@@ -1392,7 +1393,7 @@ begin
       WriteLn('=== REGISTER COMPACTION ===');
     {$ENDIF}
     try
-      RunRegisterCompaction(BytecodeProgram);
+      if GSSAOptimizationsEnabled then RunRegisterCompaction(BytecodeProgram);
       {$IFDEF DEBUG_REGALLOC}
       if DebugRegAlloc then
         WriteLn;
@@ -1901,6 +1902,8 @@ begin
         OptStats := True
       else if Param = '--no-exec' then
         OptNoExec := True
+      else if (Param = '--no-opt') or (Param = '--no-optimize') then
+        GSSAOptimizationsEnabled := False   // differential-test reference: skip the optimization passes
       else if (Param = '--help') or (Param = '-h') or (Param = '-?') then
         OptHelp := True
       {$IFDEF ENABLE_PROFILER}
