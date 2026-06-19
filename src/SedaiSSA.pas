@@ -106,6 +106,8 @@ type
     FModuleRecordVars: TStringList;      // V5b: "VARNAME|TYPENAME" of module-scope DIM'd UDTs (globals)
     FSharedVars: TStringList;            // M6: DIM SHARED scalar names -> transfer slot (Objects[]=slot)
     FInDispatcher: Boolean;              // M6: true while emitting a virtual dispatcher (skip shared sync)
+    FBlockScopes: array of TStringList;  // M8: per active loop body, the "VAR|TYPE" of its DIM'd UDTs
+    FBlockHandledVars: TStringList;      // M8: var names destructed block-scoped (excluded from frame/module dtors)
     FCurrentThisType: string;   // M4.1: owner UDT type while lowering a method body (THIS's type)
     // UDT/record support (M3)
     FUDTs: array of TUDTType;            // declared record types
@@ -155,6 +157,10 @@ type
     procedure EmitFrameDestructors;                     // V5: dtor calls for the current frame
     procedure CollectModuleRecordVars(Node: TASTNode);  // V5b: gather module-scope DIM'd UDTs (skip procs)
     procedure EmitModuleDestructors;                    // V5b: dtor calls for globals at program end
+    procedure BlockScopeEnter;                           // M8: open a loop-body block scope (mark push)
+    procedure BlockScopeExit;                            // M8: close it (destructors + mark pop, then drop)
+    procedure EmitBlockScopeCleanup(Idx: Integer);       // M8: destructors + mark pop for scope Idx (no drop)
+    procedure EmitAllBlockScopesCleanup;                 // M8: unwind every active block scope (early frame exit)
     procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
     procedure EmitSharedSyncOut;                         // M6: store shared-global registers -> their slots
     procedure EmitSharedSyncIn;                          // M6: load shared-global slots -> their registers
@@ -358,6 +364,9 @@ begin
   FSharedVars := TStringList.Create;
   FSharedVars.CaseSensitive := False;
   FInDispatcher := False;
+  FBlockHandledVars := TStringList.Create;
+  FBlockHandledVars.CaseSensitive := False;
+  SetLength(FBlockScopes, 0);
 end;
 
 destructor TSSAGenerator.Destroy;
@@ -376,6 +385,7 @@ begin
   FCurrentProcByvalRecs.Free;
   FModuleRecordVars.Free;
   FSharedVars.Free;
+  FBlockHandledVars.Free;
   inherited Destroy;
 end;
 
@@ -3038,6 +3048,15 @@ begin
           EmitConstructorCall(RecHandleVal, RecTypeName, ArrayDeclNode.GetChild(2))
         else
           EmitConstructorCall(RecHandleVal, RecTypeName);
+        // M8: a UDT DIM'd inside a loop body is block-scoped — register it for destruction +
+        // reclamation at this iteration's end (BlockScopeExit), and exclude it from the frame/module
+        // destructors (which would otherwise also destroy it, on a stale/reused handle).
+        if Length(FBlockScopes) > 0 then
+        begin
+          FBlockScopes[High(FBlockScopes)].Add(UpperCase(ArrName) + '|' + RecTypeName);
+          if FBlockHandledVars.IndexOf(UpperCase(ArrName)) < 0 then
+            FBlockHandledVars.Add(UpperCase(ArrName));
+        end;
       end;
       // M4.4e: general initializer "DIM v AS T = expr" — child[2] is the init expression (not the
       // ctor-args antArgumentList). After allocation/construction, assign it: a scalar store, or a
@@ -3562,6 +3581,10 @@ begin
     WriteLn('[SSA] Edge: ', CondBlock.LabelName, ' → ', BodyBlock.LabelName, ' (true)');
   {$ENDIF}
 
+  // M8: open a block scope for this loop body (mark push at body entry; UDT DIMs in the body are
+  // destructed and reclaimed each iteration). Paired with BlockScopeExit in ProcessNext.
+  BlockScopeEnter;
+
   // Push loop info onto stack
   LoopInfo.VarName := VarName;
   LoopInfo.VarReg := VarReg;
@@ -3689,12 +3712,14 @@ begin
       BodyBlock.AddPredecessor(CondBlock);
     end;
 
+    BlockScopeEnter;   // M8: open this loop body's block scope
     // Process body statements
     if Assigned(BodyNode) then
     begin
       for i := 0 to BodyNode.ChildCount - 1 do
         ProcessStatement(BodyNode.GetChild(i));
     end;
+    BlockScopeExit;    // M8: destruct + reclaim the body's DIM'd UDTs before the back-edge
 
     // Jump back to condition check
     EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone),
@@ -3721,12 +3746,14 @@ begin
       BodyBlock.AddPredecessor(PrevBlock);
     end;
 
+    BlockScopeEnter;   // M8: open this loop body's block scope
     // Process body statements
     if Assigned(BodyNode) then
     begin
       for i := 0 to BodyNode.ChildCount - 1 do
         ProcessStatement(BodyNode.GetChild(i));
     end;
+    BlockScopeExit;    // M8: destruct + reclaim the body's DIM'd UDTs before the back-edge
 
     if HasCondition and Assigned(ConditionNode) then
     begin
@@ -3839,6 +3866,9 @@ begin
   if Length(FLoopStack) = 0 then Exit;  // Error: NEXT without FOR
   LoopInfo := FLoopStack[High(FLoopStack)];
   SetLength(FLoopStack, Length(FLoopStack) - 1);
+
+  // M8: close this loop body's block scope (destruct its DIM'd UDTs + reclaim) before the back-edge.
+  BlockScopeExit;
 
   // Increment loop variable by step
   if LoopInfo.VarReg.RegType = srtInt then
@@ -8671,6 +8701,7 @@ begin
       if bar <= 0 then Continue;
       VName := Copy(FCurrentProcLocalRecs[i], 1, bar - 1);
       TName := Copy(FCurrentProcLocalRecs[i], bar + 1, MaxInt);
+      if FBlockHandledVars.IndexOf(VName) >= 0 then Continue;   // M8: destructed block-scoped
       EmitDestructorCall(GetOrAllocateVariable(VName), TName);
     end;
   if (FCurrentProcByvalRecs <> nil) then
@@ -8731,8 +8762,63 @@ begin
     if bar <= 0 then Continue;
     VName := Copy(FModuleRecordVars[i], 1, bar - 1);
     TName := Copy(FModuleRecordVars[i], bar + 1, MaxInt);
+    if FBlockHandledVars.IndexOf(VName) >= 0 then Continue;   // M8: destructed block-scoped
     EmitDestructorCall(GetOrAllocateVariable(VName), TName);
   end;
+end;
+
+procedure TSSAGenerator.BlockScopeEnter;
+// M8: open a block scope at a loop-body entry. Emit bcRecMarkPush (snapshot the record high-water
+// mark) and push an empty UDT list; DIMs lowered in the body register themselves here (ProcessDim).
+begin
+  EmitInstruction(ssaRecMarkPush, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  SetLength(FBlockScopes, Length(FBlockScopes) + 1);
+  FBlockScopes[High(FBlockScopes)] := TStringList.Create;
+end;
+
+procedure TSSAGenerator.EmitBlockScopeCleanup(Idx: Integer);
+// M8: run the destructors (reverse construction order) for the block scope at Idx, then bcRecMarkPop
+// to reclaim its records. Does NOT drop the scope — used both by the normal exit (which then drops)
+// and by early exits (EXIT loop / EXIT SUB / RETURN), which only emit cleanup for the path taken.
+var
+  i, bar: Integer;
+  L: TStringList;
+  VName, TName: string;
+begin
+  if (Idx < 0) or (Idx > High(FBlockScopes)) then Exit;
+  L := FBlockScopes[Idx];
+  if L <> nil then
+    for i := L.Count - 1 downto 0 do
+    begin
+      bar := Pos('|', L[i]);
+      if bar <= 0 then Continue;
+      VName := Copy(L[i], 1, bar - 1);
+      TName := Copy(L[i], bar + 1, MaxInt);
+      EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+    end;
+  EmitInstruction(ssaRecMarkPop, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.BlockScopeExit;
+// M8: normal loop-body exit — clean up the innermost block scope, then drop it.
+begin
+  if Length(FBlockScopes) = 0 then Exit;
+  EmitBlockScopeCleanup(High(FBlockScopes));
+  FBlockScopes[High(FBlockScopes)].Free;
+  SetLength(FBlockScopes, Length(FBlockScopes) - 1);
+end;
+
+procedure TSSAGenerator.EmitAllBlockScopesCleanup;
+// M8: on an early frame exit from inside one or more loops (EXIT SUB / EXIT FUNCTION / RETURN), unwind
+// every active block scope innermost-first, before the frame destructors. The scopes are NOT dropped
+// (this is one CFG path; the loops' own normal ends still emit their cleanup on the other path).
+var
+  k: Integer;
+begin
+  for k := High(FBlockScopes) downto 0 do
+    EmitBlockScopeCleanup(k);
 end;
 
 procedure TSSAGenerator.CollectSharedVars(Node: TASTNode);
@@ -9584,6 +9670,7 @@ begin
         // EXIT SUB / EXIT FUNCTION inside a procedure -> frame return.
         if FInProcedure and ((Pos('SUB', ExitKind) > 0) or (Pos('FUNCTION', ExitKind) > 0)) then
         begin
+          EmitAllBlockScopesCleanup;   // M8: unwind active loop block scopes before the frame exit
           EmitFrameDestructors;   // V5
           EmitSharedSyncOut;      // M6: publish shared-global changes before returning
           EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
@@ -9592,7 +9679,8 @@ begin
         end
         else if Length(FLoopStack) > 0 then
         begin
-          // EXIT FOR/DO/WHILE - jump to the current loop's EndLabel
+          // EXIT FOR/DO/WHILE - clean up this loop's block scope, then jump to its EndLabel.
+          if Length(FBlockScopes) > 0 then EmitBlockScopeCleanup(High(FBlockScopes));   // M8
           EmitInstruction(ssaJump, MakeSSALabel(FLoopStack[High(FLoopStack)].EndLabel),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           FCurrentBlock := nil;
@@ -9600,6 +9688,7 @@ begin
         else if FInProcedure then
         begin
           // Bare EXIT inside a procedure with no enclosing loop -> frame return.
+          EmitAllBlockScopesCleanup;   // M8
           EmitFrameDestructors;   // V5
           EmitSharedSyncOut;      // M6: publish shared-global changes before returning
           EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
@@ -9628,6 +9717,7 @@ begin
           else
             EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, RetVal);
         end;
+        EmitAllBlockScopesCleanup;   // M8: unwind active loop block scopes before the frame exit
         EmitFrameDestructors;   // V5: destroy local UDTs before returning
         EmitSharedSyncOut;      // M6: publish shared-global changes before returning
         EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
@@ -9926,6 +10016,10 @@ begin
   // registration so each var's bank is known). These slots survive the bcCallSub save/restore.
   FSharedVars.Clear;
   CollectSharedVars(AST);
+
+  // M8: reset block-scope state (loop-body record reclamation).
+  FBlockHandledVars.Clear;
+  SetLength(FBlockScopes, 0);
 
   // V5b: collect module-scope DIM'd UDTs (globals) once, so both an explicit `END` statement and the
   // implicit fall-through halt can emit their destructor calls (in reverse construction order).

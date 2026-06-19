@@ -129,6 +129,14 @@ type
     // a frame (assignment copies; a UDT return is copied into a caller-allocated instance).
     FFrameRecBase: array of Integer;
     FFrameRecBaseTop: Integer;
+    // Block-scoped record reclamation (M8): a stack of record high-water marks, pushed at a loop-body
+    // entry (bcRecMarkPush) and popped at the body exit (bcRecMarkPop, after the compiler-emitted
+    // destructors) to free that iteration's DIM'd records. Independent of the frame stack; FramePush
+    // records its top and FramePop restores it, so a non-local exit (EXIT SUB from inside a loop)
+    // discards any block marks left dangling by that frame.
+    FBlockRecMark: array of Integer;
+    FBlockRecMarkTop: Integer;
+    FFrameBlockMarkTop: array of Integer;   // M8: FBlockRecMarkTop saved per frame (restored on pop)
     // Transfer registers (M2): per-bank banks that are NEVER snapshot/restored, so they
     // carry arguments (caller->callee param slots) and the result (callee->caller) across
     // the bcCallSub/bcReturnSub frame save/restore. Indexed by a small per-bank slot.
@@ -404,6 +412,7 @@ begin
   FFrameSaveFloatTop := 0;
   FFrameSaveStrTop := 0;
   FFrameRecBaseTop := 0;
+  FBlockRecMarkTop := 0;
   SetLength(FRecords, 0);
   FRecordCount := 0;
   FCursorCol := 0;
@@ -1087,7 +1096,10 @@ begin
   // RAII (V2): remember where this frame's record allocations begin.
   if FFrameRecBaseTop >= Length(FFrameRecBase) then
     SetLength(FFrameRecBase, FFrameRecBaseTop + 256);
+  if FFrameRecBaseTop >= Length(FFrameBlockMarkTop) then
+    SetLength(FFrameBlockMarkTop, FFrameRecBaseTop + 256);
   FFrameRecBase[FFrameRecBaseTop] := FRecordCount;
+  FFrameBlockMarkTop[FFrameRecBaseTop] := FBlockRecMarkTop;  // M8: remember the block-mark depth
   Inc(FFrameRecBaseTop);
 end;
 
@@ -1113,6 +1125,8 @@ begin
     Dec(FFrameRecBaseTop);
     if FFrameRecBase[FFrameRecBaseTop] < FRecordCount then
       FRecordCount := FFrameRecBase[FFrameRecBaseTop];
+    // M8: discard any block marks this frame left dangling (e.g. EXIT SUB from inside a loop).
+    FBlockRecMarkTop := FFrameBlockMarkTop[FFrameRecBaseTop];
   end;
 end;
 
@@ -1796,6 +1810,7 @@ begin
   FFrameSaveFloatTop := 0;
   FFrameSaveStrTop := 0;
   FFrameRecBaseTop := 0;
+  FBlockRecMarkTop := 0;
   SetLength(FRecords, 0);
   FRecordCount := 0;
   {$IFDEF ENABLE_INSTRUCTION_COUNTING}
@@ -2047,6 +2062,22 @@ begin
         Dec(FCallStackPtr);
         FPC := FCallStack[FCallStackPtr];
         FramePop;
+      end;
+    // Block-scoped record reclamation (M8): push the current high-water mark at a loop-body entry,
+    // and reclaim to the last mark at the body exit (after the destructors ran).
+    bcRecMarkPush:
+      begin
+        if FBlockRecMarkTop >= Length(FBlockRecMark) then
+          SetLength(FBlockRecMark, FBlockRecMarkTop + 256);
+        FBlockRecMark[FBlockRecMarkTop] := FRecordCount;
+        Inc(FBlockRecMarkTop);
+      end;
+    bcRecMarkPop:
+      if FBlockRecMarkTop > 0 then
+      begin
+        Dec(FBlockRecMarkTop);
+        if FBlockRecMark[FBlockRecMarkTop] < FRecordCount then
+          FRecordCount := FBlockRecMark[FBlockRecMarkTop];
       end;
     // Transfer registers (M2): move a value to/from the non-saved transfer banks.
     bcXferStoreInt:    FXferInt[Instr.Immediate] := FIntRegs[Instr.Src1];

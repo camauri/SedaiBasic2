@@ -90,6 +90,7 @@ type
     ssaRecordNew, ssaRecordNewArray, ssaRecordTypeId,
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString,
     ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
+    ssaRecMarkPush, ssaRecMarkPop,   // M8: block-scoped record reclamation (loop-body DIMs)
 
     ssaArrayLoad, ssaArrayStore, ssaArrayDim,
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,

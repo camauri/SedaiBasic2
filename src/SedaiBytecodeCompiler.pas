@@ -231,6 +231,8 @@ begin
     ssaRecordNew: Result := bcRecordNew;
     ssaRecordNewArray: Result := bcRecordNewArray;
     ssaRecordTypeId: Result := bcRecordTypeId;
+    ssaRecMarkPush: Result := bcRecMarkPush;   // M8: block-scoped reclamation
+    ssaRecMarkPop: Result := bcRecMarkPop;
     ssaRecordLoadInt: Result := bcRecordLoadInt;
     ssaRecordLoadFloat: Result := bcRecordLoadFloat;
     ssaRecordLoadString: Result := bcRecordLoadString;

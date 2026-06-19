@@ -521,6 +521,25 @@ begin
             CurPC := FCallStack[FCallStackPtr];
             FramePop;
           end;
+        // Block-scoped record reclamation (M8): mark at a loop-body entry, reclaim at its exit.
+        bcRecMarkPush:
+          begin
+            if FBlockRecMarkTop >= Length(FBlockRecMark) then
+              SetLength(FBlockRecMark, FBlockRecMarkTop + 256);
+            FBlockRecMark[FBlockRecMarkTop] := FRecordCount;
+            Inc(FBlockRecMarkTop);
+            Inc(CurPC);
+          end;
+        bcRecMarkPop:
+          begin
+            if FBlockRecMarkTop > 0 then
+            begin
+              Dec(FBlockRecMarkTop);
+              if FBlockRecMark[FBlockRecMarkTop] < FRecordCount then
+                FRecordCount := FBlockRecMark[FBlockRecMarkTop];
+            end;
+            Inc(CurPC);
+          end;
         // Transfer registers (M2): move a value to/from the non-saved transfer banks.
         bcXferStoreInt:
           begin FXferInt[Instr.Immediate] := FIntRegs[Instr.Src1]; Inc(CurPC); end;

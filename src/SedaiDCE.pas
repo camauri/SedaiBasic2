@@ -279,7 +279,9 @@ begin
     // are kept conservatively (cheap, and a record's handle must stay live).
     ssaRecordNew, ssaRecordNewArray,
     ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
-    ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString:
+    ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString,
+    // M8: block-scope mark push/pop mutate the record high-water mark — never elide them.
+    ssaRecMarkPush, ssaRecMarkPop:
       Result := True;
 
     // Program termination and system state - always live

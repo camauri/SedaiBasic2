@@ -168,6 +168,10 @@ begin
       Line := Format('%4d: %-20s ARR[%d] fill records', [Index, 'RecordNewArray', Instr.Src1]);
     bcRecordTypeId:
       Line := Format('%4d: %-20s R%d = typeid[R%d]', [Index, 'RecordTypeId', Instr.Dest, Instr.Src1]);
+    bcRecMarkPush:
+      Line := Format('%4d: %-20s', [Index, 'RecMarkPush']);
+    bcRecMarkPop:
+      Line := Format('%4d: %-20s', [Index, 'RecMarkPop']);
     bcEnd:
       Line := Format('%4d: %-20s', [Index, 'End']);
     bcStop:
