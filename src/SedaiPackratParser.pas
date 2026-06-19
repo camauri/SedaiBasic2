@@ -123,6 +123,9 @@ type
     function ParseCallStatement: TASTNode;
     // BASE [ ( args ) ] : explicit base-constructor call inside a child CONSTRUCTOR (M4.4f).
     function ParseBaseStatement: TASTNode;
+    // SHARED used as a standalone statement (not as the DIM SHARED modifier): not a -lang fb feature;
+    // report a clean error pointing to DIM SHARED at module level, then recover.
+    function ParseSharedError: TASTNode;
     // TYPE name / field AS type / ... / END TYPE : user-defined type (record/UDT).
     function ParseTypeDecl: TASTNode;
     function AtEndType: Boolean;
@@ -536,6 +539,7 @@ begin
         Result := Memoize('FnStatement', @ParseFnStatement);
     ttCallSub: Result := Memoize('CallStatement', @ParseCallStatement);
     ttBaseCall: Result := Memoize('BaseStatement', @ParseBaseStatement);
+    ttSharedDecl: Result := ParseSharedError;   // SHARED is only the DIM SHARED modifier, not a statement
     ttTypeDecl: Result := Memoize('TypeDecl', @ParseTypeDecl);
     ttWithBlock: Result := ParseWith;
 
@@ -1499,6 +1503,26 @@ begin
   if HasParens and Context.Check(ttDelimParClose) then
     Context.Advance;                              // )
   DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseSharedError: TASTNode;
+var
+  Tok: TLexerToken;
+begin
+  // `SHARED x` as a standalone statement (typically attempted inside a SUB/FUNCTION) is not a -lang fb
+  // feature — the FreeBASIC manual: "The Shared statement inside scope blocks ... is not supported. Use
+  // Dim|Redim|Common|Static Shared in the main program instead." Report a clean error and skip the
+  // identifier list so parsing can recover.
+  Tok := Context.CurrentToken;
+  HandleError('SHARED is only valid as the DIM SHARED modifier at module level, not as a statement '
+            + '(declare the variable with DIM SHARED outside the SUB/FUNCTION)', Tok);
+  Context.Advance;                                // consume SHARED
+  while Context.Check(ttIdentifier) do
+  begin
+    Context.Advance;                              // name
+    if Context.Check(ttSeparParam) then Context.Advance else Break;   // optional comma
+  end;
+  Result := nil;
 end;
 
 function TPackratParser.AtEndType: Boolean;
