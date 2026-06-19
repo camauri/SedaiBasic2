@@ -147,6 +147,7 @@ type
     function ResolveConstructorLabel(const TypeName, ArgSig: string): string;  // M4.4g: by type signature
     function BankToChar(Bank: TSSARegisterType): Char;          // M4.4g: I/F/S bank code for a ctor signature
     function CtorSigFromParams(ParamList: TASTNode): string;    // M4.4g: type signature of a ctor's params
+    function FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;  // M4.4h: defaulted ctor
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
     function VarRecordTypeName(const VarName: string): string;    // '' if not a record var
@@ -8392,6 +8393,48 @@ begin
   end;
 end;
 
+function TSSAGenerator.FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;
+// M4.4h: find a constructor (walking inheritance) callable with ArgCount arguments thanks to default
+// parameters — i.e. it has M >= ArgCount parameters and every parameter beyond the ArgCount-th carries
+// a default value (HASDEFAULT). Prefers the fewest parameters (closest match). Used as a last resort
+// after exact-signature and arity resolution fail. The caller fills the missing defaults.
+var
+  T, Pref, Lbl, Best: string;
+  Idx, Guard, k, j, MParams, BestM: Integer;
+  Decl, ParamList, pj: TASTNode;
+  ok: Boolean;
+begin
+  Result := '';
+  T := UpperCase(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    Pref := T + '.CONSTRUCTOR#';
+    Best := ''; BestM := MaxInt;
+    for k := 0 to FProcedureNames.Count - 1 do
+    begin
+      Lbl := FProcedureNames[k];
+      if Copy(Lbl, 1, Length(Pref)) <> Pref then Continue;
+      if not (FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2)) then Continue;
+      ParamList := Decl.GetChild(1);
+      MParams := ParamList.ChildCount - 1;            // explicit params (THIS excluded)
+      if MParams < ArgCount then Continue;            // not enough parameters even with no defaults
+      ok := True;                                     // every param beyond ArgCount must be defaulted
+      for j := ArgCount to MParams - 1 do
+      begin
+        pj := ParamList.GetChild(j + 1);              // +1: skip THIS
+        if pj.Attributes.Values['HASDEFAULT'] <> '1' then begin ok := False; Break; end;
+      end;
+      if ok and (MParams < BestM) then begin Best := Lbl; BestM := MParams; end;
+    end;
+    if Best <> '' then Exit(Best);
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
 function TSSAGenerator.IsSubtypeOf(const U, T: string): Boolean;
 // True if U is T or a (transitive) subtype of T.
 var
@@ -8636,10 +8679,11 @@ procedure TSSAGenerator.EmitConstructorCall(const HandleVal: TSSAValue; const Ty
 // call inside an argument expression.
 var
   Lbl, ArgSig: string;
-  Decl, ParamList: TASTNode;
+  Decl, ParamList, PNode: TASTNode;
   i, Slot, ArgCount: Integer;
   RT: TSSARegisterType;
   ArgVals: array of TSSAValue;
+  DefVal: TSSAValue;
 begin
   if Assigned(ArgsNode) then ArgCount := ArgsNode.ChildCount else ArgCount := 0;
   // Evaluate each argument once and accumulate its bank signature.
@@ -8651,10 +8695,11 @@ begin
     ArgSig := ArgSig + BankToChar(ArgVals[i].RegType);
   end;
   Lbl := ResolveConstructorLabel(TypeName, ArgSig);
+  // M4.4h: if no ctor matches the given count, try one that is callable via default parameters.
+  if Lbl = '' then Lbl := FindCtorWithDefaults(TypeName, ArgCount);
   if Lbl = '' then Exit;
   EmitXferStore(srtInt, 0, HandleVal);              // THIS handle -> int xfer slot 0
-  if (ArgCount > 0) and FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and
-     (Decl.ChildCount >= 2) then
+  if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
   begin
     ParamList := Decl.GetChild(1);                  // includes the implicit THIS at index 0
     for i := 0 to ArgCount - 1 do
@@ -8662,6 +8707,19 @@ begin
       if i + 1 >= ParamList.ChildCount then Break;  // defensive: arity already matched the resolution
       Slot := ParamBankAndSlot(ParamList, i + 1, RT);  // +1: skip the implicit THIS parameter
       EmitXferStore(RT, Slot, ArgVals[i]);          // coerced to the parameter's bank
+    end;
+    // M4.4h: fill any trailing parameters the call omitted with their default values (evaluated here,
+    // in the caller's context), coerced to each parameter's bank — like M7 for SUB/FUNCTION. The
+    // parameter at ParamList index k corresponds to the (k-1)-th explicit argument (THIS is index 0).
+    for i := ArgCount + 1 to ParamList.ChildCount - 1 do
+    begin
+      PNode := ParamList.GetChild(i);
+      if (PNode.Attributes.Values['HASDEFAULT'] = '1') and (PNode.ChildCount >= 1) then
+      begin
+        ProcessExpression(PNode.GetChild(PNode.ChildCount - 1), DefVal);
+        Slot := ParamBankAndSlot(ParamList, i, RT);
+        EmitXferStore(RT, Slot, DefVal);
+      end;
     end;
   end;
   EmitCallSubLabel(ProcedureLabelName(Lbl));
