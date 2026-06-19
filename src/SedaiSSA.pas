@@ -9102,17 +9102,18 @@ begin
 end;
 
 procedure TSSAGenerator.AddSharedVarSlot(const VName: string);
-// M6: assign one scalar (int/float/string) global its dedicated transfer slot, counted per-bank from
-// SHARED_SLOT_BASE upward across the WHOLE module (FSharedVars is the single source of truth, so the
-// per-bank count is derived from it — never from a local counter that resets between AST nodes). The
-// slot survives the bcCallSub frame save/restore. UDTs are already shared via the record heap (their
-// handle is a plain int), and already-shared names are idempotent no-ops.
+// M6: assign one global its dedicated transfer slot, counted per-bank from SHARED_SLOT_BASE upward
+// across the WHOLE module (FSharedVars is the single source of truth, so the per-bank count is derived
+// from it — never from a local counter that resets between AST nodes). The slot survives the bcCallSub
+// frame save/restore. A UDT instance variable is a plain int handle, so a DIM SHARED UDT shares that
+// handle through an int slot (the record itself lives in the shared heap); under FB scope a NON-shared
+// module UDT is isolated inside procedures, so the handle must travel via the slot to be visible.
+// Already-shared names are idempotent no-ops.
 var
   Bank: TSSARegisterType;
   cnt, j: Integer;
 begin
   if FSharedVars.IndexOf(VName) >= 0 then Exit;        // already shared
-  if VarRecordTypeName(VName) <> '' then Exit;         // UDT: shared via the record heap, not a slot
   Bank := GetVariableType(VName);
   cnt := 0;
   for j := 0 to FSharedVars.Count - 1 do
@@ -9713,6 +9714,12 @@ begin
     else
       FCurrentThisType := '';
 
+    // FB lexical scope (MODERN): open the procedure-root scope frame. Parameters, THIS, the FUNCTION
+    // result handle and the body's locals/implicit names bind here; resolution stops at this frame for
+    // non-shared names, so a plain module DIM is invisible inside the procedure (DIM SHARED still
+    // resolves to the module register). Popped after the body + frame destructors.
+    if FModernMode then ScopePushFrame(skProcRoot);
+
     // Entry block for the procedure body.
     FCurrentBlock := FProgram.GetOrCreateBlock(LabelName);
 
@@ -9805,6 +9812,7 @@ begin
     EmitSharedSyncOut;      // M6: publish shared-global changes to their slots before returning
     EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    if FModernMode then ScopePopFrame;   // FB scope: close the procedure-root frame
     FCurrentBlock := nil;   // procedure body terminated
     FInProcedure := False;
     FCurrentProcName := '';
