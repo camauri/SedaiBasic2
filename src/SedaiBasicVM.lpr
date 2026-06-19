@@ -617,6 +617,9 @@ begin
     {$ENDIF}
     SSAGen := TSSAGenerator.Create;
     try
+      // Dialect gate for FB lexical scope: MODERN when the source has no line numbers (mirrors the
+      // lexer config above), CLASSIC otherwise. CLASSIC keeps BASIC v7 global-by-name semantics.
+      SSAGen.ModernMode := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
       try
         Timer := CreateHiResTimer;
         SSAProgram := SSAGen.Generate(ParserResult.AST);

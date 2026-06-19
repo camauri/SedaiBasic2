@@ -74,6 +74,20 @@ type
     Filled: Boolean;               // M4.2: fields resolved (cycle-safe fill guard)
   end;
 
+  { Lexical scope frame (FreeBASIC -lang fb scoping, MODERN mode only). The scope stack runs
+    module (outermost) -> procedure-root -> nested compound blocks (innermost). An explicit DIM
+    binds a name in the innermost frame (shadowing); an implicit first-use binds at the nearest
+    proc-root/module frame. Resolution walks innermost->outermost, stopping at a proc-root (so a
+    plain module DIM is invisible inside a SUB) — except DIM SHARED globals, which resolve to the
+    module register everywhere. In CLASSIC mode the stack is inert and resolution stays global. }
+  TScopeKind = (skModule, skProcRoot, skBlock);
+  TScopeFrame = record
+    Kind: TScopeKind;
+    Bindings: TStringList;   // NAME(UPPER) -> packed (RegType<<16 | RegIndex), like FVarMap entries
+    Dtors: TStringList;      // "VAR|TYPE" UDT instances to destruct at frame exit (block frames)
+    RecMarkEmitted: Boolean; // ssaRecMarkPush emitted for this frame (block frames only)
+  end;
+
   { SSA Generator - converts AST to SSA IR }
   TSSAGenerator = class
   private
@@ -108,6 +122,8 @@ type
     FInDispatcher: Boolean;              // M6: true while emitting a virtual dispatcher (skip shared sync)
     FBlockScopes: array of TStringList;  // M8: per active loop body, the "VAR|TYPE" of its DIM'd UDTs
     FBlockHandledVars: TStringList;      // M8: var names destructed block-scoped (excluded from frame/module dtors)
+    FModernMode: Boolean;                // FB scope: True = MODERN (lexical scope); False = CLASSIC (global-by-name)
+    FScopeStack: array of TScopeFrame;   // FB scope: module -> proc-root -> blocks (innermost = High); inert in CLASSIC
     FCurrentThisType: string;   // M4.1: owner UDT type while lowering a method body (THIS's type)
     // UDT/record support (M3)
     FUDTs: array of TUDTType;            // declared record types
@@ -166,6 +182,10 @@ type
     procedure EmitAllBlockScopesCleanup;                 // M8: unwind every active block scope (early frame exit)
     procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
     procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
+    // FB lexical scope (MODERN only). ScopePushFrame/ScopePopFrame manage FScopeStack; the block
+    // variants emit the M8 record-mark instructions. Inert in CLASSIC mode (callers gate on FModernMode).
+    procedure ScopePushFrame(Kind: TScopeKind);
+    procedure ScopePopFrame;
     procedure EmitSharedSyncOut;                         // M6: store shared-global registers -> their slots
     procedure EmitSharedSyncIn;                          // M6: load shared-global slots -> their registers
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
@@ -312,6 +332,9 @@ type
     destructor Destroy; override;
     function Generate(AST: TASTNode): TSSAProgram;
     property Program_: TSSAProgram read FProgram;
+    // FB scope dialect gate: True = MODERN (FreeBASIC lexical scope), False = CLASSIC (BASIC v7
+    // global-by-name). Set by the compile driver from the LOAD-time dialect (line numbers => CLASSIC).
+    property ModernMode: Boolean read FModernMode write FModernMode;
   end;
 
 implementation
@@ -371,6 +394,8 @@ begin
   FBlockHandledVars := TStringList.Create;
   FBlockHandledVars.CaseSensitive := False;
   SetLength(FBlockScopes, 0);
+  FModernMode := False;            // default CLASSIC; the compile driver flips this for MODERN sources
+  SetLength(FScopeStack, 0);
 end;
 
 destructor TSSAGenerator.Destroy;
@@ -8942,6 +8967,32 @@ begin
     EmitBlockScopeCleanup(k);
 end;
 
+procedure TSSAGenerator.ScopePushFrame(Kind: TScopeKind);
+// FB lexical scope (MODERN): push a new scope frame with empty binding/dtor tables. Inert in CLASSIC
+// (callers gate on FModernMode), so the stack is empty there and resolution stays global-by-name.
+var
+  F: TScopeFrame;
+begin
+  F.Kind := Kind;
+  F.Bindings := TStringList.Create;
+  F.Bindings.CaseSensitive := False;
+  F.Dtors := TStringList.Create;
+  F.Dtors.CaseSensitive := False;
+  F.RecMarkEmitted := False;
+  SetLength(FScopeStack, Length(FScopeStack) + 1);
+  FScopeStack[High(FScopeStack)] := F;
+end;
+
+procedure TSSAGenerator.ScopePopFrame;
+// FB lexical scope: drop the innermost frame and free its tables. (Block-frame destructor emission and
+// record-mark pop are handled by the block-scope path; this only releases the bookkeeping.)
+begin
+  if Length(FScopeStack) = 0 then Exit;
+  FScopeStack[High(FScopeStack)].Bindings.Free;
+  FScopeStack[High(FScopeStack)].Dtors.Free;
+  SetLength(FScopeStack, Length(FScopeStack) - 1);
+end;
+
 procedure TSSAGenerator.AddSharedVarSlot(const VName: string);
 // M6: assign one scalar (int/float/string) global its dedicated transfer slot, counted per-bank from
 // SHARED_SLOT_BASE upward across the WHOLE module (FSharedVars is the single source of truth, so the
@@ -10149,6 +10200,11 @@ begin
   FProgram := TSSAProgram.Create;
   FLabelCounter := 0;
 
+  // FB lexical scope: reset the scope stack and, in MODERN mode, open the outermost module (global)
+  // frame. In CLASSIC mode the stack stays empty and name resolution remains global-by-name.
+  while Length(FScopeStack) > 0 do ScopePopFrame;
+  if FModernMode then ScopePushFrame(skModule);
+
   // PRE-ALLOCATE ALL VARIABLE REGISTERS FIRST
   // This prevents conflicts between variable registers and temporary expression registers
   {$IFDEF DEBUG_SSA}
@@ -10226,6 +10282,9 @@ begin
   // PHASE 3 TIER 3: Fix forward GOTO/GOSUB references (now that all blocks exist,
   // including procedure bodies).
   FixForwardReferences;
+
+  // FB lexical scope: release the module frame (and any frame left dangling by an error path).
+  while Length(FScopeStack) > 0 do ScopePopFrame;
 
   Result := FProgram;
 end;
