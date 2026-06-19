@@ -152,7 +152,7 @@ type
     procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
                                   ArgsNode: TASTNode = nil);  // M4.4 (ArgsNode: M4.4b ctor args)
     procedure EmitDestructorCall(const HandleVal: TSSAValue; const TypeName: string);  // V5
-    function BodyHasBaseCall(Node: TASTNode): Boolean;  // M4.4f: a ctor body contains an explicit BASE call
+    function FindBaseCall(Node: TASTNode): TASTNode;    // M4.4f: the body's explicit BASE call node (or nil)
     procedure CollectLocalRecordVars(Node: TASTNode);  // V5: gather a proc body's DIM'd local UDTs
     procedure EmitFrameDestructors;                     // V5: dtor calls for the current frame
     procedure CollectModuleRecordVars(Node: TASTNode);  // V5b: gather module-scope DIM'd UDTs (skip procs)
@@ -8643,18 +8643,22 @@ begin
       end;
 end;
 
-function TSSAGenerator.BodyHasBaseCall(Node: TASTNode): Boolean;
-// M4.4f: true if the subtree contains an explicit BASE(...) call (an antProcedureCall named "BASE").
-// Used to suppress the automatic default-base chaining when the ctor body chains the base itself.
+function TSSAGenerator.FindBaseCall(Node: TASTNode): TASTNode;
+// M4.4f: return the first explicit BASE(...) call (an antProcedureCall named "BASE") in the subtree,
+// or nil. Used to hoist the base-constructor call into the ctor prologue (base-first), and to
+// suppress the automatic default-base chaining when the body chains the base itself.
 var
   i: Integer;
 begin
-  Result := False;
+  Result := nil;
   if Node = nil then Exit;
   if (Node.NodeType = antProcedureCall) and (UpperCase(VarToStr(Node.Value)) = 'BASE') then
-    Exit(True);
+    Exit(Node);
   for i := 0 to Node.ChildCount - 1 do
-    if BodyHasBaseCall(Node.GetChild(i)) then Exit(True);
+  begin
+    Result := FindBaseCall(Node.GetChild(i));
+    if Assigned(Result) then Exit;
+  end;
 end;
 
 procedure TSSAGenerator.CollectLocalRecordVars(Node: TASTNode);
@@ -9362,11 +9366,13 @@ begin
   ArgList := nil;
   if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antArgumentList) then
     ArgList := Node.GetChild(0);
-  // M4.4f: BASE[(args)] inside a constructor body calls the owner type's parent constructor (by
-  // arity) on THIS. It reuses EmitConstructorCall against the parent type — no virtual dispatch
-  // (the base subobject's type is the static parent). Outside a method/ctor it is a no-op.
+  // M4.4f: BASE[(args)] inside a constructor body calls the owner type's parent constructor on THIS.
+  // It is normally HOISTED into the prologue (base-first) by LowerDeferredProcedures, which marks the
+  // node 'HOISTED' — so here we just skip it. (The fallback path below covers any unhoisted BASE,
+  // e.g. one not reached by the prologue scan.)
   if (UpperCase(VarToStr(Node.Value)) = 'BASE') then
   begin
+    if Node.Attributes.Values['HOISTED'] = '1' then Exit;   // already run in the prologue
     if FCurrentThisType <> '' then
     begin
       OwnerUDT := FindUDT(FCurrentThisType);
@@ -9388,7 +9394,7 @@ procedure TSSAGenerator.LowerDeferredProcedures;
 // only via ssaCallSub). Each body ends with ssaReturnSub.
 var
   i, j, Slot, PUDT, OwnerUDT: Integer;
-  Proc, NameNode, ParamList, ParamNodeJ: TASTNode;
+  Proc, NameNode, ParamList, ParamNodeJ, BaseCallNode: TASTNode;
   Name, LabelName, ParentType: string;
   RT: TSSARegisterType;
   ParamReg, LcHandle: TSSAValue;
@@ -9468,21 +9474,34 @@ begin
     // base ctor call (which syncs around itself) starts from valid shared registers.
     EmitSharedSyncIn;
 
-    // M4.4d: base-constructor auto-chaining. If this is a constructor and its owner type has a
-    // parent with a default (#0) constructor, run that base ctor on THIS before the body — the
-    // parent's own prologue chains further up the inheritance chain. Inherited fields sit at the
-    // same prefix slots, so the base ctor initialises them before the child overrides/extends them.
-    // M4.4f: suppressed when the body chains the base explicitly with BASE(args), to avoid running
-    // both the default base ctor and the explicit one.
-    if (Pos('.CONSTRUCTOR#', Name) > 0) and (FCurrentThisType <> '') and
-       (not BodyHasBaseCall(Proc)) then
+    // M4.4d/f: base-constructor initialisation runs in the prologue, BEFORE the ctor body — so the
+    // base subobject is constructed first regardless of where it appears in the source. If the body
+    // chains the base explicitly with BASE(args), that call is HOISTED here (and marked so the body
+    // skips it); otherwise the parent's default (#0) constructor is auto-chained. The parent's own
+    // prologue chains further up; inherited fields sit at the same prefix slots, so the base ctor
+    // initialises them before the child overrides/extends them.
+    if (Pos('.CONSTRUCTOR#', Name) > 0) and (FCurrentThisType <> '') then
     begin
       OwnerUDT := FindUDT(FCurrentThisType);
       if OwnerUDT >= 0 then
       begin
         ParentType := FUDTs[OwnerUDT].Parent;
-        if (ParentType <> '') and (ResolveConstructorLabel(ParentType, 0) <> '') then
-          EmitConstructorCall(GetOrAllocateVariable('THIS'), ParentType, nil);
+        if ParentType <> '' then
+        begin
+          BaseCallNode := FindBaseCall(Proc);
+          if Assigned(BaseCallNode) then
+          begin
+            // explicit BASE(args): run the chosen base ctor now, then mark the node hoisted so its
+            // in-body occurrence is skipped (ProcessProcedureCall checks the attribute).
+            if (BaseCallNode.ChildCount >= 1) and (BaseCallNode.GetChild(0).NodeType = antArgumentList) then
+              EmitConstructorCall(GetOrAllocateVariable('THIS'), ParentType, BaseCallNode.GetChild(0))
+            else
+              EmitConstructorCall(GetOrAllocateVariable('THIS'), ParentType, nil);
+            BaseCallNode.Attributes.Values['HOISTED'] := '1';
+          end
+          else if ResolveConstructorLabel(ParentType, 0) <> '' then
+            EmitConstructorCall(GetOrAllocateVariable('THIS'), ParentType, nil);  // default base ctor
+        end;
       end;
     end;
 
