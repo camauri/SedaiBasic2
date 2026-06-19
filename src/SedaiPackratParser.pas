@@ -1365,6 +1365,10 @@ begin
         ParamNode := TASTNode.CreateWithValue(antIdentifier,
                        UpperCase(Context.CurrentToken.Value), Context.CurrentToken);
         if ParamMode = kBYVAL then ParamNode.Attributes.Values['BYVAL'] := '1';
+        // An explicit BYREF on a scalar parameter requests write-back (the callee's mutations are
+        // copied back into the caller's variable argument). Recorded for the SSA call lowering; BYREF
+        // is also the implicit default, but only an explicit BYREF opts a scalar into write-back.
+        if ParamMode = kBYREF then ParamNode.Attributes.Values['BYREF'] := '1';
         Context.Advance;
         // Optional "AS typename" (M3.1): attach the type as a child antIdentifier so the
         // SSA pre-scan can type the parameter (record handle / explicit builtin bank).

@@ -118,10 +118,17 @@ type
     FCurrentResultHandle: TSSAValue;  // V3: register holding the caller's result-instance handle
     FCurrentProcLocalRecs: TStringList;  // V5: "VARNAME|TYPENAME" of the proc's DIM'd local UDTs
     FCurrentProcByvalRecs: TStringList;  // V5d: "VARNAME|TYPENAME" of the proc's BYVAL UDT param copies
+    FCurrentProcByrefScalars: TStringList;  // BYREF: explicit-BYREF scalar params; Objects[] = packed (RT<<16 | slot)
+                                            //        their final register value is written back to the slot at each return
     FModuleRecordVars: TStringList;      // V5b: "VARNAME|TYPENAME" of module-scope DIM'd UDTs (globals)
+    FModuleDtorSlots: TStringList;        // V5e: module global var (UPPER) -> reserved int xfer slot (Objects[]=slot)
+                                          //      holds its handle frame-independently so an END inside a SUB can
+                                          //      still destroy it (its module register is saved/hidden by the frame).
     FSharedVars: TStringList;            // M6: DIM SHARED scalar names -> transfer slot (Objects[]=slot)
     FInDispatcher: Boolean;              // M6: true while emitting a virtual dispatcher (skip shared sync)
     FBlockHandledVars: TStringList;      // M8: var names destructed block-scoped (excluded from frame/module dtors)
+    FCurrentTopLevelLabels: TStringList;  // GOTO-unwind: names of labels at block-depth 0 in the current frame
+                                          //   (module or proc). A GOTO to one of them exits every open block scope.
     FModernMode: Boolean;                // FB scope: True = MODERN (lexical scope); False = CLASSIC (global-by-name)
     FScopeStack: array of TScopeFrame;   // FB scope: proc-root + block frames (innermost = High); module = FVarMap
     FScopeSerial: Integer;               // FB scope: monotonic id for unique scoped internal names (NAME@serial)
@@ -141,8 +148,10 @@ type
     // resolves a use, or binds a new register: explicit DIM in the innermost frame (shadowing), implicit
     // first-use at the nearest proc-root/module. DeclareVariable is the explicit-declaration entry point.
     function ResolveExisting(const VarName: string; out Reg: TSSAValue): Boolean;
-    function BindOrResolve(const VarName: string; IsExplicitDecl: Boolean): TSSAValue;
+    function BindOrResolve(const VarName: string; IsExplicitDecl: Boolean;
+                           UseForcedType: Boolean = False; ForcedType: TSSARegisterType = srtInt): TSSAValue;
     function DeclareVariable(const VarName: string): TSSAValue;
+    function DeclareVariableTyped(const VarName: string; RegType: TSSARegisterType): TSSAValue;  // explicit DIM with a known bank
     procedure PreAllocateVariables(Node: TASTNode);  // Pre-scan AST to allocate all variable registers
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
     procedure ProcessStatement(Node: TASTNode);
@@ -182,13 +191,20 @@ type
     function FindBaseCall(Node: TASTNode): TASTNode;    // M4.4f: the body's explicit BASE call node (or nil)
     procedure CollectLocalRecordVars(Node: TASTNode);  // V5: gather a proc body's DIM'd local UDTs
     procedure EmitFrameDestructors;                     // V5: dtor calls for the current frame
+    procedure EmitByrefParamStore;                      // BYREF: callee — write explicit-BYREF scalar params back to their slots
+    procedure EmitByrefWriteback(const ParamOwnerName: string; ArgListNode: TASTNode);  // BYREF: caller — copy slots back into variable args
     procedure CollectModuleRecordVars(Node: TASTNode);  // V5b: gather module-scope DIM'd UDTs (skip procs)
-    procedure EmitModuleDestructors;                    // V5b: dtor calls for globals at program end
+    function TypeNeedsDestruction(const TypeName: string): Boolean;  // V5e: type (recursively) has a DESTRUCTOR
+    procedure AssignModuleDtorSlots;                    // V5e: reserve an int xfer slot per destructor-bearing global
+    procedure EmitModuleDestructors(UseSlots: Boolean = False);  // V5b/V5e: dtor calls for globals at program end
+                                                        //   UseSlots=True (END-in-proc): read handles from reserved slots
     function InnermostBlockFrameIdx: Integer;            // M8/FB: topmost skBlock frame index, or -1
     procedure BlockScopeEnter(IsLoopBody: Boolean = False);  // M8: open a block scope (loop/IF/SCOPE) (mark push)
     procedure BlockScopeExit;                            // M8: close it (destructors + mark pop, then drop)
     procedure EmitBlockScopeCleanup(Idx: Integer);       // M8: destructors + mark pop for scope Idx (no drop)
     procedure EmitAllBlockScopesCleanup;                 // M8: unwind every active block scope (early frame exit)
+    procedure CollectTopLevelLabels(Parent: TASTNode; StartIdx: Integer);  // GOTO-unwind: depth-0 labels of a frame
+    procedure ScanTopLevelLabels(Node: TASTNode; var Depth: Integer);      // recursive worker for the above
     procedure EmitExitLoopCleanup;                       // M8: unwind blocks down to the loop body (EXIT FOR/DO)
     procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
     procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
@@ -397,12 +413,17 @@ begin
   FNeededDispatchers.Sorted := True;
   FCurrentProcLocalRecs := TStringList.Create;
   FCurrentProcByvalRecs := TStringList.Create;
+  FCurrentProcByrefScalars := TStringList.Create;
   FModuleRecordVars := TStringList.Create;
+  FModuleDtorSlots := TStringList.Create;
+  FModuleDtorSlots.CaseSensitive := False;
   FSharedVars := TStringList.Create;
   FSharedVars.CaseSensitive := False;
   FInDispatcher := False;
   FBlockHandledVars := TStringList.Create;
   FBlockHandledVars.CaseSensitive := False;
+  FCurrentTopLevelLabels := TStringList.Create;
+  FCurrentTopLevelLabels.CaseSensitive := False;
   FModernMode := False;            // default CLASSIC; the compile driver flips this for MODERN sources
   SetLength(FScopeStack, 0);
 end;
@@ -421,9 +442,12 @@ begin
   FNeededDispatchers.Free;
   FCurrentProcLocalRecs.Free;
   FCurrentProcByvalRecs.Free;
+  FCurrentProcByrefScalars.Free;
   FModuleRecordVars.Free;
+  FModuleDtorSlots.Free;
   FSharedVars.Free;
   FBlockHandledVars.Free;
+  FCurrentTopLevelLabels.Free;
   inherited Destroy;
 end;
 
@@ -491,12 +515,16 @@ begin
   end;
 end;
 
-function TSSAGenerator.BindOrResolve(const VarName: string; IsExplicitDecl: Boolean): TSSAValue;
+function TSSAGenerator.BindOrResolve(const VarName: string; IsExplicitDecl: Boolean;
+  UseForcedType: Boolean = False; ForcedType: TSSARegisterType = srtInt): TSSAValue;
 // FB lexical scope (MODERN): resolve a use, or allocate+bind a new register. An explicit DIM binds in
 // the innermost scope frame (shadowing any outer same-name binding); an implicit first-use (or an
 // explicit DIM at pure module level) resolves if already present, else binds at the nearest proc-root,
 // else in the module namespace (FVarMap). Scoped bindings get a unique internal name (NAME@serial) so
 // the optimizer's variable->register map never collides across scopes/shadows.
+// UseForcedType: an explicit DIM with a known declared bank (DIM x AS <type>) binds in that bank rather
+// than via GetVariableType — the latter is keyed by bare name globally (first declaration wins), which
+// would mis-bank a same-named variable that two procedures DIM with different types.
 var
   nameU, internalName: string;
   targetIdx, f: Integer;
@@ -519,7 +547,8 @@ begin
       if FScopeStack[f].Kind = skProcRoot then begin targetIdx := f; Break; end;
   end;
 
-  RegType := GetVariableType(VarName);
+  if UseForcedType then RegType := ForcedType
+  else RegType := GetVariableType(VarName);
   RegIndex := FProgram.AllocRegister(RegType);
   pk := (Ord(RegType) shl 16) or RegIndex;
 
@@ -547,6 +576,15 @@ function TSSAGenerator.DeclareVariable(const VarName: string): TSSAValue;
 begin
   if not FModernMode then Exit(GetOrAllocateVariable(VarName));
   Result := BindOrResolve(VarName, True);
+end;
+
+function TSSAGenerator.DeclareVariableTyped(const VarName: string; RegType: TSSARegisterType): TSSAValue;
+// FB lexical scope: explicit DIM with a known declared bank (DIM x AS <type>). MODERN binds the new
+// scoped variable in RegType directly, so two procedures that DIM the same name with different types do
+// not collide on the single global bare-name type table. CLASSIC keeps the legacy global-by-name path.
+begin
+  if not FModernMode then Exit(GetOrAllocateVariable(VarName));
+  Result := BindOrResolve(VarName, True, True, RegType);
 end;
 
 function TSSAGenerator.GetOrAllocateVariable(const VarName: string): TSSAValue;
@@ -3135,6 +3173,7 @@ var
   RecPacked: Int64;        // M3.1: packed slot counts for bcRecordNewArray
   InitAssign: TASTNode;    // M4.4e: synthesized assignment for a "DIM v AS T = expr" initializer
   BlkIdx: Integer;         // M8/FB: innermost open block scope (-1 if none) for block-scoped UDT dtors
+  MDtorSlotIdx: Integer;   // V5e: index into FModuleDtorSlots for a module global's handle slot (-1 if none)
 const
   MAX_ARRAY_ELEMENTS = 125000000;  // 125M elements max (~1GB for 500x500x500 matrix)
 begin
@@ -3174,9 +3213,11 @@ begin
       RecUDTIdx := FindUDT(RecTypeName);
       if RecUDTIdx >= 0 then
       begin
-        // DeclareVariable (explicit): in MODERN a DIM inside a block binds the name block-locally
-        // (shadowing any outer same-name binding); at module level / CLASSIC it is allocate-or-reuse.
-        RecHandleVal := DeclareVariable(UpperCase(ArrName));
+        // DeclareVariableTyped (explicit, UDT handle = int bank): in MODERN a DIM inside a block binds
+        // the name block-locally (shadowing any outer same-name binding); at module level / CLASSIC it
+        // is allocate-or-reuse. Forcing the int bank keeps the binding correct even if the same name is
+        // DIM'd with a different type in another scope (the global type table is first-declaration-wins).
+        RecHandleVal := DeclareVariableTyped(UpperCase(ArrName), srtInt);
         EmitInstruction(ssaRecordNew, RecHandleVal,
                         MakeSSAConstInt(FUDTs[RecUDTIdx].NInt),
                         MakeSSAConstInt(FUDTs[RecUDTIdx].NFloat),
@@ -3199,12 +3240,23 @@ begin
           FScopeStack[BlkIdx].Dtors.Add(UpperCase(ArrName) + '|' + RecTypeName);
           if FBlockHandledVars.IndexOf(UpperCase(ArrName)) < 0 then
             FBlockHandledVars.Add(UpperCase(ArrName));
+        end
+        // V5e: a true module global (not in a procedure frame, not block-scoped) with a destructor gets
+        // its handle stashed in a reserved frame-independent slot, so an END inside any SUB can still
+        // destroy it. The handle is stable for the program's life (value semantics never reassign it).
+        else if not FInProcedure then
+        begin
+          MDtorSlotIdx := FModuleDtorSlots.IndexOf(UpperCase(ArrName));
+          if MDtorSlotIdx >= 0 then
+            EmitXferStore(srtInt, PtrInt(FModuleDtorSlots.Objects[MDtorSlotIdx]), RecHandleVal);
         end;
       end
       else
         // Builtin typed scalar (DIM x AS INTEGER/SINGLE/STRING): bind the name now so a DIM inside a
         // block is block-local in MODERN (and resolves before any later use). Legacy reuse otherwise.
-        DeclareVariable(UpperCase(ArrName));
+        // Bind in the DECLARED bank, so the same name DIM'd with different types in separate scopes does
+        // not collide on the global first-declaration-wins type table (GetVariableType).
+        DeclareVariableTyped(UpperCase(ArrName), TypeNameToBank(RecTypeName, UpperCase(ArrName)));
       // M4.4e: general initializer "DIM v AS T = expr" — child[2] is the init expression (not the
       // ctor-args antArgumentList). After allocation/construction, assign it: a scalar store, or a
       // value-copy when both sides are UDTs (reuses ProcessAssignment's existing semantics). The
@@ -4267,6 +4319,16 @@ begin
   if Node.ChildCount = 0 then Exit;
   LabelNode := Node.GetChild(0);
   LabelName := JumpLabelName(LabelNode);
+
+  // GOTO-unwind: if this GOTO jumps to a label at block-depth 0 of the current frame (a top-level
+  // label, outside every block scope), it leaves all currently-open block scopes — run their
+  // destructors and pop their record marks first (innermost-first), exactly as EXIT/RETURN do. Without
+  // this, a GOTO out of a FOR/IF/SCOPE body that DIM'd a UDT would skip its destructor and leak the
+  // record until frame exit. The frames are not dropped (the loop's normal end still cleans the other
+  // path). Targets at an intermediate depth are left untouched (conservative; rare and ill-defined).
+  if (LabelNode.NodeType = antIdentifier) and (InnermostBlockFrameIdx >= 0) and
+     (FCurrentTopLevelLabels.IndexOf(UpperCase(VarToStr(LabelNode.Value))) >= 0) then
+    EmitAllBlockScopesCleanup;
 
   // PHASE 3 TIER 3: Save current block before jump
   SourceBlock := FCurrentBlock;
@@ -8988,6 +9050,62 @@ begin
     end;
 end;
 
+procedure TSSAGenerator.EmitByrefParamStore;
+// BYREF: on each frame-exit path, write every explicit-BYREF scalar parameter's CURRENT register value
+// back into its transfer slot, so the caller can copy it into the variable argument after the call.
+// Must run before the bank save/restore (bcReturnSub) — the transfer slots survive it, the registers do
+// not. The slot is the same one the caller staged the argument into (ParamBankAndSlot agreement).
+var
+  i: Integer;
+  pk, Slot: Integer;
+  RT: TSSARegisterType;
+begin
+  if FCurrentProcByrefScalars = nil then Exit;
+  for i := 0 to FCurrentProcByrefScalars.Count - 1 do
+  begin
+    pk := PtrInt(FCurrentProcByrefScalars.Objects[i]);
+    RT := TSSARegisterType(pk shr 16);
+    Slot := pk and $FFFF;
+    EmitXferStore(RT, Slot, GetOrAllocateVariable(FCurrentProcByrefScalars[i]));
+  end;
+end;
+
+procedure TSSAGenerator.EmitByrefWriteback(const ParamOwnerName: string; ArgListNode: TASTNode);
+// BYREF: after a call returns, copy each explicit-BYREF scalar parameter's final value (left in its
+// transfer slot by EmitByrefParamStore) back into the variable argument the caller passed. Only simple
+// variable arguments are lvalues we can write to; a non-variable argument (literal/expression) is left
+// untouched. UDT-typed parameters are skipped — they alias the caller's instance via the handle (so
+// mutations already persist through the heap), and only scalars live in a register that needs copy-back.
+var
+  Decl, ParamList, ParamI, ArgExpr: TASTNode;
+  i, NArgs, Slot: Integer;
+  RT: TSSARegisterType;
+  TypeChild: TASTNode;
+begin
+  if not Assigned(ArgListNode) then Exit;
+  if not (ArgListNode.NodeType in [antArgumentList, antExpressionList]) then Exit;
+  if not (FProcDecls.TryGetValue(ParamOwnerName, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2)) then Exit;
+  ParamList := Decl.GetChild(1);
+  if ParamList = nil then Exit;
+  NArgs := ArgListNode.ChildCount;
+  if NArgs > ParamList.ChildCount then NArgs := ParamList.ChildCount;
+  for i := 0 to NArgs - 1 do
+  begin
+    ParamI := ParamList.GetChild(i);
+    if ParamI.Attributes.Values['BYREF'] <> '1' then Continue;   // only explicit BYREF opts in
+    // Skip UDT-typed parameters (handle-aliased): a type child that names a declared TYPE.
+    if (ParamI.ChildCount >= 1) and (ParamI.GetChild(0).NodeType = antIdentifier) then
+    begin
+      TypeChild := ParamI.GetChild(0);
+      if FindUDT(UpperCase(VarToStr(TypeChild.Value))) >= 0 then Continue;
+    end;
+    ArgExpr := ArgListNode.GetChild(i);
+    if (ArgExpr = nil) or (ArgExpr.NodeType <> antIdentifier) then Continue;  // only a variable is writable
+    Slot := ParamBankAndSlot(ParamList, i, RT);
+    EmitXferLoad(RT, Slot, GetOrAllocateVariable(UpperCase(VarToStr(ArgExpr.Value))));
+  end;
+end;
+
 procedure TSSAGenerator.CollectModuleRecordVars(Node: TASTNode);
 // V5b: recursively gather the module-scope DIM'd UDT (record) variables (the program's globals), in
 // textual order, as "VARNAME|TYPENAME" in FModuleRecordVars. Mirrors CollectLocalRecordVars but does
@@ -9019,14 +9137,76 @@ begin
     CollectModuleRecordVars(Node.GetChild(c));   // recurse into nested blocks (IF/FOR/...), not procs
 end;
 
-procedure TSSAGenerator.EmitModuleDestructors;
+function TSSAGenerator.TypeNeedsDestruction(const TypeName: string): Boolean;
+// V5e: True if TypeName — or, recursively, any of its nested-UDT members (and inherited members via
+// the prefix layout) — declares a DESTRUCTOR. Mirrors what EmitDestructorCall would actually emit, so
+// we only reserve handle slots (and run a module dtor) for globals that have observable destruction.
+// Cycle-safe: the UDT graph is a DAG (a field cannot be its own enclosing type by value), so plain
+// recursion terminates; a depth cap is a defensive backstop.
+  function Rec(const T: string; Depth: Integer): Boolean;
+  var
+    UDTIdx, i: Integer;
+  begin
+    Result := False;
+    if Depth > 64 then Exit;                         // defensive guard against pathological input
+    if ResolveMethodLabel(T, 'DESTRUCTOR') <> '' then Exit(True);
+    UDTIdx := FindUDT(UpperCase(T));
+    if UDTIdx < 0 then Exit;
+    for i := 0 to High(FUDTs[UDTIdx].Fields) do
+      if (FUDTs[UDTIdx].Fields[i].NestedType <> '') and
+         Rec(FUDTs[UDTIdx].Fields[i].NestedType, Depth + 1) then
+        Exit(True);
+  end;
+begin
+  Result := Rec(TypeName, 0);
+end;
+
+procedure TSSAGenerator.AssignModuleDtorSlots;
+// V5e: reserve one int transfer slot per destructor-bearing module global, so its handle can be stored
+// at construction (module scope) and read back at an END inside a procedure — where the global's module
+// register is hidden under the saved frame and name resolution would isolate it. Slots grow DOWN from
+// XFER_RESULT_HANDLE_SLOT-1, kept disjoint from the int SHARED region (which grows up from
+// SHARED_SLOT_BASE). If the two would collide, we stop assigning (graceful: that global's END-in-proc
+// destructor is skipped, exactly as before this feature). Module-end destruction is unaffected (it reads
+// the live module register directly).
+var
+  i, bar, sharedIntCount, nextSlot: Integer;
+  VName, TName: string;
+begin
+  FModuleDtorSlots.Clear;
+  if (FModuleRecordVars = nil) or (FModuleRecordVars.Count = 0) then Exit;
+  sharedIntCount := 0;                               // int SHARED slots occupy SHARED_SLOT_BASE .. base+count-1
+  if FSharedVars <> nil then
+    for i := 0 to FSharedVars.Count - 1 do
+      if GetVariableType(FSharedVars[i]) = srtInt then Inc(sharedIntCount);
+  nextSlot := XFER_RESULT_HANDLE_SLOT - 1;           // 253, growing down
+  for i := 0 to FModuleRecordVars.Count - 1 do       // construction order (assignment order is irrelevant)
+  begin
+    bar := Pos('|', FModuleRecordVars[i]);
+    if bar <= 0 then Continue;
+    VName := Copy(FModuleRecordVars[i], 1, bar - 1);
+    TName := Copy(FModuleRecordVars[i], bar + 1, MaxInt);
+    if FModuleDtorSlots.IndexOf(VName) >= 0 then Continue;   // one slot per name
+    if not TypeNeedsDestruction(TName) then Continue;        // no destructor anywhere -> no slot needed
+    if nextSlot <= SHARED_SLOT_BASE + sharedIntCount - 1 then Break;  // would collide with SHARED region
+    FModuleDtorSlots.AddObject(VName, TObject(PtrInt(nextSlot)));
+    Dec(nextSlot);
+  end;
+end;
+
+procedure TSSAGenerator.EmitModuleDestructors(UseSlots: Boolean = False);
 // V5b: emit destructor calls for the program's module-scope DIM'd UDTs (globals), in reverse
 // construction order, at program end (just before the implicit halt). Globals live below every frame
 // mark, so V2 never reclaims them; their destructors run here for deterministic RAII at shutdown.
 // Storage is not freed (the program is ending) — only the destructor's observable effects (e.g. I/O).
+// V5e: UseSlots=True is the END-inside-a-procedure path: the global's module register is unreachable
+// (saved under the active frame) and name resolution would isolate the proc-root, so we read each
+// handle from its reserved frame-independent slot (FModuleDtorSlots) instead. A global with no reserved
+// slot (slot space exhausted) is skipped on this path.
 var
-  i, bar: Integer;
+  i, bar, slotIdx: Integer;
   VName, TName: string;
+  H: TSSAValue;
 begin
   if (FModuleRecordVars = nil) or (FModuleRecordVars.Count = 0) then Exit;
   for i := FModuleRecordVars.Count - 1 downto 0 do
@@ -9036,7 +9216,16 @@ begin
     VName := Copy(FModuleRecordVars[i], 1, bar - 1);
     TName := Copy(FModuleRecordVars[i], bar + 1, MaxInt);
     if FBlockHandledVars.IndexOf(VName) >= 0 then Continue;   // M8: destructed block-scoped
-    EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+    if UseSlots then
+    begin
+      slotIdx := FModuleDtorSlots.IndexOf(VName);
+      if slotIdx < 0 then Continue;                           // no frame-independent handle available here
+      H := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitXferLoad(srtInt, PtrInt(FModuleDtorSlots.Objects[slotIdx]), H);
+      EmitDestructorCall(H, TName);
+    end
+    else
+      EmitDestructorCall(GetOrAllocateVariable(VName), TName);
   end;
 end;
 
@@ -9124,6 +9313,42 @@ begin
   for k := High(FScopeStack) downto 0 do
     if FScopeStack[k].Kind = skBlock then
       EmitBlockScopeCleanup(k);
+end;
+
+procedure TSSAGenerator.ScanTopLevelLabels(Node: TASTNode; var Depth: Integer);
+// GOTO-unwind worker: in-order walk of a frame's statement stream, recording the names of antLabels at
+// block-depth 0 into FCurrentTopLevelLabels. Only FOR/NEXT change depth here because the FOR body is a
+// FLAT sibling sequence (FOR and NEXT are separate statements with the body in between); IF/DO/WHILE/
+// SCOPE bodies are AST-nested under their own node, so we simply do NOT recurse into them — any label
+// inside is, by construction, not depth-0. antProgram/antStatement are transparent wrappers (recurse,
+// threading Depth so a FOR opened in one wrapper still covers following siblings).
+var
+  i: Integer;
+begin
+  if Node = nil then Exit;
+  case Node.NodeType of
+    antForLoop: Inc(Depth);                         // body follows as siblings until antNext
+    antNext: if Depth > 0 then Dec(Depth);
+    antLabel: if Depth = 0 then FCurrentTopLevelLabels.Add(UpperCase(VarToStr(Node.Value)));
+    antProgram, antStatement:
+      for i := 0 to Node.ChildCount - 1 do
+        ScanTopLevelLabels(Node.GetChild(i), Depth);
+    // antIf / antDoLoop / antScope / antThen / antElse / antProcedureDecl / ... : nested scopes whose
+    // labels are not depth-0 — do not recurse (and procedures collect their own labels separately).
+  end;
+end;
+
+procedure TSSAGenerator.CollectTopLevelLabels(Parent: TASTNode; StartIdx: Integer);
+// GOTO-unwind: (re)build FCurrentTopLevelLabels for the frame whose top-level statements are Parent's
+// children from StartIdx (module: the program root from 0; a procedure: its body, after name+params).
+var
+  i, Depth: Integer;
+begin
+  FCurrentTopLevelLabels.Clear;
+  if Parent = nil then Exit;
+  Depth := 0;
+  for i := StartIdx to Parent.ChildCount - 1 do
+    ScanTopLevelLabels(Parent.GetChild(i), Depth);
 end;
 
 procedure TSSAGenerator.ScopePushFrame(Kind: TScopeKind);
@@ -9300,6 +9525,7 @@ begin
     StageCallArgs(Name, ArgsNode);                    // evaluate args first (inner calls finish)
     EmitXferStore(srtInt, XFER_RESULT_HANDLE_SLOT, RcHandle);
     EmitCallSubLabel(ProcedureLabelName(Name));
+    EmitByrefWriteback(Name, ArgsNode);   // BYREF: copy explicit-BYREF scalar params back into variable args
     Result := RcHandle;
   end
   else
@@ -9387,6 +9613,9 @@ begin
     end
     else
       EmitCallSubLabel(ProcedureLabelName(MethodLabel));  // monomorphic: direct static call
+    // BYREF: copy explicit-BYREF scalar params back into variable args. TmpArgs aligns 1:1 with the
+    // method's params (THIS at index 0, never BYREF), so the shared writeback helper works as-is.
+    EmitByrefWriteback(MethodLabel, TmpArgs);
   finally
     TmpArgs.Free;
   end;
@@ -9695,6 +9924,7 @@ begin
     FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('call'));
   StageCallArgs(Name, ArgListNode);
   EmitCallSubLabel(ProcedureLabelName(Name));
+  EmitByrefWriteback(Name, ArgListNode);   // BYREF: copy explicit-BYREF scalar params back into variable args
 end;
 
 procedure TSSAGenerator.ProcessProcedureCall(Node: TASTNode);
@@ -9759,6 +9989,8 @@ begin
     FCurrentResultHandle := MakeSSAValue(svkNone);
     FCurrentProcLocalRecs.Clear;                          // V5: gather DIM'd local UDTs for dtors
     FCurrentProcByvalRecs.Clear;                          // V5d: BYVAL UDT param copies (filled in prologue)
+    FCurrentProcByrefScalars.Clear;                       // BYREF: explicit-BYREF scalar params (filled in prologue)
+    CollectTopLevelLabels(Proc, 2);                       // GOTO-unwind: this proc's block-depth-0 labels (body starts at child 2)
     CollectLocalRecordVars(Proc);
     // Method body (M4.1): the owner type (before the '.') is THIS's type while lowering here.
     if Pos('.', Name) > 0 then
@@ -9806,7 +10038,15 @@ begin
             FCurrentProcByvalRecs.Add(UpperCase(VarToStr(ParamNodeJ.Value)) + '|' +
                                       UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value)));
           end;
-        end;
+        end
+        // BYREF: an explicit-BYREF *scalar* parameter is written back to its slot at each return so the
+        // caller can copy it into the variable argument. UDT params are excluded (they alias the
+        // caller's instance through the handle — mutations already persist via the heap).
+        else if (ParamNodeJ.Attributes.Values['BYREF'] = '1') and
+                not ((ParamNodeJ.ChildCount >= 1) and (ParamNodeJ.GetChild(0).NodeType = antIdentifier) and
+                     (FindUDT(UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value))) >= 0)) then
+          FCurrentProcByrefScalars.AddObject(UpperCase(VarToStr(ParamNodeJ.Value)),
+                                             TObject(PtrInt((Ord(RT) shl 16) or Slot)));
       end;
     end;
     // V3: a FUNCTION returning a UDT by value receives the caller-allocated result instance handle
@@ -9862,6 +10102,7 @@ begin
       FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel(LabelName + '_END'));
     EmitFrameDestructors;   // V5: destroy local UDTs on the fall-through exit path
     EmitSharedSyncOut;      // M6: publish shared-global changes to their slots before returning
+    EmitByrefParamStore;    // BYREF: publish explicit-BYREF scalar params back to their slots
     EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     if FModernMode then ScopePopFrame;   // FB scope: close the procedure-root frame
@@ -10041,6 +10282,7 @@ begin
           EmitAllBlockScopesCleanup;   // M8: unwind active loop block scopes before the frame exit
           EmitFrameDestructors;   // V5
           EmitSharedSyncOut;      // M6: publish shared-global changes before returning
+          EmitByrefParamStore;    // BYREF: publish explicit-BYREF scalar params back to their slots
           EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           FCurrentBlock := nil;
@@ -10060,6 +10302,7 @@ begin
           EmitAllBlockScopesCleanup;   // M8
           EmitFrameDestructors;   // V5
           EmitSharedSyncOut;      // M6: publish shared-global changes before returning
+          EmitByrefParamStore;    // BYREF: publish explicit-BYREF scalar params back to their slots
           EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           FCurrentBlock := nil;
@@ -10089,6 +10332,7 @@ begin
         EmitAllBlockScopesCleanup;   // M8: unwind active loop block scopes before the frame exit
         EmitFrameDestructors;   // V5: destroy local UDTs before returning
         EmitSharedSyncOut;      // M6: publish shared-global changes before returning
+        EmitByrefParamStore;    // BYREF: publish explicit-BYREF scalar params back to their slots
         EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         FCurrentBlock := nil;
@@ -10104,11 +10348,14 @@ begin
     end;
     antEnd:
     begin
-      // V5b: an explicit `END` at module scope is a program halt — run global destructors first
-      // (reverse construction order), before the ssaEnd. Inside a procedure we skip this (the M2
-      // frame model makes that path an edge case left for later).
+      // V5b: an explicit `END` is a program halt — run global destructors first (reverse construction
+      // order), before the ssaEnd. V5e: an END *inside a procedure* runs them too, but the globals'
+      // module registers are hidden under the active frame, so it reads each handle from its reserved
+      // frame-independent slot (UseSlots=True).
       if not FInProcedure then
-        EmitModuleDestructors;
+        EmitModuleDestructors(False)
+      else
+        EmitModuleDestructors(True);
       EmitInstruction(ssaEnd, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       // PHASE 3 TIER 3: END terminates the current block - no fall-through
@@ -10416,6 +10663,17 @@ begin
   // PRE-COLLECT SUB/FUNCTION DECLARATIONS so CALL sites can resolve parameter info even
   // for procedures defined later in the source (forward references).
   PreCollectProcedures(AST);
+
+  // V5e: reserve a frame-independent int slot for each destructor-bearing global, so an END inside a
+  // SUB/FUNCTION can still destroy it (its module register is hidden under the active frame). Must run
+  // AFTER PreCollectProcedures (TypeNeedsDestruction resolves DESTRUCTOR labels via FProcDecls) and
+  // BEFORE ProcessStatement (which stores each global's handle into its slot at construction). Uses the
+  // int SHARED count (CollectSharedVars, already done) to keep the slot ranges disjoint.
+  AssignModuleDtorSlots;
+
+  // GOTO-unwind: collect the module frame's block-depth-0 labels, so a GOTO out of a FOR/IF/SCOPE body
+  // to a top-level label cleans up the exited block scopes (see ProcessGoto).
+  CollectTopLevelLabels(AST, 0);
 
   // Process AST (DATA statements will be skipped since they're already processed).
   // SUB/FUNCTION declarations are collected (not lowered) during this walk.
