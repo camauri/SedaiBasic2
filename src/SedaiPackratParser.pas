@@ -3825,8 +3825,23 @@ begin
       TypeNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(TypeTok.Value), TypeTok);
       ArrayDecl.AddChild(VarNameNode);
       ArrayDecl.AddChild(TypeNode);          // child[1] is antIdentifier (type) => typed scalar
-      // Optional parameterised construction (M4.4b): "DIM v AS T(args)" — attach the constructor
-      // argument list as child[2]; SSA stages these and calls T's matching CONSTRUCTOR.
+      // Parameterised construction (M4.4b) accepts two equivalent spellings:
+      //   DIM v AS T(args)        -- ctor args directly after the type
+      //   DIM v AS T = T(args)    -- FreeBASIC initializer form (RHS must construct the declared type)
+      // The "= T" prefix simply repositions onto the '(' so the shared arg-parsing block below runs.
+      if Context.Check(ttOpEq) and Assigned(Context.PeekNext) and
+         (Context.PeekNext.TokenType = ttIdentifier) then
+      begin
+        Context.Advance;                     // =
+        if UpperCase(Context.CurrentToken.Value) <> UpperCase(TypeTok.Value) then
+          HandleError('DIM initializer must construct the declared type ''' + TypeTok.Value +
+                      ''' (no conversion yet) — e.g. DIM v AS ' + TypeTok.Value + ' = ' +
+                      TypeTok.Value + '(...)', Context.CurrentToken)
+        else
+          Context.Advance;                   // RHS type name -> now positioned at '(' if present
+      end;
+      // Optional parameterised construction (M4.4b): attach the constructor argument list as
+      // child[2]; SSA stages these and calls T's matching CONSTRUCTOR.
       if Context.Check(ttDelimParOpen) then
       begin
         Context.Advance;                     // (
