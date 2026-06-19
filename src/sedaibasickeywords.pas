@@ -71,6 +71,7 @@ const
   kBYVAL   = 'BYVAL';    // BYVAL: pass parameter by value (copy)
   kBYREF   = 'BYREF';    // BYREF: pass parameter by reference (alias) — the default
   kBASE    = 'BASE';     // BASE(args): explicit base-constructor call inside a child CONSTRUCTOR (M4.4f)
+  kSHARED  = 'SHARED';   // DIM SHARED x: module-level variable visible (read/write) inside SUB/FUNCTION (M6)
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';

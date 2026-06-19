@@ -104,6 +104,8 @@ type
     FCurrentProcLocalRecs: TStringList;  // V5: "VARNAME|TYPENAME" of the proc's DIM'd local UDTs
     FCurrentProcByvalRecs: TStringList;  // V5d: "VARNAME|TYPENAME" of the proc's BYVAL UDT param copies
     FModuleRecordVars: TStringList;      // V5b: "VARNAME|TYPENAME" of module-scope DIM'd UDTs (globals)
+    FSharedVars: TStringList;            // M6: DIM SHARED scalar names -> transfer slot (Objects[]=slot)
+    FInDispatcher: Boolean;              // M6: true while emitting a virtual dispatcher (skip shared sync)
     FCurrentThisType: string;   // M4.1: owner UDT type while lowering a method body (THIS's type)
     // UDT/record support (M3)
     FUDTs: array of TUDTType;            // declared record types
@@ -153,6 +155,9 @@ type
     procedure EmitFrameDestructors;                     // V5: dtor calls for the current frame
     procedure CollectModuleRecordVars(Node: TASTNode);  // V5b: gather module-scope DIM'd UDTs (skip procs)
     procedure EmitModuleDestructors;                    // V5b: dtor calls for globals at program end
+    procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
+    procedure EmitSharedSyncOut;                         // M6: store shared-global registers -> their slots
+    procedure EmitSharedSyncIn;                          // M6: load shared-global slots -> their registers
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
     procedure EmitUserFunctionCall(const Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
@@ -312,6 +317,10 @@ const
   // Int transfer slot carrying the caller-allocated result-instance handle for a FUNCTION that
   // returns a UDT by value (V3 return-by-value): the callee copies its return value into it.
   XFER_RESULT_HANDLE_SLOT = 254;
+  // M6 (SHARED): module-global scalars are backed by dedicated transfer slots (which survive the
+  // bcCallSub frame save/restore). Assigned from this base upward, per bank — kept well below the
+  // result slots (254/255) and above any realistic argument-slot count (parameters use slots 0..N).
+  SHARED_SLOT_BASE = 128;
 
 constructor TSSAGenerator.Create;
 begin
@@ -346,6 +355,9 @@ begin
   FCurrentProcLocalRecs := TStringList.Create;
   FCurrentProcByvalRecs := TStringList.Create;
   FModuleRecordVars := TStringList.Create;
+  FSharedVars := TStringList.Create;
+  FSharedVars.CaseSensitive := False;
+  FInDispatcher := False;
 end;
 
 destructor TSSAGenerator.Destroy;
@@ -363,6 +375,7 @@ begin
   FCurrentProcLocalRecs.Free;
   FCurrentProcByvalRecs.Free;
   FModuleRecordVars.Free;
+  FSharedVars.Free;
   inherited Destroy;
 end;
 
@@ -8348,6 +8361,9 @@ var
   T, m, BaseLbl, DispLbl, ULbl, CallLabel, NextLabel: string;
   HReg, TReg, UidReg, CmpReg: TSSAValue;
 begin
+  // M6: a dispatcher only forwards (it never holds the shared-global registers), so its internal
+  // bcCallSub must NOT emit shared sync — that would clobber the slots the real caller already set.
+  FInDispatcher := True;
   for d := 0 to FNeededDispatchers.Count - 1 do
   begin
     T := Copy(FNeededDispatchers[d], 1, Pos('|', FNeededDispatchers[d]) - 1);
@@ -8394,6 +8410,7 @@ begin
     EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     FCurrentBlock := nil;
   end;
+  FInDispatcher := False;
 end;
 
 procedure TSSAGenerator.RegisterRecordVars(Node: TASTNode);
@@ -8711,6 +8728,80 @@ begin
     VName := Copy(FModuleRecordVars[i], 1, bar - 1);
     TName := Copy(FModuleRecordVars[i], bar + 1, MaxInt);
     EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+  end;
+end;
+
+procedure TSSAGenerator.CollectSharedVars(Node: TASTNode);
+// M6: gather the DIM SHARED scalar variables (marked by the parser with the 'SHARED' attribute) and
+// assign each a dedicated transfer slot in its bank (counted from SHARED_SLOT_BASE upward). Those
+// slots survive the bcCallSub frame save/restore, so a SUB/FUNCTION sees the module's value. v1
+// supports scalar (int/float/string) shared globals only; SHARED arrays/UDTs are left for later.
+var
+  i, k: Integer;
+  Decl: TASTNode;
+  VName: string;
+  Bank: TSSARegisterType;
+  cInt, cFloat, cStr: Integer;
+begin
+  if Node = nil then Exit;
+  cInt := 0; cFloat := 0; cStr := 0;
+  // (single flat pass over the whole AST: DIM SHARED is module-level; nested DIMs aren't marked)
+  if Node.NodeType = antDim then
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(k);
+      if (Decl.NodeType = antArrayDecl) and (Decl.Attributes.Values['SHARED'] = '1') and
+         (Decl.ChildCount >= 2) and (Decl.GetChild(1).NodeType = antIdentifier) then  // typed scalar only
+      begin
+        VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        if (FSharedVars.IndexOf(VName) < 0) and (FindUDT(UpperCase(VarToStr(Decl.GetChild(1).Value))) < 0) then
+        begin
+          Bank := GetVariableType(VName);
+          // Guard the slot range: never reach the reserved result slots (254/255). If a bank runs out
+          // of shared slots the variable is simply left non-shared (a clean limit, not a corruption).
+          case Bank of
+            srtFloat:  if SHARED_SLOT_BASE + cFloat < XFER_RESULT_HANDLE_SLOT then
+                       begin FSharedVars.AddObject(VName, TObject(PtrInt(SHARED_SLOT_BASE + cFloat))); Inc(cFloat); end;
+            srtString: if SHARED_SLOT_BASE + cStr < XFER_RESULT_HANDLE_SLOT then
+                       begin FSharedVars.AddObject(VName, TObject(PtrInt(SHARED_SLOT_BASE + cStr)));   Inc(cStr);   end;
+          else
+            if SHARED_SLOT_BASE + cInt < XFER_RESULT_HANDLE_SLOT then
+            begin FSharedVars.AddObject(VName, TObject(PtrInt(SHARED_SLOT_BASE + cInt))); Inc(cInt); end;
+          end;
+        end;
+      end;
+    end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectSharedVars(Node.GetChild(i));
+end;
+
+procedure TSSAGenerator.EmitSharedSyncOut;
+// M6: store each shared global's current register value into its dedicated transfer slot, so a
+// callee (or the caller, after the call) reads the up-to-date value across the frame save/restore.
+var
+  i: Integer;
+  V: TSSAValue;
+begin
+  if (FSharedVars = nil) or (FSharedVars.Count = 0) then Exit;
+  for i := 0 to FSharedVars.Count - 1 do
+  begin
+    V := GetOrAllocateVariable(FSharedVars[i]);
+    EmitXferStore(V.RegType, PtrInt(FSharedVars.Objects[i]), V);
+  end;
+end;
+
+procedure TSSAGenerator.EmitSharedSyncIn;
+// M6: load each shared global's dedicated transfer slot back into its register (at a SUB prologue,
+// and in the caller right after a call returns) so the register reflects the latest shared value.
+var
+  i: Integer;
+  V: TSSAValue;
+begin
+  if (FSharedVars = nil) or (FSharedVars.Count = 0) then Exit;
+  for i := 0 to FSharedVars.Count - 1 do
+  begin
+    V := GetOrAllocateVariable(FSharedVars[i]);
+    EmitXferLoad(V.RegType, PtrInt(FSharedVars.Objects[i]), V);
   end;
 end;
 
@@ -9122,6 +9213,10 @@ var
 begin
   if not Assigned(FCurrentBlock) then
     FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('call'));
+  // M6: push shared globals to their slots before the call so the callee sees the latest values
+  // (the callee's prologue loads them back). Skipped inside a virtual dispatcher, which only forwards
+  // and never holds the shared registers — syncing there would clobber the slots with stale data.
+  if not FInDispatcher then EmitSharedSyncOut;
   EmitInstruction(ssaCallSub, MakeSSALabel(LabelName), MakeSSAValue(svkNone),
                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   CallBlock := FCurrentBlock;
@@ -9141,6 +9236,8 @@ begin
     end;
   end;
   FCurrentBlock := ContBlock;
+  // M6: reload shared globals from their slots so the caller observes any change the callee made.
+  if not FInDispatcher then EmitSharedSyncIn;
 end;
 
 procedure TSSAGenerator.EmitProcedureCall(const Name: string; ArgListNode: TASTNode);
@@ -9264,6 +9361,11 @@ begin
       EmitXferLoad(srtInt, XFER_RESULT_HANDLE_SLOT, FCurrentResultHandle);
     end;
 
+    // M6: prologue — load shared globals from their slots into their registers, so the body sees the
+    // caller's values (the frame save/restore otherwise hides them). Done before auto-chaining so any
+    // base ctor call (which syncs around itself) starts from valid shared registers.
+    EmitSharedSyncIn;
+
     // M4.4d: base-constructor auto-chaining. If this is a constructor and its owner type has a
     // parent with a default (#0) constructor, run that base ctor on THIS before the body — the
     // parent's own prologue chains further up the inheritance chain. Inherited fields sit at the
@@ -9290,6 +9392,7 @@ begin
     if not Assigned(FCurrentBlock) then
       FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel(LabelName + '_END'));
     EmitFrameDestructors;   // V5: destroy local UDTs on the fall-through exit path
+    EmitSharedSyncOut;      // M6: publish shared-global changes to their slots before returning
     EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     FCurrentBlock := nil;   // procedure body terminated
@@ -9466,6 +9569,7 @@ begin
         if FInProcedure and ((Pos('SUB', ExitKind) > 0) or (Pos('FUNCTION', ExitKind) > 0)) then
         begin
           EmitFrameDestructors;   // V5
+          EmitSharedSyncOut;      // M6: publish shared-global changes before returning
           EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           FCurrentBlock := nil;
@@ -9481,6 +9585,7 @@ begin
         begin
           // Bare EXIT inside a procedure with no enclosing loop -> frame return.
           EmitFrameDestructors;   // V5
+          EmitSharedSyncOut;      // M6: publish shared-global changes before returning
           EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           FCurrentBlock := nil;
@@ -9508,6 +9613,7 @@ begin
             EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, RetVal);
         end;
         EmitFrameDestructors;   // V5: destroy local UDTs before returning
+        EmitSharedSyncOut;      // M6: publish shared-global changes before returning
         EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         FCurrentBlock := nil;
@@ -9799,6 +9905,11 @@ begin
   // vars use their declared bank.
   RegisterUDTs(AST);
   RegisterRecordVars(AST);
+
+  // M6: collect DIM SHARED scalars and assign them dedicated transfer slots (runs after type
+  // registration so each var's bank is known). These slots survive the bcCallSub save/restore.
+  FSharedVars.Clear;
+  CollectSharedVars(AST);
 
   // V5b: collect module-scope DIM'd UDTs (globals) once, so both an explicit `END` statement and the
   // implicit fall-through halt can emit their destructor calls (in reverse construction order).

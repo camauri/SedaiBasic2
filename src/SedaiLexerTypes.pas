@@ -166,6 +166,7 @@ type
     ttExtends,                // EXTENDS (TYPE Child EXTENDS Parent: single inheritance)
     ttParamMode,              // BYVAL / BYREF (parameter passing convention)
     ttBaseCall,               // BASE (explicit base-constructor call inside a child CONSTRUCTOR)
+    ttSharedDecl,             // SHARED (DIM SHARED: module global visible inside SUB/FUNCTION)
 
     // === DATA HANDLING ===
     ttDataAssignment,         // LET, SET, :=
@@ -361,7 +362,7 @@ const
   KEYWORD_TOKENS: TTokenTypeSet = [
     ttKeyword, ttLoopBlockStart, ttLoopBlockEnd,
     ttBlockBegin, ttBlockEnd, ttProcedureStart, ttProcedureEnd, ttCallSub,
-    ttTypeDecl, ttAsType, ttWithBlock, ttExtends, ttParamMode, ttBaseCall,
+    ttTypeDecl, ttAsType, ttWithBlock, ttExtends, ttParamMode, ttBaseCall, ttSharedDecl,
     ttJumpKeyword, ttDataDeclaration, ttDataAssignment, ttCommentRemark,
     ttBitwiseOperator
   ];

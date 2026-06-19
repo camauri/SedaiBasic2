@@ -3841,10 +3841,15 @@ function TPackratParser.ParseDimStatement: TASTNode;
 var
   Token, NameTok, TypeTok: TLexerToken;
   ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr: TASTNode;
+  IsShared: Boolean;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
   Context.Advance; // Consume DIM
+  // M6: "DIM SHARED ..." — the declared variables are module globals visible (read/write) inside
+  // SUB/FUNCTION bodies. Marked on each decl with the 'SHARED' attribute for the SSA pre-scan.
+  IsShared := Context.Check(ttSharedDecl);
+  if IsShared then Context.Advance;   // consume SHARED
 
   // Parse declarations separated by commas. Each is either:
   //   name AS typename   -> typed scalar (UDT record or explicit builtin type)
@@ -3903,6 +3908,7 @@ begin
         if Context.Check(ttDelimParClose) then Context.Advance;   // )
         ArrayDecl.AddChild(CtorArgs);        // child[2] = antArgumentList (ctor args)
       end;
+      if IsShared then ArrayDecl.Attributes.Values['SHARED'] := '1';   // M6: module-global scalar
       DoNodeCreated(ArrayDecl);
       Result.AddChild(ArrayDecl);
     end
@@ -3910,7 +3916,10 @@ begin
     begin
       ArrayDecl := ParseArrayDeclaration;
       if Assigned(ArrayDecl) then
-        Result.AddChild(ArrayDecl)
+      begin
+        if IsShared then ArrayDecl.Attributes.Values['SHARED'] := '1';
+        Result.AddChild(ArrayDecl);
+      end
       else
       begin
         HandleError('Expected array declaration after DIM', Context.CurrentToken);

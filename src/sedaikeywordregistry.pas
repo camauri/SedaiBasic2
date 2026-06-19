@@ -1593,6 +1593,7 @@ begin
  RegisterKeyword(kWITH,     ttWithBlock,      'With block',         kcCodeBlockConstructs);
  RegisterKeyword(kEXTENDS,  ttExtends,        'Type inheritance',   kcProcedures);
  RegisterKeyword(kBASE,     ttBaseCall,       'Base constructor call', kcProcedures);
+ RegisterKeyword(kSHARED,   ttSharedDecl,     'Shared module global',  kcProcedures);
 
  // === FLOW CONTROL - JUMP RELATED STATEMENTS ===
  RegisterKeyword(kEXIT,   ttJumpReturn,      'Exit statement',   kcJumpFlowControl);
