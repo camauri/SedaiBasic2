@@ -281,7 +281,11 @@ begin
     ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString,
     // M8: block-scope mark push/pop mutate the record high-water mark — never elide them.
-    ssaRecMarkPush, ssaRecMarkPop:
+    ssaRecMarkPush, ssaRecMarkPop,
+    // Division / modulo can raise a runtime "division by zero" error that TRAP can catch, so the
+    // operation is observable even when its result is unused — DCE must not elide it. (Without this,
+    // a dead `X = 1/0` was removed, the error never fired, and the TRAP handler was skipped.)
+    ssaDivInt, ssaDivFloat, ssaModInt, ssaModFloat:
       Result := True;
 
     // Program termination and system state - always live
