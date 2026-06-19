@@ -165,6 +165,7 @@ type
     procedure EmitBlockScopeCleanup(Idx: Integer);       // M8: destructors + mark pop for scope Idx (no drop)
     procedure EmitAllBlockScopesCleanup;                 // M8: unwind every active block scope (early frame exit)
     procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
+    procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
     procedure EmitSharedSyncOut;                         // M6: store shared-global registers -> their slots
     procedure EmitSharedSyncIn;                          // M6: load shared-global slots -> their registers
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
@@ -8941,20 +8942,40 @@ begin
     EmitBlockScopeCleanup(k);
 end;
 
+procedure TSSAGenerator.AddSharedVarSlot(const VName: string);
+// M6: assign one scalar (int/float/string) global its dedicated transfer slot, counted per-bank from
+// SHARED_SLOT_BASE upward across the WHOLE module (FSharedVars is the single source of truth, so the
+// per-bank count is derived from it — never from a local counter that resets between AST nodes). The
+// slot survives the bcCallSub frame save/restore. UDTs are already shared via the record heap (their
+// handle is a plain int), and already-shared names are idempotent no-ops.
+var
+  Bank: TSSARegisterType;
+  cnt, j: Integer;
+begin
+  if FSharedVars.IndexOf(VName) >= 0 then Exit;        // already shared
+  if VarRecordTypeName(VName) <> '' then Exit;         // UDT: shared via the record heap, not a slot
+  Bank := GetVariableType(VName);
+  cnt := 0;
+  for j := 0 to FSharedVars.Count - 1 do
+    if GetVariableType(FSharedVars[j]) = Bank then Inc(cnt);
+  // Guard the slot range: never reach the reserved result slots (254/255). If a bank runs out of
+  // shared slots the variable is simply left non-shared (a clean limit, not a corruption).
+  if SHARED_SLOT_BASE + cnt < XFER_RESULT_HANDLE_SLOT then
+    FSharedVars.AddObject(VName, TObject(PtrInt(SHARED_SLOT_BASE + cnt)));
+end;
+
 procedure TSSAGenerator.CollectSharedVars(Node: TASTNode);
-// M6: gather the DIM SHARED scalar variables (marked by the parser with the 'SHARED' attribute) and
-// assign each a dedicated transfer slot in its bank (counted from SHARED_SLOT_BASE upward). Those
-// slots survive the bcCallSub frame save/restore, so a SUB/FUNCTION sees the module's value. v1
-// supports scalar (int/float/string) shared globals only; SHARED arrays/UDTs are left for later.
+// M6: gather the DIM SHARED scalar variables (parser marks the antArrayDecl with the 'SHARED'
+// attribute) and assign each a dedicated transfer slot via AddSharedVarSlot. Those slots survive the
+// bcCallSub frame save/restore, so a SUB/FUNCTION sees the module's value. v1 supports scalar
+// (int/float/string) shared globals only; SHARED arrays are left for later (UDTs are already shared
+// via the record heap). DIM SHARED is the only sharing mechanism (the QuickBASIC `SHARED x` statement
+// inside a procedure is not a -lang fb feature).
 var
   i, k: Integer;
   Decl: TASTNode;
-  VName: string;
-  Bank: TSSARegisterType;
-  cInt, cFloat, cStr: Integer;
 begin
   if Node = nil then Exit;
-  cInt := 0; cFloat := 0; cStr := 0;
   // (single flat pass over the whole AST: DIM SHARED is module-level; nested DIMs aren't marked)
   if Node.NodeType = antDim then
     for k := 0 to Node.ChildCount - 1 do
@@ -8962,24 +8983,7 @@ begin
       Decl := Node.GetChild(k);
       if (Decl.NodeType = antArrayDecl) and (Decl.Attributes.Values['SHARED'] = '1') and
          (Decl.ChildCount >= 2) and (Decl.GetChild(1).NodeType = antIdentifier) then  // typed scalar only
-      begin
-        VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
-        if (FSharedVars.IndexOf(VName) < 0) and (FindUDT(UpperCase(VarToStr(Decl.GetChild(1).Value))) < 0) then
-        begin
-          Bank := GetVariableType(VName);
-          // Guard the slot range: never reach the reserved result slots (254/255). If a bank runs out
-          // of shared slots the variable is simply left non-shared (a clean limit, not a corruption).
-          case Bank of
-            srtFloat:  if SHARED_SLOT_BASE + cFloat < XFER_RESULT_HANDLE_SLOT then
-                       begin FSharedVars.AddObject(VName, TObject(PtrInt(SHARED_SLOT_BASE + cFloat))); Inc(cFloat); end;
-            srtString: if SHARED_SLOT_BASE + cStr < XFER_RESULT_HANDLE_SLOT then
-                       begin FSharedVars.AddObject(VName, TObject(PtrInt(SHARED_SLOT_BASE + cStr)));   Inc(cStr);   end;
-          else
-            if SHARED_SLOT_BASE + cInt < XFER_RESULT_HANDLE_SLOT then
-            begin FSharedVars.AddObject(VName, TObject(PtrInt(SHARED_SLOT_BASE + cInt))); Inc(cInt); end;
-          end;
-        end;
-      end;
+        AddSharedVarSlot(UpperCase(VarToStr(Decl.GetChild(0).Value)));
     end;
   for i := 0 to Node.ChildCount - 1 do
     CollectSharedVars(Node.GetChild(i));
