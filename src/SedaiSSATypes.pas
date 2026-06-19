@@ -1230,7 +1230,10 @@ function TSSAProgram.RunDBE: Integer;
 var
   DBE: TDeadBlockElimination;
 begin
-  if not GSSAOptimizationsEnabled then Exit(0);
+  // NB: dead-block elimination is NOT gated by --no-opt — it removes unreachable/orphan blocks that
+  // would otherwise make the dominator-tree construction fail (multiple entry points), so it is a
+  // structural prerequisite, not a value optimization. Keeping it in the no-opt path keeps that path
+  // valid as a differential reference.
   { Dead block elimination - removes unreachable blocks before dominator tree construction }
 
   Result := 0;
