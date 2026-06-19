@@ -102,6 +102,8 @@ type
     FCurrentProcRetRecType: string;   // V3: UDT type the current FUNCTION returns by value (else '')
     FCurrentResultHandle: TSSAValue;  // V3: register holding the caller's result-instance handle
     FCurrentProcLocalRecs: TStringList;  // V5: "VARNAME|TYPENAME" of the proc's DIM'd local UDTs
+    FCurrentProcByvalRecs: TStringList;  // V5d: "VARNAME|TYPENAME" of the proc's BYVAL UDT param copies
+    FModuleRecordVars: TStringList;      // V5b: "VARNAME|TYPENAME" of module-scope DIM'd UDTs (globals)
     FCurrentThisType: string;   // M4.1: owner UDT type while lowering a method body (THIS's type)
     // UDT/record support (M3)
     FUDTs: array of TUDTType;            // declared record types
@@ -147,6 +149,8 @@ type
     procedure EmitDestructorCall(const HandleVal: TSSAValue; const TypeName: string);  // V5
     procedure CollectLocalRecordVars(Node: TASTNode);  // V5: gather a proc body's DIM'd local UDTs
     procedure EmitFrameDestructors;                     // V5: dtor calls for the current frame
+    procedure CollectModuleRecordVars(Node: TASTNode);  // V5b: gather module-scope DIM'd UDTs (skip procs)
+    procedure EmitModuleDestructors;                    // V5b: dtor calls for globals at program end
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
     procedure EmitUserFunctionCall(const Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
@@ -338,6 +342,8 @@ begin
   FNeededDispatchers.Duplicates := dupIgnore;
   FNeededDispatchers.Sorted := True;
   FCurrentProcLocalRecs := TStringList.Create;
+  FCurrentProcByvalRecs := TStringList.Create;
+  FModuleRecordVars := TStringList.Create;
 end;
 
 destructor TSSAGenerator.Destroy;
@@ -353,6 +359,8 @@ begin
   FArrayRecordType.Free;
   FNeededDispatchers.Free;
   FCurrentProcLocalRecs.Free;
+  FCurrentProcByvalRecs.Free;
+  FModuleRecordVars.Free;
   inherited Destroy;
 end;
 
@@ -8511,13 +8519,34 @@ procedure TSSAGenerator.EmitDestructorCall(const HandleVal: TSSAValue; const Typ
 // V5: if TypeName (or an ancestor) declares a DESTRUCTOR, call it on the instance (THIS handle in
 // int transfer slot 0). Destructors take no arguments. Emitted at scope exit, before the records
 // are reclaimed (V2), so the body still sees valid storage.
+// V5c: destruction is recursive — after running the object's own destructor body, each nested-UDT
+// member is destroyed in reverse declaration order (C++-like: destructor, then members). This runs
+// even when TypeName has no destructor of its own, so that nested members with destructors still fire.
 var
   Lbl: string;
+  UDTIdx, i, Slot: Integer;
+  NestedHandle: TSSAValue;
 begin
+  UDTIdx := FindUDT(UpperCase(TypeName));
+  // 1) the object's own destructor body first (so it still sees its members alive).
   Lbl := ResolveMethodLabel(TypeName, 'DESTRUCTOR');
-  if Lbl = '' then Exit;
-  EmitXferStore(srtInt, 0, HandleVal);
-  EmitCallSubLabel(ProcedureLabelName(Lbl));
+  if Lbl <> '' then
+  begin
+    EmitXferStore(srtInt, 0, HandleVal);
+    EmitCallSubLabel(ProcedureLabelName(Lbl));
+  end;
+  // 2) then destroy nested-UDT members, reverse declaration order (inherited fields included — they
+  //    are part of FUDTs[UDTIdx].Fields via the prefix layout, so a single pass covers the whole object).
+  if UDTIdx >= 0 then
+    for i := High(FUDTs[UDTIdx].Fields) downto 0 do
+      if FUDTs[UDTIdx].Fields[i].NestedType <> '' then
+      begin
+        Slot := FUDTs[UDTIdx].Fields[i].Slot;
+        NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaRecordLoadInt, NestedHandle, HandleVal,
+                        MakeSSAValue(svkNone), MakeSSAConstInt(Slot));   // load nested member handle
+        EmitDestructorCall(NestedHandle, FUDTs[UDTIdx].Fields[i].NestedType);
+      end;
 end;
 
 procedure TSSAGenerator.CollectLocalRecordVars(Node: TASTNode);
@@ -8551,17 +8580,79 @@ end;
 procedure TSSAGenerator.EmitFrameDestructors;
 // V5: emit destructor calls for the current procedure's DIM'd local UDTs, in reverse construction
 // order, on each frame-exit path. Each acts on the variable's current instance handle.
+// V5d: BYVAL UDT parameter copies (V4) are destroyed too — after the locals (they were "constructed"
+// first, at entry, so they die last), also in reverse order.
 var
   i, bar: Integer;
   VName, TName: string;
 begin
-  if (FCurrentProcLocalRecs = nil) or (FCurrentProcLocalRecs.Count = 0) then Exit;
-  for i := FCurrentProcLocalRecs.Count - 1 downto 0 do
+  if (FCurrentProcLocalRecs <> nil) then
+    for i := FCurrentProcLocalRecs.Count - 1 downto 0 do
+    begin
+      bar := Pos('|', FCurrentProcLocalRecs[i]);
+      if bar <= 0 then Continue;
+      VName := Copy(FCurrentProcLocalRecs[i], 1, bar - 1);
+      TName := Copy(FCurrentProcLocalRecs[i], bar + 1, MaxInt);
+      EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+    end;
+  if (FCurrentProcByvalRecs <> nil) then
+    for i := FCurrentProcByvalRecs.Count - 1 downto 0 do
+    begin
+      bar := Pos('|', FCurrentProcByvalRecs[i]);
+      if bar <= 0 then Continue;
+      VName := Copy(FCurrentProcByvalRecs[i], 1, bar - 1);
+      TName := Copy(FCurrentProcByvalRecs[i], bar + 1, MaxInt);
+      EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+    end;
+end;
+
+procedure TSSAGenerator.CollectModuleRecordVars(Node: TASTNode);
+// V5b: recursively gather the module-scope DIM'd UDT (record) variables (the program's globals), in
+// textual order, as "VARNAME|TYPENAME" in FModuleRecordVars. Mirrors CollectLocalRecordVars but does
+// NOT descend into procedure bodies (their DIMs are proc-local, handled by EmitFrameDestructors) so
+// only true globals are collected.
+var
+  k, c: Integer;
+  Decl: TASTNode;
+  VName, TName: string;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType = antProcedureDecl then Exit;   // proc-local DIMs are not globals
+  if Node.NodeType = antDim then
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(k);
+      if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 2) and
+         (Decl.GetChild(1).NodeType = antIdentifier) then          // DIM v AS T (typed scalar)
+      begin
+        TName := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        if FindUDT(TName) >= 0 then
+        begin
+          VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+          FModuleRecordVars.Add(VName + '|' + TName);
+        end;
+      end;
+    end;
+  for c := 0 to Node.ChildCount - 1 do
+    CollectModuleRecordVars(Node.GetChild(c));   // recurse into nested blocks (IF/FOR/...), not procs
+end;
+
+procedure TSSAGenerator.EmitModuleDestructors;
+// V5b: emit destructor calls for the program's module-scope DIM'd UDTs (globals), in reverse
+// construction order, at program end (just before the implicit halt). Globals live below every frame
+// mark, so V2 never reclaims them; their destructors run here for deterministic RAII at shutdown.
+// Storage is not freed (the program is ending) — only the destructor's observable effects (e.g. I/O).
+var
+  i, bar: Integer;
+  VName, TName: string;
+begin
+  if (FModuleRecordVars = nil) or (FModuleRecordVars.Count = 0) then Exit;
+  for i := FModuleRecordVars.Count - 1 downto 0 do
   begin
-    bar := Pos('|', FCurrentProcLocalRecs[i]);
+    bar := Pos('|', FModuleRecordVars[i]);
     if bar <= 0 then Continue;
-    VName := Copy(FCurrentProcLocalRecs[i], 1, bar - 1);
-    TName := Copy(FCurrentProcLocalRecs[i], bar + 1, MaxInt);
+    VName := Copy(FModuleRecordVars[i], 1, bar - 1);
+    TName := Copy(FModuleRecordVars[i], bar + 1, MaxInt);
     EmitDestructorCall(GetOrAllocateVariable(VName), TName);
   end;
 end;
@@ -9044,6 +9135,7 @@ begin
     FCurrentProcRetRecType := VarRecordTypeName(Name);   // V3: '' unless it returns a UDT by value
     FCurrentResultHandle := MakeSSAValue(svkNone);
     FCurrentProcLocalRecs.Clear;                          // V5: gather DIM'd local UDTs for dtors
+    FCurrentProcByvalRecs.Clear;                          // V5d: BYVAL UDT param copies (filled in prologue)
     CollectLocalRecordVars(Proc);
     // Method body (M4.1): the owner type (before the '.') is THIS's type while lowering here.
     if Pos('.', Name) > 0 then
@@ -9081,6 +9173,9 @@ begin
             EmitRecordCopy(LcHandle, ParamReg, PUDT);              // copy caller's record in
             EmitInstruction(ssaCopyInt, ParamReg, LcHandle,        // param var := local copy handle
                             MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            // V5d: this BYVAL copy is frame-owned -> destruct it at frame exit (after the locals).
+            FCurrentProcByvalRecs.Add(UpperCase(VarToStr(ParamNodeJ.Value)) + '|' +
+                                      UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value)));
           end;
         end;
       end;
@@ -9334,6 +9429,11 @@ begin
     end;
     antEnd:
     begin
+      // V5b: an explicit `END` at module scope is a program halt — run global destructors first
+      // (reverse construction order), before the ssaEnd. Inside a procedure we skip this (the M2
+      // frame model makes that path an edge case left for later).
+      if not FInProcedure then
+        EmitModuleDestructors;
       EmitInstruction(ssaEnd, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       // PHASE 3 TIER 3: END terminates the current block - no fall-through
@@ -9606,6 +9706,11 @@ begin
   RegisterUDTs(AST);
   RegisterRecordVars(AST);
 
+  // V5b: collect module-scope DIM'd UDTs (globals) once, so both an explicit `END` statement and the
+  // implicit fall-through halt can emit their destructor calls (in reverse construction order).
+  FModuleRecordVars.Clear;
+  CollectModuleRecordVars(AST);
+
   PreAllocateVariables(AST);
   {$IFDEF DEBUG_SSA}
   if DebugSSA then
@@ -9638,6 +9743,11 @@ begin
     begin
       // Switch to last block to add END there
       FCurrentBlock := LastBlock;
+      // V5b: run destructors for module-scope DIM'd UDTs (globals) on the normal fall-through exit,
+      // before halting. The dtor calls split the block (bcCallSub), so END goes to FCurrentBlock
+      // after they are emitted. Globals' storage is not reclaimed (program is ending); only the
+      // destructors' observable effects run. (An explicit `END` statement runs them via antEnd.)
+      EmitModuleDestructors;
       EmitInstruction(ssaEnd, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
