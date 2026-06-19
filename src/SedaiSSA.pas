@@ -123,7 +123,8 @@ type
     FBlockScopes: array of TStringList;  // M8: per active loop body, the "VAR|TYPE" of its DIM'd UDTs
     FBlockHandledVars: TStringList;      // M8: var names destructed block-scoped (excluded from frame/module dtors)
     FModernMode: Boolean;                // FB scope: True = MODERN (lexical scope); False = CLASSIC (global-by-name)
-    FScopeStack: array of TScopeFrame;   // FB scope: module -> proc-root -> blocks (innermost = High); inert in CLASSIC
+    FScopeStack: array of TScopeFrame;   // FB scope: proc-root + block frames (innermost = High); module = FVarMap
+    FScopeSerial: Integer;               // FB scope: monotonic id for unique scoped internal names (NAME@serial)
     FCurrentThisType: string;   // M4.1: owner UDT type while lowering a method body (THIS's type)
     // UDT/record support (M3)
     FUDTs: array of TUDTType;            // declared record types
@@ -135,6 +136,13 @@ type
     function GenerateUniqueLabel(const Prefix: string): string;
     function GetVariableType(const VarName: string): TSSARegisterType;
     function GetOrAllocateVariable(const VarName: string): TSSAValue;
+    // FB lexical scope (MODERN). ResolveExisting walks FScopeStack innermost->outermost (stopping at a
+    // proc-root for non-shared names) then falls back to the module namespace (FVarMap). BindOrResolve
+    // resolves a use, or binds a new register: explicit DIM in the innermost frame (shadowing), implicit
+    // first-use at the nearest proc-root/module. DeclareVariable is the explicit-declaration entry point.
+    function ResolveExisting(const VarName: string; out Reg: TSSAValue): Boolean;
+    function BindOrResolve(const VarName: string; IsExplicitDecl: Boolean): TSSAValue;
+    function DeclareVariable(const VarName: string): TSSAValue;
     procedure PreAllocateVariables(Node: TASTNode);  // Pre-scan AST to allocate all variable registers
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
     procedure ProcessStatement(Node: TASTNode);
@@ -447,6 +455,99 @@ begin
     Result := srtFloat;  // Default BASIC type
 end;
 
+function TSSAGenerator.ResolveExisting(const VarName: string; out Reg: TSSAValue): Boolean;
+// FB lexical scope (MODERN): find an existing binding for VarName. Walk the scope stack
+// innermost->outermost; stop at a proc-root for a non-shared name (so a plain module DIM is invisible
+// inside a SUB), but let DIM SHARED globals fall through to the module namespace. The module namespace
+// is FVarMap (case-insensitive). Returns False if the name is not yet bound anywhere visible here.
+var
+  f, idx: Integer;
+  nameU: string;
+  isShared: Boolean;
+  pk: PtrInt;
+begin
+  Result := False;
+  nameU := UpperCase(VarName);
+  isShared := FSharedVars.IndexOf(nameU) >= 0;
+  for f := High(FScopeStack) downto 0 do
+  begin
+    idx := FScopeStack[f].Bindings.IndexOf(nameU);
+    if idx >= 0 then
+    begin
+      pk := PtrInt(FScopeStack[f].Bindings.Objects[idx]);
+      Reg := MakeSSARegister(TSSARegisterType(pk shr 16), pk and $FFFF);
+      Exit(True);
+    end;
+    if (FScopeStack[f].Kind = skProcRoot) and not isShared then
+      Exit(False);   // proc isolation: do not consult the module namespace from inside a procedure
+  end;
+  idx := FVarMap.IndexOf(VarName);
+  if idx >= 0 then
+  begin
+    pk := PtrInt(FVarMap.Objects[idx]);
+    Reg := MakeSSARegister(TSSARegisterType(pk shr 16), pk and $FFFF);
+    Result := True;
+  end;
+end;
+
+function TSSAGenerator.BindOrResolve(const VarName: string; IsExplicitDecl: Boolean): TSSAValue;
+// FB lexical scope (MODERN): resolve a use, or allocate+bind a new register. An explicit DIM binds in
+// the innermost scope frame (shadowing any outer same-name binding); an implicit first-use (or an
+// explicit DIM at pure module level) resolves if already present, else binds at the nearest proc-root,
+// else in the module namespace (FVarMap). Scoped bindings get a unique internal name (NAME@serial) so
+// the optimizer's variable->register map never collides across scopes/shadows.
+var
+  nameU, internalName: string;
+  targetIdx, f: Integer;
+  RegType: TSSARegisterType;
+  RegIndex: Integer;
+  pk: PtrInt;
+begin
+  // A use, or an explicit declaration at module level, first tries to resolve an existing binding.
+  if (not IsExplicitDecl) or (Length(FScopeStack) = 0) then
+    if ResolveExisting(VarName, Result) then Exit;
+
+  nameU := UpperCase(VarName);
+  // Choose the binding frame: explicit DIM -> innermost frame; implicit -> nearest proc-root (else module).
+  if IsExplicitDecl and (Length(FScopeStack) > 0) then
+    targetIdx := High(FScopeStack)
+  else
+  begin
+    targetIdx := -1;
+    for f := High(FScopeStack) downto 0 do
+      if FScopeStack[f].Kind = skProcRoot then begin targetIdx := f; Break; end;
+  end;
+
+  RegType := GetVariableType(VarName);
+  RegIndex := FProgram.AllocRegister(RegType);
+  pk := (Ord(RegType) shl 16) or RegIndex;
+
+  if targetIdx >= 0 then
+  begin
+    FScopeStack[targetIdx].Bindings.AddObject(nameU, TObject(pk));
+    Inc(FScopeSerial);
+    internalName := VarName + '@' + IntToStr(FScopeSerial);
+    FProgram.AddVariable(internalName);
+    FProgram.MapVariableToRegister(internalName, RegType, RegIndex);
+  end
+  else
+  begin
+    // Module / global namespace (legacy global-by-name; bare source name).
+    FVarMap.AddObject(VarName, TObject(pk));
+    FProgram.AddVariable(VarName);
+    FProgram.MapVariableToRegister(VarName, RegType, RegIndex);
+  end;
+  Result := MakeSSARegister(RegType, RegIndex);
+end;
+
+function TSSAGenerator.DeclareVariable(const VarName: string): TSSAValue;
+// FB lexical scope: explicit-declaration entry point (DIM/REDIM/STATIC/VAR, parameters, FUNCTION
+// result, FOR..AS counter). In CLASSIC it is just the legacy allocate-or-reuse.
+begin
+  if not FModernMode then Exit(GetOrAllocateVariable(VarName));
+  Result := BindOrResolve(VarName, True);
+end;
+
 function TSSAGenerator.GetOrAllocateVariable(const VarName: string): TSSAValue;
 var
   Idx: Integer;
@@ -454,6 +555,13 @@ var
   RegIndex: Integer;
   PackedInfo: PtrInt;
 begin
+  // MODERN: route through the scope-aware resolver (a use / implicit first-use).
+  if FModernMode then
+  begin
+    Result := BindOrResolve(VarName, False);
+    Exit;
+  end;
+  // CLASSIC: legacy global-by-name (unchanged BASIC v7 semantics).
   Idx := FVarMap.IndexOf(VarName);
   if Idx >= 0 then
   begin
@@ -10200,10 +10308,10 @@ begin
   FProgram := TSSAProgram.Create;
   FLabelCounter := 0;
 
-  // FB lexical scope: reset the scope stack and, in MODERN mode, open the outermost module (global)
-  // frame. In CLASSIC mode the stack stays empty and name resolution remains global-by-name.
+  // FB lexical scope: reset the scope stack (module scope is FVarMap itself; the stack holds only
+  // proc-root and block frames, pushed during lowering in MODERN mode). Inert in CLASSIC.
   while Length(FScopeStack) > 0 do ScopePopFrame;
-  if FModernMode then ScopePushFrame(skModule);
+  FScopeSerial := 0;
 
   // PRE-ALLOCATE ALL VARIABLE REGISTERS FIRST
   // This prevents conflicts between variable registers and temporary expression registers
