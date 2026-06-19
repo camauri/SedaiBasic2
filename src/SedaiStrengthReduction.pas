@@ -230,6 +230,15 @@ begin
 
   // Phase 2: Loop-based induction variable strength reduction
   // Transforms: FOR I = init TO n: J = I * const -> J starts at init*const, stride = step*const
+  // DISABLED (2026-06): this pass MISCOMPILES `IV * const` in DO/LOOP (and likely WHILE) loops, where
+  // the induction variable is updated at the top of the body — its pre-header / back-edge / IV-init
+  // analysis assumes the FOR shape (IV updated at the back-edge) and produces a wrong accumulator
+  // (e.g. `R.ID = N * 10` reads 1,4 instead of 10,20). The bug is independent of M8 (it reproduces
+  // with block-scope marks off and not in the equivalent FOR loop). It is a perf-only, output-
+  // preserving optimization, so disabling it cannot change correct results; re-enable by defining
+  // ENABLE_IV_STRENGTH_RED only after the loop-structure analysis is reworked. (Same stance as the
+  // disabled GVN/CSE.) Phase 1 above (x*2 → x+x) is unaffected.
+  {$IFDEF ENABLE_IV_STRENGTH_RED}
   BuildDominatorMap;
   if FDominatorMap.Count > 0 then
   begin
@@ -241,6 +250,7 @@ begin
         ReduceIVMultiplications;
     end;
   end;
+  {$ENDIF}
 
   {$IFDEF DEBUG_STRENGTH}
   if DebugStrength then
