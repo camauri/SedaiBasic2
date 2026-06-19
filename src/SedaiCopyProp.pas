@@ -128,7 +128,8 @@ function TCopyPropagation.TryReplaceCopy(const RegVal: TSSAValue;
   CurrBlock: TSSABasicBlock; CurrInstrIdx: Integer; out Replaced: TSSAValue): Boolean;
 var
   Instr: TSSAInstruction;
-  j: Integer;
+  j, k: Integer;
+  Src: TSSAValue;
 begin
   // Conservative approach: only look BACKWARDS in the current block
   // This ensures we only propagate copies that are defined before use
@@ -154,7 +155,18 @@ begin
       begin
         if Instr.Src1.Kind = svkRegister then
         begin
-          Replaced := Instr.Src1;
+          Src := Instr.Src1;
+          // SOUNDNESS: do not propagate the copy if its SOURCE is redefined between the copy (j)
+          // and this use (CurrInstrIdx). Under global-variable semantics (Version=0) the copy's
+          // source register can be reassigned in between — e.g. the swap  T=A : A=B : B=T  would
+          // otherwise rewrite  B=T  to  B=A  and read A's NEW value. (In versioned SSA the source
+          // would carry a distinct version and this never triggers; the check is just conservative.)
+          for k := j + 1 to CurrInstrIdx - 1 do
+            if (CurrBlock.Instructions[k].Dest.Kind = svkRegister) and
+               (CurrBlock.Instructions[k].Dest.RegIndex = Src.RegIndex) and
+               (CurrBlock.Instructions[k].Dest.RegType = Src.RegType) then
+              Exit(False);   // source clobbered in the gap -> unsafe to propagate
+          Replaced := Src;
           Exit(True);
         end;
       end;
