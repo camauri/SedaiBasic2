@@ -1188,7 +1188,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `ENUM...END ENUM` | ✗ | User defined enumeration of values |
-| `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, record params, `v.a.b`, FUNCTION-returns-UDT, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: single inheritance `EXTENDS`. M4.3: virtual dispatch (runtime type-id). `NEW`/ctor/dtor deferred (M4.4) |
+| `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR`. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope-bound lifetime (RAII). Still deferred: `NEW`, ctor overloading, block-scope/global destructors |
 | `CLASS...END CLASS` | ✗ | Not implemented. Keyword reserved. |
 | `UNION...END UNION` | ✗ | User defined structure of overlapping data |
 | `EXTENDS` | ◐ | Single inheritance `TYPE Child EXTENDS Parent` (M4.2): inherited fields (prefix layout) + methods + reference polymorphism. M4.3: virtual dispatch — an overridden method is selected by the instance's runtime type even through a base-typed variable (runtime type-id + dispatcher procedures). `NEW`/ctor/dtor deferred (M4.4) |
@@ -1203,7 +1203,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `Temporary Types` | ✗ | Creates a temporary copy of a user defined type |
-| `THIS` | ✗ | Built-in, hidden, parameter passed to non-static member procedures to access the user defined type instance |
+| `THIS` | ✓ | Implicit first parameter of methods/constructors/destructors (M4.1): the instance handle. `THIS.field` reads/writes fields; used to resolve the method's owner type |
 | `BASE (member access)` | ✗ | Built-in, hidden, variable to access the base user defined type instance in derived user defined types |
 | `Type Alias` | ✗ | Declares a user defined type from other user defined or standard data types |
 | `WITH` | ✓ | `WITH rec` ... `END WITH`: leading `.field` resolves against the record (M3.2) |
@@ -1542,8 +1542,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Byref` | ✗ | Specifies passing an argument by reference. |
-| `Byval` | ✗ | Specifies passing an argument by value. |
+| `Byref` | ◐ | Pass a parameter by reference. V4: the default for UDT parameters (passed as a handle, so the callee mutates the caller's object); explicit `BYREF` accepted. Scalar by-reference write-back and `Dim`/`Var` references still deferred |
+| `Byval` | ◐ | Pass a parameter by value. V4: explicit `BYVAL` gives a UDT parameter its own copy (mutations don't reach the caller); scalars are already by value |
 | `Any` | ✗ | Disables type-checking on arguments. |
 
 ##### Variadic Procedures
