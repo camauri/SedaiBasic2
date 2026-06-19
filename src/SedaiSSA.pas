@@ -8466,8 +8466,12 @@ begin
       for i := 0 to ParamList.ChildCount - 1 do
       begin
         ParamNode := ParamList.GetChild(i);
+        // M7: a parameter with a default value carries the default expression as its last child. The
+        // type child (from "AS type") is present at index 0 only when there is more than just the
+        // default — i.e. skip the type read for an untyped "param = expr".
         if (ParamNode.NodeType = antIdentifier) and (ParamNode.ChildCount >= 1) and
-           (ParamNode.GetChild(0).NodeType = antIdentifier) then
+           (ParamNode.GetChild(0).NodeType = antIdentifier) and
+           not ((ParamNode.Attributes.Values['HASDEFAULT'] = '1') and (ParamNode.ChildCount = 1)) then
         begin
           VarName := UpperCase(VarToStr(ParamNode.Value));
           TypeName := UpperCase(VarToStr(ParamNode.GetChild(0).Value));
@@ -9181,7 +9185,7 @@ procedure TSSAGenerator.StageCallArgs(const ParamOwnerName: string; ArgListNode:
 // transfer slot. The parameter layout is taken from ParamOwnerName's declaration (so a
 // virtual call stages per the base method's signature; the override has the same signature).
 var
-  Decl, ParamList, ArgExpr: TASTNode;
+  Decl, ParamList, ArgExpr, ParamI: TASTNode;
   i, NArgs, Slot: Integer;
   RT: TSSARegisterType;
   ArgVal: TSSAValue;
@@ -9200,6 +9204,18 @@ begin
       ProcessExpression(ArgExpr, ArgVal);
       Slot := ParamBankAndSlot(ParamList, i, RT);
       EmitXferStore(RT, Slot, ArgVal);
+    end;
+    // M7: default arguments — for each trailing parameter the call omitted, stage its default value
+    // (the parameter node's last child, marked 'HASDEFAULT'), evaluated in the caller's context.
+    for i := NArgs to ParamList.ChildCount - 1 do
+    begin
+      ParamI := ParamList.GetChild(i);
+      if (ParamI.Attributes.Values['HASDEFAULT'] = '1') and (ParamI.ChildCount >= 1) then
+      begin
+        ProcessExpression(ParamI.GetChild(ParamI.ChildCount - 1), ArgVal);
+        Slot := ParamBankAndSlot(ParamList, i, RT);
+        EmitXferStore(RT, Slot, ArgVal);
+      end;
     end;
   end;
 end;

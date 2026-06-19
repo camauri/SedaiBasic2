@@ -1277,7 +1277,7 @@ function TPackratParser.ParseProcedureDecl: TASTNode;
 var
   Token, NameTok: TLexerToken;
   Kind, MethodType, QualName, ParamMode: string;
-  NameNode, ParamList, ParamNode, ThisNode: TASTNode;
+  NameNode, ParamList, ParamNode, ThisNode, DefExpr: TASTNode;
 begin
   // SUB|FUNCTION name [ ( params ) ] [AS type] <body> END SUB|FUNCTION
   // Method form (M4.1): SUB|FUNCTION Type.method(...) — qualified name "TYPE.METHOD" with an
@@ -1372,6 +1372,19 @@ begin
             ParamNode.AddChild(TASTNode.CreateWithValue(antIdentifier,
                          UpperCase(Context.CurrentToken.Value), Context.CurrentToken));
             Context.Advance;                      // typename
+          end;
+        end;
+        // Optional default value "= expr" (M7): a call that omits this trailing argument has the
+        // default staged in its place. Marked with 'HASDEFAULT'; the default expression is the
+        // parameter node's last child (after the optional type child).
+        if Context.Check(ttOpEq) then
+        begin
+          Context.Advance;                        // =
+          DefExpr := FExpressionParser.ParseExpression;
+          if Assigned(DefExpr) then
+          begin
+            ParamNode.Attributes.Values['HASDEFAULT'] := '1';
+            ParamNode.AddChild(DefExpr);          // last child = default-value expression
           end;
         end;
         ParamList.AddChild(ParamNode);
