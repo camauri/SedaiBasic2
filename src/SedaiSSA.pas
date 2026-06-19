@@ -144,7 +144,9 @@ type
     procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
     function ResolveMethodLabel(const TypeName, MethNm: string): string;  // walk inheritance
-    function ResolveConstructorLabel(const TypeName: string; ArgCount: Integer): string;  // M4.4d: by arity
+    function ResolveConstructorLabel(const TypeName, ArgSig: string): string;  // M4.4g: by type signature
+    function BankToChar(Bank: TSSARegisterType): Char;          // M4.4g: I/F/S bank code for a ctor signature
+    function CtorSigFromParams(ParamList: TASTNode): string;    // M4.4g: type signature of a ctor's params
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
     function VarRecordTypeName(const VarName: string): string;    // '' if not a record var
@@ -8321,22 +8323,68 @@ begin
   end;
 end;
 
-function TSSAGenerator.ResolveConstructorLabel(const TypeName: string; ArgCount: Integer): string;
-// M4.4d: find a constructor by arity, walking up the inheritance chain. Each CONSTRUCTOR's label
-// encodes its explicit-parameter count as "TYPE.CONSTRUCTOR#<n>" (arity-based overloading), so a
-// DIM with N arguments resolves to the matching N-parameter ctor (a subtype with no matching-arity
-// ctor inherits the parent's). Same-arity/different-type overloading is a later refinement.
+function TSSAGenerator.BankToChar(Bank: TSSARegisterType): Char;
+// M4.4g: one-char code of a register bank for a constructor type signature.
+begin
+  case Bank of
+    srtFloat:  Result := 'F';
+    srtString: Result := 'S';
+  else
+    Result := 'I';   // int (incl. UDT handles)
+  end;
+end;
+
+function TSSAGenerator.CtorSigFromParams(ParamList: TASTNode): string;
+// M4.4g: the type signature of a constructor's explicit parameters (THIS at index 0 excluded), one
+// bank char per param, e.g. "II", "IS", "" (no params). A UDT-typed param is an int handle ('I').
 var
-  T, Lbl: string;
-  Idx, Guard: Integer;
+  i: Integer;
+  p: TASTNode;
+  tname: string;
+begin
+  Result := '';
+  if ParamList = nil then Exit;
+  for i := 1 to ParamList.ChildCount - 1 do          // skip the implicit THIS at 0
+  begin
+    p := ParamList.GetChild(i);
+    // The type child is at index 0 when present; for an untyped "param = default" the only child is
+    // the default expression, so skip it (HASDEFAULT + single child => no type).
+    tname := '';
+    if (p.ChildCount >= 1) and (p.GetChild(0).NodeType = antIdentifier) and
+       not ((p.Attributes.Values['HASDEFAULT'] = '1') and (p.ChildCount = 1)) then
+      tname := UpperCase(VarToStr(p.GetChild(0).Value));
+    if FindUDT(tname) >= 0 then
+      Result := Result + 'I'                          // UDT handle
+    else
+      Result := Result + BankToChar(TypeNameToBank(tname, VarToStr(p.Value)));
+  end;
+end;
+
+function TSSAGenerator.ResolveConstructorLabel(const TypeName, ArgSig: string): string;
+// M4.4g: find a constructor by TYPE SIGNATURE, walking up the inheritance chain. Each CONSTRUCTOR's
+// label encodes its parameter bank signature as "TYPE.CONSTRUCTOR#<sig>" (e.g. "#II", "#IS", "#"),
+// so same-arity/different-type overloads coexist. Resolution: exact signature match first; if none,
+// fall back to ARITY (BASIC's loose typing — an int arg may target a float/string-prefixed param,
+// coerced at staging): the first ctor of the same parameter count. A subtype with no matching ctor
+// inherits the parent's.
+var
+  T, Lbl, Pref: string;
+  Idx, Guard, k: Integer;
 begin
   Result := '';
   T := UpperCase(TypeName);
   Guard := 0;
   while (T <> '') and (Guard < 64) do
   begin
-    Lbl := T + '.CONSTRUCTOR#' + IntToStr(ArgCount);
+    // 1) exact signature
+    Lbl := T + '.CONSTRUCTOR#' + ArgSig;
     if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
+    // 2) arity fallback: first ctor of T with the same parameter count (= length of its signature)
+    Pref := T + '.CONSTRUCTOR#';
+    for k := 0 to FProcedureNames.Count - 1 do
+      if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
+         (Length(FProcedureNames[k]) - Length(Pref) = Length(ArgSig)) then
+        Exit(FProcedureNames[k]);
     Idx := FindUDT(T);
     if Idx < 0 then Break;
     T := FUDTs[Idx].Parent;
@@ -8581,29 +8629,39 @@ procedure TSSAGenerator.EmitConstructorCall(const HandleVal: TSSAValue; const Ty
 // dispatch: at allocation the runtime type equals the static type, so the most-derived ctor is exact.
 // M4.4b: ArgsNode (DIM v AS T(args)) supplies the constructor arguments — staged into the declared
 // parameter slots that follow THIS.
-// M4.4d: constructors are overloaded by arity — the ctor whose explicit-parameter count equals the
-// number of arguments is selected (ResolveConstructorLabel).
+// M4.4d/g: constructors are overloaded by TYPE SIGNATURE (with arity fallback): the arguments are
+// evaluated first to build their bank signature, then the matching ctor is resolved
+// (ResolveConstructorLabel) and the argument values are staged into its parameter slots (coerced to
+// each parameter's bank). Evaluating before staging also avoids transfer-slot clobber from a nested
+// call inside an argument expression.
 var
-  Lbl: string;
+  Lbl, ArgSig: string;
   Decl, ParamList: TASTNode;
   i, Slot, ArgCount: Integer;
   RT: TSSARegisterType;
-  ArgVal: TSSAValue;
+  ArgVals: array of TSSAValue;
 begin
   if Assigned(ArgsNode) then ArgCount := ArgsNode.ChildCount else ArgCount := 0;
-  Lbl := ResolveConstructorLabel(TypeName, ArgCount);
+  // Evaluate each argument once and accumulate its bank signature.
+  SetLength(ArgVals, ArgCount);
+  ArgSig := '';
+  for i := 0 to ArgCount - 1 do
+  begin
+    ProcessExpression(ArgsNode.GetChild(i), ArgVals[i]);
+    ArgSig := ArgSig + BankToChar(ArgVals[i].RegType);
+  end;
+  Lbl := ResolveConstructorLabel(TypeName, ArgSig);
   if Lbl = '' then Exit;
   EmitXferStore(srtInt, 0, HandleVal);              // THIS handle -> int xfer slot 0
-  if Assigned(ArgsNode) and FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and
+  if (ArgCount > 0) and FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and
      (Decl.ChildCount >= 2) then
   begin
     ParamList := Decl.GetChild(1);                  // includes the implicit THIS at index 0
-    for i := 0 to ArgsNode.ChildCount - 1 do
+    for i := 0 to ArgCount - 1 do
     begin
       if i + 1 >= ParamList.ChildCount then Break;  // defensive: arity already matched the resolution
-      ProcessExpression(ArgsNode.GetChild(i), ArgVal);
       Slot := ParamBankAndSlot(ParamList, i + 1, RT);  // +1: skip the implicit THIS parameter
-      EmitXferStore(RT, Slot, ArgVal);
+      EmitXferStore(RT, Slot, ArgVals[i]);          // coerced to the parameter's bank
     end;
   end;
   EmitCallSubLabel(ProcedureLabelName(Lbl));
@@ -9194,6 +9252,16 @@ begin
   NameNode := Node.GetChild(0);
   if NameNode.NodeType <> antIdentifier then Exit;
   Name := UpperCase(VarToStr(NameNode.Value));
+  // M4.4g: re-encode a CONSTRUCTOR's label with its parameter TYPE signature (the parser only knew
+  // the arity). "TYPE.CONSTRUCTOR#<arity>" -> "TYPE.CONSTRUCTOR#<sig>" (e.g. "#IS"), so same-arity
+  // different-type overloads get distinct labels. Done here, before keying FProcDecls, so the whole
+  // pipeline (resolution + lowering) sees the signature label.
+  if (Pos('.CONSTRUCTOR#', Name) > 0) and (Node.ChildCount >= 2) and
+     (Node.GetChild(1).NodeType = antParameterList) then
+  begin
+    Name := Copy(Name, 1, Pos('#', Name)) + CtorSigFromParams(Node.GetChild(1));
+    NameNode.Value := Name;
+  end;
   if FProcDecls.ContainsKey(Name) then Exit;  // already registered by the pre-scan
   n := Length(FDeferredProcs);
   SetLength(FDeferredProcs, n + 1);
@@ -9499,7 +9567,7 @@ begin
               EmitConstructorCall(GetOrAllocateVariable('THIS'), ParentType, nil);
             BaseCallNode.Attributes.Values['HOISTED'] := '1';
           end
-          else if ResolveConstructorLabel(ParentType, 0) <> '' then
+          else if ResolveConstructorLabel(ParentType, '') <> '' then
             EmitConstructorCall(GetOrAllocateVariable('THIS'), ParentType, nil);  // default base ctor
         end;
       end;
