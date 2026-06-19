@@ -148,6 +148,7 @@ type
     procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
                                   ArgsNode: TASTNode = nil);  // M4.4 (ArgsNode: M4.4b ctor args)
     procedure EmitDestructorCall(const HandleVal: TSSAValue; const TypeName: string);  // V5
+    function BodyHasBaseCall(Node: TASTNode): Boolean;  // M4.4f: a ctor body contains an explicit BASE call
     procedure CollectLocalRecordVars(Node: TASTNode);  // V5: gather a proc body's DIM'd local UDTs
     procedure EmitFrameDestructors;                     // V5: dtor calls for the current frame
     procedure CollectModuleRecordVars(Node: TASTNode);  // V5b: gather module-scope DIM'd UDTs (skip procs)
@@ -8591,6 +8592,20 @@ begin
       end;
 end;
 
+function TSSAGenerator.BodyHasBaseCall(Node: TASTNode): Boolean;
+// M4.4f: true if the subtree contains an explicit BASE(...) call (an antProcedureCall named "BASE").
+// Used to suppress the automatic default-base chaining when the ctor body chains the base itself.
+var
+  i: Integer;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  if (Node.NodeType = antProcedureCall) and (UpperCase(VarToStr(Node.Value)) = 'BASE') then
+    Exit(True);
+  for i := 0 to Node.ChildCount - 1 do
+    if BodyHasBaseCall(Node.GetChild(i)) then Exit(True);
+end;
+
 procedure TSSAGenerator.CollectLocalRecordVars(Node: TASTNode);
 // V5: recursively gather the DIM'd UDT (record) variables in a procedure body, in textual order,
 // as "VARNAME|TYPENAME" entries in FCurrentProcLocalRecs (used to emit destructor calls at exit).
@@ -9142,10 +9157,29 @@ procedure TSSAGenerator.ProcessProcedureCall(Node: TASTNode);
 // return-point block created by EmitProcedureCall.
 var
   ArgList: TASTNode;
+  ParentType: string;
+  OwnerUDT: Integer;
 begin
   ArgList := nil;
   if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antArgumentList) then
     ArgList := Node.GetChild(0);
+  // M4.4f: BASE[(args)] inside a constructor body calls the owner type's parent constructor (by
+  // arity) on THIS. It reuses EmitConstructorCall against the parent type — no virtual dispatch
+  // (the base subobject's type is the static parent). Outside a method/ctor it is a no-op.
+  if (UpperCase(VarToStr(Node.Value)) = 'BASE') then
+  begin
+    if FCurrentThisType <> '' then
+    begin
+      OwnerUDT := FindUDT(FCurrentThisType);
+      if OwnerUDT >= 0 then
+      begin
+        ParentType := FUDTs[OwnerUDT].Parent;
+        if ParentType <> '' then
+          EmitConstructorCall(GetOrAllocateVariable('THIS'), ParentType, ArgList);
+      end;
+    end;
+    Exit;
+  end;
   EmitProcedureCall(UpperCase(VarToStr(Node.Value)), ArgList);
 end;
 
@@ -9234,7 +9268,10 @@ begin
     // parent with a default (#0) constructor, run that base ctor on THIS before the body — the
     // parent's own prologue chains further up the inheritance chain. Inherited fields sit at the
     // same prefix slots, so the base ctor initialises them before the child overrides/extends them.
-    if (Pos('.CONSTRUCTOR#', Name) > 0) and (FCurrentThisType <> '') then
+    // M4.4f: suppressed when the body chains the base explicitly with BASE(args), to avoid running
+    // both the default base ctor and the explicit one.
+    if (Pos('.CONSTRUCTOR#', Name) > 0) and (FCurrentThisType <> '') and
+       (not BodyHasBaseCall(Proc)) then
     begin
       OwnerUDT := FindUDT(FCurrentThisType);
       if OwnerUDT >= 0 then

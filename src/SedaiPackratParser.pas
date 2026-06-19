@@ -121,6 +121,8 @@ type
     function AtEndProcedure: Boolean;
     // CALL name [ ( args ) ] : statement-level SUB invocation.
     function ParseCallStatement: TASTNode;
+    // BASE [ ( args ) ] : explicit base-constructor call inside a child CONSTRUCTOR (M4.4f).
+    function ParseBaseStatement: TASTNode;
     // TYPE name / field AS type / ... / END TYPE : user-defined type (record/UDT).
     function ParseTypeDecl: TASTNode;
     function AtEndType: Boolean;
@@ -533,6 +535,7 @@ begin
       else
         Result := Memoize('FnStatement', @ParseFnStatement);
     ttCallSub: Result := Memoize('CallStatement', @ParseCallStatement);
+    ttBaseCall: Result := Memoize('BaseStatement', @ParseBaseStatement);
     ttTypeDecl: Result := Memoize('TypeDecl', @ParseTypeDecl);
     ttWithBlock: Result := ParseWith;
 
@@ -1432,6 +1435,41 @@ begin
   HasParens := Context.Check(ttDelimParOpen);
   if HasParens then Context.Advance;              // (
   // Parse a comma-separated argument list (empty is fine).
+  if not (Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or
+          Context.Check(ttSeparStmt) or Context.Check(ttDelimParClose)) then
+  begin
+    repeat
+      ArgExpr := FExpressionParser.ParseExpression;
+      if not Assigned(ArgExpr) then Break;
+      ArgList.AddChild(ArgExpr);
+      if Context.Check(ttSeparParam) then
+        Context.Advance                           // ,
+      else
+        Break;
+    until False;
+  end;
+  if HasParens and Context.Check(ttDelimParClose) then
+    Context.Advance;                              // )
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseBaseStatement: TASTNode;
+var
+  Token: TLexerToken;
+  ArgList, ArgExpr: TASTNode;
+  HasParens: Boolean;
+begin
+  // BASE [ ( args ) ] — explicit base-constructor call inside a child CONSTRUCTOR body. Lowers to an
+  // antProcedureCall named "BASE"; SSA routes it to the owner type's parent constructor (by arity) on
+  // THIS, and suppresses the automatic default-base chaining for this ctor.
+  Token := Context.CurrentToken;
+  Context.Advance;                                // consume BASE
+  Result := TASTNode.CreateWithValue(antProcedureCall, 'BASE', Token);
+  ArgList := TASTNode.Create(antArgumentList, Token);
+  Result.AddChild(ArgList);
+
+  HasParens := Context.Check(ttDelimParOpen);
+  if HasParens then Context.Advance;              // (
   if not (Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or
           Context.Check(ttSeparStmt) or Context.Check(ttDelimParClose)) then
   begin

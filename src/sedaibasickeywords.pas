@@ -70,6 +70,7 @@ const
   kDESTRUCTOR  = 'DESTRUCTOR';  // DESTRUCTOR Type(): auto-called at scope exit for a local (V5)
   kBYVAL   = 'BYVAL';    // BYVAL: pass parameter by value (copy)
   kBYREF   = 'BYREF';    // BYREF: pass parameter by reference (alias) — the default
+  kBASE    = 'BASE';     // BASE(args): explicit base-constructor call inside a child CONSTRUCTOR (M4.4f)
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';
