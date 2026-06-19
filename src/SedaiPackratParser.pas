@@ -3802,7 +3802,7 @@ end;
 function TPackratParser.ParseDimStatement: TASTNode;
 var
   Token, NameTok, TypeTok: TLexerToken;
-  ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr: TASTNode;
+  ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr: TASTNode;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
@@ -3831,20 +3831,23 @@ begin
       TypeNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(TypeTok.Value), TypeTok);
       ArrayDecl.AddChild(VarNameNode);
       ArrayDecl.AddChild(TypeNode);          // child[1] is antIdentifier (type) => typed scalar
-      // Parameterised construction (M4.4b) accepts two equivalent spellings:
-      //   DIM v AS T(args)        -- ctor args directly after the type
-      //   DIM v AS T = T(args)    -- FreeBASIC initializer form (RHS must construct the declared type)
-      // The "= T" prefix simply repositions onto the '(' so the shared arg-parsing block below runs.
-      if Context.Check(ttOpEq) and Assigned(Context.PeekNext) and
-         (Context.PeekNext.TokenType = ttIdentifier) then
+      // Optional initializer after the type. Two cases:
+      //   = T(args)   (M4.4c) constructor call on the declared type — consume "= T" and let the
+      //               shared arg-parsing block below attach the antArgumentList as child[2].
+      //   = expr      (M4.4e) general initializer — parse the expression and attach it as child[2];
+      //               SSA emits an assignment (scalar store / UDT value-copy) after construction.
+      if Context.Check(ttOpEq) then
       begin
         Context.Advance;                     // =
-        if UpperCase(Context.CurrentToken.Value) <> UpperCase(TypeTok.Value) then
-          HandleError('DIM initializer must construct the declared type ''' + TypeTok.Value +
-                      ''' (no conversion yet) — e.g. DIM v AS ' + TypeTok.Value + ' = ' +
-                      TypeTok.Value + '(...)', Context.CurrentToken)
+        if Context.Check(ttIdentifier) and
+           (UpperCase(Context.CurrentToken.Value) = UpperCase(TypeTok.Value)) then
+          Context.Advance                    // RHS == declared type: ctor form (block below reads '(')
         else
-          Context.Advance;                   // RHS type name -> now positioned at '(' if present
+        begin
+          InitExpr := FExpressionParser.ParseExpression;    // general initializer expression
+          if Assigned(InitExpr) then
+            ArrayDecl.AddChild(InitExpr);                   // child[2] = initializer (not antArgumentList)
+        end;
       end;
       // Optional parameterised construction (M4.4b): attach the constructor argument list as
       // child[2]; SSA stages these and calls T's matching CONSTRUCTOR.

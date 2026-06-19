@@ -2971,6 +2971,7 @@ var
   RecHandleVal: TSSAValue; // M3
   RecArrUDTIdx: Integer;   // M3.1: array-of-UDT element type index (-1 if not)
   RecPacked: Int64;        // M3.1: packed slot counts for bcRecordNewArray
+  InitAssign: TASTNode;    // M4.4e: synthesized assignment for a "DIM v AS T = expr" initializer
 const
   MAX_ARRAY_ELEMENTS = 125000000;  // 125M elements max (~1GB for 500x500x500 matrix)
 begin
@@ -3023,6 +3024,20 @@ begin
           EmitConstructorCall(RecHandleVal, RecTypeName, ArrayDeclNode.GetChild(2))
         else
           EmitConstructorCall(RecHandleVal, RecTypeName);
+      end;
+      // M4.4e: general initializer "DIM v AS T = expr" — child[2] is the init expression (not the
+      // ctor-args antArgumentList). After allocation/construction, assign it: a scalar store, or a
+      // value-copy when both sides are UDTs (reuses ProcessAssignment's existing semantics). The
+      // synthesized node is transient and freed here; its cloned expression is owned by it.
+      if (ArrayDeclNode.ChildCount >= 3) and
+         (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
+      begin
+        InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
+        InitAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(ArrName),
+                                                     ArrayDeclNode.GetChild(0).Token));
+        InitAssign.AddChild(ArrayDeclNode.GetChild(2).Clone);
+        ProcessAssignment(InitAssign);
+        InitAssign.Free;
       end;
       Continue;
     end;
