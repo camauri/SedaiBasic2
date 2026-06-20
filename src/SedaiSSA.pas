@@ -885,20 +885,29 @@ begin
       end
       else
       begin
-        // Try to convert string to number (handles cases like file handle "1")
         TempStr := VarToStr(Node.Value);
-        TempFloat := 0;
-        Val(TempStr, TempFloat, ValCode);
-        if ValCode = 0 then
-        begin
-          // Successfully parsed as number
-          if Frac(TempFloat) = 0 then
-            Result := MakeSSAConstInt(Int64(Trunc(TempFloat)))
-          else
-            Result := MakeSSAConstFloat(TempFloat);
-        end
+        // A genuine quoted string literal (lexer token ttStringLiteral) is ALWAYS a string, even when its
+        // text looks numeric ("." , "5", ".5"). Without this, Val() below silently turned such literals
+        // into numbers, so e.g. LEN(".") was 0 and INSTR(s, ".") was wrong. Only synthesized/ambiguous
+        // literals (no string token — e.g. a file handle written bare) fall through to the Val() guess.
+        if (Node.Token <> nil) and (Node.Token.TokenType = ttStringLiteral) then
+          Result := MakeSSAConstString(TempStr)
         else
-          Result := MakeSSAConstString(TempStr);
+        begin
+          // Try to convert string to number (handles cases like file handle "1")
+          TempFloat := 0;
+          Val(TempStr, TempFloat, ValCode);
+          if ValCode = 0 then
+          begin
+            // Successfully parsed as number
+            if Frac(TempFloat) = 0 then
+              Result := MakeSSAConstInt(Int64(Trunc(TempFloat)))
+            else
+              Result := MakeSSAConstFloat(TempFloat);
+          end
+          else
+            Result := MakeSSAConstString(TempStr);
+        end;
       end;
     end;
 
