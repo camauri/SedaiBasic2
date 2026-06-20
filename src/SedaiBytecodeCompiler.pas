@@ -240,6 +240,11 @@ begin
     ssaMutexLock: Result := bcMutexLock;
     ssaMutexUnlock: Result := bcMutexUnlock;
     ssaMutexDestroy: Result := bcMutexDestroy;
+    ssaCondCreate: Result := bcCondCreate;      // M5.4: condition variables
+    ssaCondWait: Result := bcCondWait;
+    ssaCondSignal: Result := bcCondSignal;
+    ssaCondBroadcast: Result := bcCondBroadcast;
+    ssaCondDestroy: Result := bcCondDestroy;
     ssaRecordLoadInt: Result := bcRecordLoadInt;
     ssaRecordLoadFloat: Result := bcRecordLoadFloat;
     ssaRecordLoadString: Result := bcRecordLoadString;

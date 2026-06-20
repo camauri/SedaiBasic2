@@ -113,6 +113,11 @@ type
     // FMutexTableLock guards only the table (lookup/append), never the user mutex itself.
     FMutexes: array of Pointer;
     FMutexTableLock: TRTLCriticalSection;
+    // M5.4: condition-variable table. Each entry is a TCondVar (declared in the implementation),
+    // handle = index + 1, nil = destroyed. FCondTableLock guards only the table; each TCondVar has its
+    // own internal lock + per-waiter RTLEvent list (see CondWait/CondSignal/CondBroadcast).
+    FCondVars: array of Pointer;
+    FCondTableLock: TRTLCriticalSection;
     FProgram: TBytecodeProgram;
     FOutputDevice: IOutputDevice;
     FInputDevice: IInputDevice;
@@ -220,6 +225,14 @@ type
     procedure UnlockMutex(Handle: Int64);
     procedure DestroyMutex(Handle: Int64);
     procedure CleanupMutexes;   // free any surviving mutexes (destructor)
+    // M5.4 condition variables (FB API): a mutex-released wait + signal/broadcast, built on per-waiter
+    // RTLEvents (sticky, so no lost wakeup). CondWait takes the cond and the user's mutex handle.
+    function CreateCond: Int64;
+    procedure CondWaitOp(CondHandle, MutexHandle: Int64);
+    procedure CondSignalOp(CondHandle: Int64);
+    procedure CondBroadcastOp(CondHandle: Int64);
+    procedure DestroyCond(CondHandle: Int64);
+    procedure CleanupConds;     // free any surviving condition variables (destructor)
     function AllocRecord(Ctx: TExecutionContext; IntC, FloatC, StrC, TypeId: Integer): Integer;  // M3: new record instance -> handle
     procedure RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
     procedure CheckFloatValid(Ctx: TExecutionContext; RegIndex: Integer; const OpName: string);
@@ -315,6 +328,14 @@ type
   // M5.4: a mutex is a heap-allocated critical section, kept by pointer so a held lock survives
   // table growth (the dynamic array stores these pointers; the records themselves never move).
   PMutex = ^TRTLCriticalSection;
+
+  // M5.4: a condition variable. ILock guards Waiters, a FIFO of per-waiter RTLEvents. Each waiter
+  // gets its own event (sticky → a set-before-wait still wakes it, so no lost wakeup), so broadcast
+  // is just "set them all". The associated user mutex is passed to CondWait, not stored here.
+  TCondVar = class
+    ILock: TRTLCriticalSection;
+    Waiters: array of PRTLEvent;
+  end;
 
 threadvar
   // M5.2: the execution context the current thread runs. nil on the main thread (which uses the VM's
@@ -438,6 +459,8 @@ begin
   InitCriticalSection(FWorkerLock);
   SetLength(FMutexes, 0);
   InitCriticalSection(FMutexTableLock);
+  SetLength(FCondVars, 0);
+  InitCriticalSection(FCondTableLock);
   FProgram := nil;
   FCtx.PC := 0;
   FCtx.Running := False;
@@ -576,7 +599,9 @@ begin
   // M5.2: join any worker still running, then free its spawn record + context.
   CleanupWorkers;
   DoneCriticalSection(FWorkerLock);
-  // M5.4: free any mutexes the program left undestroyed.
+  // M5.4: free any sync primitives the program left undestroyed.
+  CleanupConds;
+  DoneCriticalSection(FCondTableLock);
   CleanupMutexes;
   DoneCriticalSection(FMutexTableLock);
   FCtx.Free;
@@ -1501,6 +1526,147 @@ begin
     if M <> nil then begin DoneCriticalSection(M^); Dispose(M); end;
   end;
   SetLength(FMutexes, 0);
+end;
+
+function TBytecodeVM.CreateCond: Int64;
+// bcCondCreate: allocate a condition variable and return its handle (index + 1).
+var
+  CV: TCondVar;
+  Idx: Integer;
+begin
+  CV := TCondVar.Create;
+  InitCriticalSection(CV.ILock);
+  SetLength(CV.Waiters, 0);
+  EnterCriticalSection(FCondTableLock);
+  try
+    Idx := Length(FCondVars);
+    SetLength(FCondVars, Idx + 1);
+    FCondVars[Idx] := CV;
+    Result := Idx + 1;
+  finally
+    LeaveCriticalSection(FCondTableLock);
+  end;
+end;
+
+procedure TBytecodeVM.CondWaitOp(CondHandle, MutexHandle: Int64);
+// bcCondWait: register this thread's event on the cond var, release the user mutex, block until the
+// event is set (sticky → a signal that races the wait still wakes us), then reacquire the mutex.
+var
+  CV: TCondVar;
+  Ev: PRTLEvent;
+  N: Integer;
+begin
+  CV := nil;
+  EnterCriticalSection(FCondTableLock);
+  try
+    if (CondHandle >= 1) and (CondHandle <= Length(FCondVars)) then CV := TCondVar(FCondVars[CondHandle - 1]);
+  finally
+    LeaveCriticalSection(FCondTableLock);
+  end;
+  if CV = nil then Exit;
+  Ev := RTLEventCreate;
+  EnterCriticalSection(CV.ILock);
+  try
+    N := Length(CV.Waiters);
+    SetLength(CV.Waiters, N + 1);
+    CV.Waiters[N] := Ev;
+  finally
+    LeaveCriticalSection(CV.ILock);
+  end;
+  UnlockMutex(MutexHandle);     // release the associated mutex while we wait
+  RTLEventWaitFor(Ev);          // block; the signaler removed Ev from the list before setting it
+  LockMutex(MutexHandle);       // reacquire before returning (FB/POSIX contract)
+  RTLEventDestroy(Ev);          // we own Ev now (the signaler only set it)
+end;
+
+procedure TBytecodeVM.CondSignalOp(CondHandle: Int64);
+// bcCondSignal: wake the longest-waiting thread (FIFO front), if any.
+var
+  CV: TCondVar;
+  Ev: PRTLEvent;
+  i: Integer;
+begin
+  CV := nil;
+  EnterCriticalSection(FCondTableLock);
+  try
+    if (CondHandle >= 1) and (CondHandle <= Length(FCondVars)) then CV := TCondVar(FCondVars[CondHandle - 1]);
+  finally
+    LeaveCriticalSection(FCondTableLock);
+  end;
+  if CV = nil then Exit;
+  Ev := nil;
+  EnterCriticalSection(CV.ILock);
+  try
+    if Length(CV.Waiters) > 0 then
+    begin
+      Ev := CV.Waiters[0];
+      for i := 1 to High(CV.Waiters) do CV.Waiters[i - 1] := CV.Waiters[i];
+      SetLength(CV.Waiters, Length(CV.Waiters) - 1);
+    end;
+  finally
+    LeaveCriticalSection(CV.ILock);
+  end;
+  if Ev <> nil then RTLEventSetEvent(Ev);   // set outside ILock; the waiter destroys Ev after waking
+end;
+
+procedure TBytecodeVM.CondBroadcastOp(CondHandle: Int64);
+// bcCondBroadcast: wake every waiter.
+var
+  CV: TCondVar;
+  Evs: array of PRTLEvent;
+  i: Integer;
+begin
+  CV := nil;
+  EnterCriticalSection(FCondTableLock);
+  try
+    if (CondHandle >= 1) and (CondHandle <= Length(FCondVars)) then CV := TCondVar(FCondVars[CondHandle - 1]);
+  finally
+    LeaveCriticalSection(FCondTableLock);
+  end;
+  if CV = nil then Exit;
+  Evs := nil;
+  EnterCriticalSection(CV.ILock);
+  try
+    SetLength(Evs, Length(CV.Waiters));
+    for i := 0 to High(CV.Waiters) do Evs[i] := CV.Waiters[i];
+    SetLength(CV.Waiters, 0);
+  finally
+    LeaveCriticalSection(CV.ILock);
+  end;
+  for i := 0 to High(Evs) do RTLEventSetEvent(Evs[i]);
+end;
+
+procedure TBytecodeVM.DestroyCond(CondHandle: Int64);
+// bcCondDestroy: detach and free the condition variable (FB contract: no waiters remain).
+var
+  CV: TCondVar;
+begin
+  CV := nil;
+  EnterCriticalSection(FCondTableLock);
+  try
+    if (CondHandle >= 1) and (CondHandle <= Length(FCondVars)) then
+    begin
+      CV := TCondVar(FCondVars[CondHandle - 1]);
+      FCondVars[CondHandle - 1] := nil;
+    end;
+  finally
+    LeaveCriticalSection(FCondTableLock);
+  end;
+  if CV <> nil then begin DoneCriticalSection(CV.ILock); CV.Free; end;
+end;
+
+procedure TBytecodeVM.CleanupConds;
+// Destructor helper: free any condition variable the program left undestroyed.
+var
+  i: Integer;
+  CV: TCondVar;
+begin
+  for i := 0 to Length(FCondVars) - 1 do
+  begin
+    CV := TCondVar(FCondVars[i]);
+    if CV <> nil then begin DoneCriticalSection(CV.ILock); CV.Free; end;
+  end;
+  SetLength(FCondVars, 0);
 end;
 
 procedure TBytecodeVM.EnsureRegisterCapacity(Ctx: TExecutionContext; RegType: TSSARegisterType; MinIndex: Integer);

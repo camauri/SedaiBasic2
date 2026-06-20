@@ -230,8 +230,9 @@ begin
         bcCallSub, bcReturnSub,
         // M5.2: spawning/joining a worker is a side-effecting barrier (the worker touches shared state).
         bcThreadCreate, bcThreadWait,
-        // M5.4: mutex ops are synchronization barriers — don't fuse register work across them.
-        bcMutexCreate, bcMutexLock, bcMutexUnlock, bcMutexDestroy:
+        // M5.4: mutex + condition-variable ops are synchronization barriers — don't fuse across them.
+        bcMutexCreate, bcMutexLock, bcMutexUnlock, bcMutexDestroy,
+        bcCondCreate, bcCondWait, bcCondSignal, bcCondBroadcast, bcCondDestroy:
           IsControlFlow := True;
       end;
     end

@@ -102,6 +102,9 @@ type
     ssaLoadProcAddr, ssaThreadCreate, ssaThreadWait,
     // Mutexes (M5.4, FB API): MutexCreate (Dest=int handle, no operands); Lock/Unlock/Destroy (Src1=handle reg).
     ssaMutexCreate, ssaMutexLock, ssaMutexUnlock, ssaMutexDestroy,
+    // Condition variables (M5.4): CondCreate (Dest=int handle); CondWait (Src1=cond, Src2=mutex);
+    // CondSignal/CondBroadcast/CondDestroy (Src1=cond handle).
+    ssaCondCreate, ssaCondWait, ssaCondSignal, ssaCondBroadcast, ssaCondDestroy,
     ssaRecMarkPush, ssaRecMarkPop,   // M8: block-scoped record reclamation (loop-body DIMs)
 
     ssaArrayLoad, ssaArrayStore, ssaArrayDim,

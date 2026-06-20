@@ -78,6 +78,11 @@ const
   kMUTEXLOCK    = 'MUTEXLOCK';    // MUTEXLOCK m: acquire a mutex (M5.4, FB API)
   kMUTEXUNLOCK  = 'MUTEXUNLOCK';  // MUTEXUNLOCK m: release a mutex (M5.4, FB API)
   kMUTEXDESTROY = 'MUTEXDESTROY'; // MUTEXDESTROY m: free a mutex (M5.4, FB API)
+  kCONDCREATE   = 'CONDCREATE';   // c = CONDCREATE(): create a condition variable (M5.4, FB API)
+  kCONDWAIT     = 'CONDWAIT';     // CONDWAIT c, m: release mutex m, wait on c, reacquire m (M5.4)
+  kCONDSIGNAL   = 'CONDSIGNAL';   // CONDSIGNAL c: wake one waiter (M5.4)
+  kCONDBROADCAST = 'CONDBROADCAST'; // CONDBROADCAST c: wake all waiters (M5.4)
+  kCONDDESTROY  = 'CONDDESTROY';  // CONDDESTROY c: free a condition variable (M5.4)
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';

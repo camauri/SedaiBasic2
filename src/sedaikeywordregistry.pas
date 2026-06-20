@@ -1600,6 +1600,11 @@ begin
  RegisterKeyword(kMUTEXLOCK,    ttMutexLock,    'Lock a mutex',          kcProcedures);
  RegisterKeyword(kMUTEXUNLOCK,  ttMutexUnlock,  'Unlock a mutex',        kcProcedures);
  RegisterKeyword(kMUTEXDESTROY, ttMutexDestroy, 'Destroy a mutex',       kcProcedures);
+ RegisterKeyword(kCONDCREATE,   ttCondCreate,   'Create a cond var',     kcProcedures);
+ RegisterKeyword(kCONDWAIT,     ttCondWait,     'Wait on a cond var',    kcProcedures);
+ RegisterKeyword(kCONDSIGNAL,   ttCondSignal,   'Signal a cond var',     kcProcedures);
+ RegisterKeyword(kCONDBROADCAST,ttCondBroadcast,'Broadcast a cond var',  kcProcedures);
+ RegisterKeyword(kCONDDESTROY,  ttCondDestroy,  'Destroy a cond var',    kcProcedures);
 
  // === FLOW CONTROL - JUMP RELATED STATEMENTS ===
  RegisterKeyword(kEXIT,   ttJumpReturn,      'Exit statement',   kcJumpFlowControl);

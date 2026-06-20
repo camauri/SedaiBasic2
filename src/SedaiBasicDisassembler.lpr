@@ -184,6 +184,10 @@ begin
     bcMutexCreate:  begin Result := Format('R%d = mutex()', [Instr.Dest]); Exit; end;
     bcMutexLock, bcMutexUnlock, bcMutexDestroy:
                     begin Result := Format('R%d', [Instr.Src1]); Exit; end;
+    bcCondCreate:   begin Result := Format('R%d = cond()', [Instr.Dest]); Exit; end;
+    bcCondWait:     begin Result := Format('cond=R%d mutex=R%d', [Instr.Src1, Instr.Src2]); Exit; end;
+    bcCondSignal, bcCondBroadcast, bcCondDestroy:
+                    begin Result := Format('R%d', [Instr.Src1]); Exit; end;
   end;
 
   // Handle superinstructions (opcodes 100+) separately

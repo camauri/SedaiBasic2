@@ -556,6 +556,17 @@ begin
           begin UnlockMutex(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
         bcMutexDestroy:
           begin DestroyMutex(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+        // Condition variables (M5.4, FreeBASIC API).
+        bcCondCreate:
+          begin Ctx.IntRegs[Instr.Dest] := CreateCond; Inc(CurPC); end;
+        bcCondWait:
+          begin CondWaitOp(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]); Inc(CurPC); end;
+        bcCondSignal:
+          begin CondSignalOp(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+        bcCondBroadcast:
+          begin CondBroadcastOp(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+        bcCondDestroy:
+          begin DestroyCond(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
         // Block-scoped record reclamation (M8): mark at a loop-body entry, reclaim at its exit.
         bcRecMarkPush:
           begin

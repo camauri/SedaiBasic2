@@ -127,6 +127,10 @@ type
     function ParseThreadWaitStatement: TASTNode;
     // MUTEXLOCK/MUTEXUNLOCK/MUTEXDESTROY handle : mutex ops (M5.4); node type keyed on the token.
     function ParseMutexOpStatement: TASTNode;
+    // CONDWAIT cond, mutex : wait on a condition variable (M5.4).
+    function ParseCondWaitStatement: TASTNode;
+    // CONDSIGNAL/CONDBROADCAST/CONDDESTROY cond : single-handle cond ops (M5.4); node keyed on the token.
+    function ParseCondOpStatement: TASTNode;
     // SHARED used as a standalone statement (not as the DIM SHARED modifier): not a -lang fb feature;
     // report a clean error pointing to DIM SHARED at module level, then recover.
     function ParseSharedError: TASTNode;
@@ -546,6 +550,9 @@ begin
     ttThreadWait: Result := Memoize('ThreadWaitStatement', @ParseThreadWaitStatement);
     ttMutexLock, ttMutexUnlock, ttMutexDestroy:
       Result := Memoize('MutexOpStatement', @ParseMutexOpStatement);
+    ttCondWait: Result := Memoize('CondWaitStatement', @ParseCondWaitStatement);
+    ttCondSignal, ttCondBroadcast, ttCondDestroy:
+      Result := Memoize('CondOpStatement', @ParseCondOpStatement);
     ttSharedDecl: Result := ParseSharedError;   // SHARED is only the DIM SHARED modifier, not a statement
     ttTypeDecl: Result := Memoize('TypeDecl', @ParseTypeDecl);
     ttWithBlock: Result := ParseWith;
@@ -1561,6 +1568,61 @@ begin
   if HasParens then Context.Advance;              // (
   HandleExpr := FExpressionParser.ParseExpression;
   if not Assigned(HandleExpr) then Exit;          // malformed
+  if HasParens and Context.Check(ttDelimParClose) then
+    Context.Advance;                              // )
+  Result := TASTNode.CreateWithValue(NodeType, Name, Token);
+  Result.AddChild(HandleExpr);
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseCondWaitStatement: TASTNode;
+var
+  Token: TLexerToken;
+  CondExpr, MutexExpr: TASTNode;
+  HasParens: Boolean;
+begin
+  // CONDWAIT cond, mutex  (or CONDWAIT(cond, mutex)) — child0 = cond handle, child1 = mutex handle.
+  Token := Context.CurrentToken;
+  Context.Advance;                                // consume CONDWAIT
+  Result := nil;
+  HasParens := Context.Check(ttDelimParOpen);
+  if HasParens then Context.Advance;              // (
+  CondExpr := FExpressionParser.ParseExpression;
+  if not Assigned(CondExpr) then Exit;
+  if not Context.Check(ttSeparParam) then Exit;   // expect ,
+  Context.Advance;                                // ,
+  MutexExpr := FExpressionParser.ParseExpression;
+  if not Assigned(MutexExpr) then Exit;
+  if HasParens and Context.Check(ttDelimParClose) then
+    Context.Advance;                              // )
+  Result := TASTNode.CreateWithValue(antCondWait, 'CONDWAIT', Token);
+  Result.AddChild(CondExpr);
+  Result.AddChild(MutexExpr);
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseCondOpStatement: TASTNode;
+var
+  Token: TLexerToken;
+  HandleExpr: TASTNode;
+  HasParens: Boolean;
+  NodeType: TASTNodeType;
+  Name: string;
+begin
+  // CONDSIGNAL / CONDBROADCAST / CONDDESTROY cond  (parens optional). child0 = cond handle.
+  Token := Context.CurrentToken;
+  case Token.TokenType of
+    ttCondBroadcast: begin NodeType := antCondBroadcast; Name := 'CONDBROADCAST'; end;
+    ttCondDestroy:   begin NodeType := antCondDestroy;   Name := 'CONDDESTROY';   end;
+  else
+    begin NodeType := antCondSignal; Name := 'CONDSIGNAL'; end;
+  end;
+  Context.Advance;                                // consume the COND* keyword
+  Result := nil;
+  HasParens := Context.Check(ttDelimParOpen);
+  if HasParens then Context.Advance;              // (
+  HandleExpr := FExpressionParser.ParseExpression;
+  if not Assigned(HandleExpr) then Exit;
   if HasParens and Context.Check(ttDelimParClose) then
     Context.Advance;                              // )
   Result := TASTNode.CreateWithValue(NodeType, Name, Token);

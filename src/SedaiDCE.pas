@@ -277,6 +277,8 @@ begin
     ssaLoadProcAddr, ssaThreadCreate, ssaThreadWait,
     // Mutexes (M5.4): create/lock/unlock/destroy all have synchronization side effects.
     ssaMutexCreate, ssaMutexLock, ssaMutexUnlock, ssaMutexDestroy,
+    // Condition variables (M5.4): create/wait/signal/broadcast/destroy all have side effects.
+    ssaCondCreate, ssaCondWait, ssaCondSignal, ssaCondBroadcast, ssaCondDestroy,
     // Transfer-register moves carry args/result across the call; never elide them.
     ssaXferStoreInt, ssaXferStoreFloat, ssaXferStoreString,
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString,

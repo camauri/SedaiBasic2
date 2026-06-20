@@ -2319,11 +2319,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `CONDCREATE` | ✗ | Creates a conditional variable. |
-| `CONDWAIT` | ✗ | Pauses execution of a threaded procedure. |
-| `CONDSIGNAL` | ✗ | Resumes execution of a threaded procedure waiting for a conditional. |
-| `CONDBROADCAST` | ✗ | Resumes all threaded procedures waiting for a conditional. |
-| `CONDDESTROY` | ✗ | Destroys a conditional variable that is no longer needed. |
+| `CONDCREATE` | ✓ | Creates a conditional variable. `c = CONDCREATE()` (M5.4). |
+| `CONDWAIT` | ✓ | Pauses execution of a threaded procedure. `CONDWAIT cond, mutex` (atomically releases the mutex, waits, reacquires) (M5.4). |
+| `CONDSIGNAL` | ✓ | Resumes execution of a threaded procedure waiting for a conditional. `CONDSIGNAL cond` (M5.4). |
+| `CONDBROADCAST` | ✓ | Resumes all threaded procedures waiting for a conditional. `CONDBROADCAST cond` (M5.4). |
+| `CONDDESTROY` | ✓ | Destroys a conditional variable that is no longer needed. `CONDDESTROY cond` (M5.4). |
 
 ### User Input Functions
 

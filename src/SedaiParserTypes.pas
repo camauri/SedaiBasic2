@@ -48,6 +48,11 @@ type
     antMutexLock,         // MUTEXLOCK handle: acquire a mutex (statement); child0 = handle expr
     antMutexUnlock,       // MUTEXUNLOCK handle: release a mutex (statement); child0 = handle expr
     antMutexDestroy,      // MUTEXDESTROY handle: free a mutex (statement); child0 = handle expr
+    antCondCreate,        // CONDCREATE(): create a condition variable (expr → int handle), no children
+    antCondWait,          // CONDWAIT cond, mutex: statement; child0 = cond handle, child1 = mutex handle
+    antCondSignal,        // CONDSIGNAL cond: wake one waiter (statement); child0 = cond handle
+    antCondBroadcast,     // CONDBROADCAST cond: wake all waiters (statement); child0 = cond handle
+    antCondDestroy,       // CONDDESTROY cond: free a condition variable (statement); child0 = cond handle
     antTypeDecl,          // TYPE name ... END TYPE (UDT/record): value=name, children=fields (antIdentifier, value=field name, with a type tag)
     antMemberAccess,      // record.field : child0 = object expr, value = field name
     antSpecialVariable,   // Special variables (TI, TI$, DT$, etc.)
@@ -373,7 +378,7 @@ begin
     antLiteral, antIdentifier, antBinaryOp, antUnaryOp,
     antFunctionCall, antArrayAccess, antParentheses,
     antExpressionList, antParameterList, antArgumentList,
-    antProcAddress, antThreadCreate, antMutexCreate
+    antProcAddress, antThreadCreate, antMutexCreate, antCondCreate
   ];
 end;
 
@@ -390,7 +395,8 @@ begin
     // Sprite commands
     antSprite, antMovspr, antSprcolor, antSprsav, antCollision, antSprdef,
     antSprsave, antSprload, antSprsize, antSprform,
-    antThreadWait, antMutexLock, antMutexUnlock, antMutexDestroy
+    antThreadWait, antMutexLock, antMutexUnlock, antMutexDestroy,
+    antCondWait, antCondSignal, antCondBroadcast, antCondDestroy
   ];
 end;
 

@@ -190,6 +190,8 @@ begin
     bcLoadProcAddr, bcThreadCreate,
     // Mutexes (M5.4): MutexCreate writes a mutex handle (int).
     bcMutexCreate,
+    // Condition variables (M5.4): CondCreate writes a cond-var handle (int).
+    bcCondCreate,
     // === GROUP 0: Core VM operations ===
     // Integer operations
     bcLoadConstInt, bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -353,6 +355,8 @@ begin
     bcThreadCreate, bcThreadWait,
     // Mutexes (M5.4): Lock/Unlock/Destroy Src1 = mutex handle reg.
     bcMutexLock, bcMutexUnlock, bcMutexDestroy,
+    // Condition variables (M5.4): Wait/Signal/Broadcast/Destroy Src1 = cond handle reg.
+    bcCondWait, bcCondSignal, bcCondBroadcast, bcCondDestroy,
 
     // === GROUP 0: Core VM operations ===
     // Int arithmetic
@@ -476,6 +480,8 @@ begin
     bcRecordStoreInt,
     // OS threading (M5.2): ThreadCreate's Src2 is the int worker parameter.
     bcThreadCreate,
+    // Condition variables (M5.4): CondWait's Src2 is the mutex handle (int).
+    bcCondWait,
     // === GROUP 0: Core VM operations ===
     // Int arithmetic (second operand)
     bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt,

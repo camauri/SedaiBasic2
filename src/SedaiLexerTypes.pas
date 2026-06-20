@@ -174,6 +174,11 @@ type
     ttMutexLock,              // MUTEXLOCK (statement: acquire a mutex by handle)
     ttMutexUnlock,            // MUTEXUNLOCK (statement: release a mutex by handle)
     ttMutexDestroy,           // MUTEXDESTROY (statement: free a mutex by handle)
+    ttCondCreate,             // CONDCREATE (expression: → condition-variable handle)
+    ttCondWait,               // CONDWAIT (statement: atomically release mutex + wait on cond + relock)
+    ttCondSignal,             // CONDSIGNAL (statement: wake one waiter)
+    ttCondBroadcast,          // CONDBROADCAST (statement: wake all waiters)
+    ttCondDestroy,            // CONDDESTROY (statement: free a condition variable by handle)
 
     // === DATA HANDLING ===
     ttDataAssignment,         // LET, SET, :=
@@ -371,6 +376,7 @@ const
     ttBlockBegin, ttBlockEnd, ttProcedureStart, ttProcedureEnd, ttCallSub,
     ttTypeDecl, ttAsType, ttWithBlock, ttExtends, ttParamMode, ttBaseCall, ttSharedDecl,
     ttThreadWait, ttMutexLock, ttMutexUnlock, ttMutexDestroy,
+    ttCondWait, ttCondSignal, ttCondBroadcast, ttCondDestroy,
     ttJumpKeyword, ttDataDeclaration, ttDataAssignment, ttCommentRemark,
     ttBitwiseOperator
   ];

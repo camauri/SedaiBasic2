@@ -845,6 +845,14 @@ begin
                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
 
+    antCondCreate:
+    begin
+      // CONDCREATE() → a fresh condition-variable handle (int). No operands.
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaCondCreate, Result, MakeSSAValue(svkNone),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+
     antLiteral:
     begin
       if VarIsNumeric(Node.Value) then
@@ -10244,6 +10252,31 @@ begin
         antMutexDestroy: OpCode := ssaMutexDestroy;
       else
         OpCode := ssaMutexLock;
+      end;
+      EmitInstruction(OpCode, MakeSSAValue(svkNone), ExprResult,
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+
+    antCondWait:
+    begin
+      // CONDWAIT cond, mutex — atomically release mutex, wait on cond, reacquire mutex.
+      ProcessExpression(Node.GetChild(0), ExprResult);
+      ExprResult := EnsureIntRegister(ExprResult);    // cond handle
+      ProcessExpression(Node.GetChild(1), AddrVal);
+      AddrVal := EnsureIntRegister(AddrVal);          // mutex handle
+      EmitInstruction(ssaCondWait, MakeSSAValue(svkNone), ExprResult, AddrVal, MakeSSAValue(svkNone));
+    end;
+
+    antCondSignal, antCondBroadcast, antCondDestroy:
+    begin
+      // CONDSIGNAL/CONDBROADCAST/CONDDESTROY cond — operate on the cond var named by the int handle.
+      ProcessExpression(Node.GetChild(0), ExprResult);
+      ExprResult := EnsureIntRegister(ExprResult);
+      case Node.NodeType of
+        antCondBroadcast: OpCode := ssaCondBroadcast;
+        antCondDestroy:   OpCode := ssaCondDestroy;
+      else
+        OpCode := ssaCondSignal;
       end;
       EmitInstruction(OpCode, MakeSSAValue(svkNone), ExprResult,
                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));

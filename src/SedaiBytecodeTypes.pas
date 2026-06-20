@@ -271,6 +271,14 @@ const
   bcMutexLock        = bcGroupCore + 118;
   bcMutexUnlock      = bcGroupCore + 119;
   bcMutexDestroy     = bcGroupCore + 120;
+  // Condition variables (M5.4, FB API). bcCondCreate writes a handle (Dest); bcCondWait takes a cond
+  // handle (Src1) and a mutex handle (Src2) and atomically unlocks+waits+relocks; Signal/Broadcast/
+  // Destroy take a cond handle (Src1).
+  bcCondCreate       = bcGroupCore + 121;
+  bcCondWait         = bcGroupCore + 122;
+  bcCondSignal       = bcGroupCore + 123;
+  bcCondBroadcast    = bcGroupCore + 124;
+  bcCondDestroy      = bcGroupCore + 125;
 
   // === GROUP 1: STRING OPERATIONS (0x01xx) ===
   bcStrConcat       = bcGroupString + 0;
@@ -1246,6 +1254,11 @@ begin
         118: Result := 'MutexLock';
         119: Result := 'MutexUnlock';
         120: Result := 'MutexDestroy';
+        121: Result := 'CondCreate';
+        122: Result := 'CondWait';
+        123: Result := 'CondSignal';
+        124: Result := 'CondBroadcast';
+        125: Result := 'CondDestroy';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

@@ -186,6 +186,16 @@ begin
       Line := Format('%4d: %-20s R%d', [Index, 'MutexUnlock', Instr.Src1]);
     bcMutexDestroy:
       Line := Format('%4d: %-20s R%d', [Index, 'MutexDestroy', Instr.Src1]);
+    bcCondCreate:
+      Line := Format('%4d: %-20s R%d = cond()', [Index, 'CondCreate', Instr.Dest]);
+    bcCondWait:
+      Line := Format('%4d: %-20s cond=R%d mutex=R%d', [Index, 'CondWait', Instr.Src1, Instr.Src2]);
+    bcCondSignal:
+      Line := Format('%4d: %-20s R%d', [Index, 'CondSignal', Instr.Src1]);
+    bcCondBroadcast:
+      Line := Format('%4d: %-20s R%d', [Index, 'CondBroadcast', Instr.Src1]);
+    bcCondDestroy:
+      Line := Format('%4d: %-20s R%d', [Index, 'CondDestroy', Instr.Src1]);
     bcEnd:
       Line := Format('%4d: %-20s', [Index, 'End']);
     bcStop:
