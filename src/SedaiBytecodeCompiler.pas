@@ -233,6 +233,9 @@ begin
     ssaRecordTypeId: Result := bcRecordTypeId;
     ssaRecMarkPush: Result := bcRecMarkPush;   // M8: block-scoped reclamation
     ssaRecMarkPop: Result := bcRecMarkPop;
+    ssaLoadProcAddr: Result := bcLoadProcAddr;  // M5.2: @sub → entry PC
+    ssaThreadCreate: Result := bcThreadCreate;
+    ssaThreadWait: Result := bcThreadWait;
     ssaRecordLoadInt: Result := bcRecordLoadInt;
     ssaRecordLoadFloat: Result := bcRecordLoadFloat;
     ssaRecordLoadString: Result := bcRecordLoadString;
@@ -1539,6 +1542,11 @@ begin
   begin
     AddJumpFixup(BCIndex, Instr.Dest.LabelName);
   end;
+
+  // M5.2: ssaLoadProcAddr (@sub) carries the procedure entry label in Src1; resolve it to the
+  // entry PC into the Immediate field, exactly like a call target.
+  if (Instr.OpCode = ssaLoadProcAddr) and (Instr.Src1.Kind = svkLabel) then
+    AddJumpFixup(BCIndex, Instr.Src1.LabelName);
 end;
 
 procedure TBytecodeCompiler.ResolveLabels;

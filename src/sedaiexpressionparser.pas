@@ -75,6 +75,8 @@ type
     function ParseInputFunction(Token: TLexerToken): TASTNode;
     function ParseUsrFunction(Token: TLexerToken): TASTNode;
     function ParseUserFunction(Token: TLexerToken): TASTNode;
+    function ParseProcAddress(Token: TLexerToken): TASTNode;   // @subname → antProcAddress (M5.2)
+    function ParseThreadCreate(Token: TLexerToken): TASTNode;  // THREADCREATE(@sub, param) (M5.2)
     function ParseSpecialVariable(Token: TLexerToken): TASTNode;
     {$IFDEF WEB_MODE}
     function ParseWebFunction(Token: TLexerToken): TASTNode;
@@ -115,6 +117,8 @@ function StaticParseSpriteFunction(Parser: Pointer; Token: TLexerToken): TObject
 function StaticParseInputFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseUsrFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseUserFunction(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseProcAddress(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseThreadCreate(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseSpecialVariable(Parser: Pointer; Token: TLexerToken): TObject;
 {$IFDEF WEB_MODE}
 function StaticParseWebFunction(Parser: Pointer; Token: TLexerToken): TObject;
@@ -223,6 +227,16 @@ end;
 function StaticParseUserFunction(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseUserFunction(Token);
+end;
+
+function StaticParseProcAddress(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseProcAddress(Token);
+end;
+
+function StaticParseThreadCreate(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseThreadCreate(Token);
 end;
 
 function StaticParseSpecialVariable(Parser: Pointer; Token: TLexerToken): TObject;
@@ -343,6 +357,9 @@ begin
   Context.SetParseRule(ttInputFunction, MakePrefixRule(@StaticParseInputFunction, precCall));
   Context.SetParseRule(ttUsrFunction, MakePrefixRule(@StaticParseUsrFunction, precCall));
   Context.SetParseRule(ttProcedureStart, MakePrefixRule(@StaticParseUserFunction, precCall));
+  // M5.2 threading: @subname (proc address) and THREADCREATE(@sub, param) as value expressions.
+  Context.SetParseRule(ttOpAt, MakePrefixRule(@StaticParseProcAddress, precUnary));
+  Context.SetParseRule(ttThreadCreate, MakePrefixRule(@StaticParseThreadCreate, precCall));
   Context.SetParseRule(ttSpecialVariable, MakePrefixRule(@StaticParseSpecialVariable, precPrimary));
 
   {$IFDEF WEB_MODE}
@@ -1247,6 +1264,61 @@ begin
     Exit;
   end;
 
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseProcAddress(Token: TLexerToken): TASTNode;
+begin
+  // '@' is already consumed; the next token must be a SUB/FUNCTION name (identifier).
+  // Lowers to antProcAddress (value = upper-cased proc name) → the procedure's entry PC.
+  if not Context.Check(ttIdentifier) then
+  begin
+    HandleError('Expected a SUB name after "@"', Context.CurrentToken);
+    Result := nil;
+    Exit;
+  end;
+  Result := TASTNode.CreateWithValue(antProcAddress, UpperCase(Context.CurrentToken.Value), Token);
+  Context.Advance;  // consume the proc name
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseThreadCreate(Token: TLexerToken): TASTNode;
+var
+  ProcExpr, ParamExpr: TASTNode;
+begin
+  // THREADCREATE(@sub [, param]) — spawn a worker thread; evaluates to an int handle.
+  // child0 = proc-address expression (@sub), child1 = the int parameter (default 0 if omitted).
+  Result := TASTNode.CreateWithValue(antThreadCreate, 'THREADCREATE', Token);
+  if not Context.Match(ttDelimParOpen) then
+  begin
+    HandleError('Expected "(" after THREADCREATE', Context.CurrentToken);
+    Result.Free; Result := nil; Exit;
+  end;
+  ProcExpr := ParseExpression;
+  if not Assigned(ProcExpr) then
+  begin
+    HandleError('Expected @sub as the first THREADCREATE argument', Context.CurrentToken);
+    Result.Free; Result := nil; Exit;
+  end;
+  Result.AddChild(ProcExpr);
+  if Context.Match(ttSeparParam) then
+  begin
+    ParamExpr := ParseExpression;
+    if not Assigned(ParamExpr) then
+    begin
+      HandleError('Expected a parameter expression after "," in THREADCREATE', Context.CurrentToken);
+      Result.Free; Result := nil; Exit;
+    end;
+    Result.AddChild(ParamExpr);
+  end
+  else
+    // Param omitted: default to integer 0 (FB allows the optional parameter to be absent).
+    Result.AddChild(TASTNode.CreateWithValue(antLiteral, '0', Token));
+  if not Context.Match(ttDelimParClose) then
+  begin
+    HandleError('Expected ")" after THREADCREATE arguments', Context.CurrentToken);
+    Result.Free; Result := nil; Exit;
+  end;
   DoNodeCreated(Result);
 end;
 

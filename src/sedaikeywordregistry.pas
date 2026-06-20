@@ -1594,6 +1594,8 @@ begin
  RegisterKeyword(kEXTENDS,  ttExtends,        'Type inheritance',   kcProcedures);
  RegisterKeyword(kBASE,     ttBaseCall,       'Base constructor call', kcProcedures);
  RegisterKeyword(kSHARED,   ttSharedDecl,     'Shared module global',  kcProcedures);
+ RegisterKeyword(kTHREADCREATE, ttThreadCreate, 'Spawn a worker thread', kcProcedures);
+ RegisterKeyword(kTHREADWAIT,   ttThreadWait,   'Join a worker thread',  kcProcedures);
 
  // === FLOW CONTROL - JUMP RELATED STATEMENTS ===
  RegisterKeyword(kEXIT,   ttJumpReturn,      'Exit statement',   kcJumpFlowControl);

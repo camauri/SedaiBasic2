@@ -186,6 +186,8 @@ begin
     bcRecordNew, bcRecordLoadInt,
     // OOP (M4.3): RecordTypeId writes the runtime type-id (int).
     bcRecordTypeId,
+    // OS threading (M5.2): LoadProcAddr writes an entry PC (int); ThreadCreate writes a thread handle (int).
+    bcLoadProcAddr, bcThreadCreate,
     // === GROUP 0: Core VM operations ===
     // Integer operations
     bcLoadConstInt, bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -344,6 +346,9 @@ begin
     bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString,
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString,
     bcRecordTypeId,   // OOP (M4.3): Src1 = handle
+    // OS threading (M5.2): ThreadCreate Src1 = proc-addr reg; ThreadWait Src1 = handle reg.
+    // (bcLoadProcAddr's Src1 is the entry-PC label → Immediate, not a register, so it is excluded.)
+    bcThreadCreate, bcThreadWait,
 
     // === GROUP 0: Core VM operations ===
     // Int arithmetic
@@ -465,6 +470,8 @@ begin
   case OpCode of
     // UDT/record (M3): RecordStoreInt's Src2 is the int value being written.
     bcRecordStoreInt,
+    // OS threading (M5.2): ThreadCreate's Src2 is the int worker parameter.
+    bcThreadCreate,
     // === GROUP 0: Core VM operations ===
     // Int arithmetic (second operand)
     bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt,

@@ -72,6 +72,8 @@ const
   kBYREF   = 'BYREF';    // BYREF: pass parameter by reference (alias) — the default
   kBASE    = 'BASE';     // BASE(args): explicit base-constructor call inside a child CONSTRUCTOR (M4.4f)
   kSHARED  = 'SHARED';   // DIM SHARED x: module-level variable visible (read/write) inside SUB/FUNCTION (M6)
+  kTHREADCREATE = 'THREADCREATE'; // h = THREADCREATE(@sub, param): spawn an OS worker thread (M5.2, FB API)
+  kTHREADWAIT   = 'THREADWAIT';   // THREADWAIT h: join a worker thread by handle (M5.2, FB API)
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';

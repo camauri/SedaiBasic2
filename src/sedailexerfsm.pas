@@ -1832,6 +1832,20 @@ begin
           Exit;
         end;
 
+      // === AT OPERATOR (proc-address prefix: @subname) ===
+      '@':
+        begin
+          ResetToken;
+          TokenBufferAdd(CurrentChar);
+          AdvanceChar;
+          Result := CreateToken(ttOpAt);
+          {$IFDEF DEBUG}
+          if FDebugMode then
+            FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
+          {$ENDIF}
+          Exit;
+        end;
+
       //// === DOT OPERATOR ===
       //'.':
       //  begin

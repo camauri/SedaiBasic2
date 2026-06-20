@@ -138,7 +138,8 @@ begin
     Instr := FProgram.GetInstruction(i);
 
     case TBytecodeOp(Instr.OpCode) of
-      bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcCallSub:
+      bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcCallSub,
+      bcLoadProcAddr:   // M5.2: Immediate is a SUB entry PC (a worker enters there) → a block boundary
       begin
         Target := Instr.Immediate;
         if (Target >= 0) and (Target < FProgram.GetInstructionCount) then

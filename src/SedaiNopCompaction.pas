@@ -119,7 +119,9 @@ function IsJumpOrBranchOp(OpCode: Word): Boolean;
 begin
   // Check base bytecode jump instructions
   case OpCode of
-    Ord(bcJump), Ord(bcJumpIfZero), Ord(bcJumpIfNotZero), Ord(bcCall), Ord(bcCallSub):
+    Ord(bcJump), Ord(bcJumpIfZero), Ord(bcJumpIfNotZero), Ord(bcCall), Ord(bcCallSub),
+    // M5.2: bcLoadProcAddr's Immediate is a SUB entry PC; remap it when instructions shift, like a call target.
+    Ord(bcLoadProcAddr):
       Result := True;
     // Fused compare-and-branch (Int)
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt:

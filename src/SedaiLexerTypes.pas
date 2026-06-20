@@ -86,6 +86,7 @@ type
     ttOpPow,                 // ^
     ttOpMod,                 // MOD
     ttOpDot,                 // . (member access: record.field)
+    ttOpAt,                  // @ (proc-address prefix: @subname → entry PC, for Threadcreate)
 
     // === COMPARISON OPERATORS ===
     ttOpEq,                  // =
@@ -167,6 +168,8 @@ type
     ttParamMode,              // BYVAL / BYREF (parameter passing convention)
     ttBaseCall,               // BASE (explicit base-constructor call inside a child CONSTRUCTOR)
     ttSharedDecl,             // SHARED (DIM SHARED: module global visible inside SUB/FUNCTION)
+    ttThreadCreate,           // THREADCREATE (expression: THREADCREATE(@sub, param) → thread handle)
+    ttThreadWait,             // THREADWAIT (statement: join a worker thread by handle)
 
     // === DATA HANDLING ===
     ttDataAssignment,         // LET, SET, :=
@@ -363,6 +366,7 @@ const
     ttKeyword, ttLoopBlockStart, ttLoopBlockEnd,
     ttBlockBegin, ttBlockEnd, ttProcedureStart, ttProcedureEnd, ttCallSub,
     ttTypeDecl, ttAsType, ttWithBlock, ttExtends, ttParamMode, ttBaseCall, ttSharedDecl,
+    ttThreadWait,
     ttJumpKeyword, ttDataDeclaration, ttDataAssignment, ttCommentRemark,
     ttBitwiseOperator
   ];

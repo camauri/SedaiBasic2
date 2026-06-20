@@ -53,14 +53,18 @@ begin
   if Instructions = nil then raise Exception.Create('Empty program');
 
   InstrCount := FProgram.GetInstructionCount;
-  CurPC := FProgram.EntryPoint;
-  // M5.2: bind the active execution context once (a worker thread will supply its own here in
-  // M5.2b — a single read per Run, so per-instruction access stays a register-direct Ctx.*).
-  Ctx := FCtx;
+  // M5.2: bind the active execution context once per Run — a worker thread supplies its own via
+  // the GActiveCtx threadvar (set by WorkerThreadEntry before calling RunFast); the main thread
+  // leaves it nil and uses FCtx. A single read per Run keeps per-instruction access register-direct.
+  if GActiveCtx <> nil then Ctx := GActiveCtx else Ctx := FCtx;
+  // The main context starts at the program EntryPoint (StartPC = -1); a worker starts at the entry
+  // PC of the SUB it runs (StartPC set in RunWorker), with a synthetic call frame already primed.
+  if Ctx.StartPC >= 0 then CurPC := Ctx.StartPC else CurPC := FProgram.EntryPoint;
   Ctx.Running := True;  // Mark VM as running
-  // M5.3: the thread that drives the execution loop is the render owner (only it may touch
-  // the SDL device). Worker contexts (M5.2) defer their graphics ops to it via the draw queue.
-  FRenderOwnerThreadId := GetCurrentThreadID;
+  // M5.3: the main thread is the render owner (only it may touch the SDL device). A worker
+  // (GActiveCtx <> nil) must never steal ownership; its graphics ops defer to the owner's draw queue.
+  if GActiveCtx = nil then
+    FRenderOwnerThreadId := GetCurrentThreadID;
 
   // Get direct pointers to register arrays
   IntRegs := @Ctx.IntRegs[0];
@@ -129,8 +133,9 @@ begin
     Inc(FInstructionsExecuted);
     {$ENDIF}
 
-    // Periodic event polling via callback - keeps UI responsive
-    if Assigned(FEventPollCallback) then
+    // Periodic event polling via callback - keeps UI responsive. M5.2: only the main thread
+    // (GActiveCtx = nil) polls — the callback touches SDL/input, which is not thread-safe.
+    if Assigned(FEventPollCallback) and (GActiveCtx = nil) then
     begin
       Inc(EventPollCounter);
       if EventPollCounter >= FEventPollInterval then
@@ -528,6 +533,20 @@ begin
             CurPC := Ctx.CallStack[Ctx.CallStackPtr];
             FramePop(Ctx);
           end;
+        // OS threading (M5.2, FreeBASIC API).
+        bcLoadProcAddr:
+          // @sub: the SUB's entry PC was resolved into Immediate at link time; load it into Dest.
+          begin Ctx.IntRegs[Instr.Dest] := Instr.Immediate; Inc(CurPC); end;
+        bcThreadCreate:
+          // h = THREADCREATE(@sub, param): spawn a worker running the SUB at the entry PC (Src1)
+          // with the int parameter (Src2); the returned int handle goes into Dest. Falls through.
+          begin
+            Ctx.IntRegs[Instr.Dest] := SpawnWorker(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);
+            Inc(CurPC);
+          end;
+        bcThreadWait:
+          // THREADWAIT h: join the worker named by the handle in Src1, then continue.
+          begin JoinWorker(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
         // Block-scoped record reclamation (M8): mark at a loop-body entry, reclaim at its exit.
         bcRecMarkPush:
           begin

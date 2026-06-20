@@ -175,6 +175,14 @@ var
 begin
   Result := '';
 
+  // M5.2 threading core opcodes (114-116) — formatted before the >= 100 branch below, which
+  // otherwise misreads any core opcode >= 100 as a superinstruction (a pre-existing sbd quirk).
+  case Instr.OpCode of
+    bcLoadProcAddr: begin Result := Format('R%d = @%d', [Instr.Dest, Instr.Immediate]); Exit; end;
+    bcThreadCreate: begin Result := Format('R%d = thread(R%d, R%d)', [Instr.Dest, Instr.Src1, Instr.Src2]); Exit; end;
+    bcThreadWait:   begin Result := Format('R%d', [Instr.Src1]); Exit; end;
+  end;
+
   // Handle superinstructions (opcodes 100+) separately
   if Instr.OpCode >= 100 then
   begin
@@ -298,6 +306,7 @@ begin
       Result := Format('ARR[%d] fill records', [Instr.Src1]);
     bcRecordTypeId:
       Result := Format('R%d = typeid[R%d]', [Instr.Dest, Instr.Src1]);
+    // (bcLoadProcAddr / bcThreadCreate / bcThreadWait are handled at the top of FormatOperands.)
 
     bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
     bcPrintInt, bcPrintIntLn:

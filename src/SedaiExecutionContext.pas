@@ -68,6 +68,9 @@ type
 
     // --- Program counter / run state ---
     PC: Integer;
+    // M5.2: where this context's run loop starts. The main context uses -1 (= program EntryPoint);
+    // a worker sets it to the entry PC of the SUB it runs, so Run begins at the worker's procedure.
+    StartPC: Integer;
     Running: Boolean;
     Stopped: Boolean;           // True if stopped by STOP command (can CONT)
     StoppedPC: Integer;         // PC to resume from when CONT is called

@@ -97,6 +97,9 @@ type
     ssaRecordNew, ssaRecordNewArray, ssaRecordTypeId,
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString,
     ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
+    // OS threading (M5.2, FreeBASIC API): @sub → entry PC (Dest=int reg, Src1=svkLabel PROC_name);
+    // THREADCREATE (Dest=int handle, Src1=procAddr reg, Src2=param reg); THREADWAIT (Src1=handle reg).
+    ssaLoadProcAddr, ssaThreadCreate, ssaThreadWait,
     ssaRecMarkPush, ssaRecMarkPop,   // M8: block-scoped record reclamation (loop-body DIMs)
 
     ssaArrayLoad, ssaArrayStore, ssaArrayDim,

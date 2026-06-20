@@ -33,6 +33,8 @@ program SedaiBasicVM;
 {$I ProfilerFlags.inc}
 
 uses
+  // M5.2 threading: on Unix the cthreads unit MUST be first so BeginThread uses pthreads.
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   {$IFDEF WINDOWS}Windows,{$ENDIF}
   Classes, SysUtils, Variants, TypInfo, Math,
   // Lexer/Parser

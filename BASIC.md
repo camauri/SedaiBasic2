@@ -2301,8 +2301,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `THREADCALL` | ✗ | Starts a procedure with parameters in a separate thread of execution. |
-| `THREADCREATE` | ✗ | Starts a procedure in a separate thread of execution. |
-| `THREADWAIT` | ✗ | Waits for a thread to finish and releases the thread handle. |
+| `THREADCREATE` | ✓ | Starts a procedure in a separate thread of execution. `h = THREADCREATE(@sub [, intparam])` (M5.2; v1: one int param, workers share global arrays only). |
+| `THREADWAIT` | ✓ | Waits for a thread to finish and releases the thread handle. `THREADWAIT h` (M5.2). |
 | `THREADDETACH` | ✗ | Releases a thread handle without waiting for the thread to finish. |
 | `THREADSELF` | ✗ | Returns the thread handle of the current thread. |
 

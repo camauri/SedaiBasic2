@@ -156,7 +156,8 @@ begin
     if Instr.OpCode < bcGroupString then
     begin
       case Instr.OpCode of
-        bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcCallSub:
+        bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcCallSub,
+        bcLoadProcAddr:   // M5.2: Immediate is a SUB entry PC → a block boundary (worker entry)
           if Instr.Immediate = Index then
           begin
             Result := True;
@@ -226,7 +227,9 @@ begin
       // Standard control flow opcodes in Group 0
       case Instr.OpCode of
         bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcReturn, bcEnd, bcStop,
-        bcCallSub, bcReturnSub:
+        bcCallSub, bcReturnSub,
+        // M5.2: spawning/joining a worker is a side-effecting barrier (the worker touches shared state).
+        bcThreadCreate, bcThreadWait:
           IsControlFlow := True;
       end;
     end

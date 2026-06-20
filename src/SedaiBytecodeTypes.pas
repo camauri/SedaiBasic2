@@ -257,6 +257,14 @@ const
   // No operands. The mark stack is independent of the frame save/restore (which also resets it).
   bcRecMarkPush      = bcGroupCore + 112;
   bcRecMarkPop       = bcGroupCore + 113;
+  // OS threading (M5.2, FreeBASIC API). bcLoadProcAddr resolves a SUB's PROC_<name> label to its
+  // entry PC into an int register (Dest=int reg; Immediate=entry PC, filled by the label fixup like
+  // bcCallSub). bcThreadCreate spawns an RTL worker thread running that SUB on a fresh execution
+  // context (Dest=int handle; Src1=proc-addr reg; Src2=param reg → the worker's XferInt[0]).
+  // bcThreadWait joins a worker by handle (Src1=handle reg).
+  bcLoadProcAddr     = bcGroupCore + 114;
+  bcThreadCreate     = bcGroupCore + 115;
+  bcThreadWait       = bcGroupCore + 116;
 
   // === GROUP 1: STRING OPERATIONS (0x01xx) ===
   bcStrConcat       = bcGroupString + 0;
@@ -1223,6 +1231,11 @@ begin
         109: Result := 'RecordStoreString';
         110: Result := 'RecordNewArray';
         111: Result := 'RecordTypeId';
+        112: Result := 'RecMarkPush';
+        113: Result := 'RecMarkPop';
+        114: Result := 'LoadProcAddr';
+        115: Result := 'ThreadCreate';
+        116: Result := 'ThreadWait';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

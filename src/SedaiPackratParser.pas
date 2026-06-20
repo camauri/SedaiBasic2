@@ -123,6 +123,8 @@ type
     function ParseCallStatement: TASTNode;
     // BASE [ ( args ) ] : explicit base-constructor call inside a child CONSTRUCTOR (M4.4f).
     function ParseBaseStatement: TASTNode;
+    // THREADWAIT handle : join a worker thread by handle (M5.2 threading).
+    function ParseThreadWaitStatement: TASTNode;
     // SHARED used as a standalone statement (not as the DIM SHARED modifier): not a -lang fb feature;
     // report a clean error pointing to DIM SHARED at module level, then recover.
     function ParseSharedError: TASTNode;
@@ -539,6 +541,7 @@ begin
         Result := Memoize('FnStatement', @ParseFnStatement);
     ttCallSub: Result := Memoize('CallStatement', @ParseCallStatement);
     ttBaseCall: Result := Memoize('BaseStatement', @ParseBaseStatement);
+    ttThreadWait: Result := Memoize('ThreadWaitStatement', @ParseThreadWaitStatement);
     ttSharedDecl: Result := ParseSharedError;   // SHARED is only the DIM SHARED modifier, not a statement
     ttTypeDecl: Result := Memoize('TypeDecl', @ParseTypeDecl);
     ttWithBlock: Result := ParseWith;
@@ -1506,6 +1509,28 @@ begin
   end;
   if HasParens and Context.Check(ttDelimParClose) then
     Context.Advance;                              // )
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseThreadWaitStatement: TASTNode;
+var
+  Token: TLexerToken;
+  HandleExpr: TASTNode;
+  HasParens: Boolean;
+begin
+  // THREADWAIT handle  (or THREADWAIT(handle)) — join a worker thread. Lowers to antThreadWait
+  // with the handle expression as child0; SSA emits ssaThreadWait(handle).
+  Token := Context.CurrentToken;
+  Context.Advance;                                // consume THREADWAIT
+  Result := nil;
+  HasParens := Context.Check(ttDelimParOpen);
+  if HasParens then Context.Advance;              // (
+  HandleExpr := FExpressionParser.ParseExpression;
+  if not Assigned(HandleExpr) then Exit;          // malformed THREADWAIT
+  if HasParens and Context.Check(ttDelimParClose) then
+    Context.Advance;                              // )
+  Result := TASTNode.CreateWithValue(antThreadWait, 'THREADWAIT', Token);
+  Result.AddChild(HandleExpr);
   DoNodeCreated(Result);
 end;
 

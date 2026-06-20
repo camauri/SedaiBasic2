@@ -172,6 +172,12 @@ begin
       Line := Format('%4d: %-20s', [Index, 'RecMarkPush']);
     bcRecMarkPop:
       Line := Format('%4d: %-20s', [Index, 'RecMarkPop']);
+    bcLoadProcAddr:
+      Line := Format('%4d: %-20s R%d = @%d', [Index, 'LoadProcAddr', Instr.Dest, Instr.Immediate]);
+    bcThreadCreate:
+      Line := Format('%4d: %-20s R%d = thread(R%d, R%d)', [Index, 'ThreadCreate', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcThreadWait:
+      Line := Format('%4d: %-20s R%d', [Index, 'ThreadWait', Instr.Src1]);
     bcEnd:
       Line := Format('%4d: %-20s', [Index, 'End']);
     bcStop:

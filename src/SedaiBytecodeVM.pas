@@ -102,6 +102,12 @@ type
     FDrainCtx: TExecutionContext;       // scratch context used to replay a drained command
     FRenderOwnerThreadId: TThreadID;    // the thread allowed to render (set when Run begins)
     FHasWorkers: Boolean;               // True once a worker context has been spawned (M5.2)
+    // M5.2: live worker threads. Each entry is a TWorkerSpawn (declared in the implementation);
+    // a Threadcreate handle is (index + 1), 0 = invalid. Guarded by FWorkerLock since a worker may
+    // itself spawn/join. The table is append-only for the program's life (joined entries stay,
+    // so a stale handle is harmless); contexts/spawn records are freed in the VM destructor.
+    FWorkerThreads: array of TObject;
+    FWorkerLock: TRTLCriticalSection;
     FProgram: TBytecodeProgram;
     FOutputDevice: IOutputDevice;
     FInputDevice: IInputDevice;
@@ -194,6 +200,15 @@ type
     procedure EnsureRegisterCapacity(Ctx: TExecutionContext; RegType: TSSARegisterType; MinIndex: Integer);
     procedure FramePush(Ctx: TExecutionContext);   // bcCallSub: snapshot whole register banks
     procedure FramePop(Ctx: TExecutionContext);    // bcReturnSub: restore whole register banks
+    // M5.2 OS threading: spawn/join workers running their own TExecutionContext over the shared
+    // program/heap (FreeBASIC shared-memory model). SetupWorkerContext sizes a fresh context's banks;
+    // SpawnWorker BeginThreads a worker (returns the handle); JoinWorker waits on it; RunWorker is the
+    // worker-thread body (Spawn is a TWorkerSpawn) that primes a synthetic call frame and runs the loop.
+    procedure SetupWorkerContext(WCtx: TExecutionContext);
+    function SpawnWorker(EntryPC, Param: Int64): Int64;
+    procedure JoinWorker(Handle: Int64);
+    procedure RunWorker(Spawn: TObject);
+    procedure CleanupWorkers;   // join any survivors + free spawn records/contexts (destructor)
     function AllocRecord(Ctx: TExecutionContext; IntC, FloatC, StrC, TypeId: Integer): Integer;  // M3: new record instance -> handle
     procedure RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
     procedure CheckFloatValid(Ctx: TExecutionContext; RegIndex: Integer; const OpName: string);
@@ -272,6 +287,42 @@ type
   end;
 
 implementation
+
+type
+  // M5.2: one record per spawned worker thread. Carries everything the RTL thread function needs:
+  // the VM (shared program/heap/runtime), the worker's own TExecutionContext, the SUB entry PC and
+  // the int parameter. Lives in the VM's FWorkerThreads table for the program's lifetime.
+  TWorkerSpawn = class
+    VM: TBytecodeVM;
+    Ctx: TExecutionContext;
+    EntryPC: Integer;
+    Param: Int64;
+    ThreadId: TThreadID;
+    Joined: Boolean;
+  end;
+
+threadvar
+  // M5.2: the execution context the current thread runs. nil on the main thread (which uses the VM's
+  // FCtx); set by WorkerThreadEntry to the worker's own context before it enters the run loop. Read
+  // once per Run (RunTemplate.inc) so the hot path stays register-direct — the point of M5.2a.
+  GActiveCtx: TExecutionContext;
+
+function WorkerThreadEntry(p: Pointer): PtrInt;
+// RTL thread entry (BeginThread): bind this thread's active context, run the worker SUB, then exit.
+var
+  Spawn: TWorkerSpawn;
+begin
+  Spawn := TWorkerSpawn(p);
+  GActiveCtx := Spawn.Ctx;
+  try
+    Spawn.VM.RunWorker(Spawn);
+  except
+    // A worker must never propagate an exception past the RTL thread boundary (it would abort the
+    // process). v1: swallow it — the join still completes. (Proper per-thread error reporting: M5.5.)
+  end;
+  GActiveCtx := nil;
+  Result := 0;
+end;
 
 {$IFDEF WITH_SEDAI_AUDIO}
 const
@@ -365,6 +416,11 @@ begin
   FDrainCtx := TExecutionContext.Create;
   FRenderOwnerThreadId := GetCurrentThreadID;
   FHasWorkers := False;
+  // M5.2: the main context starts at the program EntryPoint (StartPC = -1); workers override it.
+  FCtx.StartPC := -1;
+  FDrainCtx.StartPC := -1;
+  SetLength(FWorkerThreads, 0);
+  InitCriticalSection(FWorkerLock);
   FProgram := nil;
   FCtx.PC := 0;
   FCtx.Running := False;
@@ -500,6 +556,9 @@ begin
   if FOwnsConsoleBehavior and Assigned(FConsoleBehavior) then
     FConsoleBehavior.Free;
   FVarMap.Free;
+  // M5.2: join any worker still running, then free its spawn record + context.
+  CleanupWorkers;
+  DoneCriticalSection(FWorkerLock);
   FCtx.Free;
   FDrainCtx.Free;
   FDrawQueue.Free;
@@ -1208,6 +1267,136 @@ begin
   TypeId := (PackedCounts shr 48) and $FFFF;
   for k := 0 to FArrays[ArrayId].TotalSize - 1 do
     FArrays[ArrayId].IntData[k] := AllocRecord(Ctx, IntC, FloatC, StrC, TypeId);
+end;
+
+procedure TBytecodeVM.SetupWorkerContext(WCtx: TExecutionContext);
+// Size a fresh worker context's banks/stacks to the program's needs and zero them — the same
+// initial state InitializeRegisters + the constructor give the main context. Register banks are
+// sized to the main context's current counts (already grown to the program's full register usage),
+// so the worker SUB never indexes past its banks. FB locals/registers start at 0 / 0.0 / ''.
+var i: Integer;
+begin
+  WCtx.IntRegCount := FCtx.IntRegCount;
+  WCtx.FloatRegCount := FCtx.FloatRegCount;
+  WCtx.StringRegCount := FCtx.StringRegCount;
+  SetLength(WCtx.IntRegs, WCtx.IntRegCount);
+  SetLength(WCtx.FloatRegs, WCtx.FloatRegCount);
+  SetLength(WCtx.StringRegs, WCtx.StringRegCount);
+  SetLength(WCtx.TempIntRegs, WCtx.IntRegCount);
+  SetLength(WCtx.TempFloatRegs, WCtx.FloatRegCount);
+  SetLength(WCtx.TempFStringRegs, WCtx.StringRegCount);
+  for i := 0 to WCtx.IntRegCount - 1 do begin WCtx.IntRegs[i] := 0; WCtx.TempIntRegs[i] := 0; end;
+  for i := 0 to WCtx.FloatRegCount - 1 do begin WCtx.FloatRegs[i] := 0.0; WCtx.TempFloatRegs[i] := 0.0; end;
+  for i := 0 to WCtx.StringRegCount - 1 do begin WCtx.StringRegs[i] := ''; WCtx.TempFStringRegs[i] := ''; end;
+  SetLength(WCtx.CallStack, 256);
+  SetLength(WCtx.XferInt, 256);
+  SetLength(WCtx.XferFloat, 256);
+  SetLength(WCtx.XferStr, 256);
+  WCtx.CallStackPtr := 0;
+  WCtx.FrameSaveIntTop := 0;
+  WCtx.FrameSaveFloatTop := 0;
+  WCtx.FrameSaveStrTop := 0;
+  WCtx.FrameRecBaseTop := 0;
+  WCtx.BlockRecMarkTop := 0;
+  SetLength(WCtx.Records, 0);
+  WCtx.RecordCount := 0;
+  WCtx.CursorCol := 0;
+  WCtx.TrapLine := 0;
+  WCtx.TrapPC := -1;
+  WCtx.ResumePC := -1;
+  WCtx.InErrorHandler := False;
+  WCtx.PC := 0;
+end;
+
+function TBytecodeVM.SpawnWorker(EntryPC, Param: Int64): Int64;
+// bcThreadCreate: register a worker (handle = index+1) and BeginThread it. The worker runs the SUB
+// at EntryPC on its own context; Param is delivered as the SUB's first int argument. From the first
+// spawn FHasWorkers is True, wiring the M5.3 draw queue (off-owner graphics ops marshal to the owner).
+var
+  Spawn: TWorkerSpawn;
+  Idx: Integer;
+begin
+  Spawn := TWorkerSpawn.Create;
+  Spawn.VM := Self;
+  Spawn.Ctx := TExecutionContext.Create;
+  Spawn.EntryPC := EntryPC;
+  Spawn.Param := Param;
+  Spawn.Joined := False;
+  EnterCriticalSection(FWorkerLock);
+  try
+    Idx := Length(FWorkerThreads);
+    SetLength(FWorkerThreads, Idx + 1);
+    FWorkerThreads[Idx] := Spawn;
+    FHasWorkers := True;
+    Result := Idx + 1;   // handle (0 = invalid)
+  finally
+    LeaveCriticalSection(FWorkerLock);
+  end;
+  Spawn.ThreadId := BeginThread(@WorkerThreadEntry, Pointer(Spawn));
+end;
+
+procedure TBytecodeVM.RunWorker(Spawn: TObject);
+// Worker-thread body (called from WorkerThreadEntry, with GActiveCtx already = Sp.Ctx). Initialise the
+// context, prime a synthetic call frame identical to bcCallSub (so the SUB's bcReturnSub exits the
+// loop) and enter the run loop at the SUB's entry PC.
+var
+  Sp: TWorkerSpawn;
+  WCtx: TExecutionContext;
+begin
+  Sp := TWorkerSpawn(Spawn);
+  WCtx := Sp.Ctx;
+  SetupWorkerContext(WCtx);
+  WCtx.StartPC := Sp.EntryPC;
+  FramePush(WCtx);                                  // snapshot the (zeroed) banks for the SUB frame
+  WCtx.CallStack[0] := FProgram.GetInstructionCount;  // return-to-stop sentinel (CurPC >= InstrCount → exit)
+  WCtx.CallStackPtr := 1;
+  WCtx.XferInt[0] := Sp.Param;                      // SUB's first int param, loaded by its prologue
+  RunFast;                                          // binds Ctx := GActiveCtx, starts at WCtx.StartPC
+end;
+
+procedure TBytecodeVM.JoinWorker(Handle: Int64);
+// bcThreadWait: wait for the worker named by Handle to terminate (once). Invalid/stale handles and
+// already-joined workers are no-ops, matching FB's tolerant Threadwait.
+var
+  Spawn: TWorkerSpawn;
+begin
+  Spawn := nil;
+  EnterCriticalSection(FWorkerLock);
+  try
+    if (Handle >= 1) and (Handle <= Length(FWorkerThreads)) then
+    begin
+      Spawn := TWorkerSpawn(FWorkerThreads[Handle - 1]);
+      if (Spawn = nil) or Spawn.Joined then
+        Spawn := nil           // nothing to wait on
+      else
+        Spawn.Joined := True;  // claim the join under the lock so only one thread waits
+    end;
+  finally
+    LeaveCriticalSection(FWorkerLock);
+  end;
+  if Spawn <> nil then
+    WaitForThreadTerminate(Spawn.ThreadId, 0);  // 0 = wait indefinitely
+end;
+
+procedure TBytecodeVM.CleanupWorkers;
+// Destructor helper: join any worker still running, then free its context and spawn record.
+var
+  i: Integer;
+  Spawn: TWorkerSpawn;
+begin
+  for i := 0 to Length(FWorkerThreads) - 1 do
+  begin
+    Spawn := TWorkerSpawn(FWorkerThreads[i]);
+    if Spawn = nil then Continue;
+    if not Spawn.Joined then
+    begin
+      WaitForThreadTerminate(Spawn.ThreadId, 0);
+      Spawn.Joined := True;
+    end;
+    Spawn.Ctx.Free;
+    Spawn.Free;
+  end;
+  SetLength(FWorkerThreads, 0);
 end;
 
 procedure TBytecodeVM.EnsureRegisterCapacity(Ctx: TExecutionContext; RegType: TSSARegisterType; MinIndex: Integer);
