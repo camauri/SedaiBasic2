@@ -132,6 +132,7 @@ type
     FSharedScalarArr: TStringList;       // name (UPPER) -> array index (Objects[]=PtrInt arrayIdx)
     FVarWidthCode: TStringList;          // B1.5 phase 2: name (UPPER) -> narrow width code (Objects[]=PtrInt 1..7)
     FVarPrintKind: TStringList;          // B1.5 phase C: name (UPPER) -> 1=BOOLEAN, 2=unsigned-64 (print form)
+    FArrayElemWidth: TStringList;        // B1.5: array name (UPPER) -> element narrow width code (1..7)
     FInDispatcher: Boolean;              // M6: true while emitting a virtual dispatcher (skip shared sync)
     FBlockHandledVars: TStringList;      // M8: var names destructed block-scoped (excluded from frame/module dtors)
     FCurrentTopLevelLabels: TStringList;  // GOTO-unwind: names of labels at block-depth 0 in the current frame
@@ -235,7 +236,8 @@ type
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
     function TypeNameWidthCode(const TypeName: string): Integer;        // B1.5 phase 2: type -> narrow code
     procedure RecordVarWidth(const VarName, TypeName: string);          // B1.5 phase 2: remember a var's width
-    function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on store
+    function ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;  // narrow by an explicit width code
+    function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on scalar store
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
     // Resolve a member-access object (a record variable or an array-of-UDT element) to its
@@ -442,6 +444,8 @@ begin
   FVarWidthCode.CaseSensitive := False;
   FVarPrintKind := TStringList.Create;
   FVarPrintKind.CaseSensitive := False;
+  FArrayElemWidth := TStringList.Create;
+  FArrayElemWidth.CaseSensitive := False;
   FInDispatcher := False;
   FBlockHandledVars := TStringList.Create;
   FBlockHandledVars.CaseSensitive := False;
@@ -472,6 +476,7 @@ begin
   FSharedScalarArr.Free;
   FVarWidthCode.Free;
   FVarPrintKind.Free;
+  FArrayElemWidth.Free;
   FBlockHandledVars.Free;
   FCurrentTopLevelLabels.Free;
   inherited Destroy;
@@ -3465,6 +3470,11 @@ begin
   // Evaluate value expression
   ProcessExpression(ExprNode, ExprValue);
 
+  // B1.5: a narrow element type (DIM a(n) AS BYTE/SHORT/.../SINGLE) wraps/rounds the value on store.
+  j := FArrayElemWidth.IndexOf(UpperCase(ArrName));
+  if j >= 0 then
+    ExprValue := ApplyNarrowCode(PtrInt(FArrayElemWidth.Objects[j]), ExprValue);
+
   {$IFNDEF DISABLE_CONSTANT_FOLDING}
   // OPTIMIZATION: Constant folding for type conversions
   // Convert constants at compile-time instead of emitting runtime instructions
@@ -3553,7 +3563,7 @@ var
   LowerBounds: array of Integer;  // FB "lb TO ub": constant lower bound per dimension (0 = default)
   HasLowerBounds: Boolean;
   LbVal: TSSAValue;
-  DimCount, i, j, ArrayIdx: Integer;
+  DimCount, i, j, ArrayIdx, WIdx: Integer;
   DimValue: TSSAValue;
   DimValues: array of TSSAValue;  // Store dimension values (registers or constants)
   DimRegs: array of Integer;      // Register indices for variable dimensions
@@ -3738,6 +3748,21 @@ begin
       ElementType := TypeNameToBank(ArrElemTypeName, ArrName)
     else
       ElementType := GetVariableType(ArrName);
+
+    // B1.5: remember a narrow element width (DIM a(n) AS BYTE/.../SINGLE) so element stores wrap to it.
+    if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') then
+    begin
+      WIdx := FArrayElemWidth.IndexOf(UpperCase(ArrName));
+      if TypeNameWidthCode(ArrElemTypeName) <> 0 then
+      begin
+        if WIdx >= 0 then
+          FArrayElemWidth.Objects[WIdx] := TObject(PtrInt(TypeNameWidthCode(ArrElemTypeName)))
+        else
+          FArrayElemWidth.AddObject(UpperCase(ArrName), TObject(PtrInt(TypeNameWidthCode(ArrElemTypeName))));
+      end
+      else if WIdx >= 0 then
+        FArrayElemWidth.Delete(WIdx);  // re-DIM to a wide element type clears prior narrowing
+    end;
 
     // Validate dimensions node
     if DimsNode.NodeType <> antDimensions then
@@ -8999,16 +9024,22 @@ begin
 end;
 
 function TSSAGenerator.ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;
-// On store to a narrow-typed scalar, wrap/sign-extend (int widths) or round to single. Folds
-// constants; otherwise emits bcNarrowInt / bcNarrowSingle. No-op for full-width / untracked vars.
+// On store to a narrow-typed scalar, narrow the value to the declared width. No-op for untracked vars.
 var
-  Idx, W: Integer;
+  Idx: Integer;
+begin
+  Idx := FVarWidthCode.IndexOf(UpperCase(VarName));
+  if Idx < 0 then Exit(Value);
+  Result := ApplyNarrowCode(PtrInt(FVarWidthCode.Objects[Idx]), Value);
+end;
+
+function TSSAGenerator.ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;
+// Wrap/sign-extend (int widths 1..6) or round to single (7) a value before a store to a narrow-typed
+// destination. Folds constants; otherwise emits bcNarrowInt / bcNarrowSingle. W=0 -> no-op.
+var
   NarrowReg: TSSAValue;
 begin
   Result := Value;
-  Idx := FVarWidthCode.IndexOf(UpperCase(VarName));
-  if Idx < 0 then Exit;
-  W := PtrInt(FVarWidthCode.Objects[Idx]);
   if W = 7 then
   begin
     // SINGLE: round a float value to single precision.
@@ -11448,6 +11479,7 @@ begin
   FSharedScalarArr.Clear;
   FVarWidthCode.Clear;
   FVarPrintKind.Clear;
+  FArrayElemWidth.Clear;
   CollectSharedVars(AST);
 
   // M8: reset block-scope state (block-scoped record reclamation; the scope stack itself was reset above).
