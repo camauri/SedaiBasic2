@@ -241,6 +241,10 @@ const
   // FreeBASIC array bound queries (B1.4)
   kLBOUND  = 'LBOUND';    // lower bound of an array dimension
   kUBOUND  = 'UBOUND';    // upper bound of an array dimension
+  // FreeBASIC array statements (B1.4)
+  kERASE   = 'ERASE';     // reset array elements to default
+  kREDIM   = 'REDIM';     // re-dimension an array
+  kPRESERVE = 'PRESERVE'; // REDIM PRESERVE modifier (keep existing data)
 
   // String functions
   kASC     = 'ASC';

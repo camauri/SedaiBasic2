@@ -252,6 +252,8 @@ type
     procedure ProcessPrint(Node: TASTNode);
     procedure ProcessInput(Node: TASTNode);
     procedure ProcessDim(Node: TASTNode);
+    procedure ProcessErase(Node: TASTNode);
+    procedure ProcessRedim(Node: TASTNode);
     procedure ProcessForLoop(Node: TASTNode);
     procedure ProcessDoLoop(Node: TASTNode);
     procedure ProcessBlock(Node: TASTNode);
@@ -3811,6 +3813,71 @@ begin
                       MakeSSAArrayRef(ArrayIdx, srtInt), MakeSSAConstInt(RecPacked),
                       MakeSSAValue(svkNone));
     end;
+  end;
+end;
+
+procedure TSSAGenerator.ProcessErase(Node: TASTNode);
+// ERASE arr [, arr ...] (B1.4): reset each named array's elements to default.
+var
+  j, ArrayIdx: Integer;
+  ArrName: string;
+  Child: TASTNode;
+begin
+  for j := 0 to Node.ChildCount - 1 do
+  begin
+    Child := Node.GetChild(j);
+    if Child.NodeType <> antIdentifier then Continue;
+    ArrName := UpperCase(VarToStr(Child.Value));
+    ArrayIdx := FProgram.FindArray(ArrName);
+    if ArrayIdx < 0 then
+      raise Exception.CreateFmt('ERASE: array not declared: %s', [ArrName]);
+    EmitInstruction(ssaArrayErase, MakeSSAValue(svkNone),
+                    MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+procedure TSSAGenerator.ProcessRedim(Node: TASTNode);
+// REDIM [PRESERVE] arr(ub) [, ...] (B1.4): re-dimension existing 1-D arrays at runtime.
+// v1: the array must already be declared (DIM first); only a single dimension is supported,
+// and the original lower bound is kept (only the upper bound / size changes).
+var
+  j, ArrayIdx: Integer;
+  ArrName: string;
+  ArrayDeclNode, DimsNode, DimChild, DimExpr: TASTNode;
+  UbValue, UbReg: TSSAValue;
+  PreserveFlag: Int64;
+begin
+  if Node.Attributes.Values['PRESERVE'] = '1' then PreserveFlag := 1 else PreserveFlag := 0;
+  for j := 0 to Node.ChildCount - 1 do
+  begin
+    ArrayDeclNode := Node.GetChild(j);
+    if ArrayDeclNode.NodeType <> antArrayDecl then Continue;
+    if ArrayDeclNode.ChildCount < 2 then Continue;
+    if ArrayDeclNode.GetChild(0).NodeType <> antIdentifier then Continue;
+    ArrName := UpperCase(VarToStr(ArrayDeclNode.GetChild(0).Value));
+    ArrayIdx := FProgram.FindArray(ArrName);
+    if ArrayIdx < 0 then
+      raise Exception.CreateFmt('REDIM: array not declared (DIM it first): %s', [ArrName]);
+
+    DimsNode := ArrayDeclNode.GetChild(1);
+    if DimsNode.NodeType <> antDimensions then
+      raise Exception.CreateFmt('REDIM: invalid dimensions for %s', [ArrName]);
+    if DimsNode.ChildCount <> 1 then
+      raise Exception.CreateFmt('REDIM supports a single dimension (v1): %s', [ArrName]);
+
+    // Bare upper bound, or antDimRange(lb, ub): keep the array's original lower bound, take ub.
+    DimChild := DimsNode.GetChild(0);
+    if DimChild.NodeType = antDimRange then
+      DimExpr := DimChild.GetChild(1)
+    else
+      DimExpr := DimChild;
+    ProcessExpression(DimExpr, UbValue);
+    UbReg := EnsureIntRegister(UbValue);
+
+    EmitInstruction(ssaArrayRedim, MakeSSAValue(svkNone),
+                    MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType),
+                    UbReg, MakeSSAConstInt(PreserveFlag));
   end;
 end;
 
@@ -10784,6 +10851,8 @@ begin
     antPrint: ProcessPrint(Node);
     antInput: ProcessInput(Node);
     antDim: ProcessDim(Node);
+    antErase: ProcessErase(Node);
+    antRedim: ProcessRedim(Node);
     antDef: ProcessDefFn(Node);
     antForLoop: ProcessForLoop(Node);
     antDoLoop: ProcessDoLoop(Node);

@@ -1941,14 +1941,14 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `OPTION STATIC` | ✓ | Reverts a previous OPTION DYNAMIC command. |
 | `'$STATIC` | ✗ | Alternate form of the OPTION STATIC statement. |
 | `DIM` | ✓ | Defines any type of array. |
-| `REDIM` | ✗ | Defines and resizes variable-length arrays. |
-| `PRESERVE` | ✗ | Preserves array contents when used with REDIM. |
+| `REDIM` | ◐ | Resizes an array. `REDIM [PRESERVE] arr(ub)` (B1.4). v1: array must be DIM'd first; single dimension; keeps the original lower bound (only the upper bound/size changes). |
+| `PRESERVE` | ✓ | Preserves the overlapping array contents when used with `REDIM` (B1.4). |
 
 #### Clearing Array Data
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ERASE` | ✗ | Destroys variable-length array elements and initializes fixed-length array elements. |
+| `ERASE` | ✓ | `ERASE arr [, arr ...]` resets every element to its default (0 / 0.0 / "") keeping the current size (B1.4). |
 
 #### Retrieving Array Size
 

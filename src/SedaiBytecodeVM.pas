@@ -197,6 +197,9 @@ type
     procedure ExecuteStringOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteMathOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteArrayOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+    procedure EraseArray(ArrayIdx: Integer);                                   // B1.4: ERASE
+    procedure RedimArray(ArrayIdx, NewUpper: Integer; Preserve: Boolean);       // B1.4: REDIM
+
     procedure ExecuteIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSpecialVarOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteGraphicsOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -2085,6 +2088,12 @@ begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
         end;
 
+        // REDIM: Src2 = int new upper bound (Src1 = array id, not a register; no Dest)
+        bcArrayRedim:
+        begin
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+        end;
+
         // Int source (Src1) for branch
         bcJumpIfZero, bcJumpIfNotZero:
         begin
@@ -3927,6 +3936,58 @@ begin
   end;
 end;
 
+// ERASE arr (B1.4): reset every element of an existing array to its default
+// (0 / 0.0 / ""), keeping the current dimensions.
+procedure TBytecodeVM.EraseArray(ArrayIdx: Integer);
+var
+  k: Integer;
+begin
+  if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then Exit;
+  case FArrays[ArrayIdx].ElementType of
+    0: for k := 0 to High(FArrays[ArrayIdx].IntData) do FArrays[ArrayIdx].IntData[k] := 0;
+    1: for k := 0 to High(FArrays[ArrayIdx].FloatData) do FArrays[ArrayIdx].FloatData[k] := 0.0;
+    2: for k := 0 to High(FArrays[ArrayIdx].StringData) do FArrays[ArrayIdx].StringData[k] := '';
+  end;
+end;
+
+// REDIM [PRESERVE] arr(ub) (B1.4): re-dimension an existing 1-D array, keeping its
+// original lower bound. PRESERVE keeps the overlapping elements; otherwise all are
+// reset to default. New element type is unchanged (taken from the existing array).
+procedure TBytecodeVM.RedimArray(ArrayIdx, NewUpper: Integer; Preserve: Boolean);
+var
+  Lb, NewSize, k: Integer;
+begin
+  if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then Exit;
+  Lb := 0;
+  if Length(FArrays[ArrayIdx].LowerBounds) > 0 then Lb := FArrays[ArrayIdx].LowerBounds[0];
+  NewSize := NewUpper - Lb + 1;
+  if NewSize < 0 then NewSize := 0;
+  case FArrays[ArrayIdx].ElementType of
+    0: begin
+         SetLength(FArrays[ArrayIdx].IntData, NewSize);
+         if not Preserve then
+           for k := 0 to NewSize - 1 do FArrays[ArrayIdx].IntData[k] := 0;
+       end;
+    1: begin
+         SetLength(FArrays[ArrayIdx].FloatData, NewSize);
+         if not Preserve then
+           for k := 0 to NewSize - 1 do FArrays[ArrayIdx].FloatData[k] := 0.0;
+       end;
+    2: begin
+         SetLength(FArrays[ArrayIdx].StringData, NewSize);
+         if not Preserve then
+           for k := 0 to NewSize - 1 do FArrays[ArrayIdx].StringData[k] := '';
+       end;
+  end;
+  // Collapse to a single dimension with the same lower bound.
+  FArrays[ArrayIdx].DimCount := 1;
+  SetLength(FArrays[ArrayIdx].Dimensions, 1);
+  FArrays[ArrayIdx].Dimensions[0] := NewSize;
+  SetLength(FArrays[ArrayIdx].LowerBounds, 1);
+  FArrays[ArrayIdx].LowerBounds[0] := Lb;
+  FArrays[ArrayIdx].TotalSize := NewSize;
+end;
+
 procedure TBytecodeVM.ExecuteArrayOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
@@ -4110,6 +4171,10 @@ begin
         Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx]
                                    + FArrays[ArrayIdx].Dimensions[LinearIdx] - 1;
       end;
+    11: // bcArrayErase - ERASE arr - reset all elements to default, keep size (B1.4)
+      EraseArray(Instr.Src1);
+    12: // bcArrayRedim - REDIM [PRESERVE] arr(ub) (B1.4); Src2=ub reg, Immediate bit0=preserve
+      RedimArray(Instr.Src1, Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0);
   else
     raise Exception.CreateFmt('Unknown array opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

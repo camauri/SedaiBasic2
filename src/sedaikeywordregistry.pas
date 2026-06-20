@@ -1653,6 +1653,8 @@ begin
  RegisterKeyword(kCONST,   ttConstant,        'Constant assignment',  kcData);
  RegisterKeyword(kDATA,    ttDataConstant,    'Data statement',       kcData);
  RegisterKeyword(kDIM,     ttDataDeclaration, 'Dimension arrays',     kcData);
+ RegisterKeyword(kERASE,   ttArrayErase,      'Reset array elements to default (FreeBASIC)', kcData);
+ RegisterKeyword(kREDIM,   ttArrayRedim,      'Re-dimension an array (FreeBASIC)',           kcData);
  RegisterKeyword(kLET,     ttDataAssignment,  'Variable assignment',  kcData);
  RegisterKeyword(kREAD,    ttDataRead,        'Read data',            kcData);
  RegisterKeyword(kRESTORE, ttDataConstant,    'Restore data pointer', kcData);

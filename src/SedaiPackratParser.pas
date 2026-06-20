@@ -154,6 +154,8 @@ type
     function ParseSlowStatement: TASTNode;
     function ParseRemStatement: TASTNode;
     function ParseDimStatement: TASTNode;
+    function ParseEraseStatement: TASTNode;
+    function ParseRedimStatement: TASTNode;
     function ParseDefStatement: TASTNode;
     function ParseFnStatement: TASTNode;
     function ParseConstStatement: TASTNode;
@@ -489,6 +491,8 @@ begin
     // === DATA HANDLING ===
     ttDataAssignment: Result := Memoize('LetStatement', @ParseLetStatement);
     ttDataDeclaration: Result := Memoize('DimStatement', @ParseDimStatement);
+    ttArrayErase: Result := Memoize('EraseStatement', @ParseEraseStatement);
+    ttArrayRedim: Result := Memoize('RedimStatement', @ParseRedimStatement);
     ttConstant: Result := Memoize('ConstStatement', @ParseConstStatement);
     ttDataConstant: Result := Memoize('DataStatement', @ParseDataStatement);
     ttDataRead: Result := Memoize('ReadStatement', @ParseReadStatement);
@@ -4169,6 +4173,63 @@ begin
 
   until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
 
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseEraseStatement: TASTNode;
+// ERASE arr [, arr ...] (FreeBASIC, B1.4) - reset each named array's elements to default.
+var
+  Token, NameTok: TLexerToken;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antErase, Token);
+  Context.Advance; // Consume ERASE
+  repeat
+    if not Context.Check(ttIdentifier) then
+    begin
+      HandleError('Expected array name after ERASE', Context.CurrentToken);
+      Break;
+    end;
+    NameTok := Context.CurrentToken;
+    Result.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
+    Context.Advance;                     // array name
+    if Context.Check(ttSeparParam) then
+      Context.Advance                    // comma -> another array
+    else
+      Break;
+  until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseRedimStatement: TASTNode;
+// REDIM [PRESERVE] arr(dims) [, arr(dims) ...] (FreeBASIC, B1.4) - re-dimension arrays.
+var
+  Token: TLexerToken;
+  ArrayDecl: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antRedim, Token);
+  Context.Advance; // Consume REDIM
+  // Optional PRESERVE modifier (not a reserved keyword -> arrives as an identifier).
+  if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PRESERVE') then
+  begin
+    Result.Attributes.Values['PRESERVE'] := '1';
+    Context.Advance;
+  end;
+  repeat
+    ArrayDecl := ParseArrayDeclaration;  // name(dims) [AS type]
+    if Assigned(ArrayDecl) then
+      Result.AddChild(ArrayDecl)
+    else
+    begin
+      HandleError('Expected array declaration after REDIM', Context.CurrentToken);
+      Break;
+    end;
+    if Context.Check(ttSeparParam) then
+      Context.Advance                    // comma -> another array
+    else
+      Break;
+  until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
   DoNodeCreated(Result);
 end;
 

@@ -120,6 +120,7 @@ type
 
     ssaArrayLoad, ssaArrayStore, ssaArrayDim,
     ssaArrayLBound, ssaArrayUBound,  // LBOUND/UBOUND(arr[, dim]) (B1.4)
+    ssaArrayErase, ssaArrayRedim,    // ERASE / REDIM (B1.4)
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
     ssaPrintInt, ssaPrintIntLn,
     ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,

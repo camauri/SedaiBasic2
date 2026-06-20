@@ -272,6 +272,8 @@ begin
     ssaArrayStore: Result := bcArrayStore;  // Fallback - should use GetTypedArrayStoreOp
     ssaArrayLBound: Result := bcArrayLBound;  // B1.4 array bound queries
     ssaArrayUBound: Result := bcArrayUBound;
+    ssaArrayErase: Result := bcArrayErase;    // B1.4 array statements
+    ssaArrayRedim: Result := bcArrayRedim;
     // Graphics operations
     ssaGraphicRGBA: Result := bcGraphicRGBA;
     ssaGraphicSetMode: Result := bcGraphicSetMode;

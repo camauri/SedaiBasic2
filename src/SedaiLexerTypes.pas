@@ -190,6 +190,8 @@ type
     ttConstant,               // CONST
     ttDataConstant,           // ENUM, DATA
     ttDataDeclaration,        // DIM, DECLARE, VAR
+    ttArrayErase,             // ERASE (FreeBASIC, B1.4)
+    ttArrayRedim,             // REDIM (FreeBASIC, B1.4)
     ttDataRead,               // READ
     ttDataType,               // TYPE, STRUCT, RECORD
 
@@ -381,7 +383,7 @@ const
     ttTypeDecl, ttAsType, ttWithBlock, ttExtends, ttParamMode, ttBaseCall, ttSharedDecl,
     ttThreadWait, ttThreadDetach, ttMutexLock, ttMutexUnlock, ttMutexDestroy,
     ttCondWait, ttCondSignal, ttCondBroadcast, ttCondDestroy,
-    ttJumpKeyword, ttDataDeclaration, ttDataAssignment, ttCommentRemark,
+    ttJumpKeyword, ttDataDeclaration, ttArrayErase, ttArrayRedim, ttDataAssignment, ttCommentRemark,
     ttBitwiseOperator
   ];
 

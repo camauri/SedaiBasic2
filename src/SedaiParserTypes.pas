@@ -125,6 +125,8 @@ type
     antArrayDecl,        // DIM array declaration: A(10)
     antDimensions,       // List dimensions: (5,3,2)
     antDimRange,         // FreeBASIC explicit array bound "lb TO ub" within antDimensions: child0=lb, child1=ub
+    antErase,            // FreeBASIC ERASE arr [, arr...] - reset array elements (B1.4)
+    antRedim,            // FreeBASIC REDIM [PRESERVE] arr(dims) - re-dimension an array (B1.4)
 
     // === DATA ===
     antData,              // DATA statement
@@ -391,6 +393,7 @@ begin
     antStatement, antAssignment, antPrint, antInput, antGoto,
     antGosub, antOnGoto, antOnGosub, antReturn, antEnd, antStop, antRem, antIf,
     antThen, antElse, antForLoop, antWhileLoop, antDoLoop, antDim,
+    antErase, antRedim,
     antDef, antData, antConst, antRead, antRestore, antClear,
     antOpen, antClose, antDopen, antDclose, antAppend, antDclear, antRecord,
     antGet, antPut, antPoke, antSys, antNew, antRun, antList,

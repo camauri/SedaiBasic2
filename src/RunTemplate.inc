@@ -734,6 +734,18 @@ begin
             Inc(CurPC);
           end;
 
+        // ERASE arr / REDIM [PRESERVE] arr(ub) (B1.4)
+        bcArrayErase:
+          begin
+            EraseArray(Instr.Src1);
+            Inc(CurPC);
+          end;
+        bcArrayRedim:
+          begin
+            RedimArray(Instr.Src1, IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0);
+            Inc(CurPC);
+          end;
+
         // Generic array load/store (slower - legacy)
         bcArrayLoad:
           begin

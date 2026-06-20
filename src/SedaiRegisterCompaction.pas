@@ -503,6 +503,7 @@ begin
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     bcArrayLBound, bcArrayUBound,  // B1.4: Src2 = 0-based dim index (int)
+    bcArrayRedim,  // B1.4: REDIM - Src2 = new upper bound (int)
     // === GROUP 10: Graphics ===
     bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
     bcGraphicWindow,  // Src2 = row1 register (int)

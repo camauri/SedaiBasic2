@@ -342,6 +342,9 @@ const
   // FreeBASIC array bound queries (B1.4). Dest=int result, Src1=array id, Src2=0-based dim index reg.
   bcArrayLBound     = bcGroupArray + 9;   // LBOUND(arr[, dim]) - lower bound of a dimension
   bcArrayUBound     = bcGroupArray + 10;  // UBOUND(arr[, dim]) - upper bound of a dimension
+  // FreeBASIC array statements (B1.4). Src1 = array id.
+  bcArrayErase      = bcGroupArray + 11;  // ERASE arr - reset elements to default (keep size)
+  bcArrayRedim      = bcGroupArray + 12;  // REDIM [PRESERVE] arr(ub): Src2=ub reg, Immediate bit0=preserve
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values
@@ -1333,6 +1336,8 @@ begin
         8: Result := 'ArrayStoreString';
         9: Result := 'ArrayLBound';
         10: Result := 'ArrayUBound';
+        11: Result := 'ArrayErase';
+        12: Result := 'ArrayRedim';
       else
         Result := Format('Array_%d', [SubOp]);
       end;
