@@ -124,7 +124,12 @@ type
     FModuleDtorSlots: TStringList;        // V5e: module global var (UPPER) -> reserved int xfer slot (Objects[]=slot)
                                           //      holds its handle frame-independently so an END inside a SUB can
                                           //      still destroy it (its module register is saved/hidden by the frame).
-    FSharedVars: TStringList;            // M6: DIM SHARED scalar names -> transfer slot (Objects[]=slot)
+    FSharedVars: TStringList;            // M6: DIM SHARED scalar names -> transfer slot (Objects[]=slot); also the "is shared" marker for scope resolution
+    // Refinement #2 (cross-thread SHARED scalars): a DIM SHARED scalar is backed by a 1-element global
+    // array (global arrays live in the shared FArrays, so any thread sees live updates — FreeBASIC's
+    // shared-memory model). Maps the UPPER-case name -> its array index. Every read/write of the name is
+    // routed to element 0 of this array, so the value is never a per-thread register.
+    FSharedScalarArr: TStringList;       // name (UPPER) -> array index (Objects[]=PtrInt arrayIdx)
     FInDispatcher: Boolean;              // M6: true while emitting a virtual dispatcher (skip shared sync)
     FBlockHandledVars: TStringList;      // M8: var names destructed block-scoped (excluded from frame/module dtors)
     FCurrentTopLevelLabels: TStringList;  // GOTO-unwind: names of labels at block-depth 0 in the current frame
@@ -208,6 +213,9 @@ type
     procedure EmitExitLoopCleanup;                       // M8: unwind blocks down to the loop body (EXIT FOR/DO)
     procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
     procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
+    // Refinement #2: cross-thread SHARED scalars backed by a 1-element global array.
+    function IsSharedScalar(const Name: string): Boolean;                       // name is a SHARED scalar (array-backed)?
+    function MakeSharedScalarAccess(const Name: string; const Tok: TLexerToken): TASTNode;  // build name(0) array-access node
     // FB lexical scope (MODERN only). ScopePushFrame/ScopePopFrame manage FScopeStack; the block
     // variants emit the M8 record-mark instructions. Inert in CLASSIC mode (callers gate on FModernMode).
     procedure ScopePushFrame(Kind: TScopeKind);
@@ -419,6 +427,8 @@ begin
   FModuleDtorSlots.CaseSensitive := False;
   FSharedVars := TStringList.Create;
   FSharedVars.CaseSensitive := False;
+  FSharedScalarArr := TStringList.Create;
+  FSharedScalarArr.CaseSensitive := False;
   FInDispatcher := False;
   FBlockHandledVars := TStringList.Create;
   FBlockHandledVars.CaseSensitive := False;
@@ -446,6 +456,7 @@ begin
   FModuleRecordVars.Free;
   FModuleDtorSlots.Free;
   FSharedVars.Free;
+  FSharedScalarArr.Free;
   FBlockHandledVars.Free;
   FCurrentTopLevelLabels.Free;
   inherited Destroy;
@@ -892,9 +903,18 @@ begin
 
     antIdentifier:
     begin
-      // Return the register assigned to this variable
       VarName := VarToStr(Node.Value);
-      Result := GetOrAllocateVariable(VarName);
+      // Refinement #2: a SHARED scalar is backed by a 1-element global array — read element 0 (a live,
+      // cross-thread load), not a per-thread register.
+      if IsSharedScalar(VarName) then
+      begin
+        ArgListNode := MakeSharedScalarAccess(VarName, Node.Token);
+        ProcessExpression(ArgListNode, Result);
+        ArgListNode.Free;
+      end
+      else
+        // Return the register assigned to this variable
+        Result := GetOrAllocateVariable(VarName);
     end;
 
     antSpecialVariable:
@@ -2617,7 +2637,7 @@ end;
 
 procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
 var
-  VarNode, ExprNode: TASTNode;
+  VarNode, ExprNode, SharedAssign: TASTNode;
   VarName, LhsRecType, RhsRecType: string;
   ExprValue, VarReg, SrcRecHandle: TSSAValue;
   CopyOp: TSSAOpCode;
@@ -2664,6 +2684,18 @@ begin
 
   if VarNode.NodeType <> antIdentifier then Exit;
   VarName := VarToStr(VarNode.Value);
+
+  // Refinement #2: a SHARED scalar is backed by a 1-element global array — store to element 0 (a live,
+  // cross-thread write), reusing the array-store lowering (coercion to the element type, etc.).
+  if IsSharedScalar(VarName) then
+  begin
+    SharedAssign := TASTNode.Create(antAssignment, VarNode.Token);
+    SharedAssign.AddChild(MakeSharedScalarAccess(VarName, VarNode.Token));
+    SharedAssign.AddChild(ExprNode.Clone);
+    ProcessArrayStore(SharedAssign);
+    SharedAssign.Free;
+    Exit;
+  end;
 
   // FUNCTION result (M2): "fname = expr" inside a FUNCTION body sets the return value.
   // Also accepts the unqualified method name inside a FUNCTION method (M4.1): for a method
@@ -3293,6 +3325,24 @@ begin
     if DimsNode.NodeType = antIdentifier then
     begin
       RecTypeName := UpperCase(VarToStr(DimsNode.Value));
+      // Refinement #2: a builtin-typed SHARED scalar is backed by a 1-element global array (registered in
+      // CollectSharedVars). Emit its array allocation and apply any "= expr" initializer, then we are done.
+      if (ArrayDeclNode.Attributes.Values['SHARED'] = '1') and IsSharedScalar(UpperCase(ArrName)) then
+      begin
+        ArrayIdx := PtrInt(FSharedScalarArr.Objects[FSharedScalarArr.IndexOf(UpperCase(ArrName))]);
+        ArrayRef := MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType);
+        EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
+        begin
+          InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
+          InitAssign.AddChild(MakeSharedScalarAccess(UpperCase(ArrName), ArrayDeclNode.GetChild(0).Token));
+          InitAssign.AddChild(ArrayDeclNode.GetChild(2).Clone);
+          ProcessArrayStore(InitAssign);
+          InitAssign.Free;
+        end;
+        Continue;
+      end;
       RecUDTIdx := FindUDT(RecTypeName);
       if RecUDTIdx >= 0 then
       begin
@@ -9555,8 +9605,10 @@ procedure TSSAGenerator.CollectSharedVars(Node: TASTNode);
 // via the record heap). DIM SHARED is the only sharing mechanism (the QuickBASIC `SHARED x` statement
 // inside a procedure is not a -lang fb feature).
 var
-  i, k: Integer;
+  i, k, ai: Integer;
   Decl: TASTNode;
+  VNameU, TypeNameU: string;
+  ElemBank: TSSARegisterType;
 begin
   if Node = nil then Exit;
   // (single flat pass over the whole AST: DIM SHARED is module-level; nested DIMs aren't marked)
@@ -9566,10 +9618,42 @@ begin
       Decl := Node.GetChild(k);
       if (Decl.NodeType = antArrayDecl) and (Decl.Attributes.Values['SHARED'] = '1') and
          (Decl.ChildCount >= 2) and (Decl.GetChild(1).NodeType = antIdentifier) then  // typed scalar only
-        AddSharedVarSlot(UpperCase(VarToStr(Decl.GetChild(0).Value)));
+      begin
+        VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        AddSharedVarSlot(VNameU);                       // keep the "is shared" marker (scope resolution)
+        // Refinement #2: a builtin-typed SHARED scalar is backed by a 1-element global array, so it lives
+        // in the shared FArrays and is visible/live across threads. (A SHARED UDT scalar keeps the M6
+        // handle-in-register path — its record is already shared via the per-record region, M5.2c.)
+        TypeNameU := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        if (FindUDT(TypeNameU) < 0) and (FSharedScalarArr.IndexOf(VNameU) < 0) then
+        begin
+          ElemBank := TypeNameToBank(TypeNameU, VNameU);
+          ai := FProgram.DeclareArray(VNameU, ElemBank, [1]);   // 1-element global array, same name
+          FSharedScalarArr.AddObject(VNameU, TObject(PtrInt(ai)));
+        end;
+      end;
     end;
   for i := 0 to Node.ChildCount - 1 do
     CollectSharedVars(Node.GetChild(i));
+end;
+
+function TSSAGenerator.IsSharedScalar(const Name: string): Boolean;
+begin
+  Result := (FSharedScalarArr <> nil) and (FSharedScalarArr.IndexOf(UpperCase(Name)) >= 0);
+end;
+
+function TSSAGenerator.MakeSharedScalarAccess(const Name: string; const Tok: TLexerToken): TASTNode;
+// Build the AST for "name(0)" — antArrayAccess(antIdentifier(name), antExpressionList(antLiteral 0)) —
+// so reads and writes of a SHARED scalar reuse the existing array load/store lowering (element 0 of its
+// backing 1-element global array). The caller owns and frees the returned node.
+var
+  IdxList: TASTNode;
+begin
+  Result := TASTNode.Create(antArrayAccess, Tok);
+  Result.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(Name), Tok));
+  IdxList := TASTNode.Create(antExpressionList, Tok);
+  IdxList.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Tok));
+  Result.AddChild(IdxList);
 end;
 
 procedure TSSAGenerator.EmitSharedSyncOut;
@@ -9582,6 +9666,7 @@ begin
   if (FSharedVars = nil) or (FSharedVars.Count = 0) then Exit;
   for i := 0 to FSharedVars.Count - 1 do
   begin
+    if IsSharedScalar(FSharedVars[i]) then Continue;   // array-backed: lives in shared FArrays, no slot sync
     V := GetOrAllocateVariable(FSharedVars[i]);
     EmitXferStore(V.RegType, PtrInt(FSharedVars.Objects[i]), V);
   end;
@@ -9597,6 +9682,7 @@ begin
   if (FSharedVars = nil) or (FSharedVars.Count = 0) then Exit;
   for i := 0 to FSharedVars.Count - 1 do
   begin
+    if IsSharedScalar(FSharedVars[i]) then Continue;   // array-backed: lives in shared FArrays, no slot sync
     V := GetOrAllocateVariable(FSharedVars[i]);
     EmitXferLoad(V.RegType, PtrInt(FSharedVars.Objects[i]), V);
   end;
@@ -10833,6 +10919,7 @@ begin
   // M6: collect DIM SHARED scalars and assign them dedicated transfer slots (runs after type
   // registration so each var's bank is known). These slots survive the bcCallSub save/restore.
   FSharedVars.Clear;
+  FSharedScalarArr.Clear;
   CollectSharedVars(AST);
 
   // M8: reset block-scope state (block-scoped record reclamation; the scope stack itself was reset above).
