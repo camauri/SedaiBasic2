@@ -1277,24 +1277,24 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `BYTE and UBYTE` | ✗ | 8-bit wide data types that store integer values. |
-| `SHORT and USHORT` | ✗ | 16-bit wide data types that store integer values. |
-| `LONG and ULONG` | ✗ | 32-bit wide data types that store integer values. |
-| `INTEGER and UINTEGER` | ✗ | 32-bit or 64-bit wide data types that store integer values. |
-| `LONGINT and ULONGINT` | ✗ | 64-bit wide data types that store integer values. |
+| `BYTE and UBYTE` | ◐ | 8-bit integer types. Accepted in `DIM ... AS` (B1.5); stored in the Int64 bank — width/sign not yet enforced. |
+| `SHORT and USHORT` | ◐ | 16-bit integer types. Accepted (B1.5); stored as Int64, width not enforced. |
+| `LONG and ULONG` | ◐ | 32-bit integer types. Accepted (B1.5); stored as Int64, width not enforced. |
+| `INTEGER and UINTEGER` | ✓ | 32/64-bit integer types. Stored as Int64. |
+| `LONGINT and ULONGINT` | ✓ | 64-bit integer types. Stored as Int64. |
 
 ##### Floating-point types
 
 | Keyword | Status | Description |
 |---|---|---|
-| `SINGLE` | ✗ | 32-bit wide data types that store real number values. |
-| `DOUBLE` | ✗ | 64-bit wide data types that store real number values. |
+| `SINGLE` | ◐ | Accepted in `DIM ... AS` (B1.5); stored in the Double bank (single precision not enforced). |
+| `DOUBLE` | ✓ | 64-bit real type. |
 
 ##### Boolean types
 
 | Keyword | Status | Description |
 |---|---|---|
-| `BOOLEAN` | ✗ | 1-bit wide data types that store boolean values. |
+| `BOOLEAN` | ◐ | Accepted in `DIM ... AS` (B1.5); stored as Int64 (-1/0); 1-bit semantics not enforced. |
 
 ##### Procedure Types
 
