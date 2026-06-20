@@ -317,6 +317,7 @@ begin
     bcIntToString, bcFloatToString,
     // === GROUP 1: String operations ===
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrChr,
+    bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: string->string
     bcStrStr,    // STR$(n) - number to string
     bcStrHex,    // HEX$(n) - int to hex string
     bcStrErr,    // ERR$(n) - error code to message string
@@ -577,6 +578,7 @@ begin
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
     // === GROUP 1: String operations ===
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrLen, bcStrAsc,
+    bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string
     bcStrVal,    // VAL(str) - reads string, produces float
     bcStrInstr,  // INSTR(haystack, needle) - haystack is Src1
     // === GROUP 2: Math operations ===

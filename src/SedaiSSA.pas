@@ -1881,6 +1881,26 @@ begin
           Result := MakeSSARegister(srtString, DestReg);
           EmitInstruction(ssaStrHex, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
+        else if (FuncName = 'LTRIM') or (FuncName = 'RTRIM') or (FuncName = 'TRIM') or
+                (FuncName = 'UCASE') or (FuncName = 'UCASE$') or
+                (FuncName = 'LCASE') or (FuncName = 'LCASE$') then
+        begin
+          // FreeBASIC single-arg string functions: one string in, string out (B1.2).
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+            ArgReg := EnsureStringRegister(ArgValue);
+            DestReg := FProgram.AllocRegister(srtString);
+            Result := MakeSSARegister(srtString, DestReg);
+            if FuncName = 'LTRIM' then OpCode := ssaStrLTrim
+            else if FuncName = 'RTRIM' then OpCode := ssaStrRTrim
+            else if FuncName = 'TRIM' then OpCode := ssaStrTrim
+            else if (FuncName = 'UCASE') or (FuncName = 'UCASE$') then OpCode := ssaStrUCase
+            else OpCode := ssaStrLCase;
+            EmitInstruction(OpCode, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+        end
         else if (FuncName = 'LEFT$') then
         begin
           // LEFT$(str, n) - returns leftmost n chars

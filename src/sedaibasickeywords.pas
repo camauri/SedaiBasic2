@@ -235,6 +235,14 @@ const
   kTAB     = 'TAB';
   kINSTR   = 'INSTR';
   kLEN     = 'LEN';
+  // FreeBASIC string functions (B1.2). UCASE/LCASE accept both the bare and the '$' suffixed form.
+  kLTRIM   = 'LTRIM';
+  kRTRIM   = 'RTRIM';
+  kTRIM    = 'TRIM';
+  kUCASE   = 'UCASE';
+  kUCASES  = 'UCASE$';
+  kLCASE   = 'LCASE';
+  kLCASES  = 'LCASE$';
 
   // Graphics
   kBOX     = 'BOX';

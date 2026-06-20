@@ -296,6 +296,12 @@ const
   bcStrHex          = bcGroupString + 9;
   bcStrInstr        = bcGroupString + 10;
   bcStrErr          = bcGroupString + 11;  // ERR$(n) - error message for code n
+  // FreeBASIC string functions (B1.2). All Dest=string, Src1=string (single-argument).
+  bcStrLTrim        = bcGroupString + 12;  // LTRIM(s) - remove leading spaces
+  bcStrRTrim        = bcGroupString + 13;  // RTRIM(s) - remove trailing spaces
+  bcStrTrim         = bcGroupString + 14;  // TRIM(s)  - remove leading+trailing spaces
+  bcStrUCase        = bcGroupString + 15;  // UCASE(s) - upper case
+  bcStrLCase        = bcGroupString + 16;  // LCASE(s) - lower case
 
   // === GROUP 2: MATH FUNCTIONS (0x02xx) ===
   bcMathSin         = bcGroupMath + 0;

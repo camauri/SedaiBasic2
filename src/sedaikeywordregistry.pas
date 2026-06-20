@@ -1720,6 +1720,13 @@ begin
  RegisterKeyword(kHEXS,   ttStringFunction, 'Hex number string from decimal number',            kcStringFunctions);
  RegisterKeyword(kINSTR,  ttStringFunction, 'Position of source string in destination string',  kcStringFunctions);
  RegisterKeyword(kLEN,    ttStringFunction, 'Return string length',                             kcStringFunctions);
+ RegisterKeyword(kLTRIM,  ttStringFunction, 'Remove leading spaces',                            kcStringFunctions);
+ RegisterKeyword(kRTRIM,  ttStringFunction, 'Remove trailing spaces',                           kcStringFunctions);
+ RegisterKeyword(kTRIM,   ttStringFunction, 'Remove leading and trailing spaces',               kcStringFunctions);
+ RegisterKeyword(kUCASE,  ttStringFunction, 'Convert string to upper case',                     kcStringFunctions);
+ RegisterKeyword(kUCASES, ttStringFunction, 'Convert string to upper case',                     kcStringFunctions);
+ RegisterKeyword(kLCASE,  ttStringFunction, 'Convert string to lower case',                     kcStringFunctions);
+ RegisterKeyword(kLCASES, ttStringFunction, 'Convert string to lower case',                     kcStringFunctions);
  RegisterKeyword(kLEFTS,  ttStringFunction, 'Return string leftmost chars',                     kcStringFunctions);
  RegisterKeyword(kMIDS,   ttStringFunction, 'Return substring from larger string',              kcStringFunctions);
  RegisterKeyword(kRIGHTS, ttStringFunction, 'Return string rightmost chars',                    kcStringFunctions);

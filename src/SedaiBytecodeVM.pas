@@ -2126,6 +2126,7 @@ begin
         // String dest, string sources
         bcLoadConstString, bcCopyString, bcStrConcat,
         bcStrLeft, bcStrRight, bcStrMid,
+        bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2
         bcInputString:
         begin
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
@@ -3726,6 +3727,16 @@ begin
       end;
     6: // bcStrChr
       Ctx.StringRegs[Instr.Dest] := Chr(Ctx.IntRegs[Instr.Src1] and $FF);
+    12: // bcStrLTrim - LTRIM(s)
+      Ctx.StringRegs[Instr.Dest] := TrimLeft(Ctx.StringRegs[Instr.Src1]);
+    13: // bcStrRTrim - RTRIM(s)
+      Ctx.StringRegs[Instr.Dest] := TrimRight(Ctx.StringRegs[Instr.Src1]);
+    14: // bcStrTrim - TRIM(s)
+      Ctx.StringRegs[Instr.Dest] := Trim(Ctx.StringRegs[Instr.Src1]);
+    15: // bcStrUCase - UCASE(s)
+      Ctx.StringRegs[Instr.Dest] := UpperCase(Ctx.StringRegs[Instr.Src1]);
+    16: // bcStrLCase - LCASE(s)
+      Ctx.StringRegs[Instr.Dest] := LowerCase(Ctx.StringRegs[Instr.Src1]);
     7: // bcStrStr - STR$(n)
       Ctx.StringRegs[Instr.Dest] := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]);
     8: // bcStrVal - VAL(s)

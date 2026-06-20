@@ -82,6 +82,8 @@ type
     ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,
     ssaStrConcat, ssaStrLen, ssaStrLeft, ssaStrRight, ssaStrMid,
     ssaStrAsc, ssaStrChr, ssaStrStr, ssaStrVal, ssaStrHex, ssaStrInstr, ssaStrErr,
+    // FreeBASIC string functions (B1.2): single string arg -> string result.
+    ssaStrLTrim, ssaStrRTrim, ssaStrTrim, ssaStrUCase, ssaStrLCase,
     ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathLog, ssaMathExp,
     ssaMathSqr, ssaMathAbs, ssaMathSgn, ssaMathInt, ssaMathRnd,
     ssaMathLog10, ssaMathLog2, ssaMathLogN,  // Additional log functions

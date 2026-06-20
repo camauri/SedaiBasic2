@@ -2283,11 +2283,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `LEFT` | ✗ | Returns a substring of the leftmost characters in a string. |
 | `MID (Function)` | ✗ | Returns a substring of a string. |
 | `RIGHT` | ✗ | Returns a substring of the rightmost characters in a string. |
-| `LCASE` | ✗ | Returns a copy of a string converted to lowercase alpha characters. |
-| `UCASE` | ✗ | Returns a copy of a string converted to uppercase alpha characters. |
-| `LTRIM` | ✗ | Removes surrounding substrings or characters on the left side of a string. |
-| `RTRIM` | ✗ | Removes surrounding substrings or characters on the right side of a string. |
-| `TRIM` | ✗ | Removes surrounding substrings or characters on the left and right side of a string. |
+| `LCASE` | ✓ | Returns a copy of a string converted to lowercase. `LCASE(s)` / `LCASE$(s)` (B1.2). |
+| `UCASE` | ✓ | Returns a copy of a string converted to uppercase. `UCASE(s)` / `UCASE$(s)` (B1.2). |
+| `LTRIM` | ✓ | Removes leading spaces. `LTRIM(s)` (B1.2; trimset variant deferred). |
+| `RTRIM` | ✓ | Removes trailing spaces. `RTRIM(s)` (B1.2; trimset variant deferred). |
+| `TRIM` | ✓ | Removes leading and trailing spaces. `TRIM(s)` (B1.2; trimset variant deferred). |
 | `INSTR` | ✓ | Returns the first occurrence of a substring or character within a string. |
 | `INSTRREV` | ✗ | Returns the last occurrence of a substring or character within a string. |
 | `MID (Statement)` | ✗ | Copies a substring to a substring of a string. |

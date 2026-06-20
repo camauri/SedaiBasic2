@@ -175,6 +175,11 @@ begin
     ssaStrVal: Result := bcStrVal;
     ssaStrHex: Result := bcStrHex;
     ssaStrInstr: Result := bcStrInstr;
+    ssaStrLTrim: Result := bcStrLTrim;   // B1.2 FreeBASIC string functions
+    ssaStrRTrim: Result := bcStrRTrim;
+    ssaStrTrim: Result := bcStrTrim;
+    ssaStrUCase: Result := bcStrUCase;
+    ssaStrLCase: Result := bcStrLCase;
     ssaStrErr: Result := bcStrErr;
     // Math functions
     ssaMathAbs: Result := bcMathAbs;
