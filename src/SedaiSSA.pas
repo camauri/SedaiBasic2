@@ -130,6 +130,7 @@ type
     // shared-memory model). Maps the UPPER-case name -> its array index. Every read/write of the name is
     // routed to element 0 of this array, so the value is never a per-thread register.
     FSharedScalarArr: TStringList;       // name (UPPER) -> array index (Objects[]=PtrInt arrayIdx)
+    FVarWidthCode: TStringList;          // B1.5 phase 2: name (UPPER) -> narrow width code (Objects[]=PtrInt 1..7)
     FInDispatcher: Boolean;              // M6: true while emitting a virtual dispatcher (skip shared sync)
     FBlockHandledVars: TStringList;      // M8: var names destructed block-scoped (excluded from frame/module dtors)
     FCurrentTopLevelLabels: TStringList;  // GOTO-unwind: names of labels at block-depth 0 in the current frame
@@ -231,6 +232,9 @@ type
                               out NestedType: string): Boolean;
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
+    function TypeNameWidthCode(const TypeName: string): Integer;        // B1.5 phase 2: type -> narrow code
+    procedure RecordVarWidth(const VarName, TypeName: string);          // B1.5 phase 2: remember a var's width
+    function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on store
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
     // Resolve a member-access object (a record variable or an array-of-UDT element) to its
@@ -433,6 +437,8 @@ begin
   FSharedVars.CaseSensitive := False;
   FSharedScalarArr := TStringList.Create;
   FSharedScalarArr.CaseSensitive := False;
+  FVarWidthCode := TStringList.Create;
+  FVarWidthCode.CaseSensitive := False;
   FInDispatcher := False;
   FBlockHandledVars := TStringList.Create;
   FBlockHandledVars.CaseSensitive := False;
@@ -461,6 +467,7 @@ begin
   FModuleDtorSlots.Free;
   FSharedVars.Free;
   FSharedScalarArr.Free;
+  FVarWidthCode.Free;
   FBlockHandledVars.Free;
   FCurrentTopLevelLabels.Free;
   inherited Destroy;
@@ -2984,6 +2991,11 @@ begin
   // Evaluate expression with destination hint to avoid unnecessary copies
   ProcessExpression(ExprNode, ExprValue, VarReg);
 
+  // B1.5 phase 2: if VarName was DIM'd with a sub-64-bit integer type or SINGLE, wrap/round the
+  // value to that width before storing (FreeBASIC narrows at the store). No-op for wide/untracked
+  // vars. Emitting into a fresh register forces the store below to copy the narrowed value.
+  ExprValue := ApplyScalarNarrow(VarName, ExprValue);
+
   // If expression result is a constant, load it directly to variable register
   if ExprValue.Kind in [svkConstInt, svkConstFloat, svkConstString] then
   begin
@@ -3665,7 +3677,10 @@ begin
         // block is block-local in MODERN (and resolves before any later use). Legacy reuse otherwise.
         // Bind in the DECLARED bank, so the same name DIM'd with different types in separate scopes does
         // not collide on the global first-declaration-wins type table (GetVariableType).
-        DeclareVariableTyped(UpperCase(ArrName), TypeNameToBank(RecTypeName, UpperCase(ArrName)));
+        begin
+          DeclareVariableTyped(UpperCase(ArrName), TypeNameToBank(RecTypeName, UpperCase(ArrName)));
+          RecordVarWidth(UpperCase(ArrName), RecTypeName);  // B1.5 phase 2: narrow on store to a sub-64-bit type
+        end;
       // M4.4e: general initializer "DIM v AS T = expr" — child[2] is the init expression (not the
       // ctor-args antArgumentList). After allocation/construction, assign it: a scalar store, or a
       // value-copy when both sides are UDTs (reuses ProcessAssignment's existing semantics). The
@@ -8907,6 +8922,84 @@ begin
   end;
 end;
 
+function TSSAGenerator.TypeNameWidthCode(const TypeName: string): Integer;
+// Map a declared type name to a narrowing width code (B1.5 phase 2). 0 = full-width / no narrowing.
+// 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 (Long/ULong are 32-bit in FB); 7 = single precision.
+// INTEGER/LONGINT (=64-bit here), UINTEGER/ULONGINT and DOUBLE need no bit narrowing.
+var
+  T: string;
+begin
+  T := UpperCase(TypeName);
+  if T = 'BYTE' then Result := 1
+  else if T = 'UBYTE' then Result := 2
+  else if T = 'SHORT' then Result := 3
+  else if T = 'USHORT' then Result := 4
+  else if T = 'LONG' then Result := 5
+  else if T = 'ULONG' then Result := 6
+  else if T = 'SINGLE' then Result := 7
+  else Result := 0;
+end;
+
+procedure TSSAGenerator.RecordVarWidth(const VarName, TypeName: string);
+// Remember a declared scalar's narrowing width so stores to it can wrap to the declared type.
+var
+  W, Idx: Integer;
+begin
+  W := TypeNameWidthCode(TypeName);
+  Idx := FVarWidthCode.IndexOf(UpperCase(VarName));
+  if W = 0 then
+  begin
+    if Idx >= 0 then FVarWidthCode.Delete(Idx);  // re-DIM to a wide type clears any prior narrowing
+    Exit;
+  end;
+  if Idx >= 0 then
+    FVarWidthCode.Objects[Idx] := TObject(PtrInt(W))
+  else
+    FVarWidthCode.AddObject(UpperCase(VarName), TObject(PtrInt(W)));
+end;
+
+function TSSAGenerator.ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;
+// On store to a narrow-typed scalar, wrap/sign-extend (int widths) or round to single. Folds
+// constants; otherwise emits bcNarrowInt / bcNarrowSingle. No-op for full-width / untracked vars.
+var
+  Idx, W: Integer;
+  NarrowReg: TSSAValue;
+begin
+  Result := Value;
+  Idx := FVarWidthCode.IndexOf(UpperCase(VarName));
+  if Idx < 0 then Exit;
+  W := PtrInt(FVarWidthCode.Objects[Idx]);
+  if W = 7 then
+  begin
+    // SINGLE: round a float value to single precision.
+    if Value.Kind = svkConstFloat then
+      Result := MakeSSAConstFloat(Single(Value.ConstFloat))
+    else if (Value.Kind = svkRegister) and (Value.RegType = srtFloat) then
+    begin
+      NarrowReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+      EmitInstruction(ssaNarrowSingle, NarrowReg, Value, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Result := NarrowReg;
+    end;
+  end
+  else if (W >= 1) and (W <= 6) then
+  begin
+    // Integer widths: wrap/sign-extend. A float value first truncates to int (assignment to an
+    // integer-typed scalar), then narrows.
+    if Value.Kind = svkConstInt then
+      Result := MakeSSAConstInt(NarrowConstInt(Value.ConstInt, W))
+    else if Value.Kind = svkConstFloat then
+      Result := MakeSSAConstInt(NarrowConstInt(Trunc(Value.ConstFloat), W))
+    else if (Value.Kind = svkRegister) and (Value.RegType = srtInt) then
+    begin
+      NarrowReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaNarrowInt, NarrowReg, Value, MakeSSAValue(svkNone), MakeSSAConstInt(W));
+      Result := NarrowReg;
+    end;
+    // A float register reaching here is handled by the existing store conversion (float->int), so
+    // narrowing it would require an extra int temp; deferred (rare: DIM b AS BYTE = floatExpr).
+  end;
+end;
+
 function TSSAGenerator.TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
 // Map a declared field/var type name to a register bank. Empty type => infer by name suffix.
 var
@@ -11313,6 +11406,7 @@ begin
   // registration so each var's bank is known). These slots survive the bcCallSub save/restore.
   FSharedVars.Clear;
   FSharedScalarArr.Clear;
+  FVarWidthCode.Clear;
   CollectSharedVars(AST);
 
   // M8: reset block-scope state (block-scoped record reclamation; the scope stack itself was reset above).

@@ -1277,17 +1277,17 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `BYTE and UBYTE` | ◐ | 8-bit integer types. Accepted in `DIM ... AS` (B1.5); stored in the Int64 bank — width/sign not yet enforced. |
-| `SHORT and USHORT` | ◐ | 16-bit integer types. Accepted (B1.5); stored as Int64, width not enforced. |
-| `LONG and ULONG` | ◐ | 32-bit integer types. Accepted (B1.5); stored as Int64, width not enforced. |
-| `INTEGER and UINTEGER` | ✓ | 32/64-bit integer types. Stored as Int64. |
+| `BYTE and UBYTE` | ✓ | 8-bit integer types. Stored in the Int64 bank but **assignments wrap/sign-extend to 8 bits** (B1.5): e.g. a `UBYTE` counter wraps 255→0. |
+| `SHORT and USHORT` | ✓ | 16-bit integer types; assignments wrap/sign-extend to 16 bits (B1.5). |
+| `LONG and ULONG` | ✓ | 32-bit integer types; assignments wrap/sign-extend to 32 bits (B1.5). |
+| `INTEGER and UINTEGER` | ✓ | 64-bit integer types here (platform width). Stored as Int64. |
 | `LONGINT and ULONGINT` | ✓ | 64-bit integer types. Stored as Int64. |
 
 ##### Floating-point types
 
 | Keyword | Status | Description |
 |---|---|---|
-| `SINGLE` | ◐ | Accepted in `DIM ... AS` (B1.5); stored in the Double bank (single precision not enforced). |
+| `SINGLE` | ✓ | Assignments round to true single precision (held in the Double bank) (B1.5). |
 | `DOUBLE` | ✓ | 64-bit real type. |
 
 ##### Boolean types
