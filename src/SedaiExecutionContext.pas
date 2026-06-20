@@ -52,6 +52,7 @@ type
     FloatData: array of Double;
     StringData: array of string;
   end;
+  PRecordStorage = ^TRecordStorage;   // M5.2c: stable pointer to a record (per-thread or shared region)
 
   TExecutionContext = class
   public

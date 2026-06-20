@@ -611,20 +611,21 @@ begin
             RecordNewArrayInit(Ctx, Instr.Src1, Instr.Immediate);
             Inc(CurPC);
           end;
+        // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).
         bcRecordLoadInt:
-          begin Ctx.IntRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].IntData[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.IntData[Instr.Immediate]; Inc(CurPC); end;
         bcRecordLoadFloat:
-          begin Ctx.FloatRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.FloatRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.FloatData[Instr.Immediate]; Inc(CurPC); end;
         bcRecordLoadString:
-          begin Ctx.StringRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].StringData[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.StringRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate]; Inc(CurPC); end;
         bcRecordStoreInt:
-          begin Ctx.Records[Ctx.IntRegs[Instr.Src1]].IntData[Instr.Immediate] := Ctx.IntRegs[Instr.Src2]; Inc(CurPC); end;
+          begin ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.IntData[Instr.Immediate] := Ctx.IntRegs[Instr.Src2]; Inc(CurPC); end;
         bcRecordStoreFloat:
-          begin Ctx.Records[Ctx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate] := Ctx.FloatRegs[Instr.Src2]; Inc(CurPC); end;
+          begin ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.FloatData[Instr.Immediate] := Ctx.FloatRegs[Instr.Src2]; Inc(CurPC); end;
         bcRecordStoreString:
-          begin Ctx.Records[Ctx.IntRegs[Instr.Src1]].StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2]; Inc(CurPC); end;
+          begin ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2]; Inc(CurPC); end;
         bcRecordTypeId:
-          begin Ctx.IntRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].TypeId; Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.TypeId; Inc(CurPC); end;
 
         // Array operations - typed versions are faster
         bcArrayLoadInt:

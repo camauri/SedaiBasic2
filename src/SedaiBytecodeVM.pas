@@ -118,6 +118,14 @@ type
     // own internal lock + per-waiter RTLEvent list (see CondWait/CondSignal/CondBroadcast).
     FCondVars: array of Pointer;
     FCondTableLock: TRTLCriticalSection;
+    // M5.2c: shared UDT-record region for cross-thread record access. Records reachable through shared
+    // storage (arrays of UDT — their handles live in the global FArrays) are allocated here instead of a
+    // thread's per-context heap, so any thread routes field access to the same instance. Each entry is a
+    // separately heap-allocated record (stable pointer → a handle stays valid when the outer array grows).
+    // A handle with SHARED_REC_FLAG set indexes here; otherwise it indexes the active context's heap.
+    FSharedRecords: array of PRecordStorage;
+    FSharedRecordCount: Integer;
+    FSharedRecLock: TRTLCriticalSection;
     FProgram: TBytecodeProgram;
     FOutputDevice: IOutputDevice;
     FInputDevice: IInputDevice;
@@ -234,6 +242,10 @@ type
     procedure DestroyCond(CondHandle: Int64);
     procedure CleanupConds;     // free any surviving condition variables (destructor)
     function AllocRecord(Ctx: TExecutionContext; IntC, FloatC, StrC, TypeId: Integer): Integer;  // M3: new record instance -> handle
+    // M5.2c: allocate in the shared region (cross-thread); ResolveRec routes a handle to its record.
+    function AllocSharedRecord(IntC, FloatC, StrC, TypeId: Integer): Int64;
+    function ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordStorage; inline;
+    procedure CleanupSharedRecords;   // free the shared region (destructor)
     procedure RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
     procedure CheckFloatValid(Ctx: TExecutionContext; RegIndex: Integer; const OpName: string);
     function FormatUsingString(const FormatStr: string; Value: Double): string;
@@ -336,6 +348,12 @@ type
     ILock: TRTLCriticalSection;
     Waiters: array of PRTLEvent;
   end;
+
+const
+  // M5.2c: a record handle with this bit set lives in the VM shared region (cross-thread); the
+  // remaining bits are the index. Plain handles (bit clear) index the active context's per-thread heap.
+  SHARED_REC_FLAG = Int64(1) shl 62;
+  SHARED_REC_MASK = SHARED_REC_FLAG - 1;
 
 threadvar
   // M5.2: the execution context the current thread runs. nil on the main thread (which uses the VM's
@@ -461,6 +479,9 @@ begin
   InitCriticalSection(FMutexTableLock);
   SetLength(FCondVars, 0);
   InitCriticalSection(FCondTableLock);
+  SetLength(FSharedRecords, 0);
+  FSharedRecordCount := 0;
+  InitCriticalSection(FSharedRecLock);
   FProgram := nil;
   FCtx.PC := 0;
   FCtx.Running := False;
@@ -604,6 +625,9 @@ begin
   DoneCriticalSection(FCondTableLock);
   CleanupMutexes;
   DoneCriticalSection(FMutexTableLock);
+  // M5.2c: free the shared UDT-record region.
+  CleanupSharedRecords;
+  DoneCriticalSection(FSharedRecLock);
   FCtx.Free;
   FDrainCtx.Free;
   FDrawQueue.Free;
@@ -1300,9 +1324,63 @@ begin
   Inc(Ctx.RecordCount);
 end;
 
+function TBytecodeVM.AllocSharedRecord(IntC, FloatC, StrC, TypeId: Integer): Int64;
+// M5.2c: allocate a record in the cross-thread shared region and return a SHARED_REC_FLAG-tagged
+// handle. Each record is its own heap block (stable pointer), so a handle survives the outer array
+// growing. Used for arrays of UDT, whose handles live in the global FArrays and are read by any thread.
+var
+  R: PRecordStorage;
+  Idx: Integer;
+begin
+  New(R);
+  R^.TypeId := TypeId;
+  SetLength(R^.IntData, IntC);
+  SetLength(R^.FloatData, FloatC);
+  SetLength(R^.StringData, StrC);
+  EnterCriticalSection(FSharedRecLock);
+  try
+    Idx := FSharedRecordCount;
+    if Idx >= Length(FSharedRecords) then
+      SetLength(FSharedRecords, (Idx + 1) * 2);
+    FSharedRecords[Idx] := R;
+    Inc(FSharedRecordCount);
+  finally
+    LeaveCriticalSection(FSharedRecLock);
+  end;
+  Result := SHARED_REC_FLAG or Int64(Idx);
+end;
+
+function TBytecodeVM.ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordStorage;
+// M5.2c: route a record handle to its storage. A SHARED_REC_FLAG-tagged handle indexes the shared
+// region (looked up under FSharedRecLock; the returned pointer is stable, so field access is then
+// lock-free — concurrent writes to the SAME shared record are the programmer's job, via a mutex).
+// A plain handle indexes the active context's per-thread heap (only that thread touches it).
+begin
+  if (Handle and SHARED_REC_FLAG) <> 0 then
+  begin
+    EnterCriticalSection(FSharedRecLock);
+    Result := FSharedRecords[Handle and SHARED_REC_MASK];
+    LeaveCriticalSection(FSharedRecLock);
+  end
+  else
+    Result := @Ctx.Records[Handle];
+end;
+
+procedure TBytecodeVM.CleanupSharedRecords;
+// Destructor helper: free every record in the shared region.
+var
+  i: Integer;
+begin
+  for i := 0 to FSharedRecordCount - 1 do
+    if FSharedRecords[i] <> nil then Dispose(FSharedRecords[i]);
+  SetLength(FSharedRecords, 0);
+  FSharedRecordCount := 0;
+end;
+
 procedure TBytecodeVM.RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);
-// Eager-allocate one record instance per element of the (int handle) array and store the
-// handles. PackedCounts = intCount | floatCount<<16 | strCount<<32 | typeId<<48.
+// Eager-allocate one record instance per element of the (int handle) array and store the handles.
+// PackedCounts = intCount | floatCount<<16 | strCount<<32 | typeId<<48. M5.2c: array-of-UDT records go
+// in the shared region (the handle array FArrays[ArrayId] is global, so any thread can reach them).
 var
   k, IntC, FloatC, StrC, TypeId: Integer;
 begin
@@ -1311,7 +1389,7 @@ begin
   StrC := (PackedCounts shr 32) and $FFFF;
   TypeId := (PackedCounts shr 48) and $FFFF;
   for k := 0 to FArrays[ArrayId].TotalSize - 1 do
-    FArrays[ArrayId].IntData[k] := AllocRecord(Ctx, IntC, FloatC, StrC, TypeId);
+    FArrays[ArrayId].IntData[k] := AllocSharedRecord(IntC, FloatC, StrC, TypeId);
 end;
 
 procedure TBytecodeVM.SetupWorkerContext(WCtx: TExecutionContext);
@@ -2604,13 +2682,14 @@ begin
                                           Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
     bcRecordNewArray:
       RecordNewArrayInit(Ctx, Instr.Src1, Instr.Immediate);  // Src1=array id; Imm=packed slot counts
-    bcRecordLoadInt:    Ctx.IntRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].IntData[Instr.Immediate];
-    bcRecordLoadFloat:  Ctx.FloatRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate];
-    bcRecordLoadString: Ctx.StringRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].StringData[Instr.Immediate];
-    bcRecordStoreInt:   Ctx.Records[Ctx.IntRegs[Instr.Src1]].IntData[Instr.Immediate] := Ctx.IntRegs[Instr.Src2];
-    bcRecordStoreFloat: Ctx.Records[Ctx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate] := Ctx.FloatRegs[Instr.Src2];
-    bcRecordStoreString:Ctx.Records[Ctx.IntRegs[Instr.Src1]].StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2];
-    bcRecordTypeId:     Ctx.IntRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].TypeId;
+    // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).
+    bcRecordLoadInt:    Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.IntData[Instr.Immediate];
+    bcRecordLoadFloat:  Ctx.FloatRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.FloatData[Instr.Immediate];
+    bcRecordLoadString: Ctx.StringRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate];
+    bcRecordStoreInt:   ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.IntData[Instr.Immediate] := Ctx.IntRegs[Instr.Src2];
+    bcRecordStoreFloat: ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.FloatData[Instr.Immediate] := Ctx.FloatRegs[Instr.Src2];
+    bcRecordStoreString:ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2];
+    bcRecordTypeId:     Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.TypeId;
     // System commands
     bcEnd:
       begin
