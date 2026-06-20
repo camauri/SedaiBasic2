@@ -660,7 +660,7 @@ end;
 function TExpressionParser.ParseNumber(Token: TLexerToken): TASTNode;
 var
   Value: Variant;
-  IntValue: Integer;
+  Int64Value: Int64;
   FloatValue: Double;
   FormatSettings: TFormatSettings;
 begin
@@ -672,9 +672,12 @@ begin
   FormatSettings := DefaultFormatSettings;
   FormatSettings.DecimalSeparator := '.';
 
-  // Try integer first
-  if TryStrToInt(Token.Value, IntValue) then
-    Value := IntValue
+  // Try integer first (full 64-bit range, so e.g. 5000000000 stays an integer rather than
+  // overflowing into a float). A literal written with a '.'/exponent fails this and stays a
+  // float Variant - the SSA literal handler keys the int/float bank off that Variant type, so
+  // 1.0 remains a float (and 1.0/3.0 is float division), not collapsed to integer 1.
+  if TryStrToInt64(Token.Value, Int64Value) then
+    Value := Int64Value
   else if TryStrToFloat(Token.Value, FloatValue, FormatSettings) then
     Value := FloatValue
   else

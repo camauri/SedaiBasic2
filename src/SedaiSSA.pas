@@ -883,10 +883,13 @@ begin
     begin
       if VarIsNumeric(Node.Value) then
       begin
-        if Frac(Double(Node.Value)) = 0 then
-          Result := MakeSSAConstInt(Int64(Node.Value))
+        // Key the int/float bank off the literal's Variant type (how it was parsed), NOT off the
+        // value: a float literal like 1.0 is an integer-valued Double and must stay a float, else
+        // 1.0/3.0 would fold as integer 1 div 3 = 0. Integer literals (incl. >2^31) stay integers.
+        if VarIsFloat(Node.Value) then
+          Result := MakeSSAConstFloat(Double(Node.Value))
         else
-          Result := MakeSSAConstFloat(Double(Node.Value));
+          Result := MakeSSAConstInt(Int64(Node.Value));
       end
       else
       begin
