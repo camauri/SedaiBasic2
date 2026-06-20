@@ -83,14 +83,7 @@ type
     StringData: array of string;
   end;
 
-  { UDT/record instance storage (M3): a heap block of typed slot arrays, referenced by a
-    handle (its index in the VM record heap). Per-bank slot counts come from bcRecordNew. }
-  TRecordStorage = record
-    TypeId: Integer;          // M4.3: runtime UDT type id (for virtual dispatch); -1 if untyped
-    IntData: array of Int64;
-    FloatData: array of Double;
-    StringData: array of string;
-  end;
+  { TRecordStorage moved to SedaiExecutionContext (M5.2b: the record heap is per-context). }
 
   { Bytecode VM - register-based virtual machine }
   TBytecodeVM = class
@@ -123,11 +116,7 @@ type
     FFunctionKeys: array[1..12] of string;
     FVarMap: TStringList;
     FArrays: array of TArrayStorage;
-    // UDT/record heap (M3): instances allocated by bcRecordNew; a handle is an index here.
-    // v1 has no reclamation (instances live until program reset) — acceptable for module-scope
-    // DIM; refcount/free is a documented future step.
-    FRecords: array of TRecordStorage;
-    FRecordCount: Integer;
+    // UDT/record heap is per-context (FCtx.Records / FCtx.RecordCount) since M5.2b.
     // DATA pool for DATA/READ/RESTORE statements (the read cursor FCtx.DataIndex is per-context)
     FDataPool: array of Variant;
     // PUDEF format characters (filler, comma, decimal, dollar)
@@ -205,8 +194,8 @@ type
     procedure EnsureRegisterCapacity(Ctx: TExecutionContext; RegType: TSSARegisterType; MinIndex: Integer);
     procedure FramePush(Ctx: TExecutionContext);   // bcCallSub: snapshot whole register banks
     procedure FramePop(Ctx: TExecutionContext);    // bcReturnSub: restore whole register banks
-    function AllocRecord(IntC, FloatC, StrC, TypeId: Integer): Integer;  // M3: new record instance -> handle
-    procedure RecordNewArrayInit(ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
+    function AllocRecord(Ctx: TExecutionContext; IntC, FloatC, StrC, TypeId: Integer): Integer;  // M3: new record instance -> handle
+    procedure RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
     procedure CheckFloatValid(Ctx: TExecutionContext; RegIndex: Integer; const OpName: string);
     function FormatUsingString(const FormatStr: string; Value: Double): string;
     // M5.1: per-context accessors for the read-only PC/Running/Stopped/LastError* properties.
@@ -385,8 +374,8 @@ begin
   FCtx.FrameSaveStrTop := 0;
   FCtx.FrameRecBaseTop := 0;
   FCtx.BlockRecMarkTop := 0;
-  SetLength(FRecords, 0);
-  FRecordCount := 0;
+  SetLength(FCtx.Records, 0);
+  FCtx.RecordCount := 0;
   FCtx.CursorCol := 0;
   // Initialize time tracking
   FStartTicks := GetTickCount64;
@@ -1161,7 +1150,7 @@ begin
     SetLength(Ctx.FrameRecBase, Ctx.FrameRecBaseTop + 256);
   if Ctx.FrameRecBaseTop >= Length(Ctx.FrameBlockMarkTop) then
     SetLength(Ctx.FrameBlockMarkTop, Ctx.FrameRecBaseTop + 256);
-  Ctx.FrameRecBase[Ctx.FrameRecBaseTop] := FRecordCount;
+  Ctx.FrameRecBase[Ctx.FrameRecBaseTop] := Ctx.RecordCount;
   Ctx.FrameBlockMarkTop[Ctx.FrameRecBaseTop] := Ctx.BlockRecMarkTop;  // M8: remember the block-mark depth
   Inc(Ctx.FrameRecBaseTop);
 end;
@@ -1186,27 +1175,28 @@ begin
   if Ctx.FrameRecBaseTop > 0 then
   begin
     Dec(Ctx.FrameRecBaseTop);
-    if Ctx.FrameRecBase[Ctx.FrameRecBaseTop] < FRecordCount then
-      FRecordCount := Ctx.FrameRecBase[Ctx.FrameRecBaseTop];
+    if Ctx.FrameRecBase[Ctx.FrameRecBaseTop] < Ctx.RecordCount then
+      Ctx.RecordCount := Ctx.FrameRecBase[Ctx.FrameRecBaseTop];
     // M8: discard any block marks this frame left dangling (e.g. EXIT SUB from inside a loop).
     Ctx.BlockRecMarkTop := Ctx.FrameBlockMarkTop[Ctx.FrameRecBaseTop];
   end;
 end;
 
-function TBytecodeVM.AllocRecord(IntC, FloatC, StrC, TypeId: Integer): Integer;
-// Allocate a record instance (heap block of typed slot arrays) and return its handle.
+function TBytecodeVM.AllocRecord(Ctx: TExecutionContext; IntC, FloatC, StrC, TypeId: Integer): Integer;
+// Allocate a record instance (heap block of typed slot arrays) in Ctx's per-thread heap and
+// return its handle (an index into Ctx.Records).
 begin
-  if FRecordCount >= Length(FRecords) then
-    SetLength(FRecords, (FRecordCount + 1) * 2);
-  FRecords[FRecordCount].TypeId := TypeId;
-  SetLength(FRecords[FRecordCount].IntData, IntC);
-  SetLength(FRecords[FRecordCount].FloatData, FloatC);
-  SetLength(FRecords[FRecordCount].StringData, StrC);
-  Result := FRecordCount;
-  Inc(FRecordCount);
+  if Ctx.RecordCount >= Length(Ctx.Records) then
+    SetLength(Ctx.Records, (Ctx.RecordCount + 1) * 2);
+  Ctx.Records[Ctx.RecordCount].TypeId := TypeId;
+  SetLength(Ctx.Records[Ctx.RecordCount].IntData, IntC);
+  SetLength(Ctx.Records[Ctx.RecordCount].FloatData, FloatC);
+  SetLength(Ctx.Records[Ctx.RecordCount].StringData, StrC);
+  Result := Ctx.RecordCount;
+  Inc(Ctx.RecordCount);
 end;
 
-procedure TBytecodeVM.RecordNewArrayInit(ArrayId: Integer; PackedCounts: Int64);
+procedure TBytecodeVM.RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);
 // Eager-allocate one record instance per element of the (int handle) array and store the
 // handles. PackedCounts = intCount | floatCount<<16 | strCount<<32 | typeId<<48.
 var
@@ -1217,7 +1207,7 @@ begin
   StrC := (PackedCounts shr 32) and $FFFF;
   TypeId := (PackedCounts shr 48) and $FFFF;
   for k := 0 to FArrays[ArrayId].TotalSize - 1 do
-    FArrays[ArrayId].IntData[k] := AllocRecord(IntC, FloatC, StrC, TypeId);
+    FArrays[ArrayId].IntData[k] := AllocRecord(Ctx, IntC, FloatC, StrC, TypeId);
 end;
 
 procedure TBytecodeVM.EnsureRegisterCapacity(Ctx: TExecutionContext; RegType: TSSARegisterType; MinIndex: Integer);
@@ -1874,8 +1864,8 @@ begin
   FCtx.FrameSaveStrTop := 0;
   FCtx.FrameRecBaseTop := 0;
   FCtx.BlockRecMarkTop := 0;
-  SetLength(FRecords, 0);
-  FRecordCount := 0;
+  SetLength(FCtx.Records, 0);
+  FCtx.RecordCount := 0;
   {$IFDEF ENABLE_INSTRUCTION_COUNTING}
   FInstructionsExecuted := 0;
   {$ENDIF}
@@ -2132,15 +2122,15 @@ begin
       begin
         if Ctx.BlockRecMarkTop >= Length(Ctx.BlockRecMark) then
           SetLength(Ctx.BlockRecMark, Ctx.BlockRecMarkTop + 256);
-        Ctx.BlockRecMark[Ctx.BlockRecMarkTop] := FRecordCount;
+        Ctx.BlockRecMark[Ctx.BlockRecMarkTop] := Ctx.RecordCount;
         Inc(Ctx.BlockRecMarkTop);
       end;
     bcRecMarkPop:
       if Ctx.BlockRecMarkTop > 0 then
       begin
         Dec(Ctx.BlockRecMarkTop);
-        if Ctx.BlockRecMark[Ctx.BlockRecMarkTop] < FRecordCount then
-          FRecordCount := Ctx.BlockRecMark[Ctx.BlockRecMarkTop];
+        if Ctx.BlockRecMark[Ctx.BlockRecMarkTop] < Ctx.RecordCount then
+          Ctx.RecordCount := Ctx.BlockRecMark[Ctx.BlockRecMarkTop];
       end;
     // Transfer registers (M2): move a value to/from the non-saved transfer banks.
     bcXferStoreInt:    Ctx.XferInt[Instr.Immediate] := Ctx.IntRegs[Instr.Src1];
@@ -2151,17 +2141,17 @@ begin
     bcXferLoadString:  Ctx.StringRegs[Instr.Dest] := Ctx.XferStr[Instr.Immediate];
     // UDT/record heap (M3)
     bcRecordNew:
-      Ctx.IntRegs[Instr.Dest] := AllocRecord(Instr.Src1, Instr.Src2,
+      Ctx.IntRegs[Instr.Dest] := AllocRecord(Ctx, Instr.Src1, Instr.Src2,
                                           Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
     bcRecordNewArray:
-      RecordNewArrayInit(Instr.Src1, Instr.Immediate);  // Src1=array id; Imm=packed slot counts
-    bcRecordLoadInt:    Ctx.IntRegs[Instr.Dest] := FRecords[Ctx.IntRegs[Instr.Src1]].IntData[Instr.Immediate];
-    bcRecordLoadFloat:  Ctx.FloatRegs[Instr.Dest] := FRecords[Ctx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate];
-    bcRecordLoadString: Ctx.StringRegs[Instr.Dest] := FRecords[Ctx.IntRegs[Instr.Src1]].StringData[Instr.Immediate];
-    bcRecordStoreInt:   FRecords[Ctx.IntRegs[Instr.Src1]].IntData[Instr.Immediate] := Ctx.IntRegs[Instr.Src2];
-    bcRecordStoreFloat: FRecords[Ctx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate] := Ctx.FloatRegs[Instr.Src2];
-    bcRecordStoreString:FRecords[Ctx.IntRegs[Instr.Src1]].StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2];
-    bcRecordTypeId:     Ctx.IntRegs[Instr.Dest] := FRecords[Ctx.IntRegs[Instr.Src1]].TypeId;
+      RecordNewArrayInit(Ctx, Instr.Src1, Instr.Immediate);  // Src1=array id; Imm=packed slot counts
+    bcRecordLoadInt:    Ctx.IntRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].IntData[Instr.Immediate];
+    bcRecordLoadFloat:  Ctx.FloatRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate];
+    bcRecordLoadString: Ctx.StringRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].StringData[Instr.Immediate];
+    bcRecordStoreInt:   Ctx.Records[Ctx.IntRegs[Instr.Src1]].IntData[Instr.Immediate] := Ctx.IntRegs[Instr.Src2];
+    bcRecordStoreFloat: Ctx.Records[Ctx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate] := Ctx.FloatRegs[Instr.Src2];
+    bcRecordStoreString:Ctx.Records[Ctx.IntRegs[Instr.Src1]].StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2];
+    bcRecordTypeId:     Ctx.IntRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].TypeId;
     // System commands
     bcEnd:
       begin

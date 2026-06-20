@@ -533,7 +533,7 @@ begin
           begin
             if Ctx.BlockRecMarkTop >= Length(Ctx.BlockRecMark) then
               SetLength(Ctx.BlockRecMark, Ctx.BlockRecMarkTop + 256);
-            Ctx.BlockRecMark[Ctx.BlockRecMarkTop] := FRecordCount;
+            Ctx.BlockRecMark[Ctx.BlockRecMarkTop] := Ctx.RecordCount;
             Inc(Ctx.BlockRecMarkTop);
             Inc(CurPC);
           end;
@@ -542,8 +542,8 @@ begin
             if Ctx.BlockRecMarkTop > 0 then
             begin
               Dec(Ctx.BlockRecMarkTop);
-              if Ctx.BlockRecMark[Ctx.BlockRecMarkTop] < FRecordCount then
-                FRecordCount := Ctx.BlockRecMark[Ctx.BlockRecMarkTop];
+              if Ctx.BlockRecMark[Ctx.BlockRecMarkTop] < Ctx.RecordCount then
+                Ctx.RecordCount := Ctx.BlockRecMark[Ctx.BlockRecMarkTop];
             end;
             Inc(CurPC);
           end;
@@ -563,29 +563,29 @@ begin
         // UDT/record heap (M3)
         bcRecordNew:
           begin
-            Ctx.IntRegs[Instr.Dest] := AllocRecord(Instr.Src1, Instr.Src2,
+            Ctx.IntRegs[Instr.Dest] := AllocRecord(Ctx, Instr.Src1, Instr.Src2,
                                       Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
             Inc(CurPC);
           end;
         bcRecordNewArray:
           begin
-            RecordNewArrayInit(Instr.Src1, Instr.Immediate);
+            RecordNewArrayInit(Ctx, Instr.Src1, Instr.Immediate);
             Inc(CurPC);
           end;
         bcRecordLoadInt:
-          begin Ctx.IntRegs[Instr.Dest] := FRecords[Ctx.IntRegs[Instr.Src1]].IntData[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].IntData[Instr.Immediate]; Inc(CurPC); end;
         bcRecordLoadFloat:
-          begin Ctx.FloatRegs[Instr.Dest] := FRecords[Ctx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.FloatRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate]; Inc(CurPC); end;
         bcRecordLoadString:
-          begin Ctx.StringRegs[Instr.Dest] := FRecords[Ctx.IntRegs[Instr.Src1]].StringData[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.StringRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].StringData[Instr.Immediate]; Inc(CurPC); end;
         bcRecordStoreInt:
-          begin FRecords[Ctx.IntRegs[Instr.Src1]].IntData[Instr.Immediate] := Ctx.IntRegs[Instr.Src2]; Inc(CurPC); end;
+          begin Ctx.Records[Ctx.IntRegs[Instr.Src1]].IntData[Instr.Immediate] := Ctx.IntRegs[Instr.Src2]; Inc(CurPC); end;
         bcRecordStoreFloat:
-          begin FRecords[Ctx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate] := Ctx.FloatRegs[Instr.Src2]; Inc(CurPC); end;
+          begin Ctx.Records[Ctx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate] := Ctx.FloatRegs[Instr.Src2]; Inc(CurPC); end;
         bcRecordStoreString:
-          begin FRecords[Ctx.IntRegs[Instr.Src1]].StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2]; Inc(CurPC); end;
+          begin Ctx.Records[Ctx.IntRegs[Instr.Src1]].StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2]; Inc(CurPC); end;
         bcRecordTypeId:
-          begin Ctx.IntRegs[Instr.Dest] := FRecords[Ctx.IntRegs[Instr.Src1]].TypeId; Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr.Dest] := Ctx.Records[Ctx.IntRegs[Instr.Src1]].TypeId; Inc(CurPC); end;
 
         // Array operations - typed versions are faster
         bcArrayLoadInt:

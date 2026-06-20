@@ -43,6 +43,16 @@ interface
   state starts at 0 / False / '' as the VM expects. }
 
 type
+  { UDT/record instance storage (M3): a heap block of typed slot arrays, referenced by a
+    handle (its index in the record heap). M5.2b: the heap is per-context (per-thread), so a
+    thread's RAII frame-mark rollback reclaims only its own records, never another thread's. }
+  TRecordStorage = record
+    TypeId: Integer;          // M4.3: runtime UDT type id (for virtual dispatch); -1 if untyped
+    IntData: array of Int64;
+    FloatData: array of Double;
+    StringData: array of string;
+  end;
+
   TExecutionContext = class
   public
     // --- Register banks (one working set per context) ---
@@ -107,6 +117,13 @@ type
 
     // --- DATA / READ / RESTORE cursor (the DATA pool itself stays shared) ---
     DataIndex: Integer;         // Current read position in the DATA pool
+
+    // --- UDT/record heap (M3; per-context since M5.2b) ---
+    // Instances allocated by bcRecordNew; a handle is an index here. RAII (V2) rolls
+    // RecordCount back to a frame's saved mark on exit, freeing that frame's records — sound
+    // per-thread because each thread owns its heap (no cross-thread reclamation, S16.4).
+    Records: array of TRecordStorage;
+    RecordCount: Integer;
   end;
 
 implementation
