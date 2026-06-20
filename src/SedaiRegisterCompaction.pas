@@ -480,8 +480,6 @@ begin
   case OpCode of
     // UDT/record (M3): RecordStoreInt's Src2 is the int value being written.
     bcRecordStoreInt,
-    // OS threading (M5.2): ThreadCreate's Src2 is the int worker parameter.
-    bcThreadCreate,
     // Condition variables (M5.4): CondWait's Src2 is the mutex handle (int).
     bcCondWait,
     // === GROUP 0: Core VM operations ===

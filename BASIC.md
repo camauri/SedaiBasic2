@@ -2300,8 +2300,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `THREADCALL` | ✓ | Starts a procedure with parameters in a separate thread of execution. `h = THREADCALL sub(arg)` (sugar for THREADCREATE; M5.5; v1: one int arg). |
-| `THREADCREATE` | ✓ | Starts a procedure in a separate thread of execution. `h = THREADCREATE(@sub [, intparam])` (M5.2; v1: one int param, workers share global arrays + arrays of UDT). |
+| `THREADCALL` | ✓ | Starts a procedure with parameters in a separate thread of execution. `h = THREADCALL sub(a, b, ...)` — typed, multi-argument (int/float/string), like a normal call (M5.5). |
+| `THREADCREATE` | ✓ | Starts a procedure in a separate thread of execution. `h = THREADCREATE(@sub [, param])` (M5.2; one param, any type; workers share global arrays + arrays of UDT). |
 | `THREADWAIT` | ✓ | Waits for a thread to finish and releases the thread handle. `THREADWAIT h` (M5.2). |
 | `THREADDETACH` | ✓ | Releases a thread handle without waiting for the thread to finish. `THREADDETACH h` (M5.5; v1: cleaned up at program end). |
 | `THREADSELF` | ✓ | Returns the thread handle of the current thread. `h = THREADSELF()` (0 on the main thread) (M5.5). |

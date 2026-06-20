@@ -826,15 +826,16 @@ begin
 
     antThreadCreate:
     begin
-      // THREADCREATE(@sub, param) → spawn an OS worker running SUB; evaluates to an int handle.
-      // child0 = @sub (lowered to ssaLoadProcAddr, an int reg holding the entry PC); child1 = the
-      // int parameter delivered to the worker via its XferInt[0] at spawn (M5.2).
+      // THREADCREATE(@sub, arg) / THREADCALL sub(args) → spawn an OS worker running SUB; evaluates to an
+      // int handle. child0 = @sub (lowered to ssaLoadProcAddr, an int reg = entry PC); child1 =
+      // antArgumentList. The args are staged into the transfer slots per SUB's parameter signature
+      // (StageCallArgs, like a normal call); the spawn snapshots the transfer slots into the worker's
+      // context, whose prologue loads the parameters — so workers take typed, multi-argument parameters.
+      StageCallArgs(VarToStr(Node.GetChild(0).Value), Node.GetChild(1));
       ProcessExpression(Node.GetChild(0), Left);
       Left := EnsureIntRegister(Left);
-      ProcessExpression(Node.GetChild(1), Right);
-      Right := EnsureIntRegister(Right);
       Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaThreadCreate, Result, Left, Right, MakeSSAValue(svkNone));
+      EmitInstruction(ssaThreadCreate, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
 
     antThreadSelf:

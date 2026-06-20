@@ -1318,10 +1318,11 @@ end;
 
 function TExpressionParser.ParseThreadCreate(Token: TLexerToken): TASTNode;
 var
-  ProcExpr, ParamExpr: TASTNode;
+  ProcExpr, ArgList, ParamExpr: TASTNode;
 begin
-  // THREADCREATE(@sub [, param]) — spawn a worker thread; evaluates to an int handle.
-  // child0 = proc-address expression (@sub), child1 = the int parameter (default 0 if omitted).
+  // THREADCREATE(@sub [, param]) — spawn a worker thread; evaluates to an int handle. FB passes a single
+  // (Any Ptr) parameter. child0 = proc-address (@sub), child1 = antArgumentList (the param, or literal 0
+  // if omitted). The arg list lets SSA stage the parameter through StageCallArgs like a normal call.
   Result := TASTNode.CreateWithValue(antThreadCreate, 'THREADCREATE', Token);
   if not Context.Match(ttDelimParOpen) then
   begin
@@ -1335,6 +1336,8 @@ begin
     Result.Free; Result := nil; Exit;
   end;
   Result.AddChild(ProcExpr);
+  ArgList := TASTNode.Create(antArgumentList, Token);
+  Result.AddChild(ArgList);
   if Context.Match(ttSeparParam) then
   begin
     ParamExpr := ParseExpression;
@@ -1343,11 +1346,11 @@ begin
       HandleError('Expected a parameter expression after "," in THREADCREATE', Context.CurrentToken);
       Result.Free; Result := nil; Exit;
     end;
-    Result.AddChild(ParamExpr);
+    ArgList.AddChild(ParamExpr);
   end
   else
     // Param omitted: default to integer 0 (FB allows the optional parameter to be absent).
-    Result.AddChild(TASTNode.CreateWithValue(antLiteral, '0', Token));
+    ArgList.AddChild(TASTNode.CreateWithValue(antLiteral, '0', Token));
   if not Context.Match(ttDelimParClose) then
   begin
     HandleError('Expected ")" after THREADCREATE arguments', Context.CurrentToken);
@@ -1382,10 +1385,11 @@ end;
 
 function TExpressionParser.ParseThreadCall(Token: TLexerToken): TASTNode;
 var
-  ProcNode, ArgExpr, Extra: TASTNode;
+  ProcNode, ArgList, ArgExpr: TASTNode;
 begin
-  // THREADCALL subname [(arg [, ...])] — sugar for THREADCREATE(@subname, arg). v1: a single int arg
-  // (extra args parsed and discarded). Lowers to an antThreadCreate node so SSA reuses the spawn path.
+  // THREADCALL subname [(arg [, ...])] — sugar for THREADCREATE that passes the SUB's actual arguments
+  // (int/float/string, any arity). Lowers to an antThreadCreate node: child0 = @subname, child1 =
+  // antArgumentList, so SSA stages the args through StageCallArgs exactly like a normal call.
   if not Context.Check(ttIdentifier) then
   begin
     HandleError('Expected a SUB name after THREADCALL', Context.CurrentToken);
@@ -1396,25 +1400,20 @@ begin
   Context.Advance;                                // consume the sub name
   Result := TASTNode.CreateWithValue(antThreadCreate, 'THREADCREATE', Token);
   Result.AddChild(ProcNode);
-  ArgExpr := nil;
+  ArgList := TASTNode.Create(antArgumentList, Token);
+  Result.AddChild(ArgList);
   if Context.Match(ttDelimParOpen) then
   begin
     if not Context.Check(ttDelimParClose) then
     begin
-      ArgExpr := ParseExpression;
-      // v1 supports one int parameter; parse and discard any extra arguments.
-      while Context.Match(ttSeparParam) do
-      begin
-        Extra := ParseExpression;
-        if Assigned(Extra) then Extra.Free;
-      end;
+      repeat
+        ArgExpr := ParseExpression;
+        if not Assigned(ArgExpr) then Break;
+        ArgList.AddChild(ArgExpr);
+      until not Context.Match(ttSeparParam);
     end;
     if Context.Check(ttDelimParClose) then Context.Advance;  // )
   end;
-  if Assigned(ArgExpr) then
-    Result.AddChild(ArgExpr)
-  else
-    Result.AddChild(TASTNode.CreateWithValue(antLiteral, '0', Token));  // omitted param → 0
   DoNodeCreated(Result);
 end;
 

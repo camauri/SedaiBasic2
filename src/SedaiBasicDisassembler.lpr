@@ -179,7 +179,7 @@ begin
   // otherwise misreads any core opcode >= 100 as a superinstruction (a pre-existing sbd quirk).
   case Instr.OpCode of
     bcLoadProcAddr: begin Result := Format('R%d = @%d', [Instr.Dest, Instr.Immediate]); Exit; end;
-    bcThreadCreate: begin Result := Format('R%d = thread(R%d, R%d)', [Instr.Dest, Instr.Src1, Instr.Src2]); Exit; end;
+    bcThreadCreate: begin Result := Format('R%d = thread(@R%d)', [Instr.Dest, Instr.Src1]); Exit; end;
     bcThreadWait:   begin Result := Format('R%d', [Instr.Src1]); Exit; end;
     bcThreadSelf:   begin Result := Format('R%d = self', [Instr.Dest]); Exit; end;
     bcThreadDetach: begin Result := Format('R%d', [Instr.Src1]); Exit; end;

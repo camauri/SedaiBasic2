@@ -175,7 +175,7 @@ begin
     bcLoadProcAddr:
       Line := Format('%4d: %-20s R%d = @%d', [Index, 'LoadProcAddr', Instr.Dest, Instr.Immediate]);
     bcThreadCreate:
-      Line := Format('%4d: %-20s R%d = thread(R%d, R%d)', [Index, 'ThreadCreate', Instr.Dest, Instr.Src1, Instr.Src2]);
+      Line := Format('%4d: %-20s R%d = thread(@R%d)', [Index, 'ThreadCreate', Instr.Dest, Instr.Src1]);
     bcThreadWait:
       Line := Format('%4d: %-20s R%d', [Index, 'ThreadWait', Instr.Src1]);
     bcThreadSelf:

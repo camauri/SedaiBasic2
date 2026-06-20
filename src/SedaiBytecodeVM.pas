@@ -223,7 +223,7 @@ type
     // SpawnWorker BeginThreads a worker (returns the handle); JoinWorker waits on it; RunWorker is the
     // worker-thread body (Spawn is a TWorkerSpawn) that primes a synthetic call frame and runs the loop.
     procedure SetupWorkerContext(WCtx: TExecutionContext);
-    function SpawnWorker(EntryPC, Param: Int64): Int64;
+    function SpawnWorker(EntryPC: Int64; SpawnerCtx: TExecutionContext): Int64;
     procedure JoinWorker(Handle: Int64);
     procedure DetachWorker(Handle: Int64);   // M5.5: mark a worker detached (not explicitly joined)
     procedure RunWorker(Spawn: TObject);
@@ -333,7 +333,6 @@ type
     VM: TBytecodeVM;
     Ctx: TExecutionContext;
     EntryPC: Integer;
-    Param: Int64;
     ThreadId: TThreadID;
     Handle: Int64;       // M5.5: this worker's Threadcreate handle (so it can answer THREADSELF)
     Joined: Boolean;
@@ -1418,9 +1417,8 @@ begin
   for i := 0 to WCtx.FloatRegCount - 1 do begin WCtx.FloatRegs[i] := 0.0; WCtx.TempFloatRegs[i] := 0.0; end;
   for i := 0 to WCtx.StringRegCount - 1 do begin WCtx.StringRegs[i] := ''; WCtx.TempFStringRegs[i] := ''; end;
   SetLength(WCtx.CallStack, 256);
-  SetLength(WCtx.XferInt, 256);
-  SetLength(WCtx.XferFloat, 256);
-  SetLength(WCtx.XferStr, 256);
+  // NB: the transfer slots (XferInt/Float/Str) are sized and filled by SpawnWorker with the worker's
+  // argument snapshot — do NOT re-init them here, or the arguments would be lost.
   WCtx.CallStackPtr := 0;
   WCtx.FrameSaveIntTop := 0;
   WCtx.FrameSaveFloatTop := 0;
@@ -1437,10 +1435,10 @@ begin
   WCtx.PC := 0;
 end;
 
-function TBytecodeVM.SpawnWorker(EntryPC, Param: Int64): Int64;
-// bcThreadCreate: register a worker (handle = index+1) and BeginThread it. The worker runs the SUB
-// at EntryPC on its own context; Param is delivered as the SUB's first int argument. From the first
-// spawn FHasWorkers is True, wiring the M5.3 draw queue (off-owner graphics ops marshal to the owner).
+function TBytecodeVM.SpawnWorker(EntryPC: Int64; SpawnerCtx: TExecutionContext): Int64;
+// bcThreadCreate: register a worker (handle = index+1) and BeginThread it. The worker runs the SUB at
+// EntryPC on its own context; the SUB's arguments are snapshotted from SpawnerCtx's transfer slots (the
+// caller staged them there). From the first spawn FHasWorkers is True, wiring the M5.3 draw queue.
 var
   Spawn: TWorkerSpawn;
   Idx: Integer;
@@ -1449,9 +1447,18 @@ begin
   Spawn.VM := Self;
   Spawn.Ctx := TExecutionContext.Create;
   Spawn.EntryPC := EntryPC;
-  Spawn.Param := Param;
   Spawn.Joined := False;
   Spawn.Detached := False;
+  // Snapshot the spawning context's transfer slots into the worker's context: the arguments were just
+  // staged there (StageCallArgs, like a normal call), and the worker's SUB prologue loads its parameters
+  // from these same slots. Done here on the spawner thread (the worker hasn't started), so it is safe
+  // and the args are captured before any later spawn overwrites the spawner's transfer slots.
+  SetLength(Spawn.Ctx.XferInt, Length(SpawnerCtx.XferInt));
+  SetLength(Spawn.Ctx.XferFloat, Length(SpawnerCtx.XferFloat));
+  SetLength(Spawn.Ctx.XferStr, Length(SpawnerCtx.XferStr));
+  for Idx := 0 to High(SpawnerCtx.XferInt) do Spawn.Ctx.XferInt[Idx] := SpawnerCtx.XferInt[Idx];
+  for Idx := 0 to High(SpawnerCtx.XferFloat) do Spawn.Ctx.XferFloat[Idx] := SpawnerCtx.XferFloat[Idx];
+  for Idx := 0 to High(SpawnerCtx.XferStr) do Spawn.Ctx.XferStr[Idx] := SpawnerCtx.XferStr[Idx];
   EnterCriticalSection(FWorkerLock);
   try
     Idx := Length(FWorkerThreads);
@@ -1476,12 +1483,13 @@ var
 begin
   Sp := TWorkerSpawn(Spawn);
   WCtx := Sp.Ctx;
-  SetupWorkerContext(WCtx);
+  SetupWorkerContext(WCtx);                          // sizes register/stack banks; leaves the xfer snapshot intact
   WCtx.StartPC := Sp.EntryPC;
   FramePush(WCtx);                                  // snapshot the (zeroed) banks for the SUB frame
   WCtx.CallStack[0] := FProgram.GetInstructionCount;  // return-to-stop sentinel (CurPC >= InstrCount → exit)
   WCtx.CallStackPtr := 1;
-  WCtx.XferInt[0] := Sp.Param;                      // SUB's first int param, loaded by its prologue
+  // The SUB's arguments are already in WCtx's transfer slots (snapshotted at spawn from the caller);
+  // the prologue loads them into the parameter registers — so workers take typed, multi-arg parameters.
   RunFast;                                          // binds Ctx := GActiveCtx, starts at WCtx.StartPC
 end;
 

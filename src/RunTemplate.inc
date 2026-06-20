@@ -538,10 +538,11 @@ begin
           // @sub: the SUB's entry PC was resolved into Immediate at link time; load it into Dest.
           begin Ctx.IntRegs[Instr.Dest] := Instr.Immediate; Inc(CurPC); end;
         bcThreadCreate:
-          // h = THREADCREATE(@sub, param): spawn a worker running the SUB at the entry PC (Src1)
-          // with the int parameter (Src2); the returned int handle goes into Dest. Falls through.
+          // h = THREADCREATE/THREADCALL: spawn a worker running the SUB at the entry PC (Src1). The
+          // arguments are already staged in this context's transfer slots; SpawnWorker snapshots them
+          // into the worker. The returned int handle goes into Dest. Falls through.
           begin
-            Ctx.IntRegs[Instr.Dest] := SpawnWorker(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);
+            Ctx.IntRegs[Instr.Dest] := SpawnWorker(Ctx.IntRegs[Instr.Src1], Ctx);
             Inc(CurPC);
           end;
         bcThreadWait:
