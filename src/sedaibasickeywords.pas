@@ -238,6 +238,9 @@ const
   kVALINT  = 'VALINT';    // string -> Integer
   kVALLNG  = 'VALLNG';    // string -> LongInt
   kVALUINT = 'VALUINT';   // string -> UInteger
+  // FreeBASIC array bound queries (B1.4)
+  kLBOUND  = 'LBOUND';    // lower bound of an array dimension
+  kUBOUND  = 'UBOUND';    // upper bound of an array dimension
 
   // String functions
   kASC     = 'ASC';

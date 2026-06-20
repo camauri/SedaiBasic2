@@ -214,6 +214,7 @@ begin
     bcStrValInt,   // VALINT/VALLNG/VALUINT(str) returns int (B1.3)
     // === GROUP 3: Array operations ===
     bcArrayLoadInt,  // Typed array load (int) - Dest is WRITTEN
+    bcArrayLBound, bcArrayUBound,  // B1.4: LBOUND/UBOUND - Dest = int bound
     // === GROUP 4: I/O operations ===
     bcInputInt,      // Input int
     bcDataReadInt,   // Read next DATA value into int register
@@ -501,6 +502,7 @@ begin
     // === GROUP 3: Typed array operations: Src2 is always int (linear index) ===
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
+    bcArrayLBound, bcArrayUBound,  // B1.4: Src2 = 0-based dim index (int)
     // === GROUP 10: Graphics ===
     bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
     bcGraphicWindow,  // Src2 = row1 register (int)

@@ -1921,6 +1921,54 @@ begin
           Result := MakeSSARegister(srtInt, DestReg);
           EmitInstruction(ssaStrValInt, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
+        else if (FuncName = 'LBOUND') or (FuncName = 'UBOUND') then
+        begin
+          // LBOUND/UBOUND(arrayname [, dim]) - bound of a dimension (1-based dim, default 1).
+          if ArgListNode = nil then begin Result := MakeSSAValue(svkNone); Exit; end;
+          if (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            IndicesNode := ArgListNode.GetChild(0)   // reuse IndicesNode as the array-name node
+          else
+            IndicesNode := ArgListNode;
+          // The array name may arrive as a bare identifier or wrapped in an array-access node.
+          if IndicesNode.NodeType = antArrayAccess then
+            ArrName := VarToStr(IndicesNode.GetChild(0).Value)
+          else
+            ArrName := VarToStr(IndicesNode.Value);
+          ArrayIdx := FProgram.FindArray(ArrName);
+          if ArrayIdx < 0 then
+            raise Exception.CreateFmt('%s: array not declared: %s', [FuncName, ArrName]);
+          ArrInfo := FProgram.GetArray(ArrayIdx);
+          ArrayRef := MakeSSAArrayRef(ArrayIdx, srtInt);
+
+          // 0-based dimension index in an int register: (dim - 1), default 0.
+          TempReg := FProgram.AllocRegister(srtInt);
+          ArgReg := MakeSSARegister(srtInt, TempReg);
+          if (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(1), ArgValue);
+            if ArgValue.Kind = svkConstInt then
+              EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(ArgValue.ConstInt - 1), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+            else if ArgValue.Kind = svkConstFloat then
+              EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(Trunc(ArgValue.ConstFloat) - 1), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+            else
+            begin
+              IntRegVal := EnsureIntRegister(ArgValue);
+              TempReg := FProgram.AllocRegister(srtInt);
+              TempVal := MakeSSARegister(srtInt, TempReg);
+              EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              EmitInstruction(ssaSubInt, ArgReg, IntRegVal, TempVal, MakeSSAValue(svkNone));
+            end;
+          end
+          else
+            EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          if FuncName = 'LBOUND' then
+            EmitInstruction(ssaArrayLBound, Result, ArrayRef, ArgReg, MakeSSAValue(svkNone))
+          else
+            EmitInstruction(ssaArrayUBound, Result, ArrayRef, ArgReg, MakeSSAValue(svkNone));
+        end
         else if (FuncName = 'INSTRREV') then
         begin
           // INSTRREV(str, sub) -> int position of the last occurrence (Dest=int, two string args).

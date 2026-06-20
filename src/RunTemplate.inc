@@ -698,6 +698,13 @@ begin
               else
                 FArrays[ArrayIdx].Dimensions[i] := ArrInfo.Dimensions[i];
             end;
+            // Record per-dimension lower bounds for LBOUND/UBOUND (B1.4); default 0.
+            SetLength(FArrays[ArrayIdx].LowerBounds, ArrInfo.DimCount);
+            for i := 0 to ArrInfo.DimCount - 1 do
+              if i <= High(ArrInfo.LowerBounds) then
+                FArrays[ArrayIdx].LowerBounds[i] := ArrInfo.LowerBounds[i]
+              else
+                FArrays[ArrayIdx].LowerBounds[i] := 0;
             ProdDims := 1;
             for i := 0 to ArrInfo.DimCount - 1 do
               ProdDims := ProdDims * FArrays[ArrayIdx].Dimensions[i];
@@ -707,6 +714,23 @@ begin
               srtFloat: SetLength(FArrays[ArrayIdx].FloatData, ProdDims);
               srtString: SetLength(FArrays[ArrayIdx].StringData, ProdDims);
             end;
+            Inc(CurPC);
+          end;
+
+        // LBOUND/UBOUND(arr[, dim]) - bound of a dimension (B1.4)
+        bcArrayLBound:
+          begin
+            ArrayIdx := Instr.Src1;
+            LinearIdx := IntRegs[Instr.Src2];  // 0-based dim index
+            IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx];
+            Inc(CurPC);
+          end;
+        bcArrayUBound:
+          begin
+            ArrayIdx := Instr.Src1;
+            LinearIdx := IntRegs[Instr.Src2];  // 0-based dim index
+            IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx]
+                                   + FArrays[ArrayIdx].Dimensions[LinearIdx] - 1;
             Inc(CurPC);
           end;
 

@@ -76,7 +76,8 @@ type
   TArrayStorage = record
     ElementType: Byte;        // 0=Int, 1=Float, 2=String (maps to TSSARegisterType)
     DimCount: Integer;
-    Dimensions: array of Integer;
+    Dimensions: array of Integer;   // element count per dimension
+    LowerBounds: array of Integer;  // lower bound per dimension (B1.4: LBOUND/UBOUND)
     TotalSize: Integer;
     IntData: array of Int64;
     FloatData: array of Double;
@@ -2077,6 +2078,13 @@ begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;  // index is int
         end;
 
+        // LBOUND/UBOUND: Dest = int bound, Src2 = int dim index (Src1 = array id, not a register)
+        bcArrayLBound, bcArrayUBound:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+        end;
+
         // Int source (Src1) for branch
         bcJumpIfZero, bcJumpIfNotZero:
         begin
@@ -3988,6 +3996,13 @@ begin
           else
             FArrays[ArrayIdx].Dimensions[i] := ArrInfo.Dimensions[i];
         end;
+        // Record per-dimension lower bounds for LBOUND/UBOUND (B1.4); default 0.
+        SetLength(FArrays[ArrayIdx].LowerBounds, ArrInfo.DimCount);
+        for i := 0 to ArrInfo.DimCount - 1 do
+          if i <= High(ArrInfo.LowerBounds) then
+            FArrays[ArrayIdx].LowerBounds[i] := ArrInfo.LowerBounds[i]
+          else
+            FArrays[ArrayIdx].LowerBounds[i] := 0;
         ProdDims := 1;
         for i := 0 to ArrInfo.DimCount - 1 do
           ProdDims := ProdDims * FArrays[ArrayIdx].Dimensions[i];
@@ -4081,6 +4096,19 @@ begin
         if Assigned(FProfiler) and FProfiler.Enabled then
           FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
         {$ENDIF}
+      end;
+    9: // bcArrayLBound - LBOUND(arr[, dim]) - Src2 = 0-based dim index (B1.4)
+      begin
+        ArrayIdx := Instr.Src1;
+        LinearIdx := Ctx.IntRegs[Instr.Src2];
+        Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx];
+      end;
+    10: // bcArrayUBound - UBOUND(arr[, dim]) - upper = lower + size - 1 (B1.4)
+      begin
+        ArrayIdx := Instr.Src1;
+        LinearIdx := Ctx.IntRegs[Instr.Src2];
+        Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx]
+                                   + FArrays[ArrayIdx].Dimensions[LinearIdx] - 1;
       end;
   else
     raise Exception.CreateFmt('Unknown array opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);

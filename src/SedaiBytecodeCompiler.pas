@@ -270,6 +270,8 @@ begin
     // to emit typed opcodes (bcArrayLoadInt/Float/String, bcArrayStoreInt/Float/String)
     ssaArrayLoad: Result := bcArrayLoad;  // Fallback - should use GetTypedArrayLoadOp
     ssaArrayStore: Result := bcArrayStore;  // Fallback - should use GetTypedArrayStoreOp
+    ssaArrayLBound: Result := bcArrayLBound;  // B1.4 array bound queries
+    ssaArrayUBound: Result := bcArrayUBound;
     // Graphics operations
     ssaGraphicRGBA: Result := bcGraphicRGBA;
     ssaGraphicSetMode: Result := bcGraphicSetMode;

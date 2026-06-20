@@ -1870,6 +1870,8 @@ begin
  RegisterKeyword(kVALINT,  ttMathFunction, 'Parse leading integer from a string',                    kcMathFunctions);
  RegisterKeyword(kVALLNG,  ttMathFunction, 'Parse leading 64-bit integer from a string',             kcMathFunctions);
  RegisterKeyword(kVALUINT, ttMathFunction, 'Parse leading unsigned integer from a string',           kcMathFunctions);
+ RegisterKeyword(kLBOUND,  ttMathFunction, 'Lower bound of an array dimension',                       kcMathFunctions);
+ RegisterKeyword(kUBOUND,  ttMathFunction, 'Upper bound of an array dimension',                       kcMathFunctions);
 
  // === RESERVED VARIABLES ===
  RegisterKeyword(kDS,  ttSpecialVariable, 'Get disk status code',          kcReservedVariables);

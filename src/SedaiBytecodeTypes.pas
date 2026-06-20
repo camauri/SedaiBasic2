@@ -339,6 +339,9 @@ const
   bcArrayStoreInt   = bcGroupArray + 6;
   bcArrayStoreFloat = bcGroupArray + 7;
   bcArrayStoreString = bcGroupArray + 8;
+  // FreeBASIC array bound queries (B1.4). Dest=int result, Src1=array id, Src2=0-based dim index reg.
+  bcArrayLBound     = bcGroupArray + 9;   // LBOUND(arr[, dim]) - lower bound of a dimension
+  bcArrayUBound     = bcGroupArray + 10;  // UBOUND(arr[, dim]) - upper bound of a dimension
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values
@@ -1328,6 +1331,8 @@ begin
         6: Result := 'ArrayStoreInt';
         7: Result := 'ArrayStoreFloat';
         8: Result := 'ArrayStoreString';
+        9: Result := 'ArrayLBound';
+        10: Result := 'ArrayUBound';
       else
         Result := Format('Array_%d', [SubOp]);
       end;

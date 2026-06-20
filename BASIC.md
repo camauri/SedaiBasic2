@@ -1956,8 +1956,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `ARRAYLEN` | ✗ | Returns the total number of array elements. |
 | `ARRAYSIZE` | ✗ | Returns the total array size (in bytes). |
-| `LBOUND` | ✗ | Returns the lower bound of an array's dimension. |
-| `UBOUND` | ✗ | Returns the upper bound of an array's dimension. |
+| `LBOUND` | ✓ | Returns the lower bound of an array's dimension. `LBOUND(arr[, dim])` (B1.4). |
+| `UBOUND` | ✓ | Returns the upper bound of an array's dimension. `UBOUND(arr[, dim])` (B1.4; honors explicit `lb TO ub` and dynamic sizes). |
 
 #### Retrieving Array Descriptor
 
