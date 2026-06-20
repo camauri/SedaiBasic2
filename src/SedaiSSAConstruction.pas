@@ -681,7 +681,7 @@ begin
       AddUse(Instr.Src3);
 
       // CRITICAL FIX: Some instructions USE their Dest operand instead of DEFINING it!
-      if Instr.OpCode in [ssaArrayStore, ssaPrint, ssaPrintLn] then
+      if OpIn(Instr.OpCode, [ssaArrayStore, ssaPrint, ssaPrintLn]) then
         AddUse(Instr.Dest);
     end;
   end;
@@ -1035,7 +1035,7 @@ begin
     if Instr.Dest.Kind = svkRegister then
     begin
       // Check if this instruction USES Dest (not defines it)
-      if Instr.OpCode in [ssaArrayStore, ssaPrint, ssaPrintLn] then
+      if OpIn(Instr.OpCode, [ssaArrayStore, ssaPrint, ssaPrintLn]) then
       begin
         // USE Dest - with global semantics keep Version=0
         if not FGlobalVariableSemantics then

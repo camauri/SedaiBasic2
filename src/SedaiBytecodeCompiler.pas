@@ -249,6 +249,8 @@ begin
     ssaThreadSelf: Result := bcThreadSelf;       // M5.5
     ssaThreadDetach: Result := bcThreadDetach;
     ssaFloatRound: Result := bcFloatRound;       // B1.3: CINT/CLNG round-to-int
+    ssaNarrowInt: Result := bcNarrowInt;         // B1.5: integer width narrowing
+    ssaNarrowSingle: Result := bcNarrowSingle;   // B1.5: single-precision rounding
     ssaMutexCreate: Result := bcMutexCreate;    // M5.4: mutex primitives
     ssaMutexLock: Result := bcMutexLock;
     ssaMutexUnlock: Result := bcMutexUnlock;
@@ -1036,7 +1038,7 @@ begin
   // Special handling for MOVSPR - map Src3 to Dest (not Immediate)
   // MOVSPR has 3 float operands: Src1=spriteNum, Src2=x/dist/angle, Src3=y/angle/speed
   // Src3 must go to Dest since there is no return value
-  if Instr.OpCode in [ssaMovsprAbs, ssaMovsprRel, ssaMovsprPolar, ssaMovsprAuto] then
+  if OpIn(Instr.OpCode, [ssaMovsprAbs, ssaMovsprRel, ssaMovsprPolar, ssaMovsprAuto]) then
   begin
     BCOp := CompileSSAOpCode(Instr.OpCode);
     BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
@@ -1334,7 +1336,7 @@ begin
   end;
 
   // Special handling for GET and GETKEY
-  if Instr.OpCode in [ssaGet, ssaGetkey] then
+  if OpIn(Instr.OpCode, [ssaGet, ssaGetkey]) then
   begin
     if Instr.OpCode = ssaGet then
       BCOp := bcGet
@@ -1553,7 +1555,7 @@ begin
     BCInstr.Immediate := Instr.Src2.ConstInt;
 
   {$IFDEF DEBUG_BYTECODE}
-  if DebugBytecode and (Instr.OpCode in [ssaPrintInt, ssaLoadEL, ssaLoadER]) then
+  if DebugBytecode and OpIn(Instr.OpCode, [ssaPrintInt, ssaLoadEL, ssaLoadER]) then
     WriteLn('[BC] Final instruction: Op=', Ord(BCOp), ' Dest=', BCInstr.Dest, ' Src1=', BCInstr.Src1, ' Src2=', BCInstr.Src2, ' @L', Instr.SourceLine);
   {$ENDIF}
 
@@ -1563,7 +1565,7 @@ begin
 
   // If this is a jump with a label, add to fixup list. ssaCallSub carries the
   // procedure entry label in Dest, resolved to the entry PC like ssaCall.
-  if (Instr.OpCode in [ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaCall, ssaCallSub]) and
+  if OpIn(Instr.OpCode, [ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaCall, ssaCallSub]) and
      (Instr.Dest.Kind = svkLabel) then
   begin
     AddJumpFixup(BCIndex, Instr.Dest.LabelName);

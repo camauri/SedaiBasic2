@@ -1197,7 +1197,7 @@ begin
     { Note: ssaCallSub (M2) likewise: procedure entry + return point }
     { Note: ssaTrap can have 2 successors: normal flow + error handler }
     { Note: ssaReturnSub (M2) ends a SUB/FUNCTION body (0 successors) }
-    if not (LastInstr.OpCode in [ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
+    if not OpIn(LastInstr.OpCode, [ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
                                   ssaReturn, ssaEnd, ssaStop, ssaCall, ssaTrap,
                                   ssaCallSub, ssaReturnSub]) then
     begin

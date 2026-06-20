@@ -379,8 +379,8 @@ begin
 
   // Step 3: Try to fold binary operations with constant operands
   // This transforms:  %r3 = AddFloat 3.14159, 365.24  →  %r3 = LoadConstFloat 368.38159
-  if Instr.OpCode in [ssaAddInt, ssaSubInt, ssaMulInt, ssaDivInt,
-                      ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat] then
+  if OpIn(Instr.OpCode, [ssaAddInt, ssaSubInt, ssaMulInt, ssaDivInt,
+                      ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat]) then
   begin
     HasLeft := False;
     HasRight := False;

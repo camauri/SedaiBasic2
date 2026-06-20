@@ -159,7 +159,7 @@ begin
   // Instructions that can be safely eliminated if redundant
   // Must be pure (no side effects) and deterministic (same inputs → same output)
 
-  Result := Instr.OpCode in [
+  Result := OpIn(Instr.OpCode, [
     // Arithmetic operations (pure and deterministic)
     ssaAddInt, ssaSubInt, ssaMulInt, ssaDivInt, ssaModInt, ssaNegInt,
     ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat, ssaPowFloat, ssaNegFloat,
@@ -179,7 +179,7 @@ begin
 
     // Array loads (pure if indices are same - we check this separately)
     ssaArrayLoad
-  ];
+  ]);
 end;
 
 function TCommonSubexpressionElimination.HashValue(const Val: TSSAValue): Int64;

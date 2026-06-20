@@ -474,8 +474,8 @@ begin
           // Check last instruction for control flow
           if Block.Instructions.Count > 0 then
           begin
-            if Block.Instructions[Block.Instructions.Count - 1].OpCode in
-               [ssaJump, ssaReturn, ssaEnd, ssaStop, ssaResume, ssaResumeNext] then
+            if OpIn(Block.Instructions[Block.Instructions.Count - 1].OpCode,
+               [ssaJump, ssaReturn, ssaEnd, ssaStop, ssaResume, ssaResumeNext]) then
               Break;
           end;
 
@@ -553,8 +553,8 @@ begin
     // Skip if block ends with a terminator (no fallthrough needed)
     if Block.Instructions.Count > 0 then
     begin
-      if Block.Instructions[Block.Instructions.Count - 1].OpCode in
-         [ssaJump, ssaReturn, ssaEnd, ssaStop, ssaResume, ssaResumeNext] then
+      if OpIn(Block.Instructions[Block.Instructions.Count - 1].OpCode,
+         [ssaJump, ssaReturn, ssaEnd, ssaStop, ssaResume, ssaResumeNext]) then
         Continue;
     end;
 

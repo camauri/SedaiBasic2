@@ -451,6 +451,8 @@ begin
         bcIntToFloat: begin FloatRegs[Instr.Dest] := IntRegs[Instr.Src1]; Inc(CurPC); end;
         bcFloatToInt: begin IntRegs[Instr.Dest] := Trunc(FloatRegs[Instr.Src1]); Inc(CurPC); end;
         bcFloatRound: begin IntRegs[Instr.Dest] := Round(FloatRegs[Instr.Src1]); Inc(CurPC); end;  // CINT (round-to-even)
+        bcNarrowInt: begin IntRegs[Instr.Dest] := NarrowInt64(IntRegs[Instr.Src1], Instr.Immediate); Inc(CurPC); end;  // B1.5
+        bcNarrowSingle: begin FloatRegs[Instr.Dest] := Single(FloatRegs[Instr.Src1]); Inc(CurPC); end;  // B1.5
 
         // Integer comparisons (use TrueVal for TRUE, 0 for FALSE)
         bcCmpEqInt: begin if IntRegs[Instr.Src1] = IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;

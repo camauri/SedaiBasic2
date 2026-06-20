@@ -480,7 +480,7 @@ begin
     Instr := Block.Instructions[j];
 
     // Look for AddInt or AddFloat with constant step
-    if (Instr.OpCode in [ssaAddInt, ssaAddFloat]) and
+    if OpIn(Instr.OpCode, [ssaAddInt, ssaAddFloat]) and
        (Instr.Src2.Kind = svkConstInt) then
     begin
       // Found a potential IV increment

@@ -230,6 +230,7 @@ type
                               out Bank: TSSARegisterType; out Slot: Integer;
                               out NestedType: string): Boolean;
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
+    function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
     // Resolve a member-access object (a record variable or an array-of-UDT element) to its
@@ -798,6 +799,8 @@ var
   TempInt: Integer;
   TempStr: string;
   ValCode: Integer;
+  ConvW: Integer;   // B1.5: integer-narrowing width code for a Cxxx conversion (0 = full width)
+  NarrowReg: TSSAValue;
   // Array access variables
   ArrName: string;
   ArrayIdx: Integer;
@@ -2136,12 +2139,21 @@ begin
                 (FuncName = 'CUSHORT') or (FuncName = 'CUINT') or (FuncName = 'CULNG') then
         begin
           // FreeBASIC integer conversion functions: round-to-nearest (banker's rounding)
-          // toward an integer result. Range-clamping per concrete type is deferred (v1).
+          // toward an integer result, then wrap/sign-extend to the type's width (B1.5).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
           else if (ArgListNode <> nil) and (ArgListNode.NodeType <> antArgumentList) then
             ProcessExpression(ArgListNode, ArgValue)
           else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          // Width code for the narrowing: signed/unsigned 8/16/32-bit; 0 = full 64-bit (CINT/CUINT/CLNGINT).
+          if FuncName = 'CBYTE' then ConvW := 1
+          else if FuncName = 'CUBYTE' then ConvW := 2
+          else if FuncName = 'CSHORT' then ConvW := 3
+          else if FuncName = 'CUSHORT' then ConvW := 4
+          else if FuncName = 'CLNG' then ConvW := 5
+          else if FuncName = 'CULNG' then ConvW := 6
+          else ConvW := 0;
 
           if ArgValue.Kind = svkConstFloat then
             Result := MakeSSAConstInt(Round(ArgValue.ConstFloat))
@@ -2157,11 +2169,24 @@ begin
           else
             // Already an integer value (register or string-coerced) - pass through.
             Result := EnsureIntRegister(ArgValue);
+
+          // Narrow to the declared width: fold constants, else emit bcNarrowInt.
+          if ConvW <> 0 then
+          begin
+            if Result.Kind = svkConstInt then
+              Result := MakeSSAConstInt(NarrowConstInt(Result.ConstInt, ConvW))
+            else
+            begin
+              NarrowReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaNarrowInt, NarrowReg, Result, MakeSSAValue(svkNone), MakeSSAConstInt(ConvW));
+              Result := NarrowReg;
+            end;
+          end;
         end
         else if (FuncName = 'CDBL') or (FuncName = 'CSNG') then
         begin
-          // FreeBASIC float conversion functions: produce a float value.
-          // CSNG single-precision rounding is approximated as Double (v1).
+          // FreeBASIC float conversion functions: produce a float value. CSNG rounds to true
+          // single precision (held in the Double bank) via bcNarrowSingle (B1.5).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
           else if (ArgListNode <> nil) and (ArgListNode.NodeType <> antArgumentList) then
@@ -2174,6 +2199,18 @@ begin
             Result := MakeSSAConstFloat(ArgValue.ConstFloat)
           else
             Result := EnsureFloatRegister(ArgValue);
+
+          if FuncName = 'CSNG' then
+          begin
+            if Result.Kind = svkConstFloat then
+              Result := MakeSSAConstFloat(Single(Result.ConstFloat))
+            else
+            begin
+              NarrowReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+              EmitInstruction(ssaNarrowSingle, NarrowReg, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              Result := NarrowReg;
+            end;
+          end;
         end
         else
         begin
@@ -8722,7 +8759,7 @@ begin
       // ssaCallSub mirrors ssaCall (GOSUB): it terminates its block with two successors
       // (procedure entry + return point), so the procedure block gets a predecessor and is
       // reachable from entry (clean single-entry CFG for the dominator tree).
-      if (Instr.OpCode in [ssaJump, ssaCall, ssaCallSub, ssaJumpIfZero, ssaJumpIfNotZero]) and (Instr.Dest.Kind = svkLabel) then
+      if OpIn(Instr.OpCode, [ssaJump, ssaCall, ssaCallSub, ssaJumpIfZero, ssaJumpIfNotZero]) and (Instr.Dest.Kind = svkLabel) then
       begin
         TargetLabel := Instr.Dest.LabelName;
         TargetBlock := FProgram.FindBlock(TargetLabel);
@@ -8847,6 +8884,21 @@ end;
 function TSSAGenerator.ProcedureLabelName(const Name: string): string;
 begin
   Result := 'PROC_' + UpperCase(Name);
+end;
+
+function TSSAGenerator.NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;
+// B1.5 compile-time fold of bcNarrowInt: 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32.
+begin
+  case WidthCode of
+    1: Result := Int64(ShortInt(Value and $FF));
+    2: Result := Value and $FF;
+    3: Result := Int64(SmallInt(Value and $FFFF));
+    4: Result := Value and $FFFF;
+    5: Result := Int64(LongInt(Value and $FFFFFFFF));
+    6: Result := Value and $FFFFFFFF;
+  else
+    Result := Value;
+  end;
 end;
 
 function TSSAGenerator.TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;

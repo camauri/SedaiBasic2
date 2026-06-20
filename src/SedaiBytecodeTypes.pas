@@ -271,6 +271,14 @@ const
   // Round a float to the nearest integer (round-to-even, banker's), for FreeBASIC CINT/CLNG/... (B1.3).
   // Dest = int reg, Src1 = float reg. (bcFloatToInt truncates; bcMathInt floors — neither is CINT.)
   bcFloatRound       = bcGroupCore + 128;
+  // Type-width narrowing (B1.5 phase): wrap/sign-extend an Int64 to a narrower integer width, or
+  // round a Double to single precision. FreeBASIC narrows only at conversion/store to a typed dest,
+  // never on arithmetic - so these are pure unary ops off the hot arithmetic path.
+  //   bcNarrowInt: Dest=int reg, Src1=int reg, Immediate=width code
+  //     1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 (s64/u64 need no bit change -> never emitted)
+  //   bcNarrowSingle: Dest=float reg, Src1=float reg -> Double(Single(x))
+  bcNarrowInt        = bcGroupCore + 129;
+  bcNarrowSingle     = bcGroupCore + 130;
   // Mutexes (M5.4, FreeBASIC API), thin wrappers over TRTLCriticalSection. bcMutexCreate writes a
   // fresh mutex handle into an int register (Dest); Lock/Unlock/Destroy take a handle reg (Src1).
   bcMutexCreate      = bcGroupCore + 117;
@@ -1285,6 +1293,9 @@ begin
         125: Result := 'CondDestroy';
         126: Result := 'ThreadSelf';
         127: Result := 'ThreadDetach';
+        128: Result := 'FloatRound';
+        129: Result := 'NarrowInt';
+        130: Result := 'NarrowSingle';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

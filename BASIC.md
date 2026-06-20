@@ -1338,11 +1338,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `CBYTE and CUBYTE` | ✓ | Converts numeric expressions to 8-bit values. Round-to-nearest, ties-to-even (B1.3; range clamping deferred). |
-| `CSHORT and CUSHORT` | ✓ | Converts numeric expressions to 16-bit values (B1.3; range clamping deferred). |
-| `CLNG and CULNG` | ✓ | Converts numeric expressions to 32-bit values (B1.3; range clamping deferred). |
-| `CINT and CUINT` | ✓ | Converts numeric expressions to 32-bit or 64-bit values (B1.3). |
-| `CLNGINT and CULNGINT` | ◐ | `CLNGINT` ✓ (B1.3); `CULNGINT` not yet. |
+| `CBYTE and CUBYTE` | ✓ | Converts to 8-bit values: round-to-nearest (ties-to-even) then wrap/sign-extend to 8 bits (B1.3/B1.5). |
+| `CSHORT and CUSHORT` | ✓ | Converts to 16-bit values with width wrap/sign-extend (B1.3/B1.5). |
+| `CLNG and CULNG` | ✓ | Converts to 32-bit values with width wrap/sign-extend (B1.3/B1.5). |
+| `CINT and CUINT` | ✓ | Converts to 64-bit values (platform Integer width here) (B1.3). |
+| `CLNGINT and CULNGINT` | ◐ | `CLNGINT` ✓ (B1.3, 64-bit); `CULNGINT` not yet. |
 | `CSIGN` | ✗ | Converts a numeric expression to a signed-type value. |
 | `CUNSG` | ✗ | Converts a numeric expression to an unsigned-type value. |
 
@@ -1350,7 +1350,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `CSNG and CDBL` | ◐ | Converts a numeric expression to floating-point. `CDBL` ✓; `CSNG` ✓ as Double approximation (single-precision rounding deferred) (B1.3). String operand deferred. |
+| `CSNG and CDBL` | ◐ | Converts a numeric expression to floating-point. `CDBL` ✓; `CSNG` ✓ rounds to true single precision (held in the Double bank) (B1.3/B1.5). String operand deferred. |
 
 ##### Conversions to/from string types
 

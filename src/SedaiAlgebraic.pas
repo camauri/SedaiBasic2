@@ -199,7 +199,7 @@ begin
       // Track LoadConstInt and LoadConstFloat instructions
       // CRITICAL: DO NOT track if destination is a user variable (BASIC global variable semantics)
       // A user variable like I%=0 in a FOR loop is NOT a constant, even if initialized to 0!
-      if (Instr.OpCode in [ssaLoadConstInt, ssaLoadConstFloat]) and
+      if OpIn(Instr.OpCode, [ssaLoadConstInt, ssaLoadConstFloat]) and
          (Instr.Dest.Kind = svkRegister) then
       begin
         DestKey := MakeRegKey(Instr.Dest);
@@ -552,8 +552,8 @@ begin
   Result := Instr;
 
   // Apply algebraic simplifications
-  if Instr.OpCode in [ssaAddInt, ssaAddFloat, ssaSubInt, ssaSubFloat,
-                      ssaMulInt, ssaMulFloat, ssaDivInt, ssaDivFloat] then
+  if OpIn(Instr.OpCode, [ssaAddInt, ssaAddFloat, ssaSubInt, ssaSubFloat,
+                      ssaMulInt, ssaMulFloat, ssaDivInt, ssaDivFloat]) then
   begin
     Result := SimplifyArithmetic(Instr);
   end;

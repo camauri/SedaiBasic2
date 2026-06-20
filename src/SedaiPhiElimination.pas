@@ -137,7 +137,7 @@ begin
   LastInstr := NominalPred.Instructions[NominalPred.Instructions.Count - 1];
 
   // Check if it's a jump to PhiBlock
-  if LastInstr.OpCode in [ssaJump, ssaJumpIfZero, ssaJumpIfNotZero] then
+  if OpIn(LastInstr.OpCode, [ssaJump, ssaJumpIfZero, ssaJumpIfNotZero]) then
   begin
     if LastInstr.Dest.Kind = svkLabel then
     begin

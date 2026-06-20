@@ -138,7 +138,7 @@ begin
       Instr := Block.Instructions[j];
 
       // Track LoadConst instructions: R_ver = Const
-      if (Instr.OpCode in [ssaLoadConstInt, ssaLoadConstFloat, ssaLoadConstString]) and
+      if (OpIn(Instr.OpCode, [ssaLoadConstInt, ssaLoadConstFloat, ssaLoadConstString])) and
          (Instr.Dest.Kind = svkRegister) and
          (Instr.Dest.Version > 0) then  // Only versioned registers (SSA form)
       begin
@@ -215,7 +215,7 @@ begin
       // This would break the VM's register-based architecture.
 
       // Skip LoadConst - they define constants, we don't modify them
-      if Instr.OpCode in [ssaLoadConstInt, ssaLoadConstFloat, ssaLoadConstString] then
+      if OpIn(Instr.OpCode, [ssaLoadConstInt, ssaLoadConstFloat, ssaLoadConstString]) then
         Continue;
 
       // DISABLED: Constant propagation into operands is UNSAFE!

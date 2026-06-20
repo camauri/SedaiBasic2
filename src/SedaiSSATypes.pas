@@ -111,6 +111,8 @@ type
     // M5.5: ThreadSelf (Dest=int = current thread handle, 0 on main); ThreadDetach (Src1=handle).
     ssaThreadSelf, ssaThreadDetach,
     ssaFloatRound,   // B1.3: round float -> int (round-to-even), for CINT/CLNG/...
+    ssaNarrowInt,    // B1.5: wrap/sign-extend int to a narrower width (Src1=int, Src3=width code)
+    ssaNarrowSingle, // B1.5: round Double -> single precision (Dest/Src1 float)
     // Mutexes (M5.4, FB API): MutexCreate (Dest=int handle, no operands); Lock/Unlock/Destroy (Src1=handle reg).
     ssaMutexCreate, ssaMutexLock, ssaMutexUnlock, ssaMutexDestroy,
     // Condition variables (M5.4): CondCreate (Dest=int handle); CondWait (Src1=cond, Src2=mutex);
@@ -384,6 +386,10 @@ function MakeSSAArrayRef(ArrayIdx: Integer; ElementType: TSSARegisterType): TSSA
 function SSAValueToString(const Value: TSSAValue): string;
 function SSAOpCodeToString(OpCode: TSSAOpCode): string;
 function SSARegisterTypeToString(RegType: TSSARegisterType): string;
+// Membership test over an open array of opcodes. Replaces `Op in [..]`: TSSAOpCode now has
+// more than 256 members, so `set of TSSAOpCode` (which an `in [..]` literal builds) is no longer
+// a legal type in FPC. An open-array constructor has no such limit.
+function OpIn(const Op: TSSAOpCode; const Ops: array of TSSAOpCode): Boolean;
 
 implementation
 
@@ -1390,6 +1396,15 @@ begin
   finally
     CopyCoal.Free;
   end;
+end;
+
+function OpIn(const Op: TSSAOpCode; const Ops: array of TSSAOpCode): Boolean;
+var
+  i: Integer;
+begin
+  for i := 0 to High(Ops) do
+    if Ops[i] = Op then Exit(True);
+  Result := False;
 end;
 
 function MakeSSAValue(Kind: TSSAValueKind): TSSAValue;

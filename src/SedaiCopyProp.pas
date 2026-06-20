@@ -151,7 +151,7 @@ begin
        (Instr.Dest.Version = RegVal.Version) then
     begin
       // Found the definition - check if it's a copy
-      if Instr.OpCode in [ssaCopyInt, ssaCopyFloat, ssaCopyString] then
+      if OpIn(Instr.OpCode, [ssaCopyInt, ssaCopyFloat, ssaCopyString]) then
       begin
         if Instr.Src1.Kind = svkRegister then
         begin

@@ -369,6 +369,23 @@ threadvar
   // M5.5: the current thread's Threadcreate handle (THREADSELF reads it). 0 on the main thread.
   GSelfHandle: Int64;
 
+// B1.5 type-width narrowing: wrap/sign-extend an Int64 to a narrower integer width.
+// Width codes: 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32. Anything else is a full-width no-op
+// (s64/u64 need no bit change; unsigned-64 semantics live in compare/div/print, not here).
+function NarrowInt64(Value: Int64; WidthCode: Int64): Int64;
+begin
+  case WidthCode of
+    1: Result := Int64(ShortInt(Value and $FF));         // s8
+    2: Result := Value and $FF;                           // u8
+    3: Result := Int64(SmallInt(Value and $FFFF));        // s16
+    4: Result := Value and $FFFF;                          // u16
+    5: Result := Int64(LongInt(Value and $FFFFFFFF));     // s32
+    6: Result := Value and $FFFFFFFF;                      // u32
+  else
+    Result := Value;
+  end;
+end;
+
 function WorkerThreadEntry(p: Pointer): PtrInt;
 // RTL thread entry (BeginThread): bind this thread's active context, run the worker SUB, then exit.
 var
@@ -2051,6 +2068,20 @@ begin
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
         end;
 
+        // NarrowInt: int Dest, int Src1 (B1.5)
+        bcNarrowInt:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
+
+        // NarrowSingle: float Dest, float Src1 (B1.5)
+        bcNarrowSingle:
+        begin
+          if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
+          if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
+        end;
+
         // StringToInt: int Dest, string Src1
         bcStringToInt:
         begin
@@ -2648,6 +2679,8 @@ begin
     bcIntToFloat: Ctx.FloatRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
     bcFloatToInt: Ctx.IntRegs[Instr.Dest] := Trunc(Ctx.FloatRegs[Instr.Src1]);
     bcFloatRound: Ctx.IntRegs[Instr.Dest] := Round(Ctx.FloatRegs[Instr.Src1]);  // CINT (round-to-even)
+    bcNarrowInt: Ctx.IntRegs[Instr.Dest] := NarrowInt64(Ctx.IntRegs[Instr.Src1], Instr.Immediate);  // B1.5
+    bcNarrowSingle: Ctx.FloatRegs[Instr.Dest] := Single(Ctx.FloatRegs[Instr.Src1]);                  // B1.5
     // Comparison operators - Int (use FTrueValue for TRUE, 0 for FALSE)
     bcCmpEqInt: if Ctx.IntRegs[Instr.Src1] = Ctx.IntRegs[Instr.Src2] then Ctx.IntRegs[Instr.Dest] := FTrueValue else Ctx.IntRegs[Instr.Dest] := 0;
     bcCmpNeInt: if Ctx.IntRegs[Instr.Src1] <> Ctx.IntRegs[Instr.Src2] then Ctx.IntRegs[Instr.Dest] := FTrueValue else Ctx.IntRegs[Instr.Dest] := 0;

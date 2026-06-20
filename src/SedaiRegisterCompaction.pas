@@ -206,6 +206,7 @@ begin
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot,
     // Conversions to int
     bcFloatToInt, bcStringToInt, bcFloatRound,
+    bcNarrowInt,   // B1.5: integer width narrowing (Dest=int)
     // === GROUP 1: String operations ===
     bcStrLen,      // String length returns int
     bcStrAsc,      // ASC(str) returns int ASCII code
@@ -274,6 +275,7 @@ begin
     bcNegFloat, bcPowFloat,
     // Conversion to float
     bcIntToFloat, bcStringToFloat,
+    bcNarrowSingle,  // B1.5: single-precision rounding (Dest=float)
     // === GROUP 1: String operations ===
     bcStrVal,      // VAL(str) - string to float
     // === GROUP 2: Math functions ===
@@ -372,6 +374,7 @@ begin
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt,
     // Conversion from int
     bcIntToFloat, bcIntToString,
+    bcNarrowInt,   // B1.5: integer width narrowing (Src1=int)
     // Branch on int (comparison result)
     bcJumpIfZero, bcJumpIfNotZero,
     // Error handling - RESUME <line> reads line number from Src1
@@ -445,6 +448,7 @@ begin
     bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat,
     // Conversion from float
     bcFloatToInt, bcFloatToString, bcFloatRound,
+    bcNarrowSingle,  // B1.5: single-precision rounding (Src1=float)
     // === GROUP 2: Math functions ===
     bcMathSqr, bcMathSin, bcMathCos, bcMathTan, bcMathAtn,
     bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,

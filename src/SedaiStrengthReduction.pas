@@ -277,7 +277,7 @@ begin
          (Instr.Dest.RegType = Val.RegType) and (Instr.Dest.RegIndex = Val.RegIndex) then
       begin
         Inc(defs);
-        if not (Instr.OpCode in [ssaLoadConstInt, ssaLoadConstFloat,
+        if not OpIn(Instr.OpCode, [ssaLoadConstInt, ssaLoadConstFloat,
                                  ssaCopyInt, ssaCopyFloat, ssaIntToFloat]) then
           Exit(True);   // computed (e.g. Add/Mul) -> not a constant
       end;
@@ -557,7 +557,7 @@ begin
   NewInstr := Instr.Clone;
 
   // Handle both integer and float multiplication
-  if not (Instr.OpCode in [ssaMulInt, ssaMulFloat]) then
+  if not (OpIn(Instr.OpCode, [ssaMulInt, ssaMulFloat])) then
     Exit;
 
   IsFloat := (Instr.OpCode = ssaMulFloat);
@@ -907,7 +907,7 @@ begin
   Result := False;
 
   // Check for i = i + const or i = i - const (integer or float)
-  if not (Instr.OpCode in [ssaAddInt, ssaSubInt, ssaAddFloat, ssaSubFloat]) then
+  if not (OpIn(Instr.OpCode, [ssaAddInt, ssaSubInt, ssaAddFloat, ssaSubFloat])) then
     Exit;
 
   // Destination must be a register
@@ -927,14 +927,14 @@ begin
       IVRegIndex := DestReg.RegIndex;
       IVRegType := DestReg.RegType;
       StepValue := Instr.Src2;
-      IsAdd := Instr.OpCode in [ssaAddInt, ssaAddFloat];
+      IsAdd := OpIn(Instr.OpCode, [ssaAddInt, ssaAddFloat]);
       Result := True;
       Exit;
     end
     else if (Instr.Src2.Kind = svkRegister) then
     begin
       // Check if the register contains a constant
-      if (Instr.OpCode in [ssaAddInt, ssaSubInt]) and GetConstInt(Instr.Src2, TempInt) then
+      if OpIn(Instr.OpCode, [ssaAddInt, ssaSubInt]) and GetConstInt(Instr.Src2, TempInt) then
       begin
         IVRegIndex := DestReg.RegIndex;
         IVRegType := DestReg.RegType;
@@ -943,7 +943,7 @@ begin
         Result := True;
         Exit;
       end
-      else if (Instr.OpCode in [ssaAddFloat, ssaSubFloat]) and GetConstFloat(Instr.Src2, TempFloat) then
+      else if OpIn(Instr.OpCode, [ssaAddFloat, ssaSubFloat]) and GetConstFloat(Instr.Src2, TempFloat) then
       begin
         IVRegIndex := DestReg.RegIndex;
         IVRegType := DestReg.RegType;
@@ -956,7 +956,7 @@ begin
   end;
 
   // Check if Src2 is the same register as Dest (i = step + i) - only for addition
-  if (Instr.OpCode in [ssaAddInt, ssaAddFloat]) and
+  if (OpIn(Instr.OpCode, [ssaAddInt, ssaAddFloat])) and
      (Instr.Src2.Kind = svkRegister) and
      (Instr.Src2.RegIndex = DestReg.RegIndex) and
      (Instr.Src2.RegType = DestReg.RegType) then
@@ -1038,7 +1038,7 @@ begin
         Instr := Block.Instructions[k];
 
         {$IFDEF DEBUG_STRENGTH}
-        if DebugStrength and (Instr.OpCode in [ssaAddInt, ssaSubInt, ssaAddFloat, ssaSubFloat]) then
+        if DebugStrength and (OpIn(Instr.OpCode, [ssaAddInt, ssaSubInt, ssaAddFloat, ssaSubFloat])) then
         begin
           WriteLn('[StrengthRed]     Add/Sub instr: ', Instr.ToString);
           // Debug: check if we can resolve the step constant
@@ -1376,7 +1376,7 @@ begin
         Instr := Block.Instructions[k];
 
         // Look for multiplication operations
-        if not (Instr.OpCode in [ssaMulInt, ssaMulFloat]) then
+        if not (OpIn(Instr.OpCode, [ssaMulInt, ssaMulFloat])) then
         begin
           Inc(k);
           Continue;
