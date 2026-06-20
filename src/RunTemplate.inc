@@ -21,6 +21,7 @@ var
   InstrCount: Integer;
   CurPC: Integer;  // Current Program Counter (local for speed)
   Instr: TBytecodeInstruction;
+  Ctx: TExecutionContext;  // M5.2: active execution context, read once per Run (zero hot-path cost)
   Op: Word;
   Group: Word;
   // Local copies of frequently accessed fields for better register allocation
@@ -53,14 +54,17 @@ begin
 
   InstrCount := FProgram.GetInstructionCount;
   CurPC := FProgram.EntryPoint;
-  FCtx.Running := True;  // Mark VM as running
+  // M5.2: bind the active execution context once (a worker thread will supply its own here in
+  // M5.2b — a single read per Run, so per-instruction access stays a register-direct Ctx.*).
+  Ctx := FCtx;
+  Ctx.Running := True;  // Mark VM as running
   // M5.3: the thread that drives the execution loop is the render owner (only it may touch
   // the SDL device). Worker contexts (M5.2) defer their graphics ops to it via the draw queue.
   FRenderOwnerThreadId := GetCurrentThreadID;
 
   // Get direct pointers to register arrays
-  IntRegs := @FCtx.IntRegs[0];
-  FloatRegs := @FCtx.FloatRegs[0];
+  IntRegs := @Ctx.IntRegs[0];
+  FloatRegs := @Ctx.FloatRegs[0];
   // Local copy of TrueValue for comparison operators
   TrueVal := FTrueValue;
   // Initialize event polling counter
@@ -82,7 +86,7 @@ begin
   repeat
     TrapTriggered := False;
     try
-    while FCtx.Running and (CurPC < InstrCount) do
+    while Ctx.Running and (CurPC < InstrCount) do
   begin
     Instr := Instructions[CurPC];
     Op := Instr.OpCode;
@@ -101,15 +105,15 @@ begin
       if FDebugger.IsPaused then
       begin
         // Save state and exit loop - console will handle debug commands
-        FCtx.PC := CurPC;
-        FCtx.Running := False;
+        Ctx.PC := CurPC;
+        Ctx.Running := False;
         Break;
       end;
     end
-    else if FCtx.TraceActive and (CurSourceLine > 0) and (CurSourceLine <> FCtx.LastSourceLine) then
+    else if Ctx.TraceActive and (CurSourceLine > 0) and (CurSourceLine <> Ctx.LastSourceLine) then
     begin
       // Legacy TRON trace output (when no debugger attached)
-      FCtx.LastSourceLine := CurSourceLine;
+      Ctx.LastSourceLine := CurSourceLine;
       if Assigned(FOutputDevice) then
         FOutputDevice.Print('[' + IntToStr(CurSourceLine) + ']');
     end;
@@ -134,7 +138,7 @@ begin
         EventPollCounter := 0;
         if FEventPollCallback() then
         begin
-          FCtx.Running := False;
+          Ctx.Running := False;
           Break;
         end;
       end;
@@ -320,9 +324,9 @@ begin
             ArrIdxW := Instr.Src1;
             while LStartIdx < LEndIdx do
             begin
-              FCtx.SwapTempInt := FArrays[ArrIdxW].IntData[LStartIdx];
+              Ctx.SwapTempInt := FArrays[ArrIdxW].IntData[LStartIdx];
               FArrays[ArrIdxW].IntData[LStartIdx] := FArrays[ArrIdxW].IntData[LEndIdx];
-              FArrays[ArrIdxW].IntData[LEndIdx] := FCtx.SwapTempInt;
+              FArrays[ArrIdxW].IntData[LEndIdx] := Ctx.SwapTempInt;
               Inc(LStartIdx);
               Dec(LEndIdx);
             end;
@@ -349,9 +353,9 @@ begin
         // Array Swap (Int) - sub-opcode 250
         250: // bcArraySwapInt: swap arr[idx1] and arr[idx2]
           begin
-            FCtx.SwapTempInt := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]];
+            Ctx.SwapTempInt := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]];
             FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Dest]];
-            FArrays[Instr.Src1].IntData[IntRegs[Instr.Dest]] := FCtx.SwapTempInt;
+            FArrays[Instr.Src1].IntData[IntRegs[Instr.Dest]] := Ctx.SwapTempInt;
             Inc(CurPC);
           end;
 
@@ -377,29 +381,29 @@ begin
       // Standard bytecode opcodes - dispatch by group
       // For non-Group 0 opcodes, delegate to specialized handlers
       case Group of
-        1: begin FCtx.PC := CurPC; ExecuteStringOp(Instr); CurPC := FCtx.PC + 1; end;
-        2: begin FCtx.PC := CurPC; ExecuteMathOp(Instr); CurPC := FCtx.PC + 1; end;
-        3: begin FCtx.PC := CurPC; ExecuteArrayOp(Instr); CurPC := FCtx.PC + 1; end;
-        4: begin FCtx.PC := CurPC; ExecuteIOOp(Instr); if not FCtx.Running then Break; CurPC := FCtx.PC + 1; end;
-        5: begin FCtx.PC := CurPC; ExecuteSpecialVarOp(Instr); CurPC := FCtx.PC + 1; end;
-        6: begin FCtx.PC := CurPC; ExecuteFileIOOp(Instr); CurPC := FCtx.PC + 1; end;
-        7: begin FCtx.PC := CurPC; ExecuteSpriteOp(Instr); CurPC := FCtx.PC + 1; end;
+        1: begin Ctx.PC := CurPC; ExecuteStringOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        2: begin Ctx.PC := CurPC; ExecuteMathOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        3: begin Ctx.PC := CurPC; ExecuteArrayOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        4: begin Ctx.PC := CurPC; ExecuteIOOp(Ctx, Instr); if not Ctx.Running then Break; CurPC := Ctx.PC + 1; end;
+        5: begin Ctx.PC := CurPC; ExecuteSpecialVarOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        6: begin Ctx.PC := CurPC; ExecuteFileIOOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        7: begin Ctx.PC := CurPC; ExecuteSpriteOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
         {$IFDEF WEB_MODE}
-        8: begin FCtx.PC := CurPC; ExecuteWebOp(Instr); CurPC := FCtx.PC + 1; end;
+        8: begin Ctx.PC := CurPC; ExecuteWebOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
         {$ENDIF}
-        10: begin FCtx.PC := CurPC; ExecuteGraphicsOp(Instr); CurPC := FCtx.PC + 1; end;
-        11: begin FCtx.PC := CurPC; ExecuteSoundOp(Instr); CurPC := FCtx.PC + 1; end;
+        10: begin Ctx.PC := CurPC; ExecuteGraphicsOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        11: begin Ctx.PC := CurPC; ExecuteSoundOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
         0: // Core VM operations - inline for performance
           case Op of
         // Load constants - very common
         bcLoadConstInt: begin IntRegs[Instr.Dest] := Instr.Immediate; Inc(CurPC); end;
         bcLoadConstFloat: begin FloatRegs[Instr.Dest] := Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end;
-        bcLoadConstString: begin FCtx.StringRegs[Instr.Dest] := FProgram.StringConstants[Instr.Immediate]; Inc(CurPC); end;
+        bcLoadConstString: begin Ctx.StringRegs[Instr.Dest] := FProgram.StringConstants[Instr.Immediate]; Inc(CurPC); end;
 
         // Copy operations
         bcCopyInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1]; Inc(CurPC); end;
         bcCopyFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1]; Inc(CurPC); end;
-        bcCopyString: begin FCtx.StringRegs[Instr.Dest] := FCtx.StringRegs[Instr.Src1]; Inc(CurPC); end;
+        bcCopyString: begin Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Src1]; Inc(CurPC); end;
 
         // Integer arithmetic
         bcAddInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] + IntRegs[Instr.Src2]; Inc(CurPC); end;
@@ -459,10 +463,10 @@ begin
         bcCmpGeFloat: begin if FloatRegs[Instr.Src1] >= FloatRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
 
         // String comparisons (use TrueVal for TRUE, 0 for FALSE)
-        bcCmpEqString: begin if FCtx.StringRegs[Instr.Src1] = FCtx.StringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpNeString: begin if FCtx.StringRegs[Instr.Src1] <> FCtx.StringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpLtString: begin if FCtx.StringRegs[Instr.Src1] < FCtx.StringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpGtString: begin if FCtx.StringRegs[Instr.Src1] > FCtx.StringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpEqString: begin if Ctx.StringRegs[Instr.Src1] = Ctx.StringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpNeString: begin if Ctx.StringRegs[Instr.Src1] <> Ctx.StringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpLtString: begin if Ctx.StringRegs[Instr.Src1] < Ctx.StringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpGtString: begin if Ctx.StringRegs[Instr.Src1] > Ctx.StringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
 
         // Math functions
         bcMathAbs: begin FloatRegs[Instr.Dest] := Abs(FloatRegs[Instr.Src1]); Inc(CurPC); end;
@@ -488,8 +492,8 @@ begin
         bcJumpIfNotZero: if IntRegs[Instr.Src1] <> 0 then CurPC := Instr.Immediate else Inc(CurPC);
         bcCall:
           begin
-            FCtx.CallStack[FCtx.CallStackPtr] := CurPC + 1;
-            Inc(FCtx.CallStackPtr);
+            Ctx.CallStack[Ctx.CallStackPtr] := CurPC + 1;
+            Inc(Ctx.CallStackPtr);
             {$IFDEF DEBUG_MODE}
             if Assigned(FDebugger) then FDebugger.NotifyCall;
             {$ENDIF}
@@ -497,19 +501,19 @@ begin
           end;
         bcReturn:
           begin
-            Dec(FCtx.CallStackPtr);
+            Dec(Ctx.CallStackPtr);
             {$IFDEF DEBUG_MODE}
             if Assigned(FDebugger) then FDebugger.NotifyReturn;
             {$ENDIF}
-            CurPC := FCtx.CallStack[FCtx.CallStackPtr];
+            CurPC := Ctx.CallStack[Ctx.CallStackPtr];
           end;
         // SUB/FUNCTION call frames (M2): like bcCall/bcReturn but snapshot/restore the
         // register banks so the callee has its own locals and recursion works.
         bcCallSub:
           begin
-            FramePush;
-            FCtx.CallStack[FCtx.CallStackPtr] := CurPC + 1;
-            Inc(FCtx.CallStackPtr);
+            FramePush(Ctx);
+            Ctx.CallStack[Ctx.CallStackPtr] := CurPC + 1;
+            Inc(Ctx.CallStackPtr);
             {$IFDEF DEBUG_MODE}
             if Assigned(FDebugger) then FDebugger.NotifyCall;
             {$ENDIF}
@@ -517,49 +521,49 @@ begin
           end;
         bcReturnSub:
           begin
-            Dec(FCtx.CallStackPtr);
+            Dec(Ctx.CallStackPtr);
             {$IFDEF DEBUG_MODE}
             if Assigned(FDebugger) then FDebugger.NotifyReturn;
             {$ENDIF}
-            CurPC := FCtx.CallStack[FCtx.CallStackPtr];
-            FramePop;
+            CurPC := Ctx.CallStack[Ctx.CallStackPtr];
+            FramePop(Ctx);
           end;
         // Block-scoped record reclamation (M8): mark at a loop-body entry, reclaim at its exit.
         bcRecMarkPush:
           begin
-            if FCtx.BlockRecMarkTop >= Length(FCtx.BlockRecMark) then
-              SetLength(FCtx.BlockRecMark, FCtx.BlockRecMarkTop + 256);
-            FCtx.BlockRecMark[FCtx.BlockRecMarkTop] := FRecordCount;
-            Inc(FCtx.BlockRecMarkTop);
+            if Ctx.BlockRecMarkTop >= Length(Ctx.BlockRecMark) then
+              SetLength(Ctx.BlockRecMark, Ctx.BlockRecMarkTop + 256);
+            Ctx.BlockRecMark[Ctx.BlockRecMarkTop] := FRecordCount;
+            Inc(Ctx.BlockRecMarkTop);
             Inc(CurPC);
           end;
         bcRecMarkPop:
           begin
-            if FCtx.BlockRecMarkTop > 0 then
+            if Ctx.BlockRecMarkTop > 0 then
             begin
-              Dec(FCtx.BlockRecMarkTop);
-              if FCtx.BlockRecMark[FCtx.BlockRecMarkTop] < FRecordCount then
-                FRecordCount := FCtx.BlockRecMark[FCtx.BlockRecMarkTop];
+              Dec(Ctx.BlockRecMarkTop);
+              if Ctx.BlockRecMark[Ctx.BlockRecMarkTop] < FRecordCount then
+                FRecordCount := Ctx.BlockRecMark[Ctx.BlockRecMarkTop];
             end;
             Inc(CurPC);
           end;
         // Transfer registers (M2): move a value to/from the non-saved transfer banks.
         bcXferStoreInt:
-          begin FCtx.XferInt[Instr.Immediate] := FCtx.IntRegs[Instr.Src1]; Inc(CurPC); end;
+          begin Ctx.XferInt[Instr.Immediate] := Ctx.IntRegs[Instr.Src1]; Inc(CurPC); end;
         bcXferStoreFloat:
-          begin FCtx.XferFloat[Instr.Immediate] := FCtx.FloatRegs[Instr.Src1]; Inc(CurPC); end;
+          begin Ctx.XferFloat[Instr.Immediate] := Ctx.FloatRegs[Instr.Src1]; Inc(CurPC); end;
         bcXferStoreString:
-          begin FCtx.XferStr[Instr.Immediate] := FCtx.StringRegs[Instr.Src1]; Inc(CurPC); end;
+          begin Ctx.XferStr[Instr.Immediate] := Ctx.StringRegs[Instr.Src1]; Inc(CurPC); end;
         bcXferLoadInt:
-          begin FCtx.IntRegs[Instr.Dest] := FCtx.XferInt[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr.Dest] := Ctx.XferInt[Instr.Immediate]; Inc(CurPC); end;
         bcXferLoadFloat:
-          begin FCtx.FloatRegs[Instr.Dest] := FCtx.XferFloat[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.FloatRegs[Instr.Dest] := Ctx.XferFloat[Instr.Immediate]; Inc(CurPC); end;
         bcXferLoadString:
-          begin FCtx.StringRegs[Instr.Dest] := FCtx.XferStr[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.StringRegs[Instr.Dest] := Ctx.XferStr[Instr.Immediate]; Inc(CurPC); end;
         // UDT/record heap (M3)
         bcRecordNew:
           begin
-            FCtx.IntRegs[Instr.Dest] := AllocRecord(Instr.Src1, Instr.Src2,
+            Ctx.IntRegs[Instr.Dest] := AllocRecord(Instr.Src1, Instr.Src2,
                                       Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
             Inc(CurPC);
           end;
@@ -569,34 +573,34 @@ begin
             Inc(CurPC);
           end;
         bcRecordLoadInt:
-          begin FCtx.IntRegs[Instr.Dest] := FRecords[FCtx.IntRegs[Instr.Src1]].IntData[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr.Dest] := FRecords[Ctx.IntRegs[Instr.Src1]].IntData[Instr.Immediate]; Inc(CurPC); end;
         bcRecordLoadFloat:
-          begin FCtx.FloatRegs[Instr.Dest] := FRecords[FCtx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.FloatRegs[Instr.Dest] := FRecords[Ctx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate]; Inc(CurPC); end;
         bcRecordLoadString:
-          begin FCtx.StringRegs[Instr.Dest] := FRecords[FCtx.IntRegs[Instr.Src1]].StringData[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.StringRegs[Instr.Dest] := FRecords[Ctx.IntRegs[Instr.Src1]].StringData[Instr.Immediate]; Inc(CurPC); end;
         bcRecordStoreInt:
-          begin FRecords[FCtx.IntRegs[Instr.Src1]].IntData[Instr.Immediate] := FCtx.IntRegs[Instr.Src2]; Inc(CurPC); end;
+          begin FRecords[Ctx.IntRegs[Instr.Src1]].IntData[Instr.Immediate] := Ctx.IntRegs[Instr.Src2]; Inc(CurPC); end;
         bcRecordStoreFloat:
-          begin FRecords[FCtx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate] := FCtx.FloatRegs[Instr.Src2]; Inc(CurPC); end;
+          begin FRecords[Ctx.IntRegs[Instr.Src1]].FloatData[Instr.Immediate] := Ctx.FloatRegs[Instr.Src2]; Inc(CurPC); end;
         bcRecordStoreString:
-          begin FRecords[FCtx.IntRegs[Instr.Src1]].StringData[Instr.Immediate] := FCtx.StringRegs[Instr.Src2]; Inc(CurPC); end;
+          begin FRecords[Ctx.IntRegs[Instr.Src1]].StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2]; Inc(CurPC); end;
         bcRecordTypeId:
-          begin FCtx.IntRegs[Instr.Dest] := FRecords[FCtx.IntRegs[Instr.Src1]].TypeId; Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr.Dest] := FRecords[Ctx.IntRegs[Instr.Src1]].TypeId; Inc(CurPC); end;
 
         // Array operations - typed versions are faster
         bcArrayLoadInt:
           begin
-            FCtx.IntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]];
+            Ctx.IntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]];
             Inc(CurPC);
           end;
         bcArrayLoadFloat:
           begin
-            FCtx.FloatRegs[Instr.Dest] := FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]];
+            Ctx.FloatRegs[Instr.Dest] := FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]];
             Inc(CurPC);
           end;
         bcArrayLoadString:
           begin
-            FCtx.StringRegs[Instr.Dest] := FArrays[Instr.Src1].StringData[IntRegs[Instr.Src2]];
+            Ctx.StringRegs[Instr.Dest] := FArrays[Instr.Src1].StringData[IntRegs[Instr.Src2]];
             Inc(CurPC);
           end;
         bcArrayStoreInt:
@@ -611,7 +615,7 @@ begin
           end;
         bcArrayStoreString:
           begin
-            FArrays[Instr.Src1].StringData[IntRegs[Instr.Src2]] := FCtx.StringRegs[Instr.Dest];
+            FArrays[Instr.Src1].StringData[IntRegs[Instr.Src2]] := Ctx.StringRegs[Instr.Dest];
             Inc(CurPC);
           end;
 
@@ -655,9 +659,9 @@ begin
             ArrayIdx := Instr.Src1;
             LinearIdx := IntRegs[Instr.Src2];
             case FArrays[ArrayIdx].ElementType of
-              0: FCtx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
-              1: FCtx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
-              2: FCtx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
+              0: Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
+              1: Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
+              2: Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
             end;
             Inc(CurPC);
           end;
@@ -666,9 +670,9 @@ begin
             ArrayIdx := Instr.Src1;
             LinearIdx := IntRegs[Instr.Src2];
             case FArrays[ArrayIdx].ElementType of
-              0: FArrays[ArrayIdx].IntData[LinearIdx] := FCtx.IntRegs[Instr.Dest];
-              1: FArrays[ArrayIdx].FloatData[LinearIdx] := FCtx.FloatRegs[Instr.Dest];
-              2: FArrays[ArrayIdx].StringData[LinearIdx] := FCtx.StringRegs[Instr.Dest];
+              0: FArrays[ArrayIdx].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
+              1: FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
+              2: FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
             end;
             Inc(CurPC);
           end;
@@ -704,20 +708,20 @@ begin
         // Special variables - fall back to slow path
         bcLoadTI, bcLoadTIS, bcStoreTIS, bcLoadDTS, bcFre, bcPeek, bcPoke:
           begin
-            FCtx.PC := CurPC;
-            ExecuteInstruction(Instr);
-            CurPC := FCtx.PC + 1;
+            Ctx.PC := CurPC;
+            ExecuteInstruction(Ctx, Instr);
+            CurPC := Ctx.PC + 1;
           end;
 
         // TRON/TROFF - switch between debug and fast mode
         bcTron:
           begin
-            FCtx.TraceActive := True;
-            FCtx.LastSourceLine := 0;
+            Ctx.TraceActive := True;
+            Ctx.LastSourceLine := 0;
             {$IFNDEF DEBUG_MODE}
             // In RunFast: switch to RunDebug for trace support
-            FCtx.PC := CurPC + 1;  // Continue from next instruction
-            FCtx.Running := False; // Signal to exit main loop
+            Ctx.PC := CurPC + 1;  // Continue from next instruction
+            Ctx.Running := False; // Signal to exit main loop
             Break;             // Exit loop, then call RunDebug
             {$ELSE}
             Inc(CurPC);
@@ -725,11 +729,11 @@ begin
           end;
         bcTroff:
           begin
-            FCtx.TraceActive := False;
+            Ctx.TraceActive := False;
             {$IFDEF DEBUG_MODE}
             // In RunDebug: switch to RunFast for speed
-            FCtx.PC := CurPC + 1;  // Continue from next instruction
-            FCtx.Running := False; // Signal to exit main loop
+            Ctx.PC := CurPC + 1;  // Continue from next instruction
+            Ctx.Running := False; // Signal to exit main loop
             Break;             // Exit loop, then call RunFast
             {$ELSE}
             Inc(CurPC);
@@ -742,43 +746,43 @@ begin
         bcClear:
           begin
             // CLR: Clear all variables (fall back to slow path for simplicity)
-            FCtx.PC := CurPC;
-            ExecuteInstruction(Instr);
-            CurPC := FCtx.PC + 1;
+            Ctx.PC := CurPC;
+            ExecuteInstruction(Ctx, Instr);
+            CurPC := Ctx.PC + 1;
           end;
 
         // Load/Store var (legacy - should not appear in optimized code)
         bcLoadVar, bcStoreVar:
           begin
             // Fall back to slow path
-            FCtx.PC := CurPC;
-            ExecuteInstruction(Instr);
-            CurPC := FCtx.PC + 1;
+            Ctx.PC := CurPC;
+            ExecuteInstruction(Ctx, Instr);
+            CurPC := Ctx.PC + 1;
           end;
 
         // DATA/READ/RESTORE - fall back to slow path
         bcDataAdd, bcDataReadInt, bcDataReadFloat, bcDataReadString, bcDataRestore:
           begin
-            FCtx.PC := CurPC;
-            ExecuteInstruction(Instr);
-            CurPC := FCtx.PC + 1;
+            Ctx.PC := CurPC;
+            ExecuteInstruction(Ctx, Instr);
+            CurPC := Ctx.PC + 1;
           end;
 
         // Input/Output commands - fall back to slow path
         bcGet, bcGetkey, bcPrintUsing, bcPudef, bcChar:
           begin
-            FCtx.PC := CurPC;
-            ExecuteInstruction(Instr);
-            if not FCtx.Running then Break;  // CTRL+C or quit requested
-            CurPC := FCtx.PC + 1;
+            Ctx.PC := CurPC;
+            ExecuteInstruction(Ctx, Instr);
+            if not Ctx.Running then Break;  // CTRL+C or quit requested
+            CurPC := Ctx.PC + 1;
           end;
 
         // System commands - fall back to slow path
         bcFast, bcSlow, bcSleep, bcKey, bcFrame:
           begin
-            FCtx.PC := CurPC;
-            ExecuteInstruction(Instr);
-            CurPC := FCtx.PC + 1;
+            Ctx.PC := CurPC;
+            ExecuteInstruction(Ctx, Instr);
+            CurPC := Ctx.PC + 1;
           end;
 
         // Error handling
@@ -788,23 +792,23 @@ begin
             // If Immediate >= 0, use it directly (constant line number)
             // If Immediate = -1, use register R[Src1] (variable line number)
             if Instr.Immediate >= 0 then
-              FCtx.TrapLine := Instr.Immediate
+              Ctx.TrapLine := Instr.Immediate
             else
-              FCtx.TrapLine := IntRegs[Instr.Src1];
-            if FCtx.TrapLine > 0 then
-              FCtx.TrapPC := -1  // Will be resolved when error occurs
+              Ctx.TrapLine := IntRegs[Instr.Src1];
+            if Ctx.TrapLine > 0 then
+              Ctx.TrapPC := -1  // Will be resolved when error occurs
             else
             begin
               // TRAP 0 - Disable trap handler
-              FCtx.TrapLine := 0;
-              FCtx.TrapPC := -1;
+              Ctx.TrapLine := 0;
+              Ctx.TrapPC := -1;
             end;
             Inc(CurPC);
           end;
         bcResume:
           begin
             // RESUME [line] - Resume at error line or specified line
-            if FCtx.InErrorHandler then
+            if Ctx.InErrorHandler then
             begin
               // Check if Src1 contains a line number (non-zero register = line number)
               if Instr.Src1 <> 0 then
@@ -814,18 +818,18 @@ begin
                 if CurPC < 0 then
                   CurPC := InstrCount;  // Line not found - end program
               end
-              else if FCtx.ResumePC >= 0 then
+              else if Ctx.ResumePC >= 0 then
               begin
                 // Plain RESUME - jump back to error line
-                CurPC := FCtx.ResumePC;
+                CurPC := Ctx.ResumePC;
               end
               else
               begin
                 Inc(CurPC);
-                FCtx.InErrorHandler := False;
+                Ctx.InErrorHandler := False;
                 System.Continue;
               end;
-              FCtx.InErrorHandler := False;
+              Ctx.InErrorHandler := False;
               // NOTE: Must use System.Continue to get loop control, NOT Self.Continue method!
               System.Continue;  // Jump to resume PC immediately
             end
@@ -835,14 +839,14 @@ begin
         bcResumeNext:
           begin
             // RESUME NEXT - Resume at next BASIC line after the one that caused the error
-            if FCtx.InErrorHandler and (FCtx.LastErrorLine > 0) then
+            if Ctx.InErrorHandler and (Ctx.LastErrorLine > 0) then
             begin
               // Find the first instruction of the NEXT BASIC line after the error line
               // This is the correct semantics: RESUME NEXT skips to the next BASIC statement
-              CurPC := FProgram.FindPCAfterLine(FCtx.LastErrorLine);
+              CurPC := FProgram.FindPCAfterLine(Ctx.LastErrorLine);
               if CurPC < 0 then
                 CurPC := InstrCount;  // No more lines - end program
-              FCtx.InErrorHandler := False;
+              Ctx.InErrorHandler := False;
               // NOTE: Must use System.Continue to get loop control, NOT Self.Continue method!
               System.Continue;  // Jump to new PC immediately
             end
@@ -856,9 +860,9 @@ begin
         // File management commands
         bcCopyFile, bcScratch, bcRenameFile, bcConcat, bcMkdir, bcChdir, bcMoveFile:
           begin
-            FCtx.PC := CurPC;
-            ExecuteInstruction(Instr);
-            CurPC := FCtx.PC + 1;
+            Ctx.PC := CurPC;
+            ExecuteInstruction(Ctx, Instr);
+            CurPC := Ctx.PC + 1;
           end;
       else
         raise Exception.CreateFmt('Unknown Group 0 opcode %d at CurPC=%d', [Op, CurPC]);
@@ -886,46 +890,46 @@ begin
     begin
       // Check if a TRAP handler is set and we're not already in an error handler
       // (to prevent infinite recursion if exception occurs during error handling)
-      if (FCtx.TrapLine > 0) and (not FCtx.InErrorHandler) then
+      if (Ctx.TrapLine > 0) and (not Ctx.InErrorHandler) then
       begin
         // Save error info for EL, ER, ERR$ variables
-        FCtx.LastErrorLine := FProgram.GetSourceLine(CurPC);
-        FCtx.ResumePC := CurPC;  // Save PC for RESUME
-        FCtx.InErrorHandler := True;
+        Ctx.LastErrorLine := FProgram.GetSourceLine(CurPC);
+        Ctx.ResumePC := CurPC;  // Save PC for RESUME
+        Ctx.InErrorHandler := True;
 
         // Map FPC exception types to BASIC error codes
         if E is EDivByZero then
-          FCtx.LastErrorCode := ERR_DIVISION_BY_ZERO
+          Ctx.LastErrorCode := ERR_DIVISION_BY_ZERO
         else if E is EZeroDivide then
-          FCtx.LastErrorCode := ERR_DIVISION_BY_ZERO
+          Ctx.LastErrorCode := ERR_DIVISION_BY_ZERO
         else if E is EOverflow then
-          FCtx.LastErrorCode := ERR_OVERFLOW
+          Ctx.LastErrorCode := ERR_OVERFLOW
         else if E is EUnderflow then
-          FCtx.LastErrorCode := ERR_UNDERFLOW
+          Ctx.LastErrorCode := ERR_UNDERFLOW
         else if E is EInvalidOp then
-          FCtx.LastErrorCode := ERR_DOMAIN
+          Ctx.LastErrorCode := ERR_DOMAIN
         else if E is ERangeError then
-          FCtx.LastErrorCode := ERR_BAD_SUBSCRIPT
+          Ctx.LastErrorCode := ERR_BAD_SUBSCRIPT
         else
-          FCtx.LastErrorCode := ERR_INTERNAL;
+          Ctx.LastErrorCode := ERR_INTERNAL;
 
-        FCtx.LastErrorMessage := E.Message;
+        Ctx.LastErrorMessage := E.Message;
 
         // Find PC for trap line number
-        FCtx.TrapPC := FProgram.FindPCForLine(FCtx.TrapLine);
+        Ctx.TrapPC := FProgram.FindPCForLine(Ctx.TrapLine);
 
-        if FCtx.TrapPC >= 0 then
+        if Ctx.TrapPC >= 0 then
         begin
           // Jump to error handler - set flag to re-enter loop
-          CurPC := FCtx.TrapPC;
-          FCtx.PC := CurPC;
-          FCtx.Running := True;
+          CurPC := Ctx.TrapPC;
+          Ctx.PC := CurPC;
+          Ctx.Running := True;
           TrapTriggered := True;  // Will restart the loop
         end
         else
         begin
           // Trap line not found - re-raise
-          FCtx.InErrorHandler := False;
+          Ctx.InErrorHandler := False;
           raise;
         end;
       end
@@ -940,29 +944,29 @@ begin
 
   {$POP}  // Restore range/overflow checking
 
-  FCtx.PC := CurPC;
+  Ctx.PC := CurPC;
 
   // Check if we need to switch execution mode (TRON/TROFF)
-  if FCtx.TraceActive and (FCtx.PC < InstrCount) then
+  if Ctx.TraceActive and (Ctx.PC < InstrCount) then
   begin
     {$IFNDEF DEBUG_MODE}
     // Was RunFast, now need RunDebug
-    FCtx.Running := True;
+    Ctx.Running := True;
     RunDebug;
     Exit;
     {$ENDIF}
   end
-  else if (not FCtx.TraceActive) and (FCtx.PC < InstrCount) then
+  else if (not Ctx.TraceActive) and (Ctx.PC < InstrCount) then
   begin
     {$IFDEF DEBUG_MODE}
     // Was RunDebug, now need RunFast
-    FCtx.Running := True;
+    Ctx.Running := True;
     RunFast;
     Exit;
     {$ENDIF}
   end;
 
-  FCtx.Running := False;
+  Ctx.Running := False;
 
   {$IFDEF DEBUG_MODE}
   {$IFDEF ENABLE_PROFILER}
