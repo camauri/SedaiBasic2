@@ -8285,6 +8285,18 @@ begin
             {$ENDIF}
           end;
         end
+        // A user GOTO/GOSUB/ON ... (or CALL) to a line number, label or procedure that
+        // was never defined. Without this guard the unresolved label resolves to PC 0 at
+        // bytecode time, sending control back to the program start: that turns a stray
+        // GOSUB into an unbounded recursion that overflows the return stack (access
+        // violation). Internal compiler labels never carry these prefixes, so the prefix
+        // filter limits the diagnostic to genuine user targets.
+        else if (Copy(TargetLabel, 1, 5) = 'LINE_') then
+          raise Exception.CreateFmt('Undefined line number: %s', [Copy(TargetLabel, 6, MaxInt)])
+        else if (Copy(TargetLabel, 1, 6) = 'LABEL_') then
+          raise Exception.CreateFmt('Undefined label: %s', [Copy(TargetLabel, 7, MaxInt)])
+        else if (Copy(TargetLabel, 1, 5) = 'PROC_') then
+          raise Exception.CreateFmt('Undefined procedure: %s', [Copy(TargetLabel, 6, MaxInt)])
         {$IFDEF DEBUG_SSA}
         else if DebugSSA then
           WriteLn('[SSA] WARNING: Target block not found: ', TargetLabel);
