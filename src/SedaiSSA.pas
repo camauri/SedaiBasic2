@@ -1881,6 +1881,34 @@ begin
           Result := MakeSSARegister(srtString, DestReg);
           EmitInstruction(ssaStrHex, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
+        else if (FuncName = 'INSTRREV') then
+        begin
+          // INSTRREV(str, sub) -> int position of the last occurrence (Dest=int, two string args).
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);   // str
+            ProcessExpression(ArgListNode.GetChild(1), Arg2Value);  // substring
+            ArgReg := EnsureStringRegister(ArgValue);
+            Arg2Reg := EnsureStringRegister(Arg2Value);
+            DestReg := FProgram.AllocRegister(srtInt);
+            Result := MakeSSARegister(srtInt, DestReg);
+            EmitInstruction(ssaStrInstrRev, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
+          end
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+        end
+        else if (FuncName = 'SPACE') or (FuncName = 'SPACE$') then
+        begin
+          // SPACE(n) -> string of n spaces (Dest=string, single int arg).
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+            ArgReg := EnsureIntRegister(ArgValue);
+            DestReg := FProgram.AllocRegister(srtString);
+            Result := MakeSSARegister(srtString, DestReg);
+            EmitInstruction(ssaStrSpace, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+        end
         else if (FuncName = 'LTRIM') or (FuncName = 'RTRIM') or (FuncName = 'TRIM') or
                 (FuncName = 'UCASE') or (FuncName = 'UCASE$') or
                 (FuncName = 'LCASE') or (FuncName = 'LCASE$') then

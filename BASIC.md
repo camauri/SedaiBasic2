@@ -2223,7 +2223,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `ZSTRING` | ✗ | Standard data type: null terminated 8 bit character string. |
 | `WSTRING` | ✗ | Standard data type: wide character string. |
 | `WSTRING (Function)` | ✗ | Returns a WString of multiple characters. |
-| `SPACE` | ✗ | Returns a String consisting of spaces. |
+| `SPACE` | ✓ | Returns a String of N spaces. `SPACE(n)` / `SPACE$(n)` (B1.2). |
 | `WSPACE` | ✗ | Returns a WString consisting of spaces. |
 | `LEN` | ✓ | Returns the length of a string in characters. |
 
@@ -2289,7 +2289,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `RTRIM` | ✓ | Removes trailing spaces. `RTRIM(s)` (B1.2; trimset variant deferred). |
 | `TRIM` | ✓ | Removes leading and trailing spaces. `TRIM(s)` (B1.2; trimset variant deferred). |
 | `INSTR` | ✓ | Returns the first occurrence of a substring or character within a string. |
-| `INSTRREV` | ✗ | Returns the last occurrence of a substring or character within a string. |
+| `INSTRREV` | ✓ | Position of the last occurrence of a substring. `INSTRREV(str, sub)` (B1.2; `start` arg deferred). |
 | `MID (Statement)` | ✗ | Copies a substring to a substring of a string. |
 | `LSET` | ✗ | Left-justifies a string. |
 | `RSET` | ✗ | Right-justifies a string. |

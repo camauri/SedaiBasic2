@@ -243,6 +243,9 @@ const
   kUCASES  = 'UCASE$';
   kLCASE   = 'LCASE';
   kLCASES  = 'LCASE$';
+  kINSTRREV = 'INSTRREV';
+  kSPACE   = 'SPACE';
+  kSPACES  = 'SPACE$';
 
   // Graphics
   kBOX     = 'BOX';

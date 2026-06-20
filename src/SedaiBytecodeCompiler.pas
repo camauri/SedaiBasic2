@@ -180,6 +180,8 @@ begin
     ssaStrTrim: Result := bcStrTrim;
     ssaStrUCase: Result := bcStrUCase;
     ssaStrLCase: Result := bcStrLCase;
+    ssaStrInstrRev: Result := bcStrInstrRev;
+    ssaStrSpace: Result := bcStrSpace;
     ssaStrErr: Result := bcStrErr;
     // Math functions
     ssaMathAbs: Result := bcMathAbs;

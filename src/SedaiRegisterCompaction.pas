@@ -210,6 +210,7 @@ begin
     bcStrLen,      // String length returns int
     bcStrAsc,      // ASC(str) returns int ASCII code
     bcStrInstr,    // INSTR(haystack, needle) returns int position
+    bcStrInstrRev, // INSTRREV(str, sub) returns int position
     // === GROUP 3: Array operations ===
     bcArrayLoadInt,  // Typed array load (int) - Dest is WRITTEN
     // === GROUP 4: I/O operations ===
@@ -317,7 +318,7 @@ begin
     bcIntToString, bcFloatToString,
     // === GROUP 1: String operations ===
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrChr,
-    bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: string->string
+    bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrSpace,  // B1.2: string dest
     bcStrStr,    // STR$(n) - number to string
     bcStrHex,    // HEX$(n) - int to hex string
     bcStrErr,    // ERR$(n) - error code to message string
@@ -375,7 +376,7 @@ begin
     // Bitwise operations
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot,
     // === GROUP 1: String operations with int param ===
-    bcStrChr, bcStrHex, bcStrErr,
+    bcStrChr, bcStrHex, bcStrErr, bcStrSpace,
     // === GROUP 5: Memory operations ===
     bcPeek,           // PEEK(address): Src1 = address (int)
     bcPoke,           // POKE address, value: Src1 = address (int)
@@ -581,6 +582,7 @@ begin
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string
     bcStrVal,    // VAL(str) - reads string, produces float
     bcStrInstr,  // INSTR(haystack, needle) - haystack is Src1
+    bcStrInstrRev,  // INSTRREV(str, sub) - str is Src1
     // === GROUP 2: Math operations ===
     bcStrDec,  // DEC(hexstring) - reads string, produces int
     // === GROUP 4: I/O operations ===
@@ -615,6 +617,7 @@ begin
     // === GROUP 1: String operations ===
     bcStrConcat,  // String concatenation (second operand)
     bcStrInstr,   // INSTR(haystack, needle) - needle is Src2
+    bcStrInstrRev, // INSTRREV(str, sub) - sub is Src2
     // === GROUP 6: File I/O operations ===
     bcDopen, bcOpen,  // Src2 = filename (string)
     bcAppend:         // Src2 = data (string)

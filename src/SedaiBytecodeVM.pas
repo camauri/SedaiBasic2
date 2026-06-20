@@ -2174,8 +2174,8 @@ begin
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
         end;
 
-        // Int Src1 -> String Dest (CHR$, HEX$, ERR$)
-        bcStrChr, bcStrHex, bcStrErr:
+        // Int Src1 -> String Dest (CHR$, HEX$, ERR$, SPACE)
+        bcStrChr, bcStrHex, bcStrErr, bcStrSpace:
         begin
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
@@ -2195,8 +2195,8 @@ begin
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
         end;
 
-        // INSTR(haystack$, needle$[, start]) -> int Dest
-        bcStrInstr:
+        // INSTR/INSTRREV(haystack$, needle$[, start]) -> int Dest
+        bcStrInstr, bcStrInstrRev:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;  // haystack
@@ -3685,7 +3685,7 @@ procedure TBytecodeVM.ExecuteStringOp(Ctx: TExecutionContext; const Instr: TByte
 var
   SubOp: Word;
   Len, StartPos, Count: Integer;
-  S: string;
+  S, SubStr: string;
 begin
   SubOp := Instr.OpCode and $FF;  // Extract sub-opcode (low byte)
   case SubOp of
@@ -3737,6 +3737,22 @@ begin
       Ctx.StringRegs[Instr.Dest] := UpperCase(Ctx.StringRegs[Instr.Src1]);
     16: // bcStrLCase - LCASE(s)
       Ctx.StringRegs[Instr.Dest] := LowerCase(Ctx.StringRegs[Instr.Src1]);
+    17: // bcStrInstrRev - INSTRREV(str, sub) -> position of last occurrence (1-based, 0 if none)
+      begin
+        S := Ctx.StringRegs[Instr.Src1];
+        SubStr := Ctx.StringRegs[Instr.Src2];
+        Len := 0;
+        if SubStr <> '' then
+          for StartPos := 1 to Length(S) - Length(SubStr) + 1 do
+            if Copy(S, StartPos, Length(SubStr)) = SubStr then Len := StartPos;
+        Ctx.IntRegs[Instr.Dest] := Len;
+      end;
+    18: // bcStrSpace - SPACE(n) -> n spaces
+      begin
+        Count := Ctx.IntRegs[Instr.Src1];
+        if Count < 0 then Count := 0;
+        Ctx.StringRegs[Instr.Dest] := StringOfChar(' ', Count);
+      end;
     7: // bcStrStr - STR$(n)
       Ctx.StringRegs[Instr.Dest] := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]);
     8: // bcStrVal - VAL(s)

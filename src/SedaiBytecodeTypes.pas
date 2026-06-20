@@ -302,6 +302,8 @@ const
   bcStrTrim         = bcGroupString + 14;  // TRIM(s)  - remove leading+trailing spaces
   bcStrUCase        = bcGroupString + 15;  // UCASE(s) - upper case
   bcStrLCase        = bcGroupString + 16;  // LCASE(s) - lower case
+  bcStrInstrRev     = bcGroupString + 17;  // INSTRREV(s, sub) - last occurrence (Dest=int, Src1/Src2=string)
+  bcStrSpace        = bcGroupString + 18;  // SPACE(n) - n spaces (Dest=string, Src1=int count)
 
   // === GROUP 2: MATH FUNCTIONS (0x02xx) ===
   bcMathSin         = bcGroupMath + 0;

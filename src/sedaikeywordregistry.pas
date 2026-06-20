@@ -1727,6 +1727,9 @@ begin
  RegisterKeyword(kUCASES, ttStringFunction, 'Convert string to upper case',                     kcStringFunctions);
  RegisterKeyword(kLCASE,  ttStringFunction, 'Convert string to lower case',                     kcStringFunctions);
  RegisterKeyword(kLCASES, ttStringFunction, 'Convert string to lower case',                     kcStringFunctions);
+ RegisterKeyword(kINSTRREV, ttStringFunction, 'Position of last occurrence of substring',       kcStringFunctions);
+ RegisterKeyword(kSPACE,  ttStringFunction, 'Return a string of N spaces',                      kcStringFunctions);
+ RegisterKeyword(kSPACES, ttStringFunction, 'Return a string of N spaces',                      kcStringFunctions);
  RegisterKeyword(kLEFTS,  ttStringFunction, 'Return string leftmost chars',                     kcStringFunctions);
  RegisterKeyword(kMIDS,   ttStringFunction, 'Return substring from larger string',              kcStringFunctions);
  RegisterKeyword(kRIGHTS, ttStringFunction, 'Return string rightmost chars',                    kcStringFunctions);

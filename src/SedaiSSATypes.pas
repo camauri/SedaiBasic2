@@ -84,6 +84,8 @@ type
     ssaStrAsc, ssaStrChr, ssaStrStr, ssaStrVal, ssaStrHex, ssaStrInstr, ssaStrErr,
     // FreeBASIC string functions (B1.2): single string arg -> string result.
     ssaStrLTrim, ssaStrRTrim, ssaStrTrim, ssaStrUCase, ssaStrLCase,
+    ssaStrInstrRev,   // INSTRREV(s, sub) -> int (last occurrence)
+    ssaStrSpace,      // SPACE(n) -> string of n spaces
     ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathLog, ssaMathExp,
     ssaMathSqr, ssaMathAbs, ssaMathSgn, ssaMathInt, ssaMathRnd,
     ssaMathLog10, ssaMathLog2, ssaMathLogN,  // Additional log functions
