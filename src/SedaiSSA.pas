@@ -216,6 +216,7 @@ type
     // Refinement #2: cross-thread SHARED scalars backed by a 1-element global array.
     function IsSharedScalar(const Name: string): Boolean;                       // name is a SHARED scalar (array-backed)?
     function MakeSharedScalarAccess(const Name: string; const Tok: TLexerToken): TASTNode;  // build name(0) array-access node
+    procedure EmitSharedScalarStoreVal(const Name: string; const Val: TSSAValue);  // store an SSA value into name(0)
     // FB lexical scope (MODERN only). ScopePushFrame/ScopePopFrame manage FScopeStack; the block
     // variants emit the M8 record-mark instructions. Inert in CLASSIC mode (callers gate on FModernMode).
     procedure ScopePushFrame(Kind: TScopeKind);
@@ -2685,9 +2686,10 @@ begin
   if VarNode.NodeType <> antIdentifier then Exit;
   VarName := VarToStr(VarNode.Value);
 
-  // Refinement #2: a SHARED scalar is backed by a 1-element global array — store to element 0 (a live,
-  // cross-thread write), reusing the array-store lowering (coercion to the element type, etc.).
-  if IsSharedScalar(VarName) then
+  // Refinement #2: a builtin SHARED scalar is backed by a 1-element global array — store to element 0 (a
+  // live cross-thread write), reusing the array-store lowering. A SHARED UDT scalar is excluded here: its
+  // handle never changes (value semantics), so "p = q" falls through to the memberwise record copy below.
+  if IsSharedScalar(VarName) and (VarRecordTypeName(VarName) = '') then
   begin
     SharedAssign := TASTNode.Create(antAssignment, VarNode.Token);
     SharedAssign.AddChild(MakeSharedScalarAccess(VarName, VarNode.Token));
@@ -3325,15 +3327,42 @@ begin
     if DimsNode.NodeType = antIdentifier then
     begin
       RecTypeName := UpperCase(VarToStr(DimsNode.Value));
-      // Refinement #2: a builtin-typed SHARED scalar is backed by a 1-element global array (registered in
-      // CollectSharedVars). Emit its array allocation and apply any "= expr" initializer, then we are done.
+      // Refinement #2: a SHARED scalar is backed by a 1-element global array (registered in
+      // CollectSharedVars). Emit its array allocation; then for a UDT scalar allocate the record in the
+      // shared region and store its handle into element 0; for a builtin scalar apply any "= expr".
       if (ArrayDeclNode.Attributes.Values['SHARED'] = '1') and IsSharedScalar(UpperCase(ArrName)) then
       begin
         ArrayIdx := PtrInt(FSharedScalarArr.Objects[FSharedScalarArr.IndexOf(UpperCase(ArrName))]);
         ArrayRef := MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType);
         EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-        if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
+        RecUDTIdx := FindUDT(RecTypeName);
+        if RecUDTIdx >= 0 then
+        begin
+          // Shared UDT scalar: allocate the record in the SHARED region (immediate bit 48), construct it,
+          // and store its handle into element 0 — so any thread reaches the same instance. (Nested-UDT
+          // field instances are still per-thread; flat UDTs are fully cross-thread.)
+          RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaRecordNew, RecHandleVal,
+                          MakeSSAConstInt(FUDTs[RecUDTIdx].NInt),
+                          MakeSSAConstInt(FUDTs[RecUDTIdx].NFloat),
+                          MakeSSAConstInt(FUDTs[RecUDTIdx].NStr or (Int64(RecUDTIdx) shl 32) or (Int64(1) shl 48)));
+          EmitRecordInit(RecHandleVal, RecUDTIdx);
+          if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType = antArgumentList) then
+            EmitConstructorCall(RecHandleVal, RecTypeName, ArrayDeclNode.GetChild(2))
+          else
+            EmitConstructorCall(RecHandleVal, RecTypeName);
+          EmitSharedScalarStoreVal(UpperCase(ArrName), RecHandleVal);  // publish the handle into name(0)
+          // V5e: a module-global UDT with a destructor stashes its handle in a reserved transfer slot so
+          // an END inside any SUB can still destroy it (the same as a non-shared global).
+          if not FInProcedure then
+          begin
+            MDtorSlotIdx := FModuleDtorSlots.IndexOf(UpperCase(ArrName));
+            if MDtorSlotIdx >= 0 then
+              EmitXferStore(srtInt, PtrInt(FModuleDtorSlots.Objects[MDtorSlotIdx]), RecHandleVal);
+          end;
+        end
+        else if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
         begin
           InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
           InitAssign.AddChild(MakeSharedScalarAccess(UpperCase(ArrName), ArrayDeclNode.GetChild(0).Token));
@@ -9621,13 +9650,16 @@ begin
       begin
         VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
         AddSharedVarSlot(VNameU);                       // keep the "is shared" marker (scope resolution)
-        // Refinement #2: a builtin-typed SHARED scalar is backed by a 1-element global array, so it lives
-        // in the shared FArrays and is visible/live across threads. (A SHARED UDT scalar keeps the M6
-        // handle-in-register path — its record is already shared via the per-record region, M5.2c.)
+        // Refinement #2: a SHARED scalar is backed by a 1-element global array, so it lives in the shared
+        // FArrays and is visible/live across threads. A builtin scalar stores its value; a UDT scalar
+        // stores its (int) record handle — the record itself is allocated in the shared region at DIM.
         TypeNameU := UpperCase(VarToStr(Decl.GetChild(1).Value));
-        if (FindUDT(TypeNameU) < 0) and (FSharedScalarArr.IndexOf(VNameU) < 0) then
+        if FSharedScalarArr.IndexOf(VNameU) < 0 then
         begin
-          ElemBank := TypeNameToBank(TypeNameU, VNameU);
+          if FindUDT(TypeNameU) >= 0 then
+            ElemBank := srtInt                           // UDT scalar: the array element is the record handle
+          else
+            ElemBank := TypeNameToBank(TypeNameU, VNameU);
           ai := FProgram.DeclareArray(VNameU, ElemBank, [1]);   // 1-element global array, same name
           FSharedScalarArr.AddObject(VNameU, TObject(PtrInt(ai)));
         end;
@@ -9654,6 +9686,28 @@ begin
   IdxList := TASTNode.Create(antExpressionList, Tok);
   IdxList.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Tok));
   Result.AddChild(IdxList);
+end;
+
+procedure TSSAGenerator.EmitSharedScalarStoreVal(const Name: string; const Val: TSSAValue);
+// Store an already-computed SSA value into element 0 of a SHARED scalar's backing array (used to publish
+// a freshly-constructed UDT record handle). Coerces to the array element type.
+var
+  ai: Integer;
+  et: TSSARegisterType;
+  ArrayRef, Idx0, V: TSSAValue;
+begin
+  ai := PtrInt(FSharedScalarArr.Objects[FSharedScalarArr.IndexOf(UpperCase(Name))]);
+  et := FProgram.GetArray(ai).ElementType;
+  Idx0 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, Idx0, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  case et of
+    srtFloat:  V := EnsureFloatRegister(Val);
+    srtString: V := EnsureStringRegister(Val);
+  else
+    V := EnsureIntRegister(Val);
+  end;
+  ArrayRef := MakeSSAArrayRef(ai, et);
+  EmitInstruction(ssaArrayStore, V, ArrayRef, Idx0, MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.EmitSharedSyncOut;
@@ -9876,6 +9930,7 @@ var
   ParentHandle, NestedHandle: TSSAValue;
   ParentUDT, Slot: Integer;
   Bank: TSSARegisterType;
+  SharedTmp: TASTNode;
 begin
   Result := False;
   TypeName := '';
@@ -9884,7 +9939,16 @@ begin
     // Record variable (or record-typed parameter): handle is the variable's int register.
     TypeName := VarRecordTypeName(VarToStr(ObjNode.Value));
     if TypeName = '' then Exit;
-    HandleVal := GetOrAllocateVariable(UpperCase(VarToStr(ObjNode.Value)));
+    // Refinement #2: a SHARED UDT scalar keeps its (shared) record handle in element 0 of its backing
+    // array, so read the handle from there — the record lives in the shared region (cross-thread).
+    if IsSharedScalar(VarToStr(ObjNode.Value)) then
+    begin
+      SharedTmp := MakeSharedScalarAccess(VarToStr(ObjNode.Value), ObjNode.Token);
+      ProcessExpression(SharedTmp, HandleVal);
+      SharedTmp.Free;
+    end
+    else
+      HandleVal := GetOrAllocateVariable(UpperCase(VarToStr(ObjNode.Value)));
     Result := True;
   end
   else if ObjNode.NodeType = antArrayAccess then

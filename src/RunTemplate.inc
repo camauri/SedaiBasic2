@@ -609,7 +609,13 @@ begin
         // UDT/record heap (M3)
         bcRecordNew:
           begin
-            Ctx.IntRegs[Instr.Dest] := AllocRecord(Ctx, Instr.Src1, Instr.Src2,
+            // Immediate bit 48 (M5.2c refinement): allocate in the shared region (cross-thread, e.g. a
+            // SHARED UDT scalar); otherwise in this thread's per-context heap. typeId is bits 32..47.
+            if (Instr.Immediate shr 48) and 1 <> 0 then
+              Ctx.IntRegs[Instr.Dest] := AllocSharedRecord(Instr.Src1, Instr.Src2,
+                                      Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF)
+            else
+              Ctx.IntRegs[Instr.Dest] := AllocRecord(Ctx, Instr.Src1, Instr.Src2,
                                       Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
             Inc(CurPC);
           end;

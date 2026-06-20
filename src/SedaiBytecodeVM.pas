@@ -2712,7 +2712,12 @@ begin
     bcXferLoadString:  Ctx.StringRegs[Instr.Dest] := Ctx.XferStr[Instr.Immediate];
     // UDT/record heap (M3)
     bcRecordNew:
-      Ctx.IntRegs[Instr.Dest] := AllocRecord(Ctx, Instr.Src1, Instr.Src2,
+      // Immediate bit 48: allocate in the shared cross-thread region (e.g. a SHARED UDT scalar).
+      if (Instr.Immediate shr 48) and 1 <> 0 then
+        Ctx.IntRegs[Instr.Dest] := AllocSharedRecord(Instr.Src1, Instr.Src2,
+                                          Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF)
+      else
+        Ctx.IntRegs[Instr.Dest] := AllocRecord(Ctx, Instr.Src1, Instr.Src2,
                                           Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
     bcRecordNewArray:
       RecordNewArrayInit(Ctx, Instr.Src1, Instr.Immediate);  // Src1=array id; Imm=packed slot counts
