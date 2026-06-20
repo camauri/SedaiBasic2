@@ -2263,6 +2263,12 @@ begin
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
         end;
 
+        // PrintBool/PrintUInt (B1.5 phase C): int value in Src1
+        bcPrintBool, bcPrintUInt:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
+
         // ArrayStore: Dest is value register, Src2 is index (int)
         bcArrayStoreInt:
         begin
@@ -4301,6 +4307,28 @@ begin
           FOutputDevice.Print(PrintStr);
           FOutputDevice.NewLine;  // NewLine already calls Present
           Ctx.CursorCol := 0;
+        end;
+      end;
+    16: // bcPrintBool (B1.5): a BOOLEAN prints as "true"/"false"
+      begin
+        if Ctx.IntRegs[Instr.Src1] <> 0 then PrintStr := 'true' else PrintStr := 'false';
+        if (FCmdHandle > 0) and Assigned(FOnFileData) then
+          FOnFileData(Self, 'PRINT#', FCmdHandle, PrintStr, CmdErr)
+        else if Assigned(FOutputDevice) then
+        begin
+          FOutputDevice.Print(PrintStr);
+          Inc(Ctx.CursorCol, Length(PrintStr));
+        end;
+      end;
+    17: // bcPrintUInt (B1.5): print an Int64 as an unsigned 64-bit value
+      begin
+        PrintStr := FConsoleBehavior.FormatUInt(QWord(Ctx.IntRegs[Instr.Src1]));
+        if (FCmdHandle > 0) and Assigned(FOnFileData) then
+          FOnFileData(Self, 'PRINT#', FCmdHandle, PrintStr, CmdErr)
+        else if Assigned(FOutputDevice) then
+        begin
+          FOutputDevice.Print(PrintStr);
+          Inc(Ctx.CursorCol, Length(PrintStr));
         end;
       end;
     6: // bcPrintComma

@@ -206,6 +206,8 @@ begin
     ssaPrintString: Result := bcPrintString;
     ssaPrintStringLn: Result := bcPrintStringLn;
     ssaPrintInt: Result := bcPrintInt;
+    ssaPrintBool: Result := bcPrintBool;     // B1.5 phase C
+    ssaPrintUInt: Result := bcPrintUInt;
     ssaPrintIntLn: Result := bcPrintIntLn;
     ssaPrintComma: Result := bcPrintComma;
     ssaPrintSemicolon: Result := bcPrintSemicolon;

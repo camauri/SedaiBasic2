@@ -1280,8 +1280,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `BYTE and UBYTE` | ✓ | 8-bit integer types. Stored in the Int64 bank but **assignments wrap/sign-extend to 8 bits** (B1.5): e.g. a `UBYTE` counter wraps 255→0. |
 | `SHORT and USHORT` | ✓ | 16-bit integer types; assignments wrap/sign-extend to 16 bits (B1.5). |
 | `LONG and ULONG` | ✓ | 32-bit integer types; assignments wrap/sign-extend to 32 bits (B1.5). |
-| `INTEGER and UINTEGER` | ✓ | 64-bit integer types here (platform width). Stored as Int64. |
-| `LONGINT and ULONGINT` | ✓ | 64-bit integer types. Stored as Int64. |
+| `INTEGER and UINTEGER` | ✓ | 64-bit integer types here (platform width). Stored as Int64; a `UINTEGER` prints as unsigned (B1.5). |
+| `LONGINT and ULONGINT` | ✓ | 64-bit integer types. Stored as Int64; a `ULONGINT` prints as unsigned 0..2^64-1 (B1.5). |
 
 ##### Floating-point types
 
@@ -1294,7 +1294,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `BOOLEAN` | ◐ | Accepted in `DIM ... AS` (B1.5); stored as Int64 (-1/0); 1-bit semantics not enforced. |
+| `BOOLEAN` | ✓ | Stored as Int64 (0 = false, non-zero = true); a `BOOLEAN` variable **prints as `true`/`false`** (B1.5). |
 
 ##### Procedure Types
 

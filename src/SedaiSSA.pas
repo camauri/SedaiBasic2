@@ -131,6 +131,7 @@ type
     // routed to element 0 of this array, so the value is never a per-thread register.
     FSharedScalarArr: TStringList;       // name (UPPER) -> array index (Objects[]=PtrInt arrayIdx)
     FVarWidthCode: TStringList;          // B1.5 phase 2: name (UPPER) -> narrow width code (Objects[]=PtrInt 1..7)
+    FVarPrintKind: TStringList;          // B1.5 phase C: name (UPPER) -> 1=BOOLEAN, 2=unsigned-64 (print form)
     FInDispatcher: Boolean;              // M6: true while emitting a virtual dispatcher (skip shared sync)
     FBlockHandledVars: TStringList;      // M8: var names destructed block-scoped (excluded from frame/module dtors)
     FCurrentTopLevelLabels: TStringList;  // GOTO-unwind: names of labels at block-depth 0 in the current frame
@@ -439,6 +440,8 @@ begin
   FSharedScalarArr.CaseSensitive := False;
   FVarWidthCode := TStringList.Create;
   FVarWidthCode.CaseSensitive := False;
+  FVarPrintKind := TStringList.Create;
+  FVarPrintKind.CaseSensitive := False;
   FInDispatcher := False;
   FBlockHandledVars := TStringList.Create;
   FBlockHandledVars.CaseSensitive := False;
@@ -468,6 +471,7 @@ begin
   FSharedVars.Free;
   FSharedScalarArr.Free;
   FVarWidthCode.Free;
+  FVarPrintKind.Free;
   FBlockHandledVars.Free;
   FCurrentTopLevelLabels.Free;
   inherited Destroy;
@@ -3061,6 +3065,7 @@ var
   Child, ArgNode: TASTNode;
   SeparatorChar, FuncName: string;
   EndsWithSeparator: Boolean;
+  PKidx: Integer;   // B1.5 phase C: print-kind index for a BOOLEAN / unsigned-64 identifier
 begin
   // Handle empty PRINT statement (just newline)
   if Node.ChildCount = 0 then
@@ -3156,6 +3161,23 @@ begin
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           ExprValue := RegValue;
         end;
+      end;
+    end;
+
+    // B1.5 phase C: printing a BOOLEAN variable yields "true"/"false"; a 64-bit unsigned variable
+    // (UInteger/ULongInt) prints unsigned. Only the direct `PRINT var` form is special-cased.
+    if (Child.NodeType = antIdentifier) and (ExprValue.RegType = srtInt) then
+    begin
+      PKidx := FVarPrintKind.IndexOf(UpperCase(VarToStr(Child.Value)));
+      if PKidx >= 0 then
+      begin
+        if PtrInt(FVarPrintKind.Objects[PKidx]) = 1 then
+          EmitInstruction(ssaPrintBool, MakeSSAValue(svkNone), ExprValue,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else
+          EmitInstruction(ssaPrintUInt, MakeSSAValue(svkNone), ExprValue,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Continue;
       end;
     end;
 
@@ -8941,21 +8963,39 @@ begin
 end;
 
 procedure TSSAGenerator.RecordVarWidth(const VarName, TypeName: string);
-// Remember a declared scalar's narrowing width so stores to it can wrap to the declared type.
+// Remember a declared scalar's narrowing width (so stores wrap to the declared type) and its print
+// form (BOOLEAN -> true/false, UInteger/ULongInt -> unsigned-64).
 var
-  W, Idx: Integer;
+  W, Idx, PK: Integer;
+  Nm, T: string;
 begin
+  Nm := UpperCase(VarName);
+  T := UpperCase(TypeName);
+  // Narrowing width (phase 2).
   W := TypeNameWidthCode(TypeName);
-  Idx := FVarWidthCode.IndexOf(UpperCase(VarName));
+  Idx := FVarWidthCode.IndexOf(Nm);
   if W = 0 then
   begin
     if Idx >= 0 then FVarWidthCode.Delete(Idx);  // re-DIM to a wide type clears any prior narrowing
-    Exit;
-  end;
-  if Idx >= 0 then
+  end
+  else if Idx >= 0 then
     FVarWidthCode.Objects[Idx] := TObject(PtrInt(W))
   else
-    FVarWidthCode.AddObject(UpperCase(VarName), TObject(PtrInt(W)));
+    FVarWidthCode.AddObject(Nm, TObject(PtrInt(W)));
+  // Print form (phase C). UByte/UShort/ULong are stored as positive Int64 after narrowing, so they
+  // print correctly as signed already; only the 64-bit unsigned types need the unsigned print form.
+  if T = 'BOOLEAN' then PK := 1
+  else if (T = 'UINTEGER') or (T = 'ULONGINT') then PK := 2
+  else PK := 0;
+  Idx := FVarPrintKind.IndexOf(Nm);
+  if PK = 0 then
+  begin
+    if Idx >= 0 then FVarPrintKind.Delete(Idx);
+  end
+  else if Idx >= 0 then
+    FVarPrintKind.Objects[Idx] := TObject(PtrInt(PK))
+  else
+    FVarPrintKind.AddObject(Nm, TObject(PtrInt(PK)));
 end;
 
 function TSSAGenerator.ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;
@@ -11407,6 +11447,7 @@ begin
   FSharedVars.Clear;
   FSharedScalarArr.Clear;
   FVarWidthCode.Clear;
+  FVarPrintKind.Clear;
   CollectSharedVars(AST);
 
   // M8: reset block-scope state (block-scoped record reclamation; the scope stack itself was reset above).

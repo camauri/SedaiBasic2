@@ -314,7 +314,7 @@ begin
 
     // I/O operations - always live (visible side effects)
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
-    ssaPrintInt, ssaPrintIntLn,
+    ssaPrintInt, ssaPrintIntLn, ssaPrintBool, ssaPrintUInt,
     ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
     ssaPrintEnd,  // Reset reverse mode - affects display state
     ssaInput, ssaInputInt, ssaInputFloat, ssaInputString,

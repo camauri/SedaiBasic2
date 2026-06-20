@@ -374,6 +374,9 @@ const
   bcInputInt        = bcGroupIO + 13;
   bcInputFloat      = bcGroupIO + 14;
   bcInputString     = bcGroupIO + 15;
+  // FreeBASIC typed print (B1.5 phase C). Src1 = int register holding the value.
+  bcPrintBool       = bcGroupIO + 16;  // print a BOOLEAN as "true"/"false"
+  bcPrintUInt       = bcGroupIO + 17;  // print an Int64 as an unsigned 64-bit value
 
   // === GROUP 5: SPECIAL VARIABLES (0x05xx) ===
   bcLoadTI          = bcGroupSpecial + 0;   // TI: jiffies since start
@@ -1370,6 +1373,8 @@ begin
         13: Result := 'InputInt';
         14: Result := 'InputFloat';
         15: Result := 'InputString';
+        16: Result := 'PrintBool';
+        17: Result := 'PrintUInt';
       else
         Result := Format('IO_%d', [SubOp]);
       end;

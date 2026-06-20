@@ -154,6 +154,9 @@ type
     { Formatta un numero secondo le regole correnti }
     function FormatNumber(Value: Double): string;
 
+    { Formatta un intero senza segno a 64 bit (B1.5: UInteger/ULongInt), valore sempre >= 0 }
+    function FormatUInt(Value: QWord): string;
+
     { Formatta una stringa secondo le regole correnti }
     function FormatString(const S: string): string;
 
@@ -406,6 +409,31 @@ begin
     Result := Prefix + IntToStr(Round(Value)) + Suffix
   else
     Result := Prefix + FloatToStr(Value) + Suffix;
+end;
+
+function TConsoleBehavior.FormatUInt(Value: QWord): string;
+// Like FormatNumber but for an exact unsigned 64-bit value (it is always >= 0, so it gets the
+// same leading space a positive number would). Formatting via QWord avoids the Double precision
+// loss FormatNumber would suffer for values above 2^53.
+var
+  Prefix, Suffix: string;
+begin
+  Prefix := '';
+  Suffix := '';
+  case FNumberFormat of
+    nfCommodore, nfMSX:
+      begin Prefix := ' '; Suffix := ' '; end;     // non-negative -> leading space
+    nfSpectrum:
+      begin Prefix := ''; Suffix := ''; end;
+    nfAtari:
+      begin Prefix := ''; Suffix := ' '; end;
+    nfCustom:
+      begin
+        if FNumberSpaceBefore then Prefix := ' ';
+        if FNumberSpaceAfter then Suffix := ' ';
+      end;
+  end;
+  Result := Prefix + UIntToStr(Value) + Suffix;
 end;
 
 function TConsoleBehavior.FormatString(const S: string): string;

@@ -387,7 +387,7 @@ begin
     bcPeek,           // PEEK(address): Src1 = address (int)
     bcPoke,           // POKE address, value: Src1 = address (int)
     // === GROUP 4: I/O operations ===
-    bcPrintInt, bcPrintIntLn,
+    bcPrintInt, bcPrintIntLn, bcPrintBool, bcPrintUInt,
     bcPrintTab, bcPrintSpc,  // TAB(n) and SPC(n) - Src1 = count register
     // === GROUP 6: Sound operations ===
     bcSoundVol,       // Src1 = volume (int 0-15)

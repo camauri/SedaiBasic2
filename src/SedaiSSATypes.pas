@@ -125,6 +125,7 @@ type
     ssaArrayErase, ssaArrayRedim,    // ERASE / REDIM (B1.4)
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
     ssaPrintInt, ssaPrintIntLn,
+    ssaPrintBool, ssaPrintUInt,   // B1.5 phase C: BOOLEAN true/false, unsigned-64 print
     ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
     ssaPrintEnd,   // Reset reverse mode after PRINT statement (C128 behavior)
     ssaInput, ssaInputInt, ssaInputFloat, ssaInputString,
