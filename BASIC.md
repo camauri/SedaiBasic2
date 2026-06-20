@@ -1353,13 +1353,13 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `= (Assignment)` | ✓ |  |
-| `&= (Concatenate and Assign)` | ✗ |  |
-| `+= (Add and Assign)` | ✗ |  |
-| `-= (Subtract and Assign)` | ✗ |  |
-| `*= (Multiply and Assign)` | ✗ |  |
-| `/= (Divide and Assign)` | ✗ |  |
+| `&= (Concatenate and Assign)` | ✗ | (word/`&=` compound ops deferred) |
+| `+= (Add and Assign)` | ✓ | desugars to `lhs = lhs + rhs` (scalar/array/member) (B1.1) |
+| `-= (Subtract and Assign)` | ✓ | (B1.1) |
+| `*= (Multiply and Assign)` | ✓ | (B1.1) |
+| `/= (Divide and Assign)` | ✓ | (B1.1) |
 | `\= (Integer Divide and Assign)` | ✗ |  |
-| `^= (Exponentiate and Assign)` | ✗ |  |
+| `^= (Exponentiate and Assign)` | ✓ | (B1.1; also fixed integer `^` which computed `a+b`) |
 | `MOD= (Modulus and Assign)` | ✗ |  |
 | `AND= (Conjunction and Assign)` | ✗ |  |
 | `EQV= (Equivalence and Assign)` | ✗ |  |

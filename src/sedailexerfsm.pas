@@ -1579,12 +1579,16 @@ begin
         end;
 
       // === SINGLE CHAR OPERATORS - ZERO PROCESSING ===
+      // Arithmetic operators. FreeBASIC compound assignment ("op="): if '=' follows, emit a single
+      // ttCompoundAssign token whose value is the operator symbol (the trailing '=' is consumed but not
+      // kept), which the parser desugars to "lhs = lhs op rhs".
       '+':
         begin
           ResetToken;
           TokenBufferAdd(CurrentChar);
           AdvanceChar;
-          Result := CreateToken(ttOpAdd);
+          if GetCurrentChar = '=' then begin AdvanceChar; Result := CreateToken(ttCompoundAssign); end
+          else Result := CreateToken(ttOpAdd);
           {$IFDEF DEBUG}
           if FDebugMode then
             FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
@@ -1597,7 +1601,8 @@ begin
           ResetToken;
           TokenBufferAdd(CurrentChar);
           AdvanceChar;
-          Result := CreateToken(ttOpSub);
+          if GetCurrentChar = '=' then begin AdvanceChar; Result := CreateToken(ttCompoundAssign); end
+          else Result := CreateToken(ttOpSub);
           {$IFDEF DEBUG}
           if FDebugMode then
             FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
@@ -1610,7 +1615,8 @@ begin
           ResetToken;
           TokenBufferAdd(CurrentChar);
           AdvanceChar;
-          Result := CreateToken(ttOpMul);
+          if GetCurrentChar = '=' then begin AdvanceChar; Result := CreateToken(ttCompoundAssign); end
+          else Result := CreateToken(ttOpMul);
           {$IFDEF DEBUG}
           if FDebugMode then
             FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
@@ -1623,7 +1629,8 @@ begin
           ResetToken;
           TokenBufferAdd(CurrentChar);
           AdvanceChar;
-          Result := CreateToken(ttOpDiv);
+          if GetCurrentChar = '=' then begin AdvanceChar; Result := CreateToken(ttCompoundAssign); end
+          else Result := CreateToken(ttOpDiv);
           {$IFDEF DEBUG}
           if FDebugMode then
             FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
@@ -1636,7 +1643,8 @@ begin
           ResetToken;
           TokenBufferAdd(CurrentChar);
           AdvanceChar;
-          Result := CreateToken(ttOpPow);
+          if GetCurrentChar = '=' then begin AdvanceChar; Result := CreateToken(ttCompoundAssign); end
+          else Result := CreateToken(ttOpPow);
           {$IFDEF DEBUG}
           if FDebugMode then
             FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);

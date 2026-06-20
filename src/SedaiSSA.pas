@@ -1476,6 +1476,28 @@ begin
           Result := MakeSSARegister(srtFloat, DestReg);
           OpCode := ssaDivFloat;
         end
+        // Exponentiation (^): like FreeBASIC, always operates in and returns floating point (there is no
+        // integer power opcode). Without this, integer "a ^ b" fell through to ssaAddInt (a + b)!
+        else if Node.Token.TokenType = ttOpPow then
+        begin
+          if Left.RegType = srtInt then
+          begin
+            TempReg := FProgram.AllocRegister(srtFloat);
+            TempVal := MakeSSARegister(srtFloat, TempReg);
+            EmitInstruction(ssaIntToFloat, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Left := TempVal;
+          end;
+          if Right.RegType = srtInt then
+          begin
+            TempReg := FProgram.AllocRegister(srtFloat);
+            TempVal := MakeSSARegister(srtFloat, TempReg);
+            EmitInstruction(ssaIntToFloat, TempVal, Right, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Right := TempVal;
+          end;
+          DestReg := FProgram.AllocRegister(srtFloat);
+          Result := MakeSSARegister(srtFloat, DestReg);
+          OpCode := ssaPowFloat;
+        end
         // MOD: float if any operand is float, otherwise integer
         else if Node.Token.TokenType = ttOpMod then
         begin

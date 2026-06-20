@@ -87,6 +87,7 @@ type
     ttOpMod,                 // MOD
     ttOpDot,                 // . (member access: record.field)
     ttOpAt,                  // @ (proc-address prefix: @subname → entry PC, for Threadcreate)
+    ttCompoundAssign,        // += -= *= /= ^= (FreeBASIC compound assignment; value = the operator symbol)
 
     // === COMPARISON OPERATORS ===
     ttOpEq,                  // =

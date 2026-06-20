@@ -1323,7 +1323,7 @@ begin
   // THREADCREATE(@sub [, param]) — spawn a worker thread; evaluates to an int handle. FB passes a single
   // (Any Ptr) parameter. child0 = proc-address (@sub), child1 = antArgumentList (the param, or literal 0
   // if omitted). The arg list lets SSA stage the parameter through StageCallArgs like a normal call.
-  Result := TASTNode.CreateWithValue(antThreadCreate, 'THREADCREATE', Token);
+  Result := TASTNode.CreateWithValue(antThreadCreate, kTHREADCREATE, Token);
   if not Context.Match(ttDelimParOpen) then
   begin
     HandleError('Expected "(" after THREADCREATE', Context.CurrentToken);
@@ -1362,7 +1362,7 @@ end;
 function TExpressionParser.ParseMutexCreate(Token: TLexerToken): TASTNode;
 begin
   // MUTEXCREATE [()] — create a mutex; evaluates to an int handle. No arguments.
-  Result := TASTNode.CreateWithValue(antMutexCreate, 'MUTEXCREATE', Token);
+  Result := TASTNode.CreateWithValue(antMutexCreate, kMUTEXCREATE, Token);
   if Context.Check(ttDelimParOpen) then
   begin
     Context.Advance;                              // optional (
@@ -1374,7 +1374,7 @@ end;
 function TExpressionParser.ParseThreadSelf(Token: TLexerToken): TASTNode;
 begin
   // THREADSELF [()] — the current thread's handle (0 on the main thread). No arguments.
-  Result := TASTNode.CreateWithValue(antThreadSelf, 'THREADSELF', Token);
+  Result := TASTNode.CreateWithValue(antThreadSelf, kTHREADSELF, Token);
   if Context.Check(ttDelimParOpen) then
   begin
     Context.Advance;                              // optional (
@@ -1398,7 +1398,7 @@ begin
   end;
   ProcNode := TASTNode.CreateWithValue(antProcAddress, UpperCase(Context.CurrentToken.Value), Token);
   Context.Advance;                                // consume the sub name
-  Result := TASTNode.CreateWithValue(antThreadCreate, 'THREADCREATE', Token);
+  Result := TASTNode.CreateWithValue(antThreadCreate, kTHREADCREATE, Token);
   Result.AddChild(ProcNode);
   ArgList := TASTNode.Create(antArgumentList, Token);
   Result.AddChild(ArgList);
@@ -1420,7 +1420,7 @@ end;
 function TExpressionParser.ParseCondCreate(Token: TLexerToken): TASTNode;
 begin
   // CONDCREATE [()] — create a condition variable; evaluates to an int handle. No arguments.
-  Result := TASTNode.CreateWithValue(antCondCreate, 'CONDCREATE', Token);
+  Result := TASTNode.CreateWithValue(antCondCreate, kCONDCREATE, Token);
   if Context.Check(ttDelimParOpen) then
   begin
     Context.Advance;                              // optional (

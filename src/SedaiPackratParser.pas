@@ -694,6 +694,8 @@ var
  Token: TLexerToken;
  SavedToken: TLexerToken;
  LhsIsExpr: Boolean;   // LHS built by the expression parser (member/array): may be a call stmt
+ OpSym: string;        // compound-assignment operator symbol ('+','-','*','/','^')
+ OpType: TTokenType;   // its arithmetic binary-op token type
 begin
  Token := Context.CurrentToken;
  SavedToken := Token;   // default (member/array LHS branches don't set it; avoids nil on error)
@@ -735,6 +737,36 @@ begin
   begin
     HandleError('Expected variable name in assignment', Context.CurrentToken);  // ← Token corrente
     Result := nil;
+    Exit;
+  end;
+
+  // FreeBASIC compound assignment "lhs op= rhs" desugars to "lhs = lhs op rhs". The lexer emits a single
+  // ttCompoundAssign token whose value is the operator symbol; clone the LHS as the left operand.
+  if Context.Check(ttCompoundAssign) then
+  begin
+    OpSym := Context.CurrentToken.Value;
+    Context.Advance;                                 // consume the "op=" token
+    Expression := FExpressionParser.ParseExpression;
+    if not Assigned(Expression) then
+    begin
+      if Assigned(LeftSide) then LeftSide.Free;
+      Result := nil;
+      Exit;
+    end;
+    case OpSym of
+      '-': OpType := ttOpSub;
+      '*': OpType := ttOpMul;
+      '/': OpType := ttOpDiv;
+      '^': OpType := ttOpPow;
+    else
+      OpType := ttOpAdd;
+    end;
+    Expression := CreateBinaryOpNode(OpType, LeftSide.Clone, Expression,
+                                     TLexerToken.CreateSimple(OpType, OpSym));
+    Result := TASTNode.Create(antAssignment);
+    Result.AddChild(LeftSide);
+    Result.AddChild(Expression);
+    DoNodeCreated(Result);
     Exit;
   end;
 
@@ -1543,7 +1575,7 @@ begin
   if not Assigned(HandleExpr) then Exit;          // malformed THREADWAIT
   if HasParens and Context.Check(ttDelimParClose) then
     Context.Advance;                              // )
-  Result := TASTNode.CreateWithValue(antThreadWait, 'THREADWAIT', Token);
+  Result := TASTNode.CreateWithValue(antThreadWait, kTHREADWAIT, Token);
   Result.AddChild(HandleExpr);
   DoNodeCreated(Result);
 end;
@@ -1564,7 +1596,7 @@ begin
   if not Assigned(HandleExpr) then Exit;
   if HasParens and Context.Check(ttDelimParClose) then
     Context.Advance;                              // )
-  Result := TASTNode.CreateWithValue(antThreadDetach, 'THREADDETACH', Token);
+  Result := TASTNode.CreateWithValue(antThreadDetach, kTHREADDETACH, Token);
   Result.AddChild(HandleExpr);
   DoNodeCreated(Result);
 end;
@@ -1581,10 +1613,10 @@ begin
   // antMutex* node with the handle expression as child0.
   Token := Context.CurrentToken;
   case Token.TokenType of
-    ttMutexUnlock:  begin NodeType := antMutexUnlock;  Name := 'MUTEXUNLOCK';  end;
-    ttMutexDestroy: begin NodeType := antMutexDestroy; Name := 'MUTEXDESTROY'; end;
+    ttMutexUnlock:  begin NodeType := antMutexUnlock;  Name := kMUTEXUNLOCK;  end;
+    ttMutexDestroy: begin NodeType := antMutexDestroy; Name := kMUTEXDESTROY; end;
   else
-    begin NodeType := antMutexLock; Name := 'MUTEXLOCK'; end;
+    begin NodeType := antMutexLock; Name := kMUTEXLOCK; end;
   end;
   Context.Advance;                                // consume the MUTEX* keyword
   Result := nil;
@@ -1619,7 +1651,7 @@ begin
   if not Assigned(MutexExpr) then Exit;
   if HasParens and Context.Check(ttDelimParClose) then
     Context.Advance;                              // )
-  Result := TASTNode.CreateWithValue(antCondWait, 'CONDWAIT', Token);
+  Result := TASTNode.CreateWithValue(antCondWait, kCONDWAIT, Token);
   Result.AddChild(CondExpr);
   Result.AddChild(MutexExpr);
   DoNodeCreated(Result);
@@ -1636,10 +1668,10 @@ begin
   // CONDSIGNAL / CONDBROADCAST / CONDDESTROY cond  (parens optional). child0 = cond handle.
   Token := Context.CurrentToken;
   case Token.TokenType of
-    ttCondBroadcast: begin NodeType := antCondBroadcast; Name := 'CONDBROADCAST'; end;
-    ttCondDestroy:   begin NodeType := antCondDestroy;   Name := 'CONDDESTROY';   end;
+    ttCondBroadcast: begin NodeType := antCondBroadcast; Name := kCONDBROADCAST; end;
+    ttCondDestroy:   begin NodeType := antCondDestroy;   Name := kCONDDESTROY;   end;
   else
-    begin NodeType := antCondSignal; Name := 'CONDSIGNAL'; end;
+    begin NodeType := antCondSignal; Name := kCONDSIGNAL; end;
   end;
   Context.Advance;                                // consume the COND* keyword
   Result := nil;
@@ -3956,7 +3988,7 @@ begin
     if not Assigned(Dimension) then Break;
     // FreeBASIC explicit bound "lb TO ub": the first expression is the lower bound. Wrap both in an
     // antDimRange (child0=lb, child1=ub). A bare expression stays the upper bound (lower bound = 0).
-    if Context.Check(ttLoopControl) and (UpperCase(Context.CurrentToken.Value) = 'TO') then
+    if Context.Check(ttLoopControl) and (UpperCase(Context.CurrentToken.Value) = kTO) then
     begin
       Context.Advance;                              // consume TO
       UpperExpr := ParseExpression;
