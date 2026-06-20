@@ -1202,8 +1202,11 @@ begin
           ttOpSub: Result := MakeSSAConstInt(Left.ConstInt - Right.ConstInt);
           ttOpMul: Result := MakeSSAConstInt(Left.ConstInt * Right.ConstInt);
           ttOpDiv:
+            // `/` is always floating-point division (both C64 BASIC and FreeBASIC), even for
+            // integer operands - so 10/4 = 2.5, matching the non-const lowering above. Folding
+            // to integer `div` here made the constant case disagree with the runtime.
             if Right.ConstInt <> 0 then
-              Result := MakeSSAConstInt(Left.ConstInt div Right.ConstInt)
+              Result := MakeSSAConstFloat(Left.ConstInt / Right.ConstInt)
             else
               Result := MakeSSAValue(svkNone);
         else
