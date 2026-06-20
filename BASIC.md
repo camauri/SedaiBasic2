@@ -300,6 +300,27 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `TAN` | ✓ | Return tangent of argument |
 | `VAL` | ✓ | Return the numeric value of a number string |
 
+## Type Conversion Functions (FreeBASIC) (11/11 - 100%)
+
+| Function | Status | Description |
+|----------|--------|-------------|
+| `CINT` | ✓ | Convert to Integer, rounding to nearest (banker's rounding) |
+| `CLNG` | ✓ | Convert to Long, rounding to nearest |
+| `CLNGINT` | ✓ | Convert to LongInt (64-bit), rounding to nearest |
+| `CSHORT` | ✓ | Convert to Short, rounding to nearest |
+| `CBYTE` | ✓ | Convert to Byte, rounding to nearest |
+| `CUBYTE` | ✓ | Convert to UByte, rounding to nearest |
+| `CUSHORT` | ✓ | Convert to UShort, rounding to nearest |
+| `CUINT` | ✓ | Convert to UInteger, rounding to nearest |
+| `CULNG` | ✓ | Convert to ULong, rounding to nearest |
+| `CDBL` | ✓ | Convert to Double-precision float |
+| `CSNG` | ✓ | Convert to Single-precision float |
+
+Note: integer conversions round-to-nearest with ties-to-even (banker's rounding),
+matching FreeBASIC's `CINT` family — distinct from `INT` (floor) and the implicit
+truncation of a float→int assignment. Per-type range clamping/wrapping (e.g. `CBYTE`
+modulo 256) is not yet applied (v1).
+
 ## Reserved Variables (6/9 - 67%)
 
 | Variable | Status | Description |

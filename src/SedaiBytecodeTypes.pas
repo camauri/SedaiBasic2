@@ -268,6 +268,9 @@ const
   // M5.5: ThreadSelf (Dest=int = current thread handle, 0 on main); ThreadDetach (Src1=handle).
   bcThreadSelf       = bcGroupCore + 126;
   bcThreadDetach     = bcGroupCore + 127;
+  // Round a float to the nearest integer (round-to-even, banker's), for FreeBASIC CINT/CLNG/... (B1.3).
+  // Dest = int reg, Src1 = float reg. (bcFloatToInt truncates; bcMathInt floors — neither is CINT.)
+  bcFloatRound       = bcGroupCore + 128;
   // Mutexes (M5.4, FreeBASIC API), thin wrappers over TRTLCriticalSection. bcMutexCreate writes a
   // fresh mutex handle into an int register (Dest); Lock/Unlock/Destroy take a handle reg (Src1).
   bcMutexCreate      = bcGroupCore + 117;

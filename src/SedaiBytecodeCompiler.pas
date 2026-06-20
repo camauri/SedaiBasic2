@@ -245,6 +245,7 @@ begin
     ssaThreadWait: Result := bcThreadWait;
     ssaThreadSelf: Result := bcThreadSelf;       // M5.5
     ssaThreadDetach: Result := bcThreadDetach;
+    ssaFloatRound: Result := bcFloatRound;       // B1.3: CINT/CLNG round-to-int
     ssaMutexCreate: Result := bcMutexCreate;    // M5.4: mutex primitives
     ssaMutexLock: Result := bcMutexLock;
     ssaMutexUnlock: Result := bcMutexUnlock;

@@ -221,6 +221,18 @@ const
   kTAN     = 'TAN';
   kVAL     = 'VAL';
   kDEC     = 'DEC';
+  // FreeBASIC type-conversion functions (B1.3)
+  kCINT    = 'CINT';      // round to Integer (banker's rounding)
+  kCLNG    = 'CLNG';      // round to Long
+  kCLNGINT = 'CLNGINT';   // round to LongInt (64-bit)
+  kCSHORT  = 'CSHORT';    // round to Short
+  kCBYTE   = 'CBYTE';     // round to Byte
+  kCUBYTE  = 'CUBYTE';    // round to UByte
+  kCUSHORT = 'CUSHORT';   // round to UShort
+  kCUINT   = 'CUINT';     // round to UInteger
+  kCULNG   = 'CULNG';     // round to ULong
+  kCDBL    = 'CDBL';      // convert to Double
+  kCSNG    = 'CSNG';      // convert to Single
 
   // String functions
   kASC     = 'ASC';

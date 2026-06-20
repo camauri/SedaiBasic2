@@ -1853,6 +1853,18 @@ begin
  RegisterKeyword(kSQR,   ttMathFunction, 'Return square root of argument',                           kcMathFunctions);
  RegisterKeyword(kTAN,   ttMathFunction, 'Return tangent of argument',                               kcMathFunctions);
  RegisterKeyword(kVAL,   ttMathFunction, 'Return the numeric value of a number string',              kcMathFunctions);
+ // FreeBASIC type-conversion functions (B1.3)
+ RegisterKeyword(kCINT,    ttMathFunction, 'Convert to Integer, rounding to nearest',                kcMathFunctions);
+ RegisterKeyword(kCLNG,    ttMathFunction, 'Convert to Long, rounding to nearest',                   kcMathFunctions);
+ RegisterKeyword(kCLNGINT, ttMathFunction, 'Convert to LongInt (64-bit), rounding to nearest',       kcMathFunctions);
+ RegisterKeyword(kCSHORT,  ttMathFunction, 'Convert to Short, rounding to nearest',                  kcMathFunctions);
+ RegisterKeyword(kCBYTE,   ttMathFunction, 'Convert to Byte, rounding to nearest',                   kcMathFunctions);
+ RegisterKeyword(kCUBYTE,  ttMathFunction, 'Convert to UByte, rounding to nearest',                  kcMathFunctions);
+ RegisterKeyword(kCUSHORT, ttMathFunction, 'Convert to UShort, rounding to nearest',                 kcMathFunctions);
+ RegisterKeyword(kCUINT,   ttMathFunction, 'Convert to UInteger, rounding to nearest',               kcMathFunctions);
+ RegisterKeyword(kCULNG,   ttMathFunction, 'Convert to ULong, rounding to nearest',                  kcMathFunctions);
+ RegisterKeyword(kCDBL,    ttMathFunction, 'Convert to Double-precision float',                      kcMathFunctions);
+ RegisterKeyword(kCSNG,    ttMathFunction, 'Convert to Single-precision float',                      kcMathFunctions);
 
  // === RESERVED VARIABLES ===
  RegisterKeyword(kDS,  ttSpecialVariable, 'Get disk status code',          kcReservedVariables);

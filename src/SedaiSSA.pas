@@ -2050,6 +2050,50 @@ begin
           end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end
+        else if (FuncName = 'CINT') or (FuncName = 'CLNG') or (FuncName = 'CLNGINT') or
+                (FuncName = 'CSHORT') or (FuncName = 'CBYTE') or (FuncName = 'CUBYTE') or
+                (FuncName = 'CUSHORT') or (FuncName = 'CUINT') or (FuncName = 'CULNG') then
+        begin
+          // FreeBASIC integer conversion functions: round-to-nearest (banker's rounding)
+          // toward an integer result. Range-clamping per concrete type is deferred (v1).
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          else if (ArgListNode <> nil) and (ArgListNode.NodeType <> antArgumentList) then
+            ProcessExpression(ArgListNode, ArgValue)
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          if ArgValue.Kind = svkConstFloat then
+            Result := MakeSSAConstInt(Round(ArgValue.ConstFloat))
+          else if ArgValue.Kind = svkConstInt then
+            Result := MakeSSAConstInt(ArgValue.ConstInt)
+          else if (ArgValue.Kind = svkRegister) and (ArgValue.RegType = srtFloat) then
+          begin
+            // Round-to-even (banker's): bcFloatRound, distinct from truncating ssaFloatToInt.
+            DestReg := FProgram.AllocRegister(srtInt);
+            Result := MakeSSARegister(srtInt, DestReg);
+            EmitInstruction(ssaFloatRound, Result, ArgValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end
+          else
+            // Already an integer value (register or string-coerced) - pass through.
+            Result := EnsureIntRegister(ArgValue);
+        end
+        else if (FuncName = 'CDBL') or (FuncName = 'CSNG') then
+        begin
+          // FreeBASIC float conversion functions: produce a float value.
+          // CSNG single-precision rounding is approximated as Double (v1).
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          else if (ArgListNode <> nil) and (ArgListNode.NodeType <> antArgumentList) then
+            ProcessExpression(ArgListNode, ArgValue)
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          if ArgValue.Kind = svkConstInt then
+            Result := MakeSSAConstFloat(ArgValue.ConstInt)
+          else if ArgValue.Kind = svkConstFloat then
+            Result := MakeSSAConstFloat(ArgValue.ConstFloat)
+          else
+            Result := EnsureFloatRegister(ArgValue);
+        end
         else
         begin
           // Standard math functions (single argument, float result)

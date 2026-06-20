@@ -106,6 +106,7 @@ type
     ssaLoadProcAddr, ssaThreadCreate, ssaThreadWait,
     // M5.5: ThreadSelf (Dest=int = current thread handle, 0 on main); ThreadDetach (Src1=handle).
     ssaThreadSelf, ssaThreadDetach,
+    ssaFloatRound,   // B1.3: round float -> int (round-to-even), for CINT/CLNG/...
     // Mutexes (M5.4, FB API): MutexCreate (Dest=int handle, no operands); Lock/Unlock/Destroy (Src1=handle reg).
     ssaMutexCreate, ssaMutexLock, ssaMutexUnlock, ssaMutexDestroy,
     // Condition variables (M5.4): CondCreate (Dest=int handle); CondWait (Src1=cond, Src2=mutex);

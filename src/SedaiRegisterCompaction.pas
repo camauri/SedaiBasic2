@@ -205,7 +205,7 @@ begin
     // Bitwise operations (result is int)
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot,
     // Conversions to int
-    bcFloatToInt, bcStringToInt,
+    bcFloatToInt, bcStringToInt, bcFloatRound,
     // === GROUP 1: String operations ===
     bcStrLen,      // String length returns int
     bcStrAsc,      // ASC(str) returns int ASCII code
@@ -441,7 +441,7 @@ begin
     // Float comparisons
     bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat,
     // Conversion from float
-    bcFloatToInt, bcFloatToString,
+    bcFloatToInt, bcFloatToString, bcFloatRound,
     // === GROUP 2: Math functions ===
     bcMathSqr, bcMathSin, bcMathCos, bcMathTan, bcMathAtn,
     bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,
