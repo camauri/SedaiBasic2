@@ -124,6 +124,7 @@ type
     antArrayAccess,      // Array element access: A(5)
     antArrayDecl,        // DIM array declaration: A(10)
     antDimensions,       // List dimensions: (5,3,2)
+    antDimRange,         // FreeBASIC explicit array bound "lb TO ub" within antDimensions: child0=lb, child1=ub
 
     // === DATA ===
     antData,              // DATA statement

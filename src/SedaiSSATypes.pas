@@ -304,6 +304,7 @@ type
     Dimensions: array of Integer;       // Size for each dimension (0 = runtime-sized)
     DimRegisters: array of Integer;     // SSA register indices for variable dimensions
     DimRegTypes: array of TSSARegisterType; // Register types for variable dimensions
+    LowerBounds: array of Integer;      // FreeBASIC "lb TO ub": constant lower bound per dim (0 if none)
     ArrayIndex: Integer;                 // Index in VM array table
   end;
 
@@ -331,6 +332,7 @@ type
     function GetVariableRegister(const VarName: string; out RegType: TSSARegisterType; out RegIndex: Integer): Boolean;
     function DeclareArray(const ArrName: string; ElementType: TSSARegisterType; const Dims: array of Integer): Integer;
     procedure SetArrayDimRegisters(ArrayIdx: Integer; const DimRegs: array of Integer; const DimRegTypes: array of TSSARegisterType);
+    procedure SetArrayLowerBounds(ArrayIdx: Integer; const LowerBounds: array of Integer);
     function FindArray(const ArrName: string): Integer;
     function GetArray(Index: Integer): TSSAArrayInfo;
     function GetArrayCount: Integer;
@@ -843,6 +845,18 @@ begin
     if i <= High(DimRegTypes) then
       FArrays[ArrayIdx].DimRegTypes[i] := DimRegTypes[i];
   end;
+end;
+
+procedure TSSAProgram.SetArrayLowerBounds(ArrayIdx: Integer; const LowerBounds: array of Integer);
+// FreeBASIC "lb TO ub": record each dimension's constant lower bound (0 = default, no adjustment).
+var
+  i: Integer;
+begin
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) then
+    raise Exception.CreateFmt('Invalid array index: %d', [ArrayIdx]);
+  SetLength(FArrays[ArrayIdx].LowerBounds, Length(LowerBounds));
+  for i := 0 to High(LowerBounds) do
+    FArrays[ArrayIdx].LowerBounds[i] := LowerBounds[i];
 end;
 
 function TSSAProgram.FindArray(const ArrName: string): Integer;

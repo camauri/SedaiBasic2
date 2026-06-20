@@ -2468,6 +2468,21 @@ begin
           end;
         end;
 
+        // FreeBASIC explicit lower bounds ("lb TO ub"): the dimension's allocated size is ub-lb+1 and the
+        // heap is 0-based, so map each source index to a 0-based offset by subtracting its lower bound.
+        for i := 0 to High(Indices) do
+          if (i <= High(ArrInfo.LowerBounds)) and (ArrInfo.LowerBounds[i] <> 0) then
+          begin
+            TempReg := FProgram.AllocRegister(srtInt);
+            TempVal := MakeSSARegister(srtInt, TempReg);
+            EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(ArrInfo.LowerBounds[i]),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            TempReg := FProgram.AllocRegister(srtInt);
+            AddResult := MakeSSARegister(srtInt, TempReg);
+            EmitInstruction(ssaSubInt, AddResult, Indices[i], TempVal, MakeSSAValue(svkNone));
+            Indices[i] := AddResult;
+          end;
+
         // Calculate linear index at compile-time using row-major order formula:
         // LinearIndex = i0 * (d1*d2*...*dn) + i1 * (d2*...*dn) + ... + i(n-1)
         // This eliminates the need for consecutive registers at runtime
@@ -3066,6 +3081,21 @@ begin
     end;
   end;
 
+  // FreeBASIC explicit lower bounds ("lb TO ub"): map each source index to a 0-based offset by
+  // subtracting its dimension's lower bound (the heap is 0-based, size is ub-lb+1).
+  for i := 0 to High(Indices) do
+    if (i <= High(ArrInfo.LowerBounds)) and (ArrInfo.LowerBounds[i] <> 0) then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      TempVal := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(ArrInfo.LowerBounds[i]),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      TempReg := FProgram.AllocRegister(srtInt);
+      AddResult := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaSubInt, AddResult, Indices[i], TempVal, MakeSSAValue(svkNone));
+      Indices[i] := AddResult;
+    end;
+
   // Calculate linear index at compile-time using row-major order formula:
   // LinearIndex = i0 * (d1*d2*...*dn) + i1 * (d2*...*dn) + ... + i(n-1)
   // This eliminates the need for consecutive registers at runtime
@@ -3203,8 +3233,11 @@ procedure TSSAGenerator.ProcessDim(Node: TASTNode);
 var
   ArrName: string;
   ElementType: TSSARegisterType;
-  DimsNode, DimExpr, ArrayDeclNode: TASTNode;
+  DimsNode, DimExpr, DimChild, ArrayDeclNode: TASTNode;
   Dimensions: array of Integer;
+  LowerBounds: array of Integer;  // FB "lb TO ub": constant lower bound per dimension (0 = default)
+  HasLowerBounds: Boolean;
+  LbVal: TSSAValue;
   DimCount, i, j, ArrayIdx: Integer;
   DimValue: TSSAValue;
   DimValues: array of TSSAValue;  // Store dimension values (registers or constants)
@@ -3219,6 +3252,7 @@ var
   RecUDTIdx: Integer;      // M3
   RecHandleVal: TSSAValue; // M3
   RecArrUDTIdx: Integer;   // M3.1: array-of-UDT element type index (-1 if not)
+  ArrElemTypeName: string; // declared "AS <type>" element type for an array (empty if none)
   RecPacked: Int64;        // M3.1: packed slot counts for bcRecordNewArray
   InitAssign: TASTNode;    // M4.4e: synthesized assignment for a "DIM v AS T = expr" initializer
   BlkIdx: Integer;         // M8/FB: innermost open block scope (-1 if none) for block-scoped UDT dtors
@@ -3323,15 +3357,23 @@ begin
       Continue;
     end;
 
-    // Array of UDT (M3.1): "DIM name(dims) AS udt" — child[2] is the element type. Such an
-    // array stores record handles, so its element type is int.
+    // Element type of "DIM name(dims) [AS type]". child[2] (if present) is the AS-type identifier.
+    //   - AS <udt>      → an array of record handles (element type int); element UDT tracked below.
+    //   - AS <builtin>  → use the DECLARED type (STRING/INTEGER/DOUBLE/...), NOT the name suffix —
+    //                     otherwise "DIM a(n) AS STRING" (no $ suffix) was mis-typed as numeric.
+    //   - no AS-type    → infer from the array name suffix ("DIM a$(n)", "DIM a%(n)", ...).
     RecArrUDTIdx := -1;
+    ArrElemTypeName := '';
     if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType = antIdentifier) then
-      RecArrUDTIdx := FindUDT(UpperCase(VarToStr(ArrayDeclNode.GetChild(2).Value)));
+    begin
+      ArrElemTypeName := UpperCase(VarToStr(ArrayDeclNode.GetChild(2).Value));
+      RecArrUDTIdx := FindUDT(ArrElemTypeName);
+    end;
     if RecArrUDTIdx >= 0 then
       ElementType := srtInt
+    else if ArrElemTypeName <> '' then
+      ElementType := TypeNameToBank(ArrElemTypeName, ArrName)
     else
-      // Determine element type from array name suffix
       ElementType := GetVariableType(ArrName);
 
     // Validate dimensions node
@@ -3347,25 +3389,45 @@ begin
 
     SetLength(Dimensions, DimCount);
     SetLength(DimValues, DimCount);
+    SetLength(LowerBounds, DimCount);
+    HasLowerBounds := False;
     TotalElements := 1;
 
     for i := 0 to DimCount - 1 do
     begin
-      DimExpr := DimsNode.GetChild(i);
+      // A dimension is either a bare upper-bound expression (lower bound 0) or a FreeBASIC explicit
+      // bound antDimRange(lb, ub). The lower bound must be a compile-time constant; the upper bound may
+      // be constant or a variable (runtime-sized). Allocated count for the dimension = ub - lb + 1.
+      DimChild := DimsNode.GetChild(i);
+      LowerBounds[i] := 0;
+      if DimChild.NodeType = antDimRange then
+      begin
+        ProcessExpression(DimChild.GetChild(0), LbVal);
+        if LbVal.Kind = svkConstInt then
+          LowerBounds[i] := Integer(LbVal.ConstInt)
+        else if LbVal.Kind = svkConstFloat then
+          LowerBounds[i] := Integer(Trunc(LbVal.ConstFloat))
+        else
+          raise Exception.CreateFmt('Array lower bound must be a constant: %s', [ArrName]);
+        if LowerBounds[i] <> 0 then HasLowerBounds := True;
+        DimExpr := DimChild.GetChild(1);
+      end
+      else
+        DimExpr := DimChild;
       ProcessExpression(DimExpr, DimValue);
 
       // Store dimension value for VM (needed for variable dimensions)
       DimValues[i] := DimValue;
 
-      // BASIC semantics: DIM A(N) allocates N+1 elements [0..N]
-      // Dimensions can be constants or variables - evaluated once at DIM execution
+      // BASIC semantics: DIM A(N) allocates N+1 elements [0..N]; FB "lb TO ub" allocates ub-lb+1 [lb..ub].
+      // Dimensions can be constants or variables - evaluated once at DIM execution.
       if DimValue.Kind = svkConstInt then
       begin
-        Dimensions[i] := Integer(DimValue.ConstInt) + 1;
+        Dimensions[i] := Integer(DimValue.ConstInt) - LowerBounds[i] + 1;
 
         // Safety check for constant dimensions
         if Dimensions[i] <= 0 then
-          raise Exception.CreateFmt('Array dimension must be positive: %s[%d] = %d', [ArrName, i, Dimensions[i]-1]);
+          raise Exception.CreateFmt('Array upper bound must be >= lower bound: %s[%d]', [ArrName, i]);
 
         // Calculate total elements (with overflow check)
         TotalElements := TotalElements * Dimensions[i];
@@ -3374,10 +3436,10 @@ begin
       end
       else if DimValue.Kind = svkConstFloat then
       begin
-        Dimensions[i] := Integer(Trunc(DimValue.ConstFloat)) + 1;
+        Dimensions[i] := Integer(Trunc(DimValue.ConstFloat)) - LowerBounds[i] + 1;
 
         if Dimensions[i] <= 0 then
-          raise Exception.CreateFmt('Array dimension must be positive: %s[%d] = %d', [ArrName, i, Dimensions[i]-1]);
+          raise Exception.CreateFmt('Array upper bound must be >= lower bound: %s[%d]', [ArrName, i]);
 
         TotalElements := TotalElements * Dimensions[i];
         if TotalElements > MAX_ARRAY_ELEMENTS then
@@ -3385,8 +3447,8 @@ begin
       end
       else if DimValue.Kind = svkRegister then
       begin
-        // Variable dimension: DIM A(S%) - VM will read value from register
-        // Use 0 as placeholder - actual size determined at runtime
+        // Variable upper bound: DIM A(S%) or DIM A(lb TO S%) - VM computes size = ub - lb + 1 at runtime.
+        // Use 0 as placeholder - actual size determined at runtime.
         Dimensions[i] := 0;
         // Cannot validate size at compile time
         TotalElements := -1;
@@ -3397,6 +3459,8 @@ begin
 
     // Declare array in SSA program
     ArrayIdx := FProgram.DeclareArray(ArrName, ElementType, Dimensions);
+    if HasLowerBounds then
+      FProgram.SetArrayLowerBounds(ArrayIdx, LowerBounds);
 
     // Store dimension registers (for any variable dimensions, even if mixed with constants)
     SetLength(DimRegs, DimCount);

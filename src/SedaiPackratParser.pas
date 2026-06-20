@@ -3947,16 +3947,32 @@ end;
 
 function TPackratParser.ParseDimensionList: TASTNode;
 var
-  Dimension: TASTNode;
+  Dimension, UpperExpr, RangeNode: TASTNode;
 begin
   Result := TASTNode.Create(antDimensions);
 
   repeat
     Dimension := ParseExpression;
-    if Assigned(Dimension) then
-      Result.AddChild(Dimension)
+    if not Assigned(Dimension) then Break;
+    // FreeBASIC explicit bound "lb TO ub": the first expression is the lower bound. Wrap both in an
+    // antDimRange (child0=lb, child1=ub). A bare expression stays the upper bound (lower bound = 0).
+    if Context.Check(ttLoopControl) and (UpperCase(Context.CurrentToken.Value) = 'TO') then
+    begin
+      Context.Advance;                              // consume TO
+      UpperExpr := ParseExpression;
+      if not Assigned(UpperExpr) then
+      begin
+        HandleError('Expected an upper bound after TO in array dimension', Context.CurrentToken);
+        Dimension.Free;
+        Break;
+      end;
+      RangeNode := TASTNode.Create(antDimRange, Context.CurrentToken);
+      RangeNode.AddChild(Dimension);
+      RangeNode.AddChild(UpperExpr);
+      Result.AddChild(RangeNode);
+    end
     else
-      Break;
+      Result.AddChild(Dimension);
 
     // Check for comma separator
     if Context.Check(ttSeparParam) then

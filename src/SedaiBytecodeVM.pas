@@ -3838,7 +3838,7 @@ end;
 procedure TBytecodeVM.ExecuteArrayOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
-  ArrayIdx, LinearIdx, i, ProdDims: Integer;
+  ArrayIdx, LinearIdx, i, ProdDims, ArrLowerBound: Integer;
   ArrInfo: TSSAArrayInfo;
 begin
   SubOp := Instr.OpCode and $FF;
@@ -3888,9 +3888,12 @@ begin
           begin
             if (i < Length(ArrInfo.DimRegisters)) and (ArrInfo.DimRegisters[i] >= 0) then
             begin
+              // Variable upper bound: size = ub - lb + 1 (lb = the FreeBASIC explicit lower bound, 0 if none).
+              ArrLowerBound := 0;
+              if i <= High(ArrInfo.LowerBounds) then ArrLowerBound := ArrInfo.LowerBounds[i];
               case ArrInfo.DimRegTypes[i] of
-                srtInt: FArrays[ArrayIdx].Dimensions[i] := Ctx.IntRegs[ArrInfo.DimRegisters[i]] + 1;
-                srtFloat: FArrays[ArrayIdx].Dimensions[i] := Trunc(Ctx.FloatRegs[ArrInfo.DimRegisters[i]]) + 1;
+                srtInt: FArrays[ArrayIdx].Dimensions[i] := Ctx.IntRegs[ArrInfo.DimRegisters[i]] - ArrLowerBound + 1;
+                srtFloat: FArrays[ArrayIdx].Dimensions[i] := Trunc(Ctx.FloatRegs[ArrInfo.DimRegisters[i]]) - ArrLowerBound + 1;
               else
                 raise Exception.CreateFmt('Invalid dimension register type for array %s', [ArrInfo.Name]);
               end;

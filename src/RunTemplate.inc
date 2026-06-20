@@ -27,7 +27,7 @@ var
   // Local copies of frequently accessed fields for better register allocation
   IntRegs: PInt64;
   FloatRegs: PDouble;
-  ArrayIdx, LinearIdx: Integer;
+  ArrayIdx, LinearIdx, ArrLowerBound: Integer;
   InputStr, PrintStr: string;
   InputVal: Double;
   i, ProdDims: Integer;
@@ -680,9 +680,12 @@ begin
             begin
               if ArrInfo.Dimensions[i] = 0 then
               begin
+                // Variable upper bound: size = ub - lb + 1 (FreeBASIC explicit lower bound, 0 if none).
+                ArrLowerBound := 0;
+                if i <= High(ArrInfo.LowerBounds) then ArrLowerBound := ArrInfo.LowerBounds[i];
                 case ArrInfo.DimRegTypes[i] of
-                  srtInt: FArrays[ArrayIdx].Dimensions[i] := IntRegs[ArrInfo.DimRegisters[i]] + 1;
-                  srtFloat: FArrays[ArrayIdx].Dimensions[i] := Trunc(FloatRegs[ArrInfo.DimRegisters[i]]) + 1;
+                  srtInt: FArrays[ArrayIdx].Dimensions[i] := IntRegs[ArrInfo.DimRegisters[i]] - ArrLowerBound + 1;
+                  srtFloat: FArrays[ArrayIdx].Dimensions[i] := Trunc(FloatRegs[ArrInfo.DimRegisters[i]]) - ArrLowerBound + 1;
                 end;
               end
               else
