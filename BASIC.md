@@ -1338,11 +1338,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `CBYTE and CUBYTE` | ✗ | Converts numeric expressions to 8-bit values. |
-| `CSHORT and CUSHORT` | ✗ | Converts numeric expressions to 16-bit values. |
-| `CLNG and CULNG` | ✗ | Converts numeric expressions to 32-bit values. |
-| `CINT and CUINT` | ✗ | Converts numeric expressions to 32-bit or 64-bit values. |
-| `CLNGINT and CULNGINT` | ✗ | Converts numeric expressions to 64-bit values. |
+| `CBYTE and CUBYTE` | ✓ | Converts numeric expressions to 8-bit values. Round-to-nearest, ties-to-even (B1.3; range clamping deferred). |
+| `CSHORT and CUSHORT` | ✓ | Converts numeric expressions to 16-bit values (B1.3; range clamping deferred). |
+| `CLNG and CULNG` | ✓ | Converts numeric expressions to 32-bit values (B1.3; range clamping deferred). |
+| `CINT and CUINT` | ✓ | Converts numeric expressions to 32-bit or 64-bit values (B1.3). |
+| `CLNGINT and CULNGINT` | ◐ | `CLNGINT` ✓ (B1.3); `CULNGINT` not yet. |
 | `CSIGN` | ✗ | Converts a numeric expression to a signed-type value. |
 | `CUNSG` | ✗ | Converts a numeric expression to an unsigned-type value. |
 
@@ -1350,7 +1350,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `CSNG and CDBL` | ✗ | Converts a numeric or string expression to floating-point values. |
+| `CSNG and CDBL` | ◐ | Converts a numeric expression to floating-point. `CDBL` ✓; `CSNG` ✓ as Double approximation (single-precision rounding deferred) (B1.3). String operand deferred. |
 
 ##### Conversions to/from string types
 
@@ -1358,8 +1358,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `STR and WSTR` | ✗ | Converts numeric expressions or booleans to their string representation. |
 | `VAL` | ✓ | Converts a numeric string expression to a floating-point value. |
-| `VALINT and VALUINT` | ✗ | Converts numeric string expressions to integer values. |
-| `VALLNG and VALULNG` | ✗ | Converts numeric string expressions to long values. |
+| `VALINT and VALUINT` | ✓ | Converts numeric string expressions to integer values. Parses the leading integer (B1.3; range/sign differences deferred). |
+| `VALLNG and VALULNG` | ◐ | `VALLNG` ✓ (B1.3, leading-integer parse); `VALULNG` not yet. |
 
 ##### Conversion to boolean types
 
@@ -2260,11 +2260,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `BIN` | ✗ | Returns a binary String representation of an integral value. |
+| `BIN` | ✓ | Returns a binary String representation of an integral value. `BIN(n)`, no leading zeros (B1.3). |
 | `WBIN` | ✗ | Returns a binary WString representation of an integral value. |
-| `HEX` | ✗ | Returns a hexadecimal String representation of an integral value. |
+| `HEX` | ✓ | Returns a hexadecimal String representation of an integral value (as `HEX$`). |
 | `WHEX` | ✗ | Returns a hexadecimal WString representation of an integral value. |
-| `OCT` | ✗ | Returns an octal String representation of an integral value. |
+| `OCT` | ✓ | Returns an octal String representation of an integral value. `OCT(n)`, no leading zeros (B1.3). |
 | `WOCT` | ✗ | Returns an octal WString representation of an integral value. |
 | `STR` | ✗ | Returns the String representation of numeric value or boolean. |
 | `WSTR` | ✗ | Returns the WString representation of numeric value. |

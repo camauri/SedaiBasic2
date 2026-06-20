@@ -1890,6 +1890,37 @@ begin
           Result := MakeSSARegister(srtString, DestReg);
           EmitInstruction(ssaStrHex, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
+        else if (FuncName = 'OCT') or (FuncName = 'BIN') then
+        begin
+          // OCT(n)/BIN(n) - octal/binary string of an integer (no leading zeros).
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          else if ArgListNode <> nil then
+            ProcessExpression(ArgListNode, ArgValue)
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          ArgReg := EnsureIntRegister(ArgValue);
+          DestReg := FProgram.AllocRegister(srtString);
+          Result := MakeSSARegister(srtString, DestReg);
+          if FuncName = 'OCT' then
+            EmitInstruction(ssaStrOct, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+          else
+            EmitInstruction(ssaStrBin, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if (FuncName = 'VALINT') or (FuncName = 'VALLNG') or (FuncName = 'VALUINT') then
+        begin
+          // VALINT/VALLNG/VALUINT(s) - parse leading integer from a string (0 if none).
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          else if ArgListNode <> nil then
+            ProcessExpression(ArgListNode, ArgValue)
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          ArgReg := EnsureStringRegister(ArgValue);
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaStrValInt, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
         else if (FuncName = 'INSTRREV') then
         begin
           // INSTRREV(str, sub) -> int position of the last occurrence (Dest=int, two string args).

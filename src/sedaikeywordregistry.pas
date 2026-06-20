@@ -1737,6 +1737,8 @@ begin
  RegisterKeyword(kSTRS,   ttStringFunction, 'Convert number to string',                         kcStringFunctions);
  RegisterKeyword(kTAB,    ttStringFunction, 'Move cursor forward string from the first column', kcStringFunctions);
  RegisterKeyword(kDEC,    ttStringFunction, 'Convert hex string to decimal integer',            kcStringFunctions);
+ RegisterKeyword(kOCT,    ttStringFunction, 'Octal number string from integer',                 kcStringFunctions);
+ RegisterKeyword(kBIN,    ttStringFunction, 'Binary number string from integer',                kcStringFunctions);
  RegisterKeyword(kERRS,   ttStringFunction, 'Return error message for error code',               kcStringFunctions);
 
  // === MEMORY HANDLING (COMMANDS AND FUNCTIONS) ===
@@ -1865,6 +1867,9 @@ begin
  RegisterKeyword(kCULNG,   ttMathFunction, 'Convert to ULong, rounding to nearest',                  kcMathFunctions);
  RegisterKeyword(kCDBL,    ttMathFunction, 'Convert to Double-precision float',                      kcMathFunctions);
  RegisterKeyword(kCSNG,    ttMathFunction, 'Convert to Single-precision float',                      kcMathFunctions);
+ RegisterKeyword(kVALINT,  ttMathFunction, 'Parse leading integer from a string',                    kcMathFunctions);
+ RegisterKeyword(kVALLNG,  ttMathFunction, 'Parse leading 64-bit integer from a string',             kcMathFunctions);
+ RegisterKeyword(kVALUINT, ttMathFunction, 'Parse leading unsigned integer from a string',           kcMathFunctions);
 
  // === RESERVED VARIABLES ===
  RegisterKeyword(kDS,  ttSpecialVariable, 'Get disk status code',          kcReservedVariables);

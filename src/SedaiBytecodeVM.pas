@@ -2168,14 +2168,14 @@ begin
         end;
 
         // String Src1 (source) -> int Dest
-        bcStrLen, bcStrAsc, bcStrDec:
+        bcStrLen, bcStrAsc, bcStrDec, bcStrValInt:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
         end;
 
-        // Int Src1 -> String Dest (CHR$, HEX$, ERR$, SPACE)
-        bcStrChr, bcStrHex, bcStrErr, bcStrSpace:
+        // Int Src1 -> String Dest (CHR$, HEX$, ERR$, SPACE, OCT, BIN)
+        bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin:
         begin
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
@@ -3682,6 +3682,51 @@ procedure TBytecodeVM.RunDebug;
   instruction cache locality.
   ============================================================================ }
 
+// Parse the leading integer of a string (optional sign + digits), stopping at the
+// first non-numeric character - matches FreeBASIC VALINT/VALLNG/VALUINT. Returns 0
+// when no digits are present.
+function ParseLeadingInt64(const S: string): Int64;
+var
+  I, Len: Integer;
+  Neg: Boolean;
+begin
+  Result := 0;
+  Len := Length(S);
+  I := 1;
+  while (I <= Len) and (S[I] = ' ') do Inc(I);  // skip leading whitespace
+  Neg := False;
+  if (I <= Len) and ((S[I] = '+') or (S[I] = '-')) then
+  begin
+    Neg := (S[I] = '-');
+    Inc(I);
+  end;
+  while (I <= Len) and (S[I] >= '0') and (S[I] <= '9') do
+  begin
+    Result := Result * 10 + (Ord(S[I]) - Ord('0'));
+    Inc(I);
+  end;
+  if Neg then Result := -Result;
+end;
+
+// Render an Int64 in an arbitrary base (2..16) as an unsigned bit pattern, no
+// leading zeros - mirrors HEX$ semantics for OCT(n)/BIN(n) (FreeBASIC B1.3).
+function IntToBaseStr(Value: Int64; Base: Integer): string;
+const
+  Digits: array[0..15] of Char = '0123456789ABCDEF';
+var
+  U: QWord;
+begin
+  U := QWord(Value);
+  if U = 0 then
+    Exit('0');
+  Result := '';
+  while U > 0 do
+  begin
+    Result := Digits[U mod QWord(Base)] + Result;
+    U := U div QWord(Base);
+  end;
+end;
+
 procedure TBytecodeVM.ExecuteStringOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
@@ -3784,6 +3829,12 @@ begin
       end;
     11: // bcStrErr - ERR$(n)
       Ctx.StringRegs[Instr.Dest] := SedaiExecutorErrors.GetErrorCodeDescription(Ctx.IntRegs[Instr.Src1]);
+    19: // bcStrOct - OCT(n) - octal string, no leading zeros, full INT64 range
+      Ctx.StringRegs[Instr.Dest] := IntToBaseStr(Ctx.IntRegs[Instr.Src1], 8);
+    20: // bcStrBin - BIN(n) - binary string, no leading zeros, full INT64 range
+      Ctx.StringRegs[Instr.Dest] := IntToBaseStr(Ctx.IntRegs[Instr.Src1], 2);
+    21: // bcStrValInt - VALINT/VALLNG/VALUINT(s) - parse leading integer (0 if none)
+      Ctx.IntRegs[Instr.Dest] := ParseLeadingInt64(Ctx.StringRegs[Instr.Src1]);
   else
     raise Exception.CreateFmt('Unknown string opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

@@ -86,6 +86,10 @@ type
     ssaStrLTrim, ssaStrRTrim, ssaStrTrim, ssaStrUCase, ssaStrLCase,
     ssaStrInstrRev,   // INSTRREV(s, sub) -> int (last occurrence)
     ssaStrSpace,      // SPACE(n) -> string of n spaces
+    // FreeBASIC numeric<->string conversions (B1.3).
+    ssaStrOct,        // OCT(n) -> octal string
+    ssaStrBin,        // BIN(n) -> binary string
+    ssaStrValInt,     // VALINT/VALLNG/VALUINT(s) -> integer
     ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathLog, ssaMathExp,
     ssaMathSqr, ssaMathAbs, ssaMathSgn, ssaMathInt, ssaMathRnd,
     ssaMathLog10, ssaMathLog2, ssaMathLogN,  // Additional log functions

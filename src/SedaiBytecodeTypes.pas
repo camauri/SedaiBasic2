@@ -307,6 +307,10 @@ const
   bcStrLCase        = bcGroupString + 16;  // LCASE(s) - lower case
   bcStrInstrRev     = bcGroupString + 17;  // INSTRREV(s, sub) - last occurrence (Dest=int, Src1/Src2=string)
   bcStrSpace        = bcGroupString + 18;  // SPACE(n) - n spaces (Dest=string, Src1=int count)
+  // FreeBASIC numeric<->string conversions (B1.3).
+  bcStrOct          = bcGroupString + 19;  // OCT(n)  - octal string (Dest=string, Src1=int)
+  bcStrBin          = bcGroupString + 20;  // BIN(n)  - binary string (Dest=string, Src1=int)
+  bcStrValInt       = bcGroupString + 21;  // VALINT/VALLNG/VALUINT(s) - parse integer (Dest=int, Src1=string)
 
   // === GROUP 2: MATH FUNCTIONS (0x02xx) ===
   bcMathSin         = bcGroupMath + 0;
@@ -1291,6 +1295,9 @@ begin
         8: Result := 'StrVal';
         9: Result := 'StrHex';
         10: Result := 'StrInstr';
+        19: Result := 'StrOct';
+        20: Result := 'StrBin';
+        21: Result := 'StrValInt';
       else
         Result := Format('String_%d', [SubOp]);
       end;

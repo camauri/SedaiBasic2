@@ -233,6 +233,11 @@ const
   kCULNG   = 'CULNG';     // round to ULong
   kCDBL    = 'CDBL';      // convert to Double
   kCSNG    = 'CSNG';      // convert to Single
+  kOCT     = 'OCT';       // integer -> octal string
+  kBIN     = 'BIN';       // integer -> binary string
+  kVALINT  = 'VALINT';    // string -> Integer
+  kVALLNG  = 'VALLNG';    // string -> LongInt
+  kVALUINT = 'VALUINT';   // string -> UInteger
 
   // String functions
   kASC     = 'ASC';

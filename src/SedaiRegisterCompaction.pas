@@ -211,6 +211,7 @@ begin
     bcStrAsc,      // ASC(str) returns int ASCII code
     bcStrInstr,    // INSTR(haystack, needle) returns int position
     bcStrInstrRev, // INSTRREV(str, sub) returns int position
+    bcStrValInt,   // VALINT/VALLNG/VALUINT(str) returns int (B1.3)
     // === GROUP 3: Array operations ===
     bcArrayLoadInt,  // Typed array load (int) - Dest is WRITTEN
     // === GROUP 4: I/O operations ===
@@ -321,6 +322,7 @@ begin
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrSpace,  // B1.2: string dest
     bcStrStr,    // STR$(n) - number to string
     bcStrHex,    // HEX$(n) - int to hex string
+    bcStrOct, bcStrBin,  // OCT(n)/BIN(n) - int to octal/binary string (B1.3)
     bcStrErr,    // ERR$(n) - error code to message string
     // === GROUP 3: Array operations ===
     bcArrayLoadString,  // Typed array load (string) - Dest is WRITTEN
@@ -376,7 +378,7 @@ begin
     // Bitwise operations
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot,
     // === GROUP 1: String operations with int param ===
-    bcStrChr, bcStrHex, bcStrErr, bcStrSpace,
+    bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin,
     // === GROUP 5: Memory operations ===
     bcPeek,           // PEEK(address): Src1 = address (int)
     bcPoke,           // POKE address, value: Src1 = address (int)
@@ -581,6 +583,7 @@ begin
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrLen, bcStrAsc,
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string
     bcStrVal,    // VAL(str) - reads string, produces float
+    bcStrValInt, // VALINT/VALLNG/VALUINT(str) - reads string, produces int
     bcStrInstr,  // INSTR(haystack, needle) - haystack is Src1
     bcStrInstrRev,  // INSTRREV(str, sub) - str is Src1
     // === GROUP 2: Math operations ===
