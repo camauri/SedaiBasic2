@@ -228,8 +228,8 @@ begin
       case Instr.OpCode of
         bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcReturn, bcEnd, bcStop,
         bcCallSub, bcReturnSub,
-        // M5.2: spawning/joining a worker is a side-effecting barrier (the worker touches shared state).
-        bcThreadCreate, bcThreadWait,
+        // M5.2/M5.5: spawning/joining/detaching a worker is a side-effecting barrier (the worker touches shared state).
+        bcThreadCreate, bcThreadWait, bcThreadSelf, bcThreadDetach,
         // M5.4: mutex + condition-variable ops are synchronization barriers — don't fuse across them.
         bcMutexCreate, bcMutexLock, bcMutexUnlock, bcMutexDestroy,
         bcCondCreate, bcCondWait, bcCondSignal, bcCondBroadcast, bcCondDestroy:

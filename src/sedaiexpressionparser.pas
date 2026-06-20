@@ -77,6 +77,8 @@ type
     function ParseUserFunction(Token: TLexerToken): TASTNode;
     function ParseProcAddress(Token: TLexerToken): TASTNode;   // @subname → antProcAddress (M5.2)
     function ParseThreadCreate(Token: TLexerToken): TASTNode;  // THREADCREATE(@sub, param) (M5.2)
+    function ParseThreadSelf(Token: TLexerToken): TASTNode;    // THREADSELF() → antThreadSelf (M5.5)
+    function ParseThreadCall(Token: TLexerToken): TASTNode;    // THREADCALL sub(arg) → antThreadCreate (M5.5)
     function ParseMutexCreate(Token: TLexerToken): TASTNode;   // MUTEXCREATE() → antMutexCreate (M5.4)
     function ParseCondCreate(Token: TLexerToken): TASTNode;    // CONDCREATE() → antCondCreate (M5.4)
     function ParseSpecialVariable(Token: TLexerToken): TASTNode;
@@ -121,6 +123,8 @@ function StaticParseUsrFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseUserFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseProcAddress(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadCreate(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseThreadSelf(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseThreadCall(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseMutexCreate(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseCondCreate(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseSpecialVariable(Parser: Pointer; Token: TLexerToken): TObject;
@@ -253,6 +257,16 @@ begin
   Result := TExpressionParser(Parser).ParseCondCreate(Token);
 end;
 
+function StaticParseThreadSelf(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseThreadSelf(Token);
+end;
+
+function StaticParseThreadCall(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseThreadCall(Token);
+end;
+
 function StaticParseSpecialVariable(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseSpecialVariable(Token);
@@ -374,6 +388,9 @@ begin
   // M5.2 threading: @subname (proc address) and THREADCREATE(@sub, param) as value expressions.
   Context.SetParseRule(ttOpAt, MakePrefixRule(@StaticParseProcAddress, precUnary));
   Context.SetParseRule(ttThreadCreate, MakePrefixRule(@StaticParseThreadCreate, precCall));
+  // M5.5: THREADSELF() value + THREADCALL sub(arg) (sugar that lowers to THREADCREATE).
+  Context.SetParseRule(ttThreadSelf, MakePrefixRule(@StaticParseThreadSelf, precCall));
+  Context.SetParseRule(ttThreadCall, MakePrefixRule(@StaticParseThreadCall, precCall));
   // M5.4 mutexes: MUTEXCREATE() is a value expression returning an int handle.
   Context.SetParseRule(ttMutexCreate, MakePrefixRule(@StaticParseMutexCreate, precCall));
   Context.SetParseRule(ttCondCreate, MakePrefixRule(@StaticParseCondCreate, precCall));
@@ -1348,6 +1365,56 @@ begin
     Context.Advance;                              // optional (
     if Context.Check(ttDelimParClose) then Context.Advance;  // )
   end;
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseThreadSelf(Token: TLexerToken): TASTNode;
+begin
+  // THREADSELF [()] — the current thread's handle (0 on the main thread). No arguments.
+  Result := TASTNode.CreateWithValue(antThreadSelf, 'THREADSELF', Token);
+  if Context.Check(ttDelimParOpen) then
+  begin
+    Context.Advance;                              // optional (
+    if Context.Check(ttDelimParClose) then Context.Advance;  // )
+  end;
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseThreadCall(Token: TLexerToken): TASTNode;
+var
+  ProcNode, ArgExpr, Extra: TASTNode;
+begin
+  // THREADCALL subname [(arg [, ...])] — sugar for THREADCREATE(@subname, arg). v1: a single int arg
+  // (extra args parsed and discarded). Lowers to an antThreadCreate node so SSA reuses the spawn path.
+  if not Context.Check(ttIdentifier) then
+  begin
+    HandleError('Expected a SUB name after THREADCALL', Context.CurrentToken);
+    Result := nil;
+    Exit;
+  end;
+  ProcNode := TASTNode.CreateWithValue(antProcAddress, UpperCase(Context.CurrentToken.Value), Token);
+  Context.Advance;                                // consume the sub name
+  Result := TASTNode.CreateWithValue(antThreadCreate, 'THREADCREATE', Token);
+  Result.AddChild(ProcNode);
+  ArgExpr := nil;
+  if Context.Match(ttDelimParOpen) then
+  begin
+    if not Context.Check(ttDelimParClose) then
+    begin
+      ArgExpr := ParseExpression;
+      // v1 supports one int parameter; parse and discard any extra arguments.
+      while Context.Match(ttSeparParam) do
+      begin
+        Extra := ParseExpression;
+        if Assigned(Extra) then Extra.Free;
+      end;
+    end;
+    if Context.Check(ttDelimParClose) then Context.Advance;  // )
+  end;
+  if Assigned(ArgExpr) then
+    Result.AddChild(ArgExpr)
+  else
+    Result.AddChild(TASTNode.CreateWithValue(antLiteral, '0', Token));  // omitted param → 0
   DoNodeCreated(Result);
 end;
 

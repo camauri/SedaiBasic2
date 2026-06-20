@@ -178,6 +178,10 @@ begin
       Line := Format('%4d: %-20s R%d = thread(R%d, R%d)', [Index, 'ThreadCreate', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcThreadWait:
       Line := Format('%4d: %-20s R%d', [Index, 'ThreadWait', Instr.Src1]);
+    bcThreadSelf:
+      Line := Format('%4d: %-20s R%d = self', [Index, 'ThreadSelf', Instr.Dest]);
+    bcThreadDetach:
+      Line := Format('%4d: %-20s R%d', [Index, 'ThreadDetach', Instr.Src1]);
     bcMutexCreate:
       Line := Format('%4d: %-20s R%d = mutex()', [Index, 'MutexCreate', Instr.Dest]);
     bcMutexLock:

@@ -265,6 +265,9 @@ const
   bcLoadProcAddr     = bcGroupCore + 114;
   bcThreadCreate     = bcGroupCore + 115;
   bcThreadWait       = bcGroupCore + 116;
+  // M5.5: ThreadSelf (Dest=int = current thread handle, 0 on main); ThreadDetach (Src1=handle).
+  bcThreadSelf       = bcGroupCore + 126;
+  bcThreadDetach     = bcGroupCore + 127;
   // Mutexes (M5.4, FreeBASIC API), thin wrappers over TRTLCriticalSection. bcMutexCreate writes a
   // fresh mutex handle into an int register (Dest); Lock/Unlock/Destroy take a handle reg (Src1).
   bcMutexCreate      = bcGroupCore + 117;
@@ -1259,6 +1262,8 @@ begin
         123: Result := 'CondSignal';
         124: Result := 'CondBroadcast';
         125: Result := 'CondDestroy';
+        126: Result := 'ThreadSelf';
+        127: Result := 'ThreadDetach';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

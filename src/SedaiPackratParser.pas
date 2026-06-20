@@ -125,6 +125,8 @@ type
     function ParseBaseStatement: TASTNode;
     // THREADWAIT handle : join a worker thread by handle (M5.2 threading).
     function ParseThreadWaitStatement: TASTNode;
+    // THREADDETACH handle : detach a worker thread by handle (M5.5).
+    function ParseThreadDetachStatement: TASTNode;
     // MUTEXLOCK/MUTEXUNLOCK/MUTEXDESTROY handle : mutex ops (M5.4); node type keyed on the token.
     function ParseMutexOpStatement: TASTNode;
     // CONDWAIT cond, mutex : wait on a condition variable (M5.4).
@@ -548,6 +550,7 @@ begin
     ttCallSub: Result := Memoize('CallStatement', @ParseCallStatement);
     ttBaseCall: Result := Memoize('BaseStatement', @ParseBaseStatement);
     ttThreadWait: Result := Memoize('ThreadWaitStatement', @ParseThreadWaitStatement);
+    ttThreadDetach: Result := Memoize('ThreadDetachStatement', @ParseThreadDetachStatement);
     ttMutexLock, ttMutexUnlock, ttMutexDestroy:
       Result := Memoize('MutexOpStatement', @ParseMutexOpStatement);
     ttCondWait: Result := Memoize('CondWaitStatement', @ParseCondWaitStatement);
@@ -1541,6 +1544,27 @@ begin
   if HasParens and Context.Check(ttDelimParClose) then
     Context.Advance;                              // )
   Result := TASTNode.CreateWithValue(antThreadWait, 'THREADWAIT', Token);
+  Result.AddChild(HandleExpr);
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseThreadDetachStatement: TASTNode;
+var
+  Token: TLexerToken;
+  HandleExpr: TASTNode;
+  HasParens: Boolean;
+begin
+  // THREADDETACH handle  (or THREADDETACH(handle)) — detach a worker. child0 = handle expr.
+  Token := Context.CurrentToken;
+  Context.Advance;                                // consume THREADDETACH
+  Result := nil;
+  HasParens := Context.Check(ttDelimParOpen);
+  if HasParens then Context.Advance;              // (
+  HandleExpr := FExpressionParser.ParseExpression;
+  if not Assigned(HandleExpr) then Exit;
+  if HasParens and Context.Check(ttDelimParClose) then
+    Context.Advance;                              // )
+  Result := TASTNode.CreateWithValue(antThreadDetach, 'THREADDETACH', Token);
   Result.AddChild(HandleExpr);
   DoNodeCreated(Result);
 end;

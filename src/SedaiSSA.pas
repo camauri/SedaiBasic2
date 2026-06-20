@@ -837,6 +837,14 @@ begin
       EmitInstruction(ssaThreadCreate, Result, Left, Right, MakeSSAValue(svkNone));
     end;
 
+    antThreadSelf:
+    begin
+      // THREADSELF() → the current thread's handle (int; 0 on the main thread). No operands.
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaThreadSelf, Result, MakeSSAValue(svkNone),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+
     antMutexCreate:
     begin
       // MUTEXCREATE() → a fresh mutex handle (int). No operands.
@@ -10233,12 +10241,13 @@ begin
   end;
 
   case Node.NodeType of
-    antThreadWait:
+    antThreadWait, antThreadDetach:
     begin
-      // THREADWAIT handle — join the worker thread named by the int handle (child0).
+      // THREADWAIT/THREADDETACH handle — join or detach the worker named by the int handle (child0).
       ProcessExpression(Node.GetChild(0), ExprResult);
       ExprResult := EnsureIntRegister(ExprResult);
-      EmitInstruction(ssaThreadWait, MakeSSAValue(svkNone), ExprResult,
+      if Node.NodeType = antThreadDetach then OpCode := ssaThreadDetach else OpCode := ssaThreadWait;
+      EmitInstruction(OpCode, MakeSSAValue(svkNone), ExprResult,
                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
 

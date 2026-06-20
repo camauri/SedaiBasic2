@@ -188,6 +188,8 @@ begin
     bcRecordTypeId,
     // OS threading (M5.2): LoadProcAddr writes an entry PC (int); ThreadCreate writes a thread handle (int).
     bcLoadProcAddr, bcThreadCreate,
+    // M5.5: ThreadSelf writes the current thread handle (int).
+    bcThreadSelf,
     // Mutexes (M5.4): MutexCreate writes a mutex handle (int).
     bcMutexCreate,
     // Condition variables (M5.4): CondCreate writes a cond-var handle (int).
@@ -352,7 +354,7 @@ begin
     bcRecordTypeId,   // OOP (M4.3): Src1 = handle
     // OS threading (M5.2): ThreadCreate Src1 = proc-addr reg; ThreadWait Src1 = handle reg.
     // (bcLoadProcAddr's Src1 is the entry-PC label → Immediate, not a register, so it is excluded.)
-    bcThreadCreate, bcThreadWait,
+    bcThreadCreate, bcThreadWait, bcThreadDetach,
     // Mutexes (M5.4): Lock/Unlock/Destroy Src1 = mutex handle reg.
     bcMutexLock, bcMutexUnlock, bcMutexDestroy,
     // Condition variables (M5.4): Wait/Signal/Broadcast/Destroy Src1 = cond handle reg.

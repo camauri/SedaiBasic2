@@ -170,6 +170,9 @@ type
     ttSharedDecl,             // SHARED (DIM SHARED: module global visible inside SUB/FUNCTION)
     ttThreadCreate,           // THREADCREATE (expression: THREADCREATE(@sub, param) → thread handle)
     ttThreadWait,             // THREADWAIT (statement: join a worker thread by handle)
+    ttThreadCall,             // THREADCALL (expression: THREADCALL sub(arg) → thread handle; sugar for THREADCREATE)
+    ttThreadDetach,           // THREADDETACH (statement: detach a worker — not joinable, cleaned up at program end)
+    ttThreadSelf,             // THREADSELF (expression: → current thread handle, 0 on the main thread)
     ttMutexCreate,            // MUTEXCREATE (expression: → mutex handle)
     ttMutexLock,              // MUTEXLOCK (statement: acquire a mutex by handle)
     ttMutexUnlock,            // MUTEXUNLOCK (statement: release a mutex by handle)
@@ -375,7 +378,7 @@ const
     ttKeyword, ttLoopBlockStart, ttLoopBlockEnd,
     ttBlockBegin, ttBlockEnd, ttProcedureStart, ttProcedureEnd, ttCallSub,
     ttTypeDecl, ttAsType, ttWithBlock, ttExtends, ttParamMode, ttBaseCall, ttSharedDecl,
-    ttThreadWait, ttMutexLock, ttMutexUnlock, ttMutexDestroy,
+    ttThreadWait, ttThreadDetach, ttMutexLock, ttMutexUnlock, ttMutexDestroy,
     ttCondWait, ttCondSignal, ttCondBroadcast, ttCondDestroy,
     ttJumpKeyword, ttDataDeclaration, ttDataAssignment, ttCommentRemark,
     ttBitwiseOperator

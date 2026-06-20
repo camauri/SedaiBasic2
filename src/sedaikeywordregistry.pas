@@ -1596,6 +1596,9 @@ begin
  RegisterKeyword(kSHARED,   ttSharedDecl,     'Shared module global',  kcProcedures);
  RegisterKeyword(kTHREADCREATE, ttThreadCreate, 'Spawn a worker thread', kcProcedures);
  RegisterKeyword(kTHREADWAIT,   ttThreadWait,   'Join a worker thread',  kcProcedures);
+ RegisterKeyword(kTHREADCALL,   ttThreadCall,   'Spawn a worker (call)', kcProcedures);
+ RegisterKeyword(kTHREADDETACH, ttThreadDetach, 'Detach a worker',       kcProcedures);
+ RegisterKeyword(kTHREADSELF,   ttThreadSelf,   'Current thread handle', kcProcedures);
  RegisterKeyword(kMUTEXCREATE,  ttMutexCreate,  'Create a mutex',        kcProcedures);
  RegisterKeyword(kMUTEXLOCK,    ttMutexLock,    'Lock a mutex',          kcProcedures);
  RegisterKeyword(kMUTEXUNLOCK,  ttMutexUnlock,  'Unlock a mutex',        kcProcedures);

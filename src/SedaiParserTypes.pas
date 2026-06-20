@@ -44,6 +44,8 @@ type
     antProcAddress,       // @subname : proc-address expression (value = SUB name) → entry PC
     antThreadCreate,      // THREADCREATE(@sub, param): spawn a worker (expr → int handle); child0=antProcAddress, child1=param
     antThreadWait,        // THREADWAIT handle: join a worker thread (statement); child0 = handle expr
+    antThreadSelf,        // THREADSELF(): current thread handle (expr → int), no children
+    antThreadDetach,      // THREADDETACH handle: detach a worker (statement); child0 = handle expr
     antMutexCreate,       // MUTEXCREATE(): create a mutex (expr → int handle), no children
     antMutexLock,         // MUTEXLOCK handle: acquire a mutex (statement); child0 = handle expr
     antMutexUnlock,       // MUTEXUNLOCK handle: release a mutex (statement); child0 = handle expr
@@ -378,7 +380,7 @@ begin
     antLiteral, antIdentifier, antBinaryOp, antUnaryOp,
     antFunctionCall, antArrayAccess, antParentheses,
     antExpressionList, antParameterList, antArgumentList,
-    antProcAddress, antThreadCreate, antMutexCreate, antCondCreate
+    antProcAddress, antThreadCreate, antMutexCreate, antCondCreate, antThreadSelf
   ];
 end;
 
@@ -395,7 +397,7 @@ begin
     // Sprite commands
     antSprite, antMovspr, antSprcolor, antSprsav, antCollision, antSprdef,
     antSprsave, antSprload, antSprsize, antSprform,
-    antThreadWait, antMutexLock, antMutexUnlock, antMutexDestroy,
+    antThreadWait, antThreadDetach, antMutexLock, antMutexUnlock, antMutexDestroy,
     antCondWait, antCondSignal, antCondBroadcast, antCondDestroy
   ];
 end;

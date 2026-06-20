@@ -236,6 +236,8 @@ begin
     ssaLoadProcAddr: Result := bcLoadProcAddr;  // M5.2: @sub → entry PC
     ssaThreadCreate: Result := bcThreadCreate;
     ssaThreadWait: Result := bcThreadWait;
+    ssaThreadSelf: Result := bcThreadSelf;       // M5.5
+    ssaThreadDetach: Result := bcThreadDetach;
     ssaMutexCreate: Result := bcMutexCreate;    // M5.4: mutex primitives
     ssaMutexLock: Result := bcMutexLock;
     ssaMutexUnlock: Result := bcMutexUnlock;

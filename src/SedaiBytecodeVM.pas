@@ -225,6 +225,7 @@ type
     procedure SetupWorkerContext(WCtx: TExecutionContext);
     function SpawnWorker(EntryPC, Param: Int64): Int64;
     procedure JoinWorker(Handle: Int64);
+    procedure DetachWorker(Handle: Int64);   // M5.5: mark a worker detached (not explicitly joined)
     procedure RunWorker(Spawn: TObject);
     procedure CleanupWorkers;   // join any survivors + free spawn records/contexts (destructor)
     // M5.4 mutexes (FB API): thin wrappers over TRTLCriticalSection, addressed by integer handle.
@@ -334,7 +335,9 @@ type
     EntryPC: Integer;
     Param: Int64;
     ThreadId: TThreadID;
+    Handle: Int64;       // M5.5: this worker's Threadcreate handle (so it can answer THREADSELF)
     Joined: Boolean;
+    Detached: Boolean;   // M5.5: THREADDETACH — won't be explicitly joined (cleaned up at program end)
   end;
 
   // M5.4: a mutex is a heap-allocated critical section, kept by pointer so a held lock survives
@@ -360,6 +363,8 @@ threadvar
   // FCtx); set by WorkerThreadEntry to the worker's own context before it enters the run loop. Read
   // once per Run (RunTemplate.inc) so the hot path stays register-direct — the point of M5.2a.
   GActiveCtx: TExecutionContext;
+  // M5.5: the current thread's Threadcreate handle (THREADSELF reads it). 0 on the main thread.
+  GSelfHandle: Int64;
 
 function WorkerThreadEntry(p: Pointer): PtrInt;
 // RTL thread entry (BeginThread): bind this thread's active context, run the worker SUB, then exit.
@@ -368,6 +373,7 @@ var
 begin
   Spawn := TWorkerSpawn(p);
   GActiveCtx := Spawn.Ctx;
+  GSelfHandle := Spawn.Handle;   // M5.5: THREADSELF inside this worker returns its own handle
   try
     Spawn.VM.RunWorker(Spawn);
   except
@@ -1445,6 +1451,7 @@ begin
   Spawn.EntryPC := EntryPC;
   Spawn.Param := Param;
   Spawn.Joined := False;
+  Spawn.Detached := False;
   EnterCriticalSection(FWorkerLock);
   try
     Idx := Length(FWorkerThreads);
@@ -1455,6 +1462,7 @@ begin
   finally
     LeaveCriticalSection(FWorkerLock);
   end;
+  Spawn.Handle := Result;   // M5.5: so the worker can report its own handle via THREADSELF
   Spawn.ThreadId := BeginThread(@WorkerThreadEntry, Pointer(Spawn));
 end;
 
@@ -1489,8 +1497,8 @@ begin
     if (Handle >= 1) and (Handle <= Length(FWorkerThreads)) then
     begin
       Spawn := TWorkerSpawn(FWorkerThreads[Handle - 1]);
-      if (Spawn = nil) or Spawn.Joined then
-        Spawn := nil           // nothing to wait on
+      if (Spawn = nil) or Spawn.Joined or Spawn.Detached then
+        Spawn := nil           // nothing to wait on (already joined, or detached)
       else
         Spawn.Joined := True;  // claim the join under the lock so only one thread waits
     end;
@@ -1499,6 +1507,24 @@ begin
   end;
   if Spawn <> nil then
     WaitForThreadTerminate(Spawn.ThreadId, 0);  // 0 = wait indefinitely
+end;
+
+procedure TBytecodeVM.DetachWorker(Handle: Int64);
+// bcThreadDetach: mark a worker as not-to-be-explicitly-joined. It runs to completion independently;
+// the VM still waits for it at program end (CleanupWorkers) so its context is never freed under it.
+var
+  Spawn: TWorkerSpawn;
+begin
+  EnterCriticalSection(FWorkerLock);
+  try
+    if (Handle >= 1) and (Handle <= Length(FWorkerThreads)) then
+    begin
+      Spawn := TWorkerSpawn(FWorkerThreads[Handle - 1]);
+      if Spawn <> nil then Spawn.Detached := True;
+    end;
+  finally
+    LeaveCriticalSection(FWorkerLock);
+  end;
 end;
 
 procedure TBytecodeVM.CleanupWorkers;

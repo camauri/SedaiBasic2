@@ -547,6 +547,12 @@ begin
         bcThreadWait:
           // THREADWAIT h: join the worker named by the handle in Src1, then continue.
           begin JoinWorker(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+        bcThreadSelf:
+          // THREADSELF(): the current thread's handle (0 on the main thread).
+          begin Ctx.IntRegs[Instr.Dest] := GSelfHandle; Inc(CurPC); end;
+        bcThreadDetach:
+          // THREADDETACH h: detach the worker named by the handle in Src1.
+          begin DetachWorker(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
         // Mutexes (M5.4, FreeBASIC API).
         bcMutexCreate:
           begin Ctx.IntRegs[Instr.Dest] := CreateMutex; Inc(CurPC); end;
