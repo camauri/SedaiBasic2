@@ -93,6 +93,8 @@ type
     ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathLog, ssaMathExp,
     ssaMathSqr, ssaMathAbs, ssaMathSgn, ssaMathInt, ssaMathRnd,
     ssaMathLog10, ssaMathLog2, ssaMathLogN,  // Additional log functions
+    ssaMathAcos, ssaMathAsin, ssaMathAtan2, ssaMathFix, ssaMathFrac,  // FreeBASIC math
+
     ssaStrDec,  // DEC(hexstring) - convert hex string to decimal
     ssaLabel, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaCall, ssaReturn,
     ssaCallSub, ssaReturnSub,  // SUB/FUNCTION call frame (M2): Dest=label of procedure entry

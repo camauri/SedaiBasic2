@@ -205,6 +205,11 @@ const
   kATN     = 'ATN';
   kATAN    = 'ATAN';      // SedaiBasic
   kCOS     = 'COS';
+  kACOS    = 'ACOS';      // FreeBASIC: arccosine
+  kASIN    = 'ASIN';      // FreeBASIC: arcsine
+  kATAN2   = 'ATAN2';     // FreeBASIC: two-argument arctangent
+  kFIX     = 'FIX';       // FreeBASIC: truncate toward zero
+  kFRAC    = 'FRAC';      // FreeBASIC: fractional part
   kEXP     = 'EXP';
   kFRE     = 'FRE';
   kINT     = 'INT';

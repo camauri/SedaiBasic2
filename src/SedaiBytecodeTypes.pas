@@ -336,6 +336,12 @@ const
   bcMathLog2        = bcGroupMath + 12;  // LOG2(x) - base 2 logarithm
   bcMathLogN        = bcGroupMath + 13;  // LOGN(n, x) - base n logarithm
   bcStrDec          = bcGroupMath + 14;  // DEC(hexstr) - convert hex string to decimal
+  // FreeBASIC math functions (all float Dest/Src1; ATAN2 takes Src1=y, Src2=x).
+  bcMathAcos        = bcGroupMath + 15;  // ACOS(x) - arccosine
+  bcMathAsin        = bcGroupMath + 16;  // ASIN(x) - arcsine
+  bcMathAtan2       = bcGroupMath + 17;  // ATAN2(y, x) - two-argument arctangent
+  bcMathFix         = bcGroupMath + 18;  // FIX(x) - truncate toward zero
+  bcMathFrac        = bcGroupMath + 19;  // FRAC(x) - fractional part
 
   // === GROUP 3: ARRAY OPERATIONS (0x03xx) ===
   bcArrayLoad       = bcGroupArray + 0;   // Generic (deprecated)
@@ -1334,6 +1340,11 @@ begin
         8: Result := 'MathSgn';
         9: Result := 'MathInt';
         10: Result := 'MathRnd';
+        15: Result := 'MathAcos';
+        16: Result := 'MathAsin';
+        17: Result := 'MathAtan2';
+        18: Result := 'MathFix';
+        19: Result := 'MathFrac';
       else
         Result := Format('Math_%d', [SubOp]);
       end;

@@ -285,6 +285,11 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `ABS` | ✓ | Return absolute value |
 | `ATN` | ✓ | Return arctangent of argument |
 | `ATAN` | ✓ | Return arctangent of argument |
+| `ATAN2` | ✓ | Two-argument arctangent `ATAN2(y, x)` (FreeBASIC) |
+| `ACOS` | ✓ | Arccosine (radians), domain [-1,1] (FreeBASIC) |
+| `ASIN` | ✓ | Arcsine (radians), domain [-1,1] (FreeBASIC) |
+| `FIX` | ✓ | Truncate toward zero (FreeBASIC; differs from `INT`/floor for negatives) |
+| `FRAC` | ✓ | Fractional part, keeps sign (FreeBASIC) |
 | `COS` | ✓ | Return cosine of angle of x radians |
 | `EXP` | ✓ | Return value of e raised to the power x |
 | `INT` | ✓ | Convert float number to integer |

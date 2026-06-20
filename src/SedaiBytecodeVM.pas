@@ -2135,7 +2135,8 @@ begin
         bcLoadConstFloat, bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat,
         bcModFloat, bcPowFloat, bcNegFloat,
         bcMathAbs, bcMathSgn, bcMathInt, bcMathSqr, bcMathSin, bcMathCos, bcMathTan,
-        bcMathExp, bcMathLog, bcMathAtn, bcMathRnd:
+        bcMathExp, bcMathLog, bcMathAtn, bcMathRnd,
+        bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
@@ -3970,6 +3971,22 @@ begin
             raise Exception.CreateFmt('?ILLEGAL QUANTITY ERROR: Invalid hex string "%s"', [Ctx.StringRegs[Instr.Src1]]);
         end;
       end;
+    15: // bcMathAcos - ACOS(x), domain [-1, 1]
+      if Abs(Ctx.FloatRegs[Instr.Src1]) <= 1 then
+        Ctx.FloatRegs[Instr.Dest] := ArcCos(Ctx.FloatRegs[Instr.Src1])
+      else
+        raise Exception.Create('?ILLEGAL QUANTITY ERROR: ACOS argument out of [-1,1]');
+    16: // bcMathAsin - ASIN(x), domain [-1, 1]
+      if Abs(Ctx.FloatRegs[Instr.Src1]) <= 1 then
+        Ctx.FloatRegs[Instr.Dest] := ArcSin(Ctx.FloatRegs[Instr.Src1])
+      else
+        raise Exception.Create('?ILLEGAL QUANTITY ERROR: ASIN argument out of [-1,1]');
+    17: // bcMathAtan2 - ATAN2(y, x) - Src1 = y, Src2 = x
+      Ctx.FloatRegs[Instr.Dest] := ArcTan2(Ctx.FloatRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2]);
+    18: // bcMathFix - FIX(x) - truncate toward zero
+      Ctx.FloatRegs[Instr.Dest] := Trunc(Ctx.FloatRegs[Instr.Src1]);
+    19: // bcMathFrac - FRAC(x) - fractional part (keeps sign)
+      Ctx.FloatRegs[Instr.Dest] := Frac(Ctx.FloatRegs[Instr.Src1]);
   else
     raise Exception.CreateFmt('Unknown math opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

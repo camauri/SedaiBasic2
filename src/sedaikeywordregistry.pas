@@ -1842,6 +1842,11 @@ begin
  RegisterKeyword(kATN,   ttMathFunction, 'Return arctangent of argument',                            kcMathFunctions);
  RegisterKeyword(kATAN,  ttMathFunction, 'Return arctangent of argument',                            kcMathFunctions);
  RegisterKeyword(kCOS,   ttMathFunction, 'Return cosine of angle of x radians',                      kcMathFunctions);
+ RegisterKeyword(kACOS,  ttMathFunction, 'Return arccosine (radians) of x in [-1,1]',                kcMathFunctions);
+ RegisterKeyword(kASIN,  ttMathFunction, 'Return arcsine (radians) of x in [-1,1]',                  kcMathFunctions);
+ RegisterKeyword(kATAN2, ttMathFunction, 'Return two-argument arctangent ATAN2(y, x)',               kcMathFunctions);
+ RegisterKeyword(kFIX,   ttMathFunction, 'Truncate toward zero',                                     kcMathFunctions);
+ RegisterKeyword(kFRAC,  ttMathFunction, 'Return the fractional part (keeps sign)',                  kcMathFunctions);
  // DEC is registered as ttStringFunction because it takes a string argument
  RegisterKeyword(kEXP,   ttMathFunction, 'Return value of e raised to the power x',                  kcMathFunctions);
  RegisterKeyword(kINT,   ttMathFunction, 'Convert float number to integer',                          kcMathFunctions);

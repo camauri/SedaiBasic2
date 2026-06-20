@@ -282,6 +282,7 @@ begin
     bcMathSqr, bcMathSin, bcMathCos, bcMathTan, bcMathAtn,
     bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,
     bcMathLog10, bcMathLog2, bcMathLogN,
+    bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,  // FreeBASIC math
     // === GROUP 3: Array operations ===
     bcArrayLoadFloat,  // Typed array load (float) - Dest is WRITTEN
     // === GROUP 4: I/O operations ===
@@ -453,6 +454,7 @@ begin
     bcMathSqr, bcMathSin, bcMathCos, bcMathTan, bcMathAtn,
     bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,
     bcMathLog10, bcMathLog2, bcMathLogN,
+    bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,  // FreeBASIC math
     // === GROUP 1: String operations with float param ===
     bcStrStr,      // STR$(n) - reads float, produces string
     // === GROUP 4: I/O operations ===
@@ -563,8 +565,8 @@ begin
     bcMulAddFloat, bcMulSubFloat, bcMulAddToFloat, bcMulSubToFloat,
     // Fused Square-Sum: Src2 is 'y' or 'x' (square operand)
     bcSquareSumFloat, bcAddSquareFloat, bcMulMulFloat, bcAddSqrtFloat,
-    // LOGN(base, x): Src2 is 'x' (the value)
-    bcMathLogN,
+    // LOGN(base, x): Src2 is 'x' (the value); ATAN2(y, x): Src2 is 'x'
+    bcMathLogN, bcMathAtan2,
     // === GROUP 4: I/O operations ===
     bcPrintUsing,  // PRINT USING - Src2 = value (float)
     // === GROUP 7: Sprite ===

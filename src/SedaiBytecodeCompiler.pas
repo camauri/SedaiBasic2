@@ -200,6 +200,11 @@ begin
     ssaMathLog2: Result := bcMathLog2;
     ssaMathLogN: Result := bcMathLogN;
     ssaMathRnd: Result := bcMathRnd;
+    ssaMathAcos: Result := bcMathAcos;     // FreeBASIC math functions
+    ssaMathAsin: Result := bcMathAsin;
+    ssaMathAtan2: Result := bcMathAtan2;
+    ssaMathFix: Result := bcMathFix;
+    ssaMathFrac: Result := bcMathFrac;
     ssaStrDec: Result := bcStrDec;
     ssaPrint: Result := bcPrint;
     ssaPrintLn: Result := bcPrintLn;

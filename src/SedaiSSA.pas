@@ -2158,6 +2158,21 @@ begin
           end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end
+        else if (FuncName = 'ATAN2') then
+        begin
+          // ATAN2(y, x) - two-argument arctangent; Src1 = y, Src2 = x.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);  // y
+            ProcessExpression(ArgListNode.GetChild(1), Arg2Value); // x
+            ArgReg := EnsureFloatRegister(ArgValue);
+            Arg2Reg := EnsureFloatRegister(Arg2Value);
+            DestReg := FProgram.AllocRegister(srtFloat);
+            Result := MakeSSARegister(srtFloat, DestReg);
+            EmitInstruction(ssaMathAtan2, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
+          end
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+        end
         else if (FuncName = 'CINT') or (FuncName = 'CLNG') or (FuncName = 'CLNGINT') or
                 (FuncName = 'CSHORT') or (FuncName = 'CBYTE') or (FuncName = 'CUBYTE') or
                 (FuncName = 'CUSHORT') or (FuncName = 'CUINT') or (FuncName = 'CULNG') then
@@ -2309,6 +2324,14 @@ begin
             OpCode := ssaMathLog2
           else if (FuncName = 'ATN') or (FuncName = 'ATAN') then
             OpCode := ssaMathAtn
+          else if FuncName = 'ACOS' then
+            OpCode := ssaMathAcos
+          else if FuncName = 'ASIN' then
+            OpCode := ssaMathAsin
+          else if FuncName = 'FIX' then
+            OpCode := ssaMathFix
+          else if FuncName = 'FRAC' then
+            OpCode := ssaMathFrac
           else if FuncName = 'RND' then
             OpCode := ssaMathRnd
           else
