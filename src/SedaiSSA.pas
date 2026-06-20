@@ -64,6 +64,7 @@ type
     Bank: TSSARegisterType;
     Slot: Integer;          // index within that bank's slot array of the instance
     NestedType: string;     // UDT type name if this field is itself a record (else ''); held as an int handle
+    WidthCode: Integer;     // B1.5: narrow width code for a sub-64-bit/SINGLE field (0 = full width)
   end;
   TUDTType = record
     Name: string;
@@ -232,6 +233,7 @@ type
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
                               out Bank: TSSARegisterType; out Slot: Integer;
                               out NestedType: string): Boolean;
+    function UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;  // B1.5: field narrow width
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
     function TypeNameWidthCode(const TypeName: string): Integer;        // B1.5 phase 2: type -> narrow code
@@ -8970,9 +8972,14 @@ begin
 end;
 
 function TSSAGenerator.TypeNameWidthCode(const TypeName: string): Integer;
-// Map a declared type name to a narrowing width code (B1.5 phase 2). 0 = full-width / no narrowing.
-// 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 (Long/ULong are 32-bit in FB); 7 = single precision.
+// Map a declared type name to a narrowing width code for STORE narrowing (B1.5). 0 = no narrowing.
+// 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 (Long/ULong are 32-bit in FB).
 // INTEGER/LONGINT (=64-bit here), UINTEGER/ULONGINT and DOUBLE need no bit narrowing.
+// NOTE: SINGLE is intentionally NOT narrowed on store (returns 0): rounding a SINGLE-typed variable
+// to single precision is faithful for storage but exposes the representation error in PRINT (we lack
+// single-precision display formatting, so 1.65 would show as 1.6499...). True single-precision storage
+// is deferred until print formats single-typed values with single precision. The explicit CSNG()
+// conversion still rounds to single (separate path), as the user asked for it explicitly.
 var
   T: string;
 begin
@@ -8983,7 +8990,6 @@ begin
   else if T = 'USHORT' then Result := 4
   else if T = 'LONG' then Result := 5
   else if T = 'ULONG' then Result := 6
-  else if T = 'SINGLE' then Result := 7
   else Result := 0;
 end;
 
@@ -9122,6 +9128,19 @@ begin
     end;
 end;
 
+function TSSAGenerator.UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;
+// B1.5: the narrow width code of a field (0 = full width / not found).
+var
+  i: Integer;
+  F: string;
+begin
+  Result := 0;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].WidthCode);
+end;
+
 procedure TSSAGenerator.RegisterUDTs(Node: TASTNode);
 // Two passes so a TYPE may reference another TYPE declared later (forward reference).
 begin
@@ -9215,6 +9234,10 @@ begin
       FUDTs[Idx].Fields[n].Name := UpperCase(FieldName);
       FUDTs[Idx].Fields[n].Bank := Bank;
       FUDTs[Idx].Fields[n].NestedType := NestedT;
+      if NestedT = '' then
+        FUDTs[Idx].Fields[n].WidthCode := TypeNameWidthCode(TypeName)  // B1.5: narrow field on store
+      else
+        FUDTs[Idx].Fields[n].WidthCode := 0;
       case Bank of
         srtFloat:  begin FUDTs[Idx].Fields[n].Slot := cFloat; Inc(cFloat); end;
         srtString: begin FUDTs[Idx].Fields[n].Slot := cStr;   Inc(cStr);   end;
@@ -10521,11 +10544,12 @@ begin
   if not UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot, NestedT) then Exit;
 
   ProcessExpression(ExprNode, ExprVal);
+  // B1.5: a field declared with a narrow integer type or SINGLE wraps/rounds the value on store.
   case Bank of
-    srtFloat:  begin ExprVal := EnsureFloatRegister(ExprVal);  Op := ssaRecordStoreFloat; end;
+    srtFloat:  begin ExprVal := EnsureFloatRegister(ExprVal);  ExprVal := ApplyNarrowCode(UDTFieldWidthCode(UDTIdx, VarToStr(MemberNode.Value)), ExprVal); Op := ssaRecordStoreFloat; end;
     srtString: begin ExprVal := EnsureStringRegister(ExprVal); Op := ssaRecordStoreString; end;
   else
-    begin ExprVal := EnsureIntRegister(ExprVal); Op := ssaRecordStoreInt; end;
+    begin ExprVal := EnsureIntRegister(ExprVal); ExprVal := ApplyNarrowCode(UDTFieldWidthCode(UDTIdx, VarToStr(MemberNode.Value)), ExprVal); Op := ssaRecordStoreInt; end;
   end;
   EmitInstruction(Op, MakeSSAValue(svkNone), HandleVal, ExprVal, MakeSSAConstInt(Slot));
 end;
