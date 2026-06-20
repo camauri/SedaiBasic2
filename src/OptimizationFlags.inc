@@ -70,9 +70,15 @@
 // DISABLE_CSE is defined, CSE runs only when DISABLE_GVN is defined. With NEITHER
 // defined (the current state) the gating runs NEITHER, so no SSA redundancy pass
 // runs. GVN itself is correct (inter-block, dominator-scoped) and verified against
-// the regression corpus, but it is left OFF for now pending a rework of how it fits
-// the pipeline (on the current line-per-block CFG it finds little, and it conflicts
-// with the array loop-idiom superinstructions). To toggle:
+// the regression corpus, but it is left OFF: on the current line-per-block CFG it
+// finds little, and the array loop-idiom superinstructions already capture the wins.
+//
+// Re-evaluated with fresh data 2026-06-20 (DISABLE_CSE on -> GVN runs): the produced
+// bytecode was BYTE-IDENTICAL to GVN-off on every benchmark (n-body 485, fannkuch 81,
+// spectral-norm 158, sieve 87, sieve_int 77) and the corpus differential stayed 47/47,
+// 0 OPTDIFF. So GVN is correct but yields ZERO reduction here -- enabling it only adds
+// compile-time work. Left OFF until the CFG/pipeline rework that would make it pay off.
+// To toggle:
 //   - GVN on:  uncomment {$DEFINE DISABLE_CSE} below.
 //   - CSE on:  define DISABLE_GVN instead.
 {.$DEFINE DISABLE_CSE}
