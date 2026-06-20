@@ -54,6 +54,9 @@ begin
   InstrCount := FProgram.GetInstructionCount;
   CurPC := FProgram.EntryPoint;
   FCtx.Running := True;  // Mark VM as running
+  // M5.3: the thread that drives the execution loop is the render owner (only it may touch
+  // the SDL device). Worker contexts (M5.2) defer their graphics ops to it via the draw queue.
+  FRenderOwnerThreadId := GetCurrentThreadID;
 
   // Get direct pointers to register arrays
   IntRegs := @FCtx.IntRegs[0];

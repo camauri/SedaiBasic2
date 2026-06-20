@@ -34,7 +34,7 @@ uses
   Classes, SysUtils, Math, Variants, StrUtils,
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
   SedaiConsoleBehavior, SedaiDebugger, SedaiExecutorErrors,
-  SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext
+  SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
   {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioTypes, SedaiAudioBackend, SedaiSIDEvo{$ENDIF}
   {$IFDEF WEB_MODE}, SedaiWebIO{$ENDIF};
@@ -100,6 +100,15 @@ type
     // future worker thread can run its own context over the shared program/heap (S16.2).
     // The VM owns exactly one context; the single-threaded run uses it — a no-op relocation.
     FCtx: TExecutionContext;
+    // M5.3 (render command queue, S16.3): the rule once OS threads land (M5.2) is that only
+    // the render-owner thread touches the SDL device. Worker threads enqueue graphics/sprite
+    // opcodes here (resolved); the owner drains them at the present cadence. FHasWorkers gates
+    // the whole mechanism: it is False until M5.2, so today every graphics op runs inline on
+    // the owner thread and the queue/guard add no behaviour and no overhead (provable no-op).
+    FDrawQueue: TDrawCommandQueue;
+    FDrainCtx: TExecutionContext;       // scratch context used to replay a drained command
+    FRenderOwnerThreadId: TThreadID;    // the thread allowed to render (set when Run begins)
+    FHasWorkers: Boolean;               // True once a worker context has been spawned (M5.2)
     FProgram: TBytecodeProgram;
     FOutputDevice: IOutputDevice;
     FInputDevice: IInputDevice;
@@ -207,6 +216,11 @@ type
     function GetLastErrorLine: Integer;
     function GetLastErrorCode: Integer;
     function GetLastErrorMessage: string;
+    // M5.3: render command queue. No-ops on the single-threaded path (FHasWorkers = False).
+    function IsRenderOwner: Boolean; inline;
+    procedure EnqueueDeferredOp(Kind: TDrawCommandKind; const Instr: TBytecodeInstruction);
+    procedure DrainDrawQueue;
+    procedure PresentFrame;  // drain deferred draws (if any) then present — the per-frame hook
   public
     constructor Create;
     destructor Destroy; override;
@@ -357,6 +371,11 @@ begin
   inherited Create;
   // M5.1: the per-context execution state must exist before any field below is touched.
   FCtx := TExecutionContext.Create;
+  // M5.3: render command queue + scratch replay context. Dormant until M5.2 sets FHasWorkers.
+  FDrawQueue := TDrawCommandQueue.Create;
+  FDrainCtx := TExecutionContext.Create;
+  FRenderOwnerThreadId := GetCurrentThreadID;
+  FHasWorkers := False;
   FProgram := nil;
   FCtx.PC := 0;
   FCtx.Running := False;
@@ -493,7 +512,72 @@ begin
     FConsoleBehavior.Free;
   FVarMap.Free;
   FCtx.Free;
+  FDrainCtx.Free;
+  FDrawQueue.Free;
   inherited Destroy;
+end;
+
+function TBytecodeVM.IsRenderOwner: Boolean;
+begin
+  Result := GetCurrentThreadID = FRenderOwnerThreadId;
+end;
+
+{ EnqueueDeferredOp — snapshot a graphics/sprite opcode and the resolved register banks it
+  reads, for the render-owner thread to replay later. Only reached from a worker thread
+  (FHasWorkers and not IsRenderOwner); dormant on the single-threaded path. }
+procedure TBytecodeVM.EnqueueDeferredOp(Kind: TDrawCommandKind; const Instr: TBytecodeInstruction);
+var
+  Cmd: TDrawCommand;
+begin
+  Cmd.Kind := Kind;
+  Cmd.Instr := Instr;
+  // Copy the producer's whole register banks so the owner can read any operand the handler
+  // touches without per-opcode marshaling. (M5.2 may narrow this to the touched registers.)
+  Cmd.IntRegs := Copy(FCtx.IntRegs, 0, FCtx.IntRegCount);
+  Cmd.FloatRegs := Copy(FCtx.FloatRegs, 0, FCtx.FloatRegCount);
+  Cmd.StringRegs := Copy(FCtx.StringRegs, 0, FCtx.StringRegCount);
+  FDrawQueue.Enqueue(Cmd);
+end;
+
+{ DrainDrawQueue — replay every queued command on the real device. Runs only on the render-
+  owner thread, at the present cadence. Each command's register snapshot is installed into a
+  scratch context so the existing opcode handlers (which read FCtx.*) replay unchanged. }
+procedure TBytecodeVM.DrainDrawQueue;
+var
+  Items: array of TDrawCommand;
+  n, i: Integer;
+  Saved: TExecutionContext;
+begin
+  if FDrawQueue.IsEmpty then Exit;
+  SetLength(Items, 4096);
+  n := FDrawQueue.DequeueAll(Items);
+  Saved := FCtx;
+  try
+    for i := 0 to n - 1 do
+    begin
+      FDrainCtx.IntRegs := Items[i].IntRegs;
+      FDrainCtx.FloatRegs := Items[i].FloatRegs;
+      FDrainCtx.StringRegs := Items[i].StringRegs;
+      FDrainCtx.IntRegCount := Length(Items[i].IntRegs);
+      FDrainCtx.FloatRegCount := Length(Items[i].FloatRegs);
+      FDrainCtx.StringRegCount := Length(Items[i].StringRegs);
+      FCtx := FDrainCtx;
+      case Items[i].Kind of
+        dckGraphics: ExecuteGraphicsOp(Items[i].Instr);
+        dckSprite:   ExecuteSpriteOp(Items[i].Instr);
+      end;
+    end;
+  finally
+    FCtx := Saved;
+  end;
+end;
+
+{ PresentFrame — the once-per-frame render hook: replay any deferred worker draws, then present.
+  On the single-threaded path FHasWorkers is False, so this is exactly FOutputDevice.Present. }
+procedure TBytecodeVM.PresentFrame;
+begin
+  if FHasWorkers then DrainDrawQueue;
+  if Assigned(FOutputDevice) then FOutputDevice.Present;
 end;
 
 function TBytecodeVM.GetPC: Integer;
@@ -774,7 +858,7 @@ begin
       if Assigned(FInputDevice) then
         FInputDevice.ProcessEvents;
       if Assigned(FOutputDevice) then
-        FOutputDevice.Present;
+        PresentFrame;
     end;
   end;
 end;
@@ -858,7 +942,7 @@ begin
   if Assigned(FInputDevice) then
     FInputDevice.ProcessEvents;
   if Assigned(FOutputDevice) then
-    FOutputDevice.Present;
+    PresentFrame;
 
   // Auto-set master volume if zero (C128: PLAY enables audio automatically)
   AutoVolume := False;
@@ -2130,7 +2214,7 @@ begin
           else
           begin
             if Assigned(FOutputDevice) then
-              FOutputDevice.Present;
+              PresentFrame;
             if Assigned(FInputDevice) then
             begin
               FInputDevice.ProcessEvents;
@@ -2170,7 +2254,7 @@ begin
             if Assigned(FEventPollCallback) then
               FEventPollCallback()
             else begin
-              if Assigned(FOutputDevice) then FOutputDevice.Present;
+              if Assigned(FOutputDevice) then PresentFrame;
               if Assigned(FInputDevice) then begin
                 FInputDevice.ProcessEvents;
                 if FInputDevice.ShouldStop or FInputDevice.ShouldQuit then begin
@@ -2186,7 +2270,7 @@ begin
           if Assigned(FEventPollCallback) then
             FEventPollCallback()
           else if Assigned(FOutputDevice) then
-            FOutputDevice.Present;
+            PresentFrame;
         end;
 
         // Use target-based timing to prevent drift
@@ -2431,7 +2515,7 @@ begin
                 end;
               end
               else if Assigned(FOutputDevice) then
-                FOutputDevice.Present;
+                PresentFrame;
               Sleep(10);  // Prevent busy-wait
             until False;
             // Only read character if we didn't exit due to CTRL+C
@@ -3751,6 +3835,13 @@ var
   SubOp: Word;
   DrawMode: Integer;
 begin
+  // M5.3: off the render-owner thread, defer to the queue instead of touching SDL. Dormant on
+  // the single-threaded path (FHasWorkers = False short-circuits before any thread-id check).
+  if FHasWorkers and not IsRenderOwner then
+  begin
+    EnqueueDeferredOp(dckGraphics, Instr);
+    Exit;
+  end;
   SubOp := Instr.OpCode and $FF;
   case SubOp of
     0: // bcGraphicRGBA
@@ -4063,7 +4154,7 @@ begin
         if Assigned(FInputDevice) then
           FInputDevice.ProcessEvents;
         if Assigned(FOutputDevice) then
-          FOutputDevice.Present;
+          PresentFrame;
 
         // Wait for duration (outside lock to allow callback to run)
         if DurationMs > 0 then
@@ -4212,6 +4303,15 @@ var
   SaveStr: string;
 begin
   { Group 7: Sprite operations (0x07xx) — delegated to ISpriteManager }
+
+  // M5.3: off the render-owner thread, defer to the queue (see ExecuteGraphicsOp). Dormant on
+  // the single-threaded path. NOTE for M5.2: sprite *query* ops (RSPRITE/BUMP/RSPPOS) return a
+  // value into a register and so must run synchronously, not be deferred — to be split out then.
+  if FHasWorkers and not IsRenderOwner then
+  begin
+    EnqueueDeferredOp(dckSprite, Instr);
+    Exit;
+  end;
 
   SubOp := Instr.OpCode and $FF;
 
