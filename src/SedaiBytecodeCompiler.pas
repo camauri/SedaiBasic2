@@ -236,6 +236,10 @@ begin
     ssaLoadProcAddr: Result := bcLoadProcAddr;  // M5.2: @sub → entry PC
     ssaThreadCreate: Result := bcThreadCreate;
     ssaThreadWait: Result := bcThreadWait;
+    ssaMutexCreate: Result := bcMutexCreate;    // M5.4: mutex primitives
+    ssaMutexLock: Result := bcMutexLock;
+    ssaMutexUnlock: Result := bcMutexUnlock;
+    ssaMutexDestroy: Result := bcMutexDestroy;
     ssaRecordLoadInt: Result := bcRecordLoadInt;
     ssaRecordLoadFloat: Result := bcRecordLoadFloat;
     ssaRecordLoadString: Result := bcRecordLoadString;

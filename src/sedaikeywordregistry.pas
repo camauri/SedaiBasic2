@@ -1596,6 +1596,10 @@ begin
  RegisterKeyword(kSHARED,   ttSharedDecl,     'Shared module global',  kcProcedures);
  RegisterKeyword(kTHREADCREATE, ttThreadCreate, 'Spawn a worker thread', kcProcedures);
  RegisterKeyword(kTHREADWAIT,   ttThreadWait,   'Join a worker thread',  kcProcedures);
+ RegisterKeyword(kMUTEXCREATE,  ttMutexCreate,  'Create a mutex',        kcProcedures);
+ RegisterKeyword(kMUTEXLOCK,    ttMutexLock,    'Lock a mutex',          kcProcedures);
+ RegisterKeyword(kMUTEXUNLOCK,  ttMutexUnlock,  'Unlock a mutex',        kcProcedures);
+ RegisterKeyword(kMUTEXDESTROY, ttMutexDestroy, 'Destroy a mutex',       kcProcedures);
 
  // === FLOW CONTROL - JUMP RELATED STATEMENTS ===
  RegisterKeyword(kEXIT,   ttJumpReturn,      'Exit statement',   kcJumpFlowControl);

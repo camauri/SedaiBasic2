@@ -275,6 +275,8 @@ begin
     // OS threading (M5.2): spawning/joining and taking a proc address all have side effects
     // (a worker reads/writes shared globals); ssaLoadProcAddr also anchors the proc liveness edge.
     ssaLoadProcAddr, ssaThreadCreate, ssaThreadWait,
+    // Mutexes (M5.4): create/lock/unlock/destroy all have synchronization side effects.
+    ssaMutexCreate, ssaMutexLock, ssaMutexUnlock, ssaMutexDestroy,
     // Transfer-register moves carry args/result across the call; never elide them.
     ssaXferStoreInt, ssaXferStoreFloat, ssaXferStoreString,
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString,

@@ -108,6 +108,11 @@ type
     // so a stale handle is harmless); contexts/spawn records are freed in the VM destructor.
     FWorkerThreads: array of TObject;
     FWorkerLock: TRTLCriticalSection;
+    // M5.4: mutex table. Each entry is a heap-allocated TRTLCriticalSection (pointer kept stable so a
+    // held lock survives table growth); a Mutexcreate handle is (index + 1), 0 = invalid, nil = destroyed.
+    // FMutexTableLock guards only the table (lookup/append), never the user mutex itself.
+    FMutexes: array of Pointer;
+    FMutexTableLock: TRTLCriticalSection;
     FProgram: TBytecodeProgram;
     FOutputDevice: IOutputDevice;
     FInputDevice: IInputDevice;
@@ -209,6 +214,12 @@ type
     procedure JoinWorker(Handle: Int64);
     procedure RunWorker(Spawn: TObject);
     procedure CleanupWorkers;   // join any survivors + free spawn records/contexts (destructor)
+    // M5.4 mutexes (FB API): thin wrappers over TRTLCriticalSection, addressed by integer handle.
+    function CreateMutex: Int64;
+    procedure LockMutex(Handle: Int64);
+    procedure UnlockMutex(Handle: Int64);
+    procedure DestroyMutex(Handle: Int64);
+    procedure CleanupMutexes;   // free any surviving mutexes (destructor)
     function AllocRecord(Ctx: TExecutionContext; IntC, FloatC, StrC, TypeId: Integer): Integer;  // M3: new record instance -> handle
     procedure RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
     procedure CheckFloatValid(Ctx: TExecutionContext; RegIndex: Integer; const OpName: string);
@@ -300,6 +311,10 @@ type
     ThreadId: TThreadID;
     Joined: Boolean;
   end;
+
+  // M5.4: a mutex is a heap-allocated critical section, kept by pointer so a held lock survives
+  // table growth (the dynamic array stores these pointers; the records themselves never move).
+  PMutex = ^TRTLCriticalSection;
 
 threadvar
   // M5.2: the execution context the current thread runs. nil on the main thread (which uses the VM's
@@ -421,6 +436,8 @@ begin
   FDrainCtx.StartPC := -1;
   SetLength(FWorkerThreads, 0);
   InitCriticalSection(FWorkerLock);
+  SetLength(FMutexes, 0);
+  InitCriticalSection(FMutexTableLock);
   FProgram := nil;
   FCtx.PC := 0;
   FCtx.Running := False;
@@ -559,6 +576,9 @@ begin
   // M5.2: join any worker still running, then free its spawn record + context.
   CleanupWorkers;
   DoneCriticalSection(FWorkerLock);
+  // M5.4: free any mutexes the program left undestroyed.
+  CleanupMutexes;
+  DoneCriticalSection(FMutexTableLock);
   FCtx.Free;
   FDrainCtx.Free;
   FDrawQueue.Free;
@@ -1397,6 +1417,90 @@ begin
     Spawn.Free;
   end;
   SetLength(FWorkerThreads, 0);
+end;
+
+function TBytecodeVM.CreateMutex: Int64;
+// bcMutexCreate: allocate a fresh critical section and register it; return its handle (index + 1).
+var
+  M: PMutex;
+  Idx: Integer;
+begin
+  New(M);
+  InitCriticalSection(M^);
+  EnterCriticalSection(FMutexTableLock);
+  try
+    Idx := Length(FMutexes);
+    SetLength(FMutexes, Idx + 1);
+    FMutexes[Idx] := M;
+    Result := Idx + 1;
+  finally
+    LeaveCriticalSection(FMutexTableLock);
+  end;
+end;
+
+procedure TBytecodeVM.LockMutex(Handle: Int64);
+// bcMutexLock: look the mutex up under the table lock, then block on the mutex itself (outside the
+// table lock, so locking one mutex never serialises others).
+var
+  M: PMutex;
+begin
+  M := nil;
+  EnterCriticalSection(FMutexTableLock);
+  try
+    if (Handle >= 1) and (Handle <= Length(FMutexes)) then M := PMutex(FMutexes[Handle - 1]);
+  finally
+    LeaveCriticalSection(FMutexTableLock);
+  end;
+  if M <> nil then EnterCriticalSection(M^);
+end;
+
+procedure TBytecodeVM.UnlockMutex(Handle: Int64);
+// bcMutexUnlock: release the mutex (invalid/destroyed handles are no-ops).
+var
+  M: PMutex;
+begin
+  M := nil;
+  EnterCriticalSection(FMutexTableLock);
+  try
+    if (Handle >= 1) and (Handle <= Length(FMutexes)) then M := PMutex(FMutexes[Handle - 1]);
+  finally
+    LeaveCriticalSection(FMutexTableLock);
+  end;
+  if M <> nil then LeaveCriticalSection(M^);
+end;
+
+procedure TBytecodeVM.DestroyMutex(Handle: Int64);
+// bcMutexDestroy: detach the mutex from the table (handle stays invalid) and free it. The caller
+// must not hold or use it afterward (FB contract).
+var
+  M: PMutex;
+begin
+  M := nil;
+  EnterCriticalSection(FMutexTableLock);
+  try
+    if (Handle >= 1) and (Handle <= Length(FMutexes)) then
+    begin
+      M := PMutex(FMutexes[Handle - 1]);
+      FMutexes[Handle - 1] := nil;
+    end;
+  finally
+    LeaveCriticalSection(FMutexTableLock);
+  end;
+  if M <> nil then begin DoneCriticalSection(M^); Dispose(M); end;
+end;
+
+procedure TBytecodeVM.CleanupMutexes;
+// Destructor helper: free any mutex the program left undestroyed.
+var
+  i: Integer;
+  M: PMutex;
+begin
+  for i := 0 to Length(FMutexes) - 1 do
+  begin
+    M := PMutex(FMutexes[i]);
+    if M <> nil then begin DoneCriticalSection(M^); Dispose(M); end;
+  end;
+  SetLength(FMutexes, 0);
 end;
 
 procedure TBytecodeVM.EnsureRegisterCapacity(Ctx: TExecutionContext; RegType: TSSARegisterType; MinIndex: Integer);

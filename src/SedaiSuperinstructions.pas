@@ -229,7 +229,9 @@ begin
         bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcReturn, bcEnd, bcStop,
         bcCallSub, bcReturnSub,
         // M5.2: spawning/joining a worker is a side-effecting barrier (the worker touches shared state).
-        bcThreadCreate, bcThreadWait:
+        bcThreadCreate, bcThreadWait,
+        // M5.4: mutex ops are synchronization barriers — don't fuse register work across them.
+        bcMutexCreate, bcMutexLock, bcMutexUnlock, bcMutexDestroy:
           IsControlFlow := True;
       end;
     end

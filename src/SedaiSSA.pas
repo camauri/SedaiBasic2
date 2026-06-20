@@ -837,6 +837,14 @@ begin
       EmitInstruction(ssaThreadCreate, Result, Left, Right, MakeSSAValue(svkNone));
     end;
 
+    antMutexCreate:
+    begin
+      // MUTEXCREATE() → a fresh mutex handle (int). No operands.
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMutexCreate, Result, MakeSSAValue(svkNone),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+
     antLiteral:
     begin
       if VarIsNumeric(Node.Value) then
@@ -10187,6 +10195,7 @@ var
   ExitKind: string;       // M2: EXIT/RETURN kind
   IsExitStmt: Boolean;    // M2
   RetVal: TSSAValue;      // M2: RETURN expr / FUNCTION result
+  OpCode: TSSAOpCode;     // M5.4: selected mutex op
 begin
   if Node = nil then Exit;
 
@@ -10222,6 +10231,21 @@ begin
       ProcessExpression(Node.GetChild(0), ExprResult);
       ExprResult := EnsureIntRegister(ExprResult);
       EmitInstruction(ssaThreadWait, MakeSSAValue(svkNone), ExprResult,
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+
+    antMutexLock, antMutexUnlock, antMutexDestroy:
+    begin
+      // MUTEXLOCK/UNLOCK/DESTROY handle — operate on the mutex named by the int handle (child0).
+      ProcessExpression(Node.GetChild(0), ExprResult);
+      ExprResult := EnsureIntRegister(ExprResult);
+      case Node.NodeType of
+        antMutexUnlock:  OpCode := ssaMutexUnlock;
+        antMutexDestroy: OpCode := ssaMutexDestroy;
+      else
+        OpCode := ssaMutexLock;
+      end;
+      EmitInstruction(OpCode, MakeSSAValue(svkNone), ExprResult,
                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
 

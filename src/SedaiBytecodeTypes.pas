@@ -265,6 +265,12 @@ const
   bcLoadProcAddr     = bcGroupCore + 114;
   bcThreadCreate     = bcGroupCore + 115;
   bcThreadWait       = bcGroupCore + 116;
+  // Mutexes (M5.4, FreeBASIC API), thin wrappers over TRTLCriticalSection. bcMutexCreate writes a
+  // fresh mutex handle into an int register (Dest); Lock/Unlock/Destroy take a handle reg (Src1).
+  bcMutexCreate      = bcGroupCore + 117;
+  bcMutexLock        = bcGroupCore + 118;
+  bcMutexUnlock      = bcGroupCore + 119;
+  bcMutexDestroy     = bcGroupCore + 120;
 
   // === GROUP 1: STRING OPERATIONS (0x01xx) ===
   bcStrConcat       = bcGroupString + 0;
@@ -1236,6 +1242,10 @@ begin
         114: Result := 'LoadProcAddr';
         115: Result := 'ThreadCreate';
         116: Result := 'ThreadWait';
+        117: Result := 'MutexCreate';
+        118: Result := 'MutexLock';
+        119: Result := 'MutexUnlock';
+        120: Result := 'MutexDestroy';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

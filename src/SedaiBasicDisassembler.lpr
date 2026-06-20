@@ -181,6 +181,9 @@ begin
     bcLoadProcAddr: begin Result := Format('R%d = @%d', [Instr.Dest, Instr.Immediate]); Exit; end;
     bcThreadCreate: begin Result := Format('R%d = thread(R%d, R%d)', [Instr.Dest, Instr.Src1, Instr.Src2]); Exit; end;
     bcThreadWait:   begin Result := Format('R%d', [Instr.Src1]); Exit; end;
+    bcMutexCreate:  begin Result := Format('R%d = mutex()', [Instr.Dest]); Exit; end;
+    bcMutexLock, bcMutexUnlock, bcMutexDestroy:
+                    begin Result := Format('R%d', [Instr.Src1]); Exit; end;
   end;
 
   // Handle superinstructions (opcodes 100+) separately

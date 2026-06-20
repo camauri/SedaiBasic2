@@ -77,6 +77,7 @@ type
     function ParseUserFunction(Token: TLexerToken): TASTNode;
     function ParseProcAddress(Token: TLexerToken): TASTNode;   // @subname → antProcAddress (M5.2)
     function ParseThreadCreate(Token: TLexerToken): TASTNode;  // THREADCREATE(@sub, param) (M5.2)
+    function ParseMutexCreate(Token: TLexerToken): TASTNode;   // MUTEXCREATE() → antMutexCreate (M5.4)
     function ParseSpecialVariable(Token: TLexerToken): TASTNode;
     {$IFDEF WEB_MODE}
     function ParseWebFunction(Token: TLexerToken): TASTNode;
@@ -119,6 +120,7 @@ function StaticParseUsrFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseUserFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseProcAddress(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadCreate(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseMutexCreate(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseSpecialVariable(Parser: Pointer; Token: TLexerToken): TObject;
 {$IFDEF WEB_MODE}
 function StaticParseWebFunction(Parser: Pointer; Token: TLexerToken): TObject;
@@ -237,6 +239,11 @@ end;
 function StaticParseThreadCreate(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseThreadCreate(Token);
+end;
+
+function StaticParseMutexCreate(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseMutexCreate(Token);
 end;
 
 function StaticParseSpecialVariable(Parser: Pointer; Token: TLexerToken): TObject;
@@ -360,6 +367,8 @@ begin
   // M5.2 threading: @subname (proc address) and THREADCREATE(@sub, param) as value expressions.
   Context.SetParseRule(ttOpAt, MakePrefixRule(@StaticParseProcAddress, precUnary));
   Context.SetParseRule(ttThreadCreate, MakePrefixRule(@StaticParseThreadCreate, precCall));
+  // M5.4 mutexes: MUTEXCREATE() is a value expression returning an int handle.
+  Context.SetParseRule(ttMutexCreate, MakePrefixRule(@StaticParseMutexCreate, precCall));
   Context.SetParseRule(ttSpecialVariable, MakePrefixRule(@StaticParseSpecialVariable, precPrimary));
 
   {$IFDEF WEB_MODE}
@@ -1318,6 +1327,18 @@ begin
   begin
     HandleError('Expected ")" after THREADCREATE arguments', Context.CurrentToken);
     Result.Free; Result := nil; Exit;
+  end;
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseMutexCreate(Token: TLexerToken): TASTNode;
+begin
+  // MUTEXCREATE [()] — create a mutex; evaluates to an int handle. No arguments.
+  Result := TASTNode.CreateWithValue(antMutexCreate, 'MUTEXCREATE', Token);
+  if Context.Check(ttDelimParOpen) then
+  begin
+    Context.Advance;                              // optional (
+    if Context.Check(ttDelimParClose) then Context.Advance;  // )
   end;
   DoNodeCreated(Result);
 end;

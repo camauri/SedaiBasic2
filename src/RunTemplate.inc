@@ -547,6 +547,15 @@ begin
         bcThreadWait:
           // THREADWAIT h: join the worker named by the handle in Src1, then continue.
           begin JoinWorker(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+        // Mutexes (M5.4, FreeBASIC API).
+        bcMutexCreate:
+          begin Ctx.IntRegs[Instr.Dest] := CreateMutex; Inc(CurPC); end;
+        bcMutexLock:
+          begin LockMutex(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+        bcMutexUnlock:
+          begin UnlockMutex(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+        bcMutexDestroy:
+          begin DestroyMutex(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
         // Block-scoped record reclamation (M8): mark at a loop-body entry, reclaim at its exit.
         bcRecMarkPush:
           begin

@@ -44,6 +44,10 @@ type
     antProcAddress,       // @subname : proc-address expression (value = SUB name) → entry PC
     antThreadCreate,      // THREADCREATE(@sub, param): spawn a worker (expr → int handle); child0=antProcAddress, child1=param
     antThreadWait,        // THREADWAIT handle: join a worker thread (statement); child0 = handle expr
+    antMutexCreate,       // MUTEXCREATE(): create a mutex (expr → int handle), no children
+    antMutexLock,         // MUTEXLOCK handle: acquire a mutex (statement); child0 = handle expr
+    antMutexUnlock,       // MUTEXUNLOCK handle: release a mutex (statement); child0 = handle expr
+    antMutexDestroy,      // MUTEXDESTROY handle: free a mutex (statement); child0 = handle expr
     antTypeDecl,          // TYPE name ... END TYPE (UDT/record): value=name, children=fields (antIdentifier, value=field name, with a type tag)
     antMemberAccess,      // record.field : child0 = object expr, value = field name
     antSpecialVariable,   // Special variables (TI, TI$, DT$, etc.)
@@ -369,7 +373,7 @@ begin
     antLiteral, antIdentifier, antBinaryOp, antUnaryOp,
     antFunctionCall, antArrayAccess, antParentheses,
     antExpressionList, antParameterList, antArgumentList,
-    antProcAddress, antThreadCreate
+    antProcAddress, antThreadCreate, antMutexCreate
   ];
 end;
 
@@ -386,7 +390,7 @@ begin
     // Sprite commands
     antSprite, antMovspr, antSprcolor, antSprsav, antCollision, antSprdef,
     antSprsave, antSprload, antSprsize, antSprform,
-    antThreadWait
+    antThreadWait, antMutexLock, antMutexUnlock, antMutexDestroy
   ];
 end;
 

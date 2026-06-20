@@ -100,6 +100,8 @@ type
     // OS threading (M5.2, FreeBASIC API): @sub → entry PC (Dest=int reg, Src1=svkLabel PROC_name);
     // THREADCREATE (Dest=int handle, Src1=procAddr reg, Src2=param reg); THREADWAIT (Src1=handle reg).
     ssaLoadProcAddr, ssaThreadCreate, ssaThreadWait,
+    // Mutexes (M5.4, FB API): MutexCreate (Dest=int handle, no operands); Lock/Unlock/Destroy (Src1=handle reg).
+    ssaMutexCreate, ssaMutexLock, ssaMutexUnlock, ssaMutexDestroy,
     ssaRecMarkPush, ssaRecMarkPop,   // M8: block-scoped record reclamation (loop-body DIMs)
 
     ssaArrayLoad, ssaArrayStore, ssaArrayDim,

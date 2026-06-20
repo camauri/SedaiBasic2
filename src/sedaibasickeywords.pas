@@ -74,6 +74,10 @@ const
   kSHARED  = 'SHARED';   // DIM SHARED x: module-level variable visible (read/write) inside SUB/FUNCTION (M6)
   kTHREADCREATE = 'THREADCREATE'; // h = THREADCREATE(@sub, param): spawn an OS worker thread (M5.2, FB API)
   kTHREADWAIT   = 'THREADWAIT';   // THREADWAIT h: join a worker thread by handle (M5.2, FB API)
+  kMUTEXCREATE  = 'MUTEXCREATE';  // m = MUTEXCREATE(): create a mutex (M5.4, FB API)
+  kMUTEXLOCK    = 'MUTEXLOCK';    // MUTEXLOCK m: acquire a mutex (M5.4, FB API)
+  kMUTEXUNLOCK  = 'MUTEXUNLOCK';  // MUTEXUNLOCK m: release a mutex (M5.4, FB API)
+  kMUTEXDESTROY = 'MUTEXDESTROY'; // MUTEXDESTROY m: free a mutex (M5.4, FB API)
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';

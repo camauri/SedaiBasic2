@@ -188,6 +188,8 @@ begin
     bcRecordTypeId,
     // OS threading (M5.2): LoadProcAddr writes an entry PC (int); ThreadCreate writes a thread handle (int).
     bcLoadProcAddr, bcThreadCreate,
+    // Mutexes (M5.4): MutexCreate writes a mutex handle (int).
+    bcMutexCreate,
     // === GROUP 0: Core VM operations ===
     // Integer operations
     bcLoadConstInt, bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -349,6 +351,8 @@ begin
     // OS threading (M5.2): ThreadCreate Src1 = proc-addr reg; ThreadWait Src1 = handle reg.
     // (bcLoadProcAddr's Src1 is the entry-PC label → Immediate, not a register, so it is excluded.)
     bcThreadCreate, bcThreadWait,
+    // Mutexes (M5.4): Lock/Unlock/Destroy Src1 = mutex handle reg.
+    bcMutexLock, bcMutexUnlock, bcMutexDestroy,
 
     // === GROUP 0: Core VM operations ===
     // Int arithmetic

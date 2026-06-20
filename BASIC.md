@@ -2310,10 +2310,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `MUTEXCREATE` | ✗ | Creates a mutex. |
-| `MUTEXLOCK` | ✗ | Acquires a lock on a mutex. |
-| `MUTEXUNLOCK` | ✗ | Releases a lock on a mutex. |
-| `MUTEXDESTROY` | ✗ | Destroys a mutex that is no longer needed. |
+| `MUTEXCREATE` | ✓ | Creates a mutex. `m = MUTEXCREATE()` (M5.4; wraps TRTLCriticalSection). |
+| `MUTEXLOCK` | ✓ | Acquires a lock on a mutex. `MUTEXLOCK m` (M5.4). |
+| `MUTEXUNLOCK` | ✓ | Releases a lock on a mutex. `MUTEXUNLOCK m` (M5.4). |
+| `MUTEXDESTROY` | ✓ | Destroys a mutex that is no longer needed. `MUTEXDESTROY m` (M5.4). |
 
 #### Conditional Variables
 

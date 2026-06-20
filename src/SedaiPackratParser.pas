@@ -125,6 +125,8 @@ type
     function ParseBaseStatement: TASTNode;
     // THREADWAIT handle : join a worker thread by handle (M5.2 threading).
     function ParseThreadWaitStatement: TASTNode;
+    // MUTEXLOCK/MUTEXUNLOCK/MUTEXDESTROY handle : mutex ops (M5.4); node type keyed on the token.
+    function ParseMutexOpStatement: TASTNode;
     // SHARED used as a standalone statement (not as the DIM SHARED modifier): not a -lang fb feature;
     // report a clean error pointing to DIM SHARED at module level, then recover.
     function ParseSharedError: TASTNode;
@@ -542,6 +544,8 @@ begin
     ttCallSub: Result := Memoize('CallStatement', @ParseCallStatement);
     ttBaseCall: Result := Memoize('BaseStatement', @ParseBaseStatement);
     ttThreadWait: Result := Memoize('ThreadWaitStatement', @ParseThreadWaitStatement);
+    ttMutexLock, ttMutexUnlock, ttMutexDestroy:
+      Result := Memoize('MutexOpStatement', @ParseMutexOpStatement);
     ttSharedDecl: Result := ParseSharedError;   // SHARED is only the DIM SHARED modifier, not a statement
     ttTypeDecl: Result := Memoize('TypeDecl', @ParseTypeDecl);
     ttWithBlock: Result := ParseWith;
@@ -1530,6 +1534,36 @@ begin
   if HasParens and Context.Check(ttDelimParClose) then
     Context.Advance;                              // )
   Result := TASTNode.CreateWithValue(antThreadWait, 'THREADWAIT', Token);
+  Result.AddChild(HandleExpr);
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseMutexOpStatement: TASTNode;
+var
+  Token: TLexerToken;
+  HandleExpr: TASTNode;
+  HasParens: Boolean;
+  NodeType: TASTNodeType;
+  Name: string;
+begin
+  // MUTEXLOCK / MUTEXUNLOCK / MUTEXDESTROY handle  (parens optional). Lowers to the matching
+  // antMutex* node with the handle expression as child0.
+  Token := Context.CurrentToken;
+  case Token.TokenType of
+    ttMutexUnlock:  begin NodeType := antMutexUnlock;  Name := 'MUTEXUNLOCK';  end;
+    ttMutexDestroy: begin NodeType := antMutexDestroy; Name := 'MUTEXDESTROY'; end;
+  else
+    begin NodeType := antMutexLock; Name := 'MUTEXLOCK'; end;
+  end;
+  Context.Advance;                                // consume the MUTEX* keyword
+  Result := nil;
+  HasParens := Context.Check(ttDelimParOpen);
+  if HasParens then Context.Advance;              // (
+  HandleExpr := FExpressionParser.ParseExpression;
+  if not Assigned(HandleExpr) then Exit;          // malformed
+  if HasParens and Context.Check(ttDelimParClose) then
+    Context.Advance;                              // )
+  Result := TASTNode.CreateWithValue(NodeType, Name, Token);
   Result.AddChild(HandleExpr);
   DoNodeCreated(Result);
 end;
