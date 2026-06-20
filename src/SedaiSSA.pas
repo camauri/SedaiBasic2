@@ -10776,7 +10776,7 @@ procedure TSSAGenerator.LowerDeferredProcedures;
 // the module END is emitted so procedure blocks sit beyond it (never reached by fall-through;
 // only via ssaCallSub). Each body ends with ssaReturnSub.
 var
-  i, j, Slot, PUDT, OwnerUDT: Integer;
+  i, j, Slot, PUDT, OwnerUDT, WIdx: Integer;
   Proc, NameNode, ParamList, ParamNodeJ, BaseCallNode: TASTNode;
   Name, LabelName, ParentType: string;
   RT: TSSARegisterType;
@@ -10829,6 +10829,15 @@ begin
         ParamReg := GetOrAllocateVariable(VarToStr(ParamNodeJ.Value));
         Slot := ParamBankAndSlot(ParamList, j, RT);
         EmitXferLoad(RT, Slot, ParamReg);
+        // B1.5: a parameter declared with a narrow integer type (child 0 = AS-type identifier) wraps
+        // the incoming argument to that width, in place. Only when it lands in the int bank.
+        if (RT = srtInt) and (ParamNodeJ.ChildCount >= 1) and
+           (ParamNodeJ.GetChild(0).NodeType = antIdentifier) then
+        begin
+          WIdx := TypeNameWidthCode(VarToStr(ParamNodeJ.GetChild(0).Value));
+          if (WIdx >= 1) and (WIdx <= 6) then
+            EmitInstruction(ssaNarrowInt, ParamReg, ParamReg, MakeSSAValue(svkNone), MakeSSAConstInt(WIdx));
+        end;
         // V4: a BYVAL UDT parameter gets its own copy (the caller passed a handle = BYREF default,
         // so copy the caller's record into a fresh local instance that the body mutates instead).
         // The local copy lives in the callee frame and is reclaimed at frame exit (V2).
