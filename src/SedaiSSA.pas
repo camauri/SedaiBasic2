@@ -869,6 +869,8 @@ var
   RevLen, RevSum, RevOne, RevCnt, RevPrefix: TSSAValue;  // INSTRREV(str,sub,start) lowering temps
   TrimMode: Integer;  // bcStrTrimSet mode: 0/1/2 side (both/left/right) | 4 = Any (char-set) form
   IsAny: Boolean;     // FreeBASIC "Any" modifier on the set/substring argument
+  OpLhsType, OpLabel: string;  // operator overloading: UDT operand type + resolved operator label
+  OpArgs: TASTNode;
   // User function handling
   FnDef: TUserFunctionDef;
   OldParamValue: TSSAValue;
@@ -1194,6 +1196,28 @@ begin
 
     antBinaryOp:
     begin
+      // Operator overloading (FreeBASIC): if both operands are UDT handles of the same type T and a
+      // user "OPERATOR <sym>(a AS T, b AS T)" is defined, lower a call to it (label T.OPERATOR<sym>)
+      // instead of a numeric op. Resolved by the left operand's static type; direct binary form (the
+      // chained "(a+b)+c" case relies on the result type being inferable — v1 covers direct operands).
+      if (Node.ChildCount >= 2) and Assigned(Node.Token) then
+      begin
+        OpLhsType := ObjectTypeName(Node.GetChild(0));
+        if (OpLhsType <> '') and (ObjectTypeName(Node.GetChild(1)) = OpLhsType) then
+        begin
+          OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value));
+          if OpLabel <> '' then
+          begin
+            OpArgs := TASTNode.Create(antArgumentList, Node.Token);
+            OpArgs.AddChild(Node.GetChild(0).Clone);
+            OpArgs.AddChild(Node.GetChild(1).Clone);
+            EmitUserFunctionCall(OpLabel, OpArgs, Result);
+            OpArgs.Free;
+            Exit;
+          end;
+        end;
+      end;
+
       ProcessExpression(Node.GetChild(0), Left);
       ProcessExpression(Node.GetChild(1), Right);
 

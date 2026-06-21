@@ -28,7 +28,7 @@ unit SedaiPackratParser;
 interface
 
 uses
-  Classes, SysUtils, DateUtils,
+  Classes, SysUtils, DateUtils, Variants,
   SedaiLexerTypes, SedaiLexerToken, SedaiTokenList, SedaiParserTypes,
   SedaiAST, SedaiParserContext, SedaiParserResults, SedaiParserErrors,
   SedaiPackratCore, SedaiExpressionParser, SedaiParserValidation,
@@ -696,7 +696,7 @@ begin
     ttProcedureStart:
       if (UpperCase(Token.Value) = kSUB) or (UpperCase(Token.Value) = kFUNCTION) or
          (UpperCase(Token.Value) = kCONSTRUCTOR) or (UpperCase(Token.Value) = kDESTRUCTOR) or
-         (UpperCase(Token.Value) = kPROPERTY) then
+         (UpperCase(Token.Value) = kPROPERTY) or (UpperCase(Token.Value) = kOPERATOR) then
         Result := Memoize('ProcedureDecl', @ParseProcedureDecl)
       else
         Result := Memoize('FnStatement', @ParseFnStatement);
@@ -1487,7 +1487,7 @@ end;
 function TPackratParser.ParseProcedureDecl: TASTNode;
 var
   Token, NameTok: TLexerToken;
-  Kind, MethodType, QualName, ParamMode: string;
+  Kind, MethodType, QualName, ParamMode, OpSym, OpOwnerType: string;
   NameNode, ParamList, ParamNode, ThisNode, DefExpr: TASTNode;
 begin
   // SUB|FUNCTION name [ ( params ) ] [AS type] <body> END SUB|FUNCTION
@@ -1499,6 +1499,19 @@ begin
   Result := TASTNode.CreateWithValue(antProcedureDecl, Kind, Token);
 
   MethodType := '';
+  OpSym := '';
+  if Kind = kOPERATOR then
+  begin
+    // OPERATOR <sym> (a AS T, b AS T) AS R — capture the operator symbol token; the owning type is
+    // derived from the first parameter after the list is parsed (label "<T>.OPERATOR<sym>"). No
+    // implicit THIS: it is a 2-argument global function resolved by operand type at the binary op.
+    OpSym := Context.CurrentToken.Value;
+    Context.Advance;                                // consume the operator symbol
+    NameNode := TASTNode.CreateWithValue(antIdentifier, 'OPERATOR' + OpSym, Token);  // placeholder
+    Result.AddChild(NameNode);
+  end
+  else
+  begin
   // The procedure/owner name must be a plain identifier. A reserved word here (e.g. a graphics
   // keyword such as CIRCLE/BOX/LINE used as a type name) is malformed: report a clean error and
   // skip the body up to its END, so the parser terminates instead of derailing on a misaligned
@@ -1544,6 +1557,7 @@ begin
     NameNode := TASTNode.CreateWithValue(antIdentifier, QualName, NameTok);
     Result.AddChild(NameNode);
   end;
+  end;   // end of non-OPERATOR name parsing
 
   ParamList := TASTNode.Create(antParameterList, Token);
   // Implicit THIS parameter for methods: THIS AS <Type> (record handle), first in the list.
@@ -1630,6 +1644,18 @@ begin
       Kind := kFUNCTION;                           // getter returns the property value
       Result.Value := kFUNCTION;
     end;
+  end;
+
+  // OPERATOR: now that the parameters are parsed, take the owning type from the first parameter's
+  // AS-type and form the label "<T>.OPERATOR<sym>", then treat it as a normal FUNCTION. The binary-op
+  // lowering resolves it by the left operand's type.
+  if (Kind = kOPERATOR) and Assigned(NameNode) and (ParamList.ChildCount >= 1) and
+     (ParamList.GetChild(0).ChildCount >= 1) then
+  begin
+    OpOwnerType := UpperCase(VarToStr(ParamList.GetChild(0).GetChild(0).Value));
+    NameNode.Value := OpOwnerType + '.OPERATOR' + OpSym;
+    Kind := kFUNCTION;
+    Result.Value := kFUNCTION;
   end;
 
   // FUNCTION return type: "FUNCTION name(...) AS rettype" (M3.2). Attach the type as a child

@@ -1613,6 +1613,7 @@ begin
  RegisterKeyword(kCONSTRUCTOR, ttProcedureStart, 'TYPE constructor', kcProcedures);
  RegisterKeyword(kDESTRUCTOR,  ttProcedureStart, 'TYPE destructor',  kcProcedures);
  RegisterKeyword(kPROPERTY,    ttProcedureStart, 'TYPE property getter/setter (FreeBASIC)', kcProcedures);
+ RegisterKeyword(kOPERATOR,    ttProcedureStart, 'Operator overloading (FreeBASIC)', kcProcedures);
  RegisterKeyword(kBYVAL,    ttParamMode,      'Pass by value',      kcProcedures);
  RegisterKeyword(kBYREF,    ttParamMode,      'Pass by reference',  kcProcedures);
  RegisterKeyword(kCALL,     ttCallSub,        'Call a SUB',         kcProcedures);
