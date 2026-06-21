@@ -145,9 +145,14 @@ begin
   begin
     Instr := CurrBlock.Instructions[j];
 
-    // Check if this instruction defines our register
+    // Check if this instruction defines our register. The register BANK (RegType) is part of the
+    // identity: the int, float and string banks are independent, so int R0 and string R0 are
+    // DIFFERENT registers. Without the RegType check, a string copy (e.g. CopyString R0,R1 from a
+    // string variable / PHI elimination) was matched as the definition of int R0 and its string
+    // source propagated into an int operand — miscompiling a later "a < b" into "Rstr < Rstr".
     if (Instr.Dest.Kind = svkRegister) and
        (Instr.Dest.RegIndex = RegVal.RegIndex) and
+       (Instr.Dest.RegType = RegVal.RegType) and
        (Instr.Dest.Version = RegVal.Version) then
     begin
       // Found the definition - check if it's a copy
