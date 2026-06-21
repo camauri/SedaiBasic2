@@ -861,6 +861,8 @@ var
   // String function handling
   Arg2Value, Arg3Value, Arg2Reg, Arg3Reg: TSSAValue;
   RevLen, RevSum, RevOne, RevCnt, RevPrefix: TSSAValue;  // INSTRREV(str,sub,start) lowering temps
+  TrimMode: Integer;  // bcStrTrimSet mode: 0/1/2 side (both/left/right) | 4 = Any (char-set) form
+  IsAny: Boolean;     // FreeBASIC "Any" modifier on the set/substring argument
   // User function handling
   FnDef: TUserFunctionDef;
   OldParamValue: TSSAValue;
@@ -2085,29 +2087,44 @@ begin
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
             ProcessExpression(ArgListNode.GetChild(0), ArgValue);   // str
-            ProcessExpression(ArgListNode.GetChild(1), Arg2Value);  // substring
+            ProcessExpression(ArgListNode.GetChild(1), Arg2Value);  // substring / char set
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureStringRegister(Arg2Value);
+            // FreeBASIC "Any" form: the 2nd argument is a character SET; find the last single char in
+            // it (ssaStrInstrRevAny) rather than the whole substring.
+            IsAny := ArgListNode.GetChild(1).Attributes.Values['ANYSET'] = '1';
             if ArgListNode.ChildCount >= 3 then
             begin
               ProcessExpression(ArgListNode.GetChild(2), Arg3Value);  // start (1-based)
               Arg3Reg := EnsureIntRegister(Arg3Value);
-              // cnt = start + LEN(sub) - 1 ; str := LEFT$(str, cnt)
-              RevLen := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-              EmitInstruction(ssaStrLen, RevLen, Arg2Reg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-              RevSum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-              EmitInstruction(ssaAddInt, RevSum, Arg3Reg, RevLen, MakeSSAValue(svkNone));
-              RevOne := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-              EmitInstruction(ssaLoadConstInt, RevOne, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-              RevCnt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-              EmitInstruction(ssaSubInt, RevCnt, RevSum, RevOne, MakeSSAValue(svkNone));
-              RevPrefix := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-              EmitInstruction(ssaStrLeft, RevPrefix, ArgReg, RevCnt, MakeSSAValue(svkNone));
+              if IsAny then
+              begin
+                // single-char matches: a match at P survives iff P <= start -> LEFT$(str, start)
+                RevPrefix := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+                EmitInstruction(ssaStrLeft, RevPrefix, ArgReg, Arg3Reg, MakeSSAValue(svkNone));
+              end
+              else
+              begin
+                // substring: a match at P survives iff P <= start -> LEFT$(str, start + LEN(sub) - 1)
+                RevLen := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+                EmitInstruction(ssaStrLen, RevLen, Arg2Reg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                RevSum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+                EmitInstruction(ssaAddInt, RevSum, Arg3Reg, RevLen, MakeSSAValue(svkNone));
+                RevOne := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+                EmitInstruction(ssaLoadConstInt, RevOne, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                RevCnt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+                EmitInstruction(ssaSubInt, RevCnt, RevSum, RevOne, MakeSSAValue(svkNone));
+                RevPrefix := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+                EmitInstruction(ssaStrLeft, RevPrefix, ArgReg, RevCnt, MakeSSAValue(svkNone));
+              end;
               ArgReg := RevPrefix;   // search within the restricted prefix
             end;
             DestReg := FProgram.AllocRegister(srtInt);
             Result := MakeSSARegister(srtInt, DestReg);
-            EmitInstruction(ssaStrInstrRev, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
+            if IsAny then
+              EmitInstruction(ssaStrInstrRevAny, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone))
+            else
+              EmitInstruction(ssaStrInstrRev, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
           end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end
@@ -2143,12 +2160,13 @@ begin
             begin
               ProcessExpression(ArgListNode.GetChild(1), Arg2Value);   // trimset
               Arg2Reg := EnsureStringRegister(Arg2Value);
-              if FuncName = 'LTRIM' then
-                EmitInstruction(ssaStrTrimSet, Result, ArgReg, Arg2Reg, MakeSSAConstInt(1))   // left
-              else if FuncName = 'RTRIM' then
-                EmitInstruction(ssaStrTrimSet, Result, ArgReg, Arg2Reg, MakeSSAConstInt(2))   // right
-              else
-                EmitInstruction(ssaStrTrimSet, Result, ArgReg, Arg2Reg, MakeSSAConstInt(0));  // both (TRIM)
+              if FuncName = 'LTRIM' then TrimMode := 1                  // left
+              else if FuncName = 'RTRIM' then TrimMode := 2             // right
+              else TrimMode := 0;                                       // both (TRIM)
+              // FreeBASIC "Any" form: trim any character in the set (bit 4) instead of the substring.
+              if ArgListNode.GetChild(1).Attributes.Values['ANYSET'] = '1' then
+                TrimMode := TrimMode or 4;
+              EmitInstruction(ssaStrTrimSet, Result, ArgReg, Arg2Reg, MakeSSAConstInt(TrimMode));
             end
             else
             begin

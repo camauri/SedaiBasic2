@@ -599,6 +599,7 @@ begin
     bcStrValInt, // VALINT/VALLNG/VALUINT(str) - reads string, produces int
     bcStrInstr,  // INSTR(haystack, needle) - haystack is Src1
     bcStrInstrRev,  // INSTRREV(str, sub) - str is Src1
+    bcStrInstrRevAny, // INSTRREV(str, Any set) - str is Src1
     bcStrTrimSet,   // LTRIM/RTRIM/TRIM(s, set) - s is Src1
     // === GROUP 2: Math operations ===
     bcStrDec,  // DEC(hexstring) - reads string, produces int
@@ -635,6 +636,7 @@ begin
     bcStrConcat,  // String concatenation (second operand)
     bcStrInstr,   // INSTR(haystack, needle) - needle is Src2
     bcStrInstrRev, // INSTRREV(str, sub) - sub is Src2
+    bcStrInstrRevAny, // INSTRREV(str, Any set) - set is Src2
     bcStrTrimSet,  // LTRIM/RTRIM/TRIM(s, set) - set is Src2
     // === GROUP 6: File I/O operations ===
     bcDopen, bcOpen,  // Src2 = filename (string)

@@ -595,6 +595,7 @@ end;
 function TExpressionParser.ParseExpressionList(Delimiter: TTokenType = ttSeparParam): TASTNode;
 var
   Expr: TASTNode;
+  WasAny: Boolean;
 begin
   //WriteLn('>>> DEBUG ExpressionParser.ParseExpressionList: ENTRY');
   //WriteLn('>>> DEBUG ExpressionParser.ParseExpressionList: Current token = "', Context.CurrentToken.Value, '"');
@@ -630,11 +631,30 @@ begin
         Continue; // Continue looking for the next expression
       end;
 
+      // FreeBASIC "Any" modifier (char-set form of TRIM/LTRIM/RTRIM and INSTRREV): "Any <expr>"
+      // marks this argument so the lowering trims/searches any character in the set rather than the
+      // whole substring. Only treated as a modifier when "Any" is immediately followed by another
+      // expression (otherwise it is a plain identifier argument named ANY). The attribute is inert for
+      // calls that don't consult it.
+      WasAny := False;
+      if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'ANY')
+         and Assigned(Context.PeekNext)
+         and not (Context.PeekNext.TokenType in
+                  [ttDelimParClose, ttDelimBrackClose, ttSeparParam, ttEndOfLine, ttEndOfFile]) then
+      begin
+        Context.Advance;   // consume "Any"
+        WasAny := True;
+      end;
+
       Expr := ParseExpression(precNone);
       //WriteLn('>>> DEBUG ExpressionParser.ParseExpressionList: ParseExpression returned: ', Assigned(Expr));
 
       if Assigned(Expr) then
+      begin
+        if WasAny then
+          Expr.Attributes.Values['ANYSET'] := '1';
         Result.AddChild(Expr)
+      end
       else
         Break;
 

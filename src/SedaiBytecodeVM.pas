@@ -2261,11 +2261,11 @@ begin
         end;
 
         // INSTR/INSTRREV(haystack$, needle$[, start]) -> int Dest
-        bcStrInstr, bcStrInstrRev:
+        bcStrInstr, bcStrInstrRev, bcStrInstrRevAny:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;  // haystack
-          if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;  // needle
+          if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;  // needle / set
         end;
 
         // Print/PrintLn: float in Src1
@@ -3882,28 +3882,56 @@ begin
         if Count < 0 then Count := 0;
         Ctx.StringRegs[Instr.Dest] := StringOfChar(' ', Count);
       end;
+    24: // bcStrInstrRevAny - INSTRREV(str, Any set) -> last position of any char in set (1-based, 0 if none)
+      begin
+        S := Ctx.StringRegs[Instr.Src1];
+        SubStr := Ctx.StringRegs[Instr.Src2];   // character set
+        Len := 0;
+        if SubStr <> '' then
+          for StartPos := Length(S) downto 1 do
+            if Pos(S[StartPos], SubStr) > 0 then
+            begin
+              Len := StartPos;
+              Break;
+            end;
+        Ctx.IntRegs[Instr.Dest] := Len;
+      end;
     22: // bcStrString - STRING(n, ch) -> n copies of the character whose code is Src2
       begin
         Count := Ctx.IntRegs[Instr.Src1];
         if Count < 0 then Count := 0;
         Ctx.StringRegs[Instr.Dest] := StringOfChar(Chr(Ctx.IntRegs[Instr.Src2] and $FF), Count);
       end;
-    23: // bcStrTrimSet - LTRIM/RTRIM/TRIM(s, set): strip repeated occurrences of the `set`
-        // substring from the end(s). Immediate = mode (0=both, 1=left, 2=right). FreeBASIC default
-        // (no Any) trims the trimset as a substring; case-sensitive.
+    23: // bcStrTrimSet - LTRIM/RTRIM/TRIM(s, set). Immediate = mode: low 2 bits = side (0=both,
+        // 1=left, 2=right); bit 2 (value 4) = FreeBASIC "Any" form (trim any CHARACTER in the set)
+        // vs the default which trims the whole `set` substring. Case-sensitive.
       begin
         S := Ctx.StringRegs[Instr.Src1];
-        SubStr := Ctx.StringRegs[Instr.Src2];   // trimset (substring)
-        Count := Instr.Immediate;               // mode
+        SubStr := Ctx.StringRegs[Instr.Src2];   // trimset
+        Count := Instr.Immediate and 3;         // side
         Len := Length(SubStr);
         if Len > 0 then
         begin
-          if Count <> 2 then                    // left or both
-            while (Length(S) >= Len) and (Copy(S, 1, Len) = SubStr) do
-              Delete(S, 1, Len);
-          if Count <> 1 then                    // right or both
-            while (Length(S) >= Len) and (Copy(S, Length(S) - Len + 1, Len) = SubStr) do
-              Delete(S, Length(S) - Len + 1, Len);
+          if (Instr.Immediate and 4) <> 0 then
+          begin
+            // "Any" form: strip any single character that appears in the set.
+            if Count <> 2 then                  // left or both
+              while (Length(S) >= 1) and (Pos(S[1], SubStr) > 0) do
+                Delete(S, 1, 1);
+            if Count <> 1 then                  // right or both
+              while (Length(S) >= 1) and (Pos(S[Length(S)], SubStr) > 0) do
+                Delete(S, Length(S), 1);
+          end
+          else
+          begin
+            // Default form: strip repeated occurrences of the whole `set` substring.
+            if Count <> 2 then                  // left or both
+              while (Length(S) >= Len) and (Copy(S, 1, Len) = SubStr) do
+                Delete(S, 1, Len);
+            if Count <> 1 then                  // right or both
+              while (Length(S) >= Len) and (Copy(S, Length(S) - Len + 1, Len) = SubStr) do
+                Delete(S, Length(S) - Len + 1, Len);
+          end;
         end;
         Ctx.StringRegs[Instr.Dest] := S;
       end;

@@ -87,7 +87,8 @@ type
     ssaStrInstrRev,   // INSTRREV(s, sub) -> int (last occurrence)
     ssaStrSpace,      // SPACE(n) -> string of n spaces
     ssaStrString,     // STRING(n,ch) -> n copies of a char (Src1=count int, Src2=charcode int)
-    ssaStrTrimSet,    // LTRIM/RTRIM/TRIM(s, set) -> trim substring from ends (Src1/Src2=string, Src3=mode const 0=both/1=left/2=right)
+    ssaStrTrimSet,    // LTRIM/RTRIM/TRIM(s, set) -> trim substring from ends (Src1/Src2=string, Src3=mode const 0=both/1=left/2=right [|4=Any])
+    ssaStrInstrRevAny, // INSTRREV(str, Any set) -> int last position of any char in set (Src1/Src2=string)
     // FreeBASIC numeric<->string conversions (B1.3).
     ssaStrOct,        // OCT(n) -> octal string
     ssaStrBin,        // BIN(n) -> binary string
