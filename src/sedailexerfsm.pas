@@ -148,6 +148,7 @@ type
     // === TOKEN PROCESSING ===
     function ProcessIdentifier: TLexerToken;
     function ProcessNumber: TLexerToken;
+    function LexAmpBaseLiteral: TLexerToken;   // FreeBASIC &H/&O/&B hex/oct/bin integer literal
     function ProcessString: TLexerToken;
     function ProcessComment: TLexerToken;
     function ProcessLineComment: TLexerToken;
@@ -1335,6 +1336,56 @@ begin
    Result := CreateToken(ttNumber);
 end;
 
+function TLexerFSM.LexAmpBaseLiteral: TLexerToken;
+// FreeBASIC &H../&O../&B.. integer literal. On entry the '&' has been consumed and added to the token
+// buffer, and the current char is the base letter (H/O/B). Returns nil (consuming nothing more) when
+// the '&' is NOT a base-literal prefix, so the caller falls back to "&="/concat. The base digits are
+// folded into an Int64 and the token's value is set to the decimal string, so the parser handles it as
+// an ordinary integer (values beyond Int64 wrap — an accepted v1 limit, like other big literals).
+var
+  Base, DigVal: Integer;
+  Ch: Char;
+  Val: Int64;
+
+  function IsBaseDigit(C: Char; B: Integer): Boolean;
+  begin
+    case B of
+      16: Result := C in ['0'..'9', 'A'..'F', 'a'..'f'];
+      8:  Result := C in ['0'..'7'];
+      2:  Result := C in ['0'..'1'];
+    else  Result := False;
+    end;
+  end;
+
+begin
+  Result := nil;
+  Ch := GetCurrentChar;   // base letter candidate
+  case Ch of
+    'H', 'h': Base := 16;
+    'O', 'o': Base := 8;
+    'B', 'b': Base := 2;
+  else        Exit;       // not a base prefix
+  end;
+  if not IsBaseDigit(PeekChar(1), Base) then Exit;   // need at least one valid digit -> else it's '&'
+
+  TokenBufferAdd(Ch); AdvanceChar;   // consume the base letter
+  Val := 0;
+  while IsBaseDigit(GetCurrentChar, Base) do
+  begin
+    Ch := GetCurrentChar;
+    case Ch of
+      '0'..'9': DigVal := Ord(Ch) - Ord('0');
+      'A'..'F': DigVal := Ord(Ch) - Ord('A') + 10;
+      'a'..'f': DigVal := Ord(Ch) - Ord('a') + 10;
+    else        DigVal := 0;
+    end;
+    Val := Val * Base + DigVal;
+    TokenBufferAdd(Ch); AdvanceChar;
+  end;
+  Result := CreateToken(ttNumber);
+  Result.SetExtractedValue(IntToStr(Val));   // logical value is decimal, not the "&H.." source text
+end;
+
 function TLexerFSM.ProcessString: TLexerToken;
 var
   S: string;
@@ -1859,12 +1910,16 @@ begin
       '&':
         begin
           // FreeBASIC string concatenation. Compound "&=" emits a ttCompoundAssign (value '&').
-          // (The &H/&O/&B hex/oct/bin literal prefixes are a separate, not-yet-supported feature.)
+          // "&H../&O../&B.." are hex/oct/bin integer literals (handled by LexAmpBaseLiteral).
           ResetToken;
           TokenBufferAdd(CurrentChar);
           AdvanceChar;
-          if GetCurrentChar = '=' then begin AdvanceChar; Result := CreateToken(ttCompoundAssign); end
-          else Result := CreateToken(ttOpConcat);
+          Result := LexAmpBaseLiteral;   // &H/&O/&B integer literal, or nil if not a base prefix
+          if Result = nil then
+          begin
+            if GetCurrentChar = '=' then begin AdvanceChar; Result := CreateToken(ttCompoundAssign); end
+            else Result := CreateToken(ttOpConcat);
+          end;
           {$IFDEF DEBUG}
           if FDebugMode then
             FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);

@@ -147,6 +147,9 @@ type
 
     // INTERNAL: Lazy extraction setup (used by lexer)
     procedure SetupLazyExtraction(ExtractorCtx: Pointer; ExtractorFn: TTokenValueExtractor; RecIdx: Integer);
+    // INTERNAL: force an explicit value, bypassing/cancelling lazy extraction (used by the lexer when
+    // the token's logical value differs from its source text, e.g. &H/&O/&B literals -> decimal).
+    procedure SetExtractedValue(const S: string);
 
     // Read-only computed properties
     property EndPosition: Integer read GetEndPosition;
@@ -281,6 +284,14 @@ begin
   FExtractorContext := ExtractorCtx;
   FExtractorFunc := ExtractorFn;
   FTokenRecIndex := RecIdx;
+end;
+
+procedure TLexerToken.SetExtractedValue(const S: string);
+begin
+  // Mark as already extracted so GetValue returns S instead of re-reading the source text.
+  FValue := S;
+  FValueExtracted := True;
+  FExtractorFunc := nil;
 end;
 
 procedure TLexerToken.InvalidateCache;
