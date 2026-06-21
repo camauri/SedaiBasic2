@@ -1227,9 +1227,12 @@ The following PETSCII codes are silently ignored because they require full-scree
 > core plus the M1/M2/M3 structured subset: block `IF`/`ELSEIF`/`END IF`, `SELECT CASE`, `FOR`/`NEXT`,
 > `DO`/`LOOP`, named labels, `SUB`/`FUNCTION`/`CALL`/`EXIT`/`RETURN`, `TYPE`/`AS`/`.` records).
 > ◐ = partially implemented (see note). ✗ = not implemented.
-> Note: a ✓ marks name recognition — exact semantics may still differ from FreeBASIC (e.g. FB's OOP
-> `TYPE`, pointers, threading, and preprocessor are not present). This is a forward-looking gap map,
-> not a claim of FreeBASIC compatibility.
+> Note: a ✓ marks name recognition — exact semantics may still differ from FreeBASIC. Some FB areas
+> are not yet present (preprocessor) or are intentionally modelled differently for now (OOP `TYPE` is
+> implemented; threading is implemented). **Pointers are NOT excluded** — their implementation is not
+> yet decided; today the language is reference-only, and adding FB-style pointers later is an open
+> design question (it would make SedaiBasic a powerful FreeBASIC alternative). This is a forward-looking
+> gap map, not a claim of FreeBASIC compatibility.
 >
 > **Coverage (FreeBASIC-keyword overlap):** Language ~**95/363**, Runtime Library **72/280**,
 > total ~**167/643** (M3 adds `AS`, member-access `.`, and `TYPE` ◐).
