@@ -198,6 +198,8 @@ type
     ttArrayRedim,             // REDIM (FreeBASIC, B1.4)
     ttEnum,                   // ENUM ... END ENUM (FreeBASIC named integer constants)
     ttDefType,                // DEFINT/DEFLNG/DEFSNG/DEFDBL/DEFSTR... (FreeBASIC default type by letter)
+    ttLSet,                   // LSET (FreeBASIC/QBasic - left-justify string into a buffer)
+    ttRSet,                   // RSET (FreeBASIC/QBasic - right-justify string into a buffer)
     ttDataRead,               // READ
     ttDataType,               // TYPE, STRUCT, RECORD
 
@@ -390,6 +392,7 @@ const
     ttThreadWait, ttThreadDetach, ttMutexLock, ttMutexUnlock, ttMutexDestroy,
     ttCondWait, ttCondSignal, ttCondBroadcast, ttCondDestroy,
     ttJumpKeyword, ttDataDeclaration, ttArrayErase, ttArrayRedim, ttEnum, ttDefType, ttDataAssignment, ttCommentRemark,
+    ttLSet, ttRSet,
     ttBitwiseOperator
   ];
 

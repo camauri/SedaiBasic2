@@ -1657,6 +1657,8 @@ begin
  RegisterKeyword(kDATA,    ttDataConstant,    'Data statement',       kcData);
  RegisterKeyword(kDIM,     ttDataDeclaration, 'Dimension arrays',     kcData);
  RegisterKeyword(kERASE,   ttArrayErase,      'Reset array elements to default (FreeBASIC)', kcData);
+ RegisterKeyword(kLSET,    ttLSet,            'Left-justify a string into a buffer (FreeBASIC/QBasic)',  kcData);
+ RegisterKeyword(kRSET,    ttRSet,            'Right-justify a string into a buffer (FreeBASIC/QBasic)', kcData);
  RegisterKeyword(kREDIM,   ttArrayRedim,      'Re-dimension an array (FreeBASIC)',           kcData);
  RegisterKeyword(kENUM,    ttEnum,            'Named integer constants block (FreeBASIC)',   kcData);
  RegisterKeyword(kDEFINT,  ttDefType,         'Default INTEGER type by initial letter (FreeBASIC)', kcData);

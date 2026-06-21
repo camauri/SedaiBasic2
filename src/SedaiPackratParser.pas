@@ -177,6 +177,7 @@ type
     function ParseEraseStatement: TASTNode;
     function ParseRedimStatement: TASTNode;
     function ParseSwapStatement: TASTNode;
+    function ParseLRSetStatement(NodeType: TASTNodeType): TASTNode;
     function ParseMidStatement: TASTNode;
     function ParseEnumStatement: TASTNode;
     function ParseDefTypeStatement: TASTNode;
@@ -539,6 +540,8 @@ begin
     ttDataAssignment: Result := Memoize('LetStatement', @ParseLetStatement);
     ttDataDeclaration: Result := Memoize('DimStatement', @ParseDimStatement);
     ttArrayErase: Result := Memoize('EraseStatement', @ParseEraseStatement);
+    ttLSet: Result := ParseLRSetStatement(antLSet);
+    ttRSet: Result := ParseLRSetStatement(antRSet);
     ttArrayRedim: Result := Memoize('RedimStatement', @ParseRedimStatement);
     ttEnum: Result := Memoize('EnumStatement', @ParseEnumStatement);
     ttDefType: Result := Memoize('DefTypeStatement', @ParseDefTypeStatement);
@@ -4347,6 +4350,47 @@ begin
     Exit;
   end;
   Result.AddChild(Right);
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseLRSetStatement(NodeType: TASTNodeType): TASTNode;
+// LSET/RSET dst (= | ,) src  - justify src into dst's string buffer (dst's length is preserved).
+// Both the QBasic ("dst = src") and FreeBASIC ("dst, src") separators are accepted.
+// AST children: child0 = dst lvalue, child1 = src expression.
+var
+  Token: TLexerToken;
+  Dst, Src: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(NodeType, Token);
+  Context.Advance; // consume LSET / RSET
+  // Parse the destination as an lvalue (identifier / array element / member). Use precCall so the
+  // expression parser stops before "=" (which would otherwise be read as an equality operator in the
+  // QBasic "dst = src" form).
+  Dst := FExpressionParser.ParseExpression(precCall);
+  if not Assigned(Dst) then
+  begin
+    HandleError('Expected destination variable after LSET/RSET', Context.CurrentToken);
+    DoNodeCreated(Result);
+    Exit;
+  end;
+  Result.AddChild(Dst);
+  if Context.Check(ttOpEq) or Context.Check(ttSeparParam) then
+    Context.Advance                      // "=" (QBasic) or "," (FreeBASIC)
+  else
+  begin
+    HandleError('Expected "=" or "," after LSET/RSET destination', Context.CurrentToken);
+    DoNodeCreated(Result);
+    Exit;
+  end;
+  Src := ParseExpression;
+  if not Assigned(Src) then
+  begin
+    HandleError('Expected source string in LSET/RSET', Context.CurrentToken);
+    DoNodeCreated(Result);
+    Exit;
+  end;
+  Result.AddChild(Src);
   DoNodeCreated(Result);
 end;
 

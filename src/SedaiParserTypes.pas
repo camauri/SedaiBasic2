@@ -129,6 +129,8 @@ type
     antRedim,            // FreeBASIC REDIM [PRESERVE] arr(dims) - re-dimension an array (B1.4)
     antSwap,             // FreeBASIC SWAP a, b - exchange two lvalues (child0, child1)
     antMidStatement,     // FreeBASIC MID(dst, start [,len]) = src - in-place substring overwrite
+    antLSet,             // FreeBASIC/QBasic LSET dst (=|,) src - left-justify src into dst's buffer
+    antRSet,             // FreeBASIC/QBasic RSET dst (=|,) src - right-justify src into dst's buffer
     antEnum,             // FreeBASIC ENUM ... END ENUM - children are antAssignment (member = value)
     antDefType,          // FreeBASIC DEFINT/DEFSTR... - Value=bank; attr LETTERS = covered initials
 
@@ -405,7 +407,7 @@ begin
     antStatement, antAssignment, antPrint, antInput, antGoto,
     antGosub, antOnGoto, antOnGosub, antReturn, antEnd, antStop, antRem, antIf,
     antThen, antElse, antForLoop, antWhileLoop, antDoLoop, antDim,
-    antErase, antRedim, antSwap, antMidStatement, antEnum, antDefType,
+    antErase, antRedim, antSwap, antMidStatement, antLSet, antRSet, antEnum, antDefType,
     antDef, antData, antConst, antRead, antRestore, antClear,
     antOpen, antClose, antDopen, antDclose, antAppend, antDclear, antRecord,
     antGet, antPut, antPoke, antSys, antNew, antRun, antList,

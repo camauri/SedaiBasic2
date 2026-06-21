@@ -272,6 +272,7 @@ type
     procedure ProcessDefType(Node: TASTNode);
     procedure CollectDefTypes(Node: TASTNode);
     procedure ProcessMidStatement(Node: TASTNode);
+    procedure ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
     procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);
     function InferExprBank(Node: TASTNode): TSSARegisterType;
@@ -4412,6 +4413,68 @@ begin
   // target = result  (dispatches on the target lvalue kind via the existing assignment machinery)
   AsnNode := TASTNode.Create(antAssignment, Node.Token);
   AsnNode.AddChild(TargetNode.Clone);
+  TmpRef := TASTNode.CreateWithValue(antIdentifier, TmpName, Node.Token);
+  AsnNode.AddChild(TmpRef);
+  ProcessAssignment(AsnNode);
+  AsnNode.Free;
+end;
+
+procedure TSSAGenerator.ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
+// LSET/RSET dst, src (FreeBASIC/QBasic): justify src into dst's string buffer, preserving dst's
+// current length. src is truncated from the right if longer than the buffer, else padded with
+// spaces (LSET pads on the right / left-justifies; RSET pads on the left / right-justifies).
+// Lowered with existing string ops (no new opcode):
+//   N      = LEN(dst)
+//   capped = LEFT$(src, N)                 ' truncate from the right when too long
+//   pad    = SPACE$(N - LEN(capped))       ' >= 0
+//   dst    = capped + pad   (LSET)  |  pad + capped  (RSET)
+// The result lands in a named temp string var, then ProcessAssignment writes it back to the dst
+// lvalue (scalar / array element / member, uniformly).
+
+  function NS: TSSAValue;  // fresh string register
+  begin Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString)); end;
+  function NI: TSSAValue;  // fresh int register
+  begin Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt)); end;
+
+var
+  DstNode, SrcNode, AsnNode, TmpRef: TASTNode;
+  DstVal, SrcVal: TSSAValue;
+  DstReg, SrcReg, NReg, CappedReg, LCapReg, PadNReg, PadReg, ResultReg: TSSAValue;
+  TmpName: string;
+  NoneV: TSSAValue;
+begin
+  if Node.ChildCount < 2 then Exit;
+  NoneV := MakeSSAValue(svkNone);
+  DstNode := Node.GetChild(0);
+  SrcNode := Node.GetChild(1);
+
+  // Read inputs.
+  ProcessExpression(DstNode, DstVal); DstReg := EnsureStringRegister(DstVal);
+  ProcessExpression(SrcNode, SrcVal); SrcReg := EnsureStringRegister(SrcVal);
+
+  // N = LEN(dst): the buffer size to preserve.
+  NReg := NI; EmitInstruction(ssaStrLen, NReg, DstReg, NoneV, NoneV);
+
+  // capped = LEFT$(src, N): truncate from the right when src is longer than the buffer.
+  CappedReg := NS; EmitInstruction(ssaStrLeft, CappedReg, SrcReg, NReg, NoneV);
+
+  // pad = SPACE$(N - LEN(capped)).  LEN(capped) = min(LEN(src), N) so the count is always >= 0.
+  LCapReg := NI;  EmitInstruction(ssaStrLen, LCapReg, CappedReg, NoneV, NoneV);
+  PadNReg := NI;  EmitInstruction(ssaSubInt, PadNReg, NReg, LCapReg, NoneV);
+  PadReg := NS;   EmitInstruction(ssaStrSpace, PadReg, PadNReg, NoneV, NoneV);
+
+  // result = capped + pad (left-justify) | pad + capped (right-justify), into a named temp string var.
+  TmpName := '__LRSET' + IntToStr(FSwapTempSeq) + '$';
+  Inc(FSwapTempSeq);
+  ResultReg := GetOrAllocateVariable(TmpName);
+  if IsLeft then
+    EmitInstruction(ssaStrConcat, ResultReg, CappedReg, PadReg, NoneV)
+  else
+    EmitInstruction(ssaStrConcat, ResultReg, PadReg, CappedReg, NoneV);
+
+  // dst = result  (dispatches on the dst lvalue kind via the existing assignment machinery)
+  AsnNode := TASTNode.Create(antAssignment, Node.Token);
+  AsnNode.AddChild(DstNode.Clone);
   TmpRef := TASTNode.CreateWithValue(antIdentifier, TmpName, Node.Token);
   AsnNode.AddChild(TmpRef);
   ProcessAssignment(AsnNode);
@@ -11582,6 +11645,8 @@ begin
     antSwap: ProcessSwap(Node);
     antDefType: ProcessDefType(Node);
     antMidStatement: ProcessMidStatement(Node);
+    antLSet: ProcessLRSetStatement(Node, True);
+    antRSet: ProcessLRSetStatement(Node, False);
     antEnum:
       // ENUM members lower to a sequence of plain assignments (member = value), like CONST.
       for i := 0 to Node.ChildCount - 1 do

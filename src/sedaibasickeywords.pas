@@ -92,6 +92,8 @@ const
   kUNTIL   = 'UNTIL';
   kEXIT    = 'EXIT';
   kCONTINUE = 'CONTINUE';  // FreeBASIC: skip to the next loop iteration (FOR/DO/WHILE)
+  kLSET    = 'LSET';       // FreeBASIC/QBasic: left-justify a string into a fixed-length buffer
+  kRSET    = 'RSET';       // FreeBASIC/QBasic: right-justify a string into a fixed-length buffer
   kGOTO    = 'GOTO';
   kGO_TO   = 'GO'; // GO + TO constraint
   kGOSUB   = 'GOSUB';
