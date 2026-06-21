@@ -194,6 +194,12 @@ type
     // WITH obj / ... / END WITH : a leading '.field' resolves against obj. Parse-time desugar.
     function ParseWith: TASTNode;
     function AtEndWith: Boolean;
+    // NAMESPACE name / ... / END NAMESPACE (FreeBASIC): group member decls under a name.
+    function ParseNamespaceDecl: TASTNode;
+    function AtEndNamespace: Boolean;
+    // Read a dotted name "ident(.ident)*" (e.g. a namespace-qualified type "Forms.Point"); returns
+    // the joined UPPER-cased name and consumes all segments. The first token must already be checked.
+    function ParseDottedName: string;
     procedure ConsumeEndProcedure;
     function ParseForStatement: TASTNode;
     function ParseDoStatement: TASTNode;
@@ -712,6 +718,7 @@ begin
     ttSharedDecl: Result := ParseSharedError;   // SHARED is only the DIM SHARED modifier, not a statement
     ttTypeDecl: Result := Memoize('TypeDecl', @ParseTypeDecl);
     ttWithBlock: Result := ParseWith;
+    ttNamespaceBlock: Result := Memoize('NamespaceDecl', @ParseNamespaceDecl);
 
     // === MEMORY COMMANDS ===
     ttMemoryCommand: Result := Memoize('MemoryStatement', @ParseMemoryStatement);
@@ -1486,7 +1493,7 @@ end;
 
 function TPackratParser.ParseProcedureDecl: TASTNode;
 var
-  Token, NameTok: TLexerToken;
+  Token, NameTok, RetTok: TLexerToken;
   Kind, MethodType, QualName, ParamMode, OpSym, OpOwnerType: string;
   NameNode, ParamList, ParamNode, ThisNode, DefExpr: TASTNode;
 begin
@@ -1598,9 +1605,9 @@ begin
           Context.Advance;                        // AS
           if Context.Check(ttIdentifier) then
           begin
+            RetTok := Context.CurrentToken;
             ParamNode.AddChild(TASTNode.CreateWithValue(antIdentifier,
-                         UpperCase(Context.CurrentToken.Value), Context.CurrentToken));
-            Context.Advance;                      // typename
+                         ParseDottedName, RetTok));  // dotted: namespace-qualified param type
           end;
         end;
         // Optional default value "= expr" (M7): a call that omits this trailing argument has the
@@ -1665,9 +1672,9 @@ begin
     Context.Advance;                              // AS
     if Context.Check(ttIdentifier) then
     begin
+      RetTok := Context.CurrentToken;
       NameNode.AddChild(TASTNode.CreateWithValue(antIdentifier,
-                   UpperCase(Context.CurrentToken.Value), Context.CurrentToken));
-      Context.Advance;                            // rettype
+                   ParseDottedName, RetTok));       // dotted: namespace-qualified return type
     end;
   end;
 
@@ -1975,11 +1982,78 @@ begin
   DoNodeCreated(Result);
 end;
 
+function TPackratParser.AtEndNamespace: Boolean;
+begin
+  // END NAMESPACE  (END is ttProgramEnd, NAMESPACE is ttNamespaceBlock)
+  Result := Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+            (Context.PeekNext.TokenType = ttNamespaceBlock);
+end;
+
+function TPackratParser.ParseDottedName: string;
+// Read "ident(.ident)*" — used for namespace-qualified type names ("Forms.Point"). The cursor
+// must be on the first identifier. Segments after a '.' may be reserved words (member names).
+begin
+  Result := UpperCase(VarToStr(Context.CurrentToken.Value));
+  Context.Advance;                                   // first segment
+  while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
+        (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+        (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
+  begin
+    Context.Advance;                                 // '.'
+    Result := Result + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
+    Context.Advance;                                 // segment
+  end;
+end;
+
+function TPackratParser.ParseNamespaceDecl: TASTNode;
+// NAMESPACE name <newline> member-statements <newline> END NAMESPACE (FreeBASIC). The body holds
+// ordinary declarations (TYPE/SUB/FUNCTION/CONST/DIM); a later AST pass (SedaiNamespace) mangles
+// their names to "name.member" and hoists them to module level. The name may itself be dotted
+// (nested specifier, e.g. NAMESPACE Outer.Inner).
+var
+  Token: TLexerToken;
+  Stmt: TASTNode;
+  NsName: string;
+  PrevIdx: Integer;
+begin
+  Token := Context.CurrentToken;
+  Context.Advance;                                   // consume NAMESPACE
+  Result := nil;
+  if not Context.Check(ttIdentifier) then
+  begin
+    HandleError('Expected a namespace name after NAMESPACE', Context.CurrentToken);
+    Exit;
+  end;
+  NsName := ParseDottedName;                          // dotted nested specifier allowed
+  Result := TASTNode.CreateWithValue(antNamespace, NsName, Token);
+
+  while not Context.Check(ttEndOfFile) do
+  begin
+    if Context.Match(ttEndOfLine) then Continue;
+    if Context.Check(ttSeparStmt) then begin Context.Advance; Continue; end;
+    if AtEndNamespace then Break;
+    PrevIdx := Context.CurrentIndex;
+    Stmt := ParseStatement;
+    if Assigned(Stmt) then
+      Result.AddChild(Stmt)
+    else if Context.CurrentIndex = PrevIdx then
+      Context.Advance;                               // no progress: skip a token (defensive)
+  end;
+
+  if AtEndNamespace then
+  begin
+    Context.Advance;   // END
+    Context.Advance;   // NAMESPACE
+  end;
+  DoNodeCreated(Result);
+end;
+
 function TPackratParser.ParseTypeDecl: TASTNode;
 var
-  Token, NameTok, FieldTok, TypeTok: TLexerToken;
+  Token, NameTok, FieldTok: TLexerToken;
   FieldNode, TypeNode: TASTNode;
   PrevIdx: Integer;
+  FieldTypeName: string;
 begin
   // TYPE name <newline> field AS type <newline> ... END TYPE
   // Each field node is antIdentifier(fieldName) with one child antIdentifier(typeName).
@@ -2025,20 +2099,17 @@ begin
     begin
       FieldTok := Context.CurrentToken;
       Context.Advance;                              // field name
-      TypeTok := TLexerToken.CreateSimple(ttIdentifier, '');  // empty => infer by suffix
+      FieldTypeName := '';                          // empty => infer by suffix
       if Context.Check(ttAsType) then
       begin
         Context.Advance;                            // AS
         if Context.Check(ttIdentifier) or
            ((Length(Context.CurrentToken.Value) > 0) and
             (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
-        begin
-          TypeTok := Context.CurrentToken;
-          Context.Advance;                          // type name
-        end;
+          FieldTypeName := ParseDottedName;         // dotted: namespace-qualified field type
       end;
       FieldNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(FieldTok.Value), FieldTok);
-      TypeNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(TypeTok.Value), FieldTok);
+      TypeNode := TASTNode.CreateWithValue(antIdentifier, FieldTypeName, FieldTok);
       FieldNode.AddChild(TypeNode);
       Result.AddChild(FieldNode);
     end
@@ -4137,7 +4208,7 @@ function TPackratParser.ParseArrayDeclaration: TASTNode;
 var
   VarName: TASTNode;
   Dimensions: TASTNode;
-  Token: TLexerToken;
+  Token, TypeTok: TLexerToken;
 begin
   Token := Context.CurrentToken;
 
@@ -4193,9 +4264,9 @@ begin
     Context.Advance;                                // AS
     if Context.Check(ttIdentifier) then
     begin
+      TypeTok := Context.CurrentToken;
       Result.AddChild(TASTNode.CreateWithValue(antIdentifier,
-                   UpperCase(Context.CurrentToken.Value), Context.CurrentToken));
-      Context.Advance;                              // typename
+                   ParseDottedName, TypeTok));        // dotted: namespace-qualified element type
     end;
   end;
 
@@ -4301,6 +4372,7 @@ var
   Token, NameTok, TypeTok: TLexerToken;
   ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr: TASTNode;
   IsShared: Boolean;
+  DimTypeName: string;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
@@ -4327,10 +4399,10 @@ begin
         Break;
       end;
       TypeTok := Context.CurrentToken;
-      Context.Advance;                       // typename
+      DimTypeName := ParseDottedName;          // dotted: namespace-qualified type ("Forms.Point")
       ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
       VarNameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
-      TypeNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(TypeTok.Value), TypeTok);
+      TypeNode := TASTNode.CreateWithValue(antIdentifier, DimTypeName, TypeTok);
       ArrayDecl.AddChild(VarNameNode);
       ArrayDecl.AddChild(TypeNode);          // child[1] is antIdentifier (type) => typed scalar
       // Optional initializer after the type. Two cases:
@@ -4342,7 +4414,7 @@ begin
       begin
         Context.Advance;                     // =
         if Context.Check(ttIdentifier) and
-           (UpperCase(Context.CurrentToken.Value) = UpperCase(TypeTok.Value)) then
+           (UpperCase(Context.CurrentToken.Value) = DimTypeName) then
           Context.Advance                    // RHS == declared type: ctor form (block below reads '(')
         else
         begin

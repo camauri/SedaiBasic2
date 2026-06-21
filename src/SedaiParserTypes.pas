@@ -61,6 +61,7 @@ type
     antCondBroadcast,     // CONDBROADCAST cond: wake all waiters (statement); child0 = cond handle
     antCondDestroy,       // CONDDESTROY cond: free a condition variable (statement); child0 = cond handle
     antTypeDecl,          // TYPE name ... END TYPE (UDT/record): value=name, children=fields (antIdentifier, value=field name, with a type tag)
+    antNamespace,         // NAMESPACE name ... END NAMESPACE (FreeBASIC): value=name, children=member statements; flattened away before SSA
     antMemberAccess,      // record.field : child0 = object expr, value = field name
     antSpecialVariable,   // Special variables (TI, TI$, DT$, etc.)
 
@@ -413,7 +414,7 @@ begin
     antGosub, antOnGoto, antOnGosub, antReturn, antEnd, antStop, antRem, antIf,
     antThen, antElse, antForLoop, antWhileLoop, antDoLoop, antDim,
     antErase, antRedim, antSwap, antMidStatement, antLSet, antRSet, antEnum, antDefType,
-    antDef, antData, antConst, antRead, antRestore, antClear,
+    antDef, antData, antConst, antRead, antRestore, antClear, antNamespace,
     antOpen, antClose, antDopen, antDclose, antAppend, antDclear, antRecord,
     antGet, antPut, antPoke, antSys, antNew, antRun, antList,
     antSave, antLoad, antVerify, antBload, antBsave, antBoot, antCatalog, antBlock,

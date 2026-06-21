@@ -34,7 +34,7 @@ interface
 uses
   Classes, SysUtils, StrUtils, Variants, Math, Generics.Collections,
   SedaiLexerTypes, SedaiLexerToken, SedaiParserTypes, SedaiAST,
-  SedaiSSATypes, SedaiBasicKeywords;
+  SedaiSSATypes, SedaiBasicKeywords, SedaiNamespace;
 
 type
   { Loop info for FOR/NEXT implementation }
@@ -12217,6 +12217,10 @@ var
 begin
   FProgram := TSSAProgram.Create;
   FLabelCounter := 0;
+
+  // FreeBASIC NAMESPACE: flatten namespace blocks into mangled, module-level declarations before any
+  // pre-scan walks the AST. No-op when the program has no NAMESPACE (keyword is MODERN-only anyway).
+  FlattenNamespaces(AST);
 
   // FB lexical scope: reset the scope stack (module scope is FVarMap itself; the stack holds only
   // proc-root and block frames, pushed during lowering in MODERN mode). Inert in CLASSIC.

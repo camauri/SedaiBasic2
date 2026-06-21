@@ -134,7 +134,8 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `PROPERTY Type.name` | ✓ | Property getter/setter (desugars to method) |
 | `OPERATOR <sym>` | ✓ | Operator overloading for UDTs (binary, direct operands) |
 | `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like macros; function-like macros pending) |
-| `NAMESPACE` / BYREF-return / `WSTRING` | ✗ | Not yet implemented |
+| `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening (methods of a namespaced TYPE / `USING` / `..global` pending) |
+| BYREF-return / `WSTRING` | ✗ | Not yet implemented |
 
 ## Variable Scope
 
@@ -1672,7 +1673,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `EXTERN` | ✗ |  |
 | `EXTERN...END EXTERN` | ✗ |  |
 | `IMPORT` | ✗ |  |
-| `NAMESPACE` | ✗ |  |
+| `NAMESPACE` | ✓ | Group decls under a name (AST-flattened to `N.member`); nesting + reopening |
 | `PRIVATE` | ✗ |  |
 | `PUBLIC` | ✗ |  |
 | `USING (Namespaces)` | ✓ |  |

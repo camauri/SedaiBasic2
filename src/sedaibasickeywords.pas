@@ -65,6 +65,7 @@ const
   kTYPE    = 'TYPE';     // TYPE ... END TYPE: user-defined type (record/UDT)
   kAS      = 'AS';       // AS: type annotation (DIM x AS t, field AS t)
   kWITH    = 'WITH';     // WITH ... END WITH: with-block (.field => withobject.field)
+  kNAMESPACE = 'NAMESPACE'; // NAMESPACE n ... END NAMESPACE: group decls under a name (FreeBASIC)
   kEXTENDS = 'EXTENDS';  // TYPE Child EXTENDS Parent: single inheritance
   kCONSTRUCTOR = 'CONSTRUCTOR'; // CONSTRUCTOR Type(...): auto-called at instance allocation (M4.4)
   kDESTRUCTOR  = 'DESTRUCTOR';  // DESTRUCTOR Type(): auto-called at scope exit for a local (V5)

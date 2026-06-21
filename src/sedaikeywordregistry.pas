@@ -1620,6 +1620,7 @@ begin
  RegisterKeyword(kTYPE,     ttTypeDecl,       'User-defined type',  kcProcedures);
  RegisterKeyword(kAS,       ttAsType,         'Type annotation',    kcProcedures);
  RegisterKeyword(kWITH,     ttWithBlock,      'With block',         kcCodeBlockConstructs);
+ RegisterKeyword(kNAMESPACE,ttNamespaceBlock, 'Namespace block (FreeBASIC)', kcCodeBlockConstructs);
  RegisterKeyword(kEXTENDS,  ttExtends,        'Type inheritance',   kcProcedures);
  RegisterKeyword(kBASE,     ttBaseCall,       'Base constructor call', kcProcedures);
  RegisterKeyword(kSHARED,   ttSharedDecl,     'Shared module global',  kcProcedures);
@@ -1982,7 +1983,7 @@ begin
   // FreeBASIC/QBasic-only keywords: declassified to plain identifiers in CLASSIC (Commodore v7), so a
   // v7 program may still use these names as variables. They keep their keyword meaning in MODERN.
   // Commodore v7 has no CONTINUE (CONT is separate)/LSET/RSET/ENUM/DEF* , so this is safe.
-  SetKeywordsDialect([kCONTINUE, kLSET, kRSET, kENUM,
+  SetKeywordsDialect([kCONTINUE, kLSET, kRSET, kENUM, kNAMESPACE,
                       kDEFINT, kDEFLNG, kDEFBYTE, kDEFSHORT, kDEFLNGINT, kDEFSNG, kDEFDBL, kDEFSTR],
                      kdModernOnly);
 
