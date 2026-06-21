@@ -2,13 +2,20 @@
 
 ## Implementation Progress
 
-**188 / 209 commands implemented (90%)**
+**Commodore BASIC v7 core — 188 / 209 commands implemented (90%)**
 
 ```
 [█████████████████████████████████████████████····] 90%
 ```
 
-Legend: ✓ = Implemented | ✗ = Not implemented
+**FreeBASIC keyword set — 242 / 643 implemented (38%)** (+ 11 partial); see the
+[FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
+
+```
+[███████████████████·······························] 38%
+```
+
+Legend: ✓ = Implemented | ◐ = Partial | ✗ = Not implemented
 
 ## Operators (12/12 - 100%)
 
@@ -1242,8 +1249,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 > design question (it would make SedaiBasic a powerful FreeBASIC alternative). This is a forward-looking
 > gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC-keyword overlap):** Language ~**95/363**, Runtime Library **72/280**,
-> total ~**167/643** (M3 adds `AS`, member-access `.`, and `TYPE` ◐).
+> **Coverage (FreeBASIC keyword set):** **242 / 643 implemented (38%)**, plus 11 partial (◐).
+> Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
+> dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
+> compound & bitwise operators, string/conversion/array functions, and a basic preprocessor. Main
+> gaps: namespaces, pointers (undecided), WString/unicode, function-like macros, file I/O in FB syntax.
 
 ## Language Documentation
 
