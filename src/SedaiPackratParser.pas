@@ -41,6 +41,22 @@ type
   // OPTION MODE MODERN / OPTION MODE CLASSIC; use SetDialect(pdAuto) after LOAD to re-detect.
   TParserDialect = (pdAuto, pdModern, pdClassic);
 
+  // Dialect-pluggable statement handler: a per-dialect parser for a statement keyed by its leading
+  // token type. Registered into the parser by the active dialect profile; consulted by ParseStatement
+  // BEFORE the built-in dispatch. A handler may return nil to decline (then the built-in case runs).
+  TStatementParseFunc = function: TASTNode of object;
+
+  // A dialect profile bundles the parsing differences between CLASSIC (Commodore BASIC v7) and
+  // MODERN (FreeBASIC-style). It is data: feature toggles read by ApplyDialectProfile, which (re)installs
+  // the matching statement handlers (mechanism 3) and — when dialects diverge there — expression
+  // parse-rules (mechanism 2). Keyword availability (mechanism 1) is handled upstream by the lexer's
+  // per-keyword dialect tags. Add a toggle here when a new construct's parsing differs by dialect.
+  TDialectProfile = record
+    Modern: Boolean;           // MODERN (FreeBASIC) vs CLASSIC (v7)
+    SwapIsStatement: Boolean;  // SWAP exchanges two lvalues (MODERN) vs C128 RAM-bank command (CLASSIC)
+    MidIsStatement: Boolean;   // bare "MID(dst,start[,len]) = src" in-place overwrite (MODERN)
+  end;
+
   { TPackratParser - Main BASIC Parser with Packrat memoization }
   TPackratParser = class(TPackratCore)
   private
@@ -53,6 +69,15 @@ type
     // stream (no line numbers => MODERN); mirrors the SSA's SourceHasLineNumbers gate.
     FModernMode: Boolean;
     FDialectOverride: TParserDialect;  // pdAuto = detect per-Parse; pdModern/pdClassic = forced
+    // Dialect-pluggable: per-token statement handlers installed by the active dialect profile.
+    // Consulted by ParseStatement before the built-in case; nil entry = no override.
+    FStmtHandlers: array[TTokenType] of TStatementParseFunc;
+    FProfile: TDialectProfile;  // active dialect profile (derived from FModernMode)
+
+    // Dialect profile application + the per-dialect statement handlers it installs.
+    procedure ApplyDialectProfile;
+    function MemSwapStatementHandler: TASTNode;   // MODERN: SWAP a,b ; declines for other mem commands
+    function IdentMidStatementHandler: TASTNode;  // MODERN: MID(dst,..)=src ; declines for other idents
 
     // options & configuration
     function DefaultParserOptions: TParserOptions;
@@ -93,6 +118,12 @@ type
     // Takes effect on the next Parse; pdAuto also refreshes FModernMode immediately if a
     // token stream is already bound.
     procedure SetDialect(ADialect: TParserDialect);
+
+    // === DIALECT-PLUGGABLE STATEMENT HANDLERS (mechanism 3) ===
+    // Install/clear per-token statement parsers for the active dialect. A handler returning nil
+    // (without committing) declines and the built-in dispatch runs instead.
+    procedure RegisterStatementHandler(TokenType: TTokenType; Handler: TStatementParseFunc);
+    procedure ClearStatementHandlers;
 
     // === CONTEXT MANAGEMENT OVERRIDE ===
     procedure SetContext(AContext: TParserContext); override;
@@ -259,6 +290,7 @@ begin
   FExpressionParser := TExpressionParser.Create;
   FOptions := DefaultParserOptions;
   FDialectOverride := pdAuto;  // detect dialect from each program's tokens unless forced
+  ClearStatementHandlers;      // no per-dialect statement overrides until a profile installs them
 
   // === TIER 1: Enable adaptive memoization for BASIC (linear programs) ===
   // Most BASIC programs are linear with simple control flow
@@ -301,6 +333,58 @@ begin
     if Assigned(Context) and Assigned(Context.TokenList) then
       FModernMode := not Context.TokenList.HasTokenType(ttLineNumber);
   end;
+  ApplyDialectProfile;   // keep the installed handlers in sync with the forced/redetected dialect
+end;
+
+procedure TPackratParser.RegisterStatementHandler(TokenType: TTokenType; Handler: TStatementParseFunc);
+begin
+  FStmtHandlers[TokenType] := Handler;
+end;
+
+procedure TPackratParser.ClearStatementHandlers;
+var
+  tt: TTokenType;
+begin
+  for tt := Low(TTokenType) to High(TTokenType) do
+    FStmtHandlers[tt] := nil;
+end;
+
+procedure TPackratParser.ApplyDialectProfile;
+// Build the active profile from the resolved dialect (FModernMode) and (re)install the dialect's
+// statement handlers. Idempotent: clears first, so it is safe to call again on a dialect switch
+// (NEW MODERN/CLASSIC, OPTION MODE, LOAD re-detect). Mechanism-2 expression parse-rules would be
+// (re)registered here too once a construct's expression syntax diverges by dialect (none today).
+begin
+  FProfile.Modern := FModernMode;
+  FProfile.SwapIsStatement := FModernMode;
+  FProfile.MidIsStatement := FModernMode;
+
+  ClearStatementHandlers;
+  if FProfile.SwapIsStatement then
+    RegisterStatementHandler(ttMemoryCommand, @MemSwapStatementHandler);
+  if FProfile.MidIsStatement then
+    RegisterStatementHandler(ttIdentifier, @IdentMidStatementHandler);
+end;
+
+function TPackratParser.MemSwapStatementHandler: TASTNode;
+// MODERN override for ttMemoryCommand: SWAP exchanges two lvalues. Any other memory command declines
+// (returns nil) so the built-in ParseMemoryStatement handles it (POKE/BANK/...).
+begin
+  if UpperCase(Context.CurrentToken.Value) = 'SWAP' then
+    Result := ParseSwapStatement
+  else
+    Result := nil;
+end;
+
+function TPackratParser.IdentMidStatementHandler: TASTNode;
+// MODERN override for ttIdentifier: the in-place "MID(dst,start[,len]) = src" statement. Declines
+// (nil) for any other identifier, and for MID(...) without a trailing '=' (ParseMidStatement returns
+// nil), so the normal identifier path (label / assignment / call / expression) runs instead.
+begin
+  Result := nil;
+  if (UpperCase(Context.CurrentToken.Value) = 'MID') and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+    Result := ParseMidStatement;
 end;
 
 // === MAIN PARSING METHODS ===
@@ -327,6 +411,7 @@ begin
     else
       FModernMode := Assigned(TokenList) and not TokenList.HasTokenType(ttLineNumber);
     end;
+    ApplyDialectProfile;   // install the dialect's statement handlers for this parse
 
     DoParsingStarted;
 
@@ -507,6 +592,17 @@ begin
    Exit;
  end;
 
+ // Dialect-pluggable (mechanism 3): a per-dialect statement handler for this token type takes
+ // priority over the built-in dispatch. It may decline by returning nil without committing, in
+ // which case we restore the cursor and fall through to the case below.
+ if Assigned(FStmtHandlers[Token.TokenType]) then
+ begin
+   SavedIndex := Context.CurrentIndex;
+   Result := FStmtHandlers[Token.TokenType]();
+   if Assigned(Result) then Exit;
+   Context.CurrentIndex := SavedIndex;
+ end;
+
  // Route to appropriate statement parser based on keyword
  case Token.TokenType of
     // === I/O COMMANDS ===
@@ -685,26 +781,9 @@ begin
           Context.Advance;   // consume ':'
           DoNodeCreated(Result);
         end
-        // FreeBASIC MID statement: "MID(dst, start [,len]) = src" overwrites in place. Only in
-        // MODERN (in v7 MID$ is a function and bare MID is a plain identifier). Recognized by the
-        // bare keyword MID followed by '('; ParseMidStatement returns nil if there is no trailing
-        // '=', so a stray MID(...) expression falls back below.
-        else if FModernMode and (UpperCase(Token.Value) = 'MID') and
-                Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
-        begin
-          SavedIndex := Context.CurrentIndex;
-          Result := Memoize('MidStatement', @ParseMidStatement);
-          if not Assigned(Result) then
-          begin
-            Context.CurrentIndex := SavedIndex;
-            Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
-            if not Assigned(Result) then
-            begin
-              Context.CurrentIndex := SavedIndex;
-              Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
-            end;
-          end;
-        end
+        // Note: the FreeBASIC in-place "MID(dst,start[,len]) = src" statement (MODERN) is intercepted
+        // earlier by the dialect profile's IdentMidStatementHandler (mechanism 3), so it does not need
+        // a branch here; in CLASSIC bare MID is a plain identifier handled by the default path below.
         else
         begin
           // Prova SEMPRE assignment prima per identifier
@@ -2804,10 +2883,9 @@ begin
   Token := Context.CurrentToken;
   CmdName := UpperCase(Token.Value);
 
-  // SWAP is dialect-dependent: in BASIC v7 (CLASSIC) it is the C128 RAM-bank memory command,
-  // but in FreeBASIC (MODERN) it exchanges two lvalues. Disambiguate on the program dialect.
-  if (CmdName = 'SWAP') and ModernMode then
-    Exit(ParseSwapStatement);
+  // SWAP is dialect-dependent: here (reached only in CLASSIC, or in MODERN for a non-SWAP command)
+  // it is the C128 RAM-bank memory command. In MODERN, SWAP a,b is intercepted earlier by the dialect
+  // profile's MemSwapStatementHandler (mechanism 3), so it never reaches this v7 path.
 
   // Select appropriate node type based on command
   if CmdName = 'POKE' then
