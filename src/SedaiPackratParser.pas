@@ -42,6 +42,9 @@ type
     FStartTime: TDateTime;
     FOptions: TParserOptions;
     FValidationStacks: TParserValidationStacks;
+    // Dialect: True when the source has no line numbers (FreeBASIC / MODERN). Computed
+    // once per Parse from the token stream; mirrors the SSA's SourceHasLineNumbers gate.
+    FModernMode: Boolean;
 
     // options & configuration
     function DefaultParserOptions: TParserOptions;
@@ -73,6 +76,11 @@ type
     destructor Destroy; override;
 
     property Options: TParserOptions read GetOptions write SetOptions;
+
+    // Dialect of the program being parsed: MODERN (FreeBASIC, no line numbers) vs
+    // CLASSIC (BASIC v7, line-numbered). Used to disambiguate keywords that exist in
+    // both dialects with different meaning (e.g. SWAP, MID). = NOT (has line numbers).
+    property ModernMode: Boolean read FModernMode;
 
     // === CONTEXT MANAGEMENT OVERRIDE ===
     procedure SetContext(AContext: TParserContext); override;
@@ -280,6 +288,9 @@ begin
     {$IFDEF DEBUG}
     Context.DebugMode := DebugMode;
     {$ENDIF}
+
+    // Determine the dialect once: a program with no line-number tokens is FreeBASIC (MODERN).
+    FModernMode := Assigned(TokenList) and not TokenList.HasTokenType(ttLineNumber);
 
     DoParsingStarted;
 
@@ -2727,10 +2738,9 @@ begin
   Token := Context.CurrentToken;
   CmdName := UpperCase(Token.Value);
 
-  // SWAP is dialect-dependent: in BASIC v7 (CLASSIC, line-numbered) it is the C128 RAM-bank
-  // memory command, but in FreeBASIC (MODERN, no line numbers) it exchanges two lvalues.
-  // A program with no ttLineNumber tokens is the FreeBASIC dialect -> variable swap.
-  if (CmdName = 'SWAP') and not Context.TokenList.HasTokenType(ttLineNumber) then
+  // SWAP is dialect-dependent: in BASIC v7 (CLASSIC) it is the C128 RAM-bank memory command,
+  // but in FreeBASIC (MODERN) it exchanges two lvalues. Disambiguate on the program dialect.
+  if (CmdName = 'SWAP') and ModernMode then
     Exit(ParseSwapStatement);
 
   // Select appropriate node type based on command
