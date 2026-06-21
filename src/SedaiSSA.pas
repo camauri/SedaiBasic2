@@ -11168,20 +11168,34 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessMemberStore(MemberNode, ExprNode: TASTNode);
-// Lower "obj.field = expr" to ssaRecordStore<bank>(handle, value, slot).
+// Lower "obj.field = expr" to ssaRecordStore<bank>(handle, value, slot). If the member is not a field
+// but a PROPERTY setter (FreeBASIC), lower a method call obj.<prop>.SET(expr) instead.
 var
   TypeName, NestedT: string;
   UDTIdx, Slot: Integer;
   Bank: TSSARegisterType;
-  HandleVal, ExprVal: TSSAValue;
+  HandleVal, ExprVal, DummyVal: TSSAValue;
   Op: TSSAOpCode;
+  SetterArgs: TASTNode;
 begin
   if MemberNode.ChildCount < 1 then Exit;
   // Evaluate the RHS first, then resolve the target (object handle). Order matters only for
   // side effects; both are emitted before the store.
   if not ResolveRecordObject(MemberNode.GetChild(0), HandleVal, TypeName) then Exit;
   UDTIdx := FindUDT(TypeName);
-  if not UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot, NestedT) then Exit;
+  if not UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot, NestedT) then
+  begin
+    // Not a field — a PROPERTY setter? obj.prop = expr -> SUB Type.prop.SET(expr).
+    if ResolveMethodLabel(TypeName, VarToStr(MemberNode.Value) + '.SET') <> '' then
+    begin
+      SetterArgs := TASTNode.Create(antArgumentList, MemberNode.Token);
+      SetterArgs.AddChild(ExprNode.Clone);
+      ProcessMethodCall(MemberNode.GetChild(0), TypeName, VarToStr(MemberNode.Value) + '.SET',
+                        SetterArgs, DummyVal);
+      SetterArgs.Free;
+    end;
+    Exit;
+  end;
 
   ProcessExpression(ExprNode, ExprVal);
   // B1.5: a field declared with a narrow integer type or SINGLE wraps/rounds the value on store.

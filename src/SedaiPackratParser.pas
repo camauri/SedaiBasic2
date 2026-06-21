@@ -695,7 +695,8 @@ begin
     ttProcedureDefine: Result := Memoize('DefStatement', @ParseDefStatement);
     ttProcedureStart:
       if (UpperCase(Token.Value) = kSUB) or (UpperCase(Token.Value) = kFUNCTION) or
-         (UpperCase(Token.Value) = kCONSTRUCTOR) or (UpperCase(Token.Value) = kDESTRUCTOR) then
+         (UpperCase(Token.Value) = kCONSTRUCTOR) or (UpperCase(Token.Value) = kDESTRUCTOR) or
+         (UpperCase(Token.Value) = kPROPERTY) then
         Result := Memoize('ProcedureDecl', @ParseProcedureDecl)
       else
         Result := Memoize('FnStatement', @ParseFnStatement);
@@ -1610,6 +1611,25 @@ begin
     end;
     if Context.Check(ttDelimParClose) then
       Context.Advance;                            // )
+  end;
+
+  // PROPERTY (FreeBASIC OOP) desugars to a method: a getter "PROPERTY T.p() AS RT" becomes
+  // FUNCTION T.p (read via obj.p), a setter "PROPERTY T.p(v AS VT)" becomes SUB T.p.SET (write via
+  // obj.p = v). Decided by explicit param count (THIS excluded). After this, the FUNCTION/SUB
+  // machinery (return type, body, END) applies unchanged; END PROPERTY is accepted generically.
+  if (Kind = kPROPERTY) and Assigned(NameNode) then
+  begin
+    if (ParamList.ChildCount - 1) >= 1 then       // >=1 explicit param (THIS at index 0) => setter
+    begin
+      Kind := kSUB;
+      Result.Value := kSUB;
+      NameNode.Value := QualName + '.SET';
+    end
+    else
+    begin
+      Kind := kFUNCTION;                           // getter returns the property value
+      Result.Value := kFUNCTION;
+    end;
   end;
 
   // FUNCTION return type: "FUNCTION name(...) AS rettype" (M3.2). Attach the type as a child

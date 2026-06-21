@@ -68,6 +68,7 @@ const
   kEXTENDS = 'EXTENDS';  // TYPE Child EXTENDS Parent: single inheritance
   kCONSTRUCTOR = 'CONSTRUCTOR'; // CONSTRUCTOR Type(...): auto-called at instance allocation (M4.4)
   kDESTRUCTOR  = 'DESTRUCTOR';  // DESTRUCTOR Type(): auto-called at scope exit for a local (V5)
+  kPROPERTY    = 'PROPERTY';    // PROPERTY Type.name [()|(value)]: getter/setter (FreeBASIC OOP)
   kBYVAL   = 'BYVAL';    // BYVAL: pass parameter by value (copy)
   kBYREF   = 'BYREF';    // BYREF: pass parameter by reference (alias) — the default
   kBASE    = 'BASE';     // BASE(args): explicit base-constructor call inside a child CONSTRUCTOR (M4.4f)
