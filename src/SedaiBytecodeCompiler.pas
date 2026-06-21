@@ -141,6 +141,8 @@ begin
     ssaNegFloat: Result := bcNegFloat;
     ssaIntToFloat: Result := bcIntToFloat;
     ssaFloatToInt: Result := bcFloatToInt;
+    ssaIntToString: Result := bcIntToString;
+    ssaFloatToString: Result := bcFloatToString;
     // Comparison operators
     ssaCmpEqInt: Result := bcCmpEqInt;
     ssaCmpNeInt: Result := bcCmpNeInt;

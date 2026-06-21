@@ -1507,8 +1507,24 @@ begin
         end;
 
       else
+        // FreeBASIC "&": ALWAYS string concatenation; coerce both operands to their string form
+        // (numeric operands become their STR$ representation).
+        if Node.Token.TokenType = ttOpConcat then
+        begin
+          // Materialize numeric constants into a register first (EnsureStringRegister only coerces
+          // registers / const strings), then convert each operand to its string form.
+          if Left.Kind = svkConstInt then Left := EnsureIntRegister(Left)
+          else if Left.Kind = svkConstFloat then Left := EnsureFloatRegister(Left);
+          if Right.Kind = svkConstInt then Right := EnsureIntRegister(Right)
+          else if Right.Kind = svkConstFloat then Right := EnsureFloatRegister(Right);
+          Left := EnsureStringRegister(Left);
+          Right := EnsureStringRegister(Right);
+          DestReg := FProgram.AllocRegister(srtString);
+          Result := MakeSSARegister(srtString, DestReg);
+          EmitInstruction(ssaStrConcat, Result, Left, Right, MakeSSAValue(svkNone));
+        end
         // SPECIAL CASE: String concatenation (string + string or string + any)
-        if (Node.Token.TokenType = ttOpAdd) and
+        else if (Node.Token.TokenType = ttOpAdd) and
            ((Left.RegType = srtString) or (Right.RegType = srtString)) then
         begin
           // String concatenation

@@ -429,6 +429,8 @@ begin
   // Bit shifts (FreeBASIC): looser than +/-, tighter than comparisons.
   Context.SetParseRule(ttOpShl, MakeInfixRule(@StaticParseBinaryOperator, precShift));
   Context.SetParseRule(ttOpShr, MakeInfixRule(@StaticParseBinaryOperator, precShift));
+  // String concatenation (FreeBASIC): looser than +/-, tighter than SHL/SHR.
+  Context.SetParseRule(ttOpConcat, MakeInfixRule(@StaticParseBinaryOperator, precConcat));
   Context.SetParseRule(ttOpPow, MakeInfixRule(@StaticParsePower, precPower));
 
   // Comparison operators

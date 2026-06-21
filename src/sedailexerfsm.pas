@@ -1856,6 +1856,22 @@ begin
         end;
 
       // === AT OPERATOR (proc-address prefix: @subname) ===
+      '&':
+        begin
+          // FreeBASIC string concatenation. Compound "&=" emits a ttCompoundAssign (value '&').
+          // (The &H/&O/&B hex/oct/bin literal prefixes are a separate, not-yet-supported feature.)
+          ResetToken;
+          TokenBufferAdd(CurrentChar);
+          AdvanceChar;
+          if GetCurrentChar = '=' then begin AdvanceChar; Result := CreateToken(ttCompoundAssign); end
+          else Result := CreateToken(ttOpConcat);
+          {$IFDEF DEBUG}
+          if FDebugMode then
+            FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
+          {$ENDIF}
+          Exit;
+        end;
+
       '@':
         begin
           ResetToken;

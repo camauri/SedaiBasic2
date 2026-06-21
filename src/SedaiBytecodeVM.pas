@@ -2693,6 +2693,14 @@ begin
     bcNegFloat: Ctx.FloatRegs[Instr.Dest] := -Ctx.FloatRegs[Instr.Src1];
     bcIntToFloat: Ctx.FloatRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
     bcFloatToInt: Ctx.IntRegs[Instr.Dest] := Trunc(Ctx.FloatRegs[Instr.Src1]);
+    // Numeric -> string (FreeBASIC Str() / "&" concat): no leading sign-space, unlike v7 STR$.
+    bcIntToString: Ctx.StringRegs[Instr.Dest] := IntToStr(Ctx.IntRegs[Instr.Src1]);
+    bcFloatToString:
+      begin
+        Ctx.StringRegs[Instr.Dest] := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]);
+        if (Length(Ctx.StringRegs[Instr.Dest]) > 0) and (Ctx.StringRegs[Instr.Dest][1] = ' ') then
+          Delete(Ctx.StringRegs[Instr.Dest], 1, 1);
+      end;
     bcFloatRound: Ctx.IntRegs[Instr.Dest] := Round(Ctx.FloatRegs[Instr.Src1]);  // CINT (round-to-even)
     bcNarrowInt: Ctx.IntRegs[Instr.Dest] := NarrowInt64(Ctx.IntRegs[Instr.Src1], Instr.Immediate);  // B1.5
     bcNarrowSingle: Ctx.FloatRegs[Instr.Dest] := Single(Ctx.FloatRegs[Instr.Src1]);                  // B1.5

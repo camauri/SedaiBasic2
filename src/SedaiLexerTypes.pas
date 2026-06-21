@@ -84,6 +84,7 @@ type
     ttOpMul,                 // *
     ttOpDiv,                 // /
     ttOpIntDiv,              // \ (FreeBASIC integer division)
+    ttOpConcat,              // & (FreeBASIC string concatenation)
     ttOpShl,                 // SHL (FreeBASIC shift left)
     ttOpShr,                 // SHR (FreeBASIC shift right)
     ttOpPow,                 // ^

@@ -450,6 +450,15 @@ begin
         // Type conversions
         bcIntToFloat: begin FloatRegs[Instr.Dest] := IntRegs[Instr.Src1]; Inc(CurPC); end;
         bcFloatToInt: begin IntRegs[Instr.Dest] := Trunc(FloatRegs[Instr.Src1]); Inc(CurPC); end;
+        // Numeric -> string (FreeBASIC Str() / "&" concat): no leading sign-space, unlike v7 STR$.
+        bcIntToString: begin Ctx.StringRegs[Instr.Dest] := IntToStr(IntRegs[Instr.Src1]); Inc(CurPC); end;
+        bcFloatToString:
+          begin
+            Ctx.StringRegs[Instr.Dest] := FConsoleBehavior.FormatNumber(FloatRegs[Instr.Src1]);
+            if (Length(Ctx.StringRegs[Instr.Dest]) > 0) and (Ctx.StringRegs[Instr.Dest][1] = ' ') then
+              Delete(Ctx.StringRegs[Instr.Dest], 1, 1);
+            Inc(CurPC);
+          end;
         bcFloatRound: begin IntRegs[Instr.Dest] := Round(FloatRegs[Instr.Src1]); Inc(CurPC); end;  // CINT (round-to-even)
         bcNarrowInt: begin IntRegs[Instr.Dest] := NarrowInt64(IntRegs[Instr.Src1], Instr.Immediate); Inc(CurPC); end;  // B1.5
         bcNarrowSingle: begin FloatRegs[Instr.Dest] := Single(FloatRegs[Instr.Src1]); Inc(CurPC); end;  // B1.5

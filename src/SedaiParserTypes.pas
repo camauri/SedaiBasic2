@@ -244,6 +244,7 @@ type
     precEquality,       // = <> (comparison)
     precComparison,     // < > <= >=
     precShift,          // SHL SHR (FreeBASIC: looser than +/-, tighter than comparisons)
+    precConcat,         // & (FreeBASIC string concat: looser than +/-, tighter than SHL/SHR)
     precTerm,           // + -
     precFactor,         // * / \ MOD
     precUnary,          // - NOT
@@ -334,6 +335,7 @@ begin
     ttOpLt, ttOpGt, ttOpLe, ttOpGe: Result := precComparison;
 
     // Addition/Subtraction
+    ttOpConcat: Result := precConcat;
     ttOpAdd, ttOpSub: Result := precTerm;
 
     // Multiplication/Division (\ = integer division)
@@ -366,6 +368,7 @@ begin
     precEquality: Result := 'Equality';
     precComparison: Result := 'Comparison';
     precShift: Result := 'Shift';
+    precConcat: Result := 'Concat';
     precTerm: Result := 'Term';
     precFactor: Result := 'Factor';
     precUnary: Result := 'Unary';

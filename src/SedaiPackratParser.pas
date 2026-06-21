@@ -831,6 +831,7 @@ begin
       '*': OpType := ttOpMul;
       '/': OpType := ttOpDiv;
       '\': OpType := ttOpIntDiv;   // FreeBASIC integer-division compound "\="
+      '&': OpType := ttOpConcat;   // FreeBASIC string-concat compound "&="
       '^': OpType := ttOpPow;
     else
       OpType := ttOpAdd;
