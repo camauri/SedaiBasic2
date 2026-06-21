@@ -1684,6 +1684,15 @@ begin
     Result.Value := kFUNCTION;
   end;
 
+  // FreeBASIC BYREF function result: "FUNCTION name(...) BYREF AS rettype" returns a reference (the
+  // SSA lowers it to return an address; the caller reads/writes through it). Mark and consume BYREF.
+  if (Kind = kFUNCTION) and Context.Check(ttParamMode) and
+     (UpperCase(Context.CurrentToken.Value) = kBYREF) and Assigned(NameNode) then
+  begin
+    Result.Attributes.Values['BYREFRET'] := '1';
+    Context.Advance;                                // consume BYREF
+  end;
+
   // FUNCTION return type: "FUNCTION name(...) AS rettype" (M3.2). Attach the type as a child
   // of the name node so the pre-scan can type the function name (UDT handle / builtin bank).
   if (Kind = kFUNCTION) and Context.Check(ttAsType) and Assigned(NameNode) then

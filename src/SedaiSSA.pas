@@ -138,6 +138,8 @@ type
     // routed to element 0 of this array, so the value is never a per-thread register.
     FSharedScalarArr: TStringList;       // name (UPPER) -> array index (Objects[]=PtrInt arrayIdx)
     FPointerVars: TStringList;           // FreeBASIC pointers: var name (UPPER) -> pointee type name (e.g. "INTEGER")
+    FByrefRetFuncs: TStringList;         // FreeBASIC BYREF function results: func name (UPPER) -> pointee type name
+    FCurrentProcByrefRet: Boolean;       // lowering a "FUNCTION f() BYREF AS T" (returns an address)
     FVarWidthCode: TStringList;          // B1.5 phase 2: name (UPPER) -> narrow width code (Objects[]=PtrInt 1..7)
     FVarPrintKind: TStringList;          // B1.5 phase C: name (UPPER) -> 1=BOOLEAN, 2=unsigned-64 (print form)
     FArrayElemWidth: TStringList;        // B1.5: array name (UPPER) -> element narrow width code (1..7)
@@ -238,6 +240,9 @@ type
     procedure CollectDimVarBanks(Node: TASTNode; Dict: TStringList);
     procedure MarkAddressTaken(Node: TASTNode; Dict: TStringList);
     function PointeeBankOf(const PtrName: string): TSSARegisterType;            // bank of *p from p's declared pointee
+    function EmitVarAddress(const Name: string): TSSAValue;                     // address (arrayId+1) of a backed scalar (0=NULL)
+    function IsByrefRetFunc(const Name: string): Boolean;                       // FUNCTION declared BYREF AS T?
+    function ByrefRetPointeeBank(const Name: string): TSSARegisterType;         // bank of a byref function's pointee
     // FB lexical scope (MODERN only). ScopePushFrame/ScopePopFrame manage FScopeStack; the block
     // variants emit the M8 record-mark instructions. Inert in CLASSIC mode (callers gate on FModernMode).
     procedure ScopePushFrame(Kind: TScopeKind);
@@ -470,6 +475,7 @@ begin
   FSharedVars.CaseSensitive := False;
   FSharedScalarArr := TStringList.Create;
   FPointerVars := TStringList.Create;
+  FByrefRetFuncs := TStringList.Create;
   FSharedScalarArr.CaseSensitive := False;
   FVarWidthCode := TStringList.Create;
   FVarWidthCode.CaseSensitive := False;
@@ -507,6 +513,7 @@ begin
   FSharedVars.Free;
   FSharedScalarArr.Free;
   FPointerVars.Free;
+  FByrefRetFuncs.Free;
   FVarWidthCode.Free;
   FVarPrintKind.Free;
   FArrayElemWidth.Free;
@@ -3185,6 +3192,39 @@ begin
     Exit;
   end;
 
+  // FreeBASIC BYREF function result as an lvalue: "f(args) = expr". The call returns the address of
+  // the referenced variable; store expr through it (parsed like an array access / call target).
+  if (VarNode.NodeType = antArrayAccess) and (VarNode.ChildCount >= 1) and
+     (VarNode.GetChild(0).NodeType = antIdentifier) and
+     IsByrefRetFunc(VarToStr(VarNode.GetChild(0).Value)) then
+  begin
+    VarName := VarToStr(VarNode.GetChild(0).Value);
+    if VarNode.ChildCount >= 2 then
+      EmitProcedureCall(VarName, VarNode.GetChild(1))
+    else
+      EmitProcedureCall(VarName, nil);
+    VarReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitXferLoad(srtInt, XFER_RESULT_SLOT, VarReg);   // VarReg = returned address
+    DerefBank := ByrefRetPointeeBank(VarName);
+    ProcessExpression(ExprNode, ExprValue);
+    case DerefBank of
+      srtFloat:
+        begin
+          ExprValue := EnsureFloatRegister(ExprValue);
+          EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+        end;
+      srtString:
+        begin
+          ExprValue := EnsureStringRegister(ExprValue);
+          EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+        end;
+    else
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+    end;
+    Exit;
+  end;
+
   // Check if target is array access (array store)
   if VarNode.NodeType = antArrayAccess then
   begin
@@ -3239,6 +3279,14 @@ begin
       (Pos('.', FCurrentProcName) > 0) and
       (UpperCase(VarName) = Copy(FCurrentProcName, Pos('.', FCurrentProcName) + 1, MaxInt))) then
   begin
+    // FreeBASIC BYREF result: return the ADDRESS of the named (address-backed) variable, not its
+    // value, so the caller can read or write through it. The returned variable must be address-backed
+    // (a SHARED/global scalar or one whose address is taken); a local would dangle (v1: not enforced).
+    if FCurrentProcByrefRet and (ExprNode.NodeType = antIdentifier) then
+    begin
+      EmitXferStore(srtInt, XFER_RESULT_SLOT, EmitVarAddress(VarToStr(ExprNode.Value)));
+      Exit;
+    end;
     ProcessExpression(ExprNode, ExprValue);
     // V3: a UDT result is copied (by value) into the caller-allocated result instance; a scalar
     // result is staged into the result transfer slot as before.
@@ -11052,6 +11100,38 @@ begin
   end;
 end;
 
+function TSSAGenerator.EmitVarAddress(const Name: string): TSSAValue;
+// The address of an address-backed scalar (its 1-element backing array id + 1; 0 stays NULL). Emits a
+// constant load. Returns a 0 constant when the variable is not backed (a deref would then fault).
+var
+  idx: Integer;
+begin
+  idx := FSharedScalarArr.IndexOf(UpperCase(Name));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if idx >= 0 then
+    EmitInstruction(ssaLoadConstInt, Result,
+                    MakeSSAConstInt(PtrInt(FSharedScalarArr.Objects[idx]) + 1),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  else
+    EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.IsByrefRetFunc(const Name: string): Boolean;
+begin
+  Result := FByrefRetFuncs.IndexOfName(UpperCase(Name)) >= 0;
+end;
+
+function TSSAGenerator.ByrefRetPointeeBank(const Name: string): TSSARegisterType;
+var
+  idx: Integer;
+begin
+  Result := srtInt;
+  idx := FByrefRetFuncs.IndexOfName(UpperCase(Name));
+  if idx >= 0 then
+    Result := TypeNameToBank(FByrefRetFuncs.ValueFromIndex[idx], Name);
+end;
+
 procedure TSSAGenerator.EmitSharedSyncOut;
 // M6: store each shared global's current register value into its dedicated transfer slot, so a
 // callee (or the caller, after the call) reads the up-to-date value across the frame save/restore.
@@ -11139,7 +11219,7 @@ var
   FuncRetType: TSSARegisterType;
   RecType: string;
   UDTIdx: Integer;
-  RcHandle: TSSAValue;
+  RcHandle, AddrVal: TSSAValue;
 begin
   RecType := VarRecordTypeName(Name);
   if RecType <> '' then
@@ -11155,6 +11235,23 @@ begin
     EmitCallSubLabel(ProcedureLabelName(Name));
     EmitByrefWriteback(Name, ArgsNode);   // BYREF: copy explicit-BYREF scalar params back into variable args
     Result := RcHandle;
+  end
+  else if IsByrefRetFunc(Name) then
+  begin
+    // FreeBASIC BYREF result used as an rvalue: the function returns an address; load it and then
+    // dereference through it to read the pointee value. (Lvalue use "(f())=rhs" is handled in
+    // ProcessAssignment, which stores through the same address instead.)
+    EmitProcedureCall(Name, ArgsNode);
+    AddrVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitXferLoad(srtInt, XFER_RESULT_SLOT, AddrVal);
+    FuncRetType := ByrefRetPointeeBank(Name);
+    Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
+    case FuncRetType of
+      srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    else
+      EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
   end
   else
   begin
@@ -11401,7 +11498,7 @@ procedure TSSAGenerator.CollectProcedureDecl(Node: TASTNode);
 // AST layout: child 0 = name (antIdentifier), child 1 = antParameterList, rest = body.
 var
   NameNode: TASTNode;
-  Name: string;
+  Name, Pointee: string;
   n: Integer;
 begin
   if Node.ChildCount = 0 then Exit;
@@ -11425,6 +11522,15 @@ begin
   if FProcedureNames.IndexOf(Name) < 0 then
     FProcedureNames.Add(Name);
   FProcDecls.AddOrSetValue(Name, Node);
+  // FreeBASIC BYREF function result: the function returns an address; record its pointee type (the
+  // declared return type, attached as the name node's type child by the parser).
+  if (Node.Attributes.Values['BYREFRET'] = '1') and (FByrefRetFuncs.IndexOfName(Name) < 0) then
+  begin
+    Pointee := 'INTEGER';
+    if (NameNode.ChildCount >= 1) and (NameNode.GetChild(0).NodeType = antIdentifier) then
+      Pointee := UpperCase(VarToStr(NameNode.GetChild(0).Value));
+    FByrefRetFuncs.Add(Name + '=' + Pointee);
+  end;
 end;
 
 procedure TSSAGenerator.PreCollectProcedures(Node: TASTNode);
@@ -11638,6 +11744,7 @@ begin
     FCurrentProcName := Name;
     FCurrentProcIsFunction := (UpperCase(VarToStr(Proc.Value)) = kFUNCTION);
     FCurrentProcRetType := GetVariableType(Name);
+    FCurrentProcByrefRet := IsByrefRetFunc(Name);         // BYREF result: the function returns an address
     FCurrentProcRetRecType := VarRecordTypeName(Name);   // V3: '' unless it returns a UDT by value
     FCurrentResultHandle := MakeSSAValue(svkNone);
     FCurrentProcLocalRecs.Clear;                          // V5: gather DIM'd local UDTs for dtors
@@ -12087,12 +12194,18 @@ begin
         // FUNCTION also stages the result.
         if (Node.ChildCount > 0) and FCurrentProcIsFunction then
         begin
-          ProcessExpression(Node.GetChild(0), RetVal);
-          // V3: UDT result copied by value into the caller's result instance; scalar via xfer slot.
-          if FCurrentProcRetRecType <> '' then
-            EmitRecordCopy(FCurrentResultHandle, RetVal, FindUDT(FCurrentProcRetRecType))
+          // FreeBASIC BYREF result: stage the ADDRESS of the returned (address-backed) variable.
+          if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) then
+            EmitXferStore(srtInt, XFER_RESULT_SLOT, EmitVarAddress(VarToStr(Node.GetChild(0).Value)))
           else
-            EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, RetVal);
+          begin
+            ProcessExpression(Node.GetChild(0), RetVal);
+            // V3: UDT result copied by value into the caller's result instance; scalar via xfer slot.
+            if FCurrentProcRetRecType <> '' then
+              EmitRecordCopy(FCurrentResultHandle, RetVal, FindUDT(FCurrentProcRetRecType))
+            else
+              EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, RetVal);
+          end;
         end;
         EmitAllBlockScopesCleanup;   // M8: unwind active loop block scopes before the frame exit
         EmitFrameDestructors;   // V5: destroy local UDTs before returning
@@ -12408,6 +12521,7 @@ begin
   FSharedVars.Clear;
   FSharedScalarArr.Clear;
   FPointerVars.Clear;
+  FByrefRetFuncs.Clear;
   FVarWidthCode.Clear;
   FVarPrintKind.Clear;
   FArrayElemWidth.Clear;
