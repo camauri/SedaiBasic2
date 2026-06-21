@@ -860,6 +860,7 @@ var
   RReg, GReg, BReg, AReg: TSSAValue;
   // String function handling
   Arg2Value, Arg3Value, Arg2Reg, Arg3Reg: TSSAValue;
+  RevLen, RevSum, RevOne, RevCnt, RevPrefix: TSSAValue;  // INSTRREV(str,sub,start) lowering temps
   // User function handling
   FnDef: TUserFunctionDef;
   OldParamValue: TSSAValue;
@@ -2074,13 +2075,36 @@ begin
         end
         else if (FuncName = 'INSTRREV') then
         begin
-          // INSTRREV(str, sub) -> int position of the last occurrence (Dest=int, two string args).
+          // INSTRREV(str, sub [, start]) -> int position of the last occurrence of sub (Dest=int).
+          // With an explicit `start` (FreeBASIC), only matches that BEGIN at or before `start` count:
+          // lowered (like the MID statement, with existing ops, no new opcode) as
+          //   INSTRREV( LEFT$(str, start + LEN(sub) - 1), sub )
+          // so a match starting at position P survives iff P + LEN(sub) - 1 <= start + LEN(sub) - 1,
+          // i.e. P <= start. Assumes start >= 1 (the usual case); a non-positive runtime start narrows
+          // to a short prefix rather than searching from the end (use the 2-arg form for from-the-end).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
             ProcessExpression(ArgListNode.GetChild(0), ArgValue);   // str
             ProcessExpression(ArgListNode.GetChild(1), Arg2Value);  // substring
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureStringRegister(Arg2Value);
+            if ArgListNode.ChildCount >= 3 then
+            begin
+              ProcessExpression(ArgListNode.GetChild(2), Arg3Value);  // start (1-based)
+              Arg3Reg := EnsureIntRegister(Arg3Value);
+              // cnt = start + LEN(sub) - 1 ; str := LEFT$(str, cnt)
+              RevLen := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaStrLen, RevLen, Arg2Reg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              RevSum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaAddInt, RevSum, Arg3Reg, RevLen, MakeSSAValue(svkNone));
+              RevOne := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaLoadConstInt, RevOne, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              RevCnt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaSubInt, RevCnt, RevSum, RevOne, MakeSSAValue(svkNone));
+              RevPrefix := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+              EmitInstruction(ssaStrLeft, RevPrefix, ArgReg, RevCnt, MakeSSAValue(svkNone));
+              ArgReg := RevPrefix;   // search within the restricted prefix
+            end;
             DestReg := FProgram.AllocRegister(srtInt);
             Result := MakeSSARegister(srtInt, DestReg);
             EmitInstruction(ssaStrInstrRev, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
