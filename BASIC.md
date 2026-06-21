@@ -1570,7 +1570,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `WHILE..WEND (or 'WHILE...END WHILE')` | ✓ | Executes a block of statements while a condition is met. |
 | `FOR..NEXT` | ✓ | Executes a block of statements while an iterator is less than or greater than an expression. |
 | `DO..LOOP` | ✓ | Executes a block of statements while or until a condition is met. |
-| `CONTINUE WHILE, CONTINUE FOR and CONTINUE DO` | ✗ | Prematurely re-enters a loop. |
+| `CONTINUE WHILE, CONTINUE FOR and CONTINUE DO` | ✓ | Skip to the next loop iteration (innermost loop; FOR/DO forms). |
 | `EXIT WHILE, EXIT FOR and EXIT DO` | ✓ | Prematurely breaks out of a loop. |
 
 #### Procedures
@@ -2343,8 +2343,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `INSTR` | ✓ | Returns the first occurrence of a substring or character within a string. |
 | `INSTRREV` | ✓ | Position of the last occurrence of a substring. `INSTRREV(str, sub)` (B1.2; `start` arg deferred). |
 | `MID (Statement)` | ✗ | Copies a substring to a substring of a string. |
-| `LSET` | ✗ | Left-justifies a string. |
-| `RSET` | ✗ | Right-justifies a string. |
+| `LSET` | ✓ | Left-justifies a string into a buffer (string lvalues; QBasic `=` and FreeBASIC `,` forms). |
+| `RSET` | ✓ | Right-justifies a string into a buffer (string lvalues; QBasic `=` and FreeBASIC `,` forms). |
 
 ### Threading Support Functions
 
