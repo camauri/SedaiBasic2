@@ -121,6 +121,13 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | Conversions `CINT`/`CLNG`/`CSHORT`/`CBYTE`/`CDBL`/`CSNG`/`VALINT`/`OCT`/`BIN`... | ✓ | FreeBASIC type conversions (B1.3) |
 | `LBOUND`/`UBOUND`/`ERASE`/`REDIM [PRESERVE]` | ✓ | FreeBASIC array operations (B1.4) |
 | Math `ACOS`/`ASIN`/`ATAN2`/`FIX`/`FRAC` | ✓ | FreeBASIC math functions |
+| `&H`/`&O`/`&B` literals | ✓ | Hex / octal / binary integer literals |
+| `LSET`/`RSET` | ✓ | Justify a string into a buffer (QBasic `=` and FB `,` forms) |
+| `EXIT`/`CONTINUE n,n` | ✓ | Multi-level loop exit/continue (`Exit For, For`) |
+| `PROPERTY Type.name` | ✓ | Property getter/setter (desugars to method) |
+| `OPERATOR <sym>` | ✓ | Operator overloading for UDTs (binary, direct operands) |
+| `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like macros; function-like macros pending) |
+| `NAMESPACE` / BYREF-return / `WSTRING` | ✗ | Not yet implemented |
 
 ## Variable Scope
 
