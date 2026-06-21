@@ -269,6 +269,8 @@ type
     procedure ProcessMidStatement(Node: TASTNode);
     procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);
+    function InferExprBank(Node: TASTNode): TSSARegisterType;
+    procedure EmitIif(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure ProcessForLoop(Node: TASTNode);
     procedure ProcessDoLoop(Node: TASTNode);
     procedure ProcessBlock(Node: TASTNode);
@@ -2775,6 +2777,14 @@ begin
           Exit;
         end;
 
+        // FreeBASIC IIF(cond, a, b): short-circuit conditional expression. Parses as array access
+        // (IIF is not a registered keyword); intercept in MODERN when it is not a declared array.
+        if FModernMode and (UpperCase(ArrName) = 'IIF') and (FProgram.FindArray(ArrName) < 0) then
+        begin
+          EmitIif(Node.GetChild(1), Result);
+          Exit;
+        end;
+
         ArrayIdx := FProgram.FindArray(ArrName);
         if ArrayIdx < 0 then
           raise Exception.CreateFmt('Array not declared: %s', [ArrName]);
@@ -4124,6 +4134,103 @@ begin
     EmitInstruction(ssaStrLen, Arg3Reg, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     EmitInstruction(ssaStrMid, Result, ArgReg, Arg2Reg, Arg3Reg);
   end;
+end;
+
+function TSSAGenerator.InferExprBank(Node: TASTNode): TSSARegisterType;
+// Best-effort, non-emitting type of an expression — used only to pick the bank/suffix of the IIF
+// result temp. Covers the realistic IIF branch shapes (literals, variables, string functions,
+// concatenation/arithmetic); falls back to float when unknown.
+  function IsBareStringFunc(const Nm: string): Boolean;
+  begin
+    Result := (Nm = 'MID') or (Nm = 'STRING') or (Nm = 'UCASE') or (Nm = 'LCASE') or
+              (Nm = 'LTRIM') or (Nm = 'RTRIM') or (Nm = 'TRIM') or (Nm = 'SPACE');
+  end;
+var
+  Nm: string;
+  ai: Integer;
+  L, R: TSSARegisterType;
+begin
+  Result := srtFloat;
+  if Node = nil then Exit;
+  case Node.NodeType of
+    antLiteral:
+      if ((Node.Token <> nil) and (Node.Token.TokenType = ttStringLiteral)) or VarIsStr(Node.Value) then
+        Result := srtString
+      else if VarIsFloat(Node.Value) then
+        Result := srtFloat
+      else
+        Result := srtInt;
+    antIdentifier:
+      Result := GetVariableType(VarToStr(Node.Value));
+    antArrayAccess:
+      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+      begin
+        Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
+        if (Length(Nm) > 0) and ((Nm[Length(Nm)] = '$') or IsBareStringFunc(Nm)) then
+          Result := srtString
+        else
+        begin
+          ai := FProgram.FindArray(Nm);
+          if ai >= 0 then Result := FProgram.GetArray(ai).ElementType
+          else Result := srtInt;
+        end;
+      end;
+    antBinaryOp:
+      begin
+        L := InferExprBank(Node.GetChild(0));
+        if Node.ChildCount > 1 then R := InferExprBank(Node.GetChild(1)) else R := L;
+        if (L = srtString) or (R = srtString) then Result := srtString
+        else if (L = srtFloat) or (R = srtFloat) then Result := srtFloat
+        else Result := srtInt;
+      end;
+    antUnaryOp:
+      if Node.ChildCount > 0 then Result := InferExprBank(Node.GetChild(0));
+  end;
+end;
+
+procedure TSSAGenerator.EmitIif(ArgsNode: TASTNode; out Result: TSSAValue);
+// IIF(cond, a, b) (FreeBASIC): short-circuit conditional expression — only the taken branch is
+// evaluated. Lowered by REUSING ProcessIfStatement (the proven IF path, with correct PHIs at the
+// merge): synthesize "IF cond THEN tmp = a ELSE tmp = b", process it, then read tmp. The result
+// bank is taken from the TRUE branch (FB widens to float if either is float — not modelled here).
+var
+  IfNode, ThenNode, ElseNode, Asn: TASTNode;
+  Bank: TSSARegisterType;
+  TmpName, Suffix: string;
+begin
+  if (ArgsNode = nil) or (ArgsNode.ChildCount < 3) then begin Result := MakeSSAValue(svkNone); Exit; end;
+
+  Bank := InferExprBank(ArgsNode.GetChild(1));
+  case Bank of
+    srtString: Suffix := '$';
+    srtInt: Suffix := '%';
+  else
+    Suffix := '';
+  end;
+  TmpName := '__IIF' + IntToStr(FSwapTempSeq) + Suffix;
+  Inc(FSwapTempSeq);
+
+  IfNode := TASTNode.Create(antIf, ArgsNode.Token);
+  IfNode.AddChild(ArgsNode.GetChild(0).Clone);   // condition
+
+  ThenNode := TASTNode.Create(antThen, ArgsNode.Token);
+  Asn := TASTNode.Create(antAssignment, ArgsNode.Token);
+  Asn.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, ArgsNode.Token));
+  Asn.AddChild(ArgsNode.GetChild(1).Clone);       // true value
+  ThenNode.AddChild(Asn);
+  IfNode.AddChild(ThenNode);
+
+  ElseNode := TASTNode.Create(antElse, ArgsNode.Token);
+  Asn := TASTNode.Create(antAssignment, ArgsNode.Token);
+  Asn.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, ArgsNode.Token));
+  Asn.AddChild(ArgsNode.GetChild(2).Clone);       // false value
+  ElseNode.AddChild(Asn);
+  IfNode.AddChild(ElseNode);
+
+  ProcessIfStatement(IfNode);
+  IfNode.Free;
+
+  Result := GetOrAllocateVariable(TmpName);
 end;
 
 procedure TSSAGenerator.EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);
