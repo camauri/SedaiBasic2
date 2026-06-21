@@ -23,6 +23,8 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `MOD` | ✓ | Modulo operator |
 | `SHL` | ✓ | Bit shift left (FreeBASIC; looser than +/-, tighter than comparisons) |
 | `SHR` | ✓ | Bit shift right, logical (FreeBASIC) |
+| `&` | ✓ | String concatenation (FreeBASIC; coerces numbers to string, looser than +/-) |
+| `+= -= *= /= ^= \= &=` | ✓ | Compound assignment (FreeBASIC) |
 | `=` | ✓ | Equal operator |
 | `<` | ✓ | Lesser than operator |
 | `>` | ✓ | Greater than operator |
@@ -101,6 +103,24 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `SUB` | ✓ | Structured SUB procedure (FreeBASIC/QB): params (ByVal), locals, recursion. `END SUB` |
 | `FUNCTION` | ✓ | Structured FUNCTION: params, return via `fname=expr` or `RETURN expr`, recursion. `END FUNCTION` |
 | `CALL` | ✓ | Invoke a SUB: `CALL name(args)` (or `CALL name args`); `EXIT SUB`/`EXIT FUNCTION` for early return |
+
+## FreeBASIC (MODERN) additions
+
+These are available in the MODERN dialect (line-number-less / `.fb`). Where a name collides with a v7
+command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
+
+| Command | Status | Description |
+|---------|--------|-------------|
+| `SWAP a, b` | ✓ | Exchange two lvalues (scalar / array element / UDT field) |
+| `MID(...)` | ✓ | Substring function (bare, MODERN) and `MID(dst,start[,len]) = src` in-place statement |
+| `STRING(n,ch)` | ✓ | N copies of a character (also `STRING$`, both dialects) |
+| `IIF(cond, a, b)` | ✓ | Short-circuit conditional expression (only the taken branch is evaluated) |
+| `ENUM ... END ENUM` | ✓ | Named integer constants (auto-increment; member with no value = previous + 1) |
+| `DEFINT`/`DEFLNG`/`DEFBYTE`/`DEFSHORT`/`DEFLNGINT`/`DEFSNG`/`DEFDBL`/`DEFSTR` | ✓ | Default variable type by initial letter, e.g. `DEFINT I-N` |
+| `&` / `&=` | ✓ | String concatenation operator and compound assignment |
+| Conversions `CINT`/`CLNG`/`CSHORT`/`CBYTE`/`CDBL`/`CSNG`/`VALINT`/`OCT`/`BIN`... | ✓ | FreeBASIC type conversions (B1.3) |
+| `LBOUND`/`UBOUND`/`ERASE`/`REDIM [PRESERVE]` | ✓ | FreeBASIC array operations (B1.4) |
+| Math `ACOS`/`ASIN`/`ATAN2`/`FIX`/`FRAC` | ✓ | FreeBASIC math functions |
 
 ## Variable Scope
 
@@ -202,8 +222,11 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `INSTR` | ✓ | Position of source string in destination string (1-based, optional start) |
 | `LEN` | ✓ | Return string length |
 | `LEFT$` | ✓ | Return string leftmost chars |
-| `MID$` | ✓ | Return substring from larger string |
+| `MID$` | ✓ | Return substring (v7). In MODERN also `MID(...)` function and `MID(dst,start[,len]) = src` in-place statement (FreeBASIC) |
 | `RIGHT$` | ✓ | Return string rightmost chars |
+| `SPACE` / `SPACE$` | ✓ | String of N spaces (FreeBASIC) |
+| `STRING` / `STRING$` | ✓ | N copies of a character (FreeBASIC; `STRING$` both dialects, bare `STRING` MODERN) |
+| `LTRIM`/`RTRIM`/`TRIM`/`UCASE`/`LCASE`/`INSTRREV` | ✓ | FreeBASIC string functions |
 | `SPC` | ✓ | Skip spaces on context output |
 | `STR$` | ✓ | Convert number to string |
 | `TAB` | ✓ | Move cursor forward string from the first column |
@@ -217,7 +240,7 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `POKE` | ✓ | Set content of memory-mapped location |
 | `RREG` | ✗ | Read contents of accumulator and registers |
 | `STASH` | ✗ | Move content of host RAM to expansion RAM |
-| `SWAP` | ✗ | Swap content of host RAM to expansion RAM |
+| `SWAP` | ~ | (v7) Swap host/expansion RAM — NOT implemented. In MODERN, `SWAP a, b` exchanges two lvalues (FreeBASIC) ✓ |
 | `FRE` | ✓ | Return RAM bytes free (FRE(0)) |
 | `PEEK` | ✓ | Return content of memory-mapped location |
 | `POINTER` | ✗ | Return the address of a variable name |
