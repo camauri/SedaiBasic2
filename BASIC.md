@@ -135,6 +135,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `OPERATOR <sym>` | ✓ | Operator overloading for UDTs (binary, direct operands) |
 | `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like macros; function-like macros pending) |
 | `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening (methods of a namespaced TYPE / `USING` / `..global` pending) |
+| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit scalar pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Pointer arithmetic, pointers into array/UDT, multi-level PTR pending |
 | BYREF-return / `WSTRING` | ✗ | Not yet implemented |
 
 ## Variable Scope

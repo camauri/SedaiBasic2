@@ -76,6 +76,7 @@ type
     function ParseUsrFunction(Token: TLexerToken): TASTNode;
     function ParseUserFunction(Token: TLexerToken): TASTNode;
     function ParseProcAddress(Token: TLexerToken): TASTNode;   // @subname → antProcAddress (M5.2)
+    function ParseDeref(Token: TLexerToken): TASTNode;         // *ptr → antDeref (FreeBASIC pointers)
     function ParseThreadCreate(Token: TLexerToken): TASTNode;  // THREADCREATE(@sub, param) (M5.2)
     function ParseThreadSelf(Token: TLexerToken): TASTNode;    // THREADSELF() → antThreadSelf (M5.5)
     function ParseThreadCall(Token: TLexerToken): TASTNode;    // THREADCALL sub(arg) → antThreadCreate (M5.5)
@@ -122,6 +123,7 @@ function StaticParseInputFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseUsrFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseUserFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseProcAddress(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseDeref(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadCreate(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadSelf(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadCall(Parser: Pointer; Token: TLexerToken): TObject;
@@ -240,6 +242,11 @@ end;
 function StaticParseProcAddress(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseProcAddress(Token);
+end;
+
+function StaticParseDeref(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseDeref(Token);
 end;
 
 function StaticParseThreadCreate(Parser: Pointer; Token: TLexerToken): TObject;
@@ -423,6 +430,11 @@ begin
 
   // Altri operatori aritmetici (solo INFIX)
   Context.SetParseRule(ttOpMul, MakeInfixRule(@StaticParseBinaryOperator, precFactor));
+  // FreeBASIC pointer dereference: '*' is ALSO a unary prefix (*ptr). Add the prefix function while
+  // preserving the infix multiply rule above (the Pratt loop uses prefix at operand position only).
+  Rule := Context.GetParseRule(ttOpMul);
+  Rule.Prefix := @StaticParseDeref;
+  Context.SetParseRule(ttOpMul, Rule);
   Context.SetParseRule(ttOpDiv, MakeInfixRule(@StaticParseBinaryOperator, precFactor));
   Context.SetParseRule(ttOpMod, MakeInfixRule(@StaticParseBinaryOperator, precFactor));
   Context.SetParseRule(ttOpIntDiv, MakeInfixRule(@StaticParseBinaryOperator, precFactor));  // \ integer division
@@ -1342,6 +1354,24 @@ begin
   end;
   Result := TASTNode.CreateWithValue(antProcAddress, UpperCase(Context.CurrentToken.Value), Token);
   Context.Advance;  // consume the proc name
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseDeref(Token: TLexerToken): TASTNode;
+// '*' as a prefix operator (FreeBASIC pointer dereference). '*' is already consumed; parse the
+// pointer operand at unary precedence so "*p" binds the pointer and "*p + 1" is "(*p) + 1".
+var
+  Operand: TASTNode;
+begin
+  Operand := ParseExpression(precUnary);
+  if not Assigned(Operand) then
+  begin
+    HandleError('Expected a pointer expression after "*"', Token);
+    Result := nil;
+    Exit;
+  end;
+  Result := TASTNode.Create(antDeref, Token);
+  Result.AddChild(Operand);
   DoNodeCreated(Result);
 end;
 

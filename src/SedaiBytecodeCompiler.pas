@@ -290,6 +290,13 @@ begin
     ssaArrayUBound: Result := bcArrayUBound;
     ssaArrayErase: Result := bcArrayErase;    // B1.4 array statements
     ssaArrayRedim: Result := bcArrayRedim;
+    // FreeBASIC pointer dereference (load/store through a runtime address register)
+    ssaRefLoadInt: Result := bcRefLoadInt;
+    ssaRefLoadFloat: Result := bcRefLoadFloat;
+    ssaRefLoadString: Result := bcRefLoadString;
+    ssaRefStoreInt: Result := bcRefStoreInt;
+    ssaRefStoreFloat: Result := bcRefStoreFloat;
+    ssaRefStoreString: Result := bcRefStoreString;
     // Graphics operations
     ssaGraphicRGBA: Result := bcGraphicRGBA;
     ssaGraphicSetMode: Result := bcGraphicSetMode;

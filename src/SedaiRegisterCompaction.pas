@@ -216,6 +216,7 @@ begin
     // === GROUP 3: Array operations ===
     bcArrayLoadInt,  // Typed array load (int) - Dest is WRITTEN
     bcArrayLBound, bcArrayUBound,  // B1.4: LBOUND/UBOUND - Dest = int bound
+    bcRefLoadInt,    // FreeBASIC pointer deref (int) - Dest = value loaded
     // === GROUP 4: I/O operations ===
     bcInputInt,      // Input int
     bcDataReadInt,   // Read next DATA value into int register
@@ -285,6 +286,7 @@ begin
     bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,  // FreeBASIC math
     // === GROUP 3: Array operations ===
     bcArrayLoadFloat,  // Typed array load (float) - Dest is WRITTEN
+    bcRefLoadFloat,    // FreeBASIC pointer deref (float) - Dest = value loaded
     // === GROUP 4: I/O operations ===
     bcInputFloat,
     bcDataReadFloat,   // Read next DATA value into float register
@@ -332,6 +334,7 @@ begin
     bcStrErr,    // ERR$(n) - error code to message string
     // === GROUP 3: Array operations ===
     bcArrayLoadString,  // Typed array load (string) - Dest is WRITTEN
+    bcRefLoadString,    // FreeBASIC pointer deref (string) - Dest = value loaded
     // === GROUP 4: I/O operations ===
     bcInputString,
     bcDataReadString,  // Read next DATA value into string register
@@ -384,6 +387,9 @@ begin
     bcResume,
     // Bitwise operations
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
+    // === GROUP 3: Pointer deref (FreeBASIC): Src1 = address register (always int) ===
+    bcRefLoadInt, bcRefLoadFloat, bcRefLoadString,
+    bcRefStoreInt, bcRefStoreFloat, bcRefStoreString,
     // === GROUP 1: String operations with int param ===
     bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin,
     bcStrString,  // STRING(n,ch) - Src1 = count (int)
@@ -514,6 +520,7 @@ begin
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     bcArrayLBound, bcArrayUBound,  // B1.4: Src2 = 0-based dim index (int)
     bcArrayRedim,  // B1.4: REDIM - Src2 = new upper bound (int)
+    bcRefStoreInt,  // FreeBASIC pointer store (int) - Src2 = value (int)
     // === GROUP 10: Graphics ===
     bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
     bcGraphicWindow,  // Src2 = row1 register (int)
@@ -571,6 +578,8 @@ begin
     bcSquareSumFloat, bcAddSquareFloat, bcMulMulFloat, bcAddSqrtFloat,
     // LOGN(base, x): Src2 is 'x' (the value); ATAN2(y, x): Src2 is 'x'
     bcMathLogN, bcMathAtan2,
+    // === GROUP 3: Pointer store (FreeBASIC): Src2 = float value ===
+    bcRefStoreFloat,
     // === GROUP 4: I/O operations ===
     bcPrintUsing,  // PRINT USING - Src2 = value (float)
     // === GROUP 7: Sprite ===
@@ -638,6 +647,8 @@ begin
     bcStrInstrRev, // INSTRREV(str, sub) - sub is Src2
     bcStrInstrRevAny, // INSTRREV(str, Any set) - set is Src2
     bcStrTrimSet,  // LTRIM/RTRIM/TRIM(s, set) - set is Src2
+    // === GROUP 3: Pointer store (FreeBASIC): Src2 = string value ===
+    bcRefStoreString,
     // === GROUP 6: File I/O operations ===
     bcDopen, bcOpen,  // Src2 = filename (string)
     bcAppend:         // Src2 = data (string)

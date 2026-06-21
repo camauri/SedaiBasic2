@@ -365,6 +365,15 @@ const
   // FreeBASIC array statements (B1.4). Src1 = array id.
   bcArrayErase      = bcGroupArray + 11;  // ERASE arr - reset elements to default (keep size)
   bcArrayRedim      = bcGroupArray + 12;  // REDIM [PRESERVE] arr(ub): Src2=ub reg, Immediate bit0=preserve
+  // FreeBASIC pointer dereference. The "address" is a runtime int register holding the id of a
+  // 1-element backing array (element 0). Load: Dest=value, Src1=address reg. Store: Src1=address
+  // reg, Src2=value reg.
+  bcRefLoadInt      = bcGroupArray + 13;
+  bcRefLoadFloat    = bcGroupArray + 14;
+  bcRefLoadString   = bcGroupArray + 15;
+  bcRefStoreInt     = bcGroupArray + 16;
+  bcRefStoreFloat   = bcGroupArray + 17;
+  bcRefStoreString  = bcGroupArray + 18;
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values
@@ -1374,6 +1383,12 @@ begin
         10: Result := 'ArrayUBound';
         11: Result := 'ArrayErase';
         12: Result := 'ArrayRedim';
+        13: Result := 'RefLoadInt';
+        14: Result := 'RefLoadFloat';
+        15: Result := 'RefLoadString';
+        16: Result := 'RefStoreInt';
+        17: Result := 'RefStoreFloat';
+        18: Result := 'RefStoreString';
       else
         Result := Format('Array_%d', [SubOp]);
       end;

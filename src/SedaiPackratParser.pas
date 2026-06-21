@@ -820,6 +820,18 @@ begin
         end;
       end;
 
+    // === FreeBASIC pointer-deref assignment ("*p = expr") ===
+    ttOpMul:
+      begin
+        SavedIndex := Context.CurrentIndex;
+        Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
+        if not Assigned(Result) then
+        begin
+          Context.CurrentIndex := SavedIndex;
+          Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+        end;
+      end;
+
     // === SPECIAL VARIABLES (TI$, etc.) ===
     ttSpecialVariable:
       begin
@@ -869,6 +881,13 @@ begin
   begin
     // Leading '.field = ...' inside a WITH block (M3.2): the expression parser's prefix rule
     // resolves it against the current WITH object.
+    LeftSide := FExpressionParser.ParseExpression(precCall);
+    LhsIsExpr := True;
+  end
+  else if Context.Check(ttOpMul) then
+  begin
+    // FreeBASIC pointer-deref assignment "*p = expr": the expression parser's '*' prefix rule builds
+    // the antDeref target (it stops before '=', lower precedence).
     LeftSide := FExpressionParser.ParseExpression(precCall);
     LhsIsExpr := True;
   end
@@ -4400,6 +4419,13 @@ begin
       end;
       TypeTok := Context.CurrentToken;
       DimTypeName := ParseDottedName;          // dotted: namespace-qualified type ("Forms.Point")
+      // FreeBASIC pointer type: "<type> PTR" (one or more PTR). A pointer is stored as an int handle
+      // (the address); the suffix is kept on the type name so the SSA records the pointee bank.
+      while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+      begin
+        DimTypeName := DimTypeName + ' PTR';
+        Context.Advance;                       // consume PTR
+      end;
       ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
       VarNameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
       TypeNode := TASTNode.CreateWithValue(antIdentifier, DimTypeName, TypeTok);

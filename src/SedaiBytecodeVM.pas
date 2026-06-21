@@ -2303,6 +2303,38 @@ begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;        // index
         end;
 
+        // Pointer deref (FreeBASIC). Address (Src1) is always an int register; value bank varies.
+        bcRefLoadInt:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;    // value
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;    // address
+        end;
+        bcRefLoadFloat:
+        begin
+          if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;  // value
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;      // address
+        end;
+        bcRefLoadString:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;  // value
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;        // address
+        end;
+        bcRefStoreInt:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;    // address
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;    // value
+        end;
+        bcRefStoreFloat:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;      // address
+          if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;  // value
+        end;
+        bcRefStoreString:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;        // address
+          if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;  // value
+        end;
+
         // ArrayLoad: Dest is result, Src2 is index (int)
         // Note: bcArrayLoadInt/Float/String already handled above
 
@@ -4310,6 +4342,51 @@ begin
       EraseArray(Instr.Src1);
     12: // bcArrayRedim - REDIM [PRESERVE] arr(ub) (B1.4); Src2=ub reg, Immediate bit0=preserve
       RedimArray(Instr.Src1, Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0);
+    // FreeBASIC pointer dereference. The address is (arrayId + 1) so 0 means NULL; the pointee is
+    // element 0 of that 1-element backing array. Load: Dest=value, Src1=address. Store: Src1=address,
+    // Src2=value.
+    13: // bcRefLoadInt
+      begin
+        ArrayIdx := Ctx.IntRegs[Instr.Src1] - 1;
+        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) then
+          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ctx.IntRegs[Instr.Src1]]);
+        Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[0];
+      end;
+    14: // bcRefLoadFloat
+      begin
+        ArrayIdx := Ctx.IntRegs[Instr.Src1] - 1;
+        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) then
+          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ctx.IntRegs[Instr.Src1]]);
+        Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[0];
+      end;
+    15: // bcRefLoadString
+      begin
+        ArrayIdx := Ctx.IntRegs[Instr.Src1] - 1;
+        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) then
+          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ctx.IntRegs[Instr.Src1]]);
+        Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[0];
+      end;
+    16: // bcRefStoreInt
+      begin
+        ArrayIdx := Ctx.IntRegs[Instr.Src1] - 1;
+        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) then
+          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ctx.IntRegs[Instr.Src1]]);
+        FArrays[ArrayIdx].IntData[0] := Ctx.IntRegs[Instr.Src2];
+      end;
+    17: // bcRefStoreFloat
+      begin
+        ArrayIdx := Ctx.IntRegs[Instr.Src1] - 1;
+        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) then
+          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ctx.IntRegs[Instr.Src1]]);
+        FArrays[ArrayIdx].FloatData[0] := Ctx.FloatRegs[Instr.Src2];
+      end;
+    18: // bcRefStoreString
+      begin
+        ArrayIdx := Ctx.IntRegs[Instr.Src1] - 1;
+        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) then
+          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ctx.IntRegs[Instr.Src1]]);
+        FArrays[ArrayIdx].StringData[0] := Ctx.StringRegs[Instr.Src2];
+      end;
   else
     raise Exception.CreateFmt('Unknown array opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

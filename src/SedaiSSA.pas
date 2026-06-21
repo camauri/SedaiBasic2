@@ -137,6 +137,7 @@ type
     // shared-memory model). Maps the UPPER-case name -> its array index. Every read/write of the name is
     // routed to element 0 of this array, so the value is never a per-thread register.
     FSharedScalarArr: TStringList;       // name (UPPER) -> array index (Objects[]=PtrInt arrayIdx)
+    FPointerVars: TStringList;           // FreeBASIC pointers: var name (UPPER) -> pointee type name (e.g. "INTEGER")
     FVarWidthCode: TStringList;          // B1.5 phase 2: name (UPPER) -> narrow width code (Objects[]=PtrInt 1..7)
     FVarPrintKind: TStringList;          // B1.5 phase C: name (UPPER) -> 1=BOOLEAN, 2=unsigned-64 (print form)
     FArrayElemWidth: TStringList;        // B1.5: array name (UPPER) -> element narrow width code (1..7)
@@ -231,6 +232,12 @@ type
     function IsSharedScalar(const Name: string): Boolean;                       // name is a SHARED scalar (array-backed)?
     function MakeSharedScalarAccess(const Name: string; const Tok: TLexerToken): TASTNode;  // build name(0) array-access node
     procedure EmitSharedScalarStoreVal(const Name: string; const Val: TSSAValue);  // store an SSA value into name(0)
+    // FreeBASIC pointers: record pointer-var pointee types and back every address-taken (@x) scalar
+    // with a 1-element global array (reusing the SHARED-scalar machinery), so it has a stable address.
+    procedure CollectAddressTakenVars(Node: TASTNode);
+    procedure CollectDimVarBanks(Node: TASTNode; Dict: TStringList);
+    procedure MarkAddressTaken(Node: TASTNode; Dict: TStringList);
+    function PointeeBankOf(const PtrName: string): TSSARegisterType;            // bank of *p from p's declared pointee
     // FB lexical scope (MODERN only). ScopePushFrame/ScopePopFrame manage FScopeStack; the block
     // variants emit the M8 record-mark instructions. Inert in CLASSIC mode (callers gate on FModernMode).
     procedure ScopePushFrame(Kind: TScopeKind);
@@ -462,6 +469,7 @@ begin
   FSharedVars := TStringList.Create;
   FSharedVars.CaseSensitive := False;
   FSharedScalarArr := TStringList.Create;
+  FPointerVars := TStringList.Create;
   FSharedScalarArr.CaseSensitive := False;
   FVarWidthCode := TStringList.Create;
   FVarWidthCode.CaseSensitive := False;
@@ -498,6 +506,7 @@ begin
   FModuleDtorSlots.Free;
   FSharedVars.Free;
   FSharedScalarArr.Free;
+  FPointerVars.Free;
   FVarWidthCode.Free;
   FVarPrintKind.Free;
   FArrayElemWidth.Free;
@@ -884,13 +893,47 @@ begin
   case Node.NodeType of
     antProcAddress:
     begin
-      // @subname → the named SUB's entry PC. The PROC_<name> label resolves to a PC at bytecode
-      // time (like bcCallSub's target); FixForwardReferences also adds a CFG edge to the proc
-      // block so an address-taken-only SUB is not dead-block-eliminated.
-      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaLoadProcAddr, Result,
-                      MakeSSALabel(ProcedureLabelName(VarToStr(Node.Value))),
-                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // @name : either the address of a data variable (FreeBASIC pointers) or, when name is a SUB,
+      // its entry PC. A data variable that is address-taken was backed by a 1-element global array
+      // (CollectAddressTakenVars); its "address" is (arrayId + 1) so 0 stays a NULL sentinel.
+      if IsSharedScalar(VarToStr(Node.Value)) then
+      begin
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, Result,
+                        MakeSSAConstInt(PtrInt(FSharedScalarArr.Objects[
+                          FSharedScalarArr.IndexOf(UpperCase(VarToStr(Node.Value)))]) + 1),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+      begin
+        // @subname → the named SUB's entry PC. The PROC_<name> label resolves to a PC at bytecode
+        // time (like bcCallSub's target); FixForwardReferences also adds a CFG edge to the proc
+        // block so an address-taken-only SUB is not dead-block-eliminated.
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadProcAddr, Result,
+                        MakeSSALabel(ProcedureLabelName(VarToStr(Node.Value))),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+    end;
+
+    antDeref:
+    begin
+      // *p (rvalue): load the pointee value. Address = p's int value; the pointee bank comes from p's
+      // declared pointer type (FPointerVars), defaulting to int.
+      ProcessExpression(Node.GetChild(0), Left);
+      Left := EnsureIntRegister(Left);
+      if Node.GetChild(0).NodeType = antIdentifier then
+        FuncRetType := PointeeBankOf(VarToStr(Node.GetChild(0).Value))
+      else
+        FuncRetType := srtInt;
+      DestReg := FProgram.AllocRegister(FuncRetType);
+      Result := MakeSSARegister(FuncRetType, DestReg);
+      case FuncRetType of
+        srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      else
+        EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
     end;
 
     antThreadCreate:
@@ -3099,6 +3142,7 @@ var
   VarName, LhsRecType, RhsRecType: string;
   ExprValue, VarReg, SrcRecHandle: TSSAValue;
   CopyOp: TSSAOpCode;
+  DerefBank: TSSARegisterType;   // FreeBASIC "*p = expr": bank of the pointee
 begin
   if Node.ChildCount < 2 then Exit;
 
@@ -3109,6 +3153,35 @@ begin
   if VarNode.NodeType = antMemberAccess then
   begin
     ProcessMemberStore(VarNode, ExprNode);
+    Exit;
+  end;
+
+  // FreeBASIC pointer-deref store: *p = expr. Store the value into the pointee cell at p's address
+  // (= p's int value). The pointee bank comes from p's declared pointer type.
+  if VarNode.NodeType = antDeref then
+  begin
+    ProcessExpression(VarNode.GetChild(0), VarReg);
+    VarReg := EnsureIntRegister(VarReg);
+    if VarNode.GetChild(0).NodeType = antIdentifier then
+      DerefBank := PointeeBankOf(VarToStr(VarNode.GetChild(0).Value))
+    else
+      DerefBank := srtInt;
+    ProcessExpression(ExprNode, ExprValue);
+    case DerefBank of
+      srtFloat:
+        begin
+          ExprValue := EnsureFloatRegister(ExprValue);
+          EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+        end;
+      srtString:
+        begin
+          ExprValue := EnsureStringRegister(ExprValue);
+          EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+        end;
+    else
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+    end;
     Exit;
   end;
 
@@ -9710,6 +9783,9 @@ begin
   T := UpperCase(TypeName);
   if T = '' then
     Exit(GetVariableType(FieldName));
+  // FreeBASIC pointer "<type> PTR": stored as an int handle (the address).
+  if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+    Exit(srtInt);
   if (T = 'INTEGER') or (T = 'LONG') or (T = 'SHORT') or (T = 'BYTE') or
      (T = 'UBYTE') or (T = 'USHORT') or (T = 'UINTEGER') or (T = 'ULONG') or
      (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'BOOLEAN') then
@@ -10886,6 +10962,94 @@ begin
   end;
   ArrayRef := MakeSSAArrayRef(ai, et);
   EmitInstruction(ssaArrayStore, V, ArrayRef, Idx0, MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.CollectDimVarBanks(Node: TASTNode; Dict: TStringList);
+// Pass 1: gather every @-taken NAME (antProcAddress operand) into Dict, and record pointee types of
+// pointer-typed DIMs ("type PTR") in FPointerVars (for typing "*p").
+var
+  i, k: Integer;
+  Decl: TASTNode;
+  VNameU, TypeNameU: string;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType = antProcAddress then
+  begin
+    VNameU := UpperCase(VarToStr(Node.Value));
+    if Dict.IndexOf(VNameU) < 0 then Dict.Add(VNameU);
+  end;
+  if Node.NodeType = antDim then
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(k);
+      if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 2) and
+         (Decl.GetChild(0).NodeType = antIdentifier) and (Decl.GetChild(1).NodeType = antIdentifier) then
+      begin
+        VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        TypeNameU := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        if (Length(TypeNameU) >= 4) and (Copy(TypeNameU, Length(TypeNameU) - 3, 4) = ' PTR') and
+           (FPointerVars.IndexOfName(VNameU) < 0) then
+          FPointerVars.Add(VNameU + '=' + Trim(Copy(TypeNameU, 1, Length(TypeNameU) - 4)));
+      end;
+    end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectDimVarBanks(Node.GetChild(i), Dict);
+end;
+
+procedure TSSAGenerator.MarkAddressTaken(Node: TASTNode; Dict: TStringList);
+// Pass 2: mark each typed-scalar DIM whose variable is @-taken as SHARED, so CollectSharedVars backs
+// it with a 1-element global array (giving it a stable address) and ProcessDim emits its array dim.
+var
+  i, k: Integer;
+  Decl: TASTNode;
+  VNameU: string;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType = antDim then
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(k);
+      if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 2) and
+         (Decl.GetChild(0).NodeType = antIdentifier) and (Decl.GetChild(1).NodeType = antIdentifier) then
+      begin
+        VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        if Dict.IndexOf(VNameU) >= 0 then
+          Decl.Attributes.Values['SHARED'] := '1';   // route through the SHARED-scalar backing machinery
+      end;
+    end;
+  for i := 0 to Node.ChildCount - 1 do
+    MarkAddressTaken(Node.GetChild(i), Dict);
+end;
+
+procedure TSSAGenerator.CollectAddressTakenVars(Node: TASTNode);
+// Runs BEFORE CollectSharedVars: marks @-taken declared scalars SHARED so they become array-backed
+// (addressable). Also records pointer-var pointee types in FPointerVars.
+var
+  Dict: TStringList;
+begin
+  if Node = nil then Exit;
+  Dict := TStringList.Create;
+  try
+    CollectDimVarBanks(Node, Dict);   // collect @-taken names + pointee types
+    MarkAddressTaken(Node, Dict);     // mark their DIMs SHARED
+  finally
+    Dict.Free;
+  end;
+end;
+
+function TSSAGenerator.PointeeBankOf(const PtrName: string): TSSARegisterType;
+// Bank of the pointee for "*p", from p's declared pointer type (default int if unknown).
+var
+  idx: Integer;
+  Pointee: string;
+begin
+  Result := srtInt;
+  idx := FPointerVars.IndexOfName(UpperCase(PtrName));
+  if idx >= 0 then
+  begin
+    Pointee := FPointerVars.ValueFromIndex[idx];
+    Result := TypeNameToBank(Pointee, PtrName);
+  end;
 end;
 
 procedure TSSAGenerator.EmitSharedSyncOut;
@@ -12243,9 +12407,13 @@ begin
   // registration so each var's bank is known). These slots survive the bcCallSub save/restore.
   FSharedVars.Clear;
   FSharedScalarArr.Clear;
+  FPointerVars.Clear;
   FVarWidthCode.Clear;
   FVarPrintKind.Clear;
   FArrayElemWidth.Clear;
+  // FreeBASIC pointers: mark each address-taken (@x) declared scalar SHARED so the next pass backs it
+  // with a 1-element global array (a stable address); also records pointee types in FPointerVars.
+  CollectAddressTakenVars(AST);
   CollectSharedVars(AST);
 
   // M8: reset block-scope state (block-scoped record reclamation; the scope stack itself was reset above).

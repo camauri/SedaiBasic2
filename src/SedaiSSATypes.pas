@@ -129,6 +129,10 @@ type
     ssaArrayLoad, ssaArrayStore, ssaArrayDim,
     ssaArrayLBound, ssaArrayUBound,  // LBOUND/UBOUND(arr[, dim]) (B1.4)
     ssaArrayErase, ssaArrayRedim,    // ERASE / REDIM (B1.4)
+    // FreeBASIC pointers: dereference through a runtime "address" = the id of a 1-element backing
+    // array (element 0). Load: Dest=value, Src1=address reg. Store: Src1=address reg, Src2=value.
+    ssaRefLoadInt, ssaRefLoadFloat, ssaRefLoadString,
+    ssaRefStoreInt, ssaRefStoreFloat, ssaRefStoreString,
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
     ssaPrintInt, ssaPrintIntLn,
     ssaPrintBool, ssaPrintUInt,   // B1.5 phase C: BOOLEAN true/false, unsigned-64 print

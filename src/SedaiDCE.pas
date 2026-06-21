@@ -309,6 +309,7 @@ begin
     // Memory operations - always live (may affect program state)
     ssaStoreVar, ssaArrayStore, ssaArrayDim,
     ssaArrayErase, ssaArrayRedim,  // B1.4: mutate array storage in place
+    ssaRefStoreInt, ssaRefStoreFloat, ssaRefStoreString,  // FreeBASIC pointer store: mutates pointee
     ssaPoke:  // POKE writes to memory-mapped I/O (visible side effects like color changes)
       Result := True;
 

@@ -63,6 +63,7 @@ type
     antTypeDecl,          // TYPE name ... END TYPE (UDT/record): value=name, children=fields (antIdentifier, value=field name, with a type tag)
     antNamespace,         // NAMESPACE name ... END NAMESPACE (FreeBASIC): value=name, children=member statements; flattened away before SSA
     antMemberAccess,      // record.field : child0 = object expr, value = field name
+    antDeref,             // FreeBASIC pointer dereference *p : child0 = pointer expr (lvalue or rvalue)
     antSpecialVariable,   // Special variables (TI, TI$, DT$, etc.)
 
     // === FUNCTIONS ===
