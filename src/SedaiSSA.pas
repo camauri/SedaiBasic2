@@ -135,6 +135,7 @@ type
     FVarPrintKind: TStringList;          // B1.5 phase C: name (UPPER) -> 1=BOOLEAN, 2=unsigned-64 (print form)
     FArrayElemWidth: TStringList;        // B1.5: array name (UPPER) -> element narrow width code (1..7)
     FSwapTempSeq: Integer;               // SWAP: unique counter for synthesized snapshot temp names
+    FDefTypeBank: array['A'..'Z'] of Integer;  // DEFINT/DEFSTR...: initial letter -> bank (0/1/2), -1=unset
     FInDispatcher: Boolean;              // M6: true while emitting a virtual dispatcher (skip shared sync)
     FBlockHandledVars: TStringList;      // M8: var names destructed block-scoped (excluded from frame/module dtors)
     FCurrentTopLevelLabels: TStringList;  // GOTO-unwind: names of labels at block-depth 0 in the current frame
@@ -266,6 +267,8 @@ type
     procedure ProcessErase(Node: TASTNode);
     procedure ProcessRedim(Node: TASTNode);
     procedure ProcessSwap(Node: TASTNode);
+    procedure ProcessDefType(Node: TASTNode);
+    procedure CollectDefTypes(Node: TASTNode);
     procedure ProcessMidStatement(Node: TASTNode);
     procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);
@@ -410,6 +413,8 @@ const
   SHARED_SLOT_BASE = 128;
 
 constructor TSSAGenerator.Create;
+var
+  DefCh: Char;
 begin
   inherited Create;
   FProgram := nil;
@@ -462,6 +467,7 @@ begin
   FCurrentTopLevelLabels.CaseSensitive := False;
   FModernMode := False;            // default CLASSIC; the compile driver flips this for MODERN sources
   SetLength(FScopeStack, 0);
+  for DefCh := 'A' to 'Z' do FDefTypeBank[DefCh] := -1;  // DEFtype: no default-by-letter initially
 end;
 
 destructor TSSAGenerator.Destroy;
@@ -517,7 +523,14 @@ begin
   else if LastChar = '%' then
     Result := srtInt
   else
-    Result := srtFloat;  // Default BASIC type
+  begin
+    // FreeBASIC DEFINT/DEFSTR...: a bare name (no suffix, no explicit DIM..AS type) takes the
+    // default bank set for its initial letter, if any; otherwise the classic float default.
+    Result := srtFloat;
+    if (UpCase(VarName[1]) >= 'A') and (UpCase(VarName[1]) <= 'Z') and
+       (FDefTypeBank[UpCase(VarName[1])] >= 0) then
+      Result := TSSARegisterType(FDefTypeBank[UpCase(VarName[1])]);
+  end;
 end;
 
 function TSSAGenerator.ResolveExisting(const VarName: string; out Reg: TSSAValue): Boolean;
@@ -3089,6 +3102,15 @@ begin
       EmitInstruction(ssaLoadConstFloat, VarReg, ExprValue,
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end
+    else if (ExprValue.Kind = svkConstFloat) and (VarReg.RegType = srtInt) then
+    begin
+      // Convert float constant to int at compile time (truncate toward zero, matching the runtime
+      // ssaFloatToInt path). Without this a float const was loaded straight into an int register
+      // (e.g. DIM x AS INTEGER : x = 3.9 stored garbage / 0).
+      ExprValue := MakeSSAConstInt(Trunc(ExprValue.ConstFloat));
+      EmitInstruction(ssaLoadConstInt, VarReg, ExprValue,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
     else
     begin
       // Direct load
@@ -4056,6 +4078,36 @@ begin
                     MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType),
                     UbReg, MakeSSAConstInt(PreserveFlag));
   end;
+end;
+
+procedure TSSAGenerator.ProcessDefType(Node: TASTNode);
+// DEFINT/DEFSTR... : record the default bank for each covered initial letter. Consulted by
+// GetVariableType for a bare name (no suffix / no explicit type) declared after this point.
+var
+  Bank, i: Integer;
+  Letters: string;
+  c: Char;
+begin
+  Bank := Integer(Node.Value);
+  Letters := Node.Attributes.Values['LETTERS'];
+  for i := 1 to Length(Letters) do
+  begin
+    c := UpCase(Letters[i]);
+    if (c >= 'A') and (c <= 'Z') then FDefTypeBank[c] := Bank;
+  end;
+end;
+
+procedure TSSAGenerator.CollectDefTypes(Node: TASTNode);
+// Pre-pass: populate the DEFINT/DEFSTR letter->bank table from all DEFtype statements BEFORE
+// variables are pre-allocated (PreAllocateVariables binds them via GetVariableType). Treated as
+// module-global (positional scoping not modelled): put DEFtype at the top of the program.
+var
+  i: Integer;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType = antDefType then ProcessDefType(Node);
+  for i := 0 to Node.ChildCount - 1 do
+    CollectDefTypes(Node.GetChild(i));
 end;
 
 procedure TSSAGenerator.ProcessSwap(Node: TASTNode);
@@ -11469,6 +11521,7 @@ begin
     antErase: ProcessErase(Node);
     antRedim: ProcessRedim(Node);
     antSwap: ProcessSwap(Node);
+    antDefType: ProcessDefType(Node);
     antMidStatement: ProcessMidStatement(Node);
     antEnum:
       // ENUM members lower to a sequence of plain assignments (member = value), like CONST.
@@ -11852,6 +11905,7 @@ function TSSAGenerator.Generate(AST: TASTNode): TSSAProgram;
 var
   LastBlock: TSSABasicBlock;
   LastInstr: TSSAInstruction;
+  DefCh: Char;
 begin
   FProgram := TSSAProgram.Create;
   FLabelCounter := 0;
@@ -11889,6 +11943,11 @@ begin
   // implicit fall-through halt can emit their destructor calls (in reverse construction order).
   FModuleRecordVars.Clear;
   CollectModuleRecordVars(AST);
+
+  // FreeBASIC DEFINT/DEFSTR...: collect default-type-by-initial BEFORE pre-allocating variables,
+  // so a bare name gets its DEF bank (PreAllocateVariables binds via GetVariableType).
+  for DefCh := 'A' to 'Z' do FDefTypeBank[DefCh] := -1;
+  CollectDefTypes(AST);
 
   PreAllocateVariables(AST);
   {$IFDEF DEBUG_SSA}

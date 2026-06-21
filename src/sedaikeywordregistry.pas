@@ -1658,6 +1658,14 @@ begin
  RegisterKeyword(kERASE,   ttArrayErase,      'Reset array elements to default (FreeBASIC)', kcData);
  RegisterKeyword(kREDIM,   ttArrayRedim,      'Re-dimension an array (FreeBASIC)',           kcData);
  RegisterKeyword(kENUM,    ttEnum,            'Named integer constants block (FreeBASIC)',   kcData);
+ RegisterKeyword(kDEFINT,  ttDefType,         'Default INTEGER type by initial letter (FreeBASIC)', kcData);
+ RegisterKeyword(kDEFLNG,  ttDefType,         'Default LONG type by initial letter (FreeBASIC)',    kcData);
+ RegisterKeyword(kDEFBYTE, ttDefType,         'Default BYTE type by initial letter (FreeBASIC)',    kcData);
+ RegisterKeyword(kDEFSHORT,ttDefType,         'Default SHORT type by initial letter (FreeBASIC)',   kcData);
+ RegisterKeyword(kDEFLNGINT,ttDefType,        'Default LONGINT type by initial letter (FreeBASIC)', kcData);
+ RegisterKeyword(kDEFSNG,  ttDefType,         'Default SINGLE type by initial letter (FreeBASIC)',  kcData);
+ RegisterKeyword(kDEFDBL,  ttDefType,         'Default DOUBLE type by initial letter (FreeBASIC)',  kcData);
+ RegisterKeyword(kDEFSTR,  ttDefType,         'Default STRING type by initial letter (FreeBASIC)',  kcData);
  RegisterKeyword(kLET,     ttDataAssignment,  'Variable assignment',  kcData);
  RegisterKeyword(kREAD,    ttDataRead,        'Read data',            kcData);
  RegisterKeyword(kRESTORE, ttDataConstant,    'Restore data pointer', kcData);

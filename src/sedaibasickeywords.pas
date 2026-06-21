@@ -112,6 +112,15 @@ const
   kDIM     = 'DIM';
   kDEF     = 'DEF';
   kFN      = 'FN';
+  // FreeBASIC DEFtype: default variable type by initial letter (no suffix / no explicit type)
+  kDEFINT  = 'DEFINT';
+  kDEFLNG  = 'DEFLNG';
+  kDEFBYTE = 'DEFBYTE';
+  kDEFSHORT = 'DEFSHORT';
+  kDEFLNGINT = 'DEFLNGINT';
+  kDEFSNG  = 'DEFSNG';
+  kDEFDBL  = 'DEFDBL';
+  kDEFSTR  = 'DEFSTR';
 
   // Input/output operations
   kPRINT   = 'PRINT';

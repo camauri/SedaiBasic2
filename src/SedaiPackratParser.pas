@@ -179,6 +179,7 @@ type
     function ParseSwapStatement: TASTNode;
     function ParseMidStatement: TASTNode;
     function ParseEnumStatement: TASTNode;
+    function ParseDefTypeStatement: TASTNode;
     function ParseDefStatement: TASTNode;
     function ParseFnStatement: TASTNode;
     function ParseConstStatement: TASTNode;
@@ -540,6 +541,7 @@ begin
     ttArrayErase: Result := Memoize('EraseStatement', @ParseEraseStatement);
     ttArrayRedim: Result := Memoize('RedimStatement', @ParseRedimStatement);
     ttEnum: Result := Memoize('EnumStatement', @ParseEnumStatement);
+    ttDefType: Result := Memoize('DefTypeStatement', @ParseDefTypeStatement);
     ttConstant: Result := Memoize('ConstStatement', @ParseConstStatement);
     ttDataConstant: Result := Memoize('DataStatement', @ParseDataStatement);
     ttDataRead: Result := Memoize('ReadStatement', @ParseReadStatement);
@@ -4449,6 +4451,48 @@ begin
     IsFirst := False;
     while Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam]) do Context.Advance;
   end;
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseDefTypeStatement: TASTNode;
+// DEFINT/DEFLNG/DEFSNG/DEFDBL/DEFSTR... letter-ranges  (FreeBASIC): set the default type of
+// variables whose name starts with one of the given initials (when they have no suffix / explicit
+// type). Stored as Value=bank (0=int,1=float,2=string) + attribute LETTERS = the covered initials.
+var
+  Token: TLexerToken;
+  Bank: Integer;
+  Letters: string;
+  c1, c2, c: Char;
+  KwU: string;
+begin
+  Token := Context.CurrentToken;
+  KwU := UpperCase(Token.Value);
+  if KwU = 'DEFSTR' then Bank := 2
+  else if (KwU = 'DEFSNG') or (KwU = 'DEFDBL') then Bank := 1
+  else Bank := 0;   // DEFINT/DEFLNG/DEFBYTE/DEFSHORT/DEFLNGINT -> int bank
+  Result := TASTNode.CreateWithValue(antDefType, Bank, Token);
+  Context.Advance;  // consume DEFxxx
+  Letters := '';
+  while Context.Check(ttIdentifier) and (Length(Context.CurrentToken.Value) > 0) do
+  begin
+    c1 := UpCase(Context.CurrentToken.Value[1]);
+    Context.Advance;
+    c2 := c1;
+    if Context.Check(ttOpSub) then           // a range "A-Z"
+    begin
+      Context.Advance;
+      if Context.Check(ttIdentifier) and (Length(Context.CurrentToken.Value) > 0) then
+      begin
+        c2 := UpCase(Context.CurrentToken.Value[1]);
+        Context.Advance;
+      end;
+    end;
+    if c1 <= c2 then
+      for c := c1 to c2 do
+        if (c >= 'A') and (c <= 'Z') then Letters := Letters + c;
+    if Context.Check(ttSeparParam) then Context.Advance else Break;
+  end;
+  Result.Attributes.Values['LETTERS'] := Letters;
   DoNodeCreated(Result);
 end;
 

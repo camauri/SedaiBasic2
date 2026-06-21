@@ -196,6 +196,7 @@ type
     ttArrayErase,             // ERASE (FreeBASIC, B1.4)
     ttArrayRedim,             // REDIM (FreeBASIC, B1.4)
     ttEnum,                   // ENUM ... END ENUM (FreeBASIC named integer constants)
+    ttDefType,                // DEFINT/DEFLNG/DEFSNG/DEFDBL/DEFSTR... (FreeBASIC default type by letter)
     ttDataRead,               // READ
     ttDataType,               // TYPE, STRUCT, RECORD
 
@@ -387,7 +388,7 @@ const
     ttTypeDecl, ttAsType, ttWithBlock, ttExtends, ttParamMode, ttBaseCall, ttSharedDecl,
     ttThreadWait, ttThreadDetach, ttMutexLock, ttMutexUnlock, ttMutexDestroy,
     ttCondWait, ttCondSignal, ttCondBroadcast, ttCondDestroy,
-    ttJumpKeyword, ttDataDeclaration, ttArrayErase, ttArrayRedim, ttEnum, ttDataAssignment, ttCommentRemark,
+    ttJumpKeyword, ttDataDeclaration, ttArrayErase, ttArrayRedim, ttEnum, ttDefType, ttDataAssignment, ttCommentRemark,
     ttBitwiseOperator
   ];
 
