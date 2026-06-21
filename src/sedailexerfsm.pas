@@ -1305,6 +1305,17 @@ begin
 
   if Match.Found then
   begin
+    // Dialect-pluggable filter: a keyword tagged for the OTHER dialect is not a keyword here — emit a
+    // plain identifier so the name stays usable (e.g. FB-only CONTINUE/LSET/ENUM as a variable in
+    // CLASSIC). HasLineNumbers=True => CLASSIC; False => MODERN.
+    if Assigned(Match.KeywordInfo) and
+       (((Match.KeywordInfo.Dialect = kdModernOnly) and FLexerOptions.HasLineNumbers) or
+        ((Match.KeywordInfo.Dialect = kdClassicOnly) and not FLexerOptions.HasLineNumbers)) then
+    begin
+      Result := CreateToken(ttIdentifier);
+      Exit;
+    end;
+
     // Spaceless mode: rewind cursor if keyword is prefix of longer token
     if (Match.MatchType = mtPrefix) and (not FLexerOptions.RequireSpacesBetweenTokens) then
     begin

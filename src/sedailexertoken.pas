@@ -162,6 +162,13 @@ type
   end;
 
   { TKeywordInfo - Keyword information class }
+  // Dialect availability of a keyword (dialect-pluggable architecture). kdAny = recognized in both
+  // dialects; kdClassicOnly = only Commodore BASIC v7 (CLASSIC); kdModernOnly = only FreeBASIC-style
+  // (MODERN). The lexer declassifies a keyword to a plain identifier when it does not match the
+  // dialect currently being lexed, so e.g. FB-only words (CONTINUE/LSET/ENUM/...) stay free as
+  // variable names in CLASSIC.
+  TKeywordDialect = (kdAny, kdClassicOnly, kdModernOnly);
+
   TKeywordInfo = class
   private
     FKeyword: string;
@@ -171,6 +178,7 @@ type
     FCategory: string;
     FIsDeprecated: Boolean;
     FMinLanguageVersion: string;
+    FDialect: TKeywordDialect;
 
   public
     constructor Create(const AKeyword: string; ATokenType: TTokenType;
@@ -203,6 +211,7 @@ type
     property Category: string read FCategory write FCategory;
     property IsDeprecated: Boolean read FIsDeprecated write FIsDeprecated;
     property MinLanguageVersion: string read FMinLanguageVersion write FMinLanguageVersion;
+    property Dialect: TKeywordDialect read FDialect write FDialect;
   end;
 
   // === SUPPORT TYPES ===
@@ -617,6 +626,7 @@ begin
   FCategory := GetTokenCategory(ATokenType);
   FIsDeprecated := False;
   FMinLanguageVersion := '';
+  FDialect := kdAny;
 end;
 
 constructor TKeywordInfo.CreateWithCategory(const AKeyword: string; ATokenType: TTokenType;
@@ -693,6 +703,7 @@ begin
   Result.FCategory := FCategory;
   Result.FIsDeprecated := FIsDeprecated;
   Result.FMinLanguageVersion := FMinLanguageVersion;
+  Result.FDialect := FDialect;
 end;
 
 // === GLOBAL UTILITY FUNCTIONS ===

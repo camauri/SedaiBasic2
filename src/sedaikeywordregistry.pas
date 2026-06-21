@@ -84,6 +84,11 @@ type
 
     function UnregisterKeyword(const Keyword: string): Boolean;
     function UnregisterKeywordsByCategory(const Category: string): Integer;
+    // Dialect-pluggable: tag a registered keyword as available only in one dialect (or both). The
+    // lexer consults this to declassify a non-matching keyword to a plain identifier. Returns False
+    // if the keyword is not registered. ADialects accepts a list so several names can be tagged at once.
+    function SetKeywordDialect(const Keyword: string; ADialect: TKeywordDialect): Boolean;
+    procedure SetKeywordsDialect(const Keywords: array of string; ADialect: TKeywordDialect);
     procedure Clear;
 
     // === BASIC LOOKUP METHODS ===
@@ -488,6 +493,26 @@ begin
 
     //WriteLn('DEBUG UnregisterKeyword: Removed "', UpperKeyword, '"');
   end;
+end;
+
+function TKeywordRegistry.SetKeywordDialect(const Keyword: string; ADialect: TKeywordDialect): Boolean;
+var
+  KeywordInfo: TKeywordInfo;
+begin
+  // The hash and trie share the same TKeywordInfo instance, so tagging it here is also visible to
+  // FindKeyword (the lexer's lookup path). Non-destructive: the keyword stays registered.
+  KeywordInfo := GetKeywordInfo(Keyword);
+  Result := Assigned(KeywordInfo);
+  if Result then
+    KeywordInfo.Dialect := ADialect;
+end;
+
+procedure TKeywordRegistry.SetKeywordsDialect(const Keywords: array of string; ADialect: TKeywordDialect);
+var
+  i: Integer;
+begin
+  for i := Low(Keywords) to High(Keywords) do
+    SetKeywordDialect(Keywords[i], ADialect);
 end;
 
 function TKeywordRegistry.UnregisterKeywordsByCategory(const Category: string): Integer;
@@ -1950,6 +1975,14 @@ begin
   // === SYNTAX CONSTRAINTS ===
   RegisterConstraint(kGO_TO, 'TO',  False, 'GO must be followed by TO');
   RegisterConstraint(kDEF,   'FN*', False, 'DEF must be followed by FN+function_name');
+
+  // === DIALECT TAGGING (dialect-pluggable architecture) ===
+  // FreeBASIC/QBasic-only keywords: declassified to plain identifiers in CLASSIC (Commodore v7), so a
+  // v7 program may still use these names as variables. They keep their keyword meaning in MODERN.
+  // Commodore v7 has no CONTINUE (CONT is separate)/LSET/RSET/ENUM/DEF* , so this is safe.
+  SetKeywordsDialect([kCONTINUE, kLSET, kRSET, kENUM,
+                      kDEFINT, kDEFLNG, kDEFBYTE, kDEFSHORT, kDEFLNGINT, kDEFSNG, kDEFDBL, kDEFSTR],
+                     kdModernOnly);
 
   //WriteLn('DEBUG RegisterBasicKeywords: Completed registration of ', GetKeywordCount, ' keywords');
 end;
