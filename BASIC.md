@@ -2337,11 +2337,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `RIGHT` | ✗ | Returns a substring of the rightmost characters in a string. |
 | `LCASE` | ✓ | Returns a copy of a string converted to lowercase. `LCASE(s)` / `LCASE$(s)` (B1.2). |
 | `UCASE` | ✓ | Returns a copy of a string converted to uppercase. `UCASE(s)` / `UCASE$(s)` (B1.2). |
-| `LTRIM` | ✓ | Removes leading spaces. `LTRIM(s)` (B1.2; trimset variant deferred). |
-| `RTRIM` | ✓ | Removes trailing spaces. `RTRIM(s)` (B1.2; trimset variant deferred). |
-| `TRIM` | ✓ | Removes leading and trailing spaces. `TRIM(s)` (B1.2; trimset variant deferred). |
+| `LTRIM` | ✓ | Removes leading spaces, or `LTRIM(s, set)` strips the trimset substring (`Any` form deferred). |
+| `RTRIM` | ✓ | Removes trailing spaces, or `RTRIM(s, set)` strips the trimset substring (`Any` form deferred). |
+| `TRIM` | ✓ | Removes leading/trailing spaces, or `TRIM(s, set)` strips the trimset substring (`Any` form deferred). |
 | `INSTR` | ✓ | Returns the first occurrence of a substring or character within a string. |
-| `INSTRREV` | ✓ | Position of the last occurrence of a substring. `INSTRREV(str, sub)` (B1.2; `start` arg deferred). |
+| `INSTRREV` | ✓ | Position of the last occurrence of a substring. `INSTRREV(str, sub [, start])` (`Any` form deferred). |
 | `MID (Statement)` | ✗ | Copies a substring to a substring of a string. |
 | `LSET` | ✓ | Left-justifies a string into a buffer (string lvalues; QBasic `=` and FreeBASIC `,` forms). |
 | `RSET` | ✓ | Right-justifies a string into a buffer (string lvalues; QBasic `=` and FreeBASIC `,` forms). |
