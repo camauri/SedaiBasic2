@@ -177,6 +177,7 @@ type
     function ParseEraseStatement: TASTNode;
     function ParseRedimStatement: TASTNode;
     function ParseSwapStatement: TASTNode;
+    function ParseMidStatement: TASTNode;
     function ParseDefStatement: TASTNode;
     function ParseFnStatement: TASTNode;
     function ParseConstStatement: TASTNode;
@@ -676,6 +677,26 @@ begin
           Context.Advance;   // consume the identifier
           Context.Advance;   // consume ':'
           DoNodeCreated(Result);
+        end
+        // FreeBASIC MID statement: "MID(dst, start [,len]) = src" overwrites in place. Only in
+        // MODERN (in v7 MID$ is a function and bare MID is a plain identifier). Recognized by the
+        // bare keyword MID followed by '('; ParseMidStatement returns nil if there is no trailing
+        // '=', so a stray MID(...) expression falls back below.
+        else if FModernMode and (UpperCase(Token.Value) = 'MID') and
+                Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+        begin
+          SavedIndex := Context.CurrentIndex;
+          Result := Memoize('MidStatement', @ParseMidStatement);
+          if not Assigned(Result) then
+          begin
+            Context.CurrentIndex := SavedIndex;
+            Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
+            if not Assigned(Result) then
+            begin
+              Context.CurrentIndex := SavedIndex;
+              Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+            end;
+          end;
         end
         else
         begin
@@ -4316,6 +4337,56 @@ begin
     Exit;
   end;
   Result.AddChild(Right);
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseMidStatement: TASTNode;
+// MID(target, start [, len]) = source  (FreeBASIC, MODERN): overwrite a substring of target
+// in place. Returns nil (no error) if the trailing "=" is absent, so the caller can fall back
+// to an expression/assignment. AST children: target, start, [len,] source.
+var
+  Token: TLexerToken;
+  TargetNode, StartNode, LenNode, SourceNode: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Context.Advance;                       // consume MID
+  if not Context.Match(ttDelimParOpen) then Exit(nil);
+  TargetNode := FExpressionParser.ParseExpression;
+  if not Assigned(TargetNode) then Exit(nil);
+  if not Context.Match(ttSeparParam) then begin TargetNode.Free; Exit(nil); end;
+  StartNode := FExpressionParser.ParseExpression;
+  if not Assigned(StartNode) then begin TargetNode.Free; Exit(nil); end;
+  LenNode := nil;
+  if Context.Match(ttSeparParam) then    // optional length
+  begin
+    LenNode := FExpressionParser.ParseExpression;
+    if not Assigned(LenNode) then begin TargetNode.Free; StartNode.Free; Exit(nil); end;
+  end;
+  if not Context.Match(ttDelimParClose) then
+  begin
+    TargetNode.Free; StartNode.Free;
+    if Assigned(LenNode) then LenNode.Free;
+    Exit(nil);
+  end;
+  // The "=" decides this is the MID statement (not a MID(...) expression).
+  if not Context.Match(ttOpEq) then
+  begin
+    TargetNode.Free; StartNode.Free;
+    if Assigned(LenNode) then LenNode.Free;
+    Exit(nil);
+  end;
+  SourceNode := FExpressionParser.ParseExpression;
+  if not Assigned(SourceNode) then
+  begin
+    TargetNode.Free; StartNode.Free;
+    if Assigned(LenNode) then LenNode.Free;
+    Exit(nil);
+  end;
+  Result := TASTNode.Create(antMidStatement, Token);
+  Result.AddChild(TargetNode);
+  Result.AddChild(StartNode);
+  if Assigned(LenNode) then Result.AddChild(LenNode);
+  Result.AddChild(SourceNode);
   DoNodeCreated(Result);
 end;
 

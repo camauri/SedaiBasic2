@@ -266,6 +266,7 @@ type
     procedure ProcessErase(Node: TASTNode);
     procedure ProcessRedim(Node: TASTNode);
     procedure ProcessSwap(Node: TASTNode);
+    procedure ProcessMidStatement(Node: TASTNode);
     procedure ProcessForLoop(Node: TASTNode);
     procedure ProcessDoLoop(Node: TASTNode);
     procedure ProcessBlock(Node: TASTNode);
@@ -2133,8 +2134,14 @@ begin
               EmitInstruction(ssaStrMid, Result, ArgReg, Arg2Reg, Arg3Reg);
             end
             else
-              // No length specified - use MaxInt for "rest of string"
-              EmitInstruction(ssaStrMid, Result, ArgReg, Arg2Reg, MakeSSAConstInt(MaxInt));
+            begin
+              // No length specified -> rest of string. Pass LEN(str) as the length REGISTER (the VM
+              // clamps to the chars remaining). A constant here is wrong: ssaStrMid encodes its length
+              // operand as a register index, so a const (e.g. MaxInt) reads a bogus register => "".
+              Arg3Reg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaStrLen, Arg3Reg, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              EmitInstruction(ssaStrMid, Result, ArgReg, Arg2Reg, Arg3Reg);
+            end;
           end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end
@@ -4096,6 +4103,97 @@ begin
   AsnBTmp.AddChild(TmpRef);
   ProcessAssignment(AsnBTmp);
   AsnBTmp.Free;
+end;
+
+procedure TSSAGenerator.ProcessMidStatement(Node: TASTNode);
+// MID(target, start [, len]) = source (FreeBASIC, MODERN): overwrite a substring of target in
+// place; target's length is unchanged. Lowered with existing string ops (no new opcode):
+//   midsrc = LEFT$( (len given ? LEFT$(source,len) : source), LEN(target)-start+1 )
+//   target = LEFT$(target, start-1) + midsrc + MID$(target, start + LEN(midsrc))
+// The trailing concat lands in a temp string var, then ProcessAssignment writes it back to the
+// target lvalue (scalar / array element / member, uniformly). Assumes start >= 1 (1-based, as in FB).
+
+  function NS: TSSAValue;  // fresh string register
+  begin Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString)); end;
+  function NI: TSSAValue;  // fresh int register
+  begin Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt)); end;
+
+var
+  TargetNode, StartNode, LenNode, SourceNode, AsnNode, TmpRef: TASTNode;
+  TextVal, StartVal, SrcVal, LenVal: TSSAValue;
+  TextReg, StartReg, SrcReg, SrcCapReg, MidSrcReg: TSSAValue;
+  LenTextReg, AvailTmpReg, AvailReg, OneReg, StartM1Reg, PrefixReg: TSSAValue;
+  LenMidReg, SuffixStartReg, SuffixReg, R1Reg, ResultReg: TSSAValue;
+  TmpName: string;
+  HasLen: Boolean;
+  NoneV: TSSAValue;
+begin
+  if Node.ChildCount < 3 then Exit;
+  NoneV := MakeSSAValue(svkNone);
+  TargetNode := Node.GetChild(0);
+  StartNode := Node.GetChild(1);
+  HasLen := Node.ChildCount >= 4;
+  if HasLen then
+  begin
+    LenNode := Node.GetChild(2);
+    SourceNode := Node.GetChild(3);
+  end
+  else
+  begin
+    LenNode := nil;
+    SourceNode := Node.GetChild(2);
+  end;
+
+  // Read inputs.
+  ProcessExpression(TargetNode, TextVal); TextReg := EnsureStringRegister(TextVal);
+  ProcessExpression(StartNode, StartVal); StartReg := EnsureIntRegister(StartVal);
+  ProcessExpression(SourceNode, SrcVal);  SrcReg := EnsureStringRegister(SrcVal);
+
+  // source capped to len: LEFT$(source, len) when a length was given.
+  if HasLen then
+  begin
+    ProcessExpression(LenNode, LenVal);
+    SrcCapReg := NS;
+    EmitInstruction(ssaStrLeft, SrcCapReg, SrcReg, EnsureIntRegister(LenVal), NoneV);
+  end
+  else
+    SrcCapReg := SrcReg;
+
+  OneReg := NI; EmitInstruction(ssaLoadConstInt, OneReg, MakeSSAConstInt(1), NoneV, NoneV);
+
+  // avail = LEN(target) - start + 1
+  LenTextReg := NI;  EmitInstruction(ssaStrLen, LenTextReg, TextReg, NoneV, NoneV);
+  AvailTmpReg := NI; EmitInstruction(ssaSubInt, AvailTmpReg, LenTextReg, StartReg, NoneV);
+  AvailReg := NI;    EmitInstruction(ssaAddInt, AvailReg, AvailTmpReg, OneReg, NoneV);
+
+  // midsrc = LEFT$(srcCap, avail) -> the characters that actually overwrite, clamped to room left.
+  MidSrcReg := NS; EmitInstruction(ssaStrLeft, MidSrcReg, SrcCapReg, AvailReg, NoneV);
+
+  // prefix = LEFT$(target, start-1)
+  StartM1Reg := NI; EmitInstruction(ssaSubInt, StartM1Reg, StartReg, OneReg, NoneV);
+  PrefixReg := NS;  EmitInstruction(ssaStrLeft, PrefixReg, TextReg, StartM1Reg, NoneV);
+
+  // suffix = MID$(target, start + LEN(midsrc), LEN(target))  [rest of the original string after the
+  // overwrite]. Length is passed as the LEN(target) register (always >= the remaining count, which the
+  // VM clamps) — NOT a constant, since ssaStrMid encodes its length operand as a register index.
+  LenMidReg := NI;      EmitInstruction(ssaStrLen, LenMidReg, MidSrcReg, NoneV, NoneV);
+  SuffixStartReg := NI; EmitInstruction(ssaAddInt, SuffixStartReg, StartReg, LenMidReg, NoneV);
+  SuffixReg := NS;      EmitInstruction(ssaStrMid, SuffixReg, TextReg, SuffixStartReg, LenTextReg);
+
+  // result = prefix + midsrc + suffix, into a named temp string var so it can be assigned back.
+  TmpName := '__MID' + IntToStr(FSwapTempSeq) + '$';
+  Inc(FSwapTempSeq);
+  ResultReg := GetOrAllocateVariable(TmpName);
+  R1Reg := NS; EmitInstruction(ssaStrConcat, R1Reg, PrefixReg, MidSrcReg, NoneV);
+  EmitInstruction(ssaStrConcat, ResultReg, R1Reg, SuffixReg, NoneV);
+
+  // target = result  (dispatches on the target lvalue kind via the existing assignment machinery)
+  AsnNode := TASTNode.Create(antAssignment, Node.Token);
+  AsnNode.AddChild(TargetNode.Clone);
+  TmpRef := TASTNode.CreateWithValue(antIdentifier, TmpName, Node.Token);
+  AsnNode.AddChild(TmpRef);
+  ProcessAssignment(AsnNode);
+  AsnNode.Free;
 end;
 
 procedure TSSAGenerator.ProcessForLoop(Node: TASTNode);
@@ -11219,6 +11317,7 @@ begin
     antErase: ProcessErase(Node);
     antRedim: ProcessRedim(Node);
     antSwap: ProcessSwap(Node);
+    antMidStatement: ProcessMidStatement(Node);
     antDef: ProcessDefFn(Node);
     antForLoop: ProcessForLoop(Node);
     antDoLoop: ProcessDoLoop(Node);
