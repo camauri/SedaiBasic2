@@ -35,6 +35,12 @@ uses
   SedaiExecutorTypes, SedaiBasicKeywords;
 
 type
+  // Dialect selection for the parser. pdAuto (default) detects the dialect from the token
+  // stream at each Parse (line numbers => CLASSIC, none => MODERN). pdModern/pdClassic force
+  // it explicitly and survive subsequent Parse calls — set these from NEW MODERN / NEW CLASSIC,
+  // OPTION MODE MODERN / OPTION MODE CLASSIC; use SetDialect(pdAuto) after LOAD to re-detect.
+  TParserDialect = (pdAuto, pdModern, pdClassic);
+
   { TPackratParser - Main BASIC Parser with Packrat memoization }
   TPackratParser = class(TPackratCore)
   private
@@ -42,9 +48,11 @@ type
     FStartTime: TDateTime;
     FOptions: TParserOptions;
     FValidationStacks: TParserValidationStacks;
-    // Dialect: True when the source has no line numbers (FreeBASIC / MODERN). Computed
-    // once per Parse from the token stream; mirrors the SSA's SourceHasLineNumbers gate.
+    // Dialect: True when parsing in the FreeBASIC / MODERN dialect. Refreshed at each Parse:
+    // from FDialectOverride when forced (pdModern/pdClassic), else auto-detected from the token
+    // stream (no line numbers => MODERN); mirrors the SSA's SourceHasLineNumbers gate.
     FModernMode: Boolean;
+    FDialectOverride: TParserDialect;  // pdAuto = detect per-Parse; pdModern/pdClassic = forced
 
     // options & configuration
     function DefaultParserOptions: TParserOptions;
@@ -79,8 +87,12 @@ type
 
     // Dialect of the program being parsed: MODERN (FreeBASIC, no line numbers) vs
     // CLASSIC (BASIC v7, line-numbered). Used to disambiguate keywords that exist in
-    // both dialects with different meaning (e.g. SWAP, MID). = NOT (has line numbers).
+    // both dialects with different meaning (e.g. SWAP, MID).
     property ModernMode: Boolean read FModernMode;
+    // Force the dialect (NEW MODERN/CLASSIC, OPTION MODE) or pdAuto to re-detect (after LOAD).
+    // Takes effect on the next Parse; pdAuto also refreshes FModernMode immediately if a
+    // token stream is already bound.
+    procedure SetDialect(ADialect: TParserDialect);
 
     // === CONTEXT MANAGEMENT OVERRIDE ===
     procedure SetContext(AContext: TParserContext); override;
@@ -242,6 +254,7 @@ begin
   inherited Create;
   FExpressionParser := TExpressionParser.Create;
   FOptions := DefaultParserOptions;
+  FDialectOverride := pdAuto;  // detect dialect from each program's tokens unless forced
 
   // === TIER 1: Enable adaptive memoization for BASIC (linear programs) ===
   // Most BASIC programs are linear with simple control flow
@@ -273,6 +286,19 @@ begin
     FExpressionParser.SetContext(AContext);
 end;
 
+procedure TPackratParser.SetDialect(ADialect: TParserDialect);
+begin
+  FDialectOverride := ADialect;
+  // Reflect the new dialect immediately so a query before the next Parse is correct.
+  case ADialect of
+    pdModern:  FModernMode := True;
+    pdClassic: FModernMode := False;
+  else
+    if Assigned(Context) and Assigned(Context.TokenList) then
+      FModernMode := not Context.TokenList.HasTokenType(ttLineNumber);
+  end;
+end;
+
 // === MAIN PARSING METHODS ===
 
 function TPackratParser.Parse(TokenList: TTokenList): TParsingResult;
@@ -289,8 +315,14 @@ begin
     Context.DebugMode := DebugMode;
     {$ENDIF}
 
-    // Determine the dialect once: a program with no line-number tokens is FreeBASIC (MODERN).
-    FModernMode := Assigned(TokenList) and not TokenList.HasTokenType(ttLineNumber);
+    // Resolve the dialect for this parse: honor an explicit override (NEW MODERN/CLASSIC,
+    // OPTION MODE), otherwise auto-detect — a program with no line-number tokens is MODERN.
+    case FDialectOverride of
+      pdModern:  FModernMode := True;
+      pdClassic: FModernMode := False;
+    else
+      FModernMode := Assigned(TokenList) and not TokenList.HasTokenType(ttLineNumber);
+    end;
 
     DoParsingStarted;
 
