@@ -322,6 +322,7 @@ const
   bcStrOct          = bcGroupString + 19;  // OCT(n)  - octal string (Dest=string, Src1=int)
   bcStrBin          = bcGroupString + 20;  // BIN(n)  - binary string (Dest=string, Src1=int)
   bcStrValInt       = bcGroupString + 21;  // VALINT/VALLNG/VALUINT(s) - parse integer (Dest=int, Src1=string)
+  bcStrString       = bcGroupString + 22;  // STRING(n,ch) - n copies of a char (Dest=string, Src1=int count, Src2=int charcode)
 
   // === GROUP 2: MATH FUNCTIONS (0x02xx) ===
   bcMathSin         = bcGroupMath + 0;
@@ -1329,6 +1330,7 @@ begin
         19: Result := 'StrOct';
         20: Result := 'StrBin';
         21: Result := 'StrValInt';
+        22: Result := 'StrString';
       else
         Result := Format('String_%d', [SubOp]);
       end;

@@ -268,6 +268,7 @@ type
     procedure ProcessSwap(Node: TASTNode);
     procedure ProcessMidStatement(Node: TASTNode);
     procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
+    procedure EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure ProcessForLoop(Node: TASTNode);
     procedure ProcessDoLoop(Node: TASTNode);
     procedure ProcessBlock(Node: TASTNode);
@@ -2764,6 +2765,16 @@ begin
           Exit;
         end;
 
+        // FreeBASIC STRING(n, ch) / v7-QB STRING$(n, ch): n copies of a character. STRING parses as
+        // array access (STRING is a type name, not a registered keyword). STRING$ works in both
+        // dialects; bare STRING is the FB form (MODERN only). Only when not actually a declared array.
+        if (FProgram.FindArray(ArrName) < 0) and
+           ((UpperCase(ArrName) = 'STRING$') or (FModernMode and (UpperCase(ArrName) = 'STRING'))) then
+        begin
+          EmitStringFill(Node.GetChild(1), Result);
+          Exit;
+        end;
+
         ArrayIdx := FProgram.FindArray(ArrName);
         if ArrayIdx < 0 then
           raise Exception.CreateFmt('Array not declared: %s', [ArrName]);
@@ -4113,6 +4124,30 @@ begin
     EmitInstruction(ssaStrLen, Arg3Reg, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     EmitInstruction(ssaStrMid, Result, ArgReg, Arg2Reg, Arg3Reg);
   end;
+end;
+
+procedure TSSAGenerator.EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);
+// Lower STRING(count, ch) -> count copies of a character (ssaStrString). ArgsNode children:
+// count, ch. ch may be a string (its first character's code is used) or a numeric char code.
+var
+  CountVal, ChVal, CountReg, CodeReg, StrReg: TSSAValue;
+begin
+  if (ArgsNode = nil) or (ArgsNode.ChildCount < 2) then begin Result := MakeSSAValue(svkNone); Exit; end;
+  ProcessExpression(ArgsNode.GetChild(0), CountVal);
+  CountReg := EnsureIntRegister(CountVal);
+  ProcessExpression(ArgsNode.GetChild(1), ChVal);
+  if (ChVal.Kind = svkConstString) or
+     ((ChVal.Kind = svkRegister) and (ChVal.RegType = srtString)) then
+  begin
+    // String char argument: take ASC of its first character.
+    StrReg := EnsureStringRegister(ChVal);
+    CodeReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaStrAsc, CodeReg, StrReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+    CodeReg := EnsureIntRegister(ChVal);  // numeric char code (int/float coerced to int)
+  Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaStrString, Result, CountReg, CodeReg, MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.ProcessMidStatement(Node: TASTNode);

@@ -2230,6 +2230,14 @@ begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
 
+        // STRING(n,ch): int count (Src1) + int char code (Src2) -> String Dest
+        bcStrString:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+        end;
+
         // Float Src1 -> String Dest (STR$)
         bcStrStr:
         begin
@@ -3857,6 +3865,12 @@ begin
         Count := Ctx.IntRegs[Instr.Src1];
         if Count < 0 then Count := 0;
         Ctx.StringRegs[Instr.Dest] := StringOfChar(' ', Count);
+      end;
+    22: // bcStrString - STRING(n, ch) -> n copies of the character whose code is Src2
+      begin
+        Count := Ctx.IntRegs[Instr.Src1];
+        if Count < 0 then Count := 0;
+        Ctx.StringRegs[Instr.Dest] := StringOfChar(Chr(Ctx.IntRegs[Instr.Src2] and $FF), Count);
       end;
     7: // bcStrStr - STR$(n)
       Ctx.StringRegs[Instr.Dest] := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]);

@@ -324,6 +324,7 @@ begin
     // === GROUP 1: String operations ===
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrChr,
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrSpace,  // B1.2: string dest
+    bcStrString,  // STRING(n,ch) - string dest
     bcStrStr,    // STR$(n) - number to string
     bcStrHex,    // HEX$(n) - int to hex string
     bcStrOct, bcStrBin,  // OCT(n)/BIN(n) - int to octal/binary string (B1.3)
@@ -384,6 +385,7 @@ begin
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
     // === GROUP 1: String operations with int param ===
     bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin,
+    bcStrString,  // STRING(n,ch) - Src1 = count (int)
     // === GROUP 5: Memory operations ===
     bcPeek,           // PEEK(address): Src1 = address (int)
     bcPoke,           // POKE address, value: Src1 = address (int)
@@ -505,6 +507,7 @@ begin
     // === GROUP 1: String operations with int second param ===
     bcStrLeft, bcStrRight,  // LEFT$/RIGHT$(str, len) - len is Src2 (int)
     bcStrMid,  // Mid$(str, start, length) - start is Src1, length is Src2
+    bcStrString,  // STRING(n,ch) - Src2 = char code (int)
     // === GROUP 3: Typed array operations: Src2 is always int (linear index) ===
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,

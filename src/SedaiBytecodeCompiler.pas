@@ -182,6 +182,7 @@ begin
     ssaStrLCase: Result := bcStrLCase;
     ssaStrInstrRev: Result := bcStrInstrRev;
     ssaStrSpace: Result := bcStrSpace;
+    ssaStrString: Result := bcStrString;
     ssaStrOct: Result := bcStrOct;       // B1.3 numeric<->string conversions
     ssaStrBin: Result := bcStrBin;
     ssaStrValInt: Result := bcStrValInt;

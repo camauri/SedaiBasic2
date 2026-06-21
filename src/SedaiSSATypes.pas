@@ -86,6 +86,7 @@ type
     ssaStrLTrim, ssaStrRTrim, ssaStrTrim, ssaStrUCase, ssaStrLCase,
     ssaStrInstrRev,   // INSTRREV(s, sub) -> int (last occurrence)
     ssaStrSpace,      // SPACE(n) -> string of n spaces
+    ssaStrString,     // STRING(n,ch) -> n copies of a char (Src1=count int, Src2=charcode int)
     // FreeBASIC numeric<->string conversions (B1.3).
     ssaStrOct,        // OCT(n) -> octal string
     ssaStrBin,        // BIN(n) -> binary string
