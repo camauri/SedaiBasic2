@@ -109,6 +109,8 @@ type
 implementation
 
 uses
+  // Preprocessor (runs before lexing)
+  SedaiPreprocessor,
   // Lexer/Parser
   SedaiLexerFSM, SedaiLexerTypes, SedaiLexerToken, SedaiTokenList,
   SedaiParserTypes, SedaiAST, SedaiParserContext, SedaiParserResults,
@@ -288,6 +290,9 @@ begin
         Inc(removed);
       end;
     end;
+
+    // === PREPROCESSOR === (FreeBASIC #define/#undef/#ifdef/.../#include) before lexing.
+    Source.Text := PreprocessSource(Source.Text, GetCurrentDir);
 
     // === LEXING ===
     // Dialect auto-selected at LOAD by content: a program with line numbers is

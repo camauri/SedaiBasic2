@@ -62,7 +62,7 @@ uses
   // I/O Manager
   SedaiIOManager, SedaiTerminalIO,
   // Runner and Serializer (for .basc support)
-  SedaiRunner, SedaiBytecodeSerializer;
+  SedaiRunner, SedaiBytecodeSerializer, SedaiPreprocessor;
 
 // Include version information (must be after uses, contains const declarations)
 {$I Version.inc}
@@ -534,6 +534,10 @@ begin
     end;
     if OptVerbose and (removed > 0) then
       WriteLn(Format('Pre-filter: removed %d fence line(s) from source (non-destructive).', [removed]));
+
+    // === PREPROCESSOR === (FreeBASIC #define/#undef/#ifdef/#ifndef/#else/#endif/#include).
+    // Pure text->text pass before lexing; #include paths resolve relative to the source file.
+    Source.Text := PreprocessSource(Source.Text, ExtractFilePath(ExpandFileName(SourceFile)));
 
     if OptVerbose then
       WriteLn;
