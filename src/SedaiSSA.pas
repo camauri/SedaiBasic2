@@ -11470,6 +11470,11 @@ begin
     antRedim: ProcessRedim(Node);
     antSwap: ProcessSwap(Node);
     antMidStatement: ProcessMidStatement(Node);
+    antEnum:
+      // ENUM members lower to a sequence of plain assignments (member = value), like CONST.
+      for i := 0 to Node.ChildCount - 1 do
+        if Node.GetChild(i).NodeType = antAssignment then
+          ProcessAssignment(Node.GetChild(i));
     antDef: ProcessDefFn(Node);
     antForLoop: ProcessForLoop(Node);
     antDoLoop: ProcessDoLoop(Node);

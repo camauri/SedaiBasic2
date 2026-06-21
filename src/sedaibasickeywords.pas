@@ -130,6 +130,7 @@ const
   kST      = 'ST';
   kSTASH   = 'STASH';
   kSWAP    = 'SWAP';
+  kENUM    = 'ENUM';      // ENUM ... END ENUM - named integer constants (FreeBASIC)
 
   // time
   kTI      = 'TI';

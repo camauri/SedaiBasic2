@@ -178,6 +178,7 @@ type
     function ParseRedimStatement: TASTNode;
     function ParseSwapStatement: TASTNode;
     function ParseMidStatement: TASTNode;
+    function ParseEnumStatement: TASTNode;
     function ParseDefStatement: TASTNode;
     function ParseFnStatement: TASTNode;
     function ParseConstStatement: TASTNode;
@@ -538,6 +539,7 @@ begin
     ttDataDeclaration: Result := Memoize('DimStatement', @ParseDimStatement);
     ttArrayErase: Result := Memoize('EraseStatement', @ParseEraseStatement);
     ttArrayRedim: Result := Memoize('RedimStatement', @ParseRedimStatement);
+    ttEnum: Result := Memoize('EnumStatement', @ParseEnumStatement);
     ttConstant: Result := Memoize('ConstStatement', @ParseConstStatement);
     ttDataConstant: Result := Memoize('DataStatement', @ParseDataStatement);
     ttDataRead: Result := Memoize('ReadStatement', @ParseReadStatement);
@@ -4388,6 +4390,65 @@ begin
   Result.AddChild(StartNode);
   if Assigned(LenNode) then Result.AddChild(LenNode);
   Result.AddChild(SourceNode);
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseEnumStatement: TASTNode;
+// ENUM [typename] / member [= expr] / ... / END ENUM  (FreeBASIC named integer constants).
+// Desugared to a sequence of assignments (like CONST): a member with no "= expr" takes the
+// previous member + 1 (the first defaults to 0). Children of the antEnum node are antAssignment.
+var
+  Token: TLexerToken;
+  MemberName, PrevMember: string;
+  ValueNode, AsnNode: TASTNode;
+  IsFirst: Boolean;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antEnum, Token);
+  Context.Advance;                              // consume ENUM
+  // Optional enum type name on the header line (unused). Skip whatever token it is — it may be a
+  // reserved word (e.g. a type/colour keyword), so don't require ttIdentifier.
+  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam, ttEndOfFile]) then
+    Context.Advance;
+  while Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam]) do Context.Advance;
+
+  PrevMember := '';
+  IsFirst := True;
+  while not Context.Check(ttEndOfFile) do
+  begin
+    if Context.Check(ttProgramEnd) then        // END [ENUM] terminator
+    begin
+      Context.Advance;
+      if Context.Check(ttEnum) then Context.Advance;
+      Break;
+    end;
+    if not Context.Check(ttIdentifier) then
+    begin
+      if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam]) then
+      begin Context.Advance; Continue; end;
+      HandleError('Expected enum member name', Context.CurrentToken);
+      Break;
+    end;
+    MemberName := UpperCase(Context.CurrentToken.Value);
+    Context.Advance;
+    if Context.Match(ttOpEq) then
+      ValueNode := FExpressionParser.ParseExpression
+    else if IsFirst then
+      ValueNode := CreateLiteralNode(0, Token)
+    else
+      ValueNode := CreateBinaryOpNode(ttOpAdd,
+        TASTNode.CreateWithValue(antIdentifier, PrevMember, Token),
+        CreateLiteralNode(1, Token),
+        TLexerToken.CreateSimple(ttOpAdd, '+'));
+    if not Assigned(ValueNode) then ValueNode := CreateLiteralNode(0, Token);
+    AsnNode := TASTNode.Create(antAssignment, Token);
+    AsnNode.AddChild(TASTNode.CreateWithValue(antIdentifier, MemberName, Token));
+    AsnNode.AddChild(ValueNode);
+    Result.AddChild(AsnNode);
+    PrevMember := MemberName;
+    IsFirst := False;
+    while Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam]) do Context.Advance;
+  end;
   DoNodeCreated(Result);
 end;
 
