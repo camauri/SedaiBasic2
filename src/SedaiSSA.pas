@@ -267,6 +267,7 @@ type
     procedure ProcessRedim(Node: TASTNode);
     procedure ProcessSwap(Node: TASTNode);
     procedure ProcessMidStatement(Node: TASTNode);
+    procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure ProcessForLoop(Node: TASTNode);
     procedure ProcessDoLoop(Node: TASTNode);
     procedure ProcessBlock(Node: TASTNode);
@@ -2115,36 +2116,8 @@ begin
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end
         else if (FuncName = 'MID$') then
-        begin
-          // MID$(str, start [,length]) - returns substring
-          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
-          begin
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue);  // string
-            ProcessExpression(ArgListNode.GetChild(1), Arg2Value); // start
-            ArgReg := EnsureStringRegister(ArgValue);
-            Arg2Reg := EnsureIntRegister(Arg2Value);
-            DestReg := FProgram.AllocRegister(srtString);
-            Result := MakeSSARegister(srtString, DestReg);
-            // Length is optional - pass in Src3 (as constant or register)
-            if ArgListNode.ChildCount >= 3 then
-            begin
-              ProcessExpression(ArgListNode.GetChild(2), Arg3Value);
-              // Pass length as Src3 - can be constant or register
-              Arg3Reg := EnsureIntRegister(Arg3Value);
-              EmitInstruction(ssaStrMid, Result, ArgReg, Arg2Reg, Arg3Reg);
-            end
-            else
-            begin
-              // No length specified -> rest of string. Pass LEN(str) as the length REGISTER (the VM
-              // clamps to the chars remaining). A constant here is wrong: ssaStrMid encodes its length
-              // operand as a register index, so a const (e.g. MaxInt) reads a bogus register => "".
-              Arg3Reg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-              EmitInstruction(ssaStrLen, Arg3Reg, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-              EmitInstruction(ssaStrMid, Result, ArgReg, Arg2Reg, Arg3Reg);
-            end;
-          end
-          else begin Result := MakeSSAValue(svkNone); Exit; end;
-        end
+          // MID$(str, start [,length]) - v7 substring function (works in both dialects).
+          EmitMidSubstring(ArgListNode, Result)
         else if (FuncName = 'INSTR') then
         begin
           // INSTR(str1, str2 [,start]) - find str2 in str1, return position
@@ -2779,6 +2752,15 @@ begin
         if FProcedureNames.IndexOf(UpperCase(ArrName)) >= 0 then
         begin
           EmitUserFunctionCall(UpperCase(ArrName), Node.GetChild(1), Result);
+          Exit;
+        end;
+
+        // FreeBASIC bare MID as the substring function (MODERN only): "MID(s, start [,len])" parses as
+        // array access, but in FreeBASIC MID is the function (MID$ stays the v7 form; in CLASSIC MID is
+        // a plain identifier/array). Only when MID is not actually a declared array.
+        if FModernMode and (UpperCase(ArrName) = 'MID') and (FProgram.FindArray(ArrName) < 0) then
+        begin
+          EmitMidSubstring(Node.GetChild(1), Result);
           Exit;
         end;
 
@@ -4103,6 +4085,34 @@ begin
   AsnBTmp.AddChild(TmpRef);
   ProcessAssignment(AsnBTmp);
   AsnBTmp.Free;
+end;
+
+procedure TSSAGenerator.EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
+// Lower MID$/MID(str, start [,length]) to a substring (ssaStrMid). ArgsNode children: str, start [,len]
+// (accepts an antArgumentList from MID$ or an antExpressionList from a bare MID(...) intercept).
+var
+  ArgValue, Arg2Value, Arg3Value, ArgReg, Arg2Reg, Arg3Reg: TSSAValue;
+begin
+  if (ArgsNode = nil) or (ArgsNode.ChildCount < 2) then begin Result := MakeSSAValue(svkNone); Exit; end;
+  ProcessExpression(ArgsNode.GetChild(0), ArgValue);   // string
+  ProcessExpression(ArgsNode.GetChild(1), Arg2Value);  // start
+  ArgReg := EnsureStringRegister(ArgValue);
+  Arg2Reg := EnsureIntRegister(Arg2Value);
+  Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  if ArgsNode.ChildCount >= 3 then
+  begin
+    ProcessExpression(ArgsNode.GetChild(2), Arg3Value);  // length
+    Arg3Reg := EnsureIntRegister(Arg3Value);
+    EmitInstruction(ssaStrMid, Result, ArgReg, Arg2Reg, Arg3Reg);
+  end
+  else
+  begin
+    // No length -> rest of string. Pass LEN(str) as the length REGISTER (the VM clamps to the chars
+    // remaining). A constant here is wrong: ssaStrMid encodes its length operand as a register index.
+    Arg3Reg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaStrLen, Arg3Reg, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ssaStrMid, Result, ArgReg, Arg2Reg, Arg3Reg);
+  end;
 end;
 
 procedure TSSAGenerator.ProcessMidStatement(Node: TASTNode);
