@@ -136,7 +136,8 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like macros; function-like macros pending) |
 | `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening (methods of a namespaced TYPE / `USING` / `..global` pending) |
 | Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit scalar pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Pointer arithmetic, pointers into array/UDT, multi-level PTR pending |
-| BYREF-return / `WSTRING` | ✗ | Not yet implemented |
+| `FUNCTION f() BYREF AS T` | ✓ | BYREF function results: return a reference to a SHARED/global scalar, read + write through it (`f()=x`). Returning a BYREF parameter (the `min(a,b)=0` idiom) pending |
+| `WSTRING` | ✗ | Not yet implemented |
 
 ## Variable Scope
 
