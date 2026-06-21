@@ -31,6 +31,11 @@ uses
   Classes, SysUtils,
   SedaiLexerTypes, SedaiLexerToken, SedaiExecutorTypes;
 
+const
+  // AST attribute key: target loop depth of a multi-level EXIT/CONTINUE ("Exit For, For"). Set by the
+  // parser, read by the SSA generator. (An internal attribute name, not a BASIC keyword.)
+  ATTR_LOOP_LEVELS = 'LEVELS';
+
 type
   // === AST NODE TYPES ===
   TASTNodeType = (

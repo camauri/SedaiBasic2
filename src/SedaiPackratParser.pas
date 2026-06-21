@@ -2371,11 +2371,12 @@ var
   IsExit, IsContinue: Boolean;
   Kw: string;
   ExprNode: TASTNode;
+  Levels: Integer;
 begin
   Token := Context.CurrentToken;
   Kw := UpperCase(Token.Value);
-  IsExit := Kw = 'EXIT';
-  IsContinue := Kw = 'CONTINUE';
+  IsExit := Kw = kEXIT;
+  IsContinue := Kw = kCONTINUE;
   Result := TASTNode.Create(antReturn, Token);
   Context.Advance; // consume EXIT / CONTINUE / RETURN
 
@@ -2383,12 +2384,25 @@ begin
   begin
     // EXIT [SUB|FUNCTION|FOR|DO|WHILE|LOOP] / CONTINUE [FOR|DO|WHILE|LOOP]. Capture the kind
     // word (if any) in the node value so SSA can route EXIT SUB/FUNCTION to a frame return vs a
-    // loop exit; for CONTINUE the kind is informational (innermost loop is the target in v1).
+    // loop exit. FreeBASIC multi-level form repeats the same loop kind comma-separated
+    // ("Exit For, For" / "Continue Do, Do") to target the N-th enclosing loop of that kind: count
+    // the repetitions into the LEVELS attribute (default 1 = innermost).
     if not (Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt)) then
     begin
       KindTok := Context.CurrentToken;
       Result.Value := Kw + ' ' + UpperCase(KindTok.Value);
       Context.Advance;   // consume the kind keyword (SUB/FUNCTION/FOR/...)
+      Levels := 1;
+      // Additional ", <same-kind>" entries increase the target depth (loops only).
+      while Context.Check(ttSeparParam) and Assigned(Context.PeekNext) and
+            (UpperCase(Context.PeekNext.Value) = UpperCase(KindTok.Value)) do
+      begin
+        Context.Advance;   // comma
+        Context.Advance;   // repeated kind word
+        Inc(Levels);
+      end;
+      if Levels > 1 then
+        Result.Attributes.Values[ATTR_LOOP_LEVELS] := IntToStr(Levels);
     end
     else
       Result.Value := Kw;
@@ -2397,7 +2411,7 @@ begin
   begin
     // RETURN [expr]: a bare RETURN ends a GOSUB / procedure; RETURN expr (FreeBASIC) also
     // delivers a FUNCTION result. Parse a trailing expression if present on this line.
-    Result.Value := 'RETURN';
+    Result.Value := kRETURN;
     if not (Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt)) then
     begin
       ExprNode := FExpressionParser.ParseExpression;

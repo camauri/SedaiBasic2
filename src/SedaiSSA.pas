@@ -34,11 +34,15 @@ interface
 uses
   Classes, SysUtils, StrUtils, Variants, Math, Generics.Collections,
   SedaiLexerTypes, SedaiLexerToken, SedaiParserTypes, SedaiAST,
-  SedaiSSATypes;
+  SedaiSSATypes, SedaiBasicKeywords;
 
 type
   { Loop info for FOR/NEXT implementation }
+  // Loop kind, for multi-level EXIT/CONTINUE which target the N-th enclosing loop of a given kind.
+  // WHILE/WEND is not a standalone construct here (DO WHILE is a DO), so only FOR and DO exist.
+  TLoopKind = (lkFor, lkDo);
   TLoopInfo = record
+    LoopKind: TLoopKind;
     VarName: string;
     VarReg: TSSAValue;
     EndValue: TSSAValue;
@@ -219,6 +223,8 @@ type
     procedure CollectTopLevelLabels(Parent: TASTNode; StartIdx: Integer);  // GOTO-unwind: depth-0 labels of a frame
     procedure ScanTopLevelLabels(Node: TASTNode; var Depth: Integer);      // recursive worker for the above
     procedure EmitExitLoopCleanup;                       // M8: unwind blocks down to the loop body (EXIT FOR/DO)
+    procedure EmitExitLoopCleanupN(LoopLevels: Integer); // multi-level EXIT/CONTINUE (Exit For, For)
+    function FindEnclosingLoop(Kind: TLoopKind; Levels: Integer; out LoopIdx, AllDepth: Integer): Boolean;
     procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
     procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
     // Refinement #2: cross-thread SHARED scalars backed by a 1-element global array.
@@ -4906,6 +4912,7 @@ begin
   BlockScopeEnter(True);   // loop body: EXIT FOR unwinds down to here
 
   // Push loop info onto stack
+  LoopInfo.LoopKind := lkFor;
   LoopInfo.VarName := VarName;
   LoopInfo.VarReg := VarReg;
   LoopInfo.EndValue := EndValue;
@@ -4965,6 +4972,7 @@ begin
   EndLabel := GenerateUniqueLabel('do_end');
 
   // Push loop info for EXIT support
+  LoopInfo.LoopKind := lkDo;
   LoopInfo.VarName := '';  // DO loops don't have a loop variable
   LoopInfo.VarReg := MakeSSAValue(svkNone);
   LoopInfo.EndValue := MakeSSAValue(svkNone);
@@ -10587,15 +10595,54 @@ procedure TSSAGenerator.EmitExitLoopCleanup;
 // M8: on EXIT FOR/DO/WHILE, unwind block scopes innermost-first down to AND INCLUDING the nearest loop
 // body frame (so any IF/SCOPE blocks nested between the EXIT and the loop are cleaned too). Frames are
 // NOT dropped — this is one CFG path; the loop's own NEXT/LOOP end pops them on the fall-through path.
-var
-  k: Integer;
 begin
+  EmitExitLoopCleanupN(1);
+end;
+
+procedure TSSAGenerator.EmitExitLoopCleanupN(LoopLevels: Integer);
+// Multi-level EXIT/CONTINUE (FreeBASIC "Exit For, For"): unwind block scopes innermost-first down to
+// AND INCLUDING the LoopLevels-th enclosing loop-body frame (counting ALL loop bodies passed, of any
+// kind, plus the IF/SCOPE blocks between them). LoopLevels=1 == EmitExitLoopCleanup.
+var
+  k, seen: Integer;
+begin
+  if LoopLevels < 1 then LoopLevels := 1;
+  seen := 0;
   for k := High(FScopeStack) downto 0 do
     if FScopeStack[k].Kind = skBlock then
     begin
       EmitBlockScopeCleanup(k);
-      if FScopeStack[k].IsLoopBody then Break;   // reached the loop body — stop (it is the EXIT target)
+      if FScopeStack[k].IsLoopBody then
+      begin
+        Inc(seen);
+        if seen >= LoopLevels then Break;
+      end;
     end;
+end;
+
+function TSSAGenerator.FindEnclosingLoop(Kind: TLoopKind; Levels: Integer;
+  out LoopIdx, AllDepth: Integer): Boolean;
+// Locate the Levels-th enclosing loop of the given Kind, scanning FLoopStack from the top. LoopIdx is
+// its index in FLoopStack; AllDepth is how many loops (of ANY kind) lie from the top down to and
+// including it — i.e. how many loop-body frames the scope cleanup must pass. Returns False if there is
+// no such loop (caller then falls back to the innermost).
+var
+  k, seenKind, allSeen: Integer;
+begin
+  Result := False; LoopIdx := -1; AllDepth := 0;
+  seenKind := 0; allSeen := 0;
+  for k := High(FLoopStack) downto 0 do
+  begin
+    Inc(allSeen);
+    if FLoopStack[k].LoopKind = Kind then
+    begin
+      Inc(seenKind);
+      if seenKind >= Levels then
+      begin
+        LoopIdx := k; AllDepth := allSeen; Result := True; Exit;
+      end;
+    end;
+  end;
 end;
 
 procedure TSSAGenerator.EmitBlockScopeCleanup(Idx: Integer);
@@ -11020,7 +11067,7 @@ begin
   end;
   IsFunc := False;
   if FProcDecls.TryGetValue(MethodLabel, Decl) and Assigned(Decl) then
-    IsFunc := UpperCase(VarToStr(Decl.Value)) = 'FUNCTION';
+    IsFunc := UpperCase(VarToStr(Decl.Value)) = kFUNCTION;
   if IsFunc then
   begin
     RT := GetVariableType(MethodLabel);   // method return bank (record handle => int)
@@ -11387,7 +11434,7 @@ begin
     // Establish procedure context (for "fname = expr" results, RETURN, EXIT SUB/FUNCTION).
     FInProcedure := True;
     FCurrentProcName := Name;
-    FCurrentProcIsFunction := (UpperCase(VarToStr(Proc.Value)) = 'FUNCTION');
+    FCurrentProcIsFunction := (UpperCase(VarToStr(Proc.Value)) = kFUNCTION);
     FCurrentProcRetType := GetVariableType(Name);
     FCurrentProcRetRecType := VarRecordTypeName(Name);   // V3: '' unless it returns a UDT by value
     FCurrentResultHandle := MakeSSAValue(svkNone);
@@ -11543,6 +11590,8 @@ var
   ExitKind: string;       // M2: EXIT/RETURN kind
   IsExitStmt: Boolean;    // M2
   IsContinueStmt: Boolean; // FreeBASIC CONTINUE
+  ExitLevels, ExitLoopIdx, ExitAllDepth: Integer;  // multi-level EXIT/CONTINUE
+  ExitLoopKind: TLoopKind;
   RetVal: TSSAValue;      // M2: RETURN expr / FUNCTION result
   OpCode: TSSAOpCode;     // M5.4: selected mutex op
 begin
@@ -11750,8 +11799,8 @@ begin
     antReturn:
     begin
       ExitKind := UpperCase(VarToStr(Node.Value));   // 'EXIT[ kind]' / 'CONTINUE[ kind]' / 'RETURN'
-      IsExitStmt := Assigned(Node.Token) and (UpperCase(Node.Token.Value) = 'EXIT');
-      IsContinueStmt := Assigned(Node.Token) and (UpperCase(Node.Token.Value) = 'CONTINUE');
+      IsExitStmt := Assigned(Node.Token) and (UpperCase(Node.Token.Value) = kEXIT);
+      IsContinueStmt := Assigned(Node.Token) and (UpperCase(Node.Token.Value) = kCONTINUE);
       if IsContinueStmt then
       begin
         // FreeBASIC CONTINUE: skip the rest of the current iteration and jump to the innermost loop's
@@ -11760,9 +11809,18 @@ begin
         // current iteration's block scope (same unwinding as EXIT, down to and including the loop body).
         if Length(FLoopStack) > 0 then
         begin
-          FLoopStack[High(FLoopStack)].ContUsed := True;
-          EmitExitLoopCleanup;   // M8: destruct + reclaim this iteration's block-scoped UDTs
-          EmitInstruction(ssaJump, MakeSSALabel(FLoopStack[High(FLoopStack)].ContLabel),
+          ExitLevels := StrToIntDef(Node.Attributes.Values[ATTR_LOOP_LEVELS], 1);
+          ExitLoopIdx := High(FLoopStack);   // default: innermost
+          ExitAllDepth := 1;
+          if ExitLevels > 1 then
+          begin
+            if Pos(kFOR, ExitKind) > 0 then ExitLoopKind := lkFor else ExitLoopKind := lkDo;
+            if not FindEnclosingLoop(ExitLoopKind, ExitLevels, ExitLoopIdx, ExitAllDepth) then
+            begin ExitLoopIdx := High(FLoopStack); ExitAllDepth := 1; end;
+          end;
+          FLoopStack[ExitLoopIdx].ContUsed := True;
+          EmitExitLoopCleanupN(ExitAllDepth);   // M8: destruct + reclaim the abandoned iterations' scopes
+          EmitInstruction(ssaJump, MakeSSALabel(FLoopStack[ExitLoopIdx].ContLabel),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           FCurrentBlock := nil;
         end
@@ -11772,7 +11830,7 @@ begin
       else if IsExitStmt then
       begin
         // EXIT SUB / EXIT FUNCTION inside a procedure -> frame return.
-        if FInProcedure and ((Pos('SUB', ExitKind) > 0) or (Pos('FUNCTION', ExitKind) > 0)) then
+        if FInProcedure and ((Pos(kSUB, ExitKind) > 0) or (Pos(kFUNCTION, ExitKind) > 0)) then
         begin
           EmitAllBlockScopesCleanup;   // M8: unwind active loop block scopes before the frame exit
           EmitFrameDestructors;   // V5
@@ -11785,9 +11843,19 @@ begin
         else if Length(FLoopStack) > 0 then
         begin
           // EXIT FOR/DO/WHILE - clean up the loop's block scope (and any IF/SCOPE blocks nested between
-          // here and the loop body), then jump to its EndLabel.
-          EmitExitLoopCleanup;   // M8
-          EmitInstruction(ssaJump, MakeSSALabel(FLoopStack[High(FLoopStack)].EndLabel),
+          // here and the loop body), then jump to its EndLabel. Multi-level "Exit For, For" targets the
+          // N-th enclosing loop of that kind and unwinds every block scope down to and including it.
+          ExitLevels := StrToIntDef(Node.Attributes.Values[ATTR_LOOP_LEVELS], 1);
+          ExitLoopIdx := High(FLoopStack);   // default: innermost
+          ExitAllDepth := 1;
+          if ExitLevels > 1 then
+          begin
+            if Pos(kFOR, ExitKind) > 0 then ExitLoopKind := lkFor else ExitLoopKind := lkDo;
+            if not FindEnclosingLoop(ExitLoopKind, ExitLevels, ExitLoopIdx, ExitAllDepth) then
+            begin ExitLoopIdx := High(FLoopStack); ExitAllDepth := 1; end;
+          end;
+          EmitExitLoopCleanupN(ExitAllDepth);   // M8
+          EmitInstruction(ssaJump, MakeSSALabel(FLoopStack[ExitLoopIdx].EndLabel),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           FCurrentBlock := nil;
         end
