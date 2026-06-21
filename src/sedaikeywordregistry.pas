@@ -1613,6 +1613,7 @@ begin
 
  // === FLOW CONTROL - JUMP RELATED STATEMENTS ===
  RegisterKeyword(kEXIT,   ttJumpReturn,      'Exit statement',   kcJumpFlowControl);
+ RegisterKeyword(kCONTINUE, ttJumpReturn,    'Continue loop (FreeBASIC)', kcJumpFlowControl);
  RegisterKeyword(kGOSUB,  ttJumpGosub,       'Gosub statement',  kcJumpFlowControl);
  RegisterKeyword(kGOTO,   ttJumpGoto,        'Goto statement',   kcJumpFlowControl);
  RegisterKeyword(kGO_TO,  ttJumpGoto,        'Go to statement',  kcJumpFlowControl);

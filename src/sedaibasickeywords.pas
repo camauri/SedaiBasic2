@@ -91,6 +91,7 @@ const
   kWHILE   = 'WHILE';
   kUNTIL   = 'UNTIL';
   kEXIT    = 'EXIT';
+  kCONTINUE = 'CONTINUE';  // FreeBASIC: skip to the next loop iteration (FOR/DO/WHILE)
   kGOTO    = 'GOTO';
   kGO_TO   = 'GO'; // GO + TO constraint
   kGOSUB   = 'GOSUB';

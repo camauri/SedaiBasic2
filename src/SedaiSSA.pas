@@ -49,6 +49,8 @@ type
     CondLabelGE: string;        // GE label if NeedRuntimeCheck, empty otherwise
     BodyLabel: string;
     EndLabel: string;
+    ContLabel: string;          // CONTINUE target (FOR: increment; DO-top/WHILE: cond; DO-bottom: bottom cond; infinite: body)
+    ContUsed: Boolean;          // True if a CONTINUE in the body referenced ContLabel (gates a dedicated block)
   end;
 
   { User-defined function info for DEF FN }
@@ -4794,6 +4796,10 @@ begin
     LoopInfo.CondLabelGE := '';
   LoopInfo.BodyLabel := BodyLabel;
   LoopInfo.EndLabel := EndLabel;
+  // CONTINUE FOR target: a dedicated block placed at the increment (materialized in ProcessNext only
+  // if a CONTINUE actually references it, so loops without CONTINUE keep byte-identical bytecode).
+  LoopInfo.ContLabel := GenerateUniqueLabel('for_cont');
+  LoopInfo.ContUsed := False;
   SetLength(FLoopStack, Length(FLoopStack) + 1);
   FLoopStack[High(FLoopStack)] := LoopInfo;
 end;
@@ -4846,6 +4852,16 @@ begin
   LoopInfo.CondLabelGE := '';
   LoopInfo.BodyLabel := BodyLabel;
   LoopInfo.EndLabel := EndLabel;
+  // CONTINUE DO/WHILE target. Top-tested loops re-check the condition (CondLabel); the bottom-tested
+  // form needs a dedicated block at the trailing condition (materialized below only if referenced);
+  // an unconditional DO...LOOP simply re-runs the body (BodyLabel).
+  if HasCondition and (ConditionPosition = 'TOP') then
+    LoopInfo.ContLabel := CondLabel
+  else if HasCondition then
+    LoopInfo.ContLabel := GenerateUniqueLabel('do_cont')
+  else
+    LoopInfo.ContLabel := BodyLabel;
+  LoopInfo.ContUsed := False;
   SetLength(FLoopStack, Length(FLoopStack) + 1);
   FLoopStack[High(FLoopStack)] := LoopInfo;
 
@@ -4949,6 +4965,19 @@ begin
         ProcessStatement(BodyNode.GetChild(i));
     end;
     BlockScopeExit;    // M8: destruct + reclaim the body's DIM'd UDTs before the back-edge
+
+    // CONTINUE DO lands here (after per-iteration cleanup, at the trailing condition test). Only
+    // materialized when a CONTINUE referenced it; otherwise the condition stays inline.
+    if HasCondition and Assigned(ConditionNode) and FLoopStack[High(FLoopStack)].ContUsed then
+    begin
+      CondBlock := FProgram.CreateBlock(FLoopStack[High(FLoopStack)].ContLabel);
+      if Assigned(FCurrentBlock) then
+      begin
+        FCurrentBlock.AddSuccessor(CondBlock);
+        CondBlock.AddPredecessor(FCurrentBlock);
+      end;
+      FCurrentBlock := CondBlock;
+    end;
 
     if HasCondition and Assigned(ConditionNode) then
     begin
@@ -5058,7 +5087,7 @@ var
   NewVarReg: Integer;
   TempReg: Integer;
   TempVal: TSSAValue;
-  BodyBlock, CondBlock, EndBlock: TSSABasicBlock;  // PHASE 3 TIER 3: CFG construction
+  BodyBlock, CondBlock, EndBlock, ContBlock: TSSABasicBlock;  // PHASE 3 TIER 3: CFG construction
 begin
   // Pop loop info from stack
   if Length(FLoopStack) = 0 then Exit;  // Error: NEXT without FOR
@@ -5067,6 +5096,19 @@ begin
 
   // M8: close this loop body's block scope (destruct its DIM'd UDTs + reclaim) before the back-edge.
   BlockScopeExit;
+
+  // CONTINUE FOR lands here (after the per-iteration block cleanup, at the increment). Only emitted
+  // when a CONTINUE referenced it; otherwise the increment stays inline and the bytecode is unchanged.
+  if LoopInfo.ContUsed then
+  begin
+    ContBlock := FProgram.CreateBlock(LoopInfo.ContLabel);
+    if Assigned(FCurrentBlock) then   // body falls through into the increment block
+    begin
+      FCurrentBlock.AddSuccessor(ContBlock);
+      ContBlock.AddPredecessor(FCurrentBlock);
+    end;
+    FCurrentBlock := ContBlock;
+  end;
 
   // Increment loop variable by step
   if LoopInfo.VarReg.RegType = srtInt then
@@ -11377,6 +11419,7 @@ var
   AddrVal, AddrReg, ValueReg: TSSAValue;  // For POKE command
   ExitKind: string;       // M2: EXIT/RETURN kind
   IsExitStmt: Boolean;    // M2
+  IsContinueStmt: Boolean; // FreeBASIC CONTINUE
   RetVal: TSSAValue;      // M2: RETURN expr / FUNCTION result
   OpCode: TSSAOpCode;     // M5.4: selected mutex op
 begin
@@ -11581,9 +11624,27 @@ begin
     antFilter: ProcessFilter(Node);
     antReturn:
     begin
-      ExitKind := UpperCase(VarToStr(Node.Value));   // 'EXIT[ kind]' or 'RETURN'
+      ExitKind := UpperCase(VarToStr(Node.Value));   // 'EXIT[ kind]' / 'CONTINUE[ kind]' / 'RETURN'
       IsExitStmt := Assigned(Node.Token) and (UpperCase(Node.Token.Value) = 'EXIT');
-      if IsExitStmt then
+      IsContinueStmt := Assigned(Node.Token) and (UpperCase(Node.Token.Value) = 'CONTINUE');
+      if IsContinueStmt then
+      begin
+        // FreeBASIC CONTINUE: skip the rest of the current iteration and jump to the innermost loop's
+        // continue point (FOR: increment; DO WHILE/WHILE: top condition; DO...LOOP cond: bottom test;
+        // DO...LOOP: body top). The kind word (FOR/DO/WHILE) is informational in v1. Clean up the
+        // current iteration's block scope (same unwinding as EXIT, down to and including the loop body).
+        if Length(FLoopStack) > 0 then
+        begin
+          FLoopStack[High(FLoopStack)].ContUsed := True;
+          EmitExitLoopCleanup;   // M8: destruct + reclaim this iteration's block-scoped UDTs
+          EmitInstruction(ssaJump, MakeSSALabel(FLoopStack[High(FLoopStack)].ContLabel),
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          FCurrentBlock := nil;
+        end
+        else
+          WriteLn(StdErr, 'Warning: CONTINUE outside loop at line ', FCurrentLineNumber);
+      end
+      else if IsExitStmt then
       begin
         // EXIT SUB / EXIT FUNCTION inside a procedure -> frame return.
         if FInProcedure and ((Pos('SUB', ExitKind) > 0) or (Pos('FUNCTION', ExitKind) > 0)) then

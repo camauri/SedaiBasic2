@@ -2286,26 +2286,30 @@ end;
 function TPackratParser.ParseReturnStatement: TASTNode;
 var
   Token, KindTok: TLexerToken;
-  IsExit: Boolean;
+  IsExit, IsContinue: Boolean;
+  Kw: string;
   ExprNode: TASTNode;
 begin
   Token := Context.CurrentToken;
-  IsExit := UpperCase(Token.Value) = 'EXIT';
+  Kw := UpperCase(Token.Value);
+  IsExit := Kw = 'EXIT';
+  IsContinue := Kw = 'CONTINUE';
   Result := TASTNode.Create(antReturn, Token);
-  Context.Advance; // consume EXIT / RETURN
+  Context.Advance; // consume EXIT / CONTINUE / RETURN
 
-  if IsExit then
+  if IsExit or IsContinue then
   begin
-    // EXIT [SUB|FUNCTION|FOR|DO|WHILE|LOOP]. Capture the kind word (if any) in the node
-    // value so SSA can route EXIT SUB/FUNCTION to a frame return vs a loop exit.
+    // EXIT [SUB|FUNCTION|FOR|DO|WHILE|LOOP] / CONTINUE [FOR|DO|WHILE|LOOP]. Capture the kind
+    // word (if any) in the node value so SSA can route EXIT SUB/FUNCTION to a frame return vs a
+    // loop exit; for CONTINUE the kind is informational (innermost loop is the target in v1).
     if not (Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt)) then
     begin
       KindTok := Context.CurrentToken;
-      Result.Value := 'EXIT ' + UpperCase(KindTok.Value);
+      Result.Value := Kw + ' ' + UpperCase(KindTok.Value);
       Context.Advance;   // consume the kind keyword (SUB/FUNCTION/FOR/...)
     end
     else
-      Result.Value := 'EXIT';
+      Result.Value := Kw;
   end
   else
   begin
