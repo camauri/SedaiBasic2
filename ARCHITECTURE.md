@@ -621,7 +621,7 @@ const
   bcGroupCore    = $0000;  // Group 0: Core VM operations
   bcGroupString  = $0100;  // Group 1: String operations
   bcGroupMath    = $0200;  // Group 2: Math functions
-  bcGroupArray   = $0300;  // Group 3: Array operations
+  bcGroupArray   = $0300;  // Group 3: Array operations (+ FreeBASIC pointer deref: bcRefLoad/Store{Int,Float,String})
   bcGroupIO      = $0400;  // Group 4: I/O operations
   bcGroupSpecial = $0500;  // Group 5: Special variables (TI, TI$, etc.)
   bcGroupFileIO  = $0600;  // Group 6: File I/O
@@ -1112,6 +1112,7 @@ SedaiBasic emulates key aspects of the Commodore 128 for compatibility:
 | `SedaiPackratParser.pas` | Packrat parser (statements) |
 | `sedaiexpressionparser.pas` | Pratt parser (expressions) |
 | `sedaiast.pas` | AST node definitions |
+| `SedaiNamespace.pas` | FreeBASIC NAMESPACE flattening (AST→AST, pre-SSA) |
 | `SedaiSSA.pas` | SSA generator |
 | `SedaiSSATypes.pas` | SSA types |
 | `SedaiBytecodeCompiler.pas` | Bytecode compiler |

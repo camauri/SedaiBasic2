@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 242 / 643 implemented (38%)** (+ 11 partial); see the
+**FreeBASIC keyword set — 244 / 643 implemented (38%)** (+ 12 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1527,8 +1527,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `@ (Address of)` | ✗ |  |
-| `* (Value of)` | ✓ |  |
+| `@ (Address of)` | ✓ | Address-of a declared scalar variable (yields an int reference). `@sub` (procedure address) also supported |
+| `* (Value of)` | ✓ | Pointer dereference, read (`x = *p`) and write (`*p = v`) |
 | `VARPTR (Variable pointer)` | ✗ |  |
 | `PROCPTR (Procedure pointer and vtable index)` | ✗ |  |
 
@@ -1659,7 +1659,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Byref (function results)` | ✗ | Specifies that a function returns by reference rather than by value. |
+| `Byref (function results)` | ◐ | `FUNCTION f() BYREF AS T` returns a reference to a SHARED/global scalar (read + write through `f()`); returning a BYREF parameter (`min(a,b)=0`) still pending |
 | `Call` | ✓ | Invokes a procedure. |
 | `Naked` | ✗ | Specifies that a function body is not to be given any prolog/epilog code |
 
