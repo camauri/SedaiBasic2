@@ -279,6 +279,9 @@ const
   //   bcNarrowSingle: Dest=float reg, Src1=float reg -> Double(Single(x))
   bcNarrowInt        = bcGroupCore + 129;
   bcNarrowSingle     = bcGroupCore + 130;
+  // FreeBASIC bit shifts (integer): Dest = Src1 shifted by Src2 bits.
+  bcShl              = bcGroupCore + 131;  // SHL: shift left
+  bcShr              = bcGroupCore + 132;  // SHR: arithmetic shift right
   // Mutexes (M5.4, FreeBASIC API), thin wrappers over TRTLCriticalSection. bcMutexCreate writes a
   // fresh mutex handle into an int register (Dest); Lock/Unlock/Destroy take a handle reg (Src1).
   bcMutexCreate      = bcGroupCore + 117;
@@ -1305,6 +1308,8 @@ begin
         128: Result := 'FloatRound';
         129: Result := 'NarrowInt';
         130: Result := 'NarrowSingle';
+        131: Result := 'Shl';
+        132: Result := 'Shr';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

@@ -399,7 +399,7 @@ procedure TLexerFSM.InitializeCharacterConfig;
 begin
   FCharConfig.Letters := ['A'..'Z', 'a'..'z'];
   FCharConfig.Digits := ['0'..'9'];
-  FCharConfig.Operators := ['+', '-', '*', '/', '=', '<', '>', '^', '&', '|', '!', '~'];
+  FCharConfig.Operators := ['+', '-', '*', '/', '\', '=', '<', '>', '^', '&', '|', '!', '~'];
   FCharConfig.Delimiters := ['(', ')', '[', ']', '{', '}'];
   FCharConfig.Separators := [',', ';', ':'];
   FCharConfig.Whitespace := [' ', #9];
@@ -1631,6 +1631,20 @@ begin
           AdvanceChar;
           if GetCurrentChar = '=' then begin AdvanceChar; Result := CreateToken(ttCompoundAssign); end
           else Result := CreateToken(ttOpDiv);
+          {$IFDEF DEBUG}
+          if FDebugMode then
+            FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
+          {$ENDIF}
+          Exit;
+        end;
+
+      '\':
+        begin
+          // FreeBASIC integer division. (Compound "\=" deferred.)
+          ResetToken;
+          TokenBufferAdd(CurrentChar);
+          AdvanceChar;
+          Result := CreateToken(ttOpIntDiv);
           {$IFDEF DEBUG}
           if FDebugMode then
             FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);

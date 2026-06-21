@@ -425,6 +425,10 @@ begin
   Context.SetParseRule(ttOpMul, MakeInfixRule(@StaticParseBinaryOperator, precFactor));
   Context.SetParseRule(ttOpDiv, MakeInfixRule(@StaticParseBinaryOperator, precFactor));
   Context.SetParseRule(ttOpMod, MakeInfixRule(@StaticParseBinaryOperator, precFactor));
+  Context.SetParseRule(ttOpIntDiv, MakeInfixRule(@StaticParseBinaryOperator, precFactor));  // \ integer division
+  // Bit shifts (FreeBASIC): looser than +/-, tighter than comparisons.
+  Context.SetParseRule(ttOpShl, MakeInfixRule(@StaticParseBinaryOperator, precShift));
+  Context.SetParseRule(ttOpShr, MakeInfixRule(@StaticParseBinaryOperator, precShift));
   Context.SetParseRule(ttOpPow, MakeInfixRule(@StaticParsePower, precPower));
 
   // Comparison operators

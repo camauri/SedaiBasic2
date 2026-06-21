@@ -258,6 +258,8 @@ begin
     ssaFloatRound: Result := bcFloatRound;       // B1.3: CINT/CLNG round-to-int
     ssaNarrowInt: Result := bcNarrowInt;         // B1.5: integer width narrowing
     ssaNarrowSingle: Result := bcNarrowSingle;   // B1.5: single-precision rounding
+    ssaShl: Result := bcShl;                     // FreeBASIC bit shifts
+    ssaShr: Result := bcShr;
     ssaMutexCreate: Result := bcMutexCreate;    // M5.4: mutex primitives
     ssaMutexLock: Result := bcMutexLock;
     ssaMutexUnlock: Result := bcMutexUnlock;

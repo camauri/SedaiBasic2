@@ -1544,6 +1544,8 @@ begin
   RegisterKeyword('/',  ttOpDiv, 'Divide operator',                kcOperators);
   RegisterKeyword('^',  ttOpPow, 'Power operator',                 kcOperators);
   RegisterKeyword(kMOD, ttOpMod, 'Modulo operator',                kcOperators);
+  RegisterKeyword(kSHL, ttOpShl, 'Bit shift left operator (FreeBASIC)',  kcOperators);
+  RegisterKeyword(kSHR, ttOpShr, 'Bit shift right operator (FreeBASIC)', kcOperators);
   RegisterKeyword('=',  ttOpEq,  'Equal operator',                 kcOperators);
   RegisterKeyword('<',  ttOpLt,  'Lesser than operator',           kcOperators);
   RegisterKeyword('>',  ttOpGt,  'Greater than operator',          kcOperators);

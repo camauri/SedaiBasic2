@@ -796,6 +796,16 @@ begin
             IntRegs[Instr.Dest] := not IntRegs[Instr.Src1];
             Inc(CurPC);
           end;
+        bcShl:  // FreeBASIC SHL
+          begin
+            IntRegs[Instr.Dest] := IntRegs[Instr.Src1] shl IntRegs[Instr.Src2];
+            Inc(CurPC);
+          end;
+        bcShr:  // FreeBASIC SHR (logical)
+          begin
+            IntRegs[Instr.Dest] := IntRegs[Instr.Src1] shr IntRegs[Instr.Src2];
+            Inc(CurPC);
+          end;
 
         // NOTE: Graphics operations (bcGraphic*) are now handled by Group 10 (ExecuteGraphicsOp)
         // NOTE: Sound operations (bcSound*) are now handled by Group 11 (ExecuteSoundOp)

@@ -239,8 +239,9 @@ type
     precAnd,            // AND
     precEquality,       // = <> (comparison)
     precComparison,     // < > <= >=
+    precShift,          // SHL SHR (FreeBASIC: looser than +/-, tighter than comparisons)
     precTerm,           // + -
-    precFactor,         // * /
+    precFactor,         // * / \ MOD
     precUnary,          // - NOT
     precPower,          // ^
     precCall,           // Function calls, array access
@@ -331,8 +332,11 @@ begin
     // Addition/Subtraction
     ttOpAdd, ttOpSub: Result := precTerm;
 
-    // Multiplication/Division
-    ttOpMul, ttOpDiv, ttOpMod: Result := precFactor;
+    // Multiplication/Division (\ = integer division)
+    ttOpMul, ttOpDiv, ttOpMod, ttOpIntDiv: Result := precFactor;
+
+    // Bit shifts (FreeBASIC)
+    ttOpShl, ttOpShr: Result := precShift;
 
     // Unary
     ttBitwiseNOT: Result := precUnary;
@@ -357,6 +361,7 @@ begin
     precAnd: Result := 'And';
     precEquality: Result := 'Equality';
     precComparison: Result := 'Comparison';
+    precShift: Result := 'Shift';
     precTerm: Result := 'Term';
     precFactor: Result := 'Factor';
     precUnary: Result := 'Unary';

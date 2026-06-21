@@ -1227,6 +1227,13 @@ begin
               Result := MakeSSAConstFloat(Left.ConstInt / Right.ConstInt)
             else
               Result := MakeSSAValue(svkNone);
+          ttOpIntDiv:  // \ integer division (FreeBASIC), truncates toward zero
+            if Right.ConstInt <> 0 then
+              Result := MakeSSAConstInt(Left.ConstInt div Right.ConstInt)
+            else
+              Result := MakeSSAValue(svkNone);
+          ttOpShl: Result := MakeSSAConstInt(Left.ConstInt shl Right.ConstInt);
+          ttOpShr: Result := MakeSSAConstInt(Left.ConstInt shr Right.ConstInt);
         else
           Result := MakeSSAValue(svkNone);
         end;
@@ -1566,6 +1573,34 @@ begin
             DestReg := FProgram.AllocRegister(srtInt);
             Result := MakeSSARegister(srtInt, DestReg);
             OpCode := ssaModInt;
+          end;
+        end
+        // FreeBASIC \ (integer division), SHL, SHR: always integer; truncate any float operand.
+        else if (Node.Token.TokenType = ttOpIntDiv) or (Node.Token.TokenType = ttOpShl) or
+                (Node.Token.TokenType = ttOpShr) then
+        begin
+          if Left.RegType = srtFloat then
+          begin
+            TempReg := FProgram.AllocRegister(srtInt);
+            TempVal := MakeSSARegister(srtInt, TempReg);
+            EmitInstruction(ssaFloatToInt, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Left := TempVal;
+          end;
+          if Right.RegType = srtFloat then
+          begin
+            TempReg := FProgram.AllocRegister(srtInt);
+            TempVal := MakeSSARegister(srtInt, TempReg);
+            EmitInstruction(ssaFloatToInt, TempVal, Right, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Right := TempVal;
+          end;
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          case Node.Token.TokenType of
+            ttOpIntDiv: OpCode := ssaDivInt;
+            ttOpShl: OpCode := ssaShl;
+            ttOpShr: OpCode := ssaShr;
+          else
+            OpCode := ssaDivInt;
           end;
         end
         // Determine result type and allocate register (use hint if compatible)

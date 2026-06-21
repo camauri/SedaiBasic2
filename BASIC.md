@@ -17,9 +17,12 @@ Legend: ✓ = Implemented | ✗ = Not implemented
 | `+` | ✓ | Add operator |
 | `-` | ✓ | Subtract operator |
 | `*` | ✓ | Multiply operator |
-| `/` | ✓ | Divide operator |
+| `/` | ✓ | Divide operator (always floating-point) |
+| `\` | ✓ | Integer division (FreeBASIC; truncates toward zero) |
 | `^` | ✓ | Power operator |
 | `MOD` | ✓ | Modulo operator |
+| `SHL` | ✓ | Bit shift left (FreeBASIC; looser than +/-, tighter than comparisons) |
+| `SHR` | ✓ | Bit shift right, logical (FreeBASIC) |
 | `=` | ✓ | Equal operator |
 | `<` | ✓ | Lesser than operator |
 | `>` | ✓ | Greater than operator |
@@ -1412,12 +1415,12 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `- (Subtract)` | ✓ |  |
 | `* (Multiply)` | ✓ |  |
 | `/ (Divide)` | ✓ |  |
-| `\ (Integer divide)` | ✗ |  |
+| `\ (Integer divide)` | ✓ | truncates toward zero |
 | `^ (Exponentiate)` | ✓ |  |
 | `MOD (Modulus)` | ✓ |  |
 | `- (Negate)` | ✓ |  |
-| `SHL (Shift left)` | ✗ |  |
-| `SHR (Shift right)` | ✗ |  |
+| `SHL (Shift left)` | ✓ | `a SHL b` (FreeBASIC) |
+| `SHR (Shift right)` | ✓ | `a SHR b`, logical (FreeBASIC) |
 
 #### Indexing Operators
 

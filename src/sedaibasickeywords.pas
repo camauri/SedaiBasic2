@@ -219,6 +219,8 @@ const
   kLOG2    = 'LOG2';      // SedaiBasic
   kLOGN    = 'LOGN';      // SedaiBasic - LOGN(base, x)
   kMOD     = 'MOD';       // SedaiBasic
+  kSHL     = 'SHL';       // FreeBASIC bit shift left
+  kSHR     = 'SHR';       // FreeBASIC bit shift right
   kRND     = 'RND';
   kSGN     = 'SGN';
   kSIN     = 'SIN';

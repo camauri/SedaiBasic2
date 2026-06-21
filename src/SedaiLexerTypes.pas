@@ -83,6 +83,9 @@ type
     ttOpSub,                 // -
     ttOpMul,                 // *
     ttOpDiv,                 // /
+    ttOpIntDiv,              // \ (FreeBASIC integer division)
+    ttOpShl,                 // SHL (FreeBASIC shift left)
+    ttOpShr,                 // SHR (FreeBASIC shift right)
     ttOpPow,                 // ^
     ttOpMod,                 // MOD
     ttOpDot,                 // . (member access: record.field)

@@ -203,7 +203,7 @@ begin
     bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat,
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
     // Bitwise operations (result is int)
-    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot,
+    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
     // Conversions to int
     bcFloatToInt, bcStringToInt, bcFloatRound,
     bcNarrowInt,   // B1.5: integer width narrowing (Dest=int)
@@ -381,7 +381,7 @@ begin
     // Error handling - RESUME <line> reads line number from Src1
     bcResume,
     // Bitwise operations
-    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot,
+    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
     // === GROUP 1: String operations with int param ===
     bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin,
     // === GROUP 5: Memory operations ===
@@ -498,8 +498,8 @@ begin
     bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt,
     // Int comparisons (second operand)
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt,
-    // Bitwise operations (second operand)
-    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor,
+    // Bitwise operations (second operand); shifts: Src2 = shift count
+    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr,
     // === GROUP 5: Memory operations ===
     bcPoke,           // POKE address, value: Src2 = value (int)
     // === GROUP 1: String operations with int second param ===
