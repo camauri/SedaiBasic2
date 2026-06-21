@@ -2238,6 +2238,14 @@ begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
         end;
 
+        // TRIM/LTRIM/RTRIM(s$, set$) -> String Dest (mode is a constant in Immediate)
+        bcStrTrimSet:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+          if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;
+        end;
+
         // Float Src1 -> String Dest (STR$)
         bcStrStr:
         begin
@@ -3879,6 +3887,25 @@ begin
         Count := Ctx.IntRegs[Instr.Src1];
         if Count < 0 then Count := 0;
         Ctx.StringRegs[Instr.Dest] := StringOfChar(Chr(Ctx.IntRegs[Instr.Src2] and $FF), Count);
+      end;
+    23: // bcStrTrimSet - LTRIM/RTRIM/TRIM(s, set): strip repeated occurrences of the `set`
+        // substring from the end(s). Immediate = mode (0=both, 1=left, 2=right). FreeBASIC default
+        // (no Any) trims the trimset as a substring; case-sensitive.
+      begin
+        S := Ctx.StringRegs[Instr.Src1];
+        SubStr := Ctx.StringRegs[Instr.Src2];   // trimset (substring)
+        Count := Instr.Immediate;               // mode
+        Len := Length(SubStr);
+        if Len > 0 then
+        begin
+          if Count <> 2 then                    // left or both
+            while (Length(S) >= Len) and (Copy(S, 1, Len) = SubStr) do
+              Delete(S, 1, Len);
+          if Count <> 1 then                    // right or both
+            while (Length(S) >= Len) and (Copy(S, Length(S) - Len + 1, Len) = SubStr) do
+              Delete(S, Length(S) - Len + 1, Len);
+        end;
+        Ctx.StringRegs[Instr.Dest] := S;
       end;
     7: // bcStrStr - STR$(n)
       Ctx.StringRegs[Instr.Dest] := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]);

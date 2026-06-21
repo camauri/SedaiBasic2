@@ -2135,12 +2135,30 @@ begin
             ArgReg := EnsureStringRegister(ArgValue);
             DestReg := FProgram.AllocRegister(srtString);
             Result := MakeSSARegister(srtString, DestReg);
-            if FuncName = 'LTRIM' then OpCode := ssaStrLTrim
-            else if FuncName = 'RTRIM' then OpCode := ssaStrRTrim
-            else if FuncName = 'TRIM' then OpCode := ssaStrTrim
-            else if (FuncName = 'UCASE') or (FuncName = 'UCASE$') then OpCode := ssaStrUCase
-            else OpCode := ssaStrLCase;
-            EmitInstruction(OpCode, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            // FreeBASIC trimset form: LTRIM/RTRIM/TRIM(s, set) trims the `set` substring from the
+            // end(s). One opcode (bcStrTrimSet) with the side encoded as a constant in Src3->Immediate
+            // (0=both, 1=left, 2=right). The `Any` (character-set) keyword form is not yet supported.
+            if ((FuncName = 'LTRIM') or (FuncName = 'RTRIM') or (FuncName = 'TRIM')) and
+               (ArgListNode.ChildCount >= 2) then
+            begin
+              ProcessExpression(ArgListNode.GetChild(1), Arg2Value);   // trimset
+              Arg2Reg := EnsureStringRegister(Arg2Value);
+              if FuncName = 'LTRIM' then
+                EmitInstruction(ssaStrTrimSet, Result, ArgReg, Arg2Reg, MakeSSAConstInt(1))   // left
+              else if FuncName = 'RTRIM' then
+                EmitInstruction(ssaStrTrimSet, Result, ArgReg, Arg2Reg, MakeSSAConstInt(2))   // right
+              else
+                EmitInstruction(ssaStrTrimSet, Result, ArgReg, Arg2Reg, MakeSSAConstInt(0));  // both (TRIM)
+            end
+            else
+            begin
+              if FuncName = 'LTRIM' then OpCode := ssaStrLTrim
+              else if FuncName = 'RTRIM' then OpCode := ssaStrRTrim
+              else if FuncName = 'TRIM' then OpCode := ssaStrTrim
+              else if (FuncName = 'UCASE') or (FuncName = 'UCASE$') then OpCode := ssaStrUCase
+              else OpCode := ssaStrLCase;
+              EmitInstruction(OpCode, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            end;
           end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end

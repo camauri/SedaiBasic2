@@ -185,6 +185,7 @@ begin
     ssaStrInstrRev: Result := bcStrInstrRev;
     ssaStrSpace: Result := bcStrSpace;
     ssaStrString: Result := bcStrString;
+    ssaStrTrimSet: Result := bcStrTrimSet;
     ssaStrOct: Result := bcStrOct;       // B1.3 numeric<->string conversions
     ssaStrBin: Result := bcStrBin;
     ssaStrValInt: Result := bcStrValInt;

@@ -325,6 +325,7 @@ begin
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrChr,
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrSpace,  // B1.2: string dest
     bcStrString,  // STRING(n,ch) - string dest
+    bcStrTrimSet, // LTRIM/RTRIM/TRIM(s,set) - string dest
     bcStrStr,    // STR$(n) - number to string
     bcStrHex,    // HEX$(n) - int to hex string
     bcStrOct, bcStrBin,  // OCT(n)/BIN(n) - int to octal/binary string (B1.3)
@@ -598,6 +599,7 @@ begin
     bcStrValInt, // VALINT/VALLNG/VALUINT(str) - reads string, produces int
     bcStrInstr,  // INSTR(haystack, needle) - haystack is Src1
     bcStrInstrRev,  // INSTRREV(str, sub) - str is Src1
+    bcStrTrimSet,   // LTRIM/RTRIM/TRIM(s, set) - s is Src1
     // === GROUP 2: Math operations ===
     bcStrDec,  // DEC(hexstring) - reads string, produces int
     // === GROUP 4: I/O operations ===
@@ -633,6 +635,7 @@ begin
     bcStrConcat,  // String concatenation (second operand)
     bcStrInstr,   // INSTR(haystack, needle) - needle is Src2
     bcStrInstrRev, // INSTRREV(str, sub) - sub is Src2
+    bcStrTrimSet,  // LTRIM/RTRIM/TRIM(s, set) - set is Src2
     // === GROUP 6: File I/O operations ===
     bcDopen, bcOpen,  // Src2 = filename (string)
     bcAppend:         // Src2 = data (string)
