@@ -1640,11 +1640,12 @@ begin
 
       '\':
         begin
-          // FreeBASIC integer division. (Compound "\=" deferred.)
+          // FreeBASIC integer division; compound "\=" emits a ttCompoundAssign (value '\').
           ResetToken;
           TokenBufferAdd(CurrentChar);
           AdvanceChar;
-          Result := CreateToken(ttOpIntDiv);
+          if GetCurrentChar = '=' then begin AdvanceChar; Result := CreateToken(ttCompoundAssign); end
+          else Result := CreateToken(ttOpIntDiv);
           {$IFDEF DEBUG}
           if FDebugMode then
             FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);

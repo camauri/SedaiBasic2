@@ -826,6 +826,7 @@ begin
       '-': OpType := ttOpSub;
       '*': OpType := ttOpMul;
       '/': OpType := ttOpDiv;
+      '\': OpType := ttOpIntDiv;   // FreeBASIC integer-division compound "\="
       '^': OpType := ttOpPow;
     else
       OpType := ttOpAdd;
