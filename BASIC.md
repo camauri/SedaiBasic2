@@ -1234,9 +1234,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 > core plus the M1/M2/M3 structured subset: block `IF`/`ELSEIF`/`END IF`, `SELECT CASE`, `FOR`/`NEXT`,
 > `DO`/`LOOP`, named labels, `SUB`/`FUNCTION`/`CALL`/`EXIT`/`RETURN`, `TYPE`/`AS`/`.` records).
 > ◐ = partially implemented (see note). ✗ = not implemented.
-> Note: a ✓ marks name recognition — exact semantics may still differ from FreeBASIC. Some FB areas
-> are not yet present (preprocessor) or are intentionally modelled differently for now (OOP `TYPE` is
-> implemented; threading is implemented). **Pointers are NOT excluded** — their implementation is not
+> Note: a ✓ marks name recognition — exact semantics may still differ from FreeBASIC. OOP `TYPE`
+> (methods/inheritance/virtual dispatch/constructors/destructors/PROPERTY/OPERATOR), threading, and a
+> basic preprocessor (object-like #define, #ifdef/#include) are implemented; namespaces, WString and
+> function-like macros are not yet present. **Pointers are NOT excluded** — their implementation is not
 > yet decided; today the language is reference-only, and adding FB-style pointers later is an open
 > design question (it would make SedaiBasic a powerful FreeBASIC alternative). This is a forward-looking
 > gap map, not a claim of FreeBASIC compatibility.
@@ -1266,8 +1267,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ENUM...END ENUM` | ✗ | User defined enumeration of values |
-| `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR`. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope-bound lifetime (RAII). Still deferred: `NEW`, ctor overloading, block-scope/global destructors |
+| `ENUM...END ENUM` | ✓ | Named integer constants (auto-increment) |
+| `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR` (overloaded by arity & type, default args, `BASE`). `PROPERTY` getter/setter, `OPERATOR` overloading. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope/block/global RAII. Still deferred: `NEW`, explicit `VIRTUAL`/`OVERRIDE`/`ABSTRACT` |
 | `CLASS...END CLASS` | ✗ | Not implemented. Keyword reserved. |
 | `UNION...END UNION` | ✗ | User defined structure of overlapping data |
 | `EXTENDS` | ◐ | Single inheritance `TYPE Child EXTENDS Parent` (M4.2): inherited fields (prefix layout) + methods + reference polymorphism. M4.3: virtual dispatch — an overridden method is selected by the instance's runtime type even through a base-typed variable (runtime type-id + dispatcher procedures). `NEW`/ctor/dtor deferred (M4.4) |
@@ -1295,9 +1296,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `CONSTRUCTOR` | ◐ | Member procedure auto-called when an instance is created. M4.4a: `CONSTRUCTOR Type()` runs at `DIM v AS T` (nested members first, then the object); inherited if the subtype has none. M4.4b: parameterised `DIM v AS T(args)`. Overloading / `NEW` / base-chaining deferred (M4.4c) |
 | `DESTRUCTOR` | ◐ | Member procedure auto-called when an instance goes out of scope. V5: `DESTRUCTOR Type()` runs for a procedure's DIM'd local UDTs at every exit path, in reverse construction order. Globals / nested members / BYVAL-param copies deferred |
 | `FUNCTION` | ✓ | Declares or defines a member procedure returning a value |
-| `OPERATOR` | ✗ | Declares or defines an overloaded operator |
+| `OPERATOR` | ✓ | Overloaded operator `OPERATOR <sym>(a AS T, b AS T) AS R` (binary, direct operands; resolved by left operand type) |
 | `OVERRIDE` | ✗ | Member method attribute that specifies that the method is expected to override a virtual method in the base user defined type |
-| `PROPERTY` | ✗ | Declares or defines property member procedures for a user defined type |
+| `PROPERTY` | ✓ | Property getter/setter `PROPERTY Type.name() AS T` / `PROPERTY Type.name(v AS T)` (desugars to a method) |
 | `SUB` | ✓ | Declare or defines a member procedure |
 | `STATIC (Member)` | ✗ | Declares or defines a member procedure or variable is static |
 | `VIRTUAL` | ✗ | Member method attribute that declares that a member must have an implementation |
@@ -1675,22 +1676,22 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `#IF` | ✗ | Compiles the following code block based on a condition. |
-| `#IFDEF` | ✗ | Compiles the following code block if a symbol is defined. |
-| `#IFNDEF` | ✗ | Compiles the following code block if a symbol is not defined. |
+| `#IFDEF` | ✓ | Compiles the following code block if a symbol is defined. |
+| `#IFNDEF` | ✓ | Compiles the following code block if a symbol is not defined. |
 | `#ELSEIF` | ✗ | Compiles the following code block if a condition is true and the previous conditions was false. |
 | `#ELSEIFDEF` | ✗ | Compiles the following code block if a symbol is defined and the previous conditions was false. |
 | `#ELSEIFNDEF` | ✗ | Compiles the following code block if a symbol is not defined and the previous conditions was false. |
-| `#ELSE` | ✗ | Compiles the following code block if previous conditions were false. |
-| `#ENDIF` | ✗ | Signifies the end of a code block. |
+| `#ELSE` | ✓ | Compiles the following code block if previous conditions were false. |
+| `#ENDIF` | ✓ | Signifies the end of a code block. |
 | `DEFINED` | ✗ | Returns "-1" if a symbol is defined, otherwise "0". |
 
 ##### Text Replacement
 
 | Keyword | Status | Description |
 |---|---|---|
-| `#DEFINE` | ✗ | Creates a single-line text-replacement macro. |
+| `#DEFINE` | ◐ | Object-like text-replacement macro (function-like macros not yet supported). |
 | `#MACRO and #ENDMACRO` | ✗ | Creates a multi-line text-replacement macro. |
-| `#UNDEF` | ✗ | Undefines a symbol. |
+| `#UNDEF` | ✓ | Undefines a symbol. |
 | `# Preprocessor stringize` | ✗ | Converts text into a string literal. |
 | `## Preprocessor concatenate` | ✗ | Concatenates two pieces of text. |
 | `! Escaped String Literal` | ✗ | Indicates string literal immediately following must be processed for escape sequences. |
@@ -1700,7 +1701,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `#INCLUDE` | ✗ | Inserts text from a file. |
+| `#INCLUDE` | ✓ | Inserts text from a file. |
 | `#INCLIB` | ✗ | Includes a library in the linking processes. |
 | `#LIBPATH` | ✗ | Includes a path to search for libraries in the linking process. |
 
@@ -1949,7 +1950,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `DO` | ✓ |  |
 | `END IF` | ✓ |  |
-| `IIF` | ✗ |  |
+| `IIF` | ✓ | Short-circuit conditional expression `IIF(cond, a, b)` |
 | `LOOP` | ✓ |  |
 | `NEXT` | ✓ |  |
 | `THEN` | ✓ |  |
@@ -2180,8 +2181,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `EXP` | ✓ | Returns e raised to some power. |
 | `LOG` | ✓ | Returns the natural logarithm of a number. |
 | `SQR` | ✓ | Returns the square root of a number. |
-| `FIX` | ✗ | Returns the integer part of a number. |
-| `FRAC` | ✗ | Returns the fractional part of a number. |
+| `FIX` | ✓ | Returns the integer part of a number. |
+| `FRAC` | ✓ | Returns the fractional part of a number. |
 | `INT` | ✓ | Returns the largest integer less than or equal to a number. |
 | `SGN` | ✓ | Returns the sign of a number. |
 
@@ -2190,12 +2191,12 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `SIN` | ✓ | Returns the sine of an angle. |
-| `ASIN` | ✗ | Returns the arcsine of a number. |
+| `ASIN` | ✓ | Returns the arcsine of a number. |
 | `COS` | ✓ | Returns the cosine of an angle. |
-| `ACOS` | ✗ | Returns the arccosine of a number. |
+| `ACOS` | ✓ | Returns the arccosine of a number. |
 | `TAN` | ✓ | Returns the tangent of an angle. |
 | `ATN` | ✓ | Returns the arctangent of a number. |
-| `ATAN2` | ✗ | Returns the arctangent of the ratio between two numbers. |
+| `ATAN2` | ✓ | Returns the arctangent of the ratio between two numbers. |
 
 #### Miscellaneous Procedures
 
@@ -2316,9 +2317,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `VAL` | ✓ | Returns the Double conversion of a numeric string. |
-| `VALINT` | ✗ | Returns the Integer conversion of a numeric string. |
-| `VALLNG` | ✗ | Returns the Long conversion of a numeric string. |
-| `VALUINT` | ✗ | Returns the uInteger conversion of a numeric string. |
+| `VALINT` | ✓ | Returns the Integer conversion of a numeric string. |
+| `VALLNG` | ✓ | Returns the Long conversion of a numeric string. |
+| `VALUINT` | ✓ | Returns the uInteger conversion of a numeric string. |
 | `VALULNG` | ✗ | Returns the ULong conversion of a numeric string. |
 
 #### Numeric Serialization
@@ -2343,7 +2344,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `LEFT` | ✗ | Returns a substring of the leftmost characters in a string. |
-| `MID (Function)` | ✗ | Returns a substring of a string. |
+| `MID (Function)` | ✓ | Returns a substring of a string. |
 | `RIGHT` | ✗ | Returns a substring of the rightmost characters in a string. |
 | `LCASE` | ✓ | Returns a copy of a string converted to lowercase. `LCASE(s)` / `LCASE$(s)` (B1.2). |
 | `UCASE` | ✓ | Returns a copy of a string converted to uppercase. `UCASE(s)` / `UCASE$(s)` (B1.2). |
@@ -2352,7 +2353,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `TRIM` | ✓ | `TRIM(s)` / `TRIM(s, set)` substring / `TRIM(s, Any set)` character-set. |
 | `INSTR` | ✓ | Returns the first occurrence of a substring or character within a string. |
 | `INSTRREV` | ✓ | Position of the last occurrence. `INSTRREV(str, sub [, start])` and `INSTRREV(str, Any set [, start])`. |
-| `MID (Statement)` | ✗ | Copies a substring to a substring of a string. |
+| `MID (Statement)` | ✓ | Copies a substring to a substring of a string. |
 | `LSET` | ✓ | Left-justifies a string into a buffer (string lvalues; QBasic `=` and FreeBASIC `,` forms). |
 | `RSET` | ✓ | Right-justifies a string into a buffer (string lvalues; QBasic `=` and FreeBASIC `,` forms). |
 
