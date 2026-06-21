@@ -156,6 +156,7 @@ type
     function ParseDimStatement: TASTNode;
     function ParseEraseStatement: TASTNode;
     function ParseRedimStatement: TASTNode;
+    function ParseSwapStatement: TASTNode;
     function ParseDefStatement: TASTNode;
     function ParseFnStatement: TASTNode;
     function ParseConstStatement: TASTNode;
@@ -2726,6 +2727,12 @@ begin
   Token := Context.CurrentToken;
   CmdName := UpperCase(Token.Value);
 
+  // SWAP is dialect-dependent: in BASIC v7 (CLASSIC, line-numbered) it is the C128 RAM-bank
+  // memory command, but in FreeBASIC (MODERN, no line numbers) it exchanges two lvalues.
+  // A program with no ttLineNumber tokens is the FreeBASIC dialect -> variable swap.
+  if (CmdName = 'SWAP') and not Context.TokenList.HasTokenType(ttLineNumber) then
+    Exit(ParseSwapStatement);
+
   // Select appropriate node type based on command
   if CmdName = 'POKE' then
   begin
@@ -4230,6 +4237,43 @@ begin
     else
       Break;
   until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseSwapStatement: TASTNode;
+// SWAP a, b (FreeBASIC) - exchange the values of two lvalues. Each operand is a
+// full lvalue expression (scalar, array element, UDT member); the SSA stage snapshots
+// one value into a temp and reuses ProcessAssignment for the cross-store.
+var
+  Token: TLexerToken;
+  Left, Right: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antSwap, Token);
+  Context.Advance; // Consume SWAP
+  Left := ParseExpression;
+  if not Assigned(Left) then
+  begin
+    HandleError('Expected variable after SWAP', Context.CurrentToken);
+    DoNodeCreated(Result);
+    Exit;
+  end;
+  Result.AddChild(Left);
+  if not Context.Check(ttSeparParam) then
+  begin
+    HandleError('Expected comma between SWAP operands', Context.CurrentToken);
+    DoNodeCreated(Result);
+    Exit;
+  end;
+  Context.Advance; // comma
+  Right := ParseExpression;
+  if not Assigned(Right) then
+  begin
+    HandleError('Expected second variable in SWAP', Context.CurrentToken);
+    DoNodeCreated(Result);
+    Exit;
+  end;
+  Result.AddChild(Right);
   DoNodeCreated(Result);
 end;
 

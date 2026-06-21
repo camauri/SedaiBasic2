@@ -134,6 +134,7 @@ type
     FVarWidthCode: TStringList;          // B1.5 phase 2: name (UPPER) -> narrow width code (Objects[]=PtrInt 1..7)
     FVarPrintKind: TStringList;          // B1.5 phase C: name (UPPER) -> 1=BOOLEAN, 2=unsigned-64 (print form)
     FArrayElemWidth: TStringList;        // B1.5: array name (UPPER) -> element narrow width code (1..7)
+    FSwapTempSeq: Integer;               // SWAP: unique counter for synthesized snapshot temp names
     FInDispatcher: Boolean;              // M6: true while emitting a virtual dispatcher (skip shared sync)
     FBlockHandledVars: TStringList;      // M8: var names destructed block-scoped (excluded from frame/module dtors)
     FCurrentTopLevelLabels: TStringList;  // GOTO-unwind: names of labels at block-depth 0 in the current frame
@@ -264,6 +265,7 @@ type
     procedure ProcessDim(Node: TASTNode);
     procedure ProcessErase(Node: TASTNode);
     procedure ProcessRedim(Node: TASTNode);
+    procedure ProcessSwap(Node: TASTNode);
     procedure ProcessForLoop(Node: TASTNode);
     procedure ProcessDoLoop(Node: TASTNode);
     procedure ProcessBlock(Node: TASTNode);
@@ -4044,6 +4046,56 @@ begin
                     MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType),
                     UbReg, MakeSSAConstInt(PreserveFlag));
   end;
+end;
+
+procedure TSSAGenerator.ProcessSwap(Node: TASTNode);
+// SWAP a, b (FreeBASIC): exchange the values of two lvalues. We snapshot a's current value
+// into a freshly-named typed temp, then reuse ProcessAssignment for "a = b" and "b = tmp" so
+// every lvalue kind (scalar, array element, UDT member) is handled by the existing store paths.
+// This lowers to the classic T=A:A=B:B=T idiom, which the copy-prop soundness fix already covers.
+var
+  LeftNode, RightNode, AsnAB, AsnBTmp, TmpRef: TASTNode;
+  ValA, TmpReg: TSSAValue;
+  TmpName, Suffix: string;
+  CopyOp: TSSAOpCode;
+begin
+  if Node.ChildCount < 2 then Exit;
+  LeftNode := Node.GetChild(0);
+  RightNode := Node.GetChild(1);
+
+  // Snapshot the current value of the first operand (scalar / array / member read).
+  ProcessExpression(LeftNode, ValA);
+  // A non-register result means the operand is not an lvalue (e.g. a literal): nothing to swap.
+  if ValA.Kind in [svkConstInt, svkConstFloat, svkConstString] then Exit;
+
+  // Pick a temp whose name-suffix forces the bank matching the snapshot value's type.
+  case ValA.RegType of
+    srtInt:    begin Suffix := '%'; CopyOp := ssaCopyInt; end;
+    srtString: begin Suffix := '$'; CopyOp := ssaCopyString; end;
+  else
+    begin Suffix := ''; CopyOp := ssaCopyFloat; end;   // float is the default bank
+  end;
+  TmpName := '__SWP' + IntToStr(FSwapTempSeq) + Suffix;
+  Inc(FSwapTempSeq);
+
+  // tmp = old A  (a real snapshot register, stable across the cross-store below)
+  TmpReg := GetOrAllocateVariable(TmpName);
+  EmitInstruction(CopyOp, TmpReg, ValA, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // a = b  (re-dispatches on a's lvalue kind via the existing assignment machinery)
+  AsnAB := TASTNode.Create(antAssignment, Node.Token);
+  AsnAB.AddChild(LeftNode.Clone);
+  AsnAB.AddChild(RightNode.Clone);
+  ProcessAssignment(AsnAB);
+  AsnAB.Free;
+
+  // b = tmp
+  TmpRef := TASTNode.CreateWithValue(antIdentifier, TmpName, Node.Token);
+  AsnBTmp := TASTNode.Create(antAssignment, Node.Token);
+  AsnBTmp.AddChild(RightNode.Clone);
+  AsnBTmp.AddChild(TmpRef);
+  ProcessAssignment(AsnBTmp);
+  AsnBTmp.Free;
 end;
 
 procedure TSSAGenerator.ProcessForLoop(Node: TASTNode);
@@ -11166,6 +11218,7 @@ begin
     antDim: ProcessDim(Node);
     antErase: ProcessErase(Node);
     antRedim: ProcessRedim(Node);
+    antSwap: ProcessSwap(Node);
     antDef: ProcessDefFn(Node);
     antForLoop: ProcessForLoop(Node);
     antDoLoop: ProcessDoLoop(Node);
