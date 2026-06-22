@@ -243,6 +243,7 @@ type
     function PointeeBankOf(const PtrName: string): TSSARegisterType;            // bank of *p from p's declared pointee
     function PointerUDTType(const PtrName: string): string;                     // pointee UDT type if p is a "T PTR" (T a UDT), else ''
     function UDTFieldPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT of a "T PTR" field, else ''
+    function DerefedType(Node: TASTNode): string;                               // FB type of *<expr> (multi-level aware)
     function DerefOperandBank(Node: TASTNode): TSSARegisterType;                // bank of *<expr> incl. pointer arithmetic (p+n)
     procedure EmitArrayElementAddress(Node: TASTNode; out Result: TSSAValue);   // @arr(i) → packed element address
     procedure EmitFieldAddress(MemberNode: TASTNode; out Result: TSSAValue);    // @obj.field → record-field pointer
@@ -11218,27 +11219,53 @@ begin
   end;
 end;
 
-function TSSAGenerator.DerefOperandBank(Node: TASTNode): TSSARegisterType;
-// Bank of the pointee for "*<expr>". A plain pointer identifier resolves from its declared type; for
-// pointer arithmetic ("*(p+n)" / "*(p-n)") the bank follows whichever operand of the +/- is a known
-// pointer variable. Defaults to int otherwise.
+function TSSAGenerator.DerefedType(Node: TASTNode): string;
+// The FreeBASIC type string of "*Node" (one dereference). Drives multi-level pointers: an identifier
+// pointer yields its declared pointee (FPointerVars, e.g. "DOUBLE" or "DOUBLE PTR"); a nested deref
+// "*(*p)" strips one more PTR level; pointer arithmetic follows the pointer operand of +/-. '' if Node
+// is not dereferenceable.
+var
+  idx: Integer;
+  T: string;
 begin
-  Result := srtInt;
+  Result := '';
   if Node = nil then Exit;
-  // Peel parenthesis wrappers: "*(p + 1)" parses the operand as antParentheses(antBinaryOp(...)).
   while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do
     Node := Node.GetChild(0);
   if Node.NodeType = antIdentifier then
-    Result := PointeeBankOf(VarToStr(Node.Value))
+  begin
+    idx := FPointerVars.IndexOfName(UpperCase(VarToStr(Node.Value)));
+    if idx >= 0 then Result := UpperCase(FPointerVars.ValueFromIndex[idx]);
+  end
+  else if Node.NodeType = antDeref then
+  begin
+    // *(*inner): the type of *inner must itself be a pointer; deref it one more level.
+    T := DerefedType(Node.GetChild(0));
+    if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+      Result := Trim(Copy(T, 1, Length(T) - 4));
+  end
   else if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) then
   begin
     if (Node.GetChild(0).NodeType = antIdentifier) and
        (FPointerVars.IndexOfName(UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) then
-      Result := PointeeBankOf(VarToStr(Node.GetChild(0).Value))
+      Result := DerefedType(Node.GetChild(0))
     else if (Node.GetChild(1).NodeType = antIdentifier) and
             (FPointerVars.IndexOfName(UpperCase(VarToStr(Node.GetChild(1).Value))) >= 0) then
-      Result := PointeeBankOf(VarToStr(Node.GetChild(1).Value));
+      Result := DerefedType(Node.GetChild(1));
   end;
+end;
+
+function TSSAGenerator.DerefOperandBank(Node: TASTNode): TSSARegisterType;
+// Bank of the pointee for "*<expr>". A "T PTR" pointee (a multi-level pointer) is an address → int
+// bank; otherwise the declared scalar bank. Defaults to int when the type is unknown.
+var
+  T: string;
+begin
+  T := DerefedType(Node);
+  if T = '' then
+    Result := srtInt
+  else
+    Result := TypeNameToBank(T, '');
 end;
 
 procedure TSSAGenerator.EmitArrayElementAddress(Node: TASTNode; out Result: TSSAValue);
