@@ -135,7 +135,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `OPERATOR <sym>` | ✓ | Operator overloading for UDTs (binary, direct operands) |
 | `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like macros; function-like macros pending) |
 | `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening (methods of a namespaced TYPE / `USING` / `..global` pending) |
-| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit scalar pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Pointer arithmetic, pointers into array/UDT, multi-level PTR pending |
+| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit scalar pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, pointer arithmetic `*(p±n)`, and indexing `p[i]`/`p(i)` (read+write) supported. Pointers into UDT fields and multi-level PTR pending |
 | `FUNCTION f() BYREF AS T` | ✓ | BYREF function results: return a reference to a SHARED/global scalar, read + write through it (`f()=x`). Returning a BYREF parameter (the `min(a,b)=0` idiom) pending |
 | `WSTRING` | ✗ | Not yet implemented |
 
@@ -1475,7 +1475,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `() (Array index)` | ✗ |  |
 | `[] (String index)` | ✗ |  |
-| `[] (Pointer index)` | ✗ |  |
+| `[] (Pointer index)` | ✓ | `p[i]` (and `p(i)`) ≡ `*(p + i)`, read and write |
 
 #### String Operators
 
@@ -1527,8 +1527,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `@ (Address of)` | ✓ | Address-of a declared scalar variable (yields an int reference). `@sub` (procedure address) also supported |
-| `* (Value of)` | ✓ | Pointer dereference, read (`x = *p`) and write (`*p = v`) |
+| `@ (Address of)` | ✓ | Address-of a declared scalar variable or array element `@arr(i)` (yields a packed int reference). `@sub` (procedure address) also supported |
+| `* (Value of)` | ✓ | Pointer dereference, read (`x = *p`) and write (`*p = v`); supports pointer arithmetic `*(p±n)` |
 | `VARPTR (Variable pointer)` | ✗ |  |
 | `PROCPTR (Procedure pointer and vtable index)` | ✗ |  |
 
