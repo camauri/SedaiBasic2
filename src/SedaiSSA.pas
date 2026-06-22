@@ -333,6 +333,7 @@ type
     procedure ProcessMidStatement(Node: TASTNode);
     procedure ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
     procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
+    procedure EmitWStr(ArgsNode: TASTNode; out Result: TSSAValue);   // FreeBASIC WSTR(x) -> wide string
     procedure EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);
     function InferExprBank(Node: TASTNode): TSSARegisterType;
     procedure EmitIif(ArgsNode: TASTNode; out Result: TSSAValue);
@@ -3149,6 +3150,14 @@ begin
           Exit;
         end;
 
+        // FreeBASIC WSTR(x): convert a number/string to a wide string (MODERN; parses as array access,
+        // WSTR is not a registered keyword). Only when not a declared array.
+        if FModernMode and (UpperCase(ArrName) = 'WSTR') and (FProgram.FindArray(ArrName) < 0) then
+        begin
+          EmitWStr(Node.GetChild(1), Result);
+          Exit;
+        end;
+
         // FreeBASIC RAW pointer indexing: "p[i]" where p is an Allocate'd raw pointer. The byte address
         // is p + i*SizeOf(pointee); load SizeOf(pointee) bytes from the raw heap with the pointee's type.
         if (FProgram.FindArray(ArrName) < 0) and IsRawPtr(ArrName) and
@@ -4795,6 +4804,26 @@ begin
     else EmitInstruction(ssaStrLen, Arg3Reg, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     if IsW then EmitInstruction(ssaStrMidW, Result, ArgReg, Arg2Reg, Arg3Reg)
     else EmitInstruction(ssaStrMid, Result, ArgReg, Arg2Reg, Arg3Reg);
+  end;
+end;
+
+procedure TSSAGenerator.EmitWStr(ArgsNode: TASTNode; out Result: TSSAValue);
+// Lower FreeBASIC WSTR(x) to a wide string. In the UTF-8 storage model a numeric argument becomes its
+// STR$ text (ASCII digits are valid UTF-8); a string argument passes through unchanged (its bytes are
+// already UTF-8). The WSTR(...) node is recognised as wide by IsWStringExpr, so a downstream LEN/MID on
+// the result is codepoint-based. ArgsNode is an antArgumentList / antExpressionList; child 0 = value.
+var
+  ArgValue, ArgReg: TSSAValue;
+begin
+  if (ArgsNode = nil) or (ArgsNode.ChildCount < 1) then begin Result := MakeSSAValue(svkNone); Exit; end;
+  ProcessExpression(ArgsNode.GetChild(0), ArgValue);
+  if ArgValue.RegType = srtString then
+    Result := EnsureStringRegister(ArgValue)      // already UTF-8 bytes: widen is a no-op on storage
+  else
+  begin
+    ArgReg := EnsureFloatRegister(ArgValue);
+    Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaStrStr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 end;
 
@@ -11810,13 +11839,16 @@ begin
 end;
 
 procedure TSSAGenerator.CollectWStringVars(Node: TASTNode);
-// Pre-scan: record every variable, parameter, UDT field or FUNCTION result declared AS WSTRING. These
-// share the srtString bank (UTF-8 byte storage) but their LEN/MID/LEFT/RIGHT count/index by Unicode
-// codepoint. Declarations surface as antArrayDecl(name, "WSTRING") (DIM / TYPE field) or as a typed
-// parameter / return whose type identifier is "WSTRING".
+// Pre-scan: record every variable, parameter or FUNCTION result declared AS WSTRING (by name, into the
+// flat FWStringVars). These share the srtString bank (UTF-8 byte storage) but their LEN/MID/LEFT/RIGHT
+// count/index by Unicode codepoint. Declaration shapes: DIM scalar = antArrayDecl(name, "WSTRING"); a
+// parameter = antIdentifier(name) with a type child "WSTRING" inside an antParameterList; a FUNCTION
+// result = the procedure's name node with a type child "WSTRING" (the result is referenced by the bare
+// function name inside the body, so marking that name also makes a call f(...) detect as wide).
 var
   i: Integer;
-  NameU, TypeU: string;
+  TypeU: string;
+  NameNode, P: TASTNode;
 
   procedure MarkW(const N: string);
   begin
@@ -11826,7 +11858,7 @@ var
 
 begin
   if Node = nil then Exit;
-  // DIM v AS WSTRING [* n] / TYPE field AS WSTRING : antArrayDecl(child0=name ident, child1=type ident).
+  // DIM v AS WSTRING [* n] : antArrayDecl(child0=name ident, child1=type ident).
   if (Node.NodeType = antArrayDecl) and (Node.ChildCount >= 2) and
      (Node.GetChild(0).NodeType = antIdentifier) and (Node.GetChild(1).NodeType = antIdentifier) then
   begin
@@ -11834,6 +11866,25 @@ begin
     if TypeU = 'WSTRING' then
       MarkW(VarToStr(Node.GetChild(0).Value));
   end;
+  // FUNCTION ... AS WSTRING : child0 = name node, its child0 = return-type identifier.
+  if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) then
+  begin
+    NameNode := Node.GetChild(0);
+    if (NameNode.NodeType = antIdentifier) and (NameNode.ChildCount >= 1) and
+       (NameNode.GetChild(0).NodeType = antIdentifier) and
+       (UpperCase(VarToStr(NameNode.GetChild(0).Value)) = 'WSTRING') then
+      MarkW(VarToStr(NameNode.Value));   // bare fname = wide result; also makes a call detect wide
+  end;
+  // Parameter AS WSTRING : antIdentifier(param) with a type child "WSTRING", inside an antParameterList.
+  if Node.NodeType = antParameterList then
+    for i := 0 to Node.ChildCount - 1 do
+    begin
+      P := Node.GetChild(i);
+      if (P.NodeType = antIdentifier) and (P.ChildCount >= 1) and
+         (P.GetChild(0).NodeType = antIdentifier) and
+         (UpperCase(VarToStr(P.GetChild(0).Value)) = 'WSTRING') then
+        MarkW(VarToStr(P.Value));
+    end;
   for i := 0 to Node.ChildCount - 1 do
     CollectWStringVars(Node.GetChild(i));
 end;
@@ -11847,6 +11898,8 @@ function TSSAGenerator.IsWStringExpr(Node: TASTNode): Boolean;
 // True if the expression yields a WSTRING value: a WSTRING variable, a WSTR(...) conversion, a
 // parenthesised WSTRING, or a string concatenation/expression with a WSTRING operand (the result of
 // '&' on wide data is still wide). Conservative: anything else is treated as a plain (byte) STRING.
+var
+  NameU: string;
 begin
   Result := False;
   if Node = nil then Exit;
@@ -11860,11 +11913,15 @@ begin
       Result := (Node.ChildCount >= 2) and
                 (IsWStringExpr(Node.GetChild(0)) or IsWStringExpr(Node.GetChild(1)));
     antArrayAccess, antFunctionCall:
-      // WSTR(...) conversion is the canonical wide producer; the call name is child0/Value.
-      if Node.ChildCount >= 1 then
-        Result := UpperCase(VarToStr(Node.GetChild(0).Value)) = 'WSTR'
-      else
-        Result := UpperCase(VarToStr(Node.Value)) = 'WSTR';
+      // A call is wide if it is WSTR(...) (the canonical wide producer) or a call to a FUNCTION declared
+      // AS WSTRING (its name was marked in FWStringVars). The call name is child0.Value (else Node.Value).
+      begin
+        if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+          NameU := UpperCase(VarToStr(Node.GetChild(0).Value))
+        else
+          NameU := UpperCase(VarToStr(Node.Value));
+        Result := (NameU = 'WSTR') or IsWStringVar(NameU);
+      end;
   end;
 end;
 
