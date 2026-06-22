@@ -217,6 +217,7 @@ begin
     bcArrayLoadInt,  // Typed array load (int) - Dest is WRITTEN
     bcArrayLBound, bcArrayUBound,  // B1.4: LBOUND/UBOUND - Dest = int bound
     bcRefLoadInt,    // FreeBASIC pointer deref (int) - Dest = value loaded
+    bcRefAddrField,  // @obj.field - Dest = packed record-field pointer (int)
     // === GROUP 4: I/O operations ===
     bcInputInt,      // Input int
     bcDataReadInt,   // Read next DATA value into int register
@@ -390,6 +391,7 @@ begin
     // === GROUP 3: Pointer deref (FreeBASIC): Src1 = address register (always int) ===
     bcRefLoadInt, bcRefLoadFloat, bcRefLoadString,
     bcRefStoreInt, bcRefStoreFloat, bcRefStoreString,
+    bcRefAddrField,  // @obj.field - Src1 = record handle (int)
     // === GROUP 1: String operations with int param ===
     bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin,
     bcStrString,  // STRING(n,ch) - Src1 = count (int)

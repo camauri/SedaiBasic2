@@ -242,6 +242,7 @@ type
     function PointeeBankOf(const PtrName: string): TSSARegisterType;            // bank of *p from p's declared pointee
     function DerefOperandBank(Node: TASTNode): TSSARegisterType;                // bank of *<expr> incl. pointer arithmetic (p+n)
     procedure EmitArrayElementAddress(Node: TASTNode; out Result: TSSAValue);   // @arr(i) → packed element address
+    procedure EmitFieldAddress(MemberNode: TASTNode; out Result: TSSAValue);    // @obj.field → record-field pointer
     function EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue; // p[i] → address (p + i)
     function EmitVarAddress(const Name: string): TSSAValue;                     // packed address of a backed scalar (0=NULL)
     function IsByrefRetFunc(const Name: string): Boolean;                       // FUNCTION declared BYREF AS T?
@@ -906,9 +907,12 @@ begin
       // @name : either the address of a data variable (FreeBASIC pointers) or, when name is a SUB,
       // its entry PC. A data variable that is address-taken was backed by a 1-element global array
       // (CollectAddressTakenVars); its packed address is (arrayId+1) shl POINTER_ARRAY_SHIFT so 0
-      // stays a NULL sentinel. @arr(i) (an index child is present) addresses an array element.
-      if Node.ChildCount > 0 then
-        EmitArrayElementAddress(Node, Result)
+      // stays a NULL sentinel. A child is present for @arr(i) (index list → array element) and
+      // @obj.field (member access → record-field pointer).
+      if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antMemberAccess) then
+        EmitFieldAddress(Node.GetChild(0), Result)
+      else if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antArrayAccess) then
+        EmitArrayElementAddress(Node.GetChild(0), Result)
       else if IsSharedScalar(VarToStr(Node.Value)) then
         Result := EmitVarAddress(VarToStr(Node.Value))
       else
@@ -11165,10 +11169,11 @@ begin
 end;
 
 procedure TSSAGenerator.EmitArrayElementAddress(Node: TASTNode; out Result: TSSAValue);
-// @arr(i [,j...]) — the packed address of an array element. The base array id is resolved by name; the
-// linear (row-major) element index is computed exactly like an array read, then folded into the low
-// bits of the address: packedAddr = ((arrayId+1) shl POINTER_ARRAY_SHIFT) + linearIndex. This makes
-// plain integer arithmetic on the pointer ("p + 1") advance by one element, FreeBASIC-style.
+// @arr(i [,j...]) — the packed address of an array element. Node is the antArrayAccess subtree
+// (child0 = array name identifier, child1 = index expression list). The base array id is resolved by
+// name; the linear (row-major) element index is computed exactly like an array read, then folded into
+// the low bits of the address: packedAddr = ((arrayId+1) shl POINTER_ARRAY_SHIFT) + linearIndex. This
+// makes plain integer arithmetic on the pointer ("p + 1") advance by one element, FreeBASIC-style.
 var
   ArrName: string;
   ArrayIdx, i, j: Integer;
@@ -11178,12 +11183,12 @@ var
   LinearIndex, TempVal, AddResult, StrideVal, MulResult, BaseVal: TSSAValue;
   TempReg, Stride: Integer;
 begin
-  ArrName := VarToStr(Node.Value);
+  ArrName := VarToStr(Node.GetChild(0).Value);
   ArrayIdx := FProgram.FindArray(ArrName);
   if ArrayIdx < 0 then
     raise Exception.CreateFmt('Cannot take address of element of undeclared array: %s', [ArrName]);
   ArrInfo := FProgram.GetArray(ArrayIdx);
-  IndicesNode := Node.GetChild(0);  // antExpressionList of indices
+  IndicesNode := Node.GetChild(1);  // antExpressionList of indices
 
   SetLength(Indices, IndicesNode.ChildCount);
   for i := 0 to IndicesNode.ChildCount - 1 do
@@ -11260,6 +11265,32 @@ begin
   TempReg := FProgram.AllocRegister(srtInt);
   Result := MakeSSARegister(srtInt, TempReg);
   EmitInstruction(ssaAddInt, Result, BaseVal, LinearIndex, MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.EmitFieldAddress(MemberNode: TASTNode; out Result: TSSAValue);
+// @obj.field — the address of a record field. Resolve the owning record's handle (ResolveRecordObject,
+// which handles obj / arr(i) / nested a.b) and the field's slot, then emit ssaRefAddrField to pack a
+// record-field pointer (RECPTR_TAG | handle | slot) at runtime. The pointee bank is carried by the
+// pointer's declared type (FPointerVars), as for any other pointer.
+var
+  TypeName, NestedT: string;
+  UDTIdx, Slot: Integer;
+  Bank: TSSARegisterType;
+  HandleVal: TSSAValue;
+begin
+  Result := MakeSSAValue(svkNone);
+  if MemberNode.ChildCount < 1 then Exit;
+  TypeName := ObjectTypeName(MemberNode.GetChild(0));
+  if TypeName = '' then
+    raise Exception.Create('Cannot take address of field: object is not a record');
+  UDTIdx := FindUDT(TypeName);
+  if not UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot, NestedT) then
+    raise Exception.CreateFmt('Cannot take address of unknown field "%s" of type %s',
+                              [VarToStr(MemberNode.Value), TypeName]);
+  if not ResolveRecordObject(MemberNode.GetChild(0), HandleVal, TypeName) then
+    raise Exception.Create('Cannot take address of field: unresolved record object');
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRefAddrField, Result, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
 end;
 
 function TSSAGenerator.EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue;

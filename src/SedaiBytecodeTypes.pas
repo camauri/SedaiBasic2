@@ -374,6 +374,8 @@ const
   bcRefStoreInt     = bcGroupArray + 16;
   bcRefStoreFloat   = bcGroupArray + 17;
   bcRefStoreString  = bcGroupArray + 18;
+  // @obj.field : pack a record-field pointer. Dest=packed addr, Src1=record handle, Immediate=field slot.
+  bcRefAddrField    = bcGroupArray + 19;
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values
@@ -1389,6 +1391,7 @@ begin
         16: Result := 'RefStoreInt';
         17: Result := 'RefStoreFloat';
         18: Result := 'RefStoreString';
+        19: Result := 'RefAddrField';
       else
         Result := Format('Array_%d', [SubOp]);
       end;

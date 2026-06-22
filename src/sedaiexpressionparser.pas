@@ -1344,33 +1344,40 @@ end;
 
 function TExpressionParser.ParseProcAddress(Token: TLexerToken): TASTNode;
 var
-  Indices: TASTNode;
+  Operand: TASTNode;
 begin
-  // '@' is already consumed; the next token must be a name (identifier): a SUB/FUNCTION (→ entry PC),
-  // a data variable (→ its address), or an array followed by "(i)" (→ the element's address).
-  // Lowers to antProcAddress (value = upper-cased name); for "@arr(i)" the index expression list is
-  // attached as child0 so SSA computes the element address.
+  // '@' is already consumed. Parse the operand as a full postfix expression (precCall stops before
+  // binary operators), so all of these are handled: @sub / @x (identifier), @arr(i) (array access),
+  // @obj.field and @arr(i).field and @a.b.c (member access). Lower to antProcAddress; SSA dispatches
+  // on the operand's node kind:
+  //   - antIdentifier  → Value = name, no child (data-var address or @sub entry PC)
+  //   - antArrayAccess → child0 = the array access (element address)
+  //   - antMemberAccess→ child0 = the member access (record-field pointer)
   if not Context.Check(ttIdentifier) then
   begin
     HandleError('Expected a name after "@"', Context.CurrentToken);
     Result := nil;
     Exit;
   end;
-  Result := TASTNode.CreateWithValue(antProcAddress, UpperCase(Context.CurrentToken.Value), Token);
-  Context.Advance;  // consume the name
-  // "@arr(i [,j...])" — address of an array element.
-  if Context.Check(ttDelimParOpen) then
+  Operand := ParseExpression(precCall);
+  if not Assigned(Operand) then
   begin
-    Context.Advance;  // consume '('
-    Indices := ParseExpressionList(ttSeparParam);
-    if not Context.Match(ttDelimParClose) then
-    begin
-      HandleError('Expected ")" after array index in "@"', Context.CurrentToken);
-      Result.Free;
-      Result := nil;
-      Exit;
-    end;
-    Result.AddChild(Indices);
+    HandleError('Expected a name after "@"', Context.CurrentToken);
+    Result := nil;
+    Exit;
+  end;
+  if Operand.NodeType = antIdentifier then
+  begin
+    // @x / @sub: keep the historical shape (Value = name, no child) so threading and scalar/proc
+    // address paths are unaffected.
+    Result := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(Operand.Value)), Token);
+    Operand.Free;
+  end
+  else
+  begin
+    // @arr(i) / @obj.field: keep the operand subtree as child0.
+    Result := TASTNode.Create(antProcAddress, Token);
+    Result.AddChild(Operand);
   end;
   DoNodeCreated(Result);
 end;

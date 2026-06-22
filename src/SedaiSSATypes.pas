@@ -43,6 +43,16 @@ const
   POINTER_ARRAY_SHIFT = 32;
   POINTER_OFFSET_MASK = (Int64(1) shl POINTER_ARRAY_SHIFT) - 1;
 
+  { Record-field pointer (@obj.field). FArrays-backed pointers (scalars/array elements) have bit 63
+    clear (arrayId+1 < 2^31); a record-field pointer sets bit 63 (RECPTR_TAG) as a discriminator. It
+    packs the record handle's index in bits [RECPTR_SLOT_BITS..61], the shared-record flag in bit 62
+    (copied straight from the handle), and the field slot in the low RECPTR_SLOT_BITS bits. The six
+    bcRef{Load,Store} ops test bit 63 to route to record storage vs FArrays. }
+  RECPTR_TAG = Int64(1) shl 63;
+  RECPTR_SLOT_BITS = 16;
+  RECPTR_SLOT_MASK = (Int64(1) shl RECPTR_SLOT_BITS) - 1;
+  RECPTR_INDEX_MASK = (Int64(1) shl 46) - 1;
+
 var
   // Runtime master switch for the SSA optimization passes (the `--no-opt` CLI flag clears it). The
   // structural passes (SSA construction, dominator tree, PHI elimination) ignore it and always run;
@@ -140,6 +150,7 @@ type
     // array (element 0). Load: Dest=value, Src1=address reg. Store: Src1=address reg, Src2=value.
     ssaRefLoadInt, ssaRefLoadFloat, ssaRefLoadString,
     ssaRefStoreInt, ssaRefStoreFloat, ssaRefStoreString,
+    ssaRefAddrField,  // @obj.field: pack a record-field pointer (Dest=addr, Src1=handle, Immediate=slot)
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
     ssaPrintInt, ssaPrintIntLn,
     ssaPrintBool, ssaPrintUInt,   // B1.5 phase C: BOOLEAN true/false, unsigned-64 print

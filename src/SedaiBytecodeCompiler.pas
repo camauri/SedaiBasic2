@@ -297,6 +297,7 @@ begin
     ssaRefStoreInt: Result := bcRefStoreInt;
     ssaRefStoreFloat: Result := bcRefStoreFloat;
     ssaRefStoreString: Result := bcRefStoreString;
+    ssaRefAddrField: Result := bcRefAddrField;
     // Graphics operations
     ssaGraphicRGBA: Result := bcGraphicRGBA;
     ssaGraphicSetMode: Result := bcGraphicSetMode;

@@ -250,6 +250,7 @@ type
     // M5.2c: allocate in the shared region (cross-thread); ResolveRec routes a handle to its record.
     function AllocSharedRecord(IntC, FloatC, StrC, TypeId: Integer): Int64;
     function ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordStorage; inline;
+    function RecPtrTarget(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage; inline;  // decode @obj.field pointer
     procedure CleanupSharedRecords;   // free the shared region (destructor)
     procedure RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
     procedure CheckFloatValid(Ctx: TExecutionContext; RegIndex: Integer; const OpName: string);
@@ -1392,6 +1393,18 @@ begin
     Result := @Ctx.Records[Handle];
 end;
 
+function TBytecodeVM.RecPtrTarget(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage;
+// Decode a record-field pointer (RECPTR_TAG set): recover the record handle (index + shared flag) and
+// the field slot, then route the handle to its storage. See SedaiSSATypes for the bit layout.
+var
+  Handle: Int64;
+begin
+  Slot := PtrAddr and RECPTR_SLOT_MASK;
+  Handle := (PtrAddr shr RECPTR_SLOT_BITS) and RECPTR_INDEX_MASK;
+  if (PtrAddr and SHARED_REC_FLAG) <> 0 then Handle := Handle or SHARED_REC_FLAG;
+  Result := ResolveRec(Ctx, Handle);
+end;
+
 procedure TBytecodeVM.CleanupSharedRecords;
 // Destructor helper: free every record in the shared region.
 var
@@ -2333,6 +2346,11 @@ begin
         begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;        // address
           if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;  // value
+        end;
+        bcRefAddrField:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;        // packed addr
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;        // record handle
         end;
 
         // ArrayLoad: Dest is result, Src2 is index (int)
@@ -4161,7 +4179,8 @@ var
   ArrayIdx, LinearIdx, i, ProdDims, ArrLowerBound: Integer;
   ArrInfo: TSSAArrayInfo;
   PtrAddr: Int64;
-  PtrOffset: Integer;
+  PtrOffset, RecSlot: Integer;
+  Rec: PRecordStorage;
 begin
   SubOp := Instr.OpCode and $FF;
   case SubOp of
@@ -4344,63 +4363,119 @@ begin
       EraseArray(Instr.Src1);
     12: // bcArrayRedim - REDIM [PRESERVE] arr(ub) (B1.4); Src2=ub reg, Immediate bit0=preserve
       RedimArray(Instr.Src1, Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0);
-    // FreeBASIC pointer dereference. The packed address holds (arrayId+1) in the high bits (0 = NULL)
-    // and the element offset in the low POINTER_ARRAY_SHIFT bits; the pointee is element <offset> of
-    // that backing array (offset 0 for a scalar's 1-element backing). Load: Dest=value, Src1=address.
-    // Store: Src1=address, Src2=value.
+    // FreeBASIC pointer dereference. Two pointer kinds share these ops, discriminated by bit 63: a
+    // record-field pointer (RECPTR_TAG set, so PtrAddr < 0) addresses ResolveRec(handle)^.Data[slot];
+    // otherwise the packed address holds (arrayId+1) in the high bits (0 = NULL) and the element offset
+    // in the low POINTER_ARRAY_SHIFT bits, addressing FArrays[arrayId].Data[offset] (offset 0 for a
+    // scalar's 1-element backing). Load: Dest=value, Src1=address. Store: Src1=address, Src2=value.
     13: // bcRefLoadInt
       begin
         PtrAddr := Ctx.IntRegs[Instr.Src1];
-        ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
-        PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].IntData)) then
-          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-        Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[PtrOffset];
+        if PtrAddr < 0 then
+        begin
+          Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+          Ctx.IntRegs[Instr.Dest] := Rec^.IntData[RecSlot];
+        end
+        else
+        begin
+          ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+          PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].IntData)) then
+            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+          Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[PtrOffset];
+        end;
       end;
     14: // bcRefLoadFloat
       begin
         PtrAddr := Ctx.IntRegs[Instr.Src1];
-        ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
-        PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].FloatData)) then
-          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-        Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[PtrOffset];
+        if PtrAddr < 0 then
+        begin
+          Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+          Ctx.FloatRegs[Instr.Dest] := Rec^.FloatData[RecSlot];
+        end
+        else
+        begin
+          ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+          PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].FloatData)) then
+            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+          Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[PtrOffset];
+        end;
       end;
     15: // bcRefLoadString
       begin
         PtrAddr := Ctx.IntRegs[Instr.Src1];
-        ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
-        PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
-          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-        Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[PtrOffset];
+        if PtrAddr < 0 then
+        begin
+          Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+          Ctx.StringRegs[Instr.Dest] := Rec^.StringData[RecSlot];
+        end
+        else
+        begin
+          ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+          PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
+            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+          Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[PtrOffset];
+        end;
       end;
     16: // bcRefStoreInt
       begin
         PtrAddr := Ctx.IntRegs[Instr.Src1];
-        ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
-        PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].IntData)) then
-          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-        FArrays[ArrayIdx].IntData[PtrOffset] := Ctx.IntRegs[Instr.Src2];
+        if PtrAddr < 0 then
+        begin
+          Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+          Rec^.IntData[RecSlot] := Ctx.IntRegs[Instr.Src2];
+        end
+        else
+        begin
+          ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+          PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].IntData)) then
+            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+          FArrays[ArrayIdx].IntData[PtrOffset] := Ctx.IntRegs[Instr.Src2];
+        end;
       end;
     17: // bcRefStoreFloat
       begin
         PtrAddr := Ctx.IntRegs[Instr.Src1];
-        ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
-        PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].FloatData)) then
-          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-        FArrays[ArrayIdx].FloatData[PtrOffset] := Ctx.FloatRegs[Instr.Src2];
+        if PtrAddr < 0 then
+        begin
+          Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+          Rec^.FloatData[RecSlot] := Ctx.FloatRegs[Instr.Src2];
+        end
+        else
+        begin
+          ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+          PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].FloatData)) then
+            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+          FArrays[ArrayIdx].FloatData[PtrOffset] := Ctx.FloatRegs[Instr.Src2];
+        end;
       end;
     18: // bcRefStoreString
       begin
         PtrAddr := Ctx.IntRegs[Instr.Src1];
-        ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
-        PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
-          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-        FArrays[ArrayIdx].StringData[PtrOffset] := Ctx.StringRegs[Instr.Src2];
+        if PtrAddr < 0 then
+        begin
+          Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+          Rec^.StringData[RecSlot] := Ctx.StringRegs[Instr.Src2];
+        end
+        else
+        begin
+          ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+          PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
+            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+          FArrays[ArrayIdx].StringData[PtrOffset] := Ctx.StringRegs[Instr.Src2];
+        end;
+      end;
+    19: // bcRefAddrField — pack a record-field pointer from a handle (Src1) and slot (Immediate)
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1];   // record handle (may carry SHARED_REC_FLAG)
+        Ctx.IntRegs[Instr.Dest] := RECPTR_TAG or (PtrAddr and SHARED_REC_FLAG) or
+          (((PtrAddr and SHARED_REC_MASK) and RECPTR_INDEX_MASK) shl RECPTR_SLOT_BITS) or
+          (Int64(Instr.Immediate) and RECPTR_SLOT_MASK);
       end;
   else
     raise Exception.CreateFmt('Unknown array opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
