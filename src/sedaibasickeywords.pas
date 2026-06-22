@@ -248,6 +248,7 @@ const
   kCINT    = 'CINT';      // round to Integer (banker's rounding)
   kCLNG    = 'CLNG';      // round to Long
   kCLNGINT = 'CLNGINT';   // round to LongInt (64-bit)
+  kCULNGINT = 'CULNGINT'; // round to ULongInt (64-bit, unsigned)
   kCSHORT  = 'CSHORT';    // round to Short
   kCBYTE   = 'CBYTE';     // round to Byte
   kCUBYTE  = 'CUBYTE';    // round to UByte
@@ -260,6 +261,7 @@ const
   kBIN     = 'BIN';       // integer -> binary string
   kVALINT  = 'VALINT';    // string -> Integer
   kVALLNG  = 'VALLNG';    // string -> LongInt
+  kVALULNG = 'VALULNG';   // string -> ULongInt (unsigned)
   kVALUINT = 'VALUINT';   // string -> UInteger
   // FreeBASIC array bound queries (B1.4)
   kLBOUND  = 'LBOUND';    // lower bound of an array dimension

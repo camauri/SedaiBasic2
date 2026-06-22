@@ -2248,7 +2248,8 @@ begin
           else
             EmitInstruction(ssaStrBin, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
-        else if (FuncName = 'VALINT') or (FuncName = 'VALLNG') or (FuncName = 'VALUINT') then
+        else if (FuncName = 'VALINT') or (FuncName = 'VALLNG') or (FuncName = 'VALUINT') or
+                (FuncName = 'VALULNG') then
         begin
           // VALINT/VALLNG/VALUINT(s) - parse leading integer from a string (0 if none).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
@@ -2533,6 +2534,7 @@ begin
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end
         else if (FuncName = 'CINT') or (FuncName = 'CLNG') or (FuncName = 'CLNGINT') or
+                (FuncName = 'CULNGINT') or
                 (FuncName = 'CSHORT') or (FuncName = 'CBYTE') or (FuncName = 'CUBYTE') or
                 (FuncName = 'CUSHORT') or (FuncName = 'CUINT') or (FuncName = 'CULNG') then
         begin
@@ -2595,6 +2597,13 @@ begin
             Result := MakeSSAConstFloat(ArgValue.ConstInt)
           else if ArgValue.Kind = svkConstFloat then
             Result := MakeSSAConstFloat(ArgValue.ConstFloat)
+          else if (ArgValue.Kind = svkConstString) or
+                  ((ArgValue.Kind = svkRegister) and (ArgValue.RegType = srtString)) then
+          begin
+            // String operand: parse as a number (VAL semantics), e.g. CDBL("3.14").
+            Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+            EmitInstruction(ssaStrVal, Result, EnsureStringRegister(ArgValue), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end
           else
             Result := EnsureFloatRegister(ArgValue);
 

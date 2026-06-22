@@ -1908,6 +1908,7 @@ begin
  RegisterKeyword(kCINT,    ttMathFunction, 'Convert to Integer, rounding to nearest',                kcMathFunctions);
  RegisterKeyword(kCLNG,    ttMathFunction, 'Convert to Long, rounding to nearest',                   kcMathFunctions);
  RegisterKeyword(kCLNGINT, ttMathFunction, 'Convert to LongInt (64-bit), rounding to nearest',       kcMathFunctions);
+ RegisterKeyword(kCULNGINT,ttMathFunction, 'Convert to ULongInt (64-bit unsigned), rounding to nearest', kcMathFunctions);
  RegisterKeyword(kCSHORT,  ttMathFunction, 'Convert to Short, rounding to nearest',                  kcMathFunctions);
  RegisterKeyword(kCBYTE,   ttMathFunction, 'Convert to Byte, rounding to nearest',                   kcMathFunctions);
  RegisterKeyword(kCUBYTE,  ttMathFunction, 'Convert to UByte, rounding to nearest',                  kcMathFunctions);
@@ -1918,6 +1919,7 @@ begin
  RegisterKeyword(kCSNG,    ttMathFunction, 'Convert to Single-precision float',                      kcMathFunctions);
  RegisterKeyword(kVALINT,  ttMathFunction, 'Parse leading integer from a string',                    kcMathFunctions);
  RegisterKeyword(kVALLNG,  ttMathFunction, 'Parse leading 64-bit integer from a string',             kcMathFunctions);
+ RegisterKeyword(kVALULNG, ttMathFunction, 'Parse leading 64-bit unsigned integer from a string',     kcMathFunctions);
  RegisterKeyword(kVALUINT, ttMathFunction, 'Parse leading unsigned integer from a string',           kcMathFunctions);
  RegisterKeyword(kLBOUND,  ttMathFunction, 'Lower bound of an array dimension',                       kcMathFunctions);
  RegisterKeyword(kUBOUND,  ttMathFunction, 'Upper bound of an array dimension',                       kcMathFunctions);
