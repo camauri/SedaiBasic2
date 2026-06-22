@@ -135,7 +135,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `OPERATOR <sym>` | ✓ | Operator overloading for UDTs (binary, direct operands) |
 | `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like macros; function-like macros pending) |
 | `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening (methods of a namespaced TYPE / `USING` / `..global` pending) |
-| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit scalar pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, pointer arithmetic `*(p±n)`, and indexing `p[i]`/`p(i)` (read+write) supported. Pointers into UDT fields and multi-level PTR pending |
+| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`/`p(i)`, and passing pointers across SUB calls — all read+write. Multi-level PTR pending |
 | `FUNCTION f() BYREF AS T` | ✓ | BYREF function results: return a reference to a SHARED/global scalar, read + write through it (`f()=x`). Returning a BYREF parameter (the `min(a,b)=0` idiom) pending |
 | `WSTRING` | ✗ | Not yet implemented |
 
@@ -1527,7 +1527,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `@ (Address of)` | ✓ | Address-of a declared scalar variable or array element `@arr(i)` (yields a packed int reference). `@sub` (procedure address) also supported |
+| `@ (Address of)` | ✓ | Address-of a scalar, array element `@arr(i)`, or UDT field `@obj.field` (yields a packed int reference). `@sub` (procedure address) also supported |
 | `* (Value of)` | ✓ | Pointer dereference, read (`x = *p`) and write (`*p = v`); supports pointer arithmetic `*(p±n)` |
 | `VARPTR (Variable pointer)` | ✗ |  |
 | `PROCPTR (Procedure pointer and vtable index)` | ✗ |  |
