@@ -10442,7 +10442,15 @@ begin
         begin
           VarName := UpperCase(VarToStr(ParamNode.Value));
           TypeName := UpperCase(VarToStr(ParamNode.GetChild(0).Value));
-          if TypeName <> '' then RegisterTypedVar(VarName, TypeName);
+          // A BYREF scalar param of a BYREF-return FUNCTION is an address carrier (it holds the caller
+          // variable's address). Register it as INT regardless of its declared (float/string) type, so
+          // its register/transfer-slot are int (an address); the declared type is used only to type the
+          // auto-deref (FCurrentProcAddrParams, set in the prologue).
+          if (Node.Attributes.Values['BYREFRET'] = '1') and
+             (ParamNode.Attributes.Values['BYREF'] = '1') and
+             (FindUDT(TypeName) < 0) then
+            RegisterTypedVar(VarName, 'INTEGER')
+          else if TypeName <> '' then RegisterTypedVar(VarName, TypeName);
         end;
       end;
     end;
