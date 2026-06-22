@@ -378,6 +378,14 @@ const
   bcRefStoreString  = bcGroupArray + 18;
   // @obj.field : pack a record-field pointer. Dest=packed addr, Src1=record handle, Immediate=field slot.
   bcRefAddrField    = bcGroupArray + 19;
+  // FreeBASIC raw byte heap (Allocate family). Raw pointer = RAWPTR_TAG | byte offset.
+  bcRawAlloc        = bcGroupArray + 20;  // Dest=raw ptr; Src1=byte count reg (zeroed)
+  bcRawFree         = bcGroupArray + 21;  // Src1=raw ptr
+  bcRawRealloc      = bcGroupArray + 22;  // Dest=raw ptr; Src1=old ptr; Src2=byte count reg
+  bcRawLoadInt      = bcGroupArray + 23;  // Dest=int; Src1=raw ptr; Immediate=raw type code (width)
+  bcRawLoadFloat    = bcGroupArray + 24;  // Dest=float; Src1=raw ptr; Immediate=type code (single/double)
+  bcRawStoreInt     = bcGroupArray + 25;  // Src1=raw ptr; Src2=int value; Immediate=type code
+  bcRawStoreFloat   = bcGroupArray + 26;  // Src1=raw ptr; Src2=float value; Immediate=type code
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values
@@ -1395,6 +1403,13 @@ begin
         17: Result := 'RefStoreFloat';
         18: Result := 'RefStoreString';
         19: Result := 'RefAddrField';
+        20: Result := 'RawAlloc';
+        21: Result := 'RawFree';
+        22: Result := 'RawRealloc';
+        23: Result := 'RawLoadInt';
+        24: Result := 'RawLoadFloat';
+        25: Result := 'RawStoreInt';
+        26: Result := 'RawStoreFloat';
       else
         Result := Format('Array_%d', [SubOp]);
       end;

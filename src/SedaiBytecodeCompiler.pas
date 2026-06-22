@@ -299,6 +299,13 @@ begin
     ssaRefStoreFloat: Result := bcRefStoreFloat;
     ssaRefStoreString: Result := bcRefStoreString;
     ssaRefAddrField: Result := bcRefAddrField;
+    ssaRawAlloc: Result := bcRawAlloc;
+    ssaRawFree: Result := bcRawFree;
+    ssaRawRealloc: Result := bcRawRealloc;
+    ssaRawLoadInt: Result := bcRawLoadInt;
+    ssaRawLoadFloat: Result := bcRawLoadFloat;
+    ssaRawStoreInt: Result := bcRawStoreInt;
+    ssaRawStoreFloat: Result := bcRawStoreFloat;
     // Graphics operations
     ssaGraphicRGBA: Result := bcGraphicRGBA;
     ssaGraphicSetMode: Result := bcGraphicSetMode;

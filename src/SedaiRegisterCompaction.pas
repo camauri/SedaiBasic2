@@ -218,6 +218,8 @@ begin
     bcArrayLBound, bcArrayUBound,  // B1.4: LBOUND/UBOUND - Dest = int bound
     bcRefLoadInt,    // FreeBASIC pointer deref (int) - Dest = value loaded
     bcRefAddrField,  // @obj.field - Dest = packed record-field pointer (int)
+    bcRawAlloc, bcRawRealloc,  // raw heap: Dest = raw pointer (int)
+    bcRawLoadInt,              // raw deref (int) - Dest = value
     // === GROUP 4: I/O operations ===
     bcInputInt,      // Input int
     bcDataReadInt,   // Read next DATA value into int register
@@ -288,6 +290,7 @@ begin
     // === GROUP 3: Array operations ===
     bcArrayLoadFloat,  // Typed array load (float) - Dest is WRITTEN
     bcRefLoadFloat,    // FreeBASIC pointer deref (float) - Dest = value loaded
+    bcRawLoadFloat,    // raw deref (float) - Dest = value loaded
     // === GROUP 4: I/O operations ===
     bcInputFloat,
     bcDataReadFloat,   // Read next DATA value into float register
@@ -393,6 +396,9 @@ begin
     bcRefLoadInt, bcRefLoadFloat, bcRefLoadString,
     bcRefStoreInt, bcRefStoreFloat, bcRefStoreString,
     bcRefAddrField,  // @obj.field - Src1 = record handle (int)
+    // raw heap: Src1 = byte count (alloc) / raw pointer (free/realloc/load/store) — all int
+    bcRawAlloc, bcRawFree, bcRawRealloc,
+    bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat,
     // === GROUP 1: String operations with int param ===
     bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin,
     bcStrString,  // STRING(n,ch) - Src1 = count (int)
@@ -503,6 +509,8 @@ begin
   case OpCode of
     // UDT/record (M3): RecordStoreInt's Src2 is the int value being written.
     bcRecordStoreInt,
+    // raw heap: Realloc's Src2 = byte count; RawStoreInt's Src2 = int value.
+    bcRawRealloc, bcRawStoreInt,
     // Condition variables (M5.4): CondWait's Src2 is the mutex handle (int).
     bcCondWait,
     // === GROUP 0: Core VM operations ===
@@ -567,6 +575,8 @@ begin
   case OpCode of
     // UDT/record (M3): RecordStoreFloat's Src2 is the float value being written.
     bcRecordStoreFloat,
+    // raw heap: RawStoreFloat's Src2 is the float value being written.
+    bcRawStoreFloat,
     // === GROUP 0: Core VM operations ===
     // Float arithmetic (second operand)
     bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcPowFloat,

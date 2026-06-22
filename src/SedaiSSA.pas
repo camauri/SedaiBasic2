@@ -141,6 +141,9 @@ type
     // routed to element 0 of this array, so the value is never a per-thread register.
     FSharedScalarArr: TStringList;       // name (UPPER) -> array index (Objects[]=PtrInt arrayIdx)
     FPointerVars: TStringList;           // FreeBASIC pointers: var name (UPPER) -> pointee type name (e.g. "INTEGER")
+    FRawPtrVars: TStringList;            // FreeBASIC raw pointers: var (UPPER) ever assigned from Allocate/CAllocate/
+                                         // Reallocate. Its value is a RAWPTR_TAG byte offset → deref/arithmetic use the
+                                         // raw byte heap (SizeOf-scaled), not the managed FArrays/record path.
     FAddrLocalVars: TStringList;         // @-taken LOCALS (in a SUB/FUNCTION): name (UPPER) -> type name. Backed by
                                          // a per-frame 1-field record (handle in hidden "<name>$REC"), so the address
                                          // is distinct per recursion level (a module-level @-taken var stays SHARED-backed).
@@ -251,6 +254,12 @@ type
     function PointerUDTType(const PtrName: string): string;                     // pointee UDT type if p is a "T PTR" (T a UDT), else ''
     function IsAddrParam(const Name: string): Boolean;                          // BYREF-return address-carrying param?
     function AddrParamBank(const Name: string): TSSARegisterType;               // pointee bank of an address param
+    function IsRawPtr(const Name: string): Boolean;                             // raw (Allocate-backed) pointer var?
+    procedure CollectRawPtrVars(Node: TASTNode);                                // pre-scan: mark ptrs assigned from Allocate*
+    function IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;           // Node = ALLOCATE/CALLOCATE/REALLOCATE(...)?
+    function RawTypeCodeOf(const PtrName: string): Integer;                      // raw element type code for *p / p[i]
+    function RawElemSizeOf(const PtrName: string): Int64;                        // SizeOf(pointee) in bytes
+    procedure EmitRawAlloc(CallNode: TASTNode; out Result: TSSAValue);           // ALLOCATE/CALLOCATE/REALLOCATE → raw ptr
     function IsAddrLocal(const Name: string): Boolean;                          // @-taken LOCAL (per-frame record-backed)?
     function AddrLocalBank(const Name: string): TSSARegisterType;               // bank of an @-taken local
     function AddrLocalHandle(const Name: string): TSSAValue;                    // its per-frame record handle (hidden var)
@@ -499,6 +508,7 @@ begin
   FSharedScalarArr := TStringList.Create;
   FPointerVars := TStringList.Create;
   FAddrLocalVars := TStringList.Create;
+  FRawPtrVars := TStringList.Create;
   FByrefRetFuncs := TStringList.Create;
   FSharedScalarArr.CaseSensitive := False;
   FVarWidthCode := TStringList.Create;
@@ -539,6 +549,7 @@ begin
   FSharedScalarArr.Free;
   FPointerVars.Free;
   FAddrLocalVars.Free;
+  FRawPtrVars.Free;
   FByrefRetFuncs.Free;
   FVarWidthCode.Free;
   FVarPrintKind.Free;
@@ -891,7 +902,7 @@ var
   ConvW: Integer;   // B1.5: integer-narrowing width code for a Cxxx conversion (0 = full width)
   NarrowReg: TSSAValue;
   // Array access variables
-  ArrName: string;
+  ArrName, ArrName2: string;
   ArrayIdx: Integer;
   ArrInfo: TSSAArrayInfo;
   IndicesNode: TASTNode;
@@ -973,6 +984,22 @@ begin
          (PointerUDTType(VarToStr(Node.GetChild(0).Value)) <> '') then
       begin
         Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.GetChild(0).Value))));
+        Exit;
+      end;
+      // *p where p is a RAW (Allocate'd) pointer: load SizeOf(pointee) bytes from the raw heap.
+      if (Node.GetChild(0).NodeType = antIdentifier) and IsRawPtr(VarToStr(Node.GetChild(0).Value)) then
+      begin
+        Left := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.GetChild(0).Value))));
+        if PointeeBankOf(VarToStr(Node.GetChild(0).Value)) = srtFloat then
+        begin
+          Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+          EmitInstruction(ssaRawLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOf(VarToStr(Node.GetChild(0).Value))));
+        end
+        else
+        begin
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaRawLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOf(VarToStr(Node.GetChild(0).Value))));
+        end;
         Exit;
       end;
       // *p (rvalue): load the pointee value. Address = p's int value; the pointee bank comes from p's
@@ -2995,6 +3022,24 @@ begin
 
         ArrName := VarToStr(Node.GetChild(0).Value);
 
+        // FreeBASIC raw heap: ALLOCATE(n)/CALLOCATE(n)/REALLOCATE(p,n) as an expression → raw pointer;
+        // DEALLOCATE(p) as an expression-statement → free (yields a dummy 0). Parse as array-access (not
+        // a declared array/function).
+        if IsAllocCall(Node, ArrName2) then
+        begin
+          EmitRawAlloc(Node, Result);
+          Exit;
+        end;
+        if (UpperCase(ArrName) = 'DEALLOCATE') and (FProgram.FindArray(ArrName) < 0) and
+           (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          ProcessExpression(Node.GetChild(1).GetChild(0), Left);
+          EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), EnsureIntRegister(Left), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
         // User-defined FUNCTION (M2): "name(args)" parses as array access, but if the name
         // is a declared FUNCTION it is a call. Stage args, call, read the result slot.
         if FProcedureNames.IndexOf(UpperCase(ArrName)) >= 0 then
@@ -3027,6 +3072,25 @@ begin
         if FModernMode and (UpperCase(ArrName) = 'IIF') and (FProgram.FindArray(ArrName) < 0) then
         begin
           EmitIif(Node.GetChild(1), Result);
+          Exit;
+        end;
+
+        // FreeBASIC RAW pointer indexing: "p[i]" where p is an Allocate'd raw pointer. The byte address
+        // is p + i*SizeOf(pointee); load SizeOf(pointee) bytes from the raw heap with the pointee's type.
+        if (FProgram.FindArray(ArrName) < 0) and IsRawPtr(ArrName) and
+           (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
+        begin
+          Left := EmitPointerIndexAddress(ArrName, Node.GetChild(1));   // raw-scaled (see helper)
+          if PointeeBankOf(ArrName) = srtFloat then
+          begin
+            Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+            EmitInstruction(ssaRawLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOf(ArrName)));
+          end
+          else
+          begin
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaRawLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOf(ArrName)));
+          end;
           Exit;
         end;
 
@@ -3237,7 +3301,7 @@ end;
 procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
 var
   VarNode, ExprNode, SharedAssign: TASTNode;
-  VarName, LhsRecType, RhsRecType: string;
+  VarName, LhsRecType, RhsRecType, AllocFuncU: string;
   ExprValue, VarReg, SrcRecHandle: TSSAValue;
   CopyOp: TSSAOpCode;
   DerefBank: TSSARegisterType;   // FreeBASIC "*p = expr": bank of the pointee
@@ -3251,6 +3315,26 @@ begin
   if VarNode.NodeType = antMemberAccess then
   begin
     ProcessMemberStore(VarNode, ExprNode);
+    Exit;
+  end;
+
+  // FreeBASIC RAW pointer-deref store: "*p = expr" where p is Allocate'd → store SizeOf(T) bytes to the
+  // raw heap at p's byte offset.
+  if (VarNode.NodeType = antDeref) and (VarNode.GetChild(0).NodeType = antIdentifier) and
+     IsRawPtr(VarToStr(VarNode.GetChild(0).Value)) then
+  begin
+    VarReg := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(VarNode.GetChild(0).Value))));
+    ProcessExpression(ExprNode, ExprValue);
+    if PointeeBankOf(VarToStr(VarNode.GetChild(0).Value)) = srtFloat then
+    begin
+      ExprValue := EnsureFloatRegister(ExprValue);
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(VarToStr(VarNode.GetChild(0).Value))));
+    end
+    else
+    begin
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(VarToStr(VarNode.GetChild(0).Value))));
+    end;
     Exit;
   end;
 
@@ -3309,6 +3393,30 @@ begin
     else
       ExprValue := EnsureIntRegister(ExprValue);
       EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+    end;
+    Exit;
+  end;
+
+  // FreeBASIC RAW pointer indexing as an lvalue: "p[i] = expr" where p is Allocate'd. Store SizeOf(T)
+  // bytes at p + i*SizeOf(T) into the raw heap.
+  if (VarNode.NodeType = antArrayAccess) and (VarNode.ChildCount >= 2) and
+     (VarNode.GetChild(0).NodeType = antIdentifier) and
+     (FProgram.FindArray(VarToStr(VarNode.GetChild(0).Value)) < 0) and
+     IsRawPtr(VarToStr(VarNode.GetChild(0).Value)) and
+     (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
+  begin
+    VarName := VarToStr(VarNode.GetChild(0).Value);
+    VarReg := EmitPointerIndexAddress(VarName, VarNode.GetChild(1));
+    ProcessExpression(ExprNode, ExprValue);
+    if PointeeBankOf(VarName) = srtFloat then
+    begin
+      ExprValue := EnsureFloatRegister(ExprValue);
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(VarName)));
+    end
+    else
+    begin
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(VarName)));
     end;
     Exit;
   end;
@@ -3372,6 +3480,15 @@ begin
 
   if VarNode.NodeType <> antIdentifier then Exit;
   VarName := VarToStr(VarNode.Value);
+
+  // FreeBASIC raw heap: "p = Allocate(n)" / "CAllocate(n)" / "Reallocate(q,n)" — allocate/resize a byte
+  // block and store the raw pointer (a RAWPTR_TAG byte offset) into p.
+  if IsAllocCall(ExprNode, AllocFuncU) then
+  begin
+    EmitRawAlloc(ExprNode, ExprValue);
+    EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
 
   // Refinement #2: a builtin SHARED scalar is backed by a 1-element global array — store to element 0 (a
   // live cross-thread write), reusing the array-store lowering. A SHARED UDT scalar is excluded here: its
@@ -11412,6 +11529,95 @@ begin
   if idx >= 0 then Result := TypeNameToBank(FCurrentProcAddrParams.ValueFromIndex[idx], Name);
 end;
 
+function TSSAGenerator.IsRawPtr(const Name: string): Boolean;
+// A pointer variable whose value is a raw byte-heap offset (it was assigned from Allocate/CAllocate/
+// Reallocate). Its deref and arithmetic use the raw heap (SizeOf-scaled), not the managed path.
+begin
+  Result := FRawPtrVars.IndexOf(UpperCase(Name)) >= 0;
+end;
+
+function TSSAGenerator.IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;
+// Recognise ALLOCATE(n) / CALLOCATE(n) / REALLOCATE(p,n) — they parse as an array-access (call) whose
+// name is not a declared array/function. FuncU receives the upper-case function name.
+begin
+  Result := False; FuncU := '';
+  if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) then Exit;
+  if Node.GetChild(0).NodeType <> antIdentifier then Exit;
+  FuncU := UpperCase(VarToStr(Node.GetChild(0).Value));
+  if (FuncU = 'ALLOCATE') or (FuncU = 'CALLOCATE') or (FuncU = 'REALLOCATE') then
+    Result := FProgram.FindArray(FuncU) < 0;
+end;
+
+function TSSAGenerator.RawTypeCodeOf(const PtrName: string): Integer;
+// Raw element type code for *p / p[i], from the pointer's declared pointee type.
+var
+  T: string;
+begin
+  T := UpperCase(FPointerVars.Values[UpperCase(PtrName)]);
+  if (T = 'BYTE') or (T = 'UBYTE') then Result := RTC_I8
+  else if (T = 'SHORT') or (T = 'USHORT') then Result := RTC_I16
+  else if (T = 'LONG') or (T = 'ULONG') then Result := RTC_I32
+  else if T = 'SINGLE' then Result := RTC_SINGLE
+  else if T = 'DOUBLE' then Result := RTC_DOUBLE
+  else Result := RTC_I64;   // INTEGER/LONGINT/UINTEGER/ULONGINT (our INTEGER is 64-bit)
+end;
+
+function TSSAGenerator.RawElemSizeOf(const PtrName: string): Int64;
+// SizeOf(pointee) in bytes — scales raw pointer arithmetic and p[i] indexing.
+begin
+  case RawTypeCodeOf(PtrName) of
+    RTC_I8: Result := 1;
+    RTC_I16: Result := 2;
+    RTC_I32, RTC_SINGLE: Result := 4;
+  else
+    Result := 8;   // I64 / DOUBLE
+  end;
+end;
+
+procedure TSSAGenerator.EmitRawAlloc(CallNode: TASTNode; out Result: TSSAValue);
+// Lower ALLOCATE(n)/CALLOCATE(n) → bcRawAlloc(n bytes); REALLOCATE(p,n) → bcRawRealloc(p, n bytes).
+// The byte count is taken verbatim (FreeBASIC Allocate is byte-granular; SizeOf supplies the math).
+var
+  FuncU: string;
+  CountV, OldV: TSSAValue;
+  ArgsNode: TASTNode;
+begin
+  IsAllocCall(CallNode, FuncU);
+  ArgsNode := CallNode.GetChild(1);
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if FuncU = 'REALLOCATE' then
+  begin
+    ProcessExpression(ArgsNode.GetChild(0), OldV);   OldV := EnsureIntRegister(OldV);
+    ProcessExpression(ArgsNode.GetChild(1), CountV); CountV := EnsureIntRegister(CountV);
+    EmitInstruction(ssaRawRealloc, Result, OldV, CountV, MakeSSAValue(svkNone));
+  end
+  else
+  begin
+    ProcessExpression(ArgsNode.GetChild(0), CountV); CountV := EnsureIntRegister(CountV);
+    EmitInstruction(ssaRawAlloc, Result, CountV, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+procedure TSSAGenerator.CollectRawPtrVars(Node: TASTNode);
+// Pre-scan: a pointer variable assigned from ALLOCATE/CALLOCATE/REALLOCATE anywhere is a raw pointer
+// for its whole scope (so deref/arithmetic pick the raw heap regardless of statement order).
+var
+  i: Integer;
+  Lhs: TASTNode;
+  FuncU: string;
+begin
+  if Node = nil then Exit;
+  if (Node.NodeType = antAssignment) and (Node.ChildCount >= 2) then
+  begin
+    Lhs := Node.GetChild(0);
+    if (Lhs.NodeType = antIdentifier) and IsAllocCall(Node.GetChild(1), FuncU) then
+      if FRawPtrVars.IndexOf(UpperCase(VarToStr(Lhs.Value))) < 0 then
+        FRawPtrVars.Add(UpperCase(VarToStr(Lhs.Value)));
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectRawPtrVars(Node.GetChild(i));
+end;
+
 function TSSAGenerator.IsAddrLocal(const Name: string): Boolean;
 // An @-taken variable declared inside the CURRENT SUB/FUNCTION: backed by a per-frame 1-field record so
 // its address is distinct per recursion level. FAddrLocalVars is rebuilt per procedure (populated by
@@ -11677,14 +11883,23 @@ begin
 end;
 
 function TSSAGenerator.EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue;
-// p[i] (FreeBASIC pointer indexing) ≡ *(p + i): returns the address register p + i. p holds a packed
-// pointer value; integer addition advances it by i elements (the low bits are the element offset).
+// p[i] (FreeBASIC pointer indexing) ≡ *(p + i): returns the address register p + i. For a MANAGED
+// pointer the low bits are the element offset, so adding i advances one element. For a RAW (Allocate'd)
+// pointer the address is a byte offset, so the index is scaled by SizeOf(pointee) — FreeBASIC semantics.
 var
-  PtrReg, IdxVal: TSSAValue;
+  PtrReg, IdxVal, SzVal, ScaledIdx: TSSAValue;
 begin
   PtrReg := EnsureIntRegister(GetOrAllocateVariable(PtrName));
   ProcessExpression(IndicesNode.GetChild(0), IdxVal);
   IdxVal := EnsureIntRegister(IdxVal);
+  if IsRawPtr(PtrName) and (RawElemSizeOf(PtrName) > 1) then
+  begin
+    SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, SzVal, MakeSSAConstInt(RawElemSizeOf(PtrName)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    ScaledIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, ScaledIdx, IdxVal, SzVal, MakeSSAValue(svkNone));
+    IdxVal := ScaledIdx;
+  end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaAddInt, Result, PtrReg, IdxVal, MakeSSAValue(svkNone));
 end;
@@ -12324,10 +12539,18 @@ var
   ArgList: TASTNode;
   ParentType: string;
   OwnerUDT: Integer;
+  PtrVal: TSSAValue;
 begin
   ArgList := nil;
   if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antArgumentList) then
     ArgList := Node.GetChild(0);
+  // FreeBASIC "Deallocate(p)": free the raw byte block p points at. (Not a declared SUB; intercepted.)
+  if (UpperCase(VarToStr(Node.Value)) = 'DEALLOCATE') and Assigned(ArgList) and (ArgList.ChildCount >= 1) then
+  begin
+    ProcessExpression(ArgList.GetChild(0), PtrVal);
+    EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), EnsureIntRegister(PtrVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
   // M4.4f: BASE[(args)] inside a constructor body calls the owner type's parent constructor on THIS.
   // It is normally HOISTED into the prologue (base-first) by LowerDeferredProcedures, which marks the
   // node 'HOISTED' — so here we just skip it. (The fallback path below covers any unhoisted BASE,
@@ -13168,6 +13391,7 @@ begin
   FSharedScalarArr.Clear;
   FPointerVars.Clear;
   FAddrLocalVars.Clear;
+  FRawPtrVars.Clear;
   FByrefRetFuncs.Clear;
   FVarWidthCode.Clear;
   FVarPrintKind.Clear;
@@ -13176,6 +13400,7 @@ begin
   // with a 1-element global array (a stable address); also records pointee types in FPointerVars.
   CollectAddressTakenVars(AST);
   CollectSharedVars(AST);
+  CollectRawPtrVars(AST);   // FreeBASIC raw pointers: vars assigned from Allocate/CAllocate/Reallocate
 
   // M8: reset block-scope state (block-scoped record reclamation; the scope stack itself was reset above).
   FBlockHandledVars.Clear;

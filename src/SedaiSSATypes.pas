@@ -53,6 +53,16 @@ const
   RECPTR_SLOT_MASK = (Int64(1) shl RECPTR_SLOT_BITS) - 1;
   RECPTR_INDEX_MASK = (Int64(1) shl 46) - 1;
 
+  { FreeBASIC raw memory (Allocate/CAST/...). A raw pointer is a byte OFFSET into the VM-internal byte
+    heap (FRawHeap), tagged with RAWPTR_TAG (bit 62) so it is distinct from a managed FArrays pointer
+    (bit 63=0, bit 62=0) and a record-field pointer (bit 63=1). Deref reads/writes SizeOf(T) bytes at the
+    offset; pointer arithmetic scales by SizeOf(pointee). 0 = NULL (untagged). The raw type code below
+    selects the element width/bank at load/store. }
+  RAWPTR_TAG = Int64(1) shl 62;
+  RAWPTR_OFS_MASK = RAWPTR_TAG - 1;     // byte offset occupies the low 62 bits
+  // Raw element type codes (Immediate of bcRaw{Load,Store}): width + bank.
+  RTC_I8 = 1; RTC_I16 = 2; RTC_I32 = 3; RTC_I64 = 4; RTC_SINGLE = 5; RTC_DOUBLE = 6;
+
 var
   // Runtime master switch for the SSA optimization passes (the `--no-opt` CLI flag clears it). The
   // structural passes (SSA construction, dominator tree, PHI elimination) ignore it and always run;
@@ -151,6 +161,9 @@ type
     ssaRefLoadInt, ssaRefLoadFloat, ssaRefLoadString,
     ssaRefStoreInt, ssaRefStoreFloat, ssaRefStoreString,
     ssaRefAddrField,  // @obj.field: pack a record-field pointer (Dest=addr, Src1=handle, Immediate=slot)
+    // FreeBASIC raw byte heap (Allocate family).
+    ssaRawAlloc, ssaRawFree, ssaRawRealloc,
+    ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat,
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
     ssaPrintInt, ssaPrintIntLn,
     ssaPrintBool, ssaPrintUInt,   // B1.5 phase C: BOOLEAN true/false, unsigned-64 print

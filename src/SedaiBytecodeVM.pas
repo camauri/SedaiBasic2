@@ -129,6 +129,17 @@ type
     FSharedRecFreeList: array of Integer;  // DELETE: indices of freed shared records, reused by NEW
     FSharedRecFreeCount: Integer;
     FSharedRecLock: TRTLCriticalSection;
+    // FreeBASIC raw memory (Allocate/Deallocate/...): a VM-internal byte heap. A raw pointer is a byte
+    // OFFSET into FRawHeap (tagged with RAWPTR_TAG so it is distinct from managed FArrays/record
+    // pointers). Each block carries an 8-byte size header just below the returned offset; freed blocks
+    // go on a first-fit free list. VM-managed (not OS addresses) → memory-safe and portable. Guarded by
+    // FRawHeapLock for cross-thread Allocate/Free.
+    FRawHeap: array of Byte;
+    FRawHeapTop: PtrUInt;                       // bump pointer (next free byte)
+    FRawFreeOfs: array of PtrUInt;              // free-list block data offsets
+    FRawFreeSz: array of PtrUInt;               // matching block payload sizes
+    FRawFreeCount: Integer;
+    FRawHeapLock: TRTLCriticalSection;
     FProgram: TBytecodeProgram;
     FOutputDevice: IOutputDevice;
     FInputDevice: IInputDevice;
@@ -252,6 +263,14 @@ type
     // M5.2c: allocate in the shared region (cross-thread); ResolveRec routes a handle to its record.
     function AllocSharedRecord(IntC, FloatC, StrC, TypeId: Integer): Int64;
     procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
+    // FreeBASIC raw byte heap (Allocate family). All return/take RAWPTR_TAG-tagged byte offsets.
+    function RawAlloc(ByteCount: PtrUInt): Int64;
+    procedure RawFree(RawPtr: Int64);
+    function RawRealloc(RawPtr: Int64; ByteCount: PtrUInt): Int64;
+    function RawLoadInt(RawPtr: Int64; TypeCode: Integer): Int64;
+    function RawLoadFloat(RawPtr: Int64; TypeCode: Integer): Double;
+    procedure RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
+    procedure RawStoreFloat(RawPtr: Int64; TypeCode: Integer; Value: Double);
     function ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordStorage; inline;
     function RecPtrTarget(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage; inline;  // decode @obj.field pointer
     procedure CleanupSharedRecords;   // free the shared region (destructor)
@@ -512,6 +531,9 @@ begin
   SetLength(FSharedRecords, 0);
   FSharedRecordCount := 0;
   InitCriticalSection(FSharedRecLock);
+  InitCriticalSection(FRawHeapLock);
+  FRawHeapTop := 0;
+  FRawFreeCount := 0;
   FProgram := nil;
   FCtx.PC := 0;
   FCtx.Running := False;
@@ -658,6 +680,8 @@ begin
   // M5.2c: free the shared UDT-record region.
   CleanupSharedRecords;
   DoneCriticalSection(FSharedRecLock);
+  SetLength(FRawHeap, 0);
+  DoneCriticalSection(FRawHeapLock);
   FCtx.Free;
   FDrainCtx.Free;
   FDrawQueue.Free;
@@ -1451,6 +1475,139 @@ begin
   FSharedRecordCount := 0;
   SetLength(FSharedRecFreeList, 0);
   FSharedRecFreeCount := 0;
+end;
+
+// ===== FreeBASIC raw byte heap =====
+// Block layout: [8-byte payload-size header][payload...]. The raw pointer (RAWPTR_TAG | dataOffset)
+// points at the payload; the header just below it lets Free/Realloc recover the size. dataOffset is
+// always >= 8, so a valid raw pointer is never 0 (NULL). Allocations are 8-byte aligned for safe typed
+// access. A first-fit free list recycles exact-or-larger freed blocks; otherwise the bump pointer grows.
+
+function TBytecodeVM.RawAlloc(ByteCount: PtrUInt): Int64;
+var
+  i, best: Integer;
+  dataOfs, need: PtrUInt;
+begin
+  if ByteCount = 0 then ByteCount := 1;
+  ByteCount := (ByteCount + 7) and not PtrUInt(7);   // round payload up to 8
+  EnterCriticalSection(FRawHeapLock);
+  try
+    // first-fit reuse
+    best := -1;
+    for i := 0 to FRawFreeCount - 1 do
+      if FRawFreeSz[i] >= ByteCount then begin best := i; Break; end;
+    if best >= 0 then
+    begin
+      dataOfs := FRawFreeOfs[best];
+      // remove from the free list (swap with last)
+      FRawFreeOfs[best] := FRawFreeOfs[FRawFreeCount - 1];
+      FRawFreeSz[best] := FRawFreeSz[FRawFreeCount - 1];
+      Dec(FRawFreeCount);
+      // keep the recorded size (block stays its original size); header already holds it
+    end
+    else
+    begin
+      if FRawHeapTop = 0 then FRawHeapTop := 8;        // reserve offset 0 region (NULL)
+      need := FRawHeapTop + 8 + ByteCount;
+      if need > PtrUInt(Length(FRawHeap)) then
+        SetLength(FRawHeap, (need + need div 2) + 4096);
+      dataOfs := FRawHeapTop + 8;
+      PtrUInt((@FRawHeap[dataOfs - 8])^) := ByteCount; // size header
+      FRawHeapTop := dataOfs + ByteCount;
+    end;
+    FillChar(FRawHeap[dataOfs], PtrUInt((@FRawHeap[dataOfs - 8])^), 0);  // zero the payload
+  finally
+    LeaveCriticalSection(FRawHeapLock);
+  end;
+  Result := RAWPTR_TAG or Int64(dataOfs);
+end;
+
+procedure TBytecodeVM.RawFree(RawPtr: Int64);
+var
+  dataOfs, sz: PtrUInt;
+begin
+  if (RawPtr and RAWPTR_TAG) = 0 then Exit;            // not a raw pointer / NULL
+  dataOfs := RawPtr and RAWPTR_OFS_MASK;
+  if (dataOfs < 8) or (dataOfs > PtrUInt(Length(FRawHeap))) then Exit;
+  EnterCriticalSection(FRawHeapLock);
+  try
+    sz := PtrUInt((@FRawHeap[dataOfs - 8])^);
+    if FRawFreeCount >= Length(FRawFreeOfs) then
+    begin
+      SetLength(FRawFreeOfs, (FRawFreeCount + 1) * 2);
+      SetLength(FRawFreeSz, (FRawFreeCount + 1) * 2);
+    end;
+    FRawFreeOfs[FRawFreeCount] := dataOfs;
+    FRawFreeSz[FRawFreeCount] := sz;
+    Inc(FRawFreeCount);
+  finally
+    LeaveCriticalSection(FRawHeapLock);
+  end;
+end;
+
+function TBytecodeVM.RawRealloc(RawPtr: Int64; ByteCount: PtrUInt): Int64;
+var
+  oldOfs, oldSz, newOfs, copySz: PtrUInt;
+begin
+  if (RawPtr and RAWPTR_TAG) = 0 then Exit(RawAlloc(ByteCount));   // realloc(NULL,n) == alloc
+  oldOfs := RawPtr and RAWPTR_OFS_MASK;
+  oldSz := PtrUInt((@FRawHeap[oldOfs - 8])^);
+  Result := RawAlloc(ByteCount);
+  newOfs := Result and RAWPTR_OFS_MASK;
+  copySz := oldSz;
+  if PtrUInt((@FRawHeap[newOfs - 8])^) < copySz then copySz := PtrUInt((@FRawHeap[newOfs - 8])^);
+  Move(FRawHeap[oldOfs], FRawHeap[newOfs], copySz);
+  RawFree(RawPtr);
+end;
+
+function TBytecodeVM.RawLoadInt(RawPtr: Int64; TypeCode: Integer): Int64;
+var
+  ofs: PtrUInt;
+begin
+  ofs := RawPtr and RAWPTR_OFS_MASK;
+  if (RawPtr and RAWPTR_TAG) = 0 then raise ERangeError.Create('Null or invalid raw pointer dereference');
+  case TypeCode of
+    RTC_I8:  Result := PShortInt(@FRawHeap[ofs])^;
+    RTC_I16: Result := PSmallInt(@FRawHeap[ofs])^;
+    RTC_I32: Result := PLongInt(@FRawHeap[ofs])^;
+  else
+    Result := PInt64(@FRawHeap[ofs])^;
+  end;
+end;
+
+function TBytecodeVM.RawLoadFloat(RawPtr: Int64; TypeCode: Integer): Double;
+var
+  ofs: PtrUInt;
+begin
+  ofs := RawPtr and RAWPTR_OFS_MASK;
+  if (RawPtr and RAWPTR_TAG) = 0 then raise ERangeError.Create('Null or invalid raw pointer dereference');
+  if TypeCode = RTC_SINGLE then Result := PSingle(@FRawHeap[ofs])^
+  else Result := PDouble(@FRawHeap[ofs])^;
+end;
+
+procedure TBytecodeVM.RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
+var
+  ofs: PtrUInt;
+begin
+  ofs := RawPtr and RAWPTR_OFS_MASK;
+  if (RawPtr and RAWPTR_TAG) = 0 then raise ERangeError.Create('Null or invalid raw pointer dereference');
+  case TypeCode of
+    RTC_I8:  PShortInt(@FRawHeap[ofs])^ := ShortInt(Value);
+    RTC_I16: PSmallInt(@FRawHeap[ofs])^ := SmallInt(Value);
+    RTC_I32: PLongInt(@FRawHeap[ofs])^ := LongInt(Value);
+  else
+    PInt64(@FRawHeap[ofs])^ := Value;
+  end;
+end;
+
+procedure TBytecodeVM.RawStoreFloat(RawPtr: Int64; TypeCode: Integer; Value: Double);
+var
+  ofs: PtrUInt;
+begin
+  ofs := RawPtr and RAWPTR_OFS_MASK;
+  if (RawPtr and RAWPTR_TAG) = 0 then raise ERangeError.Create('Null or invalid raw pointer dereference');
+  if TypeCode = RTC_SINGLE then PSingle(@FRawHeap[ofs])^ := Value
+  else PDouble(@FRawHeap[ofs])^ := Value;
 end;
 
 procedure TBytecodeVM.RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);
@@ -2388,6 +2545,35 @@ begin
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;        // packed addr
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;        // record handle
+        end;
+        // Raw heap (FreeBASIC Allocate family): Src1 is always int (count/pointer).
+        bcRawAlloc, bcRawRealloc:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;        // raw pointer
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;        // count / old pointer
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;        // realloc count
+        end;
+        bcRawFree:
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        bcRawLoadInt:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
+        bcRawLoadFloat:
+        begin
+          if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
+        bcRawStoreInt:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+        end;
+        bcRawStoreFloat:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+          if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;
         end;
 
         // ArrayLoad: Dest is result, Src2 is index (int)
@@ -4516,6 +4702,14 @@ begin
           (((PtrAddr and SHARED_REC_MASK) and RECPTR_INDEX_MASK) shl RECPTR_SLOT_BITS) or
           (Int64(Instr.Immediate) and RECPTR_SLOT_MASK);
       end;
+    // FreeBASIC raw byte heap (Allocate family).
+    20: Ctx.IntRegs[Instr.Dest] := RawAlloc(Ctx.IntRegs[Instr.Src1]);                              // bcRawAlloc
+    21: RawFree(Ctx.IntRegs[Instr.Src1]);                                                          // bcRawFree
+    22: Ctx.IntRegs[Instr.Dest] := RawRealloc(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);   // bcRawRealloc
+    23: Ctx.IntRegs[Instr.Dest] := RawLoadInt(Ctx.IntRegs[Instr.Src1], Instr.Immediate);           // bcRawLoadInt
+    24: Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(Ctx.IntRegs[Instr.Src1], Instr.Immediate);       // bcRawLoadFloat
+    25: RawStoreInt(Ctx.IntRegs[Instr.Src1], Instr.Immediate, Ctx.IntRegs[Instr.Src2]);            // bcRawStoreInt
+    26: RawStoreFloat(Ctx.IntRegs[Instr.Src1], Instr.Immediate, Ctx.FloatRegs[Instr.Src2]);        // bcRawStoreFloat
   else
     raise Exception.CreateFmt('Unknown array opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
