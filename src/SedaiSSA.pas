@@ -259,6 +259,7 @@ type
     function IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;           // Node = ALLOCATE/CALLOCATE/REALLOCATE(...)?
     function RawTypeCodeOf(const PtrName: string): Integer;                      // raw element type code for *p / p[i]
     function RawElemSizeOf(const PtrName: string): Int64;                        // SizeOf(pointee) in bytes
+    function TypeSizeBytes(const TypeName: string): Int64;                       // SizeOf(T) in bytes (FB sizes)
     procedure EmitRawAlloc(CallNode: TASTNode; out Result: TSSAValue);           // ALLOCATE/CALLOCATE/REALLOCATE → raw ptr
     function IsAddrLocal(const Name: string): Boolean;                          // @-taken LOCAL (per-frame record-backed)?
     function AddrLocalBank(const Name: string): TSSARegisterType;               // bank of an @-taken local
@@ -3037,6 +3038,22 @@ begin
           EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), EnsureIntRegister(Left), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC SIZEOF(T) / LEN(T) — compile-time byte size of a type. The argument is a type name
+        // (identifier); a pointer variable argument resolves to pointer size (8). Used for "Allocate(n *
+        // SizeOf(Integer))". (Only the single-identifier form; "SizeOf(T PTR)" needs type-arg parsing.)
+        if (UpperCase(ArrName) = 'SIZEOF') and (FProgram.FindArray(ArrName) < 0) and
+           (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount = 1) and
+           (Node.GetChild(1).GetChild(0).NodeType = antIdentifier) then
+        begin
+          ArrName2 := UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value));
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          if (FPointerVars.IndexOfName(ArrName2) >= 0) or IsRawPtr(ArrName2) then
+            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+          else
+            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(ArrName2)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
         end;
 
@@ -11571,6 +11588,39 @@ begin
     RTC_I32, RTC_SINGLE: Result := 4;
   else
     Result := 8;   // I64 / DOUBLE
+  end;
+end;
+
+function TSSAGenerator.TypeSizeBytes(const TypeName: string): Int64;
+// SizeOf(T) in bytes for the FreeBASIC SizeOf() operator. Scalars use FB widths (our INTEGER is 64-bit);
+// a "... PTR" or unknown type is pointer-sized (8); a UDT sums its fields' sizes.
+var
+  T: string;
+  u, j: Integer;
+begin
+  T := UpperCase(Trim(TypeName));
+  if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(8);
+  if (T = 'BYTE') or (T = 'UBYTE') or (T = 'BOOLEAN') then Result := 1
+  else if (T = 'SHORT') or (T = 'USHORT') then Result := 2
+  else if (T = 'LONG') or (T = 'ULONG') then Result := 4
+  else if T = 'SINGLE' then Result := 4
+  else if (T = 'INTEGER') or (T = 'UINTEGER') or (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'DOUBLE') then Result := 8
+  else
+  begin
+    u := FindUDT(T);
+    if u >= 0 then
+    begin
+      Result := 0;
+      for j := 0 to High(FUDTs[u].Fields) do
+        case FUDTs[u].Fields[j].Bank of
+          srtFloat: Result := Result + 8;
+          srtString: Result := Result + 8;   // string field = handle/pointer-sized in our model
+        else Result := Result + 8;
+        end;
+      if Result = 0 then Result := 8;
+    end
+    else
+      Result := 8;   // unknown / pointer-sized default
   end;
 end;
 
