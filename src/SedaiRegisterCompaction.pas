@@ -209,6 +209,7 @@ begin
     bcNarrowInt,   // B1.5: integer width narrowing (Dest=int)
     // === GROUP 1: String operations ===
     bcStrLen,      // String length returns int
+    bcStrLenW,     // LEN(wstring) returns int codepoint count
     bcStrAsc,      // ASC(str) returns int ASCII code
     bcStrInstr,    // INSTR(haystack, needle) returns int position
     bcStrInstrRev, // INSTRREV(str, sub) returns int position
@@ -615,7 +616,7 @@ begin
     // String comparison (first operand)
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
     // === GROUP 1: String operations ===
-    bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrLen, bcStrAsc,
+    bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrLen, bcStrLenW, bcStrAsc,
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string
     bcStrVal,    // VAL(str) - reads string, produces float
     bcStrValInt, // VALINT/VALLNG/VALUINT(str) - reads string, produces int

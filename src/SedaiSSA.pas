@@ -145,6 +145,9 @@ type
     FRawPtrVars: TStringList;            // FreeBASIC raw pointers: var (UPPER) ever assigned from Allocate/CAllocate/
                                          // Reallocate. Its value is a RAWPTR_TAG byte offset → deref/arithmetic use the
                                          // raw byte heap (SizeOf-scaled), not the managed FArrays/record path.
+    FWStringVars: TStringList;           // FreeBASIC WSTRING vars (UPPER): share the srtString bank but hold UTF-8 bytes
+                                         // whose LEN/MID/LEFT/RIGHT count/index by Unicode codepoint (not byte). Assignment/
+                                         // concat/copy/PRINT are unchanged (UTF-8 in, UTF-8 out); only width-aware ops differ.
     FAddrLocalVars: TStringList;         // @-taken LOCALS (in a SUB/FUNCTION): name (UPPER) -> type name. Backed by
                                          // a per-frame 1-field record (handle in hidden "<name>$REC"), so the address
                                          // is distinct per recursion level (a module-level @-taken var stays SHARED-backed).
@@ -257,6 +260,9 @@ type
     function AddrParamBank(const Name: string): TSSARegisterType;               // pointee bank of an address param
     function IsRawPtr(const Name: string): Boolean;                             // raw (Allocate-backed) pointer var?
     procedure CollectRawPtrVars(Node: TASTNode);                                // pre-scan: mark ptrs assigned from Allocate*
+    procedure CollectWStringVars(Node: TASTNode);                               // pre-scan: mark DIM ... AS WSTRING vars
+    function IsWStringVar(const Name: string): Boolean;                         // declared WSTRING var (UTF-8, codepoint LEN)?
+    function IsWStringExpr(Node: TASTNode): Boolean;                            // expression that yields a WSTRING value?
     function IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;           // Node = ALLOCATE/CALLOCATE/REALLOCATE(...)?
     function RawPtrExprName(Node: TASTNode): string;                            // raw pointer var of a raw ptr expr (p, p±n), else ''
     procedure EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);           // p±n raw pointer arithmetic (SizeOf-scaled)
@@ -513,6 +519,8 @@ begin
   FPointerVars := TStringList.Create;
   FAddrLocalVars := TStringList.Create;
   FRawPtrVars := TStringList.Create;
+  FWStringVars := TStringList.Create;
+  FWStringVars.CaseSensitive := False;
   FByrefRetFuncs := TStringList.Create;
   FSharedScalarArr.CaseSensitive := False;
   FVarWidthCode := TStringList.Create;
@@ -554,6 +562,7 @@ begin
   FPointerVars.Free;
   FAddrLocalVars.Free;
   FRawPtrVars.Free;
+  FWStringVars.Free;
   FByrefRetFuncs.Free;
   FVarWidthCode.Free;
   FVarPrintKind.Free;
@@ -894,6 +903,7 @@ var
   FuncName, VarName: string;
   FuncRetType: TSSARegisterType;  // M2: user FUNCTION return type
   MethodObjNode: TASTNode;        // M4.1: object of a method call
+  ArgNode: TASTNode;              // WSTRING: the source AST node of a string-function argument (width detect)
   MethodOwnerType, MethodLabelName: string;  // M4.1
   ArgValue, ArgReg: TSSAValue;
   TempReg, IntReg: Integer;
@@ -2112,17 +2122,27 @@ begin
         // === STRING FUNCTIONS ===
         else if (FuncName = 'LEN') then
         begin
-          // LEN(str) - returns integer length
+          // LEN(str) - returns integer length. For a WSTRING argument the result is the Unicode codepoint
+          // count (ssaStrLenW) rather than the byte length (ssaStrLen); the UTF-8 storage is the same.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+            ArgNode := ArgListNode.GetChild(0);
+          end
           else if ArgListNode <> nil then
-            ProcessExpression(ArgListNode, ArgValue)
+          begin
+            ProcessExpression(ArgListNode, ArgValue);
+            ArgNode := ArgListNode;
+          end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
 
           ArgReg := EnsureStringRegister(ArgValue);
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
-          EmitInstruction(ssaStrLen, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          if IsWStringExpr(ArgNode) then
+            EmitInstruction(ssaStrLenW, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+          else
+            EmitInstruction(ssaStrLen, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else if (FuncName = 'ASC') then
         begin
@@ -11776,6 +11796,65 @@ begin
     CollectRawPtrVars(Node.GetChild(i));
 end;
 
+procedure TSSAGenerator.CollectWStringVars(Node: TASTNode);
+// Pre-scan: record every variable, parameter, UDT field or FUNCTION result declared AS WSTRING. These
+// share the srtString bank (UTF-8 byte storage) but their LEN/MID/LEFT/RIGHT count/index by Unicode
+// codepoint. Declarations surface as antArrayDecl(name, "WSTRING") (DIM / TYPE field) or as a typed
+// parameter / return whose type identifier is "WSTRING".
+var
+  i: Integer;
+  NameU, TypeU: string;
+
+  procedure MarkW(const N: string);
+  begin
+    if (N <> '') and (FWStringVars.IndexOf(UpperCase(N)) < 0) then
+      FWStringVars.Add(UpperCase(N));
+  end;
+
+begin
+  if Node = nil then Exit;
+  // DIM v AS WSTRING [* n] / TYPE field AS WSTRING : antArrayDecl(child0=name ident, child1=type ident).
+  if (Node.NodeType = antArrayDecl) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) and (Node.GetChild(1).NodeType = antIdentifier) then
+  begin
+    TypeU := UpperCase(VarToStr(Node.GetChild(1).Value));
+    if TypeU = 'WSTRING' then
+      MarkW(VarToStr(Node.GetChild(0).Value));
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectWStringVars(Node.GetChild(i));
+end;
+
+function TSSAGenerator.IsWStringVar(const Name: string): Boolean;
+begin
+  Result := FWStringVars.IndexOf(UpperCase(Name)) >= 0;
+end;
+
+function TSSAGenerator.IsWStringExpr(Node: TASTNode): Boolean;
+// True if the expression yields a WSTRING value: a WSTRING variable, a WSTR(...) conversion, a
+// parenthesised WSTRING, or a string concatenation/expression with a WSTRING operand (the result of
+// '&' on wide data is still wide). Conservative: anything else is treated as a plain (byte) STRING.
+begin
+  Result := False;
+  if Node = nil then Exit;
+  case Node.NodeType of
+    antIdentifier:
+      Result := IsWStringVar(VarToStr(Node.Value));
+    antParentheses:
+      Result := (Node.ChildCount >= 1) and IsWStringExpr(Node.GetChild(0));
+    antBinaryOp:
+      // Concatenation (or any binary string op): wide if either operand is wide.
+      Result := (Node.ChildCount >= 2) and
+                (IsWStringExpr(Node.GetChild(0)) or IsWStringExpr(Node.GetChild(1)));
+    antArrayAccess, antFunctionCall:
+      // WSTR(...) conversion is the canonical wide producer; the call name is child0/Value.
+      if Node.ChildCount >= 1 then
+        Result := UpperCase(VarToStr(Node.GetChild(0).Value)) = 'WSTR'
+      else
+        Result := UpperCase(VarToStr(Node.Value)) = 'WSTR';
+  end;
+end;
+
 function TSSAGenerator.IsAddrLocal(const Name: string): Boolean;
 // An @-taken variable declared inside the CURRENT SUB/FUNCTION: backed by a per-frame 1-field record so
 // its address is distinct per recursion level. FAddrLocalVars is rebuilt per procedure (populated by
@@ -13550,6 +13629,7 @@ begin
   FPointerVars.Clear;
   FAddrLocalVars.Clear;
   FRawPtrVars.Clear;
+  FWStringVars.Clear;
   FByrefRetFuncs.Clear;
   FVarWidthCode.Clear;
   FVarPrintKind.Clear;
@@ -13567,6 +13647,9 @@ begin
     FRawCollectChanged := False;
     CollectRawPtrVars(AST);
   until not FRawCollectChanged;
+  // FreeBASIC WSTRING: record vars/fields declared AS WSTRING so width-aware ops (LEN/MID/...) count by
+  // Unicode codepoint. Same srtString bank (UTF-8 storage) → no new register bank, existing ops intact.
+  CollectWStringVars(AST);
 
   // M8: reset block-scope state (block-scoped record reclamation; the scope stack itself was reset above).
   FBlockHandledVars.Clear;

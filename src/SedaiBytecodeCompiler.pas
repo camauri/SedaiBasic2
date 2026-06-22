@@ -168,6 +168,7 @@ begin
     // String functions
     ssaStrConcat: Result := bcStrConcat;
     ssaStrLen: Result := bcStrLen;
+    ssaStrLenW: Result := bcStrLenW;
     ssaStrLeft: Result := bcStrLeft;
     ssaStrRight: Result := bcStrRight;
     ssaStrMid: Result := bcStrMid;

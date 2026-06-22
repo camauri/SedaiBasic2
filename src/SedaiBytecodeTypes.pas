@@ -327,6 +327,8 @@ const
   bcStrString       = bcGroupString + 22;  // STRING(n,ch) - n copies of a char (Dest=string, Src1=int count, Src2=int charcode)
   bcStrTrimSet      = bcGroupString + 23;  // LTRIM/RTRIM/TRIM(s, set) - trim a substring from the ends (Dest/Src1/Src2=string, Immediate=mode 0=both/1=left/2=right [|4=Any char-set])
   bcStrInstrRevAny  = bcGroupString + 24;  // INSTRREV(str, Any set) - last position of any char in set (Dest=int, Src1/Src2=string)
+  // FreeBASIC WSTRING (UTF-8 storage, codepoint-indexed). Same string bank; only width-aware ops differ.
+  bcStrLenW         = bcGroupString + 25;  // LEN(wstring) - Unicode codepoint count (Dest=int, Src1=string)
 
   // === GROUP 2: MATH FUNCTIONS (0x02xx) ===
   bcMathSin         = bcGroupMath + 0;

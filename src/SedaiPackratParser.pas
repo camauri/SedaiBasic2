@@ -4481,6 +4481,19 @@ begin
       TypeNode := TASTNode.CreateWithValue(antIdentifier, DimTypeName, TypeTok);
       ArrayDecl.AddChild(VarNameNode);
       ArrayDecl.AddChild(TypeNode);          // child[1] is antIdentifier (type) => typed scalar
+      // FreeBASIC fixed-length string: "AS STRING * n" / "AS WSTRING * n" / "AS ZSTRING * n". The
+      // declared capacity is parsed and recorded (attribute 'FIXEDLEN', advisory in v1 — storage is
+      // variable-length). Consume "* <length-expr>" so the declaration parses cleanly.
+      if Context.Check(ttOpMul) then
+      begin
+        Context.Advance;                     // consume '*'
+        InitExpr := FExpressionParser.ParseExpression(precCall);   // length operand (no binary ops)
+        if Assigned(InitExpr) then
+        begin
+          ArrayDecl.Attributes.Values['FIXEDLEN'] := '1';
+          InitExpr.Free;                     // advisory: capacity not stored as a child in v1
+        end;
+      end;
       // Optional initializer after the type. Two cases:
       //   = T(args)   (M4.4c) constructor call on the declared type — consume "= T" and let the
       //               shared arg-parsing block below attach the antArgumentList as child[2].

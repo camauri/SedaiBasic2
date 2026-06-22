@@ -2407,7 +2407,7 @@ begin
         end;
 
         // String Src1 (source) -> int Dest
-        bcStrLen, bcStrAsc, bcStrDec, bcStrValInt:
+        bcStrLen, bcStrLenW, bcStrAsc, bcStrDec, bcStrValInt:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
@@ -4080,6 +4080,15 @@ begin
       Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Src1] + Ctx.StringRegs[Instr.Src2];
     1: // bcStrLen
       Ctx.IntRegs[Instr.Dest] := Length(Ctx.StringRegs[Instr.Src1]);
+    25: // bcStrLenW - LEN(wstring): count Unicode codepoints in the UTF-8 byte storage. A codepoint's
+        // lead byte is any byte that is NOT a UTF-8 continuation byte (10xxxxxx), so count those.
+      begin
+        S := Ctx.StringRegs[Instr.Src1];
+        Count := 0;
+        for Len := 1 to Length(S) do
+          if (Ord(S[Len]) and $C0) <> $80 then Inc(Count);
+        Ctx.IntRegs[Instr.Dest] := Count;
+      end;
     2: // bcStrLeft
       begin
         Len := Ctx.IntRegs[Instr.Src2];

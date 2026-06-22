@@ -368,7 +368,7 @@ begin
       Result := True;
 
     // String operations (pure functions)
-    ssaStrConcat, ssaStrLen, ssaStrLeft, ssaStrRight, ssaStrMid:
+    ssaStrConcat, ssaStrLen, ssaStrLenW, ssaStrLeft, ssaStrRight, ssaStrMid:
       Result := True;
 
     // Math functions (pure functions)
