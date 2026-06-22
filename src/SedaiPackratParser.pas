@@ -893,10 +893,11 @@ begin
   end
   else if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
     ((Context.PeekNext.TokenType = ttDelimParOpen) or
+     (Context.PeekNext.TokenType = ttDelimBrackOpen) or
      (Context.PeekNext.TokenType = ttOpDot)) then
   begin
-    // Array access A(i) or member access rec.field - use the expression parser to build
-    // the full target (antArrayAccess / antMemberAccess); it stops before '=' (lower prec).
+    // Array access A(i), pointer index p[i], or member access rec.field - use the expression parser to
+    // build the full target (antArrayAccess / antMemberAccess); it stops before '=' (lower prec).
     LeftSide := FExpressionParser.ParseExpression(precCall);
     LhsIsExpr := True;
   end

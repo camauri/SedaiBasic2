@@ -36,6 +36,13 @@ const
   MIN_REGISTER_SLOTS = 256;      // Initial allocation size (backward compatible)
   MAX_REGISTER_SLOTS = 65536;    // Maximum registers per type (2^16)
 
+  { FreeBASIC pointer encoding. A pointer value is a packed int: the high bits hold (backingArrayId+1)
+    so 0 stays NULL, the low POINTER_ARRAY_SHIFT bits hold the element offset (in element units). Plain
+    integer arithmetic on the pointer ("p + 1") therefore advances by one array element. Deref decodes
+    arrayId = addr shr POINTER_ARRAY_SHIFT - 1, offset = addr and POINTER_OFFSET_MASK. }
+  POINTER_ARRAY_SHIFT = 32;
+  POINTER_OFFSET_MASK = (Int64(1) shl POINTER_ARRAY_SHIFT) - 1;
+
 var
   // Runtime master switch for the SSA optimization passes (the `--no-opt` CLI flag clears it). The
   // structural passes (SSA construction, dominator tree, PHI elimination) ignore it and always run;

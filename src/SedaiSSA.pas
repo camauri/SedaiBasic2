@@ -240,7 +240,10 @@ type
     procedure CollectDimVarBanks(Node: TASTNode; Dict: TStringList);
     procedure MarkAddressTaken(Node: TASTNode; Dict: TStringList);
     function PointeeBankOf(const PtrName: string): TSSARegisterType;            // bank of *p from p's declared pointee
-    function EmitVarAddress(const Name: string): TSSAValue;                     // address (arrayId+1) of a backed scalar (0=NULL)
+    function DerefOperandBank(Node: TASTNode): TSSARegisterType;                // bank of *<expr> incl. pointer arithmetic (p+n)
+    procedure EmitArrayElementAddress(Node: TASTNode; out Result: TSSAValue);   // @arr(i) → packed element address
+    function EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue; // p[i] → address (p + i)
+    function EmitVarAddress(const Name: string): TSSAValue;                     // packed address of a backed scalar (0=NULL)
     function IsByrefRetFunc(const Name: string): Boolean;                       // FUNCTION declared BYREF AS T?
     function ByrefRetPointeeBank(const Name: string): TSSARegisterType;         // bank of a byref function's pointee
     // FB lexical scope (MODERN only). ScopePushFrame/ScopePopFrame manage FScopeStack; the block
@@ -902,15 +905,12 @@ begin
     begin
       // @name : either the address of a data variable (FreeBASIC pointers) or, when name is a SUB,
       // its entry PC. A data variable that is address-taken was backed by a 1-element global array
-      // (CollectAddressTakenVars); its "address" is (arrayId + 1) so 0 stays a NULL sentinel.
-      if IsSharedScalar(VarToStr(Node.Value)) then
-      begin
-        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-        EmitInstruction(ssaLoadConstInt, Result,
-                        MakeSSAConstInt(PtrInt(FSharedScalarArr.Objects[
-                          FSharedScalarArr.IndexOf(UpperCase(VarToStr(Node.Value)))]) + 1),
-                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      end
+      // (CollectAddressTakenVars); its packed address is (arrayId+1) shl POINTER_ARRAY_SHIFT so 0
+      // stays a NULL sentinel. @arr(i) (an index child is present) addresses an array element.
+      if Node.ChildCount > 0 then
+        EmitArrayElementAddress(Node, Result)
+      else if IsSharedScalar(VarToStr(Node.Value)) then
+        Result := EmitVarAddress(VarToStr(Node.Value))
       else
       begin
         // @subname → the named SUB's entry PC. The PROC_<name> label resolves to a PC at bytecode
@@ -929,10 +929,7 @@ begin
       // declared pointer type (FPointerVars), defaulting to int.
       ProcessExpression(Node.GetChild(0), Left);
       Left := EnsureIntRegister(Left);
-      if Node.GetChild(0).NodeType = antIdentifier then
-        FuncRetType := PointeeBankOf(VarToStr(Node.GetChild(0).Value))
-      else
-        FuncRetType := srtInt;
+      FuncRetType := DerefOperandBank(Node.GetChild(0));
       DestReg := FProgram.AllocRegister(FuncRetType);
       Result := MakeSSARegister(FuncRetType, DestReg);
       case FuncRetType of
@@ -2957,6 +2954,24 @@ begin
           Exit;
         end;
 
+        // FreeBASIC pointer indexing: "p[i]" (also "p(i)") where p is a declared pointer, not an array.
+        // Lower to *(p + i): compute the address then load the pointee with p's declared bank.
+        if (FProgram.FindArray(ArrName) < 0) and (FPointerVars.IndexOfName(UpperCase(ArrName)) >= 0) and
+           (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
+        begin
+          Left := EmitPointerIndexAddress(ArrName, Node.GetChild(1));
+          FuncRetType := PointeeBankOf(ArrName);
+          DestReg := FProgram.AllocRegister(FuncRetType);
+          Result := MakeSSARegister(FuncRetType, DestReg);
+          case FuncRetType of
+            srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          else
+            EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+          Exit;
+        end;
+
         ArrayIdx := FProgram.FindArray(ArrName);
         if ArrayIdx < 0 then
           raise Exception.CreateFmt('Array not declared: %s', [ArrName]);
@@ -3169,10 +3184,7 @@ begin
   begin
     ProcessExpression(VarNode.GetChild(0), VarReg);
     VarReg := EnsureIntRegister(VarReg);
-    if VarNode.GetChild(0).NodeType = antIdentifier then
-      DerefBank := PointeeBankOf(VarToStr(VarNode.GetChild(0).Value))
-    else
-      DerefBank := srtInt;
+    DerefBank := DerefOperandBank(VarNode.GetChild(0));
     ProcessExpression(ExprNode, ExprValue);
     case DerefBank of
       srtFloat:
@@ -3206,6 +3218,35 @@ begin
     VarReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitXferLoad(srtInt, XFER_RESULT_SLOT, VarReg);   // VarReg = returned address
     DerefBank := ByrefRetPointeeBank(VarName);
+    ProcessExpression(ExprNode, ExprValue);
+    case DerefBank of
+      srtFloat:
+        begin
+          ExprValue := EnsureFloatRegister(ExprValue);
+          EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+        end;
+      srtString:
+        begin
+          ExprValue := EnsureStringRegister(ExprValue);
+          EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+        end;
+    else
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+    end;
+    Exit;
+  end;
+
+  // FreeBASIC pointer indexing as an lvalue: "p[i] = expr" (also "p(i) = expr") ≡ *(p + i) = expr.
+  if (VarNode.NodeType = antArrayAccess) and (VarNode.ChildCount >= 2) and
+     (VarNode.GetChild(0).NodeType = antIdentifier) and
+     (FProgram.FindArray(VarToStr(VarNode.GetChild(0).Value)) < 0) and
+     (FPointerVars.IndexOfName(UpperCase(VarToStr(VarNode.GetChild(0).Value))) >= 0) and
+     (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
+  begin
+    VarName := VarToStr(VarNode.GetChild(0).Value);
+    VarReg := EmitPointerIndexAddress(VarName, VarNode.GetChild(1));
+    DerefBank := PointeeBankOf(VarName);
     ProcessExpression(ExprNode, ExprValue);
     case DerefBank of
       srtFloat:
@@ -11100,9 +11141,144 @@ begin
   end;
 end;
 
+function TSSAGenerator.DerefOperandBank(Node: TASTNode): TSSARegisterType;
+// Bank of the pointee for "*<expr>". A plain pointer identifier resolves from its declared type; for
+// pointer arithmetic ("*(p+n)" / "*(p-n)") the bank follows whichever operand of the +/- is a known
+// pointer variable. Defaults to int otherwise.
+begin
+  Result := srtInt;
+  if Node = nil then Exit;
+  // Peel parenthesis wrappers: "*(p + 1)" parses the operand as antParentheses(antBinaryOp(...)).
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do
+    Node := Node.GetChild(0);
+  if Node.NodeType = antIdentifier then
+    Result := PointeeBankOf(VarToStr(Node.Value))
+  else if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) then
+  begin
+    if (Node.GetChild(0).NodeType = antIdentifier) and
+       (FPointerVars.IndexOfName(UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) then
+      Result := PointeeBankOf(VarToStr(Node.GetChild(0).Value))
+    else if (Node.GetChild(1).NodeType = antIdentifier) and
+            (FPointerVars.IndexOfName(UpperCase(VarToStr(Node.GetChild(1).Value))) >= 0) then
+      Result := PointeeBankOf(VarToStr(Node.GetChild(1).Value));
+  end;
+end;
+
+procedure TSSAGenerator.EmitArrayElementAddress(Node: TASTNode; out Result: TSSAValue);
+// @arr(i [,j...]) — the packed address of an array element. The base array id is resolved by name; the
+// linear (row-major) element index is computed exactly like an array read, then folded into the low
+// bits of the address: packedAddr = ((arrayId+1) shl POINTER_ARRAY_SHIFT) + linearIndex. This makes
+// plain integer arithmetic on the pointer ("p + 1") advance by one element, FreeBASIC-style.
+var
+  ArrName: string;
+  ArrayIdx, i, j: Integer;
+  ArrInfo: TSSAArrayInfo;
+  IndicesNode: TASTNode;
+  Indices: array of TSSAValue;
+  LinearIndex, TempVal, AddResult, StrideVal, MulResult, BaseVal: TSSAValue;
+  TempReg, Stride: Integer;
+begin
+  ArrName := VarToStr(Node.Value);
+  ArrayIdx := FProgram.FindArray(ArrName);
+  if ArrayIdx < 0 then
+    raise Exception.CreateFmt('Cannot take address of element of undeclared array: %s', [ArrName]);
+  ArrInfo := FProgram.GetArray(ArrayIdx);
+  IndicesNode := Node.GetChild(0);  // antExpressionList of indices
+
+  SetLength(Indices, IndicesNode.ChildCount);
+  for i := 0 to IndicesNode.ChildCount - 1 do
+  begin
+    ProcessExpression(IndicesNode.GetChild(i), Indices[i]);
+    if Indices[i].Kind = svkConstInt then
+    begin
+      TempVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, TempVal, Indices[i], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Indices[i] := TempVal;
+    end
+    else if Indices[i].Kind = svkConstFloat then
+    begin
+      TempVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(Trunc(Indices[i].ConstFloat)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Indices[i] := TempVal;
+    end
+    else if (Indices[i].Kind = svkRegister) and (Indices[i].RegType = srtFloat) then
+    begin
+      TempVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaFloatToInt, TempVal, Indices[i], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Indices[i] := TempVal;
+    end;
+  end;
+
+  // Map each index to a 0-based offset honoring explicit lower bounds (lb TO ub).
+  for i := 0 to High(Indices) do
+    if (i <= High(ArrInfo.LowerBounds)) and (ArrInfo.LowerBounds[i] <> 0) then
+    begin
+      TempVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(ArrInfo.LowerBounds[i]),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      AddResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaSubInt, AddResult, Indices[i], TempVal, MakeSSAValue(svkNone));
+      Indices[i] := AddResult;
+    end;
+
+  // Row-major linear index (same formula as antArrayAccess).
+  if Length(Indices) = 1 then
+    LinearIndex := Indices[0]
+  else
+  begin
+    LinearIndex := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, LinearIndex, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    for i := 0 to High(Indices) do
+    begin
+      Stride := 1;
+      for j := i + 1 to High(ArrInfo.Dimensions) do
+        Stride := Stride * ArrInfo.Dimensions[j];
+      if Stride = 1 then
+      begin
+        AddResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaAddInt, AddResult, LinearIndex, Indices[i], MakeSSAValue(svkNone));
+        LinearIndex := AddResult;
+      end
+      else
+      begin
+        StrideVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, StrideVal, MakeSSAConstInt(Stride), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        MulResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaMulInt, MulResult, Indices[i], StrideVal, MakeSSAValue(svkNone));
+        AddResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaAddInt, AddResult, LinearIndex, MulResult, MakeSSAValue(svkNone));
+        LinearIndex := AddResult;
+      end;
+    end;
+  end;
+
+  // packedAddr = baseConst + linearIndex, baseConst = (arrayId+1) shl POINTER_ARRAY_SHIFT.
+  BaseVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, BaseVal,
+                  MakeSSAConstInt((Int64(ArrayIdx) + 1) shl POINTER_ARRAY_SHIFT),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  TempReg := FProgram.AllocRegister(srtInt);
+  Result := MakeSSARegister(srtInt, TempReg);
+  EmitInstruction(ssaAddInt, Result, BaseVal, LinearIndex, MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue;
+// p[i] (FreeBASIC pointer indexing) ≡ *(p + i): returns the address register p + i. p holds a packed
+// pointer value; integer addition advances it by i elements (the low bits are the element offset).
+var
+  PtrReg, IdxVal: TSSAValue;
+begin
+  PtrReg := EnsureIntRegister(GetOrAllocateVariable(PtrName));
+  ProcessExpression(IndicesNode.GetChild(0), IdxVal);
+  IdxVal := EnsureIntRegister(IdxVal);
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Result, PtrReg, IdxVal, MakeSSAValue(svkNone));
+end;
+
 function TSSAGenerator.EmitVarAddress(const Name: string): TSSAValue;
-// The address of an address-backed scalar (its 1-element backing array id + 1; 0 stays NULL). Emits a
-// constant load. Returns a 0 constant when the variable is not backed (a deref would then fault).
+// The packed address of an address-backed scalar (its 1-element backing array, offset 0). The id is
+// folded into the high bits: ((arrayId+1) shl POINTER_ARRAY_SHIFT); 0 stays NULL. Emits a constant
+// load. Returns a 0 constant when the variable is not backed (a deref would then fault).
 var
   idx: Integer;
 begin
@@ -11110,7 +11286,7 @@ begin
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   if idx >= 0 then
     EmitInstruction(ssaLoadConstInt, Result,
-                    MakeSSAConstInt(PtrInt(FSharedScalarArr.Objects[idx]) + 1),
+                    MakeSSAConstInt((Int64(PtrInt(FSharedScalarArr.Objects[idx])) + 1) shl POINTER_ARRAY_SHIFT),
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone))
   else
     EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0),

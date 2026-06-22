@@ -4160,6 +4160,8 @@ var
   SubOp: Word;
   ArrayIdx, LinearIdx, i, ProdDims, ArrLowerBound: Integer;
   ArrInfo: TSSAArrayInfo;
+  PtrAddr: Int64;
+  PtrOffset: Integer;
 begin
   SubOp := Instr.OpCode and $FF;
   case SubOp of
@@ -4342,50 +4344,63 @@ begin
       EraseArray(Instr.Src1);
     12: // bcArrayRedim - REDIM [PRESERVE] arr(ub) (B1.4); Src2=ub reg, Immediate bit0=preserve
       RedimArray(Instr.Src1, Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0);
-    // FreeBASIC pointer dereference. The address is (arrayId + 1) so 0 means NULL; the pointee is
-    // element 0 of that 1-element backing array. Load: Dest=value, Src1=address. Store: Src1=address,
-    // Src2=value.
+    // FreeBASIC pointer dereference. The packed address holds (arrayId+1) in the high bits (0 = NULL)
+    // and the element offset in the low POINTER_ARRAY_SHIFT bits; the pointee is element <offset> of
+    // that backing array (offset 0 for a scalar's 1-element backing). Load: Dest=value, Src1=address.
+    // Store: Src1=address, Src2=value.
     13: // bcRefLoadInt
       begin
-        ArrayIdx := Ctx.IntRegs[Instr.Src1] - 1;
-        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) then
-          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ctx.IntRegs[Instr.Src1]]);
-        Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[0];
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+        PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].IntData)) then
+          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+        Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[PtrOffset];
       end;
     14: // bcRefLoadFloat
       begin
-        ArrayIdx := Ctx.IntRegs[Instr.Src1] - 1;
-        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) then
-          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ctx.IntRegs[Instr.Src1]]);
-        Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[0];
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+        PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].FloatData)) then
+          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+        Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[PtrOffset];
       end;
     15: // bcRefLoadString
       begin
-        ArrayIdx := Ctx.IntRegs[Instr.Src1] - 1;
-        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) then
-          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ctx.IntRegs[Instr.Src1]]);
-        Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[0];
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+        PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
+          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+        Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[PtrOffset];
       end;
     16: // bcRefStoreInt
       begin
-        ArrayIdx := Ctx.IntRegs[Instr.Src1] - 1;
-        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) then
-          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ctx.IntRegs[Instr.Src1]]);
-        FArrays[ArrayIdx].IntData[0] := Ctx.IntRegs[Instr.Src2];
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+        PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].IntData)) then
+          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+        FArrays[ArrayIdx].IntData[PtrOffset] := Ctx.IntRegs[Instr.Src2];
       end;
     17: // bcRefStoreFloat
       begin
-        ArrayIdx := Ctx.IntRegs[Instr.Src1] - 1;
-        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) then
-          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ctx.IntRegs[Instr.Src1]]);
-        FArrays[ArrayIdx].FloatData[0] := Ctx.FloatRegs[Instr.Src2];
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+        PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].FloatData)) then
+          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+        FArrays[ArrayIdx].FloatData[PtrOffset] := Ctx.FloatRegs[Instr.Src2];
       end;
     18: // bcRefStoreString
       begin
-        ArrayIdx := Ctx.IntRegs[Instr.Src1] - 1;
-        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) then
-          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ctx.IntRegs[Instr.Src1]]);
-        FArrays[ArrayIdx].StringData[0] := Ctx.StringRegs[Instr.Src2];
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+        PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+        if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
+          raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+        FArrays[ArrayIdx].StringData[PtrOffset] := Ctx.StringRegs[Instr.Src2];
       end;
   else
     raise Exception.CreateFmt('Unknown array opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);

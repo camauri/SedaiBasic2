@@ -1343,17 +1343,35 @@ begin
 end;
 
 function TExpressionParser.ParseProcAddress(Token: TLexerToken): TASTNode;
+var
+  Indices: TASTNode;
 begin
-  // '@' is already consumed; the next token must be a SUB/FUNCTION name (identifier).
-  // Lowers to antProcAddress (value = upper-cased proc name) → the procedure's entry PC.
+  // '@' is already consumed; the next token must be a name (identifier): a SUB/FUNCTION (→ entry PC),
+  // a data variable (→ its address), or an array followed by "(i)" (→ the element's address).
+  // Lowers to antProcAddress (value = upper-cased name); for "@arr(i)" the index expression list is
+  // attached as child0 so SSA computes the element address.
   if not Context.Check(ttIdentifier) then
   begin
-    HandleError('Expected a SUB name after "@"', Context.CurrentToken);
+    HandleError('Expected a name after "@"', Context.CurrentToken);
     Result := nil;
     Exit;
   end;
   Result := TASTNode.CreateWithValue(antProcAddress, UpperCase(Context.CurrentToken.Value), Token);
-  Context.Advance;  // consume the proc name
+  Context.Advance;  // consume the name
+  // "@arr(i [,j...])" — address of an array element.
+  if Context.Check(ttDelimParOpen) then
+  begin
+    Context.Advance;  // consume '('
+    Indices := ParseExpressionList(ttSeparParam);
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" after array index in "@"', Context.CurrentToken);
+      Result.Free;
+      Result := nil;
+      Exit;
+    end;
+    Result.AddChild(Indices);
+  end;
   DoNodeCreated(Result);
 end;
 
