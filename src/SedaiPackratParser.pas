@@ -4343,6 +4343,12 @@ begin
       TypeTok := Context.CurrentToken;
       Result.AddChild(TASTNode.CreateWithValue(antIdentifier,
                    ParseDottedName, TypeTok));        // dotted: namespace-qualified element type
+      // FreeBASIC fixed-length string array: "AS STRING * n" / "AS WSTRING * n" (advisory in v1).
+      if Context.Check(ttOpMul) then
+      begin
+        Context.Advance;                              // '*'
+        FExpressionParser.ParseExpression(precCall).Free;   // length operand (discarded)
+      end;
     end;
   end;
 

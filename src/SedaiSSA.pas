@@ -11863,7 +11863,6 @@ procedure TSSAGenerator.CollectWStringVars(Node: TASTNode);
 // function name inside the body, so marking that name also makes a call f(...) detect as wide).
 var
   i: Integer;
-  TypeU: string;
   NameNode, P: TASTNode;
 
   procedure MarkW(const N: string);
@@ -11874,12 +11873,18 @@ var
 
 begin
   if Node = nil then Exit;
-  // DIM v AS WSTRING [* n] : antArrayDecl(child0=name ident, child1=type ident).
+  // DIM v AS WSTRING [* n]      : antArrayDecl(child0=name, child1=type ident).
+  // DIM a(n) AS WSTRING [* n]   : antArrayDecl(child0=name, child1=dimensions, child2=type ident).
+  // Marking the array name makes a(i) detect as wide too (IsWStringExpr checks IsWStringVar on the name).
   if (Node.NodeType = antArrayDecl) and (Node.ChildCount >= 2) and
-     (Node.GetChild(0).NodeType = antIdentifier) and (Node.GetChild(1).NodeType = antIdentifier) then
+     (Node.GetChild(0).NodeType = antIdentifier) then
   begin
-    TypeU := UpperCase(VarToStr(Node.GetChild(1).Value));
-    if TypeU = 'WSTRING' then
+    P := nil;
+    if Node.GetChild(1).NodeType = antIdentifier then
+      P := Node.GetChild(1)                                   // scalar typed: type at child 1
+    else if (Node.ChildCount >= 3) and (Node.GetChild(2).NodeType = antIdentifier) then
+      P := Node.GetChild(2);                                  // array typed: type at child 2
+    if (P <> nil) and (UpperCase(VarToStr(P.Value)) = 'WSTRING') then
       MarkW(VarToStr(Node.GetChild(0).Value));
   end;
   // FUNCTION ... AS WSTRING : child0 = name node, its child0 = return-type identifier.
