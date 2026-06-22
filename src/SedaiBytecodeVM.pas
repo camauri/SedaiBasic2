@@ -2452,7 +2452,7 @@ begin
         end;
 
         // INSTR/INSTRREV(haystack$, needle$[, start]) -> int Dest
-        bcStrInstr, bcStrInstrRev, bcStrInstrRevAny:
+        bcStrInstr, bcStrInstrRev, bcStrInstrRevAny, bcStrInstrW, bcStrInstrRevW:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;  // haystack
@@ -4103,6 +4103,17 @@ begin
   Result := Copy(S, bStart, bEnd - bStart);
 end;
 
+// Map a 1-based BYTE position in a UTF-8 string to a 1-based CODEPOINT position (0 stays 0 = not found).
+function Utf8BytePosToCP(const S: string; BytePos: Integer): Integer;
+var
+  i: Integer;
+begin
+  if BytePos <= 0 then Exit(0);
+  Result := 0;
+  for i := 1 to BytePos do
+    if (i <= Length(S)) and ((Ord(S[i]) and $C0) <> $80) then Inc(Result);
+end;
+
 procedure TBytecodeVM.ExecuteStringOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
@@ -4133,6 +4144,22 @@ begin
         StartPos := Ctx.IntRegs[Instr.Src2];
         Count := Ctx.IntRegs[Instr.Immediate and $FFFF];
         Ctx.StringRegs[Instr.Dest] := Utf8SubCP(Ctx.StringRegs[Instr.Src1], StartPos, Count);
+      end;
+    29: // bcStrInstrW - INSTR(wstring, sub): codepoint position of first occurrence (0 if none).
+      begin
+        S := Ctx.StringRegs[Instr.Src1];
+        SubStr := Ctx.StringRegs[Instr.Src2];
+        Ctx.IntRegs[Instr.Dest] := Utf8BytePosToCP(S, Pos(SubStr, S));
+      end;
+    30: // bcStrInstrRevW - INSTRREV(wstring, sub): codepoint position of last occurrence (0 if none).
+      begin
+        S := Ctx.StringRegs[Instr.Src1];
+        SubStr := Ctx.StringRegs[Instr.Src2];
+        Len := 0;
+        if SubStr <> '' then
+          for StartPos := 1 to Length(S) - Length(SubStr) + 1 do
+            if Copy(S, StartPos, Length(SubStr)) = SubStr then Len := StartPos;  // last byte match
+        Ctx.IntRegs[Instr.Dest] := Utf8BytePosToCP(S, Len);
       end;
     2: // bcStrLeft
       begin

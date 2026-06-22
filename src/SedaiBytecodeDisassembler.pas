@@ -234,6 +234,10 @@ begin
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrRightW', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcStrMidW:
       Line := Format('%4d: %-20s R%d, R%d, startR%d, lenR%d', [Index, 'StrMidW', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate and $FFFF]);
+    bcStrInstrW:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrInstrW', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcStrInstrRevW:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrInstrRevW', Instr.Dest, Instr.Src1, Instr.Src2]);
 
     // === GROUP 2: MATH FUNCTIONS (0x02xx) ===
     bcMathSin:

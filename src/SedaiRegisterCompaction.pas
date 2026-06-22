@@ -213,6 +213,7 @@ begin
     bcStrAsc,      // ASC(str) returns int ASCII code
     bcStrInstr,    // INSTR(haystack, needle) returns int position
     bcStrInstrRev, // INSTRREV(str, sub) returns int position
+    bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV return int codepoint position
     bcStrValInt,   // VALINT/VALLNG/VALUINT(str) returns int (B1.3)
     // === GROUP 3: Array operations ===
     bcArrayLoadInt,  // Typed array load (int) - Dest is WRITTEN
@@ -625,6 +626,7 @@ begin
     bcStrValInt, // VALINT/VALLNG/VALUINT(str) - reads string, produces int
     bcStrInstr,  // INSTR(haystack, needle) - haystack is Src1
     bcStrInstrRev,  // INSTRREV(str, sub) - str is Src1
+    bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV - haystack is Src1
     bcStrInstrRevAny, // INSTRREV(str, Any set) - str is Src1
     bcStrTrimSet,   // LTRIM/RTRIM/TRIM(s, set) - s is Src1
     // === GROUP 2: Math operations ===
@@ -662,6 +664,7 @@ begin
     bcStrConcat,  // String concatenation (second operand)
     bcStrInstr,   // INSTR(haystack, needle) - needle is Src2
     bcStrInstrRev, // INSTRREV(str, sub) - sub is Src2
+    bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV - needle is Src2
     bcStrInstrRevAny, // INSTRREV(str, Any set) - set is Src2
     bcStrTrimSet,  // LTRIM/RTRIM/TRIM(s, set) - set is Src2
     // === GROUP 3: Pointer store (FreeBASIC): Src2 = string value ===

@@ -369,7 +369,7 @@ begin
 
     // String operations (pure functions)
     ssaStrConcat, ssaStrLen, ssaStrLenW, ssaStrLeft, ssaStrRight, ssaStrMid,
-    ssaStrLeftW, ssaStrRightW, ssaStrMidW:
+    ssaStrLeftW, ssaStrRightW, ssaStrMidW, ssaStrInstrW, ssaStrInstrRevW:
       Result := True;
 
     // Math functions (pure functions)

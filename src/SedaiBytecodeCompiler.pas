@@ -172,6 +172,8 @@ begin
     ssaStrLeftW: Result := bcStrLeftW;
     ssaStrRightW: Result := bcStrRightW;
     ssaStrMidW: Result := bcStrMidW;
+    ssaStrInstrW: Result := bcStrInstrW;
+    ssaStrInstrRevW: Result := bcStrInstrRevW;
     ssaStrLeft: Result := bcStrLeft;
     ssaStrRight: Result := bcStrRight;
     ssaStrMid: Result := bcStrMid;

@@ -2358,6 +2358,9 @@ begin
             Result := MakeSSARegister(srtInt, DestReg);
             if IsAny then
               EmitInstruction(ssaStrInstrRevAny, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone))
+            else if (ArgListNode.ChildCount = 2) and IsWStringExpr(ArgListNode.GetChild(0)) then
+              // WSTRING haystack (no start arg): codepoint position of the last occurrence.
+              EmitInstruction(ssaStrInstrRevW, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone))
             else
               EmitInstruction(ssaStrInstrRev, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
           end
@@ -2476,6 +2479,9 @@ begin
               else
                 EmitInstructionWithImmediate(ssaStrInstr, Result, ArgReg, Arg2Reg, 1); // Default start=1
             end
+            else if IsWStringExpr(ArgListNode.GetChild(0)) then
+              // WSTRING haystack (no start arg): return a codepoint position, not a byte position.
+              EmitInstruction(ssaStrInstrW, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone))
             else
               EmitInstructionWithImmediate(ssaStrInstr, Result, ArgReg, Arg2Reg, 0); // 0 means use Pos (start from 1)
           end

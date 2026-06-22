@@ -120,6 +120,8 @@ type
     ssaStrLeftW,       // LEFT$(wstring, n)  -> first n codepoints (Src1=string, Src2=int)
     ssaStrRightW,      // RIGHT$(wstring, n) -> last n codepoints (Src1=string, Src2=int)
     ssaStrMidW,        // MID$(wstring, start[,len]) -> codepoint substring (Src1=string, Src2=int start, Src3=int len)
+    ssaStrInstrW,      // INSTR(wstring, sub) -> int codepoint position of first occurrence (Src1/Src2=string)
+    ssaStrInstrRevW,   // INSTRREV(wstring, sub) -> int codepoint position of last occurrence (Src1/Src2=string)
     // FreeBASIC numeric<->string conversions (B1.3).
     ssaStrOct,        // OCT(n) -> octal string
     ssaStrBin,        // BIN(n) -> binary string
