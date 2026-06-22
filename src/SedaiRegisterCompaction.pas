@@ -330,10 +330,10 @@ begin
     bcLoadConstString, bcCopyString,
     bcIntToString, bcFloatToString,
     // === GROUP 1: String operations ===
-    bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrChr,
+    bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrChr, bcStrWChr,
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING codepoint substrings - string dest
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrSpace,  // B1.2: string dest
-    bcStrString,  // STRING(n,ch) - string dest
+    bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - string dest
     bcStrTrimSet, // LTRIM/RTRIM/TRIM(s,set) - string dest
     bcStrStr,    // STR$(n) - number to string
     bcStrHex,    // HEX$(n) - int to hex string
@@ -403,8 +403,8 @@ begin
     bcRawAlloc, bcRawFree, bcRawRealloc,
     bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat,
     // === GROUP 1: String operations with int param ===
-    bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin,
-    bcStrString,  // STRING(n,ch) - Src1 = count (int)
+    bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin, bcStrWChr,
+    bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - Src1 = count (int)
     // === GROUP 5: Memory operations ===
     bcPeek,           // PEEK(address): Src1 = address (int)
     bcPoke,           // POKE address, value: Src1 = address (int)
@@ -529,7 +529,7 @@ begin
     bcStrLeft, bcStrRight,  // LEFT$/RIGHT$(str, len) - len is Src2 (int)
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src2 = codepoint count/start (int)
     bcStrMid,  // Mid$(str, start, length) - start is Src1, length is Src2
-    bcStrString,  // STRING(n,ch) - Src2 = char code (int)
+    bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - Src2 = char code/codepoint (int)
     // === GROUP 3: Typed array operations: Src2 is always int (linear index) ===
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,

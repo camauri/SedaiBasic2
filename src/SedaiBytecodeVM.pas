@@ -2415,14 +2415,14 @@ begin
         end;
 
         // Int Src1 -> String Dest (CHR$, HEX$, ERR$, SPACE, OCT, BIN)
-        bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin:
+        bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin, bcStrWChr:
         begin
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
 
-        // STRING(n,ch): int count (Src1) + int char code (Src2) -> String Dest
-        bcStrString:
+        // STRING(n,ch) / WSTRING(n,cp): int count (Src1) + int char code/codepoint (Src2) -> String Dest
+        bcStrString, bcStrWStringN:
         begin
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
@@ -4103,6 +4103,22 @@ begin
   Result := Copy(S, bStart, bEnd - bStart);
 end;
 
+// Encode a single Unicode codepoint as its UTF-8 byte sequence (FreeBASIC WCHR). Invalid codepoints
+// (negative or > U+10FFFF) yield the replacement char U+FFFD.
+function Utf8EncodeCP(CP: Integer): string;
+begin
+  if (CP < 0) or (CP > $10FFFF) then CP := $FFFD;
+  if CP < $80 then
+    Result := Chr(CP)
+  else if CP < $800 then
+    Result := Chr($C0 or (CP shr 6)) + Chr($80 or (CP and $3F))
+  else if CP < $10000 then
+    Result := Chr($E0 or (CP shr 12)) + Chr($80 or ((CP shr 6) and $3F)) + Chr($80 or (CP and $3F))
+  else
+    Result := Chr($F0 or (CP shr 18)) + Chr($80 or ((CP shr 12) and $3F)) +
+              Chr($80 or ((CP shr 6) and $3F)) + Chr($80 or (CP and $3F));
+end;
+
 // Map a 1-based BYTE position in a UTF-8 string to a 1-based CODEPOINT position (0 stays 0 = not found).
 function Utf8BytePosToCP(const S: string; BytePos: Integer): Integer;
 var
@@ -4160,6 +4176,17 @@ begin
           for StartPos := 1 to Length(S) - Length(SubStr) + 1 do
             if Copy(S, StartPos, Length(SubStr)) = SubStr then Len := StartPos;  // last byte match
         Ctx.IntRegs[Instr.Dest] := Utf8BytePosToCP(S, Len);
+      end;
+    31: // bcStrWChr - WCHR(n): UTF-8 byte sequence for Unicode codepoint n.
+      Ctx.StringRegs[Instr.Dest] := Utf8EncodeCP(Ctx.IntRegs[Instr.Src1]);
+    32: // bcStrWStringN - WSTRING(n,cp): n copies of the UTF-8 char for codepoint cp.
+      begin
+        Count := Ctx.IntRegs[Instr.Src1];
+        if Count < 0 then Count := 0;
+        SubStr := Utf8EncodeCP(Ctx.IntRegs[Instr.Src2]);
+        S := '';
+        for StartPos := 1 to Count do S := S + SubStr;
+        Ctx.StringRegs[Instr.Dest] := S;
       end;
     2: // bcStrLeft
       begin

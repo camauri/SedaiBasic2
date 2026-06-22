@@ -1783,6 +1783,11 @@ begin
  RegisterKeyword(kDEC,    ttStringFunction, 'Convert hex string to decimal integer',            kcStringFunctions);
  RegisterKeyword(kOCT,    ttStringFunction, 'Octal number string from integer',                 kcStringFunctions);
  RegisterKeyword(kBIN,    ttStringFunction, 'Binary number string from integer',                kcStringFunctions);
+ RegisterKeyword(kWOCT,   ttStringFunction, 'Octal wide string from integer (FreeBASIC)',       kcStringFunctions);
+ RegisterKeyword(kWBIN,   ttStringFunction, 'Binary wide string from integer (FreeBASIC)',      kcStringFunctions);
+ RegisterKeyword(kWHEX,   ttStringFunction, 'Hex wide string from integer (FreeBASIC)',         kcStringFunctions);
+ RegisterKeyword(kWCHR,   ttStringFunction, 'Wide (UTF-8) char from a Unicode codepoint (FreeBASIC)', kcStringFunctions);
+ RegisterKeyword(kWSPACE, ttStringFunction, 'Return a wide string of N spaces (FreeBASIC)',     kcStringFunctions);
  RegisterKeyword(kERRS,   ttStringFunction, 'Return error message for error code',               kcStringFunctions);
 
  // === MEMORY HANDLING (COMMANDS AND FUNCTIONS) ===

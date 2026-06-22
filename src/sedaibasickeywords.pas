@@ -259,6 +259,11 @@ const
   kCSNG    = 'CSNG';      // convert to Single
   kOCT     = 'OCT';       // integer -> octal string
   kBIN     = 'BIN';       // integer -> binary string
+  kWOCT    = 'WOCT';      // integer -> octal wide string (FreeBASIC)
+  kWBIN    = 'WBIN';      // integer -> binary wide string (FreeBASIC)
+  kWHEX    = 'WHEX';      // integer -> hex wide string (FreeBASIC)
+  kWCHR    = 'WCHR';      // Unicode codepoint -> wide (UTF-8) char (FreeBASIC)
+  kWSPACE  = 'WSPACE';    // N wide spaces (FreeBASIC)
   kVALINT  = 'VALINT';    // string -> Integer
   kVALLNG  = 'VALLNG';    // string -> LongInt
   kVALULNG = 'VALULNG';   // string -> ULongInt (unsigned)

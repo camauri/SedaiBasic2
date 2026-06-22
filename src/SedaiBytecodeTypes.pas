@@ -334,6 +334,8 @@ const
   bcStrMidW         = bcGroupString + 28;  // MID$(wstring, start[,len]) - codepoint substring (Dest/Src1=string, Src2=int start, Immediate=int len reg)
   bcStrInstrW       = bcGroupString + 29;  // INSTR(wstring, sub) - codepoint position of first occurrence (Dest=int, Src1/Src2=string)
   bcStrInstrRevW    = bcGroupString + 30;  // INSTRREV(wstring, sub) - codepoint position of last occurrence (Dest=int, Src1/Src2=string)
+  bcStrWChr         = bcGroupString + 31;  // WCHR(n) - UTF-8 bytes of Unicode codepoint n (Dest=string, Src1=int)
+  bcStrWStringN     = bcGroupString + 32;  // WSTRING(n,cp) - n copies of the UTF-8 char for codepoint cp (Dest=string, Src1=int n, Src2=int cp)
 
   // === GROUP 2: MATH FUNCTIONS (0x02xx) ===
   bcMathSin         = bcGroupMath + 0;

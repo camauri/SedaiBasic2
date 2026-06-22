@@ -122,6 +122,8 @@ type
     ssaStrMidW,        // MID$(wstring, start[,len]) -> codepoint substring (Src1=string, Src2=int start, Src3=int len)
     ssaStrInstrW,      // INSTR(wstring, sub) -> int codepoint position of first occurrence (Src1/Src2=string)
     ssaStrInstrRevW,   // INSTRREV(wstring, sub) -> int codepoint position of last occurrence (Src1/Src2=string)
+    ssaStrWChr,        // WCHR(n) -> UTF-8 bytes of Unicode codepoint n (Src1=int)
+    ssaStrWStringN,    // WSTRING(n,cp) -> n copies of the UTF-8 char for codepoint cp (Src1=int n, Src2=int cp)
     // FreeBASIC numeric<->string conversions (B1.3).
     ssaStrOct,        // OCT(n) -> octal string
     ssaStrBin,        // BIN(n) -> binary string

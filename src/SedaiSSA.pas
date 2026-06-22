@@ -337,6 +337,7 @@ type
     procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure EmitWStr(ArgsNode: TASTNode; out Result: TSSAValue);   // FreeBASIC WSTR(x) -> wide string
     procedure EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);
+    procedure EmitWStringFill(ArgsNode: TASTNode; out Result: TSSAValue);  // WSTRING(n,cp) -> n wide chars
     function InferExprBank(Node: TASTNode): TSSARegisterType;
     procedure EmitIif(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure ProcessForLoop(Node: TASTNode);
@@ -2175,6 +2176,21 @@ begin
           Result := MakeSSARegister(srtString, DestReg);
           EmitInstruction(ssaStrChr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
+        else if (FuncName = 'WCHR') then
+        begin
+          // WCHR(n) - the wide character for Unicode codepoint n, encoded as UTF-8 bytes (unlike CHR$,
+          // which emits a single raw byte). Single-codepoint form (v1).
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          else if ArgListNode <> nil then
+            ProcessExpression(ArgListNode, ArgValue)
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+
+          ArgReg := EnsureIntRegister(ArgValue);
+          DestReg := FProgram.AllocRegister(srtString);
+          Result := MakeSSARegister(srtString, DestReg);
+          EmitInstruction(ssaStrWChr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
         else if (FuncName = 'ERR$') then
         begin
           // ERR$(n) - returns error message for error code n
@@ -2217,9 +2233,9 @@ begin
           Result := MakeSSARegister(srtFloat, DestReg);
           EmitInstruction(ssaStrVal, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
-        else if (FuncName = 'HEX$') then
+        else if (FuncName = 'HEX$') or (FuncName = 'WHEX') then
         begin
-          // HEX$(n) - returns 4-char hex string
+          // HEX$(n) / WHEX(n) - hex string (WHEX = wide; ASCII hex digits are identical UTF-8)
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
           else if ArgListNode <> nil then
@@ -2231,9 +2247,10 @@ begin
           Result := MakeSSARegister(srtString, DestReg);
           EmitInstruction(ssaStrHex, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
-        else if (FuncName = 'OCT') or (FuncName = 'BIN') then
+        else if (FuncName = 'OCT') or (FuncName = 'BIN') or (FuncName = 'WOCT') or (FuncName = 'WBIN') then
         begin
-          // OCT(n)/BIN(n) - octal/binary string of an integer (no leading zeros).
+          // OCT/BIN/WOCT/WBIN(n) - octal/binary string of an integer (no leading zeros). The W* forms are
+          // wide; the digits are ASCII so the bytes are identical to the narrow form.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
           else if ArgListNode <> nil then
@@ -2243,7 +2260,7 @@ begin
           ArgReg := EnsureIntRegister(ArgValue);
           DestReg := FProgram.AllocRegister(srtString);
           Result := MakeSSARegister(srtString, DestReg);
-          if FuncName = 'OCT' then
+          if (FuncName = 'OCT') or (FuncName = 'WOCT') then
             EmitInstruction(ssaStrOct, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
           else
             EmitInstruction(ssaStrBin, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -2367,7 +2384,7 @@ begin
           end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end
-        else if (FuncName = 'SPACE') or (FuncName = 'SPACE$') then
+        else if (FuncName = 'SPACE') or (FuncName = 'SPACE$') or (FuncName = 'WSPACE') then
         begin
           // SPACE(n) -> string of n spaces (Dest=string, single int arg).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
@@ -3156,6 +3173,14 @@ begin
            ((UpperCase(ArrName) = 'STRING$') or (FModernMode and (UpperCase(ArrName) = 'STRING'))) then
         begin
           EmitStringFill(Node.GetChild(1), Result);
+          Exit;
+        end;
+
+        // FreeBASIC WSTRING(n, cp) function: n copies of the wide (UTF-8) char for codepoint cp. WSTRING
+        // also names the type; as a call (MODERN, not a declared array) it is the fill function.
+        if FModernMode and (UpperCase(ArrName) = 'WSTRING') and (FProgram.FindArray(ArrName) < 0) then
+        begin
+          EmitWStringFill(Node.GetChild(1), Result);
           Exit;
         end;
 
@@ -4963,6 +4988,31 @@ begin
     CodeReg := EnsureIntRegister(ChVal);  // numeric char code (int/float coerced to int)
   Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
   EmitInstruction(ssaStrString, Result, CountReg, CodeReg, MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.EmitWStringFill(ArgsNode: TASTNode; out Result: TSSAValue);
+// Lower WSTRING(count, cp) -> count copies of the UTF-8 char for Unicode codepoint cp (ssaStrWStringN).
+// cp may be a wide-char string (its first codepoint is used) or a numeric codepoint. Wide form of STRING.
+var
+  CountVal, ChVal, CountReg, CodeReg, StrReg: TSSAValue;
+begin
+  if (ArgsNode = nil) or (ArgsNode.ChildCount < 2) then begin Result := MakeSSAValue(svkNone); Exit; end;
+  ProcessExpression(ArgsNode.GetChild(0), CountVal);
+  CountReg := EnsureIntRegister(CountVal);
+  ProcessExpression(ArgsNode.GetChild(1), ChVal);
+  if (ChVal.Kind = svkConstString) or
+     ((ChVal.Kind = svkRegister) and (ChVal.RegType = srtString)) then
+  begin
+    // String char argument: ASC gives the first BYTE — acceptable for an ASCII char; a full wide-char
+    // first-codepoint decode is a v1 limitation (use the numeric codepoint form for non-ASCII).
+    StrReg := EnsureStringRegister(ChVal);
+    CodeReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaStrAsc, CodeReg, StrReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+    CodeReg := EnsureIntRegister(ChVal);  // numeric codepoint
+  Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaStrWStringN, Result, CountReg, CodeReg, MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.ProcessMidStatement(Node: TASTNode);
@@ -11961,7 +12011,7 @@ begin
           NameU := UpperCase(VarToStr(Node.GetChild(0).Value))
         else
           NameU := UpperCase(VarToStr(Node.Value));
-        Result := (NameU = 'WSTR') or IsWStringVar(NameU);
+        Result := (NameU = 'WSTR') or (NameU = 'WCHR') or (NameU = 'WSTRING') or IsWStringVar(NameU);
       end;
   end;
 end;
