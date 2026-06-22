@@ -441,30 +441,13 @@ var
   GCallbackCount: Integer = 0;
   GLastSamplePrinted: Boolean = False;
   GMaxSampleSeen: Single = 0;
-  GTotalSamples: Int64 = 0;  // For test tone phase
-  GTestToneEnabled: Boolean = False;  // Set to True to test audio output
 
 procedure SAFAudioCallback(AOutput: PSingle; AFrameCount: Integer; AUserData: Pointer);
 var
   I: Integer;
   Sample: Single;
-  Phase: Single;
 begin
   Inc(GCallbackCount);
-
-  // TEST MODE: Generate a 440 Hz sine wave to verify audio output works
-  if GTestToneEnabled then
-  begin
-    for I := 0 to AFrameCount - 1 do
-    begin
-      Phase := (GTotalSamples + I) * 440.0 * 2.0 * Pi / 44100.0;
-      Sample := Sin(Phase) * 0.3;  // 30% volume
-      AOutput[I * 2] := Sample;      // Left
-      AOutput[I * 2 + 1] := Sample;  // Right
-    end;
-    Inc(GTotalSamples, AFrameCount);
-    Exit;
-  end;
 
   if not Assigned(GSIDEvoInstance) then
   begin
@@ -487,8 +470,8 @@ begin
     if Abs(Sample) > GMaxSampleSeen then
       GMaxSampleSeen := Abs(Sample);
     {$ENDIF}
-    // Amplify signal (SIDEvo ReSID-exact output is normalized but quiet)
-    Sample := Sample * 3.0;
+    // No extra amplification: SIDEvo output is already at proper level
+    // once master volume ($D418) is set; clamp only to guard against overflow.
     // Clamp to valid range
     if Sample > 1.0 then Sample := 1.0;
     if Sample < -1.0 then Sample := -1.0;
