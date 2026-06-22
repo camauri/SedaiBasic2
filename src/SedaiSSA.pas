@@ -258,6 +258,8 @@ type
     function IsRawPtr(const Name: string): Boolean;                             // raw (Allocate-backed) pointer var?
     procedure CollectRawPtrVars(Node: TASTNode);                                // pre-scan: mark ptrs assigned from Allocate*
     function IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;           // Node = ALLOCATE/CALLOCATE/REALLOCATE(...)?
+    function RawPtrExprName(Node: TASTNode): string;                            // raw pointer var of a raw ptr expr (p, p±n), else ''
+    procedure EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);           // p±n raw pointer arithmetic (SizeOf-scaled)
     function RawTypeCodeOf(const PtrName: string): Integer;                      // raw element type code for *p / p[i]
     function RawElemSizeOf(const PtrName: string): Int64;                        // SizeOf(pointee) in bytes
     function TypeSizeBytes(const TypeName: string): Int64;                       // SizeOf(T) in bytes (FB sizes)
@@ -1003,19 +1005,22 @@ begin
         Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.GetChild(0).Value))));
         Exit;
       end;
-      // *p where p is a RAW (Allocate'd) pointer: load SizeOf(pointee) bytes from the raw heap.
-      if (Node.GetChild(0).NodeType = antIdentifier) and IsRawPtr(VarToStr(Node.GetChild(0).Value)) then
+      // *p / *(p±n) where p is a RAW (Allocate'd) pointer: load SizeOf(pointee) bytes from the raw heap.
+      // RawPtrExprName resolves the pointer var (for its element type) through the arithmetic.
+      if RawPtrExprName(Node.GetChild(0)) <> '' then
       begin
-        Left := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.GetChild(0).Value))));
-        if PointeeBankOf(VarToStr(Node.GetChild(0).Value)) = srtFloat then
+        ArrName2 := RawPtrExprName(Node.GetChild(0));
+        ProcessExpression(Node.GetChild(0), Left);   // raw byte address (arithmetic already scaled)
+        Left := EnsureIntRegister(Left);
+        if PointeeBankOf(ArrName2) = srtFloat then
         begin
           Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
-          EmitInstruction(ssaRawLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOf(VarToStr(Node.GetChild(0).Value))));
+          EmitInstruction(ssaRawLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOf(ArrName2)));
         end
         else
         begin
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaRawLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOf(VarToStr(Node.GetChild(0).Value))));
+          EmitInstruction(ssaRawLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOf(ArrName2)));
         end;
         Exit;
       end;
@@ -1363,6 +1368,16 @@ begin
 
     antBinaryOp:
     begin
+      // FreeBASIC raw pointer arithmetic: "p + n" / "p - n" (and "n + p") where p is a raw pointer.
+      // The index is scaled by SizeOf(pointee) — the result is a raw byte pointer. (Managed pointers
+      // keep element-unit arithmetic via the normal numeric lowering below.)
+      if (Node.ChildCount >= 2) and Assigned(Node.Token) and
+         ((Node.Token.TokenType = ttOpAdd) or (Node.Token.TokenType = ttOpSub)) and
+         (RawPtrExprName(Node) <> '') then
+      begin
+        EmitRawPtrArith(Node, Result);
+        Exit;
+      end;
       // Operator overloading (FreeBASIC): if both operands are UDT handles of the same type T and a
       // user "OPERATOR <sym>(a AS T, b AS T)" is defined, lower a call to it (label T.OPERATOR<sym>)
       // instead of a numeric op. Resolved by the left operand's static type; direct binary form (the
@@ -3351,22 +3366,23 @@ begin
     Exit;
   end;
 
-  // FreeBASIC RAW pointer-deref store: "*p = expr" where p is Allocate'd → store SizeOf(T) bytes to the
-  // raw heap at p's byte offset.
-  if (VarNode.NodeType = antDeref) and (VarNode.GetChild(0).NodeType = antIdentifier) and
-     IsRawPtr(VarToStr(VarNode.GetChild(0).Value)) then
+  // FreeBASIC RAW pointer-deref store: "*p = expr" / "*(p±n) = expr" where p is Allocate'd → store
+  // SizeOf(T) bytes to the raw heap at the (arithmetic-scaled) byte address.
+  if (VarNode.NodeType = antDeref) and (RawPtrExprName(VarNode.GetChild(0)) <> '') then
   begin
-    VarReg := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(VarNode.GetChild(0).Value))));
+    AllocFuncU := RawPtrExprName(VarNode.GetChild(0));   // reuse local for the raw pointer name
+    ProcessExpression(VarNode.GetChild(0), VarReg);
+    VarReg := EnsureIntRegister(VarReg);
     ProcessExpression(ExprNode, ExprValue);
-    if PointeeBankOf(VarToStr(VarNode.GetChild(0).Value)) = srtFloat then
+    if PointeeBankOf(AllocFuncU) = srtFloat then
     begin
       ExprValue := EnsureFloatRegister(ExprValue);
-      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(VarToStr(VarNode.GetChild(0).Value))));
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(AllocFuncU)));
     end
     else
     begin
       ExprValue := EnsureIntRegister(ExprValue);
-      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(VarToStr(VarNode.GetChild(0).Value))));
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(AllocFuncU)));
     end;
     Exit;
   end;
@@ -11581,6 +11597,59 @@ begin
     Result := FProgram.FindArray(FuncU) < 0;
 end;
 
+procedure TSSAGenerator.EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);
+// Lower "p + n" / "p - n" / "n + p" (raw pointer ± integer) to ptrVal ± n*SizeOf(pointee), a raw byte
+// pointer. The raw pointer side is identified by RawPtrExprName; the other side is the integer index.
+var
+  PtrName: string;
+  PtrSide, IntSide: TASTNode;
+  PtrVal, IntVal, SzVal, Scaled: TSSAValue;
+  sz: Int64;
+begin
+  // Decide which child is the raw pointer (left for +/-, or right only for +).
+  if RawPtrExprName(Node.GetChild(0)) <> '' then
+  begin PtrSide := Node.GetChild(0); IntSide := Node.GetChild(1); end
+  else
+  begin PtrSide := Node.GetChild(1); IntSide := Node.GetChild(0); end;
+  PtrName := RawPtrExprName(PtrSide);
+  ProcessExpression(PtrSide, PtrVal); PtrVal := EnsureIntRegister(PtrVal);
+  ProcessExpression(IntSide, IntVal); IntVal := EnsureIntRegister(IntVal);
+  sz := RawElemSizeOf(PtrName);
+  if sz > 1 then
+  begin
+    SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, SzVal, MakeSSAConstInt(sz), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Scaled := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, Scaled, IntVal, SzVal, MakeSSAValue(svkNone));
+    IntVal := Scaled;
+  end;
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if Node.Token.TokenType = ttOpSub then
+    EmitInstruction(ssaSubInt, Result, PtrVal, IntVal, MakeSSAValue(svkNone))
+  else
+    EmitInstruction(ssaAddInt, Result, PtrVal, IntVal, MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.RawPtrExprName(Node: TASTNode): string;
+// If Node is a raw-pointer expression — a raw pointer identifier, "(p)", or "p + n"/"p - n"/"n + p"
+// where p is raw — return the raw pointer variable name (for its element type); else ''.
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do
+    Node := Node.GetChild(0);
+  if Node.NodeType = antIdentifier then
+  begin
+    if IsRawPtr(VarToStr(Node.Value)) then Result := UpperCase(VarToStr(Node.Value));
+  end
+  else if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) and Assigned(Node.Token) and
+          ((Node.Token.TokenType = ttOpAdd) or (Node.Token.TokenType = ttOpSub)) then
+  begin
+    Result := RawPtrExprName(Node.GetChild(0));
+    if (Result = '') and (Node.Token.TokenType = ttOpAdd) then Result := RawPtrExprName(Node.GetChild(1));
+  end;
+end;
+
 function TSSAGenerator.RawTypeCodeOf(const PtrName: string): Integer;
 // Raw element type code for *p / p[i], from the pointer's declared pointee type.
 var
@@ -13491,6 +13560,9 @@ begin
   CollectSharedVars(AST);
   // FreeBASIC raw pointers: vars assigned from Allocate/CAllocate/Reallocate (and CAST/copies of raw).
   // Iterate to a fixpoint so raw-ness propagates through copies regardless of statement order.
+  // (Stage 2 byte-backing of address-taken arrays was withdrawn: a managed/raw mix is unsound at function
+  // boundaries — a "T PTR" parameter can receive both a managed @x and a raw @arr/Allocate pointer. So
+  // @arr stays managed; only Allocate buffers are raw. CollectAddrTakenArrays is intentionally not called.)
   repeat
     FRawCollectChanged := False;
     CollectRawPtrVars(AST);
