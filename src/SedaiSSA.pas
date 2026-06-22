@@ -70,6 +70,7 @@ type
     Bank: TSSARegisterType;
     Slot: Integer;          // index within that bank's slot array of the instance
     NestedType: string;     // UDT type name if this field is itself a record (else ''); held as an int handle
+    PtrPointee: string;     // pointee UDT type if this field is a "T PTR" (else ''); held as an int handle
     WidthCode: Integer;     // B1.5: narrow width code for a sub-64-bit/SINGLE field (0 = full width)
   end;
   TUDTType = record
@@ -240,9 +241,13 @@ type
     procedure CollectDimVarBanks(Node: TASTNode; Dict: TStringList);
     procedure MarkAddressTaken(Node: TASTNode; Dict: TStringList);
     function PointeeBankOf(const PtrName: string): TSSARegisterType;            // bank of *p from p's declared pointee
+    function PointerUDTType(const PtrName: string): string;                     // pointee UDT type if p is a "T PTR" (T a UDT), else ''
+    function UDTFieldPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT of a "T PTR" field, else ''
     function DerefOperandBank(Node: TASTNode): TSSARegisterType;                // bank of *<expr> incl. pointer arithmetic (p+n)
     procedure EmitArrayElementAddress(Node: TASTNode; out Result: TSSAValue);   // @arr(i) → packed element address
     procedure EmitFieldAddress(MemberNode: TASTNode; out Result: TSSAValue);    // @obj.field → record-field pointer
+    procedure EmitNewObject(Node: TASTNode; out Result: TSSAValue);             // NEW T [(args)] → heap record handle
+    procedure EmitDeleteObject(Node: TASTNode);                                 // DELETE p → run destructor on the pointee
     function EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue; // p[i] → address (p + i)
     function EmitVarAddress(const Name: string): TSSAValue;                     // packed address of a backed scalar (0=NULL)
     function IsByrefRetFunc(const Name: string): Boolean;                       // FUNCTION declared BYREF AS T?
@@ -913,6 +918,9 @@ begin
         EmitFieldAddress(Node.GetChild(0), Result)
       else if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antArrayAccess) then
         EmitArrayElementAddress(Node.GetChild(0), Result)
+      else if VarRecordTypeName(VarToStr(Node.Value)) <> '' then
+        // @obj where obj is a UDT value variable: its handle IS the pointer (managed-reference model).
+        Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.Value))))
       else if IsSharedScalar(VarToStr(Node.Value)) then
         Result := EmitVarAddress(VarToStr(Node.Value))
       else
@@ -927,8 +935,22 @@ begin
       end;
     end;
 
+    antNew:
+      // FreeBASIC "NEW T"/"NEW T(args)" used as an expression (RHS of "p = NEW T"). The classic
+      // program-editing NEW carries no Value and is handled as a statement, so this branch only fires
+      // for the FB allocator form (Value = the type name).
+      EmitNewObject(Node, Result);
+
     antDeref:
     begin
+      // *p where p is a UDT pointer: the value is the record handle itself (managed-reference model),
+      // so *p just evaluates p (no load). Lets "q = *p" alias and "(*p).field" resolve.
+      if (Node.GetChild(0).NodeType = antIdentifier) and
+         (PointerUDTType(VarToStr(Node.GetChild(0).Value)) <> '') then
+      begin
+        Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.GetChild(0).Value))));
+        Exit;
+      end;
       // *p (rvalue): load the pointee value. Address = p's int value; the pointee bank comes from p's
       // declared pointer type (FPointerVars), defaulting to int.
       ProcessExpression(Node.GetChild(0), Left);
@@ -9251,6 +9273,15 @@ var
 begin
   if FCurrentBlock = nil then Exit;
 
+  // FreeBASIC "DELETE p": the MODERN parser attaches the pointer expression (an identifier) as child0.
+  // The classic line-delete form attaches line-number literals instead, so an antIdentifier child0
+  // unambiguously selects the FB form.
+  if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+  begin
+    EmitDeleteObject(Node);
+    Exit;
+  end;
+
   // DELETE [start[-end]]
   // Parser provides: 0 children = delete nothing
   //                  1 child = single line delete
@@ -9935,6 +9966,20 @@ begin
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].WidthCode);
 end;
 
+function TSSAGenerator.UDTFieldPtrPointee(UDTIdx: Integer; const FieldName: string): string;
+// The pointee UDT type of a "T PTR" field (held as an int handle), or '' — used to resolve chained
+// pointer-field access such as "node->nxt->val".
+var
+  i: Integer;
+  F: string;
+begin
+  Result := '';
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].PtrPointee);
+end;
+
 procedure TSSAGenerator.RegisterUDTs(Node: TASTNode);
 // Two passes so a TYPE may reference another TYPE declared later (forward reference).
 begin
@@ -9977,7 +10022,7 @@ var
   FieldNode, TypeNode: TASTNode;
   Bank: TSSARegisterType;
   cInt, cFloat, cStr: Integer;
-  TypeName, FieldName, NestedT: string;
+  TypeName, FieldName, NestedT, PtrPointeeT: string;
 begin
   if (Idx < 0) or (Idx > High(FUDTs)) then Exit;
   if FUDTs[Idx].Filled then Exit;
@@ -10014,13 +10059,21 @@ begin
       TypeName := '';
       if Assigned(TypeNode) then TypeName := UpperCase(VarToStr(TypeNode.Value));
       NestedT := '';
+      PtrPointeeT := '';
       if (TypeName <> '') and (FindUDT(TypeName) >= 0) then
       begin
         Bank := srtInt;        // nested record field: int handle to the nested instance
         NestedT := TypeName;
       end
       else if TypeName <> '' then
-        Bank := TypeNameToBank(TypeName, FieldName)
+      begin
+        Bank := TypeNameToBank(TypeName, FieldName);
+        // A "T PTR" field where T is a UDT holds an int handle to a heap record. Record the pointee so
+        // chained pointer-field access (p->nxt->val) and p->ptrfield-> resolve correctly.
+        if (Length(TypeName) > 4) and (Copy(TypeName, Length(TypeName) - 3, 4) = ' PTR') and
+           (FindUDT(Trim(Copy(TypeName, 1, Length(TypeName) - 4))) >= 0) then
+          PtrPointeeT := Trim(Copy(TypeName, 1, Length(TypeName) - 4));
+      end
       else
         Bank := GetVariableType(FieldName);
       n := Length(FUDTs[Idx].Fields);
@@ -10028,6 +10081,7 @@ begin
       FUDTs[Idx].Fields[n].Name := UpperCase(FieldName);
       FUDTs[Idx].Fields[n].Bank := Bank;
       FUDTs[Idx].Fields[n].NestedType := NestedT;
+      FUDTs[Idx].Fields[n].PtrPointee := PtrPointeeT;
       if NestedT = '' then
         FUDTs[Idx].Fields[n].WidthCode := TypeNameWidthCode(TypeName)  // B1.5: narrow field on store
       else
@@ -11106,7 +11160,10 @@ begin
          (Decl.GetChild(0).NodeType = antIdentifier) and (Decl.GetChild(1).NodeType = antIdentifier) then
       begin
         VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
-        if Dict.IndexOf(VNameU) >= 0 then
+        // Only builtin scalars need array backing: a UDT variable is already a stable record handle, so
+        // @obj just reads that handle (EmitVarAddress's machinery would wrongly turn the UDT into a
+        // 1-element int array).
+        if (Dict.IndexOf(VNameU) >= 0) and (FindUDT(UpperCase(VarToStr(Decl.GetChild(1).Value))) < 0) then
           Decl.Attributes.Values['SHARED'] := '1';   // route through the SHARED-scalar backing machinery
       end;
     end;
@@ -11142,6 +11199,22 @@ begin
   begin
     Pointee := FPointerVars.ValueFromIndex[idx];
     Result := TypeNameToBank(Pointee, PtrName);
+  end;
+end;
+
+function TSSAGenerator.PointerUDTType(const PtrName: string): string;
+// If PtrName is declared "DIM p AS T PTR" where T is a user UDT, return T; else ''. Such a pointer
+// carries a record handle directly (the managed-reference model), so p.field / p->field resolve to
+// record access on p's int value, and @obj / NEW T produce that handle.
+var
+  idx: Integer;
+begin
+  Result := '';
+  idx := FPointerVars.IndexOfName(UpperCase(PtrName));
+  if idx >= 0 then
+  begin
+    if FindUDT(UpperCase(FPointerVars.ValueFromIndex[idx])) >= 0 then
+      Result := UpperCase(FPointerVars.ValueFromIndex[idx]);
   end;
 end;
 
@@ -11265,6 +11338,47 @@ begin
   TempReg := FProgram.AllocRegister(srtInt);
   Result := MakeSSARegister(srtInt, TempReg);
   EmitInstruction(ssaAddInt, Result, BaseVal, LinearIndex, MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.EmitNewObject(Node: TASTNode; out Result: TSSAValue);
+// FreeBASIC "NEW T" / "NEW T(args)": allocate a record on the heap and run its constructor; evaluates
+// to the record handle (int), assignable to a "T PTR". The record is allocated in the SHARED region
+// (immediate bit 48) so it is NOT reclaimed at the allocating frame's exit — the pointer keeps it
+// alive until DELETE. Member access through the pointer (p->field) routes via the handle as usual.
+var
+  NewType: string;
+  UDTIdx: Integer;
+begin
+  NewType := UpperCase(VarToStr(Node.Value));
+  UDTIdx := FindUDT(NewType);
+  if UDTIdx < 0 then
+    raise Exception.CreateFmt('NEW requires a known TYPE, got "%s"', [NewType]);
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRecordNew, Result,
+                  MakeSSAConstInt(FUDTs[UDTIdx].NInt), MakeSSAConstInt(FUDTs[UDTIdx].NFloat),
+                  MakeSSAConstInt(FUDTs[UDTIdx].NStr or (Int64(UDTIdx) shl 32) or (Int64(1) shl 48)));
+  EmitRecordInit(Result, UDTIdx);                 // allocate nested-UDT members
+  if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antArgumentList) then
+    EmitConstructorCall(Result, NewType, Node.GetChild(0))
+  else
+    EmitConstructorCall(Result, NewType);
+end;
+
+procedure TSSAGenerator.EmitDeleteObject(Node: TASTNode);
+// FreeBASIC "DELETE p": run the pointee's destructor (if any). v1 does not free the heap slot (the
+// shared region has no free list yet) — the observable effect (the destructor) is what matters; the
+// memory is reclaimed at program end. Node child0 = the pointer expression (must be a UDT pointer).
+var
+  PtrName, PtrType: string;
+begin
+  if Node.ChildCount < 1 then Exit;
+  if Node.GetChild(0).NodeType <> antIdentifier then
+    raise Exception.Create('DELETE expects a pointer variable');
+  PtrName := VarToStr(Node.GetChild(0).Value);
+  PtrType := PointerUDTType(PtrName);
+  if PtrType = '' then
+    raise Exception.CreateFmt('DELETE expects a UDT pointer, "%s" is not one', [PtrName]);
+  EmitDestructorCall(EnsureIntRegister(GetOrAllocateVariable(UpperCase(PtrName))), PtrType);
 end;
 
 procedure TSSAGenerator.EmitFieldAddress(MemberNode: TASTNode; out Result: TSSAValue);
@@ -11479,7 +11593,12 @@ begin
   Result := '';
   if ObjNode = nil then Exit;
   if ObjNode.NodeType = antIdentifier then
-    Result := VarRecordTypeName(VarToStr(ObjNode.Value))
+  begin
+    Result := VarRecordTypeName(VarToStr(ObjNode.Value));
+    if Result = '' then Result := PointerUDTType(VarToStr(ObjNode.Value));  // UDT pointer: p.field / p->field
+  end
+  else if ObjNode.NodeType = antDeref then
+    Result := PointerUDTType(VarToStr(ObjNode.GetChild(0).Value))           // (*p).field
   else if ObjNode.NodeType = antArrayAccess then
   begin
     if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0).NodeType = antIdentifier) then
@@ -11493,7 +11612,11 @@ begin
   begin
     ParentType := ObjectTypeName(ObjNode.GetChild(0));
     if UDTFieldBankSlot(FindUDT(ParentType), VarToStr(ObjNode.Value), Bank, Slot, NestedT) then
+    begin
       Result := NestedT;
+      // A pointer field (T PTR) holds a handle to a T — used for chained access "p->nxt->val".
+      if Result = '' then Result := UDTFieldPtrPointee(FindUDT(ParentType), VarToStr(ObjNode.Value));
+    end;
   end;
 end;
 
@@ -11584,7 +11707,15 @@ begin
   begin
     // Record variable (or record-typed parameter): handle is the variable's int register.
     TypeName := VarRecordTypeName(VarToStr(ObjNode.Value));
-    if TypeName = '' then Exit;
+    if TypeName = '' then
+    begin
+      // UDT pointer (DIM p AS T PTR): p's int value IS the record handle (managed-reference model).
+      TypeName := PointerUDTType(VarToStr(ObjNode.Value));
+      if TypeName = '' then Exit;
+      HandleVal := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(ObjNode.Value))));
+      Result := True;
+      Exit;
+    end;
     // Refinement #2: a SHARED UDT scalar keeps its (shared) record handle in element 0 of its backing
     // array, so read the handle from there — the record lives in the shared region (cross-thread).
     if IsSharedScalar(VarToStr(ObjNode.Value)) then
@@ -11595,6 +11726,14 @@ begin
     end
     else
       HandleVal := GetOrAllocateVariable(UpperCase(VarToStr(ObjNode.Value)));
+    Result := True;
+  end
+  else if ObjNode.NodeType = antDeref then
+  begin
+    // (*p).field where p is a UDT pointer: the deref yields p's handle directly.
+    TypeName := PointerUDTType(VarToStr(ObjNode.GetChild(0).Value));
+    if TypeName = '' then Exit;
+    HandleVal := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(ObjNode.GetChild(0).Value))));
     Result := True;
   end
   else if ObjNode.NodeType = antArrayAccess then
@@ -11609,11 +11748,16 @@ begin
   end
   else if ObjNode.NodeType = antMemberAccess then
   begin
-    // Chained access (a.b.c): the parent (a.b) is itself a nested-UDT field; load its handle.
+    // Chained access (a.b.c): the parent (a.b) is itself a nested-UDT field, or a pointer field
+    // (a->b where b is "T PTR"). Either way the field stores an int handle to the target record; load
+    // it and continue. For a pointer field the handle is the pointee; for a nested record it is the
+    // embedded instance.
     if not ResolveRecordObject(ObjNode.GetChild(0), ParentHandle, ParentType) then Exit;
     ParentUDT := FindUDT(ParentType);
     if not UDTFieldBankSlot(ParentUDT, VarToStr(ObjNode.Value), Bank, Slot, NestedT) then Exit;
-    if NestedT = '' then Exit;   // parent.field is not itself a record
+    if NestedT = '' then
+      NestedT := UDTFieldPtrPointee(ParentUDT, VarToStr(ObjNode.Value));
+    if NestedT = '' then Exit;   // parent.field is neither a record nor a UDT pointer
     NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaRecordLoadInt, NestedHandle, ParentHandle,
                     MakeSSAValue(svkNone), MakeSSAConstInt(Slot));

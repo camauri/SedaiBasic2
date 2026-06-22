@@ -78,6 +78,8 @@ type
     procedure ApplyDialectProfile;
     function MemSwapStatementHandler: TASTNode;   // MODERN: SWAP a,b ; declines for other mem commands
     function IdentMidStatementHandler: TASTNode;  // MODERN: MID(dst,..)=src ; declines for other idents
+    function ProgEditModernHandler: TASTNode;     // MODERN: DELETE p ; declines for other prog-edit cmds
+    function ParseDeleteStatement: TASTNode;      // MODERN: DELETE p → antDelete(child0=ptr expr)
 
     // options & configuration
     function DefaultParserOptions: TParserOptions;
@@ -370,6 +372,34 @@ begin
     RegisterStatementHandler(ttMemoryCommand, @MemSwapStatementHandler);
   if FProfile.MidIsStatement then
     RegisterStatementHandler(ttIdentifier, @IdentMidStatementHandler);
+  if FProfile.Modern then
+    RegisterStatementHandler(ttProgramEditing, @ProgEditModernHandler);
+end;
+
+function TPackratParser.ProgEditModernHandler: TASTNode;
+// MODERN override for ttProgramEditing: "DELETE p" frees a NEW'd object (FreeBASIC). Any other
+// program-editing command (NEW/LIST/RENUMBER...) declines (nil) so the classic statement parser runs.
+// (Bare "NEW T" is an expression, handled by the expression parser, not here.)
+begin
+  Result := nil;
+  if UpperCase(Context.CurrentToken.Value) = 'DELETE' then
+    Result := ParseDeleteStatement;
+end;
+
+function TPackratParser.ParseDeleteStatement: TASTNode;
+// "DELETE p" — run the destructor of the pointee and free it. child0 = the pointer expression.
+var
+  PtrExpr: TASTNode;
+begin
+  Context.Advance;   // consume DELETE
+  PtrExpr := FExpressionParser.ParseExpression(precCall);
+  if not Assigned(PtrExpr) then
+  begin
+    HandleError('Expected a pointer after DELETE', Context.CurrentToken);
+    Exit(nil);
+  end;
+  Result := TASTNode.Create(antDelete, Context.CurrentToken);
+  Result.AddChild(PtrExpr);
 end;
 
 function TPackratParser.MemSwapStatementHandler: TASTNode;
@@ -2135,7 +2165,17 @@ begin
         if Context.Check(ttIdentifier) or
            ((Length(Context.CurrentToken.Value) > 0) and
             (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
+        begin
           FieldTypeName := ParseDottedName;         // dotted: namespace-qualified field type
+          // FreeBASIC pointer field "<type> PTR": stored as an int handle. Capturing the suffix keeps
+          // a self-referential field (e.g. "NXT AS NODE PTR" in a linked list) from being treated as a
+          // nested record (which would recurse forever when allocating the type).
+          while Context.Check(ttIdentifier) and (UpCase(Context.CurrentToken.Value) = 'PTR') do
+          begin
+            FieldTypeName := FieldTypeName + ' PTR';
+            Context.Advance;                        // consume PTR
+          end;
+        end;
       end;
       FieldNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(FieldTok.Value), FieldTok);
       TypeNode := TASTNode.CreateWithValue(antIdentifier, FieldTypeName, FieldTok);

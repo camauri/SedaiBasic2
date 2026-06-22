@@ -1664,6 +1664,9 @@ begin
           TokenBufferAdd(CurrentChar);
           AdvanceChar;
           if GetCurrentChar = '=' then begin AdvanceChar; Result := CreateToken(ttCompoundAssign); end
+          // FreeBASIC pointer-to-member "->": lexes as the member-access operator (our UDT pointers
+          // carry the record handle directly, so p->field is the same as p.field).
+          else if GetCurrentChar = '>' then begin AdvanceChar; Result := CreateToken(ttOpDot); end
           else Result := CreateToken(ttOpSub);
           {$IFDEF DEBUG}
           if FDebugMode then

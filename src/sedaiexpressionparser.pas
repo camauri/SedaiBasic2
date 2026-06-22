@@ -76,6 +76,7 @@ type
     function ParseUsrFunction(Token: TLexerToken): TASTNode;
     function ParseUserFunction(Token: TLexerToken): TASTNode;
     function ParseProcAddress(Token: TLexerToken): TASTNode;   // @subname → antProcAddress (M5.2)
+    function ParseNew(Token: TLexerToken): TASTNode;           // NEW T [(args)] → antNew (FreeBASIC)
     function ParseDeref(Token: TLexerToken): TASTNode;         // *ptr → antDeref (FreeBASIC pointers)
     function ParseThreadCreate(Token: TLexerToken): TASTNode;  // THREADCREATE(@sub, param) (M5.2)
     function ParseThreadSelf(Token: TLexerToken): TASTNode;    // THREADSELF() → antThreadSelf (M5.5)
@@ -123,6 +124,7 @@ function StaticParseInputFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseUsrFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseUserFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseProcAddress(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseNew(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseDeref(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadCreate(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadSelf(Parser: Pointer; Token: TLexerToken): TObject;
@@ -242,6 +244,11 @@ end;
 function StaticParseProcAddress(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseProcAddress(Token);
+end;
+
+function StaticParseNew(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseNew(Token);
 end;
 
 function StaticParseDeref(Parser: Pointer; Token: TLexerToken): TObject;
@@ -394,6 +401,10 @@ begin
   Context.SetParseRule(ttProcedureStart, MakePrefixRule(@StaticParseUserFunction, precCall));
   // M5.2 threading: @subname (proc address) and THREADCREATE(@sub, param) as value expressions.
   Context.SetParseRule(ttOpAt, MakePrefixRule(@StaticParseProcAddress, precUnary));
+  // FreeBASIC heap allocation: "NEW T"/"NEW T(args)" as a value expression (a "T PTR"). NEW lexes as
+  // ttProgramEditing (its classic role is the program-erase command, parsed at statement level), so a
+  // prefix rule here only fires when NEW appears where an expression is expected (e.g. "p = NEW T").
+  Context.SetParseRule(ttProgramEditing, MakePrefixRule(@StaticParseNew, precUnary));
   Context.SetParseRule(ttThreadCreate, MakePrefixRule(@StaticParseThreadCreate, precCall));
   // M5.5: THREADSELF() value + THREADCALL sub(arg) (sugar that lowers to THREADCREATE).
   Context.SetParseRule(ttThreadSelf, MakePrefixRule(@StaticParseThreadSelf, precCall));
@@ -1378,6 +1389,39 @@ begin
     // @arr(i) / @obj.field: keep the operand subtree as child0.
     Result := TASTNode.Create(antProcAddress, Token);
     Result.AddChild(Operand);
+  end;
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseNew(Token: TLexerToken): TASTNode;
+// FreeBASIC "NEW T" / "NEW T(args)". The NEW token is already consumed (prefix rule). Read the type
+// name, then an optional parenthesised constructor argument list. Lowers to antNew(value = type name,
+// child0 = antArgumentList of ctor args when present). SSA allocates a heap record and runs its ctor.
+var
+  ArgList: TASTNode;
+begin
+  if not Context.Check(ttIdentifier) then
+  begin
+    HandleError('Expected a TYPE name after NEW', Context.CurrentToken);
+    Result := nil;
+    Exit;
+  end;
+  Result := TASTNode.CreateWithValue(antNew, UpperCase(Context.CurrentToken.Value), Token);
+  Context.Advance;  // consume the type name
+  if Context.Check(ttDelimParOpen) then
+  begin
+    Context.Advance;  // consume '('
+    if Context.Check(ttDelimParClose) then
+      ArgList := TASTNode.Create(antArgumentList, Token)   // NEW T() — empty arg list
+    else
+      ArgList := ParseArgumentList;                        // comma-separated ctor args → antArgumentList
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" after NEW constructor arguments', Context.CurrentToken);
+      if Assigned(ArgList) then ArgList.Free;
+      Result.Free; Result := nil; Exit;
+    end;
+    if Assigned(ArgList) then Result.AddChild(ArgList);
   end;
   DoNodeCreated(Result);
 end;
