@@ -135,7 +135,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `OPERATOR <sym>` | ✓ | Operator overloading for UDTs (binary, direct operands) |
 | `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like macros; function-like macros pending) |
 | `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening (methods of a namespaced TYPE / `USING` / `..global` pending) |
-| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`/`p(i)`, and passing pointers across SUB calls — all read+write. Multi-level PTR pending |
+| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`/`p(i)`, passing pointers across SUB calls. **UDT pointers**: `DIM p AS T PTR`, `NEW T`/`DELETE`, `@obj`, `p->field`/`p.field`, self-referential `NXT AS NODE PTR` (linked lists/trees), chained `p->nxt->val`. Multi-level `PTR PTR` pending |
 | `FUNCTION f() BYREF AS T` | ✓ | BYREF function results: return a reference to a SHARED/global scalar, read + write through it (`f()=x`). Returning a BYREF parameter (the `min(a,b)=0` idiom) pending |
 | `WSTRING` | ✗ | Not yet implemented |
 
@@ -1544,11 +1544,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `New Expression` | ✓ |  |
-| `New Overload` | ✓ |  |
+| `New Expression` | ✓ | `NEW T` / `NEW T(args)` allocates a heap record (runs its constructor) and yields a `T PTR`. Outlives the allocating frame |
+| `New Overload` | ✗ | Constructor overloads apply, but `operator new` is not user-overloadable |
 | `Placement New` | ✗ |  |
-| `Delete Statement` | ✓ |  |
-| `Delete Overload` | ✓ |  |
+| `Delete Statement` | ✓ | `DELETE p` runs the pointee's destructor (heap slot not yet reclaimed) |
+| `Delete Overload` | ✗ |  |
 
 #### Iteration Operators
 
