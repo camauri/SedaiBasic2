@@ -137,7 +137,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening (methods of a namespaced TYPE / `USING` / `..global` pending) |
 | Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`/`p(i)`, passing pointers across SUB calls, multi-level `PTR PTR` (`**pp`). **UDT pointers**: `DIM p AS T PTR`, `NEW T`/`DELETE`, `@obj`, `p->field`/`p.field`, self-referential `NXT AS NODE PTR` (linked lists/trees), chained `p->nxt->val`. **BYREF-return of a BYREF param** (`min(a,b)=0`, int pointees). Raw `Allocate`/`CAllocate` pending |
 | `FUNCTION f() BYREF AS T` | ✓ | BYREF function results: return a reference to a SHARED/global scalar or a BYREF parameter (the `min(a,b)=0` idiom, int pointees), read + write through it (`f()=x`) |
-| `WSTRING` | ✗ | Not yet implemented |
+| `WSTRING` | ✓ | Unicode wide string (UTF-8 storage). `DIM s AS WSTRING [* n]`, params/return/UDT fields/arrays. `LEN`/`LEFT$`/`RIGHT$`/`MID$` index by codepoint; assignment/concat/PRINT shared with `STRING`. `WSTR(x)` converter. Fixed-length `* n` advisory (var-length storage) |
 
 ## Variable Scope
 
@@ -1246,17 +1246,17 @@ The following PETSCII codes are silently ignored because they require full-scree
 > ◐ = partially implemented (see note). ✗ = not implemented.
 > Note: a ✓ marks name recognition — exact semantics may still differ from FreeBASIC. OOP `TYPE`
 > (methods/inheritance/virtual dispatch/constructors/destructors/PROPERTY/OPERATOR), threading, and a
-> basic preprocessor (object-like #define, #ifdef/#include) are implemented; namespaces, WString and
-> function-like macros are not yet present. **Pointers are NOT excluded** — their implementation is not
-> yet decided; today the language is reference-only, and adding FB-style pointers later is an open
-> design question (it would make SedaiBasic a powerful FreeBASIC alternative). This is a forward-looking
-> gap map, not a claim of FreeBASIC compatibility.
+> basic preprocessor (object-like #define, #ifdef/#include), namespaces, pointers (managed + raw
+> `Allocate`), and WString/unicode (UTF-8, codepoint-aware) are implemented; function-like macros and
+> FB-syntax file I/O are not yet present. This is a forward-looking gap map, not a claim of FreeBASIC
+> compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **242 / 643 implemented (38%)**, plus 11 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **244 / 643 implemented (38%)**, plus 11 partial (◐).
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
-> compound & bitwise operators, string/conversion/array functions, and a basic preprocessor. Main
-> gaps: namespaces, pointers (undecided), WString/unicode, function-like macros, file I/O in FB syntax.
+> compound & bitwise operators, string/conversion/array functions, namespaces, pointers (managed + raw
+> `Allocate`), WString/unicode, and a basic preprocessor. Main gaps: function-like macros, file I/O in
+> FB syntax, the remaining wide-string helpers (WCHR/WHEX/WBIN/WOCT/WSPACE).
 
 ## Language Documentation
 
@@ -1373,7 +1373,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `STRING` | ✗ | Fixed-length and variable-length strings with built-in memory management. |
 | `ZSTRING` | ✗ | Fixed-length and variable-length null-terminated strings. |
-| `WSTRING` | ✗ | Fixed-length and variable-length null-terminated strings of wide characters. |
+| `WSTRING` | ✓ | Wide-character strings (UTF-8 storage, codepoint-aware LEN/MID/LEFT$/RIGHT$). Fixed-length `* n` parsed but advisory (var-length storage). |
 
 ##### Class types
 
@@ -1411,7 +1411,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `STR and WSTR` | ✗ | Converts numeric expressions or booleans to their string representation. |
+| `STR and WSTR` | ✓ | Converts numeric expressions to their string representation (`STR$`/`WSTR`; `WSTR` yields a wide string). |
 | `VAL` | ✓ | Converts a numeric string expression to a floating-point value. |
 | `VALINT and VALUINT` | ✓ | Converts numeric string expressions to integer values. Parses the leading integer (B1.3; range/sign differences deferred). |
 | `VALLNG and VALULNG` | ◐ | `VALLNG` ✓ (B1.3, leading-integer parse); `VALULNG` not yet. |
@@ -2297,7 +2297,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `STRING` | ✗ | Standard data type: 8 bit character string. |
 | `STRING (Function)` | ✗ | Returns a String of multiple characters. |
 | `ZSTRING` | ✗ | Standard data type: null terminated 8 bit character string. |
-| `WSTRING` | ✗ | Standard data type: wide character string. |
+| `WSTRING` | ✓ | Standard data type: wide character string (UTF-8 storage, codepoint-aware LEN/slice). |
 | `WSTRING (Function)` | ✗ | Returns a WString of multiple characters. |
 | `SPACE` | ✓ | Returns a String of N spaces. `SPACE(n)` / `SPACE$(n)` (B1.2). |
 | `WSPACE` | ✗ | Returns a WString consisting of spaces. |
@@ -2322,7 +2322,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `OCT` | ✓ | Returns an octal String representation of an integral value. `OCT(n)`, no leading zeros (B1.3). |
 | `WOCT` | ✗ | Returns an octal WString representation of an integral value. |
 | `STR` | ✗ | Returns the String representation of numeric value or boolean. |
-| `WSTR` | ✗ | Returns the WString representation of numeric value. |
+| `WSTR` | ✓ | Returns the WString representation of a numeric value (or widens a string). |
 | `FORMAT` | ✗ | Returns a formatted String representation of a Double. |
 
 #### String to Numeric Conversions
