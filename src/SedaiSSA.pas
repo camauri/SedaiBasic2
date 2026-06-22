@@ -141,6 +141,7 @@ type
     // routed to element 0 of this array, so the value is never a per-thread register.
     FSharedScalarArr: TStringList;       // name (UPPER) -> array index (Objects[]=PtrInt arrayIdx)
     FPointerVars: TStringList;           // FreeBASIC pointers: var name (UPPER) -> pointee type name (e.g. "INTEGER")
+    FRawCollectChanged: Boolean;         // CollectRawPtrVars fixpoint: a new raw var was discovered this pass
     FRawPtrVars: TStringList;            // FreeBASIC raw pointers: var (UPPER) ever assigned from Allocate/CAllocate/
                                          // Reallocate. Its value is a RAWPTR_TAG byte offset → deref/arithmetic use the
                                          // raw byte heap (SizeOf-scaled), not the managed FArrays/record path.
@@ -976,6 +977,21 @@ begin
       // program-editing NEW carries no Value and is handled as a statement, so this branch only fires
       // for the FB allocator form (Value = the type name).
       EmitNewObject(Node, Result);
+
+    antCast:
+    begin
+      // FreeBASIC CAST/CPTR(type, expr). A pointer target type is a value passthrough (the raw byte
+      // offset / managed handle is reinterpreted, not changed — the receiving variable's declared type
+      // drives the deref). A scalar target type converts the value to that bank.
+      ArrName2 := UpperCase(VarToStr(Node.Value));
+      ProcessExpression(Node.GetChild(0), Left);
+      if (Length(ArrName2) >= 4) and (Copy(ArrName2, Length(ArrName2) - 3, 4) = ' PTR') then
+        Result := EnsureIntRegister(Left)                   // pointer cast: value passthrough
+      else if (ArrName2 = 'DOUBLE') or (ArrName2 = 'SINGLE') then
+        Result := EnsureFloatRegister(Left)
+      else
+        Result := EnsureIntRegister(Left);                  // scalar int conversion (truncates float)
+    end;
 
     antDeref:
     begin
@@ -11649,20 +11665,43 @@ begin
 end;
 
 procedure TSSAGenerator.CollectRawPtrVars(Node: TASTNode);
-// Pre-scan: a pointer variable assigned from ALLOCATE/CALLOCATE/REALLOCATE anywhere is a raw pointer
-// for its whole scope (so deref/arithmetic pick the raw heap regardless of statement order).
+// Pre-scan (run to a fixpoint by the caller): a pointer variable is RAW if it is assigned from
+// ALLOCATE/CALLOCATE/REALLOCATE, from a pointer CAST/CPTR of a raw value, or copied from another raw
+// pointer. Raw-ness then drives deref/arithmetic onto the byte heap regardless of statement order.
 var
   i: Integer;
-  Lhs: TASTNode;
-  FuncU: string;
+  Lhs, Rhs: TASTNode;
+  FuncU, LhsU, TypeU: string;
+
+  procedure MarkRaw(const N: string);
+  begin
+    if FRawPtrVars.IndexOf(UpperCase(N)) < 0 then
+    begin
+      FRawPtrVars.Add(UpperCase(N));
+      FRawCollectChanged := True;
+    end;
+  end;
+
 begin
   if Node = nil then Exit;
-  if (Node.NodeType = antAssignment) and (Node.ChildCount >= 2) then
+  if (Node.NodeType = antAssignment) and (Node.ChildCount >= 2) and (Node.GetChild(0).NodeType = antIdentifier) then
   begin
     Lhs := Node.GetChild(0);
-    if (Lhs.NodeType = antIdentifier) and IsAllocCall(Node.GetChild(1), FuncU) then
-      if FRawPtrVars.IndexOf(UpperCase(VarToStr(Lhs.Value))) < 0 then
-        FRawPtrVars.Add(UpperCase(VarToStr(Lhs.Value)));
+    Rhs := Node.GetChild(1);
+    LhsU := UpperCase(VarToStr(Lhs.Value));
+    if IsAllocCall(Rhs, FuncU) then
+      MarkRaw(LhsU)
+    else if Rhs.NodeType = antCast then
+    begin
+      // p = CAST(<ptr type>, X): raw if X is an Allocate call or an already-raw pointer var.
+      TypeU := UpperCase(VarToStr(Rhs.Value));
+      if (Length(TypeU) >= 4) and (Copy(TypeU, Length(TypeU) - 3, 4) = ' PTR') and (Rhs.ChildCount >= 1) then
+        if IsAllocCall(Rhs.GetChild(0), FuncU) or
+           ((Rhs.GetChild(0).NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.GetChild(0).Value))) then
+          MarkRaw(LhsU);
+    end
+    else if (Rhs.NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.Value)) then
+      MarkRaw(LhsU);   // p = q, q raw
   end;
   for i := 0 to Node.ChildCount - 1 do
     CollectRawPtrVars(Node.GetChild(i));
@@ -13450,7 +13489,12 @@ begin
   // with a 1-element global array (a stable address); also records pointee types in FPointerVars.
   CollectAddressTakenVars(AST);
   CollectSharedVars(AST);
-  CollectRawPtrVars(AST);   // FreeBASIC raw pointers: vars assigned from Allocate/CAllocate/Reallocate
+  // FreeBASIC raw pointers: vars assigned from Allocate/CAllocate/Reallocate (and CAST/copies of raw).
+  // Iterate to a fixpoint so raw-ness propagates through copies regardless of statement order.
+  repeat
+    FRawCollectChanged := False;
+    CollectRawPtrVars(AST);
+  until not FRawCollectChanged;
 
   // M8: reset block-scope state (block-scoped record reclamation; the scope stack itself was reset above).
   FBlockHandledVars.Clear;

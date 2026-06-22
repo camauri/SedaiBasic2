@@ -77,6 +77,7 @@ type
     function ParseUserFunction(Token: TLexerToken): TASTNode;
     function ParseProcAddress(Token: TLexerToken): TASTNode;   // @subname → antProcAddress (M5.2)
     function ParseNew(Token: TLexerToken): TASTNode;           // NEW T [(args)] → antNew (FreeBASIC)
+    function ParseCast(Token: TLexerToken): TASTNode;          // CAST/CPTR(type, expr) → antCast
     function ParseDeref(Token: TLexerToken): TASTNode;         // *ptr → antDeref (FreeBASIC pointers)
     function ParseThreadCreate(Token: TLexerToken): TASTNode;  // THREADCREATE(@sub, param) (M5.2)
     function ParseThreadSelf(Token: TLexerToken): TASTNode;    // THREADSELF() → antThreadSelf (M5.5)
@@ -777,6 +778,16 @@ begin
 
   IdentName := UpperCase(Token.Value);
 
+  // FreeBASIC CAST(type, expr) / CPTR(type, expr): the first argument is a TYPE (which the expression
+  // parser cannot parse as an expression), so handle it specially. Lowers to antCast(value = type
+  // string, child0 = value expr). In the raw-pointer model a pointer cast is a value passthrough (the
+  // byte offset is unchanged); a scalar type converts the value.
+  if ((IdentName = 'CAST') or (IdentName = 'CPTR')) and Context.Check(ttDelimParOpen) then
+  begin
+    Result := ParseCast(Token);
+    Exit;
+  end;
+
   // Check if this is a user-defined function call (FNxxx followed by parenthesis)
   // This handles the case where FNSQ(5) is tokenized as a single identifier
   if (Length(IdentName) > 2) and (Copy(IdentName, 1, 2) = 'FN') and
@@ -1423,6 +1434,47 @@ begin
     end;
     if Assigned(ArgList) then Result.AddChild(ArgList);
   end;
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseCast(Token: TLexerToken): TASTNode;
+// CAST/CPTR(type, expr). The leading identifier is already consumed; the current token is '('. Read the
+// type (identifiers joined with spaces, dots kept tight — e.g. "INTEGER PTR", "FORMS.POINT"), then the
+// value expression. Lowers to antCast(value = upper-case type string, child0 = value expr).
+var
+  TypeStr: string;
+  ValExpr: TASTNode;
+begin
+  Context.Advance;   // consume '('
+  TypeStr := '';
+  while (not Context.IsAtEnd) and (not Context.Check(ttSeparParam)) and (not Context.Check(ttDelimParClose)) do
+  begin
+    if Context.Check(ttOpDot) then TypeStr := TypeStr + '.'
+    else
+    begin
+      if (TypeStr <> '') and (TypeStr[Length(TypeStr)] <> '.') then TypeStr := TypeStr + ' ';
+      TypeStr := TypeStr + UpperCase(Context.CurrentToken.Value);
+    end;
+    Context.Advance;
+  end;
+  if not Context.Match(ttSeparParam) then
+  begin
+    HandleError('Expected "," after the type in CAST/CPTR', Context.CurrentToken);
+    Exit(nil);
+  end;
+  ValExpr := ParseExpression(precNone);
+  if not Assigned(ValExpr) then
+  begin
+    HandleError('Expected a value expression in CAST/CPTR', Context.CurrentToken);
+    Exit(nil);
+  end;
+  if not Context.Match(ttDelimParClose) then
+  begin
+    HandleError('Expected ")" to close CAST/CPTR', Context.CurrentToken);
+    ValExpr.Free; Exit(nil);
+  end;
+  Result := TASTNode.CreateWithValue(antCast, Trim(TypeStr), Token);
+  Result.AddChild(ValExpr);
   DoNodeCreated(Result);
 end;
 

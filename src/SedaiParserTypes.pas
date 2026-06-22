@@ -64,6 +64,7 @@ type
     antNamespace,         // NAMESPACE name ... END NAMESPACE (FreeBASIC): value=name, children=member statements; flattened away before SSA
     antMemberAccess,      // record.field : child0 = object expr, value = field name
     antDeref,             // FreeBASIC pointer dereference *p : child0 = pointer expr (lvalue or rvalue)
+    antCast,              // FreeBASIC CAST/CPTR(type, expr) : value = type string, child0 = value expr
     antSpecialVariable,   // Special variables (TI, TI$, DT$, etc.)
 
     // === FUNCTIONS ===
