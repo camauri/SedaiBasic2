@@ -72,6 +72,7 @@ type
     NestedType: string;     // UDT type name if this field is itself a record (else ''); held as an int handle
     PtrPointee: string;     // pointee UDT type if this field is a "T PTR" (else ''); held as an int handle
     WidthCode: Integer;     // B1.5: narrow width code for a sub-64-bit/SINGLE field (0 = full width)
+    IsWString: Boolean;     // WSTRING field: srtString storage (UTF-8) but LEN/MID count by codepoint
   end;
   TUDTType = record
     Name: string;
@@ -274,6 +275,7 @@ type
     function AddrLocalBank(const Name: string): TSSARegisterType;               // bank of an @-taken local
     function AddrLocalHandle(const Name: string): TSSAValue;                    // its per-frame record handle (hidden var)
     function UDTFieldPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT of a "T PTR" field, else ''
+    function UDTFieldIsWString(UDTIdx: Integer; const FieldName: string): Boolean;  // field declared AS WSTRING?
     function DerefedType(Node: TASTNode): string;                               // FB type of *<expr> (multi-level aware)
     function DerefOperandBank(Node: TASTNode): TSSARegisterType;                // bank of *<expr> incl. pointer arithmetic (p+n)
     procedure EmitArrayElementAddress(Node: TASTNode; out Result: TSSAValue);   // @arr(i) → packed element address
@@ -10322,6 +10324,19 @@ begin
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].PtrPointee);
 end;
 
+function TSSAGenerator.UDTFieldIsWString(UDTIdx: Integer; const FieldName: string): Boolean;
+// True if the named field is declared AS WSTRING (so obj.field LEN/MID index by codepoint).
+var
+  i: Integer;
+  F: string;
+begin
+  Result := False;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].IsWString);
+end;
+
 procedure TSSAGenerator.RegisterUDTs(Node: TASTNode);
 // Two passes so a TYPE may reference another TYPE declared later (forward reference).
 begin
@@ -10424,6 +10439,7 @@ begin
       FUDTs[Idx].Fields[n].Bank := Bank;
       FUDTs[Idx].Fields[n].NestedType := NestedT;
       FUDTs[Idx].Fields[n].PtrPointee := PtrPointeeT;
+      FUDTs[Idx].Fields[n].IsWString := (TypeName = 'WSTRING');  // codepoint LEN/MID on obj.field
       if NestedT = '' then
         FUDTs[Idx].Fields[n].WidthCode := TypeNameWidthCode(TypeName)  // B1.5: narrow field on store
       else
@@ -11908,6 +11924,11 @@ begin
       Result := IsWStringVar(VarToStr(Node.Value));
     antParentheses:
       Result := (Node.ChildCount >= 1) and IsWStringExpr(Node.GetChild(0));
+    antMemberAccess:
+      // obj.field where the field is declared AS WSTRING. Resolve the object's UDT type (no code
+      // emitted) and look up the field. Value = field name, child 0 = the object expression.
+      if Node.ChildCount >= 1 then
+        Result := UDTFieldIsWString(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value));
     antBinaryOp:
       // Concatenation (or any binary string op): wide if either operand is wide.
       Result := (Node.ChildCount >= 2) and

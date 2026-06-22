@@ -2175,6 +2175,13 @@ begin
             FieldTypeName := FieldTypeName + ' PTR';
             Context.Advance;                        // consume PTR
           end;
+          // FreeBASIC fixed-length string field: "AS STRING * n" / "AS WSTRING * n". Consume the
+          // "* <length>" so the field parses; the capacity is advisory in v1 (variable-length storage).
+          if Context.Check(ttOpMul) then
+          begin
+            Context.Advance;                        // '*'
+            FExpressionParser.ParseExpression(precCall).Free;   // length operand (discarded)
+          end;
         end;
       end;
       FieldNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(FieldTok.Value), FieldTok);
