@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 250 / 643 implemented (39%)** (+ ~6 partial); see the
+**FreeBASIC keyword set — 258 / 643 implemented (40%)** (+ ~4 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1251,7 +1251,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 > FB-syntax file I/O are not yet present. This is a forward-looking gap map, not a claim of FreeBASIC
 > compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **250 / 643 implemented (39%)**, plus ~6 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **258 / 643 implemented (40%)**, plus ~4 partial (◐).
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
 > compound & bitwise operators, string/conversion/array functions, namespaces, pointers (managed + raw
@@ -2298,9 +2298,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `STRING (Function)` | ✗ | Returns a String of multiple characters. |
 | `ZSTRING` | ✗ | Standard data type: null terminated 8 bit character string. |
 | `WSTRING` | ✓ | Standard data type: wide character string (UTF-8 storage, codepoint-aware LEN/slice). |
-| `WSTRING (Function)` | ✗ | Returns a WString of multiple characters. |
+| `WSTRING (Function)` | ✓ | `WSTRING(n, cp)` — n copies of the wide char for Unicode codepoint cp. |
 | `SPACE` | ✓ | Returns a String of N spaces. `SPACE(n)` / `SPACE$(n)` (B1.2). |
-| `WSPACE` | ✗ | Returns a WString consisting of spaces. |
+| `WSPACE` | ✓ | `WSPACE(n)` — a wide string of n spaces. |
 | `LEN` | ✓ | Returns the length of a string in characters. |
 
 #### Character Conversion
@@ -2309,18 +2309,18 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `ASC` | ✓ | Returns an Integer representation of an character. |
 | `CHR` | ✗ | Returns a string of one or more characters from their ASCII Integer representation. |
-| `WCHR` | ✗ | Returns a WString of one or more characters from their Unicode Integer representation. |
+| `WCHR` | ✓ | `WCHR(n)` — the wide (UTF-8) character for Unicode codepoint n (single-codepoint form). |
 
 #### Numeric/Boolean to String Conversions
 
 | Keyword | Status | Description |
 |---|---|---|
 | `BIN` | ✓ | Returns a binary String representation of an integral value. `BIN(n)`, no leading zeros (B1.3). |
-| `WBIN` | ✗ | Returns a binary WString representation of an integral value. |
+| `WBIN` | ✓ | `WBIN(n)` — binary wide string of an integer. |
 | `HEX` | ✓ | Returns a hexadecimal String representation of an integral value (as `HEX$`). |
-| `WHEX` | ✗ | Returns a hexadecimal WString representation of an integral value. |
+| `WHEX` | ✓ | `WHEX(n)` — hexadecimal wide string of an integer. |
 | `OCT` | ✓ | Returns an octal String representation of an integral value. `OCT(n)`, no leading zeros (B1.3). |
-| `WOCT` | ✗ | Returns an octal WString representation of an integral value. |
+| `WOCT` | ✓ | `WOCT(n)` — octal wide string of an integer. |
 | `STR` | ✗ | Returns the String representation of numeric value or boolean. |
 | `WSTR` | ✓ | Returns the WString representation of a numeric value (or widens a string). |
 | `FORMAT` | ✗ | Returns a formatted String representation of a Double. |
