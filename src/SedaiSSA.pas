@@ -2423,7 +2423,10 @@ begin
             Arg2Reg := EnsureIntRegister(Arg2Value);
             DestReg := FProgram.AllocRegister(srtString);
             Result := MakeSSARegister(srtString, DestReg);
-            EmitInstruction(ssaStrLeft, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
+            if IsWStringExpr(ArgListNode.GetChild(0)) then  // WSTRING: n is a codepoint count
+              EmitInstruction(ssaStrLeftW, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone))
+            else
+              EmitInstruction(ssaStrLeft, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
           end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end
@@ -2438,7 +2441,10 @@ begin
             Arg2Reg := EnsureIntRegister(Arg2Value);
             DestReg := FProgram.AllocRegister(srtString);
             Result := MakeSSARegister(srtString, DestReg);
-            EmitInstruction(ssaStrRight, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
+            if IsWStringExpr(ArgListNode.GetChild(0)) then  // WSTRING: n is a codepoint count
+              EmitInstruction(ssaStrRightW, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone))
+            else
+              EmitInstruction(ssaStrRight, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
           end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end
@@ -4762,8 +4768,10 @@ procedure TSSAGenerator.EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAVal
 // (accepts an antArgumentList from MID$ or an antExpressionList from a bare MID(...) intercept).
 var
   ArgValue, Arg2Value, Arg3Value, ArgReg, Arg2Reg, Arg3Reg: TSSAValue;
+  IsW: Boolean;  // WSTRING source: start/length are codepoint-based (ssaStrMidW)
 begin
   if (ArgsNode = nil) or (ArgsNode.ChildCount < 2) then begin Result := MakeSSAValue(svkNone); Exit; end;
+  IsW := IsWStringExpr(ArgsNode.GetChild(0));
   ProcessExpression(ArgsNode.GetChild(0), ArgValue);   // string
   ProcessExpression(ArgsNode.GetChild(1), Arg2Value);  // start
   ArgReg := EnsureStringRegister(ArgValue);
@@ -4773,15 +4781,20 @@ begin
   begin
     ProcessExpression(ArgsNode.GetChild(2), Arg3Value);  // length
     Arg3Reg := EnsureIntRegister(Arg3Value);
-    EmitInstruction(ssaStrMid, Result, ArgReg, Arg2Reg, Arg3Reg);
+    if IsW then EmitInstruction(ssaStrMidW, Result, ArgReg, Arg2Reg, Arg3Reg)
+    else EmitInstruction(ssaStrMid, Result, ArgReg, Arg2Reg, Arg3Reg);
   end
   else
   begin
     // No length -> rest of string. Pass LEN(str) as the length REGISTER (the VM clamps to the chars
     // remaining). A constant here is wrong: ssaStrMid encodes its length operand as a register index.
+    // For a WSTRING the codepoint length (ssaStrLenW) is the natural cap (a byte length would also work
+    // since Utf8SubCP clamps to the end, but the codepoint count keeps the bytecode self-consistent).
     Arg3Reg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaStrLen, Arg3Reg, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    EmitInstruction(ssaStrMid, Result, ArgReg, Arg2Reg, Arg3Reg);
+    if IsW then EmitInstruction(ssaStrLenW, Arg3Reg, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+    else EmitInstruction(ssaStrLen, Arg3Reg, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    if IsW then EmitInstruction(ssaStrMidW, Result, ArgReg, Arg2Reg, Arg3Reg)
+    else EmitInstruction(ssaStrMid, Result, ArgReg, Arg2Reg, Arg3Reg);
   end;
 end;
 

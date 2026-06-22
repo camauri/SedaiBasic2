@@ -228,6 +228,12 @@ begin
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrRight', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcStrMid:
       Line := Format('%4d: %-20s R%d, R%d, startR%d, lenR%d', [Index, 'StrMid', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate and $FFFF]);
+    bcStrLeftW:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrLeftW', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcStrRightW:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrRightW', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcStrMidW:
+      Line := Format('%4d: %-20s R%d, R%d, startR%d, lenR%d', [Index, 'StrMidW', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate and $FFFF]);
 
     // === GROUP 2: MATH FUNCTIONS (0x02xx) ===
     bcMathSin:

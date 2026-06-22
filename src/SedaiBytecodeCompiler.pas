@@ -169,6 +169,9 @@ begin
     ssaStrConcat: Result := bcStrConcat;
     ssaStrLen: Result := bcStrLen;
     ssaStrLenW: Result := bcStrLenW;
+    ssaStrLeftW: Result := bcStrLeftW;
+    ssaStrRightW: Result := bcStrRightW;
+    ssaStrMidW: Result := bcStrMidW;
     ssaStrLeft: Result := bcStrLeft;
     ssaStrRight: Result := bcStrRight;
     ssaStrMid: Result := bcStrMid;

@@ -330,6 +330,7 @@ begin
     bcIntToString, bcFloatToString,
     // === GROUP 1: String operations ===
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrChr,
+    bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING codepoint substrings - string dest
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrSpace,  // B1.2: string dest
     bcStrString,  // STRING(n,ch) - string dest
     bcStrTrimSet, // LTRIM/RTRIM/TRIM(s,set) - string dest
@@ -525,6 +526,7 @@ begin
     bcPoke,           // POKE address, value: Src2 = value (int)
     // === GROUP 1: String operations with int second param ===
     bcStrLeft, bcStrRight,  // LEFT$/RIGHT$(str, len) - len is Src2 (int)
+    bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src2 = codepoint count/start (int)
     bcStrMid,  // Mid$(str, start, length) - start is Src1, length is Src2
     bcStrString,  // STRING(n,ch) - Src2 = char code (int)
     // === GROUP 3: Typed array operations: Src2 is always int (linear index) ===
@@ -617,6 +619,7 @@ begin
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
     // === GROUP 1: String operations ===
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrLen, bcStrLenW, bcStrAsc,
+    bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src1 = source string
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string
     bcStrVal,    // VAL(str) - reads string, produces float
     bcStrValInt, // VALINT/VALLNG/VALUINT(str) - reads string, produces int
@@ -904,9 +907,9 @@ begin
       MarkFloatRegUsed((Instr.Immediate shr 16) and $FFFF);  // denom register
     end;
 
-    // bcStrMid: Immediate contains length register index (int)
+    // bcStrMid/bcStrMidW: Immediate contains length register index (int)
     // MID$(str, start, length) - start is Src2, length is in Immediate
-    if OpCode = bcStrMid then
+    if (OpCode = bcStrMid) or (OpCode = bcStrMidW) then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // bcGraphicWindow: Src1=col1, Src2=row1, Dest=col2, Immediate = (clear_reg << 16) | row2_reg
@@ -1367,9 +1370,9 @@ begin
       end;
     end;
 
-    // bcStrMid: Immediate contains length register index (int)
+    // bcStrMid/bcStrMidW: Immediate contains length register index (int)
     // MID$(str, start, length) - start is Src2, length is in Immediate
-    if OpCode = bcStrMid then
+    if (OpCode = bcStrMid) or (OpCode = bcStrMidW) then
     begin
       OldReg := Instr.Immediate and $FFFF;
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then

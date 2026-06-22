@@ -2365,6 +2365,7 @@ begin
         // String dest, string sources
         bcLoadConstString, bcCopyString, bcStrConcat,
         bcStrLeft, bcStrRight, bcStrMid,
+        bcStrLeftW, bcStrRightW, bcStrMidW,                        // WSTRING codepoint substrings
         bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2
         bcInputString:
         begin
@@ -4068,6 +4069,40 @@ begin
   end;
 end;
 
+// FreeBASIC WSTRING helpers. Wide strings are stored as UTF-8 bytes in the ordinary string bank; these
+// count/extract by Unicode codepoint. A codepoint boundary is any byte that is not a UTF-8 continuation
+// byte (10xxxxxx).
+function Utf8CPCount(const S: string): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 1 to Length(S) do
+    if (Ord(S[i]) and $C0) <> $80 then Inc(Result);
+end;
+
+// Return the substring covering CPCount codepoints starting at the 1-based codepoint CPStart, clamped.
+function Utf8SubCP(const S: string; CPStart, CPCount: Integer): string;
+var
+  i, n, cp, bStart, bEnd: Integer;
+begin
+  if CPStart < 1 then CPStart := 1;
+  if CPCount < 0 then CPCount := 0;
+  n := Length(S);
+  bStart := n + 1;   // default past end => empty
+  bEnd := n + 1;     // default => copy to end of string
+  cp := 0;
+  for i := 1 to n do
+    if (Ord(S[i]) and $C0) <> $80 then
+    begin
+      Inc(cp);                                  // byte i begins codepoint #cp (1-based)
+      if cp = CPStart then bStart := i;
+      if cp = CPStart + CPCount then begin bEnd := i; Break; end;
+    end;
+  if bStart > n then Exit('');
+  Result := Copy(S, bStart, bEnd - bStart);
+end;
+
 procedure TBytecodeVM.ExecuteStringOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
@@ -4080,14 +4115,24 @@ begin
       Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Src1] + Ctx.StringRegs[Instr.Src2];
     1: // bcStrLen
       Ctx.IntRegs[Instr.Dest] := Length(Ctx.StringRegs[Instr.Src1]);
-    25: // bcStrLenW - LEN(wstring): count Unicode codepoints in the UTF-8 byte storage. A codepoint's
-        // lead byte is any byte that is NOT a UTF-8 continuation byte (10xxxxxx), so count those.
+    25: // bcStrLenW - LEN(wstring): Unicode codepoint count of the UTF-8 byte storage.
+      Ctx.IntRegs[Instr.Dest] := Utf8CPCount(Ctx.StringRegs[Instr.Src1]);
+    26: // bcStrLeftW - LEFT$(wstring, n): first n codepoints.
+      Ctx.StringRegs[Instr.Dest] := Utf8SubCP(Ctx.StringRegs[Instr.Src1], 1, Ctx.IntRegs[Instr.Src2]);
+    27: // bcStrRightW - RIGHT$(wstring, n): last n codepoints.
       begin
         S := Ctx.StringRegs[Instr.Src1];
-        Count := 0;
-        for Len := 1 to Length(S) do
-          if (Ord(S[Len]) and $C0) <> $80 then Inc(Count);
-        Ctx.IntRegs[Instr.Dest] := Count;
+        Count := Ctx.IntRegs[Instr.Src2];
+        Len := Utf8CPCount(S);                    // total codepoints
+        if Count < 0 then Count := 0;
+        if Count > Len then Count := Len;
+        Ctx.StringRegs[Instr.Dest] := Utf8SubCP(S, Len - Count + 1, Count);
+      end;
+    28: // bcStrMidW - MID$(wstring, start[,len]): codepoint substring. Src2=start, Immediate=len reg.
+      begin
+        StartPos := Ctx.IntRegs[Instr.Src2];
+        Count := Ctx.IntRegs[Instr.Immediate and $FFFF];
+        Ctx.StringRegs[Instr.Dest] := Utf8SubCP(Ctx.StringRegs[Instr.Src1], StartPos, Count);
       end;
     2: // bcStrLeft
       begin

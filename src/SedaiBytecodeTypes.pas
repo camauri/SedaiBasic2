@@ -329,6 +329,9 @@ const
   bcStrInstrRevAny  = bcGroupString + 24;  // INSTRREV(str, Any set) - last position of any char in set (Dest=int, Src1/Src2=string)
   // FreeBASIC WSTRING (UTF-8 storage, codepoint-indexed). Same string bank; only width-aware ops differ.
   bcStrLenW         = bcGroupString + 25;  // LEN(wstring) - Unicode codepoint count (Dest=int, Src1=string)
+  bcStrLeftW        = bcGroupString + 26;  // LEFT$(wstring, n) - first n codepoints (Dest/Src1=string, Src2=int n)
+  bcStrRightW       = bcGroupString + 27;  // RIGHT$(wstring, n) - last n codepoints (Dest/Src1=string, Src2=int n)
+  bcStrMidW         = bcGroupString + 28;  // MID$(wstring, start[,len]) - codepoint substring (Dest/Src1=string, Src2=int start, Immediate=int len reg)
 
   // === GROUP 2: MATH FUNCTIONS (0x02xx) ===
   bcMathSin         = bcGroupMath + 0;
