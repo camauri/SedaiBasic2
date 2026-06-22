@@ -251,6 +251,8 @@ const
   bcRecordNewArray   = bcGroupCore + 110;
   // OOP virtual dispatch (M4.3): read an instance's runtime type-id (handle -> type-id).
   bcRecordTypeId     = bcGroupCore + 111;  // Dest=int reg; Src1=handle reg
+  // FreeBASIC DELETE: release a NEW'd (shared-region) record and recycle its slot. Src1=handle reg.
+  bcRecordFree       = bcGroupCore + 133;
   // Block-scoped record reclamation (M8). bcRecMarkPush snapshots the current record high-water mark
   // onto a block-mark stack at a loop-body entry; bcRecMarkPop reclaims to the last mark at the body
   // exit (after the compiler-emitted destructors), so a DIM inside a loop is freed each iteration.
@@ -1303,6 +1305,7 @@ begin
         109: Result := 'RecordStoreString';
         110: Result := 'RecordNewArray';
         111: Result := 'RecordTypeId';
+        133: Result := 'RecordFree';
         112: Result := 'RecMarkPush';
         113: Result := 'RecMarkPop';
         114: Result := 'LoadProcAddr';

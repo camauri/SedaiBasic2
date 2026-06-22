@@ -126,6 +126,8 @@ type
     // A handle with SHARED_REC_FLAG set indexes here; otherwise it indexes the active context's heap.
     FSharedRecords: array of PRecordStorage;
     FSharedRecordCount: Integer;
+    FSharedRecFreeList: array of Integer;  // DELETE: indices of freed shared records, reused by NEW
+    FSharedRecFreeCount: Integer;
     FSharedRecLock: TRTLCriticalSection;
     FProgram: TBytecodeProgram;
     FOutputDevice: IOutputDevice;
@@ -249,6 +251,7 @@ type
     function AllocRecord(Ctx: TExecutionContext; IntC, FloatC, StrC, TypeId: Integer): Integer;  // M3: new record instance -> handle
     // M5.2c: allocate in the shared region (cross-thread); ResolveRec routes a handle to its record.
     function AllocSharedRecord(IntC, FloatC, StrC, TypeId: Integer): Int64;
+    procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
     function ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordStorage; inline;
     function RecPtrTarget(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage; inline;  // decode @obj.field pointer
     procedure CleanupSharedRecords;   // free the shared region (destructor)
@@ -1366,15 +1369,47 @@ begin
   SetLength(R^.StringData, StrC);
   EnterCriticalSection(FSharedRecLock);
   try
-    Idx := FSharedRecordCount;
-    if Idx >= Length(FSharedRecords) then
-      SetLength(FSharedRecords, (Idx + 1) * 2);
+    // Reuse a slot freed by DELETE if one is available, else append.
+    if FSharedRecFreeCount > 0 then
+    begin
+      Dec(FSharedRecFreeCount);
+      Idx := FSharedRecFreeList[FSharedRecFreeCount];
+    end
+    else
+    begin
+      Idx := FSharedRecordCount;
+      if Idx >= Length(FSharedRecords) then
+        SetLength(FSharedRecords, (Idx + 1) * 2);
+      Inc(FSharedRecordCount);
+    end;
     FSharedRecords[Idx] := R;
-    Inc(FSharedRecordCount);
   finally
     LeaveCriticalSection(FSharedRecLock);
   end;
   Result := SHARED_REC_FLAG or Int64(Idx);
+end;
+
+procedure TBytecodeVM.FreeSharedRecord(Handle: Int64);
+// DELETE: release a shared-region record and recycle its slot. A non-shared (per-thread) handle is
+// ignored — those records are reclaimed by frame unwinding. Double-free / use-after-free are the
+// programmer's responsibility (as in FreeBASIC).
+var
+  Idx: Integer;
+begin
+  if (Handle and SHARED_REC_FLAG) = 0 then Exit;
+  Idx := Handle and SHARED_REC_MASK;
+  EnterCriticalSection(FSharedRecLock);
+  try
+    if (Idx < 0) or (Idx >= FSharedRecordCount) or (FSharedRecords[Idx] = nil) then Exit;
+    Dispose(FSharedRecords[Idx]);   // finalizes the record's managed fields (strings/arrays)
+    FSharedRecords[Idx] := nil;
+    if FSharedRecFreeCount >= Length(FSharedRecFreeList) then
+      SetLength(FSharedRecFreeList, (FSharedRecFreeCount + 1) * 2);
+    FSharedRecFreeList[FSharedRecFreeCount] := Idx;
+    Inc(FSharedRecFreeCount);
+  finally
+    LeaveCriticalSection(FSharedRecLock);
+  end;
 end;
 
 function TBytecodeVM.ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordStorage;
@@ -1414,6 +1449,8 @@ begin
     if FSharedRecords[i] <> nil then Dispose(FSharedRecords[i]);
   SetLength(FSharedRecords, 0);
   FSharedRecordCount := 0;
+  SetLength(FSharedRecFreeList, 0);
+  FSharedRecFreeCount := 0;
 end;
 
 procedure TBytecodeVM.RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);
@@ -2856,6 +2893,8 @@ begin
                                           Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
     bcRecordNewArray:
       RecordNewArrayInit(Ctx, Instr.Src1, Instr.Immediate);  // Src1=array id; Imm=packed slot counts
+    bcRecordFree:
+      FreeSharedRecord(Ctx.IntRegs[Instr.Src1]);  // DELETE p: release the heap record (Src1=handle)
     // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).
     bcRecordLoadInt:    Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.IntData[Instr.Immediate];
     bcRecordLoadFloat:  Ctx.FloatRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.FloatData[Instr.Immediate];

@@ -11515,11 +11515,11 @@ begin
 end;
 
 procedure TSSAGenerator.EmitDeleteObject(Node: TASTNode);
-// FreeBASIC "DELETE p": run the pointee's destructor (if any). v1 does not free the heap slot (the
-// shared region has no free list yet) — the observable effect (the destructor) is what matters; the
-// memory is reclaimed at program end. Node child0 = the pointer expression (must be a UDT pointer).
+// FreeBASIC "DELETE p": run the pointee's destructor (if any), then release the heap record and
+// recycle its slot (ssaRecordFree). Node child0 = the pointer expression (must be a UDT pointer).
 var
   PtrName, PtrType: string;
+  HandleReg: TSSAValue;
 begin
   if Node.ChildCount < 1 then Exit;
   if Node.GetChild(0).NodeType <> antIdentifier then
@@ -11528,7 +11528,9 @@ begin
   PtrType := PointerUDTType(PtrName);
   if PtrType = '' then
     raise Exception.CreateFmt('DELETE expects a UDT pointer, "%s" is not one', [PtrName]);
-  EmitDestructorCall(EnsureIntRegister(GetOrAllocateVariable(UpperCase(PtrName))), PtrType);
+  HandleReg := EnsureIntRegister(GetOrAllocateVariable(UpperCase(PtrName)));
+  EmitDestructorCall(HandleReg, PtrType);
+  EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.EmitFieldAddress(MemberNode: TASTNode; out Result: TSSAValue);

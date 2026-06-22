@@ -651,6 +651,8 @@ begin
           begin ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2]; Inc(CurPC); end;
         bcRecordTypeId:
           begin Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.TypeId; Inc(CurPC); end;
+        bcRecordFree:
+          begin FreeSharedRecord(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;   // DELETE p
 
         // Array operations - typed versions are faster
         bcArrayLoadInt:

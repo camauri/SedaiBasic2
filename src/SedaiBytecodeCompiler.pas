@@ -253,6 +253,7 @@ begin
     ssaRecordNew: Result := bcRecordNew;
     ssaRecordNewArray: Result := bcRecordNewArray;
     ssaRecordTypeId: Result := bcRecordTypeId;
+    ssaRecordFree: Result := bcRecordFree;     // DELETE
     ssaRecMarkPush: Result := bcRecMarkPush;   // M8: block-scoped reclamation
     ssaRecMarkPop: Result := bcRecMarkPop;
     ssaLoadProcAddr: Result := bcLoadProcAddr;  // M5.2: @sub → entry PC
