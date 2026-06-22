@@ -128,6 +128,8 @@ type
     FCurrentProcByvalRecs: TStringList;  // V5d: "VARNAME|TYPENAME" of the proc's BYVAL UDT param copies
     FCurrentProcByrefScalars: TStringList;  // BYREF: explicit-BYREF scalar params; Objects[] = packed (RT<<16 | slot)
                                             //        their final register value is written back to the slot at each return
+    FCurrentProcAddrParams: TStringList;    // BYREF-return funcs: BYREF params carried as addresses (auto-deref);
+                                            //   ValueFromIndex = pointee type name. Lets "RETURN param" return a reference.
     FModuleRecordVars: TStringList;      // V5b: "VARNAME|TYPENAME" of module-scope DIM'd UDTs (globals)
     FModuleDtorSlots: TStringList;        // V5e: module global var (UPPER) -> reserved int xfer slot (Objects[]=slot)
                                           //      holds its handle frame-independently so an END inside a SUB can
@@ -238,10 +240,14 @@ type
     // FreeBASIC pointers: record pointer-var pointee types and back every address-taken (@x) scalar
     // with a 1-element global array (reusing the SHARED-scalar machinery), so it has a stable address.
     procedure CollectAddressTakenVars(Node: TASTNode);
+    procedure GatherByrefRetFuncNames(Node: TASTNode; Names: TStringList);   // byref-ret funcs with a BYREF param
+    procedure MarkByrefRetCallArgs(Node: TASTNode; Names, Dict: TStringList); // mark their call args address-taken
     procedure CollectDimVarBanks(Node: TASTNode; Dict: TStringList);
     procedure MarkAddressTaken(Node: TASTNode; Dict: TStringList);
     function PointeeBankOf(const PtrName: string): TSSARegisterType;            // bank of *p from p's declared pointee
     function PointerUDTType(const PtrName: string): string;                     // pointee UDT type if p is a "T PTR" (T a UDT), else ''
+    function IsAddrParam(const Name: string): Boolean;                          // BYREF-return address-carrying param?
+    function AddrParamBank(const Name: string): TSSARegisterType;               // pointee bank of an address param
     function UDTFieldPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT of a "T PTR" field, else ''
     function DerefedType(Node: TASTNode): string;                               // FB type of *<expr> (multi-level aware)
     function DerefOperandBank(Node: TASTNode): TSSARegisterType;                // bank of *<expr> incl. pointer arithmetic (p+n)
@@ -478,6 +484,7 @@ begin
   FCurrentProcLocalRecs := TStringList.Create;
   FCurrentProcByvalRecs := TStringList.Create;
   FCurrentProcByrefScalars := TStringList.Create;
+  FCurrentProcAddrParams := TStringList.Create;
   FModuleRecordVars := TStringList.Create;
   FModuleDtorSlots := TStringList.Create;
   FModuleDtorSlots.CaseSensitive := False;
@@ -518,6 +525,7 @@ begin
   FCurrentProcLocalRecs.Free;
   FCurrentProcByvalRecs.Free;
   FCurrentProcByrefScalars.Free;
+  FCurrentProcAddrParams.Free;
   FModuleRecordVars.Free;
   FModuleDtorSlots.Free;
   FSharedVars.Free;
@@ -1048,9 +1056,23 @@ begin
     antIdentifier:
     begin
       VarName := VarToStr(Node.Value);
+      // BYREF-return address param: the register holds the caller variable's address — reading the
+      // parameter dereferences it (load the pointee through the address).
+      if IsAddrParam(VarName) then
+      begin
+        Left := EnsureIntRegister(GetOrAllocateVariable(VarName));
+        FuncRetType := AddrParamBank(VarName);
+        Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
+        case FuncRetType of
+          srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        else
+          EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+      end
       // Refinement #2: a SHARED scalar is backed by a 1-element global array — read element 0 (a live,
       // cross-thread load), not a per-thread register.
-      if IsSharedScalar(VarName) then
+      else if IsSharedScalar(VarName) then
       begin
         ArgListNode := MakeSharedScalarAccess(VarName, Node.Token);
         ProcessExpression(ArgListNode, Result);
@@ -3352,7 +3374,12 @@ begin
     // (a SHARED/global scalar or one whose address is taken); a local would dangle (v1: not enforced).
     if FCurrentProcByrefRet and (ExprNode.NodeType = antIdentifier) then
     begin
-      EmitXferStore(srtInt, XFER_RESULT_SLOT, EmitVarAddress(VarToStr(ExprNode.Value)));
+      // Returning an address-carrying BYREF param yields the address it already holds (a reference into
+      // the caller's variable, the min(a,b)=0 idiom); any other named var returns its backing address.
+      if IsAddrParam(VarToStr(ExprNode.Value)) then
+        EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(GetOrAllocateVariable(VarToStr(ExprNode.Value))))
+      else
+        EmitXferStore(srtInt, XFER_RESULT_SLOT, EmitVarAddress(VarToStr(ExprNode.Value)));
       Exit;
     end;
     ProcessExpression(ExprNode, ExprValue);
@@ -3362,6 +3389,22 @@ begin
       EmitRecordCopy(FCurrentResultHandle, ExprValue, FindUDT(FCurrentProcRetRecType))
     else
       EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, ExprValue);
+    Exit;
+  end;
+
+  // BYREF-return address param: assigning to the parameter stores through the address it carries
+  // (mutating the caller's variable), not into the local register.
+  if IsAddrParam(VarName) then
+  begin
+    ProcessExpression(ExprNode, ExprValue);
+    VarReg := EnsureIntRegister(GetOrAllocateVariable(VarName));   // the carried address
+    case AddrParamBank(VarName) of
+      srtFloat:  begin ExprValue := EnsureFloatRegister(ExprValue);  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone)); end;
+      srtString: begin ExprValue := EnsureStringRegister(ExprValue); EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone)); end;
+    else
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+    end;
     Exit;
   end;
 
@@ -10690,6 +10733,10 @@ begin
     ArgExpr := ArgListNode.GetChild(i);
     if (ArgExpr = nil) or (ArgExpr.NodeType <> antIdentifier) then Continue;  // only a variable is writable
     Slot := ParamBankAndSlot(ParamList, i, RT);
+    // BYREF-return function: an int BYREF param was passed by ADDRESS (StageCallArgs), not copy-in/out,
+    // so the slot holds an address — do NOT write it back into the argument (mutations already went
+    // through the address). Other params (non-byref-ret, or non-int) keep the normal copy-back.
+    if IsByrefRetFunc(ParamOwnerName) and (RT = srtInt) then Continue;
     EmitXferLoad(RT, Slot, GetOrAllocateVariable(UpperCase(VarToStr(ArgExpr.Value))));
   end;
 end;
@@ -11172,19 +11219,78 @@ begin
     MarkAddressTaken(Node.GetChild(i), Dict);
 end;
 
+function ByrefRetDeclHasByrefParam(Node: TASTNode): Boolean;
+// True if Node is a FUNCTION declared BYREF-return ("FUNCTION f() BYREF AS T") with at least one
+// explicit-BYREF parameter — the shape that can return a reference to one of its parameters.
+var
+  PList: TASTNode;
+  i: Integer;
+begin
+  Result := False;
+  if (Node = nil) or (Node.NodeType <> antProcedureDecl) then Exit;
+  if Node.Attributes.Values['BYREFRET'] <> '1' then Exit;
+  if (Node.ChildCount < 2) or (Node.GetChild(1).NodeType <> antParameterList) then Exit;
+  PList := Node.GetChild(1);
+  for i := 0 to PList.ChildCount - 1 do
+    if PList.GetChild(i).Attributes.Values['BYREF'] = '1' then Exit(True);
+end;
+
+procedure TSSAGenerator.GatherByrefRetFuncNames(Node: TASTNode; Names: TStringList);
+// Collect the names of FUNCTIONs that are BYREF-return AND take a BYREF parameter (so a call's args
+// may need to be address-backed, to let "RETURN param" yield a reference into the caller's variable).
+var
+  i: Integer;
+begin
+  if Node = nil then Exit;
+  if ByrefRetDeclHasByrefParam(Node) and (Node.GetChild(0).NodeType = antIdentifier) then
+    if Names.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) < 0 then
+      Names.Add(UpperCase(VarToStr(Node.GetChild(0).Value)));
+  for i := 0 to Node.ChildCount - 1 do
+    GatherByrefRetFuncNames(Node.GetChild(i), Names);
+end;
+
+procedure TSSAGenerator.MarkByrefRetCallArgs(Node: TASTNode; Names, Dict: TStringList);
+// For every call "f(args)" to a byref-return function in Names, mark each identifier argument as
+// address-taken (added to Dict), so it is backed by a stable address the function can return.
+var
+  i: Integer;
+  ArgsNode: TASTNode;
+begin
+  if Node = nil then Exit;
+  if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) and
+     (Names.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) and
+     (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) then
+  begin
+    ArgsNode := Node.GetChild(1);
+    for i := 0 to ArgsNode.ChildCount - 1 do
+      if (ArgsNode.GetChild(i).NodeType = antIdentifier) and
+         (Dict.IndexOf(UpperCase(VarToStr(ArgsNode.GetChild(i).Value))) < 0) then
+        Dict.Add(UpperCase(VarToStr(ArgsNode.GetChild(i).Value)));
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    MarkByrefRetCallArgs(Node.GetChild(i), Names, Dict);
+end;
+
 procedure TSSAGenerator.CollectAddressTakenVars(Node: TASTNode);
 // Runs BEFORE CollectSharedVars: marks @-taken declared scalars SHARED so they become array-backed
-// (addressable). Also records pointer-var pointee types in FPointerVars.
+// (addressable). Also records pointer-var pointee types in FPointerVars. In addition, arguments passed
+// to a BYREF-return function are address-backed so it can return a reference to them (min(a,b)=0).
 var
-  Dict: TStringList;
+  Dict, ByrefRetNames: TStringList;
 begin
   if Node = nil then Exit;
   Dict := TStringList.Create;
+  ByrefRetNames := TStringList.Create;
   try
     CollectDimVarBanks(Node, Dict);   // collect @-taken names + pointee types
+    GatherByrefRetFuncNames(Node, ByrefRetNames);
+    if ByrefRetNames.Count > 0 then
+      MarkByrefRetCallArgs(Node, ByrefRetNames, Dict);   // back the args of byref-return calls
     MarkAddressTaken(Node, Dict);     // mark their DIMs SHARED
   finally
     Dict.Free;
+    ByrefRetNames.Free;
   end;
 end;
 
@@ -11201,6 +11307,23 @@ begin
     Pointee := FPointerVars.ValueFromIndex[idx];
     Result := TypeNameToBank(Pointee, PtrName);
   end;
+end;
+
+function TSSAGenerator.IsAddrParam(const Name: string): Boolean;
+// Is Name a BYREF-return address-carrying parameter (its register holds the caller variable's address,
+// so reads/writes auto-dereference)? Only ever non-empty inside a byref-return function.
+begin
+  Result := (FCurrentProcAddrParams <> nil) and (FCurrentProcAddrParams.IndexOfName(UpperCase(Name)) >= 0);
+end;
+
+function TSSAGenerator.AddrParamBank(const Name: string): TSSARegisterType;
+// The pointee bank of an address parameter (from its declared scalar type).
+var
+  idx: Integer;
+begin
+  Result := srtInt;
+  idx := FCurrentProcAddrParams.IndexOfName(UpperCase(Name));
+  if idx >= 0 then Result := TypeNameToBank(FCurrentProcAddrParams.ValueFromIndex[idx], Name);
 end;
 
 function TSSAGenerator.PointerUDTType(const PtrName: string): string;
@@ -11999,9 +12122,20 @@ begin
     for i := 0 to NArgs - 1 do
     begin
       ArgExpr := ArgListNode.GetChild(i);
-      ProcessExpression(ArgExpr, ArgVal);
       Slot := ParamBankAndSlot(ParamList, i, RT);
-      EmitXferStore(RT, Slot, ArgVal);
+      // BYREF-return function with a BYREF (int) param: pass the ADDRESS of the argument variable, not
+      // its value, so the function can return a reference into the caller's variable (min(a,b)=0). Gated
+      // to int-banked params (address and slot are both int). The arg was address-backed by
+      // CollectAddressTakenVars; EmitVarAddress yields its stable packed address.
+      if IsByrefRetFunc(ParamOwnerName) and (RT = srtInt) and
+         (ParamList.GetChild(i).Attributes.Values['BYREF'] = '1') and
+         (ArgExpr.NodeType = antIdentifier) then
+        EmitXferStore(srtInt, Slot, EmitVarAddress(VarToStr(ArgExpr.Value)))
+      else
+      begin
+        ProcessExpression(ArgExpr, ArgVal);
+        EmitXferStore(RT, Slot, ArgVal);
+      end;
     end;
     // M7: default arguments — for each trailing parameter the call omitted, stage its default value
     // (the parameter node's last child, marked 'HASDEFAULT'), evaluated in the caller's context.
@@ -12128,6 +12262,7 @@ begin
     FCurrentProcLocalRecs.Clear;                          // V5: gather DIM'd local UDTs for dtors
     FCurrentProcByvalRecs.Clear;                          // V5d: BYVAL UDT param copies (filled in prologue)
     FCurrentProcByrefScalars.Clear;                       // BYREF: explicit-BYREF scalar params (filled in prologue)
+    FCurrentProcAddrParams.Clear;                         // BYREF-return: address-carrying params (filled in prologue)
     CollectTopLevelLabels(Proc, 2);                       // GOTO-unwind: this proc's block-depth-0 labels (body starts at child 2)
     CollectLocalRecordVars(Proc);
     // Method body (M4.1): the owner type (before the '.') is THIS's type while lowering here.
@@ -12186,6 +12321,14 @@ begin
                                       UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value)));
           end;
         end
+        // BYREF-return function: an int BYREF param is an ADDRESS carrier (the caller staged @arg). The
+        // param register holds the caller variable's stable address; reads/writes auto-deref through it
+        // and "RETURN param" yields that address. No copy-out (the deref already hits the caller's cell).
+        else if FCurrentProcByrefRet and (RT = srtInt) and (ParamNodeJ.Attributes.Values['BYREF'] = '1') and
+                (ParamNodeJ.ChildCount >= 1) and (ParamNodeJ.GetChild(0).NodeType = antIdentifier) and
+                (FindUDT(UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value))) < 0) then
+          FCurrentProcAddrParams.Add(UpperCase(VarToStr(ParamNodeJ.Value)) + '=' +
+                                     UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value)))
         // BYREF: an explicit-BYREF *scalar* parameter is written back to its slot at each return so the
         // caller can copy it into the variable argument. UDT params are excluded (they alias the
         // caller's instance through the handle — mutations already persist via the heap).
@@ -12572,8 +12715,13 @@ begin
         // FUNCTION also stages the result.
         if (Node.ChildCount > 0) and FCurrentProcIsFunction then
         begin
-          // FreeBASIC BYREF result: stage the ADDRESS of the returned (address-backed) variable.
-          if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) then
+          // FreeBASIC BYREF result: stage the ADDRESS of the returned variable. An address-carrying
+          // BYREF param already holds the caller variable's address (min(a,b)=0); any other named var
+          // returns its own backing address.
+          if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) and
+             IsAddrParam(VarToStr(Node.GetChild(0).Value)) then
+            EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(GetOrAllocateVariable(VarToStr(Node.GetChild(0).Value))))
+          else if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) then
             EmitXferStore(srtInt, XFER_RESULT_SLOT, EmitVarAddress(VarToStr(Node.GetChild(0).Value)))
           else
           begin
