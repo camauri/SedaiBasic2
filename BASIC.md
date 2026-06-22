@@ -135,8 +135,8 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `OPERATOR <sym>` | ✓ | Operator overloading for UDTs (binary, direct operands) |
 | `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like macros; function-like macros pending) |
 | `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening (methods of a namespaced TYPE / `USING` / `..global` pending) |
-| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`/`p(i)`, passing pointers across SUB calls. **UDT pointers**: `DIM p AS T PTR`, `NEW T`/`DELETE`, `@obj`, `p->field`/`p.field`, self-referential `NXT AS NODE PTR` (linked lists/trees), chained `p->nxt->val`. Multi-level `PTR PTR` pending |
-| `FUNCTION f() BYREF AS T` | ✓ | BYREF function results: return a reference to a SHARED/global scalar, read + write through it (`f()=x`). Returning a BYREF parameter (the `min(a,b)=0` idiom) pending |
+| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`/`p(i)`, passing pointers across SUB calls, multi-level `PTR PTR` (`**pp`). **UDT pointers**: `DIM p AS T PTR`, `NEW T`/`DELETE`, `@obj`, `p->field`/`p.field`, self-referential `NXT AS NODE PTR` (linked lists/trees), chained `p->nxt->val`. **BYREF-return of a BYREF param** (`min(a,b)=0`, int pointees). Raw `Allocate`/`CAllocate` pending |
+| `FUNCTION f() BYREF AS T` | ✓ | BYREF function results: return a reference to a SHARED/global scalar or a BYREF parameter (the `min(a,b)=0` idiom, int pointees), read + write through it (`f()=x`) |
 | `WSTRING` | ✗ | Not yet implemented |
 
 ## Variable Scope
@@ -1281,7 +1281,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `ENUM...END ENUM` | ✓ | Named integer constants (auto-increment) |
-| `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR` (overloaded by arity & type, default args, `BASE`). `PROPERTY` getter/setter, `OPERATOR` overloading. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope/block/global RAII. Still deferred: `NEW`, explicit `VIRTUAL`/`OVERRIDE`/`ABSTRACT` |
+| `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR` (overloaded by arity & type, default args, `BASE`). `PROPERTY` getter/setter, `OPERATOR` overloading. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope/block/global RAII. Heap instances via `NEW T`/`DELETE` reachable through `T PTR` (linked lists/trees). Still deferred: explicit `VIRTUAL`/`OVERRIDE`/`ABSTRACT` |
 | `CLASS...END CLASS` | ✗ | Not implemented. Keyword reserved. |
 | `UNION...END UNION` | ✗ | User defined structure of overlapping data |
 | `EXTENDS` | ◐ | Single inheritance `TYPE Child EXTENDS Parent` (M4.2): inherited fields (prefix layout) + methods + reference polymorphism. M4.3: virtual dispatch — an overridden method is selected by the instance's runtime type even through a base-typed variable (runtime type-id + dispatcher procedures). `NEW`/ctor/dtor deferred (M4.4) |
@@ -1659,7 +1659,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Byref (function results)` | ◐ | `FUNCTION f() BYREF AS T` returns a reference to a SHARED/global scalar (read + write through `f()`); returning a BYREF parameter (`min(a,b)=0`) still pending |
+| `Byref (function results)` | ✓ | `FUNCTION f() BYREF AS T` returns a reference to a SHARED/global scalar or a BYREF parameter (`min(a,b)=0` idiom, int pointees); read + write through `f()` |
 | `Call` | ✓ | Invokes a procedure. |
 | `Naked` | ✗ | Specifies that a function body is not to be given any prolog/epilog code |
 
