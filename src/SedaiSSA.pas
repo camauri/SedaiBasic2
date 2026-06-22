@@ -141,6 +141,9 @@ type
     // routed to element 0 of this array, so the value is never a per-thread register.
     FSharedScalarArr: TStringList;       // name (UPPER) -> array index (Objects[]=PtrInt arrayIdx)
     FPointerVars: TStringList;           // FreeBASIC pointers: var name (UPPER) -> pointee type name (e.g. "INTEGER")
+    FAddrLocalVars: TStringList;         // @-taken LOCALS (in a SUB/FUNCTION): name (UPPER) -> type name. Backed by
+                                         // a per-frame 1-field record (handle in hidden "<name>$REC"), so the address
+                                         // is distinct per recursion level (a module-level @-taken var stays SHARED-backed).
     FByrefRetFuncs: TStringList;         // FreeBASIC BYREF function results: func name (UPPER) -> pointee type name
     FCurrentProcByrefRet: Boolean;       // lowering a "FUNCTION f() BYREF AS T" (returns an address)
     FVarWidthCode: TStringList;          // B1.5 phase 2: name (UPPER) -> narrow width code (Objects[]=PtrInt 1..7)
@@ -243,11 +246,14 @@ type
     procedure GatherByrefRetFuncNames(Node: TASTNode; Names: TStringList);   // byref-ret funcs with a BYREF param
     procedure MarkByrefRetCallArgs(Node: TASTNode; Names, Dict: TStringList); // mark their call args address-taken
     procedure CollectDimVarBanks(Node: TASTNode; Dict: TStringList);
-    procedure MarkAddressTaken(Node: TASTNode; Dict: TStringList);
+    procedure MarkAddressTaken(Node: TASTNode; Dict: TStringList; InProc: Boolean = False);
     function PointeeBankOf(const PtrName: string): TSSARegisterType;            // bank of *p from p's declared pointee
     function PointerUDTType(const PtrName: string): string;                     // pointee UDT type if p is a "T PTR" (T a UDT), else ''
     function IsAddrParam(const Name: string): Boolean;                          // BYREF-return address-carrying param?
     function AddrParamBank(const Name: string): TSSARegisterType;               // pointee bank of an address param
+    function IsAddrLocal(const Name: string): Boolean;                          // @-taken LOCAL (per-frame record-backed)?
+    function AddrLocalBank(const Name: string): TSSARegisterType;               // bank of an @-taken local
+    function AddrLocalHandle(const Name: string): TSSAValue;                    // its per-frame record handle (hidden var)
     function UDTFieldPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT of a "T PTR" field, else ''
     function DerefedType(Node: TASTNode): string;                               // FB type of *<expr> (multi-level aware)
     function DerefOperandBank(Node: TASTNode): TSSARegisterType;                // bank of *<expr> incl. pointer arithmetic (p+n)
@@ -492,6 +498,7 @@ begin
   FSharedVars.CaseSensitive := False;
   FSharedScalarArr := TStringList.Create;
   FPointerVars := TStringList.Create;
+  FAddrLocalVars := TStringList.Create;
   FByrefRetFuncs := TStringList.Create;
   FSharedScalarArr.CaseSensitive := False;
   FVarWidthCode := TStringList.Create;
@@ -531,6 +538,7 @@ begin
   FSharedVars.Free;
   FSharedScalarArr.Free;
   FPointerVars.Free;
+  FAddrLocalVars.Free;
   FByrefRetFuncs.Free;
   FVarWidthCode.Free;
   FVarPrintKind.Free;
@@ -930,6 +938,13 @@ begin
       else if VarRecordTypeName(VarToStr(Node.Value)) <> '' then
         // @obj where obj is a UDT value variable: its handle IS the pointer (managed-reference model).
         Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.Value))))
+      else if IsAddrLocal(VarToStr(Node.Value)) then
+      begin
+        // @local: a record-field pointer into this frame's backing record (slot 0) — distinct per call.
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaRefAddrField, Result, AddrLocalHandle(VarToStr(Node.Value)),
+                        MakeSSAValue(svkNone), MakeSSAConstInt(0));
+      end
       else if IsSharedScalar(VarToStr(Node.Value)) then
         Result := EmitVarAddress(VarToStr(Node.Value))
       else
@@ -1068,6 +1083,18 @@ begin
           srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         else
           EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+      end
+      // @-taken local: read its per-frame backing record (field slot 0) through the hidden handle.
+      else if IsAddrLocal(VarName) then
+      begin
+        FuncRetType := AddrLocalBank(VarName);
+        Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
+        case FuncRetType of
+          srtFloat:  EmitInstruction(ssaRecordLoadFloat, Result, AddrLocalHandle(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(0));
+          srtString: EmitInstruction(ssaRecordLoadString, Result, AddrLocalHandle(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(0));
+        else
+          EmitInstruction(ssaRecordLoadInt, Result, AddrLocalHandle(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(0));
         end;
       end
       // Refinement #2: a SHARED scalar is backed by a 1-element global array — read element 0 (a live,
@@ -3359,6 +3386,20 @@ begin
     Exit;
   end;
 
+  // @-taken local: store into its per-frame backing record (field slot 0) through the hidden handle.
+  if IsAddrLocal(VarName) then
+  begin
+    ProcessExpression(ExprNode, ExprValue);
+    case AddrLocalBank(VarName) of
+      srtFloat:  begin ExprValue := EnsureFloatRegister(ExprValue);  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), AddrLocalHandle(VarName), ExprValue, MakeSSAConstInt(0)); end;
+      srtString: begin ExprValue := EnsureStringRegister(ExprValue); EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), AddrLocalHandle(VarName), ExprValue, MakeSSAConstInt(0)); end;
+    else
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), AddrLocalHandle(VarName), ExprValue, MakeSSAConstInt(0));
+    end;
+    Exit;
+  end;
+
   // FUNCTION result (M2): "fname = expr" inside a FUNCTION body sets the return value.
   // Also accepts the unqualified method name inside a FUNCTION method (M4.1): for a method
   // PT.SUM, "SUM = expr" works (the qualified "PT.SUM = expr" would parse as member access).
@@ -4053,6 +4094,35 @@ begin
     if DimsNode.NodeType = antIdentifier then
     begin
       RecTypeName := UpperCase(VarToStr(DimsNode.Value));
+      // @-taken LOCAL scalar: back it with a per-frame 1-field record (reclaimed at frame exit, distinct
+      // per recursion). Allocate the record, store its handle in the hidden "<name>$REC", apply any
+      // "= expr" through it; reads/writes/@ of the name route through the handle (recursion-safe @local).
+      if (ArrayDeclNode.Attributes.Values['ADDRLOCAL'] = '1') and FInProcedure then
+      begin
+        // Register this local for the current procedure (per-proc set, cleared at the prologue) so its
+        // reads/writes/@ route through the record. Type from the AS-type child.
+        if FAddrLocalVars.IndexOfName(UpperCase(ArrName)) < 0 then
+          FAddrLocalVars.Add(UpperCase(ArrName) + '=' + RecTypeName);
+        RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        case AddrLocalBank(UpperCase(ArrName)) of
+          srtFloat:  EmitInstruction(ssaRecordNew, RecHandleVal, MakeSSAConstInt(0), MakeSSAConstInt(1), MakeSSAConstInt(0));
+          srtString: EmitInstruction(ssaRecordNew, RecHandleVal, MakeSSAConstInt(0), MakeSSAConstInt(0), MakeSSAConstInt(1));
+        else
+          EmitInstruction(ssaRecordNew, RecHandleVal, MakeSSAConstInt(1), MakeSSAConstInt(0), MakeSSAConstInt(0));
+        end;
+        EmitInstruction(ssaCopyInt, AddrLocalHandle(UpperCase(ArrName)), RecHandleVal,
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // "DIM v AS T = expr": store the initializer through the record (slot 0), reusing ProcessAssignment.
+        if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
+        begin
+          InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
+          InitAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(ArrName), ArrayDeclNode.GetChild(0).Token));
+          InitAssign.AddChild(ArrayDeclNode.GetChild(2).Clone);
+          ProcessAssignment(InitAssign);
+          InitAssign.Free;
+        end;
+        Continue;
+      end;
       // Refinement #2: a SHARED scalar is backed by a 1-element global array (registered in
       // CollectSharedVars). Emit its array allocation; then for a UDT scalar allocate the record in the
       // shared region and store its handle into element 0; for a builtin scalar apply any "= expr".
@@ -11199,13 +11269,15 @@ begin
     CollectDimVarBanks(Node.GetChild(i), Dict);
 end;
 
-procedure TSSAGenerator.MarkAddressTaken(Node: TASTNode; Dict: TStringList);
-// Pass 2: mark each typed-scalar DIM whose variable is @-taken as SHARED, so CollectSharedVars backs
-// it with a 1-element global array (giving it a stable address) and ProcessDim emits its array dim.
+procedure TSSAGenerator.MarkAddressTaken(Node: TASTNode; Dict: TStringList; InProc: Boolean);
+// Pass 2: route each typed-scalar DIM whose variable is @-taken. A MODULE-level var is marked SHARED
+// (CollectSharedVars backs it with a 1-element global array — one stable cell, correct lifetime). A var
+// declared INSIDE a SUB/FUNCTION is instead recorded in FAddrLocalVars: it gets a per-frame 1-field
+// record (ProcessDim), so its address is distinct per recursion level (a shared cell would collide).
 var
   i, k: Integer;
   Decl: TASTNode;
-  VNameU: string;
+  VNameU, VTypeU: string;
 begin
   if Node = nil then Exit;
   if Node.NodeType = antDim then
@@ -11216,15 +11288,21 @@ begin
          (Decl.GetChild(0).NodeType = antIdentifier) and (Decl.GetChild(1).NodeType = antIdentifier) then
       begin
         VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
-        // Only builtin scalars need array backing: a UDT variable is already a stable record handle, so
-        // @obj just reads that handle (EmitVarAddress's machinery would wrongly turn the UDT into a
-        // 1-element int array).
-        if (Dict.IndexOf(VNameU) >= 0) and (FindUDT(UpperCase(VarToStr(Decl.GetChild(1).Value))) < 0) then
-          Decl.Attributes.Values['SHARED'] := '1';   // route through the SHARED-scalar backing machinery
+        VTypeU := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        // Only builtin scalars need backing: a UDT variable is already a stable record handle, so @obj
+        // just reads that handle (the backing machinery would wrongly turn the UDT into a 1-element array).
+        if (Dict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeU) < 0) then
+        begin
+          if InProc then
+            Decl.Attributes.Values['ADDRLOCAL'] := '1'    // per-frame record-backed (recursion-safe)
+          else
+            Decl.Attributes.Values['SHARED'] := '1';      // module: one shared 1-element global array
+        end;
       end;
     end;
+  if Node.NodeType = antProcedureDecl then InProc := True;
   for i := 0 to Node.ChildCount - 1 do
-    MarkAddressTaken(Node.GetChild(i), Dict);
+    MarkAddressTaken(Node.GetChild(i), Dict, InProc);
 end;
 
 function ByrefRetDeclHasByrefParam(Node: TASTNode): Boolean;
@@ -11332,6 +11410,37 @@ begin
   Result := srtInt;
   idx := FCurrentProcAddrParams.IndexOfName(UpperCase(Name));
   if idx >= 0 then Result := TypeNameToBank(FCurrentProcAddrParams.ValueFromIndex[idx], Name);
+end;
+
+function TSSAGenerator.IsAddrLocal(const Name: string): Boolean;
+// An @-taken variable declared inside the CURRENT SUB/FUNCTION: backed by a per-frame 1-field record so
+// its address is distinct per recursion level. FAddrLocalVars is rebuilt per procedure (populated by
+// ProcessDim, cleared at the prologue), so a module-level @-taken var of the same name is never matched.
+begin
+  Result := FAddrLocalVars.IndexOfName(UpperCase(Name)) >= 0;
+end;
+
+function TSSAGenerator.AddrLocalBank(const Name: string): TSSARegisterType;
+var
+  idx: Integer;
+begin
+  Result := srtInt;
+  idx := FAddrLocalVars.IndexOfName(UpperCase(Name));
+  if idx >= 0 then Result := TypeNameToBank(FAddrLocalVars.ValueFromIndex[idx], Name);
+end;
+
+function TSSAGenerator.AddrLocalHandle(const Name: string): TSSAValue;
+// The hidden INT variable holding this @-taken local's per-frame record handle. ProcessDim allocates
+// the record and stores its handle here; reads/writes/@ of the local route through it. The name is
+// forced to the int bank (its trailing letter would otherwise default to float, and a value-converting
+// EnsureIntRegister would corrupt the handle bit pattern).
+var
+  HName: string;
+begin
+  HName := UpperCase(Name) + '$REC';
+  if FVarExplicitType.IndexOf(HName) < 0 then
+    FVarExplicitType.AddObject(HName, TObject(PtrInt(Ord(srtInt))));
+  Result := GetOrAllocateVariable(HName);
 end;
 
 function TSSAGenerator.PointerUDTType(const PtrName: string): string;
@@ -12273,6 +12382,7 @@ begin
     FCurrentProcByvalRecs.Clear;                          // V5d: BYVAL UDT param copies (filled in prologue)
     FCurrentProcByrefScalars.Clear;                       // BYREF: explicit-BYREF scalar params (filled in prologue)
     FCurrentProcAddrParams.Clear;                         // BYREF-return: address-carrying params (filled in prologue)
+    FAddrLocalVars.Clear;                                 // @-taken locals of THIS proc (filled by ProcessDim)
     CollectTopLevelLabels(Proc, 2);                       // GOTO-unwind: this proc's block-depth-0 labels (body starts at child 2)
     CollectLocalRecordVars(Proc);
     // Method body (M4.1): the owner type (before the '.') is THIS's type while lowering here.
@@ -13057,6 +13167,7 @@ begin
   FSharedVars.Clear;
   FSharedScalarArr.Clear;
   FPointerVars.Clear;
+  FAddrLocalVars.Clear;
   FByrefRetFuncs.Clear;
   FVarWidthCode.Clear;
   FVarPrintKind.Clear;
