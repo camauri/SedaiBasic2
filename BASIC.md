@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 244 / 643 implemented (38%)** (+ 12 partial); see the
+**FreeBASIC keyword set — 250 / 643 implemented (39%)** (+ ~6 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1251,7 +1251,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 > FB-syntax file I/O are not yet present. This is a forward-looking gap map, not a claim of FreeBASIC
 > compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **244 / 643 implemented (38%)**, plus 11 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **250 / 643 implemented (39%)**, plus ~6 partial (◐).
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
 > compound & bitwise operators, string/conversion/array functions, namespaces, pointers (managed + raw
@@ -1284,7 +1284,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR` (overloaded by arity & type, default args, `BASE`). `PROPERTY` getter/setter, `OPERATOR` overloading. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope/block/global RAII. Heap instances via `NEW T`/`DELETE` reachable through `T PTR` (linked lists/trees). Still deferred: explicit `VIRTUAL`/`OVERRIDE`/`ABSTRACT` |
 | `CLASS...END CLASS` | ✗ | Not implemented. Keyword reserved. |
 | `UNION...END UNION` | ✗ | User defined structure of overlapping data |
-| `EXTENDS` | ◐ | Single inheritance `TYPE Child EXTENDS Parent` (M4.2): inherited fields (prefix layout) + methods + reference polymorphism. M4.3: virtual dispatch — an overridden method is selected by the instance's runtime type even through a base-typed variable (runtime type-id + dispatcher procedures). `NEW`/ctor/dtor deferred (M4.4) |
+| `EXTENDS` | ✓ | Single inheritance `TYPE Child EXTENDS Parent`: inherited fields (prefix layout) + methods + reference polymorphism (M4.2); virtual dispatch — an overridden method is selected by the instance's runtime type even through a base-typed variable (M4.3); inherited/ chained constructors & destructors (M4.4). |
 | `EXTENDS WSTRING` | ✗ | Extends an user defined type to inherits Wstring behavior |
 | `EXTENDS ZSTRING` | ✗ | Extends an user defined type to inherits Zstring behavior |
 | `IMPLEMENTS` | ✗ | Not implemented. Keyword reserved. |
@@ -1306,8 +1306,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `BASE (initialization)` | ✗ | Specifies an initializer for the base user defined type in derived user defined type constructors |
-| `CONSTRUCTOR` | ◐ | Member procedure auto-called when an instance is created. M4.4a: `CONSTRUCTOR Type()` runs at `DIM v AS T` (nested members first, then the object); inherited if the subtype has none. M4.4b: parameterised `DIM v AS T(args)`. Overloading / `NEW` / base-chaining deferred (M4.4c) |
-| `DESTRUCTOR` | ◐ | Member procedure auto-called when an instance goes out of scope. V5: `DESTRUCTOR Type()` runs for a procedure's DIM'd local UDTs at every exit path, in reverse construction order. Globals / nested members / BYVAL-param copies deferred |
+| `CONSTRUCTOR` | ✓ | Member procedure auto-called when an instance is created: `DIM v AS T` / `DIM v AS T(args)` / `NEW T(args)` (nested members first, then the object); overloading by arity and by parameter type (M4.4d/g); base-constructor auto-chaining and explicit `BASE(args)` (M4.4f); inherited if the subtype has none. |
+| `DESTRUCTOR` | ✓ | Member procedure auto-called when an instance goes out of scope, in reverse construction order: procedure-local DIM'd UDTs, block-scoped DIMs (per loop iteration), module globals (program end / `END` in a proc), nested members, and BYVAL-param copies (V5/V5b/V5c/V5d). |
 | `FUNCTION` | ✓ | Declares or defines a member procedure returning a value |
 | `OPERATOR` | ✓ | Overloaded operator `OPERATOR <sym>(a AS T, b AS T) AS R` (binary, direct operands; resolved by left operand type) |
 | `OVERRIDE` | ✗ | Member method attribute that specifies that the method is expected to override a virtual method in the base user defined type |
@@ -1397,7 +1397,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `CSHORT and CUSHORT` | ✓ | Converts to 16-bit values with width wrap/sign-extend (B1.3/B1.5). |
 | `CLNG and CULNG` | ✓ | Converts to 32-bit values with width wrap/sign-extend (B1.3/B1.5). |
 | `CINT and CUINT` | ✓ | Converts to 64-bit values (platform Integer width here) (B1.3). |
-| `CLNGINT and CULNGINT` | ◐ | `CLNGINT` ✓ (B1.3, 64-bit); `CULNGINT` not yet. |
+| `CLNGINT and CULNGINT` | ✓ | `CLNGINT`/`CULNGINT` — round to a 64-bit signed/unsigned integer (full width). |
 | `CSIGN` | ✗ | Converts a numeric expression to a signed-type value. |
 | `CUNSG` | ✗ | Converts a numeric expression to an unsigned-type value. |
 
@@ -1405,7 +1405,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `CSNG and CDBL` | ◐ | Converts a numeric expression to floating-point. `CDBL` ✓; `CSNG` ✓ rounds to true single precision (held in the Double bank) (B1.3/B1.5). String operand deferred. |
+| `CSNG and CDBL` | ✓ | Converts a numeric expression (or a numeric string, via VAL) to floating-point. `CSNG` rounds to true single precision held in the Double bank (B1.3/B1.5). |
 
 ##### Conversions to/from string types
 
@@ -1414,7 +1414,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `STR and WSTR` | ✓ | Converts numeric expressions to their string representation (`STR$`/`WSTR`; `WSTR` yields a wide string). |
 | `VAL` | ✓ | Converts a numeric string expression to a floating-point value. |
 | `VALINT and VALUINT` | ✓ | Converts numeric string expressions to integer values. Parses the leading integer (B1.3; range/sign differences deferred). |
-| `VALLNG and VALULNG` | ◐ | `VALLNG` ✓ (B1.3, leading-integer parse); `VALULNG` not yet. |
+| `VALLNG and VALULNG` | ✓ | `VALLNG`/`VALULNG` — parse a leading 64-bit signed/unsigned integer from a string. |
 
 ##### Conversion to boolean types
 
@@ -1635,8 +1635,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Byref` | ◐ | Pass a parameter by reference. V4: the default for UDT parameters (passed as a handle, so the callee mutates the caller's object); explicit `BYREF` accepted. Scalar by-reference write-back and `Dim`/`Var` references still deferred |
-| `Byval` | ◐ | Pass a parameter by value. V4: explicit `BYVAL` gives a UDT parameter its own copy (mutations don't reach the caller); scalars are already by value |
+| `Byref` | ◐ | Pass a parameter by reference. UDT parameters default to by-reference (handle, so the callee mutates the caller's object); explicit `BYREF` on scalars writes back to the caller's variable at every return (M13). `BYREF` function results (`min(a,b)=0`) supported. Standalone `Dim`/`Var` reference variables still deferred |
+| `Byval` | ✓ | Pass a parameter by value. Explicit `BYVAL` gives a UDT parameter its own copy (mutations don't reach the caller; the copy is destructed at frame exit); scalars are by value by default. |
 | `Any` | ✗ | Disables type-checking on arguments. |
 
 ##### Variadic Procedures
