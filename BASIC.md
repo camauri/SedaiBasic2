@@ -1547,7 +1547,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `New Expression` | ✓ | `NEW T` / `NEW T(args)` allocates a heap record (runs its constructor) and yields a `T PTR`. Outlives the allocating frame |
 | `New Overload` | ✗ | Constructor overloads apply, but `operator new` is not user-overloadable |
 | `Placement New` | ✗ |  |
-| `Delete Statement` | ✓ | `DELETE p` runs the pointee's destructor (heap slot not yet reclaimed) |
+| `Delete Statement` | ✓ | `DELETE p` runs the pointee's destructor and frees the heap record (slot recycled via a free list) |
 | `Delete Overload` | ✗ |  |
 
 #### Iteration Operators
