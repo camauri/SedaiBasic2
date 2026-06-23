@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 262 / 643 implemented (41%)** (+ ~4 partial); see the
+**FreeBASIC keyword set — 265 / 643 implemented (41%)** (+ ~4 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1251,7 +1251,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 > FB-syntax file I/O are not yet present. This is a forward-looking gap map, not a claim of FreeBASIC
 > compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **262 / 643 implemented (41%)**, plus ~4 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **265 / 643 implemented (41%)**, plus ~4 partial (◐).
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
 > compound & bitwise operators, string/conversion/array functions, namespaces, pointers (managed + raw
@@ -2071,7 +2071,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `? (Shortcut for 'PRINT')` | ✗ | Writes text to the console. |
 | `PRINT USING` | ✓ |  |
 | `? USING (Shortcut for 'PRINT USING')` | ✗ | Writes formatted text to the console. |
-| `WRITE` | ✗ | Writes a list of items to the console. |
+| `WRITE` | ◐ | `WRITE #n, ...` quoted-CSV file output (strings double-quoted, comma-separated). Console WRITE deferred. |
 | `SPC` | ✓ | Skips a number of spaces when writing text. |
 | `TAB` | ✓ | Skips to a certain column when writing text. |
 
@@ -2408,7 +2408,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `INPUT` | ✓ | Reads values from the keyboard buffer. |
-| `LINE INPUT` | ✗ | Reads a line of text from the keyboard buffer. |
+| `LINE INPUT` | ◐ | `LINE INPUT #n, s` read a whole file line (commas not split). Console LINE INPUT deferred. |
 | `INPUT()` | ✓ | Reads a number of characters from the keyboard buffer, file or device. |
 | `WINPUT()` | ✗ | Reads a number of wide characters from the keyboard buffer, file or device. |
 
