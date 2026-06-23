@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 267 / 643 implemented (41%)** (+ ~4 partial); see the
+**FreeBASIC keyword set — 264 / 643 implemented (41%)** (+ ~4 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1251,7 +1251,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 > FB-syntax file I/O are not yet present. This is a forward-looking gap map, not a claim of FreeBASIC
 > compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **267 / 643 implemented (41%)**, plus ~4 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **264 / 643 implemented (41%)**, plus ~4 partial (◐).
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
 > compound & bitwise operators, string/conversion/array functions, namespaces, pointers (managed + raw
@@ -1996,7 +1996,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `OPTION STATIC` | ✓ | Reverts a previous OPTION DYNAMIC command. |
 | `'$STATIC` | ✗ | Alternate form of the OPTION STATIC statement. |
 | `DIM` | ✓ | Defines any type of array. |
-| `REDIM` | ◐ | Resizes an array. `REDIM [PRESERVE] arr(ub)` (B1.4). v1: array must be DIM'd first; single dimension; keeps the original lower bound (only the upper bound/size changes). |
+| `REDIM` | ✓ | Resizes an array: `REDIM [PRESERVE] arr(ub [, ub ...])` (B1.4) — single or multi-dimensional. The array must be DIM'd first; each dimension's lower bound is kept. A multi-dim REDIM'd array computes its element strides at runtime. |
 | `PRESERVE` | ✓ | Preserves the overlapping array contents when used with `REDIM` (B1.4). |
 
 #### Clearing Array Data

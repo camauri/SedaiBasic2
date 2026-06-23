@@ -26,10 +26,90 @@ end;
 
 // Replace whole-word object-like macro occurrences using Defs (Names hold UPPER macro names), skipping
 // the contents of "..." string literals. A match must be a full identifier (word boundaries).
-function SubstituteMacros(const Line: string; Defs: TStringList): string;
+// Split a function-like macro argument string into top-level arguments (commas inside nested parens or
+// string literals do not separate). Returns the count; Args holds the trimmed argument texts.
+procedure SplitMacroArgs(const S: string; out Args: array of string; out Count: Integer);
 var
-  i, j, idx: Integer;
-  Word: string;
+  i, depth: Integer;
+  cur: string;
+  InStr: Boolean;
+begin
+  Count := 0; cur := ''; depth := 0; InStr := False;
+  for i := 1 to Length(S) do
+  begin
+    if InStr then
+    begin
+      cur := cur + S[i];
+      if S[i] = '"' then InStr := False;
+    end
+    else if S[i] = '"' then begin InStr := True; cur := cur + S[i]; end
+    else if S[i] = '(' then begin Inc(depth); cur := cur + S[i]; end
+    else if S[i] = ')' then begin Dec(depth); cur := cur + S[i]; end
+    else if (S[i] = ',') and (depth = 0) then
+    begin
+      if Count <= High(Args) then Args[Count] := Trim(cur);
+      Inc(Count); cur := '';
+    end
+    else cur := cur + S[i];
+  end;
+  if (Trim(cur) <> '') or (Count > 0) then
+  begin
+    if Count <= High(Args) then Args[Count] := Trim(cur);
+    Inc(Count);
+  end;
+end;
+
+// Expand a function-like macro body by replacing each whole-identifier parameter with its argument.
+// ParamsBody is "p1,p2,..."#1"body"; ArgsStr is the raw argument text between the parentheses.
+function ExpandFnBody(const ParamsBody, ArgsStr: string): string;
+var
+  sep, i, j, pi: Integer;
+  ParamList, Body, Word: string;
+  Params: array of string;
+  Args: array[0..63] of string;
+  PCount, ACount: Integer;
+  InStr: Boolean;
+begin
+  sep := Pos(#1, ParamsBody);
+  ParamList := Copy(ParamsBody, 1, sep - 1);
+  Body := Copy(ParamsBody, sep + 1, MaxInt);
+  // parameter names
+  SetLength(Params, 0); PCount := 0;
+  i := 1;
+  while i <= Length(ParamList) do
+  begin
+    j := i;
+    while (j <= Length(ParamList)) and (ParamList[j] <> ',') do Inc(j);
+    SetLength(Params, PCount + 1); Params[PCount] := Trim(Copy(ParamList, i, j - i)); Inc(PCount);
+    i := j + 1;
+  end;
+  SplitMacroArgs(ArgsStr, Args, ACount);
+  // replace each whole-identifier parameter occurrence in the body with the matching argument
+  Result := ''; i := 1; InStr := False;
+  while i <= Length(Body) do
+  begin
+    if InStr then begin Result := Result + Body[i]; if Body[i] = '"' then InStr := False; Inc(i); Continue; end;
+    if Body[i] = '"' then begin InStr := True; Result := Result + Body[i]; Inc(i); Continue; end;
+    if Body[i] in ['A'..'Z', 'a'..'z', '_'] then
+    begin
+      j := i;
+      while (j <= Length(Body)) and IsIdentChar(Body[j]) do Inc(j);
+      Word := Copy(Body, i, j - i);
+      pi := -1;
+      for sep := 0 to PCount - 1 do
+        if Params[sep] = Word then begin pi := sep; Break; end;
+      if (pi >= 0) and (pi < ACount) then Result := Result + Args[pi]
+      else Result := Result + Word;
+      i := j;
+    end
+    else begin Result := Result + Body[i]; Inc(i); end;
+  end;
+end;
+
+function SubstituteMacros(const Line: string; Defs, FnDefs: TStringList): string;
+var
+  i, j, idx, depth: Integer;
+  Word, ArgsStr: string;
   InStr: Boolean;
 begin
   Result := '';
@@ -54,6 +134,29 @@ begin
       j := i;
       while (j <= Length(Line)) and IsIdentChar(Line[j]) do Inc(j);
       Word := Copy(Line, i, j - i);
+      // Function-like macro: NAME immediately followed by '(' — expand with its arguments.
+      idx := FnDefs.IndexOfName(UpperCase(Word));
+      if (idx >= 0) and (j <= Length(Line)) and (Line[j] = '(') then
+      begin
+        depth := 0; ArgsStr := '';
+        Inc(j);   // skip '('
+        while j <= Length(Line) do
+        begin
+          if (Line[j] = '(') then Inc(depth)
+          else if (Line[j] = ')') then
+          begin
+            if depth = 0 then Break;
+            Dec(depth);
+          end;
+          ArgsStr := ArgsStr + Line[j];
+          Inc(j);
+        end;
+        if (j <= Length(Line)) and (Line[j] = ')') then Inc(j);   // skip ')'
+        // Expand the body (param substitution), then re-run object-like substitution on the result.
+        Result := Result + SubstituteMacros(ExpandFnBody(FnDefs.ValueFromIndex[idx], ArgsStr), Defs, FnDefs);
+        i := j;
+        Continue;
+      end;
       idx := Defs.IndexOfName(UpperCase(Word));
       if idx >= 0 then
         Result := Result + Defs.ValueFromIndex[idx]
@@ -86,7 +189,8 @@ end;
 
 function PreprocessSource(const Src, BaseDir: string): string;
 var
-  Defs: TStringList;     // Names = UPPER macro names, Values = macro bodies
+  Defs: TStringList;     // Names = UPPER object-like macro names, Values = macro bodies
+  FnDefs: TStringList;   // Names = UPPER function-like macro names, Values = "params"#1"body"
   Output: TStringList;
   // Conditional stack: Active[k] = currently emitting at nesting level k (already factors parents);
   // Taken[k] = a branch has been taken at this level (for #else).
@@ -100,7 +204,7 @@ var
   procedure Expand(const Text, Dir: string);
   var
     Lines: TStringList;
-    li, p: Integer;
+    li, p, q: Integer;
     Raw, Trimmed, DName, DRest, MacroName, MacroVal, FileName, FullPath: string;
     ParentEmit, Cond: Boolean;
     IncText: TStringList;
@@ -154,8 +258,19 @@ var
             p := 1;
             while (p <= Length(DRest)) and IsIdentChar(DRest[p]) do Inc(p);
             MacroName := UpperCase(Copy(DRest, 1, p - 1));
-            MacroVal := Trim(Copy(DRest, p, MaxInt));
-            if MacroName <> '' then Defs.Values[MacroName] := MacroVal;
+            if (p <= Length(DRest)) and (DRest[p] = '(') then
+            begin
+              // Function-like macro "NAME(params) body": store as "params"#1"body" in FnDefs.
+              q := p + 1;
+              while (q <= Length(DRest)) and (DRest[q] <> ')') do Inc(q);
+              MacroVal := Trim(Copy(DRest, p + 1, q - p - 1)) + #1 + Trim(Copy(DRest, q + 1, MaxInt));
+              if MacroName <> '' then FnDefs.Values[MacroName] := MacroVal;
+            end
+            else
+            begin
+              MacroVal := Trim(Copy(DRest, p, MaxInt));
+              if MacroName <> '' then Defs.Values[MacroName] := MacroVal;
+            end;
           end
           else if (DName = 'undef') and Emitting then
           begin
@@ -184,7 +299,7 @@ var
           Output.Add('');
         end
         else if Emitting then
-          Output.Add(SubstituteMacros(Raw, Defs))
+          Output.Add(SubstituteMacros(Raw, Defs, FnDefs))
         else
           Output.Add('');   // excluded line — blank placeholder preserves line numbers
       end;
@@ -205,6 +320,7 @@ begin
     Exit(Src);
 
   Defs := TStringList.Create;
+  FnDefs := TStringList.Create;
   Output := TStringList.Create;
   try
     SetLength(Active, 0);
@@ -213,6 +329,7 @@ begin
     Result := Output.Text;
   finally
     Defs.Free;
+    FnDefs.Free;
     Output.Free;
   end;
 end;
