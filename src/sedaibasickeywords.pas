@@ -167,8 +167,14 @@ const
   kFREEFILE = 'FREEFILE'; // FreeBASIC: next free file number (1..15, 0 if none)
   kLOF     = 'LOF';       // FreeBASIC: file length in bytes
   kLOC     = 'LOC';       // FreeBASIC: current byte position
+  kSEEK    = 'SEEK';      // FreeBASIC: SEEK #n,pos statement / SEEK(n) position
+  kPUT     = 'PUT';       // FreeBASIC: PUT #n[,pos],var binary write (intercepted, not reserved)
+  kWRITE   = 'WRITE';     // FreeBASIC: WRITE #n,... quoted-CSV (intercepted, not reserved)
+  kLINE    = 'LINE';      // FreeBASIC: LINE INPUT #n,s (intercepted, not reserved)
+  kOUTPUT  = 'OUTPUT';    // FreeBASIC: OPEN ... FOR OUTPUT
+  kBINARY  = 'BINARY';    // FreeBASIC: OPEN ... FOR BINARY
+  kRANDOM  = 'RANDOM';    // FreeBASIC: OPEN ... FOR RANDOM
   kGET     = 'GET';
-  { kPUT     = 'PUT'; // PUT is not a C128 command }
   kDLOAD   = 'DLOAD';
   kDSAVE   = 'DSAVE';
   kVERIFY  = 'VERIFY';
@@ -267,6 +273,8 @@ const
   kWBIN    = 'WBIN';      // integer -> binary wide string (FreeBASIC)
   kWHEX    = 'WHEX';      // integer -> hex wide string (FreeBASIC)
   kWCHR    = 'WCHR';      // Unicode codepoint -> wide (UTF-8) char (FreeBASIC)
+  kWSTR    = 'WSTR';      // FreeBASIC: WSTR(x) -> wide string (intercepted as array-access)
+  kWSTRING = 'WSTRING';   // FreeBASIC: WSTRING type and WSTRING(n,cp) builder function
   kWSPACE  = 'WSPACE';    // N wide spaces (FreeBASIC)
   kVALINT  = 'VALINT';    // string -> Integer
   kVALLNG  = 'VALLNG';    // string -> LongInt

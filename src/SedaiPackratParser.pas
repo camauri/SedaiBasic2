@@ -826,21 +826,21 @@ begin
         // FreeBASIC "LINE INPUT #n, var": LINE is not a registered keyword here (it is a bare
         // identifier), so detect the two-word form. Unambiguous — no statement has `line input`
         // meaning anything else.
-        else if (UpperCase(Token.Value) = 'LINE') and Assigned(Context.PeekNext) and
-                (UpperCase(Context.PeekNext.Value) = 'INPUT') then
+        else if (UpperCase(Token.Value) = kLINE) and Assigned(Context.PeekNext) and
+                (UpperCase(Context.PeekNext.Value) = kINPUT) then
           Result := ParseLineInputStatement
         // FreeBASIC "WRITE #n, ...": comma-separated, quoted-string CSV output (WRITE is a bare
         // identifier here; the `#` after it disambiguates from an assignment to a var named `write`).
-        else if (UpperCase(Token.Value) = 'WRITE') and Assigned(Context.PeekNext) and
+        else if (UpperCase(Token.Value) = kWRITE) and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
           Result := ParseWriteFileStatement
         // FreeBASIC "SEEK #n, pos" statement (SEEK is also the SEEK(n) function — the `#` selects the
         // statement form). SEEK is a bare identifier here.
-        else if (UpperCase(Token.Value) = 'SEEK') and Assigned(Context.PeekNext) and
+        else if (UpperCase(Token.Value) = kSEEK) and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
           Result := ParseSeekStatement
         // FreeBASIC binary "PUT #n, [pos], var" — PUT is a bare identifier; the `#` selects it.
-        else if (UpperCase(Token.Value) = 'PUT') and Assigned(Context.PeekNext) and
+        else if (UpperCase(Token.Value) = kPUT) and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
         begin
           Context.Advance;   // consume PUT
@@ -3646,19 +3646,19 @@ begin
     Param := ParseExpression;     // filename
     if not Assigned(Param) then begin HandleError('Expected filename after OPEN', Token); Exit; end;
     ModeStr := 'R';
-    if UpperCase(Context.CurrentToken.Value) = 'FOR' then
+    if UpperCase(Context.CurrentToken.Value) = kFOR then
     begin
       Context.Advance;            // FOR
       MW := UpperCase(Context.CurrentToken.Value);
-      if MW = 'INPUT' then ModeStr := 'R'
-      else if MW = 'OUTPUT' then ModeStr := 'W'
-      else if MW = 'APPEND' then ModeStr := 'A'
-      else if MW = 'BINARY' then ModeStr := 'B'
-      else if MW = 'RANDOM' then ModeStr := 'B'
+      if MW = kINPUT then ModeStr := 'R'
+      else if MW = kOUTPUT then ModeStr := 'W'
+      else if MW = kAPPEND then ModeStr := 'A'
+      else if MW = kBINARY then ModeStr := 'B'
+      else if MW = kRANDOM then ModeStr := 'B'
       else HandleError('Expected INPUT/OUTPUT/APPEND/BINARY/RANDOM after FOR', Token);
       Context.Advance;            // mode word
     end;
-    if (UpperCase(Context.CurrentToken.Value) = 'AS') or Context.Check(ttAsType) then
+    if (UpperCase(Context.CurrentToken.Value) = kAS) or Context.Check(ttAsType) then
       Context.Advance;            // AS
     if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
       Context.Advance;            // optional '#'
@@ -3673,7 +3673,7 @@ begin
       Context.Advance;
     end
     else begin HandleError('Expected file number after AS', Token); Exit; end;
-    if UpperCase(Context.CurrentToken.Value) = 'LEN' then   // optional "LEN = reclen" (RANDOM): ignored v1
+    if UpperCase(Context.CurrentToken.Value) = kLEN then   // optional "LEN = reclen" (RANDOM): ignored v1
     begin
       Context.Advance;
       if Context.Check(ttOpEq) then Context.Advance;

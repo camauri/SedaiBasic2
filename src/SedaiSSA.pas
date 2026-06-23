@@ -2149,7 +2149,7 @@ begin
           else
             EmitInstruction(ssaStrLen, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
-        else if (FuncName = 'FREEFILE') then
+        else if (FuncName = kFREEFILE) then
         begin
           // FreeBASIC FREEFILE - no argument; the lowest unused file number (handle slot is ignored).
           ArgReg := EnsureIntRegister(MakeSSAConstInt(0));
@@ -2185,7 +2185,7 @@ begin
           Result := MakeSSARegister(srtString, DestReg);
           EmitInstruction(ssaStrChr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
-        else if (FuncName = 'WCHR') then
+        else if (FuncName = kWCHR) then
         begin
           // WCHR(n) - the wide character for Unicode codepoint n, encoded as UTF-8 bytes (unlike CHR$,
           // which emits a single raw byte). Single-codepoint form (v1).
@@ -2242,7 +2242,7 @@ begin
           Result := MakeSSARegister(srtFloat, DestReg);
           EmitInstruction(ssaStrVal, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
-        else if (FuncName = 'HEX$') or (FuncName = 'WHEX') then
+        else if (FuncName = 'HEX$') or (FuncName = kWHEX) then
         begin
           // HEX$(n) / WHEX(n) - hex string (WHEX = wide; ASCII hex digits are identical UTF-8)
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
@@ -2256,7 +2256,7 @@ begin
           Result := MakeSSARegister(srtString, DestReg);
           EmitInstruction(ssaStrHex, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
-        else if (FuncName = 'OCT') or (FuncName = 'BIN') or (FuncName = 'WOCT') or (FuncName = 'WBIN') then
+        else if (FuncName = 'OCT') or (FuncName = 'BIN') or (FuncName = kWOCT) or (FuncName = kWBIN) then
         begin
           // OCT/BIN/WOCT/WBIN(n) - octal/binary string of an integer (no leading zeros). The W* forms are
           // wide; the digits are ASCII so the bytes are identical to the narrow form.
@@ -2269,13 +2269,13 @@ begin
           ArgReg := EnsureIntRegister(ArgValue);
           DestReg := FProgram.AllocRegister(srtString);
           Result := MakeSSARegister(srtString, DestReg);
-          if (FuncName = 'OCT') or (FuncName = 'WOCT') then
+          if (FuncName = 'OCT') or (FuncName = kWOCT) then
             EmitInstruction(ssaStrOct, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
           else
             EmitInstruction(ssaStrBin, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else if (FuncName = 'VALINT') or (FuncName = 'VALLNG') or (FuncName = 'VALUINT') or
-                (FuncName = 'VALULNG') then
+                (FuncName = kVALULNG) then
         begin
           // VALINT/VALLNG/VALUINT(s) - parse leading integer from a string (0 if none).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
@@ -2393,7 +2393,7 @@ begin
           end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end
-        else if (FuncName = 'SPACE') or (FuncName = 'SPACE$') or (FuncName = 'WSPACE') then
+        else if (FuncName = 'SPACE') or (FuncName = 'SPACE$') or (FuncName = kWSPACE) then
         begin
           // SPACE(n) -> string of n spaces (Dest=string, single int arg).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
@@ -2560,7 +2560,7 @@ begin
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end
         else if (FuncName = 'CINT') or (FuncName = 'CLNG') or (FuncName = 'CLNGINT') or
-                (FuncName = 'CULNGINT') or
+                (FuncName = kCULNGINT) or
                 (FuncName = 'CSHORT') or (FuncName = 'CBYTE') or (FuncName = 'CUBYTE') or
                 (FuncName = 'CUSHORT') or (FuncName = 'CUINT') or (FuncName = 'CULNG') then
         begin
@@ -3187,7 +3187,7 @@ begin
 
         // FreeBASIC WSTRING(n, cp) function: n copies of the wide (UTF-8) char for codepoint cp. WSTRING
         // also names the type; as a call (MODERN, not a declared array) it is the fill function.
-        if FModernMode and (UpperCase(ArrName) = 'WSTRING') and (FProgram.FindArray(ArrName) < 0) then
+        if FModernMode and (UpperCase(ArrName) = kWSTRING) and (FProgram.FindArray(ArrName) < 0) then
         begin
           EmitWStringFill(Node.GetChild(1), Result);
           Exit;
@@ -3203,7 +3203,7 @@ begin
 
         // FreeBASIC WSTR(x): convert a number/string to a wide string (MODERN; parses as array access,
         // WSTR is not a registered keyword). Only when not a declared array.
-        if FModernMode and (UpperCase(ArrName) = 'WSTR') and (FProgram.FindArray(ArrName) < 0) then
+        if FModernMode and (UpperCase(ArrName) = kWSTR) and (FProgram.FindArray(ArrName) < 0) then
         begin
           EmitWStr(Node.GetChild(1), Result);
           Exit;
@@ -3213,16 +3213,16 @@ begin
         // registered as keywords, so common names like `loc` stay usable as variables). MODERN, not a
         // declared array. Query code: EOF=0, LOF=2, LOC=3 (matches bcFileQuery).
         if FModernMode and (FProgram.FindArray(ArrName) < 0) and
-           ((UpperCase(ArrName) = 'EOF') or (UpperCase(ArrName) = 'LOF') or
-            (UpperCase(ArrName) = 'LOC') or (UpperCase(ArrName) = 'SEEK')) and
+           ((UpperCase(ArrName) = kEOF) or (UpperCase(ArrName) = kLOF) or
+            (UpperCase(ArrName) = kLOC) or (UpperCase(ArrName) = kSEEK)) and
            (Node.GetChild(1).ChildCount >= 1) then
         begin
           ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureIntRegister(ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          if UpperCase(ArrName) = 'LOF' then ValCode := 2
-          else if UpperCase(ArrName) = 'LOC' then ValCode := 3
-          else if UpperCase(ArrName) = 'SEEK' then ValCode := 4
+          if UpperCase(ArrName) = kLOF then ValCode := 2
+          else if UpperCase(ArrName) = kLOC then ValCode := 3
+          else if UpperCase(ArrName) = kSEEK then ValCode := 4
           else ValCode := 0;
           EmitInstruction(ssaFileQuery, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(ValCode));
           Exit;
@@ -12178,7 +12178,7 @@ begin
           NameU := UpperCase(VarToStr(Node.GetChild(0).Value))
         else
           NameU := UpperCase(VarToStr(Node.Value));
-        Result := (NameU = 'WSTR') or (NameU = 'WCHR') or (NameU = 'WSTRING') or IsWStringVar(NameU);
+        Result := (NameU = kWSTR) or (NameU = kWCHR) or (NameU = kWSTRING) or IsWStringVar(NameU);
       end;
   end;
 end;
