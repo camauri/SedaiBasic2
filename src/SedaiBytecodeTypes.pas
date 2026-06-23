@@ -453,6 +453,7 @@ const
   bcInputFileInt    = bcGroupFileIO + 15;   // INPUT# file, int var
   bcFileQuery       = bcGroupFileIO + 16;   // FreeBASIC EOF/FREEFILE/LOF/LOC/SEEK: Dest=int result, Src1=handle reg, Immediate=query code (0=EOF,1=FREEFILE,2=LOF,3=LOC,4=SEEK)
   bcSeekSet         = bcGroupFileIO + 17;   // SEEK #n, pos statement: Src1=handle reg, Src2=position reg (1-based)
+  bcInputFileLine   = bcGroupFileIO + 18;   // LINE INPUT# file, string var (whole line, no comma split): Dest=string var, Src1=handle
 
   // === GROUP 7: SPRITE OPERATIONS (0x07xx) ===
   // Sprite commands

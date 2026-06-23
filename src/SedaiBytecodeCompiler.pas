@@ -400,6 +400,7 @@ begin
     ssaCmd: Result := bcCmd;
     ssaFileQuery: Result := bcFileQuery;
     ssaSeekSet: Result := bcSeekSet;
+    ssaInputFileLine: Result := bcInputFileLine;
     // Sprite commands
     ssaSprite: Result := bcSprite;
     ssaMovsprAbs: Result := bcMovsprAbs;

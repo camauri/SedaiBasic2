@@ -9029,9 +9029,14 @@ begin
     begin
       VarName := string(VarChild.Value);
       VarReg := GetOrAllocateVariable(VarName);
-      // Emit INPUT# instruction for each variable
-      EmitInstruction(ssaInputFile, VarReg, HandleReg,
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // LINE INPUT# reads a whole line (no comma split) into a string variable; plain INPUT# reads a
+      // comma/newline-delimited field (typed int/float/string by the compiler from the var's bank).
+      if Node.Attributes.Values['LINEINPUT'] = '1' then
+        EmitInstruction(ssaInputFileLine, VarReg, HandleReg,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      else
+        EmitInstruction(ssaInputFile, VarReg, HandleReg,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
     // Skip separators and other nodes
   end;

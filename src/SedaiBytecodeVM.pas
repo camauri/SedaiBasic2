@@ -6216,6 +6216,22 @@ begin
           FOnFileData(Self, 'SEEKSET', HandleNum, Data, ErrorCode);
       end;
 
+    18: // bcInputFileLine - LINE INPUT# file, string var: read a whole line (commas not split)
+      begin
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        if Assigned(FOnFileData) then
+        begin
+          Data := '';
+          FOnFileData(Self, 'LINEINPUT#', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('LINE INPUT# error %d reading from file: %d', [ErrorCode, HandleNum]);
+          if Instr.Dest >= 0 then
+            Ctx.StringRegs[Instr.Dest] := Data;
+        end
+        else
+          raise Exception.Create('LINE INPUT# command not supported: no handler assigned');
+      end;
+
   else
     raise Exception.CreateFmt('Unknown file I/O opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

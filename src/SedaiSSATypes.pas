@@ -272,6 +272,7 @@ type
     ssaPrintFileNewLine, // PRINT# newline: Write CR to file (handle in Src1)
     ssaFileQuery,      // EOF/FREEFILE/LOF/LOC/SEEK(n) -> int (Src1=handle, Src3=query code immediate)
     ssaSeekSet,        // SEEK #n, pos statement (Src1=handle, Src2=position)
+    ssaInputFileLine,  // LINE INPUT# file, string var: read a whole line (Dest=string var, Src1=handle)
     // Sprite commands
     ssaSprite,         // SPRITE n [,on] [,color] [,priority] [,xscale] [,yscale] [,mode]
     ssaMovsprAbs,      // MOVSPR n, x, y: Position sprite at absolute coordinates

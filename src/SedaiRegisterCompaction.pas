@@ -355,7 +355,8 @@ begin
     bcGraphicSShape,   // SSHAPE A$, x1, y1: capture screen area to string
     // === GROUP 6: File I/O operations ===
     bcGetFile,         // GET# - Dest = char read (string)
-    bcInputFile:       // INPUT# - Dest = line read (string)
+    bcInputFile,       // INPUT# - Dest = line read (string)
+    bcInputFileLine:   // LINE INPUT# - Dest = whole line read (string)
       Result := True;
     // NOTE: bcArrayStoreString uses Dest as SOURCE (read), handled by DestReadIsStringReg
   else
@@ -451,7 +452,7 @@ begin
     bcGetFile, bcInputFile, bcPrintFile,     // Src1 = handle (int)
     bcInputFileFloat, bcInputFileInt,        // Src1 = handle (int)
     bcPrintFileFloat, bcPrintFileInt,        // Src1 = handle (int)
-    bcFileQuery, bcSeekSet,                  // Src1 = handle (int)
+    bcFileQuery, bcSeekSet, bcInputFileLine, // Src1 = handle (int)
     bcCmd, bcAppend, bcRecord:               // Src1 = handle (int)
       Result := True;
   else

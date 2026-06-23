@@ -253,6 +253,7 @@ type
     function ParseFileManagementStatement: TASTNode;
     function ParseFileInputStatement: TASTNode;
     function ParseFileOutputStatement: TASTNode;
+    function ParseLineInputStatement: TASTNode;  // FreeBASIC LINE INPUT #n, var (whole line)
     function ParseErrorHandlingStatement: TASTNode;
     function ParseDebugStatement: TASTNode;
     function ParseTracingStatement: TASTNode;
@@ -819,6 +820,12 @@ begin
           Context.Advance;   // consume ':'
           DoNodeCreated(Result);
         end
+        // FreeBASIC "LINE INPUT #n, var": LINE is not a registered keyword here (it is a bare
+        // identifier), so detect the two-word form. Unambiguous — no statement has `line input`
+        // meaning anything else.
+        else if (UpperCase(Token.Value) = 'LINE') and Assigned(Context.PeekNext) and
+                (UpperCase(Context.PeekNext.Value) = 'INPUT') then
+          Result := ParseLineInputStatement
         // Note: the FreeBASIC in-place "MID(dst,start[,len]) = src" statement (MODERN) is intercepted
         // earlier by the dialect profile's IdentMidStatementHandler (mechanism 3), so it does not need
         // a branch here; in CLASSIC bare MID is a plain identifier handled by the default path below.
@@ -4006,6 +4013,47 @@ begin
   // Generic file input command handling (fallback)
   Result := TASTNode.Create(antStatement, Token);
   Context.Advance;
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseLineInputStatement: TASTNode;
+// FreeBASIC "LINE INPUT #n, var" — read a whole line from a file (commas are NOT field separators).
+// Cursor is at the LINE identifier. Builds an antInputFile node tagged LINEINPUT.
+var
+  P: TASTNode;
+  Tok: TLexerToken;
+begin
+  Tok := Context.CurrentToken;
+  Context.Advance;  // LINE
+  Context.Advance;  // INPUT
+  if not (Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#')) then
+  begin
+    HandleError('LINE INPUT from the console is not yet supported (use LINE INPUT #n, var)', Tok);
+    Result := TASTNode.Create(antStatement, Tok);
+    Exit;
+  end;
+  Result := TASTNode.Create(antInputFile, Tok);
+  Result.Attributes.Values['LINEINPUT'] := '1';
+  Context.Advance;  // '#'
+  if Context.Check(ttNumber) or Context.Check(ttInteger) then
+  begin
+    Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
+    Context.Advance;
+  end
+  else if Context.Check(ttIdentifier) then
+  begin
+    Result.AddChild(TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken));
+    Context.Advance;
+  end
+  else
+    HandleError('Expected file number after LINE INPUT #', Tok);
+  if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;  // comma after the handle
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
+  begin
+    P := ParseExpression;     // destination string variable
+    if Assigned(P) then Result.AddChild(P) else Break;
+    if Context.Check(ttSeparParam) then Context.Advance else Break;
+  end;
   DoNodeCreated(Result);
 end;
 
