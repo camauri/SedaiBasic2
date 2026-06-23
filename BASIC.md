@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 258 / 643 implemented (40%)** (+ ~4 partial); see the
+**FreeBASIC keyword set — 262 / 643 implemented (41%)** (+ ~4 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1251,7 +1251,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 > FB-syntax file I/O are not yet present. This is a forward-looking gap map, not a claim of FreeBASIC
 > compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **258 / 643 implemented (40%)**, plus ~4 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **262 / 643 implemented (41%)**, plus ~4 partial (◐).
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
 > compound & bitwise operators, string/conversion/array functions, namespaces, pointers (managed + raw
@@ -2137,8 +2137,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `FREEFILE` | ✗ | Gets an available file number that can be used to read or write from files or devices. |
-| `OPEN` | ✓ | Binds a file number to a physical file to provide reading and writing capabilities. |
+| `FREEFILE` | ✓ | Lowest unused file number (1..15). Bare `FREEFILE` or `FREEFILE()`. |
+| `OPEN` | ✓ | `OPEN "f" FOR {INPUT\|OUTPUT\|APPEND\|BINARY\|RANDOM} AS [#]n` (FreeBASIC) and legacy `OPEN #n,"f",mode$`. Works headless (CLI) and in the console. |
 | `OPEN COM` | ✓ | Binds a file number to a communications port. |
 | `OPEN CONS` | ✓ | Binds a file number to the standard input and output streams. |
 | `OPEN ERR` | ✓ | Binds a file number to the standard input and error streams. |
@@ -2176,9 +2176,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `LOF` | ✗ | Gets the length (in bytes) of a file. |
-| `LOC` | ✗ | Gets the file position of the last read or write operation. |
-| `EOF` | ✗ | Returns true if all of the data has been read from a file. |
+| `LOF` | ✓ | `LOF(#n)` — length in bytes of an open file. |
+| `LOC` | ✓ | `LOC(#n)` — current byte position of an open file. |
+| `EOF` | ✓ | `EOF(#n)` — -1 at/after end of file, else 0. |
 | `SEEK (Statement)` | ✗ | Sets the file position of the next read or write operation. |
 | `SEEK (Function)` | ✗ | Gets the file position of the next read or write operation. |
 | `LOCK` | ✗ | Restricts read or write access to a file or portion of a file. |
