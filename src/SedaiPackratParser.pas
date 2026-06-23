@@ -254,6 +254,7 @@ type
     function ParseFileInputStatement: TASTNode;
     function ParseFileOutputStatement: TASTNode;
     function ParseLineInputStatement: TASTNode;  // FreeBASIC LINE INPUT #n, var (whole line)
+    function ParseWriteFileStatement: TASTNode;   // FreeBASIC WRITE #n, exprlist (quoted CSV)
     function ParseErrorHandlingStatement: TASTNode;
     function ParseDebugStatement: TASTNode;
     function ParseTracingStatement: TASTNode;
@@ -826,6 +827,11 @@ begin
         else if (UpperCase(Token.Value) = 'LINE') and Assigned(Context.PeekNext) and
                 (UpperCase(Context.PeekNext.Value) = 'INPUT') then
           Result := ParseLineInputStatement
+        // FreeBASIC "WRITE #n, ...": comma-separated, quoted-string CSV output (WRITE is a bare
+        // identifier here; the `#` after it disambiguates from an assignment to a var named `write`).
+        else if (UpperCase(Token.Value) = 'WRITE') and Assigned(Context.PeekNext) and
+                ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
+          Result := ParseWriteFileStatement
         // Note: the FreeBASIC in-place "MID(dst,start[,len]) = src" statement (MODERN) is intercepted
         // earlier by the dialect profile's IdentMidStatementHandler (mechanism 3), so it does not need
         // a branch here; in CLASSIC bare MID is a plain identifier handled by the default path below.
@@ -4051,6 +4057,41 @@ begin
   while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
     P := ParseExpression;     // destination string variable
+    if Assigned(P) then Result.AddChild(P) else Break;
+    if Context.Check(ttSeparParam) then Context.Advance else Break;
+  end;
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseWriteFileStatement: TASTNode;
+// FreeBASIC "WRITE #n, v1, v2, ..." — CSV output (strings quoted). Cursor is at the WRITE identifier.
+// Built as an antPrintFile node tagged WRITE; SSA (EmitWriteFileValues) does the formatting.
+var
+  P: TASTNode;
+  Tok: TLexerToken;
+begin
+  Tok := Context.CurrentToken;
+  Context.Advance;  // WRITE
+  Result := TASTNode.Create(antPrintFile, Tok);
+  Result.Attributes.Values['WRITE'] := '1';
+  if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+    Context.Advance;  // '#'
+  if Context.Check(ttNumber) or Context.Check(ttInteger) then
+  begin
+    Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
+    Context.Advance;
+  end
+  else if Context.Check(ttIdentifier) then
+  begin
+    Result.AddChild(TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken));
+    Context.Advance;
+  end
+  else
+    HandleError('Expected file number after WRITE #', Tok);
+  if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;  // comma after the handle
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
+  begin
+    P := ParseExpression;
     if Assigned(P) then Result.AddChild(P) else Break;
     if Context.Check(ttSeparParam) then Context.Advance else Break;
   end;

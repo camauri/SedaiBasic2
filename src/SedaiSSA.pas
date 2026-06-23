@@ -336,6 +336,7 @@ type
     procedure ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
     procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure EmitWStr(ArgsNode: TASTNode; out Result: TSSAValue);   // FreeBASIC WSTR(x) -> wide string
+    procedure EmitWriteFileValues(Node: TASTNode; const HandleReg: TSSAValue);  // WRITE #n CSV formatting
     procedure EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure EmitWStringFill(ArgsNode: TASTNode; out Result: TSSAValue);  // WSTRING(n,cp) -> n wide chars
     function InferExprBank(Node: TASTNode): TSSARegisterType;
@@ -9042,6 +9043,54 @@ begin
   end;
 end;
 
+procedure TSSAGenerator.EmitWriteFileValues(Node: TASTNode; const HandleReg: TSSAValue);
+// FreeBASIC WRITE #n, v1, v2, ...: write each value comma-separated; strings are wrapped in double
+// quotes; numbers use their plain string form; a trailing newline terminates the record (so a matching
+// INPUT# reads the fields back). Children 1+ are values (separators are ignored — WRITE always uses ',').
+var
+  i, vc: Integer;
+  Child: TASTNode;
+  ExprVal, StrReg: TSSAValue;
+
+  procedure EmitLit(const S: string);
+  var R: TSSAValue;
+  begin
+    R := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaLoadConstString, R, MakeSSAConstString(S), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ssaPrintFile, R, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+begin
+  vc := 0;
+  for i := 1 to Node.ChildCount - 1 do
+  begin
+    Child := Node.GetChild(i);
+    if Child.NodeType = antSeparator then Continue;
+    if vc > 0 then EmitLit(',');
+    ProcessExpression(Child, ExprVal);
+    if (ExprVal.Kind = svkConstString) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtString)) then
+    begin
+      EmitLit('"');
+      EmitInstruction(ssaPrintFile, EnsureStringRegister(ExprVal), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitLit('"');
+    end
+    else if (ExprVal.Kind = svkConstInt) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtInt)) then
+    begin
+      StrReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaIntToString, StrReg, EnsureIntRegister(ExprVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaPrintFile, StrReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+    begin
+      StrReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaFloatToString, StrReg, EnsureFloatRegister(ExprVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaPrintFile, StrReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    Inc(vc);
+  end;
+  EmitInstruction(ssaPrintFileNewLine, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
 procedure TSSAGenerator.ProcessPrintFile(Node: TASTNode);
 var
   HandleVal, HandleReg, ExprVal, ExprReg: TSSAValue;
@@ -9099,6 +9148,13 @@ begin
   begin
     ProcessExpression(HandleChild, HandleVal);
     HandleReg := EnsureIntRegister(HandleVal);
+  end;
+
+  // FreeBASIC WRITE #n, ...: comma-separated values, strings quoted, then a newline.
+  if Node.Attributes.Values['WRITE'] = '1' then
+  begin
+    EmitWriteFileValues(Node, HandleReg);
+    Exit;
   end;
 
   // If only handle (no expressions), this is PRINT# with no data
