@@ -405,6 +405,8 @@ begin
     ssaPutBinFloat: Result := bcPutBinFloat;
     ssaGetBinInt: Result := bcGetBinInt;
     ssaGetBinFloat: Result := bcGetBinFloat;
+    ssaPutBinStr: Result := bcPutBinStr;
+    ssaGetBinStr: Result := bcGetBinStr;
     // Sprite commands
     ssaSprite: Result := bcSprite;
     ssaMovsprAbs: Result := bcMovsprAbs;

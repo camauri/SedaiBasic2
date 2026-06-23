@@ -458,6 +458,8 @@ const
   bcPutBinFloat     = bcGroupFileIO + 20;   // PUT #n: write 8 bytes of a double  (Src1=handle, Src2=float value)
   bcGetBinInt       = bcGroupFileIO + 21;   // GET #n: read 8 bytes into an integer (Dest=int value, Src1=handle)
   bcGetBinFloat     = bcGroupFileIO + 22;   // GET #n: read 8 bytes into a double  (Dest=float value, Src1=handle)
+  bcPutBinStr       = bcGroupFileIO + 23;   // PUT #n: write a string as [int32 length][bytes] (Src1=handle, Src2=string value)
+  bcGetBinStr       = bcGroupFileIO + 24;   // GET #n: read a length-prefixed string (Dest=string value, Src1=handle)
 
   // === GROUP 7: SPRITE OPERATIONS (0x07xx) ===
   // Sprite commands

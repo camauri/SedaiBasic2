@@ -333,7 +333,7 @@ begin
     ssaDopen, ssaDclose, ssaOpen, ssaClose,
     ssaGetFile, ssaInputFile, ssaPrintFile, ssaPrintFileNewLine,
     ssaCmd, ssaAppend, ssaDclear, ssaRecord, ssaFileQuery, ssaSeekSet, ssaInputFileLine,
-    ssaPutBinInt, ssaPutBinFloat, ssaGetBinInt, ssaGetBinFloat,
+    ssaPutBinInt, ssaPutBinFloat, ssaGetBinInt, ssaGetBinFloat, ssaPutBinStr, ssaGetBinStr,
     // File management commands
     ssaLoad, ssaSave, ssaVerify, ssaBload, ssaBsave, ssaBoot,
     ssaScratch, ssaCopyFile, ssaRenameFile, ssaMkdir, ssaChdir, ssaMoveFile, ssaConcat:

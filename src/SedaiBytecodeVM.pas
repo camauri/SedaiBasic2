@@ -5900,6 +5900,7 @@ var
   HandleName, Filename, Mode, Data: string;
   BinI: Int64;
   BinF: Double;
+  BinLen: Longint;
 begin
   { Group 6: File I/O operations (0x06xx)
     Opcodes:
@@ -6280,6 +6281,39 @@ begin
           Data := '8'; FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
           if Length(Data) >= 8 then Move(Data[1], BinF, 8) else BinF := 0;
           if Instr.Dest >= 0 then Ctx.FloatRegs[Instr.Dest] := BinF;
+        end
+        else raise Exception.Create('GET command not supported: no handler assigned');
+      end;
+
+    23: // bcPutBinStr - PUT #n: write a string as [int32 length][bytes] (Src1=handle, Src2=string value)
+      begin
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        BinLen := Length(Ctx.StringRegs[Instr.Src2]);
+        SetLength(HandleName, 4); Move(BinLen, HandleName[1], 4);
+        Data := HandleName + Ctx.StringRegs[Instr.Src2];
+        if Assigned(FOnFileData) then
+        begin
+          FOnFileData(Self, 'PUTBIN', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then raise Exception.CreateFmt('PUT error %d to file %d', [ErrorCode, HandleNum]);
+        end
+        else raise Exception.Create('PUT command not supported: no handler assigned');
+      end;
+
+    24: // bcGetBinStr - GET #n: read a length-prefixed string (Dest=string value, Src1=handle)
+      begin
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        if Assigned(FOnFileData) then
+        begin
+          Data := '4'; FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
+          if Length(Data) >= 4 then Move(Data[1], BinLen, 4) else BinLen := 0;
+          if BinLen < 0 then BinLen := 0;
+          if BinLen > 0 then
+          begin
+            Data := IntToStr(BinLen);
+            FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
+          end
+          else Data := '';
+          if Instr.Dest >= 0 then Ctx.StringRegs[Instr.Dest] := Data;
         end
         else raise Exception.Create('GET command not supported: no handler assigned');
       end;

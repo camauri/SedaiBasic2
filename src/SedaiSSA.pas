@@ -8935,6 +8935,8 @@ begin
     VarReg := GetOrAllocateVariable(string(VarChild.Value));
     if VarReg.RegType = srtFloat then
       EmitInstruction(ssaGetBinFloat, VarReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+    else if VarReg.RegType = srtString then
+      EmitInstruction(ssaGetBinStr, VarReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
     else
       EmitInstruction(ssaGetBinInt, VarReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
@@ -9197,6 +9199,8 @@ begin
       ProcessExpression(Node.GetChild(1), ExprVal);   // the value to write
       if (ExprVal.Kind = svkConstFloat) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtFloat)) then
         EmitInstruction(ssaPutBinFloat, MakeSSAValue(svkNone), HandleReg, EnsureFloatRegister(ExprVal), MakeSSAValue(svkNone))
+      else if (ExprVal.Kind = svkConstString) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtString)) then
+        EmitInstruction(ssaPutBinStr, MakeSSAValue(svkNone), HandleReg, EnsureStringRegister(ExprVal), MakeSSAValue(svkNone))
       else
         EmitInstruction(ssaPutBinInt, MakeSSAValue(svkNone), HandleReg, EnsureIntRegister(ExprVal), MakeSSAValue(svkNone));
     end;

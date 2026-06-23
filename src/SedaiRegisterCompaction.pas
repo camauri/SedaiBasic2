@@ -358,7 +358,8 @@ begin
     // === GROUP 6: File I/O operations ===
     bcGetFile,         // GET# - Dest = char read (string)
     bcInputFile,       // INPUT# - Dest = line read (string)
-    bcInputFileLine:   // LINE INPUT# - Dest = whole line read (string)
+    bcInputFileLine,   // LINE INPUT# - Dest = whole line read (string)
+    bcGetBinStr:       // GET #n binary string - Dest = string read
       Result := True;
     // NOTE: bcArrayStoreString uses Dest as SOURCE (read), handled by DestReadIsStringReg
   else
@@ -456,6 +457,7 @@ begin
     bcPrintFileFloat, bcPrintFileInt,        // Src1 = handle (int)
     bcFileQuery, bcSeekSet, bcInputFileLine, // Src1 = handle (int)
     bcGetBinInt, bcGetBinFloat, bcPutBinInt, bcPutBinFloat,  // Src1 = handle (int)
+    bcGetBinStr, bcPutBinStr,                                // Src1 = handle (int)
     bcCmd, bcAppend, bcRecord:               // Src1 = handle (int)
       Result := True;
   else
@@ -682,7 +684,8 @@ begin
     bcRefStoreString,
     // === GROUP 6: File I/O operations ===
     bcDopen, bcOpen,  // Src2 = filename (string)
-    bcAppend:         // Src2 = data (string)
+    bcAppend,         // Src2 = data (string)
+    bcPutBinStr:      // PUT #n: Src2 = string value
       Result := True;
   else
     Result := False;
