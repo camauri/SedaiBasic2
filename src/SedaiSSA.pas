@@ -8920,6 +8920,26 @@ begin
   // Need at least 2 children (handle and variable)
   if Node.ChildCount < 2 then Exit;
 
+  // FreeBASIC binary GET #n, [pos], var: read sizeof(var) bytes into a scalar (int/float v1). The
+  // handle child is clean (antLiteral number or antIdentifier variable, no "#N" merge).
+  if Node.Attributes.Values['BIN'] = '1' then
+  begin
+    ProcessExpression(Node.GetChild(0), HandleVal);
+    HandleReg := EnsureIntRegister(HandleVal);
+    if (Node.Attributes.Values['HASPOS'] = '1') and (Node.ChildCount >= 3) then
+    begin
+      ProcessExpression(Node.GetChild(2), HandleVal);   // optional position: seek first
+      EmitInstruction(ssaSeekSet, MakeSSAValue(svkNone), HandleReg, EnsureIntRegister(HandleVal), MakeSSAValue(svkNone));
+    end;
+    VarChild := Node.GetChild(1);
+    VarReg := GetOrAllocateVariable(string(VarChild.Value));
+    if VarReg.RegType = srtFloat then
+      EmitInstruction(ssaGetBinFloat, VarReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+    else
+      EmitInstruction(ssaGetBinInt, VarReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+
   // Parse handle (first child)
   HandleChild := Node.GetChild(0);
   if HandleChild.NodeType = antLiteral then
@@ -9160,6 +9180,25 @@ begin
       ProcessExpression(Node.GetChild(1), ExprVal);
       EmitInstruction(ssaSeekSet, MakeSSAValue(svkNone), HandleReg,
                      EnsureIntRegister(ExprVal), MakeSSAValue(svkNone));
+    end;
+    Exit;
+  end;
+
+  // FreeBASIC binary PUT #n, [pos], var: write sizeof(var) bytes of a scalar (int/float v1).
+  if Node.Attributes.Values['PUTBIN'] = '1' then
+  begin
+    if (Node.Attributes.Values['HASPOS'] = '1') and (Node.ChildCount >= 3) then
+    begin
+      ProcessExpression(Node.GetChild(2), ExprVal);   // optional position: seek first
+      EmitInstruction(ssaSeekSet, MakeSSAValue(svkNone), HandleReg, EnsureIntRegister(ExprVal), MakeSSAValue(svkNone));
+    end;
+    if Node.ChildCount >= 2 then
+    begin
+      ProcessExpression(Node.GetChild(1), ExprVal);   // the value to write
+      if (ExprVal.Kind = svkConstFloat) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtFloat)) then
+        EmitInstruction(ssaPutBinFloat, MakeSSAValue(svkNone), HandleReg, EnsureFloatRegister(ExprVal), MakeSSAValue(svkNone))
+      else
+        EmitInstruction(ssaPutBinInt, MakeSSAValue(svkNone), HandleReg, EnsureIntRegister(ExprVal), MakeSSAValue(svkNone));
     end;
     Exit;
   end;

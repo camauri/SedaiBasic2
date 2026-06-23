@@ -228,6 +228,7 @@ begin
     // === GROUP 6: File I/O operations ===
     bcInputFileInt,  // INPUT# file, int var
     bcFileQuery,     // EOF/FREEFILE/LOF/LOC/SEEK -> int result
+    bcGetBinInt,     // GET #n binary -> int Dest
     // === GROUP 5: Special variables ===
     bcLoadTI,         // TI: jiffies since start (int)
     bcLoadEL,         // EL: last error line number (int)
@@ -283,6 +284,7 @@ begin
     // Conversion to float
     bcIntToFloat, bcStringToFloat,
     bcNarrowSingle,  // B1.5: single-precision rounding (Dest=float)
+    bcGetBinFloat,   // GET #n binary -> float Dest
     // === GROUP 1: String operations ===
     bcStrVal,      // VAL(str) - string to float
     // === GROUP 2: Math functions ===
@@ -453,6 +455,7 @@ begin
     bcInputFileFloat, bcInputFileInt,        // Src1 = handle (int)
     bcPrintFileFloat, bcPrintFileInt,        // Src1 = handle (int)
     bcFileQuery, bcSeekSet, bcInputFileLine, // Src1 = handle (int)
+    bcGetBinInt, bcGetBinFloat, bcPutBinInt, bcPutBinFloat,  // Src1 = handle (int)
     bcCmd, bcAppend, bcRecord:               // Src1 = handle (int)
       Result := True;
   else
@@ -530,6 +533,7 @@ begin
     bcPoke,           // POKE address, value: Src2 = value (int)
     // === GROUP 6: File I/O ===
     bcSeekSet,        // SEEK #n, pos: Src2 = position (int)
+    bcPutBinInt,      // PUT #n: Src2 = int value
     // === GROUP 1: String operations with int second param ===
     bcStrLeft, bcStrRight,  // LEFT$/RIGHT$(str, len) - len is Src2 (int)
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src2 = codepoint count/start (int)
@@ -604,6 +608,8 @@ begin
     bcRefStoreFloat,
     // === GROUP 4: I/O operations ===
     bcPrintUsing,  // PRINT USING - Src2 = value (float)
+    // === GROUP 6: File I/O ===
+    bcPutBinFloat, // PUT #n: Src2 = float value
     // === GROUP 7: Sprite ===
     bcSprSize,     // SPRSIZE: Src2 = width (float)
     bcSprForm:     // SPRFORM: Src2 = format (float)

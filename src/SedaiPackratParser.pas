@@ -256,6 +256,7 @@ type
     function ParseLineInputStatement: TASTNode;  // FreeBASIC LINE INPUT #n, var (whole line)
     function ParseWriteFileStatement: TASTNode;   // FreeBASIC WRITE #n, exprlist (quoted CSV)
     function ParseSeekStatement: TASTNode;         // FreeBASIC SEEK #n, pos (set position)
+    function ParseBinaryFileTail(IsGet: Boolean; const Tok: TLexerToken): TASTNode;  // GET/PUT #n,[pos],var
     function ParseErrorHandlingStatement: TASTNode;
     function ParseDebugStatement: TASTNode;
     function ParseTracingStatement: TASTNode;
@@ -838,6 +839,13 @@ begin
         else if (UpperCase(Token.Value) = 'SEEK') and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
           Result := ParseSeekStatement
+        // FreeBASIC binary "PUT #n, [pos], var" — PUT is a bare identifier; the `#` selects it.
+        else if (UpperCase(Token.Value) = 'PUT') and Assigned(Context.PeekNext) and
+                ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
+        begin
+          Context.Advance;   // consume PUT
+          Result := ParseBinaryFileTail(False, Token);
+        end
         // Note: the FreeBASIC in-place "MID(dst,start[,len]) = src" statement (MODERN) is intercepted
         // earlier by the dialect profile's IdentMidStatementHandler (mechanism 3), so it does not need
         // a branch here; in CLASSIC bare MID is a plain identifier handled by the default path below.
@@ -1230,6 +1238,14 @@ begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antGet, Token);
   Context.Advance; // Consume GET
+
+  // FreeBASIC binary "GET #n, [pos], var" — read sizeof(var) bytes into a scalar.
+  if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+  begin
+    Result.Free;
+    Result := ParseBinaryFileTail(True, Token);
+    Exit;
+  end;
 
   // GET requires a single string variable
   // Format: GET A$
@@ -4100,6 +4116,58 @@ begin
     P := ParseExpression;
     if Assigned(P) then Result.AddChild(P) else Break;
     if Context.Check(ttSeparParam) then Context.Advance else Break;
+  end;
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseBinaryFileTail(IsGet: Boolean; const Tok: TLexerToken): TASTNode;
+// FreeBASIC binary GET/PUT tail: "#n [, [pos] , var]". Cursor is at '#'. Builds antGetFile tagged BIN
+// (GET) or antPrintFile tagged PUTBIN (PUT): child0=handle, child1=var, optional child2=pos (HASPOS).
+var
+  H, V, P: TASTNode;
+begin
+  if IsGet then
+  begin
+    Result := TASTNode.Create(antGetFile, Tok);
+    Result.Attributes.Values['BIN'] := '1';
+  end
+  else
+  begin
+    Result := TASTNode.Create(antPrintFile, Tok);
+    Result.Attributes.Values['PUTBIN'] := '1';
+  end;
+  if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+    Context.Advance;  // '#'
+  if Context.Check(ttNumber) or Context.Check(ttInteger) then
+  begin
+    H := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
+    Context.Advance;
+  end
+  else if Context.Check(ttIdentifier) then
+  begin
+    H := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+    Context.Advance;
+  end
+  else
+  begin
+    HandleError('Expected file number after GET/PUT #', Tok);
+    H := TASTNode.CreateWithValue(antLiteral, 1, Tok);
+  end;
+  Result.AddChild(H);   // child 0 = handle
+  P := nil;
+  if Context.Check(ttSeparParam) then
+  begin
+    Context.Advance;  // comma after the handle
+    if not Context.Check(ttSeparParam) then
+      P := ParseExpression;   // optional position (empty in "GET #1, , var")
+    if Context.Check(ttSeparParam) then Context.Advance;  // comma before the variable
+  end;
+  V := ParseExpression;   // destination (GET) / source value (PUT)
+  if Assigned(V) then Result.AddChild(V);   // child 1 = var
+  if Assigned(P) then
+  begin
+    Result.Attributes.Values['HASPOS'] := '1';
+    Result.AddChild(P);   // child 2 = position
   end;
   DoNodeCreated(Result);
 end;

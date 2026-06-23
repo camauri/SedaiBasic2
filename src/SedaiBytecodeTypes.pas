@@ -454,6 +454,10 @@ const
   bcFileQuery       = bcGroupFileIO + 16;   // FreeBASIC EOF/FREEFILE/LOF/LOC/SEEK: Dest=int result, Src1=handle reg, Immediate=query code (0=EOF,1=FREEFILE,2=LOF,3=LOC,4=SEEK)
   bcSeekSet         = bcGroupFileIO + 17;   // SEEK #n, pos statement: Src1=handle reg, Src2=position reg (1-based)
   bcInputFileLine   = bcGroupFileIO + 18;   // LINE INPUT# file, string var (whole line, no comma split): Dest=string var, Src1=handle
+  bcPutBinInt       = bcGroupFileIO + 19;   // PUT #n: write 8 bytes of an integer (Src1=handle, Src2=int value)
+  bcPutBinFloat     = bcGroupFileIO + 20;   // PUT #n: write 8 bytes of a double  (Src1=handle, Src2=float value)
+  bcGetBinInt       = bcGroupFileIO + 21;   // GET #n: read 8 bytes into an integer (Dest=int value, Src1=handle)
+  bcGetBinFloat     = bcGroupFileIO + 22;   // GET #n: read 8 bytes into a double  (Dest=float value, Src1=handle)
 
   // === GROUP 7: SPRITE OPERATIONS (0x07xx) ===
   // Sprite commands

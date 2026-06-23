@@ -180,6 +180,24 @@ begin
     if Length(Data) > 0 then
       try FS.Write(Data[1], Length(Data)); except ErrorCode := 25; end;
   end
+  else if Command = 'PUTBIN' then
+  begin
+    // Binary PUT: Data already holds the raw bytes to write (serialised by the VM).
+    if Length(Data) > 0 then
+      try FS.Write(Data[1], Length(Data)); except ErrorCode := 25; end;
+  end
+  else if Command = 'GETBIN' then
+  begin
+    // Binary GET: Data on input is the byte count to read; return the raw bytes read (fewer at EOF).
+    i := StrToIntDef(Data, 0);
+    if i < 0 then i := 0;
+    SetLength(Data, i);
+    if i > 0 then
+    begin
+      i := FS.Read(Data[1], i);
+      SetLength(Data, i);
+    end;
+  end
   else if Command = 'RECORD' then
   begin
     try FS.Position := StrToInt64(Data); except

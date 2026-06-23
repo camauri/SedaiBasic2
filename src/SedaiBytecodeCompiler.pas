@@ -401,6 +401,10 @@ begin
     ssaFileQuery: Result := bcFileQuery;
     ssaSeekSet: Result := bcSeekSet;
     ssaInputFileLine: Result := bcInputFileLine;
+    ssaPutBinInt: Result := bcPutBinInt;
+    ssaPutBinFloat: Result := bcPutBinFloat;
+    ssaGetBinInt: Result := bcGetBinInt;
+    ssaGetBinFloat: Result := bcGetBinFloat;
     // Sprite commands
     ssaSprite: Result := bcSprite;
     ssaMovsprAbs: Result := bcMovsprAbs;

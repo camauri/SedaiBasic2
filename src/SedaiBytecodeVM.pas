@@ -5898,6 +5898,8 @@ var
   ErrorCode: Integer;
   HandleNum: Integer;
   HandleName, Filename, Mode, Data: string;
+  BinI: Int64;
+  BinF: Double;
 begin
   { Group 6: File I/O operations (0x06xx)
     Opcodes:
@@ -6230,6 +6232,56 @@ begin
         end
         else
           raise Exception.Create('LINE INPUT# command not supported: no handler assigned');
+      end;
+
+    19: // bcPutBinInt - PUT #n: write 8 bytes of an integer (Src1=handle, Src2=int value)
+      begin
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        BinI := Ctx.IntRegs[Instr.Src2];
+        SetLength(Data, 8); Move(BinI, Data[1], 8);
+        if Assigned(FOnFileData) then
+        begin
+          FOnFileData(Self, 'PUTBIN', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then raise Exception.CreateFmt('PUT error %d to file %d', [ErrorCode, HandleNum]);
+        end
+        else raise Exception.Create('PUT command not supported: no handler assigned');
+      end;
+
+    20: // bcPutBinFloat - PUT #n: write 8 bytes of a double (Src1=handle, Src2=float value)
+      begin
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        BinF := Ctx.FloatRegs[Instr.Src2];
+        SetLength(Data, 8); Move(BinF, Data[1], 8);
+        if Assigned(FOnFileData) then
+        begin
+          FOnFileData(Self, 'PUTBIN', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then raise Exception.CreateFmt('PUT error %d to file %d', [ErrorCode, HandleNum]);
+        end
+        else raise Exception.Create('PUT command not supported: no handler assigned');
+      end;
+
+    21: // bcGetBinInt - GET #n: read 8 bytes into an integer (Dest=int value, Src1=handle)
+      begin
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        if Assigned(FOnFileData) then
+        begin
+          Data := '8'; FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
+          if Length(Data) >= 8 then Move(Data[1], BinI, 8) else BinI := 0;
+          if Instr.Dest >= 0 then Ctx.IntRegs[Instr.Dest] := BinI;
+        end
+        else raise Exception.Create('GET command not supported: no handler assigned');
+      end;
+
+    22: // bcGetBinFloat - GET #n: read 8 bytes into a double (Dest=float value, Src1=handle)
+      begin
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        if Assigned(FOnFileData) then
+        begin
+          Data := '8'; FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
+          if Length(Data) >= 8 then Move(Data[1], BinF, 8) else BinF := 0;
+          if Instr.Dest >= 0 then Ctx.FloatRegs[Instr.Dest] := BinF;
+        end
+        else raise Exception.Create('GET command not supported: no handler assigned');
       end;
 
   else
