@@ -311,6 +311,8 @@ begin
     // Memory operations - always live (may affect program state)
     ssaStoreVar, ssaArrayStore, ssaArrayDim,
     ssaArrayErase, ssaArrayRedim,  // B1.4: mutate array storage in place
+    ssaArrayRedimPush, ssaArrayRedimN,  // REDIM multi-dim (mutate array storage)
+    ssaArrayIdxPush, ssaArrayIdxResolve,  // runtime multi-dim index (mutate the pending-index accumulator)
     ssaRefStoreInt, ssaRefStoreFloat, ssaRefStoreString,  // FreeBASIC pointer store: mutates pointee
     ssaPoke:  // POKE writes to memory-mapped I/O (visible side effects like color changes)
       Result := True;

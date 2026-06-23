@@ -146,6 +146,9 @@ type
     FRawPtrVars: TStringList;            // FreeBASIC raw pointers: var (UPPER) ever assigned from Allocate/CAllocate/
                                          // Reallocate. Its value is a RAWPTR_TAG byte offset → deref/arithmetic use the
                                          // raw byte heap (SizeOf-scaled), not the managed FArrays/record path.
+    FRedimMultiArrays: TStringList;      // array names (UPPER) that appear in a multi-dim REDIM → their multi-dim
+                                         // element access computes the linear index from RUNTIME dimensions
+                                         // (push/resolve), since REDIM changes the strides; others stay const-folded.
     FWStringVars: TStringList;           // FreeBASIC WSTRING vars (UPPER): share the srtString bank but hold UTF-8 bytes
                                          // whose LEN/MID/LEFT/RIGHT count/index by Unicode codepoint (not byte). Assignment/
                                          // concat/copy/PRINT are unchanged (UTF-8 in, UTF-8 out); only width-aware ops differ.
@@ -262,6 +265,9 @@ type
     function IsRawPtr(const Name: string): Boolean;                             // raw (Allocate-backed) pointer var?
     procedure CollectRawPtrVars(Node: TASTNode);                                // pre-scan: mark ptrs assigned from Allocate*
     procedure CollectWStringVars(Node: TASTNode);                               // pre-scan: mark DIM ... AS WSTRING vars
+    procedure CollectRedimMultiArrays(Node: TASTNode);                          // pre-scan: arrays in a multi-dim REDIM
+    function EmitArrayLinearIndex(const Indices: array of TSSAValue; const ArrInfo: TSSAArrayInfo;
+                                  const ArrName: string): TSSAValue;            // row-major linear index (const or runtime)
     function IsWStringVar(const Name: string): Boolean;                         // declared WSTRING var (UTF-8, codepoint LEN)?
     function IsWStringExpr(Node: TASTNode): Boolean;                            // expression that yields a WSTRING value?
     function IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;           // Node = ALLOCATE/CALLOCATE/REALLOCATE(...)?
@@ -526,6 +532,8 @@ begin
   FRawPtrVars := TStringList.Create;
   FWStringVars := TStringList.Create;
   FWStringVars.CaseSensitive := False;
+  FRedimMultiArrays := TStringList.Create;
+  FRedimMultiArrays.CaseSensitive := False;
   FByrefRetFuncs := TStringList.Create;
   FSharedScalarArr.CaseSensitive := False;
   FVarWidthCode := TStringList.Create;
@@ -568,6 +576,7 @@ begin
   FAddrLocalVars.Free;
   FRawPtrVars.Free;
   FWStringVars.Free;
+  FRedimMultiArrays.Free;
   FByrefRetFuncs.Free;
   FVarWidthCode.Free;
   FVarPrintKind.Free;
@@ -3319,56 +3328,8 @@ begin
             Indices[i] := AddResult;
           end;
 
-        // Calculate linear index at compile-time using row-major order formula:
-        // LinearIndex = i0 * (d1*d2*...*dn) + i1 * (d2*...*dn) + ... + i(n-1)
-        // This eliminates the need for consecutive registers at runtime
-        if Length(Indices) = 1 then
-        begin
-          // 1D array: linear index = first index
-          LinearIndex := Indices[0];
-        end
-        else
-        begin
-          // N-D array: compute linear index
-          // Start with index 0 (will accumulate the sum)
-          TempReg := FProgram.AllocRegister(srtInt);
-          LinearIndex := MakeSSARegister(srtInt, TempReg);
-          EmitInstruction(ssaLoadConstInt, LinearIndex, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-
-          for i := 0 to High(Indices) do
-          begin
-            // Calculate stride for dimension i: product of dimensions i+1 to n-1
-            // NOTE: ArrInfo.Dimensions[j] already contains the actual size (N+1 for DIM A(N))
-            Stride := 1;
-            for j := i + 1 to High(ArrInfo.Dimensions) do
-              Stride := Stride * ArrInfo.Dimensions[j];
-
-            if Stride = 1 then
-            begin
-              // Last dimension: just add the index
-              TempReg := FProgram.AllocRegister(srtInt);
-              AddResult := MakeSSARegister(srtInt, TempReg);
-              EmitInstruction(ssaAddInt, AddResult, LinearIndex, Indices[i], MakeSSAValue(svkNone));
-              LinearIndex := AddResult;
-            end
-            else
-            begin
-              // Multiply index by stride, then add to accumulator
-              TempReg := FProgram.AllocRegister(srtInt);
-              StrideVal := MakeSSARegister(srtInt, TempReg);
-              EmitInstruction(ssaLoadConstInt, StrideVal, MakeSSAConstInt(Stride), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-
-              TempReg := FProgram.AllocRegister(srtInt);
-              MulResult := MakeSSARegister(srtInt, TempReg);
-              EmitInstruction(ssaMulInt, MulResult, Indices[i], StrideVal, MakeSSAValue(svkNone));
-
-              TempReg := FProgram.AllocRegister(srtInt);
-              AddResult := MakeSSARegister(srtInt, TempReg);
-              EmitInstruction(ssaAddInt, AddResult, LinearIndex, MulResult, MakeSSAValue(svkNone));
-              LinearIndex := AddResult;
-            end;
-          end;
-        end;
+        // Row-major linear index (compile-time const strides, or runtime push/resolve for REDIM'd arrays).
+        LinearIndex := EmitArrayLinearIndex(Indices, ArrInfo, ArrName);
 
         // Allocate result register with array element type
         DestReg := FProgram.AllocRegister(ArrInfo.ElementType);
@@ -4163,56 +4124,8 @@ begin
       Indices[i] := AddResult;
     end;
 
-  // Calculate linear index at compile-time using row-major order formula:
-  // LinearIndex = i0 * (d1*d2*...*dn) + i1 * (d2*...*dn) + ... + i(n-1)
-  // This eliminates the need for consecutive registers at runtime
-  if Length(Indices) = 1 then
-  begin
-    // 1D array: linear index = first index
-    LinearIndex := Indices[0];
-  end
-  else
-  begin
-    // N-D array: compute linear index
-    // Start with index 0 (will accumulate the sum)
-    TempReg := FProgram.AllocRegister(srtInt);
-    LinearIndex := MakeSSARegister(srtInt, TempReg);
-    EmitInstruction(ssaLoadConstInt, LinearIndex, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-
-    for i := 0 to High(Indices) do
-    begin
-      // Calculate stride for dimension i: product of dimensions i+1 to n-1
-      // NOTE: ArrInfo.Dimensions[j] already contains the actual size (N+1 for DIM A(N))
-      Stride := 1;
-      for j := i + 1 to High(ArrInfo.Dimensions) do
-        Stride := Stride * ArrInfo.Dimensions[j];
-
-      if Stride = 1 then
-      begin
-        // Last dimension: just add the index
-        TempReg := FProgram.AllocRegister(srtInt);
-        AddResult := MakeSSARegister(srtInt, TempReg);
-        EmitInstruction(ssaAddInt, AddResult, LinearIndex, Indices[i], MakeSSAValue(svkNone));
-        LinearIndex := AddResult;
-      end
-      else
-      begin
-        // Multiply index by stride, then add to accumulator
-        TempReg := FProgram.AllocRegister(srtInt);
-        StrideVal := MakeSSARegister(srtInt, TempReg);
-        EmitInstruction(ssaLoadConstInt, StrideVal, MakeSSAConstInt(Stride), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-
-        TempReg := FProgram.AllocRegister(srtInt);
-        MulResult := MakeSSARegister(srtInt, TempReg);
-        EmitInstruction(ssaMulInt, MulResult, Indices[i], StrideVal, MakeSSAValue(svkNone));
-
-        TempReg := FProgram.AllocRegister(srtInt);
-        AddResult := MakeSSARegister(srtInt, TempReg);
-        EmitInstruction(ssaAddInt, AddResult, LinearIndex, MulResult, MakeSSAValue(svkNone));
-        LinearIndex := AddResult;
-      end;
-    end;
-  end;
+  // Row-major linear index (compile-time const strides, or runtime push/resolve for REDIM'd arrays).
+  LinearIndex := EmitArrayLinearIndex(Indices, ArrInfo, ArrName);
 
   // Evaluate value expression
   ProcessExpression(ExprNode, ExprValue);
@@ -4719,11 +4632,11 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessRedim(Node: TASTNode);
-// REDIM [PRESERVE] arr(ub) [, ...] (B1.4): re-dimension existing 1-D arrays at runtime.
-// v1: the array must already be declared (DIM first); only a single dimension is supported,
-// and the original lower bound is kept (only the upper bound / size changes).
+// REDIM [PRESERVE] arr(ub [, ub ...]) [, ...] (B1.4): re-dimension an existing array at runtime.
+// The array must already be declared (DIM first); each dimension's original lower bound is kept (only
+// the upper bounds / size change). PRESERVE keeps the flat element order up to the new size.
 var
-  j, ArrayIdx: Integer;
+  j, di, ArrayIdx: Integer;
   ArrName: string;
   ArrayDeclNode, DimsNode, DimChild, DimExpr: TASTNode;
   UbValue, UbReg: TSSAValue;
@@ -4744,21 +4657,36 @@ begin
     DimsNode := ArrayDeclNode.GetChild(1);
     if DimsNode.NodeType <> antDimensions then
       raise Exception.CreateFmt('REDIM: invalid dimensions for %s', [ArrName]);
-    if DimsNode.ChildCount <> 1 then
-      raise Exception.CreateFmt('REDIM supports a single dimension (v1): %s', [ArrName]);
+    if DimsNode.ChildCount < 1 then
+      raise Exception.CreateFmt('REDIM: missing dimensions for %s', [ArrName]);
 
-    // Bare upper bound, or antDimRange(lb, ub): keep the array's original lower bound, take ub.
-    DimChild := DimsNode.GetChild(0);
-    if DimChild.NodeType = antDimRange then
-      DimExpr := DimChild.GetChild(1)
+    if DimsNode.ChildCount = 1 then
+    begin
+      // 1-D REDIM: bare upper bound, or antDimRange(lb, ub) — keep the original lower bound, take ub.
+      DimChild := DimsNode.GetChild(0);
+      if DimChild.NodeType = antDimRange then DimExpr := DimChild.GetChild(1) else DimExpr := DimChild;
+      ProcessExpression(DimExpr, UbValue);
+      UbReg := EnsureIntRegister(UbValue);
+      EmitInstruction(ssaArrayRedim, MakeSSAValue(svkNone),
+                      MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType),
+                      UbReg, MakeSSAConstInt(PreserveFlag));
+    end
     else
-      DimExpr := DimChild;
-    ProcessExpression(DimExpr, UbValue);
-    UbReg := EnsureIntRegister(UbValue);
-
-    EmitInstruction(ssaArrayRedim, MakeSSAValue(svkNone),
-                    MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType),
-                    UbReg, MakeSSAConstInt(PreserveFlag));
+    begin
+      // Multi-dim REDIM a(u0, u1, ...): push each upper bound, then commit. The VM accumulates the
+      // bounds (bcArrayRedimPush) and reshapes on commit (bcArrayRedimN), keeping each dim's lower bound.
+      for di := 0 to DimsNode.ChildCount - 1 do
+      begin
+        DimChild := DimsNode.GetChild(di);
+        if DimChild.NodeType = antDimRange then DimExpr := DimChild.GetChild(1) else DimExpr := DimChild;
+        ProcessExpression(DimExpr, UbValue);
+        UbReg := EnsureIntRegister(UbValue);
+        EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), UbReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+      EmitInstruction(ssaArrayRedimN, MakeSSAValue(svkNone),
+                      MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType),
+                      MakeSSAValue(svkNone), MakeSSAConstInt(PreserveFlag));
+    end;
   end;
 end;
 
@@ -12147,6 +12075,83 @@ begin
   Result := FWStringVars.IndexOf(UpperCase(Name)) >= 0;
 end;
 
+procedure TSSAGenerator.CollectRedimMultiArrays(Node: TASTNode);
+// Pre-scan: record every array name that appears in a REDIM with more than one dimension.
+var
+  i, k: Integer;
+  Decl, Dims: TASTNode;
+  Nm: string;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType = antRedim then
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(k);
+      if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 2) and
+         (Decl.GetChild(0).NodeType = antIdentifier) and (Decl.GetChild(1).NodeType = antDimensions) and
+         (Decl.GetChild(1).ChildCount > 1) then
+      begin
+        Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        if FRedimMultiArrays.IndexOf(Nm) < 0 then FRedimMultiArrays.Add(Nm);
+      end;
+    end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectRedimMultiArrays(Node.GetChild(i));
+end;
+
+function TSSAGenerator.EmitArrayLinearIndex(const Indices: array of TSSAValue;
+  const ArrInfo: TSSAArrayInfo; const ArrName: string): TSSAValue;
+// Row-major linear index for a multi-dimensional array access. For arrays that are multi-dim REDIM'd
+// (FRedimMultiArrays) the strides change at runtime, so push each index and resolve from the array's
+// CURRENT dimensions (bcArrayIdxPush/Resolve); every other array keeps the fast compile-time const path.
+var
+  i, j, TempReg, ai: Integer;
+  Stride: Int64;
+  StrideVal, MulResult, AddResult, LinIdx: TSSAValue;
+begin
+  if Length(Indices) = 1 then Exit(Indices[0]);
+
+  if FRedimMultiArrays.IndexOf(UpperCase(ArrName)) >= 0 then
+  begin
+    ai := FProgram.FindArray(ArrName);
+    for i := 0 to High(Indices) do
+      EmitInstruction(ssaArrayIdxPush, MakeSSAValue(svkNone), Indices[i], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    LinIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaArrayIdxResolve, LinIdx,
+                    MakeSSAArrayRef(ai, FProgram.GetArray(ai).ElementType),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit(LinIdx);
+  end;
+
+  // Compile-time const-folded strides (row-major).
+  TempReg := FProgram.AllocRegister(srtInt);
+  LinIdx := MakeSSARegister(srtInt, TempReg);
+  EmitInstruction(ssaLoadConstInt, LinIdx, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  for i := 0 to High(Indices) do
+  begin
+    Stride := 1;
+    for j := i + 1 to High(ArrInfo.Dimensions) do
+      Stride := Stride * ArrInfo.Dimensions[j];
+    if Stride = 1 then
+    begin
+      AddResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, AddResult, LinIdx, Indices[i], MakeSSAValue(svkNone));
+      LinIdx := AddResult;
+    end
+    else
+    begin
+      StrideVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, StrideVal, MakeSSAConstInt(Stride), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      MulResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, MulResult, Indices[i], StrideVal, MakeSSAValue(svkNone));
+      AddResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, AddResult, LinIdx, MulResult, MakeSSAValue(svkNone));
+      LinIdx := AddResult;
+    end;
+  end;
+  Result := LinIdx;
+end;
+
 function TSSAGenerator.IsWStringExpr(Node: TASTNode): Boolean;
 // True if the expression yields a WSTRING value: a WSTRING variable, a WSTR(...) conversion, a
 // parenthesised WSTRING, or a string concatenation/expression with a WSTRING operand (the result of
@@ -13978,6 +13983,11 @@ begin
   // FreeBASIC WSTRING: record vars/fields declared AS WSTRING so width-aware ops (LEN/MID/...) count by
   // Unicode codepoint. Same srtString bank (UTF-8 storage) → no new register bank, existing ops intact.
   CollectWStringVars(AST);
+  // REDIM multi-dim: an array re-dimensioned with >1 dimension must compute its element linear index
+  // from RUNTIME dimensions (strides change on REDIM). Collect those array names; their multi-dim access
+  // uses the push/resolve path. Arrays never multi-dim-REDIM'd keep the fast const-folded strides.
+  FRedimMultiArrays.Clear;
+  CollectRedimMultiArrays(AST);
 
   // M8: reset block-scope state (block-scoped record reclamation; the scope stack itself was reset above).
   FBlockHandledVars.Clear;

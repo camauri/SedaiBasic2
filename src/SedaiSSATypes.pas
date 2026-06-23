@@ -164,6 +164,8 @@ type
     ssaArrayLoad, ssaArrayStore, ssaArrayDim,
     ssaArrayLBound, ssaArrayUBound,  // LBOUND/UBOUND(arr[, dim]) (B1.4)
     ssaArrayErase, ssaArrayRedim,    // ERASE / REDIM (B1.4)
+    ssaArrayRedimPush, ssaArrayRedimN,  // REDIM multi-dim: push an upper bound / commit N dims
+    ssaArrayIdxPush, ssaArrayIdxResolve,  // runtime multi-dim index: push an index / resolve to a linear index
     // FreeBASIC pointers: dereference through a runtime "address" = the id of a 1-element backing
     // array (element 0). Load: Dest=value, Src1=address reg. Store: Src1=address reg, Src2=value.
     ssaRefLoadInt, ssaRefLoadFloat, ssaRefLoadString,

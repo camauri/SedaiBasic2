@@ -299,6 +299,10 @@ begin
     ssaArrayUBound: Result := bcArrayUBound;
     ssaArrayErase: Result := bcArrayErase;    // B1.4 array statements
     ssaArrayRedim: Result := bcArrayRedim;
+    ssaArrayRedimPush: Result := bcArrayRedimPush;
+    ssaArrayRedimN: Result := bcArrayRedimN;
+    ssaArrayIdxPush: Result := bcArrayIdxPush;
+    ssaArrayIdxResolve: Result := bcArrayIdxResolve;
     // FreeBASIC pointer dereference (load/store through a runtime address register)
     ssaRefLoadInt: Result := bcRefLoadInt;
     ssaRefLoadFloat: Result := bcRefLoadFloat;

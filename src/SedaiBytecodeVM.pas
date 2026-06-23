@@ -154,6 +154,9 @@ type
     FFunctionKeys: array[1..12] of string;
     FVarMap: TStringList;
     FArrays: array of TArrayStorage;
+    FRedimPendingUBs: array of Integer;   // REDIM multi-dim: upper bounds accumulated by bcArrayRedimPush, consumed by bcArrayRedimN
+    FIdxPending: array of Int64;          // runtime multi-dim index: indices accumulated by bcArrayIdxPush, consumed by bcArrayIdxResolve
+
     // UDT/record heap is per-context (FCtx.Records / FCtx.RecordCount) since M5.2b.
     // DATA pool for DATA/READ/RESTORE statements (the read cursor FCtx.DataIndex is per-context)
     FDataPool: array of Variant;
@@ -211,7 +214,8 @@ type
     procedure ExecuteMathOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteArrayOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure EraseArray(ArrayIdx: Integer);                                   // B1.4: ERASE
-    procedure RedimArray(ArrayIdx, NewUpper: Integer; Preserve: Boolean);       // B1.4: REDIM
+    procedure RedimArray(ArrayIdx, NewUpper: Integer; Preserve: Boolean);       // B1.4: REDIM (1-D)
+    procedure RedimArrayN(ArrayIdx: Integer; const Uppers: array of Integer; Preserve: Boolean); // REDIM multi-dim
 
     procedure ExecuteIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSpecialVarOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -4489,6 +4493,45 @@ begin
   FArrays[ArrayIdx].TotalSize := NewSize;
 end;
 
+procedure TBytecodeVM.RedimArrayN(ArrayIdx: Integer; const Uppers: array of Integer; Preserve: Boolean);
+// REDIM a(u0, u1, ...) — re-dimension a multi-dimensional array. Keeps each dimension's original lower
+// bound (only the upper bounds change). PRESERVE keeps the flat element order up to the new size (FB
+// preserves the linear layout); otherwise the storage is cleared. Strides stay row-major (computed at
+// access from Dimensions[]).
+var
+  d, NewSize, k, Lb: Integer;
+begin
+  if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) or (Length(Uppers) = 0) then Exit;
+  NewSize := 1;
+  SetLength(FArrays[ArrayIdx].Dimensions, Length(Uppers));
+  if Length(FArrays[ArrayIdx].LowerBounds) < Length(Uppers) then
+    SetLength(FArrays[ArrayIdx].LowerBounds, Length(Uppers));
+  for d := 0 to High(Uppers) do
+  begin
+    Lb := FArrays[ArrayIdx].LowerBounds[d];   // keep the original lower bound per dimension
+    k := Uppers[d] - Lb + 1;
+    if k < 0 then k := 0;
+    FArrays[ArrayIdx].Dimensions[d] := k;
+    NewSize := NewSize * k;
+  end;
+  case FArrays[ArrayIdx].ElementType of
+    0: begin
+         SetLength(FArrays[ArrayIdx].IntData, NewSize);
+         if not Preserve then for k := 0 to NewSize - 1 do FArrays[ArrayIdx].IntData[k] := 0;
+       end;
+    1: begin
+         SetLength(FArrays[ArrayIdx].FloatData, NewSize);
+         if not Preserve then for k := 0 to NewSize - 1 do FArrays[ArrayIdx].FloatData[k] := 0.0;
+       end;
+    2: begin
+         SetLength(FArrays[ArrayIdx].StringData, NewSize);
+         if not Preserve then for k := 0 to NewSize - 1 do FArrays[ArrayIdx].StringData[k] := '';
+       end;
+  end;
+  FArrays[ArrayIdx].DimCount := Length(Uppers);
+  FArrays[ArrayIdx].TotalSize := NewSize;
+end;
+
 procedure TBytecodeVM.ExecuteArrayOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
@@ -4801,6 +4844,37 @@ begin
     24: Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(Ctx.IntRegs[Instr.Src1], Instr.Immediate);       // bcRawLoadFloat
     25: RawStoreInt(Ctx.IntRegs[Instr.Src1], Instr.Immediate, Ctx.IntRegs[Instr.Src2]);            // bcRawStoreInt
     26: RawStoreFloat(Ctx.IntRegs[Instr.Src1], Instr.Immediate, Ctx.FloatRegs[Instr.Src2]);        // bcRawStoreFloat
+    27: // bcArrayRedimPush - push one upper bound onto the pending REDIM dimension list
+      begin
+        SetLength(FRedimPendingUBs, Length(FRedimPendingUBs) + 1);
+        FRedimPendingUBs[High(FRedimPendingUBs)] := Ctx.IntRegs[Instr.Src1];
+      end;
+    28: // bcArrayRedimN - commit a multi-dimensional REDIM using the pushed upper bounds
+      begin
+        RedimArrayN(Instr.Src1, FRedimPendingUBs, (Instr.Immediate and 1) <> 0);
+        SetLength(FRedimPendingUBs, 0);
+      end;
+    29: // bcArrayIdxPush - push one (already lower-bound-adjusted) index for a runtime multi-dim access
+      begin
+        SetLength(FIdxPending, Length(FIdxPending) + 1);
+        FIdxPending[High(FIdxPending)] := Ctx.IntRegs[Instr.Src1];
+      end;
+    30: // bcArrayIdxResolve - linear row-major index from the array's CURRENT dimensions: Dest=int, Src1=array id.
+        // Matches the compile-time formula Σ idx[d] * (Π Dimensions[d+1..]) but with runtime sizes (REDIM).
+      begin
+        ArrayIdx := Instr.Src1;
+        LinearIdx := 0;
+        if (ArrayIdx >= 0) and (ArrayIdx < Length(FArrays)) then
+          for i := 0 to High(FIdxPending) do
+          begin
+            ProdDims := 1;
+            for ArrLowerBound := i + 1 to High(FArrays[ArrayIdx].Dimensions) do
+              ProdDims := ProdDims * FArrays[ArrayIdx].Dimensions[ArrLowerBound];
+            LinearIdx := LinearIdx + FIdxPending[i] * ProdDims;
+          end;
+        Ctx.IntRegs[Instr.Dest] := LinearIdx;
+        SetLength(FIdxPending, 0);
+      end;
   else
     raise Exception.CreateFmt('Unknown array opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

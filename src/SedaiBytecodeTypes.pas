@@ -395,6 +395,10 @@ const
   bcRawLoadFloat    = bcGroupArray + 24;  // Dest=float; Src1=raw ptr; Immediate=type code (single/double)
   bcRawStoreInt     = bcGroupArray + 25;  // Src1=raw ptr; Src2=int value; Immediate=type code
   bcRawStoreFloat   = bcGroupArray + 26;  // Src1=raw ptr; Src2=float value; Immediate=type code
+  bcArrayRedimPush  = bcGroupArray + 27;  // REDIM multi-dim: push one upper bound (Src1=int ub reg) onto the pending-dims list
+  bcArrayRedimN     = bcGroupArray + 28;  // REDIM multi-dim commit: Src1=array ref, Immediate bit0=preserve; uses the pushed upper bounds
+  bcArrayIdxPush    = bcGroupArray + 29;  // Runtime multi-dim index: push one index (Src1=int reg) onto the pending-index list
+  bcArrayIdxResolve = bcGroupArray + 30;  // Runtime multi-dim index: Dest=linear index (int), Src1=array ref; row-major from the array's CURRENT dimensions (for REDIM'd arrays)
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values

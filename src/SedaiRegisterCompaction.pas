@@ -229,6 +229,7 @@ begin
     bcInputFileInt,  // INPUT# file, int var
     bcFileQuery,     // EOF/FREEFILE/LOF/LOC/SEEK -> int result
     bcGetBinInt,     // GET #n binary -> int Dest
+    bcArrayIdxResolve,  // runtime multi-dim index -> int Dest (linear index)
     // === GROUP 5: Special variables ===
     bcLoadTI,         // TI: jiffies since start (int)
     bcLoadEL,         // EL: last error line number (int)
@@ -458,6 +459,8 @@ begin
     bcFileQuery, bcSeekSet, bcInputFileLine, // Src1 = handle (int)
     bcGetBinInt, bcGetBinFloat, bcPutBinInt, bcPutBinFloat,  // Src1 = handle (int)
     bcGetBinStr, bcPutBinStr,                                // Src1 = handle (int)
+    bcArrayRedimPush,                        // REDIM multi-dim: Src1 = upper bound (int)
+    bcArrayIdxPush,                          // runtime multi-dim index: Src1 = index (int)
     bcCmd, bcAppend, bcRecord:               // Src1 = handle (int)
       Result := True;
   else
