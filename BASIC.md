@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 265 / 643 implemented (41%)** (+ ~4 partial); see the
+**FreeBASIC keyword set — 267 / 643 implemented (41%)** (+ ~4 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -184,7 +184,7 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 
 | Command | Status | Description |
 |---------|--------|-------------|
-| `GET#` | ✓ | Get character from file |
+| `GET#` | ✓ | C128 GET char from file; FreeBASIC `GET #n,[pos],var` / `PUT #n,[pos],var` binary record I/O of scalar int/double (string/UDT records deferred). |
 | `INPUT#` | ✓ | Input from file |
 | `PRINT#` | ✓ | Print to file |
 
@@ -1251,7 +1251,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 > FB-syntax file I/O are not yet present. This is a forward-looking gap map, not a claim of FreeBASIC
 > compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **265 / 643 implemented (41%)**, plus ~4 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **267 / 643 implemented (41%)**, plus ~4 partial (◐).
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
 > compound & bitwise operators, string/conversion/array functions, namespaces, pointers (managed + raw
