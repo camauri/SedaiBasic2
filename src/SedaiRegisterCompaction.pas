@@ -227,6 +227,7 @@ begin
     bcDataReadInt,   // Read next DATA value into int register
     // === GROUP 6: File I/O operations ===
     bcInputFileInt,  // INPUT# file, int var
+    bcFileQuery,     // EOF/FREEFILE/LOF/LOC/SEEK -> int result
     // === GROUP 5: Special variables ===
     bcLoadTI,         // TI: jiffies since start (int)
     bcLoadEL,         // EL: last error line number (int)
@@ -450,6 +451,7 @@ begin
     bcGetFile, bcInputFile, bcPrintFile,     // Src1 = handle (int)
     bcInputFileFloat, bcInputFileInt,        // Src1 = handle (int)
     bcPrintFileFloat, bcPrintFileInt,        // Src1 = handle (int)
+    bcFileQuery, bcSeekSet,                  // Src1 = handle (int)
     bcCmd, bcAppend, bcRecord:               // Src1 = handle (int)
       Result := True;
   else
@@ -525,6 +527,8 @@ begin
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr,
     // === GROUP 5: Memory operations ===
     bcPoke,           // POKE address, value: Src2 = value (int)
+    // === GROUP 6: File I/O ===
+    bcSeekSet,        // SEEK #n, pos: Src2 = position (int)
     // === GROUP 1: String operations with int second param ===
     bcStrLeft, bcStrRight,  // LEFT$/RIGHT$(str, len) - len is Src2 (int)
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src2 = codepoint count/start (int)

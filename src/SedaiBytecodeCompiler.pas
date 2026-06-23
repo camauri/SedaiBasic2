@@ -398,6 +398,8 @@ begin
     ssaPrintFile: Result := bcPrintFile;
     ssaPrintFileNewLine: Result := bcPrintFileNewLine;
     ssaCmd: Result := bcCmd;
+    ssaFileQuery: Result := bcFileQuery;
+    ssaSeekSet: Result := bcSeekSet;
     // Sprite commands
     ssaSprite: Result := bcSprite;
     ssaMovsprAbs: Result := bcMovsprAbs;

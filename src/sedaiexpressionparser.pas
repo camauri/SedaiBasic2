@@ -1004,6 +1004,14 @@ begin
 
   Result := TASTNode.CreateWithValue(antFunctionCall, Token.Value, Token);
 
+  // FreeBASIC FREEFILE takes no argument: accept it bare (FREEFILE), as well as FREEFILE(). Attach an
+  // empty argument list so the SSA function dispatch (which only runs for ChildCount>0) still sees it.
+  if (UpperCase(Token.Value) = 'FREEFILE') and not Context.Check(ttDelimParOpen) then
+  begin
+    Result.AddChild(TASTNode.Create(antArgumentList, Token));
+    Exit;
+  end;
+
   // Consume opening parenthesis
   if not Context.Match(ttDelimParOpen) then
   begin

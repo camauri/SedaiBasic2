@@ -270,6 +270,8 @@ type
     ssaDclear,         // DCLEAR: Close all open file handles
     ssaRecord,         // RECORD #handle, position: Seek to position in file
     ssaPrintFileNewLine, // PRINT# newline: Write CR to file (handle in Src1)
+    ssaFileQuery,      // EOF/FREEFILE/LOF/LOC/SEEK(n) -> int (Src1=handle, Src3=query code immediate)
+    ssaSeekSet,        // SEEK #n, pos statement (Src1=handle, Src2=position)
     // Sprite commands
     ssaSprite,         // SPRITE n [,on] [,color] [,priority] [,xscale] [,yscale] [,mode]
     ssaMovsprAbs,      // MOVSPR n, x, y: Position sprite at absolute coordinates

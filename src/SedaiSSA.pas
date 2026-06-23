@@ -2148,6 +2148,14 @@ begin
           else
             EmitInstruction(ssaStrLen, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
+        else if (FuncName = 'FREEFILE') then
+        begin
+          // FreeBASIC FREEFILE - no argument; the lowest unused file number (handle slot is ignored).
+          ArgReg := EnsureIntRegister(MakeSSAConstInt(0));
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaFileQuery, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(1));
+        end
         else if (FuncName = 'ASC') then
         begin
           // ASC(str) - returns integer ASCII code of first char
@@ -3197,6 +3205,23 @@ begin
         if FModernMode and (UpperCase(ArrName) = 'WSTR') and (FProgram.FindArray(ArrName) < 0) then
         begin
           EmitWStr(Node.GetChild(1), Result);
+          Exit;
+        end;
+
+        // FreeBASIC EOF(#n)/LOF(#n)/LOC(#n): file query returning int. Parsed as array access (not
+        // registered as keywords, so common names like `loc` stay usable as variables). MODERN, not a
+        // declared array. Query code: EOF=0, LOF=2, LOC=3 (matches bcFileQuery).
+        if FModernMode and (FProgram.FindArray(ArrName) < 0) and
+           ((UpperCase(ArrName) = 'EOF') or (UpperCase(ArrName) = 'LOF') or (UpperCase(ArrName) = 'LOC')) and
+           (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ArgReg := EnsureIntRegister(ArgValue);
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          if UpperCase(ArrName) = 'LOF' then ValCode := 2
+          else if UpperCase(ArrName) = 'LOC' then ValCode := 3
+          else ValCode := 0;
+          EmitInstruction(ssaFileQuery, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(ValCode));
           Exit;
         end;
 
@@ -8557,15 +8582,18 @@ begin
         EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
+      else if FModernMode then
+      begin
+        // FreeBASIC: "AS #f" — the handle is a variable holding the file number; evaluate it.
+        ProcessExpression(HandleChild, HandleVal);
+        HandleReg := EnsureIntRegister(HandleVal);
+      end
       else
       begin
-        // Named handle: #MYFILE - store name in string constants
-        HandleNameIdx := FProgram.AllocRegister(srtInt);  // Use as temporary identifier
-        // Create a temporary register to hold the handle number (will be assigned at runtime)
+        // Legacy (CLASSIC) named handle: #MYFILE - placeholder handle 0.
         HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-        // Store handle name as string constant for runtime lookup
         HandleNameIdx := FProgram.AllocRegister(srtString);
       end;
     end
@@ -8658,9 +8686,15 @@ begin
         EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
+      else if FModernMode then
+      begin
+        // FreeBASIC: the handle is a variable holding the file number; evaluate it.
+        ProcessExpression(HandleChild, HandleVal);
+        HandleReg := EnsureIntRegister(HandleVal);
+      end
       else
       begin
-        // Named handle: #MYFILE - for now, treat as 0 (runtime will resolve)
+        // Legacy named handle: #MYFILE - placeholder 0.
         HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -8969,6 +9003,11 @@ begin
       EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end
+    else if FModernMode then
+    begin
+      ProcessExpression(HandleChild, HandleVal);   // FreeBASIC: handle is a variable
+      HandleReg := EnsureIntRegister(HandleVal);
+    end
     else
     begin
       HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -9038,6 +9077,11 @@ begin
       HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if FModernMode then
+    begin
+      ProcessExpression(HandleChild, HandleVal);   // FreeBASIC: handle is a variable
+      HandleReg := EnsureIntRegister(HandleVal);
     end
     else
     begin
@@ -9161,6 +9205,11 @@ begin
       HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if FModernMode then
+    begin
+      ProcessExpression(HandleChild, HandleVal);   // FreeBASIC: handle is a variable
+      HandleReg := EnsureIntRegister(HandleVal);
     end
     else
     begin

@@ -163,6 +163,10 @@ const
   kCATALOG = 'CATALOG';
   kOPEN    = 'OPEN';
   kCLOSE   = 'CLOSE';
+  kEOF     = 'EOF';       // FreeBASIC: EOF(#n) -> -1 at end of file
+  kFREEFILE = 'FREEFILE'; // FreeBASIC: next free file number (1..15, 0 if none)
+  kLOF     = 'LOF';       // FreeBASIC: file length in bytes
+  kLOC     = 'LOC';       // FreeBASIC: current byte position
   kGET     = 'GET';
   { kPUT     = 'PUT'; // PUT is not a C128 command }
   kDLOAD   = 'DLOAD';

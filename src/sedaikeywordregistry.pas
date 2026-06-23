@@ -1925,6 +1925,10 @@ begin
  RegisterKeyword(kVALINT,  ttMathFunction, 'Parse leading integer from a string',                    kcMathFunctions);
  RegisterKeyword(kVALLNG,  ttMathFunction, 'Parse leading 64-bit integer from a string',             kcMathFunctions);
  RegisterKeyword(kVALULNG, ttMathFunction, 'Parse leading 64-bit unsigned integer from a string',     kcMathFunctions);
+ // EOF/LOF/LOC are NOT registered as keywords: they would reserve common variable names (e.g. `loc`).
+ // They are intercepted as functions in the array-access path (MODERN, when not a declared array),
+ // exactly like bare MID/STRING/IIF/WSTR. FREEFILE has no argument list, so it stays a keyword.
+ RegisterKeyword(kFREEFILE,ttMathFunction, 'FREEFILE: lowest unused file number (FreeBASIC)',          kcMathFunctions);
  RegisterKeyword(kVALUINT, ttMathFunction, 'Parse leading unsigned integer from a string',           kcMathFunctions);
  RegisterKeyword(kLBOUND,  ttMathFunction, 'Lower bound of an array dimension',                       kcMathFunctions);
  RegisterKeyword(kUBOUND,  ttMathFunction, 'Upper bound of an array dimension',                       kcMathFunctions);

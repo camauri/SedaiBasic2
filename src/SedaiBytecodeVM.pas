@@ -6190,6 +6190,32 @@ begin
           raise Exception.Create('INPUT# command not supported: no handler assigned');
       end;
 
+    16: // bcFileQuery - EOF/FREEFILE/LOF/LOC/SEEK(n) -> int (non-fatal; Src1=handle, Immediate=query code)
+      begin
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        case Instr.Immediate of
+          1: Mode := 'FREEFILE';
+          2: Mode := 'LOF';
+          3: Mode := 'LOC';
+          4: Mode := 'SEEK';
+        else
+          Mode := 'EOF';
+        end;
+        Data := '';
+        if Assigned(FOnFileData) then
+          FOnFileData(Self, Mode, HandleNum, Data, ErrorCode);   // queries don't raise
+        if Instr.Dest >= 0 then
+          Ctx.IntRegs[Instr.Dest] := StrToIntDef(Trim(Data), 0);
+      end;
+
+    17: // bcSeekSet - SEEK #n, pos: set the 1-based file position
+      begin
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        Data := IntToStr(Ctx.IntRegs[Instr.Src2]);
+        if Assigned(FOnFileData) then
+          FOnFileData(Self, 'SEEKSET', HandleNum, Data, ErrorCode);
+      end;
+
   else
     raise Exception.CreateFmt('Unknown file I/O opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
