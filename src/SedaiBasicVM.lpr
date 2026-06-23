@@ -45,6 +45,8 @@ uses
   SedaiSSATypes, SedaiSSA,
   SedaiBytecodeTypes, SedaiBytecodeCompiler, SedaiBytecodeVM,
   SedaiBytecodeDisassembler,
+  // Headless file I/O handler (OPEN/PRINT#/INPUT#/EOF/FREEFILE...) for the CLI VM
+  SedaiFileIO,
   // Register Allocation
   SedaiRegAlloc,
   // Peephole and Superinstructions
@@ -356,6 +358,17 @@ end;
 var
   // Global option for TRUE value in comparisons (-1 = Commodore BASIC, 1 = modern BASIC)
   OptTrueValue: Int64 = -1;
+  // Headless file-I/O handler shared by the CLI VM instances (lazily created, freed at exit).
+  GFileHandler: TVMFileHandler = nil;
+
+{ Attach the headless file handler's callbacks to a freshly created VM, so OPEN /
+  PRINT# / INPUT# / EOF / FREEFILE perform real file I/O in the CLI. }
+procedure WireFileHandler(AVM: TBytecodeVM);
+begin
+  if GFileHandler = nil then GFileHandler := TVMFileHandler.Create;
+  AVM.OnDiskFile := @GFileHandler.DiskFile;
+  AVM.OnFileData := @GFileHandler.FileData;
+end;
 
 { Print version banner }
 procedure PrintVersion;
@@ -1480,6 +1493,7 @@ begin
       Input := TTerminalInput.Create;
       Output.Initialize('SedaiBasic', 80, 25);
       VM := TBytecodeVM.Create;
+      WireFileHandler(VM);
     {$IFDEF ENABLE_PROFILER}
     Profiler := nil;
     if OptProfile then
@@ -1729,6 +1743,7 @@ begin
       Input := TTerminalInput.Create;
       Output.Initialize('SedaiBasic', 80, 25);
       VM := TBytecodeVM.Create;
+      WireFileHandler(VM);
       {$IFDEF ENABLE_PROFILER}
       Profiler := nil;
       if OptProfile then

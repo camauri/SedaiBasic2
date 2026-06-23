@@ -1048,6 +1048,29 @@ begin
     Result := TASTNode.Create(antPrint, Token);
     Context.Advance; // Consume PRINT
 
+    // FreeBASIC file output: "PRINT #n, exprlist" -> antPrintFile (handle = child 0). The shared
+    // print-list loop below appends the expressions/separators (same shape as PRINT#).
+    if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+    begin
+      Result.Free;
+      Result := TASTNode.Create(antPrintFile, Token);
+      Context.Advance;  // consume '#'
+      if Context.Check(ttNumber) or Context.Check(ttInteger) then
+      begin
+        Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
+        Context.Advance;
+      end
+      else if Context.Check(ttIdentifier) then
+      begin
+        Result.AddChild(TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken));
+        Context.Advance;
+      end
+      else
+        HandleError('Expected file number after PRINT #', Token);
+      if Context.CheckAny([ttSeparParam, ttSeparOutput]) then
+        Context.Advance;   // the comma/semicolon after the file number
+    end
+    else
     // Check for USING keyword after PRINT
     if Context.Check(ttOutputCommand) and (UpperCase(Context.CurrentToken.Value) = kUSING) then
     begin
@@ -1122,6 +1145,35 @@ begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antInput, Token);
   Context.Advance; // Consume INPUT
+
+  // FreeBASIC file input: "INPUT #n, varlist" -> antInputFile (handle = child 0, then variables).
+  if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+  begin
+    Result.Free;
+    Result := TASTNode.Create(antInputFile, Token);
+    Context.Advance;  // consume '#'
+    if Context.Check(ttNumber) or Context.Check(ttInteger) then
+    begin
+      Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
+      Context.Advance;
+    end
+    else if Context.Check(ttIdentifier) then
+    begin
+      Result.AddChild(TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken));
+      Context.Advance;
+    end
+    else
+      HandleError('Expected file number after INPUT #', Token);
+    if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;  // comma after handle
+    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
+    begin
+      Expr := ParseExpression;     // a destination variable (identifier or array element)
+      if Assigned(Expr) then Result.AddChild(Expr) else Break;
+      if Context.Check(ttSeparParam) then Context.Advance else Break;
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
 
   while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
@@ -3525,7 +3577,7 @@ function TPackratParser.ParseFileOperationStatement: TASTNode;
 var
   Token: TLexerToken;
   Param, HandleNode: TASTNode;
-  CmdName: string;
+  CmdName, ModeStr, MW: string;
 begin
   Token := Context.CurrentToken;
   CmdName := UpperCase(Token.Value);
@@ -3549,6 +3601,55 @@ begin
   end;
 
   Context.Advance; // Consume file operation command
+
+  // FreeBASIC OPEN: OPEN "filename" FOR {INPUT|OUTPUT|APPEND|BINARY|RANDOM} AS [#]n [LEN = reclen].
+  // Detected when OPEN is NOT immediately followed by a '#handle' (that is the legacy C64/C128 form).
+  // Built as the same antDopen node (child0=handle, child1=filename, child2=mode$) the legacy form uses.
+  if ((CmdName = 'DOPEN') or (CmdName = 'OPEN')) and
+     not (Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#')) then
+  begin
+    Param := ParseExpression;     // filename
+    if not Assigned(Param) then begin HandleError('Expected filename after OPEN', Token); Exit; end;
+    ModeStr := 'R';
+    if UpperCase(Context.CurrentToken.Value) = 'FOR' then
+    begin
+      Context.Advance;            // FOR
+      MW := UpperCase(Context.CurrentToken.Value);
+      if MW = 'INPUT' then ModeStr := 'R'
+      else if MW = 'OUTPUT' then ModeStr := 'W'
+      else if MW = 'APPEND' then ModeStr := 'A'
+      else if MW = 'BINARY' then ModeStr := 'B'
+      else if MW = 'RANDOM' then ModeStr := 'B'
+      else HandleError('Expected INPUT/OUTPUT/APPEND/BINARY/RANDOM after FOR', Token);
+      Context.Advance;            // mode word
+    end;
+    if (UpperCase(Context.CurrentToken.Value) = 'AS') or Context.Check(ttAsType) then
+      Context.Advance;            // AS
+    if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+      Context.Advance;            // optional '#'
+    if Context.Check(ttNumber) or Context.Check(ttInteger) then
+    begin
+      HandleNode := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
+      Context.Advance;
+    end
+    else if Context.Check(ttIdentifier) then
+    begin
+      HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+      Context.Advance;
+    end
+    else begin HandleError('Expected file number after AS', Token); Exit; end;
+    if UpperCase(Context.CurrentToken.Value) = 'LEN' then   // optional "LEN = reclen" (RANDOM): ignored v1
+    begin
+      Context.Advance;
+      if Context.Check(ttOpEq) then Context.Advance;
+      ParseExpression.Free;
+    end;
+    Result.AddChild(HandleNode);                            // child 0 = handle
+    Result.AddChild(Param);                                 // child 1 = filename
+    Result.AddChild(TASTNode.CreateWithValue(antLiteral, ModeStr, Token));  // child 2 = mode$
+    DoNodeCreated(Result);
+    Exit;
+  end;
 
   // Special handling for DOPEN/OPEN and DCLOSE/CLOSE
   if (CmdName = 'DOPEN') or (CmdName = 'OPEN') or (CmdName = 'DCLOSE') or (CmdName = 'CLOSE') then
