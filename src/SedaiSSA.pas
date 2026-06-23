@@ -3213,7 +3213,8 @@ begin
         // registered as keywords, so common names like `loc` stay usable as variables). MODERN, not a
         // declared array. Query code: EOF=0, LOF=2, LOC=3 (matches bcFileQuery).
         if FModernMode and (FProgram.FindArray(ArrName) < 0) and
-           ((UpperCase(ArrName) = 'EOF') or (UpperCase(ArrName) = 'LOF') or (UpperCase(ArrName) = 'LOC')) and
+           ((UpperCase(ArrName) = 'EOF') or (UpperCase(ArrName) = 'LOF') or
+            (UpperCase(ArrName) = 'LOC') or (UpperCase(ArrName) = 'SEEK')) and
            (Node.GetChild(1).ChildCount >= 1) then
         begin
           ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
@@ -3221,6 +3222,7 @@ begin
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           if UpperCase(ArrName) = 'LOF' then ValCode := 2
           else if UpperCase(ArrName) = 'LOC' then ValCode := 3
+          else if UpperCase(ArrName) = 'SEEK' then ValCode := 4
           else ValCode := 0;
           EmitInstruction(ssaFileQuery, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(ValCode));
           Exit;
@@ -9148,6 +9150,18 @@ begin
   begin
     ProcessExpression(HandleChild, HandleVal);
     HandleReg := EnsureIntRegister(HandleVal);
+  end;
+
+  // FreeBASIC SEEK #n, pos: set the 1-based file position (reuses the antPrintFile node, tagged SEEK).
+  if Node.Attributes.Values['SEEK'] = '1' then
+  begin
+    if Node.ChildCount >= 2 then
+    begin
+      ProcessExpression(Node.GetChild(1), ExprVal);
+      EmitInstruction(ssaSeekSet, MakeSSAValue(svkNone), HandleReg,
+                     EnsureIntRegister(ExprVal), MakeSSAValue(svkNone));
+    end;
+    Exit;
   end;
 
   // FreeBASIC WRITE #n, ...: comma-separated values, strings quoted, then a newline.

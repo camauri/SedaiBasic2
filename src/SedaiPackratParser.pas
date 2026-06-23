@@ -255,6 +255,7 @@ type
     function ParseFileOutputStatement: TASTNode;
     function ParseLineInputStatement: TASTNode;  // FreeBASIC LINE INPUT #n, var (whole line)
     function ParseWriteFileStatement: TASTNode;   // FreeBASIC WRITE #n, exprlist (quoted CSV)
+    function ParseSeekStatement: TASTNode;         // FreeBASIC SEEK #n, pos (set position)
     function ParseErrorHandlingStatement: TASTNode;
     function ParseDebugStatement: TASTNode;
     function ParseTracingStatement: TASTNode;
@@ -832,6 +833,11 @@ begin
         else if (UpperCase(Token.Value) = 'WRITE') and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
           Result := ParseWriteFileStatement
+        // FreeBASIC "SEEK #n, pos" statement (SEEK is also the SEEK(n) function — the `#` selects the
+        // statement form). SEEK is a bare identifier here.
+        else if (UpperCase(Token.Value) = 'SEEK') and Assigned(Context.PeekNext) and
+                ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
+          Result := ParseSeekStatement
         // Note: the FreeBASIC in-place "MID(dst,start[,len]) = src" statement (MODERN) is intercepted
         // earlier by the dialect profile's IdentMidStatementHandler (mechanism 3), so it does not need
         // a branch here; in CLASSIC bare MID is a plain identifier handled by the default path below.
@@ -4095,6 +4101,37 @@ begin
     if Assigned(P) then Result.AddChild(P) else Break;
     if Context.Check(ttSeparParam) then Context.Advance else Break;
   end;
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseSeekStatement: TASTNode;
+// FreeBASIC "SEEK #n, pos" — set the 1-based file position. Cursor is at the SEEK identifier. Reuses
+// an antPrintFile node tagged SEEK (child0=handle, child1=position); SSA emits ssaSeekSet.
+var
+  P: TASTNode;
+  Tok: TLexerToken;
+begin
+  Tok := Context.CurrentToken;
+  Context.Advance;  // SEEK
+  Result := TASTNode.Create(antPrintFile, Tok);
+  Result.Attributes.Values['SEEK'] := '1';
+  if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+    Context.Advance;  // '#'
+  if Context.Check(ttNumber) or Context.Check(ttInteger) then
+  begin
+    Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
+    Context.Advance;
+  end
+  else if Context.Check(ttIdentifier) then
+  begin
+    Result.AddChild(TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken));
+    Context.Advance;
+  end
+  else
+    HandleError('Expected file number after SEEK #', Tok);
+  if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;  // comma
+  P := ParseExpression;   // position (1-based)
+  if Assigned(P) then Result.AddChild(P);
   DoNodeCreated(Result);
 end;
 
