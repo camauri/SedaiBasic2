@@ -273,7 +273,8 @@ const
   kWBIN    = 'WBIN';      // integer -> binary wide string (FreeBASIC)
   kWHEX    = 'WHEX';      // integer -> hex wide string (FreeBASIC)
   kWCHR    = 'WCHR';      // Unicode codepoint -> wide (UTF-8) char (FreeBASIC)
-  kWSTR    = 'WSTR';      // FreeBASIC: WSTR(x) -> wide string (intercepted as array-access)
+  kWSTR    = 'WSTR';      // FreeBASIC: WSTR(x) -> wide string
+  kSADD    = 'SADD';      // FreeBASIC: SADD(s) -> raw pointer to a copy of the string's bytes (read-only snapshot) (intercepted as array-access)
   kWSTRING = 'WSTRING';   // FreeBASIC: WSTRING type and WSTRING(n,cp) builder function
   kWSPACE  = 'WSPACE';    // N wide spaces (FreeBASIC)
   kVALINT  = 'VALINT';    // string -> Integer

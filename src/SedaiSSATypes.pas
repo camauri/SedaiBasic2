@@ -124,6 +124,7 @@ type
     ssaStrInstrRevW,   // INSTRREV(wstring, sub) -> int codepoint position of last occurrence (Src1/Src2=string)
     ssaStrWChr,        // WCHR(n) -> UTF-8 bytes of Unicode codepoint n (Src1=int)
     ssaStrWStringN,    // WSTRING(n,cp) -> n copies of the UTF-8 char for codepoint cp (Src1=int n, Src2=int cp)
+    ssaStrSAdd,        // SADD(s) -> raw byte-heap pointer to a NUL-terminated copy of s (Dest=int, Src1=string)
     // FreeBASIC numeric<->string conversions (B1.3).
     ssaStrOct,        // OCT(n) -> octal string
     ssaStrBin,        // BIN(n) -> binary string

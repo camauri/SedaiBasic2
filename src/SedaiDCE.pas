@@ -288,6 +288,8 @@ begin
     ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
     // FreeBASIC raw heap: alloc/free/realloc and stores mutate the heap; loads are pure (kept if used).
     ssaRawAlloc, ssaRawFree, ssaRawRealloc, ssaRawStoreInt, ssaRawStoreFloat,
+    // SADD(s) allocates a fresh raw byte-heap copy each call — allocating, so never elide or CSE it.
+    ssaStrSAdd,
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString,
     // M8: block-scope mark push/pop mutate the record high-water mark — never elide them.
     ssaRecMarkPush, ssaRecMarkPop,

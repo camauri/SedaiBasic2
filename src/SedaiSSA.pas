@@ -3223,6 +3223,18 @@ begin
           Exit;
         end;
 
+        // FreeBASIC SADD(s): raw byte-heap pointer to a NUL-terminated copy of the string's bytes (a
+        // read-only snapshot — the managed string has no stable mutable buffer address). MODERN, not an array.
+        if FModernMode and (UpperCase(ArrName) = kSADD) and (FProgram.FindArray(ArrName) < 0) and
+           (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ArgReg := EnsureStringRegister(ArgValue);
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaStrSAdd, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
         // FreeBASIC EOF(#n)/LOF(#n)/LOC(#n): file query returning int. Parsed as array access (not
         // registered as keywords, so common names like `loc` stay usable as variables). MODERN, not a
         // declared array. Query code: EOF=0, LOF=2, LOC=3 (matches bcFileQuery).
@@ -12051,7 +12063,12 @@ begin
           MarkRaw(LhsU);
     end
     else if (Rhs.NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.Value)) then
-      MarkRaw(LhsU);   // p = q, q raw
+      MarkRaw(LhsU)   // p = q, q raw
+    else if FModernMode and (Rhs.NodeType = antArrayAccess) and (Rhs.ChildCount >= 1) and
+            (Rhs.GetChild(0).NodeType = antIdentifier) and
+            (UpperCase(VarToStr(Rhs.GetChild(0).Value)) = kSADD) and
+            (FProgram.FindArray(VarToStr(Rhs.GetChild(0).Value)) < 0) then
+      MarkRaw(LhsU);   // p = SADD(s): a raw byte-heap pointer -> deref p[i] onto the byte heap
   end;
   for i := 0 to Node.ChildCount - 1 do
     CollectRawPtrVars(Node.GetChild(i));

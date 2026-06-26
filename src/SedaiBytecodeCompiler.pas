@@ -176,6 +176,7 @@ begin
     ssaStrInstrRevW: Result := bcStrInstrRevW;
     ssaStrWChr: Result := bcStrWChr;
     ssaStrWStringN: Result := bcStrWStringN;
+    ssaStrSAdd: Result := bcStrSAdd;
     ssaStrLeft: Result := bcStrLeft;
     ssaStrRight: Result := bcStrRight;
     ssaStrMid: Result := bcStrMid;

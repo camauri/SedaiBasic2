@@ -269,6 +269,7 @@ type
     procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
     // FreeBASIC raw byte heap (Allocate family). All return/take RAWPTR_TAG-tagged byte offsets.
     function RawAlloc(ByteCount: PtrUInt): Int64;
+    function StrSAdd(const S: string): Int64;   // SADD(s) -> raw pointer to a NUL-terminated byte copy
     procedure RawFree(RawPtr: Int64);
     function RawRealloc(RawPtr: Int64; ByteCount: PtrUInt): Int64;
     function RawLoadInt(RawPtr: Int64; TypeCode: Integer): Int64;
@@ -1509,6 +1510,22 @@ begin
   Result := RAWPTR_TAG or Int64(dataOfs);
 end;
 
+function TBytecodeVM.StrSAdd(const S: string): Int64;
+// FreeBASIC SADD: a raw byte-heap pointer to a NUL-terminated COPY of the string's bytes. A read-only
+// snapshot — writes through it do not propagate back to the managed string (the managed string model has
+// no stable mutable buffer address). Suitable for reading the bytes / passing a ZSTRING pointer.
+var
+  ofs: PtrUInt;
+  i: Integer;
+begin
+  Result := RawAlloc(PtrUInt(Length(S)) + 1);
+  if (Result and RAWPTR_TAG) = 0 then Exit;
+  ofs := PtrUInt(Result and RAWPTR_OFS_MASK);
+  for i := 1 to Length(S) do
+    FRawHeap[ofs + PtrUInt(i) - 1] := Byte(Ord(S[i]));
+  FRawHeap[ofs + PtrUInt(Length(S))] := 0;   // NUL terminator (ZSTRING)
+end;
+
 procedure TBytecodeVM.RawFree(RawPtr: Int64);
 var
   dataOfs, sz: PtrUInt;
@@ -2412,7 +2429,7 @@ begin
         end;
 
         // String Src1 (source) -> int Dest
-        bcStrLen, bcStrLenW, bcStrAsc, bcStrDec, bcStrValInt:
+        bcStrLen, bcStrLenW, bcStrAsc, bcStrDec, bcStrValInt, bcStrSAdd:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
@@ -4192,6 +4209,8 @@ begin
         for StartPos := 1 to Count do S := S + SubStr;
         Ctx.StringRegs[Instr.Dest] := S;
       end;
+    33: // bcStrSAdd - SADD(s): raw byte-heap pointer to a NUL-terminated copy of the string
+      Ctx.IntRegs[Instr.Dest] := StrSAdd(Ctx.StringRegs[Instr.Src1]);
     2: // bcStrLeft
       begin
         Len := Ctx.IntRegs[Instr.Src2];

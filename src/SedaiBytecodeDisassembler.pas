@@ -242,6 +242,8 @@ begin
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'StrWChr', Instr.Dest, Instr.Src1]);
     bcStrWStringN:
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrWStringN', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcStrSAdd:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'StrSAdd', Instr.Dest, Instr.Src1]);
 
     // === GROUP 2: MATH FUNCTIONS (0x02xx) ===
     bcMathSin:
