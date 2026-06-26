@@ -4064,8 +4064,22 @@ begin
   Context.Advance;  // INPUT
   if not (Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#')) then
   begin
-    HandleError('LINE INPUT from the console is not yet supported (use LINE INPUT #n, var)', Tok);
-    Result := TASTNode.Create(antStatement, Tok);
+    // Console "LINE INPUT [;] [prompt ;|,] var" — read a whole line into a string variable. Reuses the
+    // console string-input path (antInput); v1 shows INPUT's "? " prompt.
+    Result := TASTNode.Create(antInput, Tok);
+    if Context.Check(ttSeparOutput) then Context.Advance;   // optional leading ';'
+    // Optional prompt string followed by ';' or ',' then the variable.
+    if Context.Check(ttStringLiteral) and Assigned(Context.PeekNext) and
+       ((Context.PeekNext.TokenType = ttSeparOutput) or (Context.PeekNext.TokenType = ttSeparParam)) then
+    begin
+      Result.AddChild(TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken));
+      Context.Advance;   // prompt
+      Result.AddChild(TASTNode.CreateWithValue(antSeparator, Context.CurrentToken.Value, Context.CurrentToken));
+      Context.Advance;   // ';' or ','
+    end;
+    P := ParseExpression;   // destination string variable
+    if Assigned(P) then Result.AddChild(P);
+    DoNodeCreated(Result);
     Exit;
   end;
   Result := TASTNode.Create(antInputFile, Tok);
