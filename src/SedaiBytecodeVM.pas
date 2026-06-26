@@ -149,6 +149,7 @@ type
     // Time tracking for TI and TI$
     FStartTicks: QWord;     // Milliseconds since system start when VM started
     FTimeOffset: Int64;     // TI$ offset in milliseconds from real time
+    FClockOffsetDays: Double; // FreeBASIC SETDATE/SETTIME offset (days) applied to NOW/DATE/TIME/TIMER
     FLastFrameTick: QWord;  // Last FRAME sync tick for drift-free timing
     // Function key definitions (1-12)
     FFunctionKeys: array[1..12] of string;
@@ -2399,6 +2400,36 @@ begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
 
+        // DATEADD: float Dest, string Src1 (interval), int Src2 (number), float Immediate reg (serial).
+        bcDateAdd:
+        begin
+          if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+          if Instr.Immediate > MaxFloatReg then MaxFloatReg := Instr.Immediate;
+        end;
+
+        // DATEDIFF: int Dest, string Src1 (interval), float Src2 (s1), float Immediate reg (s2).
+        bcDateDiff:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+          if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;
+          if Instr.Immediate > MaxFloatReg then MaxFloatReg := Instr.Immediate;
+        end;
+
+        // DATEPART: int Dest, string Src1 (interval), float Src2 (serial).
+        bcDatePart:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+          if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;
+        end;
+
+        // SETDATE/SETTIME: string Src1 only (statement, no result).
+        bcSetClock:
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+
         // InputFloat/Input: float Dest (result), string Src1 (prompt, optional)
         bcInput, bcInputFloat:
         begin
@@ -4259,9 +4290,9 @@ begin
     34: // bcDateStr - DATE ("mm-dd-yyyy") / TIME ("hh:mm:ss"). Immediate 0=DATE, 1=TIME.
       begin
         if Instr.Immediate = 1 then
-          Ctx.StringRegs[Instr.Dest] := FormatDateTime('hh":"nn":"ss', Now)
+          Ctx.StringRegs[Instr.Dest] := FormatDateTime('hh":"nn":"ss', Now + FClockOffsetDays)
         else
-          Ctx.StringRegs[Instr.Dest] := FormatDateTime('mm"-"dd"-"yyyy', Now);
+          Ctx.StringRegs[Instr.Dest] := FormatDateTime('mm"-"dd"-"yyyy', Now + FClockOffsetDays);
       end;
     35: // bcDateName - MONTHNAME(n) / WEEKDAYNAME(n). Immediate 0=month (1..12), 1=weekday (1=Sunday..7=Saturday).
       begin
@@ -4505,11 +4536,32 @@ begin
   Result := True;
 end;
 
+function IntervalCode(const S: string): Integer;
+// FreeBASIC/VB date interval string -> internal code (used by DATEADD/DATEDIFF/DATEPART).
+// 0=yyyy 1=q 2=m 3=y(dayOfYear) 4=d 5=w(weekday) 6=ww(week) 7=h 8=n(minute) 9=s. Default = day.
+var
+  u: string;
+begin
+  u := LowerCase(Trim(S));
+  if u = 'yyyy' then Result := 0
+  else if u = 'q' then Result := 1
+  else if u = 'm' then Result := 2
+  else if u = 'y' then Result := 3
+  else if u = 'd' then Result := 4
+  else if u = 'w' then Result := 5
+  else if u = 'ww' then Result := 6
+  else if u = 'h' then Result := 7
+  else if u = 'n' then Result := 8
+  else if u = 's' then Result := 9
+  else Result := 4;
+end;
+
 procedure TBytecodeVM.ExecuteMathOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
-  dtVal: TDateTime;
+  dtVal, dt2: TDateTime;
   dY, dMo, dD, dH, dMi, dS, dMs: Word;
+  iv, n: Integer;
 begin
   SubOp := Instr.OpCode and $FF;
   case SubOp of
@@ -4599,7 +4651,7 @@ begin
       Ctx.FloatRegs[Instr.Dest] := Frac(Ctx.FloatRegs[Instr.Src1]);
     20: // bcDateNow - Immediate 0=NOW (date+time serial), 1=TIMER (seconds since midnight)
       begin
-        dtVal := Now;
+        dtVal := Now + FClockOffsetDays;
         if Instr.Immediate = 1 then
           Ctx.FloatRegs[Instr.Dest] := Frac(dtVal) * 86400.0   // TIMER
         else
@@ -4647,6 +4699,75 @@ begin
         Ctx.IntRegs[Instr.Dest] := -1
       else
         Ctx.IntRegs[Instr.Dest] := 0;
+    26: // bcDateAdd - DATEADD(interval$, number, serial) -> serial. Src1=interval, Src2=n, Immediate=serial reg.
+      begin
+        iv := IntervalCode(Ctx.StringRegs[Instr.Src1]);
+        n := Ctx.IntRegs[Instr.Src2];
+        dtVal := Ctx.FloatRegs[Instr.Immediate];
+        case iv of
+          0: dtVal := IncYear(dtVal, n);          // yyyy
+          1: dtVal := IncMonth(dtVal, n * 3);     // q (quarter)
+          2: dtVal := IncMonth(dtVal, n);         // m
+          6: dtVal := dtVal + n * 7;              // ww (week)
+          7: dtVal := dtVal + n / 24.0;           // h
+          8: dtVal := dtVal + n / 1440.0;         // n (minute)
+          9: dtVal := dtVal + n / 86400.0;        // s
+        else
+          dtVal := dtVal + n;                     // y / d / w (whole days)
+        end;
+        Ctx.FloatRegs[Instr.Dest] := dtVal;
+      end;
+    27: // bcDateDiff - DATEDIFF(interval$, s1, s2) -> int count. Src1=interval, Src2=s1, Immediate=s2 reg.
+      begin
+        iv := IntervalCode(Ctx.StringRegs[Instr.Src1]);
+        dtVal := Ctx.FloatRegs[Instr.Src2];                 // s1
+        dt2 := Ctx.FloatRegs[Instr.Immediate];              // s2
+        case iv of
+          0: Ctx.IntRegs[Instr.Dest] := YearOf(dt2) - YearOf(dtVal);
+          1: Ctx.IntRegs[Instr.Dest] := (YearOf(dt2) * 4 + (MonthOf(dt2) - 1) div 3) -
+                                        (YearOf(dtVal) * 4 + (MonthOf(dtVal) - 1) div 3);
+          2: Ctx.IntRegs[Instr.Dest] := (YearOf(dt2) * 12 + MonthOf(dt2)) -
+                                        (YearOf(dtVal) * 12 + MonthOf(dtVal));
+          6: Ctx.IntRegs[Instr.Dest] := (Trunc(dt2) - Trunc(dtVal)) div 7;
+          7: Ctx.IntRegs[Instr.Dest] := Round((dt2 - dtVal) * 24.0);
+          8: Ctx.IntRegs[Instr.Dest] := Round((dt2 - dtVal) * 1440.0);
+          9: Ctx.IntRegs[Instr.Dest] := Round((dt2 - dtVal) * 86400.0);
+        else
+          Ctx.IntRegs[Instr.Dest] := Trunc(dt2) - Trunc(dtVal);   // y / d / w (whole days)
+        end;
+      end;
+    28: // bcDatePart - DATEPART(interval$, serial) -> int. Src1=interval, Src2=serial.
+      begin
+        iv := IntervalCode(Ctx.StringRegs[Instr.Src1]);
+        dtVal := Ctx.FloatRegs[Instr.Src2];
+        case iv of
+          0: Ctx.IntRegs[Instr.Dest] := YearOf(dtVal);
+          1: Ctx.IntRegs[Instr.Dest] := (MonthOf(dtVal) - 1) div 3 + 1;
+          2: Ctx.IntRegs[Instr.Dest] := MonthOf(dtVal);
+          3: Ctx.IntRegs[Instr.Dest] := DayOfTheYear(dtVal);   // y (day of year)
+          4: Ctx.IntRegs[Instr.Dest] := DayOf(dtVal);          // d
+          5: Ctx.IntRegs[Instr.Dest] := DayOfWeek(dtVal);      // w (1=Sunday)
+          6: Ctx.IntRegs[Instr.Dest] := WeekOfTheYear(dtVal);  // ww
+          7: Ctx.IntRegs[Instr.Dest] := HourOf(dtVal);
+          8: Ctx.IntRegs[Instr.Dest] := MinuteOf(dtVal);
+          9: Ctx.IntRegs[Instr.Dest] := SecondOf(dtVal);
+        else
+          Ctx.IntRegs[Instr.Dest] := 0;
+        end;
+      end;
+    29: // bcSetClock - SETDATE/SETTIME str: adjust the VM clock offset. Immediate 0=SETDATE, 1=SETTIME.
+      begin
+        if ParseDateSerial(Ctx.StringRegs[Instr.Src1], dtVal) then
+        begin
+          dt2 := Now + FClockOffsetDays;   // currently-observed VM time
+          if Instr.Immediate = 1 then
+            // SETTIME: replace the time-of-day, keep the date.
+            FClockOffsetDays := FClockOffsetDays + (Frac(dtVal) - Frac(dt2))
+          else
+            // SETDATE: replace the date, keep the time-of-day.
+            FClockOffsetDays := FClockOffsetDays + (Trunc(dtVal) - Trunc(dt2));
+        end;
+      end;
   else
     raise Exception.CreateFmt('Unknown math opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

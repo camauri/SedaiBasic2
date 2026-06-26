@@ -369,6 +369,10 @@ const
   bcTimeSerial      = bcGroupMath + 23;  // Dest=float, Src1=int h, Src2=int m, Immediate=int s register
   bcDateValue       = bcGroupMath + 24;  // Dest=float, Src1=string; Imm: 0=DATEVALUE, 1=TIMEVALUE
   bcIsDate          = bcGroupMath + 25;  // Dest=int (bool), Src1=string
+  bcDateAdd         = bcGroupMath + 26;  // DATEADD(interval$,n,serial): Dest=float, Src1=string, Src2=int n, Immediate=float serial reg
+  bcDateDiff        = bcGroupMath + 27;  // DATEDIFF(interval$,s1,s2): Dest=int, Src1=string, Src2=float s1, Immediate=float s2 reg
+  bcDatePart        = bcGroupMath + 28;  // DATEPART(interval$,serial): Dest=int, Src1=string, Src2=float serial
+  bcSetClock        = bcGroupMath + 29;  // SETDATE/SETTIME str: Src1=string; Imm: 0=SETDATE, 1=SETTIME (side-effecting)
 
   // === GROUP 3: ARRAY OPERATIONS (0x03xx) ===
   bcArrayLoad       = bcGroupArray + 0;   // Generic (deprecated)
@@ -1419,6 +1423,10 @@ begin
         23: Result := 'TimeSerial';
         24: Result := 'DateValue';
         25: Result := 'IsDate';
+        26: Result := 'DateAdd';
+        27: Result := 'DateDiff';
+        28: Result := 'DatePart';
+        29: Result := 'SetClock';
       else
         Result := Format('Math_%d', [SubOp]);
       end;

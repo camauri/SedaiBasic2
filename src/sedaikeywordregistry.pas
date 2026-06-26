@@ -1904,6 +1904,8 @@ begin
  RegisterKeyword(kTIMER,  ttMathFunction,   'TIMER: seconds since midnight (FreeBASIC)',              kcMathFunctions);
  RegisterKeyword(kDATEFN, ttStringFunction, 'DATE: current date as "mm-dd-yyyy" (FreeBASIC)',         kcStringFunctions);
  RegisterKeyword(kTIMEFN, ttStringFunction, 'TIME: current time as "hh:mm:ss" (FreeBASIC)',           kcStringFunctions);
+ RegisterKeyword(kSETDATE, ttProgramSetClock, 'SETDATE str: set the VM-internal current date (FreeBASIC)', kcProgramFlowControl);
+ RegisterKeyword(kSETTIME, ttProgramSetClock, 'SETTIME str: set the VM-internal current time (FreeBASIC)', kcProgramFlowControl);
  // DEC is registered as ttStringFunction because it takes a string argument
  RegisterKeyword(kEXP,   ttMathFunction, 'Return value of e raised to the power x',                  kcMathFunctions);
  RegisterKeyword(kINT,   ttMathFunction, 'Convert float number to integer',                          kcMathFunctions);
@@ -2006,7 +2008,7 @@ begin
   // Commodore v7 has no CONTINUE (CONT is separate)/LSET/RSET/ENUM/DEF* , so this is safe.
   SetKeywordsDialect([kCONTINUE, kLSET, kRSET, kENUM, kNAMESPACE,
                       kDEFINT, kDEFLNG, kDEFBYTE, kDEFSHORT, kDEFLNGINT, kDEFSNG, kDEFDBL, kDEFSTR,
-                      kNOW, kTIMER, kDATEFN, kTIMEFN],
+                      kNOW, kTIMER, kDATEFN, kTIMEFN, kSETDATE, kSETTIME],
                      kdModernOnly);
 
   //WriteLn('DEBUG RegisterBasicKeywords: Completed registration of ', GetKeywordCount, ' keywords');

@@ -262,6 +262,14 @@ begin
       Line := Format('%4d: %-20s R%d, R%d, imm=%d', [Index, 'DateValue', Instr.Dest, Instr.Src1, Instr.Immediate]);
     bcIsDate:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'IsDate', Instr.Dest, Instr.Src1]);
+    bcDateAdd:
+      Line := Format('%4d: %-20s R%d, R%d, R%d, immreg=%d', [Index, 'DateAdd', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcDateDiff:
+      Line := Format('%4d: %-20s R%d, R%d, R%d, immreg=%d', [Index, 'DateDiff', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcDatePart:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'DatePart', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcSetClock:
+      Line := Format('%4d: %-20s R%d, imm=%d', [Index, 'SetClock', Instr.Src1, Instr.Immediate]);
     bcMathSin:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'MathSin', Instr.Dest, Instr.Src1]);
     bcMathCos:

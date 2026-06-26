@@ -3335,6 +3335,43 @@ begin
             EmitInstruction(ssaDateName, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
             Exit;
           end;
+          // DATEADD(interval$, number, serial) -> float serial. Src1=string, Src2=int n, Src3=float serial reg.
+          if (ArrNameU = kDATEADD) and (Node.GetChild(1).ChildCount >= 3) then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ProcessExpression(Node.GetChild(1).GetChild(1), Arg2Value);
+            ProcessExpression(Node.GetChild(1).GetChild(2), Arg3Value);
+            ArgReg := EnsureStringRegister(ArgValue);
+            Arg2Reg := EnsureIntRegister(Arg2Value);
+            Arg3Reg := EnsureFloatRegister(Arg3Value);
+            Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+            EmitInstruction(ssaDateAdd, Result, ArgReg, Arg2Reg, Arg3Reg);
+            Exit;
+          end;
+          // DATEDIFF(interval$, serial1, serial2) -> int. Src1=string, Src2=float s1, Src3=float s2 reg.
+          if (ArrNameU = kDATEDIFF) and (Node.GetChild(1).ChildCount >= 3) then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ProcessExpression(Node.GetChild(1).GetChild(1), Arg2Value);
+            ProcessExpression(Node.GetChild(1).GetChild(2), Arg3Value);
+            ArgReg := EnsureStringRegister(ArgValue);
+            Arg2Reg := EnsureFloatRegister(Arg2Value);
+            Arg3Reg := EnsureFloatRegister(Arg3Value);
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaDateDiff, Result, ArgReg, Arg2Reg, Arg3Reg);
+            Exit;
+          end;
+          // DATEPART(interval$, serial) -> int. Src1=string, Src2=float serial.
+          if (ArrNameU = kDATEPART) and (Node.GetChild(1).ChildCount >= 2) then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ProcessExpression(Node.GetChild(1).GetChild(1), Arg2Value);
+            ArgReg := EnsureStringRegister(ArgValue);
+            Arg2Reg := EnsureFloatRegister(Arg2Value);
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaDatePart, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
+            Exit;
+          end;
         end;
 
         // FreeBASIC EOF(#n)/LOF(#n)/LOC(#n): file query returning int. Parsed as array access (not
@@ -13494,6 +13531,8 @@ var
   PrevBlock, NewBlock: TSSABasicBlock;  // PHASE 3 TIER 3: CFG construction
   SecondsVal: TSSAValue;  // For SLEEP command
   FPSReg: TSSAValue;  // For FRAME command
+  ArgReg: TSSAValue;      // For SETDATE/SETTIME string argument
+  SelImm: Integer;        // For SETDATE/SETTIME selector
   KeyNumVal, KeyTextVal, KeyNumReg, KeyTextReg: TSSAValue;  // For KEY command
   ExprResult, LineNumReg: TSSAValue;  // For TRAP command
   AddrVal, AddrReg, ValueReg: TSSAValue;  // For POKE command
@@ -13877,6 +13916,18 @@ begin
         // SLEEP without parameter - default to 1 second
         EmitInstruction(ssaSleep, MakeSSAValue(svkNone), MakeSSAConstInt(1),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+    end;
+    antSetClock:
+    begin
+      // SETDATE str / SETTIME str - set the VM-internal current date/time. Node.Value = SETDATE/SETTIME.
+      if Node.ChildCount > 0 then
+      begin
+        ProcessExpression(Node.GetChild(0), SecondsVal);
+        ArgReg := EnsureStringRegister(SecondsVal);
+        if UpperCase(VarToStr(Node.Value)) = kSETTIME then SelImm := 1 else SelImm := 0;
+        EmitInstruction(ssaSetClock, MakeSSAValue(svkNone), ArgReg,
+                       MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
       end;
     end;
     antFrame:

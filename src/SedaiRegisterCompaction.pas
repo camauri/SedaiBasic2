@@ -219,6 +219,7 @@ begin
     // === GROUP 2: Date/time -> int ===
     bcDateDecode,  // YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY(serial) -> int
     bcIsDate,      // ISDATE(str) -> int bool
+    bcDateDiff, bcDatePart,  // DATEDIFF/DATEPART -> int
     // === GROUP 3: Array operations ===
     bcArrayLoadInt,  // Typed array load (int) - Dest is WRITTEN
     bcArrayLBound, bcArrayUBound,  // B1.4: LBOUND/UBOUND - Dest = int bound
@@ -298,7 +299,7 @@ begin
     bcMathLog10, bcMathLog2, bcMathLogN,
     bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,  // FreeBASIC math
     // Date/time -> float (date serial = Double)
-    bcDateNow, bcDateSerial, bcTimeSerial, bcDateValue,
+    bcDateNow, bcDateSerial, bcTimeSerial, bcDateValue, bcDateAdd,
     // === GROUP 3: Array operations ===
     bcArrayLoadFloat,  // Typed array load (float) - Dest is WRITTEN
     bcRefLoadFloat,    // FreeBASIC pointer deref (float) - Dest = value loaded
@@ -555,8 +556,8 @@ begin
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src2 = codepoint count/start (int)
     bcStrMid,  // Mid$(str, start, length) - start is Src1, length is Src2
     bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - Src2 = char code/codepoint (int)
-    // === GROUP 2: Date/time: DATESERIAL/TIMESERIAL Src2 = month/minute (int) ===
-    bcDateSerial, bcTimeSerial,
+    // === GROUP 2: Date/time: DATESERIAL/TIMESERIAL Src2 = month/minute (int); DATEADD Src2 = number ===
+    bcDateSerial, bcTimeSerial, bcDateAdd,
     // === GROUP 3: Typed array operations: Src2 is always int (linear index) ===
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
@@ -622,6 +623,8 @@ begin
     bcSquareSumFloat, bcAddSquareFloat, bcMulMulFloat, bcAddSqrtFloat,
     // LOGN(base, x): Src2 is 'x' (the value); ATAN2(y, x): Src2 is 'x'
     bcMathLogN, bcMathAtan2,
+    // DATEDIFF(interval, s1, s2): Src2 = s1; DATEPART(interval, serial): Src2 = serial (float)
+    bcDateDiff, bcDatePart,
     // === GROUP 3: Pointer store (FreeBASIC): Src2 = float value ===
     bcRefStoreFloat,
     // === GROUP 4: I/O operations ===
@@ -662,6 +665,8 @@ begin
     bcStrDec,  // DEC(hexstring) - reads string, produces int
     bcDateValue, // DATEVALUE/TIMEVALUE(str) - reads string, produces float serial
     bcIsDate,    // ISDATE(str) - reads string, produces int bool
+    bcDateAdd, bcDateDiff, bcDatePart,  // Src1 = interval string
+    bcSetClock,  // SETDATE/SETTIME str - Src1 = date/time string
     // === GROUP 4: I/O operations ===
     bcPrintString, bcPrintStringLn,
     bcPrintUsing,  // PRINT USING - Src1 = format string
@@ -785,7 +790,9 @@ begin
     // Fused Multiply-Add (FMA): Immediate is 'c' in (c op a*b) - the accumulator
     bcMulAddFloat, bcMulSubFloat,
     // Fused Mul-Mul: Immediate is 'c' in (a*b*c)
-    bcMulMulFloat:
+    bcMulMulFloat,
+    // DATEADD: Immediate = serial (float reg); DATEDIFF: Immediate = s2 (float reg)
+    bcDateAdd, bcDateDiff:
       Result := True;
   else
     Result := False;

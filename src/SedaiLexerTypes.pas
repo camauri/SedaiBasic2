@@ -149,6 +149,7 @@ type
     ttProgramEnd,             // END
     ttProgramRun,             // RUN
     ttProgramSleep,           // SLEEP
+    ttProgramSetClock,        // SETDATE / SETTIME (FreeBASIC, set the VM-internal date/time)
     ttProgramFrame,           // FRAME
     ttProgramStop,            // STOP
     ttProgramWait,            // WAIT

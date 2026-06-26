@@ -106,6 +106,7 @@ type
     antFast,              // FAST statement (C128 2MHz mode)
     antSlow,              // SLOW statement (C128 1MHz mode)
     antSleep,             // SLEEP statement (delay n seconds)
+    antSetClock,          // SETDATE/SETTIME str statement (set the VM-internal date/time)
     antFrame,             // FRAME statement (wait for frame sync, default 60fps)
     antKey,               // KEY statement (define/list function keys)
     antTron,              // TRON statement (trace on - enable debug mode)

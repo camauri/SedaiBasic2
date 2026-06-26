@@ -233,6 +233,7 @@ type
     function ParseRunStatement: TASTNode;
     function ParseClockStatement: TASTNode;
     function ParseSleepStatement: TASTNode;
+    function ParseSetClockStatement: TASTNode;
     function ParseFrameStatement: TASTNode;
     function ParseWaitStatement: TASTNode;
     function ParseProgramEditingStatement: TASTNode;
@@ -721,6 +722,7 @@ begin
     ttProgramCont: Result := Memoize('ContStatement', @ParseContStatement);
     ttProgramClock: Result := Memoize('ClockStatement', @ParseClockStatement);
     ttProgramSleep: Result := Memoize('SleepStatement', @ParseSleepStatement);
+    ttProgramSetClock: Result := Memoize('SetClockStatement', @ParseSetClockStatement);
     ttProgramFrame: Result := Memoize('FrameStatement', @ParseFrameStatement);
     ttProgramWait: Result := Memoize('WaitStatement', @ParseWaitStatement);
     ttProgramEditing: Result := Memoize('ProgramEditingStatement', @ParseProgramEditingStatement);
@@ -2930,6 +2932,25 @@ begin
       Result.AddChild(Param);
   end;
 
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseSetClockStatement: TASTNode;
+// SETDATE str / SETTIME str: set the VM-internal current date/time. The node Value keeps the keyword
+// ("SETDATE"/"SETTIME") so SSA can pick the selector; the single string expression is child 0.
+var
+  Token: TLexerToken;
+  Param: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.CreateWithValue(antSetClock, UpperCase(Token.Value), Token);
+  Context.Advance; // Consume SETDATE/SETTIME
+  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+  begin
+    Param := ParseExpression;
+    if Assigned(Param) then
+      Result.AddChild(Param);
+  end;
   DoNodeCreated(Result);
 end;
 

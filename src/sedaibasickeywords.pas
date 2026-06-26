@@ -255,6 +255,11 @@ const
   kMONTHNAME   = 'MONTHNAME';    // MONTHNAME(n) -> month name string
   kWEEKDAYNAME = 'WEEKDAYNAME';  // WEEKDAYNAME(n) -> weekday name string
   kISDATE      = 'ISDATE';       // ISDATE(str) -> -1 if a valid date/time string, else 0
+  kDATEADD     = 'DATEADD';      // DATEADD(interval$, n, serial) -> serial
+  kDATEDIFF    = 'DATEDIFF';     // DATEDIFF(interval$, s1, s2) -> integer count of intervals
+  kDATEPART    = 'DATEPART';     // DATEPART(interval$, serial) -> integer component
+  kSETDATE     = 'SETDATE';      // SETDATE str: set the (VM-internal) current date
+  kSETTIME     = 'SETTIME';      // SETTIME str: set the (VM-internal) current time
   kEXP     = 'EXP';
   kFRE     = 'FRE';
   kINT     = 'INT';

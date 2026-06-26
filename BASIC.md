@@ -8,11 +8,11 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 308 / 643 implemented (48%)** (+ 3 partial); see the
+**FreeBASIC keyword set — 313 / 643 implemented (49%)** (+ 3 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
-[███████████████████████·······················] 48%
+[███████████████████████·······················] 49%
 ```
 
 Legend: ✓ = Implemented | ◐ = Partial | ✗ = Not implemented
@@ -138,7 +138,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`/`p(i)`, passing pointers across SUB calls, multi-level `PTR PTR` (`**pp`). **UDT pointers**: `DIM p AS T PTR`, `NEW T`/`DELETE`, `@obj`, `p->field`/`p.field`, self-referential `NXT AS NODE PTR` (linked lists/trees), chained `p->nxt->val`. **BYREF-return of a BYREF param** (`min(a,b)=0`, int pointees). **Raw memory**: `Allocate`/`CAllocate`/`Reallocate`/`Deallocate` on a VM-internal byte heap, `SizeOf(T)`, `CAST`/`CPTR(type, expr)`, scaled `p[i]`/`*(p±n)`; `SADD(s)` = raw ZSTRING pointer to a string's bytes (read-only snapshot) |
 | `FUNCTION f() BYREF AS T` | ✓ | BYREF function results: return a reference to a SHARED/global scalar or a BYREF parameter (the `min(a,b)=0` idiom, int pointees), read + write through it (`f()=x`) |
 | `WSTRING` | ✓ | Unicode wide string (UTF-8 storage). `DIM s AS WSTRING [* n]`, params/return/UDT fields/arrays. `LEN`/`LEFT$`/`RIGHT$`/`MID$` index by codepoint; assignment/concat/PRINT shared with `STRING`. `WSTR(x)` converter. Fixed-length `* n` advisory (var-length storage) |
-| Date/time | ✓ | Date serial = Double (epoch 1899-12-30). `NOW`/`TIMER`/`DATE`/`TIME` (bare), `DATESERIAL`/`TIMESERIAL`, `DATEVALUE`/`TIMEVALUE`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`/`WEEKDAY`, `MONTHNAME`/`WEEKDAYNAME`, `ISDATE`. Field functions intercepted by name so `day`/`month`/`year`/`second`… stay usable as variables. `DATEADD`/`DATEDIFF`/`DATEPART`/`SETDATE`/`SETTIME` pending |
+| Date/time | ✓ | Date serial = Double (epoch 1899-12-30). `NOW`/`TIMER`/`DATE`/`TIME` (bare), `DATESERIAL`/`TIMESERIAL`, `DATEVALUE`/`TIMEVALUE`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`/`WEEKDAY`, `MONTHNAME`/`WEEKDAYNAME`, `ISDATE`, `DATEADD`/`DATEDIFF`/`DATEPART` (intervals `yyyy q m y d w ww h n s`), `SETDATE`/`SETTIME` (VM-internal clock offset). Field functions intercepted by name so `day`/`month`/`year`/`second`… stay usable as variables |
 
 ## Variable Scope
 
@@ -1251,7 +1251,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **308 / 643 implemented (48%)**, plus 3 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **313 / 643 implemented (49%)**, plus 3 partial (◐).
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
 > compound & bitwise operators, string/conversion/array functions, namespaces, pointers (managed + raw
@@ -2094,9 +2094,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `WEEKDAY` | ✓ | `WEEKDAY(serial)` -> 1=Sunday..7=Saturday. |
 | `MONTH` | ✓ | `MONTH(serial)` -> 1..12. Intercepted by name (not a reserved word). |
 | `YEAR` | ✓ | `YEAR(serial)` -> integer. Intercepted by name (not a reserved word). |
-| `DATEPART` | ✗ | Gets a time interval from a date serial. |
-| `DATEADD` | ✗ | Gets the result of a time interval added to a date serial. |
-| `DATEDIFF` | ✗ | Gets a time interval between two date serials. |
+| `DATEPART` | ✓ | `DATEPART(interval$, serial)` -> component. Intervals: `yyyy q m y d w ww h n s`. |
+| `DATEADD` | ✓ | `DATEADD(interval$, number, serial)` -> serial with `number` interval units added. |
+| `DATEDIFF` | ✓ | `DATEDIFF(interval$, s1, s2)` -> integer count of intervals from s1 to s2. |
 | `ISDATE` | ✓ | `ISDATE(str)` -> -1 if a valid date/time string, else 0. |
 | `MONTHNAME` | ✓ | `MONTHNAME(n)` -> English month name (1..12). |
 | `WEEKDAYNAME` | ✓ | `WEEKDAYNAME(n)` -> English weekday name (1=Sunday..7=Saturday). |
@@ -2107,8 +2107,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `DATE` | ✓ | Current system date as `"mm-dd-yyyy"`. Bare (no parens); MODERN-only keyword. |
 | `TIME` | ✓ | Current system time as `"hh:mm:ss"`. Bare (no parens); MODERN-only keyword. |
-| `SETDATE` | ✗ | Sets the current system date. |
-| `SETTIME` | ✗ | Sets the current system time. |
+| `SETDATE` | ✓ | `SETDATE str` sets the VM-internal current date (OS-safe offset, not the real system clock). |
+| `SETTIME` | ✓ | `SETTIME str` sets the VM-internal current time (OS-safe offset). |
 | `TIMER` | ✓ | Seconds elapsed since midnight (Double). Bare (no parens). |
 
 ### Error Handling Functions

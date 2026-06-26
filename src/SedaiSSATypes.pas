@@ -143,6 +143,10 @@ type
     ssaIsDate,      // ISDATE(s) -> int bool (Dest=int, Src1=string)
     ssaDateStr,     // DATE / TIME -> string (Dest=string; Imm selects)
     ssaDateName,    // MONTHNAME/WEEKDAYNAME(n) -> string (Dest=string, Src1=int; Imm selects)
+    ssaDateAdd,     // DATEADD(interval$, number, serial) -> float (Dest=float, Src1=string, Src2=int, Immediate=float serial reg)
+    ssaDateDiff,    // DATEDIFF(interval$, s1, s2) -> int (Dest=int, Src1=string, Src2=float s1, Immediate=float s2 reg)
+    ssaDatePart,    // DATEPART(interval$, serial) -> int (Dest=int, Src1=string, Src2=float serial)
+    ssaSetClock,    // SETDATE/SETTIME str (statement; Src1=string; Imm: 0=SETDATE, 1=SETTIME) - side-effecting
 
     ssaStrDec,  // DEC(hexstring) - convert hex string to decimal
     ssaLabel, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaCall, ssaReturn,

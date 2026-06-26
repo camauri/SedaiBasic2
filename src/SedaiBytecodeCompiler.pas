@@ -185,6 +185,10 @@ begin
     ssaIsDate: Result := bcIsDate;
     ssaDateStr: Result := bcDateStr;
     ssaDateName: Result := bcDateName;
+    ssaDateAdd: Result := bcDateAdd;
+    ssaDateDiff: Result := bcDateDiff;
+    ssaDatePart: Result := bcDatePart;
+    ssaSetClock: Result := bcSetClock;
     ssaStrLeft: Result := bcStrLeft;
     ssaStrRight: Result := bcStrRight;
     ssaStrMid: Result := bcStrMid;
