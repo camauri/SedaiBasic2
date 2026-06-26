@@ -8,11 +8,11 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 270 / 643 implemented (42%)** (+ ~4 partial); see the
+**FreeBASIC keyword set — 278 / 643 implemented (43%)** (+ 3 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
-[███████████████████·······························] 38%
+[█████████████████████·····························] 43%
 ```
 
 Legend: ✓ = Implemented | ◐ = Partial | ✗ = Not implemented
@@ -133,9 +133,9 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `EXIT`/`CONTINUE n,n` | ✓ | Multi-level loop exit/continue (`Exit For, For`) |
 | `PROPERTY Type.name` | ✓ | Property getter/setter (desugars to method) |
 | `OPERATOR <sym>` | ✓ | Operator overloading for UDTs (binary, direct operands) |
-| `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like macros; function-like macros pending) |
+| `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like **and** function-like macros `#define NAME(p) body`, nested expansion) |
 | `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening (methods of a namespaced TYPE / `USING` / `..global` pending) |
-| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`/`p(i)`, passing pointers across SUB calls, multi-level `PTR PTR` (`**pp`). **UDT pointers**: `DIM p AS T PTR`, `NEW T`/`DELETE`, `@obj`, `p->field`/`p.field`, self-referential `NXT AS NODE PTR` (linked lists/trees), chained `p->nxt->val`. **BYREF-return of a BYREF param** (`min(a,b)=0`, int pointees). Raw `Allocate`/`CAllocate` pending |
+| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`/`p(i)`, passing pointers across SUB calls, multi-level `PTR PTR` (`**pp`). **UDT pointers**: `DIM p AS T PTR`, `NEW T`/`DELETE`, `@obj`, `p->field`/`p.field`, self-referential `NXT AS NODE PTR` (linked lists/trees), chained `p->nxt->val`. **BYREF-return of a BYREF param** (`min(a,b)=0`, int pointees). **Raw memory**: `Allocate`/`CAllocate`/`Reallocate`/`Deallocate` on a VM-internal byte heap, `SizeOf(T)`, `CAST`/`CPTR(type, expr)`, scaled `p[i]`/`*(p±n)`; `SADD(s)` = raw ZSTRING pointer to a string's bytes (read-only snapshot) |
 | `FUNCTION f() BYREF AS T` | ✓ | BYREF function results: return a reference to a SHARED/global scalar or a BYREF parameter (the `min(a,b)=0` idiom, int pointees), read + write through it (`f()=x`) |
 | `WSTRING` | ✓ | Unicode wide string (UTF-8 storage). `DIM s AS WSTRING [* n]`, params/return/UDT fields/arrays. `LEN`/`LEFT$`/`RIGHT$`/`MID$` index by codepoint; assignment/concat/PRINT shared with `STRING`. `WSTR(x)` converter. Fixed-length `* n` advisory (var-length storage) |
 
@@ -1246,17 +1246,17 @@ The following PETSCII codes are silently ignored because they require full-scree
 > ◐ = partially implemented (see note). ✗ = not implemented.
 > Note: a ✓ marks name recognition — exact semantics may still differ from FreeBASIC. OOP `TYPE`
 > (methods/inheritance/virtual dispatch/constructors/destructors/PROPERTY/OPERATOR), threading, and a
-> basic preprocessor (object-like #define, #ifdef/#include), namespaces, pointers (managed + raw
-> `Allocate`), and WString/unicode (UTF-8, codepoint-aware) are implemented; function-like macros and
-> FB-syntax file I/O are not yet present. This is a forward-looking gap map, not a claim of FreeBASIC
-> compatibility.
+> preprocessor (object-like **and** function-like #define, #ifdef/#include), namespaces, pointers
+> (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
+> are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **270 / 643 implemented (42%)**, plus ~4 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **278 / 643 implemented (43%)**, plus 3 partial (◐).
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
 > compound & bitwise operators, string/conversion/array functions, namespaces, pointers (managed + raw
-> `Allocate`), WString/unicode, and a basic preprocessor. Main gaps: function-like macros, file I/O in
-> FB syntax, the remaining wide-string helpers (WCHR/WHEX/WBIN/WOCT/WSPACE).
+> memory `Allocate`/`SizeOf`/`CAST`/`SADD`), WString/unicode, function-like macros, FB-syntax file I/O,
+> and the wide-string helpers (WCHR/WHEX/WBIN/WOCT/WSPACE). The FreeBASIC language surface is now
+> substantially complete; remaining gaps are mostly niche keywords and standard-library breadth.
 
 ## Language Documentation
 
@@ -1977,7 +1977,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `END (Block)` | ✓ |  |
 | `OFFSETOF` | ✗ |  |
-| `SIZEOF` | ✗ |  |
+| `SIZEOF` | ✓ | `SizeOf(scalar-type / UDT)` byte size; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`. |
 | `TYPEOF` | ✗ |  |
 | `LET` | ✓ |  |
 | `REM` | ✓ |  |
@@ -2163,10 +2163,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `INPUT #` | ✓ | Reads a list of values from a file or device. |
-| `WRITE #` | ✗ | Writes a list of values to a file or device. |
+| `WRITE #` | ✓ | Writes a list of values to a file as quoted CSV (strings in `"`, comma-separated). |
 | `INPUT()` | ✓ | Reads a number of characters from a file or device. |
 | `WINPUT()` | ✗ | Reads a number of wide characters from a file or device. |
-| `LINE INPUT #` | ✗ | Reads a line of text from a file or device. |
+| `LINE INPUT #` | ✓ | `LINE INPUT #n, s` reads a whole line of text (commas not split). |
 | `PRINT #` | ✓ |  |
 | `? # (Shortcut for 'PRINT #')` | ✗ | Writes text data to a file or device. |
 | `PUT #` | ✓ | Writes arbitrary data to a file or device. |
@@ -2179,8 +2179,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `LOF` | ✓ | `LOF(#n)` — length in bytes of an open file. |
 | `LOC` | ✓ | `LOC(#n)` — current byte position of an open file. |
 | `EOF` | ✓ | `EOF(#n)` — -1 at/after end of file, else 0. |
-| `SEEK (Statement)` | ✗ | Sets the file position of the next read or write operation. |
-| `SEEK (Function)` | ✗ | Gets the file position of the next read or write operation. |
+| `SEEK (Statement)` | ✓ | `SEEK #n, pos` sets the file position of the next read or write operation. |
+| `SEEK (Function)` | ✓ | `SEEK(n)` gets the file position of the next read or write operation. |
 | `LOCK` | ✗ | Restricts read or write access to a file or portion of a file. |
 | `UNLOCK` | ✗ | Remove read or write restrictions from a previous Lock command. |
 
@@ -2224,10 +2224,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ALLOCATE` | ✗ | Reserves a number of bytes of uninitialized memory and returns the address. |
-| `CALLOCATE` | ✗ | Reserves a number of bytes of initialized (zeroed) memory and returns the address. |
-| `REALLOCATE` | ✗ | Changes the size of reserved memory. |
-| `DEALLOCATE` | ✗ | Returns reserved memory back to the system. |
+| `ALLOCATE` | ✓ | Reserves a number of bytes of uninitialized memory and returns the address (raw pointer into a VM-internal byte heap; `p[i]`/`*(p±n)` scale by `SizeOf(pointee)`). |
+| `CALLOCATE` | ✓ | Reserves a number of bytes of initialized (zeroed) memory and returns the address. |
+| `REALLOCATE` | ✓ | Changes the size of reserved memory, preserving existing contents. |
+| `DEALLOCATE` | ✓ | Returns reserved memory back to the heap (free-list recycled). |
 
 #### Miscellaneous Procedures
 
@@ -2240,7 +2240,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `FB_MEMCOPYCLEAR` | ✗ | Copies the first part of a block of memory from a location to another and clears the rest. (memory areas must not overlap) |
 | `FB_MEMMOVE` | ✗ | Copies a block of memory from a location to another. (memory areas may overlap) |
 | `SWAP` | ✓ | Exchange the contents of two variables. |
-| `SADD` | ✗ | Returns the address for the data in a zstring/wstring variable. |
+| `SADD` | ✓ | Returns a raw byte-heap pointer to a NUL-terminated copy (ZSTRING) of the string's bytes. Read-only snapshot — writes through the pointer do not propagate back to the managed string. |
 
 ### Operating System Functions
 
@@ -2408,7 +2408,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `INPUT` | ✓ | Reads values from the keyboard buffer. |
-| `LINE INPUT` | ◐ | `LINE INPUT #n, s` read a whole file line (commas not split). Console LINE INPUT deferred. |
+| `LINE INPUT` | ✓ | `LINE INPUT [;][prompt;]var` reads a whole line from the console; `LINE INPUT #n, s` from a file (commas not split). |
 | `INPUT()` | ✓ | Reads a number of characters from the keyboard buffer, file or device. |
 | `WINPUT()` | ✗ | Reads a number of wide characters from the keyboard buffer, file or device. |
 
