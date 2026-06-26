@@ -146,6 +146,8 @@ type
     FRawPtrVars: TStringList;            // FreeBASIC raw pointers: var (UPPER) ever assigned from Allocate/CAllocate/
                                          // Reallocate. Its value is a RAWPTR_TAG byte offset → deref/arithmetic use the
                                          // raw byte heap (SizeOf-scaled), not the managed FArrays/record path.
+    FFixedLenVars: TStringList;          // fixed-length string vars (UPPER) -> capacity (DIM s AS STRING/WSTRING * n);
+                                         // assignments truncate to the capacity (codepoints if also a WSTRING).
     FRedimMultiArrays: TStringList;      // array names (UPPER) that appear in a multi-dim REDIM → their multi-dim
                                          // element access computes the linear index from RUNTIME dimensions
                                          // (push/resolve), since REDIM changes the strides; others stay const-folded.
@@ -534,6 +536,8 @@ begin
   FWStringVars.CaseSensitive := False;
   FRedimMultiArrays := TStringList.Create;
   FRedimMultiArrays.CaseSensitive := False;
+  FFixedLenVars := TStringList.Create;
+  FFixedLenVars.CaseSensitive := False;
   FByrefRetFuncs := TStringList.Create;
   FSharedScalarArr.CaseSensitive := False;
   FVarWidthCode := TStringList.Create;
@@ -577,6 +581,7 @@ begin
   FRawPtrVars.Free;
   FWStringVars.Free;
   FRedimMultiArrays.Free;
+  FFixedLenVars.Free;
   FByrefRetFuncs.Free;
   FVarWidthCode.Free;
   FVarPrintKind.Free;
@@ -3419,6 +3424,8 @@ var
   ExprValue, VarReg, SrcRecHandle: TSSAValue;
   CopyOp: TSSAOpCode;
   DerefBank: TSSARegisterType;   // FreeBASIC "*p = expr": bank of the pointee
+  FixedCap: Integer;             // fixed-length string capacity (DIM s AS STRING/WSTRING * n)
+  FixedCapReg, FixedTrunc: TSSAValue;
 begin
   if Node.ChildCount < 2 then Exit;
 
@@ -3602,6 +3609,24 @@ begin
   begin
     EmitRawAlloc(ExprNode, ExprValue);
     EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+
+  // Fixed-length string (DIM s AS STRING/WSTRING * n): truncate the assigned value to the capacity
+  // (codepoints for a WSTRING, bytes otherwise). Plain string scalars only — SHARED/@-taken fall through.
+  FixedCap := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
+  if (FixedCap > 0) and not IsSharedScalar(VarName) and not IsAddrLocal(VarName) then
+  begin
+    ProcessExpression(ExprNode, ExprValue);
+    ExprValue := EnsureStringRegister(ExprValue);
+    FixedCapReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, FixedCapReg, MakeSSAConstInt(FixedCap), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    FixedTrunc := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    if IsWStringVar(VarName) then
+      EmitInstruction(ssaStrLeftW, FixedTrunc, ExprValue, FixedCapReg, MakeSSAValue(svkNone))
+    else
+      EmitInstruction(ssaStrLeft, FixedTrunc, ExprValue, FixedCapReg, MakeSSAValue(svkNone));
+    EmitInstruction(ssaCopyString, GetOrAllocateVariable(VarName), FixedTrunc, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
   end;
 
@@ -12046,6 +12071,11 @@ begin
       P := Node.GetChild(2);                                  // array typed: type at child 2
     if (P <> nil) and (UpperCase(VarToStr(P.Value)) = 'WSTRING') then
       MarkW(VarToStr(Node.GetChild(0).Value));
+    // Fixed-length string capacity (DIM s AS STRING/WSTRING * n): record a positive constant capacity so
+    // ProcessAssignment truncates stores. Only the scalar form carries a numeric FIXEDLEN attribute.
+    if (Node.GetChild(1).NodeType = antIdentifier) and (Node.Attributes.IndexOfName('FIXEDLEN') >= 0) and
+       (StrToIntDef(Node.Attributes.Values['FIXEDLEN'], -1) > 0) then
+      FFixedLenVars.Values[UpperCase(VarToStr(Node.GetChild(0).Value))] := Node.Attributes.Values['FIXEDLEN'];
   end;
   // FUNCTION ... AS WSTRING : child0 = name node, its child0 = return-type identifier.
   if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) then
@@ -13982,6 +14012,7 @@ begin
   until not FRawCollectChanged;
   // FreeBASIC WSTRING: record vars/fields declared AS WSTRING so width-aware ops (LEN/MID/...) count by
   // Unicode codepoint. Same srtString bank (UTF-8 storage) → no new register bank, existing ops intact.
+  FFixedLenVars.Clear;
   CollectWStringVars(AST);
   // REDIM multi-dim: an array re-dimensioned with >1 dimension must compute its element linear index
   // from RUNTIME dimensions (strides change on REDIM). Collect those array names; their multi-dim access

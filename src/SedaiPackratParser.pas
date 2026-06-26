@@ -4798,8 +4798,13 @@ begin
         InitExpr := FExpressionParser.ParseExpression(precCall);   // length operand (no binary ops)
         if Assigned(InitExpr) then
         begin
-          ArrayDecl.Attributes.Values['FIXEDLEN'] := '1';
-          InitExpr.Free;                     // advisory: capacity not stored as a child in v1
+          // Record the capacity. A constant literal becomes the number (the SSA truncates assignments
+          // to it); a non-constant capacity stays advisory ('1' = present but unknown).
+          if InitExpr.NodeType = antLiteral then
+            ArrayDecl.Attributes.Values['FIXEDLEN'] := VarToStr(InitExpr.Value)
+          else
+            ArrayDecl.Attributes.Values['FIXEDLEN'] := '-1';   // present but non-constant -> advisory
+          InitExpr.Free;
         end;
       end;
       // Optional initializer after the type. Two cases:
