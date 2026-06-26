@@ -933,9 +933,10 @@ var
   TempStr: string;
   ValCode: Integer;
   ConvW: Integer;   // B1.5: integer-narrowing width code for a Cxxx conversion (0 = full width)
+  SelImm: Integer;  // date/time function selector encoded in the opcode Immediate
   NarrowReg: TSSAValue;
   // Array access variables
-  ArrName, ArrName2: string;
+  ArrName, ArrName2, ArrNameU: string;
   ArrayIdx: Integer;
   ArrInfo: TSSAArrayInfo;
   IndicesNode: TASTNode;
@@ -2587,6 +2588,23 @@ begin
           end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end
+        // FreeBASIC bare date/time functions (no arguments): NOW/TIMER (numeric serial / seconds),
+        // DATE/TIME (formatted strings). Registered as MODERN-only keywords, parsed with an empty
+        // argument list. Immediate selects which: NOW=0/TIMER=1, DATE=0/TIME=1.
+        else if (FuncName = kNOW) or (FuncName = kTIMER) then
+        begin
+          DestReg := FProgram.AllocRegister(srtFloat);
+          Result := MakeSSARegister(srtFloat, DestReg);
+          if FuncName = kTIMER then SelImm := 1 else SelImm := 0;
+          EmitInstruction(ssaDateNow, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+        end
+        else if (FuncName = kDATEFN) or (FuncName = kTIMEFN) then
+        begin
+          DestReg := FProgram.AllocRegister(srtString);
+          Result := MakeSSARegister(srtString, DestReg);
+          if FuncName = kTIMEFN then SelImm := 1 else SelImm := 0;
+          EmitInstruction(ssaDateStr, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+        end
         else if (FuncName = 'CINT') or (FuncName = 'CLNG') or (FuncName = 'CLNGINT') or
                 (FuncName = kCULNGINT) or
                 (FuncName = 'CSHORT') or (FuncName = 'CBYTE') or (FuncName = 'CUBYTE') or
@@ -3247,6 +3265,76 @@ begin
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaStrSAdd, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
+        end;
+
+        // FreeBASIC date/time functions taking arguments. Intercepted by name (not registered as
+        // keywords) so common identifiers like YEAR/MONTH/DAY/SECOND/MINUTE/HOUR/WEEKDAY stay usable as
+        // variables. MODERN, not a declared array. Date serial = Double (FPC TDateTime epoch 1899-12-30).
+        if FModernMode and (FProgram.FindArray(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          ArrNameU := UpperCase(ArrName);
+          // YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY(serial) -> int. Immediate selects the field.
+          SelImm := -1;
+          if ArrNameU = kYEARFN then SelImm := 0
+          else if ArrNameU = kMONTHFN then SelImm := 1
+          else if ArrNameU = kDAYFN then SelImm := 2
+          else if ArrNameU = kHOURFN then SelImm := 3
+          else if ArrNameU = kMINUTEFN then SelImm := 4
+          else if ArrNameU = kSECONDFN then SelImm := 5
+          else if ArrNameU = kWEEKDAY then SelImm := 6;
+          if SelImm >= 0 then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ArgReg := EnsureFloatRegister(ArgValue);
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaDateDecode, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+            Exit;
+          end;
+          // DATESERIAL(y,m,d) / TIMESERIAL(h,m,s) -> float serial. 3 int args: Src1, Src2, Src3-as-reg.
+          if ((ArrNameU = kDATESERIAL) or (ArrNameU = kTIMESERIAL)) and (Node.GetChild(1).ChildCount >= 3) then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ProcessExpression(Node.GetChild(1).GetChild(1), Arg2Value);
+            ProcessExpression(Node.GetChild(1).GetChild(2), Arg3Value);
+            ArgReg := EnsureIntRegister(ArgValue);
+            Arg2Reg := EnsureIntRegister(Arg2Value);
+            Arg3Reg := EnsureIntRegister(Arg3Value);
+            Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+            if ArrNameU = kTIMESERIAL then
+              EmitInstruction(ssaTimeSerial, Result, ArgReg, Arg2Reg, Arg3Reg)
+            else
+              EmitInstruction(ssaDateSerial, Result, ArgReg, Arg2Reg, Arg3Reg);
+            Exit;
+          end;
+          // DATEVALUE(s) / TIMEVALUE(s) -> float serial parsed from a string. Immediate selects.
+          if (ArrNameU = kDATEVALUE) or (ArrNameU = kTIMEVALUE) then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ArgReg := EnsureStringRegister(ArgValue);
+            Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+            if ArrNameU = kTIMEVALUE then SelImm := 1 else SelImm := 0;
+            EmitInstruction(ssaDateValue, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+            Exit;
+          end;
+          // ISDATE(s) -> int bool.
+          if ArrNameU = kISDATE then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ArgReg := EnsureStringRegister(ArgValue);
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaIsDate, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Exit;
+          end;
+          // MONTHNAME(n) / WEEKDAYNAME(n) -> string. Immediate selects.
+          if (ArrNameU = kMONTHNAME) or (ArrNameU = kWEEKDAYNAME) then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ArgReg := EnsureIntRegister(ArgValue);
+            Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+            if ArrNameU = kWEEKDAYNAME then SelImm := 1 else SelImm := 0;
+            EmitInstruction(ssaDateName, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+            Exit;
+          end;
         end;
 
         // FreeBASIC EOF(#n)/LOF(#n)/LOC(#n): file query returning int. Parsed as array access (not

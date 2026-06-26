@@ -1896,6 +1896,14 @@ begin
  RegisterKeyword(kATAN2, ttMathFunction, 'Return two-argument arctangent ATAN2(y, x)',               kcMathFunctions);
  RegisterKeyword(kFIX,   ttMathFunction, 'Truncate toward zero',                                     kcMathFunctions);
  RegisterKeyword(kFRAC,  ttMathFunction, 'Return the fractional part (keeps sign)',                  kcMathFunctions);
+ // FreeBASIC bare date/time functions (no arguments). MODERN-only (tagged below) so v7 may still use
+ // these names as variables. NOW/TIMER return numbers; DATE/TIME return strings. The remaining
+ // date functions (YEAR/MONTH/DATESERIAL/...) are intercepted by name in the array-access path so they
+ // do not reserve common identifiers.
+ RegisterKeyword(kNOW,    ttMathFunction,   'NOW: current date+time as a serial Double (FreeBASIC)',  kcMathFunctions);
+ RegisterKeyword(kTIMER,  ttMathFunction,   'TIMER: seconds since midnight (FreeBASIC)',              kcMathFunctions);
+ RegisterKeyword(kDATEFN, ttStringFunction, 'DATE: current date as "mm-dd-yyyy" (FreeBASIC)',         kcStringFunctions);
+ RegisterKeyword(kTIMEFN, ttStringFunction, 'TIME: current time as "hh:mm:ss" (FreeBASIC)',           kcStringFunctions);
  // DEC is registered as ttStringFunction because it takes a string argument
  RegisterKeyword(kEXP,   ttMathFunction, 'Return value of e raised to the power x',                  kcMathFunctions);
  RegisterKeyword(kINT,   ttMathFunction, 'Convert float number to integer',                          kcMathFunctions);
@@ -1997,7 +2005,8 @@ begin
   // v7 program may still use these names as variables. They keep their keyword meaning in MODERN.
   // Commodore v7 has no CONTINUE (CONT is separate)/LSET/RSET/ENUM/DEF* , so this is safe.
   SetKeywordsDialect([kCONTINUE, kLSET, kRSET, kENUM, kNAMESPACE,
-                      kDEFINT, kDEFLNG, kDEFBYTE, kDEFSHORT, kDEFLNGINT, kDEFSNG, kDEFDBL, kDEFSTR],
+                      kDEFINT, kDEFLNG, kDEFBYTE, kDEFSHORT, kDEFLNGINT, kDEFSNG, kDEFDBL, kDEFSTR,
+                      kNOW, kTIMER, kDATEFN, kTIMEFN],
                      kdModernOnly);
 
   //WriteLn('DEBUG RegisterBasicKeywords: Completed registration of ', GetKeywordCount, ' keywords');

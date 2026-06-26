@@ -244,8 +244,24 @@ begin
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrWStringN', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcStrSAdd:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'StrSAdd', Instr.Dest, Instr.Src1]);
+    bcDateStr:
+      Line := Format('%4d: %-20s R%d, imm=%d', [Index, 'DateStr', Instr.Dest, Instr.Immediate]);
+    bcDateName:
+      Line := Format('%4d: %-20s R%d, R%d, imm=%d', [Index, 'DateName', Instr.Dest, Instr.Src1, Instr.Immediate]);
 
     // === GROUP 2: MATH FUNCTIONS (0x02xx) ===
+    bcDateNow:
+      Line := Format('%4d: %-20s R%d, imm=%d', [Index, 'DateNow', Instr.Dest, Instr.Immediate]);
+    bcDateDecode:
+      Line := Format('%4d: %-20s R%d, R%d, imm=%d', [Index, 'DateDecode', Instr.Dest, Instr.Src1, Instr.Immediate]);
+    bcDateSerial:
+      Line := Format('%4d: %-20s R%d, R%d, R%d, immreg=%d', [Index, 'DateSerial', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcTimeSerial:
+      Line := Format('%4d: %-20s R%d, R%d, R%d, immreg=%d', [Index, 'TimeSerial', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcDateValue:
+      Line := Format('%4d: %-20s R%d, R%d, imm=%d', [Index, 'DateValue', Instr.Dest, Instr.Src1, Instr.Immediate]);
+    bcIsDate:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'IsDate', Instr.Dest, Instr.Src1]);
     bcMathSin:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'MathSin', Instr.Dest, Instr.Src1]);
     bcMathCos:

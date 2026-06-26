@@ -216,6 +216,9 @@ begin
     bcStrInstrRev, // INSTRREV(str, sub) returns int position
     bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV return int codepoint position
     bcStrValInt,   // VALINT/VALLNG/VALUINT(str) returns int (B1.3)
+    // === GROUP 2: Date/time -> int ===
+    bcDateDecode,  // YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY(serial) -> int
+    bcIsDate,      // ISDATE(str) -> int bool
     // === GROUP 3: Array operations ===
     bcArrayLoadInt,  // Typed array load (int) - Dest is WRITTEN
     bcArrayLBound, bcArrayUBound,  // B1.4: LBOUND/UBOUND - Dest = int bound
@@ -294,6 +297,8 @@ begin
     bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,
     bcMathLog10, bcMathLog2, bcMathLogN,
     bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,  // FreeBASIC math
+    // Date/time -> float (date serial = Double)
+    bcDateNow, bcDateSerial, bcTimeSerial, bcDateValue,
     // === GROUP 3: Array operations ===
     bcArrayLoadFloat,  // Typed array load (float) - Dest is WRITTEN
     bcRefLoadFloat,    // FreeBASIC pointer deref (float) - Dest = value loaded
@@ -344,6 +349,8 @@ begin
     bcStrHex,    // HEX$(n) - int to hex string
     bcStrOct, bcStrBin,  // OCT(n)/BIN(n) - int to octal/binary string (B1.3)
     bcStrErr,    // ERR$(n) - error code to message string
+    bcDateStr,   // DATE/TIME -> formatted string
+    bcDateName,  // MONTHNAME/WEEKDAYNAME(n) -> string
     // === GROUP 3: Array operations ===
     bcArrayLoadString,  // Typed array load (string) - Dest is WRITTEN
     bcRefLoadString,    // FreeBASIC pointer deref (string) - Dest = value loaded
@@ -462,6 +469,8 @@ begin
     bcGetBinStr, bcPutBinStr,                                // Src1 = handle (int)
     bcArrayRedimPush,                        // REDIM multi-dim: Src1 = upper bound (int)
     bcArrayIdxPush,                          // runtime multi-dim index: Src1 = index (int)
+    // Date/time: DATESERIAL/TIMESERIAL Src1 = year/hour (int); MONTHNAME/WEEKDAYNAME Src1 = index (int)
+    bcDateSerial, bcTimeSerial, bcDateName,
     bcCmd, bcAppend, bcRecord:               // Src1 = handle (int)
       Result := True;
   else
@@ -488,6 +497,7 @@ begin
     bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,
     bcMathLog10, bcMathLog2, bcMathLogN,
     bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,  // FreeBASIC math
+    bcDateDecode,  // YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY: Src1 = float serial
     // === GROUP 1: String operations with float param ===
     bcStrStr,      // STR$(n) - reads float, produces string
     // === GROUP 4: I/O operations ===
@@ -545,6 +555,8 @@ begin
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src2 = codepoint count/start (int)
     bcStrMid,  // Mid$(str, start, length) - start is Src1, length is Src2
     bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - Src2 = char code/codepoint (int)
+    // === GROUP 2: Date/time: DATESERIAL/TIMESERIAL Src2 = month/minute (int) ===
+    bcDateSerial, bcTimeSerial,
     // === GROUP 3: Typed array operations: Src2 is always int (linear index) ===
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
@@ -648,6 +660,8 @@ begin
     bcStrTrimSet,   // LTRIM/RTRIM/TRIM(s, set) - s is Src1
     // === GROUP 2: Math operations ===
     bcStrDec,  // DEC(hexstring) - reads string, produces int
+    bcDateValue, // DATEVALUE/TIMEVALUE(str) - reads string, produces float serial
+    bcIsDate,    // ISDATE(str) - reads string, produces int bool
     // === GROUP 4: I/O operations ===
     bcPrintString, bcPrintStringLn,
     bcPrintUsing,  // PRINT USING - Src1 = format string
@@ -931,6 +945,10 @@ begin
     // bcStrMid/bcStrMidW: Immediate contains length register index (int)
     // MID$(str, start, length) - start is Src2, length is in Immediate
     if (OpCode = bcStrMid) or (OpCode = bcStrMidW) then
+      MarkIntRegUsed(Instr.Immediate and $FFFF);
+
+    // bcDateSerial/bcTimeSerial: Immediate contains the 3rd arg (day/second) register index (int)
+    if (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // bcGraphicWindow: Src1=col1, Src2=row1, Dest=col2, Immediate = (clear_reg << 16) | row2_reg
@@ -1393,7 +1411,9 @@ begin
 
     // bcStrMid/bcStrMidW: Immediate contains length register index (int)
     // MID$(str, start, length) - start is Src2, length is in Immediate
-    if (OpCode = bcStrMid) or (OpCode = bcStrMidW) then
+    // bcDateSerial/bcTimeSerial: Immediate contains the 3rd arg (day/second) register index (int)
+    if (OpCode = bcStrMid) or (OpCode = bcStrMidW) or
+       (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) then
     begin
       OldReg := Instr.Immediate and $FFFF;
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then

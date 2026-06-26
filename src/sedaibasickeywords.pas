@@ -236,6 +236,25 @@ const
   kATAN2   = 'ATAN2';     // FreeBASIC: two-argument arctangent
   kFIX     = 'FIX';       // FreeBASIC: truncate toward zero
   kFRAC    = 'FRAC';      // FreeBASIC: fractional part
+  // FreeBASIC date/time (date serial = Double, epoch 1899-12-30)
+  kNOW         = 'NOW';          // current date+time as a serial Double
+  kTIMER       = 'TIMER';        // seconds elapsed since midnight (Double)
+  kDATEFN      = 'DATE';         // current date as "mm-dd-yyyy" string
+  kTIMEFN      = 'TIME';         // current time as "hh:mm:ss" string
+  kDATESERIAL  = 'DATESERIAL';   // DATESERIAL(year, month, day) -> serial
+  kTIMESERIAL  = 'TIMESERIAL';   // TIMESERIAL(hour, minute, second) -> serial
+  kDATEVALUE   = 'DATEVALUE';    // DATEVALUE(str) -> serial (date part)
+  kTIMEVALUE   = 'TIMEVALUE';    // TIMEVALUE(str) -> serial (time part)
+  kYEARFN      = 'YEAR';         // YEAR(serial) -> integer
+  kMONTHFN     = 'MONTH';        // MONTH(serial) -> integer 1..12
+  kDAYFN       = 'DAY';          // DAY(serial) -> integer 1..31
+  kHOURFN      = 'HOUR';         // HOUR(serial) -> integer 0..23
+  kMINUTEFN    = 'MINUTE';       // MINUTE(serial) -> integer 0..59
+  kSECONDFN    = 'SECOND';       // SECOND(serial) -> integer 0..59
+  kWEEKDAY     = 'WEEKDAY';      // WEEKDAY(serial) -> integer 1=Sunday..7=Saturday
+  kMONTHNAME   = 'MONTHNAME';    // MONTHNAME(n) -> month name string
+  kWEEKDAYNAME = 'WEEKDAYNAME';  // WEEKDAYNAME(n) -> weekday name string
+  kISDATE      = 'ISDATE';       // ISDATE(str) -> -1 if a valid date/time string, else 0
   kEXP     = 'EXP';
   kFRE     = 'FRE';
   kINT     = 'INT';

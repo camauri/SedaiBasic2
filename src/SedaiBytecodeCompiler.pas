@@ -177,6 +177,14 @@ begin
     ssaStrWChr: Result := bcStrWChr;
     ssaStrWStringN: Result := bcStrWStringN;
     ssaStrSAdd: Result := bcStrSAdd;
+    ssaDateNow: Result := bcDateNow;
+    ssaDateDecode: Result := bcDateDecode;
+    ssaDateSerial: Result := bcDateSerial;
+    ssaTimeSerial: Result := bcTimeSerial;
+    ssaDateValue: Result := bcDateValue;
+    ssaIsDate: Result := bcIsDate;
+    ssaDateStr: Result := bcDateStr;
+    ssaDateName: Result := bcDateName;
     ssaStrLeft: Result := bcStrLeft;
     ssaStrRight: Result := bcStrRight;
     ssaStrMid: Result := bcStrMid;

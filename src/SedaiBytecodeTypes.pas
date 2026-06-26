@@ -335,6 +335,8 @@ const
   bcStrInstrW       = bcGroupString + 29;  // INSTR(wstring, sub) - codepoint position of first occurrence (Dest=int, Src1/Src2=string)
   bcStrInstrRevW    = bcGroupString + 30;  // INSTRREV(wstring, sub) - codepoint position of last occurrence (Dest=int, Src1/Src2=string)
   bcStrSAdd         = bcGroupString + 33;  // SADD(s) - raw byte-heap pointer to a NUL-terminated copy of s (Dest=int raw ptr, Src1=string)
+  bcDateStr         = bcGroupString + 34;  // DATE / TIME -> string (Dest=string; Immediate: 0=DATE "mm-dd-yyyy", 1=TIME "hh:mm:ss")
+  bcDateName        = bcGroupString + 35;  // MONTHNAME(n)/WEEKDAYNAME(n) -> string (Dest=string, Src1=int; Imm: 0=MONTHNAME, 1=WEEKDAYNAME)
   bcStrWChr         = bcGroupString + 31;  // WCHR(n) - UTF-8 bytes of Unicode codepoint n (Dest=string, Src1=int)
   bcStrWStringN     = bcGroupString + 32;  // WSTRING(n,cp) - n copies of the UTF-8 char for codepoint cp (Dest=string, Src1=int n, Src2=int cp)
 
@@ -360,6 +362,13 @@ const
   bcMathAtan2       = bcGroupMath + 17;  // ATAN2(y, x) - two-argument arctangent
   bcMathFix         = bcGroupMath + 18;  // FIX(x) - truncate toward zero
   bcMathFrac        = bcGroupMath + 19;  // FRAC(x) - fractional part
+  // FreeBASIC date/time. Date serial = Double (FPC TDateTime epoch 1899-12-30 = VB/FB serial).
+  bcDateNow         = bcGroupMath + 20;  // Dest=float; Immediate: 0=NOW, 1=TIMER
+  bcDateDecode      = bcGroupMath + 21;  // Dest=int, Src1=float serial; Imm: 0=YEAR 1=MONTH 2=DAY 3=HOUR 4=MINUTE 5=SECOND 6=WEEKDAY
+  bcDateSerial      = bcGroupMath + 22;  // Dest=float, Src1=int y, Src2=int m, Immediate=int d register
+  bcTimeSerial      = bcGroupMath + 23;  // Dest=float, Src1=int h, Src2=int m, Immediate=int s register
+  bcDateValue       = bcGroupMath + 24;  // Dest=float, Src1=string; Imm: 0=DATEVALUE, 1=TIMEVALUE
+  bcIsDate          = bcGroupMath + 25;  // Dest=int (bool), Src1=string
 
   // === GROUP 3: ARRAY OPERATIONS (0x03xx) ===
   bcArrayLoad       = bcGroupArray + 0;   // Generic (deprecated)
@@ -1380,6 +1389,9 @@ begin
         22: Result := 'StrString';
         23: Result := 'StrTrimSet';
         24: Result := 'StrInstrRevAny';
+        33: Result := 'StrSAdd';
+        34: Result := 'DateStr';
+        35: Result := 'DateName';
       else
         Result := Format('String_%d', [SubOp]);
       end;
@@ -1401,6 +1413,12 @@ begin
         17: Result := 'MathAtan2';
         18: Result := 'MathFix';
         19: Result := 'MathFrac';
+        20: Result := 'DateNow';
+        21: Result := 'DateDecode';
+        22: Result := 'DateSerial';
+        23: Result := 'TimeSerial';
+        24: Result := 'DateValue';
+        25: Result := 'IsDate';
       else
         Result := Format('Math_%d', [SubOp]);
       end;

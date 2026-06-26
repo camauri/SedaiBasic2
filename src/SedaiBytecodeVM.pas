@@ -31,7 +31,7 @@ unit SedaiBytecodeVM;
 interface
 
 uses
-  Classes, SysUtils, Math, Variants, StrUtils,
+  Classes, SysUtils, Math, Variants, StrUtils, DateUtils,
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
   SedaiConsoleBehavior, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue
@@ -2354,6 +2354,51 @@ begin
           if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;
         end;
 
+        // Date/time: NOW/TIMER -> float Dest, no sources.
+        bcDateNow:
+          if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
+
+        // DATESERIAL/TIMESERIAL: float Dest, int Src1/Src2, and an int register in Immediate (3rd arg).
+        bcDateSerial, bcTimeSerial:
+        begin
+          if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+          if Instr.Immediate > MaxIntReg then MaxIntReg := Instr.Immediate;
+        end;
+
+        // DATEVALUE/TIMEVALUE: float Dest, string Src1.
+        bcDateValue:
+        begin
+          if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+        end;
+
+        // YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY: int Dest, float Src1 (serial).
+        bcDateDecode:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
+        end;
+
+        // ISDATE: int Dest, string Src1.
+        bcIsDate:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+        end;
+
+        // DATE/TIME: string Dest, no sources.
+        bcDateStr:
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+
+        // MONTHNAME/WEEKDAYNAME: string Dest, int Src1.
+        bcDateName:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
+
         // InputFloat/Input: float Dest (result), string Src1 (prompt, optional)
         bcInput, bcInputFloat:
         begin
@@ -4211,6 +4256,35 @@ begin
       end;
     33: // bcStrSAdd - SADD(s): raw byte-heap pointer to a NUL-terminated copy of the string
       Ctx.IntRegs[Instr.Dest] := StrSAdd(Ctx.StringRegs[Instr.Src1]);
+    34: // bcDateStr - DATE ("mm-dd-yyyy") / TIME ("hh:mm:ss"). Immediate 0=DATE, 1=TIME.
+      begin
+        if Instr.Immediate = 1 then
+          Ctx.StringRegs[Instr.Dest] := FormatDateTime('hh":"nn":"ss', Now)
+        else
+          Ctx.StringRegs[Instr.Dest] := FormatDateTime('mm"-"dd"-"yyyy', Now);
+      end;
+    35: // bcDateName - MONTHNAME(n) / WEEKDAYNAME(n). Immediate 0=month (1..12), 1=weekday (1=Sunday..7=Saturday).
+      begin
+        Count := Ctx.IntRegs[Instr.Src1];   // the 1-based index
+        if Instr.Immediate = 1 then
+        begin
+          case Count of
+            1: S := 'Sunday';   2: S := 'Monday';  3: S := 'Tuesday'; 4: S := 'Wednesday';
+            5: S := 'Thursday'; 6: S := 'Friday';  7: S := 'Saturday';
+          else S := '';
+          end;
+        end
+        else
+        begin
+          case Count of
+            1: S := 'January';  2: S := 'February'; 3: S := 'March';     4: S := 'April';
+            5: S := 'May';      6: S := 'June';     7: S := 'July';      8: S := 'August';
+            9: S := 'September'; 10: S := 'October'; 11: S := 'November'; 12: S := 'December';
+          else S := '';
+          end;
+        end;
+        Ctx.StringRegs[Instr.Dest] := S;
+      end;
     2: // bcStrLeft
       begin
         Len := Ctx.IntRegs[Instr.Src2];
@@ -4365,9 +4439,77 @@ begin
   end;
 end;
 
+function ParseDateSerial(const S: string; out DT: TDateTime): Boolean;
+// Parse a date/time string into a TDateTime serial. Accepts ISO-ish forms deterministically across
+// platforms/locales: "yyyy-mm-dd", "yyyy/mm/dd", "hh:mm[:ss]", or "<date> <time>". Anything else falls
+// back to the locale parser. Used by DATEVALUE/TIMEVALUE/ISDATE.
+var
+  ds, ts, w: string;
+  sp, y, mo, d, hh, mi, ss: Integer;
+  dpart, tpart: TDateTime;
+  haveD, haveT: Boolean;
+
+  function SplitInts(const Str: string; Sep: Char; out a, b, c: Integer): Integer;
+  // Split Str on Sep into up to 3 integer fields; returns the field count (2 or 3), or -1 if a/b are
+  // not numeric or there are too many fields.
+  var
+    f: array[0..2] of string;
+    i, n: Integer;
+  begin
+    n := 0; f[0] := ''; f[1] := ''; f[2] := '';
+    for i := 1 to Length(Str) do
+      if Str[i] = Sep then
+      begin
+        Inc(n);
+        if n > 2 then begin Result := -1; Exit; end;
+      end
+      else
+        f[n] := f[n] + Str[i];
+    a := StrToIntDef(Trim(f[0]), -999999);
+    b := StrToIntDef(Trim(f[1]), -999999);
+    if n >= 2 then c := StrToIntDef(Trim(f[2]), 0) else c := 0;
+    if (a = -999999) or (b = -999999) then Result := -1 else Result := n + 1;
+  end;
+
+begin
+  Result := False; DT := 0;
+  w := Trim(S);
+  if w = '' then Exit;
+  haveD := False; haveT := False; dpart := 0; tpart := 0;
+  sp := Pos(' ', w);
+  if sp > 0 then begin ds := Trim(Copy(w, 1, sp - 1)); ts := Trim(Copy(w, sp + 1, Length(w))); end
+  else if Pos(':', w) > 0 then begin ds := ''; ts := w; end
+  else begin ds := w; ts := ''; end;
+  if ds <> '' then
+  begin
+    if (Pos('-', ds) > 0) and (SplitInts(ds, '-', y, mo, d) >= 3) and TryEncodeDate(y, mo, d, dpart) then
+      haveD := True
+    else if (Pos('/', ds) > 0) and (SplitInts(ds, '/', y, mo, d) >= 3) and TryEncodeDate(y, mo, d, dpart) then
+      haveD := True
+    else if TryStrToDate(ds, dpart) then
+      haveD := True
+    else
+      Exit;
+  end;
+  if ts <> '' then
+  begin
+    if (Pos(':', ts) > 0) and (SplitInts(ts, ':', hh, mi, ss) >= 2) and TryEncodeTime(hh, mi, ss, 0, tpart) then
+      haveT := True
+    else if TryStrToTime(ts, tpart) then
+      haveT := True
+    else
+      Exit;
+  end;
+  if not (haveD or haveT) then Exit;
+  DT := dpart + tpart;
+  Result := True;
+end;
+
 procedure TBytecodeVM.ExecuteMathOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
+  dtVal: TDateTime;
+  dY, dMo, dD, dH, dMi, dS, dMs: Word;
 begin
   SubOp := Instr.OpCode and $FF;
   case SubOp of
@@ -4455,6 +4597,56 @@ begin
       Ctx.FloatRegs[Instr.Dest] := Trunc(Ctx.FloatRegs[Instr.Src1]);
     19: // bcMathFrac - FRAC(x) - fractional part (keeps sign)
       Ctx.FloatRegs[Instr.Dest] := Frac(Ctx.FloatRegs[Instr.Src1]);
+    20: // bcDateNow - Immediate 0=NOW (date+time serial), 1=TIMER (seconds since midnight)
+      begin
+        dtVal := Now;
+        if Instr.Immediate = 1 then
+          Ctx.FloatRegs[Instr.Dest] := Frac(dtVal) * 86400.0   // TIMER
+        else
+          Ctx.FloatRegs[Instr.Dest] := dtVal;                  // NOW
+      end;
+    21: // bcDateDecode - YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY(serial). Immediate selects the field.
+      begin
+        dtVal := Ctx.FloatRegs[Instr.Src1];
+        DecodeDate(dtVal, dY, dMo, dD);
+        DecodeTime(dtVal, dH, dMi, dS, dMs);
+        case Instr.Immediate of
+          0: Ctx.IntRegs[Instr.Dest] := dY;
+          1: Ctx.IntRegs[Instr.Dest] := dMo;
+          2: Ctx.IntRegs[Instr.Dest] := dD;
+          3: Ctx.IntRegs[Instr.Dest] := dH;
+          4: Ctx.IntRegs[Instr.Dest] := dMi;
+          5: Ctx.IntRegs[Instr.Dest] := dS;
+          6: Ctx.IntRegs[Instr.Dest] := DayOfWeek(dtVal);   // 1=Sunday .. 7=Saturday
+        else
+          Ctx.IntRegs[Instr.Dest] := 0;
+        end;
+      end;
+    22: // bcDateSerial - DATESERIAL(y,m,d) -> serial, with VB-style month/day rollover (Src1=y, Src2=m, Immediate=d reg)
+      begin
+        dtVal := EncodeDate(Word(Ctx.IntRegs[Instr.Src1]), 1, 1);
+        dtVal := IncMonth(dtVal, Ctx.IntRegs[Instr.Src2] - 1);
+        dtVal := dtVal + (Ctx.IntRegs[Instr.Immediate] - 1);
+        Ctx.FloatRegs[Instr.Dest] := dtVal;
+      end;
+    23: // bcTimeSerial - TIMESERIAL(h,m,s) -> serial fraction (Src1=h, Src2=m, Immediate=s reg)
+      Ctx.FloatRegs[Instr.Dest] :=
+        (Ctx.IntRegs[Instr.Src1] * 3600.0 + Ctx.IntRegs[Instr.Src2] * 60.0 + Ctx.IntRegs[Instr.Immediate]) / 86400.0;
+    24: // bcDateValue - DATEVALUE/TIMEVALUE(str) -> serial. Immediate 0=date part, 1=time part. 0 on failure.
+      begin
+        if ParseDateSerial(Ctx.StringRegs[Instr.Src1], dtVal) then
+        begin
+          if Instr.Immediate = 1 then Ctx.FloatRegs[Instr.Dest] := Frac(dtVal)
+          else Ctx.FloatRegs[Instr.Dest] := Trunc(dtVal);
+        end
+        else
+          Ctx.FloatRegs[Instr.Dest] := 0;
+      end;
+    25: // bcIsDate - ISDATE(str) -> -1 if a valid date/time string, else 0
+      if ParseDateSerial(Ctx.StringRegs[Instr.Src1], dtVal) then
+        Ctx.IntRegs[Instr.Dest] := -1
+      else
+        Ctx.IntRegs[Instr.Dest] := 0;
   else
     raise Exception.CreateFmt('Unknown math opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

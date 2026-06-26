@@ -133,6 +133,16 @@ type
     ssaMathSqr, ssaMathAbs, ssaMathSgn, ssaMathInt, ssaMathRnd,
     ssaMathLog10, ssaMathLog2, ssaMathLogN,  // Additional log functions
     ssaMathAcos, ssaMathAsin, ssaMathAtan2, ssaMathFix, ssaMathFrac,  // FreeBASIC math
+    // FreeBASIC date/time (date serial = Double, FPC TDateTime epoch 1899-12-30 = VB/FB serial).
+    // Each carries an Immediate selector that picks the concrete function (see SedaiBytecodeTypes).
+    ssaDateNow,     // NOW / TIMER -> float (Dest=float; Imm selects)
+    ssaDateDecode,  // YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY(serial) -> int (Dest=int, Src1=float; Imm selects)
+    ssaDateSerial,  // DATESERIAL(y,m,d) -> float (Dest=float, Src1=int y, Src2=int m, Immediate=int d reg)
+    ssaTimeSerial,  // TIMESERIAL(h,m,s) -> float (Dest=float, Src1=int h, Src2=int m, Immediate=int s reg)
+    ssaDateValue,   // DATEVALUE/TIMEVALUE(s) -> float (Dest=float, Src1=string; Imm selects)
+    ssaIsDate,      // ISDATE(s) -> int bool (Dest=int, Src1=string)
+    ssaDateStr,     // DATE / TIME -> string (Dest=string; Imm selects)
+    ssaDateName,    // MONTHNAME/WEEKDAYNAME(n) -> string (Dest=string, Src1=int; Imm selects)
 
     ssaStrDec,  // DEC(hexstring) - convert hex string to decimal
     ssaLabel, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaCall, ssaReturn,
