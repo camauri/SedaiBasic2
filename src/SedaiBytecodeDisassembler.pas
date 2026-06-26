@@ -244,6 +244,14 @@ begin
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrWStringN', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcStrSAdd:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'StrSAdd', Instr.Dest, Instr.Src1]);
+    bcStrMkInt:
+      Line := Format('%4d: %-20s R%d, R%d, width=%d', [Index, 'StrMkInt', Instr.Dest, Instr.Src1, Instr.Immediate]);
+    bcStrMkFloat:
+      Line := Format('%4d: %-20s R%d, R%d, width=%d', [Index, 'StrMkFloat', Instr.Dest, Instr.Src1, Instr.Immediate]);
+    bcStrCvInt:
+      Line := Format('%4d: %-20s R%d, R%d, width=%d', [Index, 'StrCvInt', Instr.Dest, Instr.Src1, Instr.Immediate]);
+    bcStrCvFloat:
+      Line := Format('%4d: %-20s R%d, R%d, width=%d', [Index, 'StrCvFloat', Instr.Dest, Instr.Src1, Instr.Immediate]);
     bcDateStr:
       Line := Format('%4d: %-20s R%d, imm=%d', [Index, 'DateStr', Instr.Dest, Instr.Immediate]);
     bcDateName:

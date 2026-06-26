@@ -369,7 +369,9 @@ begin
 
     // String operations (pure functions)
     ssaStrConcat, ssaStrLen, ssaStrLenW, ssaStrLeft, ssaStrRight, ssaStrMid,
-    ssaStrLeftW, ssaStrRightW, ssaStrMidW, ssaStrInstrW, ssaStrInstrRevW, ssaStrWChr, ssaStrWStringN:
+    ssaStrLeftW, ssaStrRightW, ssaStrMidW, ssaStrInstrW, ssaStrInstrRevW, ssaStrWChr, ssaStrWStringN,
+    // FreeBASIC numeric serialization (B3): MK*/CV* are pure deterministic packers/unpackers.
+    ssaStrMkInt, ssaStrMkFloat, ssaStrCvInt, ssaStrCvFloat:
       Result := True;
 
     // Math functions (pure functions)

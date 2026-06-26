@@ -305,6 +305,21 @@ const
   kVALLNG  = 'VALLNG';    // string -> LongInt
   kVALULNG = 'VALULNG';   // string -> ULongInt (unsigned)
   kVALUINT = 'VALUINT';   // string -> UInteger
+  // FreeBASIC numeric serialization (B3): pack/unpack a number to/from a fixed-width binary string.
+  // Intercepted by name as array-access (not registered keywords), so the identifiers stay free. The MK*
+  // functions accept both the bare and the '$' suffixed form. Byte widths are FB-faithful on x64.
+  kMKI       = 'MKI';        kMKIS       = 'MKI$';        // Integer  -> string (platform Integer = 8 bytes on x64)
+  kMKL       = 'MKL';        kMKLS       = 'MKL$';        // Long (32-bit)    -> 4-byte string
+  kMKD       = 'MKD';        kMKDS       = 'MKD$';        // Double           -> 8-byte string
+  kMKS       = 'MKS';        kMKSS       = 'MKS$';        // Single           -> 4-byte string
+  kMKSHORT   = 'MKSHORT';    kMKSHORTS   = 'MKSHORT$';    // Short (16-bit)   -> 2-byte string
+  kMKLONGINT = 'MKLONGINT';  kMKLONGINTS = 'MKLONGINT$';  // LongInt (64-bit) -> 8-byte string
+  kCVI       = 'CVI';        // string -> Integer (8 bytes on x64)
+  kCVL       = 'CVL';        // 4-byte string -> Long (32-bit)
+  kCVD       = 'CVD';        // 8-byte string -> Double
+  kCVS       = 'CVS';        // 4-byte string -> Single
+  kCVSHORT   = 'CVSHORT';    // 2-byte string -> Short (16-bit)
+  kCVLONGINT = 'CVLONGINT';  // 8-byte string -> LongInt (64-bit)
   // FreeBASIC array bound queries (B1.4)
   kLBOUND  = 'LBOUND';    // lower bound of an array dimension
   kUBOUND  = 'UBOUND';    // upper bound of an array dimension

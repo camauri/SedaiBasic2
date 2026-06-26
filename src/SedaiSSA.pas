@@ -3374,6 +3374,67 @@ begin
           end;
         end;
 
+        // FreeBASIC numeric serialization (B3): MKI$/MKL$/MKD$/MKS$/MKSHORT/MKLONGINT pack a number into
+        // a fixed-width binary string; CVI/CVL/CVD/CVS/CVSHORT/CVLONGINT unpack one back. Intercepted by
+        // name (not registered as keywords). MODERN, not a declared array. Byte width goes in the Immediate.
+        // The MK* names accept both the bare and the '$' suffixed form. Widths are FB-faithful on x64.
+        if FModernMode and (FProgram.FindArray(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          ArrNameU := UpperCase(ArrName);
+          // MK*: integer -> binary string. Width 2/4/8 selects the encoding.
+          SelImm := -1;
+          if (ArrNameU = kMKI) or (ArrNameU = kMKIS) then SelImm := 8         // Integer = 8 bytes on x64
+          else if (ArrNameU = kMKLONGINT) or (ArrNameU = kMKLONGINTS) then SelImm := 8
+          else if (ArrNameU = kMKL) or (ArrNameU = kMKLS) then SelImm := 4
+          else if (ArrNameU = kMKSHORT) or (ArrNameU = kMKSHORTS) then SelImm := 2;
+          if SelImm > 0 then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ArgReg := EnsureIntRegister(ArgValue);
+            Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+            EmitInstruction(ssaStrMkInt, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+            Exit;
+          end;
+          // MK*: float -> binary string (MKS single = 4 bytes, MKD double = 8 bytes).
+          SelImm := -1;
+          if (ArrNameU = kMKS) or (ArrNameU = kMKSS) then SelImm := 4
+          else if (ArrNameU = kMKD) or (ArrNameU = kMKDS) then SelImm := 8;
+          if SelImm > 0 then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ArgReg := EnsureFloatRegister(ArgValue);
+            Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+            EmitInstruction(ssaStrMkFloat, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+            Exit;
+          end;
+          // CV*: binary string -> integer. Width 2/4/8 selects the (sign-extended) decoding.
+          SelImm := -1;
+          if ArrNameU = kCVI then SelImm := 8                                 // Integer = 8 bytes on x64
+          else if ArrNameU = kCVLONGINT then SelImm := 8
+          else if ArrNameU = kCVL then SelImm := 4
+          else if ArrNameU = kCVSHORT then SelImm := 2;
+          if SelImm > 0 then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ArgReg := EnsureStringRegister(ArgValue);
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaStrCvInt, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+            Exit;
+          end;
+          // CV*: binary string -> float (CVS single = 4 bytes, CVD double = 8 bytes).
+          SelImm := -1;
+          if ArrNameU = kCVS then SelImm := 4
+          else if ArrNameU = kCVD then SelImm := 8;
+          if SelImm > 0 then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ArgReg := EnsureStringRegister(ArgValue);
+            Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+            EmitInstruction(ssaStrCvFloat, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+            Exit;
+          end;
+        end;
+
         // FreeBASIC EOF(#n)/LOF(#n)/LOC(#n): file query returning int. Parsed as array access (not
         // registered as keywords, so common names like `loc` stay usable as variables). MODERN, not a
         // declared array. Query code: EOF=0, LOF=2, LOC=3 (matches bcFileQuery).

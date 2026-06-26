@@ -177,6 +177,10 @@ begin
     ssaStrWChr: Result := bcStrWChr;
     ssaStrWStringN: Result := bcStrWStringN;
     ssaStrSAdd: Result := bcStrSAdd;
+    ssaStrMkInt: Result := bcStrMkInt;
+    ssaStrMkFloat: Result := bcStrMkFloat;
+    ssaStrCvInt: Result := bcStrCvInt;
+    ssaStrCvFloat: Result := bcStrCvFloat;
     ssaDateNow: Result := bcDateNow;
     ssaDateDecode: Result := bcDateDecode;
     ssaDateSerial: Result := bcDateSerial;

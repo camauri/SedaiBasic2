@@ -2340,18 +2340,18 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `MKD` | ✗ | Returns an eight character String representation of a Double. |
-| `MKI` | ✗ | Returns a four character String representation of a Integer. |
-| `MKL` | ✗ | Returns a four character String representation of a Long. |
-| `MKLONGINT` | ✗ | Returns an eight character String representation of a Longint. |
-| `MKS` | ✗ | Returns a four character String representation of a Single. |
-| `MKSHORT` | ✗ | Returns a two character String representation of a Short. |
-| `CVD` | ✗ | Returns a Double representation of an eight character String. |
-| `CVI` | ✗ | Returns an Integer representation of a four character String. |
-| `CVL` | ✗ | Returns a Long representation of a four character String. |
-| `CVLONGINT` | ✗ | Returns a Longint representation of an eight character String. |
-| `CVS` | ✗ | Returns a Single representation of a four character String. |
-| `CVSHORT` | ✗ | Returns a Short representation of a two character String. |
+| `MKD` | ✓ | Returns an eight character String representation of a Double. |
+| `MKI` | ✓ | Returns an eight character String representation of an Integer (platform Integer = 8 bytes on x64). |
+| `MKL` | ✓ | Returns a four character String representation of a Long. |
+| `MKLONGINT` | ✓ | Returns an eight character String representation of a Longint. |
+| `MKS` | ✓ | Returns a four character String representation of a Single. |
+| `MKSHORT` | ✓ | Returns a two character String representation of a Short. |
+| `CVD` | ✓ | Returns a Double representation of an eight character String. |
+| `CVI` | ✓ | Returns an Integer representation of an eight character String (platform Integer = 8 bytes on x64). |
+| `CVL` | ✓ | Returns a Long representation of a four character String. |
+| `CVLONGINT` | ✓ | Returns a Longint representation of an eight character String. |
+| `CVS` | ✓ | Returns a Single representation of a four character String. |
+| `CVSHORT` | ✓ | Returns a Short representation of a two character String. |
 
 #### Working with Substrings
 

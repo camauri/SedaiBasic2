@@ -337,6 +337,10 @@ const
   bcStrSAdd         = bcGroupString + 33;  // SADD(s) - raw byte-heap pointer to a NUL-terminated copy of s (Dest=int raw ptr, Src1=string)
   bcDateStr         = bcGroupString + 34;  // DATE / TIME -> string (Dest=string; Immediate: 0=DATE "mm-dd-yyyy", 1=TIME "hh:mm:ss")
   bcDateName        = bcGroupString + 35;  // MONTHNAME(n)/WEEKDAYNAME(n) -> string (Dest=string, Src1=int; Imm: 0=MONTHNAME, 1=WEEKDAYNAME)
+  bcStrMkInt        = bcGroupString + 36;  // MKI/MKL/MKSHORT/MKLONGINT - pack int into a binary string (Dest=string, Src1=int, Imm=byte width)
+  bcStrMkFloat      = bcGroupString + 37;  // MKS/MKD - pack float into an IEEE binary string (Dest=string, Src1=float, Imm=byte width)
+  bcStrCvInt        = bcGroupString + 38;  // CVI/CVL/CVSHORT/CVLONGINT - unpack int from a binary string (Dest=int, Src1=string, Imm=byte width)
+  bcStrCvFloat      = bcGroupString + 39;  // CVS/CVD - unpack float from an IEEE binary string (Dest=float, Src1=string, Imm=byte width)
   bcStrWChr         = bcGroupString + 31;  // WCHR(n) - UTF-8 bytes of Unicode codepoint n (Dest=string, Src1=int)
   bcStrWStringN     = bcGroupString + 32;  // WSTRING(n,cp) - n copies of the UTF-8 char for codepoint cp (Dest=string, Src1=int n, Src2=int cp)
 
@@ -1396,6 +1400,10 @@ begin
         33: Result := 'StrSAdd';
         34: Result := 'DateStr';
         35: Result := 'DateName';
+        36: Result := 'StrMkInt';
+        37: Result := 'StrMkFloat';
+        38: Result := 'StrCvInt';
+        39: Result := 'StrCvFloat';
       else
         Result := Format('String_%d', [SubOp]);
       end;

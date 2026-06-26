@@ -2505,14 +2505,14 @@ begin
         end;
 
         // String Src1 (source) -> int Dest
-        bcStrLen, bcStrLenW, bcStrAsc, bcStrDec, bcStrValInt, bcStrSAdd:
+        bcStrLen, bcStrLenW, bcStrAsc, bcStrDec, bcStrValInt, bcStrSAdd, bcStrCvInt:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
         end;
 
-        // Int Src1 -> String Dest (CHR$, HEX$, ERR$, SPACE, OCT, BIN)
-        bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin, bcStrWChr:
+        // Int Src1 -> String Dest (CHR$, HEX$, ERR$, SPACE, OCT, BIN, MK*int)
+        bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin, bcStrWChr, bcStrMkInt:
         begin
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
@@ -2534,15 +2534,15 @@ begin
           if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;
         end;
 
-        // Float Src1 -> String Dest (STR$)
-        bcStrStr:
+        // Float Src1 -> String Dest (STR$, MK*float)
+        bcStrStr, bcStrMkFloat:
         begin
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
         end;
 
-        // String Src1 -> Float Dest (VAL)
-        bcStrVal:
+        // String Src1 -> Float Dest (VAL, CV*float)
+        bcStrVal, bcStrCvFloat:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
@@ -4232,6 +4232,9 @@ var
   SubOp: Word;
   Len, StartPos, Count: Integer;
   S, SubStr: string;
+  PackInt: Int64;        // B3 serialization scratch (MK*/CV* integer pack/unpack)
+  PackSingle: Single;
+  PackDouble: Double;
 begin
   SubOp := Instr.OpCode and $FF;  // Extract sub-opcode (low byte)
   case SubOp of
@@ -4287,6 +4290,70 @@ begin
       end;
     33: // bcStrSAdd - SADD(s): raw byte-heap pointer to a NUL-terminated copy of the string
       Ctx.IntRegs[Instr.Dest] := StrSAdd(Ctx.StringRegs[Instr.Src1]);
+    36: // bcStrMkInt - MKI/MKL/MKSHORT/MKLONGINT: binary copy of an integer into a string.
+      begin
+        // Immediate = byte width (2/4/8). Write the low `width` bytes, little-endian (two's complement).
+        Count := Instr.Immediate;
+        PackInt := Ctx.IntRegs[Instr.Src1];
+        SetLength(S, Count);
+        for StartPos := 1 to Count do
+        begin
+          S[StartPos] := Chr(PackInt and $FF);
+          PackInt := PackInt shr 8;
+        end;
+        Ctx.StringRegs[Instr.Dest] := S;
+      end;
+    37: // bcStrMkFloat - MKS (4=single) / MKD (8=double): binary copy of a float into a string.
+      begin
+        Count := Instr.Immediate;
+        if Count = 4 then
+        begin
+          PackSingle := Ctx.FloatRegs[Instr.Src1];   // narrow Double -> IEEE-754 single
+          SetLength(S, 4);
+          Move(PackSingle, S[1], 4);
+        end
+        else
+        begin
+          PackDouble := Ctx.FloatRegs[Instr.Src1];
+          SetLength(S, 8);
+          Move(PackDouble, S[1], 8);
+        end;
+        Ctx.StringRegs[Instr.Dest] := S;
+      end;
+    38: // bcStrCvInt - CVI/CVL/CVSHORT/CVLONGINT: read `width` little-endian bytes, sign-extend to Int64.
+      begin
+        Count := Instr.Immediate;                  // byte width (2/4/8)
+        S := Ctx.StringRegs[Instr.Src1];
+        if Length(S) < Count then
+          Ctx.IntRegs[Instr.Dest] := 0             // FreeBASIC: 0 if the string is too short
+        else
+        begin
+          PackInt := 0;
+          for StartPos := Count downto 1 do
+            PackInt := (PackInt shl 8) or Int64(Ord(S[StartPos]));
+          // Sign-extend from the top bit of the `width`-byte value (skip for the full-width 8-byte case).
+          if (Count < 8) and ((PackInt and (Int64(1) shl (Count * 8 - 1))) <> 0) then
+            PackInt := PackInt or not ((Int64(1) shl (Count * 8)) - 1);
+          Ctx.IntRegs[Instr.Dest] := PackInt;
+        end;
+      end;
+    39: // bcStrCvFloat - CVS (4=single) / CVD (8=double): read IEEE-754 bytes, widen to Double.
+      begin
+        Count := Instr.Immediate;
+        S := Ctx.StringRegs[Instr.Src1];
+        if Length(S) < Count then
+          Ctx.FloatRegs[Instr.Dest] := 0.0         // FreeBASIC: 0 if the string is too short
+        else if Count = 4 then
+        begin
+          Move(S[1], PackSingle, 4);
+          Ctx.FloatRegs[Instr.Dest] := PackSingle;
+        end
+        else
+        begin
+          Move(S[1], PackDouble, 8);
+          Ctx.FloatRegs[Instr.Dest] := PackDouble;
+        end;
+      end;
     34: // bcDateStr - DATE ("mm-dd-yyyy") / TIME ("hh:mm:ss"). Immediate 0=DATE, 1=TIME.
       begin
         if Instr.Immediate = 1 then

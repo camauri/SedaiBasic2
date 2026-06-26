@@ -216,6 +216,7 @@ begin
     bcStrInstrRev, // INSTRREV(str, sub) returns int position
     bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV return int codepoint position
     bcStrValInt,   // VALINT/VALLNG/VALUINT(str) returns int (B1.3)
+    bcStrCvInt,    // CVI/CVL/CVSHORT/CVLONGINT(str) returns int (B3 serialization)
     // === GROUP 2: Date/time -> int ===
     bcDateDecode,  // YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY(serial) -> int
     bcIsDate,      // ISDATE(str) -> int bool
@@ -293,6 +294,7 @@ begin
     bcGetBinFloat,   // GET #n binary -> float Dest
     // === GROUP 1: String operations ===
     bcStrVal,      // VAL(str) - string to float
+    bcStrCvFloat,  // CVS/CVD(str) - binary string to float (B3 serialization)
     // === GROUP 2: Math functions ===
     bcMathSqr, bcMathSin, bcMathCos, bcMathTan, bcMathAtn,
     bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,
@@ -347,6 +349,7 @@ begin
     bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - string dest
     bcStrTrimSet, // LTRIM/RTRIM/TRIM(s,set) - string dest
     bcStrStr,    // STR$(n) - number to string
+    bcStrMkInt, bcStrMkFloat,  // MK*(n) - number to binary string (B3 serialization)
     bcStrHex,    // HEX$(n) - int to hex string
     bcStrOct, bcStrBin,  // OCT(n)/BIN(n) - int to octal/binary string (B1.3)
     bcStrErr,    // ERR$(n) - error code to message string
@@ -419,6 +422,7 @@ begin
     bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat,
     // === GROUP 1: String operations with int param ===
     bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin, bcStrWChr,
+    bcStrMkInt,  // MKI/MKL/MKSHORT/MKLONGINT(n) - Src1 = int value to pack (B3)
     bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - Src1 = count (int)
     // === GROUP 5: Memory operations ===
     bcPeek,           // PEEK(address): Src1 = address (int)
@@ -501,6 +505,7 @@ begin
     bcDateDecode,  // YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY: Src1 = float serial
     // === GROUP 1: String operations with float param ===
     bcStrStr,      // STR$(n) - reads float, produces string
+    bcStrMkFloat,  // MKS/MKD(n) - reads float, produces binary string (B3)
     // === GROUP 4: I/O operations ===
     // Print float value (bcPrint/bcPrintLn use float register in Src1)
     bcPrint, bcPrintLn,
@@ -656,6 +661,7 @@ begin
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string
     bcStrVal,    // VAL(str) - reads string, produces float
     bcStrValInt, // VALINT/VALLNG/VALUINT(str) - reads string, produces int
+    bcStrCvInt, bcStrCvFloat,  // CV*(str) - reads binary string, produces int/float (B3 serialization)
     bcStrInstr,  // INSTR(haystack, needle) - haystack is Src1
     bcStrInstrRev,  // INSTRREV(str, sub) - str is Src1
     bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV - haystack is Src1
