@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 264 / 643 implemented (41%)** (+ ~4 partial); see the
+**FreeBASIC keyword set — 270 / 643 implemented (42%)** (+ ~4 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1251,7 +1251,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 > FB-syntax file I/O are not yet present. This is a forward-looking gap map, not a claim of FreeBASIC
 > compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **264 / 643 implemented (41%)**, plus ~4 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **270 / 643 implemented (42%)**, plus ~4 partial (◐).
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
 > compound & bitwise operators, string/conversion/array functions, namespaces, pointers (managed + raw
@@ -1702,7 +1702,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `#DEFINE` | ◐ | Object-like text-replacement macro (function-like macros not yet supported). |
+| `#DEFINE` | ✓ | Object-like and function-like text-replacement macros: `#define NAME body` and `#define NAME(params) body`. |
 | `#MACRO and #ENDMACRO` | ✗ | Creates a multi-line text-replacement macro. |
 | `#UNDEF` | ✓ | Undefines a symbol. |
 | `# Preprocessor stringize` | ✗ | Converts text into a string literal. |
