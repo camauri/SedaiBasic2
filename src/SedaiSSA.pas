@@ -344,7 +344,7 @@ type
     procedure ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
     procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure EmitWStr(ArgsNode: TASTNode; out Result: TSSAValue);   // FreeBASIC WSTR(x) -> wide string
-    procedure EmitWriteFileValues(Node: TASTNode; const HandleReg: TSSAValue);  // WRITE #n CSV formatting
+    procedure EmitWriteFileValues(Node: TASTNode; const HandleReg: TSSAValue; ToConsole: Boolean);  // WRITE [#n] CSV
     procedure EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure EmitWStringFill(ArgsNode: TASTNode; out Result: TSSAValue);  // WSTRING(n,cp) -> n wide chars
     function InferExprBank(Node: TASTNode): TSSARegisterType;
@@ -3805,6 +3805,13 @@ var
   EndsWithSeparator: Boolean;
   PKidx: Integer;   // B1.5 phase C: print-kind index for a BOOLEAN / unsigned-64 identifier
 begin
+  // FreeBASIC console WRITE: quoted-CSV to the screen (child 0 is a placeholder; values are children 1+).
+  if Node.Attributes.Values['WRITECSV'] = '1' then
+  begin
+    EmitWriteFileValues(Node, MakeSSAValue(svkNone), True);
+    Exit;
+  end;
+
   // Handle empty PRINT statement (just newline)
   if Node.ChildCount = 0 then
   begin
@@ -9020,7 +9027,7 @@ begin
   end;
 end;
 
-procedure TSSAGenerator.EmitWriteFileValues(Node: TASTNode; const HandleReg: TSSAValue);
+procedure TSSAGenerator.EmitWriteFileValues(Node: TASTNode; const HandleReg: TSSAValue; ToConsole: Boolean);
 // FreeBASIC WRITE #n, v1, v2, ...: write each value comma-separated; strings are wrapped in double
 // quotes; numbers use their plain string form; a trailing newline terminates the record (so a matching
 // INPUT# reads the fields back). Children 1+ are values (separators are ignored — WRITE always uses ',').
@@ -9029,12 +9036,20 @@ var
   Child: TASTNode;
   ExprVal, StrReg: TSSAValue;
 
+  procedure EmitStr(const R: TSSAValue);   // write one string register to the file or the console
+  begin
+    if ToConsole then
+      EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), R, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+    else
+      EmitInstruction(ssaPrintFile, R, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
   procedure EmitLit(const S: string);
   var R: TSSAValue;
   begin
     R := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
     EmitInstruction(ssaLoadConstString, R, MakeSSAConstString(S), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    EmitInstruction(ssaPrintFile, R, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitStr(R);
   end;
 
 begin
@@ -9048,24 +9063,27 @@ begin
     if (ExprVal.Kind = svkConstString) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtString)) then
     begin
       EmitLit('"');
-      EmitInstruction(ssaPrintFile, EnsureStringRegister(ExprVal), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitStr(EnsureStringRegister(ExprVal));
       EmitLit('"');
     end
     else if (ExprVal.Kind = svkConstInt) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtInt)) then
     begin
       StrReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
       EmitInstruction(ssaIntToString, StrReg, EnsureIntRegister(ExprVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      EmitInstruction(ssaPrintFile, StrReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitStr(StrReg);
     end
     else
     begin
       StrReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
       EmitInstruction(ssaFloatToString, StrReg, EnsureFloatRegister(ExprVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      EmitInstruction(ssaPrintFile, StrReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitStr(StrReg);
     end;
     Inc(vc);
   end;
-  EmitInstruction(ssaPrintFileNewLine, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  if ToConsole then
+    EmitInstruction(ssaPrintNewLine, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  else
+    EmitInstruction(ssaPrintFileNewLine, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.ProcessPrintFile(Node: TASTNode);
@@ -9163,7 +9181,7 @@ begin
   // FreeBASIC WRITE #n, ...: comma-separated values, strings quoted, then a newline.
   if Node.Attributes.Values['WRITE'] = '1' then
   begin
-    EmitWriteFileValues(Node, HandleReg);
+    EmitWriteFileValues(Node, HandleReg, False);
     Exit;
   end;
 

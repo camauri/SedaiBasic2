@@ -255,6 +255,7 @@ type
     function ParseFileOutputStatement: TASTNode;
     function ParseLineInputStatement: TASTNode;  // FreeBASIC LINE INPUT #n, var (whole line)
     function ParseWriteFileStatement: TASTNode;   // FreeBASIC WRITE #n, exprlist (quoted CSV)
+    function ParseWriteConsole: TASTNode;          // FreeBASIC WRITE exprlist (quoted CSV to screen)
     function ParseSeekStatement: TASTNode;         // FreeBASIC SEEK #n, pos (set position)
     function ParseBinaryFileTail(IsGet: Boolean; const Tok: TLexerToken): TASTNode;  // GET/PUT #n,[pos],var
     function ParseErrorHandlingStatement: TASTNode;
@@ -834,6 +835,13 @@ begin
         else if (UpperCase(Token.Value) = kWRITE) and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
           Result := ParseWriteFileStatement
+        // FreeBASIC console "WRITE v1, v2, ...": quoted-CSV to the screen. WRITE is a bare identifier, so
+        // only treat it as the statement when a value follows (not "write = ...", an assignment, nor a
+        // bare "write" used as a variable).
+        else if (UpperCase(Token.Value) = kWRITE) and Assigned(Context.PeekNext) and
+                (Context.PeekNext.TokenType <> ttOpEq) and (Context.PeekNext.Value <> '=') and
+                not (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+          Result := ParseWriteConsole
         // FreeBASIC "SEEK #n, pos" statement (SEEK is also the SEEK(n) function — the `#` selects the
         // statement form). SEEK is a bare identifier here.
         else if (UpperCase(Token.Value) = kSEEK) and Assigned(Context.PeekNext) and
@@ -4168,6 +4176,27 @@ begin
   begin
     Result.Attributes.Values['HASPOS'] := '1';
     Result.AddChild(P);   // child 2 = position
+  end;
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseWriteConsole: TASTNode;
+// FreeBASIC "WRITE v1, v2, ..." — quoted-CSV output to the screen. Built as an antPrint node tagged
+// WRITECSV with a placeholder child 0 (so the shared CSV emitter, which skips child 0, sees values at 1+).
+var
+  P: TASTNode;
+  Tok: TLexerToken;
+begin
+  Tok := Context.CurrentToken;
+  Context.Advance;  // WRITE
+  Result := TASTNode.Create(antPrint, Tok);
+  Result.Attributes.Values['WRITECSV'] := '1';
+  Result.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Tok));   // child 0 placeholder
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
+  begin
+    P := ParseExpression;
+    if Assigned(P) then Result.AddChild(P) else Break;
+    if Context.Check(ttSeparParam) then Context.Advance else Break;
   end;
   DoNodeCreated(Result);
 end;
