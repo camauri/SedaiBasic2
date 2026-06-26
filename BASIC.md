@@ -8,11 +8,11 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 278 / 643 implemented (43%)** (+ 3 partial); see the
+**FreeBASIC keyword set — 290 / 643 implemented (45%)** (+ 3 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
-[█████████████████████·····························] 43%
+[██████████████████████··························] 45%
 ```
 
 Legend: ✓ = Implemented | ◐ = Partial | ✗ = Not implemented
@@ -1250,7 +1250,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **278 / 643 implemented (43%)**, plus 3 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **290 / 643 implemented (45%)**, plus 3 partial (◐).
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
 > compound & bitwise operators, string/conversion/array functions, namespaces, pointers (managed + raw
@@ -1429,21 +1429,21 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `= (Assignment)` | ✓ |  |
-| `&= (Concatenate and Assign)` | ✗ | (word/`&=` compound ops deferred) |
+| `&= (Concatenate and Assign)` | ✓ | desugars to `lhs = lhs & rhs` (string concat) |
 | `+= (Add and Assign)` | ✓ | desugars to `lhs = lhs + rhs` (scalar/array/member) (B1.1) |
 | `-= (Subtract and Assign)` | ✓ | (B1.1) |
 | `*= (Multiply and Assign)` | ✓ | (B1.1) |
 | `/= (Divide and Assign)` | ✓ | (B1.1) |
-| `\= (Integer Divide and Assign)` | ✗ |  |
+| `\= (Integer Divide and Assign)` | ✓ | desugars to `lhs = lhs \ rhs` |
 | `^= (Exponentiate and Assign)` | ✓ | (B1.1; also fixed integer `^` which computed `a+b`) |
-| `MOD= (Modulus and Assign)` | ✗ |  |
-| `AND= (Conjunction and Assign)` | ✗ |  |
-| `EQV= (Equivalence and Assign)` | ✗ |  |
-| `IMP= (Implication and Assign)` | ✗ |  |
-| `OR= (Inclusive Disjunction and Assign)` | ✗ |  |
-| `XOR= (Exclusive Disjunction and Assign)` | ✗ |  |
-| `SHL= (Shift Left and Assign)` | ✗ |  |
-| `SHR= (Shift Right and Assign)` | ✗ |  |
+| `MOD= (Modulus and Assign)` | ✓ | keyword-operator compound; desugars to `lhs = lhs MOD rhs` |
+| `AND= (Conjunction and Assign)` | ✓ | desugars to `lhs = lhs AND rhs` |
+| `EQV= (Equivalence and Assign)` | ✓ | desugars to `lhs = lhs EQV rhs` |
+| `IMP= (Implication and Assign)` | ✓ | desugars to `lhs = lhs IMP rhs` |
+| `OR= (Inclusive Disjunction and Assign)` | ✓ | desugars to `lhs = lhs OR rhs` |
+| `XOR= (Exclusive Disjunction and Assign)` | ✓ | desugars to `lhs = lhs XOR rhs` |
+| `SHL= (Shift Left and Assign)` | ✓ | desugars to `lhs = lhs SHL rhs` |
+| `SHR= (Shift Right and Assign)` | ✓ | desugars to `lhs = lhs SHR rhs` |
 | `LET (Assign)` | ✓ |  |
 | `LET() (Assignment)` | ✓ |  |
 
@@ -1501,8 +1501,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `AND (Conjunction)` | ✓ |  |
-| `EQV (Equivalence)` | ✗ |  |
-| `IMP (Implication)` | ✗ |  |
+| `EQV (Equivalence)` | ✓ | Bitwise equivalence `a EQV b = NOT (a XOR b)`. Looser than OR/XOR. |
+| `IMP (Implication)` | ✓ | Bitwise implication `a IMP b = (NOT a) OR b`. Loosest binary operator. |
 | `NOT (Complement)` | ✓ |  |
 | `OR (Inclusive Disjunction)` | ✓ |  |
 | `XOR (Exclusive Disjunction)` | ✓ |  |

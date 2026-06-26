@@ -402,6 +402,8 @@ const
   kOR    = 'OR';
   kNOT   = 'NOT';
   kXOR   = 'XOR';
+  kEQV   = 'EQV';        // FreeBASIC bitwise equivalence operator: NOT (a XOR b)
+  kIMP   = 'IMP';        // FreeBASIC bitwise implication operator: (NOT a) OR b
 
   // SedaiBasic Options
   kOPTION = 'OPTION';

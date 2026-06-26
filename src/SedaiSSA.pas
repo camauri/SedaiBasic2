@@ -1719,8 +1719,8 @@ begin
             EmitInstruction(OpCode, Result, Left, Right, MakeSSAValue(svkNone));
         end;
 
-        // Bitwise operators (AND, OR, XOR) - result is always Int
-        ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR:
+        // Bitwise operators (AND, OR, XOR, EQV, IMP) - result is always Int
+        ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR, ttOpEqv, ttOpImp:
         begin
           // Bitwise operators always return integer
           DestReg := FProgram.AllocRegister(srtInt);
@@ -1743,14 +1743,28 @@ begin
           end;
 
           case Node.Token.TokenType of
-            ttBitwiseAND: OpCode := ssaBitwiseAnd;
-            ttBitwiseOR: OpCode := ssaBitwiseOr;
-            ttBitwiseXOR: OpCode := ssaBitwiseXor;
+            ttBitwiseAND: EmitInstruction(ssaBitwiseAnd, Result, Left, Right, MakeSSAValue(svkNone));
+            ttBitwiseOR: EmitInstruction(ssaBitwiseOr, Result, Left, Right, MakeSSAValue(svkNone));
+            ttBitwiseXOR: EmitInstruction(ssaBitwiseXor, Result, Left, Right, MakeSSAValue(svkNone));
+            ttOpEqv:
+              begin
+                // a EQV b = NOT (a XOR b): bitwise equivalence.
+                TempReg := FProgram.AllocRegister(srtInt);
+                TempVal := MakeSSARegister(srtInt, TempReg);
+                EmitInstruction(ssaBitwiseXor, TempVal, Left, Right, MakeSSAValue(svkNone));
+                EmitInstruction(ssaBitwiseNot, Result, TempVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              end;
+            ttOpImp:
+              begin
+                // a IMP b = (NOT a) OR b: bitwise implication.
+                TempReg := FProgram.AllocRegister(srtInt);
+                TempVal := MakeSSARegister(srtInt, TempReg);
+                EmitInstruction(ssaBitwiseNot, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                EmitInstruction(ssaBitwiseOr, Result, TempVal, Right, MakeSSAValue(svkNone));
+              end;
           else
-            OpCode := ssaBitwiseAnd;
+            EmitInstruction(ssaBitwiseAnd, Result, Left, Right, MakeSSAValue(svkNone));
           end;
-
-          EmitInstruction(OpCode, Result, Left, Right, MakeSSAValue(svkNone));
         end;
 
       else

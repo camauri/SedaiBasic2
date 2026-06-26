@@ -249,6 +249,8 @@ type
   TPrecedence = (
     precNone,           // No precedence
     precAssignment,     // = (assignment)
+    precImp,            // IMP (FreeBASIC: loosest logical operator)
+    precEqv,            // EQV (FreeBASIC: looser than OR/XOR, tighter than IMP)
     precOr,             // OR
     precAnd,            // AND
     precEquality,       // = <> (comparison)

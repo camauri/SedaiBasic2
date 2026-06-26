@@ -89,6 +89,8 @@ type
     ttOpShr,                 // SHR (FreeBASIC shift right)
     ttOpPow,                 // ^
     ttOpMod,                 // MOD
+    ttOpEqv,                 // EQV (FreeBASIC bitwise equivalence: NOT (a XOR b))
+    ttOpImp,                 // IMP (FreeBASIC bitwise implication: (NOT a) OR b)
     ttOpDot,                 // . (member access: record.field)
     ttOpAt,                  // @ (proc-address prefix: @subname → entry PC, for Threadcreate)
     ttCompoundAssign,        // += -= *= /= ^= (FreeBASIC compound assignment; value = the operator symbol)
@@ -417,7 +419,7 @@ const
 
   // Operator tokens
   OPERATOR_TOKENS: TTokenTypeSet = [
-    ttOpAdd, ttOpSub, ttOpMul, ttOpDiv, ttOpPow, ttOpMod,
+    ttOpAdd, ttOpSub, ttOpMul, ttOpDiv, ttOpPow, ttOpMod, ttOpEqv, ttOpImp,
     ttOpEq, ttOpNeq, ttOpLt, ttOpGt, ttOpLe, ttOpGe,
     ttBitwiseOperator, ttOperator
   ];

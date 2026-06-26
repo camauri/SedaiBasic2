@@ -988,6 +988,40 @@ begin
     Exit;
   end;
 
+  // FreeBASIC keyword-operator compound assignment: "lhs MOD= rhs", "lhs AND/OR/XOR= rhs",
+  // "lhs SHL/SHR= rhs", "lhs EQV/IMP= rhs". Unlike the symbolic forms (+= &= ...), the keyword stops
+  // at the '=', so the lexer yields the operator token (ttOpMod/ttBitwiseAND/...) followed by a
+  // separate ttOpEq. Detect by lookahead and desugar to "lhs = lhs op rhs".
+  if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpEq) and
+     ((Context.CurrentToken.TokenType = ttOpMod) or
+      (Context.CurrentToken.TokenType = ttOpShl) or
+      (Context.CurrentToken.TokenType = ttOpShr) or
+      (Context.CurrentToken.TokenType = ttBitwiseAND) or
+      (Context.CurrentToken.TokenType = ttBitwiseOR) or
+      (Context.CurrentToken.TokenType = ttBitwiseXOR) or
+      (Context.CurrentToken.TokenType = ttOpEqv) or
+      (Context.CurrentToken.TokenType = ttOpImp)) then
+  begin
+    OpType := Context.CurrentToken.TokenType;
+    OpSym := Context.CurrentToken.Value;
+    Context.Advance;                                 // consume the operator keyword
+    Context.Advance;                                 // consume the trailing "="
+    Expression := FExpressionParser.ParseExpression;
+    if not Assigned(Expression) then
+    begin
+      if Assigned(LeftSide) then LeftSide.Free;
+      Result := nil;
+      Exit;
+    end;
+    Expression := CreateBinaryOpNode(OpType, LeftSide.Clone, Expression,
+                                     TLexerToken.CreateSimple(OpType, OpSym));
+    Result := TASTNode.Create(antAssignment);
+    Result.AddChild(LeftSide);
+    Result.AddChild(Expression);
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
   // FreeBASIC compound assignment "lhs op= rhs" desugars to "lhs = lhs op rhs". The lexer emits a single
   // ttCompoundAssign token whose value is the operator symbol; clone the LHS as the left operand.
   if Context.Check(ttCompoundAssign) then

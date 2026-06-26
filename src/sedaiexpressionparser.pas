@@ -469,6 +469,9 @@ begin
   Context.SetParseRule(ttBitwiseAND, MakeInfixRule(@StaticParseBinaryOperator, precAnd));
   Context.SetParseRule(ttBitwiseOR, MakeInfixRule(@StaticParseBinaryOperator, precOr));
   Context.SetParseRule(ttBitwiseXOR, MakeInfixRule(@StaticParseBinaryOperator, precOr));
+  // FreeBASIC EQV / IMP: looser than OR/XOR; IMP is the loosest binary operator.
+  Context.SetParseRule(ttOpEqv, MakeInfixRule(@StaticParseBinaryOperator, precEqv));
+  Context.SetParseRule(ttOpImp, MakeInfixRule(@StaticParseBinaryOperator, precImp));
 
   // Assignment
   Context.SetParseRule(ttDataAssignment, MakeInfixRule(@StaticParseAssignment, precAssignment));
