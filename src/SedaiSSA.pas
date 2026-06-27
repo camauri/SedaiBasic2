@@ -1274,16 +1274,16 @@ begin
         Result := MakeSSARegister(srtString, DestReg);
         EmitInstruction(ssaLoadCWDS, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
-      else if VarName = 'EL' then
+      else if (VarName = 'EL') or (VarName = 'ERL') then
       begin
-        // EL returns last error line number - integer
+        // EL / ERL (FreeBASIC) returns last error line number - integer
         DestReg := FProgram.AllocRegister(srtInt);
         Result := MakeSSARegister(srtInt, DestReg);
         EmitInstruction(ssaLoadEL, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
-      else if VarName = 'ER' then
+      else if (VarName = 'ER') or (VarName = 'ERR') then
       begin
-        // ER returns last error code - integer
+        // ER / ERR (FreeBASIC) returns last error code - integer
         DestReg := FProgram.AllocRegister(srtInt);
         Result := MakeSSARegister(srtInt, DestReg);
         EmitInstruction(ssaLoadER, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -10881,6 +10881,24 @@ begin
         else if (Copy(TargetLabel, 1, 5) = 'PROC_') then
           raise Exception.CreateFmt('Undefined procedure (address-of @): %s', [Copy(TargetLabel, 6, MaxInt)]);
       end;
+
+      // FreeBASIC error handling: ssaOnError (ON ERROR GOTO label) / ssaResumeLabel (RESUME label)
+      // carry the target label in Src1. We do NOT add a CFG edge here: the handler block is reached
+      // dynamically (on error / RESUME), exactly like a TRAP handler, so it is kept alive by DBE
+      // (referenced-label preservation) and the dominator validation tolerates its missing
+      // predecessor (HasTrap relaxation). Adding a successor edge here would instead give a
+      // non-terminator block >1 successors and fail CFG validation. We only diagnose a missing target.
+      if OpIn(Instr.OpCode, [ssaOnError, ssaResumeLabel]) and (Instr.Src1.Kind = svkLabel) then
+      begin
+        TargetLabel := Instr.Src1.LabelName;
+        if not Assigned(FProgram.FindBlock(TargetLabel)) then
+        begin
+          if (Copy(TargetLabel, 1, 6) = 'LABEL_') then
+            raise Exception.CreateFmt('Undefined error-handler label: %s', [Copy(TargetLabel, 7, MaxInt)])
+          else if (Copy(TargetLabel, 1, 5) = 'LINE_') then
+            raise Exception.CreateFmt('Undefined error-handler line: %s', [Copy(TargetLabel, 6, MaxInt)]);
+        end;
+      end;
     end;
   end;
 
@@ -14094,6 +14112,13 @@ var
 begin
   if Node = nil then Exit;
 
+  // MODERN (FreeBASIC, no line numbers): stamp each statement's physical source line into
+  // FCurrentLineNumber so emitted instructions carry it in the source map. This makes ERL and
+  // RESUME NEXT work (both rely on GetSourceLine / FindPCAfterLine). CLASSIC keeps using the
+  // BASIC line numbers set by antLineNumber below.
+  if FModernMode and (Node.SourceLine > 0) then
+    FCurrentLineNumber := Node.SourceLine;
+
   // Handle line numbers
   if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antLineNumber) then
   begin
@@ -14588,14 +14613,31 @@ begin
     end;
     antResume:
     begin
-      // RESUME [line] - continue at error line or specified line
+      // RESUME [NEXT | <line> | <label> | 0] - continue after an error
       if Node.ChildCount > 0 then
       begin
-        // RESUME <line> - jump to specific line
-        ProcessExpression(Node.GetChild(0), ExprResult);
-        LineNumReg := EnsureIntRegister(ExprResult);
-        EmitInstruction(ssaResume, MakeSSAValue(svkNone), LineNumReg,
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        if Node.GetChild(0).NodeType = antIdentifier then
+        begin
+          // FreeBASIC: RESUME <label> - jump to a named label (label -> resolved PC in Immediate)
+          EmitInstruction(ssaResumeLabel, MakeSSAValue(svkNone),
+                         MakeSSALabel(JumpLabelName(Node.GetChild(0))),
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else
+        begin
+          ProcessExpression(Node.GetChild(0), ExprResult);
+          // RESUME 0 == plain RESUME (continue at the faulting statement)
+          if (ExprResult.Kind = svkConstInt) and (ExprResult.ConstInt = 0) then
+            EmitInstruction(ssaResume, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                           MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+          else
+          begin
+            // RESUME <line> - jump to a specific classic line number
+            LineNumReg := EnsureIntRegister(ExprResult);
+            EmitInstruction(ssaResume, MakeSSAValue(svkNone), LineNumReg,
+                           MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+        end;
       end
       else
       begin
@@ -14603,6 +14645,38 @@ begin
         EmitInstruction(ssaResume, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
+    end;
+    antOnError:
+    begin
+      // ON [LOCAL] ERROR GOTO <label|0>
+      // Child[0] = target: an identifier (label) installs a label-based handler;
+      // a numeric 0 disables; a positive number is a classic line-number handler (reuse TRAP).
+      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+      begin
+        // Label-based handler (FreeBASIC MODERN). Src1 carries the handler label ->
+        // resolved to the handler PC in Immediate (jump fixup, like @sub / GOTO).
+        EmitInstruction(ssaOnError, MakeSSAValue(svkNone),
+                       MakeSSALabel(JumpLabelName(Node.GetChild(0))),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if Node.ChildCount >= 1 then
+      begin
+        // Numeric target: 0 disables, positive selects a classic line-number handler.
+        ProcessExpression(Node.GetChild(0), ExprResult);
+        if ExprResult.Kind = svkConstInt then
+          EmitInstruction(ssaTrap, MakeSSAValue(svkNone), ExprResult,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else
+        begin
+          LineNumReg := EnsureIntRegister(ExprResult);
+          EmitInstruction(ssaTrap, MakeSSAValue(svkNone), LineNumReg,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+      end
+      else
+        // ON ERROR GOTO with no target -> disable
+        EmitInstruction(ssaTrap, MakeSSAValue(svkNone), MakeSSAConstInt(0),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
     antResumeNext:
     begin

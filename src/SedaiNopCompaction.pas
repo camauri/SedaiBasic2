@@ -121,7 +121,9 @@ begin
   case OpCode of
     Ord(bcJump), Ord(bcJumpIfZero), Ord(bcJumpIfNotZero), Ord(bcCall), Ord(bcCallSub),
     // M5.2: bcLoadProcAddr's Immediate is a SUB entry PC; remap it when instructions shift, like a call target.
-    Ord(bcLoadProcAddr):
+    Ord(bcLoadProcAddr),
+    // FreeBASIC error handling: bcOnError / bcResumeLabel Immediate is a handler/target PC; remap on shift.
+    Ord(bcOnError), Ord(bcResumeLabel):
       Result := True;
     // Fused compare-and-branch (Int)
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt:

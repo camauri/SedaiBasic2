@@ -220,6 +220,9 @@ const
   bcTrap            = bcGroupCore + 90;  // TRAP linenum: Set error handler line
   bcResume          = bcGroupCore + 91;  // RESUME: Continue after error at error line
   bcResumeNext      = bcGroupCore + 92;  // RESUME NEXT: Continue after error at next statement
+  // FreeBASIC label-based error handling (Immediate = resolved handler/target PC).
+  bcOnError         = bcGroupCore + 135; // ON ERROR GOTO label: set TrapPC directly from Immediate
+  bcResumeLabel     = bcGroupCore + 136; // RESUME label: jump to Immediate, leave error handler
   bcModFloat        = bcGroupCore + 93;  // Float modulo (A - Floor(A/B) * B)
   bcFrame           = bcGroupCore + 94;  // FRAME [fps]: Wait for frame sync (default 60fps)
   // SUB/FUNCTION call frames (M2). v1: Immediate = procedure entry PC (resolved via the

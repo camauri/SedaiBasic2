@@ -325,6 +325,8 @@ type
     ssaTrap,            // TRAP linenum: Set error handler
     ssaResume,          // RESUME: Continue after error at error line
     ssaResumeNext,      // RESUME NEXT: Continue after error at next statement
+    ssaOnError,         // ON ERROR GOTO label: Src1 = handler label -> resolved PC in Immediate
+    ssaResumeLabel,     // RESUME label: Src1 = target label -> resolved PC in Immediate
     // Web operations (WEB_MODE only)
     {$IFDEF WEB_MODE}
     ssaWebGetParam,     // GET$("nome") - HTML-escaped parameter

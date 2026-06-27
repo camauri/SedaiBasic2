@@ -3444,6 +3444,23 @@ begin
         end;
         // If not in error handler, just continue
       end;
+    bcOnError:
+      begin
+        // ON ERROR GOTO <label> - install a label-based error handler.
+        // Immediate = resolved handler PC; TrapLine = -2 marks "label handler, PC pre-resolved".
+        Ctx.TrapPC := Instr.Immediate;
+        Ctx.TrapLine := -2;
+      end;
+    bcResumeLabel:
+      begin
+        // RESUME <label> - resume at a named label (Immediate = target PC)
+        if Ctx.InErrorHandler then
+        begin
+          Ctx.PC := Instr.Immediate;
+          Ctx.InErrorHandler := False;
+          Exit;  // Don't increment PC - we already set it
+        end;
+      end;
     bcNop: ;
     bcClear: ClearAllVariables;
     // DATA/READ/RESTORE

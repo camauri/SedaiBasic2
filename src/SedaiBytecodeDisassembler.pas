@@ -519,6 +519,10 @@ begin
       Line := Format('%4d: %-20s', [Index, 'Resume']);
     bcResumeNext:
       Line := Format('%4d: %-20s', [Index, 'ResumeNext']);
+    bcOnError:
+      Line := Format('%4d: %-20s ->%d', [Index, 'OnError', Instr.Immediate]);
+    bcResumeLabel:
+      Line := Format('%4d: %-20s ->%d', [Index, 'ResumeLabel', Instr.Immediate]);
     bcDataAdd:
       Line := Format('%4d: %-20s type=%d, Imm=%d', [Index, 'DataAdd', Instr.Src1, Instr.Immediate]);
     bcDataReadInt:

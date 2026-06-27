@@ -115,6 +115,7 @@ type
     antTrap,              // TRAP statement (error handler: TRAP linenum)
     antResume,            // RESUME statement (continue after error)
     antResumeNext,        // RESUME NEXT statement (continue after error at next statement)
+    antOnError,           // ON [LOCAL] ERROR GOTO label (FreeBASIC label-based error handler)
     antRem,               // REM statement
 
     // === CONTROL FLOW ===

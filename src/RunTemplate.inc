@@ -974,6 +974,26 @@ begin
             else
               Inc(CurPC);
           end;
+        bcOnError:
+          begin
+            // ON ERROR GOTO <label> - install a label-based error handler.
+            // Immediate = resolved handler PC; TrapLine = -2 marks "label handler, PC pre-resolved".
+            Ctx.TrapPC := Instr.Immediate;
+            Ctx.TrapLine := -2;
+            Inc(CurPC);
+          end;
+        bcResumeLabel:
+          begin
+            // RESUME <label> - resume at a named label (Immediate = target PC)
+            if Ctx.InErrorHandler then
+            begin
+              CurPC := Instr.Immediate;
+              Ctx.InErrorHandler := False;
+              System.Continue;  // Jump to target PC immediately
+            end
+            else
+              Inc(CurPC);
+          end;
 
         // File and system operations - fall back to slow path
         bcLoad, bcSave, bcVerify, bcBload, bcBsave, bcBoot,
@@ -1010,8 +1030,10 @@ begin
     on E: Exception do
     begin
       // Check if a TRAP handler is set and we're not already in an error handler
-      // (to prevent infinite recursion if exception occurs during error handling)
-      if (Ctx.TrapLine > 0) and (not Ctx.InErrorHandler) then
+      // (to prevent infinite recursion if exception occurs during error handling).
+      // TrapLine > 0: classic line-number handler (TRAP / ON ERROR GOTO <line>).
+      // TrapLine = -2: FreeBASIC label-based handler (ON ERROR GOTO <label>); TrapPC pre-resolved.
+      if ((Ctx.TrapLine > 0) or (Ctx.TrapLine = -2)) and (not Ctx.InErrorHandler) then
       begin
         // Save error info for EL, ER, ERR$ variables
         Ctx.LastErrorLine := FProgram.GetSourceLine(CurPC);
@@ -1036,8 +1058,10 @@ begin
 
         Ctx.LastErrorMessage := E.Message;
 
-        // Find PC for trap line number
-        Ctx.TrapPC := FProgram.FindPCForLine(Ctx.TrapLine);
+        // Resolve the handler PC. Line-based: look up the line; label-based (-2): TrapPC is
+        // already the resolved handler PC set by bcOnError.
+        if Ctx.TrapLine > 0 then
+          Ctx.TrapPC := FProgram.FindPCForLine(Ctx.TrapLine);
 
         if Ctx.TrapPC >= 0 then
         begin

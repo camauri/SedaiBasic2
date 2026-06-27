@@ -920,7 +920,9 @@ begin
     for j := 0 to Block.Instructions.Count - 1 do
     begin
       Instr := Block.Instructions[j];
-      if Instr.OpCode = ssaTrap then
+      // ssaOnError (FreeBASIC ON ERROR GOTO label) installs a dynamically-invoked handler too,
+      // so its handler block may legitimately have no static predecessor — relax like TRAP.
+      if (Instr.OpCode = ssaTrap) or (Instr.OpCode = ssaOnError) then
       begin
         HasTrap := True;
         Break;

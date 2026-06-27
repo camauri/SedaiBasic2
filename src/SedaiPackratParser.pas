@@ -1083,7 +1083,7 @@ begin
     end;
     Expression := CreateBinaryOpNode(OpType, LeftSide.Clone, Expression,
                                      TLexerToken.CreateSimple(OpType, OpSym));
-    Result := TASTNode.Create(antAssignment);
+    Result := TASTNode.Create(antAssignment, SavedToken);
     Result.AddChild(LeftSide);
     Result.AddChild(Expression);
     DoNodeCreated(Result);
@@ -1115,7 +1115,7 @@ begin
     end;
     Expression := CreateBinaryOpNode(OpType, LeftSide.Clone, Expression,
                                      TLexerToken.CreateSimple(OpType, OpSym));
-    Result := TASTNode.Create(antAssignment);
+    Result := TASTNode.Create(antAssignment, SavedToken);
     Result.AddChild(LeftSide);
     Result.AddChild(Expression);
     DoNodeCreated(Result);
@@ -1154,7 +1154,7 @@ begin
     Exit;
   end;
 
-  Result := TASTNode.Create(antAssignment);
+  Result := TASTNode.Create(antAssignment, SavedToken);
   Result.AddChild(LeftSide);
   Result.AddChild(Expression);
   DoNodeCreated(Result);
@@ -3227,10 +3227,44 @@ function TPackratParser.ParseConditionalJumpStatement: TASTNode;
 var
   Expression, TargetList, TargetNode: TASTNode;
   Token, JumpToken: TLexerToken;
-  IsGosub: Boolean;
+  IsGosub, IsLocal: Boolean;
 begin
   Token := Context.CurrentToken;
   Context.Advance; // Consume ON
+
+  // FreeBASIC/QB error handling: ON [LOCAL] ERROR GOTO <label|0>.
+  // LOCAL is accepted and treated as a global handler in v1 (no per-procedure scoping).
+  // ERROR/LOCAL are matched by token value (not reserved keywords).
+  IsLocal := False;
+  if UpperCase(Context.CurrentToken.Value) = 'LOCAL' then
+  begin
+    IsLocal := True;
+    Context.Advance; // consume LOCAL
+  end;
+  if UpperCase(Context.CurrentToken.Value) = kERROR then
+  begin
+    Context.Advance; // consume ERROR
+    Result := TASTNode.Create(antOnError, Token);
+    if IsLocal then
+      Result.Value := 'LOCAL';
+    // Expect GOTO (matched by value to be robust to token classification)
+    if UpperCase(Context.CurrentToken.Value) = kGOTO then
+    begin
+      Context.Advance; // consume GOTO
+      TargetNode := ParseExpression;  // label identifier, or line number (0 disables)
+      if Assigned(TargetNode) then
+        Result.AddChild(TargetNode);
+    end
+    else
+    begin
+      HandleError('Expected GOTO after ON ERROR', Context.CurrentToken);
+      Result.Free;
+      Result := nil;
+      Exit;
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
 
   // Parse expression (the selector value)
   Expression := ParseExpression;
@@ -4598,13 +4632,21 @@ begin
       Result := TASTNode.Create(antResumeNext, Token);
       Context.Advance; // Consume NEXT
     end
-    // Check for line number (RESUME <line>)
+    // Check for line number (RESUME <line>) — RESUME 0 means resume at the faulting statement
     else if Context.Check(ttNumber) then
     begin
       Result := TASTNode.Create(antResume, Token);
       LineNumNode := ParseExpression;
       if Assigned(LineNumNode) then
         Result.AddChild(LineNumNode);
+    end
+    // FreeBASIC: RESUME <label> — resume at a named label (MODERN, no line numbers)
+    else if Context.Check(ttIdentifier) then
+    begin
+      Result := TASTNode.Create(antResume, Token);
+      LineNumNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+      Context.Advance; // consume label
+      Result.AddChild(LineNumNode);
     end
     else
     begin
@@ -6069,10 +6111,46 @@ function TPackratParser.ParseOnStatement: TASTNode;
 var
   Expression, Target: TASTNode;
   Token: TLexerToken;
+  IsLocal: Boolean;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antStatement, Token);
   Context.Advance; // Consume ON
+
+  // FreeBASIC/QB error handling: ON [LOCAL] ERROR GOTO <label|0>.
+  // LOCAL is accepted and treated as a global handler in v1 (no per-procedure scoping).
+  // Detected by token value (ERROR/LOCAL are not reserved keywords).
+  IsLocal := False;
+  if UpperCase(Context.CurrentToken.Value) = 'LOCAL' then
+  begin
+    IsLocal := True;
+    Context.Advance; // consume LOCAL
+  end;
+  if UpperCase(Context.CurrentToken.Value) = kERROR then
+  begin
+    Context.Advance; // consume ERROR
+    Result.Free;
+    Result := TASTNode.Create(antOnError, Token);
+    if IsLocal then
+      Result.Value := 'LOCAL';
+    // Expect GOTO (matched by value to be robust to token classification)
+    if UpperCase(Context.CurrentToken.Value) = kGOTO then
+    begin
+      Context.Advance; // consume GOTO
+      Target := ParseExpression;  // label identifier, or line number (0 disables)
+      if Assigned(Target) then
+        Result.AddChild(Target);
+    end
+    else
+    begin
+      HandleError('Expected GOTO after ON ERROR', Context.CurrentToken);
+      Result.Free;
+      Result := nil;
+      Exit;
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
 
   // Parse expression
   Expression := ParseExpression;

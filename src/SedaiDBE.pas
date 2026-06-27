@@ -76,6 +76,7 @@ type
     FProgram: TSSAProgram;
     FReachable: array of Boolean;  // [BlockIdx] = IsReachable
     FReferencedLines: specialize TDictionary<Integer, Boolean>;  // Line numbers referenced by instructions
+    FReferencedLabels: TStringList;  // Block labels referenced by ON ERROR GOTO / RESUME <label>
     FRemovedCount: Integer;
 
     { Try to resolve a register value to its constant definition }
@@ -119,11 +120,16 @@ begin
   FProgram := Prog;
   FRemovedCount := 0;
   FReferencedLines := specialize TDictionary<Integer, Boolean>.Create;
+  FReferencedLabels := TStringList.Create;
+  FReferencedLabels.Sorted := True;
+  FReferencedLabels.Duplicates := dupIgnore;
+  FReferencedLabels.CaseSensitive := False;
 end;
 
 destructor TDeadBlockElimination.Destroy;
 begin
   FReferencedLines.Free;
+  FReferencedLabels.Free;
   inherited;
 end;
 
@@ -191,6 +197,7 @@ begin
     Note: GOTO and GOSUB use block labels which are already in CFG edges. }
 
   FReferencedLines.Clear;
+  FReferencedLabels.Clear;
 
   for i := 0 to FProgram.Blocks.Count - 1 do
   begin
@@ -198,6 +205,12 @@ begin
     for j := 0 to Block.Instructions.Count - 1 do
     begin
       Instr := Block.Instructions[j];
+
+      // FreeBASIC error handling: ON ERROR GOTO <label> / RESUME <label> reference a block
+      // by its label name (Src1 = svkLabel). Keep that handler block even if no static CFG
+      // edge reaches it (it is entered dynamically, like a TRAP handler).
+      if OpIn(Instr.OpCode, [ssaOnError, ssaResumeLabel]) and (Instr.Src1.Kind = svkLabel) then
+        FReferencedLabels.Add(Instr.Src1.LabelName);
 
       case Instr.OpCode of
         // TRAP <line> - error handler target
@@ -264,8 +277,15 @@ var
 begin
   Result := False;
 
-  // Extract line number from block label (e.g., "LINE_100" -> 100)
+  // FreeBASIC error handling: block targeted by ON ERROR GOTO <label> / RESUME <label>.
   LabelName := Block.LabelName;
+  if (LabelName <> '') and (FReferencedLabels.IndexOf(LabelName) >= 0) then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  // Extract line number from block label (e.g., "LINE_100" -> 100)
   if LabelName.StartsWith('LINE_') then
   begin
     if TryStrToInt(Copy(LabelName, 6, Length(LabelName) - 5), LineNum) then

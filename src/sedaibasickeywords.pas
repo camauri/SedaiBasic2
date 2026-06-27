@@ -102,6 +102,7 @@ const
   kLSET    = 'LSET';       // FreeBASIC/QBasic: left-justify a string into a fixed-length buffer
   kRSET    = 'RSET';       // FreeBASIC/QBasic: right-justify a string into a fixed-length buffer
   kGOTO    = 'GOTO';
+  kERROR   = 'ERROR';   // FreeBASIC: ON [LOCAL] ERROR GOTO (not a reserved keyword; matched by value)
   kGO_TO   = 'GO'; // GO + TO constraint
   kGOSUB   = 'GOSUB';
   kRETURN  = 'RETURN';
@@ -444,6 +445,8 @@ const
   kKEY	   = 'KEY';
   kEL      = 'EL';
   kER      = 'ER';
+  kERR     = 'ERR';     // FreeBASIC: last error code (alias of ER)
+  kERL     = 'ERL';     // FreeBASIC: last error source line (alias of EL)
   kERRS    = 'ERR$';
   kGETN    = 'GET#';
   kGO64    = 'GO64';

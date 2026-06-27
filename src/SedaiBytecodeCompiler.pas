@@ -266,6 +266,8 @@ begin
     ssaTrap: Result := bcTrap;
     ssaResume: Result := bcResume;
     ssaResumeNext: Result := bcResumeNext;
+    ssaOnError: Result := bcOnError;
+    ssaResumeLabel: Result := bcResumeLabel;
     ssaJump: Result := bcJump;
     ssaJumpIfZero: Result := bcJumpIfZero;
     ssaJumpIfNotZero: Result := bcJumpIfNotZero;
@@ -1647,6 +1649,11 @@ begin
   // M5.2: ssaLoadProcAddr (@sub) carries the procedure entry label in Src1; resolve it to the
   // entry PC into the Immediate field, exactly like a call target.
   if (Instr.OpCode = ssaLoadProcAddr) and (Instr.Src1.Kind = svkLabel) then
+    AddJumpFixup(BCIndex, Instr.Src1.LabelName);
+
+  // FreeBASIC error handling: ON ERROR GOTO <label> (ssaOnError) and RESUME <label>
+  // (ssaResumeLabel) carry the target label in Src1; resolve it to the target PC into Immediate.
+  if OpIn(Instr.OpCode, [ssaOnError, ssaResumeLabel]) and (Instr.Src1.Kind = svkLabel) then
     AddJumpFixup(BCIndex, Instr.Src1.LabelName);
 end;
 

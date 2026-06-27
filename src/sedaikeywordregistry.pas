@@ -1962,6 +1962,8 @@ begin
  RegisterKeyword(kDSS, ttSpecialVariable, 'Get disk status message',       kcReservedVariables);
  RegisterKeyword(kEL,  ttSpecialVariable, 'Return last error line',        kcReservedVariables);
  RegisterKeyword(kER,  ttSpecialVariable, 'Return last error code',        kcReservedVariables);
+ RegisterKeyword(kERR, ttSpecialVariable, 'Return last error code (FreeBASIC, alias of ER)', kcReservedVariables);
+ RegisterKeyword(kERL, ttSpecialVariable, 'Return last error source line (FreeBASIC, alias of EL)', kcReservedVariables);
  RegisterKeyword(kST,  ttSpecialVariable, 'Get I/O status byte',           kcReservedVariables);
  RegisterKeyword(kTI,  ttSpecialVariable, 'Get time elapse from power on', kcReservedVariables);
  RegisterKeyword(kTIS, ttSpecialVariable, 'Get/set 24h clock',             kcReservedVariables);

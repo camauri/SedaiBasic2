@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 420 / 643 implemented (65%)** (+ 4 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 423 / 643 implemented (66%)** (+ 4 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **420 (73%)** are implemented. See the
+**572 applicable** keywords, **423 (74%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1876,7 +1876,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Err` | ✗ |  |
+| `Err` | ✓ | Error number of the last error (alias of `ER`/`ERR`). |
 
 ##### Default error handling
 
@@ -2120,20 +2120,20 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ERL` | ✗ | Gets the line in source code where the error occurred. |
-| `ERFN` | ✗ | Gets the name of the function where the error occurred. |
-| `ERMN` | ✗ | Gets the name of the source file where the error occurred. |
-| `ERR` | ✗ | Gets the error number of the last error that occurred. |
+| `ERL` | ✓ | Source line where the error occurred (alias of `EL`; physical source line in MODERN). |
+| `ERFN` | ✗ | Gets the name of the function where the error occurred. (Deferred: needs a per-PC function map.) |
+| `ERMN` | ✗ | Gets the name of the source file where the error occurred. (Deferred: needs a per-PC file map.) |
+| `ERR` | ✓ | Error number of the last error that occurred (alias of `ER`). |
 | `ERROR` | ✗ | Generates an error using an error number. |
 
 #### Handling Errors
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ON ERROR` | ✓ | Sets a global error handler using a label. |
-| `ON LOCAL ERROR` | ✓ | Sets a local error handler using a label. |
-| `RESUME` | ✓ | Resumes execution at the line where the error occurred. |
-| `RESUME NEXT` | ✓ | Resumes execution at the line after where the error occurred. |
+| `ON ERROR` | ✓ | Sets a global error handler using a label: `ON ERROR GOTO <label>` (MODERN/FreeBASIC) or a line number (classic); `ON ERROR GOTO 0` disables. Extends the existing TRAP mechanism. |
+| `ON LOCAL ERROR` | ✓ | `ON LOCAL ERROR GOTO <label>`; `LOCAL` is accepted and treated as a global handler in v1 (no per-procedure scoping). |
+| `RESUME` | ✓ | Resumes at the faulting statement (`RESUME` / `RESUME 0`), or at a named label / line (`RESUME <label>`). |
+| `RESUME NEXT` | ✓ | Resumes at the statement after the one that caused the error. |
 
 ### File I/O Functions
 
