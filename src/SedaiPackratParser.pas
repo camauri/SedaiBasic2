@@ -2292,7 +2292,7 @@ var
   Token, NameTok, FieldTok: TLexerToken;
   FieldNode, TypeNode: TASTNode;
   PrevIdx: Integer;
-  FieldTypeName: string;
+  FieldTypeName, TokU: string;
 begin
   // TYPE name <newline> field AS type <newline> ... END TYPE
   // Each field node is antIdentifier(fieldName) with one child antIdentifier(typeName).
@@ -2330,6 +2330,24 @@ begin
     if Context.Check(ttSeparStmt) then begin Context.Advance; Continue; end;
     if AtEndType then Break;
     PrevIdx := Context.CurrentIndex;
+    TokU := UpperCase(VarToStr(Context.CurrentToken.Value));
+    // FreeBASIC access specifiers inside a TYPE: "Public:" / "Private:" / "Protected:". Access is not
+    // enforced (v1) — recognize and skip the label so it is not mistaken for a field.
+    if ((TokU = 'PUBLIC') or (TokU = 'PRIVATE') or (TokU = 'PROTECTED')) and
+       Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttSeparStmt) then
+    begin
+      Context.Advance;                              // specifier
+      Context.Advance;                              // ':'
+      Continue;
+    end;
+    // FreeBASIC in-TYPE method declaration: "Declare [Virtual|Abstract|Static] Sub|Function ...". Methods
+    // are defined out-of-line (SUB Type.method); skip the declaration line (consume to end of statement).
+    if TokU = 'DECLARE' then
+    begin
+      while (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) and (not AtEndType) do
+        Context.Advance;
+      Continue;
+    end;
     // A field name may be an identifier or a reserved word (e.g. LEN, TYPE, NAME): accept any
     // alphabetic token as the field name here.
     if Context.Check(ttIdentifier) or

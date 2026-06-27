@@ -1311,21 +1311,21 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `DESTRUCTOR` | ✓ | Member procedure auto-called when an instance goes out of scope, in reverse construction order: procedure-local DIM'd UDTs, block-scoped DIMs (per loop iteration), module globals (program end / `END` in a proc), nested members, and BYVAL-param copies (V5/V5b/V5c/V5d). |
 | `FUNCTION` | ✓ | Declares or defines a member procedure returning a value |
 | `OPERATOR` | ✓ | Overloaded operator `OPERATOR <sym>(a AS T, b AS T) AS R` (binary, direct operands; resolved by left operand type) |
-| `OVERRIDE` | ✗ | Member method attribute that specifies that the method is expected to override a virtual method in the base user defined type |
+| `OVERRIDE` | ✓ | Accepted in an in-TYPE Declare; dispatch already works via runtime type-id (M4.3). |
 | `PROPERTY` | ✓ | Property getter/setter `PROPERTY Type.name() AS T` / `PROPERTY Type.name(v AS T)` (desugars to a method) |
 | `SUB` | ✓ | Declare or defines a member procedure |
 | `STATIC (Member)` | ✗ | Declares or defines a member procedure or variable is static |
-| `VIRTUAL` | ✗ | Member method attribute that declares that a member must have an implementation |
-| `ABSTRACT` | ✗ | Member method attribute that declares that a member must be implemented in a derived user defined type |
+| `VIRTUAL` | ✓ | Accepted in an in-TYPE Declare; dispatch already works via runtime type-id (M4.3). |
+| `ABSTRACT` | ✓ | Accepted in an in-TYPE Declare (no-body enforcement deferred). |
 | `CONST (Member)` | ✓ | Member method attribute that declares or defines that the method is readonly and does not modify the user defined types's data |
 
 ##### Member Access Control
 
 | Keyword | Status | Description |
 |---|---|---|
-| `PUBLIC: (Access Control)` | ✗ | Data and members in a user defined type have public visibility |
-| `PRIVATE: (Access Control)` | ✗ | Data and members in a user defined type have private visibility |
-| `PROTECTED: (Access Control)` | ✗ | Data and members in a user defined type have protected visibility |
+| `PUBLIC: (Access Control)` | ✓ | Parsed inside a TYPE; access not enforced (v1). |
+| `PRIVATE: (Access Control)` | ✓ | Parsed inside a TYPE; access not enforced (v1). |
+| `PROTECTED: (Access Control)` | ✓ | Parsed inside a TYPE; access not enforced (v1). |
 
 #### Standard Data Types
 
