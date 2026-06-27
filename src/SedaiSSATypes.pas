@@ -174,6 +174,7 @@ type
     ssaNarrowInt,    // B1.5: wrap/sign-extend int to a narrower width (Src1=int, Src3=width code)
     ssaNarrowSingle, // B1.5: round Double -> single precision (Dest/Src1 float)
     ssaShl, ssaShr,  // FreeBASIC bit shifts (integer)
+    ssaRandomize,    // RANDOMIZE: seed the RNG (Src1=seed reg, Immediate=1; or Immediate=0 = time-based)
     // Mutexes (M5.4, FB API): MutexCreate (Dest=int handle, no operands); Lock/Unlock/Destroy (Src1=handle reg).
     ssaMutexCreate, ssaMutexLock, ssaMutexUnlock, ssaMutexDestroy,
     // Condition variables (M5.4): CondCreate (Dest=int handle); CondWait (Src1=cond, Src2=mutex);

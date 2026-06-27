@@ -190,6 +190,8 @@ begin
       Line := Format('%4d: %-20s R%d', [Index, 'MutexUnlock', Instr.Src1]);
     bcMutexDestroy:
       Line := Format('%4d: %-20s R%d', [Index, 'MutexDestroy', Instr.Src1]);
+    bcRandomize:
+      Line := Format('%4d: %-20s seed=R%d imm=%d', [Index, 'Randomize', Instr.Src1, Instr.Immediate]);
     bcCondCreate:
       Line := Format('%4d: %-20s R%d = cond()', [Index, 'CondCreate', Instr.Dest]);
     bcCondWait:

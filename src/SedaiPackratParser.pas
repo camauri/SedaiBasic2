@@ -193,6 +193,8 @@ type
     function ParseTypeDecl: TASTNode;
     // UNION name / field AS type / ... / END UNION : record with overlapping same-bank fields.
     function ParseUnionDecl: TASTNode;
+    // RANDOMIZE [seed] : seed the RNG (the optional seed expression becomes child0).
+    function ParseRandomizeStatement: TASTNode;
     // Shared body for TYPE / UNION (IsUnion tags the node so SSA overlaps same-bank fields).
     function ParseRecordDecl(IsUnion: Boolean): TASTNode;
     function AtEndType: Boolean;
@@ -767,6 +769,7 @@ begin
     ttSharedDecl: Result := ParseSharedError;   // SHARED is only the DIM SHARED modifier, not a statement
     ttTypeDecl: Result := Memoize('TypeDecl', @ParseTypeDecl);
     ttUnionDecl: Result := Memoize('UnionDecl', @ParseUnionDecl);
+    ttRandomize: Result := Memoize('RandomizeStatement', @ParseRandomizeStatement);
     ttWithBlock: Result := ParseWith;
     ttNamespaceBlock: Result := Memoize('NamespaceDecl', @ParseNamespaceDecl);
     ttScopeBlock: Result := Memoize('ScopeBlock', @ParseScopeBlock);
@@ -2410,6 +2413,33 @@ begin
     if Context.CurrentIndex = PrevIdx then Break;   // no progress guard
   end;
   ConsumeEndType;
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseRandomizeStatement: TASTNode;
+// RANDOMIZE [seed] : seed the RNG. The optional seed expression is child0; with no seed the
+// generator is seeded from the system timer. A trailing ", algorithm" argument (FreeBASIC) is
+// accepted and ignored (we have a single RNG).
+var
+  Token: TLexerToken;
+  SeedExpr: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Context.Advance;                                  // consume RANDOMIZE
+  Result := TASTNode.CreateWithValue(antRandomize, kRANDOMIZE, Token);
+  // A seed expression may follow on the same statement; stop at end-of-line/statement separator.
+  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+  begin
+    SeedExpr := FExpressionParser.ParseExpression;
+    if Assigned(SeedExpr) then Result.AddChild(SeedExpr);
+    // Optional ", algorithm" — parse and discard (single RNG, no algorithm selection).
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;                              // ','
+      if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+        FExpressionParser.ParseExpression.Free;     // algorithm operand (discarded)
+    end;
+  end;
   DoNodeCreated(Result);
 end;
 

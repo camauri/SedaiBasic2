@@ -1621,6 +1621,7 @@ begin
  RegisterKeyword(kCALL,     ttCallSub,        'Call a SUB',         kcProcedures);
  RegisterKeyword(kTYPE,     ttTypeDecl,       'User-defined type',  kcProcedures);
  RegisterKeyword(kUNION,    ttUnionDecl,      'Union type (overlapping fields)', kcProcedures);
+ RegisterKeyword(kRANDOMIZE, ttRandomize,     'Seed the random number generator', kcMathFunctions);
  RegisterKeyword(kAS,       ttAsType,         'Type annotation',    kcProcedures);
  RegisterKeyword(kWITH,     ttWithBlock,      'With block',         kcCodeBlockConstructs);
  RegisterKeyword(kNAMESPACE,ttNamespaceBlock, 'Namespace block (FreeBASIC)', kcCodeBlockConstructs);

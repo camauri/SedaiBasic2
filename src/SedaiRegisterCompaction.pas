@@ -398,6 +398,8 @@ begin
     bcMutexLock, bcMutexUnlock, bcMutexDestroy,
     // Condition variables (M5.4): Wait/Signal/Broadcast/Destroy Src1 = cond handle reg.
     bcCondWait, bcCondSignal, bcCondBroadcast, bcCondDestroy,
+    // RANDOMIZE: Src1 = seed reg (Immediate flags seed vs time-based).
+    bcRandomize,
 
     // === GROUP 0: Core VM operations ===
     // Int arithmetic

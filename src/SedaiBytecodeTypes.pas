@@ -284,6 +284,7 @@ const
   // FreeBASIC bit shifts (integer): Dest = Src1 shifted by Src2 bits.
   bcShl              = bcGroupCore + 131;  // SHL: shift left
   bcShr              = bcGroupCore + 132;  // SHR: arithmetic shift right
+  bcRandomize        = bcGroupCore + 134;  // RANDOMIZE: seed the RNG (Src1=seed reg; Immediate=1 seed / 0 time-based)
   // Mutexes (M5.4, FreeBASIC API), thin wrappers over TRTLCriticalSection. bcMutexCreate writes a
   // fresh mutex handle into an int register (Dest); Lock/Unlock/Destroy take a handle reg (Src1).
   bcMutexCreate      = bcGroupCore + 117;

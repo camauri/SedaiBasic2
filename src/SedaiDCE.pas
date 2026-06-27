@@ -279,6 +279,8 @@ begin
     ssaMutexCreate, ssaMutexLock, ssaMutexUnlock, ssaMutexDestroy,
     // Condition variables (M5.4): create/wait/signal/broadcast/destroy all have side effects.
     ssaCondCreate, ssaCondWait, ssaCondSignal, ssaCondBroadcast, ssaCondDestroy,
+    // RANDOMIZE mutates RNG state — a side effect; never elide it.
+    ssaRandomize,
     // Transfer-register moves carry args/result across the call; never elide them.
     ssaXferStoreInt, ssaXferStoreFloat, ssaXferStoreString,
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString,

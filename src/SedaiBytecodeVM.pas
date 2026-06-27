@@ -2259,7 +2259,8 @@ begin
         // Int dest, int sources
         bcLoadConstInt, bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
         bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
-        bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr:
+        bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
+        bcRandomize:  // RANDOMIZE: Src1 = seed reg (Dest unused = 0)
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
@@ -3092,6 +3093,8 @@ begin
     bcBitwiseNot: Ctx.IntRegs[Instr.Dest] := not Ctx.IntRegs[Instr.Src1];
     bcShl: Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] shl Ctx.IntRegs[Instr.Src2];  // SHL
     bcShr: Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] shr Ctx.IntRegs[Instr.Src2];  // SHR (logical)
+    bcRandomize:  // RANDOMIZE: seed the RNG (Immediate=1 -> explicit seed in Src1; 0 -> time-based)
+      if Instr.Immediate <> 0 then RandSeed := Cardinal(Ctx.IntRegs[Instr.Src1]) else Randomize;
     // Control flow
     bcJump: Ctx.PC := Instr.Immediate - 1;
     bcJumpIfZero:

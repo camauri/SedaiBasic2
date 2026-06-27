@@ -817,6 +817,11 @@ begin
             IntRegs[Instr.Dest] := IntRegs[Instr.Src1] shr IntRegs[Instr.Src2];
             Inc(CurPC);
           end;
+        bcRandomize:  // RANDOMIZE: seed the RNG (Immediate=1 -> explicit seed in Src1; 0 -> time-based)
+          begin
+            if Instr.Immediate <> 0 then RandSeed := Cardinal(IntRegs[Instr.Src1]) else Randomize;
+            Inc(CurPC);
+          end;
 
         // NOTE: Graphics operations (bcGraphic*) are now handled by Group 10 (ExecuteGraphicsOp)
         // NOTE: Sound operations (bcSound*) are now handled by Group 11 (ExecuteSoundOp)

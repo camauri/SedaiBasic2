@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 357 / 643 implemented (55%)** (+ 3 partial); see the
+**FreeBASIC keyword set — 358 / 643 implemented (56%)** (+ 3 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -2216,7 +2216,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `RANDOMIZE` | ✗ | Seeds the random number generator used by Rnd. |
+| `RANDOMIZE` | ✓ | Seeds the RNG used by `RND`: `RANDOMIZE seed` sets a deterministic seed (same seed reproduces the same sequence); bare `RANDOMIZE` seeds from the system timer. A trailing algorithm argument is accepted and ignored. |
 | `RND` | ✓ | Returns a random Double in the range [0, 1). |
 
 ### Memory Functions

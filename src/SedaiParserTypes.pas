@@ -51,6 +51,7 @@ type
     antThreadWait,        // THREADWAIT handle: join a worker thread (statement); child0 = handle expr
     antThreadSelf,        // THREADSELF(): current thread handle (expr → int), no children
     antThreadDetach,      // THREADDETACH handle: detach a worker (statement); child0 = handle expr
+    antRandomize,         // RANDOMIZE [seed]: seed the RNG (statement); child0 = seed expr (optional)
     antMutexCreate,       // MUTEXCREATE(): create a mutex (expr → int handle), no children
     antMutexLock,         // MUTEXLOCK handle: acquire a mutex (statement); child0 = handle expr
     antMutexUnlock,       // MUTEXUNLOCK handle: release a mutex (statement); child0 = handle expr

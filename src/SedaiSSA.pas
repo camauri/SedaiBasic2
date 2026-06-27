@@ -13905,6 +13905,26 @@ begin
                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
 
+    antRandomize:
+    begin
+      // RANDOMIZE [seed] — seed the RNG. With a seed expression: Src1 = seed reg, Immediate = 1.
+      // Without: seed from the system timer (Immediate = 0); Src1 holds a dummy 0 register so
+      // register compaction always sees a valid Src1.
+      if Node.ChildCount >= 1 then
+      begin
+        ProcessExpression(Node.GetChild(0), ExprResult);
+        ExprResult := EnsureIntRegister(ExprResult);
+        EmitInstruction(ssaRandomize, MakeSSAValue(svkNone), ExprResult,
+                        MakeSSAValue(svkNone), MakeSSAConstInt(1));
+      end
+      else
+      begin
+        ExprResult := EnsureIntRegister(MakeSSAConstInt(0));
+        EmitInstruction(ssaRandomize, MakeSSAValue(svkNone), ExprResult,
+                        MakeSSAValue(svkNone), MakeSSAConstInt(0));
+      end;
+    end;
+
     antMutexLock, antMutexUnlock, antMutexDestroy:
     begin
       // MUTEXLOCK/UNLOCK/DESTROY handle — operate on the mutex named by the int handle (child0).
