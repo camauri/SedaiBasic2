@@ -362,6 +362,8 @@ type
     procedure EmitArrayLen(ArgsNode: TASTNode; out Result: TSSAValue);
     // FreeBASIC short-circuit operators a ANDALSO b / a ORELSE b (lowered via the IIF/IF mechanism).
     procedure EmitShortCircuit(Node: TASTNode; out Result: TSSAValue);
+    // FreeBASIC RTTI: obj IS Type -> -1 if obj's runtime type is Type or a subtype, else 0.
+    procedure EmitIsCheck(ObjNode: TASTNode; const TypeName: string; out Result: TSSAValue);
     procedure ProcessForLoop(Node: TASTNode);
     procedure ProcessDoLoop(Node: TASTNode);
     procedure ProcessBlock(Node: TASTNode);
@@ -1446,6 +1448,12 @@ begin
          ((Node.Token.TokenType = ttOpAndAlso) or (Node.Token.TokenType = ttOpOrElse)) then
       begin
         EmitShortCircuit(Node, Result);
+        Exit;
+      end;
+      // FreeBASIC RTTI: obj IS Type. The right child is a type name (an identifier), not a value.
+      if (Node.ChildCount >= 2) and Assigned(Node.Token) and (Node.Token.TokenType = ttOpIs) then
+      begin
+        EmitIsCheck(Node.GetChild(0), VarToStr(Node.GetChild(1).Value), Result);
         Exit;
       end;
       // FreeBASIC raw pointer arithmetic: "p + n" / "p - n" (and "n + p") where p is a raw pointer.
@@ -5440,6 +5448,42 @@ begin
   Zero := EnsureIntRegister(MakeSSAConstInt(0));
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaCmpNeInt, Result, EnsureIntRegister(IifVal), Zero, MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.EmitIsCheck(ObjNode: TASTNode; const TypeName: string; out Result: TSSAValue);
+// obj IS Type (FreeBASIC RTTI). The set of concrete types satisfying "is-a Type" — Type itself plus
+// every descendant — is known at compile time, so this lowers to: tid = typeid(obj); result = OR over
+// {i : FUDTs[i] is-a Type} of (tid = i). No runtime hierarchy walk, no new opcodes. Yields -1/0.
+var
+  TU: string;
+  Handle, Tid, Acc, Idx, Cmp, NewAcc: TSSAValue;
+  i: Integer;
+  Matched: Boolean;
+begin
+  Result := MakeSSAConstInt(0);
+  TU := UpperCase(TypeName);
+  if FindUDT(TU) < 0 then Exit;                    // RHS is not a known type -> always 0
+  ProcessExpression(ObjNode, Handle);              // obj evaluates to its record handle (int)
+  Handle := EnsureIntRegister(Handle);
+  Tid := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRecordTypeId, Tid, Handle, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Matched := False;
+  Acc := MakeSSAValue(svkNone);
+  for i := 0 to High(FUDTs) do
+    if IsSubtypeOf(FUDTs[i].Name, TU) then
+    begin
+      Idx := EnsureIntRegister(MakeSSAConstInt(i));
+      Cmp := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaCmpEqInt, Cmp, Tid, Idx, MakeSSAValue(svkNone));   // (tid = i) -> -1/0
+      if not Matched then begin Acc := Cmp; Matched := True; end
+      else
+      begin
+        NewAcc := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaBitwiseOr, NewAcc, Acc, Cmp, MakeSSAValue(svkNone));
+        Acc := NewAcc;
+      end;
+    end;
+  if Matched then Result := Acc;                   // else no concrete type matches -> stays 0
 end;
 
 procedure TSSAGenerator.EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);

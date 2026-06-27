@@ -466,6 +466,7 @@ const
   kIMP   = 'IMP';        // FreeBASIC bitwise implication operator: (NOT a) OR b
   kANDALSO = 'ANDALSO';  // FreeBASIC short-circuit logical AND
   kORELSE  = 'ORELSE';   // FreeBASIC short-circuit logical OR
+  kIS      = 'IS';       // FreeBASIC RTTI operator: obj IS Type
 
   // SedaiBasic Options
   kOPTION = 'OPTION';

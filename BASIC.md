@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 409 / 643 implemented (64%)** (+ 4 partial); see the
+**FreeBASIC keyword set — 410 / 643 implemented (64%)** (+ 4 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1539,7 +1539,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `. (Member access)` | ✓ | Record field access `rec.field` (M3) |
 | `-> (Pointer to member access)` | ✓ | `p->field` member access through a UDT pointer/handle (equivalent to `p.field`). |
-| `IS (Run-time type information operator)` | ✗ |  |
+| `IS (Run-time type information operator)` | ✓ | `obj IS Type` → -1 if obj's runtime type is `Type` or a subtype of it, else 0. Lowered at compile time to a type-id check against `Type` and all its descendants (handles polymorphic/derived correctly). |
 
 #### Memory Operators
 

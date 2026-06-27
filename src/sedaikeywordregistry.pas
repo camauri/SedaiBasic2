@@ -1598,6 +1598,7 @@ begin
  RegisterKeyword(kIMP, ttOpImp, 'IMP operator (bitwise implication)', kcBitwiseOperators);
  RegisterKeyword(kANDALSO, ttOpAndAlso, 'ANDALSO operator (short-circuit AND)', kcBitwiseOperators);
  RegisterKeyword(kORELSE,  ttOpOrElse,  'ORELSE operator (short-circuit OR)',  kcBitwiseOperators);
+ RegisterKeyword(kIS,      ttOpIs,      'IS operator (runtime type check)',    kcBitwiseOperators);
  // Operatori avanzati (opzionali)
  //RegisterKeyword('NAND', ttBitwiseNAND, 'NAND operator', kcBitwiseOperators);
  //RegisterKeyword('NOR',  ttBitwiseNOR,  'NOR operator',  kcBitwiseOperators);

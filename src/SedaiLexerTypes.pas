@@ -93,6 +93,7 @@ type
     ttOpImp,                 // IMP (FreeBASIC bitwise implication: (NOT a) OR b)
     ttOpAndAlso,             // ANDALSO (FreeBASIC short-circuit logical AND)
     ttOpOrElse,              // ORELSE (FreeBASIC short-circuit logical OR)
+    ttOpIs,                  // IS (FreeBASIC RTTI: obj IS Type -> -1 if obj's runtime type is-a Type)
     ttOpDot,                 // . (member access: record.field)
     ttOpAt,                  // @ (proc-address prefix: @subname → entry PC, for Threadcreate)
     ttCompoundAssign,        // += -= *= /= ^= (FreeBASIC compound assignment; value = the operator symbol)
@@ -425,7 +426,7 @@ const
 
   // Operator tokens
   OPERATOR_TOKENS: TTokenTypeSet = [
-    ttOpAdd, ttOpSub, ttOpMul, ttOpDiv, ttOpPow, ttOpMod, ttOpEqv, ttOpImp, ttOpAndAlso, ttOpOrElse,
+    ttOpAdd, ttOpSub, ttOpMul, ttOpDiv, ttOpPow, ttOpMod, ttOpEqv, ttOpImp, ttOpAndAlso, ttOpOrElse, ttOpIs,
     ttOpEq, ttOpNeq, ttOpLt, ttOpGt, ttOpLe, ttOpGe,
     ttBitwiseOperator, ttOperator
   ];

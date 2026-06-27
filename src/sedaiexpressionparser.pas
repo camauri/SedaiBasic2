@@ -476,6 +476,8 @@ begin
   // ANDALSO). They parse as ordinary binary-op nodes; the SSA lowers them to short-circuit IFs.
   Context.SetParseRule(ttOpAndAlso, MakeInfixRule(@StaticParseBinaryOperator, precAndAlso));
   Context.SetParseRule(ttOpOrElse, MakeInfixRule(@StaticParseBinaryOperator, precOrElse));
+  // FreeBASIC IS (runtime type check): relational-level; RHS is a type name (an identifier).
+  Context.SetParseRule(ttOpIs, MakeInfixRule(@StaticParseBinaryOperator, precEquality));
 
   // Assignment
   Context.SetParseRule(ttDataAssignment, MakeInfixRule(@StaticParseAssignment, precAssignment));
