@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 316 / 643 implemented (49%)** (+ 3 partial); see the
+**FreeBASIC keyword set — 348 / 643 implemented (54%)** (+ 3 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1388,7 +1388,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `CAST and CPTR` | ✗ | Converts expressions between different types. |
+| `CAST and CPTR` | ✓ | `CAST(type, expr)` converts/reinterprets an expression; `CPTR(type ptr, expr)` is a pointer cast (passthrough). |
 
 ##### Conversions to integral types
 
@@ -1452,8 +1452,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `CAST (operator)` | ✗ |  |
-| `CPTR` | ✗ |  |
+| `CAST (operator)` | ✓ | `CAST(type, expr)` type conversion / reinterpretation. |
+| `CPTR` | ✓ | `CPTR(type ptr, expr)` pointer cast (passthrough). |
 
 #### Arithmetic Operators
 
@@ -1483,7 +1483,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `+ (String concatenation)` | ✓ |  |
-| `& (String concatenation with conversion)` | ✗ |  |
+| `& (String concatenation with conversion)` | ✓ | `&` concatenates, coercing numeric operands to string (FreeBASIC). |
 | `STRPTR (String pointer)` | ✓ | Raw pointer to the string's data (read-only byte-heap snapshot, NUL-terminated); same model as `SADD` |
 
 #### Relational Operators
@@ -1538,7 +1538,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `. (Member access)` | ✓ | Record field access `rec.field` (M3) |
-| `-> (Pointer to member access)` | ✗ |  |
+| `-> (Pointer to member access)` | ✓ | `p->field` member access through a UDT pointer/handle (equivalent to `p.field`). |
 | `IS (Run-time type information operator)` | ✗ |  |
 
 #### Memory Operators
