@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 348 / 643 implemented (54%)** (+ 3 partial); see the
+**FreeBASIC keyword set — 357 / 643 implemented (55%)** (+ 3 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1421,7 +1421,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `CBOOL` | ✗ | Converts a numeric or string expression to a boolean value. |
+| `CBOOL` | ✓ | Converts to boolean: -1 if the operand is nonzero, else 0 (FreeBASIC/VM -1/0 convention). |
 
 ### Operators
 
@@ -1867,7 +1867,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `FALSE and TRUE` | ✗ | Intrinsic constants for the Boolean data type. |
+| `FALSE and TRUE` | ✓ | Boolean constants (MODERN): `TRUE` = -1, `FALSE` = 0. |
 
 #### Error Handling
 
@@ -2031,18 +2031,18 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `LOBYTE` | ✗ | Gets the least significant byte (LSB, or lo-byte) value of an Uinteger value. |
-| `HIBYTE` | ✗ | Gets the most significant byte (MSB, or hi-byte) value of the least significant word (LSW, or lo-word) of an Uinteger value. |
-| `LOWORD` | ✗ | Gets the least significant word (LSW, or lo-word) value of an Uinteger value. |
-| `HIWORD` | ✗ | Gets the most significant word (LSW, or hi-word) value of an Uinteger value. |
+| `LOBYTE` | ✓ | Low byte: `x AND &HFF`. |
+| `HIBYTE` | ✓ | Second byte: `(x SHR 8) AND &HFF`. |
+| `LOWORD` | ✓ | Low word: `x AND &HFFFF`. |
+| `HIWORD` | ✓ | Second word: `(x SHR 16) AND &HFFFF`. |
 
 #### Bit Manipulation Macros
 
 | Keyword | Status | Description |
 |---|---|---|
-| `BIT` | ✗ | Gets the state of an individual bit in an integer value. |
-| `BITRESET` | ✗ | Gets the value of an integer with a specified bit cleared. |
-| `BITSET` | ✗ | Gets the value of an integer with a specified bit set. |
+| `BIT` | ✓ | Bit `b` of `x`: `(x SHR b) AND 1`. |
+| `BITRESET` | ✓ | `x` with bit `b` cleared: `x AND NOT (1 SHL b)`. |
+| `BITSET` | ✓ | `x` with bit `b` set: `x OR (1 SHL b)`. |
 
 ### Console Functions
 

@@ -304,6 +304,16 @@ const
   kWSTR    = 'WSTR';      // FreeBASIC: WSTR(x) -> wide string
   kSADD    = 'SADD';      // FreeBASIC: SADD(s) -> raw pointer to a copy of the string's bytes (read-only snapshot) (intercepted as array-access)
   kSTRPTR  = 'STRPTR';    // FreeBASIC: STRPTR(s) -> raw pointer to the string's data (same model as SADD) (intercepted as array-access)
+  kTRUE    = 'TRUE';      // FreeBASIC boolean constant TRUE = -1 (MODERN)
+  kFALSE   = 'FALSE';     // FreeBASIC boolean constant FALSE = 0 (MODERN)
+  kLOBYTE  = 'LOBYTE';    // FreeBASIC: low byte of an integer (x AND &HFF) (intercepted as array-access)
+  kHIBYTE  = 'HIBYTE';    // FreeBASIC: 2nd byte of an integer ((x SHR 8) AND &HFF)
+  kLOWORD  = 'LOWORD';    // FreeBASIC: low word of an integer (x AND &HFFFF)
+  kHIWORD  = 'HIWORD';    // FreeBASIC: 2nd word of an integer ((x SHR 16) AND &HFFFF)
+  kBIT     = 'BIT';       // FreeBASIC: bit b of x ((x SHR b) AND 1)
+  kBITSET  = 'BITSET';    // FreeBASIC: x with bit b set (x OR (1 SHL b))
+  kBITRESET= 'BITRESET';  // FreeBASIC: x with bit b cleared (x AND NOT (1 SHL b))
+  kCBOOL   = 'CBOOL';     // FreeBASIC: convert to boolean (-1 if nonzero, else 0)
   kVARPTR  = 'VARPTR';    // FreeBASIC: VARPTR(v) -> address of a variable (= @v) (intercepted as array-access)
   kPROCPTR = 'PROCPTR';   // FreeBASIC: PROCPTR(p) -> address of a procedure (= @p) (intercepted as array-access)
   kWSTRING = 'WSTRING';   // FreeBASIC: WSTRING type and WSTRING(n,cp) builder function

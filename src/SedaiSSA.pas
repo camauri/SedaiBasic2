@@ -355,6 +355,9 @@ type
     procedure EmitWStringFill(ArgsNode: TASTNode; out Result: TSSAValue);  // WSTRING(n,cp) -> n wide chars
     function InferExprBank(Node: TASTNode): TSSARegisterType;
     procedure EmitIif(ArgsNode: TASTNode; out Result: TSSAValue);
+    // FreeBASIC bit/byte macros (LOBYTE/HIBYTE/LOWORD/HIWORD/BIT/BITSET/BITRESET) and CBOOL,
+    // lowered to existing integer bitwise/shift/compare SSA ops (no new opcodes).
+    procedure EmitBitMacro(const FuncName: string; ArgsNode: TASTNode; out Result: TSSAValue);
     procedure ProcessForLoop(Node: TASTNode);
     procedure ProcessDoLoop(Node: TASTNode);
     procedure ProcessBlock(Node: TASTNode);
@@ -1159,6 +1162,18 @@ begin
     antIdentifier:
     begin
       VarName := VarToStr(Node.Value);
+      // FreeBASIC boolean constants: TRUE = -1, FALSE = 0 (MODERN only; in CLASSIC v7 they are
+      // ordinary variables that default to 0, so the dialect gate preserves v7 behaviour).
+      if FModernMode and (UpperCase(VarName) = kTRUE) then
+      begin
+        Result := MakeSSAConstInt(-1);
+        Exit;
+      end;
+      if FModernMode and (UpperCase(VarName) = kFALSE) then
+      begin
+        Result := MakeSSAConstInt(0);
+        Exit;
+      end;
       // BYREF-return address param: the register holds the caller variable's address — reading the
       // parameter dereferences it (load the pointee through the address).
       if IsAddrParam(VarName) then
@@ -3293,6 +3308,18 @@ begin
           Exit;
         end;
 
+        // FreeBASIC bit/byte macros (LOBYTE/HIBYTE/LOWORD/HIWORD/BIT/BITSET/BITRESET) and CBOOL: pure
+        // integer functions, parse as array access (not registered keywords). MODERN, not a declared array.
+        if FModernMode and (FProgram.FindArray(ArrName) < 0) and
+           ((UpperCase(ArrName) = kLOBYTE) or (UpperCase(ArrName) = kHIBYTE) or
+            (UpperCase(ArrName) = kLOWORD) or (UpperCase(ArrName) = kHIWORD) or
+            (UpperCase(ArrName) = kBIT) or (UpperCase(ArrName) = kBITSET) or
+            (UpperCase(ArrName) = kBITRESET) or (UpperCase(ArrName) = kCBOOL)) then
+        begin
+          EmitBitMacro(UpperCase(ArrName), Node.GetChild(1), Result);
+          Exit;
+        end;
+
         // FreeBASIC VARPTR(v) / PROCPTR(p): the address of a variable / procedure. Both are exactly
         // "@arg" in our model — synthesize an antProcAddress for the argument and process it (the @
         // lowering handles a scalar / array element / UDT field|handle / SHARED global / SUB entry PC).
@@ -5244,6 +5271,82 @@ begin
   IfNode.Free;
 
   Result := GetOrAllocateVariable(TmpName);
+end;
+
+procedure TSSAGenerator.EmitBitMacro(const FuncName: string; ArgsNode: TASTNode; out Result: TSSAValue);
+// FreeBASIC bit/byte macros + CBOOL, lowered to existing integer SSA ops (no new opcodes).
+// All operands are materialized into integer registers (EnsureIntRegister handles constants), so
+// the bitwise/shift/compare ops always see register operands.
+//   LOBYTE(x)      = x AND &HFF              HIBYTE(x)   = (x SHR 8)  AND &HFF
+//   LOWORD(x)      = x AND &HFFFF            HIWORD(x)   = (x SHR 16) AND &HFFFF
+//   BIT(x, b)      = (x SHR b) AND 1
+//   BITSET(x, b)   = x OR  (1 SHL b)         BITRESET(x, b) = x AND NOT (1 SHL b)
+//   CBOOL(x)       = -1 if x <> 0 else 0     (matches the VM's -1/0 boolean convention)
+var
+  V0, V1, A0, A1, Tmp, OneShl, NotShl: TSSAValue;
+
+  function NewIntReg: TSSAValue;
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  end;
+
+  function IntConst(C: Int64): TSSAValue;
+  begin
+    Result := EnsureIntRegister(MakeSSAConstInt(C));
+  end;
+
+begin
+  Result := MakeSSAValue(svkNone);
+  if (ArgsNode = nil) or (ArgsNode.ChildCount < 1) then Exit;
+
+  ProcessExpression(ArgsNode.GetChild(0), V0);
+  A0 := EnsureIntRegister(V0);
+  Result := NewIntReg;
+
+  if FuncName = kLOBYTE then
+    EmitInstruction(ssaBitwiseAnd, Result, A0, IntConst($FF), MakeSSAValue(svkNone))
+  else if FuncName = kLOWORD then
+    EmitInstruction(ssaBitwiseAnd, Result, A0, IntConst($FFFF), MakeSSAValue(svkNone))
+  else if FuncName = kHIBYTE then
+  begin
+    Tmp := NewIntReg;
+    EmitInstruction(ssaShr, Tmp, A0, IntConst(8), MakeSSAValue(svkNone));
+    EmitInstruction(ssaBitwiseAnd, Result, Tmp, IntConst($FF), MakeSSAValue(svkNone));
+  end
+  else if FuncName = kHIWORD then
+  begin
+    Tmp := NewIntReg;
+    EmitInstruction(ssaShr, Tmp, A0, IntConst(16), MakeSSAValue(svkNone));
+    EmitInstruction(ssaBitwiseAnd, Result, Tmp, IntConst($FFFF), MakeSSAValue(svkNone));
+  end
+  else if FuncName = kCBOOL then
+    EmitInstruction(ssaCmpNeInt, Result, A0, IntConst(0), MakeSSAValue(svkNone))
+  else if (FuncName = kBIT) or (FuncName = kBITSET) or (FuncName = kBITRESET) then
+  begin
+    if ArgsNode.ChildCount < 2 then begin Result := A0; Exit; end;   // missing bit index: pass x through
+    ProcessExpression(ArgsNode.GetChild(1), V1);
+    A1 := EnsureIntRegister(V1);
+    if FuncName = kBIT then
+    begin
+      Tmp := NewIntReg;
+      EmitInstruction(ssaShr, Tmp, A0, A1, MakeSSAValue(svkNone));            // x SHR b
+      EmitInstruction(ssaBitwiseAnd, Result, Tmp, IntConst(1), MakeSSAValue(svkNone));   // AND 1
+    end
+    else if FuncName = kBITSET then
+    begin
+      OneShl := NewIntReg;
+      EmitInstruction(ssaShl, OneShl, IntConst(1), A1, MakeSSAValue(svkNone));   // 1 SHL b
+      EmitInstruction(ssaBitwiseOr, Result, A0, OneShl, MakeSSAValue(svkNone));  // x OR (1 SHL b)
+    end
+    else  // kBITRESET
+    begin
+      OneShl := NewIntReg;
+      NotShl := NewIntReg;
+      EmitInstruction(ssaShl, OneShl, IntConst(1), A1, MakeSSAValue(svkNone));    // 1 SHL b
+      EmitInstruction(ssaBitwiseNot, NotShl, OneShl, MakeSSAValue(svkNone), MakeSSAValue(svkNone));  // NOT (1 SHL b)
+      EmitInstruction(ssaBitwiseAnd, Result, A0, NotShl, MakeSSAValue(svkNone));  // x AND NOT (1 SHL b)
+    end;
+  end;
 end;
 
 procedure TSSAGenerator.EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);
