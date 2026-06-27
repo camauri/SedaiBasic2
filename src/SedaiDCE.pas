@@ -293,8 +293,8 @@ begin
     // SADD(s) allocates a fresh raw byte-heap copy each call — allocating, so never elide or CSE it.
     ssaStrSAdd,
     // FILEEXISTS depends on external filesystem state — keep it (don't elide/CSE) so repeated checks
-    // re-query rather than being deduplicated.
-    ssaFileExists,
+    // re-query rather than being deduplicated. CURDIR/ENVIRON likewise read mutable external state.
+    ssaFileExists, ssaCurDir, ssaEnviron,
     // SETDATE/SETTIME mutate the VM-internal clock offset — a side effect, never elide it.
     ssaSetClock,
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString,

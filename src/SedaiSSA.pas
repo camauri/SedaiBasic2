@@ -1180,6 +1180,13 @@ begin
         Result := MakeSSAConstInt(0);
         Exit;
       end;
+      // FreeBASIC CURDIR$ / CURDIR used bare (no parentheses): the current working directory.
+      if FModernMode and ((UpperCase(VarName) = kCURDIRS) or (UpperCase(VarName) = kCURDIR)) then
+      begin
+        Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaCurDir, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Exit;
+      end;
       // BYREF-return address param: the register holds the caller variable's address — reading the
       // parameter dereferences it (load the pointee through the address).
       if IsAddrParam(VarName) then
@@ -3356,6 +3363,26 @@ begin
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaFileExists, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC CURDIR$() / CURDIR() (parenthesised form): current working directory.
+        if FModernMode and ((UpperCase(ArrName) = kCURDIRS) or (UpperCase(ArrName) = kCURDIR)) and
+           (FProgram.FindArray(ArrName) < 0) then
+        begin
+          Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+          EmitInstruction(ssaCurDir, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC ENVIRON$(name) / ENVIRON(name): value of an environment variable.
+        if FModernMode and ((UpperCase(ArrName) = kENVIRONS) or (UpperCase(ArrName) = kENVIRON)) and
+           (FProgram.FindArray(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ArgReg := EnsureStringRegister(ArgValue);
+          Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+          EmitInstruction(ssaEnviron, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
         end;
 

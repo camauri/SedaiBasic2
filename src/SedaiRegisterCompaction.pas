@@ -347,6 +347,7 @@ begin
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrChr, bcStrWChr,
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING codepoint substrings - string dest
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrSpace,  // B1.2: string dest
+    bcCurDir, bcEnviron,  // CURDIR$ / ENVIRON$(name) - string dest
     bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - string dest
     bcStrTrimSet, // LTRIM/RTRIM/TRIM(s,set) - string dest
     bcStrStr,    // STR$(n) - number to string
@@ -663,6 +664,8 @@ begin
     bcFileExists,  // FILEEXISTS(path): Src1 = path string
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src1 = source string
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string
+    bcEnviron,   // ENVIRON$(name) - Src1 = name string
+
     bcStrVal,    // VAL(str) - reads string, produces float
     bcStrValInt, // VALINT/VALLNG/VALUINT(str) - reads string, produces int
     bcStrCvInt, bcStrCvFloat,  // CV*(str) - reads binary string, produces int/float (B3 serialization)

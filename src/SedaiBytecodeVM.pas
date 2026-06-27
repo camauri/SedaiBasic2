@@ -2390,9 +2390,16 @@ begin
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
         end;
 
-        // DATE/TIME: string Dest, no sources.
-        bcDateStr:
+        // DATE/TIME, CURDIR$: string Dest, no sources.
+        bcDateStr, bcCurDir:
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+
+        // ENVIRON$(name): string Dest, string Src1.
+        bcEnviron:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+        end;
 
         // MONTHNAME/WEEKDAYNAME: string Dest, int Src1.
         bcDateName:
@@ -4296,6 +4303,10 @@ begin
     40: // bcFileExists - FILEEXISTS(path): -1 if the file exists, else 0 (cross-platform).
       if FileExists(Ctx.StringRegs[Instr.Src1]) then Ctx.IntRegs[Instr.Dest] := -1
       else Ctx.IntRegs[Instr.Dest] := 0;
+    41: // bcCurDir - CURDIR$: the current working directory (cross-platform).
+      Ctx.StringRegs[Instr.Dest] := GetCurrentDir;
+    42: // bcEnviron - ENVIRON$(name): value of an environment variable ('' if unset).
+      Ctx.StringRegs[Instr.Dest] := GetEnvironmentVariable(Ctx.StringRegs[Instr.Src1]);
     36: // bcStrMkInt - MKI/MKL/MKSHORT/MKLONGINT: binary copy of an integer into a string.
       begin
         // Immediate = byte width (2/4/8). Write the low `width` bytes, little-endian (two's complement).

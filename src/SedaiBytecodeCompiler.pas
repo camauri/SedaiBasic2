@@ -178,6 +178,8 @@ begin
     ssaStrWStringN: Result := bcStrWStringN;
     ssaStrSAdd: Result := bcStrSAdd;
     ssaFileExists: Result := bcFileExists;
+    ssaCurDir: Result := bcCurDir;
+    ssaEnviron: Result := bcEnviron;
     ssaStrMkInt: Result := bcStrMkInt;
     ssaStrMkFloat: Result := bcStrMkFloat;
     ssaStrCvInt: Result := bcStrCvInt;

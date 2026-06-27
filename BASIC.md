@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 411 / 643 implemented (64%)** (+ 4 partial); see the
+**FreeBASIC keyword set — 413 / 643 implemented (64%)** (+ 4 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -2270,7 +2270,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `CURDIR` | ✗ | Gets the current working directory. |
+| `CURDIR` | ✓ | `CURDIR` / `CURDIR$` (bare or parenthesised) -> the current working directory. |
 | `CHDIR` | ✓ | Sets the current working directory. |
 | `DIR` | ✓ | Gets the names of files or directories matching certain attributes. |
 | `EXEPATH` | ✗ | Gets the directory of the current running program. |
@@ -2283,7 +2283,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `FRE` | ✓ | Gets the amount of free memory (in bytes) available. |
 | `COMMAND` | ✗ | Gets the command-line parameters passed to the program. |
-| `ENVIRON` | ✗ | Gets the value of an environment variable. |
+| `ENVIRON` | ✓ | `ENVIRON$(name)` -> the value of an environment variable ("" if unset). |
 | `ISREDIRECTED` | ✗ | Checks whether stdin or stdout is redirected to a file or not. |
 | `SETENVIRON` | ✗ | Sets the value of an environment variable. |
 | `SHELL` | ✗ | Sends a command to the system command interpreter. |

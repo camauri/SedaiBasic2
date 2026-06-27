@@ -248,6 +248,10 @@ begin
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'StrSAdd', Instr.Dest, Instr.Src1]);
     bcFileExists:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'FileExists', Instr.Dest, Instr.Src1]);
+    bcCurDir:
+      Line := Format('%4d: %-20s R%d', [Index, 'CurDir', Instr.Dest]);
+    bcEnviron:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'Environ', Instr.Dest, Instr.Src1]);
     bcStrMkInt:
       Line := Format('%4d: %-20s R%d, R%d, width=%d', [Index, 'StrMkInt', Instr.Dest, Instr.Src1, Instr.Immediate]);
     bcStrMkFloat:
