@@ -1934,10 +1934,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `INP` | ✗ |  |
-| `LPRINT` | ✗ |  |
-| `LPOS` | ✗ |  |
-| `OUT` | ✗ |  |
+| `INP` | ✗ | N/A — hardware port I/O is not available in a portable bytecode VM. |
+| `LPRINT` | ✗ | N/A — direct printer/LPT access is not available in a portable bytecode VM. |
+| `LPOS` | ✗ | N/A — printer head position; no printer device. |
+| `OUT` | ✗ | N/A — hardware port I/O is not available in a portable bytecode VM. |
 | `WAIT` | ✓ |  |
 
 ##### Operating System
@@ -2249,7 +2249,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `EXEC and CHAIN` | ✗ | Temporarily transfers control to another program. |
+| `EXEC and CHAIN` | ✗ | N/A — launching/transferring to external programs is out of scope for the sandboxed VM. |
 | `RUN` | ✓ | Transfers control to another program. |
 | `KILL` | ✗ | Deletes an existing file. |
 | `NAME` | ✗ | Renames an existing file. |
@@ -2286,8 +2286,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `ENVIRON` | ✓ | `ENVIRON$(name)` -> the value of an environment variable ("" if unset). |
 | `ISREDIRECTED` | ✗ | Checks whether stdin or stdout is redirected to a file or not. |
 | `SETENVIRON` | ✗ | Sets the value of an environment variable. |
-| `SHELL` | ✗ | Sends a command to the system command interpreter. |
-| `SYSTEM` | ✗ | Closes all open files and exits the program. |
+| `SHELL` | ✗ | N/A — external command execution is out of scope for the sandboxed VM. |
+| `SYSTEM` | ✗ | Closes all files and exits — equivalent to END/STOP (not yet aliased). |
 
 ### String Functions
 
