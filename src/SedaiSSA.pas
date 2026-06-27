@@ -1784,6 +1784,7 @@ begin
           DestReg := FProgram.AllocRegister(srtString);
           Result := MakeSSARegister(srtString, DestReg);
           EmitInstruction(ssaStrConcat, Result, Left, Right, MakeSSAValue(svkNone));
+          Exit;   // concat emits its own instruction; do NOT fall through to the trailing arithmetic emit
         end
         // SPECIAL CASE: String concatenation (string + string or string + any)
         else if (Node.Token.TokenType = ttOpAdd) and
@@ -1793,6 +1794,7 @@ begin
           DestReg := FProgram.AllocRegister(srtString);
           Result := MakeSSARegister(srtString, DestReg);
           EmitInstruction(ssaStrConcat, Result, Left, Right, MakeSSAValue(svkNone));
+          Exit;   // concat emits its own instruction; do NOT fall through to the trailing arithmetic emit
         end
         // Arithmetic operators
         // SPECIAL CASE: Division always returns float (even for int/int)
