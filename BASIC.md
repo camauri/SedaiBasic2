@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 358 / 643 implemented (56%)** (+ 3 partial); see the
+**FreeBASIC keyword set — 380 / 643 implemented (59%)** (+ 3 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1760,22 +1760,22 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `__FB_WIN32__` | ✗ | Defined if compiling for Windows. |
-| `__FB_LINUX__` | ✗ | Defined if compiling for Linux. |
+| `__FB_WIN32__` | ✓ | Defined if compiling for Windows. |
+| `__FB_LINUX__` | ✓ | Defined if compiling for Linux. |
 | `__FB_DOS__` | ✗ | Defined if compiling for DOS. |
 | `__FB_CYGWIN__` | ✗ | Defined if compiling for Cygwin. |
-| `__FB_FREEBSD__` | ✗ | Defined if compiling for FreeBSD. |
-| `__FB_NETBSD__` | ✗ | Defined if compiling for NetBSD. |
-| `__FB_OPENBSD__` | ✗ | Defined if compiling for OpenBSD. |
-| `__FB_DARWIN__` | ✗ | Defined if compiling for Darwin. |
+| `__FB_FREEBSD__` | ✓ | Defined if compiling for FreeBSD. |
+| `__FB_NETBSD__` | ✓ | Defined if compiling for NetBSD. |
+| `__FB_OPENBSD__` | ✓ | Defined if compiling for OpenBSD. |
+| `__FB_DARWIN__` | ✓ | Defined if compiling for Darwin. |
 | `__FB_XBOX__` | ✗ | Defined if compiling for Xbox. |
-| `__FB_BIGENDIAN__` | ✗ | Defined if compiling on a system using big-endian byte-order. |
-| `__FB_PCOS__` | ✗ | Defined if compiling for a common PC OS (e.g. DOS, Windows, OS/2). |
-| `__FB_UNIX__` | ✗ | Defined if compiling for a Unix-like OS. |
-| `__FB_64BIT__` | ✗ | Defined if compiling for a 64bit target. |
-| `__FB_ARM__` | ✗ | Defined if compiling for the ARM architecture. |
-| `__FB_PPC__` | ✗ | Defined if compiling for the PowerPC architecture. |
-| `__FB_X86__` | ✗ | Defined if compiling for the X86 / X86_64 architecture. |
+| `__FB_BIGENDIAN__` | ✓ | Defined if compiling on a system using big-endian byte-order. |
+| `__FB_PCOS__` | ✓ | Defined if compiling for a common PC OS (e.g. DOS, Windows, OS/2). |
+| `__FB_UNIX__` | ✓ | Defined if compiling for a Unix-like OS. |
+| `__FB_64BIT__` | ✓ | Defined if compiling for a 64bit target. |
+| `__FB_ARM__` | ✓ | Defined if compiling for the ARM architecture. |
+| `__FB_PPC__` | ✓ | Defined if compiling for the PowerPC architecture. |
+| `__FB_X86__` | ✓ | Defined if compiling for the X86 / X86_64 architecture. |
 | `__FB_JS__` | ✗ | Defined if compiling for emscripten target. |
 | `__FB_ANDROID__` | ✗ | Defined if compiling for android target. |
 
@@ -1783,14 +1783,14 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `__FB_VERSION__` | ✗ | Defined as a string literal of the compiler version. |
-| `__FB_VER_MAJOR__` | ✗ | Defined as an integral literal of the compiler major version number. |
-| `__FB_VER_MINOR__` | ✗ | Defined as an integral literal of the compiler minor version number. |
-| `__FB_VER_PATCH__` | ✗ | Defined as an integral literal of the compiler patch number. |
+| `__FB_VERSION__` | ✓ | Defined as a string literal of the compiler version. |
+| `__FB_VER_MAJOR__` | ✓ | Defined as an integral literal of the compiler major version number. |
+| `__FB_VER_MINOR__` | ✓ | Defined as an integral literal of the compiler minor version number. |
+| `__FB_VER_PATCH__` | ✓ | Defined as an integral literal of the compiler patch number. |
 | `__FB_MIN_VERSION__` | ✗ | Macro to check for a minimum compiler version. |
 | `__FB_BUILD_DATE__` | ✗ | Defined as a string literal of the compiler build date in "mm-dd-yyyy" format. |
 | `__FB_BUILD_DATE_ISO__` | ✗ | Defined as a string literal of the compiler build date in "yyyy-mm-dd" format. |
-| `__FB_SIGNATURE__` | ✗ | Defined as a string literal of the compiler signature. |
+| `__FB_SIGNATURE__` | ✓ | Defined as a string literal of the compiler signature. |
 | `__FB_BUILD_SHA1__` | ✗ | Defined as a string literal of the compiler's source revision sha-1. |
 | `__FB_BUILD_FORK_ID__` | ✗ | Defined as a string literal of the custom defined project fork identifier name. |
 
@@ -1804,14 +1804,14 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `__FB_OPTIMIZE__` | ✗ | Defined to the optimization level depending on -O. |
 | `__FB_GUI__` | ✗ | True (-1) if the "-s gui" switch was used, false (0) otherwise. |
 | `__FB_MAIN__` | ✗ | Defined if compiling a module with an entry point. |
-| `__FB_DEBUG__` | ✗ | True (-1) if the "-g" switch was used, false (0) otherwise. |
+| `__FB_DEBUG__` | ✓ | True (-1) if the "-g" switch was used, false (0) otherwise. |
 | `__FB_ERR__` | ✗ | Zero (0) if neither the "-e", "-ex" or "-exx" switches were used. |
 | `__FB_FPMODE__` | ✗ | Defined as "fast" if compiling for fast SSE math, "precise" otherwise. |
 | `__FB_FPU__` | ✗ | Defined as "sse" if compiling for SSE floating point unit, or "x87" for normal x87 floating-point unit. |
-| `__FB_LANG__` | ✗ | Defined to a string literal of the "-lang" dialect used. |
-| `__FB_MT__` | ✗ | True (-1) if the "-mt" switch was used, false (0) otherwise. |
+| `__FB_LANG__` | ✓ | Defined to a string literal of the "-lang" dialect used. |
+| `__FB_MT__` | ✓ | True (-1) if the "-mt" switch was used, false (0) otherwise. |
 | `__FB_OUT_DLL__` | ✗ | True (-1) in a module being compiled and linked into a shared library, false (0) otherwise. |
-| `__FB_OUT_EXE__` | ✗ | True (-1) in a module being compiled and linked into an executable, false (0) otherwise. |
+| `__FB_OUT_EXE__` | ✓ | True (-1) in a module being compiled and linked into an executable, false (0) otherwise. |
 | `__FB_OUT_LIB__` | ✗ | True (-1) in a module being compiled and linked into a static library, zero (0) otherwise. |
 | `__FB_OUT_OBJ__` | ✗ | True (-1) in a module being compiled only, zero (0) otherwise. |
 | `__FB_PROFILE__` | ✗ | Set to an integer to indicate the profiling method. |

@@ -212,8 +212,10 @@ var
     else Result := StrToInt64Def(S, 0);
   end;
 
-  // Tokenize, substituting defined()/macros into numeric tokens as we go.
-  procedure Tokenize(const S: string);
+  // Tokenize, substituting defined()/macros into numeric tokens as we go. A macro's value is
+  // re-tokenized (depth-guarded) rather than added as one token, so values like "-1" (-> '-' '1'),
+  // "&HFF", or "1 + 2" parse correctly and nested macros expand.
+  procedure Tokenize(const S: string; Depth: Integer);
   var p, q: Integer; id, two: string; nm: string;
   begin
     p := 1;
@@ -258,7 +260,12 @@ var
         else if (id = 'AND') or (id = 'OR') or (id = 'NOT') or (id = 'MOD') then
           Toks.Add(id)
         else if Defs.IndexOfName(id) >= 0 then
-          Toks.Add(Trim(Defs.Values[id]))     // macro value (numeric expected)
+        begin
+          // Re-tokenize the macro's value so multi-token values (-1, &HFF, 1+2) and nested
+          // macros work; bail to 0 past a sane nesting depth (cycle guard).
+          if Depth < 32 then Tokenize(Trim(Defs.Values[id]), Depth + 1)
+          else Toks.Add('0');
+        end
         else
           Toks.Add('0');                       // undefined identifier -> 0
         Continue;
@@ -346,13 +353,78 @@ begin
   Result := False;
   Toks := TStringList.Create;
   try
-    Tokenize(RawExpr);
+    Tokenize(RawExpr, 0);
     if Toks.Count = 0 then Exit;
     TPos := 0;
     Result := ParseOr <> 0;
   finally
     Toks.Free;
   end;
+end;
+
+procedure RegisterIntrinsicDefines(Defs: TStringList);
+// Pre-populate the macro table with FreeBASIC compiler intrinsic defines, so FB programs that use
+// conditional compilation (#if __FB_WIN32__ / #ifdef __FB_64BIT__ / #if __FB_VER_MAJOR__ >= 1) take
+// the right branch instead of failing. SedaiBasic claims FreeBASIC 1.10.x compatibility. Values use
+// the FB boolean convention (-1 = TRUE) where the macro is a flag. Platform/arch macros are defined
+// ONLY for the host the VM was built for, matching FreeBASIC (e.g. __FB_LINUX__ exists only on Linux),
+// so `#ifdef` of a foreign platform is correctly false. String-valued macros keep their quotes so they
+// substitute as string literals in ordinary code.
+begin
+  // --- Version (claim FreeBASIC 1.10.x) ---
+  Defs.Values['__FB_VERSION__']   := '"1.10.1"';
+  Defs.Values['__FB_VER_MAJOR__'] := '1';
+  Defs.Values['__FB_VER_MINOR__'] := '10';
+  Defs.Values['__FB_VER_PATCH__'] := '1';
+  Defs.Values['__FB_SIGNATURE__'] := '"SedaiBasic (FreeBASIC-compatible)"';
+  // --- Language / compile mode, mapped to SedaiBasic's actual state ---
+  Defs.Values['__FB_LANG__']    := '"fb"';
+  Defs.Values['__FB_MT__']      := '-1';   // multithreading runtime is available
+  Defs.Values['__FB_OUT_EXE__'] := '-1';   // programs are run (executable-like target)
+  {$IFDEF DEBUG}
+  Defs.Values['__FB_DEBUG__']   := '-1';
+  {$ENDIF}
+  // --- Platform (host-only, like FreeBASIC) ---
+  {$IFDEF WINDOWS}
+  Defs.Values['__FB_WIN32__'] := '-1';
+  Defs.Values['__FB_PCOS__']  := '-1';
+  {$ENDIF}
+  {$IFDEF LINUX}
+  Defs.Values['__FB_LINUX__'] := '-1';
+  Defs.Values['__FB_UNIX__']  := '-1';
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  Defs.Values['__FB_DARWIN__'] := '-1';
+  Defs.Values['__FB_UNIX__']   := '-1';
+  {$ENDIF}
+  {$IFDEF FREEBSD}
+  Defs.Values['__FB_FREEBSD__'] := '-1';
+  Defs.Values['__FB_UNIX__']    := '-1';
+  {$ENDIF}
+  {$IFDEF NETBSD}
+  Defs.Values['__FB_NETBSD__'] := '-1';
+  Defs.Values['__FB_UNIX__']   := '-1';
+  {$ENDIF}
+  {$IFDEF OPENBSD}
+  Defs.Values['__FB_OPENBSD__'] := '-1';
+  Defs.Values['__FB_UNIX__']    := '-1';
+  {$ENDIF}
+  // --- Architecture (host-only) ---
+  {$IFDEF CPU64}
+  Defs.Values['__FB_64BIT__'] := '-1';
+  {$ENDIF}
+  {$IF DEFINED(CPUX86_64) OR DEFINED(CPUI386)}
+  Defs.Values['__FB_X86__'] := '-1';
+  {$ENDIF}
+  {$IF DEFINED(CPUAARCH64) OR DEFINED(CPUARM)}
+  Defs.Values['__FB_ARM__'] := '-1';
+  {$ENDIF}
+  {$IFDEF CPUPOWERPC}
+  Defs.Values['__FB_PPC__'] := '-1';
+  {$ENDIF}
+  {$IFDEF ENDIAN_BIG}
+  Defs.Values['__FB_BIGENDIAN__'] := '-1';
+  {$ENDIF}
 end;
 
 function PreprocessSource(const Src, BaseDir: string): string;
@@ -551,14 +623,16 @@ var
   end;
 
 begin
-  // Fast path: no preprocessor directive at all -> return unchanged (zero overhead for normal code).
-  if Pos('#', Src) = 0 then
+  // Fast path: no preprocessor directive and no intrinsic-define usage -> return unchanged (zero
+  // overhead for normal code). '#' covers all directives; '__' covers bare __FB_*__ intrinsic macros.
+  if (Pos('#', Src) = 0) and (Pos('__', Src) = 0) then
     Exit(Src);
 
   Defs := TStringList.Create;
   FnDefs := TStringList.Create;
   Output := TStringList.Create;
   try
+    RegisterIntrinsicDefines(Defs);   // FreeBASIC compiler intrinsic defines (__FB_*__)
     SetLength(Active, 0);
     SetLength(Taken, 0);
     Expand(Src, BaseDir);
