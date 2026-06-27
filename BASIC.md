@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 314 / 643 implemented (49%)** (+ 3 partial); see the
+**FreeBASIC keyword set — 315 / 643 implemented (49%)** (+ 3 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1704,7 +1704,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `#DEFINE` | ✓ | Object-like and function-like text-replacement macros: `#define NAME body` and `#define NAME(params) body`. |
-| `#MACRO and #ENDMACRO` | ✗ | Creates a multi-line text-replacement macro. |
+| `#MACRO and #ENDMACRO` | ✓ | Multi-line text-replacement macro `#macro NAME[(params)]` ... `#endmacro`; body lines are joined with the `:` statement separator (object-like or function-like). |
 | `#UNDEF` | ✓ | Undefines a symbol. |
 | `# Preprocessor stringize` | ✗ | Converts text into a string literal. |
 | `## Preprocessor concatenate` | ✗ | Concatenates two pieces of text. |

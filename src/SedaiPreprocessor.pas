@@ -1,7 +1,8 @@
 unit SedaiPreprocessor;
 // FreeBASIC-style source preprocessor (v1). A pure text->text pass run BEFORE lexing.
 // Supports:
-//   #define NAME [value]      object-like macro (function-like macros are not yet supported)
+//   #define NAME [value]      object-like or function-like (NAME(params) body) macro
+//   #macro NAME[(params)] ... #endmacro   multi-line macro (body lines joined with ':')
 //   #undef NAME
 //   #ifdef NAME / #ifndef NAME / #else / #endif   conditional compilation
 //   #if <expr> / #elif <expr>   conditional compilation on a constant integer expression
@@ -373,6 +374,8 @@ var
     Lines: TStringList;
     li, p, q: Integer;
     Raw, Trimmed, DName, DRest, MacroName, MacroVal, FileName, FullPath: string;
+    Params, MacroBody, BodyTrim, EName, ERest: string;
+    IsFn: Boolean;
     ParentEmit, Cond: Boolean;
     IncText: TStringList;
     SavedStackTop: Integer;
@@ -381,7 +384,8 @@ var
     Lines := TStringList.Create;
     try
       Lines.Text := Text;
-      for li := 0 to Lines.Count - 1 do
+      li := 0;
+      while li < Lines.Count do
       begin
         Raw := Lines[li];
         Trimmed := TrimLeft(Raw);
@@ -461,6 +465,48 @@ var
               if MacroName <> '' then Defs.Values[MacroName] := MacroVal;
             end;
           end
+          else if (DName = 'macro') and Emitting then
+          begin
+            // Multi-line macro: "#macro NAME[(params)]" ... body lines ... "#endmacro".
+            // The body lines are joined with the BASIC statement separator ':' so a single
+            // invocation expands to the whole sequence; with params it becomes a function-like
+            // macro (FnDefs), otherwise an object-like one (Defs). Body lines are consumed here
+            // and replaced by blanks to preserve source line numbers.
+            p := 1;
+            while (p <= Length(DRest)) and IsIdentChar(DRest[p]) do Inc(p);
+            MacroName := UpperCase(Copy(DRest, 1, p - 1));
+            IsFn := (p <= Length(DRest)) and (DRest[p] = '(');
+            Params := '';
+            if IsFn then
+            begin
+              q := p + 1;
+              while (q <= Length(DRest)) and (DRest[q] <> ')') do Inc(q);
+              Params := Trim(Copy(DRest, p + 1, q - p - 1));
+            end;
+            MacroBody := '';
+            Inc(li);
+            while li < Lines.Count do
+            begin
+              BodyTrim := TrimLeft(Lines[li]);
+              if (Length(BodyTrim) > 0) and (BodyTrim[1] = '#') then
+              begin
+                SplitDirective(BodyTrim, EName, ERest);
+                if EName = 'endmacro' then begin Output.Add(''); Break; end;
+              end;
+              if Trim(Lines[li]) <> '' then
+              begin
+                if MacroBody <> '' then MacroBody := MacroBody + ' : ';
+                MacroBody := MacroBody + Trim(Lines[li]);
+              end;
+              Output.Add('');   // blank placeholder preserves line numbers
+              Inc(li);
+            end;
+            if MacroName <> '' then
+            begin
+              if IsFn then FnDefs.Values[MacroName] := Params + #1 + MacroBody
+              else Defs.Values[MacroName] := MacroBody;
+            end;
+          end
           else if (DName = 'undef') and Emitting then
           begin
             p := Defs.IndexOfName(UpperCase(Trim(DRest)));
@@ -491,6 +537,7 @@ var
           Output.Add(SubstituteMacros(Raw, Defs, FnDefs))
         else
           Output.Add('');   // excluded line — blank placeholder preserves line numbers
+        Inc(li);
       end;
       // Drop any conditionals left open by this (included) text, so it can't affect the caller.
       while High(Active) > SavedStackTop do
