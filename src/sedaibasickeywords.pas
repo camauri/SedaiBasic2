@@ -357,6 +357,11 @@ const
   kASC     = 'ASC';
   kCHAR    = 'CHAR';
   kCHRS    = 'CHR$';
+  // FreeBASIC bare (no-$) forms of the string functions, routed to the $-suffixed implementations.
+  kCHR     = 'CHR';
+  kSTR     = 'STR';
+  kLEFT    = 'LEFT';
+  kRIGHT   = 'RIGHT';
   kHEXS    = 'HEX$';
   kLEFTS   = 'LEFT$';
   kMIDS    = 'MID$';

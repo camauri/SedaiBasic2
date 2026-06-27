@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 414 / 643 implemented (64%)** (+ 4 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 418 / 643 implemented (65%)** (+ 4 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **414 (72%)** are implemented. See the
+**572 applicable** keywords, **418 (73%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -2312,7 +2312,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `ASC` | ✓ | Returns an Integer representation of an character. |
-| `CHR` | ✗ | Returns a string of one or more characters from their ASCII Integer representation. |
+| `CHR` | ✓ | `CHR(n)` (bare FB form) routed to `CHR$`. |
 | `WCHR` | ✓ | `WCHR(n)` — the wide (UTF-8) character for Unicode codepoint n (single-codepoint form). |
 
 #### Numeric/Boolean to String Conversions
@@ -2325,7 +2325,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `WHEX` | ✓ | `WHEX(n)` — hexadecimal wide string of an integer. |
 | `OCT` | ✓ | Returns an octal String representation of an integral value. `OCT(n)`, no leading zeros (B1.3). |
 | `WOCT` | ✓ | `WOCT(n)` — octal wide string of an integer. |
-| `STR` | ✗ | Returns the String representation of numeric value or boolean. |
+| `STR` | ✓ | `STR(n)` (bare FB form) routed to `STR$`. |
 | `WSTR` | ✓ | Returns the WString representation of a numeric value (or widens a string). |
 | `FORMAT` | ✗ | Returns a formatted String representation of a Double. |
 
@@ -2360,9 +2360,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `LEFT` | ✗ | Returns a substring of the leftmost characters in a string. |
+| `LEFT` | ✓ | `LEFT(s,n)` (bare FB form) routed to `LEFT$`. |
 | `MID (Function)` | ✓ | Returns a substring of a string. |
-| `RIGHT` | ✗ | Returns a substring of the rightmost characters in a string. |
+| `RIGHT` | ✓ | `RIGHT(s,n)` (bare FB form) routed to `RIGHT$`. |
 | `LCASE` | ✓ | Returns a copy of a string converted to lowercase. `LCASE(s)` / `LCASE$(s)` (B1.2). |
 | `UCASE` | ✓ | Returns a copy of a string converted to uppercase. `UCASE(s)` / `UCASE$(s)` (B1.2). |
 | `LTRIM` | ✓ | `LTRIM(s)` / `LTRIM(s, set)` substring / `LTRIM(s, Any set)` character-set. |

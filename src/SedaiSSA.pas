@@ -360,6 +360,8 @@ type
     procedure EmitBitMacro(const FuncName: string; ArgsNode: TASTNode; out Result: TSSAValue);
     // FreeBASIC ARRAYLEN(arr): total element count = product over dims of (ubound-lbound+1).
     procedure EmitArrayLen(ArgsNode: TASTNode; out Result: TSSAValue);
+    // FreeBASIC bare string functions (CHR/STR/LEFT/RIGHT) routed to their $-suffixed forms.
+    procedure EmitBareStringFunc(const DollarName: string; ArrayAccessNode: TASTNode; out Result: TSSAValue);
     // FreeBASIC short-circuit operators a ANDALSO b / a ORELSE b (lowered via the IIF/IF mechanism).
     procedure EmitShortCircuit(Node: TASTNode; out Result: TSSAValue);
     // FreeBASIC RTTI: obj IS Type -> -1 if obj's runtime type is Type or a subtype, else 0.
@@ -3366,6 +3368,16 @@ begin
           Exit;
         end;
 
+        // FreeBASIC bare string functions: CHR/STR/LEFT/RIGHT are the canonical FB names for the
+        // $-suffixed functions. MODERN, parenthesised call, not a declared array.
+        if FModernMode and (FProgram.FindArray(ArrName) < 0) then
+        begin
+          if UpperCase(ArrName) = kCHR then begin EmitBareStringFunc(kCHRS, Node, Result); Exit; end;
+          if UpperCase(ArrName) = kSTR then begin EmitBareStringFunc(kSTRS, Node, Result); Exit; end;
+          if UpperCase(ArrName) = kLEFT then begin EmitBareStringFunc(kLEFTS, Node, Result); Exit; end;
+          if UpperCase(ArrName) = kRIGHT then begin EmitBareStringFunc(kRIGHTS, Node, Result); Exit; end;
+        end;
+
         // FreeBASIC FILELEN(path): file size in bytes (0 if absent). MODERN, not a declared array.
         if FModernMode and (UpperCase(ArrName) = kFILELEN) and (FProgram.FindArray(ArrName) < 0) and
            (Node.GetChild(1).ChildCount >= 1) then
@@ -5423,6 +5435,33 @@ begin
       EmitInstruction(ssaBitwiseNot, NotShl, OneShl, MakeSSAValue(svkNone), MakeSSAValue(svkNone));  // NOT (1 SHL b)
       EmitInstruction(ssaBitwiseAnd, Result, A0, NotShl, MakeSSAValue(svkNone));  // x AND NOT (1 SHL b)
     end;
+  end;
+end;
+
+procedure TSSAGenerator.EmitBareStringFunc(const DollarName: string; ArrayAccessNode: TASTNode; out Result: TSSAValue);
+// FreeBASIC's canonical bare names (CHR/STR/LEFT/RIGHT) are aliases of the $-suffixed functions we
+// already implement. Synthesize the equivalent antFunctionCall ("CHR$"/...) with the same argument
+// list and process it through the existing string-function lowering — no duplicate code.
+var
+  SynthCall, ArgList, IdxNode: TASTNode;
+  i: Integer;
+begin
+  Result := MakeSSAValue(svkNone);
+  SynthCall := TASTNode.CreateWithValue(antFunctionCall, DollarName, ArrayAccessNode.Token);
+  try
+    // Rebuild a proper antArgumentList from the array-access index list (the string-function
+    // handlers expect an antArgumentList, not the raw index-list node).
+    ArgList := TASTNode.Create(antArgumentList, ArrayAccessNode.Token);
+    if ArrayAccessNode.ChildCount >= 2 then
+    begin
+      IdxNode := ArrayAccessNode.GetChild(1);
+      for i := 0 to IdxNode.ChildCount - 1 do
+        ArgList.AddChild(IdxNode.GetChild(i).Clone);
+    end;
+    SynthCall.AddChild(ArgList);   // argument list -> child 0
+    ProcessExpression(SynthCall, Result);
+  finally
+    SynthCall.Free;
   end;
 end;
 
