@@ -216,6 +216,7 @@ const
   bcMkdir           = bcGroupCore + 87;  // MKDIR/MD "path": Create directory
   bcChdir           = bcGroupCore + 88;  // CHDIR/CD "path": Change current directory
   bcRmdir           = bcGroupCore + 137; // RMDIR/RD "path": Remove directory (FreeBASIC/QB)
+  bcRaiseError      = bcGroupCore + 138; // ERROR <n>: raise a user runtime error (Src1 = number)
   bcMoveFile        = bcGroupCore + 89;  // MOVE/MV "src","dest": Move file
   // Error handling
   bcTrap            = bcGroupCore + 90;  // TRAP linenum: Set error handler line

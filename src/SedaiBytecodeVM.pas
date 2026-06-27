@@ -230,6 +230,8 @@ type
     // Raise a dialect-aware filesystem runtime error: FreeBASIC error number + message in MODERN,
     // Commodore error number + '?...' message in CLASSIC. The code reaches ERR via the except handler.
     procedure RaiseFileError(const FBMsg: string; FBCode: Integer; const CBMMsg: string; CBMCode: Integer);
+    // FreeBASIC resets Err/Erl after RESUME / RESUME NEXT; Commodore keeps EL/ER. Reset only in MODERN.
+    procedure ResetErrorStateIfModern(Ctx: TExecutionContext);
     // File management operations (executed directly in VM)
     procedure ExecuteCopyFile(const Src, Dest: string; Overwrite: Boolean);
     procedure ExecuteScratch(const Pattern: string; Force: Boolean; Silent: Boolean = False);
@@ -3434,6 +3436,7 @@ begin
             Ctx.PC := Ctx.ResumePC;
           end;
           Ctx.InErrorHandler := False;
+          ResetErrorStateIfModern(Ctx);  // FreeBASIC clears Err after RESUME (MODERN only)
           Exit;  // Don't increment PC
         end;
         // If not in error handler, just continue
@@ -3446,6 +3449,7 @@ begin
           // Jump to the instruction AFTER the one that caused the error
           Ctx.PC := Ctx.ResumePC + 1;
           Ctx.InErrorHandler := False;
+          ResetErrorStateIfModern(Ctx);  // FreeBASIC clears Err after RESUME NEXT (MODERN only)
           Exit;  // Don't increment PC - we already set it
         end;
         // If not in error handler, just continue
@@ -3464,8 +3468,16 @@ begin
         begin
           Ctx.PC := Instr.Immediate;
           Ctx.InErrorHandler := False;
+          ResetErrorStateIfModern(Ctx);  // FreeBASIC clears Err after RESUME <label> (MODERN only)
           Exit;  // Don't increment PC - we already set it
         end;
+      end;
+    bcRaiseError:
+      begin
+        // ERROR <n> - raise a user runtime error number n. The run-loop except handler reads the
+        // code into ERR and transfers to any active ON ERROR / TRAP handler (or aborts if none).
+        raise TExecutorRuntimeException.CreateWithCode(
+          'Error ' + IntToStr(Ctx.IntRegs[Instr.Src1]), Ctx.IntRegs[Instr.Src1]);
       end;
     bcNop: ;
     bcClear: ClearAllVariables;
@@ -6874,6 +6886,18 @@ begin
 end;
 
 { ========== FILE MANAGEMENT COMMANDS (executed directly in VM) ========== }
+
+procedure TBytecodeVM.ResetErrorStateIfModern(Ctx: TExecutionContext);
+begin
+  // FreeBASIC: "Err is reset by Resume and Resume Next." Commodore BASIC keeps EL/ER until the
+  // next error, so only clear in MODERN.
+  if Assigned(FProgram) and FProgram.ModernMode then
+  begin
+    Ctx.LastErrorCode := 0;
+    Ctx.LastErrorLine := 0;
+    Ctx.LastErrorMessage := '';
+  end;
+end;
 
 procedure TBytecodeVM.RaiseFileError(const FBMsg: string; FBCode: Integer; const CBMMsg: string; CBMCode: Integer);
 begin

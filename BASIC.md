@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 431 / 643 implemented (67%)** (+ 4 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 432 / 643 implemented (67%)** (+ 4 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **431 (75%)** are implemented. See the
+**572 applicable** keywords, **432 (76%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -2124,7 +2124,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `ERFN` | ✗ | Gets the name of the function where the error occurred. (Deferred: needs a per-PC function map.) |
 | `ERMN` | ✗ | Gets the name of the source file where the error occurred. (Deferred: needs a per-PC file map.) |
 | `ERR` | ✓ | Error number of the last error that occurred (alias of `ER`). |
-| `ERROR` | ✗ | Generates an error using an error number. |
+| `ERROR` | ✓ | `ERROR <n>` raises a user runtime error number n (caught by `ON ERROR`; `ERR` returns n). Intercepted by name, so `ERROR` stays usable as an identifier. |
 
 #### Handling Errors
 

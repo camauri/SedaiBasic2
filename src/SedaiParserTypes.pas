@@ -116,6 +116,7 @@ type
     antResume,            // RESUME statement (continue after error)
     antResumeNext,        // RESUME NEXT statement (continue after error at next statement)
     antOnError,           // ON [LOCAL] ERROR GOTO label (FreeBASIC label-based error handler)
+    antErrorStmt,         // ERROR <n>: raise a user-defined runtime error (FreeBASIC/QB)
     antRem,               // REM statement
 
     // === CONTROL FLOW ===

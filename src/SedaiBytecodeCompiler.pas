@@ -268,6 +268,7 @@ begin
     ssaResumeNext: Result := bcResumeNext;
     ssaOnError: Result := bcOnError;
     ssaResumeLabel: Result := bcResumeLabel;
+    ssaRaiseError: Result := bcRaiseError;
     ssaJump: Result := bcJump;
     ssaJumpIfZero: Result := bcJumpIfZero;
     ssaJumpIfNotZero: Result := bcJumpIfNotZero;

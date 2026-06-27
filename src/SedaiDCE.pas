@@ -311,6 +311,7 @@ begin
     ssaTron, ssaTroff,  // TRON/TROFF switch VM execution mode (side effect)
     ssaTrap, ssaResume, ssaResumeNext,  // Error handling (side effect on VM state)
     ssaOnError, ssaResumeLabel,  // FreeBASIC label-based error handling (side effect on VM state)
+    ssaRaiseError,  // ERROR <n> raises a runtime error (side effect / control transfer)
     ssaKey:  // KEY command - prints key list or modifies function key state
       Result := True;
 

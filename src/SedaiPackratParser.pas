@@ -274,6 +274,7 @@ type
     function ParseSeekStatement: TASTNode;         // FreeBASIC SEEK #n, pos (set position)
     function ParseNameStatement: TASTNode;         // FreeBASIC NAME old AS new (rename)
     function PeekNameHasAs: Boolean;               // lookahead: NAME ... AS ... on this statement
+    function ParseRaiseErrorStatement: TASTNode;   // FreeBASIC ERROR <n> (raise runtime error)
     function ParseBinaryFileTail(IsGet: Boolean; const Tok: TLexerToken): TASTNode;  // GET/PUT #n,[pos],var
     function ParseErrorHandlingStatement: TASTNode;
     function ParseDebugStatement: TASTNode;
@@ -929,6 +930,13 @@ begin
         // assignment "name = ..." (no bare AS) and from "name" used as a value.
         else if (UpperCase(Token.Value) = kNAME) and PeekNameHasAs then
           Result := ParseNameStatement
+        // FreeBASIC/QB "ERROR <n>" — raise a user runtime error. ERROR is a bare identifier (not
+        // reserved); an argument (not '=' / '.' / '(' / '[' / end-of-statement) selects the statement
+        // form and keeps "error" usable as a variable.
+        else if (UpperCase(Token.Value) = kERROR) and Assigned(Context.PeekNext) and
+                not (Context.PeekNext.TokenType in [ttOpEq, ttOpDot, ttDelimParOpen, ttDelimBrackOpen,
+                                                    ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+          Result := ParseRaiseErrorStatement
         // Note: the FreeBASIC in-place "MID(dst,start[,len]) = src" statement (MODERN) is intercepted
         // earlier by the dialect profile's IdentMidStatementHandler (mechanism 3), so it does not need
         // a branch here; in CLASSIC bare MID is a plain identifier handled by the default path below.
@@ -4580,6 +4588,20 @@ begin
   NewExpr := ParseExpression;   // new path
   if Assigned(NewExpr) then Result.AddChild(NewExpr);
 
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseRaiseErrorStatement: TASTNode;
+// FreeBASIC/QB "ERROR <n>" -> antErrorStmt (child0 = error number expression).
+var
+  Tok: TLexerToken;
+  NumExpr: TASTNode;
+begin
+  Tok := Context.CurrentToken;
+  Context.Advance;  // consume ERROR
+  Result := TASTNode.Create(antErrorStmt, Tok);
+  NumExpr := ParseExpression;
+  if Assigned(NumExpr) then Result.AddChild(NumExpr);
   DoNodeCreated(Result);
 end;
 

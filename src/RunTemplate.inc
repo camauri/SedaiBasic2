@@ -948,9 +948,11 @@ begin
               begin
                 Inc(CurPC);
                 Ctx.InErrorHandler := False;
+                ResetErrorStateIfModern(Ctx);
                 System.Continue;
               end;
               Ctx.InErrorHandler := False;
+              ResetErrorStateIfModern(Ctx);  // FreeBASIC clears Err after RESUME (MODERN only)
               // NOTE: Must use System.Continue to get loop control, NOT Self.Continue method!
               System.Continue;  // Jump to resume PC immediately
             end
@@ -968,6 +970,7 @@ begin
               if CurPC < 0 then
                 CurPC := InstrCount;  // No more lines - end program
               Ctx.InErrorHandler := False;
+              ResetErrorStateIfModern(Ctx);  // FreeBASIC clears Err after RESUME NEXT (MODERN only)
               // NOTE: Must use System.Continue to get loop control, NOT Self.Continue method!
               System.Continue;  // Jump to new PC immediately
             end
@@ -989,6 +992,7 @@ begin
             begin
               CurPC := Instr.Immediate;
               Ctx.InErrorHandler := False;
+              ResetErrorStateIfModern(Ctx);  // FreeBASIC clears Err after RESUME <label> (MODERN only)
               System.Continue;  // Jump to target PC immediately
             end
             else
@@ -999,7 +1003,8 @@ begin
         bcLoad, bcSave, bcVerify, bcBload, bcBsave, bcBoot,
         bcRun, bcList, bcNew, bcCatalog,
         // File management commands
-        bcCopyFile, bcScratch, bcRenameFile, bcConcat, bcMkdir, bcChdir, bcRmdir, bcMoveFile:
+        bcCopyFile, bcScratch, bcRenameFile, bcConcat, bcMkdir, bcChdir, bcRmdir, bcMoveFile,
+        bcRaiseError:
           begin
             Ctx.PC := CurPC;
             ExecuteInstruction(Ctx, Instr);

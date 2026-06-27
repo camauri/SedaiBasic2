@@ -14712,6 +14712,19 @@ begin
         EmitInstruction(ssaTrap, MakeSSAValue(svkNone), MakeSSAConstInt(0),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
+    antErrorStmt:
+    begin
+      // ERROR <n> - raise a user-defined runtime error with number n (Src1 = number register).
+      // The VM raises a coded exception; the run-loop handler sets ERR=n and jumps to any active
+      // ON ERROR / TRAP handler, exactly like a built-in runtime error.
+      if Node.ChildCount >= 1 then
+      begin
+        ProcessExpression(Node.GetChild(0), ExprResult);
+        LineNumReg := EnsureIntRegister(ExprResult);
+        EmitInstruction(ssaRaiseError, MakeSSAValue(svkNone), LineNumReg,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+    end;
     antResumeNext:
     begin
       // RESUME NEXT - continue at next statement after error

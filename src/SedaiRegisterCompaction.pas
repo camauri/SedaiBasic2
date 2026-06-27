@@ -419,6 +419,8 @@ begin
     bcJumpIfZero, bcJumpIfNotZero,
     // Error handling - RESUME <line> reads line number from Src1
     bcResume,
+    // ERROR <n> reads the user error number from Src1
+    bcRaiseError,
     // Bitwise operations
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
     // === GROUP 3: Pointer deref (FreeBASIC): Src1 = address register (always int) ===
