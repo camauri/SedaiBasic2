@@ -1269,10 +1269,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `DIM` | ✓ | Declares a variable at the current scope. |
 | `CONST` | ✓ | Declares a non-modifiable variable. |
-| `SCOPE` | ✗ | Begins a new scope block. |
-| `STATIC` | ✗ | Declares variables in a procedure that retain their value between calls. |
-| `SHARED` | ✗ | Used with Dim allows variables to be visible throughout a module. |
-| `VAR` | ✗ | Declares variables where the data type is implied from an initializer. |
+| `SCOPE` | ✓ | Begins a new scope block. |
+| `STATIC` | ✓ | Declares variables in a procedure that retain their value between calls. |
+| `SHARED` | ✓ | Used with Dim allows variables to be visible throughout a module. |
+| `VAR` | ✓ | Declares variables where the data type is implied from an initializer. |
 | `BYREF (variables)` | ✗ | Used with Dim or Static or Var allows to declare references. |
 
 #### User Defined Types

@@ -1688,9 +1688,7 @@ begin
  RegisterKeyword(kDATA,    ttDataConstant,    'Data statement',       kcData);
  RegisterKeyword(kDIM,     ttDataDeclaration, 'Dimension arrays',     kcData);
  RegisterKeyword(kVAR,     ttDataDeclaration, 'Declare with inferred type (FreeBASIC)', kcData);
- // STATIC (persistent-storage local) is parsed (ParseStaticStatement) but not yet wired for SSA
- // persistence — keyword registration is deferred so it stays a plain identifier until then.
- // RegisterKeyword(kSTATIC,  ttDataDeclaration, 'Declare a static-storage local (FreeBASIC)', kcData);
+ RegisterKeyword(kSTATIC,  ttDataDeclaration, 'Declare a static-storage local (FreeBASIC)', kcData);
  RegisterKeyword(kERASE,   ttArrayErase,      'Reset array elements to default (FreeBASIC)', kcData);
  RegisterKeyword(kLSET,    ttLSet,            'Left-justify a string into a buffer (FreeBASIC/QBasic)',  kcData);
  RegisterKeyword(kRSET,    ttRSet,            'Right-justify a string into a buffer (FreeBASIC/QBasic)', kcData);
@@ -2011,7 +2009,7 @@ begin
   // FreeBASIC/QBasic-only keywords: declassified to plain identifiers in CLASSIC (Commodore v7), so a
   // v7 program may still use these names as variables. They keep their keyword meaning in MODERN.
   // Commodore v7 has no CONTINUE (CONT is separate)/LSET/RSET/ENUM/DEF* , so this is safe.
-  SetKeywordsDialect([kCONTINUE, kLSET, kRSET, kENUM, kNAMESPACE, kSCOPE, kVAR,
+  SetKeywordsDialect([kCONTINUE, kLSET, kRSET, kENUM, kNAMESPACE, kSCOPE, kVAR, kSTATIC,
                       kDEFINT, kDEFLNG, kDEFBYTE, kDEFSHORT, kDEFLNGINT, kDEFSNG, kDEFDBL, kDEFSTR,
                       kNOW, kTIMER, kDATEFN, kTIMEFN, kSETDATE, kSETTIME],
                      kdModernOnly);

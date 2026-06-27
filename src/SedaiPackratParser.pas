@@ -5037,6 +5037,8 @@ begin
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected a variable name after VAR', Context.CurrentToken);
+      while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+        Context.Advance;                             // recover: skip the bad statement (avoid a re-parse loop)
       Break;
     end;
     NameTok := Context.CurrentToken;
@@ -5080,6 +5082,8 @@ begin
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected a variable name after STATIC', Context.CurrentToken);
+      while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+        Context.Advance;                             // recover: skip the bad statement (avoid a re-parse loop)
       Break;
     end;
     NameTok := Context.CurrentToken;

@@ -34,7 +34,7 @@ interface
 uses
   Classes, SysUtils, StrUtils, Variants, Math, Generics.Collections,
   SedaiLexerTypes, SedaiLexerToken, SedaiParserTypes, SedaiAST,
-  SedaiSSATypes, SedaiBasicKeywords, SedaiNamespace;
+  SedaiSSATypes, SedaiBasicKeywords, SedaiNamespace, SedaiStaticLocals;
 
 type
   { Loop info for FOR/NEXT implementation }
@@ -14243,6 +14243,10 @@ begin
   // FreeBASIC NAMESPACE: flatten namespace blocks into mangled, module-level declarations before any
   // pre-scan walks the AST. No-op when the program has no NAMESPACE (keyword is MODERN-only anyway).
   FlattenNamespaces(AST);
+
+  // FreeBASIC STATIC locals: rewrite each proc-level STATIC into a hoisted, uniquely-named DIM SHARED
+  // global (persistent across calls, initialised once). No-op without STATIC declarations.
+  LowerStaticLocals(AST);
 
   // FB lexical scope: reset the scope stack (module scope is FVarMap itself; the stack holds only
   // proc-root and block frames, pushed during lowering in MODERN mode). Inert in CLASSIC.
