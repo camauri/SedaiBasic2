@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 410 / 643 implemented (64%)** (+ 4 partial); see the
+**FreeBASIC keyword set — 411 / 643 implemented (64%)** (+ 4 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -2261,7 +2261,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `FILEATTR` | ✗ | Gets information about a file bound to a file number. |
 | `FILECOPY` | ✗ | Copies a file. |
 | `FILEDATETIME` | ✗ | Gets the last modified date and time of a file. |
-| `FILEEXISTS` | ✗ | Tests for the existence of a file. |
+| `FILEEXISTS` | ✓ | `FILEEXISTS(path)` returns -1 if the file exists, else 0 (cross-platform). |
 | `FILELEN` | ✗ | Gets the length (in bytes) of a file. |
 | `FILESETEOF` | ✗ | Sets the length of an open file bound to a file number. |
 | `FILEFLUSH` | ✗ | Flushes application or system buffers for an open file bound to a file number. |

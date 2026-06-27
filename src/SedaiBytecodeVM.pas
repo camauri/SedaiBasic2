@@ -2506,7 +2506,7 @@ begin
         end;
 
         // String Src1 (source) -> int Dest
-        bcStrLen, bcStrLenW, bcStrAsc, bcStrDec, bcStrValInt, bcStrSAdd, bcStrCvInt:
+        bcStrLen, bcStrLenW, bcStrAsc, bcStrDec, bcStrValInt, bcStrSAdd, bcStrCvInt, bcFileExists:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
@@ -4293,6 +4293,9 @@ begin
       end;
     33: // bcStrSAdd - SADD(s): raw byte-heap pointer to a NUL-terminated copy of the string
       Ctx.IntRegs[Instr.Dest] := StrSAdd(Ctx.StringRegs[Instr.Src1]);
+    40: // bcFileExists - FILEEXISTS(path): -1 if the file exists, else 0 (cross-platform).
+      if FileExists(Ctx.StringRegs[Instr.Src1]) then Ctx.IntRegs[Instr.Dest] := -1
+      else Ctx.IntRegs[Instr.Dest] := 0;
     36: // bcStrMkInt - MKI/MKL/MKSHORT/MKLONGINT: binary copy of an integer into a string.
       begin
         // Immediate = byte width (2/4/8). Write the low `width` bytes, little-endian (two's complement).

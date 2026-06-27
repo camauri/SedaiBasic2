@@ -211,6 +211,7 @@ begin
     bcStrLen,      // String length returns int
     bcStrLenW,     // LEN(wstring) returns int codepoint count
     bcStrSAdd,     // SADD(s) returns int (raw pointer)
+    bcFileExists,  // FILEEXISTS(path) returns int (-1/0)
     bcStrAsc,      // ASC(str) returns int ASCII code
     bcStrInstr,    // INSTR(haystack, needle) returns int position
     bcStrInstrRev, // INSTRREV(str, sub) returns int position
@@ -659,6 +660,7 @@ begin
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
     // === GROUP 1: String operations ===
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrLen, bcStrLenW, bcStrAsc, bcStrSAdd,
+    bcFileExists,  // FILEEXISTS(path): Src1 = path string
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src1 = source string
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string
     bcStrVal,    // VAL(str) - reads string, produces float

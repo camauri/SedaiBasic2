@@ -317,6 +317,7 @@ const
   kBITRESET= 'BITRESET';  // FreeBASIC: x with bit b cleared (x AND NOT (1 SHL b))
   kCBOOL   = 'CBOOL';     // FreeBASIC: convert to boolean (-1 if nonzero, else 0)
   kARRAYLEN = 'ARRAYLEN'; // FreeBASIC: total number of elements in an array (intercepted as array-access)
+  kFILEEXISTS = 'FILEEXISTS'; // FreeBASIC: -1 if a file exists, else 0 (intercepted as array-access)
   kRANDOMIZE = 'RANDOMIZE'; // FreeBASIC/QB: seed the RNG (RANDOMIZE [seed])
   kVARPTR  = 'VARPTR';    // FreeBASIC: VARPTR(v) -> address of a variable (= @v) (intercepted as array-access)
   kPROCPTR = 'PROCPTR';   // FreeBASIC: PROCPTR(p) -> address of a procedure (= @p) (intercepted as array-access)

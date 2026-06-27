@@ -125,6 +125,7 @@ type
     ssaStrWChr,        // WCHR(n) -> UTF-8 bytes of Unicode codepoint n (Src1=int)
     ssaStrWStringN,    // WSTRING(n,cp) -> n copies of the UTF-8 char for codepoint cp (Src1=int n, Src2=int cp)
     ssaStrSAdd,        // SADD(s) -> raw byte-heap pointer to a NUL-terminated copy of s (Dest=int, Src1=string)
+    ssaFileExists,     // FILEEXISTS(path) -> -1 if the file exists else 0 (Dest=int, Src1=string)
     // FreeBASIC numeric serialization (B3): pack/unpack a number to/from a fixed-width binary string.
     ssaStrMkInt,       // MKI/MKL/MKSHORT/MKLONGINT -> binary string of an int (Dest=string, Src1=int, Imm=byte width)
     ssaStrMkFloat,     // MKS/MKD -> 4/8-byte IEEE binary string of a float (Dest=string, Src1=float, Imm=byte width)

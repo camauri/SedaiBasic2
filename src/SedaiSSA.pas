@@ -3348,6 +3348,17 @@ begin
           Exit;
         end;
 
+        // FreeBASIC FILEEXISTS(path): -1 if the file exists, else 0. MODERN, not a declared array.
+        if FModernMode and (UpperCase(ArrName) = kFILEEXISTS) and (FProgram.FindArray(ArrName) < 0) and
+           (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ArgReg := EnsureStringRegister(ArgValue);
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaFileExists, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
         // FreeBASIC VARPTR(v) / PROCPTR(p): the address of a variable / procedure. Both are exactly
         // "@arg" in our model — synthesize an antProcAddress for the argument and process it (the @
         // lowering handles a scalar / array element / UDT field|handle / SHARED global / SUB entry PC).

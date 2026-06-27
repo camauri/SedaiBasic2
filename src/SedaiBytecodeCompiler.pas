@@ -177,6 +177,7 @@ begin
     ssaStrWChr: Result := bcStrWChr;
     ssaStrWStringN: Result := bcStrWStringN;
     ssaStrSAdd: Result := bcStrSAdd;
+    ssaFileExists: Result := bcFileExists;
     ssaStrMkInt: Result := bcStrMkInt;
     ssaStrMkFloat: Result := bcStrMkFloat;
     ssaStrCvInt: Result := bcStrCvInt;

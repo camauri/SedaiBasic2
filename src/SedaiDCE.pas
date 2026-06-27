@@ -292,6 +292,9 @@ begin
     ssaRawAlloc, ssaRawFree, ssaRawRealloc, ssaRawStoreInt, ssaRawStoreFloat,
     // SADD(s) allocates a fresh raw byte-heap copy each call — allocating, so never elide or CSE it.
     ssaStrSAdd,
+    // FILEEXISTS depends on external filesystem state — keep it (don't elide/CSE) so repeated checks
+    // re-query rather than being deduplicated.
+    ssaFileExists,
     // SETDATE/SETTIME mutate the VM-internal clock offset — a side effect, never elide it.
     ssaSetClock,
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString,
