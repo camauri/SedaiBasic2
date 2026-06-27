@@ -130,6 +130,8 @@ const
   kDEFBYTE = 'DEFBYTE';
   kDEFSHORT = 'DEFSHORT';
   kDEFLNGINT = 'DEFLNGINT';
+  kDEFLONGINT = 'DEFLONGINT';   // FreeBASIC: default LONGINT type by initial letter (int bank)
+  kDEFULONGINT = 'DEFULONGINT'; // FreeBASIC: default ULONGINT type by initial letter (int bank)
   kDEFSNG  = 'DEFSNG';
   kDEFDBL  = 'DEFDBL';
   kDEFSTR  = 'DEFSTR';

@@ -1706,6 +1706,8 @@ begin
  RegisterKeyword(kDEFBYTE, ttDefType,         'Default BYTE type by initial letter (FreeBASIC)',    kcData);
  RegisterKeyword(kDEFSHORT,ttDefType,         'Default SHORT type by initial letter (FreeBASIC)',   kcData);
  RegisterKeyword(kDEFLNGINT,ttDefType,        'Default LONGINT type by initial letter (FreeBASIC)', kcData);
+ RegisterKeyword(kDEFLONGINT,ttDefType,       'Default LONGINT type by initial letter (FreeBASIC)', kcData);
+ RegisterKeyword(kDEFULONGINT,ttDefType,      'Default ULONGINT type by initial letter (FreeBASIC)',kcData);
  RegisterKeyword(kDEFSNG,  ttDefType,         'Default SINGLE type by initial letter (FreeBASIC)',  kcData);
  RegisterKeyword(kDEFDBL,  ttDefType,         'Default DOUBLE type by initial letter (FreeBASIC)',  kcData);
  RegisterKeyword(kDEFSTR,  ttDefType,         'Default STRING type by initial letter (FreeBASIC)',  kcData);
@@ -2017,7 +2019,7 @@ begin
   // v7 program may still use these names as variables. They keep their keyword meaning in MODERN.
   // Commodore v7 has no CONTINUE (CONT is separate)/LSET/RSET/ENUM/DEF* , so this is safe.
   SetKeywordsDialect([kCONTINUE, kLSET, kRSET, kENUM, kNAMESPACE, kSCOPE, kVAR, kSTATIC,
-                      kDEFINT, kDEFLNG, kDEFBYTE, kDEFSHORT, kDEFLNGINT, kDEFSNG, kDEFDBL, kDEFSTR,
+                      kDEFINT, kDEFLNG, kDEFBYTE, kDEFSHORT, kDEFLNGINT, kDEFLONGINT, kDEFULONGINT, kDEFSNG, kDEFDBL, kDEFSTR,
                       kNOW, kTIMER, kDATEFN, kTIMEFN, kSETDATE, kSETTIME],
                      kdModernOnly);
 

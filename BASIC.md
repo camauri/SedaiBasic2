@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 418 / 643 implemented (65%)** (+ 4 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 420 / 643 implemented (65%)** (+ 4 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **418 (73%)** are implemented. See the
+**572 applicable** keywords, **420 (73%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1754,8 +1754,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `DEFLONGINT` | ✗ |  |
-| `DEFULONGINT` | ✗ |  |
+| `DEFLONGINT` | ✓ | Default LONGINT type by initial letter (int bank), like DEFINT/DEFLNG. |
+| `DEFULONGINT` | ✓ | Default ULONGINT type by initial letter (int bank; unsigned not distinguished). |
 
 #### Intrinsic Defines
 
