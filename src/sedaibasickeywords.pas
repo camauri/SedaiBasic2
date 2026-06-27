@@ -454,6 +454,10 @@ const
   kRENUMBER = 'RENUMBER';
   kRWINDOW = 'RWINDOW';
   kSCNCLR  = 'SCNCLR';
+  kCLS     = 'CLS';       // FreeBASIC/QB: clear screen (alias of SCNCLR)
+  kINKEY   = 'INKEY';     // FreeBASIC: INKEY non-blocking key read (returns "" if none)
+  kINKEYS  = 'INKEY$';    // QB: INKEY$ non-blocking key read (string form)
+  kCSRLIN  = 'CSRLIN';    // FreeBASIC/QB: current text cursor row
   kWINDOW  = 'WINDOW';
 
   // Arithmetic operators

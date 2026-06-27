@@ -1274,6 +1274,21 @@ begin
         Result := MakeSSARegister(srtString, DestReg);
         EmitInstruction(ssaLoadCWDS, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
+      else if (VarName = 'INKEY') or (VarName = 'INKEY$') then
+      begin
+        // INKEY / INKEY$ (FreeBASIC/QB): non-blocking read of one key; "" if none. Reuses the
+        // GET non-blocking key opcode as an expression (side-effecting: consumes one keystroke).
+        DestReg := FProgram.AllocRegister(srtString);
+        Result := MakeSSARegister(srtString, DestReg);
+        EmitInstruction(ssaGet, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if VarName = 'CSRLIN' then
+      begin
+        // CSRLIN (FreeBASIC/QB): current text cursor row (parallels POS(0) for the column).
+        DestReg := FProgram.AllocRegister(srtInt);
+        Result := MakeSSARegister(srtInt, DestReg);
+        EmitInstruction(ssaCsrlin, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
       else if (VarName = 'EL') or (VarName = 'ERL') then
       begin
         // EL / ERL (FreeBASIC) returns last error line number - integer

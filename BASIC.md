@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 423 / 643 implemented (66%)** (+ 4 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 427 / 643 implemented (66%)** (+ 4 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **423 (74%)** are implemented. See the
+**572 applicable** keywords, **427 (75%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -180,7 +180,7 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `GETKEY` | ✓ | Get keypress (blocking, waits for key) |
 | `INPUT` | ✓ | Input statement |
 | `CHAR` | ✓ | Displays text at specific position (mode, col, row, text [,reverse]) |
-| `PRINT` | ✓ | Print statement |
+| `PRINT` | ✓ | Print statement (`?` is accepted as an abbreviation, Commodore/FreeBASIC style) |
 | `PUDEF` | ✓ | Redefine PRINT USING symbols (filler, comma, decimal, dollar) |
 | `USING` | ✓ | Formatted output (PRINT USING "#$######.##";value) |
 
@@ -2053,16 +2053,16 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `CLS` | ✗ | Clears the entire screen or text viewport. |
+| `CLS` | ✓ | Clears the screen and homes the cursor (alias of `SCNCLR`; resets `POS`/`CSRLIN` to 0). |
 | `WIDTH` | ✓ | Sets or returns the number of rows and columns of the console display. |
-| `VIEW PRINT` | ✗ | Sets the printable area of the console screen. |
+| `VIEW PRINT` | ✗ | Sets the printable area of the console screen. (Deferred: needs a scroll-region console.) |
 
 #### Cursor Color and Positioning
 
 | Keyword | Status | Description |
 |---|---|---|
 | `COLOR` | ✓ | Changes the foreground and background color of text to be written. |
-| `CSRLIN` | ✗ | Returns the row position of the cursor. |
+| `CSRLIN` | ✓ | Returns the row position of the cursor (VM-tracked, parallels `POS`). |
 | `POS` | ✓ | Returns the column position of the cursor. |
 | `LOCATE` | ✓ | Sets the row and column position of the cursor and its visibility. |
 | `SCREEN (Console)` | ✗ | Gets the character or color attribute at a given location. |
@@ -2420,7 +2420,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `INKEY` | ✗ | Gets the first key, if any, waiting in the keyboard buffer. |
+| `INKEY` | ✓ | Non-blocking read of the first key waiting in the keyboard buffer (`INKEY` / `INKEY$`); returns `""` if none. |
 | `GETKEY` | ✓ | Gets and waits for the first key in the keyboard buffer. |
 
 #### Detecting key status by keyboard scancode
@@ -2514,7 +2514,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `CLS` | ✗ | Clears the entire screen or viewport. |
+| `CLS` | ✓ | Clears the screen and homes the cursor (alias of `SCNCLR`). |
 | `SCREENSET` | ✗ | Sets the current work and visible pages. |
 | `SCREENCOPY and PCOPY and FLIP` | ✗ | Copies pixel data from one page to another. |
 | `SCREENSYNC` | ✗ | Waits for the vertical refresh of the monitor. |

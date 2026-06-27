@@ -104,6 +104,7 @@ type
 
     // --- Cursor / print state ---
     CursorCol: Integer;         // Track cursor column for TAB zones
+    CursorRow: Integer;         // Track cursor row for CSRLIN (incremented at each print newline)
 
     // --- TRAP/RESUME error handling state ---
     TrapLine: Integer;          // Line to jump to on error (0 = no trap)

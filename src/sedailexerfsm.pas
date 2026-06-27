@@ -1640,6 +1640,24 @@ begin
           Exit;
         end;
 
+      // === '?' IS AN ALIAS FOR PRINT (Commodore BASIC and FreeBASIC) ===
+      // Emit a PRINT token (ttOutputCommand, value 'PRINT') so the statement parser dispatches to
+      // ParsePrintStatement. '?' inside a string literal never reaches here (the '"' handler consumes
+      // the whole string first).
+      '?':
+        begin
+          ResetToken;
+          TokenBufferAdd(CurrentChar);
+          AdvanceChar;
+          Result := CreateToken(ttOutputCommand);
+          Result.SetExtractedValue(kPRINT);
+          {$IFDEF DEBUG}
+          if FDebugMode then
+            FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
+          {$ENDIF}
+          Exit;
+        end;
+
       // === SINGLE CHAR OPERATORS - ZERO PROCESSING ===
       // Arithmetic operators. FreeBASIC compound assignment ("op="): if '=' follows, emit a single
       // ttCompoundAssign token whose value is the operator symbol (the trailing '=' is consumed but not

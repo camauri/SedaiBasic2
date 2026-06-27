@@ -536,6 +536,7 @@ begin
   SetLength(FCtx.Records, 0);
   FCtx.RecordCount := 0;
   FCtx.CursorCol := 0;
+  FCtx.CursorRow := 0;
   // Initialize time tracking
   FStartTicks := GetTickCount64;
   FTimeOffset := 0;
@@ -1677,6 +1678,7 @@ begin
   SetLength(WCtx.Records, 0);
   WCtx.RecordCount := 0;
   WCtx.CursorCol := 0;
+  WCtx.CursorRow := 0;
   WCtx.TrapLine := 0;
   WCtx.TrapPC := -1;
   WCtx.ResumePC := -1;
@@ -5367,6 +5369,7 @@ begin
           FOutputDevice.Print(PrintStr);
           FOutputDevice.NewLine;  // NewLine already calls Present
           Ctx.CursorCol := 0;
+          Inc(Ctx.CursorRow);  // CSRLIN: advance to next text row on a print newline
         end;
       end;
     2: // bcPrintString
@@ -5393,6 +5396,7 @@ begin
           FOutputDevice.Print(PrintStr);
           FOutputDevice.NewLine;  // NewLine already calls Present
           Ctx.CursorCol := 0;
+          Inc(Ctx.CursorRow);  // CSRLIN: advance to next text row on a print newline
         end;
       end;
     4: // bcPrintInt
@@ -5419,6 +5423,7 @@ begin
           FOutputDevice.Print(PrintStr);
           FOutputDevice.NewLine;  // NewLine already calls Present
           Ctx.CursorCol := 0;
+          Inc(Ctx.CursorRow);  // CSRLIN: advance to next text row on a print newline
         end;
       end;
     16: // bcPrintBool (B1.5): a BOOLEAN prints as "true"/"false"
@@ -5451,6 +5456,7 @@ begin
         begin
           FOutputDevice.NewLine;
           Ctx.CursorCol := 0;
+          Inc(Ctx.CursorRow);  // CSRLIN: advance to next text row on a print newline
         end
         else if FConsoleBehavior.CommaAction = caTabZone then
         begin
@@ -5472,6 +5478,7 @@ begin
         begin
           FOutputDevice.NewLine;
           Ctx.CursorCol := 0;
+          Inc(Ctx.CursorRow);  // CSRLIN: advance to next text row on a print newline
         end;
       end;
     7: // bcPrintSemicolon
@@ -5523,6 +5530,7 @@ begin
         begin
           FOutputDevice.NewLine;
           Ctx.CursorCol := 0;
+          Inc(Ctx.CursorRow);  // CSRLIN: advance to next text row on a print newline
         end;
       end;
     11: // bcPrintEnd - Reset reverse mode after PRINT (C128 behavior)
@@ -5735,6 +5743,8 @@ begin
       end;
     10: // bcLoadCWDS - return current working directory
       Ctx.StringRegs[Instr.Dest] := GetCurrentDir;
+    11: // bcCsrlin - return current text cursor row (VM-tracked, parallels POS/CursorCol)
+      Ctx.IntRegs[Instr.Dest] := Ctx.CursorRow;
   else
     raise Exception.CreateFmt('Unknown special variable opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
@@ -5947,9 +5957,13 @@ begin
         Ctx.IntRegs[Instr.Dest] := Int64(FOutputDevice.GetPaletteColor(Ctx.IntRegs[Instr.Src1]))
       else
         Ctx.IntRegs[Instr.Dest] := 0;
-    21: // bcScnClr - SCNCLR [mode]
-      if Assigned(FOutputDevice) then
-        FOutputDevice.ClearScreen(Ctx.IntRegs[Instr.Src1]);
+    21: // bcScnClr - SCNCLR [mode] / CLS: clear screen and home the cursor (POS/CSRLIN -> 0)
+      begin
+        if Assigned(FOutputDevice) then
+          FOutputDevice.ClearScreen(Ctx.IntRegs[Instr.Src1]);
+        Ctx.CursorCol := 0;
+        Ctx.CursorRow := 0;
+      end;
     22: // bcPLoad - PLOAD "filename"
       if Assigned(FOutputDevice) then
       begin

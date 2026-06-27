@@ -247,6 +247,7 @@ type
     ssaLoadEL,         // EL: Load last error line number
     ssaLoadER,         // ER: Load last error code
     ssaLoadERRS,       // ERR$: Load last error message (variable, not function)
+    ssaCsrlin,         // CSRLIN: current text cursor row
     ssaFre,            // FRE(x): Return available memory in bytes
     // Memory operations
     ssaPeek,           // PEEK(address): Read from memory-mapped location

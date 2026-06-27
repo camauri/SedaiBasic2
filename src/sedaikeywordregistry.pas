@@ -1833,6 +1833,7 @@ begin
  RegisterKeyword(kPAINT,   ttGraphicsCommand,  'Fill area with color',                             kcGraphicsHandling);
  RegisterKeyword(kSCALE,   ttGraphicsCommand,  'Alter scaling in graphics mode',                   kcGraphicsHandling);
  RegisterKeyword(kSCNCLR,  ttGraphicsCommand,  'Clear screen',                                     kcGraphicsHandling);
+ RegisterKeyword(kCLS,     ttGraphicsCommand,  'Clear screen (FreeBASIC/QB, alias of SCNCLR)',     kcGraphicsHandling);
  RegisterKeyword(kPLOAD,   ttGraphicsCommand,  'Load palette from JSON file',                      kcGraphicsHandling);
  RegisterKeyword(kPSAVE,   ttGraphicsCommand,  'Save palette to JSON file',                        kcGraphicsHandling);
  RegisterKeyword(kPRST,    ttGraphicsCommand,  'Reset palette to C64 default',                     kcGraphicsHandling);
@@ -1968,6 +1969,9 @@ begin
  RegisterKeyword(kTI,  ttSpecialVariable, 'Get time elapse from power on', kcReservedVariables);
  RegisterKeyword(kTIS, ttSpecialVariable, 'Get/set 24h clock',             kcReservedVariables);
  RegisterKeyword(kDTS, ttSpecialVariable, 'Get current date YYYYMMDD',     kcReservedVariables);
+ RegisterKeyword(kINKEY,  ttSpecialVariable, 'Non-blocking key read (FreeBASIC INKEY)',   kcReservedVariables);
+ RegisterKeyword(kINKEYS, ttSpecialVariable, 'Non-blocking key read (QB INKEY$)',         kcReservedVariables);
+ RegisterKeyword(kCSRLIN, ttSpecialVariable, 'Current text cursor row',                   kcReservedVariables);
  RegisterKeyword(kCWDS, ttSpecialVariable, 'Get current working directory', kcReservedVariables);
 
   // === ERROR HANDLING (COMMANDS AND FUNCTIONS) ===

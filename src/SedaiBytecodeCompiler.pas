@@ -390,6 +390,7 @@ begin
     ssaLoadEL: Result := bcLoadEL;
     ssaLoadER: Result := bcLoadER;
     ssaLoadERRS: Result := bcLoadERRS;
+    ssaCsrlin: Result := bcCsrlin;
     ssaFre: Result := bcFre;
     // Memory operations
     ssaPeek: Result := bcPeek;

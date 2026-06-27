@@ -382,6 +382,8 @@ begin
       Line := Format('%4d: %-20s R%d', [Index, 'LoadER', Instr.Dest]);
     bcLoadERRS:
       Line := Format('%4d: %-20s R%d', [Index, 'LoadERR$', Instr.Dest]);
+    bcCsrlin:
+      Line := Format('%4d: %-20s R%d', [Index, 'Csrlin', Instr.Dest]);
     bcLoadCWDS:
       Line := Format('%4d: %-20s R%d', [Index, 'LoadCWD$', Instr.Dest]);
 

@@ -242,6 +242,7 @@ begin
     bcLoadTI,         // TI: jiffies since start (int)
     bcLoadEL,         // EL: last error line number (int)
     bcLoadER,         // ER: last error code (int)
+    bcCsrlin,         // CSRLIN: current cursor row (int)
     bcFre,            // FRE: available memory (int)
     bcPeek,           // PEEK(address): read from memory (int)
     // === GROUP 7: Sprite functions ===
@@ -363,6 +364,8 @@ begin
     bcRefLoadString,    // FreeBASIC pointer deref (string) - Dest = value loaded
     // === GROUP 4: I/O operations ===
     bcInputString,
+    bcGet,             // GET A$ / INKEY$ - Dest = char read (string), "" if none
+    bcGetkey,          // GETKEY A$ - Dest = char read (string, blocking)
     bcDataReadString,  // Read next DATA value into string register
     // === GROUP 5: Special variables ===
     bcLoadTIS,         // TI$: current time HHMMSS (string)

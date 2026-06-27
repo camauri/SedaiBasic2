@@ -3512,7 +3512,7 @@ begin
   // Select appropriate node type based on command
   if CmdName = 'GRAPHIC' then
     Result := TASTNode.Create(antGraphics, Token)
-  else if CmdName = 'SCNCLR' then
+  else if (CmdName = 'SCNCLR') or (CmdName = 'CLS') then
     Result := TASTNode.Create(antScnClr, Token)
   else if CmdName = 'BOX' then
     Result := TASTNode.Create(antBox, Token)
@@ -3561,8 +3561,8 @@ begin
     MaxParams := 2
   else if CmdName = 'DRAW' then
     MaxParams := 100  // DRAW can have many TO segments
-  else if CmdName = 'SCNCLR' then
-    MaxParams := 1  // SCNCLR [mode] - optional mode 0-11
+  else if (CmdName = 'SCNCLR') or (CmdName = 'CLS') then
+    MaxParams := 1  // SCNCLR [mode] / CLS - optional mode 0-11
   else if CmdName = 'COLOR' then
     MaxParams := 2  // COLOR source, color
   else if CmdName = 'SETCOLOR' then

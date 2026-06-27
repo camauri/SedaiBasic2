@@ -463,6 +463,7 @@ const
   bcPeek            = bcGroupSpecial + 8;   // PEEK(address): read from memory-mapped location
   bcPoke            = bcGroupSpecial + 9;   // POKE address, value: write to memory-mapped location
   bcLoadCWDS        = bcGroupSpecial + 10;  // CWD$: current working directory
+  bcCsrlin          = bcGroupSpecial + 11;  // CSRLIN: current text cursor row
 
   // === GROUP 6: FILE I/O (0x06xx) ===
   bcDopen           = bcGroupFileIO + 0;    // DOPEN #handle, "filename" [, mode$]
