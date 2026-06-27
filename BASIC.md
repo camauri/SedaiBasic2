@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 384 / 643 implemented (60%)** (+ 3 partial); see the
+**FreeBASIC keyword set — 395 / 643 implemented (61%)** (+ 3 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1604,10 +1604,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Declare` | ✗ | Declares a module-level or member procedure. |
+| `Declare` | ✓ | Forward `DECLARE SUB|FUNCTION ...` is accepted and ignored (calls are resolved by a pre-pass over the definitions). |
 | `Sub` | ✓ | Specifies a procedure that does not return an argument. |
 | `Function` | ✓ | Specifies a procedure that returns an argument. |
-| `Overload` | ✗ | Specifies that the procedure name can be used in other procedure declarations. |
+| `Overload` | ✓ | Accepted after a procedure name and ignored (overloading by arity/signature already works for constructors; the marker is not required). |
 | `Static` | ✗ | Specifies static storage for all variables and objects in the procedure body. |
 | `Const (Member)` | ✓ | Specifies a const member procedure in user-defined type definitions. |
 | `Static (Member)` | ✗ | Specifies a static member procedure in user-defined type definitions. |
@@ -1616,21 +1616,21 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Public` | ✗ | Specifies external linkage for a procedure. |
-| `Private` | ✗ | Specifies internal linkage for a procedure. |
-| `Alias` | ✗ | Specifies an alternate external name for a procedure. |
+| `Public` | ✓ | Accepted as a procedure/declaration prefix and ignored (linkage is not enforced). |
+| `Private` | ✓ | Accepted as a procedure/declaration prefix and ignored (linkage is not enforced). |
+| `Alias` | ✓ | `ALIAS "name"` accepted after a procedure name and ignored (no external linking). |
 | `Export` | ✗ | Specifies a procedure is to be exported from a shared library. |
-| `Lib` | ✗ | Specifies automatic loading of a library. |
+| `Lib` | ✓ | `LIB "name"` accepted after a procedure name and ignored (no external linking). |
 
 ##### Calling conventions
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Stdcall` | ✗ | Specifies the standard calling convention for BASIC languages, including FreeBASIC. |
-| `Cdecl` | ✗ | Specifies the standard calling convention in the C and C++ languages. |
-| `Pascal` | ✗ | Specifies the standard calling convention in the Fortran, Pascal and Microsoft QuickBASIC/QBasic languages. |
-| `Fastcall` | ✗ | Specifies the fastcall calling convention for 32-bit procedures. |
-| `Thiscall` | ✗ | Specifies the thiscall calling convention for 32-bit member procedures. |
+| `Stdcall` | ✓ | Accepted after a procedure name and ignored (single internal calling convention). |
+| `Cdecl` | ✓ | Accepted after a procedure name and ignored (single internal calling convention). |
+| `Pascal` | ✓ | Accepted after a procedure name and ignored (single internal calling convention). |
+| `Fastcall` | ✓ | Accepted after a procedure name and ignored (single internal calling convention). |
+| `Thiscall` | ✓ | Accepted after a procedure name and ignored (single internal calling convention). |
 
 ##### Parameter passing conventions
 

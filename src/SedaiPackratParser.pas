@@ -659,6 +659,29 @@ begin
    Context.CurrentIndex := SavedIndex;
  end;
 
+ // FreeBASIC linkage prefix: PRIVATE / PUBLIC before SUB/FUNCTION/TYPE/UNION/CLASS/CONST/DECLARE.
+ // SedaiBasic does not enforce module linkage, so consume the modifier and dispatch the following
+ // declaration as usual (PRIVATE/PUBLIC are not registered keywords, so they arrive as identifiers).
+ if (Token.TokenType = ttIdentifier) and
+    ((UpperCase(Token.Value) = 'PRIVATE') or (UpperCase(Token.Value) = 'PUBLIC')) and
+    Assigned(Context.PeekNext) and
+    ((Context.PeekNext.TokenType in [ttProcedureStart, ttTypeDecl, ttUnionDecl, ttConstant]) or
+     ((Context.PeekNext.TokenType = ttIdentifier) and (UpperCase(Context.PeekNext.Value) = 'DECLARE'))) then
+ begin
+   Context.Advance;                 // consume PRIVATE / PUBLIC
+   Token := Context.CurrentToken;   // re-dispatch on the actual declaration keyword below
+ end;
+
+ // FreeBASIC forward declaration "DECLARE SUB|FUNCTION ...": our parser resolves calls via a pre-pass
+ // over the real definitions, so a forward declaration is a no-op — skip the rest of the line. (Without
+ // this, module-level DECLARE falls through to identifier/assignment parsing and hangs.)
+ if (Token.TokenType = ttIdentifier) and (UpperCase(Token.Value) = 'DECLARE') then
+ begin
+   while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
+   Result := nil;
+   Exit;
+ end;
+
  // Route to appropriate statement parser based on keyword
  case Token.TokenType of
     // === I/O COMMANDS ===
@@ -1692,7 +1715,7 @@ end;
 function TPackratParser.ParseProcedureDecl: TASTNode;
 var
   Token, NameTok, RetTok: TLexerToken;
-  Kind, MethodType, QualName, ParamMode, OpSym, OpOwnerType: string;
+  Kind, MethodType, QualName, ParamMode, OpSym, OpOwnerType, DecoU: string;
   NameNode, ParamList, ParamNode, ThisNode, DefExpr: TASTNode;
 begin
   // SUB|FUNCTION name [ ( params ) ] [AS type] <body> END SUB|FUNCTION
@@ -1763,6 +1786,26 @@ begin
     Result.AddChild(NameNode);
   end;
   end;   // end of non-OPERATOR name parsing
+
+  // FreeBASIC procedure decorators between the name and the parameter list: calling conventions
+  // (CDECL/STDCALL/PASCAL/FASTCALL/THISCALL), OVERLOAD, ALIAS "name", LIB "name". SedaiBasic has a
+  // single internal calling convention and no external (C) linking, so these are accepted and
+  // ignored — they exist so that real FreeBASIC declarations parse. (Any other identifier ends the
+  // loop, so a one-line body starting with an identifier is unaffected.)
+  while Context.Check(ttIdentifier) do
+  begin
+    DecoU := UpperCase(Context.CurrentToken.Value);
+    if (DecoU = 'CDECL') or (DecoU = 'STDCALL') or (DecoU = 'PASCAL') or
+       (DecoU = 'FASTCALL') or (DecoU = 'THISCALL') or (DecoU = 'OVERLOAD') then
+      Context.Advance
+    else if (DecoU = 'ALIAS') or (DecoU = 'LIB') then
+    begin
+      Context.Advance;                            // ALIAS / LIB
+      if Context.Check(ttStringLiteral) then Context.Advance;   // "name" (discarded)
+    end
+    else
+      Break;
+  end;
 
   ParamList := TASTNode.Create(antParameterList, Token);
   // Implicit THIS parameter for methods: THIS AS <Type> (record handle), first in the list.
