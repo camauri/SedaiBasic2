@@ -8,7 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 414 / 643 implemented (64%)** (+ 4 partial); see the
+**FreeBASIC keyword set — 414 / 643 implemented (64%)** (+ 4 partial). **71** of the unimplemented
+entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
+build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
+**572 applicable** keywords, **414 (72%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1619,7 +1622,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `Public` | ✓ | Accepted as a procedure/declaration prefix and ignored (linkage is not enforced). |
 | `Private` | ✓ | Accepted as a procedure/declaration prefix and ignored (linkage is not enforced). |
 | `Alias` | ✓ | `ALIAS "name"` accepted after a procedure name and ignored (no external linking). |
-| `Export` | ✗ | Specifies a procedure is to be exported from a shared library. |
+| `Export` | ✗ | N/A — native linkage / ABI directive; no native object output. |
 | `Lib` | ✓ | `LIB "name"` accepted after a procedure name and ignored (no external linking). |
 
 ##### Calling conventions
@@ -1638,16 +1641,16 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `Byref` | ◐ | Pass a parameter by reference. UDT parameters default to by-reference (handle, so the callee mutates the caller's object); explicit `BYREF` on scalars writes back to the caller's variable at every return (M13). `BYREF` function results (`min(a,b)=0`) supported. Standalone `Dim`/`Var` reference variables still deferred |
 | `Byval` | ✓ | Pass a parameter by value. Explicit `BYVAL` gives a UDT parameter its own copy (mutations don't reach the caller; the copy is destructed at frame exit); scalars are by value by default. |
-| `Any` | ✗ | Disables type-checking on arguments. |
+| `Any` | ✗ | N/A — native linkage / ABI directive; no native object output. |
 
 ##### Variadic Procedures
 
 | Keyword | Status | Description |
 |---|---|---|
-| `... (Ellipsis)` | ✗ | Indicates a variadic procedure in a declaration. |
-| `VA_FIRST` | ✗ | Macro to obtain the argument list in a variadic procedure. |
-| `VA_ARG` | ✗ | Macro to obtain the current argument in a variadic procedure. |
-| `VA_NEXT` | ✗ | Macro to move to the next argument in a variadic procedure. |
+| `... (Ellipsis)` | ✗ | N/A — variadic C ABI is not modelled by the register VM. |
+| `VA_FIRST` | ✗ | N/A — variadic C ABI is not modelled by the register VM. |
+| `VA_ARG` | ✗ | N/A — variadic C ABI is not modelled by the register VM. |
+| `VA_NEXT` | ✗ | N/A — variadic C ABI is not modelled by the register VM. |
 
 ##### Automatic execution
 
@@ -1662,16 +1665,16 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `Byref (function results)` | ✓ | `FUNCTION f() BYREF AS T` returns a reference to a SHARED/global scalar or a BYREF parameter (`min(a,b)=0` idiom, int pointees); read + write through `f()` |
 | `Call` | ✓ | Invokes a procedure. |
-| `Naked` | ✗ | Specifies that a function body is not to be given any prolog/epilog code |
+| `Naked` | ✗ | N/A — native linkage / ABI directive; no native object output. |
 
 #### Modularizing
 
 | Keyword | Status | Description |
 |---|---|---|
 | `COMMON` | ✓ | `COMMON [SHARED] var` — module-shared variable, modelled as `DIM SHARED` (single-module model). |
-| `DYLIBFREE` | ✗ |  |
-| `DYLIBLOAD` | ✗ |  |
-| `DYLIBSYMBOL` | ✗ |  |
+| `DYLIBFREE` | ✗ | N/A — native dynamic linking is out of scope for the bytecode VM. |
+| `DYLIBLOAD` | ✗ | N/A — native dynamic linking is out of scope for the bytecode VM. |
+| `DYLIBSYMBOL` | ✗ | N/A — native dynamic linking is out of scope for the bytecode VM. |
 | `EXPORT` | ✗ |  |
 | `EXTERN` | ✓ | Accepted and skipped — external linkage is N/A for a single-module bytecode VM (no native linking). |
 | `EXTERN...END EXTERN` | ✓ | `EXTERN "lang" ... END EXTERN` block accepted and skipped (no native linking). |
@@ -1716,21 +1719,21 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `#INCLUDE` | ✓ | Inserts text from a file. |
-| `#INCLIB` | ✗ | Includes a library in the linking processes. |
-| `#LIBPATH` | ✗ | Includes a path to search for libraries in the linking process. |
+| `#INCLIB` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
+| `#LIBPATH` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
 
 ##### Control Directives
 
 | Keyword | Status | Description |
 |---|---|---|
-| `#PRAGMA` | ✗ | Sets compiling options. |
-| `#PRAGMA RESERVE` | ✗ | Reserves symbol name. |
-| `#CMDLINE` | ✗ | Sets compiler command options from source. |
-| `#LANG` | ✗ | Sets dialect from source. |
+| `#PRAGMA` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
+| `#PRAGMA RESERVE` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
+| `#CMDLINE` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
+| `#LANG` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
 | `#PRINT` | ✓ | `#print msg` emits a macro-expanded compile-time message to stderr. |
 | `#ERROR` | ✗ | Outputs a messages to standard output and stops compilation. |
 | `#ASSERT` | ✗ | Stops compilation with an error message if a given condition is false. |
-| `#LINE` | ✗ | Sets the current line number and file name. |
+| `#LINE` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
 
 ##### Metacommands
 
@@ -1762,13 +1765,13 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `__FB_WIN32__` | ✓ | Defined if compiling for Windows. |
 | `__FB_LINUX__` | ✓ | Defined if compiling for Linux. |
-| `__FB_DOS__` | ✗ | Defined if compiling for DOS. |
-| `__FB_CYGWIN__` | ✗ | Defined if compiling for Cygwin. |
+| `__FB_DOS__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_CYGWIN__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_FREEBSD__` | ✓ | Defined if compiling for FreeBSD. |
 | `__FB_NETBSD__` | ✓ | Defined if compiling for NetBSD. |
 | `__FB_OPENBSD__` | ✓ | Defined if compiling for OpenBSD. |
 | `__FB_DARWIN__` | ✓ | Defined if compiling for Darwin. |
-| `__FB_XBOX__` | ✗ | Defined if compiling for Xbox. |
+| `__FB_XBOX__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_BIGENDIAN__` | ✓ | Defined if compiling on a system using big-endian byte-order. |
 | `__FB_PCOS__` | ✓ | Defined if compiling for a common PC OS (e.g. DOS, Windows, OS/2). |
 | `__FB_UNIX__` | ✓ | Defined if compiling for a Unix-like OS. |
@@ -1776,8 +1779,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `__FB_ARM__` | ✓ | Defined if compiling for the ARM architecture. |
 | `__FB_PPC__` | ✓ | Defined if compiling for the PowerPC architecture. |
 | `__FB_X86__` | ✓ | Defined if compiling for the X86 / X86_64 architecture. |
-| `__FB_JS__` | ✗ | Defined if compiling for emscripten target. |
-| `__FB_ANDROID__` | ✗ | Defined if compiling for android target. |
+| `__FB_JS__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_ANDROID__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 
 ##### Version Information
 
@@ -1787,36 +1790,36 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `__FB_VER_MAJOR__` | ✓ | Defined as an integral literal of the compiler major version number. |
 | `__FB_VER_MINOR__` | ✓ | Defined as an integral literal of the compiler minor version number. |
 | `__FB_VER_PATCH__` | ✓ | Defined as an integral literal of the compiler patch number. |
-| `__FB_MIN_VERSION__` | ✗ | Macro to check for a minimum compiler version. |
-| `__FB_BUILD_DATE__` | ✗ | Defined as a string literal of the compiler build date in "mm-dd-yyyy" format. |
-| `__FB_BUILD_DATE_ISO__` | ✗ | Defined as a string literal of the compiler build date in "yyyy-mm-dd" format. |
+| `__FB_MIN_VERSION__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_BUILD_DATE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_BUILD_DATE_ISO__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_SIGNATURE__` | ✓ | Defined as a string literal of the compiler signature. |
-| `__FB_BUILD_SHA1__` | ✗ | Defined as a string literal of the compiler's source revision sha-1. |
-| `__FB_BUILD_FORK_ID__` | ✗ | Defined as a string literal of the custom defined project fork identifier name. |
+| `__FB_BUILD_SHA1__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_BUILD_FORK_ID__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 
 ##### Command-line switches
 
 | Keyword | Status | Description |
 |---|---|---|
-| `__FB_ASM__` | ✗ | Defined to either "intel" or "att" depending on -asm. |
-| `__FB_BACKEND__` | ✗ | Defined to either "gas" or "gcc" depending on -gen. |
-| `__FB_GCC__` | ✗ | True (-1) if -gen gcc is used, false (0) otherwise. |
-| `__FB_OPTIMIZE__` | ✗ | Defined to the optimization level depending on -O. |
-| `__FB_GUI__` | ✗ | True (-1) if the "-s gui" switch was used, false (0) otherwise. |
-| `__FB_MAIN__` | ✗ | Defined if compiling a module with an entry point. |
+| `__FB_ASM__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_BACKEND__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_GCC__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OPTIMIZE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_GUI__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_MAIN__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_DEBUG__` | ✓ | True (-1) if the "-g" switch was used, false (0) otherwise. |
-| `__FB_ERR__` | ✗ | Zero (0) if neither the "-e", "-ex" or "-exx" switches were used. |
-| `__FB_FPMODE__` | ✗ | Defined as "fast" if compiling for fast SSE math, "precise" otherwise. |
-| `__FB_FPU__` | ✗ | Defined as "sse" if compiling for SSE floating point unit, or "x87" for normal x87 floating-point unit. |
+| `__FB_ERR__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_FPMODE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_FPU__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_LANG__` | ✓ | Defined to a string literal of the "-lang" dialect used. |
 | `__FB_MT__` | ✓ | True (-1) if the "-mt" switch was used, false (0) otherwise. |
-| `__FB_OUT_DLL__` | ✗ | True (-1) in a module being compiled and linked into a shared library, false (0) otherwise. |
+| `__FB_OUT_DLL__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_OUT_EXE__` | ✓ | True (-1) in a module being compiled and linked into an executable, false (0) otherwise. |
-| `__FB_OUT_LIB__` | ✗ | True (-1) in a module being compiled and linked into a static library, zero (0) otherwise. |
-| `__FB_OUT_OBJ__` | ✗ | True (-1) in a module being compiled only, zero (0) otherwise. |
-| `__FB_PROFILE__` | ✗ | Set to an integer to indicate the profiling method. |
-| `__FB_SSE__` | ✗ | Defined if compiling for SSE floating point unit. |
-| `__FB_VECTORIZE__` | ✗ | Defined as the level of automatic vectorization (0 to 2) |
+| `__FB_OUT_LIB__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OUT_OBJ__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_PROFILE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_SSE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_VECTORIZE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 
 ##### Environment Information
 
@@ -1836,32 +1839,32 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `__FILE__ and __FILE_NQ__` | ◐ | `__FILE__` expands to the top-level source file name (string literal); `__FILE_NQ__` (no quotes) not implemented. |
 | `__FUNCTION__ and __FUNCTION_NQ__` | ✗ | Defined as the name of the procedure where it's used. |
 | `__LINE__` | ✓ | Expands to the current source line number (1-based). |
-| `__FB_OPTION_BYVAL__` | ✗ | True (-1) if parameters are declared by value by default, zero (0) otherwise. |
-| `__FB_OPTION_DYNAMIC__` | ✗ | True (-1) if all arrays are variable-length, zero (0) otherwise. |
-| `__FB_OPTION_ESCAPE__` | ✗ | True (-1) if string literals are processed for escape sequences, zero (0) otherwise. |
-| `__FB_OPTION_GOSUB__` | ✗ | True (-1) if gosub support is enabled, zero (0) otherwise. |
-| `__FB_OPTION_EXPLICIT__` | ✗ | True (-1) if variables and objects need to be explicitly declared, zero (0) otherwise. |
-| `__FB_OPTION_PRIVATE__` | ✗ | True (-1) if all procedures are private by default, zero (0) otherwise. |
-| `__FB_OPTION_PROFILE__` | ✗ | True (-1) if profiling code is generated, zero (0) otherwise. |
+| `__FB_OPTION_BYVAL__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OPTION_DYNAMIC__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OPTION_ESCAPE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OPTION_GOSUB__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OPTION_EXPLICIT__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OPTION_PRIVATE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OPTION_PROFILE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 
 ##### Basic-macros
 
 | Keyword | Status | Description |
 |---|---|---|
-| `__FB_ARG_COUNT__` | ✗ | Counts the number of arguments in an argument list. |
-| `__FB_ARG_EXTRACT__` | ✗ | Returns nth argument from an argument list. |
-| `__FB_ARG_LEFTOF__` | ✗ | Returns left token based on separator. |
-| `__FB_ARG_LISTEXPAND__` | ✗ | Expands a macro one or more time on an argument list |
-| `__FB_ARG_RIGHTOF__` | ✗ | Returns right token based on separator. |
-| `__FB_EVAL__` | ✗ | Evaluates an argument (expression) at compile time. |
-| `__FB_IIF__` | ✗ | Returns an expression depending on the result of a comparison expression evaluated at compile time. |
-| `__FB_JOIN__` | ✗ | Joins two token arguments together as one. |
-| `__FB_QUERY_SYMBOL__` | ✗ | Queries a fbc's symbol internals. |
-| `__FB_QUOTE__` | ✗ | Converts the argument to a string. |
-| `__FB_UNIQUEID__` | ✗ | Gets the identifier at the top of a stack. |
-| `__FB_UNIQUEID_POP__` | ✗ | Pops an identifier off of a stack. |
-| `__FB_UNIQUEID_PUSH__` | ✗ | Pushes a new unique identifier on to a stack. |
-| `__FB_UNQUOTE__` | ✗ | Takes a literal string and converts it back to tokens. |
+| `__FB_ARG_COUNT__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_ARG_EXTRACT__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_ARG_LEFTOF__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_ARG_LISTEXPAND__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_ARG_RIGHTOF__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_EVAL__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_IIF__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_JOIN__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_QUERY_SYMBOL__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_QUOTE__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_UNIQUEID__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_UNIQUEID_POP__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_UNIQUEID_PUSH__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_UNQUOTE__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
 
 ##### Constants
 
@@ -1910,7 +1913,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `Local` | ✗ |  |
 | `Resume` | ✓ |  |
 | `Resume Next` | ✓ |  |
-| `__FB_ERR__` | ✗ |  |
+| `__FB_ERR__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 
 #### Miscellaneous Keywords
 
@@ -2019,7 +2022,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Array[Const]DescriptorPtr` | ✗ | Returns a [constant] pointer to array's descriptor (FBARRAY). |
+| `Array[Const]DescriptorPtr` | ✗ | N/A — internal array descriptor pointer; not exposed. |
 
 ### Bit Manipulation
 
