@@ -1689,10 +1689,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `#IF` | ✗ | Compiles the following code block based on a condition. |
+| `#IF` | ✓ | Conditional compilation on a constant integer expression (literals, defined(), macro values, comparisons, AND/OR/NOT, parens). |
 | `#IFDEF` | ✓ | Compiles the following code block if a symbol is defined. |
 | `#IFNDEF` | ✓ | Compiles the following code block if a symbol is not defined. |
-| `#ELSEIF` | ✗ | Compiles the following code block if a condition is true and the previous conditions was false. |
+| `#ELSEIF` | ✓ | `#elif <expr>` — else-if branch on a constant expression. |
 | `#ELSEIFDEF` | ✗ | Compiles the following code block if a symbol is defined and the previous conditions was false. |
 | `#ELSEIFNDEF` | ✗ | Compiles the following code block if a symbol is not defined and the previous conditions was false. |
 | `#ELSE` | ✓ | Compiles the following code block if previous conditions were false. |
