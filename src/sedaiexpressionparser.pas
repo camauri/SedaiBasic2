@@ -1022,6 +1022,16 @@ begin
     Exit;
   end;
 
+  // FreeBASIC bare RND (no parentheses) is equivalent to RND(1): synthesize the argument so it
+  // reuses the existing RND(arg) lowering with no SSA changes.
+  if (UpperCase(Token.Value) = kRND) and not Context.Check(ttDelimParOpen) then
+  begin
+    Args := TASTNode.Create(antArgumentList, Token);
+    Args.AddChild(TASTNode.CreateWithValue(antLiteral, 1, Token));
+    Result.AddChild(Args);
+    Exit;
+  end;
+
   // Consume opening parenthesis
   if not Context.Match(ttDelimParOpen) then
   begin

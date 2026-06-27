@@ -2217,7 +2217,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `RANDOMIZE` | ✓ | Seeds the RNG used by `RND`: `RANDOMIZE seed` sets a deterministic seed (same seed reproduces the same sequence); bare `RANDOMIZE` seeds from the system timer. A trailing algorithm argument is accepted and ignored. |
-| `RND` | ✓ | Returns a random Double in the range [0, 1). |
+| `RND` | ✓ | Returns a random Double in the range [0, 1). Bare `RND` (no parentheses) is accepted, equivalent to `RND(1)`. |
 
 ### Memory Functions
 
