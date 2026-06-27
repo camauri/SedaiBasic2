@@ -142,6 +142,9 @@ type
     // routed to element 0 of this array, so the value is never a per-thread register.
     FSharedScalarArr: TStringList;       // name (UPPER) -> array index (Objects[]=PtrInt arrayIdx)
     FPointerVars: TStringList;           // FreeBASIC pointers: var name (UPPER) -> pointee type name (e.g. "INTEGER")
+    FRefVars: TStringList;               // FreeBASIC reference variables (DIM BYREF r AS T = target): name
+                                         // (UPPER) -> pointee type. r's register is int (it carries target's
+                                         // address); reads/writes auto-dereference, like a BYREF-return param.
     FRawCollectChanged: Boolean;         // CollectRawPtrVars fixpoint: a new raw var was discovered this pass
     FRawPtrVars: TStringList;            // FreeBASIC raw pointers: var (UPPER) ever assigned from Allocate/CAllocate/
                                          // Reallocate. Its value is a RAWPTR_TAG byte offset → deref/arithmetic use the
@@ -264,6 +267,8 @@ type
     function PointerUDTType(const PtrName: string): string;                     // pointee UDT type if p is a "T PTR" (T a UDT), else ''
     function IsAddrParam(const Name: string): Boolean;                          // BYREF-return address-carrying param?
     function AddrParamBank(const Name: string): TSSARegisterType;               // pointee bank of an address param
+    function IsRefVar(const Name: string): Boolean;                             // BYREF reference variable (auto-deref)?
+    function RefVarBank(const Name: string): TSSARegisterType;                  // pointee bank of a reference variable
     function IsRawPtr(const Name: string): Boolean;                             // raw (Allocate-backed) pointer var?
     procedure CollectRawPtrVars(Node: TASTNode);                                // pre-scan: mark ptrs assigned from Allocate*
     procedure CollectWStringVars(Node: TASTNode);                               // pre-scan: mark DIM ... AS WSTRING vars
@@ -531,6 +536,7 @@ begin
   FSharedScalarArr := TStringList.Create;
   FPointerVars := TStringList.Create;
   FAddrLocalVars := TStringList.Create;
+  FRefVars := TStringList.Create;
   FRawPtrVars := TStringList.Create;
   FWStringVars := TStringList.Create;
   FWStringVars.CaseSensitive := False;
@@ -578,6 +584,7 @@ begin
   FSharedScalarArr.Free;
   FPointerVars.Free;
   FAddrLocalVars.Free;
+  FRefVars.Free;
   FRawPtrVars.Free;
   FWStringVars.Free;
   FRedimMultiArrays.Free;
@@ -1156,6 +1163,20 @@ begin
       begin
         Left := EnsureIntRegister(GetOrAllocateVariable(VarName));
         FuncRetType := AddrParamBank(VarName);
+        Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
+        case FuncRetType of
+          srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        else
+          EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+      end
+      // BYREF reference variable (DIM BYREF r AS T = target): r's register carries target's address —
+      // reading r dereferences it (load the pointee through the address), so r reads as target.
+      else if IsRefVar(VarName) then
+      begin
+        Left := EnsureIntRegister(GetOrAllocateVariable(VarName));
+        FuncRetType := RefVarBank(VarName);
         Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
         case FuncRetType of
           srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -3817,6 +3838,22 @@ begin
   if VarNode.NodeType <> antIdentifier then Exit;
   VarName := VarToStr(VarNode.Value);
 
+  // BYREF reference variable (DIM BYREF r AS T = target): assigning to r stores through the address it
+  // carries (mutating target), not into r's own register — so "r = v" writes target.
+  if IsRefVar(VarName) then
+  begin
+    ProcessExpression(ExprNode, ExprValue);
+    VarReg := EnsureIntRegister(GetOrAllocateVariable(VarName));   // the carried address
+    case RefVarBank(VarName) of
+      srtFloat:  begin ExprValue := EnsureFloatRegister(ExprValue);  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone)); end;
+      srtString: begin ExprValue := EnsureStringRegister(ExprValue); EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone)); end;
+    else
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+    end;
+    Exit;
+  end;
+
   // FreeBASIC raw heap: "p = Allocate(n)" / "CAllocate(n)" / "Reallocate(q,n)" — allocate/resize a byte
   // block and store the raw pointer (a RAWPTR_TAG byte offset) into p.
   if IsAllocCall(ExprNode, AllocFuncU) then
@@ -4520,6 +4557,19 @@ begin
 
     // (VAR x = expr is rewritten to a typed-scalar DIM by RegisterRecordVars, so it arrives here as an
     // ordinary "DIM x AS T = expr" — no VAR-specific handling needed.)
+
+    // DIM BYREF r AS T = target (FreeBASIC reference variable): bind r to target's address. child[2] is
+    // "@target" (an antProcAddress); evaluate it to the packed address and store it into r's int
+    // register. r is already registered in FRefVars (RegisterRecordVars), so subsequent reads/writes of
+    // r auto-dereference through this address.
+    if (ArrayDeclNode.Attributes.Values['BYREF'] = '1') and IsRefVar(ArrName) and
+       (ArrayDeclNode.ChildCount >= 3) then
+    begin
+      ProcessExpression(ArrayDeclNode.GetChild(2), RecHandleVal);   // @target -> packed address (int)
+      EmitInstruction(ssaCopyInt, GetOrAllocateVariable(UpperCase(ArrName)), EnsureIntRegister(RecHandleVal),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Continue;
+    end;
 
     // Typed scalar declaration (M3): "DIM name AS typename" — child[1] is an antIdentifier
     // (the type), not antDimensions. A UDT type allocates a record instance and stores its
@@ -11154,6 +11204,20 @@ begin
         end;
         Continue;
       end;
+      // DIM BYREF r AS T = target: a reference variable. Its register carries target's address (int);
+      // record the pointee type in FRefVars (drives the auto-deref bank) and force r's bank to INT, so
+      // pre-allocation gives it an int register. The "@target" init (child[2]) backs the target via the
+      // address-taken pre-pass automatically.
+      if (Decl.Attributes.Values['BYREF'] = '1') and (Decl.ChildCount >= 2) and
+         (Decl.GetChild(0).NodeType = antIdentifier) and (Decl.GetChild(1).NodeType = antIdentifier) then
+      begin
+        VarName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        TypeName := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        if FRefVars.IndexOfName(VarName) < 0 then
+          FRefVars.Add(VarName + '=' + TypeName);
+        RegisterTypedVar(VarName, 'INTEGER');   // r holds an address -> int register
+        Continue;
+      end;
       // DIM name AS type  -> typed scalar (child[1] = antIdentifier type). M4.4b: a parameterised
       // "DIM v AS T(args)" also has child[2] = antArgumentList, so accept ChildCount >= 2 here
       // (the array-of-UDT case has child[1] = antDimensions, not antIdentifier, so no overlap).
@@ -12098,6 +12162,23 @@ begin
   Result := srtInt;
   idx := FCurrentProcAddrParams.IndexOfName(UpperCase(Name));
   if idx >= 0 then Result := TypeNameToBank(FCurrentProcAddrParams.ValueFromIndex[idx], Name);
+end;
+
+function TSSAGenerator.IsRefVar(const Name: string): Boolean;
+// A FreeBASIC reference variable (DIM BYREF r AS T = target): its register carries target's address, so
+// reads/writes auto-dereference (like a BYREF-return address param, but bound at its declaration).
+begin
+  Result := FRefVars.IndexOfName(UpperCase(Name)) >= 0;
+end;
+
+function TSSAGenerator.RefVarBank(const Name: string): TSSARegisterType;
+// The pointee bank of a reference variable (from its declared scalar type).
+var
+  idx: Integer;
+begin
+  Result := srtInt;
+  idx := FRefVars.IndexOfName(UpperCase(Name));
+  if idx >= 0 then Result := TypeNameToBank(FRefVars.ValueFromIndex[idx], Name);
 end;
 
 function TSSAGenerator.IsRawPtr(const Name: string): Boolean;

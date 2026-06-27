@@ -4894,8 +4894,8 @@ end;
 function TPackratParser.ParseDimStatement: TASTNode;
 var
   Token, NameTok, TypeTok: TLexerToken;
-  ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr: TASTNode;
-  IsShared: Boolean;
+  ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode: TASTNode;
+  IsShared, IsByref: Boolean;
   DimTypeName: string;
 begin
   Token := Context.CurrentToken;
@@ -4908,6 +4908,10 @@ begin
   // SUB/FUNCTION bodies. Marked on each decl with the 'SHARED' attribute for the SSA pre-scan.
   IsShared := Context.Check(ttSharedDecl);
   if IsShared then Context.Advance;   // consume SHARED
+  // FreeBASIC reference variable: "DIM BYREF r AS T = target" — r is an alias for target (shared
+  // storage). Detected here as a statement-level modifier; handled in the typed-scalar branch below.
+  IsByref := Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF');
+  if IsByref then Context.Advance;    // consume BYREF
 
   // Parse declarations separated by commas. Each is either:
   //   name AS typename   -> typed scalar (UDT record or explicit builtin type)
@@ -4939,6 +4943,41 @@ begin
       TypeNode := TASTNode.CreateWithValue(antIdentifier, DimTypeName, TypeTok);
       ArrayDecl.AddChild(VarNameNode);
       ArrayDecl.AddChild(TypeNode);          // child[1] is antIdentifier (type) => typed scalar
+      // FreeBASIC reference variable: "DIM BYREF r AS T = target". Require "= target" and store @target
+      // as child[2] (an antProcAddress), so the SSA backs the target's stable address and binds r to it;
+      // r then auto-dereferences on every read/write. Skips the normal fixed-len / init / ctor handling.
+      if IsByref then
+      begin
+        ArrayDecl.Attributes.Values['BYREF'] := '1';
+        if Context.Check(ttOpEq) then
+        begin
+          Context.Advance;                   // =
+          InitExpr := FExpressionParser.ParseExpression;   // the referand (an lvalue)
+          if Assigned(InitExpr) then
+          begin
+            if InitExpr.NodeType = antIdentifier then
+            begin
+              // @scalar: historical shape (Value = name, no child).
+              AddrNode := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(InitExpr.Value)), NameTok);
+              InitExpr.Free;
+            end
+            else
+            begin
+              // @arr(i) / @obj.field: keep the operand subtree as child0.
+              AddrNode := TASTNode.Create(antProcAddress, NameTok);
+              AddrNode.AddChild(InitExpr);
+            end;
+            ArrayDecl.AddChild(AddrNode);     // child[2] = @target
+          end;
+        end
+        else
+          HandleError('DIM BYREF requires an initializer: DIM BYREF name AS type = target', Context.CurrentToken);
+        if IsShared then ArrayDecl.Attributes.Values['SHARED'] := '1';
+        DoNodeCreated(ArrayDecl);
+        Result.AddChild(ArrayDecl);
+        if Context.Check(ttSeparParam) then begin Context.Advance; Continue; end;
+        Break;
+      end;
       // FreeBASIC fixed-length string: "AS STRING * n" / "AS WSTRING * n" / "AS ZSTRING * n". The
       // declared capacity is parsed and recorded (attribute 'FIXEDLEN', advisory in v1 — storage is
       // variable-length). Consume "* <length-expr>" so the declaration parses cleanly.

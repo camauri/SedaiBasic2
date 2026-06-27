@@ -1273,7 +1273,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `STATIC` | ✓ | Declares variables in a procedure that retain their value between calls. |
 | `SHARED` | ✓ | Used with Dim allows variables to be visible throughout a module. |
 | `VAR` | ✓ | Declares variables where the data type is implied from an initializer. |
-| `BYREF (variables)` | ✗ | Used with Dim or Static or Var allows to declare references. |
+| `BYREF (variables)` | ✓ | Used with Dim or Static or Var allows to declare references. (DIM BYREF done; VAR/STATIC BYREF deferred.) |
 
 #### User Defined Types
 
