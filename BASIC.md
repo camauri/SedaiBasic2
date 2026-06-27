@@ -1530,8 +1530,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `@ (Address of)` | ✓ | Address-of a scalar, array element `@arr(i)`, or UDT field `@obj.field` (yields a packed int reference). `@sub` (procedure address) also supported |
 | `* (Value of)` | ✓ | Pointer dereference, read (`x = *p`) and write (`*p = v`); supports pointer arithmetic `*(p±n)` |
-| `VARPTR (Variable pointer)` | ✗ |  |
-| `PROCPTR (Procedure pointer and vtable index)` | ✗ |  |
+| `VARPTR (Variable pointer)` | ✓ | Address of a variable (= @v). |
+| `PROCPTR (Procedure pointer and vtable index)` | ✓ | Address of a procedure (= @p); vtable index form deferred. |
 
 #### Type or Class Operators
 

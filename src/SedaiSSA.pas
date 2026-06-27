@@ -965,6 +965,7 @@ var
   IsAny: Boolean;     // FreeBASIC "Any" modifier on the set/substring argument
   OpLhsType, OpLabel: string;  // operator overloading: UDT operand type + resolved operator label
   OpArgs: TASTNode;
+  AddrNode: TASTNode;          // VARPTR/PROCPTR: synthesized "@arg" node lowered via the address path
   // User function handling
   FnDef: TUserFunctionDef;
   OldParamValue: TSSAValue;
@@ -3287,6 +3288,28 @@ begin
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaStrSAdd, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC VARPTR(v) / PROCPTR(p): the address of a variable / procedure. Both are exactly
+        // "@arg" in our model — synthesize an antProcAddress for the argument and process it (the @
+        // lowering handles a scalar / array element / UDT field|handle / SHARED global / SUB entry PC).
+        // MODERN, not a declared array.
+        if FModernMode and ((UpperCase(ArrName) = kVARPTR) or (UpperCase(ArrName) = kPROCPTR)) and
+           (FProgram.FindArray(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          ArgNode := Node.GetChild(1).GetChild(0);   // the variable / procedure operand
+          if ArgNode.NodeType = antIdentifier then
+            // @scalar / @sub: historical shape (Value = name, no child).
+            AddrNode := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(ArgNode.Value)), ArgNode.Token)
+          else
+          begin
+            // @arr(i) / @obj.field: keep the operand subtree as child0.
+            AddrNode := TASTNode.Create(antProcAddress, ArgNode.Token);
+            AddrNode.AddChild(ArgNode.Clone);
+          end;
+          ProcessExpression(AddrNode, Result);
+          AddrNode.Free;
           Exit;
         end;
 
@@ -12001,6 +12024,17 @@ begin
   if Node.NodeType = antProcAddress then
   begin
     VNameU := UpperCase(VarToStr(Node.Value));
+    if Dict.IndexOf(VNameU) < 0 then Dict.Add(VNameU);
+  end;
+  // VARPTR(x) takes the address of a DATA variable x (= @x), so x must be backed with stable storage —
+  // mark it @-taken here, just like an antProcAddress operand. (PROCPTR's argument is a procedure: its
+  // @sub entry-PC path needs no data backing, so it is not collected here.)
+  if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) and
+     (UpperCase(VarToStr(Node.GetChild(0).Value)) = kVARPTR) and
+     (Node.GetChild(1).ChildCount >= 1) and (Node.GetChild(1).GetChild(0).NodeType = antIdentifier) then
+  begin
+    VNameU := UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value));
     if Dict.IndexOf(VNameU) < 0 then Dict.Add(VNameU);
   end;
   if Node.NodeType = antDim then
