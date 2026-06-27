@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 395 / 643 implemented (61%)** (+ 3 partial); see the
+**FreeBASIC keyword set — 403 / 643 implemented (63%)** (+ 3 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1519,8 +1519,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `# (Argument stringize)` | ✗ |  |
-| `## (Argument concatenation)` | ✗ |  |
+| `# (Argument stringize)` | ✓ | `#param` in a function-like macro body stringizes the argument into a string literal. |
+| `## (Argument concatenation)` | ✓ | `a ## b` in a macro body pastes the surrounding tokens together. |
 | `! (Escaped String Literal)` | ✗ |  |
 | `$ (Non-Escaped String Literal)` | ✗ |  |
 
@@ -1668,14 +1668,14 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `COMMON` | ✗ |  |
+| `COMMON` | ✓ | `COMMON [SHARED] var` — module-shared variable, modelled as `DIM SHARED` (single-module model). |
 | `DYLIBFREE` | ✗ |  |
 | `DYLIBLOAD` | ✗ |  |
 | `DYLIBSYMBOL` | ✗ |  |
 | `EXPORT` | ✗ |  |
-| `EXTERN` | ✗ |  |
-| `EXTERN...END EXTERN` | ✗ |  |
-| `IMPORT` | ✗ |  |
+| `EXTERN` | ✓ | Accepted and skipped — external linkage is N/A for a single-module bytecode VM (no native linking). |
+| `EXTERN...END EXTERN` | ✓ | `EXTERN "lang" ... END EXTERN` block accepted and skipped (no native linking). |
+| `IMPORT` | ✓ | Accepted and skipped (no native linking). |
 | `NAMESPACE` | ✓ | Group decls under a name (AST-flattened to `N.member`); nesting + reopening |
 | `PRIVATE` | ✗ |  |
 | `PUBLIC` | ✗ |  |
@@ -1706,8 +1706,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `#DEFINE` | ✓ | Object-like and function-like text-replacement macros: `#define NAME body` and `#define NAME(params) body`. |
 | `#MACRO and #ENDMACRO` | ✓ | Multi-line text-replacement macro `#macro NAME[(params)]` ... `#endmacro`; body lines are joined with the `:` statement separator (object-like or function-like). |
 | `#UNDEF` | ✓ | Undefines a symbol. |
-| `# Preprocessor stringize` | ✗ | Converts text into a string literal. |
-| `## Preprocessor concatenate` | ✗ | Concatenates two pieces of text. |
+| `# Preprocessor stringize` | ✓ | `#param` stringizes a macro argument into a string literal. |
+| `## Preprocessor concatenate` | ✓ | `a ## b` pastes tokens together in a macro body. |
 | `! Escaped String Literal` | ✗ | Indicates string literal immediately following must be processed for escape sequences. |
 | `$ Non-Escaped String Literal` | ✗ | Indicates string literal immediately following must not be processed for escape sequences. |
 

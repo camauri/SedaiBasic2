@@ -682,6 +682,32 @@ begin
    Exit;
  end;
 
+ // FreeBASIC EXTERN / IMPORT — external linkage, N/A for a single-module bytecode VM (no native
+ // linking). Accepted and skipped so files using them still parse. `EXTERN "lang"` opens a block
+ // closed by END EXTERN; otherwise it is a single-line declaration. (Without this, module-level
+ // EXTERN would fall through to identifier/assignment parsing and hang, like DECLARE did.)
+ if (Token.TokenType = ttIdentifier) and
+    ((UpperCase(Token.Value) = 'EXTERN') or (UpperCase(Token.Value) = 'IMPORT')) then
+ begin
+   if (UpperCase(Token.Value) = 'EXTERN') and Assigned(Context.PeekNext) and
+      (Context.PeekNext.TokenType = ttStringLiteral) then
+   begin
+     Context.Advance;   // EXTERN  ("lang" block form -> skip to END EXTERN)
+     while not Context.Check(ttEndOfFile) do
+     begin
+       if Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+          (Context.PeekNext.TokenType = ttIdentifier) and
+          (UpperCase(Context.PeekNext.Value) = 'EXTERN') then
+       begin Context.Advance; Context.Advance; Break; end;   // consume END EXTERN
+       Context.Advance;
+     end;
+   end
+   else
+     while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
+   Result := nil;
+   Exit;
+ end;
+
  // Route to appropriate statement parser based on keyword
  case Token.TokenType of
     // === I/O COMMANDS ===
@@ -5017,6 +5043,9 @@ begin
   // SUB/FUNCTION bodies. Marked on each decl with the 'SHARED' attribute for the SSA pre-scan.
   IsShared := Context.Check(ttSharedDecl);
   if IsShared then Context.Advance;   // consume SHARED
+  // FreeBASIC COMMON [SHARED] var: a module-shared variable. In our single-module model this is
+  // exactly DIM SHARED, so force the SHARED flag (an explicit SHARED, if present, was consumed above).
+  if UpperCase(VarToStr(Token.Value)) = kCOMMON then IsShared := True;
   // FreeBASIC reference variable: "DIM BYREF r AS T = target" — r is an alias for target (shared
   // storage). Detected here as a statement-level modifier; handled in the typed-scalar branch below.
   IsByref := Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF');

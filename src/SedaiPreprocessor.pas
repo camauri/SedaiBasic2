@@ -3,6 +3,7 @@ unit SedaiPreprocessor;
 // Supports:
 //   #define NAME [value]      object-like or function-like (NAME(params) body) macro
 //   #macro NAME[(params)] ... #endmacro   multi-line macro (body lines joined with ':')
+//   In a function-like macro body: #param stringizes an argument; a ## b pastes tokens together.
 //   #undef NAME
 //   #ifdef NAME / #ifndef NAME / #else / #endif   conditional compilation
 //   #elseifdef NAME / #elseifndef NAME            else-if on a defined/undefined symbol
@@ -67,12 +68,32 @@ end;
 // ParamsBody is "p1,p2,..."#1"body"; ArgsStr is the raw argument text between the parentheses.
 function ExpandFnBody(const ParamsBody, ArgsStr: string): string;
 var
-  sep, i, j, pi: Integer;
+  sep, i, j, k, pi: Integer;
   ParamList, Body, Word: string;
   Params: array of string;
   Args: array[0..63] of string;
   PCount, ACount: Integer;
   InStr: Boolean;
+
+  function ParamIndex(const W: string): Integer;
+  var n: Integer;
+  begin
+    Result := -1;
+    for n := 0 to PCount - 1 do
+      if Params[n] = W then begin Result := n; Exit; end;
+  end;
+
+  function Stringize(const S: string): string;
+  // Turn an argument into a BASIC string literal: trim, and double any embedded quote.
+  var t: string; n: Integer;
+  begin
+    t := Trim(S);
+    Result := '"';
+    for n := 1 to Length(t) do
+      if t[n] = '"' then Result := Result + '""' else Result := Result + t[n];
+    Result := Result + '"';
+  end;
+
 begin
   sep := Pos(#1, ParamsBody);
   ParamList := Copy(ParamsBody, 1, sep - 1);
@@ -88,20 +109,44 @@ begin
     i := j + 1;
   end;
   SplitMacroArgs(ArgsStr, Args, ACount);
-  // replace each whole-identifier parameter occurrence in the body with the matching argument
+  // Replace each whole-identifier parameter with its argument, handling the FreeBASIC preprocessor
+  // operators: "#param" stringizes the argument; "a ## b" pastes the surrounding tokens together.
   Result := ''; i := 1; InStr := False;
   while i <= Length(Body) do
   begin
     if InStr then begin Result := Result + Body[i]; if Body[i] = '"' then InStr := False; Inc(i); Continue; end;
     if Body[i] = '"' then begin InStr := True; Result := Result + Body[i]; Inc(i); Continue; end;
+    // Token paste "##": drop trailing whitespace already emitted and skip whitespace after ##.
+    if (Body[i] = '#') and (i < Length(Body)) and (Body[i + 1] = '#') then
+    begin
+      while (Length(Result) > 0) and (Result[Length(Result)] in [' ', #9]) do
+        Delete(Result, Length(Result), 1);
+      Inc(i, 2);
+      while (i <= Length(Body)) and (Body[i] in [' ', #9]) do Inc(i);
+      Continue;
+    end;
+    // Stringize "#param": emit the matching argument as a quoted string literal.
+    if Body[i] = '#' then
+    begin
+      j := i + 1;
+      while (j <= Length(Body)) and (Body[j] in [' ', #9]) do Inc(j);
+      if (j <= Length(Body)) and (Body[j] in ['A'..'Z', 'a'..'z', '_']) then
+      begin
+        k := j;
+        while (k <= Length(Body)) and IsIdentChar(Body[k]) do Inc(k);
+        Word := Copy(Body, j, k - j);
+        pi := ParamIndex(Word);
+        if (pi >= 0) and (pi < ACount) then
+        begin Result := Result + Stringize(Args[pi]); i := k; Continue; end;
+      end;
+      Result := Result + '#'; Inc(i); Continue;   // a lone '#' that is not a stringize
+    end;
     if Body[i] in ['A'..'Z', 'a'..'z', '_'] then
     begin
       j := i;
       while (j <= Length(Body)) and IsIdentChar(Body[j]) do Inc(j);
       Word := Copy(Body, i, j - i);
-      pi := -1;
-      for sep := 0 to PCount - 1 do
-        if Params[sep] = Word then begin pi := sep; Break; end;
+      pi := ParamIndex(Word);
       if (pi >= 0) and (pi < ACount) then Result := Result + Args[pi]
       else Result := Result + Word;
       i := j;

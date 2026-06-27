@@ -1690,6 +1690,7 @@ begin
  RegisterKeyword(kCONST,   ttConstant,        'Constant assignment',  kcData);
  RegisterKeyword(kDATA,    ttDataConstant,    'Data statement',       kcData);
  RegisterKeyword(kDIM,     ttDataDeclaration, 'Dimension arrays',     kcData);
+ RegisterKeyword(kCOMMON,  ttDataDeclaration, 'Module-shared variable (modelled as DIM SHARED)', kcData);
  RegisterKeyword(kVAR,     ttDataDeclaration, 'Declare with inferred type (FreeBASIC)', kcData);
  RegisterKeyword(kSTATIC,  ttDataDeclaration, 'Declare a static-storage local (FreeBASIC)', kcData);
  RegisterKeyword(kERASE,   ttArrayErase,      'Reset array elements to default (FreeBASIC)', kcData);
