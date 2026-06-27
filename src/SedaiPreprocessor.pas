@@ -18,7 +18,7 @@ unit SedaiPreprocessor;
 
 interface
 
-function PreprocessSource(const Src, BaseDir: string): string;
+function PreprocessSource(const Src, BaseDir: string; const FileName: string = ''): string;
 
 implementation
 
@@ -476,7 +476,7 @@ begin
   {$ENDIF}
 end;
 
-function PreprocessSource(const Src, BaseDir: string): string;
+function PreprocessSource(const Src, BaseDir: string; const FileName: string = ''): string;
 var
   Defs: TStringList;     // Names = UPPER object-like macro names, Values = macro bodies
   FnDefs: TStringList;   // Names = UPPER function-like macro names, Values = "params"#1"body"
@@ -510,6 +510,36 @@ var
       begin
         Raw := Lines[li];
         Trimmed := TrimLeft(Raw);
+        // __LINE__ expands to the current source line number (1-based). Updated every line so it is
+        // correct wherever it appears; __FILE__ is set once (top-level file) in the begin block below.
+        Defs.Values['__LINE__'] := IntToStr(li + 1);
+        // QuickBASIC-style metacommand '$INCLUDE: 'file' (a leading apostrophe makes it a comment to
+        // the lexer; intercept it here and splice the file, like #include).
+        if (Length(Trimmed) >= 9) and (UpperCase(Copy(Trimmed, 1, 9)) = '''$INCLUDE') and Emitting then
+        begin
+          q := Pos('''', Copy(Trimmed, 2, MaxInt));   // first quote after the leading apostrophe
+          if q > 0 then
+          begin
+            FileName := Copy(Trimmed, q + 2, MaxInt);   // text after that quote
+            p := Pos('''', FileName);
+            if p > 0 then FileName := Copy(FileName, 1, p - 1);
+            FullPath := FileName;
+            if not FileExists(FullPath) then FullPath := IncludeTrailingPathDelimiter(Dir) + FileName;
+            if FileExists(FullPath) then
+            begin
+              IncText := TStringList.Create;
+              try
+                IncText.LoadFromFile(FullPath);
+                Expand(IncText.Text, ExtractFilePath(ExpandFileName(FullPath)));
+              finally
+                IncText.Free;
+              end;
+            end;
+          end;
+          Output.Add('');   // the metacommand line itself produces no output
+          Inc(li);
+          Continue;
+        end;
         if (Length(Trimmed) > 0) and (Trimmed[1] = '#') then
         begin
           SplitDirective(Trimmed, DName, DRest);
@@ -657,7 +687,10 @@ var
                 IncText.Free;
               end;
             end;
-          end;
+          end
+          else if (DName = 'print') and Emitting then
+            // #print msg — emit a compile-time diagnostic (macro-expanded) to stderr.
+            WriteLn(StdErr, SubstituteMacros(DRest, Defs, FnDefs));
           // All directive lines are dropped from the output; emit a blank to keep line numbers.
           Output.Add('');
         end
@@ -680,8 +713,9 @@ var
 
 begin
   // Fast path: no preprocessor directive and no intrinsic-define usage -> return unchanged (zero
-  // overhead for normal code). '#' covers all directives; '__' covers bare __FB_*__ intrinsic macros.
-  if (Pos('#', Src) = 0) and (Pos('__', Src) = 0) then
+  // overhead for normal code). '#' covers all directives; '__' covers bare __FB_*__ intrinsic
+  // macros; '$ covers the QuickBASIC '$INCLUDE metacommand.
+  if (Pos('#', Src) = 0) and (Pos('__', Src) = 0) and (Pos('''$', Src) = 0) then
     Exit(Src);
 
   Defs := TStringList.Create;
@@ -689,6 +723,8 @@ begin
   Output := TStringList.Create;
   try
     RegisterIntrinsicDefines(Defs);   // FreeBASIC compiler intrinsic defines (__FB_*__)
+    // __FILE__ expands to the top-level source file name (string literal); empty if unknown.
+    Defs.Values['__FILE__'] := '"' + FileName + '"';
     SetLength(Active, 0);
     SetLength(Taken, 0);
     Expand(Src, BaseDir);

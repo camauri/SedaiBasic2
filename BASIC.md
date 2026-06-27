@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 403 / 643 implemented (63%)** (+ 3 partial); see the
+**FreeBASIC keyword set — 406 / 643 implemented (63%)** (+ 4 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1727,7 +1727,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `#PRAGMA RESERVE` | ✗ | Reserves symbol name. |
 | `#CMDLINE` | ✗ | Sets compiler command options from source. |
 | `#LANG` | ✗ | Sets dialect from source. |
-| `#PRINT` | ✗ | Outputs a messages to standard output while compiling. |
+| `#PRINT` | ✓ | `#print msg` emits a macro-expanded compile-time message to stderr. |
 | `#ERROR` | ✗ | Outputs a messages to standard output and stops compilation. |
 | `#ASSERT` | ✗ | Stops compilation with an error message if a given condition is false. |
 | `#LINE` | ✗ | Sets the current line number and file name. |
@@ -1736,7 +1736,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `'$INCLUDE` | ✗ | Alternate form of the #INCLUDE directive. |
+| `'$INCLUDE` | ✓ | QuickBASIC metacommand `'$INCLUDE: 'file'` — splices a file, like `#include`. |
 | `'$DYNAMIC` | ✗ | Alternate form of the OPTION DYNAMIC statement. |
 | `'$STATIC` | ✗ | Alternate form of the OPTION STATIC statement. |
 | `'$LANG` | ✗ | Alternate form of the #lang directive. |
@@ -1833,9 +1833,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `__FILE__ and __FILE_NQ__` | ✗ | Defined as the name of the module. |
+| `__FILE__ and __FILE_NQ__` | ◐ | `__FILE__` expands to the top-level source file name (string literal); `__FILE_NQ__` (no quotes) not implemented. |
 | `__FUNCTION__ and __FUNCTION_NQ__` | ✗ | Defined as the name of the procedure where it's used. |
-| `__LINE__` | ✗ | Defined as an integer literal of the line of the module where it's used. |
+| `__LINE__` | ✓ | Expands to the current source line number (1-based). |
 | `__FB_OPTION_BYVAL__` | ✗ | True (-1) if parameters are declared by value by default, zero (0) otherwise. |
 | `__FB_OPTION_DYNAMIC__` | ✗ | True (-1) if all arrays are variable-length, zero (0) otherwise. |
 | `__FB_OPTION_ESCAPE__` | ✗ | True (-1) if string literals are processed for escape sequences, zero (0) otherwise. |
