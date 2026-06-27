@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 315 / 643 implemented (49%)** (+ 3 partial); see the
+**FreeBASIC keyword set — 316 / 643 implemented (49%)** (+ 3 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1284,7 +1284,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `ENUM...END ENUM` | ✓ | Named integer constants (auto-increment) |
 | `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR` (overloaded by arity & type, default args, `BASE`). `PROPERTY` getter/setter, `OPERATOR` overloading. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope/block/global RAII. Heap instances via `NEW T`/`DELETE` reachable through `T PTR` (linked lists/trees). Still deferred: explicit `VIRTUAL`/`OVERRIDE`/`ABSTRACT` |
 | `CLASS...END CLASS` | ✗ | Not implemented. Keyword reserved. |
-| `UNION...END UNION` | ✗ | User defined structure of overlapping data |
+| `UNION...END UNION` | ✓ | Record whose members share storage. Overlap is faithful within a bank — members of the same type alias the same slot (write one, read another of the same type). Members in different banks (int/float/string) occupy distinct slots; cross-bank byte reinterpretation is not modelled (slot-based record model, v1). |
 | `EXTENDS` | ✓ | Single inheritance `TYPE Child EXTENDS Parent`: inherited fields (prefix layout) + methods + reference polymorphism (M4.2); virtual dispatch — an overridden method is selected by the instance's runtime type even through a base-typed variable (M4.3); inherited/ chained constructors & destructors (M4.4). |
 | `EXTENDS WSTRING` | ✗ | Extends an user defined type to inherits Wstring behavior |
 | `EXTENDS ZSTRING` | ✗ | Extends an user defined type to inherits Zstring behavior |

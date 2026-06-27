@@ -191,6 +191,10 @@ type
     function ParseSharedError: TASTNode;
     // TYPE name / field AS type / ... / END TYPE : user-defined type (record/UDT).
     function ParseTypeDecl: TASTNode;
+    // UNION name / field AS type / ... / END UNION : record with overlapping same-bank fields.
+    function ParseUnionDecl: TASTNode;
+    // Shared body for TYPE / UNION (IsUnion tags the node so SSA overlaps same-bank fields).
+    function ParseRecordDecl(IsUnion: Boolean): TASTNode;
     function AtEndType: Boolean;
     procedure ConsumeEndType;
     // WITH obj / ... / END WITH : a leading '.field' resolves against obj. Parse-time desugar.
@@ -762,6 +766,7 @@ begin
       Result := Memoize('CondOpStatement', @ParseCondOpStatement);
     ttSharedDecl: Result := ParseSharedError;   // SHARED is only the DIM SHARED modifier, not a statement
     ttTypeDecl: Result := Memoize('TypeDecl', @ParseTypeDecl);
+    ttUnionDecl: Result := Memoize('UnionDecl', @ParseUnionDecl);
     ttWithBlock: Result := ParseWith;
     ttNamespaceBlock: Result := Memoize('NamespaceDecl', @ParseNamespaceDecl);
     ttScopeBlock: Result := Memoize('ScopeBlock', @ParseScopeBlock);
@@ -2117,9 +2122,10 @@ end;
 
 function TPackratParser.AtEndType: Boolean;
 begin
-  // END TYPE  (END is ttProgramEnd, TYPE is ttTypeDecl)
+  // END TYPE / END UNION  (END is ttProgramEnd, TYPE is ttTypeDecl, UNION is ttUnionDecl)
   Result := Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
-            (Context.PeekNext.TokenType = ttTypeDecl);
+            ((Context.PeekNext.TokenType = ttTypeDecl) or
+             (Context.PeekNext.TokenType = ttUnionDecl));
 end;
 
 procedure TPackratParser.ConsumeEndType;
@@ -2288,17 +2294,28 @@ begin
 end;
 
 function TPackratParser.ParseTypeDecl: TASTNode;
+begin
+  Result := ParseRecordDecl(False);
+end;
+
+function TPackratParser.ParseUnionDecl: TASTNode;
+begin
+  Result := ParseRecordDecl(True);
+end;
+
+function TPackratParser.ParseRecordDecl(IsUnion: Boolean): TASTNode;
 var
   Token, NameTok, FieldTok: TLexerToken;
   FieldNode, TypeNode: TASTNode;
   PrevIdx: Integer;
   FieldTypeName, TokU: string;
 begin
-  // TYPE name <newline> field AS type <newline> ... END TYPE
+  // TYPE/UNION name <newline> field AS type <newline> ... END TYPE/END UNION
   // Each field node is antIdentifier(fieldName) with one child antIdentifier(typeName).
   // An empty type name child means "infer from the field's name suffix" (SSA side).
+  // A UNION is the same record shape but flagged so SSA overlaps fields of the same bank.
   Token := Context.CurrentToken;
-  Context.Advance;                                  // consume TYPE
+  Context.Advance;                                  // consume TYPE / UNION
   Result := nil;
   // The type name must be a plain identifier; a reserved word (e.g. the graphics keyword
   // CIRCLE/BOX/LINE) is not a valid type name — report it cleanly instead of silently bailing
@@ -2311,6 +2328,7 @@ begin
   end;
   NameTok := Context.CurrentToken;
   Result := TASTNode.CreateWithValue(antTypeDecl, UpperCase(NameTok.Value), NameTok);
+  if IsUnion then Result.Attributes.Values['UNION'] := '1';
   Context.Advance;                                  // consume type name
 
   // Optional single inheritance: TYPE Child EXTENDS Parent (M4.2). Stored as an attribute.

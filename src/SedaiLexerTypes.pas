@@ -170,6 +170,7 @@ type
     ttProcedureStart,         // PROCEDURE, FUNCTION, DEF, SUB
     ttCallSub,                // CALL (statement-level SUB invocation)
     ttTypeDecl,               // TYPE (UDT/record declaration; END TYPE terminates)
+    ttUnionDecl,              // UNION (record with overlapping same-bank fields; END UNION terminates)
     ttAsType,                 // AS (type annotation: DIM x AS t, field AS t)
     ttWithBlock,              // WITH (with-block; END WITH terminates; .field => with-object.field)
     ttNamespaceBlock,         // NAMESPACE (group decls under a name; END NAMESPACE terminates) FreeBASIC
@@ -393,7 +394,7 @@ const
   KEYWORD_TOKENS: TTokenTypeSet = [
     ttKeyword, ttLoopBlockStart, ttLoopBlockEnd,
     ttBlockBegin, ttBlockEnd, ttProcedureStart, ttProcedureEnd, ttCallSub,
-    ttTypeDecl, ttAsType, ttWithBlock, ttNamespaceBlock, ttScopeBlock, ttExtends, ttParamMode, ttBaseCall, ttSharedDecl,
+    ttTypeDecl, ttUnionDecl, ttAsType, ttWithBlock, ttNamespaceBlock, ttScopeBlock, ttExtends, ttParamMode, ttBaseCall, ttSharedDecl,
     ttThreadWait, ttThreadDetach, ttMutexLock, ttMutexUnlock, ttMutexDestroy,
     ttCondWait, ttCondSignal, ttCondBroadcast, ttCondDestroy,
     ttJumpKeyword, ttDataDeclaration, ttArrayErase, ttArrayRedim, ttEnum, ttDefType, ttDataAssignment, ttCommentRemark,

@@ -81,6 +81,7 @@ type
     Parent: string;                // M4.2: base type name (EXTENDS), or '' — single inheritance
     Node: TASTNode;                // the antTypeDecl (to fill fields on demand, parent-first)
     Filled: Boolean;               // M4.2: fields resolved (cycle-safe fill guard)
+    IsUnion: Boolean;              // UNION: all fields of the same bank overlap (share slot 0)
   end;
 
   { Lexical scope frame (FreeBASIC -lang fb scoping, MODERN mode only). The scope stack runs
@@ -10857,6 +10858,7 @@ begin
       FUDTs[n].Parent := UpperCase(Node.Attributes.Values['EXTENDS']);  // '' if none (M4.2)
       FUDTs[n].Node := Node;
       FUDTs[n].Filled := False;
+      FUDTs[n].IsUnion := (Node.Attributes.Values['UNION'] = '1');  // UNION: overlap same-bank fields
     end;
     Exit;
   end;
@@ -10938,12 +10940,23 @@ begin
         FUDTs[Idx].Fields[n].WidthCode := TypeNameWidthCode(TypeName)  // B1.5: narrow field on store
       else
         FUDTs[Idx].Fields[n].WidthCode := 0;
-      case Bank of
-        srtFloat:  begin FUDTs[Idx].Fields[n].Slot := cFloat; Inc(cFloat); end;
-        srtString: begin FUDTs[Idx].Fields[n].Slot := cStr;   Inc(cStr);   end;
+      if FUDTs[Idx].IsUnion then
+        // UNION: every member of a bank overlaps at slot 0 of that bank (faithful same-bank
+        // aliasing — write one member, read another of the same type back). The per-bank count
+        // is at most 1 slot. Cross-bank reinterpretation (int<->float bytes) is not modelled.
+        case Bank of
+          srtFloat:  begin FUDTs[Idx].Fields[n].Slot := 0; if cFloat < 1 then cFloat := 1; end;
+          srtString: begin FUDTs[Idx].Fields[n].Slot := 0; if cStr   < 1 then cStr   := 1; end;
+        else
+          begin FUDTs[Idx].Fields[n].Slot := 0; if cInt < 1 then cInt := 1; end;
+        end
       else
-        begin FUDTs[Idx].Fields[n].Slot := cInt; Inc(cInt); end;
-      end;
+        case Bank of
+          srtFloat:  begin FUDTs[Idx].Fields[n].Slot := cFloat; Inc(cFloat); end;
+          srtString: begin FUDTs[Idx].Fields[n].Slot := cStr;   Inc(cStr);   end;
+        else
+          begin FUDTs[Idx].Fields[n].Slot := cInt; Inc(cInt); end;
+        end;
     end;
   FUDTs[Idx].NInt := cInt; FUDTs[Idx].NFloat := cFloat; FUDTs[Idx].NStr := cStr;
 end;
