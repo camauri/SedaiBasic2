@@ -1623,6 +1623,7 @@ begin
  RegisterKeyword(kAS,       ttAsType,         'Type annotation',    kcProcedures);
  RegisterKeyword(kWITH,     ttWithBlock,      'With block',         kcCodeBlockConstructs);
  RegisterKeyword(kNAMESPACE,ttNamespaceBlock, 'Namespace block (FreeBASIC)', kcCodeBlockConstructs);
+ RegisterKeyword(kSCOPE,    ttScopeBlock,     'Scope block (FreeBASIC)',     kcCodeBlockConstructs);
  RegisterKeyword(kEXTENDS,  ttExtends,        'Type inheritance',   kcProcedures);
  RegisterKeyword(kBASE,     ttBaseCall,       'Base constructor call', kcProcedures);
  RegisterKeyword(kSHARED,   ttSharedDecl,     'Shared module global',  kcProcedures);
@@ -1686,6 +1687,10 @@ begin
  RegisterKeyword(kCONST,   ttConstant,        'Constant assignment',  kcData);
  RegisterKeyword(kDATA,    ttDataConstant,    'Data statement',       kcData);
  RegisterKeyword(kDIM,     ttDataDeclaration, 'Dimension arrays',     kcData);
+ RegisterKeyword(kVAR,     ttDataDeclaration, 'Declare with inferred type (FreeBASIC)', kcData);
+ // STATIC (persistent-storage local) is parsed (ParseStaticStatement) but not yet wired for SSA
+ // persistence — keyword registration is deferred so it stays a plain identifier until then.
+ // RegisterKeyword(kSTATIC,  ttDataDeclaration, 'Declare a static-storage local (FreeBASIC)', kcData);
  RegisterKeyword(kERASE,   ttArrayErase,      'Reset array elements to default (FreeBASIC)', kcData);
  RegisterKeyword(kLSET,    ttLSet,            'Left-justify a string into a buffer (FreeBASIC/QBasic)',  kcData);
  RegisterKeyword(kRSET,    ttRSet,            'Right-justify a string into a buffer (FreeBASIC/QBasic)', kcData);
@@ -2006,7 +2011,7 @@ begin
   // FreeBASIC/QBasic-only keywords: declassified to plain identifiers in CLASSIC (Commodore v7), so a
   // v7 program may still use these names as variables. They keep their keyword meaning in MODERN.
   // Commodore v7 has no CONTINUE (CONT is separate)/LSET/RSET/ENUM/DEF* , so this is safe.
-  SetKeywordsDialect([kCONTINUE, kLSET, kRSET, kENUM, kNAMESPACE,
+  SetKeywordsDialect([kCONTINUE, kLSET, kRSET, kENUM, kNAMESPACE, kSCOPE, kVAR,
                       kDEFINT, kDEFLNG, kDEFBYTE, kDEFSHORT, kDEFLNGINT, kDEFSNG, kDEFDBL, kDEFSTR,
                       kNOW, kTIMER, kDATEFN, kTIMEFN, kSETDATE, kSETTIME],
                      kdModernOnly);

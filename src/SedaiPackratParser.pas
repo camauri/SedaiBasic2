@@ -199,6 +199,10 @@ type
     // NAMESPACE name / ... / END NAMESPACE (FreeBASIC): group member decls under a name.
     function ParseNamespaceDecl: TASTNode;
     function AtEndNamespace: Boolean;
+    // SCOPE ... END SCOPE (FreeBASIC): anonymous lexical block scope. Parsed into an antBlock node
+    // (same as BEGIN/BEND), so the SSA's MODERN block-scope machinery handles DIM shadowing + destructors.
+    function ParseScopeBlock: TASTNode;
+    function AtEndScope: Boolean;
     // Read a dotted name "ident(.ident)*" (e.g. a namespace-qualified type "Forms.Point"); returns
     // the joined UPPER-cased name and consumes all segments. The first token must already be checked.
     function ParseDottedName: string;
@@ -213,6 +217,10 @@ type
     function ParseSlowStatement: TASTNode;
     function ParseRemStatement: TASTNode;
     function ParseDimStatement: TASTNode;
+    // VAR x = expr (FreeBASIC): declare a variable with type inferred from the initializer (SSA side).
+    function ParseVarStatement: TASTNode;
+    // STATIC x AS t [= expr] (FreeBASIC): a local with persistent storage across calls.
+    function ParseStaticStatement: TASTNode;
     function ParseEraseStatement: TASTNode;
     function ParseRedimStatement: TASTNode;
     function ParseSwapStatement: TASTNode;
@@ -756,6 +764,7 @@ begin
     ttTypeDecl: Result := Memoize('TypeDecl', @ParseTypeDecl);
     ttWithBlock: Result := ParseWith;
     ttNamespaceBlock: Result := Memoize('NamespaceDecl', @ParseNamespaceDecl);
+    ttScopeBlock: Result := Memoize('ScopeBlock', @ParseScopeBlock);
 
     // === MEMORY COMMANDS ===
     ttMemoryCommand: Result := Memoize('MemoryStatement', @ParseMemoryStatement);
@@ -2234,6 +2243,46 @@ begin
   begin
     Context.Advance;   // END
     Context.Advance;   // NAMESPACE
+  end;
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.AtEndScope: Boolean;
+begin
+  // END SCOPE  (END is ttProgramEnd, SCOPE is ttScopeBlock)
+  Result := Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+            (Context.PeekNext.TokenType = ttScopeBlock);
+end;
+
+function TPackratParser.ParseScopeBlock: TASTNode;
+// SCOPE <newline> statements <newline> END SCOPE (FreeBASIC). Produced as an antBlock node so the SSA
+// gives it the same MODERN block-scope treatment as BEGIN/BEND (DIM shadowing + destructors at exit).
+var
+  Token: TLexerToken;
+  Stmt: TASTNode;
+  PrevIdx: Integer;
+begin
+  Token := Context.CurrentToken;
+  Context.Advance;                                   // consume SCOPE
+  Result := TASTNode.Create(antBlock, Token);
+
+  while not Context.Check(ttEndOfFile) do
+  begin
+    if Context.Match(ttEndOfLine) then Continue;
+    if Context.Check(ttSeparStmt) then begin Context.Advance; Continue; end;
+    if AtEndScope then Break;
+    PrevIdx := Context.CurrentIndex;
+    Stmt := ParseStatement;
+    if Assigned(Stmt) then
+      Result.AddChild(Stmt)
+    else if Context.CurrentIndex = PrevIdx then
+      Context.Advance;                               // no progress: skip a token (defensive)
+  end;
+
+  if AtEndScope then
+  begin
+    Context.Advance;   // END
+    Context.Advance;   // SCOPE
   end;
   DoNodeCreated(Result);
 end;
@@ -4850,6 +4899,9 @@ var
   DimTypeName: string;
 begin
   Token := Context.CurrentToken;
+  // VAR / STATIC share the ttDataDeclaration token with DIM; route to their own parsers.
+  if UpperCase(VarToStr(Token.Value)) = kVAR then Exit(ParseVarStatement);
+  if UpperCase(VarToStr(Token.Value)) = kSTATIC then Exit(ParseStaticStatement);
   Result := TASTNode.Create(antDim, Token);
   Context.Advance; // Consume DIM
   // M6: "DIM SHARED ..." — the declared variables are module globals visible (read/write) inside
@@ -4966,6 +5018,110 @@ begin
 
   until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
 
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseVarStatement: TASTNode;
+// VAR name = expr [, name = expr ...] (FreeBASIC): declare variables whose type is inferred from the
+// initializer expression. Produced as an antDim whose antArrayDecl children carry child[0]=name and
+// child[1]=the initializer expression, marked INFER='1'. The SSA evaluates the initializer, infers its
+// bank, declares the (lexically scoped) variable in that bank, and stores the value.
+var
+  Token, NameTok: TLexerToken;
+  Decl, InitExpr: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antDim, Token);
+  Context.Advance;                                   // consume VAR
+  repeat
+    if not Context.Check(ttIdentifier) then
+    begin
+      HandleError('Expected a variable name after VAR', Context.CurrentToken);
+      Break;
+    end;
+    NameTok := Context.CurrentToken;
+    Context.Advance;                                 // name
+    if not Context.Check(ttOpEq) then
+    begin
+      HandleError('VAR requires an initializer: VAR name = expression', Context.CurrentToken);
+      Break;
+    end;
+    Context.Advance;                                 // =
+    InitExpr := FExpressionParser.ParseExpression;
+    if not Assigned(InitExpr) then Break;
+    Decl := TASTNode.Create(antArrayDecl, NameTok);
+    Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
+    Decl.AddChild(InitExpr);                         // child[1] = initializer (NOT a type / dimensions)
+    Decl.Attributes.Values['INFER'] := '1';
+    DoNodeCreated(Decl);
+    Result.AddChild(Decl);
+    if Context.Check(ttSeparParam) then
+      Context.Advance                                // comma -> another inferred declaration
+    else
+      Break;
+  until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseStaticStatement: TASTNode;
+// STATIC name AS type [= expr] [, ...] (FreeBASIC): declare locals with persistent storage that keeps
+// its value across calls. Produced as an antDim with antArrayDecl children shaped like a DIM typed
+// scalar (child[0]=name, child[1]=type, optional child[2]=initializer), each marked STATIC='1' so the
+// SSA backs it with persistent storage and runs the initializer only once.
+var
+  Token, NameTok, TypeTok: TLexerToken;
+  DeclNode, NameNode, TypeNd, Init: TASTNode;
+  StaticTypeName: string;
+begin
+  Token := Context.CurrentToken;
+  Result := TASTNode.Create(antDim, Token);
+  Context.Advance;                                   // consume STATIC
+  repeat
+    if not Context.Check(ttIdentifier) then
+    begin
+      HandleError('Expected a variable name after STATIC', Context.CurrentToken);
+      Break;
+    end;
+    NameTok := Context.CurrentToken;
+    Context.Advance;                                 // name
+    if not Context.Check(ttAsType) then
+    begin
+      HandleError('STATIC requires a type: STATIC name AS type', Context.CurrentToken);
+      Break;
+    end;
+    Context.Advance;                                 // AS
+    if not Context.Check(ttIdentifier) then
+    begin
+      HandleError('Expected type name after AS', Context.CurrentToken);
+      Break;
+    end;
+    TypeTok := Context.CurrentToken;
+    StaticTypeName := ParseDottedName;               // dotted: namespace-qualified type
+    while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+    begin
+      StaticTypeName := StaticTypeName + ' PTR';
+      Context.Advance;                               // consume PTR
+    end;
+    DeclNode := TASTNode.Create(antArrayDecl, NameTok);
+    NameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
+    TypeNd := TASTNode.CreateWithValue(antIdentifier, StaticTypeName, TypeTok);
+    DeclNode.AddChild(NameNode);
+    DeclNode.AddChild(TypeNd);                       // child[1] = type (typed scalar)
+    if Context.Check(ttOpEq) then
+    begin
+      Context.Advance;                               // =
+      Init := FExpressionParser.ParseExpression;
+      if Assigned(Init) then
+        DeclNode.AddChild(Init);                     // child[2] = once-only initializer expression
+    end;
+    DeclNode.Attributes.Values['STATIC'] := '1';
+    DoNodeCreated(DeclNode);
+    Result.AddChild(DeclNode);
+    if Context.Check(ttSeparParam) then
+      Context.Advance                                // comma -> another static declaration
+    else
+      Break;
+  until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
   DoNodeCreated(Result);
 end;
 

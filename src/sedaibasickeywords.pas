@@ -66,6 +66,7 @@ const
   kAS      = 'AS';       // AS: type annotation (DIM x AS t, field AS t)
   kWITH    = 'WITH';     // WITH ... END WITH: with-block (.field => withobject.field)
   kNAMESPACE = 'NAMESPACE'; // NAMESPACE n ... END NAMESPACE: group decls under a name (FreeBASIC)
+  kSCOPE   = 'SCOPE';    // SCOPE ... END SCOPE: anonymous lexical block scope (FreeBASIC)
   kEXTENDS = 'EXTENDS';  // TYPE Child EXTENDS Parent: single inheritance
   kCONSTRUCTOR = 'CONSTRUCTOR'; // CONSTRUCTOR Type(...): auto-called at instance allocation (M4.4)
   kDESTRUCTOR  = 'DESTRUCTOR';  // DESTRUCTOR Type(): auto-called at scope exit for a local (V5)
@@ -116,6 +117,8 @@ const
   kCONST   = 'CONST';
   kLET     = 'LET';
   kDIM     = 'DIM';
+  kVAR     = 'VAR';      // FreeBASIC: VAR x = expr -> declare a variable with type inferred from expr
+  kSTATIC  = 'STATIC';   // FreeBASIC: STATIC x AS t [= expr] -> local with persistent (static) storage
   kDEF     = 'DEF';
   kFN      = 'FN';
   // FreeBASIC DEFtype: default variable type by initial letter (no suffix / no explicit type)

@@ -173,6 +173,7 @@ type
     ttAsType,                 // AS (type annotation: DIM x AS t, field AS t)
     ttWithBlock,              // WITH (with-block; END WITH terminates; .field => with-object.field)
     ttNamespaceBlock,         // NAMESPACE (group decls under a name; END NAMESPACE terminates) FreeBASIC
+    ttScopeBlock,             // SCOPE (anonymous block scope; END SCOPE terminates) FreeBASIC
     ttExtends,                // EXTENDS (TYPE Child EXTENDS Parent: single inheritance)
     ttParamMode,              // BYVAL / BYREF (parameter passing convention)
     ttBaseCall,               // BASE (explicit base-constructor call inside a child CONSTRUCTOR)
@@ -392,7 +393,7 @@ const
   KEYWORD_TOKENS: TTokenTypeSet = [
     ttKeyword, ttLoopBlockStart, ttLoopBlockEnd,
     ttBlockBegin, ttBlockEnd, ttProcedureStart, ttProcedureEnd, ttCallSub,
-    ttTypeDecl, ttAsType, ttWithBlock, ttNamespaceBlock, ttExtends, ttParamMode, ttBaseCall, ttSharedDecl,
+    ttTypeDecl, ttAsType, ttWithBlock, ttNamespaceBlock, ttScopeBlock, ttExtends, ttParamMode, ttBaseCall, ttSharedDecl,
     ttThreadWait, ttThreadDetach, ttMutexLock, ttMutexUnlock, ttMutexDestroy,
     ttCondWait, ttCondSignal, ttCondBroadcast, ttCondDestroy,
     ttJumpKeyword, ttDataDeclaration, ttArrayErase, ttArrayRedim, ttEnum, ttDefType, ttDataAssignment, ttCommentRemark,

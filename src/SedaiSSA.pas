@@ -4516,6 +4516,9 @@ begin
     ArrName := VarToStr(ArrayDeclNode.GetChild(0).Value);
     DimsNode := ArrayDeclNode.GetChild(1);
 
+    // (VAR x = expr is rewritten to a typed-scalar DIM by RegisterRecordVars, so it arrives here as an
+    // ordinary "DIM x AS T = expr" — no VAR-specific handling needed.)
+
     // Typed scalar declaration (M3): "DIM name AS typename" — child[1] is an antIdentifier
     // (the type), not antDimensions. A UDT type allocates a record instance and stores its
     // handle in the variable; a builtin type needs no allocation (type already recorded).
@@ -11125,6 +11128,30 @@ begin
     begin
       Decl := Node.GetChild(k);
       if Decl.NodeType <> antArrayDecl then Continue;
+      // VAR x = expr (FreeBASIC type inference): child[1] is the initializer expression, NOT a type.
+      // REWRITE it here into the exact shape of a typed scalar DIM — antArrayDecl(name, <typeIdent>, expr)
+      // — by inferring the bank and inserting the corresponding type name as a new child[1] (the init
+      // expression shifts to child[2]). After this the node is indistinguishable from "DIM x AS T = expr",
+      // so every downstream pass (pre-allocation, ProcessDim, regalloc) handles it identically — no
+      // VAR-specific code path. This pre-pass runs in source order before pre-allocation, so an earlier
+      // VAR's inferred type is visible to a later VAR that references it. Idempotent (INFER cleared).
+      if Decl.Attributes.Values['INFER'] = '1' then
+      begin
+        if (Decl.ChildCount >= 2) and (Decl.GetChild(0).NodeType = antIdentifier) then
+        begin
+          VarName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+          case InferExprBank(Decl.GetChild(1)) of
+            srtString: TypeName := 'STRING';
+            srtInt:    TypeName := 'INTEGER';
+          else
+            TypeName := 'DOUBLE';
+          end;
+          Decl.InsertChild(1, TASTNode.CreateWithValue(antIdentifier, TypeName, Decl.GetChild(0).Token));
+          Decl.Attributes.Values['INFER'] := '0';
+          RegisterTypedVar(VarName, TypeName);
+        end;
+        Continue;
+      end;
       // DIM name AS type  -> typed scalar (child[1] = antIdentifier type). M4.4b: a parameterised
       // "DIM v AS T(args)" also has child[2] = antArgumentList, so accept ChildCount >= 2 here
       // (the array-of-UDT case has child[1] = antDimensions, not antIdentifier, so no overlap).
