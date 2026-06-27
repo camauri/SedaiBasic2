@@ -302,6 +302,7 @@ const
   kWCHR    = 'WCHR';      // Unicode codepoint -> wide (UTF-8) char (FreeBASIC)
   kWSTR    = 'WSTR';      // FreeBASIC: WSTR(x) -> wide string
   kSADD    = 'SADD';      // FreeBASIC: SADD(s) -> raw pointer to a copy of the string's bytes (read-only snapshot) (intercepted as array-access)
+  kSTRPTR  = 'STRPTR';    // FreeBASIC: STRPTR(s) -> raw pointer to the string's data (same model as SADD) (intercepted as array-access)
   kVARPTR  = 'VARPTR';    // FreeBASIC: VARPTR(v) -> address of a variable (= @v) (intercepted as array-access)
   kPROCPTR = 'PROCPTR';   // FreeBASIC: PROCPTR(p) -> address of a procedure (= @p) (intercepted as array-access)
   kWSTRING = 'WSTRING';   // FreeBASIC: WSTRING type and WSTRING(n,cp) builder function

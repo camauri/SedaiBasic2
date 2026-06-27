@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 313 / 643 implemented (49%)** (+ 3 partial); see the
+**FreeBASIC keyword set — 314 / 643 implemented (49%)** (+ 3 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1484,7 +1484,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `+ (String concatenation)` | ✓ |  |
 | `& (String concatenation with conversion)` | ✗ |  |
-| `STRPTR (String pointer)` | ✗ |  |
+| `STRPTR (String pointer)` | ✓ | Raw pointer to the string's data (read-only byte-heap snapshot, NUL-terminated); same model as `SADD` |
 
 #### Relational Operators
 

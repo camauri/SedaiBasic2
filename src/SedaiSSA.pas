@@ -3279,10 +3279,11 @@ begin
           Exit;
         end;
 
-        // FreeBASIC SADD(s): raw byte-heap pointer to a NUL-terminated copy of the string's bytes (a
-        // read-only snapshot — the managed string has no stable mutable buffer address). MODERN, not an array.
-        if FModernMode and (UpperCase(ArrName) = kSADD) and (FProgram.FindArray(ArrName) < 0) and
-           (Node.GetChild(1).ChildCount >= 1) then
+        // FreeBASIC SADD(s) / STRPTR(s): raw byte-heap pointer to a NUL-terminated copy of the string's
+        // bytes (a read-only snapshot — the managed string has no stable mutable buffer address). STRPTR
+        // returns a pointer to the string data, equivalent to SADD for var-length strings. MODERN, not an array.
+        if FModernMode and ((UpperCase(ArrName) = kSADD) or (UpperCase(ArrName) = kSTRPTR)) and
+           (FProgram.FindArray(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
         begin
           ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
@@ -12410,9 +12411,10 @@ begin
       MarkRaw(LhsU)   // p = q, q raw
     else if FModernMode and (Rhs.NodeType = antArrayAccess) and (Rhs.ChildCount >= 1) and
             (Rhs.GetChild(0).NodeType = antIdentifier) and
-            (UpperCase(VarToStr(Rhs.GetChild(0).Value)) = kSADD) and
+            ((UpperCase(VarToStr(Rhs.GetChild(0).Value)) = kSADD) or
+             (UpperCase(VarToStr(Rhs.GetChild(0).Value)) = kSTRPTR)) and
             (FProgram.FindArray(VarToStr(Rhs.GetChild(0).Value)) < 0) then
-      MarkRaw(LhsU);   // p = SADD(s): a raw byte-heap pointer -> deref p[i] onto the byte heap
+      MarkRaw(LhsU);   // p = SADD(s)/STRPTR(s): a raw byte-heap pointer -> deref p[i] onto the byte heap
   end;
   for i := 0 to Node.ChildCount - 1 do
     CollectRawPtrVars(Node.GetChild(i));
