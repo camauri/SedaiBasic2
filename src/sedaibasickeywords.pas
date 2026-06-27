@@ -464,6 +464,8 @@ const
   kXOR   = 'XOR';
   kEQV   = 'EQV';        // FreeBASIC bitwise equivalence operator: NOT (a XOR b)
   kIMP   = 'IMP';        // FreeBASIC bitwise implication operator: (NOT a) OR b
+  kANDALSO = 'ANDALSO';  // FreeBASIC short-circuit logical AND
+  kORELSE  = 'ORELSE';   // FreeBASIC short-circuit logical OR
 
   // SedaiBasic Options
   kOPTION = 'OPTION';

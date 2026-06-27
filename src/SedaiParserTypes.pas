@@ -251,7 +251,9 @@ type
   TPrecedence = (
     precNone,           // No precedence
     precAssignment,     // = (assignment)
-    precImp,            // IMP (FreeBASIC: loosest logical operator)
+    precOrElse,         // ORELSE (FreeBASIC short-circuit OR: loosest operator)
+    precAndAlso,        // ANDALSO (FreeBASIC short-circuit AND: looser than IMP/OR/AND)
+    precImp,            // IMP (FreeBASIC: loosest bitwise/logical operator)
     precEqv,            // EQV (FreeBASIC: looser than OR/XOR, tighter than IMP)
     precOr,             // OR
     precAnd,            // AND

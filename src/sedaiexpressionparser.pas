@@ -472,6 +472,10 @@ begin
   // FreeBASIC EQV / IMP: looser than OR/XOR; IMP is the loosest binary operator.
   Context.SetParseRule(ttOpEqv, MakeInfixRule(@StaticParseBinaryOperator, precEqv));
   Context.SetParseRule(ttOpImp, MakeInfixRule(@StaticParseBinaryOperator, precImp));
+  // FreeBASIC ANDALSO / ORELSE short-circuit operators: the loosest of all (ORELSE looser than
+  // ANDALSO). They parse as ordinary binary-op nodes; the SSA lowers them to short-circuit IFs.
+  Context.SetParseRule(ttOpAndAlso, MakeInfixRule(@StaticParseBinaryOperator, precAndAlso));
+  Context.SetParseRule(ttOpOrElse, MakeInfixRule(@StaticParseBinaryOperator, precOrElse));
 
   // Assignment
   Context.SetParseRule(ttDataAssignment, MakeInfixRule(@StaticParseAssignment, precAssignment));

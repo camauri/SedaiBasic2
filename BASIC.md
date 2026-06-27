@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 407 / 643 implemented (63%)** (+ 4 partial); see the
+**FreeBASIC keyword set — 409 / 643 implemented (64%)** (+ 4 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1512,8 +1512,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ANDALSO (Short Circuit Conjunction)` | ✗ |  |
-| `ORELSE (Short Circuit Inclusive Disjunction)` | ✗ |  |
+| `ANDALSO (Short Circuit Conjunction)` | ✓ | `a ANDALSO b` — short-circuit logical AND (b evaluated only if a is nonzero); result -1/0. |
+| `ORELSE (Short Circuit Inclusive Disjunction)` | ✓ | `a ORELSE b` — short-circuit logical OR (b evaluated only if a is zero); result -1/0. |
 
 #### Preprocessor Operators
 

@@ -360,6 +360,8 @@ type
     procedure EmitBitMacro(const FuncName: string; ArgsNode: TASTNode; out Result: TSSAValue);
     // FreeBASIC ARRAYLEN(arr): total element count = product over dims of (ubound-lbound+1).
     procedure EmitArrayLen(ArgsNode: TASTNode; out Result: TSSAValue);
+    // FreeBASIC short-circuit operators a ANDALSO b / a ORELSE b (lowered via the IIF/IF mechanism).
+    procedure EmitShortCircuit(Node: TASTNode; out Result: TSSAValue);
     procedure ProcessForLoop(Node: TASTNode);
     procedure ProcessDoLoop(Node: TASTNode);
     procedure ProcessBlock(Node: TASTNode);
@@ -1438,6 +1440,14 @@ begin
 
     antBinaryOp:
     begin
+      // FreeBASIC short-circuit operators a ANDALSO b / a ORELSE b: only the taken side of b is
+      // evaluated, so lower via the IIF/IF mechanism (a real branch) instead of the eager path below.
+      if (Node.ChildCount >= 2) and Assigned(Node.Token) and
+         ((Node.Token.TokenType = ttOpAndAlso) or (Node.Token.TokenType = ttOpOrElse)) then
+      begin
+        EmitShortCircuit(Node, Result);
+        Exit;
+      end;
       // FreeBASIC raw pointer arithmetic: "p + n" / "p - n" (and "n + p") where p is a raw pointer.
       // The index is scaled by SizeOf(pointee) — the result is a raw byte pointer. (Managed pointers
       // keep element-unit arithmetic via the normal numeric lowering below.)
@@ -5397,6 +5407,39 @@ begin
     Acc := NewAcc;
   end;
   Result := Acc;
+end;
+
+procedure TSSAGenerator.EmitShortCircuit(Node: TASTNode; out Result: TSSAValue);
+// a ANDALSO b  ->  IIF(a, b, 0)   (b evaluated only when a is nonzero)
+// a ORELSE  b  ->  IIF(a, -1, b)  (b evaluated only when a is zero)
+// EmitIif emits a real IF, so only the taken branch runs => genuine short-circuit. The IIF result
+// is normalised to a FreeBASIC boolean (-1/0). For the usual integer/boolean operands this is exact.
+var
+  ArgsNode: TASTNode;
+  IifVal, Zero: TSSAValue;
+begin
+  Result := MakeSSAValue(svkNone);
+  if Node.ChildCount < 2 then Exit;
+  ArgsNode := TASTNode.Create(antArgumentList, Node.Token);
+  try
+    ArgsNode.AddChild(Node.GetChild(0).Clone);          // cond = a
+    if Node.Token.TokenType = ttOpAndAlso then
+    begin
+      ArgsNode.AddChild(Node.GetChild(1).Clone);                               // true  = b
+      ArgsNode.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Node.Token));  // false = 0
+    end
+    else
+    begin
+      ArgsNode.AddChild(TASTNode.CreateWithValue(antLiteral, -1, Node.Token)); // true  = -1
+      ArgsNode.AddChild(Node.GetChild(1).Clone);                               // false = b
+    end;
+    EmitIif(ArgsNode, IifVal);
+  finally
+    ArgsNode.Free;
+  end;
+  Zero := EnsureIntRegister(MakeSSAConstInt(0));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpNeInt, Result, EnsureIntRegister(IifVal), Zero, MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);
