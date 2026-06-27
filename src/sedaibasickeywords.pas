@@ -64,6 +64,7 @@ const
   kCALL    = 'CALL';     // CALL: statement-level SUB invocation (QB/FB)
   kTYPE    = 'TYPE';     // TYPE ... END TYPE: user-defined type (record/UDT)
   kUNION   = 'UNION';    // UNION ... END UNION: record with overlapping same-bank fields
+  kCLASS   = 'CLASS';    // CLASS ... END CLASS: FreeBASIC class — modelled as a TYPE (access not enforced)
   kAS      = 'AS';       // AS: type annotation (DIM x AS t, field AS t)
   kWITH    = 'WITH';     // WITH ... END WITH: with-block (.field => withobject.field)
   kNAMESPACE = 'NAMESPACE'; // NAMESPACE n ... END NAMESPACE: group decls under a name (FreeBASIC)

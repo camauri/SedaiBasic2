@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 380 / 643 implemented (59%)** (+ 3 partial); see the
+**FreeBASIC keyword set — 384 / 643 implemented (60%)** (+ 3 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1283,7 +1283,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `ENUM...END ENUM` | ✓ | Named integer constants (auto-increment) |
 | `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR` (overloaded by arity & type, default args, `BASE`). `PROPERTY` getter/setter, `OPERATOR` overloading. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope/block/global RAII. Heap instances via `NEW T`/`DELETE` reachable through `T PTR` (linked lists/trees). Still deferred: explicit `VIRTUAL`/`OVERRIDE`/`ABSTRACT` |
-| `CLASS...END CLASS` | ✗ | Not implemented. Keyword reserved. |
+| `CLASS...END CLASS` | ✓ | Modelled as a `TYPE` (member access control is not enforced): fields, methods, arrays, construction all behave as for a record. |
 | `UNION...END UNION` | ✓ | Record whose members share storage. Overlap is faithful within a bank — members of the same type alias the same slot (write one, read another of the same type). Members in different banks (int/float/string) occupy distinct slots; cross-bank byte reinterpretation is not modelled (slot-based record model, v1). |
 | `EXTENDS` | ✓ | Single inheritance `TYPE Child EXTENDS Parent`: inherited fields (prefix layout) + methods + reference polymorphism (M4.2); virtual dispatch — an overridden method is selected by the instance's runtime type even through a base-typed variable (M4.3); inherited/ chained constructors & destructors (M4.4). |
 | `EXTENDS WSTRING` | ✗ | Extends an user defined type to inherits Wstring behavior |
@@ -1693,11 +1693,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `#IFDEF` | ✓ | Compiles the following code block if a symbol is defined. |
 | `#IFNDEF` | ✓ | Compiles the following code block if a symbol is not defined. |
 | `#ELSEIF` | ✓ | `#elif <expr>` — else-if branch on a constant expression. |
-| `#ELSEIFDEF` | ✗ | Compiles the following code block if a symbol is defined and the previous conditions was false. |
-| `#ELSEIFNDEF` | ✗ | Compiles the following code block if a symbol is not defined and the previous conditions was false. |
+| `#ELSEIFDEF` | ✓ | Else-if branch taken when a symbol is defined (`#elseifdef NAME`). |
+| `#ELSEIFNDEF` | ✓ | Else-if branch taken when a symbol is not defined (`#elseifndef NAME`). |
 | `#ELSE` | ✓ | Compiles the following code block if previous conditions were false. |
 | `#ENDIF` | ✓ | Signifies the end of a code block. |
-| `DEFINED` | ✗ | Returns "-1" if a symbol is defined, otherwise "0". |
+| `DEFINED` | ✓ | `defined(NAME)` / `defined NAME` in `#if`/`#elif` evaluates to 1 if the symbol is defined, else 0. |
 
 ##### Text Replacement
 

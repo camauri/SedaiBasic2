@@ -5,7 +5,8 @@ unit SedaiPreprocessor;
 //   #macro NAME[(params)] ... #endmacro   multi-line macro (body lines joined with ':')
 //   #undef NAME
 //   #ifdef NAME / #ifndef NAME / #else / #endif   conditional compilation
-//   #if <expr> / #elif <expr>   conditional compilation on a constant integer expression
+//   #elseifdef NAME / #elseifndef NAME            else-if on a defined/undefined symbol
+//   #if <expr> / #elif <expr> / #elseif <expr>    conditional compilation on a constant integer expression
 //       (literals, defined(NAME), macro values, comparisons, AND/OR/NOT, parentheses)
 //   #include "file"           splice another file (relative to the including file's directory)
 // Directive lines in the top-level file are blanked (kept as empty lines) so error line numbers in
@@ -286,10 +287,13 @@ var
   var t: string;
   begin
     t := Peek;
+    // NB: the recursive self-calls MUST use parentheses — in {$mode objfpc} a bare `ParsePrimary`
+    // refers to this function's Result variable (TP/Delphi compatibility), not a recursive call, so
+    // `not`/unary `-`/`+` would read an uninitialised Result instead of their operand.
     if t = '(' then begin Inc(TPos); Result := ParseOr; if Peek = ')' then Inc(TPos); end
-    else if (t = 'NOT') or (t = '!') then begin Inc(TPos); if ParsePrimary <> 0 then Result := 0 else Result := 1; end
-    else if t = '-' then begin Inc(TPos); Result := -ParsePrimary; end
-    else if t = '+' then begin Inc(TPos); Result := ParsePrimary; end
+    else if (t = 'NOT') or (t = '!') then begin Inc(TPos); if ParsePrimary() <> 0 then Result := 0 else Result := 1; end
+    else if t = '-' then begin Inc(TPos); Result := -ParsePrimary(); end
+    else if t = '+' then begin Inc(TPos); Result := ParsePrimary(); end
     else if IsNum(t) then begin Result := NumOf(t); Inc(TPos); end
     else begin Inc(TPos); Result := 0; end;
   end;
@@ -485,8 +489,10 @@ var
             SetLength(Active, Length(Active) + 1); Active[High(Active)] := Cond;
             SetLength(Taken, Length(Taken) + 1);   Taken[High(Taken)] := Cond;
           end
-          else if DName = 'elif' then
+          else if (DName = 'elif') or (DName = 'elseif') or
+                  (DName = 'elseifdef') or (DName = 'elseifndef') then
           begin
+            // #elif <expr> / #elseif <expr> / #elseifdef NAME / #elseifndef NAME — an else-if branch.
             if Length(Active) > 0 then
             begin
               ParentEmit := (Length(Active) = 1) or Active[High(Active) - 1];
@@ -494,7 +500,12 @@ var
                 Active[High(Active)] := False                  // an earlier branch already won
               else
               begin
-                Cond := ParentEmit and EvalPPExpr(DRest, Defs);
+                if DName = 'elseifdef' then
+                  Cond := ParentEmit and (Defs.IndexOfName(UpperCase(Trim(DRest))) >= 0)
+                else if DName = 'elseifndef' then
+                  Cond := ParentEmit and (Defs.IndexOfName(UpperCase(Trim(DRest))) < 0)
+                else
+                  Cond := ParentEmit and EvalPPExpr(DRest, Defs);
                 Active[High(Active)] := Cond;
                 if Cond then Taken[High(Taken)] := True;
               end;
