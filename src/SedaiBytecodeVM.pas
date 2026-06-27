@@ -271,6 +271,7 @@ type
     // FreeBASIC raw byte heap (Allocate family). All return/take RAWPTR_TAG-tagged byte offsets.
     function RawAlloc(ByteCount: PtrUInt): Int64;
     function StrSAdd(const S: string): Int64;   // SADD(s) -> raw pointer to a NUL-terminated byte copy
+    function FileLength(const Path: string): Int64;   // FILELEN(path) -> file size in bytes (0 if absent)
     procedure RawFree(RawPtr: Int64);
     function RawRealloc(RawPtr: Int64; ByteCount: PtrUInt): Int64;
     function RawLoadInt(RawPtr: Int64; TypeCode: Integer): Int64;
@@ -1527,6 +1528,21 @@ begin
   FRawHeap[ofs + PtrUInt(Length(S))] := 0;   // NUL terminator (ZSTRING)
 end;
 
+function TBytecodeVM.FileLength(const Path: string): Int64;
+// FreeBASIC FILELEN(path): size of a file in bytes, or 0 if it does not exist / can't be opened.
+var
+  fs: TFileStream;
+begin
+  Result := 0;
+  if not FileExists(Path) then Exit;
+  try
+    fs := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+    try Result := fs.Size; finally fs.Free; end;
+  except
+    Result := 0;
+  end;
+end;
+
 procedure TBytecodeVM.RawFree(RawPtr: Int64);
 var
   dataOfs, sz: PtrUInt;
@@ -2513,7 +2529,7 @@ begin
         end;
 
         // String Src1 (source) -> int Dest
-        bcStrLen, bcStrLenW, bcStrAsc, bcStrDec, bcStrValInt, bcStrSAdd, bcStrCvInt, bcFileExists:
+        bcStrLen, bcStrLenW, bcStrAsc, bcStrDec, bcStrValInt, bcStrSAdd, bcStrCvInt, bcFileExists, bcFileLen:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
@@ -4307,6 +4323,8 @@ begin
       Ctx.StringRegs[Instr.Dest] := GetCurrentDir;
     42: // bcEnviron - ENVIRON$(name): value of an environment variable ('' if unset).
       Ctx.StringRegs[Instr.Dest] := GetEnvironmentVariable(Ctx.StringRegs[Instr.Src1]);
+    43: // bcFileLen - FILELEN(path): size of the file in bytes (0 if absent).
+      Ctx.IntRegs[Instr.Dest] := FileLength(Ctx.StringRegs[Instr.Src1]);
     36: // bcStrMkInt - MKI/MKL/MKSHORT/MKLONGINT: binary copy of an integer into a string.
       begin
         // Immediate = byte width (2/4/8). Write the low `width` bytes, little-endian (two's complement).

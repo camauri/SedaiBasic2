@@ -318,6 +318,7 @@ const
   kCBOOL   = 'CBOOL';     // FreeBASIC: convert to boolean (-1 if nonzero, else 0)
   kARRAYLEN = 'ARRAYLEN'; // FreeBASIC: total number of elements in an array (intercepted as array-access)
   kFILEEXISTS = 'FILEEXISTS'; // FreeBASIC: -1 if a file exists, else 0 (intercepted as array-access)
+  kFILELEN = 'FILELEN';  // FreeBASIC: FILELEN(path) -> file size in bytes (intercepted as array-access)
   kCURDIR  = 'CURDIR';   kCURDIRS  = 'CURDIR$';   // FreeBASIC: current working directory
   kENVIRON = 'ENVIRON';  kENVIRONS = 'ENVIRON$';  // FreeBASIC: ENVIRON$(name) -> env var value
   kRANDOMIZE = 'RANDOMIZE'; // FreeBASIC/QB: seed the RNG (RANDOMIZE [seed])

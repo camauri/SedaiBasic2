@@ -180,6 +180,7 @@ begin
     ssaFileExists: Result := bcFileExists;
     ssaCurDir: Result := bcCurDir;
     ssaEnviron: Result := bcEnviron;
+    ssaFileLen: Result := bcFileLen;
     ssaStrMkInt: Result := bcStrMkInt;
     ssaStrMkFloat: Result := bcStrMkFloat;
     ssaStrCvInt: Result := bcStrCvInt;

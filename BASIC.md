@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 413 / 643 implemented (64%)** (+ 4 partial); see the
+**FreeBASIC keyword set — 414 / 643 implemented (64%)** (+ 4 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -2262,7 +2262,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `FILECOPY` | ✗ | Copies a file. |
 | `FILEDATETIME` | ✗ | Gets the last modified date and time of a file. |
 | `FILEEXISTS` | ✓ | `FILEEXISTS(path)` returns -1 if the file exists, else 0 (cross-platform). |
-| `FILELEN` | ✗ | Gets the length (in bytes) of a file. |
+| `FILELEN` | ✓ | `FILELEN(path)` -> file size in bytes (0 if the file does not exist); cross-platform. |
 | `FILESETEOF` | ✗ | Sets the length of an open file bound to a file number. |
 | `FILEFLUSH` | ✗ | Flushes application or system buffers for an open file bound to a file number. |
 

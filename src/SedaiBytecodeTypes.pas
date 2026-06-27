@@ -339,6 +339,7 @@ const
   bcFileExists      = bcGroupString + 40;  // FILEEXISTS(path) - -1 if the file exists else 0 (Dest=int, Src1=string)
   bcCurDir          = bcGroupString + 41;  // CURDIR$ - current working directory (Dest=string)
   bcEnviron         = bcGroupString + 42;  // ENVIRON$(name) - environment variable value (Dest=string, Src1=string)
+  bcFileLen         = bcGroupString + 43;  // FILELEN(path) - file size in bytes (Dest=int, Src1=string)
   bcDateStr         = bcGroupString + 34;  // DATE / TIME -> string (Dest=string; Immediate: 0=DATE "mm-dd-yyyy", 1=TIME "hh:mm:ss")
   bcDateName        = bcGroupString + 35;  // MONTHNAME(n)/WEEKDAYNAME(n) -> string (Dest=string, Src1=int; Imm: 0=MONTHNAME, 1=WEEKDAYNAME)
   bcStrMkInt        = bcGroupString + 36;  // MKI/MKL/MKSHORT/MKLONGINT - pack int into a binary string (Dest=string, Src1=int, Imm=byte width)
@@ -1405,6 +1406,7 @@ begin
         40: Result := 'FileExists';
         41: Result := 'CurDir';
         42: Result := 'Environ';
+        43: Result := 'FileLen';
         34: Result := 'DateStr';
         35: Result := 'DateName';
         36: Result := 'StrMkInt';

@@ -294,7 +294,7 @@ begin
     ssaStrSAdd,
     // FILEEXISTS depends on external filesystem state — keep it (don't elide/CSE) so repeated checks
     // re-query rather than being deduplicated. CURDIR/ENVIRON likewise read mutable external state.
-    ssaFileExists, ssaCurDir, ssaEnviron,
+    ssaFileExists, ssaCurDir, ssaEnviron, ssaFileLen,
     // SETDATE/SETTIME mutate the VM-internal clock offset — a side effect, never elide it.
     ssaSetClock,
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString,
