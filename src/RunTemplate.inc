@@ -999,7 +999,7 @@ begin
         bcLoad, bcSave, bcVerify, bcBload, bcBsave, bcBoot,
         bcRun, bcList, bcNew, bcCatalog,
         // File management commands
-        bcCopyFile, bcScratch, bcRenameFile, bcConcat, bcMkdir, bcChdir, bcMoveFile:
+        bcCopyFile, bcScratch, bcRenameFile, bcConcat, bcMkdir, bcChdir, bcRmdir, bcMoveFile:
           begin
             Ctx.PC := CurPC;
             ExecuteInstruction(Ctx, Instr);
@@ -1040,8 +1040,12 @@ begin
         Ctx.ResumePC := CurPC;  // Save PC for RESUME
         Ctx.InErrorHandler := True;
 
+        // Map the exception to a BASIC error code. A TExecutorException already carries the
+        // dialect-aware code (e.g. filesystem errors raised by RaiseFileError) — use it verbatim.
+        if E is TExecutorException then
+          Ctx.LastErrorCode := TExecutorException(E).ErrorCode
         // Map FPC exception types to BASIC error codes
-        if E is EDivByZero then
+        else if E is EDivByZero then
           Ctx.LastErrorCode := ERR_DIVISION_BY_ZERO
         else if E is EZeroDivide then
           Ctx.LastErrorCode := ERR_DIVISION_BY_ZERO

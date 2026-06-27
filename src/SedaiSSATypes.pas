@@ -284,6 +284,7 @@ type
     ssaConcat,         // CONCAT "src","dest": Concatenate files
     ssaMkdir,          // MKDIR/MD "path": Create directory
     ssaChdir,          // CHDIR/CD "path": Change current directory
+    ssaRmdir,          // RMDIR/RD "path": Remove directory (FreeBASIC/QB)
     ssaMoveFile,       // MOVE/MV "src","dest": Move file
     // Disk file I/O
     ssaDopen,          // DOPEN #handle, "filename" [, mode$]: Open disk file

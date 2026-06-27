@@ -348,7 +348,7 @@ begin
     ssaPutBinInt, ssaPutBinFloat, ssaGetBinInt, ssaGetBinFloat, ssaPutBinStr, ssaGetBinStr,
     // File management commands
     ssaLoad, ssaSave, ssaVerify, ssaBload, ssaBsave, ssaBoot,
-    ssaScratch, ssaCopyFile, ssaRenameFile, ssaMkdir, ssaChdir, ssaMoveFile, ssaConcat:
+    ssaScratch, ssaCopyFile, ssaRenameFile, ssaMkdir, ssaChdir, ssaRmdir, ssaMoveFile, ssaConcat:
       Result := True;
 
     // Graphics operations - always live (visible side effects on screen)

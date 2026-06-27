@@ -215,6 +215,7 @@ const
   bcConcat          = bcGroupCore + 86;  // CONCAT "src","dest": Concatenate files
   bcMkdir           = bcGroupCore + 87;  // MKDIR/MD "path": Create directory
   bcChdir           = bcGroupCore + 88;  // CHDIR/CD "path": Change current directory
+  bcRmdir           = bcGroupCore + 137; // RMDIR/RD "path": Remove directory (FreeBASIC/QB)
   bcMoveFile        = bcGroupCore + 89;  // MOVE/MV "src","dest": Move file
   // Error handling
   bcTrap            = bcGroupCore + 90;  // TRAP linenum: Set error handler line
@@ -721,7 +722,11 @@ type
     FStringVarRegCount: Integer;
     // Procedure descriptor table (M2): one entry per SUB/FUNCTION, indexed by bcCallSub.
     FProcedures: array of TProcDescriptor;
+    // Dialect of the compiled source: True = MODERN (FreeBASIC), False = CLASSIC (Commodore v7).
+    // Used at runtime for dialect-aware behaviour (e.g. filesystem error codes: FB vs CBM).
+    FModernMode: Boolean;
   public
+    property ModernMode: Boolean read FModernMode write FModernMode;
     constructor Create;
     destructor Destroy; override;
     procedure AddInstruction(const Instr: TBytecodeInstruction);

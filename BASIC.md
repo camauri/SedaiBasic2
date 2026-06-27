@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 427 / 643 implemented (66%)** (+ 4 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 431 / 643 implemented (67%)** (+ 4 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **427 (75%)** are implemented. See the
+**572 applicable** keywords, **431 (75%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -2254,16 +2254,16 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `EXEC and CHAIN` | ✗ | N/A — launching/transferring to external programs is out of scope for the sandboxed VM. |
 | `RUN` | ✓ | Transfers control to another program. |
-| `KILL` | ✗ | Deletes an existing file. |
-| `NAME` | ✗ | Renames an existing file. |
+| `KILL` | ✓ | Deletes an existing file (`KILL "path"`). Raises a dialect-aware runtime error (FB code 2 = file not found) catchable by `ON ERROR`. |
+| `NAME` | ✓ | Renames a file: `NAME old AS new` (intercepted by name, so `NAME` stays usable as an identifier/field). |
 
 #### File Properties
 
 | Keyword | Status | Description |
 |---|---|---|
 | `FILEATTR` | ✗ | Gets information about a file bound to a file number. |
-| `FILECOPY` | ✗ | Copies a file. |
-| `FILEDATETIME` | ✗ | Gets the last modified date and time of a file. |
+| `FILECOPY` | ✓ | Copies a file (`FILECOPY src, dst`). |
+| `FILEDATETIME` | ✗ | Gets the last modified date and time of a file. (Deferred: needs a datetime-serial function.) |
 | `FILEEXISTS` | ✓ | `FILEEXISTS(path)` returns -1 if the file exists, else 0 (cross-platform). |
 | `FILELEN` | ✓ | `FILELEN(path)` -> file size in bytes (0 if the file does not exist); cross-platform. |
 | `FILESETEOF` | ✗ | Sets the length of an open file bound to a file number. |
@@ -2278,7 +2278,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `DIR` | ✓ | Gets the names of files or directories matching certain attributes. |
 | `EXEPATH` | ✗ | Gets the directory of the current running program. |
 | `MKDIR` | ✓ | Creates a new directory. |
-| `RMDIR` | ✗ | Deletes an existing directory. |
+| `RMDIR` | ✓ | Removes an empty directory (`RMDIR "path"`, alias `RD`). |
 
 #### System Procedures
 

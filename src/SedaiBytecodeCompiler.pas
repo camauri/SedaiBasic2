@@ -469,6 +469,7 @@ begin
     ssaConcat: Result := bcConcat;
     ssaMkdir: Result := bcMkdir;
     ssaChdir: Result := bcChdir;
+    ssaRmdir: Result := bcRmdir;
     ssaMoveFile: Result := bcMoveFile;
     {$IFDEF WEB_MODE}
     // Web operations

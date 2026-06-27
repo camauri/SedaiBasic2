@@ -209,6 +209,11 @@ const
   kCD      = 'CD';           // Alias for CHDIR
   kMOVE    = 'MOVE';
   kMV      = 'MV';           // Alias for MOVE
+  kKILL    = 'KILL';         // FreeBASIC/QB: delete a file
+  kRMDIR   = 'RMDIR';        // FreeBASIC/QB: remove an (empty) directory
+  kRD      = 'RD';           // Alias for RMDIR
+  kFILECOPY = 'FILECOPY';    // FreeBASIC: copy a file
+  kNAME    = 'NAME';         // FreeBASIC/QB: NAME old AS new (rename); intercepted by-name, not reserved
 
   // Memory and system
   kBANK	   = 'BANK';

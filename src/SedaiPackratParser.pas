@@ -272,6 +272,8 @@ type
     function ParseWriteFileStatement: TASTNode;   // FreeBASIC WRITE #n, exprlist (quoted CSV)
     function ParseWriteConsole: TASTNode;          // FreeBASIC WRITE exprlist (quoted CSV to screen)
     function ParseSeekStatement: TASTNode;         // FreeBASIC SEEK #n, pos (set position)
+    function ParseNameStatement: TASTNode;         // FreeBASIC NAME old AS new (rename)
+    function PeekNameHasAs: Boolean;               // lookahead: NAME ... AS ... on this statement
     function ParseBinaryFileTail(IsGet: Boolean; const Tok: TLexerToken): TASTNode;  // GET/PUT #n,[pos],var
     function ParseErrorHandlingStatement: TASTNode;
     function ParseDebugStatement: TASTNode;
@@ -922,6 +924,11 @@ begin
           Context.Advance;   // consume PUT
           Result := ParseBinaryFileTail(False, Token);
         end
+        // FreeBASIC/QB "NAME old AS new" (rename). NAME is a bare identifier (not reserved, so it can
+        // still be a variable/field); the trailing AS before end-of-statement disambiguates from an
+        // assignment "name = ..." (no bare AS) and from "name" used as a value.
+        else if (UpperCase(Token.Value) = kNAME) and PeekNameHasAs then
+          Result := ParseNameStatement
         // Note: the FreeBASIC in-place "MID(dst,start[,len]) = src" statement (MODERN) is intercepted
         // earlier by the dialect profile's IdentMidStatementHandler (mechanism 3), so it does not need
         // a branch here; in CLASSIC bare MID is a plain identifier handled by the default path below.
@@ -4176,6 +4183,11 @@ begin
     'MKDIR', 'MD': Result := TASTNode.Create(antMkdir, Token);
     'CHDIR', 'CD': Result := TASTNode.Create(antChdir, Token);
     'MOVE', 'MV': Result := TASTNode.Create(antMove, Token);
+    // FreeBASIC/QB filesystem mutation: KILL deletes a file (= SCRATCH), FILECOPY copies (= COPY),
+    // RMDIR removes a directory (new).
+    'KILL': Result := TASTNode.Create(antScratch, Token);
+    'FILECOPY': Result := TASTNode.Create(antCopy, Token);
+    'RMDIR', 'RD': Result := TASTNode.Create(antRmdir, Token);
   else
     Result := TASTNode.Create(antStatement, Token);
   end;
@@ -4516,6 +4528,58 @@ begin
   if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;  // comma
   P := ParseExpression;   // position (1-based)
   if Assigned(P) then Result.AddChild(P);
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.PeekNameHasAs: Boolean;
+// True when the statement starting at NAME is the FreeBASIC "NAME old AS new" rename form: an AS
+// (ttAsType) appears before end-of-statement, and NAME is not immediately followed by '=' / '.' /
+// '(' / '[' (which would make it an assignment, member, array or call to a variable named NAME).
+var
+  SavedIndex: Integer;
+begin
+  Result := False;
+  Context.SavePosition(SavedIndex);
+  try
+    Context.Advance;  // skip NAME
+    if Context.CheckAny([ttOpEq, ttOpDot, ttDelimParOpen, ttDelimBrackOpen]) then
+      Exit;
+    while not Context.CheckAny([ttEndOfLine, ttEndOfFile, ttSeparStmt]) do
+    begin
+      if Context.Check(ttAsType) then
+      begin
+        Result := True;
+        Exit;
+      end;
+      Context.Advance;
+    end;
+  finally
+    Context.RestorePosition(SavedIndex);
+  end;
+end;
+
+function TPackratParser.ParseNameStatement: TASTNode;
+// FreeBASIC/QB "NAME old AS new" -> antRenameFile (child0 = old path, child1 = new path),
+// reusing the existing RENAME lowering (ssaRenameFile).
+var
+  Tok: TLexerToken;
+  OldExpr, NewExpr: TASTNode;
+begin
+  Tok := Context.CurrentToken;
+  Context.Advance;  // consume NAME
+  Result := TASTNode.Create(antRenameFile, Tok);
+
+  OldExpr := ParseExpression;   // old path (stops before AS)
+  if Assigned(OldExpr) then Result.AddChild(OldExpr);
+
+  if Context.Check(ttAsType) then
+    Context.Advance   // consume AS
+  else
+    HandleError('Expected AS in NAME statement', Context.CurrentToken);
+
+  NewExpr := ParseExpression;   // new path
+  if Assigned(NewExpr) then Result.AddChild(NewExpr);
+
   DoNodeCreated(Result);
 end;
 

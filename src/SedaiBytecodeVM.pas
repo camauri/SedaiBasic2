@@ -227,6 +227,9 @@ type
     {$IFDEF WEB_MODE}
     procedure ExecuteWebOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     {$ENDIF}
+    // Raise a dialect-aware filesystem runtime error: FreeBASIC error number + message in MODERN,
+    // Commodore error number + '?...' message in CLASSIC. The code reaches ERR via the except handler.
+    procedure RaiseFileError(const FBMsg: string; FBCode: Integer; const CBMMsg: string; CBMCode: Integer);
     // File management operations (executed directly in VM)
     procedure ExecuteCopyFile(const Src, Dest: string; Overwrite: Boolean);
     procedure ExecuteScratch(const Pattern: string; Force: Boolean; Silent: Boolean = False);
@@ -234,6 +237,7 @@ type
     procedure ExecuteConcat(const Src, Dest: string);
     procedure ExecuteMkdir(const Path: string);
     procedure ExecuteChdir(const Path: string);
+    procedure ExecuteRmdir(const Path: string);
     procedure ExecuteMoveFile(const Src, Dest: string);
     procedure InitializeRegisters;
     procedure ClearAllVariables;
@@ -3830,6 +3834,13 @@ begin
         ExecuteChdir(Ctx.StringRegs[Instr.Src1]);
       end;
 
+    bcRmdir:
+      begin
+        // RMDIR "path" (FreeBASIC/QB) - remove an empty directory
+        // Src1 = path
+        ExecuteRmdir(Ctx.StringRegs[Instr.Src1]);
+      end;
+
     bcMoveFile:
       begin
         // MOVE "src", "dest"
@@ -6864,6 +6875,17 @@ end;
 
 { ========== FILE MANAGEMENT COMMANDS (executed directly in VM) ========== }
 
+procedure TBytecodeVM.RaiseFileError(const FBMsg: string; FBCode: Integer; const CBMMsg: string; CBMCode: Integer);
+begin
+  // Dialect selects the error number and message. The except handler in the run loop reads
+  // TExecutorException.ErrorCode into ERR (and the message into ERR$), so a caught filesystem
+  // error reports the dialect's native code: FreeBASIC numbers in MODERN, Commodore in CLASSIC.
+  if Assigned(FProgram) and FProgram.ModernMode then
+    raise TExecutorIOException.CreateWithCode(FBMsg, FBCode)
+  else
+    raise TExecutorIOException.CreateWithCode(CBMMsg, CBMCode);
+end;
+
 procedure TBytecodeVM.ExecuteCopyFile(const Src, Dest: string; Overwrite: Boolean);
 var
   SrcStream, DstStream: TFileStream;
@@ -6884,7 +6906,8 @@ begin
   begin
     // Wildcard copy - destination must be a directory
     if not DirectoryExists(Dest) then
-      raise Exception.Create('?DESTINATION MUST BE A DIRECTORY FOR WILDCARDS');
+      RaiseFileError('Illegal function call', FBERR_ILLEGAL_CALL,
+                     '?DESTINATION MUST BE A DIRECTORY FOR WILDCARDS', ERR_INVALID_ARGUMENT);
 
     if FindFirst(IncludeTrailingPathDelimiter(SrcDir) + SrcPattern,
                  faAnyFile and not faDirectory, SearchRec) = 0 then
@@ -6916,13 +6939,14 @@ begin
       end;
     end
     else
-      raise Exception.Create('?FILE NOT FOUND');
+      RaiseFileError('File not found', FBERR_FILE_NOT_FOUND, '?FILE NOT FOUND', ERR_FILE_NOT_FOUND);
   end
   else
   begin
     // Single file copy
     if not FileExists(Src) then
-      raise Exception.Create('?FILE NOT FOUND: ' + ExtractFileName(Src));
+      RaiseFileError('File not found', FBERR_FILE_NOT_FOUND,
+                     '?FILE NOT FOUND: ' + ExtractFileName(Src), ERR_FILE_NOT_FOUND);
 
     // Determine destination
     if DirectoryExists(Dest) then
@@ -6932,7 +6956,8 @@ begin
 
     // Check overwrite
     if FileExists(DstFullPath) and not Overwrite then
-      raise Exception.Create('?FILE EXISTS: ' + ExtractFileName(DstFullPath));
+      RaiseFileError('File I/O error', FBERR_FILE_IO,
+                     '?FILE EXISTS: ' + ExtractFileName(DstFullPath), ERR_FILE_ACCESS);
 
     // Copy file
     SrcStream := TFileStream.Create(Src, fmOpenRead or fmShareDenyWrite);
@@ -6971,7 +6996,8 @@ begin
         if not SysUtils.DeleteFile(FullPath) then
         begin
           if not Force then
-            raise Exception.Create('?CANNOT DELETE: ' + SearchRec.Name);
+            RaiseFileError('File I/O error', FBERR_FILE_IO,
+                           '?CANNOT DELETE: ' + SearchRec.Name, ERR_FILE_ACCESS);
         end;
       until FindNext(SearchRec) <> 0;
     finally
@@ -6982,20 +7008,22 @@ begin
   begin
     // Only raise error if not Silent
     if not Silent then
-      raise Exception.Create('?FILE NOT FOUND');
+      RaiseFileError('File not found', FBERR_FILE_NOT_FOUND, '?FILE NOT FOUND', ERR_FILE_NOT_FOUND);
   end;
 end;
 
 procedure TBytecodeVM.ExecuteRenameFile(const OldName, NewName: string);
 begin
   if not FileExists(OldName) then
-    raise Exception.Create('?FILE NOT FOUND: ' + ExtractFileName(OldName));
+    RaiseFileError('File not found', FBERR_FILE_NOT_FOUND,
+                   '?FILE NOT FOUND: ' + ExtractFileName(OldName), ERR_FILE_NOT_FOUND);
 
   if FileExists(NewName) then
-    raise Exception.Create('?FILE EXISTS: ' + ExtractFileName(NewName));
+    RaiseFileError('File I/O error', FBERR_FILE_IO,
+                   '?FILE EXISTS: ' + ExtractFileName(NewName), ERR_FILE_ACCESS);
 
   if not SysUtils.RenameFile(OldName, NewName) then
-    raise Exception.Create('?CANNOT RENAME FILE');
+    RaiseFileError('File I/O error', FBERR_FILE_IO, '?CANNOT RENAME FILE', ERR_FILE_ACCESS);
 end;
 
 procedure TBytecodeVM.ExecuteConcat(const Src, Dest: string);
@@ -7004,11 +7032,13 @@ var
 begin
   // Source must exist
   if not FileExists(Src) then
-    raise Exception.Create('?FILE NOT FOUND: ' + ExtractFileName(Src));
+    RaiseFileError('File not found', FBERR_FILE_NOT_FOUND,
+                   '?FILE NOT FOUND: ' + ExtractFileName(Src), ERR_FILE_NOT_FOUND);
 
   // Destination must exist (we append to it)
   if not FileExists(Dest) then
-    raise Exception.Create('?FILE NOT FOUND: ' + ExtractFileName(Dest));
+    RaiseFileError('File not found', FBERR_FILE_NOT_FOUND,
+                   '?FILE NOT FOUND: ' + ExtractFileName(Dest), ERR_FILE_NOT_FOUND);
 
   // Open source for reading
   SrcStream := TFileStream.Create(Src, fmOpenRead or fmShareDenyWrite);
@@ -7029,19 +7059,29 @@ end;
 procedure TBytecodeVM.ExecuteMkdir(const Path: string);
 begin
   if DirectoryExists(Path) then
-    raise Exception.Create('?DIRECTORY EXISTS: ' + Path);
+    RaiseFileError('File I/O error', FBERR_FILE_IO, '?DIRECTORY EXISTS: ' + Path, ERR_FILE_ACCESS);
 
   if not ForceDirectories(Path) then
-    raise Exception.Create('?CANNOT CREATE DIRECTORY: ' + Path);
+    RaiseFileError('File I/O error', FBERR_FILE_IO, '?CANNOT CREATE DIRECTORY: ' + Path, ERR_FILE_ACCESS);
 end;
 
 procedure TBytecodeVM.ExecuteChdir(const Path: string);
 begin
   if not DirectoryExists(Path) then
-    raise Exception.Create('?DIRECTORY NOT FOUND: ' + Path);
+    RaiseFileError('File not found', FBERR_FILE_NOT_FOUND, '?DIRECTORY NOT FOUND: ' + Path, ERR_FILE_NOT_FOUND);
 
   if not SetCurrentDir(Path) then
-    raise Exception.Create('?CANNOT CHANGE DIRECTORY: ' + Path);
+    RaiseFileError('File I/O error', FBERR_FILE_IO, '?CANNOT CHANGE DIRECTORY: ' + Path, ERR_FILE_ACCESS);
+end;
+
+procedure TBytecodeVM.ExecuteRmdir(const Path: string);
+begin
+  if not DirectoryExists(Path) then
+    RaiseFileError('File not found', FBERR_FILE_NOT_FOUND, '?DIRECTORY NOT FOUND: ' + Path, ERR_FILE_NOT_FOUND);
+
+  // RemoveDir fails if the directory is not empty (or on permission error) -> File I/O error.
+  if not RemoveDir(Path) then
+    RaiseFileError('File I/O error', FBERR_FILE_IO, '?CANNOT REMOVE DIRECTORY: ' + Path, ERR_FILE_ACCESS);
 end;
 
 procedure TBytecodeVM.ExecuteMoveFile(const Src, Dest: string);
@@ -7049,7 +7089,8 @@ var
   DstFullPath: string;
 begin
   if not FileExists(Src) then
-    raise Exception.Create('?FILE NOT FOUND: ' + ExtractFileName(Src));
+    RaiseFileError('File not found', FBERR_FILE_NOT_FOUND,
+                   '?FILE NOT FOUND: ' + ExtractFileName(Src), ERR_FILE_NOT_FOUND);
 
   // Determine destination
   if DirectoryExists(Dest) then
@@ -7058,7 +7099,8 @@ begin
     DstFullPath := Dest;
 
   if FileExists(DstFullPath) then
-    raise Exception.Create('?FILE EXISTS: ' + ExtractFileName(DstFullPath));
+    RaiseFileError('File I/O error', FBERR_FILE_IO,
+                   '?FILE EXISTS: ' + ExtractFileName(DstFullPath), ERR_FILE_ACCESS);
 
   // Try rename first (works if same volume)
   if not SysUtils.RenameFile(Src, DstFullPath) then
@@ -7066,7 +7108,7 @@ begin
     // If rename fails (different volumes), copy then delete
     ExecuteCopyFile(Src, DstFullPath, False);
     if not SysUtils.DeleteFile(Src) then
-      raise Exception.Create('?CANNOT DELETE SOURCE AFTER MOVE');
+      RaiseFileError('File I/O error', FBERR_FILE_IO, '?CANNOT DELETE SOURCE AFTER MOVE', ERR_FILE_ACCESS);
   end;
 end;
 

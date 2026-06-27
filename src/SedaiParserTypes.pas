@@ -192,6 +192,7 @@ type
     antConcat,            // CONCAT command (concatenate files)
     antMkdir,             // MKDIR/MD command (create directory)
     antChdir,             // CHDIR/CD command (change directory)
+    antRmdir,             // RMDIR/RD command (remove directory) - FreeBASIC/QB
     antMove,              // MOVE/MV command (move file)
     antGraphics,          // GRAPHIC command
     antScnClr,            // SCNCLR command (clear screen)

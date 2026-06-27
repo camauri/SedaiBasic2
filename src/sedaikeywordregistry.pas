@@ -1771,6 +1771,10 @@ begin
  RegisterKeyword(kCD,        ttFileManagement, 'Change directory (alias for CHDIR)',       kcDOSCommands);
  RegisterKeyword(kMOVE,      ttFileManagement, 'Move file to another location',            kcDOSCommands);
  RegisterKeyword(kMV,        ttFileManagement, 'Move file (alias for MOVE)',               kcDOSCommands);
+ RegisterKeyword(kKILL,      ttFileManagement, 'Delete a file (FreeBASIC/QB)',             kcDOSCommands);
+ RegisterKeyword(kRMDIR,     ttFileManagement, 'Remove a directory (FreeBASIC/QB)',        kcDOSCommands);
+ RegisterKeyword(kRD,        ttFileManagement, 'Remove a directory (alias for RMDIR)',     kcDOSCommands);
+ RegisterKeyword(kFILECOPY,  ttFileManagement, 'Copy a file (FreeBASIC)',                  kcDOSCommands);
 
  // === STRING FUNCTIONS ===
  RegisterKeyword(kASC,    ttStringFunction, 'Return character code',                            kcStringFunctions);

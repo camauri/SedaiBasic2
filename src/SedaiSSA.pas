@@ -458,6 +458,7 @@ type
     procedure ProcessConcat(Node: TASTNode);
     procedure ProcessMkdir(Node: TASTNode);
     procedure ProcessChdir(Node: TASTNode);
+    procedure ProcessRmdir(Node: TASTNode);
     procedure ProcessMoveFile(Node: TASTNode);
     {$IFDEF WEB_MODE}
     procedure ProcessWebCommand(Node: TASTNode);
@@ -10729,6 +10730,24 @@ begin
                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
+procedure TSSAGenerator.ProcessRmdir(Node: TASTNode);
+var
+  PathVal: TSSAValue;
+  PathReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+
+  // RMDIR "path"
+  if Node.ChildCount < 1 then
+    raise Exception.Create('RMDIR requires a path');
+
+  ProcessExpression(Node.GetChild(0), PathVal);
+  PathReg := EnsureStringRegister(PathVal);
+
+  EmitInstruction(ssaRmdir, MakeSSAValue(svkNone), PathReg,
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
 procedure TSSAGenerator.ProcessMoveFile(Node: TASTNode);
 var
   SrcVal, DstVal: TSSAValue;
@@ -14755,6 +14774,7 @@ begin
     antConcat: ProcessConcat(Node);
     antMkdir: ProcessMkdir(Node);
     antChdir: ProcessChdir(Node);
+    antRmdir: ProcessRmdir(Node);
     antMove: ProcessMoveFile(Node);
     antClear:
     begin

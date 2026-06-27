@@ -1260,6 +1260,9 @@ begin
           WriteLn('ERROR: Bytecode compilation failed!');
           Exit;
         end;
+        // Record the source dialect on the program so the VM can pick dialect-aware behaviour
+        // (e.g. filesystem error codes: FreeBASIC vs Commodore). Mirrors SSAGen.ModernMode above.
+        BytecodeProgram.ModernMode := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
       except
         on E: Exception do
         begin

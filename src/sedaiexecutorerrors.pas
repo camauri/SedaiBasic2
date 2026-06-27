@@ -198,6 +198,19 @@ const
   ERR_WRONG_NUM_ARGS       = 112; // Wrong number of arguments
   ERR_INVALID_ARGUMENT     = 113; // Invalid argument
 
+  // FreeBASIC runtime error codes (MODERN dialect) — from the official manual
+  // (job/fb-manual/TblRuntimeErrors.html). These collide numerically with the Commodore
+  // codes above (e.g. FB 2 = "file not found" vs CBM 2 = "file already open"), so the VM
+  // selects the set by dialect at runtime.
+  FBERR_ILLEGAL_CALL       = 1;   // Illegal function call
+  FBERR_FILE_NOT_FOUND     = 2;   // File not found
+  FBERR_FILE_IO            = 3;   // File I/O error
+  FBERR_OUT_OF_MEMORY      = 4;   // Out of memory
+  FBERR_ILLEGAL_RESUME     = 5;   // Illegal resume
+  FBERR_OUT_OF_BOUNDS      = 6;   // Out of bounds array access
+  FBERR_NULL_POINTER       = 7;   // Null pointer access
+  FBERR_NO_PRIVILEGES      = 8;   // No privileges
+
   // Aliases for backward compatibility
   ERR_UNDEFINED_LINE = ERR_UNDEFINED_STATEMENT;
   ERR_ARRAY_INDEX_OUT_OF_BOUNDS = ERR_BAD_SUBSCRIPT;
