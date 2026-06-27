@@ -358,6 +358,8 @@ type
     // FreeBASIC bit/byte macros (LOBYTE/HIBYTE/LOWORD/HIWORD/BIT/BITSET/BITRESET) and CBOOL,
     // lowered to existing integer bitwise/shift/compare SSA ops (no new opcodes).
     procedure EmitBitMacro(const FuncName: string; ArgsNode: TASTNode; out Result: TSSAValue);
+    // FreeBASIC ARRAYLEN(arr): total element count = product over dims of (ubound-lbound+1).
+    procedure EmitArrayLen(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure ProcessForLoop(Node: TASTNode);
     procedure ProcessDoLoop(Node: TASTNode);
     procedure ProcessBlock(Node: TASTNode);
@@ -3320,6 +3322,14 @@ begin
           Exit;
         end;
 
+        // FreeBASIC ARRAYLEN(arr): total element count. Not a registered keyword; intercept in MODERN
+        // when ARRAYLEN itself is not a declared array. (Its argument names the array to measure.)
+        if FModernMode and (UpperCase(ArrName) = kARRAYLEN) and (FProgram.FindArray(ArrName) < 0) then
+        begin
+          EmitArrayLen(Node.GetChild(1), Result);
+          Exit;
+        end;
+
         // FreeBASIC VARPTR(v) / PROCPTR(p): the address of a variable / procedure. Both are exactly
         // "@arg" in our model — synthesize an antProcAddress for the argument and process it (the @
         // lowering handles a scalar / array element / UDT field|handle / SHARED global / SUB entry PC).
@@ -5347,6 +5357,46 @@ begin
       EmitInstruction(ssaBitwiseAnd, Result, A0, NotShl, MakeSSAValue(svkNone));  // x AND NOT (1 SHL b)
     end;
   end;
+end;
+
+procedure TSSAGenerator.EmitArrayLen(ArgsNode: TASTNode; out Result: TSSAValue);
+// FreeBASIC ARRAYLEN(arr): total number of elements = product over every dimension of
+// (UBOUND(arr,d) - LBOUND(arr,d) + 1). Emitted at runtime from the existing bound ops so it is
+// correct for fixed and REDIM'd arrays alike. The argument is an array name (bare or array-access).
+var
+  NameNode: TASTNode;
+  ArrName: string;
+  ArrayIdx, DimCount, d: Integer;
+  ArrayRef, Acc, One, DimReg, Ub, Lb, Diff, Cnt, NewAcc: TSSAValue;
+begin
+  Result := MakeSSAValue(svkNone);
+  if (ArgsNode = nil) or (ArgsNode.ChildCount < 1) then Exit;
+  NameNode := ArgsNode.GetChild(0);
+  if NameNode.NodeType = antArrayAccess then ArrName := VarToStr(NameNode.GetChild(0).Value)
+  else ArrName := VarToStr(NameNode.Value);
+  ArrayIdx := FProgram.FindArray(ArrName);
+  if ArrayIdx < 0 then Exit;                       // not an array -> leave Result as none
+  DimCount := FProgram.GetArray(ArrayIdx).DimCount;
+  if DimCount < 1 then DimCount := 1;
+  ArrayRef := MakeSSAArrayRef(ArrayIdx, srtInt);
+  One := EnsureIntRegister(MakeSSAConstInt(1));
+  Acc := EnsureIntRegister(MakeSSAConstInt(1));     // accumulator = 1
+  for d := 0 to DimCount - 1 do
+  begin
+    DimReg := EnsureIntRegister(MakeSSAConstInt(d));  // 0-based dimension index
+    Ub := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    Lb := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaArrayUBound, Ub, ArrayRef, DimReg, MakeSSAValue(svkNone));
+    EmitInstruction(ssaArrayLBound, Lb, ArrayRef, DimReg, MakeSSAValue(svkNone));
+    Diff := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, Diff, Ub, Lb, MakeSSAValue(svkNone));   // ub - lb
+    Cnt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, Cnt, Diff, One, MakeSSAValue(svkNone)); // + 1
+    NewAcc := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, NewAcc, Acc, Cnt, MakeSSAValue(svkNone));
+    Acc := NewAcc;
+  end;
+  Result := Acc;
 end;
 
 procedure TSSAGenerator.EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);

@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 406 / 643 implemented (63%)** (+ 4 partial); see the
+**FreeBASIC keyword set — 407 / 643 implemented (63%)** (+ 4 partial); see the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -2010,7 +2010,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ARRAYLEN` | ✗ | Returns the total number of array elements. |
+| `ARRAYLEN` | ✓ | Total element count = product over dims of `(ubound-lbound+1)`; computed at runtime, correct for fixed, `lb TO ub`, multi-dim, and REDIM'd arrays. |
 | `ARRAYSIZE` | ✗ | Returns the total array size (in bytes). |
 | `LBOUND` | ✓ | Returns the lower bound of an array's dimension. `LBOUND(arr[, dim])` (B1.4). |
 | `UBOUND` | ✓ | Returns the upper bound of an array's dimension. `UBOUND(arr[, dim])` (B1.4; honors explicit `lb TO ub` and dynamic sizes). |
