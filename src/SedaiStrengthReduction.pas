@@ -1262,6 +1262,8 @@ var
   AccumInitInt: Int64;
   AccumInitFloat: Double;
   IVUpdatePos, PosScan: Integer;   // guard: position of the IV update vs the multiply in the block
+  NestedSkip: Boolean;             // guard: multiply lives in a loop nested inside the IV's loop
+  InnerLoop: TLoopInfoSR;          // candidate nested loop in the nested-loop guard
 
   // Initialize variables to avoid warnings
   procedure InitVars;
@@ -1430,6 +1432,34 @@ begin
         end;
 
         if not FoundIV then
+        begin
+          Inc(k);
+          Continue;
+        end;
+
+        // SOUNDNESS GUARD (nested loops): the accumulator is updated exactly once per IV-loop
+        // iteration (after the IV update on the back-edge), so replacing `IV * const` with a copy
+        // of the accumulator is only valid when the multiply executes once per IV-loop iteration.
+        // If the multiply lives inside an INNER loop nested within the IV's loop, it executes more
+        // often than the accumulator updates and would read a stale value across outer iterations
+        // (e.g. nested DO WHILE: `J = i*10` computed in the inner loop reads 1,4 instead of 1,2).
+        // Detect that the multiply's block belongs to a loop nested inside this one and skip — the
+        // multiply stays and computes correctly.
+        NestedSkip := False;
+        for PosScan := 0 to FLoops.Count - 1 do
+        begin
+          InnerLoop := TLoopInfoSR(FLoops[PosScan]);
+          if InnerLoop.Header = Loop.Header then
+            Continue;
+          // InnerLoop is nested in Loop when Loop contains InnerLoop's header; the multiply is
+          // inside it when InnerLoop also contains the multiply's block.
+          if Loop.ContainsBlock(InnerLoop.Header) and InnerLoop.ContainsBlock(Block) then
+          begin
+            NestedSkip := True;
+            Break;
+          end;
+        end;
+        if NestedSkip then
         begin
           Inc(k);
           Continue;
