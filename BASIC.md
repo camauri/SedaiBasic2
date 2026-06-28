@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **436 / 643 implemented (68%)**, plus 4 partial (◐).
-> Of the 207 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **436 / 572 ≈ 76% of the
+> **Coverage (FreeBASIC keyword set):** **437 / 643 implemented (68%)**, plus 4 partial (◐).
+> Of the 202 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **437 / 572 ≈ 76% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -1975,7 +1975,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `NEXT` | ✓ |  |
 | `THEN` | ✓ |  |
 | `UNTIL` | ✓ |  |
-| `WEND (or 'END WHILE')` | ✗ |  |
+| `WEND (or 'END WHILE')` | ✓ | Closes a `WHILE...WEND` loop (desugared to `DO WHILE...LOOP`). `END WHILE` form: see note. |
 | `WHILE` | ✓ |  |
 
 ##### Uncategorized
