@@ -346,6 +346,7 @@ const
   bcEnviron         = bcGroupString + 42;  // ENVIRON$(name) - environment variable value (Dest=string, Src1=string)
   bcFileLen         = bcGroupString + 43;  // FILELEN(path) - file size in bytes (Dest=int, Src1=string)
   bcExePath         = bcGroupString + 44;  // EXEPATH - directory of the running program (Dest=string)
+  bcStrFormat       = bcGroupString + 45;  // FORMAT(num, mask) - formatted string (Dest=string, Src1=mask, Immediate=value float reg)
   bcDateStr         = bcGroupString + 34;  // DATE / TIME -> string (Dest=string; Immediate: 0=DATE "mm-dd-yyyy", 1=TIME "hh:mm:ss")
   bcDateName        = bcGroupString + 35;  // MONTHNAME(n)/WEEKDAYNAME(n) -> string (Dest=string, Src1=int; Imm: 0=MONTHNAME, 1=WEEKDAYNAME)
   bcStrMkInt        = bcGroupString + 36;  // MKI/MKL/MKSHORT/MKLONGINT - pack int into a binary string (Dest=string, Src1=int, Imm=byte width)
@@ -1424,6 +1425,7 @@ begin
         42: Result := 'Environ';
         43: Result := 'FileLen';
         44: Result := 'ExePath';
+        45: Result := 'Format';
         34: Result := 'DateStr';
         35: Result := 'DateName';
         36: Result := 'StrMkInt';

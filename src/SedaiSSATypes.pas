@@ -129,6 +129,7 @@ type
     ssaCurDir,         // CURDIR$ -> current working directory (Dest=string, no operand)
     ssaEnviron,        // ENVIRON$(name) -> environment variable value (Dest=string, Src1=string)
     ssaExePath,        // EXEPATH -> directory of the running program (Dest=string, no operand)
+    ssaStrFormat,      // FORMAT(num, mask) -> formatted string (Dest=string, Src1=mask string, Immediate=value float reg)
     ssaFileLen,        // FILELEN(path) -> file size in bytes (Dest=int, Src1=string)
     // FreeBASIC numeric serialization (B3): pack/unpack a number to/from a fixed-width binary string.
     ssaStrMkInt,       // MKI/MKL/MKSHORT/MKLONGINT -> binary string of an int (Dest=string, Src1=int, Imm=byte width)

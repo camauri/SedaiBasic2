@@ -950,6 +950,7 @@ var
   ArgNode: TASTNode;              // WSTRING: the source AST node of a string-function argument (width detect)
   MethodOwnerType, MethodLabelName: string;  // M4.1
   ArgValue, ArgReg: TSSAValue;
+  MaskValue, MaskReg: TSSAValue;   // FORMAT(num, mask): the mask string operand
   TempReg, IntReg: Integer;
   IntRegVal, TempVal: TSSAValue;
   ArgListNode: TASTNode;
@@ -3455,6 +3456,29 @@ begin
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
           EmitInstruction(ssaEnviron, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC FORMAT(num [, mask]) / FORMAT$(...): formatted number string. Numeric masks
+        // (0 # , . % and scientific E+/E-/e+/e-, plus literals) are supported in v1; date/time masks
+        // are deferred. The value goes in the Immediate float-register slot (like DATEADD's serial).
+        if FModernMode and ((UpperCase(ArrName) = kFORMAT) or (UpperCase(ArrName) = kFORMATS)) and
+           (FProgram.FindArray(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ArgReg := EnsureFloatRegister(ArgValue);          // the number to format
+          if Node.GetChild(1).ChildCount >= 2 then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(1), MaskValue);
+            MaskReg := EnsureStringRegister(MaskValue);
+          end
+          else
+          begin
+            MaskReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+            EmitInstruction(ssaLoadConstString, MaskReg, MakeSSAConstString(''), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+          Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+          EmitInstruction(ssaStrFormat, Result, MaskReg, MakeSSAValue(svkNone), ArgReg);  // Src3=value float -> Immediate
           Exit;
         end;
 

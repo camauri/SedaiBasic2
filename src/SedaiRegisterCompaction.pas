@@ -351,6 +351,7 @@ begin
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING codepoint substrings - string dest
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrSpace,  // B1.2: string dest
     bcCurDir, bcEnviron, bcExePath,  // CURDIR$ / ENVIRON$(name) / EXEPATH - string dest
+    bcStrFormat,  // FORMAT(num, mask) - string dest
     bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - string dest
     bcStrTrimSet, // LTRIM/RTRIM/TRIM(s,set) - string dest
     bcStrStr,    // STR$(n) - number to string
@@ -676,6 +677,7 @@ begin
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src1 = source string
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string
     bcEnviron,   // ENVIRON$(name) - Src1 = name string
+    bcStrFormat, // FORMAT(num, mask) - Src1 = mask string
 
     bcStrVal,    // VAL(str) - reads string, produces float
     bcStrValInt, // VALINT/VALLNG/VALUINT(str) - reads string, produces int
@@ -816,7 +818,9 @@ begin
     // Fused Mul-Mul: Immediate is 'c' in (a*b*c)
     bcMulMulFloat,
     // DATEADD: Immediate = serial (float reg); DATEDIFF: Immediate = s2 (float reg)
-    bcDateAdd, bcDateDiff:
+    bcDateAdd, bcDateDiff,
+    // FORMAT(num, mask): Immediate = the value being formatted (float reg)
+    bcStrFormat:
       Result := True;
   else
     Result := False;

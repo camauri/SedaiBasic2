@@ -8,7 +8,7 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 453 / 643 implemented (70%)** (+ 4 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 453 / 643 implemented (70%)** (+ 5 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
 **572 applicable** keywords, **453 (79%)** are implemented. See the
@@ -1254,8 +1254,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **453 / 643 implemented (70%)**, plus 4 partial (◐).
-> Of the 186 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> **Coverage (FreeBASIC keyword set):** **453 / 643 implemented (70%)**, plus 5 partial (◐).
+> Of the 185 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
 > linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **453 / 572 ≈ 79% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
@@ -2330,7 +2330,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `WOCT` | ✓ | `WOCT(n)` — octal wide string of an integer. |
 | `STR` | ✓ | `STR(n)` (bare FB form) routed to `STR$`. |
 | `WSTR` | ✓ | Returns the WString representation of a numeric value (or widens a string). |
-| `FORMAT` | ✗ | Returns a formatted String representation of a Double. |
+| `FORMAT` | ◐ | `FORMAT(num [, mask])` / `FORMAT$` → formatted string. Numeric masks supported: `0`/`#` digit placeholders, `.`, `,` grouping, `%`, scientific `E+`/`E-`/`e+`/`e-`, literals (`\x`, `"..."`). Date/time masks (d/m/y/h/s) not yet handled. |
 
 #### String to Numeric Conversions
 

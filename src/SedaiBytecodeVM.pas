@@ -277,6 +277,7 @@ type
     // FreeBASIC raw byte heap (Allocate family). All return/take RAWPTR_TAG-tagged byte offsets.
     function RawAlloc(ByteCount: PtrUInt): Int64;
     function StrSAdd(const S: string): Int64;   // SADD(s) -> raw pointer to a NUL-terminated byte copy
+    function FormatNumber(Value: Double; const Mask: string): string;  // FORMAT(num, mask) -> formatted string (numeric masks)
     function FileLength(const Path: string): Int64;   // FILELEN(path) -> file size in bytes (0 if absent)
     procedure RawFree(RawPtr: Int64);
     function RawRealloc(RawPtr: Int64; ByteCount: PtrUInt): Int64;
@@ -1537,6 +1538,163 @@ begin
   FRawHeap[ofs + PtrUInt(Length(S))] := 0;   // NUL terminator (ZSTRING)
 end;
 
+// FreeBASIC FORMAT(number, mask): format a Double per a VB/FB-style picture string. v1 covers NUMERIC
+// masks — digit placeholders '0' (required) and '#' (optional), '.' decimal point, ',' thousands
+// grouping, '%' percent (x100), scientific 'E+'/'E-'/'e+'/'e-', and literal characters (also '\x' and
+// "..."). Date/time masks (d/m/y/h/s) are not yet handled. An empty mask yields a general format.
+function TBytecodeVM.FormatNumber(Value: Double; const Mask: string): string;
+var
+  M: string;
+  pctCount, i, ePos: Integer;
+
+  function ProcLiteral(const S: string): string;
+  var k: Integer; ch: Char;
+  begin
+    Result := '';
+    k := 1;
+    while k <= Length(S) do
+    begin
+      ch := S[k];
+      if (ch = '\') and (k < Length(S)) then begin Result := Result + S[k+1]; Inc(k, 2); end
+      else if ch = '"' then
+      begin
+        Inc(k);
+        while (k <= Length(S)) and (S[k] <> '"') do begin Result := Result + S[k]; Inc(k); end;
+        Inc(k);   // skip closing quote
+      end
+      else begin Result := Result + ch; Inc(k); end;
+    end;
+  end;
+
+  function Grouped(const Digits: string): string;
+  var k, c: Integer;
+  begin
+    Result := '';
+    c := 0;
+    for k := Length(Digits) downto 1 do
+    begin
+      Result := Digits[k] + Result;
+      Inc(c);
+      if (c mod 3 = 0) and (k > 1) then Result := ',' + Result;
+    end;
+  end;
+
+  function FixedPoint(V: Double; const FM: string): string;
+  var
+    neg, grouping: Boolean;
+    dotPos, fracPH, reqZeros, firstCore, lastCore, j: Integer;
+    absV: Double;
+    Z, intDigits, fracDigits, intMask, fracMask, intOut, fracOut, prefix, suffix: string;
+    scaled: Int64;
+  begin
+    neg := V < 0;
+    absV := Abs(V);
+    dotPos := Pos('.', FM);
+    firstCore := 0; lastCore := 0;
+    for j := 1 to Length(FM) do
+      if (FM[j] = '0') or (FM[j] = '#') then
+      begin
+        if firstCore = 0 then firstCore := j;
+        lastCore := j;
+      end;
+    if firstCore = 0 then Exit(ProcLiteral(FM));   // no placeholders: pure literal
+    prefix := ProcLiteral(Copy(FM, 1, firstCore - 1));
+    suffix := ProcLiteral(Copy(FM, lastCore + 1, MaxInt));
+    if (dotPos > firstCore) and (dotPos < lastCore) then
+    begin
+      intMask := Copy(FM, firstCore, dotPos - firstCore);
+      fracMask := Copy(FM, dotPos + 1, lastCore - dotPos);
+    end
+    else
+    begin
+      intMask := Copy(FM, firstCore, lastCore - firstCore + 1);
+      fracMask := '';
+    end;
+    fracPH := 0;
+    for j := 1 to Length(fracMask) do
+      if (fracMask[j] = '0') or (fracMask[j] = '#') then Inc(fracPH);
+    grouping := Pos(',', intMask) > 0;
+    reqZeros := 0;
+    for j := 1 to Length(intMask) do if intMask[j] = '0' then Inc(reqZeros);
+    scaled := Round(absV * Power(10, fracPH));
+    Z := IntToStr(scaled);
+    while Length(Z) < fracPH + 1 do Z := '0' + Z;
+    fracDigits := Copy(Z, Length(Z) - fracPH + 1, fracPH);
+    intDigits := Copy(Z, 1, Length(Z) - fracPH);
+    if intDigits = '' then intDigits := '0';
+    while Length(intDigits) < reqZeros do intDigits := '0' + intDigits;
+    if reqZeros = 0 then
+      while (Length(intDigits) > 1) and (intDigits[1] = '0') do Delete(intDigits, 1, 1);
+    if grouping and (Length(intDigits) > 0) then intOut := Grouped(intDigits)
+    else intOut := intDigits;
+    fracOut := '';
+    for j := 1 to Length(fracMask) do
+      if (fracMask[j] = '0') or (fracMask[j] = '#') then
+      begin
+        if j <= Length(fracDigits) then fracOut := fracOut + fracDigits[j]
+        else fracOut := fracOut + '0';
+      end
+      else
+        fracOut := fracOut + fracMask[j];
+    // trailing '#' placeholders drop trailing zeros
+    j := Length(fracMask);
+    while (j >= 1) and (Length(fracOut) >= 1) and (fracMask[j] = '#') and (fracOut[Length(fracOut)] = '0') do
+    begin
+      Delete(fracOut, Length(fracOut), 1);
+      Dec(j);
+    end;
+    Result := intOut;
+    if fracOut <> '' then Result := Result + '.' + fracOut;
+    if neg and (scaled <> 0) then Result := '-' + Result;
+    Result := prefix + Result + suffix;
+  end;
+
+  function Scientific(V: Double; const FM: string; EIdx: Integer): string;
+  var
+    mantMask, expDigitsMask: string;
+    plusSign: Boolean;
+    expo, j, expDigits: Integer;
+    absV, mant: Double;
+    mantStr, expStr: string;
+  begin
+    plusSign := FM[EIdx + 1] = '+';
+    mantMask := Copy(FM, 1, EIdx - 1);
+    expDigitsMask := Copy(FM, EIdx + 2, MaxInt);
+    expDigits := 0;
+    for j := 1 to Length(expDigitsMask) do
+      if (expDigitsMask[j] = '0') or (expDigitsMask[j] = '#') then Inc(expDigits);
+    absV := Abs(V);
+    if absV = 0 then begin expo := 0; mant := 0; end
+    else begin expo := Floor(Log10(absV)); mant := absV / Power(10, expo); end;
+    mantStr := FixedPoint(mant, mantMask);
+    expStr := IntToStr(Abs(expo));
+    while Length(expStr) < expDigits do expStr := '0' + expStr;
+    if expo < 0 then expStr := '-' + expStr
+    else if plusSign then expStr := '+' + expStr;
+    Result := mantStr + Copy(FM, EIdx, 1) + expStr;
+    if (V < 0) and (absV <> 0) then Result := '-' + Result;
+  end;
+
+begin
+  if Mask = '' then
+  begin
+    Result := FloatToStrF(Value, ffGeneral, 15, 0);
+    if Copy(Result, 1, 2) = '0.' then Delete(Result, 1, 1)
+    else if Copy(Result, 1, 3) = '-0.' then Delete(Result, 2, 1);
+    Exit;
+  end;
+  M := Mask;
+  pctCount := 0;
+  for i := 1 to Length(M) do if M[i] = '%' then Inc(pctCount);
+  for i := 1 to pctCount do Value := Value * 100;
+  ePos := 0;
+  for i := 1 to Length(M) - 1 do
+    if ((M[i] = 'E') or (M[i] = 'e')) and ((M[i+1] = '+') or (M[i+1] = '-')) then
+    begin ePos := i; Break; end;
+  if ePos > 0 then Result := Scientific(Value, M, ePos)
+  else Result := FixedPoint(Value, M);
+end;
+
 function TBytecodeVM.FileLength(const Path: string): Int64;
 // FreeBASIC FILELEN(path): size of a file in bytes, or 0 if it does not exist / can't be opened.
 var
@@ -2450,6 +2608,14 @@ begin
         // DATE/TIME, CURDIR$, EXEPATH: string Dest, no sources.
         bcDateStr, bcCurDir, bcExePath:
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+
+        // FORMAT(num, mask): string Dest, string Src1 (mask), float Immediate reg (value).
+        bcStrFormat:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+          if Instr.Immediate > MaxFloatReg then MaxFloatReg := Instr.Immediate;
+        end;
 
         // ENVIRON$(name): string Dest, string Src1.
         bcEnviron:
@@ -4417,6 +4583,8 @@ begin
       Ctx.IntRegs[Instr.Dest] := FileLength(Ctx.StringRegs[Instr.Src1]);
     44: // bcExePath - EXEPATH: directory of the running program (cross-platform).
       Ctx.StringRegs[Instr.Dest] := ExtractFileDir(ParamStr(0));
+    45: // bcStrFormat - FORMAT(num, mask): formatted number string. Value is in the Immediate float reg.
+      Ctx.StringRegs[Instr.Dest] := FormatNumber(Ctx.FloatRegs[Instr.Immediate], Ctx.StringRegs[Instr.Src1]);
     36: // bcStrMkInt - MKI/MKL/MKSHORT/MKLONGINT: binary copy of an integer into a string.
       begin
         // Immediate = byte width (2/4/8). Write the low `width` bytes, little-endian (two's complement).
