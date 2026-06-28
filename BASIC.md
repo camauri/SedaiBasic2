@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **441 / 643 implemented (69%)**, plus 4 partial (◐).
-> Of the 198 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **441 / 572 ≈ 77% of the
+> **Coverage (FreeBASIC keyword set):** **442 / 643 implemented (69%)**, plus 4 partial (◐).
+> Of the 197 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **442 / 572 ≈ 77% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -1305,7 +1305,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `Temporary Types` | ✗ | Creates a temporary copy of a user defined type |
 | `THIS` | ✓ | Implicit first parameter of methods/constructors/destructors (M4.1): the instance handle. `THIS.field` reads/writes fields; used to resolve the method's owner type |
 | `BASE (member access)` | ✗ | Built-in, hidden, variable to access the base user defined type instance in derived user defined types |
-| `Type Alias` | ✗ | Declares a user defined type from other user defined or standard data types |
+| `Type Alias` | ✓ | `TYPE newname AS underlyingtype` — synonym for a builtin or UDT; resolved via CanonicalType (chained aliases, narrowing, and alias-to-UDT supported). |
 | `WITH` | ✓ | `WITH rec` ... `END WITH`: leading `.field` resolves against the record (M3.2) |
 
 ##### Member Procedures

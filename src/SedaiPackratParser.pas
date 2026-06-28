@@ -2396,7 +2396,7 @@ var
   Token, NameTok, FieldTok: TLexerToken;
   FieldNode, TypeNode: TASTNode;
   PrevIdx: Integer;
-  FieldTypeName, TokU: string;
+  FieldTypeName, TokU, AliasType: string;
 begin
   // TYPE/UNION name <newline> field AS type <newline> ... END TYPE/END UNION
   // Each field node is antIdentifier(fieldName) with one child antIdentifier(typeName).
@@ -2418,6 +2418,35 @@ begin
   Result := TASTNode.CreateWithValue(antTypeDecl, UpperCase(NameTok.Value), NameTok);
   if IsUnion then Result.Attributes.Values['UNION'] := '1';
   Context.Advance;                                  // consume type name
+
+  // FreeBASIC type alias: "TYPE newname AS underlyingtype" — a one-line synonym with no field block
+  // and no END TYPE. Distinguished from a record by an AS immediately after the type name. Recorded
+  // as an ALIAS attribute on the antTypeDecl; SSA resolves it via CanonicalType (UNION cannot alias).
+  if (not IsUnion) and Context.Check(ttAsType) then
+  begin
+    Context.Advance;                                // consume AS
+    AliasType := '';
+    if Context.Check(ttIdentifier) or
+       ((Length(Context.CurrentToken.Value) > 0) and
+        (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
+    begin
+      AliasType := ParseDottedName;
+      while Context.Check(ttIdentifier) and (UpCase(Context.CurrentToken.Value) = 'PTR') do
+      begin
+        AliasType := AliasType + ' PTR';
+        Context.Advance;                            // consume PTR
+      end;
+      // "AS STRING * n" fixed-length form: consume and ignore the length (advisory, like fields).
+      if Context.Check(ttOpMul) then
+      begin
+        Context.Advance;                            // '*'
+        FExpressionParser.ParseExpression(precCall).Free;
+      end;
+    end;
+    Result.Attributes.Values['ALIAS'] := UpperCase(AliasType);
+    DoNodeCreated(Result);
+    Exit;
+  end;
 
   // Optional single inheritance: TYPE Child EXTENDS Parent (M4.2). Stored as an attribute.
   if Context.Check(ttExtends) then

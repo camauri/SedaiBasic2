@@ -178,6 +178,7 @@ type
     FCurrentThisType: string;   // M4.1: owner UDT type while lowering a method body (THIS's type)
     // UDT/record support (M3)
     FUDTs: array of TUDTType;            // declared record types
+    FTypeAliases: TStringList;           // FB "TYPE alias AS underlying": alias (UPPER) -> underlying (UPPER)
     FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
@@ -309,6 +310,7 @@ type
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
     procedure EmitUserFunctionCall(const Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
+    function CanonicalType(const TypeName: string): string;   // resolve FB TYPE-alias chain to its base
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
                               out Bank: TSSARegisterType; out Slot: Integer;
                               out NestedType: string): Boolean;
@@ -542,6 +544,7 @@ begin
   FCurrentProcByrefScalars := TStringList.Create;
   FCurrentProcAddrParams := TStringList.Create;
   FModuleRecordVars := TStringList.Create;
+  FTypeAliases := TStringList.Create;
   FModuleDtorSlots := TStringList.Create;
   FModuleDtorSlots.CaseSensitive := False;
   FSharedVars := TStringList.Create;
@@ -592,6 +595,7 @@ begin
   FCurrentProcByrefScalars.Free;
   FCurrentProcAddrParams.Free;
   FModuleRecordVars.Free;
+  FTypeAliases.Free;
   FModuleDtorSlots.Free;
   FSharedVars.Free;
   FSharedScalarArr.Free;
@@ -11024,7 +11028,7 @@ function TSSAGenerator.TypeNameWidthCode(const TypeName: string): Integer;
 var
   T: string;
 begin
-  T := UpperCase(TypeName);
+  T := CanonicalType(TypeName);   // resolve FB TYPE-alias before the builtin width match
   if T = 'BYTE' then Result := 1
   else if T = 'UBYTE' then Result := 2
   else if T = 'SHORT' then Result := 3
@@ -11129,6 +11133,7 @@ begin
   // FreeBASIC pointer "<type> PTR": stored as an int handle (the address).
   if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
     Exit(srtInt);
+  T := CanonicalType(T);   // resolve FB TYPE-alias (e.g. "int32" -> "LONG") before the builtin match
   if (T = 'INTEGER') or (T = 'LONG') or (T = 'SHORT') or (T = 'BYTE') or
      (T = 'UBYTE') or (T = 'USHORT') or (T = 'UINTEGER') or (T = 'ULONG') or
      (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'BOOLEAN') then
@@ -11141,12 +11146,35 @@ begin
     Result := GetVariableType(FieldName);  // unknown (e.g. nested UDT, deferred): fall back to suffix
 end;
 
+function TSSAGenerator.CanonicalType(const TypeName: string): string;
+// Resolve a FreeBASIC "TYPE alias AS underlying" chain to its base type name. A non-alias name is
+// returned unchanged (UPPER). Guarded against accidental alias cycles. PTR-suffixed names are not
+// aliased here (handle types are resolved at their own call sites).
+var
+  T, Next: string;
+  Guard, Idx: Integer;
+begin
+  T := UpperCase(TypeName);
+  if FTypeAliases.Count = 0 then Exit(T);
+  Guard := 0;
+  while Guard < 32 do
+  begin
+    Idx := FTypeAliases.IndexOfName(T);
+    if Idx < 0 then Break;
+    Next := UpperCase(FTypeAliases.ValueFromIndex[Idx]);
+    if (Next = '') or (Next = T) then Break;
+    T := Next;
+    Inc(Guard);
+  end;
+  Result := T;
+end;
+
 function TSSAGenerator.FindUDT(const TypeName: string): Integer;
 var
   i: Integer;
   U: string;
 begin
-  U := UpperCase(TypeName);
+  U := CanonicalType(TypeName);
   for i := 0 to High(FUDTs) do
     if FUDTs[i].Name = U then Exit(i);
   Result := -1;
@@ -11228,6 +11256,14 @@ begin
   if Node.NodeType = antTypeDecl then
   begin
     Name := UpperCase(VarToStr(Node.Value));
+    // FreeBASIC "TYPE alias AS underlying": a one-line type synonym, not a record. Register it in
+    // the alias map (resolved via CanonicalType at the type resolvers) and do not create a UDT.
+    if Node.Attributes.Values['ALIAS'] <> '' then
+    begin
+      if FTypeAliases.IndexOfName(Name) < 0 then
+        FTypeAliases.Values[Name] := UpperCase(Node.Attributes.Values['ALIAS']);
+      Exit;
+    end;
     if FindUDT(Name) < 0 then
     begin
       n := Length(FUDTs);
@@ -12716,6 +12752,7 @@ var
 begin
   T := UpperCase(Trim(TypeName));
   if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(8);
+  T := CanonicalType(T);   // resolve FB TYPE-alias before the builtin/UDT size match
   if (T = 'BYTE') or (T = 'UBYTE') or (T = 'BOOLEAN') then Result := 1
   else if (T = 'SHORT') or (T = 'USHORT') then Result := 2
   else if (T = 'LONG') or (T = 'ULONG') then Result := 4
