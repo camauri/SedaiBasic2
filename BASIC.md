@@ -1254,7 +1254,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **313 / 643 implemented (49%)**, plus 3 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **436 / 643 implemented (68%)**, plus 4 partial (◐).
+> Of the 207 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **436 / 572 ≈ 76% of the
+> applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
 > compound & bitwise operators, string/conversion/array functions, namespaces, pointers (managed + raw
@@ -1524,8 +1527,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `# (Argument stringize)` | ✓ | `#param` in a function-like macro body stringizes the argument into a string literal. |
 | `## (Argument concatenation)` | ✓ | `a ## b` in a macro body pastes the surrounding tokens together. |
-| `! (Escaped String Literal)` | ✗ |  |
-| `$ (Non-Escaped String Literal)` | ✗ |  |
+| `! (Escaped String Literal)` | ✓ | `!"\n\t\\\"..."` processes escape sequences (lexer). |
+| `$ (Non-Escaped String Literal)` | ✓ | `$"..."` takes the body verbatim (our default for `"..."`). |
 
 #### Pointer Operators
 
@@ -1711,8 +1714,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `#UNDEF` | ✓ | Undefines a symbol. |
 | `# Preprocessor stringize` | ✓ | `#param` stringizes a macro argument into a string literal. |
 | `## Preprocessor concatenate` | ✓ | `a ## b` pastes tokens together in a macro body. |
-| `! Escaped String Literal` | ✗ | Indicates string literal immediately following must be processed for escape sequences. |
-| `$ Non-Escaped String Literal` | ✗ | Indicates string literal immediately following must not be processed for escape sequences. |
+| `! Escaped String Literal` | ✓ | Indicates string literal immediately following must be processed for escape sequences. |
+| `$ Non-Escaped String Literal` | ✓ | Indicates string literal immediately following must not be processed for escape sequences. |
 
 ##### File Directives
 

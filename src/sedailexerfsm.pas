@@ -149,6 +149,8 @@ type
     function ProcessIdentifier: TLexerToken;
     function ProcessNumber: TLexerToken;
     function LexAmpBaseLiteral: TLexerToken;   // FreeBASIC &H/&O/&B hex/oct/bin integer literal
+    function LexPrefixedString(DoEscape: Boolean): TLexerToken; // FreeBASIC !"..." / $"..." string literal
+    function ProcessEscapes(const Raw: string): string;         // expand FreeBASIC escape sequences
     function ProcessString: TLexerToken;
     function ProcessComment: TLexerToken;
     function ProcessLineComment: TLexerToken;
@@ -1397,6 +1399,195 @@ begin
   Result.SetExtractedValue(IntToStr(Val));   // logical value is decimal, not the "&H.." source text
 end;
 
+function TLexerFSM.ProcessEscapes(const Raw: string): string;
+// Expand the FreeBASIC escape sequences accepted inside an escaped string literal (!"...").
+// Recognised: \a \b \f \n \l \r \t \v \\ \" \' ; \DDD decimal (1-3 digits); \&hNN hex; \&oNNN octal;
+// \&bNNNNNNNN binary; \uNNNN unicode codepoint (1-4 hex digits, UTF-8 encoded). A produced NUL
+// (\0 / \&h00 / ...) is the string terminator: only the bytes before it are kept (FB semantics).
+var
+  i, n: Integer;
+  c: Char;
+  Val, Cnt, d, Base: Integer;
+
+  function HexDigit(ch: Char): Integer;
+  begin
+    case ch of
+      '0'..'9': Result := Ord(ch) - Ord('0');
+      'A'..'F': Result := Ord(ch) - Ord('A') + 10;
+      'a'..'f': Result := Ord(ch) - Ord('a') + 10;
+    else        Result := -1;
+    end;
+  end;
+
+  procedure AppendCP(CP: Integer);
+  // UTF-8 encode a codepoint into Result (our string storage is UTF-8, like WSTRING).
+  begin
+    if CP < $80 then
+      Result := Result + Chr(CP)
+    else if CP < $800 then
+    begin
+      Result := Result + Chr($C0 or (CP shr 6));
+      Result := Result + Chr($80 or (CP and $3F));
+    end
+    else if CP < $10000 then
+    begin
+      Result := Result + Chr($E0 or (CP shr 12));
+      Result := Result + Chr($80 or ((CP shr 6) and $3F));
+      Result := Result + Chr($80 or (CP and $3F));
+    end
+    else
+    begin
+      Result := Result + Chr($F0 or (CP shr 18));
+      Result := Result + Chr($80 or ((CP shr 12) and $3F));
+      Result := Result + Chr($80 or ((CP shr 6) and $3F));
+      Result := Result + Chr($80 or (CP and $3F));
+    end;
+  end;
+
+  // Emit a numeric escape result. Returns False when the value is NUL (truncate the string).
+  function EmitByte(Val: Integer): Boolean;
+  begin
+    if Val = 0 then
+      Result := False
+    else
+    begin
+      AppendCP(Val);
+      Result := True;
+    end;
+  end;
+
+begin
+  Result := '';
+  i := 1;
+  n := Length(Raw);
+  while i <= n do
+  begin
+    c := Raw[i];
+    if (c <> '\') or (i = n) then
+    begin
+      Result := Result + c;
+      Inc(i);
+      Continue;
+    end;
+    // c = '\', and there is at least one more char
+    Inc(i);
+    c := Raw[i];
+    case c of
+      'a': begin Result := Result + Chr(7);  Inc(i); end;
+      'b': begin Result := Result + Chr(8);  Inc(i); end;
+      'f': begin Result := Result + Chr(12); Inc(i); end;
+      'n', 'l': begin Result := Result + Chr(10); Inc(i); end;
+      'r': begin Result := Result + Chr(13); Inc(i); end;
+      't': begin Result := Result + Chr(9);  Inc(i); end;
+      'v': begin Result := Result + Chr(11); Inc(i); end;
+      '\': begin Result := Result + '\';  Inc(i); end;
+      '"': begin Result := Result + '"';  Inc(i); end;
+      '''': begin Result := Result + ''''; Inc(i); end;
+      '0'..'9':
+        begin
+          // decimal, up to 3 digits
+          Val := 0; Cnt := 0;
+          while (i <= n) and (Cnt < 3) and (Raw[i] >= '0') and (Raw[i] <= '9') do
+          begin
+            Val := Val * 10 + (Ord(Raw[i]) - Ord('0'));
+            Inc(i); Inc(Cnt);
+          end;
+          if not EmitByte(Val and $FF) then Exit;
+        end;
+      'u', 'U':
+        begin
+          // unicode codepoint, up to 4 hex digits
+          Inc(i);
+          Val := 0; Cnt := 0;
+          while (i <= n) and (Cnt < 4) and (HexDigit(Raw[i]) >= 0) do
+          begin
+            Val := Val * 16 + HexDigit(Raw[i]);
+            Inc(i); Inc(Cnt);
+          end;
+          if not EmitByte(Val) then Exit;
+        end;
+      '&':
+        begin
+          // \&hNN hex, \&oNNN octal, \&bNNNNNNNN binary
+          Inc(i);
+          if i > n then begin Result := Result + '&'; Continue; end;
+          case Raw[i] of
+            'h', 'H': Base := 16;
+            'o', 'O': Base := 8;
+            'b', 'B': Base := 2;
+          else        Base := 0;
+          end;
+          if Base = 0 then
+          begin
+            Result := Result + '&';   // not a valid base prefix: keep literally
+            Continue;
+          end;
+          Inc(i);
+          Val := 0;
+          while i <= n do
+          begin
+            if Base = 16 then
+            begin
+              d := HexDigit(Raw[i]);
+              if d < 0 then Break;
+            end
+            else
+            begin
+              d := Ord(Raw[i]) - Ord('0');
+              if (d < 0) or (d >= Base) then Break;
+            end;
+            Val := Val * Base + d;
+            Inc(i);
+          end;
+          if not EmitByte(Val and $FF) then Exit;
+        end;
+    else
+      // Unknown escape: keep the character literally (lenient; FB would raise a compile error).
+      Result := Result + c;
+      Inc(i);
+    end;
+  end;
+end;
+
+function TLexerFSM.LexPrefixedString(DoEscape: Boolean): TLexerToken;
+// On entry the current char is the prefix ('!' or '$') and PeekChar(1) is the opening '"'.
+// Consumes the prefix, the quotes, and the body. For the escaped form (!), a '\' protects the
+// following char so an escaped quote (\") does not terminate the literal; escape expansion is then
+// applied. For the non-escaped form ($), '\' has no special meaning and a '"' always terminates.
+var
+  Ch: Char;
+  Raw: string;
+begin
+  ResetToken;
+  TokenBufferAdd(GetCurrentChar);   // the prefix, for source position/length bookkeeping
+  AdvanceChar;                      // consume prefix
+  AdvanceChar;                      // consume opening quote
+  Raw := '';
+  Ch := GetCurrentChar;
+  while (Ch <> #0) and (Ch <> '"') do
+  begin
+    if DoEscape and (Ch = '\') then
+    begin
+      Raw := Raw + Ch;              // keep the backslash for ProcessEscapes
+      AdvanceChar;
+      Ch := GetCurrentChar;
+      if Ch = #0 then Break;
+      Raw := Raw + Ch;              // keep the escaped char verbatim (even if it is '"')
+      AdvanceChar;
+    end
+    else
+    begin
+      Raw := Raw + Ch;
+      AdvanceChar;
+    end;
+    Ch := GetCurrentChar;
+  end;
+  if Ch = '"' then AdvanceChar;     // consume closing quote
+  if DoEscape then Raw := ProcessEscapes(Raw);
+  Result := CreateToken(ttStringLiteral);
+  Result.SetExtractedValue(Raw);
+end;
+
 function TLexerFSM.ProcessString: TLexerToken;
 var
   S: string;
@@ -2129,6 +2320,25 @@ begin
           TokenBufferAdd(CurrentChar);
           AdvanceChar;
           Result := CreateToken(ttFileHandlePrefix);
+          {$IFDEF DEBUG}
+          if FDebugMode then
+            FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
+          {$ENDIF}
+          Exit;
+        end;
+
+      // === FreeBASIC ESCAPED / NON-ESCAPED STRING LITERAL PREFIXES ===
+      // !"..."  -> string literal WITH escape-sequence processing (\n \t \\ \" \&hNN \uNNNN ...).
+      // $"..."  -> string literal explicitly WITHOUT escape processing; since plain "..." is already
+      //            non-escaped (our default), the '$' is simply consumed and the body taken verbatim.
+      // A '!' or '$' NOT immediately followed by '"' is not a string prefix: fall through to the FSM
+      // (preserves '!' for FSM error handling and '$' as a lone unexpected char, unchanged behaviour).
+      '!', '$':
+        begin
+          if PeekChar(1) = '"' then
+            Result := LexPrefixedString(CurrentChar = '!')
+          else
+            Result := NextTokenFSM;
           {$IFDEF DEBUG}
           if FDebugMode then
             FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
