@@ -2285,7 +2285,40 @@ end;
 function TPackratParser.ParseDottedName: string;
 // Read "ident(.ident)*" — used for namespace-qualified type names ("Forms.Point"). The cursor
 // must be on the first identifier. Segments after a '.' may be reserved words (member names).
+var
+  BaseU: string;
 begin
+  // FreeBASIC "UNSIGNED <basetype>" modifier: map to the unsigned variant type name. A bare
+  // "UNSIGNED" (no integer base type following) means UNSIGNED INTEGER. UNSIGNED is not a reserved
+  // keyword (it tokenizes as an identifier), so handle it here at the central type-name reader.
+  if UpperCase(VarToStr(Context.CurrentToken.Value)) = 'UNSIGNED' then
+  begin
+    Context.Advance;                                 // consume UNSIGNED
+    BaseU := UpperCase(VarToStr(Context.CurrentToken.Value));
+    if (BaseU = 'INTEGER') or (BaseU = 'BYTE') or (BaseU = 'SHORT') or
+       (BaseU = 'LONG') or (BaseU = 'LONGINT') then
+    begin
+      Context.Advance;                               // consume the base type
+      case BaseU of
+        'BYTE':    Result := 'UBYTE';
+        'SHORT':   Result := 'USHORT';
+        'LONG':    Result := 'ULONG';
+        'LONGINT': Result := 'ULONGINT';
+      else
+        Result := 'UINTEGER';
+      end;
+    end
+    else if (BaseU = 'UINTEGER') or (BaseU = 'UBYTE') or (BaseU = 'USHORT') or
+            (BaseU = 'ULONG') or (BaseU = 'ULONGINT') then
+    begin
+      Context.Advance;                               // already unsigned: keep it
+      Result := BaseU;
+    end
+    else
+      Result := 'UINTEGER';                          // bare UNSIGNED = UNSIGNED INTEGER
+    Exit;
+  end;
+
   Result := UpperCase(VarToStr(Context.CurrentToken.Value));
   Context.Advance;                                   // first segment
   while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and

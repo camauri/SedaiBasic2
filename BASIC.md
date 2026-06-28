@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 446 / 643 implemented (69%)** (+ 4 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 447 / 643 implemented (70%)** (+ 4 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **446 (78%)** are implemented. See the
+**572 applicable** keywords, **447 (78%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **446 / 643 implemented (69%)**, plus 4 partial (◐).
-> Of the 193 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **446 / 572 ≈ 78% of the
+> **Coverage (FreeBASIC keyword set):** **447 / 643 implemented (70%)**, plus 4 partial (◐).
+> Of the 192 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **447 / 572 ≈ 78% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -1371,7 +1371,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `CONST` | ✓ | Specifies a read only type. |
 | `POINTER and PTR (Shortcut for 'POINTER')` | ✓ | Modifies types to be pointer types. |
-| `UNSIGNED` | ✗ | Specifies an unsigned integer type. |
+| `UNSIGNED` | ✓ | `AS UNSIGNED <basetype>` modifier → maps to the unsigned variant (INTEGER→UINTEGER, BYTE→UBYTE, SHORT→USHORT, LONG→ULONG, LONGINT→ULONGINT). Bare `UNSIGNED` == UNSIGNED INTEGER. |
 | `ALIAS (Modifier)` | ✗ | Modifies how a datatype is linked with other languages (Name mangling). |
 
 ##### String types
