@@ -484,6 +484,8 @@ var
   // Conditional stack: Active[k] = currently emitting at nesting level k (already factors parents);
   // Taken[k] = a branch has been taken at this level (for #else).
   Active, Taken: array of Boolean;
+  NowDT: TDateTime;      // captured once for __DATE__/__DATE_ISO__/__TIME__
+  PathStr: string;       // module directory for __PATH__
 
   function Emitting: Boolean;
   begin
@@ -725,6 +727,17 @@ begin
     RegisterIntrinsicDefines(Defs);   // FreeBASIC compiler intrinsic defines (__FB_*__)
     // __FILE__ expands to the top-level source file name (string literal); empty if unknown.
     Defs.Values['__FILE__'] := '"' + FileName + '"';
+    // Compilation date/time intrinsics (string literals). SedaiBasic compiles-then-runs in one
+    // process, so "compilation time" is captured here, once, when preprocessing starts.
+    NowDT := Now;
+    Defs.Values['__DATE__']     := '"' + FormatDateTime('mm"-"dd"-"yyyy', NowDT) + '"';  // mm-dd-yyyy
+    Defs.Values['__DATE_ISO__'] := '"' + FormatDateTime('yyyy"-"mm"-"dd', NowDT) + '"';  // yyyy-mm-dd
+    Defs.Values['__TIME__']     := '"' + FormatDateTime('hh":"nn":"ss', NowDT) + '"';    // hh:mm:ss
+    // __PATH__ expands to the absolute path of the module directory (no trailing separator).
+    PathStr := BaseDir;
+    if PathStr = '' then PathStr := GetCurrentDir;
+    PathStr := ExcludeTrailingPathDelimiter(ExpandFileName(PathStr));
+    Defs.Values['__PATH__'] := '"' + PathStr + '"';
     SetLength(Active, 0);
     SetLength(Taken, 0);
     Expand(Src, BaseDir);

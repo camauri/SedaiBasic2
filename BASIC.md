@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **437 / 643 implemented (68%)**, plus 4 partial (◐).
-> Of the 202 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **437 / 572 ≈ 76% of the
+> **Coverage (FreeBASIC keyword set):** **441 / 643 implemented (69%)**, plus 4 partial (◐).
+> Of the 198 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **441 / 572 ≈ 77% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -1830,10 +1830,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `__FB_ARGC__` | ✗ | Defined as an integer literal of the number of command-line arguments passed to the program. |
 | `__FB_ARGV__` | ✗ | Defined as a Zstring Ptr Ptr to the command line arguments passed to the program. |
-| `__DATE__` | ✗ | Defined as a string literal of the compilation date in "mm-dd-yyyy" format. |
-| `__DATE_ISO__` | ✗ | Defined as a string literal of the compilation date in "yyyy-mm-dd" format. |
-| `__TIME__` | ✗ | Defined as a string literal of the compilation time. |
-| `__PATH__` | ✗ | Defined as a string literal of the absolute path of the module. |
+| `__DATE__` | ✓ | String literal of the compilation date in "mm-dd-yyyy" format (captured at compile time). |
+| `__DATE_ISO__` | ✓ | String literal of the compilation date in "yyyy-mm-dd" format. |
+| `__TIME__` | ✓ | String literal of the compilation time in "hh:mm:ss" format. |
+| `__PATH__` | ✓ | String literal of the absolute path of the module directory. |
 
 ##### Context-specific Information
 
