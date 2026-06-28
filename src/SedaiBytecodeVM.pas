@@ -2447,8 +2447,8 @@ begin
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
         end;
 
-        // DATE/TIME, CURDIR$: string Dest, no sources.
-        bcDateStr, bcCurDir:
+        // DATE/TIME, CURDIR$, EXEPATH: string Dest, no sources.
+        bcDateStr, bcCurDir, bcExePath:
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
 
         // ENVIRON$(name): string Dest, string Src1.
@@ -4415,6 +4415,8 @@ begin
       Ctx.StringRegs[Instr.Dest] := GetEnvironmentVariable(Ctx.StringRegs[Instr.Src1]);
     43: // bcFileLen - FILELEN(path): size of the file in bytes (0 if absent).
       Ctx.IntRegs[Instr.Dest] := FileLength(Ctx.StringRegs[Instr.Src1]);
+    44: // bcExePath - EXEPATH: directory of the running program (cross-platform).
+      Ctx.StringRegs[Instr.Dest] := ExtractFileDir(ParamStr(0));
     36: // bcStrMkInt - MKI/MKL/MKSHORT/MKLONGINT: binary copy of an integer into a string.
       begin
         // Immediate = byte width (2/4/8). Write the low `width` bytes, little-endian (two's complement).

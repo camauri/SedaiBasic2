@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 447 / 643 implemented (70%)** (+ 4 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 453 / 643 implemented (70%)** (+ 4 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **447 (78%)** are implemented. See the
+**572 applicable** keywords, **453 (79%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **447 / 643 implemented (70%)**, plus 4 partial (◐).
-> Of the 192 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **447 / 572 ≈ 78% of the
+> **Coverage (FreeBASIC keyword set):** **453 / 643 implemented (70%)**, plus 4 partial (◐).
+> Of the 186 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **453 / 572 ≈ 79% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -1743,9 +1743,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `'$INCLUDE` | ✓ | QuickBASIC metacommand `'$INCLUDE: 'file'` — splices a file, like `#include`. |
-| `'$DYNAMIC` | ✗ | Alternate form of the OPTION DYNAMIC statement. |
-| `'$STATIC` | ✗ | Alternate form of the OPTION STATIC statement. |
-| `'$LANG` | ✗ | Alternate form of the #lang directive. |
+| `'$DYNAMIC` | ✓ | Advisory metacommand, accepted and ignored (REDIM works regardless of array storage class). |
+| `'$STATIC` | ✓ | Advisory metacommand, accepted and ignored. |
+| `'$LANG` | ✓ | Advisory metacommand, accepted and ignored (dialect is auto-detected). |
 
 #### Meta-statements
 
@@ -1999,9 +1999,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `OPTION DYNAMIC` | ✓ | Forces arrays to be defined as variable-length arrays. |
-| `'$DYNAMIC` | ✗ | Alternate form of the OPTION DYNAMIC statement. |
+| `'$DYNAMIC` | ✓ | Advisory metacommand, accepted and ignored (REDIM works regardless of array storage class). |
 | `OPTION STATIC` | ✓ | Reverts a previous OPTION DYNAMIC command. |
-| `'$STATIC` | ✗ | Alternate form of the OPTION STATIC statement. |
+| `'$STATIC` | ✓ | Advisory metacommand, accepted and ignored. |
 | `DIM` | ✓ | Defines any type of array. |
 | `REDIM` | ✓ | Resizes an array: `REDIM [PRESERVE] arr(ub [, ub ...])` (B1.4) — single or multi-dimensional. The array must be DIM'd first; each dimension's lower bound is kept. A multi-dim REDIM'd array computes its element strides at runtime. |
 | `PRESERVE` | ✓ | Preserves the overlapping array contents when used with `REDIM` (B1.4). |
@@ -2279,7 +2279,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `CURDIR` | ✓ | `CURDIR` / `CURDIR$` (bare or parenthesised) -> the current working directory. |
 | `CHDIR` | ✓ | Sets the current working directory. |
 | `DIR` | ✓ | Gets the names of files or directories matching certain attributes. |
-| `EXEPATH` | ✗ | Gets the directory of the current running program. |
+| `EXEPATH` | ✓ | `EXEPATH` (bare or `EXEPATH()`) → directory of the running program. |
 | `MKDIR` | ✓ | Creates a new directory. |
 | `RMDIR` | ✓ | Removes an empty directory (`RMDIR "path"`, alias `RD`). |
 

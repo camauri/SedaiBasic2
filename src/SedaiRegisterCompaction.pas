@@ -350,7 +350,7 @@ begin
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrChr, bcStrWChr,
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING codepoint substrings - string dest
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrSpace,  // B1.2: string dest
-    bcCurDir, bcEnviron,  // CURDIR$ / ENVIRON$(name) - string dest
+    bcCurDir, bcEnviron, bcExePath,  // CURDIR$ / ENVIRON$(name) / EXEPATH - string dest
     bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - string dest
     bcStrTrimSet, // LTRIM/RTRIM/TRIM(s,set) - string dest
     bcStrStr,    // STR$(n) - number to string

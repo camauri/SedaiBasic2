@@ -1195,6 +1195,13 @@ begin
         EmitInstruction(ssaCurDir, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         Exit;
       end;
+      // FreeBASIC EXEPATH used bare: directory of the running program.
+      if FModernMode and (UpperCase(VarName) = kEXEPATH) then
+      begin
+        Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaExePath, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Exit;
+      end;
       // BYREF-return address param: the register holds the caller variable's address — reading the
       // parameter dereferences it (load the pointee through the address).
       if IsAddrParam(VarName) then
@@ -3429,6 +3436,14 @@ begin
         begin
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
           EmitInstruction(ssaCurDir, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC EXEPATH() (parenthesised form): directory of the running program.
+        if FModernMode and (UpperCase(ArrName) = kEXEPATH) and (FProgram.FindArray(ArrName) < 0) then
+        begin
+          Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+          EmitInstruction(ssaExePath, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
         end;
 

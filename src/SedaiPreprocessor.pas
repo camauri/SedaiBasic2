@@ -542,6 +542,18 @@ var
           Inc(li);
           Continue;
         end;
+        // FreeBASIC/QuickBASIC advisory metacommands '$DYNAMIC / '$STATIC / '$LANG: accepted and
+        // ignored. '$DYNAMIC/'$STATIC pick the default array storage (we allow REDIM regardless);
+        // '$LANG mirrors the #lang directive (dialect is auto-detected). They emit nothing.
+        if (Length(Trimmed) >= 2) and (Trimmed[1] = '''') and (Trimmed[2] = '$') and Emitting and
+           ((UpperCase(Copy(Trimmed, 3, 7)) = 'DYNAMIC') or
+            (UpperCase(Copy(Trimmed, 3, 6)) = 'STATIC') or
+            (UpperCase(Copy(Trimmed, 3, 4)) = 'LANG')) then
+        begin
+          Output.Add('');
+          Inc(li);
+          Continue;
+        end;
         if (Length(Trimmed) > 0) and (Trimmed[1] = '#') then
         begin
           SplitDirective(Trimmed, DName, DRest);
