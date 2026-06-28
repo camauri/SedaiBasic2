@@ -428,6 +428,11 @@ const
   bcArrayIdxPush    = bcGroupArray + 29;  // Runtime multi-dim index: push one index (Src1=int reg) onto the pending-index list
   bcArrayIdxResolve = bcGroupArray + 30;  // Runtime multi-dim index: Dest=linear index (int), Src1=array ref; row-major from the array's CURRENT dimensions (for REDIM'd arrays)
 
+  // FreeBASIC raw-memory block ops on the byte heap (FB_MEMCOPY/FB_MEMMOVE/CLEAR).
+  bcRawMemCopy      = bcGroupArray + 31;  // Dest=dst ptr(result); Src1=dst raw ptr; Src2=src raw ptr; Immediate=byte count reg
+  bcRawMemMove      = bcGroupArray + 32;  // same layout as bcRawMemCopy; overlap-safe (identical here, FPC Move is overlap-safe)
+  bcRawClear        = bcGroupArray + 33;  // Src1=dst raw ptr; Src2=byte value reg; Immediate=byte count reg
+
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values
   bcPrint           = bcGroupIO + 0;
@@ -1486,6 +1491,9 @@ begin
         24: Result := 'RawLoadFloat';
         25: Result := 'RawStoreInt';
         26: Result := 'RawStoreFloat';
+        31: Result := 'RawMemCopy';
+        32: Result := 'RawMemMove';
+        33: Result := 'RawClear';
       else
         Result := Format('Array_%d', [SubOp]);
       end;

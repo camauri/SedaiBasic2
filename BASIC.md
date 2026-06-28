@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 432 / 643 implemented (67%)** (+ 4 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 446 / 643 implemented (69%)** (+ 4 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **432 (76%)** are implemented. See the
+**572 applicable** keywords, **446 (78%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **442 / 643 implemented (69%)**, plus 4 partial (◐).
-> Of the 197 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **442 / 572 ≈ 77% of the
+> **Coverage (FreeBASIC keyword set):** **446 / 643 implemented (69%)**, plus 4 partial (◐).
+> Of the 193 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **446 / 572 ≈ 78% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -2242,10 +2242,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `PEEK` | ✓ | Reads some type of value from an address. |
 | `POKE` | ✓ | Writes some type of value to an address. |
-| `CLEAR` | ✗ | Clears data in an array with a specified value. |
-| `FB_MEMCOPY` | ✗ | Copies a block of memory from a location to another. (memory areas must not overlap) |
-| `FB_MEMCOPYCLEAR` | ✗ | Copies the first part of a block of memory from a location to another and clears the rest. (memory areas must not overlap) |
-| `FB_MEMMOVE` | ✗ | Copies a block of memory from a location to another. (memory areas may overlap) |
+| `CLEAR` | ✓ | `CLEAR(dst, value, bytes)`: set a block of raw heap memory (from Allocate) to a byte value. v1 takes the pointer directly. |
+| `FB_MEMCOPY` | ✓ | `FB_MEMCOPY(dst, src, bytes)`: copy a block of raw heap memory; returns dst. v1 takes pointers directly. |
+| `FB_MEMCOPYCLEAR` | ✓ | `FB_MEMCOPYCLEAR(dst, dstlen, src, srclen)`: copy the first srclen bytes, clear the rest (composed from FB_MEMCOPY + CLEAR). |
+| `FB_MEMMOVE` | ✓ | `FB_MEMMOVE(dst, src, bytes)`: copy a block of raw heap memory, overlap-safe; returns dst. |
 | `SWAP` | ✓ | Exchange the contents of two variables. |
 | `SADD` | ✓ | Returns a raw byte-heap pointer to a NUL-terminated copy (ZSTRING) of the string's bytes. Read-only snapshot — writes through the pointer do not propagate back to the managed string. |
 

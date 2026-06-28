@@ -230,6 +230,7 @@ begin
     bcRefAddrField,  // @obj.field - Dest = packed record-field pointer (int)
     bcRawAlloc, bcRawRealloc,  // raw heap: Dest = raw pointer (int)
     bcRawLoadInt,              // raw deref (int) - Dest = value
+    bcRawMemCopy, bcRawMemMove,  // FB_MEMCOPY/FB_MEMMOVE: Dest = destination pointer returned (int)
     // === GROUP 4: I/O operations ===
     bcInputInt,      // Input int
     bcDataReadInt,   // Read next DATA value into int register
@@ -430,6 +431,8 @@ begin
     // raw heap: Src1 = byte count (alloc) / raw pointer (free/realloc/load/store) — all int
     bcRawAlloc, bcRawFree, bcRawRealloc,
     bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat,
+    // FB_MEMCOPY/FB_MEMMOVE/CLEAR: Src1 = destination raw pointer (int)
+    bcRawMemCopy, bcRawMemMove, bcRawClear,
     // === GROUP 1: String operations with int param ===
     bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin, bcStrWChr,
     bcStrMkInt,  // MKI/MKL/MKSHORT/MKLONGINT(n) - Src1 = int value to pack (B3)
@@ -552,6 +555,8 @@ begin
     bcRecordStoreInt,
     // raw heap: Realloc's Src2 = byte count; RawStoreInt's Src2 = int value.
     bcRawRealloc, bcRawStoreInt,
+    // FB_MEMCOPY/FB_MEMMOVE: Src2 = source pointer; CLEAR: Src2 = byte value — all int.
+    bcRawMemCopy, bcRawMemMove, bcRawClear,
     // Condition variables (M5.4): CondWait's Src2 is the mutex handle (int).
     bcCondWait,
     // === GROUP 0: Core VM operations ===
@@ -975,6 +980,10 @@ begin
 
     // bcDateSerial/bcTimeSerial: Immediate contains the 3rd arg (day/second) register index (int)
     if (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) then
+      MarkIntRegUsed(Instr.Immediate and $FFFF);
+
+    // FB_MEMCOPY/FB_MEMMOVE/CLEAR: Immediate contains the byte-count register index (int)
+    if (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // bcGraphicWindow: Src1=col1, Src2=row1, Dest=col2, Immediate = (clear_reg << 16) | row2_reg
@@ -1439,7 +1448,8 @@ begin
     // MID$(str, start, length) - start is Src2, length is in Immediate
     // bcDateSerial/bcTimeSerial: Immediate contains the 3rd arg (day/second) register index (int)
     if (OpCode = bcStrMid) or (OpCode = bcStrMidW) or
-       (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) then
+       (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) or
+       (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) then
     begin
       OldReg := Instr.Immediate and $FFFF;
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then

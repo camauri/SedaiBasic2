@@ -286,6 +286,7 @@ type
     function RawElemSizeOf(const PtrName: string): Int64;                        // SizeOf(pointee) in bytes
     function TypeSizeBytes(const TypeName: string): Int64;                       // SizeOf(T) in bytes (FB sizes)
     procedure EmitRawAlloc(CallNode: TASTNode; out Result: TSSAValue);           // ALLOCATE/CALLOCATE/REALLOCATE → raw ptr
+    procedure EmitRawMemOp(const FuncU: string; ArgsNode: TASTNode; out Result: TSSAValue);  // FB_MEMCOPY/FB_MEMMOVE/CLEAR/FB_MEMCOPYCLEAR
     function IsAddrLocal(const Name: string): Boolean;                          // @-taken LOCAL (per-frame record-backed)?
     function AddrLocalBank(const Name: string): TSSARegisterType;               // bank of an @-taken local
     function AddrLocalHandle(const Name: string): TSSAValue;                    // its per-frame record handle (hidden var)
@@ -3274,6 +3275,19 @@ begin
           EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), EnsureIntRegister(Left), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC raw-memory block ops on the byte heap (MODERN only): FB_MEMCOPY(dst,src,bytes),
+        // FB_MEMMOVE(dst,src,bytes), CLEAR(dst,value,bytes), FB_MEMCOPYCLEAR(dst,dstlen,src,srclen).
+        // dst/src are raw pointer values (from Allocate); v1 takes the pointer directly. Valid as a
+        // statement, or (memcopy/memmove) as an expression yielding the destination pointer.
+        if FModernMode and (FProgram.FindArray(ArrName) < 0) and
+           (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and
+           ((UpperCase(ArrName) = kFBMEMCOPY) or (UpperCase(ArrName) = kFBMEMMOVE) or
+            (UpperCase(ArrName) = kCLEAR) or (UpperCase(ArrName) = kFBMEMCOPYCLEAR)) then
+        begin
+          EmitRawMemOp(UpperCase(ArrName), Node.GetChild(1), Result);
           Exit;
         end;
 
@@ -12798,6 +12812,55 @@ begin
   begin
     ProcessExpression(ArgsNode.GetChild(0), CountV); CountV := EnsureIntRegister(CountV);
     EmitInstruction(ssaRawAlloc, Result, CountV, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+procedure TSSAGenerator.EmitRawMemOp(const FuncU: string; ArgsNode: TASTNode; out Result: TSSAValue);
+// FreeBASIC raw-memory block ops on the byte heap. The byte count register is carried in Src3 (the
+// compiler maps Src3 -> Immediate). FB_MEMCOPYCLEAR is composed from a memcopy plus a clear of the
+// tail (no dedicated opcode): rest pointer = dst + srclen (a raw pointer is a tagged byte offset, so a
+// small integer add keeps the tag), rest length = dstlen - srclen.
+var
+  DstR, SrcR, BytesR, ValR, DstLenR, SrcLenR, RestPtr, RestLen, ZeroR, TmpV: TSSAValue;
+begin
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if (FuncU = kFBMEMCOPY) or (FuncU = kFBMEMMOVE) then
+  begin
+    ProcessExpression(ArgsNode.GetChild(0), TmpV); DstR := EnsureIntRegister(TmpV);
+    ProcessExpression(ArgsNode.GetChild(1), TmpV); SrcR := EnsureIntRegister(TmpV);
+    ProcessExpression(ArgsNode.GetChild(2), TmpV); BytesR := EnsureIntRegister(TmpV);
+    if FuncU = kFBMEMCOPY then
+      EmitInstruction(ssaRawMemCopy, Result, DstR, SrcR, BytesR)   // Result = destination pointer (FB returns dst)
+    else
+      EmitInstruction(ssaRawMemMove, Result, DstR, SrcR, BytesR);
+  end
+  else if FuncU = kCLEAR then
+  begin
+    ProcessExpression(ArgsNode.GetChild(0), TmpV); DstR := EnsureIntRegister(TmpV);
+    ProcessExpression(ArgsNode.GetChild(1), TmpV); ValR := EnsureIntRegister(TmpV);
+    ProcessExpression(ArgsNode.GetChild(2), TmpV); BytesR := EnsureIntRegister(TmpV);
+    EmitInstruction(ssaRawClear, MakeSSAValue(svkNone), DstR, ValR, BytesR);
+    EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else  // kFBMEMCOPYCLEAR: (dst, dstlen, src, srclen)
+  begin
+    ProcessExpression(ArgsNode.GetChild(0), TmpV); DstR := EnsureIntRegister(TmpV);
+    ProcessExpression(ArgsNode.GetChild(1), TmpV); DstLenR := EnsureIntRegister(TmpV);
+    ProcessExpression(ArgsNode.GetChild(2), TmpV); SrcR := EnsureIntRegister(TmpV);
+    ProcessExpression(ArgsNode.GetChild(3), TmpV); SrcLenR := EnsureIntRegister(TmpV);
+    // copy the first srclen bytes
+    EmitInstruction(ssaRawMemCopy, MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt)), DstR, SrcR, SrcLenR);
+    // rest pointer = dst + srclen
+    RestPtr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, RestPtr, DstR, SrcLenR, MakeSSAValue(svkNone));
+    // rest length = dstlen - srclen
+    RestLen := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, RestLen, DstLenR, SrcLenR, MakeSSAValue(svkNone));
+    // clear the rest to zero
+    ZeroR := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, ZeroR, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ssaRawClear, MakeSSAValue(svkNone), RestPtr, ZeroR, RestLen);
+    EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 end;
 

@@ -343,6 +343,9 @@ begin
     ssaRawLoadFloat: Result := bcRawLoadFloat;
     ssaRawStoreInt: Result := bcRawStoreInt;
     ssaRawStoreFloat: Result := bcRawStoreFloat;
+    ssaRawMemCopy: Result := bcRawMemCopy;
+    ssaRawMemMove: Result := bcRawMemMove;
+    ssaRawClear: Result := bcRawClear;
     // Graphics operations
     ssaGraphicRGBA: Result := bcGraphicRGBA;
     ssaGraphicSetMode: Result := bcGraphicSetMode;

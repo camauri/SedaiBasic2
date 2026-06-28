@@ -284,6 +284,8 @@ type
     function RawLoadFloat(RawPtr: Int64; TypeCode: Integer): Double;
     procedure RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
     procedure RawStoreFloat(RawPtr: Int64; TypeCode: Integer; Value: Double);
+    procedure RawMemCopy(DstPtr, SrcPtr: Int64; ByteCount: PtrUInt);  // FB_MEMCOPY/FB_MEMMOVE: copy ByteCount bytes on the raw heap
+    procedure RawClear(DstPtr: Int64; Value: Byte; ByteCount: PtrUInt);  // CLEAR: set ByteCount bytes to Value on the raw heap
     function ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordStorage; inline;
     function RecPtrTarget(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage; inline;  // decode @obj.field pointer
     procedure CleanupSharedRecords;   // free the shared region (destructor)
@@ -1638,6 +1640,37 @@ begin
   else PDouble(@FRawHeap[ofs])^ := Value;
 end;
 
+// FB_MEMCOPY / FB_MEMMOVE: copy ByteCount bytes from SrcPtr to DstPtr on the raw byte heap. Both raw
+// pointers are RAWPTR_TAG-tagged byte offsets. FPC Move is overlap-safe, so this serves both the
+// (non-overlapping) memcopy and the (overlap-safe) memmove semantics.
+procedure TBytecodeVM.RawMemCopy(DstPtr, SrcPtr: Int64; ByteCount: PtrUInt);
+var
+  dofs, sofs: PtrUInt;
+begin
+  if ByteCount = 0 then Exit;
+  if ((DstPtr and RAWPTR_TAG) = 0) or ((SrcPtr and RAWPTR_TAG) = 0) then
+    raise ERangeError.Create('Null or invalid raw pointer in memory copy');
+  dofs := DstPtr and RAWPTR_OFS_MASK;
+  sofs := SrcPtr and RAWPTR_OFS_MASK;
+  if (dofs + ByteCount > PtrUInt(Length(FRawHeap))) or (sofs + ByteCount > PtrUInt(Length(FRawHeap))) then
+    raise ERangeError.Create('Raw memory copy out of bounds');
+  Move(FRawHeap[sofs], FRawHeap[dofs], ByteCount);
+end;
+
+// CLEAR: set ByteCount bytes at DstPtr to Value on the raw byte heap.
+procedure TBytecodeVM.RawClear(DstPtr: Int64; Value: Byte; ByteCount: PtrUInt);
+var
+  dofs: PtrUInt;
+begin
+  if ByteCount = 0 then Exit;
+  if (DstPtr and RAWPTR_TAG) = 0 then
+    raise ERangeError.Create('Null or invalid raw pointer in clear');
+  dofs := DstPtr and RAWPTR_OFS_MASK;
+  if dofs + ByteCount > PtrUInt(Length(FRawHeap)) then
+    raise ERangeError.Create('Raw clear out of bounds');
+  FillChar(FRawHeap[dofs], ByteCount, Value);
+end;
+
 procedure TBytecodeVM.RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);
 // Eager-allocate one record instance per element of the (int handle) array and store the handles.
 // PackedCounts = intCount | floatCount<<16 | strCount<<32 | typeId<<48. M5.2c: array-of-UDT records go
@@ -2687,6 +2720,21 @@ begin
         begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
           if Instr.Src2 > MaxFloatReg then MaxFloatReg := Instr.Src2;
+        end;
+        // FB_MEMCOPY/FB_MEMMOVE: Dest=dst result, Src1=dst, Src2=src, Immediate=byte count — all int.
+        bcRawMemCopy, bcRawMemMove:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+          if Instr.Immediate > MaxIntReg then MaxIntReg := Instr.Immediate;
+        end;
+        // CLEAR: Src1=dst, Src2=value, Immediate=byte count — all int.
+        bcRawClear:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+          if Instr.Immediate > MaxIntReg then MaxIntReg := Instr.Immediate;
         end;
 
         // ArrayLoad: Dest is result, Src2 is index (int)
@@ -5320,6 +5368,18 @@ begin
     24: Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(Ctx.IntRegs[Instr.Src1], Instr.Immediate);       // bcRawLoadFloat
     25: RawStoreInt(Ctx.IntRegs[Instr.Src1], Instr.Immediate, Ctx.IntRegs[Instr.Src2]);            // bcRawStoreInt
     26: RawStoreFloat(Ctx.IntRegs[Instr.Src1], Instr.Immediate, Ctx.FloatRegs[Instr.Src2]);        // bcRawStoreFloat
+    31: // bcRawMemCopy - FB_MEMCOPY(dst, src, bytes); Dest receives dst (FB returns the destination)
+      begin
+        RawMemCopy(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], PtrUInt(Ctx.IntRegs[Instr.Immediate]));
+        Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
+      end;
+    32: // bcRawMemMove - FB_MEMMOVE(dst, src, bytes); overlap-safe
+      begin
+        RawMemCopy(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], PtrUInt(Ctx.IntRegs[Instr.Immediate]));
+        Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
+      end;
+    33: // bcRawClear - CLEAR(dst, value, bytes)
+      RawClear(Ctx.IntRegs[Instr.Src1], Byte(Ctx.IntRegs[Instr.Src2]), PtrUInt(Ctx.IntRegs[Instr.Immediate]));
     27: // bcArrayRedimPush - push one upper bound onto the pending REDIM dimension list
       begin
         SetLength(FRedimPendingUBs, Length(FRedimPendingUBs) + 1);

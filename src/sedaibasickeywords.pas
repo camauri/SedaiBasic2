@@ -216,6 +216,12 @@ const
   kFILECOPY = 'FILECOPY';    // FreeBASIC: copy a file
   kNAME    = 'NAME';         // FreeBASIC/QB: NAME old AS new (rename); intercepted by-name, not reserved
 
+  // FreeBASIC raw memory block ops (operate on the byte heap; intercepted by-name, not reserved)
+  kCLEAR          = 'CLEAR';            // FreeBASIC: set a block of raw memory to a byte value
+  kFBMEMCOPY      = 'FB_MEMCOPY';       // FreeBASIC: copy a block of raw memory (areas must not overlap)
+  kFBMEMMOVE      = 'FB_MEMMOVE';       // FreeBASIC: copy a block of raw memory (overlap-safe)
+  kFBMEMCOPYCLEAR = 'FB_MEMCOPYCLEAR';  // FreeBASIC: copy the first part, clear the rest
+
   // Memory and system
   kBANK	   = 'BANK';
   kCLR     = 'CLR';

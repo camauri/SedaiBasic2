@@ -290,6 +290,8 @@ begin
     ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
     // FreeBASIC raw heap: alloc/free/realloc and stores mutate the heap; loads are pure (kept if used).
     ssaRawAlloc, ssaRawFree, ssaRawRealloc, ssaRawStoreInt, ssaRawStoreFloat,
+    // FB_MEMCOPY/FB_MEMMOVE/CLEAR mutate the raw heap — side-effecting, never elide.
+    ssaRawMemCopy, ssaRawMemMove, ssaRawClear,
     // SADD(s) allocates a fresh raw byte-heap copy each call — allocating, so never elide or CSE it.
     ssaStrSAdd,
     // FILEEXISTS depends on external filesystem state — keep it (don't elide/CSE) so repeated checks
