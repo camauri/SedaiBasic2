@@ -2250,25 +2250,15 @@ begin
           TokenBufferAdd(CurrentChar); // Opening quote
           AdvanceChar;
 
-          // Fast string loop
+          // Fast string loop. A plain "..." literal is NON-escaped (FreeBASIC default): '\' is an
+          // ordinary character and a '"' ALWAYS terminates the string. (Escape processing happens only
+          // for the prefixed !"..." form, handled by LexPrefixedString.) Backslash must NOT protect the
+          // closing quote here, otherwise a trailing "\" would swallow the terminator and run to EOF.
           CurrentChar := GetCurrentChar;
           while (CurrentChar <> #0) and (CurrentChar <> '"') do
           begin
-            if CurrentChar = '\' then
-            begin
-              TokenBufferAdd(CurrentChar);
-              AdvanceChar;
-              if GetCurrentChar <> #0 then
-              begin
-                TokenBufferAdd(GetCurrentChar);
-                AdvanceChar;
-              end;
-            end
-            else
-            begin
-              TokenBufferAdd(CurrentChar);
-              AdvanceChar;
-            end;
+            TokenBufferAdd(CurrentChar);
+            AdvanceChar;
             CurrentChar := GetCurrentChar;
           end;
 
