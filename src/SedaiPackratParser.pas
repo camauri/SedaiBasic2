@@ -89,6 +89,7 @@ type
 
     // Helper methods for block parsing
     function ParseBlockUntil(EndTokens: array of TTokenType): TASTNode;
+    function ParseLoopBody: TASTNode;   // DO/WHILE body, skipping nested flat FOR...NEXT
     function FindMatchingNext: Integer;
     function FindMatchingEnd(StartToken: TTokenType): Integer;
     function ParseDimensionList: TASTNode;
@@ -2819,8 +2820,9 @@ begin
     Exit;
   end;
 
-  // Parse body until LOOP
-  Body := ParseBlockUntil([ttLoopBlockEnd]);
+  // Parse body until LOOP (nesting-aware: a nested flat FOR...NEXT is consumed, not mistaken
+  // for the terminator).
+  Body := ParseLoopBody;
   if Assigned(Body) then
     Result.AddChild(Body);
 
@@ -3233,8 +3235,19 @@ var
   Token: TLexerToken;
 begin
   Token := Context.CurrentToken;
+
+  // A WHILE at statement start opens a WHILE...WEND loop (the DO WHILE / LOOP WHILE
+  // modifier forms are consumed inside ParseDoStatement and never reach here).
+  if UpperCase(Token.Value) = kWHILE then
+  begin
+    Result := ParseWhileStatement;
+    Exit;
+  end;
+
+  // A bare TO/STEP/UNTIL at statement start is a stray loop-control keyword: consume it
+  // as a no-op statement (legacy tolerance).
   Result := TASTNode.Create(antStatement, Token);
-  Context.Advance; // Consume TO/STEP/WHILE/UNTIL
+  Context.Advance; // Consume TO/STEP/UNTIL
   DoNodeCreated(Result);
 end;
 
@@ -6167,15 +6180,19 @@ begin
 end;
 
 function TPackratParser.ParseWhileStatement: TASTNode;
+// WHILE <cond> ... WEND. Desugared at parse time into the same antDoLoop node that
+// "DO WHILE <cond> ... LOOP" produces (top-tested WHILE condition), so it reuses the
+// fully-supported DO/LOOP lowering in both the SSA compiler and the tree executor
+// (the antWhileLoop node is only handled by the tree executor, not the SSA pipeline).
 var
   Condition, Body: TASTNode;
   Token: TLexerToken;
 begin
   Token := Context.CurrentToken;
-  Result := TASTNode.Create(antWhileLoop, Token);
+  Result := TASTNode.Create(antDoLoop, Token);
   Context.Advance; // Consume WHILE
 
-  // Parse condition
+  // Parse condition (top-tested, like DO WHILE)
   Condition := ParseExpression;
   if not Assigned(Condition) then
   begin
@@ -6183,12 +6200,23 @@ begin
     Result := nil;
     Exit;
   end;
-  Result.AddChild(Condition);
 
-  // Parse body until matching WEND or END WHILE
-  Body := ParseBlockUntil([ttLoopBlockEnd]);
+  // Parse body until matching WEND (registered as ttLoopBlockEnd, like LOOP/NEXT).
+  // ParseLoopBody is nesting-aware: nested flat FOR...NEXT loops are consumed rather
+  // than mistaken for our terminator.
+  Body := ParseLoopBody;
   if Assigned(Body) then
     Result.AddChild(Body);
+
+  // Consume the closing WEND. ParseWhileStatement manages it directly (like DO/LOOP),
+  // so no validation-stack push/pop is involved.
+  if Context.Check(ttLoopBlockEnd) and (UpperCase(Context.CurrentToken.Value) = kWEND) then
+    Context.Advance;
+
+  // antDoLoop layout: child 0 = body, child 1 = condition; metadata in attributes.
+  Result.AddChild(Condition);
+  Result.Attributes.Values['ConditionType'] := 'WHILE';
+  Result.Attributes.Values['ConditionPosition'] := 'TOP';
 
   DoNodeCreated(Result);
 end;
@@ -6432,6 +6460,67 @@ begin
         Break;
       // Otherwise, continue - the statement was handled internally
     end;
+  end;
+
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseLoopBody: TASTNode;
+// Parses the body of a DO/LOOP or WHILE/WEND, stopping at the matching LOOP/WEND.
+//
+// DO and WHILE build a nested body (this block), but FOR uses a FLAT representation:
+// ParseForStatement emits just the antForLoop header (pushing a validation entry) and the
+// matching NEXT is a sibling statement consumed later by ParseLoopEndStatement. A generic
+// ParseBlockUntil([ttLoopBlockEnd]) would therefore stop at a nested FOR's NEXT, treating it
+// as the loop terminator (the historical "FOR without matching NEXT (found LOOP)" failure).
+//
+// This helper tracks the number of still-open nested flat FOR loops: while one is open, a NEXT
+// is NOT our terminator — it is parsed as a normal statement (which closes the FOR). Nested
+// DO/WHILE self-consume their own LOOP/WEND, so they never leave a pending end here.
+var
+  Statement: TASTNode;
+  Token: TLexerToken;
+  StartIndex, PendingFor: Integer;
+  IsEnd: Boolean;
+begin
+  Result := TASTNode.Create(antBlock);
+  PendingFor := 0;
+
+  while not Context.IsAtEnd do
+  begin
+    Token := Context.CurrentToken;
+
+    // Skip line numbers and EOL — they remain at root level.
+    if Context.Match(ttLineNumber) or Context.Match(ttEndOfLine) then
+      Continue;
+
+    if Token.TokenType = ttLoopBlockEnd then
+    begin
+      // A NEXT closing a still-open nested FOR is part of the body, not our terminator.
+      if (UpperCase(Token.Value) = kNEXT) and (PendingFor > 0) then
+      begin
+        Dec(PendingFor);
+        Statement := ParseStatement;        // consumes NEXT, pops the FOR validation entry
+        if Assigned(Statement) then
+          Result.AddChild(Statement);
+        Continue;
+      end;
+      // Otherwise (LOOP/WEND, or NEXT with no open FOR) this is our terminator.
+      Break;
+    end;
+
+    StartIndex := Context.CurrentIndex;
+    Statement := ParseStatement;
+    if Assigned(Statement) then
+    begin
+      Result.AddChild(Statement);
+      // A flat FOR header leaves a NEXT to be matched later in this body.
+      IsEnd := Statement.NodeType = antForLoop;
+      if IsEnd then
+        Inc(PendingFor);
+    end
+    else if Context.CurrentIndex = StartIndex then
+      Break;  // no progress — avoid an infinite loop
   end;
 
   DoNodeCreated(Result);

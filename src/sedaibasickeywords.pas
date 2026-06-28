@@ -96,6 +96,7 @@ const
   kDO      = 'DO';
   kLOOP    = 'LOOP';
   kWHILE   = 'WHILE';
+  kWEND    = 'WEND';       // FreeBASIC/QBasic: closes a WHILE...WEND loop
   kUNTIL   = 'UNTIL';
   kEXIT    = 'EXIT';
   kCONTINUE = 'CONTINUE';  // FreeBASIC: skip to the next loop iteration (FOR/DO/WHILE)

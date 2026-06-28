@@ -1677,6 +1677,7 @@ begin
  RegisterKeyword(kTO,    ttLoopControl,    'Sets FOR loop end value',                         kcLoopConstructs);
  RegisterKeyword(kUNTIL, ttLoopControl,    'DO/LOOP until condition',                         kcLoopConstructs);
  RegisterKeyword(kWHILE, ttLoopControl,    'DO/LOOP while condition',                         kcLoopConstructs);
+ RegisterKeyword(kWEND,  ttLoopBlockEnd,   'Closes WHILE...WEND loop',                        kcLoopConstructs);
 
  // === CODE BLOCK CONSTRUCTS ===
  RegisterKeyword(kBEGIN, ttBlockBegin, 'Starts code block', kcCodeBlockConstructs);
