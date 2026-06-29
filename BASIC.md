@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 457 / 643 implemented (71%)** (+ 6 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 458 / 643 implemented (71%)** (+ 5 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **457 (80%)** are implemented. See the
+**572 applicable** keywords, **458 (80%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,7 +1254,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **457 / 643 implemented (71%)**, plus 6 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **458 / 643 implemented (71%)**, plus 5 partial (◐).
 > Of the 180 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
 > linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **453 / 572 ≈ 79% of the
 > applicable keywords**.
@@ -1320,7 +1320,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `OVERRIDE` | ✓ | Accepted in an in-TYPE Declare; dispatch already works via runtime type-id (M4.3). |
 | `PROPERTY` | ✓ | Property getter/setter `PROPERTY Type.name() AS T` / `PROPERTY Type.name(v AS T)` (desugars to a method) |
 | `SUB` | ✓ | Declare or defines a member procedure |
-| `STATIC (Member)` | ◐ | Static member **methods** work: `Type.method(args)` called via the type name, no instance (DECLARE STATIC + out-of-line body). Static member **variables** (shared storage) not yet implemented. |
+| `STATIC (Member)` | ✓ | Static member **methods** (`Type.method(args)`, no instance) and static member **variables** (`Static field AS type` → one shared storage per type, accessed via the type name or any instance). |
 | `VIRTUAL` | ✓ | Accepted in an in-TYPE Declare; dispatch already works via runtime type-id (M4.3). |
 | `ABSTRACT` | ✓ | Accepted in an in-TYPE Declare (no-body enforcement deferred). |
 | `CONST (Member)` | ✓ | Member method attribute that declares or defines that the method is readonly and does not modify the user defined types's data |

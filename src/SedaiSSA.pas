@@ -142,6 +142,7 @@ type
     // shared-memory model). Maps the UPPER-case name -> its array index. Every read/write of the name is
     // routed to element 0 of this array, so the value is never a per-thread register.
     FSharedScalarArr: TStringList;       // name (UPPER) -> array index (Objects[]=PtrInt arrayIdx)
+    FStaticMembers: TStringList;         // OOP: static member variables "TYPE.FIELD" (UPPER), backed by a shared global scalar
     FPointerVars: TStringList;           // FreeBASIC pointers: var name (UPPER) -> pointee type name (e.g. "INTEGER")
     FRefVars: TStringList;               // FreeBASIC reference variables (DIM BYREF r AS T = target): name
                                          // (UPPER) -> pointee type. r's register is int (it carries target's
@@ -253,6 +254,9 @@ type
     procedure EmitExitLoopCleanupN(LoopLevels: Integer); // multi-level EXIT/CONTINUE (Exit For, For)
     function FindEnclosingLoop(Kind: TLoopKind; Levels: Integer; out LoopIdx, AllDepth: Integer): Boolean;
     procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
+    procedure CollectStaticMembers(Node: TASTNode);     // OOP: gather TYPE static member vars, back each with a shared global
+    procedure EmitStaticMemberAllocs;                   // OOP: allocate the static members' backing arrays at program start
+    function StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;  // "TYPE.FIELD" backing name, or '' if not static
     procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
     // Refinement #2: cross-thread SHARED scalars backed by a 1-element global array.
     function IsSharedScalar(const Name: string): Boolean;                       // name is a SHARED scalar (array-backed)?
@@ -554,6 +558,8 @@ begin
   FSharedVars := TStringList.Create;
   FSharedVars.CaseSensitive := False;
   FSharedScalarArr := TStringList.Create;
+  FStaticMembers := TStringList.Create;
+  FStaticMembers.CaseSensitive := False;
   FPointerVars := TStringList.Create;
   FAddrLocalVars := TStringList.Create;
   FRefVars := TStringList.Create;
@@ -603,6 +609,7 @@ begin
   FModuleDtorSlots.Free;
   FSharedVars.Free;
   FSharedScalarArr.Free;
+  FStaticMembers.Free;
   FPointerVars.Free;
   FAddrLocalVars.Free;
   FRefVars.Free;
@@ -11394,6 +11401,7 @@ begin
     begin
       FieldNode := FUDTs[Idx].Node.GetChild(j);
       if FieldNode.NodeType <> antIdentifier then Continue;
+      if FieldNode.Attributes.Values['STATIC'] = '1' then Continue;  // static member: backed by a global, no per-instance slot
       FieldName := VarToStr(FieldNode.Value);
       TypeNode := nil;
       if FieldNode.ChildCount > 0 then TypeNode := FieldNode.GetChild(0);
@@ -12490,6 +12498,84 @@ begin
   IdxList := TASTNode.Create(antExpressionList, Tok);
   IdxList.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Tok));
   Result.AddChild(IdxList);
+end;
+
+procedure TSSAGenerator.CollectStaticMembers(Node: TASTNode);
+// OOP static member variables: a TYPE field declared "Static x AS t" has ONE storage shared by every
+// instance. Back each with a 1-element global array named "TYPE.FIELD" (reusing the DIM SHARED scalar
+// machinery, so it is visible from methods/threads). v1 supports builtin scalar static members.
+var
+  i, k, ai: Integer;
+  FieldNode: TASTNode;
+  tn, fn, ftype, backing: string;
+  bank: TSSARegisterType;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType = antTypeDecl then
+  begin
+    tn := UpperCase(VarToStr(Node.Value));
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      FieldNode := Node.GetChild(k);
+      if (FieldNode.NodeType = antIdentifier) and (FieldNode.Attributes.Values['STATIC'] = '1') then
+      begin
+        fn := UpperCase(VarToStr(FieldNode.Value));
+        ftype := '';
+        if FieldNode.ChildCount > 0 then ftype := UpperCase(VarToStr(FieldNode.GetChild(0).Value));
+        bank := TypeNameToBank(ftype, fn);                 // builtin scalar bank (int/float/string)
+        backing := tn + '.' + fn;
+        if FStaticMembers.IndexOf(backing) < 0 then
+        begin
+          ai := FProgram.DeclareArray(backing, bank, [1]);  // 1-element global array, same dotted name
+          FSharedScalarArr.AddObject(backing, TObject(PtrInt(ai)));
+          FStaticMembers.Add(backing);
+        end;
+      end;
+    end;
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectStaticMembers(Node.GetChild(i));
+end;
+
+procedure TSSAGenerator.EmitStaticMemberAllocs;
+// Allocate the static members' backing 1-element arrays once at program start (they have no DIM).
+var
+  i, ai: Integer;
+  ArrayRef: TSSAValue;
+begin
+  if FStaticMembers = nil then Exit;
+  for i := 0 to FStaticMembers.Count - 1 do
+  begin
+    ai := PtrInt(FSharedScalarArr.Objects[FSharedScalarArr.IndexOf(FStaticMembers[i])]);
+    ArrayRef := MakeSSAArrayRef(ai, FProgram.GetArray(ai).ElementType);
+    EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+function TSSAGenerator.StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;
+// If ObjNode.FieldName is a static member (accessed via the type name OR via an instance), return the
+// backing shared-scalar name "DECLTYPE.FIELD" (walking the inheritance chain); otherwise ''.
+var
+  at, t, key: string;
+  idx: Integer;
+begin
+  Result := '';
+  if ObjNode = nil then Exit;
+  if (ObjNode.NodeType = antIdentifier) and (FindUDT(UpperCase(VarToStr(ObjNode.Value))) >= 0) then
+    at := UpperCase(VarToStr(ObjNode.Value))     // TypeName.field (no instance)
+  else
+    at := ObjectTypeName(ObjNode);               // instance.field
+  if at = '' then Exit;
+  t := at;
+  while t <> '' do
+  begin
+    key := t + '.' + UpperCase(FieldName);
+    if FStaticMembers.IndexOf(key) >= 0 then Exit(key);
+    idx := FindUDT(t);
+    if idx < 0 then Break;
+    t := UpperCase(FUDTs[idx].Parent);
+  end;
 end;
 
 procedure TSSAGenerator.EmitSharedScalarStoreVal(const Name: string; const Val: TSSAValue);
@@ -13812,14 +13898,23 @@ procedure TSSAGenerator.ProcessMemberAccess(Node: TASTNode; out Result: TSSAValu
 // Lower a record field read "obj.field" to ssaRecordLoad<bank>(dest, handle, slot). If the
 // member is not a field but a (no-arg) method of the object's type, lower a method call.
 var
-  TypeName, NestedT, MethodLbl: string;
+  TypeName, NestedT, MethodLbl, SMBack: string;
   UDTIdx, Slot: Integer;
   Bank: TSSARegisterType;
   HandleVal, DestVal: TSSAValue;
   Op: TSSAOpCode;
+  AccNode: TASTNode;
 begin
   Result := MakeSSAValue(svkNone);
   if Node.ChildCount < 1 then Exit;
+  // OOP static member variable (via type name or instance): read from its shared global scalar.
+  SMBack := StaticMemberBackingName(Node.GetChild(0), VarToStr(Node.Value));
+  if SMBack <> '' then
+  begin
+    AccNode := MakeSharedScalarAccess(SMBack, Node.Token);
+    try ProcessExpression(AccNode, Result); finally AccNode.Free; end;
+    Exit;
+  end;
   TypeName := ObjectTypeName(Node.GetChild(0));
   if TypeName = '' then
   begin
@@ -13853,14 +13948,24 @@ procedure TSSAGenerator.ProcessMemberStore(MemberNode, ExprNode: TASTNode);
 // Lower "obj.field = expr" to ssaRecordStore<bank>(handle, value, slot). If the member is not a field
 // but a PROPERTY setter (FreeBASIC), lower a method call obj.<prop>.SET(expr) instead.
 var
-  TypeName, NestedT: string;
+  TypeName, NestedT, SMBack: string;
   UDTIdx, Slot: Integer;
   Bank: TSSARegisterType;
   HandleVal, ExprVal, DummyVal: TSSAValue;
   Op: TSSAOpCode;
-  SetterArgs: TASTNode;
+  SetterArgs, StoreAssign: TASTNode;
 begin
   if MemberNode.ChildCount < 1 then Exit;
+  // OOP static member variable (via type name or instance): store to its shared global scalar.
+  SMBack := StaticMemberBackingName(MemberNode.GetChild(0), VarToStr(MemberNode.Value));
+  if SMBack <> '' then
+  begin
+    StoreAssign := TASTNode.Create(antAssignment, MemberNode.Token);
+    StoreAssign.AddChild(MakeSharedScalarAccess(SMBack, MemberNode.Token));
+    StoreAssign.AddChild(ExprNode.Clone);
+    try ProcessArrayStore(StoreAssign); finally StoreAssign.Free; end;
+    Exit;
+  end;
   // Evaluate the RHS first, then resolve the target (object handle). Order matters only for
   // side effects; both are emitted before the store.
   if not ResolveRecordObject(MemberNode.GetChild(0), HandleVal, TypeName) then Exit;
@@ -15072,6 +15177,9 @@ begin
   // with a 1-element global array (a stable address); also records pointee types in FPointerVars.
   CollectAddressTakenVars(AST);
   CollectSharedVars(AST);
+  // OOP static member variables: back each "Static x AS t" type field with a shared global scalar.
+  FStaticMembers.Clear;
+  CollectStaticMembers(AST);
   // FreeBASIC raw pointers: vars assigned from Allocate/CAllocate/Reallocate (and CAST/copies of raw).
   // Iterate to a fixpoint so raw-ness propagates through copies regardless of statement order.
   // (Stage 2 byte-backing of address-taken arrays was withdrawn: a managed/raw mix is unsound at function
@@ -15112,6 +15220,9 @@ begin
 
   // Create entry block
   FCurrentBlock := FProgram.CreateBlock('_entry');
+
+  // OOP: allocate static member variables' backing arrays at program start (no DIM to trigger it).
+  EmitStaticMemberAllocs;
 
   // PRE-PROCESS DATA STATEMENTS FIRST
   // In BASIC, DATA statements are collected before program execution,

@@ -2430,6 +2430,7 @@ var
   FieldNode, TypeNode: TASTNode;
   PrevIdx: Integer;
   FieldTypeName, TokU, AliasType: string;
+  IsStaticField: Boolean;
 begin
   // TYPE/UNION name <newline> field AS type <newline> ... END TYPE/END UNION
   // Each field node is antIdentifier(fieldName) with one child antIdentifier(typeName).
@@ -2527,6 +2528,17 @@ begin
         Context.Advance;
       Continue;
     end;
+    // FreeBASIC static member variable: "Static field AS type" — one storage shared by all instances.
+    // Consume the STATIC prefix and mark the field; the SSA backs it with a module-global, not a slot.
+    IsStaticField := False;
+    if (TokU = 'STATIC') and Assigned(Context.PeekNext) and
+       ((Context.PeekNext.TokenType = ttIdentifier) or
+        ((Length(VarToStr(Context.PeekNext.Value)) > 0) and
+         (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']))) then
+    begin
+      Context.Advance;                              // consume STATIC
+      IsStaticField := True;
+    end;
     // A field name may be an identifier or a reserved word (e.g. LEN, TYPE, NAME): accept any
     // alphabetic token as the field name here.
     if Context.Check(ttIdentifier) or
@@ -2564,6 +2576,7 @@ begin
       FieldNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(FieldTok.Value), FieldTok);
       TypeNode := TASTNode.CreateWithValue(antIdentifier, FieldTypeName, FieldTok);
       FieldNode.AddChild(TypeNode);
+      if IsStaticField then FieldNode.Attributes.Values['STATIC'] := '1';
       Result.AddChild(FieldNode);
     end
     else
