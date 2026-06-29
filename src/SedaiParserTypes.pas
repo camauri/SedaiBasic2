@@ -197,6 +197,7 @@ type
     antMove,              // MOVE/MV command (move file)
     antGraphics,          // GRAPHIC command
     antScnClr,            // SCNCLR command (clear screen)
+    antBeep,              // BEEP command (console bell: emits CHR(7))
     antBox,               // BOX command
     antCircle,            // CIRCLE command
     antDraw,              // DRAW command

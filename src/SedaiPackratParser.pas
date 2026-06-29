@@ -3937,6 +3937,8 @@ begin
     Result := TASTNode.Create(antPlay, Token)
   else if CmdName = 'FILTER' then
     Result := TASTNode.Create(antFilter, Token)
+  else if CmdName = 'BEEP' then
+    Result := TASTNode.Create(antBeep, Token)
   else
     Result := TASTNode.Create(antStatement, Token);
 
@@ -3962,6 +3964,8 @@ begin
     MaxParams := 5
   else if CmdName = 'PLAY' then
     MaxParams := 1  // Single string argument
+  else if CmdName = 'BEEP' then
+    MaxParams := 0  // No arguments (console bell)
   else
     MaxParams := 10;
 

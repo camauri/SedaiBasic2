@@ -1882,6 +1882,7 @@ begin
  RegisterKeyword(kSOUND,    ttSoundCommand, 'Outputs sound effects and musical notes',    kcSoundHandling);
  RegisterKeyword(kTEMPO,    ttSoundCommand, 'Define the speed of the song being played',  kcSoundHandling);
  RegisterKeyword(kVOL,      ttSoundCommand, 'Define output level of sound',               kcSoundHandling);
+ RegisterKeyword(kBEEP,     ttSoundCommand, 'Console bell (FreeBASIC/QB): emits CHR(7)',   kcSoundHandling);
  {$ENDIF}
 
  {$IFDEF WEB_MODE}

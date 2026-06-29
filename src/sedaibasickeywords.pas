@@ -338,6 +338,7 @@ const
   kCURDIR  = 'CURDIR';   kCURDIRS  = 'CURDIR$';   // FreeBASIC: current working directory
   kENVIRON = 'ENVIRON';  kENVIRONS = 'ENVIRON$';  // FreeBASIC: ENVIRON$(name) -> env var value
   kEXEPATH = 'EXEPATH';                            // FreeBASIC: directory of the running program
+  kBEEP    = 'BEEP';                                // FreeBASIC/QB: console bell (emits CHR(7))
   kFORMAT  = 'FORMAT';   kFORMATS  = 'FORMAT$';    // FreeBASIC: FORMAT(num, mask) -> formatted string
   kRANDOMIZE = 'RANDOMIZE'; // FreeBASIC/QB: seed the RNG (RANDOMIZE [seed])
   kVARPTR  = 'VARPTR';    // FreeBASIC: VARPTR(v) -> address of a variable (= @v) (intercepted as array-access)

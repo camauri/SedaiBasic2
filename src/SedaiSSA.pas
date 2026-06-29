@@ -388,6 +388,7 @@ type
     procedure ProcessLocate(Node: TASTNode);
     procedure ProcessGraphics(Node: TASTNode);
     procedure ProcessScnClr(Node: TASTNode);
+    procedure ProcessBeep(Node: TASTNode);   // BEEP: console bell (emit CHR(7), no newline)
     procedure ProcessColor(Node: TASTNode);
     procedure ProcessSetColor(Node: TASTNode);
     procedure ProcessWidth(Node: TASTNode);
@@ -7130,6 +7131,18 @@ begin
   // Emit ssaScnClr with mode (-1 = current, 0-5 = specific)
   EmitInstruction(ssaScnClr, MakeSSAValue(svkNone),
                  ModeReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessBeep(Node: TASTNode);
+// BEEP (FreeBASIC/QB): ring the console bell. Lowered to printing the BEL character (CHR 7) with no
+// newline — no dedicated opcode needed. On a terminal this beeps; headless it emits the byte.
+var
+  R: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+  R := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaLoadConstString, R, MakeSSAConstString(Chr(7)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), R, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
 { ProcessBox - Handle BOX command for drawing rectangles
@@ -14492,6 +14505,7 @@ begin
     antLocate: ProcessLocate(Node);
     antGraphics: ProcessGraphics(Node);
     antScnClr: ProcessScnClr(Node);
+    antBeep: ProcessBeep(Node);
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);
     antWidth: ProcessWidth(Node);
