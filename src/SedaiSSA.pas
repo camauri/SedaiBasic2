@@ -332,6 +332,8 @@ type
     function ObjectTypeName(ObjNode: TASTNode): string;
     procedure ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
                                 ArgsNode: TASTNode; out Result: TSSAValue);
+    function TryStaticMethodCall(ObjNode: TASTNode; const MethNm: string;     // TypeName.method(args) (static member, no instance)
+                                 ArgsNode: TASTNode; out CallResult: TSSAValue): Boolean;
     // Map parameter at Index (within ParamList) to its transfer-bank type and per-bank slot.
     function ParamBankAndSlot(ParamList: TASTNode; Index: Integer; out RT: TSSARegisterType): Integer;
     procedure EmitXferStore(RT: TSSARegisterType; Slot: Integer; const Val: TSSAValue);
@@ -3257,7 +3259,11 @@ begin
                                 Node.GetChild(1), Result);
               Exit;
             end;
-          end;
+          end
+          // Static member method: "TypeName.method(args)" with no instance (TypeName is a type, not a var).
+          else if TryStaticMethodCall(MethodObjNode, VarToStr(Node.GetChild(0).Value),
+                                      Node.GetChild(1), Result) then
+            Exit;
         end;
 
         // First child is array name
@@ -13702,6 +13708,31 @@ begin
   end;
 end;
 
+function TSSAGenerator.TryStaticMethodCall(ObjNode: TASTNode; const MethNm: string;
+  ArgsNode: TASTNode; out CallResult: TSSAValue): Boolean;
+// FreeBASIC static member method: "TypeName.method(args)" invoked WITHOUT an instance. ObjNode names a
+// declared UDT (not a variable). The method is invoked with a dummy THIS (handle 0) — a static method
+// does not dereference THIS, so the slot is harmless. Returns False when this is not a static-method
+// call (ObjNode is not a type name, or the type has no such method) so the caller can fall through.
+var
+  TypeName: string;
+  DummyThis: TASTNode;
+begin
+  Result := False;
+  CallResult := MakeSSAValue(svkNone);
+  if (ObjNode = nil) or (ObjNode.NodeType <> antIdentifier) then Exit;
+  TypeName := UpperCase(VarToStr(ObjNode.Value));
+  if FindUDT(TypeName) < 0 then Exit;                        // not a declared type name
+  if ResolveMethodLabel(TypeName, MethNm) = '' then Exit;    // type has no such method
+  DummyThis := TASTNode.CreateWithValue(antLiteral, 0, ObjNode.Token);
+  try
+    ProcessMethodCall(DummyThis, TypeName, MethNm, ArgsNode, CallResult);
+  finally
+    DummyThis.Free;
+  end;
+  Result := True;
+end;
+
 function TSSAGenerator.ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
   out TypeName: string): Boolean;
 var
@@ -13790,7 +13821,12 @@ begin
   Result := MakeSSAValue(svkNone);
   if Node.ChildCount < 1 then Exit;
   TypeName := ObjectTypeName(Node.GetChild(0));
-  if TypeName = '' then Exit;
+  if TypeName = '' then
+  begin
+    // Static member method called with no args via the type name: "TypeName.method".
+    TryStaticMethodCall(Node.GetChild(0), VarToStr(Node.Value), nil, Result);
+    Exit;
+  end;
   UDTIdx := FindUDT(TypeName);
   if not UDTFieldBankSlot(UDTIdx, VarToStr(Node.Value), Bank, Slot, NestedT) then
   begin
