@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 462 / 643 implemented (72%)** (+ 4 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 466 / 643 implemented (72%)**. **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **462 (81%)** are implemented. See the
+**572 applicable** keywords, **466 (81%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,7 +1254,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **462 / 643 implemented (72%)**, plus 4 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **466 / 643 implemented (72%)**.
 > Of the 177 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
 > linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **453 / 572 ≈ 79% of the
 > applicable keywords**.
@@ -1288,7 +1288,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `ENUM...END ENUM` | ✓ | Named integer constants (auto-increment) |
-| `TYPE...END TYPE` | ◐ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR` (overloaded by arity & type, default args, `BASE`). `PROPERTY` getter/setter, `OPERATOR` overloading. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope/block/global RAII. Heap instances via `NEW T`/`DELETE` reachable through `T PTR` (linked lists/trees). Still deferred: explicit `VIRTUAL`/`OVERRIDE`/`ABSTRACT` |
+| `TYPE...END TYPE` | ✓ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR` (overloaded by arity & type, default args, `BASE`). `PROPERTY` getter/setter, `OPERATOR` overloading. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope/block/global RAII. Heap instances via `NEW T`/`DELETE` reachable through `T PTR` (linked lists/trees). `EXTENDS Object` RTTI + `IS`. Static member methods & variables. Explicit `DECLARE [VIRTUAL\|ABSTRACT\|STATIC]` and `OVERRIDE` accepted (virtual dispatch is automatic via runtime type-id). |
 | `CLASS...END CLASS` | ✓ | Modelled as a `TYPE` (member access control is not enforced): fields, methods, arrays, construction all behave as for a record. |
 | `UNION...END UNION` | ✓ | Record whose members share storage. Overlap is faithful within a bank — members of the same type alias the same slot (write one, read another of the same type). Members in different banks (int/float/string) occupy distinct slots; cross-bank byte reinterpretation is not modelled (slot-based record model, v1). |
 | `EXTENDS` | ✓ | Single inheritance `TYPE Child EXTENDS Parent`: inherited fields (prefix layout) + methods + reference polymorphism (M4.2); virtual dispatch — an overridden method is selected by the instance's runtime type even through a base-typed variable (M4.3); inherited/ chained constructors & destructors (M4.4). |
@@ -1642,7 +1642,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Byref` | ◐ | Pass a parameter by reference. UDT parameters default to by-reference (handle, so the callee mutates the caller's object); explicit `BYREF` on scalars writes back to the caller's variable at every return (M13). `BYREF` function results (`min(a,b)=0`) supported. Standalone `Dim`/`Var` reference variables still deferred |
+| `Byref` | ✓ | Pass a parameter by reference: UDT params default to by-reference; explicit `BYREF` on scalars writes back to the caller's variable at every return (M13); `BYREF` function results (`min(a,b)=0`) supported. `DIM BYREF r AS T = target` reference variables work (batch 4). (`VAR`/`STATIC` reference-variable forms still deferred.) |
 | `Byval` | ✓ | Pass a parameter by value. Explicit `BYVAL` gives a UDT parameter its own copy (mutations don't reach the caller; the copy is destructed at frame exit); scalars are by value by default. |
 | `Any` | ✗ | N/A — native linkage / ABI directive; no native object output. |
 
@@ -1839,7 +1839,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `__FILE__ and __FILE_NQ__` | ◐ | `__FILE__` expands to the top-level source file name (string literal); `__FILE_NQ__` (no quotes) not implemented. |
+| `__FILE__ and __FILE_NQ__` | ✓ | `__FILE__` → top-level source file name (quoted string literal); `__FILE_NQ__` → the same name without the surrounding quotes (raw token). |
 | `__FUNCTION__ and __FUNCTION_NQ__` | ✗ | Defined as the name of the procedure where it's used. |
 | `__LINE__` | ✓ | Expands to the current source line number (1-based). |
 | `__FB_OPTION_BYVAL__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
@@ -2078,7 +2078,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `? (Shortcut for 'PRINT')` | ✗ | Writes text to the console. |
 | `PRINT USING` | ✓ |  |
 | `? USING (Shortcut for 'PRINT USING')` | ✗ | Writes formatted text to the console. |
-| `WRITE` | ◐ | `WRITE #n, ...` quoted-CSV file output (strings double-quoted, comma-separated). Console WRITE deferred. |
+| `WRITE` | ✓ | `WRITE #n, ...` quoted-CSV file output and console `WRITE v1, v2` (strings double-quoted, comma-separated). |
 | `SPC` | ✓ | Skips a number of spaces when writing text. |
 | `TAB` | ✓ | Skips to a certain column when writing text. |
 

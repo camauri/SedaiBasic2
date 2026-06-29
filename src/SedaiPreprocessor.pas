@@ -739,6 +739,8 @@ begin
     RegisterIntrinsicDefines(Defs);   // FreeBASIC compiler intrinsic defines (__FB_*__)
     // __FILE__ expands to the top-level source file name (string literal); empty if unknown.
     Defs.Values['__FILE__'] := '"' + FileName + '"';
+    // __FILE_NQ__: same file name WITHOUT the surrounding quotes (FreeBASIC "no quotes" form).
+    Defs.Values['__FILE_NQ__'] := FileName;
     // Compilation date/time intrinsics (string literals). SedaiBasic compiles-then-runs in one
     // process, so "compilation time" is captured here, once, when preprocessing starts.
     NowDT := Now;
