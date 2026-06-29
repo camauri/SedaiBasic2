@@ -231,6 +231,9 @@ type
     ssaPSave,          // PSAVE "filename": Save palette to JSON file
     ssaPRst,           // PRST: Reset palette to default
     ssaScnClr,         // SCNCLR [mode]: Clear screen (text or graphics)
+    ssaGfxScreenRes,   // SCREENRES w,h (FreeBASIC graphics, via IGraphicsBackend)
+    ssaGfxPset,        // PSET (x,y),color
+    ssaGfxPoint,       // POINT(x,y) -> color
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n
     ssaGraphicRwindow, // RWINDOW(n): Return window size info

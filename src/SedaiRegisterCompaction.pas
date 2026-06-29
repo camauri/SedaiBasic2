@@ -252,6 +252,7 @@ begin
     bcRsprite,        // RSPRITE(sprite, attr): sprite attribute (int)
     // === GROUP 10: Graphics ===
     bcGraphicRGBA,    // Dest = RGBA result (int)
+    bcGfxPoint,       // POINT(x,y): Dest = pixel color (int)
     bcGraphicRdot,    // Dest = pixel cursor info (int)
     bcGraphicGetMode, // Dest = current graphic mode (int)
     bcGraphicPos,     // POS(x): cursor column position (int)
@@ -454,6 +455,7 @@ begin
     bcGraphicWindow,  // Src1 = col1 register (int)
     bcGraphicCircle,  // Src1 = color register (int)
     bcGraphicPaint,   // Src1 = source register (int)
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint,  // FreeBASIC graphics slice: Src1 = w / x (int)
     bcGraphicSShape,  // Src1 = x1 coordinate (int)
     bcGraphicColor,   // Src1 = source register (int)
     bcGraphicWidth,   // Src1 = width value (int)
@@ -589,6 +591,7 @@ begin
     bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
     bcGraphicWindow,  // Src2 = row1 register (int)
     bcGraphicCircle,  // Src2 = x register (int)
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint,  // FreeBASIC graphics slice: Src2 = h / y (int)
     bcGraphicScale,   // Src2 = xmax register (int)
     bcGraphicColor,   // Src2 = color value (int)
     bcGraphicPaint,   // Src2 = x coordinate (int)
@@ -988,6 +991,10 @@ begin
 
     // FB_MEMCOPY/FB_MEMMOVE/CLEAR: Immediate contains the byte-count register index (int)
     if (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) then
+      MarkIntRegUsed(Instr.Immediate and $FFFF);
+
+    // PSET (x,y),color: Immediate contains the color register index (int)
+    if OpCode = bcGfxPset then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // bcGraphicWindow: Src1=col1, Src2=row1, Dest=col2, Immediate = (clear_reg << 16) | row2_reg
@@ -1453,7 +1460,8 @@ begin
     // bcDateSerial/bcTimeSerial: Immediate contains the 3rd arg (day/second) register index (int)
     if (OpCode = bcStrMid) or (OpCode = bcStrMidW) or
        (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) or
-       (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) then
+       (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) or
+       (OpCode = bcGfxPset) then
     begin
       OldReg := Instr.Immediate and $FFFF;
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then

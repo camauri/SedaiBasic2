@@ -197,6 +197,8 @@ type
     antMove,              // MOVE/MV command (move file)
     antGraphics,          // GRAPHIC command
     antScnClr,            // SCNCLR command (clear screen)
+    antScreenRes,         // SCREENRES w, h (FreeBASIC graphics)
+    antGfxPset,           // PSET (x, y) [, color] (FreeBASIC graphics)
     antBeep,              // BEEP command (console bell: emits CHR(7))
     antBox,               // BOX command
     antCircle,            // CIRCLE command

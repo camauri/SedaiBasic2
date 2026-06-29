@@ -396,6 +396,8 @@ type
     procedure ProcessGraphics(Node: TASTNode);
     procedure ProcessScnClr(Node: TASTNode);
     procedure ProcessBeep(Node: TASTNode);   // BEEP: console bell (emit CHR(7), no newline)
+    procedure ProcessScreenRes(Node: TASTNode);  // SCREENRES w, h (FreeBASIC graphics)
+    procedure ProcessGfxPset(Node: TASTNode);    // PSET (x, y) [, color]
     procedure ProcessColor(Node: TASTNode);
     procedure ProcessSetColor(Node: TASTNode);
     procedure ProcessWidth(Node: TASTNode);
@@ -2175,6 +2177,19 @@ begin
           else
             raise Exception.Create('RDOT requires 1 argument: RDOT(n) where n=0,1,2');
         end
+        else if FuncName = 'POINT' then
+        begin
+          // FreeBASIC POINT(x, y) -> pixel color (read from the graphics backend).
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
+            ProcessExpression(ArgListNode.GetChild(1), RVal);     RReg := EnsureIntRegister(RVal);
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaGfxPoint, Result, ArgReg, RReg, MakeSSAValue(svkNone));
+          end
+          else
+            raise Exception.Create('POINT requires 2 arguments: POINT(x, y)');
+        end
         else if FuncName = 'RGR' then
         begin
           // RGR(n) returns graphics mode info
@@ -2978,6 +2993,19 @@ begin
           else
             raise Exception.Create('RDOT requires 1 argument: RDOT(n) where n=0,1,2');
         end
+        else if FuncName = 'POINT' then
+        begin
+          // FreeBASIC POINT(x, y) -> pixel color (read from the graphics backend).
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
+            ProcessExpression(ArgListNode.GetChild(1), RVal);     RReg := EnsureIntRegister(RVal);
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaGfxPoint, Result, ArgReg, RReg, MakeSSAValue(svkNone));
+          end
+          else
+            raise Exception.Create('POINT requires 2 arguments: POINT(x, y)');
+        end
         else if FuncName = 'RGR' then
         begin
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
@@ -3494,6 +3522,22 @@ begin
           end;
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
           EmitInstruction(ssaStrFormat, Result, MaskReg, MakeSSAValue(svkNone), ArgReg);  // Src3=value float -> Immediate
+          Exit;
+        end;
+
+        // FreeBASIC POINT(x, y): read a pixel's colour from the graphics backend. Intercepted by name
+        // (POINT is NOT a reserved keyword, so "Point" stays usable as a type/array name). Only when it
+        // is not a declared array, UDT type, or user function.
+        if FModernMode and (UpperCase(ArrName) = kPOINT) and
+           (FProgram.FindArray(ArrName) < 0) and (FindUDT(UpperCase(ArrName)) < 0) and
+           (FProcedureNames.IndexOf(UpperCase(ArrName)) < 0) and
+           (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and
+           (Node.GetChild(1).ChildCount >= 2) then
+        begin
+          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
+          ProcessExpression(Node.GetChild(1).GetChild(1), MaskValue); MaskReg := EnsureIntRegister(MaskValue);
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaGfxPoint, Result, ArgReg, MaskReg, MakeSSAValue(svkNone));
           Exit;
         end;
 
@@ -7145,6 +7189,37 @@ begin
   // Emit ssaScnClr with mode (-1 = current, 0-5 = specific)
   EmitInstruction(ssaScnClr, MakeSSAValue(svkNone),
                  ModeReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessScreenRes(Node: TASTNode);
+// SCREENRES w, h : set the graphics screen resolution (routed to the graphics backend).
+var
+  WVal, HVal, WReg, HReg: TSSAValue;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 2) then Exit;
+  ProcessExpression(Node.GetChild(0), WVal); WReg := EnsureIntRegister(WVal);
+  ProcessExpression(Node.GetChild(1), HVal); HReg := EnsureIntRegister(HVal);
+  EmitInstruction(ssaGfxScreenRes, MakeSSAValue(svkNone), WReg, HReg, MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessGfxPset(Node: TASTNode);
+// PSET (x, y) [, color] : set a pixel. Children: x, y [, color]. Color in Src3 -> Immediate (int reg).
+var
+  XVal, YVal, CVal, XReg, YReg, CReg: TSSAValue;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 2) then Exit;
+  ProcessExpression(Node.GetChild(0), XVal); XReg := EnsureIntRegister(XVal);
+  ProcessExpression(Node.GetChild(1), YVal); YReg := EnsureIntRegister(YVal);
+  if Node.ChildCount >= 3 then
+  begin
+    ProcessExpression(Node.GetChild(2), CVal); CReg := EnsureIntRegister(CVal);
+  end
+  else
+  begin
+    CReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, CReg, MakeSSAConstInt(Int64($FFFFFFFF)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));  // default: white
+  end;
+  EmitInstruction(ssaGfxPset, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color -> Immediate
 end;
 
 procedure TSSAGenerator.ProcessBeep(Node: TASTNode);
@@ -14669,6 +14744,8 @@ begin
     antGraphics: ProcessGraphics(Node);
     antScnClr: ProcessScnClr(Node);
     antBeep: ProcessBeep(Node);
+    antScreenRes: ProcessScreenRes(Node);
+    antGfxPset: ProcessGfxPset(Node);
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);
     antWidth: ProcessWidth(Node);

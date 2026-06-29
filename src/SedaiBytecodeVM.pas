@@ -3109,6 +3109,25 @@ begin
           if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;  // mode
         end;
 
+        // FreeBASIC graphics slice: all int registers.
+        bcGfxScreenRes:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // w
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // h
+        end;
+        bcGfxPset:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // x
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // y
+          if Instr.Immediate > MaxIntReg then MaxIntReg := Instr.Immediate;  // color reg
+        end;
+        bcGfxPoint:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // color result
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // x
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // y
+        end;
+
         // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
         // Immediate bits 0-15 = row2 register(int), bits 16-31 = clear register(int)
         bcGraphicWindow:
@@ -6423,6 +6442,19 @@ begin
     24: // bcPRst - PRST (reset palette to C64 default)
       if Assigned(FOutputDevice) then
         FOutputDevice.ResetPalette;
+    // FreeBASIC graphics (phase 1 slice) routed through the IGraphicsBackend abstraction.
+    25: // bcGfxScreenRes - SCREENRES w, h
+      if Assigned(FGraphics) then
+        FGraphics.ResizeScreen(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], 0);
+    26: // bcGfxPset - PSET (x,y), color  (color in Immediate float-free int register)
+      if Assigned(FGraphics) then
+        FGraphics.SetPixel(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+                           UInt32(Ctx.IntRegs[Instr.Immediate]));
+    27: // bcGfxPoint - POINT(x, y) -> color
+      if Assigned(FGraphics) then
+        Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.GetPixel(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]))
+      else
+        Ctx.IntRegs[Instr.Dest] := 0;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

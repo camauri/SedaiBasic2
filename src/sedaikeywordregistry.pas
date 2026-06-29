@@ -1853,6 +1853,11 @@ begin
  RegisterKeyword(kRDOT,    ttGraphicsFunction, 'Return current position or color of pixel cursor', kcGraphicsHandling);
  RegisterKeyword(kRGR,     ttGraphicsFunction, 'Return current graphic mode',                      kcGraphicsHandling);
  RegisterKeyword(kRGBA,    ttGraphicsFunction, 'Create 32-bit RGBA color value',                   kcGraphicsHandling);
+ // NOTE: POINT is intentionally NOT registered (it is a very common identifier/type name, e.g. TYPE
+ // Point). It is intercepted by name as POINT(x,y) in the array-access path, only when it is not a
+ // declared type/array/function — so user code may still use "Point" as a type.
+ RegisterKeyword(kSCREENRES, ttGraphicsCommand, 'FreeBASIC: set graphics screen resolution',        kcGraphicsHandling);
+ RegisterKeyword(kPSET,    ttGraphicsCommand, 'FreeBASIC: set a pixel, PSET (x,y),color',           kcGraphicsHandling);
  RegisterKeyword(kRWINDOW, ttInputFunction,    'Return the size of the current text window',       kcStdIO);
 
  // === SPRITES HANDLING (COMMANDS AND FUNCTIONS) ===

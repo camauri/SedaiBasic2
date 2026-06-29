@@ -371,6 +371,9 @@ begin
     ssaPSave: Result := bcPSave;
     ssaPRst: Result := bcPRst;
     ssaScnClr: Result := bcScnClr;
+    ssaGfxScreenRes: Result := bcGfxScreenRes;
+    ssaGfxPset: Result := bcGfxPset;
+    ssaGfxPoint: Result := bcGfxPoint;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;
     ssaGraphicRwindow: Result := bcGraphicRwindow;

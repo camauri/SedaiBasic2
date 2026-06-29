@@ -3685,11 +3685,33 @@ begin
     Result := TASTNode.Create(antPSave, Token)
   else if CmdName = 'PRST' then
     Result := TASTNode.Create(antPRst, Token)
+  else if CmdName = 'SCREENRES' then
+    Result := TASTNode.Create(antScreenRes, Token)
+  else if CmdName = 'PSET' then
+    Result := TASTNode.Create(antGfxPset, Token)
   else
     Result := TASTNode.Create(antStatement, Token);
 
   Context.Advance;
   ParamCount := 0;
+
+  // FreeBASIC PSET (x, y) [, color]: the coordinate pair is parenthesised, so parse it explicitly
+  // rather than via the generic comma-separated parameter loop below.
+  if CmdName = 'PSET' then
+  begin
+    if Context.Check(ttDelimParOpen) then Context.Advance;        // '('
+    Result.AddChild(ParseExpression);                             // x
+    if Context.Check(ttSeparParam) then Context.Advance;          // ','
+    Result.AddChild(ParseExpression);                             // y
+    if Context.Check(ttDelimParClose) then Context.Advance;       // ')'
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;                                            // ','
+      Result.AddChild(ParseExpression);                           // color
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
 
   // Set max parameters based on command
   if CmdName = 'CIRCLE' then
@@ -3726,6 +3748,8 @@ begin
     MaxParams := 1  // PSAVE "filename"
   else if CmdName = 'PRST' then
     MaxParams := 0  // PRST (no parameters)
+  else if CmdName = 'SCREENRES' then
+    MaxParams := 2  // SCREENRES w, h
   else
     MaxParams := 5;
 

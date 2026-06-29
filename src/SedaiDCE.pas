@@ -358,7 +358,8 @@ begin
     ssaChar,  // CHAR mode, col, row, text - writes to screen
     ssaGraphicSetMode, ssaGraphicBox, ssaGraphicCircle, ssaGraphicDraw, ssaGraphicLocate,
     ssaGraphicColor, ssaSetColor, ssaGraphicWidth, ssaGraphicScale, ssaGraphicPaint, ssaGraphicWindow,
-    ssaGraphicSShape, ssaGraphicGShape, ssaGraphicGList, ssaPLoad, ssaPSave, ssaPRst, ssaScnClr:
+    ssaGraphicSShape, ssaGraphicGShape, ssaGraphicGList, ssaPLoad, ssaPSave, ssaPRst, ssaScnClr,
+    ssaGfxScreenRes, ssaGfxPset:
       Result := True;
 
     // Sprite operations - always live (modify sprite state)

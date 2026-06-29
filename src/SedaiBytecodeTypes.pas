@@ -547,6 +547,10 @@ const
   bcPLoad           = bcGroupGraphics + 22;  // PLOAD "filename" - Load palette from JSON
   bcPSave           = bcGroupGraphics + 23;  // PSAVE "filename" - Save palette to JSON
   bcPRst            = bcGroupGraphics + 24;  // PRST - Reset palette to C64 default
+  // FreeBASIC graphics (phase 1 slice — routed through IGraphicsBackend)
+  bcGfxScreenRes    = bcGroupGraphics + 25;  // SCREENRES w,h : Src1=w, Src2=h
+  bcGfxPset         = bcGroupGraphics + 26;  // PSET (x,y),color : Src1=x, Src2=y, Immediate=color reg
+  bcGfxPoint        = bcGroupGraphics + 27;  // POINT(x,y) : Dest=color, Src1=x, Src2=y
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1618,6 +1622,9 @@ begin
         22: Result := 'PLoad';
         23: Result := 'PSave';
         24: Result := 'PRst';
+        25: Result := 'GfxScreenRes';
+        26: Result := 'GfxPset';
+        27: Result := 'GfxPoint';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;
