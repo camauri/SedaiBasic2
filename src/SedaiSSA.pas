@@ -218,6 +218,7 @@ type
     function ProcedureLabelName(const Name: string): string;
     // UDT/record support (M3)
     procedure RegisterUDTs(Node: TASTNode);        // pre-scan TYPE declarations (2 passes)
+    procedure EnsureObjectBaseType;                // OOP: register the built-in empty OBJECT base type (RTTI root)
     procedure CollectUDTNames(Node: TASTNode);     // pass 1: register type names (empty)
     procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
@@ -11322,8 +11323,29 @@ end;
 procedure TSSAGenerator.RegisterUDTs(Node: TASTNode);
 // Two passes so a TYPE may reference another TYPE declared later (forward reference).
 begin
+  EnsureObjectBaseType;    // OOP: the built-in OBJECT base type must exist before TYPE names are collected
   CollectUDTNames(Node);   // pass 1: all type names known
   FillUDTFields(Node);     // pass 2: resolve fields (incl. nested-UDT fields)
+end;
+
+procedure TSSAGenerator.EnsureObjectBaseType;
+// FreeBASIC OBJECT: the built-in base type that provides RTTI. We model it as an empty UDT (no fields)
+// so that "TYPE X EXTENDS Object" has a real (harmless) base, "X IS Object" is true for any derived
+// type (IsSubtypeOf walks to OBJECT), and "DIM v AS Object" declares a generic object handle. Our
+// virtual dispatch is type-id based, so no actual vtable pointer field is needed.
+var
+  n: Integer;
+begin
+  if FindUDT('OBJECT') >= 0 then Exit;
+  n := Length(FUDTs);
+  SetLength(FUDTs, n + 1);
+  FUDTs[n].Name := 'OBJECT';
+  SetLength(FUDTs[n].Fields, 0);
+  FUDTs[n].NInt := 0; FUDTs[n].NFloat := 0; FUDTs[n].NStr := 0;
+  FUDTs[n].Parent := '';
+  FUDTs[n].Node := nil;
+  FUDTs[n].Filled := True;     // empty: nothing to fill
+  FUDTs[n].IsUnion := False;
 end;
 
 procedure TSSAGenerator.CollectUDTNames(Node: TASTNode);
