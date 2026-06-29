@@ -278,6 +278,7 @@ type
     function RawAlloc(ByteCount: PtrUInt): Int64;
     function StrSAdd(const S: string): Int64;   // SADD(s) -> raw pointer to a NUL-terminated byte copy
     function FormatNumber(Value: Double; const Mask: string): string;  // FORMAT(num, mask) -> formatted string (numeric masks)
+    function FormatDateMask(Value: Double; const Mask: string): string;  // FORMAT(serial, mask) -> date/time formatted string
     function FileLength(const Path: string): Int64;   // FILELEN(path) -> file size in bytes (0 if absent)
     procedure RawFree(RawPtr: Int64);
     function RawRealloc(RawPtr: Int64; ByteCount: PtrUInt): Int64;
@@ -1546,6 +1547,7 @@ function TBytecodeVM.FormatNumber(Value: Double; const Mask: string): string;
 var
   M: string;
   pctCount, i, ePos: Integer;
+  hasNum, hasDate: Boolean;
 
   function ProcLiteral(const S: string): string;
   var k: Integer; ch: Char;
@@ -1684,6 +1686,14 @@ begin
     Exit;
   end;
   M := Mask;
+  // Date/time mask: no numeric placeholders (0/#) but contains date/time letters -> format as a date.
+  hasNum := False; hasDate := False;
+  for i := 1 to Length(M) do
+  begin
+    if (M[i] = '0') or (M[i] = '#') then hasNum := True;
+    if UpCase(M[i]) in ['D', 'M', 'Y', 'H', 'S', 'N'] then hasDate := True;
+  end;
+  if (not hasNum) and hasDate then Exit(FormatDateMask(Value, M));
   pctCount := 0;
   for i := 1 to Length(M) do if M[i] = '%' then Inc(pctCount);
   for i := 1 to pctCount do Value := Value * 100;
@@ -1693,6 +1703,152 @@ begin
     begin ePos := i; Break; end;
   if ePos > 0 then Result := Scientific(Value, M, ePos)
   else Result := FixedPoint(Value, M);
+end;
+
+// FreeBASIC FORMAT with a date/time mask: the value is a TDateTime serial (FB serial == FPC TDateTime,
+// epoch 1899-12-30). Supported tokens: d/dd/ddd/dddd/ddddd, m/mm/mmm/mmmm (month) or minute when in a
+// time context, M/MM (always month), n/nn (minute), y/yy/yyyy, h/hh, s/ss, ttttt, AM/PM | A/P (12-hour),
+// ':' and '/' separators, "..." and \x literals. (English month/day names, like MONTHNAME/WEEKDAYNAME.)
+function TBytecodeVM.FormatDateMask(Value: Double; const Mask: string): string;
+var
+  y, mo, d, h, mi, s, ms: Word;
+  wd, i, runLen, h12: Integer;
+  c, cl: Char;
+  timeCtx, hasAMPM, pm: Boolean;
+
+  function Pad2(v: Integer): string;
+  begin Result := IntToStr(v); if Length(Result) < 2 then Result := '0' + Result; end;
+
+  function MonName(n: Integer; full: Boolean): string;
+  begin
+    case n of
+      1: Result := 'January';  2: Result := 'February'; 3: Result := 'March';     4: Result := 'April';
+      5: Result := 'May';      6: Result := 'June';     7: Result := 'July';      8: Result := 'August';
+      9: Result := 'September'; 10: Result := 'October'; 11: Result := 'November'; 12: Result := 'December';
+    else Result := '';
+    end;
+    if (not full) and (Length(Result) > 3) then Result := Copy(Result, 1, 3);
+  end;
+
+  function DayName(n: Integer; full: Boolean): string;   // n: 1=Sunday .. 7=Saturday
+  begin
+    case n of
+      1: Result := 'Sunday';   2: Result := 'Monday'; 3: Result := 'Tuesday'; 4: Result := 'Wednesday';
+      5: Result := 'Thursday'; 6: Result := 'Friday'; 7: Result := 'Saturday';
+    else Result := '';
+    end;
+    if (not full) and (Length(Result) > 3) then Result := Copy(Result, 1, 3);
+  end;
+
+begin
+  DecodeDate(Value, y, mo, d);
+  DecodeTime(Value, h, mi, s, ms);
+  wd := DayOfWeek(Value);                       // 1=Sunday .. 7=Saturday
+  hasAMPM := (Pos('AM/PM', UpperCase(Mask)) > 0) or (Pos('A/P', UpperCase(Mask)) > 0);
+  pm := h >= 12;
+  h12 := h mod 12; if h12 = 0 then h12 := 12;
+  Result := '';
+  timeCtx := False;
+  i := 1;
+  // NOTE: do NOT use the `Continue` loop keyword here — TBytecodeVM has a method named Continue (CONT)
+  // that would shadow it and run instead. The body is an if/else chain that increments i per branch.
+  while i <= Length(Mask) do
+  begin
+    c := Mask[i];
+    cl := UpCase(c);
+    if (c = '\') and (i < Length(Mask)) then
+    begin
+      Result := Result + Mask[i+1]; Inc(i, 2);
+    end
+    else if c = '"' then
+    begin
+      Inc(i);
+      while (i <= Length(Mask)) and (Mask[i] <> '"') do begin Result := Result + Mask[i]; Inc(i); end;
+      if i <= Length(Mask) then Inc(i);   // skip the closing quote
+    end
+    else if hasAMPM and (cl = 'A') and (i + 4 <= Length(Mask)) and (UpperCase(Copy(Mask, i, 5)) = 'AM/PM') then
+    begin
+      if pm then Result := Result + 'PM' else Result := Result + 'AM'; Inc(i, 5);
+    end
+    else if hasAMPM and ((cl = 'A') or (cl = 'P')) and (i + 2 <= Length(Mask)) and (UpperCase(Copy(Mask, i, 3)) = 'A/P') then
+    begin
+      if pm then Result := Result + 'P' else Result := Result + 'A'; Inc(i, 3);
+    end
+    else
+    begin
+    // run of the same letter (case-insensitive)
+    runLen := 1;
+    while (i + runLen <= Length(Mask)) and (UpCase(Mask[i + runLen]) = cl) do Inc(runLen);
+    case cl of
+      'D':
+        begin
+          if runLen = 1 then Result := Result + IntToStr(d)
+          else if runLen = 2 then Result := Result + Pad2(d)
+          else if runLen = 3 then Result := Result + DayName(wd, False)
+          else if runLen = 4 then Result := Result + DayName(wd, True)
+          else Result := Result + Pad2(mo) + '/' + Pad2(d) + '/' + IntToStr(y);   // ddddd: complete date
+          timeCtx := False; Inc(i, runLen);
+        end;
+      'M':
+        begin
+          if (c = 'M') or (not timeCtx) then           // 'M' always month; 'm' is month unless in a time context
+          begin
+            if runLen = 1 then Result := Result + IntToStr(mo)
+            else if runLen = 2 then Result := Result + Pad2(mo)
+            else if runLen = 3 then Result := Result + MonName(mo, False)
+            else Result := Result + MonName(mo, True);
+            timeCtx := False;
+          end
+          else
+          begin
+            if runLen = 1 then Result := Result + IntToStr(mi) else Result := Result + Pad2(mi);
+            timeCtx := True;
+          end;
+          Inc(i, runLen);
+        end;
+      'N':
+        begin
+          if runLen = 1 then Result := Result + IntToStr(mi) else Result := Result + Pad2(mi);
+          timeCtx := True; Inc(i, runLen);
+        end;
+      'Y':
+        begin
+          if runLen >= 3 then Result := Result + IntToStr(y) else Result := Result + Pad2(y mod 100);
+          timeCtx := False; Inc(i, runLen);
+        end;
+      'H':
+        begin
+          if hasAMPM then
+          begin
+            if runLen = 1 then Result := Result + IntToStr(h12) else Result := Result + Pad2(h12);
+          end
+          else
+          begin
+            if runLen = 1 then Result := Result + IntToStr(h) else Result := Result + Pad2(h);
+          end;
+          timeCtx := True; Inc(i, runLen);
+        end;
+      'S':
+        begin
+          if runLen = 1 then Result := Result + IntToStr(s) else Result := Result + Pad2(s);
+          timeCtx := True; Inc(i, runLen);
+        end;
+      'T':
+        begin
+          if runLen >= 5 then Result := Result + Pad2(h) + ':' + Pad2(mi) + ':' + Pad2(s)  // ttttt: complete time
+          else Result := Result + Copy(Mask, i, runLen);
+          Inc(i, runLen);
+        end;
+    else
+      begin
+        Result := Result + c;
+        if c = ':' then timeCtx := True
+        else if c = '/' then timeCtx := False;
+        Inc(i);
+      end;
+    end;   // case
+    end;   // else (non-literal/non-AMPM token branch)
+  end;     // while
 end;
 
 function TBytecodeVM.FileLength(const Path: string): Int64;

@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 461 / 643 implemented (72%)** (+ 5 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 462 / 643 implemented (72%)** (+ 4 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **461 (81%)** are implemented. See the
+**572 applicable** keywords, **462 (81%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,7 +1254,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **461 / 643 implemented (72%)**, plus 5 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **462 / 643 implemented (72%)**, plus 4 partial (◐).
 > Of the 177 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
 > linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **453 / 572 ≈ 79% of the
 > applicable keywords**.
@@ -2330,7 +2330,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `WOCT` | ✓ | `WOCT(n)` — octal wide string of an integer. |
 | `STR` | ✓ | `STR(n)` (bare FB form) routed to `STR$`. |
 | `WSTR` | ✓ | Returns the WString representation of a numeric value (or widens a string). |
-| `FORMAT` | ◐ | `FORMAT(num [, mask])` / `FORMAT$` → formatted string. Numeric masks supported: `0`/`#` digit placeholders, `.`, `,` grouping, `%`, scientific `E+`/`E-`/`e+`/`e-`, literals (`\x`, `"..."`). Date/time masks (d/m/y/h/s) not yet handled. |
+| `FORMAT` | ✓ | `FORMAT(num [, mask])` / `FORMAT$` → formatted string. Numeric masks (`0`/`#`, `.`, `,` grouping, `%`, scientific `E±`, literals) **and** date/time masks (`d`/`dd`/`ddd`/`dddd`, `m`/`mm`/`mmm`/`mmmm` & minute-after-`h`, `n`, `y`/`yy`/`yyyy`, `h`/`hh`, `s`/`ss`, `ttttt`, `AM/PM`/`A/P`, `:` `/` separators). English month/day names. |
 
 #### String to Numeric Conversions
 
