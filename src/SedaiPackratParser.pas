@@ -4000,7 +4000,7 @@ begin
     'DOPEN', 'OPEN': Result := TASTNode.Create(antDopen, Token);
     'DCLOSE', 'CLOSE': Result := TASTNode.Create(antDclose, Token);
     'APPEND': Result := TASTNode.Create(antAppend, Token);
-    'DCLEAR': Result := TASTNode.Create(antDclear, Token);
+    'DCLEAR', 'RESET': Result := TASTNode.Create(antDclear, Token);  // RESET (FreeBASIC) unbinds all file numbers = DCLEAR
     'RECORD': Result := TASTNode.Create(antRecord, Token);
   else
     Result := TASTNode.Create(antStatement, Token); // Other file commands
@@ -4166,9 +4166,9 @@ begin
     Exit;
   end;
 
-  // Special handling for DCLEAR (close all channels)
-  // Syntax: DCLEAR
-  if CmdName = 'DCLEAR' then
+  // Special handling for DCLEAR / RESET (close all channels)
+  // Syntax: DCLEAR  (FreeBASIC RESET is the same: unbind all file numbers)
+  if (CmdName = 'DCLEAR') or (CmdName = 'RESET') then
   begin
     // No parameters needed
     DoNodeCreated(Result);

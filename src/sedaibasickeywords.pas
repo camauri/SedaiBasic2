@@ -197,6 +197,7 @@ const
   kDELETE  = 'DELETE';
   kRENAME  = 'RENAME';
   kDCLEAR  = 'DCLEAR';
+  kRESET   = 'RESET';        // FreeBASIC: unbind all file numbers (= DCLEAR)
   kDCLOSE  = 'DCLOSE';
   kCONCAT  = 'CONCAT';
   kCOPY    = 'COPY';

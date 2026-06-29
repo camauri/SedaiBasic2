@@ -1750,6 +1750,7 @@ begin
  RegisterKeyword(kCOPY,      ttFileManagement, 'Copy file from drive to drive',            kcDOSCommands);
  RegisterKeyword(kCP,        ttFileManagement, 'Copy file (alias for COPY)',               kcDOSCommands);
  RegisterKeyword(kDCLEAR,    ttFileOperation,  'Clear all open channels on disk drive',    kcDOSCommands);
+ RegisterKeyword(kRESET,     ttFileOperation,  'FreeBASIC: unbind all file numbers (= DCLEAR)', kcDOSCommands);
  RegisterKeyword(kDCLOSE,    ttFileOperation,  'Close disk drive file(s)',                 kcDOSCommands);
  RegisterKeyword(kDIR,       ttFileManagement, 'Display drive directory (alias)',          kcDOSCommands);
  RegisterKeyword(kDIRECTORY, ttFileManagement, 'Display drive directory',                  kcDOSCommands);

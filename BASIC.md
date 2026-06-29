@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 453 / 643 implemented (70%)** (+ 5 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 454 / 643 implemented (71%)** (+ 5 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **453 (79%)** are implemented. See the
+**572 applicable** keywords, **454 (79%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,8 +1254,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **453 / 643 implemented (70%)**, plus 5 partial (◐).
-> Of the 185 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> **Coverage (FreeBASIC keyword set):** **454 / 643 implemented (71%)**, plus 5 partial (◐).
+> Of the 184 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
 > linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **453 / 572 ≈ 79% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
@@ -2153,7 +2153,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `OPEN PIPE` | ✓ | Binds a file number to the input and output streams of a process. |
 | `OPEN SCRN` | ✓ | Binds a file number directly to the console. |
 | `CLOSE` | ✓ | Unbinds a file number from a file or device. |
-| `RESET` | ✗ | Unbinds all active file numbers. |
+| `RESET` | ✓ | Unbinds all active file numbers (closes every open handle; alias of DCLEAR). |
 | `INPUT (File Mode)` | ✓ | Text data can be read from the file. |
 | `OUTPUT` | ✗ | Text data can be written to the file. |
 | `APPEND` | ✓ | Text data is added to the end of a file when output. |

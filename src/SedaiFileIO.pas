@@ -62,6 +62,9 @@ var
   FileMode: Word;
 begin
   ErrorCode := 0;
+  // DCLEAR / RESET: close every open handle. Signalled with Handle 0, so it must be handled before
+  // the per-handle range check below (which would otherwise reject Handle 0 with error 64).
+  if Command = 'DCLEAR' then begin CloseAll; Exit; end;
   if (Handle < 1) or (Handle > 15) then begin ErrorCode := 64; Exit; end;
 
   if Command = 'DOPEN' then
