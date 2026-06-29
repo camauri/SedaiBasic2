@@ -2504,6 +2504,31 @@ begin
     FExpressionParser.ParseExpression(precCall).Free;  // consume & discard the alignment value
   end;
 
+  // FreeBASIC IMPLEMENTS clause: "TYPE name [EXTENDS base] IMPLEMENTS iface[, iface...]". Interfaces are
+  // a RESERVED-but-UNIMPLEMENTED FreeBASIC feature (the compiler itself does not implement them — the
+  // manual's Implements page is a stub), so we accept and ignore the clause: the type behaves as an
+  // ordinary UDT, matching FB. IMPLEMENTS is not reserved here (it tokenizes as an identifier).
+  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'IMPLEMENTS') then
+  begin
+    Context.Advance;                                // consume IMPLEMENTS
+    repeat
+      // consume one (possibly dotted) interface name
+      if Context.Check(ttIdentifier) or
+         ((Length(VarToStr(Context.CurrentToken.Value)) > 0) and
+          (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_'])) then
+        Context.Advance
+      else
+        Break;
+      while Context.Check(ttOpDot) and Assigned(Context.PeekNext) do
+      begin
+        Context.Advance;                            // '.'
+        Context.Advance;                            // dotted segment
+      end;
+      if Context.Check(ttSeparParam) then Context.Advance   // ',' -> another interface
+      else Break;
+    until False;
+  end;
+
   while not Context.Check(ttEndOfFile) do
   begin
     if Context.Match(ttEndOfLine) then Continue;

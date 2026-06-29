@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 458 / 643 implemented (71%)** (+ 5 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 459 / 643 implemented (71%)** (+ 5 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **458 (80%)** are implemented. See the
+**572 applicable** keywords, **459 (80%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,8 +1254,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **458 / 643 implemented (71%)**, plus 5 partial (◐).
-> Of the 180 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> **Coverage (FreeBASIC keyword set):** **459 / 643 implemented (71%)**, plus 5 partial (◐).
+> Of the 179 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
 > linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **453 / 572 ≈ 79% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
@@ -1294,7 +1294,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `EXTENDS` | ✓ | Single inheritance `TYPE Child EXTENDS Parent`: inherited fields (prefix layout) + methods + reference polymorphism (M4.2); virtual dispatch — an overridden method is selected by the instance's runtime type even through a base-typed variable (M4.3); inherited/ chained constructors & destructors (M4.4). |
 | `EXTENDS WSTRING` | ✗ | Extends an user defined type to inherits Wstring behavior |
 | `EXTENDS ZSTRING` | ✗ | Extends an user defined type to inherits Zstring behavior |
-| `IMPLEMENTS` | ✗ | Not implemented. Keyword reserved. |
+| `IMPLEMENTS` | ✓ | `TYPE name [EXTENDS base] IMPLEMENTS iface[, ...]` clause accepted and ignored — interfaces are a reserved-but-unimplemented FB feature (the FB compiler itself does not implement them), so the type behaves as an ordinary UDT, matching FB. |
 | `FIELD` | ✓ | `TYPE name FIELD = n` alignment header — accepted and ignored (advisory in the slot-based record model). |
 | `OBJECT` | ✗ | Built-in type providing run-time type information |
 
