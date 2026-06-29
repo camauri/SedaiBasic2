@@ -143,6 +143,8 @@ type
     FRawHeapLock: TRTLCriticalSection;
     FProgram: TBytecodeProgram;
     FOutputDevice: IOutputDevice;
+    FGraphics: IGraphicsBackend;     // FreeBASIC graphics phase: operation-level drawing backend (SW headless / SDL2 on sbv)
+    FOwnedGraphics: TObject;         // concrete backend object the VM owns and frees (e.g. the software backend on sb)
     FInputDevice: IInputDevice;
     FMemoryMapper: IMemoryMapper;  // Memory-mapped PEEK/POKE support
     FConsoleBehavior: TConsoleBehavior;
@@ -313,6 +315,10 @@ type
     procedure LoadProgram(Program_: TBytecodeProgram);
     procedure ClearProgram;  // Clear program reference (use before freeing the program externally)
     procedure SetOutputDevice(Device: IOutputDevice);
+    // FreeBASIC graphics backend. OwnedObj (optional) is the concrete object the VM should free on
+    // destruction (used for the software backend on sb; pass nil for the SDL2 device owned elsewhere).
+    procedure SetGraphicsBackend(Backend: IGraphicsBackend; OwnedObj: TObject = nil);
+    procedure UseSoftwareGraphics;  // attach a VM-owned headless software graphics backend (CLI / bare-metal)
     procedure SetInputDevice(Device: IInputDevice);
     procedure SetMemoryMapper(Mapper: IMemoryMapper);
     procedure SetSpriteManager(Manager: ISpriteManager);
@@ -670,6 +676,8 @@ begin
   {$ENDIF}
   if FOwnsConsoleBehavior and Assigned(FConsoleBehavior) then
     FConsoleBehavior.Free;
+  if Assigned(FOwnedGraphics) then
+    FreeAndNil(FOwnedGraphics);   // free a VM-owned graphics backend (e.g. the software backend on sb)
   FVarMap.Free;
   // M5.2: join any worker still running, then free its spawn record + context.
   CleanupWorkers;
@@ -3215,6 +3223,22 @@ end;
 procedure TBytecodeVM.SetOutputDevice(Device: IOutputDevice);
 begin
   FOutputDevice := Device;
+end;
+
+procedure TBytecodeVM.SetGraphicsBackend(Backend: IGraphicsBackend; OwnedObj: TObject = nil);
+begin
+  if Assigned(FOwnedGraphics) and (FOwnedGraphics <> OwnedObj) then
+    FreeAndNil(FOwnedGraphics);
+  FGraphics := Backend;
+  FOwnedGraphics := OwnedObj;
+end;
+
+procedure TBytecodeVM.UseSoftwareGraphics;
+var
+  SW: TSoftwareGraphicsBackend;
+begin
+  SW := TSoftwareGraphicsBackend.Create;
+  SetGraphicsBackend(SW, SW);
 end;
 
 procedure TBytecodeVM.SetInputDevice(Device: IInputDevice);

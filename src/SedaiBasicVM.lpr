@@ -1526,6 +1526,7 @@ begin
     {$ENDIF}
     try
       VM.SetOutputDevice(Output);
+      VM.UseSoftwareGraphics;  // headless software graphics backend (POINT/GET work; no display)
       VM.SetInputDevice(Input);
       VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
       VM.LoadProgram(BytecodeProgram);
@@ -1772,6 +1773,7 @@ begin
       {$ENDIF}
       try
         VM.SetOutputDevice(Output);
+        VM.UseSoftwareGraphics;  // headless software graphics backend (POINT/GET work; no display)
         VM.SetInputDevice(Input);
         VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
         VM.LoadProgram(BytecodeProgram);
