@@ -2492,6 +2492,17 @@ begin
     end;
   end;
 
+  // FreeBASIC field alignment header: "TYPE name [EXTENDS base] FIELD = n". Advisory in our slot-based
+  // record model (no exposed byte layout) — accept and ignore the alignment value. FIELD is not a
+  // reserved word; require the following '=' so a member named "field" (in the body) is unaffected.
+  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'FIELD') and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpEq) then
+  begin
+    Context.Advance;                                // consume FIELD
+    Context.Advance;                                // consume '='
+    FExpressionParser.ParseExpression(precCall).Free;  // consume & discard the alignment value
+  end;
+
   while not Context.Check(ttEndOfFile) do
   begin
     if Context.Match(ttEndOfLine) then Continue;

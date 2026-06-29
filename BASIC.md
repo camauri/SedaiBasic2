@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 454 / 643 implemented (71%)** (+ 5 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 455 / 643 implemented (71%)** (+ 5 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **454 (79%)** are implemented. See the
+**572 applicable** keywords, **455 (80%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,8 +1254,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **454 / 643 implemented (71%)**, plus 5 partial (◐).
-> Of the 184 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> **Coverage (FreeBASIC keyword set):** **455 / 643 implemented (71%)**, plus 5 partial (◐).
+> Of the 183 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
 > linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **453 / 572 ≈ 79% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
@@ -1295,7 +1295,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `EXTENDS WSTRING` | ✗ | Extends an user defined type to inherits Wstring behavior |
 | `EXTENDS ZSTRING` | ✗ | Extends an user defined type to inherits Zstring behavior |
 | `IMPLEMENTS` | ✗ | Not implemented. Keyword reserved. |
-| `FIELD` | ✗ | Specifies field alignment within a user defined type |
+| `FIELD` | ✓ | `TYPE name FIELD = n` alignment header — accepted and ignored (advisory in the slot-based record model). |
 | `OBJECT` | ✗ | Built-in type providing run-time type information |
 
 ##### Referencing
