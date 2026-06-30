@@ -464,7 +464,7 @@ end;
 
 function TTerminalController.GetPixelIndex(X, Y: Integer): TPaletteIndex;
 begin
-  Result := 0;   // RDOT(2) colour readback not tracked in viewport-only mode
+  if FGfxMem <> nil then Result := FGfxMem.GetPixelIndex(X, Y) else Result := 0;
 end;
 
 procedure TTerminalController.EnablePalette(Enable: Boolean);
