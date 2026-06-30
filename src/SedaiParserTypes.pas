@@ -209,6 +209,7 @@ type
     antGfxGet,            // GET (x1,y1)-(x2,y2), dst (FreeBASIC: capture screen rect to image)
     antGfxPut,            // PUT (x,y), src [, mode] (FreeBASIC: blit image to screen)
     antScreenInfo,        // SCREENINFO w, h [, depth, bpp, pitch, rate] (FreeBASIC)
+    antGfxNop,            // accept-and-ignore graphics sync/window primitive (SCREENLOCK/UNLOCK/SYNC/WINDOWTITLE)
     antBeep,              // BEEP command (console bell: emits CHR(7))
     antBox,               // BOX command
     antCircle,            // CIRCLE command

@@ -424,6 +424,10 @@ const
   kIMAGEDESTROY = 'IMAGEDESTROY';  // FreeBASIC: free an image surface
   kIMAGEINFO    = 'IMAGEINFO';     // FreeBASIC: query an image surface (width/height)
   kSCREENINFO   = 'SCREENINFO';    // FreeBASIC: query the current graphics screen (width/height/depth)
+  kSCREENLOCK   = 'SCREENLOCK';    // FreeBASIC: begin direct screen access (no-op on the buffered backend)
+  kSCREENUNLOCK = 'SCREENUNLOCK';  // FreeBASIC: end direct screen access (no-op)
+  kSCREENSYNC   = 'SCREENSYNC';    // FreeBASIC: wait for vertical retrace (no-op headless)
+  kWINDOWTITLE  = 'WINDOWTITLE';   // FreeBASIC: set the graphics window caption (accept-and-ignore v1)
   kDRAW    = 'DRAW';
   kCIRCLE  = 'CIRCLE';
   kPAINT   = 'PAINT';

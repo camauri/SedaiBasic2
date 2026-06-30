@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 474 / 643 implemented (74%)** (+ 2 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 478 / 643 implemented (74%)** (+ 2 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **474 (83%)** are implemented. See the
+**572 applicable** keywords, **478 (84%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **474 / 643 implemented (74%)**, plus 2 partial (◐).
-> Of the 167 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **460 / 572 ≈ 80% of the
+> **Coverage (FreeBASIC keyword set):** **478 / 643 implemented (74%)**, plus 2 partial (◐).
+> Of the 163 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **464 / 572 ≈ 81% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -2511,7 +2511,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `SCREENCONTROL` | ✗ | Gets or sets internal graphics library settings. |
 | `SCREENEVENT` | ✗ | Gets system events. |
 | `SCREENGLPROC` | ✗ | Returns the address of an OpenGL procedure. |
-| `WINDOWTITLE` | ✗ | Sets the running program's window caption. |
+| `WINDOWTITLE` | ✓ | Parsed; accept-and-ignore (the caption has no effect on the headless/buffered backend; sbv caption plumbing deferred). |
 
 #### Working with pages
 
@@ -2520,15 +2520,15 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `CLS` | ✓ | Clears the screen and homes the cursor (alias of `SCNCLR`). |
 | `SCREENSET` | ✗ | Sets the current work and visible pages. |
 | `SCREENCOPY and PCOPY and FLIP` | ✗ | Copies pixel data from one page to another. |
-| `SCREENSYNC` | ✗ | Waits for the vertical refresh of the monitor. |
+| `SCREENSYNC` | ✓ | Parsed; accept-and-ignore (no vertical-retrace wait on the headless/buffered backend). |
 
 #### Working video memory
 
 | Keyword | Status | Description |
 |---|---|---|
 | `SCREENPTR` | ✗ | Gets the address of the working page's framebuffer. |
-| `SCREENLOCK` | ✗ | Locks the current working page's framebuffer for direct access. |
-| `SCREENUNLOCK` | ✗ | Reverts a previous ScreenLock command. |
+| `SCREENLOCK` | ✓ | Parsed; accept-and-ignore (the drawable surface is always a CPU buffer, so no lock is needed). |
+| `SCREENUNLOCK` | ✓ | Parsed; accept-and-ignore (pairs with SCREENLOCK). |
 
 #### Screen Metrics
 

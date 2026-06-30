@@ -1864,6 +1864,10 @@ begin
  RegisterKeyword(kIMAGEDESTROY, ttGraphicsCommand,  'FreeBASIC: free an image surface',               kcGraphicsHandling);
  RegisterKeyword(kIMAGEINFO,    ttGraphicsCommand,  'FreeBASIC: query an image surface width/height', kcGraphicsHandling);
  RegisterKeyword(kSCREENINFO,   ttGraphicsCommand,  'FreeBASIC: query the graphics screen width/height/depth', kcGraphicsHandling);
+ RegisterKeyword(kSCREENLOCK,   ttGraphicsCommand,  'FreeBASIC: begin direct screen access (no-op)',  kcGraphicsHandling);
+ RegisterKeyword(kSCREENUNLOCK, ttGraphicsCommand,  'FreeBASIC: end direct screen access (no-op)',    kcGraphicsHandling);
+ RegisterKeyword(kSCREENSYNC,   ttGraphicsCommand,  'FreeBASIC: wait for vertical retrace (no-op)',   kcGraphicsHandling);
+ RegisterKeyword(kWINDOWTITLE,  ttGraphicsCommand,  'FreeBASIC: set the graphics window caption',     kcGraphicsHandling);
  RegisterKeyword(kRWINDOW, ttInputFunction,    'Return the size of the current text window',       kcStdIO);
 
  // === SPRITES HANDLING (COMMANDS AND FUNCTIONS) ===

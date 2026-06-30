@@ -3750,6 +3750,9 @@ begin
     Result := TASTNode.Create(antImageInfo, Token)
   else if CmdName = 'SCREENINFO' then
     Result := TASTNode.Create(antScreenInfo, Token)
+  else if (CmdName = 'SCREENLOCK') or (CmdName = 'SCREENUNLOCK') or
+          (CmdName = 'SCREENSYNC') or (CmdName = 'WINDOWTITLE') then
+    Result := TASTNode.Create(antGfxNop, Token)
   else
     Result := TASTNode.Create(antStatement, Token);
 
@@ -3873,6 +3876,16 @@ begin
       Context.Advance;                                          // ','
       Result.AddChild(ParseExpression);                         // next variable
     end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // FreeBASIC SCREENLOCK / SCREENUNLOCK / SCREENSYNC / WINDOWTITLE — accept-and-ignore (sync/caption
+  // primitives with no effect on the buffered/headless backend). Consume any arguments, emit nothing.
+  if Result.NodeType = antGfxNop then
+  begin
+    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
+      Context.Advance;
     DoNodeCreated(Result);
     Exit;
   end;

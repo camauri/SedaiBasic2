@@ -15142,6 +15142,7 @@ begin
     antGfxGet: ProcessGfxGet(Node);
     antGfxPut: ProcessGfxPut(Node);
     antScreenInfo: ProcessScreenInfo(Node);
+    antGfxNop: ;  // SCREENLOCK/UNLOCK/SYNC/WINDOWTITLE: accept-and-ignore (no code emitted)
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);
     antWidth: ProcessWidth(Node);
