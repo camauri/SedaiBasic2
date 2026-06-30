@@ -418,6 +418,7 @@ const
   kMORE    = 'MORE';     // Paginate output (pipe modifier)
   kGRAPHIC = 'GRAPHIC';
   kRGBA    = 'RGBA';     // Create 32-bit RGBA color value: RGBA(r, g, b, a)
+  kRGB     = 'RGB';      // FreeBASIC: opaque colour value RGB(r, g, b) = RGBA(r, g, b, 255)
   kDRAW    = 'DRAW';
   kCIRCLE  = 'CIRCLE';
   kPAINT   = 'PAINT';

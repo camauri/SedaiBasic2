@@ -1853,6 +1853,7 @@ begin
  RegisterKeyword(kRDOT,    ttGraphicsFunction, 'Return current position or color of pixel cursor', kcGraphicsHandling);
  RegisterKeyword(kRGR,     ttGraphicsFunction, 'Return current graphic mode',                      kcGraphicsHandling);
  RegisterKeyword(kRGBA,    ttGraphicsFunction, 'Create 32-bit RGBA color value',                   kcGraphicsHandling);
+ RegisterKeyword(kRGB,     ttGraphicsFunction, 'FreeBASIC: opaque colour RGB(r,g,b) = RGBA(r,g,b,255)', kcGraphicsHandling);
  // NOTE: POINT is intentionally NOT registered (it is a very common identifier/type name, e.g. TYPE
  // Point). It is intercepted by name as POINT(x,y) in the array-access path, only when it is not a
  // declared type/array/function — so user code may still use "Point" as a type.

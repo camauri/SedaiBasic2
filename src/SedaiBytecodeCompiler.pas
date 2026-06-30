@@ -640,15 +640,9 @@ begin
       if Length(Instr.PhiSources) > 0 then
       begin
         with Instr.PhiSources[0].Value do
-        begin
           if Kind = svkRegister then
             ARegMapped := MapSSARegisterToBytecode(RegType, RegIndex, Version);
-          WriteLn(StdErr, 'RGBA: B_bc=', BRegMapped, ' A_bc=', ARegMapped,
-            ' A_ssa(type=', Ord(RegType), ',idx=', RegIndex, ',ver=', Version, ')');
-        end;
-      end
-      else
-        WriteLn(StdErr, 'RGBA: B=', BRegMapped, ' NO PhiSources!');
+      end;
 
       BCInstr.Immediate := (BRegMapped shl 16) or ARegMapped;
     end;

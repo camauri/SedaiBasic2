@@ -2964,6 +2964,41 @@ begin
           else
             raise Exception.Create('RGBA requires 4 arguments: RGBA(r, g, b, a)');
         end
+        else if FuncName = 'RGB' then
+        begin
+          // FreeBASIC RGB(r, g, b) = RGBA(r, g, b, 255): opaque colour. Same packed layout as RGBA
+          // (alpha in bits 24-31), so it reuses ssaGraphicRGBA with a constant 255 alpha register.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 3) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), RVal);
+            ProcessExpression(ArgListNode.GetChild(1), GVal);
+            ProcessExpression(ArgListNode.GetChild(2), BVal);
+            if (RVal.Kind = svkConstInt) and (GVal.Kind = svkConstInt) and (BVal.Kind = svkConstInt) then
+              Result := MakeSSAConstInt((Int64($FF) shl 24) or
+                          ((RVal.ConstInt and $FF) shl 16) or
+                          ((GVal.ConstInt and $FF) shl 8) or
+                          (BVal.ConstInt and $FF))
+            else if (RVal.Kind = svkConstFloat) and (GVal.Kind = svkConstFloat) and (BVal.Kind = svkConstFloat) then
+              Result := MakeSSAConstInt((Int64($FF) shl 24) or
+                          ((Trunc(RVal.ConstFloat) and $FF) shl 16) or
+                          ((Trunc(GVal.ConstFloat) and $FF) shl 8) or
+                          (Trunc(BVal.ConstFloat) and $FF))
+            else
+            begin
+              RReg := EnsureIntRegister(RVal);
+              GReg := EnsureIntRegister(GVal);
+              BReg := EnsureIntRegister(BVal);
+              AReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaLoadConstInt, AReg, MakeSSAConstInt(255), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              DestReg := FProgram.AllocRegister(srtInt);
+              Result := MakeSSARegister(srtInt, DestReg);
+              EmitInstruction(ssaGraphicRGBA, Result, RReg, GReg, BReg);
+              FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1].AddPhiSource(AReg, nil);
+            end;
+          end
+          else
+            raise Exception.Create('RGB requires 3 arguments: RGB(r, g, b)');
+        end
         else if FuncName = 'RDOT' then
         begin
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
