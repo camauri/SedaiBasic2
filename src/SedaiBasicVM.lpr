@@ -497,7 +497,9 @@ begin
   if Assigned(GPresenter) then
   begin
     AVM.EventPollCallback := nil;
-    if not GPresenter.Closed then GPresenter.WaitClose;
+    // FreeBASIC convention: the program terminates at END and the window closes with it. To keep the
+    // window visible after drawing, the program waits (SLEEP / a GETKEY loop) — those keep the event
+    // pump alive and presenting. We do NOT block here, so `END` actually ends the program.
     FreeAndNil(GPresenter);
   end;
   {$ENDIF}
