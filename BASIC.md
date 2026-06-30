@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 483 / 643 implemented (75%)** (+ 1 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 485 / 643 implemented (75%)** (+ 1 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **483 (84%)** are implemented. See the
+**572 applicable** keywords, **485 (85%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **483 / 643 implemented (75%)**, plus 1 partial (◐).
-> Of the 159 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **469 / 572 ≈ 82% of the
+> **Coverage (FreeBASIC keyword set):** **485 / 643 implemented (75%)**, plus 1 partial (◐).
+> Of the 157 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **471 / 572 ≈ 82% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -2430,7 +2430,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `MULTIKEY` | ✗ | Detects the status of a key by its scancode. |
+| `MULTIKEY` | ✓ | `MULTIKEY(scancode)` returns -1 if the key (FB AT scancode) is held, 0 otherwise — real-time. Live on `sb --window` and sbv (SDL keyboard state); headless `sb` reports all keys up. |
 
 ### Graphics - 2D Drawing
 
@@ -2497,7 +2497,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `MULTIKEY` | ✗ | Gets key information for the keyboard. |
+| `MULTIKEY` | ✓ | See "Detecting key status by keyboard scancode": `MULTIKEY(scancode)` real-time key-down state (live on `sb --window` / sbv). |
 
 ### Graphics - Screen
 

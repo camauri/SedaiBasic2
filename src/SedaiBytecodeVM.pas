@@ -35,7 +35,7 @@ uses
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
   SedaiConsoleBehavior, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue,
-  SedaiGraphicsBackend
+  SedaiGraphicsBackend, SedaiInputState
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
   {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioTypes, SedaiAudioBackend, SedaiSIDEvo{$ENDIF}
   {$IFDEF WEB_MODE}, SedaiWebIO{$ENDIF};
@@ -3254,6 +3254,12 @@ begin
         // bcGfxScreen: Src1=mode (Immediate = num_pages const, not a reg)
         bcGfxScreen:
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        // bcMultikey: Dest=result, Src1=scancode
+        bcMultikey:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
 
         // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
         // Immediate bits 0-15 = row2 register(int), bits 16-31 = clear register(int)
@@ -6842,6 +6848,11 @@ begin
         if (WinW > 0) and (WinH > 0) then
           SetupGfxScreen(WinW, WinH, Instr.Immediate);
       end;
+    48: // bcMultikey - MULTIKEY(scancode): -1 if held, 0 otherwise (real-time, via the input provider)
+      if Assigned(GKeyDownProvider) and GKeyDownProvider(Ctx.IntRegs[Instr.Src1]) then
+        Ctx.IntRegs[Instr.Dest] := -1
+      else
+        Ctx.IntRegs[Instr.Dest] := 0;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

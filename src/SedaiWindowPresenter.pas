@@ -30,7 +30,7 @@ interface
 
 {$IFDEF WITH_WINDOW}
 uses
-  SysUtils, Math, SDL2, SedaiGraphicsBackend, SedaiGraphicsMemory;
+  SysUtils, Math, SDL2, SedaiGraphicsBackend, SedaiGraphicsMemory, SedaiInputState;
 
 type
   TWindowPresenter = class
@@ -55,6 +55,20 @@ implementation
 
 {$IFDEF WITH_WINDOW}
 
+// Real-time key state for MULTIKEY (installed as GKeyDownProvider while the window is open).
+function WindowKeyDown(ATScanCode: Integer): Boolean;
+var
+  NumKeys, SdlSc: Integer;
+  State: PUInt8;
+begin
+  Result := False;
+  SDL_PumpEvents;
+  State := SDL_GetKeyboardState(@NumKeys);
+  if State = nil then Exit;
+  SdlSc := ATScancodeToSDL(ATScanCode);
+  Result := (SdlSc > 0) and (SdlSc < NumKeys) and ((State + SdlSc)^ <> 0);
+end;
+
 constructor TWindowPresenter.Create(ABackend: TSoftwareGraphicsBackend; const Title: string);
 begin
   inherited Create;
@@ -74,10 +88,12 @@ begin
     FRenderer := SDL_CreateRenderer(FWindow, -1, SDL_RENDERER_ACCELERATED)
   else
     FRenderer := nil;
+  GKeyDownProvider := @WindowKeyDown;   // MULTIKEY now reads the live SDL keyboard state
 end;
 
 destructor TWindowPresenter.Destroy;
 begin
+  GKeyDownProvider := nil;
   if Assigned(FTexture) then SDL_DestroyTexture(FTexture);
   if Assigned(FRenderer) then SDL_DestroyRenderer(FRenderer);
   if Assigned(FWindow) then SDL_DestroyWindow(FWindow);

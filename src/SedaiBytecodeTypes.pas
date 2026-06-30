@@ -593,6 +593,8 @@ const
   bcGfxView         = bcGroupGraphics + 46;
   // SCREEN mode [, , num_pages] : Src1=mode reg, Immediate=number of pages (mapped mode->resolution in VM)
   bcGfxScreen       = bcGroupGraphics + 47;
+  // MULTIKEY(scancode) : Dest=result (-1/0), Src1=FB scancode reg — real-time key state via the input provider
+  bcMultikey        = bcGroupGraphics + 48;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1687,6 +1689,7 @@ begin
         45: Result := 'GfxPMap';
         46: Result := 'GfxView';
         47: Result := 'GfxScreen';
+        48: Result := 'Multikey';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

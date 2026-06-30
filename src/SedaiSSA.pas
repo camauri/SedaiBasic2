@@ -3105,6 +3105,19 @@ begin
           else
             raise Exception.Create('PMAP requires 2 arguments: PMAP(coord, n)');
         end
+        else if FuncName = 'MULTIKEY' then
+        begin
+          // MULTIKEY(scancode) -> -1 if the key is held, 0 otherwise.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
+            DestReg := FProgram.AllocRegister(srtInt);
+            Result := MakeSSARegister(srtInt, DestReg);
+            EmitInstruction(ssaMultikey, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end
+          else
+            raise Exception.Create('MULTIKEY requires 1 argument: MULTIKEY(scancode)');
+        end
         else if FuncName = 'RDOT' then
         begin
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then

@@ -254,6 +254,7 @@ type
     ssaGfxPMap,        // __PMAP(coord, n) -> mapped coordinate (Dest=result, Src1=coord, Immediate=n)
     ssaGfxView,        // VIEW [SCREEN] (x1,y1)-(x2,y2) : set/clear the viewport (offset + clip)
     ssaGfxScreen,      // SCREEN mode[,,num_pages] : set a numbered graphics mode (Src1=mode, Immediate=pages)
+    ssaMultikey,       // MULTIKEY(scancode) -> -1 if the key is held, 0 otherwise (Dest=result, Src1=scancode)
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n
     ssaGraphicRwindow, // RWINDOW(n): Return window size info

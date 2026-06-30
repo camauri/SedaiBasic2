@@ -32,6 +32,7 @@ uses
   Classes, SysUtils, Variants, Math, SDL2, SDL2_ttf, TypInfo,
   SedaiOutputInterface, SedaiGraphicsModes, SedaiGraphicsTypes,
   SedaiGraphicsMemory, SedaiGraphicsPrimitives, SedaiGraphicsBackend,
+  SedaiInputState,
   SedaiProgramMemory, SedaiAST, SedaiParserTypes,
   SedaiCommandRouter, SedaiCommandTypes,
   SedaiSDL2VideoModes,
@@ -988,11 +989,26 @@ function GlobalMemoryStatusEx(var lpBuffer: TMemoryStatusEx): BOOL; stdcall; ext
 
 { TVideoController }
 
+// Real-time key state for MULTIKEY on sbv (installed as GKeyDownProvider; SDL keyboard state is global).
+function VConKeyDown(ATScanCode: Integer): Boolean;
+var
+  NumKeys, SdlSc: Integer;
+  State: PUInt8;
+begin
+  Result := False;
+  SDL_PumpEvents;
+  State := SDL_GetKeyboardState(@NumKeys);
+  if State = nil then Exit;
+  SdlSc := ATScancodeToSDL(ATScanCode);
+  Result := (SdlSc > 0) and (SdlSc < NumKeys) and ((State + SdlSc)^ <> 0);
+end;
+
 constructor TVideoController.Create;
 begin
   inherited Create;
   FWindow := nil;
   FRenderer := nil;
+  GKeyDownProvider := @VConKeyDown;   // sbv: MULTIKEY reads the live SDL keyboard state
   FFont := nil;
   FPaletteManager := nil;
   FGraphicsMemory := nil;

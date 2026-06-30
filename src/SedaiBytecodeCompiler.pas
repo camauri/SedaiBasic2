@@ -393,6 +393,7 @@ begin
     ssaGfxWindow: Result := bcGfxWindow;
     ssaGfxView: Result := bcGfxView;
     ssaGfxScreen: Result := bcGfxScreen;
+    ssaMultikey: Result := bcMultikey;
     ssaGfxPMap: Result := bcGfxPMap;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;
