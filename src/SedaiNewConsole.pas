@@ -136,6 +136,8 @@ type
 
     // Persistent graphics memory (handles all classic mode buffers)
     FGraphicsMemory: TGraphicsMemory;
+    // FreeBASIC image surfaces (IMAGECREATE); id = index+1, freed slots stay nil (G3)
+    FImageSurfaces: array of TGraphicsMemory;
     // SDL2 texture for rendering the graphics buffer
     FGraphicsTexture: PSDL_Texture;
     // SDL2 texture for persistent text rendering (dirty tracking optimization)
@@ -306,6 +308,7 @@ type
     procedure GBClearSurface(Surface: TGfxSurface; Color: TGfxColor);
     procedure GBPresent;
     function  GBScreenSurface: TGfxSurface;
+    function  GBImageMem(Surface: TGfxSurface): TGraphicsMemory;   // image memory for a surface id, nil if invalid
     function  GBCreateSurface(W, H: Integer; Fill: TGfxColor): TGfxSurface;
     procedure GBDestroySurface(Surface: TGfxSurface);
     function  GBSurfaceWidth(Surface: TGfxSurface): Integer;
@@ -1208,6 +1211,8 @@ begin
 end;
 
 destructor TVideoController.Destroy;
+var
+  IdxFreeImg: Integer;
 begin
   // Destroy graphics texture first (needs renderer)
   DestroyGraphicsTexture;
@@ -1219,6 +1224,10 @@ begin
     FGraphicsMemory.Free;
     FGraphicsMemory := nil;
   end;
+  // Free FreeBASIC image surfaces (G3)
+  for IdxFreeImg := 0 to High(FImageSurfaces) do
+    FImageSurfaces[IdxFreeImg].Free;
+  SetLength(FImageSurfaces, 0);
   inherited Destroy;
 end;
 
@@ -3685,33 +3694,74 @@ begin
   Result := GFX_SCREEN_SURFACE;
 end;
 
-function TVideoController.GBCreateSurface(W, H: Integer; Fill: TGfxColor): TGfxSurface;
+function TVideoController.GBImageMem(Surface: TGfxSurface): TGraphicsMemory;
+// Image-surface memory for a surface id (>0); nil for the screen (0) or an invalid/destroyed id.
 begin
-  Result := GFX_INVALID_SURFACE;   // image buffers deferred to phase 2/G3
+  if (Surface >= 1) and (Surface <= Length(FImageSurfaces)) then
+    Result := FImageSurfaces[Surface - 1]
+  else
+    Result := nil;
+end;
+
+function TVideoController.GBCreateSurface(W, H: Integer; Fill: TGfxColor): TGfxSurface;
+// FreeBASIC IMAGECREATE: allocate a truecolor image surface, cleared to Fill. Reuses a freed slot.
+var
+  Img: TGraphicsMemory;
+  i, Slot: Integer;
+begin
+  if (W <= 0) or (H <= 0) then Exit(GFX_INVALID_SURFACE);
+  Img := TGraphicsMemory.Create;
+  Img.AllocateBuffers(W, H, False, gmSDL2Dynamic);
+  Img.ClearCurrentMode(Fill);
+  Slot := -1;
+  for i := 0 to High(FImageSurfaces) do
+    if FImageSurfaces[i] = nil then begin Slot := i; Break; end;
+  if Slot < 0 then
+  begin
+    SetLength(FImageSurfaces, Length(FImageSurfaces) + 1);
+    Slot := High(FImageSurfaces);
+  end;
+  FImageSurfaces[Slot] := Img;
+  Result := Slot + 1;   // id 0 = screen
 end;
 
 procedure TVideoController.GBDestroySurface(Surface: TGfxSurface);
 begin
+  if (Surface >= 1) and (Surface <= Length(FImageSurfaces)) and Assigned(FImageSurfaces[Surface - 1]) then
+  begin
+    FImageSurfaces[Surface - 1].Free;
+    FImageSurfaces[Surface - 1] := nil;
+  end;
 end;
 
 function TVideoController.GBSurfaceWidth(Surface: TGfxSurface): Integer;
+var M: TGraphicsMemory;
 begin
-  Result := FViewportWidth;
+  M := GBImageMem(Surface);
+  if Assigned(M) then Result := M.State.Width else Result := FViewportWidth;
 end;
 
 function TVideoController.GBSurfaceHeight(Surface: TGfxSurface): Integer;
+var M: TGraphicsMemory;
 begin
-  Result := FViewportHeight;
+  M := GBImageMem(Surface);
+  if Assigned(M) then Result := M.State.Height else Result := FViewportHeight;
 end;
 
 procedure TVideoController.GBSetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
+var M: TGraphicsMemory;
 begin
-  SetPixel(X, Y, Color);
+  M := GBImageMem(Surface);
+  if Assigned(M) then M.SetPixel(X, Y, Color)
+  else SetPixel(X, Y, Color);   // screen (texture repainted by the render poll)
 end;
 
 function TVideoController.GBGetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;
+var M: TGraphicsMemory;
 begin
-  Result := GetPixel(X, Y);
+  M := GBImageMem(Surface);
+  if Assigned(M) then Result := M.GetPixel(X, Y)
+  else Result := GetPixel(X, Y);
 end;
 
 procedure TVideoController.GBDrawLine(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; LineWidth: Integer);
@@ -3735,8 +3785,68 @@ begin
 end;
 
 procedure TVideoController.GBBlit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);
+// Blit the whole Src surface onto Dst at (X,Y), per pixel, applying the blit mode (ABGR colours;
+// TRANS skips the magenta key). Mirrors the software backend so sb and sbv agree pixel-for-pixel.
+const
+  TRANS_KEY = TGfxColor($FFFF00FF);
+var
+  SW, SH, DW, DH, sx, sy, dx, dy: Integer;
+  sc, dc, nc: TGfxColor;
+
+  function Blend(D, S: TGfxColor): TGfxColor;
+  var dr, dg, db, sr, sg, sb, sa, r, g, b: Integer;
+  begin
+    case Mode of
+      gbmAnd: Result := D and S;
+      gbmOr:  Result := D or S;
+      gbmXor: Result := D xor S;
+      gbmAdd:
+        begin
+          sr := S and $FF; sg := (S shr 8) and $FF; sb := (S shr 16) and $FF;
+          dr := D and $FF; dg := (D shr 8) and $FF; db := (D shr 16) and $FF;
+          r := dr + sr; if r > 255 then r := 255;
+          g := dg + sg; if g > 255 then g := 255;
+          b := db + sb; if b > 255 then b := 255;
+          Result := (D and $FF000000) or TGfxColor(b shl 16) or TGfxColor(g shl 8) or TGfxColor(r);
+        end;
+      gbmAlpha:
+        begin
+          sa := (S shr 24) and $FF;
+          sr := S and $FF; sg := (S shr 8) and $FF; sb := (S shr 16) and $FF;
+          dr := D and $FF; dg := (D shr 8) and $FF; db := (D shr 16) and $FF;
+          r := (sr * sa + dr * (255 - sa)) div 255;
+          g := (sg * sa + dg * (255 - sa)) div 255;
+          b := (sb * sa + db * (255 - sa)) div 255;
+          Result := $FF000000 or TGfxColor(b shl 16) or TGfxColor(g shl 8) or TGfxColor(r);
+        end;
+    else
+      Result := S;
+    end;
+  end;
+
 begin
-  // Image blitting (PUT) deferred to phase 2/G3.
+  SW := GBSurfaceWidth(Src);  SH := GBSurfaceHeight(Src);
+  DW := GBSurfaceWidth(Dst);  DH := GBSurfaceHeight(Dst);
+  for sy := 0 to SH - 1 do
+  begin
+    dy := Y + sy;
+    if (dy < 0) or (dy >= DH) then Continue;
+    for sx := 0 to SW - 1 do
+    begin
+      dx := X + sx;
+      if (dx < 0) or (dx >= DW) then Continue;
+      sc := GBGetPixel(Src, sx, sy);
+      if (Mode = gbmTrans) and (sc = TRANS_KEY) then Continue;
+      if Mode in [gbmPSet, gbmTrans, gbmCustom] then
+        nc := sc
+      else
+      begin
+        dc := GBGetPixel(Dst, dx, dy);
+        nc := Blend(dc, sc);
+      end;
+      GBSetPixel(Dst, dx, dy, nc);
+    end;
+  end;
 end;
 
 procedure TVideoController.GBEnablePalette(Enable: Boolean);
