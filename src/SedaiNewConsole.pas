@@ -31,7 +31,7 @@ interface
 uses
   Classes, SysUtils, Variants, Math, SDL2, SDL2_ttf, TypInfo,
   SedaiOutputInterface, SedaiGraphicsModes, SedaiGraphicsTypes,
-  SedaiGraphicsMemory, SedaiGraphicsPrimitives,
+  SedaiGraphicsMemory, SedaiGraphicsPrimitives, SedaiGraphicsBackend,
   SedaiProgramMemory, SedaiAST, SedaiParserTypes,
   SedaiCommandRouter, SedaiCommandTypes,
   SedaiSDL2VideoModes,
@@ -75,7 +75,7 @@ type
 
   { TVideoController - SDL2 video mode management with persistent graphics buffers }
   { NOTE: Using TObject instead of TInterfacedObject because interfaces use CORBA mode (no refcount) }
-  TVideoController = class(TObject, IOutputDevice)
+  TVideoController = class(TObject, IOutputDevice, IGraphicsBackend)
   private
     FWindow: PSDL_Window;
     FRenderer: PSDL_Renderer;
@@ -295,6 +295,54 @@ type
     // SSHAPE/GSHAPE command support
     function SaveShape(X1, Y1, X2, Y2: Double): string;
     procedure LoadShape(const Data: string; X, Y: Double; Mode: Integer);
+
+    // === IGraphicsBackend (FreeBASIC graphics): operation-level methods delegating to this device's
+    // existing drawing methods. Mapped via resolution clauses to avoid clashing with the IOutputDevice
+    // methods of different signatures. This is the live graphics device for running programs on sbv. ===
+    function  GBSetMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
+    function  GBResizeScreen(W, H, Depth: Integer): Boolean;
+    function  GBGetMode: TGraphicMode;
+    function  GBInGraphics: Boolean;
+    procedure GBClearSurface(Surface: TGfxSurface; Color: TGfxColor);
+    procedure GBPresent;
+    function  GBScreenSurface: TGfxSurface;
+    function  GBCreateSurface(W, H: Integer; Fill: TGfxColor): TGfxSurface;
+    procedure GBDestroySurface(Surface: TGfxSurface);
+    function  GBSurfaceWidth(Surface: TGfxSurface): Integer;
+    function  GBSurfaceHeight(Surface: TGfxSurface): Integer;
+    procedure GBSetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
+    function  GBGetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;
+    procedure GBDrawLine(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; LineWidth: Integer);
+    procedure GBDrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
+    procedure GBDrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
+    procedure GBFill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
+    procedure GBBlit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);
+    procedure GBEnablePalette(Enable: Boolean);
+    procedure GBSetPaletteColor(Index: TPaletteIndex; Color: TGfxColor);
+    function  GBGetPaletteColor(Index: TPaletteIndex): TGfxColor;
+    procedure GBResetPalette;
+    function  IGraphicsBackend.SetMode = GBSetMode;
+    function  IGraphicsBackend.ResizeScreen = GBResizeScreen;
+    function  IGraphicsBackend.GetMode = GBGetMode;
+    function  IGraphicsBackend.InGraphics = GBInGraphics;
+    procedure IGraphicsBackend.ClearSurface = GBClearSurface;
+    procedure IGraphicsBackend.Present = GBPresent;
+    function  IGraphicsBackend.ScreenSurface = GBScreenSurface;
+    function  IGraphicsBackend.CreateSurface = GBCreateSurface;
+    procedure IGraphicsBackend.DestroySurface = GBDestroySurface;
+    function  IGraphicsBackend.SurfaceWidth = GBSurfaceWidth;
+    function  IGraphicsBackend.SurfaceHeight = GBSurfaceHeight;
+    procedure IGraphicsBackend.SetPixel = GBSetPixel;
+    function  IGraphicsBackend.GetPixel = GBGetPixel;
+    procedure IGraphicsBackend.DrawLine = GBDrawLine;
+    procedure IGraphicsBackend.DrawRect = GBDrawRect;
+    procedure IGraphicsBackend.DrawEllipse = GBDrawEllipse;
+    procedure IGraphicsBackend.Fill = GBFill;
+    procedure IGraphicsBackend.Blit = GBBlit;
+    procedure IGraphicsBackend.EnablePalette = GBEnablePalette;
+    procedure IGraphicsBackend.SetPaletteColor = GBSetPaletteColor;
+    function  IGraphicsBackend.GetPaletteColor = GBGetPaletteColor;
+    procedure IGraphicsBackend.ResetPalette = GBResetPalette;
 
     property CurrentMode: TGraphicMode read FCurrentMode;
     property ModeInfo: TGraphicModeInfo read FModeInfo;
@@ -3599,6 +3647,118 @@ begin
   end;
 end;
 
+// === TVideoController IGraphicsBackend implementation (delegates to the existing drawing methods) ===
+
+function TVideoController.GBSetMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
+begin
+  Result := SetGraphicMode(Mode, ClearBuffer, SplitLine);
+end;
+
+function TVideoController.GBResizeScreen(W, H, Depth: Integer): Boolean;
+begin
+  // Phase 1: route to the SDL2 dynamic mode. Precise arbitrary W x H sizing is deferred to phase 2/G1.
+  Result := SetGraphicMode(gmSDL2Dynamic, True, -1);
+end;
+
+function TVideoController.GBGetMode: TGraphicMode;
+begin
+  Result := GetGraphicMode;
+end;
+
+function TVideoController.GBInGraphics: Boolean;
+begin
+  Result := IsInGraphicsMode;
+end;
+
+procedure TVideoController.GBClearSurface(Surface: TGfxSurface; Color: TGfxColor);
+begin
+  ClearScreen(-1);
+end;
+
+procedure TVideoController.GBPresent;
+begin
+  Present;
+end;
+
+function TVideoController.GBScreenSurface: TGfxSurface;
+begin
+  Result := GFX_SCREEN_SURFACE;
+end;
+
+function TVideoController.GBCreateSurface(W, H: Integer; Fill: TGfxColor): TGfxSurface;
+begin
+  Result := GFX_INVALID_SURFACE;   // image buffers deferred to phase 2/G3
+end;
+
+procedure TVideoController.GBDestroySurface(Surface: TGfxSurface);
+begin
+end;
+
+function TVideoController.GBSurfaceWidth(Surface: TGfxSurface): Integer;
+begin
+  Result := FViewportWidth;
+end;
+
+function TVideoController.GBSurfaceHeight(Surface: TGfxSurface): Integer;
+begin
+  Result := FViewportHeight;
+end;
+
+procedure TVideoController.GBSetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
+begin
+  SetPixel(X, Y, Color);
+end;
+
+function TVideoController.GBGetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;
+begin
+  Result := GetPixel(X, Y);
+end;
+
+procedure TVideoController.GBDrawLine(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; LineWidth: Integer);
+begin
+  DrawLine(X1, Y1, X2, Y2, Color);
+end;
+
+procedure TVideoController.GBDrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
+begin
+  DrawBoxWithColor(X1, Y1, X2, Y2, Color, Angle, Filled);
+end;
+
+procedure TVideoController.GBDrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
+begin
+  DrawCircleWithColor(CX, CY, RX, RY, Color, StartAngle, EndAngle, RotationAngle, AngleStep);
+end;
+
+procedure TVideoController.GBFill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
+begin
+  // FB PAINT on this device deferred (the existing FloodFill is colour-source based, not direct-colour).
+end;
+
+procedure TVideoController.GBBlit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);
+begin
+  // Image blitting (PUT) deferred to phase 2/G3.
+end;
+
+procedure TVideoController.GBEnablePalette(Enable: Boolean);
+begin
+  EnablePalette(Enable);
+end;
+
+procedure TVideoController.GBSetPaletteColor(Index: TPaletteIndex; Color: TGfxColor);
+begin
+  SetPaletteColor(Index, Color);
+end;
+
+function TVideoController.GBGetPaletteColor(Index: TPaletteIndex): TGfxColor;
+begin
+  Result := GetPaletteColor(Index);
+end;
+
+procedure TVideoController.GBResetPalette;
+begin
+  ResetPalette;
+end;
+
 { TScrollbackRingBuffer }
 
 constructor TScrollbackRingBuffer.Create(ACapacity: Integer);
@@ -5624,6 +5784,9 @@ begin
   // Initialize VM-based execution
   FBytecodeVM := TBytecodeVM.Create;
   FBytecodeVM.SetOutputDevice(FVideoController);
+  // FreeBASIC graphics: the video controller is also the graphics backend (same instance) so the new
+  // operation-level ops (SCREENRES/PSET/POINT, ...) draw on screen. Owned by the console (OwnedObj=nil).
+  FBytecodeVM.SetGraphicsBackend(FVideoController);
   // Use dedicated program input handler for VM (NOT the console input handler)
   FBytecodeVM.SetInputDevice(FProgramInputHandler);
   // Create sprite engine with SDL2 renderer and palette resolver
