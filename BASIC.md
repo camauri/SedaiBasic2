@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 473 / 643 implemented (74%)** (+ 2 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 474 / 643 implemented (74%)** (+ 2 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **473 (83%)** are implemented. See the
+**572 applicable** keywords, **474 (83%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **473 / 643 implemented (74%)**, plus 2 partial (◐).
-> Of the 168 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **459 / 572 ≈ 80% of the
+> **Coverage (FreeBASIC keyword set):** **474 / 643 implemented (74%)**, plus 2 partial (◐).
+> Of the 167 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **460 / 572 ≈ 80% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -2507,7 +2507,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `SCREENLIST` | ✗ | Gets the available fullscreen resolutions. |
 | `SCREEN (Graphics) and SCREENRES` | ◐ | `SCREENRES w,h` sets the graphics screen surface (via IGraphicsBackend). Headless: exact w×h; on sbv: routed to the SDL2 dynamic mode (precise arbitrary w×h sizing on screen deferred to G1). |
-| `SCREENINFO` | ✗ | Gets information about the system desktop or current display mode. |
+| `SCREENINFO` | ✓ | `SCREENINFO w, h [, depth, bpp, pitch, rate]` writes the current graphics surface's width/height (and depth=32, bpp=4, pitch=w*4) into the variables (via IGraphicsBackend; headless-testable). Desktop-info form deferred. |
 | `SCREENCONTROL` | ✗ | Gets or sets internal graphics library settings. |
 | `SCREENEVENT` | ✗ | Gets system events. |
 | `SCREENGLPROC` | ✗ | Returns the address of an OpenGL procedure. |

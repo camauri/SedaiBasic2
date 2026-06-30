@@ -257,6 +257,7 @@ begin
     bcGfxForeColor,   // current draw foreground: Dest = colour (int)
     bcGfxImageCreate, // IMAGECREATE: Dest = image handle (int)
     bcGfxImageInfo,   // __IMGINFO: Dest = width/height (int)
+    bcGfxScreenInfo,  // __SCRINFO: Dest = screen info field (int)
     bcGraphicRdot,    // Dest = pixel cursor info (int)
     bcGraphicGetMode, // Dest = current graphic mode (int)
     bcGraphicPos,     // POS(x): cursor column position (int)

@@ -423,6 +423,7 @@ const
   kIMAGECREATE  = 'IMAGECREATE';   // FreeBASIC: allocate an image surface -> handle
   kIMAGEDESTROY = 'IMAGEDESTROY';  // FreeBASIC: free an image surface
   kIMAGEINFO    = 'IMAGEINFO';     // FreeBASIC: query an image surface (width/height)
+  kSCREENINFO   = 'SCREENINFO';    // FreeBASIC: query the current graphics screen (width/height/depth)
   kDRAW    = 'DRAW';
   kCIRCLE  = 'CIRCLE';
   kPAINT   = 'PAINT';

@@ -408,6 +408,7 @@ type
     procedure ProcessImageInfo(Node: TASTNode);      // IMAGEINFO handle, w, h
     procedure ProcessGfxGet(Node: TASTNode);         // GET (x1,y1)-(x2,y2), dst
     procedure ProcessGfxPut(Node: TASTNode);         // PUT (x,y), src [, mode]
+    procedure ProcessScreenInfo(Node: TASTNode);     // SCREENINFO w, h [, depth, ...]
     procedure ProcessColor(Node: TASTNode);
     procedure ProcessSetColor(Node: TASTNode);
     procedure ProcessWidth(Node: TASTNode);
@@ -3065,6 +3066,22 @@ begin
           end
           else
             raise Exception.Create('__IMGINFO requires 2 arguments');
+        end
+        else if FuncName = '__SCRINFO' then
+        begin
+          // Internal helper for SCREENINFO: __SCRINFO(which) -> w(0)/h(1)/depth(2)/bpp(3)/pitch(4)/rate(5).
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), RVal);     // which (constant)
+            DestReg := FProgram.AllocRegister(srtInt);
+            Result := MakeSSARegister(srtInt, DestReg);
+            if RVal.Kind = svkConstInt then
+              EmitInstruction(ssaGfxScreenInfo, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), RVal)
+            else
+              EmitInstruction(ssaGfxScreenInfo, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), EnsureIntRegister(RVal));
+          end
+          else
+            raise Exception.Create('__SCRINFO requires 1 argument');
         end
         else if FuncName = 'RDOT' then
         begin
@@ -7566,6 +7583,29 @@ begin
   EmitInstruction(ssaGfxPut, MakeSSAValue(svkNone), XR, YR, SR);
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(MakeSSAConstInt(Mode), nil);
+end;
+
+procedure TSSAGenerator.ProcessScreenInfo(Node: TASTNode);
+// SCREENINFO w, h [, depth, bpp, pitch, rate] : write the screen's info into the variables. Lowered to
+// synthetic "var = __SCRINFO(which)" assignments (which: 0=w,1=h,2=depth,3=bpp,4=pitch,5=rate).
+var
+  Assign, Call, ArgList, WhichLit: TASTNode;
+  i: Integer;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 1) then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    WhichLit := TASTNode.CreateWithValue(antLiteral, i, Node.Token);
+    ArgList := TASTNode.Create(antArgumentList, Node.Token);
+    ArgList.AddChild(WhichLit);
+    Call := TASTNode.CreateWithValue(antGraphicsFunction, '__SCRINFO', Node.Token);
+    Call.AddChild(ArgList);
+    Assign := TASTNode.Create(antAssignment, Node.Token);
+    Assign.AddChild(Node.GetChild(i).Clone);   // destination variable
+    Assign.AddChild(Call);
+    ProcessStatement(Assign);
+    Assign.Free;
+  end;
 end;
 
 procedure TSSAGenerator.ProcessBeep(Node: TASTNode);
@@ -15101,6 +15141,7 @@ begin
     antImageInfo: ProcessImageInfo(Node);
     antGfxGet: ProcessGfxGet(Node);
     antGfxPut: ProcessGfxPut(Node);
+    antScreenInfo: ProcessScreenInfo(Node);
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);
     antWidth: ProcessWidth(Node);

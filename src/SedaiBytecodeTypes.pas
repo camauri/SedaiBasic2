@@ -577,6 +577,8 @@ const
   bcGfxGet          = bcGroupGraphics + 39;
   // PUT (x,y),src[,mode] : Src1=x, Src2=y; Immediate [0-15]=src handle reg, [16-31]=blit-mode ordinal (const)
   bcGfxPut          = bcGroupGraphics + 40;
+  // __SCRINFO(which) : Dest=result, Immediate=which (0=w,1=h,2=depth,3=bpp,4=pitch,5=rate)
+  bcGfxScreenInfo   = bcGroupGraphics + 41;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1664,6 +1666,7 @@ begin
         38: Result := 'GfxImageInfo';
         39: Result := 'GfxGet';
         40: Result := 'GfxPut';
+        41: Result := 'GfxScreenInfo';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

@@ -387,6 +387,7 @@ begin
     ssaGfxImageInfo: Result := bcGfxImageInfo;
     ssaGfxGet: Result := bcGfxGet;
     ssaGfxPut: Result := bcGfxPut;
+    ssaGfxScreenInfo: Result := bcGfxScreenInfo;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;
     ssaGraphicRwindow: Result := bcGraphicRwindow;

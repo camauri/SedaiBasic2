@@ -1863,6 +1863,7 @@ begin
  RegisterKeyword(kIMAGECREATE,  ttGraphicsFunction, 'FreeBASIC: allocate an image surface -> handle', kcGraphicsHandling);
  RegisterKeyword(kIMAGEDESTROY, ttGraphicsCommand,  'FreeBASIC: free an image surface',               kcGraphicsHandling);
  RegisterKeyword(kIMAGEINFO,    ttGraphicsCommand,  'FreeBASIC: query an image surface width/height', kcGraphicsHandling);
+ RegisterKeyword(kSCREENINFO,   ttGraphicsCommand,  'FreeBASIC: query the graphics screen width/height/depth', kcGraphicsHandling);
  RegisterKeyword(kRWINDOW, ttInputFunction,    'Return the size of the current text window',       kcStdIO);
 
  // === SPRITES HANDLING (COMMANDS AND FUNCTIONS) ===

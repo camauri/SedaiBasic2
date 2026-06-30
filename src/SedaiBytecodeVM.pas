@@ -3209,6 +3209,9 @@ begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // y
           if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;             // src handle
         end;
+        // bcGfxScreenInfo: Dest=result (Immediate = which selector, not a reg)
+        bcGfxScreenInfo:
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // result
 
         // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
         // Immediate bits 0-15 = row2 register(int), bits 16-31 = clear register(int)
@@ -6627,6 +6630,18 @@ begin
       if Assigned(FGraphics) then
         FGraphics.Blit(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
                        Ctx.IntRegs[Instr.Immediate and $FFFF], TGfxBlitMode((Instr.Immediate shr 16) and $FFFF));
+    41: // bcGfxScreenInfo - __SCRINFO(which): screen w/h/depth/bpp/pitch/rate
+      if Assigned(FGraphics) then
+        case Instr.Immediate of
+          0: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(FGraphics.ScreenSurface);
+          1: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceHeight(FGraphics.ScreenSurface);
+          2: Ctx.IntRegs[Instr.Dest] := 32;                                             // colour depth (bits)
+          3: Ctx.IntRegs[Instr.Dest] := 4;                                              // bytes per pixel
+          4: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(FGraphics.ScreenSurface) * 4;  // pitch (bytes)
+        else Ctx.IntRegs[Instr.Dest] := 0;                                              // refresh rate (unknown)
+        end
+      else
+        Ctx.IntRegs[Instr.Dest] := 0;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

@@ -3748,6 +3748,8 @@ begin
     Result := TASTNode.Create(antImageDestroy, Token)
   else if CmdName = 'IMAGEINFO' then
     Result := TASTNode.Create(antImageInfo, Token)
+  else if CmdName = 'SCREENINFO' then
+    Result := TASTNode.Create(antScreenInfo, Token)
   else
     Result := TASTNode.Create(antStatement, Token);
 
@@ -3858,6 +3860,19 @@ begin
     Result.AddChild(ParseExpression);                            // w variable
     if Context.Check(ttSeparParam) then Context.Advance;          // ','
     Result.AddChild(ParseExpression);                            // h variable
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // FreeBASIC SCREENINFO w, h [, depth, bpp, pitch, rate] — writes the screen's info into the variables.
+  if Result.NodeType = antScreenInfo then
+  begin
+    Result.AddChild(ParseExpression);                            // w variable
+    while Context.Check(ttSeparParam) do
+    begin
+      Context.Advance;                                          // ','
+      Result.AddChild(ParseExpression);                         // next variable
+    end;
     DoNodeCreated(Result);
     Exit;
   end;

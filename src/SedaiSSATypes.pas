@@ -247,6 +247,7 @@ type
     ssaGfxImageInfo,   // __IMGINFO(handle, which) -> w/h (Dest=result, Src1=handle, Immediate=which)
     ssaGfxGet,         // GET (x1,y1)-(x2,y2),dst : capture screen rect into image dst
     ssaGfxPut,         // PUT (x,y),src[,mode] : blit image src onto screen
+    ssaGfxScreenInfo,  // __SCRINFO(which) -> screen w/h/depth/... (Dest=result, Immediate=which)
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n
     ssaGraphicRwindow, // RWINDOW(n): Return window size info
