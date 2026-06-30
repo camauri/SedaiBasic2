@@ -38,7 +38,7 @@ uses
   SedaiSDL2VideoModes,
   SedaiBytecodeTypes, SedaiBytecodeVM, SedaiImmediateCompiler,
   SedaiBytecodeSerializer, SedaiBytecodeCompiler,
-  SedaiBytecodeDisassembler,
+  SedaiBytecodeDisassembler, SedaiRunner,
   SedaiSSATypes, SedaiSSA,
   SedaiBasicKeywords, SedaiDebugger,
   SedaiMemoryMapper, SedaiC128MemoryMapper, SedaiSpriteEngine, SedaiSpriteTypes,
@@ -951,6 +951,8 @@ type
 
     // Startup file support (passed via command line)
     procedure SetStartupFile(const AFileName: string; AAutoRun: Boolean);
+    function SourceHasLineNumbers(const AFileName: string): Boolean;  // CLASSIC (true) vs FreeBASIC MODERN (false)
+    procedure LoadModernSource(const AFileName: string);              // compile a FreeBASIC source straight to bytecode
     // History file support
     procedure SetHistoryFile(const AFileName: string);
 
@@ -9005,6 +9007,80 @@ begin
   end;
 end;
 
+function TSedaiNewConsole.SourceHasLineNumbers(const AFileName: string): Boolean;
+// A classic line-numbered BASIC source has a leading integer on its lines; a FreeBASIC (MODERN) source
+// never does. Scan the non-empty lines: if the first whitespace-delimited token is a non-negative
+// integer on any line, treat the file as classic.
+var
+  Lines: TStringList;
+  i, SpacePos, N: Integer;
+  L, Tok: string;
+begin
+  Result := False;
+  if not FileExists(AFileName) then Exit;
+  Lines := TStringList.Create;
+  try
+    try Lines.LoadFromFile(AFileName); except Exit; end;
+    for i := 0 to Lines.Count - 1 do
+    begin
+      L := Trim(Lines[i]);
+      if L = '' then Continue;
+      SpacePos := Pos(' ', L);
+      if SpacePos > 0 then Tok := Copy(L, 1, SpacePos - 1) else Tok := L;
+      if TryStrToInt(Tok, N) and (N >= 0) then Exit(True);
+    end;
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure TSedaiNewConsole.LoadModernSource(const AFileName: string);
+// Compile a FreeBASIC (MODERN) source file straight to bytecode and switch to bytecode-run mode (the
+// line-keyed program store cannot hold a number-less source). RUN then executes FLoadedBytecode.
+var
+  Runner: TSedaiRunner;
+begin
+  FTextBuffer.NewLine;
+  FTextBuffer.PutString('LOADING ' + ExtractFileName(AFileName));
+  FTextBuffer.NewLine;
+  RenderScreen;
+  Runner := TSedaiRunner.Create;
+  try
+    if Assigned(FLoadedBytecode) then FreeAndNil(FLoadedBytecode);
+    FProgramMemory.Clear;
+    try
+      FLoadedBytecode := Runner.LoadFromSource(AFileName);
+    except
+      on E: Exception do
+      begin
+        FLoadedBytecode := nil;
+        FBytecodeMode := False;
+        FTextBuffer.PutString('?COMPILE ERROR: ' + E.Message);
+        FTextBuffer.NewLine;
+        FTextBuffer.PutString('READY.'); FReadyPrinted := True;
+        FTextBuffer.NewLine;
+        Exit;
+      end;
+    end;
+    if Assigned(FLoadedBytecode) then
+    begin
+      FBytecodeMode := True;
+      FTextBuffer.PutString('READY.'); FReadyPrinted := True;
+      FTextBuffer.NewLine;
+    end
+    else
+    begin
+      FBytecodeMode := False;
+      FTextBuffer.PutString('?LOAD FAILED');
+      FTextBuffer.NewLine;
+      FTextBuffer.PutString('READY.'); FReadyPrinted := True;
+      FTextBuffer.NewLine;
+    end;
+  finally
+    Runner.Free;
+  end;
+end;
+
 procedure TSedaiNewConsole.ExecuteBLoad(const Filename: string);
 var
   Serializer: TBytecodeSerializer;
@@ -11608,9 +11684,17 @@ begin
       FTextBuffer.NewLine;
       ExecuteBLoad(FStartupFile);
     end
+    else if not SourceHasLineNumbers(FStartupFile) then
+    begin
+      // FreeBASIC (MODERN) source: no line numbers, so it cannot live in the line-keyed program store.
+      // Compile it straight to bytecode and run it via the bytecode path (like a precompiled .basc).
+      FTextBuffer.PutString('LOAD "' + FStartupFile + '"');
+      FTextBuffer.NewLine;
+      LoadModernSource(FStartupFile);
+    end
     else
     begin
-      // Load BASIC source
+      // Classic line-numbered BASIC: load into the editable program store.
       FTextBuffer.PutString('LOAD "' + FStartupFile + '"');
       FTextBuffer.NewLine;
       ExecuteLoad(FStartupFile);
