@@ -202,6 +202,7 @@ type
     antGfxPaint,          // PAINT (x, y) [, color] (FreeBASIC graphics, flood fill)
     antGfxLine,           // LINE (x1,y1)-(x2,y2) [,color] [,B|BF] (FreeBASIC graphics)
     antGfxCircle,         // CIRCLE (x, y), r [, color] (FreeBASIC graphics)
+    antPalette,           // PALETTE [GET] [index, r, g, b] (FreeBASIC; OP attribute = SET/GET/RESET)
     antBeep,              // BEEP command (console bell: emits CHR(7))
     antBox,               // BOX command
     antCircle,            // CIRCLE command

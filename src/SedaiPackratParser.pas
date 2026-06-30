@@ -3707,6 +3707,8 @@ begin
     Result := TASTNode.Create(antScreenRes, Token)
   else if CmdName = 'PSET' then
     Result := TASTNode.Create(antGfxPset, Token)
+  else if CmdName = 'PALETTE' then
+    Result := TASTNode.Create(antPalette, Token)
   else
     Result := TASTNode.Create(antStatement, Token);
 
@@ -3745,6 +3747,35 @@ begin
     begin
       Context.Advance;                                            // ','
       Result.AddChild(ParseExpression);                           // color
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // FreeBASIC PALETTE — three v1 forms (the QB-compat &hBBGGRR 2-arg form and PALETTE USING deferred):
+  //   PALETTE                       -> reset the palette to the mode default          (OP=RESET)
+  //   PALETTE index, r, g, b        -> set entry index to (r,g,b), components 0-255   (OP=SET)
+  //   PALETTE GET index, r, g, b    -> read entry index into the r, g, b variables    (OP=GET)
+  if Result.NodeType = antPalette then
+  begin
+    if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+      Result.Attributes.Values['OP'] := 'RESET'
+    else
+    begin
+      if UpperCase(Context.CurrentToken.Value) = 'GET' then
+      begin
+        Result.Attributes.Values['OP'] := 'GET';
+        Context.Advance;                                          // GET
+      end
+      else
+        Result.Attributes.Values['OP'] := 'SET';
+      Result.AddChild(ParseExpression);                           // index
+      if Context.Check(ttSeparParam) then Context.Advance;        // ','
+      Result.AddChild(ParseExpression);                           // r (or r-variable for GET)
+      if Context.Check(ttSeparParam) then Context.Advance;        // ','
+      Result.AddChild(ParseExpression);                           // g
+      if Context.Check(ttSeparParam) then Context.Advance;        // ','
+      Result.AddChild(ParseExpression);                           // b
     end;
     DoNodeCreated(Result);
     Exit;

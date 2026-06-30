@@ -3150,6 +3150,18 @@ begin
           if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;             // radius
           if ((Instr.Immediate shr 16) and $FFFF) > MaxIntReg then MaxIntReg := (Instr.Immediate shr 16) and $FFFF;  // color
         end;
+        // bcGfxPalette: Src1=index, Src2=packed colour (both int)
+        bcGfxPalette:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // index
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // colour
+        end;
+        // bcGfxPalGet: Dest=result, Src1=index (Immediate = which selector, not a reg)
+        bcGfxPalGet:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // result
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // index
+        end;
 
         // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
         // Immediate bits 0-15 = row2 register(int), bits 16-31 = clear register(int)
@@ -6230,6 +6242,7 @@ procedure TBytecodeVM.ExecuteGraphicsOp(Ctx: TExecutionContext; const Instr: TBy
 var
   SubOp: Word;
   DrawMode: Integer;
+  PalColor: UInt32;
 begin
   // M5.3: off the render-owner thread, defer to the queue instead of touching SDL. Dormant on
   // the single-threaded path (FHasWorkers = False short-circuits before any thread-id check).
@@ -6501,6 +6514,25 @@ begin
         FGraphics.DrawEllipse(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
           Ctx.IntRegs[Instr.Immediate and $FFFF], Ctx.IntRegs[Instr.Immediate and $FFFF],
           UInt32(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]), 0.0, 360.0, 0.0, 0.0, 1);
+    31: // bcGfxPalette - PALETTE index, r,g,b  (Src1=index, Src2=packed RGBA colour)
+      if Assigned(FGraphics) and (Ctx.IntRegs[Instr.Src1] >= 0) and (Ctx.IntRegs[Instr.Src1] <= 255) then
+        FGraphics.SetPaletteColor(TPaletteIndex(Ctx.IntRegs[Instr.Src1]), UInt32(Ctx.IntRegs[Instr.Src2]));
+    32: // bcGfxPalGet - __PALGET(index, which) -> 0-255 component (Dest=result, Src1=index, Immediate=which)
+      if Assigned(FGraphics) and (Ctx.IntRegs[Instr.Src1] >= 0) and (Ctx.IntRegs[Instr.Src1] <= 255) then
+      begin
+        // Engine palette is ABGR ($AABBGGRR): red = low byte, blue = bits 16-23.
+        PalColor := UInt32(FGraphics.GetPaletteColor(TPaletteIndex(Ctx.IntRegs[Instr.Src1])));
+        case Instr.Immediate of
+          0: Ctx.IntRegs[Instr.Dest] := PalColor and $FF;           // red
+          1: Ctx.IntRegs[Instr.Dest] := (PalColor shr 8) and $FF;   // green
+        else Ctx.IntRegs[Instr.Dest] := (PalColor shr 16) and $FF;  // blue
+        end;
+      end
+      else
+        Ctx.IntRegs[Instr.Dest] := 0;
+    33: // bcGfxPaletteReset - PALETTE (no args)
+      if Assigned(FGraphics) then
+        FGraphics.ResetPalette;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

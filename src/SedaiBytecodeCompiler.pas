@@ -377,6 +377,9 @@ begin
     ssaGfxPaint: Result := bcGfxPaint;
     ssaGfxLine: Result := bcGfxLine;
     ssaGfxCircle: Result := bcGfxCircle;
+    ssaGfxPalette: Result := bcGfxPalette;
+    ssaGfxPalGet: Result := bcGfxPalGet;
+    ssaGfxPaletteReset: Result := bcGfxPaletteReset;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;
     ssaGraphicRwindow: Result := bcGraphicRwindow;

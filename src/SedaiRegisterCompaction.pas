@@ -253,6 +253,7 @@ begin
     // === GROUP 10: Graphics ===
     bcGraphicRGBA,    // Dest = RGBA result (int)
     bcGfxPoint,       // POINT(x,y): Dest = pixel color (int)
+    bcGfxPalGet,      // __PALGET(index,which): Dest = palette component (int)
     bcGraphicRdot,    // Dest = pixel cursor info (int)
     bcGraphicGetMode, // Dest = current graphic mode (int)
     bcGraphicPos,     // POS(x): cursor column position (int)
@@ -456,6 +457,7 @@ begin
     bcGraphicCircle,  // Src1 = color register (int)
     bcGraphicPaint,   // Src1 = source register (int)
     bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxLine, bcGfxCircle,  // FreeBASIC graphics: Src1 = w / x / x1 (int)
+    bcGfxPalette, bcGfxPalGet,  // PALETTE: Src1 = index (int)
     bcGraphicSShape,  // Src1 = x1 coordinate (int)
     bcGraphicColor,   // Src1 = source register (int)
     bcGraphicWidth,   // Src1 = width value (int)
@@ -592,6 +594,7 @@ begin
     bcGraphicWindow,  // Src2 = row1 register (int)
     bcGraphicCircle,  // Src2 = x register (int)
     bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxLine, bcGfxCircle,  // FreeBASIC graphics: Src2 = h / y / y1 (int)
+    bcGfxPalette,  // PALETTE set: Src2 = packed colour (int)
     bcGraphicScale,   // Src2 = xmax register (int)
     bcGraphicColor,   // Src2 = color value (int)
     bcGraphicPaint,   // Src2 = x coordinate (int)

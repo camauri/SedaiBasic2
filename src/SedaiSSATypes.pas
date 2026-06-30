@@ -237,6 +237,9 @@ type
     ssaGfxPaint,       // PAINT (x,y),color (flood fill)
     ssaGfxLine,        // LINE (x1,y1)-(x2,y2),color[,B|BF] (line / box outline / filled box)
     ssaGfxCircle,      // CIRCLE (x,y),r[,color] (circle via DrawEllipse)
+    ssaGfxPalette,     // PALETTE index, r, g, b : set a palette entry (Src1=index, Src2=packed color)
+    ssaGfxPalGet,      // __PALGET(index, which) -> palette component (Dest=result, Src1=index, Immediate=which)
+    ssaGfxPaletteReset,// PALETTE (no args) : reset the palette to the mode default
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n
     ssaGraphicRwindow, // RWINDOW(n): Return window size info

@@ -401,6 +401,7 @@ type
     procedure ProcessGfxPaint(Node: TASTNode);   // PAINT (x, y) [, color] (flood fill)
     procedure ProcessGfxLine(Node: TASTNode);     // LINE (x1,y1)-(x2,y2) [,color] [,B|BF]
     procedure ProcessGfxCircle(Node: TASTNode);   // CIRCLE (x, y), r [, color]
+    procedure ProcessPalette(Node: TASTNode);      // PALETTE [GET] [index, r, g, b] / reset
     procedure ProcessColor(Node: TASTNode);
     procedure ProcessSetColor(Node: TASTNode);
     procedure ProcessWidth(Node: TASTNode);
@@ -2998,6 +2999,25 @@ begin
           end
           else
             raise Exception.Create('RGB requires 3 arguments: RGB(r, g, b)');
+        end
+        else if FuncName = '__PALGET' then
+        begin
+          // Internal helper for PALETTE GET: __PALGET(index, which) -> palette component (0=r,1=g,2=b),
+          // each 0-255. Reads via FGraphics.GetPaletteColor; the `which` selector is a constant literal.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
+            ProcessExpression(ArgListNode.GetChild(1), RVal);     // which (constant 0/1/2)
+            DestReg := FProgram.AllocRegister(srtInt);
+            Result := MakeSSARegister(srtInt, DestReg);
+            // which goes in Src3 -> Immediate
+            if RVal.Kind = svkConstInt then
+              EmitInstruction(ssaGfxPalGet, Result, ArgReg, MakeSSAValue(svkNone), RVal)
+            else
+              EmitInstruction(ssaGfxPalGet, Result, ArgReg, MakeSSAValue(svkNone), EnsureIntRegister(RVal));
+          end
+          else
+            raise Exception.Create('__PALGET requires 2 arguments');
         end
         else if FuncName = 'RDOT' then
         begin
@@ -7340,6 +7360,67 @@ begin
   EmitInstruction(ssaGfxCircle, MakeSSAValue(svkNone), XR, YR, RR);
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(CR, nil);
+end;
+
+procedure TSSAGenerator.ProcessPalette(Node: TASTNode);
+// PALETTE (FreeBASIC). OP attribute selects the form:
+//   RESET -> ssaGfxPaletteReset (no operands).
+//   SET   -> pack (r,g,b,255) into a colour via ssaGraphicRGBA, then ssaGfxPalette(index, colour).
+//   GET   -> read entry index into the r,g,b variables. Lowered to three synthetic assignments
+//            "var = __PALGET(index, which)" so the full assignment machinery handles the store; the
+//            __PALGET graphics function (ssaGfxPalGet) reads FGraphics.GetPaletteColor and extracts
+//            the requested 0-255 component. The index expression is cloned per component.
+var
+  Op: string;
+  IdxV, RV, GV, BV, AReg, ColorReg, IdxR: TSSAValue;
+  Instr: TSSAInstruction;
+  i: Integer;
+  Assign, Call, ArgList, WhichLit: TASTNode;
+begin
+  if FCurrentBlock = nil then Exit;
+  Op := UpperCase(Node.Attributes.Values['OP']);
+
+  if Op = 'RESET' then
+  begin
+    EmitInstruction(ssaGfxPaletteReset, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+
+  if Node.ChildCount < 4 then Exit;
+
+  if Op = 'GET' then
+  begin
+    // var(i) = __PALGET(index, i)  for i = 0 (r), 1 (g), 2 (b)
+    for i := 0 to 2 do
+    begin
+      WhichLit := TASTNode.CreateWithValue(antLiteral, i, Node.Token);
+      ArgList := TASTNode.Create(antArgumentList, Node.Token);
+      ArgList.AddChild(Node.GetChild(0).Clone);   // index (cloned per component)
+      ArgList.AddChild(WhichLit);
+      Call := TASTNode.CreateWithValue(antGraphicsFunction, '__PALGET', Node.Token);
+      Call.AddChild(ArgList);
+      Assign := TASTNode.Create(antAssignment, Node.Token);
+      Assign.AddChild(Node.GetChild(i + 1).Clone); // destination variable r/g/b
+      Assign.AddChild(Call);
+      ProcessStatement(Assign);
+      Assign.Free;   // frees the synthetic subtree (Call/ArgList/clones)
+    end;
+    Exit;
+  end;
+
+  // SET: index, r, g, b (components 0-255). The engine palette is ABGR ($AABBGGRR), so pack the colour
+  // by reusing the RGBA instruction with R and B swapped: RGBA(b, g, r, 255) = (255<<24)|(b<<16)|(g<<8)|r.
+  ProcessExpression(Node.GetChild(0), IdxV); IdxR := EnsureIntRegister(IdxV);
+  ProcessExpression(Node.GetChild(1), RV);   RV := EnsureIntRegister(RV);
+  ProcessExpression(Node.GetChild(2), GV);   GV := EnsureIntRegister(GV);
+  ProcessExpression(Node.GetChild(3), BV);   BV := EnsureIntRegister(BV);
+  AReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, AReg, MakeSSAConstInt(255), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  ColorReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaGraphicRGBA, ColorReg, BV, GV, RV);   // (B,G,R) -> ABGR packing
+  Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+  Instr.AddPhiSource(AReg, nil);
+  EmitInstruction(ssaGfxPalette, MakeSSAValue(svkNone), IdxR, ColorReg, MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.ProcessBeep(Node: TASTNode);
@@ -14869,6 +14950,7 @@ begin
     antGfxPaint: ProcessGfxPaint(Node);
     antGfxLine: ProcessGfxLine(Node);
     antGfxCircle: ProcessGfxCircle(Node);
+    antPalette: ProcessPalette(Node);
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);
     antWidth: ProcessWidth(Node);

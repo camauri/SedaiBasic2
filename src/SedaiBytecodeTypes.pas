@@ -557,6 +557,12 @@ const
   bcGfxLine         = bcGroupGraphics + 29;
   // CIRCLE (x,y),r[,color] : Src1=x, Src2=y; Immediate [0-15]=radius reg, [16-31]=color reg
   bcGfxCircle       = bcGroupGraphics + 30;
+  // PALETTE index, r, g, b : set a palette entry. Src1=index reg, Src2=packed RGBA color reg
+  bcGfxPalette      = bcGroupGraphics + 31;
+  // __PALGET(index, which) : read palette component. Dest=result reg, Src1=index reg, Immediate=which (0=r,1=g,2=b)
+  bcGfxPalGet       = bcGroupGraphics + 32;
+  // PALETTE (no args) : reset the palette to the current mode default
+  bcGfxPaletteReset = bcGroupGraphics + 33;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1634,6 +1640,9 @@ begin
         28: Result := 'GfxPaint';
         29: Result := 'GfxLine';
         30: Result := 'GfxCircle';
+        31: Result := 'GfxPalette';
+        32: Result := 'GfxPalGet';
+        33: Result := 'GfxPaletteReset';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

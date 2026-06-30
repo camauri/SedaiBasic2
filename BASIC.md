@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 469 / 643 implemented (73%)** (+ 2 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 470 / 643 implemented (73%)** (+ 2 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **469 (82%)** are implemented. See the
+**572 applicable** keywords, **470 (82%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **469 / 643 implemented (73%)**, plus 2 partial (◐).
-> Of the 172 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **455 / 572 ≈ 79% of the
+> **Coverage (FreeBASIC keyword set):** **470 / 643 implemented (73%)**, plus 2 partial (◐).
+> Of the 171 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **456 / 572 ≈ 80% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -2439,7 +2439,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `COLOR` | ✓ | Sets the foreground and background color to use with the drawing procedures. |
-| `PALETTE` | ✗ | Gets or sets color table information in paletted modes. |
+| `PALETTE` | ✓ | `PALETTE index,r,g,b` sets a palette entry (components 0-255), `PALETTE GET index,r,g,b` reads it back into variables, `PALETTE` alone resets to the mode default (via IGraphicsBackend; headless-testable round-trip). The QB-compat `&hBBGGRR` 2-arg form and `PALETTE USING` deferred. |
 | `RGB` | ✓ | `RGB(r,g,b)` returns an opaque 32-bit colour (= `RGBA(r,g,b,255)`; alpha in bits 24-31). Constant-folded when all args are constant. |
 | `RGBA` | ✓ | Returns a color value including alpha (transparency) for hi/truecolor modes. |
 | `POINT` | ✓ | `POINT(x,y)` reads a pixel's colour from the screen surface (via the IGraphicsBackend abstraction). Image-buffer form deferred to G3. |

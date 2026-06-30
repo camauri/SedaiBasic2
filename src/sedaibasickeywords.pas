@@ -419,6 +419,7 @@ const
   kGRAPHIC = 'GRAPHIC';
   kRGBA    = 'RGBA';     // Create 32-bit RGBA color value: RGBA(r, g, b, a)
   kRGB     = 'RGB';      // FreeBASIC: opaque colour value RGB(r, g, b) = RGBA(r, g, b, 255)
+  kPALETTE = 'PALETTE';  // FreeBASIC: set/get/reset a palette entry
   kDRAW    = 'DRAW';
   kCIRCLE  = 'CIRCLE';
   kPAINT   = 'PAINT';
