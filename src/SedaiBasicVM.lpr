@@ -460,6 +460,7 @@ end;
 
 var
   OptWindow: Boolean = False;   // sb --window: mirror the software framebuffer into an SDL2 window
+  GTermCtrl: TTerminalController = nil;   // concrete terminal output device (for graphics attach under --window)
 {$IFDEF WITH_WINDOW}
 var
   GPresenter: TWindowPresenter = nil;
@@ -477,6 +478,10 @@ begin
   begin
     SW := TSoftwareGraphicsBackend.Create;
     AVM.SetGraphicsBackend(SW, SW);
+    // Share the backend's framebuffer with the terminal output device so the C128 (BASIC v7) graphics
+    // commands (GRAPHIC/BOX/CIRCLE/COLOR/SETCOLOR/PAINT...) render into the same surface the window
+    // shows — not just the FreeBASIC graphics. Viewport-only (no text-on-graphics / sprites).
+    if Assigned(GTermCtrl) then GTermCtrl.AttachGraphicsMemory(SW.ScreenMemory);
     GPresenter := TWindowPresenter.Create(SW, 'SedaiBasic');
     AVM.EventPollCallback := @GPresenter.Pump;   // present + pump events during execution
     Exit;
@@ -1534,7 +1539,8 @@ begin
         WriteLn('=== VIRTUAL MACHINE EXECUTION ===');
       // Use TIOManager to create I/O devices based on mode
       // Default is terminal mode (pure console, no SDL2)
-      Output := TTerminalController.Create;
+      GTermCtrl := TTerminalController.Create;
+      Output := GTermCtrl;   // keep a concrete handle so --window can attach the shared graphics surface
       Input := TTerminalInput.Create;
       Output.Initialize('SedaiBasic', 80, 25);
       VM := TBytecodeVM.Create;
@@ -1786,7 +1792,8 @@ begin
       if OptVerbose then
         WriteLn('=== VIRTUAL MACHINE EXECUTION ===');
 
-      Output := TTerminalController.Create;
+      GTermCtrl := TTerminalController.Create;
+      Output := GTermCtrl;   // keep a concrete handle so --window can attach the shared graphics surface
       Input := TTerminalInput.Create;
       Output.Initialize('SedaiBasic', 80, 25);
       VM := TBytecodeVM.Create;

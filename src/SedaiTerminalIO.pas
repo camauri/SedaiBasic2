@@ -46,7 +46,8 @@ unit SedaiTerminalIO;
 interface
 
 uses
-  Classes, SysUtils, SedaiOutputInterface, SedaiGraphicsTypes
+  Classes, SysUtils, SedaiOutputInterface, SedaiGraphicsTypes,
+  SedaiGraphicsMemory, SedaiGraphicsPrimitives
   {$IFDEF WINDOWS}
   , Windows
   {$ENDIF}
@@ -60,8 +61,19 @@ type
     FInitialized: Boolean;
     FCursorX, FCursorY: Integer;
     FCols, FRows: Integer;
+    // Optional shared graphics framebuffer (sb --window): when attached, the C128 graphics commands
+    // render into it (the software backend's surface, which the window presenter mirrors). nil = the
+    // usual headless terminal (graphics are no-ops). Not owned. Viewport-only — no text-on-graphics.
+    FGfxMem: TGraphicsMemory;
+    FGfxMode: TGraphicMode;
+    FBgIdx, FFgIdx, FMc1Idx, FMc2Idx: Byte;   // C128 colour sources -> palette indices
+    FColorSrc: array[0..6] of Integer;        // RCLR/GETCOLOR readback
+    FPcX, FPcY: Integer;                       // pixel cursor (LOCATE/DRAW)
+    function ResolveC128Color(Source: UInt32; out UseIndex: Boolean): UInt32;
   public
     constructor Create;
+    // sb --window: attach the shared graphics surface so C128 graphics draw into the window.
+    procedure AttachGraphicsMemory(Mem: TGraphicsMemory);
 
     // IOutputDevice implementation
     function Initialize(const Title: string = ''; Width: Integer = 80; Height: Integer = 25): Boolean;
@@ -378,52 +390,86 @@ begin
   Result := False;
 end;
 
-// Graphics stubs - not supported in terminal mode
+// Graphics: no-op stubs in plain terminal mode; render into the attached surface (sb --window).
+
+procedure TTerminalController.AttachGraphicsMemory(Mem: TGraphicsMemory);
+begin
+  FGfxMem := Mem;
+  FGfxMode := gm40ColText;
+  FBgIdx := 0; FFgIdx := 1; FMc1Idx := 2; FMc2Idx := 3;
+end;
+
+function TTerminalController.ResolveC128Color(Source: UInt32; out UseIndex: Boolean): UInt32;
+// C128 colour model: in classic (paletted) modes the BOX/CIRCLE/LINE "colour" is a source selector
+// (0=bg,1=fg,2=mc1,3=mc2) or a direct palette index; in the truecolor mode it is a raw RGBA value.
+begin
+  UseIndex := FGfxMode <> gmSDL2Dynamic;
+  if UseIndex then
+    case Source of
+      0: Result := FBgIdx;
+      1: Result := FFgIdx;
+      2: Result := FMc1Idx;
+      3: Result := FMc2Idx;
+    else
+      if Source < 256 then Result := Source else Result := FFgIdx;
+    end
+  else
+    Result := Source;
+end;
 
 function TTerminalController.SetGraphicMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
 begin
-  Result := False;  // Graphics not supported
+  if FGfxMem = nil then Exit(False);   // headless terminal: graphics unsupported
+  FGfxMode := Mode;
+  FGfxMem.AllocateBuffers(0, 0, Mode <> gmSDL2Dynamic, Mode);
+  if ClearBuffer then FGfxMem.ClearCurrentModeWithIndex(FBgIdx);
+  Result := True;
 end;
 
 function TTerminalController.GetGraphicMode: TGraphicMode;
 begin
-  Result := gm40ColText;  // Terminal always in text mode
+  if FGfxMem <> nil then Result := FGfxMode else Result := gm40ColText;
 end;
 
 function TTerminalController.IsInGraphicsMode: Boolean;
 begin
-  Result := False;
+  Result := (FGfxMem <> nil) and not (FGfxMode in [gm40ColText, gm80ColText, gm80x50Text]);
 end;
 
 procedure TTerminalController.ClearScreen(Mode: Integer);
 begin
-  // In terminal mode, just clear the screen
-  Clear;
+  if IsInGraphicsMode then
+    FGfxMem.ClearCurrentModeWithIndex(FBgIdx)   // SCNCLR in graphics: clear the viewport to background
+  else
+    Clear;                                        // text mode: clear the console
 end;
 
 procedure TTerminalController.SetPixel(X, Y: Integer; RGB: UInt32);
+var UseIdx: Boolean; C: UInt32;
 begin
-  // Not supported in terminal mode
+  if FGfxMem = nil then Exit;
+  C := ResolveC128Color(RGB, UseIdx);
+  if UseIdx then FGfxMem.SetPixel(X, Y, TPaletteIndex(C)) else FGfxMem.SetPixel(X, Y, C);
 end;
 
 procedure TTerminalController.SetPixel(X, Y: Integer; PaletteIndex: TPaletteIndex);
 begin
-  // Not supported in terminal mode
+  if FGfxMem <> nil then FGfxMem.SetPixel(X, Y, PaletteIndex);
 end;
 
 function TTerminalController.GetPixel(X, Y: Integer): UInt32;
 begin
-  Result := 0;
+  if FGfxMem <> nil then Result := FGfxMem.GetPixel(X, Y) else Result := 0;
 end;
 
 function TTerminalController.GetPixelIndex(X, Y: Integer): TPaletteIndex;
 begin
-  Result := 0;
+  Result := 0;   // RDOT(2) colour readback not tracked in viewport-only mode
 end;
 
 procedure TTerminalController.EnablePalette(Enable: Boolean);
 begin
-  // Not supported in terminal mode
+  if FGfxMem <> nil then FGfxMem.EnablePalette(Enable);
 end;
 
 function TTerminalController.IsPaletteEnabled: Boolean;
@@ -433,22 +479,22 @@ end;
 
 procedure TTerminalController.SetPaletteColor(Index: TPaletteIndex; RGB: UInt32);
 begin
-  // Not supported in terminal mode
+  if FGfxMem <> nil then FGfxMem.SetPaletteColor(Index, RGB);
 end;
 
 function TTerminalController.GetPaletteColor(Index: TPaletteIndex): UInt32;
 begin
-  Result := 0;
+  if FGfxMem <> nil then Result := FGfxMem.GetPaletteColor(Index) else Result := 0;
 end;
 
 procedure TTerminalController.ResetPalette;
 begin
-  // Not supported in terminal mode
+  if FGfxMem <> nil then FGfxMem.ResetPalette;
 end;
 
 procedure TTerminalController.SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
 begin
-  // Not supported in terminal mode
+  if FGfxMem <> nil then FGfxMem.SetPaletteColorRGBA(Index, R, G, B, A);
 end;
 
 function TTerminalController.LoadPaletteFromJSON(const FileName: string): Boolean;
@@ -479,34 +525,43 @@ begin
 end;
 
 procedure TTerminalController.DrawBoxWithColor(X1, Y1, X2, Y2: Integer; Color: UInt32; Angle: Double; Filled: Boolean);
+var UseIdx: Boolean; C: UInt32;
 begin
-  // Not supported in terminal mode
+  if FGfxMem = nil then Exit;
+  C := ResolveC128Color(Color, UseIdx);
+  DrawBoxToMemory(FGfxMem, X1, Y1, X2, Y2, C, UseIdx, Filled, 1, Angle, FGfxMem.State.Width, FGfxMem.State.Height);
 end;
 
 procedure TTerminalController.DrawCircleWithColor(X, Y, XR, YR: Integer; Color: UInt32;
                                                   SA, EA, Angle, Inc: Double);
+var UseIdx: Boolean; C: UInt32;
 begin
-  // Not supported in terminal mode
+  if FGfxMem = nil then Exit;
+  C := ResolveC128Color(Color, UseIdx);
+  DrawCircleToMemory(FGfxMem, X, Y, XR, YR, C, UseIdx, SA, EA, Angle, Inc, 1, FGfxMem.State.Width, FGfxMem.State.Height);
 end;
 
 procedure TTerminalController.DrawLine(X1, Y1, X2, Y2: Integer; Color: UInt32);
+var UseIdx: Boolean; C: UInt32;
 begin
-  // Not supported in terminal mode
+  if FGfxMem = nil then Exit;
+  C := ResolveC128Color(Color, UseIdx);
+  DrawLineToMemory(FGfxMem, X1, Y1, X2, Y2, C, UseIdx, 1, FGfxMem.State.Width, FGfxMem.State.Height);
 end;
 
 procedure TTerminalController.SetPixelCursor(X, Y: Integer);
 begin
-  // Not supported in terminal mode (no pixel cursor)
+  FPcX := X; FPcY := Y;
 end;
 
 function TTerminalController.GetPixelCursorX: Integer;
 begin
-  Result := 0;  // No pixel cursor in terminal mode
+  Result := FPcX;
 end;
 
 function TTerminalController.GetPixelCursorY: Integer;
 begin
-  Result := 0;  // No pixel cursor in terminal mode
+  Result := FPcY;
 end;
 
 procedure TTerminalController.SetBorderStyle(const Style: TBorderStyle);
@@ -553,18 +608,40 @@ end;
 // Additional graphics interface methods (stubs for terminal mode)
 
 procedure TTerminalController.SetColorSource(Source, Color: Integer);
+// C128 COLOR source, color (1-based colour) -> palette index source mapping.
+var Idx: Integer;
 begin
-  // Not supported in terminal mode
+  if (Source < 0) or (Source > 6) then Exit;
+  Idx := Color - 1;
+  if Idx < 0 then Idx := 0;
+  if Idx > 255 then Idx := 255;
+  FColorSrc[Source] := Idx;
+  case Source of
+    0: FBgIdx := Byte(Idx);
+    1: FFgIdx := Byte(Idx);
+    2: FMc1Idx := Byte(Idx);
+    3: FMc2Idx := Byte(Idx);
+  end;
 end;
 
 procedure TTerminalController.SetColorSourceDirect(Source, Color: Integer);
+// Like SetColorSource but Color is a 0-based palette index (no -1 adjustment).
 begin
-  // Not supported in terminal mode
+  if (Source < 0) or (Source > 6) then Exit;
+  if Color < 0 then Color := 0;
+  if Color > 255 then Color := 255;
+  FColorSrc[Source] := Color;
+  case Source of
+    0: FBgIdx := Byte(Color);
+    1: FFgIdx := Byte(Color);
+    2: FMc1Idx := Byte(Color);
+    3: FMc2Idx := Byte(Color);
+  end;
 end;
 
 function TTerminalController.GetColorSourceDirect(Source: Integer): Integer;
 begin
-  Result := 0;
+  if (Source >= 0) and (Source <= 6) then Result := FColorSrc[Source] else Result := 0;
 end;
 
 procedure TTerminalController.SetLineWidth(Width: Integer);
@@ -578,8 +655,39 @@ begin
 end;
 
 procedure TTerminalController.FloodFill(Source: Integer; X, Y: Double; Mode: Integer);
+// C128 PAINT source, x, y — iterative 4-way flood fill into the attached surface (RGBA, deterministic).
+var
+  UseIdx: Boolean;
+  FillCol, Target: UInt32;
+  W, H, Top, SX, SY, CX, CY: Integer;
+  Stack: array of record PX, PY: Integer; end;
+
+  procedure Push(AX, AY: Integer);
+  begin
+    if (AX < 0) or (AY < 0) or (AX >= W) or (AY >= H) then Exit;
+    if Top >= Length(Stack) then SetLength(Stack, (Top + 1) * 2);
+    Stack[Top].PX := AX; Stack[Top].PY := AY; Inc(Top);
+  end;
+
 begin
-  // Not supported in terminal mode
+  if FGfxMem = nil then Exit;
+  FillCol := ResolveC128Color(UInt32(Source), UseIdx);
+  if UseIdx then FillCol := FGfxMem.GetPaletteColor(TPaletteIndex(FillCol));
+  W := FGfxMem.State.Width; H := FGfxMem.State.Height;
+  SX := Round(X); SY := Round(Y);
+  if (SX < 0) or (SY < 0) or (SX >= W) or (SY >= H) then Exit;
+  Target := FGfxMem.GetPixelRGBA(SX, SY);
+  if Target = FillCol then Exit;
+  Top := 0; SetLength(Stack, 64);
+  Push(SX, SY);
+  while Top > 0 do
+  begin
+    Dec(Top);
+    CX := Stack[Top].PX; CY := Stack[Top].PY;
+    if FGfxMem.GetPixelRGBA(CX, CY) <> Target then Continue;
+    FGfxMem.SetPixelRGBA(CX, CY, FillCol);
+    Push(CX + 1, CY); Push(CX - 1, CY); Push(CX, CY + 1); Push(CX, CY - 1);
+  end;
 end;
 
 procedure TTerminalController.SetWindow(Col1, Row1, Col2, Row2: Integer; DoClear: Boolean);
