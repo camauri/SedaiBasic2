@@ -392,6 +392,7 @@ begin
     ssaGfxPCopy: Result := bcGfxPCopy;
     ssaGfxWindow: Result := bcGfxWindow;
     ssaGfxView: Result := bcGfxView;
+    ssaGfxScreen: Result := bcGfxScreen;
     ssaGfxPMap: Result := bcGfxPMap;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;

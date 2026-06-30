@@ -591,6 +591,8 @@ const
   // VIEW [SCREEN] (x1,y1)-(x2,y2) : Src1=x1, Src2=y1; Immediate [0-15]=x2 reg, [16-31]=y2 reg,
   //   bit32=has-bounds (else reset), bit33=SCREEN (absolute coords, no offset)
   bcGfxView         = bcGroupGraphics + 46;
+  // SCREEN mode [, , num_pages] : Src1=mode reg, Immediate=number of pages (mapped mode->resolution in VM)
+  bcGfxScreen       = bcGroupGraphics + 47;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1684,6 +1686,7 @@ begin
         44: Result := 'GfxWindow';
         45: Result := 'GfxPMap';
         46: Result := 'GfxView';
+        47: Result := 'GfxScreen';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

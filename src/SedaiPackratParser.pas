@@ -3766,6 +3766,8 @@ begin
     else
       Result := TASTNode.Create(antGfxView, Token);
   end
+  else if CmdName = 'SCREEN' then
+    Result := TASTNode.Create(antGfxScreen, Token)
   else if CmdName = 'SCREENINFO' then
     Result := TASTNode.Create(antScreenInfo, Token)
   else if (CmdName = 'SCREENLOCK') or (CmdName = 'SCREENUNLOCK') or
@@ -3950,6 +3952,23 @@ begin
       if Context.Check(ttSeparParam) then Context.Advance;     // ','
       Result.AddChild(ParseExpression);                        // y2
       if Context.Check(ttDelimParClose) then Context.Advance;  // ')'
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // FreeBASIC SCREEN mode [, depth [, num_pages [, ...]]] — numbered graphics mode. Children: mode,
+  // [depth], [num_pages]; depth is ignored, num_pages drives page allocation.
+  if Result.NodeType = antGfxScreen then
+  begin
+    Result.AddChild(ParseExpression);                          // mode
+    while Context.Check(ttSeparParam) do
+    begin
+      Context.Advance;                                         // ','
+      if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+        Result.AddChild(ParseExpression)
+      else
+        Result.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Token));   // empty arg placeholder
     end;
     DoNodeCreated(Result);
     Exit;

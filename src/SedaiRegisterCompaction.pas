@@ -468,6 +468,7 @@ begin
     bcGfxGet, bcGfxPut,  // GET/PUT: Src1 = x1 / x (int)
     bcGfxScreenSet, bcGfxPCopy,  // SCREENSET/PCOPY: Src1 = work / src page (int)
     bcGfxWindow, bcGfxView, bcGfxPMap,  // WINDOW/VIEW: Src1 = x1 ; PMAP: Src1 = coord (int)
+    bcGfxScreen,  // SCREEN: Src1 = mode (int)
     bcGraphicSShape,  // Src1 = x1 coordinate (int)
     bcGraphicColor,   // Src1 = source register (int)
     bcGraphicWidth,   // Src1 = width value (int)

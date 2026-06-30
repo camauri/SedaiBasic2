@@ -413,6 +413,7 @@ type
     procedure ProcessPCopy(Node: TASTNode);          // PCOPY src,dst / SCREENCOPY
     procedure ProcessGfxWindow(Node: TASTNode);      // WINDOW [SCREEN] (x1,y1)-(x2,y2)
     procedure ProcessGfxView(Node: TASTNode);        // VIEW [SCREEN] (x1,y1)-(x2,y2)
+    procedure ProcessGfxScreen(Node: TASTNode);      // SCREEN mode [, depth, num_pages]
     procedure ProcessColor(Node: TASTNode);
     procedure ProcessSetColor(Node: TASTNode);
     procedure ProcessWidth(Node: TASTNode);
@@ -7787,6 +7788,26 @@ begin
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(Y2R, nil);
   Instr.AddPhiSource(MakeSSAConstInt(Flags), nil);
+end;
+
+procedure TSSAGenerator.ProcessGfxScreen(Node: TASTNode);
+// SCREEN mode [, depth [, num_pages]] : numbered graphics mode. Src1=mode; num_pages (child 2, a
+// compile-time constant, default 1) in Src3 -> Immediate. depth (child 1) is accepted-and-ignored.
+var
+  ModeVal, ModeReg, NVal: TSSAValue;
+  NumPages: Int64;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 1) then Exit;
+  ProcessExpression(Node.GetChild(0), ModeVal); ModeReg := EnsureIntRegister(ModeVal);
+  NumPages := 1;
+  if Node.ChildCount >= 3 then
+  begin
+    ProcessExpression(Node.GetChild(2), NVal);
+    if NVal.Kind = svkConstInt then NumPages := NVal.ConstInt
+    else if NVal.Kind = svkConstFloat then NumPages := Trunc(NVal.ConstFloat);
+  end;
+  if NumPages < 1 then NumPages := 1;
+  EmitInstruction(ssaGfxScreen, MakeSSAValue(svkNone), ModeReg, MakeSSAValue(svkNone), MakeSSAConstInt(NumPages));
 end;
 
 procedure TSSAGenerator.ProcessBeep(Node: TASTNode);
@@ -15327,6 +15348,7 @@ begin
     antPCopy: ProcessPCopy(Node);
     antGfxWindow: ProcessGfxWindow(Node);
     antGfxView: ProcessGfxView(Node);
+    antGfxScreen: ProcessGfxScreen(Node);
     antGfxNop: ;  // SCREENLOCK/UNLOCK/SYNC/WINDOWTITLE/VIEW PRINT: accept-and-ignore (no code emitted)
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);

@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 482 / 643 implemented (75%)** (+ 2 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 483 / 643 implemented (75%)** (+ 1 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **482 (84%)** are implemented. See the
+**572 applicable** keywords, **483 (84%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **482 / 643 implemented (75%)**, plus 2 partial (◐).
+> **Coverage (FreeBASIC keyword set):** **483 / 643 implemented (75%)**, plus 1 partial (◐).
 > Of the 159 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **468 / 572 ≈ 82% of the
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **469 / 572 ≈ 82% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -2506,7 +2506,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `SCREENLIST` | ✗ | Gets the available fullscreen resolutions. |
-| `SCREEN (Graphics) and SCREENRES` | ◐ | `SCREENRES w,h` sets the graphics screen surface (via IGraphicsBackend). Headless: exact w×h; on sbv: routed to the SDL2 dynamic mode (precise arbitrary w×h sizing on screen deferred to G1). |
+| `SCREEN (Graphics) and SCREENRES` | ✓ | `SCREENRES w,h[,depth[,num_pages]]` sets the graphics screen surface; `SCREEN n` selects a numbered QB/FB mode (1/7→320×200, 13→320×200, 18→640×480, 19→800×600, 20→1024×768, 21→1280×1024, …) mapped to a resolution. Both allocate pages and route through IGraphicsBackend (headless-testable via SCREENINFO). depth accepted-and-ignored. |
 | `SCREENINFO` | ✓ | `SCREENINFO w, h [, depth, bpp, pitch, rate]` writes the current graphics surface's width/height (and depth=32, bpp=4, pitch=w*4) into the variables (via IGraphicsBackend; headless-testable). Desktop-info form deferred. |
 | `SCREENCONTROL` | ✗ | Gets or sets internal graphics library settings. |
 | `SCREENEVENT` | ✗ | Gets system events. |

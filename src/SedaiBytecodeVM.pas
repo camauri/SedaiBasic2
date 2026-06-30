@@ -226,6 +226,7 @@ type
     procedure ExecuteSuperinstruction(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     function GfxMapX(LX: Double): Integer;   // FreeBASIC WINDOW: logical x -> physical x
     function GfxMapY(LY: Double): Integer;   // FreeBASIC WINDOW: logical y -> physical y
+    procedure SetupGfxScreen(W, H, NumPages: Integer);  // SCREENRES/SCREEN: resize + (re)build pages
     // Group-specific dispatch handlers
     procedure ExecuteStringOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteMathOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -3250,6 +3251,9 @@ begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
+        // bcGfxScreen: Src1=mode (Immediate = num_pages const, not a reg)
+        bcGfxScreen:
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
 
         // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
         // Immediate bits 0-15 = row2 register(int), bits 16-31 = clear register(int)
@@ -6326,6 +6330,26 @@ begin
   end;
 end;
 
+procedure TBytecodeVM.SetupGfxScreen(W, H, NumPages: Integer);
+// SCREENRES / SCREEN: resize the screen surface and (re)build the page table (page 0 = screen, pages
+// 1..n-1 = same-size image surfaces). Resets the work/visible page to 0. Shared by both opcodes.
+var
+  i: Integer;
+begin
+  if not Assigned(FGraphics) then Exit;
+  FGraphics.ResizeScreen(W, H, 0);
+  for i := 1 to High(FGfxPages) do
+    if FGfxPages[i] <> GFX_SCREEN_SURFACE then FGraphics.DestroySurface(FGfxPages[i]);
+  if NumPages < 1 then NumPages := 1;
+  SetLength(FGfxPages, NumPages);
+  FGfxPages[0] := GFX_SCREEN_SURFACE;
+  for i := 1 to NumPages - 1 do
+    FGfxPages[i] := FGraphics.CreateSurface(W, H, $000000FF);
+  FGfxWorkPage := 0;
+  FGfxVisiblePage := 0;
+  FGfxWorkSurface := GFX_SCREEN_SURFACE;
+end;
+
 function TBytecodeVM.GfxMapX(LX: Double): Integer;
 // Map a logical x to a physical x: WINDOW transform (identity when off) then the VIEW viewport offset.
 begin
@@ -6583,23 +6607,7 @@ begin
         FOutputDevice.ResetPalette;
     // FreeBASIC graphics (phase 1 slice) routed through the IGraphicsBackend abstraction.
     25: // bcGfxScreenRes - SCREENRES w, h [, , numpages]  (Immediate = number of pages, default 1)
-      if Assigned(FGraphics) then
-      begin
-        FGraphics.ResizeScreen(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], 0);
-        // (Re)build the page table. Free any image-backed pages from a previous SCREENRES, then page 0 =
-        // the screen surface and pages 1..n-1 are fresh image surfaces of the same size.
-        for GetSx := 1 to High(FGfxPages) do
-          if FGfxPages[GetSx] <> GFX_SCREEN_SURFACE then FGraphics.DestroySurface(FGfxPages[GetSx]);
-        DrawMode := Instr.Immediate;                       // numpages (reuse temp)
-        if DrawMode < 1 then DrawMode := 1;
-        SetLength(FGfxPages, DrawMode);
-        FGfxPages[0] := GFX_SCREEN_SURFACE;
-        for GetSx := 1 to DrawMode - 1 do
-          FGfxPages[GetSx] := FGraphics.CreateSurface(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], $000000FF);
-        FGfxWorkPage := 0;
-        FGfxVisiblePage := 0;
-        FGfxWorkSurface := GFX_SCREEN_SURFACE;
-      end;
+      SetupGfxScreen(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate);
     26: // bcGfxPset - PSET (x,y), color  (color in Immediate float-free int register; targets the work page)
       if Assigned(FGraphics) then
         FGraphics.SetPixel(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
@@ -6812,6 +6820,27 @@ begin
             if WinY1 <= WinY2 then FGfxViewOffsetY := WinY1 else FGfxViewOffsetY := WinY2;
           end;
         end;
+      end;
+    47: // bcGfxScreen - SCREEN mode [, , num_pages]: numbered graphics mode -> resolution (QB/FB table)
+      begin
+        case Ctx.IntRegs[Instr.Src1] of
+          1, 7:  begin WinW := 320; WinH := 200; end;
+          2, 8:  begin WinW := 640; WinH := 200; end;
+          9, 10: begin WinW := 640; WinH := 350; end;
+          11, 12, 18: begin WinW := 640; WinH := 480; end;
+          13:    begin WinW := 320; WinH := 200; end;
+          14:    begin WinW := 320; WinH := 240; end;
+          15:    begin WinW := 400; WinH := 300; end;
+          16:    begin WinW := 512; WinH := 384; end;
+          17:    begin WinW := 640; WinH := 400; end;
+          19:    begin WinW := 800; WinH := 600; end;
+          20:    begin WinW := 1024; WinH := 768; end;
+          21:    begin WinW := 1280; WinH := 1024; end;
+        else
+          WinW := 0; WinH := 0;   // mode 0 / unknown: no graphics mode change (v1)
+        end;
+        if (WinW > 0) and (WinH > 0) then
+          SetupGfxScreen(WinW, WinH, Instr.Immediate);
       end;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
