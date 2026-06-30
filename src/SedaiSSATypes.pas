@@ -240,6 +240,8 @@ type
     ssaGfxPalette,     // PALETTE index, r, g, b : set a palette entry (Src1=index, Src2=packed color)
     ssaGfxPalGet,      // __PALGET(index, which) -> palette component (Dest=result, Src1=index, Immediate=which)
     ssaGfxPaletteReset,// PALETTE (no args) : reset the palette to the mode default
+    ssaGfxColor,       // COLOR [fg][,bg] : set current draw foreground/background (Src1=fg, Src2=bg)
+    ssaGfxForeColor,   // read the current draw foreground colour (Dest=result) — omitted-colour default
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n
     ssaGraphicRwindow, // RWINDOW(n): Return window size info

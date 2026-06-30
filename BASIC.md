@@ -2438,7 +2438,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `COLOR` | ✓ | Sets the foreground and background color to use with the drawing procedures. |
+| `COLOR` | ✓ | Sets the foreground/background drawing colours. C128 form (`COLOR source,color`, CLASSIC dialect) and FreeBASIC form (`COLOR [fg][,bg]`, MODERN dialect → sets the current draw foreground/background; subsequent PSET/LINE/CIRCLE/PAINT with no explicit colour use the foreground). |
 | `PALETTE` | ✓ | `PALETTE index,r,g,b` sets a palette entry (components 0-255), `PALETTE GET index,r,g,b` reads it back into variables, `PALETTE` alone resets to the mode default (via IGraphicsBackend; headless-testable round-trip). The QB-compat `&hBBGGRR` 2-arg form and `PALETTE USING` deferred. |
 | `RGB` | ✓ | `RGB(r,g,b)` returns an opaque 32-bit colour (= `RGBA(r,g,b,255)`; alpha in bits 24-31). Constant-folded when all args are constant. |
 | `RGBA` | ✓ | Returns a color value including alpha (transparency) for hi/truecolor modes. |

@@ -402,6 +402,8 @@ type
     procedure ProcessGfxLine(Node: TASTNode);     // LINE (x1,y1)-(x2,y2) [,color] [,B|BF]
     procedure ProcessGfxCircle(Node: TASTNode);   // CIRCLE (x, y), r [, color]
     procedure ProcessPalette(Node: TASTNode);      // PALETTE [GET] [index, r, g, b] / reset
+    procedure ProcessGfxColor(Node: TASTNode);     // COLOR [fg][,bg] (FreeBASIC draw colour)
+    function  DefaultDrawColorReg: TSSAValue;       // omitted-colour default = current draw foreground
     procedure ProcessColor(Node: TASTNode);
     procedure ProcessSetColor(Node: TASTNode);
     procedure ProcessWidth(Node: TASTNode);
@@ -7273,10 +7275,7 @@ begin
     ProcessExpression(Node.GetChild(2), CVal); CReg := EnsureIntRegister(CVal);
   end
   else
-  begin
-    CReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, CReg, MakeSSAConstInt(Int64($FFFFFFFF)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));  // default: white
-  end;
+    CReg := DefaultDrawColorReg;   // omitted colour -> current draw foreground (COLOR)
   EmitInstruction(ssaGfxPset, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color -> Immediate
 end;
 
@@ -7294,10 +7293,7 @@ begin
     ProcessExpression(Node.GetChild(2), CVal); CReg := EnsureIntRegister(CVal);
   end
   else
-  begin
-    CReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, CReg, MakeSSAConstInt(Int64($FFFFFFFF)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));  // default: white
-  end;
+    CReg := DefaultDrawColorReg;   // omitted colour -> current draw foreground (COLOR)
   EmitInstruction(ssaGfxPaint, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color -> Immediate
 end;
 
@@ -7322,10 +7318,7 @@ begin
     ProcessExpression(Node.GetChild(4), CV); CR := EnsureIntRegister(CV);
   end
   else
-  begin
-    CR := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, CR, MakeSSAConstInt(Int64($FFFFFFFF)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));  // default: white
-  end;
+    CR := DefaultDrawColorReg;   // omitted colour -> current draw foreground (COLOR)
   Shape := UpperCase(Node.Attributes.Values['SHAPE']);
   if Shape = 'BF' then Flag := 2
   else if Shape = 'B' then Flag := 1
@@ -7353,10 +7346,7 @@ begin
     ProcessExpression(Node.GetChild(3), CV); CR := EnsureIntRegister(CV);
   end
   else
-  begin
-    CR := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, CR, MakeSSAConstInt(Int64($FFFFFFFF)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));  // default: white
-  end;
+    CR := DefaultDrawColorReg;   // omitted colour -> current draw foreground (COLOR)
   EmitInstruction(ssaGfxCircle, MakeSSAValue(svkNone), XR, YR, RR);
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(CR, nil);
@@ -7421,6 +7411,46 @@ begin
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(AReg, nil);
   EmitInstruction(ssaGfxPalette, MakeSSAValue(svkNone), IdxR, ColorReg, MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.DefaultDrawColorReg: TSSAValue;
+// Colour register used when a drawing statement omits its colour: the current draw foreground (set by
+// COLOR; defaults to white). Read at runtime via ssaGfxForeColor so a prior COLOR takes effect. (Safe
+// under LICM: in GlobalVariableSemantics mode no register-dest instruction is hoisted.)
+begin
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaGfxForeColor, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessGfxColor(Node: TASTNode);
+// COLOR [fg] [, bg] (FreeBASIC): set the current draw foreground/background colour. Either may be
+// omitted; the HASFG/HASBG attributes (and Immediate flag bits) tell the VM which to update.
+var
+  FgReg, BgReg, ChildVal: TSSAValue;
+  HasFg, HasBg: Boolean;
+  Flags: Int64;
+  Idx: Integer;
+begin
+  if FCurrentBlock = nil then Exit;
+  HasFg := Node.Attributes.Values['HASFG'] = '1';
+  HasBg := Node.Attributes.Values['HASBG'] = '1';
+  Idx := 0;
+  FgReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, FgReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  BgReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, BgReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  if HasFg then
+  begin
+    ProcessExpression(Node.GetChild(Idx), ChildVal); FgReg := EnsureIntRegister(ChildVal); Inc(Idx);
+  end;
+  if HasBg then
+  begin
+    ProcessExpression(Node.GetChild(Idx), ChildVal); BgReg := EnsureIntRegister(ChildVal);
+  end;
+  Flags := 0;
+  if HasFg then Flags := Flags or 1;
+  if HasBg then Flags := Flags or 2;
+  EmitInstruction(ssaGfxColor, MakeSSAValue(svkNone), FgReg, BgReg, MakeSSAConstInt(Flags));   // Src3=flags -> Immediate
 end;
 
 procedure TSSAGenerator.ProcessBeep(Node: TASTNode);
@@ -14951,6 +14981,7 @@ begin
     antGfxLine: ProcessGfxLine(Node);
     antGfxCircle: ProcessGfxCircle(Node);
     antPalette: ProcessPalette(Node);
+    antGfxColor: ProcessGfxColor(Node);
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);
     antWidth: ProcessWidth(Node);

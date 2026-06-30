@@ -380,6 +380,8 @@ begin
     ssaGfxPalette: Result := bcGfxPalette;
     ssaGfxPalGet: Result := bcGfxPalGet;
     ssaGfxPaletteReset: Result := bcGfxPaletteReset;
+    ssaGfxColor: Result := bcGfxColor;
+    ssaGfxForeColor: Result := bcGfxForeColor;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;
     ssaGraphicRwindow: Result := bcGraphicRwindow;

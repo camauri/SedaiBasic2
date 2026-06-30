@@ -3674,7 +3674,13 @@ begin
   else if CmdName = 'LOCATE' then
     Result := TASTNode.Create(antLocate, Token)
   else if CmdName = 'COLOR' then
-    Result := TASTNode.Create(antColor, Token)
+  begin
+    // FreeBASIC COLOR [fg][,bg] (draw colours) vs C128 COLOR source,color — disambiguated by dialect.
+    if FModernMode then
+      Result := TASTNode.Create(antGfxColor, Token)
+    else
+      Result := TASTNode.Create(antColor, Token);
+  end
   else if CmdName = 'SETCOLOR' then
     Result := TASTNode.Create(antSetColor, Token)
   else if CmdName = 'WIDTH' then
@@ -3776,6 +3782,28 @@ begin
       Result.AddChild(ParseExpression);                           // g
       if Context.Check(ttSeparParam) then Context.Advance;        // ','
       Result.AddChild(ParseExpression);                           // b
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // FreeBASIC COLOR [fg] [, bg] — set the current draw foreground/background colour. Either may be
+  // omitted ("COLOR fg", "COLOR fg, bg", "COLOR , bg"). HASFG/HASBG attributes record which are present.
+  if Result.NodeType = antGfxColor then
+  begin
+    if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+    begin
+      Result.AddChild(ParseExpression);                           // fg
+      Result.Attributes.Values['HASFG'] := '1';
+    end;
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;                                            // ','
+      if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+      begin
+        Result.AddChild(ParseExpression);                         // bg
+        Result.Attributes.Values['HASBG'] := '1';
+      end;
     end;
     DoNodeCreated(Result);
     Exit;

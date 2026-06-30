@@ -360,7 +360,7 @@ begin
     ssaGraphicColor, ssaSetColor, ssaGraphicWidth, ssaGraphicScale, ssaGraphicPaint, ssaGraphicWindow,
     ssaGraphicSShape, ssaGraphicGShape, ssaGraphicGList, ssaPLoad, ssaPSave, ssaPRst, ssaScnClr,
     ssaGfxScreenRes, ssaGfxPset, ssaGfxPaint, ssaGfxLine, ssaGfxCircle,
-    ssaGfxPalette, ssaGfxPaletteReset:
+    ssaGfxPalette, ssaGfxPaletteReset, ssaGfxColor:
       Result := True;
 
     // Sprite operations - always live (modify sprite state)

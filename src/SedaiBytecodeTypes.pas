@@ -563,6 +563,10 @@ const
   bcGfxPalGet       = bcGroupGraphics + 32;
   // PALETTE (no args) : reset the palette to the current mode default
   bcGfxPaletteReset = bcGroupGraphics + 33;
+  // COLOR [fg][,bg] : set the current draw colours. Src1=fg reg, Src2=bg reg, Immediate bit0=hasFg, bit1=hasBg
+  bcGfxColor        = bcGroupGraphics + 34;
+  // read the current draw foreground (Dest=result) — used as the omitted-colour default for PSET/LINE/...
+  bcGfxForeColor    = bcGroupGraphics + 35;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1643,6 +1647,8 @@ begin
         31: Result := 'GfxPalette';
         32: Result := 'GfxPalGet';
         33: Result := 'GfxPaletteReset';
+        34: Result := 'GfxColor';
+        35: Result := 'GfxForeColor';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

@@ -145,6 +145,8 @@ type
     FOutputDevice: IOutputDevice;
     FGraphics: IGraphicsBackend;     // FreeBASIC graphics phase: operation-level drawing backend (SW headless / SDL2 on sbv)
     FOwnedGraphics: TObject;         // concrete backend object the VM owns and frees (e.g. the software backend on sb)
+    FGfxForeColor: UInt32;           // current FreeBASIC draw foreground (COLOR fg); omitted-colour default
+    FGfxBackColor: UInt32;           // current FreeBASIC draw background (COLOR ,bg)
     FInputDevice: IInputDevice;
     FMemoryMapper: IMemoryMapper;  // Memory-mapped PEEK/POKE support
     FConsoleBehavior: TConsoleBehavior;
@@ -519,6 +521,9 @@ var
 {$ENDIF}
 begin
   inherited Create;
+  // FreeBASIC draw colours: white foreground, opaque-black background (match the SCREENRES surface clear).
+  FGfxForeColor := $FFFFFFFF;
+  FGfxBackColor := $000000FF;
   // M5.1: the per-context execution state must exist before any field below is touched.
   FCtx := TExecutionContext.Create;
   // M5.3: render command queue + scratch replay context. Dormant until M5.2 sets FHasWorkers.
@@ -3162,6 +3167,15 @@ begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // result
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // index
         end;
+        // bcGfxColor: Src1=fg, Src2=bg (Immediate = present-flags, not regs)
+        bcGfxColor:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // fg
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // bg
+        end;
+        // bcGfxForeColor: Dest=result (current foreground)
+        bcGfxForeColor:
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // result
 
         // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
         // Immediate bits 0-15 = row2 register(int), bits 16-31 = clear register(int)
@@ -6533,6 +6547,13 @@ begin
     33: // bcGfxPaletteReset - PALETTE (no args)
       if Assigned(FGraphics) then
         FGraphics.ResetPalette;
+    34: // bcGfxColor - COLOR [fg][,bg] : set current draw colours (Immediate bit0=hasFg, bit1=hasBg)
+      begin
+        if (Instr.Immediate and 1) <> 0 then FGfxForeColor := UInt32(Ctx.IntRegs[Instr.Src1]);
+        if (Instr.Immediate and 2) <> 0 then FGfxBackColor := UInt32(Ctx.IntRegs[Instr.Src2]);
+      end;
+    35: // bcGfxForeColor - read current draw foreground (omitted-colour default)
+      Ctx.IntRegs[Instr.Dest] := Int64(FGfxForeColor);
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
