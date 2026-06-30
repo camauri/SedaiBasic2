@@ -147,6 +147,10 @@ type
     FOwnedGraphics: TObject;         // concrete backend object the VM owns and frees (e.g. the software backend on sb)
     FGfxForeColor: UInt32;           // current FreeBASIC draw foreground (COLOR fg); omitted-colour default
     FGfxBackColor: UInt32;           // current FreeBASIC draw background (COLOR ,bg)
+    FGfxWorkSurface: Integer;        // FreeBASIC page flipping: cached surface all draw ops target (= FGfxPages[FGfxWorkPage])
+    FGfxWorkPage: Integer;           // current work page index (drawing target)
+    FGfxVisiblePage: Integer;        // current visible page index (shown on screen; sbv)
+    FGfxPages: array of Integer;     // page index -> surface id (page 0 = screen surface 0; 1+ = image surfaces)
     FInputDevice: IInputDevice;
     FMemoryMapper: IMemoryMapper;  // Memory-mapped PEEK/POKE support
     FConsoleBehavior: TConsoleBehavior;
@@ -524,6 +528,12 @@ begin
   // FreeBASIC draw colours: white foreground, opaque-black background (match the SCREENRES surface clear).
   FGfxForeColor := $FFFFFFFF;
   FGfxBackColor := $000000FF;
+  // FreeBASIC page flipping: single page (the screen) until SCREENRES requests more.
+  FGfxWorkSurface := GFX_SCREEN_SURFACE;
+  FGfxWorkPage := 0;
+  FGfxVisiblePage := 0;
+  SetLength(FGfxPages, 1);
+  FGfxPages[0] := GFX_SCREEN_SURFACE;
   // M5.1: the per-context execution state must exist before any field below is touched.
   FCtx := TExecutionContext.Create;
   // M5.3: render command queue + scratch replay context. Dormant until M5.2 sets FHasWorkers.
@@ -3212,6 +3222,12 @@ begin
         // bcGfxScreenInfo: Dest=result (Immediate = which selector, not a reg)
         bcGfxScreenInfo:
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // result
+        // bcGfxScreenSet / bcGfxPCopy: Src1, Src2 (Immediate = flags const, not regs)
+        bcGfxScreenSet, bcGfxPCopy:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+        end;
 
         // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
         // Immediate bits 0-15 = row2 register(int), bits 16-31 = clear register(int)
@@ -6530,39 +6546,54 @@ begin
       if Assigned(FOutputDevice) then
         FOutputDevice.ResetPalette;
     // FreeBASIC graphics (phase 1 slice) routed through the IGraphicsBackend abstraction.
-    25: // bcGfxScreenRes - SCREENRES w, h
+    25: // bcGfxScreenRes - SCREENRES w, h [, , numpages]  (Immediate = number of pages, default 1)
       if Assigned(FGraphics) then
+      begin
         FGraphics.ResizeScreen(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], 0);
-    26: // bcGfxPset - PSET (x,y), color  (color in Immediate float-free int register)
+        // (Re)build the page table. Free any image-backed pages from a previous SCREENRES, then page 0 =
+        // the screen surface and pages 1..n-1 are fresh image surfaces of the same size.
+        for GetSx := 1 to High(FGfxPages) do
+          if FGfxPages[GetSx] <> GFX_SCREEN_SURFACE then FGraphics.DestroySurface(FGfxPages[GetSx]);
+        DrawMode := Instr.Immediate;                       // numpages (reuse temp)
+        if DrawMode < 1 then DrawMode := 1;
+        SetLength(FGfxPages, DrawMode);
+        FGfxPages[0] := GFX_SCREEN_SURFACE;
+        for GetSx := 1 to DrawMode - 1 do
+          FGfxPages[GetSx] := FGraphics.CreateSurface(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], $000000FF);
+        FGfxWorkPage := 0;
+        FGfxVisiblePage := 0;
+        FGfxWorkSurface := GFX_SCREEN_SURFACE;
+      end;
+    26: // bcGfxPset - PSET (x,y), color  (color in Immediate float-free int register; targets the work page)
       if Assigned(FGraphics) then
-        FGraphics.SetPixel(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+        FGraphics.SetPixel(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
                            UInt32(Ctx.IntRegs[Instr.Immediate]));
-    27: // bcGfxPoint - POINT(x, y) -> color
+    27: // bcGfxPoint - POINT(x, y) -> color  (reads the work page)
       if Assigned(FGraphics) then
-        Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.GetPixel(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]))
+        Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.GetPixel(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]))
       else
         Ctx.IntRegs[Instr.Dest] := 0;
     28: // bcGfxPaint - PAINT (x,y), color  (flood fill; color in the Immediate int register)
       if Assigned(FGraphics) then
-        FGraphics.Fill(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+        FGraphics.Fill(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
                        UInt32(Ctx.IntRegs[Instr.Immediate]));
     29: // bcGfxLine - LINE (x1,y1)-(x2,y2),color[,B|BF]
       if Assigned(FGraphics) then
         case (Instr.Immediate shr 48) and $3 of
-          1: FGraphics.DrawRect(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+          1: FGraphics.DrawRect(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
                Ctx.IntRegs[(Instr.Immediate) and $FFFF], Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF],
                UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), False, 1, 0.0);    // B  = box outline
-          2: FGraphics.DrawRect(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+          2: FGraphics.DrawRect(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
                Ctx.IntRegs[(Instr.Immediate) and $FFFF], Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF],
                UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), True, 1, 0.0);     // BF = filled box
         else
-          FGraphics.DrawLine(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+          FGraphics.DrawLine(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
             Ctx.IntRegs[(Instr.Immediate) and $FFFF], Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF],
             UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), 1);                   // plain line
         end;
     30: // bcGfxCircle - CIRCLE (x,y),r[,color]  (full circle, RX=RY=r)
       if Assigned(FGraphics) then
-        FGraphics.DrawEllipse(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+        FGraphics.DrawEllipse(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
           Ctx.IntRegs[Instr.Immediate and $FFFF], Ctx.IntRegs[Instr.Immediate and $FFFF],
           UInt32(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]), 0.0, 360.0, 0.0, 0.0, 1);
     31: // bcGfxPalette - PALETTE index, r,g,b  (Src1=index, Src2=packed RGBA colour)
@@ -6623,12 +6654,12 @@ begin
         for GetSy := 0 to (GetY2 - GetY1) do
           for GetSx := 0 to (GetX2 - GetX1) do
             FGraphics.SetPixel(DrawMode, GetSx, GetSy,
-              FGraphics.GetPixel(FGraphics.ScreenSurface, GetX1 + GetSx, GetY1 + GetSy));
+              FGraphics.GetPixel(FGfxWorkSurface, GetX1 + GetSx, GetY1 + GetSy));
       end;
-    40: // bcGfxPut - PUT (x,y),src[,mode] : blit image src onto the screen (Immediate[0-15]=src handle
+    40: // bcGfxPut - PUT (x,y),src[,mode] : blit image src onto the work page (Immediate[0-15]=src handle
         //  register, Immediate[16-31]=mode ordinal constant)
       if Assigned(FGraphics) then
-        FGraphics.Blit(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+        FGraphics.Blit(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
                        Ctx.IntRegs[Instr.Immediate and $FFFF], TGfxBlitMode((Instr.Immediate shr 16) and $FFFF));
     41: // bcGfxScreenInfo - __SCRINFO(which): screen w/h/depth/bpp/pitch/rate
       if Assigned(FGraphics) then
@@ -6642,6 +6673,32 @@ begin
         end
       else
         Ctx.IntRegs[Instr.Dest] := 0;
+    42: // bcGfxScreenSet - SCREENSET work[,visible] / FLIP (page selection; Immediate bit0=hasWork,
+        //  bit1=hasVisible, bit2=swap). Drawing follows the work page; the visible page is shown on sbv.
+      begin
+        if (Instr.Immediate and 4) <> 0 then       // FLIP with no args: swap work and visible pages
+        begin
+          SwapTmp := FGfxWorkPage; FGfxWorkPage := FGfxVisiblePage; FGfxVisiblePage := SwapTmp;
+        end
+        else
+        begin
+          if (Instr.Immediate and 1) <> 0 then FGfxWorkPage := Ctx.IntRegs[Instr.Src1];
+          if (Instr.Immediate and 2) <> 0 then FGfxVisiblePage := Ctx.IntRegs[Instr.Src2];
+        end;
+        if (FGfxWorkPage < 0) or (FGfxWorkPage > High(FGfxPages)) then FGfxWorkPage := 0;
+        if (FGfxVisiblePage < 0) or (FGfxVisiblePage > High(FGfxPages)) then FGfxVisiblePage := 0;
+        FGfxWorkSurface := FGfxPages[FGfxWorkPage];
+        // sbv: showing a non-zero visible page on screen is deferred (headless tracks it for SCREENCOPY).
+      end;
+    43: // bcGfxPCopy - PCOPY src,dst / SCREENCOPY [src][,dst] : copy one page onto another (full-surface
+        //  blit). Immediate bit0=hasSrc, bit1=hasDst; omitted src defaults to the work page, dst to visible.
+      if Assigned(FGraphics) then
+      begin
+        if (Instr.Immediate and 1) <> 0 then GetX1 := Ctx.IntRegs[Instr.Src1] else GetX1 := FGfxWorkPage;     // src page
+        if (Instr.Immediate and 2) <> 0 then GetY1 := Ctx.IntRegs[Instr.Src2] else GetY1 := FGfxVisiblePage;  // dst page
+        if (GetX1 >= 0) and (GetX1 <= High(FGfxPages)) and (GetY1 >= 0) and (GetY1 <= High(FGfxPages)) and (GetX1 <> GetY1) then
+          FGraphics.Blit(FGfxPages[GetY1], 0, 0, FGfxPages[GetX1], gbmPSet);
+      end;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

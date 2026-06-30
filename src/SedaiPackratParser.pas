@@ -3753,6 +3753,26 @@ begin
   else if (CmdName = 'SCREENLOCK') or (CmdName = 'SCREENUNLOCK') or
           (CmdName = 'SCREENSYNC') or (CmdName = 'WINDOWTITLE') then
     Result := TASTNode.Create(antGfxNop, Token)
+  else if CmdName = 'SCREENSET' then
+  begin
+    Result := TASTNode.Create(antScreenSet, Token);
+    Result.Attributes.Values['OP'] := 'SET';
+  end
+  else if CmdName = 'FLIP' then
+  begin
+    Result := TASTNode.Create(antScreenSet, Token);
+    Result.Attributes.Values['OP'] := 'FLIP';
+  end
+  else if CmdName = 'PCOPY' then
+  begin
+    Result := TASTNode.Create(antPCopy, Token);
+    Result.Attributes.Values['OP'] := 'PCOPY';
+  end
+  else if CmdName = 'SCREENCOPY' then
+  begin
+    Result := TASTNode.Create(antPCopy, Token);
+    Result.Attributes.Values['OP'] := 'SCREENCOPY';
+  end
   else
     Result := TASTNode.Create(antStatement, Token);
 
@@ -3890,6 +3910,23 @@ begin
     Exit;
   end;
 
+  // FreeBASIC page-flipping primitives: SCREENSET/FLIP (antScreenSet) and PCOPY/SCREENCOPY (antPCopy).
+  // All take 0-2 optional comma-separated page expressions; the SSA maps them to Src1/Src2 + flags.
+  if (Result.NodeType = antScreenSet) or (Result.NodeType = antPCopy) then
+  begin
+    if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+    begin
+      Result.AddChild(ParseExpression);                          // first page
+      if Context.Check(ttSeparParam) then
+      begin
+        Context.Advance;                                         // ','
+        Result.AddChild(ParseExpression);                        // second page
+      end;
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
   // Set max parameters based on command
   if CmdName = 'CIRCLE' then
     MaxParams := 9
@@ -3926,7 +3963,7 @@ begin
   else if CmdName = 'PRST' then
     MaxParams := 0  // PRST (no parameters)
   else if CmdName = 'SCREENRES' then
-    MaxParams := 2  // SCREENRES w, h
+    MaxParams := 4  // SCREENRES w, h [, depth [, num_pages]]
   else
     MaxParams := 5;
 

@@ -210,6 +210,8 @@ type
     antGfxPut,            // PUT (x,y), src [, mode] (FreeBASIC: blit image to screen)
     antScreenInfo,        // SCREENINFO w, h [, depth, bpp, pitch, rate] (FreeBASIC)
     antGfxNop,            // accept-and-ignore graphics sync/window primitive (SCREENLOCK/UNLOCK/SYNC/WINDOWTITLE)
+    antScreenSet,         // SCREENSET work[,visible] / FLIP (FreeBASIC page selection; OP attribute)
+    antPCopy,             // PCOPY src,dst / SCREENCOPY (FreeBASIC page copy; OP attribute)
     antBeep,              // BEEP command (console bell: emits CHR(7))
     antBox,               // BOX command
     antCircle,            // CIRCLE command

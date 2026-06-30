@@ -579,6 +579,10 @@ const
   bcGfxPut          = bcGroupGraphics + 40;
   // __SCRINFO(which) : Dest=result, Immediate=which (0=w,1=h,2=depth,3=bpp,4=pitch,5=rate)
   bcGfxScreenInfo   = bcGroupGraphics + 41;
+  // SCREENSET work[,visible] / FLIP : Src1=work page, Src2=visible page, Immediate bit0=hasWork,1=hasVisible,2=swap
+  bcGfxScreenSet    = bcGroupGraphics + 42;
+  // PCOPY src,dst / SCREENCOPY : Src1=src page, Src2=dst page, Immediate bit0=hasSrc,1=hasDst
+  bcGfxPCopy        = bcGroupGraphics + 43;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1667,6 +1671,8 @@ begin
         39: Result := 'GfxGet';
         40: Result := 'GfxPut';
         41: Result := 'GfxScreenInfo';
+        42: Result := 'GfxScreenSet';
+        43: Result := 'GfxPCopy';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

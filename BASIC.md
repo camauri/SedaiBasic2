@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 478 / 643 implemented (74%)** (+ 2 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 480 / 643 implemented (75%)** (+ 2 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **478 (84%)** are implemented. See the
+**572 applicable** keywords, **480 (84%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **478 / 643 implemented (74%)**, plus 2 partial (◐).
-> Of the 163 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **464 / 572 ≈ 81% of the
+> **Coverage (FreeBASIC keyword set):** **480 / 643 implemented (75%)**, plus 2 partial (◐).
+> Of the 161 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **466 / 572 ≈ 81% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -2518,8 +2518,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `CLS` | ✓ | Clears the screen and homes the cursor (alias of `SCNCLR`). |
-| `SCREENSET` | ✗ | Sets the current work and visible pages. |
-| `SCREENCOPY and PCOPY and FLIP` | ✗ | Copies pixel data from one page to another. |
+| `SCREENSET` | ✓ | `SCREENSET work[,visible]` selects the work page (all drawing/POINT target it) and the visible page (shown on sbv). `SCREENRES w,h,depth,num_pages` allocates the pages. Headless-testable. |
+| `SCREENCOPY and PCOPY and FLIP` | ✓ | `PCOPY src,dst` and `SCREENCOPY [src][,dst]` (default work→visible) copy one page onto another; `FLIP` (no args) swaps the work and visible pages (`FLIP visible[,work]` sets them). Headless-testable; on-screen page display on sbv deferred. |
 | `SCREENSYNC` | ✓ | Parsed; accept-and-ignore (no vertical-retrace wait on the headless/buffered backend). |
 
 #### Working video memory

@@ -388,6 +388,8 @@ begin
     ssaGfxGet: Result := bcGfxGet;
     ssaGfxPut: Result := bcGfxPut;
     ssaGfxScreenInfo: Result := bcGfxScreenInfo;
+    ssaGfxScreenSet: Result := bcGfxScreenSet;
+    ssaGfxPCopy: Result := bcGfxPCopy;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;
     ssaGraphicRwindow: Result := bcGraphicRwindow;

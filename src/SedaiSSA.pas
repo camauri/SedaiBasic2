@@ -409,6 +409,8 @@ type
     procedure ProcessGfxGet(Node: TASTNode);         // GET (x1,y1)-(x2,y2), dst
     procedure ProcessGfxPut(Node: TASTNode);         // PUT (x,y), src [, mode]
     procedure ProcessScreenInfo(Node: TASTNode);     // SCREENINFO w, h [, depth, ...]
+    procedure ProcessScreenSet(Node: TASTNode);      // SCREENSET work[,visible] / FLIP
+    procedure ProcessPCopy(Node: TASTNode);          // PCOPY src,dst / SCREENCOPY
     procedure ProcessColor(Node: TASTNode);
     procedure ProcessSetColor(Node: TASTNode);
     procedure ProcessWidth(Node: TASTNode);
@@ -7314,14 +7316,25 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessScreenRes(Node: TASTNode);
-// SCREENRES w, h : set the graphics screen resolution (routed to the graphics backend).
+// SCREENRES w, h [, depth [, num_pages]] : set the graphics screen resolution (routed to the backend).
+// depth is accepted-and-ignored; num_pages (a compile-time constant, default 1) sets up page flipping
+// and is carried in Src3 -> Immediate (the VM reads it as the literal page count, not a register).
 var
-  WVal, HVal, WReg, HReg: TSSAValue;
+  WVal, HVal, NVal, WReg, HReg: TSSAValue;
+  NumPages: Int64;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 2) then Exit;
   ProcessExpression(Node.GetChild(0), WVal); WReg := EnsureIntRegister(WVal);
   ProcessExpression(Node.GetChild(1), HVal); HReg := EnsureIntRegister(HVal);
-  EmitInstruction(ssaGfxScreenRes, MakeSSAValue(svkNone), WReg, HReg, MakeSSAValue(svkNone));
+  NumPages := 1;
+  if Node.ChildCount >= 4 then
+  begin
+    ProcessExpression(Node.GetChild(3), NVal);   // num_pages (constant)
+    if NVal.Kind = svkConstInt then NumPages := NVal.ConstInt
+    else if NVal.Kind = svkConstFloat then NumPages := Trunc(NVal.ConstFloat);
+  end;
+  if NumPages < 1 then NumPages := 1;
+  EmitInstruction(ssaGfxScreenRes, MakeSSAValue(svkNone), WReg, HReg, MakeSSAConstInt(NumPages));
 end;
 
 procedure TSSAGenerator.ProcessGfxPset(Node: TASTNode);
@@ -7606,6 +7619,83 @@ begin
     ProcessStatement(Assign);
     Assign.Free;
   end;
+end;
+
+procedure TSSAGenerator.ProcessScreenSet(Node: TASTNode);
+// SCREENSET work[,visible] / FLIP : select the work/visible page. Src1=work, Src2=visible, Src3=flags
+// (bit0=hasWork, bit1=hasVisible, bit2=swap). FLIP with no args swaps the pages; FLIP v[,w] sets them
+// (note FB's FLIP arg order is visible first, then work). Omitted page regs are loaded with 0.
+var
+  Op: string;
+  WorkReg, VisReg, V0, V1: TSSAValue;
+  Flags: Int64;
+
+  function ZeroReg: TSSAValue;
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+begin
+  if FCurrentBlock = nil then Exit;
+  Op := UpperCase(Node.Attributes.Values['OP']);
+  Flags := 0;
+  WorkReg := ZeroReg;
+  VisReg := ZeroReg;
+  if Op = 'FLIP' then
+  begin
+    if Node.ChildCount = 0 then
+      Flags := 4                                   // swap work<->visible
+    else
+    begin
+      ProcessExpression(Node.GetChild(0), V0); VisReg := EnsureIntRegister(V0); Flags := Flags or 2;  // visible
+      if Node.ChildCount >= 2 then
+      begin
+        ProcessExpression(Node.GetChild(1), V1); WorkReg := EnsureIntRegister(V1); Flags := Flags or 1;  // work
+      end;
+    end;
+  end
+  else  // SET: work[,visible]
+  begin
+    if Node.ChildCount >= 1 then
+    begin
+      ProcessExpression(Node.GetChild(0), V0); WorkReg := EnsureIntRegister(V0); Flags := Flags or 1;
+    end;
+    if Node.ChildCount >= 2 then
+    begin
+      ProcessExpression(Node.GetChild(1), V1); VisReg := EnsureIntRegister(V1); Flags := Flags or 2;
+    end;
+  end;
+  EmitInstruction(ssaGfxScreenSet, MakeSSAValue(svkNone), WorkReg, VisReg, MakeSSAConstInt(Flags));
+end;
+
+procedure TSSAGenerator.ProcessPCopy(Node: TASTNode);
+// PCOPY src,dst / SCREENCOPY [src][,dst] : copy one page onto another. Src1=src, Src2=dst, Src3=flags
+// (bit0=hasSrc, bit1=hasDst). An omitted src defaults to the work page, dst to the visible page (VM).
+var
+  SrcReg, DstReg, V0, V1: TSSAValue;
+  Flags: Int64;
+
+  function ZeroReg: TSSAValue;
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+begin
+  if FCurrentBlock = nil then Exit;
+  Flags := 0;
+  SrcReg := ZeroReg;
+  DstReg := ZeroReg;
+  if Node.ChildCount >= 1 then
+  begin
+    ProcessExpression(Node.GetChild(0), V0); SrcReg := EnsureIntRegister(V0); Flags := Flags or 1;
+  end;
+  if Node.ChildCount >= 2 then
+  begin
+    ProcessExpression(Node.GetChild(1), V1); DstReg := EnsureIntRegister(V1); Flags := Flags or 2;
+  end;
+  EmitInstruction(ssaGfxPCopy, MakeSSAValue(svkNone), SrcReg, DstReg, MakeSSAConstInt(Flags));
 end;
 
 procedure TSSAGenerator.ProcessBeep(Node: TASTNode);
@@ -15142,6 +15232,8 @@ begin
     antGfxGet: ProcessGfxGet(Node);
     antGfxPut: ProcessGfxPut(Node);
     antScreenInfo: ProcessScreenInfo(Node);
+    antScreenSet: ProcessScreenSet(Node);
+    antPCopy: ProcessPCopy(Node);
     antGfxNop: ;  // SCREENLOCK/UNLOCK/SYNC/WINDOWTITLE: accept-and-ignore (no code emitted)
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);

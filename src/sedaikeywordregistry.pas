@@ -1868,6 +1868,10 @@ begin
  RegisterKeyword(kSCREENUNLOCK, ttGraphicsCommand,  'FreeBASIC: end direct screen access (no-op)',    kcGraphicsHandling);
  RegisterKeyword(kSCREENSYNC,   ttGraphicsCommand,  'FreeBASIC: wait for vertical retrace (no-op)',   kcGraphicsHandling);
  RegisterKeyword(kWINDOWTITLE,  ttGraphicsCommand,  'FreeBASIC: set the graphics window caption',     kcGraphicsHandling);
+ RegisterKeyword(kSCREENSET,    ttGraphicsCommand,  'FreeBASIC: select work/visible page',            kcGraphicsHandling);
+ RegisterKeyword(kSCREENCOPY,   ttGraphicsCommand,  'FreeBASIC: copy one page onto another',          kcGraphicsHandling);
+ RegisterKeyword(kPCOPY,        ttGraphicsCommand,  'FreeBASIC/QB: copy page src to page dst',        kcGraphicsHandling);
+ RegisterKeyword(kFLIP,         ttGraphicsCommand,  'FreeBASIC: swap or set visible/work pages',      kcGraphicsHandling);
  RegisterKeyword(kRWINDOW, ttInputFunction,    'Return the size of the current text window',       kcStdIO);
 
  // === SPRITES HANDLING (COMMANDS AND FUNCTIONS) ===

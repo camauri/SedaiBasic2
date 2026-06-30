@@ -428,6 +428,10 @@ const
   kSCREENUNLOCK = 'SCREENUNLOCK';  // FreeBASIC: end direct screen access (no-op)
   kSCREENSYNC   = 'SCREENSYNC';    // FreeBASIC: wait for vertical retrace (no-op headless)
   kWINDOWTITLE  = 'WINDOWTITLE';   // FreeBASIC: set the graphics window caption (accept-and-ignore v1)
+  kSCREENSET    = 'SCREENSET';     // FreeBASIC: select work/visible page (double buffering)
+  kSCREENCOPY   = 'SCREENCOPY';    // FreeBASIC: copy one page onto another (defaults work->visible)
+  kPCOPY        = 'PCOPY';         // FreeBASIC/QB: copy page src to page dst
+  kFLIP         = 'FLIP';          // FreeBASIC: swap (or set) visible/work pages
   kDRAW    = 'DRAW';
   kCIRCLE  = 'CIRCLE';
   kPAINT   = 'PAINT';
