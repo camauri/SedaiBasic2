@@ -455,7 +455,7 @@ begin
     bcGraphicWindow,  // Src1 = col1 register (int)
     bcGraphicCircle,  // Src1 = color register (int)
     bcGraphicPaint,   // Src1 = source register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint,  // FreeBASIC graphics slice: Src1 = w / x (int)
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint,  // FreeBASIC graphics: Src1 = w / x (int)
     bcGraphicSShape,  // Src1 = x1 coordinate (int)
     bcGraphicColor,   // Src1 = source register (int)
     bcGraphicWidth,   // Src1 = width value (int)
@@ -591,7 +591,7 @@ begin
     bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
     bcGraphicWindow,  // Src2 = row1 register (int)
     bcGraphicCircle,  // Src2 = x register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint,  // FreeBASIC graphics slice: Src2 = h / y (int)
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint,  // FreeBASIC graphics: Src2 = h / y (int)
     bcGraphicScale,   // Src2 = xmax register (int)
     bcGraphicColor,   // Src2 = color value (int)
     bcGraphicPaint,   // Src2 = x coordinate (int)
@@ -993,8 +993,8 @@ begin
     if (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
-    // PSET (x,y),color: Immediate contains the color register index (int)
-    if OpCode = bcGfxPset then
+    // PSET/PAINT (x,y),color: Immediate contains the color register index (int)
+    if (OpCode = bcGfxPset) or (OpCode = bcGfxPaint) then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // bcGraphicWindow: Src1=col1, Src2=row1, Dest=col2, Immediate = (clear_reg << 16) | row2_reg
@@ -1461,7 +1461,7 @@ begin
     if (OpCode = bcStrMid) or (OpCode = bcStrMidW) or
        (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) or
        (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) or
-       (OpCode = bcGfxPset) then
+       (OpCode = bcGfxPset) or (OpCode = bcGfxPaint) then
     begin
       OldReg := Instr.Immediate and $FFFF;
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then

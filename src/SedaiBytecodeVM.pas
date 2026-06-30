@@ -3127,6 +3127,12 @@ begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // x
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // y
         end;
+        bcGfxPaint:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // x
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // y
+          if Instr.Immediate > MaxIntReg then MaxIntReg := Instr.Immediate;  // color reg
+        end;
 
         // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
         // Immediate bits 0-15 = row2 register(int), bits 16-31 = clear register(int)
@@ -6455,6 +6461,10 @@ begin
         Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.GetPixel(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]))
       else
         Ctx.IntRegs[Instr.Dest] := 0;
+    28: // bcGfxPaint - PAINT (x,y), color  (flood fill; color in the Immediate int register)
+      if Assigned(FGraphics) then
+        FGraphics.Fill(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+                       UInt32(Ctx.IntRegs[Instr.Immediate]));
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

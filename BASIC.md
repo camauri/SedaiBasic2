@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 466 / 643 implemented (72%)**. **71** of the unimplemented
+**FreeBASIC keyword set — 467 / 643 implemented (73%)** (+ 2 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **466 (81%)** are implemented. See the
+**572 applicable** keywords, **467 (82%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,8 +1254,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **466 / 643 implemented (72%)**.
-> Of the 177 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> **Coverage (FreeBASIC keyword set):** **467 / 643 implemented (73%)**, plus 2 partial (◐).
+> Of the 174 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
 > linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **453 / 572 ≈ 79% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
@@ -2442,18 +2442,18 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `PALETTE` | ✗ | Gets or sets color table information in paletted modes. |
 | `RGB` | ✗ | Returns a color value for hi/truecolor modes. |
 | `RGBA` | ✓ | Returns a color value including alpha (transparency) for hi/truecolor modes. |
-| `POINT` | ✗ | Gets a pixel value from an image buffer or screen. |
+| `POINT` | ✓ | `POINT(x,y)` reads a pixel's colour from the screen surface (via the IGraphicsBackend abstraction). Image-buffer form deferred to G3. |
 
 #### Drawing to Image Buffers
 
 | Keyword | Status | Description |
 |---|---|---|
-| `PSET and PRESET` | ✗ | Plots a single pixel on an image buffer or screen. |
+| `PSET and PRESET` | ◐ | `PSET (x,y),color` plots a pixel on the screen surface (via IGraphicsBackend; headless-testable + on-screen on sbv). `PRESET` and the image-buffer target deferred. |
 | `LINE (GRAPHICS)` | ✗ | Plots a line of pixels on an image buffer or screen. |
 | `CIRCLE` | ✓ | Plots circles and ellipses on an image buffer or screen. |
 | `DRAW` | ✓ | Draws in a sequence of commands on an image buffer or screen. |
 | `DRAW STRING` | ✓ | Writes text to an image buffer or screen. |
-| `PAINT` | ✓ | Fills an area with color on an image buffer or screen. |
+| `PAINT` | ✓ | Flood fill. C128 form (`PAINT source,x,y`) and FreeBASIC form (`PAINT (x,y),color`, parenthesised → routed through IGraphicsBackend, headless-testable). Border-colour argument deferred. |
 
 #### Image Buffer Creation
 
@@ -2506,7 +2506,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `SCREENLIST` | ✗ | Gets the available fullscreen resolutions. |
-| `SCREEN (Graphics) and SCREENRES` | ✗ | Sets a new graphics display mode. |
+| `SCREEN (Graphics) and SCREENRES` | ◐ | `SCREENRES w,h` sets the graphics screen surface (via IGraphicsBackend). Headless: exact w×h; on sbv: routed to the SDL2 dynamic mode (precise arbitrary w×h sizing on screen deferred to G1). |
 | `SCREENINFO` | ✗ | Gets information about the system desktop or current display mode. |
 | `SCREENCONTROL` | ✗ | Gets or sets internal graphics library settings. |
 | `SCREENEVENT` | ✗ | Gets system events. |

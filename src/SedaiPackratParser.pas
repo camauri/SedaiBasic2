@@ -3670,7 +3670,13 @@ begin
   else if CmdName = 'SCALE' then
     Result := TASTNode.Create(antScale, Token)
   else if CmdName = 'PAINT' then
-    Result := TASTNode.Create(antPaint, Token)
+  begin
+    // FreeBASIC PAINT (x,y),color vs C128 PAINT source,x,y,mode — disambiguated by the parenthesis.
+    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+      Result := TASTNode.Create(antGfxPaint, Token)
+    else
+      Result := TASTNode.Create(antPaint, Token);
+  end
   else if CmdName = 'WINDOW' then
     Result := TASTNode.Create(antWindow, Token)
   else if CmdName = 'SSHAPE' then
@@ -3695,9 +3701,9 @@ begin
   Context.Advance;
   ParamCount := 0;
 
-  // FreeBASIC PSET (x, y) [, color]: the coordinate pair is parenthesised, so parse it explicitly
-  // rather than via the generic comma-separated parameter loop below.
-  if CmdName = 'PSET' then
+  // FreeBASIC PSET (x, y) [, color] and PAINT (x, y) [, color]: the coordinate pair is parenthesised,
+  // so parse it explicitly rather than via the generic comma-separated parameter loop below.
+  if (CmdName = 'PSET') or (Result.NodeType = antGfxPaint) then
   begin
     if Context.Check(ttDelimParOpen) then Context.Advance;        // '('
     Result.AddChild(ParseExpression);                             // x

@@ -374,6 +374,7 @@ begin
     ssaGfxScreenRes: Result := bcGfxScreenRes;
     ssaGfxPset: Result := bcGfxPset;
     ssaGfxPoint: Result := bcGfxPoint;
+    ssaGfxPaint: Result := bcGfxPaint;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;
     ssaGraphicRwindow: Result := bcGraphicRwindow;

@@ -551,6 +551,7 @@ const
   bcGfxScreenRes    = bcGroupGraphics + 25;  // SCREENRES w,h : Src1=w, Src2=h
   bcGfxPset         = bcGroupGraphics + 26;  // PSET (x,y),color : Src1=x, Src2=y, Immediate=color reg
   bcGfxPoint        = bcGroupGraphics + 27;  // POINT(x,y) : Dest=color, Src1=x, Src2=y
+  bcGfxPaint        = bcGroupGraphics + 28;  // PAINT (x,y),color : flood fill; Src1=x, Src2=y, Immediate=color reg
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1625,6 +1626,7 @@ begin
         25: Result := 'GfxScreenRes';
         26: Result := 'GfxPset';
         27: Result := 'GfxPoint';
+        28: Result := 'GfxPaint';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

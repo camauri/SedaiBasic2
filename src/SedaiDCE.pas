@@ -359,7 +359,7 @@ begin
     ssaGraphicSetMode, ssaGraphicBox, ssaGraphicCircle, ssaGraphicDraw, ssaGraphicLocate,
     ssaGraphicColor, ssaSetColor, ssaGraphicWidth, ssaGraphicScale, ssaGraphicPaint, ssaGraphicWindow,
     ssaGraphicSShape, ssaGraphicGShape, ssaGraphicGList, ssaPLoad, ssaPSave, ssaPRst, ssaScnClr,
-    ssaGfxScreenRes, ssaGfxPset:
+    ssaGfxScreenRes, ssaGfxPset, ssaGfxPaint:
       Result := True;
 
     // Sprite operations - always live (modify sprite state)

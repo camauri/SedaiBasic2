@@ -398,6 +398,7 @@ type
     procedure ProcessBeep(Node: TASTNode);   // BEEP: console bell (emit CHR(7), no newline)
     procedure ProcessScreenRes(Node: TASTNode);  // SCREENRES w, h (FreeBASIC graphics)
     procedure ProcessGfxPset(Node: TASTNode);    // PSET (x, y) [, color]
+    procedure ProcessGfxPaint(Node: TASTNode);   // PAINT (x, y) [, color] (flood fill)
     procedure ProcessColor(Node: TASTNode);
     procedure ProcessSetColor(Node: TASTNode);
     procedure ProcessWidth(Node: TASTNode);
@@ -7220,6 +7221,27 @@ begin
     EmitInstruction(ssaLoadConstInt, CReg, MakeSSAConstInt(Int64($FFFFFFFF)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));  // default: white
   end;
   EmitInstruction(ssaGfxPset, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color -> Immediate
+end;
+
+procedure TSSAGenerator.ProcessGfxPaint(Node: TASTNode);
+// PAINT (x, y) [, color] : flood fill from (x,y) with color. Children: x, y [, color]. Color in Src3
+// -> Immediate (int reg). (FB's optional border-colour argument is deferred.)
+var
+  XVal, YVal, CVal, XReg, YReg, CReg: TSSAValue;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 2) then Exit;
+  ProcessExpression(Node.GetChild(0), XVal); XReg := EnsureIntRegister(XVal);
+  ProcessExpression(Node.GetChild(1), YVal); YReg := EnsureIntRegister(YVal);
+  if Node.ChildCount >= 3 then
+  begin
+    ProcessExpression(Node.GetChild(2), CVal); CReg := EnsureIntRegister(CVal);
+  end
+  else
+  begin
+    CReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, CReg, MakeSSAConstInt(Int64($FFFFFFFF)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));  // default: white
+  end;
+  EmitInstruction(ssaGfxPaint, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color -> Immediate
 end;
 
 procedure TSSAGenerator.ProcessBeep(Node: TASTNode);
@@ -14746,6 +14768,7 @@ begin
     antBeep: ProcessBeep(Node);
     antScreenRes: ProcessScreenRes(Node);
     antGfxPset: ProcessGfxPset(Node);
+    antGfxPaint: ProcessGfxPaint(Node);
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);
     antWidth: ProcessWidth(Node);

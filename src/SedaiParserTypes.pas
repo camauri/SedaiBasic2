@@ -199,6 +199,7 @@ type
     antScnClr,            // SCNCLR command (clear screen)
     antScreenRes,         // SCREENRES w, h (FreeBASIC graphics)
     antGfxPset,           // PSET (x, y) [, color] (FreeBASIC graphics)
+    antGfxPaint,          // PAINT (x, y) [, color] (FreeBASIC graphics, flood fill)
     antBeep,              // BEEP command (console bell: emits CHR(7))
     antBox,               // BOX command
     antCircle,            // CIRCLE command

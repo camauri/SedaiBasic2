@@ -234,6 +234,7 @@ type
     ssaGfxScreenRes,   // SCREENRES w,h (FreeBASIC graphics, via IGraphicsBackend)
     ssaGfxPset,        // PSET (x,y),color
     ssaGfxPoint,       // POINT(x,y) -> color
+    ssaGfxPaint,       // PAINT (x,y),color (flood fill)
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n
     ssaGraphicRwindow, // RWINDOW(n): Return window size info
