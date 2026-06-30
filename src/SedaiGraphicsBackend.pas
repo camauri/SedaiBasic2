@@ -78,12 +78,15 @@ type
   end;
 
   { Software reference backend: TGraphicsMemory + the *ToMemory primitives. No SDL, headless, fully
-    deterministic — the universal fallback and the test oracle. Image surfaces (>0) are deferred. }
+    deterministic — the universal fallback and the test oracle. Image surfaces (>0) are backed by
+    additional TGraphicsMemory instances in FImages (surface id = index+1; freed slots stay nil). }
   TSoftwareGraphicsBackend = class(TObject, IGraphicsBackend)
   private
     FScreen: TGraphicsMemory;
     FInGraphics: Boolean;
+    FImages: array of TGraphicsMemory;   // image surfaces; id = index+1, 0 = screen
     function ValidScreen: Boolean; inline;
+    function MemoryOf(Surface: TGfxSurface): TGraphicsMemory;   // screen (0) or image (>0), nil if invalid
   public
     constructor Create;
     destructor Destroy; override;
@@ -121,7 +124,12 @@ begin
 end;
 
 destructor TSoftwareGraphicsBackend.Destroy;
+var
+  i: Integer;
 begin
+  for i := 0 to High(FImages) do
+    FImages[i].Free;
+  SetLength(FImages, 0);
   FScreen.Free;
   inherited Destroy;
 end;
@@ -129,6 +137,19 @@ end;
 function TSoftwareGraphicsBackend.ValidScreen: Boolean;
 begin
   Result := Assigned(FScreen) and Assigned(FScreen.GraphicsBuffer);
+end;
+
+function TSoftwareGraphicsBackend.MemoryOf(Surface: TGfxSurface): TGraphicsMemory;
+// Screen (0) or an image surface (>0). Returns nil for an invalid/destroyed surface.
+begin
+  if Surface = GFX_SCREEN_SURFACE then
+  begin
+    if ValidScreen then Result := FScreen else Result := nil;
+  end
+  else if (Surface >= 1) and (Surface <= Length(FImages)) then
+    Result := FImages[Surface - 1]
+  else
+    Result := nil;
 end;
 
 function TSoftwareGraphicsBackend.SetMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
@@ -162,9 +183,10 @@ begin
 end;
 
 procedure TSoftwareGraphicsBackend.ClearSurface(Surface: TGfxSurface; Color: TGfxColor);
+var M: TGraphicsMemory;
 begin
-  if (Surface = GFX_SCREEN_SURFACE) and ValidScreen then
-    FScreen.ClearCurrentMode(Color);
+  M := MemoryOf(Surface);
+  if Assigned(M) then M.ClearCurrentMode(Color);
 end;
 
 procedure TSoftwareGraphicsBackend.Present;
@@ -178,58 +200,86 @@ begin
 end;
 
 function TSoftwareGraphicsBackend.CreateSurface(W, H: Integer; Fill: TGfxColor): TGfxSurface;
+// Allocate a truecolor image surface of W x H, cleared to Fill. Reuses a freed (nil) slot if any.
+var
+  Img: TGraphicsMemory;
+  i, Slot: Integer;
 begin
-  // Image buffers (IMAGECREATE) deferred to phase 2/G3.
-  Result := GFX_INVALID_SURFACE;
+  if (W <= 0) or (H <= 0) then Exit(GFX_INVALID_SURFACE);
+  Img := TGraphicsMemory.Create;
+  Img.AllocateBuffers(W, H, False, gmSDL2Dynamic);
+  Img.ClearCurrentMode(Fill);
+  Slot := -1;
+  for i := 0 to High(FImages) do
+    if FImages[i] = nil then begin Slot := i; Break; end;
+  if Slot < 0 then
+  begin
+    SetLength(FImages, Length(FImages) + 1);
+    Slot := High(FImages);
+  end;
+  FImages[Slot] := Img;
+  Result := Slot + 1;   // id 0 is reserved for the screen
 end;
 
 procedure TSoftwareGraphicsBackend.DestroySurface(Surface: TGfxSurface);
 begin
-  // No image surfaces yet (deferred).
+  if (Surface >= 1) and (Surface <= Length(FImages)) and Assigned(FImages[Surface - 1]) then
+  begin
+    FImages[Surface - 1].Free;
+    FImages[Surface - 1] := nil;   // leave the slot for reuse (ids stay stable)
+  end;
 end;
 
 function TSoftwareGraphicsBackend.SurfaceWidth(Surface: TGfxSurface): Integer;
+var M: TGraphicsMemory;
 begin
-  if (Surface = GFX_SCREEN_SURFACE) and Assigned(FScreen) then Result := FScreen.State.Width
-  else Result := 0;
+  M := MemoryOf(Surface);
+  if Assigned(M) then Result := M.State.Width else Result := 0;
 end;
 
 function TSoftwareGraphicsBackend.SurfaceHeight(Surface: TGfxSurface): Integer;
+var M: TGraphicsMemory;
 begin
-  if (Surface = GFX_SCREEN_SURFACE) and Assigned(FScreen) then Result := FScreen.State.Height
-  else Result := 0;
+  M := MemoryOf(Surface);
+  if Assigned(M) then Result := M.State.Height else Result := 0;
 end;
 
 procedure TSoftwareGraphicsBackend.SetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
+var M: TGraphicsMemory;
 begin
-  if (Surface = GFX_SCREEN_SURFACE) and ValidScreen then
-    FScreen.SetPixel(X, Y, Color);
+  M := MemoryOf(Surface);
+  if Assigned(M) then M.SetPixel(X, Y, Color);
 end;
 
 function TSoftwareGraphicsBackend.GetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;
+var M: TGraphicsMemory;
 begin
-  if (Surface = GFX_SCREEN_SURFACE) and ValidScreen then
-    Result := FScreen.GetPixel(X, Y)
-  else
-    Result := 0;
+  M := MemoryOf(Surface);
+  if Assigned(M) then Result := M.GetPixel(X, Y) else Result := 0;
 end;
 
 procedure TSoftwareGraphicsBackend.DrawLine(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; LineWidth: Integer);
+var M: TGraphicsMemory;
 begin
-  if (Surface = GFX_SCREEN_SURFACE) and ValidScreen then
-    DrawLineToMemory(FScreen, X1, Y1, X2, Y2, Color, False, LineWidth, FScreen.State.Width, FScreen.State.Height);
+  M := MemoryOf(Surface);
+  if Assigned(M) then
+    DrawLineToMemory(M, X1, Y1, X2, Y2, Color, False, LineWidth, M.State.Width, M.State.Height);
 end;
 
 procedure TSoftwareGraphicsBackend.DrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
+var M: TGraphicsMemory;
 begin
-  if (Surface = GFX_SCREEN_SURFACE) and ValidScreen then
-    DrawBoxToMemory(FScreen, X1, Y1, X2, Y2, Color, False, Filled, LineWidth, Angle, FScreen.State.Width, FScreen.State.Height);
+  M := MemoryOf(Surface);
+  if Assigned(M) then
+    DrawBoxToMemory(M, X1, Y1, X2, Y2, Color, False, Filled, LineWidth, Angle, M.State.Width, M.State.Height);
 end;
 
 procedure TSoftwareGraphicsBackend.DrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
+var M: TGraphicsMemory;
 begin
-  if (Surface = GFX_SCREEN_SURFACE) and ValidScreen then
-    DrawCircleToMemory(FScreen, CX, CY, RX, RY, Color, False, StartAngle, EndAngle, RotationAngle, AngleStep, LineWidth, FScreen.State.Width, FScreen.State.Height);
+  M := MemoryOf(Surface);
+  if Assigned(M) then
+    DrawCircleToMemory(M, CX, CY, RX, RY, Color, False, StartAngle, EndAngle, RotationAngle, AngleStep, LineWidth, M.State.Width, M.State.Height);
 end;
 
 procedure TSoftwareGraphicsBackend.Fill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
@@ -249,11 +299,13 @@ var
 
 var
   CX, CY: Integer;
+  M: TGraphicsMemory;
 begin
-  if (Surface <> GFX_SCREEN_SURFACE) or not ValidScreen then Exit;
-  W := FScreen.State.Width; H := FScreen.State.Height;
+  M := MemoryOf(Surface);
+  if not Assigned(M) then Exit;
+  W := M.State.Width; H := M.State.Height;
   if (X < 0) or (Y < 0) or (X >= W) or (Y >= H) then Exit;
-  Target := FScreen.GetPixel(X, Y);
+  Target := M.GetPixel(X, Y);
   if Target = Color then Exit;
   Top := 0;
   SetLength(Stack, 64);
@@ -262,16 +314,80 @@ begin
   begin
     Dec(Top);
     CX := Stack[Top].PX; CY := Stack[Top].PY;
-    if FScreen.GetPixel(CX, CY) <> Target then Continue;
-    FScreen.SetPixel(CX, CY, Color);
+    if M.GetPixel(CX, CY) <> Target then Continue;
+    M.SetPixel(CX, CY, Color);
     Push(CX + 1, CY); Push(CX - 1, CY);
     Push(CX, CY + 1); Push(CX, CY - 1);
   end;
 end;
 
 procedure TSoftwareGraphicsBackend.Blit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);
+// Blit the whole Src surface onto Dst at top-left (X,Y), per-pixel, applying the blit mode. Colours are
+// in the engine ABGR layout ($AABBGGRR). TRANS skips magenta (RGB 255,0,255). CUSTOM falls back to PSET.
+const
+  TRANS_KEY = TGfxColor($FFFF00FF);   // ABGR magenta = RGB(255,0,255)
+var
+  MD, MS: TGraphicsMemory;
+  SW, SH, DW, DH, sx, sy, dx, dy: Integer;
+  sc, dc, nc: TGfxColor;
+
+  function Blend(D, S: TGfxColor): TGfxColor;
+  var dr, dg, db, sr, sg, sb, sa, r, g, b: Integer;
+  begin
+    case Mode of
+      gbmAnd: Result := D and S;
+      gbmOr:  Result := D or S;
+      gbmXor: Result := D xor S;
+      gbmAdd:
+        begin
+          sr := S and $FF; sg := (S shr 8) and $FF; sb := (S shr 16) and $FF;
+          dr := D and $FF; dg := (D shr 8) and $FF; db := (D shr 16) and $FF;
+          r := dr + sr; if r > 255 then r := 255;
+          g := dg + sg; if g > 255 then g := 255;
+          b := db + sb; if b > 255 then b := 255;
+          Result := (D and $FF000000) or TGfxColor(b shl 16) or TGfxColor(g shl 8) or TGfxColor(r);
+        end;
+      gbmAlpha:
+        begin
+          sa := (S shr 24) and $FF;
+          sr := S and $FF; sg := (S shr 8) and $FF; sb := (S shr 16) and $FF;
+          dr := D and $FF; dg := (D shr 8) and $FF; db := (D shr 16) and $FF;
+          r := (sr * sa + dr * (255 - sa)) div 255;
+          g := (sg * sa + dg * (255 - sa)) div 255;
+          b := (sb * sa + db * (255 - sa)) div 255;
+          Result := $FF000000 or TGfxColor(b shl 16) or TGfxColor(g shl 8) or TGfxColor(r);
+        end;
+    else
+      Result := S;   // gbmPSet / gbmTrans (handled by caller) / gbmCustom
+    end;
+  end;
+
 begin
-  // Image blitting (PUT) deferred to phase 2/G3 (needs image surfaces).
+  MD := MemoryOf(Dst);
+  MS := MemoryOf(Src);
+  if (not Assigned(MD)) or (not Assigned(MS)) then Exit;
+  SW := MS.State.Width;  SH := MS.State.Height;
+  DW := MD.State.Width;  DH := MD.State.Height;
+  for sy := 0 to SH - 1 do
+  begin
+    dy := Y + sy;
+    if (dy < 0) or (dy >= DH) then Continue;
+    for sx := 0 to SW - 1 do
+    begin
+      dx := X + sx;
+      if (dx < 0) or (dx >= DW) then Continue;
+      sc := MS.GetPixel(sx, sy);
+      if (Mode = gbmTrans) and (sc = TRANS_KEY) then Continue;   // transparent pixel: leave dst
+      if Mode in [gbmPSet, gbmTrans, gbmCustom] then
+        nc := sc
+      else
+      begin
+        dc := MD.GetPixel(dx, dy);
+        nc := Blend(dc, sc);
+      end;
+      MD.SetPixel(dx, dy, nc);
+    end;
+  end;
 end;
 
 procedure TSoftwareGraphicsBackend.EnablePalette(Enable: Boolean);

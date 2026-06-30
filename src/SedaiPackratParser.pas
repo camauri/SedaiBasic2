@@ -3715,6 +3715,10 @@ begin
     Result := TASTNode.Create(antGfxPset, Token)
   else if CmdName = 'PALETTE' then
     Result := TASTNode.Create(antPalette, Token)
+  else if CmdName = 'IMAGEDESTROY' then
+    Result := TASTNode.Create(antImageDestroy, Token)
+  else if CmdName = 'IMAGEINFO' then
+    Result := TASTNode.Create(antImageInfo, Token)
   else
     Result := TASTNode.Create(antStatement, Token);
 
@@ -3805,6 +3809,26 @@ begin
         Result.Attributes.Values['HASBG'] := '1';
       end;
     end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // FreeBASIC IMAGEDESTROY handle
+  if Result.NodeType = antImageDestroy then
+  begin
+    Result.AddChild(ParseExpression);                            // handle
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // FreeBASIC IMAGEINFO handle, w, h  (writes width/height into the w and h variables)
+  if Result.NodeType = antImageInfo then
+  begin
+    Result.AddChild(ParseExpression);                            // handle
+    if Context.Check(ttSeparParam) then Context.Advance;          // ','
+    Result.AddChild(ParseExpression);                            // w variable
+    if Context.Check(ttSeparParam) then Context.Advance;          // ','
+    Result.AddChild(ParseExpression);                            // h variable
     DoNodeCreated(Result);
     Exit;
   end;

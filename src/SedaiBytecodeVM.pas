@@ -3176,6 +3176,23 @@ begin
         // bcGfxForeColor: Dest=result (current foreground)
         bcGfxForeColor:
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // result
+        // bcGfxImageCreate: Dest=handle, Src1=w, Src2=h, Immediate=fill colour reg
+        bcGfxImageCreate:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // handle
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // w
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // h
+          if Instr.Immediate > MaxIntReg then MaxIntReg := Instr.Immediate;  // fill colour reg
+        end;
+        // bcGfxImageDestroy: Src1=handle
+        bcGfxImageDestroy:
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // handle
+        // bcGfxImageInfo: Dest=result, Src1=handle (Immediate = which selector, not a reg)
+        bcGfxImageInfo:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // result
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // handle
+        end;
 
         // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
         // Immediate bits 0-15 = row2 register(int), bits 16-31 = clear register(int)
@@ -6554,6 +6571,25 @@ begin
       end;
     35: // bcGfxForeColor - read current draw foreground (omitted-colour default)
       Ctx.IntRegs[Instr.Dest] := Int64(FGfxForeColor);
+    36: // bcGfxImageCreate - IMAGECREATE(w,h[,color]) -> handle (Immediate = fill colour reg)
+      if Assigned(FGraphics) then
+        Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.CreateSurface(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+                                          UInt32(Ctx.IntRegs[Instr.Immediate])))
+      else
+        Ctx.IntRegs[Instr.Dest] := GFX_INVALID_SURFACE;
+    37: // bcGfxImageDestroy - IMAGEDESTROY handle
+      if Assigned(FGraphics) then
+        FGraphics.DestroySurface(Ctx.IntRegs[Instr.Src1]);
+    38: // bcGfxImageInfo - __IMGINFO(handle, which): width (0) / height (1)
+      if Assigned(FGraphics) then
+      begin
+        if Instr.Immediate = 0 then
+          Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(Ctx.IntRegs[Instr.Src1])
+        else
+          Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceHeight(Ctx.IntRegs[Instr.Src1]);
+      end
+      else
+        Ctx.IntRegs[Instr.Dest] := 0;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

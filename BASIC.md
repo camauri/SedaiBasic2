@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 470 / 643 implemented (73%)** (+ 2 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 473 / 643 implemented (74%)** (+ 2 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **470 (82%)** are implemented. See the
+**572 applicable** keywords, **473 (83%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **470 / 643 implemented (73%)**, plus 2 partial (◐).
-> Of the 171 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **456 / 572 ≈ 80% of the
+> **Coverage (FreeBASIC keyword set):** **473 / 643 implemented (74%)**, plus 2 partial (◐).
+> Of the 168 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **459 / 572 ≈ 80% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -2460,10 +2460,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `GET (GRAPHICS)` | ✓ | Creates an image buffer from a portion of another image buffer or screen. |
-| `IMAGECREATE` | ✗ | Creates an image buffer of a certain size and pixel depth. |
-| `IMAGEDESTROY` | ✗ | Frees an image buffer resource. |
+| `IMAGECREATE` | ✓ | `IMAGECREATE(w,h[,color])` allocates a truecolor image surface and returns an integer handle (via IGraphicsBackend; software-backed, headless-testable). Default fill is the transparent key (magenta). |
+| `IMAGEDESTROY` | ✓ | `IMAGEDESTROY handle` frees an image surface (the id slot is reused by a later IMAGECREATE). |
 | `IMAGECONVERTROW` | ✗ | Converts a row of pixels in an image buffer to a different color depth. |
-| `IMAGEINFO` | ✗ | Retrieves useful information about an image buffer |
+| `IMAGEINFO` | ✓ | `IMAGEINFO handle, w, h` writes the surface width/height into the w and h variables. (Pitch/depth/pixel-pointer forms deferred.) |
 | `BLOAD` | ✓ | Creates an image buffer from a file. |
 | `BSAVE` | ✓ | Saves an image buffer to a file. |
 

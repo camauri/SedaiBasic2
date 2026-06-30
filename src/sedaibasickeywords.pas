@@ -420,6 +420,9 @@ const
   kRGBA    = 'RGBA';     // Create 32-bit RGBA color value: RGBA(r, g, b, a)
   kRGB     = 'RGB';      // FreeBASIC: opaque colour value RGB(r, g, b) = RGBA(r, g, b, 255)
   kPALETTE = 'PALETTE';  // FreeBASIC: set/get/reset a palette entry
+  kIMAGECREATE  = 'IMAGECREATE';   // FreeBASIC: allocate an image surface -> handle
+  kIMAGEDESTROY = 'IMAGEDESTROY';  // FreeBASIC: free an image surface
+  kIMAGEINFO    = 'IMAGEINFO';     // FreeBASIC: query an image surface (width/height)
   kDRAW    = 'DRAW';
   kCIRCLE  = 'CIRCLE';
   kPAINT   = 'PAINT';

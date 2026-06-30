@@ -255,6 +255,8 @@ begin
     bcGfxPoint,       // POINT(x,y): Dest = pixel color (int)
     bcGfxPalGet,      // __PALGET(index,which): Dest = palette component (int)
     bcGfxForeColor,   // current draw foreground: Dest = colour (int)
+    bcGfxImageCreate, // IMAGECREATE: Dest = image handle (int)
+    bcGfxImageInfo,   // __IMGINFO: Dest = width/height (int)
     bcGraphicRdot,    // Dest = pixel cursor info (int)
     bcGraphicGetMode, // Dest = current graphic mode (int)
     bcGraphicPos,     // POS(x): cursor column position (int)
@@ -460,6 +462,7 @@ begin
     bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxLine, bcGfxCircle,  // FreeBASIC graphics: Src1 = w / x / x1 (int)
     bcGfxPalette, bcGfxPalGet,  // PALETTE: Src1 = index (int)
     bcGfxColor,  // COLOR: Src1 = foreground (int)
+    bcGfxImageCreate, bcGfxImageDestroy, bcGfxImageInfo,  // IMAGE*: Src1 = w / handle (int)
     bcGraphicSShape,  // Src1 = x1 coordinate (int)
     bcGraphicColor,   // Src1 = source register (int)
     bcGraphicWidth,   // Src1 = width value (int)
@@ -598,6 +601,7 @@ begin
     bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxLine, bcGfxCircle,  // FreeBASIC graphics: Src2 = h / y / y1 (int)
     bcGfxPalette,  // PALETTE set: Src2 = packed colour (int)
     bcGfxColor,  // COLOR: Src2 = background (int)
+    bcGfxImageCreate,  // IMAGECREATE: Src2 = h (int)
     bcGraphicScale,   // Src2 = xmax register (int)
     bcGraphicColor,   // Src2 = color value (int)
     bcGraphicPaint,   // Src2 = x coordinate (int)
@@ -1001,6 +1005,10 @@ begin
 
     // PSET/PAINT (x,y),color: Immediate contains the color register index (int)
     if (OpCode = bcGfxPset) or (OpCode = bcGfxPaint) then
+      MarkIntRegUsed(Instr.Immediate and $FFFF);
+
+    // IMAGECREATE: Immediate contains the fill-colour register index (int)
+    if OpCode = bcGfxImageCreate then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // LINE: Immediate [0-15]=x2, [16-31]=y2, [32-47]=color (all int regs; bits 48-49 = shape flag, NOT a reg)
@@ -1482,7 +1490,7 @@ begin
     if (OpCode = bcStrMid) or (OpCode = bcStrMidW) or
        (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) or
        (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) or
-       (OpCode = bcGfxPset) or (OpCode = bcGfxPaint) then
+       (OpCode = bcGfxPset) or (OpCode = bcGfxPaint) or (OpCode = bcGfxImageCreate) then
     begin
       OldReg := Instr.Immediate and $FFFF;
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then

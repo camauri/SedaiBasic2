@@ -567,6 +567,12 @@ const
   bcGfxColor        = bcGroupGraphics + 34;
   // read the current draw foreground (Dest=result) — used as the omitted-colour default for PSET/LINE/...
   bcGfxForeColor    = bcGroupGraphics + 35;
+  // IMAGECREATE(w,h[,color]) : Dest=handle, Src1=w, Src2=h, Immediate=fill colour reg
+  bcGfxImageCreate  = bcGroupGraphics + 36;
+  // IMAGEDESTROY handle : Src1=handle
+  bcGfxImageDestroy = bcGroupGraphics + 37;
+  // __IMGINFO(handle, which) : Dest=result, Src1=handle, Immediate=which (0=width, 1=height)
+  bcGfxImageInfo    = bcGroupGraphics + 38;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1649,6 +1655,9 @@ begin
         33: Result := 'GfxPaletteReset';
         34: Result := 'GfxColor';
         35: Result := 'GfxForeColor';
+        36: Result := 'GfxImageCreate';
+        37: Result := 'GfxImageDestroy';
+        38: Result := 'GfxImageInfo';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

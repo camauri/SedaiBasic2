@@ -242,6 +242,9 @@ type
     ssaGfxPaletteReset,// PALETTE (no args) : reset the palette to the mode default
     ssaGfxColor,       // COLOR [fg][,bg] : set current draw foreground/background (Src1=fg, Src2=bg)
     ssaGfxForeColor,   // read the current draw foreground colour (Dest=result) — omitted-colour default
+    ssaGfxImageCreate, // IMAGECREATE(w,h[,color]) -> image handle (Dest=handle, Src1=w, Src2=h, Src3=color)
+    ssaGfxImageDestroy,// IMAGEDESTROY handle (Src1=handle)
+    ssaGfxImageInfo,   // __IMGINFO(handle, which) -> w/h (Dest=result, Src1=handle, Immediate=which)
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n
     ssaGraphicRwindow, // RWINDOW(n): Return window size info

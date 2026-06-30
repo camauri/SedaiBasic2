@@ -382,6 +382,9 @@ begin
     ssaGfxPaletteReset: Result := bcGfxPaletteReset;
     ssaGfxColor: Result := bcGfxColor;
     ssaGfxForeColor: Result := bcGfxForeColor;
+    ssaGfxImageCreate: Result := bcGfxImageCreate;
+    ssaGfxImageDestroy: Result := bcGfxImageDestroy;
+    ssaGfxImageInfo: Result := bcGfxImageInfo;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;
     ssaGraphicRwindow: Result := bcGraphicRwindow;

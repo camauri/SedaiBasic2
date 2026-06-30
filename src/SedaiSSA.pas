@@ -404,6 +404,8 @@ type
     procedure ProcessPalette(Node: TASTNode);      // PALETTE [GET] [index, r, g, b] / reset
     procedure ProcessGfxColor(Node: TASTNode);     // COLOR [fg][,bg] (FreeBASIC draw colour)
     function  DefaultDrawColorReg: TSSAValue;       // omitted-colour default = current draw foreground
+    procedure ProcessImageDestroy(Node: TASTNode);  // IMAGEDESTROY handle
+    procedure ProcessImageInfo(Node: TASTNode);      // IMAGEINFO handle, w, h
     procedure ProcessColor(Node: TASTNode);
     procedure ProcessSetColor(Node: TASTNode);
     procedure ProcessWidth(Node: TASTNode);
@@ -3020,6 +3022,47 @@ begin
           end
           else
             raise Exception.Create('__PALGET requires 2 arguments');
+        end
+        else if FuncName = 'IMAGECREATE' then
+        begin
+          // IMAGECREATE(w, h [, color]) -> image handle. Default fill is the transparent key (magenta,
+          // RGB 255,0,255) so an untouched image blits as transparent under PUT TRANS.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);  // w
+            ProcessExpression(ArgListNode.GetChild(1), RVal);     RReg := EnsureIntRegister(RVal);          // h
+            if ArgListNode.ChildCount >= 3 then
+            begin
+              ProcessExpression(ArgListNode.GetChild(2), GVal); GReg := EnsureIntRegister(GVal);
+            end
+            else
+            begin
+              GReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaLoadConstInt, GReg, MakeSSAConstInt(Int64($FFFF00FF)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            end;
+            DestReg := FProgram.AllocRegister(srtInt);
+            Result := MakeSSARegister(srtInt, DestReg);
+            EmitInstruction(ssaGfxImageCreate, Result, ArgReg, RReg, GReg);   // Src3=color -> Immediate
+          end
+          else
+            raise Exception.Create('IMAGECREATE requires at least 2 arguments: IMAGECREATE(w, h [, color])');
+        end
+        else if FuncName = '__IMGINFO' then
+        begin
+          // Internal helper for IMAGEINFO: __IMGINFO(handle, which) -> width (0) / height (1).
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
+            ProcessExpression(ArgListNode.GetChild(1), RVal);     // which (constant 0/1)
+            DestReg := FProgram.AllocRegister(srtInt);
+            Result := MakeSSARegister(srtInt, DestReg);
+            if RVal.Kind = svkConstInt then
+              EmitInstruction(ssaGfxImageInfo, Result, ArgReg, MakeSSAValue(svkNone), RVal)
+            else
+              EmitInstruction(ssaGfxImageInfo, Result, ArgReg, MakeSSAValue(svkNone), EnsureIntRegister(RVal));
+          end
+          else
+            raise Exception.Create('__IMGINFO requires 2 arguments');
         end
         else if FuncName = 'RDOT' then
         begin
@@ -7451,6 +7494,39 @@ begin
   if HasFg then Flags := Flags or 1;
   if HasBg then Flags := Flags or 2;
   EmitInstruction(ssaGfxColor, MakeSSAValue(svkNone), FgReg, BgReg, MakeSSAConstInt(Flags));   // Src3=flags -> Immediate
+end;
+
+procedure TSSAGenerator.ProcessImageDestroy(Node: TASTNode);
+// IMAGEDESTROY handle : free the image surface.
+var HVal, HReg: TSSAValue;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 1) then Exit;
+  ProcessExpression(Node.GetChild(0), HVal); HReg := EnsureIntRegister(HVal);
+  EmitInstruction(ssaGfxImageDestroy, MakeSSAValue(svkNone), HReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessImageInfo(Node: TASTNode);
+// IMAGEINFO handle, w, h : write the image's width/height into the w and h variables. Lowered to two
+// synthetic assignments "var = __IMGINFO(handle, which)" reusing the assignment machinery (handle cloned).
+var
+  Assign, Call, ArgList, WhichLit: TASTNode;
+  i: Integer;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 3) then Exit;
+  for i := 0 to 1 do
+  begin
+    WhichLit := TASTNode.CreateWithValue(antLiteral, i, Node.Token);
+    ArgList := TASTNode.Create(antArgumentList, Node.Token);
+    ArgList.AddChild(Node.GetChild(0).Clone);    // handle (cloned per query)
+    ArgList.AddChild(WhichLit);
+    Call := TASTNode.CreateWithValue(antGraphicsFunction, '__IMGINFO', Node.Token);
+    Call.AddChild(ArgList);
+    Assign := TASTNode.Create(antAssignment, Node.Token);
+    Assign.AddChild(Node.GetChild(i + 1).Clone); // destination variable (w then h)
+    Assign.AddChild(Call);
+    ProcessStatement(Assign);
+    Assign.Free;
+  end;
 end;
 
 procedure TSSAGenerator.ProcessBeep(Node: TASTNode);
@@ -14982,6 +15058,8 @@ begin
     antGfxCircle: ProcessGfxCircle(Node);
     antPalette: ProcessPalette(Node);
     antGfxColor: ProcessGfxColor(Node);
+    antImageDestroy: ProcessImageDestroy(Node);
+    antImageInfo: ProcessImageInfo(Node);
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);
     antWidth: ProcessWidth(Node);

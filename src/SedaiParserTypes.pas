@@ -204,6 +204,8 @@ type
     antGfxCircle,         // CIRCLE (x, y), r [, color] (FreeBASIC graphics)
     antPalette,           // PALETTE [GET] [index, r, g, b] (FreeBASIC; OP attribute = SET/GET/RESET)
     antGfxColor,          // COLOR [fg][,bg] (FreeBASIC graphics draw colour; HASFG/HASBG attributes)
+    antImageDestroy,      // IMAGEDESTROY handle (FreeBASIC)
+    antImageInfo,         // IMAGEINFO handle, w, h (FreeBASIC)
     antBeep,              // BEEP command (console bell: emits CHR(7))
     antBox,               // BOX command
     antCircle,            // CIRCLE command

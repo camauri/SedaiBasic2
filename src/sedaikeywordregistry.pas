@@ -1860,6 +1860,9 @@ begin
  RegisterKeyword(kSCREENRES, ttGraphicsCommand, 'FreeBASIC: set graphics screen resolution',        kcGraphicsHandling);
  RegisterKeyword(kPSET,    ttGraphicsCommand, 'FreeBASIC: set a pixel, PSET (x,y),color',           kcGraphicsHandling);
  RegisterKeyword(kPALETTE, ttGraphicsCommand, 'FreeBASIC: set/get/reset a palette entry',            kcGraphicsHandling);
+ RegisterKeyword(kIMAGECREATE,  ttGraphicsFunction, 'FreeBASIC: allocate an image surface -> handle', kcGraphicsHandling);
+ RegisterKeyword(kIMAGEDESTROY, ttGraphicsCommand,  'FreeBASIC: free an image surface',               kcGraphicsHandling);
+ RegisterKeyword(kIMAGEINFO,    ttGraphicsCommand,  'FreeBASIC: query an image surface width/height', kcGraphicsHandling);
  RegisterKeyword(kRWINDOW, ttInputFunction,    'Return the size of the current text window',       kcStdIO);
 
  // === SPRITES HANDLING (COMMANDS AND FUNCTIONS) ===
