@@ -778,6 +778,7 @@ begin
     bcGraphicScale,   // Dest = ymax register (int) - READ, not written
     bcGraphicPaint,   // Dest = y coordinate (int) - READ, not written
     bcGraphicGShape,  // Dest = y coordinate (int) - READ, not written
+    bcSetColor,       // SETCOLOR: Dest = G component (int) - READ, not written
     // === GROUP 11: Sound ===
     bcSoundSound,     // Dest = duration register (int) - READ, not written
     // === SUPERINSTRUCTIONS ===
@@ -990,6 +991,13 @@ begin
     begin
       MarkIntRegUsed(Instr.Immediate and $FFFF);           // A register
       MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);  // B register
+    end;
+
+    // bcSetColor (SETCOLOR): Immediate = B reg (bits 0-11) | A reg (bits 12-23) - two int registers
+    if OpCode = bcSetColor then
+    begin
+      MarkIntRegUsed(Instr.Immediate and $FFF);            // B register
+      MarkIntRegUsed((Instr.Immediate shr 12) and $FFF);   // A register
     end;
 
     // bcArrayLoadDivAddFloat: Immediate = (denom_reg << 16) | acc_reg - two float registers
@@ -1438,6 +1446,23 @@ begin
         NewReg := OldReg;
       NewImm := NewImm or ((Int64(NewReg) and $FFF) shl 48);
 
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
+      end;
+    end;
+
+    // bcSetColor (SETCOLOR): Immediate = B reg (bits 0-11) | A reg (bits 12-23) - two int registers
+    if OpCode = bcSetColor then
+    begin
+      NewImm := 0;
+      OldReg := Instr.Immediate and $FFF;                                                  // B
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewReg and $FFF;
+      OldReg := (Instr.Immediate shr 12) and $FFF;                                         // A
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFF) shl 12);
       if NewImm <> Instr.Immediate then
       begin
         Instr.Immediate := NewImm;
