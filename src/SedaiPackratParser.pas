@@ -270,6 +270,7 @@ type
     function ParseFileInputStatement: TASTNode;
     function ParseFileOutputStatement: TASTNode;
     function ParseLineInputStatement: TASTNode;  // FreeBASIC LINE INPUT #n, var (whole line)
+    function ParseGfxLineStatement: TASTNode;     // FreeBASIC LINE (x1,y1)-(x2,y2),color[,B|BF]
     function ParseWriteFileStatement: TASTNode;   // FreeBASIC WRITE #n, exprlist (quoted CSV)
     function ParseWriteConsole: TASTNode;          // FreeBASIC WRITE exprlist (quoted CSV to screen)
     function ParseSeekStatement: TASTNode;         // FreeBASIC SEEK #n, pos (set position)
@@ -902,6 +903,11 @@ begin
         else if (UpperCase(Token.Value) = kLINE) and Assigned(Context.PeekNext) and
                 (UpperCase(Context.PeekNext.Value) = kINPUT) then
           Result := ParseLineInputStatement
+        // FreeBASIC graphics "LINE (x1,y1)-(x2,y2),color[,B|BF]": LINE is a bare identifier here; the
+        // parenthesis after it selects the graphics statement (vs LINE INPUT, vs an assignment to `line`).
+        else if (UpperCase(Token.Value) = kLINE) and Assigned(Context.PeekNext) and
+                (Context.PeekNext.TokenType = ttDelimParOpen) then
+          Result := ParseGfxLineStatement
         // FreeBASIC "WRITE #n, ...": comma-separated, quoted-string CSV output (WRITE is a bare
         // identifier here; the `#` after it disambiguates from an assignment to a var named `write`).
         else if (UpperCase(Token.Value) = kWRITE) and Assigned(Context.PeekNext) and
@@ -3656,7 +3662,13 @@ begin
   else if CmdName = 'BOX' then
     Result := TASTNode.Create(antBox, Token)
   else if CmdName = 'CIRCLE' then
-    Result := TASTNode.Create(antCircle, Token)
+  begin
+    // FreeBASIC CIRCLE (x,y),r[,color] vs C128 CIRCLE source,x,y,... — disambiguated by the parenthesis.
+    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+      Result := TASTNode.Create(antGfxCircle, Token)
+    else
+      Result := TASTNode.Create(antCircle, Token);
+  end
   else if CmdName = 'DRAW' then
     Result := TASTNode.Create(antDraw, Token)
   else if CmdName = 'LOCATE' then
@@ -3710,6 +3722,25 @@ begin
     if Context.Check(ttSeparParam) then Context.Advance;          // ','
     Result.AddChild(ParseExpression);                             // y
     if Context.Check(ttDelimParClose) then Context.Advance;       // ')'
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;                                            // ','
+      Result.AddChild(ParseExpression);                           // color
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // FreeBASIC CIRCLE (x, y), r [, color]: parenthesised centre then radius (and optional colour).
+  if Result.NodeType = antGfxCircle then
+  begin
+    if Context.Check(ttDelimParOpen) then Context.Advance;        // '('
+    Result.AddChild(ParseExpression);                             // x
+    if Context.Check(ttSeparParam) then Context.Advance;          // ','
+    Result.AddChild(ParseExpression);                             // y
+    if Context.Check(ttDelimParClose) then Context.Advance;       // ')'
+    if Context.Check(ttSeparParam) then Context.Advance;          // ','
+    Result.AddChild(ParseExpression);                             // radius
     if Context.Check(ttSeparParam) then
     begin
       Context.Advance;                                            // ','
@@ -4554,6 +4585,67 @@ begin
     P := ParseExpression;     // destination string variable
     if Assigned(P) then Result.AddChild(P) else Break;
     if Context.Check(ttSeparParam) then Context.Advance else Break;
+  end;
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseGfxLineStatement: TASTNode;
+// FreeBASIC graphics "LINE (x1,y1)-(x2,y2)[,color][,B|BF]". Cursor is at the LINE identifier.
+// Children: x1, y1, x2, y2 [, color]. The box flag is stored in the SHAPE attribute ('' = line,
+// 'B' = box outline, 'BF' = filled box). The leading start-coordinate / STEP / line-style forms are
+// deferred (v1 requires the full two-point form). "LINE INPUT" is intercepted before this is reached.
+var
+  Tok: TLexerToken;
+  FlagStr: string;
+  IsFlagToken: Boolean;
+begin
+  Tok := Context.CurrentToken;
+  Result := TASTNode.Create(antGfxLine, Tok);
+  Context.Advance;                                          // LINE
+  if Context.Check(ttDelimParOpen) then Context.Advance;    // '('
+  Result.AddChild(ParseExpression);                         // x1
+  if Context.Check(ttSeparParam) then Context.Advance;      // ','
+  Result.AddChild(ParseExpression);                         // y1
+  if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+  if Context.Check(ttOpSub) then Context.Advance;           // '-'
+  if Context.Check(ttDelimParOpen) then Context.Advance;    // '('
+  Result.AddChild(ParseExpression);                         // x2
+  if Context.Check(ttSeparParam) then Context.Advance;      // ','
+  Result.AddChild(ParseExpression);                         // y2
+  if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+
+  // Optional trailing fields: [,color] [,B|BF]. FB puts colour first; a lone ",B"/",BF" (colour omitted)
+  // is also accepted for convenience, as is the faithful ",,B"/",,BF".
+  if Context.Check(ttSeparParam) then
+  begin
+    Context.Advance;                                        // first ','
+    IsFlagToken := Context.Check(ttIdentifier) and
+      ((UpperCase(Context.CurrentToken.Value) = 'B') or (UpperCase(Context.CurrentToken.Value) = 'BF')) and
+      (not Assigned(Context.PeekNext) or
+       (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]));
+    if IsFlagToken then
+    begin
+      Result.Attributes.Values['SHAPE'] := UpperCase(Context.CurrentToken.Value);
+      Context.Advance;
+    end
+    else
+    begin
+      if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+        Result.AddChild(ParseExpression);                   // color
+      if Context.Check(ttSeparParam) then
+      begin
+        Context.Advance;                                    // second ','
+        if Context.Check(ttIdentifier) then
+        begin
+          FlagStr := UpperCase(Context.CurrentToken.Value);
+          if (FlagStr = 'B') or (FlagStr = 'BF') then
+          begin
+            Result.Attributes.Values['SHAPE'] := FlagStr;
+            Context.Advance;
+          end;
+        end;
+      end;
+    end;
   end;
   DoNodeCreated(Result);
 end;

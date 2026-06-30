@@ -375,6 +375,8 @@ begin
     ssaGfxPset: Result := bcGfxPset;
     ssaGfxPoint: Result := bcGfxPoint;
     ssaGfxPaint: Result := bcGfxPaint;
+    ssaGfxLine: Result := bcGfxLine;
+    ssaGfxCircle: Result := bcGfxCircle;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;
     ssaGraphicRwindow: Result := bcGraphicRwindow;
@@ -1275,6 +1277,65 @@ begin
         BCInstr.Immediate := BCInstr.Immediate or ((Int64(Instr.PhiSources[0].Value.ConstInt) and $FFFF) shl 16);
     end;
 
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // FreeBASIC LINE (x1,y1)-(x2,y2),color[,B|BF]: Src1=x1, Src2=y1; Immediate packs x2 (from Src3,
+  // bits 0-15), y2 (PhiSources[0], bits 16-31), color (PhiSources[1], bits 32-47) and the shape flag
+  // (PhiSources[2] ConstInt, bits 48-49: 0=line, 1=box outline, 2=filled box).
+  if Instr.OpCode = ssaGfxLine then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcGfxLine, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    BCInstr.Immediate := 0;
+    // x2 (bits 0-15)
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Immediate := BCInstr.Immediate or
+        (Int64(MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version)) and $FFFF)
+    else if Instr.Src3.Kind = svkConstInt then
+      BCInstr.Immediate := BCInstr.Immediate or (Int64(Instr.Src3.ConstInt) and $FFFF);
+    // y2 (bits 16-31)
+    if (Length(Instr.PhiSources) >= 1) and (Instr.PhiSources[0].Value.Kind = svkRegister) then
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+          Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF) shl 16);
+    // color (bits 32-47)
+    if (Length(Instr.PhiSources) >= 2) and (Instr.PhiSources[1].Value.Kind = svkRegister) then
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
+          Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FFFF) shl 32);
+    // shape flag (bits 48-49, a constant — NOT a register)
+    if (Length(Instr.PhiSources) >= 3) and (Instr.PhiSources[2].Value.Kind = svkConstInt) then
+      BCInstr.Immediate := BCInstr.Immediate or ((Int64(Instr.PhiSources[2].Value.ConstInt) and $3) shl 48);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // FreeBASIC CIRCLE (x,y),r[,color]: Src1=x, Src2=y; Immediate packs r (from Src3, bits 0-15) and
+  // color (PhiSources[0], bits 16-31).
+  if Instr.OpCode = ssaGfxCircle then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcGfxCircle, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    BCInstr.Immediate := 0;
+    // radius (bits 0-15)
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Immediate := BCInstr.Immediate or
+        (Int64(MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version)) and $FFFF)
+    else if Instr.Src3.Kind = svkConstInt then
+      BCInstr.Immediate := BCInstr.Immediate or (Int64(Instr.Src3.ConstInt) and $FFFF);
+    // color (bits 16-31)
+    if (Length(Instr.PhiSources) >= 1) and (Instr.PhiSources[0].Value.Kind = svkRegister) then
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+          Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF) shl 16);
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;

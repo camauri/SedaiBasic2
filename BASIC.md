@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 467 / 643 implemented (73%)** (+ 2 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 468 / 643 implemented (73%)** (+ 2 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **467 (82%)** are implemented. See the
+**572 applicable** keywords, **468 (82%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **467 / 643 implemented (73%)**, plus 2 partial (◐).
-> Of the 174 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **453 / 572 ≈ 79% of the
+> **Coverage (FreeBASIC keyword set):** **468 / 643 implemented (73%)**, plus 2 partial (◐).
+> Of the 173 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **454 / 572 ≈ 79% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -2449,8 +2449,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `PSET and PRESET` | ◐ | `PSET (x,y),color` plots a pixel on the screen surface (via IGraphicsBackend; headless-testable + on-screen on sbv). `PRESET` and the image-buffer target deferred. |
-| `LINE (GRAPHICS)` | ✗ | Plots a line of pixels on an image buffer or screen. |
-| `CIRCLE` | ✓ | Plots circles and ellipses on an image buffer or screen. |
+| `LINE (GRAPHICS)` | ✓ | `LINE (x1,y1)-(x2,y2)[,color][,B\|BF]` draws a line, box outline (B) or filled box (BF) on the screen surface (via IGraphicsBackend; headless-testable + on-screen on sbv). Parenthesised form disambiguates from `LINE INPUT`. Leading start-coordinate / STEP / line-style and the image-buffer target deferred. |
+| `CIRCLE` | ✓ | Plots circles and ellipses. C128 form (`CIRCLE source,x,y,...`) and FreeBASIC form (`CIRCLE (x,y),r[,color]`, parenthesised → routed through IGraphicsBackend, headless-testable + on-screen on sbv). FB ellipse/arc/aspect arguments deferred. |
 | `DRAW` | ✓ | Draws in a sequence of commands on an image buffer or screen. |
 | `DRAW STRING` | ✓ | Writes text to an image buffer or screen. |
 | `PAINT` | ✓ | Flood fill. C128 form (`PAINT source,x,y`) and FreeBASIC form (`PAINT (x,y),color`, parenthesised → routed through IGraphicsBackend, headless-testable). Border-colour argument deferred. |

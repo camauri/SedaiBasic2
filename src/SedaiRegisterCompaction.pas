@@ -455,7 +455,7 @@ begin
     bcGraphicWindow,  // Src1 = col1 register (int)
     bcGraphicCircle,  // Src1 = color register (int)
     bcGraphicPaint,   // Src1 = source register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint,  // FreeBASIC graphics: Src1 = w / x (int)
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxLine, bcGfxCircle,  // FreeBASIC graphics: Src1 = w / x / x1 (int)
     bcGraphicSShape,  // Src1 = x1 coordinate (int)
     bcGraphicColor,   // Src1 = source register (int)
     bcGraphicWidth,   // Src1 = width value (int)
@@ -591,7 +591,7 @@ begin
     bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
     bcGraphicWindow,  // Src2 = row1 register (int)
     bcGraphicCircle,  // Src2 = x register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint,  // FreeBASIC graphics: Src2 = h / y (int)
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxLine, bcGfxCircle,  // FreeBASIC graphics: Src2 = h / y / y1 (int)
     bcGraphicScale,   // Src2 = xmax register (int)
     bcGraphicColor,   // Src2 = color value (int)
     bcGraphicPaint,   // Src2 = x coordinate (int)
@@ -996,6 +996,21 @@ begin
     // PSET/PAINT (x,y),color: Immediate contains the color register index (int)
     if (OpCode = bcGfxPset) or (OpCode = bcGfxPaint) then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
+
+    // LINE: Immediate [0-15]=x2, [16-31]=y2, [32-47]=color (all int regs; bits 48-49 = shape flag, NOT a reg)
+    if OpCode = bcGfxLine then
+    begin
+      MarkIntRegUsed(Instr.Immediate and $FFFF);            // x2
+      MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);   // y2
+      MarkIntRegUsed((Instr.Immediate shr 32) and $FFFF);   // color
+    end;
+
+    // CIRCLE: Immediate [0-15]=radius, [16-31]=color (both int regs)
+    if OpCode = bcGfxCircle then
+    begin
+      MarkIntRegUsed(Instr.Immediate and $FFFF);            // radius
+      MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);   // color
+    end;
 
     // bcGraphicWindow: Src1=col1, Src2=row1, Dest=col2, Immediate = (clear_reg << 16) | row2_reg
     // All 5 parameters are int registers
@@ -1472,6 +1487,46 @@ begin
           Instr.Immediate := NewReg and $FFFF;
           Modified := True;
         end;
+      end;
+    end;
+
+    // bcGfxLine: Immediate [0-15]=x2, [16-31]=y2, [32-47]=color (int regs); bits 48-49 = shape flag (preserved)
+    if OpCode = bcGfxLine then
+    begin
+      // x2 (bits 0-15)
+      OldReg := Instr.Immediate and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewReg and $FFFF;
+      // y2 (bits 16-31)
+      OldReg := (Instr.Immediate shr 16) and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 16);
+      // color (bits 32-47)
+      OldReg := (Instr.Immediate shr 32) and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 32);
+      // shape flag (bits 48-49) preserved verbatim
+      NewImm := NewImm or (((Instr.Immediate shr 48) and $3) shl 48);
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
+      end;
+    end;
+
+    // bcGfxCircle: Immediate [0-15]=radius, [16-31]=color (int regs)
+    if OpCode = bcGfxCircle then
+    begin
+      OldReg := Instr.Immediate and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewReg and $FFFF;
+      OldReg := (Instr.Immediate shr 16) and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 16);
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
       end;
     end;
 

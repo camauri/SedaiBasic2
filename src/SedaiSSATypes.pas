@@ -235,6 +235,8 @@ type
     ssaGfxPset,        // PSET (x,y),color
     ssaGfxPoint,       // POINT(x,y) -> color
     ssaGfxPaint,       // PAINT (x,y),color (flood fill)
+    ssaGfxLine,        // LINE (x1,y1)-(x2,y2),color[,B|BF] (line / box outline / filled box)
+    ssaGfxCircle,      // CIRCLE (x,y),r[,color] (circle via DrawEllipse)
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n
     ssaGraphicRwindow, // RWINDOW(n): Return window size info

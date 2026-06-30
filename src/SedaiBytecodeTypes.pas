@@ -552,6 +552,11 @@ const
   bcGfxPset         = bcGroupGraphics + 26;  // PSET (x,y),color : Src1=x, Src2=y, Immediate=color reg
   bcGfxPoint        = bcGroupGraphics + 27;  // POINT(x,y) : Dest=color, Src1=x, Src2=y
   bcGfxPaint        = bcGroupGraphics + 28;  // PAINT (x,y),color : flood fill; Src1=x, Src2=y, Immediate=color reg
+  // LINE (x1,y1)-(x2,y2),color[,B|BF] : Src1=x1, Src2=y1; Immediate [0-15]=x2 reg, [16-31]=y2 reg,
+  //   [32-47]=color reg, [48-49]=shape flag (0=line, 1=box outline, 2=box filled)
+  bcGfxLine         = bcGroupGraphics + 29;
+  // CIRCLE (x,y),r[,color] : Src1=x, Src2=y; Immediate [0-15]=radius reg, [16-31]=color reg
+  bcGfxCircle       = bcGroupGraphics + 30;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1627,6 +1632,8 @@ begin
         26: Result := 'GfxPset';
         27: Result := 'GfxPoint';
         28: Result := 'GfxPaint';
+        29: Result := 'GfxLine';
+        30: Result := 'GfxCircle';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

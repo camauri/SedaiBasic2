@@ -399,6 +399,8 @@ type
     procedure ProcessScreenRes(Node: TASTNode);  // SCREENRES w, h (FreeBASIC graphics)
     procedure ProcessGfxPset(Node: TASTNode);    // PSET (x, y) [, color]
     procedure ProcessGfxPaint(Node: TASTNode);   // PAINT (x, y) [, color] (flood fill)
+    procedure ProcessGfxLine(Node: TASTNode);     // LINE (x1,y1)-(x2,y2) [,color] [,B|BF]
+    procedure ProcessGfxCircle(Node: TASTNode);   // CIRCLE (x, y), r [, color]
     procedure ProcessColor(Node: TASTNode);
     procedure ProcessSetColor(Node: TASTNode);
     procedure ProcessWidth(Node: TASTNode);
@@ -7242,6 +7244,67 @@ begin
     EmitInstruction(ssaLoadConstInt, CReg, MakeSSAConstInt(Int64($FFFFFFFF)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));  // default: white
   end;
   EmitInstruction(ssaGfxPaint, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color -> Immediate
+end;
+
+procedure TSSAGenerator.ProcessGfxLine(Node: TASTNode);
+// LINE (x1,y1)-(x2,y2) [,color] [,B|BF] : draw a line, a box outline (B) or a filled box (BF).
+// Children: x1, y1, x2, y2 [, color]. The SHAPE attribute selects the shape ('' / 'B' / 'BF').
+// Packed for the compiler as Src1=x1, Src2=y1, Src3=x2, PhiSources[0]=y2, [1]=color, [2]=shape flag.
+var
+  X1V, Y1V, X2V, Y2V, CV: TSSAValue;
+  X1R, Y1R, X2R, Y2R, CR: TSSAValue;
+  Instr: TSSAInstruction;
+  Shape: string;
+  Flag: Int64;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 4) then Exit;
+  ProcessExpression(Node.GetChild(0), X1V); X1R := EnsureIntRegister(X1V);
+  ProcessExpression(Node.GetChild(1), Y1V); Y1R := EnsureIntRegister(Y1V);
+  ProcessExpression(Node.GetChild(2), X2V); X2R := EnsureIntRegister(X2V);
+  ProcessExpression(Node.GetChild(3), Y2V); Y2R := EnsureIntRegister(Y2V);
+  if Node.ChildCount >= 5 then
+  begin
+    ProcessExpression(Node.GetChild(4), CV); CR := EnsureIntRegister(CV);
+  end
+  else
+  begin
+    CR := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, CR, MakeSSAConstInt(Int64($FFFFFFFF)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));  // default: white
+  end;
+  Shape := UpperCase(Node.Attributes.Values['SHAPE']);
+  if Shape = 'BF' then Flag := 2
+  else if Shape = 'B' then Flag := 1
+  else Flag := 0;
+  EmitInstruction(ssaGfxLine, MakeSSAValue(svkNone), X1R, Y1R, X2R);
+  Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+  Instr.AddPhiSource(Y2R, nil);
+  Instr.AddPhiSource(CR, nil);
+  Instr.AddPhiSource(MakeSSAConstInt(Flag), nil);
+end;
+
+procedure TSSAGenerator.ProcessGfxCircle(Node: TASTNode);
+// CIRCLE (x, y), r [, color] : a circle of radius r (drawn via the ellipse primitive, RX=RY=r).
+// Children: x, y, r [, color]. Packed as Src1=x, Src2=y, Src3=r, PhiSources[0]=color.
+var
+  XV, YV, RV, CV, XR, YR, RR, CR: TSSAValue;
+  Instr: TSSAInstruction;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 3) then Exit;
+  ProcessExpression(Node.GetChild(0), XV); XR := EnsureIntRegister(XV);
+  ProcessExpression(Node.GetChild(1), YV); YR := EnsureIntRegister(YV);
+  ProcessExpression(Node.GetChild(2), RV); RR := EnsureIntRegister(RV);
+  if Node.ChildCount >= 4 then
+  begin
+    ProcessExpression(Node.GetChild(3), CV); CR := EnsureIntRegister(CV);
+  end
+  else
+  begin
+    CR := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, CR, MakeSSAConstInt(Int64($FFFFFFFF)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));  // default: white
+  end;
+  EmitInstruction(ssaGfxCircle, MakeSSAValue(svkNone), XR, YR, RR);
+  Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+  Instr.AddPhiSource(CR, nil);
 end;
 
 procedure TSSAGenerator.ProcessBeep(Node: TASTNode);
@@ -14769,6 +14832,8 @@ begin
     antScreenRes: ProcessScreenRes(Node);
     antGfxPset: ProcessGfxPset(Node);
     antGfxPaint: ProcessGfxPaint(Node);
+    antGfxLine: ProcessGfxLine(Node);
+    antGfxCircle: ProcessGfxCircle(Node);
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);
     antWidth: ProcessWidth(Node);

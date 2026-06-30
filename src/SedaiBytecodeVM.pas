@@ -3133,6 +3133,23 @@ begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // y
           if Instr.Immediate > MaxIntReg then MaxIntReg := Instr.Immediate;  // color reg
         end;
+        // bcGfxLine: Src1=x1, Src2=y1; Immediate [0-15]=x2, [16-31]=y2, [32-47]=color, [48-49]=flag
+        bcGfxLine:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // x1
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // y1
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;             // x2
+          if ((Instr.Immediate shr 16) and $FFFF) > MaxIntReg then MaxIntReg := (Instr.Immediate shr 16) and $FFFF;  // y2
+          if ((Instr.Immediate shr 32) and $FFFF) > MaxIntReg then MaxIntReg := (Instr.Immediate shr 32) and $FFFF;  // color
+        end;
+        // bcGfxCircle: Src1=x, Src2=y; Immediate [0-15]=radius, [16-31]=color
+        bcGfxCircle:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // x
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // y
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;             // radius
+          if ((Instr.Immediate shr 16) and $FFFF) > MaxIntReg then MaxIntReg := (Instr.Immediate shr 16) and $FFFF;  // color
+        end;
 
         // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
         // Immediate bits 0-15 = row2 register(int), bits 16-31 = clear register(int)
@@ -6465,6 +6482,25 @@ begin
       if Assigned(FGraphics) then
         FGraphics.Fill(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
                        UInt32(Ctx.IntRegs[Instr.Immediate]));
+    29: // bcGfxLine - LINE (x1,y1)-(x2,y2),color[,B|BF]
+      if Assigned(FGraphics) then
+        case (Instr.Immediate shr 48) and $3 of
+          1: FGraphics.DrawRect(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+               Ctx.IntRegs[(Instr.Immediate) and $FFFF], Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF],
+               UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), False, 1, 0.0);    // B  = box outline
+          2: FGraphics.DrawRect(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+               Ctx.IntRegs[(Instr.Immediate) and $FFFF], Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF],
+               UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), True, 1, 0.0);     // BF = filled box
+        else
+          FGraphics.DrawLine(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+            Ctx.IntRegs[(Instr.Immediate) and $FFFF], Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF],
+            UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), 1);                   // plain line
+        end;
+    30: // bcGfxCircle - CIRCLE (x,y),r[,color]  (full circle, RX=RY=r)
+      if Assigned(FGraphics) then
+        FGraphics.DrawEllipse(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+          Ctx.IntRegs[Instr.Immediate and $FFFF], Ctx.IntRegs[Instr.Immediate and $FFFF],
+          UInt32(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]), 0.0, 360.0, 0.0, 0.0, 1);
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
