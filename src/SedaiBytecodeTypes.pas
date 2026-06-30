@@ -583,6 +583,11 @@ const
   bcGfxScreenSet    = bcGroupGraphics + 42;
   // PCOPY src,dst / SCREENCOPY : Src1=src page, Src2=dst page, Immediate bit0=hasSrc,1=hasDst
   bcGfxPCopy        = bcGroupGraphics + 43;
+  // WINDOW [SCREEN] (x1,y1)-(x2,y2) : Src1=x1, Src2=y1; Immediate [0-15]=x2 reg, [16-31]=y2 reg,
+  //   bit32=has-bounds (else disable), bit33=SCREEN (no y-flip)
+  bcGfxWindow       = bcGroupGraphics + 44;
+  // __PMAP(coord, n) : Dest=result, Src1=coord, Immediate=n (0=lx->px,1=ly->py,2=px->lx,3=py->ly)
+  bcGfxPMap         = bcGroupGraphics + 45;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1673,6 +1678,8 @@ begin
         41: Result := 'GfxScreenInfo';
         42: Result := 'GfxScreenSet';
         43: Result := 'GfxPCopy';
+        44: Result := 'GfxWindow';
+        45: Result := 'GfxPMap';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

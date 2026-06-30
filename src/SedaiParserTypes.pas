@@ -212,6 +212,7 @@ type
     antGfxNop,            // accept-and-ignore graphics sync/window primitive (SCREENLOCK/UNLOCK/SYNC/WINDOWTITLE)
     antScreenSet,         // SCREENSET work[,visible] / FLIP (FreeBASIC page selection; OP attribute)
     antPCopy,             // PCOPY src,dst / SCREENCOPY (FreeBASIC page copy; OP attribute)
+    antGfxWindow,         // WINDOW [SCREEN] (x1,y1)-(x2,y2) (FreeBASIC logical coordinate system)
     antBeep,              // BEEP command (console bell: emits CHR(7))
     antBox,               // BOX command
     antCircle,            // CIRCLE command

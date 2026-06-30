@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 480 / 643 implemented (75%)** (+ 2 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 481 / 643 implemented (75%)** (+ 2 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **480 (84%)** are implemented. See the
+**572 applicable** keywords, **481 (84%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1254,9 +1254,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **480 / 643 implemented (75%)**, plus 2 partial (◐).
-> Of the 161 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **466 / 572 ≈ 81% of the
+> **Coverage (FreeBASIC keyword set):** **481 / 643 implemented (75%)**, plus 2 partial (◐).
+> Of the 160 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **467 / 572 ≈ 82% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -2535,8 +2535,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `VIEW (GRAPHICS)` | ✗ | Sets a clipping region for all drawing and blitting procedures. |
-| `WINDOW` | ✓ | Sets a new coordinate mapping for the current viewport. |
-| `PMAP` | ✗ | Converts coordinates between physical and view mappings. |
+| `WINDOW` | ✓ | `WINDOW [SCREEN] (x1,y1)-(x2,y2)` sets a logical coordinate system mapped onto the screen (default Y-flip; SCREEN = no flip); bare `WINDOW` disables it. PSET/LINE/CIRCLE/PAINT/POINT map logical→physical (CIRCLE radius scaled by the x-axis scale). GET/PUT stay in physical coords (v1). Disambiguated from the C128 text `WINDOW`. |
+| `PMAP` | ✓ | `PMAP(coord, n)` maps between logical and physical coordinates (n: 0=lx→px, 1=ly→py, 2=px→lx, 3=py→ly) using the active WINDOW transform. |
 | `POINTCOORD` | ✗ | Queries Draw's pen position. |
 
 #### Screen Data Types

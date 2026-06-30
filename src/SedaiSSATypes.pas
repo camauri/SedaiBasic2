@@ -250,6 +250,8 @@ type
     ssaGfxScreenInfo,  // __SCRINFO(which) -> screen w/h/depth/... (Dest=result, Immediate=which)
     ssaGfxScreenSet,   // SCREENSET work[,visible] / FLIP : select work/visible page (Src1=wp, Src2=vp, Immediate=flags)
     ssaGfxPCopy,       // PCOPY src,dst / SCREENCOPY : copy one page onto another (Src1=src, Src2=dst, Immediate=flags)
+    ssaGfxWindow,      // WINDOW [SCREEN] (x1,y1)-(x2,y2) : set/clear the logical coordinate transform
+    ssaGfxPMap,        // __PMAP(coord, n) -> mapped coordinate (Dest=result, Src1=coord, Immediate=n)
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n
     ssaGraphicRwindow, // RWINDOW(n): Return window size info

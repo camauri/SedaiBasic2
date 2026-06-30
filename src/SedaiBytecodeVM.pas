@@ -151,6 +151,9 @@ type
     FGfxWorkPage: Integer;           // current work page index (drawing target)
     FGfxVisiblePage: Integer;        // current visible page index (shown on screen; sbv)
     FGfxPages: array of Integer;     // page index -> surface id (page 0 = screen surface 0; 1+ = image surfaces)
+    // FreeBASIC WINDOW logical coordinate system: physical = A*logical + B (per axis). Identity when off.
+    FGfxWinActive: Boolean;
+    FGfxWinAx, FGfxWinBx, FGfxWinAy, FGfxWinBy: Double;
     FInputDevice: IInputDevice;
     FMemoryMapper: IMemoryMapper;  // Memory-mapped PEEK/POKE support
     FConsoleBehavior: TConsoleBehavior;
@@ -219,6 +222,8 @@ type
     {$ENDIF}
     procedure ExecuteInstruction(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSuperinstruction(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+    function GfxMapX(LX: Double): Integer;   // FreeBASIC WINDOW: logical x -> physical x
+    function GfxMapY(LY: Double): Integer;   // FreeBASIC WINDOW: logical y -> physical y
     // Group-specific dispatch handlers
     procedure ExecuteStringOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteMathOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -534,6 +539,7 @@ begin
   FGfxVisiblePage := 0;
   SetLength(FGfxPages, 1);
   FGfxPages[0] := GFX_SCREEN_SURFACE;
+  FGfxWinActive := False;   // WINDOW logical coords off -> identity mapping
   // M5.1: the per-context execution state must exist before any field below is touched.
   FCtx := TExecutionContext.Create;
   // M5.3: render command queue + scratch replay context. Dormant until M5.2 sets FHasWorkers.
@@ -3227,6 +3233,20 @@ begin
         begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+        end;
+        // bcGfxWindow: Src1=x1, Src2=y1; Immediate [0-15]=x2, [16-31]=y2 (bits 32-33 = flags, not regs)
+        bcGfxWindow:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;
+          if ((Instr.Immediate shr 16) and $FFFF) > MaxIntReg then MaxIntReg := (Instr.Immediate shr 16) and $FFFF;
+        end;
+        // bcGfxPMap: Dest=result, Src1=coord (Immediate = n selector, not a reg)
+        bcGfxPMap:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
 
         // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
@@ -6304,12 +6324,24 @@ begin
   end;
 end;
 
+function TBytecodeVM.GfxMapX(LX: Double): Integer;
+// Map a logical x to a physical x through the active WINDOW transform (identity when WINDOW is off).
+begin
+  if FGfxWinActive then Result := Round(FGfxWinAx * LX + FGfxWinBx) else Result := Round(LX);
+end;
+
+function TBytecodeVM.GfxMapY(LY: Double): Integer;
+begin
+  if FGfxWinActive then Result := Round(FGfxWinAy * LY + FGfxWinBy) else Result := Round(LY);
+end;
+
 procedure TBytecodeVM.ExecuteGraphicsOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
   DrawMode: Integer;
   PalColor: UInt32;
   GetX1, GetY1, GetX2, GetY2, GetSx, GetSy, SwapTmp: Integer;
+  WinX1, WinY1, WinX2, WinY2, WinW, WinH: Integer;
 begin
   // M5.3: off the render-owner thread, defer to the queue instead of touching SDL. Dormant on
   // the single-threaded path (FHasWorkers = False short-circuits before any thread-id check).
@@ -6566,36 +6598,40 @@ begin
       end;
     26: // bcGfxPset - PSET (x,y), color  (color in Immediate float-free int register; targets the work page)
       if Assigned(FGraphics) then
-        FGraphics.SetPixel(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+        FGraphics.SetPixel(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
                            UInt32(Ctx.IntRegs[Instr.Immediate]));
     27: // bcGfxPoint - POINT(x, y) -> color  (reads the work page)
       if Assigned(FGraphics) then
-        Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.GetPixel(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]))
+        Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.GetPixel(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2])))
       else
         Ctx.IntRegs[Instr.Dest] := 0;
     28: // bcGfxPaint - PAINT (x,y), color  (flood fill; color in the Immediate int register)
       if Assigned(FGraphics) then
-        FGraphics.Fill(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+        FGraphics.Fill(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
                        UInt32(Ctx.IntRegs[Instr.Immediate]));
-    29: // bcGfxLine - LINE (x1,y1)-(x2,y2),color[,B|BF]
+    29: // bcGfxLine - LINE (x1,y1)-(x2,y2),color[,B|BF]  (endpoints mapped through the WINDOW transform)
       if Assigned(FGraphics) then
         case (Instr.Immediate shr 48) and $3 of
-          1: FGraphics.DrawRect(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
-               Ctx.IntRegs[(Instr.Immediate) and $FFFF], Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF],
+          1: FGraphics.DrawRect(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
+               GfxMapX(Ctx.IntRegs[(Instr.Immediate) and $FFFF]), GfxMapY(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]),
                UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), False, 1, 0.0);    // B  = box outline
-          2: FGraphics.DrawRect(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
-               Ctx.IntRegs[(Instr.Immediate) and $FFFF], Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF],
+          2: FGraphics.DrawRect(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
+               GfxMapX(Ctx.IntRegs[(Instr.Immediate) and $FFFF]), GfxMapY(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]),
                UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), True, 1, 0.0);     // BF = filled box
         else
-          FGraphics.DrawLine(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
-            Ctx.IntRegs[(Instr.Immediate) and $FFFF], Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF],
+          FGraphics.DrawLine(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
+            GfxMapX(Ctx.IntRegs[(Instr.Immediate) and $FFFF]), GfxMapY(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]),
             UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), 1);                   // plain line
         end;
-    30: // bcGfxCircle - CIRCLE (x,y),r[,color]  (full circle, RX=RY=r)
+    30: // bcGfxCircle - CIRCLE (x,y),r[,color]  (centre mapped; radius scaled by the x-axis WINDOW scale)
       if Assigned(FGraphics) then
-        FGraphics.DrawEllipse(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
-          Ctx.IntRegs[Instr.Immediate and $FFFF], Ctx.IntRegs[Instr.Immediate and $FFFF],
+      begin
+        if FGfxWinActive then GetX1 := Round(Ctx.IntRegs[Instr.Immediate and $FFFF] * Abs(FGfxWinAx))
+        else GetX1 := Ctx.IntRegs[Instr.Immediate and $FFFF];                              // physical radius
+        FGraphics.DrawEllipse(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
+          GetX1, GetX1,
           UInt32(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]), 0.0, 360.0, 0.0, 0.0, 1);
+      end;
     31: // bcGfxPalette - PALETTE index, r,g,b  (Src1=index, Src2=packed RGBA colour)
       if Assigned(FGraphics) and (Ctx.IntRegs[Instr.Src1] >= 0) and (Ctx.IntRegs[Instr.Src1] <= 255) then
         FGraphics.SetPaletteColor(TPaletteIndex(Ctx.IntRegs[Instr.Src1]), UInt32(Ctx.IntRegs[Instr.Src2]));
@@ -6698,6 +6734,53 @@ begin
         if (Instr.Immediate and 2) <> 0 then GetY1 := Ctx.IntRegs[Instr.Src2] else GetY1 := FGfxVisiblePage;  // dst page
         if (GetX1 >= 0) and (GetX1 <= High(FGfxPages)) and (GetY1 >= 0) and (GetY1 <= High(FGfxPages)) and (GetX1 <> GetY1) then
           FGraphics.Blit(FGfxPages[GetY1], 0, 0, FGfxPages[GetX1], gbmPSet);
+      end;
+    44: // bcGfxWindow - WINDOW [SCREEN] (x1,y1)-(x2,y2): set/clear the logical coordinate transform
+      if Assigned(FGraphics) then
+      begin
+        if ((Instr.Immediate shr 32) and 1) = 0 then
+          FGfxWinActive := False                                    // no bounds -> identity
+        else
+        begin
+          WinX1 := Ctx.IntRegs[Instr.Src1];
+          WinY1 := Ctx.IntRegs[Instr.Src2];
+          WinX2 := Ctx.IntRegs[Instr.Immediate and $FFFF];
+          WinY2 := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];
+          WinW := FGraphics.SurfaceWidth(FGfxWorkSurface);
+          WinH := FGraphics.SurfaceHeight(FGfxWorkSurface);
+          if (WinX2 <> WinX1) and (WinY2 <> WinY1) and (WinW > 1) and (WinH > 1) then
+          begin
+            FGfxWinAx := (WinW - 1) / (WinX2 - WinX1);
+            FGfxWinBx := -WinX1 * FGfxWinAx;
+            if ((Instr.Immediate shr 33) and 1) = 1 then
+            begin
+              // WINDOW SCREEN: y1 = top, y2 = bottom (no flip)
+              FGfxWinAy := (WinH - 1) / (WinY2 - WinY1);
+              FGfxWinBy := -WinY1 * FGfxWinAy;
+            end
+            else
+            begin
+              // WINDOW (default): y1 = bottom, y2 = top (y flipped)
+              FGfxWinAy := -(WinH - 1) / (WinY2 - WinY1);
+              FGfxWinBy := (WinH - 1) - WinY1 * FGfxWinAy;
+            end;
+            FGfxWinActive := True;
+          end
+          else
+            FGfxWinActive := False;
+        end;
+      end;
+    45: // bcGfxPMap - __PMAP(coord, n): map between logical and physical coordinates
+      case Instr.Immediate of
+        0: Ctx.IntRegs[Instr.Dest] := GfxMapX(Ctx.IntRegs[Instr.Src1]);   // logical x -> physical x
+        1: Ctx.IntRegs[Instr.Dest] := GfxMapY(Ctx.IntRegs[Instr.Src1]);   // logical y -> physical y
+        2: if FGfxWinActive and (FGfxWinAx <> 0) then                      // physical x -> logical x
+             Ctx.IntRegs[Instr.Dest] := Round((Ctx.IntRegs[Instr.Src1] - FGfxWinBx) / FGfxWinAx)
+           else Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
+      else
+        if FGfxWinActive and (FGfxWinAy <> 0) then                        // physical y -> logical y
+          Ctx.IntRegs[Instr.Dest] := Round((Ctx.IntRegs[Instr.Src1] - FGfxWinBy) / FGfxWinAy)
+        else Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
       end;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);

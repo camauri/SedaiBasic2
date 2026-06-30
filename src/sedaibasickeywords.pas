@@ -432,6 +432,7 @@ const
   kSCREENCOPY   = 'SCREENCOPY';    // FreeBASIC: copy one page onto another (defaults work->visible)
   kPCOPY        = 'PCOPY';         // FreeBASIC/QB: copy page src to page dst
   kFLIP         = 'FLIP';          // FreeBASIC: swap (or set) visible/work pages
+  kPMAP         = 'PMAP';          // FreeBASIC: map between logical (WINDOW) and physical coordinates
   kDRAW    = 'DRAW';
   kCIRCLE  = 'CIRCLE';
   kPAINT   = 'PAINT';

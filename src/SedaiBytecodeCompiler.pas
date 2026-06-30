@@ -390,6 +390,8 @@ begin
     ssaGfxScreenInfo: Result := bcGfxScreenInfo;
     ssaGfxScreenSet: Result := bcGfxScreenSet;
     ssaGfxPCopy: Result := bcGfxPCopy;
+    ssaGfxWindow: Result := bcGfxWindow;
+    ssaGfxPMap: Result := bcGfxPMap;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;
     ssaGraphicRwindow: Result := bcGraphicRwindow;
@@ -1387,6 +1389,29 @@ begin
         (Int64(MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version)) and $FFFF);
     if (Length(Instr.PhiSources) >= 1) and (Instr.PhiSources[0].Value.Kind = svkConstInt) then
       BCInstr.Immediate := BCInstr.Immediate or ((Int64(Instr.PhiSources[0].Value.ConstInt) and $FFFF) shl 16);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // FreeBASIC WINDOW (x1,y1)-(x2,y2): Src1=x1, Src2=y1; Immediate packs x2 (Src3, bits 0-15),
+  // y2 (PhiSources[0], bits 16-31) and the flag bits (PhiSources[1] ConstInt, bits 32-33).
+  if Instr.OpCode = ssaGfxWindow then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcGfxWindow, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    BCInstr.Immediate := 0;
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Immediate := BCInstr.Immediate or
+        (Int64(MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version)) and $FFFF);
+    if (Length(Instr.PhiSources) >= 1) and (Instr.PhiSources[0].Value.Kind = svkRegister) then
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+          Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF) shl 16);
+    if (Length(Instr.PhiSources) >= 2) and (Instr.PhiSources[1].Value.Kind = svkConstInt) then
+      BCInstr.Immediate := BCInstr.Immediate or ((Int64(Instr.PhiSources[1].Value.ConstInt) and $3) shl 32);
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;

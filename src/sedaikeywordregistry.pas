@@ -1872,6 +1872,7 @@ begin
  RegisterKeyword(kSCREENCOPY,   ttGraphicsCommand,  'FreeBASIC: copy one page onto another',          kcGraphicsHandling);
  RegisterKeyword(kPCOPY,        ttGraphicsCommand,  'FreeBASIC/QB: copy page src to page dst',        kcGraphicsHandling);
  RegisterKeyword(kFLIP,         ttGraphicsCommand,  'FreeBASIC: swap or set visible/work pages',      kcGraphicsHandling);
+ RegisterKeyword(kPMAP,         ttGraphicsFunction, 'FreeBASIC: map logical<->physical coordinates',   kcGraphicsHandling);
  RegisterKeyword(kRWINDOW, ttInputFunction,    'Return the size of the current text window',       kcStdIO);
 
  // === SPRITES HANDLING (COMMANDS AND FUNCTIONS) ===

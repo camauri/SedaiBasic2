@@ -3725,7 +3725,17 @@ begin
       Result := TASTNode.Create(antPaint, Token);
   end
   else if CmdName = 'WINDOW' then
-    Result := TASTNode.Create(antWindow, Token)
+  begin
+    // FreeBASIC graphics WINDOW [SCREEN] (x1,y1)-(x2,y2) / bare WINDOW (disable) vs C128 text WINDOW
+    // col1,row1,col2,row2 — disambiguated by a leading '(' / SCREEN keyword, or a bare WINDOW (no args:
+    // C128 WINDOW always has arguments, so a bare WINDOW is the FB "disable" form).
+    if (not Assigned(Context.PeekNext)) or
+       (Context.PeekNext.TokenType = ttDelimParOpen) or (UpperCase(Context.PeekNext.Value) = 'SCREEN') or
+       (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+      Result := TASTNode.Create(antGfxWindow, Token)
+    else
+      Result := TASTNode.Create(antWindow, Token);
+  end
   else if CmdName = 'SSHAPE' then
     Result := TASTNode.Create(antSShape, Token)
   else if CmdName = 'GSHAPE' then
@@ -3906,6 +3916,33 @@ begin
   begin
     while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
       Context.Advance;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // FreeBASIC WINDOW [SCREEN] [(x1,y1)-(x2,y2)] — set/clear the logical coordinate system. SCREEN (no
+  // y-flip) is recorded in the SCREEN attribute; no bounds = disable. Children: x1, y1, x2, y2.
+  if Result.NodeType = antGfxWindow then
+  begin
+    if UpperCase(Context.CurrentToken.Value) = 'SCREEN' then
+    begin
+      Result.Attributes.Values['SCREEN'] := '1';
+      Context.Advance;                                         // SCREEN
+    end;
+    if Context.Check(ttDelimParOpen) then
+    begin
+      Context.Advance;                                         // '('
+      Result.AddChild(ParseExpression);                        // x1
+      if Context.Check(ttSeparParam) then Context.Advance;     // ','
+      Result.AddChild(ParseExpression);                        // y1
+      if Context.Check(ttDelimParClose) then Context.Advance;  // ')'
+      if Context.Check(ttOpSub) then Context.Advance;          // '-'
+      if Context.Check(ttDelimParOpen) then Context.Advance;   // '('
+      Result.AddChild(ParseExpression);                        // x2
+      if Context.Check(ttSeparParam) then Context.Advance;     // ','
+      Result.AddChild(ParseExpression);                        // y2
+      if Context.Check(ttDelimParClose) then Context.Advance;  // ')'
+    end;
     DoNodeCreated(Result);
     Exit;
   end;

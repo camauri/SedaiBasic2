@@ -411,6 +411,7 @@ type
     procedure ProcessScreenInfo(Node: TASTNode);     // SCREENINFO w, h [, depth, ...]
     procedure ProcessScreenSet(Node: TASTNode);      // SCREENSET work[,visible] / FLIP
     procedure ProcessPCopy(Node: TASTNode);          // PCOPY src,dst / SCREENCOPY
+    procedure ProcessGfxWindow(Node: TASTNode);      // WINDOW [SCREEN] (x1,y1)-(x2,y2)
     procedure ProcessColor(Node: TASTNode);
     procedure ProcessSetColor(Node: TASTNode);
     procedure ProcessWidth(Node: TASTNode);
@@ -3084,6 +3085,23 @@ begin
           end
           else
             raise Exception.Create('__SCRINFO requires 1 argument');
+        end
+        else if FuncName = 'PMAP' then
+        begin
+          // PMAP(coord, n) -> mapped coordinate (n: 0=lx->px,1=ly->py,2=px->lx,3=py->ly).
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);  // coord
+            ProcessExpression(ArgListNode.GetChild(1), RVal);     // n (constant)
+            DestReg := FProgram.AllocRegister(srtInt);
+            Result := MakeSSARegister(srtInt, DestReg);
+            if RVal.Kind = svkConstInt then
+              EmitInstruction(ssaGfxPMap, Result, ArgReg, MakeSSAValue(svkNone), RVal)
+            else
+              EmitInstruction(ssaGfxPMap, Result, ArgReg, MakeSSAValue(svkNone), EnsureIntRegister(RVal));
+          end
+          else
+            raise Exception.Create('PMAP requires 2 arguments: PMAP(coord, n)');
         end
         else if FuncName = 'RDOT' then
         begin
@@ -7696,6 +7714,42 @@ begin
     ProcessExpression(Node.GetChild(1), V1); DstReg := EnsureIntRegister(V1); Flags := Flags or 2;
   end;
   EmitInstruction(ssaGfxPCopy, MakeSSAValue(svkNone), SrcReg, DstReg, MakeSSAConstInt(Flags));
+end;
+
+procedure TSSAGenerator.ProcessGfxWindow(Node: TASTNode);
+// WINDOW [SCREEN] (x1,y1)-(x2,y2) : set the logical coordinate system (no bounds = disable). Packed as
+// Src1=x1, Src2=y1, Src3=x2, PhiSources[0]=y2, PhiSources[1]=flags (bit0=hasBounds, bit1=SCREEN no-flip).
+var
+  X1V, Y1V, X2V, Y2V, X1R, Y1R, X2R, Y2R: TSSAValue;
+  Instr: TSSAInstruction;
+  Flags: Int64;
+
+  function ZeroReg: TSSAValue;
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount >= 4 then
+  begin
+    ProcessExpression(Node.GetChild(0), X1V); X1R := EnsureIntRegister(X1V);
+    ProcessExpression(Node.GetChild(1), Y1V); Y1R := EnsureIntRegister(Y1V);
+    ProcessExpression(Node.GetChild(2), X2V); X2R := EnsureIntRegister(X2V);
+    ProcessExpression(Node.GetChild(3), Y2V); Y2R := EnsureIntRegister(Y2V);
+    Flags := 1;                                    // has-bounds
+    if Node.Attributes.Values['SCREEN'] = '1' then Flags := Flags or 2;
+  end
+  else
+  begin
+    X1R := ZeroReg; Y1R := ZeroReg; X2R := ZeroReg; Y2R := ZeroReg;
+    Flags := 0;                                    // disable -> identity
+  end;
+  EmitInstruction(ssaGfxWindow, MakeSSAValue(svkNone), X1R, Y1R, X2R);
+  Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+  Instr.AddPhiSource(Y2R, nil);
+  Instr.AddPhiSource(MakeSSAConstInt(Flags), nil);
 end;
 
 procedure TSSAGenerator.ProcessBeep(Node: TASTNode);
@@ -15234,6 +15288,7 @@ begin
     antScreenInfo: ProcessScreenInfo(Node);
     antScreenSet: ProcessScreenSet(Node);
     antPCopy: ProcessPCopy(Node);
+    antGfxWindow: ProcessGfxWindow(Node);
     antGfxNop: ;  // SCREENLOCK/UNLOCK/SYNC/WINDOWTITLE: accept-and-ignore (no code emitted)
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);
