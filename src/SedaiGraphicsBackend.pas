@@ -114,6 +114,8 @@ type
     procedure SetPaletteColor(Index: TPaletteIndex; Color: TGfxColor);
     function  GetPaletteColor(Index: TPaletteIndex): TGfxColor;
     procedure ResetPalette;
+    // Window presenter access (sb --window): the screen surface's CPU framebuffer is the source of truth.
+    function  ScreenMemory: TGraphicsMemory;
   end;
 
 implementation
@@ -417,6 +419,11 @@ end;
 procedure TSoftwareGraphicsBackend.ResetPalette;
 begin
   FScreen.ResetPalette;
+end;
+
+function TSoftwareGraphicsBackend.ScreenMemory: TGraphicsMemory;
+begin
+  Result := FScreen;
 end;
 
 end.

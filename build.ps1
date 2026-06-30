@@ -58,6 +58,10 @@ param(
     [switch]$Clean,
     [switch]$NoBanner,
 
+    # Build the CLI VM (sb) with the optional SDL2 window presenter, enabling `sb --window`.
+    # Default off: the headless sb (regression target) takes no SDL2 window dependency.
+    [switch]$Window,
+
     [ValidateSet('x86_64', 'i386', 'aarch64', '')]
     [string]$CPU = 'x86_64',
 
@@ -477,6 +481,12 @@ if ($DebugFlags -and $DebugFlags -ne '') {
         }
     }
     Write-Host "Debug flags: $($debugDefines -join ', ')" -ForegroundColor Magenta
+}
+
+# Optional SDL2 window presenter for the CLI VM (sb --window)
+if ($Window) {
+    $debugDefines += 'WITH_WINDOW'
+    Write-Host "Window presenter: ENABLED (sb --window available)" -ForegroundColor Magenta
 }
 
 Write-Host "Building Targets..." -ForegroundColor Cyan

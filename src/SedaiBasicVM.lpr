@@ -63,6 +63,8 @@ uses
   SedaiExecutorContext, SedaiExecutorTypes, SedaiOutputInterface,
   // I/O Manager
   SedaiIOManager, SedaiTerminalIO,
+  // Optional SDL2 window presenter for `sb --window` (WITH_WINDOW build only; no SDL2 dependency otherwise)
+  {$IFDEF WITH_WINDOW}SedaiGraphicsBackend, SedaiWindowPresenter,{$ENDIF}
   // Runner and Serializer (for .basc support)
   SedaiRunner, SedaiBytecodeSerializer, SedaiPreprocessor;
 
@@ -454,6 +456,46 @@ begin
   WriteLn('                                          Profile and export to JSON');
   {$ENDIF}
   WriteLn('  sb --help                   Show this help');
+end;
+
+var
+  OptWindow: Boolean = False;   // sb --window: mirror the software framebuffer into an SDL2 window
+{$IFDEF WITH_WINDOW}
+var
+  GPresenter: TWindowPresenter = nil;
+{$ENDIF}
+
+// Graphics setup shared by both run paths: a window presenter (sb --window, WITH_WINDOW build) or the
+// plain headless software backend (default — the regression target never opens a window).
+procedure SetupVMGraphics(AVM: TBytecodeVM);
+{$IFDEF WITH_WINDOW}
+var SW: TSoftwareGraphicsBackend;
+{$ENDIF}
+begin
+  {$IFDEF WITH_WINDOW}
+  if OptWindow then
+  begin
+    SW := TSoftwareGraphicsBackend.Create;
+    AVM.SetGraphicsBackend(SW, SW);
+    GPresenter := TWindowPresenter.Create(SW, 'SedaiBasic');
+    AVM.EventPollCallback := @GPresenter.Pump;   // present + pump events during execution
+    Exit;
+  end;
+  {$ENDIF}
+  AVM.UseSoftwareGraphics;
+end;
+
+// After the program ends: keep the window open until the user closes it, then tear it down.
+procedure FinishVMGraphics(AVM: TBytecodeVM);
+begin
+  {$IFDEF WITH_WINDOW}
+  if Assigned(GPresenter) then
+  begin
+    AVM.EventPollCallback := nil;
+    if not GPresenter.Closed then GPresenter.WaitClose;
+    FreeAndNil(GPresenter);
+  end;
+  {$ENDIF}
 end;
 
 procedure TestBytecodeCompilation(const SourceFile: string;
@@ -1526,7 +1568,7 @@ begin
     {$ENDIF}
     try
       VM.SetOutputDevice(Output);
-      VM.UseSoftwareGraphics;  // headless software graphics backend (POINT/GET work; no display)
+      SetupVMGraphics(VM);  // headless SW backend by default; SDL2 window when `sb --window` (WITH_WINDOW)
       VM.SetInputDevice(Input);
       VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
       VM.LoadProgram(BytecodeProgram);
@@ -1542,6 +1584,7 @@ begin
         VM.RunFast;  // Use optimized execution loop
         {$ENDIF}
         ExecuteTime := Timer.ElapsedMilliseconds;
+        FinishVMGraphics(VM);  // sb --window: keep the window open until closed
       except
         on E: Exception do
         begin
@@ -1773,7 +1816,7 @@ begin
       {$ENDIF}
       try
         VM.SetOutputDevice(Output);
-        VM.UseSoftwareGraphics;  // headless software graphics backend (POINT/GET work; no display)
+        SetupVMGraphics(VM);  // headless SW backend by default; SDL2 window when `sb --window` (WITH_WINDOW)
         VM.SetInputDevice(Input);
         VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
         VM.LoadProgram(BytecodeProgram);
@@ -1789,6 +1832,7 @@ begin
           VM.RunFast;
           {$ENDIF}
           ExecuteTime := Timer.ElapsedMilliseconds;
+          FinishVMGraphics(VM);  // sb --window: keep the window open until closed
         except
           on E: Exception do
           begin
@@ -1933,6 +1977,8 @@ begin
         OptNoExec := True
       else if (Param = '--no-opt') or (Param = '--no-optimize') then
         GSSAOptimizationsEnabled := False   // differential-test reference: skip the optimization passes
+      else if Param = '--window' then
+        OptWindow := True   // present graphics in an SDL2 window (WITH_WINDOW build only; ignored otherwise)
       else if (Param = '--help') or (Param = '-h') or (Param = '-?') then
         OptHelp := True
       {$IFDEF ENABLE_PROFILER}
