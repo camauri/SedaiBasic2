@@ -252,6 +252,7 @@ type
     ssaGfxPCopy,       // PCOPY src,dst / SCREENCOPY : copy one page onto another (Src1=src, Src2=dst, Immediate=flags)
     ssaGfxWindow,      // WINDOW [SCREEN] (x1,y1)-(x2,y2) : set/clear the logical coordinate transform
     ssaGfxPMap,        // __PMAP(coord, n) -> mapped coordinate (Dest=result, Src1=coord, Immediate=n)
+    ssaGfxView,        // VIEW [SCREEN] (x1,y1)-(x2,y2) : set/clear the viewport (offset + clip)
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n
     ssaGraphicRwindow, // RWINDOW(n): Return window size info

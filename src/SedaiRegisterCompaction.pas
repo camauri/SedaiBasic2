@@ -467,7 +467,7 @@ begin
     bcGfxImageCreate, bcGfxImageDestroy, bcGfxImageInfo,  // IMAGE*: Src1 = w / handle (int)
     bcGfxGet, bcGfxPut,  // GET/PUT: Src1 = x1 / x (int)
     bcGfxScreenSet, bcGfxPCopy,  // SCREENSET/PCOPY: Src1 = work / src page (int)
-    bcGfxWindow, bcGfxPMap,  // WINDOW: Src1 = x1 ; PMAP: Src1 = coord (int)
+    bcGfxWindow, bcGfxView, bcGfxPMap,  // WINDOW/VIEW: Src1 = x1 ; PMAP: Src1 = coord (int)
     bcGraphicSShape,  // Src1 = x1 coordinate (int)
     bcGraphicColor,   // Src1 = source register (int)
     bcGraphicWidth,   // Src1 = width value (int)
@@ -609,7 +609,7 @@ begin
     bcGfxImageCreate,  // IMAGECREATE: Src2 = h (int)
     bcGfxGet, bcGfxPut,  // GET/PUT: Src2 = y1 / y (int)
     bcGfxScreenSet, bcGfxPCopy,  // SCREENSET/PCOPY: Src2 = visible / dst page (int)
-    bcGfxWindow,  // WINDOW: Src2 = y1 (int)
+    bcGfxWindow, bcGfxView,  // WINDOW/VIEW: Src2 = y1 (int)
     bcGraphicScale,   // Src2 = xmax register (int)
     bcGraphicColor,   // Src2 = color value (int)
     bcGraphicPaint,   // Src2 = x coordinate (int)
@@ -1046,8 +1046,8 @@ begin
     if OpCode = bcGfxPut then
       MarkIntRegUsed(Instr.Immediate and $FFFF);            // src handle
 
-    // WINDOW: Immediate [0-15]=x2, [16-31]=y2 (int regs; bits 32-33 = flags, not regs)
-    if OpCode = bcGfxWindow then
+    // WINDOW/VIEW: Immediate [0-15]=x2, [16-31]=y2 (int regs; bits 32-33 = flags, not regs)
+    if (OpCode = bcGfxWindow) or (OpCode = bcGfxView) then
     begin
       MarkIntRegUsed(Instr.Immediate and $FFFF);            // x2
       MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);   // y2
@@ -1603,8 +1603,8 @@ begin
       end;
     end;
 
-    // bcGfxWindow: Immediate [0-15]=x2, [16-31]=y2 (int regs); bits 32-33 = flags (preserved)
-    if OpCode = bcGfxWindow then
+    // bcGfxWindow/bcGfxView: Immediate [0-15]=x2, [16-31]=y2 (int regs); bits 32-33 = flags (preserved)
+    if (OpCode = bcGfxWindow) or (OpCode = bcGfxView) then
     begin
       OldReg := Instr.Immediate and $FFFF;
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;

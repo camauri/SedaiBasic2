@@ -69,6 +69,7 @@ type
     procedure DrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
     procedure DrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
     procedure Fill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);   // flood fill (PAINT)
+    procedure SetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);  // VIEW clip rect
     procedure Blit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);  // accelerable; deferred to G3
     // --- palette ---
     procedure EnablePalette(Enable: Boolean);
@@ -107,6 +108,7 @@ type
     procedure DrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
     procedure DrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
     procedure Fill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
+    procedure SetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);
     procedure Blit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);
     procedure EnablePalette(Enable: Boolean);
     procedure SetPaletteColor(Index: TPaletteIndex; Color: TGfxColor);
@@ -319,6 +321,13 @@ begin
     Push(CX + 1, CY); Push(CX - 1, CY);
     Push(CX, CY + 1); Push(CX, CY - 1);
   end;
+end;
+
+procedure TSoftwareGraphicsBackend.SetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);
+var M: TGraphicsMemory;
+begin
+  M := MemoryOf(Surface);
+  if Assigned(M) then M.SetClip(Active, X1, Y1, X2, Y2);
 end;
 
 procedure TSoftwareGraphicsBackend.Blit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);

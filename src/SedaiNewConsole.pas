@@ -319,6 +319,7 @@ type
     procedure GBDrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
     procedure GBDrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
     procedure GBFill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
+    procedure GBSetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);
     procedure GBBlit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);
     procedure GBEnablePalette(Enable: Boolean);
     procedure GBSetPaletteColor(Index: TPaletteIndex; Color: TGfxColor);
@@ -341,6 +342,7 @@ type
     procedure IGraphicsBackend.DrawRect = GBDrawRect;
     procedure IGraphicsBackend.DrawEllipse = GBDrawEllipse;
     procedure IGraphicsBackend.Fill = GBFill;
+    procedure IGraphicsBackend.SetClip = GBSetClip;
     procedure IGraphicsBackend.Blit = GBBlit;
     procedure IGraphicsBackend.EnablePalette = GBEnablePalette;
     procedure IGraphicsBackend.SetPaletteColor = GBSetPaletteColor;
@@ -3782,6 +3784,14 @@ end;
 procedure TVideoController.GBFill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
 begin
   // FB PAINT on this device deferred (the existing FloodFill is colour-source based, not direct-colour).
+end;
+
+procedure TVideoController.GBSetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);
+var M: TGraphicsMemory;
+begin
+  M := GBImageMem(Surface);
+  if Assigned(M) then M.SetClip(Active, X1, Y1, X2, Y2)
+  else if Assigned(FGraphicsMemory) then FGraphicsMemory.SetClip(Active, X1, Y1, X2, Y2);   // screen
 end;
 
 procedure TVideoController.GBBlit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);

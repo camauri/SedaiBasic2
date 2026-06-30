@@ -433,6 +433,7 @@ const
   kPCOPY        = 'PCOPY';         // FreeBASIC/QB: copy page src to page dst
   kFLIP         = 'FLIP';          // FreeBASIC: swap (or set) visible/work pages
   kPMAP         = 'PMAP';          // FreeBASIC: map between logical (WINDOW) and physical coordinates
+  kVIEW         = 'VIEW';          // FreeBASIC: set the graphics viewport (offset + clip); VIEW PRINT = text
   kDRAW    = 'DRAW';
   kCIRCLE  = 'CIRCLE';
   kPAINT   = 'PAINT';

@@ -213,6 +213,7 @@ type
     antScreenSet,         // SCREENSET work[,visible] / FLIP (FreeBASIC page selection; OP attribute)
     antPCopy,             // PCOPY src,dst / SCREENCOPY (FreeBASIC page copy; OP attribute)
     antGfxWindow,         // WINDOW [SCREEN] (x1,y1)-(x2,y2) (FreeBASIC logical coordinate system)
+    antGfxView,           // VIEW [SCREEN] (x1,y1)-(x2,y2) (FreeBASIC viewport: offset + clip)
     antBeep,              // BEEP command (console bell: emits CHR(7))
     antBox,               // BOX command
     antCircle,            // CIRCLE command

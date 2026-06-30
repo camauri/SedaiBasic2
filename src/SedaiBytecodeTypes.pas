@@ -588,6 +588,9 @@ const
   bcGfxWindow       = bcGroupGraphics + 44;
   // __PMAP(coord, n) : Dest=result, Src1=coord, Immediate=n (0=lx->px,1=ly->py,2=px->lx,3=py->ly)
   bcGfxPMap         = bcGroupGraphics + 45;
+  // VIEW [SCREEN] (x1,y1)-(x2,y2) : Src1=x1, Src2=y1; Immediate [0-15]=x2 reg, [16-31]=y2 reg,
+  //   bit32=has-bounds (else reset), bit33=SCREEN (absolute coords, no offset)
+  bcGfxView         = bcGroupGraphics + 46;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1680,6 +1683,7 @@ begin
         43: Result := 'GfxPCopy';
         44: Result := 'GfxWindow';
         45: Result := 'GfxPMap';
+        46: Result := 'GfxView';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

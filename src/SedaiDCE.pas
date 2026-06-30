@@ -362,7 +362,7 @@ begin
     ssaGfxScreenRes, ssaGfxPset, ssaGfxPaint, ssaGfxLine, ssaGfxCircle,
     ssaGfxPalette, ssaGfxPaletteReset, ssaGfxColor,
     ssaGfxImageCreate, ssaGfxImageDestroy, ssaGfxGet, ssaGfxPut,
-    ssaGfxScreenSet, ssaGfxPCopy, ssaGfxWindow:
+    ssaGfxScreenSet, ssaGfxPCopy, ssaGfxWindow, ssaGfxView:
       Result := True;
 
     // Sprite operations - always live (modify sprite state)

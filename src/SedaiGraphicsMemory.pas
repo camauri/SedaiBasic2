@@ -69,6 +69,10 @@ type
     FState: TGraphicsState;
     FPalette: array[0..255] of UInt32;
     FDefaultC64Palette: array[0..15] of UInt32;
+    // FreeBASIC VIEW clip rectangle (inclusive, physical pixels). When active, pixel writes outside it
+    // are discarded. Reads (GetPixel) are unaffected.
+    FClipActive: Boolean;
+    FClipX1, FClipY1, FClipX2, FClipY2: Integer;
     FLastPaletteError: string;
 
     procedure InitC64Palette;
@@ -82,6 +86,7 @@ type
 
     // Helper for coordinate validation
     function ValidateCoordinates(X, Y: Integer): Boolean; inline;
+    function ClipRejects(X, Y: Integer): Boolean; inline;   // True if (X,Y) is outside an active clip rect
 
   public
     constructor Create;
@@ -98,6 +103,9 @@ type
     procedure ClearCurrentModeWithIndex(PaletteIndex: TPaletteIndex);
     function HasValidBuffer(Mode: TGraphicMode): Boolean;
 
+    // FreeBASIC VIEW clip rectangle: restrict pixel writes to [X1..X2, Y1..Y2] (inclusive). Active=False
+    // clears the clip (full-surface drawing).
+    procedure SetClip(Active: Boolean; X1, Y1, X2, Y2: Integer);
     procedure EnablePalette(Enable: Boolean);
     function IsPaletteEnabled: Boolean;
     procedure SetPaletteColor(Index: TPaletteIndex; RGB: UInt32);
@@ -240,6 +248,7 @@ var
   WasClassicMode: Boolean;
   BufferExisted: Boolean;
 begin
+  FClipActive := False;   // a (re)allocated surface starts unclipped
   WasClassicMode := FIsClassicMode;
   FIsClassicMode := IsClassicMode(Mode);
 
@@ -844,6 +853,21 @@ begin
   Result := (X >= 0) and (X < FState.Width) and (Y >= 0) and (Y < FState.Height);
 end;
 
+function TGraphicsMemory.ClipRejects(X, Y: Integer): Boolean;
+begin
+  Result := FClipActive and ((X < FClipX1) or (X > FClipX2) or (Y < FClipY1) or (Y > FClipY2));
+end;
+
+procedure TGraphicsMemory.SetClip(Active: Boolean; X1, Y1, X2, Y2: Integer);
+begin
+  FClipActive := Active;
+  if Active then
+  begin
+    if X1 <= X2 then begin FClipX1 := X1; FClipX2 := X2; end else begin FClipX1 := X2; FClipX2 := X1; end;
+    if Y1 <= Y2 then begin FClipY1 := Y1; FClipY2 := Y2; end else begin FClipY1 := Y2; FClipY2 := Y1; end;
+  end;
+end;
+
 procedure TGraphicsMemory.SetPixel(X, Y: Integer; RGB: UInt32);
 var
   Offset: Integer;
@@ -852,6 +876,7 @@ var
 begin
   if not ValidateCoordinates(X, Y) then
     Exit;
+  if ClipRejects(X, Y) then Exit;
 
   if FState.PaletteMode and FState.PaletteEnabled then
   begin
@@ -882,6 +907,7 @@ var
 begin
   if not ValidateCoordinates(X, Y) then
     Exit;
+  if ClipRejects(X, Y) then Exit;
 
   // Save index in color buffer if in palette mode
   if FState.PaletteMode and Assigned(FColorBuffer) then

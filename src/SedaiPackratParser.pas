@@ -3758,6 +3758,14 @@ begin
     Result := TASTNode.Create(antImageDestroy, Token)
   else if CmdName = 'IMAGEINFO' then
     Result := TASTNode.Create(antImageInfo, Token)
+  else if CmdName = 'VIEW' then
+  begin
+    // FB graphics VIEW [SCREEN] [(x1,y1)-(x2,y2)] vs QB "VIEW PRINT" (text scroll region, deferred).
+    if Assigned(Context.PeekNext) and (UpperCase(Context.PeekNext.Value) = 'PRINT') then
+      Result := TASTNode.Create(antGfxNop, Token)        // VIEW PRINT: accept-and-ignore (deferred)
+    else
+      Result := TASTNode.Create(antGfxView, Token);
+  end
   else if CmdName = 'SCREENINFO' then
     Result := TASTNode.Create(antScreenInfo, Token)
   else if (CmdName = 'SCREENLOCK') or (CmdName = 'SCREENUNLOCK') or
@@ -3942,6 +3950,40 @@ begin
       if Context.Check(ttSeparParam) then Context.Advance;     // ','
       Result.AddChild(ParseExpression);                        // y2
       if Context.Check(ttDelimParClose) then Context.Advance;  // ')'
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // FreeBASIC VIEW [SCREEN] [(x1,y1)-(x2,y2)] — set/clear the viewport. SCREEN = absolute coords (no
+  // offset); no bounds = reset to full screen. Children: x1, y1, x2, y2. (Optional fill/border deferred.)
+  if Result.NodeType = antGfxView then
+  begin
+    if UpperCase(Context.CurrentToken.Value) = 'SCREEN' then
+    begin
+      Result.Attributes.Values['SCREEN'] := '1';
+      Context.Advance;                                         // SCREEN
+    end;
+    if Context.Check(ttDelimParOpen) then
+    begin
+      Context.Advance;                                         // '('
+      Result.AddChild(ParseExpression);                        // x1
+      if Context.Check(ttSeparParam) then Context.Advance;     // ','
+      Result.AddChild(ParseExpression);                        // y1
+      if Context.Check(ttDelimParClose) then Context.Advance;  // ')'
+      if Context.Check(ttOpSub) then Context.Advance;          // '-'
+      if Context.Check(ttDelimParOpen) then Context.Advance;   // '('
+      Result.AddChild(ParseExpression);                        // x2
+      if Context.Check(ttSeparParam) then Context.Advance;     // ','
+      Result.AddChild(ParseExpression);                        // y2
+      if Context.Check(ttDelimParClose) then Context.Advance;  // ')'
+      // optional ,fill[,border] — consumed and ignored (deferred)
+      while Context.Check(ttSeparParam) do
+      begin
+        Context.Advance;
+        if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+          ParseExpression;
+      end;
     end;
     DoNodeCreated(Result);
     Exit;

@@ -154,6 +154,8 @@ type
     // FreeBASIC WINDOW logical coordinate system: physical = A*logical + B (per axis). Identity when off.
     FGfxWinActive: Boolean;
     FGfxWinAx, FGfxWinBx, FGfxWinAy, FGfxWinBy: Double;
+    // FreeBASIC VIEW viewport: physical origin added to mapped coords (non-SCREEN form); clip is on the surface.
+    FGfxViewOffsetX, FGfxViewOffsetY: Integer;
     FInputDevice: IInputDevice;
     FMemoryMapper: IMemoryMapper;  // Memory-mapped PEEK/POKE support
     FConsoleBehavior: TConsoleBehavior;
@@ -3234,8 +3236,8 @@ begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
         end;
-        // bcGfxWindow: Src1=x1, Src2=y1; Immediate [0-15]=x2, [16-31]=y2 (bits 32-33 = flags, not regs)
-        bcGfxWindow:
+        // bcGfxWindow / bcGfxView: Src1=x1, Src2=y1; Immediate [0-15]=x2, [16-31]=y2 (bits 32-33 = flags)
+        bcGfxWindow, bcGfxView:
         begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
@@ -6325,14 +6327,16 @@ begin
 end;
 
 function TBytecodeVM.GfxMapX(LX: Double): Integer;
-// Map a logical x to a physical x through the active WINDOW transform (identity when WINDOW is off).
+// Map a logical x to a physical x: WINDOW transform (identity when off) then the VIEW viewport offset.
 begin
   if FGfxWinActive then Result := Round(FGfxWinAx * LX + FGfxWinBx) else Result := Round(LX);
+  Result := Result + FGfxViewOffsetX;
 end;
 
 function TBytecodeVM.GfxMapY(LY: Double): Integer;
 begin
   if FGfxWinActive then Result := Round(FGfxWinAy * LY + FGfxWinBy) else Result := Round(LY);
+  Result := Result + FGfxViewOffsetY;
 end;
 
 procedure TBytecodeVM.ExecuteGraphicsOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -6770,17 +6774,44 @@ begin
             FGfxWinActive := False;
         end;
       end;
-    45: // bcGfxPMap - __PMAP(coord, n): map between logical and physical coordinates
+    45: // bcGfxPMap - __PMAP(coord, n): map between logical and physical coordinates (incl. VIEW offset)
       case Instr.Immediate of
         0: Ctx.IntRegs[Instr.Dest] := GfxMapX(Ctx.IntRegs[Instr.Src1]);   // logical x -> physical x
         1: Ctx.IntRegs[Instr.Dest] := GfxMapY(Ctx.IntRegs[Instr.Src1]);   // logical y -> physical y
         2: if FGfxWinActive and (FGfxWinAx <> 0) then                      // physical x -> logical x
-             Ctx.IntRegs[Instr.Dest] := Round((Ctx.IntRegs[Instr.Src1] - FGfxWinBx) / FGfxWinAx)
-           else Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
+             Ctx.IntRegs[Instr.Dest] := Round((Ctx.IntRegs[Instr.Src1] - FGfxViewOffsetX - FGfxWinBx) / FGfxWinAx)
+           else Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] - FGfxViewOffsetX;
       else
         if FGfxWinActive and (FGfxWinAy <> 0) then                        // physical y -> logical y
-          Ctx.IntRegs[Instr.Dest] := Round((Ctx.IntRegs[Instr.Src1] - FGfxWinBy) / FGfxWinAy)
-        else Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
+          Ctx.IntRegs[Instr.Dest] := Round((Ctx.IntRegs[Instr.Src1] - FGfxViewOffsetY - FGfxWinBy) / FGfxWinAy)
+        else Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] - FGfxViewOffsetY;
+      end;
+    46: // bcGfxView - VIEW [SCREEN] (x1,y1)-(x2,y2): set/clear the viewport (offset + clip on the work page)
+      if Assigned(FGraphics) then
+      begin
+        if ((Instr.Immediate shr 32) and 1) = 0 then
+        begin
+          FGfxViewOffsetX := 0; FGfxViewOffsetY := 0;          // reset -> full screen, no offset
+          FGraphics.SetClip(FGfxWorkSurface, False, 0, 0, 0, 0);
+        end
+        else
+        begin
+          WinX1 := Ctx.IntRegs[Instr.Src1];
+          WinY1 := Ctx.IntRegs[Instr.Src2];
+          WinX2 := Ctx.IntRegs[Instr.Immediate and $FFFF];
+          WinY2 := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];
+          FGraphics.SetClip(FGfxWorkSurface, True, WinX1, WinY1, WinX2, WinY2);
+          if ((Instr.Immediate shr 33) and 1) = 1 then
+          begin
+            FGfxViewOffsetX := 0; FGfxViewOffsetY := 0;        // VIEW SCREEN: absolute coordinates
+          end
+          else
+          begin
+            // VIEW (default): coordinates relative to the viewport's top-left corner
+            if WinX1 <= WinX2 then FGfxViewOffsetX := WinX1 else FGfxViewOffsetX := WinX2;
+            if WinY1 <= WinY2 then FGfxViewOffsetY := WinY1 else FGfxViewOffsetY := WinY2;
+          end;
+        end;
       end;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
