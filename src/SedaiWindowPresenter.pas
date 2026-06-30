@@ -30,7 +30,7 @@ interface
 
 {$IFDEF WITH_WINDOW}
 uses
-  SysUtils, SDL2, SedaiGraphicsBackend, SedaiGraphicsMemory;
+  SysUtils, Math, SDL2, SedaiGraphicsBackend, SedaiGraphicsMemory;
 
 type
   TWindowPresenter = class
@@ -62,6 +62,10 @@ begin
   FClosed := False;
   FTexW := 0; FTexH := 0;
   FTexture := nil;
+  // FPC leaves FP exceptions UNMASKED; SDL2 and GPU drivers do internal FP that produces inf/NaN
+  // (e.g. divide-by-zero) and expect them masked — otherwise SDL_CreateRenderer raises EZeroDivide.
+  // Safe here: the VM detects BASIC division-by-zero with explicit value checks, not the FPU trap.
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow, exUnderflow, exPrecision]);
   if SDL_WasInit(SDL_INIT_VIDEO) = 0 then
     SDL_InitSubSystem(SDL_INIT_VIDEO);
   FWindow := SDL_CreateWindow(PChar(Title), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
