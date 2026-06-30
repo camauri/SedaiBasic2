@@ -361,7 +361,7 @@ begin
     ssaGraphicSShape, ssaGraphicGShape, ssaGraphicGList, ssaPLoad, ssaPSave, ssaPRst, ssaScnClr,
     ssaGfxScreenRes, ssaGfxPset, ssaGfxPaint, ssaGfxLine, ssaGfxCircle,
     ssaGfxPalette, ssaGfxPaletteReset, ssaGfxColor,
-    ssaGfxImageCreate, ssaGfxImageDestroy:
+    ssaGfxImageCreate, ssaGfxImageDestroy, ssaGfxGet, ssaGfxPut:
       Result := True;
 
     // Sprite operations - always live (modify sprite state)

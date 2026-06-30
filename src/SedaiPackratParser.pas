@@ -271,6 +271,7 @@ type
     function ParseFileOutputStatement: TASTNode;
     function ParseLineInputStatement: TASTNode;  // FreeBASIC LINE INPUT #n, var (whole line)
     function ParseGfxLineStatement: TASTNode;     // FreeBASIC LINE (x1,y1)-(x2,y2),color[,B|BF]
+    function ParseGfxPutStatement: TASTNode;       // FreeBASIC PUT (x,y), src [, mode]
     function ParseWriteFileStatement: TASTNode;   // FreeBASIC WRITE #n, exprlist (quoted CSV)
     function ParseWriteConsole: TASTNode;          // FreeBASIC WRITE exprlist (quoted CSV to screen)
     function ParseSeekStatement: TASTNode;         // FreeBASIC SEEK #n, pos (set position)
@@ -925,6 +926,11 @@ begin
         else if (UpperCase(Token.Value) = kSEEK) and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
           Result := ParseSeekStatement
+        // FreeBASIC graphics "PUT (x,y), src [, mode]" — PUT is a bare identifier; the leading '('
+        // (vs '#') selects the graphics blit form.
+        else if (UpperCase(Token.Value) = kPUT) and Assigned(Context.PeekNext) and
+                (Context.PeekNext.TokenType = ttDelimParOpen) then
+          Result := ParseGfxPutStatement
         // FreeBASIC binary "PUT #n, [pos], var" — PUT is a bare identifier; the `#` selects it.
         else if (UpperCase(Token.Value) = kPUT) and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
@@ -1370,6 +1376,29 @@ begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antGet, Token);
   Context.Advance; // Consume GET
+
+  // FreeBASIC graphics "GET (x1,y1)-(x2,y2), dst" — capture a screen rectangle into an image surface.
+  // The leading '(' disambiguates from "GET A$" and "GET #n,...".
+  if Context.Check(ttDelimParOpen) then
+  begin
+    Result.Free;
+    Result := TASTNode.Create(antGfxGet, Token);
+    Context.Advance;                                            // '('
+    Result.AddChild(ParseExpression);                           // x1
+    if Context.Check(ttSeparParam) then Context.Advance;        // ','
+    Result.AddChild(ParseExpression);                           // y1
+    if Context.Check(ttDelimParClose) then Context.Advance;     // ')'
+    if Context.Check(ttOpSub) then Context.Advance;             // '-'
+    if Context.Check(ttDelimParOpen) then Context.Advance;      // '('
+    Result.AddChild(ParseExpression);                           // x2
+    if Context.Check(ttSeparParam) then Context.Advance;        // ','
+    Result.AddChild(ParseExpression);                           // y2
+    if Context.Check(ttDelimParClose) then Context.Advance;     // ')'
+    if Context.Check(ttSeparParam) then Context.Advance;        // ','
+    Result.AddChild(ParseExpression);                           // dst image handle
+    DoNodeCreated(Result);
+    Exit;
+  end;
 
   // FreeBASIC binary "GET #n, [pos], var" — read sizeof(var) bytes into a scalar.
   if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
@@ -4730,6 +4759,44 @@ begin
       end;
     end;
   end;
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseGfxPutStatement: TASTNode;
+// FreeBASIC graphics "PUT (x,y), src [, mode]" — blit an image surface onto the screen at (x,y).
+// Cursor is at the PUT identifier. mode is an optional name (PSET/PRESET/TRANS/ALPHA/ADD/AND/OR/XOR);
+// stored as the MODE attribute (blit-mode ordinal). The binary "PUT #n,..." form is handled elsewhere.
+var
+  Tok: TLexerToken;
+  ModeStr: string;
+  ModeOrd: Integer;
+begin
+  Tok := Context.CurrentToken;
+  Result := TASTNode.Create(antGfxPut, Tok);
+  Context.Advance;                                            // PUT
+  if Context.Check(ttDelimParOpen) then Context.Advance;      // '('
+  Result.AddChild(ParseExpression);                           // x
+  if Context.Check(ttSeparParam) then Context.Advance;        // ','
+  Result.AddChild(ParseExpression);                           // y
+  if Context.Check(ttDelimParClose) then Context.Advance;     // ')'
+  if Context.Check(ttSeparParam) then Context.Advance;        // ','
+  Result.AddChild(ParseExpression);                           // src image handle
+  ModeOrd := 0;                                               // default: PSET
+  if Context.Check(ttSeparParam) then
+  begin
+    Context.Advance;                                          // ','
+    ModeStr := UpperCase(Context.CurrentToken.Value);
+    if (ModeStr = 'PSET') or (ModeStr = 'PRESET') then ModeOrd := 0
+    else if ModeStr = 'TRANS' then ModeOrd := 1
+    else if ModeStr = 'ALPHA' then ModeOrd := 2
+    else if ModeStr = 'AND' then ModeOrd := 3
+    else if ModeStr = 'OR' then ModeOrd := 4
+    else if ModeStr = 'XOR' then ModeOrd := 5
+    else if ModeStr = 'ADD' then ModeOrd := 6
+    else ModeOrd := 0;                                        // CUSTOM/unknown -> PSET fallback
+    Context.Advance;                                          // mode keyword
+  end;
+  Result.Attributes.Values['MODE'] := IntToStr(ModeOrd);
   DoNodeCreated(Result);
 end;
 

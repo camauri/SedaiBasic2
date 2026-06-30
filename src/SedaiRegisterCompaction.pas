@@ -463,6 +463,7 @@ begin
     bcGfxPalette, bcGfxPalGet,  // PALETTE: Src1 = index (int)
     bcGfxColor,  // COLOR: Src1 = foreground (int)
     bcGfxImageCreate, bcGfxImageDestroy, bcGfxImageInfo,  // IMAGE*: Src1 = w / handle (int)
+    bcGfxGet, bcGfxPut,  // GET/PUT: Src1 = x1 / x (int)
     bcGraphicSShape,  // Src1 = x1 coordinate (int)
     bcGraphicColor,   // Src1 = source register (int)
     bcGraphicWidth,   // Src1 = width value (int)
@@ -602,6 +603,7 @@ begin
     bcGfxPalette,  // PALETTE set: Src2 = packed colour (int)
     bcGfxColor,  // COLOR: Src2 = background (int)
     bcGfxImageCreate,  // IMAGECREATE: Src2 = h (int)
+    bcGfxGet, bcGfxPut,  // GET/PUT: Src2 = y1 / y (int)
     bcGraphicScale,   // Src2 = xmax register (int)
     bcGraphicColor,   // Src2 = color value (int)
     bcGraphicPaint,   // Src2 = x coordinate (int)
@@ -1025,6 +1027,18 @@ begin
       MarkIntRegUsed(Instr.Immediate and $FFFF);            // radius
       MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);   // color
     end;
+
+    // GET: Immediate [0-15]=x2, [16-31]=y2, [32-47]=dst handle (all int regs)
+    if OpCode = bcGfxGet then
+    begin
+      MarkIntRegUsed(Instr.Immediate and $FFFF);            // x2
+      MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);   // y2
+      MarkIntRegUsed((Instr.Immediate shr 32) and $FFFF);   // dst handle
+    end;
+
+    // PUT: Immediate [0-15]=src handle (int reg; bits 16-31 = mode ordinal, NOT a reg)
+    if OpCode = bcGfxPut then
+      MarkIntRegUsed(Instr.Immediate and $FFFF);            // src handle
 
     // bcGraphicWindow: Src1=col1, Src2=row1, Dest=col2, Immediate = (clear_reg << 16) | row2_reg
     // All 5 parameters are int registers
@@ -1537,6 +1551,38 @@ begin
       OldReg := (Instr.Immediate shr 16) and $FFFF;
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
       NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 16);
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
+      end;
+    end;
+
+    // bcGfxGet: Immediate [0-15]=x2, [16-31]=y2, [32-47]=dst handle (all int regs)
+    if OpCode = bcGfxGet then
+    begin
+      OldReg := Instr.Immediate and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewReg and $FFFF;
+      OldReg := (Instr.Immediate shr 16) and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 16);
+      OldReg := (Instr.Immediate shr 32) and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 32);
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
+      end;
+    end;
+
+    // bcGfxPut: Immediate [0-15]=src handle (int reg); bits 16-31 = mode ordinal (preserved)
+    if OpCode = bcGfxPut then
+    begin
+      OldReg := Instr.Immediate and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := (NewReg and $FFFF) or (Instr.Immediate and Int64($FFFF0000));   // preserve mode bits 16-31
       if NewImm <> Instr.Immediate then
       begin
         Instr.Immediate := NewImm;

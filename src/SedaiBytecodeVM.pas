@@ -3193,6 +3193,22 @@ begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // result
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // handle
         end;
+        // bcGfxGet: Src1=x1, Src2=y1; Immediate [0-15]=x2, [16-31]=y2, [32-47]=dst handle
+        bcGfxGet:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // x1
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // y1
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;             // x2
+          if ((Instr.Immediate shr 16) and $FFFF) > MaxIntReg then MaxIntReg := (Instr.Immediate shr 16) and $FFFF;  // y2
+          if ((Instr.Immediate shr 32) and $FFFF) > MaxIntReg then MaxIntReg := (Instr.Immediate shr 32) and $FFFF;  // dst handle
+        end;
+        // bcGfxPut: Src1=x, Src2=y; Immediate [0-15]=src handle (Immediate[16-31]=mode const, not a reg)
+        bcGfxPut:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // x
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // y
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;             // src handle
+        end;
 
         // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
         // Immediate bits 0-15 = row2 register(int), bits 16-31 = clear register(int)
@@ -6274,6 +6290,7 @@ var
   SubOp: Word;
   DrawMode: Integer;
   PalColor: UInt32;
+  GetX1, GetY1, GetX2, GetY2, GetSx, GetSy, SwapTmp: Integer;
 begin
   // M5.3: off the render-owner thread, defer to the queue instead of touching SDL. Dormant on
   // the single-threaded path (FHasWorkers = False short-circuits before any thread-id check).
@@ -6590,6 +6607,26 @@ begin
       end
       else
         Ctx.IntRegs[Instr.Dest] := 0;
+    39: // bcGfxGet - GET (x1,y1)-(x2,y2),dst : capture a screen rect into image dst (per-pixel copy)
+      if Assigned(FGraphics) then
+      begin
+        GetX1 := Ctx.IntRegs[Instr.Src1];
+        GetY1 := Ctx.IntRegs[Instr.Src2];
+        GetX2 := Ctx.IntRegs[Instr.Immediate and $FFFF];
+        GetY2 := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];
+        DrawMode := Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF];   // dst image handle (reuse DrawMode var)
+        if GetX2 < GetX1 then begin SwapTmp := GetX1; GetX1 := GetX2; GetX2 := SwapTmp; end;
+        if GetY2 < GetY1 then begin SwapTmp := GetY1; GetY1 := GetY2; GetY2 := SwapTmp; end;
+        for GetSy := 0 to (GetY2 - GetY1) do
+          for GetSx := 0 to (GetX2 - GetX1) do
+            FGraphics.SetPixel(DrawMode, GetSx, GetSy,
+              FGraphics.GetPixel(FGraphics.ScreenSurface, GetX1 + GetSx, GetY1 + GetSy));
+      end;
+    40: // bcGfxPut - PUT (x,y),src[,mode] : blit image src onto the screen (Immediate[0-15]=src handle
+        //  register, Immediate[16-31]=mode ordinal constant)
+      if Assigned(FGraphics) then
+        FGraphics.Blit(FGraphics.ScreenSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+                       Ctx.IntRegs[Instr.Immediate and $FFFF], TGfxBlitMode((Instr.Immediate shr 16) and $FFFF));
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

@@ -573,6 +573,10 @@ const
   bcGfxImageDestroy = bcGroupGraphics + 37;
   // __IMGINFO(handle, which) : Dest=result, Src1=handle, Immediate=which (0=width, 1=height)
   bcGfxImageInfo    = bcGroupGraphics + 38;
+  // GET (x1,y1)-(x2,y2),dst : Src1=x1, Src2=y1; Immediate [0-15]=x2 reg, [16-31]=y2 reg, [32-47]=dst handle reg
+  bcGfxGet          = bcGroupGraphics + 39;
+  // PUT (x,y),src[,mode] : Src1=x, Src2=y; Immediate [0-15]=src handle reg, [16-31]=blit-mode ordinal (const)
+  bcGfxPut          = bcGroupGraphics + 40;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1658,6 +1662,8 @@ begin
         36: Result := 'GfxImageCreate';
         37: Result := 'GfxImageDestroy';
         38: Result := 'GfxImageInfo';
+        39: Result := 'GfxGet';
+        40: Result := 'GfxPut';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

@@ -406,6 +406,8 @@ type
     function  DefaultDrawColorReg: TSSAValue;       // omitted-colour default = current draw foreground
     procedure ProcessImageDestroy(Node: TASTNode);  // IMAGEDESTROY handle
     procedure ProcessImageInfo(Node: TASTNode);      // IMAGEINFO handle, w, h
+    procedure ProcessGfxGet(Node: TASTNode);         // GET (x1,y1)-(x2,y2), dst
+    procedure ProcessGfxPut(Node: TASTNode);         // PUT (x,y), src [, mode]
     procedure ProcessColor(Node: TASTNode);
     procedure ProcessSetColor(Node: TASTNode);
     procedure ProcessWidth(Node: TASTNode);
@@ -7527,6 +7529,43 @@ begin
     ProcessStatement(Assign);
     Assign.Free;
   end;
+end;
+
+procedure TSSAGenerator.ProcessGfxGet(Node: TASTNode);
+// GET (x1,y1)-(x2,y2), dst : capture a screen rectangle into image surface dst. Children x1,y1,x2,y2,dst.
+// Packed as Src1=x1, Src2=y1, Src3=x2, PhiSources[0]=y2, PhiSources[1]=dst handle.
+var
+  X1V, Y1V, X2V, Y2V, DV, X1R, Y1R, X2R, Y2R, DR: TSSAValue;
+  Instr: TSSAInstruction;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 5) then Exit;
+  ProcessExpression(Node.GetChild(0), X1V); X1R := EnsureIntRegister(X1V);
+  ProcessExpression(Node.GetChild(1), Y1V); Y1R := EnsureIntRegister(Y1V);
+  ProcessExpression(Node.GetChild(2), X2V); X2R := EnsureIntRegister(X2V);
+  ProcessExpression(Node.GetChild(3), Y2V); Y2R := EnsureIntRegister(Y2V);
+  ProcessExpression(Node.GetChild(4), DV);  DR  := EnsureIntRegister(DV);
+  EmitInstruction(ssaGfxGet, MakeSSAValue(svkNone), X1R, Y1R, X2R);
+  Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+  Instr.AddPhiSource(Y2R, nil);
+  Instr.AddPhiSource(DR, nil);
+end;
+
+procedure TSSAGenerator.ProcessGfxPut(Node: TASTNode);
+// PUT (x,y), src [, mode] : blit image src onto the screen at (x,y). Children x,y,src; MODE attribute =
+// blit-mode ordinal. Packed as Src1=x, Src2=y, Src3=src handle, PhiSources[0]=mode (constant).
+var
+  XV, YV, SV, XR, YR, SR: TSSAValue;
+  Instr: TSSAInstruction;
+  Mode: Int64;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 3) then Exit;
+  ProcessExpression(Node.GetChild(0), XV); XR := EnsureIntRegister(XV);
+  ProcessExpression(Node.GetChild(1), YV); YR := EnsureIntRegister(YV);
+  ProcessExpression(Node.GetChild(2), SV); SR := EnsureIntRegister(SV);
+  Mode := StrToIntDef(Node.Attributes.Values['MODE'], 0);
+  EmitInstruction(ssaGfxPut, MakeSSAValue(svkNone), XR, YR, SR);
+  Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+  Instr.AddPhiSource(MakeSSAConstInt(Mode), nil);
 end;
 
 procedure TSSAGenerator.ProcessBeep(Node: TASTNode);
@@ -15060,6 +15099,8 @@ begin
     antGfxColor: ProcessGfxColor(Node);
     antImageDestroy: ProcessImageDestroy(Node);
     antImageInfo: ProcessImageInfo(Node);
+    antGfxGet: ProcessGfxGet(Node);
+    antGfxPut: ProcessGfxPut(Node);
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);
     antWidth: ProcessWidth(Node);

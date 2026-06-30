@@ -2459,7 +2459,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `GET (GRAPHICS)` | ✓ | Creates an image buffer from a portion of another image buffer or screen. |
+| `GET (GRAPHICS)` | ✓ | `GET (x1,y1)-(x2,y2), dst` captures a screen rectangle into image surface `dst` (via IGraphicsBackend; headless-testable). Array-buffer destination deferred. |
 | `IMAGECREATE` | ✓ | `IMAGECREATE(w,h[,color])` allocates a truecolor image surface and returns an integer handle (via IGraphicsBackend; software-backed, headless-testable). Default fill is the transparent key (magenta). |
 | `IMAGEDESTROY` | ✓ | `IMAGEDESTROY handle` frees an image surface (the id slot is reused by a later IMAGECREATE). |
 | `IMAGECONVERTROW` | ✗ | Converts a row of pixels in an image buffer to a different color depth. |
@@ -2471,7 +2471,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `PUT (GRAPHICS)` | ✓ | Blits an image buffer to another image buffer or screen. |
+| `PUT (GRAPHICS)` | ✓ | `PUT (x,y), src [, mode]` blits image surface `src` onto the screen at (x,y). Modes: PSET/PRESET, TRANS (magenta key), ALPHA, ADD, AND, OR, XOR (CUSTOM falls back to PSET). Array-buffer source deferred. |
 | `ADD` | ✗ | Saturated addition of the source and target components. |
 | `ALPHA` | ✗ | Blend using a uniform transparency or the image buffer's alpha channel. |
 | `AND (Graphics Put)` | ✓ | Combine the source and target components using a bitwise And |

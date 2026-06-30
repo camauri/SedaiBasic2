@@ -385,6 +385,8 @@ begin
     ssaGfxImageCreate: Result := bcGfxImageCreate;
     ssaGfxImageDestroy: Result := bcGfxImageDestroy;
     ssaGfxImageInfo: Result := bcGfxImageInfo;
+    ssaGfxGet: Result := bcGfxGet;
+    ssaGfxPut: Result := bcGfxPut;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;
     ssaGraphicRwindow: Result := bcGraphicRwindow;
@@ -1338,6 +1340,50 @@ begin
       BCInstr.Immediate := BCInstr.Immediate or
         ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
           Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF) shl 16);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // FreeBASIC GET (x1,y1)-(x2,y2),dst: Src1=x1, Src2=y1; Immediate packs x2 (Src3, bits 0-15),
+  // y2 (PhiSources[0], bits 16-31) and the dst image handle (PhiSources[1], bits 32-47).
+  if Instr.OpCode = ssaGfxGet then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcGfxGet, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    BCInstr.Immediate := 0;
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Immediate := BCInstr.Immediate or
+        (Int64(MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version)) and $FFFF);
+    if (Length(Instr.PhiSources) >= 1) and (Instr.PhiSources[0].Value.Kind = svkRegister) then
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+          Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF) shl 16);
+    if (Length(Instr.PhiSources) >= 2) and (Instr.PhiSources[1].Value.Kind = svkRegister) then
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
+          Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FFFF) shl 32);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // FreeBASIC PUT (x,y),src[,mode]: Src1=x, Src2=y; Immediate packs the src image handle (Src3, bits
+  // 0-15) and the blit-mode ordinal (PhiSources[0] ConstInt, bits 16-31, NOT a register).
+  if Instr.OpCode = ssaGfxPut then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcGfxPut, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    BCInstr.Immediate := 0;
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Immediate := BCInstr.Immediate or
+        (Int64(MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version)) and $FFFF);
+    if (Length(Instr.PhiSources) >= 1) and (Instr.PhiSources[0].Value.Kind = svkConstInt) then
+      BCInstr.Immediate := BCInstr.Immediate or ((Int64(Instr.PhiSources[0].Value.ConstInt) and $FFFF) shl 16);
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;

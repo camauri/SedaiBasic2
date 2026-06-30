@@ -245,6 +245,8 @@ type
     ssaGfxImageCreate, // IMAGECREATE(w,h[,color]) -> image handle (Dest=handle, Src1=w, Src2=h, Src3=color)
     ssaGfxImageDestroy,// IMAGEDESTROY handle (Src1=handle)
     ssaGfxImageInfo,   // __IMGINFO(handle, which) -> w/h (Dest=result, Src1=handle, Immediate=which)
+    ssaGfxGet,         // GET (x1,y1)-(x2,y2),dst : capture screen rect into image dst
+    ssaGfxPut,         // PUT (x,y),src[,mode] : blit image src onto screen
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n
     ssaGraphicRwindow, // RWINDOW(n): Return window size info
