@@ -4524,13 +4524,25 @@ begin
         Exit;
       end;
 
-      // Parse optional mode parameter
+      // Parse optional mode. Commodore writes the mode as a bare letter (,W ,R ,A ,B); the FreeBASIC and
+      // quoted forms use a string expression. A bare single mode letter must be taken literally — otherwise
+      // ParseExpression reads it as a (usually empty) variable and DOPEN silently falls back to read mode.
       if Context.Check(ttSeparParam) then
       begin
         Context.Advance;
-        Param := ParseExpression;
-        if Assigned(Param) then
-          Result.AddChild(Param);
+        if Context.Check(ttIdentifier) and (Length(Context.CurrentToken.Value) = 1) and
+           (UpCase(Context.CurrentToken.Value[1]) in ['R', 'W', 'A', 'B']) then
+        begin
+          Result.AddChild(TASTNode.CreateWithValue(antLiteral,
+            UpperCase(Context.CurrentToken.Value), Context.CurrentToken));
+          Context.Advance;
+        end
+        else
+        begin
+          Param := ParseExpression;
+          if Assigned(Param) then
+            Result.AddChild(Param);
+        end;
       end;
     end;
     // DCLOSE/CLOSE only needs the handle, already parsed
