@@ -2,7 +2,7 @@
 
 ## Implementation Progress
 
-**Commodore BASIC v7 core — 193 / 209 commands implemented (92%)**
+**Commodore BASIC v7 core — 201 / 209 commands implemented (96%)**
 
 ```
 [█████████████████████████████████████████████····] 90%
@@ -209,7 +209,7 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `BSAVE` | ✓ | Save bytecode file (.basc) |
 | `CATALOG` | ✓ | Display drive directory |
 | `CLOSE` | ✓ | Close file (alias for DCLOSE) |
-| `COLLECT` | ✗ | Free inaccessible disk space |
+| `COLLECT` | ✓ | No-op (host filesystem needs no B-A/BAM garbage collection). |
 | `CHDIR` | ✓ | Change current directory (alias: CD) |
 | `CONCAT` | ✓ | Concatenate files - append source to destination |
 | `COPY` | ✓ | Copy file(s) with wildcard support (alias: CP) |
@@ -256,11 +256,11 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 
 | Command/Function | Status | Description |
 |------------------|--------|-------------|
-| `BANK` | ✗ | Select RAM bank (0-15) |
-| `FETCH` | ✗ | Get data from expansion RAM |
+| `BANK` | ✓ | Accept-and-ignore no-op (a portable VM has no C64 RAM banking; PEEK/POKE go through the memory mapper). |
+| `FETCH` | ✓ | Accept-and-ignore no-op (no REU/expansion RAM to DMA from). |
 | `POKE` | ✓ | Set content of memory-mapped location |
-| `RREG` | ✗ | Read contents of accumulator and registers |
-| `STASH` | ✗ | Move content of host RAM to expansion RAM |
+| `RREG` | ✓ | Accept-and-ignore no-op (no 6502 to read registers from; target variables keep their default 0). |
+| `STASH` | ✓ | Accept-and-ignore no-op (no REU/expansion RAM to DMA to). |
 | `SWAP` | ~ | (v7) Swap host/expansion RAM — NOT implemented. In MODERN, `SWAP a, b` exchanges two lvalues (FreeBASIC) ✓ |
 | `FRE` | ✓ | Return RAM bytes free (FRE(0)) |
 | `PEEK` | ✓ | Return content of memory-mapped location |
@@ -400,7 +400,7 @@ modulo 256) is not yet applied (v1).
 
 | Command | Status | Description |
 |---------|--------|-------------|
-| `HELP` | ✗ | Highlight the line where the error occurred |
+| `HELP` | ✓ | No-op in non-interactive execution (no editor line to highlight). |
 | `TRON` | ✓ | Activate debug mode (trace, breakpoints, stepping) |
 | `TROFF` | ✓ | Deactivate debug mode |
 
@@ -438,8 +438,8 @@ modulo 256) is not yet applied (v1).
 | Function | Status | Description |
 |----------|--------|-------------|
 | `JOY` | ✗ | Return joystick status |
-| `PEN` | ✗ | Return light pen status |
-| `POT` | ✗ | Return paddle status |
+| `PEN` | ✓ | `PEN(n)` returns 0 (no light pen device). |
+| `POT` | ✓ | `POT(n)` returns 0 (no paddle device). |
 
 ## System Management (1/1 - 100%)
 

@@ -3660,16 +3660,17 @@ begin
   end
   else
   begin
-    // Other memory commands (BANK, FETCH, etc.) - use generic handling
+    // Other memory commands: BANK (RAM bank select), FETCH/STASH (host<->expansion-RAM DMA), RREG (6502
+    // register read after SYS). None of this hardware exists in a portable VM, so they are accept-and-ignore
+    // no-ops: the arguments are parsed and discarded (an empty statement emits no code, and no 'unhandled
+    // node type' warning). RREG's target variables are left at their default 0.
     Result := TASTNode.Create(antStatement, Token);
     Context.Advance; // Consume memory command
-
-    // Parse parameters as single expression list
     if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
     begin
       Param1 := ParseExpressionList(ttSeparParam);
       if Assigned(Param1) then
-        Result.AddChild(Param1);
+        Param1.Free;   // consumed and discarded (unemulated hardware -> no-op)
     end;
   end;
 
