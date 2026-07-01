@@ -7518,11 +7518,13 @@ begin
         HandleNum := Ctx.IntRegs[Instr.Src1];
         Filename := Ctx.StringRegs[Instr.Src2];
 
-        // Mode is optional, default to "R" (read)
-        if Instr.Immediate > 0 then
-          Mode := Ctx.StringRegs[Instr.Immediate]
-        else
-          Mode := 'R';
+        // The mode string always lives in the register named by Immediate: ProcessDopen (the sole emitter
+        // of ssaDopen) always allocates a mode register, defaulting to "R". A previous `Immediate > 0`
+        // guard silently dropped the mode whenever register allocation placed it in string register 0
+        // (low-pressure programs), so OPEN ... FOR OUTPUT fell back to read and failed on a fresh file.
+        // Reading register 0 is safe: it holds the mode, and an empty string still means read.
+        Mode := Ctx.StringRegs[Instr.Immediate];
+        if Mode = '' then Mode := 'R';
 
         // Named handles not currently used, clear handle name
         HandleName := '';
