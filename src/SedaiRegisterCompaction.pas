@@ -262,6 +262,10 @@ begin
     bcMultikey,       // MULTIKEY: Dest = -1/0 key state (int)
     bcGetmouse,       // GETMOUSE: Dest = status 0/1 (int)
     bcMouseAxis,      // __MOUSEAXIS: Dest = cached mouse component (int)
+    bcGetJoystick,    // GETJOYSTICK: Dest = status 0/1 (int)
+    bcJoyBtn,         // __JOYBTN: Dest = cached button bitmask (int)
+    bcStick,          // STICK: Dest = axis position 1..200/0 (int)
+    bcStrig,          // STRIG: Dest = button state -1/0 (int)
     bcGraphicRdot,    // Dest = pixel cursor info (int)
     bcGraphicGetMode, // Dest = current graphic mode (int)
     bcGraphicPos,     // POS(x): cursor column position (int)
@@ -327,6 +331,8 @@ begin
     bcInputFileFloat,  // INPUT# file, float var
     // === GROUP 7: Sprite functions ===
     bcRsppos,          // RSPPOS(sprite, attr): position/speed (float)
+    // === GROUP 10: Graphics ===
+    bcJoyAxis,         // __JOYAXIS: Dest = cached joystick axis value (float, -1..1 / -1000)
     // === SUPERINSTRUCTIONS ===
     // Fused arithmetic-to-dest (Float): Dest = Dest op Src1
     bcAddFloatTo, bcSubFloatTo, bcMulFloatTo, bcDivFloatTo,
@@ -474,6 +480,8 @@ begin
     bcGfxScreen,  // SCREEN: Src1 = mode (int)
     bcMultikey,  // MULTIKEY: Src1 = scancode (int)
     bcSetmouse,  // SETMOUSE: Src1 = x (int)
+    bcGetJoystick,  // GETJOYSTICK: Src1 = device id (int)
+    bcStick, bcStrig,  // STICK/STRIG: Src1 = axis / button (int)
     bcGraphicSShape,  // Src1 = x1 coordinate (int)
     bcGraphicColor,   // Src1 = source register (int)
     bcGraphicWidth,   // Src1 = width value (int)

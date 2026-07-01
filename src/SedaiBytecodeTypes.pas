@@ -601,6 +601,16 @@ const
   bcMouseAxis       = bcGroupGraphics + 50;
   // SETMOUSE x,y,visibility : Src1=x reg, Src2=y reg, Immediate[0-15]=visibility reg (-1 = no change)
   bcSetmouse        = bcGroupGraphics + 51;
+  // GETJOYSTICK snapshot : Src1=id reg, Dest=status (0 ok / 1 no device); caches buttons + 8 axes in the VM
+  bcGetJoystick     = bcGroupGraphics + 52;
+  // __JOYBTN() : Dest=result — cached joystick button bitmask (int)
+  bcJoyBtn          = bcGroupGraphics + 53;
+  // __JOYAXIS(which) : Dest=result (FLOAT), Immediate=which (0..7) — cached joystick axis value (-1..1 / -1000)
+  bcJoyAxis         = bcGroupGraphics + 54;
+  // STICK(axis) : Dest=result (int 1..200 / 0), Src1=axis reg (0..3)
+  bcStick           = bcGroupGraphics + 55;
+  // STRIG(button) : Dest=result (int -1/0), Src1=button reg (0..7)
+  bcStrig           = bcGroupGraphics + 56;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1699,6 +1709,11 @@ begin
         49: Result := 'Getmouse';
         50: Result := 'MouseAxis';
         51: Result := 'Setmouse';
+        52: Result := 'GetJoystick';
+        53: Result := 'JoyBtn';
+        54: Result := 'JoyAxis';
+        55: Result := 'Stick';
+        56: Result := 'Strig';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

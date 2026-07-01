@@ -1876,6 +1876,9 @@ begin
  RegisterKeyword(kMULTIKEY,     ttGraphicsFunction, 'FreeBASIC: real-time key-down state MULTIKEY(sc)',  kcGraphicsHandling);
  RegisterKeyword(kGETMOUSE,     ttGraphicsFunction, 'FreeBASIC: read mouse GETMOUSE(x,y[,w][,b][,c])',  kcGraphicsHandling);
  RegisterKeyword(kSETMOUSE,     ttGraphicsCommand,  'FreeBASIC: set mouse position/visibility',         kcGraphicsHandling);
+ RegisterKeyword(kGETJOYSTICK,  ttGraphicsFunction, 'FreeBASIC: read gaming device GETJOYSTICK(id,...)', kcGraphicsHandling);
+ RegisterKeyword(kSTICK,        ttGraphicsFunction, 'FreeBASIC/QB: gaming-device axis STICK(axis)',      kcGraphicsHandling);
+ RegisterKeyword(kSTRIG,        ttGraphicsFunction, 'FreeBASIC/QB: gaming-device button STRIG(button)',  kcGraphicsHandling);
  RegisterKeyword(kVIEW,         ttGraphicsCommand,  'FreeBASIC: set the graphics viewport (offset+clip)', kcGraphicsHandling);
  RegisterKeyword(kSCREENGFX,    ttGraphicsCommand,  'FreeBASIC: set a numbered graphics mode (SCREEN n)', kcGraphicsHandling);
  RegisterKeyword(kRWINDOW, ttInputFunction,    'Return the size of the current text window',       kcStdIO);

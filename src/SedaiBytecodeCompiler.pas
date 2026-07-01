@@ -397,6 +397,11 @@ begin
     ssaGetmouse: Result := bcGetmouse;
     ssaMouseAxis: Result := bcMouseAxis;
     ssaSetmouse: Result := bcSetmouse;
+    ssaGetJoystick: Result := bcGetJoystick;
+    ssaJoyBtn: Result := bcJoyBtn;
+    ssaJoyAxis: Result := bcJoyAxis;
+    ssaStick: Result := bcStick;
+    ssaStrig: Result := bcStrig;
     ssaGfxPMap: Result := bcGfxPMap;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;

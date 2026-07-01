@@ -436,6 +436,9 @@ const
   kMULTIKEY     = 'MULTIKEY';      // FreeBASIC: real-time key-down state, MULTIKEY(scancode)
   kGETMOUSE     = 'GETMOUSE';      // FreeBASIC: read mouse state, GETMOUSE(x,y[,wheel][,buttons][,clip])
   kSETMOUSE     = 'SETMOUSE';      // FreeBASIC: set mouse position/visibility, SETMOUSE [x][,y][,vis][,clip]
+  kGETJOYSTICK  = 'GETJOYSTICK';   // FreeBASIC: read gaming device, GETJOYSTICK(id,buttons,a1..a8) -> status
+  kSTICK        = 'STICK';         // FreeBASIC/QB: gaming-device axis position, STICK(axis) 0-3 -> 1..200/0
+  kSTRIG        = 'STRIG';         // FreeBASIC/QB: gaming-device button state, STRIG(button) 0-7 -> -1/0
   kVIEW         = 'VIEW';          // FreeBASIC: set the graphics viewport (offset + clip); VIEW PRINT = text
   kSCREENGFX    = 'SCREEN';        // FreeBASIC: set a numbered graphics mode (SCREEN n)
   kDRAW    = 'DRAW';

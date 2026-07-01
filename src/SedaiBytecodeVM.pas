@@ -159,6 +159,10 @@ type
     // FreeBASIC GETMOUSE snapshot cache: bcGetmouse queries the input provider once and stores the state
     // here; bcMouseAxis(which) then reads the requested component (0=x,1=y,2=wheel,3=buttons,4=clip).
     FMouseX, FMouseY, FMouseWheel, FMouseButtons, FMouseClip: Integer;
+    // FreeBASIC GETJOYSTICK snapshot cache: bcGetJoystick queries the provider once and stores the state
+    // here; bcJoyBtn reads the button bitmask, bcJoyAxis(which) reads axis `which` (0..7).
+    FJoyButtons: Integer;
+    FJoyAxes: array[0..7] of Single;
     FInputDevice: IInputDevice;
     FMemoryMapper: IMemoryMapper;  // Memory-mapped PEEK/POKE support
     FConsoleBehavior: TConsoleBehavior;
@@ -548,6 +552,9 @@ begin
   FGfxWinActive := False;   // WINDOW logical coords off -> identity mapping
   // GETMOUSE cache: no snapshot taken yet -> report "no mouse" (-1) until the first bcGetmouse.
   FMouseX := -1; FMouseY := -1; FMouseWheel := 0; FMouseButtons := 0; FMouseClip := 0;
+  // GETJOYSTICK cache: no snapshot yet. FJoyAxes is filled wholesale by bcGetJoystick before any bcJoyAxis
+  // read (__JOYAXIS is only emitted inside GETJOYSTICK, after the snapshot), so it needs no init here.
+  FJoyButtons := 0;
   // M5.1: the per-context execution state must exist before any field below is touched.
   FCtx := TExecutionContext.Create;
   // M5.3: render command queue + scratch replay context. Dormant until M5.2 sets FHasWorkers.
@@ -3275,6 +3282,18 @@ begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
           if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;
         end;
+        // bcGetJoystick: Dest=status, Src1=id; bcStick/bcStrig: Dest=result, Src1=axis/button (all int)
+        bcGetJoystick, bcStick, bcStrig:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
+        // bcJoyBtn: Dest=button bitmask (int)
+        bcJoyBtn:
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+        // bcJoyAxis: Dest=axis value (FLOAT); Immediate=which const (not a reg)
+        bcJoyAxis:
+          if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
 
         // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
         // Immediate bits 0-15 = row2 register(int), bits 16-31 = clear register(int)
@@ -6391,6 +6410,9 @@ var
   PalColor: UInt32;
   GetX1, GetY1, GetX2, GetY2, GetSx, GetSy, SwapTmp: Integer;
   WinX1, WinY1, WinX2, WinY2, WinW, WinH: Integer;
+  JoyBtns, JoyDev, JoyLocal, JoyBtnIdx: Integer;
+  JoyAx: array[0..7] of Single;
+  JoyV: Single;
 begin
   // M5.3: off the render-owner thread, defer to the queue instead of touching SDL. Dormant on
   // the single-threaded path (FHasWorkers = False short-circuits before any thread-id check).
@@ -6897,6 +6919,51 @@ begin
       if Assigned(GSetMouseProvider) then
         GSetMouseProvider(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
                           Ctx.IntRegs[Instr.Immediate and $FFFF]);
+    52: // bcGetJoystick - snapshot gaming device Src1=id into the cache; Dest = status (0 ok, 1 no device).
+      begin
+        if Assigned(GGetJoystickProvider) and
+           GGetJoystickProvider(Ctx.IntRegs[Instr.Src1], FJoyButtons, @FJoyAxes[0], 8) then
+          Ctx.IntRegs[Instr.Dest] := 0    // success
+        else
+        begin
+          // No provider (headless) or device absent: FB sets buttons 0, axes -1000, returns 1.
+          FJoyButtons := 0;
+          for JoyLocal := 0 to 7 do FJoyAxes[JoyLocal] := -1000.0;
+          Ctx.IntRegs[Instr.Dest] := 1;   // failure
+        end;
+      end;
+    53: // bcJoyBtn - cached joystick button bitmask (int).
+      Ctx.IntRegs[Instr.Dest] := FJoyButtons;
+    54: // bcJoyAxis - cached joystick axis value (Immediate = which 0..7); FLOAT result.
+      if (Instr.Immediate >= 0) and (Instr.Immediate <= 7) then
+        Ctx.FloatRegs[Instr.Dest] := FJoyAxes[Instr.Immediate]
+      else
+        Ctx.FloatRegs[Instr.Dest] := -1000.0;
+    55: // bcStick - STICK(axis): axis 0..3 (X/Y of device A/B) -> 1..200, or 0 if not attached/absent.
+      begin
+        JoyDev := Ctx.IntRegs[Instr.Src1] div 2;    // 0,1 -> device A (0); 2,3 -> device B (1)
+        JoyLocal := Ctx.IntRegs[Instr.Src1] and 1;  // 0 = X, 1 = Y
+        if Assigned(GGetJoystickProvider) and GGetJoystickProvider(JoyDev, JoyBtns, @JoyAx[0], 8) and
+           (JoyLocal < 8) and (JoyAx[JoyLocal] > -999.0) then
+        begin
+          JoyV := JoyAx[JoyLocal];                  // -1..1 -> 1..200 (100.5 = centre)
+          Ctx.IntRegs[Instr.Dest] := 1 + Round((JoyV + 1.0) * 99.5);
+        end
+        else
+          Ctx.IntRegs[Instr.Dest] := 0;             // not attached
+      end;
+    56: // bcStrig - STRIG(button): button 0..7 -> -1 (pressed) / 0. v1 reports the current level for both
+        //   the "pressed since" (even) and "is pressed" (odd) queries (no edge latch).
+      begin
+        // 0,1->devA btn0; 2,3->devB btn0; 4,5->devA btn1; 6,7->devB btn1.
+        JoyDev := (Ctx.IntRegs[Instr.Src1] shr 1) and 1;
+        JoyBtnIdx := (Ctx.IntRegs[Instr.Src1] shr 2) and 1;
+        if Assigned(GGetJoystickProvider) and GGetJoystickProvider(JoyDev, JoyBtns, @JoyAx[0], 8) and
+           ((JoyBtns and (1 shl JoyBtnIdx)) <> 0) then
+          Ctx.IntRegs[Instr.Dest] := -1
+        else
+          Ctx.IntRegs[Instr.Dest] := 0;
+      end;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

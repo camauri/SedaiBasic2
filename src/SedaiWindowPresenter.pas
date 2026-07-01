@@ -57,6 +57,7 @@ implementation
 
 var
   GActiveWindow: PSDL_Window = nil;   // the presenter's window while open (for SetMouse warp / bounds)
+  GJoy: array[0..15] of PSDL_Joystick;   // lazily-opened gaming devices (GETJOYSTICK/STICK/STRIG)
 
 // Real-time key state for MULTIKEY (installed as GKeyDownProvider while the window is open).
 function WindowKeyDown(ATScanCode: Integer): Boolean;
@@ -107,6 +108,35 @@ begin
   else if Visibility = 1 then SDL_ShowCursor(SDL_ENABLE);
 end;
 
+// GETJOYSTICK / STICK / STRIG: read gaming device `Id` (lazily opened). Fills the button bitmask and up
+// to MaxAxes axis values (SDL int16 -32768..32767 normalised to -1..1; -1000 if the axis is absent).
+// Returns False if the device is not present.
+function WindowGetJoystick(Id: Integer; out Buttons: Integer; Axes: PSingle; MaxAxes: Integer): Boolean;
+var
+  i, n: Integer;
+begin
+  Buttons := 0;
+  for i := 0 to MaxAxes - 1 do Axes[i] := -1000.0;
+  Result := False;
+  if (Id < 0) or (Id > 15) then Exit;
+  if SDL_WasInit(SDL_INIT_JOYSTICK) = 0 then SDL_InitSubSystem(SDL_INIT_JOYSTICK);
+  if GJoy[Id] = nil then
+  begin
+    if Id >= SDL_NumJoysticks then Exit;
+    GJoy[Id] := SDL_JoystickOpen(Id);
+    if GJoy[Id] = nil then Exit;
+  end;
+  SDL_JoystickUpdate;
+  n := SDL_JoystickNumAxes(GJoy[Id]);
+  for i := 0 to MaxAxes - 1 do
+    if i < n then Axes[i] := SDL_JoystickGetAxis(GJoy[Id], i) / 32767.0
+    else Axes[i] := -1000.0;
+  n := SDL_JoystickNumButtons(GJoy[Id]);
+  for i := 0 to n - 1 do
+    if (i < 32) and (SDL_JoystickGetButton(GJoy[Id], i) <> 0) then Buttons := Buttons or (1 shl i);
+  Result := True;
+end;
+
 constructor TWindowPresenter.Create(ABackend: TSoftwareGraphicsBackend; const Title: string);
 begin
   inherited Create;
@@ -130,14 +160,20 @@ begin
   GKeyDownProvider := @WindowKeyDown;    // MULTIKEY reads the live SDL keyboard state
   GGetMouseProvider := @WindowGetMouse;  // GETMOUSE reads the live SDL mouse state
   GSetMouseProvider := @WindowSetMouse;  // SETMOUSE warps / toggles the cursor
+  GGetJoystickProvider := @WindowGetJoystick;  // GETJOYSTICK/STICK/STRIG read SDL gaming devices
 end;
 
 destructor TWindowPresenter.Destroy;
+var
+  i: Integer;
 begin
   GKeyDownProvider := nil;
   GGetMouseProvider := nil;
   GSetMouseProvider := nil;
+  GGetJoystickProvider := nil;
   GActiveWindow := nil;
+  for i := 0 to High(GJoy) do
+    if GJoy[i] <> nil then begin SDL_JoystickClose(GJoy[i]); GJoy[i] := nil; end;
   if Assigned(FTexture) then SDL_DestroyTexture(FTexture);
   if Assigned(FRenderer) then SDL_DestroyRenderer(FRenderer);
   if Assigned(FWindow) then SDL_DestroyWindow(FWindow);

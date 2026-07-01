@@ -991,6 +991,9 @@ function GlobalMemoryStatusEx(var lpBuffer: TMemoryStatusEx): BOOL; stdcall; ext
 
 { TVideoController }
 
+var
+  GVConJoy: array[0..15] of PSDL_Joystick;   // lazily-opened gaming devices (GETJOYSTICK/STICK/STRIG on sbv)
+
 // Real-time key state for MULTIKEY on sbv (installed as GKeyDownProvider; SDL keyboard state is global).
 function VConKeyDown(ATScanCode: Integer): Boolean;
 var
@@ -1041,6 +1044,34 @@ begin
   else if Visibility = 1 then SDL_ShowCursor(SDL_ENABLE);
 end;
 
+// GETJOYSTICK / STICK / STRIG on sbv: read gaming device `Id` (lazily opened). Fills the button bitmask
+// and up to MaxAxes axis values (-1..1, or -1000 if absent). Returns False if the device is not present.
+function VConGetJoystick(Id: Integer; out Buttons: Integer; Axes: PSingle; MaxAxes: Integer): Boolean;
+var
+  i, n: Integer;
+begin
+  Buttons := 0;
+  for i := 0 to MaxAxes - 1 do Axes[i] := -1000.0;
+  Result := False;
+  if (Id < 0) or (Id > 15) then Exit;
+  if SDL_WasInit(SDL_INIT_JOYSTICK) = 0 then SDL_InitSubSystem(SDL_INIT_JOYSTICK);
+  if GVConJoy[Id] = nil then
+  begin
+    if Id >= SDL_NumJoysticks then Exit;
+    GVConJoy[Id] := SDL_JoystickOpen(Id);
+    if GVConJoy[Id] = nil then Exit;
+  end;
+  SDL_JoystickUpdate;
+  n := SDL_JoystickNumAxes(GVConJoy[Id]);
+  for i := 0 to MaxAxes - 1 do
+    if i < n then Axes[i] := SDL_JoystickGetAxis(GVConJoy[Id], i) / 32767.0
+    else Axes[i] := -1000.0;
+  n := SDL_JoystickNumButtons(GVConJoy[Id]);
+  for i := 0 to n - 1 do
+    if (i < 32) and (SDL_JoystickGetButton(GVConJoy[Id], i) <> 0) then Buttons := Buttons or (1 shl i);
+  Result := True;
+end;
+
 constructor TVideoController.Create;
 begin
   inherited Create;
@@ -1049,6 +1080,7 @@ begin
   GKeyDownProvider := @VConKeyDown;     // sbv: MULTIKEY reads the live SDL keyboard state
   GGetMouseProvider := @VConGetMouse;   // sbv: GETMOUSE reads the live SDL mouse state
   GSetMouseProvider := @VConSetMouse;   // sbv: SETMOUSE warps / toggles the cursor
+  GGetJoystickProvider := @VConGetJoystick;  // sbv: GETJOYSTICK/STICK/STRIG read SDL gaming devices
   FFont := nil;
   FPaletteManager := nil;
   FGraphicsMemory := nil;

@@ -258,6 +258,11 @@ type
     ssaGetmouse,       // GETMOUSE snapshot: query the mouse into the VM cache (Dest=status 0/1); reads via ssaMouseAxis
     ssaMouseAxis,      // __MOUSEAXIS(which) -> cached mouse component (Dest=result, Immediate=which: 0=x,1=y,2=wheel,3=buttons,4=clip)
     ssaSetmouse,       // SETMOUSE x,y,visibility : move/show the mouse (Src1=x, Src2=y, Immediate=visibility reg)
+    ssaGetJoystick,    // GETJOYSTICK snapshot: query gaming device Src1=id into the VM cache (Dest=status 0/1)
+    ssaJoyBtn,         // __JOYBTN() -> cached joystick button bitmask (Dest=int)
+    ssaJoyAxis,        // __JOYAXIS(which) -> cached joystick axis value (Dest=FLOAT, Immediate=which 0..7)
+    ssaStick,          // STICK(axis) -> gaming-device axis position 1..200/0 (Dest=int, Src1=axis)
+    ssaStrig,          // STRIG(button) -> gaming-device button state -1/0 (Dest=int, Src1=button)
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n
     ssaGraphicRwindow, // RWINDOW(n): Return window size info

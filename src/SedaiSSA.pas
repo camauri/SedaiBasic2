@@ -407,6 +407,7 @@ type
     procedure ProcessImageDestroy(Node: TASTNode);  // IMAGEDESTROY handle
     procedure ProcessImageInfo(Node: TASTNode);      // IMAGEINFO handle, w, h
     function  EmitGetmouse(Node, ArgListNode: TASTNode): TSSAValue;  // GETMOUSE(x,y[,w][,b][,c]) -> status
+    function  EmitGetJoystick(Node, ArgListNode: TASTNode): TSSAValue;  // GETJOYSTICK(id,buttons,a1..a8) -> status
     procedure ProcessGfxSetmouse(Node: TASTNode);    // SETMOUSE [x][,y][,visibility][,clip]
     procedure ProcessGfxGet(Node: TASTNode);         // GET (x1,y1)-(x2,y2), dst
     procedure ProcessGfxPut(Node: TASTNode);         // PUT (x,y), src [, mode]
@@ -3140,6 +3141,60 @@ begin
           end
           else
             raise Exception.Create('__MOUSEAXIS requires 1 argument');
+        end
+        else if FuncName = 'GETJOYSTICK' then
+          // GETJOYSTICK(id, buttons, a1..a8) -> status (0 ok / 1 no device). Writes each provided lvalue
+          // by reference (buttons int, a1..a8 single); see EmitGetJoystick. Expression or bare statement.
+          Result := EmitGetJoystick(Node, ArgListNode)
+        else if FuncName = '__JOYBTN' then
+        begin
+          // Internal helper for GETJOYSTICK: cached joystick button bitmask (int).
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaJoyBtn, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
+        else if FuncName = '__JOYAXIS' then
+        begin
+          // Internal helper for GETJOYSTICK: cached joystick axis value (single). `which` (0..7) rides in
+          // the Immediate like __SCRINFO/__MOUSEAXIS; the result is a FLOAT register.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), RVal);   // which (constant)
+            DestReg := FProgram.AllocRegister(srtFloat);
+            Result := MakeSSARegister(srtFloat, DestReg);
+            if RVal.Kind = svkConstInt then
+              EmitInstruction(ssaJoyAxis, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), RVal)
+            else
+              EmitInstruction(ssaJoyAxis, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), EnsureIntRegister(RVal));
+          end
+          else
+            raise Exception.Create('__JOYAXIS requires 1 argument');
+        end
+        else if FuncName = 'STICK' then
+        begin
+          // STICK(axis) -> gaming-device axis position (1..200, or 0 if not attached). axis 0..3.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
+            DestReg := FProgram.AllocRegister(srtInt);
+            Result := MakeSSARegister(srtInt, DestReg);
+            EmitInstruction(ssaStick, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end
+          else
+            raise Exception.Create('STICK requires 1 argument: STICK(axis)');
+        end
+        else if FuncName = 'STRIG' then
+        begin
+          // STRIG(button) -> gaming-device button state (-1 pressed / 0 not). button 0..7.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
+            DestReg := FProgram.AllocRegister(srtInt);
+            Result := MakeSSARegister(srtInt, DestReg);
+            EmitInstruction(ssaStrig, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end
+          else
+            raise Exception.Create('STRIG requires 1 argument: STRIG(button)');
         end
         else if FuncName = 'RDOT' then
         begin
@@ -7645,6 +7700,56 @@ begin
       Call.AddChild(InnerArgs);
       Assign := TASTNode.Create(antAssignment, Node.Token);
       Assign.AddChild(Child.Clone);   // destination lvalue (x/y/wheel/buttons/clip)
+      Assign.AddChild(Call);
+      ProcessStatement(Assign);
+      Assign.Free;
+    end;
+  end;
+  Result := StatusReg;
+end;
+
+function TSSAGenerator.EmitGetJoystick(Node, ArgListNode: TASTNode): TSSAValue;
+// GETJOYSTICK(id, buttons, a1 .. a8) : snapshot gaming device `id` (ssaGetJoystick, Src1=id, Dest=status),
+// then write each provided lvalue from the cache: buttons (int) via __JOYBTN(), a1..a8 (single) via
+// __JOYAXIS(which). Mirrors EmitGetmouse; buttons is index 1, axes are indices 2..9 (which = i-2).
+// Returns the status register (0 = ok, 1 = no device -> buttons 0, axes -1000).
+var
+  StatusReg, IdVal, IdReg: TSSAValue;
+  Child, WhichLit, InnerArgs, Call, Assign: TASTNode;
+  i, MaxArgs: Integer;
+begin
+  StatusReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+  begin
+    ProcessExpression(ArgListNode.GetChild(0), IdVal);   // id (rvalue input)
+    IdReg := EnsureIntRegister(IdVal);
+  end
+  else
+    IdReg := MakeSSAValue(svkNone);
+  EmitInstruction(ssaGetJoystick, StatusReg, IdReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) then
+  begin
+    MaxArgs := ArgListNode.ChildCount;
+    if MaxArgs > 10 then MaxArgs := 10;   // id + buttons + a1..a8
+    for i := 1 to MaxArgs - 1 do
+    begin
+      Child := ArgListNode.GetChild(i);
+      if (Child = nil) or (Child.NodeType = antLiteral) then Continue;   // empty slot -> no target
+      if i = 1 then
+      begin
+        Call := TASTNode.CreateWithValue(antGraphicsFunction, '__JOYBTN', Node.Token);  // buttons (int)
+        Call.AddChild(TASTNode.Create(antArgumentList, Node.Token));   // empty arg list (ChildCount>0 to be intercepted)
+      end
+      else
+      begin
+        WhichLit := TASTNode.CreateWithValue(antLiteral, i - 2, Node.Token);            // axis which (0..7)
+        InnerArgs := TASTNode.Create(antArgumentList, Node.Token);
+        InnerArgs.AddChild(WhichLit);
+        Call := TASTNode.CreateWithValue(antGraphicsFunction, '__JOYAXIS', Node.Token); // axis (single)
+        Call.AddChild(InnerArgs);
+      end;
+      Assign := TASTNode.Create(antAssignment, Node.Token);
+      Assign.AddChild(Child.Clone);
       Assign.AddChild(Call);
       ProcessStatement(Assign);
       Assign.Free;

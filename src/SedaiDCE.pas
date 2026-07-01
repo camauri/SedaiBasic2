@@ -365,7 +365,10 @@ begin
     ssaGfxScreenSet, ssaGfxPCopy, ssaGfxWindow, ssaGfxView, ssaGfxScreen,
     // GETMOUSE snapshot / SETMOUSE mutate external state; __MOUSEAXIS reads the mutable cache and must
     // keep program order with the snapshot (no reorder/CSE) -> all three are treated as side-effecting.
-    ssaGetmouse, ssaMouseAxis, ssaSetmouse:
+    // GETJOYSTICK snapshot + __JOYBTN/__JOYAXIS cache reads follow the same rule. (STICK/STRIG are pure
+    // value producers like MULTIKEY: kept only when their result is used.)
+    ssaGetmouse, ssaMouseAxis, ssaSetmouse,
+    ssaGetJoystick, ssaJoyBtn, ssaJoyAxis:
       Result := True;
 
     // Sprite operations - always live (modify sprite state)

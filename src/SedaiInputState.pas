@@ -28,11 +28,16 @@ type
   // Move the mouse cursor / set its visibility. Each parameter is -1 for "no change" (FB SetMouse
   // semantics); Visibility is 0 = hide, 1 = show.
   TSetMouseFn = procedure(X, Y, Visibility: Integer);
+  // Query gaming device `Id` (0-15): fills the button bitmask + up to MaxAxes axis values (each -1..1,
+  // or -1000 if the axis is absent). Axes points at a caller-owned Single[MaxAxes]. Returns False if the
+  // device is not attached (FB GetJoystick then returns 1). Used by GETJOYSTICK, STICK and STRIG.
+  TGetJoystickFn = function(Id: Integer; out Buttons: Integer; Axes: PSingle; MaxAxes: Integer): Boolean;
 
 var
   GKeyDownProvider: TKeyDownFn = nil;
   GGetMouseProvider: TGetMouseFn = nil;
   GSetMouseProvider: TSetMouseFn = nil;
+  GGetJoystickProvider: TGetJoystickFn = nil;
 
 // FB MULTIKEY scancode (PC/AT set 1) -> SDL_Scancode. Returns 0 (SDL_SCANCODE_UNKNOWN) if unmapped.
 function ATScancodeToSDL(AT: Integer): Integer;
