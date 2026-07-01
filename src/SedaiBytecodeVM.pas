@@ -164,6 +164,7 @@ type
     FJoyButtons: Integer;
     FJoyAxes: array[0..7] of Single;
     FProgramArgs: array of string;   // COMMAND$: arguments passed to the BASIC program (arg 1, 2, ...)
+    FIOStatus: Integer;   // ST (Commodore): Kernal I/O status byte; bit 6 (64) = EOF on the last GET#
     FInputDevice: IInputDevice;
     FMemoryMapper: IMemoryMapper;  // Memory-mapped PEEK/POKE support
     FConsoleBehavior: TConsoleBehavior;
@@ -305,6 +306,7 @@ type
     function FormatNumber(Value: Double; const Mask: string): string;  // FORMAT(num, mask) -> formatted string (numeric masks)
     function FormatDateMask(Value: Double; const Mask: string): string;  // FORMAT(serial, mask) -> date/time formatted string
     function CommandLine(Index: Integer): string;  // COMMAND$(index) -> command-line argument(s)
+    function DiskStatusString: string;  // DS$ -> Commodore disk status line "NN, MESSAGE,00,00"
     function FileLength(const Path: string): Int64;   // FILELEN(path) -> file size in bytes (0 if absent)
     procedure RawFree(RawPtr: Int64);
     function RawRealloc(RawPtr: Int64; ByteCount: PtrUInt): Int64;
@@ -560,6 +562,7 @@ begin
   // GETJOYSTICK cache: no snapshot yet. FJoyAxes is filled wholesale by bcGetJoystick before any bcJoyAxis
   // read (__JOYAXIS is only emitted inside GETJOYSTICK, after the snapshot), so it needs no init here.
   FJoyButtons := 0;
+  FIOStatus := 0;   // ST: no I/O yet -> clear (no EOF)
   // M5.1: the per-context execution state must exist before any field below is touched.
   FCtx := TExecutionContext.Create;
   // M5.3: render command queue + scratch replay context. Dormant until M5.2 sets FHasWorkers.
@@ -3473,6 +3476,25 @@ begin
     Result := FProgramArgs[Index - 1]
   else
     Result := '';
+end;
+
+function TBytecodeVM.DiskStatusString: string;
+// DS$: the Commodore drive status channel, formatted "NN, MESSAGE,TT,SS". We report the last file
+// operation's error code (0 = OK) and its message; track/sector are always 00 (no physical geometry).
+var
+  Code: Integer;
+  Msg: string;
+begin
+  Code := FCtx.LastErrorCode;
+  if Code = 0 then
+    Msg := 'OK'
+  else
+  begin
+    Msg := FCtx.LastErrorMessage;
+    if (Msg <> '') and (Msg[1] = '?') then Delete(Msg, 1, 1);   // strip the leading '?' of CBM messages
+    if Msg = '' then Msg := 'ERROR';
+  end;
+  Result := Format('%.2d, %s,00,00', [Code, UpperCase(Msg)]);
 end;
 
 procedure TBytecodeVM.SetMemoryMapper(Mapper: IMemoryMapper);
@@ -6410,6 +6432,12 @@ begin
       Ctx.StringRegs[Instr.Dest] := GetCurrentDir;
     11: // bcCsrlin - return current text cursor row (VM-tracked, parallels POS/CursorCol)
       Ctx.IntRegs[Instr.Dest] := Ctx.CursorRow;
+    12: // bcLoadDS - Commodore disk status code = last file-operation error code (0 = OK)
+      Ctx.IntRegs[Instr.Dest] := Ctx.LastErrorCode;
+    13: // bcLoadDSS - Commodore disk status message line "NN, MESSAGE,00,00"
+      Ctx.StringRegs[Instr.Dest] := DiskStatusString;
+    14: // bcLoadST - Kernal I/O status byte (bit 6 = EOF on the last GET#)
+      Ctx.IntRegs[Instr.Dest] := FIOStatus;
   else
     raise Exception.CreateFmt('Unknown special variable opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
@@ -7499,6 +7527,7 @@ begin
         // Named handles not currently used, clear handle name
         HandleName := '';
 
+        FIOStatus := 0;   // ST (Commodore): a fresh file open clears the I/O status (no EOF yet)
         if Assigned(FOnDiskFile) then
         begin
           FOnDiskFile(Self, 'DOPEN', HandleNum, HandleName, Filename, Mode, ErrorCode);
@@ -7541,6 +7570,8 @@ begin
           FOnFileData(Self, 'GET#', HandleNum, Data, ErrorCode);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('GET# error %d reading from file: %d', [ErrorCode, HandleNum]);
+          // ST (Commodore): a GET# that returns no byte has hit end-of-file -> set the EOF bit (64).
+          if Data = '' then FIOStatus := FIOStatus or 64 else FIOStatus := FIOStatus and not 64;
           // Store result in string register
           if Instr.Dest >= 0 then
             Ctx.StringRegs[Instr.Dest] := Data;

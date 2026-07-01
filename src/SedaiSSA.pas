@@ -1365,6 +1365,27 @@ begin
         Result := MakeSSARegister(srtString, DestReg);
         EmitInstruction(ssaLoadERRS, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
+      else if VarName = 'DS' then
+      begin
+        // DS (Commodore): disk status code = last file-operation error code (0 = OK) - integer
+        DestReg := FProgram.AllocRegister(srtInt);
+        Result := MakeSSARegister(srtInt, DestReg);
+        EmitInstruction(ssaLoadDS, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if VarName = 'DS$' then
+      begin
+        // DS$ (Commodore): disk status message line "NN, MESSAGE,00,00" - string
+        DestReg := FProgram.AllocRegister(srtString);
+        Result := MakeSSARegister(srtString, DestReg);
+        EmitInstruction(ssaLoadDSS, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if VarName = 'ST' then
+      begin
+        // ST (Commodore): Kernal I/O status byte (bit 6 = EOF on the last GET#) - integer
+        DestReg := FProgram.AllocRegister(srtInt);
+        Result := MakeSSARegister(srtInt, DestReg);
+        EmitInstruction(ssaLoadST, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
       else
         Result := MakeSSAValue(svkNone);  // Unknown special variable
     end;

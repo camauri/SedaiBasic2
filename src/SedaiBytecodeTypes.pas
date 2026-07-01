@@ -474,6 +474,9 @@ const
   bcPoke            = bcGroupSpecial + 9;   // POKE address, value: write to memory-mapped location
   bcLoadCWDS        = bcGroupSpecial + 10;  // CWD$: current working directory
   bcCsrlin          = bcGroupSpecial + 11;  // CSRLIN: current text cursor row
+  bcLoadDS          = bcGroupSpecial + 12;  // DS: Commodore disk status code (= last file error code)
+  bcLoadDSS         = bcGroupSpecial + 13;  // DS$: Commodore disk status message line (Dest=string)
+  bcLoadST          = bcGroupSpecial + 14;  // ST: Kernal I/O status byte (bit 6 = EOF on the last GET#)
 
   // === GROUP 6: FILE I/O (0x06xx) ===
   bcDopen           = bcGroupFileIO + 0;    // DOPEN #handle, "filename" [, mode$]

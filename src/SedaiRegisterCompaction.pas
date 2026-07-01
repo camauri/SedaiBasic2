@@ -243,6 +243,8 @@ begin
     bcLoadTI,         // TI: jiffies since start (int)
     bcLoadEL,         // EL: last error line number (int)
     bcLoadER,         // ER: last error code (int)
+    bcLoadDS,         // DS: Commodore disk status code (int)
+    bcLoadST,         // ST: Kernal I/O status byte (int)
     bcCsrlin,         // CSRLIN: current cursor row (int)
     bcFre,            // FRE: available memory (int)
     bcPeek,           // PEEK(address): read from memory (int)
@@ -390,6 +392,7 @@ begin
     bcLoadDTS,         // DT$: current date YYYYMMDD (string)
     bcLoadCWDS,        // CWD$: current working directory (string)
     bcLoadERRS,        // ERR$: last error message (string)
+    bcLoadDSS,         // DS$: Commodore disk status message line (string)
     // === GROUP 10: Graphics ===
     bcGraphicSShape,   // SSHAPE A$, x1, y1: capture screen area to string
     // === GROUP 6: File I/O operations ===

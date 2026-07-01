@@ -283,6 +283,9 @@ type
     ssaLoadEL,         // EL: Load last error line number
     ssaLoadER,         // ER: Load last error code
     ssaLoadERRS,       // ERR$: Load last error message (variable, not function)
+    ssaLoadDS,         // DS: Commodore disk status code (= last file-operation error code)
+    ssaLoadDSS,        // DS$: Commodore disk status message line "NN, MESSAGE,00,00"
+    ssaLoadST,         // ST: Kernal I/O status byte (bit 6 = end-of-file on the last GET#)
     ssaCsrlin,         // CSRLIN: current text cursor row
     ssaFre,            // FRE(x): Return available memory in bytes
     // Memory operations

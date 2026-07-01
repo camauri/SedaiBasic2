@@ -2,7 +2,7 @@
 
 ## Implementation Progress
 
-**Commodore BASIC v7 core — 188 / 209 commands implemented (90%)**
+**Commodore BASIC v7 core — 191 / 209 commands implemented (91%)**
 
 ```
 [█████████████████████████████████████████████····] 90%
@@ -377,13 +377,13 @@ modulo 256) is not yet applied (v1).
 
 | Variable | Status | Description |
 |----------|--------|-------------|
-| `DS` | ✗ | Get disk status code |
-| `DS$` | ✗ | Get disk status message |
+| `DS` | ✓ | Disk status code — the last file-operation error code (0 = OK). |
+| `DS$` | ✓ | Disk status message line `"NN, MESSAGE,00,00"` (track/sector are 00; no physical geometry). |
 | `CWD$` | ✓ | Get current working directory (read-only) |
 | `DT$` | ✓ | Get current date (YYYYMMDD format, read-only) |
 | `EL` | ✓ | Return last error line |
 | `ER` | ✓ | Return last error code |
-| `ST` | ✗ | Get I/O status byte |
+| `ST` | ✓ | Kernal I/O status byte — bit 6 (64) = end-of-file on the last C64-style `GET#` (`bcGetFile`); 0 otherwise. Cleared on file open. |
 | `TI` | ✓ | Get time elapsed from power on (jiffies, 1/60 sec) |
 | `TI$` | ✓ | Get/set 24h clock (HHMMSS format) |
 

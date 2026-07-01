@@ -429,6 +429,9 @@ begin
     ssaLoadEL: Result := bcLoadEL;
     ssaLoadER: Result := bcLoadER;
     ssaLoadERRS: Result := bcLoadERRS;
+    ssaLoadDS: Result := bcLoadDS;
+    ssaLoadDSS: Result := bcLoadDSS;
+    ssaLoadST: Result := bcLoadST;
     ssaCsrlin: Result := bcCsrlin;
     ssaFre: Result := bcFre;
     // Memory operations
