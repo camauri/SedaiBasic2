@@ -218,13 +218,13 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `DIR` | ✓ | Display drive directory (alias for DIRECTORY) |
 | `DIRECTORY` | ✓ | Display drive directory |
 | `DLOAD` | ✓ | Load BASIC file |
-| `DOPEN` | ✓ | Open disk file for read/write |
+| `DOPEN` | ✓ | Open disk file. `DOPEN#lf,"name"[,W\|R\|A]` (bare CBM mode letter or quoted); `DOPEN#lf,"name",L,reclen` opens a relative (fixed-record) file. Spaceless `DOPEN#1` form works. |
 | `DSAVE` | ✓ | Save BASIC file |
 | `DVERIFY` | ✓ | Verify saved BASIC file |
 | `HEADER` | ✗ | Formats a diskette |
 | `LOAD` | ✓ | Load program |
-| `OPEN` | ✓ | Open file for input/output (alias for DOPEN) |
-| `RECORD` | ✓ | Position relative file pointer |
+| `OPEN` | ✓ | Open file for input/output. FreeBASIC `OPEN "f" FOR mode AS #n`, C128 `DOPEN`, and the C64 `OPEN lf,dev,sa,"name,type,mode"` form (mode from the filename's `,W`/`,R`/`,A`; drive prefix `N:` stripped; command channel = no-op). |
+| `RECORD` | ✓ | `RECORD#lf,recnum` positions a relative file to record `recnum` (1-based → byte offset `(recnum-1)*reclen`). |
 | `MKDIR` | ✓ | Create directory (alias: MD) |
 | `MOVE` | ✓ | Move file (alias: MV) |
 | `RENAME` | ✓ | Rename file (RENAME oldname newname) |

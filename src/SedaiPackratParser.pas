@@ -905,7 +905,8 @@ begin
         // identifier), so detect the two-word form. Unambiguous — no statement has `line input`
         // meaning anything else.
         else if (UpperCase(Token.Value) = kLINE) and Assigned(Context.PeekNext) and
-                (UpperCase(Context.PeekNext.Value) = kINPUT) then
+                ((UpperCase(Context.PeekNext.Value) = kINPUT) or
+                 (UpperCase(Context.PeekNext.Value) = kINPUTN)) then   // 'INPUT' or combined 'INPUT#'
           Result := ParseLineInputStatement
         // FreeBASIC graphics "LINE (x1,y1)-(x2,y2),color[,B|BF]": LINE is a bare identifier here; the
         // parenthesis after it selects the graphics statement (vs LINE INPUT, vs an assignment to `line`).
@@ -4588,11 +4589,21 @@ begin
       begin
         Context.Advance;
         if Context.Check(ttIdentifier) and (Length(Context.CurrentToken.Value) = 1) and
-           (UpCase(Context.CurrentToken.Value[1]) in ['R', 'W', 'A', 'B']) then
+           (UpCase(Context.CurrentToken.Value[1]) in ['R', 'W', 'A', 'B', 'L']) then
         begin
-          Result.AddChild(TASTNode.CreateWithValue(antLiteral,
-            UpperCase(Context.CurrentToken.Value), Context.CurrentToken));
+          ModeStr := UpperCase(Context.CurrentToken.Value);
           Context.Advance;
+          // Relative file "DOPEN#lf,"name",L,reclen": fold the record length into the mode string ("L10").
+          if (ModeStr = 'L') and Context.Check(ttSeparParam) then
+          begin
+            Context.Advance;                      // ',' before the record length
+            if Context.Check(ttNumber) or Context.Check(ttInteger) then
+            begin
+              ModeStr := 'L' + Context.CurrentToken.Value;
+              Context.Advance;
+            end;
+          end;
+          Result.AddChild(TASTNode.CreateWithValue(antLiteral, ModeStr, Token));
         end
         else
         begin
@@ -4909,11 +4920,14 @@ function TPackratParser.ParseLineInputStatement: TASTNode;
 var
   P: TASTNode;
   Tok: TLexerToken;
+  CombinedHash: Boolean;   // the second word was the combined 'INPUT#' token (spaceless LINE INPUT#1)
 begin
   Tok := Context.CurrentToken;
   Context.Advance;  // LINE
-  Context.Advance;  // INPUT
-  if not (Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#')) then
+  CombinedHash := (UpperCase(Context.CurrentToken.Value) = kINPUTN);   // 'INPUT#' already carries the '#'
+  Context.Advance;  // INPUT or INPUT#
+  if (not CombinedHash) and
+     not (Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#')) then
   begin
     // Console "LINE INPUT [;] [prompt ;|,] var" — read a whole line into a string variable. Reuses the
     // console string-input path (antInput); v1 shows INPUT's "? " prompt.
@@ -4935,7 +4949,7 @@ begin
   end;
   Result := TASTNode.Create(antInputFile, Tok);
   Result.Attributes.Values['LINEINPUT'] := '1';
-  Context.Advance;  // '#'
+  if not CombinedHash then Context.Advance;  // consume the separate '#' (combined 'INPUT#' already has it)
   if Context.Check(ttNumber) or Context.Check(ttInteger) then
   begin
     Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));

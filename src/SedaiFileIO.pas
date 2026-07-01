@@ -25,6 +25,7 @@ type
   private
     FFileHandles: array[1..15] of TFileStream;
     FFileModes: array[1..15] of string;
+    FRecordLens: array[1..15] of Integer;   // relative-file record length per handle (0 = not relative)
   public
     destructor Destroy; override;
     procedure CloseAll;
@@ -52,6 +53,7 @@ begin
     begin
       FreeAndNil(FFileHandles[i]);
       FFileModes[i] := '';
+      FRecordLens[i] := 0;
     end;
 end;
 
@@ -74,7 +76,23 @@ begin
       FreeAndNil(FFileHandles[Handle]);
       FFileModes[Handle] := '';
     end;
+    FRecordLens[Handle] := 0;
     M := UpperCase(Mode);
+    // Relative file "L<reclen>": random-access, read+write, created if absent (never truncated).
+    if (Length(M) >= 1) and (M[1] = 'L') then
+    begin
+      if FileExists(Filename) then FileMode := fmOpenReadWrite else FileMode := fmCreate;
+      try
+        FFileHandles[Handle] := TFileStream.Create(Filename, FileMode);
+        FFileModes[Handle] := M;
+        FRecordLens[Handle] := StrToIntDef(Copy(M, 2, Length(M) - 1), 1);
+        if FRecordLens[Handle] < 1 then FRecordLens[Handle] := 1;
+      except
+        on E: EFCreateError do begin ErrorCode := 26; FFileHandles[Handle] := nil; end;
+        on E: Exception do begin ErrorCode := 70; FFileHandles[Handle] := nil; end;
+      end;
+      Exit;
+    end;
     if not FileExists(Filename) and
        (Pos('W', M) = 0) and (Pos('A', M) = 0) and (Pos('B', M) = 0) then
     begin
@@ -106,6 +124,7 @@ begin
       FreeAndNil(FFileHandles[Handle]);
       FFileModes[Handle] := '';
     end;
+    FRecordLens[Handle] := 0;
   end;
 end;
 
@@ -203,7 +222,14 @@ begin
   end
   else if Command = 'RECORD' then
   begin
-    try FS.Position := StrToInt64(Data); except
+    // Relative file: RECORD #n, recnum positions to record recnum (1-based) -> byte (recnum-1)*reclen.
+    // A non-relative handle keeps the historic raw-byte behaviour.
+    try
+      if FRecordLens[Handle] > 0 then
+        FS.Position := (StrToInt64(Data) - 1) * FRecordLens[Handle]
+      else
+        FS.Position := StrToInt64(Data);
+    except
       on E: EConvertError do ErrorCode := 63;
       on E: Exception do ErrorCode := 70;
     end;
