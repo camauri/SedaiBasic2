@@ -260,6 +260,8 @@ begin
     bcGfxScreenInfo,  // __SCRINFO: Dest = screen info field (int)
     bcGfxPMap,        // __PMAP: Dest = mapped coordinate (int)
     bcMultikey,       // MULTIKEY: Dest = -1/0 key state (int)
+    bcGetmouse,       // GETMOUSE: Dest = status 0/1 (int)
+    bcMouseAxis,      // __MOUSEAXIS: Dest = cached mouse component (int)
     bcGraphicRdot,    // Dest = pixel cursor info (int)
     bcGraphicGetMode, // Dest = current graphic mode (int)
     bcGraphicPos,     // POS(x): cursor column position (int)
@@ -471,6 +473,7 @@ begin
     bcGfxWindow, bcGfxView, bcGfxPMap,  // WINDOW/VIEW: Src1 = x1 ; PMAP: Src1 = coord (int)
     bcGfxScreen,  // SCREEN: Src1 = mode (int)
     bcMultikey,  // MULTIKEY: Src1 = scancode (int)
+    bcSetmouse,  // SETMOUSE: Src1 = x (int)
     bcGraphicSShape,  // Src1 = x1 coordinate (int)
     bcGraphicColor,   // Src1 = source register (int)
     bcGraphicWidth,   // Src1 = width value (int)
@@ -613,6 +616,7 @@ begin
     bcGfxGet, bcGfxPut,  // GET/PUT: Src2 = y1 / y (int)
     bcGfxScreenSet, bcGfxPCopy,  // SCREENSET/PCOPY: Src2 = visible / dst page (int)
     bcGfxWindow, bcGfxView,  // WINDOW/VIEW: Src2 = y1 (int)
+    bcSetmouse,  // SETMOUSE: Src2 = y (int)
     bcGraphicScale,   // Src2 = xmax register (int)
     bcGraphicColor,   // Src2 = color value (int)
     bcGraphicPaint,   // Src2 = x coordinate (int)
@@ -1028,6 +1032,10 @@ begin
 
     // IMAGECREATE: Immediate contains the fill-colour register index (int)
     if OpCode = bcGfxImageCreate then
+      MarkIntRegUsed(Instr.Immediate and $FFFF);
+
+    // SETMOUSE: Immediate[0-15] contains the visibility register index (int)
+    if OpCode = bcSetmouse then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // LINE: Immediate [0-15]=x2, [16-31]=y2, [32-47]=color (all int regs; bits 48-49 = shape flag, NOT a reg)
@@ -1545,7 +1553,8 @@ begin
     if (OpCode = bcStrMid) or (OpCode = bcStrMidW) or
        (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) or
        (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) or
-       (OpCode = bcGfxPset) or (OpCode = bcGfxPaint) or (OpCode = bcGfxImageCreate) then
+       (OpCode = bcGfxPset) or (OpCode = bcGfxPaint) or (OpCode = bcGfxImageCreate) or
+       (OpCode = bcSetmouse) then   // SETMOUSE: Immediate[0-15] = visibility register
     begin
       OldReg := Instr.Immediate and $FFFF;
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then

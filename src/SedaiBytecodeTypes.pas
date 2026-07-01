@@ -595,6 +595,12 @@ const
   bcGfxScreen       = bcGroupGraphics + 47;
   // MULTIKEY(scancode) : Dest=result (-1/0), Src1=FB scancode reg — real-time key state via the input provider
   bcMultikey        = bcGroupGraphics + 48;
+  // GETMOUSE snapshot : Dest=status (0 ok / 1 no mouse); caches x,y,wheel,buttons,clip in the VM
+  bcGetmouse        = bcGroupGraphics + 49;
+  // __MOUSEAXIS(which) : Dest=result, Immediate=which (0=x,1=y,2=wheel,3=buttons,4=clip) — reads the cache
+  bcMouseAxis       = bcGroupGraphics + 50;
+  // SETMOUSE x,y,visibility : Src1=x reg, Src2=y reg, Immediate[0-15]=visibility reg (-1 = no change)
+  bcSetmouse        = bcGroupGraphics + 51;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1690,6 +1696,9 @@ begin
         46: Result := 'GfxView';
         47: Result := 'GfxScreen';
         48: Result := 'Multikey';
+        49: Result := 'Getmouse';
+        50: Result := 'MouseAxis';
+        51: Result := 'Setmouse';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

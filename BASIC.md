@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 485 / 643 implemented (75%)** (+ 1 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 487 / 643 implemented (76%)** (+ 1 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **485 (85%)** are implemented. See the
+**572 applicable** keywords, **487 (85%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -2487,8 +2487,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `GETMOUSE` | ✗ | Gets button and axis information for the mouse. |
-| `SETMOUSE` | ✗ | Sets position and visibility of the mouse cursor. |
+| `GETMOUSE` | ✓ | `GETMOUSE(x, y [,wheel] [,buttons] [,clip])` snapshots the mouse into the by-reference variables and returns 0 (ok) / 1 (no mouse / off-window → all fields -1). Buttons is an FB bitmask (bit0=left, bit1=right, bit2=middle). Live on `sb --window` and sbv (SDL mouse state); headless `sb` reports no mouse. Wheel/clip are 0 in v1. |
+| `SETMOUSE` | ✓ | `SETMOUSE [x] [,y] [,visibility] [,clip]` moves the cursor and/or toggles visibility (each field -1 = no change; visibility 1=show, 0=hide). Live on `sb --window` and sbv; headless `sb` is a no-op. Clip parsed but ignored in v1. |
 | `GETJOYSTICK` | ✗ | Gets button and axis information for gaming devices. |
 | `STICK` | ✗ | Gets axis position for gaming devices. |
 | `STRIG` | ✗ | Gets button state for gaming devices. |

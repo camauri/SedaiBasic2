@@ -55,6 +55,9 @@ implementation
 
 {$IFDEF WITH_WINDOW}
 
+var
+  GActiveWindow: PSDL_Window = nil;   // the presenter's window while open (for SetMouse warp / bounds)
+
 // Real-time key state for MULTIKEY (installed as GKeyDownProvider while the window is open).
 function WindowKeyDown(ATScanCode: Integer): Boolean;
 var
@@ -67,6 +70,41 @@ begin
   if State = nil then Exit;
   SdlSc := ATScancodeToSDL(ATScanCode);
   Result := (SdlSc > 0) and (SdlSc < NumKeys) and ((State + SdlSc)^ <> 0);
+end;
+
+// GETMOUSE: window-relative position + button bitmask (installed as GGetMouseProvider while open).
+// Returns False (FB: all -1, status 1) when the pointer is not over our window. Wheel is 0 (untracked v1).
+function WindowGetMouse(out X, Y, Wheel, Buttons: Integer): Boolean;
+var
+  sx, sy, w, h: Integer;
+  st: UInt32;
+  Focus: PSDL_Window;
+begin
+  X := -1; Y := -1; Wheel := 0; Buttons := 0;
+  Result := False;
+  SDL_PumpEvents;
+  Focus := SDL_GetMouseFocus;
+  if Focus = nil then Exit;
+  if (GActiveWindow <> nil) and (Focus <> GActiveWindow) then Exit;
+  st := SDL_GetMouseState(@sx, @sy);
+  w := 0; h := 0;
+  SDL_GetWindowSize(Focus, @w, @h);
+  if (sx < 0) or (sy < 0) or (sx >= w) or (sy >= h) then Exit;   // pointer off the window
+  X := sx; Y := sy;
+  // SDL mask (L=1,M=2,R=4) -> FB bitmask (bit0=left, bit1=right, bit2=middle).
+  if (st and SDL_BUTTON_LMASK) <> 0 then Buttons := Buttons or 1;
+  if (st and SDL_BUTTON_RMASK) <> 0 then Buttons := Buttons or 2;
+  if (st and SDL_BUTTON_MMASK) <> 0 then Buttons := Buttons or 4;
+  Result := True;
+end;
+
+// SETMOUSE: warp the pointer and/or toggle cursor visibility (-1 = no change on each field).
+procedure WindowSetMouse(X, Y, Visibility: Integer);
+begin
+  if (GActiveWindow <> nil) and (X >= 0) and (Y >= 0) then
+    SDL_WarpMouseInWindow(GActiveWindow, X, Y);
+  if Visibility = 0 then SDL_ShowCursor(SDL_DISABLE)
+  else if Visibility = 1 then SDL_ShowCursor(SDL_ENABLE);
 end;
 
 constructor TWindowPresenter.Create(ABackend: TSoftwareGraphicsBackend; const Title: string);
@@ -88,12 +126,18 @@ begin
     FRenderer := SDL_CreateRenderer(FWindow, -1, SDL_RENDERER_ACCELERATED)
   else
     FRenderer := nil;
-  GKeyDownProvider := @WindowKeyDown;   // MULTIKEY now reads the live SDL keyboard state
+  GActiveWindow := FWindow;
+  GKeyDownProvider := @WindowKeyDown;    // MULTIKEY reads the live SDL keyboard state
+  GGetMouseProvider := @WindowGetMouse;  // GETMOUSE reads the live SDL mouse state
+  GSetMouseProvider := @WindowSetMouse;  // SETMOUSE warps / toggles the cursor
 end;
 
 destructor TWindowPresenter.Destroy;
 begin
   GKeyDownProvider := nil;
+  GGetMouseProvider := nil;
+  GSetMouseProvider := nil;
+  GActiveWindow := nil;
   if Assigned(FTexture) then SDL_DestroyTexture(FTexture);
   if Assigned(FRenderer) then SDL_DestroyRenderer(FRenderer);
   if Assigned(FWindow) then SDL_DestroyWindow(FWindow);

@@ -25,8 +25,9 @@ type
   TKeyDownFn = function(ATScanCode: Integer): Boolean;
   // Fills the current mouse state (window-relative). Returns False if no mouse / off-window (FB: x=-1).
   TGetMouseFn = function(out X, Y, Wheel, Buttons: Integer): Boolean;
-  // Move the mouse cursor / set its visibility.
-  TSetMouseFn = procedure(X, Y: Integer; Visible: Boolean);
+  // Move the mouse cursor / set its visibility. Each parameter is -1 for "no change" (FB SetMouse
+  // semantics); Visibility is 0 = hide, 1 = show.
+  TSetMouseFn = procedure(X, Y, Visibility: Integer);
 
 var
   GKeyDownProvider: TKeyDownFn = nil;

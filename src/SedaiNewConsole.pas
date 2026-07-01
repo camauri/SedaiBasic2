@@ -1005,12 +1005,50 @@ begin
   Result := (SdlSc > 0) and (SdlSc < NumKeys) and ((State + SdlSc)^ <> 0);
 end;
 
+// GETMOUSE on sbv: window-relative position + FB button bitmask (installed as GGetMouseProvider).
+// Returns False (FB: all -1, status 1) when the pointer is not over the graphics window.
+function VConGetMouse(out X, Y, Wheel, Buttons: Integer): Boolean;
+var
+  sx, sy, w, h: Integer;
+  st: UInt32;
+  Focus: PSDL_Window;
+begin
+  X := -1; Y := -1; Wheel := 0; Buttons := 0;
+  Result := False;
+  SDL_PumpEvents;
+  Focus := SDL_GetMouseFocus;
+  if Focus = nil then Exit;
+  st := SDL_GetMouseState(@sx, @sy);
+  w := 0; h := 0;
+  SDL_GetWindowSize(Focus, @w, @h);
+  if (sx < 0) or (sy < 0) or (sx >= w) or (sy >= h) then Exit;
+  X := sx; Y := sy;
+  if (st and SDL_BUTTON_LMASK) <> 0 then Buttons := Buttons or 1;
+  if (st and SDL_BUTTON_RMASK) <> 0 then Buttons := Buttons or 2;
+  if (st and SDL_BUTTON_MMASK) <> 0 then Buttons := Buttons or 4;
+  Result := True;
+end;
+
+// SETMOUSE on sbv: warp the pointer / toggle cursor visibility (-1 = no change on each field).
+procedure VConSetMouse(X, Y, Visibility: Integer);
+var
+  Focus: PSDL_Window;
+begin
+  Focus := SDL_GetMouseFocus;
+  if (Focus <> nil) and (X >= 0) and (Y >= 0) then
+    SDL_WarpMouseInWindow(Focus, X, Y);
+  if Visibility = 0 then SDL_ShowCursor(SDL_DISABLE)
+  else if Visibility = 1 then SDL_ShowCursor(SDL_ENABLE);
+end;
+
 constructor TVideoController.Create;
 begin
   inherited Create;
   FWindow := nil;
   FRenderer := nil;
-  GKeyDownProvider := @VConKeyDown;   // sbv: MULTIKEY reads the live SDL keyboard state
+  GKeyDownProvider := @VConKeyDown;     // sbv: MULTIKEY reads the live SDL keyboard state
+  GGetMouseProvider := @VConGetMouse;   // sbv: GETMOUSE reads the live SDL mouse state
+  GSetMouseProvider := @VConSetMouse;   // sbv: SETMOUSE warps / toggles the cursor
   FFont := nil;
   FPaletteManager := nil;
   FGraphicsMemory := nil;

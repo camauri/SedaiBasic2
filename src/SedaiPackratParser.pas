@@ -834,6 +834,9 @@ begin
 
     // === GRAPHICS COMMANDS ===
     ttGraphicsCommand: Result := Memoize('GraphicsStatement', @ParseGraphicsStatement);
+    // A graphics function at statement start is an expression statement (e.g. GETMOUSE(x,y) called for its
+    // by-reference side effects, discarding the status). Mirrors ttSpriteFunction / ttInputFunction.
+    ttGraphicsFunction: Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
 
     // === SPRITE COMMANDS ===
     ttSpriteCommand: Result := Memoize('SpriteStatement', @ParseSpriteStatement);
@@ -3793,6 +3796,8 @@ begin
     Result := TASTNode.Create(antPCopy, Token);
     Result.Attributes.Values['OP'] := 'SCREENCOPY';
   end
+  else if CmdName = 'SETMOUSE' then
+    Result := TASTNode.Create(antGfxSetmouse, Token)
   else
     Result := TASTNode.Create(antStatement, Token);
 
@@ -3883,6 +3888,26 @@ begin
         Result.Attributes.Values['HASBG'] := '1';
       end;
     end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // FreeBASIC SETMOUSE [x] [, y] [, visibility] [, clip] — set the mouse position/visibility. Each field is
+  // optional (-1 = "no change"); an omitted slot is an empty antLiteral placeholder. Parens are optional
+  // (both `SetMouse 320,240` and `SetMouse(320,240)` are accepted). Children: x, y, visibility, clip.
+  if Result.NodeType = antGfxSetmouse then
+  begin
+    if Context.Check(ttDelimParOpen) then Context.Advance;       // optional '('
+    while not Context.CheckAny([ttDelimParClose, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
+    begin
+      if Context.Check(ttSeparParam) then
+        Result.AddChild(TASTNode.CreateWithValue(antLiteral, -1, Token))  // empty slot -> "no change"
+      else
+        Result.AddChild(ParseExpression);
+      if Context.Check(ttSeparParam) then Context.Advance         // ','
+      else Break;
+    end;
+    if Context.Check(ttDelimParClose) then Context.Advance;      // optional ')'
     DoNodeCreated(Result);
     Exit;
   end;

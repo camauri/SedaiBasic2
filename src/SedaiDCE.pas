@@ -362,7 +362,10 @@ begin
     ssaGfxScreenRes, ssaGfxPset, ssaGfxPaint, ssaGfxLine, ssaGfxCircle,
     ssaGfxPalette, ssaGfxPaletteReset, ssaGfxColor,
     ssaGfxImageCreate, ssaGfxImageDestroy, ssaGfxGet, ssaGfxPut,
-    ssaGfxScreenSet, ssaGfxPCopy, ssaGfxWindow, ssaGfxView, ssaGfxScreen:
+    ssaGfxScreenSet, ssaGfxPCopy, ssaGfxWindow, ssaGfxView, ssaGfxScreen,
+    // GETMOUSE snapshot / SETMOUSE mutate external state; __MOUSEAXIS reads the mutable cache and must
+    // keep program order with the snapshot (no reorder/CSE) -> all three are treated as side-effecting.
+    ssaGetmouse, ssaMouseAxis, ssaSetmouse:
       Result := True;
 
     // Sprite operations - always live (modify sprite state)

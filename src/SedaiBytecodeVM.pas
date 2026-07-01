@@ -156,6 +156,9 @@ type
     FGfxWinAx, FGfxWinBx, FGfxWinAy, FGfxWinBy: Double;
     // FreeBASIC VIEW viewport: physical origin added to mapped coords (non-SCREEN form); clip is on the surface.
     FGfxViewOffsetX, FGfxViewOffsetY: Integer;
+    // FreeBASIC GETMOUSE snapshot cache: bcGetmouse queries the input provider once and stores the state
+    // here; bcMouseAxis(which) then reads the requested component (0=x,1=y,2=wheel,3=buttons,4=clip).
+    FMouseX, FMouseY, FMouseWheel, FMouseButtons, FMouseClip: Integer;
     FInputDevice: IInputDevice;
     FMemoryMapper: IMemoryMapper;  // Memory-mapped PEEK/POKE support
     FConsoleBehavior: TConsoleBehavior;
@@ -543,6 +546,8 @@ begin
   SetLength(FGfxPages, 1);
   FGfxPages[0] := GFX_SCREEN_SURFACE;
   FGfxWinActive := False;   // WINDOW logical coords off -> identity mapping
+  // GETMOUSE cache: no snapshot taken yet -> report "no mouse" (-1) until the first bcGetmouse.
+  FMouseX := -1; FMouseY := -1; FMouseWheel := 0; FMouseButtons := 0; FMouseClip := 0;
   // M5.1: the per-context execution state must exist before any field below is touched.
   FCtx := TExecutionContext.Create;
   // M5.3: render command queue + scratch replay context. Dormant until M5.2 sets FHasWorkers.
@@ -3259,6 +3264,16 @@ begin
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
+        // bcGetmouse: Dest=status; bcMouseAxis: Dest=result (Immediate=which const, not a reg)
+        bcGetmouse, bcMouseAxis:
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+        // bcSetmouse: Src1=x, Src2=y, Immediate[0-15]=visibility reg
+        bcSetmouse:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;
         end;
 
         // bcGraphicWindow: Src1=col1(int), Src2=row1(int), Dest=col2(int)
@@ -6853,6 +6868,35 @@ begin
         Ctx.IntRegs[Instr.Dest] := -1
       else
         Ctx.IntRegs[Instr.Dest] := 0;
+    49: // bcGetmouse - snapshot the mouse into the cache; Dest = status (0 ok, 1 no mouse / off-window).
+      begin
+        if Assigned(GGetMouseProvider) and
+           GGetMouseProvider(FMouseX, FMouseY, FMouseWheel, FMouseButtons) then
+        begin
+          FMouseClip := 0;                 // clip status not tracked in v1
+          Ctx.IntRegs[Instr.Dest] := 0;    // success
+        end
+        else
+        begin
+          // No provider (headless) or mouse off-window: FB sets every field to -1 and returns 1.
+          FMouseX := -1; FMouseY := -1; FMouseWheel := -1; FMouseButtons := -1; FMouseClip := -1;
+          Ctx.IntRegs[Instr.Dest] := 1;    // failure
+        end;
+      end;
+    50: // bcMouseAxis - read a cached mouse component (Immediate: 0=x,1=y,2=wheel,3=buttons,4=clip).
+      case Instr.Immediate of
+        0: Ctx.IntRegs[Instr.Dest] := FMouseX;
+        1: Ctx.IntRegs[Instr.Dest] := FMouseY;
+        2: Ctx.IntRegs[Instr.Dest] := FMouseWheel;
+        3: Ctx.IntRegs[Instr.Dest] := FMouseButtons;
+        4: Ctx.IntRegs[Instr.Dest] := FMouseClip;
+      else
+        Ctx.IntRegs[Instr.Dest] := -1;
+      end;
+    51: // bcSetmouse - move/show the mouse; Src1=x, Src2=y, Immediate[0-15]=visibility reg (-1 = no change).
+      if Assigned(GSetMouseProvider) then
+        GSetMouseProvider(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+                          Ctx.IntRegs[Instr.Immediate and $FFFF]);
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

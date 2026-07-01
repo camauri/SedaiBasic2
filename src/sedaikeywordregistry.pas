@@ -1874,6 +1874,8 @@ begin
  RegisterKeyword(kFLIP,         ttGraphicsCommand,  'FreeBASIC: swap or set visible/work pages',      kcGraphicsHandling);
  RegisterKeyword(kPMAP,         ttGraphicsFunction, 'FreeBASIC: map logical<->physical coordinates',   kcGraphicsHandling);
  RegisterKeyword(kMULTIKEY,     ttGraphicsFunction, 'FreeBASIC: real-time key-down state MULTIKEY(sc)',  kcGraphicsHandling);
+ RegisterKeyword(kGETMOUSE,     ttGraphicsFunction, 'FreeBASIC: read mouse GETMOUSE(x,y[,w][,b][,c])',  kcGraphicsHandling);
+ RegisterKeyword(kSETMOUSE,     ttGraphicsCommand,  'FreeBASIC: set mouse position/visibility',         kcGraphicsHandling);
  RegisterKeyword(kVIEW,         ttGraphicsCommand,  'FreeBASIC: set the graphics viewport (offset+clip)', kcGraphicsHandling);
  RegisterKeyword(kSCREENGFX,    ttGraphicsCommand,  'FreeBASIC: set a numbered graphics mode (SCREEN n)', kcGraphicsHandling);
  RegisterKeyword(kRWINDOW, ttInputFunction,    'Return the size of the current text window',       kcStdIO);

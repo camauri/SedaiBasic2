@@ -406,6 +406,8 @@ type
     function  DefaultDrawColorReg: TSSAValue;       // omitted-colour default = current draw foreground
     procedure ProcessImageDestroy(Node: TASTNode);  // IMAGEDESTROY handle
     procedure ProcessImageInfo(Node: TASTNode);      // IMAGEINFO handle, w, h
+    function  EmitGetmouse(Node, ArgListNode: TASTNode): TSSAValue;  // GETMOUSE(x,y[,w][,b][,c]) -> status
+    procedure ProcessGfxSetmouse(Node: TASTNode);    // SETMOUSE [x][,y][,visibility][,clip]
     procedure ProcessGfxGet(Node: TASTNode);         // GET (x1,y1)-(x2,y2), dst
     procedure ProcessGfxPut(Node: TASTNode);         // PUT (x,y), src [, mode]
     procedure ProcessScreenInfo(Node: TASTNode);     // SCREENINFO w, h [, depth, ...]
@@ -3117,6 +3119,27 @@ begin
           end
           else
             raise Exception.Create('MULTIKEY requires 1 argument: MULTIKEY(scancode)');
+        end
+        else if FuncName = 'GETMOUSE' then
+          // GETMOUSE(x, y [, wheel] [, buttons] [, clip]) -> status (0 ok / 1 no mouse). Writes each
+          // provided lvalue by reference; see EmitGetmouse. Works as an expression or a bare statement.
+          Result := EmitGetmouse(Node, ArgListNode)
+        else if FuncName = '__MOUSEAXIS' then
+        begin
+          // Internal helper for GETMOUSE: __MOUSEAXIS(which) -> cached component (0=x,1=y,2=wheel,3=buttons,
+          // 4=clip). `which` is a constant literal; it rides in the Immediate like __SCRINFO's selector.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), RVal);   // which (constant)
+            DestReg := FProgram.AllocRegister(srtInt);
+            Result := MakeSSARegister(srtInt, DestReg);
+            if RVal.Kind = svkConstInt then
+              EmitInstruction(ssaMouseAxis, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), RVal)
+            else
+              EmitInstruction(ssaMouseAxis, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), EnsureIntRegister(RVal));
+          end
+          else
+            raise Exception.Create('__MOUSEAXIS requires 1 argument');
         end
         else if FuncName = 'RDOT' then
         begin
@@ -7592,6 +7615,72 @@ begin
     ProcessStatement(Assign);
     Assign.Free;
   end;
+end;
+
+function TSSAGenerator.EmitGetmouse(Node, ArgListNode: TASTNode): TSSAValue;
+// GETMOUSE(x, y [, wheel] [, buttons] [, clip]) : snapshot the mouse once (ssaGetmouse, Dest=status), then
+// write each provided lvalue argument from the cached component via a synthetic "var = __MOUSEAXIS(which)"
+// assignment (reusing the assignment machinery, exactly like IMAGEINFO/SCREENINFO). An omitted slot is an
+// empty antLiteral placeholder and is skipped. Returns the status register (0 = ok, 1 = no mouse/off-window).
+var
+  StatusReg: TSSAValue;
+  Child, WhichLit, InnerArgs, Call, Assign: TASTNode;
+  i, MaxArgs: Integer;
+begin
+  StatusReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaGetmouse, StatusReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) then
+  begin
+    MaxArgs := ArgListNode.ChildCount;
+    if MaxArgs > 5 then MaxArgs := 5;   // x,y,wheel,buttons,clip
+    for i := 0 to MaxArgs - 1 do
+    begin
+      Child := ArgListNode.GetChild(i);
+      // An empty argument slot ("GetMouse(x,,b)") parses to a bare antLiteral -> no target for that field.
+      if (Child = nil) or (Child.NodeType = antLiteral) then Continue;
+      WhichLit := TASTNode.CreateWithValue(antLiteral, i, Node.Token);
+      InnerArgs := TASTNode.Create(antArgumentList, Node.Token);
+      InnerArgs.AddChild(WhichLit);
+      Call := TASTNode.CreateWithValue(antGraphicsFunction, '__MOUSEAXIS', Node.Token);
+      Call.AddChild(InnerArgs);
+      Assign := TASTNode.Create(antAssignment, Node.Token);
+      Assign.AddChild(Child.Clone);   // destination lvalue (x/y/wheel/buttons/clip)
+      Assign.AddChild(Call);
+      ProcessStatement(Assign);
+      Assign.Free;
+    end;
+  end;
+  Result := StatusReg;
+end;
+
+procedure TSSAGenerator.ProcessGfxSetmouse(Node: TASTNode);
+// SETMOUSE [x] [, y] [, visibility] [, clip] : move the mouse and/or set its visibility. Each omitted field
+// is -1 ("no change"). v1 wires x, y and visibility to the input provider (clip is parsed but ignored).
+// Emitted as Src1=x, Src2=y, Src3=visibility (the compiler packs visibility into Immediate[0-15]).
+var
+  XR, YR, VR: TSSAValue;
+
+  function ChildRegOrNoChange(Idx: Integer): TSSAValue;
+  var V: TSSAValue;
+  begin
+    if (Node.ChildCount > Idx) and (Node.GetChild(Idx) <> nil) and
+       (Node.GetChild(Idx).NodeType <> antLiteral) then
+    begin
+      ProcessExpression(Node.GetChild(Idx), V);
+      Result := EnsureIntRegister(V);
+    end
+    else
+    begin
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+  end;
+begin
+  if FCurrentBlock = nil then Exit;
+  XR := ChildRegOrNoChange(0);   // x (-1 = no change)
+  YR := ChildRegOrNoChange(1);   // y
+  VR := ChildRegOrNoChange(2);   // visibility (1 show, 0 hide, -1 no change)
+  EmitInstruction(ssaSetmouse, MakeSSAValue(svkNone), XR, YR, VR);
 end;
 
 procedure TSSAGenerator.ProcessGfxGet(Node: TASTNode);
@@ -15283,9 +15372,9 @@ begin
       ProcessProcedureCall(Node);
     antTypeDecl:
       ;  // UDT declaration: registered in the pre-scan (RegisterUDTs); nothing to emit here.
-    antMemberAccess, antArrayAccess, antFunctionCall:
-      // Statement-level call for side effects (e.g. obj.method(args), or a function/array
-      // expression used as a statement). Lower as an expression and discard the result.
+    antMemberAccess, antArrayAccess, antFunctionCall, antGraphicsFunction:
+      // Statement-level call for side effects (e.g. obj.method(args), a function/array expression used
+      // as a statement, or GETMOUSE(x,y) called for its by-reference writes). Lower and discard the result.
       ProcessExpression(Node, RetVal);
     antLabel:
     begin
@@ -15362,6 +15451,7 @@ begin
     antGfxWindow: ProcessGfxWindow(Node);
     antGfxView: ProcessGfxView(Node);
     antGfxScreen: ProcessGfxScreen(Node);
+    antGfxSetmouse: ProcessGfxSetmouse(Node);
     antGfxNop: ;  // SCREENLOCK/UNLOCK/SYNC/WINDOWTITLE/VIEW PRINT: accept-and-ignore (no code emitted)
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);

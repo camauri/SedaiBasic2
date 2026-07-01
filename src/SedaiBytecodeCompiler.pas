@@ -394,6 +394,9 @@ begin
     ssaGfxView: Result := bcGfxView;
     ssaGfxScreen: Result := bcGfxScreen;
     ssaMultikey: Result := bcMultikey;
+    ssaGetmouse: Result := bcGetmouse;
+    ssaMouseAxis: Result := bcMouseAxis;
+    ssaSetmouse: Result := bcSetmouse;
     ssaGfxPMap: Result := bcGfxPMap;
     ssaGraphicPos: Result := bcGraphicPos;
     ssaGraphicRclr: Result := bcGraphicRclr;
@@ -1348,6 +1351,23 @@ begin
       BCInstr.Immediate := BCInstr.Immediate or
         ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
           Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF) shl 16);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // FreeBASIC SETMOUSE x,y,visibility: Src1=x, Src2=y; Immediate packs visibility (from Src3, bits 0-15).
+  if Instr.OpCode = ssaSetmouse then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcSetmouse, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    BCInstr.Immediate := 0;
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Immediate := Int64(MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version)) and $FFFF
+    else if Instr.Src3.Kind = svkConstInt then
+      BCInstr.Immediate := Int64(Instr.Src3.ConstInt) and $FFFF;
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;

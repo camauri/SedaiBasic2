@@ -255,6 +255,9 @@ type
     ssaGfxView,        // VIEW [SCREEN] (x1,y1)-(x2,y2) : set/clear the viewport (offset + clip)
     ssaGfxScreen,      // SCREEN mode[,,num_pages] : set a numbered graphics mode (Src1=mode, Immediate=pages)
     ssaMultikey,       // MULTIKEY(scancode) -> -1 if the key is held, 0 otherwise (Dest=result, Src1=scancode)
+    ssaGetmouse,       // GETMOUSE snapshot: query the mouse into the VM cache (Dest=status 0/1); reads via ssaMouseAxis
+    ssaMouseAxis,      // __MOUSEAXIS(which) -> cached mouse component (Dest=result, Immediate=which: 0=x,1=y,2=wheel,3=buttons,4=clip)
+    ssaSetmouse,       // SETMOUSE x,y,visibility : move/show the mouse (Src1=x, Src2=y, Immediate=visibility reg)
     ssaGraphicPos,     // POS(x): Return cursor column position
     ssaGraphicRclr,    // RCLR(n): Return color of source n
     ssaGraphicRwindow, // RWINDOW(n): Return window size info

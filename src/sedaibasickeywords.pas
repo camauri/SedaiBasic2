@@ -434,6 +434,8 @@ const
   kFLIP         = 'FLIP';          // FreeBASIC: swap (or set) visible/work pages
   kPMAP         = 'PMAP';          // FreeBASIC: map between logical (WINDOW) and physical coordinates
   kMULTIKEY     = 'MULTIKEY';      // FreeBASIC: real-time key-down state, MULTIKEY(scancode)
+  kGETMOUSE     = 'GETMOUSE';      // FreeBASIC: read mouse state, GETMOUSE(x,y[,wheel][,buttons][,clip])
+  kSETMOUSE     = 'SETMOUSE';      // FreeBASIC: set mouse position/visibility, SETMOUSE [x][,y][,vis][,clip]
   kVIEW         = 'VIEW';          // FreeBASIC: set the graphics viewport (offset + clip); VIEW PRINT = text
   kSCREENGFX    = 'SCREEN';        // FreeBASIC: set a numbered graphics mode (SCREEN n)
   kDRAW    = 'DRAW';
