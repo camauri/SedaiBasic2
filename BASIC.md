@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 490 / 643 implemented (76%)** (+ 1 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 491 / 643 implemented (76%)** (+ 1 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **490 (86%)** are implemented. See the
+**572 applicable** keywords, **491 (86%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -2288,7 +2288,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `FRE` | ✓ | Gets the amount of free memory (in bytes) available. |
-| `COMMAND` | ✗ | Gets the command-line parameters passed to the program. |
+| `COMMAND` | ✓ | `COMMAND$([index])` returns command-line arguments: bare / `-1` = all program args (space-separated), `0` = executable name, `n` = the n-th argument (`""` if out of range). On `sb`, arguments are the non-flag tokens after the script file (`sb prog.bas arg1 arg2`); sb's own flags are still recognised anywhere. |
 | `ENVIRON` | ✓ | `ENVIRON$(name)` -> the value of an environment variable ("" if unset). |
 | `ISREDIRECTED` | ✗ | Checks whether stdin or stdout is redirected to a file or not. |
 | `SETENVIRON` | ✗ | Sets the value of an environment variable. |

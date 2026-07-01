@@ -338,6 +338,7 @@ const
   kCURDIR  = 'CURDIR';   kCURDIRS  = 'CURDIR$';   // FreeBASIC: current working directory
   kENVIRON = 'ENVIRON';  kENVIRONS = 'ENVIRON$';  // FreeBASIC: ENVIRON$(name) -> env var value
   kEXEPATH = 'EXEPATH';                            // FreeBASIC: directory of the running program
+  kCOMMAND = 'COMMAND';  kCOMMANDS = 'COMMAND$';   // FreeBASIC: COMMAND$([index]) -> command-line argument(s)
   // FreeBASIC graphics (phase 1 slice — routed through the IGraphicsBackend abstraction)
   kSCREENRES = 'SCREENRES';   // SCREENRES w, h : set the graphics screen resolution
   kPSET      = 'PSET';        // PSET (x, y) [, color] : set a pixel

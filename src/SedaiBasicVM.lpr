@@ -445,6 +445,7 @@ begin
   {$ENDIF}
   WriteLn('Examples:');
   WriteLn('  sb program.bas              Run program (output only)');
+  WriteLn('  sb program.bas arg1 arg2    Run, passing arg1/arg2 to the program (COMMAND$)');
   WriteLn('  sb program.bas --verbose    Run with verbose output');
   WriteLn('  sb program.bas --stats      Run with execution statistics');
   WriteLn('  sb program.bas --disasm     Show disassembly and run');
@@ -461,6 +462,7 @@ end;
 var
   OptWindow: Boolean = False;   // sb --window: mirror the software framebuffer into an SDL2 window
   GTermCtrl: TTerminalController = nil;   // concrete terminal output device (for graphics attach under --window)
+  GProgramArgs: array of string;   // COMMAND$: everything on the command line after the script file
 {$IFDEF WITH_WINDOW}
 var
   GPresenter: TWindowPresenter = nil;
@@ -1577,6 +1579,7 @@ begin
     try
       VM.SetOutputDevice(Output);
       SetupVMGraphics(VM);  // headless SW backend by default; SDL2 window when `sb --window` (WITH_WINDOW)
+      VM.SetProgramArgs(GProgramArgs);  // COMMAND$: command-line args after the script
       VM.SetInputDevice(Input);
       VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
       VM.LoadProgram(BytecodeProgram);
@@ -1826,6 +1829,7 @@ begin
       try
         VM.SetOutputDevice(Output);
         SetupVMGraphics(VM);  // headless SW backend by default; SDL2 window when `sb --window` (WITH_WINDOW)
+        VM.SetProgramArgs(GProgramArgs);  // COMMAND$: command-line args after the script
         VM.SetInputDevice(Input);
         VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
         VM.LoadProgram(BytecodeProgram);
@@ -2015,7 +2019,14 @@ begin
         end;
       end
       else if (Pos('--', Param) <> 1) and (TestFile = '') then
-        TestFile := ParamStr(i);  // Use original case for filename
+        TestFile := ParamStr(i)   // first non-flag argument = the script/bytecode file
+      else if (Pos('--', Param) <> 1) then
+      begin
+        // Non-flag arguments after the script are program arguments (for COMMAND$). Known sb flags are
+        // still recognised anywhere (see above); flag-looking tokens are not forwarded to the program.
+        SetLength(GProgramArgs, Length(GProgramArgs) + 1);
+        GProgramArgs[High(GProgramArgs)] := ParamStr(i);
+      end;
     end;
 
     // Show help if requested or no file provided

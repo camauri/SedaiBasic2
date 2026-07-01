@@ -181,6 +181,7 @@ begin
     ssaCurDir: Result := bcCurDir;
     ssaEnviron: Result := bcEnviron;
     ssaExePath: Result := bcExePath;
+    ssaCommand: Result := bcCommand;
     ssaStrFormat: Result := bcStrFormat;
     ssaFileLen: Result := bcFileLen;
     ssaStrMkInt: Result := bcStrMkInt;

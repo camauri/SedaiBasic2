@@ -366,7 +366,7 @@ begin
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrChr, bcStrWChr,
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING codepoint substrings - string dest
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrSpace,  // B1.2: string dest
-    bcCurDir, bcEnviron, bcExePath,  // CURDIR$ / ENVIRON$(name) / EXEPATH - string dest
+    bcCurDir, bcEnviron, bcExePath, bcCommand,  // CURDIR$ / ENVIRON$(name) / EXEPATH / COMMAND$(index) - string dest
     bcStrFormat,  // FORMAT(num, mask) - string dest
     bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - string dest
     bcStrTrimSet, // LTRIM/RTRIM/TRIM(s,set) - string dest
@@ -454,6 +454,7 @@ begin
     bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin, bcStrWChr,
     bcStrMkInt,  // MKI/MKL/MKSHORT/MKLONGINT(n) - Src1 = int value to pack (B3)
     bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - Src1 = count (int)
+    bcCommand,  // COMMAND$(index) - Src1 = index (int)
     // === GROUP 5: Memory operations ===
     bcPeek,           // PEEK(address): Src1 = address (int)
     bcPoke,           // POKE address, value: Src1 = address (int)

@@ -163,6 +163,7 @@ type
     // here; bcJoyBtn reads the button bitmask, bcJoyAxis(which) reads axis `which` (0..7).
     FJoyButtons: Integer;
     FJoyAxes: array[0..7] of Single;
+    FProgramArgs: array of string;   // COMMAND$: arguments passed to the BASIC program (arg 1, 2, ...)
     FInputDevice: IInputDevice;
     FMemoryMapper: IMemoryMapper;  // Memory-mapped PEEK/POKE support
     FConsoleBehavior: TConsoleBehavior;
@@ -303,6 +304,7 @@ type
     function StrSAdd(const S: string): Int64;   // SADD(s) -> raw pointer to a NUL-terminated byte copy
     function FormatNumber(Value: Double; const Mask: string): string;  // FORMAT(num, mask) -> formatted string (numeric masks)
     function FormatDateMask(Value: Double; const Mask: string): string;  // FORMAT(serial, mask) -> date/time formatted string
+    function CommandLine(Index: Integer): string;  // COMMAND$(index) -> command-line argument(s)
     function FileLength(const Path: string): Int64;   // FILELEN(path) -> file size in bytes (0 if absent)
     procedure RawFree(RawPtr: Int64);
     function RawRealloc(RawPtr: Int64; ByteCount: PtrUInt): Int64;
@@ -341,6 +343,9 @@ type
     procedure SetGraphicsBackend(Backend: IGraphicsBackend; OwnedObj: TObject = nil);
     procedure UseSoftwareGraphics;  // attach a VM-owned headless software graphics backend (CLI / bare-metal)
     procedure SetInputDevice(Device: IInputDevice);
+    // Command-line arguments passed to the BASIC program (for COMMAND$): Args are the arguments only
+    // (arg 1, 2, ...), excluding the interpreter/script name. Empty by default.
+    procedure SetProgramArgs(const Args: array of string);
     procedure SetMemoryMapper(Mapper: IMemoryMapper);
     procedure SetSpriteManager(Manager: ISpriteManager);
     procedure SetConsoleBehavior(ABehavior: TConsoleBehavior; OwnsBehavior: Boolean = False);
@@ -2825,6 +2830,13 @@ begin
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
         end;
 
+        // COMMAND$(index): string Dest, int Src1 (index).
+        bcCommand:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
+
         // MONTHNAME/WEEKDAYNAME: string Dest, int Src1.
         bcDateName:
         begin
@@ -3430,6 +3442,37 @@ end;
 procedure TBytecodeVM.SetInputDevice(Device: IInputDevice);
 begin
   FInputDevice := Device;
+end;
+
+procedure TBytecodeVM.SetProgramArgs(const Args: array of string);
+var
+  i: Integer;
+begin
+  SetLength(FProgramArgs, Length(Args));
+  for i := 0 to High(Args) do
+    FProgramArgs[i] := Args[i];
+end;
+
+function TBytecodeVM.CommandLine(Index: Integer): string;
+// COMMAND$(index): index < 0 -> the whole command line (program args, space-separated); 0 -> the
+// executable name; n >= 1 -> the n-th program argument ('' if out of range). FProgramArgs holds the
+// arguments only (arg 1 at FProgramArgs[0]); the interpreter/script name is excluded.
+var
+  i: Integer;
+begin
+  if Index < 0 then
+  begin
+    Result := '';
+    for i := 0 to High(FProgramArgs) do
+      if i = 0 then Result := FProgramArgs[i]
+      else Result := Result + ' ' + FProgramArgs[i];
+  end
+  else if Index = 0 then
+    Result := ParamStr(0)
+  else if Index <= Length(FProgramArgs) then
+    Result := FProgramArgs[Index - 1]
+  else
+    Result := '';
 end;
 
 procedure TBytecodeVM.SetMemoryMapper(Mapper: IMemoryMapper);
@@ -4952,6 +4995,8 @@ begin
       Ctx.StringRegs[Instr.Dest] := ExtractFileDir(ParamStr(0));
     45: // bcStrFormat - FORMAT(num, mask): formatted number string. Value is in the Immediate float reg.
       Ctx.StringRegs[Instr.Dest] := FormatNumber(Ctx.FloatRegs[Instr.Immediate], Ctx.StringRegs[Instr.Src1]);
+    46: // bcCommand - COMMAND$(index): command-line argument(s) passed to the BASIC program.
+      Ctx.StringRegs[Instr.Dest] := CommandLine(Ctx.IntRegs[Instr.Src1]);
     36: // bcStrMkInt - MKI/MKL/MKSHORT/MKLONGINT: binary copy of an integer into a string.
       begin
         // Immediate = byte width (2/4/8). Write the low `width` bytes, little-endian (two's complement).

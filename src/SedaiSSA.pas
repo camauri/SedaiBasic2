@@ -1235,6 +1235,15 @@ begin
         EmitInstruction(ssaExePath, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         Exit;
       end;
+      // FreeBASIC COMMAND$ / COMMAND used bare = COMMAND$(-1): the whole command line (space-separated args).
+      if FModernMode and ((UpperCase(VarName) = kCOMMAND) or (UpperCase(VarName) = kCOMMANDS)) then
+      begin
+        ArgReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaCommand, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Exit;
+      end;
       // BYREF-return address param: the register holds the caller variable's address — reading the
       // parameter dereferences it (load the pointee through the address).
       if IsAddrParam(VarName) then
@@ -3734,6 +3743,26 @@ begin
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
           EmitInstruction(ssaEnviron, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC COMMAND$(index) / COMMAND(index): the index-th command-line argument (index<0 = whole
+        // command line, 0 = executable name, n>=1 = n-th arg, '' if out of range). Empty parens = -1.
+        if FModernMode and ((UpperCase(ArrName) = kCOMMAND) or (UpperCase(ArrName) = kCOMMANDS)) and
+           (FProgram.FindArray(ArrName) < 0) then
+        begin
+          if Node.GetChild(1).ChildCount >= 1 then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ArgReg := EnsureIntRegister(ArgValue);
+          end
+          else
+          begin
+            ArgReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+          Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+          EmitInstruction(ssaCommand, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
         end;
 
