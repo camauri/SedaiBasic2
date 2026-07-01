@@ -1757,6 +1757,7 @@ end;
 function TLexerFSM.NextToken: TLexerToken;
 var
   CurrentChar: Char;
+  HashStem: string;   // identifier text before a '#' (to disambiguate PRINT#/GET# vs DOPEN#1 vs A#)
   {$IFDEF DEBUG}
   StartTime: TDateTime;
   {$ENDIF}
@@ -2184,7 +2185,9 @@ begin
           TokenBufferAdd(CurrentChar);
           AdvanceChar;
 
-          // Fast identifier loop - NO FSM
+          // Fast identifier loop - NO FSM. '#' is handled separately below: it is ambiguous between the
+          // double-precision suffix (A#), the PRINT#/INPUT#/GET# keywords, and a Commodore file-handle
+          // prefix (DOPEN#1), so gluing it unconditionally (and swallowing the following digits) is wrong.
           CurrentChar := GetCurrentChar;
           while ((CurrentChar >= 'A') and (CurrentChar <= 'Z')) or
                 ((CurrentChar >= 'a') and (CurrentChar <= 'z')) or
@@ -2192,12 +2195,28 @@ begin
                 (CurrentChar = '_') or
                 (CurrentChar = '$') or   // String
                 (CurrentChar = '%') or   // Integer (16 bit)
-                (CurrentChar = '#') or   // Double precision (64 bit)
                 (CurrentChar = '!') do   // Single precision (32 bit)
           begin
             TokenBufferAdd(CurrentChar);
             AdvanceChar;
             CurrentChar := GetCurrentChar;
+          end;
+
+          // '#' disambiguation (Commodore-friendly):
+          //   PRINT# / INPUT# / GET#      -> '#' is part of the keyword: glue it, then stop.
+          //   <name>#<digit>  (DOPEN#1)   -> '#' begins a file-handle number: stop BEFORE '#' so it lexes
+          //                                  as a separate file-handle-prefix token (like the spaced form).
+          //   <name>#<other>  (A#)        -> '#' is the double-precision type suffix: glue it, then stop.
+          if CurrentChar = '#' then
+          begin
+            HashStem := UpperCase(TokenBufferAsString);
+            if (HashStem = 'PRINT') or (HashStem = 'INPUT') or (HashStem = 'GET') or
+               not ((PeekChar(1) >= '0') and (PeekChar(1) <= '9')) then
+            begin
+              TokenBufferAdd('#');
+              AdvanceChar;
+            end;
+            // else: '#' + digit and not a #-keyword -> leave '#' for the file-handle-prefix token.
           end;
 
           Result := ProcessIdentifier;
