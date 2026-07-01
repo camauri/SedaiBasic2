@@ -7528,6 +7528,9 @@ begin
         HandleName := '';
 
         FIOStatus := 0;   // ST (Commodore): a fresh file open clears the I/O status (no EOF yet)
+        // Commodore OPEN to a device/command channel (no filename, e.g. OPEN 1,8,15) is a no-op here:
+        // there is no drive to command, so opening nothing must not raise.
+        if Filename = '' then Exit;
         if Assigned(FOnDiskFile) then
         begin
           FOnDiskFile(Self, 'DOPEN', HandleNum, HandleName, Filename, Mode, ErrorCode);

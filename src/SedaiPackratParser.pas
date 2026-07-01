@@ -4398,6 +4398,9 @@ var
   Token: TLexerToken;
   Param, HandleNode: TASTNode;
   CmdName, ModeStr, MW: string;
+  C64Name, C64Rest, C64Base: string;   // C64 OPEN lf,dev,sa,"name[,type][,mode]" decoding
+  C64Dev, C64Sa, C64FileName: TASTNode;
+  C64CommaPos: Integer;
 begin
   Token := Context.CurrentToken;
   CmdName := UpperCase(Token.Value);
@@ -4428,8 +4431,62 @@ begin
   if ((CmdName = 'DOPEN') or (CmdName = 'OPEN')) and
      not (Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#')) then
   begin
-    Param := ParseExpression;     // filename
+    Param := ParseExpression;     // FB filename OR C64 logical file number
     if not Assigned(Param) then begin HandleError('Expected filename after OPEN', Token); Exit; end;
+
+    // Commodore OPEN lf, dev [, sa [, "name[,type][,mode]"]] : the first arg is the logical file number
+    // and a COMMA follows (the FreeBASIC form uses FOR/AS, never a comma here). Map it to the same
+    // antDopen node (handle, filename, mode$). Device/secondary-address are parsed but not emulated (v1);
+    // the read/write/append mode is taken from the filename's trailing ,W/,R/,A (a leading drive "N:" is
+    // stripped). With no filename (e.g. OPEN 1,8,15 command channel) the open is a harmless no-op.
+    if (CmdName = 'OPEN') and Context.Check(ttSeparParam) then
+    begin
+      HandleNode := Param;                       // logical file number = handle
+      Context.Advance;                           // ','
+      C64Dev := ParseExpression; if Assigned(C64Dev) then C64Dev.Free;   // device (8=disk...) - v1 ignore
+      C64FileName := nil;
+      if Context.Check(ttSeparParam) then
+      begin
+        Context.Advance;                         // ',' before secondary address (or, rarely, the name)
+        if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+        begin
+          C64Sa := ParseExpression; if Assigned(C64Sa) then C64Sa.Free;  // secondary address - v1 ignore
+        end;
+        if Context.Check(ttSeparParam) then
+        begin
+          Context.Advance;                       // ',' before filename
+          C64FileName := ParseExpression;        // "name[,type][,mode]"
+        end;
+      end;
+      ModeStr := 'R';
+      if Assigned(C64FileName) and (C64FileName.NodeType = antLiteral) and VarIsStr(C64FileName.Value) then
+      begin
+        C64Name := VarToStr(C64FileName.Value);
+        C64CommaPos := Pos(',', C64Name);
+        if C64CommaPos > 0 then
+        begin
+          C64Base := Copy(C64Name, 1, C64CommaPos - 1);
+          C64Rest := UpperCase(Copy(C64Name, C64CommaPos + 1, MaxInt));   // "S,W" / "W" / "S,R" ...
+          if (C64Rest = 'W') or (Pos(',W', C64Rest) > 0) then ModeStr := 'W'
+          else if (C64Rest = 'A') or (Pos(',A', C64Rest) > 0) then ModeStr := 'A'
+          else if (C64Rest = 'R') or (Pos(',R', C64Rest) > 0) then ModeStr := 'R';
+          C64Name := C64Base;
+        end;
+        // Strip a leading Commodore drive prefix "N:" (e.g. "0:file" -> "file").
+        if (Length(C64Name) >= 2) and (C64Name[1] in ['0'..'9']) and (C64Name[2] = ':') then
+          C64Name := Copy(C64Name, 3, MaxInt);
+        C64FileName.Value := C64Name;
+      end;
+      Result.AddChild(HandleNode);                                       // child 0 = handle
+      if Assigned(C64FileName) then
+        Result.AddChild(C64FileName)                                     // child 1 = filename
+      else
+        Result.AddChild(TASTNode.CreateWithValue(antLiteral, '', Token));  // no name -> empty (no-op open)
+      Result.AddChild(TASTNode.CreateWithValue(antLiteral, ModeStr, Token));  // child 2 = mode$
+      DoNodeCreated(Result);
+      Exit;
+    end;
+
     ModeStr := 'R';
     if UpperCase(Context.CurrentToken.Value) = kFOR then
     begin
