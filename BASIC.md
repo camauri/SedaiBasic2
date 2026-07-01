@@ -2,16 +2,16 @@
 
 ## Implementation Progress
 
-**Commodore BASIC v7 core — 191 / 209 commands implemented (91%)**
+**Commodore BASIC v7 core — 193 / 209 commands implemented (92%)**
 
 ```
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 491 / 643 implemented (76%)** (+ 1 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 495 / 643 implemented (77%)** (+ 1 partial). **71** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **491 (86%)** are implemented. See the
+**572 applicable** keywords, **495 (87%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -82,7 +82,7 @@ Legend: ✓ = Implemented | ◐ = Partial | ✗ = Not implemented
 | `SLEEP` | ✓ | Delay program for n seconds (0 < n < 65536, interruptible with CTRL+C) |
 | `SLOW` | ✓ | Set slow speed clock (hides black overlay) |
 | `STOP` | ✓ | Halt program execution (can resume with CONT) |
-| `WAIT` | ✗ | Pause until condition satisfied |
+| `WAIT` | ✓ | `WAIT addr, mask [,xor]` — no-op on a portable VM (the awaited hardware bit would never change, so the arguments are parsed and discarded). |
 
 ## Flow Control - Loops (8/8 - 100%)
 
@@ -264,7 +264,7 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `SWAP` | ~ | (v7) Swap host/expansion RAM — NOT implemented. In MODERN, `SWAP a, b` exchanges two lvalues (FreeBASIC) ✓ |
 | `FRE` | ✓ | Return RAM bytes free (FRE(0)) |
 | `PEEK` | ✓ | Return content of memory-mapped location |
-| `POINTER` | ✗ | Return the address of a variable name |
+| `POINTER` | ✓ | `POINTER(v)` = the address of a variable (identical to `VARPTR(v)` / `@v`). |
 
 ## Graphics Management (24/24 - 100%)
 
@@ -2075,9 +2075,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `PRINT` | ✓ |  |
-| `? (Shortcut for 'PRINT')` | ✗ | Writes text to the console. |
+| `? (Shortcut for 'PRINT')` | ✓ | `?` is a shorthand for `PRINT`. |
 | `PRINT USING` | ✓ |  |
-| `? USING (Shortcut for 'PRINT USING')` | ✗ | Writes formatted text to the console. |
+| `? USING (Shortcut for 'PRINT USING')` | ✓ | `? USING mask; expr` is a shorthand for `PRINT USING`. |
 | `WRITE` | ✓ | `WRITE #n, ...` quoted-CSV file output and console `WRITE v1, v2` (strings double-quoted, comma-separated). |
 | `SPC` | ✓ | Skips a number of spaces when writing text. |
 | `TAB` | ✓ | Skips to a certain column when writing text. |
@@ -2155,11 +2155,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `CLOSE` | ✓ | Unbinds a file number from a file or device. |
 | `RESET` | ✓ | Unbinds all active file numbers (closes every open handle; alias of DCLEAR). |
 | `INPUT (File Mode)` | ✓ | Text data can be read from the file. |
-| `OUTPUT` | ✗ | Text data can be written to the file. |
+| `OUTPUT` | ✓ | `OPEN "f" FOR OUTPUT AS #n` opens the file for writing (truncating). |
 | `APPEND` | ✓ | Text data is added to the end of a file when output. |
 | `BINARY` | ✗ | Arbitrary data can be read from or written to the file. |
 | `RANDOM` | ✗ | Blocks of data of certain size can be read from and written to the file. |
-| `ACCESS` | ✗ | An overview of file access privileges. |
+| `ACCESS` | ✓ | `OPEN ... ACCESS {READ\|WRITE\|READ WRITE} ...` — parsed and accepted (the VM does not enforce share/access rights). |
 | `READ (File Access)` | ✓ | Binary data can only be read from the file. |
 | `WRITE (File Access)` | ✗ | Binary data can only be written to the file. |
 | `READ WRITE(File Access)` | ✓ | Binary data can be read from and written to the file. |

@@ -172,6 +172,7 @@ const
   kBOOT    = 'BOOT';
   kCATALOG = 'CATALOG';
   kOPEN    = 'OPEN';
+  kACCESS  = 'ACCESS';   // FreeBASIC OPEN ... ACCESS {READ|WRITE|READ WRITE}: access-rights clause (accepted/ignored)
   kCLOSE   = 'CLOSE';
   kEOF     = 'EOF';       // FreeBASIC: EOF(#n) -> -1 at end of file
   kFREEFILE = 'FREEFILE'; // FreeBASIC: next free file number (1..15, 0 if none)

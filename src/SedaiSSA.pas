@@ -3830,7 +3830,9 @@ begin
         // "@arg" in our model — synthesize an antProcAddress for the argument and process it (the @
         // lowering handles a scalar / array element / UDT field|handle / SHARED global / SUB entry PC).
         // MODERN, not a declared array.
-        if FModernMode and ((UpperCase(ArrName) = kVARPTR) or (UpperCase(ArrName) = kPROCPTR)) and
+        // POINTER(v) is the Commodore spelling of VARPTR(v) — the address of a variable.
+        if FModernMode and ((UpperCase(ArrName) = kVARPTR) or (UpperCase(ArrName) = kPROCPTR) or
+                            (UpperCase(ArrName) = kPOINTER)) and
            (FProgram.FindArray(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
         begin
           ArgNode := Node.GetChild(1).GetChild(0);   // the variable / procedure operand

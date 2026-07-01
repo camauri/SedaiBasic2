@@ -3326,22 +3326,21 @@ begin
 end;
 
 function TPackratParser.ParseWaitStatement: TASTNode;
+// Commodore WAIT addr, mask [, xor]: pause until (PEEK(addr) XOR xor) AND mask <> 0. A portable VM has no
+// such hardware — the location would never change, so a real wait would hang. WAIT is therefore a no-op:
+// the arguments are parsed and discarded, and an empty statement (no code) is emitted.
 var
   Token: TLexerToken;
-  Condition: TASTNode;
+  Args: TASTNode;
 begin
   Token := Context.CurrentToken;
-  Result := TASTNode.Create(antStatement, Token);
+  Result := TASTNode.Create(antStatement, Token);   // empty -> no code emitted
   Context.Advance; // Consume WAIT
-
-  // Parse condition
   if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
   begin
-    Condition := ParseExpression;
-    if Assigned(Condition) then
-      Result.AddChild(Condition);
+    Args := ParseExpressionList(ttSeparParam);       // addr, mask [, xor] — consumed and discarded
+    if Assigned(Args) then Args.Free;
   end;
-
   DoNodeCreated(Result);
 end;
 
@@ -4500,6 +4499,14 @@ begin
       else if MW = kRANDOM then ModeStr := 'B'
       else HandleError('Expected INPUT/OUTPUT/APPEND/BINARY/RANDOM after FOR', Token);
       Context.Advance;            // mode word
+    end;
+    // Optional "ACCESS {READ | WRITE | READ WRITE}" clause (FreeBASIC): accepted and ignored — the VM's
+    // file model does not enforce share/access rights.
+    if UpperCase(Context.CurrentToken.Value) = kACCESS then
+    begin
+      Context.Advance;            // ACCESS
+      if UpperCase(Context.CurrentToken.Value) = kREAD then Context.Advance;
+      if UpperCase(Context.CurrentToken.Value) = kWRITE then Context.Advance;
     end;
     if (UpperCase(Context.CurrentToken.Value) = kAS) or Context.Check(ttAsType) then
       Context.Advance;            // AS

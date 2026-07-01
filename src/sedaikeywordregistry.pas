@@ -1821,7 +1821,9 @@ begin
  // functions
  RegisterKeyword(kFRE,     ttMemoryFunction, 'Return RAM bytes free',                      kcMemoryHandling);
  RegisterKeyword(kPEEK,    ttMemoryFunction, 'Return content of specific RAM location',    kcMemoryHandling);
- RegisterKeyword(kPOINTER, ttMemoryFunction, 'Return the address of a variable name',      kcMemoryHandling);
+ // POINTER is NOT registered: like VARPTR it stays a bare name and is intercepted in SedaiSSA as the
+ // address-of a variable (POINTER(v) == VARPTR(v) == @v). Registering it would route it to the generic
+ // memory-function path (which returns 0).
 
  {$IFNDEF WEB_MODE}
  // === GRAPHICS HANDLING (COMMANDS AND FUNCTION) ===
