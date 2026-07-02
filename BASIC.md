@@ -2264,7 +2264,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `FILEATTR` | ✗ | Gets information about a file bound to a file number. |
+| `FILEATTR` | ✓ | `FILEATTR(filenum[,returntype])` -> info about an open file number: returntype 1 (default) = File Mode (Input=1/Output=2/Random=4/Append=8/Binary=32), 2 = OS handle, 3 = Encoding (0=ASCII). |
 | `FILECOPY` | ✓ | Copies a file (`FILECOPY src, dst`). |
 | `FILEDATETIME` | ✓ | `FILEDATETIME(path)` -> the file's last-modified timestamp as a Date Serial (Double), or 0 if absent; cross-platform. |
 | `FILEEXISTS` | ✓ | `FILEEXISTS(path)` returns -1 if the file exists, else 0 (cross-platform). |

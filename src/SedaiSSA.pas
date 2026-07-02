@@ -4061,6 +4061,29 @@ begin
           Exit;
         end;
 
+        // FreeBASIC FILEATTR(filenum [, returntype]): info about an open file number (returntype 1=File
+        // Mode [default], 2=OS Handle, 3=Encoding). Src1=handle, Src2=returntype (default 1). MODERN,
+        // parsed as array access (not a reserved keyword), not a declared array.
+        if FModernMode and (UpperCase(ArrName) = kFILEATTR) and (FProgram.FindArray(ArrName) < 0) and
+           (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ArgReg := EnsureIntRegister(ArgValue);
+          if Node.GetChild(1).ChildCount >= 2 then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(1), MaskValue);
+            MaskReg := EnsureIntRegister(MaskValue);
+          end
+          else
+          begin
+            MaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, MaskReg, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaFileAttr, Result, ArgReg, MaskReg, MakeSSAValue(svkNone));
+          Exit;
+        end;
+
         // FreeBASIC RAW pointer indexing: "p[i]" where p is an Allocate'd raw pointer. The byte address
         // is p + i*SizeOf(pointee); load SizeOf(pointee) bytes from the raw heap with the pointee's type.
         if (FProgram.FindArray(ArrName) < 0) and IsRawPtr(ArrName) and

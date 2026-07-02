@@ -340,6 +340,7 @@ type
     ssaRecord,         // RECORD #handle, position: Seek to position in file
     ssaPrintFileNewLine, // PRINT# newline: Write CR to file (handle in Src1)
     ssaFileQuery,      // EOF/FREEFILE/LOF/LOC/SEEK(n) -> int (Src1=handle, Src3=query code immediate)
+    ssaFileAttr,       // FILEATTR(filenum, returntype) -> int (Src1=handle, Src2=returntype)
     ssaSeekSet,        // SEEK #n, pos statement (Src1=handle, Src2=position)
     ssaInputFileLine,  // LINE INPUT# file, string var: read a whole line (Dest=string var, Src1=handle)
     ssaPutBinInt, ssaPutBinFloat,    // PUT #n: write 8 bytes of an int/double (Src1=handle, Src2=value)

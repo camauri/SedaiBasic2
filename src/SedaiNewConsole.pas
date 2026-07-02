@@ -9550,8 +9550,40 @@ var
   BytesRead: Integer;
   Ch: Byte;
   Line: string;
+  M: string;
+  RetType, V: Integer;
 begin
   ErrorCode := 0;
+
+  // FILEATTR(filenum, returntype): info about an open file number (returntype in Data, result back in
+  // Data). 1 = File Mode (Input1/Output2/Random4/Append8/Binary32), 2 = OS handle, 3 = Encoding (ASCII).
+  // Handled before the range check so an invalid/closed handle yields 0 rather than a fatal error.
+  if Command = 'FILEATTR' then
+  begin
+    RetType := StrToIntDef(Data, 1);
+    Data := '0';
+    if (Handle >= 1) and (Handle <= 15) and Assigned(FFileHandles[Handle]) then
+      case RetType of
+        2: Data := IntToStr(PtrInt(FFileHandles[Handle].Handle));  // OS file handle
+        3: Data := '0';   // Encoding: ASCII
+      else
+        begin
+          M := UpperCase(FFileModes[Handle]);
+          V := 0;
+          if (Length(M) >= 1) and (M[1] = 'L') then
+            V := 4                                    // relative file = Random
+          else
+          begin
+            if Pos('R', M) > 0 then V := V or 1;      // Input
+            if Pos('W', M) > 0 then V := V or 2;      // Output
+            if Pos('A', M) > 0 then V := V or 8;      // Append
+            if Pos('B', M) > 0 then V := V or 32;     // Binary
+          end;
+          Data := IntToStr(V);
+        end;
+      end;
+    Exit;
+  end;
 
   // Validate handle range
   if (Handle < 1) or (Handle > 15) then

@@ -471,6 +471,7 @@ begin
     ssaPrintFileNewLine: Result := bcPrintFileNewLine;
     ssaCmd: Result := bcCmd;
     ssaFileQuery: Result := bcFileQuery;
+    ssaFileAttr: Result := bcFileAttr;
     ssaSeekSet: Result := bcSeekSet;
     ssaInputFileLine: Result := bcInputFileLine;
     ssaPutBinInt: Result := bcPutBinInt;

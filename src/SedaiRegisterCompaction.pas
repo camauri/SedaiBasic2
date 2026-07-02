@@ -237,6 +237,7 @@ begin
     // === GROUP 6: File I/O operations ===
     bcInputFileInt,  // INPUT# file, int var
     bcFileQuery,     // EOF/FREEFILE/LOF/LOC/SEEK -> int result
+    bcFileAttr,      // FILEATTR(filenum, returntype) -> int result
     bcGetBinInt,     // GET #n binary -> int Dest
     bcArrayIdxResolve,  // runtime multi-dim index -> int Dest (linear index)
     // === GROUP 5: Special variables ===
@@ -516,7 +517,7 @@ begin
     bcGetFile, bcInputFile, bcPrintFile,     // Src1 = handle (int)
     bcInputFileFloat, bcInputFileInt,        // Src1 = handle (int)
     bcPrintFileFloat, bcPrintFileInt,        // Src1 = handle (int)
-    bcFileQuery, bcSeekSet, bcInputFileLine, // Src1 = handle (int)
+    bcFileQuery, bcFileAttr, bcSeekSet, bcInputFileLine, // Src1 = handle (int)
     bcGetBinInt, bcGetBinFloat, bcPutBinInt, bcPutBinFloat,  // Src1 = handle (int)
     bcGetBinStr, bcPutBinStr,                                // Src1 = handle (int)
     bcArrayRedimPush,                        // REDIM multi-dim: Src1 = upper bound (int)
@@ -604,6 +605,7 @@ begin
     bcPoke,           // POKE address, value: Src2 = value (int)
     // === GROUP 6: File I/O ===
     bcSeekSet,        // SEEK #n, pos: Src2 = position (int)
+    bcFileAttr,       // FILEATTR(filenum, returntype): Src2 = returntype (int)
     bcPutBinInt,      // PUT #n: Src2 = int value
     // === GROUP 1: String operations with int second param ===
     bcStrLeft, bcStrRight,  // LEFT$/RIGHT$(str, len) - len is Src2 (int)

@@ -505,6 +505,7 @@ const
   bcGetBinFloat     = bcGroupFileIO + 22;   // GET #n: read 8 bytes into a double  (Dest=float value, Src1=handle)
   bcPutBinStr       = bcGroupFileIO + 23;   // PUT #n: write a string as [int32 length][bytes] (Src1=handle, Src2=string value)
   bcGetBinStr       = bcGroupFileIO + 24;   // GET #n: read a length-prefixed string (Dest=string value, Src1=handle)
+  bcFileAttr        = bcGroupFileIO + 25;   // FILEATTR(filenum, returntype) -> int info (Dest=int result, Src1=handle, Src2=returntype)
 
   // === GROUP 7: SPRITE OPERATIONS (0x07xx) ===
   // Sprite commands
@@ -1620,6 +1621,7 @@ begin
         11: Result := 'PrintFileNewLine';
         12: Result := 'PrintFileFloat';
         13: Result := 'PrintFileInt';
+        25: Result := 'FileAttr';
       else
         Result := Format('FileIO_%d', [SubOp]);
       end;

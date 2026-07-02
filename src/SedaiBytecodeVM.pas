@@ -7835,6 +7835,16 @@ begin
           FOnFileData(Self, 'SEEKSET', HandleNum, Data, ErrorCode);
       end;
 
+    25: // bcFileAttr - FILEATTR(filenum, returntype) -> int (non-fatal; Src1=handle, Src2=returntype).
+      begin           // The returntype is passed in via Data; the handler writes the result back to Data.
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        Data := IntToStr(Ctx.IntRegs[Instr.Src2]);
+        if Assigned(FOnFileData) then
+          FOnFileData(Self, 'FILEATTR', HandleNum, Data, ErrorCode);   // queries don't raise
+        if Instr.Dest >= 0 then
+          Ctx.IntRegs[Instr.Dest] := StrToIntDef(Trim(Data), 0);
+      end;
+
     18: // bcInputFileLine - LINE INPUT# file, string var: read a whole line (commas not split)
       begin
         HandleNum := Ctx.IntRegs[Instr.Src1];
