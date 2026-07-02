@@ -4928,6 +4928,62 @@ begin
   if Neg then Result := -Result;
 end;
 
+// Parse the leading floating-point number of a string, FreeBASIC VAL style: skip leading whitespace,
+// read the longest valid number ([sign] digits [. digits] [ (e|d) [sign] digits ]) and stop at the
+// first unsuitable character (so VAL("10abc")=10, VAL("10.5xy")=10.5). A "&H"/"&O"/"&B" base prefix is
+// parsed as an integer. Returns 0 when no number is present.
+function ParseLeadingFloat(const S: string): Double;
+var
+  I, J, K, Len, Code: Integer;
+  T: string;
+  HasDigit, HasDot: Boolean;
+begin
+  Result := 0.0;
+  Len := Length(S);
+  I := 1;
+  while (I <= Len) and (S[I] = ' ') do Inc(I);   // skip leading whitespace
+  // A base prefix (optionally signed) is an integer value; reuse ParseLeadingInt64.
+  J := I;
+  if (J <= Len) and ((S[J] = '+') or (S[J] = '-')) then Inc(J);
+  if (J <= Len) and (S[J] = '&') then
+  begin
+    Result := ParseLeadingInt64(Copy(S, I, Len - I + 1));
+    Exit;
+  end;
+  // [sign] digits [. digits]
+  J := I;
+  if (J <= Len) and ((S[J] = '+') or (S[J] = '-')) then Inc(J);
+  HasDigit := False;
+  HasDot := False;
+  while J <= Len do
+  begin
+    if (S[J] >= '0') and (S[J] <= '9') then begin HasDigit := True; Inc(J); end
+    else if (S[J] = '.') and (not HasDot) then begin HasDot := True; Inc(J); end
+    else Break;
+  end;
+  if not HasDigit then Exit;
+  // Optional exponent: (e|E|d|D) [sign] digits — only consumed if at least one exponent digit follows.
+  if (J <= Len) and (UpCase(S[J]) in ['E', 'D']) then
+  begin
+    K := J + 1;
+    if (K <= Len) and ((S[K] = '+') or (S[K] = '-')) then Inc(K);
+    if (K <= Len) and (S[K] >= '0') and (S[K] <= '9') then
+    begin
+      while (K <= Len) and (S[K] >= '0') and (S[K] <= '9') do Inc(K);
+      J := K;
+    end;
+  end;
+  T := Copy(S, I, J - I);
+  // A leading '.' (e.g. ".5" or "-.5") needs a '0' for Pascal's Val; and FB's 'D' exponent -> 'E'.
+  if (Length(T) >= 1) and (T[1] = '.') then T := '0' + T
+  else if (Length(T) >= 2) and ((T[1] = '+') or (T[1] = '-')) and (T[2] = '.') then
+    T := T[1] + '0' + Copy(T, 2, Length(T));
+  T := StringReplace(T, 'd', 'e', [rfReplaceAll]);
+  T := StringReplace(T, 'D', 'E', [rfReplaceAll]);
+  Val(T, Result, Code);
+  if Code <> 0 then Result := 0.0;
+end;
+
 // Render an Int64 in an arbitrary base (2..16) as an unsigned bit pattern, no
 // leading zeros - mirrors HEX$ semantics for OCT(n)/BIN(n) (FreeBASIC B1.3).
 function IntToBaseStr(Value: Int64; Base: Integer): string;
@@ -5296,11 +5352,9 @@ begin
       end;
     7: // bcStrStr - STR$(n)
       Ctx.StringRegs[Instr.Dest] := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]);
-    8: // bcStrVal - VAL(s)
+    8: // bcStrVal - VAL(s): leading floating-point number, FreeBASIC style (leading parse + &H/&O/&B).
       begin
-        S := Trim(Ctx.StringRegs[Instr.Src1]);
-        if not TryStrToFloat(S, Ctx.FloatRegs[Instr.Dest]) then
-          Ctx.FloatRegs[Instr.Dest] := 0.0;
+        Ctx.FloatRegs[Instr.Dest] := ParseLeadingFloat(Ctx.StringRegs[Instr.Src1]);
       end;
     9: // bcStrHex - HEX$(n) - full INT64 range, no leading zeros
       begin

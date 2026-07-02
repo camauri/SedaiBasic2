@@ -1419,7 +1419,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `STR and WSTR` | ✓ | Converts numeric expressions to their string representation (`STR$`/`WSTR`; `WSTR` yields a wide string). |
-| `VAL` | ✓ | Converts a numeric string expression to a floating-point value. |
+| `VAL` | ✓ | Converts a numeric string expression to a floating-point value. Parses the leading number and stops at the first unsuitable character; honours `&H`/`&O`/`&B` base prefixes. |
 | `VALINT and VALUINT` | ✓ | Converts numeric string expressions to integer values. Parses the leading integer, including `&H`/`&O`/`&B` base prefixes (B1.3; range/sign differences deferred). |
 | `VALLNG and VALULNG` | ✓ | `VALLNG`/`VALULNG` — parse a leading 64-bit signed/unsigned integer from a string, including `&H`/`&O`/`&B` base prefixes. |
 
