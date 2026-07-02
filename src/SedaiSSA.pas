@@ -1221,6 +1221,19 @@ begin
         Result := MakeSSAConstInt(0);
         Exit;
       end;
+      // FreeBASIC __FUNCTION__ / __FUNCTION_NQ__: the compiler substitutes the name of the enclosing
+      // function block (uppercased, as FB reports it). Resolved to a compile-time string constant here
+      // because it depends on the current procedure context (the preprocessor cannot know proc bounds).
+      // At module level FB reports "__FB_MAINPROC__". The _NQ_ form yields the same string value (its
+      // only distinct use is @__FUNCTION_NQ__ to take a symbol address, which has no meaning here).
+      if FModernMode and ((UpperCase(VarName) = kMACROFUNCTION) or (UpperCase(VarName) = kMACROFUNCTIONNQ)) then
+      begin
+        if FInProcedure then
+          Result := MakeSSAConstString(FCurrentProcName)
+        else
+          Result := MakeSSAConstString(kFBMAINPROC);
+        Exit;
+      end;
       // FreeBASIC CURDIR$ / CURDIR used bare (no parentheses): the current working directory.
       if FModernMode and ((UpperCase(VarName) = kCURDIRS) or (UpperCase(VarName) = kCURDIR)) then
       begin

@@ -1840,7 +1840,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `__FILE__ and __FILE_NQ__` | ✓ | `__FILE__` → top-level source file name (quoted string literal); `__FILE_NQ__` → the same name without the surrounding quotes (raw token). |
-| `__FUNCTION__ and __FUNCTION_NQ__` | ✗ | Defined as the name of the procedure where it's used. |
+| `__FUNCTION__ and __FUNCTION_NQ__` | ✓ | The name of the enclosing procedure (uppercased), or `__FB_MAINPROC__` at module level; resolved to a compile-time string constant. Both forms yield the same string value. |
 | `__LINE__` | ✓ | Expands to the current source line number (1-based). |
 | `__FB_OPTION_BYVAL__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_OPTION_DYNAMIC__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |

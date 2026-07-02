@@ -341,6 +341,9 @@ const
   kENVIRON = 'ENVIRON';  kENVIRONS = 'ENVIRON$';  // FreeBASIC: ENVIRON$(name) -> env var value
   kEXEPATH = 'EXEPATH';                            // FreeBASIC: directory of the running program
   kCOMMAND = 'COMMAND';  kCOMMANDS = 'COMMAND$';   // FreeBASIC: COMMAND$([index]) -> command-line argument(s)
+  kMACROFUNCTION   = '__FUNCTION__';    // FreeBASIC: quoted name of the current function block (intrinsic macro string)
+  kMACROFUNCTIONNQ = '__FUNCTION_NQ__'; // FreeBASIC: non-quoted name of the current function block
+  kFBMAINPROC      = '__FB_MAINPROC__'; // FreeBASIC: __FUNCTION__ value when used at module level (main module)
   // FreeBASIC graphics (phase 1 slice — routed through the IGraphicsBackend abstraction)
   kSCREENRES = 'SCREENRES';   // SCREENRES w, h : set the graphics screen resolution
   kPSET      = 'PSET';        // PSET (x, y) [, color] : set a pixel
