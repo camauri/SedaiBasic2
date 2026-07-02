@@ -1796,7 +1796,7 @@ end;
 function TPackratParser.ParseProcedureDecl: TASTNode;
 var
   Token, NameTok, RetTok: TLexerToken;
-  Kind, MethodType, QualName, ParamMode, OpSym, OpOwnerType, DecoU: string;
+  Kind, MethodType, QualName, ParamMode, OpSym, OpOwnerType, DecoU, RetTypeName: string;
   NameNode, ParamList, ParamNode, ThisNode, DefExpr: TASTNode;
 begin
   // SUB|FUNCTION name [ ( params ) ] [AS type] <body> END SUB|FUNCTION
@@ -2004,8 +2004,15 @@ begin
     if Context.Check(ttIdentifier) then
     begin
       RetTok := Context.CurrentToken;
-      NameNode.AddChild(TASTNode.CreateWithValue(antIdentifier,
-                   ParseDottedName, RetTok));       // dotted: namespace-qualified return type
+      RetTypeName := ParseDottedName;               // dotted: namespace-qualified return type
+      // FreeBASIC pointer return type: "<type> PTR" (e.g. "FUNCTION f() AS Tree PTR"). Consume the PTR
+      // suffix and keep it on the type name so the pre-scan records a pointer (int-handle) return.
+      while Context.Check(ttIdentifier) and (UpCase(Context.CurrentToken.Value) = 'PTR') do
+      begin
+        RetTypeName := RetTypeName + ' PTR';
+        Context.Advance;                            // consume PTR
+      end;
+      NameNode.AddChild(TASTNode.CreateWithValue(antIdentifier, RetTypeName, RetTok));
     end;
   end;
 
@@ -5914,10 +5921,10 @@ end;
 
 function TPackratParser.ParseDimStatement: TASTNode;
 var
-  Token, NameTok, TypeTok: TLexerToken;
+  Token, NameTok, TypeTok, SharedTypeTok: TLexerToken;
   ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode: TASTNode;
-  IsShared, IsByref: Boolean;
-  DimTypeName: string;
+  IsShared, IsByref, LeadingAS: Boolean;
+  DimTypeName, SharedTypeName: string;
 begin
   Token := Context.CurrentToken;
   // VAR / STATIC share the ttDataDeclaration token with DIM; route to their own parsers.
@@ -5937,30 +5944,69 @@ begin
   IsByref := Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF');
   if IsByref then Context.Advance;    // consume BYREF
 
+  // FreeBASIC "leading-AS" form: "DIM [SHARED] AS <type> name1[, name2, ...] [= init]" — the type comes
+  // first and is shared by every name in the list (e.g. "DIM AS STRING ch = MID(s,1,1)"). Parse the
+  // shared type once here; each declaration in the loop below is then just "name [= init]".
+  LeadingAS := Context.Check(ttAsType);
+  if LeadingAS then
+  begin
+    Context.Advance;                          // AS
+    if not Context.Check(ttIdentifier) then
+    begin
+      HandleError('Expected type name after AS', Context.CurrentToken);
+      DoNodeCreated(Result);
+      Exit;
+    end;
+    SharedTypeTok := Context.CurrentToken;
+    SharedTypeName := ParseDottedName;
+    while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+    begin
+      SharedTypeName := SharedTypeName + ' PTR';
+      Context.Advance;                        // consume PTR
+    end;
+  end;
+
   // Parse declarations separated by commas. Each is either:
   //   name AS typename   -> typed scalar (UDT record or explicit builtin type)
+  //   AS typename name   -> leading-AS typed scalar (shared type parsed above)
   //   name ( dims )      -> array (classic)
   repeat
-    if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
-       (Context.PeekNext.TokenType = ttAsType) then
+    if LeadingAS or (Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttAsType)) then
     begin
-      // "name AS typename"
-      NameTok := Context.CurrentToken;
-      Context.Advance;                       // name
-      Context.Advance;                       // AS
-      if not Context.Check(ttIdentifier) then
+      if LeadingAS then
       begin
-        HandleError('Expected type name after AS', Context.CurrentToken);
-        Break;
-      end;
-      TypeTok := Context.CurrentToken;
-      DimTypeName := ParseDottedName;          // dotted: namespace-qualified type ("Forms.Point")
-      // FreeBASIC pointer type: "<type> PTR" (one or more PTR). A pointer is stored as an int handle
-      // (the address); the suffix is kept on the type name so the SSA records the pointee bank.
-      while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+        // Leading-AS: the declaration is a bare name using the shared type parsed above.
+        if not Context.Check(ttIdentifier) then
+        begin
+          HandleError('Expected variable name after AS type', Context.CurrentToken);
+          Break;
+        end;
+        NameTok := Context.CurrentToken;
+        Context.Advance;                       // name
+        DimTypeName := SharedTypeName;
+        TypeTok := SharedTypeTok;
+      end
+      else
       begin
-        DimTypeName := DimTypeName + ' PTR';
-        Context.Advance;                       // consume PTR
+        // "name AS typename"
+        NameTok := Context.CurrentToken;
+        Context.Advance;                       // name
+        Context.Advance;                       // AS
+        if not Context.Check(ttIdentifier) then
+        begin
+          HandleError('Expected type name after AS', Context.CurrentToken);
+          Break;
+        end;
+        TypeTok := Context.CurrentToken;
+        DimTypeName := ParseDottedName;          // dotted: namespace-qualified type ("Forms.Point")
+        // FreeBASIC pointer type: "<type> PTR" (one or more PTR). A pointer is stored as an int handle
+        // (the address); the suffix is kept on the type name so the SSA records the pointee bank.
+        while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+        begin
+          DimTypeName := DimTypeName + ' PTR';
+          Context.Advance;                       // consume PTR
+        end;
       end;
       ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
       VarNameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
