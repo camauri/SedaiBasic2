@@ -1805,7 +1805,7 @@ end;
 function TPackratParser.ParseProcedureDecl: TASTNode;
 var
   Token, NameTok, RetTok: TLexerToken;
-  Kind, MethodType, QualName, ParamMode, OpSym, OpOwnerType, DecoU, RetTypeName: string;
+  Kind, MethodType, QualName, ParamMode, OpSym, OpOwnerType, DecoU, RetTypeName, ParamTypeName, ParamNameU: string;
   NameNode, ParamList, ParamNode, ThisNode, DefExpr: TASTNode;
 begin
   // SUB|FUNCTION name [ ( params ) ] [AS type] <body> END SUB|FUNCTION
@@ -1931,15 +1931,28 @@ begin
         Context.Advance;
         // Optional "AS typename" (M3.1): attach the type as a child antIdentifier so the
         // SSA pre-scan can type the parameter (record handle / explicit builtin bank).
+        ParamTypeName := '';
         if Context.Check(ttAsType) then
         begin
           Context.Advance;                        // AS
           if Context.Check(ttIdentifier) then
           begin
             RetTok := Context.CurrentToken;
+            ParamTypeName := UpperCase(ParseDottedName);
             ParamNode.AddChild(TASTNode.CreateWithValue(antIdentifier,
-                         ParseDottedName, RetTok));  // dotted: namespace-qualified param type
+                         ParamTypeName, RetTok));  // dotted: namespace-qualified param type
           end;
+        end;
+        // FreeBASIC -lang fb default (MODERN): String / ZString / WString parameters are passed BYREF by
+        // default (the callee's mutations propagate back to the caller's argument), unless BYVAL/BYREF
+        // was given explicitly. Numeric scalars stay BYVAL, matching FB. A bare "name$" (no AS type) is a
+        // string too. CLASSIC keeps its own convention (untouched).
+        if FModernMode and (ParamMode = '') then
+        begin
+          ParamNameU := UpperCase(VarToStr(ParamNode.Value));
+          if (ParamTypeName = 'STRING') or (ParamTypeName = 'ZSTRING') or (ParamTypeName = 'WSTRING') or
+             ((ParamTypeName = '') and (Length(ParamNameU) > 0) and (ParamNameU[Length(ParamNameU)] = '$')) then
+            ParamNode.Attributes.Values['BYREF'] := '1';
         end;
         // Optional default value "= expr" (M7): a call that omits this trailing argument has the
         // default staged in its place. Marked with 'HASDEFAULT'; the default expression is the
@@ -2727,7 +2740,7 @@ end;
 // each 'sel' is a fresh clone of the SELECT selector (so it isn't shared in the AST).
 function TPackratParser.ParseCaseCondition(Selector: TASTNode): TASTNode;
 var
-  ValueExpr, Cmp: TASTNode;
+  ValueExpr, HighExpr, Cmp, GeNode, LeNode: TASTNode;
 begin
   Result := nil;
   repeat
@@ -2735,8 +2748,23 @@ begin
     if not Assigned(ValueExpr) then Break;
     // NB: SSA lowering reads the operator from Node.Token.TokenType, so the binary
     // op needs a real token of that type (not nil).
-    Cmp := CreateBinaryOpNode(ttOpEq, Selector.Clone, ValueExpr,
-                              TLexerToken.CreateSimple(ttOpEq, '='));     // sel = value
+    // FreeBASIC "CASE lo TO hi" range: (sel >= lo) AND (sel <= hi). Comparison results are -1/0, so a
+    // bitwise AND combines them correctly (as the OR chain below does for a value list). Without this,
+    // the value parses as "CASE lo" and the leftover "TO hi" derails the case body.
+    if Context.Check(ttLoopControl) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TO') then
+    begin
+      Context.Advance;                                 // consume TO
+      HighExpr := FExpressionParser.ParseExpression;   // hi
+      GeNode := CreateBinaryOpNode(ttOpGe, Selector.Clone, ValueExpr,
+                                   TLexerToken.CreateSimple(ttOpGe, '>='));   // sel >= lo
+      LeNode := CreateBinaryOpNode(ttOpLe, Selector.Clone, HighExpr,
+                                   TLexerToken.CreateSimple(ttOpLe, '<='));   // sel <= hi
+      Cmp := CreateBinaryOpNode(ttBitwiseAND, GeNode, LeNode,
+                                TLexerToken.CreateSimple(ttBitwiseAND, 'AND'));
+    end
+    else
+      Cmp := CreateBinaryOpNode(ttOpEq, Selector.Clone, ValueExpr,
+                                TLexerToken.CreateSimple(ttOpEq, '='));     // sel = value
     if Result = nil then
       Result := Cmp
     else
