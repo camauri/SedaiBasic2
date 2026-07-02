@@ -238,6 +238,7 @@ begin
     bcInputFileInt,  // INPUT# file, int var
     bcFileQuery,     // EOF/FREEFILE/LOF/LOC/SEEK -> int result
     bcFileAttr,      // FILEATTR(filenum, returntype) -> int result
+    bcFileSetEof,    // FILESETEOF filenum -> int status result
     bcGetBinInt,     // GET #n binary -> int Dest
     bcArrayIdxResolve,  // runtime multi-dim index -> int Dest (linear index)
     // === GROUP 5: Special variables ===
@@ -517,7 +518,7 @@ begin
     bcGetFile, bcInputFile, bcPrintFile,     // Src1 = handle (int)
     bcInputFileFloat, bcInputFileInt,        // Src1 = handle (int)
     bcPrintFileFloat, bcPrintFileInt,        // Src1 = handle (int)
-    bcFileQuery, bcFileAttr, bcSeekSet, bcInputFileLine, // Src1 = handle (int)
+    bcFileQuery, bcFileAttr, bcFileSetEof, bcSeekSet, bcInputFileLine, // Src1 = handle (int)
     bcGetBinInt, bcGetBinFloat, bcPutBinInt, bcPutBinFloat,  // Src1 = handle (int)
     bcGetBinStr, bcPutBinStr,                                // Src1 = handle (int)
     bcArrayRedimPush,                        // REDIM multi-dim: Src1 = upper bound (int)

@@ -188,6 +188,20 @@ begin
   end;
   FS := FFileHandles[Handle];
 
+  if Command = 'FILESETEOF' then
+  begin
+    // FreeBASIC FILESETEOF: set the file length to the current position (truncate if before EOF, extend
+    // with zero bytes if beyond). After the call the position is at the (new) end. Status 0 = success.
+    try
+      FS.Size := FS.Position;
+      FS.Position := FS.Size;
+      Data := '0';
+    except
+      ErrorCode := 63; Data := IntToStr(ErrorCode);   // could not set the file size
+    end;
+    Exit;
+  end;
+
   if Command = 'EOF' then
     // FreeBASIC EOF: -1 (true) at/after end of file, 0 otherwise.
     Data := IntToStr(-Ord(FS.Position >= FS.Size))

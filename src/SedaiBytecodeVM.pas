@@ -7845,6 +7845,16 @@ begin
           Ctx.IntRegs[Instr.Dest] := StrToIntDef(Trim(Data), 0);
       end;
 
+    26: // bcFileSetEof - FILESETEOF filenum: set the file length to the current position (Src1=handle).
+      begin           // The handler truncates/extends and writes a status (0 = success) back to Data.
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        Data := '';
+        if Assigned(FOnFileData) then
+          FOnFileData(Self, 'FILESETEOF', HandleNum, Data, ErrorCode);
+        if Instr.Dest >= 0 then
+          Ctx.IntRegs[Instr.Dest] := StrToIntDef(Trim(Data), 0);
+      end;
+
     18: // bcInputFileLine - LINE INPUT# file, string var: read a whole line (commas not split)
       begin
         HandleNum := Ctx.IntRegs[Instr.Src1];

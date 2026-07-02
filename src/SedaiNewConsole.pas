@@ -9598,6 +9598,19 @@ begin
     Exit;
   end;
 
+  if Command = 'FILESETEOF' then
+  begin
+    // FreeBASIC FILESETEOF: set the file length to the current position (truncate/extend). Status 0 = OK.
+    try
+      FFileHandles[Handle].Size := FFileHandles[Handle].Position;
+      FFileHandles[Handle].Position := FFileHandles[Handle].Size;
+      Data := '0';
+    except
+      ErrorCode := 63; Data := IntToStr(ErrorCode);
+    end;
+    Exit;
+  end;
+
   if Command = 'GET#' then
   begin
     // Read one character

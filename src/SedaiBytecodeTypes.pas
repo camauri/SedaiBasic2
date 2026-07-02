@@ -506,6 +506,7 @@ const
   bcPutBinStr       = bcGroupFileIO + 23;   // PUT #n: write a string as [int32 length][bytes] (Src1=handle, Src2=string value)
   bcGetBinStr       = bcGroupFileIO + 24;   // GET #n: read a length-prefixed string (Dest=string value, Src1=handle)
   bcFileAttr        = bcGroupFileIO + 25;   // FILEATTR(filenum, returntype) -> int info (Dest=int result, Src1=handle, Src2=returntype)
+  bcFileSetEof      = bcGroupFileIO + 26;   // FILESETEOF filenum: truncate/extend to current position (Dest=int status, Src1=handle)
 
   // === GROUP 7: SPRITE OPERATIONS (0x07xx) ===
   // Sprite commands
@@ -1622,6 +1623,7 @@ begin
         12: Result := 'PrintFileFloat';
         13: Result := 'PrintFileInt';
         25: Result := 'FileAttr';
+        26: Result := 'FileSetEof';
       else
         Result := Format('FileIO_%d', [SubOp]);
       end;

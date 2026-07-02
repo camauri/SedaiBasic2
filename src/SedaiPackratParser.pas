@@ -4420,11 +4420,30 @@ begin
     'APPEND': Result := TASTNode.Create(antAppend, Token);
     'DCLEAR', 'RESET': Result := TASTNode.Create(antDclear, Token);  // RESET (FreeBASIC) unbinds all file numbers = DCLEAR
     'RECORD': Result := TASTNode.Create(antRecord, Token);
+    'FILESETEOF': Result := TASTNode.Create(antFileSetEof, Token);  // FreeBASIC: truncate/extend to current position
   else
     Result := TASTNode.Create(antStatement, Token); // Other file commands
   end;
 
   Context.Advance; // Consume file operation command
+
+  // FreeBASIC FILESETEOF [#]filenum : truncate/extend the open file to the current 1-based position.
+  // The file number is a bare expression (number or variable), optionally prefixed with '#'.
+  if CmdName = 'FILESETEOF' then
+  begin
+    if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+      Context.Advance;
+    Param := ParseExpression;
+    if Assigned(Param) then
+      Result.AddChild(Param)
+    else
+    begin
+      HandleError('Expected file number after FILESETEOF', Token);
+      Exit;
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
 
   // FreeBASIC OPEN: OPEN "filename" FOR {INPUT|OUTPUT|APPEND|BINARY|RANDOM} AS [#]n [LEN = reclen].
   // Detected when OPEN is NOT immediately followed by a '#handle' (that is the legacy C64/C128 form).

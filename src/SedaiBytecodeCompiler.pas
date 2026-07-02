@@ -472,6 +472,7 @@ begin
     ssaCmd: Result := bcCmd;
     ssaFileQuery: Result := bcFileQuery;
     ssaFileAttr: Result := bcFileAttr;
+    ssaFileSetEof: Result := bcFileSetEof;
     ssaSeekSet: Result := bcSeekSet;
     ssaInputFileLine: Result := bcInputFileLine;
     ssaPutBinInt: Result := bcPutBinInt;

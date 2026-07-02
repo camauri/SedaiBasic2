@@ -1752,6 +1752,7 @@ begin
  RegisterKeyword(kDCLEAR,    ttFileOperation,  'Clear all open channels on disk drive',    kcDOSCommands);
  RegisterKeyword(kRESET,     ttFileOperation,  'FreeBASIC: unbind all file numbers (= DCLEAR)', kcDOSCommands);
  RegisterKeyword(kDCLOSE,    ttFileOperation,  'Close disk drive file(s)',                 kcDOSCommands);
+ RegisterKeyword(kFILESETEOF, ttFileOperation, 'FreeBASIC: set open file length to current position', kcDOSCommands);
  RegisterKeyword(kDIR,       ttFileManagement, 'Display drive directory (alias)',          kcDOSCommands);
  RegisterKeyword(kDIRECTORY, ttFileManagement, 'Display drive directory',                  kcDOSCommands);
  RegisterKeyword(kDLOAD,     ttFileOperation,  'Load BASIC file',                          kcDOSCommands);

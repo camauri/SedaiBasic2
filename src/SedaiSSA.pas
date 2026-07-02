@@ -457,6 +457,7 @@ type
     // Disk file I/O
     procedure ProcessDopen(Node: TASTNode);
     procedure ProcessDclose(Node: TASTNode);
+    procedure ProcessFileSetEof(Node: TASTNode);
     // File data I/O
     procedure ProcessGetFile(Node: TASTNode);
     procedure ProcessInputFile(Node: TASTNode);
@@ -10372,6 +10373,31 @@ begin
                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
+procedure TSSAGenerator.ProcessFileSetEof(Node: TASTNode);
+// FreeBASIC FILESETEOF filenum: set the open file's length to the current 1-based position (truncate
+// if before EOF, extend with zero bytes if beyond). Src1 = handle; Dest = a throwaway status register
+// (0 on success) — allocated so the VM always has somewhere to put the result, and kept alive because
+// ssaFileSetEof is side-effecting (see SedaiDCE).
+var
+  HandleVal, HandleReg, StatusReg: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount > 0 then
+  begin
+    ProcessExpression(Node.GetChild(0), HandleVal);
+    HandleReg := EnsureIntRegister(HandleVal);
+  end
+  else
+  begin
+    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+  StatusReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaFileSetEof, StatusReg, HandleReg,
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
 procedure TSSAGenerator.ProcessAppend(Node: TASTNode);
 var
   HandleVal, DataVal: TSSAValue;
@@ -16066,6 +16092,7 @@ begin
     antAppend: ProcessAppend(Node);
     antDclear: ProcessDclear(Node);
     antRecord: ProcessRecord(Node);
+    antFileSetEof: ProcessFileSetEof(Node);
     // Sprite commands
     antSprite: ProcessSprite(Node);
     antMovspr: ProcessMovspr(Node);

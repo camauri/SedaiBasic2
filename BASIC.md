@@ -2269,7 +2269,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `FILEDATETIME` | ✓ | `FILEDATETIME(path)` -> the file's last-modified timestamp as a Date Serial (Double), or 0 if absent; cross-platform. |
 | `FILEEXISTS` | ✓ | `FILEEXISTS(path)` returns -1 if the file exists, else 0 (cross-platform). |
 | `FILELEN` | ✓ | `FILELEN(path)` -> file size in bytes (0 if the file does not exist); cross-platform. |
-| `FILESETEOF` | ✗ | Sets the length of an open file bound to a file number. |
+| `FILESETEOF` | ✓ | `FILESETEOF filenum` sets an open file's length to the current 1-based position (truncates if before EOF, extends with zero bytes if beyond). Statement form. |
 | `FILEFLUSH` | ✗ | Flushes application or system buffers for an open file bound to a file number. |
 
 #### Working with Directories
