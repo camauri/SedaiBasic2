@@ -3100,10 +3100,19 @@ end;
 function TPackratParser.ParseEndStatement: TASTNode;
 var
   Token: TLexerToken;
+  ExitArg: TASTNode;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antEnd, Token);
-  Context.Advance; // Consume END
+  Context.Advance; // Consume END / SYSTEM
+  // FreeBASIC SYSTEM may carry an optional exit code (SYSTEM 0). We have no process exit-code channel,
+  // so it is parsed and discarded; SYSTEM otherwise behaves exactly like END. (END takes no argument.)
+  if (UpperCase(Token.Value) = kSYSTEM) and
+     (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse])) then
+  begin
+    ExitArg := ParseExpression;
+    if Assigned(ExitArg) then ExitArg.Free;
+  end;
   DoNodeCreated(Result);
 end;
 
@@ -4426,6 +4435,22 @@ begin
   end;
 
   Context.Advance; // Consume file operation command
+
+  // FreeBASIC FILEFLUSH [[#]filenum [, systembuffers]]: flush buffered output. Our file streams are
+  // unbuffered (writes go straight to the OS), so there is nothing to flush — accept and discard the
+  // optional arguments, emitting no code (Result is the empty antStatement from the case above).
+  if CmdName = 'FILEFLUSH' then
+  begin
+    if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+      Context.Advance;
+    if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+    begin
+      Param := ParseExpressionList(ttSeparParam);   // filenum [, systembuffers] — consumed and discarded
+      if Assigned(Param) then Param.Free;
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
 
   // FreeBASIC FILESETEOF [#]filenum : truncate/extend the open file to the current 1-based position.
   // The file number is a bare expression (number or variable), optionally prefixed with '#'.

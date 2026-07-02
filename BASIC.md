@@ -2270,7 +2270,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `FILEEXISTS` | ✓ | `FILEEXISTS(path)` returns -1 if the file exists, else 0 (cross-platform). |
 | `FILELEN` | ✓ | `FILELEN(path)` -> file size in bytes (0 if the file does not exist); cross-platform. |
 | `FILESETEOF` | ✓ | `FILESETEOF filenum` sets an open file's length to the current 1-based position (truncates if before EOF, extends with zero bytes if beyond). Statement form. |
-| `FILEFLUSH` | ✗ | Flushes application or system buffers for an open file bound to a file number. |
+| `FILEFLUSH` | ✓ | `FILEFLUSH [[#]filenum]` — accepted as a no-op (the VM's file streams are unbuffered, so buffered output is already written). |
 
 #### Working with Directories
 
@@ -2293,7 +2293,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `ISREDIRECTED` | ✗ | Checks whether stdin or stdout is redirected to a file or not. |
 | `SETENVIRON` | ✗ | Sets the value of an environment variable. |
 | `SHELL` | ✗ | N/A — external command execution is out of scope for the sandboxed VM. |
-| `SYSTEM` | ✗ | Closes all files and exits — equivalent to END/STOP (not yet aliased). |
+| `SYSTEM` | ✓ | `SYSTEM [exitcode]` ends the program like `END` (an optional exit code is parsed and ignored). |
 
 ### String Functions
 

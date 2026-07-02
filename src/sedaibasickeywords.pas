@@ -341,6 +341,8 @@ const
   kFILESETEOF = 'FILESETEOF';  // FreeBASIC: FILESETEOF filenum -> truncate/extend an open file to the current position
   kASSERT     = 'ASSERT';      // FreeBASIC: ASSERT(expr) -> if expr is false, print a message and halt
   kASSERTWARN = 'ASSERTWARN';  // FreeBASIC: ASSERTWARN(expr) -> if expr is false, print a warning and continue
+  kSYSTEM     = 'SYSTEM';      // FreeBASIC: SYSTEM [exitcode] -> close all files and end the program (= END)
+  kFILEFLUSH  = 'FILEFLUSH';   // FreeBASIC: FILEFLUSH [filenum] -> flush file buffers (no-op: streams are unbuffered)
   kCURDIR  = 'CURDIR';   kCURDIRS  = 'CURDIR$';   // FreeBASIC: current working directory
   kENVIRON = 'ENVIRON';  kENVIRONS = 'ENVIRON$';  // FreeBASIC: ENVIRON$(name) -> env var value
   kEXEPATH = 'EXEPATH';                            // FreeBASIC: directory of the running program

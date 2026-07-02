@@ -1660,6 +1660,7 @@ begin
  // === FLOW CONTROL - PROGRAM EXECUTION ===
  RegisterKeyword(kCONT,  ttProgramCont,  'Continue program execution',      kcProgramFlowControl);
  RegisterKeyword(kEND,   ttProgramEnd,   'Ends program execution',          kcProgramFlowControl);
+ RegisterKeyword(kSYSTEM, ttProgramEnd,  'FreeBASIC: close all files and end the program (= END)', kcProgramFlowControl);
  RegisterKeyword(kFAST,  ttProgramClock, 'Set fast speed clock',            kcProgramFlowControl);
  RegisterKeyword(kRUN,   ttProgramRun,   'Execute program',                 kcProgramFlowControl);
  RegisterKeyword(kSLEEP, ttProgramSleep, 'Delay program for given seconds', kcProgramFlowControl);
@@ -1753,6 +1754,7 @@ begin
  RegisterKeyword(kRESET,     ttFileOperation,  'FreeBASIC: unbind all file numbers (= DCLEAR)', kcDOSCommands);
  RegisterKeyword(kDCLOSE,    ttFileOperation,  'Close disk drive file(s)',                 kcDOSCommands);
  RegisterKeyword(kFILESETEOF, ttFileOperation, 'FreeBASIC: set open file length to current position', kcDOSCommands);
+ RegisterKeyword(kFILEFLUSH,  ttFileOperation, 'FreeBASIC: flush file buffers (no-op, unbuffered)',   kcDOSCommands);
  RegisterKeyword(kDIR,       ttFileManagement, 'Display drive directory (alias)',          kcDOSCommands);
  RegisterKeyword(kDIRECTORY, ttFileManagement, 'Display drive directory',                  kcDOSCommands);
  RegisterKeyword(kDLOAD,     ttFileOperation,  'Load BASIC file',                          kcDOSCommands);
