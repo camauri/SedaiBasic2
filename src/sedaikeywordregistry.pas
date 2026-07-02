@@ -2073,9 +2073,16 @@ begin
 
   // Commodore v7-only keywords: declassified to plain identifiers in MODERN (FreeBASIC), so an FB
   // program may use these names as variables/parameters/procedures. They keep their keyword meaning in
-  // CLASSIC. FreeBASIC has no KEY statement (it uses GETKEY/INKEY/MULTIKEY) and no MOVE statement, so a
-  // real FB program can legitimately name a parameter "key" or a SUB "move" — common in practice.
-  SetKeywordsDialect([kKEY, kMOVE], kdClassicOnly);
+  // CLASSIC. Each of these is a Commodore command/function with NO FreeBASIC counterpart (verified: no
+  // page in the FB reference), so in the FB dialect the word is not reserved and must be a plain
+  // identifier — real FB code routinely names things "key", "move", "bank", "pen", "header", etc. (Words
+  // that FreeBASIC DOES define — e.g. LINE, VIEW, SCREEN, GET, PUT, SPRITE, PLAY, SOUND, CONCAT, TEMPO —
+  // are intentionally NOT listed: keywords common to both dialects are disambiguated by context, not
+  // reclassified.)
+  SetKeywordsDialect([kKEY, kMOVE, kBANK, kFETCH, kSTASH, kRREG, kPEN, kPOT, kJOY, kBUMP,
+                      kCOLLECT, kCOLLISION, kSCRATCH, kHEADER, kBACKUP, kCATALOG, kRENUMBER, kAUTO,
+                      kMONITOR, kPUDEF, kMOVSPR, kENVELOPE, kFILTER, kVOL],
+                     kdClassicOnly);
 
   //WriteLn('DEBUG RegisterBasicKeywords: Completed registration of ', GetKeywordCount, ' keywords');
 end;
