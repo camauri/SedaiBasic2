@@ -339,6 +339,8 @@ const
   kFILEDATETIME = 'FILEDATETIME'; // FreeBASIC: FILEDATETIME(path) -> last-modified date serial (intercepted as array-access)
   kFILEATTR = 'FILEATTR';  // FreeBASIC: FILEATTR(filenum[,returntype]) -> open-file info (intercepted as array-access)
   kFILESETEOF = 'FILESETEOF';  // FreeBASIC: FILESETEOF filenum -> truncate/extend an open file to the current position
+  kASSERT     = 'ASSERT';      // FreeBASIC: ASSERT(expr) -> if expr is false, print a message and halt
+  kASSERTWARN = 'ASSERTWARN';  // FreeBASIC: ASSERTWARN(expr) -> if expr is false, print a warning and continue
   kCURDIR  = 'CURDIR';   kCURDIRS  = 'CURDIR$';   // FreeBASIC: current working directory
   kENVIRON = 'ENVIRON';  kENVIRONS = 'ENVIRON$';  // FreeBASIC: ENVIRON$(name) -> env var value
   kEXEPATH = 'EXEPATH';                            // FreeBASIC: directory of the running program

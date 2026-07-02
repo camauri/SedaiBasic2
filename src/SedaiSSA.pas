@@ -458,6 +458,7 @@ type
     procedure ProcessDopen(Node: TASTNode);
     procedure ProcessDclose(Node: TASTNode);
     procedure ProcessFileSetEof(Node: TASTNode);
+    procedure ProcessAssert(Node: TASTNode; Halt: Boolean);
     // File data I/O
     procedure ProcessGetFile(Node: TASTNode);
     procedure ProcessInputFile(Node: TASTNode);
@@ -10398,6 +10399,34 @@ begin
                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
+procedure TSSAGenerator.ProcessAssert(Node: TASTNode; Halt: Boolean);
+// FreeBASIC ASSERT(expr) / ASSERTWARN(expr): if the condition evaluates to 0 (false), print a
+// diagnostic and — for ASSERT — halt the program. The whole message (function name, source line and
+// the stringized expression) is known at compile time and baked into a string constant; only the
+// conditional print/halt happens at run time. The source file name is not threaded to codegen, so it
+// is omitted from the message (a documented deviation from FB's "file(line): ..." prefix).
+var
+  CondVal, CondReg, MsgReg: TSSAValue;
+  FuncName, Msg: string;
+  LineNum: Integer;
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount = 0 then Exit;
+
+  if FInProcedure then FuncName := FCurrentProcName else FuncName := kFBMAINPROC;
+  if Node.Token <> nil then LineNum := Node.Token.Line else LineNum := FCurrentLineNumber;
+  Msg := 'assertion failed at ' + FuncName + ' (line ' + IntToStr(LineNum) + ')';
+  if VarToStr(Node.Value) <> '' then Msg := Msg + ': ' + VarToStr(Node.Value);
+
+  ProcessExpression(Node.GetChild(0), CondVal);
+  CondReg := EnsureIntRegister(CondVal);
+  MsgReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaLoadConstString, MsgReg, MakeSSAConstString(Msg),
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EmitInstruction(ssaAssert, MakeSSAValue(svkNone), CondReg, MsgReg,
+                 MakeSSAConstInt(Ord(Halt)));
+end;
+
 procedure TSSAGenerator.ProcessAppend(Node: TASTNode);
 var
   HandleVal, DataVal: TSSAValue;
@@ -16093,6 +16122,8 @@ begin
     antDclear: ProcessDclear(Node);
     antRecord: ProcessRecord(Node);
     antFileSetEof: ProcessFileSetEof(Node);
+    antAssert: ProcessAssert(Node, True);
+    antAssertWarn: ProcessAssert(Node, False);
     // Sprite commands
     antSprite: ProcessSprite(Node);
     antMovspr: ProcessMovspr(Node);

@@ -5450,9 +5450,44 @@ end;
 
 function TPackratParser.ParseDebugStatement: TASTNode;
 var
-  Token: TLexerToken;
+  Token, T: TLexerToken;
+  CmdName, ExprText: string;
+  HasParen: Boolean;
+  StartIdx, EndIdx, i: Integer;
+  Cond: TASTNode;
 begin
   Token := Context.CurrentToken;
+  CmdName := UpperCase(Token.Value);
+
+  // FreeBASIC ASSERT(expr) / ASSERTWARN(expr): if expr is false, print a diagnostic (and, for ASSERT,
+  // halt). The expression's source text is captured (by joining its tokens) for the message, mirroring
+  // the FB `#expression` stringize. Unlike FB, our build always generates the check (no -g gate).
+  if (CmdName = kASSERT) or (CmdName = kASSERTWARN) then
+  begin
+    Context.Advance; // consume ASSERT / ASSERTWARN
+    HasParen := (Context.CurrentToken.Value = '(');
+    if HasParen then Context.Advance;
+    StartIdx := Context.CurrentIndex;
+    Cond := ParseExpression;
+    EndIdx := Context.CurrentIndex;
+    ExprText := '';
+    for i := StartIdx to EndIdx - 1 do
+    begin
+      T := Context.TokenList.GetTokenDirect(i);
+      if not Assigned(T) then Continue;
+      if ExprText <> '' then ExprText := ExprText + ' ';
+      ExprText := ExprText + T.Value;
+    end;
+    if HasParen and (Context.CurrentToken.Value = ')') then Context.Advance;
+    if CmdName = kASSERT then
+      Result := TASTNode.CreateWithValue(antAssert, ExprText, Token)
+    else
+      Result := TASTNode.CreateWithValue(antAssertWarn, ExprText, Token);
+    if Assigned(Cond) then Result.AddChild(Cond);
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
   Result := TASTNode.Create(antStatement, Token);
   Context.Advance; // Consume debug command
   DoNodeCreated(Result);

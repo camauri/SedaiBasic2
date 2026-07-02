@@ -519,6 +519,7 @@ begin
     bcInputFileFloat, bcInputFileInt,        // Src1 = handle (int)
     bcPrintFileFloat, bcPrintFileInt,        // Src1 = handle (int)
     bcFileQuery, bcFileAttr, bcFileSetEof, bcSeekSet, bcInputFileLine, // Src1 = handle (int)
+    bcAssert,        // ASSERT/ASSERTWARN: Src1 = condition (int)
     bcGetBinInt, bcGetBinFloat, bcPutBinInt, bcPutBinFloat,  // Src1 = handle (int)
     bcGetBinStr, bcPutBinStr,                                // Src1 = handle (int)
     bcArrayRedimPush,                        // REDIM multi-dim: Src1 = upper bound (int)
@@ -778,7 +779,9 @@ begin
     // === GROUP 6: File I/O operations ===
     bcDopen, bcOpen,  // Src2 = filename (string)
     bcAppend,         // Src2 = data (string)
-    bcPutBinStr:      // PUT #n: Src2 = string value
+    bcPutBinStr,      // PUT #n: Src2 = string value
+    // === GROUP 0: ASSERT/ASSERTWARN — Src2 = message (string) ===
+    bcAssert:
       Result := True;
   else
     Result := False;

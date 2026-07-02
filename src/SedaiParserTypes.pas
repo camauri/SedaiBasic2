@@ -162,6 +162,8 @@ type
     antDclear,            // DCLEAR statement (close all file handles)
     antRecord,            // RECORD statement (seek file position)
     antFileSetEof,        // FILESETEOF statement (truncate/extend open file to current position)
+    antAssert,            // ASSERT(expr): halt with a message if expr is false (Value = expression text)
+    antAssertWarn,        // ASSERTWARN(expr): warn if expr is false, then continue (Value = expression text)
     antGet,               // GET statement (non-blocking character input)
     antGetkey,            // GETKEY statement (blocking character input)
     antGetFile,           // GET# statement (get char from file)
@@ -448,7 +450,7 @@ begin
     antErase, antRedim, antSwap, antMidStatement, antLSet, antRSet, antEnum, antDefType,
     antDef, antData, antConst, antRead, antRestore, antClear, antNamespace,
     antOpen, antClose, antDopen, antDclose, antAppend, antDclear, antRecord,
-    antFileSetEof,
+    antFileSetEof, antAssert, antAssertWarn,
     antGet, antPut, antPoke, antSys, antNew, antRun, antList,
     antSave, antLoad, antVerify, antBload, antBsave, antBoot, antCatalog, antBlock,
     // Sprite commands

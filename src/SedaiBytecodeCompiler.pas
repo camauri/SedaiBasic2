@@ -473,6 +473,7 @@ begin
     ssaFileQuery: Result := bcFileQuery;
     ssaFileAttr: Result := bcFileAttr;
     ssaFileSetEof: Result := bcFileSetEof;
+    ssaAssert: Result := bcAssert;
     ssaSeekSet: Result := bcSeekSet;
     ssaInputFileLine: Result := bcInputFileLine;
     ssaPutBinInt: Result := bcPutBinInt;

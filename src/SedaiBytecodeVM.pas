@@ -3875,6 +3875,24 @@ begin
         Ctx.Running := False;
         Ctx.Stopped := False;  // END clears stopped state
       end;
+    bcAssert:
+      begin
+        // ASSERT/ASSERTWARN: if the condition (Src1) is 0 (false), print the pre-built diagnostic
+        // (Src2). For ASSERT (Immediate bit 0 set) the program also halts; ASSERTWARN continues.
+        if Ctx.IntRegs[Instr.Src1] = 0 then
+        begin
+          if Assigned(FOutputDevice) then
+          begin
+            FOutputDevice.Print(Ctx.StringRegs[Instr.Src2]);
+            FOutputDevice.NewLine;
+          end;
+          if (Instr.Immediate and 1) <> 0 then
+          begin
+            Ctx.Running := False;
+            Ctx.Stopped := False;
+          end;
+        end;
+      end;
     bcStop:
       begin
         Ctx.Running := False;

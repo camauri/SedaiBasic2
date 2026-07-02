@@ -2020,6 +2020,8 @@ begin
 
   // === DEBUG ===
   RegisterKeyword(kHELP,  ttDebugCommand,     'Highlight the line where the error occurred', kcDebug);
+  RegisterKeyword(kASSERT,     ttDebugCommand, 'FreeBASIC: halt if the expression is false',   kcDebug);
+  RegisterKeyword(kASSERTWARN, ttDebugCommand, 'FreeBASIC: warn if the expression is false',   kcDebug);
   RegisterKeyword(kTRON,  ttDebugTracingMode, 'Set tracing mode on',                         kcDebug);
   RegisterKeyword(kTROFF, ttDebugTracingMode, 'Set tracing mode off',                        kcDebug);
 

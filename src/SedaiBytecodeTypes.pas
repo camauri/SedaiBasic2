@@ -304,6 +304,7 @@ const
   bcCondSignal       = bcGroupCore + 123;
   bcCondBroadcast    = bcGroupCore + 124;
   bcCondDestroy      = bcGroupCore + 125;
+  bcAssert           = bcGroupCore + 139;  // ASSERT/ASSERTWARN: if Src1=0 print Src2 (string); Immediate bit0 = halt
 
   // === GROUP 1: STRING OPERATIONS (0x01xx) ===
   bcStrConcat       = bcGroupString + 0;
@@ -1468,6 +1469,7 @@ begin
         130: Result := 'NarrowSingle';
         131: Result := 'Shl';
         132: Result := 'Shr';
+        139: Result := 'Assert';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

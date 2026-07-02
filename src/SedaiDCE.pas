@@ -281,6 +281,8 @@ begin
     ssaCondCreate, ssaCondWait, ssaCondSignal, ssaCondBroadcast, ssaCondDestroy,
     // RANDOMIZE mutates RNG state — a side effect; never elide it.
     ssaRandomize,
+    // ASSERT/ASSERTWARN print (and Assert halts) as a side effect; never elide it.
+    ssaAssert,
     // Transfer-register moves carry args/result across the call; never elide them.
     ssaXferStoreInt, ssaXferStoreFloat, ssaXferStoreString,
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString,

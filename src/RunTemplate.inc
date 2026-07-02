@@ -890,11 +890,13 @@ begin
           end;
 
         // Input/Output commands - fall back to slow path
-        bcGet, bcGetkey, bcPrintUsing, bcPudef, bcChar:
+        bcGet, bcGetkey, bcPrintUsing, bcPudef, bcChar,
+        // ASSERT may halt the program (its slow-path handler clears Ctx.Running), so check it here too.
+        bcAssert:
           begin
             Ctx.PC := CurPC;
             ExecuteInstruction(Ctx, Instr);
-            if not Ctx.Running then Break;  // CTRL+C or quit requested
+            if not Ctx.Running then Break;  // CTRL+C, quit requested, or a failed ASSERT
             CurPC := Ctx.PC + 1;
           end;
 

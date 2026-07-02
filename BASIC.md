@@ -1932,8 +1932,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ASSERT` | ✗ |  |
-| `ASSERTWARN` | ✗ |  |
+| `ASSERT` | ✓ | `ASSERT(expr)` prints a diagnostic (function, line, stringized expression) and halts the program if `expr` is false. Always generated (no `-g` gate); the source file name is omitted from the message. |
+| `ASSERTWARN` | ✓ | `ASSERTWARN(expr)` prints the same diagnostic if `expr` is false but continues execution. |
 | `STOP` | ✓ |  |
 
 ##### Hardware Access
