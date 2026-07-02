@@ -1929,6 +1929,17 @@ begin
         // is also the implicit default, but only an explicit BYREF opts a scalar into write-back.
         if ParamMode = kBYREF then ParamNode.Attributes.Values['BYREF'] := '1';
         Context.Advance;
+        // FreeBASIC array parameter: "name() AS type" (empty parens; arrays are always passed ByRef,
+        // with unspecified bounds). Consume the "()" and mark the parameter as an array. Without this
+        // the '(' is never consumed and the parameter loop spins forever.
+        if Context.Check(ttDelimParOpen) then
+        begin
+          Context.Advance;                        // (
+          while not Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile, ttSeparStmt]) do
+            Context.Advance;                      // skip anything inside (usually empty)
+          if Context.Check(ttDelimParClose) then Context.Advance;   // )
+          ParamNode.Attributes.Values['ARRAY'] := '1';
+        end;
         // Optional "AS typename" (M3.1): attach the type as a child antIdentifier so the
         // SSA pre-scan can type the parameter (record handle / explicit builtin bank).
         ParamTypeName := '';
@@ -6063,6 +6074,22 @@ begin
   //   AS typename name   -> leading-AS typed scalar (shared type parsed above)
   //   name ( dims )      -> array (classic)
   repeat
+    // Leading-AS array declaration: "DIM [SHARED] AS type name(dims)". Route to ParseArrayDeclaration
+    // (which handles the dimension list, including "lo TO hi" ranges and negative lower bounds) and
+    // inject the shared type when no explicit "AS type" follows the array.
+    if LeadingAS and Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttDelimParOpen) then
+    begin
+      ArrayDecl := ParseArrayDeclaration;
+      if not Assigned(ArrayDecl) then Break;
+      if ArrayDecl.ChildCount < 3 then         // no explicit element type -> use the shared type
+        ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, SharedTypeName, SharedTypeTok));
+      if IsShared then ArrayDecl.Attributes.Values['SHARED'] := '1';
+      Result.AddChild(ArrayDecl);
+      if Context.Check(ttSeparParam) then begin Context.Advance; Continue; end;
+      Break;
+    end;
+
     if LeadingAS or (Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
        (Context.PeekNext.TokenType = ttAsType)) then
     begin
