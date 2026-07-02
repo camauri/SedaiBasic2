@@ -175,6 +175,7 @@ type
     function AtEndProcedure: Boolean;
     // CALL name [ ( args ) ] : statement-level SUB invocation.
     function ParseCallStatement: TASTNode;
+    function ParseBareCallStatement: TASTNode;
     // BASE [ ( args ) ] : explicit base-constructor call inside a child CONSTRUCTOR (M4.4f).
     function ParseBaseStatement: TASTNode;
     // THREADWAIT handle : join a worker thread by handle (M5.2 threading).
@@ -957,6 +958,14 @@ begin
         // Note: the FreeBASIC in-place "MID(dst,start[,len]) = src" statement (MODERN) is intercepted
         // earlier by the dialect profile's IdentMidStatementHandler (mechanism 3), so it does not need
         // a branch here; in CLASSIC bare MID is a plain identifier handled by the default path below.
+        // FreeBASIC/QB bare SUB call with unparenthesised arguments: "SubName arg1[, arg2...]". The name
+        // is a bare identifier immediately followed by a value token (the first argument), so it cannot
+        // be an assignment ("name = ..."), a compound assignment ("name += ..."), or a member / array /
+        // call ("name." / "name(" / "name["). A bare "name" with nothing after it is left to the default
+        // path (an expression/assignment), so the name stays usable as a variable.
+        else if Assigned(Context.PeekNext) and
+                (Context.PeekNext.TokenType in [ttNumber, ttInteger, ttFloat, ttStringLiteral, ttIdentifier]) then
+          Result := Memoize('BareCallStatement', @ParseBareCallStatement)
         else
         begin
           // Prova SEMPRE assignment prima per identifier
@@ -2068,6 +2077,35 @@ begin
   end;
   if HasParens and Context.Check(ttDelimParClose) then
     Context.Advance;                              // )
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseBareCallStatement: TASTNode;
+// FreeBASIC/QB statement-level SUB call without CALL or parentheses: "SubName arg1, arg2, ...".
+// The name is already the current token; arguments are an unparenthesised comma-separated list. Builds
+// the same antProcedureCall (child = antArgumentList) that CALL produces, so SSA lowering is shared.
+var
+  Token, NameTok: TLexerToken;
+  ArgList, ArgExpr: TASTNode;
+begin
+  NameTok := Context.CurrentToken;
+  Token := NameTok;
+  Result := TASTNode.CreateWithValue(antProcedureCall, UpperCase(NameTok.Value), NameTok);
+  Context.Advance;                                // consume the SUB name
+  ArgList := TASTNode.Create(antArgumentList, Token);
+  Result.AddChild(ArgList);
+  if not (Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt)) then
+  begin
+    repeat
+      ArgExpr := FExpressionParser.ParseExpression;
+      if not Assigned(ArgExpr) then Break;
+      ArgList.AddChild(ArgExpr);
+      if Context.Check(ttSeparParam) then
+        Context.Advance                           // ,
+      else
+        Break;
+    until False;
+  end;
   DoNodeCreated(Result);
 end;
 

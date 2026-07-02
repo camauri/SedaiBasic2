@@ -2071,6 +2071,12 @@ begin
                       kNOW, kTIMER, kDATEFN, kTIMEFN, kSETDATE, kSETTIME],
                      kdModernOnly);
 
+  // Commodore v7-only keywords: declassified to plain identifiers in MODERN (FreeBASIC), so an FB
+  // program may use these names as variables/parameters/procedures. They keep their keyword meaning in
+  // CLASSIC. FreeBASIC has no KEY statement (it uses GETKEY/INKEY/MULTIKEY) and no MOVE statement, so a
+  // real FB program can legitimately name a parameter "key" or a SUB "move" — common in practice.
+  SetKeywordsDialect([kKEY, kMOVE], kdClassicOnly);
+
   //WriteLn('DEBUG RegisterBasicKeywords: Completed registration of ', GetKeywordCount, ' keywords');
 end;
 
