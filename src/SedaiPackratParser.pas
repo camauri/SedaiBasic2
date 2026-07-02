@@ -2743,6 +2743,13 @@ begin
   Token := Context.CurrentToken;
   Context.Advance;                                  // consume SELECT
   if Context.Check(ttCaseClause) then Context.Advance;   // consume CASE
+  // FreeBASIC "SELECT CASE AS CONST <sel>": a jump-table optimisation hint (the case values must be
+  // constants). Semantically identical to a plain SELECT CASE here, so consume and ignore "AS CONST".
+  if Context.Check(ttAsType) then
+  begin
+    Context.Advance;                                // AS
+    if UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST' then Context.Advance;   // CONST
+  end;
   Selector := ParseExpression;
 
   RootIf := nil; PrevIf := nil; IsFirst := True;
@@ -2864,6 +2871,7 @@ function TPackratParser.ParseForStatement: TASTNode;
 var
   Variable, StartExpr, EndExpr, StepExpr: TASTNode;
   Token: TLexerToken;
+  ForVarType: string;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antForLoop, Token);
@@ -2884,6 +2892,24 @@ begin
   Variable := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
   Context.Advance;
   Result.AddChild(Variable);
+
+  // FreeBASIC typed loop variable: "FOR i AS <type> = start TO end". The counter is a block-local of the
+  // given type; consume the "AS <type>" clause (PTR-aware) and record it as an advisory attribute. The
+  // loop otherwise runs on the type inferred from the bounds (integer counters, the common case).
+  if Context.Check(ttAsType) then
+  begin
+    Context.Advance;                              // AS
+    if Context.Check(ttIdentifier) then
+    begin
+      ForVarType := ParseDottedName;
+      while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+      begin
+        ForVarType := ForVarType + ' PTR';
+        Context.Advance;
+      end;
+      Result.Attributes.Values['VARTYPE'] := ForVarType;
+    end;
+  end;
 
   if not Context.Match(ttOpEq) and not Context.Match(ttDataAssignment) then
   begin
