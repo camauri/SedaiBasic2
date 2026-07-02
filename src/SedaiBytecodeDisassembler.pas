@@ -254,6 +254,8 @@ begin
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'Environ', Instr.Dest, Instr.Src1]);
     bcFileLen:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'FileLen', Instr.Dest, Instr.Src1]);
+    bcFileDateTime:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'FileDateTime', Instr.Dest, Instr.Src1]);
     bcStrMkInt:
       Line := Format('%4d: %-20s R%d, R%d, width=%d', [Index, 'StrMkInt', Instr.Dest, Instr.Src1, Instr.Immediate]);
     bcStrMkFloat:

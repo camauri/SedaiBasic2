@@ -184,6 +184,7 @@ begin
     ssaCommand: Result := bcCommand;
     ssaStrFormat: Result := bcStrFormat;
     ssaFileLen: Result := bcFileLen;
+    ssaFileDateTime: Result := bcFileDateTime;
     ssaStrMkInt: Result := bcStrMkInt;
     ssaStrMkFloat: Result := bcStrMkFloat;
     ssaStrCvInt: Result := bcStrCvInt;

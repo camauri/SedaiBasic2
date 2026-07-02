@@ -308,6 +308,7 @@ type
     function CommandLine(Index: Integer): string;  // COMMAND$(index) -> command-line argument(s)
     function DiskStatusString: string;  // DS$ -> Commodore disk status line "NN, MESSAGE,00,00"
     function FileLength(const Path: string): Int64;   // FILELEN(path) -> file size in bytes (0 if absent)
+    function FileDateTimeSerial(const Path: string): Double;  // FILEDATETIME(path) -> last-modified date serial (0 if absent)
     procedure RawFree(RawPtr: Int64);
     function RawRealloc(RawPtr: Int64; ByteCount: PtrUInt): Int64;
     function RawLoadInt(RawPtr: Int64; TypeCode: Integer): Int64;
@@ -1919,6 +1920,24 @@ begin
   end;
 end;
 
+function TBytecodeVM.FileDateTimeSerial(const Path: string): Double;
+// FreeBASIC FILEDATETIME(path): the file's last-modified timestamp as a Date Serial (Double),
+// or 0 if the file does not exist. FPC's FileAge returns a packed DOS datetime (-1 if absent);
+// FileDateToDateTime converts it to a TDateTime, which is the same day-serial convention FB uses.
+var
+  Age: LongInt;
+begin
+  Result := 0;
+  if not FileExists(Path) then Exit;
+  try
+    Age := FileAge(Path);
+    if Age = -1 then Exit;
+    Result := FileDateToDateTime(Age);
+  except
+    Result := 0;
+  end;
+end;
+
 procedure TBytecodeVM.RawFree(RawPtr: Int64);
 var
   dataOfs, sz: PtrUInt;
@@ -2988,8 +3007,8 @@ begin
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
         end;
 
-        // String Src1 -> Float Dest (VAL, CV*float)
-        bcStrVal, bcStrCvFloat:
+        // String Src1 -> Float Dest (VAL, CV*float, FILEDATETIME)
+        bcStrVal, bcStrCvFloat, bcFileDateTime:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
@@ -5019,6 +5038,8 @@ begin
       Ctx.StringRegs[Instr.Dest] := FormatNumber(Ctx.FloatRegs[Instr.Immediate], Ctx.StringRegs[Instr.Src1]);
     46: // bcCommand - COMMAND$(index): command-line argument(s) passed to the BASIC program.
       Ctx.StringRegs[Instr.Dest] := CommandLine(Ctx.IntRegs[Instr.Src1]);
+    47: // bcFileDateTime - FILEDATETIME(path): last-modified date serial (Double), 0 if absent.
+      Ctx.FloatRegs[Instr.Dest] := FileDateTimeSerial(Ctx.StringRegs[Instr.Src1]);
     36: // bcStrMkInt - MKI/MKL/MKSHORT/MKLONGINT: binary copy of an integer into a string.
       begin
         // Immediate = byte width (2/4/8). Write the low `width` bytes, little-endian (two's complement).

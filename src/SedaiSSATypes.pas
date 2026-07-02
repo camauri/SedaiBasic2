@@ -132,6 +132,7 @@ type
     ssaCommand,        // COMMAND$(index) -> command-line argument(s) (Dest=string, Src1=index int)
     ssaStrFormat,      // FORMAT(num, mask) -> formatted string (Dest=string, Src1=mask string, Immediate=value float reg)
     ssaFileLen,        // FILELEN(path) -> file size in bytes (Dest=int, Src1=string)
+    ssaFileDateTime,   // FILEDATETIME(path) -> last-modified date serial (Dest=float, Src1=string)
     // FreeBASIC numeric serialization (B3): pack/unpack a number to/from a fixed-width binary string.
     ssaStrMkInt,       // MKI/MKL/MKSHORT/MKLONGINT -> binary string of an int (Dest=string, Src1=int, Imm=byte width)
     ssaStrMkFloat,     // MKS/MKD -> 4/8-byte IEEE binary string of a float (Dest=string, Src1=float, Imm=byte width)

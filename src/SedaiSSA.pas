@@ -3739,6 +3739,17 @@ begin
           Exit;
         end;
 
+        // FreeBASIC FILEDATETIME(path): last-modified date serial (0 if absent). MODERN, not a declared array.
+        if FModernMode and (UpperCase(ArrName) = kFILEDATETIME) and (FProgram.FindArray(ArrName) < 0) and
+           (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ArgReg := EnsureStringRegister(ArgValue);
+          Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+          EmitInstruction(ssaFileDateTime, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
         // FreeBASIC CURDIR$() / CURDIR() (parenthesised form): current working directory.
         if FModernMode and ((UpperCase(ArrName) = kCURDIRS) or (UpperCase(ArrName) = kCURDIR)) and
            (FProgram.FindArray(ArrName) < 0) then

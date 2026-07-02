@@ -322,6 +322,7 @@ begin
     bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,  // FreeBASIC math
     // Date/time -> float (date serial = Double)
     bcDateNow, bcDateSerial, bcTimeSerial, bcDateValue, bcDateAdd,
+    bcFileDateTime,  // FILEDATETIME(path): last-modified date serial (float Dest, string Src1)
     // === GROUP 3: Array operations ===
     bcArrayLoadFloat,  // Typed array load (float) - Dest is WRITTEN
     bcRefLoadFloat,    // FreeBASIC pointer deref (float) - Dest = value loaded
@@ -713,7 +714,7 @@ begin
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
     // === GROUP 1: String operations ===
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrLen, bcStrLenW, bcStrAsc, bcStrSAdd,
-    bcFileExists, bcFileLen,  // FILEEXISTS/FILELEN(path): Src1 = path string
+    bcFileExists, bcFileLen, bcFileDateTime,  // FILEEXISTS/FILELEN/FILEDATETIME(path): Src1 = path string
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src1 = source string
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string
     bcEnviron,   // ENVIRON$(name) - Src1 = name string
