@@ -1481,7 +1481,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `() (Array index)` | ✗ |  |
-| `[] (String index)` | ✗ |  |
+| `[] (String index)` | ✓ | `s[i]` reads/writes the byte (character code) at 0-based index `i` of a scalar string (read = `ASC(MID$(s,i+1,1))`; write replaces that byte). |
 | `[] (Pointer index)` | ✓ | `p[i]` (and `p(i)`) ≡ `*(p + i)`, read and write |
 
 #### String Operators

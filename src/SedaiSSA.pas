@@ -357,6 +357,8 @@ type
     procedure ProcessDefType(Node: TASTNode);
     procedure CollectDefTypes(Node: TASTNode);
     procedure ProcessMidStatement(Node: TASTNode);
+    function EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
+    procedure EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
     procedure ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
     procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure EmitWStr(ArgsNode: TASTNode; out Result: TSSAValue);   // FreeBASIC WSTR(x) -> wide string
@@ -4123,6 +4125,16 @@ begin
           Exit;
         end;
 
+        // FreeBASIC string subscript "s[i]" (also "s(i)") on a scalar STRING variable: the byte at the
+        // 0-based index i (its character code). Not an array, not a pointer -> a string byte read.
+        if (FProgram.FindArray(ArrName) < 0) and (GetVariableType(ArrName) = srtString) and
+           (FPointerVars.IndexOfName(UpperCase(ArrName)) < 0) and
+           (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
+        begin
+          Result := EmitStringByteRead(Node.GetChild(0), Node.GetChild(1).GetChild(0));
+          Exit;
+        end;
+
         ArrayIdx := FProgram.FindArray(ArrName);
         if ArrayIdx < 0 then
           raise Exception.CreateFmt('Array not declared: %s', [ArrName]);
@@ -4960,6 +4972,16 @@ begin
   // Get array name
   if TargetNode.GetChild(0).NodeType <> antIdentifier then Exit;
   ArrName := VarToStr(TargetNode.GetChild(0).Value);
+
+  // FreeBASIC string subscript write "s[i] = c" on a scalar STRING variable: set the byte at the
+  // 0-based index i. Not an array, not a pointer -> a string byte write.
+  if (FProgram.FindArray(ArrName) < 0) and (GetVariableType(ArrName) = srtString) and
+     (FPointerVars.IndexOfName(UpperCase(ArrName)) < 0) and
+     (TargetNode.GetChild(1).NodeType = antExpressionList) and (TargetNode.GetChild(1).ChildCount = 1) then
+  begin
+    EmitStringByteWrite(TargetNode.GetChild(0), TargetNode.GetChild(1).GetChild(0), ExprNode, Node.Token);
+    Exit;
+  end;
 
   // Find array in program
   ArrayIdx := FProgram.FindArray(ArrName);
@@ -6177,6 +6199,74 @@ begin
   AsnNode := TASTNode.Create(antAssignment, Node.Token);
   AsnNode.AddChild(TargetNode.Clone);
   TmpRef := TASTNode.CreateWithValue(antIdentifier, TmpName, Node.Token);
+  AsnNode.AddChild(TmpRef);
+  ProcessAssignment(AsnNode);
+  AsnNode.Free;
+end;
+
+function TSSAGenerator.EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
+// FreeBASIC "s[i]" on a scalar STRING: the byte (character code) at 0-based index i. Lowered to
+// ASC(MID$(s, i+1, 1)) with existing string ops (no new opcode). Out-of-range -> 0 (ASC of "").
+var
+  SVal, IdxVal, SReg, IdxReg, OneReg, StartReg, LenReg, MidReg: TSSAValue;
+  NoneV: TSSAValue;
+begin
+  NoneV := MakeSSAValue(svkNone);
+  ProcessExpression(SNode, SVal);   SReg := EnsureStringRegister(SVal);
+  ProcessExpression(IdxNode, IdxVal); IdxReg := EnsureIntRegister(IdxVal);
+  OneReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, OneReg, MakeSSAConstInt(1), NoneV, NoneV);
+  StartReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, StartReg, IdxReg, OneReg, NoneV);         // start = i + 1 (MID is 1-based)
+  LenReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, LenReg, MakeSSAConstInt(1), NoneV, NoneV);
+  MidReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaStrMid, MidReg, SReg, StartReg, LenReg);          // MID$(s, i+1, 1)
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaStrAsc, Result, MidReg, NoneV, NoneV);            // ASC(...)
+end;
+
+procedure TSSAGenerator.EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
+// FreeBASIC "s[i] = c" on a scalar STRING: set the byte at 0-based index i to character code c.
+// Lowered to s = LEFT$(s, i) + CHR$(c) + MID$(s, i+2, LEN(s)), landing in a named temp string var,
+// then written back through the existing assignment machinery. No new opcode.
+var
+  SVal, IdxVal, ValVal, SReg, IdxReg, ValReg: TSSAValue;
+  PrefixReg, ChrReg, TwoReg, SufStartReg, LenSReg, SufReg, R1Reg, ResultReg: TSSAValue;
+  NoneV: TSSAValue;
+  TmpName: string;
+  AsnNode, TmpRef: TASTNode;
+begin
+  NoneV := MakeSSAValue(svkNone);
+  ProcessExpression(SNode, SVal);   SReg := EnsureStringRegister(SVal);
+  ProcessExpression(IdxNode, IdxVal); IdxReg := EnsureIntRegister(IdxVal);
+  ProcessExpression(ValNode, ValVal); ValReg := EnsureIntRegister(ValVal);
+  // prefix = LEFT$(s, i)   (the first i bytes, before the target)
+  PrefixReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaStrLeft, PrefixReg, SReg, IdxReg, NoneV);
+  // chr = CHR$(c)
+  ChrReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaStrChr, ChrReg, ValReg, NoneV, NoneV);
+  // suffix = MID$(s, i+2, LEN(s))   (the rest, after the replaced byte)
+  TwoReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, TwoReg, MakeSSAConstInt(2), NoneV, NoneV);
+  SufStartReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, SufStartReg, IdxReg, TwoReg, NoneV);
+  LenSReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaStrLen, LenSReg, SReg, NoneV, NoneV);
+  SufReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaStrMid, SufReg, SReg, SufStartReg, LenSReg);
+  // result = prefix + chr + suffix, into a named temp so it can be assigned back to the target lvalue.
+  TmpName := '__IDX' + IntToStr(FSwapTempSeq) + '$';
+  Inc(FSwapTempSeq);
+  ResultReg := GetOrAllocateVariable(TmpName);
+  R1Reg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaStrConcat, R1Reg, PrefixReg, ChrReg, NoneV);
+  EmitInstruction(ssaStrConcat, ResultReg, R1Reg, SufReg, NoneV);
+  // s = result
+  AsnNode := TASTNode.Create(antAssignment, Tok);
+  AsnNode.AddChild(SNode.Clone);
+  TmpRef := TASTNode.CreateWithValue(antIdentifier, TmpName, Tok);
   AsnNode.AddChild(TmpRef);
   ProcessAssignment(AsnNode);
   AsnNode.Free;
