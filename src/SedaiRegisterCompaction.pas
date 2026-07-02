@@ -309,7 +309,7 @@ begin
     bcRecordLoadFloat,
     // === GROUP 0: Core VM operations ===
     bcLoadConstFloat, bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat,
-    bcNegFloat, bcPowFloat,
+    bcModFloat, bcNegFloat, bcPowFloat,
     // Conversion to float
     bcIntToFloat, bcStringToFloat,
     bcNarrowSingle,  // B1.5: single-precision rounding (Dest=float)
@@ -541,7 +541,7 @@ begin
     bcXferStoreFloat,
     // === GROUP 0: Core VM operations ===
     // Float arithmetic
-    bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcNegFloat, bcPowFloat,
+    bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcModFloat, bcNegFloat, bcPowFloat,
     // Float comparisons
     bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat,
     // Conversion from float
@@ -677,7 +677,7 @@ begin
     bcRawStoreFloat,
     // === GROUP 0: Core VM operations ===
     // Float arithmetic (second operand)
-    bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcPowFloat,
+    bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcModFloat, bcPowFloat,
     // Float comparisons (second operand)
     bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat,
     // === SUPERINSTRUCTIONS ===
