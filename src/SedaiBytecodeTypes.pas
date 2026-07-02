@@ -437,6 +437,8 @@ const
   bcRawMemCopy      = bcGroupArray + 31;  // Dest=dst ptr(result); Src1=dst raw ptr; Src2=src raw ptr; Immediate=byte count reg
   bcRawMemMove      = bcGroupArray + 32;  // same layout as bcRawMemCopy; overlap-safe (identical here, FPC Move is overlap-safe)
   bcRawClear        = bcGroupArray + 33;  // Src1=dst raw ptr; Src2=byte value reg; Immediate=byte count reg
+  bcArrayBind       = bcGroupArray + 34;  // Array BYREF param bind: Src1=param array id, Src2=arg array id (both immediates). Saves FArrays[Src1] then aliases it to FArrays[Src2] (shares the element data). No registers.
+  bcArrayUnbind     = bcGroupArray + 35;  // Restore the last saved FArrays[Src1] (Src1=param array id immediate). Pops the bind save-stack.
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values
@@ -1573,6 +1575,8 @@ begin
         31: Result := 'RawMemCopy';
         32: Result := 'RawMemMove';
         33: Result := 'RawClear';
+        34: Result := 'ArrayBind';
+        35: Result := 'ArrayUnbind';
       else
         Result := Format('Array_%d', [SubOp]);
       end;

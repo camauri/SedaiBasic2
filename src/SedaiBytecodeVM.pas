@@ -178,6 +178,11 @@ type
     FFunctionKeys: array[1..12] of string;
     FVarMap: TStringList;
     FArrays: array of TArrayStorage;
+    // Array BYREF parameter binding (MODERN): a save-stack for bcArrayBind/bcArrayUnbind. Binding
+    // aliases a callee param-array slot to the caller's array (sharing the element data); the saved
+    // original is restored on unbind. A stack so recursion / re-entrancy nest correctly.
+    FArrayBindStack: array of record SlotId: Integer; Saved: TArrayStorage; end;
+    FArrayBindTop: Integer;
     FRedimPendingUBs: array of Integer;   // REDIM multi-dim: upper bounds accumulated by bcArrayRedimPush, consumed by bcArrayRedimN
     FIdxPending: array of Int64;          // runtime multi-dim index: indices accumulated by bcArrayIdxPush, consumed by bcArrayIdxResolve
 
@@ -6107,6 +6112,32 @@ begin
       end;
     33: // bcRawClear - CLEAR(dst, value, bytes)
       RawClear(Ctx.IntRegs[Instr.Src1], Byte(Ctx.IntRegs[Instr.Src2]), PtrUInt(Ctx.IntRegs[Instr.Immediate]));
+    34: // bcArrayBind - array BYREF param: save FArrays[Src1], then alias it to FArrays[Immediate] (share
+      begin  // the element data, so the callee's writes hit the caller's array). Src1=param id, Imm=arg id.
+        if (Instr.Src1 >= 0) and (Instr.Immediate >= 0) and (Instr.Immediate <= High(FArrays)) then
+        begin
+          // The param placeholder array is never runtime-DIM'd, so grow FArrays to hold its slot.
+          if Instr.Src1 > High(FArrays) then SetLength(FArrays, Instr.Src1 + 1);
+          if FArrayBindTop >= Length(FArrayBindStack) then
+            SetLength(FArrayBindStack, (FArrayBindTop + 1) * 2);
+          FArrayBindStack[FArrayBindTop].SlotId := Instr.Src1;
+          FArrayBindStack[FArrayBindTop].Saved := FArrays[Instr.Src1];   // dyn-array fields share by ref
+          Inc(FArrayBindTop);
+          FArrays[Instr.Src1] := FArrays[Instr.Immediate];               // alias: share the caller's data
+        end;
+      end;
+    35: // bcArrayUnbind - restore the last saved FArrays[Src1] (Src1 = param array id).
+      begin
+        if (FArrayBindTop > 0) and (FArrayBindStack[FArrayBindTop - 1].SlotId = Instr.Src1) then
+        begin
+          Dec(FArrayBindTop);
+          FArrays[Instr.Src1] := FArrayBindStack[FArrayBindTop].Saved;
+          // Release the saved copy's references (the restore transferred ownership back).
+          SetLength(FArrayBindStack[FArrayBindTop].Saved.IntData, 0);
+          SetLength(FArrayBindStack[FArrayBindTop].Saved.FloatData, 0);
+          SetLength(FArrayBindStack[FArrayBindTop].Saved.StringData, 0);
+        end;
+      end;
     27: // bcArrayRedimPush - push one upper bound onto the pending REDIM dimension list
       begin
         SetLength(FRedimPendingUBs, Length(FRedimPendingUBs) + 1);

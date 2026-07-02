@@ -116,6 +116,7 @@ type
     // (they must not run as part of module flow); they are collected here and lowered
     // after the module's END, each into its own block region reachable only via ssaCallSub.
     FDeferredProcs: array of TASTNode;
+    FArrayParamSlots: array of Integer;  // FArrays indices of array-parameter placeholders (runtime lower bounds)
     FProcedureNames: TStringList;  // UPPERCASE names of declared SUB/FUNCTION (call resolution)
     FProcDecls: specialize TDictionary<string, TASTNode>;  // name -> antProcedureDecl (param info)
     // Context while lowering a procedure body (M2): used to lower "fname = expr" / RETURN expr
@@ -215,6 +216,10 @@ type
     function MethodNeedsDispatch(const TypeName, MethNm: string): Boolean;
     procedure GenerateDispatchers;
     procedure LowerDeferredProcedures;
+    procedure RegisterArrayParams;   // pre-register array-parameter placeholder arrays (MODERN byref)
+    procedure EmitArrayArgBinds(const ProcName: string; ArgListNode: TASTNode; Bind: Boolean);
+    function IsArrayParamSlot(Idx: Integer): Boolean;
+    function EmitParamArrayLBoundSub(const Idx: TSSAValue; ArrayIdx, Dim: Integer): TSSAValue;
     function ProcedureLabelName(const Name: string): string;
     // UDT/record support (M3)
     procedure RegisterUDTs(Node: TASTNode);        // pre-scan TYPE declarations (2 passes)
@@ -4175,9 +4180,13 @@ begin
         end;
 
         // FreeBASIC explicit lower bounds ("lb TO ub"): the dimension's allocated size is ub-lb+1 and the
-        // heap is 0-based, so map each source index to a 0-based offset by subtracting its lower bound.
+        // heap is 0-based, so map each source index to a 0-based offset by subtracting its lower bound. For
+        // an array PARAMETER the lower bound is only known at run time (it aliases the caller's array), so
+        // subtract LBOUND(arr, dim) dynamically instead of a compile-time constant.
         for i := 0 to High(Indices) do
-          if (i <= High(ArrInfo.LowerBounds)) and (ArrInfo.LowerBounds[i] <> 0) then
+          if IsArrayParamSlot(ArrayIdx) then
+            Indices[i] := EmitParamArrayLBoundSub(Indices[i], ArrayIdx, i)
+          else if (i <= High(ArrInfo.LowerBounds)) and (ArrInfo.LowerBounds[i] <> 0) then
           begin
             TempReg := FProgram.AllocRegister(srtInt);
             TempVal := MakeSSARegister(srtInt, TempReg);
@@ -5024,9 +5033,12 @@ begin
   end;
 
   // FreeBASIC explicit lower bounds ("lb TO ub"): map each source index to a 0-based offset by
-  // subtracting its dimension's lower bound (the heap is 0-based, size is ub-lb+1).
+  // subtracting its dimension's lower bound (the heap is 0-based, size is ub-lb+1). Array PARAMETERs use
+  // the run-time lower bound (they alias the caller's array).
   for i := 0 to High(Indices) do
-    if (i <= High(ArrInfo.LowerBounds)) and (ArrInfo.LowerBounds[i] <> 0) then
+    if IsArrayParamSlot(ArrayIdx) then
+      Indices[i] := EmitParamArrayLBoundSub(Indices[i], ArrayIdx, i)
+    else if (i <= High(ArrInfo.LowerBounds)) and (ArrInfo.LowerBounds[i] <> 0) then
     begin
       TempReg := FProgram.AllocRegister(srtInt);
       TempVal := MakeSSARegister(srtInt, TempReg);
@@ -14514,9 +14526,12 @@ begin
     end;
   end;
 
-  // Map each index to a 0-based offset honoring explicit lower bounds (lb TO ub).
+  // Map each index to a 0-based offset honoring explicit lower bounds (lb TO ub). Array PARAMETERs use
+  // the run-time lower bound (they alias the caller's array).
   for i := 0 to High(Indices) do
-    if (i <= High(ArrInfo.LowerBounds)) and (ArrInfo.LowerBounds[i] <> 0) then
+    if IsArrayParamSlot(ArrayIdx) then
+      Indices[i] := EmitParamArrayLBoundSub(Indices[i], ArrayIdx, i)
+    else if (i <= High(ArrInfo.LowerBounds)) and (ArrInfo.LowerBounds[i] <> 0) then
     begin
       TempVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(ArrInfo.LowerBounds[i]),
@@ -15198,6 +15213,9 @@ begin
   for i := 0 to Index do
   begin
     if i >= ParamList.ChildCount then Break;
+    // Array parameters are passed by aliasing a VM array slot (bcArrayBind), not through a scalar
+    // transfer slot, so they take no slot in any bank — skip them in the running count.
+    if ParamList.GetChild(i).Attributes.Values['ARRAY'] = '1' then Continue;
     t := GetVariableType(VarToStr(ParamList.GetChild(i).Value));
     RT := t;
     case t of
@@ -15258,6 +15276,9 @@ begin
     if NArgs > ParamList.ChildCount then NArgs := ParamList.ChildCount;
     for i := 0 to NArgs - 1 do
     begin
+      // Array argument (matched to an array parameter): passed by aliasing a VM array slot at the call
+      // site (EmitArrayArgBinds), not staged as a scalar value — skip it here.
+      if ParamList.GetChild(i).Attributes.Values['ARRAY'] = '1' then Continue;
       ArgExpr := ArgListNode.GetChild(i);
       Slot := ParamBankAndSlot(ParamList, i, RT);
       // BYREF-return function with a BYREF (int) param: pass the ADDRESS of the argument variable, not
@@ -15331,7 +15352,9 @@ begin
   if not Assigned(FCurrentBlock) then
     FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('call'));
   StageCallArgs(Name, ArgListNode);
+  EmitArrayArgBinds(Name, ArgListNode, True);    // array params: alias each to the caller's array
   EmitCallSubLabel(ProcedureLabelName(Name));
+  EmitArrayArgBinds(Name, ArgListNode, False);   // restore the aliased array slots after the call returns
   EmitByrefWriteback(Name, ArgListNode);   // BYREF: copy explicit-BYREF scalar params back into variable args
 end;
 
@@ -15374,6 +15397,108 @@ begin
     Exit;
   end;
   EmitProcedureCall(UpperCase(VarToStr(Node.Value)), ArgList);
+end;
+
+procedure TSSAGenerator.RegisterArrayParams;
+// MODERN array parameters: a "name() AS type" parameter is passed ByRef by aliasing a VM array slot
+// (bcArrayBind) at the call site. Pre-register a placeholder array (0-size, the element type from the
+// parameter's AS-type or name suffix) for each array-parameter name, so the body's array accesses
+// resolve to a real slot. Global/CLASSIC arrays are untouched. A shared slot per parameter name is fine:
+// the bind save-stack restores across nested/recursive calls.
+var
+  i, j, Slot: Integer;
+  Proc, ParamList, PN: TASTNode;
+  PName, TypeName: string;
+  ET: TSSARegisterType;
+begin
+  for i := 0 to High(FDeferredProcs) do
+  begin
+    Proc := FDeferredProcs[i];
+    if (Proc.ChildCount < 2) or (Proc.GetChild(1).NodeType <> antParameterList) then Continue;
+    ParamList := Proc.GetChild(1);
+    for j := 0 to ParamList.ChildCount - 1 do
+    begin
+      PN := ParamList.GetChild(j);
+      if PN.Attributes.Values['ARRAY'] <> '1' then Continue;
+      PName := UpperCase(VarToStr(PN.Value));
+      if (PN.ChildCount >= 1) and (PN.GetChild(0).NodeType = antIdentifier) then
+      begin
+        TypeName := UpperCase(VarToStr(PN.GetChild(0).Value));
+        ET := TypeNameToBank(TypeName, '');
+      end
+      else
+        ET := GetVariableType(PName);
+      if FProgram.FindArray(PName) < 0 then
+        FProgram.DeclareArray(PName, ET, [0]);   // placeholder; overwritten by bind at each call
+      // Record the slot so array accesses on it subtract the lower bound at RUNTIME (the bound array's
+      // lower bound varies per call and cannot be a compile-time constant like a normal array's).
+      Slot := FProgram.FindArray(PName);
+      if (Slot >= 0) and not IsArrayParamSlot(Slot) then
+      begin
+        SetLength(FArrayParamSlots, Length(FArrayParamSlots) + 1);
+        FArrayParamSlots[High(FArrayParamSlots)] := Slot;
+      end;
+    end;
+  end;
+end;
+
+function TSSAGenerator.IsArrayParamSlot(Idx: Integer): Boolean;
+var k: Integer;
+begin
+  Result := False;
+  for k := 0 to High(FArrayParamSlots) do
+    if FArrayParamSlots[k] = Idx then Exit(True);
+end;
+
+function TSSAGenerator.EmitParamArrayLBoundSub(const Idx: TSSAValue; ArrayIdx, Dim: Integer): TSSAValue;
+// Return "Idx - LBOUND(array, Dim)" evaluated at run time (Dim is 0-based). Used to map a user index on
+// an array PARAMETER to the 0-based heap offset, since the bound array's lower bound is only known then.
+var
+  DimReg, LbReg: TSSAValue;
+begin
+  DimReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, DimReg, MakeSSAConstInt(Dim), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  LbReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaArrayLBound, LbReg, MakeSSAArrayRef(ArrayIdx, srtInt), DimReg, MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaSubInt, Result, Idx, LbReg, MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.EmitArrayArgBinds(const ProcName: string; ArgListNode: TASTNode; Bind: Boolean);
+// Emit bcArrayBind (Bind=True, before the call) or bcArrayUnbind (Bind=False, after the return) for each
+// array parameter of ProcName. The parameter's placeholder array slot is aliased to the argument array's
+// slot for the duration of the call. The argument is an array reference "name()"/"name" whose array id
+// is resolved by FindArray (a global array or another proc's array-param placeholder).
+var
+  Decl, ParamList, ArgExpr: TASTNode;
+  i, NArgs, ParamId, ArgId: Integer;
+  ArgName: string;
+begin
+  if not (Assigned(ArgListNode) and (ArgListNode.NodeType in [antArgumentList, antExpressionList])) then Exit;
+  if not (FProcDecls.TryGetValue(ProcName, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2)) then Exit;
+  ParamList := Decl.GetChild(1);
+  NArgs := ArgListNode.ChildCount;
+  if NArgs > ParamList.ChildCount then NArgs := ParamList.ChildCount;
+  for i := 0 to NArgs - 1 do
+  begin
+    if ParamList.GetChild(i).Attributes.Values['ARRAY'] <> '1' then Continue;
+    ParamId := FProgram.FindArray(UpperCase(VarToStr(ParamList.GetChild(i).Value)));
+    if ParamId < 0 then Continue;
+    // The array argument's name: an "name()" array-access node (child 0 = identifier) or a bare identifier.
+    ArgExpr := ArgListNode.GetChild(i);
+    if (ArgExpr.NodeType = antArrayAccess) and (ArgExpr.ChildCount >= 1) then
+      ArgName := UpperCase(VarToStr(ArgExpr.GetChild(0).Value))
+    else
+      ArgName := UpperCase(VarToStr(ArgExpr.Value));
+    ArgId := FProgram.FindArray(ArgName);
+    if ArgId < 0 then Continue;
+    if Bind then
+      EmitInstruction(ssaArrayBind, MakeSSAValue(svkNone), MakeSSAArrayRef(ParamId, srtInt),
+                      MakeSSAValue(svkNone), MakeSSAConstInt(ArgId))
+    else
+      EmitInstruction(ssaArrayUnbind, MakeSSAValue(svkNone), MakeSSAArrayRef(ParamId, srtInt),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
 end;
 
 procedure TSSAGenerator.LowerDeferredProcedures;
@@ -15434,6 +15559,10 @@ begin
       for j := 0 to ParamList.ChildCount - 1 do
       begin
         ParamNodeJ := ParamList.GetChild(j);
+        // Array parameter: it is bound to the caller's array by aliasing a VM array slot at the call
+        // site (bcArrayBind), so there is no scalar value to load from a transfer slot. The body's
+        // references to the name resolve to the pre-registered placeholder array (RegisterArrayParams).
+        if ParamNodeJ.Attributes.Values['ARRAY'] = '1' then Continue;
         ParamReg := GetOrAllocateVariable(VarToStr(ParamNodeJ.Value));
         Slot := ParamBankAndSlot(ParamList, j, RT);
         EmitXferLoad(RT, Slot, ParamReg);
@@ -16390,6 +16519,9 @@ begin
   // PRE-COLLECT SUB/FUNCTION DECLARATIONS so CALL sites can resolve parameter info even
   // for procedures defined later in the source (forward references).
   PreCollectProcedures(AST);
+  // Register array-parameter placeholder arrays now (procs are collected), BEFORE any module code or
+  // body is lowered, so every call site's bind and every body's array access resolve the placeholder.
+  RegisterArrayParams;
 
   // V5e: reserve a frame-independent int slot for each destructor-bearing global, so an END inside a
   // SUB/FUNCTION can still destroy it (its module register is hidden under the active frame). Must run

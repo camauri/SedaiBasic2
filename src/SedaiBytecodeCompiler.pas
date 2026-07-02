@@ -350,6 +350,8 @@ begin
     ssaRawMemCopy: Result := bcRawMemCopy;
     ssaRawMemMove: Result := bcRawMemMove;
     ssaRawClear: Result := bcRawClear;
+    ssaArrayBind: Result := bcArrayBind;
+    ssaArrayUnbind: Result := bcArrayUnbind;
     // Graphics operations
     ssaGraphicRGBA: Result := bcGraphicRGBA;
     ssaGraphicSetMode: Result := bcGraphicSetMode;

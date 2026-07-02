@@ -204,6 +204,7 @@ type
     ssaRawAlloc, ssaRawFree, ssaRawRealloc,
     ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat,
     ssaRawMemCopy, ssaRawMemMove, ssaRawClear,   // FB_MEMCOPY/FB_MEMMOVE/CLEAR raw-memory block ops
+    ssaArrayBind, ssaArrayUnbind,   // array BYREF param: alias/restore a param array slot to a caller's array
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
     ssaPrintInt, ssaPrintIntLn,
     ssaPrintBool, ssaPrintUInt,   // B1.5 phase C: BOOLEAN true/false, unsigned-64 print
