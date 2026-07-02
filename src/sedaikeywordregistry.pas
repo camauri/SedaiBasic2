@@ -2081,7 +2081,10 @@ begin
   // reclassified.)
   SetKeywordsDialect([kKEY, kMOVE, kBANK, kFETCH, kSTASH, kRREG, kPEN, kPOT, kJOY, kBUMP,
                       kCOLLECT, kCOLLISION, kSCRATCH, kHEADER, kBACKUP, kCATALOG, kRENUMBER, kAUTO,
-                      kMONITOR, kPUDEF, kMOVSPR, kENVELOPE, kFILTER, kVOL],
+                      kMONITOR, kPUDEF, kMOVSPR, kENVELOPE, kFILTER, kVOL,
+                      // Commodore DOS directory shortcuts (FB uses MKDIR/CHDIR/RMDIR; DIR is an FB
+                      // function so it stays reserved). Common variable names in real FB code (md, cd).
+                      kMD, kCD, kRD, kCP],
                      kdClassicOnly);
 
   //WriteLn('DEBUG RegisterBasicKeywords: Completed registration of ', GetKeywordCount, ' keywords');
