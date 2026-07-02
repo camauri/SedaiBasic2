@@ -5159,6 +5159,9 @@ var
   HasVariableDims: Boolean;
   DimInstr: TSSAInstruction;
   VarDimCount: Integer;
+  InitVals: TASTNode;                       // "=> {...}" array initializer value list
+  InitElemVal, InitElemReg, IdxReg: TSSAValue;
+  k: Integer;                               // "=> {...}" initializer loop index (j is an outer loop var)
   RecTypeName: string;     // M3: DIM..AS type name
   RecUDTIdx: Integer;      // M3
   RecHandleVal: TSSAValue; // M3
@@ -5548,6 +5551,30 @@ begin
       EmitInstruction(ssaRecordNewArray, MakeSSAValue(svkNone),
                       MakeSSAArrayRef(ArrayIdx, srtInt), MakeSSAConstInt(RecPacked),
                       MakeSSAValue(svkNone));
+    end;
+
+    // FreeBASIC array initializer "=> { v0, v1, ... }": store each value into element k (0-based flat
+    // heap position — the values are positional from the array's first element). Not for UDT-element
+    // arrays (handled above). The store's index is the raw 0-based offset (no lower-bound adjustment).
+    if (RecArrUDTIdx < 0) and (ArrayDeclNode.Attributes.Values['ARRAYINIT'] = '1') then
+    begin
+      InitVals := nil;
+      for k := 0 to ArrayDeclNode.ChildCount - 1 do
+        if ArrayDeclNode.GetChild(k).NodeType = antArgumentList then
+        begin InitVals := ArrayDeclNode.GetChild(k); Break; end;
+      if Assigned(InitVals) then
+        for k := 0 to InitVals.ChildCount - 1 do
+        begin
+          ProcessExpression(InitVals.GetChild(k), InitElemVal);
+          case ElementType of
+            srtFloat:  InitElemReg := EnsureFloatRegister(InitElemVal);
+            srtString: InitElemReg := EnsureStringRegister(InitElemVal);
+          else         InitElemReg := EnsureIntRegister(InitElemVal);
+          end;
+          IdxReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, IdxReg, MakeSSAConstInt(k), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          EmitInstruction(ssaArrayStore, InitElemReg, MakeSSAArrayRef(ArrayIdx, ElementType), IdxReg, MakeSSAValue(svkNone));
+        end;
     end;
   end;
 end;

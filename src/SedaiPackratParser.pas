@@ -5858,6 +5858,7 @@ var
   VarName: TASTNode;
   Dimensions: TASTNode;
   Token, TypeTok: TLexerToken;
+  InitList, ValExpr: TASTNode;
 begin
   Token := Context.CurrentToken;
 
@@ -5922,6 +5923,30 @@ begin
         Context.Advance;                              // '*'
         FExpressionParser.ParseExpression(precCall).Free;   // length operand (discarded)
       end;
+    end;
+  end;
+
+  // FreeBASIC array initializer: "DIM arr(dims) AS type => { v0, v1, ... }". "=>" is lexed as '=' then
+  // '>'. Parse the brace value list into an antArgumentList child (marked ARRAYINIT); the SSA stores each
+  // value into the corresponding element after allocating the array.
+  if Context.Check(ttOpEq) and Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpGt) then
+  begin
+    Context.Advance;                                  // =
+    Context.Advance;                                  // >
+    if Context.Check(ttDelimBraceOpen) then
+    begin
+      Context.Advance;                                // {
+      InitList := TASTNode.Create(antArgumentList, Token);
+      if not Context.Check(ttDelimBraceClose) then
+        repeat
+          ValExpr := FExpressionParser.ParseExpression;
+          if not Assigned(ValExpr) then Break;
+          InitList.AddChild(ValExpr);
+          if Context.Check(ttSeparParam) then Context.Advance else Break;
+        until Context.CheckAny([ttDelimBraceClose, ttEndOfLine, ttEndOfFile, ttSeparStmt]);
+      if Context.Check(ttDelimBraceClose) then Context.Advance;   // }
+      Result.Attributes.Values['ARRAYINIT'] := '1';
+      Result.AddChild(InitList);                      // initializer values (antArgumentList)
     end;
   end;
 
