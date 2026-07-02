@@ -1420,8 +1420,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `STR and WSTR` | ✓ | Converts numeric expressions to their string representation (`STR$`/`WSTR`; `WSTR` yields a wide string). |
 | `VAL` | ✓ | Converts a numeric string expression to a floating-point value. |
-| `VALINT and VALUINT` | ✓ | Converts numeric string expressions to integer values. Parses the leading integer (B1.3; range/sign differences deferred). |
-| `VALLNG and VALULNG` | ✓ | `VALLNG`/`VALULNG` — parse a leading 64-bit signed/unsigned integer from a string. |
+| `VALINT and VALUINT` | ✓ | Converts numeric string expressions to integer values. Parses the leading integer, including `&H`/`&O`/`&B` base prefixes (B1.3; range/sign differences deferred). |
+| `VALLNG and VALULNG` | ✓ | `VALLNG`/`VALULNG` — parse a leading 64-bit signed/unsigned integer from a string, including `&H`/`&O`/`&B` base prefixes. |
 
 ##### Conversion to boolean types
 
@@ -2340,7 +2340,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `VALINT` | ✓ | Returns the Integer conversion of a numeric string. |
 | `VALLNG` | ✓ | Returns the Long conversion of a numeric string. |
 | `VALUINT` | ✓ | Returns the uInteger conversion of a numeric string. |
-| `VALULNG` | ✗ | Returns the ULong conversion of a numeric string. |
+| `VALULNG` | ✓ | Returns the ULong conversion of a numeric string. |
 
 #### Numeric Serialization
 

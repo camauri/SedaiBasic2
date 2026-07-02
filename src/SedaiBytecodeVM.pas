@@ -4873,12 +4873,15 @@ procedure TBytecodeVM.RunDebug;
   ============================================================================ }
 
 // Parse the leading integer of a string (optional sign + digits), stopping at the
-// first non-numeric character - matches FreeBASIC VALINT/VALLNG/VALUINT. Returns 0
-// when no digits are present.
+// first non-numeric character - matches FreeBASIC VALINT/VALLNG/VALUINT/VALULNG.
+// A "&H"/"&O"/"&B" prefix selects hexadecimal/octal/binary parsing. Returns 0 when
+// no digits are present.
 function ParseLeadingInt64(const S: string): Int64;
 var
-  I, Len: Integer;
+  I, Len, Base, D: Integer;
   Neg: Boolean;
+  C: Char;
+  U: QWord;
 begin
   Result := 0;
   Len := Length(S);
@@ -4889,6 +4892,33 @@ begin
   begin
     Neg := (S[I] = '-');
     Inc(I);
+  end;
+  // FreeBASIC base prefixes: &H hex, &O octal, &B binary.
+  if (I < Len) and (S[I] = '&') then
+  begin
+    C := UpCase(S[I + 1]);
+    Base := 0;
+    if C = 'H' then Base := 16
+    else if C = 'O' then Base := 8
+    else if C = 'B' then Base := 2;
+    if Base > 0 then
+    begin
+      Inc(I, 2);  // skip the "&X" prefix
+      U := 0;
+      while I <= Len do
+      begin
+        C := UpCase(S[I]);
+        if (C >= '0') and (C <= '9') then D := Ord(C) - Ord('0')
+        else if (C >= 'A') and (C <= 'F') then D := Ord(C) - Ord('A') + 10
+        else Break;
+        if D >= Base then Break;
+        U := U * QWord(Base) + QWord(D);
+        Inc(I);
+      end;
+      Result := Int64(U);
+      if Neg then Result := -Result;
+      Exit;
+    end;
   end;
   while (I <= Len) and (S[I] >= '0') and (S[I] <= '9') do
   begin
