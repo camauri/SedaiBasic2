@@ -815,6 +815,16 @@ begin
     // Simple blocking ReadLn
     System.ReadLn(Input);
 
+    // Standard input exhausted (EOF — piped/redirected input, or a headless run): stop asking. Signal
+    // quit so a numeric INPUT loop does not spin "?REDO FROM START" forever (and eventually crash); the
+    // program ends cleanly instead. At an interactive terminal EOF is only reached on Ctrl-Z / Ctrl-D.
+    if System.Eof(System.Input) and (Input = '') then
+    begin
+      FShouldQuit := True;
+      Result := '';
+      Exit;
+    end;
+
     // Validate if numeric only
     if NumericOnly and (Input <> '') then
     begin
