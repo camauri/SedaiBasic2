@@ -970,6 +970,12 @@ begin
         else if Assigned(Context.PeekNext) and
                 (Context.PeekNext.TokenType in [ttNumber, ttInteger, ttFloat, ttStringLiteral, ttIdentifier]) then
           Result := Memoize('BareCallStatement', @ParseBareCallStatement)
+        // FreeBASIC/QB bare parameterless SUB call: a lone "SubName" as a whole statement (nothing after
+        // the name before the end of the statement). Parsed as an argument-less call; the SSA no-ops it
+        // if the name is not a known procedure, so a stray bare identifier does not misfire as a call.
+        else if Assigned(Context.PeekNext) and
+                (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+          Result := Memoize('BareCallStatement', @ParseBareCallStatement)
         else
         begin
           // Prova SEMPRE assignment prima per identifier

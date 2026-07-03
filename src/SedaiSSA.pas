@@ -15639,6 +15639,13 @@ begin
     end;
     Exit;
   end;
+  // A bare parameterless "name" statement that is NOT a declared procedure is just a stray identifier
+  // (the parser routes any lone identifier statement here). Treat it as a no-op instead of emitting a
+  // call to an undefined PROC_ label (which the CFG pass would reject). Calls WITH arguments, or to a
+  // known procedure, fall through to the normal lowering.
+  if (not Assigned(ArgList) or (ArgList.ChildCount = 0)) and
+     (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) then
+    Exit;
   EmitProcedureCall(UpperCase(VarToStr(Node.Value)), ArgList);
 end;
 
