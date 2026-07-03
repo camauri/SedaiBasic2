@@ -5926,13 +5926,16 @@ begin
     end;
   end;
 
-  // FreeBASIC array initializer: "DIM arr(dims) AS type => { v0, v1, ... }". "=>" is lexed as '=' then
-  // '>'. Parse the brace value list into an antArgumentList child (marked ARRAYINIT); the SSA stores each
-  // value into the corresponding element after allocating the array.
-  if Context.Check(ttOpEq) and Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpGt) then
+  // FreeBASIC array initializer: "DIM arr(dims) AS type = { v0, v1, ... }" or "=> { ... }". Both '=' and
+  // '=>' are valid initializer signs (FB manual: plain '=' is the common form, '=>' avoids the declaration
+  // resembling an expression); "=>" is lexed as '=' then '>'. Parse the brace value list into an
+  // antArgumentList child (marked ARRAYINIT); the SSA stores each value into the corresponding element
+  // after allocating the array.
+  if Context.Check(ttOpEq) and Assigned(Context.PeekNext) and
+     ((Context.PeekNext.TokenType = ttOpGt) or (Context.PeekNext.TokenType = ttDelimBraceOpen)) then
   begin
     Context.Advance;                                  // =
-    Context.Advance;                                  // >
+    if Context.Check(ttOpGt) then Context.Advance;    // optional '>' (=> form)
     if Context.Check(ttDelimBraceOpen) then
     begin
       Context.Advance;                                // {
@@ -6107,8 +6110,12 @@ begin
     begin
       ArrayDecl := ParseArrayDeclaration;
       if not Assigned(ArrayDecl) then Break;
-      if ArrayDecl.ChildCount < 3 then         // no explicit element type -> use the shared type
-        ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, SharedTypeName, SharedTypeTok));
+      // Inject the shared type unless the array already carries an explicit element-type child. The type
+      // child (when present) is the antIdentifier at index 2; an ARRAYINIT initializer is an antArgumentList
+      // that also lands at/after index 2, so a bare ChildCount check would wrongly skip type injection for
+      // "DIM AS String a(n) = { ... }". Insert at index 2 so it precedes any initializer list.
+      if (ArrayDecl.ChildCount < 3) or (ArrayDecl.GetChild(2).NodeType <> antIdentifier) then
+        ArrayDecl.InsertChild(2, TASTNode.CreateWithValue(antIdentifier, SharedTypeName, SharedTypeTok));
       if IsShared then ArrayDecl.Attributes.Values['SHARED'] := '1';
       Result.AddChild(ArrayDecl);
       if Context.Check(ttSeparParam) then begin Context.Advance; Continue; end;
