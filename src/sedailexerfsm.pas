@@ -117,6 +117,8 @@ type
     // === INTERNAL METHODS ===
     function GetCurrentChar: Char; inline;
     function PeekChar(Offset: Integer = 1): Char; inline;
+    function IsLineContinuationHere: Boolean;   // current char '_' is a FreeBASIC line-continuation marker
+    procedure ConsumeLineContinuation;          // consume '_' + rest-of-line + newline (no token emitted)
     procedure AdvanceChar;
     function CreateToken(TokenType: TTokenType; KeywordInfo: TKeywordInfo = nil): TLexerToken; inline;
     function AllocTokenRec: Integer; inline;  // Returns index to new TTokenRec
@@ -1089,6 +1091,43 @@ begin
     Result := #0;
 end;
 
+function TLexerFSM.IsLineContinuationHere: Boolean;
+// Precondition: GetCurrentChar = '_'. Returns True when this '_' is a FreeBASIC
+// line-continuation marker, i.e. a STANDALONE '_' whose remainder of the physical line is
+// only whitespace (optionally a ' comment) before the newline/EOF. This distinguishes it
+// from '_' as an identifier character: '_foo' has a letter after the '_' (not a line end),
+// and 'a_' is consumed by the identifier scanner before this point is ever reached.
+var
+  Off: Integer;
+  Ch: Char;
+begin
+  Off := 1;
+  Ch := PeekChar(Off);
+  while (Ch = ' ') or (Ch = #9) do
+  begin
+    Inc(Off);
+    Ch := PeekChar(Off);
+  end;
+  Result := (Ch = #10) or (Ch = #13) or (Ch = #0) or (Ch = '''');
+end;
+
+procedure TLexerFSM.ConsumeLineContinuation;
+// Precondition: IsLineContinuationHere = True. Consumes the '_', any trailing whitespace, an
+// optional trailing ' comment, and the terminating CR/LF/CRLF, so the logical line continues
+// seamlessly on the next physical line. No token is emitted. AdvanceChar keeps FCurrentLine
+// accurate (it treats CRLF as a single step), so token line numbers stay correct.
+var
+  Ch: Char;
+begin
+  AdvanceChar;  // consume '_'
+  Ch := GetCurrentChar;
+  while (Ch = ' ') or (Ch = #9) do begin AdvanceChar; Ch := GetCurrentChar; end;
+  if Ch = '''' then
+    while (Ch <> #0) and (Ch <> #10) and (Ch <> #13) do begin AdvanceChar; Ch := GetCurrentChar; end;
+  if (Ch = #13) or (Ch = #10) then
+    AdvanceChar;  // AdvanceChar consumes CRLF as one step
+end;
+
 procedure TLexerFSM.AdvanceChar;
 begin
   if FCurrentPosition <= FSourceLength then
@@ -1794,20 +1833,46 @@ begin
       Exit;
     end;
 
-    // === WHITESPACE - VERY FAST SKIP ===
-    while CurrentChar in [' ', #9] do
+    // === WHITESPACE + LINE CONTINUATION - VERY FAST SKIP ===
+    // A FreeBASIC '_' line-continuation marker joins the current line to the next physical
+    // line. It is consumed here (transparently, like whitespace) together with the newline,
+    // so the two lines lex as one logical line. Identifiers are unaffected: a continuation
+    // '_' is a standalone token followed only by whitespace/comment before the newline, while
+    // '_foo'/'a_' are handled by the identifier scanner (see IsLineContinuationHere).
+    while True do
     begin
-      AdvanceChar;
-      CurrentChar := GetCurrentChar;
-      if (FCurrentPosition > FSourceLength) or (CurrentChar = #0) then
+      while CurrentChar in [' ', #9] do
       begin
-        Result := ProcessEndOfFile;
-        {$IFDEF DEBUG}
-        if FDebugMode then
-          FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
-        {$ENDIF}
-        Exit;
+        AdvanceChar;
+        CurrentChar := GetCurrentChar;
+        if (FCurrentPosition > FSourceLength) or (CurrentChar = #0) then
+        begin
+          Result := ProcessEndOfFile;
+          {$IFDEF DEBUG}
+          if FDebugMode then
+            FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
+          {$ENDIF}
+          Exit;
+        end;
       end;
+
+      if (CurrentChar = '_') and IsLineContinuationHere then
+      begin
+        ConsumeLineContinuation;
+        CurrentChar := GetCurrentChar;
+        if (FCurrentPosition > FSourceLength) or (CurrentChar = #0) then
+        begin
+          Result := ProcessEndOfFile;
+          {$IFDEF DEBUG}
+          if FDebugMode then
+            FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
+          {$ENDIF}
+          Exit;
+        end;
+        Continue;  // keep skipping whitespace on the continued line
+      end;
+
+      Break;
     end;
 
     // === DIRECT CHARACTER DISPATCH - LUA STYLE ===
