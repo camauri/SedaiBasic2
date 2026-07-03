@@ -363,16 +363,29 @@ end;
 
 function TConsoleBehavior.FormatNumber(Value: Double): string;
 var
-  Prefix, Suffix: string;
+  Prefix, Suffix, NumStr: string;
+  Bits: Int64;
+  NonNeg, IsNanV, IsInfV: Boolean;
 begin
   Prefix := '';
   Suffix := '';
+
+  // Classify NaN/Infinity by IEEE-754 bit pattern (a MODERN float division by zero yields these). FP
+  // comparisons and Frac/FloatToStr on a NaN raise EInvalidOp because FPC leaves FP exceptions unmasked,
+  // so the sign and special-value tests must inspect the raw bits, never do arithmetic on Value.
+  Bits := PInt64(@Value)^;
+  IsNanV := ((Bits shr 52) and $7FF = $7FF) and ((Bits and $000FFFFFFFFFFFFF) <> 0);
+  IsInfV := ((Bits shr 52) and $7FF = $7FF) and ((Bits and $000FFFFFFFFFFFFF) =  0);
+  if IsNanV then
+    NonNeg := Bits >= 0            // sign bit (bit 63); a NaN cannot be ordered-compared safely
+  else
+    NonNeg := Value >= 0;         // ordered comparison is safe for finite values and +/-Inf
 
   case FNumberFormat of
     nfCommodore, nfMSX:
       begin
         // Spazio prima se positivo (al posto del segno -)
-        if Value >= 0 then
+        if NonNeg then
           Prefix := ' '
         else
           Prefix := '';  // Il segno - è già nella rappresentazione
@@ -397,18 +410,27 @@ begin
 
     nfCustom:
       begin
-        if FNumberSpaceBefore and (Value >= 0) then
+        if FNumberSpaceBefore and NonNeg then
           Prefix := ' ';
         if FNumberSpaceAfter then
           Suffix := ' ';
       end;
   end;
 
-  // Formatta il numero
-  if Frac(Value) = 0 then
-    Result := Prefix + IntToStr(Round(Value)) + Suffix
+  // Formatta il numero. NaN/Infinity use the FreeBASIC textual forms ("nan"/"inf"/"-inf") and must skip
+  // Frac/FloatToStr (both trap on non-finite input). '-inf' already carries its sign, so drop the Prefix.
+  if IsNanV then
+    NumStr := 'nan'
+  else if IsInfV then
+  begin
+    if NonNeg then NumStr := 'inf' else NumStr := '-inf';
+  end
+  else if Frac(Value) = 0 then
+    NumStr := IntToStr(Round(Value))
   else
-    Result := Prefix + FloatToStr(Value) + Suffix;
+    NumStr := FloatToStr(Value);
+
+  Result := Prefix + NumStr + Suffix;
 end;
 
 function TConsoleBehavior.FormatUInt(Value: QWord): string;

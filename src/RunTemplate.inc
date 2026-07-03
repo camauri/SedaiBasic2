@@ -182,8 +182,9 @@ begin
         32: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] * FloatRegs[Instr.Src1]; Inc(CurPC); end; // bcMulFloatTo
         33: begin // bcDivFloatTo
           if Abs(FloatRegs[Instr.Src1]) < 1e-300 then
-            raise EZeroDivide.Create('Division by zero');
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] / FloatRegs[Instr.Src1];
+            FloatRegs[Instr.Dest] := DivZeroFloat(FloatRegs[Instr.Dest])   // MODERN: IEEE Inf/NaN; CLASSIC: error
+          else
+            FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] / FloatRegs[Instr.Src1];
           Inc(CurPC);
         end;
 
@@ -198,8 +199,9 @@ begin
         52: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end; // bcMulFloatConst
         53: begin // bcDivFloatConst
           if Abs(Double(Pointer(@Instr.Immediate)^)) < 1e-300 then
-            raise EZeroDivide.Create('Division by zero');
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / Double(Pointer(@Instr.Immediate)^);
+            FloatRegs[Instr.Dest] := DivZeroFloat(FloatRegs[Instr.Src1])   // MODERN: IEEE Inf/NaN; CLASSIC: error
+          else
+            FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / Double(Pointer(@Instr.Immediate)^);
           Inc(CurPC);
         end;
 
@@ -282,9 +284,11 @@ begin
         112: begin // bcArrayLoadDivAddFloat: dest = acc + arr[idx] / denom
           // Extra encodes: acc_reg (low 16) + denom_reg (high 16)
           if Abs(FloatRegs[(Instr.Immediate shr 16) and $FFFF]) < 1e-300 then
-            raise EZeroDivide.Create('Division by zero');
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate and $FFFF] +
-            FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]] / FloatRegs[(Instr.Immediate shr 16) and $FFFF];
+            FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate and $FFFF] +
+              DivZeroFloat(FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]])   // MODERN: IEEE; CLASSIC: error
+          else
+            FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate and $FFFF] +
+              FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]] / FloatRegs[(Instr.Immediate shr 16) and $FFFF];
           Inc(CurPC);
         end;
 
@@ -434,8 +438,9 @@ begin
         bcMulFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2]; Inc(CurPC); end;
         bcDivFloat: begin
           if FloatRegs[Instr.Src2] = 0.0 then
-            raise EZeroDivide.Create('Division by zero');
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / FloatRegs[Instr.Src2];
+            FloatRegs[Instr.Dest] := DivZeroFloat(FloatRegs[Instr.Src1])   // MODERN: IEEE Inf/NaN; CLASSIC: error
+          else
+            FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / FloatRegs[Instr.Src2];
           Inc(CurPC);
         end;
         bcModFloat: begin

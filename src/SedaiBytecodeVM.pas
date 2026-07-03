@@ -263,6 +263,10 @@ type
     procedure RaiseFileError(const FBMsg: string; FBCode: Integer; const CBMMsg: string; CBMCode: Integer);
     // FreeBASIC resets Err/Erl after RESUME / RESUME NEXT; Commodore keeps EL/ER. Reset only in MODERN.
     procedure ResetErrorStateIfModern(Ctx: TExecutionContext);
+    // Dialect-aware float division by (near-)zero. FreeBASIC (MODERN) follows IEEE-754: x/0 -> +/-Inf,
+    // 0/0 -> NaN. Commodore BASIC (CLASSIC) raises ?DIVISION BY ZERO ERROR. Given the numerator, returns
+    // the IEEE result in MODERN or raises EZeroDivide in CLASSIC. Used at every float-div-by-zero site.
+    function DivZeroFloat(Numerator: Double): Double;
     // File management operations (executed directly in VM)
     procedure ExecuteCopyFile(const Src, Dest: string; Overwrite: Boolean);
     procedure ExecuteScratch(const Pattern: string; Force: Boolean; Silent: Boolean = False);
@@ -3751,7 +3755,7 @@ begin
           {$ENDIF}
         end
         else
-          raise EZeroDivide.Create('Division by zero');
+          Ctx.FloatRegs[Instr.Dest] := DivZeroFloat(Ctx.FloatRegs[Instr.Src1]);
       end;
     bcPowFloat: Ctx.FloatRegs[Instr.Dest] := Power(Ctx.FloatRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2]);
     bcNegFloat: Ctx.FloatRegs[Instr.Dest] := -Ctx.FloatRegs[Instr.Src1];
@@ -4619,7 +4623,7 @@ begin
       if Ctx.FloatRegs[Instr.Src1] <> 0.0 then
         Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Dest] / Ctx.FloatRegs[Instr.Src1]
       else
-        raise Exception.Create('Division by zero');
+        Ctx.FloatRegs[Instr.Dest] := DivZeroFloat(Ctx.FloatRegs[Instr.Dest]);
 
     // Fused constant arithmetic (Int) - sub-opcodes 40-42
     40: // bcAddIntConst: r[dest] = r[src1] + immediate
@@ -4640,7 +4644,7 @@ begin
       if Double(Pointer(@Instr.Immediate)^) <> 0.0 then
         Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Src1] / Double(Pointer(@Instr.Immediate)^)
       else
-        raise Exception.Create('Division by zero');
+        Ctx.FloatRegs[Instr.Dest] := DivZeroFloat(Ctx.FloatRegs[Instr.Src1]);
 
     // Fused compare-zero-and-branch (Int) - sub-opcodes 60-61
     60: // bcBranchEqZeroInt
@@ -4708,8 +4712,12 @@ begin
     111: // bcArrayLoadSubFloat: dest = acc - arr[idx]
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate] - FArrays[Instr.Src1].FloatData[Ctx.IntRegs[Instr.Src2]];
     112: // bcArrayLoadDivAddFloat: dest = acc + arr[idx] / denom
-      Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate and $FFFF] +
-        FArrays[Instr.Src1].FloatData[Ctx.IntRegs[Instr.Src2]] / Ctx.FloatRegs[(Instr.Immediate shr 16) and $FFFF];
+      if Abs(Ctx.FloatRegs[(Instr.Immediate shr 16) and $FFFF]) < 1e-300 then
+        Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate and $FFFF] +
+          DivZeroFloat(FArrays[Instr.Src1].FloatData[Ctx.IntRegs[Instr.Src2]])   // MODERN: IEEE; CLASSIC: error
+      else
+        Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate and $FFFF] +
+          FArrays[Instr.Src1].FloatData[Ctx.IntRegs[Instr.Src2]] / Ctx.FloatRegs[(Instr.Immediate shr 16) and $FFFF];
 
     // Square-Sum patterns - sub-opcodes 120-121
     120: // bcSquareSumFloat: dest = x*x + y*y
@@ -8104,6 +8112,21 @@ begin
     Ctx.LastErrorLine := 0;
     Ctx.LastErrorMessage := '';
   end;
+end;
+
+function TBytecodeVM.DivZeroFloat(Numerator: Double): Double;
+begin
+  // MODERN (FreeBASIC) follows IEEE-754: a positive numerator over zero is +Inf, a negative one is -Inf,
+  // and 0/0 is NaN. The result is built from Math-unit constants (a plain assignment, so it never triggers
+  // the FP hardware trap that FPC leaves unmasked). CLASSIC (Commodore v7) raises ?DIVISION BY ZERO ERROR.
+  if Assigned(FProgram) and FProgram.ModernMode then
+  begin
+    if Numerator > 0.0 then Result := Infinity
+    else if Numerator < 0.0 then Result := NegInfinity
+    else Result := NaN;
+  end
+  else
+    raise EZeroDivide.Create('Division by zero');
 end;
 
 procedure TBytecodeVM.RaiseFileError(const FBMsg: string; FBCode: Integer; const CBMMsg: string; CBMCode: Integer);
