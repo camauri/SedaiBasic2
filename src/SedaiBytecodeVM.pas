@@ -220,6 +220,8 @@ type
     // Error state for EL, ER, ERR$ (FCtx.LastError*) and TRAP/RESUME (FCtx.Trap*) is per-context.
     FTrueValue: Int64;            // TRUE value: -1 (Commodore BASIC) or 1 (modern BASIC)
     FC128InputMode: Boolean;      // True = C128 mode (accept all, show ?REDO), False = input mask (reject invalid chars)
+    FBoundsCheck: Boolean;        // True = always raise on out-of-bounds array access (even in MODERN). Default False:
+                                  // MODERN follows FreeBASIC (no bounds check -> default read / ignored write), CLASSIC always checks.
     {$IFDEF WEB_MODE}
     FWebContext: TObject;         // TWebContext for web mode (forward reference)
     {$ENDIF}
@@ -245,6 +247,10 @@ type
     procedure ExecuteStringOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteMathOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteArrayOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+    // Dialect-aware bounds test for a flat element index. Returns True when in range. Out of bounds:
+    // CLASSIC (Commodore ?BAD SUBSCRIPT) or an explicit --bounds-check raises; MODERN (FreeBASIC, which
+    // does not bounds-check) returns False so the caller yields a default on read / skips the write.
+    function ArrayBoundsOK(ArrayIdx, LinearIdx: Integer): Boolean;
     procedure EraseArray(ArrayIdx: Integer);                                   // B1.4: ERASE
     procedure RedimArray(ArrayIdx, NewUpper: Integer; Preserve: Boolean);       // B1.4: REDIM (1-D)
     procedure RedimArrayN(ArrayIdx: Integer; const Uppers: array of Integer; Preserve: Boolean); // REDIM multi-dim
@@ -403,6 +409,9 @@ type
     property TrueValue: Int64 read FTrueValue write FTrueValue;
     // C128 INPUT mode: True = accept all then show ?REDO FROM START, False = input mask
     property C128InputMode: Boolean read FC128InputMode write FC128InputMode;
+    // Array bounds checking: when True, every out-of-bounds access raises (a debugging aid, akin to FB's
+    // -exx). Default False -> MODERN skips the check like FreeBASIC; CLASSIC always checks regardless.
+    property BoundsCheck: Boolean read FBoundsCheck write FBoundsCheck;
     // Function key definitions (for console expansion)
     function GetFunctionKey(KeyNum: Integer): string;
     // Event polling callback (for deferred rendering during VM execution)
@@ -5796,6 +5805,19 @@ begin
   FArrays[ArrayIdx].TotalSize := NewSize;
 end;
 
+function TBytecodeVM.ArrayBoundsOK(ArrayIdx, LinearIdx: Integer): Boolean;
+begin
+  if (LinearIdx >= 0) and (LinearIdx < FArrays[ArrayIdx].TotalSize) then
+    Exit(True);
+  // Out of bounds. CLASSIC keeps Commodore's ?BAD SUBSCRIPT semantics; --bounds-check forces the raise in
+  // any dialect. Otherwise MODERN matches FreeBASIC, which performs no bounds check by default: the caller
+  // substitutes a default value on a read and drops the store, keeping us memory-safe (FB would touch
+  // adjacent heap). Enable BoundsCheck to turn accidental out-of-bounds accesses back into hard errors.
+  if FBoundsCheck or (Assigned(FProgram) and not FProgram.ModernMode) then
+    raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
+  Result := False;
+end;
+
 procedure TBytecodeVM.ExecuteArrayOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
@@ -5813,13 +5835,18 @@ begin
         if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
           raise ERangeError.CreateFmt('Array not allocated: %d', [ArrayIdx]);
         LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
-          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
-        case FArrays[ArrayIdx].ElementType of
-          0: Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
-          1: Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
-          2: Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
-        end;
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
+          case FArrays[ArrayIdx].ElementType of
+            0: Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
+            1: Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
+            2: Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
+          end
+        else                                  // MODERN out-of-bounds read -> default (FreeBASIC)
+          case FArrays[ArrayIdx].ElementType of
+            0: Ctx.IntRegs[Instr.Dest] := 0;
+            1: Ctx.FloatRegs[Instr.Dest] := 0.0;
+            2: Ctx.StringRegs[Instr.Dest] := '';
+          end;
       end;
     1: // bcArrayStore (generic, deprecated)
       begin
@@ -5827,13 +5854,12 @@ begin
         if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
           raise ERangeError.CreateFmt('Array not allocated: %d', [ArrayIdx]);
         LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
-          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
-        case FArrays[ArrayIdx].ElementType of
-          0: FArrays[ArrayIdx].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
-          1: FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
-          2: FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
-        end;
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then   // MODERN out-of-bounds store is dropped (FreeBASIC)
+          case FArrays[ArrayIdx].ElementType of
+            0: FArrays[ArrayIdx].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
+            1: FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
+            2: FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
+          end;
       end;
     2: // bcArrayDim
       begin
@@ -5901,73 +5927,85 @@ begin
       begin
         ArrayIdx := Instr.Src1;
         LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
-          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
-        Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
-        {$IFDEF ENABLE_PROFILER}
-        if Assigned(FProfiler) and FProfiler.Enabled then
-          FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
-        {$ENDIF}
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
+        begin
+          Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
+          {$IFDEF ENABLE_PROFILER}
+          if Assigned(FProfiler) and FProfiler.Enabled then
+            FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
+          {$ENDIF}
+        end
+        else
+          Ctx.IntRegs[Instr.Dest] := 0;   // MODERN out-of-bounds read -> default (FreeBASIC)
       end;
     4: // bcArrayLoadFloat
       begin
         ArrayIdx := Instr.Src1;
         LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
-          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
-        Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
-        {$IFDEF ENABLE_PROFILER}
-        if Assigned(FProfiler) and FProfiler.Enabled then
-          FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
-        {$ENDIF}
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
+        begin
+          Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
+          {$IFDEF ENABLE_PROFILER}
+          if Assigned(FProfiler) and FProfiler.Enabled then
+            FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
+          {$ENDIF}
+        end
+        else
+          Ctx.FloatRegs[Instr.Dest] := 0.0;   // MODERN out-of-bounds read -> default
       end;
     5: // bcArrayLoadString
       begin
         ArrayIdx := Instr.Src1;
         LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
-          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
-        Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
-        {$IFDEF ENABLE_PROFILER}
-        if Assigned(FProfiler) and FProfiler.Enabled then
-          FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
-        {$ENDIF}
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
+        begin
+          Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
+          {$IFDEF ENABLE_PROFILER}
+          if Assigned(FProfiler) and FProfiler.Enabled then
+            FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
+          {$ENDIF}
+        end
+        else
+          Ctx.StringRegs[Instr.Dest] := '';   // MODERN out-of-bounds read -> default
       end;
     6: // bcArrayStoreInt
       begin
         ArrayIdx := Instr.Src1;
         LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
-          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
-        FArrays[ArrayIdx].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
-        {$IFDEF ENABLE_PROFILER}
-        if Assigned(FProfiler) and FProfiler.Enabled then
-          FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
-        {$ENDIF}
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then     // MODERN out-of-bounds store is dropped (FreeBASIC)
+        begin
+          FArrays[ArrayIdx].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
+          {$IFDEF ENABLE_PROFILER}
+          if Assigned(FProfiler) and FProfiler.Enabled then
+            FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
+          {$ENDIF}
+        end;
       end;
     7: // bcArrayStoreFloat
       begin
         ArrayIdx := Instr.Src1;
         LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
-          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
-        FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
-        {$IFDEF ENABLE_PROFILER}
-        if Assigned(FProfiler) and FProfiler.Enabled then
-          FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
-        {$ENDIF}
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
+        begin
+          FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
+          {$IFDEF ENABLE_PROFILER}
+          if Assigned(FProfiler) and FProfiler.Enabled then
+            FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
+          {$ENDIF}
+        end;
       end;
     8: // bcArrayStoreString
       begin
         ArrayIdx := Instr.Src1;
         LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (LinearIdx < 0) or (LinearIdx >= FArrays[ArrayIdx].TotalSize) then
-          raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
-        FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
-        {$IFDEF ENABLE_PROFILER}
-        if Assigned(FProfiler) and FProfiler.Enabled then
-          FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
-        {$ENDIF}
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
+        begin
+          FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
+          {$IFDEF ENABLE_PROFILER}
+          if Assigned(FProfiler) and FProfiler.Enabled then
+            FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
+          {$ENDIF}
+        end;
       end;
     9: // bcArrayLBound - LBOUND(arr[, dim]) - Src2 = 0-based dim index (B1.4)
       begin

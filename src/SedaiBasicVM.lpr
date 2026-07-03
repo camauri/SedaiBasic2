@@ -360,6 +360,9 @@ end;
 var
   // Global option for TRUE value in comparisons (-1 = Commodore BASIC, 1 = modern BASIC)
   OptTrueValue: Int64 = -1;
+  // --bounds-check: force array bounds checking on in every dialect (default off; MODERN follows FreeBASIC
+  // and skips it, CLASSIC always checks). A debugging aid analogous to FreeBASIC's -exx.
+  OptBoundsCheck: Boolean = False;
   // Headless file-I/O handler shared by the CLI VM instances (lazily created, freed at exit).
   GFileHandler: TVMFileHandler = nil;
 
@@ -399,6 +402,7 @@ begin
   WriteLn('  --disasm-pre        Show bytecode BEFORE superinstruction fusion');
   WriteLn('  --no-exec           Compile only, do not execute (useful with --disasm)');
   WriteLn('  --no-opt            Skip the SSA/bytecode optimization passes (differential testing)');
+  WriteLn('  --bounds-check      Hard-error on out-of-bounds array access (MODERN too; default follows dialect)');
   WriteLn('  --stats             Show execution statistics');
   WriteLn('  --true-value=N      Set TRUE value for comparisons (-1 or 1, default: -1)');
   WriteLn('                        -1 = Commodore BASIC style (default)');
@@ -1582,6 +1586,7 @@ begin
       VM.SetProgramArgs(GProgramArgs);  // COMMAND$: command-line args after the script
       VM.SetInputDevice(Input);
       VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
+      VM.BoundsCheck := OptBoundsCheck;  // --bounds-check: hard-error on out-of-bounds array access
       VM.LoadProgram(BytecodeProgram);
 
       try
@@ -1832,6 +1837,7 @@ begin
         VM.SetProgramArgs(GProgramArgs);  // COMMAND$: command-line args after the script
         VM.SetInputDevice(Input);
         VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
+        VM.BoundsCheck := OptBoundsCheck;  // --bounds-check: hard-error on out-of-bounds array access
         VM.LoadProgram(BytecodeProgram);
 
         try
@@ -1990,6 +1996,8 @@ begin
         OptNoExec := True
       else if (Param = '--no-opt') or (Param = '--no-optimize') then
         GSSAOptimizationsEnabled := False   // differential-test reference: skip the optimization passes
+      else if (Param = '--bounds-check') or (Param = '--boundscheck') then
+        OptBoundsCheck := True   // force array bounds checking on (even in MODERN); default follows the dialect
       else if Param = '--window' then
         OptWindow := True   // present graphics in an SDL2 window (WITH_WINDOW build only; ignored otherwise)
       else if (Param = '--help') or (Param = '-h') or (Param = '-?') then
