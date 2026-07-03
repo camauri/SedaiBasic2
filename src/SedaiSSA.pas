@@ -5405,6 +5405,33 @@ begin
     // Extract dimension sizes
     DimCount := DimsNode.ChildCount;
 
+    // FreeBASIC variable-length array declared empty ("DIM x()" / "DIM AS T x()"): no subscripts. Model
+    // it as one runtime-sized dimension whose upper bound is -1 (LBOUND 0, so the VM computes size
+    // ub-lb+1 = 0); a later REDIM resizes it. Reusing the variable-dimension path (a register holding the
+    // upper bound) needs no VM change: an empty array is just an array whose runtime upper bound is -1.
+    if (DimCount = 0) and (ArrayDeclNode.Attributes.Values['VARLEN'] = '1') then
+    begin
+      SetLength(Dimensions, 1);
+      Dimensions[0] := 0;                              // 0 => runtime-sized; the ub register below holds -1
+      ArrayIdx := FProgram.DeclareArray(ArrName, ElementType, Dimensions);
+      IdxReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, IdxReg, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      SetLength(DimRegs, 1);     DimRegs[0] := IdxReg.RegIndex;
+      SetLength(DimRegTypes, 1); DimRegTypes[0] := srtInt;
+      FProgram.SetArrayDimRegisters(ArrayIdx, DimRegs, DimRegTypes);
+      EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), MakeSSAArrayRef(ArrayIdx, ElementType),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // Keep the ub register alive for DCE (ssaArrayDim references it only through metadata).
+      if Assigned(FCurrentBlock) and (FCurrentBlock.Instructions.Count > 0) then
+      begin
+        DimInstr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+        SetLength(DimInstr.PhiSources, 1);
+        DimInstr.PhiSources[0].Value := IdxReg;
+        DimInstr.PhiSources[0].FromBlock := nil;
+      end;
+      Continue;
+    end;
+
     // Safety check: must have at least one dimension
     if DimCount < 1 then
       raise Exception.CreateFmt('Array must have at least 1 dimension: %s', [ArrName]);

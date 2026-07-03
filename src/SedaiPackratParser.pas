@@ -5882,30 +5882,45 @@ begin
     Exit;
   end;
 
-  // Parse dimensions
-  Dimensions := ParseDimensionList;
-  if not Assigned(Dimensions) then
+  // FreeBASIC variable-length array with an empty subscript list: "DIM x()" declares a resizable array
+  // that starts empty (UBOUND = -1) and is sized later with REDIM. Accept the empty "()" here as a
+  // dimension list with zero children (marked VARLEN); ProcessDim allocates a 0-element array.
+  if Context.Check(ttDelimParClose) then
   begin
-    HandleError('Expected dimension list', Context.CurrentToken);
-    VarName.Free;
-    Result := nil;
-    Exit;
-  end;
-
-  // Expect closing parenthesis
-  if not Context.Match(ttDelimParClose) then
+    Context.Advance;                                  // )
+    Dimensions := TASTNode.Create(antDimensions);
+    Result := TASTNode.Create(antArrayDecl, Token);
+    Result.AddChild(VarName);
+    Result.AddChild(Dimensions);
+    Result.Attributes.Values['VARLEN'] := '1';
+  end
+  else
   begin
-    HandleError('Expected ")" after dimension list', Context.CurrentToken);
-    VarName.Free;
-    Dimensions.Free;
-    Result := nil;
-    Exit;
-  end;
+    // Parse dimensions
+    Dimensions := ParseDimensionList;
+    if not Assigned(Dimensions) then
+    begin
+      HandleError('Expected dimension list', Context.CurrentToken);
+      VarName.Free;
+      Result := nil;
+      Exit;
+    end;
 
-  // Create array declaration node
-  Result := TASTNode.Create(antArrayDecl, Token);
-  Result.AddChild(VarName);
-  Result.AddChild(Dimensions);
+    // Expect closing parenthesis
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" after dimension list', Context.CurrentToken);
+      VarName.Free;
+      Dimensions.Free;
+      Result := nil;
+      Exit;
+    end;
+
+    // Create array declaration node
+    Result := TASTNode.Create(antArrayDecl, Token);
+    Result.AddChild(VarName);
+    Result.AddChild(Dimensions);
+  end;
 
   // Optional "AS typename" (M3.1): array of UDT (or explicitly-typed array). Attached as a
   // 3rd child antIdentifier(typename); SSA treats a UDT element type as an int handle array.
