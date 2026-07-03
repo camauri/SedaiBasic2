@@ -196,6 +196,18 @@ begin
     begin
       Instr := Block.Instructions[j];
 
+      // Do NOT propagate into a call-argument staging store (ssaXferStore*). These sit at the very end
+      // of a block, right before the ssaCallSub that consumes them, so the block boundary IS a call.
+      // Replacing the staged copy's DEST with its SOURCE means the copy's destination register is no
+      // longer used in this block but is still used AFTER the call (later blocks) — e.g. merge sort's
+      // "iMiddle" staged into the first recursive call and reused by the second call and the merge.
+      // That leaves the destination live across the call with no use in the defining block, a pattern
+      // the register allocator mishandles across the frame save/restore, miscompiling the callee's
+      // argument (a size/data-dependent wrong result). Since the copy is reused after the call it cannot
+      // be eliminated anyway, so propagating here yields no benefit — skip it.
+      if OpIn(Instr.OpCode, [ssaXferStoreInt, ssaXferStoreFloat, ssaXferStoreString]) then
+        Continue;
+
       // Try to replace Src1 in-place
       if TryReplaceCopy(Instr.Src1, Block, j, ReplacedVal) then
       begin
