@@ -3775,11 +3775,9 @@ begin
     // Numeric -> string (FreeBASIC Str() / "&" concat): no leading sign-space, unlike v7 STR$.
     bcIntToString: Ctx.StringRegs[Instr.Dest] := IntToStr(Ctx.IntRegs[Instr.Src1]);
     bcFloatToString:
-      begin
-        Ctx.StringRegs[Instr.Dest] := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]);
-        if (Length(Ctx.StringRegs[Instr.Dest]) > 0) and (Ctx.StringRegs[Instr.Dest][1] = ' ') then
-          Delete(Ctx.StringRegs[Instr.Dest], 1, 1);
-      end;
+      // FreeBASIC Str()/"&" concat of a float: the number with no leading sign-space and no trailing
+      // field-space (FormatNumber adds both under the Commodore preset).
+      Ctx.StringRegs[Instr.Dest] := Trim(FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]));
     bcFloatRound: Ctx.IntRegs[Instr.Dest] := Round(Ctx.FloatRegs[Instr.Src1]);  // CINT (round-to-even)
     bcNarrowInt: Ctx.IntRegs[Instr.Dest] := NarrowInt64(Ctx.IntRegs[Instr.Src1], Instr.Immediate);  // B1.5
     bcNarrowSingle: Ctx.FloatRegs[Instr.Dest] := Single(Ctx.FloatRegs[Instr.Src1]);                  // B1.5
@@ -5381,8 +5379,15 @@ begin
         end;
         Ctx.StringRegs[Instr.Dest] := S;
       end;
-    7: // bcStrStr - STR$(n)
-      Ctx.StringRegs[Instr.Dest] := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]);
+    7: // bcStrStr - STR$(n) / Str(n). FormatNumber applies the console PRINT spacing (a leading sign-
+      // space AND a trailing field-space); neither belongs in the string value returned by STR$/Str.
+      // MODERN (FreeBASIC Str): no spaces at all. CLASSIC (v7 STR$): keep the leading sign-space for a
+      // non-negative value, drop the trailing space. (Without this, e.g. Right(Str(638269696),6) picked
+      // up the trailing space and returned "69696 " instead of "269696".)
+      if Assigned(FProgram) and FProgram.ModernMode then
+        Ctx.StringRegs[Instr.Dest] := Trim(FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]))
+      else
+        Ctx.StringRegs[Instr.Dest] := TrimRight(FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]));
     8: // bcStrVal - VAL(s): leading floating-point number, FreeBASIC style (leading parse + &H/&O/&B).
       begin
         Ctx.FloatRegs[Instr.Dest] := ParseLeadingFloat(Ctx.StringRegs[Instr.Src1]);
