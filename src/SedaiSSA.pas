@@ -218,6 +218,8 @@ type
     procedure LowerDeferredProcedures;
     procedure RegisterArrayParams;   // pre-register array-parameter placeholder arrays (MODERN byref)
     procedure EmitArrayArgBinds(const ProcName: string; ArgListNode: TASTNode; Bind: Boolean);
+    function ParamArrayMangle(const ProcName, ParamName: string): string;  // per-proc placeholder array name
+    function ArrayIndexOf(const ArrName: string): Integer;  // scope-aware array lookup (proc param placeholder first)
     function IsArrayParamSlot(Idx: Integer): Boolean;
     function EmitParamArrayLBoundSub(const Idx: TSSAValue; ArrayIdx, Dim: Integer): TSSAValue;
     function ProcedureLabelName(const Name: string): string;
@@ -2526,7 +2528,7 @@ begin
             ArrName := VarToStr(IndicesNode.GetChild(0).Value)
           else
             ArrName := VarToStr(IndicesNode.Value);
-          ArrayIdx := FProgram.FindArray(ArrName);
+          ArrayIdx := ArrayIndexOf(ArrName);
           if ArrayIdx < 0 then
             raise Exception.CreateFmt('%s: array not declared: %s', [FuncName, ArrName]);
           ArrInfo := FProgram.GetArray(ArrayIdx);
@@ -3606,7 +3608,7 @@ begin
           EmitRawAlloc(Node, Result);
           Exit;
         end;
-        if (UpperCase(ArrName) = 'DEALLOCATE') and (FProgram.FindArray(ArrName) < 0) and
+        if (UpperCase(ArrName) = 'DEALLOCATE') and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount >= 1) then
         begin
           ProcessExpression(Node.GetChild(1).GetChild(0), Left);
@@ -3620,7 +3622,7 @@ begin
         // FB_MEMMOVE(dst,src,bytes), CLEAR(dst,value,bytes), FB_MEMCOPYCLEAR(dst,dstlen,src,srclen).
         // dst/src are raw pointer values (from Allocate); v1 takes the pointer directly. Valid as a
         // statement, or (memcopy/memmove) as an expression yielding the destination pointer.
-        if FModernMode and (FProgram.FindArray(ArrName) < 0) and
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and
            ((UpperCase(ArrName) = kFBMEMCOPY) or (UpperCase(ArrName) = kFBMEMMOVE) or
             (UpperCase(ArrName) = kCLEAR) or (UpperCase(ArrName) = kFBMEMCOPYCLEAR)) then
@@ -3632,7 +3634,7 @@ begin
         // FreeBASIC SIZEOF(T) / LEN(T) — compile-time byte size of a type. The argument is a type name
         // (identifier); a pointer variable argument resolves to pointer size (8). Used for "Allocate(n *
         // SizeOf(Integer))". (Only the single-identifier form; "SizeOf(T PTR)" needs type-arg parsing.)
-        if (UpperCase(ArrName) = 'SIZEOF') and (FProgram.FindArray(ArrName) < 0) and
+        if (UpperCase(ArrName) = 'SIZEOF') and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount = 1) and
            (Node.GetChild(1).GetChild(0).NodeType = antIdentifier) then
         begin
@@ -3656,7 +3658,7 @@ begin
         // FreeBASIC bare MID as the substring function (MODERN only): "MID(s, start [,len])" parses as
         // array access, but in FreeBASIC MID is the function (MID$ stays the v7 form; in CLASSIC MID is
         // a plain identifier/array). Only when MID is not actually a declared array.
-        if FModernMode and (UpperCase(ArrName) = 'MID') and (FProgram.FindArray(ArrName) < 0) then
+        if FModernMode and (UpperCase(ArrName) = 'MID') and (ArrayIndexOf(ArrName) < 0) then
         begin
           EmitMidSubstring(Node.GetChild(1), Result);
           Exit;
@@ -3665,7 +3667,7 @@ begin
         // FreeBASIC STRING(n, ch) / v7-QB STRING$(n, ch): n copies of a character. STRING parses as
         // array access (STRING is a type name, not a registered keyword). STRING$ works in both
         // dialects; bare STRING is the FB form (MODERN only). Only when not actually a declared array.
-        if (FProgram.FindArray(ArrName) < 0) and
+        if (ArrayIndexOf(ArrName) < 0) and
            ((UpperCase(ArrName) = 'STRING$') or (FModernMode and (UpperCase(ArrName) = 'STRING'))) then
         begin
           EmitStringFill(Node.GetChild(1), Result);
@@ -3674,7 +3676,7 @@ begin
 
         // FreeBASIC WSTRING(n, cp) function: n copies of the wide (UTF-8) char for codepoint cp. WSTRING
         // also names the type; as a call (MODERN, not a declared array) it is the fill function.
-        if FModernMode and (UpperCase(ArrName) = kWSTRING) and (FProgram.FindArray(ArrName) < 0) then
+        if FModernMode and (UpperCase(ArrName) = kWSTRING) and (ArrayIndexOf(ArrName) < 0) then
         begin
           EmitWStringFill(Node.GetChild(1), Result);
           Exit;
@@ -3682,7 +3684,7 @@ begin
 
         // FreeBASIC IIF(cond, a, b): short-circuit conditional expression. Parses as array access
         // (IIF is not a registered keyword); intercept in MODERN when it is not a declared array.
-        if FModernMode and (UpperCase(ArrName) = 'IIF') and (FProgram.FindArray(ArrName) < 0) then
+        if FModernMode and (UpperCase(ArrName) = 'IIF') and (ArrayIndexOf(ArrName) < 0) then
         begin
           EmitIif(Node.GetChild(1), Result);
           Exit;
@@ -3690,7 +3692,7 @@ begin
 
         // FreeBASIC WSTR(x): convert a number/string to a wide string (MODERN; parses as array access,
         // WSTR is not a registered keyword). Only when not a declared array.
-        if FModernMode and (UpperCase(ArrName) = kWSTR) and (FProgram.FindArray(ArrName) < 0) then
+        if FModernMode and (UpperCase(ArrName) = kWSTR) and (ArrayIndexOf(ArrName) < 0) then
         begin
           EmitWStr(Node.GetChild(1), Result);
           Exit;
@@ -3700,7 +3702,7 @@ begin
         // bytes (a read-only snapshot — the managed string has no stable mutable buffer address). STRPTR
         // returns a pointer to the string data, equivalent to SADD for var-length strings. MODERN, not an array.
         if FModernMode and ((UpperCase(ArrName) = kSADD) or (UpperCase(ArrName) = kSTRPTR)) and
-           (FProgram.FindArray(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
+           (ArrayIndexOf(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
         begin
           ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
@@ -3711,7 +3713,7 @@ begin
 
         // FreeBASIC bit/byte macros (LOBYTE/HIBYTE/LOWORD/HIWORD/BIT/BITSET/BITRESET) and CBOOL: pure
         // integer functions, parse as array access (not registered keywords). MODERN, not a declared array.
-        if FModernMode and (FProgram.FindArray(ArrName) < 0) and
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and
            ((UpperCase(ArrName) = kLOBYTE) or (UpperCase(ArrName) = kHIBYTE) or
             (UpperCase(ArrName) = kLOWORD) or (UpperCase(ArrName) = kHIWORD) or
             (UpperCase(ArrName) = kBIT) or (UpperCase(ArrName) = kBITSET) or
@@ -3723,14 +3725,14 @@ begin
 
         // FreeBASIC ARRAYLEN(arr): total element count. Not a registered keyword; intercept in MODERN
         // when ARRAYLEN itself is not a declared array. (Its argument names the array to measure.)
-        if FModernMode and (UpperCase(ArrName) = kARRAYLEN) and (FProgram.FindArray(ArrName) < 0) then
+        if FModernMode and (UpperCase(ArrName) = kARRAYLEN) and (ArrayIndexOf(ArrName) < 0) then
         begin
           EmitArrayLen(Node.GetChild(1), Result);
           Exit;
         end;
 
         // FreeBASIC FILEEXISTS(path): -1 if the file exists, else 0. MODERN, not a declared array.
-        if FModernMode and (UpperCase(ArrName) = kFILEEXISTS) and (FProgram.FindArray(ArrName) < 0) and
+        if FModernMode and (UpperCase(ArrName) = kFILEEXISTS) and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).ChildCount >= 1) then
         begin
           ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
@@ -3742,7 +3744,7 @@ begin
 
         // FreeBASIC bare string functions: CHR/STR/LEFT/RIGHT are the canonical FB names for the
         // $-suffixed functions. MODERN, parenthesised call, not a declared array.
-        if FModernMode and (FProgram.FindArray(ArrName) < 0) then
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) then
         begin
           if UpperCase(ArrName) = kCHR then begin EmitBareStringFunc(kCHRS, Node, Result); Exit; end;
           if UpperCase(ArrName) = kSTR then begin EmitBareStringFunc(kSTRS, Node, Result); Exit; end;
@@ -3751,7 +3753,7 @@ begin
         end;
 
         // FreeBASIC FILELEN(path): file size in bytes (0 if absent). MODERN, not a declared array.
-        if FModernMode and (UpperCase(ArrName) = kFILELEN) and (FProgram.FindArray(ArrName) < 0) and
+        if FModernMode and (UpperCase(ArrName) = kFILELEN) and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).ChildCount >= 1) then
         begin
           ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
@@ -3762,7 +3764,7 @@ begin
         end;
 
         // FreeBASIC FILEDATETIME(path): last-modified date serial (0 if absent). MODERN, not a declared array.
-        if FModernMode and (UpperCase(ArrName) = kFILEDATETIME) and (FProgram.FindArray(ArrName) < 0) and
+        if FModernMode and (UpperCase(ArrName) = kFILEDATETIME) and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).ChildCount >= 1) then
         begin
           ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
@@ -3774,7 +3776,7 @@ begin
 
         // FreeBASIC CURDIR$() / CURDIR() (parenthesised form): current working directory.
         if FModernMode and ((UpperCase(ArrName) = kCURDIRS) or (UpperCase(ArrName) = kCURDIR)) and
-           (FProgram.FindArray(ArrName) < 0) then
+           (ArrayIndexOf(ArrName) < 0) then
         begin
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
           EmitInstruction(ssaCurDir, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -3782,7 +3784,7 @@ begin
         end;
 
         // FreeBASIC EXEPATH() (parenthesised form): directory of the running program.
-        if FModernMode and (UpperCase(ArrName) = kEXEPATH) and (FProgram.FindArray(ArrName) < 0) then
+        if FModernMode and (UpperCase(ArrName) = kEXEPATH) and (ArrayIndexOf(ArrName) < 0) then
         begin
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
           EmitInstruction(ssaExePath, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -3791,7 +3793,7 @@ begin
 
         // FreeBASIC ENVIRON$(name) / ENVIRON(name): value of an environment variable.
         if FModernMode and ((UpperCase(ArrName) = kENVIRONS) or (UpperCase(ArrName) = kENVIRON)) and
-           (FProgram.FindArray(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
+           (ArrayIndexOf(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
         begin
           ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
@@ -3803,7 +3805,7 @@ begin
         // FreeBASIC COMMAND$(index) / COMMAND(index): the index-th command-line argument (index<0 = whole
         // command line, 0 = executable name, n>=1 = n-th arg, '' if out of range). Empty parens = -1.
         if FModernMode and ((UpperCase(ArrName) = kCOMMAND) or (UpperCase(ArrName) = kCOMMANDS)) and
-           (FProgram.FindArray(ArrName) < 0) then
+           (ArrayIndexOf(ArrName) < 0) then
         begin
           if Node.GetChild(1).ChildCount >= 1 then
           begin
@@ -3824,7 +3826,7 @@ begin
         // (0 # , . % and scientific E+/E-/e+/e-, plus literals) are supported in v1; date/time masks
         // are deferred. The value goes in the Immediate float-register slot (like DATEADD's serial).
         if FModernMode and ((UpperCase(ArrName) = kFORMAT) or (UpperCase(ArrName) = kFORMATS)) and
-           (FProgram.FindArray(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
+           (ArrayIndexOf(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
         begin
           ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureFloatRegister(ArgValue);          // the number to format
@@ -3847,7 +3849,7 @@ begin
         // (POINT is NOT a reserved keyword, so "Point" stays usable as a type/array name). Only when it
         // is not a declared array, UDT type, or user function.
         if FModernMode and (UpperCase(ArrName) = kPOINT) and
-           (FProgram.FindArray(ArrName) < 0) and (FindUDT(UpperCase(ArrName)) < 0) and
+           (ArrayIndexOf(ArrName) < 0) and (FindUDT(UpperCase(ArrName)) < 0) and
            (FProcedureNames.IndexOf(UpperCase(ArrName)) < 0) and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and
            (Node.GetChild(1).ChildCount >= 2) then
@@ -3866,7 +3868,7 @@ begin
         // POINTER(v) is the Commodore spelling of VARPTR(v) — the address of a variable.
         if FModernMode and ((UpperCase(ArrName) = kVARPTR) or (UpperCase(ArrName) = kPROCPTR) or
                             (UpperCase(ArrName) = kPOINTER)) and
-           (FProgram.FindArray(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
+           (ArrayIndexOf(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
         begin
           ArgNode := Node.GetChild(1).GetChild(0);   // the variable / procedure operand
           if ArgNode.NodeType = antIdentifier then
@@ -3886,7 +3888,7 @@ begin
         // FreeBASIC date/time functions taking arguments. Intercepted by name (not registered as
         // keywords) so common identifiers like YEAR/MONTH/DAY/SECOND/MINUTE/HOUR/WEEKDAY stay usable as
         // variables. MODERN, not a declared array. Date serial = Double (FPC TDateTime epoch 1899-12-30).
-        if FModernMode and (FProgram.FindArray(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
         begin
           ArrNameU := UpperCase(ArrName);
           // YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY(serial) -> int. Immediate selects the field.
@@ -3994,7 +3996,7 @@ begin
         // a fixed-width binary string; CVI/CVL/CVD/CVS/CVSHORT/CVLONGINT unpack one back. Intercepted by
         // name (not registered as keywords). MODERN, not a declared array. Byte width goes in the Immediate.
         // The MK* names accept both the bare and the '$' suffixed form. Widths are FB-faithful on x64.
-        if FModernMode and (FProgram.FindArray(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
         begin
           ArrNameU := UpperCase(ArrName);
           // MK*: integer -> binary string. Width 2/4/8 selects the encoding.
@@ -4054,7 +4056,7 @@ begin
         // FreeBASIC EOF(#n)/LOF(#n)/LOC(#n): file query returning int. Parsed as array access (not
         // registered as keywords, so common names like `loc` stay usable as variables). MODERN, not a
         // declared array. Query code: EOF=0, LOF=2, LOC=3 (matches bcFileQuery).
-        if FModernMode and (FProgram.FindArray(ArrName) < 0) and
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and
            ((UpperCase(ArrName) = kEOF) or (UpperCase(ArrName) = kLOF) or
             (UpperCase(ArrName) = kLOC) or (UpperCase(ArrName) = kSEEK)) and
            (Node.GetChild(1).ChildCount >= 1) then
@@ -4073,7 +4075,7 @@ begin
         // FreeBASIC FILEATTR(filenum [, returntype]): info about an open file number (returntype 1=File
         // Mode [default], 2=OS Handle, 3=Encoding). Src1=handle, Src2=returntype (default 1). MODERN,
         // parsed as array access (not a reserved keyword), not a declared array.
-        if FModernMode and (UpperCase(ArrName) = kFILEATTR) and (FProgram.FindArray(ArrName) < 0) and
+        if FModernMode and (UpperCase(ArrName) = kFILEATTR) and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).ChildCount >= 1) then
         begin
           ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
@@ -4095,7 +4097,7 @@ begin
 
         // FreeBASIC RAW pointer indexing: "p[i]" where p is an Allocate'd raw pointer. The byte address
         // is p + i*SizeOf(pointee); load SizeOf(pointee) bytes from the raw heap with the pointee's type.
-        if (FProgram.FindArray(ArrName) < 0) and IsRawPtr(ArrName) and
+        if (ArrayIndexOf(ArrName) < 0) and IsRawPtr(ArrName) and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
           Left := EmitPointerIndexAddress(ArrName, Node.GetChild(1));   // raw-scaled (see helper)
@@ -4114,7 +4116,7 @@ begin
 
         // FreeBASIC pointer indexing: "p[i]" (also "p(i)") where p is a declared pointer, not an array.
         // Lower to *(p + i): compute the address then load the pointee with p's declared bank.
-        if (FProgram.FindArray(ArrName) < 0) and (FPointerVars.IndexOfName(UpperCase(ArrName)) >= 0) and
+        if (ArrayIndexOf(ArrName) < 0) and (FPointerVars.IndexOfName(UpperCase(ArrName)) >= 0) and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
           Left := EmitPointerIndexAddress(ArrName, Node.GetChild(1));
@@ -4132,7 +4134,7 @@ begin
 
         // FreeBASIC string subscript "s[i]" (also "s(i)") on a scalar STRING variable: the byte at the
         // 0-based index i (its character code). Not an array, not a pointer -> a string byte read.
-        if (FProgram.FindArray(ArrName) < 0) and (GetVariableType(ArrName) = srtString) and
+        if (ArrayIndexOf(ArrName) < 0) and (GetVariableType(ArrName) = srtString) and
            (FPointerVars.IndexOfName(UpperCase(ArrName)) < 0) and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
@@ -4140,7 +4142,7 @@ begin
           Exit;
         end;
 
-        ArrayIdx := FProgram.FindArray(ArrName);
+        ArrayIdx := ArrayIndexOf(ArrName);
         if ArrayIdx < 0 then
           raise Exception.CreateFmt('Array not declared: %s', [ArrName]);
 
@@ -4388,7 +4390,7 @@ begin
   // bytes at p + i*SizeOf(T) into the raw heap.
   if (VarNode.NodeType = antArrayAccess) and (VarNode.ChildCount >= 2) and
      (VarNode.GetChild(0).NodeType = antIdentifier) and
-     (FProgram.FindArray(VarToStr(VarNode.GetChild(0).Value)) < 0) and
+     (ArrayIndexOf(VarToStr(VarNode.GetChild(0).Value)) < 0) and
      IsRawPtr(VarToStr(VarNode.GetChild(0).Value)) and
      (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
   begin
@@ -4411,7 +4413,7 @@ begin
   // FreeBASIC pointer indexing as an lvalue: "p[i] = expr" (also "p(i) = expr") ≡ *(p + i) = expr.
   if (VarNode.NodeType = antArrayAccess) and (VarNode.ChildCount >= 2) and
      (VarNode.GetChild(0).NodeType = antIdentifier) and
-     (FProgram.FindArray(VarToStr(VarNode.GetChild(0).Value)) < 0) and
+     (ArrayIndexOf(VarToStr(VarNode.GetChild(0).Value)) < 0) and
      (FPointerVars.IndexOfName(UpperCase(VarToStr(VarNode.GetChild(0).Value))) >= 0) and
      (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
   begin
@@ -4984,7 +4986,7 @@ begin
 
   // FreeBASIC string subscript write "s[i] = c" on a scalar STRING variable: set the byte at the
   // 0-based index i. Not an array, not a pointer -> a string byte write.
-  if (FProgram.FindArray(ArrName) < 0) and (GetVariableType(ArrName) = srtString) and
+  if (ArrayIndexOf(ArrName) < 0) and (GetVariableType(ArrName) = srtString) and
      (FPointerVars.IndexOfName(UpperCase(ArrName)) < 0) and
      (TargetNode.GetChild(1).NodeType = antExpressionList) and (TargetNode.GetChild(1).ChildCount = 1) then
   begin
@@ -4993,7 +4995,7 @@ begin
   end;
 
   // Find array in program
-  ArrayIdx := FProgram.FindArray(ArrName);
+  ArrayIdx := ArrayIndexOf(ArrName);
   if ArrayIdx < 0 then
     raise Exception.CreateFmt('Array not declared: %s', [ArrName]);
 
@@ -5633,7 +5635,7 @@ begin
     Child := Node.GetChild(j);
     if Child.NodeType <> antIdentifier then Continue;
     ArrName := UpperCase(VarToStr(Child.Value));
-    ArrayIdx := FProgram.FindArray(ArrName);
+    ArrayIdx := ArrayIndexOf(ArrName);
     if ArrayIdx < 0 then
       raise Exception.CreateFmt('ERASE: array not declared: %s', [ArrName]);
     EmitInstruction(ssaArrayErase, MakeSSAValue(svkNone),
@@ -5661,7 +5663,7 @@ begin
     if ArrayDeclNode.ChildCount < 2 then Continue;
     if ArrayDeclNode.GetChild(0).NodeType <> antIdentifier then Continue;
     ArrName := UpperCase(VarToStr(ArrayDeclNode.GetChild(0).Value));
-    ArrayIdx := FProgram.FindArray(ArrName);
+    ArrayIdx := ArrayIndexOf(ArrName);
     if ArrayIdx < 0 then
     begin
       // FreeBASIC allows REDIM to declare a fresh dynamic array (no prior DIM). REDIM parses its target
@@ -5899,7 +5901,7 @@ begin
           Result := srtString
         else
         begin
-          ai := FProgram.FindArray(Nm);
+          ai := ArrayIndexOf(Nm);
           if ai >= 0 then Result := FProgram.GetArray(ai).ElementType
           else Result := srtInt;
         end;
@@ -6080,7 +6082,7 @@ begin
   NameNode := ArgsNode.GetChild(0);
   if NameNode.NodeType = antArrayAccess then ArrName := VarToStr(NameNode.GetChild(0).Value)
   else ArrName := VarToStr(NameNode.Value);
-  ArrayIdx := FProgram.FindArray(ArrName);
+  ArrayIdx := ArrayIndexOf(ArrName);
   if ArrayIdx < 0 then Exit;                       // not an array -> leave Result as none
   DimCount := FProgram.GetArray(ArrayIdx).DimCount;
   if DimCount < 1 then DimCount := 1;
@@ -14065,7 +14067,7 @@ begin
   if Node.GetChild(0).NodeType <> antIdentifier then Exit;
   FuncU := UpperCase(VarToStr(Node.GetChild(0).Value));
   if (FuncU = 'ALLOCATE') or (FuncU = 'CALLOCATE') or (FuncU = 'REALLOCATE') then
-    Result := FProgram.FindArray(FuncU) < 0;
+    Result := ArrayIndexOf(FuncU) < 0;
 end;
 
 procedure TSSAGenerator.EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);
@@ -14296,7 +14298,7 @@ begin
             (Rhs.GetChild(0).NodeType = antIdentifier) and
             ((UpperCase(VarToStr(Rhs.GetChild(0).Value)) = kSADD) or
              (UpperCase(VarToStr(Rhs.GetChild(0).Value)) = kSTRPTR)) and
-            (FProgram.FindArray(VarToStr(Rhs.GetChild(0).Value)) < 0) then
+            (ArrayIndexOf(VarToStr(Rhs.GetChild(0).Value)) < 0) then
       MarkRaw(LhsU);   // p = SADD(s)/STRPTR(s): a raw byte-heap pointer -> deref p[i] onto the byte heap
   end;
   for i := 0 to Node.ChildCount - 1 do
@@ -14407,7 +14409,7 @@ begin
 
   if FRedimMultiArrays.IndexOf(UpperCase(ArrName)) >= 0 then
   begin
-    ai := FProgram.FindArray(ArrName);
+    ai := ArrayIndexOf(ArrName);
     for i := 0 to High(Indices) do
       EmitInstruction(ssaArrayIdxPush, MakeSSAValue(svkNone), Indices[i], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     LinIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -14594,7 +14596,7 @@ var
   TempReg, Stride: Integer;
 begin
   ArrName := VarToStr(Node.GetChild(0).Value);
-  ArrayIdx := FProgram.FindArray(ArrName);
+  ArrayIdx := ArrayIndexOf(ArrName);
   if ArrayIdx < 0 then
     raise Exception.CreateFmt('Cannot take address of element of undeclared array: %s', [ArrName]);
   ArrInfo := FProgram.GetArray(ArrayIdx);
@@ -15497,28 +15499,41 @@ begin
   EmitProcedureCall(UpperCase(VarToStr(Node.Value)), ArgList);
 end;
 
+function TSSAGenerator.ParamArrayMangle(const ProcName, ParamName: string): string;
+// Per-proc placeholder name for an array parameter. The '@' separators cannot appear in a user array
+// name (array names are BASIC identifiers), so this never collides with a module/global array — the
+// whole point: a SUB's "a() As T" parameter must NOT share a slot with a module array also named "a".
+begin
+  Result := '@P@' + ProcName + '@' + ParamName;
+end;
+
 procedure TSSAGenerator.RegisterArrayParams;
 // MODERN array parameters: a "name() AS type" parameter is passed ByRef by aliasing a VM array slot
 // (bcArrayBind) at the call site. Pre-register a placeholder array (0-size, the element type from the
-// parameter's AS-type or name suffix) for each array-parameter name, so the body's array accesses
-// resolve to a real slot. Global/CLASSIC arrays are untouched. A shared slot per parameter name is fine:
-// the bind save-stack restores across nested/recursive calls.
+// parameter's AS-type or name suffix) for each array-parameter, so the body's array accesses resolve to
+// a real slot. Global/CLASSIC arrays are untouched. The placeholder is registered under a PER-PROC
+// mangled name (ParamArrayMangle) so it never collides with a module array of the same name and each
+// proc gets its own slot (also fixes the old element-type collision when two procs share a param name).
+// Body accesses redirect to this slot via ArrayIndexOf; binds restore across nested/recursive calls.
 var
   i, j, Slot: Integer;
   Proc, ParamList, PN: TASTNode;
-  PName, TypeName: string;
+  PName, MangledName, TypeName, ProcName: string;
   ET: TSSARegisterType;
 begin
   for i := 0 to High(FDeferredProcs) do
   begin
     Proc := FDeferredProcs[i];
     if (Proc.ChildCount < 2) or (Proc.GetChild(1).NodeType <> antParameterList) then Continue;
+    if (Proc.ChildCount < 1) or (Proc.GetChild(0).NodeType <> antIdentifier) then Continue;
+    ProcName := UpperCase(VarToStr(Proc.GetChild(0).Value));
     ParamList := Proc.GetChild(1);
     for j := 0 to ParamList.ChildCount - 1 do
     begin
       PN := ParamList.GetChild(j);
       if PN.Attributes.Values['ARRAY'] <> '1' then Continue;
       PName := UpperCase(VarToStr(PN.Value));
+      MangledName := ParamArrayMangle(ProcName, PName);
       if (PN.ChildCount >= 1) and (PN.GetChild(0).NodeType = antIdentifier) then
       begin
         TypeName := UpperCase(VarToStr(PN.GetChild(0).Value));
@@ -15526,11 +15541,11 @@ begin
       end
       else
         ET := GetVariableType(PName);
-      if FProgram.FindArray(PName) < 0 then
-        FProgram.DeclareArray(PName, ET, [0]);   // placeholder; overwritten by bind at each call
+      if FProgram.FindArray(MangledName) < 0 then
+        FProgram.DeclareArray(MangledName, ET, [0]);   // placeholder; overwritten by bind at each call
       // Record the slot so array accesses on it subtract the lower bound at RUNTIME (the bound array's
       // lower bound varies per call and cannot be a compile-time constant like a normal array's).
-      Slot := FProgram.FindArray(PName);
+      Slot := FProgram.FindArray(MangledName);
       if (Slot >= 0) and not IsArrayParamSlot(Slot) then
       begin
         SetLength(FArrayParamSlots, Length(FArrayParamSlots) + 1);
@@ -15538,6 +15553,20 @@ begin
       end;
     end;
   end;
+end;
+
+function TSSAGenerator.ArrayIndexOf(const ArrName: string): Integer;
+// Scope-aware array lookup used throughout lowering. Inside a procedure body, an array name that is one
+// of the current proc's array parameters resolves to that proc's placeholder slot (ParamArrayMangle);
+// otherwise it falls back to the global/module array table. This is what keeps a SUB's "a()" parameter
+// distinct from a module array "a" (see RegisterArrayParams). ArrName is expected UpperCase.
+begin
+  if FInProcedure then
+  begin
+    Result := FProgram.FindArray(ParamArrayMangle(FCurrentProcName, ArrName));
+    if Result >= 0 then Exit;
+  end;
+  Result := FProgram.FindArray(ArrName);
 end;
 
 function TSSAGenerator.IsArrayParamSlot(Idx: Integer): Boolean;
@@ -15580,15 +15609,17 @@ begin
   for i := 0 to NArgs - 1 do
   begin
     if ParamList.GetChild(i).Attributes.Values['ARRAY'] <> '1' then Continue;
-    ParamId := FProgram.FindArray(UpperCase(VarToStr(ParamList.GetChild(i).Value)));
+    // ParamId is the CALLEE's placeholder (mangled with ProcName), not resolved in the caller's scope.
+    ParamId := FProgram.FindArray(ParamArrayMangle(ProcName, UpperCase(VarToStr(ParamList.GetChild(i).Value))));
     if ParamId < 0 then Continue;
     // The array argument's name: an "name()" array-access node (child 0 = identifier) or a bare identifier.
+    // Resolved in the CALLER's scope (ArrayIndexOf) so a caller can forward its own array parameter.
     ArgExpr := ArgListNode.GetChild(i);
     if (ArgExpr.NodeType = antArrayAccess) and (ArgExpr.ChildCount >= 1) then
       ArgName := UpperCase(VarToStr(ArgExpr.GetChild(0).Value))
     else
       ArgName := UpperCase(VarToStr(ArgExpr.Value));
-    ArgId := FProgram.FindArray(ArgName);
+    ArgId := ArrayIndexOf(ArgName);
     if ArgId < 0 then Continue;
     if Bind then
       EmitInstruction(ssaArrayBind, MakeSSAValue(svkNone), MakeSSAArrayRef(ParamId, srtInt),

@@ -180,8 +180,10 @@ type
     FArrays: array of TArrayStorage;
     // Array BYREF parameter binding (MODERN): a save-stack for bcArrayBind/bcArrayUnbind. Binding
     // aliases a callee param-array slot to the caller's array (sharing the element data); the saved
-    // original is restored on unbind. A stack so recursion / re-entrancy nest correctly.
-    FArrayBindStack: array of record SlotId: Integer; Saved: TArrayStorage; end;
+    // original is restored on unbind. A stack so recursion / re-entrancy nest correctly. ArgId is the
+    // caller's array slot, kept so a REDIM [PRESERVE] inside the callee (which reallocates the param's
+    // storage and thereby breaks the shared reference) is propagated back to the caller on unbind.
+    FArrayBindStack: array of record SlotId: Integer; ArgId: Integer; Saved: TArrayStorage; end;
     FArrayBindTop: Integer;
     FRedimPendingUBs: array of Integer;   // REDIM multi-dim: upper bounds accumulated by bcArrayRedimPush, consumed by bcArrayRedimN
     FIdxPending: array of Int64;          // runtime multi-dim index: indices accumulated by bcArrayIdxPush, consumed by bcArrayIdxResolve
@@ -6167,6 +6169,7 @@ begin
           if FArrayBindTop >= Length(FArrayBindStack) then
             SetLength(FArrayBindStack, (FArrayBindTop + 1) * 2);
           FArrayBindStack[FArrayBindTop].SlotId := Instr.Src1;
+          FArrayBindStack[FArrayBindTop].ArgId := Instr.Immediate;
           FArrayBindStack[FArrayBindTop].Saved := FArrays[Instr.Src1];   // dyn-array fields share by ref
           Inc(FArrayBindTop);
           FArrays[Instr.Src1] := FArrays[Instr.Immediate];               // alias: share the caller's data
@@ -6177,6 +6180,15 @@ begin
         if (FArrayBindTop > 0) and (FArrayBindStack[FArrayBindTop - 1].SlotId = Instr.Src1) then
         begin
           Dec(FArrayBindTop);
+          // Propagate the callee's final array back to the caller's slot. If the callee did a REDIM
+          // [PRESERVE], SetLength reallocated the param's storage (breaking the shared reference), so the
+          // caller would otherwise not see the new size/contents; copy it across. When no REDIM happened
+          // the two already share the same data, so this is a harmless same-reference assignment. Skipped
+          // when ArgId aliases the param slot itself (recursive call passing its own array parameter).
+          if (FArrayBindStack[FArrayBindTop].ArgId >= 0) and
+             (FArrayBindStack[FArrayBindTop].ArgId <= High(FArrays)) and
+             (FArrayBindStack[FArrayBindTop].ArgId <> Instr.Src1) then
+            FArrays[FArrayBindStack[FArrayBindTop].ArgId] := FArrays[Instr.Src1];
           FArrays[Instr.Src1] := FArrayBindStack[FArrayBindTop].Saved;
           // Release the saved copy's references (the restore transferred ownership back).
           SetLength(FArrayBindStack[FArrayBindTop].Saved.IntData, 0);
