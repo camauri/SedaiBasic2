@@ -398,6 +398,7 @@ const
   kLEFT    = 'LEFT';
   kRIGHT   = 'RIGHT';
   kHEXS    = 'HEX$';
+  kHEX     = 'HEX';       // integer -> hex string (FreeBASIC allows the suffixless form, like OCT/BIN)
   kLEFTS   = 'LEFT$';
   kMIDS    = 'MID$';
   kRIGHTS  = 'RIGHT$';

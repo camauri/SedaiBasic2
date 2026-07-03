@@ -2466,9 +2466,9 @@ begin
           Result := MakeSSARegister(srtFloat, DestReg);
           EmitInstruction(ssaStrVal, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
-        else if (FuncName = 'HEX$') or (FuncName = kWHEX) then
+        else if (FuncName = 'HEX$') or (FuncName = 'HEX') or (FuncName = kWHEX) then
         begin
-          // HEX$(n) / WHEX(n) - hex string (WHEX = wide; ASCII hex digits are identical UTF-8)
+          // HEX$(n) / HEX(n) / WHEX(n) - hex string (WHEX = wide; ASCII hex digits are identical UTF-8)
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
           else if ArgListNode <> nil then
@@ -5800,8 +5800,15 @@ function TSSAGenerator.InferExprBank(Node: TASTNode): TSSARegisterType;
 // concatenation/arithmetic); falls back to float when unknown.
   function IsBareStringFunc(const Nm: string): Boolean;
   begin
-    Result := (Nm = 'MID') or (Nm = 'STRING') or (Nm = 'UCASE') or (Nm = 'LCASE') or
-              (Nm = 'LTRIM') or (Nm = 'RTRIM') or (Nm = 'TRIM') or (Nm = 'SPACE');
+    // FreeBASIC string-returning intrinsics called without a '$' suffix. Used to infer the bank of an
+    // expression whose leaf is such a call (VAR type inference / IIF result temp). '$'-suffixed forms are
+    // handled separately by the caller (a trailing '$' already implies a string result).
+    Result := (Nm = 'MID') or (Nm = 'LEFT') or (Nm = 'RIGHT') or (Nm = 'STRING') or
+              (Nm = 'SPACE') or (Nm = 'TRIM') or (Nm = 'LTRIM') or (Nm = 'RTRIM') or
+              (Nm = 'UCASE') or (Nm = 'LCASE') or (Nm = 'STR') or (Nm = 'CHR') or
+              (Nm = 'HEX') or (Nm = 'OCT') or (Nm = 'BIN') or (Nm = 'WSTR') or
+              (Nm = 'WCHR') or (Nm = 'WSPACE') or (Nm = 'FORMAT') or (Nm = 'DATE') or
+              (Nm = 'TIME') or (Nm = 'ENVIRON') or (Nm = 'COMMAND') or (Nm = 'INKEY');
   end;
 var
   Nm: string;
@@ -5820,6 +5827,17 @@ begin
         Result := srtInt;
     antIdentifier:
       Result := GetVariableType(VarToStr(Node.Value));
+    antFunctionCall:
+      begin
+        // Function-call leaf (SPACE(n), LEFT(s,n), STR(x), CHR(c), a user FUNCTION, ...). A '$' suffix or a
+        // known string intrinsic yields a string; a user function yields its registered return bank; any
+        // other (numeric) intrinsic falls through to the float default below.
+        Nm := UpperCase(VarToStr(Node.Value));
+        if ((Length(Nm) > 0) and (Nm[Length(Nm)] = '$')) or IsBareStringFunc(Nm) then
+          Result := srtString
+        else if FProcedureNames.IndexOf(Nm) >= 0 then
+          Result := GetVariableType(Nm);
+      end;
     antArrayAccess:
       if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
       begin

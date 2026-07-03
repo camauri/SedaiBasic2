@@ -1785,6 +1785,7 @@ begin
  RegisterKeyword(kASC,    ttStringFunction, 'Return character code',                            kcStringFunctions);
  RegisterKeyword(kCHRS,   ttStringFunction, 'Return character from code',                       kcStringFunctions);
  RegisterKeyword(kHEXS,   ttStringFunction, 'Hex number string from decimal number',            kcStringFunctions);
+ RegisterKeyword(kHEX,    ttStringFunction, 'Hex number string from integer (suffixless form)',  kcStringFunctions);
  RegisterKeyword(kINSTR,  ttStringFunction, 'Position of source string in destination string',  kcStringFunctions);
  RegisterKeyword(kLEN,    ttStringFunction, 'Return string length',                             kcStringFunctions);
  RegisterKeyword(kLTRIM,  ttStringFunction, 'Remove leading spaces',                            kcStringFunctions);
