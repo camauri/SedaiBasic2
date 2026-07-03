@@ -29,6 +29,28 @@ begin
   Result := (C in ['A'..'Z', 'a'..'z', '0'..'9', '_']);
 end;
 
+function StripDirectiveComment(const S: string): string;
+// Remove a trailing "'" line comment from a preprocessor-directive body (e.g. a #define value),
+// honoring double-quoted string literals so a "'" inside a string is kept. FreeBASIC treats "'" as a
+// comment start in a #define body just like in code, so "#define MAX 100 ' note" defines MAX as "100"
+// (without stripping, the comment leaks into the macro body and breaks every expansion site).
+var
+  i: Integer;
+  InStr: Boolean;
+begin
+  InStr := False;
+  i := 1;
+  while i <= Length(S) do
+  begin
+    if S[i] = '"' then
+      InStr := not InStr
+    else if (S[i] = '''') and not InStr then
+      Break;
+    Inc(i);
+  end;
+  Result := TrimRight(Copy(S, 1, i - 1));
+end;
+
 // Replace whole-word object-like macro occurrences using Defs (Names hold UPPER macro names), skipping
 // the contents of "..." string literals. A match must be a full identifier (word boundaries).
 // Split a function-like macro argument string into top-level arguments (commas inside nested parens or
@@ -628,12 +650,12 @@ var
               // Function-like macro "NAME(params) body": store as "params"#1"body" in FnDefs.
               q := p + 1;
               while (q <= Length(DRest)) and (DRest[q] <> ')') do Inc(q);
-              MacroVal := Trim(Copy(DRest, p + 1, q - p - 1)) + #1 + Trim(Copy(DRest, q + 1, MaxInt));
+              MacroVal := Trim(Copy(DRest, p + 1, q - p - 1)) + #1 + Trim(StripDirectiveComment(Copy(DRest, q + 1, MaxInt)));
               if MacroName <> '' then FnDefs.Values[MacroName] := MacroVal;
             end
             else
             begin
-              MacroVal := Trim(Copy(DRest, p, MaxInt));
+              MacroVal := Trim(StripDirectiveComment(Copy(DRest, p, MaxInt)));
               if MacroName <> '' then Defs.Values[MacroName] := MacroVal;
             end;
           end
