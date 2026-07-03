@@ -758,11 +758,10 @@ begin
   LogVerbose(Format('ParseString: %s', [Token.Value]));
   {$ENDIF}
 
+  // The token value is already the final string content (the lexer's ProcessString strips the
+  // surrounding quotes and collapses doubled "" to a single "). Do NOT strip quotes again here: a
+  // legitimate content that itself begins and ends with a quote (e.g. """x""" -> "x") would be corrupted.
   Value := Token.Value;
-
-  // Remove quotes if present
-  if (Length(Value) >= 2) and (Value[1] = '"') and (Value[Length(Value)] = '"') then
-    Value := Copy(Value, 2, Length(Value) - 2);
 
   Result := CreateLiteralNode(Value, Token);
   DoNodeCreated(Result);

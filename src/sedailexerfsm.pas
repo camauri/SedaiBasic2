@@ -1632,10 +1632,16 @@ var
   S: string;
 begin
   Result := CreateToken(ttStringLiteral);
-  // Remove surrounding quotes from string value
+  // Remove surrounding quotes, then collapse each doubled "" to a single literal quote (standard BASIC
+  // string escaping; the scanner kept both quotes of a "" pair in the raw token text).
   S := Result.Value;
   if (Length(S) >= 2) and (S[1] = '"') and (S[Length(S)] = '"') then
-    Result.Value := Copy(S, 2, Length(S) - 2);
+  begin
+    S := Copy(S, 2, Length(S) - 2);
+    if Pos('""', S) > 0 then
+      S := StringReplace(S, '""', '"', [rfReplaceAll]);
+    Result.Value := S;
+  end;
 end;
 
 function TLexerFSM.ProcessComment: TLexerToken;
@@ -2335,12 +2341,25 @@ begin
           AdvanceChar;
 
           // Fast string loop. A plain "..." literal is NON-escaped (FreeBASIC default): '\' is an
-          // ordinary character and a '"' ALWAYS terminates the string. (Escape processing happens only
-          // for the prefixed !"..." form, handled by LexPrefixedString.) Backslash must NOT protect the
-          // closing quote here, otherwise a trailing "\" would swallow the terminator and run to EOF.
+          // ordinary character. Escape processing happens only for the prefixed !"..." form
+          // (LexPrefixedString). The one in-string escape here is the standard BASIC doubled quote: a ""
+          // inside the string is a single literal '"' and does NOT terminate it (e.g. "say ""hi"""). The
+          // buffer is kept byte-for-byte with the source (the token value is extracted from the source by
+          // StartPos/Length), so both quotes of a "" are buffered; ProcessString un-doubles them.
           CurrentChar := GetCurrentChar;
-          while (CurrentChar <> #0) and (CurrentChar <> '"') do
+          while CurrentChar <> #0 do
           begin
+            if CurrentChar = '"' then
+            begin
+              if PeekChar(1) = '"' then
+              begin
+                TokenBufferAdd(CurrentChar); AdvanceChar;      // first quote of the "" pair
+                TokenBufferAdd(GetCurrentChar); AdvanceChar;   // second quote
+                CurrentChar := GetCurrentChar;
+                Continue;
+              end;
+              Break;   // a lone '"' terminates the string
+            end;
             TokenBufferAdd(CurrentChar);
             AdvanceChar;
             CurrentChar := GetCurrentChar;
