@@ -15715,28 +15715,31 @@ begin
 end;
 
 procedure TSSAGenerator.EmitArrayArgBinds(const ProcName: string; ArgListNode: TASTNode; Bind: Boolean);
-// Emit bcArrayBind (Bind=True, before the call) or bcArrayUnbind (Bind=False, after the return) for each
-// array parameter of ProcName. The parameter's placeholder array slot is aliased to the argument array's
-// slot for the duration of the call. The argument is an array reference "name()"/"name" whose array id
-// is resolved by FindArray (a global array or another proc's array-param placeholder).
+// Alias each array parameter of ProcName to its argument array for the duration of a call.
+// Bind=True (before the call): phase 1 emits an ssaArrayBind per array param (save the placeholder slot
+// and SNAPSHOT the arg), then a single ssaArrayBindApply commits all snapshots at once — two-phase so a
+// batch that swaps arrays (recursive "proc(a(),b())" -> "proc(b(),a())", where arg slots coincide with
+// param slots) reads every arg before any assignment. Bind=False (after the return): emits ssaArrayUnbind
+// in REVERSE order so each pops the matching (LIFO) save-stack entry. ParamId is the CALLEE's placeholder
+// (mangled with ProcName); the arg is resolved in the CALLER's scope so a caller can forward its own array
+// parameter.
 var
   Decl, ParamList, ArgExpr: TASTNode;
   i, NArgs, ParamId, ArgId: Integer;
   ArgName: string;
+  Params: array of Integer;   // placeholder slot ids actually bound, in order
 begin
   if not (Assigned(ArgListNode) and (ArgListNode.NodeType in [antArgumentList, antExpressionList])) then Exit;
   if not (FProcDecls.TryGetValue(ProcName, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2)) then Exit;
   ParamList := Decl.GetChild(1);
   NArgs := ArgListNode.ChildCount;
   if NArgs > ParamList.ChildCount then NArgs := ParamList.ChildCount;
+  SetLength(Params, 0);
   for i := 0 to NArgs - 1 do
   begin
     if ParamList.GetChild(i).Attributes.Values['ARRAY'] <> '1' then Continue;
-    // ParamId is the CALLEE's placeholder (mangled with ProcName), not resolved in the caller's scope.
     ParamId := FProgram.FindArray(ParamArrayMangle(ProcName, UpperCase(VarToStr(ParamList.GetChild(i).Value))));
     if ParamId < 0 then Continue;
-    // The array argument's name: an "name()" array-access node (child 0 = identifier) or a bare identifier.
-    // Resolved in the CALLER's scope (ArrayIndexOf) so a caller can forward its own array parameter.
     ArgExpr := ArgListNode.GetChild(i);
     if (ArgExpr.NodeType = antArrayAccess) and (ArgExpr.ChildCount >= 1) then
       ArgName := UpperCase(VarToStr(ArgExpr.GetChild(0).Value))
@@ -15744,13 +15747,22 @@ begin
       ArgName := UpperCase(VarToStr(ArgExpr.Value));
     ArgId := ArrayIndexOf(ArgName);
     if ArgId < 0 then Continue;
+    SetLength(Params, Length(Params) + 1);
+    Params[High(Params)] := ParamId;
     if Bind then
       EmitInstruction(ssaArrayBind, MakeSSAValue(svkNone), MakeSSAArrayRef(ParamId, srtInt),
-                      MakeSSAValue(svkNone), MakeSSAConstInt(ArgId))
-    else
-      EmitInstruction(ssaArrayUnbind, MakeSSAValue(svkNone), MakeSSAArrayRef(ParamId, srtInt),
-                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                      MakeSSAValue(svkNone), MakeSSAConstInt(ArgId));
   end;
+  if Bind then
+  begin
+    if Length(Params) > 0 then
+      EmitInstruction(ssaArrayBindApply, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                      MakeSSAValue(svkNone), MakeSSAConstInt(Length(Params)));
+  end
+  else
+    for i := High(Params) downto 0 do   // reverse: LIFO save-stack
+      EmitInstruction(ssaArrayUnbind, MakeSSAValue(svkNone), MakeSSAArrayRef(Params[i], srtInt),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.LowerDeferredProcedures;

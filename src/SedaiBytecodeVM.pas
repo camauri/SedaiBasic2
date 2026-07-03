@@ -183,7 +183,7 @@ type
     // original is restored on unbind. A stack so recursion / re-entrancy nest correctly. ArgId is the
     // caller's array slot, kept so a REDIM [PRESERVE] inside the callee (which reallocates the param's
     // storage and thereby breaks the shared reference) is propagated back to the caller on unbind.
-    FArrayBindStack: array of record SlotId: Integer; ArgId: Integer; Saved: TArrayStorage; end;
+    FArrayBindStack: array of record SlotId: Integer; ArgId: Integer; Saved: TArrayStorage; Snapshot: TArrayStorage; end;
     FArrayBindTop: Integer;
     FRedimPendingUBs: array of Integer;   // REDIM multi-dim: upper bounds accumulated by bcArrayRedimPush, consumed by bcArrayRedimN
     FIdxPending: array of Int64;          // runtime multi-dim index: indices accumulated by bcArrayIdxPush, consumed by bcArrayIdxResolve
@@ -5827,6 +5827,19 @@ begin
   Result := False;
 end;
 
+function ArrayDataShared(const A, B: TArrayStorage): Boolean;
+// True if A and B still reference the SAME element-data buffer (a dynamic array shares its reference on
+// a struct copy; SetLength/REDIM reallocates and breaks the sharing). Used to detect whether a byref
+// array parameter was resized during a call. Compared by the array's element bank.
+begin
+  case A.ElementType of
+    1: Result := Pointer(A.FloatData) = Pointer(B.FloatData);
+    2: Result := Pointer(A.StringData) = Pointer(B.StringData);
+  else
+    Result := Pointer(A.IntData) = Pointer(B.IntData);
+  end;
+end;
+
 procedure TBytecodeVM.ExecuteArrayOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
@@ -6167,8 +6180,10 @@ begin
       end;
     33: // bcRawClear - CLEAR(dst, value, bytes)
       RawClear(Ctx.IntRegs[Instr.Src1], Byte(Ctx.IntRegs[Instr.Src2]), PtrUInt(Ctx.IntRegs[Instr.Immediate]));
-    34: // bcArrayBind - array BYREF param: save FArrays[Src1], then alias it to FArrays[Immediate] (share
-      begin  // the element data, so the callee's writes hit the caller's array). Src1=param id, Imm=arg id.
+    34: // bcArrayBind - array BYREF param (PHASE 1): save FArrays[Src1] and snapshot the arg FArrays[Immediate],
+      begin  // but DEFER the alias to bcArrayBindApply. Two-phase so a batch of binds that swaps arrays
+             // (recursive "proc(a(),b())" -> "proc(b(),a())", where param and arg slots coincide) reads every
+             // arg from the UNMODIFIED table before any assignment. Src1=param id, Imm=arg id.
         if (Instr.Src1 >= 0) and (Instr.Immediate >= 0) and (Instr.Immediate <= High(FArrays)) then
         begin
           // The param placeholder array is never runtime-DIM'd, so grow FArrays to hold its slot.
@@ -6177,30 +6192,40 @@ begin
             SetLength(FArrayBindStack, (FArrayBindTop + 1) * 2);
           FArrayBindStack[FArrayBindTop].SlotId := Instr.Src1;
           FArrayBindStack[FArrayBindTop].ArgId := Instr.Immediate;
-          FArrayBindStack[FArrayBindTop].Saved := FArrays[Instr.Src1];   // dyn-array fields share by ref
+          FArrayBindStack[FArrayBindTop].Saved := FArrays[Instr.Src1];        // dyn-array fields share by ref
+          FArrayBindStack[FArrayBindTop].Snapshot := FArrays[Instr.Immediate]; // the arg, captured now
           Inc(FArrayBindTop);
-          FArrays[Instr.Src1] := FArrays[Instr.Immediate];               // alias: share the caller's data
         end;
+      end;
+    36: // bcArrayBindApply - commit the top N pending binds (Immediate=N): alias each param slot to its
+      begin  // snapshotted arg. All snapshots were captured (in phase 1) from the unmodified table.
+        for I := FArrayBindTop - Instr.Immediate to FArrayBindTop - 1 do
+          if (I >= 0) and (FArrayBindStack[I].SlotId <= High(FArrays)) then
+            FArrays[FArrayBindStack[I].SlotId] := FArrayBindStack[I].Snapshot;  // alias: share the caller's data
       end;
     35: // bcArrayUnbind - restore the last saved FArrays[Src1] (Src1 = param array id).
       begin
         if (FArrayBindTop > 0) and (FArrayBindStack[FArrayBindTop - 1].SlotId = Instr.Src1) then
         begin
           Dec(FArrayBindTop);
-          // Propagate the callee's final array back to the caller's slot. If the callee did a REDIM
-          // [PRESERVE], SetLength reallocated the param's storage (breaking the shared reference), so the
-          // caller would otherwise not see the new size/contents; copy it across. When no REDIM happened
-          // the two already share the same data, so this is a harmless same-reference assignment. Skipped
-          // when ArgId aliases the param slot itself (recursive call passing its own array parameter).
+          // Propagate the callee's final array back to the caller's slot ONLY if a REDIM [PRESERVE]
+          // reallocated the param's storage — detected by its data no longer sharing the reference we
+          // snapshotted from the arg at bind time. Without a resize the caller already sees the writes via
+          // the shared reference, and copying would be wrong: in deep recursion the arg slot may have been
+          // rebound at an outer level (merge sort's swapped a()/b()), so an unconditional copy corrupts it.
           if (FArrayBindStack[FArrayBindTop].ArgId >= 0) and
              (FArrayBindStack[FArrayBindTop].ArgId <= High(FArrays)) and
-             (FArrayBindStack[FArrayBindTop].ArgId <> Instr.Src1) then
+             (FArrayBindStack[FArrayBindTop].ArgId <> Instr.Src1) and
+             not ArrayDataShared(FArrays[Instr.Src1], FArrayBindStack[FArrayBindTop].Snapshot) then
             FArrays[FArrayBindStack[FArrayBindTop].ArgId] := FArrays[Instr.Src1];
           FArrays[Instr.Src1] := FArrayBindStack[FArrayBindTop].Saved;
-          // Release the saved copy's references (the restore transferred ownership back).
+          // Release the saved/snapshot copies' references (ownership transferred back to the live slots).
           SetLength(FArrayBindStack[FArrayBindTop].Saved.IntData, 0);
           SetLength(FArrayBindStack[FArrayBindTop].Saved.FloatData, 0);
           SetLength(FArrayBindStack[FArrayBindTop].Saved.StringData, 0);
+          SetLength(FArrayBindStack[FArrayBindTop].Snapshot.IntData, 0);
+          SetLength(FArrayBindStack[FArrayBindTop].Snapshot.FloatData, 0);
+          SetLength(FArrayBindStack[FArrayBindTop].Snapshot.StringData, 0);
         end;
       end;
     27: // bcArrayRedimPush - push one upper bound onto the pending REDIM dimension list

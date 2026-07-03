@@ -352,6 +352,7 @@ begin
     ssaRawMemMove: Result := bcRawMemMove;
     ssaRawClear: Result := bcRawClear;
     ssaArrayBind: Result := bcArrayBind;
+    ssaArrayBindApply: Result := bcArrayBindApply;
     ssaArrayUnbind: Result := bcArrayUnbind;
     // Graphics operations
     ssaGraphicRGBA: Result := bcGraphicRGBA;

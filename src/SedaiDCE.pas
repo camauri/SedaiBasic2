@@ -295,7 +295,7 @@ begin
     // FB_MEMCOPY/FB_MEMMOVE/CLEAR mutate the raw heap — side-effecting, never elide.
     ssaRawMemCopy, ssaRawMemMove, ssaRawClear,
     // Array BYREF param bind/unbind alias VM array slots — side-effecting, never elide.
-    ssaArrayBind, ssaArrayUnbind,
+    ssaArrayBind, ssaArrayUnbind, ssaArrayBindApply,
     // SADD(s) allocates a fresh raw byte-heap copy each call — allocating, so never elide or CSE it.
     ssaStrSAdd,
     // FILEEXISTS depends on external filesystem state — keep it (don't elide/CSE) so repeated checks

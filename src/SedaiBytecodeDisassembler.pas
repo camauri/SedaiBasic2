@@ -154,6 +154,8 @@ begin
       Line := Format('%4d: %-20s %d', [Index, 'CallSub', Instr.Immediate]);
     bcCallSubIndirect:
       Line := Format('%4d: %-20s R%d', [Index, 'CallSubIndirect', Instr.Src1]);
+    bcArrayBindApply:
+      Line := Format('%4d: %-20s N=%d', [Index, 'ArrayBindApply', Instr.Immediate]);
     bcReturnSub:
       Line := Format('%4d: %-20s', [Index, 'ReturnSub']);
     bcXferStoreInt, bcXferStoreFloat, bcXferStoreString:

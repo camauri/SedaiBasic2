@@ -440,6 +440,7 @@ const
   bcRawClear        = bcGroupArray + 33;  // Src1=dst raw ptr; Src2=byte value reg; Immediate=byte count reg
   bcArrayBind       = bcGroupArray + 34;  // Array BYREF param bind: Src1=param array id, Src2=arg array id (both immediates). Saves FArrays[Src1] then aliases it to FArrays[Src2] (shares the element data). No registers.
   bcArrayUnbind     = bcGroupArray + 35;  // Restore the last saved FArrays[Src1] (Src1=param array id immediate). Pops the bind save-stack.
+  bcArrayBindApply  = bcGroupArray + 36;  // Commit the top N pending array binds (Immediate=N): assign each param slot its snapshotted arg. Two-phase so swapped/overlapping binds (recursive a()/b()) don't corrupt.
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values
