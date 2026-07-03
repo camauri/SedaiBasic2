@@ -6805,12 +6805,52 @@ end;
 
 function TPackratParser.ParseConstStatement: TASTNode;
 var
-  Token: TLexerToken;
-  Assignment: TASTNode;
+  Token, NameTok, TypeTok: TLexerToken;
+  Assignment, ValueNode, ArrayDecl: TASTNode;
+  TypeName: string;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antConst, Token);
   Context.Advance; // Consume CONST
+
+  // FreeBASIC typed constant: "CONST name AS type = value". Rewrite it into a typed scalar DIM
+  // (antDim -> antArrayDecl(name, typeIdent, valueExpr)) so it reuses the full typing + initialization
+  // path -- a plain assignment to a suffixless name would default to a numeric bank and drop a string
+  // value. (CONST is treated as an initialized typed variable; immutability is not enforced here.)
+  if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttAsType) then
+  begin
+    NameTok := Context.CurrentToken;
+    Context.Advance;                                  // name
+    Context.Advance;                                  // AS
+    TypeTok := Context.CurrentToken;
+    TypeName := 'INTEGER';
+    if Context.Check(ttIdentifier) then
+    begin
+      TypeName := UpperCase(ParseDottedName);         // element type
+      if Context.Check(ttOpMul) then                  // optional "PTR"-style suffix (rare for a const)
+      begin Context.Advance; TypeName := TypeName + ' PTR'; end;
+    end;
+    if not Context.Match(ttOpEq) then
+    begin
+      HandleError('Expected "=" after CONST type', Context.CurrentToken);
+      Result.Free; Result := nil; Exit;
+    end;
+    ValueNode := ParseExpression;
+    if not Assigned(ValueNode) then
+    begin
+      HandleError('Expected value after CONST =', Context.CurrentToken);
+      Result.Free; Result := nil; Exit;
+    end;
+    Result.Free;                                      // discard the antConst; emit a typed DIM instead
+    ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
+    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
+    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, TypeTok));
+    ArrayDecl.AddChild(ValueNode);
+    Result := TASTNode.Create(antDim, Token);
+    Result.AddChild(ArrayDecl);
+    DoNodeCreated(Result);
+    Exit;
+  end;
 
   // Parse assignment expression (name = value)
   Assignment := ParseAssignmentStatement;
