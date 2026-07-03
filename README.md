@@ -16,27 +16,41 @@
 
 | Branch | Status | Description |
 |--------|--------|-------------|
-| **main** | [![Stable](https://img.shields.io/badge/status-stable-green.svg)]() | Preliminary release stable enough for benchmarks and Tiny BASIC testing |
-| **develop** | [![Development](https://img.shields.io/badge/status-development-orange.svg)]() | Active development branch - compiles successfully but may contain bugs |
+| **main** | [![Stable](https://img.shields.io/badge/status-stable-green.svg)]() | Stable snapshot for benchmarking and general testing |
+| **develop** | [![Development](https://img.shields.io/badge/status-development-orange.svg)]() | Active development branch with the full two-dialect language (Commodore v7 + FreeBASIC), OOP, threading, pointers, graphics and audio. Compiles successfully; may contain bugs |
 
-> **Recommended:** Use the `main` branch for testing and benchmarking. The `develop` branch contains the latest features but may have stability issues.
+> **Recommended:** Use `develop` for the current language and feature set. Use `main` for a stable snapshot when benchmarking.
 
 ## Documentation
 
 > **Note:** This README provides an overview. For detailed information, see:
 > - [BASIC.md](BASIC.md) - Complete list of BASIC commands with implementation status
+> - [ARCHITECTURE.md](ARCHITECTURE.md) - Detailed compilation pipeline and VM architecture
 > - [CONSOLE.md](CONSOLE.md) - Keyboard shortcuts and graphics mode reference
 > - [ROADMAP.md](ROADMAP.md) - Future directions and project architecture
+> - [README_AI.md](README_AI.md) - Entry point for AI coding agents (rules + architecture)
 
 ## What is SedaiBasic2?
 
-SedaiBasic2 is a modern reimplementation of Commodore BASIC v7. At the current stage of development, it supports the **Tiny BASIC** subset plus:
+SedaiBasic2 is a reimplementation of Commodore BASIC v7 built on a full optimizing compiler pipeline that targets a fast register-based bytecode virtual machine. It supports **two dialects** from the same engine:
 
-- Multi-dimensional arrays
-- Integer type variables (suffix `%`)
-- High-performance register-based bytecode VM
+- **CLASSIC** — line-numbered Commodore BASIC v7 (**201 / 209** core commands, 96%).
+- **MODERN** — a FreeBASIC-style dialect with no line numbers (**~495 / 643** FreeBASIC keywords).
 
-The interpreter features a complete compilation pipeline: Lexer, Parser, SSA IR optimizer, and bytecode compiler targeting a fast register-based virtual machine.
+### Language features
+
+- **Core BASIC** — all data types and suffixes (`%` integer, `!`/`#` float, `$` string, plus FreeBASIC `Integer`/`Long`/`Double`/`Single`/`Byte`/`UInteger`/…), multi-dimensional arrays with arbitrary lower bounds, `DIM`/`REDIM`/array initializers/variable-length and ellipsis-sized arrays, string functions, math, date/time, `DATA`/`READ`, structured flow control.
+- **MODERN / FreeBASIC** — user-defined types and **OOP** (methods, `EXTENDS` inheritance, virtual dispatch, constructors/destructors, RAII value semantics), lexical scoping, **multithreading** (threads, mutexes, condition variables), **managed and raw pointers**, `WSTRING` (UTF-16), typed `CONST`, and a two-dialect parser that disambiguates keywords shared with v7.
+- **I/O** — console text modes (40x25 / 80x25 / 80x50), full file I/O (FreeBASIC `OPEN … FOR …` and Commodore forms), **2D graphics** (primitives, palettes, image buffers/blit, page-flipping) rendered on both the SDL2 console and, optionally, the CLI VM (`sb --window`), **interactive input** (keyboard / mouse / joystick), and optional **SID audio** emulation.
+
+### Compilation pipeline
+
+```
+Source → Lexer → Parser (Packrat + Pratt) → AST → SSA IR
+       → 16 SSA optimization passes → Bytecode → 6 bytecode passes → Register VM
+```
+
+The register-based VM uses three separate typed register banks (int / float / string) and 2-byte grouped opcodes. A differential test net runs every corpus program both optimized and with `--no-opt` and requires identical output, guarding the optimizer.
 
 ## Setup
 
@@ -180,6 +194,9 @@ Options:
   --disasm            Show bytecode disassembly
   --no-exec           Compile only, do not execute (useful with --disasm)
   --stats             Show execution statistics
+  --no-opt            Skip the SSA/bytecode optimization passes (differential testing)
+  --bounds-check      Hard-error on out-of-bounds array access (like FreeBASIC's -exx)
+  --window            Show FreeBASIC/C128 graphics in an SDL2 window (needs a -Window build)
 ```
 
 **Examples:**

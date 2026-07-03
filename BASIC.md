@@ -27,7 +27,7 @@ Legend: ✓ = Implemented | ◐ = Partial | ✗ = Not implemented
 | `+` | ✓ | Add operator |
 | `-` | ✓ | Subtract operator |
 | `*` | ✓ | Multiply operator |
-| `/` | ✓ | Divide operator (always floating-point) |
+| `/` | ✓ | Divide operator (always floating-point). Division by zero is dialect-aware: MODERN/FreeBASIC follows IEEE-754 (`x/0` → ±Inf, `0/0` → NaN, printed `inf`/`-inf`/`nan`); CLASSIC/Commodore raises `?DIVISION BY ZERO ERROR`. |
 | `\` | ✓ | Integer division (FreeBASIC; truncates toward zero) |
 | `^` | ✓ | Power operator |
 | `MOD` | ✓ | Modulo operator |
@@ -1273,12 +1273,12 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `DIM` | ✓ | Declares a variable at the current scope. Both `DIM name AS type [= init]` and the leading-AS form `DIM [SHARED] AS type name[, ...] [= init]` (type shared by every name) are supported. |
-| `CONST` | ✓ | Declares a non-modifiable variable. |
+| `DIM` | ✓ | Declares a variable at the current scope. Both `DIM name AS type [= init]` and the leading-AS form `DIM [SHARED] AS type name[, ...] [= init]` (type shared by every name) are supported. Array forms: fixed `DIM a(dims) AS type`, an initializer with either sign `DIM a(dims) AS type = { ... }` / `=> { ... }`, an empty variable-length array `DIM x()` (starts at `UBOUND = -1`, sized later with `REDIM`), and an ellipsis upper bound `DIM x(lb TO ...) = { ... }` / `DIM x(...) = { ... }` (size deduced from the initializer). |
+| `CONST` | ✓ | Declares a non-modifiable variable. Both the untyped `CONST name = value` and the typed `CONST name AS type = value` forms are supported (immutability is not enforced). |
 | `SCOPE` | ✓ | Begins a new scope block. |
 | `STATIC` | ✓ | Declares variables in a procedure that retain their value between calls. |
 | `SHARED` | ✓ | Used with Dim allows variables to be visible throughout a module. |
-| `VAR` | ✓ | Declares variables where the data type is implied from an initializer. |
+| `VAR` | ✓ | Declares variables where the data type is implied from an initializer. The bank is inferred from string literals, `+` concatenation, and string-returning function calls (`SPACE`, `LEFT`, `STR`, `CHR`, `UCASE`, `HEX`, …), as well as numeric expressions. |
 | `BYREF (variables)` | ✓ | Used with Dim or Static or Var allows to declare references. (DIM BYREF done; VAR/STATIC BYREF deferred.) |
 
 #### User Defined Types
@@ -1480,7 +1480,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `() (Array index)` | ✗ |  |
+| `() (Array index)` | ✓ | `a(i [, j ...])` reads/writes an array element, honouring per-dimension lower bounds. Bounds checking is dialect-aware: MODERN/FreeBASIC does not bounds-check by default (an out-of-bounds read yields the default value, an out-of-bounds write is dropped — memory-safe); CLASSIC/Commodore raises `?BAD SUBSCRIPT`. The `--bounds-check` CLI flag forces a hard error on any out-of-bounds access (like FreeBASIC's `-exx`). |
 | `[] (String index)` | ✓ | `s[i]` reads/writes the byte (character code) at 0-based index `i` of a scalar string (read = `ASC(MID$(s,i+1,1))`; write replaces that byte). |
 | `[] (Pointer index)` | ✓ | `p[i]` (and `p(i)`) ≡ `*(p + i)`, read and write |
 
@@ -1586,7 +1586,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `IF..END IF` | ✓ | Executes a block of statements if a condition is met. |
+| `IF..END IF` | ✓ | Executes a block of statements if a condition is met. Both the multi-line block form and the single-line `IF cond THEN a [ELSE b]` are supported, including a single-line `IF..THEN..ELSE` nested as a statement inside a multi-line block. |
 | `..ELSE IF..` | ✓ | Executes a block of code if a condition is met and all previous conditions weren't met. |
 | `..ELSE..` | ✓ | Executes a block of code if all previous conditions weren't met. |
 | `SELECT..END SELECT` | ✓ | Executes one of a number of statement blocks using a set of conditions. |
@@ -2002,8 +2002,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `'$DYNAMIC` | ✓ | Advisory metacommand, accepted and ignored (REDIM works regardless of array storage class). |
 | `OPTION STATIC` | ✓ | Reverts a previous OPTION DYNAMIC command. |
 | `'$STATIC` | ✓ | Advisory metacommand, accepted and ignored. |
-| `DIM` | ✓ | Defines any type of array. |
-| `REDIM` | ✓ | Resizes an array: `REDIM [PRESERVE] arr(ub [, ub ...])` (B1.4) — single or multi-dimensional. The array must be DIM'd first; each dimension's lower bound is kept. A multi-dim REDIM'd array computes its element strides at runtime. |
+| `DIM` | ✓ | Defines any type of array. Supports `lo TO hi` bounds (incl. negative), positional initializers `= { ... }` / `=> { ... }`, an empty variable-length array `DIM x()` (`UBOUND = -1` until `REDIM`), and an ellipsis upper bound `DIM x(lb TO ...) = { ... }` / `DIM x(...) = { ... }` sized from the initializer. |
+| `REDIM` | ✓ | Resizes an array: `REDIM [PRESERVE] arr(ub [, ub ...])` (B1.4) — single or multi-dimensional; each existing dimension's lower bound is kept. If the array was not DIM'd first, REDIM declares it as a fresh dynamic array (honouring the element type and any `lb TO ub` bounds). A multi-dim REDIM'd array computes its element strides at runtime. |
 | `PRESERVE` | ✓ | Preserves the overlapping array contents when used with `REDIM` (B1.4). |
 
 #### Clearing Array Data
