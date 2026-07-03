@@ -10063,10 +10063,11 @@ end;
 
 procedure TSSAGenerator.ProcessRead(Node: TASTNode);
 var
-  i: Integer;
-  Child: TASTNode;
-  VarName: string;
+  i, ai: Integer;
+  Child, StoreAssign: TASTNode;
+  VarName, TmpName: string;
   DestReg: TSSAValue;
+  ElemBank: TSSARegisterType;
 begin
   if FCurrentBlock = nil then Exit;
 
@@ -10094,9 +10095,28 @@ begin
     end
     else if Child.NodeType = antArrayAccess then
     begin
-      // Array element - more complex, need to read into temp then store to array
-      // For now just emit a warning, can be implemented later
-      WriteLn(StdErr, '[SSA] READ into array elements not yet implemented');
+      // READ into an array element "READ arr(i)": read the next DATA item into a temp scalar of the
+      // array's element bank, then store it into the element through the normal array-store path (which
+      // handles lower bounds, multi-dim linear indexing and element narrowing/conversion).
+      ElemBank := srtFloat;
+      if (Child.ChildCount >= 1) and (Child.GetChild(0).NodeType = antIdentifier) then
+      begin
+        ai := ArrayIndexOf(VarToStr(Child.GetChild(0).Value));
+        if ai >= 0 then ElemBank := FProgram.GetArray(ai).ElementType;
+      end;
+      case ElemBank of
+        srtInt:    TmpName := '__RDTMP%';
+        srtString: TmpName := '__RDTMP$';
+      else         TmpName := '__RDTMP!';   // single-precision suffix -> float bank
+      end;
+      DestReg := GetOrAllocateVariable(TmpName);
+      EmitInstruction(ssaDataRead, DestReg, MakeSSAConstInt(Ord(ElemBank)),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // Synthesize "arr(indices) = <temp>" and reuse ProcessArrayStore.
+      StoreAssign := TASTNode.Create(antAssignment, Child.Token);
+      StoreAssign.AddChild(Child.Clone);
+      StoreAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, Child.Token));
+      try ProcessArrayStore(StoreAssign); finally StoreAssign.Free; end;
     end;
   end;
 end;
