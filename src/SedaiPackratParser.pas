@@ -5994,6 +5994,18 @@ begin
   Result := TASTNode.Create(antDimensions);
 
   repeat
+    // FreeBASIC bare ellipsis dimension "(...)": no lower bound (defaults to 0), the upper bound is deduced
+    // from the initializer element count (ProcessDim). "..." lexes as consecutive '.' tokens.
+    if Context.Check(ttOpDot) then
+    begin
+      while Context.Check(ttOpDot) do Context.Advance;   // consume the "..." dots
+      RangeNode := TASTNode.Create(antDimRange, Context.CurrentToken);
+      RangeNode.AddChild(TASTNode.CreateWithValue(antLiteral, '0', Context.CurrentToken));   // lower bound 0
+      RangeNode.AddChild(TASTNode.CreateWithValue(antLiteral, '0', Context.CurrentToken));   // placeholder ub
+      RangeNode.Attributes.Values['ELLIPSIS'] := '1';
+      Result.AddChild(RangeNode);
+      if Context.Check(ttSeparParam) then begin Context.Advance; Continue; end else Break;
+    end;
     Dimension := ParseExpression;
     if not Assigned(Dimension) then Break;
     // FreeBASIC explicit bound "lb TO ub": the first expression is the lower bound. Wrap both in an
@@ -6001,17 +6013,32 @@ begin
     if Context.Check(ttLoopControl) and (UpperCase(Context.CurrentToken.Value) = kTO) then
     begin
       Context.Advance;                              // consume TO
-      UpperExpr := ParseExpression;
-      if not Assigned(UpperExpr) then
+      // FreeBASIC ellipsis upper bound "lb TO ...": the upper bound is deduced from the number of elements
+      // in the initializer (handled in ProcessDim). "..." lexes as consecutive '.' tokens. Represent it as
+      // an antDimRange marked ELLIPSIS with a placeholder upper bound of 0.
+      if Context.Check(ttOpDot) then
       begin
-        HandleError('Expected an upper bound after TO in array dimension', Context.CurrentToken);
-        Dimension.Free;
-        Break;
+        while Context.Check(ttOpDot) do Context.Advance;   // consume the "..." dots
+        RangeNode := TASTNode.Create(antDimRange, Context.CurrentToken);
+        RangeNode.AddChild(Dimension);
+        RangeNode.AddChild(TASTNode.CreateWithValue(antLiteral, '0', Context.CurrentToken));
+        RangeNode.Attributes.Values['ELLIPSIS'] := '1';
+        Result.AddChild(RangeNode);
+      end
+      else
+      begin
+        UpperExpr := ParseExpression;
+        if not Assigned(UpperExpr) then
+        begin
+          HandleError('Expected an upper bound after TO in array dimension', Context.CurrentToken);
+          Dimension.Free;
+          Break;
+        end;
+        RangeNode := TASTNode.Create(antDimRange, Context.CurrentToken);
+        RangeNode.AddChild(Dimension);
+        RangeNode.AddChild(UpperExpr);
+        Result.AddChild(RangeNode);
       end;
-      RangeNode := TASTNode.Create(antDimRange, Context.CurrentToken);
-      RangeNode.AddChild(Dimension);
-      RangeNode.AddChild(UpperExpr);
-      Result.AddChild(RangeNode);
     end
     else
       Result.AddChild(Dimension);

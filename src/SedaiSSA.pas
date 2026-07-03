@@ -5171,6 +5171,7 @@ var
   InitAssign: TASTNode;    // M4.4e: synthesized assignment for a "DIM v AS T = expr" initializer
   BlkIdx: Integer;         // M8/FB: innermost open block scope (-1 if none) for block-scoped UDT dtors
   MDtorSlotIdx: Integer;   // V5e: index into FModuleDtorSlots for a module global's handle slot (-1 if none)
+  EllipCount: Integer;     // FB ellipsis "lb TO ...": element count taken from the initializer list
 const
   MAX_ARRAY_ELEMENTS = 125000000;  // 125M elements max (~1GB for 500x500x500 matrix)
 begin
@@ -5463,7 +5464,21 @@ begin
       end
       else
         DimExpr := DimChild;
-      ProcessExpression(DimExpr, DimValue);
+
+      if (DimChild.NodeType = antDimRange) and (DimChild.Attributes.Values['ELLIPSIS'] = '1') then
+      begin
+        // FreeBASIC ellipsis "lb TO ...": the upper bound is deduced from the initializer element count
+        // (ub = lb + count - 1). An ellipsis bound requires an initializer list.
+        EllipCount := 0;
+        for k := 0 to ArrayDeclNode.ChildCount - 1 do
+          if ArrayDeclNode.GetChild(k).NodeType = antArgumentList then
+          begin EllipCount := ArrayDeclNode.GetChild(k).ChildCount; Break; end;
+        if EllipCount < 1 then
+          raise Exception.CreateFmt('Ellipsis array bound "..." requires an initializer: %s', [ArrName]);
+        DimValue := MakeSSAConstInt(LowerBounds[i] + EllipCount - 1);
+      end
+      else
+        ProcessExpression(DimExpr, DimValue);
 
       // Store dimension value for VM (needed for variable dimensions)
       DimValues[i] := DimValue;
