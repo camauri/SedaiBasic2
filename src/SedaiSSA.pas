@@ -352,6 +352,7 @@ type
                                  ArgsNode: TASTNode; out CallResult: TSSAValue): Boolean;
     // Map parameter at Index (within ParamList) to its transfer-bank type and per-bank slot.
     function ParamBankAndSlot(ParamList: TASTNode; Index: Integer; out RT: TSSARegisterType): Integer;
+    function ParamDeclaredBank(ParamNode: TASTNode): TSSARegisterType;  // scalar param bank from its OWN decl (no global name collision)
     procedure EmitXferStore(RT: TSSARegisterType; Slot: Integer; const Val: TSSAValue);
     procedure EmitXferLoad(RT: TSSARegisterType; Slot: Integer; const DestReg: TSSAValue);
     procedure FixForwardReferences;  // PHASE 3 TIER 3: Fix forward GOTO/GOSUB references
@@ -13088,7 +13089,10 @@ begin
           if (Node.Attributes.Values['BYREFRET'] = '1') and
              (ParamNode.Attributes.Values['BYREF'] = '1') and
              (FindUDT(TypeName) < 0) then
-            RegisterTypedVar(VarName, 'INTEGER')
+          begin
+            ParamNode.Attributes.Values['ADDRCARRIER'] := '1';   // int address, not its declared bank (ParamDeclaredBank)
+            RegisterTypedVar(VarName, 'INTEGER');
+          end
           else if TypeName <> '' then RegisterTypedVar(VarName, TypeName);
         end;
       end;
@@ -15392,11 +15396,37 @@ begin
     PreCollectProcedures(Node.GetChild(i));
 end;
 
+function TSSAGenerator.ParamDeclaredBank(ParamNode: TASTNode): TSSARegisterType;
+// The register bank of a scalar parameter, taken from its OWN declaration (FUNCPTR / "AS type" / name
+// suffix) rather than the global name→type map (FVarExplicitType). The map is keyed by bare name and
+// keeps the FIRST registration, so two procedures that share a parameter name of different banks would
+// otherwise collide — staging the argument in the wrong bank (e.g. a Double param truncated to int).
+var
+  TypeName: string;
+begin
+  if ParamNode.Attributes.Values['FUNCPTR'] = '1' then
+    Exit(srtInt);   // function pointer: holds a procedure entry PC
+  if ParamNode.Attributes.Values['ADDRCARRIER'] = '1' then
+    Exit(srtInt);   // BYREF param of a BYREF-return function: holds the caller variable's address
+  // Explicit "AS type": the type is the antIdentifier child at index 0. A parameter that ONLY carries a
+  // default value has that expression at index 0 instead (M7) — skip it and fall back to the suffix.
+  if (ParamNode.ChildCount >= 1) and (ParamNode.GetChild(0).NodeType = antIdentifier) and
+     not ((ParamNode.Attributes.Values['HASDEFAULT'] = '1') and (ParamNode.ChildCount = 1)) then
+  begin
+    TypeName := UpperCase(VarToStr(ParamNode.GetChild(0).Value));
+    if Pos(' PTR', TypeName) > 0 then Exit(srtInt);   // pointer parameter = int address
+    if FindUDT(TypeName) >= 0 then Exit(srtInt);        // UDT parameter = int handle
+    Exit(TypeNameToBank(TypeName, UpperCase(VarToStr(ParamNode.Value))));
+  end;
+  Result := GetVariableType(UpperCase(VarToStr(ParamNode.Value)));  // suffix / DEFtype (no collision)
+end;
+
 function TSSAGenerator.ParamBankAndSlot(ParamList: TASTNode; Index: Integer;
   out RT: TSSARegisterType): Integer;
 // Walk parameters [0..Index] counting per bank; the slot is the running count for the
 // bank of the Index-th parameter. Caller and callee call this with the SAME param list,
-// so they agree on slot assignment. Parameter type is taken from the BASIC name suffix.
+// so they agree on slot assignment. Parameter bank is taken from each parameter's OWN
+// declaration (ParamDeclaredBank), not the global name→type map — see that helper.
 var
   i, cInt, cFloat, cStr: Integer;
   t: TSSARegisterType;
@@ -15409,7 +15439,7 @@ begin
     // Array parameters are passed by aliasing a VM array slot (bcArrayBind), not through a scalar
     // transfer slot, so they take no slot in any bank — skip them in the running count.
     if ParamList.GetChild(i).Attributes.Values['ARRAY'] = '1' then Continue;
-    t := GetVariableType(VarToStr(ParamList.GetChild(i).Value));
+    t := ParamDeclaredBank(ParamList.GetChild(i));
     RT := t;
     case t of
       srtFloat:  begin Result := cFloat; Inc(cFloat); end;
@@ -15786,8 +15816,11 @@ begin
         // site (bcArrayBind), so there is no scalar value to load from a transfer slot. The body's
         // references to the name resolve to the pre-registered placeholder array (RegisterArrayParams).
         if ParamNodeJ.Attributes.Values['ARRAY'] = '1' then Continue;
-        ParamReg := GetOrAllocateVariable(VarToStr(ParamNodeJ.Value));
         Slot := ParamBankAndSlot(ParamList, j, RT);
+        // Bind the parameter in the scope with the bank from its OWN declaration (RT), so its register
+        // matches the transfer slot even when another procedure declared a same-named param of a
+        // different bank (the global name→type map keeps only the first). See ParamDeclaredBank.
+        ParamReg := DeclareVariableTyped(VarToStr(ParamNodeJ.Value), RT);
         EmitXferLoad(RT, Slot, ParamReg);
         // FreeBASIC function-pointer parameter: record its signature so "name(args)" in the body is
         // lowered as an indirect call through the parameter's entry-PC value (int).
