@@ -3838,6 +3838,13 @@ begin
         Inc(Ctx.CallStackPtr);
         Ctx.PC := Instr.Immediate - 1;
       end;
+    bcCallSubIndirect:  // FreeBASIC function pointer: same as bcCallSub but the target entry PC is in Src1 (int reg)
+      begin
+        FramePush(Ctx);
+        Ctx.CallStack[Ctx.CallStackPtr] := Ctx.PC;
+        Inc(Ctx.CallStackPtr);
+        Ctx.PC := Ctx.IntRegs[Instr.Src1] - 1;
+      end;
     bcReturnSub:
       if Ctx.CallStackPtr > 0 then
       begin

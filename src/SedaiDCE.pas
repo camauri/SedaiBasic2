@@ -271,7 +271,7 @@ begin
   case Instr.OpCode of
     // Control flow - always live (affect program execution)
     ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaReturn,
-    ssaCallSub, ssaReturnSub,
+    ssaCallSub, ssaCallSubIndirect, ssaReturnSub,
     // OS threading (M5.2): spawning/joining and taking a proc address all have side effects
     // (a worker reads/writes shared globals); ssaLoadProcAddr also anchors the proc liveness edge.
     ssaLoadProcAddr, ssaThreadCreate, ssaThreadWait, ssaThreadSelf, ssaThreadDetach,

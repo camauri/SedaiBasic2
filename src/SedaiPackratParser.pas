@@ -214,6 +214,10 @@ type
     // Read a dotted name "ident(.ident)*" (e.g. a namespace-qualified type "Forms.Point"); returns
     // the joined UPPER-cased name and consumes all segments. The first token must already be checked.
     function ParseDottedName: string;
+    // FreeBASIC function-pointer type "FUNCTION(params) AS ret" / "SUB(params)" after AS. If the
+    // current token is FUNCTION/SUB, consume the whole type and mark Node with FUNCPTR / FPPARAMS /
+    // FPRET attributes (the variable holds a procedure entry PC, int-banked). Returns True if matched.
+    function TryParseProcPtrType(Node: TASTNode): Boolean;
     procedure ConsumeEndProcedure;
     function ParseForStatement: TASTNode;
     function ParseDoStatement: TASTNode;
@@ -1962,7 +1966,11 @@ begin
         if Context.Check(ttAsType) then
         begin
           Context.Advance;                        // AS
-          if Context.Check(ttIdentifier) then
+          // FreeBASIC function-pointer parameter "f AS FUNCTION(...) AS ret": the parameter is an int
+          // (a procedure entry PC); the signature is recorded on the node, no UDT type child attached.
+          if TryParseProcPtrType(ParamNode) then
+            ParamTypeName := ''
+          else if Context.Check(ttIdentifier) then
           begin
             RetTok := Context.CurrentToken;
             ParamTypeName := UpperCase(ParseDottedName);
@@ -2453,6 +2461,61 @@ begin
     Result := Result + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
     Context.Advance;                                 // segment
   end;
+end;
+
+function TPackratParser.TryParseProcPtrType(Node: TASTNode): Boolean;
+// FreeBASIC function-pointer type after AS: "FUNCTION(params) AS ret" or "SUB(params)". The cursor is
+// on the FUNCTION/SUB keyword. Records the signature on Node (FUNCPTR='1'; FPPARAMS = comma list of the
+// parameter type names; FPRET = return type name, '' for SUB). The variable itself is int-banked (it
+// holds a procedure entry PC), so no type child is attached. Returns False (consuming nothing) if the
+// current token is not FUNCTION/SUB.
+var
+  IsFunc: Boolean;
+  KindU, PT, ParamTypes: string;
+begin
+  Result := False;
+  if not Context.Check(ttProcedureStart) then Exit;
+  KindU := UpperCase(VarToStr(Context.CurrentToken.Value));
+  if (KindU <> kFUNCTION) and (KindU <> kSUB) then Exit;
+  IsFunc := (KindU = kFUNCTION);
+  Context.Advance;                                   // consume FUNCTION / SUB
+  ParamTypes := '';
+  if Context.Check(ttDelimParOpen) then
+  begin
+    Context.Advance;                                 // (
+    while not Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]) do
+    begin
+      if Context.Check(ttParamMode) then Context.Advance;  // optional BYVAL/BYREF
+      // Optional parameter name before AS (FB allows both "as integer" and "x as integer").
+      if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
+         (UpperCase(VarToStr(Context.PeekNext.Value)) = kAS) then
+        Context.Advance;                             // skip the parameter name
+      PT := '';
+      if Context.Check(ttAsType) then
+      begin
+        Context.Advance;                             // AS
+        if Context.Check(ttIdentifier) then PT := UpperCase(ParseDottedName);
+        while UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR' do Context.Advance;  // pointer param
+      end;
+      if PT <> '' then
+      begin
+        if ParamTypes <> '' then ParamTypes := ParamTypes + ',';
+        ParamTypes := ParamTypes + PT;
+      end;
+      if Context.Check(ttSeparParam) then Context.Advance;   // ,
+    end;
+    if Context.Check(ttDelimParClose) then Context.Advance;  // )
+  end;
+  Node.Attributes.Values['FUNCPTR'] := '1';
+  Node.Attributes.Values['FPPARAMS'] := ParamTypes;
+  Node.Attributes.Values['FPRET'] := '';
+  if IsFunc and Context.Check(ttAsType) then
+  begin
+    Context.Advance;                                 // AS
+    if Context.Check(ttIdentifier) then Node.Attributes.Values['FPRET'] := UpperCase(ParseDottedName);
+    while UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR' do Context.Advance;  // pointer return
+  end;
+  Result := True;
 end;
 
 function TPackratParser.ParseNamespaceDecl: TASTNode;
@@ -6111,7 +6174,7 @@ end;
 function TPackratParser.ParseDimStatement: TASTNode;
 var
   Token, NameTok, TypeTok, SharedTypeTok: TLexerToken;
-  ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode: TASTNode;
+  ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode, FuncPtrSigNode: TASTNode;
   IsShared, IsByref, LeadingAS: Boolean;
   DimTypeName, SharedTypeName: string;
 begin
@@ -6183,6 +6246,7 @@ begin
     if LeadingAS or (Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
        (Context.PeekNext.TokenType = ttAsType)) then
     begin
+      FuncPtrSigNode := nil;   // set only by the "name AS FUNCTION(...)" branch; nil elsewhere (leading-AS)
       if LeadingAS then
       begin
         // Leading-AS: the declaration is a bare name using the shared type parsed above.
@@ -6202,19 +6266,38 @@ begin
         NameTok := Context.CurrentToken;
         Context.Advance;                       // name
         Context.Advance;                       // AS
-        if not Context.Check(ttIdentifier) then
+        // FreeBASIC function-pointer variable "DIM fp AS FUNCTION(...) AS ret": int-banked (holds an
+        // entry PC); the signature is captured on a scratch node and copied onto the decl below.
+        FuncPtrSigNode := nil;
+        if Context.Check(ttProcedureStart) then
         begin
-          HandleError('Expected type name after AS', Context.CurrentToken);
-          Break;
+          FuncPtrSigNode := TASTNode.Create(antArrayDecl, NameTok);
+          if TryParseProcPtrType(FuncPtrSigNode) then
+          begin
+            DimTypeName := 'INTEGER';
+            TypeTok := NameTok;
+          end
+          else
+          begin
+            FuncPtrSigNode.Free; FuncPtrSigNode := nil;
+          end;
         end;
-        TypeTok := Context.CurrentToken;
-        DimTypeName := ParseDottedName;          // dotted: namespace-qualified type ("Forms.Point")
-        // FreeBASIC pointer type: "<type> PTR" (one or more PTR). A pointer is stored as an int handle
-        // (the address); the suffix is kept on the type name so the SSA records the pointee bank.
-        while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+        if not Assigned(FuncPtrSigNode) then
         begin
-          DimTypeName := DimTypeName + ' PTR';
-          Context.Advance;                       // consume PTR
+          if not Context.Check(ttIdentifier) then
+          begin
+            HandleError('Expected type name after AS', Context.CurrentToken);
+            Break;
+          end;
+          TypeTok := Context.CurrentToken;
+          DimTypeName := ParseDottedName;          // dotted: namespace-qualified type ("Forms.Point")
+          // FreeBASIC pointer type: "<type> PTR" (one or more PTR). A pointer is stored as an int handle
+          // (the address); the suffix is kept on the type name so the SSA records the pointee bank.
+          while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+          begin
+            DimTypeName := DimTypeName + ' PTR';
+            Context.Advance;                       // consume PTR
+          end;
         end;
       end;
       ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
@@ -6222,6 +6305,14 @@ begin
       TypeNode := TASTNode.CreateWithValue(antIdentifier, DimTypeName, TypeTok);
       ArrayDecl.AddChild(VarNameNode);
       ArrayDecl.AddChild(TypeNode);          // child[1] is antIdentifier (type) => typed scalar
+      // Transfer a captured function-pointer signature (see above) onto the declaration node.
+      if Assigned(FuncPtrSigNode) then
+      begin
+        ArrayDecl.Attributes.Values['FUNCPTR'] := '1';
+        ArrayDecl.Attributes.Values['FPPARAMS'] := FuncPtrSigNode.Attributes.Values['FPPARAMS'];
+        ArrayDecl.Attributes.Values['FPRET'] := FuncPtrSigNode.Attributes.Values['FPRET'];
+        FuncPtrSigNode.Free; FuncPtrSigNode := nil;
+      end;
       // FreeBASIC reference variable: "DIM BYREF r AS T = target". Require "= target" and store @target
       // as child[2] (an antProcAddress), so the SSA backs the target's stable address and binds r to it;
       // r then auto-dereferences on every read/write. Skips the normal fixed-len / init / ctor handling.

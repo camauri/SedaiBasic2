@@ -164,6 +164,7 @@ type
     ssaStrDec,  // DEC(hexstring) - convert hex string to decimal
     ssaLabel, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero, ssaCall, ssaReturn,
     ssaCallSub, ssaReturnSub,  // SUB/FUNCTION call frame (M2): Dest=label of procedure entry
+    ssaCallSubIndirect,        // FreeBASIC function pointer call: like ssaCallSub but the target entry PC comes from Src1 (an int register), not a static label
     // Argument/result transfer registers (M2): Src1=value reg (store) / Dest=reg (load),
     // Src3=const slot index. Carry args & result across the call frame save/restore.
     ssaXferStoreInt, ssaXferStoreFloat, ssaXferStoreString,

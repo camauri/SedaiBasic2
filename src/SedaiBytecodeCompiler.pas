@@ -279,6 +279,7 @@ begin
     ssaCall: Result := bcCall;
     ssaReturn: Result := bcReturn;
     ssaCallSub: Result := bcCallSub;
+    ssaCallSubIndirect: Result := bcCallSubIndirect;
     ssaReturnSub: Result := bcReturnSub;
     ssaXferStoreInt: Result := bcXferStoreInt;
     ssaXferStoreFloat: Result := bcXferStoreFloat;

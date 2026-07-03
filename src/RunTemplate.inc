@@ -541,6 +541,16 @@ begin
             {$ENDIF}
             CurPC := Instr.Immediate;
           end;
+        bcCallSubIndirect:  // FreeBASIC function pointer: like bcCallSub but the target entry PC is in Src1 (int reg)
+          begin
+            FramePush(Ctx);
+            Ctx.CallStack[Ctx.CallStackPtr] := CurPC + 1;
+            Inc(Ctx.CallStackPtr);
+            {$IFDEF DEBUG_MODE}
+            if Assigned(FDebugger) then FDebugger.NotifyCall;
+            {$ENDIF}
+            CurPC := Ctx.IntRegs[Instr.Src1];
+          end;
         bcReturnSub:
           begin
             Dec(Ctx.CallStackPtr);

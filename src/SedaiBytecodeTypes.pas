@@ -232,6 +232,7 @@ const
   // around the call; arguments and the result travel via the transfer registers (bcXfer*).
   bcCallSub         = bcGroupCore + 95;  // Call a SUB/FUNCTION: save frame, pass args, jump
   bcReturnSub       = bcGroupCore + 96;  // Return from SUB/FUNCTION: deliver result, restore frame
+  bcCallSubIndirect = bcGroupCore + 140; // FreeBASIC function-pointer call: like bcCallSub but the target entry PC is read from Src1 (int register)
   // Argument/result transfer registers (M2): separate VM-side banks, never saved/restored,
   // so they carry args (caller->callee) and the result (callee->caller) across the frame
   // save/restore. Store: Src1=value reg, Immediate=slot. Load: Dest=reg, Immediate=slot.
@@ -1472,6 +1473,7 @@ begin
         131: Result := 'Shl';
         132: Result := 'Shr';
         139: Result := 'Assert';
+        140: Result := 'CallSubIndirect';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

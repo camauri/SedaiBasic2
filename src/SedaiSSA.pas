@@ -133,6 +133,9 @@ type
                                             //        their final register value is written back to the slot at each return
     FCurrentProcAddrParams: TStringList;    // BYREF-return funcs: BYREF params carried as addresses (auto-deref);
                                             //   ValueFromIndex = pointee type name. Lets "RETURN param" return a reference.
+    FFuncPtrSigs: TStringList;              // FreeBASIC function pointers in scope: VARNAME -> "paramtypes|rettype"
+                                            //   (paramtypes = comma list; rettype '' for SUB). A "name(args)" on such a
+                                            //   var is an indirect call (ssaCallSubIndirect) through its entry-PC value.
     FModuleRecordVars: TStringList;      // V5b: "VARNAME|TYPENAME" of module-scope DIM'd UDTs (globals)
     FModuleDtorSlots: TStringList;        // V5e: module global var (UPPER) -> reserved int xfer slot (Objects[]=slot)
                                           //      holds its handle frame-independently so an END inside a SUB can
@@ -322,6 +325,7 @@ type
     procedure EmitSharedSyncIn;                          // M6: load shared-global slots -> their registers
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
     procedure EmitUserFunctionCall(const Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
+    function EmitFuncPtrCall(const FPName, Sig: string; ArgListNode: TASTNode): TSSAValue;  // FB function-pointer indirect call
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
     function CanonicalType(const TypeName: string): string;   // resolve FB TYPE-alias chain to its base
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
@@ -584,6 +588,7 @@ begin
   FCurrentProcByvalRecs := TStringList.Create;
   FCurrentProcByrefScalars := TStringList.Create;
   FCurrentProcAddrParams := TStringList.Create;
+  FFuncPtrSigs := TStringList.Create;
   FModuleRecordVars := TStringList.Create;
   FTypeAliases := TStringList.Create;
   FModuleDtorSlots := TStringList.Create;
@@ -637,6 +642,7 @@ begin
   FCurrentProcByvalRecs.Free;
   FCurrentProcByrefScalars.Free;
   FCurrentProcAddrParams.Free;
+  FFuncPtrSigs.Free;
   FModuleRecordVars.Free;
   FTypeAliases.Free;
   FModuleDtorSlots.Free;
@@ -2143,6 +2149,13 @@ begin
         FuncName := UpperCase(VarToStr(Node.Value));
         ArgListNode := Node.GetChild(0);
 
+        // FreeBASIC function pointer "fp(args)" reaching the function-call node: indirect call.
+        if FFuncPtrSigs.IndexOfName(FuncName) >= 0 then
+        begin
+          Result := EmitFuncPtrCall(FuncName, FFuncPtrSigs.Values[FuncName], ArgListNode);
+          Exit;
+        end;
+
         // User-defined FUNCTION (M2): stage args, call, read the result (scalar via transfer slot,
         // or UDT by value via V3 return-by-value — see EmitUserFunctionCall).
         if FProcedureNames.IndexOf(FuncName) >= 0 then
@@ -3644,6 +3657,14 @@ begin
             EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
           else
             EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(ArrName2)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC function pointer "fp(args)": an indirect call through the variable's entry-PC value.
+        // Checked before the FUNCTION/array paths (the name is a local variable, not a declared proc).
+        if FFuncPtrSigs.IndexOfName(UpperCase(ArrName)) >= 0 then
+        begin
+          Result := EmitFuncPtrCall(UpperCase(ArrName), FFuncPtrSigs.Values[UpperCase(ArrName)], Node.GetChild(1));
           Exit;
         end;
 
@@ -5203,6 +5224,13 @@ begin
 
     ArrName := VarToStr(ArrayDeclNode.GetChild(0).Value);
     DimsNode := ArrayDeclNode.GetChild(1);
+
+    // FreeBASIC function-pointer variable "DIM fp AS FUNCTION(...) AS ret": an ordinary int scalar that
+    // holds a procedure entry PC (assigned via "= @func"); record its signature so "fp(args)" lowers to
+    // an indirect call. Falls through to the typed-scalar path below (element type INTEGER).
+    if ArrayDeclNode.Attributes.Values['FUNCPTR'] = '1' then
+      FFuncPtrSigs.Values[UpperCase(ArrName)] :=
+        ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' + ArrayDeclNode.Attributes.Values['FPRET'];
 
     // (VAR x = expr is rewritten to a typed-scalar DIM by RegisterRecordVars, so it arrives here as an
     // ordinary "DIM x AS T = expr" — no VAR-specific handling needed.)
@@ -13036,6 +13064,14 @@ begin
       for i := 0 to ParamList.ChildCount - 1 do
       begin
         ParamNode := ParamList.GetChild(i);
+        // FreeBASIC function-pointer parameter: it holds a procedure entry PC, so register it as INT
+        // (no type child is attached; without this it would default to the float bank and the caller
+        // would stage the address through a float slot). The signature drives the call, not the bank.
+        if ParamNode.Attributes.Values['FUNCPTR'] = '1' then
+        begin
+          RegisterTypedVar(UpperCase(VarToStr(ParamNode.Value)), 'INTEGER');
+          Continue;
+        end;
         // M7: a parameter with a default value carries the default expression as its last child. The
         // type child (from "AS type") is present at index 0 only when there is more than just the
         // default — i.e. skip the type read for an untyped "param = expr".
@@ -14881,6 +14917,63 @@ begin
   end;
 end;
 
+function TSSAGenerator.EmitFuncPtrCall(const FPName, Sig: string; ArgListNode: TASTNode): TSSAValue;
+// Lower an indirect call through a FreeBASIC function pointer: FPName is an int variable holding a
+// procedure entry PC (assigned from @func). Sig = "paramtypes|rettype" (paramtypes = comma list; ''
+// rettype = SUB). Arguments are staged into the transfer slots per the signature's parameter banks —
+// the SAME slot layout any function with that signature reads (see ParamBankAndSlot) — then
+// ssaCallSubIndirect jumps to the entry PC and the result is read from the result slot per the return
+// bank. v1: scalar params/return; shared-global sync-out only (no write-back of shared/BYREF args).
+var
+  ParamList: TStringList;
+  Bar, i, NArgs, Slot, cInt, cFloat, cStr: Integer;
+  RetPart: string;
+  RT, RetRT: TSSARegisterType;
+  ArgVal, PCVal: TSSAValue;
+begin
+  Bar := Pos('|', Sig);
+  RetPart := Copy(Sig, Bar + 1, MaxInt);
+  ParamList := TStringList.Create;
+  try
+    ParamList.StrictDelimiter := True;
+    ParamList.Delimiter := ',';
+    ParamList.DelimitedText := Copy(Sig, 1, Bar - 1);   // the parameter type names
+    // Stage each argument into its bank's next transfer slot (bank sequence = ParamBankAndSlot order).
+    if Assigned(ArgListNode) and (ArgListNode.NodeType in [antArgumentList, antExpressionList]) then
+    begin
+      cInt := 0; cFloat := 0; cStr := 0;
+      NArgs := ArgListNode.ChildCount;
+      for i := 0 to NArgs - 1 do
+      begin
+        if i < ParamList.Count then RT := TypeNameToBank(Trim(ParamList[i]), '') else RT := srtInt;
+        case RT of
+          srtFloat:  begin Slot := cFloat; Inc(cFloat); end;
+          srtString: begin Slot := cStr;   Inc(cStr);   end;
+        else
+          begin Slot := cInt; Inc(cInt); end;
+        end;
+        ProcessExpression(ArgListNode.GetChild(i), ArgVal);
+        EmitXferStore(RT, Slot, ArgVal);
+      end;
+    end;
+  finally
+    ParamList.Free;
+  end;
+  // The pointer value (entry PC) and the indirect call. FramePush/Pop preserve the caller's registers,
+  // so the call stays inline (no block split): control resumes at the next instruction on return.
+  PCVal := EnsureIntRegister(GetOrAllocateVariable(FPName));
+  if not FInDispatcher then EmitSharedSyncOut;
+  EmitInstruction(ssaCallSubIndirect, MakeSSAValue(svkNone), PCVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // Read the result (FUNCTION); a SUB pointer used as a value yields int 0 harmlessly.
+  RetRT := srtInt;
+  if RetPart <> '' then RetRT := TypeNameToBank(RetPart, '');
+  Result := MakeSSARegister(RetRT, FProgram.AllocRegister(RetRT));
+  if RetPart <> '' then
+    EmitXferLoad(RetRT, XFER_RESULT_SLOT, Result)
+  else
+    EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
 procedure TSSAGenerator.EmitUserFunctionCall(const Name: string; ArgsNode: TASTNode;
   out Result: TSSAValue);
 // Lower a call to a user FUNCTION/SUB and produce its result value. A scalar result is read from
@@ -15662,6 +15755,7 @@ begin
     FCurrentProcByvalRecs.Clear;                          // V5d: BYVAL UDT param copies (filled in prologue)
     FCurrentProcByrefScalars.Clear;                       // BYREF: explicit-BYREF scalar params (filled in prologue)
     FCurrentProcAddrParams.Clear;                         // BYREF-return: address-carrying params (filled in prologue)
+    FFuncPtrSigs.Clear;                                   // function-pointer params/locals of THIS proc (filled in prologue / ProcessDim)
     FAddrLocalVars.Clear;                                 // @-taken locals of THIS proc (filled by ProcessDim)
     CollectTopLevelLabels(Proc, 2);                       // GOTO-unwind: this proc's block-depth-0 labels (body starts at child 2)
     CollectLocalRecordVars(Proc);
@@ -15695,6 +15789,11 @@ begin
         ParamReg := GetOrAllocateVariable(VarToStr(ParamNodeJ.Value));
         Slot := ParamBankAndSlot(ParamList, j, RT);
         EmitXferLoad(RT, Slot, ParamReg);
+        // FreeBASIC function-pointer parameter: record its signature so "name(args)" in the body is
+        // lowered as an indirect call through the parameter's entry-PC value (int).
+        if ParamNodeJ.Attributes.Values['FUNCPTR'] = '1' then
+          FFuncPtrSigs.Values[UpperCase(VarToStr(ParamNodeJ.Value))] :=
+            ParamNodeJ.Attributes.Values['FPPARAMS'] + '|' + ParamNodeJ.Attributes.Values['FPRET'];
         // B1.5: a parameter declared with a narrow integer type (child 0 = AS-type identifier) wraps
         // the incoming argument to that width, in place. Only when it lands in the int bank.
         if (RT = srtInt) and (ParamNodeJ.ChildCount >= 1) and

@@ -424,6 +424,8 @@ begin
     // OS threading (M5.2): ThreadCreate Src1 = proc-addr reg; ThreadWait Src1 = handle reg.
     // (bcLoadProcAddr's Src1 is the entry-PC label → Immediate, not a register, so it is excluded.)
     bcThreadCreate, bcThreadWait, bcThreadDetach,
+    // FreeBASIC function pointer call: Src1 = int register holding the target entry PC.
+    bcCallSubIndirect,
     // Mutexes (M5.4): Lock/Unlock/Destroy Src1 = mutex handle reg.
     bcMutexLock, bcMutexUnlock, bcMutexDestroy,
     // Condition variables (M5.4): Wait/Signal/Broadcast/Destroy Src1 = cond handle reg.
