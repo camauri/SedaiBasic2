@@ -91,6 +91,7 @@ type
     function PopIf: Boolean;
     function GetCurrentIf: TIfStackEntry;
     function HasActiveIf: Boolean;
+    function IfStackDepth: Integer;    // number of currently-open IFs (for nested single-line IF handling)
     procedure SetThenForCurrentIf(ThenNode: TASTNode);
     procedure SetElseForCurrentIf;
     procedure SetThenBlockForCurrentIf;
@@ -194,6 +195,11 @@ end;
 function TParserValidationStacks.HasActiveIf: Boolean;
 begin
   Result := Length(FIfStack) > 0;
+end;
+
+function TParserValidationStacks.IfStackDepth: Integer;
+begin
+  Result := Length(FIfStack);
 end;
 
 procedure TParserValidationStacks.SetThenForCurrentIf(ThenNode: TASTNode);

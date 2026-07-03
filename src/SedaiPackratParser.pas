@@ -1665,21 +1665,37 @@ end;
 procedure TPackratParser.ParseBlockIfBody(Parent: TASTNode);
 var
   Statement: TASTNode;
-  PrevIdx: Integer;
+  PrevIdx, StartDepth: Integer;
 begin
   // Collect statements across lines into Parent until ELSE / ENDIF (ttBlockEnd) /
   // end-of-file. A nested block IF is parsed by ParseStatement -> ParseThenStatement,
   // which consumes its own ENDIF, so only this body's own ELSE/ENDIF stops us here.
+  // StartDepth = the IF-stack depth on entry (the block IF that owns this body is already on it). A nested
+  // single-line "IF ... THEN ... ELSE ..." pushes above StartDepth and leaves its ELSE for the statement
+  // dispatcher; that ELSE must NOT terminate this body — only an ELSE at StartDepth is ours.
+  StartDepth := FValidationStacks.IfStackDepth;
   while not Context.Check(ttEndOfFile) do
   begin
-    if Context.Match(ttEndOfLine) then Continue;       // skip line breaks
+    if Context.Match(ttEndOfLine) then
+    begin
+      // Close any nested single-line IFs that ended on this line, but never the block IF that owns this
+      // body (guard with IfStackDepth > StartDepth) — it is closed by its own ENDIF.
+      while FValidationStacks.HasActiveIf and (FValidationStacks.IfStackDepth > StartDepth) and
+            FValidationStacks.CanPopIfAtEOL do
+        FValidationStacks.PopIf;
+      Continue;                                         // skip line breaks
+    end;
     if Context.Check(ttSeparStmt) then
     begin
       Context.Advance;                                  // skip ':' separators
       Continue;
     end;
-    if Context.Check(ttConditionalElse) or AtBlockIfTerminator then
-      Break;                                            // ELSE / ENDIF / END IF ends this body
+    // An ELSE terminates this body only if it is at our own IF depth. A deeper ELSE belongs to a nested
+    // single-line IF still open on the stack: fall through and let ParseStatement dispatch it to ParseElse.
+    if Context.Check(ttConditionalElse) and (FValidationStacks.IfStackDepth <= StartDepth) then
+      Break;
+    if AtBlockIfTerminator then
+      Break;                                            // ENDIF / END IF ends this body
     PrevIdx := Context.CurrentIndex;
     Statement := ParseStatement;
     // NB: many statement handlers (THEN/ELSE) return nil on SUCCESS (they attach to
