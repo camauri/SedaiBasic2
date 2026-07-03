@@ -968,7 +968,11 @@ begin
         // call ("name." / "name(" / "name["). A bare "name" with nothing after it is left to the default
         // path (an expression/assignment), so the name stays usable as a variable.
         else if Assigned(Context.PeekNext) and
-                (Context.PeekNext.TokenType in [ttNumber, ttInteger, ttFloat, ttStringLiteral, ttIdentifier]) then
+                (Context.PeekNext.TokenType in [ttNumber, ttInteger, ttFloat, ttStringLiteral, ttIdentifier,
+                                                ttOpSub, ttOpAdd]) then
+          // A value token (or a leading +/- sign of a signed numeric argument, e.g. "bitwise -15, 3")
+          // right after the name makes this a bare SUB call, never an assignment. Compound assignment
+          // ("name += ..." / "name -= ...") uses a single ttCompoundAssign token, so it is unaffected.
           Result := Memoize('BareCallStatement', @ParseBareCallStatement)
         // FreeBASIC/QB bare parameterless SUB call: a lone "SubName" as a whole statement (nothing after
         // the name before the end of the statement). Parsed as an argument-less call; the SSA no-ops it
