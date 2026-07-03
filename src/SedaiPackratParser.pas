@@ -2831,9 +2831,35 @@ end;
 function TPackratParser.ParseCaseCondition(Selector: TASTNode): TASTNode;
 var
   ValueExpr, HighExpr, Cmp, GeNode, LeNode: TASTNode;
+  RelopType: TTokenType;
+  RelopSym: string;
 begin
   Result := nil;
   repeat
+    // FreeBASIC/QB "CASE IS <relop> value" (e.g. CASE IS < x): matches when "selector <relop> value".
+    // 'IS' here is the comparison form of CASE (distinct from the RTTI "obj IS Type" operator).
+    if Context.Check(ttOpIs) then
+    begin
+      Context.Advance;                                 // consume IS
+      RelopType := ttOpEq; RelopSym := '=';            // bare "CASE IS value" defaults to equality
+      case Context.CurrentToken.TokenType of
+        ttOpLt:  begin RelopType := ttOpLt;  RelopSym := '<';  Context.Advance; end;
+        ttOpGt:  begin RelopType := ttOpGt;  RelopSym := '>';  Context.Advance; end;
+        ttOpLe:  begin RelopType := ttOpLe;  RelopSym := '<='; Context.Advance; end;
+        ttOpGe:  begin RelopType := ttOpGe;  RelopSym := '>='; Context.Advance; end;
+        ttOpNeq: begin RelopType := ttOpNeq; RelopSym := '<>'; Context.Advance; end;
+        ttOpEq:  begin RelopType := ttOpEq;  RelopSym := '=';  Context.Advance; end;
+      end;
+      ValueExpr := FExpressionParser.ParseExpression;
+      if not Assigned(ValueExpr) then Break;
+      Cmp := CreateBinaryOpNode(RelopType, Selector.Clone, ValueExpr,
+                                TLexerToken.CreateSimple(RelopType, RelopSym));
+      if Result = nil then Result := Cmp
+      else Result := CreateBinaryOpNode(ttBitwiseOR, Result, Cmp,
+                                        TLexerToken.CreateSimple(ttBitwiseOR, 'OR'));
+      if Context.Check(ttSeparParam) then begin Context.Advance; Continue; end
+      else Break;
+    end;
     ValueExpr := FExpressionParser.ParseExpression;
     if not Assigned(ValueExpr) then Break;
     // NB: SSA lowering reads the operator from Node.Token.TokenType, so the binary
