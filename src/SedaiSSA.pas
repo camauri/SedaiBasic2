@@ -5634,7 +5634,7 @@ procedure TSSAGenerator.ProcessRedim(Node: TASTNode);
 var
   j, di, ArrayIdx: Integer;
   ArrName: string;
-  ArrayDeclNode, DimsNode, DimChild, DimExpr: TASTNode;
+  ArrayDeclNode, DimsNode, DimChild, DimExpr, DimNode: TASTNode;
   UbValue, UbReg: TSSAValue;
   PreserveFlag: Int64;
 begin
@@ -5648,7 +5648,18 @@ begin
     ArrName := UpperCase(VarToStr(ArrayDeclNode.GetChild(0).Value));
     ArrayIdx := FProgram.FindArray(ArrName);
     if ArrayIdx < 0 then
-      raise Exception.CreateFmt('REDIM: array not declared (DIM it first): %s', [ArrName]);
+    begin
+      // FreeBASIC allows REDIM to declare a fresh dynamic array (no prior DIM). REDIM parses its target
+      // with the same ParseArrayDeclaration as DIM, so the antArrayDecl already carries the dimensions
+      // (incl. "lb TO ub" ranges) and any "AS type": synthesize a DIM node and let ProcessDim declare and
+      // size it (honouring lower bounds, element type and variable dimensions). PRESERVE is a no-op on a
+      // fresh array. Then skip the normal resize path below.
+      DimNode := TASTNode.Create(antDim, ArrayDeclNode.Token);
+      DimNode.AddChild(ArrayDeclNode.Clone);
+      ProcessDim(DimNode);
+      DimNode.Free;
+      Continue;
+    end;
 
     DimsNode := ArrayDeclNode.GetChild(1);
     if DimsNode.NodeType <> antDimensions then
