@@ -2085,7 +2085,10 @@ begin
                       kMONITOR, kPUDEF, kMOVSPR, kENVELOPE, kFILTER, kVOL,
                       // Commodore DOS directory shortcuts (FB uses MKDIR/CHDIR/RMDIR; DIR is an FB
                       // function so it stays reserved). Common variable names in real FB code (md, cd).
-                      kMD, kCD, kRD, kCP],
+                      kMD, kCD, kRD, kCP,
+                      // CONT: the Commodore immediate-mode "resume execution" command — meaningless in
+                      // FreeBASIC, where "cont" (short for counter) is a common variable name.
+                      kCONT],
                      kdClassicOnly);
 
   //WriteLn('DEBUG RegisterBasicKeywords: Completed registration of ', GetKeywordCount, ' keywords');
