@@ -13572,6 +13572,10 @@ begin
   for i := 0 to NArgs - 1 do
   begin
     ParamI := ParamList.GetChild(i);
+    // Array parameters alias a VM array slot (bcArrayBind) — the callee's writes already reach the
+    // caller's array; they are NOT scalar copy-out. Skip them, or the array-element branch below would
+    // mistake the "arr()" argument for an lvalue and store into element 0 (corrupting arr(0)).
+    if ParamI.Attributes.Values['ARRAY'] = '1' then Continue;
     if ParamI.Attributes.Values['BYREF'] <> '1' then Continue;   // only explicit BYREF opts in
     // Skip UDT-typed parameters (handle-aliased): a type child that names a declared TYPE.
     if (ParamI.ChildCount >= 1) and (ParamI.GetChild(0).NodeType = antIdentifier) then
