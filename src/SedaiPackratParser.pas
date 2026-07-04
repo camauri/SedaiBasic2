@@ -6755,17 +6755,29 @@ function TPackratParser.ParseRedimStatement: TASTNode;
 var
   Token, RedimTypeTok: TLexerToken;
   ArrayDecl: TASTNode;
-  RedimLeadingAS: Boolean;
+  RedimLeadingAS, RedimShared: Boolean;
   RedimTypeName: string;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antRedim, Token);
   Context.Advance; // Consume REDIM
-  // Optional PRESERVE modifier (not a reserved keyword -> arrives as an identifier).
-  if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PRESERVE') then
+  // Optional PRESERVE and SHARED modifiers (in either order). SHARED (module-global, like DIM SHARED)
+  // makes a REDIM-as-declaration a shared array; PRESERVE keeps the overlapping elements on resize.
+  RedimShared := False;
+  while True do
   begin
-    Result.Attributes.Values['PRESERVE'] := '1';
-    Context.Advance;
+    if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PRESERVE') then
+    begin
+      Result.Attributes.Values['PRESERVE'] := '1';
+      Context.Advance;
+    end
+    else if Context.Check(ttSharedDecl) then
+    begin
+      RedimShared := True;
+      Context.Advance;
+    end
+    else
+      Break;
   end;
   // Leading-AS shared type: "REDIM AS type name(dims)".
   RedimLeadingAS := Context.Check(ttAsType);
@@ -6790,6 +6802,7 @@ begin
       if RedimLeadingAS and (RedimTypeName <> '') and
          ((ArrayDecl.ChildCount < 3) or (ArrayDecl.GetChild(2).NodeType <> antIdentifier)) then
         ArrayDecl.InsertChild(2, TASTNode.CreateWithValue(antIdentifier, RedimTypeName, RedimTypeTok));
+      if RedimShared then ArrayDecl.Attributes.Values['SHARED'] := '1';   // REDIM SHARED -> module-global
       Result.AddChild(ArrayDecl);
     end
     else
