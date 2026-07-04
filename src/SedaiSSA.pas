@@ -13483,7 +13483,8 @@ var
   Decl, ParamList, ParamI, ArgExpr: TASTNode;
   i, NArgs, Slot: Integer;
   RT: TSSARegisterType;
-  TypeChild: TASTNode;
+  TypeChild, StoreAssign: TASTNode;
+  TmpName: string;
 begin
   if not Assigned(ArgListNode) then Exit;
   if not (ArgListNode.NodeType in [antArgumentList, antExpressionList]) then Exit;
@@ -13503,13 +13504,36 @@ begin
       if FindUDT(UpperCase(VarToStr(TypeChild.Value))) >= 0 then Continue;
     end;
     ArgExpr := ArgListNode.GetChild(i);
-    if (ArgExpr = nil) or (ArgExpr.NodeType <> antIdentifier) then Continue;  // only a variable is writable
+    if ArgExpr = nil then Continue;
     Slot := ParamBankAndSlot(ParamList, i, RT);
     // BYREF-return function: an int BYREF param was passed by ADDRESS (StageCallArgs), not copy-in/out,
     // so the slot holds an address — do NOT write it back into the argument (mutations already went
     // through the address). Other params (non-byref-ret, or non-int) keep the normal copy-back.
     if IsByrefRetFunc(ParamOwnerName) and (RT = srtInt) then Continue;
-    EmitXferLoad(RT, Slot, GetOrAllocateVariable(UpperCase(VarToStr(ArgExpr.Value))));
+    if ArgExpr.NodeType = antIdentifier then
+      // Plain variable arg: copy the slot's final value straight back into it.
+      EmitXferLoad(RT, Slot, GetOrAllocateVariable(UpperCase(VarToStr(ArgExpr.Value))))
+    else if (ArgExpr.NodeType = antArrayAccess) and (ArgExpr.ChildCount >= 2) and
+            (ArgExpr.GetChild(0).NodeType = antIdentifier) and
+            (ArrayIndexOf(VarToStr(ArgExpr.GetChild(0).Value)) >= 0) then
+    begin
+      // Array-element lvalue arg "arr(i)": load the parameter's final value from the transfer slot into
+      // a bank-typed temp, then store it back into the element through the normal array-store path (lower
+      // bounds, multi-dim linear index and element narrowing handled there). The index is re-evaluated —
+      // the callee gets a copy of the arg and cannot change the caller's index variable, so it is stable
+      // across the call. This makes "mutate(arr(x), ...)" propagate, like a plain-variable BYREF arg.
+      case RT of
+        srtInt:    TmpName := '__BRWTMP%';
+        srtString: TmpName := '__BRWTMP$';
+      else         TmpName := '__BRWTMP!';   // single-precision suffix -> float bank
+      end;
+      EmitXferLoad(RT, Slot, GetOrAllocateVariable(TmpName));
+      StoreAssign := TASTNode.Create(antAssignment, ArgExpr.Token);
+      StoreAssign.AddChild(ArgExpr.Clone);
+      StoreAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, ArgExpr.Token));
+      try ProcessArrayStore(StoreAssign); finally StoreAssign.Free; end;
+    end;
+    // else: a literal/expression or non-writable arg — left untouched.
   end;
 end;
 
