@@ -15833,57 +15833,89 @@ begin
 end;
 
 procedure TSSAGenerator.StageCallArgs(const ParamOwnerName: string; ArgListNode: TASTNode);
-// Evaluate each argument, coerce to the parameter's type, and stage it into the matching
-// transfer slot. The parameter layout is taken from ParamOwnerName's declaration (so a
-// virtual call stages per the base method's signature; the override has the same signature).
+// Evaluate each argument, coerce to the parameter's type, and stage it into the matching transfer slot.
+// The parameter layout is taken from ParamOwnerName's declaration (so a virtual call stages per the base
+// method's signature; the override has the same signature).
+// TWO-PHASE: every argument is EVALUATED first (into its own bank register), then all the values are
+// written into the transfer slots. A later argument may itself contain a call — e.g. min(a, min(b, c)) —
+// which reuses the SAME transfer slots; staging each arg the instant it is evaluated would let that
+// nested call clobber an already-staged earlier arg (its slot would hold the nested call's arg, not
+// ours). Evaluating first keeps each value in a register the allocator preserves across the nested call,
+// so the final stores are clobber-free. (Same reason EmitConstructorCall evaluates before staging.)
 var
   Decl, ParamList, ArgExpr, ParamI: TASTNode;
-  i, NArgs, Slot: Integer;
+  i, NArgs, Slot, NStage: Integer;
   RT: TSSARegisterType;
   ArgVal: TSSAValue;
+  StageSlots: array of Integer;
+  StageRTs: array of TSSARegisterType;
+  StageVals: array of TSSAValue;
 begin
   ParamList := nil;
   if FProcDecls.TryGetValue(ParamOwnerName, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
     ParamList := Decl.GetChild(1);
-  if Assigned(ArgListNode) and
-     (ArgListNode.NodeType in [antArgumentList, antExpressionList]) and Assigned(ParamList) then
+  if not (Assigned(ArgListNode) and
+     (ArgListNode.NodeType in [antArgumentList, antExpressionList]) and Assigned(ParamList)) then Exit;
+
+  NArgs := ArgListNode.ChildCount;
+  if NArgs > ParamList.ChildCount then NArgs := ParamList.ChildCount;
+  SetLength(StageSlots, ParamList.ChildCount);
+  SetLength(StageRTs, ParamList.ChildCount);
+  SetLength(StageVals, ParamList.ChildCount);
+  NStage := 0;
+
+  // Phase 1: evaluate every explicit argument (in source order, preserving side-effect order) into a
+  // bank register, recording its target transfer slot.
+  for i := 0 to NArgs - 1 do
   begin
-    NArgs := ArgListNode.ChildCount;
-    if NArgs > ParamList.ChildCount then NArgs := ParamList.ChildCount;
-    for i := 0 to NArgs - 1 do
-    begin
-      // Array argument (matched to an array parameter): passed by aliasing a VM array slot at the call
-      // site (EmitArrayArgBinds), not staged as a scalar value — skip it here.
-      if ParamList.GetChild(i).Attributes.Values['ARRAY'] = '1' then Continue;
-      ArgExpr := ArgListNode.GetChild(i);
-      Slot := ParamBankAndSlot(ParamList, i, RT);
-      // BYREF-return function with a BYREF (int) param: pass the ADDRESS of the argument variable, not
-      // its value, so the function can return a reference into the caller's variable (min(a,b)=0). Gated
-      // to int-banked params (address and slot are both int). The arg was address-backed by
-      // CollectAddressTakenVars; EmitVarAddress yields its stable packed address.
-      if IsByrefRetFunc(ParamOwnerName) and (RT = srtInt) and
-         (ParamList.GetChild(i).Attributes.Values['BYREF'] = '1') and
-         (ArgExpr.NodeType = antIdentifier) then
-        EmitXferStore(srtInt, Slot, EmitVarAddress(VarToStr(ArgExpr.Value)))
-      else
-      begin
-        ProcessExpression(ArgExpr, ArgVal);
-        EmitXferStore(RT, Slot, ArgVal);
-      end;
+    // Array argument (matched to an array parameter): passed by aliasing a VM array slot at the call
+    // site (EmitArrayArgBinds), not staged as a scalar value — skip it here.
+    if ParamList.GetChild(i).Attributes.Values['ARRAY'] = '1' then Continue;
+    ArgExpr := ArgListNode.GetChild(i);
+    Slot := ParamBankAndSlot(ParamList, i, RT);
+    // BYREF-return function with a BYREF (int) param: pass the ADDRESS of the argument variable, not its
+    // value, so the function can return a reference into the caller's variable (min(a,b)=0). Gated to
+    // int-banked params (address and slot are both int). The arg was address-backed by
+    // CollectAddressTakenVars; EmitVarAddress yields its stable packed address.
+    if IsByrefRetFunc(ParamOwnerName) and (RT = srtInt) and
+       (ParamList.GetChild(i).Attributes.Values['BYREF'] = '1') and
+       (ArgExpr.NodeType = antIdentifier) then
+      ArgVal := EmitVarAddress(VarToStr(ArgExpr.Value))
+    else
+      ProcessExpression(ArgExpr, ArgVal);
+    // Materialize into the parameter's bank register now, so the value survives a nested call in a later
+    // argument (a raw transfer slot would be clobbered; a live bank register is preserved).
+    case RT of
+      srtFloat:  ArgVal := EnsureFloatRegister(ArgVal);
+      srtString: ArgVal := EnsureStringRegister(ArgVal);
+    else         ArgVal := EnsureIntRegister(ArgVal);
     end;
-    // M7: default arguments — for each trailing parameter the call omitted, stage its default value
-    // (the parameter node's last child, marked 'HASDEFAULT'), evaluated in the caller's context.
-    for i := NArgs to ParamList.ChildCount - 1 do
+    StageSlots[NStage] := Slot; StageRTs[NStage] := RT; StageVals[NStage] := ArgVal;
+    Inc(NStage);
+  end;
+
+  // M7: default arguments — for each trailing parameter the call omitted, evaluate its default value
+  // (the parameter node's last child, marked 'HASDEFAULT') in the caller's context, still before staging.
+  for i := NArgs to ParamList.ChildCount - 1 do
+  begin
+    ParamI := ParamList.GetChild(i);
+    if (ParamI.Attributes.Values['HASDEFAULT'] = '1') and (ParamI.ChildCount >= 1) then
     begin
-      ParamI := ParamList.GetChild(i);
-      if (ParamI.Attributes.Values['HASDEFAULT'] = '1') and (ParamI.ChildCount >= 1) then
-      begin
-        ProcessExpression(ParamI.GetChild(ParamI.ChildCount - 1), ArgVal);
-        Slot := ParamBankAndSlot(ParamList, i, RT);
-        EmitXferStore(RT, Slot, ArgVal);
+      ProcessExpression(ParamI.GetChild(ParamI.ChildCount - 1), ArgVal);
+      Slot := ParamBankAndSlot(ParamList, i, RT);
+      case RT of
+        srtFloat:  ArgVal := EnsureFloatRegister(ArgVal);
+        srtString: ArgVal := EnsureStringRegister(ArgVal);
+      else         ArgVal := EnsureIntRegister(ArgVal);
       end;
+      StageSlots[NStage] := Slot; StageRTs[NStage] := RT; StageVals[NStage] := ArgVal;
+      Inc(NStage);
     end;
   end;
+
+  // Phase 2: write every evaluated value into its transfer slot (no evaluation here -> no clobber).
+  for i := 0 to NStage - 1 do
+    EmitXferStore(StageRTs[i], StageSlots[i], StageVals[i]);
 end;
 
 procedure TSSAGenerator.EmitCallSubLabel(const LabelName: string);
