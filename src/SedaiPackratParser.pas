@@ -6425,8 +6425,11 @@ begin
       Break;
     end;
 
-    if LeadingAS or (Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
-       (Context.PeekNext.TokenType = ttAsType)) then
+    // A scalar declaration: leading-AS ("AS type name"), name-first typed ("name AS type"), or a bare
+    // suffix-typed scalar ("Dim x" / "Dim s$" / "Dim n%" — no AS, no dims). An identifier NOT followed by
+    // '(' is a scalar (an array would have '('); the type is the AS-clause, else inferred from the suffix.
+    if LeadingAS or (Context.Check(ttIdentifier) and
+       (not (Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen)))) then
     begin
       FuncPtrSigNode := nil;   // set only by the "name AS FUNCTION(...)" branch; nil elsewhere (leading-AS)
       if LeadingAS then
@@ -6441,6 +6444,15 @@ begin
         Context.Advance;                       // name
         DimTypeName := SharedTypeName;
         TypeTok := SharedTypeTok;
+      end
+      else if not (Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttAsType)) then
+      begin
+        // Bare suffix-typed scalar "Dim x" / "Dim s$": no AS clause; the type is inferred from the name
+        // suffix ($ -> string, % -> integer, ...) by the SSA pre-scan (empty DimTypeName).
+        NameTok := Context.CurrentToken;
+        Context.Advance;                       // name
+        DimTypeName := '';
+        TypeTok := NameTok;
       end
       else
       begin
