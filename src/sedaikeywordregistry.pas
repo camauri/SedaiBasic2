@@ -2088,7 +2088,10 @@ begin
                       kMD, kCD, kRD, kCP,
                       // CONT: the Commodore immediate-mode "resume execution" command — meaningless in
                       // FreeBASIC, where "cont" (short for counter) is a common variable name.
-                      kCONT],
+                      kCONT,
+                      // CHAR: the Commodore v7 "display text at position" command — FreeBASIC has no CHAR
+                      // (it uses CHR); "char" is a common variable name (character).
+                      kCHAR],
                      kdClassicOnly);
 
   //WriteLn('DEBUG RegisterBasicKeywords: Completed registration of ', GetKeywordCount, ' keywords');
