@@ -33,6 +33,34 @@ single work, but distributing separate works together (aggregation) is permitted
 | `gnome_sort.bas`              | <https://rosettacode.org/wiki/Sorting_algorithms/Gnome_sort> |
 | `dot_product.bas`             | <https://rosettacode.org/wiki/Dot_product> |
 | `insertion_sort.bas`          | <https://rosettacode.org/wiki/Sorting_algorithms/Insertion_sort> |
+| `abc_problem.bas`             | <https://rosettacode.org/wiki/ABC_problem> |
+| `amb.bas`                     | <https://rosettacode.org/wiki/Amb> |
+| `array_concatenation.bas`     | <https://rosettacode.org/wiki/Array_concatenation> |
+| `bell_numbers.bas`            | <https://rosettacode.org/wiki/Bell_numbers> |
+| `caesar_cipher.bas`           | <https://rosettacode.org/wiki/Caesar_cipher> |
+| `cholesky_decomposition.bas`  | <https://rosettacode.org/wiki/Cholesky_decomposition> |
+| `counting_sort.bas`           | <https://rosettacode.org/wiki/Sorting_algorithms/Counting_sort> |
+| `flatten_a_list.bas`          | <https://rosettacode.org/wiki/Flatten_a_list> |
+| `four_bit_adder.bas`          | <https://rosettacode.org/wiki/Four_bit_adder> |
+| `gapful_numbers.bas`          | <https://rosettacode.org/wiki/Gapful_numbers> |
+| `gray_code.bas`               | <https://rosettacode.org/wiki/Gray_code> |
+| `hailstone_sequence.bas`      | <https://rosettacode.org/wiki/Hailstone_sequence> |
+| `hofstadter_q_sequence.bas`   | <https://rosettacode.org/wiki/Hofstadter_Q_sequence> |
+| `iterated_digits_squaring.bas`| <https://rosettacode.org/wiki/Iterated_digits_squaring> |
+| `jaro_similarity.bas`         | <https://rosettacode.org/wiki/Jaro_similarity> |
+| `kronecker_product.bas`       | <https://rosettacode.org/wiki/Kronecker_product> |
+| `levenshtein_distance.bas`    | <https://rosettacode.org/wiki/Levenshtein_distance> |
+| `map_range.bas`               | <https://rosettacode.org/wiki/Map_range> |
+| `matrix_multiplication.bas`   | <https://rosettacode.org/wiki/Matrix_multiplication> |
+| `matrix_transposition.bas`    | <https://rosettacode.org/wiki/Matrix_transposition> |
+| `pascal_matrix_generation.bas`| <https://rosettacode.org/wiki/Pascal_matrix_generation> |
+| `pernicious_numbers.bas`      | <https://rosettacode.org/wiki/Pernicious_numbers> |
+| `recamans_sequence.bas`       | <https://rosettacode.org/wiki/Recaman%27s_sequence> |
+| `roman_numerals_encode.bas`   | <https://rosettacode.org/wiki/Roman_numerals/Encode> |
+| `sum_digits_of_an_integer.bas`| <https://rosettacode.org/wiki/Sum_digits_of_an_integer> |
+| `sum_of_a_series.bas`         | <https://rosettacode.org/wiki/Sum_of_a_series> |
+| `tokenize_a_string.bas`       | <https://rosettacode.org/wiki/Tokenize_a_string> |
+| `towers_of_hanoi.bas`         | <https://rosettacode.org/wiki/Towers_of_Hanoi> |
 
 ## Running
 
