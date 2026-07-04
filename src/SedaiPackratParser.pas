@@ -6326,7 +6326,7 @@ var
   Token, NameTok, TypeTok, SharedTypeTok: TLexerToken;
   ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode, FuncPtrSigNode: TASTNode;
   IsShared, IsByref, LeadingAS: Boolean;
-  DimTypeName, SharedTypeName: string;
+  DimTypeName, SharedTypeName, SharedFixedLen: string;
 begin
   Token := Context.CurrentToken;
   // VAR / STATIC share the ttDataDeclaration token with DIM; route to their own parsers.
@@ -6366,6 +6366,21 @@ begin
       SharedTypeName := SharedTypeName + ' PTR';
       Context.Advance;                        // consume PTR
     end;
+    // FreeBASIC fixed-length string in leading-AS form: "DIM AS STRING * n name[, ...]". The capacity
+    // follows the shared type and applies to every name in the list. Parse it once (advisory in v1 —
+    // storage stays variable-length) and stamp FIXEDLEN on each declaration below.
+    SharedFixedLen := '';
+    if Context.Check(ttOpMul) then
+    begin
+      Context.Advance;                        // '*'
+      InitExpr := FExpressionParser.ParseExpression(precCall);   // length operand (no binary ops)
+      if Assigned(InitExpr) then
+      begin
+        if InitExpr.NodeType = antLiteral then SharedFixedLen := VarToStr(InitExpr.Value)
+        else SharedFixedLen := '-1';          // present but non-constant -> advisory
+        InitExpr.Free;
+      end;
+    end;
   end;
 
   // Parse declarations separated by commas. Each is either:
@@ -6387,6 +6402,7 @@ begin
       // "DIM AS String a(n) = { ... }". Insert at index 2 so it precedes any initializer list.
       if (ArrayDecl.ChildCount < 3) or (ArrayDecl.GetChild(2).NodeType <> antIdentifier) then
         ArrayDecl.InsertChild(2, TASTNode.CreateWithValue(antIdentifier, SharedTypeName, SharedTypeTok));
+      if SharedFixedLen <> '' then ArrayDecl.Attributes.Values['FIXEDLEN'] := SharedFixedLen;  // AS STRING * n arr()
       if IsShared then ArrayDecl.Attributes.Values['SHARED'] := '1';
       Result.AddChild(ArrayDecl);
       if Context.Check(ttSeparParam) then begin Context.Advance; Continue; end;
@@ -6455,6 +6471,8 @@ begin
       TypeNode := TASTNode.CreateWithValue(antIdentifier, DimTypeName, TypeTok);
       ArrayDecl.AddChild(VarNameNode);
       ArrayDecl.AddChild(TypeNode);          // child[1] is antIdentifier (type) => typed scalar
+      // Leading-AS fixed-length string capacity ("DIM AS STRING * n name") applies to each name.
+      if LeadingAS and (SharedFixedLen <> '') then ArrayDecl.Attributes.Values['FIXEDLEN'] := SharedFixedLen;
       // Transfer a captured function-pointer signature (see above) onto the declaration node.
       if Assigned(FuncPtrSigNode) then
       begin
@@ -6715,9 +6733,14 @@ end;
 
 function TPackratParser.ParseRedimStatement: TASTNode;
 // REDIM [PRESERVE] arr(dims) [, arr(dims) ...] (FreeBASIC, B1.4) - re-dimension arrays.
+// Also the leading-AS form "REDIM [PRESERVE] AS type arr(dims)[, ...]" (the type precedes the names and
+// applies to each); REDIM on an undeclared array acts as a declaration (ProcessRedim synthesizes a DIM),
+// so the shared type must reach it — injected as the array-decl's type child, like leading-AS DIM.
 var
-  Token: TLexerToken;
+  Token, RedimTypeTok: TLexerToken;
   ArrayDecl: TASTNode;
+  RedimLeadingAS: Boolean;
+  RedimTypeName: string;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antRedim, Token);
@@ -6728,10 +6751,31 @@ begin
     Result.Attributes.Values['PRESERVE'] := '1';
     Context.Advance;
   end;
+  // Leading-AS shared type: "REDIM AS type name(dims)".
+  RedimLeadingAS := Context.Check(ttAsType);
+  RedimTypeName := '';
+  RedimTypeTok := Token;
+  if RedimLeadingAS then
+  begin
+    Context.Advance;                          // AS
+    if Context.Check(ttIdentifier) then
+    begin
+      RedimTypeTok := Context.CurrentToken;
+      RedimTypeName := UpperCase(ParseDottedName);
+      while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+      begin RedimTypeName := RedimTypeName + ' PTR'; Context.Advance; end;
+    end;
+  end;
   repeat
     ArrayDecl := ParseArrayDeclaration;  // name(dims) [AS type]
     if Assigned(ArrayDecl) then
-      Result.AddChild(ArrayDecl)
+    begin
+      // Inject the leading-AS shared type unless the array already carries an explicit element type.
+      if RedimLeadingAS and (RedimTypeName <> '') and
+         ((ArrayDecl.ChildCount < 3) or (ArrayDecl.GetChild(2).NodeType <> antIdentifier)) then
+        ArrayDecl.InsertChild(2, TASTNode.CreateWithValue(antIdentifier, RedimTypeName, RedimTypeTok));
+      Result.AddChild(ArrayDecl);
+    end
     else
     begin
       HandleError('Expected array declaration after REDIM', Context.CurrentToken);

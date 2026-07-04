@@ -5612,29 +5612,46 @@ begin
 
       // BASIC semantics: DIM A(N) allocates N+1 elements [0..N]; FB "lb TO ub" allocates ub-lb+1 [lb..ub].
       // Dimensions can be constants or variables - evaluated once at DIM execution.
+      // An "empty" constant dimension — ub = lb-1, so size 0 (e.g. "Redim a(-1)") — is VALID (a zero-
+      // element, REDIM-resizable array), but the VM treats a constant Dimensions[i]=0 as a runtime
+      // sentinel that needs a register. So materialize the ub into a register and route it through the
+      // variable-dimension path (Dimensions[i]=0 + a register), like the "Dim x()" empty-array path; the
+      // runtime size then computes 0. Only ub < lb-1 (size < 0) is a genuine error.
       if DimValue.Kind = svkConstInt then
       begin
         Dimensions[i] := Integer(DimValue.ConstInt) - LowerBounds[i] + 1;
-
-        // Safety check for constant dimensions
-        if Dimensions[i] <= 0 then
+        if Dimensions[i] < 0 then
           raise Exception.CreateFmt('Array upper bound must be >= lower bound: %s[%d]', [ArrName, i]);
-
-        // Calculate total elements (with overflow check)
-        TotalElements := TotalElements * Dimensions[i];
-        if TotalElements > MAX_ARRAY_ELEMENTS then
-          raise Exception.CreateFmt('Array %s too large: %d elements (max %d)', [ArrName, TotalElements, MAX_ARRAY_ELEMENTS]);
+        if Dimensions[i] = 0 then
+        begin
+          DimValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, DimValue, MakeSSAConstInt(LowerBounds[i] - 1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          DimValues[i] := DimValue; TotalElements := -1;
+        end
+        else
+        begin
+          TotalElements := TotalElements * Dimensions[i];   // element count (with overflow check)
+          if TotalElements > MAX_ARRAY_ELEMENTS then
+            raise Exception.CreateFmt('Array %s too large: %d elements (max %d)', [ArrName, TotalElements, MAX_ARRAY_ELEMENTS]);
+        end;
       end
       else if DimValue.Kind = svkConstFloat then
       begin
         Dimensions[i] := Integer(Trunc(DimValue.ConstFloat)) - LowerBounds[i] + 1;
-
-        if Dimensions[i] <= 0 then
+        if Dimensions[i] < 0 then
           raise Exception.CreateFmt('Array upper bound must be >= lower bound: %s[%d]', [ArrName, i]);
-
-        TotalElements := TotalElements * Dimensions[i];
-        if TotalElements > MAX_ARRAY_ELEMENTS then
-          raise Exception.CreateFmt('Array %s too large: %d elements (max %d)', [ArrName, TotalElements, MAX_ARRAY_ELEMENTS]);
+        if Dimensions[i] = 0 then
+        begin
+          DimValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, DimValue, MakeSSAConstInt(LowerBounds[i] - 1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          DimValues[i] := DimValue; TotalElements := -1;
+        end
+        else
+        begin
+          TotalElements := TotalElements * Dimensions[i];
+          if TotalElements > MAX_ARRAY_ELEMENTS then
+            raise Exception.CreateFmt('Array %s too large: %d elements (max %d)', [ArrName, TotalElements, MAX_ARRAY_ELEMENTS]);
+        end;
       end
       else if DimValue.Kind = svkRegister then
       begin
