@@ -6264,6 +6264,108 @@ begin
         Ctx.IntRegs[Instr.Dest] := LinearIdx;
         SetLength(FIdxPending, 0);
       end;
+    // --- UDT array members: indirect access, array handle read from a register (Src1). A handle < 1
+    //     means the member was never allocated (REDIM not yet run): reads yield the default, stores drop. ---
+    37: // bcArrayLoadIndInt
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
+          Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].IntData[LinearIdx]
+        else
+          Ctx.IntRegs[Instr.Dest] := 0;
+      end;
+    38: // bcArrayLoadIndFloat
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
+          Ctx.FloatRegs[Instr.Dest] := FArrays[PtrAddr].FloatData[LinearIdx]
+        else
+          Ctx.FloatRegs[Instr.Dest] := 0.0;
+      end;
+    39: // bcArrayLoadIndString
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
+          Ctx.StringRegs[Instr.Dest] := FArrays[PtrAddr].StringData[LinearIdx]
+        else
+          Ctx.StringRegs[Instr.Dest] := '';
+      end;
+    40: // bcArrayStoreIndInt (Dest = value register, READ)
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
+          FArrays[PtrAddr].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
+      end;
+    41: // bcArrayStoreIndFloat (Dest = value register, READ)
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
+          FArrays[PtrAddr].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
+      end;
+    42: // bcArrayStoreIndString (Dest = value register, READ)
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
+          FArrays[PtrAddr].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
+      end;
+    43: // bcArrayIdxResolveInd - member multi-dim linear index from the handle array's CURRENT dimensions
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        LinearIdx := 0;
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
+          for i := 0 to High(FIdxPending) do
+          begin
+            ProdDims := 1;
+            for ArrLowerBound := i + 1 to High(FArrays[PtrAddr].Dimensions) do
+              ProdDims := ProdDims * FArrays[PtrAddr].Dimensions[ArrLowerBound];
+            LinearIdx := LinearIdx + FIdxPending[i] * ProdDims;
+          end;
+        Ctx.IntRegs[Instr.Dest] := LinearIdx;
+        SetLength(FIdxPending, 0);
+      end;
+    44: // bcMemberArrayRedim - REDIM obj.field(...): allocate the member's FArrays entry lazily, size it
+      begin
+        Rec := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]);
+        RecSlot := (Instr.Immediate shr 8) and $FFFF;   // field int-slot within the record
+        PtrOffset := (Instr.Immediate shr 4) and $F;    // element type (0=int, 1=float, 2=string)
+        if Assigned(Rec) then
+        begin
+          PtrAddr := Rec^.IntData[RecSlot];
+          if (PtrAddr < 1) or (PtrAddr > High(FArrays)) then
+          begin
+            if Length(FArrays) = 0 then SetLength(FArrays, 1);   // keep id 0 reserved as the "unallocated" sentinel
+            PtrAddr := Length(FArrays);
+            SetLength(FArrays, PtrAddr + 1);
+            FArrays[PtrAddr].ElementType := PtrOffset;
+            FArrays[PtrAddr].DimCount := 0;
+            FArrays[PtrAddr].TotalSize := 0;
+            SetLength(FArrays[PtrAddr].Dimensions, 0);
+            SetLength(FArrays[PtrAddr].LowerBounds, 0);
+            Rec^.IntData[RecSlot] := PtrAddr;
+          end;
+          RedimArrayN(PtrAddr, FRedimPendingUBs, (Instr.Immediate and 1) <> 0);
+        end;
+        SetLength(FRedimPendingUBs, 0);
+      end;
+    45: // bcArrayLBoundInd - LBOUND of a UDT array member (Src1=handle reg, Src2=dim reg)
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and
+           (LinearIdx >= 0) and (LinearIdx <= High(FArrays[PtrAddr].LowerBounds)) then
+          Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].LowerBounds[LinearIdx]
+        else
+          Ctx.IntRegs[Instr.Dest] := 0;
+      end;
+    46: // bcArrayUBoundInd - UBOUND of a UDT array member (upper = lower + size - 1; -1 if unallocated)
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and
+           (LinearIdx >= 0) and (LinearIdx <= High(FArrays[PtrAddr].Dimensions)) then
+          Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].LowerBounds[LinearIdx]
+                                     + FArrays[PtrAddr].Dimensions[LinearIdx] - 1
+        else
+          Ctx.IntRegs[Instr.Dest] := -1;
+      end;
   else
     raise Exception.CreateFmt('Unknown array opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

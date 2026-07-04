@@ -241,6 +241,9 @@ begin
     bcFileSetEof,    // FILESETEOF filenum -> int status result
     bcGetBinInt,     // GET #n binary -> int Dest
     bcArrayIdxResolve,  // runtime multi-dim index -> int Dest (linear index)
+    bcArrayLoadIndInt,      // UDT array member load (int) - Dest is WRITTEN
+    bcArrayIdxResolveInd,   // member multi-dim index -> int Dest (linear index)
+    bcArrayLBoundInd, bcArrayUBoundInd,  // UDT array member LBOUND/UBOUND -> int Dest
     // === GROUP 5: Special variables ===
     bcLoadTI,         // TI: jiffies since start (int)
     bcLoadEL,         // EL: last error line number (int)
@@ -327,6 +330,7 @@ begin
     bcFileDateTime,  // FILEDATETIME(path): last-modified date serial (float Dest, string Src1)
     // === GROUP 3: Array operations ===
     bcArrayLoadFloat,  // Typed array load (float) - Dest is WRITTEN
+    bcArrayLoadIndFloat,  // UDT array member load (float) - Dest is WRITTEN
     bcRefLoadFloat,    // FreeBASIC pointer deref (float) - Dest = value loaded
     bcRawLoadFloat,    // raw deref (float) - Dest = value loaded
     // === GROUP 4: I/O operations ===
@@ -384,6 +388,7 @@ begin
     bcDateName,  // MONTHNAME/WEEKDAYNAME(n) -> string
     // === GROUP 3: Array operations ===
     bcArrayLoadString,  // Typed array load (string) - Dest is WRITTEN
+    bcArrayLoadIndString,  // UDT array member load (string) - Dest is WRITTEN
     bcRefLoadString,    // FreeBASIC pointer deref (string) - Dest = value loaded
     // === GROUP 4: I/O operations ===
     bcInputString,
@@ -526,6 +531,12 @@ begin
     bcGetBinStr, bcPutBinStr,                                // Src1 = handle (int)
     bcArrayRedimPush,                        // REDIM multi-dim: Src1 = upper bound (int)
     bcArrayIdxPush,                          // runtime multi-dim index: Src1 = index (int)
+    // UDT array members (indirect): Src1 = the FArrays HANDLE register (load/store/idx-resolve),
+    // or the record-HANDLE register (member REDIM) — always int.
+    bcArrayLoadIndInt, bcArrayLoadIndFloat, bcArrayLoadIndString,
+    bcArrayStoreIndInt, bcArrayStoreIndFloat, bcArrayStoreIndString,
+    bcArrayIdxResolveInd, bcMemberArrayRedim,
+    bcArrayLBoundInd, bcArrayUBoundInd,   // Src1 = FArrays handle (int)
     // Date/time: DATESERIAL/TIMESERIAL Src1 = year/hour (int); MONTHNAME/WEEKDAYNAME Src1 = index (int)
     bcDateSerial, bcTimeSerial, bcDateName,
     bcCmd, bcAppend, bcRecord:               // Src1 = handle (int)
@@ -621,6 +632,10 @@ begin
     // === GROUP 3: Typed array operations: Src2 is always int (linear index) ===
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
+    // UDT array members (indirect): Src2 = the linear index register (int)
+    bcArrayLoadIndInt, bcArrayLoadIndFloat, bcArrayLoadIndString,
+    bcArrayStoreIndInt, bcArrayStoreIndFloat, bcArrayStoreIndString,
+    bcArrayLBoundInd, bcArrayUBoundInd,  // Src2 = 0-based dim index (int)
     bcArrayLBound, bcArrayUBound,  // B1.4: Src2 = 0-based dim index (int)
     bcArrayRedim,  // B1.4: REDIM - Src2 = new upper bound (int)
     bcRefStoreInt,  // FreeBASIC pointer store (int) - Src2 = value (int)
@@ -798,6 +813,7 @@ begin
   case OpCode of
     // === GROUP 3: Array operations ===
     bcArrayStoreInt,  // Dest = value register (int) - READ, not written
+    bcArrayStoreIndInt,  // UDT array member store (int): Dest = value register - READ, not written
     // === GROUP 10: Graphics ===
     bcGraphicBox,     // Dest = y1 register (int) - READ, not written
     bcGraphicWindow,  // Dest = col2 register (int) - READ, not written
@@ -829,6 +845,7 @@ begin
   case OpCode of
     // === GROUP 3: Array operations ===
     bcArrayStoreFloat,   // Dest = value register (float) - READ, not written
+    bcArrayStoreIndFloat,  // UDT array member store (float): Dest = value register - READ, not written
     // === GROUP 6: File I/O operations ===
     bcPrintFileFloat,    // Dest = value register (float) - READ, not written
     // === GROUP 7: Sprite ===
@@ -847,6 +864,7 @@ begin
   case OpCode of
     // === GROUP 3: Array operations ===
     bcArrayStoreString,  // Dest = value register (string) - READ, not written
+    bcArrayStoreIndString,  // UDT array member store (string): Dest = value register - READ, not written
     // === GROUP 6: File I/O operations ===
     bcPrintFile:         // Dest = data register (string) - READ, not written
       Result := True;

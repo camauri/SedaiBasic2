@@ -73,6 +73,9 @@ type
     PtrPointee: string;     // pointee UDT type if this field is a "T PTR" (else ''); held as an int handle
     WidthCode: Integer;     // B1.5: narrow width code for a sub-64-bit/SINGLE field (0 = full width)
     IsWString: Boolean;     // WSTRING field: srtString storage (UTF-8) but LEN/MID count by codepoint
+    IsArray: Boolean;       // array member (e.g. "Dim As Double m(Any, Any)"): the int slot holds an FArrays handle
+    ArrayElemBank: TSSARegisterType;  // element bank of an array member (int/float/string)
+    ArrayDimCount: Integer; // declared dimension count of an array member (>=1)
   end;
   TUDTType = record
     Name: string;
@@ -331,6 +334,9 @@ type
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
                               out Bank: TSSARegisterType; out Slot: Integer;
                               out NestedType: string): Boolean;
+    function UDTArrayField(UDTIdx: Integer; const FieldName: string;
+                           out Slot: Integer; out ElemBank: TSSARegisterType;
+                           out DimCount: Integer): Boolean;   // array member (obj.field(i,j))
     function UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;  // B1.5: field narrow width
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
@@ -340,6 +346,12 @@ type
     function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on scalar store
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
+    // UDT array members obj.field(i,j): the field slot holds an FArrays handle; access is indirect.
+    function IsMemberArrayAccess(ArrAccessNode: TASTNode; out HandleReg: TSSAValue;
+                                 out ElemBank: TSSARegisterType; out LinIdx: TSSAValue): Boolean;
+    procedure ProcessMemberArrayStore(ArrAccessNode, ExprNode: TASTNode);  // obj.field(i,j) = expr
+    function TryMemberArrayBound(ArrNameNode, ArgListNode: TASTNode; IsLBound: Boolean;
+                                 out BoundVal: TSSAValue): Boolean;  // LBOUND/UBOUND(obj.field[, dim])
     // Resolve a member-access object (a record variable or an array-of-UDT element) to its
     // handle register and UDT type name. False if it is not a record object.
     function ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
@@ -1015,6 +1027,7 @@ var
   ArrName, ArrName2, ArrNameU: string;
   ArrayIdx: Integer;
   ArrInfo: TSSAArrayInfo;
+  MArrBank: TSSARegisterType;   // UDT array member: element bank of obj.field(i,j)
   IndicesNode: TASTNode;
   Indices: array of TSSAValue;
   i, j: Integer;
@@ -2537,6 +2550,9 @@ begin
             IndicesNode := ArgListNode.GetChild(0)   // reuse IndicesNode as the array-name node
           else
             IndicesNode := ArgListNode;
+          // UDT array member: LBOUND/UBOUND(obj.field [, dim]) — resolve via the field's FArrays handle.
+          if TryMemberArrayBound(IndicesNode, ArgListNode, FuncName = 'LBOUND', Result) then
+            Exit;
           // The array name may arrive as a bare identifier or wrapped in an array-access node.
           if IndicesNode.NodeType = antArrayAccess then
             ArrName := VarToStr(IndicesNode.GetChild(0).Value)
@@ -3603,6 +3619,20 @@ begin
           else if TryStaticMethodCall(MethodObjNode, VarToStr(Node.GetChild(0).Value),
                                       Node.GetChild(1), Result) then
             Exit;
+          // UDT array member read obj.field(i,j): the field is an array (not a method) -> indirect load.
+          if IsMemberArrayAccess(Node, Left, MArrBank, Right) then
+          begin
+            ArrayRef := MakeSSARegister(MArrBank, FProgram.AllocRegister(MArrBank));
+            case MArrBank of
+              srtFloat:  OpCode := ssaArrayLoadIndFloat;
+              srtString: OpCode := ssaArrayLoadIndString;
+            else
+              OpCode := ssaArrayLoadIndInt;
+            end;
+            EmitInstruction(OpCode, ArrayRef, Left, Right, MakeSSAValue(svkNone));
+            Result := ArrayRef;
+            Exit;
+          end;
         end;
 
         // First child is array name
@@ -5002,6 +5032,13 @@ begin
   if TargetNode.NodeType <> antArrayAccess then Exit;
   if TargetNode.ChildCount < 2 then Exit;
 
+  // UDT array member store obj.field(i,j) = expr: the array root is a member access -> indirect store.
+  if TargetNode.GetChild(0).NodeType = antMemberAccess then
+  begin
+    ProcessMemberArrayStore(TargetNode, ExprNode);
+    Exit;
+  end;
+
   // Get array name
   if TargetNode.GetChild(0).NodeType <> antIdentifier then Exit;
   ArrName := VarToStr(TargetNode.GetChild(0).Value);
@@ -5678,10 +5715,11 @@ procedure TSSAGenerator.ProcessRedim(Node: TASTNode);
 // The array must already be declared (DIM first); each dimension's original lower bound is kept (only
 // the upper bounds / size change). PRESERVE keeps the flat element order up to the new size.
 var
-  j, di, ArrayIdx: Integer;
-  ArrName: string;
-  ArrayDeclNode, DimsNode, DimChild, DimExpr, DimNode: TASTNode;
-  UbValue, UbReg: TSSAValue;
+  j, di, ArrayIdx, MSlot, MDimCount: Integer;
+  ArrName, MTypeName: string;
+  ArrayDeclNode, DimsNode, DimChild, DimExpr, DimNode, MemberNode: TASTNode;
+  UbValue, UbReg, MHandle: TSSAValue;
+  MElemBank: TSSARegisterType;
   PreserveFlag: Int64;
 begin
   if Node.Attributes.Values['PRESERVE'] = '1' then PreserveFlag := 1 else PreserveFlag := 0;
@@ -5690,6 +5728,30 @@ begin
     ArrayDeclNode := Node.GetChild(j);
     if ArrayDeclNode.NodeType <> antArrayDecl then Continue;
     if ArrayDeclNode.ChildCount < 2 then Continue;
+    // REDIM of a UDT array member ("Redim this.m(x,y)"): resolve the object's record handle and the
+    // field's array slot, then emit a member REDIM that allocates the FArrays entry lazily and sizes it.
+    if ArrayDeclNode.GetChild(0).NodeType = antMemberAccess then
+    begin
+      MemberNode := ArrayDeclNode.GetChild(0);
+      DimsNode := ArrayDeclNode.GetChild(1);
+      if (DimsNode.NodeType <> antDimensions) or (DimsNode.ChildCount < 1) then Continue;
+      MTypeName := ObjectTypeName(MemberNode.GetChild(0));
+      if not UDTArrayField(FindUDT(MTypeName), VarToStr(MemberNode.Value), MSlot, MElemBank, MDimCount) then
+        raise Exception.CreateFmt('REDIM: %s.%s is not an array member', [MTypeName, VarToStr(MemberNode.Value)]);
+      if not ResolveRecordObject(MemberNode.GetChild(0), MHandle, MTypeName) then Continue;
+      for di := 0 to DimsNode.ChildCount - 1 do
+      begin
+        DimChild := DimsNode.GetChild(di);
+        if DimChild.NodeType = antDimRange then DimExpr := DimChild.GetChild(1) else DimExpr := DimChild;
+        ProcessExpression(DimExpr, UbValue);
+        UbReg := EnsureIntRegister(UbValue);
+        EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), UbReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+      // Immediate packs (slot<<8) | (elemType<<4) | preserve.
+      EmitInstruction(ssaMemberArrayRedim, MakeSSAValue(svkNone), MHandle, MakeSSAValue(svkNone),
+                      MakeSSAConstInt((Int64(MSlot) shl 8) or (Int64(Ord(MElemBank)) shl 4) or PreserveFlag));
+      Continue;
+    end;
     if ArrayDeclNode.GetChild(0).NodeType <> antIdentifier then Continue;
     ArrName := UpperCase(VarToStr(ArrayDeclNode.GetChild(0).Value));
     ArrayIdx := ArrayIndexOf(ArrName);
@@ -12555,6 +12617,28 @@ begin
     end;
 end;
 
+function TSSAGenerator.UDTArrayField(UDTIdx: Integer; const FieldName: string;
+  out Slot: Integer; out ElemBank: TSSARegisterType; out DimCount: Integer): Boolean;
+// True if the named field is an array member (e.g. "Dim As Double m(Any, Any)"): its int Slot holds an
+// FArrays handle; ElemBank/DimCount describe the element storage and declared dimensionality.
+var
+  i: Integer;
+  F: string;
+begin
+  Result := False;
+  Slot := 0; ElemBank := srtInt; DimCount := 1;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if (FUDTs[UDTIdx].Fields[i].Name = F) and FUDTs[UDTIdx].Fields[i].IsArray then
+    begin
+      Slot := FUDTs[UDTIdx].Fields[i].Slot;
+      ElemBank := FUDTs[UDTIdx].Fields[i].ArrayElemBank;
+      DimCount := FUDTs[UDTIdx].Fields[i].ArrayDimCount;
+      Exit(True);
+    end;
+end;
+
 function TSSAGenerator.UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;
 // B1.5: the narrow width code of a field (0 = full width / not found).
 var
@@ -12665,9 +12749,10 @@ procedure TSSAGenerator.FillOneUDT(Idx: Integer);
 var
   j, n, PIdx: Integer;
   FieldNode, TypeNode: TASTNode;
-  Bank: TSSARegisterType;
-  cInt, cFloat, cStr: Integer;
+  Bank, ArrElemBank: TSSARegisterType;
+  cInt, cFloat, cStr, ArrDims: Integer;
   TypeName, FieldName, NestedT, PtrPointeeT: string;
+  IsArrayField: Boolean;
 begin
   if (Idx < 0) or (Idx > High(FUDTs)) then Exit;
   if FUDTs[Idx].Filled then Exit;
@@ -12722,12 +12807,28 @@ begin
       end
       else
         Bank := GetVariableType(FieldName);
+      // Array member (e.g. "Dim As Double m(Any, Any)"): the field itself is an int handle into the
+      // global FArrays table (allocated per instance on REDIM); the element bank comes from the type.
+      IsArrayField := FieldNode.Attributes.Values['ARRAYFIELD'] = '1';
+      ArrElemBank := srtInt;
+      ArrDims := 1;
+      if IsArrayField then
+      begin
+        ArrElemBank := Bank;
+        ArrDims := StrToIntDef(FieldNode.Attributes.Values['ARRAYDIMS'], 1);
+        Bank := srtInt;      // the field slot holds the FArrays handle
+        NestedT := '';       // not a nested record
+        PtrPointeeT := '';
+      end;
       n := Length(FUDTs[Idx].Fields);
       SetLength(FUDTs[Idx].Fields, n + 1);
       FUDTs[Idx].Fields[n].Name := UpperCase(FieldName);
       FUDTs[Idx].Fields[n].Bank := Bank;
       FUDTs[Idx].Fields[n].NestedType := NestedT;
       FUDTs[Idx].Fields[n].PtrPointee := PtrPointeeT;
+      FUDTs[Idx].Fields[n].IsArray := IsArrayField;
+      FUDTs[Idx].Fields[n].ArrayElemBank := ArrElemBank;
+      FUDTs[Idx].Fields[n].ArrayDimCount := ArrDims;
       FUDTs[Idx].Fields[n].IsWString := (TypeName = 'WSTRING');  // codepoint LEN/MID on obj.field
       if NestedT = '' then
         FUDTs[Idx].Fields[n].WidthCode := TypeNameWidthCode(TypeName)  // B1.5: narrow field on store
@@ -15361,6 +15462,141 @@ begin
     begin ExprVal := EnsureIntRegister(ExprVal); ExprVal := ApplyNarrowCode(UDTFieldWidthCode(UDTIdx, VarToStr(MemberNode.Value)), ExprVal); Op := ssaRecordStoreInt; end;
   end;
   EmitInstruction(Op, MakeSSAValue(svkNone), HandleVal, ExprVal, MakeSSAConstInt(Slot));
+end;
+
+function TSSAGenerator.IsMemberArrayAccess(ArrAccessNode: TASTNode; out HandleReg: TSSAValue;
+  out ElemBank: TSSARegisterType; out LinIdx: TSSAValue): Boolean;
+// obj.field(i,j) where field is a UDT array member: emit the record-handle load, evaluate/normalize the
+// indices and (for multi-dim) resolve the runtime linear index. Returns False (emitting nothing) when the
+// access is not a member array — the caller then falls back to method-call / plain-array handling.
+var
+  MemberNode, IndicesNode: TASTNode;
+  TypeName: string;
+  Slot, DimCount, i, TempReg: Integer;
+  ObjHandle, IdxVal, ResReg: TSSAValue;
+  Indices: array of TSSAValue;
+begin
+  Result := False;
+  if (ArrAccessNode = nil) or (ArrAccessNode.NodeType <> antArrayAccess) or (ArrAccessNode.ChildCount < 2) then Exit;
+  MemberNode := ArrAccessNode.GetChild(0);
+  if MemberNode.NodeType <> antMemberAccess then Exit;
+  TypeName := ObjectTypeName(MemberNode.GetChild(0));
+  if TypeName = '' then Exit;
+  if not UDTArrayField(FindUDT(TypeName), VarToStr(MemberNode.Value), Slot, ElemBank, DimCount) then Exit;
+  if not ResolveRecordObject(MemberNode.GetChild(0), ObjHandle, TypeName) then Exit;
+
+  // The field int slot holds the FArrays handle (allocated per instance on REDIM).
+  HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRecordLoadInt, HandleReg, ObjHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+
+  IndicesNode := ArrAccessNode.GetChild(1);
+  SetLength(Indices, IndicesNode.ChildCount);
+  for i := 0 to IndicesNode.ChildCount - 1 do
+  begin
+    ProcessExpression(IndicesNode.GetChild(i), IdxVal);
+    // Normalize to an int register (constants materialized; float loop-counters truncated). Member
+    // arrays are 0-based (v1), so no lower-bound subtraction is needed.
+    if IdxVal.Kind = svkConstInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      Indices[i] := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, Indices[i], IdxVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if IdxVal.Kind = svkConstFloat then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      Indices[i] := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, Indices[i], MakeSSAConstInt(Trunc(IdxVal.ConstFloat)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if (IdxVal.Kind = svkRegister) and (IdxVal.RegType = srtFloat) then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      Indices[i] := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaFloatToInt, Indices[i], IdxVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+      Indices[i] := EnsureIntRegister(IdxVal);
+  end;
+
+  if Length(Indices) = 1 then
+    LinIdx := Indices[0]
+  else
+  begin
+    // Multi-dim: push each index, resolve row-major from the handle array's CURRENT runtime dimensions.
+    for i := 0 to High(Indices) do
+      EmitInstruction(ssaArrayIdxPush, MakeSSAValue(svkNone), Indices[i], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    ResReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaArrayIdxResolveInd, ResReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    LinIdx := ResReg;
+  end;
+  Result := True;
+end;
+
+procedure TSSAGenerator.ProcessMemberArrayStore(ArrAccessNode, ExprNode: TASTNode);
+// obj.field(i,j) = expr where field is a UDT array member: indirect element store.
+var
+  HandleReg, LinIdx, ExprVal: TSSAValue;
+  ElemBank: TSSARegisterType;
+  Op: TSSAOpCode;
+begin
+  if not IsMemberArrayAccess(ArrAccessNode, HandleReg, ElemBank, LinIdx) then Exit;
+  ProcessExpression(ExprNode, ExprVal);
+  case ElemBank of
+    srtFloat:  begin ExprVal := EnsureFloatRegister(ExprVal);  Op := ssaArrayStoreIndFloat; end;
+    srtString: begin ExprVal := EnsureStringRegister(ExprVal); Op := ssaArrayStoreIndString; end;
+  else
+    begin ExprVal := EnsureIntRegister(ExprVal); Op := ssaArrayStoreIndInt; end;
+  end;
+  // Dest = value (read), Src1 = handle, Src2 = linear index.
+  EmitInstruction(Op, ExprVal, HandleReg, LinIdx, MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.TryMemberArrayBound(ArrNameNode, ArgListNode: TASTNode; IsLBound: Boolean;
+  out BoundVal: TSSAValue): Boolean;
+// LBOUND/UBOUND(obj.field [, dim]) on a UDT array member: load the field's FArrays handle and emit the
+// indirect bound op. Returns False (nothing emitted) when the argument is not a member array.
+var
+  TypeName: string;
+  Slot, DimCount: Integer;
+  ElemBank: TSSARegisterType;
+  ObjHandle, HandleReg, DimReg, ArgValue, IntRegVal, OneVal: TSSAValue;
+begin
+  Result := False;
+  if (ArrNameNode = nil) or (ArrNameNode.NodeType <> antMemberAccess) then Exit;
+  TypeName := ObjectTypeName(ArrNameNode.GetChild(0));
+  if TypeName = '' then Exit;
+  if not UDTArrayField(FindUDT(TypeName), VarToStr(ArrNameNode.Value), Slot, ElemBank, DimCount) then Exit;
+  if not ResolveRecordObject(ArrNameNode.GetChild(0), ObjHandle, TypeName) then Exit;
+
+  HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRecordLoadInt, HandleReg, ObjHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+
+  // 0-based dimension index (dim - 1), default 0.
+  DimReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+  begin
+    ProcessExpression(ArgListNode.GetChild(1), ArgValue);
+    if ArgValue.Kind = svkConstInt then
+      EmitInstruction(ssaLoadConstInt, DimReg, MakeSSAConstInt(ArgValue.ConstInt - 1), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+    else if ArgValue.Kind = svkConstFloat then
+      EmitInstruction(ssaLoadConstInt, DimReg, MakeSSAConstInt(Trunc(ArgValue.ConstFloat) - 1), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+    else
+    begin
+      IntRegVal := EnsureIntRegister(ArgValue);
+      OneVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, OneVal, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaSubInt, DimReg, IntRegVal, OneVal, MakeSSAValue(svkNone));
+    end;
+  end
+  else
+    EmitInstruction(ssaLoadConstInt, DimReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  BoundVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if IsLBound then
+    EmitInstruction(ssaArrayLBoundInd, BoundVal, HandleReg, DimReg, MakeSSAValue(svkNone))
+  else
+    EmitInstruction(ssaArrayUBoundInd, BoundVal, HandleReg, DimReg, MakeSSAValue(svkNone));
+  Result := True;
 end;
 
 procedure TSSAGenerator.CollectProcedureDecl(Node: TASTNode);

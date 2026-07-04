@@ -156,6 +156,16 @@ begin
       Line := Format('%4d: %-20s R%d', [Index, 'CallSubIndirect', Instr.Src1]);
     bcArrayBindApply:
       Line := Format('%4d: %-20s N=%d', [Index, 'ArrayBindApply', Instr.Immediate]);
+    bcArrayLoadIndInt, bcArrayLoadIndFloat, bcArrayLoadIndString:
+      Line := Format('%4d: %-20s R%d <- [hR%d](R%d)', [Index, 'ArrayLoadInd', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcArrayStoreIndInt, bcArrayStoreIndFloat, bcArrayStoreIndString:
+      Line := Format('%4d: %-20s [hR%d](R%d) <- R%d', [Index, 'ArrayStoreInd', Instr.Src1, Instr.Src2, Instr.Dest]);
+    bcArrayIdxResolveInd:
+      Line := Format('%4d: %-20s R%d = idx[hR%d]', [Index, 'ArrayIdxResolveInd', Instr.Dest, Instr.Src1]);
+    bcMemberArrayRedim:
+      Line := Format('%4d: %-20s [R%d].fld%d et=%d p=%d', [Index, 'MemberArrayRedim', Instr.Src1, (Instr.Immediate shr 8) and $FFFF, (Instr.Immediate shr 4) and $F, Instr.Immediate and 1]);
+    bcArrayLBoundInd, bcArrayUBoundInd:
+      Line := Format('%4d: %-20s R%d = bound[hR%d](dimR%d)', [Index, 'ArrayBoundInd', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcReturnSub:
       Line := Format('%4d: %-20s', [Index, 'ReturnSub']);
     bcXferStoreInt, bcXferStoreFloat, bcXferStoreString:

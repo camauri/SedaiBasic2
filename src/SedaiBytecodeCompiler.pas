@@ -354,6 +354,17 @@ begin
     ssaArrayBind: Result := bcArrayBind;
     ssaArrayBindApply: Result := bcArrayBindApply;
     ssaArrayUnbind: Result := bcArrayUnbind;
+    // UDT array members (indirect, handle from register)
+    ssaArrayLoadIndInt: Result := bcArrayLoadIndInt;
+    ssaArrayLoadIndFloat: Result := bcArrayLoadIndFloat;
+    ssaArrayLoadIndString: Result := bcArrayLoadIndString;
+    ssaArrayStoreIndInt: Result := bcArrayStoreIndInt;
+    ssaArrayStoreIndFloat: Result := bcArrayStoreIndFloat;
+    ssaArrayStoreIndString: Result := bcArrayStoreIndString;
+    ssaArrayIdxResolveInd: Result := bcArrayIdxResolveInd;
+    ssaMemberArrayRedim: Result := bcMemberArrayRedim;
+    ssaArrayLBoundInd: Result := bcArrayLBoundInd;
+    ssaArrayUBoundInd: Result := bcArrayUBoundInd;
     // Graphics operations
     ssaGraphicRGBA: Result := bcGraphicRGBA;
     ssaGraphicSetMode: Result := bcGraphicSetMode;

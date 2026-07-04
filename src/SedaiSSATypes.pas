@@ -207,6 +207,13 @@ type
     ssaRawMemCopy, ssaRawMemMove, ssaRawClear,   // FB_MEMCOPY/FB_MEMMOVE/CLEAR raw-memory block ops
     ssaArrayBind, ssaArrayUnbind,   // array BYREF param: alias/restore a param array slot to a caller's array
     ssaArrayBindApply,              // commit the pending array binds of one call (two-phase: snapshot args, then alias) — Immediate=count
+    // UDT array members: the field holds a per-instance FArrays handle; element access is INDIRECT
+    // (array id from a register). Src1=handle reg, Src2=linear index reg (load/store); Dest=value.
+    ssaArrayLoadIndInt, ssaArrayLoadIndFloat, ssaArrayLoadIndString,
+    ssaArrayStoreIndInt, ssaArrayStoreIndFloat, ssaArrayStoreIndString,
+    ssaArrayIdxResolveInd,          // linear index from a member array's runtime dims (Src1=handle reg)
+    ssaMemberArrayRedim,            // REDIM obj.field(...): Src1=record-handle reg, Immediate=(slot<<8)|(elemType<<4)|preserve
+    ssaArrayLBoundInd, ssaArrayUBoundInd,  // LBOUND/UBOUND of a UDT array member (Src1=handle reg, Src2=dim reg)
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
     ssaPrintInt, ssaPrintIntLn,
     ssaPrintBool, ssaPrintUInt,   // B1.5 phase C: BOOLEAN true/false, unsigned-64 print

@@ -441,6 +441,18 @@ const
   bcArrayBind       = bcGroupArray + 34;  // Array BYREF param bind: Src1=param array id, Src2=arg array id (both immediates). Saves FArrays[Src1] then aliases it to FArrays[Src2] (shares the element data). No registers.
   bcArrayUnbind     = bcGroupArray + 35;  // Restore the last saved FArrays[Src1] (Src1=param array id immediate). Pops the bind save-stack.
   bcArrayBindApply  = bcGroupArray + 36;  // Commit the top N pending array binds (Immediate=N): assign each param slot its snapshotted arg. Two-phase so swapped/overlapping binds (recursive a()/b()) don't corrupt.
+  // Array members of a UDT: the field holds an FArrays handle (per instance); element access is INDIRECT
+  // (array id from a register, not a compile-time immediate). Src1=handle reg, Src2=linear index reg.
+  bcArrayLoadIndInt    = bcGroupArray + 37;  // Dest(int)  = FArrays[IntRegs[Src1]].IntData[IntRegs[Src2]]
+  bcArrayLoadIndFloat  = bcGroupArray + 38;  // Dest(float)= FArrays[IntRegs[Src1]].FloatData[IntRegs[Src2]]
+  bcArrayLoadIndString = bcGroupArray + 39;  // Dest(str)  = FArrays[IntRegs[Src1]].StringData[IntRegs[Src2]]
+  bcArrayStoreIndInt   = bcGroupArray + 40;  // FArrays[IntRegs[Src1]].IntData[IntRegs[Src2]]   := IntRegs[Dest]   (Dest = value, READ)
+  bcArrayStoreIndFloat = bcGroupArray + 41;  // FArrays[IntRegs[Src1]].FloatData[IntRegs[Src2]] := FloatRegs[Dest] (Dest = value, READ)
+  bcArrayStoreIndString= bcGroupArray + 42;  // FArrays[IntRegs[Src1]].StringData[IntRegs[Src2]]:= StringRegs[Dest](Dest = value, READ)
+  bcArrayIdxResolveInd = bcGroupArray + 43;  // Dest(int) = row-major linear index from FArrays[IntRegs[Src1]].Dimensions (member multi-dim); consumes the bcArrayIdxPush list
+  bcMemberArrayRedim   = bcGroupArray + 44;  // REDIM a UDT array member: Src1=record-handle reg; Immediate packs (slot<<8)|(elemType<<4)|preserve; allocates the FArrays entry lazily and writes the handle back to the record slot; consumes the bcArrayRedimPush upper-bound list
+  bcArrayLBoundInd     = bcGroupArray + 45;  // LBOUND of a UDT array member: Dest(int)=FArrays[IntRegs[Src1]].LowerBounds[IntRegs[Src2]] (0 if unallocated)
+  bcArrayUBoundInd     = bcGroupArray + 46;  // UBOUND of a UDT array member: Dest(int)=lower+size-1 (-1 if unallocated)
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values

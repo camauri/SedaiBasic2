@@ -199,6 +199,7 @@ type
     function ParseRandomizeStatement: TASTNode;
     // Shared body for TYPE / UNION (IsUnion tags the node so SSA overlaps same-bank fields).
     function ParseRecordDecl(IsUnion: Boolean): TASTNode;
+    function ParseRecordFieldType: string;
     function AtEndType: Boolean;
     procedure ConsumeEndType;
     // WITH obj / ... / END WITH : a leading '.field' resolves against obj. Parse-time desugar.
@@ -2621,13 +2622,39 @@ begin
   Result := ParseRecordDecl(True);
 end;
 
+function TPackratParser.ParseRecordFieldType: string;
+// Parse an in-TYPE field type after AS: a (dotted) type name, an optional "PTR" suffix (stored as an
+// int handle), and an optional fixed-length "* n" (advisory in v1). Returns '' if no type token follows.
+begin
+  Result := '';
+  if Context.Check(ttIdentifier) or
+     ((Length(Context.CurrentToken.Value) > 0) and
+      (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
+  begin
+    Result := ParseDottedName;                    // dotted: namespace-qualified field type
+    // FreeBASIC pointer field "<type> PTR": stored as an int handle. Capturing the suffix keeps a
+    // self-referential field (e.g. "NXT AS NODE PTR") from being treated as a nested record.
+    while Context.Check(ttIdentifier) and (UpCase(Context.CurrentToken.Value) = 'PTR') do
+    begin
+      Result := Result + ' PTR';
+      Context.Advance;                            // consume PTR
+    end;
+    // FreeBASIC fixed-length string field "AS STRING * n": consume the length (advisory in v1).
+    if Context.Check(ttOpMul) then
+    begin
+      Context.Advance;                            // '*'
+      FExpressionParser.ParseExpression(precCall).Free;   // length operand (discarded)
+    end;
+  end;
+end;
+
 function TPackratParser.ParseRecordDecl(IsUnion: Boolean): TASTNode;
 var
   Token, NameTok, FieldTok: TLexerToken;
-  FieldNode, TypeNode: TASTNode;
+  FieldNode, TypeNode, ArrDimNode: TASTNode;
   PrevIdx: Integer;
   FieldTypeName, TokU, AliasType: string;
-  IsStaticField: Boolean;
+  IsStaticField, LeadingType: Boolean;
 begin
   // TYPE/UNION name <newline> field AS type <newline> ... END TYPE/END UNION
   // Each field node is antIdentifier(fieldName) with one child antIdentifier(typeName).
@@ -2761,6 +2788,19 @@ begin
       Context.Advance;                              // consume STATIC
       IsStaticField := True;
     end;
+    // FreeBASIC allows an in-TYPE field to be introduced with a leading DIM ("Dim As Double m(Any,Any)").
+    // Consume it — the field grammar below handles both "As type name(dims)" and "name(dims) As type".
+    if TokU = kDIM then Context.Advance;
+    FieldTypeName := '';                            // empty => infer by suffix
+    LeadingType := False;
+    ArrDimNode := nil;
+    // "As-first" form: "As <type> name(dims)" (the common FB form). Read the type before the name.
+    if Context.Check(ttAsType) then
+    begin
+      Context.Advance;                              // AS
+      FieldTypeName := ParseRecordFieldType;
+      LeadingType := True;
+    end;
     // A field name may be an identifier or a reserved word (e.g. LEN, TYPE, NAME): accept any
     // alphabetic token as the field name here.
     if Context.Check(ttIdentifier) or
@@ -2769,40 +2809,43 @@ begin
     begin
       FieldTok := Context.CurrentToken;
       Context.Advance;                              // field name
-      FieldTypeName := '';                          // empty => infer by suffix
-      if Context.Check(ttAsType) then
+      // Array member "name(dims)" — the dimension list may appear before the AS (name-first) or after
+      // the name (As-first). Only the dimension COUNT is kept; REDIM (or the declared bounds) sizes it.
+      if Context.Check(ttDelimParOpen) then
+      begin
+        Context.Advance;                            // '('
+        ArrDimNode := ParseDimensionList;
+        if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+      end;
+      // "name(dims) As type" — trailing type when it was not given up front.
+      if (not LeadingType) and Context.Check(ttAsType) then
       begin
         Context.Advance;                            // AS
-        if Context.Check(ttIdentifier) or
-           ((Length(Context.CurrentToken.Value) > 0) and
-            (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
+        FieldTypeName := ParseRecordFieldType;
+        if (ArrDimNode = nil) and Context.Check(ttDelimParOpen) then
         begin
-          FieldTypeName := ParseDottedName;         // dotted: namespace-qualified field type
-          // FreeBASIC pointer field "<type> PTR": stored as an int handle. Capturing the suffix keeps
-          // a self-referential field (e.g. "NXT AS NODE PTR" in a linked list) from being treated as a
-          // nested record (which would recurse forever when allocating the type).
-          while Context.Check(ttIdentifier) and (UpCase(Context.CurrentToken.Value) = 'PTR') do
-          begin
-            FieldTypeName := FieldTypeName + ' PTR';
-            Context.Advance;                        // consume PTR
-          end;
-          // FreeBASIC fixed-length string field: "AS STRING * n" / "AS WSTRING * n". Consume the
-          // "* <length>" so the field parses; the capacity is advisory in v1 (variable-length storage).
-          if Context.Check(ttOpMul) then
-          begin
-            Context.Advance;                        // '*'
-            FExpressionParser.ParseExpression(precCall).Free;   // length operand (discarded)
-          end;
+          Context.Advance;
+          ArrDimNode := ParseDimensionList;
+          if Context.Check(ttDelimParClose) then Context.Advance;
         end;
       end;
       FieldNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(FieldTok.Value), FieldTok);
       TypeNode := TASTNode.CreateWithValue(antIdentifier, FieldTypeName, FieldTok);
       FieldNode.AddChild(TypeNode);
       if IsStaticField then FieldNode.Attributes.Values['STATIC'] := '1';
+      if Assigned(ArrDimNode) then
+      begin
+        FieldNode.Attributes.Values['ARRAYFIELD'] := '1';
+        FieldNode.Attributes.Values['ARRAYDIMS'] := IntToStr(ArrDimNode.ChildCount);
+        ArrDimNode.Free;
+      end;
       Result.AddChild(FieldNode);
     end
     else
+    begin
+      if Assigned(ArrDimNode) then ArrDimNode.Free;
       Context.Advance;                              // skip unexpected token (defensive)
+    end;
     if Context.CurrentIndex = PrevIdx then Break;   // no progress guard
   end;
   ConsumeEndType;
@@ -5973,7 +6016,7 @@ var
   VarName: TASTNode;
   Dimensions: TASTNode;
   Token, TypeTok: TLexerToken;
-  InitList, ValExpr: TASTNode;
+  InitList, ValExpr, MemberNode: TASTNode;
 begin
   Token := Context.CurrentToken;
 
@@ -5987,6 +6030,25 @@ begin
 
   VarName := TASTNode.CreateWithValue(antIdentifier, UpperCase(Token.Value), Token);
   Context.Advance;
+
+  // Member array target "obj.field(...)" (REDIM of a UDT array member, e.g. "Redim this.m(x-1,y-1)"):
+  // fold the "." chain into an antMemberAccess so the SSA lowering resolves the field's array handle.
+  while Context.Check(ttOpDot) do
+  begin
+    Context.Advance;                                  // '.'
+    if not (Context.Check(ttIdentifier) or
+            ((Length(Context.CurrentToken.Value) > 0) and
+             (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_']))) then
+    begin
+      HandleError('Expected field name after "." in REDIM target', Context.CurrentToken);
+      VarName.Free; Result := nil; Exit;
+    end;
+    MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(Context.CurrentToken.Value),
+                                           Context.CurrentToken);
+    MemberNode.AddChild(VarName);
+    VarName := MemberNode;
+    Context.Advance;                                  // field name
+  end;
 
   // Expect opening parenthesis
   if not Context.Match(ttDelimParOpen) then
