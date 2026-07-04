@@ -352,6 +352,8 @@ type
     procedure ProcessMemberArrayStore(ArrAccessNode, ExprNode: TASTNode);  // obj.field(i,j) = expr
     function TryMemberArrayBound(ArrNameNode, ArgListNode: TASTNode; IsLBound: Boolean;
                                  out BoundVal: TSSAValue): Boolean;  // LBOUND/UBOUND(obj.field[, dim])
+    // Fold LBOUND/UBOUND(arr[,dim]) to a compile-time constant when arr's target dimension is static.
+    function TryConstFoldArrayBound(Node: TASTNode; out Val: Int64): Boolean;
     // Resolve a member-access object (a record variable or an array-of-UDT element) to its
     // handle register and UDT type name. False if it is not a record object.
     function ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
@@ -5003,6 +5005,55 @@ begin
   end;
 end;
 
+function TSSAGenerator.TryConstFoldArrayBound(Node: TASTNode; out Val: Int64): Boolean;
+// Fold LBOUND/UBOUND(arr[, dim]) to a compile-time constant when `arr` is a declared array whose
+// target dimension is STATICALLY sized (element count fixed at DIM time). This lets an array be
+// declared with the bounds of another, e.g. "Dim r(Lbound(m,2) To Ubound(m,2))" — the lower bound of
+// such a declaration must be a constant, and LBOUND/UBOUND otherwise lower to a runtime op. A
+// runtime-sized source dimension (or a non-constant dim argument) returns False, so the caller falls
+// back to the normal path (a runtime upper bound still works; a non-const lower bound still errors).
+var
+  FuncName, ArrName: string;
+  ArgList, NameNode, DimNode: TASTNode;
+  ArrayIdx, Dim0, Lb: Integer;
+  ArrInfo: TSSAArrayInfo;
+begin
+  Result := False;
+  if (Node = nil) or (Node.NodeType <> antFunctionCall) then Exit;
+  FuncName := UpperCase(VarToStr(Node.Value));
+  if (FuncName <> 'LBOUND') and (FuncName <> 'UBOUND') then Exit;
+  if (Node.ChildCount < 1) or (Node.GetChild(0).NodeType <> antArgumentList) then Exit;
+  ArgList := Node.GetChild(0);
+  if ArgList.ChildCount < 1 then Exit;
+  NameNode := ArgList.GetChild(0);
+  if NameNode.NodeType = antArrayAccess then
+  begin
+    if NameNode.ChildCount < 1 then Exit;
+    ArrName := VarToStr(NameNode.GetChild(0).Value);
+  end
+  else
+    ArrName := VarToStr(NameNode.Value);
+  ArrayIdx := ArrayIndexOf(ArrName);
+  if ArrayIdx < 0 then Exit;
+  ArrInfo := FProgram.GetArray(ArrayIdx);
+  // 0-based dimension index (default dim 1); an explicit dim must be a plain integer literal to fold.
+  Dim0 := 0;
+  if ArgList.ChildCount >= 2 then
+  begin
+    DimNode := ArgList.GetChild(1);
+    if DimNode.NodeType <> antLiteral then Exit;
+    Dim0 := StrToIntDef(VarToStr(DimNode.Value), 1) - 1;
+  end;
+  if (Dim0 < 0) or (Dim0 > High(ArrInfo.Dimensions)) then Exit;
+  if ArrInfo.Dimensions[Dim0] <= 0 then Exit;          // runtime-sized -> not a compile-time constant
+  if Dim0 <= High(ArrInfo.LowerBounds) then Lb := ArrInfo.LowerBounds[Dim0] else Lb := 0;
+  if FuncName = 'LBOUND' then
+    Val := Lb
+  else
+    Val := Lb + ArrInfo.Dimensions[Dim0] - 1;          // UBOUND = lb + count - 1
+  Result := True;
+end;
+
 procedure TSSAGenerator.ProcessArrayStore(Node: TASTNode);
 var
   TargetNode, ExprNode: TASTNode;
@@ -5210,6 +5261,7 @@ var
   LowerBounds: array of Integer;  // FB "lb TO ub": constant lower bound per dimension (0 = default)
   HasLowerBounds: Boolean;
   LbVal: TSSAValue;
+  FoldedBound: Int64;
   DimCount, i, j, ArrayIdx, WIdx: Integer;
   DimValue: TSSAValue;
   DimValues: array of TSSAValue;  // Store dimension values (registers or constants)
@@ -5520,7 +5572,12 @@ begin
       LowerBounds[i] := 0;
       if DimChild.NodeType = antDimRange then
       begin
-        ProcessExpression(DimChild.GetChild(0), LbVal);
+        // Fold "Lbound(otherarray, d)" / "Ubound(..)" to a constant so it can serve as a lower bound
+        // (which must be compile-time constant). Falls back to runtime evaluation otherwise.
+        if TryConstFoldArrayBound(DimChild.GetChild(0), FoldedBound) then
+          LbVal := MakeSSAConstInt(FoldedBound)
+        else
+          ProcessExpression(DimChild.GetChild(0), LbVal);
         if LbVal.Kind = svkConstInt then
           LowerBounds[i] := Integer(LbVal.ConstInt)
         else if LbVal.Kind = svkConstFloat then
@@ -5545,6 +5602,8 @@ begin
           raise Exception.CreateFmt('Ellipsis array bound "..." requires an initializer: %s', [ArrName]);
         DimValue := MakeSSAConstInt(LowerBounds[i] + EllipCount - 1);
       end
+      else if TryConstFoldArrayBound(DimExpr, FoldedBound) then
+        DimValue := MakeSSAConstInt(FoldedBound)   // Ubound(otherarray, d) as an upper bound
       else
         ProcessExpression(DimExpr, DimValue);
 
@@ -14589,12 +14648,26 @@ var
   i, j, TempReg, ai: Integer;
   Stride: Int64;
   StrideVal, MulResult, AddResult, LinIdx: TSSAValue;
+  NeedRuntimeStride: Boolean;
 begin
   if Length(Indices) = 1 then Exit(Indices[0]);
 
-  if FRedimMultiArrays.IndexOf(UpperCase(ArrName)) >= 0 then
+  // Runtime strides are required whenever the array's dimension SIZES are not all known at compile time,
+  // because the const-stride formula below would multiply by bogus sizes (a runtime dimension is stored
+  // as 0 -> stride collapses to 1 -> wrong element for any 2D+ access). This happens for:
+  //  - a multi-dim REDIM'd array (FRedimMultiArrays), whose sizes change at runtime;
+  //  - an array PARAMETER: its placeholder is declared 1-D size-0 (RegisterArrayParams) and only takes
+  //    the caller's real dimensions at run time via bcArrayBind;
+  //  - a plain "Dim a(n, m)" with variable (non-constant) bounds — a runtime-sized dimension.
+  // Push each (already lower-bound-adjusted) index and resolve from the array's CURRENT dimensions
+  // (bcArrayDim records them at DIM/bind time). Fully-static arrays keep the fast const path below.
+  ai := ArrayIndexOf(ArrName);
+  NeedRuntimeStride := (FRedimMultiArrays.IndexOf(UpperCase(ArrName)) >= 0) or IsArrayParamSlot(ai);
+  if not NeedRuntimeStride then
+    for i := 0 to High(ArrInfo.Dimensions) do
+      if ArrInfo.Dimensions[i] <= 0 then begin NeedRuntimeStride := True; Break; end;
+  if NeedRuntimeStride then
   begin
-    ai := ArrayIndexOf(ArrName);
     for i := 0 to High(Indices) do
       EmitInstruction(ssaArrayIdxPush, MakeSSAValue(svkNone), Indices[i], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     LinIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
