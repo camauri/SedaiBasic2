@@ -360,6 +360,8 @@ type
                                  out TypeName: string): Boolean;
     // OOP (M4.1): UDT type name of an object expression (no code emitted); method dispatch.
     function ObjectTypeName(ObjNode: TASTNode): string;
+    // FreeBASIC "Operator T.Cast() As String": if Node is a UDT with a string cast, invoke it -> string.
+    function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
     procedure ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
                                 ArgsNode: TASTNode; out Result: TSSAValue);
     function TryStaticMethodCall(ObjNode: TASTNode; const MethNm: string;     // TypeName.method(args) (static member, no instance)
@@ -1634,8 +1636,14 @@ begin
         end;
       end;
 
-      ProcessExpression(Node.GetChild(0), Left);
-      ProcessExpression(Node.GetChild(1), Right);
+      // FreeBASIC "&" is unambiguous string concatenation: a UDT operand that defines a string Cast
+      // operator ("Operator T.Cast() As String") is converted through it, so "s & vec" prints the
+      // vector's string form instead of its (numeric) handle. Only "&" is treated this way — "+" could
+      // be an operator-overload, so it is left to the arithmetic/overload paths.
+      if not ((Node.Token.TokenType = ttOpConcat) and TryEmitUDTCastToString(Node.GetChild(0), Left)) then
+        ProcessExpression(Node.GetChild(0), Left);
+      if not ((Node.Token.TokenType = ttOpConcat) and TryEmitUDTCastToString(Node.GetChild(1), Right)) then
+        ProcessExpression(Node.GetChild(1), Right);
 
       // PHASE 3 TIER 3: Unwrap register-held constants for constant folding
       // If Left is a register holding a constant, treat it as a constant
@@ -4812,6 +4820,14 @@ begin
         end;
         Continue;
       end;
+    end;
+
+    // FreeBASIC "Operator T.Cast() As String": printing a UDT instance that defines a string cast
+    // invokes the cast and prints the resulting string (e.g. "Print v" on a vector type).
+    if TryEmitUDTCastToString(Child, ExprValue) then
+    begin
+      EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Continue;
     end;
 
     ProcessExpression(Child, ExprValue);
@@ -15307,6 +15323,25 @@ begin
       if Result = '' then Result := UDTFieldPtrPointee(FindUDT(ParentType), VarToStr(ObjNode.Value));
     end;
   end;
+end;
+
+function TSSAGenerator.TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
+// FreeBASIC conversion operator "Operator T.Cast() As String": if Node evaluates to a UDT instance
+// whose type (or an ancestor) defines a string-returning Cast operator, invoke it and return the
+// resulting string. Used to convert a UDT to a string in string contexts (PRINT, "&"/"+" concat).
+var
+  TypeName, Lbl: string;
+begin
+  Result := False;
+  Val := MakeSSAValue(svkNone);
+  if Node = nil then Exit;
+  TypeName := ObjectTypeName(Node);                       // UDT type, no code emitted
+  if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
+  Lbl := ResolveMethodLabel(TypeName, 'OPERATORCAST');
+  if Lbl = '' then Exit;
+  if GetVariableType(Lbl) <> srtString then Exit;         // only a string-returning cast qualifies here
+  ProcessMethodCall(Node, TypeName, 'OPERATORCAST', nil, Val);
+  Result := (Val.Kind <> svkNone);
 end;
 
 procedure TSSAGenerator.ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;

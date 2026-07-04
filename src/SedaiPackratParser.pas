@@ -1863,11 +1863,27 @@ begin
   OpSym := '';
   if Kind = kOPERATOR then
   begin
-    // OPERATOR <sym> (a AS T, b AS T) AS R — capture the operator symbol token; the owning type is
-    // derived from the first parameter after the list is parsed (label "<T>.OPERATOR<sym>"). No
-    // implicit THIS: it is a 2-argument global function resolved by operand type at the binary op.
-    OpSym := Context.CurrentToken.Value;
-    Context.Advance;                                // consume the operator symbol
+    // Two OPERATOR forms:
+    //   Symbol form "OPERATOR <sym> (a AS T, b AS T) AS R" — a global binary op; the owning type is
+    //     derived from the first parameter after the list is parsed (label "<T>.OPERATOR<sym>"). No
+    //     implicit THIS: it is a 2-argument function resolved by operand type at the binary op.
+    //   Method form "OPERATOR <Type>.<name>() AS R" — a FreeBASIC conversion/assignment operator such as
+    //     "Operator T.Cast() As String": behaves like a method (implicit THIS AS Type). Set MethodType +
+    //     OpSym; the THIS injection and the OPERATOR post-processing below form the "<Type>.OPERATOR<name>"
+    //     label (owner read from THIS's type) exactly like the symbol form. Distinguished by "ident '.'".
+    if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpDot) then
+    begin
+      MethodType := UpperCase(VarToStr(Context.CurrentToken.Value));
+      Context.Advance;                              // <Type>
+      Context.Advance;                              // '.'
+      OpSym := UpperCase(VarToStr(Context.CurrentToken.Value));   // operator name (CAST, LET, ...)
+      Context.Advance;                              // operator name
+    end
+    else
+    begin
+      OpSym := Context.CurrentToken.Value;
+      Context.Advance;                              // consume the operator symbol
+    end;
     NameNode := TASTNode.CreateWithValue(antIdentifier, 'OPERATOR' + OpSym, Token);  // placeholder
     Result.AddChild(NameNode);
   end
