@@ -4133,10 +4133,22 @@ begin
     if Context.Check(ttDelimParClose) then Context.Advance;       // ')'
     if Context.Check(ttSeparParam) then Context.Advance;          // ','
     Result.AddChild(ParseExpression);                             // radius
+    // Optional trailing parameters: color, start-angle, end-angle, aspect, and a fill flag (F).
+    // Any may be omitted with an empty comma — FreeBASIC "CIRCLE (x,y),r,,,,,F". Only the colour
+    // (the first) is used here; the arc angles / aspect / fill are accepted and ignored (we draw a
+    // full circle). Add the colour child ONLY when actually present, so ProcessGfxCircle can default
+    // an omitted colour and never receives a nil child (which would fault the SSA lowering).
     if Context.Check(ttSeparParam) then
     begin
-      Context.Advance;                                            // ','
-      Result.AddChild(ParseExpression);                           // color
+      Context.Advance;                                            // ',' before colour
+      if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+        Result.AddChild(ParseExpression);                         // colour (present)
+      while Context.Check(ttSeparParam) do                        // consume & discard start/end/aspect/F
+      begin
+        Context.Advance;                                          // ','
+        if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+          ParseExpression.Free;                                   // param value or the fill flag -> discarded
+      end;
     end;
     DoNodeCreated(Result);
     Exit;

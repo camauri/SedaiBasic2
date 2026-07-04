@@ -7980,7 +7980,7 @@ begin
   ProcessExpression(Node.GetChild(0), XV); XR := EnsureIntRegister(XV);
   ProcessExpression(Node.GetChild(1), YV); YR := EnsureIntRegister(YV);
   ProcessExpression(Node.GetChild(2), RV); RR := EnsureIntRegister(RV);
-  if Node.ChildCount >= 4 then
+  if (Node.ChildCount >= 4) and Assigned(Node.GetChild(3)) then
   begin
     ProcessExpression(Node.GetChild(3), CV); CR := EnsureIntRegister(CV);
   end
