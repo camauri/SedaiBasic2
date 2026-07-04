@@ -10235,17 +10235,11 @@ begin
       VarName := VarToStr(Child.Value);
       DestReg := GetOrAllocateVariable(VarName);
 
-      // Emit ssaDataRead with type hint from variable suffix
-      if VarName.EndsWith('$') then
-        EmitInstruction(ssaDataRead, DestReg, MakeSSAConstInt(Ord(srtString)),
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone))
-      else if VarName.EndsWith('%') then
-        EmitInstruction(ssaDataRead, DestReg, MakeSSAConstInt(Ord(srtInt)),
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone))
-      else
-        // Default to float
-        EmitInstruction(ssaDataRead, DestReg, MakeSSAConstInt(Ord(srtFloat)),
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // Read-target bank from the variable's ACTUAL bank (DestReg is allocated in the variable's declared
+      // bank), not just the $/% suffix — "Read word" on a suffixless "Dim As String word" must read a
+      // STRING, not default to float (which mis-read a string DATA item -> "invalid variant type cast").
+      EmitInstruction(ssaDataRead, DestReg, MakeSSAConstInt(Ord(DestReg.RegType)),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end
     else if Child.NodeType = antArrayAccess then
     begin
