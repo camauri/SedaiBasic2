@@ -200,6 +200,8 @@ type
     // Shared body for TYPE / UNION (IsUnion tags the node so SSA overlaps same-bank fields).
     function ParseRecordDecl(IsUnion: Boolean): TASTNode;
     function ParseRecordFieldType: string;
+    // Parse a "{ ... }" array initializer group, appending leaf expressions to InitList (row-major).
+    procedure ParseArrayInitBraceGroup(InitList: TASTNode);
     function AtEndType: Boolean;
     procedure ConsumeEndType;
     // WITH obj / ... / END WITH : a leading '.field' resolves against obj. Parse-time desugar.
@@ -1296,6 +1298,16 @@ begin
 
   while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
+    // A separator with no preceding expression: FreeBASIC "Print ; x" / "Print , x" (a leading ';'/','
+    // controls the start position/print zone) or consecutive separators. Emit the separator node and
+    // continue, instead of letting the expression parse below fail on the ';' / ','.
+    if Context.CheckAny([ttSeparParam, ttSeparOutput]) then
+    begin
+      SeparatorNode := TASTNode.CreateWithValue(antSeparator, Context.CurrentToken.Value, Context.CurrentToken);
+      Result.AddChild(SeparatorNode);
+      Context.Advance;                 // consume the leading/standalone separator
+      Continue;
+    end;
     // Parse expression
     Expr := ParseExpression;
     if Assigned(Expr) then
@@ -2772,6 +2784,17 @@ begin
     // FreeBASIC in-TYPE method declaration: "Declare [Virtual|Abstract|Static] Sub|Function ...". Methods
     // are defined out-of-line (SUB Type.method); skip the declaration line (consume to end of statement).
     if TokU = 'DECLARE' then
+    begin
+      while (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) and (not AtEndType) do
+        Context.Advance;
+      Continue;
+    end;
+    // FreeBASIC lets CONSTRUCTOR / DESTRUCTOR / OPERATOR / PROPERTY be introduced in the TYPE body
+    // WITHOUT a leading DECLARE (e.g. "Destructor()", "Constructor(x As Integer)", "Operator cast() As
+    // String"). Like DECLARE'd methods they are defined out-of-line (SUB Type.method), so skip the whole
+    // declaration line here — otherwise the field grammar below would take the keyword as a field name
+    // and choke on its "()" parameter list (which ParseDimensionList reads as empty array dimensions).
+    if (TokU = kCONSTRUCTOR) or (TokU = kDESTRUCTOR) or (TokU = kOPERATOR) or (TokU = kPROPERTY) then
     begin
       while (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) and (not AtEndType) do
         Context.Advance;
@@ -6130,22 +6153,39 @@ begin
     if Context.Check(ttOpGt) then Context.Advance;    // optional '>' (=> form)
     if Context.Check(ttDelimBraceOpen) then
     begin
-      Context.Advance;                                // {
       InitList := TASTNode.Create(antArgumentList, Token);
-      if not Context.Check(ttDelimBraceClose) then
-        repeat
-          ValExpr := FExpressionParser.ParseExpression;
-          if not Assigned(ValExpr) then Break;
-          InitList.AddChild(ValExpr);
-          if Context.Check(ttSeparParam) then Context.Advance else Break;
-        until Context.CheckAny([ttDelimBraceClose, ttEndOfLine, ttEndOfFile, ttSeparStmt]);
-      if Context.Check(ttDelimBraceClose) then Context.Advance;   // }
+      ParseArrayInitBraceGroup(InitList);             // flattens any nested {..} row-major
       Result.Attributes.Values['ARRAYINIT'] := '1';
       Result.AddChild(InitList);                      // initializer values (antArgumentList)
     end;
   end;
 
   DoNodeCreated(Result);
+end;
+
+procedure TPackratParser.ParseArrayInitBraceGroup(InitList: TASTNode);
+// Parse a "{ ... }" array-initializer group, appending each LEAF expression to InitList in textual
+// (row-major) order. A nested "{ ... }" — a multi-dimensional initializer such as "= {{1,2},{3,4}}"
+// (FreeBASIC) — is flattened recursively: our arrays store row-major, so nested braces collapse to a
+// flat element sequence that ProcessDim then fills element-by-element. Arbitrary nesting depth works.
+var
+  ValExpr: TASTNode;
+begin
+  if not Context.Check(ttDelimBraceOpen) then Exit;
+  Context.Advance;                                    // {
+  if not Context.Check(ttDelimBraceClose) then
+    repeat
+      if Context.Check(ttDelimBraceOpen) then
+        ParseArrayInitBraceGroup(InitList)            // nested row/plane -> flatten in place
+      else
+      begin
+        ValExpr := FExpressionParser.ParseExpression;
+        if not Assigned(ValExpr) then Break;
+        InitList.AddChild(ValExpr);
+      end;
+      if Context.Check(ttSeparParam) then Context.Advance else Break;
+    until Context.CheckAny([ttDelimBraceClose, ttEndOfLine, ttEndOfFile, ttSeparStmt]);
+  if Context.Check(ttDelimBraceClose) then Context.Advance;   // }
 end;
 
 function TPackratParser.ParseDimensionList: TASTNode;
@@ -7044,6 +7084,49 @@ begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antConst, Token);
   Context.Advance; // Consume CONST
+
+  // FreeBASIC leading-AS typed constant: "CONST AS type name = value" (e.g. "Const As UInteger
+  // children = 100"). The alternate spelling of the name-first form below; same lowering to a typed
+  // scalar DIM so it reuses the full typing + initialization path.
+  if Context.Check(ttAsType) then
+  begin
+    Context.Advance;                                  // AS
+    TypeTok := Context.CurrentToken;
+    TypeName := 'INTEGER';
+    if Context.Check(ttIdentifier) then
+    begin
+      TypeName := UpperCase(ParseDottedName);         // element type
+      if Context.Check(ttOpMul) then                  // optional "PTR"-style suffix (rare for a const)
+      begin Context.Advance; TypeName := TypeName + ' PTR'; end;
+    end;
+    if not Context.Check(ttIdentifier) then
+    begin
+      HandleError('Expected constant name after CONST AS type', Context.CurrentToken);
+      Result.Free; Result := nil; Exit;
+    end;
+    NameTok := Context.CurrentToken;
+    Context.Advance;                                  // name
+    if not Context.Match(ttOpEq) then
+    begin
+      HandleError('Expected "=" after CONST name', Context.CurrentToken);
+      Result.Free; Result := nil; Exit;
+    end;
+    ValueNode := ParseExpression;
+    if not Assigned(ValueNode) then
+    begin
+      HandleError('Expected value after CONST =', Context.CurrentToken);
+      Result.Free; Result := nil; Exit;
+    end;
+    Result.Free;                                      // discard the antConst; emit a typed DIM instead
+    ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
+    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
+    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, TypeTok));
+    ArrayDecl.AddChild(ValueNode);
+    Result := TASTNode.Create(antDim, Token);
+    Result.AddChild(ArrayDecl);
+    DoNodeCreated(Result);
+    Exit;
+  end;
 
   // FreeBASIC typed constant: "CONST name AS type = value". Rewrite it into a typed scalar DIM
   // (antDim -> antArrayDecl(name, typeIdent, valueExpr)) so it reuses the full typing + initialization
