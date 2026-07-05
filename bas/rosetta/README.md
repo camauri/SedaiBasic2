@@ -72,6 +72,12 @@ single work, but distributing separate works together (aggregation) is permitted
 | `digital_root.bas`            | <https://rosettacode.org/wiki/Digital_root> |
 | `count_in_octal.bas`          | <https://rosettacode.org/wiki/Count_in_octal> |
 | `sum_multiples_of_3_and_5.bas`| <https://rosettacode.org/wiki/Sum_multiples_of_3_and_5> |
+| `averages_mode.bas`           | <https://rosettacode.org/wiki/Averages/Mode> |
+| `vigenere_cipher.bas`         | <https://rosettacode.org/wiki/Vigen%C3%A8re_cipher> |
+| `reverse_words_in_a_string.bas` | <https://rosettacode.org/wiki/Reverse_words_in_a_string> |
+| `string_length.bas`           | <https://rosettacode.org/wiki/String_length> |
+| `repeat_a_string.bas`         | <https://rosettacode.org/wiki/Repeat_a_string> |
+| `string_comparison.bas`       | <https://rosettacode.org/wiki/String_comparison> |
 
 ## Running
 
