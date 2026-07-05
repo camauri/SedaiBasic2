@@ -87,6 +87,8 @@ single work, but distributing separate works together (aggregation) is permitted
 | `comma_quibbling.bas`         | <https://rosettacode.org/wiki/Comma_quibbling> |
 | `sieve_of_eratosthenes.bas`   | <https://rosettacode.org/wiki/Sieve_of_Eratosthenes> |
 | `power_set.bas`               | <https://rosettacode.org/wiki/Power_set> |
+| `pangram_checker.bas`         | <https://rosettacode.org/wiki/Pangram_checker> |
+| `range_expansion.bas`         | <https://rosettacode.org/wiki/Range_expansion> |
 
 ## Running
 
