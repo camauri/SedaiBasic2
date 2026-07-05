@@ -364,6 +364,8 @@ type
                                  out TypeName: string): Boolean;
     // OOP (M4.1): UDT type name of an object expression (no code emitted); method dispatch.
     function ObjectTypeName(ObjNode: TASTNode): string;
+    // UDT element type of an array-of-UDT by name, scope-aware (per-proc array param, then global).
+    function ArrayRecordTypeOf(const ArrName: string): string;
     // FreeBASIC "Operator T.Cast() As String": if Node is a UDT with a string cast, invoke it -> string.
     function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
     procedure ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
@@ -15356,6 +15358,23 @@ begin
   end;
 end;
 
+function TSSAGenerator.ArrayRecordTypeOf(const ArrName: string): string;
+// The UDT element type of an array-of-UDT, resolved scope-aware: an array PARAMETER's placeholder is
+// registered under its per-proc mangled name (RegisterArrayParams), so inside a proc body try that name
+// first, then fall back to the module/global array name. Empty if the array is not an array-of-UDT.
+var
+  nameU, mangled: string;
+begin
+  Result := '';
+  nameU := UpperCase(ArrName);
+  if FInProcedure then
+  begin
+    mangled := ParamArrayMangle(FCurrentProcName, nameU);
+    if FArrayRecordType.IndexOfName(mangled) >= 0 then Exit(FArrayRecordType.Values[mangled]);
+  end;
+  if FArrayRecordType.IndexOfName(nameU) >= 0 then Result := FArrayRecordType.Values[nameU];
+end;
+
 function TSSAGenerator.ObjectTypeName(ObjNode: TASTNode): string;
 // The UDT type name of an object expression, without emitting any code. Empty if not a record.
 var
@@ -15377,8 +15396,7 @@ begin
     if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0).NodeType = antIdentifier) then
     begin
       ArrName := UpperCase(VarToStr(ObjNode.GetChild(0).Value));
-      if FArrayRecordType.IndexOfName(ArrName) >= 0 then
-        Result := FArrayRecordType.Values[ArrName];
+      Result := ArrayRecordTypeOf(ArrName);   // scope-aware (array-of-UDT parameter too)
     end;
   end
   else if ObjNode.NodeType = antMemberAccess then
@@ -15568,8 +15586,8 @@ begin
       Exit;
     end;
     // Array-of-UDT element: arr(i) evaluates to the element's record handle (int).
-    if FArrayRecordType.IndexOfName(ArrName) < 0 then Exit;
-    TypeName := FArrayRecordType.Values[ArrName];
+    TypeName := ArrayRecordTypeOf(ArrName);   // scope-aware (array-of-UDT parameter too)
+    if TypeName = '' then Exit;
     ProcessExpression(ObjNode, HandleVal);
     Result := True;
   end
@@ -16210,12 +16228,23 @@ begin
       if (PN.ChildCount >= 1) and (PN.GetChild(0).NodeType = antIdentifier) then
       begin
         TypeName := UpperCase(VarToStr(PN.GetChild(0).Value));
-        ET := TypeNameToBank(TypeName, '');
+        // Array-of-UDT parameter: each element is a record HANDLE (int), not a value of the UDT — so the
+        // placeholder is an int array (TypeNameToBank would default an unknown UDT name to float).
+        if FindUDT(TypeName) >= 0 then ET := srtInt
+        else ET := TypeNameToBank(TypeName, '');
       end
       else
+      begin
+        TypeName := '';
         ET := GetVariableType(PName);
+      end;
       if FProgram.FindArray(MangledName) < 0 then
         FProgram.DeclareArray(MangledName, ET, [0]);   // placeholder; overwritten by bind at each call
+      // Array-of-UDT parameter "p() As SomeType": record the element UDT under the placeholder's mangled
+      // name so element access (p(i), p(i).field, Swap p(i),p(j)) is recognized as an array-of-UDT. The
+      // aliased caller array already holds a record handle per element, so the placeholder allocates none.
+      if (FindUDT(TypeName) >= 0) and (FArrayRecordType.IndexOfName(MangledName) < 0) then
+        FArrayRecordType.Values[MangledName] := TypeName;
       // Record the slot so array accesses on it subtract the lower bound at RUNTIME (the bound array's
       // lower bound varies per call and cannot be a compile-time constant like a normal array's).
       Slot := FProgram.FindArray(MangledName);
