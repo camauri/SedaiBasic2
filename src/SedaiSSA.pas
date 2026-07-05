@@ -246,6 +246,8 @@ type
     procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer);  // alloc nested records
     procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
                                   ArgsNode: TASTNode = nil);  // M4.4 (ArgsNode: M4.4b ctor args)
+    // Anonymous temporary "TypeName(args)" as an expression -> allocate + construct; returns its handle.
+    function EmitUDTTemporary(const TypeName: string; ArgsNode: TASTNode; out Handle: TSSAValue): Boolean;
     procedure EmitDestructorCall(const HandleVal: TSSAValue; const TypeName: string);  // V5
     function FindBaseCall(Node: TASTNode): TASTNode;    // M4.4f: the body's explicit BASE call node (or nil)
     procedure CollectLocalRecordVars(Node: TASTNode);  // V5: gather a proc body's DIM'd local UDTs
@@ -3662,6 +3664,14 @@ begin
 
         ArrName := VarToStr(Node.GetChild(0).Value);
 
+        // FreeBASIC anonymous temporary construction "TypeName(args)" used as a VALUE (array-of-UDT
+        // initializer element, assignment RHS, function argument): the "array name" is actually a declared
+        // UDT type and not a real array. Construct a temporary instance (allocate + constructor) and return
+        // its handle. Guarded by ArrayIndexOf < 0 so a genuine array of the same name still wins.
+        if (FindUDT(UpperCase(ArrName)) >= 0) and (ArrayIndexOf(UpperCase(ArrName)) < 0) and
+           (Node.ChildCount >= 2) and (Node.GetChild(1).NodeType = antExpressionList) then
+          if EmitUDTTemporary(ArrName, Node.GetChild(1), Result) then Exit;
+
         // FreeBASIC raw heap: ALLOCATE(n)/CALLOCATE(n)/REALLOCATE(p,n) as an expression → raw pointer;
         // DEALLOCATE(p) as an expression-statement → free (yields a dummy 0). Parse as array-access (not
         // a declared array/function).
@@ -5314,6 +5324,7 @@ var
   ArrElemTypeName: string; // declared "AS <type>" element type for an array (empty if none)
   RecPacked: Int64;        // M3.1: packed slot counts for bcRecordNewArray
   InitAssign: TASTNode;    // M4.4e: synthesized assignment for a "DIM v AS T = expr" initializer
+  UdtInitArrAccess, UdtInitIdxList: TASTNode;   // synthesized "arr(k) = elem" for an array-of-UDT init
   BlkIdx: Integer;         // M8/FB: innermost open block scope (-1 if none) for block-scoped UDT dtors
   MDtorSlotIdx: Integer;   // V5e: index into FModuleDtorSlots for a module global's handle slot (-1 if none)
   EllipCount: Integer;     // FB ellipsis "lb TO ...": element count taken from the initializer list
@@ -5792,6 +5803,30 @@ begin
           IdxReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaLoadConstInt, IdxReg, MakeSSAConstInt(k), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           EmitInstruction(ssaArrayStore, InitElemReg, MakeSSAArrayRef(ArrayIdx, ElementType), IdxReg, MakeSSAValue(svkNone));
+        end;
+    end;
+
+    // FreeBASIC array-of-UDT initializer "= { T(a,b), T(c,d), ... }": every pre-allocated element record
+    // (bcRecordNewArray, above) is value-copied from its (usually a temporary-construction) initializer via
+    // the normal array-store path, which does the UDT record copy. 1-D only (v1); index = lb + k.
+    if (RecArrUDTIdx >= 0) and (ArrayDeclNode.Attributes.Values['ARRAYINIT'] = '1') and (DimCount = 1) then
+    begin
+      InitVals := nil;
+      for k := 0 to ArrayDeclNode.ChildCount - 1 do
+        if ArrayDeclNode.GetChild(k).NodeType = antArgumentList then
+        begin InitVals := ArrayDeclNode.GetChild(k); Break; end;
+      if Assigned(InitVals) then
+        for k := 0 to InitVals.ChildCount - 1 do
+        begin
+          InitAssign := TASTNode.Create(antAssignment, Node.Token);
+          UdtInitArrAccess := TASTNode.Create(antArrayAccess, Node.Token);
+          UdtInitArrAccess.AddChild(TASTNode.CreateWithValue(antIdentifier, ArrName, Node.Token));
+          UdtInitIdxList := TASTNode.Create(antExpressionList, Node.Token);
+          UdtInitIdxList.AddChild(TASTNode.CreateWithValue(antLiteral, LowerBounds[0] + k, Node.Token));
+          UdtInitArrAccess.AddChild(UdtInitIdxList);
+          InitAssign.AddChild(UdtInitArrAccess);
+          InitAssign.AddChild(InitVals.GetChild(k).Clone);
+          try ProcessArrayStore(InitAssign); finally InitAssign.Free; end;
         end;
     end;
   end;
@@ -13384,6 +13419,29 @@ begin
     end;
 end;
 
+function TSSAGenerator.EmitUDTTemporary(const TypeName: string; ArgsNode: TASTNode;
+  out Handle: TSSAValue): Boolean;
+// FreeBASIC anonymous temporary construction "TypeName(args)" used as a value (e.g. an array-of-UDT
+// initializer element, an assignment RHS, a function argument). Allocate a fresh record instance,
+// initialize nested members, run the matching constructor with the given args, and return its handle.
+// Mirrors what a "Dim v As T = T(args)" declaration does, but yields a temporary usable in any
+// expression. Returns False if TypeName is not a declared UDT.
+var
+  UDTIdx: Integer;
+begin
+  Result := False;
+  Handle := MakeSSAValue(svkNone);
+  UDTIdx := FindUDT(UpperCase(TypeName));
+  if UDTIdx < 0 then Exit;
+  Handle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRecordNew, Handle,
+                  MakeSSAConstInt(FUDTs[UDTIdx].NInt), MakeSSAConstInt(FUDTs[UDTIdx].NFloat),
+                  MakeSSAConstInt(FUDTs[UDTIdx].NStr or (Int64(UDTIdx) shl 32)));
+  EmitRecordInit(Handle, UDTIdx);
+  EmitConstructorCall(Handle, UpperCase(TypeName), ArgsNode);
+  Result := True;
+end;
+
 procedure TSSAGenerator.EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
   ArgsNode: TASTNode);
 // M4.4: if TypeName (or an ancestor) declares a CONSTRUCTOR, call it on the just-allocated instance.
@@ -15497,9 +15555,19 @@ begin
   end
   else if ObjNode.NodeType = antArrayAccess then
   begin
-    // Array-of-UDT element: arr(i) evaluates to the element's record handle (int).
     if (ObjNode.ChildCount < 1) or (ObjNode.GetChild(0).NodeType <> antIdentifier) then Exit;
     ArrName := UpperCase(VarToStr(ObjNode.GetChild(0).Value));
+    // Anonymous temporary "T(args)": ArrName is a declared UDT type (not an array). Construct it so any
+    // record context (assignment RHS, array-of-UDT initializer element, argument) gets its handle.
+    if (FindUDT(ArrName) >= 0) and (ArrayIndexOf(ArrName) < 0) and
+       (ObjNode.ChildCount >= 2) and (ObjNode.GetChild(1).NodeType = antExpressionList) and
+       EmitUDTTemporary(ArrName, ObjNode.GetChild(1), HandleVal) then
+    begin
+      TypeName := ArrName;
+      Result := True;
+      Exit;
+    end;
+    // Array-of-UDT element: arr(i) evaluates to the element's record handle (int).
     if FArrayRecordType.IndexOfName(ArrName) < 0 then Exit;
     TypeName := FArrayRecordType.Values[ArrName];
     ProcessExpression(ObjNode, HandleVal);
