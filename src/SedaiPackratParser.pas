@@ -68,6 +68,7 @@ type
     // from FDialectOverride when forced (pdModern/pdClassic), else auto-detected from the token
     // stream (no line numbers => MODERN); mirrors the SSA's SourceHasLineNumbers gate.
     FModernMode: Boolean;
+    FOptionBase: Integer;              // "OPTION BASE n": default lower bound for a bare-upper-bound array DIM (0 or 1)
     FDialectOverride: TParserDialect;  // pdAuto = detect per-Parse; pdModern/pdClassic = forced
     // Dialect-pluggable: per-token statement handlers installed by the active dialect profile.
     // Consulted by ParseStatement before the built-in case; nil entry = no override.
@@ -482,6 +483,7 @@ begin
       FModernMode := Assigned(TokenList) and not TokenList.HasTokenType(ttLineNumber);
     end;
     ApplyDialectProfile;   // install the dialect's statement handlers for this parse
+    FOptionBase := 0;      // reset per parse; set by an "OPTION BASE 1" directive as it is encountered
 
     DoParsingStarted;
 
@@ -6012,7 +6014,19 @@ begin
   // OPTION directive: consume option name argument
   if Assigned(Token.KeywordInfo) and (Token.KeywordInfo.Keyword = kOPTION) then
   begin
-    if Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttIdentifier) then
+    // OPTION BASE n: set the default lower bound (0 or 1) for arrays declared with a bare upper bound.
+    if Assigned(Context.CurrentToken) and
+       ((Context.CurrentToken.TokenType = ttIdentifier) or Assigned(Context.CurrentToken.KeywordInfo)) and
+       (UpperCase(Context.CurrentToken.Value) = 'BASE') then
+    begin
+      Context.Advance;                                 // consume BASE
+      if Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttNumber) then
+      begin
+        if Trim(Context.CurrentToken.Value) = '1' then FOptionBase := 1 else FOptionBase := 0;
+        Context.Advance;                               // consume the base value
+      end;
+    end
+    else if Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttIdentifier) then
       Context.Advance;
   end;
 
@@ -6241,8 +6255,13 @@ procedure TPackratParser.ParseArrayInitBraceGroup(InitList: TASTNode);
 // (row-major) order. A nested "{ ... }" — a multi-dimensional initializer such as "= {{1,2},{3,4}}"
 // (FreeBASIC) — is flattened recursively: our arrays store row-major, so nested braces collapse to a
 // flat element sequence that ProcessDim then fills element-by-element. Arbitrary nesting depth works.
+// A parenthesised comma-tuple element "(a, b, c)" is a UDT aggregate for an array-of-UDT element (e.g.
+// "Dim it(1 To 2) As T = {(""x"", 9), (""y"", 3)}"); it becomes an antArgumentList tagged TUPLEINIT and
+// ProcessDim aggregate-initialises the element from it. A single "(expr)" stays a normal expression.
 var
-  ValExpr: TASTNode;
+  ValExpr, TupleNode: TASTNode;
+  SavedIdx, TupleDepth: Integer;
+  IsTuple: Boolean;
 begin
   if not Context.Check(ttDelimBraceOpen) then Exit;
   Context.Advance;                                    // {
@@ -6250,6 +6269,41 @@ begin
     repeat
       if Context.Check(ttDelimBraceOpen) then
         ParseArrayInitBraceGroup(InitList)            // nested row/plane -> flatten in place
+      else if Context.Check(ttDelimParOpen) then
+      begin
+        // Look ahead for a TOP-LEVEL comma inside the parentheses -> a UDT aggregate tuple.
+        SavedIdx := Context.CurrentIndex;
+        Context.Advance;                              // step past '(' for the scan
+        TupleDepth := 1; IsTuple := False;
+        while (TupleDepth > 0) and (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) do
+        begin
+          if Context.Check(ttDelimParOpen) then Inc(TupleDepth)
+          else if Context.Check(ttDelimParClose) then Dec(TupleDepth)
+          else if Context.Check(ttSeparParam) and (TupleDepth = 1) then begin IsTuple := True; Break; end;
+          Context.Advance;
+        end;
+        Context.CurrentIndex := SavedIdx;             // rewind to '('
+        if IsTuple then
+        begin
+          Context.Advance;                            // (
+          TupleNode := TASTNode.Create(antArgumentList, Context.CurrentToken);
+          TupleNode.Attributes.Values['TUPLEINIT'] := '1';
+          repeat
+            ValExpr := FExpressionParser.ParseExpression;
+            if not Assigned(ValExpr) then Break;
+            TupleNode.AddChild(ValExpr);
+            if Context.Check(ttSeparParam) then Context.Advance else Break;
+          until Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]);
+          if Context.Check(ttDelimParClose) then Context.Advance;   // )
+          InitList.AddChild(TupleNode);
+        end
+        else
+        begin
+          ValExpr := FExpressionParser.ParseExpression;   // "(expr)" — an ordinary parenthesised value
+          if not Assigned(ValExpr) then Break;
+          InitList.AddChild(ValExpr);
+        end;
+      end
       else
       begin
         ValExpr := FExpressionParser.ParseExpression;
@@ -6313,6 +6367,15 @@ begin
         RangeNode.AddChild(UpperExpr);
         Result.AddChild(RangeNode);
       end;
+    end
+    else if FOptionBase <> 0 then
+    begin
+      // OPTION BASE 1 in effect: a bare upper bound "a(n)" means lower bound 1 (a(1..n)), so wrap it in an
+      // antDimRange(lb = OPTION BASE, ub = the expression). An explicit "lb TO ub" above is unaffected.
+      RangeNode := TASTNode.Create(antDimRange, Context.CurrentToken);
+      RangeNode.AddChild(TASTNode.CreateWithValue(antLiteral, IntToStr(FOptionBase), Context.CurrentToken));
+      RangeNode.AddChild(Dimension);
+      Result.AddChild(RangeNode);
     end
     else
       Result.AddChild(Dimension);

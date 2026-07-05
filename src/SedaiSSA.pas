@@ -5350,6 +5350,8 @@ var
   RecPacked: Int64;        // M3.1: packed slot counts for bcRecordNewArray
   InitAssign: TASTNode;    // M4.4e: synthesized assignment for a "DIM v AS T = expr" initializer
   UdtInitArrAccess, UdtInitIdxList: TASTNode;   // synthesized "arr(k) = elem" for an array-of-UDT init
+  InitElemNode, TupleCtor, TupleArgs: TASTNode; // an array-of-UDT init element (a T(..) temporary or a bare tuple)
+  m: Integer;
   BlkIdx: Integer;         // M8/FB: innermost open block scope (-1 if none) for block-scoped UDT dtors
   MDtorSlotIdx: Integer;   // V5e: index into FModuleDtorSlots for a module global's handle slot (-1 if none)
   EllipCount: Integer;     // FB ellipsis "lb TO ...": element count taken from the initializer list
@@ -5871,7 +5873,22 @@ begin
           UdtInitIdxList.AddChild(TASTNode.CreateWithValue(antLiteral, LowerBounds[0] + k, Node.Token));
           UdtInitArrAccess.AddChild(UdtInitIdxList);
           InitAssign.AddChild(UdtInitArrAccess);
-          InitAssign.AddChild(InitVals.GetChild(k).Clone);
+          // A bare tuple element "(a, b, c)" (antArgumentList, TUPLEINIT) is a UDT aggregate: wrap it as a
+          // "T(a, b, c)" temporary of the array's element type so the element-store path constructs and
+          // copies it. A "T(...)" temporary element is already an expression — used as-is.
+          InitElemNode := InitVals.GetChild(k);
+          if (InitElemNode.NodeType = antArgumentList) and (InitElemNode.Attributes.Values['TUPLEINIT'] = '1') then
+          begin
+            TupleCtor := TASTNode.Create(antArrayAccess, Node.Token);
+            TupleCtor.AddChild(TASTNode.CreateWithValue(antIdentifier, ArrElemTypeName, Node.Token));
+            TupleArgs := TASTNode.Create(antExpressionList, Node.Token);
+            for m := 0 to InitElemNode.ChildCount - 1 do
+              TupleArgs.AddChild(InitElemNode.GetChild(m).Clone);
+            TupleCtor.AddChild(TupleArgs);
+            InitAssign.AddChild(TupleCtor);
+          end
+          else
+            InitAssign.AddChild(InitElemNode.Clone);
           try ProcessArrayStore(InitAssign); finally InitAssign.Free; end;
         end;
     end;
