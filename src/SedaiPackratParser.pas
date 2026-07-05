@@ -2005,6 +2005,11 @@ begin
         if Context.Check(ttAsType) then
         begin
           Context.Advance;                        // AS
+          // FreeBASIC "AS CONST <type>": a read-only (immutable) parameter. Immutability is not enforced
+          // here, so consume and ignore the CONST qualifier and take the type that follows — otherwise
+          // CONST (a keyword, not an identifier) is skipped and the parameter is left untyped (mis-banked
+          // to numeric, so a "Const String" arg reads as 0).
+          if Context.Check(ttConstant) then Context.Advance;   // optional CONST qualifier
           // FreeBASIC function-pointer parameter "f AS FUNCTION(...) AS ret": the parameter is an int
           // (a procedure entry PC); the signature is recorded on the node, no UDT type child attached.
           if TryParseProcPtrType(ParamNode) then
