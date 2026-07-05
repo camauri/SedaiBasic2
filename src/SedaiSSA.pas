@@ -6715,7 +6715,15 @@ begin
   if Node.GetChild(0).NodeType <> antIdentifier then Exit;
 
   VarName := VarToStr(Node.GetChild(0).Value);
-  VarReg := GetOrAllocateVariable(VarName);
+  // Honor an explicit "FOR i AS <type>" counter type. A suffixless name otherwise defaults to the float
+  // bank, so an integer loop runs through per-iteration int<->float conversions — slower, and (worse) the
+  // conversions leave the counter's int register looking dead across the loop test, so register allocation
+  // can place the loop-condition result over a loop-carried integer and silently corrupt it. Binding the
+  // declared bank up front keeps an integer loop integer.
+  if Node.Attributes.Values['VARTYPE'] <> '' then
+    VarReg := DeclareVariableTyped(VarName, TypeNameToBank(Node.Attributes.Values['VARTYPE'], VarName))
+  else
+    VarReg := GetOrAllocateVariable(VarName);
 
   // Evaluate start, end, and step values
   ProcessExpression(Node.GetChild(1), StartValue);

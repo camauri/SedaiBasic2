@@ -89,6 +89,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `power_set.bas`               | <https://rosettacode.org/wiki/Power_set> |
 | `pangram_checker.bas`         | <https://rosettacode.org/wiki/Pangram_checker> |
 | `range_expansion.bas`         | <https://rosettacode.org/wiki/Range_expansion> |
+| `evaluate_binomial_coefficients.bas` | <https://rosettacode.org/wiki/Evaluate_binomial_coefficients> |
 
 ## Running
 
