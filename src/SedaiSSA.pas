@@ -7464,9 +7464,9 @@ end;
 
 procedure TSSAGenerator.ProcessIfStatement(Node: TASTNode);
 var
-  CondValue: TSSAValue;
+  CondValue, CondRegVal: TSSAValue;
   ThenLabel, ElseLabel, EndLabel: string;
-  i: Integer;
+  i, CondReg, CondInt: Integer;
   Child: TASTNode;
   HasElse: Boolean;
   PrevBlock, ThenBlock, ElseBlock, EndBlock: TSSABasicBlock;  // PHASE 3 TIER 3: CFG construction
@@ -7475,6 +7475,21 @@ begin
 
   // Evaluate condition (should return Int 0 or 1)
   ProcessExpression(Node.GetChild(0), CondValue);
+
+  // A constant condition ("IF 1 THEN", "IF 0 THEN") must be materialized into a register: ssaJumpIfZero
+  // reads its operand as a register, so a bare svkConst* would be misread as a register index (and the
+  // branch taken wrongly). Fold to an int truthiness (0/1) and load it.
+  if CondValue.Kind in [svkConstInt, svkConstFloat, svkConstString] then
+  begin
+    if CondValue.Kind = svkConstInt then CondInt := Ord(CondValue.ConstInt <> 0)
+    else if CondValue.Kind = svkConstFloat then CondInt := Ord(CondValue.ConstFloat <> 0.0)
+    else CondInt := Ord(CondValue.ConstString <> '');
+    CondReg := FProgram.AllocRegister(srtInt);
+    CondRegVal := MakeSSARegister(srtInt, CondReg);
+    EmitInstruction(ssaLoadConstInt, CondRegVal, MakeSSAConstInt(CondInt),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    CondValue := CondRegVal;
+  end;
 
   // Generate unique labels
   ThenLabel := GenerateUniqueLabel('then');

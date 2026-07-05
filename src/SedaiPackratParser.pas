@@ -1634,11 +1634,15 @@ begin
    Exit;
  end;
 
- // *** FreeBASIC/QuickBASIC block IF: "IF cond THEN" with nothing after THEN (end of
- //     line) opens a multi-line block, closed by ELSE / ENDIF. Parsed self-contained
- //     here (so nesting just recurses); the IF is popped when ENDIF is consumed. ***
- if Context.CheckAny([ttEndOfLine]) then
+ // *** FreeBASIC/QuickBASIC block IF: "IF cond THEN" with nothing after THEN opens a
+ //     multi-line block, closed by ELSE / ENDIF. Parsed self-contained here (so nesting
+ //     just recurses); the IF is popped when ENDIF is consumed. "Nothing after THEN" is
+ //     either end-of-line OR a ':' statement separator — the latter is how a block IF
+ //     written on one line ("IF c THEN : ... : END IF") appears, and how a multi-line
+ //     #macro body reads once its lines are joined with ':'. ***
+ if Context.CheckAny([ttEndOfLine]) or Context.Check(ttSeparStmt) then
  begin
+   if Context.Check(ttSeparStmt) then Context.Advance;  // consume the ':' that opened the block
    ParseBlockIfBody(ThenNode);               // THEN body, up to ELSE/ELSEIF/ENDIF/EOF
    ParseBlockElseChain(CurrentIf.IfNode);    // ELSEIF* / ELSE? tail
    ConsumeBlockIfTerminator;                 // consume ENDIF or END IF
