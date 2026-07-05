@@ -972,7 +972,13 @@ begin
         // path (an expression/assignment), so the name stays usable as a variable.
         else if Assigned(Context.PeekNext) and
                 (Context.PeekNext.TokenType in [ttNumber, ttInteger, ttFloat, ttStringLiteral, ttIdentifier,
-                                                ttOpSub, ttOpAdd]) then
+                                                ttOpSub, ttOpAdd,
+                                                // A first argument may itself start with a builtin-function
+                                                // keyword, e.g. "Split RTrim(s,sep), ...", "f Len(x), y".
+                                                ttStringFunction, ttMathFunction, ttMemoryFunction,
+                                                ttSystemFunction, ttInputFunction, ttUsrFunction,
+                                                ttErrorHandlingFunction, ttOutputFunction,
+                                                ttGraphicsFunction, ttSpriteFunction, ttSoundFunction]) then
           // A value token (or a leading +/- sign of a signed numeric argument, e.g. "bitwise -15, 3")
           // right after the name makes this a bare SUB call, never an assignment. Compound assignment
           // ("name += ..." / "name -= ...") uses a single ttCompoundAssign token, so it is unaffected.
