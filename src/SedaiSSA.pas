@@ -248,6 +248,8 @@ type
                                   ArgsNode: TASTNode = nil);  // M4.4 (ArgsNode: M4.4b ctor args)
     // Anonymous temporary "TypeName(args)" as an expression -> allocate + construct; returns its handle.
     function EmitUDTTemporary(const TypeName: string; ArgsNode: TASTNode; out Handle: TSSAValue): Boolean;
+    // FreeBASIC aggregate init "Dim As T v = (a,b,c)" / "Type<T>(a,b,c)": store args into fields in order.
+    procedure EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx: Integer; ArgsNode: TASTNode);
     procedure EmitDestructorCall(const HandleVal: TSSAValue; const TypeName: string);  // V5
     function FindBaseCall(Node: TASTNode): TASTNode;    // M4.4f: the body's explicit BASE call node (or nil)
     procedure CollectLocalRecordVars(Node: TASTNode);  // V5: gather a proc body's DIM'd local UDTs
@@ -5440,7 +5442,12 @@ begin
                           MakeSSAConstInt(FUDTs[RecUDTIdx].NStr or (Int64(RecUDTIdx) shl 32) or (Int64(1) shl 48)));
           EmitRecordInit(RecHandleVal, RecUDTIdx);
           if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType = antArgumentList) then
-            EmitConstructorCall(RecHandleVal, RecTypeName, ArrayDeclNode.GetChild(2))
+          begin
+            if ArrayDeclNode.GetChild(2).Attributes.Values['TUPLEINIT'] = '1' then
+              EmitUDTAggregateInit(RecHandleVal, RecUDTIdx, ArrayDeclNode.GetChild(2))  // = (a,b,c) field init
+            else
+              EmitConstructorCall(RecHandleVal, RecTypeName, ArrayDeclNode.GetChild(2));
+          end
           else
             EmitConstructorCall(RecHandleVal, RecTypeName);
           EmitSharedScalarStoreVal(UpperCase(ArrName), RecHandleVal);  // publish the handle into name(0)
@@ -5480,7 +5487,12 @@ begin
         // argument list as child[2] (antArgumentList).
         if (ArrayDeclNode.ChildCount >= 3) and
            (ArrayDeclNode.GetChild(2).NodeType = antArgumentList) then
-          EmitConstructorCall(RecHandleVal, RecTypeName, ArrayDeclNode.GetChild(2))
+        begin
+          if ArrayDeclNode.GetChild(2).Attributes.Values['TUPLEINIT'] = '1' then
+            EmitUDTAggregateInit(RecHandleVal, RecUDTIdx, ArrayDeclNode.GetChild(2))  // = (a,b,c) field init
+          else
+            EmitConstructorCall(RecHandleVal, RecTypeName, ArrayDeclNode.GetChild(2));
+        end
         else
           EmitConstructorCall(RecHandleVal, RecTypeName);
         // M8: a UDT DIM'd inside a block (loop body, or — MODERN — an IF branch / SCOPE block) is
@@ -13421,6 +13433,30 @@ begin
     end;
 end;
 
+procedure TSSAGenerator.EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx: Integer; ArgsNode: TASTNode);
+// FreeBASIC aggregate initialization "Dim As T v = (a, b, c)" and "Type<T>(a, b, c)": a UDT with no
+// constructor is initialized field-by-field — store each value into the field at the same position (in
+// declaration order). Extra values past the field count are ignored (FB would reject them; v1 is lenient).
+var
+  i, Slot: Integer;
+  ArgVal: TSSAValue;
+  Bank: TSSARegisterType;
+begin
+  if (UDTIdx < 0) or (ArgsNode = nil) then Exit;
+  for i := 0 to ArgsNode.ChildCount - 1 do
+  begin
+    if i > High(FUDTs[UDTIdx].Fields) then Break;
+    ProcessExpression(ArgsNode.GetChild(i), ArgVal);
+    Bank := FUDTs[UDTIdx].Fields[i].Bank;
+    Slot := FUDTs[UDTIdx].Fields[i].Slot;
+    case Bank of
+      srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal, EnsureFloatRegister(ArgVal), MakeSSAConstInt(Slot));
+      srtString: EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), HandleVal, EnsureStringRegister(ArgVal), MakeSSAConstInt(Slot));
+    else         EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal, EnsureIntRegister(ArgVal), MakeSSAConstInt(Slot));
+    end;
+  end;
+end;
+
 function TSSAGenerator.EmitUDTTemporary(const TypeName: string; ArgsNode: TASTNode;
   out Handle: TSSAValue): Boolean;
 // FreeBASIC anonymous temporary construction "TypeName(args)" used as a value (e.g. an array-of-UDT
@@ -13440,6 +13476,8 @@ begin
                   MakeSSAConstInt(FUDTs[UDTIdx].NInt), MakeSSAConstInt(FUDTs[UDTIdx].NFloat),
                   MakeSSAConstInt(FUDTs[UDTIdx].NStr or (Int64(UDTIdx) shl 32)));
   EmitRecordInit(Handle, UDTIdx);
+  // Runs the matching constructor if the type declares one; a constructor-less type is aggregate-
+  // initialized field-by-field from the args (EmitConstructorCall handles that fallback).
   EmitConstructorCall(Handle, UpperCase(TypeName), ArgsNode);
   Result := True;
 end;
@@ -13460,7 +13498,7 @@ procedure TSSAGenerator.EmitConstructorCall(const HandleVal: TSSAValue; const Ty
 var
   Lbl, ArgSig: string;
   Decl, ParamList, PNode: TASTNode;
-  i, Slot, ArgCount: Integer;
+  i, Slot, ArgCount, AggUDT: Integer;
   RT: TSSARegisterType;
   ArgVals: array of TSSAValue;
   DefVal: TSSAValue;
@@ -13477,7 +13515,25 @@ begin
   Lbl := ResolveConstructorLabel(TypeName, ArgSig);
   // M4.4h: if no ctor matches the given count, try one that is callable via default parameters.
   if Lbl = '' then Lbl := FindCtorWithDefaults(TypeName, ArgCount);
-  if Lbl = '' then Exit;
+  if Lbl = '' then
+  begin
+    // FreeBASIC aggregate init: a type with NO matching constructor but given args (e.g. "V3(1,2,3)" /
+    // "Dim As V3 v = V3(1,2,3)" on a plain UDT) sets its fields in declaration order from the args (which
+    // were already evaluated above into ArgVals — store them, do not re-evaluate).
+    AggUDT := FindUDT(TypeName);
+    if AggUDT >= 0 then
+      for i := 0 to ArgCount - 1 do
+      begin
+        if i > High(FUDTs[AggUDT].Fields) then Break;
+        Slot := FUDTs[AggUDT].Fields[i].Slot;
+        case FUDTs[AggUDT].Fields[i].Bank of
+          srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal, EnsureFloatRegister(ArgVals[i]), MakeSSAConstInt(Slot));
+          srtString: EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), HandleVal, EnsureStringRegister(ArgVals[i]), MakeSSAConstInt(Slot));
+        else         EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal, EnsureIntRegister(ArgVals[i]), MakeSSAConstInt(Slot));
+        end;
+      end;
+    Exit;
+  end;
   EmitXferStore(srtInt, 0, HandleVal);              // THIS handle -> int xfer slot 0
   if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
   begin

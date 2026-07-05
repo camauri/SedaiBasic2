@@ -6382,8 +6382,9 @@ function TPackratParser.ParseDimStatement: TASTNode;
 var
   Token, NameTok, TypeTok, SharedTypeTok: TLexerToken;
   ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode, FuncPtrSigNode: TASTNode;
-  IsShared, IsByref, LeadingAS: Boolean;
+  IsShared, IsByref, LeadingAS, IsTuple: Boolean;
   DimTypeName, SharedTypeName, SharedFixedLen: string;
+  SavedIdx, TupleDepth: Integer;
 begin
   Token := Context.CurrentToken;
   // VAR / STATIC share the ttDataDeclaration token with DIM; route to their own parsers.
@@ -6614,6 +6615,43 @@ begin
         if Context.Check(ttIdentifier) and
            (UpperCase(Context.CurrentToken.Value) = DimTypeName) then
           Context.Advance                    // RHS == declared type: ctor form (block below reads '(')
+        else if Context.Check(ttDelimParOpen) then
+        begin
+          // FreeBASIC aggregate init "Dim As T v = (a, b, c)": a parenthesised comma-tuple sets the UDT's
+          // fields in declaration order. Distinguish it from an expression that merely STARTS with '(' —
+          // e.g. "= (x + y) \ 2" — by looking ahead for a TOP-LEVEL comma inside the leading parentheses;
+          // only then is it a tuple. Without one, fall through to the normal (full) expression parse.
+          SavedIdx := Context.CurrentIndex;
+          Context.Advance;                   // step past '(' for the scan
+          TupleDepth := 1; IsTuple := False;
+          while (TupleDepth > 0) and (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) do
+          begin
+            if Context.Check(ttDelimParOpen) then Inc(TupleDepth)
+            else if Context.Check(ttDelimParClose) then Dec(TupleDepth)
+            else if Context.Check(ttSeparParam) and (TupleDepth = 1) then begin IsTuple := True; Break; end;
+            Context.Advance;
+          end;
+          Context.CurrentIndex := SavedIdx;  // rewind to the '('
+          if IsTuple then
+          begin
+            Context.Advance;                 // (
+            CtorArgs := TASTNode.Create(antArgumentList, Context.CurrentToken);
+            CtorArgs.Attributes.Values['TUPLEINIT'] := '1';   // UDT aggregate field init
+            repeat
+              ArgExpr := FExpressionParser.ParseExpression;
+              if not Assigned(ArgExpr) then Break;
+              CtorArgs.AddChild(ArgExpr);
+              if Context.Check(ttSeparParam) then Context.Advance else Break;
+            until Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]);
+            if Context.Check(ttDelimParClose) then Context.Advance;   // )
+            ArrayDecl.AddChild(CtorArgs);                     // child[2] = tuple
+          end
+          else
+          begin
+            InitExpr := FExpressionParser.ParseExpression;    // full expression, e.g. "(x + y) \ 2"
+            if Assigned(InitExpr) then ArrayDecl.AddChild(InitExpr);
+          end;
+        end
         else
         begin
           InitExpr := FExpressionParser.ParseExpression;    // general initializer expression
