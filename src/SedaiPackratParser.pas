@@ -2879,6 +2879,36 @@ begin
         ArrDimNode.Free;
       end;
       Result.AddChild(FieldNode);
+      // FreeBASIC "As <type> a, b, c": the leading-AS type is shared by every comma-separated name
+      // (e.g. "As String name, value" -> both String). Only the As-first form shares this way; a
+      // name-first field carries its own trailing "As type", so its comma is handled by re-parsing.
+      if LeadingType then
+        while Context.Check(ttSeparParam) do
+        begin
+          Context.Advance;                          // ','
+          if not (Context.Check(ttIdentifier) or
+                  ((Length(Context.CurrentToken.Value) > 0) and
+                   (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_']))) then Break;
+          FieldTok := Context.CurrentToken;
+          Context.Advance;                          // additional field name
+          ArrDimNode := nil;
+          if Context.Check(ttDelimParOpen) then     // "As type a, b(dims)": array member in the list
+          begin
+            Context.Advance;
+            ArrDimNode := ParseDimensionList;
+            if Context.Check(ttDelimParClose) then Context.Advance;
+          end;
+          FieldNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(FieldTok.Value), FieldTok);
+          FieldNode.AddChild(TASTNode.CreateWithValue(antIdentifier, FieldTypeName, FieldTok));
+          if IsStaticField then FieldNode.Attributes.Values['STATIC'] := '1';
+          if Assigned(ArrDimNode) then
+          begin
+            FieldNode.Attributes.Values['ARRAYFIELD'] := '1';
+            FieldNode.Attributes.Values['ARRAYDIMS'] := IntToStr(ArrDimNode.ChildCount);
+            ArrDimNode.Free;
+          end;
+          Result.AddChild(FieldNode);
+        end;
     end
     else
     begin
