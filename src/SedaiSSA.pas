@@ -163,6 +163,9 @@ type
     FRedimMultiArrays: TStringList;      // array names (UPPER) that appear in a multi-dim REDIM → their multi-dim
                                          // element access computes the linear index from RUNTIME dimensions
                                          // (push/resolve), since REDIM changes the strides; others stay const-folded.
+    FDynamicArrays: TStringList;         // array names (UPPER) that are dynamic (declared empty "()" or a REDIM
+                                         // target) → their lower bound can change at run time, so element access
+                                         // subtracts the RUNTIME lower bound (bcArrayLBound) instead of the DIM one.
     FWStringVars: TStringList;           // FreeBASIC WSTRING vars (UPPER): share the srtString bank but hold UTF-8 bytes
                                          // whose LEN/MID/LEFT/RIGHT count/index by Unicode codepoint (not byte). Assignment/
                                          // concat/copy/PRINT are unchanged (UTF-8 in, UTF-8 out); only width-aware ops differ.
@@ -298,6 +301,8 @@ type
     procedure CollectRawPtrVars(Node: TASTNode);                                // pre-scan: mark ptrs assigned from Allocate*
     procedure CollectWStringVars(Node: TASTNode);                               // pre-scan: mark DIM ... AS WSTRING vars
     procedure CollectRedimMultiArrays(Node: TASTNode);                          // pre-scan: arrays in a multi-dim REDIM
+    procedure CollectDynamicArrays(Node: TASTNode);                             // pre-scan: dynamic arrays (empty-declared / REDIM target)
+    function UsesRuntimeLBound(ArrayIdx: Integer; const ArrName: string): Boolean;  // access subtracts the runtime lower bound?
     function EmitArrayLinearIndex(const Indices: array of TSSAValue; const ArrInfo: TSSAArrayInfo;
                                   const ArrName: string): TSSAValue;            // row-major linear index (const or runtime)
     function IsWStringVar(const Name: string): Boolean;                         // declared WSTRING var (UTF-8, codepoint LEN)?
@@ -632,6 +637,8 @@ begin
   FWStringVars.CaseSensitive := False;
   FRedimMultiArrays := TStringList.Create;
   FRedimMultiArrays.CaseSensitive := False;
+  FDynamicArrays := TStringList.Create;
+  FDynamicArrays.CaseSensitive := False;
   FFixedLenVars := TStringList.Create;
   FFixedLenVars.CaseSensitive := False;
   FByrefRetFuncs := TStringList.Create;
@@ -681,6 +688,7 @@ begin
   FRawPtrVars.Free;
   FWStringVars.Free;
   FRedimMultiArrays.Free;
+  FDynamicArrays.Free;
   FFixedLenVars.Free;
   FByrefRetFuncs.Free;
   FVarWidthCode.Free;
@@ -4271,7 +4279,7 @@ begin
         // an array PARAMETER the lower bound is only known at run time (it aliases the caller's array), so
         // subtract LBOUND(arr, dim) dynamically instead of a compile-time constant.
         for i := 0 to High(Indices) do
-          if IsArrayParamSlot(ArrayIdx) then
+          if UsesRuntimeLBound(ArrayIdx, ArrName) then
             Indices[i] := EmitParamArrayLBoundSub(Indices[i], ArrayIdx, i)
           else if (i <= High(ArrInfo.LowerBounds)) and (ArrInfo.LowerBounds[i] <> 0) then
           begin
@@ -5192,10 +5200,10 @@ begin
   end;
 
   // FreeBASIC explicit lower bounds ("lb TO ub"): map each source index to a 0-based offset by
-  // subtracting its dimension's lower bound (the heap is 0-based, size is ub-lb+1). Array PARAMETERs use
-  // the run-time lower bound (they alias the caller's array).
+  // subtracting its dimension's lower bound (the heap is 0-based, size is ub-lb+1). Array PARAMETERs and
+  // dynamic arrays use the run-time lower bound (it aliases the caller's array / can change via REDIM).
   for i := 0 to High(Indices) do
-    if IsArrayParamSlot(ArrayIdx) then
+    if UsesRuntimeLBound(ArrayIdx, ArrName) then
       Indices[i] := EmitParamArrayLBoundSub(Indices[i], ArrayIdx, i)
     else if (i <= High(ArrInfo.LowerBounds)) and (ArrInfo.LowerBounds[i] <> 0) then
     begin
@@ -5887,9 +5895,9 @@ var
   j, di, ArrayIdx, MSlot, MDimCount: Integer;
   ArrName, MTypeName: string;
   ArrayDeclNode, DimsNode, DimChild, DimExpr, DimNode, MemberNode: TASTNode;
-  UbValue, UbReg, MHandle: TSSAValue;
+  UbValue, UbReg, MHandle, LbVal: TSSAValue;
   MElemBank: TSSARegisterType;
-  PreserveFlag: Int64;
+  PreserveFlag, LbImm, FoldedLb: Int64;
 begin
   if Node.Attributes.Values['PRESERVE'] = '1' then PreserveFlag := 1 else PreserveFlag := 0;
   for j := 0 to Node.ChildCount - 1 do
@@ -5946,16 +5954,31 @@ begin
 
     if DimsNode.ChildCount = 1 then
     begin
-      // 1-D REDIM: bare upper bound, or antDimRange(lb, ub) — keep the original lower bound, take ub.
-      // (A REDIM that changes the lower bound is not honoured: element access still uses the compile-time
-      // lower bound, so setting a new runtime lb here would desynchronise access. Left as a known limit.)
+      // 1-D REDIM: bare upper bound, or antDimRange(lb, ub). An explicit "lb TO ub" ALSO sets the lower
+      // bound (FreeBASIC); a bare "ub" keeps the array's current lower bound. Encode a constant, non-negative
+      // lb in the immediate (a dynamic array's access reads the runtime lb, so the two stay in sync).
+      // Immediate layout: bit0 = preserve, bit1 = has explicit lb, bits8+ = lb.
       DimChild := DimsNode.GetChild(0);
-      if DimChild.NodeType = antDimRange then DimExpr := DimChild.GetChild(1) else DimExpr := DimChild;
+      LbImm := 0;
+      if DimChild.NodeType = antDimRange then
+      begin
+        if TryConstFoldArrayBound(DimChild.GetChild(0), FoldedLb) then
+          LbVal := MakeSSAConstInt(FoldedLb)
+        else
+          ProcessExpression(DimChild.GetChild(0), LbVal);
+        if (LbVal.Kind = svkConstInt) and (LbVal.ConstInt >= 0) then
+          LbImm := 2 or (LbVal.ConstInt shl 8)
+        else if (LbVal.Kind = svkConstFloat) and (LbVal.ConstFloat >= 0) then
+          LbImm := 2 or (Int64(Trunc(LbVal.ConstFloat)) shl 8);
+        DimExpr := DimChild.GetChild(1);
+      end
+      else
+        DimExpr := DimChild;
       ProcessExpression(DimExpr, UbValue);
       UbReg := EnsureIntRegister(UbValue);
       EmitInstruction(ssaArrayRedim, MakeSSAValue(svkNone),
                       MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType),
-                      UbReg, MakeSSAConstInt(PreserveFlag));
+                      UbReg, MakeSSAConstInt(PreserveFlag or LbImm));
     end
     else
     begin
@@ -13301,6 +13324,12 @@ var
   VarName, TypeName: string;
 begin
   if Node = nil then Exit;
+  // A typed FOR counter ("FOR i AS Integer") pre-registers its bank so a module-level counter is
+  // pre-allocated there instead of defaulting to float — a float integer-loop counter is slower, and its
+  // int comparison result can be allocated over an int accumulator in the loop body (silent wrong sums).
+  if (Node.NodeType = antForLoop) and (Node.Attributes.Values['VARTYPE'] <> '') and
+     (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+    RegisterTypedVar(UpperCase(VarToStr(Node.GetChild(0).Value)), Node.Attributes.Values['VARTYPE']);
   if Node.NodeType = antDim then
   begin
     for k := 0 to Node.ChildCount - 1 do
@@ -14847,6 +14876,48 @@ begin
     CollectRedimMultiArrays(Node.GetChild(i));
 end;
 
+procedure TSSAGenerator.CollectDynamicArrays(Node: TASTNode);
+// Pre-scan: record every DYNAMIC array — one declared empty ("DIM/REDIM x()") or that is the target of any
+// REDIM. Such an array's lower bound is a run-time property (a REDIM "lb TO ub" can change it, and a ByRef
+// writeback can carry a changed bound back to the caller's array), so its element access must subtract the
+// current lower bound rather than the one fixed at DIM time.
+var
+  i, k: Integer;
+  Decl, Dims: TASTNode;
+  Nm: string;
+begin
+  if Node = nil then Exit;
+  if (Node.NodeType = antRedim) or (Node.NodeType = antDim) then
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(k);
+      if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) or
+         (Decl.GetChild(0).NodeType <> antIdentifier) then Continue;
+      // A REDIM target is always dynamic. A DIM is dynamic only when declared empty (no subscripts).
+      if Node.NodeType = antDim then
+      begin
+        if Decl.Attributes.Values['VARLEN'] <> '1' then
+        begin
+          if Decl.ChildCount < 2 then Continue;
+          Dims := Decl.GetChild(1);
+          if (Dims.NodeType <> antDimensions) or (Dims.ChildCount > 0) then Continue;  // has subscripts -> fixed
+        end;
+      end;
+      Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+      if FDynamicArrays.IndexOf(Nm) < 0 then FDynamicArrays.Add(Nm);
+    end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectDynamicArrays(Node.GetChild(i));
+end;
+
+function TSSAGenerator.UsesRuntimeLBound(ArrayIdx: Integer; const ArrName: string): Boolean;
+// An element access subtracts the RUNTIME lower bound (bcArrayLBound) when the array's lower bound is not
+// fixed at compile time: an array PARAMETER (aliases the caller's array) or a DYNAMIC array (its bound can
+// change via REDIM). A plain fixed "DIM a(lb TO ub)" keeps the fast compile-time constant subtraction.
+begin
+  Result := IsArrayParamSlot(ArrayIdx) or (FDynamicArrays.IndexOf(UpperCase(ArrName)) >= 0);
+end;
+
 function TSSAGenerator.EmitArrayLinearIndex(const Indices: array of TSSAValue;
   const ArrInfo: TSSAArrayInfo; const ArrName: string): TSSAValue;
 // Row-major linear index for a multi-dimensional array access. For arrays that are multi-dim REDIM'd
@@ -15092,10 +15163,10 @@ begin
     end;
   end;
 
-  // Map each index to a 0-based offset honoring explicit lower bounds (lb TO ub). Array PARAMETERs use
-  // the run-time lower bound (they alias the caller's array).
+  // Map each index to a 0-based offset honoring explicit lower bounds (lb TO ub). Array PARAMETERs and
+  // dynamic arrays use the run-time lower bound (alias the caller's array / bound can change via REDIM).
   for i := 0 to High(Indices) do
-    if IsArrayParamSlot(ArrayIdx) then
+    if UsesRuntimeLBound(ArrayIdx, ArrName) then
       Indices[i] := EmitParamArrayLBoundSub(Indices[i], ArrayIdx, i)
     else if (i <= High(ArrInfo.LowerBounds)) and (ArrInfo.LowerBounds[i] <> 0) then
     begin
@@ -17487,6 +17558,11 @@ begin
   // uses the push/resolve path. Arrays never multi-dim-REDIM'd keep the fast const-folded strides.
   FRedimMultiArrays.Clear;
   CollectRedimMultiArrays(AST);
+  // Dynamic arrays (declared empty "()" or any REDIM target): a REDIM can change the lower bound at run
+  // time (and a ByRef writeback can propagate that changed bound back to a caller's array), so their
+  // element access subtracts the RUNTIME lower bound instead of the compile-time DIM one.
+  FDynamicArrays.Clear;
+  CollectDynamicArrays(AST);
 
   // M8: reset block-scope state (block-scoped record reclamation; the scope stack itself was reset above).
   FBlockHandledVars.Clear;

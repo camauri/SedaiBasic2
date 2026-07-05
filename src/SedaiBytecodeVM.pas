@@ -254,7 +254,7 @@ type
     // does not bounds-check) returns False so the caller yields a default on read / skips the write.
     function ArrayBoundsOK(ArrayIdx, LinearIdx: Integer): Boolean;
     procedure EraseArray(ArrayIdx: Integer);                                   // B1.4: ERASE
-    procedure RedimArray(ArrayIdx, NewUpper: Integer; Preserve: Boolean);       // B1.4: REDIM (1-D)
+    procedure RedimArray(ArrayIdx, NewUpper: Integer; Preserve: Boolean; HasNewLower: Boolean = False; NewLower: Integer = 0);  // B1.4: REDIM (1-D)
     procedure RedimArrayN(ArrayIdx: Integer; const Uppers: array of Integer; Preserve: Boolean); // REDIM multi-dim
 
     procedure ExecuteIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -5745,13 +5745,18 @@ end;
 // REDIM [PRESERVE] arr(ub) (B1.4): re-dimension an existing 1-D array, keeping its
 // original lower bound. PRESERVE keeps the overlapping elements; otherwise all are
 // reset to default. New element type is unchanged (taken from the existing array).
-procedure TBytecodeVM.RedimArray(ArrayIdx, NewUpper: Integer; Preserve: Boolean);
+procedure TBytecodeVM.RedimArray(ArrayIdx, NewUpper: Integer; Preserve: Boolean;
+  HasNewLower: Boolean = False; NewLower: Integer = 0);
 var
   Lb, NewSize, k: Integer;
 begin
   if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then Exit;
   Lb := 0;
   if Length(FArrays[ArrayIdx].LowerBounds) > 0 then Lb := FArrays[ArrayIdx].LowerBounds[0];
+  // An explicit "REDIM a(lb TO ub)" sets the lower bound too (FreeBASIC); a bare "REDIM a(ub)" keeps the
+  // array's current lower bound. A dynamic array's element access reads this run-time bound (bcArrayLBound),
+  // so the two stay consistent.
+  if HasNewLower then Lb := NewLower;
   NewSize := NewUpper - Lb + 1;
   if NewSize < 0 then NewSize := 0;
   case FArrays[ArrayIdx].ElementType of
@@ -6049,8 +6054,10 @@ begin
       end;
     11: // bcArrayErase - ERASE arr - reset all elements to default, keep size (B1.4)
       EraseArray(Instr.Src1);
-    12: // bcArrayRedim - REDIM [PRESERVE] arr(ub) (B1.4); Src2=ub reg, Immediate bit0=preserve
-      RedimArray(Instr.Src1, Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0);
+    12: // bcArrayRedim - REDIM [PRESERVE] arr([lb TO] ub) (B1.4); Src2=ub reg. Immediate: bit0=preserve,
+        // bit1=has explicit lower bound, bits8+ = that (non-negative) lower bound.
+      RedimArray(Instr.Src1, Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0,
+                 (Instr.Immediate and 2) <> 0, Instr.Immediate shr 8);
     // FreeBASIC pointer dereference. Two pointer kinds share these ops, discriminated by bit 63: a
     // record-field pointer (RECPTR_TAG set, so PtrAddr < 0) addresses ResolveRec(handle)^.Data[slot];
     // otherwise the packed address holds (arrayId+1) in the high bits (0 = NULL) and the element offset

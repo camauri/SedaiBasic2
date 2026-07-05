@@ -90,6 +90,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `pangram_checker.bas`         | <https://rosettacode.org/wiki/Pangram_checker> |
 | `range_expansion.bas`         | <https://rosettacode.org/wiki/Range_expansion> |
 | `evaluate_binomial_coefficients.bas` | <https://rosettacode.org/wiki/Evaluate_binomial_coefficients> |
+| `gaussian_elimination.bas`    | <https://rosettacode.org/wiki/Gaussian_elimination> |
 
 ## Running
 
