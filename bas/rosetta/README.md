@@ -61,6 +61,11 @@ single work, but distributing separate works together (aggregation) is permitted
 | `sum_of_a_series.bas`         | <https://rosettacode.org/wiki/Sum_of_a_series> |
 | `tokenize_a_string.bas`       | <https://rosettacode.org/wiki/Tokenize_a_string> |
 | `towers_of_hanoi.bas`         | <https://rosettacode.org/wiki/Towers_of_Hanoi> |
+| `primorial_numbers.bas`       | <https://rosettacode.org/wiki/Primorial_numbers> |
+| `permutations.bas`            | <https://rosettacode.org/wiki/Permutations> |
+| `middle_three_digits.bas`     | <https://rosettacode.org/wiki/Middle_three_digits> |
+| `leap_year.bas`               | <https://rosettacode.org/wiki/Leap_year> |
+| `rot_13.bas`                  | <https://rosettacode.org/wiki/Rot-13> |
 
 ## Running
 
