@@ -5947,6 +5947,8 @@ begin
     if DimsNode.ChildCount = 1 then
     begin
       // 1-D REDIM: bare upper bound, or antDimRange(lb, ub) — keep the original lower bound, take ub.
+      // (A REDIM that changes the lower bound is not honoured: element access still uses the compile-time
+      // lower bound, so setting a new runtime lb here would desynchronise access. Left as a known limit.)
       DimChild := DimsNode.GetChild(0);
       if DimChild.NodeType = antDimRange then DimExpr := DimChild.GetChild(1) else DimExpr := DimChild;
       ProcessExpression(DimExpr, UbValue);
