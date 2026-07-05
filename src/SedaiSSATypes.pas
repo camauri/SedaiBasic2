@@ -146,6 +146,7 @@ type
     ssaMathSqr, ssaMathAbs, ssaMathSgn, ssaMathInt, ssaMathRnd,
     ssaMathLog10, ssaMathLog2, ssaMathLogN,  // Additional log functions
     ssaMathAcos, ssaMathAsin, ssaMathAtan2, ssaMathFix, ssaMathFrac,  // FreeBASIC math
+    ssaMathSinh, ssaMathCosh, ssaMathTanh, ssaMathAsinh, ssaMathAcosh, ssaMathAtanh,  // hyperbolic
     // FreeBASIC date/time (date serial = Double, FPC TDateTime epoch 1899-12-30 = VB/FB serial).
     // Each carries an Immediate selector that picks the concrete function (see SedaiBytecodeTypes).
     ssaDateNow,     // NOW / TIMER -> float (Dest=float; Imm selects)

@@ -243,6 +243,12 @@ begin
     ssaMathAtan2: Result := bcMathAtan2;
     ssaMathFix: Result := bcMathFix;
     ssaMathFrac: Result := bcMathFrac;
+    ssaMathSinh: Result := bcMathSinh;     // hyperbolic
+    ssaMathCosh: Result := bcMathCosh;
+    ssaMathTanh: Result := bcMathTanh;
+    ssaMathAsinh: Result := bcMathAsinh;
+    ssaMathAcosh: Result := bcMathAcosh;
+    ssaMathAtanh: Result := bcMathAtanh;
     ssaStrDec: Result := bcStrDec;
     ssaPrint: Result := bcPrint;
     ssaPrintLn: Result := bcPrintLn;

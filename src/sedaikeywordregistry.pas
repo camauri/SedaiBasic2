@@ -1950,6 +1950,12 @@ begin
  RegisterKeyword(kATAN2, ttMathFunction, 'Return two-argument arctangent ATAN2(y, x)',               kcMathFunctions);
  RegisterKeyword(kFIX,   ttMathFunction, 'Truncate toward zero',                                     kcMathFunctions);
  RegisterKeyword(kFRAC,  ttMathFunction, 'Return the fractional part (keeps sign)',                  kcMathFunctions);
+ RegisterKeyword(kSINH,  ttMathFunction, 'Return the hyperbolic sine of x',                          kcMathFunctions);
+ RegisterKeyword(kCOSH,  ttMathFunction, 'Return the hyperbolic cosine of x',                        kcMathFunctions);
+ RegisterKeyword(kTANH,  ttMathFunction, 'Return the hyperbolic tangent of x',                       kcMathFunctions);
+ RegisterKeyword(kASINH, ttMathFunction, 'Return the inverse hyperbolic sine of x',                  kcMathFunctions);
+ RegisterKeyword(kACOSH, ttMathFunction, 'Return the inverse hyperbolic cosine of x (x >= 1)',       kcMathFunctions);
+ RegisterKeyword(kATANH, ttMathFunction, 'Return the inverse hyperbolic tangent of x (|x| < 1)',     kcMathFunctions);
  // FreeBASIC bare date/time functions (no arguments). MODERN-only (tagged below) so v7 may still use
  // these names as variables. NOW/TIMER return numbers; DATE/TIME return strings. The remaining
  // date functions (YEAR/MONTH/DATESERIAL/...) are intercepted by name in the array-access path so they

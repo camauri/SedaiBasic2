@@ -3032,6 +3032,18 @@ begin
             OpCode := ssaMathFix
           else if FuncName = 'FRAC' then
             OpCode := ssaMathFrac
+          else if FuncName = 'SINH' then
+            OpCode := ssaMathSinh
+          else if FuncName = 'COSH' then
+            OpCode := ssaMathCosh
+          else if FuncName = 'TANH' then
+            OpCode := ssaMathTanh
+          else if FuncName = 'ASINH' then
+            OpCode := ssaMathAsinh
+          else if FuncName = 'ACOSH' then
+            OpCode := ssaMathAcosh
+          else if FuncName = 'ATANH' then
+            OpCode := ssaMathAtanh
           else if FuncName = 'RND' then
             OpCode := ssaMathRnd
           else

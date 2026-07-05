@@ -393,6 +393,13 @@ const
   bcDateDiff        = bcGroupMath + 27;  // DATEDIFF(interval$,s1,s2): Dest=int, Src1=string, Src2=float s1, Immediate=float s2 reg
   bcDatePart        = bcGroupMath + 28;  // DATEPART(interval$,serial): Dest=int, Src1=string, Src2=float serial
   bcSetClock        = bcGroupMath + 29;  // SETDATE/SETTIME str: Src1=string; Imm: 0=SETDATE, 1=SETTIME (side-effecting)
+  // Hyperbolic functions (FreeBASIC via the C runtime; FPC's Math unit provides identical IEEE results).
+  bcMathSinh        = bcGroupMath + 30;  // SINH(x) - hyperbolic sine
+  bcMathCosh        = bcGroupMath + 31;  // COSH(x) - hyperbolic cosine
+  bcMathTanh        = bcGroupMath + 32;  // TANH(x) - hyperbolic tangent
+  bcMathAsinh       = bcGroupMath + 33;  // ASINH(x) - inverse hyperbolic sine
+  bcMathAcosh       = bcGroupMath + 34;  // ACOSH(x) - inverse hyperbolic cosine (x >= 1)
+  bcMathAtanh       = bcGroupMath + 35;  // ATANH(x) - inverse hyperbolic tangent (|x| < 1)
 
   // === GROUP 3: ARRAY OPERATIONS (0x03xx) ===
   bcArrayLoad       = bcGroupArray + 0;   // Generic (deprecated)
@@ -1555,6 +1562,12 @@ begin
         27: Result := 'DateDiff';
         28: Result := 'DatePart';
         29: Result := 'SetClock';
+        30: Result := 'MathSinh';
+        31: Result := 'MathCosh';
+        32: Result := 'MathTanh';
+        33: Result := 'MathAsinh';
+        34: Result := 'MathAcosh';
+        35: Result := 'MathAtanh';
       else
         Result := Format('Math_%d', [SubOp]);
       end;

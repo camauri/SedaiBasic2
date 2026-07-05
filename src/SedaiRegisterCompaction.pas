@@ -325,6 +325,7 @@ begin
     bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,
     bcMathLog10, bcMathLog2, bcMathLogN,
     bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,  // FreeBASIC math
+    bcMathSinh, bcMathCosh, bcMathTanh, bcMathAsinh, bcMathAcosh, bcMathAtanh,  // hyperbolic
     // Date/time -> float (date serial = Double)
     bcDateNow, bcDateSerial, bcTimeSerial, bcDateValue, bcDateAdd,
     bcFileDateTime,  // FILEDATETIME(path): last-modified date serial (float Dest, string Src1)
@@ -565,6 +566,7 @@ begin
     bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,
     bcMathLog10, bcMathLog2, bcMathLogN,
     bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,  // FreeBASIC math
+    bcMathSinh, bcMathCosh, bcMathTanh, bcMathAsinh, bcMathAcosh, bcMathAtanh,  // hyperbolic
     bcDateDecode,  // YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY: Src1 = float serial
     // === GROUP 1: String operations with float param ===
     bcStrStr,      // STR$(n) - reads float, produces string

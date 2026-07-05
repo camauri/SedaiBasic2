@@ -2812,7 +2812,8 @@ begin
         bcModFloat, bcPowFloat, bcNegFloat,
         bcMathAbs, bcMathSgn, bcMathInt, bcMathSqr, bcMathSin, bcMathCos, bcMathTan,
         bcMathExp, bcMathLog, bcMathAtn, bcMathRnd,
-        bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac:
+        bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,
+        bcMathSinh, bcMathCosh, bcMathTanh, bcMathAsinh, bcMathAcosh, bcMathAtanh:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
@@ -5604,6 +5605,24 @@ begin
       Ctx.FloatRegs[Instr.Dest] := Trunc(Ctx.FloatRegs[Instr.Src1]);
     19: // bcMathFrac - FRAC(x) - fractional part (keeps sign)
       Ctx.FloatRegs[Instr.Dest] := Frac(Ctx.FloatRegs[Instr.Src1]);
+    30: // bcMathSinh - SINH(x) - hyperbolic sine
+      Ctx.FloatRegs[Instr.Dest] := Math.Sinh(Ctx.FloatRegs[Instr.Src1]);
+    31: // bcMathCosh - COSH(x) - hyperbolic cosine
+      Ctx.FloatRegs[Instr.Dest] := Math.Cosh(Ctx.FloatRegs[Instr.Src1]);
+    32: // bcMathTanh - TANH(x) - hyperbolic tangent
+      Ctx.FloatRegs[Instr.Dest] := Math.Tanh(Ctx.FloatRegs[Instr.Src1]);
+    33: // bcMathAsinh - ASINH(x) - inverse hyperbolic sine
+      Ctx.FloatRegs[Instr.Dest] := Math.ArcSinh(Ctx.FloatRegs[Instr.Src1]);
+    34: // bcMathAcosh - ACOSH(x), domain x >= 1
+      if Ctx.FloatRegs[Instr.Src1] >= 1 then
+        Ctx.FloatRegs[Instr.Dest] := Math.ArcCosh(Ctx.FloatRegs[Instr.Src1])
+      else
+        raise Exception.Create('?ILLEGAL QUANTITY ERROR: ACOSH argument < 1');
+    35: // bcMathAtanh - ATANH(x), domain |x| < 1
+      if Abs(Ctx.FloatRegs[Instr.Src1]) < 1 then
+        Ctx.FloatRegs[Instr.Dest] := Math.ArcTanh(Ctx.FloatRegs[Instr.Src1])
+      else
+        raise Exception.Create('?ILLEGAL QUANTITY ERROR: ATANH argument out of (-1,1)');
     20: // bcDateNow - Immediate 0=NOW (date+time serial), 1=TIMER (seconds since midnight)
       begin
         dtVal := Now + FClockOffsetDays;

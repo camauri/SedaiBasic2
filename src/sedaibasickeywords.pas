@@ -259,6 +259,12 @@ const
   kATAN2   = 'ATAN2';     // FreeBASIC: two-argument arctangent
   kFIX     = 'FIX';       // FreeBASIC: truncate toward zero
   kFRAC    = 'FRAC';      // FreeBASIC: fractional part
+  kSINH    = 'SINH';      // hyperbolic sine
+  kCOSH    = 'COSH';      // hyperbolic cosine
+  kTANH    = 'TANH';      // hyperbolic tangent
+  kASINH   = 'ASINH';     // inverse hyperbolic sine
+  kACOSH   = 'ACOSH';     // inverse hyperbolic cosine
+  kATANH   = 'ATANH';     // inverse hyperbolic tangent
   // FreeBASIC date/time (date serial = Double, epoch 1899-12-30)
   kNOW         = 'NOW';          // current date+time as a serial Double
   kTIMER       = 'TIMER';        // seconds elapsed since midnight (Double)
