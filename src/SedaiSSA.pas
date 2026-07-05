@@ -346,6 +346,8 @@ type
     function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on scalar store
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
+    // FB implicit THIS: a bare field name in a method body -> synthesized "this.<field>" access.
+    function TryImplicitThisField(const VarName: string; const Tok: TLexerToken; out MemberNode: TASTNode): Boolean;
     // UDT array members obj.field(i,j): the field slot holds an FArrays handle; access is indirect.
     function IsMemberArrayAccess(ArrAccessNode: TASTNode; out HandleReg: TSSAValue;
                                  out ElemBank: TSSARegisterType; out LinIdx: TSSAValue): Boolean;
@@ -1337,6 +1339,12 @@ begin
       else if IsSharedScalar(VarName) then
       begin
         ArgListNode := MakeSharedScalarAccess(VarName, Node.Token);
+        ProcessExpression(ArgListNode, Result);
+        ArgListNode.Free;
+      end
+      // FreeBASIC implicit THIS: a bare field name in a method body reads "this.<field>".
+      else if TryImplicitThisField(VarName, Node.Token, ArgListNode) then
+      begin
         ProcessExpression(ArgListNode, Result);
         ArgListNode.Free;
       end
@@ -4365,6 +4373,14 @@ begin
   if VarNode.NodeType = antMemberAccess then
   begin
     ProcessMemberStore(VarNode, ExprNode);
+    Exit;
+  end;
+
+  // FreeBASIC implicit THIS: a bare field name on the LHS inside a method body means "this.<field> = expr".
+  if (VarNode.NodeType = antIdentifier) and
+     TryImplicitThisField(VarToStr(VarNode.Value), VarNode.Token, SharedAssign) then
+  begin
+    try ProcessMemberStore(SharedAssign, ExprNode); finally SharedAssign.Free; end;
     Exit;
   end;
 
@@ -15558,6 +15574,30 @@ begin
   end;
   EmitInstruction(Op, DestVal, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
   Result := DestVal;
+end;
+
+function TSSAGenerator.TryImplicitThisField(const VarName: string; const Tok: TLexerToken;
+  out MemberNode: TASTNode): Boolean;
+// FreeBASIC implicit THIS: inside a method / constructor body, a BARE name that is a field of the owner
+// type — and is NOT shadowed by a parameter or a local DIM (FB: those win) — means "this.<field>".
+// Returns True and a synthesized antMemberAccess(value=field, child0=THIS) node (the CALLER frees it) so
+// reads and writes both reuse the ordinary member-access lowering.
+var
+  UDTIdx, Slot: Integer;
+  Bank: TSSARegisterType;
+  NestedT: string;
+  tmp: TSSAValue;
+begin
+  Result := False;
+  MemberNode := nil;
+  if FCurrentThisType = '' then Exit;                          // not lowering a method body
+  UDTIdx := FindUDT(FCurrentThisType);
+  if UDTIdx < 0 then Exit;
+  if not UDTFieldBankSlot(UDTIdx, UpperCase(VarName), Bank, Slot, NestedT) then Exit;   // not a field
+  if ResolveExisting(VarName, tmp) then Exit;                  // a param / local DIM shadows the field
+  MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(VarName), Tok);
+  MemberNode.AddChild(TASTNode.CreateWithValue(antIdentifier, 'THIS', Tok));
+  Result := True;
 end;
 
 procedure TSSAGenerator.ProcessMemberStore(MemberNode, ExprNode: TASTNode);
