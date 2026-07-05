@@ -66,6 +66,12 @@ single work, but distributing separate works together (aggregation) is permitted
 | `middle_three_digits.bas`     | <https://rosettacode.org/wiki/Middle_three_digits> |
 | `leap_year.bas`               | <https://rosettacode.org/wiki/Leap_year> |
 | `rot_13.bas`                  | <https://rosettacode.org/wiki/Rot-13> |
+| `factorial.bas`               | <https://rosettacode.org/wiki/Factorial> |
+| `greatest_common_divisor.bas` | <https://rosettacode.org/wiki/Greatest_common_divisor> |
+| `roman_numerals_decode.bas`   | <https://rosettacode.org/wiki/Roman_numerals/Decode> |
+| `digital_root.bas`            | <https://rosettacode.org/wiki/Digital_root> |
+| `count_in_octal.bas`          | <https://rosettacode.org/wiki/Count_in_octal> |
+| `sum_multiples_of_3_and_5.bas`| <https://rosettacode.org/wiki/Sum_multiples_of_3_and_5> |
 
 ## Running
 
