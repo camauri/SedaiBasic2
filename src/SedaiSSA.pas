@@ -15440,6 +15440,10 @@ var
 begin
   Result := '';
   if ObjNode = nil then Exit;
+  // See through parentheses: "(b ^ c)" has the same UDT type as "b ^ c".
+  while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do
+    ObjNode := ObjNode.GetChild(0);
+  if ObjNode = nil then Exit;
   if ObjNode.NodeType = antIdentifier then
   begin
     Result := VarRecordTypeName(VarToStr(ObjNode.Value));
@@ -15453,6 +15457,10 @@ begin
     begin
       ArrName := UpperCase(VarToStr(ObjNode.GetChild(0).Value));
       Result := ArrayRecordTypeOf(ArrName);   // scope-aware (array-of-UDT parameter too)
+      // "type<T>(...)"/"T(...)" anonymous temporary: the "array name" is a UDT type with no array of that
+      // name in scope — the node constructs a temporary T (same guard as the codegen hook).
+      if (Result = '') and (FindUDT(ArrName) >= 0) and (ArrayIndexOf(ArrName) < 0) then
+        Result := ArrName;
     end;
   end
   else if ObjNode.NodeType = antMemberAccess then
@@ -15463,6 +15471,20 @@ begin
       Result := NestedT;
       // A pointer field (T PTR) holds a handle to a T — used for chained access "p->nxt->val".
       if Result = '' then Result := UDTFieldPtrPointee(FindUDT(ParentType), VarToStr(ObjNode.Value));
+    end;
+  end
+  else if ObjNode.NodeType = antBinaryOp then
+  begin
+    // An overloaded operator "OPERATOR <sym>(a AS T, b AS T) AS R" yields a value of R. Resolve R when it
+    // is itself a UDT, so a UDT-returning operator chains ("a * (b ^ c)") and prints via its Cast operator.
+    if (ObjNode.ChildCount >= 2) and Assigned(ObjNode.Token) then
+    begin
+      ParentType := ObjectTypeName(ObjNode.GetChild(0));
+      if (ParentType <> '') and (ObjectTypeName(ObjNode.GetChild(1)) = ParentType) then
+      begin
+        NestedT := ResolveMethodLabel(ParentType, 'OPERATOR' + VarToStr(ObjNode.Token.Value));  // op label
+        if NestedT <> '' then Result := VarRecordTypeName(NestedT);   // its UDT return type ('' if scalar)
+      end;
     end;
   end;
 end;

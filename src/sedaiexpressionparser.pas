@@ -77,6 +77,7 @@ type
     function ParseUserFunction(Token: TLexerToken): TASTNode;
     function ParseProcAddress(Token: TLexerToken): TASTNode;   // @subname → antProcAddress (M5.2)
     function ParseNew(Token: TLexerToken): TASTNode;           // NEW T [(args)] → antNew (FreeBASIC)
+    function ParseTypeConstructor(Token: TLexerToken): TASTNode; // type<T>(args) → anonymous UDT temporary
     function ParseCast(Token: TLexerToken): TASTNode;          // CAST/CPTR(type, expr) → antCast
     function ParseDeref(Token: TLexerToken): TASTNode;         // *ptr → antDeref (FreeBASIC pointers)
     function ParseThreadCreate(Token: TLexerToken): TASTNode;  // THREADCREATE(@sub, param) (M5.2)
@@ -126,6 +127,7 @@ function StaticParseUsrFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseUserFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseProcAddress(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseNew(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseTypeConstructor(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseDeref(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadCreate(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadSelf(Parser: Pointer; Token: TLexerToken): TObject;
@@ -245,6 +247,11 @@ end;
 function StaticParseProcAddress(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseProcAddress(Token);
+end;
+
+function StaticParseTypeConstructor(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseTypeConstructor(Token);
 end;
 
 function StaticParseNew(Parser: Pointer; Token: TLexerToken): TObject;
@@ -406,6 +413,9 @@ begin
   // ttProgramEditing (its classic role is the program-erase command, parsed at statement level), so a
   // prefix rule here only fires when NEW appears where an expression is expected (e.g. "p = NEW T").
   Context.SetParseRule(ttProgramEditing, MakePrefixRule(@StaticParseNew, precUnary));
+  // FreeBASIC "type<T>(args)" anonymous temporary as a value expression. TYPE lexes as ttTypeDecl (its
+  // statement role opens a record declaration); a prefix rule here only fires in expression position.
+  Context.SetParseRule(ttTypeDecl, MakePrefixRule(@StaticParseTypeConstructor, precCall));
   Context.SetParseRule(ttThreadCreate, MakePrefixRule(@StaticParseThreadCreate, precCall));
   // M5.5: THREADSELF() value + THREADCALL sub(arg) (sugar that lowers to THREADCREATE).
   Context.SetParseRule(ttThreadSelf, MakePrefixRule(@StaticParseThreadSelf, precCall));
@@ -1470,6 +1480,53 @@ begin
     end;
     if Assigned(ArgList) then Result.AddChild(ArgList);
   end;
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseTypeConstructor(Token: TLexerToken): TASTNode;
+// FreeBASIC "type<T>(args)": an anonymous temporary of UDT T initialised with args (via T's constructor,
+// or field-by-field when T has none). The TYPE token is already consumed. Lowers to the same shape the
+// SSA's UDT-temporary hook recognises for "T(args)": antArrayAccess(child0 = antIdentifier(T),
+// child1 = antExpressionList(args)). The angle brackets are the comparison tokens ttOpLt / ttOpGt.
+var
+  TypeName: TLexerToken;
+  NameNode, Args: TASTNode;
+begin
+  if not Context.Match(ttOpLt) then
+  begin
+    HandleError('Expected "<" after TYPE in a type<T>(...) expression', Context.CurrentToken);
+    Exit(nil);
+  end;
+  if not Context.Check(ttIdentifier) then
+  begin
+    HandleError('Expected a TYPE name in a type<T>(...) expression', Context.CurrentToken);
+    Exit(nil);
+  end;
+  TypeName := Context.CurrentToken;
+  NameNode := TASTNode.CreateWithValue(antIdentifier, TypeName.Value, TypeName);
+  Context.Advance;   // consume the type name
+  if not Context.Match(ttOpGt) then
+  begin
+    HandleError('Expected ">" after the type name in a type<T>(...) expression', Context.CurrentToken);
+    NameNode.Free; Exit(nil);
+  end;
+  if not Context.Match(ttDelimParOpen) then
+  begin
+    HandleError('Expected "(" after type<T> in a type<T>(...) expression', Context.CurrentToken);
+    NameNode.Free; Exit(nil);
+  end;
+  if Context.Check(ttDelimParClose) then
+    Args := TASTNode.Create(antExpressionList, Token)   // type<T>() — no field values
+  else
+    Args := ParseExpressionList(ttSeparParam);          // comma-separated field/ctor args
+  if not Context.Match(ttDelimParClose) then
+  begin
+    HandleError('Expected ")" to close a type<T>(...) expression', Context.CurrentToken);
+    NameNode.Free; if Assigned(Args) then Args.Free; Exit(nil);
+  end;
+  Result := TASTNode.Create(antArrayAccess, Token);
+  Result.AddChild(NameNode);
+  Result.AddChild(Args);
   DoNodeCreated(Result);
 end;
 

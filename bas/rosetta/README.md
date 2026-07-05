@@ -79,6 +79,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `repeat_a_string.bas`         | <https://rosettacode.org/wiki/Repeat_a_string> |
 | `string_comparison.bas`       | <https://rosettacode.org/wiki/String_comparison> |
 | `sort_composite_structures.bas` | <https://rosettacode.org/wiki/Sort_an_array_of_composite_structures> |
+| `vector_products.bas`         | <https://rosettacode.org/wiki/Vector_products> |
 
 ## Running
 
