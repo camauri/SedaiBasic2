@@ -40,7 +40,7 @@ SedaiBasic2 is a reimplementation of Commodore BASIC v7 built on a full optimizi
 ### Language features
 
 - **Core BASIC** — all data types and suffixes (`%` integer, `!`/`#` float, `$` string, plus FreeBASIC `Integer`/`Long`/`Double`/`Single`/`Byte`/`UInteger`/…), multi-dimensional arrays with arbitrary lower bounds, `DIM`/`REDIM`/array initializers/variable-length and ellipsis-sized arrays, string functions, math, date/time, `DATA`/`READ`, structured flow control.
-- **MODERN / FreeBASIC** — user-defined types and **OOP** (methods, `EXTENDS` inheritance, virtual dispatch, constructors/destructors, RAII value semantics), lexical scoping, **multithreading** (threads, mutexes, condition variables), **managed and raw pointers**, `WSTRING` (UTF-16), typed `CONST`, and a two-dialect parser that disambiguates keywords shared with v7.
+- **MODERN / FreeBASIC** — user-defined types and **OOP** (methods, `EXTENDS` inheritance, virtual dispatch, constructors/destructors, RAII value semantics, **operator overloading** including `Cast`, aggregate/tuple initialization and anonymous `type<T>(…)` temporaries), lexical scoping, **multithreading** (threads, mutexes, condition variables), **managed and raw pointers**, `WSTRING` (UTF-16), typed `CONST`, function pointers, a preprocessor (`#define`, function-like/multi-line `#macro`, conditional compilation), and a two-dialect parser that disambiguates keywords shared with v7.
 - **I/O** — console text modes (40x25 / 80x25 / 80x50), full file I/O (FreeBASIC `OPEN … FOR …` and Commodore forms), **2D graphics** (primitives, palettes, image buffers/blit, page-flipping) rendered on both the SDL2 console and, optionally, the CLI VM (`sb --window`), **interactive input** (keyboard / mouse / joystick), and optional **SID audio** emulation.
 
 ### Compilation pipeline
@@ -50,7 +50,16 @@ Source → Lexer → Parser (Packrat + Pratt) → AST → SSA IR
        → 16 SSA optimization passes → Bytecode → 6 bytecode passes → Register VM
 ```
 
-The register-based VM uses three separate typed register banks (int / float / string) and 2-byte grouped opcodes. A differential test net runs every corpus program both optimized and with `--no-opt` and requires identical output, guarding the optimizer.
+The register-based VM uses three separate typed register banks (int / float / string) and 2-byte grouped opcodes. A differential regression net runs every corpus program (270+ tests) both optimized and with `--no-opt` and requires identical output, guarding the optimizer.
+
+### Real-world FreeBASIC compatibility
+
+The MODERN dialect is exercised against real programs: [`bas/rosetta/`](bas/rosetta/README.md) collects 60+ **unmodified** FreeBASIC solutions from [Rosetta Code](https://rosettacode.org), each verified to run correctly (optimized output matching `--no-opt`, deterministic, non-interactive). They are third-party works included as a mere aggregation under their original GFDL 1.2 license — see the [attribution note](bas/rosetta/README.md).
+
+```bash
+sb bas/rosetta/vector_products.bas
+sb bas/rosetta/sieve_of_eratosthenes.bas
+```
 
 ## Setup
 
