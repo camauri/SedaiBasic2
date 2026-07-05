@@ -1947,6 +1947,12 @@ var
 
 begin
   try
+    // Mask the FPU/SSE exceptions so floating-point overflow/invalid/div-by-zero produce IEEE Inf/NaN
+    // (FreeBASIC/C semantics) instead of raising a Pascal exception that would abort the program. FPC
+    // leaves these unmasked by default. The VM already guards integer and explicit division by zero by
+    // value, so this only affects genuine float edge cases (e.g. an escaping Mandelbrot iterate overflowing).
+    SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow, exUnderflow, exPrecision]);
+
     // Set console code page to UTF-8 for proper character encoding
     {$IFDEF WINDOWS}
     SetConsoleOutputCP(CP_UTF8);
