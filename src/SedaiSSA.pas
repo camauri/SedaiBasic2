@@ -16567,6 +16567,19 @@ begin
       EmitXferLoad(srtInt, XFER_RESULT_HANDLE_SLOT, FCurrentResultHandle);
     end;
 
+    // Default-initialise the scalar result slot (FreeBASIC: an unset function result is 0 / "" ). The
+    // XFER_RESULT_SLOT is global VM state reused across calls, so a function that exits without setting
+    // its result (EXIT FUNCTION / fall-through) would otherwise return the PREVIOUS call's value. A
+    // UDT-by-value result (handled above) and a BYREF-return address both have their own paths.
+    if FCurrentProcIsFunction and (FCurrentProcRetRecType = '') and (not FCurrentProcByrefRet) then
+    begin
+      case FCurrentProcRetType of
+        srtFloat:  EmitXferStore(srtFloat,  XFER_RESULT_SLOT, MakeSSAConstFloat(0.0));
+        srtString: EmitXferStore(srtString, XFER_RESULT_SLOT, MakeSSAConstString(''));
+      else         EmitXferStore(srtInt,    XFER_RESULT_SLOT, MakeSSAConstInt(0));
+      end;
+    end;
+
     // M6: prologue — load shared globals from their slots into their registers, so the body sees the
     // caller's values (the frame save/restore otherwise hides them). Done before auto-chaining so any
     // base ctor call (which syncs around itself) starts from valid shared registers.

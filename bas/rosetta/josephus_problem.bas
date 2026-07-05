@@ -1,0 +1,14 @@
+
+Function Josephus (n As Integer, k As Integer, m As Integer) As Integer
+    Dim As Integer lm = m
+    For i As Integer = m + 1  To n
+        lm = (lm + k) Mod i
+    Next i
+    Josephus = lm
+End Function
+
+Dim As Integer n = 41 'prisioneros
+Dim As Integer k = 3  'orden de ejecución
+
+Print "n ="; n, "k ="; k, "superviviente = "; Josephus(n, k, 0)
+

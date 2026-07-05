@@ -80,6 +80,13 @@ single work, but distributing separate works together (aggregation) is permitted
 | `string_comparison.bas`       | <https://rosettacode.org/wiki/String_comparison> |
 | `sort_composite_structures.bas` | <https://rosettacode.org/wiki/Sort_an_array_of_composite_structures> |
 | `vector_products.bas`         | <https://rosettacode.org/wiki/Vector_products> |
+| `kaprekar_numbers.bas`        | <https://rosettacode.org/wiki/Kaprekar_numbers> |
+| `factors_of_an_integer.bas`   | <https://rosettacode.org/wiki/Factors_of_an_integer> |
+| `josephus_problem.bas`        | <https://rosettacode.org/wiki/Josephus_problem> |
+| `primality_by_trial_division.bas` | <https://rosettacode.org/wiki/Primality_by_trial_division> |
+| `comma_quibbling.bas`         | <https://rosettacode.org/wiki/Comma_quibbling> |
+| `sieve_of_eratosthenes.bas`   | <https://rosettacode.org/wiki/Sieve_of_Eratosthenes> |
+| `power_set.bas`               | <https://rosettacode.org/wiki/Power_set> |
 
 ## Running
 
