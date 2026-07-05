@@ -6713,6 +6713,7 @@ var
   VarName: string;
   StartValue, EndValue, StepValue: TSSAValue;
   VarReg: TSSAValue;
+  WantBank: TSSARegisterType;
   CondLabel, BodyLabel, EndLabel: string;
   CmpReg: Integer;
   LoopInfo: TLoopInfo;
@@ -6733,9 +6734,16 @@ begin
   // bank, so an integer loop runs through per-iteration int<->float conversions — slower, and (worse) the
   // conversions leave the counter's int register looking dead across the loop test, so register allocation
   // can place the loop-condition result over a loop-carried integer and silently corrupt it. Binding the
-  // declared bank up front keeps an integer loop integer.
+  // declared bank up front keeps an integer loop integer. But only bind ANEW when the counter is not
+  // already present in the wanted bank: a second "FOR i AS Integer" in the same scope must reuse the first
+  // one's register, else the freshly-bound counter and the body (which resolves the older binding) would
+  // diverge — the loop would step one register while the body reads a stale one.
   if Node.Attributes.Values['VARTYPE'] <> '' then
-    VarReg := DeclareVariableTyped(VarName, TypeNameToBank(Node.Attributes.Values['VARTYPE'], VarName))
+  begin
+    WantBank := TypeNameToBank(Node.Attributes.Values['VARTYPE'], VarName);
+    if not (ResolveExisting(VarName, VarReg) and (VarReg.RegType = WantBank)) then
+      VarReg := DeclareVariableTyped(VarName, WantBank);
+  end
   else
     VarReg := GetOrAllocateVariable(VarName);
 
