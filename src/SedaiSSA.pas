@@ -225,6 +225,7 @@ type
     procedure RegisterArrayParams;   // pre-register array-parameter placeholder arrays (MODERN byref)
     procedure EmitArrayArgBinds(const ProcName: string; ArgListNode: TASTNode; Bind: Boolean);
     function ParamArrayMangle(const ProcName, ParamName: string): string;  // per-proc placeholder array name
+    function LocalArrayMangle(const ProcName, ArrName: string): string;    // per-proc name for a local array shadowing a module array
     function ArrayIndexOf(const ArrName: string): Integer;  // scope-aware array lookup (proc param placeholder first)
     function IsArrayParamSlot(Idx: Integer): Boolean;
     function EmitParamArrayLBoundSub(const Idx: TSSAValue; ArrayIdx, Dim: Integer): TSSAValue;
@@ -5300,7 +5301,7 @@ end;
 
 procedure TSSAGenerator.ProcessDim(Node: TASTNode);
 var
-  ArrName: string;
+  ArrName, DeclArrName: string;
   ElementType: TSSARegisterType;
   DimsNode, DimExpr, DimChild, ArrayDeclNode: TASTNode;
   Dimensions: array of Integer;
@@ -5580,6 +5581,17 @@ begin
     if DimsNode.NodeType <> antDimensions then
       raise Exception.CreateFmt('Invalid array dimensions for: %s', [ArrName]);
 
+    // A local array (DIM inside a proc) whose name matches an already-declared module/global array must
+    // get its own slot: DeclareArray otherwise REUSES that slot (REDIM semantics), resizing/clearing the
+    // module array — and corrupting a same-name ByRef parameter aliased to it. Mangle the DECLARED name on
+    // such a collision (ArrayIndexOf resolves references via LocalArrayMangle). A SHARED array is
+    // module-visible and never mangled; a name that is this proc's own array parameter is left alone.
+    DeclArrName := ArrName;
+    if FInProcedure and (ArrayDeclNode.Attributes.Values['SHARED'] <> '1') and
+       (FProgram.FindArray(UpperCase(ArrName)) >= 0) and
+       (FProgram.FindArray(ParamArrayMangle(FCurrentProcName, UpperCase(ArrName))) < 0) then
+      DeclArrName := LocalArrayMangle(FCurrentProcName, UpperCase(ArrName));
+
     // Extract dimension sizes
     DimCount := DimsNode.ChildCount;
 
@@ -5591,7 +5603,7 @@ begin
     begin
       SetLength(Dimensions, 1);
       Dimensions[0] := 0;                              // 0 => runtime-sized; the ub register below holds -1
-      ArrayIdx := FProgram.DeclareArray(ArrName, ElementType, Dimensions);
+      ArrayIdx := FProgram.DeclareArray(DeclArrName, ElementType, Dimensions);
       IdxReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaLoadConstInt, IdxReg, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       SetLength(DimRegs, 1);     DimRegs[0] := IdxReg.RegIndex;
@@ -5723,7 +5735,7 @@ begin
     end;
 
     // Declare array in SSA program
-    ArrayIdx := FProgram.DeclareArray(ArrName, ElementType, Dimensions);
+    ArrayIdx := FProgram.DeclareArray(DeclArrName, ElementType, Dimensions);
     if HasLowerBounds then
       FProgram.SetArrayLowerBounds(ArrayIdx, LowerBounds);
 
@@ -16299,6 +16311,16 @@ begin
   Result := '@P@' + ProcName + '@' + ParamName;
 end;
 
+function TSSAGenerator.LocalArrayMangle(const ProcName, ArrName: string): string;
+// Per-proc name for a LOCAL array (a DIM inside a SUB/FUNCTION) that shadows a module array of the same
+// name. Without this the local's DeclareArray would reuse the module array's slot (REDIM semantics),
+// resizing/clearing it — and if that module array is passed ByRef to the same proc, its parameter alias
+// is corrupted (Rosetta "Gaussian elimination": local "b" over module "b"). '@' cannot occur in a user
+// array name, so the mangled name never collides.
+begin
+  Result := '@L@' + ProcName + '@' + ArrName;
+end;
+
 procedure TSSAGenerator.RegisterArrayParams;
 // MODERN array parameters: a "name() AS type" parameter is passed ByRef by aliasing a VM array slot
 // (bcArrayBind) at the call site. Pre-register a placeholder array (0-size, the element type from the
@@ -16367,6 +16389,10 @@ begin
   if FInProcedure then
   begin
     Result := FProgram.FindArray(ParamArrayMangle(FCurrentProcName, ArrName));
+    if Result >= 0 then Exit;
+    // A local array that shadows a module array of the same name is declared under a per-proc mangled
+    // name (see ProcessDim); resolve it here first. Absent (the common case) this is a cheap miss.
+    Result := FProgram.FindArray(LocalArrayMangle(FCurrentProcName, ArrName));
     if Result >= 0 then Exit;
   end;
   Result := FProgram.FindArray(ArrName);
