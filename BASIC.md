@@ -2473,9 +2473,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `PSET and PRESET` | ✓ | `PSET (x,y)[,color]` / `PRESET (x,y)[,color]` plot a pixel (PRESET's omitted colour = the background); via IGraphicsBackend, headless-testable and on-screen on sbv. The image-buffer target form (`PSET img,(x,y)`) is deferred. |
-| `LINE (GRAPHICS)` | ✓ | `LINE (x1,y1)-(x2,y2)[,color][,B\|BF]` draws a line, box outline (B) or filled box (BF) on the screen surface (via IGraphicsBackend; headless-testable + on-screen on sbv). Parenthesised form disambiguates from `LINE INPUT`. Leading start-coordinate / STEP / line-style and the image-buffer target deferred. |
-| `CIRCLE` | ✓ | Plots circles and ellipses. C128 form (`CIRCLE source,x,y,...`) and FreeBASIC form (`CIRCLE (x,y),r[,color]`, parenthesised → routed through IGraphicsBackend, headless-testable + on-screen on sbv). FB ellipse/arc/aspect arguments deferred. |
+| `PSET and PRESET` | ✓ | `PSET [STEP](x,y)[,color]` / `PRESET [STEP](x,y)[,color]` plot a pixel (PRESET's omitted colour = the background); `STEP` = coordinate relative to the current graphics point. Via IGraphicsBackend, headless-testable and on-screen on sbv. The image-buffer target form (`PSET img,(x,y)`) is deferred. |
+| `LINE (GRAPHICS)` | ✓ | `LINE [STEP](x1,y1)-[STEP](x2,y2)[,color][,B\|BF]` draws a line, box outline (B) or filled box (BF) on the screen surface (via IGraphicsBackend; headless-testable + on-screen on sbv). Omitted start (`LINE -(x2,y2)`) draws from the current graphics point; `STEP` = relative coordinates (first STEP relative to the current point, second relative to the first point). Parenthesised form disambiguates from `LINE INPUT`. Line-style (dashed) and the image-buffer target deferred. |
+| `CIRCLE` | ✓ | Plots circles and ellipses. C128 form (`CIRCLE source,x,y,...`) and FreeBASIC form (`CIRCLE [STEP](x,y),r[,color]`, parenthesised → routed through IGraphicsBackend, headless-testable + on-screen on sbv); `STEP` = centre relative to the current graphics point. FB ellipse/arc/aspect arguments deferred. |
 | `DRAW` | ✓ | Draws in a sequence of commands on an image buffer or screen. |
 | `DRAW STRING` | ✓ | Writes text to an image buffer or screen. |
 | `PAINT` | ✓ | Flood fill. C128 form (`PAINT source,x,y`) and FreeBASIC form (`PAINT (x,y),color`, parenthesised → routed through IGraphicsBackend, headless-testable). Border-colour argument deferred. |
@@ -2497,13 +2497,15 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `PUT (GRAPHICS)` | ✓ | `PUT (x,y), src [, mode]` blits image surface `src` onto the screen at (x,y). Modes: PSET/PRESET, TRANS (magenta key), ALPHA, ADD, AND, OR, XOR (CUSTOM falls back to PSET). Array-buffer source deferred. |
-| `ADD` | ✗ | Saturated addition of the source and target components. |
-| `ALPHA` | ✗ | Blend using a uniform transparency or the image buffer's alpha channel. |
+| `ADD` | ✓ | Saturated addition of the source and target components. |
+| `ALPHA` | ✓ | Blend using the image buffer's alpha channel (per-pixel). The uniform-transparency-level form (`PUT ...,ALPHA,level`) is deferred. |
 | `AND (Graphics Put)` | ✓ | Combine the source and target components using a bitwise And |
 | `OR` | ✓ | Combine the source and target components using a bitwise Or |
-| `PSET` | ✗ | Directly copy pixel colors from the source to the destination. |
-| `TRANS` | ✗ | Pixels matching the transparent mask color are not blitted. |
-| `CUSTOM` | ✗ | Allows a custom blending procedure to be used. |
+| `XOR (Graphics Put)` | ✓ | Combine the source and target components using a bitwise Xor |
+| `PSET (Graphics Put)` | ✓ | Directly copy pixel colors from the source to the destination (the default mode). |
+| `PRESET (Graphics Put)` | ✓ | Copy the inverted source pixel colors to the destination. |
+| `TRANS` | ✓ | Pixels matching the transparent mask colour (magenta key `&hFF00FF`) are not blitted. |
+| `CUSTOM` | ✗ | A user blending procedure — falls back to PSET (no user function-pointer blend callback). |
 | `XOR` | ✓ | Combine the source and target components using a bitwise Xor |
 
 ### Graphics - User Input

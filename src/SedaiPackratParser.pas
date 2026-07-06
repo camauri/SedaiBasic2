@@ -920,9 +920,11 @@ begin
           Result := ParseLineInputStatement
         // FreeBASIC graphics "LINE (x1,y1)-(x2,y2),color[,B|BF]": LINE is a bare identifier here; the
         // parenthesis after it selects the graphics statement (vs LINE INPUT, vs an assignment to `line`).
-        // A leading '-' also selects it: "LINE -(x2,y2)" omits the start (draws from the current point).
+        // A leading '-' also selects it ("LINE -(x2,y2)" omits the start), as does a leading STEP
+        // ("LINE STEP(x1,y1)-..." — relative coordinates).
         else if (UpperCase(Token.Value) = kLINE) and Assigned(Context.PeekNext) and
-                (Context.PeekNext.TokenType in [ttDelimParOpen, ttOpSub]) then
+                ((Context.PeekNext.TokenType in [ttDelimParOpen, ttOpSub]) or
+                 (UpperCase(Context.PeekNext.Value) = kSTEP)) then
           Result := ParseGfxLineStatement
         // FreeBASIC "WRITE #n, ...": comma-separated, quoted-string CSV output (WRITE is a bare
         // identifier here; the `#` after it disambiguates from an assignment to a var named `write`).
@@ -4073,8 +4075,10 @@ begin
     Result := TASTNode.Create(antBox, Token)
   else if CmdName = 'CIRCLE' then
   begin
-    // FreeBASIC CIRCLE (x,y),r[,color] vs C128 CIRCLE source,x,y,... — disambiguated by the parenthesis.
-    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+    // FreeBASIC CIRCLE (x,y),r[,color] vs C128 CIRCLE source,x,y,... — disambiguated by the parenthesis
+    // (or a leading STEP, "CIRCLE STEP(x,y),r", which is also the FreeBASIC relative form).
+    if Assigned(Context.PeekNext) and
+       ((Context.PeekNext.TokenType = ttDelimParOpen) or (UpperCase(Context.PeekNext.Value) = kSTEP)) then
       Result := TASTNode.Create(antGfxCircle, Token)
     else
       Result := TASTNode.Create(antCircle, Token);
@@ -4188,6 +4192,12 @@ begin
   // parenthesised, so parse it explicitly rather than via the generic comma-separated parameter loop below.
   if (CmdName = 'PSET') or (CmdName = 'PRESET') or (Result.NodeType = antGfxPaint) then
   begin
+    // FreeBASIC STEP: the coordinate is relative to the current graphics point.
+    if UpperCase(Context.CurrentToken.Value) = kSTEP then
+    begin
+      Result.Attributes.Values['STEP'] := '1';
+      Context.Advance;                                            // STEP
+    end;
     if Context.Check(ttDelimParOpen) then Context.Advance;        // '('
     Result.AddChild(ParseExpression);                             // x
     if Context.Check(ttSeparParam) then Context.Advance;          // ','
@@ -4205,6 +4215,12 @@ begin
   // FreeBASIC CIRCLE (x, y), r [, color]: parenthesised centre then radius (and optional colour).
   if Result.NodeType = antGfxCircle then
   begin
+    // FreeBASIC STEP: the centre is relative to the current graphics point.
+    if UpperCase(Context.CurrentToken.Value) = kSTEP then
+    begin
+      Result.Attributes.Values['STEP'] := '1';
+      Context.Advance;                                            // STEP
+    end;
     if Context.Check(ttDelimParOpen) then Context.Advance;        // '('
     Result.AddChild(ParseExpression);                             // x
     if Context.Check(ttSeparParam) then Context.Advance;          // ','
@@ -5456,6 +5472,12 @@ begin
   end
   else
   begin
+    // FreeBASIC STEP: the start point is relative to the current graphics point.
+    if UpperCase(Context.CurrentToken.Value) = kSTEP then
+    begin
+      Result.Attributes.Values['STEP1'] := '1';
+      Context.Advance;                                        // STEP
+    end;
     if Context.Check(ttDelimParOpen) then Context.Advance;    // '('
     Result.AddChild(ParseExpression);                         // x1
     if Context.Check(ttSeparParam) then Context.Advance;      // ','
@@ -5463,6 +5485,12 @@ begin
     if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
   end;
   if Context.Check(ttOpSub) then Context.Advance;           // '-'
+  // FreeBASIC STEP on the end point: relative to the FIRST point (x1,y1), not the current point.
+  if UpperCase(Context.CurrentToken.Value) = kSTEP then
+  begin
+    Result.Attributes.Values['STEP2'] := '1';
+    Context.Advance;                                          // STEP
+  end;
   if Context.Check(ttDelimParOpen) then Context.Advance;    // '('
   Result.AddChild(ParseExpression);                         // x2
   if Context.Check(ttSeparParam) then Context.Advance;      // ','

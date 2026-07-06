@@ -450,6 +450,8 @@ type
     procedure ProcessPalette(Node: TASTNode);      // PALETTE [GET] [index, r, g, b] / reset
     procedure ProcessGfxColor(Node: TASTNode);     // COLOR [fg][,bg] (FreeBASIC draw colour)
     function  DefaultDrawColorReg: TSSAValue;       // omitted-colour default = current draw foreground
+    procedure EmitStepRelative(var XReg, YReg: TSSAValue; const BaseX, BaseY: TSSAValue);  // STEP: coord += base
+    procedure EmitPenCoordRegs(out PenX, PenY: TSSAValue);  // read the current graphics point (POINTCOORD 0/1)
     procedure ProcessImageDestroy(Node: TASTNode);  // IMAGEDESTROY handle
     procedure ProcessImageInfo(Node: TASTNode);      // IMAGEINFO handle, w, h
     function  EmitGetmouse(Node, ArgListNode: TASTNode): TSSAValue;  // GETMOUSE(x,y[,w][,b][,c]) -> status
@@ -8204,14 +8206,45 @@ begin
   EmitInstruction(ssaGfxScreenRes, MakeSSAValue(svkNone), WReg, HReg, MakeSSAConstInt(NumPages));
 end;
 
+procedure TSSAGenerator.EmitPenCoordRegs(out PenX, PenY: TSSAValue);
+// Read the current graphics point (POINTCOORD 0/1 = pen x/y, logical coords) into fresh int registers.
+begin
+  PenX := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaGfxPointCoord, PenX, EnsureIntRegister(MakeSSAConstInt(0)),
+    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  PenY := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaGfxPointCoord, PenY, EnsureIntRegister(MakeSSAConstInt(1)),
+    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.EmitStepRelative(var XReg, YReg: TSSAValue; const BaseX, BaseY: TSSAValue);
+// FreeBASIC STEP: turn a (dx,dy) offset into an absolute coordinate by adding a base point.
+// The base is the current graphics point (for the first / a single coordinate) or the previous
+// point (for the second endpoint of LINE). Emitted as plain integer adds — no new opcodes / flags.
+var
+  NewX, NewY: TSSAValue;
+begin
+  NewX := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, NewX, BaseX, XReg, MakeSSAValue(svkNone));
+  NewY := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, NewY, BaseY, YReg, MakeSSAValue(svkNone));
+  XReg := NewX; YReg := NewY;
+end;
+
 procedure TSSAGenerator.ProcessGfxPset(Node: TASTNode);
 // PSET (x, y) [, color] : set a pixel. Children: x, y [, color]. Color in Src3 -> Immediate (int reg).
+// STEP: (x,y) is relative to the current graphics point.
 var
-  XVal, YVal, CVal, XReg, YReg, CReg: TSSAValue;
+  XVal, YVal, CVal, XReg, YReg, CReg, PenX, PenY: TSSAValue;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 2) then Exit;
   ProcessExpression(Node.GetChild(0), XVal); XReg := EnsureIntRegister(XVal);
   ProcessExpression(Node.GetChild(1), YVal); YReg := EnsureIntRegister(YVal);
+  if Node.Attributes.Values['STEP'] = '1' then
+  begin
+    EmitPenCoordRegs(PenX, PenY);
+    EmitStepRelative(XReg, YReg, PenX, PenY);
+  end;
   if Node.ChildCount >= 3 then
   begin
     ProcessExpression(Node.GetChild(2), CVal); CReg := EnsureIntRegister(CVal);
@@ -8223,13 +8256,18 @@ end;
 
 procedure TSSAGenerator.ProcessGfxPaint(Node: TASTNode);
 // PAINT (x, y) [, color] : flood fill from (x,y) with color. Children: x, y [, color]. Color in Src3
-// -> Immediate (int reg). (FB's optional border-colour argument is deferred.)
+// -> Immediate (int reg). (FB's optional border-colour argument is deferred.) STEP: (x,y) relative.
 var
-  XVal, YVal, CVal, XReg, YReg, CReg: TSSAValue;
+  XVal, YVal, CVal, XReg, YReg, CReg, PenX, PenY: TSSAValue;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 2) then Exit;
   ProcessExpression(Node.GetChild(0), XVal); XReg := EnsureIntRegister(XVal);
   ProcessExpression(Node.GetChild(1), YVal); YReg := EnsureIntRegister(YVal);
+  if Node.Attributes.Values['STEP'] = '1' then
+  begin
+    EmitPenCoordRegs(PenX, PenY);
+    EmitStepRelative(XReg, YReg, PenX, PenY);
+  end;
   if Node.ChildCount >= 3 then
   begin
     ProcessExpression(Node.GetChild(2), CVal); CReg := EnsureIntRegister(CVal);
@@ -8243,18 +8281,39 @@ procedure TSSAGenerator.ProcessGfxLine(Node: TASTNode);
 // LINE (x1,y1)-(x2,y2) [,color] [,B|BF] : draw a line, a box outline (B) or a filled box (BF).
 // Children: x1, y1, x2, y2 [, color]. The SHAPE attribute selects the shape ('' / 'B' / 'BF').
 // Packed for the compiler as Src1=x1, Src2=y1, Src3=x2, PhiSources[0]=y2, [1]=color, [2]=shape flag.
+// STEP: "LINE STEP(x1,y1)-STEP(x2,y2)". The first STEP is relative to the current graphics point;
+// the second is relative to the FIRST point (x1,y1) — or to the current point when the start is
+// omitted ("LINE -STEP(...)"). Resolved to absolute coordinates here via pen reads + integer adds.
 var
   X1V, Y1V, X2V, Y2V, CV: TSSAValue;
   X1R, Y1R, X2R, Y2R, CR: TSSAValue;
+  BaseX, BaseY, PenX, PenY: TSSAValue;
   Instr: TSSAInstruction;
   Shape: string;
   Flag: Int64;
+  NoStart, Step1, Step2: Boolean;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 4) then Exit;
+  NoStart := Node.Attributes.Values['NOSTART'] = '1';
+  Step1 := Node.Attributes.Values['STEP1'] = '1';
+  Step2 := Node.Attributes.Values['STEP2'] = '1';
   ProcessExpression(Node.GetChild(0), X1V); X1R := EnsureIntRegister(X1V);
   ProcessExpression(Node.GetChild(1), Y1V); Y1R := EnsureIntRegister(Y1V);
   ProcessExpression(Node.GetChild(2), X2V); X2R := EnsureIntRegister(X2V);
   ProcessExpression(Node.GetChild(3), Y2V); Y2R := EnsureIntRegister(Y2V);
+  // Resolve the start point (unless omitted -> the VM substitutes the pen via the NOSTART flag).
+  if Step1 and not NoStart then
+  begin
+    EmitPenCoordRegs(PenX, PenY);
+    EmitStepRelative(X1R, Y1R, PenX, PenY);
+  end;
+  // Resolve the end point when it is STEP-relative to its base (the start point, or the pen when omitted).
+  if Step2 then
+  begin
+    if NoStart then EmitPenCoordRegs(BaseX, BaseY)
+    else begin BaseX := X1R; BaseY := Y1R; end;
+    EmitStepRelative(X2R, Y2R, BaseX, BaseY);
+  end;
   if Node.ChildCount >= 5 then
   begin
     ProcessExpression(Node.GetChild(4), CV); CR := EnsureIntRegister(CV);
@@ -8265,7 +8324,7 @@ begin
   if Shape = 'BF' then Flag := 2
   else if Shape = 'B' then Flag := 1
   else Flag := 0;
-  if Node.Attributes.Values['NOSTART'] = '1' then Flag := Flag or 4;   // start = current graphics point
+  if NoStart then Flag := Flag or 4;   // start = current graphics point
   EmitInstruction(ssaGfxLine, MakeSSAValue(svkNone), X1R, Y1R, X2R);
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(Y2R, nil);
@@ -8276,13 +8335,19 @@ end;
 procedure TSSAGenerator.ProcessGfxCircle(Node: TASTNode);
 // CIRCLE (x, y), r [, color] : a circle of radius r (drawn via the ellipse primitive, RX=RY=r).
 // Children: x, y, r [, color]. Packed as Src1=x, Src2=y, Src3=r, PhiSources[0]=color.
+// STEP: the centre (x,y) is relative to the current graphics point.
 var
-  XV, YV, RV, CV, XR, YR, RR, CR: TSSAValue;
+  XV, YV, RV, CV, XR, YR, RR, CR, PenX, PenY: TSSAValue;
   Instr: TSSAInstruction;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 3) then Exit;
   ProcessExpression(Node.GetChild(0), XV); XR := EnsureIntRegister(XV);
   ProcessExpression(Node.GetChild(1), YV); YR := EnsureIntRegister(YV);
+  if Node.Attributes.Values['STEP'] = '1' then
+  begin
+    EmitPenCoordRegs(PenX, PenY);
+    EmitStepRelative(XR, YR, PenX, PenY);
+  end;
   ProcessExpression(Node.GetChild(2), RV); RR := EnsureIntRegister(RV);
   if (Node.ChildCount >= 4) and Assigned(Node.GetChild(3)) then
   begin
@@ -8375,13 +8440,18 @@ end;
 
 procedure TSSAGenerator.ProcessGfxPreset(Node: TASTNode);
 // PRESET (x, y) [, color] : set a pixel; an omitted colour defaults to the current BACKGROUND (unlike PSET,
-// which uses the foreground). Otherwise identical to PSET.
+// which uses the foreground). Otherwise identical to PSET. STEP: (x,y) relative to the current point.
 var
-  XVal, YVal, CVal, XReg, YReg, CReg: TSSAValue;
+  XVal, YVal, CVal, XReg, YReg, CReg, PenX, PenY: TSSAValue;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 2) then Exit;
   ProcessExpression(Node.GetChild(0), XVal); XReg := EnsureIntRegister(XVal);
   ProcessExpression(Node.GetChild(1), YVal); YReg := EnsureIntRegister(YVal);
+  if Node.Attributes.Values['STEP'] = '1' then
+  begin
+    EmitPenCoordRegs(PenX, PenY);
+    EmitStepRelative(XReg, YReg, PenX, PenY);
+  end;
   if Node.ChildCount >= 3 then
   begin
     ProcessExpression(Node.GetChild(2), CVal); CReg := EnsureIntRegister(CVal);
