@@ -360,6 +360,8 @@ const
   kISREDIRECTED = 'ISREDIRECTED';                  // FreeBASIC: ISREDIRECTED(n) -> is a standard stream redirected?
   kINP     = 'INP';                                // FreeBASIC: INP(port) -> read a hardware I/O port (no hardware here -> 0)
   kOUT     = 'OUT';                                // FreeBASIC: OUT port, value -> write a hardware I/O port (no-op here)
+  kLOCK    = 'LOCK';                               // FreeBASIC: LOCK #n [, range] -> lock file records (no-op on a single-process VM)
+  kUNLOCK  = 'UNLOCK';                             // FreeBASIC: UNLOCK #n [, range] -> release file record locks (no-op)
   kMACROFUNCTION   = '__FUNCTION__';    // FreeBASIC: quoted name of the current function block (intrinsic macro string)
   kMACROFUNCTIONNQ = '__FUNCTION_NQ__'; // FreeBASIC: non-quoted name of the current function block
   kFBMAINPROC      = '__FB_MAINPROC__'; // FreeBASIC: __FUNCTION__ value when used at module level (main module)

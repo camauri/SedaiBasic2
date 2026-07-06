@@ -1755,6 +1755,8 @@ begin
  RegisterKeyword(kDCLOSE,    ttFileOperation,  'Close disk drive file(s)',                 kcDOSCommands);
  RegisterKeyword(kFILESETEOF, ttFileOperation, 'FreeBASIC: set open file length to current position', kcDOSCommands);
  RegisterKeyword(kFILEFLUSH,  ttFileOperation, 'FreeBASIC: flush file buffers (no-op, unbuffered)',   kcDOSCommands);
+ RegisterKeyword(kLOCK,       ttFileOperation, 'FreeBASIC: lock file records (no-op, single-process)', kcDOSCommands);
+ RegisterKeyword(kUNLOCK,     ttFileOperation, 'FreeBASIC: unlock file records (no-op)',               kcDOSCommands);
  RegisterKeyword(kDIR,       ttFileManagement, 'Display drive directory (alias)',          kcDOSCommands);
  RegisterKeyword(kDIRECTORY, ttFileManagement, 'Display drive directory',                  kcDOSCommands);
  RegisterKeyword(kDLOAD,     ttFileOperation,  'Load BASIC file',                          kcDOSCommands);

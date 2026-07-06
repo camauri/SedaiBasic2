@@ -4831,6 +4831,28 @@ begin
     Exit;
   end;
 
+  // FreeBASIC LOCK / UNLOCK #filenum [, record [TO record]] : file record locking. A single-process VM has
+  // no lock contention, so these are no-ops — consume the '#' prefix and the record range(s) and discard
+  // them, emitting no code (Result is the empty antStatement from the case above).
+  if (CmdName = 'LOCK') or (CmdName = 'UNLOCK') then
+  begin
+    if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+      Context.Advance;
+    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
+    begin
+      // consume an expression, a comma, or a TO (record range) token
+      if Context.Check(ttSeparParam) or (Context.Check(ttLoopControl) and (UpperCase(Context.CurrentToken.Value) = kTO)) then
+        Context.Advance
+      else
+      begin
+        Param := ParseExpression;
+        if Assigned(Param) then Param.Free else Break;
+      end;
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
   // FreeBASIC FILESETEOF [#]filenum : truncate/extend the open file to the current 1-based position.
   // The file number is a bare expression (number or variable), optionally prefixed with '#'.
   if CmdName = 'FILESETEOF' then

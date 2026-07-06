@@ -140,6 +140,13 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `TYPE ... UNION ... END UNION` | ✓ | Anonymous union nested in a TYPE (v1: members flattened as non-overlapping fields) |
 | `type<T>(args)` / `T(args)` / `= (a,b,c)` | ✓ | Anonymous UDT temporary with an explicit type; aggregate/tuple initialisation of a constructor-less UDT, including array-of-UDT `{(a,b), (c,d)}` |
 | `OPTION BASE 1` | ✓ | Default lower bound for a bare-upper-bound array `DIM a(n)` → `a(1..n)` |
+| `ENUM [name] AS <type>` | ✓ | ENUM with an explicit (advisory) underlying integer type |
+| `LPRINT` / `LPOS(n)` | ✓ | Line-printer output (routed to stdout) / head column (always 1 — no printer) |
+| `SETENVIRON` / `ENVIRON$` | ✓ | Set / read an environment variable (SETENVIRON sets a VM-internal override) |
+| `SHELL cmd` | ✓ | Run a command via the platform shell (cmd.exe / /bin/sh); returns the exit code |
+| `ISREDIRECTED(n)` | ✓ | Whether a standard stream is redirected (portable default 0) |
+| `INP(port)` / `OUT port, value` | ✓ | Hardware I/O port read/write — no-op on a portable VM (INP → 0) |
+| `LOCK` / `UNLOCK` | ✓ | File record locking — no-op on a single-process VM |
 | `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like **and** function-like macros `#define NAME(p) body`, nested expansion) |
 | `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening (methods of a namespaced TYPE / `USING` / `..global` pending) |
 | Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`/`p(i)`, passing pointers across SUB calls, multi-level `PTR PTR` (`**pp`). **UDT pointers**: `DIM p AS T PTR`, `NEW T`/`DELETE`, `@obj`, `p->field`/`p.field`, self-referential `NXT AS NODE PTR` (linked lists/trees), chained `p->nxt->val`. **BYREF-return of a BYREF param** (`min(a,b)=0`, int pointees). **Pointer return types** (`FUNCTION f() AS T PTR` returning a pointer value). **Raw memory**: `Allocate`/`CAllocate`/`Reallocate`/`Deallocate` on a VM-internal byte heap, `SizeOf(T)`, `CAST`/`CPTR(type, expr)`, scaled `p[i]`/`*(p±n)`; `SADD(s)` = raw ZSTRING pointer to a string's bytes (read-only snapshot) |
