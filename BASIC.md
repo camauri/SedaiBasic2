@@ -131,11 +131,15 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | Conversions `CINT`/`CLNG`/`CSHORT`/`CBYTE`/`CDBL`/`CSNG`/`VALINT`/`OCT`/`BIN`... | ✓ | FreeBASIC type conversions (B1.3) |
 | `LBOUND`/`UBOUND`/`ERASE`/`REDIM [PRESERVE]` | ✓ | FreeBASIC array operations (B1.4) |
 | Math `ACOS`/`ASIN`/`ATAN2`/`FIX`/`FRAC` | ✓ | FreeBASIC math functions |
+| Math `SINH`/`COSH`/`TANH`/`ASINH`/`ACOSH`/`ATANH` | ✓ | Hyperbolic functions (FPC Math unit — same IEEE-754 result as FB's CRT) |
 | `&H`/`&O`/`&B` literals | ✓ | Hex / octal / binary integer literals |
 | `LSET`/`RSET` | ✓ | Justify a string into a buffer (QBasic `=` and FB `,` forms) |
 | `EXIT`/`CONTINUE n,n` | ✓ | Multi-level loop exit/continue (`Exit For, For`) |
 | `PROPERTY Type.name` | ✓ | Property getter/setter (desugars to method) |
-| `OPERATOR <sym>` | ✓ | Operator overloading for UDTs (binary, direct operands) |
+| `OPERATOR <sym>` | ✓ | Operator overloading for UDTs: binary operators and the `Cast` conversion; a UDT-returning operator chains (`a * (b ^ c)`) and prints via its `Cast` |
+| `TYPE ... UNION ... END UNION` | ✓ | Anonymous union nested in a TYPE (v1: members flattened as non-overlapping fields) |
+| `type<T>(args)` / `T(args)` / `= (a,b,c)` | ✓ | Anonymous UDT temporary with an explicit type; aggregate/tuple initialisation of a constructor-less UDT, including array-of-UDT `{(a,b), (c,d)}` |
+| `OPTION BASE 1` | ✓ | Default lower bound for a bare-upper-bound array `DIM a(n)` → `a(1..n)` |
 | `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like **and** function-like macros `#define NAME(p) body`, nested expansion) |
 | `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening (methods of a namespaced TYPE / `USING` / `..global` pending) |
 | Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`/`p(i)`, passing pointers across SUB calls, multi-level `PTR PTR` (`**pp`). **UDT pointers**: `DIM p AS T PTR`, `NEW T`/`DELETE`, `@obj`, `p->field`/`p.field`, self-referential `NXT AS NODE PTR` (linked lists/trees), chained `p->nxt->val`. **BYREF-return of a BYREF param** (`min(a,b)=0`, int pointees). **Pointer return types** (`FUNCTION f() AS T PTR` returning a pointer value). **Raw memory**: `Allocate`/`CAllocate`/`Reallocate`/`Deallocate` on a VM-internal byte heap, `SizeOf(T)`, `CAST`/`CPTR(type, expr)`, scaled `p[i]`/`*(p±n)`; `SADD(s)` = raw ZSTRING pointer to a string's bytes (read-only snapshot) |
@@ -157,8 +161,16 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
   - A `DIM` inside a block (`IF`/`ELSE` branch, `FOR`/`DO`/`WHILE` body, `BEGIN`/`BEND`) is **block-local**:
     it shadows an outer same-name variable for the rest of the block and is destroyed (UDT destructor
     runs) at the block end. `EXIT`/`RETURN` unwind block-local objects innermost-first before the frame.
-- Not yet implemented (future work): a block-scoped `FOR` counter via `FOR i AS <type>` syntax;
-  scoping of array names by block; an `OPTION` to auto-share module variables into procedures.
+- A typed `FOR` counter — `FOR i AS <type> = ... TO ...` — is honoured: the counter binds in its declared
+  bank (e.g. `AS Integer` keeps the loop in the integer register bank). It is not a fresh block-local
+  instance per loop (it binds/reuses in the enclosing scope), but a second `FOR i AS <type>` over the same
+  name reuses the same counter register rather than diverging.
+- A local array whose name matches a module array is given its own per-procedure slot (it no longer aliases
+  and corrupts the module array). A nested anonymous `UNION ... END UNION` inside a `TYPE` parses (v1
+  flattens its members as ordinary, non-overlapping fields). `OPTION BASE 1` sets the default lower bound
+  for arrays declared with a bare upper bound (`DIM a(n)` → `a(1..n)`).
+- Not yet implemented (future work): scoping of array names by block; an `OPTION` to auto-share module
+  variables into procedures.
 
 ## Data Management (7/7 - 100%)
 
@@ -236,11 +248,11 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 
 | Function | Status | Description |
 |----------|--------|-------------|
-| `ASC` | ✓ | Return character code |
-| `CHR$` | ✓ | Return character from code |
+| `ASC` | ✓ | Character code; `ASC(str[, pos])` returns the code at 1-based position `pos` (FreeBASIC) |
+| `CHR$` | ✓ | Character from code; `CHR(a[, b, ...])` builds a string, one char per argument (FreeBASIC) |
 | `DEC` | ✓ | Convert hex number string to decimal |
 | `HEX$` | ✓ | Hex number string from decimal number (4-char, 0000-FFFF) |
-| `INSTR` | ✓ | Position of source string in destination string (1-based, optional start) |
+| `INSTR` | ✓ | 1-based position of a substring; FreeBASIC `INSTR([start,] str, substr)` — the optional start comes FIRST |
 | `LEN` | ✓ | Return string length |
 | `LEFT$` | ✓ | Return string leftmost chars |
 | `MID$` | ✓ | Return substring (v7). In MODERN also `MID(...)` function and `MID(dst,start[,len]) = src` in-place statement (FreeBASIC) |
@@ -325,7 +337,7 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `TEMPO` | ✓ | Define the speed of the song being played (TEMPO n, 1-255) |
 | `VOL` | ✓ | Define output level of sound (VOL n, 0-15) |
 
-## Math Functions (17/17 - 100%)
+## Math Functions (28/28 - 100%)
 
 | Function | Status | Description |
 |----------|--------|-------------|
@@ -350,6 +362,12 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `SIN` | ✓ | Return sine of argument |
 | `SQR` | ✓ | Return square root of argument |
 | `TAN` | ✓ | Return tangent of argument |
+| `SINH` | ✓ | Hyperbolic sine (FreeBASIC via CRT; FPC Math unit — same IEEE-754 result) |
+| `COSH` | ✓ | Hyperbolic cosine |
+| `TANH` | ✓ | Hyperbolic tangent |
+| `ASINH` | ✓ | Inverse hyperbolic sine |
+| `ACOSH` | ✓ | Inverse hyperbolic cosine, domain x ≥ 1 |
+| `ATANH` | ✓ | Inverse hyperbolic tangent, domain \|x\| < 1 |
 | `VAL` | ✓ | Return the numeric value of a number string |
 
 ## Type Conversion Functions (FreeBASIC) (11/11 - 100%)
