@@ -824,7 +824,12 @@ begin
       else
         Result := Memoize('FnStatement', @ParseFnStatement);
     ttCallSub: Result := Memoize('CallStatement', @ParseCallStatement);
-    ttBaseCall: Result := Memoize('BaseStatement', @ParseBaseStatement);
+    ttBaseCall:
+      // "base.field = expr" (member assignment) vs "BASE(args)" (base-constructor call).
+      if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpDot) then
+        Result := Memoize('AssignmentStatement', @ParseAssignmentStatement)
+      else
+        Result := Memoize('BaseStatement', @ParseBaseStatement);
     ttThreadWait: Result := Memoize('ThreadWaitStatement', @ParseThreadWaitStatement);
     ttThreadDetach: Result := Memoize('ThreadDetachStatement', @ParseThreadDetachStatement);
     ttMutexLock, ttMutexUnlock, ttMutexDestroy:
@@ -1101,6 +1106,13 @@ begin
   begin
     // Array access A(i), pointer index p[i], or member access rec.field - use the expression parser to
     // build the full target (antArrayAccess / antMemberAccess); it stops before '=' (lower prec).
+    LeftSide := FExpressionParser.ParseExpression(precCall);
+    LhsIsExpr := True;
+  end
+  else if Context.Check(ttBaseCall) then
+  begin
+    // FreeBASIC "base.field = expr" inside a derived method: the expression parser's BASE prefix rule
+    // lowers `base` to THIS, so this builds an antMemberAccess target on the (inherited) base field.
     LeftSide := FExpressionParser.ParseExpression(precCall);
     LhsIsExpr := True;
   end

@@ -1329,7 +1329,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `Temporary Types` | ✗ | Creates a temporary copy of a user defined type |
 | `THIS` | ✓ | Implicit first parameter of methods/constructors/destructors (M4.1): the instance handle. `THIS.field` reads/writes fields; used to resolve the method's owner type |
-| `BASE (member access)` | ✗ | Built-in, hidden, variable to access the base user defined type instance in derived user defined types |
+| `BASE (member access)` | ✓ | `base.field` reads/writes the inherited base field in a derived method (lowered to `this.field`). `base.method()` non-virtual base calls are a v1 limitation. |
 | `Type Alias` | ✓ | `TYPE newname AS underlyingtype` — synonym for a builtin or UDT; resolved via CanonicalType (chained aliases, narrowing, and alias-to-UDT supported). |
 | `WITH` | ✓ | `WITH rec` ... `END WITH`: leading `.field` resolves against the record (M3.2) |
 
@@ -1337,7 +1337,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `BASE (initialization)` | ✗ | Specifies an initializer for the base user defined type in derived user defined type constructors |
+| `BASE (initialization)` | ✓ | `BASE(args)` calls the base type's constructor from a derived constructor. |
 | `CONSTRUCTOR` | ✓ | Member procedure auto-called when an instance is created: `DIM v AS T` / `DIM v AS T(args)` / `NEW T(args)` (nested members first, then the object); overloading by arity and by parameter type (M4.4d/g); base-constructor auto-chaining and explicit `BASE(args)` (M4.4f); inherited if the subtype has none. |
 | `DESTRUCTOR` | ✓ | Member procedure auto-called when an instance goes out of scope, in reverse construction order: procedure-local DIM'd UDTs, block-scoped DIMs (per loop iteration), module globals (program end / `END` in a proc), nested members, and BYVAL-param copies (V5/V5b/V5c/V5d). |
 | `FUNCTION` | ✓ | Declares or defines a member procedure returning a value |
@@ -1708,8 +1708,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `EXTERN...END EXTERN` | ✓ | `EXTERN "lang" ... END EXTERN` block accepted and skipped (no native linking). |
 | `IMPORT` | ✓ | Accepted and skipped (no native linking). |
 | `NAMESPACE` | ✓ | Group decls under a name (AST-flattened to `N.member`); nesting + reopening |
-| `PRIVATE` | ✗ |  |
-| `PUBLIC` | ✗ |  |
+| `PRIVATE` | ✓ | `PRIVATE SUB/FUNCTION` (module-private procedure); `PRIVATE:` visibility section inside a TYPE. |
+| `PUBLIC` | ✓ | `PUBLIC SUB/FUNCTION` (module-public procedure); `PUBLIC:` visibility section inside a TYPE. |
 | `USING (Namespaces)` | ✓ |  |
 
 ### Other

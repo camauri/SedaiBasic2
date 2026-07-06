@@ -174,6 +174,15 @@ begin
   Result := TExpressionParser(Parser).ParseIdentifier(Token);
 end;
 
+function StaticParseBase(Parser: Pointer; Token: TLexerToken): TObject;
+// FreeBASIC BASE.field member access inside a derived method: `base` names the base subobject, which in
+// our inheritance model shares the same instance fields as `this`, so lower it to the THIS identifier and
+// let the member-access infix rule resolve `base.field` as `this.field`. (The BASE(args) constructor-call
+// form is a statement, parsed elsewhere, not through this expression prefix rule.)
+begin
+  Result := TASTNode.CreateWithValue(antIdentifier, 'THIS', Token);
+end;
+
 function StaticParseLineNumber(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseLineNumber(Token);
@@ -393,6 +402,7 @@ begin
   Context.SetParseRule(ttFloat, MakePrefixRule(@StaticParseNumber, precPrimary));
   Context.SetParseRule(ttStringLiteral, MakePrefixRule(@StaticParseString, precPrimary));
   Context.SetParseRule(ttIdentifier, MakePrefixRule(@StaticParseIdentifier, precPrimary));
+  Context.SetParseRule(ttBaseCall, MakePrefixRule(@StaticParseBase, precPrimary));   // base.field -> this.field
   Context.SetParseRule(ttLineNumber, MakePrefixRule(@StaticParseLineNumber, precPrimary));
 
   // *** FIX: Parentesi tonde per ENTRAMBI parentheses e array access ***
