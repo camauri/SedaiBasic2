@@ -361,6 +361,8 @@ const
   kINP     = 'INP';                                // FreeBASIC: INP(port) -> read a hardware I/O port (no hardware here -> 0)
   kOUT     = 'OUT';                                // FreeBASIC: OUT port, value -> write a hardware I/O port (no-op here)
   kPOINTCOORD = 'POINTCOORD';                      // FreeBASIC: POINTCOORD(n) -> the DRAW pen coordinate (0=x, 1=y)
+  kSCREENLIST = 'SCREENLIST';                      // FreeBASIC: SCREENLIST(depth) -> next fullscreen resolution (0 = none here)
+  kSCREENCONTROL = 'SCREENCONTROL';                // FreeBASIC: SCREENCONTROL code[, value] -> get/set gfx settings (no-op here)
   kLOCK    = 'LOCK';                               // FreeBASIC: LOCK #n [, range] -> lock file records (no-op on a single-process VM)
   kUNLOCK  = 'UNLOCK';                             // FreeBASIC: UNLOCK #n [, range] -> release file record locks (no-op)
   kMACROFUNCTION   = '__FUNCTION__';    // FreeBASIC: quoted name of the current function block (intrinsic macro string)
@@ -369,6 +371,7 @@ const
   // FreeBASIC graphics (phase 1 slice — routed through the IGraphicsBackend abstraction)
   kSCREENRES = 'SCREENRES';   // SCREENRES w, h : set the graphics screen resolution
   kPSET      = 'PSET';        // PSET (x, y) [, color] : set a pixel
+  kPRESET    = 'PRESET';      // PRESET (x, y) [, color] : set a pixel (omitted colour = background)
   kPOINT     = 'POINT';       // POINT(x, y) : read a pixel's color
   kBEEP    = 'BEEP';                                // FreeBASIC/QB: console bell (emits CHR(7))
   kFORMAT  = 'FORMAT';   kFORMATS  = 'FORMAT$';    // FreeBASIC: FORMAT(num, mask) -> formatted string

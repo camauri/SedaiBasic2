@@ -442,6 +442,8 @@ type
     procedure ProcessBeep(Node: TASTNode);   // BEEP: console bell (emit CHR(7), no newline)
     procedure ProcessScreenRes(Node: TASTNode);  // SCREENRES w, h (FreeBASIC graphics)
     procedure ProcessGfxPset(Node: TASTNode);    // PSET (x, y) [, color]
+    procedure ProcessGfxPreset(Node: TASTNode);  // PRESET (x, y) [, color] — omitted colour = background
+    function  DefaultBackColorReg: TSSAValue;     // omitted-colour default for PRESET = current draw background
     procedure ProcessGfxPaint(Node: TASTNode);   // PAINT (x, y) [, color] (flood fill)
     procedure ProcessGfxLine(Node: TASTNode);     // LINE (x1,y1)-(x2,y2) [,color] [,B|BF]
     procedure ProcessGfxCircle(Node: TASTNode);   // CIRCLE (x, y), r [, color]
@@ -3990,6 +3992,16 @@ begin
           ArgReg := EnsureIntRegister(ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaGfxPointCoord, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC SCREENLIST(depth): enumerate fullscreen resolutions. A portable/headless VM does not
+        // enumerate hardware modes, so it returns 0 (no more resolutions). Evaluate and discard the argument.
+        if FModernMode and (UpperCase(ArrName) = kSCREENLIST) and (ArrayIndexOf(ArrName) < 0) then
+        begin
+          if Node.GetChild(1).ChildCount >= 1 then ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
         end;
 
@@ -8340,6 +8352,32 @@ function TSSAGenerator.DefaultDrawColorReg: TSSAValue;
 begin
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaGfxForeColor, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.DefaultBackColorReg: TSSAValue;
+// Colour register used when PRESET omits its colour: the current draw BACKGROUND (set by COLOR ,bg;
+// defaults to black). Read at runtime via ssaGfxForeColor with the background selector (Immediate 1).
+begin
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaGfxForeColor, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(1));
+end;
+
+procedure TSSAGenerator.ProcessGfxPreset(Node: TASTNode);
+// PRESET (x, y) [, color] : set a pixel; an omitted colour defaults to the current BACKGROUND (unlike PSET,
+// which uses the foreground). Otherwise identical to PSET.
+var
+  XVal, YVal, CVal, XReg, YReg, CReg: TSSAValue;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 2) then Exit;
+  ProcessExpression(Node.GetChild(0), XVal); XReg := EnsureIntRegister(XVal);
+  ProcessExpression(Node.GetChild(1), YVal); YReg := EnsureIntRegister(YVal);
+  if Node.ChildCount >= 3 then
+  begin
+    ProcessExpression(Node.GetChild(2), CVal); CReg := EnsureIntRegister(CVal);
+  end
+  else
+    CReg := DefaultBackColorReg;   // omitted colour -> current draw background (COLOR ,bg)
+  EmitInstruction(ssaGfxPset, MakeSSAValue(svkNone), XReg, YReg, CReg);
 end;
 
 procedure TSSAGenerator.ProcessGfxColor(Node: TASTNode);
@@ -17150,6 +17188,7 @@ begin
     antBeep: ProcessBeep(Node);
     antScreenRes: ProcessScreenRes(Node);
     antGfxPset: ProcessGfxPset(Node);
+    antGfxPreset: ProcessGfxPreset(Node);
     antGfxPaint: ProcessGfxPaint(Node);
     antGfxLine: ProcessGfxLine(Node);
     antGfxCircle: ProcessGfxCircle(Node);

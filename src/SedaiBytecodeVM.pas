@@ -7188,8 +7188,12 @@ begin
         if (Instr.Immediate and 1) <> 0 then FGfxForeColor := UInt32(Ctx.IntRegs[Instr.Src1]);
         if (Instr.Immediate and 2) <> 0 then FGfxBackColor := UInt32(Ctx.IntRegs[Instr.Src2]);
       end;
-    35: // bcGfxForeColor - read current draw foreground (omitted-colour default)
-      Ctx.IntRegs[Instr.Dest] := Int64(FGfxForeColor);
+    35: // bcGfxForeColor - read the current draw colour (Immediate 0 = foreground, 1 = background). The
+        //   omitted-colour default for PSET (foreground) and PRESET (background).
+      if Instr.Immediate = 1 then
+        Ctx.IntRegs[Instr.Dest] := Int64(FGfxBackColor)
+      else
+        Ctx.IntRegs[Instr.Dest] := Int64(FGfxForeColor);
     36: // bcGfxImageCreate - IMAGECREATE(w,h[,color]) -> handle (Immediate = fill colour reg)
       if Assigned(FGraphics) then
         Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.CreateSurface(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],

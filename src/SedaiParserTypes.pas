@@ -205,6 +205,7 @@ type
     antScnClr,            // SCNCLR command (clear screen)
     antScreenRes,         // SCREENRES w, h (FreeBASIC graphics)
     antGfxPset,           // PSET (x, y) [, color] (FreeBASIC graphics)
+    antGfxPreset,         // PRESET (x, y) [, color] (FreeBASIC graphics; omitted colour = background)
     antGfxPaint,          // PAINT (x, y) [, color] (FreeBASIC graphics, flood fill)
     antGfxLine,           // LINE (x1,y1)-(x2,y2) [,color] [,B|BF] (FreeBASIC graphics)
     antGfxCircle,         // CIRCLE (x, y), r [, color] (FreeBASIC graphics)

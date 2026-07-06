@@ -4132,6 +4132,8 @@ begin
     Result := TASTNode.Create(antScreenRes, Token)
   else if CmdName = 'PSET' then
     Result := TASTNode.Create(antGfxPset, Token)
+  else if CmdName = 'PRESET' then
+    Result := TASTNode.Create(antGfxPreset, Token)
   else if CmdName = 'PALETTE' then
     Result := TASTNode.Create(antPalette, Token)
   else if CmdName = 'IMAGEDESTROY' then
@@ -4181,9 +4183,9 @@ begin
   Context.Advance;
   ParamCount := 0;
 
-  // FreeBASIC PSET (x, y) [, color] and PAINT (x, y) [, color]: the coordinate pair is parenthesised,
-  // so parse it explicitly rather than via the generic comma-separated parameter loop below.
-  if (CmdName = 'PSET') or (Result.NodeType = antGfxPaint) then
+  // FreeBASIC PSET/PRESET (x, y) [, color] and PAINT (x, y) [, color]: the coordinate pair is
+  // parenthesised, so parse it explicitly rather than via the generic comma-separated parameter loop below.
+  if (CmdName = 'PSET') or (CmdName = 'PRESET') or (Result.NodeType = antGfxPaint) then
   begin
     if Context.Check(ttDelimParOpen) then Context.Advance;        // '('
     Result.AddChild(ParseExpression);                             // x
@@ -5215,6 +5217,7 @@ begin
     'SETENVIRON': Result := TASTNode.Create(antSetenviron, Token);
     'SHELL': Result := TASTNode.Create(antShell, Token);
     'OUT': Result := TASTNode.Create(antOut, Token);
+    'SCREENCONTROL': Result := TASTNode.Create(antOut, Token);   // no-op: evaluate and discard the arguments
     'MOVE', 'MV': Result := TASTNode.Create(antMove, Token);
     // FreeBASIC/QB filesystem mutation: KILL deletes a file (= SCRATCH), FILECOPY copies (= COPY),
     // RMDIR removes a directory (new).

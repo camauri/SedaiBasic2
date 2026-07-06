@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 516 / 643 implemented (80%)** (+ 1 partial). **66** of the unimplemented
+**FreeBASIC keyword set — 519 / 643 implemented (81%)**. **66** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, FFI) — not runnable keywords for a portable bytecode VM. Of the
-**577 applicable** keywords, **516 (89%)** are implemented. See the
+**577 applicable** keywords, **519 (90%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -2473,7 +2473,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `PSET and PRESET` | ◐ | `PSET (x,y),color` plots a pixel on the screen surface (via IGraphicsBackend; headless-testable + on-screen on sbv). `PRESET` and the image-buffer target deferred. |
+| `PSET and PRESET` | ✓ | `PSET (x,y)[,color]` / `PRESET (x,y)[,color]` plot a pixel (PRESET's omitted colour = the background); via IGraphicsBackend, headless-testable and on-screen on sbv. The image-buffer target form (`PSET img,(x,y)`) is deferred. |
 | `LINE (GRAPHICS)` | ✓ | `LINE (x1,y1)-(x2,y2)[,color][,B\|BF]` draws a line, box outline (B) or filled box (BF) on the screen surface (via IGraphicsBackend; headless-testable + on-screen on sbv). Parenthesised form disambiguates from `LINE INPUT`. Leading start-coordinate / STEP / line-style and the image-buffer target deferred. |
 | `CIRCLE` | ✓ | Plots circles and ellipses. C128 form (`CIRCLE source,x,y,...`) and FreeBASIC form (`CIRCLE (x,y),r[,color]`, parenthesised → routed through IGraphicsBackend, headless-testable + on-screen on sbv). FB ellipse/arc/aspect arguments deferred. |
 | `DRAW` | ✓ | Draws in a sequence of commands on an image buffer or screen. |
@@ -2530,10 +2530,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `SCREENLIST` | ✗ | Gets the available fullscreen resolutions. |
+| `SCREENLIST` | ✓ | Enumerate fullscreen resolutions — returns 0 (no hardware modes on a portable/headless VM). |
 | `SCREEN (Graphics) and SCREENRES` | ✓ | `SCREENRES w,h[,depth[,num_pages]]` sets the graphics screen surface; `SCREEN n` selects a numbered QB/FB mode (1/7→320×200, 13→320×200, 18→640×480, 19→800×600, 20→1024×768, 21→1280×1024, …) mapped to a resolution. Both allocate pages and route through IGraphicsBackend (headless-testable via SCREENINFO). depth accepted-and-ignored. |
 | `SCREENINFO` | ✓ | `SCREENINFO w, h [, depth, bpp, pitch, rate]` writes the current graphics surface's width/height (and depth=32, bpp=4, pitch=w*4) into the variables (via IGraphicsBackend; headless-testable). Desktop-info form deferred. |
-| `SCREENCONTROL` | ✗ | Gets or sets internal graphics library settings. |
+| `SCREENCONTROL` | ✓ | Get/set internal graphics settings — a no-op here (arguments parsed and discarded). |
 | `SCREENEVENT` | ✗ | Gets system events. |
 | `SCREENGLPROC` | ✗ | Returns the address of an OpenGL procedure. |
 | `WINDOWTITLE` | ✓ | Parsed; accept-and-ignore (the caption has no effect on the headless/buffered backend; sbv caption plumbing deferred). |

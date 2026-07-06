@@ -1779,6 +1779,7 @@ begin
  RegisterKeyword(kSHELL,     ttFileManagement, 'Run a command via the system shell',        kcDOSCommands);
  RegisterKeyword(kLPRINT,    ttOutputCommand,  'Print to the line printer (routed to stdout here)', kcStdIO);
  RegisterKeyword(kOUT,       ttFileManagement, 'Write a hardware I/O port (no-op on a portable VM)', kcDOSCommands);
+ RegisterKeyword(kSCREENCONTROL, ttFileManagement, 'Get/set internal graphics settings (no-op here)',  kcDOSCommands);
  RegisterKeyword(kCD,        ttFileManagement, 'Change directory (alias for CHDIR)',       kcDOSCommands);
  RegisterKeyword(kMOVE,      ttFileManagement, 'Move file to another location',            kcDOSCommands);
  RegisterKeyword(kMV,        ttFileManagement, 'Move file (alias for MOVE)',               kcDOSCommands);
@@ -1871,6 +1872,7 @@ begin
  // declared type/array/function — so user code may still use "Point" as a type.
  RegisterKeyword(kSCREENRES, ttGraphicsCommand, 'FreeBASIC: set graphics screen resolution',        kcGraphicsHandling);
  RegisterKeyword(kPSET,    ttGraphicsCommand, 'FreeBASIC: set a pixel, PSET (x,y),color',           kcGraphicsHandling);
+ RegisterKeyword(kPRESET,  ttGraphicsCommand, 'FreeBASIC: set a pixel (omitted colour = background)', kcGraphicsHandling);
  RegisterKeyword(kPALETTE, ttGraphicsCommand, 'FreeBASIC: set/get/reset a palette entry',            kcGraphicsHandling);
  RegisterKeyword(kIMAGECREATE,  ttGraphicsFunction, 'FreeBASIC: allocate an image surface -> handle', kcGraphicsHandling);
  RegisterKeyword(kIMAGEDESTROY, ttGraphicsCommand,  'FreeBASIC: free an image surface',               kcGraphicsHandling);
