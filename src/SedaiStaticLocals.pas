@@ -104,10 +104,32 @@ var
         CollectStatics(N.GetChild(k));
   end;
 
+  // FreeBASIC "SUB|FUNCTION ... Static": mark every scalar body-local DIM as static so it is lowered to a
+  // persistent global. Only typed-scalar DIMs (child[1] = type identifier) are covered — array locals and
+  // implicitly-declared variables are not made static by the modifier (a v1 limitation). Parameters live
+  // in the ParamList (not an antDim), so they are never touched.
+  procedure MarkAllScalarStatics(N: TASTNode);
+  var k: Integer; D: TASTNode;
+  begin
+    if N = nil then Exit;
+    if N.NodeType = antDim then
+      for k := 0 to N.ChildCount - 1 do
+      begin
+        D := N.GetChild(k);
+        if (D.NodeType = antArrayDecl) and (D.ChildCount >= 2) and
+           (D.GetChild(0).NodeType = antIdentifier) and (D.GetChild(1).NodeType = antIdentifier) then
+          D.Attributes.Values['STATIC'] := '1';
+      end;
+    for k := 0 to N.ChildCount - 1 do
+      if N.GetChild(k).NodeType <> antProcedureDecl then
+        MarkAllScalarStatics(N.GetChild(k));
+  end;
+
 begin
   Decls := TFPList.Create;
   Parents := TFPList.Create;
   try
+    if Proc.Attributes.Values['ALLSTATIC'] = '1' then MarkAllScalarStatics(Proc);
     CollectStatics(Proc);
     for i := 0 to Decls.Count - 1 do
     begin

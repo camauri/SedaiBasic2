@@ -2163,6 +2163,19 @@ begin
 
   Result.AddChild(ParamList);
 
+  // FreeBASIC trailing procedure modifiers after the signature: "[Static] [Export]". STATIC makes ALL
+  // local variables in the body persistent between calls (marked ALLSTATIC; the STATIC-locals lowering
+  // treats each scalar local as static). EXPORT is accepted and ignored. Placed here (after the return
+  // type) so it is on the signature line, before the body — distinct from a body-level "Static name AS T".
+  while (Context.CurrentToken <> nil) and
+        ((UpperCase(VarToStr(Context.CurrentToken.Value)) = 'STATIC') or
+         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'EXPORT')) do
+  begin
+    if UpperCase(VarToStr(Context.CurrentToken.Value)) = 'STATIC' then
+      Result.Attributes.Values['ALLSTATIC'] := '1';
+    Context.Advance;
+  end;
+
   ParseProcedureBody(Result);                     // statements up to END SUB/FUNCTION
   ConsumeEndProcedure;
   DoNodeCreated(Result);

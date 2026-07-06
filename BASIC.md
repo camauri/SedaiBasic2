@@ -1639,7 +1639,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `Sub` | ✓ | Specifies a procedure that does not return an argument. |
 | `Function` | ✓ | Specifies a procedure that returns an argument. |
 | `Overload` | ✓ | Accepted after a procedure name and ignored (overloading by arity/signature already works for constructors; the marker is not required). |
-| `Static` | ✗ | Specifies static storage for all variables and objects in the procedure body. |
+| `Static` | ✓ | `SUB|FUNCTION ... Static` procedure modifier: all local variables in the body are preserved between calls. Typed scalar locals are covered; array locals / implicitly-declared vars are a v1 limitation. |
 | `Const (Member)` | ✓ | Specifies a const member procedure in user-defined type definitions. |
 | `Static (Member)` | ✓ | Static member procedure: `Type.method(args)` called via the type name, no instance. |
 
