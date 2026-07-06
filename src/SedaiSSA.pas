@@ -8333,12 +8333,21 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessGfxCircle(Node: TASTNode);
-// CIRCLE (x, y), r [, color] : a circle of radius r (drawn via the ellipse primitive, RX=RY=r).
-// Children: x, y, r [, color]. Packed as Src1=x, Src2=y, Src3=r, PhiSources[0]=color.
+// CIRCLE [STEP](x,y), r [,color [,start [,end [,aspect [,F]]]]] : a circle, ellipse or arc.
+// Fixed 7-child layout: x, y, r, colour, start, end, aspect (0/1 placeholders for omitted args; presence
+// via the HAS* attributes). A plain circle (no arc/aspect) uses the tested ssaGfxCircle path (RX=RY=r).
+// With an arc or a non-unit aspect it emits ssaGfxCircleEx, computing the two radii and the angle-degree
+// values here (int) so the bytecode op carries only integer registers:
+//   RX = r, RY = round(r * aspect)   (faithful for aspect <= 1; aspect > 1 approximated, a v1 limitation)
+//   start°/end° = round(radians * 180/pi)   (FB pie-slice for negative angles deferred)
 // STEP: the centre (x,y) is relative to the current graphics point.
+const
+  RAD_TO_DEG = 57.29577951308232;   // 180 / pi
 var
   XV, YV, RV, CV, XR, YR, RR, CR, PenX, PenY: TSSAValue;
+  AspV, StartV, EndV, RadF, AspF, RYf, RYr, StF, EndF, StDegF, EnDegF, StDeg, EnDeg: TSSAValue;
   Instr: TSSAInstruction;
+  HasArc, HasAspect: Boolean;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 3) then Exit;
   ProcessExpression(Node.GetChild(0), XV); XR := EnsureIntRegister(XV);
@@ -8349,15 +8358,66 @@ begin
     EmitStepRelative(XR, YR, PenX, PenY);
   end;
   ProcessExpression(Node.GetChild(2), RV); RR := EnsureIntRegister(RV);
-  if (Node.ChildCount >= 4) and Assigned(Node.GetChild(3)) then
+  if (Node.Attributes.Values['HASCOLOR'] = '1') and (Node.ChildCount >= 4) then
   begin
     ProcessExpression(Node.GetChild(3), CV); CR := EnsureIntRegister(CV);
   end
   else
     CR := DefaultDrawColorReg;   // omitted colour -> current draw foreground (COLOR)
-  EmitInstruction(ssaGfxCircle, MakeSSAValue(svkNone), XR, YR, RR);
+
+  HasArc := (Node.Attributes.Values['HASSTART'] = '1') and (Node.Attributes.Values['HASEND'] = '1');
+  HasAspect := Node.Attributes.Values['HASASPECT'] = '1';
+
+  if not HasArc and not HasAspect then
+  begin
+    // Plain circle: the original, well-tested path (RX = RY = r, full 360°).
+    EmitInstruction(ssaGfxCircle, MakeSSAValue(svkNone), XR, YR, RR);
+    Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+    Instr.AddPhiSource(CR, nil);
+    Exit;
+  end;
+
+  // RY = round(r * aspect) when an aspect is given; otherwise RY = r.
+  if HasAspect and (Node.ChildCount >= 7) then
+  begin
+    ProcessExpression(Node.GetChild(6), AspV); AspF := EnsureFloatRegister(AspV);
+    RadF := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaIntToFloat, RadF, RR, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    RYf := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaMulFloat, RYf, RadF, AspF, MakeSSAValue(svkNone));
+    RYr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaFloatToInt, RYr, RYf, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+    RYr := RR;
+
+  // Angles: radians -> integer degrees (full circle 0..360 when no arc is given).
+  if HasArc and (Node.ChildCount >= 6) then
+  begin
+    ProcessExpression(Node.GetChild(4), StartV); StF := EnsureFloatRegister(StartV);
+    StDegF := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaMulFloat, StDegF, StF, EnsureFloatRegister(MakeSSAConstFloat(RAD_TO_DEG)), MakeSSAValue(svkNone));
+    StDeg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaFloatToInt, StDeg, StDegF, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    ProcessExpression(Node.GetChild(5), EndV); EndF := EnsureFloatRegister(EndV);
+    EnDegF := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaMulFloat, EnDegF, EndF, EnsureFloatRegister(MakeSSAConstFloat(RAD_TO_DEG)), MakeSSAValue(svkNone));
+    EnDeg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaFloatToInt, EnDeg, EnDegF, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else
+  begin
+    StDeg := EnsureIntRegister(MakeSSAConstInt(0));
+    EnDeg := EnsureIntRegister(MakeSSAConstInt(360));
+  end;
+
+  // ssaGfxCircleEx: Src1=x, Src2=y, Src3=RX; PhiSources[0]=RY, [1]=colour, [2]=start°, [3]=end°.
+  EmitInstruction(ssaGfxCircleEx, MakeSSAValue(svkNone), XR, YR, RR);
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+  Instr.AddPhiSource(RYr, nil);
   Instr.AddPhiSource(CR, nil);
+  Instr.AddPhiSource(StDeg, nil);
+  Instr.AddPhiSource(EnDeg, nil);
 end;
 
 procedure TSSAGenerator.ProcessPalette(Node: TASTNode);

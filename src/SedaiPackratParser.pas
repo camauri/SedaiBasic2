@@ -4061,6 +4061,7 @@ var
   Token: TLexerToken;
   Param: TASTNode;
   ParamCount, MaxParams: Integer;
+  CircleArgIdx: Integer;
   CmdName: string;
 begin
   Token := Context.CurrentToken;
@@ -4228,23 +4229,60 @@ begin
     if Context.Check(ttDelimParClose) then Context.Advance;       // ')'
     if Context.Check(ttSeparParam) then Context.Advance;          // ','
     Result.AddChild(ParseExpression);                             // radius
-    // Optional trailing parameters: color, start-angle, end-angle, aspect, and a fill flag (F).
-    // Any may be omitted with an empty comma — FreeBASIC "CIRCLE (x,y),r,,,,,F". Only the colour
-    // (the first) is used here; the arc angles / aspect / fill are accepted and ignored (we draw a
-    // full circle). Add the colour child ONLY when actually present, so ProcessGfxCircle can default
-    // an omitted colour and never receives a nil child (which would fault the SSA lowering).
-    if Context.Check(ttSeparParam) then
+    // Optional trailing parameters, in FreeBASIC order: color, start-angle, end-angle, aspect, and a
+    // fill flag (F). Any may be omitted with an empty comma ("CIRCLE (x,y),r,,,,,F"). They are captured
+    // into fixed child slots (3=colour, 4=start, 5=end, 6=aspect) with HAS* presence attributes, plus 0/1
+    // placeholders for omitted ones, so ProcessGfxCircle sees a stable layout. start/end are angles in
+    // radians; aspect is the y/x radius ratio. The fill flag (F) is captured but deferred (no filled-ellipse
+    // primitive). ProcessGfxCircle draws a plain circle when no arc/aspect is present.
+    for CircleArgIdx := 0 to 3 do   // 0=colour, 1=start, 2=end, 3=aspect
     begin
-      Context.Advance;                                            // ',' before colour
-      if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
-        Result.AddChild(ParseExpression);                         // colour (present)
-      while Context.Check(ttSeparParam) do                        // consume & discard start/end/aspect/F
+      if not Context.Check(ttSeparParam) then Break;
+      Context.Advance;                                            // ','
+      if Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
       begin
-        Context.Advance;                                          // ','
-        if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
-          ParseExpression.Free;                                   // param value or the fill flag -> discarded
+        // omitted (empty comma): placeholder (aspect default = 1, others = 0), no HAS* flag
+        if CircleArgIdx = 3 then Result.AddChild(TASTNode.CreateWithValue(antLiteral, '1', Token))
+        else Result.AddChild(TASTNode.CreateWithValue(antLiteral, '0', Token));
+      end
+      else
+      begin
+        // Distinguish a bare "F" fill flag (last, unquoted identifier) from a value expression.
+        if (Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'F')) and
+           (not Assigned(Context.PeekNext) or
+            (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse])) then
+        begin
+          Result.Attributes.Values['FILL'] := '1';
+          Context.Advance;                                        // F
+          // pad the remaining slots with placeholders
+          while Result.ChildCount < 7 do
+            if Result.ChildCount = 6 then Result.AddChild(TASTNode.CreateWithValue(antLiteral, '1', Token))
+            else Result.AddChild(TASTNode.CreateWithValue(antLiteral, '0', Token));
+          Break;
+        end;
+        Result.AddChild(ParseExpression);                         // present value
+        case CircleArgIdx of
+          0: Result.Attributes.Values['HASCOLOR']  := '1';
+          1: Result.Attributes.Values['HASSTART']  := '1';
+          2: Result.Attributes.Values['HASEND']    := '1';
+          3: Result.Attributes.Values['HASASPECT'] := '1';
+        end;
       end;
     end;
+    // A trailing ",F" after aspect (fill flag) — capture and ignore the value.
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;
+      if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'F') then
+      begin
+        Result.Attributes.Values['FILL'] := '1';
+        Context.Advance;
+      end;
+    end;
+    // Ensure the fixed 7-child layout (x,y,r,colour,start,end,aspect) even when trailing args were omitted.
+    while Result.ChildCount < 7 do
+      if Result.ChildCount = 6 then Result.AddChild(TASTNode.CreateWithValue(antLiteral, '1', Token))
+      else Result.AddChild(TASTNode.CreateWithValue(antLiteral, '0', Token));
     DoNodeCreated(Result);
     Exit;
   end;

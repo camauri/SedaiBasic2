@@ -7470,6 +7470,29 @@ begin
         Ctx.IntRegs[Instr.Dest] := FDrawPenY
       else
         Ctx.IntRegs[Instr.Dest] := FDrawPenX;
+    59: // bcGfxCircleEx - CIRCLE ellipse/arc. Src1=x, Src2=y, Dest=RX; Immediate [0-15]=RY, [16-31]=color,
+        // [32-47]=start-angle-degrees, [48-63]=end-angle-degrees (all int regs). Angles are already in
+        // degrees; RX/RY already carry the aspect ratio. Centre mapped and radii scaled by the WINDOW axes.
+      if Assigned(FGraphics) then
+      begin
+        if FGfxWinActive then
+        begin
+          GetX1 := Round(Ctx.IntRegs[Instr.Dest] * Abs(FGfxWinAx));            // RX physical
+          GetY1 := Round(Ctx.IntRegs[Instr.Immediate and $FFFF] * Abs(FGfxWinAy));  // RY physical
+        end
+        else
+        begin
+          GetX1 := Ctx.IntRegs[Instr.Dest];                                    // RX
+          GetY1 := Ctx.IntRegs[Instr.Immediate and $FFFF];                     // RY
+        end;
+        FGraphics.DrawEllipse(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
+          GetX1, GetY1,
+          UInt32(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]),
+          Double(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]),   // start angle (degrees)
+          Double(Ctx.IntRegs[(Instr.Immediate shr 48) and $FFFF]),   // end angle (degrees)
+          0.0, 0.0, 1);
+        FDrawPenX := Ctx.IntRegs[Instr.Src1]; FDrawPenY := Ctx.IntRegs[Instr.Src2];  // centre becomes the current point
+      end;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

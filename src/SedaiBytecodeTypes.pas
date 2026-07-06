@@ -646,6 +646,10 @@ const
   bcStrig           = bcGroupGraphics + 56;
   bcGfxDrawGML      = bcGroupGraphics + 57;  // DRAW "..." : interpret the FreeBASIC graphics macro language (Src1 = string)
   bcGfxPointCoord   = bcGroupGraphics + 58;  // POINTCOORD(n): the DRAW pen coordinate (Dest=result, Src1=selector 0=x/1=y)
+  // CIRCLE (x,y),r,c,start,end,aspect : ellipse / arc. Src1=x, Src2=y, Src3=RX; Immediate[0-15]=RY,
+  // [16-31]=color, [32-47]=start-angle-degrees, [48-63]=end-angle-degrees (all int regs). RX/RY and the
+  // angle-degree values are computed in the SSA generator, so this opcode carries only integer registers.
+  bcGfxCircleEx     = bcGroupGraphics + 59;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1767,6 +1771,7 @@ begin
         56: Result := 'Strig';
         57: Result := 'GfxDrawGML';
         58: Result := 'GfxPointCoord';
+        59: Result := 'GfxCircleEx';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

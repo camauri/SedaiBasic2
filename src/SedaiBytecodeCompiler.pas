@@ -402,6 +402,7 @@ begin
     ssaGfxPaint: Result := bcGfxPaint;
     ssaGfxLine: Result := bcGfxLine;
     ssaGfxCircle: Result := bcGfxCircle;
+    ssaGfxCircleEx: Result := bcGfxCircleEx;
     ssaGfxPalette: Result := bcGfxPalette;
     ssaGfxPalGet: Result := bcGfxPalGet;
     ssaGfxPaletteReset: Result := bcGfxPaletteReset;
@@ -1390,6 +1391,40 @@ begin
       BCInstr.Immediate := BCInstr.Immediate or
         ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
           Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF) shl 16);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // FreeBASIC CIRCLE ellipse/arc: Src1=x, Src2=y, Dest=RX (int; Dest is used here as an extra input slot,
+  // not a definition); Immediate packs RY (PhiSources[0], bits 0-15), color (PhiSources[1], bits 16-31),
+  // start-angle-degrees (PhiSources[2], bits 32-47) and end-angle-degrees (PhiSources[3], bits 48-63) —
+  // all integer registers (RX/RY and the angle-degree values are precomputed in the SSA generator).
+  if Instr.OpCode = ssaGfxCircleEx then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcGfxCircleEx, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);  // RX
+    BCInstr.Immediate := 0;
+    if (Length(Instr.PhiSources) >= 1) and (Instr.PhiSources[0].Value.Kind = svkRegister) then       // RY
+      BCInstr.Immediate := BCInstr.Immediate or
+        (Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+          Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF);
+    if (Length(Instr.PhiSources) >= 2) and (Instr.PhiSources[1].Value.Kind = svkRegister) then       // color
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
+          Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FFFF) shl 16);
+    if (Length(Instr.PhiSources) >= 3) and (Instr.PhiSources[2].Value.Kind = svkRegister) then       // start°
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[2].Value.RegType,
+          Instr.PhiSources[2].Value.RegIndex, Instr.PhiSources[2].Value.Version)) and $FFFF) shl 32);
+    if (Length(Instr.PhiSources) >= 4) and (Instr.PhiSources[3].Value.Kind = svkRegister) then       // end°
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[3].Value.RegType,
+          Instr.PhiSources[3].Value.RegIndex, Instr.PhiSources[3].Value.Version)) and $FFFF) shl 48);
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
