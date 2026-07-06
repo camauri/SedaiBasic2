@@ -13877,6 +13877,28 @@ begin
         end;
         Continue;
       end;
+      // DIM AS TypeOf(expr) name (FreeBASIC): child[1] is the type-of expression (NOT an initializer).
+      // Infer its bank and REPLACE child[1] with the concrete type identifier — no initializer is added,
+      // so the variable is declared with the inferred type and default-initialized. Rewritten to the exact
+      // shape of a typed-scalar DIM so every downstream pass handles it identically.
+      if Decl.Attributes.Values['TYPEOF'] = '1' then
+      begin
+        if (Decl.ChildCount >= 2) and (Decl.GetChild(0).NodeType = antIdentifier) then
+        begin
+          VarName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+          case InferExprBank(Decl.GetChild(1)) of
+            srtString: TypeName := 'STRING';
+            srtInt:    TypeName := 'INTEGER';
+          else
+            TypeName := 'DOUBLE';
+          end;
+          Decl.RemoveChildAt(1);   // drop the type-of expression (the child list owns and frees it)
+          Decl.InsertChild(1, TASTNode.CreateWithValue(antIdentifier, TypeName, Decl.GetChild(0).Token));
+          Decl.Attributes.Values['TYPEOF'] := '0';
+          RegisterTypedVar(VarName, TypeName);
+        end;
+        Continue;
+      end;
       // DIM BYREF r AS T = target: a reference variable. Its register carries target's address (int);
       // record the pointee type in FRefVars (drives the auto-deref bank) and force r's bank to INT, so
       // pre-allocation gives it an int register. The "@target" init (child[2]) backs the target via the

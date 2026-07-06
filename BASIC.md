@@ -2010,7 +2010,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `END (Block)` | ✓ |  |
 | `OFFSETOF` | ✗ |  |
 | `SIZEOF` | ✓ | `SizeOf(scalar-type / UDT)` byte size; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`. |
-| `TYPEOF` | ✗ |  |
+| `TYPEOF` | ~ | `DIM AS TypeOf(expr) name` declares a variable with the type inferred from an expression/variable/literal (like VAR without an initializer). The preprocessor `#if TypeOf(a)=TypeOf(b)` form is deferred. |
 | `LET` | ✓ |  |
 | `REM` | ✓ |  |
 | `OPTION()` | ✓ |  |

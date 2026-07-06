@@ -6675,7 +6675,7 @@ end;
 function TPackratParser.ParseDimStatement: TASTNode;
 var
   Token, NameTok, TypeTok, SharedTypeTok: TLexerToken;
-  ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode, FuncPtrSigNode: TASTNode;
+  ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode, FuncPtrSigNode, LeadingTypeOfExpr: TASTNode;
   IsShared, IsByref, LeadingAS, IsTuple: Boolean;
   DimTypeName, SharedTypeName, SharedFixedLen: string;
   SavedIdx, TupleDepth: Integer;
@@ -6686,6 +6686,7 @@ begin
   if UpperCase(VarToStr(Token.Value)) = kSTATIC then Exit(ParseStaticStatement);
   Result := TASTNode.Create(antDim, Token);
   Context.Advance; // Consume DIM
+  LeadingTypeOfExpr := nil;   // set when the leading-AS type is "TypeOf(expr)" (inferred in the SSA pre-pass)
   // M6: "DIM SHARED ..." — the declared variables are module globals visible (read/write) inside
   // SUB/FUNCTION bodies. Marked on each decl with the 'SHARED' attribute for the SSA pre-scan.
   IsShared := Context.Check(ttSharedDecl);
@@ -6705,6 +6706,22 @@ begin
   if LeadingAS then
   begin
     Context.Advance;                          // AS
+    // FreeBASIC "DIM AS TypeOf(expr) name": the type is inferred from an expression. Capture the
+    // expression; each declared name gets it as child[1] with TYPEOF='1' and the concrete type is
+    // resolved in the SSA pre-pass (like VAR's INFER, but with no initializer).
+    if (UpperCase(Context.CurrentToken.Value) = 'TYPEOF') and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttDelimParOpen) then
+    begin
+      SharedTypeTok := Context.CurrentToken;
+      Context.Advance;                        // TYPEOF
+      Context.Advance;                        // '('
+      LeadingTypeOfExpr := FExpressionParser.ParseExpression;
+      if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+      SharedTypeName := 'INTEGER';            // placeholder; replaced by the inferred type in SSA
+      SharedFixedLen := '';
+    end
+    else
+    begin
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected type name after AS', Context.CurrentToken);
@@ -6733,6 +6750,7 @@ begin
         InitExpr.Free;
       end;
     end;
+    end;   // end of the non-TypeOf leading-AS type parse
   end;
 
   // Parse declarations separated by commas. Each is either:
@@ -6832,9 +6850,18 @@ begin
       end;
       ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
       VarNameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
-      TypeNode := TASTNode.CreateWithValue(antIdentifier, DimTypeName, TypeTok);
       ArrayDecl.AddChild(VarNameNode);
-      ArrayDecl.AddChild(TypeNode);          // child[1] is antIdentifier (type) => typed scalar
+      if LeadingAS and Assigned(LeadingTypeOfExpr) then
+      begin
+        // "DIM AS TypeOf(expr) name": child[1] is the expression; the SSA pre-pass infers its type.
+        ArrayDecl.AddChild(LeadingTypeOfExpr.Clone);
+        ArrayDecl.Attributes.Values['TYPEOF'] := '1';
+      end
+      else
+      begin
+        TypeNode := TASTNode.CreateWithValue(antIdentifier, DimTypeName, TypeTok);
+        ArrayDecl.AddChild(TypeNode);        // child[1] is antIdentifier (type) => typed scalar
+      end;
       // Leading-AS fixed-length string capacity ("DIM AS STRING * n name") applies to each name.
       if LeadingAS and (SharedFixedLen <> '') then ArrayDecl.Attributes.Values['FIXEDLEN'] := SharedFixedLen;
       // Transfer a captured function-pointer signature (see above) onto the declaration node.
@@ -6996,6 +7023,7 @@ begin
 
   until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
 
+  if Assigned(LeadingTypeOfExpr) then LeadingTypeOfExpr.Free;   // clones are on each decl; free the original
   DoNodeCreated(Result);
 end;
 
