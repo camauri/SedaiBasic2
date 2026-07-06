@@ -93,6 +93,10 @@ single work, but distributing separate works together (aggregation) is permitted
 | `gaussian_elimination.bas`    | <https://rosettacode.org/wiki/Gaussian_elimination> |
 | `luhn_test.bas`               | <https://rosettacode.org/wiki/Luhn_test_of_credit_card_numbers> |
 | `ludic_numbers.bas`           | <https://rosettacode.org/wiki/Ludic_numbers> |
+| `sequence_of_non_squares.bas` | <https://rosettacode.org/wiki/Sequence_of_non-squares> |
+| `carmichael_3_pseudoprimes.bas` | <https://rosettacode.org/wiki/Carmichael_3_strong_pseudoprimes> |
+| `harshad_niven_series.bas`    | <https://rosettacode.org/wiki/Harshad_or_Niven_series> |
+| `smith_numbers.bas`           | <https://rosettacode.org/wiki/Smith_numbers> |
 
 ## Running
 
