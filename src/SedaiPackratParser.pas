@@ -5044,11 +5044,28 @@ begin
       else HandleError('Expected INPUT/OUTPUT/APPEND/BINARY/RANDOM after FOR', Token);
       Context.Advance;            // mode word
     end;
+    // Optional "ENCODING <string>" clause (FreeBASIC text encoding): accepted; v1 treats file text as an
+    // ASCII/UTF-8 byte passthrough (utf16/utf32 re-encoding of file I/O is not applied).
+    if UpperCase(Context.CurrentToken.Value) = kENCODING then
+    begin
+      Context.Advance;            // ENCODING
+      if Context.Check(ttStringLiteral) then Context.Advance;   // "ascii" / "utf8" / "utf16" / ...
+    end;
     // Optional "ACCESS {READ | WRITE | READ WRITE}" clause (FreeBASIC): accepted and ignored — the VM's
     // file model does not enforce share/access rights.
     if UpperCase(Context.CurrentToken.Value) = kACCESS then
     begin
       Context.Advance;            // ACCESS
+      if UpperCase(Context.CurrentToken.Value) = kREAD then Context.Advance;
+      if UpperCase(Context.CurrentToken.Value) = kWRITE then Context.Advance;
+    end;
+    // Optional lock_type clause (FreeBASIC): "SHARED" or "LOCK {READ|WRITE|READ WRITE}" — accepted and
+    // ignored (single-process VM, no file locking).
+    if UpperCase(Context.CurrentToken.Value) = kSHARED then
+      Context.Advance             // SHARED
+    else if UpperCase(Context.CurrentToken.Value) = kLOCK then
+    begin
+      Context.Advance;            // LOCK
       if UpperCase(Context.CurrentToken.Value) = kREAD then Context.Advance;
       if UpperCase(Context.CurrentToken.Value) = kWRITE then Context.Advance;
     end;

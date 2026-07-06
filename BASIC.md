@@ -2188,7 +2188,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `READ (File Access)` | ✓ | Binary data can only be read from the file. |
 | `WRITE (File Access)` | ✓ | `WRITE #n, ...` writes quoted comma-separated (CSV) values to the file. |
 | `READ WRITE(File Access)` | ✓ | Binary data can be read from and written to the file. |
-| `ENCODING` | ✗ | Specifies the character encoding of a file. |
+| `ENCODING` | ~ | `OPEN ... ENCODING "ascii|utf8|..."` is parsed and accepted; v1 is an ASCII/UTF-8 byte passthrough (utf16/utf32 re-encoding of file I/O is not applied). |
 
 #### Reading from and Writing to Files or Devices
 

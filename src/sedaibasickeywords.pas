@@ -173,6 +173,7 @@ const
   kCATALOG = 'CATALOG';
   kOPEN    = 'OPEN';
   kACCESS  = 'ACCESS';   // FreeBASIC OPEN ... ACCESS {READ|WRITE|READ WRITE}: access-rights clause (accepted/ignored)
+  kENCODING = 'ENCODING'; // FreeBASIC OPEN ... ENCODING "ascii|utf8|utf16|utf32": text encoding (v1: ASCII/UTF-8 passthrough)
   kCLOSE   = 'CLOSE';
   kEOF     = 'EOF';       // FreeBASIC: EOF(#n) -> -1 at end of file
   kFREEFILE = 'FREEFILE'; // FreeBASIC: next free file number (1..15, 0 if none)
