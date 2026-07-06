@@ -7130,8 +7130,11 @@ begin
       SetupGfxScreen(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate);
     26: // bcGfxPset - PSET (x,y), color  (color in Immediate float-free int register; targets the work page)
       if Assigned(FGraphics) then
+      begin
         FGraphics.SetPixel(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
                            UInt32(Ctx.IntRegs[Instr.Immediate]));
+        FDrawPenX := Ctx.IntRegs[Instr.Src1]; FDrawPenY := Ctx.IntRegs[Instr.Src2];  // becomes the current graphics point
+      end;
     27: // bcGfxPoint - POINT(x, y) -> color  (reads the work page)
       if Assigned(FGraphics) then
         Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.GetPixel(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2])))
@@ -7143,18 +7146,32 @@ begin
                        UInt32(Ctx.IntRegs[Instr.Immediate]));
     29: // bcGfxLine - LINE (x1,y1)-(x2,y2),color[,B|BF]  (endpoints mapped through the WINDOW transform)
       if Assigned(FGraphics) then
+      begin
+        GetX2 := Ctx.IntRegs[(Instr.Immediate) and $FFFF];          // logical x2
+        GetY2 := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];   // logical y2
+        // NOSTART (bit 50): "LINE -(x2,y2)" omits the start -> use the current graphics point.
+        if (Instr.Immediate shr 50) and 1 <> 0 then
+        begin
+          GetX1 := FDrawPenX; GetY1 := FDrawPenY;
+        end
+        else
+        begin
+          GetX1 := Ctx.IntRegs[Instr.Src1]; GetY1 := Ctx.IntRegs[Instr.Src2];
+        end;
         case (Instr.Immediate shr 48) and $3 of
-          1: FGraphics.DrawRect(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
-               GfxMapX(Ctx.IntRegs[(Instr.Immediate) and $FFFF]), GfxMapY(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]),
+          1: FGraphics.DrawRect(FGfxWorkSurface, GfxMapX(GetX1), GfxMapY(GetY1),
+               GfxMapX(GetX2), GfxMapY(GetY2),
                UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), False, 1, 0.0);    // B  = box outline
-          2: FGraphics.DrawRect(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
-               GfxMapX(Ctx.IntRegs[(Instr.Immediate) and $FFFF]), GfxMapY(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]),
+          2: FGraphics.DrawRect(FGfxWorkSurface, GfxMapX(GetX1), GfxMapY(GetY1),
+               GfxMapX(GetX2), GfxMapY(GetY2),
                UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), True, 1, 0.0);     // BF = filled box
         else
-          FGraphics.DrawLine(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
-            GfxMapX(Ctx.IntRegs[(Instr.Immediate) and $FFFF]), GfxMapY(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]),
+          FGraphics.DrawLine(FGfxWorkSurface, GfxMapX(GetX1), GfxMapY(GetY1),
+            GfxMapX(GetX2), GfxMapY(GetY2),
             UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), 1);                   // plain line
         end;
+        FDrawPenX := GetX2; FDrawPenY := GetY2;   // the end point becomes the current graphics point
+      end;
     30: // bcGfxCircle - CIRCLE (x,y),r[,color]  (centre mapped; radius scaled by the x-axis WINDOW scale)
       if Assigned(FGraphics) then
       begin

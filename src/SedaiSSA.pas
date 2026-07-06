@@ -8255,6 +8255,7 @@ begin
   if Shape = 'BF' then Flag := 2
   else if Shape = 'B' then Flag := 1
   else Flag := 0;
+  if Node.Attributes.Values['NOSTART'] = '1' then Flag := Flag or 4;   // start = current graphics point
   EmitInstruction(ssaGfxLine, MakeSSAValue(svkNone), X1R, Y1R, X2R);
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(Y2R, nil);

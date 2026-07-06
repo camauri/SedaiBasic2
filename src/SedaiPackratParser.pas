@@ -920,8 +920,9 @@ begin
           Result := ParseLineInputStatement
         // FreeBASIC graphics "LINE (x1,y1)-(x2,y2),color[,B|BF]": LINE is a bare identifier here; the
         // parenthesis after it selects the graphics statement (vs LINE INPUT, vs an assignment to `line`).
+        // A leading '-' also selects it: "LINE -(x2,y2)" omits the start (draws from the current point).
         else if (UpperCase(Token.Value) = kLINE) and Assigned(Context.PeekNext) and
-                (Context.PeekNext.TokenType = ttDelimParOpen) then
+                (Context.PeekNext.TokenType in [ttDelimParOpen, ttOpSub]) then
           Result := ParseGfxLineStatement
         // FreeBASIC "WRITE #n, ...": comma-separated, quoted-string CSV output (WRITE is a bare
         // identifier here; the `#` after it disambiguates from an assignment to a var named `write`).
@@ -5444,11 +5445,23 @@ begin
   Tok := Context.CurrentToken;
   Result := TASTNode.Create(antGfxLine, Tok);
   Context.Advance;                                          // LINE
-  if Context.Check(ttDelimParOpen) then Context.Advance;    // '('
-  Result.AddChild(ParseExpression);                         // x1
-  if Context.Check(ttSeparParam) then Context.Advance;      // ','
-  Result.AddChild(ParseExpression);                         // y1
-  if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+  // FreeBASIC "LINE -(x2,y2)": the start point is omitted, so the line runs from the current graphics
+  // point (the last point plotted by LINE/PSET/DRAW). Placeholder x1/y1 = 0; the VM substitutes the last
+  // point when the NOSTART flag is set.
+  if Context.Check(ttOpSub) then
+  begin
+    Result.Attributes.Values['NOSTART'] := '1';
+    Result.AddChild(TASTNode.CreateWithValue(antLiteral, '0', Tok));   // x1 placeholder
+    Result.AddChild(TASTNode.CreateWithValue(antLiteral, '0', Tok));   // y1 placeholder
+  end
+  else
+  begin
+    if Context.Check(ttDelimParOpen) then Context.Advance;    // '('
+    Result.AddChild(ParseExpression);                         // x1
+    if Context.Check(ttSeparParam) then Context.Advance;      // ','
+    Result.AddChild(ParseExpression);                         // y1
+    if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+  end;
   if Context.Check(ttOpSub) then Context.Advance;           // '-'
   if Context.Check(ttDelimParOpen) then Context.Advance;    // '('
   Result.AddChild(ParseExpression);                         // x2

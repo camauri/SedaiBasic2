@@ -1361,9 +1361,10 @@ begin
       BCInstr.Immediate := BCInstr.Immediate or
         ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
           Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FFFF) shl 32);
-    // shape flag (bits 48-49, a constant — NOT a register)
+    // shape flag (bits 48-50, a constant — NOT a register): bits 0-1 = shape (0/1/2 = line/B/BF),
+    // bit 2 = NOSTART (start point omitted -> use the current graphics point)
     if (Length(Instr.PhiSources) >= 3) and (Instr.PhiSources[2].Value.Kind = svkConstInt) then
-      BCInstr.Immediate := BCInstr.Immediate or ((Int64(Instr.PhiSources[2].Value.ConstInt) and $3) shl 48);
+      BCInstr.Immediate := BCInstr.Immediate or ((Int64(Instr.PhiSources[2].Value.ConstInt) and $7) shl 48);
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;

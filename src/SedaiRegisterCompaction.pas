@@ -1629,7 +1629,7 @@ begin
       end;
     end;
 
-    // bcGfxLine: Immediate [0-15]=x2, [16-31]=y2, [32-47]=color (int regs); bits 48-49 = shape flag (preserved)
+    // bcGfxLine: Immediate [0-15]=x2, [16-31]=y2, [32-47]=color (int regs); bits 48-50 = shape+NOSTART flags (preserved)
     if OpCode = bcGfxLine then
     begin
       // x2 (bits 0-15)
@@ -1644,8 +1644,8 @@ begin
       OldReg := (Instr.Immediate shr 32) and $FFFF;
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
       NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 32);
-      // shape flag (bits 48-49) preserved verbatim
-      NewImm := NewImm or (((Instr.Immediate shr 48) and $3) shl 48);
+      // shape + NOSTART flags (bits 48-50) preserved verbatim
+      NewImm := NewImm or (((Instr.Immediate shr 48) and $7) shl 48);
       if NewImm <> Instr.Immediate then
       begin
         Instr.Immediate := NewImm;
