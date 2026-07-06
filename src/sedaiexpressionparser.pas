@@ -175,12 +175,14 @@ begin
 end;
 
 function StaticParseBase(Parser: Pointer; Token: TLexerToken): TObject;
-// FreeBASIC BASE.field member access inside a derived method: `base` names the base subobject, which in
-// our inheritance model shares the same instance fields as `this`, so lower it to the THIS identifier and
-// let the member-access infix rule resolve `base.field` as `this.field`. (The BASE(args) constructor-call
-// form is a statement, parsed elsewhere, not through this expression prefix rule.)
+// FreeBASIC BASE.field / BASE.method() inside a derived method: `base` names the base subobject, which in
+// our inheritance model shares the same instance fields as `this`, so lower it to the THIS identifier (the
+// member-access infix rule then resolves `base.field` as `this.field`). The BASEREF attribute marks it so
+// a `base.method()` call is dispatched non-virtually against the parent type (a super call), rather than
+// virtually against the instance's runtime type. (The BASE(args) constructor-call form is a statement.)
 begin
   Result := TASTNode.CreateWithValue(antIdentifier, 'THIS', Token);
+  TASTNode(Result).Attributes.Values['BASEREF'] := '1';
 end;
 
 function StaticParseLineNumber(Parser: Pointer; Token: TLexerToken): TObject;

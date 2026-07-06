@@ -1329,7 +1329,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `Temporary Types` | ✗ | Creates a temporary copy of a user defined type |
 | `THIS` | ✓ | Implicit first parameter of methods/constructors/destructors (M4.1): the instance handle. `THIS.field` reads/writes fields; used to resolve the method's owner type |
-| `BASE (member access)` | ✓ | `base.field` reads/writes the inherited base field in a derived method (lowered to `this.field`). `base.method()` non-virtual base calls are a v1 limitation. |
+| `BASE (member access)` | ✓ | `base.field` reads/writes the inherited base field, and `base.method()` is a non-virtual super call to the parent type's method (SUB/FUNCTION, with args/return), inside a derived method. |
 | `Type Alias` | ✓ | `TYPE newname AS underlyingtype` — synonym for a builtin or UDT; resolved via CanonicalType (chained aliases, narrowing, and alias-to-UDT supported). |
 | `WITH` | ✓ | `WITH rec` ... `END WITH`: leading `.field` resolves against the record (M3.2) |
 

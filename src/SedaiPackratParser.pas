@@ -825,9 +825,19 @@ begin
         Result := Memoize('FnStatement', @ParseFnStatement);
     ttCallSub: Result := Memoize('CallStatement', @ParseCallStatement);
     ttBaseCall:
-      // "base.field = expr" (member assignment) vs "BASE(args)" (base-constructor call).
+      // "base.field = expr" (member assignment) or "base.method()" (super call) vs "BASE(args)"
+      // (base-constructor call). ParseAssignmentStatement returns nil for a member call (no '='), so
+      // fall back to an expression statement which emits the call.
       if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpDot) then
-        Result := Memoize('AssignmentStatement', @ParseAssignmentStatement)
+      begin
+        Context.SavePosition(SavedIndex);
+        Result := ParseAssignmentStatement;
+        if not Assigned(Result) then
+        begin
+          Context.RestorePosition(SavedIndex);   // assignment consumed the LHS; rewind before the call form
+          Result := ParseExpressionStatement;
+        end;
+      end
       else
         Result := Memoize('BaseStatement', @ParseBaseStatement);
     ttThreadWait: Result := Memoize('ThreadWaitStatement', @ParseThreadWaitStatement);

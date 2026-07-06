@@ -377,7 +377,7 @@ type
     // FreeBASIC "Operator T.Cast() As String": if Node is a UDT with a string cast, invoke it -> string.
     function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
     procedure ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
-                                ArgsNode: TASTNode; out Result: TSSAValue);
+                                ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic: Boolean = False);
     function TryStaticMethodCall(ObjNode: TASTNode; const MethNm: string;     // TypeName.method(args) (static member, no instance)
                                  ArgsNode: TASTNode; out CallResult: TSSAValue): Boolean;
     // Map parameter at Index (within ParamList) to its transfer-bank type and per-bank slot.
@@ -3723,6 +3723,20 @@ begin
           MethodOwnerType := ObjectTypeName(MethodObjNode);
           if MethodOwnerType <> '' then
           begin
+            // FreeBASIC "base.method()" super call: dispatch non-virtually against the parent type (the
+            // object is `this` marked BASEREF). Resolves the parent's method and calls it directly, so a
+            // derived override does not re-invoke itself.
+            if MethodObjNode.Attributes.Values['BASEREF'] = '1' then
+            begin
+              ArrayIdx := FindUDT(MethodOwnerType);
+              if ArrayIdx >= 0 then TempStr := FUDTs[ArrayIdx].Parent else TempStr := '';
+              if (TempStr <> '') and (ResolveMethodLabel(TempStr, VarToStr(Node.GetChild(0).Value)) <> '') then
+              begin
+                ProcessMethodCall(MethodObjNode, TempStr, VarToStr(Node.GetChild(0).Value),
+                                  Node.GetChild(1), Result, True);
+                Exit;
+              end;
+            end;
             MethodLabelName := ResolveMethodLabel(MethodOwnerType, VarToStr(Node.GetChild(0).Value));
             if MethodLabelName <> '' then
             begin
@@ -16164,7 +16178,7 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
-  ArgsNode: TASTNode; out Result: TSSAValue);
+  ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic: Boolean = False);
 // Lower obj.method(args): pass the object handle as the implicit THIS first argument, then the
 // declared args. A monomorphic call goes straight to the resolved method; a polymorphic one goes
 // through a generated virtual dispatcher (chosen by the instance's runtime type-id). Read the
@@ -16203,14 +16217,14 @@ begin
     StageCallArgs(MethodLabel, TmpArgs);                 // THIS + declared args (base signature)
     if RetRecType <> '' then
       EmitXferStore(srtInt, XFER_RESULT_HANDLE_SLOT, RcHandle);
-    if MethodNeedsDispatch(ObjType, MethNm) then
+    if (not ForceStatic) and MethodNeedsDispatch(ObjType, MethNm) then
     begin
       // Polymorphic: call the virtual dispatcher (it forwards the staged args + result handle).
       FNeededDispatchers.Add(UpperCase(ObjType) + '|' + UpperCase(MethNm));
       EmitCallSubLabel(ProcedureLabelName('VDISP.' + UpperCase(ObjType) + '.' + UpperCase(MethNm)));
     end
     else
-      EmitCallSubLabel(ProcedureLabelName(MethodLabel));  // monomorphic: direct static call
+      EmitCallSubLabel(ProcedureLabelName(MethodLabel));  // monomorphic / super call: direct static call
     // BYREF: copy explicit-BYREF scalar params back into variable args. TmpArgs aligns 1:1 with the
     // method's params (THIS at index 0, never BYREF), so the shared writeback helper works as-is.
     EmitByrefWriteback(MethodLabel, TmpArgs);
