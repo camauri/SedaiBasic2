@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 515 / 643 implemented (80%)** (+ 1 partial). **66** of the unimplemented
+**FreeBASIC keyword set — 516 / 643 implemented (80%)** (+ 1 partial). **66** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, FFI) — not runnable keywords for a portable bytecode VM. Of the
-**577 applicable** keywords, **515 (89%)** are implemented. See the
+**577 applicable** keywords, **516 (89%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -2474,8 +2474,6 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `PSET and PRESET` | ◐ | `PSET (x,y),color` plots a pixel on the screen surface (via IGraphicsBackend; headless-testable + on-screen on sbv). `PRESET` and the image-buffer target deferred. |
-| `DRAW` | ✓ | FreeBASIC graphics macro language `DRAW "C15 M50,50 R10 D10 ..."` (C/S/A, M abs+relative, U/D/L/R, E/F/G/H, B/N prefixes); tracks the pen for `POINTCOORD`. |
-| `POINTCOORD` | ✓ | `POINTCOORD(0)`/`POINTCOORD(1)` — the DRAW pen x / y. |
 | `LINE (GRAPHICS)` | ✓ | `LINE (x1,y1)-(x2,y2)[,color][,B\|BF]` draws a line, box outline (B) or filled box (BF) on the screen surface (via IGraphicsBackend; headless-testable + on-screen on sbv). Parenthesised form disambiguates from `LINE INPUT`. Leading start-coordinate / STEP / line-style and the image-buffer target deferred. |
 | `CIRCLE` | ✓ | Plots circles and ellipses. C128 form (`CIRCLE source,x,y,...`) and FreeBASIC form (`CIRCLE (x,y),r[,color]`, parenthesised → routed through IGraphicsBackend, headless-testable + on-screen on sbv). FB ellipse/arc/aspect arguments deferred. |
 | `DRAW` | ✓ | Draws in a sequence of commands on an image buffer or screen. |
