@@ -6562,7 +6562,7 @@ begin
       end;
     4: // bcPrintInt
       begin
-        PrintStr := FConsoleBehavior.FormatNumber(Ctx.IntRegs[Instr.Src1]);
+        PrintStr := FConsoleBehavior.FormatInt(Ctx.IntRegs[Instr.Src1]);  // exact 64-bit (no Double rounding above 2^53)
         if (FCmdHandle > 0) and Assigned(FOnFileData) then
           FOnFileData(Self, 'PRINT#', FCmdHandle, PrintStr, CmdErr)
         else if Assigned(FOutputDevice) then
@@ -6573,7 +6573,7 @@ begin
       end;
     5: // bcPrintIntLn
       begin
-        PrintStr := FConsoleBehavior.FormatNumber(Ctx.IntRegs[Instr.Src1]);
+        PrintStr := FConsoleBehavior.FormatInt(Ctx.IntRegs[Instr.Src1]);  // exact 64-bit (no Double rounding above 2^53)
         if (FCmdHandle > 0) and Assigned(FOnFileData) then
         begin
           FOnFileData(Self, 'PRINT#', FCmdHandle, PrintStr, CmdErr);
@@ -8304,7 +8304,7 @@ begin
           Dest = int register (value to print)
           Src1 = file handle register (int) }
         HandleNum := Ctx.IntRegs[Instr.Src1];
-        Data := FConsoleBehavior.FormatNumber(Ctx.IntRegs[Instr.Dest]);
+        Data := FConsoleBehavior.FormatInt(Ctx.IntRegs[Instr.Dest]);  // exact 64-bit (no Double rounding above 2^53)
         if Assigned(FOnFileData) then
         begin
           FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);

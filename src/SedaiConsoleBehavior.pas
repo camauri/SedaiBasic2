@@ -157,6 +157,10 @@ type
     { Formatta un intero senza segno a 64 bit (B1.5: UInteger/ULongInt), valore sempre >= 0 }
     function FormatUInt(Value: QWord): string;
 
+    { Formatta un intero con segno a 64 bit in modo esatto. Come FormatNumber ma senza il passaggio
+      per Double (che perde precisione oltre 2^53): un Integer/LongInt grande deve stampare esatto. }
+    function FormatInt(Value: Int64): string;
+
     { Formatta una stringa secondo le regole correnti }
     function FormatString(const S: string): string;
 
@@ -456,6 +460,36 @@ begin
       end;
   end;
   Result := Prefix + UIntToStr(Value) + Suffix;
+end;
+
+function TConsoleBehavior.FormatInt(Value: Int64): string;
+// Exact signed 64-bit formatting with the same PRINT spacing as FormatNumber, but without routing the
+// value through a Double (which rounds integers above 2^53). Non-negative gets the leading space that
+// stands in for the sign; a negative value already carries its '-'.
+var
+  Prefix, Suffix: string;
+  NonNeg: Boolean;
+begin
+  Prefix := '';
+  Suffix := '';
+  NonNeg := Value >= 0;
+  case FNumberFormat of
+    nfCommodore, nfMSX:
+      begin
+        if NonNeg then Prefix := ' ';   // leading space in place of the sign
+        Suffix := ' ';
+      end;
+    nfSpectrum:
+      begin Prefix := ''; Suffix := ''; end;
+    nfAtari:
+      begin Prefix := ''; Suffix := ' '; end;
+    nfCustom:
+      begin
+        if FNumberSpaceBefore and NonNeg then Prefix := ' ';
+        if FNumberSpaceAfter then Suffix := ' ';
+      end;
+  end;
+  Result := Prefix + IntToStr(Value) + Suffix;
 end;
 
 function TConsoleBehavior.FormatString(const S: string): string;
