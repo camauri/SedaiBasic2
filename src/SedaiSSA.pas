@@ -448,6 +448,7 @@ type
     procedure ProcessGfxLine(Node: TASTNode);     // LINE (x1,y1)-(x2,y2) [,color] [,B|BF]
     procedure ProcessGfxCircle(Node: TASTNode);   // CIRCLE (x, y), r [, color]
     procedure ProcessPalette(Node: TASTNode);      // PALETTE [GET] [index, r, g, b] / reset
+    function  ScalePaletteComponent(const PackedReg: TSSAValue; Shift: Integer): TSSAValue;  // ((c shr n) and 63)*255 div 63
     procedure ProcessGfxColor(Node: TASTNode);     // COLOR [fg][,bg] (FreeBASIC draw colour)
     function  DefaultDrawColorReg: TSSAValue;       // omitted-colour default = current draw foreground
     procedure EmitStepRelative(var XReg, YReg: TSSAValue; const BaseX, BaseY: TSSAValue);  // STEP: coord += base
@@ -8365,12 +8366,13 @@ procedure TSSAGenerator.ProcessGfxLine(Node: TASTNode);
 // the second is relative to the FIRST point (x1,y1) — or to the current point when the start is
 // omitted ("LINE -STEP(...)"). Resolved to absolute coordinates here via pen reads + integer adds.
 var
-  X1V, Y1V, X2V, Y2V, CV: TSSAValue;
-  X1R, Y1R, X2R, Y2R, CR: TSSAValue;
+  X1V, Y1V, X2V, Y2V, CV, StV: TSSAValue;
+  X1R, Y1R, X2R, Y2R, CR, StyR: TSSAValue;
   BaseX, BaseY, PenX, PenY: TSSAValue;
   Instr: TSSAInstruction;
   Shape: string;
   Flag: Int64;
+  StyleIdx, StyleCode: Integer;
   NoStart, Step1, Step2, HasTarget: Boolean;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 4) then Exit;
@@ -8394,7 +8396,7 @@ begin
     else begin BaseX := X1R; BaseY := Y1R; end;
     EmitStepRelative(X2R, Y2R, BaseX, BaseY);
   end;
-  if EffChildCount(Node) >= 5 then
+  if Node.Attributes.Values['HASCOLOR'] = '1' then
   begin
     ProcessExpression(Node.GetChild(4), CV); CR := EnsureIntRegister(CV);
   end
@@ -8404,8 +8406,26 @@ begin
   if Shape = 'BF' then Flag := 2
   else if Shape = 'B' then Flag := 1
   else Flag := 0;
-  if NoStart then Flag := Flag or 4;   // start = current graphics point
   HasTarget := EmitDrawTargetBegin(Node);
+  // Styled (dashed) line/box: a style mask selects the styled opcode. BF (filled box) ignores the style.
+  if (Node.Attributes.Values['STYLEIDX'] <> '') and (Shape <> 'BF') then
+  begin
+    Val(Node.Attributes.Values['STYLEIDX'], StyleIdx, StyleCode);
+    if (StyleCode = 0) and (StyleIdx >= 0) and (StyleIdx < Node.ChildCount) then
+    begin
+      if NoStart then EmitPenCoordRegs(X1R, Y1R);   // "LINE -(x2,y2),,,style": start = current point
+      ProcessExpression(Node.GetChild(StyleIdx), StV); StyR := EnsureIntRegister(StV);
+      EmitInstruction(ssaGfxLineStyled, MakeSSAValue(svkNone), X1R, Y1R, X2R);
+      Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+      Instr.AddPhiSource(Y2R, nil);
+      Instr.AddPhiSource(CR, nil);
+      Instr.AddPhiSource(StyR, nil);
+      Instr.AddPhiSource(MakeSSAConstInt(Flag), nil);   // 0=line, 1=box outline
+      if HasTarget then EmitDrawTargetEnd;
+      Exit;
+    end;
+  end;
+  if NoStart then Flag := Flag or 4;   // start = current graphics point
   EmitInstruction(ssaGfxLine, MakeSSAValue(svkNone), X1R, Y1R, X2R);
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(Y2R, nil);
@@ -8505,6 +8525,26 @@ begin
   if HasTarget then EmitDrawTargetEnd;
 end;
 
+function TSSAGenerator.ScalePaletteComponent(const PackedReg: TSSAValue; Shift: Integer): TSSAValue;
+// Extract a 6-bit (0-63) colour component from a packed PALETTE value at the given bit shift and scale it
+// to 0-255: ((packed shr shift) and &h3F) * 255 div 63. All integer ops.
+var
+  Shifted, Masked, Scaled: TSSAValue;
+begin
+  Shifted := PackedReg;
+  if Shift > 0 then
+  begin
+    Shifted := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaShr, Shifted, PackedReg, EnsureIntRegister(MakeSSAConstInt(Shift)), MakeSSAValue(svkNone));
+  end;
+  Masked := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Masked, Shifted, EnsureIntRegister(MakeSSAConstInt($3F)), MakeSSAValue(svkNone));
+  Scaled := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaMulInt, Scaled, Masked, EnsureIntRegister(MakeSSAConstInt(255)), MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaDivInt, Result, Scaled, EnsureIntRegister(MakeSSAConstInt(63)), MakeSSAValue(svkNone));
+end;
+
 procedure TSSAGenerator.ProcessPalette(Node: TASTNode);
 // PALETTE (FreeBASIC). OP attribute selects the form:
 //   RESET -> ssaGfxPaletteReset (no operands).
@@ -8526,6 +8566,27 @@ begin
   if Op = 'RESET' then
   begin
     EmitInstruction(ssaGfxPaletteReset, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+
+  // SETPACKED: PALETTE index, &hBBGGRR — a single packed value, components BGR each 0-63 (QB compat).
+  // Decode red = c and &h3F, green = (c shr 8) and &h3F, blue = (c shr 16) and &h3F, scale 0-63 -> 0-255
+  // (c*255 div 63), then pack ABGR like the 4-component SET form.
+  if Op = 'SETPACKED' then
+  begin
+    if Node.ChildCount < 2 then Exit;
+    ProcessExpression(Node.GetChild(0), IdxV); IdxR := EnsureIntRegister(IdxV);
+    ProcessExpression(Node.GetChild(1), RV);   ColorReg := EnsureIntRegister(RV);   // packed BGR value
+    RV := ScalePaletteComponent(ColorReg, 0);    // red   (0-255)
+    GV := ScalePaletteComponent(ColorReg, 8);    // green
+    BV := ScalePaletteComponent(ColorReg, 16);   // blue
+    AReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, AReg, MakeSSAConstInt(255), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    ColorReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaGraphicRGBA, ColorReg, BV, GV, RV);   // (B,G,R) -> ABGR packing
+    Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+    Instr.AddPhiSource(AReg, nil);
+    EmitInstruction(ssaGfxPalette, MakeSSAValue(svkNone), IdxR, ColorReg, MakeSSAValue(svkNone));
     Exit;
   end;
 

@@ -4322,10 +4322,11 @@ begin
     Exit;
   end;
 
-  // FreeBASIC PALETTE — three v1 forms (the QB-compat &hBBGGRR 2-arg form and PALETTE USING deferred):
-  //   PALETTE                       -> reset the palette to the mode default          (OP=RESET)
-  //   PALETTE index, r, g, b        -> set entry index to (r,g,b), components 0-255   (OP=SET)
-  //   PALETTE GET index, r, g, b    -> read entry index into the r, g, b variables    (OP=GET)
+  // FreeBASIC PALETTE — forms (PALETTE USING deferred):
+  //   PALETTE                       -> reset the palette to the mode default              (OP=RESET)
+  //   PALETTE index, r, g, b        -> set entry index to (r,g,b), components 0-255       (OP=SET)
+  //   PALETTE index, &hBBGGRR       -> set entry from a packed BGR value, components 0-63 (OP=SETPACKED)
+  //   PALETTE GET index, r, g, b    -> read entry index into the r, g, b variables        (OP=GET)
   if Result.NodeType = antPalette then
   begin
     if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
@@ -4341,11 +4342,16 @@ begin
         Result.Attributes.Values['OP'] := 'SET';
       Result.AddChild(ParseExpression);                           // index
       if Context.Check(ttSeparParam) then Context.Advance;        // ','
-      Result.AddChild(ParseExpression);                           // r (or r-variable for GET)
-      if Context.Check(ttSeparParam) then Context.Advance;        // ','
-      Result.AddChild(ParseExpression);                           // g
-      if Context.Check(ttSeparParam) then Context.Advance;        // ','
-      Result.AddChild(ParseExpression);                           // b
+      Result.AddChild(ParseExpression);                           // r / packed BGR colour (or r-variable for GET)
+      if Context.Check(ttSeparParam) then
+      begin
+        Context.Advance;                                          // ','
+        Result.AddChild(ParseExpression);                         // g
+        if Context.Check(ttSeparParam) then Context.Advance;      // ','
+        Result.AddChild(ParseExpression);                         // b
+      end
+      else if Result.Attributes.Values['OP'] = 'SET' then
+        Result.Attributes.Values['OP'] := 'SETPACKED';            // 2-arg form: PALETTE index, &hBBGGRR
     end;
     DoNodeCreated(Result);
     Exit;
@@ -5579,36 +5585,42 @@ begin
   Result.AddChild(ParseExpression);                         // y2
   if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
 
-  // Optional trailing fields: [,color] [,B|BF]. FB puts colour first; a lone ",B"/",BF" (colour omitted)
-  // is also accepted for convenience, as is the faithful ",,B"/",,BF".
+  // Optional trailing fields: [,color] [,B|BF] [,style]. FB puts colour first; a lone ",B"/",BF" (colour
+  // omitted) is also accepted for convenience. `style` is a 16-bit line-style bitmask (dashed line).
   if Context.Check(ttSeparParam) then
   begin
     Context.Advance;                                        // first ','
     IsFlagToken := Context.Check(ttIdentifier) and
-      ((UpperCase(Context.CurrentToken.Value) = 'B') or (UpperCase(Context.CurrentToken.Value) = 'BF')) and
-      (not Assigned(Context.PeekNext) or
-       (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]));
+      ((UpperCase(Context.CurrentToken.Value) = 'B') or (UpperCase(Context.CurrentToken.Value) = 'BF'));
     if IsFlagToken then
     begin
       Result.Attributes.Values['SHAPE'] := UpperCase(Context.CurrentToken.Value);
       Context.Advance;
     end
-    else
+    else if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
     begin
-      if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
-        Result.AddChild(ParseExpression);                   // color
-      if Context.Check(ttSeparParam) then
+      Result.AddChild(ParseExpression);                     // color
+      Result.Attributes.Values['HASCOLOR'] := '1';
+    end;
+    // second field: B|BF (only when the first field was the colour, not the lone flag)
+    if (not IsFlagToken) and Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;                                      // second ','
+      if Context.Check(ttIdentifier) and
+         ((UpperCase(Context.CurrentToken.Value) = 'B') or (UpperCase(Context.CurrentToken.Value) = 'BF')) then
       begin
-        Context.Advance;                                    // second ','
-        if Context.Check(ttIdentifier) then
-        begin
-          FlagStr := UpperCase(Context.CurrentToken.Value);
-          if (FlagStr = 'B') or (FlagStr = 'BF') then
-          begin
-            Result.Attributes.Values['SHAPE'] := FlagStr;
-            Context.Advance;
-          end;
-        end;
+        Result.Attributes.Values['SHAPE'] := UpperCase(Context.CurrentToken.Value);
+        Context.Advance;
+      end;
+    end;
+    // third field: style (a 16-bit bitmask). STYLEIDX records the child index of the style expression.
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;                                      // ',' before style
+      if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+      begin
+        Result.Attributes.Values['STYLEIDX'] := IntToStr(Result.ChildCount);
+        Result.AddChild(ParseExpression);                   // style mask
       end;
     end;
   end;

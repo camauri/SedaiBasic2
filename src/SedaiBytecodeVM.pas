@@ -7519,6 +7519,26 @@ begin
       end
       else
         FGfxDrawTargetActive := False;
+    62: // bcGfxLineStyled - LINE (x1,y1)-(x2,y2),color,[B],style : styled (dashed) line or box outline.
+        // Src1=x1, Src2=y1, Dest=x2; Immediate [0-15]=y2, [16-31]=color, [32-47]=style, [48-49]=shape.
+      if Assigned(FGraphics) then
+      begin
+        GetX1 := GfxMapX(Ctx.IntRegs[Instr.Src1]); GetY1 := GfxMapY(Ctx.IntRegs[Instr.Src2]);
+        GetX2 := GfxMapX(Ctx.IntRegs[Instr.Dest]); GetY2 := GfxMapY(Ctx.IntRegs[(Instr.Immediate) and $FFFF]);
+        GetSx := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];         // colour
+        GetSy := Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF] and $FFFF;   // style mask (16-bit)
+        if ((Instr.Immediate shr 48) and $3) = 1 then
+        begin
+          // B: styled box outline = four styled edges (pattern restarts on each edge).
+          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY1, GetX2, GetY1, UInt32(GetSx), Word(GetSy));
+          FGraphics.DrawLineStyled(DrawSurface, GetX2, GetY1, GetX2, GetY2, UInt32(GetSx), Word(GetSy));
+          FGraphics.DrawLineStyled(DrawSurface, GetX2, GetY2, GetX1, GetY2, UInt32(GetSx), Word(GetSy));
+          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY2, GetX1, GetY1, UInt32(GetSx), Word(GetSy));
+        end
+        else
+          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY1, GetX2, GetY2, UInt32(GetSx), Word(GetSy));
+        FDrawPenX := Ctx.IntRegs[Instr.Dest]; FDrawPenY := Ctx.IntRegs[(Instr.Immediate) and $FFFF];
+      end;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

@@ -486,7 +486,7 @@ begin
     bcGraphicWindow,  // Src1 = col1 register (int)
     bcGraphicCircle,  // Src1 = color register (int)
     bcGraphicPaint,   // Src1 = source register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxCircle, bcGfxCircleEx,
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled, bcGfxCircle, bcGfxCircleEx,
     bcGfxSetTarget,  // SETTARGET: Src1 = image handle (int)  // FreeBASIC graphics: Src1 = w / x / x1 (int)
     bcGfxPalette, bcGfxPalGet,  // PALETTE: Src1 = index (int)
     bcGfxColor,  // COLOR: Src1 = foreground (int)
@@ -648,7 +648,7 @@ begin
     bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
     bcGraphicWindow,  // Src2 = row1 register (int)
     bcGraphicCircle,  // Src2 = x register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxCircle, bcGfxCircleEx,  // FreeBASIC graphics: Src2 = h / y / y1 (int)
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled, bcGfxCircle, bcGfxCircleEx,  // FreeBASIC graphics: Src2 = h / y / y1 (int)
     bcGfxPalette,  // PALETTE set: Src2 = packed colour (int)
     bcGfxColor,  // COLOR: Src2 = background (int)
     bcGfxImageCreate,  // IMAGECREATE: Src2 = h (int)
@@ -1109,6 +1109,16 @@ begin
     begin
       MarkIntRegUsed(Instr.Immediate and $FFFF);            // color
       MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);   // border
+    end;
+
+    // LINE styled: Dest=x2 (an input, not a def); Immediate [0-15]=y2, [16-31]=color, [32-47]=style
+    // (all int regs; bits 48-49 = shape flag). Dest handled here, NOT via the Dest-def lists.
+    if OpCode = bcGfxLineStyled then
+    begin
+      MarkIntRegUsed(Instr.Dest);                            // x2
+      MarkIntRegUsed(Instr.Immediate and $FFFF);            // y2
+      MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);   // color
+      MarkIntRegUsed((Instr.Immediate shr 32) and $FFFF);   // style
     end;
 
     // CIRCLE (ellipse/arc): Dest=RX (an input, not a def); Immediate [0-15]=RY, [16-31]=color,
@@ -1697,6 +1707,30 @@ begin
       OldReg := (Instr.Immediate shr 16) and $FFFF;
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
       NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 16);
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
+      end;
+    end;
+
+    // bcGfxLineStyled: Dest=x2 (an input slot); Immediate [0-15]=y2, [16-31]=color, [32-47]=style
+    // (int regs; bits 48-49 = shape flag, preserved). Dest remapped as an input (NOT in the Dest-def lists).
+    if OpCode = bcGfxLineStyled then
+    begin
+      OldReg := Instr.Dest;                                  // x2
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) and (FIntRegMap[OldReg] <> OldReg) then
+      begin Instr.Dest := FIntRegMap[OldReg]; Modified := True; end;
+      OldReg := Instr.Immediate and $FFFF;                  // y2
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewReg and $FFFF;
+      OldReg := (Instr.Immediate shr 16) and $FFFF;         // color
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 16);
+      OldReg := (Instr.Immediate shr 32) and $FFFF;         // style
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 32);
+      NewImm := NewImm or (((Instr.Immediate shr 48) and $3) shl 48);   // shape flag preserved
       if NewImm <> Instr.Immediate then
       begin
         Instr.Immediate := NewImm;

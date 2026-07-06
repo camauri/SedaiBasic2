@@ -66,6 +66,7 @@ type
     procedure SetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     function  GetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;   // POINT / GET (deterministic)
     procedure DrawLine(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; LineWidth: Integer);
+    procedure DrawLineStyled(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Style: Word);  // LINE ...,style (dashed)
     procedure DrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
     procedure DrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
     procedure Fill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);   // flood fill (PAINT)
@@ -106,6 +107,7 @@ type
     procedure SetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     function  GetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;
     procedure DrawLine(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; LineWidth: Integer);
+    procedure DrawLineStyled(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Style: Word);  // LINE ...,style (dashed)
     procedure DrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
     procedure DrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
     procedure Fill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
@@ -270,6 +272,42 @@ begin
   M := MemoryOf(Surface);
   if Assigned(M) then
     DrawLineToMemory(M, X1, Y1, X2, Y2, Color, False, LineWidth, M.State.Width, M.State.Height);
+end;
+
+procedure TSoftwareGraphicsBackend.DrawLineStyled(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Style: Word);
+// FreeBASIC styled (dashed) line: a 16-bit pattern applied along the line. Starting at (x1,y1), the
+// MOST-SIGNIFICANT bit is checked first (pixel 0 -> bit 15, pixel 1 -> bit 14, ..., pixel 15 -> bit 0),
+// then the mask is reused. A set bit draws the pixel; a clear bit skips it. Bresenham, one pixel per step.
+var
+  M: TGraphicsMemory;
+  DX, DY, SX, SY, Err, E2, Idx: Integer;
+begin
+  M := MemoryOf(Surface);
+  if not Assigned(M) then Exit;
+  DX := Abs(X2 - X1);
+  DY := -Abs(Y2 - Y1);
+  if X1 < X2 then SX := 1 else SX := -1;
+  if Y1 < Y2 then SY := 1 else SY := -1;
+  Err := DX + DY;
+  Idx := 0;
+  while True do
+  begin
+    if ((Style shr (15 - (Idx and 15))) and 1) <> 0 then
+      M.SetPixel(X1, Y1, Color);
+    Inc(Idx);
+    if (X1 = X2) and (Y1 = Y2) then Break;
+    E2 := 2 * Err;
+    if E2 >= DY then
+    begin
+      if X1 = X2 then Break;
+      Err := Err + DY; X1 := X1 + SX;
+    end;
+    if E2 <= DX then
+    begin
+      if Y1 = Y2 then Break;
+      Err := Err + DX; Y1 := Y1 + SY;
+    end;
+  end;
 end;
 
 procedure TSoftwareGraphicsBackend.DrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);

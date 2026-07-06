@@ -655,6 +655,9 @@ const
   // Per-statement image draw target ("PSET img,(x,y)"): Src1=image handle reg; Immediate bit 0 = active (1=set,
   // 0=clear -> back to the work page). The following draw op(s) target the image; emitted before/after them.
   bcGfxSetTarget    = bcGroupGraphics + 61;
+  // LINE with a style mask (dashed): Src1=x1, Src2=y1, Dest=x2; Immediate[0-15]=y2, [16-31]=color,
+  // [32-47]=style (all int regs), [48-49]=shape flag (0=line, 1=box outline).
+  bcGfxLineStyled   = bcGroupGraphics + 62;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1779,6 +1782,7 @@ begin
         59: Result := 'GfxCircleEx';
         60: Result := 'GfxPaintBorder';
         61: Result := 'GfxSetTarget';
+        62: Result := 'GfxLineStyled';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

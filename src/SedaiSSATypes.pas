@@ -255,6 +255,7 @@ type
     ssaGfxCircleEx,    // CIRCLE (x,y),r,c,start,end,aspect (ellipse / arc; Src3=RX, Immediate=RY|color|start°|end°)
     ssaGfxPaintBorder, // PAINT (x,y),color,border (boundary fill; Src1=x, Src2=y, Src3=color, PhiSources[0]=border)
     ssaGfxSetTarget,   // set/clear the per-statement image draw target (Src1=handle, Src3=active flag const)
+    ssaGfxLineStyled,  // LINE with a style mask (Src1=x1, Src2=y1, Src3=x2, PhiSources y2|color|style|shape)
     ssaGfxPalette,     // PALETTE index, r, g, b : set a palette entry (Src1=index, Src2=packed color)
     ssaGfxPalGet,      // __PALGET(index, which) -> palette component (Dest=result, Src1=index, Immediate=which)
     ssaGfxPaletteReset,// PALETTE (no args) : reset the palette to the mode default
