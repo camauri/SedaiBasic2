@@ -353,6 +353,11 @@ const
   kENVIRON = 'ENVIRON';  kENVIRONS = 'ENVIRON$';  // FreeBASIC: ENVIRON$(name) -> env var value
   kEXEPATH = 'EXEPATH';                            // FreeBASIC: directory of the running program
   kCOMMAND = 'COMMAND';  kCOMMANDS = 'COMMAND$';   // FreeBASIC: COMMAND$([index]) -> command-line argument(s)
+  kSETENVIRON = 'SETENVIRON';                      // FreeBASIC: SETENVIRON "NAME=value" -> set an environment variable
+  kSHELL   = 'SHELL';                              // FreeBASIC: SHELL cmd -> run a command (statement); SHELL(cmd) -> exit code
+  kLPRINT  = 'LPRINT';                             // FreeBASIC: LPRINT ... -> print to the line printer (routed to stdout here)
+  kLPOS    = 'LPOS';                               // FreeBASIC: LPOS(n) -> line-printer head column
+  kISREDIRECTED = 'ISREDIRECTED';                  // FreeBASIC: ISREDIRECTED(n) -> is a standard stream redirected?
   kMACROFUNCTION   = '__FUNCTION__';    // FreeBASIC: quoted name of the current function block (intrinsic macro string)
   kMACROFUNCTIONNQ = '__FUNCTION_NQ__'; // FreeBASIC: non-quoted name of the current function block
   kFBMAINPROC      = '__FB_MAINPROC__'; // FreeBASIC: __FUNCTION__ value when used at module level (main module)

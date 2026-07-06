@@ -535,6 +535,8 @@ type
     procedure ProcessRenameFile(Node: TASTNode);
     procedure ProcessConcat(Node: TASTNode);
     procedure ProcessMkdir(Node: TASTNode);
+    procedure ProcessSetenviron(Node: TASTNode);
+    procedure ProcessShell(Node: TASTNode);
     procedure ProcessChdir(Node: TASTNode);
     procedure ProcessRmdir(Node: TASTNode);
     procedure ProcessMoveFile(Node: TASTNode);
@@ -3947,6 +3949,26 @@ begin
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
           EmitInstruction(ssaEnviron, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC LPOS(n): the line-printer head column. This portable VM has no printer (LPRINT is routed
+        // to stdout), so the head is always at column 1. Evaluate and discard the argument.
+        if FModernMode and (UpperCase(ArrName) = kLPOS) and (ArrayIndexOf(ArrName) < 0) then
+        begin
+          if Node.GetChild(1).ChildCount >= 1 then ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC ISREDIRECTED(n): whether a standard stream is redirected. Portable default: not
+        // redirected (0). Evaluate and discard the argument.
+        if FModernMode and (UpperCase(ArrName) = kISREDIRECTED) and (ArrayIndexOf(ArrName) < 0) then
+        begin
+          if Node.GetChild(1).ChildCount >= 1 then ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
         end;
 
@@ -12422,6 +12444,28 @@ begin
                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
+procedure TSSAGenerator.ProcessSetenviron(Node: TASTNode);
+// SETENVIRON "NAME=value": set an environment variable for the process. Src1 = the string.
+var
+  Val, Reg: TSSAValue;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 1) then Exit;
+  ProcessExpression(Node.GetChild(0), Val);
+  Reg := EnsureStringRegister(Val);
+  EmitInstruction(ssaSetEnviron, MakeSSAValue(svkNone), Reg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.ProcessShell(Node: TASTNode);
+// SHELL cmd: run a command through the system shell (statement form; the exit code is discarded here).
+var
+  Val, Reg: TSSAValue;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 1) then Exit;
+  ProcessExpression(Node.GetChild(0), Val);
+  Reg := EnsureStringRegister(Val);
+  EmitInstruction(ssaShell, MakeSSAValue(svkNone), Reg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
 procedure TSSAGenerator.ProcessChdir(Node: TASTNode);
 var
   PathVal: TSSAValue;
@@ -17512,6 +17556,8 @@ begin
     antRenameFile: ProcessRenameFile(Node);
     antConcat: ProcessConcat(Node);
     antMkdir: ProcessMkdir(Node);
+    antSetenviron: ProcessSetenviron(Node);
+    antShell: ProcessShell(Node);
     antChdir: ProcessChdir(Node);
     antRmdir: ProcessRmdir(Node);
     antMove: ProcessMoveFile(Node);

@@ -741,6 +741,8 @@ begin
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src1 = source string
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string
     bcEnviron,   // ENVIRON$(name) - Src1 = name string
+    bcSetEnviron, // SETENVIRON "NAME=value" - Src1 = string
+    bcShell,      // SHELL cmd - Src1 = command string
     bcStrFormat, // FORMAT(num, mask) - Src1 = mask string
 
     bcStrVal,    // VAL(str) - reads string, produces float

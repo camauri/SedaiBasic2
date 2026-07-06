@@ -535,6 +535,8 @@ begin
     ssaRenameFile: Result := bcRenameFile;
     ssaConcat: Result := bcConcat;
     ssaMkdir: Result := bcMkdir;
+    ssaSetEnviron: Result := bcSetEnviron;
+    ssaShell: Result := bcShell;
     ssaChdir: Result := bcChdir;
     ssaRmdir: Result := bcRmdir;
     ssaMoveFile: Result := bcMoveFile;

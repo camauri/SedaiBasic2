@@ -233,6 +233,8 @@ const
   bcCallSub         = bcGroupCore + 95;  // Call a SUB/FUNCTION: save frame, pass args, jump
   bcReturnSub       = bcGroupCore + 96;  // Return from SUB/FUNCTION: deliver result, restore frame
   bcCallSubIndirect = bcGroupCore + 140; // FreeBASIC function-pointer call: like bcCallSub but the target entry PC is read from Src1 (int register)
+  bcSetEnviron      = bcGroupCore + 141; // SETENVIRON "NAME=value": set an environment variable (Src1 = string)
+  bcShell           = bcGroupCore + 142; // SHELL cmd: run a command via the shell (Src1 = string; Dest = int exit code)
   // Argument/result transfer registers (M2): separate VM-side banks, never saved/restored,
   // so they carry args (caller->callee) and the result (callee->caller) across the frame
   // save/restore. Store: Src1=value reg, Immediate=slot. Load: Dest=reg, Immediate=slot.
@@ -1494,6 +1496,8 @@ begin
         132: Result := 'Shr';
         139: Result := 'Assert';
         140: Result := 'CallSubIndirect';
+        141: Result := 'SetEnviron';
+        142: Result := 'Shell';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

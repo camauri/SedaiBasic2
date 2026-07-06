@@ -335,6 +335,8 @@ type
     ssaConcat,         // CONCAT "src","dest": Concatenate files
     ssaMkdir,          // MKDIR/MD "path": Create directory
     ssaChdir,          // CHDIR/CD "path": Change current directory
+    ssaSetEnviron,     // SETENVIRON "NAME=value": set an environment variable (Src1 = string)
+    ssaShell,          // SHELL cmd: run a command (Src1 = string); Dest (int) = exit code when used as a value
     ssaRmdir,          // RMDIR/RD "path": Remove directory (FreeBASIC/QB)
     ssaMoveFile,       // MOVE/MV "src","dest": Move file
     // Disk file I/O

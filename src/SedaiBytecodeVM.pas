@@ -173,6 +173,7 @@ type
     FStartTicks: QWord;     // Milliseconds since system start when VM started
     FTimeOffset: Int64;     // TI$ offset in milliseconds from real time
     FClockOffsetDays: Double; // FreeBASIC SETDATE/SETTIME offset (days) applied to NOW/DATE/TIME/TIMER
+    FEnvOverrides: TStringList; // SETENVIRON "NAME=value" overrides, consulted by ENVIRON$ before the OS environment
     FLastFrameTick: QWord;  // Last FRAME sync tick for drift-free timing
     // Function key definitions (1-12)
     FFunctionKeys: array[1..12] of string;
@@ -281,6 +282,8 @@ type
     procedure ExecuteRenameFile(const OldName, NewName: string);
     procedure ExecuteConcat(const Src, Dest: string);
     procedure ExecuteMkdir(const Path: string);
+    procedure SetEnvOverride(const NameValue: string);   // SETENVIRON: record a "NAME=value" override
+    function RunShellCommand(const Cmd: string): Integer; // SHELL: run a command via the platform shell, return exit code
     procedure ExecuteChdir(const Path: string);
     procedure ExecuteRmdir(const Path: string);
     procedure ExecuteMoveFile(const Src, Dest: string);
@@ -568,6 +571,8 @@ var
 {$ENDIF}
 begin
   inherited Create;
+  FEnvOverrides := TStringList.Create;
+  FEnvOverrides.CaseSensitive := False;   // environment names are case-insensitive on Windows; harmless elsewhere
   // FreeBASIC draw colours: white foreground, opaque-black background (match the SCREENRES surface clear).
   FGfxForeColor := $FFFFFFFF;
   FGfxBackColor := $000000FF;
@@ -726,6 +731,7 @@ end;
 
 destructor TBytecodeVM.Destroy;
 begin
+  FEnvOverrides.Free;
   {$IFDEF WITH_SEDAI_AUDIO}
   // Stop and shutdown SAF audio backend
   if Assigned(FAudioBackend) then
@@ -4548,6 +4554,19 @@ begin
         ExecuteMkdir(Ctx.StringRegs[Instr.Src1]);
       end;
 
+    bcSetEnviron:
+      begin
+        // SETENVIRON "NAME=value": record a VM-internal override (consulted by ENVIRON$). A bare "NAME"
+        // (no '=') clears the value. Portable — no OS-specific setenv needed.
+        SetEnvOverride(Ctx.StringRegs[Instr.Src1]);
+      end;
+
+    bcShell:
+      begin
+        // SHELL cmd: run the command through the platform shell. Dest (if used) receives the exit code.
+        Ctx.IntRegs[Instr.Dest] := RunShellCommand(Ctx.StringRegs[Instr.Src1]);
+      end;
+
     bcChdir:
       begin
         // CHDIR "path"
@@ -5097,7 +5116,7 @@ end;
 procedure TBytecodeVM.ExecuteStringOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
-  Len, StartPos, Count: Integer;
+  Len, StartPos, Count, EnvIdx: Integer;
   S, SubStr: string;
   PackInt: Int64;        // B3 serialization scratch (MK*/CV* integer pack/unpack)
   PackSingle: Single;
@@ -5162,8 +5181,15 @@ begin
       else Ctx.IntRegs[Instr.Dest] := 0;
     41: // bcCurDir - CURDIR$: the current working directory (cross-platform).
       Ctx.StringRegs[Instr.Dest] := GetCurrentDir;
-    42: // bcEnviron - ENVIRON$(name): value of an environment variable ('' if unset).
-      Ctx.StringRegs[Instr.Dest] := GetEnvironmentVariable(Ctx.StringRegs[Instr.Src1]);
+    42: // bcEnviron - ENVIRON$(name): value of an environment variable ('' if unset). A SETENVIRON override
+        // (VM-internal) takes precedence over the OS environment.
+      begin
+        EnvIdx := FEnvOverrides.IndexOfName(Ctx.StringRegs[Instr.Src1]);
+        if EnvIdx >= 0 then
+          Ctx.StringRegs[Instr.Dest] := FEnvOverrides.ValueFromIndex[EnvIdx]
+        else
+          Ctx.StringRegs[Instr.Dest] := GetEnvironmentVariable(Ctx.StringRegs[Instr.Src1]);
+      end;
     43: // bcFileLen - FILELEN(path): size of the file in bytes (0 if absent).
       Ctx.IntRegs[Instr.Dest] := FileLength(Ctx.StringRegs[Instr.Src1]);
     44: // bcExePath - EXEPATH: directory of the running program (cross-platform).
@@ -8531,6 +8557,45 @@ begin
 
   if not ForceDirectories(Path) then
     RaiseFileError('File I/O error', FBERR_FILE_IO, '?CANNOT CREATE DIRECTORY: ' + Path, ERR_FILE_ACCESS);
+end;
+
+procedure TBytecodeVM.SetEnvOverride(const NameValue: string);
+// SETENVIRON "NAME=value": store a VM-internal environment override (consulted by ENVIRON$ before the OS
+// environment). A bare "NAME" with no '=' clears the value. Portable — avoids OS-specific setenv.
+var
+  eq: Integer;
+  nm: string;
+begin
+  eq := Pos('=', NameValue);
+  if eq > 0 then
+    FEnvOverrides.Values[Copy(NameValue, 1, eq - 1)] := Copy(NameValue, eq + 1, MaxInt)
+  else
+  begin
+    nm := NameValue;
+    FEnvOverrides.Values[nm] := '';
+  end;
+end;
+
+function TBytecodeVM.RunShellCommand(const Cmd: string): Integer;
+// SHELL cmd: run a command through the platform shell (cmd.exe on Windows, /bin/sh elsewhere) and return
+// its exit code (-1 if the shell could not be launched). Uses SysUtils.ExecuteProcess (portable).
+{$IFDEF WINDOWS}
+var
+  ComSpec: string;
+{$ENDIF}
+begin
+  Result := -1;
+  try
+    {$IFDEF WINDOWS}
+    ComSpec := GetEnvironmentVariable('COMSPEC');
+    if ComSpec = '' then ComSpec := 'cmd.exe';
+    Result := ExecuteProcess(ComSpec, ['/C', Cmd], []);
+    {$ELSE}
+    Result := ExecuteProcess('/bin/sh', ['-c', Cmd], []);
+    {$ENDIF}
+  except
+    on E: Exception do Result := -1;   // shell not found / launch failure
+  end;
 end;
 
 procedure TBytecodeVM.ExecuteChdir(const Path: string);

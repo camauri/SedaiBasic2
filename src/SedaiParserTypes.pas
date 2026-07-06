@@ -198,6 +198,8 @@ type
     antChdir,             // CHDIR/CD command (change directory)
     antRmdir,             // RMDIR/RD command (remove directory) - FreeBASIC/QB
     antMove,              // MOVE/MV command (move file)
+    antSetenviron,        // SETENVIRON "NAME=value" (FreeBASIC: set an environment variable)
+    antShell,             // SHELL cmd (FreeBASIC: run a command via the system shell)
     antGraphics,          // GRAPHIC command
     antScnClr,            // SCNCLR command (clear screen)
     antScreenRes,         // SCREENRES w, h (FreeBASIC graphics)

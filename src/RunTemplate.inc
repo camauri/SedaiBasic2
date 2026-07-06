@@ -1021,6 +1021,7 @@ begin
         bcRun, bcList, bcNew, bcCatalog,
         // File management commands
         bcCopyFile, bcScratch, bcRenameFile, bcConcat, bcMkdir, bcChdir, bcRmdir, bcMoveFile,
+        bcSetEnviron, bcShell,
         bcRaiseError:
           begin
             Ctx.PC := CurPC;

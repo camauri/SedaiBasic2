@@ -1773,6 +1773,9 @@ begin
  RegisterKeyword(kMKDIR,     ttFileManagement, 'Create directory',                         kcDOSCommands);
  RegisterKeyword(kMD,        ttFileManagement, 'Create directory (alias for MKDIR)',       kcDOSCommands);
  RegisterKeyword(kCHDIR,     ttFileManagement, 'Change current directory',                 kcDOSCommands);
+ RegisterKeyword(kSETENVIRON, ttFileManagement, 'Set an environment variable (NAME=value)', kcDOSCommands);
+ RegisterKeyword(kSHELL,     ttFileManagement, 'Run a command via the system shell',        kcDOSCommands);
+ RegisterKeyword(kLPRINT,    ttOutputCommand,  'Print to the line printer (routed to stdout here)', kcStdIO);
  RegisterKeyword(kCD,        ttFileManagement, 'Change directory (alias for CHDIR)',       kcDOSCommands);
  RegisterKeyword(kMOVE,      ttFileManagement, 'Move file to another location',            kcDOSCommands);
  RegisterKeyword(kMV,        ttFileManagement, 'Move file (alias for MOVE)',               kcDOSCommands);
