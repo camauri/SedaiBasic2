@@ -7130,10 +7130,18 @@ begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antEnum, Token);
   Context.Advance;                              // consume ENUM
-  // Optional enum type name on the header line (unused). Skip whatever token it is — it may be a
-  // reserved word (e.g. a type/colour keyword), so don't require ttIdentifier.
-  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam, ttEndOfFile]) then
-    Context.Advance;
+  // Optional enum type name, then an optional "AS <underlying-type>" (FreeBASIC "Enum [name] [As Integer]").
+  // Both are advisory here — enum members are plain integer constants regardless of the declared width. The
+  // name may be a reserved word (a type/colour keyword), so don't require ttIdentifier; exclude AS so a
+  // nameless "Enum As Integer" is not mistaken for a name.
+  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam, ttEndOfFile, ttAsType]) then
+    Context.Advance;                            // enum type name
+  if Context.Check(ttAsType) then
+  begin
+    Context.Advance;                            // AS
+    if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam, ttEndOfFile]) then
+      Context.Advance;                          // underlying integer type name
+  end;
   while Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam]) do Context.Advance;
 
   PrevMember := '';
