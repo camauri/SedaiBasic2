@@ -2467,18 +2467,18 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `PALETTE` | ✓ | `PALETTE index,r,g,b` sets a palette entry (components 0-255), `PALETTE GET index,r,g,b` reads it back into variables, `PALETTE` alone resets to the mode default (via IGraphicsBackend; headless-testable round-trip). The QB-compat `&hBBGGRR` 2-arg form and `PALETTE USING` deferred. |
 | `RGB` | ✓ | `RGB(r,g,b)` returns an opaque 32-bit colour (= `RGBA(r,g,b,255)`; alpha in bits 24-31). Constant-folded when all args are constant. |
 | `RGBA` | ✓ | Returns a color value including alpha (transparency) for hi/truecolor modes. |
-| `POINT` | ✓ | `POINT(x,y)` reads a pixel's colour from the screen surface (via the IGraphicsBackend abstraction). Image-buffer form deferred to G3. |
+| `POINT` | ✓ | `POINT(x,y[,img])` reads a pixel's colour from the screen surface, or from an image surface when a 3rd image-handle argument is given (via the IGraphicsBackend abstraction). |
 
 #### Drawing to Image Buffers
 
 | Keyword | Status | Description |
 |---|---|---|
-| `PSET and PRESET` | ✓ | `PSET [STEP](x,y)[,color]` / `PRESET [STEP](x,y)[,color]` plot a pixel (PRESET's omitted colour = the background); `STEP` = coordinate relative to the current graphics point. Via IGraphicsBackend, headless-testable and on-screen on sbv. The image-buffer target form (`PSET img,(x,y)`) is deferred. |
-| `LINE (GRAPHICS)` | ✓ | `LINE [STEP](x1,y1)-[STEP](x2,y2)[,color][,B\|BF]` draws a line, box outline (B) or filled box (BF) on the screen surface (via IGraphicsBackend; headless-testable + on-screen on sbv). Omitted start (`LINE -(x2,y2)`) draws from the current graphics point; `STEP` = relative coordinates (first STEP relative to the current point, second relative to the first point). Parenthesised form disambiguates from `LINE INPUT`. Line-style (dashed) and the image-buffer target deferred. |
-| `CIRCLE` | ✓ | Plots circles and ellipses. C128 form (`CIRCLE source,x,y,...`) and FreeBASIC form (`CIRCLE [STEP](x,y),r[,color]`, parenthesised → routed through IGraphicsBackend, headless-testable + on-screen on sbv); `STEP` = centre relative to the current graphics point. FB ellipse/arc/aspect arguments deferred. |
+| `PSET and PRESET` | ✓ | `PSET [img,][STEP](x,y)[,color]` / `PRESET ...` plot a pixel (PRESET's omitted colour = the background); `STEP` = coordinate relative to the current graphics point; an optional leading image handle draws on that off-screen image (`PSET img,(x,y)`). Via IGraphicsBackend, headless-testable and on-screen on sbv. |
+| `LINE (GRAPHICS)` | ✓ | `LINE [img,][STEP](x1,y1)-[STEP](x2,y2)[,color][,B\|BF]` draws a line (a leading image handle draws on that off-screen image), box outline (B) or filled box (BF) on the screen surface (via IGraphicsBackend; headless-testable + on-screen on sbv). Omitted start (`LINE -(x2,y2)`) draws from the current graphics point; `STEP` = relative coordinates (first STEP relative to the current point, second relative to the first point). Parenthesised form disambiguates from `LINE INPUT`. Line-style (dashed) deferred. |
+| `CIRCLE` | ✓ | Plots circles and ellipses. C128 form (`CIRCLE source,x,y,...`) and FreeBASIC form (`CIRCLE [img,][STEP](x,y),r[,color]`, parenthesised (a leading image handle draws on that off-screen image) → routed through IGraphicsBackend, headless-testable + on-screen on sbv); `STEP` = centre relative to the current graphics point. Ellipse (aspect) and arcs (start/end angle) supported; the fill flag (F) and pie-slice for negative angles deferred. |
 | `DRAW` | ✓ | Draws in a sequence of commands on an image buffer or screen. |
 | `DRAW STRING` | ✓ | Writes text to an image buffer or screen. |
-| `PAINT` | ✓ | Flood fill. C128 form (`PAINT source,x,y`) and FreeBASIC form (`PAINT [STEP](x,y),color[,border]`, parenthesised → routed through IGraphicsBackend, headless-testable). An optional border colour selects the boundary-fill form (fill up to the border colour); `STEP` = coordinate relative to the current graphics point. |
+| `PAINT` | ✓ | Flood fill. C128 form (`PAINT source,x,y`) and FreeBASIC form (`PAINT [img,][STEP](x,y),color[,border]`, parenthesised (a leading image handle fills that off-screen image) → routed through IGraphicsBackend, headless-testable). An optional border colour selects the boundary-fill form (fill up to the border colour); `STEP` = coordinate relative to the current graphics point. |
 
 #### Image Buffer Creation
 

@@ -652,6 +652,9 @@ const
   bcGfxCircleEx     = bcGroupGraphics + 59;
   // PAINT (x,y),color,border : boundary flood fill. Src1=x, Src2=y; Immediate[0-15]=color, [16-31]=border (int regs).
   bcGfxPaintBorder  = bcGroupGraphics + 60;
+  // Per-statement image draw target ("PSET img,(x,y)"): Src1=image handle reg; Immediate bit 0 = active (1=set,
+  // 0=clear -> back to the work page). The following draw op(s) target the image; emitted before/after them.
+  bcGfxSetTarget    = bcGroupGraphics + 61;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1775,6 +1778,7 @@ begin
         58: Result := 'GfxPointCoord';
         59: Result := 'GfxCircleEx';
         60: Result := 'GfxPaintBorder';
+        61: Result := 'GfxSetTarget';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

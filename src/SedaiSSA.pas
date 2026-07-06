@@ -452,6 +452,9 @@ type
     function  DefaultDrawColorReg: TSSAValue;       // omitted-colour default = current draw foreground
     procedure EmitStepRelative(var XReg, YReg: TSSAValue; const BaseX, BaseY: TSSAValue);  // STEP: coord += base
     procedure EmitPenCoordRegs(out PenX, PenY: TSSAValue);  // read the current graphics point (POINTCOORD 0/1)
+    function  EmitDrawTargetBegin(Node: TASTNode): Boolean;  // "PSET img,(x,y)": set the image draw target (if any)
+    procedure EmitDrawTargetEnd;                             // clear the image draw target (back to the work page)
+    function  EffChildCount(Node: TASTNode): Integer;        // ChildCount excluding an appended image-target child
     procedure ProcessImageDestroy(Node: TASTNode);  // IMAGEDESTROY handle
     procedure ProcessImageInfo(Node: TASTNode);      // IMAGEINFO handle, w, h
     function  EmitGetmouse(Node, ArgListNode: TASTNode): TSSAValue;  // GETMOUSE(x,y[,w][,b][,c]) -> status
@@ -2319,13 +2322,21 @@ begin
         end
         else if FuncName = 'POINT' then
         begin
-          // FreeBASIC POINT(x, y) -> pixel color (read from the graphics backend).
+          // FreeBASIC POINT(x, y [, img]) -> pixel color. An optional image handle reads from that image.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
+            if ArgListNode.ChildCount >= 3 then   // image target: read from the image surface
+            begin
+              ProcessExpression(ArgListNode.GetChild(2), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
+              EmitInstruction(ssaGfxSetTarget, MakeSSAValue(svkNone), ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(1));
+            end;
             ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
             ProcessExpression(ArgListNode.GetChild(1), RVal);     RReg := EnsureIntRegister(RVal);
             Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
             EmitInstruction(ssaGfxPoint, Result, ArgReg, RReg, MakeSSAValue(svkNone));
+            if ArgListNode.ChildCount >= 3 then
+              EmitInstruction(ssaGfxSetTarget, MakeSSAValue(svkNone), EnsureIntRegister(MakeSSAConstInt(0)),
+                MakeSSAValue(svkNone), MakeSSAConstInt(0));
           end
           else
             raise Exception.Create('POINT requires 2 arguments: POINT(x, y)');
@@ -3409,13 +3420,21 @@ begin
         end
         else if FuncName = 'POINT' then
         begin
-          // FreeBASIC POINT(x, y) -> pixel color (read from the graphics backend).
+          // FreeBASIC POINT(x, y [, img]) -> pixel color. An optional image handle reads from that image.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
+            if ArgListNode.ChildCount >= 3 then   // image target: read from the image surface
+            begin
+              ProcessExpression(ArgListNode.GetChild(2), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
+              EmitInstruction(ssaGfxSetTarget, MakeSSAValue(svkNone), ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(1));
+            end;
             ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
             ProcessExpression(ArgListNode.GetChild(1), RVal);     RReg := EnsureIntRegister(RVal);
             Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
             EmitInstruction(ssaGfxPoint, Result, ArgReg, RReg, MakeSSAValue(svkNone));
+            if ArgListNode.ChildCount >= 3 then
+              EmitInstruction(ssaGfxSetTarget, MakeSSAValue(svkNone), EnsureIntRegister(MakeSSAConstInt(0)),
+                MakeSSAValue(svkNone), MakeSSAConstInt(0));
           end
           else
             raise Exception.Create('POINT requires 2 arguments: POINT(x, y)');
@@ -4050,19 +4069,28 @@ begin
           Exit;
         end;
 
-        // FreeBASIC POINT(x, y): read a pixel's colour from the graphics backend. Intercepted by name
-        // (POINT is NOT a reserved keyword, so "Point" stays usable as a type/array name). Only when it
-        // is not a declared array, UDT type, or user function.
+        // FreeBASIC POINT(x, y [, img]): read a pixel's colour from the graphics backend (or from an image
+        // surface when a 3rd handle argument is given). Intercepted by name (POINT is NOT a reserved
+        // keyword, so "Point" stays usable as a type/array name). Only when it is not a declared array,
+        // UDT type, or user function.
         if FModernMode and (UpperCase(ArrName) = kPOINT) and
            (ArrayIndexOf(ArrName) < 0) and (FindUDT(UpperCase(ArrName)) < 0) and
            (FProcedureNames.IndexOf(UpperCase(ArrName)) < 0) and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and
            (Node.GetChild(1).ChildCount >= 2) then
         begin
+          if Node.GetChild(1).ChildCount >= 3 then   // image target: read from the image surface
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(2), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
+            EmitInstruction(ssaGfxSetTarget, MakeSSAValue(svkNone), ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(1));
+          end;
           ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
           ProcessExpression(Node.GetChild(1).GetChild(1), MaskValue); MaskReg := EnsureIntRegister(MaskValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaGfxPoint, Result, ArgReg, MaskReg, MakeSSAValue(svkNone));
+          if Node.GetChild(1).ChildCount >= 3 then
+            EmitInstruction(ssaGfxSetTarget, MakeSSAValue(svkNone), EnsureIntRegister(MakeSSAConstInt(0)),
+              MakeSSAValue(svkNone), MakeSSAConstInt(0));
           Exit;
         end;
 
@@ -8217,6 +8245,39 @@ begin
     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
+function TSSAGenerator.EmitDrawTargetBegin(Node: TASTNode): Boolean;
+// FreeBASIC "PSET img,(x,y)" (and LINE/CIRCLE/PAINT/POINT): when the statement names an image target
+// (attribute TARGETIDX = the child holding the target-handle expression), evaluate it and emit
+// ssaGfxSetTarget(handle, active=1) so the following draw op targets the image. Returns True if a target
+// was set (the caller must then call EmitDrawTargetEnd after emitting the draw op). No-op otherwise.
+var
+  Idx, Code: Integer;
+  HVal, HReg: TSSAValue;
+begin
+  Result := False;
+  if Node.Attributes.Values['TARGETIDX'] = '' then Exit;
+  Val(Node.Attributes.Values['TARGETIDX'], Idx, Code);
+  if (Code <> 0) or (Idx < 0) or (Idx >= Node.ChildCount) then Exit;
+  ProcessExpression(Node.GetChild(Idx), HVal);
+  HReg := EnsureIntRegister(HVal);
+  EmitInstruction(ssaGfxSetTarget, MakeSSAValue(svkNone), HReg, MakeSSAValue(svkNone), MakeSSAConstInt(1));
+  Result := True;
+end;
+
+procedure TSSAGenerator.EmitDrawTargetEnd;
+// Clear the image draw target set by EmitDrawTargetBegin (drawing returns to the work page).
+begin
+  EmitInstruction(ssaGfxSetTarget, MakeSSAValue(svkNone), EnsureIntRegister(MakeSSAConstInt(0)),
+    MakeSSAValue(svkNone), MakeSSAConstInt(0));
+end;
+
+function TSSAGenerator.EffChildCount(Node: TASTNode): Integer;
+// The count of real argument children, excluding an image-target child appended last (TARGETIDX).
+begin
+  Result := Node.ChildCount;
+  if Node.Attributes.Values['TARGETIDX'] <> '' then Dec(Result);
+end;
+
 procedure TSSAGenerator.EmitStepRelative(var XReg, YReg: TSSAValue; const BaseX, BaseY: TSSAValue);
 // FreeBASIC STEP: turn a (dx,dy) offset into an absolute coordinate by adding a base point.
 // The base is the current graphics point (for the first / a single coordinate) or the previous
@@ -8245,13 +8306,19 @@ begin
     EmitPenCoordRegs(PenX, PenY);
     EmitStepRelative(XReg, YReg, PenX, PenY);
   end;
-  if Node.ChildCount >= 3 then
+  if EffChildCount(Node) >= 3 then
   begin
     ProcessExpression(Node.GetChild(2), CVal); CReg := EnsureIntRegister(CVal);
   end
   else
     CReg := DefaultDrawColorReg;   // omitted colour -> current draw foreground (COLOR)
-  EmitInstruction(ssaGfxPset, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color -> Immediate
+  if EmitDrawTargetBegin(Node) then
+  begin
+    EmitInstruction(ssaGfxPset, MakeSSAValue(svkNone), XReg, YReg, CReg);
+    EmitDrawTargetEnd;
+  end
+  else
+    EmitInstruction(ssaGfxPset, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color -> Immediate
 end;
 
 procedure TSSAGenerator.ProcessGfxPaint(Node: TASTNode);
@@ -8261,6 +8328,7 @@ procedure TSSAGenerator.ProcessGfxPaint(Node: TASTNode);
 var
   XVal, YVal, CVal, BVal, XReg, YReg, CReg, BReg, PenX, PenY: TSSAValue;
   Instr: TSSAInstruction;
+  HasTarget: Boolean;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 2) then Exit;
   ProcessExpression(Node.GetChild(0), XVal); XReg := EnsureIntRegister(XVal);
@@ -8270,21 +8338,23 @@ begin
     EmitPenCoordRegs(PenX, PenY);
     EmitStepRelative(XReg, YReg, PenX, PenY);
   end;
-  if Node.ChildCount >= 3 then
+  if EffChildCount(Node) >= 3 then
   begin
     ProcessExpression(Node.GetChild(2), CVal); CReg := EnsureIntRegister(CVal);
   end
   else
     CReg := DefaultDrawColorReg;   // omitted colour -> current draw foreground (COLOR)
-  if (Node.Attributes.Values['HASBORDER'] = '1') and (Node.ChildCount >= 4) then
+  HasTarget := EmitDrawTargetBegin(Node);
+  if (Node.Attributes.Values['HASBORDER'] = '1') and (EffChildCount(Node) >= 4) then
   begin
     ProcessExpression(Node.GetChild(3), BVal); BReg := EnsureIntRegister(BVal);
     EmitInstruction(ssaGfxPaintBorder, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color
     Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
     Instr.AddPhiSource(BReg, nil);   // border -> Immediate bits 16-31
-    Exit;
-  end;
-  EmitInstruction(ssaGfxPaint, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color -> Immediate
+  end
+  else
+    EmitInstruction(ssaGfxPaint, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color -> Immediate
+  if HasTarget then EmitDrawTargetEnd;
 end;
 
 procedure TSSAGenerator.ProcessGfxLine(Node: TASTNode);
@@ -8301,7 +8371,7 @@ var
   Instr: TSSAInstruction;
   Shape: string;
   Flag: Int64;
-  NoStart, Step1, Step2: Boolean;
+  NoStart, Step1, Step2, HasTarget: Boolean;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 4) then Exit;
   NoStart := Node.Attributes.Values['NOSTART'] = '1';
@@ -8324,7 +8394,7 @@ begin
     else begin BaseX := X1R; BaseY := Y1R; end;
     EmitStepRelative(X2R, Y2R, BaseX, BaseY);
   end;
-  if Node.ChildCount >= 5 then
+  if EffChildCount(Node) >= 5 then
   begin
     ProcessExpression(Node.GetChild(4), CV); CR := EnsureIntRegister(CV);
   end
@@ -8335,11 +8405,13 @@ begin
   else if Shape = 'B' then Flag := 1
   else Flag := 0;
   if NoStart then Flag := Flag or 4;   // start = current graphics point
+  HasTarget := EmitDrawTargetBegin(Node);
   EmitInstruction(ssaGfxLine, MakeSSAValue(svkNone), X1R, Y1R, X2R);
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(Y2R, nil);
   Instr.AddPhiSource(CR, nil);
   Instr.AddPhiSource(MakeSSAConstInt(Flag), nil);
+  if HasTarget then EmitDrawTargetEnd;
 end;
 
 procedure TSSAGenerator.ProcessGfxCircle(Node: TASTNode);
@@ -8357,7 +8429,7 @@ var
   XV, YV, RV, CV, XR, YR, RR, CR, PenX, PenY: TSSAValue;
   AspV, StartV, EndV, RadF, AspF, RYf, RYr, StF, EndF, StDegF, EnDegF, StDeg, EnDeg: TSSAValue;
   Instr: TSSAInstruction;
-  HasArc, HasAspect: Boolean;
+  HasArc, HasAspect, HasTarget: Boolean;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 3) then Exit;
   ProcessExpression(Node.GetChild(0), XV); XR := EnsureIntRegister(XV);
@@ -8377,6 +8449,7 @@ begin
 
   HasArc := (Node.Attributes.Values['HASSTART'] = '1') and (Node.Attributes.Values['HASEND'] = '1');
   HasAspect := Node.Attributes.Values['HASASPECT'] = '1';
+  HasTarget := EmitDrawTargetBegin(Node);
 
   if not HasArc and not HasAspect then
   begin
@@ -8384,6 +8457,7 @@ begin
     EmitInstruction(ssaGfxCircle, MakeSSAValue(svkNone), XR, YR, RR);
     Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
     Instr.AddPhiSource(CR, nil);
+    if HasTarget then EmitDrawTargetEnd;
     Exit;
   end;
 
@@ -8428,6 +8502,7 @@ begin
   Instr.AddPhiSource(CR, nil);
   Instr.AddPhiSource(StDeg, nil);
   Instr.AddPhiSource(EnDeg, nil);
+  if HasTarget then EmitDrawTargetEnd;
 end;
 
 procedure TSSAGenerator.ProcessPalette(Node: TASTNode);
@@ -8522,13 +8597,19 @@ begin
     EmitPenCoordRegs(PenX, PenY);
     EmitStepRelative(XReg, YReg, PenX, PenY);
   end;
-  if Node.ChildCount >= 3 then
+  if EffChildCount(Node) >= 3 then
   begin
     ProcessExpression(Node.GetChild(2), CVal); CReg := EnsureIntRegister(CVal);
   end
   else
     CReg := DefaultBackColorReg;   // omitted colour -> current draw background (COLOR ,bg)
-  EmitInstruction(ssaGfxPset, MakeSSAValue(svkNone), XReg, YReg, CReg);
+  if EmitDrawTargetBegin(Node) then
+  begin
+    EmitInstruction(ssaGfxPset, MakeSSAValue(svkNone), XReg, YReg, CReg);
+    EmitDrawTargetEnd;
+  end
+  else
+    EmitInstruction(ssaGfxPset, MakeSSAValue(svkNone), XReg, YReg, CReg);
 end;
 
 procedure TSSAGenerator.ProcessGfxColor(Node: TASTNode);

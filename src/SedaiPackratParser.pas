@@ -286,6 +286,7 @@ type
     function ParseSeekStatement: TASTNode;         // FreeBASIC SEEK #n, pos (set position)
     function ParseNameStatement: TASTNode;         // FreeBASIC NAME old AS new (rename)
     function PeekNameHasAs: Boolean;               // lookahead: NAME ... AS ... on this statement
+    function LooksLikeImageTarget: Boolean;        // lookahead: "cmd img, (x,y)..." FB image draw-target form
     function ParseRaiseErrorStatement: TASTNode;   // FreeBASIC ERROR <n> (raise runtime error)
     function ParseBinaryFileTail(IsGet: Boolean; const Tok: TLexerToken): TASTNode;  // GET/PUT #n,[pos],var
     function ParseErrorHandlingStatement: TASTNode;
@@ -921,10 +922,10 @@ begin
         // FreeBASIC graphics "LINE (x1,y1)-(x2,y2),color[,B|BF]": LINE is a bare identifier here; the
         // parenthesis after it selects the graphics statement (vs LINE INPUT, vs an assignment to `line`).
         // A leading '-' also selects it ("LINE -(x2,y2)" omits the start), as does a leading STEP
-        // ("LINE STEP(x1,y1)-..." — relative coordinates).
+        // ("LINE STEP(x1,y1)-...") or the image-target form ("LINE img,(x1,y1)-(x2,y2)").
         else if (UpperCase(Token.Value) = kLINE) and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType in [ttDelimParOpen, ttOpSub]) or
-                 (UpperCase(Context.PeekNext.Value) = kSTEP)) then
+                 (UpperCase(Context.PeekNext.Value) = kSTEP) or LooksLikeImageTarget) then
           Result := ParseGfxLineStatement
         // FreeBASIC "WRITE #n, ...": comma-separated, quoted-string CSV output (WRITE is a bare
         // identifier here; the `#` after it disambiguates from an assignment to a var named `write`).
@@ -4062,10 +4063,12 @@ var
   Param: TASTNode;
   ParamCount, MaxParams: Integer;
   CircleArgIdx: Integer;
+  TargetNode: TASTNode;
   CmdName: string;
 begin
   Token := Context.CurrentToken;
   CmdName := UpperCase(Token.Value);
+  TargetNode := nil;
 
   // Select appropriate node type based on command
   if CmdName = 'GRAPHIC' then
@@ -4077,9 +4080,10 @@ begin
   else if CmdName = 'CIRCLE' then
   begin
     // FreeBASIC CIRCLE (x,y),r[,color] vs C128 CIRCLE source,x,y,... — disambiguated by the parenthesis
-    // (or a leading STEP, "CIRCLE STEP(x,y),r", which is also the FreeBASIC relative form).
-    if Assigned(Context.PeekNext) and
-       ((Context.PeekNext.TokenType = ttDelimParOpen) or (UpperCase(Context.PeekNext.Value) = kSTEP)) then
+    // (or a leading STEP "CIRCLE STEP(x,y),r", or the image-target form "CIRCLE img,(x,y),r").
+    if (Assigned(Context.PeekNext) and
+        ((Context.PeekNext.TokenType = ttDelimParOpen) or (UpperCase(Context.PeekNext.Value) = kSTEP))) or
+       LooksLikeImageTarget then
       Result := TASTNode.Create(antGfxCircle, Token)
     else
       Result := TASTNode.Create(antCircle, Token);
@@ -4104,8 +4108,10 @@ begin
     Result := TASTNode.Create(antScale, Token)
   else if CmdName = 'PAINT' then
   begin
-    // FreeBASIC PAINT (x,y),color vs C128 PAINT source,x,y,mode — disambiguated by the parenthesis.
-    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+    // FreeBASIC PAINT (x,y),color vs C128 PAINT source,x,y,mode — disambiguated by the parenthesis
+    // (or the image-target form "PAINT img,(x,y),color").
+    if (Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen)) or
+       LooksLikeImageTarget then
       Result := TASTNode.Create(antGfxPaint, Token)
     else
       Result := TASTNode.Create(antPaint, Token);
@@ -4193,6 +4199,12 @@ begin
   // parenthesised, so parse it explicitly rather than via the generic comma-separated parameter loop below.
   if (CmdName = 'PSET') or (CmdName = 'PRESET') or (Result.NodeType = antGfxPaint) then
   begin
+    // FreeBASIC image draw target: "PSET img, (x,y)" — an image handle before the coordinate.
+    if (not Context.Check(ttDelimParOpen)) and (UpperCase(Context.CurrentToken.Value) <> kSTEP) then
+    begin
+      TargetNode := ParseExpression;                              // image handle
+      if Context.Check(ttSeparParam) then Context.Advance;        // ','
+    end;
     // FreeBASIC STEP: the coordinate is relative to the current graphics point.
     if UpperCase(Context.CurrentToken.Value) = kSTEP then
     begin
@@ -4216,6 +4228,11 @@ begin
         Result.Attributes.Values['HASBORDER'] := '1';
       end;
     end;
+    if Assigned(TargetNode) then   // image draw target appended last (TARGETIDX = its child index)
+    begin
+      Result.Attributes.Values['TARGETIDX'] := IntToStr(Result.ChildCount);
+      Result.AddChild(TargetNode);
+    end;
     DoNodeCreated(Result);
     Exit;
   end;
@@ -4223,6 +4240,12 @@ begin
   // FreeBASIC CIRCLE (x, y), r [, color]: parenthesised centre then radius (and optional colour).
   if Result.NodeType = antGfxCircle then
   begin
+    // FreeBASIC image draw target: "CIRCLE img, (x,y), r".
+    if (not Context.Check(ttDelimParOpen)) and (UpperCase(Context.CurrentToken.Value) <> kSTEP) then
+    begin
+      TargetNode := ParseExpression;                              // image handle
+      if Context.Check(ttSeparParam) then Context.Advance;        // ','
+    end;
     // FreeBASIC STEP: the centre is relative to the current graphics point.
     if UpperCase(Context.CurrentToken.Value) = kSTEP then
     begin
@@ -4290,6 +4313,11 @@ begin
     while Result.ChildCount < 7 do
       if Result.ChildCount = 6 then Result.AddChild(TASTNode.CreateWithValue(antLiteral, '1', Token))
       else Result.AddChild(TASTNode.CreateWithValue(antLiteral, '0', Token));
+    if Assigned(TargetNode) then   // image draw target appended after the fixed layout (child 7)
+    begin
+      Result.Attributes.Values['TARGETIDX'] := IntToStr(Result.ChildCount);
+      Result.AddChild(TargetNode);
+    end;
     DoNodeCreated(Result);
     Exit;
   end;
@@ -5502,10 +5530,19 @@ var
   Tok: TLexerToken;
   FlagStr: string;
   IsFlagToken: Boolean;
+  TargetNode: TASTNode;
 begin
   Tok := Context.CurrentToken;
   Result := TASTNode.Create(antGfxLine, Tok);
   Context.Advance;                                          // LINE
+  TargetNode := nil;
+  // FreeBASIC image draw target: "LINE img, (x1,y1)-(x2,y2)".
+  if (not Context.Check(ttDelimParOpen)) and (not Context.Check(ttOpSub)) and
+     (UpperCase(Context.CurrentToken.Value) <> kSTEP) then
+  begin
+    TargetNode := ParseExpression;                          // image handle
+    if Context.Check(ttSeparParam) then Context.Advance;    // ','
+  end;
   // FreeBASIC "LINE -(x2,y2)": the start point is omitted, so the line runs from the current graphics
   // point (the last point plotted by LINE/PSET/DRAW). Placeholder x1/y1 = 0; the VM substitutes the last
   // point when the NOSTART flag is set.
@@ -5574,6 +5611,11 @@ begin
         end;
       end;
     end;
+  end;
+  if Assigned(TargetNode) then   // image draw target appended last (TARGETIDX = its child index)
+  begin
+    Result.Attributes.Values['TARGETIDX'] := IntToStr(Result.ChildCount);
+    Result.AddChild(TargetNode);
   end;
   DoNodeCreated(Result);
 end;
@@ -5753,6 +5795,23 @@ begin
   P := ParseExpression;   // position (1-based)
   if Assigned(P) then Result.AddChild(P);
   DoNodeCreated(Result);
+end;
+
+function TPackratParser.LooksLikeImageTarget: Boolean;
+// At a graphics command token (PSET/LINE/CIRCLE/PAINT): does the FreeBASIC "cmd img, (x,y)..." image
+// draw-target form follow? Heuristic for a single-token target (image handle): the next token is not '('
+// or STEP, the one after is ',', and the one after that is '(' — which cleanly separates the target form
+// from the C128 forms ("CIRCLE src,x,y") and the plain "(x,y)" / "STEP(x,y)" screen forms. A multi-token
+// target expression in this position is not recognised (rare; image handles are simple variables).
+var
+  T1, T2, T3: TLexerToken;
+begin
+  T1 := Context.PeekToken(1);
+  T2 := Context.PeekToken(2);
+  T3 := Context.PeekToken(3);
+  Result := Assigned(T1) and Assigned(T2) and Assigned(T3) and
+            (T1.TokenType <> ttDelimParOpen) and (UpperCase(T1.Value) <> kSTEP) and
+            (T2.TokenType = ttSeparParam) and (T3.TokenType = ttDelimParOpen);
 end;
 
 function TPackratParser.PeekNameHasAs: Boolean;

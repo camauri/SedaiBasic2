@@ -148,6 +148,10 @@ type
     FGfxForeColor: UInt32;           // current FreeBASIC draw foreground (COLOR fg); omitted-colour default
     FGfxBackColor: UInt32;           // current FreeBASIC draw background (COLOR ,bg)
     FGfxWorkSurface: Integer;        // FreeBASIC page flipping: cached surface all draw ops target (= FGfxPages[FGfxWorkPage])
+    // FreeBASIC "PSET img,(x,y)" etc.: a per-statement drawing target. When active, drawing ops (PSET/LINE/
+    // CIRCLE/PAINT/POINT) target this image surface instead of the work page. Set/cleared by bcGfxSetTarget.
+    FGfxDrawTargetActive: Boolean;
+    FGfxDrawTargetHandle: Integer;
     FGfxWorkPage: Integer;           // current work page index (drawing target)
     FGfxVisiblePage: Integer;        // current visible page index (shown on screen; sbv)
     FGfxPages: array of Integer;     // page index -> surface id (page 0 = screen surface 0; 1+ = image surfaces)
@@ -246,6 +250,7 @@ type
     procedure ExecuteSuperinstruction(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     function GfxMapX(LX: Double): Integer;   // FreeBASIC WINDOW: logical x -> physical x
     function GfxMapY(LY: Double): Integer;   // FreeBASIC WINDOW: logical y -> physical y
+    function DrawSurface: Integer;           // FreeBASIC per-statement image draw target (else the work page)
     procedure SetupGfxScreen(W, H, NumPages: Integer);  // SCREENRES/SCREEN: resize + (re)build pages
     // Group-specific dispatch handlers
     procedure ExecuteStringOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -6867,6 +6872,13 @@ begin
   FGfxWorkSurface := GFX_SCREEN_SURFACE;
 end;
 
+function TBytecodeVM.DrawSurface: Integer;
+// The surface the FreeBASIC drawing ops (PSET/LINE/CIRCLE/PAINT/POINT) target: the per-statement image
+// target when one is active ("PSET img,(x,y)"), otherwise the current work page.
+begin
+  if FGfxDrawTargetActive then Result := FGfxDrawTargetHandle else Result := FGfxWorkSurface;
+end;
+
 function TBytecodeVM.GfxMapX(LX: Double): Integer;
 // Map a logical x to a physical x: WINDOW transform (identity when off) then the VIEW viewport offset.
 begin
@@ -7131,18 +7143,18 @@ begin
     26: // bcGfxPset - PSET (x,y), color  (color in Immediate float-free int register; targets the work page)
       if Assigned(FGraphics) then
       begin
-        FGraphics.SetPixel(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
+        FGraphics.SetPixel(DrawSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
                            UInt32(Ctx.IntRegs[Instr.Immediate]));
         FDrawPenX := Ctx.IntRegs[Instr.Src1]; FDrawPenY := Ctx.IntRegs[Instr.Src2];  // becomes the current graphics point
       end;
-    27: // bcGfxPoint - POINT(x, y) -> color  (reads the work page)
+    27: // bcGfxPoint - POINT(x, y [, img]) -> color  (reads the work page, or the image target when active)
       if Assigned(FGraphics) then
-        Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.GetPixel(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2])))
+        Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.GetPixel(DrawSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2])))
       else
         Ctx.IntRegs[Instr.Dest] := 0;
     28: // bcGfxPaint - PAINT (x,y), color  (flood fill; color in the Immediate int register)
       if Assigned(FGraphics) then
-        FGraphics.Fill(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
+        FGraphics.Fill(DrawSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
                        UInt32(Ctx.IntRegs[Instr.Immediate]));
     29: // bcGfxLine - LINE (x1,y1)-(x2,y2),color[,B|BF]  (endpoints mapped through the WINDOW transform)
       if Assigned(FGraphics) then
@@ -7159,14 +7171,14 @@ begin
           GetX1 := Ctx.IntRegs[Instr.Src1]; GetY1 := Ctx.IntRegs[Instr.Src2];
         end;
         case (Instr.Immediate shr 48) and $3 of
-          1: FGraphics.DrawRect(FGfxWorkSurface, GfxMapX(GetX1), GfxMapY(GetY1),
+          1: FGraphics.DrawRect(DrawSurface, GfxMapX(GetX1), GfxMapY(GetY1),
                GfxMapX(GetX2), GfxMapY(GetY2),
                UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), False, 1, 0.0);    // B  = box outline
-          2: FGraphics.DrawRect(FGfxWorkSurface, GfxMapX(GetX1), GfxMapY(GetY1),
+          2: FGraphics.DrawRect(DrawSurface, GfxMapX(GetX1), GfxMapY(GetY1),
                GfxMapX(GetX2), GfxMapY(GetY2),
                UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), True, 1, 0.0);     // BF = filled box
         else
-          FGraphics.DrawLine(FGfxWorkSurface, GfxMapX(GetX1), GfxMapY(GetY1),
+          FGraphics.DrawLine(DrawSurface, GfxMapX(GetX1), GfxMapY(GetY1),
             GfxMapX(GetX2), GfxMapY(GetY2),
             UInt32(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]), 1);                   // plain line
         end;
@@ -7177,7 +7189,7 @@ begin
       begin
         if FGfxWinActive then GetX1 := Round(Ctx.IntRegs[Instr.Immediate and $FFFF] * Abs(FGfxWinAx))
         else GetX1 := Ctx.IntRegs[Instr.Immediate and $FFFF];                              // physical radius
-        FGraphics.DrawEllipse(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
+        FGraphics.DrawEllipse(DrawSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
           GetX1, GetX1,
           UInt32(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]), 0.0, 360.0, 0.0, 0.0, 1);
         FDrawPenX := Ctx.IntRegs[Instr.Src1]; FDrawPenY := Ctx.IntRegs[Instr.Src2];  // centre becomes the current point
@@ -7485,7 +7497,7 @@ begin
           GetX1 := Ctx.IntRegs[Instr.Dest];                                    // RX
           GetY1 := Ctx.IntRegs[Instr.Immediate and $FFFF];                     // RY
         end;
-        FGraphics.DrawEllipse(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
+        FGraphics.DrawEllipse(DrawSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
           GetX1, GetY1,
           UInt32(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]),
           Double(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]),   // start angle (degrees)
@@ -7496,9 +7508,17 @@ begin
     60: // bcGfxPaintBorder - PAINT (x,y),color,border : boundary flood fill (stops at the border colour).
         // Src1=x, Src2=y; Immediate [0-15]=color, [16-31]=border (int regs).
       if Assigned(FGraphics) then
-        FGraphics.FillBorder(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
+        FGraphics.FillBorder(DrawSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
           UInt32(Ctx.IntRegs[Instr.Immediate and $FFFF]),
           UInt32(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]));
+    61: // bcGfxSetTarget - set/clear the per-statement image draw target. Src1=handle; Immediate bit 0 = active.
+      if (Instr.Immediate and 1) <> 0 then
+      begin
+        FGfxDrawTargetActive := True;
+        FGfxDrawTargetHandle := Ctx.IntRegs[Instr.Src1];
+      end
+      else
+        FGfxDrawTargetActive := False;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

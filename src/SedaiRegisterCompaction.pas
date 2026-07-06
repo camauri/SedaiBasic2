@@ -486,7 +486,8 @@ begin
     bcGraphicWindow,  // Src1 = col1 register (int)
     bcGraphicCircle,  // Src1 = color register (int)
     bcGraphicPaint,   // Src1 = source register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxCircle, bcGfxCircleEx,  // FreeBASIC graphics: Src1 = w / x / x1 (int)
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxCircle, bcGfxCircleEx,
+    bcGfxSetTarget,  // SETTARGET: Src1 = image handle (int)  // FreeBASIC graphics: Src1 = w / x / x1 (int)
     bcGfxPalette, bcGfxPalGet,  // PALETTE: Src1 = index (int)
     bcGfxColor,  // COLOR: Src1 = foreground (int)
     bcGfxImageCreate, bcGfxImageDestroy, bcGfxImageInfo,  // IMAGE*: Src1 = w / handle (int)

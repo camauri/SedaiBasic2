@@ -404,6 +404,7 @@ begin
     ssaGfxCircle: Result := bcGfxCircle;
     ssaGfxCircleEx: Result := bcGfxCircleEx;
     ssaGfxPaintBorder: Result := bcGfxPaintBorder;
+    ssaGfxSetTarget: Result := bcGfxSetTarget;
     ssaGfxPalette: Result := bcGfxPalette;
     ssaGfxPalGet: Result := bcGfxPalGet;
     ssaGfxPaletteReset: Result := bcGfxPaletteReset;
@@ -1392,6 +1393,18 @@ begin
       BCInstr.Immediate := BCInstr.Immediate or
         ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
           Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF) shl 16);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // FreeBASIC image draw target: Src1=image handle (int reg); Immediate bit 0 = active flag (Src3 const, 1=set).
+  if Instr.OpCode = ssaGfxSetTarget then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcGfxSetTarget, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    if Instr.Src3.Kind = svkConstInt then
+      BCInstr.Immediate := Int64(Instr.Src3.ConstInt) and 1;
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;
