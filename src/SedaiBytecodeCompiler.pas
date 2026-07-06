@@ -403,6 +403,7 @@ begin
     ssaGfxLine: Result := bcGfxLine;
     ssaGfxCircle: Result := bcGfxCircle;
     ssaGfxCircleEx: Result := bcGfxCircleEx;
+    ssaGfxPaintBorder: Result := bcGfxPaintBorder;
     ssaGfxPalette: Result := bcGfxPalette;
     ssaGfxPalGet: Result := bcGfxPalGet;
     ssaGfxPaletteReset: Result := bcGfxPaletteReset;
@@ -1388,6 +1389,27 @@ begin
       BCInstr.Immediate := BCInstr.Immediate or (Int64(Instr.Src3.ConstInt) and $FFFF);
     // color (bits 16-31)
     if (Length(Instr.PhiSources) >= 1) and (Instr.PhiSources[0].Value.Kind = svkRegister) then
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+          Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF) shl 16);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // FreeBASIC PAINT boundary fill: Src1=x, Src2=y; Immediate packs color (from Src3, bits 0-15) and
+  // border colour (PhiSources[0], bits 16-31) — both integer registers.
+  if Instr.OpCode = ssaGfxPaintBorder then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcGfxPaintBorder, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    BCInstr.Immediate := 0;
+    if Instr.Src3.Kind = svkRegister then                                             // color
+      BCInstr.Immediate := BCInstr.Immediate or
+        (Int64(MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version)) and $FFFF);
+    if (Length(Instr.PhiSources) >= 1) and (Instr.PhiSources[0].Value.Kind = svkRegister) then       // border
       BCInstr.Immediate := BCInstr.Immediate or
         ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
           Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF) shl 16);

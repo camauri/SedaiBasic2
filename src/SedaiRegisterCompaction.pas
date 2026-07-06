@@ -486,7 +486,7 @@ begin
     bcGraphicWindow,  // Src1 = col1 register (int)
     bcGraphicCircle,  // Src1 = color register (int)
     bcGraphicPaint,   // Src1 = source register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxLine, bcGfxCircle, bcGfxCircleEx,  // FreeBASIC graphics: Src1 = w / x / x1 (int)
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxCircle, bcGfxCircleEx,  // FreeBASIC graphics: Src1 = w / x / x1 (int)
     bcGfxPalette, bcGfxPalGet,  // PALETTE: Src1 = index (int)
     bcGfxColor,  // COLOR: Src1 = foreground (int)
     bcGfxImageCreate, bcGfxImageDestroy, bcGfxImageInfo,  // IMAGE*: Src1 = w / handle (int)
@@ -647,7 +647,7 @@ begin
     bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
     bcGraphicWindow,  // Src2 = row1 register (int)
     bcGraphicCircle,  // Src2 = x register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxLine, bcGfxCircle, bcGfxCircleEx,  // FreeBASIC graphics: Src2 = h / y / y1 (int)
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxCircle, bcGfxCircleEx,  // FreeBASIC graphics: Src2 = h / y / y1 (int)
     bcGfxPalette,  // PALETTE set: Src2 = packed colour (int)
     bcGfxColor,  // COLOR: Src2 = background (int)
     bcGfxImageCreate,  // IMAGECREATE: Src2 = h (int)
@@ -1101,6 +1101,13 @@ begin
     begin
       MarkIntRegUsed(Instr.Immediate and $FFFF);            // radius
       MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);   // color
+    end;
+
+    // PAINT boundary fill: Immediate [0-15]=color, [16-31]=border (both int regs)
+    if OpCode = bcGfxPaintBorder then
+    begin
+      MarkIntRegUsed(Instr.Immediate and $FFFF);            // color
+      MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);   // border
     end;
 
     // CIRCLE (ellipse/arc): Dest=RX (an input, not a def); Immediate [0-15]=RY, [16-31]=color,
@@ -1666,6 +1673,22 @@ begin
 
     // bcGfxCircle: Immediate [0-15]=radius, [16-31]=color (int regs)
     if OpCode = bcGfxCircle then
+    begin
+      OldReg := Instr.Immediate and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewReg and $FFFF;
+      OldReg := (Instr.Immediate shr 16) and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 16);
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
+      end;
+    end;
+
+    // bcGfxPaintBorder: Immediate [0-15]=color, [16-31]=border (int regs)
+    if OpCode = bcGfxPaintBorder then
     begin
       OldReg := Instr.Immediate and $FFFF;
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;

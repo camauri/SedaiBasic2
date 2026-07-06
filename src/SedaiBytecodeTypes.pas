@@ -650,6 +650,8 @@ const
   // [16-31]=color, [32-47]=start-angle-degrees, [48-63]=end-angle-degrees (all int regs). RX/RY and the
   // angle-degree values are computed in the SSA generator, so this opcode carries only integer registers.
   bcGfxCircleEx     = bcGroupGraphics + 59;
+  // PAINT (x,y),color,border : boundary flood fill. Src1=x, Src2=y; Immediate[0-15]=color, [16-31]=border (int regs).
+  bcGfxPaintBorder  = bcGroupGraphics + 60;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1772,6 +1774,7 @@ begin
         57: Result := 'GfxDrawGML';
         58: Result := 'GfxPointCoord';
         59: Result := 'GfxCircleEx';
+        60: Result := 'GfxPaintBorder';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

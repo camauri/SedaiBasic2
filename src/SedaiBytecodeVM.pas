@@ -7493,6 +7493,12 @@ begin
           0.0, 0.0, 1);
         FDrawPenX := Ctx.IntRegs[Instr.Src1]; FDrawPenY := Ctx.IntRegs[Instr.Src2];  // centre becomes the current point
       end;
+    60: // bcGfxPaintBorder - PAINT (x,y),color,border : boundary flood fill (stops at the border colour).
+        // Src1=x, Src2=y; Immediate [0-15]=color, [16-31]=border (int regs).
+      if Assigned(FGraphics) then
+        FGraphics.FillBorder(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
+          UInt32(Ctx.IntRegs[Instr.Immediate and $FFFF]),
+          UInt32(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]));
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

@@ -4208,6 +4208,13 @@ begin
     begin
       Context.Advance;                                            // ','
       Result.AddChild(ParseExpression);                           // color
+      // FreeBASIC PAINT (x,y), color, border : an optional border colour selects the boundary-fill form.
+      if (Result.NodeType = antGfxPaint) and Context.Check(ttSeparParam) then
+      begin
+        Context.Advance;                                          // ','
+        Result.AddChild(ParseExpression);                         // border colour
+        Result.Attributes.Values['HASBORDER'] := '1';
+      end;
     end;
     DoNodeCreated(Result);
     Exit;

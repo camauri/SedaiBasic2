@@ -8255,10 +8255,12 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessGfxPaint(Node: TASTNode);
-// PAINT (x, y) [, color] : flood fill from (x,y) with color. Children: x, y [, color]. Color in Src3
-// -> Immediate (int reg). (FB's optional border-colour argument is deferred.) STEP: (x,y) relative.
+// PAINT (x, y) [, color [, border]] : flood fill from (x,y) with color. Children: x, y [, color [, border]].
+// A border colour selects the boundary-fill form (ssaGfxPaintBorder); otherwise a plain flood fill
+// (ssaGfxPaint). STEP: (x,y) relative to the current graphics point.
 var
-  XVal, YVal, CVal, XReg, YReg, CReg, PenX, PenY: TSSAValue;
+  XVal, YVal, CVal, BVal, XReg, YReg, CReg, BReg, PenX, PenY: TSSAValue;
+  Instr: TSSAInstruction;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 2) then Exit;
   ProcessExpression(Node.GetChild(0), XVal); XReg := EnsureIntRegister(XVal);
@@ -8274,6 +8276,14 @@ begin
   end
   else
     CReg := DefaultDrawColorReg;   // omitted colour -> current draw foreground (COLOR)
+  if (Node.Attributes.Values['HASBORDER'] = '1') and (Node.ChildCount >= 4) then
+  begin
+    ProcessExpression(Node.GetChild(3), BVal); BReg := EnsureIntRegister(BVal);
+    EmitInstruction(ssaGfxPaintBorder, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color
+    Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+    Instr.AddPhiSource(BReg, nil);   // border -> Immediate bits 16-31
+    Exit;
+  end;
   EmitInstruction(ssaGfxPaint, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color -> Immediate
 end;
 

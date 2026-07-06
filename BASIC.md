@@ -2478,7 +2478,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `CIRCLE` | ✓ | Plots circles and ellipses. C128 form (`CIRCLE source,x,y,...`) and FreeBASIC form (`CIRCLE [STEP](x,y),r[,color]`, parenthesised → routed through IGraphicsBackend, headless-testable + on-screen on sbv); `STEP` = centre relative to the current graphics point. FB ellipse/arc/aspect arguments deferred. |
 | `DRAW` | ✓ | Draws in a sequence of commands on an image buffer or screen. |
 | `DRAW STRING` | ✓ | Writes text to an image buffer or screen. |
-| `PAINT` | ✓ | Flood fill. C128 form (`PAINT source,x,y`) and FreeBASIC form (`PAINT (x,y),color`, parenthesised → routed through IGraphicsBackend, headless-testable). Border-colour argument deferred. |
+| `PAINT` | ✓ | Flood fill. C128 form (`PAINT source,x,y`) and FreeBASIC form (`PAINT [STEP](x,y),color[,border]`, parenthesised → routed through IGraphicsBackend, headless-testable). An optional border colour selects the boundary-fill form (fill up to the border colour); `STEP` = coordinate relative to the current graphics point. |
 
 #### Image Buffer Creation
 

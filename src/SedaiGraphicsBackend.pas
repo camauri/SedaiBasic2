@@ -69,6 +69,7 @@ type
     procedure DrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
     procedure DrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
     procedure Fill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);   // flood fill (PAINT)
+    procedure FillBorder(Surface: TGfxSurface; X, Y: Integer; Color, BorderColor: TGfxColor);  // boundary fill (PAINT ...,border)
     procedure SetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);  // VIEW clip rect
     procedure Blit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);  // accelerable; deferred to G3
     // --- palette ---
@@ -108,6 +109,7 @@ type
     procedure DrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
     procedure DrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
     procedure Fill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
+    procedure FillBorder(Surface: TGfxSurface; X, Y: Integer; Color, BorderColor: TGfxColor);
     procedure SetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);
     procedure Blit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);
     procedure EnablePalette(Enable: Boolean);
@@ -319,6 +321,46 @@ begin
     Dec(Top);
     CX := Stack[Top].PX; CY := Stack[Top].PY;
     if M.GetPixel(CX, CY) <> Target then Continue;
+    M.SetPixel(CX, CY, Color);
+    Push(CX + 1, CY); Push(CX - 1, CY);
+    Push(CX, CY + 1); Push(CX, CY - 1);
+  end;
+end;
+
+procedure TSoftwareGraphicsBackend.FillBorder(Surface: TGfxSurface; X, Y: Integer; Color, BorderColor: TGfxColor);
+// Iterative 4-way boundary fill (FreeBASIC "PAINT (x,y), color, border"): flood outward from (x,y),
+// filling every pixel that is not already the border colour, stopping at the border. Mirrors Fill but the
+// stop condition is "pixel = BorderColor" rather than "pixel <> seed colour".
+var
+  W, H, Top: Integer;
+  Stack: array of record PX, PY: Integer; end;
+
+  procedure Push(AX, AY: Integer);
+  begin
+    if (AX < 0) or (AY < 0) or (AX >= W) or (AY >= H) then Exit;
+    if Top >= Length(Stack) then SetLength(Stack, (Top + 1) * 2);
+    Stack[Top].PX := AX; Stack[Top].PY := AY; Inc(Top);
+  end;
+
+var
+  CX, CY: Integer;
+  PC: TGfxColor;
+  M: TGraphicsMemory;
+begin
+  M := MemoryOf(Surface);
+  if not Assigned(M) then Exit;
+  W := M.State.Width; H := M.State.Height;
+  if (X < 0) or (Y < 0) or (X >= W) or (Y >= H) then Exit;
+  if M.GetPixel(X, Y) = BorderColor then Exit;   // seed already on the border
+  Top := 0;
+  SetLength(Stack, 64);
+  Push(X, Y);
+  while Top > 0 do
+  begin
+    Dec(Top);
+    CX := Stack[Top].PX; CY := Stack[Top].PY;
+    PC := M.GetPixel(CX, CY);
+    if (PC = BorderColor) or (PC = Color) then Continue;   // hit the border, or already filled
     M.SetPixel(CX, CY, Color);
     Push(CX + 1, CY); Push(CX - 1, CY);
     Push(CX, CY + 1); Push(CX, CY - 1);
