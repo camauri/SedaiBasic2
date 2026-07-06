@@ -6320,11 +6320,21 @@ begin
       end;
     antBinaryOp:
       begin
-        L := InferExprBank(Node.GetChild(0));
-        if Node.ChildCount > 1 then R := InferExprBank(Node.GetChild(1)) else R := L;
-        if (L = srtString) or (R = srtString) then Result := srtString
-        else if (L = srtFloat) or (R = srtFloat) then Result := srtFloat
-        else Result := srtInt;
+        // A comparison / short-circuit-logical operator always yields an integer boolean (-1/0),
+        // regardless of operand banks — e.g. (str = str) is INT, not string. Only value-producing
+        // operators (arithmetic, string concat) propagate the operand bank.
+        if (Node.Token <> nil) and (Node.Token.TokenType in
+             [ttOpEq, ttOpNeq, ttOpLt, ttOpGt, ttOpLe, ttOpGe,
+              ttOpAndAlso, ttOpOrElse, ttOpIs]) then
+          Result := srtInt
+        else
+        begin
+          L := InferExprBank(Node.GetChild(0));
+          if Node.ChildCount > 1 then R := InferExprBank(Node.GetChild(1)) else R := L;
+          if (L = srtString) or (R = srtString) then Result := srtString
+          else if (L = srtFloat) or (R = srtFloat) then Result := srtFloat
+          else Result := srtInt;
+        end;
       end;
     antUnaryOp:
       if Node.ChildCount > 0 then Result := InferExprBank(Node.GetChild(0));
