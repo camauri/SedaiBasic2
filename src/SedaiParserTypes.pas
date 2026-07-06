@@ -200,6 +200,7 @@ type
     antMove,              // MOVE/MV command (move file)
     antSetenviron,        // SETENVIRON "NAME=value" (FreeBASIC: set an environment variable)
     antShell,             // SHELL cmd (FreeBASIC: run a command via the system shell)
+    antOut,               // OUT port, value (FreeBASIC: hardware port write — no-op on a portable VM)
     antGraphics,          // GRAPHIC command
     antScnClr,            // SCNCLR command (clear screen)
     antScreenRes,         // SCREENRES w, h (FreeBASIC graphics)

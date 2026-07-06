@@ -358,6 +358,8 @@ const
   kLPRINT  = 'LPRINT';                             // FreeBASIC: LPRINT ... -> print to the line printer (routed to stdout here)
   kLPOS    = 'LPOS';                               // FreeBASIC: LPOS(n) -> line-printer head column
   kISREDIRECTED = 'ISREDIRECTED';                  // FreeBASIC: ISREDIRECTED(n) -> is a standard stream redirected?
+  kINP     = 'INP';                                // FreeBASIC: INP(port) -> read a hardware I/O port (no hardware here -> 0)
+  kOUT     = 'OUT';                                // FreeBASIC: OUT port, value -> write a hardware I/O port (no-op here)
   kMACROFUNCTION   = '__FUNCTION__';    // FreeBASIC: quoted name of the current function block (intrinsic macro string)
   kMACROFUNCTIONNQ = '__FUNCTION_NQ__'; // FreeBASIC: non-quoted name of the current function block
   kFBMAINPROC      = '__FB_MAINPROC__'; // FreeBASIC: __FUNCTION__ value when used at module level (main module)

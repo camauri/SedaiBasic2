@@ -5192,6 +5192,7 @@ begin
     'CHDIR', 'CD': Result := TASTNode.Create(antChdir, Token);
     'SETENVIRON': Result := TASTNode.Create(antSetenviron, Token);
     'SHELL': Result := TASTNode.Create(antShell, Token);
+    'OUT': Result := TASTNode.Create(antOut, Token);
     'MOVE', 'MV': Result := TASTNode.Create(antMove, Token);
     // FreeBASIC/QB filesystem mutation: KILL deletes a file (= SCRATCH), FILECOPY copies (= COPY),
     // RMDIR removes a directory (new).

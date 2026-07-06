@@ -537,6 +537,7 @@ type
     procedure ProcessMkdir(Node: TASTNode);
     procedure ProcessSetenviron(Node: TASTNode);
     procedure ProcessShell(Node: TASTNode);
+    procedure ProcessOut(Node: TASTNode);
     procedure ProcessChdir(Node: TASTNode);
     procedure ProcessRmdir(Node: TASTNode);
     procedure ProcessMoveFile(Node: TASTNode);
@@ -3965,6 +3966,15 @@ begin
         // FreeBASIC ISREDIRECTED(n): whether a standard stream is redirected. Portable default: not
         // redirected (0). Evaluate and discard the argument.
         if FModernMode and (UpperCase(ArrName) = kISREDIRECTED) and (ArrayIndexOf(ArrName) < 0) then
+        begin
+          if Node.GetChild(1).ChildCount >= 1 then ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC INP(port): read a hardware I/O port. A portable VM has no ports, so the value is 0.
+        if FModernMode and (UpperCase(ArrName) = kINP) and (ArrayIndexOf(ArrName) < 0) then
         begin
           if Node.GetChild(1).ChildCount >= 1 then ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -12466,6 +12476,18 @@ begin
   EmitInstruction(ssaShell, MakeSSAValue(svkNone), Reg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
+procedure TSSAGenerator.ProcessOut(Node: TASTNode);
+// OUT port, value: write a hardware I/O port. A portable VM has no hardware ports, so this is a no-op —
+// but the operand expressions are still evaluated (in case they have side effects), then discarded.
+var
+  i: Integer;
+  Val: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+    ProcessExpression(Node.GetChild(i), Val);
+end;
+
 procedure TSSAGenerator.ProcessChdir(Node: TASTNode);
 var
   PathVal: TSSAValue;
@@ -17558,6 +17580,7 @@ begin
     antMkdir: ProcessMkdir(Node);
     antSetenviron: ProcessSetenviron(Node);
     antShell: ProcessShell(Node);
+    antOut: ProcessOut(Node);
     antChdir: ProcessChdir(Node);
     antRmdir: ProcessRmdir(Node);
     antMove: ProcessMoveFile(Node);

@@ -1776,6 +1776,7 @@ begin
  RegisterKeyword(kSETENVIRON, ttFileManagement, 'Set an environment variable (NAME=value)', kcDOSCommands);
  RegisterKeyword(kSHELL,     ttFileManagement, 'Run a command via the system shell',        kcDOSCommands);
  RegisterKeyword(kLPRINT,    ttOutputCommand,  'Print to the line printer (routed to stdout here)', kcStdIO);
+ RegisterKeyword(kOUT,       ttFileManagement, 'Write a hardware I/O port (no-op on a portable VM)', kcDOSCommands);
  RegisterKeyword(kCD,        ttFileManagement, 'Change directory (alias for CHDIR)',       kcDOSCommands);
  RegisterKeyword(kMOVE,      ttFileManagement, 'Move file to another location',            kcDOSCommands);
  RegisterKeyword(kMV,        ttFileManagement, 'Move file (alias for MOVE)',               kcDOSCommands);
