@@ -2474,6 +2474,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `PSET and PRESET` | ◐ | `PSET (x,y),color` plots a pixel on the screen surface (via IGraphicsBackend; headless-testable + on-screen on sbv). `PRESET` and the image-buffer target deferred. |
+| `DRAW` | ✓ | FreeBASIC graphics macro language `DRAW "C15 M50,50 R10 D10 ..."` (C/S/A, M abs+relative, U/D/L/R, E/F/G/H, B/N prefixes); tracks the pen for `POINTCOORD`. |
+| `POINTCOORD` | ✓ | `POINTCOORD(0)`/`POINTCOORD(1)` — the DRAW pen x / y. |
 | `LINE (GRAPHICS)` | ✓ | `LINE (x1,y1)-(x2,y2)[,color][,B\|BF]` draws a line, box outline (B) or filled box (BF) on the screen surface (via IGraphicsBackend; headless-testable + on-screen on sbv). Parenthesised form disambiguates from `LINE INPUT`. Leading start-coordinate / STEP / line-style and the image-buffer target deferred. |
 | `CIRCLE` | ✓ | Plots circles and ellipses. C128 form (`CIRCLE source,x,y,...`) and FreeBASIC form (`CIRCLE (x,y),r[,color]`, parenthesised → routed through IGraphicsBackend, headless-testable + on-screen on sbv). FB ellipse/arc/aspect arguments deferred. |
 | `DRAW` | ✓ | Draws in a sequence of commands on an image buffer or screen. |
@@ -2562,7 +2564,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `VIEW (GRAPHICS)` | ✓ | `VIEW [SCREEN] (x1,y1)-(x2,y2)` sets a viewport: drawing is clipped to it and (without SCREEN) coordinates become relative to its top-left; bare `VIEW` resets to the full screen. Optional fill/border colours accepted-and-ignored (v1). Disambiguated from QB `VIEW PRINT`. |
 | `WINDOW` | ✓ | `WINDOW [SCREEN] (x1,y1)-(x2,y2)` sets a logical coordinate system mapped onto the screen (default Y-flip; SCREEN = no flip); bare `WINDOW` disables it. PSET/LINE/CIRCLE/PAINT/POINT map logical→physical (CIRCLE radius scaled by the x-axis scale). GET/PUT stay in physical coords (v1). Disambiguated from the C128 text `WINDOW`. |
 | `PMAP` | ✓ | `PMAP(coord, n)` maps between logical and physical coordinates (n: 0=lx→px, 1=ly→py, 2=px→lx, 3=py→ly) using the active WINDOW transform. |
-| `POINTCOORD` | ✗ | Queries Draw's pen position. |
+| `POINTCOORD` | ✓ | Queries DRAW's pen position — `POINTCOORD(0)` = x, `POINTCOORD(1)` = y. |
 
 #### Screen Data Types
 

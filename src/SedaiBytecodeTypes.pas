@@ -644,6 +644,8 @@ const
   bcStick           = bcGroupGraphics + 55;
   // STRIG(button) : Dest=result (int -1/0), Src1=button reg (0..7)
   bcStrig           = bcGroupGraphics + 56;
+  bcGfxDrawGML      = bcGroupGraphics + 57;  // DRAW "..." : interpret the FreeBASIC graphics macro language (Src1 = string)
+  bcGfxPointCoord   = bcGroupGraphics + 58;  // POINTCOORD(n): the DRAW pen coordinate (Dest=result, Src1=selector 0=x/1=y)
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1763,6 +1765,8 @@ begin
         54: Result := 'JoyAxis';
         55: Result := 'Stick';
         56: Result := 'Strig';
+        57: Result := 'GfxDrawGML';
+        58: Result := 'GfxPointCoord';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

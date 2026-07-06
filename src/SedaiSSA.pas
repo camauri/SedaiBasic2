@@ -3982,6 +3982,17 @@ begin
           Exit;
         end;
 
+        // FreeBASIC POINTCOORD(n): the DRAW pen coordinate (n=0 -> x, n=1 -> y) in logical coordinates.
+        if FModernMode and (UpperCase(ArrName) = kPOINTCOORD) and (ArrayIndexOf(ArrName) < 0) and
+           (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ArgReg := EnsureIntRegister(ArgValue);
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaGfxPointCoord, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
         // FreeBASIC COMMAND$(index) / COMMAND(index): the index-th command-line argument (index<0 = whole
         // command line, 0 = executable name, n>=1 = n-th arg, '' if out of range). Empty parens = -1.
         if FModernMode and ((UpperCase(ArrName) = kCOMMAND) or (UpperCase(ArrName) = kCOMMANDS)) and
@@ -9091,6 +9102,20 @@ var
   HasColor: Boolean;
 begin
   ParamCount := Node.ChildCount;
+
+  // FreeBASIC DRAW "gml": a single STRING argument is the graphics macro language (turtle graphics),
+  // interpreted at run time — not the Commodore coordinate form. Lower it to ssaGfxDrawGML.
+  if (ParamCount = 1) and Assigned(Node.GetChild(0)) then
+  begin
+    ProcessExpression(Node.GetChild(0), ColorVal);
+    if (ColorVal.Kind = svkConstString) or
+       ((ColorVal.Kind = svkRegister) and (ColorVal.RegType = srtString)) then
+    begin
+      ColorReg := EnsureStringRegister(ColorVal);
+      EmitInstruction(ssaGfxDrawGML, MakeSSAValue(svkNone), ColorReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Exit;
+    end;
+  end;
 
   // Minimum: color (or nil), x1, y1 = at least 2 non-nil params
   // Parse: [color], x1, y1 [TO x2, y2]...

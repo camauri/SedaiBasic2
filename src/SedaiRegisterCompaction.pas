@@ -273,6 +273,7 @@ begin
     bcJoyBtn,         // __JOYBTN: Dest = cached button bitmask (int)
     bcStick,          // STICK: Dest = axis position 1..200/0 (int)
     bcStrig,          // STRIG: Dest = button state -1/0 (int)
+    bcGfxPointCoord,  // POINTCOORD(n): Dest = pen coordinate (int)
     bcGraphicRdot,    // Dest = pixel cursor info (int)
     bcGraphicGetMode, // Dest = current graphic mode (int)
     bcGraphicPos,     // POS(x): cursor column position (int)
@@ -497,6 +498,7 @@ begin
     bcSetmouse,  // SETMOUSE: Src1 = x (int)
     bcGetJoystick,  // GETJOYSTICK: Src1 = device id (int)
     bcStick, bcStrig,  // STICK/STRIG: Src1 = axis / button (int)
+    bcGfxPointCoord,   // POINTCOORD(n): Src1 = selector (int)
     bcGraphicSShape,  // Src1 = x1 coordinate (int)
     bcGraphicColor,   // Src1 = source register (int)
     bcGraphicWidth,   // Src1 = width value (int)
@@ -743,6 +745,7 @@ begin
     bcEnviron,   // ENVIRON$(name) - Src1 = name string
     bcSetEnviron, // SETENVIRON "NAME=value" - Src1 = string
     bcShell,      // SHELL cmd - Src1 = command string
+    bcGfxDrawGML, // DRAW "..." - Src1 = GML string
     bcStrFormat, // FORMAT(num, mask) - Src1 = mask string
 
     bcStrVal,    // VAL(str) - reads string, produces float

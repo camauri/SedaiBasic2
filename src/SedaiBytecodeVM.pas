@@ -174,6 +174,7 @@ type
     FTimeOffset: Int64;     // TI$ offset in milliseconds from real time
     FClockOffsetDays: Double; // FreeBASIC SETDATE/SETTIME offset (days) applied to NOW/DATE/TIME/TIMER
     FEnvOverrides: TStringList; // SETENVIRON "NAME=value" overrides, consulted by ENVIRON$ before the OS environment
+    FDrawPenX, FDrawPenY: Integer; // FreeBASIC DRAW "..." (GML) pen position, in logical (WINDOW) coordinates; read by POINTCOORD
     FLastFrameTick: QWord;  // Last FRAME sync tick for drift-free timing
     // Function key definitions (1-12)
     FFunctionKeys: array[1..12] of string;
@@ -284,6 +285,7 @@ type
     procedure ExecuteMkdir(const Path: string);
     procedure SetEnvOverride(const NameValue: string);   // SETENVIRON: record a "NAME=value" override
     function RunShellCommand(const Cmd: string): Integer; // SHELL: run a command via the platform shell, return exit code
+    procedure DrawGML(const S: string);                  // DRAW "...": interpret the FreeBASIC graphics macro language
     procedure ExecuteChdir(const Path: string);
     procedure ExecuteRmdir(const Path: string);
     procedure ExecuteMoveFile(const Src, Dest: string);
@@ -7439,6 +7441,13 @@ begin
         else
           Ctx.IntRegs[Instr.Dest] := 0;
       end;
+    57: // bcGfxDrawGML - DRAW "..." : interpret the FreeBASIC graphics macro language (Src1 = string).
+      DrawGML(Ctx.StringRegs[Instr.Src1]);
+    58: // bcGfxPointCoord - POINTCOORD(n): the DRAW pen coordinate (Src1 selector: 0 = x, 1 = y).
+      if Ctx.IntRegs[Instr.Src1] = 1 then
+        Ctx.IntRegs[Instr.Dest] := FDrawPenY
+      else
+        Ctx.IntRegs[Instr.Dest] := FDrawPenX;
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
@@ -8595,6 +8604,107 @@ begin
     {$ENDIF}
   except
     on E: Exception do Result := -1;   // shell not found / launch failure
+  end;
+end;
+
+procedure TBytecodeVM.DrawGML(const S: string);
+// Interpret a FreeBASIC DRAW graphics-macro-language string, drawing on the current work surface and
+// tracking the pen position (FDrawPenX/Y, read by POINTCOORD). Supported commands (case-insensitive):
+//   C n      set the draw colour (raw, as LINE/PSET take it)
+//   S n      set scale (n/4; 4 = 1x) applied to the directional/relative distances
+//   A n      set angle in quarter-turns (0..3, clockwise)
+//   M x,y    move: absolute if unsigned, relative (pen + scaled delta) if the first coord is signed (+/-)
+//   U/D/L/R n  draw up/down/left/right by n (default 1)
+//   E/F/G/H n  draw the four diagonals by n
+//   B prefix blind move (do not draw); N prefix no-update (draw but keep the pen where it was)
+// Distances are scaled by S and rotated by A; an absolute M is neither scaled nor rotated.
+var
+  i: Integer;
+  cmd: Char;
+  blindP, noUpdateP, sgn, sgnY: Boolean;
+  num, my, sc, ang, nx, ny: Integer;
+  penColor: UInt32;
+
+  procedure SkipSep;
+  begin
+    while (i <= Length(S)) and (S[i] in [' ', ';', #9, #10, #13]) do Inc(i);
+  end;
+
+  function ReadNum(out val: Integer; out isSigned: Boolean): Boolean;
+  var st, s2: Integer;
+  begin
+    val := 0; isSigned := False; s2 := 1;
+    SkipSep;
+    if (i <= Length(S)) and ((S[i] = '+') or (S[i] = '-')) then
+    begin isSigned := True; if S[i] = '-' then s2 := -1; Inc(i); end;
+    st := i;
+    while (i <= Length(S)) and (S[i] >= '0') and (S[i] <= '9') do
+    begin val := val * 10 + (Ord(S[i]) - Ord('0')); Inc(i); end;
+    Result := i > st;
+    val := val * s2;
+  end;
+
+  function Scaled(d: Integer): Integer;
+  begin Result := (d * sc) div 4; end;
+
+  procedure StepPen(dx, dy: Integer);   // draw a scaled+rotated segment from the pen, honouring B/N
+  var t, ex, ey: Integer;
+  begin
+    dx := Scaled(dx); dy := Scaled(dy);
+    case ang and 3 of
+      1: begin t := dx; dx := -dy; dy := t; end;    // 90 CW (screen y grows down)
+      2: begin dx := -dx; dy := -dy; end;           // 180
+      3: begin t := dx; dx := dy; dy := -t; end;    // 270
+    end;
+    ex := FDrawPenX + dx; ey := FDrawPenY + dy;
+    if (not blindP) and Assigned(FGraphics) then
+      FGraphics.DrawLine(FGfxWorkSurface, GfxMapX(FDrawPenX), GfxMapY(FDrawPenY),
+                         GfxMapX(ex), GfxMapY(ey), penColor, 1);
+    if not noUpdateP then begin FDrawPenX := ex; FDrawPenY := ey; end;
+  end;
+
+begin
+  if S = '' then Exit;
+  i := 1;
+  penColor := FGfxForeColor;
+  sc := 4; ang := 0;
+  while i <= Length(S) do
+  begin
+    SkipSep;
+    if i > Length(S) then Break;
+    blindP := False; noUpdateP := False;
+    while (i <= Length(S)) and (UpCase(S[i]) in ['B', 'N']) do
+    begin
+      if UpCase(S[i]) = 'B' then blindP := True else noUpdateP := True;
+      Inc(i);
+    end;
+    if i > Length(S) then Break;
+    cmd := UpCase(S[i]); Inc(i);
+    case cmd of
+      'C': if ReadNum(num, sgn) then penColor := UInt32(num);
+      'S': if ReadNum(num, sgn) then sc := num;
+      'A': if ReadNum(num, sgn) then ang := num and 3;
+      'U': begin if not ReadNum(num, sgn) then num := 1; StepPen(0, -num); end;
+      'D': begin if not ReadNum(num, sgn) then num := 1; StepPen(0,  num); end;
+      'L': begin if not ReadNum(num, sgn) then num := 1; StepPen(-num, 0); end;
+      'R': begin if not ReadNum(num, sgn) then num := 1; StepPen( num, 0); end;
+      'E': begin if not ReadNum(num, sgn) then num := 1; StepPen( num, -num); end;
+      'F': begin if not ReadNum(num, sgn) then num := 1; StepPen( num,  num); end;
+      'G': begin if not ReadNum(num, sgn) then num := 1; StepPen(-num,  num); end;
+      'H': begin if not ReadNum(num, sgn) then num := 1; StepPen(-num, -num); end;
+      'M':
+        begin
+          ReadNum(num, sgn);
+          if (i <= Length(S)) and (S[i] = ',') then Inc(i);
+          ReadNum(my, sgnY);
+          if sgn then begin nx := FDrawPenX + Scaled(num); ny := FDrawPenY + Scaled(my); end
+          else begin nx := num; ny := my; end;
+          if (not blindP) and Assigned(FGraphics) then
+            FGraphics.DrawLine(FGfxWorkSurface, GfxMapX(FDrawPenX), GfxMapY(FDrawPenY),
+                               GfxMapX(nx), GfxMapY(ny), penColor, 1);
+          if not noUpdateP then begin FDrawPenX := nx; FDrawPenY := ny; end;
+        end;
+    end;
   end;
 end;
 

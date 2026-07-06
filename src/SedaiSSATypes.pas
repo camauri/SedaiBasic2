@@ -245,6 +245,8 @@ type
     ssaPRst,           // PRST: Reset palette to default
     ssaScnClr,         // SCNCLR [mode]: Clear screen (text or graphics)
     ssaGfxScreenRes,   // SCREENRES w,h (FreeBASIC graphics, via IGraphicsBackend)
+    ssaGfxDrawGML,     // DRAW "..." : FreeBASIC graphics-macro-language string (Src1 = string)
+    ssaGfxPointCoord,  // POINTCOORD(n): DRAW pen coordinate (Dest = result, Src1 = selector 0=x/1=y)
     ssaGfxPset,        // PSET (x,y),color
     ssaGfxPoint,       // POINT(x,y) -> color
     ssaGfxPaint,       // PAINT (x,y),color (flood fill)

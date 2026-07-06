@@ -396,6 +396,8 @@ begin
     ssaScnClr: Result := bcScnClr;
     ssaGfxScreenRes: Result := bcGfxScreenRes;
     ssaGfxPset: Result := bcGfxPset;
+    ssaGfxDrawGML: Result := bcGfxDrawGML;
+    ssaGfxPointCoord: Result := bcGfxPointCoord;
     ssaGfxPoint: Result := bcGfxPoint;
     ssaGfxPaint: Result := bcGfxPaint;
     ssaGfxLine: Result := bcGfxLine;
