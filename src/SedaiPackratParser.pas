@@ -7027,6 +7027,41 @@ begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
   Context.Advance;                                   // consume STATIC
+  // FreeBASIC AS-first form: "STATIC AS type name1 [= init] [, name2 ...]" — the shared type precedes the
+  // names (like "DIM AS type name"). Distinct from the "STATIC name AS type" form handled below.
+  if Context.Check(ttAsType) then
+  begin
+    Context.Advance;                                 // AS
+    if not Context.Check(ttIdentifier) then
+    begin
+      HandleError('Expected type name after AS', Context.CurrentToken);
+      DoNodeCreated(Result); Exit;
+    end;
+    TypeTok := Context.CurrentToken;
+    StaticTypeName := ParseDottedName;
+    while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+    begin StaticTypeName := StaticTypeName + ' PTR'; Context.Advance; end;
+    repeat
+      if not Context.Check(ttIdentifier) then Break;
+      NameTok := Context.CurrentToken;
+      Context.Advance;                               // name
+      DeclNode := TASTNode.Create(antArrayDecl, NameTok);
+      DeclNode.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
+      DeclNode.AddChild(TASTNode.CreateWithValue(antIdentifier, StaticTypeName, TypeTok));
+      if Context.Check(ttOpEq) then
+      begin
+        Context.Advance;                             // =
+        Init := FExpressionParser.ParseExpression;
+        if Assigned(Init) then DeclNode.AddChild(Init);
+      end;
+      DeclNode.Attributes.Values['STATIC'] := '1';
+      DoNodeCreated(DeclNode);
+      Result.AddChild(DeclNode);
+      if Context.Check(ttSeparParam) then Context.Advance else Break;
+    until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
+    DoNodeCreated(Result);
+    Exit;
+  end;
   repeat
     if not Context.Check(ttIdentifier) then
     begin

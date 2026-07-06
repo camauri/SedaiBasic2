@@ -1301,7 +1301,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `DIM` | ✓ | Declares a variable at the current scope. Both `DIM name AS type [= init]` and the leading-AS form `DIM [SHARED] AS type name[, ...] [= init]` (type shared by every name) are supported. Array forms: fixed `DIM a(dims) AS type`, an initializer with either sign `DIM a(dims) AS type = { ... }` / `=> { ... }`, an empty variable-length array `DIM x()` (starts at `UBOUND = -1`, sized later with `REDIM`), and an ellipsis upper bound `DIM x(lb TO ...) = { ... }` / `DIM x(...) = { ... }` (size deduced from the initializer). |
 | `CONST` | ✓ | Declares a non-modifiable variable. Both the untyped `CONST name = value` and the typed `CONST name AS type = value` forms are supported (immutability is not enforced). |
 | `SCOPE` | ✓ | Begins a new scope block. |
-| `STATIC` | ✓ | Declares variables in a procedure that retain their value between calls. |
+| `STATIC` | ✓ | Declares local variables that retain their value between calls (initializer runs once). Both `STATIC name AS type` and the AS-first `STATIC AS type name [, ...]` orders. |
 | `SHARED` | ✓ | Used with Dim allows variables to be visible throughout a module. |
 | `VAR` | ✓ | Declares variables where the data type is implied from an initializer. The bank is inferred from string literals, `+` concatenation, and string-returning function calls (`SPACE`, `LEFT`, `STR`, `CHR`, `UCASE`, `HEX`, …), as well as numeric expressions. |
 | `BYREF (variables)` | ✓ | Used with Dim or Static or Var allows to declare references. (DIM BYREF done; VAR/STATIC BYREF deferred.) |
@@ -1853,8 +1853,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `__FB_ARGC__` | ✗ | Defined as an integer literal of the number of command-line arguments passed to the program. |
-| `__FB_ARGV__` | ✗ | Defined as a Zstring Ptr Ptr to the command line arguments passed to the program. |
+| `__FB_ARGC__` | ✓ | The number of command-line arguments passed to the program (matches `COMMAND$` handling). |
+| `__FB_ARGV__` | ~ | Defined (returns 0 — a real ZSTRING PTR PTR argument vector is not exposed; use `COMMAND$(n)`). |
 | `__DATE__` | ✓ | String literal of the compilation date in "mm-dd-yyyy" format (captured at compile time). |
 | `__DATE_ISO__` | ✓ | String literal of the compilation date in "yyyy-mm-dd" format. |
 | `__TIME__` | ✓ | String literal of the compilation time in "hh:mm:ss" format. |
@@ -2182,11 +2182,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `INPUT (File Mode)` | ✓ | Text data can be read from the file. |
 | `OUTPUT` | ✓ | `OPEN "f" FOR OUTPUT AS #n` opens the file for writing (truncating). |
 | `APPEND` | ✓ | Text data is added to the end of a file when output. |
-| `BINARY` | ✗ | Arbitrary data can be read from or written to the file. |
-| `RANDOM` | ✗ | Blocks of data of certain size can be read from and written to the file. |
+| `BINARY` | ✓ | `OPEN "f" FOR BINARY AS #n`; byte/record access via `PUT #n,pos,var` / `GET #n,pos,var`. |
+| `RANDOM` | ✓ | `OPEN "f" FOR RANDOM AS #n LEN=size`; fixed-size record access via `PUT #n,rec,var` / `GET #n,rec,var`. |
 | `ACCESS` | ✓ | `OPEN ... ACCESS {READ\|WRITE\|READ WRITE} ...` — parsed and accepted (the VM does not enforce share/access rights). |
 | `READ (File Access)` | ✓ | Binary data can only be read from the file. |
-| `WRITE (File Access)` | ✗ | Binary data can only be written to the file. |
+| `WRITE (File Access)` | ✓ | `WRITE #n, ...` writes quoted comma-separated (CSV) values to the file. |
 | `READ WRITE(File Access)` | ✓ | Binary data can be read from and written to the file. |
 | `ENCODING` | ✗ | Specifies the character encoding of a file. |
 
