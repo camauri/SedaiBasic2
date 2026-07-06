@@ -2097,7 +2097,10 @@ begin
                       kCONT,
                       // CHAR: the Commodore v7 "display text at position" command — FreeBASIC has no CHAR
                       // (it uses CHR); "char" is a common variable name (character).
-                      kCHAR],
+                      kCHAR,
+                      // LIST: the Commodore/immediate-mode "list the program lines" command — FreeBASIC has
+                      // no LIST function, and "list" is a common identifier/type name (a linked list).
+                      kLIST],
                      kdClassicOnly);
 
   //WriteLn('DEBUG RegisterBasicKeywords: Completed registration of ', GetKeywordCount, ' keywords');

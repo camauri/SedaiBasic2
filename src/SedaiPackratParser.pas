@@ -2697,10 +2697,11 @@ function TPackratParser.ParseRecordDecl(IsUnion: Boolean): TASTNode;
 var
   Token, NameTok, FieldTok: TLexerToken;
   FieldNode, TypeNode, ArrDimNode: TASTNode;
-  PrevIdx: Integer;
+  PrevIdx, NestedUnionDepth: Integer;
   FieldTypeName, TokU, AliasType: string;
   IsStaticField, LeadingType: Boolean;
 begin
+  NestedUnionDepth := 0;
   // TYPE/UNION name <newline> field AS type <newline> ... END TYPE/END UNION
   // Each field node is antIdentifier(fieldName) with one child antIdentifier(typeName).
   // An empty type name child means "infer from the field's name suffix" (SSA side).
@@ -2802,7 +2803,19 @@ begin
   begin
     if Context.Match(ttEndOfLine) then Continue;
     if Context.Check(ttSeparStmt) then begin Context.Advance; Continue; end;
-    if AtEndType then Break;
+    // FreeBASIC anonymous nested UNION inside a TYPE: "union ... end union". v1 FLATTENS its members as
+    // ordinary (non-overlapping) fields of the parent — enough for code that reads back whichever member it
+    // last wrote (true storage overlap / type-punning is not modelled). Track nesting so a nested "end
+    // union" closes the union (not the whole type); the members parse as normal fields in between.
+    if Context.Check(ttUnionDecl) then begin Inc(NestedUnionDepth); Context.Advance; Continue; end;
+    if (NestedUnionDepth > 0) and Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttUnionDecl) then
+    begin
+      Dec(NestedUnionDepth);
+      Context.Advance; Context.Advance;               // consume END UNION
+      Continue;
+    end;
+    if (NestedUnionDepth = 0) and AtEndType then Break;
     PrevIdx := Context.CurrentIndex;
     TokU := UpperCase(VarToStr(Context.CurrentToken.Value));
     // FreeBASIC access specifiers inside a TYPE: "Public:" / "Private:" / "Protected:". Access is not
