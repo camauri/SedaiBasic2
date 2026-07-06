@@ -299,6 +299,7 @@ type
     procedure EnsureRegisterCapacity(Ctx: TExecutionContext; RegType: TSSARegisterType; MinIndex: Integer);
     procedure FramePush(Ctx: TExecutionContext);   // bcCallSub: snapshot whole register banks
     procedure FramePop(Ctx: TExecutionContext);    // bcReturnSub: restore whole register banks
+    procedure GrowCallStackIfNeeded(Ctx: TExecutionContext); inline;  // auto-grow return-addr stack (deep recursion)
     // M5.2 OS threading: spawn/join workers running their own TExecutionContext over the shared
     // program/heap (FreeBASIC shared-memory model). SetupWorkerContext sizes a fresh context's banks;
     // SpawnWorker BeginThreads a worker (returns the handle); JoinWorker waits on it; RunWorker is the
@@ -1391,6 +1392,15 @@ begin
   end;
 end;
 {$ENDIF}
+
+procedure TBytecodeVM.GrowCallStackIfNeeded(Ctx: TExecutionContext);
+// The return-address stack starts at 256 but deep recursion (e.g. Ackermann) can exceed it. Grow it
+// like FramePush grows the register save stacks, so an over-deep call widens the buffer instead of
+// writing out of bounds and corrupting adjacent context memory.
+begin
+  if Ctx.CallStackPtr >= Length(Ctx.CallStack) then
+    SetLength(Ctx.CallStack, Length(Ctx.CallStack) * 2 + 16);
+end;
 
 procedure TBytecodeVM.FramePush(Ctx: TExecutionContext);
 // Snapshot the whole register banks onto the flat per-bank save stacks (one frame).
@@ -3831,6 +3841,7 @@ begin
       if Ctx.IntRegs[Instr.Src1] <> 0 then Ctx.PC := Instr.Immediate - 1;
     bcCall:
       begin
+        GrowCallStackIfNeeded(Ctx);
         Ctx.CallStack[Ctx.CallStackPtr] := Ctx.PC;
         Inc(Ctx.CallStackPtr);
         Ctx.PC := Instr.Immediate - 1;
@@ -3846,6 +3857,7 @@ begin
     bcCallSub:
       begin
         FramePush(Ctx);
+        GrowCallStackIfNeeded(Ctx);
         Ctx.CallStack[Ctx.CallStackPtr] := Ctx.PC;
         Inc(Ctx.CallStackPtr);
         Ctx.PC := Instr.Immediate - 1;
@@ -3853,6 +3865,7 @@ begin
     bcCallSubIndirect:  // FreeBASIC function pointer: same as bcCallSub but the target entry PC is in Src1 (int reg)
       begin
         FramePush(Ctx);
+        GrowCallStackIfNeeded(Ctx);
         Ctx.CallStack[Ctx.CallStackPtr] := Ctx.PC;
         Inc(Ctx.CallStackPtr);
         Ctx.PC := Ctx.IntRegs[Instr.Src1] - 1;

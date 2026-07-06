@@ -565,6 +565,7 @@ begin
         bcJumpIfNotZero: if IntRegs[Instr.Src1] <> 0 then CurPC := Instr.Immediate else Inc(CurPC);
         bcCall:
           begin
+            GrowCallStackIfNeeded(Ctx);
             Ctx.CallStack[Ctx.CallStackPtr] := CurPC + 1;
             Inc(Ctx.CallStackPtr);
             {$IFDEF DEBUG_MODE}
@@ -585,6 +586,7 @@ begin
         bcCallSub:
           begin
             FramePush(Ctx);
+            GrowCallStackIfNeeded(Ctx);
             Ctx.CallStack[Ctx.CallStackPtr] := CurPC + 1;
             Inc(Ctx.CallStackPtr);
             {$IFDEF DEBUG_MODE}
@@ -595,6 +597,7 @@ begin
         bcCallSubIndirect:  // FreeBASIC function pointer: like bcCallSub but the target entry PC is in Src1 (int reg)
           begin
             FramePush(Ctx);
+            GrowCallStackIfNeeded(Ctx);
             Ctx.CallStack[Ctx.CallStackPtr] := CurPC + 1;
             Inc(Ctx.CallStackPtr);
             {$IFDEF DEBUG_MODE}
