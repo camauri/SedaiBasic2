@@ -2445,31 +2445,66 @@ begin
         end
         else if (FuncName = 'ASC') then
         begin
-          // ASC(str) - returns integer ASCII code of first char
-          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          // FreeBASIC ASC(str [, pos]) - the code of the char at 1-based position pos (default 1). With a
+          // position, take MID(str, pos, 1) first; then ASC of that single character.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);    // str
+            ProcessExpression(ArgListNode.GetChild(1), Arg2Value);   // pos
+            ArgReg := EnsureStringRegister(ArgValue);
+            Arg2Reg := EnsureIntRegister(Arg2Value);
+            Arg3Reg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, Arg3Reg, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone)); // length 1
+            TempVal := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+            EmitInstruction(ssaStrMid, TempVal, ArgReg, Arg2Reg, Arg3Reg);   // MID(str, pos, 1)
+            ArgReg := EnsureStringRegister(TempVal);
+          end
+          else if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+            ArgReg := EnsureStringRegister(ArgValue);
+          end
           else if ArgListNode <> nil then
-            ProcessExpression(ArgListNode, ArgValue)
+          begin
+            ProcessExpression(ArgListNode, ArgValue);
+            ArgReg := EnsureStringRegister(ArgValue);
+          end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
-
-          ArgReg := EnsureStringRegister(ArgValue);
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
           EmitInstruction(ssaStrAsc, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else if (FuncName = 'CHR$') then
         begin
-          // CHR$(n) - returns string char from ASCII code
+          // FreeBASIC CHR(a [, b, ...]) - one character per argument, concatenated (so CHR(65,66,67)="ABC").
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          begin
+            Result := MakeSSAValue(svkNone);
+            for i := 0 to ArgListNode.ChildCount - 1 do
+            begin
+              ProcessExpression(ArgListNode.GetChild(i), ArgValue);
+              ArgReg := EnsureIntRegister(ArgValue);
+              Arg2Value := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));   // this character
+              EmitInstruction(ssaStrChr, Arg2Value, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              if Result.Kind = svkNone then
+                Result := Arg2Value
+              else
+              begin
+                TempVal := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+                EmitInstruction(ssaStrConcat, TempVal, EnsureStringRegister(Result), Arg2Value, MakeSSAValue(svkNone));
+                Result := TempVal;
+              end;
+            end;
+          end
           else if ArgListNode <> nil then
-            ProcessExpression(ArgListNode, ArgValue)
+          begin
+            ProcessExpression(ArgListNode, ArgValue);
+            ArgReg := EnsureIntRegister(ArgValue);
+            DestReg := FProgram.AllocRegister(srtString);
+            Result := MakeSSARegister(srtString, DestReg);
+            EmitInstruction(ssaStrChr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
-
-          ArgReg := EnsureIntRegister(ArgValue);
-          DestReg := FProgram.AllocRegister(srtString);
-          Result := MakeSSARegister(srtString, DestReg);
-          EmitInstruction(ssaStrChr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else if (FuncName = kWCHR) then
         begin
