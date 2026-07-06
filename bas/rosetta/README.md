@@ -91,6 +91,8 @@ single work, but distributing separate works together (aggregation) is permitted
 | `range_expansion.bas`         | <https://rosettacode.org/wiki/Range_expansion> |
 | `evaluate_binomial_coefficients.bas` | <https://rosettacode.org/wiki/Evaluate_binomial_coefficients> |
 | `gaussian_elimination.bas`    | <https://rosettacode.org/wiki/Gaussian_elimination> |
+| `luhn_test.bas`               | <https://rosettacode.org/wiki/Luhn_test_of_credit_card_numbers> |
+| `ludic_numbers.bas`           | <https://rosettacode.org/wiki/Ludic_numbers> |
 
 ## Running
 
