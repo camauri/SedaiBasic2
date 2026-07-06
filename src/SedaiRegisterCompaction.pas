@@ -1033,6 +1033,10 @@ begin
     if OpCode = bcGraphicSetMode then
       MarkIntRegUsed(Instr.Immediate);
 
+    // bcStrInstr: Immediate = the int register holding the INSTR start position.
+    if OpCode = bcStrInstr then
+      MarkIntRegUsed(Instr.Immediate and $FFFF);
+
     // bcGraphicRGBA: Immediate = (B_reg << 16) | A_reg - two int registers
     if OpCode = bcGraphicRGBA then
     begin
@@ -1446,6 +1450,17 @@ begin
       if (Instr.Immediate < Length(FStringRegMap)) and (FStringRegMap[Instr.Immediate] >= 0) then
       begin
         Instr.Immediate := FStringRegMap[Instr.Immediate];
+        Modified := True;
+      end;
+    end;
+
+    // bcStrInstr: Immediate = the int register holding the INSTR start position. Remap it.
+    if OpCode = bcStrInstr then
+    begin
+      OldReg := Instr.Immediate and $FFFF;
+      if (OldReg >= 0) and (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+      begin
+        Instr.Immediate := FIntRegMap[OldReg];
         Modified := True;
       end;
     end;

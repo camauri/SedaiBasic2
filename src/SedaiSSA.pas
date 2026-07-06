@@ -2775,31 +2775,39 @@ begin
           EmitMidSubstring(ArgListNode, Result)
         else if (FuncName = 'INSTR') then
         begin
-          // INSTR(str1, str2 [,start]) - find str2 in str1, return position
-          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          // FreeBASIC "INSTR( [start,] str, substr )": the OPTIONAL start comes FIRST. Two args = (str,
+          // substr) searching from 1; three args = (start, str, substr). Returns the 1-based position of
+          // substr in str at or after start, else 0. ssaStrInstr carries the start in a THIRD int register
+          // (Src3), which the compiler maps to a bytecode register in the Immediate; the 2-arg form passes
+          // a materialised constant 1 so the VM always reads a real start register.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 3) then
           begin
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue);  // str1
-            ProcessExpression(ArgListNode.GetChild(1), Arg2Value); // str2
+            ProcessExpression(ArgListNode.GetChild(0), Arg3Value);   // start (numeric)
+            ProcessExpression(ArgListNode.GetChild(1), ArgValue);    // str (haystack)
+            ProcessExpression(ArgListNode.GetChild(2), Arg2Value);   // substr (needle)
+            ArgReg := EnsureStringRegister(ArgValue);
+            Arg2Reg := EnsureStringRegister(Arg2Value);
+            Arg3Reg := EnsureIntRegister(Arg3Value);                 // start in an int register (Src3)
+            DestReg := FProgram.AllocRegister(srtInt);
+            Result := MakeSSARegister(srtInt, DestReg);
+            EmitInstruction(ssaStrInstr, Result, ArgReg, Arg2Reg, Arg3Reg);
+          end
+          else if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);    // str
+            ProcessExpression(ArgListNode.GetChild(1), Arg2Value);   // substr
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureStringRegister(Arg2Value);
             DestReg := FProgram.AllocRegister(srtInt);
             Result := MakeSSARegister(srtInt, DestReg);
-            // Start position is optional
-            if ArgListNode.ChildCount >= 3 then
-            begin
-              ProcessExpression(ArgListNode.GetChild(2), Arg3Value);
-              if Arg3Value.Kind = svkConstInt then
-                EmitInstructionWithImmediate(ssaStrInstr, Result, ArgReg, Arg2Reg, Arg3Value.ConstInt)
-              else if Arg3Value.Kind = svkConstFloat then
-                EmitInstructionWithImmediate(ssaStrInstr, Result, ArgReg, Arg2Reg, Trunc(Arg3Value.ConstFloat))
-              else
-                EmitInstructionWithImmediate(ssaStrInstr, Result, ArgReg, Arg2Reg, 1); // Default start=1
-            end
-            else if IsWStringExpr(ArgListNode.GetChild(0)) then
+            if IsWStringExpr(ArgListNode.GetChild(0)) then
               // WSTRING haystack (no start arg): return a codepoint position, not a byte position.
               EmitInstruction(ssaStrInstrW, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone))
             else
-              EmitInstructionWithImmediate(ssaStrInstr, Result, ArgReg, Arg2Reg, 0); // 0 means use Pos (start from 1)
+            begin
+              Arg3Reg := EnsureIntRegister(MakeSSAConstInt(1));      // start = 1 in a register
+              EmitInstruction(ssaStrInstr, Result, ArgReg, Arg2Reg, Arg3Reg);
+            end;
           end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end

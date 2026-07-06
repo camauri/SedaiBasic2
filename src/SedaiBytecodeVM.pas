@@ -5401,12 +5401,11 @@ begin
           Delete(S, 1, 1);
         Ctx.StringRegs[Instr.Dest] := S;
       end;
-    10: // bcStrInstr - INSTR(haystack, needle [,start])
+    10: // bcStrInstr - INSTR([start,] haystack, needle)
       begin
-        // Src1 = haystack, Src2 = needle, Immediate = start position (1-based)
-        StartPos := 1;
-        if Instr.Immediate > 0 then
-          StartPos := Ctx.IntRegs[Instr.Immediate and $FFFF];
+        // Src1 = haystack, Src2 = needle, Immediate = the int register holding the 1-based start position
+        // (the 2-arg form passes a register holding 1).
+        StartPos := Ctx.IntRegs[Instr.Immediate and $FFFF];
         if StartPos < 1 then StartPos := 1;
         Ctx.IntRegs[Instr.Dest] := Pos(Ctx.StringRegs[Instr.Src2],
           Copy(Ctx.StringRegs[Instr.Src1], StartPos, MaxInt));
