@@ -340,6 +340,7 @@ const
   kBITRESET= 'BITRESET';  // FreeBASIC: x with bit b cleared (x AND NOT (1 SHL b))
   kCBOOL   = 'CBOOL';     // FreeBASIC: convert to boolean (-1 if nonzero, else 0)
   kARRAYLEN = 'ARRAYLEN'; // FreeBASIC: total number of elements in an array (intercepted as array-access)
+  kARRAYSIZE = 'ARRAYSIZE'; // FreeBASIC: total size in bytes of an array (element count * element size)
   kFILEEXISTS = 'FILEEXISTS'; // FreeBASIC: -1 if a file exists, else 0 (intercepted as array-access)
   kFILELEN = 'FILELEN';  // FreeBASIC: FILELEN(path) -> file size in bytes (intercepted as array-access)
   kFILEDATETIME = 'FILEDATETIME'; // FreeBASIC: FILEDATETIME(path) -> last-modified date serial (intercepted as array-access)

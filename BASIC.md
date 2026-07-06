@@ -1403,8 +1403,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `STRING` | ✗ | Fixed-length and variable-length strings with built-in memory management. |
-| `ZSTRING` | ✗ | Fixed-length and variable-length null-terminated strings. |
+| `STRING` | ✓ | Variable-length strings (`DIM AS STRING`); fixed-length `STRING * n` is parsed (advisory length). |
+| `ZSTRING` | ✓ | Null-terminated string type (`DIM AS ZSTRING [* n]`); `ZSTRING PTR` is a raw pointer to a string's bytes (see `SADD`). |
 | `WSTRING` | ✓ | Wide-character strings (UTF-8 storage, codepoint-aware LEN/MID/LEFT$/RIGHT$). Fixed-length `* n` parsed but advisory (var-length storage). |
 
 ##### Class types
@@ -1928,17 +1928,17 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Error` | ✗ |  |
+| `Error` | ✓ | `ERROR n` raises runtime error n (caught by `ON ERROR GOTO` / `ON LOCAL ERROR GOTO`; `ERR` holds the code). |
 
 ##### 'On [Local] Error Goto' statement use
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Error` | ✗ |  |
-| `Error` | ✗ |  |
-| `Local` | ✗ |  |
-| `Local` | ✗ |  |
-| `Local` | ✗ |  |
+| `Error` | ✓ | `ERROR n` raises runtime error n (caught by `ON ERROR GOTO` / `ON LOCAL ERROR GOTO`; `ERR` holds the code). |
+| `Error` | ✓ | `ERROR n` raises runtime error n (caught by `ON ERROR GOTO` / `ON LOCAL ERROR GOTO`; `ERR` holds the code). |
+| `Local` | ✓ | `ON LOCAL ERROR GOTO label` installs a procedure-local error handler. |
+| `Local` | ✓ | `ON LOCAL ERROR GOTO label` installs a procedure-local error handler. |
+| `Local` | ✓ | `ON LOCAL ERROR GOTO label` installs a procedure-local error handler. |
 | `Resume` | ✓ |  |
 | `Resume Next` | ✓ |  |
 | `__FB_ERR__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
@@ -1986,7 +1986,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `AS` | ✓ | Type annotation: `DIM v AS type`, `field AS type` (M3) |
 | `FOR` | ✓ |  |
 | `TO` | ✓ |  |
-| `IS` | ✗ |  |
+| `IS` | ✓ | `SELECT CASE` relational form (`CASE IS > n`) and the RTTI type check (`obj IS Type`). |
 | `STEP` | ✓ |  |
 
 ##### Control Flow
@@ -2042,7 +2042,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `ARRAYLEN` | ✓ | Total element count = product over dims of `(ubound-lbound+1)`; computed at runtime, correct for fixed, `lb TO ub`, multi-dim, and REDIM'd arrays. |
-| `ARRAYSIZE` | ✗ | Returns the total array size (in bytes). |
+| `ARRAYSIZE` | ✓ | `ARRAYSIZE(arr())` returns the total size in bytes = element count × element size (8-byte bank elements, matching FB Integer/LongInt/Double). |
 | `LBOUND` | ✓ | Returns the lower bound of an array's dimension. `LBOUND(arr[, dim])` (B1.4). |
 | `UBOUND` | ✓ | Returns the upper bound of an array's dimension. `UBOUND(arr[, dim])` (B1.4; honors explicit `lb TO ub` and dynamic sizes). |
 
@@ -2056,7 +2056,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Uinteger` | ✗ |  |
+| `Uinteger` | ✓ | Accepted as an integer type (`DIM AS UINTEGER`); stored in the 64-bit integer bank (no separate unsigned width tracking). |
 
 #### Byte Manipulation Macros
 
@@ -2200,7 +2200,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `WINPUT()` | ✗ | Reads a number of wide characters from a file or device. |
 | `LINE INPUT #` | ✓ | `LINE INPUT #n, s` reads a whole line of text (commas not split). |
 | `PRINT #` | ✓ |  |
-| `? # (Shortcut for 'PRINT #')` | ✗ | Writes text data to a file or device. |
+| `? # (Shortcut for 'PRINT #')` | ✓ | `? #n, ...` is the shortcut for `PRINT #n, ...` (the lexer maps `?` to PRINT). |
 | `PUT #` | ✓ | Writes arbitrary data to a file or device. |
 | `GET #` | ✓ | Reads arbitrary data from a file or device. |
 
@@ -2326,9 +2326,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `STRING` | ✗ | Standard data type: 8 bit character string. |
-| `STRING (Function)` | ✗ | Returns a String of multiple characters. |
-| `ZSTRING` | ✗ | Standard data type: null terminated 8 bit character string. |
+| `STRING` | ✓ | 8-bit character string data type. |
+| `STRING (Function)` | ✓ | `STRING(count, ch)` returns `count` copies of a character (a char code or the first character of a string). |
+| `ZSTRING` | ✓ | Null-terminated 8-bit character string data type. |
 | `WSTRING` | ✓ | Standard data type: wide character string (UTF-8 storage, codepoint-aware LEN/slice). |
 | `WSTRING (Function)` | ✓ | `WSTRING(n, cp)` — n copies of the wide char for Unicode codepoint cp. |
 | `SPACE` | ✓ | Returns a String of N spaces. `SPACE(n)` / `SPACE$(n)` (B1.2). |

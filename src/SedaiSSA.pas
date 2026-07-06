@@ -414,6 +414,7 @@ type
     procedure EmitBitMacro(const FuncName: string; ArgsNode: TASTNode; out Result: TSSAValue);
     // FreeBASIC ARRAYLEN(arr): total element count = product over dims of (ubound-lbound+1).
     procedure EmitArrayLen(ArgsNode: TASTNode; out Result: TSSAValue);
+    procedure EmitArraySize(ArgsNode: TASTNode; out Result: TSSAValue);  // ARRAYSIZE = ARRAYLEN * element bytes
     // FreeBASIC bare string functions (CHR/STR/LEFT/RIGHT) routed to their $-suffixed forms.
     procedure EmitBareStringFunc(const DollarName: string; ArrayAccessNode: TASTNode; out Result: TSSAValue);
     // FreeBASIC short-circuit operators a ANDALSO b / a ORELSE b (lowered via the IIF/IF mechanism).
@@ -3906,6 +3907,14 @@ begin
           Exit;
         end;
 
+        // FreeBASIC ARRAYSIZE(arr): total size in bytes = element count * element size. MODERN, not a
+        // declared array. (Elements occupy 8 bytes in the register banks — matches FB Integer/LongInt/Double.)
+        if FModernMode and (UpperCase(ArrName) = kARRAYSIZE) and (ArrayIndexOf(ArrName) < 0) then
+        begin
+          EmitArraySize(Node.GetChild(1), Result);
+          Exit;
+        end;
+
         // FreeBASIC FILEEXISTS(path): -1 if the file exists, else 0. MODERN, not a declared array.
         if FModernMode and (UpperCase(ArrName) = kFILEEXISTS) and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).ChildCount >= 1) then
@@ -6558,6 +6567,20 @@ begin
     Acc := NewAcc;
   end;
   Result := Acc;
+end;
+
+procedure TSSAGenerator.EmitArraySize(ArgsNode: TASTNode; out Result: TSSAValue);
+// FreeBASIC ARRAYSIZE(arr): total size in bytes = element count * element size. Elements occupy 8 bytes
+// in the register banks (matches FB's 64-bit Integer/LongInt/Double); sub-width element types are not
+// modelled separately here, so the size is the element count times 8.
+var
+  Cnt, Prod: TSSAValue;
+begin
+  EmitArrayLen(ArgsNode, Cnt);
+  if Cnt.Kind = svkNone then begin Result := MakeSSAValue(svkNone); Exit; end;
+  Prod := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaMulInt, Prod, EnsureIntRegister(Cnt), EnsureIntRegister(MakeSSAConstInt(8)), MakeSSAValue(svkNone));
+  Result := Prod;
 end;
 
 procedure TSSAGenerator.EmitShortCircuit(Node: TASTNode; out Result: TSSAValue);
