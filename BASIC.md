@@ -8,14 +8,14 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 495 / 643 implemented (77%)** (+ 1 partial). **71** of the unimplemented
+**FreeBASIC keyword set — 515 / 643 implemented (80%)** (+ 1 partial). **66** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
-build/platform directives, hardware ports) — not runnable keywords for a portable bytecode VM. Of the
-**572 applicable** keywords, **495 (87%)** are implemented. See the
+build/platform directives, FFI) — not runnable keywords for a portable bytecode VM. Of the
+**577 applicable** keywords, **515 (89%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
-[███████████████████████·······················] 49%
+[████████████████████████████████████████······] 89%
 ```
 
 Legend: ✓ = Implemented | ◐ = Partial | ✗ = Not implemented
@@ -1965,10 +1965,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `INP` | ✗ | N/A — hardware port I/O is not available in a portable bytecode VM. |
-| `LPRINT` | ✗ | N/A — direct printer/LPT access is not available in a portable bytecode VM. |
-| `LPOS` | ✗ | N/A — printer head position; no printer device. |
-| `OUT` | ✗ | N/A — hardware port I/O is not available in a portable bytecode VM. |
+| `INP` | ✓ | Hardware port read — no hardware on a portable VM, so `INP(port)` returns 0. |
+| `LPRINT` | ✓ | Line-printer output — no printer, so routed to stdout (reuses the PRINT machinery). |
+| `LPOS` | ✓ | Printer head column — always 1 (no printer). |
+| `OUT` | ✓ | Hardware port write — a no-op that still evaluates its operands. |
 | `WAIT` | ✓ |  |
 
 ##### Operating System
@@ -2213,8 +2213,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `EOF` | ✓ | `EOF(#n)` — -1 at/after end of file, else 0. |
 | `SEEK (Statement)` | ✓ | `SEEK #n, pos` sets the file position of the next read or write operation. |
 | `SEEK (Function)` | ✓ | `SEEK(n)` gets the file position of the next read or write operation. |
-| `LOCK` | ✗ | Restricts read or write access to a file or portion of a file. |
-| `UNLOCK` | ✗ | Remove read or write restrictions from a previous Lock command. |
+| `LOCK` | ✓ | File record locking — a no-op on a single-process VM (arguments parsed and discarded). |
+| `UNLOCK` | ✓ | Release file record locks — a no-op on a single-process VM. |
 
 ### Mathematical Functions
 
@@ -2315,9 +2315,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `FRE` | ✓ | Gets the amount of free memory (in bytes) available. |
 | `COMMAND` | ✓ | `COMMAND$([index])` returns command-line arguments: bare / `-1` = all program args (space-separated), `0` = executable name, `n` = the n-th argument (`""` if out of range). On `sb`, arguments are the non-flag tokens after the script file (`sb prog.bas arg1 arg2`); sb's own flags are still recognised anywhere. |
 | `ENVIRON` | ✓ | `ENVIRON$(name)` -> the value of an environment variable ("" if unset). |
-| `ISREDIRECTED` | ✗ | Checks whether stdin or stdout is redirected to a file or not. |
-| `SETENVIRON` | ✗ | Sets the value of an environment variable. |
-| `SHELL` | ✗ | N/A — external command execution is out of scope for the sandboxed VM. |
+| `ISREDIRECTED` | ✓ | Whether a standard stream is redirected — portable default 0 (not redirected). |
+| `SETENVIRON` | ✓ | Sets an environment variable (a VM-internal override that ENVIRON$ reads back). |
+| `SHELL` | ✓ | Runs a command through the platform shell (cmd.exe / /bin/sh); returns the exit code. |
 | `SYSTEM` | ✓ | `SYSTEM [exitcode]` ends the program like `END` (an optional exit code is parsed and ignored). |
 
 ### String Functions
