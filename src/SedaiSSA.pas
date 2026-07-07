@@ -4432,7 +4432,11 @@ begin
 
         // FreeBASIC string subscript "s[i]" (also "s(i)") on a scalar STRING variable: the byte at the
         // 0-based index i (its character code). Not an array, not a pointer -> a string byte read.
-        if (ArrayIndexOf(ArrName) < 0) and (GetVariableType(ArrName) = srtString) and
+        // A SHARED scalar string is array-backed (ArrayIndexOf >= 0) but is conceptually a scalar, so
+        // IsSharedScalar also routes it here (otherwise "s[i]" reads the whole backing element).
+        if ((ArrayIndexOf(ArrName) < 0) or IsSharedScalar(UpperCase(ArrName))) and
+           (Node.Attributes.Values['SHAREDELEM'] <> '1') and
+           (GetVariableType(ArrName) = srtString) and
            (FPointerVars.IndexOfName(UpperCase(ArrName)) < 0) and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
@@ -5363,8 +5367,11 @@ begin
   ArrName := VarToStr(TargetNode.GetChild(0).Value);
 
   // FreeBASIC string subscript write "s[i] = c" on a scalar STRING variable: set the byte at the
-  // 0-based index i. Not an array, not a pointer -> a string byte write.
-  if (ArrayIndexOf(ArrName) < 0) and (GetVariableType(ArrName) = srtString) and
+  // 0-based index i. Not an array, not a pointer -> a string byte write. A SHARED scalar string is
+  // array-backed but conceptually a scalar, so IsSharedScalar also routes it here.
+  if ((ArrayIndexOf(ArrName) < 0) or IsSharedScalar(UpperCase(ArrName))) and
+     (TargetNode.Attributes.Values['SHAREDELEM'] <> '1') and
+     (GetVariableType(ArrName) = srtString) and
      (FPointerVars.IndexOfName(UpperCase(ArrName)) < 0) and
      (TargetNode.GetChild(1).NodeType = antExpressionList) and (TargetNode.GetChild(1).ChildCount = 1) then
   begin
@@ -14851,6 +14858,10 @@ var
   IdxList: TASTNode;
 begin
   Result := TASTNode.Create(antArrayAccess, Tok);
+  // Mark this as the internal element-0 access of the backing array, so the "s[i]" string byte
+  // subscript lowering does NOT re-interpret it (a SHARED scalar string is array-backed, and
+  // without this marker the byte-subscript branch would recurse into this synthetic node forever).
+  Result.Attributes.Values['SHAREDELEM'] := '1';
   Result.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(Name), Tok));
   IdxList := TASTNode.Create(antExpressionList, Tok);
   IdxList.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Tok));
