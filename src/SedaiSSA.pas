@@ -1664,14 +1664,16 @@ begin
         EmitRawPtrArith(Node, Result);
         Exit;
       end;
-      // Operator overloading (FreeBASIC): if both operands are UDT handles of the same type T and a
-      // user "OPERATOR <sym>(a AS T, b AS T)" is defined, lower a call to it (label T.OPERATOR<sym>)
-      // instead of a numeric op. Resolved by the left operand's static type; direct binary form (the
-      // chained "(a+b)+c" case relies on the result type being inferable — v1 covers direct operands).
+      // Operator overloading (FreeBASIC): if the LEFT operand is a UDT handle of type T and a user
+      // "OPERATOR <sym>(a AS T, b AS ...)" is defined, lower a call to it (label T.OPERATOR<sym>) instead
+      // of a numeric op. The right operand may be the SAME UDT, a DIFFERENT UDT, or a scalar (e.g. a
+      // vector "vec * scalar"): the operator's declared parameter types drive the argument banks in
+      // EmitUserFunctionCall. Resolved by the left operand's static type — arithmetic on a UDT handle is
+      // never meaningful, so dispatching whenever a matching operator exists is always the right choice.
       if (Node.ChildCount >= 2) and Assigned(Node.Token) then
       begin
         OpLhsType := ObjectTypeName(Node.GetChild(0));
-        if (OpLhsType <> '') and (ObjectTypeName(Node.GetChild(1)) = OpLhsType) then
+        if OpLhsType <> '' then
         begin
           OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value));
           if OpLabel <> '' then
