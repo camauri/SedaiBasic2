@@ -108,6 +108,7 @@ type
     function GetTokenAt(Index: Integer): TLexerToken;
     function HandleTokenOverflow: TLexerToken;
     function ParseNumberDigits: Boolean;
+    procedure ConsumeIntLiteralSuffix;   // drop a trailing FB integer literal suffix (U/L/LL/UL/ULL/...)
     procedure ResetTokenPool;
     procedure TokenBufferReset; inline;
     procedure TokenBufferAdd(C: Char); inline;
@@ -1434,6 +1435,7 @@ begin
     Val := Val * Base + DigVal;
     TokenBufferAdd(Ch); AdvanceChar;
   end;
+  ConsumeIntLiteralSuffix;   // FreeBASIC typed integer literal: &hFFul, &b1010ULL, ... (dropped)
   Result := CreateToken(ttNumber);
   Result.SetExtractedValue(IntToStr(Val));   // logical value is decimal, not the "&H.." source text
 end;
@@ -1794,6 +1796,34 @@ begin
       AdvanceChar;
       CurrentChar := GetCurrentChar;
     end;
+  end;
+end;
+
+procedure TLexerFSM.ConsumeIntLiteralSuffix;
+// FreeBASIC integer literal TYPE suffix: an optional 'U' (unsigned) then an optional size letter
+// (LL / L / S / B / I), case-insensitive — e.g. 100L, 5UL, 18446744073709551615ULL, &hFFul. The suffix
+// is consumed and DROPPED (not added to the token text), so the literal's value is the number itself.
+// (We do not model per-width overflow; a big unsigned value is already handled as two's-complement.)
+// A number can never be validly glued to an identifier without an operator, so treating a trailing
+// U/L run as a suffix is unambiguous.
+var C: Char;
+begin
+  C := GetCurrentChar;
+  if (C = 'U') or (C = 'u') then
+  begin
+    AdvanceChar; C := GetCurrentChar;
+    if (C = 'L') or (C = 'l') then
+    begin
+      AdvanceChar;
+      if (GetCurrentChar = 'L') or (GetCurrentChar = 'l') then AdvanceChar;   // ULL
+    end
+    else if C in ['S', 's', 'B', 'b', 'I', 'i'] then
+      AdvanceChar;                                                            // US / UB / UI
+  end
+  else if (C = 'L') or (C = 'l') then
+  begin
+    AdvanceChar;
+    if (GetCurrentChar = 'L') or (GetCurrentChar = 'l') then AdvanceChar;     // LL
   end;
 end;
 
@@ -2315,6 +2345,7 @@ begin
             ParseNumberDigits;  // ← Parte decimale + eventuale notazione scientifica
           end;
 
+          ConsumeIntLiteralSuffix;   // FreeBASIC typed integer literal: 100L, 5UL, ...ULL (dropped)
           Result := ProcessNumber;
           Exit;
         end;
