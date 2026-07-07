@@ -959,6 +959,10 @@ begin
           if AddInstr.Src2 <> MulDest then Exit;
           // Check if mul result is temporary
           if not IsTemporaryResult(Index, MulDest) then Exit;
+          // SAFETY: the extra operand c (Src1, stored in the fused op's Immediate) must not be the mul
+          // destination — the fused op recomputes a*b into that register, so reading c=MulDest would take
+          // its STALE pre-multiply value. Happens for "(a*b) + (a*b)" (e.g. strength-reduced "2.0*(a*b)").
+          if AddInstr.Src1 = MulDest then Exit;
 
           FusedOpCode := bcMulAddFloat;
 
@@ -991,6 +995,8 @@ begin
           if AddInstr.Src2 <> MulDest then Exit;
           // Check if mul result is temporary
           if not IsTemporaryResult(Index, MulDest) then Exit;
+          // SAFETY: the extra operand c (Src1) must not be the mul destination (see the bcAddFloat note).
+          if AddInstr.Src1 = MulDest then Exit;
 
           FusedOpCode := bcMulSubFloat;
 
@@ -1059,6 +1065,13 @@ begin
       begin
         // Check if AddFloat uses the load result as Src2
         if AddInstr.Src2 <> LoadDest then Exit;
+        // SAFETY: the accumulator (Src1, which becomes the fused op's Immediate operand) must NOT be the
+        // load destination. The fused op reads the accumulator and performs the array load itself, so if
+        // the accumulator IS the load dest it reads the register's STALE pre-load value instead of the
+        // loaded element. This happens for "x + x" where both operands are the same loaded value (e.g.
+        // strength-reduced "2.0 * arr(i)" -> "arr(i) + arr(i)"): fusing gives "stale + arr[idx]" = arr[idx]
+        // instead of 2*arr[idx]. Leave it unfused in that case.
+        if AddInstr.Src1 = LoadDest then Exit;
 
         FusedOpCode := bcArrayLoadAddFloat;
 
@@ -1088,6 +1101,8 @@ begin
       begin
         // Check if SubFloat uses the load result as Src2 (acc - arr[idx])
         if AddInstr.Src2 <> LoadDest then Exit;
+        // SAFETY: the accumulator (Src1) must not be the load destination — see the bcAddFloat note.
+        if AddInstr.Src1 = LoadDest then Exit;
 
         FusedOpCode := bcArrayLoadSubFloat;
 
