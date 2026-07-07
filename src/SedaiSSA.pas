@@ -387,6 +387,7 @@ type
     // Map parameter at Index (within ParamList) to its transfer-bank type and per-bank slot.
     function ParamBankAndSlot(ParamList: TASTNode; Index: Integer; out RT: TSSARegisterType): Integer;
     function ParamDeclaredBank(ParamNode: TASTNode): TSSARegisterType;  // scalar param bank from its OWN decl (no global name collision)
+    function CurrentProcParamType(const VarName: string; out UDTType: string): Boolean;  // is VarName a param of the current proc? UDTType = its UDT ('' if not a UDT)
     procedure EmitXferStore(RT: TSSARegisterType; Slot: Integer; const Val: TSSAValue);
     procedure EmitXferLoad(RT: TSSARegisterType; Slot: Integer; const DestReg: TSSAValue);
     procedure FixForwardReferences;  // PHASE 3 TIER 3: Fix forward GOTO/GOSUB references
@@ -14131,13 +14132,55 @@ begin
   end;
 end;
 
+function TSSAGenerator.CurrentProcParamType(const VarName: string; out UDTType: string): Boolean;
+// True if VarName is a parameter of the procedure currently being lowered; UDTType is its declared UDT
+// type name (or '' if the parameter is not a UDT). Used to shadow the global FVarRecordType name→type
+// map, which is keyed by bare name (first-registration-wins) and would otherwise report the WRONG type
+// for a parameter whose name collides with a differently-typed parameter of another procedure.
+var
+  Decl, PList, P: TASTNode;
+  i: Integer;
+  TN: string;
+begin
+  Result := False;
+  UDTType := '';
+  if FCurrentProcName = '' then Exit;
+  if not (FProcDecls.TryGetValue(FCurrentProcName, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2)) then Exit;
+  PList := Decl.GetChild(1);
+  if not (Assigned(PList) and (PList.NodeType = antParameterList)) then Exit;
+  for i := 0 to PList.ChildCount - 1 do
+  begin
+    P := PList.GetChild(i);
+    if UpperCase(VarToStr(P.Value)) <> UpperCase(VarName) then Continue;
+    Result := True;   // it IS a parameter of this proc — shadows the global map (even if not a UDT)
+    // Explicit "AS type": the type is the antIdentifier child at index 0 (unless that child is a
+    // default-value expression for a parameter that only carries a default — same guard as ParamDeclaredBank).
+    if (P.ChildCount >= 1) and (P.GetChild(0).NodeType = antIdentifier) and
+       not ((P.Attributes.Values['HASDEFAULT'] = '1') and (P.ChildCount = 1)) then
+    begin
+      TN := UpperCase(VarToStr(P.GetChild(0).Value));
+      if FindUDT(TN) >= 0 then UDTType := TN;
+    end;
+    Exit;
+  end;
+end;
+
 function TSSAGenerator.VarRecordTypeName(const VarName: string): string;
 // Returns the UDT type name of a record variable, or '' if it isn't a record variable.
+var
+  ParamUDT: string;
 begin
   // THIS is method-local: its type is the owner of the method currently being lowered, not the
   // single global "THIS" entry (which different methods would otherwise overwrite).
   if (FCurrentThisType <> '') and (UpperCase(VarName) = 'THIS') then
     Exit(FCurrentThisType);
+  // A parameter of the CURRENT procedure resolves to ITS OWN declared type, shadowing the global
+  // name→type map: that map is keyed by bare name and keeps one registration, so a param "a As Edge"
+  // here would otherwise collide with a param "a As Pt" of another procedure — mis-typing "a.field"
+  // (e.g. Edge.p1 read as a Pt member) and silently yielding a wrong/garbage handle. UDT analog of the
+  // scalar parameter type collision fixed via ParamDeclaredBank.
+  if CurrentProcParamType(VarName, ParamUDT) then
+    Exit(ParamUDT);
   if FVarRecordType.IndexOfName(UpperCase(VarName)) < 0 then
     Result := ''
   else
