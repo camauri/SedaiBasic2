@@ -10,6 +10,8 @@ unit SedaiPreprocessor;
 //   #if <expr> / #elif <expr> / #elseif <expr>    conditional compilation on a constant integer expression
 //       (literals, defined(NAME), macro values, comparisons, AND/OR/NOT, parentheses)
 //   #include "file"           splice another file (relative to the including file's directory)
+//   #error msg                stop compilation with a diagnostic (message is macro-expanded)
+//   #assert <expr>            stop compilation if the constant integer expression is false
 // Directive lines in the top-level file are blanked (kept as empty lines) so error line numbers in
 // that file are preserved; included files are appended after preprocessing (their line numbers shift).
 // Object-like macro names are substituted as whole words outside string literals.
@@ -18,11 +20,18 @@ unit SedaiPreprocessor;
 
 interface
 
+uses SysUtils;
+
+type
+  // Raised by #error / a failed #assert. Callers catch it to report a clean compile-time
+  // diagnostic and abort the build (there is no meaningful program to run).
+  EPreprocessorError = class(Exception);
+
 function PreprocessSource(const Src, BaseDir: string; const FileName: string = ''): string;
 
 implementation
 
-uses Classes, SysUtils;
+uses Classes;
 
 function IsIdentChar(C: Char): Boolean; inline;
 begin
@@ -726,7 +735,16 @@ var
           end
           else if (DName = 'print') and Emitting then
             // #print msg — emit a compile-time diagnostic (macro-expanded) to stderr.
-            WriteLn(StdErr, SubstituteMacros(DRest, Defs, FnDefs));
+            WriteLn(StdErr, SubstituteMacros(DRest, Defs, FnDefs))
+          else if (DName = 'error') and Emitting then
+            // #error msg — abort compilation with a macro-expanded diagnostic.
+            raise EPreprocessorError.Create(Trim(SubstituteMacros(DRest, Defs, FnDefs)))
+          else if (DName = 'assert') and Emitting then
+          begin
+            // #assert <expr> — abort compilation if the constant integer expression is false.
+            if not EvalPPExpr(DRest, Defs) then
+              raise EPreprocessorError.Create('assertion failed: ' + Trim(DRest));
+          end;
           // All directive lines are dropped from the output; emit a blank to keep line numbers.
           Output.Add('');
         end

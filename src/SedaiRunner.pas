@@ -292,7 +292,16 @@ begin
     end;
 
     // === PREPROCESSOR === (FreeBASIC #define/#undef/#ifdef/.../#include) before lexing.
-    Source.Text := PreprocessSource(Source.Text, GetCurrentDir);
+    try
+      Source.Text := PreprocessSource(Source.Text, GetCurrentDir);
+    except
+      on E: EPreprocessorError do
+      begin
+        // The outer try..finally frees Source; just record the error and bail.
+        FLastError := Format('Preprocessor error: %s', [E.Message]);
+        Exit(nil);
+      end;
+    end;
 
     // === LEXING ===
     // Dialect auto-selected at LOAD by content: a program with line numbers is

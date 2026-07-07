@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 519 / 643 implemented (81%)**. **66** of the unimplemented
+**FreeBASIC keyword set — 521 / 643 implemented (81%)**. **66** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, FFI) — not runnable keywords for a portable bytecode VM. Of the
-**577 applicable** keywords, **519 (90%)** are implemented. See the
+**577 applicable** keywords, **521 (90%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1759,8 +1759,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `#CMDLINE` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
 | `#LANG` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
 | `#PRINT` | ✓ | `#print msg` emits a macro-expanded compile-time message to stderr. |
-| `#ERROR` | ✗ | Outputs a messages to standard output and stops compilation. |
-| `#ASSERT` | ✗ | Stops compilation with an error message if a given condition is false. |
+| `#ERROR` | ✓ | `#error msg` aborts compilation with a macro-expanded diagnostic (skipped inside a false `#if`/`#ifdef` branch). |
+| `#ASSERT` | ✓ | `#assert <expr>` aborts compilation if the constant integer expression is false. |
 | `#LINE` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
 
 ##### Metacommands

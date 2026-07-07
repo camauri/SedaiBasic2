@@ -605,7 +605,15 @@ begin
 
     // === PREPROCESSOR === (FreeBASIC #define/#undef/#ifdef/#ifndef/#else/#endif/#include).
     // Pure text->text pass before lexing; #include paths resolve relative to the source file.
-    Source.Text := PreprocessSource(Source.Text, ExtractFilePath(ExpandFileName(SourceFile)), SourceFile);
+    try
+      Source.Text := PreprocessSource(Source.Text, ExtractFilePath(ExpandFileName(SourceFile)), SourceFile);
+    except
+      on E: EPreprocessorError do
+      begin
+        WriteLn('ERROR: ', E.Message);
+        Exit;
+      end;
+    end;
 
     if OptVerbose then
       WriteLn;
