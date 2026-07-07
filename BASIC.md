@@ -1367,8 +1367,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `BYTE and UBYTE` | ✓ | 8-bit integer types. Stored in the Int64 bank but **assignments wrap/sign-extend to 8 bits** (B1.5): e.g. a `UBYTE` counter wraps 255→0. |
 | `SHORT and USHORT` | ✓ | 16-bit integer types; assignments wrap/sign-extend to 16 bits (B1.5). |
 | `LONG and ULONG` | ✓ | 32-bit integer types; assignments wrap/sign-extend to 32 bits (B1.5). |
-| `INTEGER and UINTEGER` | ✓ | 64-bit integer types here (platform width). Stored as Int64; a `UINTEGER` prints as unsigned (B1.5). |
-| `LONGINT and ULONGINT` | ✓ | 64-bit integer types. Stored as Int64; a `ULONGINT` prints as unsigned 0..2^64-1 (B1.5). |
+| `INTEGER and UINTEGER` | ✓ | 64-bit integer types here (platform width). Stored as Int64; `UINTEGER` has full unsigned semantics — exact literals 0..2^64-1 and unsigned compare/`\`/`Mod`/print (vars, params, FUNCTION returns, array elements). |
+| `LONGINT and ULONGINT` | ✓ | 64-bit integer types. Stored as Int64; `ULONGINT` has full unsigned semantics — exact literals 0..2^64-1 and unsigned compare/`\`/`Mod`/print (vars, params, FUNCTION returns, array elements). |
 
 ##### Floating-point types
 
@@ -2056,7 +2056,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Uinteger` | ✓ | Accepted as an integer type (`DIM AS UINTEGER`); stored in the 64-bit integer bank (no separate unsigned width tracking). |
+| `Uinteger` | ✓ | 64-bit unsigned integer type (`DIM AS UINTEGER`); stored in the integer bank with full unsigned compare/`\`/`Mod`/print semantics. |
 
 #### Byte Manipulation Macros
 
