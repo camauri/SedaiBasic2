@@ -2616,7 +2616,11 @@ begin
       begin
         Context.Advance;                             // AS
         if Context.Check(ttIdentifier) then PT := UpperCase(ParseDottedName);
-        while UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR' do Context.Advance;  // pointer param
+        // Keep the "PTR" suffix on the parameter type (a "T PTR" param is an int address, not a T value).
+        // Dropping it recorded a "Cat Ptr" parameter as "Cat", so the indirect call staged the argument
+        // with UDT (by-value/handle) semantics instead of passing the pointer, corrupting the callee's arg.
+        while UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR' do
+        begin PT := PT + ' PTR'; Context.Advance; end;
       end;
       if PT <> '' then
       begin
@@ -2634,7 +2638,9 @@ begin
   begin
     Context.Advance;                                 // AS
     if Context.Check(ttIdentifier) then Node.Attributes.Values['FPRET'] := UpperCase(ParseDottedName);
-    while UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR' do Context.Advance;  // pointer return
+    // Keep the "PTR" suffix on the return type too (a "T PTR" return is an int address).
+    while UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR' do
+    begin Node.Attributes.Values['FPRET'] := Node.Attributes.Values['FPRET'] + ' PTR'; Context.Advance; end;
   end;
   Result := True;
 end;
