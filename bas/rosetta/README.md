@@ -97,6 +97,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `carmichael_3_pseudoprimes.bas` | <https://rosettacode.org/wiki/Carmichael_3_strong_pseudoprimes> |
 | `harshad_niven_series.bas`    | <https://rosettacode.org/wiki/Harshad_or_Niven_series> |
 | `smith_numbers.bas`           | <https://rosettacode.org/wiki/Smith_numbers> |
+| `base64_encode_data.bas`      | <https://rosettacode.org/wiki/Base64_encode_data> |
 
 ## Running
 
