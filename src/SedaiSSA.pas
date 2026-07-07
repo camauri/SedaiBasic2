@@ -6153,12 +6153,12 @@ procedure TSSAGenerator.ProcessRedim(Node: TASTNode);
 // The array must already be declared (DIM first); each dimension's original lower bound is kept (only
 // the upper bounds / size change). PRESERVE keeps the flat element order up to the new size.
 var
-  j, di, ArrayIdx, MSlot, MDimCount: Integer;
-  ArrName, MTypeName: string;
+  j, di, ArrayIdx, MSlot, MDimCount, UdtIdx: Integer;
+  ArrName, MTypeName, ElemUdtName: string;
   ArrayDeclNode, DimsNode, DimChild, DimExpr, DimNode, MemberNode: TASTNode;
   UbValue, UbReg, MHandle, LbVal: TSSAValue;
   MElemBank: TSSARegisterType;
-  PreserveFlag, LbImm, FoldedLb: Int64;
+  PreserveFlag, LbImm, FoldedLb, RecPacked: Int64;
 begin
   if Node.Attributes.Values['PRESERVE'] = '1' then PreserveFlag := 1 else PreserveFlag := 0;
   for j := 0 to Node.ChildCount - 1 do
@@ -6256,6 +6256,26 @@ begin
       EmitInstruction(ssaArrayRedimN, MakeSSAValue(svkNone),
                       MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType),
                       MakeSSAValue(svkNone), MakeSSAConstInt(PreserveFlag));
+    end;
+
+    // Array-of-UDT: eager-allocate a record instance for each element that does not have one yet, so the
+    // freshly-grown elements are usable (an existing element's handle is non-zero and is left untouched by
+    // RecordNewArrayInit, so PRESERVE keeps its data). A plain DIM does this at declaration; a REDIM that
+    // grows/creates a dynamic array-of-UDT must do it too, else the new elements hold handle 0 and the
+    // first "arr(i).field" access dereferences an unallocated record (Access Violation).
+    ElemUdtName := ArrayRecordTypeOf(ArrName);
+    if ElemUdtName <> '' then
+    begin
+      UdtIdx := FindUDT(ElemUdtName);
+      if UdtIdx >= 0 then
+      begin
+        RecPacked := (Int64(FUDTs[UdtIdx].NInt) and $FFFF)
+                  or ((Int64(FUDTs[UdtIdx].NFloat) and $FFFF) shl 16)
+                  or ((Int64(FUDTs[UdtIdx].NStr) and $FFFF) shl 32)
+                  or ((Int64(UdtIdx) and $FFFF) shl 48);
+        EmitInstruction(ssaRecordNewArray, MakeSSAValue(svkNone),
+                        MakeSSAArrayRef(ArrayIdx, srtInt), MakeSSAConstInt(RecPacked), MakeSSAValue(svkNone));
+      end;
     end;
   end;
 end;

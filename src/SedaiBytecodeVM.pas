@@ -2111,8 +2111,13 @@ begin
   FloatC := (PackedCounts shr 16) and $FFFF;
   StrC := (PackedCounts shr 32) and $FFFF;
   TypeId := (PackedCounts shr 48) and $FFFF;
+  // Allocate a record only for elements that do not already have one. A valid array-of-UDT element
+  // handle is a shared-region record (SHARED_REC_FLAG set), so it is never 0 — a 0 handle marks an
+  // uninitialized slot. After a plain DIM every slot is 0, so all are filled; after REDIM [PRESERVE]
+  // only the freshly-grown slots are 0, so existing records are kept (no clobber / leak).
   for k := 0 to FArrays[ArrayId].TotalSize - 1 do
-    FArrays[ArrayId].IntData[k] := AllocSharedRecord(IntC, FloatC, StrC, TypeId);
+    if FArrays[ArrayId].IntData[k] = 0 then
+      FArrays[ArrayId].IntData[k] := AllocSharedRecord(IntC, FloatC, StrC, TypeId);
 end;
 
 procedure TBytecodeVM.SetupWorkerContext(WCtx: TExecutionContext);
