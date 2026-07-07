@@ -1727,6 +1727,18 @@ begin
      end;
    end;
 
+   // FreeBASIC compact block IF written on one line: "IF cond THEN stmt : END IF". The single-line THEN
+   // body may be terminated by an END IF (the author closed a one-line block IF). Consume it and pop the
+   // IF, so the trailing END IF is not left as a stray token (which failed to parse).
+   if Context.Check(ttBlockEnd) or
+      (Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttConditionalIf)) then
+   begin
+     ConsumeBlockIfTerminator;
+     if FValidationStacks.HasActiveIf then FValidationStacks.PopIf;
+     Break;
+   end;
+
    // Parse statement and add to THEN
    Statement := ParseStatement;
    if Assigned(Statement) then
