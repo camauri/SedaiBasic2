@@ -1257,7 +1257,7 @@ end;
 function TPackratParser.ParsePrintStatement: TASTNode;
 var
   Token: TLexerToken;
-  Expr, FormatNode: TASTNode;
+  Expr, FormatNode, UsingMarker: TASTNode;
   SeparatorNode: TASTNode;
   IsUsingFormat: Boolean;
 begin
@@ -1340,6 +1340,21 @@ begin
       SeparatorNode := TASTNode.CreateWithValue(antSeparator, Context.CurrentToken.Value, Context.CurrentToken);
       Result.AddChild(SeparatorNode);
       Context.Advance;                 // consume the leading/standalone separator
+      Continue;
+    end;
+    // FreeBASIC mid-list "USING fmt;": a USING clause that appears after a leading separator or an item
+    // (e.g. "Print , Using ""#.##""; x") switches the format applied to the value items that follow.
+    // Carried as an antPrintUsing marker child (format at child 0); the SSA sets it as the current format.
+    // The plain "Print Using ..." head form (whole statement) is handled above and is left untouched.
+    if (not IsUsingFormat) and Context.Check(ttOutputCommand) and
+       (UpperCase(VarToStr(Context.CurrentToken.Value)) = kUSING) then
+    begin
+      Context.Advance;                 // consume USING
+      FormatNode := ParseExpression;   // format string
+      UsingMarker := TASTNode.Create(antPrintUsing, Token);
+      if Assigned(FormatNode) then UsingMarker.AddChild(FormatNode);
+      Result.AddChild(UsingMarker);
+      if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;   // ; or , before values
       Continue;
     end;
     // Parse expression
@@ -7723,6 +7738,7 @@ begin
     ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
     ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, TypeTok));
     ArrayDecl.AddChild(ValueNode);
+    if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';     // FB: a module-level CONST is globally visible
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
     DoNodeCreated(Result);
@@ -7762,24 +7778,53 @@ begin
     ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
     ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, TypeTok));
     ArrayDecl.AddChild(ValueNode);
+    if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';     // FB: a module-level CONST is globally visible
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
     DoNodeCreated(Result);
     Exit;
   end;
 
-  // Parse assignment expression (name = value)
+  // Bare "CONST name = value" (untyped). Lower it to a SHARED typed scalar DIM — like the typed forms
+  // above — so the constant is visible module-wide, INCLUDING inside SUB/FUNCTION bodies (FreeBASIC
+  // module-level constants are global; without SHARED the synthesized module DIM would be invisible to
+  // procedures, so e.g. "Const pi = 3.14159" used inside a function read as 0). The bank is inferred from
+  // the value: a string literal -> STRING; a numeric literal with a fractional part or exponent -> DOUBLE;
+  // any other numeric literal -> LONGINT; a non-literal value expression -> DOUBLE.
   Assignment := ParseAssignmentStatement;
-  if Assigned(Assignment) and (Assignment.NodeType = antAssignment) then
-    Result.AddChild(Assignment)
-  else
+  if not (Assigned(Assignment) and (Assignment.NodeType = antAssignment) and (Assignment.ChildCount >= 2)) then
   begin
     HandleError('Expected assignment after CONST', Token);
+    if Assigned(Assignment) then Assignment.Free;
     Result.Free;
     Result := nil;
     Exit;
   end;
-
+  ValueNode := Assignment.GetChild(1).Clone;          // the constant value (assignment freed below)
+  TypeName := 'DOUBLE';
+  if ValueNode.NodeType = antLiteral then
+  begin
+    if VarIsStr(ValueNode.Value) then
+      TypeName := 'STRING'
+    else if (Pos('.', VarToStr(ValueNode.Value)) > 0) or
+            (Pos('E', UpperCase(VarToStr(ValueNode.Value))) > 0) then
+      TypeName := 'DOUBLE'
+    else
+      TypeName := 'LONGINT';
+  end;
+  NameTok := Assignment.GetChild(0).Token;
+  Result.Free;                                        // discard the antConst; emit a typed SHARED DIM
+  ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
+  ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Assignment.GetChild(0).Value)), NameTok));
+  ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, NameTok));
+  ArrayDecl.AddChild(ValueNode);
+  // Only MODERN (FreeBASIC) needs a module-level CONST to be a SHARED global for procedure visibility.
+  // CLASSIC (line-numbered Commodore BASIC) has no separate procedure scope and its execution model does
+  // not use the shared-scalar backing array; marking it SHARED there breaks the const (m: stress.bas).
+  if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';
+  Assignment.Free;
+  Result := TASTNode.Create(antDim, Token);
+  Result.AddChild(ArrayDecl);
   DoNodeCreated(Result);
 end;
 

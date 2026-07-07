@@ -4996,13 +4996,14 @@ end;
 procedure TSSAGenerator.ProcessPrint(Node: TASTNode);
 var
   i: Integer;
-  ExprValue, RegValue, ArgValue, ArgReg: TSSAValue;
+  ExprValue, RegValue, ArgValue, ArgReg, CurrentFormatReg: TSSAValue;
   DestReg: Integer;
   Child, ArgNode: TASTNode;
   SeparatorChar, FuncName: string;
   EndsWithSeparator: Boolean;
   PKidx: Integer;   // B1.5 phase C: print-kind index for a BOOLEAN / unsigned-64 identifier
 begin
+  CurrentFormatReg := MakeSSAValue(svkNone);   // FreeBASIC mid-list "USING fmt" format, once set
   // FreeBASIC console WRITE: quoted-CSV to the screen (child 0 is a placeholder; values are children 1+).
   if Node.Attributes.Values['WRITECSV'] = '1' then
   begin
@@ -5040,6 +5041,18 @@ begin
       else if SeparatorChar = ';' then
         EmitInstruction(ssaPrintSemicolon, MakeSSAValue(svkNone),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Continue;
+    end;
+
+    // FreeBASIC mid-list "USING fmt" marker (from "Print , Using ""#.##""; x"): set the format applied
+    // to the value items that follow. Carried as a nested antPrintUsing node with the format at child 0.
+    if Child.NodeType = antPrintUsing then
+    begin
+      if Child.ChildCount >= 1 then
+      begin
+        ProcessExpression(Child.GetChild(0), ExprValue);
+        CurrentFormatReg := EnsureStringRegister(ExprValue);
+      end;
       Continue;
     end;
 
@@ -5113,6 +5126,15 @@ begin
           ExprValue := RegValue;
         end;
       end;
+    end;
+
+    // Under a mid-list "USING fmt", the value is formatted with the current format string (ssaPrintUsing
+    // takes a float value), overriding the plain per-type print below.
+    if CurrentFormatReg.Kind = svkRegister then
+    begin
+      EmitInstruction(ssaPrintUsing, MakeSSAValue(svkNone), CurrentFormatReg,
+                     EnsureFloatRegister(ExprValue), MakeSSAValue(svkNone));
+      Continue;
     end;
 
     // B1.5 phase C: printing a BOOLEAN variable yields "true"/"false"; a 64-bit unsigned variable
@@ -14922,7 +14944,13 @@ var
   ElemBank: TSSARegisterType;
 begin
   if Node = nil then Exit;
-  // (single flat pass over the whole AST: DIM SHARED is module-level; nested DIMs aren't marked)
+  // Do not descend into procedure bodies: DIM SHARED (and a module-level CONST, which lowers to a
+  // SHARED DIM) is module-scoped. A CONST inside a SUB/FUNCTION is proc-local — it must NOT be promoted
+  // to a shared global (that would collide across procedures). Skipping proc bodies here leaves a
+  // proc-local const's SHARED-marked DIM out of FSharedScalarArr, so ProcessDim treats it as an ordinary
+  // local (its shared branch is gated on IsSharedScalar).
+  if Node.NodeType = antProcedureDecl then Exit;
+  // (single flat pass over module-level AST: DIM SHARED is module-level; nested DIMs aren't marked)
   if Node.NodeType = antDim then
     for k := 0 to Node.ChildCount - 1 do
     begin
