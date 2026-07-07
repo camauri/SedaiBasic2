@@ -11108,55 +11108,176 @@ end;
 
 { Formatted output implementation }
 procedure TSSAGenerator.ProcessPrintUsing(Node: TASTNode);
+// PRINT USING format$; value1; value2; ...  (FreeBASIC / QuickBASIC formatted output).
+// When the format is a STRING LITERAL (the overwhelmingly common case) it is split into fields at
+// COMPILE time, consuming one value per field so a multi-field template works — e.g.
+//   Print Using "\  \ ##.#"; name$; score      -> the "\  \" string field takes name$, "##.#" takes score.
+// Field kinds: a run of #/./,/$/+/-/^ (a NUMERIC field, formatted with the existing single-field engine);
+// "\...\" (a fixed-width STRING field, width = the backslash span, left-justified/padded/truncated);
+// "&" (a variable-width string field); "!" (one character). Any other text is emitted literally.
+// A non-literal (variable) format falls back to formatting each value with the whole format string.
 var
-  i: Integer;
-  FormatVal, ValueVal: TSSAValue;
-  FormatReg, ValueReg: TSSAValue;
-  Instr: TSSAInstruction;
+  i, vi, fi, fLen, W, nVals: Integer;
+  FmtNode: TASTNode;
+  FmtStr, FieldStr: string;
+  FormatVal, ValueVal, FormatReg, ValueReg, FmtReg, TmpReg: TSSAValue;
   EndsWithSeparator: Boolean;
-begin
-  if FCurrentBlock = nil then Exit;
-  if Node.ChildCount < 2 then Exit; // Need at least format and one value
+  ValNodes: array of TASTNode;
+  NoneV: TSSAValue;
 
-  // PRINT USING format$; value1, value2, ...
-  // Child[0] = format string
-  // Child[1..n] = values to print (may include separator nodes)
-  ProcessExpression(Node.GetChild(0), FormatVal);
-  // Ensure format is in a string register (constants need to be loaded)
-  FormatReg := EnsureStringRegister(FormatVal);
-
-  // Check if statement ends with separator (suppress newline)
-  EndsWithSeparator := (Node.ChildCount > 1) and
-                       (Node.GetChild(Node.ChildCount - 1).NodeType = antSeparator);
-
-  // Emit one instruction per value
-  for i := 1 to Node.ChildCount - 1 do
+  function IsNumFieldStart(P: Integer): Boolean;
+  var k: Integer; sawHash: Boolean;
   begin
-    if Node.GetChild(i).NodeType = antSeparator then
-      Continue; // Skip separators
-
-    ProcessExpression(Node.GetChild(i), ValueVal);
-    // Ensure value is in a float register (constants need to be loaded)
-    ValueReg := EnsureFloatRegister(ValueVal);
-
-    // Emit PRINT USING with format and value (both must be registers)
-    Instr := TSSAInstruction.Create(ssaPrintUsing);
-    Instr.Dest := MakeSSAValue(svkNone);
-    Instr.Src1 := FormatReg;  // Format string register
-    Instr.Src2 := ValueReg;   // Value register
-    Instr.Src3 := MakeSSAValue(svkNone);
-    Instr.SourceLine := Node.SourceLine;
-    FCurrentBlock.AddInstruction(Instr);
+    Result := False;
+    if P > fLen then Exit;
+    if FmtStr[P] = '#' then Exit(True);
+    // A leading $, +, or - opens a numeric field only if a '#' follows in the same run.
+    if FmtStr[P] in ['$', '+', '-'] then
+    begin
+      sawHash := False; k := P;
+      while (k <= fLen) and (FmtStr[k] in ['#', '.', '$', '+', '-', '^', ',']) do
+      begin
+        if FmtStr[k] = '#' then sawHash := True;
+        Inc(k);
+      end;
+      Result := sawHash;
+    end;
   end;
 
-  // Add newline unless statement ends with separator (; or ,)
-  if not EndsWithSeparator then
-    EmitInstruction(ssaPrintNewLine, MakeSSAValue(svkNone),
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  procedure EmitConstStr(const S: string);
+  begin
+    if S = '' then Exit;
+    TmpReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaLoadConstString, TmpReg, MakeSSAConstString(S), NoneV, NoneV);
+    EmitInstruction(ssaPrintString, NoneV, TmpReg, NoneV, NoneV);
+  end;
 
-  // Reset reverse mode after PRINT USING (C128 behavior)
-  EmitInstruction(ssaPrintEnd, MakeSSAValue(svkNone),
-                 MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // Print a string value left-justified in a fixed field of width Wid: LEFT(s + SPACE(Wid), Wid).
+  procedure EmitStrField(const SReg: TSSAValue; Wid: Integer);
+  var WReg, SpaceReg, ConcatReg, LeftReg: TSSAValue;
+  begin
+    WReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, WReg, MakeSSAConstInt(Wid), NoneV, NoneV);
+    SpaceReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaStrSpace, SpaceReg, WReg, NoneV, NoneV);
+    ConcatReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaStrConcat, ConcatReg, SReg, SpaceReg, NoneV);
+    LeftReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaStrLeft, LeftReg, ConcatReg, WReg, NoneV);
+    EmitInstruction(ssaPrintString, NoneV, LeftReg, NoneV, NoneV);
+  end;
+
+  procedure EmitNumField(const FieldFmt: string; const ValReg: TSSAValue);
+  begin
+    FmtReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaLoadConstString, FmtReg, MakeSSAConstString(FieldFmt), NoneV, NoneV);
+    EmitInstruction(ssaPrintUsing, NoneV, FmtReg, ValReg, NoneV);
+  end;
+
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 2 then Exit;   // need at least a format and one value
+  NoneV := MakeSSAValue(svkNone);
+
+  // Collect the value children (dropping separator nodes); note a trailing separator (suppresses newline).
+  SetLength(ValNodes, 0);
+  EndsWithSeparator := (Node.GetChild(Node.ChildCount - 1).NodeType = antSeparator);
+  for i := 1 to Node.ChildCount - 1 do
+    if Node.GetChild(i).NodeType <> antSeparator then
+    begin
+      SetLength(ValNodes, Length(ValNodes) + 1);
+      ValNodes[High(ValNodes)] := Node.GetChild(i);
+    end;
+  nVals := Length(ValNodes);
+
+  FmtNode := Node.GetChild(0);
+  if (FmtNode.NodeType = antLiteral) and VarIsStr(FmtNode.Value) then
+  begin
+    // Compile-time field engine. FreeBASIC RECYCLES the format when more values than fields are given
+    // (e.g. Print Using "##.# "; a; b uses "##.# " for a, then again for b), so wrap the walk in a pass
+    // loop: repeat the format until every value is consumed, stopping if a pass consumes none (a format
+    // with no value-consuming field, or all values already printed) to avoid looping forever.
+    FmtStr := VarToStr(FmtNode.Value);
+    fLen := Length(FmtStr);
+    vi := 0;
+    repeat
+    W := vi;   // remember the value index at the start of this pass (reusing W as a scratch counter)
+    fi := 1;
+    while fi <= fLen do
+    begin
+      if FmtStr[fi] = '\' then
+      begin
+        i := fi + 1;
+        while (i <= fLen) and (FmtStr[i] <> '\') do Inc(i);
+        if i <= fLen then W := i - fi + 1 else W := i - fi;   // include the closing backslash
+        fi := i + 1;
+        if vi < nVals then
+        begin
+          ProcessExpression(ValNodes[vi], ValueVal); Inc(vi);
+          EmitStrField(EnsureStringRegister(ValueVal), W);
+        end;
+      end
+      else if FmtStr[fi] = '&' then
+      begin
+        Inc(fi);
+        if vi < nVals then
+        begin
+          ProcessExpression(ValNodes[vi], ValueVal); Inc(vi);
+          EmitInstruction(ssaPrintString, NoneV, EnsureStringRegister(ValueVal), NoneV, NoneV);
+        end;
+      end
+      else if FmtStr[fi] = '!' then
+      begin
+        Inc(fi);
+        if vi < nVals then
+        begin
+          ProcessExpression(ValNodes[vi], ValueVal); Inc(vi);
+          FmtReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));   // count "1" in a register
+          EmitInstruction(ssaLoadConstInt, FmtReg, MakeSSAConstInt(1), NoneV, NoneV);
+          TmpReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+          EmitInstruction(ssaStrLeft, TmpReg, EnsureStringRegister(ValueVal), FmtReg, NoneV);
+          EmitInstruction(ssaPrintString, NoneV, TmpReg, NoneV, NoneV);
+        end;
+      end
+      else if IsNumFieldStart(fi) then
+      begin
+        i := fi;
+        while (i <= fLen) and (FmtStr[i] in ['#', '.', '$', '+', '-', '^', ',']) do Inc(i);
+        FieldStr := Copy(FmtStr, fi, i - fi);
+        fi := i;
+        if vi < nVals then
+        begin
+          ProcessExpression(ValNodes[vi], ValueVal); Inc(vi);
+          EmitNumField(FieldStr, EnsureFloatRegister(ValueVal));
+        end;
+      end
+      else
+      begin
+        // Literal text up to the next field marker.
+        i := fi;
+        while (i <= fLen) and not ((FmtStr[i] in ['\', '&', '!']) or IsNumFieldStart(i)) do Inc(i);
+        EmitConstStr(Copy(FmtStr, fi, i - fi));
+        fi := i;
+      end;
+    end;
+    until (vi >= nVals) or (vi = W);   // all values consumed, or this pass consumed none (no field)
+  end
+  else
+  begin
+    // Fallback: a non-literal (runtime) format — format each value with the whole format string.
+    ProcessExpression(FmtNode, FormatVal);
+    FormatReg := EnsureStringRegister(FormatVal);
+    for i := 0 to nVals - 1 do
+    begin
+      ProcessExpression(ValNodes[i], ValueVal);
+      ValueReg := EnsureFloatRegister(ValueVal);
+      EmitInstruction(ssaPrintUsing, NoneV, FormatReg, ValueReg, NoneV);
+    end;
+  end;
+
+  if not EndsWithSeparator then
+    EmitInstruction(ssaPrintNewLine, NoneV, NoneV, NoneV, NoneV);
+  EmitInstruction(ssaPrintEnd, NoneV, NoneV, NoneV, NoneV);
 end;
 
 procedure TSSAGenerator.ProcessPudef(Node: TASTNode);
