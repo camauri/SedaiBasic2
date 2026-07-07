@@ -104,6 +104,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `aliquot_sequence_classifications.bas` | <https://rosettacode.org/wiki/Aliquot_sequence_classifications> |
 | `gamma_function.bas`             | <https://rosettacode.org/wiki/Gamma_function> |
 | `pointers_and_references.bas` | <https://rosettacode.org/wiki/Pointers_and_references> |
+| `ranking_methods.bas`      | <https://rosettacode.org/wiki/Ranking_methods> |
 
 ## Running
 
