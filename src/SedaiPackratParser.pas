@@ -7830,7 +7830,7 @@ end;
 function TPackratParser.ParseReadStatement: TASTNode;
 var
   Token: TLexerToken;
-  VarNode: TASTNode;
+  VarNode, MemberNode: TASTNode;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antRead, Token);
@@ -7852,6 +7852,23 @@ begin
         // Simple variable
         VarNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
         Context.Advance;
+      end;
+      // Fold a ".field" chain so a READ target can be a UDT member: "READ obj.x", "READ a(i).y".
+      // Each "." wraps the current target as the object child of an antMemberAccess (like the REDIM
+      // target chain in ParseArrayDeclaration); the SSA reads a DATA item into a temp and stores it.
+      while Context.Check(ttOpDot) do
+      begin
+        Context.Advance;                              // '.'
+        if not Context.Check(ttIdentifier) then
+        begin
+          HandleError('Expected field name after "." in READ target', Context.CurrentToken);
+          Break;
+        end;
+        MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(Context.CurrentToken.Value),
+                                               Context.CurrentToken);
+        MemberNode.AddChild(VarNode);
+        VarNode := MemberNode;
+        Context.Advance;                              // field name
       end;
       Result.AddChild(VarNode);
     end

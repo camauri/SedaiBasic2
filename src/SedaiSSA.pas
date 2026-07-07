@@ -10921,6 +10921,9 @@ var
   VarName, TmpName: string;
   DestReg: TSSAValue;
   ElemBank: TSSARegisterType;
+  MemberUDT, MemberSlot: Integer;
+  MemberBank: TSSARegisterType;
+  MemberNestedT: string;
 begin
   if FCurrentBlock = nil then Exit;
 
@@ -10964,6 +10967,30 @@ begin
       StoreAssign.AddChild(Child.Clone);
       StoreAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, Child.Token));
       try ProcessArrayStore(StoreAssign); finally StoreAssign.Free; end;
+    end
+    else if Child.NodeType = antMemberAccess then
+    begin
+      // READ into a UDT member "READ obj.field" / "READ a(i).field": read the next DATA item into a
+      // temp of the FIELD's bank (resolved without emitting code), then store it into the member through
+      // the normal member-store path (which handles nested/shared records and narrowing/conversion).
+      ElemBank := srtFloat;
+      MemberUDT := FindUDT(ObjectTypeName(Child.GetChild(0)));
+      if (MemberUDT >= 0) and
+         UDTFieldBankSlot(MemberUDT, VarToStr(Child.Value), MemberBank, MemberSlot, MemberNestedT) then
+        ElemBank := MemberBank;
+      case ElemBank of
+        srtInt:    TmpName := '__RDTMP%';
+        srtString: TmpName := '__RDTMP$';
+      else         TmpName := '__RDTMP!';
+      end;
+      DestReg := GetOrAllocateVariable(TmpName);
+      EmitInstruction(ssaDataRead, DestReg, MakeSSAConstInt(Ord(ElemBank)),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // Synthesize "obj.field = <temp>" and reuse ProcessMemberStore.
+      StoreAssign := TASTNode.Create(antAssignment, Child.Token);
+      StoreAssign.AddChild(Child.Clone);
+      StoreAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, Child.Token));
+      try ProcessMemberStore(StoreAssign.GetChild(0), StoreAssign.GetChild(1)); finally StoreAssign.Free; end;
     end;
   end;
 end;
