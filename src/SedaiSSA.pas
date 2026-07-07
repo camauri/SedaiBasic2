@@ -7168,6 +7168,12 @@ begin
     end;
   end;
 
+  // A SHARED scalar loop counter is stepped in a register (VarReg), but reads of it inside the body
+  // resolve to its backing array (element 0). Publish the start value to the backing now so the first
+  // iteration's body sees it; ProcessNext republishes after each step. (No-op for a non-shared counter.)
+  if IsSharedScalar(VarName) then
+    EmitSharedScalarStoreVal(VarName, VarReg);
+
   // Materialize constants into registers for EndValue and StepValue (after var init!)
   // Convert to same type as VarReg for proper comparison
   if EndValue.Kind = svkConstInt then
@@ -7781,6 +7787,11 @@ begin
     EmitInstruction(ssaAddFloat, MakeSSARegister(srtFloat, NewVarReg), LoopInfo.VarReg, LoopInfo.StepValue, MakeSSAValue(svkNone));
     EmitInstruction(ssaCopyFloat, LoopInfo.VarReg, MakeSSARegister(srtFloat, NewVarReg), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
+
+  // A SHARED scalar counter is stepped in the register above; republish it to the backing array so the
+  // next iteration's body (which reads the shared scalar from its backing) sees the updated value.
+  if IsSharedScalar(LoopInfo.VarName) then
+    EmitSharedScalarStoreVal(LoopInfo.VarName, LoopInfo.VarReg);
 
   // Jump back to condition check
   if LoopInfo.NeedRuntimeCheck then
