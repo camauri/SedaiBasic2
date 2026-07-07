@@ -99,6 +99,8 @@ single work, but distributing separate works together (aggregation) is permitted
 | `smith_numbers.bas`           | <https://rosettacode.org/wiki/Smith_numbers> |
 | `base64_encode_data.bas`      | <https://rosettacode.org/wiki/Base64_encode_data> |
 | `determine_if_two_triangles_overlap.bas` | <https://rosettacode.org/wiki/Determine_if_two_triangles_overlap> |
+| `filter.bas`                   | <https://rosettacode.org/wiki/Filter> |
+| `averages_simple_moving_average.bas` | <https://rosettacode.org/wiki/Averages/Simple_moving_average> |
 
 ## Running
 
