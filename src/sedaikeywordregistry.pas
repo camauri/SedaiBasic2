@@ -2108,7 +2108,10 @@ begin
                       kCHAR,
                       // LIST: the Commodore/immediate-mode "list the program lines" command — FreeBASIC has
                       // no LIST function, and "list" is a common identifier/type name (a linked list).
-                      kLIST],
+                      kLIST,
+                      // ST: the Commodore I/O status-byte variable — FreeBASIC has no ST, and "st" is a very
+                      // common variable name (status / state / step / string temp). Keyword in CLASSIC only.
+                      kST],
                      kdClassicOnly);
 
   //WriteLn('DEBUG RegisterBasicKeywords: Completed registration of ', GetKeywordCount, ' keywords');
