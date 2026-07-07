@@ -13999,6 +13999,10 @@ begin
       VarName := UpperCase(VarToStr(Node.GetChild(0).Value));
       TypeName := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
       if TypeName <> '' then RegisterTypedVar(VarName, TypeName);
+      // A FUNCTION returning UInteger/ULongInt: record its print-kind under the function name so a call
+      // result (Print f(...) / f(...) in a compare) is recognised as unsigned by IsUnsigned64Expr.
+      if (TypeName = 'UINTEGER') or (TypeName = 'ULONGINT') then
+        RecordVarWidth(VarName, TypeName);
     end;
     // Record-typed (or explicit-typed) parameters: "param AS type" (M3.1). The parameter
     // node is antIdentifier(param) with a child antIdentifier(type).
@@ -14037,7 +14041,16 @@ begin
             ParamNode.Attributes.Values['ADDRCARRIER'] := '1';   // int address, not its declared bank (ParamDeclaredBank)
             RegisterTypedVar(VarName, 'INTEGER');
           end
-          else if TypeName <> '' then RegisterTypedVar(VarName, TypeName);
+          else if TypeName <> '' then
+          begin
+            RegisterTypedVar(VarName, TypeName);
+            // An unsigned 64-bit parameter (UInteger/ULongInt) prints unsigned and selects the unsigned
+            // compare/div/mod forms (IsUnsigned64Expr reads FVarPrintKind=2). Only these two 64-bit types
+            // need it — narrower unsigned params are stored as positive Int64 and behave correctly as
+            // signed. Recording just these avoids adding any store-narrowing (their width code is 0).
+            if (TypeName = 'UINTEGER') or (TypeName = 'ULONGINT') then
+              RecordVarWidth(VarName, TypeName);
+          end;
         end;
       end;
     end;
@@ -16190,11 +16203,26 @@ begin
           ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR:
             Result := IsUnsigned64Expr(Node.GetChild(0)) or IsUnsigned64Expr(Node.GetChild(1));
         end;
-    antFunctionCall:
+    antFunctionCall, antArrayAccess:
       begin
-        // FreeBASIC unsigned 64-bit conversions.
-        U := UpperCase(VarToStr(Node.Value));
+        // A "name(args)" call is parsed as antArrayAccess (callee = child 0), disambiguated to a user
+        // FUNCTION / array later; a builtin-form node uses antFunctionCall (callee = Node.Value). Cover
+        // both: an unsigned 64-bit conversion (CUINT/CULNGINT), or a user FUNCTION declared returning
+        // UInteger/ULongInt (recorded under its name in FVarPrintKind = 2 by RegisterRecordVars). A
+        // genuine array element access lands here too but its array name is never in FVarPrintKind
+        // (only scalars/params/returns are), so it correctly stays signed.
+        if Node.NodeType = antFunctionCall then
+          U := UpperCase(VarToStr(Node.Value))
+        else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+          U := UpperCase(VarToStr(Node.GetChild(0).Value))
+        else
+          U := '';
         Result := (U = 'CUINT') or (U = 'CULNGINT');
+        if not Result and (U <> '') then
+        begin
+          Idx := FVarPrintKind.IndexOf(U);
+          Result := (Idx >= 0) and (PtrInt(FVarPrintKind.Objects[Idx]) = 2);
+        end;
       end;
   end;
 end;
@@ -18175,6 +18203,11 @@ begin
   // variable pre-allocation, so record vars are allocated as int handles and DIM..AS builtin
   // vars use their declared bank.
   RegisterUDTs(AST);
+  // These must be cleared BEFORE RegisterRecordVars: that pre-pass records the print-kind of unsigned
+  // 64-bit parameters and FUNCTION return types here (so a call result / a param in a body is seen as
+  // unsigned), and a later clear would wipe them. DIM-scalar widths are (re)recorded during body gen.
+  FVarWidthCode.Clear;
+  FVarPrintKind.Clear;
   RegisterRecordVars(AST);
 
   // M6: collect DIM SHARED scalars and assign them dedicated transfer slots (runs after type
@@ -18186,8 +18219,6 @@ begin
   FRawPtrVars.Clear;
   FWStringVars.Clear;
   FByrefRetFuncs.Clear;
-  FVarWidthCode.Clear;
-  FVarPrintKind.Clear;
   FArrayElemWidth.Clear;
   // FreeBASIC pointers: mark each address-taken (@x) declared scalar SHARED so the next pass backs it
   // with a 1-element global array (a stable address); also records pointee types in FPointerVars.
