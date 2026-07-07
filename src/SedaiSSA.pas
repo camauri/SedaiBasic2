@@ -1593,8 +1593,11 @@ begin
           end
           else if Left.Kind = svkConstInt then
           begin
-            // Negate int constant at compile time
+            // Negate int constant at compile time. Overflow checking OFF so negating Int64.Min wraps
+            // (to itself) like the runtime, instead of raising EIntOverflow.
+            {$PUSH}{$Q-}{$R-}
             Result := MakeSSAConstInt(-Left.ConstInt);
+            {$POP}
           end
           else
           begin
@@ -1743,9 +1746,15 @@ begin
       else if (Left.Kind = svkConstInt) and (Right.Kind = svkConstInt) then
       begin
         case Node.Token.TokenType of
+          // Fold with overflow checking OFF so a compile-time integer add/sub/mul WRAPS (two's
+          // complement), exactly like the runtime (which runs under {$Q-}). Otherwise folding an
+          // intentional overflow (e.g. a 64-bit literal computation) raised EIntOverflow while the
+          // unfolded/runtime path silently wrapped — an opt/no-opt divergence.
+          {$PUSH}{$Q-}{$R-}
           ttOpAdd: Result := MakeSSAConstInt(Left.ConstInt + Right.ConstInt);
           ttOpSub: Result := MakeSSAConstInt(Left.ConstInt - Right.ConstInt);
           ttOpMul: Result := MakeSSAConstInt(Left.ConstInt * Right.ConstInt);
+          {$POP}
           ttOpDiv:
             // `/` is always floating-point division (both C64 BASIC and FreeBASIC), even for
             // integer operands - so 10/4 = 2.5, matching the non-const lowering above. Folding
@@ -1762,6 +1771,15 @@ begin
               // not folded here and reaches the unsigned runtime path.)
               if IsUnsigned64Expr(Node.GetChild(0)) or IsUnsigned64Expr(Node.GetChild(1)) then
                 Result := MakeSSAConstInt(Int64(QWord(Left.ConstInt) div QWord(Right.ConstInt)))
+              // x \ -1 = -x. Fold it as a (wrap-on-overflow) negation instead of a division, so the one
+              // case the hardware IDIV traps on — Int64.Min \ -1 — wraps to Int64.Min like the runtime,
+              // rather than raising EIntOverflow.
+              else if Right.ConstInt = -1 then
+              begin
+                {$PUSH}{$Q-}{$R-}
+                Result := MakeSSAConstInt(-Left.ConstInt);
+                {$POP}
+              end
               else
                 Result := MakeSSAConstInt(Left.ConstInt div Right.ConstInt);
             end
