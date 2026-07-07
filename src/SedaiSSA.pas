@@ -137,6 +137,7 @@ type
     FCurrentProcAddrParams: TStringList;    // BYREF-return funcs: BYREF params carried as addresses (auto-deref);
                                             //   ValueFromIndex = pointee type name. Lets "RETURN param" return a reference.
     FFuncPtrSigs: TStringList;              // FreeBASIC function pointers in scope: VARNAME -> "paramtypes|rettype"
+    FFuncPtrTypes: TStringList;             // FreeBASIC named funcptr TYPES ("Type X As Function(...)"): TYPENAME -> "paramtypes|rettype"
                                             //   (paramtypes = comma list; rettype '' for SUB). A "name(args)" on such a
                                             //   var is an indirect call (ssaCallSubIndirect) through its entry-PC value.
     FModuleRecordVars: TStringList;      // V5b: "VARNAME|TYPENAME" of module-scope DIM'd UDTs (globals)
@@ -637,6 +638,8 @@ begin
   FCurrentProcByrefScalars := TStringList.Create;
   FCurrentProcAddrParams := TStringList.Create;
   FFuncPtrSigs := TStringList.Create;
+  FFuncPtrTypes := TStringList.Create;
+  FFuncPtrTypes.CaseSensitive := False;
   FModuleRecordVars := TStringList.Create;
   FTypeAliases := TStringList.Create;
   FModuleDtorSlots := TStringList.Create;
@@ -695,6 +698,7 @@ begin
   FCurrentProcByrefScalars.Free;
   FCurrentProcAddrParams.Free;
   FFuncPtrSigs.Free;
+  FFuncPtrTypes.Free;
   FModuleRecordVars.Free;
   FTypeAliases.Free;
   FModuleDtorSlots.Free;
@@ -5599,7 +5603,13 @@ begin
     // an indirect call. Falls through to the typed-scalar path below (element type INTEGER).
     if ArrayDeclNode.Attributes.Values['FUNCPTR'] = '1' then
       FFuncPtrSigs.Values[UpperCase(ArrName)] :=
-        ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' + ArrayDeclNode.Attributes.Values['FPRET'];
+        ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' + ArrayDeclNode.Attributes.Values['FPRET']
+    // "DIM f AS X" where X is a named function-pointer type ("Type X As Function(...)"): f is a funcptr
+    // with X's signature (X aliases to INTEGER, so the typed-scalar path below gives it the int bank).
+    else if (DimsNode.NodeType = antIdentifier) and
+            (FFuncPtrTypes.IndexOfName(UpperCase(VarToStr(DimsNode.Value))) >= 0) then
+      FFuncPtrSigs.Values[UpperCase(ArrName)] :=
+        FFuncPtrTypes.Values[UpperCase(VarToStr(DimsNode.Value))];
 
     // (VAR x = expr is rewritten to a typed-scalar DIM by RegisterRecordVars, so it arrives here as an
     // ordinary "DIM x AS T = expr" — no VAR-specific handling needed.)
@@ -13569,6 +13579,12 @@ begin
     begin
       if FTypeAliases.IndexOfName(Name) < 0 then
         FTypeAliases.Values[Name] := UpperCase(Node.Attributes.Values['ALIAS']);
+      // FreeBASIC named function-pointer type "TYPE X As Function(params) As R": record its signature so a
+      // var/param declared "As X" becomes an int-banked function pointer (aliased to INTEGER above) whose
+      // "f(args)" lowers to an indirect call. The signature is copied into the per-proc FFuncPtrSigs.
+      if Node.Attributes.Values['FUNCPTR'] = '1' then
+        FFuncPtrTypes.Values[Name] :=
+          Node.Attributes.Values['FPPARAMS'] + '|' + Node.Attributes.Values['FPRET'];
       Exit;
     end;
     if FindUDT(Name) < 0 then
@@ -17407,7 +17423,13 @@ begin
         // lowered as an indirect call through the parameter's entry-PC value (int).
         if ParamNodeJ.Attributes.Values['FUNCPTR'] = '1' then
           FFuncPtrSigs.Values[UpperCase(VarToStr(ParamNodeJ.Value))] :=
-            ParamNodeJ.Attributes.Values['FPPARAMS'] + '|' + ParamNodeJ.Attributes.Values['FPRET'];
+            ParamNodeJ.Attributes.Values['FPPARAMS'] + '|' + ParamNodeJ.Attributes.Values['FPRET']
+        // "param AS X" where X is a named function-pointer type ("Type X As Function(...)"): the param is
+        // a funcptr with X's signature (X aliases to INTEGER, so ParamBankAndSlot already gave it int).
+        else if (ParamNodeJ.ChildCount >= 1) and (ParamNodeJ.GetChild(0).NodeType = antIdentifier) and
+                (FFuncPtrTypes.IndexOfName(UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value))) >= 0) then
+          FFuncPtrSigs.Values[UpperCase(VarToStr(ParamNodeJ.Value))] :=
+            FFuncPtrTypes.Values[UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value))];
         // B1.5: a parameter declared with a narrow integer type (child 0 = AS-type identifier) wraps
         // the incoming argument to that width, in place. Only when it lands in the int bank.
         if (RT = srtInt) and (ParamNodeJ.ChildCount >= 1) and

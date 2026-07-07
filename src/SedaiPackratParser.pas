@@ -2768,6 +2768,16 @@ begin
   if (not IsUnion) and Context.Check(ttAsType) then
   begin
     Context.Advance;                                // consume AS
+    // FreeBASIC named function-pointer type: "TYPE X As Function(params) As R" / "TYPE X As Sub(params)".
+    // Record the signature (FUNCPTR/FPPARAMS/FPRET) on the antTypeDecl and alias the storage to INTEGER
+    // (a procedure entry PC). A var/param declared "As X" becomes an int-banked function pointer with
+    // this signature (the SSA copies it into the per-proc FFuncPtrSigs so "f(args)" is an indirect call).
+    if Context.Check(ttProcedureStart) and TryParseProcPtrType(Result) then
+    begin
+      Result.Attributes.Values['ALIAS'] := 'INTEGER';
+      DoNodeCreated(Result);
+      Exit;
+    end;
     AliasType := '';
     if Context.Check(ttIdentifier) or
        ((Length(Context.CurrentToken.Value) > 0) and

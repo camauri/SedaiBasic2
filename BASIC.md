@@ -1330,7 +1330,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `Temporary Types` | ✗ | Creates a temporary copy of a user defined type |
 | `THIS` | ✓ | Implicit first parameter of methods/constructors/destructors (M4.1): the instance handle. `THIS.field` reads/writes fields; used to resolve the method's owner type |
 | `BASE (member access)` | ✓ | `base.field` reads/writes the inherited base field, and `base.method()` is a non-virtual super call to the parent type's method (SUB/FUNCTION, with args/return), inside a derived method. |
-| `Type Alias` | ✓ | `TYPE newname AS underlyingtype` — synonym for a builtin or UDT; resolved via CanonicalType (chained aliases, narrowing, and alias-to-UDT supported). |
+| `Type Alias` | ✓ | `TYPE newname AS underlyingtype` — synonym for a builtin or UDT; resolved via CanonicalType (chained aliases, narrowing, and alias-to-UDT supported). Also **named function-pointer types**: `TYPE X As Function(params) As R` / `TYPE X As Sub(params)` (params may be unnamed) — a var/param/return declared `As X` is an int-banked function pointer with X's signature; `f(args)` is an indirect call. |
 | `WITH` | ✓ | `WITH rec` ... `END WITH`: leading `.field` resolves against the record (M3.2) |
 
 ##### Member Procedures
@@ -1387,7 +1387,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `FUNCTION Pointer` | ✓ | Types that store a pointer to a function procedure |
+| `FUNCTION Pointer` | ✓ | Types that store a pointer to a function procedure. `DIM fp AS FUNCTION(...) AS R` / `AS SUB(...)`, a named `TYPE X As Function(...)` alias, funcptr params/returns, `@func` assignment, indirect call `fp(args)` (int/float/string signatures). |
 | `SUB Pointer` | ✓ | Types that store a pointer to a sub procedure |
 
 ##### Data Type Modifiers
