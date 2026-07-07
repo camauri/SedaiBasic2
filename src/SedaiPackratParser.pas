@@ -6695,6 +6695,21 @@ begin
   DoNodeCreated(Result);
 end;
 
+function IsBuiltinTypeName(const N: string): Boolean;
+// True for the built-in scalar type names. Used to keep a "DIM v AS T = T(args)" from being read as a
+// constructor call when T is a builtin that is ALSO a function — notably STRING (STRING(count, ch)):
+// there "= String(...)" is the STRING function, not a ctor. Constructors only ever apply to UDTs.
+var
+  T: string;
+begin
+  T := UpperCase(N);
+  Result := (T = 'INTEGER') or (T = 'LONG') or (T = 'SHORT') or (T = 'BYTE') or
+            (T = 'UBYTE') or (T = 'USHORT') or (T = 'UINTEGER') or (T = 'ULONG') or
+            (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'BOOLEAN') or
+            (T = 'SINGLE') or (T = 'DOUBLE') or
+            (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING');
+end;
+
 function TPackratParser.ParseDimStatement: TASTNode;
 var
   Token, NameTok, TypeTok, SharedTypeTok: TLexerToken;
@@ -6957,8 +6972,9 @@ begin
       begin
         Context.Advance;                     // =
         if Context.Check(ttIdentifier) and
-           (UpperCase(Context.CurrentToken.Value) = DimTypeName) then
-          Context.Advance                    // RHS == declared type: ctor form (block below reads '(')
+           (UpperCase(Context.CurrentToken.Value) = DimTypeName) and
+           (not IsBuiltinTypeName(DimTypeName)) then
+          Context.Advance                    // RHS == declared UDT: ctor form (block below reads '(')
         else if Context.Check(ttDelimParOpen) then
         begin
           // FreeBASIC aggregate init "Dim As T v = (a, b, c)": a parenthesised comma-tuple sets the UDT's
