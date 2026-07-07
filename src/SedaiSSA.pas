@@ -15695,8 +15695,8 @@ var
            ((Rhs.GetChild(0).NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.GetChild(0).Value))) then
           MarkRaw(TargetU);
     end
-    else if (Rhs.NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.Value)) then
-      MarkRaw(TargetU)   // p = q, q raw
+    else if RawPtrExprName(Rhs) <> '' then
+      MarkRaw(TargetU)   // p = q, p = q + n, p = q - n, p = (q): q raw
     else if FModernMode and (Rhs.NodeType = antArrayAccess) and (Rhs.ChildCount >= 1) and
             (Rhs.GetChild(0).NodeType = antIdentifier) and
             ((UpperCase(VarToStr(Rhs.GetChild(0).Value)) = kSADD) or
