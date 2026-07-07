@@ -2564,10 +2564,19 @@ begin
             ProcessExpression(ArgListNode, ArgValue)
           else begin Result := MakeSSAValue(svkNone); Exit; end;
 
-          ArgReg := EnsureFloatRegister(ArgValue);
           DestReg := FProgram.AllocRegister(srtString);
           Result := MakeSSARegister(srtString, DestReg);
-          EmitInstruction(ssaStrStr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          // FreeBASIC Str(<integer>) has no surrounding spaces, so ssaIntToString (exact IntToStr) already
+          // gives the right text — and, unlike the float formatter, it keeps full 64-bit precision (routing
+          // an Int64 through a Double rounds above 2^53). The float path still serves float arguments and
+          // the CLASSIC v7 STR$ sign-space form (v7 has no 64-bit integers in practice).
+          if (ArgValue.RegType = srtInt) and FModernMode then
+            EmitInstruction(ssaIntToString, Result, EnsureIntRegister(ArgValue), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+          else
+          begin
+            ArgReg := EnsureFloatRegister(ArgValue);
+            EmitInstruction(ssaStrStr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
         end
         else if (FuncName = 'VAL') then
         begin
