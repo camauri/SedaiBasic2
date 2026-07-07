@@ -2056,6 +2056,17 @@ begin
           begin
             RetTok := Context.CurrentToken;
             ParamTypeName := UpperCase(ParseDottedName);
+            // FreeBASIC pointer parameter "<type> PTR" (one or more PTR): keep the PTR suffix on the type
+            // name (the pointee bank is recorded from it) and — crucially — CONSUME the PTR token(s). Left
+            // unconsumed, a following parameter list ("..., x As Integer") mis-parses: the stray "PTR" is
+            // taken as the next parameter, so every parameter after a pointer one is mis-slotted (its
+            // transfer slot no longer matches the caller's staging). Applies to array-of-pointer params
+            // ("a() As T PTR") too.
+            while Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR') do
+            begin
+              ParamTypeName := ParamTypeName + ' PTR';
+              Context.Advance;                      // consume PTR
+            end;
             ParamNode.AddChild(TASTNode.CreateWithValue(antIdentifier,
                          ParamTypeName, RetTok));  // dotted: namespace-qualified param type
           end;
