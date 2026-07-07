@@ -102,6 +102,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `filter.bas`                   | <https://rosettacode.org/wiki/Filter> |
 | `averages_simple_moving_average.bas` | <https://rosettacode.org/wiki/Averages/Simple_moving_average> |
 | `aliquot_sequence_classifications.bas` | <https://rosettacode.org/wiki/Aliquot_sequence_classifications> |
+| `gamma_function.bas`             | <https://rosettacode.org/wiki/Gamma_function> |
 
 ## Running
 
