@@ -98,6 +98,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `harshad_niven_series.bas`    | <https://rosettacode.org/wiki/Harshad_or_Niven_series> |
 | `smith_numbers.bas`           | <https://rosettacode.org/wiki/Smith_numbers> |
 | `base64_encode_data.bas`      | <https://rosettacode.org/wiki/Base64_encode_data> |
+| `determine_if_two_triangles_overlap.bas` | <https://rosettacode.org/wiki/Determine_if_two_triangles_overlap> |
 
 ## Running
 
