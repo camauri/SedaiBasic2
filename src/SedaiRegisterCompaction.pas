@@ -197,9 +197,10 @@ begin
     // === GROUP 0: Core VM operations ===
     // Integer operations
     bcLoadConstInt, bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
-    bcModInt, bcNegInt,
+    bcModInt, bcNegInt, bcDivUInt, bcModUInt,
     // Comparison results (stored as int)
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt,
+    bcCmpLtUInt, bcCmpLeUInt, bcCmpGtUInt, bcCmpGeUInt,
     bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat,
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
     // Bitwise operations (result is int)
@@ -443,8 +444,10 @@ begin
     // === GROUP 0: Core VM operations ===
     // Int arithmetic
     bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
+    bcDivUInt, bcModUInt,
     // Int comparisons
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt,
+    bcCmpLtUInt, bcCmpLeUInt, bcCmpGtUInt, bcCmpGeUInt,
     // Conversion from int
     bcIntToFloat, bcIntToString,
     bcNarrowInt,   // B1.5: integer width narrowing (Src1=int)
@@ -616,9 +619,10 @@ begin
     bcCondWait,
     // === GROUP 0: Core VM operations ===
     // Int arithmetic (second operand)
-    bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt,
+    bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcDivUInt, bcModUInt,
     // Int comparisons (second operand)
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt,
+    bcCmpLtUInt, bcCmpLeUInt, bcCmpGtUInt, bcCmpGeUInt,
     // Bitwise operations (second operand); shifts: Src2 = shift count
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr,
     // === GROUP 5: Memory operations ===

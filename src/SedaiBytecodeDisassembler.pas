@@ -100,6 +100,10 @@ begin
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'DivInt', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcModInt:
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'ModInt', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcDivUInt:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'DivUInt', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcModUInt:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'ModUInt', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcNegInt:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'NegInt', Instr.Dest, Instr.Src1]);
     bcAddFloat:
@@ -128,6 +132,8 @@ begin
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'StringToFloat', Instr.Dest, Instr.Src1]);
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt:
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'CmpInt', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcCmpLtUInt, bcCmpGtUInt, bcCmpLeUInt, bcCmpGeUInt:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'CmpUInt', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpGtFloat, bcCmpLeFloat, bcCmpGeFloat:
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'CmpFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString:

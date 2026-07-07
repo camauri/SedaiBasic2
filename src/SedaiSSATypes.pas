@@ -100,10 +100,12 @@ type
     ssaCopyInt, ssaCopyFloat, ssaCopyString,
     ssaLoadVar, ssaStoreVar,
     ssaAddInt, ssaSubInt, ssaMulInt, ssaDivInt, ssaModInt, ssaNegInt,
+    ssaDivUInt, ssaModUInt,   // unsigned 64-bit \ and Mod (QWord semantics)
     ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat, ssaModFloat, ssaPowFloat, ssaNegFloat,
     ssaIntToFloat, ssaFloatToInt, ssaIntToString, ssaFloatToString,
     ssaStringToInt, ssaStringToFloat,
     ssaCmpEqInt, ssaCmpNeInt, ssaCmpLtInt, ssaCmpGtInt, ssaCmpLeInt, ssaCmpGeInt,
+    ssaCmpLtUInt, ssaCmpGtUInt, ssaCmpLeUInt, ssaCmpGeUInt,   // unsigned 64-bit compares (QWord)
     ssaCmpEqFloat, ssaCmpNeFloat, ssaCmpLtFloat, ssaCmpGtFloat, ssaCmpLeFloat, ssaCmpGeFloat,
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
     ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,

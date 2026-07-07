@@ -131,6 +131,8 @@ begin
     ssaMulInt: Result := bcMulInt;
     ssaDivInt: Result := bcDivInt;
     ssaModInt: Result := bcModInt;
+    ssaDivUInt: Result := bcDivUInt;
+    ssaModUInt: Result := bcModUInt;
     ssaModFloat: Result := bcModFloat;
     ssaNegInt: Result := bcNegInt;
     ssaAddFloat: Result := bcAddFloat;
@@ -150,6 +152,10 @@ begin
     ssaCmpGtInt: Result := bcCmpGtInt;
     ssaCmpLeInt: Result := bcCmpLeInt;
     ssaCmpGeInt: Result := bcCmpGeInt;
+    ssaCmpLtUInt: Result := bcCmpLtUInt;
+    ssaCmpGtUInt: Result := bcCmpGtUInt;
+    ssaCmpLeUInt: Result := bcCmpLeUInt;
+    ssaCmpGeUInt: Result := bcCmpGeUInt;
     ssaCmpEqFloat: Result := bcCmpEqFloat;
     ssaCmpNeFloat: Result := bcCmpNeFloat;
     ssaCmpLtFloat: Result := bcCmpLtFloat;

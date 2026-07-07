@@ -235,6 +235,15 @@ const
   bcCallSubIndirect = bcGroupCore + 140; // FreeBASIC function-pointer call: like bcCallSub but the target entry PC is read from Src1 (int register)
   bcSetEnviron      = bcGroupCore + 141; // SETENVIRON "NAME=value": set an environment variable (Src1 = string)
   bcShell           = bcGroupCore + 142; // SHELL cmd: run a command via the shell (Src1 = string; Dest = int exit code)
+  // Unsigned 64-bit integer operations (UInteger/ULongInt). The registers hold the raw two's-complement
+  // bits; only compare/div/mod differ from the signed forms (add/sub/mul/and/or/xor are bit-identical),
+  // so they reinterpret the Int64 registers as QWord. Chosen by IsUnsigned64Expr at SSA emit time.
+  bcCmpLtUInt       = bcGroupCore + 143; // unsigned <  (QWord)
+  bcCmpGtUInt       = bcGroupCore + 144; // unsigned >  (QWord)
+  bcCmpLeUInt       = bcGroupCore + 145; // unsigned <= (QWord)
+  bcCmpGeUInt       = bcGroupCore + 146; // unsigned >= (QWord)
+  bcDivUInt         = bcGroupCore + 147; // unsigned \  (QWord div)
+  bcModUInt         = bcGroupCore + 148; // unsigned Mod (QWord mod)
   // Argument/result transfer registers (M2): separate VM-side banks, never saved/restored,
   // so they carry args (caller->callee) and the result (callee->caller) across the frame
   // save/restore. Store: Src1=value reg, Immediate=slot. Load: Dest=reg, Immediate=slot.

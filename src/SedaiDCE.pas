@@ -309,7 +309,7 @@ begin
     // Division / modulo can raise a runtime "division by zero" error that TRAP can catch, so the
     // operation is observable even when its result is unused — DCE must not elide it. (Without this,
     // a dead `X = 1/0` was removed, the error never fired, and the TRAP handler was skipped.)
-    ssaDivInt, ssaDivFloat, ssaModInt, ssaModFloat:
+    ssaDivInt, ssaDivFloat, ssaModInt, ssaModFloat, ssaDivUInt, ssaModUInt:
       Result := True;
 
     // Program termination and system state - always live

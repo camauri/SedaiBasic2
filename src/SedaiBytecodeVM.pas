@@ -2745,6 +2745,7 @@ begin
         // Int dest, int sources
         bcLoadConstInt, bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
         bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
+        bcDivUInt, bcModUInt, bcCmpLtUInt, bcCmpGtUInt, bcCmpLeUInt, bcCmpGeUInt,
         bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
         bcRandomize:  // RANDOMIZE: Src1 = seed reg (Dest unused = 0)
         begin
@@ -3744,6 +3745,14 @@ begin
       if Ctx.IntRegs[Instr.Src2] <> 0 then
         Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] mod Ctx.IntRegs[Instr.Src2]
       else raise Exception.Create('Modulo by zero');
+    bcDivUInt:   // unsigned 64-bit \ : reinterpret both registers as QWord
+      if Ctx.IntRegs[Instr.Src2] <> 0 then
+        Ctx.IntRegs[Instr.Dest] := Int64(QWord(Ctx.IntRegs[Instr.Src1]) div QWord(Ctx.IntRegs[Instr.Src2]))
+      else raise Exception.Create('Division by zero');
+    bcModUInt:
+      if Ctx.IntRegs[Instr.Src2] <> 0 then
+        Ctx.IntRegs[Instr.Dest] := Int64(QWord(Ctx.IntRegs[Instr.Src1]) mod QWord(Ctx.IntRegs[Instr.Src2]))
+      else raise Exception.Create('Modulo by zero');
     bcModFloat:
       if Ctx.FloatRegs[Instr.Src2] <> 0.0 then
         Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Src1] - Floor(Ctx.FloatRegs[Instr.Src1] / Ctx.FloatRegs[Instr.Src2]) * Ctx.FloatRegs[Instr.Src2]
@@ -3812,6 +3821,10 @@ begin
     bcCmpGtInt: if Ctx.IntRegs[Instr.Src1] > Ctx.IntRegs[Instr.Src2] then Ctx.IntRegs[Instr.Dest] := FTrueValue else Ctx.IntRegs[Instr.Dest] := 0;
     bcCmpLeInt: if Ctx.IntRegs[Instr.Src1] <= Ctx.IntRegs[Instr.Src2] then Ctx.IntRegs[Instr.Dest] := FTrueValue else Ctx.IntRegs[Instr.Dest] := 0;
     bcCmpGeInt: if Ctx.IntRegs[Instr.Src1] >= Ctx.IntRegs[Instr.Src2] then Ctx.IntRegs[Instr.Dest] := FTrueValue else Ctx.IntRegs[Instr.Dest] := 0;
+    bcCmpLtUInt: if QWord(Ctx.IntRegs[Instr.Src1]) < QWord(Ctx.IntRegs[Instr.Src2]) then Ctx.IntRegs[Instr.Dest] := FTrueValue else Ctx.IntRegs[Instr.Dest] := 0;
+    bcCmpGtUInt: if QWord(Ctx.IntRegs[Instr.Src1]) > QWord(Ctx.IntRegs[Instr.Src2]) then Ctx.IntRegs[Instr.Dest] := FTrueValue else Ctx.IntRegs[Instr.Dest] := 0;
+    bcCmpLeUInt: if QWord(Ctx.IntRegs[Instr.Src1]) <= QWord(Ctx.IntRegs[Instr.Src2]) then Ctx.IntRegs[Instr.Dest] := FTrueValue else Ctx.IntRegs[Instr.Dest] := 0;
+    bcCmpGeUInt: if QWord(Ctx.IntRegs[Instr.Src1]) >= QWord(Ctx.IntRegs[Instr.Src2]) then Ctx.IntRegs[Instr.Dest] := FTrueValue else Ctx.IntRegs[Instr.Dest] := 0;
     // Comparison operators - Float (use FTrueValue for TRUE, 0 for FALSE)
     bcCmpEqFloat: if Ctx.FloatRegs[Instr.Src1] = Ctx.FloatRegs[Instr.Src2] then Ctx.IntRegs[Instr.Dest] := FTrueValue else Ctx.IntRegs[Instr.Dest] := 0;
     bcCmpNeFloat: if Ctx.FloatRegs[Instr.Src1] <> Ctx.FloatRegs[Instr.Src2] then Ctx.IntRegs[Instr.Dest] := FTrueValue else Ctx.IntRegs[Instr.Dest] := 0;

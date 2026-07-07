@@ -481,6 +481,18 @@ begin
           IntRegs[Instr.Dest] := IntRegs[Instr.Src1] mod IntRegs[Instr.Src2];
           Inc(CurPC);
         end;
+        bcDivUInt: begin   // unsigned 64-bit \ (QWord)
+          if IntRegs[Instr.Src2] = 0 then
+            raise EDivByZero.Create('Integer division by zero');
+          IntRegs[Instr.Dest] := Int64(QWord(IntRegs[Instr.Src1]) div QWord(IntRegs[Instr.Src2]));
+          Inc(CurPC);
+        end;
+        bcModUInt: begin   // unsigned 64-bit Mod (QWord)
+          if IntRegs[Instr.Src2] = 0 then
+            raise EDivByZero.Create('Integer modulo by zero');
+          IntRegs[Instr.Dest] := Int64(QWord(IntRegs[Instr.Src1]) mod QWord(IntRegs[Instr.Src2]));
+          Inc(CurPC);
+        end;
         bcNegInt: begin IntRegs[Instr.Dest] := -IntRegs[Instr.Src1]; Inc(CurPC); end;
 
         // Float arithmetic - critical for spectral-norm
@@ -526,6 +538,11 @@ begin
         bcCmpGtInt: begin if IntRegs[Instr.Src1] > IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
         bcCmpLeInt: begin if IntRegs[Instr.Src1] <= IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
         bcCmpGeInt: begin if IntRegs[Instr.Src1] >= IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        // Unsigned 64-bit comparisons (reinterpret registers as QWord)
+        bcCmpLtUInt: begin if QWord(IntRegs[Instr.Src1]) < QWord(IntRegs[Instr.Src2]) then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpGtUInt: begin if QWord(IntRegs[Instr.Src1]) > QWord(IntRegs[Instr.Src2]) then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpLeUInt: begin if QWord(IntRegs[Instr.Src1]) <= QWord(IntRegs[Instr.Src2]) then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpGeUInt: begin if QWord(IntRegs[Instr.Src1]) >= QWord(IntRegs[Instr.Src2]) then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
 
         // Float comparisons (use TrueVal for TRUE, 0 for FALSE)
         bcCmpEqFloat: begin if FloatRegs[Instr.Src1] = FloatRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;

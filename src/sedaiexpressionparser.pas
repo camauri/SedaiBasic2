@@ -742,6 +742,8 @@ function TExpressionParser.ParseNumber(Token: TLexerToken): TASTNode;
 var
   Value: Variant;
   Int64Value: Int64;
+  QWordValue: QWord;
+  ValCode: Integer;
   FloatValue: Double;
   FormatSettings: TFormatSettings;
 begin
@@ -759,13 +761,26 @@ begin
   // 1.0 remains a float (and 1.0/3.0 is float division), not collapsed to integer 1.
   if TryStrToInt64(Token.Value, Int64Value) then
     Value := Int64Value
-  else if TryStrToFloat(Token.Value, FloatValue, FormatSettings) then
-    Value := FloatValue
   else
   begin
-    HandleError(Format('Invalid number format: "%s"', [Token.Value]), Token);
-    Result := nil;
-    Exit;
+    // A decimal integer literal in (Int64.Max, QWord.Max] (e.g. an ULongInt constant like
+    // 18446744073709551615) overflows Int64 but fits an unsigned 64-bit value. Store its exact
+    // two's-complement bits reinterpreted as Int64 (Variant stays varInt64, so the whole
+    // int-bank pipeline is unaffected) instead of degrading to a lossy Double. IsUnsigned64Expr
+    // in the SSA later keys the unsigned compare/div/mod/print forms off the literal's text.
+    // Val rejects any '.'/exponent or an out-of-range magnitude via a non-zero error code, so a
+    // genuine float or a value above QWord.Max still falls through to the float path below.
+    Val(Token.Value, QWordValue, ValCode);
+    if ValCode = 0 then
+      Value := Int64(QWordValue)
+    else if TryStrToFloat(Token.Value, FloatValue, FormatSettings) then
+      Value := FloatValue
+    else
+    begin
+      HandleError(Format('Invalid number format: "%s"', [Token.Value]), Token);
+      Result := nil;
+      Exit;
+    end;
   end;
 
   Result := CreateLiteralNode(Value, Token);

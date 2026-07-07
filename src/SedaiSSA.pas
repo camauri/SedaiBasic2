@@ -370,6 +370,9 @@ type
     // handle register and UDT type name. False if it is not a record object.
     function ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
                                  out TypeName: string): Boolean;
+    // True if the expression is unsigned 64-bit (UInteger/ULongInt), selecting the QWord compare/
+    // div/mod forms. Propagates through +/-/*/\/Mod/bitwise, parentheses and unary.
+    function IsUnsigned64Expr(Node: TASTNode): Boolean;
     // OOP (M4.1): UDT type name of an object expression (no code emitted); method dispatch.
     function ObjectTypeName(ObjNode: TASTNode): string;
     // UDT element type of an array-of-UDT by name, scope-aware (per-proc array param, then global).
@@ -1744,7 +1747,15 @@ begin
               Result := MakeSSAValue(svkNone);
           ttOpIntDiv:  // \ integer division (FreeBASIC), truncates toward zero
             if Right.ConstInt <> 0 then
-              Result := MakeSSAConstInt(Left.ConstInt div Right.ConstInt)
+            begin
+              // An unsigned 64-bit operand folds with QWord division: folding -1 \ 3 signed (= 0)
+              // would disagree with the runtime ssaDivUInt. (shr already folds logically; mod is
+              // not folded here and reaches the unsigned runtime path.)
+              if IsUnsigned64Expr(Node.GetChild(0)) or IsUnsigned64Expr(Node.GetChild(1)) then
+                Result := MakeSSAConstInt(Int64(QWord(Left.ConstInt) div QWord(Right.ConstInt)))
+              else
+                Result := MakeSSAConstInt(Left.ConstInt div Right.ConstInt);
+            end
             else
               Result := MakeSSAValue(svkNone);
           ttOpShl: Result := MakeSSAConstInt(Left.ConstInt shl Right.ConstInt);
@@ -1947,6 +1958,15 @@ begin
             else
               OpCode := ssaCmpEqInt;
             end;
+            // Unsigned 64-bit ordering: reinterpret both operands as QWord. Eq/Ne are bit-identical,
+            // so only the ordering comparisons switch to the unsigned opcodes.
+            if IsUnsigned64Expr(Node.GetChild(0)) or IsUnsigned64Expr(Node.GetChild(1)) then
+              case OpCode of
+                ssaCmpLtInt: OpCode := ssaCmpLtUInt;
+                ssaCmpGtInt: OpCode := ssaCmpGtUInt;
+                ssaCmpLeInt: OpCode := ssaCmpLeUInt;
+                ssaCmpGeInt: OpCode := ssaCmpGeUInt;
+              end;
           end;
 
           if ((Left.RegType = srtString) or (Right.RegType = srtString)) and
@@ -2119,7 +2139,10 @@ begin
             // Integer MOD: both operands are already int
             DestReg := FProgram.AllocRegister(srtInt);
             Result := MakeSSARegister(srtInt, DestReg);
-            OpCode := ssaModInt;
+            if IsUnsigned64Expr(Node.GetChild(0)) or IsUnsigned64Expr(Node.GetChild(1)) then
+              OpCode := ssaModUInt
+            else
+              OpCode := ssaModInt;
           end;
         end
         // FreeBASIC \ (integer division), SHL, SHR: always integer; truncate any float operand.
@@ -2149,6 +2172,11 @@ begin
           else
             OpCode := ssaDivInt;
           end;
+          // Unsigned 64-bit integer division: \ uses QWord div (signed div of a value with the sign
+          // bit set would give the wrong quotient). Shifts keep their existing (logical) semantics.
+          if (Node.Token.TokenType = ttOpIntDiv) and
+             (IsUnsigned64Expr(Node.GetChild(0)) or IsUnsigned64Expr(Node.GetChild(1))) then
+            OpCode := ssaDivUInt;
         end
         // Determine result type and allocate register (use hint if compatible)
         else if (Left.RegType = srtFloat) or (Right.RegType = srtFloat) then
@@ -5089,6 +5117,14 @@ begin
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         Continue;
       end;
+    end;
+    // A non-identifier unsigned 64-bit expression (an unsigned literal or arithmetic over unsigned
+    // operands) also prints unsigned, so a result above Int64.Max is not shown as negative.
+    if (ExprValue.RegType = srtInt) and IsUnsigned64Expr(Child) then
+    begin
+      EmitInstruction(ssaPrintUInt, MakeSSAValue(svkNone), ExprValue,
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Continue;
     end;
 
     // Emit appropriate print instruction based on type
@@ -16107,6 +16143,60 @@ begin
     if FArrayRecordType.IndexOfName(mangled) >= 0 then Exit(FArrayRecordType.Values[mangled]);
   end;
   if FArrayRecordType.IndexOfName(nameU) >= 0 then Result := FArrayRecordType.Values[nameU];
+end;
+
+function TSSAGenerator.IsUnsigned64Expr(Node: TASTNode): Boolean;
+// True when the value should be compared/divided/modded as unsigned 64-bit. Only the 64-bit unsigned
+// types matter: UByte/UShort/ULong are stored as positive Int64 after narrowing, so they already
+// behave correctly under signed ops. Unsignedness is "contagious" through arithmetic/bitwise ops
+// (their bit patterns are identical to the signed forms), so any unsigned operand taints the result.
+var
+  U, Txt: string;
+  QW: QWord;
+  I64: Int64;
+  Code, Idx: Integer;
+begin
+  Result := False;
+  if not Assigned(Node) then Exit;
+  case Node.NodeType of
+    antLiteral:
+      begin
+        // A bare decimal integer literal above Int64.Max (but <= QWord.Max) is unsigned. Test the
+        // ORIGINAL token text (Node.Value already holds the reinterpreted, negative Int64 bits).
+        if Assigned(Node.Token) and (Node.Token.TokenType <> ttStringLiteral) then
+        begin
+          Txt := Trim(VarToStr(Node.Token.Value));
+          if (Txt <> '') and not TryStrToInt64(Txt, I64) then
+          begin
+            Val(Txt, QW, Code);
+            Result := (Code = 0);
+          end;
+        end;
+      end;
+    antIdentifier:
+      begin
+        // Declared UInteger/ULongInt variables are recorded with print-kind 2 (see RecordVarWidth).
+        U := UpperCase(VarToStr(Node.Value));
+        Idx := FVarPrintKind.IndexOf(U);
+        Result := (Idx >= 0) and (PtrInt(FVarPrintKind.Objects[Idx]) = 2);
+      end;
+    antParentheses, antUnaryOp:
+      if Node.ChildCount >= 1 then
+        Result := IsUnsigned64Expr(Node.GetChild(0));
+    antBinaryOp:
+      if (Node.ChildCount >= 2) and Assigned(Node.Token) then
+        case Node.Token.TokenType of
+          ttOpAdd, ttOpSub, ttOpMul, ttOpIntDiv, ttOpMod,
+          ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR:
+            Result := IsUnsigned64Expr(Node.GetChild(0)) or IsUnsigned64Expr(Node.GetChild(1));
+        end;
+    antFunctionCall:
+      begin
+        // FreeBASIC unsigned 64-bit conversions.
+        U := UpperCase(VarToStr(Node.Value));
+        Result := (U = 'CUINT') or (U = 'CULNGINT');
+      end;
+  end;
 end;
 
 function TSSAGenerator.ObjectTypeName(ObjNode: TASTNode): string;

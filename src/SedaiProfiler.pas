@@ -310,7 +310,7 @@ begin
         // Integer arithmetic - fast
         bcAddInt, bcSubInt, bcNegInt: Result := 2;
         bcMulInt: Result := 3;
-        bcDivInt, bcModInt: Result := 20;  // Division is slow
+        bcDivInt, bcModInt, bcDivUInt, bcModUInt: Result := 20;  // Division is slow
 
         // Float arithmetic - moderate
         bcAddFloat, bcSubFloat, bcNegFloat: Result := 3;
@@ -322,7 +322,8 @@ begin
         bcIntToFloat, bcFloatToInt: Result := 2;
 
         // Comparisons - fast
-        bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt: Result := 2;
+        bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
+        bcCmpLtUInt, bcCmpGtUInt, bcCmpLeUInt, bcCmpGeUInt: Result := 2;
         bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpGtFloat, bcCmpLeFloat, bcCmpGeFloat: Result := 3;
         bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString: Result := 10;
 
