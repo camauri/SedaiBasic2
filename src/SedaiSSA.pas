@@ -177,6 +177,7 @@ type
     FVarWidthCode: TStringList;          // B1.5 phase 2: name (UPPER) -> narrow width code (Objects[]=PtrInt 1..7)
     FVarPrintKind: TStringList;          // B1.5 phase C: name (UPPER) -> 1=BOOLEAN, 2=unsigned-64 (print form)
     FArrayElemWidth: TStringList;        // B1.5: array name (UPPER) -> element narrow width code (1..7)
+    FUnsigned64Arrays: TStringList;      // array names (UPPER) whose element type is UInteger/ULongInt (unsigned-64)
     FSwapTempSeq: Integer;               // SWAP: unique counter for synthesized snapshot temp names
     FDefTypeBank: array['A'..'Z'] of Integer;  // DEFINT/DEFSTR...: initial letter -> bank (0/1/2), -1=unset
     FInDispatcher: Boolean;              // M6: true while emitting a virtual dispatcher (skip shared sync)
@@ -664,6 +665,8 @@ begin
   FVarPrintKind.CaseSensitive := False;
   FArrayElemWidth := TStringList.Create;
   FArrayElemWidth.CaseSensitive := False;
+  FUnsigned64Arrays := TStringList.Create;
+  FUnsigned64Arrays.CaseSensitive := False;
   FInDispatcher := False;
   FBlockHandledVars := TStringList.Create;
   FBlockHandledVars.CaseSensitive := False;
@@ -709,6 +712,7 @@ begin
   FVarWidthCode.Free;
   FVarPrintKind.Free;
   FArrayElemWidth.Free;
+  FUnsigned64Arrays.Free;
   FBlockHandledVars.Free;
   FCurrentTopLevelLabels.Free;
   inherited Destroy;
@@ -5794,6 +5798,19 @@ begin
       end
       else if WIdx >= 0 then
         FArrayElemWidth.Delete(WIdx);  // re-DIM to a wide element type clears prior narrowing
+      // Unsigned 64-bit element type (UInteger/ULongInt): remember so an element read a(i) selects the
+      // unsigned compare/div/mod/print forms (IsUnsigned64Expr). Width code is 0 for these (full 64-bit),
+      // so the block above records nothing — this is a separate set.
+      if (ArrElemTypeName = 'UINTEGER') or (ArrElemTypeName = 'ULONGINT') then
+      begin
+        if FUnsigned64Arrays.IndexOf(UpperCase(ArrName)) < 0 then
+          FUnsigned64Arrays.Add(UpperCase(ArrName));
+      end
+      else
+      begin
+        WIdx := FUnsigned64Arrays.IndexOf(UpperCase(ArrName));   // re-DIM to a signed element type clears it
+        if WIdx >= 0 then FUnsigned64Arrays.Delete(WIdx);
+      end;
     end;
 
     // Validate dimensions node
@@ -16222,6 +16239,10 @@ begin
         begin
           Idx := FVarPrintKind.IndexOf(U);
           Result := (Idx >= 0) and (PtrInt(FVarPrintKind.Objects[Idx]) = 2);
+          // An element read of an array declared "AS UInteger/ULongInt" is unsigned too (antArrayAccess
+          // with the array name in child 0, which is exactly how U was derived above).
+          if not Result and (Node.NodeType = antArrayAccess) then
+            Result := FUnsigned64Arrays.IndexOf(U) >= 0;
         end;
       end;
   end;
@@ -18220,6 +18241,7 @@ begin
   FWStringVars.Clear;
   FByrefRetFuncs.Clear;
   FArrayElemWidth.Clear;
+  FUnsigned64Arrays.Clear;
   // FreeBASIC pointers: mark each address-taken (@x) declared scalar SHARED so the next pass backs it
   // with a 1-element global array (a stable address); also records pointee types in FPointerVars.
   CollectAddressTakenVars(AST);
