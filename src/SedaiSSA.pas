@@ -15667,7 +15667,7 @@ procedure TSSAGenerator.CollectRawPtrVars(Node: TASTNode);
 var
   i: Integer;
   Lhs, Rhs: TASTNode;
-  FuncU, LhsU, TypeU: string;
+  LhsU: string;
 
   procedure MarkRaw(const N: string);
   begin
@@ -15678,6 +15678,33 @@ var
     end;
   end;
 
+  // Mark TargetU raw if its initializer/RHS is a raw source: ALLOCATE/CALLOCATE/REALLOCATE, a pointer
+  // CAST/CPTR of a raw value, another raw pointer, or SADD/STRPTR of a string (byte-heap pointer).
+  procedure ConsiderRaw(const TargetU: string; Rhs: TASTNode);
+  var
+    FU, TU: string;
+  begin
+    if Rhs = nil then Exit;
+    if IsAllocCall(Rhs, FU) then
+      MarkRaw(TargetU)
+    else if Rhs.NodeType = antCast then
+    begin
+      TU := UpperCase(VarToStr(Rhs.Value));
+      if (Length(TU) >= 4) and (Copy(TU, Length(TU) - 3, 4) = ' PTR') and (Rhs.ChildCount >= 1) then
+        if IsAllocCall(Rhs.GetChild(0), FU) or
+           ((Rhs.GetChild(0).NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.GetChild(0).Value))) then
+          MarkRaw(TargetU);
+    end
+    else if (Rhs.NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.Value)) then
+      MarkRaw(TargetU)   // p = q, q raw
+    else if FModernMode and (Rhs.NodeType = antArrayAccess) and (Rhs.ChildCount >= 1) and
+            (Rhs.GetChild(0).NodeType = antIdentifier) and
+            ((UpperCase(VarToStr(Rhs.GetChild(0).Value)) = kSADD) or
+             (UpperCase(VarToStr(Rhs.GetChild(0).Value)) = kSTRPTR)) and
+            (ArrayIndexOf(VarToStr(Rhs.GetChild(0).Value)) < 0) then
+      MarkRaw(TargetU);   // p = SADD(s)/STRPTR(s): a raw byte-heap pointer -> deref p[i] onto the byte heap
+  end;
+
 begin
   if Node = nil then Exit;
   if (Node.NodeType = antAssignment) and (Node.ChildCount >= 2) and (Node.GetChild(0).NodeType = antIdentifier) then
@@ -15685,25 +15712,16 @@ begin
     Lhs := Node.GetChild(0);
     Rhs := Node.GetChild(1);
     LhsU := UpperCase(VarToStr(Lhs.Value));
-    if IsAllocCall(Rhs, FuncU) then
-      MarkRaw(LhsU)
-    else if Rhs.NodeType = antCast then
-    begin
-      // p = CAST(<ptr type>, X): raw if X is an Allocate call or an already-raw pointer var.
-      TypeU := UpperCase(VarToStr(Rhs.Value));
-      if (Length(TypeU) >= 4) and (Copy(TypeU, Length(TypeU) - 3, 4) = ' PTR') and (Rhs.ChildCount >= 1) then
-        if IsAllocCall(Rhs.GetChild(0), FuncU) or
-           ((Rhs.GetChild(0).NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.GetChild(0).Value))) then
-          MarkRaw(LhsU);
-    end
-    else if (Rhs.NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.Value)) then
-      MarkRaw(LhsU)   // p = q, q raw
-    else if FModernMode and (Rhs.NodeType = antArrayAccess) and (Rhs.ChildCount >= 1) and
-            (Rhs.GetChild(0).NodeType = antIdentifier) and
-            ((UpperCase(VarToStr(Rhs.GetChild(0).Value)) = kSADD) or
-             (UpperCase(VarToStr(Rhs.GetChild(0).Value)) = kSTRPTR)) and
-            (ArrayIndexOf(VarToStr(Rhs.GetChild(0).Value)) < 0) then
-      MarkRaw(LhsU);   // p = SADD(s)/STRPTR(s): a raw byte-heap pointer -> deref p[i] onto the byte heap
+    ConsiderRaw(LhsU, Rhs);
+  end
+  // DIM-with-initializer: "DIM As T PTR a = Allocate(...)" parses as antArrayDecl(name, type, initExpr).
+  // The pre-scan sees the declaration node (not the synthesized assignment), so detect the raw initializer
+  // here — otherwise the DIM-init form falls through to the managed-pointer path (unscaled p[i]).
+  else if (Node.NodeType = antArrayDecl) and (Node.ChildCount >= 3) and
+          (Node.GetChild(0).NodeType = antIdentifier) then
+  begin
+    LhsU := UpperCase(VarToStr(Node.GetChild(0).Value));
+    ConsiderRaw(LhsU, Node.GetChild(2));
   end;
   for i := 0 to Node.ChildCount - 1 do
     CollectRawPtrVars(Node.GetChild(i));
