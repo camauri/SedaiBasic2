@@ -105,6 +105,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `gamma_function.bas`             | <https://rosettacode.org/wiki/Gamma_function> |
 | `pointers_and_references.bas` | <https://rosettacode.org/wiki/Pointers_and_references> |
 | `ranking_methods.bas`      | <https://rosettacode.org/wiki/Ranking_methods> |
+| `longest_string_challenge.bas` | <https://rosettacode.org/wiki/Longest_string_challenge> |
 
 ## Running
 
