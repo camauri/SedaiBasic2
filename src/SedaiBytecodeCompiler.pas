@@ -380,6 +380,7 @@ begin
     ssaArrayLBoundInd: Result := bcArrayLBoundInd;
     ssaArrayUBoundInd: Result := bcArrayUBoundInd;
     ssaArrayCopyContents: Result := bcArrayCopyContents;
+    ssaArrayCopyRecords: Result := bcArrayCopyRecords;
     // Graphics operations
     ssaGraphicRGBA: Result := bcGraphicRGBA;
     ssaGraphicSetMode: Result := bcGraphicSetMode;

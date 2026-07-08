@@ -218,6 +218,7 @@ type
     ssaArrayIdxResolveInd,          // linear index from a member array's runtime dims (Src1=handle reg)
     ssaMemberArrayRedim,            // REDIM obj.field(...): Src1=record-handle reg, Immediate=(slot<<8)|(elemType<<4)|preserve
     ssaArrayCopyContents,           // deep-copy array storage between two FArrays handles: Src1=dest handle, Src2=src handle (value-semantics of an array UDT member)
+    ssaArrayCopyRecords,            // value-copy an array-of-UDT member element-wise: Src1=dest handle, Src2=src handle, Immediate=packed elem UDT slot counts. Each dest element record gets an independent copy of the src element's contents.
     ssaArrayLBoundInd, ssaArrayUBoundInd,  // LBOUND/UBOUND of a UDT array member (Src1=handle reg, Src2=dim reg)
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
     ssaPrintInt, ssaPrintIntLn,

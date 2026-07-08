@@ -334,6 +334,7 @@ begin
     ssaArrayStoreIndInt, ssaArrayStoreIndFloat, ssaArrayStoreIndString,  // UDT array member store: mutate array storage
     ssaMemberArrayRedim,  // REDIM of a UDT array member (mutate array storage + record slot)
     ssaArrayCopyContents,  // deep-copy array member storage into the destination (mutates dest array)
+    ssaArrayCopyRecords,  // value-copy an array-of-UDT member (mutates dest array + allocates element records)
     ssaRefStoreInt, ssaRefStoreFloat, ssaRefStoreString,  // FreeBASIC pointer store: mutates pointee
     ssaPoke:  // POKE writes to memory-mapped I/O (visible side effects like color changes)
       Result := True;

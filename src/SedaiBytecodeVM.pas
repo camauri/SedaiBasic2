@@ -351,6 +351,7 @@ type
     function RecPtrTarget(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage; inline;  // decode @obj.field pointer
     procedure CleanupSharedRecords;   // free the shared region (destructor)
     procedure RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
+    procedure DeepCopyArrayRecords(Ctx: TExecutionContext; DestArr, SrcArr: Int64; PackedCounts: Int64);  // value-copy array-of-UDT member
     procedure CheckFloatValid(Ctx: TExecutionContext; RegIndex: Integer; const OpName: string);
     function FormatUsingString(const FormatStr: string; Value: Double): string;
     function FormatUsingRuntime(const FormatStr: string): string;   // walk a runtime format over FPUStage
@@ -2209,6 +2210,52 @@ begin
   for k := 0 to FArrays[ArrayId].TotalSize - 1 do
     if FArrays[ArrayId].IntData[k] = 0 then
       FArrays[ArrayId].IntData[k] := AllocSharedRecord(IntC, FloatC, StrC, TypeId);
+end;
+
+procedure TBytecodeVM.DeepCopyArrayRecords(Ctx: TExecutionContext; DestArr, SrcArr: Int64; PackedCounts: Int64);
+// FreeBASIC value semantics of an array-of-UDT member: give the destination its OWN element records,
+// each holding an independent copy of the corresponding source element's contents (so "Dim b = a" and
+// return-by-value do not share element instances). The dest handle array is resized to match src; each
+// dest element is reused if present (contents overwritten) or freshly allocated. Record contents are
+// copied one level deep (Int/Float/StringData via Copy) — a nested UDT/array inside an element is copied
+// as its handle (shallow at that deeper level), matching the SSA EmitRecordCopy depth for arrays.
+var
+  IntC, FloatC, StrC, TypeId, k: Integer;
+  SrcRec, DestRec: PRecordStorage;
+begin
+  if (DestArr < 1) or (DestArr > High(FArrays)) or (SrcArr < 1) or (SrcArr > High(FArrays)) then Exit;
+  IntC := PackedCounts and $FFFF;
+  FloatC := (PackedCounts shr 16) and $FFFF;
+  StrC := (PackedCounts shr 32) and $FFFF;
+  TypeId := (PackedCounts shr 48) and $FFFF;
+  // Match the destination's shape to the source. On a size change, release the dest's current element
+  // records first (this is a distinct value instance, so they are not aliased) to avoid a leak.
+  if FArrays[DestArr].TotalSize <> FArrays[SrcArr].TotalSize then
+  begin
+    for k := 0 to FArrays[DestArr].TotalSize - 1 do
+      if FArrays[DestArr].IntData[k] <> 0 then FreeSharedRecord(FArrays[DestArr].IntData[k]);
+    FArrays[DestArr].ElementType := FArrays[SrcArr].ElementType;
+    FArrays[DestArr].DimCount    := FArrays[SrcArr].DimCount;
+    FArrays[DestArr].TotalSize   := FArrays[SrcArr].TotalSize;
+    FArrays[DestArr].Dimensions  := Copy(FArrays[SrcArr].Dimensions);
+    FArrays[DestArr].LowerBounds := Copy(FArrays[SrcArr].LowerBounds);
+    SetLength(FArrays[DestArr].IntData, FArrays[SrcArr].TotalSize);
+    for k := 0 to FArrays[DestArr].TotalSize - 1 do FArrays[DestArr].IntData[k] := 0;
+  end;
+  for k := 0 to FArrays[SrcArr].TotalSize - 1 do
+  begin
+    if FArrays[DestArr].IntData[k] = 0 then
+      FArrays[DestArr].IntData[k] := AllocSharedRecord(IntC, FloatC, StrC, TypeId);
+    SrcRec := ResolveRec(Ctx, FArrays[SrcArr].IntData[k]);
+    DestRec := ResolveRec(Ctx, FArrays[DestArr].IntData[k]);
+    if (SrcRec <> nil) and (DestRec <> nil) then
+    begin
+      DestRec^.TypeId := SrcRec^.TypeId;
+      DestRec^.IntData := Copy(SrcRec^.IntData);
+      DestRec^.FloatData := Copy(SrcRec^.FloatData);
+      DestRec^.StringData := Copy(SrcRec^.StringData);
+    end;
+  end;
 end;
 
 procedure TBytecodeVM.SetupWorkerContext(WCtx: TExecutionContext);
@@ -6631,6 +6678,8 @@ begin
           FArrays[DestArr].StringData  := Copy(FArrays[PtrAddr].StringData);
         end;
       end;
+    48: // bcArrayCopyRecords - value-copy an array-of-UDT member element-wise (independent element records)
+      DeepCopyArrayRecords(Ctx, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate);
   else
     raise Exception.CreateFmt('Unknown array opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

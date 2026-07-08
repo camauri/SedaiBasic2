@@ -16671,15 +16671,24 @@ begin
     begin
       // Array member: the int slot holds an FArrays handle. A plain handle copy would make the two
       // records SHARE one array (mutations leak; a return-by-value copy dangles when the callee frame
-      // frees its array). Deep-copy the element storage into the destination's own array instead.
-      // (Checked before NestedType so an array-of-UDT field is not mistaken for a single nested record;
-      // scalar-element arrays get correct value semantics — UDT-element arrays copy element handles,
-      // no worse than before and pending the array-of-UDT-member feature.)
+      // frees its array). Give the destination independent storage instead. (Checked before NestedType so
+      // an array-of-UDT field is not mistaken for a single nested record.)
       DNest := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaRecordLoadInt, DNest, DestHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
       SNest := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaRecordLoadInt, SNest, SrcHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
-      EmitInstruction(ssaArrayCopyContents, MakeSSAValue(svkNone), DNest, SNest, MakeSSAValue(svkNone));
+      NestedUDT := FindUDT(FUDTs[UDTIdx].Fields[i].ArrayElemType);
+      if NestedUDT >= 0 then
+        // Array-of-UDT member: copy element-wise into the destination's OWN element records (each element
+        // gets an independent copy of the source element's contents), packing the element UDT slot counts.
+        EmitInstruction(ssaArrayCopyRecords, MakeSSAValue(svkNone), DNest, SNest,
+                        MakeSSAConstInt((Int64(FUDTs[NestedUDT].NInt) and $FFFF)
+                                        or ((Int64(FUDTs[NestedUDT].NFloat) and $FFFF) shl 16)
+                                        or ((Int64(FUDTs[NestedUDT].NStr) and $FFFF) shl 32)
+                                        or ((Int64(NestedUDT) and $FFFF) shl 48)))
+      else
+        // Scalar-element array: deep-copy the element storage (Dimensions/LowerBounds/data) into dest.
+        EmitInstruction(ssaArrayCopyContents, MakeSSAValue(svkNone), DNest, SNest, MakeSSAValue(svkNone));
     end
     else if FUDTs[UDTIdx].Fields[i].NestedType <> '' then
     begin

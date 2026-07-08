@@ -545,7 +545,7 @@ begin
     bcArrayStoreIndInt, bcArrayStoreIndFloat, bcArrayStoreIndString,
     bcArrayIdxResolveInd, bcMemberArrayRedim,
     bcArrayLBoundInd, bcArrayUBoundInd,   // Src1 = FArrays handle (int)
-    bcArrayCopyContents,                  // Src1 = dest FArrays handle (int)
+    bcArrayCopyContents, bcArrayCopyRecords,  // Src1 = dest FArrays handle (int)
     // Date/time: DATESERIAL/TIMESERIAL Src1 = year/hour (int); MONTHNAME/WEEKDAYNAME Src1 = index (int)
     bcDateSerial, bcTimeSerial, bcDateName,
     bcCmd, bcAppend, bcRecord:               // Src1 = handle (int)
@@ -647,7 +647,7 @@ begin
     bcArrayLoadIndInt, bcArrayLoadIndFloat, bcArrayLoadIndString,
     bcArrayStoreIndInt, bcArrayStoreIndFloat, bcArrayStoreIndString,
     bcArrayLBoundInd, bcArrayUBoundInd,  // Src2 = 0-based dim index (int)
-    bcArrayCopyContents,  // Src2 = source FArrays handle (int)
+    bcArrayCopyContents, bcArrayCopyRecords,  // Src2 = source FArrays handle (int)
     bcArrayLBound, bcArrayUBound,  // B1.4: Src2 = 0-based dim index (int)
     bcArrayRedim,  // B1.4: REDIM - Src2 = new upper bound (int)
     bcRefStoreInt,  // FreeBASIC pointer store (int) - Src2 = value (int)

@@ -174,6 +174,8 @@ begin
       Line := Format('%4d: %-20s R%d = bound[hR%d](dimR%d)', [Index, 'ArrayBoundInd', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcArrayCopyContents:
       Line := Format('%4d: %-20s [hR%d] <- [hR%d]', [Index, 'ArrayCopyContents', Instr.Src1, Instr.Src2]);
+    bcArrayCopyRecords:
+      Line := Format('%4d: %-20s [hR%d] <= [hR%d] (deep)', [Index, 'ArrayCopyRecords', Instr.Src1, Instr.Src2]);
     bcReturnSub:
       Line := Format('%4d: %-20s', [Index, 'ReturnSub']);
     bcXferStoreInt, bcXferStoreFloat, bcXferStoreString:
