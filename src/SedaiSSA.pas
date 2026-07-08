@@ -141,6 +141,9 @@ type
                                             //        their final register value is written back to the slot at each return
     FCurrentProcAddrParams: TStringList;    // BYREF-return funcs: BYREF params carried as addresses (auto-deref);
                                             //   ValueFromIndex = pointee type name. Lets "RETURN param" return a reference.
+    FCurrentProcPtrParams: TStringList;     // "param AS T PTR" of THIS proc: VARNAME -> pointee type ("INTEGER","DOUBLE"...).
+                                            //   Per-proc (not global FPointerVars) so same-named ptr params of different
+                                            //   pointee banks across procs don't collide. Filled in prologue, cleared per proc.
     FFuncPtrSigs: TStringList;              // FreeBASIC function pointers in scope: VARNAME -> "paramtypes|rettype"
     FFuncPtrTypes: TStringList;             // FreeBASIC named funcptr TYPES ("Type X As Function(...)"): TYPENAME -> "paramtypes|rettype"
                                             //   (paramtypes = comma list; rettype '' for SUB). A "name(args)" on such a
@@ -305,6 +308,7 @@ type
     procedure CollectDimVarBanks(Node: TASTNode; Dict: TStringList);
     procedure MarkAddressTaken(Node: TASTNode; Dict: TStringList; InProc: Boolean = False);
     function PointeeBankOf(const PtrName: string): TSSARegisterType;            // bank of *p from p's declared pointee
+    function ManagedPtrPointee(const Name: string): string;                     // pointee type of a managed pointer (per-proc param or DIM'd), else ''
     function PointerUDTType(const PtrName: string): string;                     // pointee UDT type if p is a "T PTR" (T a UDT), else ''
     function IsAddrParam(const Name: string): Boolean;                          // BYREF-return address-carrying param?
     function AddrParamBank(const Name: string): TSSARegisterType;               // pointee bank of an address param
@@ -648,6 +652,7 @@ begin
   FCurrentProcByvalRecs := TStringList.Create;
   FCurrentProcByrefScalars := TStringList.Create;
   FCurrentProcAddrParams := TStringList.Create;
+  FCurrentProcPtrParams := TStringList.Create;
   FFuncPtrSigs := TStringList.Create;
   FFuncPtrTypes := TStringList.Create;
   FFuncPtrTypes.CaseSensitive := False;
@@ -710,6 +715,7 @@ begin
   FCurrentProcByvalRecs.Free;
   FCurrentProcByrefScalars.Free;
   FCurrentProcAddrParams.Free;
+  FCurrentProcPtrParams.Free;
   FFuncPtrSigs.Free;
   FFuncPtrTypes.Free;
   FModuleRecordVars.Free;
@@ -4526,7 +4532,7 @@ begin
 
         // FreeBASIC pointer indexing: "p[i]" (also "p(i)") where p is a declared pointer, not an array.
         // Lower to *(p + i): compute the address then load the pointee with p's declared bank.
-        if (ArrayIndexOf(ArrName) < 0) and (FPointerVars.IndexOfName(UpperCase(ArrName)) >= 0) and
+        if (ArrayIndexOf(ArrName) < 0) and (ManagedPtrPointee(ArrName) <> '') and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
           Left := EmitPointerIndexAddress(ArrName, Node.GetChild(1));
@@ -4849,7 +4855,7 @@ begin
   if (VarNode.NodeType = antArrayAccess) and (VarNode.ChildCount >= 2) and
      (VarNode.GetChild(0).NodeType = antIdentifier) and
      (ArrayIndexOf(VarToStr(VarNode.GetChild(0).Value)) < 0) and
-     (FPointerVars.IndexOfName(UpperCase(VarToStr(VarNode.GetChild(0).Value))) >= 0) and
+     (ManagedPtrPointee(VarToStr(VarNode.GetChild(0).Value)) <> '') and
      (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
   begin
     VarName := VarToStr(VarNode.GetChild(0).Value);
@@ -15686,19 +15692,32 @@ begin
   end;
 end;
 
+function TSSAGenerator.ManagedPtrPointee(const Name: string): string;
+// The pointee type name of a managed pointer: a "param AS T PTR" of the proc being lowered (per-proc,
+// checked first so it wins over a same-named global) or a DIM'd/global "T PTR" (FPointerVars). '' if
+// Name is not a managed pointer.
+var
+  idx: Integer;
+begin
+  Result := '';
+  if FCurrentProcPtrParams <> nil then
+  begin
+    idx := FCurrentProcPtrParams.IndexOfName(UpperCase(Name));
+    if idx >= 0 then Exit(FCurrentProcPtrParams.ValueFromIndex[idx]);
+  end;
+  idx := FPointerVars.IndexOfName(UpperCase(Name));
+  if idx >= 0 then Result := FPointerVars.ValueFromIndex[idx];
+end;
+
 function TSSAGenerator.PointeeBankOf(const PtrName: string): TSSARegisterType;
 // Bank of the pointee for "*p", from p's declared pointer type (default int if unknown).
 var
-  idx: Integer;
   Pointee: string;
 begin
   Result := srtInt;
-  idx := FPointerVars.IndexOfName(UpperCase(PtrName));
-  if idx >= 0 then
-  begin
-    Pointee := FPointerVars.ValueFromIndex[idx];
+  Pointee := ManagedPtrPointee(PtrName);
+  if Pointee <> '' then
     Result := TypeNameToBank(Pointee, PtrName);
-  end;
 end;
 
 function TSSAGenerator.IsAddrParam(const Name: string): Boolean;
@@ -16295,7 +16314,6 @@ function TSSAGenerator.DerefedType(Node: TASTNode): string;
 // "*(*p)" strips one more PTR level; pointer arithmetic follows the pointer operand of +/-. '' if Node
 // is not dereferenceable.
 var
-  idx: Integer;
   T: string;
 begin
   Result := '';
@@ -16303,10 +16321,7 @@ begin
   while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do
     Node := Node.GetChild(0);
   if Node.NodeType = antIdentifier then
-  begin
-    idx := FPointerVars.IndexOfName(UpperCase(VarToStr(Node.Value)));
-    if idx >= 0 then Result := UpperCase(FPointerVars.ValueFromIndex[idx]);
-  end
+    Result := UpperCase(ManagedPtrPointee(VarToStr(Node.Value)))   // per-proc ptr param or DIM'd pointer
   else if Node.NodeType = antDeref then
   begin
     // *(*inner): the type of *inner must itself be a pointer; deref it one more level.
@@ -16317,10 +16332,10 @@ begin
   else if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) then
   begin
     if (Node.GetChild(0).NodeType = antIdentifier) and
-       (FPointerVars.IndexOfName(UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) then
+       (ManagedPtrPointee(VarToStr(Node.GetChild(0).Value)) <> '') then
       Result := DerefedType(Node.GetChild(0))
     else if (Node.GetChild(1).NodeType = antIdentifier) and
-            (FPointerVars.IndexOfName(UpperCase(VarToStr(Node.GetChild(1).Value))) >= 0) then
+            (ManagedPtrPointee(VarToStr(Node.GetChild(1).Value)) <> '') then
       Result := DerefedType(Node.GetChild(1));
   end;
 end;
@@ -17878,6 +17893,7 @@ begin
     FCurrentProcByvalRecs.Clear;                          // V5d: BYVAL UDT param copies (filled in prologue)
     FCurrentProcByrefScalars.Clear;                       // BYREF: explicit-BYREF scalar params (filled in prologue)
     FCurrentProcAddrParams.Clear;                         // BYREF-return: address-carrying params (filled in prologue)
+    FCurrentProcPtrParams.Clear;                          // "param AS T PTR" of this proc (filled in prologue)
     FFuncPtrSigs.Clear;                                   // function-pointer params/locals of THIS proc (filled in prologue / ProcessDim)
     FAddrLocalVars.Clear;                                 // @-taken locals of THIS proc (filled by ProcessDim)
     CollectTopLevelLabels(Proc, 2);                       // GOTO-unwind: this proc's block-depth-0 labels (body starts at child 2)
@@ -17926,6 +17942,21 @@ begin
                 (FFuncPtrTypes.IndexOfName(UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value))) >= 0) then
           FFuncPtrSigs.Values[UpperCase(VarToStr(ParamNodeJ.Value))] :=
             FFuncPtrTypes.Values[UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value))];
+        // FreeBASIC pointer parameter ("param AS T PTR"): record its pointee type PER-PROC, so "p[i]"/"*p"
+        // in the body index/dereference through the parameter's address value (like a DIM'd pointer). The
+        // param register holds the caller's address; without this, "buf[i]" fell through to the array
+        // lookup and raised "Array not declared". Kept per-proc (not the global FPointerVars) so two procs
+        // that both name a pointer param "buf" with different pointee banks don't collide (first-wins would
+        // mistype the second — cf. scalar-type-collision). FUNCPTR/ADDRCARRIER/byref-return params carry a
+        // scalar address and have no " PTR" suffix, so they are naturally excluded.
+        if (ParamNodeJ.Attributes.Values['FUNCPTR'] <> '1') and
+           (ParamNodeJ.ChildCount >= 1) and (ParamNodeJ.GetChild(0).NodeType = antIdentifier) then
+        begin
+          ParentType := UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value));
+          if (Length(ParentType) >= 4) and (Copy(ParentType, Length(ParentType) - 3, 4) = ' PTR') then
+            FCurrentProcPtrParams.Values[UpperCase(VarToStr(ParamNodeJ.Value))] :=
+              Trim(Copy(ParentType, 1, Length(ParentType) - 4));
+        end;
         // B1.5: a parameter declared with a narrow integer type (child 0 = AS-type identifier) wraps
         // the incoming argument to that width, in place. Only when it lands in the int bank.
         if (RT = srtInt) and (ParamNodeJ.ChildCount >= 1) and
