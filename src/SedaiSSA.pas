@@ -6221,11 +6221,27 @@ begin
       if Assigned(InitVals) then
         for k := 0 to InitVals.ChildCount - 1 do
         begin
-          ProcessExpression(InitVals.GetChild(k), InitElemVal);
-          case ElementType of
-            srtFloat:  InitElemReg := EnsureFloatRegister(InitElemVal);
-            srtString: InitElemReg := EnsureStringRegister(InitElemVal);
-          else         InitElemReg := EnsureIntRegister(InitElemVal);
+          // A padding slot (ARRPAD) from a jagged multi-dim initializer: store the element type's zero,
+          // not the literal '0' node (which would be int-banked and coerce wrongly for string arrays).
+          if InitVals.GetChild(k).Attributes.Values['ARRPAD'] = '1' then
+          begin
+            case ElementType of
+              srtFloat:  begin InitElemReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+                               EmitInstruction(ssaLoadConstFloat, InitElemReg, MakeSSAConstFloat(0.0), MakeSSAValue(svkNone), MakeSSAValue(svkNone)); end;
+              srtString: begin InitElemReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+                               EmitInstruction(ssaLoadConstString, InitElemReg, MakeSSAConstString(''), MakeSSAValue(svkNone), MakeSSAValue(svkNone)); end;
+            else         begin InitElemReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+                               EmitInstruction(ssaLoadConstInt, InitElemReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone)); end;
+            end;
+          end
+          else
+          begin
+            ProcessExpression(InitVals.GetChild(k), InitElemVal);
+            case ElementType of
+              srtFloat:  InitElemReg := EnsureFloatRegister(InitElemVal);
+              srtString: InitElemReg := EnsureStringRegister(InitElemVal);
+            else         InitElemReg := EnsureIntRegister(InitElemVal);
+            end;
           end;
           IdxReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaLoadConstInt, IdxReg, MakeSSAConstInt(k), MakeSSAValue(svkNone), MakeSSAValue(svkNone));

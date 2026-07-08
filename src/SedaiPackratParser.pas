@@ -41,6 +41,10 @@ type
   // OPTION MODE MODERN / OPTION MODE CLASSIC; use SetDialect(pdAuto) after LOAD to re-detect.
   TParserDialect = (pdAuto, pdModern, pdClassic);
 
+  // Constant per-dimension element counts of an array declaration (for zero-padding a jagged
+  // multi-dimensional aggregate initializer). Empty when some bound is not a compile-time constant.
+  TDimSizeArray = array of Integer;
+
   // Dialect-pluggable statement handler: a per-dialect parser for a statement keyed by its leading
   // token type. Registered into the parser by the active dialect profile; consulted by ParseStatement
   // BEFORE the built-in dispatch. A handler may return nil to decline (then the built-in case runs).
@@ -204,7 +208,10 @@ type
     function ParseRecordDecl(IsUnion: Boolean): TASTNode;
     function ParseRecordFieldType: string;
     // Parse a "{ ... }" array initializer group, appending leaf expressions to InitList (row-major).
-    procedure ParseArrayInitBraceGroup(InitList: TASTNode);
+    // DimSizes (element counts per dimension, empty if not all constant) lets a short nested row/plane be
+    // zero-padded to its stride so a jagged multi-dim initializer stays row-aligned. Level = brace depth.
+    procedure ParseArrayInitBraceGroup(InitList: TASTNode; const DimSizes: array of Integer; Level: Integer);
+    function ConstDimSizes(DimsNode: TASTNode): TDimSizeArray;
     function AtEndType: Boolean;
     procedure ConsumeEndType;
     // WITH obj / ... / END WITH : a leading '.field' resolves against obj. Parse-time desugar.
@@ -6606,7 +6613,8 @@ begin
     if Context.Check(ttDelimBraceOpen) then
     begin
       InitList := TASTNode.Create(antArgumentList, Token);
-      ParseArrayInitBraceGroup(InitList);             // flattens any nested {..} row-major
+      // flattens any nested {..} row-major, zero-padding short rows when the dimensions are all constant
+      ParseArrayInitBraceGroup(InitList, ConstDimSizes(Dimensions), 0);
       Result.Attributes.Values['ARRAYINIT'] := '1';
       Result.AddChild(InitList);                      // initializer values (antArgumentList)
     end;
@@ -6615,25 +6623,61 @@ begin
   DoNodeCreated(Result);
 end;
 
-procedure TPackratParser.ParseArrayInitBraceGroup(InitList: TASTNode);
+function TPackratParser.ConstDimSizes(DimsNode: TASTNode): TDimSizeArray;
+// Return the constant element count of each dimension (ub-lb+1). Return an empty array if any bound is
+// not a compile-time integer literal or the dimension is an ellipsis/variable-length placeholder — the
+// caller then falls back to plain row-major flattening with no padding.
+var
+  i, lb, ub: Integer;
+  Dim: TASTNode;
+  function LitInt(N: TASTNode; out V: Integer): Boolean;
+  begin
+    Result := (N <> nil) and (N.NodeType = antLiteral) and TryStrToInt(Trim(VarToStr(N.Value)), V);
+  end;
+begin
+  SetLength(Result, 0);
+  if DimsNode = nil then Exit;
+  SetLength(Result, DimsNode.ChildCount);
+  for i := 0 to DimsNode.ChildCount - 1 do
+  begin
+    Dim := DimsNode.GetChild(i);
+    if Dim.NodeType = antDimRange then
+    begin
+      if (Dim.Attributes.Values['ELLIPSIS'] = '1') or
+         (not LitInt(Dim.GetChild(0), lb)) or (not LitInt(Dim.GetChild(1), ub)) then
+      begin SetLength(Result, 0); Exit; end;
+    end
+    else if LitInt(Dim, ub) then
+      lb := 0
+    else
+    begin SetLength(Result, 0); Exit; end;
+    if ub < lb then begin SetLength(Result, 0); Exit; end;
+    Result[i] := ub - lb + 1;
+  end;
+end;
+
+procedure TPackratParser.ParseArrayInitBraceGroup(InitList: TASTNode; const DimSizes: array of Integer; Level: Integer);
 // Parse a "{ ... }" array-initializer group, appending each LEAF expression to InitList in textual
 // (row-major) order. A nested "{ ... }" — a multi-dimensional initializer such as "= {{1,2},{3,4}}"
 // (FreeBASIC) — is flattened recursively: our arrays store row-major, so nested braces collapse to a
 // flat element sequence that ProcessDim then fills element-by-element. Arbitrary nesting depth works.
+// When DimSizes is known, a short NESTED group (a row/plane, Level>=1) is zero-padded to its stride
+// (product of the inner dimension sizes) so following rows stay aligned — FB zero-fills short rows.
 // A parenthesised comma-tuple element "(a, b, c)" is a UDT aggregate for an array-of-UDT element (e.g.
 // "Dim it(1 To 2) As T = {(""x"", 9), (""y"", 3)}"); it becomes an antArgumentList tagged TUPLEINIT and
 // ProcessDim aggregate-initialises the element from it. A single "(expr)" stays a normal expression.
 var
-  ValExpr, TupleNode: TASTNode;
-  SavedIdx, TupleDepth: Integer;
+  ValExpr, TupleNode, PadNode: TASTNode;
+  SavedIdx, TupleDepth, StartCount, Stride, d: Integer;
   IsTuple: Boolean;
 begin
   if not Context.Check(ttDelimBraceOpen) then Exit;
+  StartCount := InitList.ChildCount;
   Context.Advance;                                    // {
   if not Context.Check(ttDelimBraceClose) then
     repeat
       if Context.Check(ttDelimBraceOpen) then
-        ParseArrayInitBraceGroup(InitList)            // nested row/plane -> flatten in place
+        ParseArrayInitBraceGroup(InitList, DimSizes, Level + 1)  // nested row/plane -> flatten in place
       else if Context.Check(ttDelimParOpen) then
       begin
         // Look ahead for a TOP-LEVEL comma inside the parentheses -> a UDT aggregate tuple.
@@ -6678,6 +6722,23 @@ begin
       if Context.Check(ttSeparParam) then Context.Advance else Break;
     until Context.CheckAny([ttDelimBraceClose, ttEndOfLine, ttEndOfFile, ttSeparStmt]);
   if Context.Check(ttDelimBraceClose) then Context.Advance;   // }
+
+  // Zero-pad a short NESTED group (a row/plane) to its stride so a jagged multi-dim initializer stays
+  // row-aligned: FB fills each nested brace into one slot of its dimension and zero-fills the remainder.
+  // Only applied to inner groups (Level>=1) with known constant dimensions; the outer group's trailing
+  // shortfall is left to the array's default zero-init (avoids materialising a huge tail for big arrays).
+  if (Level >= 1) and (Level <= High(DimSizes)) then
+  begin
+    Stride := 1;
+    for d := Level to High(DimSizes) do Stride := Stride * DimSizes[d];
+    if (Stride > 0) and (Stride <= 65536) then
+      while InitList.ChildCount - StartCount < Stride do
+      begin
+        PadNode := TASTNode.CreateWithValue(antLiteral, '0', Context.CurrentToken);
+        PadNode.Attributes.Values['ARRPAD'] := '1';   // SSA stores the element type's zero (0 / 0.0 / "")
+        InitList.AddChild(PadNode);
+      end;
+  end;
 end;
 
 function TPackratParser.ParseDimensionList: TASTNode;
