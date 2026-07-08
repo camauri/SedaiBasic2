@@ -175,6 +175,7 @@ type
     // UDT/record heap (M3): allocate a record (Dest=handle, Src1/2/3=const slot counts) and
     // load/store a field (Dest or Src2 = value, Src1 = handle, Src3 = const slot index).
     ssaRecordNew, ssaRecordNewArray, ssaRecordTypeId, ssaRecordFree,
+    ssaRecordNewArrayInd,   // allocate a record per element of a member array by HANDLE: Src1=array-handle reg, Immediate=packed slot counts (like ssaRecordNewArray but the FArrays id comes from a register, for array-of-UDT members)
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString,
     ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
     // OS threading (M5.2, FreeBASIC API): @sub → entry PC (Dest=int reg, Src1=svkLabel PROC_name);

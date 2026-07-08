@@ -302,6 +302,7 @@ begin
     ssaXferLoadString: Result := bcXferLoadString;
     ssaRecordNew: Result := bcRecordNew;
     ssaRecordNewArray: Result := bcRecordNewArray;
+    ssaRecordNewArrayInd: Result := bcRecordNewArrayInd;
     ssaRecordTypeId: Result := bcRecordTypeId;
     ssaRecordFree: Result := bcRecordFree;     // DELETE
     ssaRecMarkPush: Result := bcRecMarkPush;   // M8: block-scoped reclamation
@@ -1987,6 +1988,9 @@ begin
   // ssaRecordNewArray (M3.1): Src1 = array id (from svkArrayRef, already mapped above);
   // the packed slot counts are carried as a const in Src2 -> Immediate.
   if Instr.OpCode = ssaRecordNewArray then
+    BCInstr.Immediate := Instr.Src2.ConstInt;
+  // ssaRecordNewArrayInd: Src1 = array-handle register (mapped normally above); Src2 const = packed counts.
+  if Instr.OpCode = ssaRecordNewArrayInd then
     BCInstr.Immediate := Instr.Src2.ConstInt;
 
   {$IFDEF DEBUG_BYTECODE}

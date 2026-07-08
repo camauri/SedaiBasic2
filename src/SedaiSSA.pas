@@ -75,6 +75,8 @@ type
     IsWString: Boolean;     // WSTRING field: srtString storage (UTF-8) but LEN/MID count by codepoint
     IsArray: Boolean;       // array member (e.g. "Dim As Double m(Any, Any)"): the int slot holds an FArrays handle
     ArrayElemBank: TSSARegisterType;  // element bank of an array member (int/float/string)
+    ArrayElemType: string;  // element UDT type name if the array member is an array-of-UDT ("verts(100) As Vertex"),
+                            // else ''. Each element is a record handle: allocated per-instance in EmitRecordInit.
     ArrayDimCount: Integer; // declared dimension count of an array member (>=1)
     ArrayBounds: TASTNode;  // antDimensions with concrete upper bounds for a FIXED-size array member
                             // ("Dim data(100) As Integer"); nil for an "Any" member (sized by REDIM).
@@ -364,6 +366,7 @@ type
     function UDTArrayField(UDTIdx: Integer; const FieldName: string;
                            out Slot: Integer; out ElemBank: TSSARegisterType;
                            out DimCount: Integer): Boolean;   // array member (obj.field(i,j))
+    function UDTArrayElemType(UDTIdx: Integer; const FieldName: string): string;  // element UDT type of an array-of-UDT member (else '')
     function UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;  // B1.5: field narrow width
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
@@ -13832,6 +13835,20 @@ begin
     end;
 end;
 
+function TSSAGenerator.UDTArrayElemType(UDTIdx: Integer; const FieldName: string): string;
+// The element UDT type name of an array-of-UDT member ("verts(100) As Vertex" -> "VERTEX"), else ''.
+var
+  i: Integer;
+  F: string;
+begin
+  Result := '';
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if (FUDTs[UDTIdx].Fields[i].Name = F) and FUDTs[UDTIdx].Fields[i].IsArray then
+      Exit(FUDTs[UDTIdx].Fields[i].ArrayElemType);
+end;
+
 function TSSAGenerator.UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;
 // B1.5: the narrow width code of a field (0 = full width / not found).
 var
@@ -13977,7 +13994,7 @@ var
   FieldNode, TypeNode: TASTNode;
   Bank, ArrElemBank: TSSARegisterType;
   cInt, cFloat, cStr, ArrDims: Integer;
-  TypeName, FieldName, NestedT, PtrPointeeT: string;
+  TypeName, FieldName, NestedT, PtrPointeeT, ArrElemType: string;
   IsArrayField: Boolean;
 begin
   if (Idx < 0) or (Idx > High(FUDTs)) then Exit;
@@ -14038,12 +14055,16 @@ begin
       IsArrayField := FieldNode.Attributes.Values['ARRAYFIELD'] = '1';
       ArrElemBank := srtInt;
       ArrDims := 1;
+      ArrElemType := '';
       if IsArrayField then
       begin
         ArrElemBank := Bank;
         ArrDims := StrToIntDef(FieldNode.Attributes.Values['ARRAYDIMS'], 1);
+        // Array-of-UDT member ("verts(100) As Vertex"): remember the element UDT type (NestedT held it)
+        // so EmitRecordInit can allocate a record per element and access resolves obj.field(i) to a handle.
+        if NestedT <> '' then ArrElemType := NestedT;
         Bank := srtInt;      // the field slot holds the FArrays handle
-        NestedT := '';       // not a nested record
+        NestedT := '';       // not a nested record (the field itself is the array handle)
         PtrPointeeT := '';
       end;
       n := Length(FUDTs[Idx].Fields);
@@ -14061,6 +14082,7 @@ begin
       FUDTs[Idx].Fields[n].PtrPointee := PtrPointeeT;
       FUDTs[Idx].Fields[n].IsArray := IsArrayField;
       FUDTs[Idx].Fields[n].ArrayElemBank := ArrElemBank;
+      FUDTs[Idx].Fields[n].ArrayElemType := ArrElemType;
       FUDTs[Idx].Fields[n].ArrayDimCount := ArrDims;
       // Fixed-size array member ("Dim data(100) As Integer"): the parser keeps the dimension list as an
       // antDimensions child. If every bound is concrete (not "Any", not ellipsis) record it so the member
@@ -14583,7 +14605,7 @@ procedure TSSAGenerator.EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integ
 // After a record instance is allocated, recursively allocate one instance for each nested-UDT
 // field and link its handle into the parent's int slot (so a.b.c works without manual init).
 var
-  i, di, NestedUDT: Integer;
+  i, di, NestedUDT, ElemUDT: Integer;
   NestedHandle, DefVal: TSSAValue;
   DimsN, UbExpr: TASTNode;
 begin
@@ -14621,6 +14643,24 @@ begin
       EmitInstruction(ssaMemberArrayRedim, MakeSSAValue(svkNone), HandleVal, MakeSSAValue(svkNone),
                       MakeSSAConstInt((Int64(FUDTs[UDTIdx].Fields[i].Slot) shl 8) or
                                       (Int64(Ord(FUDTs[UDTIdx].Fields[i].ArrayElemBank)) shl 4)));
+      // Array-of-UDT member ("verts(100) As Vertex"): each element is a record handle. Now that the
+      // handle array is sized, eagerly allocate one record instance per element (mirrors the plain
+      // array-of-UDT path via ssaRecordNewArray, but the FArrays id is the runtime handle in the field
+      // slot, so use the handle-based ssaRecordNewArrayInd). Without this "obj.field(i).x" would
+      // dereference a 0 handle.
+      ElemUDT := FindUDT(FUDTs[UDTIdx].Fields[i].ArrayElemType);
+      if ElemUDT >= 0 then
+      begin
+        NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));  // reuse: the member array handle
+        EmitInstruction(ssaRecordLoadInt, NestedHandle, HandleVal, MakeSSAValue(svkNone),
+                        MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+        EmitInstruction(ssaRecordNewArrayInd, MakeSSAValue(svkNone), NestedHandle,
+                        MakeSSAConstInt((Int64(FUDTs[ElemUDT].NInt) and $FFFF)
+                                        or ((Int64(FUDTs[ElemUDT].NFloat) and $FFFF) shl 16)
+                                        or ((Int64(FUDTs[ElemUDT].NStr) and $FFFF) shl 32)
+                                        or ((Int64(ElemUDT) and $FFFF) shl 48)),
+                        MakeSSAValue(svkNone));
+      end;
     end;
   // FreeBASIC field default values "field AS T = expr": store each into its slot. Runs after nested-UDT
   // allocation and before any constructor (so a constructor can override), and is itself overridden by
@@ -16902,6 +16942,13 @@ begin
       // name in scope — the node constructs a temporary T (same guard as the codegen hook).
       if (Result = '') and (FindUDT(ArrName) >= 0) and (ArrayIndexOf(ArrName) < 0) then
         Result := ArrName;
+    end
+    // Array-of-UDT MEMBER element "obj.field(i)": the element type is the field's ArrayElemType.
+    else if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0).NodeType = antMemberAccess) then
+    begin
+      ParentType := ObjectTypeName(ObjNode.GetChild(0).GetChild(0));
+      if ParentType <> '' then
+        Result := UDTArrayElemType(FindUDT(ParentType), VarToStr(ObjNode.GetChild(0).Value));
     end;
   end
   else if ObjNode.NodeType = antMemberAccess then
@@ -17049,7 +17096,9 @@ end;
 function TSSAGenerator.ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
   out TypeName: string): Boolean;
 var
-  ArrName, ParentType, NestedT: string;
+  ArrName, ParentType, NestedT, MemberArrElemType: string;
+  MemberArrHandle, MemberArrIdx: TSSAValue;
+  MemberArrBank: TSSARegisterType;
   ParentHandle, NestedHandle: TSSAValue;
   ParentUDT, Slot: Integer;
   Bank: TSSARegisterType;
@@ -17092,6 +17141,26 @@ begin
   end
   else if ObjNode.NodeType = antArrayAccess then
   begin
+    // Array-of-UDT MEMBER element: "obj.field(i)" where field is a UDT array member. The child-0 root is a
+    // member access, not a plain identifier. IsMemberArrayAccess loads the member's FArrays handle and the
+    // linear index; an indirect int load then yields the element's record handle. The element UDT type is
+    // the field's ArrayElemType.
+    if (ObjNode.ChildCount >= 2) and (ObjNode.GetChild(0).NodeType = antMemberAccess) then
+    begin
+      MemberArrElemType := '';
+      ParentType := ObjectTypeName(ObjNode.GetChild(0).GetChild(0));
+      if ParentType <> '' then
+        MemberArrElemType := UDTArrayElemType(FindUDT(ParentType), VarToStr(ObjNode.GetChild(0).Value));
+      if (MemberArrElemType <> '') and
+         IsMemberArrayAccess(ObjNode, MemberArrHandle, MemberArrBank, MemberArrIdx) then
+      begin
+        HandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaArrayLoadIndInt, HandleVal, MemberArrHandle, MemberArrIdx, MakeSSAValue(svkNone));
+        TypeName := MemberArrElemType;
+        Result := True;
+        Exit;
+      end;
+    end;
     if (ObjNode.ChildCount < 1) or (ObjNode.GetChild(0).NodeType <> antIdentifier) then Exit;
     ArrName := UpperCase(VarToStr(ObjNode.GetChild(0).Value));
     // Anonymous temporary "T(args)": ArrName is a declared UDT type (not an array). Construct it so any

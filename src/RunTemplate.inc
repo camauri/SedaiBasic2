@@ -722,6 +722,11 @@ begin
             RecordNewArrayInit(Ctx, Instr.Src1, Instr.Immediate);
             Inc(CurPC);
           end;
+        bcRecordNewArrayInd:  // array-of-UDT MEMBER: FArrays id is the runtime handle in IntRegs[Src1]
+          begin
+            RecordNewArrayInit(Ctx, IntRegs[Instr.Src1], Instr.Immediate);
+            Inc(CurPC);
+          end;
         // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).
         bcRecordLoadInt:
           begin Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.IntData[Instr.Immediate]; Inc(CurPC); end;

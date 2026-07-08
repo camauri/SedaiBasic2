@@ -4020,6 +4020,9 @@ begin
                                           Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
     bcRecordNewArray:
       RecordNewArrayInit(Ctx, Instr.Src1, Instr.Immediate);  // Src1=array id; Imm=packed slot counts
+    bcRecordNewArrayInd:
+      // Array-of-UDT MEMBER: the FArrays id is a runtime handle in IntRegs[Src1]. Imm=packed slot counts.
+      RecordNewArrayInit(Ctx, Ctx.IntRegs[Instr.Src1], Instr.Immediate);
     bcRecordFree:
       FreeSharedRecord(Ctx.IntRegs[Instr.Src1]);  // DELETE p: release the heap record (Src1=handle)
     // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).

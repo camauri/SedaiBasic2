@@ -429,6 +429,7 @@ begin
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString,
     bcRecordTypeId,   // OOP (M4.3): Src1 = handle
     bcRecordFree,     // DELETE: Src1 = handle
+    bcRecordNewArrayInd,  // array-of-UDT member alloc: Src1 = member array-handle reg (int)
     // OS threading (M5.2): ThreadCreate Src1 = proc-addr reg; ThreadWait Src1 = handle reg.
     // (bcLoadProcAddr's Src1 is the entry-PC label → Immediate, not a register, so it is excluded.)
     bcThreadCreate, bcThreadWait, bcThreadDetach,

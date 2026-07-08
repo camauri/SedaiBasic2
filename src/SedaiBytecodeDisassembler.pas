@@ -188,6 +188,8 @@ begin
       Line := Format('%4d: %-20s [R%d].fld%d <- R%d', [Index, 'RecordStore', Instr.Src1, Instr.Immediate, Instr.Src2]);
     bcRecordNewArray:
       Line := Format('%4d: %-20s ARR[%d] fill records', [Index, 'RecordNewArray', Instr.Src1]);
+    bcRecordNewArrayInd:
+      Line := Format('%4d: %-20s [hR%d] fill records', [Index, 'RecordNewArrayInd', Instr.Src1]);
     bcRecordTypeId:
       Line := Format('%4d: %-20s R%d = typeid[R%d]', [Index, 'RecordTypeId', Instr.Dest, Instr.Src1]);
     bcRecMarkPush:
