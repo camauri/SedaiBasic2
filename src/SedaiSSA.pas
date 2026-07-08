@@ -1067,6 +1067,7 @@ var
   DestReg: Integer;
   OpCode: TSSAOpCode;
   FuncName, VarName: string;
+  RecUDTIdx, RecSlotK: Integer;   // OFFSETOF: UDT index + field scan
   FuncRetType: TSSARegisterType;  // M2: user FUNCTION return type
   MethodObjNode: TASTNode;        // M4.1: object of a method call
   ArgNode: TASTNode;              // WSTRING: the source AST node of a string-function argument (width detect)
@@ -4023,6 +4024,31 @@ begin
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaFileExists, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC OFFSETOF(typename, field): the byte offset of a field within a UDT, as a compile-time
+        // constant. Our storage is three separate typed banks (not a byte-flat layout), so a faithful FB
+        // offset is not well-defined; we return the field's declaration index * 8 — exact for the common
+        // all-64-bit UDT (and consistent with our uniform 8-byte slot model), an approximation for narrower
+        // fields (no FB packing/alignment is modelled). Not a declared array.
+        if (UpperCase(ArrName) = 'OFFSETOF') and (ArrayIndexOf(ArrName) < 0) and
+           (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount >= 2) and
+           (Node.GetChild(1).GetChild(0).NodeType = antIdentifier) and
+           (Node.GetChild(1).GetChild(1).NodeType = antIdentifier) then
+        begin
+          RecUDTIdx := FindUDT(UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value)));
+          ValCode := 0;   // reuse as the byte offset accumulator
+          if RecUDTIdx >= 0 then
+          begin
+            ArrName2 := UpperCase(VarToStr(Node.GetChild(1).GetChild(1).Value));   // field name
+            for RecSlotK := 0 to High(FUDTs[RecUDTIdx].Fields) do
+            begin
+              if FUDTs[RecUDTIdx].Fields[RecSlotK].Name = ArrName2 then Break;
+              ValCode := ValCode + 8;
+            end;
+          end;
+          Result := MakeSSAConstInt(ValCode);
           Exit;
         end;
 
