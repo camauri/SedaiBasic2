@@ -4687,6 +4687,19 @@ begin
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
 
+  // FreeBASIC shorthand "obj = Type(args)" (no <T>): the type constructor was parsed with an inferred
+  // (empty) type name; fill it from the LHS's declared UDT so the SSA builds the right temporary.
+  if (ExprNode.NodeType = antArrayAccess) and (ExprNode.Attributes.Values['INFERTYPE'] = '1') and
+     (ExprNode.ChildCount >= 1) then
+  begin
+    LhsRecType := ObjectTypeName(VarNode);
+    if LhsRecType <> '' then
+    begin
+      ExprNode.GetChild(0).Value := LhsRecType;
+      ExprNode.Attributes.Values['INFERTYPE'] := '';
+    end;
+  end;
+
   // Record field store: obj.field = expr (M3)
   if VarNode.NodeType = antMemberAccess then
   begin

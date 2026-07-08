@@ -7130,6 +7130,14 @@ begin
             ArrayDecl.AddChild(InitExpr);                   // child[2] = initializer (not antArgumentList)
         end;
       end;
+      // FreeBASIC shorthand "Dim v As T = Type(args)" (no <T>): the type constructor was parsed with an
+      // inferred (empty) type name; fill it from the declared type so the SSA builds a T temporary.
+      if (ArrayDecl.ChildCount >= 3) and (ArrayDecl.GetChild(2).Attributes.Values['INFERTYPE'] = '1') and
+         (ArrayDecl.GetChild(2).ChildCount >= 1) then
+      begin
+        ArrayDecl.GetChild(2).GetChild(0).Value := DimTypeName;
+        ArrayDecl.GetChild(2).Attributes.Values['INFERTYPE'] := '';
+      end;
       // Optional parameterised construction (M4.4b): attach the constructor argument list as
       // child[2]; SSA stages these and calls T's matching CONSTRUCTOR.
       if Context.Check(ttDelimParOpen) then

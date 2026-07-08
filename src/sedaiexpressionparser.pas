@@ -1519,11 +1519,35 @@ var
   TypeName: TLexerToken;
   NameNode, Args: TASTNode;
 begin
-  if not Context.Match(ttOpLt) then
+  if not Context.Check(ttOpLt) then
   begin
-    HandleError('Expected "<" after TYPE in a type<T>(...) expression', Context.CurrentToken);
+    // FreeBASIC shorthand "Type(args)" without an explicit <T>: the UDT is inferred from the enclosing
+    // context (a DIM/assignment target or a FUNCTION result type). Emit the same temporary shape with an
+    // empty, INFERTYPE-marked type name; the DIM/return lowering fills in the concrete type name.
+    if Context.Check(ttDelimParOpen) then
+    begin
+      NameNode := TASTNode.CreateWithValue(antIdentifier, '', Token);
+      Context.Advance;                                  // '('
+      if Context.Check(ttDelimParClose) then
+        Args := TASTNode.Create(antExpressionList, Token)
+      else
+        Args := ParseExpressionList(ttSeparParam);
+      if not Context.Match(ttDelimParClose) then
+      begin
+        HandleError('Expected ")" to close a Type(...) expression', Context.CurrentToken);
+        NameNode.Free; if Assigned(Args) then Args.Free; Exit(nil);
+      end;
+      Result := TASTNode.Create(antArrayAccess, Token);
+      Result.Attributes.Values['INFERTYPE'] := '1';     // type deduced by the DIM/assignment/return lowering
+      Result.AddChild(NameNode);
+      Result.AddChild(Args);
+      DoNodeCreated(Result);
+      Exit;
+    end;
+    HandleError('Expected "<" or "(" after TYPE in a type constructor expression', Context.CurrentToken);
     Exit(nil);
   end;
+  Context.Advance;   // consume '<'
   if not Context.Check(ttIdentifier) then
   begin
     HandleError('Expected a TYPE name in a type<T>(...) expression', Context.CurrentToken);
