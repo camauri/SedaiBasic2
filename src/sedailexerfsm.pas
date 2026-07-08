@@ -109,6 +109,7 @@ type
     function HandleTokenOverflow: TLexerToken;
     function ParseNumberDigits: Boolean;
     procedure ConsumeIntLiteralSuffix;   // drop a trailing FB integer literal suffix (U/L/LL/UL/ULL/...)
+    procedure ConsumeFloatLiteralSuffix; // drop a trailing FB float literal suffix (f/F/d/D/!/#)
     procedure ResetTokenPool;
     procedure TokenBufferReset; inline;
     procedure TokenBufferAdd(C: Char); inline;
@@ -157,6 +158,7 @@ type
     function ProcessString: TLexerToken;
     function ProcessComment: TLexerToken;
     function ProcessLineComment: TLexerToken;
+    procedure SkipBlockComment;   // consume a FreeBASIC /' ... '/ block comment (nestable)
     function ProcessNewline: TLexerToken;
     function ProcessEndOfFile: TLexerToken;
 
@@ -1651,6 +1653,30 @@ begin
   Result := CreateToken(ttCommentText);
 end;
 
+procedure TLexerFSM.SkipBlockComment;
+// Precondition: GetCurrentChar = '/' and PeekChar(1) = ''''  (start of a FreeBASIC /' block comment).
+// Consumes the whole comment up to and including the matching '/ (or EOF), honoring nesting.
+var
+  Depth: Integer;
+begin
+  AdvanceChar;               // '/'
+  AdvanceChar;               // opening quote
+  Depth := 1;
+  while (Depth > 0) and (GetCurrentChar <> #0) do
+  begin
+    if (GetCurrentChar = '/') and (PeekChar(1) = '''') then
+    begin
+      AdvanceChar; AdvanceChar; Inc(Depth);   // nested /'
+    end
+    else if (GetCurrentChar = '''') and (PeekChar(1) = '/') then
+    begin
+      AdvanceChar; AdvanceChar; Dec(Depth);    // closing '/
+    end
+    else
+      AdvanceChar;
+  end;
+end;
+
 function TLexerFSM.ProcessLineComment: TLexerToken;
 begin
   // Remove leading space from comment text
@@ -1825,6 +1851,23 @@ begin
     AdvanceChar;
     if (GetCurrentChar = 'L') or (GetCurrentChar = 'l') then AdvanceChar;     // LL
   end;
+end;
+
+procedure TLexerFSM.ConsumeFloatLiteralSuffix;
+// FreeBASIC float literal TYPE suffix: 'f'/'F' (Single), 'd'/'D' (Double), '!' (Single), '#' (Double).
+// Consumed and DROPPED (the literal's value is the number itself; the bank is float regardless). A number
+// can never be validly glued to an identifier, so a trailing f/d is an unambiguous suffix. For f/d/F/D we
+// require the following char to be a non-alnum so a VB-style exponent (1.5D10) isn't mistaken for a suffix.
+var C: Char;
+begin
+  C := GetCurrentChar;
+  if (C = 'f') or (C = 'F') or (C = 'd') or (C = 'D') then
+  begin
+    if not (PeekChar(1) in ['0'..'9', 'A'..'Z', 'a'..'z', '_']) then
+      AdvanceChar;
+  end
+  else if (C = '!') or (C = '#') then
+    AdvanceChar;
 end;
 
 // === MAIN LEXING METHOD ===
@@ -2002,6 +2045,19 @@ begin
 
       '/':
         begin
+          // FreeBASIC block comment "/' ... '/" (nestable). Transparent like whitespace — it can appear
+          // inline (code before/after on the same line), so skip it and return the next real token rather
+          // than emitting a comment/EOL token.
+          if PeekChar(1) = '''' then
+          begin
+            SkipBlockComment;
+            Result := NextToken;
+            {$IFDEF DEBUG}
+            if FDebugMode then
+              FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);
+            {$ENDIF}
+            Exit;
+          end;
           ResetToken;
           TokenBufferAdd(CurrentChar);
           AdvanceChar;
@@ -2346,6 +2402,7 @@ begin
           end;
 
           ConsumeIntLiteralSuffix;   // FreeBASIC typed integer literal: 100L, 5UL, ...ULL (dropped)
+          ConsumeFloatLiteralSuffix; // FreeBASIC typed float literal: 1.0f, 2.5d, 3! , 4# (dropped)
           Result := ProcessNumber;
           Exit;
         end;
@@ -2358,7 +2415,10 @@ begin
           AdvanceChar;
 
           if ParseNumberDigits then  // ← If finds digits, it's a number
-            Result := ProcessNumber
+          begin
+            ConsumeFloatLiteralSuffix;   // FreeBASIC ".5f" / ".25d" typed float literal (dropped)
+            Result := ProcessNumber;
+          end
           else
             Result := CreateToken(ttOpDot);  // ← Otherwise it's the member-access operator '.'
           Exit;
