@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 525 / 643 implemented (82%)**. **66** of the unimplemented
+**FreeBASIC keyword set — 527 / 643 implemented (82%)**. **66** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, FFI) — not runnable keywords for a portable bytecode VM. Of the
-**577 applicable** keywords, **525 (91%)** are implemented. See the
+**577 applicable** keywords, **527 (91%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1284,9 +1284,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **489 / 643 implemented (76%)**, plus 1 partial (◐).
-> Of the 153 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **475 / 572 ≈ 83% of the
+> **Coverage (FreeBASIC keyword set):** **491 / 643 implemented (76%)**, plus 1 partial (◐).
+> Of the 151 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **477 / 572 ≈ 83% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -1332,7 +1332,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Temporary Types` | ✗ | Creates a temporary copy of a user defined type |
+| `Temporary Types` | ✓ | `Type<T>(args)` and the shorthand `Type(args)` (UDT inferred from the DIM/assignment target) build an anonymous temporary. |
 | `THIS` | ✓ | Implicit first parameter of methods/constructors/destructors (M4.1): the instance handle. `THIS.field` reads/writes fields; used to resolve the method's owner type |
 | `BASE (member access)` | ✓ | `base.field` reads/writes the inherited base field, and `base.method()` is a non-virtual super call to the parent type's method (SUB/FUNCTION, with args/return), inside a derived method. |
 | `Type Alias` | ✓ | `TYPE newname AS underlyingtype` — synonym for a builtin or UDT; resolved via CanonicalType (chained aliases, narrowing, and alias-to-UDT supported). Also **named function-pointer types**: `TYPE X As Function(params) As R` / `TYPE X As Sub(params)` (params may be unnamed) — a var/param/return declared `As X` is an int-banked function pointer with X's signature; `f(args)` is an indirect call. |
@@ -2013,7 +2013,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `END (Block)` | ✓ |  |
-| `OFFSETOF` | ✗ |  |
+| `OFFSETOF` | ✓ | `OFFSETOF(type, field)` — a field's byte offset (compile-time). Field-index × 8 (exact for all-64-bit UDTs, consistent with `SizeOf`; no FB packing/alignment for narrow fields). |
 | `SIZEOF` | ✓ | `SizeOf(scalar-type / UDT)` byte size; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`. |
 | `TYPEOF` | ~ | `DIM AS TypeOf(expr) name` declares a variable with the type inferred from an expression/variable/literal (like VAR without an initializer). The preprocessor `#if TypeOf(a)=TypeOf(b)` form is deferred. |
 | `LET` | ✓ |  |
