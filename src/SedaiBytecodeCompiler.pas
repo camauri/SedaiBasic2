@@ -244,6 +244,7 @@ begin
     ssaMathLog2: Result := bcMathLog2;
     ssaMathLogN: Result := bcMathLogN;
     ssaMathRnd: Result := bcMathRnd;
+    ssaMathAtn: Result := bcMathAtn;       // ATN/ATAN (arctangent) — was unmapped, compiled to a Nop
     ssaMathAcos: Result := bcMathAcos;     // FreeBASIC math functions
     ssaMathAsin: Result := bcMathAsin;
     ssaMathAtan2: Result := bcMathAtan2;

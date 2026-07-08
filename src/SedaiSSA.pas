@@ -1070,6 +1070,7 @@ var
   ConvW: Integer;   // B1.5: integer-narrowing width code for a Cxxx conversion (0 = full width)
   SelImm: Integer;  // date/time function selector encoded in the opcode Immediate
   NarrowReg: TSSAValue;
+  NegReg, FloorReg: TSSAValue;   // FLOOR/CEIL lowering (via Int and float negation)
   // Array access variables
   ArrName, ArrName2, ArrNameU: string;
   ArrayIdx: Integer;
@@ -4005,6 +4006,31 @@ begin
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaFileExists, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC FLOOR(x) / CEIL(x): round toward -inf / +inf, returning a Double. Int() already
+        // rounds toward -inf, so Floor(x) = Int(x) and Ceil(x) = -Int(-x). MODERN, not a declared array.
+        if FModernMode and ((UpperCase(ArrName) = 'FLOOR') or (UpperCase(ArrName) = 'CEIL')) and
+           (ArrayIndexOf(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ArgReg := EnsureFloatRegister(ArgValue);
+          if UpperCase(ArrName) = 'CEIL' then
+          begin
+            NegReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+            EmitInstruction(ssaNegFloat, NegReg, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            ArgReg := NegReg;
+          end;
+          FloorReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+          EmitInstruction(ssaMathInt, FloorReg, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          if UpperCase(ArrName) = 'CEIL' then
+          begin
+            Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+            EmitInstruction(ssaNegFloat, Result, FloorReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end
+          else
+            Result := FloorReg;
           Exit;
         end;
 
