@@ -87,6 +87,8 @@ type
     function GetOptions: TParserOptions;
     function ParseArrayAccess: TASTNode;
     function ParseArrayDeclaration: TASTNode;
+    function FoldFileHandlePostfix(BaseNode: TASTNode): TASTNode;
+    function ParseFileHandleIdent: TASTNode;
 
     // Helper methods for block parsing
     function ParseBlockUntil(EndTokens: array of TTokenType): TASTNode;
@@ -1290,10 +1292,7 @@ begin
         Context.Advance;
       end
       else if Context.Check(ttIdentifier) then
-      begin
-        Result.AddChild(TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken));
-        Context.Advance;
-      end
+        Result.AddChild(ParseFileHandleIdent)
       else
         HandleError('Expected file number after PRINT #', Token);
       if Context.CheckAny([ttSeparParam, ttSeparOutput]) then
@@ -1412,10 +1411,7 @@ begin
       Context.Advance;
     end
     else if Context.Check(ttIdentifier) then
-    begin
-      Result.AddChild(TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken));
-      Context.Advance;
-    end
+      Result.AddChild(ParseFileHandleIdent)
     else
       HandleError('Expected file number after INPUT #', Token);
     if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;  // comma after handle
@@ -3718,8 +3714,9 @@ begin
     else if Context.Check(ttIdentifier) then
     begin
       HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-      Result.AddChild(HandleNode);
       Context.Advance;
+      HandleNode := FoldFileHandlePostfix(HandleNode);
+      Result.AddChild(HandleNode);
     end
     else
     begin
@@ -5228,6 +5225,7 @@ begin
     begin
       HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
       Context.Advance;
+      HandleNode := FoldFileHandlePostfix(HandleNode);
     end
     else begin HandleError('Expected file number after AS', Token); Exit; end;
     if UpperCase(Context.CurrentToken.Value) = kLEN then   // optional "LEN = reclen" (RANDOM): ignored v1
@@ -5270,8 +5268,9 @@ begin
     begin
       // Named handle: #MYFILE, #DATA, etc.
       HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-      Result.AddChild(HandleNode);
       Context.Advance;
+      HandleNode := FoldFileHandlePostfix(HandleNode);
+      Result.AddChild(HandleNode);
     end
     else
     begin
@@ -5353,8 +5352,9 @@ begin
     else if Context.Check(ttIdentifier) then
     begin
       HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-      Result.AddChild(HandleNode);
       Context.Advance;
+      HandleNode := FoldFileHandlePostfix(HandleNode);
+      Result.AddChild(HandleNode);
     end
     else
     begin
@@ -5403,8 +5403,9 @@ begin
     else if Context.Check(ttIdentifier) then
     begin
       HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-      Result.AddChild(HandleNode);
       Context.Advance;
+      HandleNode := FoldFileHandlePostfix(HandleNode);
+      Result.AddChild(HandleNode);
     end
     else
     begin
@@ -5538,8 +5539,9 @@ begin
     else if Context.Check(ttIdentifier) then
     begin
       HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-      Result.AddChild(HandleNode);
       Context.Advance;
+      HandleNode := FoldFileHandlePostfix(HandleNode);
+      Result.AddChild(HandleNode);
     end
     else
     begin
@@ -5587,8 +5589,9 @@ begin
     else if Context.Check(ttIdentifier) then
     begin
       HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-      Result.AddChild(HandleNode);
       Context.Advance;
+      HandleNode := FoldFileHandlePostfix(HandleNode);
+      Result.AddChild(HandleNode);
     end
     else
     begin
@@ -5675,8 +5678,9 @@ begin
   end
   else if Context.Check(ttIdentifier) then
   begin
-    Result.AddChild(TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken));
+    P := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
     Context.Advance;
+    Result.AddChild(FoldFileHandlePostfix(P));
   end
   else
     HandleError('Expected file number after LINE INPUT #', Tok);
@@ -5853,8 +5857,9 @@ begin
   end
   else if Context.Check(ttIdentifier) then
   begin
-    Result.AddChild(TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken));
+    P := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
     Context.Advance;
+    Result.AddChild(FoldFileHandlePostfix(P));
   end
   else
     HandleError('Expected file number after WRITE #', Tok);
@@ -5892,10 +5897,7 @@ begin
     Context.Advance;
   end
   else if Context.Check(ttIdentifier) then
-  begin
-    H := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-    Context.Advance;
-  end
+    H := ParseFileHandleIdent
   else
   begin
     HandleError('Expected file number after GET/PUT #', Tok);
@@ -5961,8 +5963,9 @@ begin
   end
   else if Context.Check(ttIdentifier) then
   begin
-    Result.AddChild(TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken));
+    P := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
     Context.Advance;
+    Result.AddChild(FoldFileHandlePostfix(P));
   end
   else
     HandleError('Expected file number after SEEK #', Tok);
@@ -6087,8 +6090,9 @@ begin
     else if Context.Check(ttIdentifier) then
     begin
       HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-      Result.AddChild(HandleNode);
       Context.Advance;
+      HandleNode := FoldFileHandlePostfix(HandleNode);
+      Result.AddChild(HandleNode);
     end
     else
     begin
@@ -6750,6 +6754,39 @@ begin
   until Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]);
 
   DoNodeCreated(Result);
+end;
+
+function TPackratParser.FoldFileHandlePostfix(BaseNode: TASTNode): TASTNode;
+// A file number can be a UDT member (e.g. "#bf.bw") — the handle identifier has
+// already been consumed; fold any trailing ".field" chain into antMemberAccess nodes
+// so the SSA evaluates the member's integer value (ProcessDopen's expression fallback).
+var
+  MemberNode: TASTNode;
+begin
+  Result := BaseNode;
+  while Context.Check(ttOpDot) do
+  begin
+    Context.Advance;                               // '.'
+    if not Context.Check(ttIdentifier) then
+    begin
+      HandleError('Expected field name after "." in file number', Context.CurrentToken);
+      Break;
+    end;
+    MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(Context.CurrentToken.Value),
+                                           Context.CurrentToken);
+    MemberNode.AddChild(Result);
+    Result := MemberNode;
+    Context.Advance;                               // field name
+  end;
+end;
+
+function TPackratParser.ParseFileHandleIdent: TASTNode;
+// Current token is a file-number identifier: build antIdentifier, advance, and fold any
+// trailing ".field" chain (e.g. "#bf.bw"). Used at inline file-handle call sites.
+begin
+  Result := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+  Context.Advance;
+  Result := FoldFileHandlePostfix(Result);
 end;
 
 function TPackratParser.ParseArrayAccess: TASTNode;
