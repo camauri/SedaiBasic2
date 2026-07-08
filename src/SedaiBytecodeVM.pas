@@ -6094,7 +6094,7 @@ var
   SubOp: Word;
   ArrayIdx, LinearIdx, i, ProdDims, ArrLowerBound: Integer;
   ArrInfo: TSSAArrayInfo;
-  PtrAddr: Int64;
+  PtrAddr, DestArr: Int64;
   PtrOffset, RecSlot: Integer;
   Rec: PRecordStorage;
 begin
@@ -6611,6 +6611,22 @@ begin
                                      + FArrays[PtrAddr].Dimensions[LinearIdx] - 1
         else
           Ctx.IntRegs[Instr.Dest] := -1;
+      end;
+    47: // bcArrayCopyContents - deep-copy FArrays[Src1] <- FArrays[Src2] (value semantics of an array member)
+      begin
+        DestArr := Ctx.IntRegs[Instr.Src1]; PtrAddr := Ctx.IntRegs[Instr.Src2];
+        if (DestArr >= 1) and (DestArr <= High(FArrays)) and
+           (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
+        begin
+          FArrays[DestArr].ElementType := FArrays[PtrAddr].ElementType;
+          FArrays[DestArr].DimCount    := FArrays[PtrAddr].DimCount;
+          FArrays[DestArr].TotalSize   := FArrays[PtrAddr].TotalSize;
+          FArrays[DestArr].Dimensions  := Copy(FArrays[PtrAddr].Dimensions);
+          FArrays[DestArr].LowerBounds := Copy(FArrays[PtrAddr].LowerBounds);
+          FArrays[DestArr].IntData     := Copy(FArrays[PtrAddr].IntData);
+          FArrays[DestArr].FloatData   := Copy(FArrays[PtrAddr].FloatData);
+          FArrays[DestArr].StringData  := Copy(FArrays[PtrAddr].StringData);
+        end;
       end;
   else
     raise Exception.CreateFmt('Unknown array opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);

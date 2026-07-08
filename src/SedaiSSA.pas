@@ -16627,7 +16627,21 @@ begin
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
   begin
     Slot := FUDTs[UDTIdx].Fields[i].Slot;
-    if FUDTs[UDTIdx].Fields[i].NestedType <> '' then
+    if FUDTs[UDTIdx].Fields[i].IsArray then
+    begin
+      // Array member: the int slot holds an FArrays handle. A plain handle copy would make the two
+      // records SHARE one array (mutations leak; a return-by-value copy dangles when the callee frame
+      // frees its array). Deep-copy the element storage into the destination's own array instead.
+      // (Checked before NestedType so an array-of-UDT field is not mistaken for a single nested record;
+      // scalar-element arrays get correct value semantics — UDT-element arrays copy element handles,
+      // no worse than before and pending the array-of-UDT-member feature.)
+      DNest := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordLoadInt, DNest, DestHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+      SNest := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordLoadInt, SNest, SrcHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+      EmitInstruction(ssaArrayCopyContents, MakeSSAValue(svkNone), DNest, SNest, MakeSSAValue(svkNone));
+    end
+    else if FUDTs[UDTIdx].Fields[i].NestedType <> '' then
     begin
       // Nested record member: load both handles (int slot), deep-copy into the destination's own.
       NestedUDT := FindUDT(FUDTs[UDTIdx].Fields[i].NestedType);

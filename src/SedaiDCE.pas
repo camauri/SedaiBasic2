@@ -333,6 +333,7 @@ begin
     ssaArrayIdxResolveInd,  // member multi-dim index (consumes the pending-index accumulator)
     ssaArrayStoreIndInt, ssaArrayStoreIndFloat, ssaArrayStoreIndString,  // UDT array member store: mutate array storage
     ssaMemberArrayRedim,  // REDIM of a UDT array member (mutate array storage + record slot)
+    ssaArrayCopyContents,  // deep-copy array member storage into the destination (mutates dest array)
     ssaRefStoreInt, ssaRefStoreFloat, ssaRefStoreString,  // FreeBASIC pointer store: mutates pointee
     ssaPoke:  // POKE writes to memory-mapped I/O (visible side effects like color changes)
       Result := True;

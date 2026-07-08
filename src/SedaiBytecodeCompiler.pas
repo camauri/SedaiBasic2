@@ -378,6 +378,7 @@ begin
     ssaMemberArrayRedim: Result := bcMemberArrayRedim;
     ssaArrayLBoundInd: Result := bcArrayLBoundInd;
     ssaArrayUBoundInd: Result := bcArrayUBoundInd;
+    ssaArrayCopyContents: Result := bcArrayCopyContents;
     // Graphics operations
     ssaGraphicRGBA: Result := bcGraphicRGBA;
     ssaGraphicSetMode: Result := bcGraphicSetMode;

@@ -172,6 +172,8 @@ begin
       Line := Format('%4d: %-20s [R%d].fld%d et=%d p=%d', [Index, 'MemberArrayRedim', Instr.Src1, (Instr.Immediate shr 8) and $FFFF, (Instr.Immediate shr 4) and $F, Instr.Immediate and 1]);
     bcArrayLBoundInd, bcArrayUBoundInd:
       Line := Format('%4d: %-20s R%d = bound[hR%d](dimR%d)', [Index, 'ArrayBoundInd', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcArrayCopyContents:
+      Line := Format('%4d: %-20s [hR%d] <- [hR%d]', [Index, 'ArrayCopyContents', Instr.Src1, Instr.Src2]);
     bcReturnSub:
       Line := Format('%4d: %-20s', [Index, 'ReturnSub']);
     bcXferStoreInt, bcXferStoreFloat, bcXferStoreString:

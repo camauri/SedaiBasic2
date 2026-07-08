@@ -473,6 +473,7 @@ const
   bcMemberArrayRedim   = bcGroupArray + 44;  // REDIM a UDT array member: Src1=record-handle reg; Immediate packs (slot<<8)|(elemType<<4)|preserve; allocates the FArrays entry lazily and writes the handle back to the record slot; consumes the bcArrayRedimPush upper-bound list
   bcArrayLBoundInd     = bcGroupArray + 45;  // LBOUND of a UDT array member: Dest(int)=FArrays[IntRegs[Src1]].LowerBounds[IntRegs[Src2]] (0 if unallocated)
   bcArrayUBoundInd     = bcGroupArray + 46;  // UBOUND of a UDT array member: Dest(int)=lower+size-1 (-1 if unallocated)
+  bcArrayCopyContents  = bcGroupArray + 47;  // deep-copy FArrays[IntRegs[Src1]] <- FArrays[IntRegs[Src2]] (independent storage: Dimensions/LowerBounds/*Data via Copy); value semantics of an array UDT member
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values
