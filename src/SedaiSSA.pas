@@ -407,6 +407,7 @@ type
     function ParamBankAndSlot(ParamList: TASTNode; Index: Integer; out RT: TSSARegisterType): Integer;
     function ParamDeclaredBank(ParamNode: TASTNode): TSSARegisterType;  // scalar param bank from its OWN decl (no global name collision)
     function CurrentProcParamType(const VarName: string; out UDTType: string): Boolean;  // is VarName a param of the current proc? UDTType = its UDT ('' if not a UDT)
+    function CurrentProcLocalRecType(const VarName: string): string;  // UDT type of a DIM'd local UDT of the current proc (shadows the global map), else ''
     procedure EmitXferStore(RT: TSSARegisterType; Slot: Integer; const Val: TSSAValue);
     procedure EmitXferLoad(RT: TSSARegisterType; Slot: Integer; const DestReg: TSSAValue);
     procedure FixForwardReferences;  // PHASE 3 TIER 3: Fix forward GOTO/GOSUB references
@@ -14595,10 +14596,36 @@ begin
   // scalar parameter type collision fixed via ParamDeclaredBank.
   if CurrentProcParamType(VarName, ParamUDT) then
     Exit(ParamUDT);
+  // A LOCAL DIM of the current procedure also shadows the global name->type map (same first-wins hazard
+  // as parameters): a "Dim As Bag c" inside a proc must not resolve to a module "Dim As Holder c"
+  // registered first — that mis-types "c.field" and silently drops the store. FCurrentProcLocalRecs holds
+  // this proc's DIM'd UDT locals ("VARNAME|TYPENAME"), gathered at the prologue and empty at module level.
+  ParamUDT := CurrentProcLocalRecType(VarName);
+  if ParamUDT <> '' then
+    Exit(ParamUDT);
   if FVarRecordType.IndexOfName(UpperCase(VarName)) < 0 then
     Result := ''
   else
     Result := FVarRecordType.Values[UpperCase(VarName)];
+end;
+
+function TSSAGenerator.CurrentProcLocalRecType(const VarName: string): string;
+// The declared UDT type of a DIM'd local UDT variable of the procedure being lowered (from
+// FCurrentProcLocalRecs "VARNAME|TYPENAME"), or '' if VarName is not such a local. Lets a local shadow a
+// same-named module UDT variable in the global name->type map.
+var
+  i, bar: Integer;
+  VNameU: string;
+begin
+  Result := '';
+  if FCurrentProcLocalRecs = nil then Exit;
+  VNameU := UpperCase(VarName);
+  for i := 0 to FCurrentProcLocalRecs.Count - 1 do
+  begin
+    bar := Pos('|', FCurrentProcLocalRecs[i]);
+    if (bar > 0) and (UpperCase(Copy(FCurrentProcLocalRecs[i], 1, bar - 1)) = VNameU) then
+      Exit(Copy(FCurrentProcLocalRecs[i], bar + 1, MaxInt));
+  end;
 end;
 
 procedure TSSAGenerator.EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer);
