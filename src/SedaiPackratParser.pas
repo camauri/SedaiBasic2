@@ -2815,10 +2815,10 @@ end;
 function TPackratParser.ParseRecordDecl(IsUnion: Boolean): TASTNode;
 var
   Token, NameTok, FieldTok: TLexerToken;
-  FieldNode, TypeNode, ArrDimNode, FieldDefault: TASTNode;
+  FieldNode, TypeNode, ArrDimNode, FieldDefault, FpTmp: TASTNode;
   PrevIdx, NestedUnionDepth: Integer;
-  FieldTypeName, TokU, AliasType: string;
-  IsStaticField, LeadingType: Boolean;
+  FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
+  IsStaticField, LeadingType, FpIsFP: Boolean;
 begin
   NestedUnionDepth := 0;
   // TYPE/UNION name <newline> field AS type <newline> ... END TYPE/END UNION
@@ -2991,6 +2991,7 @@ begin
     if TokU = kDIM then Context.Advance;
     FieldTypeName := '';                            // empty => infer by suffix
     LeadingType := False;
+    FpIsFP := False; FpParams := ''; FpRet := '';   // funcptr field ("fn As Function(...) As R")
     ArrDimNode := nil;
     // "As-first" form: "As <type> name(dims)" (the common FB form). Read the type before the name.
     if Context.Check(ttAsType) then
@@ -3019,7 +3020,22 @@ begin
       if (not LeadingType) and Context.Check(ttAsType) then
       begin
         Context.Advance;                            // AS
-        FieldTypeName := ParseRecordFieldType;
+        // FreeBASIC funcptr field "fn As Function(params) As R" / "As Sub(params)": record the signature
+        // (int-banked entry PC) instead of a type name; "obj.fn(args)" is lowered as an indirect call.
+        if Context.Check(ttProcedureStart) then
+        begin
+          FpTmp := TASTNode.CreateWithValue(antIdentifier, '', FieldTok);
+          if TryParseProcPtrType(FpTmp) then
+          begin
+            FpIsFP := True;
+            FpParams := FpTmp.Attributes.Values['FPPARAMS'];
+            FpRet := FpTmp.Attributes.Values['FPRET'];
+            FieldTypeName := 'INTEGER';             // the field slot holds the procedure entry PC
+          end;
+          FpTmp.Free;
+        end
+        else
+          FieldTypeName := ParseRecordFieldType;
         if (ArrDimNode = nil) and Context.Check(ttDelimParOpen) then
         begin
           Context.Advance;
@@ -3030,6 +3046,12 @@ begin
       FieldNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(FieldTok.Value), FieldTok);
       TypeNode := TASTNode.CreateWithValue(antIdentifier, FieldTypeName, FieldTok);
       FieldNode.AddChild(TypeNode);
+      if FpIsFP then
+      begin
+        FieldNode.Attributes.Values['FUNCPTR'] := '1';
+        FieldNode.Attributes.Values['FPPARAMS'] := FpParams;
+        FieldNode.Attributes.Values['FPRET'] := FpRet;
+      end;
       if IsStaticField then FieldNode.Attributes.Values['STATIC'] := '1';
       if Assigned(ArrDimNode) then
       begin

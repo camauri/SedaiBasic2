@@ -83,6 +83,10 @@ type
                             // The SSA auto-sizes the member at construction from these bounds.
     DefaultExpr: TASTNode;  // FreeBASIC field default "field AS T = expr" (nil if none); applied on every
                             // instantiation before the constructor, overridden by aggregate "= (a,b,...)"
+    FuncPtrSig: string;     // funcptr field ("fn As Function(...) As R" or "fn As <named funcptr type>"):
+                            // "paramtypes|rettype" signature; the field is an int handle holding a proc
+                            // entry PC. Empty if the field is not a function pointer. "obj.fn(args)" is an
+                            // indirect call through the loaded field value.
   end;
   TUDTType = record
     Name: string;
@@ -358,6 +362,7 @@ type
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
     procedure EmitUserFunctionCall(const Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
     function EmitFuncPtrCall(const FPName, Sig: string; ArgListNode: TASTNode): TSSAValue;  // FB function-pointer indirect call
+    function EmitIndirectCall(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;  // indirect call through an already-loaded entry-PC value
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
     function CanonicalType(const TypeName: string): string;   // resolve FB TYPE-alias chain to its base
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
@@ -367,6 +372,7 @@ type
                            out Slot: Integer; out ElemBank: TSSARegisterType;
                            out DimCount: Integer): Boolean;   // array member (obj.field(i,j))
     function UDTArrayElemType(UDTIdx: Integer; const FieldName: string): string;  // element UDT type of an array-of-UDT member (else '')
+    function UDTFuncPtrFieldSig(UDTIdx: Integer; const FieldName: string; out Slot: Integer): string;  // funcptr field signature + slot (else '')
     function UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;  // B1.5: field narrow width
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
@@ -3858,6 +3864,17 @@ begin
             end;
             EmitInstruction(OpCode, ArrayRef, Left, Right, MakeSSAValue(svkNone));
             Result := ArrayRef;
+            Exit;
+          end;
+          // UDT funcptr field call "obj.fn(args)": the field holds an int procedure entry PC. Load it and
+          // call indirectly with the field's recorded signature (like a funcptr variable, but the PC comes
+          // from a record slot rather than a variable register).
+          TempStr := UDTFuncPtrFieldSig(FindUDT(MethodOwnerType), VarToStr(Node.GetChild(0).Value), RecSlotK);
+          if (TempStr <> '') and ResolveRecordObject(MethodObjNode, Left, MethodOwnerType) then
+          begin
+            TempVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaRecordLoadInt, TempVal, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RecSlotK));
+            Result := EmitIndirectCall(TempVal, TempStr, Node.GetChild(1));
             Exit;
           end;
         end;
@@ -13850,6 +13867,24 @@ begin
       Exit(FUDTs[UDTIdx].Fields[i].ArrayElemType);
 end;
 
+function TSSAGenerator.UDTFuncPtrFieldSig(UDTIdx: Integer; const FieldName: string; out Slot: Integer): string;
+// The "paramtypes|rettype" signature of a funcptr field ("fn As Function(...) As R"), and its int Slot,
+// else ''. Lets "obj.fn(args)" be lowered as an indirect call through the loaded field value.
+var
+  i: Integer;
+  F: string;
+begin
+  Result := ''; Slot := 0;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if (FUDTs[UDTIdx].Fields[i].Name = F) and (FUDTs[UDTIdx].Fields[i].FuncPtrSig <> '') then
+    begin
+      Slot := FUDTs[UDTIdx].Fields[i].Slot;
+      Exit(FUDTs[UDTIdx].Fields[i].FuncPtrSig);
+    end;
+end;
+
 function TSSAGenerator.UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;
 // B1.5: the narrow width code of a field (0 = full width / not found).
 var
@@ -13995,7 +14030,7 @@ var
   FieldNode, TypeNode: TASTNode;
   Bank, ArrElemBank: TSSARegisterType;
   cInt, cFloat, cStr, ArrDims: Integer;
-  TypeName, FieldName, NestedT, PtrPointeeT, ArrElemType: string;
+  TypeName, FieldName, NestedT, PtrPointeeT, ArrElemType, FuncPtrSigVal: string;
   IsArrayField: Boolean;
 begin
   if (Idx < 0) or (Idx > High(FUDTs)) then Exit;
@@ -14051,6 +14086,20 @@ begin
       end
       else
         Bank := GetVariableType(FieldName);
+      // Function-pointer field: "fn As Function(...) As R" (inline, FUNCPTR attr from the parser) or
+      // "fn As <named funcptr type>" (FFuncPtrTypes). The field holds an int procedure entry PC;
+      // "obj.fn(args)" is lowered as an indirect call through the loaded field value (see FuncPtrSig).
+      FuncPtrSigVal := '';
+      if FieldNode.Attributes.Values['FUNCPTR'] = '1' then
+      begin
+        FuncPtrSigVal := FieldNode.Attributes.Values['FPPARAMS'] + '|' + FieldNode.Attributes.Values['FPRET'];
+        Bank := srtInt; NestedT := ''; PtrPointeeT := '';
+      end
+      else if (TypeName <> '') and (FFuncPtrTypes.IndexOfName(TypeName) >= 0) then
+      begin
+        FuncPtrSigVal := FFuncPtrTypes.Values[TypeName];
+        Bank := srtInt; NestedT := ''; PtrPointeeT := '';
+      end;
       // Array member (e.g. "Dim As Double m(Any, Any)"): the field itself is an int handle into the
       // global FArrays table (allocated per instance on REDIM); the element bank comes from the type.
       IsArrayField := FieldNode.Attributes.Values['ARRAYFIELD'] = '1';
@@ -14085,6 +14134,7 @@ begin
       FUDTs[Idx].Fields[n].ArrayElemBank := ArrElemBank;
       FUDTs[Idx].Fields[n].ArrayElemType := ArrElemType;
       FUDTs[Idx].Fields[n].ArrayDimCount := ArrDims;
+      FUDTs[Idx].Fields[n].FuncPtrSig := FuncPtrSigVal;
       // Fixed-size array member ("Dim data(100) As Integer"): the parser keeps the dimension list as an
       // antDimensions child. If every bound is concrete (not "Any", not ellipsis) record it so the member
       // is auto-sized at construction; an "Any" member has no concrete bound and waits for an explicit REDIM.
@@ -16745,12 +16795,18 @@ begin
 end;
 
 function TSSAGenerator.EmitFuncPtrCall(const FPName, Sig: string; ArgListNode: TASTNode): TSSAValue;
-// Lower an indirect call through a FreeBASIC function pointer: FPName is an int variable holding a
-// procedure entry PC (assigned from @func). Sig = "paramtypes|rettype" (paramtypes = comma list; ''
-// rettype = SUB). Arguments are staged into the transfer slots per the signature's parameter banks —
-// the SAME slot layout any function with that signature reads (see ParamBankAndSlot) — then
-// ssaCallSubIndirect jumps to the entry PC and the result is read from the result slot per the return
-// bank. v1: scalar params/return; shared-global sync-out only (no write-back of shared/BYREF args).
+// Indirect call through a funcptr VARIABLE: FPName holds a procedure entry PC (assigned from @func).
+begin
+  Result := EmitIndirectCall(EnsureIntRegister(GetOrAllocateVariable(FPName)), Sig, ArgListNode);
+end;
+
+function TSSAGenerator.EmitIndirectCall(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;
+// Lower an indirect call through a procedure entry PC already loaded into PCValIn (from a funcptr
+// variable, a UDT funcptr field, etc.). Sig = "paramtypes|rettype" (paramtypes = comma list; '' rettype =
+// SUB). Arguments are staged into the transfer slots per the signature's parameter banks — the SAME slot
+// layout any function with that signature reads (see ParamBankAndSlot) — then ssaCallSubIndirect jumps to
+// the entry PC and the result is read from the result slot per the return bank. v1: scalar params/return;
+// shared-global sync-out only (no write-back of shared/BYREF args).
 var
   ParamList: TStringList;
   Bar, i, NArgs, Slot, cInt, cFloat, cStr: Integer;
@@ -16758,6 +16814,7 @@ var
   RT, RetRT: TSSARegisterType;
   ArgVal, PCVal: TSSAValue;
 begin
+  PCVal := PCValIn;
   Bar := Pos('|', Sig);
   RetPart := Copy(Sig, Bar + 1, MaxInt);
   ParamList := TStringList.Create;
@@ -16788,7 +16845,7 @@ begin
   end;
   // The pointer value (entry PC) and the indirect call. FramePush/Pop preserve the caller's registers,
   // so the call stays inline (no block split): control resumes at the next instruction on return.
-  PCVal := EnsureIntRegister(GetOrAllocateVariable(FPName));
+  PCVal := EnsureIntRegister(PCVal);
   if not FInDispatcher then EmitSharedSyncOut;
   EmitInstruction(ssaCallSubIndirect, MakeSSAValue(svkNone), PCVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   // Read the result (FUNCTION); a SUB pointer used as a value yields int 0 harmlessly.
