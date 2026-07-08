@@ -146,6 +146,8 @@ type
                                             //   (paramtypes = comma list; rettype '' for SUB). A "name(args)" on such a
                                             //   var is an indirect call (ssaCallSubIndirect) through its entry-PC value.
     FModuleRecordVars: TStringList;      // V5b: "VARNAME|TYPENAME" of module-scope DIM'd UDTs (globals)
+    FModuleCtors: TStringList;           // FB module constructors (proc labels), in definition order
+    FModuleDtors: TStringList;           // FB module destructors (proc labels), in definition order
     FModuleDtorSlots: TStringList;        // V5e: module global var (UPPER) -> reserved int xfer slot (Objects[]=slot)
                                           //      holds its handle frame-independently so an END inside a SUB can
                                           //      still destroy it (its module register is saved/hidden by the frame).
@@ -271,6 +273,9 @@ type
     function TypeNeedsDestruction(const TypeName: string): Boolean;  // V5e: type (recursively) has a DESTRUCTOR
     procedure AssignModuleDtorSlots;                    // V5e: reserve an int xfer slot per destructor-bearing global
     procedure EmitModuleDestructors(UseSlots: Boolean = False);  // V5b/V5e: dtor calls for globals at program end
+    procedure CollectModuleCtorDtors(Node: TASTNode);  // FB module constructor/destructor procs
+    procedure EmitModuleConstructors;    // FB: call module constructors before module-level code
+    procedure EmitModuleProcDestructors; // FB: call module destructors at program end
                                                         //   UseSlots=True (END-in-proc): read handles from reserved slots
     function InnermostBlockFrameIdx: Integer;            // M8/FB: topmost skBlock frame index, or -1
     procedure BlockScopeEnter(IsLoopBody: Boolean = False);  // M8: open a block scope (loop/IF/SCOPE) (mark push)
@@ -285,6 +290,7 @@ type
     procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
     procedure CollectStaticMembers(Node: TASTNode);     // OOP: gather TYPE static member vars, back each with a shared global
     procedure EmitStaticMemberAllocs;                   // OOP: allocate the static members' backing arrays at program start
+    procedure EmitSharedScalarAllocs;                   // FB module ctors: pre-size every SHARED-scalar backing array before ctors run
     function StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;  // "TYPE.FIELD" backing name, or '' if not static
     procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
     // Refinement #2: cross-thread SHARED scalars backed by a 1-element global array.
@@ -646,6 +652,8 @@ begin
   FFuncPtrTypes := TStringList.Create;
   FFuncPtrTypes.CaseSensitive := False;
   FModuleRecordVars := TStringList.Create;
+  FModuleCtors := TStringList.Create;
+  FModuleDtors := TStringList.Create;
   FTypeAliases := TStringList.Create;
   FModuleDtorSlots := TStringList.Create;
   FModuleDtorSlots.CaseSensitive := False;
@@ -705,6 +713,8 @@ begin
   FFuncPtrSigs.Free;
   FFuncPtrTypes.Free;
   FModuleRecordVars.Free;
+  FModuleCtors.Free;
+  FModuleDtors.Free;
   FTypeAliases.Free;
   FModuleDtorSlots.Free;
   FSharedVars.Free;
@@ -5762,8 +5772,13 @@ begin
       begin
         ArrayIdx := PtrInt(FSharedScalarArr.Objects[FSharedScalarArr.IndexOf(UpperCase(ArrName))]);
         ArrayRef := MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType);
-        EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
-                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // When the program has module constructors, every SHARED-scalar backing was pre-sized in the entry
+        // block (EmitSharedScalarAllocs) so the ctors could touch globals. Re-sizing here would zero the
+        // value a ctor just wrote, so skip the DIM's re-allocation in that case (the "= expr" init below,
+        // if any, still applies).
+        if (FModuleCtors = nil) or (FModuleCtors.Count = 0) then
+          EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
+                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         RecUDTIdx := FindUDT(RecTypeName);
         if RecUDTIdx >= 0 then
         begin
@@ -14907,6 +14922,52 @@ begin
     CollectModuleRecordVars(Node.GetChild(c));   // recurse into nested blocks (IF/FOR/...), not procs
 end;
 
+procedure TSSAGenerator.CollectModuleCtorDtors(Node: TASTNode);
+// FreeBASIC module constructors/destructors: a top-level "SUB name [()] Constructor|Destructor" the
+// parser tagged with MODCTOR / MODDTOR. Record each procedure's label (definition order) so the module
+// prologue calls the constructors and the module epilogue calls the destructors. A module ctor/dtor is a
+// top-level SUB, so we do not descend into procedure bodies.
+var
+  c: Integer;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType = antProcedureDecl then
+  begin
+    if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+    begin
+      if Node.Attributes.Values['MODCTOR'] = '1' then
+        FModuleCtors.Add(VarToStr(Node.GetChild(0).Value))
+      else if Node.Attributes.Values['MODDTOR'] = '1' then
+        FModuleDtors.Add(VarToStr(Node.GetChild(0).Value));
+    end;
+    Exit;   // do not descend into the procedure body
+  end;
+  for c := 0 to Node.ChildCount - 1 do
+    CollectModuleCtorDtors(Node.GetChild(c));
+end;
+
+procedure TSSAGenerator.EmitModuleConstructors;
+// FreeBASIC: run each module constructor before module-level code, in definition order. (The optional
+// integer priority that orders multiple constructors is parsed but not yet honoured — rare in practice.)
+var
+  i: Integer;
+begin
+  if (FModuleCtors = nil) or (FModuleCtors.Count = 0) then Exit;
+  for i := 0 to FModuleCtors.Count - 1 do
+    EmitProcedureCall(FModuleCtors[i], nil);
+end;
+
+procedure TSSAGenerator.EmitModuleProcDestructors;
+// FreeBASIC: run each module destructor at program end, in reverse definition order (after the module's
+// global-UDT destructors).
+var
+  i: Integer;
+begin
+  if (FModuleDtors = nil) or (FModuleDtors.Count = 0) then Exit;
+  for i := FModuleDtors.Count - 1 downto 0 do
+    EmitProcedureCall(FModuleDtors[i], nil);
+end;
+
 function TSSAGenerator.TypeNeedsDestruction(const TypeName: string): Boolean;
 // V5e: True if TypeName — or, recursively, any of its nested-UDT members (and inherited members via
 // the prefix layout) — declares a DESTRUCTOR. Mirrors what EmitDestructorCall would actually emit, so
@@ -15329,6 +15390,26 @@ begin
   for i := 0 to FStaticMembers.Count - 1 do
   begin
     ai := PtrInt(FSharedScalarArr.Objects[FSharedScalarArr.IndexOf(FStaticMembers[i])]);
+    ArrayRef := MakeSSAArrayRef(ai, FProgram.GetArray(ai).ElementType);
+    EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+procedure TSSAGenerator.EmitSharedScalarAllocs;
+// FreeBASIC module constructors run before module-level code, but a SHARED scalar's 1-element backing
+// array is normally sized by its DIM SHARED statement (in the module body, i.e. AFTER the constructors).
+// A constructor that reads/writes such a global would hit an unsized array. Pre-size EVERY SHARED-scalar
+// backing here (in the entry block, before the ctor calls) so globals are usable from module ctors. Only
+// emitted when the program defines a module constructor — otherwise it is redundant with the DIM path.
+var
+  i, ai: Integer;
+  ArrayRef: TSSAValue;
+begin
+  if (FSharedScalarArr = nil) or (FModuleCtors = nil) or (FModuleCtors.Count = 0) then Exit;
+  for i := 0 to FSharedScalarArr.Count - 1 do
+  begin
+    ai := PtrInt(FSharedScalarArr.Objects[i]);
     ArrayRef := MakeSSAArrayRef(ai, FProgram.GetArray(ai).ElementType);
     EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -18308,6 +18389,7 @@ begin
         EmitModuleDestructors(False)
       else
         EmitModuleDestructors(True);
+      EmitModuleProcDestructors;   // FB: module destructors run on an explicit END too
       EmitInstruction(ssaEnd, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       // PHASE 3 TIER 3: END terminates the current block - no fall-through
@@ -18729,6 +18811,10 @@ begin
   // implicit fall-through halt can emit their destructor calls (in reverse construction order).
   FModuleRecordVars.Clear;
   CollectModuleRecordVars(AST);
+  // FreeBASIC module constructors/destructors (top-level "SUB name Constructor|Destructor").
+  FModuleCtors.Clear;
+  FModuleDtors.Clear;
+  CollectModuleCtorDtors(AST);
 
   // FreeBASIC DEFINT/DEFSTR...: collect default-type-by-initial BEFORE pre-allocating variables,
   // so a bare name gets its DEF bank (PreAllocateVariables binds via GetVariableType).
@@ -18770,6 +18856,12 @@ begin
   // to a top-level label cleans up the exited block scopes (see ProcessGoto).
   CollectTopLevelLabels(AST, 0);
 
+  // FreeBASIC module constructors: call them before any module-level code runs (in the entry block,
+  // after static-member allocation). No-op when the program defines none. Pre-size SHARED-scalar backings
+  // first so a constructor can touch module globals before their DIM statement runs.
+  EmitSharedScalarAllocs;
+  EmitModuleConstructors;
+
   // Process AST (DATA statements will be skipped since they're already processed).
   // SUB/FUNCTION declarations are collected (not lowered) during this walk.
   ProcessStatement(AST);
@@ -18789,6 +18881,7 @@ begin
       // after they are emitted. Globals' storage is not reclaimed (program is ending); only the
       // destructors' observable effects run. (An explicit `END` statement runs them via antEnd.)
       EmitModuleDestructors;
+      EmitModuleProcDestructors;   // FB: module destructors run at program end
       EmitInstruction(ssaEnd, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;

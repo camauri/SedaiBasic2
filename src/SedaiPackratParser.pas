@@ -2212,6 +2212,28 @@ begin
 
   Result.AddChild(ParamList);
 
+  // FreeBASIC module-level constructor/destructor: "Sub name [()] Constructor [priority]" runs before
+  // module-level code; "Destructor [priority]" runs after it (at program end). Only on a plain SUB (not a
+  // Type.method — MethodType = ''); the optional integer priority (101..65535) orders multiple ctors/dtors
+  // (lower = earlier for ctors). Marked on the node for the SSA to collect and call at program start/end.
+  if (Context.CurrentToken <> nil) and (MethodType = '') and
+     ((UpperCase(VarToStr(Context.CurrentToken.Value)) = kCONSTRUCTOR) or
+      (UpperCase(VarToStr(Context.CurrentToken.Value)) = kDESTRUCTOR)) then
+  begin
+    if UpperCase(VarToStr(Context.CurrentToken.Value)) = kCONSTRUCTOR then
+      Result.Attributes.Values['MODCTOR'] := '1'
+    else
+      Result.Attributes.Values['MODDTOR'] := '1';
+    Context.Advance;                                // consume Constructor / Destructor
+    // optional integer priority immediately after the keyword
+    if (Context.CurrentToken <> nil) and (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
+       (VarToStr(Context.CurrentToken.Value)[1] in ['0'..'9']) then
+    begin
+      Result.Attributes.Values['MODPRIORITY'] := VarToStr(Context.CurrentToken.Value);
+      Context.Advance;
+    end;
+  end;
+
   // FreeBASIC trailing procedure modifiers after the signature: "[Static] [Export]". STATIC makes ALL
   // local variables in the body persistent between calls (marked ALLSTATIC; the STATIC-locals lowering
   // treats each scalar local as static). EXPORT is accepted and ignored. Placed here (after the return
