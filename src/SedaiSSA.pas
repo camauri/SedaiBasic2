@@ -76,6 +76,8 @@ type
     IsArray: Boolean;       // array member (e.g. "Dim As Double m(Any, Any)"): the int slot holds an FArrays handle
     ArrayElemBank: TSSARegisterType;  // element bank of an array member (int/float/string)
     ArrayDimCount: Integer; // declared dimension count of an array member (>=1)
+    DefaultExpr: TASTNode;  // FreeBASIC field default "field AS T = expr" (nil if none); applied on every
+                            // instantiation before the constructor, overridden by aggregate "= (a,b,...)"
   end;
   TUDTType = record
     Name: string;
@@ -13899,6 +13901,13 @@ begin
       FUDTs[Idx].Fields[n].Name := UpperCase(FieldName);
       FUDTs[Idx].Fields[n].Bank := Bank;
       FUDTs[Idx].Fields[n].NestedType := NestedT;
+      // FreeBASIC field default "field AS T = expr": the parser attaches the expression as the last child
+      // and marks HASDEFAULT. Kept for EmitRecordInit to apply on each instantiation (not for array/nested
+      // members, which manage their own storage).
+      FUDTs[Idx].Fields[n].DefaultExpr := nil;
+      if (FieldNode.Attributes.Values['HASDEFAULT'] = '1') and (NestedT = '') and (not IsArrayField) and
+         (FieldNode.ChildCount >= 2) then
+        FUDTs[Idx].Fields[n].DefaultExpr := FieldNode.GetChild(FieldNode.ChildCount - 1);
       FUDTs[Idx].Fields[n].PtrPointee := PtrPointeeT;
       FUDTs[Idx].Fields[n].IsArray := IsArrayField;
       FUDTs[Idx].Fields[n].ArrayElemBank := ArrElemBank;
@@ -14419,7 +14428,7 @@ procedure TSSAGenerator.EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integ
 // field and link its handle into the parent's int slot (so a.b.c works without manual init).
 var
   i, NestedUDT: Integer;
-  NestedHandle: TSSAValue;
+  NestedHandle, DefVal: TSSAValue;
 begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
@@ -14436,6 +14445,22 @@ begin
       EmitConstructorCall(NestedHandle, FUDTs[NestedUDT].Name);  // M4.4: construct the nested member
       EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal,
                       NestedHandle, MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+    end;
+  // FreeBASIC field default values "field AS T = expr": store each into its slot. Runs after nested-UDT
+  // allocation and before any constructor (so a constructor can override), and is itself overridden by
+  // aggregate initialization "Dim v As T = (a, b, ...)" which stores over these slots afterwards.
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil then
+    begin
+      ProcessExpression(FUDTs[UDTIdx].Fields[i].DefaultExpr, DefVal);
+      case FUDTs[UDTIdx].Fields[i].Bank of
+        srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal,
+                     EnsureFloatRegister(DefVal), MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+        srtString: EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), HandleVal,
+                     EnsureStringRegister(DefVal), MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+      else         EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal,
+                     EnsureIntRegister(DefVal), MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+      end;
     end;
 end;
 

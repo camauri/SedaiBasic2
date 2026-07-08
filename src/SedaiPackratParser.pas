@@ -2790,7 +2790,7 @@ end;
 function TPackratParser.ParseRecordDecl(IsUnion: Boolean): TASTNode;
 var
   Token, NameTok, FieldTok: TLexerToken;
-  FieldNode, TypeNode, ArrDimNode: TASTNode;
+  FieldNode, TypeNode, ArrDimNode, FieldDefault: TASTNode;
   PrevIdx, NestedUnionDepth: Integer;
   FieldTypeName, TokU, AliasType: string;
   IsStaticField, LeadingType: Boolean;
@@ -3011,6 +3011,18 @@ begin
         FieldNode.Attributes.Values['ARRAYFIELD'] := '1';
         FieldNode.Attributes.Values['ARRAYDIMS'] := IntToStr(ArrDimNode.ChildCount);
         ArrDimNode.Free;
+      end
+      // FreeBASIC field default value: "field AS T = expr". Attach the expression as the last child and
+      // mark HASDEFAULT so the SSA applies it on every instantiation (array members take no default).
+      else if Context.Check(ttOpEq) then
+      begin
+        Context.Advance;                            // '='
+        FieldDefault := FExpressionParser.ParseExpression;
+        if Assigned(FieldDefault) then
+        begin
+          FieldNode.AddChild(FieldDefault);
+          FieldNode.Attributes.Values['HASDEFAULT'] := '1';
+        end;
       end;
       Result.AddChild(FieldNode);
       // FreeBASIC "As <type> a, b, c": the leading-AS type is shared by every comma-separated name
@@ -3040,6 +3052,16 @@ begin
             FieldNode.Attributes.Values['ARRAYFIELD'] := '1';
             FieldNode.Attributes.Values['ARRAYDIMS'] := IntToStr(ArrDimNode.ChildCount);
             ArrDimNode.Free;
+          end
+          else if Context.Check(ttOpEq) then        // "As T a, b = expr": per-name default value
+          begin
+            Context.Advance;                        // '='
+            FieldDefault := FExpressionParser.ParseExpression;
+            if Assigned(FieldDefault) then
+            begin
+              FieldNode.AddChild(FieldDefault);
+              FieldNode.Attributes.Values['HASDEFAULT'] := '1';
+            end;
           end;
           Result.AddChild(FieldNode);
         end;
