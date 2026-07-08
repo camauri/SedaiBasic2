@@ -4952,6 +4952,27 @@ begin
   // block and store the raw pointer (a RAWPTR_TAG byte offset) into p.
   if IsAllocCall(ExprNode, AllocFuncU) then
   begin
+    // Option B (raw-UDT-deref): when p is a pointer to a UDT ("Dim As T Ptr p = Callocate/Allocate(...)"),
+    // allocate a MANAGED record instance rather than a raw byte block, so "p->field" — which already
+    // lowers to managed record access via PointerUDTType — resolves against real storage. This is the
+    // FreeBASIC linked-list/tree idiom; the count/size arguments are ignored (one record, zero-initialized
+    // by EmitRecordInit). p is NOT marked raw (see CollectRawPtrVars), so it stays a managed handle. Scalar
+    // /byte pointees keep the raw byte-heap path below. REALLOCATE of a UDT pointer stays raw (rare).
+    LhsRecType := PointerUDTType(VarName);
+    if (LhsRecType <> '') and (AllocFuncU <> 'REALLOCATE') then
+    begin
+      FixedCap := FindUDT(LhsRecType);
+      ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      // Allocate in the SHARED record region (Immediate bit 48): its handle carries SHARED_REC_FLAG, so it
+      // is never 0 and honours the FB null-pointer convention ("While p <> 0"). It also persists past the
+      // current frame (heap lifetime, like Allocate), so a returned/linked node stays valid.
+      EmitInstruction(ssaRecordNew, ExprValue,
+                      MakeSSAConstInt(FUDTs[FixedCap].NInt), MakeSSAConstInt(FUDTs[FixedCap].NFloat),
+                      MakeSSAConstInt(FUDTs[FixedCap].NStr or (Int64(FixedCap) shl 32) or (Int64(1) shl 48)));
+      EmitRecordInit(ExprValue, FixedCap);
+      EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Exit;
+    end;
     EmitRawAlloc(ExprNode, ExprValue);
     EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
@@ -16101,6 +16122,11 @@ var
     FU, TU: string;
   begin
     if Rhs = nil then Exit;
+    // Option B: a pointer to a UDT allocated with Allocate/Callocate holds a MANAGED record handle, not a
+    // raw byte offset (ProcessAssignment allocates a record for it, "p->field" is managed access). So do
+    // NOT mark such a var raw — that would (wrongly) route p[i]/*p onto the byte heap. Scalar/byte pointees
+    // still go raw. (PointerUDTType reads FPointerVars, populated by CollectAddressTakenVars before this.)
+    if PointerUDTType(TargetU) <> '' then Exit;
     if IsAllocCall(Rhs, FU) then
       MarkRaw(TargetU)
     else if Rhs.NodeType = antCast then
