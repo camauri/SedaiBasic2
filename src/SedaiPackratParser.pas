@@ -2035,6 +2035,17 @@ begin
     while (not Context.Check(ttDelimParClose)) and (not Context.Check(ttEndOfFile)) and
           (not Context.Check(ttEndOfLine)) do
     begin
+      // QuickBASIC-style "OPTIONAL" keyword before a parameter. FreeBASIC has no such keyword — an
+      // optional parameter is expressed by giving a default directly ("name AS T = expr"), which is
+      // handled below. Skip a leading OPTIONAL so it is not mistaken for a bare (untyped) parameter
+      // named "OPTIONAL", which would shift every following argument by one slot. Only skip when it is
+      // followed by another name or a BYVAL/BYREF qualifier, so a parameter literally named "optional"
+      // ("optional AS T") is preserved.
+      if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'OPTIONAL') and
+         Assigned(Context.PeekNext) and
+         ((Context.PeekNext.TokenType = ttIdentifier) or (Context.PeekNext.TokenType = ttParamMode)) then
+        Context.Advance;                            // consume OPTIONAL keyword
+
       // Optional passing convention (V4): BYVAL (copy) or BYREF (alias, the default) before the
       // parameter name. Recorded on the param node as the 'BYVAL' attribute for the SSA prologue.
       ParamMode := '';
