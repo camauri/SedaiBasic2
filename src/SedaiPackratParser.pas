@@ -7905,7 +7905,9 @@ begin
     if Context.Check(ttIdentifier) then
     begin
       TypeName := UpperCase(ParseDottedName);         // element type
-      if Context.Check(ttOpMul) then                  // optional "PTR"-style suffix (rare for a const)
+      // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
+      while (Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR')) or
+            Context.Check(ttOpMul) do
       begin Context.Advance; TypeName := TypeName + ' PTR'; end;
     end;
     if not Context.Check(ttIdentifier) then
@@ -7952,7 +7954,9 @@ begin
     if Context.Check(ttIdentifier) then
     begin
       TypeName := UpperCase(ParseDottedName);         // element type
-      if Context.Check(ttOpMul) then                  // optional "PTR"-style suffix (rare for a const)
+      // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
+      while (Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR')) or
+            Context.Check(ttOpMul) do
       begin Context.Advance; TypeName := TypeName + ' PTR'; end;
     end;
     if not Context.Match(ttOpEq) then
