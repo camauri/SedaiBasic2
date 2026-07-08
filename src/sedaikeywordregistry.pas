@@ -2105,6 +2105,9 @@ begin
                       // COPY: the Commodore DOS "copy file" command (alias CP, already listed) — FreeBASIC
                       // has no COPY, and "copy" is a very common identifier (Dim As T copy = this).
                       kCOPY,
+                      // SAVE: the Commodore/immediate-mode "save program" command — FreeBASIC has no SAVE,
+                      // and "save" is a common identifier (Dim As Integer save = ...).
+                      kSAVE,
                       // CONT: the Commodore immediate-mode "resume execution" command — meaningless in
                       // FreeBASIC, where "cont" (short for counter) is a common variable name.
                       kCONT,
