@@ -107,6 +107,9 @@ single work, but distributing separate works together (aggregation) is permitted
 | `ranking_methods.bas`      | <https://rosettacode.org/wiki/Ranking_methods> |
 | `longest_string_challenge.bas` | <https://rosettacode.org/wiki/Longest_string_challenge> |
 | `ramsey_theorem.bas`       | <https://rosettacode.org/wiki/Ramsey%27s_theorem> |
+| `order_disjoint_list_items.bas` | <https://rosettacode.org/wiki/Order_disjoint_list_items> |
+| `integer_long_division.bas` | <https://rosettacode.org/wiki/Integer_long_division> |
+| `check_if_two_polygons_overlap.bas` | <https://rosettacode.org/wiki/Check_if_two_polygons_overlap> |
 
 ## Running
 
