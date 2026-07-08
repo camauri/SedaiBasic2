@@ -521,10 +521,10 @@ begin
         // Numeric -> string (FreeBASIC Str() / "&" concat): no leading sign-space, unlike v7 STR$.
         bcIntToString: begin Ctx.StringRegs[Instr.Dest] := IntToStr(IntRegs[Instr.Src1]); Inc(CurPC); end;
         bcFloatToString:
+          // FreeBASIC Str()/"&" concat: no leading sign-space AND no trailing field-space (FormatNumber
+          // adds both under the Commodore preset). Trim both, matching the ExecuteInstruction path.
           begin
-            Ctx.StringRegs[Instr.Dest] := FConsoleBehavior.FormatNumber(FloatRegs[Instr.Src1]);
-            if (Length(Ctx.StringRegs[Instr.Dest]) > 0) and (Ctx.StringRegs[Instr.Dest][1] = ' ') then
-              Delete(Ctx.StringRegs[Instr.Dest], 1, 1);
+            Ctx.StringRegs[Instr.Dest] := Trim(FConsoleBehavior.FormatNumber(FloatRegs[Instr.Src1]));
             Inc(CurPC);
           end;
         bcFloatRound: begin IntRegs[Instr.Dest] := Round(FloatRegs[Instr.Src1]); Inc(CurPC); end;  // CINT (round-to-even)
