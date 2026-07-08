@@ -8246,6 +8246,7 @@ var
   BinI: Int64;
   BinF: Double;
   BinLen: Longint;
+  BinWidth: Integer;   // binary PUT/GET element byte width (from the variable's declared type)
 begin
   { Group 6: File I/O operations (0x06xx)
     Opcodes:
@@ -8608,11 +8609,14 @@ begin
           raise Exception.Create('LINE INPUT# command not supported: no handler assigned');
       end;
 
-    19: // bcPutBinInt - PUT #n: write 8 bytes of an integer (Src1=handle, Src2=int value)
+    19: // bcPutBinInt - PUT #n: write the low Immediate bytes of an integer (Src1=handle, Src2=int value;
+        //   Immediate = byte width from the variable's declared type: BYTE=1, SHORT=2, LONG=4, else 8)
       begin
         HandleNum := Ctx.IntRegs[Instr.Src1];
         BinI := Ctx.IntRegs[Instr.Src2];
-        SetLength(Data, 8); Move(BinI, Data[1], 8);
+        BinWidth := Instr.Immediate;
+        if (BinWidth < 1) or (BinWidth > 8) then BinWidth := 8;   // default: full 64-bit integer
+        SetLength(Data, BinWidth); Move(BinI, Data[1], BinWidth);  // little-endian low bytes
         if Assigned(FOnFileData) then
         begin
           FOnFileData(Self, 'PUTBIN', HandleNum, Data, ErrorCode);
@@ -8634,13 +8638,18 @@ begin
         else raise Exception.Create('PUT command not supported: no handler assigned');
       end;
 
-    21: // bcGetBinInt - GET #n: read 8 bytes into an integer (Dest=int value, Src1=handle)
+    21: // bcGetBinInt - GET #n: read the variable's declared width into an integer (Dest=int value,
+        //   Src1=handle; Immediate = byte width: BYTE=1, SHORT=2, LONG=4, else 8). Value is zero-extended;
+        //   the destination variable's own width code applies sign-extension on later use if signed.
       begin
         HandleNum := Ctx.IntRegs[Instr.Src1];
+        BinWidth := Instr.Immediate;
+        if (BinWidth < 1) or (BinWidth > 8) then BinWidth := 8;
         if Assigned(FOnFileData) then
         begin
-          Data := '8'; FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
-          if Length(Data) >= 8 then Move(Data[1], BinI, 8) else BinI := 0;
+          Data := IntToStr(BinWidth); FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
+          BinI := 0;
+          if Length(Data) >= BinWidth then Move(Data[1], BinI, BinWidth);   // little-endian, zero-extended
           if Instr.Dest >= 0 then Ctx.IntRegs[Instr.Dest] := BinI;
         end
         else raise Exception.Create('GET command not supported: no handler assigned');

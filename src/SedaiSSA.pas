@@ -377,6 +377,7 @@ type
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
     function TypeNameWidthCode(const TypeName: string): Integer;        // B1.5 phase 2: type -> narrow code
+    function BinaryElemBytes(const VarName: string): Integer;           // byte width of a scalar for binary PUT/GET (from its width code)
     procedure RecordVarWidth(const VarName, TypeName: string);          // B1.5 phase 2: remember a var's width
     function ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;  // narrow by an explicit width code
     function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on scalar store
@@ -12156,7 +12157,9 @@ begin
     else if VarReg.RegType = srtString then
       EmitInstruction(ssaGetBinStr, VarReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
     else
-      EmitInstruction(ssaGetBinInt, VarReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // Read exactly the variable's declared width (BYTE=1, SHORT=2, LONG=4, else 8); Immediate = byte count.
+      EmitInstruction(ssaGetBinInt, VarReg, HandleReg, MakeSSAValue(svkNone),
+                      MakeSSAConstInt(BinaryElemBytes(string(VarChild.Value))));
     Exit;
   end;
 
@@ -12431,7 +12434,11 @@ begin
       else if (ExprVal.Kind = svkConstString) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtString)) then
         EmitInstruction(ssaPutBinStr, MakeSSAValue(svkNone), HandleReg, EnsureStringRegister(ExprVal), MakeSSAValue(svkNone))
       else
-        EmitInstruction(ssaPutBinInt, MakeSSAValue(svkNone), HandleReg, EnsureIntRegister(ExprVal), MakeSSAValue(svkNone));
+        // Write exactly the value's declared width when it is a simple variable (BYTE=1, SHORT=2, LONG=4,
+        // else 8); a non-variable expression's name is not in the width map, so it defaults to 8.
+        // Immediate = byte count.
+        EmitInstruction(ssaPutBinInt, MakeSSAValue(svkNone), HandleReg, EnsureIntRegister(ExprVal),
+                        MakeSSAConstInt(BinaryElemBytes(VarToStr(Node.GetChild(1).Value))));
     end;
     Exit;
   end;
@@ -13688,6 +13695,24 @@ begin
   else if T = 'LONG' then Result := 5
   else if T = 'ULONG' then Result := 6
   else Result := 0;
+end;
+
+function TSSAGenerator.BinaryElemBytes(const VarName: string): Integer;
+// Byte width of a scalar variable for binary PUT/GET #n, from its narrow width code: Byte/UByte=1,
+// Short/UShort=2, Long/ULong=4; Integer/LongInt (and unknown) default to 8. Lets "Put #f, p, b" of a
+// BYTE write exactly one byte (and GET read one), instead of always 8 (which read neighbouring bytes).
+var
+  W, idx: Integer;
+begin
+  W := 0;
+  idx := FVarWidthCode.IndexOf(UpperCase(VarName));
+  if idx >= 0 then W := PtrInt(FVarWidthCode.Objects[idx]);
+  case W of
+    1, 2: Result := 1;
+    3, 4: Result := 2;
+    5, 6: Result := 4;
+  else   Result := 8;
+  end;
 end;
 
 procedure TSSAGenerator.RecordVarWidth(const VarName, TypeName: string);
