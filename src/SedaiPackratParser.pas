@@ -3532,6 +3532,13 @@ begin
   Result := TASTNode.Create(antGoto, Token);
   Context.Advance; // Consume GOTO
 
+  // CBM BASIC v7 accepts the two-word form "GO TO": the "GO" keyword (kGO_TO)
+  // is followed by a separate "TO" token which must be consumed here before the
+  // line-number target, otherwise ParseExpression chokes on "TO".
+  if (UpperCase(Token.Value) = kGO_TO) and Assigned(Context.CurrentToken) and
+     (UpperCase(Context.CurrentToken.Value) = kTO) then
+    Context.Advance; // Consume TO
+
   Target := ParseExpression;
   if Assigned(Target) then
     Result.AddChild(Target);
@@ -3994,6 +4001,11 @@ begin
   JumpToken := Context.CurrentToken;
   IsGosub := (JumpToken.TokenType = ttJumpGosub);
   Context.Advance; // Consume GOTO/GOSUB
+
+  // Two-word "GO TO" form: consume the trailing TO after the GO keyword.
+  if (UpperCase(JumpToken.Value) = kGO_TO) and Assigned(Context.CurrentToken) and
+     (UpperCase(Context.CurrentToken.Value) = kTO) then
+    Context.Advance; // Consume TO
 
   // Create appropriate node type
   if IsGosub then
