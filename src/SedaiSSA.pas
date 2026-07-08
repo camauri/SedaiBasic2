@@ -16735,8 +16735,10 @@ begin
                     MakeSSAConstInt(FUDTs[UDTIdx].NStr or (Int64(UDTIdx) shl 32)));
     EmitRecordInit(RcHandle, UDTIdx);                 // allocate nested-UDT members (no ctor calls)
     StageCallArgs(Name, ArgsNode);                    // evaluate args first (inner calls finish)
+    EmitArrayArgBinds(Name, ArgsNode, True);          // array params: alias each to the caller's array (as EmitProcedureCall)
     EmitXferStore(srtInt, XFER_RESULT_HANDLE_SLOT, RcHandle);
     EmitCallSubLabel(ProcedureLabelName(Name));
+    EmitArrayArgBinds(Name, ArgsNode, False);         // restore the aliased array slots after the call returns
     EmitByrefWriteback(Name, ArgsNode);   // BYREF: copy explicit-BYREF scalar params back into variable args
     Result := RcHandle;
   end
