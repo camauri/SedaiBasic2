@@ -2102,6 +2102,9 @@ begin
                       // Commodore DOS directory shortcuts (FB uses MKDIR/CHDIR/RMDIR; DIR is an FB
                       // function so it stays reserved). Common variable names in real FB code (md, cd).
                       kMD, kCD, kRD, kCP,
+                      // COPY: the Commodore DOS "copy file" command (alias CP, already listed) — FreeBASIC
+                      // has no COPY, and "copy" is a very common identifier (Dim As T copy = this).
+                      kCOPY,
                       // CONT: the Commodore immediate-mode "resume execution" command — meaningless in
                       // FreeBASIC, where "cont" (short for counter) is a common variable name.
                       kCONT,
