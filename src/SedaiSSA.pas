@@ -76,6 +76,9 @@ type
     IsArray: Boolean;       // array member (e.g. "Dim As Double m(Any, Any)"): the int slot holds an FArrays handle
     ArrayElemBank: TSSARegisterType;  // element bank of an array member (int/float/string)
     ArrayDimCount: Integer; // declared dimension count of an array member (>=1)
+    ArrayBounds: TASTNode;  // antDimensions with concrete upper bounds for a FIXED-size array member
+                            // ("Dim data(100) As Integer"); nil for an "Any" member (sized by REDIM).
+                            // The SSA auto-sizes the member at construction from these bounds.
     DefaultExpr: TASTNode;  // FreeBASIC field default "field AS T = expr" (nil if none); applied on every
                             // instantiation before the constructor, overridden by aggregate "= (a,b,...)"
   end;
@@ -13844,6 +13847,33 @@ begin
     CollectUDTNames(Node.GetChild(i));
 end;
 
+function ConcreteArrayBounds(FieldNode: TASTNode): TASTNode;
+// Return the antDimensions child of an array-member field node IF every dimension has a concrete upper
+// bound (i.e. the member has a fixed size like "data(100)" or "buf(1 To 8)"). Return nil if any dimension
+// is "Any" (an unspecified, REDIM-sized member) or an ellipsis, or if no dimension list was kept.
+var
+  i, k: Integer;
+  Dims, Dim: TASTNode;
+begin
+  Result := nil;
+  if FieldNode = nil then Exit;
+  Dims := nil;
+  for i := 0 to FieldNode.ChildCount - 1 do
+    if FieldNode.GetChild(i).NodeType = antDimensions then
+    begin Dims := FieldNode.GetChild(i); Break; end;
+  if (Dims = nil) or (Dims.ChildCount < 1) then Exit;
+  for k := 0 to Dims.ChildCount - 1 do
+  begin
+    Dim := Dims.GetChild(k);
+    if Dim.Attributes.Values['ELLIPSIS'] = '1' then Exit;   // "(...)" deduced bound: not fixed
+    // A bare "Any" dimension parses as an identifier; the upper bound of a range is child 1.
+    if (Dim.NodeType = antIdentifier) and (UpperCase(VarToStr(Dim.Value)) = 'ANY') then Exit;
+    if (Dim.NodeType = antDimRange) and (Dim.ChildCount >= 2) and
+       (Dim.GetChild(1).NodeType = antIdentifier) and (UpperCase(VarToStr(Dim.GetChild(1).Value)) = 'ANY') then Exit;
+  end;
+  Result := Dims;
+end;
+
 procedure TSSAGenerator.FillOneUDT(Idx: Integer);
 // Resolve one type's field layout. With EXTENDS, the parent is filled first and its fields are
 // copied at the same (bank, slot); the child's own fields are appended (prefix layout), so code
@@ -13938,6 +13968,12 @@ begin
       FUDTs[Idx].Fields[n].IsArray := IsArrayField;
       FUDTs[Idx].Fields[n].ArrayElemBank := ArrElemBank;
       FUDTs[Idx].Fields[n].ArrayDimCount := ArrDims;
+      // Fixed-size array member ("Dim data(100) As Integer"): the parser keeps the dimension list as an
+      // antDimensions child. If every bound is concrete (not "Any", not ellipsis) record it so the member
+      // is auto-sized at construction; an "Any" member has no concrete bound and waits for an explicit REDIM.
+      FUDTs[Idx].Fields[n].ArrayBounds := nil;
+      if IsArrayField then
+        FUDTs[Idx].Fields[n].ArrayBounds := ConcreteArrayBounds(FieldNode);
       FUDTs[Idx].Fields[n].IsWString := (TypeName = 'WSTRING');  // codepoint LEN/MID on obj.field
       if NestedT = '' then
         FUDTs[Idx].Fields[n].WidthCode := TypeNameWidthCode(TypeName)  // B1.5: narrow field on store
@@ -14453,8 +14489,9 @@ procedure TSSAGenerator.EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integ
 // After a record instance is allocated, recursively allocate one instance for each nested-UDT
 // field and link its handle into the parent's int slot (so a.b.c works without manual init).
 var
-  i, NestedUDT: Integer;
+  i, di, NestedUDT: Integer;
   NestedHandle, DefVal: TSSAValue;
+  DimsN, UbExpr: TASTNode;
 begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
@@ -14471,6 +14508,25 @@ begin
       EmitConstructorCall(NestedHandle, FUDTs[NestedUDT].Name);  // M4.4: construct the nested member
       EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal,
                       NestedHandle, MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+    end;
+  // Fixed-size array members ("Dim data(100) As Integer"): allocate and size the member's FArrays entry
+  // at construction (an "Any" member has no concrete bound and is left for an explicit REDIM). Mirrors the
+  // "Redim this.member(...)" lowering: push each upper bound, then a member REDIM (preserve = 0, fresh).
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if (FUDTs[UDTIdx].Fields[i].IsArray) and (FUDTs[UDTIdx].Fields[i].ArrayBounds <> nil) then
+    begin
+      DimsN := FUDTs[UDTIdx].Fields[i].ArrayBounds;
+      for di := 0 to DimsN.ChildCount - 1 do
+      begin
+        if DimsN.GetChild(di).NodeType = antDimRange then UbExpr := DimsN.GetChild(di).GetChild(1)
+        else UbExpr := DimsN.GetChild(di);
+        ProcessExpression(UbExpr, DefVal);
+        EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), EnsureIntRegister(DefVal),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+      EmitInstruction(ssaMemberArrayRedim, MakeSSAValue(svkNone), HandleVal, MakeSSAValue(svkNone),
+                      MakeSSAConstInt((Int64(FUDTs[UDTIdx].Fields[i].Slot) shl 8) or
+                                      (Int64(Ord(FUDTs[UDTIdx].Fields[i].ArrayElemBank)) shl 4)));
     end;
   // FreeBASIC field default values "field AS T = expr": store each into its slot. Runs after nested-UDT
   // allocation and before any constructor (so a constructor can override), and is itself overridden by

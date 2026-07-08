@@ -3010,7 +3010,9 @@ begin
       begin
         FieldNode.Attributes.Values['ARRAYFIELD'] := '1';
         FieldNode.Attributes.Values['ARRAYDIMS'] := IntToStr(ArrDimNode.ChildCount);
-        ArrDimNode.Free;
+        // Keep the dimension list (the SSA auto-sizes a fixed-bound member at construction; an "Any"
+        // member has no concrete bound and is left for an explicit REDIM).
+        FieldNode.AddChild(ArrDimNode);
       end
       // FreeBASIC field default value: "field AS T = expr". Attach the expression as the last child and
       // mark HASDEFAULT so the SSA applies it on every instantiation (array members take no default).
@@ -3051,7 +3053,7 @@ begin
           begin
             FieldNode.Attributes.Values['ARRAYFIELD'] := '1';
             FieldNode.Attributes.Values['ARRAYDIMS'] := IntToStr(ArrDimNode.ChildCount);
-            ArrDimNode.Free;
+            FieldNode.AddChild(ArrDimNode);         // keep dims for construction-time auto-sizing
           end
           else if Context.Check(ttOpEq) then        // "As T a, b = expr": per-name default value
           begin
