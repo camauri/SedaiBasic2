@@ -4006,6 +4006,22 @@ begin
           Exit;
         end;
 
+        // FreeBASIC CStr(x): value-to-string conversion. A string argument passes through unchanged (Str$
+        // would treat it as a number and yield "0"); a numeric one is formatted like Str() — no leading
+        // space. MODERN, parenthesised call, not a declared array.
+        if FModernMode and (UpperCase(ArrName) = 'CSTR') and (ArrayIndexOf(ArrName) < 0) and
+           (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          if InferExprBank(Node.GetChild(1).GetChild(0)) = srtString then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), Result);
+            Result := EnsureStringRegister(Result);
+          end
+          else
+            EmitBareStringFunc(kSTRS, Node, Result);
+          Exit;
+        end;
+
         // FreeBASIC bare string functions: CHR/STR/LEFT/RIGHT are the canonical FB names for the
         // $-suffixed functions. MODERN, parenthesised call, not a declared array.
         if FModernMode and (ArrayIndexOf(ArrName) < 0) then
@@ -6471,7 +6487,8 @@ function TSSAGenerator.InferExprBank(Node: TASTNode): TSSARegisterType;
               (Nm = 'UCASE') or (Nm = 'LCASE') or (Nm = 'STR') or (Nm = 'CHR') or
               (Nm = 'HEX') or (Nm = 'OCT') or (Nm = 'BIN') or (Nm = 'WSTR') or
               (Nm = 'WCHR') or (Nm = 'WSPACE') or (Nm = 'FORMAT') or (Nm = 'DATE') or
-              (Nm = 'TIME') or (Nm = 'ENVIRON') or (Nm = 'COMMAND') or (Nm = 'INKEY');
+              (Nm = 'TIME') or (Nm = 'ENVIRON') or (Nm = 'COMMAND') or (Nm = 'INKEY') or
+              (Nm = 'CSTR');
   end;
 var
   Nm: string;
