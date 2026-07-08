@@ -3003,8 +3003,12 @@ begin
         else if (FuncName = 'CINT') or (FuncName = 'CLNG') or (FuncName = 'CLNGINT') or
                 (FuncName = kCULNGINT) or
                 (FuncName = 'CSHORT') or (FuncName = 'CBYTE') or (FuncName = 'CUBYTE') or
-                (FuncName = 'CUSHORT') or (FuncName = 'CUINT') or (FuncName = 'CULNG') then
+                (FuncName = 'CUSHORT') or (FuncName = 'CUINT') or (FuncName = 'CULNG') or
+                (FuncName = kCSIGN) or (FuncName = kCUNSG) then
         begin
+          // CSIGN/CUNSG reinterpret the signedness at the source width without narrowing (full 64-bit
+          // here): CSIGN is a signed pass-through, CUNSG yields an unsigned-64 value (its unsignedness is
+          // recognised by IsUnsigned64Expr, driving unsigned compare/div/mod/print).
           // FreeBASIC integer conversion functions: round-to-nearest (banker's rounding)
           // toward an integer result, then wrap/sign-extend to the type's width (B1.5).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
@@ -16673,7 +16677,7 @@ begin
           U := UpperCase(VarToStr(Node.GetChild(0).Value))
         else
           U := '';
-        Result := (U = 'CUINT') or (U = 'CULNGINT');
+        Result := (U = 'CUINT') or (U = 'CULNGINT') or (U = kCUNSG);
         if not Result and (U <> '') then
         begin
           Idx := FVarPrintKind.IndexOf(U);

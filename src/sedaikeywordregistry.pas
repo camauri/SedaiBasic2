@@ -2000,6 +2000,8 @@ begin
  RegisterKeyword(kCUSHORT, ttMathFunction, 'Convert to UShort, rounding to nearest',                 kcMathFunctions);
  RegisterKeyword(kCUINT,   ttMathFunction, 'Convert to UInteger, rounding to nearest',               kcMathFunctions);
  RegisterKeyword(kCULNG,   ttMathFunction, 'Convert to ULong, rounding to nearest',                  kcMathFunctions);
+ RegisterKeyword(kCSIGN,   ttMathFunction, 'Reinterpret a numeric value as signed (same width)',     kcMathFunctions);
+ RegisterKeyword(kCUNSG,   ttMathFunction, 'Reinterpret a numeric value as unsigned (same width)',   kcMathFunctions);
  RegisterKeyword(kCDBL,    ttMathFunction, 'Convert to Double-precision float',                      kcMathFunctions);
  RegisterKeyword(kCSNG,    ttMathFunction, 'Convert to Single-precision float',                      kcMathFunctions);
  RegisterKeyword(kVALINT,  ttMathFunction, 'Parse leading integer from a string',                    kcMathFunctions);

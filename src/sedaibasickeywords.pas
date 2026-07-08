@@ -319,6 +319,8 @@ const
   kCUSHORT = 'CUSHORT';   // round to UShort
   kCUINT   = 'CUINT';     // round to UInteger
   kCULNG   = 'CULNG';     // round to ULong
+  kCSIGN   = 'CSIGN';     // reinterpret as a signed value (same width)
+  kCUNSG   = 'CUNSG';     // reinterpret as an unsigned value (same width)
   kCDBL    = 'CDBL';      // convert to Double
   kCSNG    = 'CSNG';      // convert to Single
   kOCT     = 'OCT';       // integer -> octal string
