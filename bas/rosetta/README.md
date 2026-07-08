@@ -110,6 +110,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `order_disjoint_list_items.bas` | <https://rosettacode.org/wiki/Order_disjoint_list_items> |
 | `integer_long_division.bas` | <https://rosettacode.org/wiki/Integer_long_division> |
 | `check_if_two_polygons_overlap.bas` | <https://rosettacode.org/wiki/Check_if_two_polygons_overlap> |
+| `dijkstras_algorithm.bas` | <https://rosettacode.org/wiki/Dijkstra%27s_algorithm> |
 
 ## Running
 
