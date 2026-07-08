@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 521 / 643 implemented (81%)**. **66** of the unimplemented
+**FreeBASIC keyword set — 523 / 643 implemented (81%)**. **66** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, FFI) — not runnable keywords for a portable bytecode VM. Of the
-**577 applicable** keywords, **521 (90%)** are implemented. See the
+**577 applicable** keywords, **523 (91%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -344,7 +344,7 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `TEMPO` | ✓ | Define the speed of the song being played (TEMPO n, 1-255) |
 | `VOL` | ✓ | Define output level of sound (VOL n, 0-15) |
 
-## Math Functions (28/28 - 100%)
+## Math Functions (30/30 - 100%)
 
 | Function | Status | Description |
 |----------|--------|-------------|
@@ -359,6 +359,8 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `COS` | ✓ | Return cosine of angle of x radians |
 | `EXP` | ✓ | Return value of e raised to the power x |
 | `INT` | ✓ | Convert float number to integer |
+| `FLOOR` | ✓ | Round toward -infinity (= `INT`); returns a Double (compat extension) |
+| `CEIL` | ✓ | Round toward +infinity (`-INT(-x)`); returns a Double (compat extension) |
 | `LN` | ✓ | Return natural log of x |
 | `LOG` | ✓ | Return natural log of x |
 | `LOG10` | ✓ | Return base 10 log of x |
@@ -377,7 +379,7 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `ATANH` | ✓ | Inverse hyperbolic tangent, domain \|x\| < 1 |
 | `VAL` | ✓ | Return the numeric value of a number string |
 
-## Type Conversion Functions (FreeBASIC) (11/11 - 100%)
+## Type Conversion Functions (FreeBASIC) (14/14 - 100%)
 
 | Function | Status | Description |
 |----------|--------|-------------|
@@ -392,6 +394,9 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `CULNG` | ✓ | Convert to ULong, rounding to nearest |
 | `CDBL` | ✓ | Convert to Double-precision float |
 | `CSNG` | ✓ | Convert to Single-precision float |
+| `CSIGN` | ✓ | Reinterpret signedness → signed value (same width; full 64-bit here) |
+| `CUNSG` | ✓ | Reinterpret signedness → unsigned value (drives unsigned compare/divide/mod/print) |
+| `CSTR` | ✓ | Value → string: numeric like `Str` (no leading space), string passthrough (compat extension) |
 
 Note: integer conversions round-to-nearest with ties-to-even (banker's rounding),
 matching FreeBASIC's `CINT` family — distinct from `INT` (floor) and the implicit
@@ -1279,9 +1284,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **485 / 643 implemented (75%)**, plus 1 partial (◐).
-> Of the 157 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **471 / 572 ≈ 82% of the
+> **Coverage (FreeBASIC keyword set):** **487 / 643 implemented (76%)**, plus 1 partial (◐).
+> Of the 155 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **473 / 572 ≈ 83% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -1313,7 +1318,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `ENUM...END ENUM` | ✓ | Named integer constants (auto-increment) |
-| `TYPE...END TYPE` | ✓ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR` (overloaded by arity & type, default args, `BASE`). `PROPERTY` getter/setter, `OPERATOR` overloading. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope/block/global RAII. Heap instances via `NEW T`/`DELETE` reachable through `T PTR` (linked lists/trees). `EXTENDS Object` RTTI + `IS`. Static member methods & variables. Explicit `DECLARE [VIRTUAL\|ABSTRACT\|STATIC]` and `OVERRIDE` accepted (virtual dispatch is automatic via runtime type-id). |
+| `TYPE...END TYPE` | ✓ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR` (overloaded by arity & type, default args, `BASE`). `PROPERTY` getter/setter, `OPERATOR` overloading. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope/block/global RAII. Heap instances via `NEW T`/`DELETE` reachable through `T PTR` (linked lists/trees). `EXTENDS Object` RTTI + `IS`. Static member methods & variables. Explicit `DECLARE [VIRTUAL\|ABSTRACT\|STATIC]` and `OVERRIDE` accepted (virtual dispatch is automatic via runtime type-id). Field default values (`x AS Integer = 10`, applied on every scalar/nested instantiation, overridden by aggregate init). Fixed-size array members (`DIM data(100) AS Integer`) are auto-sized at construction; `Any` members size via `REDIM`. `OPERATOR` overloads dispatch with a non-UDT right operand (`vec * scalar`). |
 | `CLASS...END CLASS` | ✓ | Modelled as a `TYPE` (member access control is not enforced): fields, methods, arrays, construction all behave as for a record. |
 | `UNION...END UNION` | ✓ | Record whose members share storage. Overlap is faithful within a bank — members of the same type alias the same slot (write one, read another of the same type). Members in different banks (int/float/string) occupy distinct slots; cross-bank byte reinterpretation is not modelled (slot-based record model, v1). |
 | `EXTENDS` | ✓ | Single inheritance `TYPE Child EXTENDS Parent`: inherited fields (prefix layout) + methods + reference polymorphism (M4.2); virtual dispatch — an overridden method is selected by the instance's runtime type even through a base-typed variable (M4.3); inherited/ chained constructors & destructors (M4.4). |
@@ -1430,8 +1435,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `CLNG and CULNG` | ✓ | Converts to 32-bit values with width wrap/sign-extend (B1.3/B1.5). |
 | `CINT and CUINT` | ✓ | Converts to 64-bit values (platform Integer width here) (B1.3). |
 | `CLNGINT and CULNGINT` | ✓ | `CLNGINT`/`CULNGINT` — round to a 64-bit signed/unsigned integer (full width). |
-| `CSIGN` | ✗ | Converts a numeric expression to a signed-type value. |
-| `CUNSG` | ✗ | Converts a numeric expression to an unsigned-type value. |
+| `CSIGN` | ✓ | Reinterprets a value's signedness (signed pass-through at the source width; full 64-bit here). |
+| `CUNSG` | ✓ | Reinterprets a value as unsigned; the result drives unsigned compare/divide/mod/print (`IsUnsigned64Expr`). |
 
 ##### Conversions to floating-point types
 
