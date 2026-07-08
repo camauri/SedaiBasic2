@@ -8,10 +8,10 @@
 [█████████████████████████████████████████████····] 90%
 ```
 
-**FreeBASIC keyword set — 523 / 643 implemented (81%)**. **66** of the unimplemented
+**FreeBASIC keyword set — 525 / 643 implemented (82%)**. **66** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, FFI) — not runnable keywords for a portable bytecode VM. Of the
-**577 applicable** keywords, **523 (91%)** are implemented. See the
+**577 applicable** keywords, **525 (91%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1284,9 +1284,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **487 / 643 implemented (76%)**, plus 1 partial (◐).
-> Of the 155 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **473 / 572 ≈ 83% of the
+> **Coverage (FreeBASIC keyword set):** **489 / 643 implemented (76%)**, plus 1 partial (◐).
+> Of the 153 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **475 / 572 ≈ 83% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -1689,8 +1689,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Constructor (Module)` | ✗ | Indicates a procedure is to be executed before module-level code. |
-| `Destructor (Module)` | ✗ | Indicates a procedure is to be executed after module-level code. |
+| `Constructor (Module)` | ✓ | `Sub name [()] Constructor [priority]` runs before module-level code (definition order); a ctor may initialise SHARED globals. Priority parsed but not yet ordering. |
+| `Destructor (Module)` | ✓ | `Sub name [()] Destructor [priority]` runs after module-level code (reverse order), on fall-through and explicit `END`. |
 
 ##### Miscellaneous
 
