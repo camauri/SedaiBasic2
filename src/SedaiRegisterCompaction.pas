@@ -770,6 +770,8 @@ begin
     // === GROUP 4: I/O operations ===
     bcPrintString, bcPrintStringLn,
     bcPrintUsing,  // PRINT USING - Src1 = format string
+    bcPrintUsingStage,  // stage a stringified value - Src1 = string
+    bcPrintUsingRun,    // runtime PRINT USING - Src1 = format string
     // === GROUP 5: Special variables ===
     bcStoreTIS,  // TI$ = value - reads string from Src1
     // === GROUP 6: Sound operations ===

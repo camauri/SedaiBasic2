@@ -344,7 +344,7 @@ begin
     ssaPrintEnd,  // Reset reverse mode - affects display state
     ssaInput, ssaInputInt, ssaInputFloat, ssaInputString,
     ssaGet, ssaGetkey,  // GET/GETKEY wait for input - side effects!
-    ssaPrintUsing, ssaPudef:
+    ssaPrintUsing, ssaPrintUsingStage, ssaPrintUsingRun, ssaPudef:
       Result := True;
 
     // DATA/READ/RESTORE - always live (affects DATA pool state)

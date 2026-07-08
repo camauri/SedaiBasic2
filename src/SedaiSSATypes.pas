@@ -320,6 +320,8 @@ type
     ssaGetkey,         // GETKEY A$ (blocking character input)
     // Formatted output
     ssaPrintUsing,     // PRINT USING format$; values
+    ssaPrintUsingStage,// stage one already-stringified value for a runtime-format PRINT USING (Src1=string)
+    ssaPrintUsingRun,  // run a runtime-format PRINT USING over the staged values (Src1=format string)
     ssaPudef,          // PUDEF format string (redefine PRINT USING symbols)
     ssaChar,           // CHAR mode, col, row, text [,reverse]
     // File operations

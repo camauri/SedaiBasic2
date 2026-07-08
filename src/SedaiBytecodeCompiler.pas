@@ -481,6 +481,8 @@ begin
     ssaGetkey: Result := bcGetkey;
     // Formatted output
     ssaPrintUsing: Result := bcPrintUsing;
+    ssaPrintUsingStage: Result := bcPrintUsingStage;
+    ssaPrintUsingRun: Result := bcPrintUsingRun;
     ssaPudef: Result := bcPudef;
     ssaChar: Result := bcChar;
     // File operations
@@ -1777,6 +1779,20 @@ begin
     // Src2 = value register
     if Instr.Src2.Kind = svkRegister then
       BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // Runtime-format PRINT USING: stage a stringified value / run over the staged values. Src1 is a
+  // string register in both cases (the value already converted to a string, or the format string).
+  if (Instr.OpCode = ssaPrintUsingStage) or (Instr.OpCode = ssaPrintUsingRun) then
+  begin
+    if Instr.OpCode = ssaPrintUsingStage then
+      BCInstr := MakeBytecodeInstruction(bcPrintUsingStage, 0, 0, 0, 0)
+    else
+      BCInstr := MakeBytecodeInstruction(bcPrintUsingRun, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;

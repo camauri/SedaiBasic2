@@ -989,7 +989,7 @@ begin
           end;
 
         // Input/Output commands - fall back to slow path
-        bcGet, bcGetkey, bcPrintUsing, bcPudef, bcChar,
+        bcGet, bcGetkey, bcPrintUsing, bcPrintUsingStage, bcPrintUsingRun, bcPudef, bcChar,
         // ASSERT may halt the program (its slow-path handler clears Ctx.Running), so check it here too.
         bcAssert:
           begin

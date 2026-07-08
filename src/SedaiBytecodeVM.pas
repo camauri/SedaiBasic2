@@ -202,6 +202,8 @@ type
     FPudefComma: Char;
     FPudefDecimal: Char;
     FPudefDollar: Char;
+    // Staged (already-stringified) values for a runtime-format PRINT USING (bcPrintUsingStage/Run).
+    FPUStage: array of string;
     // File command callback (LOAD, SAVE from program)
     FOnFileCommand: TFileCommandEvent;
     // Disk file I/O callback (DOPEN, DCLOSE, etc.)
@@ -351,6 +353,7 @@ type
     procedure RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
     procedure CheckFloatValid(Ctx: TExecutionContext; RegIndex: Integer; const OpName: string);
     function FormatUsingString(const FormatStr: string; Value: Double): string;
+    function FormatUsingRuntime(const FormatStr: string): string;   // walk a runtime format over FPUStage
     // M5.1: per-context accessors for the read-only PC/Running/Stopped/LastError* properties.
     function GetPC: Integer;
     function GetRunning: Boolean;
@@ -1068,6 +1071,94 @@ begin
     // Fixed dollar at start
     Result := DollarChar + Result;
   end;
+end;
+
+function TBytecodeVM.FormatUsingRuntime(const FormatStr: string): string;
+// Interpret a RUNTIME PRINT USING format string over the staged values (FPUStage), mirroring the
+// compile-time field engine in ProcessPrintUsing: a "\...\" fixed-width string field, "&" variable-width
+// string field, "!" one-character field, a run of #/./,/$/+/-/^ numeric field, and literal text; the
+// format is RECYCLED when more values than fields are given. Staged values are strings; a numeric field
+// converts via Val(). Consumes and clears FPUStage.
+var
+  fLen, fi, i, W, vi, nVals, passStart, vcode: Integer;
+  FieldStr: string;
+  dv: Double;
+
+  function IsNumFieldStart(P: Integer): Boolean;
+  var k: Integer; sawHash: Boolean;
+  begin
+    Result := False;
+    if P > fLen then Exit;
+    if FormatStr[P] = '#' then Exit(True);
+    if FormatStr[P] in ['$', '+', '-'] then
+    begin
+      sawHash := False; k := P;
+      while (k <= fLen) and (FormatStr[k] in ['#', '.', '$', '+', '-', '^', ',']) do
+      begin
+        if FormatStr[k] = '#' then sawHash := True;
+        Inc(k);
+      end;
+      Result := sawHash;
+    end;
+  end;
+
+begin
+  Result := '';
+  fLen := Length(FormatStr);
+  nVals := Length(FPUStage);
+  vi := 0;
+  if fLen = 0 then begin SetLength(FPUStage, 0); Exit; end;
+  repeat
+    passStart := vi;
+    fi := 1;
+    while fi <= fLen do
+    begin
+      if FormatStr[fi] = '\' then
+      begin
+        i := fi + 1;
+        while (i <= fLen) and (FormatStr[i] <> '\') do Inc(i);
+        if i <= fLen then W := i - fi + 1 else W := i - fi;   // include the closing backslash
+        fi := i + 1;
+        if vi < nVals then
+        begin
+          Result := Result + Copy(FPUStage[vi] + StringOfChar(' ', W), 1, W);   // left-justify/pad/truncate
+          Inc(vi);
+        end;
+      end
+      else if FormatStr[fi] = '&' then
+      begin
+        Inc(fi);
+        if vi < nVals then begin Result := Result + FPUStage[vi]; Inc(vi); end;
+      end
+      else if FormatStr[fi] = '!' then
+      begin
+        Inc(fi);
+        if vi < nVals then begin Result := Result + Copy(FPUStage[vi], 1, 1); Inc(vi); end;
+      end
+      else if IsNumFieldStart(fi) then
+      begin
+        i := fi;
+        while (i <= fLen) and (FormatStr[i] in ['#', '.', '$', '+', '-', '^', ',']) do Inc(i);
+        FieldStr := Copy(FormatStr, fi, i - fi);
+        fi := i;
+        if vi < nVals then
+        begin
+          Val(Trim(FPUStage[vi]), dv, vcode);   // locale-independent ('.' decimal); 0 on bad input
+          if vcode <> 0 then dv := 0;
+          Result := Result + FormatUsingString(FieldStr, dv);
+          Inc(vi);
+        end;
+      end
+      else
+      begin
+        i := fi;
+        while (i <= fLen) and not ((FormatStr[i] in ['\', '&', '!']) or IsNumFieldStart(i)) do Inc(i);
+        Result := Result + Copy(FormatStr, fi, i - fi);   // literal text
+        fi := i;
+      end;
+    end;
+  until (vi >= nVals) or (vi = passStart);   // all consumed, or a pass with no value-consuming field
+  SetLength(FPUStage, 0);
 end;
 
 {$IFDEF WITH_SEDAI_AUDIO}
@@ -4358,6 +4449,20 @@ begin
           // This is a simplified implementation - full PRINT USING is more complex
           FOutputDevice.Print(FormatUsingString(Ctx.StringRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2]));
         end;
+      end;
+    bcPrintUsingStage:
+      // Stage one already-stringified value for a runtime-format PRINT USING (Src1 = string register).
+      begin
+        SetLength(FPUStage, Length(FPUStage) + 1);
+        FPUStage[High(FPUStage)] := Ctx.StringRegs[Instr.Src1];
+      end;
+    bcPrintUsingRun:
+      // Run a runtime-format PRINT USING over the staged values (Src1 = format string register).
+      begin
+        if Assigned(FOutputDevice) then
+          FOutputDevice.Print(FormatUsingRuntime(Ctx.StringRegs[Instr.Src1]))
+        else
+          SetLength(FPUStage, 0);
       end;
     bcPudef:
       begin

@@ -192,6 +192,8 @@ const
   bcGetkey          = bcGroupCore + 67;  // GETKEY A$ (blocking char input)
   // Formatted output
   bcPrintUsing      = bcGroupCore + 68;  // PRINT USING format$; value
+  bcPrintUsingStage = bcGroupCore + 149; // stage one stringified value for a runtime-format PRINT USING
+  bcPrintUsingRun   = bcGroupCore + 150; // run a runtime-format PRINT USING over the staged values
   bcPudef           = bcGroupCore + 69;  // PUDEF format string
   bcChar            = bcGroupCore + 70;  // CHAR mode, col, row, text
   // File operations
@@ -1521,6 +1523,8 @@ begin
         140: Result := 'CallSubIndirect';
         141: Result := 'SetEnviron';
         142: Result := 'Shell';
+        149: Result := 'PrintUsingStage';
+        150: Result := 'PrintUsingRun';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

@@ -11417,15 +11417,29 @@ begin
   end
   else
   begin
-    // Fallback: a non-literal (runtime) format — format each value with the whole format string.
-    ProcessExpression(FmtNode, FormatVal);
-    FormatReg := EnsureStringRegister(FormatVal);
+    // Runtime (non-literal) format: the field layout is unknown at compile time, so stage each value as a
+    // string (numbers via the FB Str form) and let the VM walk the format over the staged values at run
+    // time (bcPrintUsingRun). This handles string fields (&, \..\, !) correctly — the old fallback
+    // float-formatted every value, so string values printed as 0 (and diverged opt vs no-opt).
     for i := 0 to nVals - 1 do
     begin
       ProcessExpression(ValNodes[i], ValueVal);
-      ValueReg := EnsureFloatRegister(ValueVal);
-      EmitInstruction(ssaPrintUsing, NoneV, FormatReg, ValueReg, NoneV);
+      case ValueVal.RegType of
+        srtString: TmpReg := EnsureStringRegister(ValueVal);
+        srtInt:    begin
+                     TmpReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+                     EmitInstruction(ssaIntToString, TmpReg, EnsureIntRegister(ValueVal), NoneV, NoneV);
+                   end;
+      else         begin
+                     TmpReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+                     EmitInstruction(ssaStrStr, TmpReg, EnsureFloatRegister(ValueVal), NoneV, NoneV);
+                   end;
+      end;
+      EmitInstruction(ssaPrintUsingStage, NoneV, TmpReg, NoneV, NoneV);
     end;
+    ProcessExpression(FmtNode, FormatVal);
+    FormatReg := EnsureStringRegister(FormatVal);
+    EmitInstruction(ssaPrintUsingRun, NoneV, FormatReg, NoneV, NoneV);
   end;
 
   if not EndsWithSeparator then
