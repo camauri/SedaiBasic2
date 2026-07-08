@@ -1787,6 +1787,8 @@ end;
 function TLexerFSM.ParseNumberDigits: Boolean;
 var
   CurrentChar: Char;
+  i: Integer;
+  HasMantissaDigit: Boolean;
 begin
   Result := False;
   CurrentChar := GetCurrentChar;
@@ -1800,8 +1802,14 @@ begin
     Result := True;
   end;
 
-  // Scientific notation
-  if (CurrentChar = 'E') or (CurrentChar = 'e') then
+  // Scientific notation — only when a mantissa digit has already been lexed (either by the loop above or
+  // by the caller, e.g. the leading digit of "1e10" or the "1" of "1.e10"). Without this guard the '.'
+  // lexer path — which calls this before deciding number-vs-member-dot — would treat the leading 'e' of a
+  // member name like "g.edges" as an exponent marker and consume it, corrupting the identifier to "dges".
+  HasMantissaDigit := False;
+  for i := 0 to FTokenLength - 1 do
+    if (FTokenBuffer[i] >= '0') and (FTokenBuffer[i] <= '9') then begin HasMantissaDigit := True; Break; end;
+  if ((CurrentChar = 'E') or (CurrentChar = 'e')) and HasMantissaDigit then
   begin
     TokenBufferAdd(CurrentChar);
     AdvanceChar;
