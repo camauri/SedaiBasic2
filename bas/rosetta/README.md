@@ -112,6 +112,9 @@ single work, but distributing separate works together (aggregation) is permitted
 | `check_if_two_polygons_overlap.bas` | <https://rosettacode.org/wiki/Check_if_two_polygons_overlap> |
 | `dijkstras_algorithm.bas` | <https://rosettacode.org/wiki/Dijkstra%27s_algorithm> |
 | `apply_a_callback_to_an_array.bas` | <https://rosettacode.org/wiki/Apply_a_callback_to_an_array> |
+| `multiplication_tables.bas` | <https://rosettacode.org/wiki/Multiplication_tables> |
+| `gray_code.bas` | <https://rosettacode.org/wiki/Gray_code> |
+| `nth_root.bas` | <https://rosettacode.org/wiki/Nth_root> |
 
 ## Running
 
