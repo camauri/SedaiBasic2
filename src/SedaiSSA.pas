@@ -16531,19 +16531,17 @@ begin
 end;
 
 function TSSAGenerator.PointerUDTType(const PtrName: string): string;
-// If PtrName is declared "DIM p AS T PTR" where T is a user UDT, return T; else ''. Such a pointer
-// carries a record handle directly (the managed-reference model), so p.field / p->field resolve to
-// record access on p's int value, and @obj / NEW T produce that handle.
+// If PtrName is a pointer to a user UDT ("DIM p AS T PTR" or a "p AS T PTR" parameter), return T; else ''.
+// Such a pointer carries a record handle directly (the managed-reference model), so p.field / p->field
+// resolve to record access on p's int value, and @obj / NEW T / Callocate produce that handle. Uses
+// ManagedPtrPointee so a pointer PARAMETER (per-proc) resolves too, not only a DIM'd pointer.
 var
-  idx: Integer;
+  Pointee: string;
 begin
   Result := '';
-  idx := FPointerVars.IndexOfName(UpperCase(PtrName));
-  if idx >= 0 then
-  begin
-    if FindUDT(UpperCase(FPointerVars.ValueFromIndex[idx])) >= 0 then
-      Result := UpperCase(FPointerVars.ValueFromIndex[idx]);
-  end;
+  Pointee := UpperCase(ManagedPtrPointee(PtrName));
+  if (Pointee <> '') and (FindUDT(Pointee) >= 0) then
+    Result := Pointee;
 end;
 
 function TSSAGenerator.DerefedType(Node: TASTNode): string;
