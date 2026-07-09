@@ -127,6 +127,8 @@ single work, but distributing separate works together (aggregation) is permitted
 | `soundex.bas` | <https://rosettacode.org/wiki/Soundex> |
 | `bin_given_limits.bas` | <https://rosettacode.org/wiki/Bin_given_limits> |
 | `longest_common_substring.bas` | <https://rosettacode.org/wiki/Longest_common_substring> |
+| `day_of_the_week.bas` | <https://rosettacode.org/wiki/Day_of_the_week> |
+| `pythagorean_quadruples.bas` | <https://rosettacode.org/wiki/Pythagorean_quadruples> |
 
 ## Running
 
