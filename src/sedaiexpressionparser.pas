@@ -45,6 +45,10 @@ type
     {$ENDIF}
 
   public
+    // Active dialect, mirrored from TPackratParser by ApplyDialectProfile. The expression grammar is
+    // almost dialect-neutral; the exceptions are spellings that exist only in FreeBASIC (MODERN) and
+    // must NOT be silently accepted while compiling Commodore BASIC v7 (CLASSIC).
+    ModernMode: Boolean;
     // Current WITH-block object (M3.2): a leading '.field' resolves against this (cloned).
     // nil when not inside a WITH; set/restored by the statement parser's ParseWith.
     WithObject: TASTNode;
@@ -73,6 +77,7 @@ type
     function ParseGraphicsFunction(Token: TLexerToken): TASTNode;
     function ParseSpriteFunction(Token: TLexerToken): TASTNode;
     function ParseInputFunction(Token: TLexerToken): TASTNode;
+    function ParseInputFunctionForm(Token: TLexerToken): TASTNode;   // FreeBASIC INPUT(n [, [#]f])
     function ParseUsrFunction(Token: TLexerToken): TASTNode;
     function ParseUserFunction(Token: TLexerToken): TASTNode;
     function ParseProcAddress(Token: TLexerToken): TASTNode;   // @subname → antProcAddress (M5.2)
@@ -122,6 +127,7 @@ function StaticParseStringFunction(Parser: Pointer; Token: TLexerToken): TObject
 function StaticParseMemoryFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseGraphicsFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseSpriteFunction(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseInputFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseInputFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseUsrFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseUserFunction(Parser: Pointer; Token: TLexerToken): TObject;
@@ -238,6 +244,11 @@ end;
 function StaticParseSpriteFunction(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseSpriteFunction(Token);
+end;
+
+function StaticParseInputFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseInputFunctionForm(Token);
 end;
 
 function StaticParseInputFunction(Parser: Pointer; Token: TLexerToken): TObject;
@@ -420,8 +431,10 @@ begin
   // FreeBASIC INPUT(n [, [#]filenum]) — the FUNCTION form, which reads n characters and returns them.
   // INPUT lexes as ttInputCommand because its usual role is the INPUT statement; that is parsed by the
   // statement parser and never reaches here, so a prefix rule in expression position is unambiguous.
-  // ParseStringFunction already builds exactly the node this needs: antFunctionCall "INPUT" + arg list.
-  Context.SetParseRule(ttInputCommand, MakePrefixRule(@StaticParseStringFunction, precCall));
+  // The parselet refuses the form in CLASSIC: Commodore BASIC v7 has no INPUT() function, and accepting
+  // it there would let a v7 program parse into an expression the SSA never lowers -- silently yielding
+  // nothing instead of the ?SYNTAX ERROR the dialect owes the programmer.
+  Context.SetParseRule(ttInputCommand, MakePrefixRule(@StaticParseInputFunctionForm, precCall));
   Context.SetParseRule(ttUsrFunction, MakePrefixRule(@StaticParseUsrFunction, precCall));
   Context.SetParseRule(ttProcedureStart, MakePrefixRule(@StaticParseUserFunction, precCall));
   // M5.2 threading: @subname (proc address) and THREADCREATE(@sub, param) as value expressions.
@@ -1316,6 +1329,19 @@ begin
   end;
 
   DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseInputFunctionForm(Token: TLexerToken): TASTNode;
+// FreeBASIC INPUT(n [, [#]filenum]). MODERN only: in CLASSIC, INPUT is a statement and nothing else, so
+// an INPUT in expression position is a syntax error there -- exactly as Commodore BASIC v7 reports it.
+begin
+  if not ModernMode then
+  begin
+    HandleError('INPUT is a statement in Commodore BASIC v7; INPUT(n) as a function is FreeBASIC only', Token);
+    Result := nil;
+    Exit;
+  end;
+  Result := ParseStringFunction(Token);   // antFunctionCall "INPUT" + argument list
 end;
 
 function TExpressionParser.ParseInputFunction(Token: TLexerToken): TASTNode;

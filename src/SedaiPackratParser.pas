@@ -132,6 +132,7 @@ type
     // === DIALECT-PLUGGABLE STATEMENT HANDLERS (mechanism 3) ===
     // Install/clear per-token statement parsers for the active dialect. A handler returning nil
     // (without committing) declines and the built-in dispatch runs instead.
+    procedure SyncExpressionDialect;   // mirror FModernMode onto the expression parser
     procedure RegisterStatementHandler(TokenType: TTokenType; Handler: TStatementParseFunc);
     procedure ClearStatementHandlers;
 
@@ -389,6 +390,14 @@ begin
   ApplyDialectProfile;   // keep the installed handlers in sync with the forced/redetected dialect
 end;
 
+procedure TPackratParser.SyncExpressionDialect;
+begin
+  // The expression parser needs the dialect too: a couple of spellings (INPUT(n)) exist only in MODERN
+  // and must be rejected, not silently parsed, when compiling Commodore BASIC v7.
+  if Assigned(FExpressionParser) then
+    FExpressionParser.ModernMode := FModernMode;
+end;
+
 procedure TPackratParser.RegisterStatementHandler(TokenType: TTokenType; Handler: TStatementParseFunc);
 begin
   FStmtHandlers[TokenType] := Handler;
@@ -405,9 +414,12 @@ end;
 procedure TPackratParser.ApplyDialectProfile;
 // Build the active profile from the resolved dialect (FModernMode) and (re)install the dialect's
 // statement handlers. Idempotent: clears first, so it is safe to call again on a dialect switch
-// (NEW MODERN/CLASSIC, OPTION MODE, LOAD re-detect). Mechanism-2 expression parse-rules would be
-// (re)registered here too once a construct's expression syntax diverges by dialect (none today).
+// (NEW MODERN/CLASSIC, OPTION MODE, LOAD re-detect). Expression parse-rules are installed once, so a
+// rule whose validity depends on the dialect reads TExpressionParser.ModernMode instead; that flag is
+// mirrored here (SyncExpressionDialect). Today the only such rule is FreeBASIC's INPUT(n) function
+// form, which must not be accepted while compiling Commodore BASIC v7.
 begin
+  SyncExpressionDialect;
   FProfile.Modern := FModernMode;
   FProfile.SwapIsStatement := FModernMode;
   FProfile.MidIsStatement := FModernMode;

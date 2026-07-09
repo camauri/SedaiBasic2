@@ -1396,6 +1396,14 @@ begin
       // occurred. FreeBASIC declares them as "Function Erfn() As ZString Ptr" and idiomatic code writes
       // "*Erfn()"; SedaiBasic has no ZSTRING PTR, so they yield the name as a STRING directly and the
       // "*" of "*Erfn()" is an identity on a string operand (see the antDeref lowering).
+      // Like CURDIR$/EXEPATH/COMMAND$ below, these bare-name intercepts fire before variable resolution:
+      // in MODERN the names are reserved, as they are in FreeBASIC. Guarding them on "is it already a
+      // variable?" was tried and reverted -- ResolveExisting cannot distinguish a name the program
+      // DECLARED from one bound merely because it appears in the source, and its answer depends on
+      // whether the use sits at module level or inside a procedure. That made the same spelling mean
+      // different things in different scopes, which is worse than reserving the name outright.
+      // (Consequence, shared by the whole family: "Dim As Integer erfn" is silently dropped in MODERN.
+      // A real fix needs the SSA to record which names were explicitly declared.)
       if FModernMode and (UpperCase(VarName) = kERFN) then
       begin
         Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
@@ -1409,6 +1417,11 @@ begin
         Exit;
       end;
       // FreeBASIC CURDIR$ / CURDIR used bare (no parentheses): the current working directory.
+      // NOTE: no "is it already a variable?" guard here, deliberately. ResolveExisting cannot tell a name
+      // the program DECLARED from one PreAllocateVariables bound merely because it appears in the source
+      // -- and these names appear here, in their own bare form. Guarding on it makes the intercept never
+      // fire. The consequence is that "Dim As Integer curdir" is silently dropped; fixing that properly
+      // needs a record of explicitly-declared names, which the SSA does not keep today.
       if FModernMode and ((UpperCase(VarName) = kCURDIRS) or (UpperCase(VarName) = kCURDIR)) then
       begin
         Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
