@@ -2044,7 +2044,15 @@ begin
       BCInstr := FProgram.GetInstruction(Fixup.BCInstrIndex);
       BCInstr.Immediate := TargetAddr;
       FProgram.SetInstruction(Fixup.BCInstrIndex, BCInstr);
-    end;
+    end
+    // An unresolved PROC_ label used to leave Immediate at 0, so @f silently yielded entry PC 0. Via
+    // THREADCREATE that means every worker re-runs the whole main program -- including its own
+    // THREADCREATE calls -- i.e. a recursive thread bomb that can take the machine down. A procedure
+    // address that cannot be resolved is always a compiler bug: fail loudly instead of miscompiling.
+    else if Copy(Fixup.TargetLabel, 1, 5) = 'PROC_' then
+      raise Exception.CreateFmt(
+        'Internal error: unresolved procedure address label %s (procedure eliminated before bytecode emission)',
+        [Fixup.TargetLabel]);
   end;
 end;
 

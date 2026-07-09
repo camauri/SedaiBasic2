@@ -447,18 +447,40 @@ begin
       Node := GetNode(Block);
 
       if not Assigned(Block.Predecessors) or (Block.Predecessors.Count = 0) then
-        Continue; // Unreachable block
+      begin
+        // A predecessor-less block that is nevertheless in the preorder list is a secondary entry (a
+        // PROC_ procedure entry invoked via bcCallSub / an indirect call, a TRAP handler). Build's
+        // Step 1b only self-roots those the entry DFS never reached; one reached through a successor
+        // edge lands here with Idom still nil. Leaving it nil is not benign: every block in that
+        // procedure then has exactly one idom-bearing predecessor candidate -- its own loop back edge --
+        // so a loop header's idom points inside the loop and Intersect oscillates forever. Root it at
+        // itself, exactly like the entry block.
+        if Node.Idom = nil then
+        begin
+          Node.Idom := Block;
+          SetNode(Block, Node);
+          Changed := True;
+        end;
+        Continue;
+      end;
 
-      // Find first processed predecessor
+      // Seed with the processed predecessor of SMALLEST preorder -- NOT merely the first one in the
+      // Predecessors list. Cooper-Harvey-Kennedy needs the idom chain to be monotone in the ordering
+      // Intersect climbs with (here: preorder). Seeding from whatever predecessor happens to sit first
+      // in the list can pick a loop's back-edge (latch) predecessor, which sets a loop header's idom to
+      // a block INSIDE the loop; Intersect then oscillates between the two (header -> latch -> header)
+      // and never converges. Reachable loops hid this: their preheader edge is added before the back
+      // edge, so the first predecessor happened to be the forward one. An address-only procedure's loop
+      // (its entry block reached only as a secondary DFS root) has the back edge recorded first, which
+      // exposed the bug. Picking the minimum preorder always prefers a forward predecessor when one
+      // exists, making the seed independent of edge insertion order.
       NewIdom := nil;
       for j := 0 to Block.Predecessors.Count - 1 do
       begin
         Pred := TSSABasicBlock(Block.Predecessors[j]);
         if FNodes[Pred].Idom <> nil then
-        begin
-          NewIdom := Pred;
-          Break;
-        end;
+          if (NewIdom = nil) or (FNodes[Pred].Preorder < FNodes[NewIdom].Preorder) then
+            NewIdom := Pred;
       end;
 
       if NewIdom = nil then
@@ -620,14 +642,19 @@ begin
       if DebugDomTree then
         WriteLn('[DominatorTree] Adding unreachable block to preorder list: ', Block.LabelName);
       {$ENDIF}
-      // Add as secondary entry (idom = itself like entry)
-      Node.Preorder := PreNum;
-      Inc(PreNum);
-      Node.Idom := Block;  // Self as idom (like entry)
+      // Add as secondary entry (idom = itself like entry).
+      //
+      // DFS FIRST, root AFTER. Assigning Block.Preorder here and only then calling InitialDFS made
+      // InitialDFS return immediately (it bails on an already-numbered block), so the region's other
+      // blocks were never reached from this root. The enclosing loop then met each of them still
+      // unvisited and self-rooted EVERY ONE of them. In a region containing a loop that is fatal: the
+      // latch gets Idom = itself, Intersect(latch, root) climbs one step, sees idom(latch) = latch and
+      // returns the latch, so the loop header's idom becomes a block inside its own loop -- after which
+      // idom(header) = latch and idom(latch) = header oscillate and Intersect never converges.
+      InitialDFS(Block, PreNum);     // numbers Block AND everything reachable from it
+      Node := GetNode(Block);
+      Node.Idom := Block;            // only the region's root is its own idom
       SetNode(Block, Node);
-      FPreorderList.Add(Block);
-      // Also DFS from this block to include its successors
-      InitialDFS(Block, PreNum);
     end;
   end;
 

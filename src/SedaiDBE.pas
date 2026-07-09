@@ -212,6 +212,15 @@ begin
       if OpIn(Instr.OpCode, [ssaOnError, ssaResumeLabel]) and (Instr.Src1.Kind = svkLabel) then
         FReferencedLabels.Add(Instr.Src1.LabelName);
 
+      // M5.2: @sub (ssaLoadProcAddr) takes a procedure's address (PROC_<name> label in Src1). An
+      // address-only proc (never called by name, only reached via a funcptr / bcThreadCreate) has no
+      // static CFG edge, so keep its entry block alive by reference here. FixForwardReferences must NOT
+      // add a CFG successor edge for it: that would give a conditional branch's non-terminator block
+      // >1 successor and fail CFG validation (@f inside an IF/ELSE or IIF branch). The PROC_ entry block
+      // is already tolerated as a predecessor-less secondary entry by the dominator validator.
+      if (Instr.OpCode = ssaLoadProcAddr) and (Instr.Src1.Kind = svkLabel) then
+        FReferencedLabels.Add(Instr.Src1.LabelName);
+
       case Instr.OpCode of
         // TRAP <line> - error handler target
         ssaTrap:
@@ -380,6 +389,28 @@ begin
   // SUB/FUNCTION entry blocks (M2) are reached via the ssaCallSub CFG edge from their call
   // sites, so DFS from entry already covers called procedures; uncalled ones are correctly
   // eliminated as dead code.
+
+  // M5.2: an address-only procedure (`@f` with no by-name call site — a THREADCREATE worker, a
+  // function pointer) has NO CFG edge into its entry block, by design: FixForwardReferences must not
+  // add one, or an `@f` sitting in a conditional arm would give that arm >1 successor and fail CFG
+  // validation. So seed a second DFS from every address-taken PROC_ block: the whole procedure body
+  // must survive, not just the entry block. Keeping only the entry block (via IsBlockReferenced) plus
+  // the sequential fallthrough chain is NOT enough — that chain stops at the first terminator, so any
+  // worker with a FOR/IF in it got truncated, the body's blocks were dropped, and the resulting
+  // bytecode ran off into the main program (bcThreadCreate spawning at PC 0 -> recursive thread bomb).
+  for i := 0 to FProgram.Blocks.Count - 1 do
+  begin
+    Block := FProgram.Blocks[i];
+    if (not FReachable[i]) and Block.LabelName.StartsWith('PROC_') and
+       (FReferencedLabels.IndexOf(Block.LabelName) >= 0) then
+    begin
+      {$IFDEF DEBUG_DBE}
+      if DebugDBE then
+        WriteLn('[DBE] Seeding DFS from address-taken procedure ', Block.LabelName);
+      {$ENDIF}
+      DFS(i);
+    end;
+  end;
 end;
 
 procedure TDeadBlockElimination.DFS(BlockIdx: Integer);

@@ -13611,23 +13611,17 @@ begin
       end;
 
       // M5.2: @sub (ssaLoadProcAddr) takes a procedure's address (PROC_<name> label in Src1).
-      // Add a CFG edge to the proc block so an address-taken-only worker SUB stays reachable
-      // (otherwise DBE removes it and the label never resolves → bcThreadCreate would spawn at PC 0).
-      // The edge is for liveness only; the current thread never branches there (bcThreadCreate falls
-      // through), and the worker enters via its own context StartPC.
+      // We do NOT add a CFG successor edge to the proc block: if the @f appears inside a conditional
+      // branch (an IF/ELSE or IIF arm), the branch's non-terminator block would then have >1 successor
+      // and fail CFG validation ("needs terminator for >1 succ"). Instead DBE seeds a separate
+      // reachability DFS from every address-taken PROC_ block (see SedaiDBE.MarkReachableBlocks), so the
+      // whole procedure body survives, not merely its entry block; the PROC_ entry block is tolerated as
+      // a predecessor-less secondary entry by the dominator validator (it is invoked via bcCallSub or an
+      // indirect call, not a static edge). We only diagnose a missing target here.
       if (Instr.OpCode = ssaLoadProcAddr) and (Instr.Src1.Kind = svkLabel) then
       begin
         TargetLabel := Instr.Src1.LabelName;
-        TargetBlock := FProgram.FindBlock(TargetLabel);
-        if Assigned(TargetBlock) then
-        begin
-          if Block.Successors.IndexOf(TargetBlock) = -1 then
-          begin
-            Block.AddSuccessor(TargetBlock);
-            TargetBlock.AddPredecessor(Block);
-          end;
-        end
-        else if (Copy(TargetLabel, 1, 5) = 'PROC_') then
+        if not Assigned(FProgram.FindBlock(TargetLabel)) and (Copy(TargetLabel, 1, 5) = 'PROC_') then
           raise Exception.CreateFmt('Undefined procedure (address-of @): %s', [Copy(TargetLabel, 6, MaxInt)]);
       end;
 
