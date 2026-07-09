@@ -1093,6 +1093,7 @@ var
   RecUDTIdx, RecSlotK: Integer;   // OFFSETOF: UDT index + field scan
   FuncRetType: TSSARegisterType;  // M2: user FUNCTION return type
   MethodObjNode: TASTNode;        // M4.1: object of a method call
+  DerefTarget: TASTNode;          // "*expr": the operand, with any parentheses stripped
   ArgNode: TASTNode;              // WSTRING: the source AST node of a string-function argument (width detect)
   MethodOwnerType, MethodLabelName: string;  // M4.1
   ArgValue, ArgReg: TSSAValue;
@@ -1214,6 +1215,28 @@ begin
 
     antDeref:
     begin
+      // FreeBASIC declares Erfn/Ermn as "Function () As ZString Ptr", so real FB sources write
+      // "*Erfn()" to get at the characters. SedaiBasic has no ZSTRING PTR: ssaLoadERFN/ssaLoadERMN
+      // already yield the name as a STRING, so the dereference is the identity here. Deliberately
+      // narrow -- keyed on these two names, not on "any string operand" -- so that dereferencing
+      // something that genuinely is not a pointer still reports an error rather than silently passing.
+      DerefTarget := Node.GetChild(0);
+      while (DerefTarget.NodeType = antParentheses) and (DerefTarget.ChildCount >= 1) do
+        DerefTarget := DerefTarget.GetChild(0);
+      // "Erfn" arrives as a bare antIdentifier; "Erfn()" as an antArrayAccess whose FIRST CHILD carries
+      // the name (the node itself has no Value).
+      if FModernMode and Assigned(DerefTarget) and
+         (((DerefTarget.NodeType = antIdentifier) and
+           ((UpperCase(VarToStr(DerefTarget.Value)) = kERFN) or
+            (UpperCase(VarToStr(DerefTarget.Value)) = kERMN))) or
+          ((DerefTarget.NodeType = antArrayAccess) and (DerefTarget.ChildCount >= 1) and
+           ((UpperCase(VarToStr(DerefTarget.GetChild(0).Value)) = kERFN) or
+            (UpperCase(VarToStr(DerefTarget.GetChild(0).Value)) = kERMN)))) then
+      begin
+        ProcessExpression(DerefTarget, Left);
+        Result := Left;
+        Exit;
+      end;
       // *p where p is a UDT pointer: the value is the record handle itself (managed-reference model),
       // so *p just evaluates p (no load). Lets "q = *p" alias and "(*p).field" resolve.
       if (Node.GetChild(0).NodeType = antIdentifier) and
@@ -1367,6 +1390,22 @@ begin
           Result := MakeSSAConstString(FCurrentProcName)
         else
           Result := MakeSSAConstString(kFBMAINPROC);
+        Exit;
+      end;
+      // FreeBASIC ERFN / ERMN: the procedure and the module (source file) in which the last error
+      // occurred. FreeBASIC declares them as "Function Erfn() As ZString Ptr" and idiomatic code writes
+      // "*Erfn()"; SedaiBasic has no ZSTRING PTR, so they yield the name as a STRING directly and the
+      // "*" of "*Erfn()" is an identity on a string operand (see the antDeref lowering).
+      if FModernMode and (UpperCase(VarName) = kERFN) then
+      begin
+        Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaLoadERFN, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Exit;
+      end;
+      if FModernMode and (UpperCase(VarName) = kERMN) then
+      begin
+        Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaLoadERMN, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         Exit;
       end;
       // FreeBASIC CURDIR$ / CURDIR used bare (no parentheses): the current working directory.
@@ -4189,6 +4228,20 @@ begin
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
           EmitInstruction(ssaFileDateTime, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC ERFN() / ERMN() (parenthesised form, the way FB code actually writes them).
+        if FModernMode and (UpperCase(ArrName) = kERFN) and (ArrayIndexOf(ArrName) < 0) then
+        begin
+          Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+          EmitInstruction(ssaLoadERFN, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+        if FModernMode and (UpperCase(ArrName) = kERMN) and (ArrayIndexOf(ArrName) < 0) then
+        begin
+          Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+          EmitInstruction(ssaLoadERMN, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
         end;
 

@@ -1326,6 +1326,8 @@ begin
         // Record the source dialect on the program so the VM can pick dialect-aware behaviour
         // (e.g. filesystem error codes: FreeBASIC vs Commodore). Mirrors SSAGen.ModernMode above.
         BytecodeProgram.ModernMode := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
+        // ERMN reports the module an error came from: the source file's name, as FreeBASIC does.
+        BytecodeProgram.ModuleName := ExtractFileName(SourceFile);
       except
         on E: Exception do
         begin

@@ -1163,6 +1163,8 @@ begin
       begin
         // Save error info for EL, ER, ERR$ variables
         Ctx.LastErrorLine := FProgram.GetSourceLine(CurPC);
+        // ERFN: the procedure that was executing when the error was raised ('' at module level).
+        Ctx.LastErrorProc := FProgram.GetProcNameAt(CurPC);
         Ctx.ResumePC := CurPC;  // Save PC for RESUME
         Ctx.InErrorHandler := True;
 

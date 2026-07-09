@@ -315,6 +315,8 @@ type
     ssaLoadEL,         // EL: Load last error line number
     ssaLoadER,         // ER: Load last error code
     ssaLoadERRS,       // ERR$: Load last error message (variable, not function)
+    ssaLoadERFN,       // ERFN: Load the name of the procedure in which the last error occurred
+    ssaLoadERMN,       // ERMN: Load the name of the module (source file) of the last error
     ssaLoadDS,         // DS: Commodore disk status code (= last file-operation error code)
     ssaLoadDSS,        // DS$: Commodore disk status message line "NN, MESSAGE,00,00"
     ssaLoadST,         // ST: Kernal I/O status byte (bit 6 = end-of-file on the last GET#)

@@ -424,6 +424,7 @@ type
     {$ENDIF}
     // Error state for EL, ER, ERR$ system variables
     procedure SetErrorState(ALine, ACode: Integer; const AMessage: string);
+    procedure SetErrorProc(const AProcName: string);   // ERFN
     procedure ClearErrorState;
     property LastErrorLine: Integer read GetLastErrorLine;
     property LastErrorCode: Integer read GetLastErrorCode;
@@ -3876,11 +3877,17 @@ begin
   FCtx.LastErrorMessage := AMessage;
 end;
 
+procedure TBytecodeVM.SetErrorProc(const AProcName: string);
+begin
+  FCtx.LastErrorProc := AProcName;
+end;
+
 procedure TBytecodeVM.ClearErrorState;
 begin
   FCtx.LastErrorLine := 0;
   FCtx.LastErrorCode := 0;
   FCtx.LastErrorMessage := '';
+  FCtx.LastErrorProc := '';
 end;
 
 procedure TBytecodeVM.SetTrueValue(AValue: Int64);
@@ -7185,6 +7192,10 @@ begin
       Ctx.IntRegs[Instr.Dest] := Ctx.LastErrorCode;
     7: // bcLoadERRS - return last error message (variable form)
       Ctx.StringRegs[Instr.Dest] := Ctx.LastErrorMessage;
+    15: // bcLoadERFN - name of the procedure in which the last error occurred ('' at module level)
+      Ctx.StringRegs[Instr.Dest] := Ctx.LastErrorProc;
+    16: // bcLoadERMN - name of the module (source file) the error came from
+      Ctx.StringRegs[Instr.Dest] := FProgram.ModuleName;
     8: // bcPeek - read from memory-mapped location
       begin
         if Assigned(FMemoryMapper) then
@@ -8821,6 +8832,7 @@ begin
     Ctx.LastErrorCode := 0;
     Ctx.LastErrorLine := 0;
     Ctx.LastErrorMessage := '';
+    Ctx.LastErrorProc := '';   // ERFN travels with the rest of the error state
   end;
 end;
 

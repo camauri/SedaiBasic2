@@ -2015,7 +2015,7 @@ begin
     if (DecoU = 'CDECL') or (DecoU = 'STDCALL') or (DecoU = 'PASCAL') or
        (DecoU = 'FASTCALL') or (DecoU = 'THISCALL') or (DecoU = 'OVERLOAD') then
       Context.Advance
-    else if (DecoU = 'ALIAS') or (DecoU = 'LIB') then
+    else if (DecoU = kALIAS) or (DecoU = kLIB) then
     begin
       Context.Advance;                            // ALIAS / LIB
       if Context.Check(ttStringLiteral) then Context.Advance;   // "name" (discarded)
@@ -2206,6 +2206,14 @@ begin
       NameNode.AddChild(TASTNode.CreateWithValue(antIdentifier, RetTypeName, RetTok));
     end;
   end;
+
+  // FreeBASIC EXPORT: "SUB s (...) EXPORT" / "FUNCTION f (...) AS T EXPORT" asks the compiler to put the
+  // symbol in a shared library's export table. It follows the parameter list (and, for a FUNCTION, the
+  // return type), which is why it is consumed here rather than in the decorator loop above. SedaiBasic
+  // produces bytecode, not a DLL, so there is no export table: accept and ignore, so that real FreeBASIC
+  // sources parse. EXPORT is not a reserved word, so a variable may still be called "export".
+  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = kEXPORT) then
+    Context.Advance;
 
   // Arity-based constructor overloading (M4.4d): encode the explicit-parameter count in the label
   // (THIS excluded) so multiple CONSTRUCTORs of the same type get distinct procedure labels, e.g.

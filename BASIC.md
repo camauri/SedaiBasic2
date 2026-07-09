@@ -8,14 +8,14 @@
 [████████████████████████████████████████████████··] 96%
 ```
 
-**FreeBASIC keyword set — 556 / 644 implemented (86%)**. **66** of the unimplemented
+**FreeBASIC keyword set — 560 / 644 implemented (87%)**. **66** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, FFI) — not runnable keywords for a portable bytecode VM. Of the
-**578 applicable** keywords, **556 (96%)** are implemented. See the
+**578 applicable** keywords, **560 (97%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
-[████████████████████████████████████████████████··] 96%
+[████████████████████████████████████████████████··] 97%
 ```
 
 > Counts above are derived from the status tables below, which are the source of truth.
@@ -1404,7 +1404,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `CONST` | ✓ | Specifies a read only type. |
 | `POINTER and PTR (Shortcut for 'POINTER')` | ✓ | Modifies types to be pointer types. |
 | `UNSIGNED` | ✓ | `AS UNSIGNED <basetype>` modifier → maps to the unsigned variant (INTEGER→UINTEGER, BYTE→UBYTE, SHORT→USHORT, LONG→ULONG, LONGINT→ULONGINT). Bare `UNSIGNED` == UNSIGNED INTEGER. |
-| `ALIAS (Modifier)` | ✗ | Modifies how a datatype is linked with other languages (Name mangling). |
+| `ALIAS (Modifier)` | ✓ | `SUB f ALIAS "extname" (...)` — the external name for linking. SedaiBasic emits bytecode and does no external linking, so the alias is parsed and ignored. |
 
 ##### String types
 
@@ -1710,7 +1710,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `DYLIBFREE` | ✗ | N/A — native dynamic linking is out of scope for the bytecode VM. |
 | `DYLIBLOAD` | ✗ | N/A — native dynamic linking is out of scope for the bytecode VM. |
 | `DYLIBSYMBOL` | ✗ | N/A — native dynamic linking is out of scope for the bytecode VM. |
-| `EXPORT` | ✗ |  |
+| `EXPORT` | ✓ | `SUB f (...) EXPORT` / `FUNCTION f (...) AS T EXPORT` — publish the symbol in a shared library's export table. There is no export table in a bytecode program: parsed and ignored. |
 | `EXTERN` | ✓ | Accepted and skipped — external linkage is N/A for a single-module bytecode VM (no native linking). |
 | `EXTERN...END EXTERN` | ✓ | `EXTERN "lang" ... END EXTERN` block accepted and skipped (no native linking). |
 | `IMPORT` | ✓ | Accepted and skipped (no native linking). |
@@ -2156,8 +2156,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `ERL` | ✓ | Source line where the error occurred (alias of `EL`; physical source line in MODERN). |
-| `ERFN` | ✗ | Gets the name of the function where the error occurred. (Deferred: needs a per-PC function map.) |
-| `ERMN` | ✗ | Gets the name of the source file where the error occurred. (Deferred: needs a per-PC file map.) |
+| `ERFN` | ✓ | Name of the procedure in which the last error occurred; empty at module level. FreeBASIC returns a `ZSTRING PTR` and writes `*Erfn()`; SedaiBasic returns the name as a STRING and accepts both `Erfn()` and `*Erfn()`. Cleared by RESUME in MODERN, like ERR. |
+| `ERMN` | ✓ | Name of the module (source file) the last error came from. Returns a STRING, not a `ZSTRING PTR`; `Ermn()` and `*Ermn()` both work. |
 | `ERR` | ✓ | Error number of the last error that occurred (alias of `ER`). |
 | `ERROR` | ✓ | `ERROR <n>` raises a user runtime error number n (caught by `ON ERROR`; `ERR` returns n). Intercepted by name, so `ERROR` stays usable as an identifier. |
 

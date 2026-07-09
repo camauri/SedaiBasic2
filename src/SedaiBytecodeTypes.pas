@@ -519,6 +519,8 @@ const
   bcLoadDS          = bcGroupSpecial + 12;  // DS: Commodore disk status code (= last file error code)
   bcLoadDSS         = bcGroupSpecial + 13;  // DS$: Commodore disk status message line (Dest=string)
   bcLoadST          = bcGroupSpecial + 14;  // ST: Kernal I/O status byte (bit 6 = EOF on the last GET#)
+  bcLoadERFN        = bcGroupSpecial + 15;  // ERFN: name of the procedure where the last error occurred
+  bcLoadERMN        = bcGroupSpecial + 16;  // ERMN: name of the module (source file) of the last error
 
   // === GROUP 6: FILE I/O (0x06xx) ===
   bcDopen           = bcGroupFileIO + 0;    // DOPEN #handle, "filename" [, mode$]
@@ -779,6 +781,13 @@ type
     SourceLine: Integer;    // BASIC source line number
   end;
 
+  { Procedure map entry (ERFN) - the PC where a SUB/FUNCTION's code begins. Not packed: it holds a
+    managed string. A PC belongs to the last procedure starting at or before it. }
+  TProcMapEntry = record
+    StartPC: Integer;       // First instruction of the procedure
+    Name: string;           // Procedure name, as written (without the PROC_ label prefix)
+  end;
+
   { Bytecode instruction encoding - 16 bytes (was 20 bytes)
     SourceLine moved to separate TSourceMap for better cache efficiency }
   TBytecodeInstruction = packed record
@@ -859,8 +868,17 @@ type
     // Dialect of the compiled source: True = MODERN (FreeBASIC), False = CLASSIC (Commodore v7).
     // Used at runtime for dialect-aware behaviour (e.g. filesystem error codes: FB vs CBM).
     FModernMode: Boolean;
+    // Procedure map (ERFN): the PC at which each SUB/FUNCTION's code begins, in emission order. A PC
+    // belongs to the last procedure that starts at or before it; a PC before the first entry is module
+    // level. Procedure bodies are emitted after the module's END, so the ranges never interleave.
+    // The PCs are remapped along with the source map when NOP compaction shifts instructions.
+    FProcMap: array of TProcMapEntry;
+    FProcMapCount: Integer;
+    // Name of the source file this program was compiled from (ERMN). Set by the host.
+    FModuleName: string;
   public
     property ModernMode: Boolean read FModernMode write FModernMode;
+    property ModuleName: string read FModuleName write FModuleName;
     constructor Create;
     destructor Destroy; override;
     procedure AddInstruction(const Instr: TBytecodeInstruction);
@@ -883,6 +901,10 @@ type
     // Source map API - transparent replacement for SourceLine field
     procedure SetSourceLine(PC: Integer; Line: Integer);
     function GetSourceLine(PC: Integer): Integer;
+    // Procedure map API (ERFN): record where each procedure's code starts, then ask which procedure
+    // owns a PC. Returns '' for module-level code.
+    procedure AddProcRange(StartPC: Integer; const Name: string);
+    function GetProcNameAt(PC: Integer): string;
     // Label lines API - for REM and other non-code lines that can be jump targets
     procedure AddLabelLine(LineNum: Integer; PC: Integer);
     procedure AdjustLabelLines(const IndexMap: array of Integer);  // Adjust PCs after NOP compaction
@@ -980,6 +1002,9 @@ begin
   FLastSourceLine := -1;
   SetLength(FLabelLines, 0);
   FLabelLineCount := 0;
+  SetLength(FProcMap, 0);
+  FProcMapCount := 0;
+  FModuleName := '';
   FStringConstants := TStringList.Create;
   FStringConstants.CaseSensitive := True;  // IMPORTANT: "n" and "N" are different!
   FEntryPoint := 0;
@@ -1023,6 +1048,8 @@ begin
   FLastSourceLine := -1;
   SetLength(FLabelLines, 0);
   FLabelLineCount := 0;
+  SetLength(FProcMap, 0);
+  FProcMapCount := 0;
 end;
 
 procedure TBytecodeProgram.AddVariable(const VarInfo: TVariableInfo);
@@ -1149,6 +1176,29 @@ begin
   Result := 0;  // Not found
 end;
 
+procedure TBytecodeProgram.AddProcRange(StartPC: Integer; const Name: string);
+begin
+  // Called as each procedure's entry block is emitted, so StartPC is non-decreasing and GetProcNameAt
+  // can scan for the last entry at or before a PC without sorting.
+  if FProcMapCount >= Length(FProcMap) then
+    SetLength(FProcMap, FProcMapCount + 32);
+  FProcMap[FProcMapCount].StartPC := StartPC;
+  FProcMap[FProcMapCount].Name := Name;
+  Inc(FProcMapCount);
+end;
+
+function TBytecodeProgram.GetProcNameAt(PC: Integer): string;
+var
+  i: Integer;
+begin
+  // The owning procedure is the last one starting at or before PC. A PC before the first entry is
+  // module-level code, which has no procedure name.
+  Result := '';
+  for i := FProcMapCount - 1 downto 0 do
+    if (FProcMap[i].StartPC >= 0) and (PC >= FProcMap[i].StartPC) then
+      Exit(FProcMap[i].Name);
+end;
+
 procedure TBytecodeProgram.AddLabelLine(LineNum: Integer; PC: Integer);
 begin
   // Add a label line entry that maps a BASIC line number to a PC.
@@ -1248,6 +1298,30 @@ begin
     end;
   end;
   FSourceMapCount := WriteIdx;
+
+  // The procedure map (ERFN) indexes the same instruction stream, so its entry PCs shift with it.
+  // A procedure entry is a real instruction, never a NOP, but the compaction may still have turned the
+  // first instruction of a procedure into one; scan forward exactly as the source map does above.
+  for i := 0 to FProcMapCount - 1 do
+  begin
+    OldStartPC := FProcMap[i].StartPC;
+    if (OldStartPC < 0) or (OldStartPC >= Length(IndexMap)) then
+    begin
+      FProcMap[i].StartPC := -1;   // no longer addressable: GetProcNameAt skips it
+      Continue;
+    end;
+    NewStartPC := IndexMap[OldStartPC];
+    if NewStartPC = -1 then
+    begin
+      while (OldStartPC < Length(IndexMap)) and (IndexMap[OldStartPC] = -1) do
+        Inc(OldStartPC);
+      if OldStartPC < Length(IndexMap) then
+        NewStartPC := IndexMap[OldStartPC]
+      else
+        NewStartPC := -1;
+    end;
+    FProcMap[i].StartPC := NewStartPC;
+  end;
 end;
 
 procedure TBytecodeProgram.ClearInstructionsOnly;

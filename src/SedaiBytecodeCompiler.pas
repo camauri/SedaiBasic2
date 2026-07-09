@@ -468,6 +468,8 @@ begin
     ssaLoadEL: Result := bcLoadEL;
     ssaLoadER: Result := bcLoadER;
     ssaLoadERRS: Result := bcLoadERRS;
+    ssaLoadERFN: Result := bcLoadERFN;
+    ssaLoadERMN: Result := bcLoadERMN;
     ssaLoadDS: Result := bcLoadDS;
     ssaLoadDSS: Result := bcLoadDSS;
     ssaLoadST: Result := bcLoadST;
@@ -2145,6 +2147,11 @@ begin
     Block := SSAProgram.Blocks[i];
     if Block.LabelName <> '' then
       FLabelMap.AddObject(Block.LabelName, TObject(PtrInt(FProgram.GetInstructionCount)));
+      // ERFN: remember where each procedure's code starts. Entry blocks are emitted in order, so the
+      // recorded PCs are non-decreasing and a PC belongs to the last procedure at or before it.
+      if Copy(Block.LabelName, 1, 5) = 'PROC_' then
+        FProgram.AddProcRange(FProgram.GetInstructionCount,
+                              Copy(Block.LabelName, 6, MaxInt));
 
     for j := 0 to Block.Instructions.Count - 1 do
     begin

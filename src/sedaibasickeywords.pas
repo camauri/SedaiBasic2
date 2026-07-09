@@ -527,6 +527,13 @@ const
   kERR     = 'ERR';     // FreeBASIC: last error code (alias of ER)
   kERL     = 'ERL';     // FreeBASIC: last error source line (alias of EL)
   kERRS    = 'ERR$';
+  kERFN    = 'ERFN';    // FreeBASIC: name of the procedure in which the last error occurred
+  kERMN    = 'ERMN';    // FreeBASIC: name of the module (source file) of the last error
+  // FreeBASIC procedure decorators. Not reserved words: they arrive as identifiers and are matched by
+  // value, so a variable may still be named ALIAS, LIB or EXPORT.
+  kALIAS   = 'ALIAS';   // ALIAS "extname" — external name for linking (accepted, ignored)
+  kLIB     = 'LIB';     // LIB "libname" — external library (accepted, ignored)
+  kEXPORT  = 'EXPORT';  // EXPORT — publish the symbol in a shared library's export table (ignored)
   kGETN    = 'GET#';
   kGO64    = 'GO64';
   kPOS     = 'POS';

@@ -114,6 +114,7 @@ type
     LastErrorLine: Integer;     // EL: Last error line number
     LastErrorCode: Integer;     // ER: Last error code
     LastErrorMessage: string;   // ERR$: Last error message (variable form)
+    LastErrorProc: string;      // ERFN: procedure in which the last error occurred ('' = module level)
 
     // --- Superinstruction scratch ---
     SwapTempInt: Int64;         // Temp variable for ArraySwapInt superinstruction

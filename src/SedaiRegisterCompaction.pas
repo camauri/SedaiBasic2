@@ -403,6 +403,8 @@ begin
     bcLoadDTS,         // DT$: current date YYYYMMDD (string)
     bcLoadCWDS,        // CWD$: current working directory (string)
     bcLoadERRS,        // ERR$: last error message (string)
+    bcLoadERFN,        // ERFN: procedure of the last error (string)
+    bcLoadERMN,        // ERMN: module of the last error (string)
     bcLoadDSS,         // DS$: Commodore disk status message line (string)
     // === GROUP 10: Graphics ===
     bcGraphicSShape,   // SSHAPE A$, x1, y1: capture screen area to string
