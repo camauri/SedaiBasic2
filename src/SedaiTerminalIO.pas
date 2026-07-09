@@ -47,7 +47,7 @@ interface
 
 uses
   Classes, SysUtils, SedaiOutputInterface, SedaiGraphicsTypes,
-  SedaiGraphicsMemory, SedaiGraphicsPrimitives
+  SedaiGraphicsMemory, SedaiGraphicsPrimitives, SedaiConsoleState
   {$IFDEF WINDOWS}
   , Windows
   {$ENDIF}
@@ -183,6 +183,7 @@ type
     {$IFDEF WINDOWS}
     FConsoleHandle: THandle;
     FOldConsoleMode: DWORD;
+    FOwnsConsoleInput: Boolean;   // stdin is a real console: its mode is ours to change, and to put back
     {$ENDIF}
   public
     constructor Create;
@@ -753,11 +754,18 @@ begin
   FHasPendingChar := False;
 
   {$IFDEF WINDOWS}
-  // Get console input handle
-  FConsoleHandle := GetStdHandle(STD_INPUT_HANDLE);
+  // The console input buffer, its mode and the Ctrl+C handler belong to the console -- i.e. to the
+  // parent shell -- not to this process. Only take a handle to it when stdin really is a console:
+  // under a redirect or a pipe (`sb prog.bas </dev/null`, the regression harness) there is nothing to
+  // configure and nothing that may be disturbed.
+  FOwnsConsoleInput := StdInIsConsole;
+  if FOwnsConsoleInput then
+    FConsoleHandle := GetStdHandle(STD_INPUT_HANDLE)
+  else
+    FConsoleHandle := INVALID_HANDLE_VALUE;
 
-  // Save old console mode - we keep ENABLE_PROCESSED_INPUT for proper character translation
-  if FConsoleHandle <> INVALID_HANDLE_VALUE then
+  // Remember the console's mode so ReadLine can put it back exactly as it found it.
+  if FOwnsConsoleInput then
     GetConsoleMode(FConsoleHandle, @FOldConsoleMode);
 
   // Install CTRL+C handler - this intercepts CTRL+C before it terminates the process
@@ -765,17 +773,21 @@ begin
   GCtrlCPressed := False;
   SetConsoleCtrlHandler(@ConsoleCtrlHandler, True);
 
-  // Flush any pending input events (e.g., ENTER from command line)
-  if FConsoleHandle <> INVALID_HANDLE_VALUE then
-    FlushConsoleInputBuffer(FConsoleHandle);
+  // NOTE: we deliberately do NOT FlushConsoleInputBuffer here. That buffer is shared with whatever owns
+  // the terminal, so flushing it silently DISCARDS keystrokes the user (or the tool driving the
+  // terminal) has already typed -- and it did so on every single run, interactive or not. The Enter that
+  // launched this process was consumed by the shell that read the command line; it is not sitting in the
+  // buffer waiting for us. If a stray event ever does show up, it must be dropped where it is read, not
+  // by destroying everyone else's pending input at startup.
   {$ENDIF}
 end;
 
 destructor TTerminalInput.Destroy;
 begin
   {$IFDEF WINDOWS}
-  // Restore original console mode
-  if FConsoleHandle <> INVALID_HANDLE_VALUE then
+  // Belt and braces: ReadLine already restores the mode as soon as each read finishes, so by here there
+  // is normally nothing to undo. Only a console we actually took over may be written back to.
+  if FOwnsConsoleInput then
     SetConsoleMode(FConsoleHandle, FOldConsoleMode);
 
   // Remove CTRL+C handler
@@ -796,55 +808,68 @@ var
   {$ENDIF}
 begin
   {$IFDEF WINDOWS}
-  // Ensure console is in normal line input mode with echo
-  if FConsoleHandle <> INVALID_HANDLE_VALUE then
+  // Put the console into line-input-with-echo for the duration of THIS read, and restore the mode we
+  // found as soon as we are done. The mode belongs to the parent shell: leaving it altered until our
+  // destructor runs means a process that is killed rather than exiting -- which is exactly what the
+  // regression harness does to a hung run, via `timeout -s KILL` / TerminateProcess -- hands the
+  // terminal back with echo and line editing in whatever state we left them.
+  if FOwnsConsoleInput then
   begin
     NormalMode := ENABLE_LINE_INPUT or ENABLE_ECHO_INPUT or ENABLE_PROCESSED_INPUT;
     SetConsoleMode(FConsoleHandle, NormalMode);
   end;
+  try
   {$ENDIF}
 
-  repeat
-    IsValid := True;
-    Input := '';
+    repeat
+      IsValid := True;
+      Input := '';
 
-    // Display prompt
-    if Prompt <> '' then
-      System.Write(Prompt);
+      // Display prompt
+      if Prompt <> '' then
+        System.Write(Prompt);
 
-    // Simple blocking ReadLn
-    System.ReadLn(Input);
+      // Simple blocking ReadLn
+      System.ReadLn(Input);
 
-    // Standard input exhausted (EOF — piped/redirected input, or a headless run): stop asking. Signal
-    // quit so a numeric INPUT loop does not spin "?REDO FROM START" forever (and eventually crash); the
-    // program ends cleanly instead. At an interactive terminal EOF is only reached on Ctrl-Z / Ctrl-D.
-    if System.Eof(System.Input) and (Input = '') then
-    begin
-      FShouldQuit := True;
-      Result := '';
-      Exit;
-    end;
-
-    // Validate if numeric only
-    if NumericOnly and (Input <> '') then
-    begin
-      if not TryStrToFloat(Input, TempFloat) then
+      // Standard input exhausted (EOF — piped/redirected input, or a headless run): stop asking. Signal
+      // quit so a numeric INPUT loop does not spin "?REDO FROM START" forever (and eventually crash); the
+      // program ends cleanly instead. At an interactive terminal EOF is only reached on Ctrl-Z / Ctrl-D.
+      if System.Eof(System.Input) and (Input = '') then
       begin
-        System.WriteLn('?SYNTAX ERROR - Number expected');
-        IsValid := False;
-      end
-      else if not AllowDecimal then
+        FShouldQuit := True;
+        Result := '';
+        Exit;
+      end;
+
+      // Validate if numeric only
+      if NumericOnly and (Input <> '') then
       begin
-        if Pos('.', Input) > 0 then
+        if not TryStrToFloat(Input, TempFloat) then
         begin
-          System.WriteLn('?SYNTAX ERROR - Integer expected');
+          System.WriteLn('?SYNTAX ERROR - Number expected');
           IsValid := False;
+        end
+        else if not AllowDecimal then
+        begin
+          if Pos('.', Input) > 0 then
+          begin
+            System.WriteLn('?SYNTAX ERROR - Integer expected');
+            IsValid := False;
+          end;
         end;
       end;
-    end;
-  until IsValid;
+    until IsValid;
 
-  Result := Input;
+    Result := Input;
+
+  {$IFDEF WINDOWS}
+  finally
+    // Covers the normal path, the EOF Exit above, and any exception raised while reading.
+    if FOwnsConsoleInput then
+      SetConsoleMode(FConsoleHandle, FOldConsoleMode);
+  end;
+  {$ENDIF}
 end;
 
 function TTerminalInput.ReadKey: Char;

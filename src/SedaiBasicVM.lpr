@@ -2102,9 +2102,16 @@ begin
     on E: Exception do
     begin
       WriteLn('FATAL ERROR: ', E.Message);
-      WriteLn;
-      WriteLn('Press Enter to exit...');
-      ReadLn;
+      // Hold the window open only when a human is actually there to close it (sb launched by
+      // double-click, stdin attached to a console). Under a pipe, a redirect or a test harness nobody
+      // can press anything: the wait never ends, sb never exits, and the run becomes a stray process
+      // that has to be hunted down and killed.
+      if StdInIsConsole then
+      begin
+        WriteLn;
+        WriteLn('Press Enter to exit...');
+        ReadLn;
+      end;
       ExitCode := 1;
     end;
   end;
