@@ -1448,6 +1448,17 @@ begin
   //   - antIdentifier  → Value = name, no child (data-var address or @sub entry PC)
   //   - antArrayAccess → child0 = the array access (element address)
   //   - antMemberAccess→ child0 = the member access (record-field pointer)
+  // @Sin / @Cos / ...: the address of a math builtin taken as a function pointer. The name is a keyword
+  // token (ttMathFunction), not an identifier, and has no "(args)" here, so create the antProcAddress
+  // directly (the SSA encodes a BUILTIN_FP_TAG sentinel; an indirect call computes the op). The crt/math.bi
+  // "_" aliases (sin_, cos_, ...) are ordinary identifiers and take the normal path below.
+  if Context.Check(ttMathFunction) then
+  begin
+    Result := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(Context.CurrentToken.Value)), Token);
+    Context.Advance;
+    DoNodeCreated(Result);
+    Exit;
+  end;
   if not Context.Check(ttIdentifier) then
   begin
     HandleError('Expected a name after "@"', Context.CurrentToken);

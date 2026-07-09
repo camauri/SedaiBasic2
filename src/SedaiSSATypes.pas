@@ -43,6 +43,14 @@ const
   POINTER_ARRAY_SHIFT = 32;
   POINTER_OFFSET_MASK = (Int64(1) shl POINTER_ARRAY_SHIFT) - 1;
 
+  { FreeBASIC "@Sin" and other address-of-builtin function pointers. A real entry PC is a small bytecode
+    index, so a value with this high tag (bit 62) set cannot collide with one. An indirect call
+    (bcCallSubIndirect) whose target carries the tag reads its Double argument from float transfer slot 0,
+    applies the math op in the low byte, and writes the Double result slot — no jump. Lets
+    "Dim f As Function(As Double) As Double = @Sin : f(x)" and dispatch tables of math functions work.
+    Op ids: 1=Sin 2=Cos 3=Tan 4=Atn 5=Sqr 6=Exp 7=Log 8=Abs 9=Asin 10=Acos 11=Sinh 12=Cosh 13=Tanh 14=Int. }
+  BUILTIN_FP_TAG = Int64($4000000000000000);
+
   { Record-field pointer (@obj.field). FArrays-backed pointers (scalars/array elements) have bit 63
     clear (arrayId+1 < 2^31); a record-field pointer sets bit 63 (RECPTR_TAG) as a discriminator. It
     packs the record handle's index in bits [RECPTR_SLOT_BITS..61], the shared-record flag in bit 62

@@ -612,6 +612,13 @@ begin
             CurPC := Instr.Immediate;
           end;
         bcCallSubIndirect:  // FreeBASIC function pointer: like bcCallSub but the target entry PC is in Src1 (int reg)
+          if (IntRegs[Instr.Src1] and BUILTIN_FP_TAG) <> 0 then
+          begin
+            // @Sin etc.: compute the math op on the Double arg (xfer slot 0), write the Double result slot.
+            Ctx.XferFloat[255] := ComputeBuiltinFP(IntRegs[Instr.Src1] and $FF, Ctx.XferFloat[0]);
+            Inc(CurPC);
+          end
+          else
           begin
             FramePush(Ctx);
             GrowCallStackIfNeeded(Ctx);
@@ -620,7 +627,7 @@ begin
             {$IFDEF DEBUG_MODE}
             if Assigned(FDebugger) then FDebugger.NotifyCall;
             {$ENDIF}
-            CurPC := Ctx.IntRegs[Instr.Src1];
+            CurPC := IntRegs[Instr.Src1];
           end;
         bcReturnSub:
           begin

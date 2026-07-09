@@ -248,6 +248,7 @@ type
     procedure ExecutePlayString(Ctx: TExecutionContext; const MusicStr: string);
     procedure CooperativeSleep(Ctx: TExecutionContext; Milliseconds: Integer);
     {$ENDIF}
+    function ComputeBuiltinFP(OpId: Int64; X: Double): Double;   // @Sin etc.: math builtin taken as a funcptr
     procedure ExecuteInstruction(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSuperinstruction(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     function GfxMapX(LX: Double): Integer;   // FreeBASIC WINDOW: logical x -> physical x
@@ -3822,6 +3823,28 @@ begin
   FTrueValue := AValue;
 end;
 
+function TBytecodeVM.ComputeBuiltinFP(OpId: Int64; X: Double): Double;
+// Apply a math builtin taken as a function pointer (@Sin etc.), per the op id in a BUILTIN_FP_TAG value.
+begin
+  case OpId of
+    1:  Result := System.Sin(X);
+    2:  Result := System.Cos(X);
+    3:  Result := Math.Tan(X);
+    4:  Result := System.ArcTan(X);
+    5:  Result := System.Sqrt(X);
+    6:  Result := System.Exp(X);
+    7:  Result := System.Ln(X);
+    8:  Result := System.Abs(X);
+    9:  Result := Math.ArcSin(X);
+    10: Result := Math.ArcCos(X);
+    11: Result := Math.Sinh(X);
+    12: Result := Math.Cosh(X);
+    13: Result := Math.Tanh(X);
+    14: Result := System.Int(X);
+  else  Result := 0.0;
+  end;
+end;
+
 procedure TBytecodeVM.ExecuteInstruction(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   Group: Word;
@@ -3832,6 +3855,7 @@ var
   KeyText: string;
   Ch: Char;
   InQuotes: Boolean;
+  HandleNum64: Int64;   // indirect-call target (entry PC, or a BUILTIN_FP_TAG @Sin sentinel)
 begin
   // Two-level dispatch: extract group from high byte
   Group := Instr.OpCode shr 8;
@@ -4020,11 +4044,19 @@ begin
       end;
     bcCallSubIndirect:  // FreeBASIC function pointer: same as bcCallSub but the target entry PC is in Src1 (int reg)
       begin
-        FramePush(Ctx);
-        GrowCallStackIfNeeded(Ctx);
-        Ctx.CallStack[Ctx.CallStackPtr] := Ctx.PC;
-        Inc(Ctx.CallStackPtr);
-        Ctx.PC := Ctx.IntRegs[Instr.Src1] - 1;
+        HandleNum64 := Ctx.IntRegs[Instr.Src1];
+        if (HandleNum64 and BUILTIN_FP_TAG) <> 0 then
+          // @Sin etc.: no real PC — compute the math op on the Double arg (float xfer slot 0) and write
+          // the Double result slot. No jump; the main loop advances to the next instruction.
+          Ctx.XferFloat[255] := ComputeBuiltinFP(HandleNum64 and $FF, Ctx.XferFloat[0])   // 255 = XFER_RESULT_SLOT
+        else
+        begin
+          FramePush(Ctx);
+          GrowCallStackIfNeeded(Ctx);
+          Ctx.CallStack[Ctx.CallStackPtr] := Ctx.PC;
+          Inc(Ctx.CallStackPtr);
+          Ctx.PC := HandleNum64 - 1;
+        end;
       end;
     bcReturnSub:
       if Ctx.CallStackPtr > 0 then

@@ -378,6 +378,7 @@ type
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
     function TypeNameWidthCode(const TypeName: string): Integer;        // B1.5 phase 2: type -> narrow code
     function BinaryElemBytes(const VarName: string): Integer;           // byte width of a scalar for binary PUT/GET (from its width code)
+    function BuiltinFuncPtrOpId(const NameU: string): Integer;          // @Sin/@Cos/... math-builtin funcptr op id (0 if not a builtin)
     procedure RecordVarWidth(const VarName, TypeName: string);          // B1.5 phase 2: remember a var's width
     function ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;  // narrow by an explicit width code
     function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on scalar store
@@ -1161,6 +1162,18 @@ begin
       end
       else if IsSharedScalar(VarToStr(Node.Value)) then
         Result := EmitVarAddress(VarToStr(Node.Value))
+      else if (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) and
+              (BuiltinFuncPtrOpId(VarToStr(Node.Value)) > 0) then
+      begin
+        // @Sin / @sin_ etc.: a function pointer to a math builtin. FB proper cannot @ its builtins, but a
+        // dispatch table / funcptr of math ops is useful, so encode a BUILTIN_FP_TAG sentinel (op id in the
+        // low byte); an indirect call through it computes the op (see bcCallSubIndirect). Only when the name
+        // is not a user procedure (a user "sin" would win).
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, Result,
+                        MakeSSAConstInt(BUILTIN_FP_TAG or Int64(BuiltinFuncPtrOpId(VarToStr(Node.Value)))),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
       else
       begin
         // @subname → the named SUB's entry PC. The PROC_<name> label resolves to a PC at bytecode
@@ -13694,6 +13707,32 @@ begin
   else if T = 'USHORT' then Result := 4
   else if T = 'LONG' then Result := 5
   else if T = 'ULONG' then Result := 6
+  else Result := 0;
+end;
+
+function TSSAGenerator.BuiltinFuncPtrOpId(const NameU: string): Integer;
+// Op id for "@<math-builtin>" taken as a function pointer, else 0. Accepts the FreeBASIC names and the
+// crt/math.bi "_"-suffixed aliases ("sin_", "cos_", ...). The pointer value is a BUILTIN_FP_TAG sentinel
+// (see bcCallSubIndirect), so an indirect call computes the math op instead of jumping.
+var
+  N: string;
+begin
+  N := UpperCase(NameU);
+  if (Length(N) > 1) and (N[Length(N)] = '_') then N := Copy(N, 1, Length(N) - 1);  // crt alias sin_ -> SIN
+  if      (N = 'SIN')  then Result := 1
+  else if (N = 'COS')  then Result := 2
+  else if (N = 'TAN')  then Result := 3
+  else if (N = 'ATN')  or (N = 'ATAN') then Result := 4
+  else if (N = 'SQR')  or (N = 'SQRT') then Result := 5
+  else if (N = 'EXP')  then Result := 6
+  else if (N = 'LOG')  then Result := 7
+  else if (N = 'ABS')  or (N = 'FABS') then Result := 8
+  else if (N = 'ASIN') then Result := 9
+  else if (N = 'ACOS') then Result := 10
+  else if (N = 'SINH') then Result := 11
+  else if (N = 'COSH') then Result := 12
+  else if (N = 'TANH') then Result := 13
+  else if (N = 'INT')  or (N = 'FLOOR') then Result := 14
   else Result := 0;
 end;
 
