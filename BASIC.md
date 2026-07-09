@@ -2,25 +2,27 @@
 
 ## Implementation Progress
 
-**Commodore BASIC v7 core — 201 / 209 commands implemented (96%)**
+**Commodore BASIC v7 core — 202 / 210 commands implemented (96%)**
 
 ```
-[█████████████████████████████████████████████····] 90%
+[████████████████████████████████████████████████··] 96%
 ```
 
-**FreeBASIC keyword set — 527 / 643 implemented (82%)**. **66** of the unimplemented
+**FreeBASIC keyword set — 556 / 644 implemented (86%)**. **66** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, FFI) — not runnable keywords for a portable bytecode VM. Of the
-**577 applicable** keywords, **527 (91%)** are implemented. See the
+**578 applicable** keywords, **556 (96%)** are implemented. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
-[████████████████████████████████████████······] 89%
+[████████████████████████████████████████████████··] 96%
 ```
+
+> Counts above are derived from the status tables below, which are the source of truth.
 
 Legend: ✓ = Implemented | ◐ = Partial | ✗ = Not implemented
 
-## Operators (12/12 - 100%)
+## Operators (16/16 - 100%)
 
 | Command | Status | Description |
 |---------|--------|-------------|
@@ -70,7 +72,7 @@ Legend: ✓ = Implemented | ◐ = Partial | ✗ = Not implemented
 | `ON` | ✓ | Conditional jump |
 | `RETURN` | ✓ | Return from jump |
 
-## Flow Control - Program Execution (8/9 - 89%)
+## Flow Control - Program Execution (9/9 - 100%)
 
 | Command | Status | Description |
 |---------|--------|-------------|
@@ -217,7 +219,7 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 |---------|--------|-------------|
 | `CMD` | ✓ | Redirect screen output to file |
 
-## DOS Commands (26/29 - 90%)
+## DOS Commands (27/29 - 93%)
 
 | Command | Status | Description |
 |---------|--------|-------------|
@@ -271,7 +273,7 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `STR$` | ✓ | Convert number to string |
 | `TAB` | ✓ | Move cursor forward string from the first column |
 
-## Memory Management (3/9 - 33%)
+## Memory Management (8/9 - 89%)
 
 | Command/Function | Status | Description |
 |------------------|--------|-------------|
@@ -403,7 +405,7 @@ matching FreeBASIC's `CINT` family — distinct from `INT` (floor) and the impli
 truncation of a float→int assignment. Per-type range clamping/wrapping (e.g. `CBYTE`
 modulo 256) is not yet applied (v1).
 
-## Reserved Variables (6/9 - 67%)
+## Reserved Variables (9/9 - 100%)
 
 | Variable | Status | Description |
 |----------|--------|-------------|
@@ -426,7 +428,7 @@ modulo 256) is not yet applied (v1).
 | `TRAP` | ✓ | Set error handler line (TRAP 0 disables) |
 | `ERR$(n)` | ✓ | Return error message for error code n |
 
-## Debug (2/3 - 67%)
+## Debug (3/3 - 100%)
 
 | Command | Status | Description |
 |---------|--------|-------------|
@@ -463,7 +465,7 @@ modulo 256) is not yet applied (v1).
 | `REM` | ✓ | Starts a comment or remark |
 | `'` | ✓ | Apostrophe line comment (FreeBASIC/QBasic style); not a string delimiter (only `"` delimits strings) |
 
-## Special Input Devices (0/3 - 0%)
+## Special Input Devices (2/3 - 67%)
 
 | Function | Status | Description |
 |----------|--------|-------------|
