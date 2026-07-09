@@ -115,6 +115,9 @@ single work, but distributing separate works together (aggregation) is permitted
 | `multiplication_tables.bas` | <https://rosettacode.org/wiki/Multiplication_tables> |
 | `gray_code.bas` | <https://rosettacode.org/wiki/Gray_code> |
 | `nth_root.bas` | <https://rosettacode.org/wiki/Nth_root> |
+| `trigonometric_functions.bas` | <https://rosettacode.org/wiki/Trigonometric_functions> |
+| `semiprime.bas` | <https://rosettacode.org/wiki/Semiprime> |
+| `farey_sequence.bas` | <https://rosettacode.org/wiki/Farey_sequence> |
 
 ## Running
 
