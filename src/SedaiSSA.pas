@@ -18829,11 +18829,28 @@ begin
     end;
     antSleep:
     begin
-      // SLEEP n - delay for n seconds
-      // Child[0] = expression for seconds
+      // Dialect-sensitive delay: CLASSIC (Commodore BASIC v7) "SLEEP n" is n SECONDS; MODERN (FreeBASIC)
+      // "Sleep n" is n MILLISECONDS. The bcSleep opcode takes milliseconds, so in CLASSIC scale the value
+      // by 1000 here (MODERN passes it through). Child[0] = the delay expression.
       if Node.ChildCount > 0 then
       begin
         ProcessExpression(Node.GetChild(0), SecondsVal);
+        if not FModernMode then
+        begin
+          // CLASSIC seconds -> milliseconds. Fold a constant; otherwise scale the runtime value (as float,
+          // so a fractional second like "SLEEP 0.5" is honoured).
+          if SecondsVal.Kind = svkConstInt then
+            SecondsVal := MakeSSAConstInt(SecondsVal.ConstInt * 1000)
+          else if SecondsVal.Kind = svkConstFloat then
+            SecondsVal := MakeSSAConstFloat(SecondsVal.ConstFloat * 1000.0)
+          else
+          begin
+            SecondsVal := EnsureFloatRegister(SecondsVal);
+            FPSReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+            EmitInstruction(ssaMulFloat, FPSReg, SecondsVal, MakeSSAConstFloat(1000.0), MakeSSAValue(svkNone));
+            SecondsVal := FPSReg;
+          end;
+        end;
         EmitInstruction(ssaSleep, MakeSSAValue(svkNone), SecondsVal,
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
