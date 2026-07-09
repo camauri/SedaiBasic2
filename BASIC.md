@@ -2419,6 +2419,12 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `THREADDETACH` | ✓ | Releases a thread handle without waiting for the thread to finish. `THREADDETACH h` (M5.5; v1: cleaned up at program end). |
 | `THREADSELF` | ✓ | Returns the thread handle of the current thread. `h = THREADSELF()` (0 on the main thread) (M5.5). |
 
+> **Worker limit.** At most **64 workers may be live at once**; a `THREADCREATE`/`THREADCALL` beyond that
+> fails with a runtime error rather than spawning. A worker counts as live from its creation until its
+> procedure returns, so joining with `THREADWAIT` (or letting detached workers finish) frees slots. The
+> ceiling sits far above any realistic program and exists as a backstop: it bounds the damage from a
+> runaway spawn, which would otherwise saturate the host machine instead of failing the program.
+
 #### Mutexes
 
 | Keyword | Status | Description |
