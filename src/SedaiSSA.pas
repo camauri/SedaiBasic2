@@ -380,6 +380,7 @@ type
     function TypeNameWidthCode(const TypeName: string): Integer;        // B1.5 phase 2: type -> narrow code
     function BinaryElemBytes(const VarName: string): Integer;           // byte width of a scalar for binary PUT/GET (from its width code)
     function BuiltinFuncPtrOpId(const NameU: string): Integer;          // @Sin/@Cos/... math-builtin funcptr op id (0 if not a builtin)
+    function MathConstValue(const NameU: string; out V: Double): Boolean;  // crt/math.bi constants (M_PI, M_E, ...)
     procedure RecordVarWidth(const VarName, TypeName: string);          // B1.5 phase 2: remember a var's width
     function ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;  // narrow by an explicit width code
     function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on scalar store
@@ -1346,6 +1347,13 @@ begin
       if FModernMode and (UpperCase(VarName) = kFALSE) then
       begin
         Result := MakeSSAConstInt(0);
+        Exit;
+      end;
+      // FreeBASIC crt/math.bi constants (M_PI, M_E, ...): recognised as float literals (the include is a
+      // no-op). The M_ names are specific enough not to shadow a real variable in practice.
+      if FModernMode and MathConstValue(UpperCase(VarName), TempFloat) then
+      begin
+        Result := MakeSSAConstFloat(TempFloat);
         Exit;
       end;
       // FreeBASIC __FUNCTION__ / __FUNCTION_NQ__: the compiler substitutes the name of the enclosing
@@ -13739,6 +13747,27 @@ begin
   else if T = 'LONG' then Result := 5
   else if T = 'ULONG' then Result := 6
   else Result := 0;
+end;
+
+function TSSAGenerator.MathConstValue(const NameU: string; out V: Double): Boolean;
+// FreeBASIC crt/math.bi math constants (M_PI, M_E, ...). "#Include ""crt/math.bi""" is a no-op here, so
+// recognise the constants it would define directly, as compile-time Double literals (MODERN only).
+begin
+  Result := True;
+  if      NameU = 'M_PI'      then V := 3.14159265358979323846
+  else if NameU = 'M_E'       then V := 2.71828182845904523536
+  else if NameU = 'M_SQRT2'   then V := 1.41421356237309504880
+  else if NameU = 'M_SQRT1_2' then V := 0.70710678118654752440
+  else if NameU = 'M_LN2'     then V := 0.69314718055994530942
+  else if NameU = 'M_LN10'    then V := 2.30258509299404568402
+  else if NameU = 'M_LOG2E'   then V := 1.44269504088896340736
+  else if NameU = 'M_LOG10E'  then V := 0.43429448190325182765
+  else if NameU = 'M_PI_2'    then V := 1.57079632679489661923
+  else if NameU = 'M_PI_4'    then V := 0.78539816339744830962
+  else if NameU = 'M_1_PI'    then V := 0.31830988618379067154
+  else if NameU = 'M_2_PI'    then V := 0.63661977236758134308
+  else if NameU = 'M_2_SQRTPI' then V := 1.12837916709551257390
+  else begin Result := False; V := 0.0; end;
 end;
 
 function TSSAGenerator.BuiltinFuncPtrOpId(const NameU: string): Integer;
