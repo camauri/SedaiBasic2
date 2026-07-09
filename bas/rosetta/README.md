@@ -118,6 +118,10 @@ single work, but distributing separate works together (aggregation) is permitted
 | `trigonometric_functions.bas` | <https://rosettacode.org/wiki/Trigonometric_functions> |
 | `semiprime.bas` | <https://rosettacode.org/wiki/Semiprime> |
 | `farey_sequence.bas` | <https://rosettacode.org/wiki/Farey_sequence> |
+| `bitwise_operations.bas` | <https://rosettacode.org/wiki/Bitwise_operations> |
+| `enumerations.bas` | <https://rosettacode.org/wiki/Enumerations> |
+| `fibonacci_word.bas` | <https://rosettacode.org/wiki/Fibonacci_word> |
+| `amicable_pairs.bas` | <https://rosettacode.org/wiki/Amicable_pairs> |
 
 ## Running
 
