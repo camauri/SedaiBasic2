@@ -122,6 +122,11 @@ single work, but distributing separate works together (aggregation) is permitted
 | `enumerations.bas` | <https://rosettacode.org/wiki/Enumerations> |
 | `fibonacci_word.bas` | <https://rosettacode.org/wiki/Fibonacci_word> |
 | `amicable_pairs.bas` | <https://rosettacode.org/wiki/Amicable_pairs> |
+| `non-decimal_radices_convert.bas` | <https://rosettacode.org/wiki/Non-decimal_radices/Convert> |
+| `word_wrap.bas` | <https://rosettacode.org/wiki/Word_wrap> |
+| `soundex.bas` | <https://rosettacode.org/wiki/Soundex> |
+| `bin_given_limits.bas` | <https://rosettacode.org/wiki/Bin_given_limits> |
+| `longest_common_substring.bas` | <https://rosettacode.org/wiki/Longest_common_substring> |
 
 ## Running
 
