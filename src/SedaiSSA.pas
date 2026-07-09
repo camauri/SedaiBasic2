@@ -211,6 +211,7 @@ type
     FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
+    FArrayFuncPtrSig: TStringList;       // array-of-funcptr (DIM As <named funcptr type> a(..)) -> "params|ret" signature, so "a(i)(args)" is an indirect call
     FNeededDispatchers: TStringList;     // M4.3: "TYPE|METHOD" pairs needing a virtual dispatcher
 
     function GenerateUniqueLabel(const Prefix: string): string;
@@ -657,6 +658,8 @@ begin
   FVarExplicitType.CaseSensitive := False;
   FArrayRecordType := TStringList.Create;
   FArrayRecordType.CaseSensitive := False;
+  FArrayFuncPtrSig := TStringList.Create;
+  FArrayFuncPtrSig.CaseSensitive := False;
   FNeededDispatchers := TStringList.Create;
   FNeededDispatchers.Duplicates := dupIgnore;
   FNeededDispatchers.Sorted := True;
@@ -722,6 +725,7 @@ begin
   FVarRecordType.Free;
   FVarExplicitType.Free;
   FArrayRecordType.Free;
+  FArrayFuncPtrSig.Free;
   FNeededDispatchers.Free;
   FCurrentProcLocalRecs.Free;
   FCurrentProcByvalRecs.Free;
@@ -3832,6 +3836,20 @@ begin
           Exit;
         end;
 
+        // Dispatch table "arr(i)(args)": child0 is itself an array access into an array of function
+        // pointers ("Dim As <named funcptr type> arr(..)"). Evaluate arr(i) to the element's entry-PC
+        // value and lower an indirect call through it with the array's recorded signature.
+        if (Node.GetChild(0).NodeType = antArrayAccess) and
+           (Node.GetChild(0).ChildCount >= 1) and
+           (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+           (FArrayFuncPtrSig.Values[UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))] <> '') then
+        begin
+          TempStr := FArrayFuncPtrSig.Values[UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))];
+          ProcessExpression(Node.GetChild(0), Left);   // arr(i) -> the funcptr value (int)
+          Result := EmitIndirectCall(Left, TempStr, Node.GetChild(1));
+          Exit;
+        end;
+
         // Method call obj.method(args) (M4.1): child0 is a member access whose field is a
         // method of the object's type. Pass the object as the implicit THIS argument.
         if Node.GetChild(0).NodeType = antMemberAccess then
@@ -6019,6 +6037,11 @@ begin
       ElementType := TypeNameToBank(ArrElemTypeName, ArrName)
     else
       ElementType := GetVariableType(ArrName);
+
+    // Array of function pointers ("Dim As <named funcptr type> a(..)"): the element is an int entry PC.
+    // Record the signature so "a(i)(args)" is lowered as an indirect call through the loaded element.
+    if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') and (FFuncPtrTypes.IndexOfName(ArrElemTypeName) >= 0) then
+      FArrayFuncPtrSig.Values[UpperCase(ArrName)] := FFuncPtrTypes.Values[ArrElemTypeName];
 
     // B1.5: remember a narrow element width (DIM a(n) AS BYTE/.../SINGLE) so element stores wrap to it.
     if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') then
