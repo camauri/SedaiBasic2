@@ -18706,16 +18706,21 @@ begin
       IsContinueStmt := Assigned(Node.Token) and (UpperCase(Node.Token.Value) = kCONTINUE);
       if IsContinueStmt then
       begin
-        // FreeBASIC CONTINUE: skip the rest of the current iteration and jump to the innermost loop's
-        // continue point (FOR: increment; DO WHILE/WHILE: top condition; DO...LOOP cond: bottom test;
-        // DO...LOOP: body top). The kind word (FOR/DO/WHILE) is informational in v1. Clean up the
-        // current iteration's block scope (same unwinding as EXIT, down to and including the loop body).
+        // FreeBASIC CONTINUE: skip the rest of the current iteration and jump to a loop's continue point
+        // (FOR: increment; DO WHILE/WHILE: top condition; DO...LOOP cond: bottom test; DO...LOOP: body
+        // top). The kind word SELECTS which loop: "Continue Do" from inside a nested FOR must resume the
+        // enclosing DO (breaking out of the FOR), NOT the innermost loop. Only a bare "Continue" (no kind)
+        // targets the innermost loop. Clean up every abandoned iteration's block scope down to and
+        // including the target loop body (same unwinding as EXIT).
         if Length(FLoopStack) > 0 then
         begin
           ExitLevels := StrToIntDef(Node.Attributes.Values[ATTR_LOOP_LEVELS], 1);
-          ExitLoopIdx := High(FLoopStack);   // default: innermost
+          ExitLoopIdx := High(FLoopStack);   // default: innermost (bare CONTINUE)
           ExitAllDepth := 1;
-          if ExitLevels > 1 then
+          // A named kind (For / Do / While / Loop) routes to the ExitLevels-th enclosing loop of that
+          // kind; WHILE/WEND and DO...LOOP are both lkDo here.
+          if (Pos(kFOR, ExitKind) > 0) or (Pos(kDO, ExitKind) > 0) or
+             (Pos(kWHILE, ExitKind) > 0) or (Pos(kLOOP, ExitKind) > 0) then
           begin
             if Pos(kFOR, ExitKind) > 0 then ExitLoopKind := lkFor else ExitLoopKind := lkDo;
             if not FindEnclosingLoop(ExitLoopKind, ExitLevels, ExitLoopIdx, ExitAllDepth) then
@@ -18746,12 +18751,15 @@ begin
         else if Length(FLoopStack) > 0 then
         begin
           // EXIT FOR/DO/WHILE - clean up the loop's block scope (and any IF/SCOPE blocks nested between
-          // here and the loop body), then jump to its EndLabel. Multi-level "Exit For, For" targets the
-          // N-th enclosing loop of that kind and unwinds every block scope down to and including it.
+          // here and the loop body), then jump to its EndLabel. The kind word SELECTS which loop: "Exit
+          // Do" from inside a nested FOR must exit the enclosing DO (breaking the FOR too), not the
+          // innermost loop. Multi-level "Exit For, For" targets the N-th enclosing loop of that kind.
+          // Every case unwinds every block scope down to and including the target loop body.
           ExitLevels := StrToIntDef(Node.Attributes.Values[ATTR_LOOP_LEVELS], 1);
-          ExitLoopIdx := High(FLoopStack);   // default: innermost
+          ExitLoopIdx := High(FLoopStack);   // default: innermost (bare EXIT)
           ExitAllDepth := 1;
-          if ExitLevels > 1 then
+          if (Pos(kFOR, ExitKind) > 0) or (Pos(kDO, ExitKind) > 0) or
+             (Pos(kWHILE, ExitKind) > 0) or (Pos(kLOOP, ExitKind) > 0) then
           begin
             if Pos(kFOR, ExitKind) > 0 then ExitLoopKind := lkFor else ExitLoopKind := lkDo;
             if not FindEnclosingLoop(ExitLoopKind, ExitLevels, ExitLoopIdx, ExitAllDepth) then

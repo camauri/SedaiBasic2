@@ -25,6 +25,7 @@ single work, but distributing separate works together (aggregation) is permitted
 
 | File | Rosetta Code task |
 |------|-------------------|
+| `lzw_compression.bas`         | <https://rosettacode.org/wiki/LZW_compression> |
 | `pascals_triangle.bas`        | <https://rosettacode.org/wiki/Pascal%27s_triangle> |
 | `perfect_numbers.bas`         | <https://rosettacode.org/wiki/Perfect_numbers> |
 | `100_doors.bas`               | <https://rosettacode.org/wiki/100_doors> |
