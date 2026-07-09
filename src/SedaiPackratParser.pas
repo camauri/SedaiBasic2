@@ -3834,12 +3834,17 @@ begin
   Result := TASTNode.Create(antSleep, Token);
   Context.Advance; // Consume SLEEP
 
-  // Parse required parameter (seconds to sleep)
+  // Parse optional parameter (milliseconds to sleep)
   if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
   begin
     Param := ParseExpression;
     if Assigned(Param) then
       Result.AddChild(Param);
+    // FreeBASIC "Sleep milliseconds, wakeup": the optional second argument (1 = do not wake on a
+    // keypress) is consumed and ignored — the headless VM has no interactive wake anyway. Without this it
+    // was left as a stray ", literal" statement (a benign but noisy "Unhandled node type" warning).
+    if Context.Match(ttSeparParam) then
+      ParseExpression.Free;   // wakeup flag: discard
   end;
 
   DoNodeCreated(Result);

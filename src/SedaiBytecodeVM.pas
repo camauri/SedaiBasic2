@@ -4186,10 +4186,14 @@ begin
     bcSlow: if Assigned(FOutputDevice) then FOutputDevice.SetFastMode(False);
     bcSleep:
       begin
+        // FreeBASIC "Sleep n" is n MILLISECONDS (not seconds); the argument is a millisecond count. A bare
+        // "Sleep" (no argument) waits for a keypress in FB — headless there is none, so approximate with a
+        // short fixed wait. (The sleep duration never affects program OUTPUT, which is deterministic, so
+        // this only changes wall-clock time — but treating ms as seconds made "Sleep 100" hang ~100 s.)
         if Instr.Immediate > 0 then
-          SleepMs := Instr.Immediate * 1000
+          SleepMs := Instr.Immediate
         else if Instr.Src1 < Ctx.FloatRegCount then
-          SleepMs := Trunc(Ctx.FloatRegs[Instr.Src1] * 1000)
+          SleepMs := Trunc(Ctx.FloatRegs[Instr.Src1])
         else
           SleepMs := 1000;
         if SleepMs < 0 then SleepMs := 0;
