@@ -298,13 +298,16 @@ function TParserContext.Check(TokenType: TTokenType): Boolean;
 var
   ACurrentToken: TLexerToken;
 begin
-  if IsAtEnd then
-    Result := False
-  else
-  begin
-    ACurrentToken := GetCurrentToken;
-    Result := Assigned(ACurrentToken) and (ACurrentToken.TokenType = TokenType);
-  end;
+  // Do NOT short-circuit on IsAtEnd: IsAtEnd is true not only past the end but also WHILE sitting on
+  // the ttEndOfFile sentinel token, so "if IsAtEnd then False" made Check(ttEndOfFile) return False
+  // even when the current token *is* ttEndOfFile. Dozens of parser loops guard on
+  // "while not Check(ttEndOfFile)"; with that guard permanently False and Advance a no-op at EOF, any
+  // recovery/body/skip loop that reached EOF without its other terminator spun forever (sb pinned at
+  // 100% CPU — e.g. a SUB with no END SUB, an unterminated parameter list, a reserved word used as an
+  // array parameter). GetCurrentToken already returns nil past the end, so the Assigned() check below
+  // covers the genuine out-of-range case; when a token exists we compare its type, ttEndOfFile included.
+  ACurrentToken := GetCurrentToken;
+  Result := Assigned(ACurrentToken) and (ACurrentToken.TokenType = TokenType);
 end;
 
 function TParserContext.CheckAny(const TokenTypes: array of TTokenType): Boolean;
@@ -312,10 +315,10 @@ var
   i: Integer;
   ACurrentToken: TLexerToken;
 begin
+  // See TParserContext.Check: do NOT short-circuit on IsAtEnd, or CheckAny([..., ttEndOfFile]) can
+  // never report the ttEndOfFile sentinel and EOF-guarded loops spin forever. GetCurrentToken returns
+  // nil past the end, so the Assigned() check is the correct out-of-range guard.
   Result := False;
-  if IsAtEnd then
-    Exit;
-
   ACurrentToken := GetCurrentToken;
   if not Assigned(ACurrentToken) then
     Exit;
