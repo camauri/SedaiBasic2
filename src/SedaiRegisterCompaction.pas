@@ -183,7 +183,7 @@ begin
     // SUB/FUNCTION transfer-register load (M2): Dest is the int register written.
     bcXferLoadInt,
     // UDT/record (M3): RecordNew writes the handle (int); RecordLoadInt writes an int field.
-    bcRecordNew, bcRecordLoadInt,
+    bcRecordNew, bcRecordNewBlock, bcRecordLoadInt,
     // OOP (M4.3): RecordTypeId writes the runtime type-id (int).
     bcRecordTypeId,
     // OS threading (M5.2): LoadProcAddr writes an entry PC (int); ThreadCreate writes a thread handle (int).
@@ -430,6 +430,7 @@ begin
     bcRecordTypeId,   // OOP (M4.3): Src1 = handle
     bcRecordFree,     // DELETE: Src1 = handle
     bcRecordNewArrayInd,  // array-of-UDT member alloc: Src1 = member array-handle reg (int)
+    bcRecordNewBlock,     // Callocate block: Src1 = count reg (int)
     // OS threading (M5.2): ThreadCreate Src1 = proc-addr reg; ThreadWait Src1 = handle reg.
     // (bcLoadProcAddr's Src1 is the entry-PC label → Immediate, not a register, so it is excluded.)
     bcThreadCreate, bcThreadWait, bcThreadDetach,

@@ -195,6 +195,7 @@ const
   bcPrintUsingStage = bcGroupCore + 149; // stage one stringified value for a runtime-format PRINT USING
   bcPrintUsingRun   = bcGroupCore + 150; // run a runtime-format PRINT USING over the staged values
   bcRecordNewArrayInd = bcGroupCore + 151; // allocate a record per element of the member array whose FArrays handle is in IntRegs[Src1]; Immediate = packed slot counts (int|float<<16|str<<32|typeId<<48)
+  bcRecordNewBlock    = bcGroupCore + 152; // Callocate(n,SizeOf(T)) of a UDT: allocate IntRegs[Src1] CONSECUTIVE shared records, Dest = first handle; Immediate = packed slot counts. "p[i]" (first+i) indexes the i-th.
   bcPudef           = bcGroupCore + 69;  // PUDEF format string
   bcChar            = bcGroupCore + 70;  // CHAR mode, col, row, text
   // File operations
@@ -1500,6 +1501,7 @@ begin
         109: Result := 'RecordStoreString';
         110: Result := 'RecordNewArray';
         151: Result := 'RecordNewArrayInd';
+        152: Result := 'RecordNewBlock';
         111: Result := 'RecordTypeId';
         133: Result := 'RecordFree';
         112: Result := 'RecMarkPush';

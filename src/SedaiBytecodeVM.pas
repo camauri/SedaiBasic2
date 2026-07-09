@@ -330,6 +330,7 @@ type
     function AllocRecord(Ctx: TExecutionContext; IntC, FloatC, StrC, TypeId: Integer): Integer;  // M3: new record instance -> handle
     // M5.2c: allocate in the shared region (cross-thread); ResolveRec routes a handle to its record.
     function AllocSharedRecord(IntC, FloatC, StrC, TypeId: Integer): Int64;
+    function AllocSharedRecordBlock(N, IntC, FloatC, StrC, TypeId: Integer): Int64;  // N consecutive shared records (Callocate block)
     procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
     // FreeBASIC raw byte heap (Allocate family). All return/take RAWPTR_TAG-tagged byte offsets.
     function RawAlloc(ByteCount: PtrUInt): Int64;
@@ -2211,6 +2212,36 @@ begin
   for k := 0 to FArrays[ArrayId].TotalSize - 1 do
     if FArrays[ArrayId].IntData[k] = 0 then
       FArrays[ArrayId].IntData[k] := AllocSharedRecord(IntC, FloatC, StrC, TypeId);
+end;
+
+function TBytecodeVM.AllocSharedRecordBlock(N, IntC, FloatC, StrC, TypeId: Integer): Int64;
+// Allocate N records at CONSECUTIVE shared-region indices (always append, never reuse a freed slot) and
+// return the first's SHARED_REC_FLAG handle. Because the indices are consecutive, "handle + i" (a plain
+// pointer add) yields the i-th record's handle — the basis for "p[i]" on a Callocate(n, SizeOf(T)) block.
+var
+  i, firstIdx: Integer;
+  R: PRecordStorage;
+begin
+  if N < 1 then N := 1;
+  EnterCriticalSection(FSharedRecLock);
+  try
+    firstIdx := FSharedRecordCount;
+    for i := 0 to N - 1 do
+    begin
+      New(R);
+      R^.TypeId := TypeId;
+      SetLength(R^.IntData, IntC);
+      SetLength(R^.FloatData, FloatC);
+      SetLength(R^.StringData, StrC);
+      if FSharedRecordCount >= Length(FSharedRecords) then
+        SetLength(FSharedRecords, (FSharedRecordCount + 1) * 2);
+      FSharedRecords[FSharedRecordCount] := R;
+      Inc(FSharedRecordCount);
+    end;
+  finally
+    LeaveCriticalSection(FSharedRecLock);
+  end;
+  Result := SHARED_REC_FLAG or Int64(firstIdx);
 end;
 
 procedure TBytecodeVM.DeepCopyArrayRecords(Ctx: TExecutionContext; DestArr, SrcArr: Int64; PackedCounts: Int64);
@@ -4102,6 +4133,10 @@ begin
     bcRecordNewArrayInd:
       // Array-of-UDT MEMBER: the FArrays id is a runtime handle in IntRegs[Src1]. Imm=packed slot counts.
       RecordNewArrayInit(Ctx, Ctx.IntRegs[Instr.Src1], Instr.Immediate);
+    bcRecordNewBlock:  // Callocate(n, SizeOf(T)) of a UDT: n consecutive shared records; Dest = first handle
+      Ctx.IntRegs[Instr.Dest] := AllocSharedRecordBlock(Ctx.IntRegs[Instr.Src1],
+                                   Instr.Immediate and $FFFF, (Instr.Immediate shr 16) and $FFFF,
+                                   (Instr.Immediate shr 32) and $FFFF, (Instr.Immediate shr 48) and $FFFF);
     bcRecordFree:
       FreeSharedRecord(Ctx.IntRegs[Instr.Src1]);  // DELETE p: release the heap record (Src1=handle)
     // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).

@@ -4976,14 +4976,22 @@ begin
     if (LhsRecType <> '') and (AllocFuncU <> 'REALLOCATE') then
     begin
       FixedCap := FindUDT(LhsRecType);
+      // Record COUNT: CALLOCATE(count, SizeOf(T)) allocates a block of `count` records (arg 0); ALLOCATE
+      // (single byte-count arg) allocates one. A block of N CONSECUTIVE shared records makes "p[i]" (p + i)
+      // index the i-th; a single record covers the linked-list/tree node case. Both live in the shared
+      // region (handle non-zero, honours "p <> 0"; persists past the frame like Allocate).
+      if (UpperCase(AllocFuncU) = 'CALLOCATE') and (ExprNode.ChildCount >= 2) and
+         (ExprNode.GetChild(1).ChildCount >= 2) then
+        ProcessExpression(ExprNode.GetChild(1).GetChild(0), FixedCapReg)   // the element count
+      else
+        FixedCapReg := MakeSSAConstInt(1);
       ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      // Allocate in the SHARED record region (Immediate bit 48): its handle carries SHARED_REC_FLAG, so it
-      // is never 0 and honours the FB null-pointer convention ("While p <> 0"). It also persists past the
-      // current frame (heap lifetime, like Allocate), so a returned/linked node stays valid.
-      EmitInstruction(ssaRecordNew, ExprValue,
-                      MakeSSAConstInt(FUDTs[FixedCap].NInt), MakeSSAConstInt(FUDTs[FixedCap].NFloat),
-                      MakeSSAConstInt(FUDTs[FixedCap].NStr or (Int64(FixedCap) shl 32) or (Int64(1) shl 48)));
-      EmitRecordInit(ExprValue, FixedCap);
+      EmitInstruction(ssaRecordNewBlock, ExprValue, EnsureIntRegister(FixedCapReg),
+                      MakeSSAConstInt((Int64(FUDTs[FixedCap].NInt) and $FFFF)
+                                      or ((Int64(FUDTs[FixedCap].NFloat) and $FFFF) shl 16)
+                                      or ((Int64(FUDTs[FixedCap].NStr) and $FFFF) shl 32)
+                                      or ((Int64(FixedCap) and $FFFF) shl 48)),
+                      MakeSSAValue(svkNone));
       EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       Exit;
     end;
@@ -17125,6 +17133,10 @@ begin
       // name in scope — the node constructs a temporary T (same guard as the codegen hook).
       if (Result = '') and (FindUDT(ArrName) >= 0) and (ArrayIndexOf(ArrName) < 0) then
         Result := ArrName;
+      // "ptr[i].field": ptr is a pointer to a UDT (Callocate'd record block / managed handle); ptr[i] is a
+      // record of the pointee type.
+      if (Result = '') and (ArrayIndexOf(ArrName) < 0) then
+        Result := PointerUDTType(ArrName);
     end
     // Array-of-UDT MEMBER element "obj.field(i)": the element type is the field's ArrayElemType.
     else if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0).NodeType = antMemberAccess) then
@@ -17358,7 +17370,21 @@ begin
     end;
     // Array-of-UDT element: arr(i) evaluates to the element's record handle (int).
     TypeName := ArrayRecordTypeOf(ArrName);   // scope-aware (array-of-UDT parameter too)
-    if TypeName = '' then Exit;
+    if TypeName = '' then
+    begin
+      // "ptr[i].field": ptr is a pointer to a UDT (a Callocate(n, SizeOf(T)) record block, or a single
+      // managed handle). The i-th record's handle is ptr's value + i — records from one Callocate are
+      // consecutive shared-region slots, so adding i indexes the i-th (i=0 = ptr itself / a linked-list
+      // node). EmitPointerIndexAddress computes ptr + i (managed, unscaled).
+      ParentType := PointerUDTType(ArrName);
+      if (ParentType <> '') and (ObjNode.ChildCount >= 2) then
+      begin
+        HandleVal := EmitPointerIndexAddress(ArrName, ObjNode.GetChild(1));
+        TypeName := ParentType;
+        Result := True;
+      end;
+      Exit;
+    end;
     ProcessExpression(ObjNode, HandleVal);
     Result := True;
   end

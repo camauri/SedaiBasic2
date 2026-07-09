@@ -184,6 +184,7 @@ type
     // load/store a field (Dest or Src2 = value, Src1 = handle, Src3 = const slot index).
     ssaRecordNew, ssaRecordNewArray, ssaRecordTypeId, ssaRecordFree,
     ssaRecordNewArrayInd,   // allocate a record per element of a member array by HANDLE: Src1=array-handle reg, Immediate=packed slot counts (like ssaRecordNewArray but the FArrays id comes from a register, for array-of-UDT members)
+    ssaRecordNewBlock,      // Callocate(n, SizeOf(T)) of a UDT: allocate N CONSECUTIVE shared records and return the first handle: Dest=first handle, Src1=count reg, Immediate=packed slot counts. "p[i]" = first+i indexes the i-th.
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString,
     ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
     // OS threading (M5.2, FreeBASIC API): @sub → entry PC (Dest=int reg, Src1=svkLabel PROC_name);

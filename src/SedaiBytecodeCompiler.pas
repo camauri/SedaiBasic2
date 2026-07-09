@@ -303,6 +303,7 @@ begin
     ssaRecordNew: Result := bcRecordNew;
     ssaRecordNewArray: Result := bcRecordNewArray;
     ssaRecordNewArrayInd: Result := bcRecordNewArrayInd;
+    ssaRecordNewBlock: Result := bcRecordNewBlock;
     ssaRecordTypeId: Result := bcRecordTypeId;
     ssaRecordFree: Result := bcRecordFree;     // DELETE
     ssaRecMarkPush: Result := bcRecMarkPush;   // M8: block-scoped reclamation
@@ -1992,6 +1993,9 @@ begin
     BCInstr.Immediate := Instr.Src2.ConstInt;
   // ssaRecordNewArrayInd: Src1 = array-handle register (mapped normally above); Src2 const = packed counts.
   if Instr.OpCode = ssaRecordNewArrayInd then
+    BCInstr.Immediate := Instr.Src2.ConstInt;
+  // ssaRecordNewBlock: Dest = first handle, Src1 = count register (mapped normally); Src2 const = packed counts.
+  if Instr.OpCode = ssaRecordNewBlock then
     BCInstr.Immediate := Instr.Src2.ConstInt;
 
   {$IFDEF DEBUG_BYTECODE}

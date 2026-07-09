@@ -734,6 +734,13 @@ begin
             RecordNewArrayInit(Ctx, IntRegs[Instr.Src1], Instr.Immediate);
             Inc(CurPC);
           end;
+        bcRecordNewBlock:  // Callocate(n, SizeOf(T)) of a UDT: n consecutive shared records; Dest = first
+          begin
+            IntRegs[Instr.Dest] := AllocSharedRecordBlock(IntRegs[Instr.Src1],
+                                     Instr.Immediate and $FFFF, (Instr.Immediate shr 16) and $FFFF,
+                                     (Instr.Immediate shr 32) and $FFFF, (Instr.Immediate shr 48) and $FFFF);
+            Inc(CurPC);
+          end;
         // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).
         bcRecordLoadInt:
           begin Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.IntData[Instr.Immediate]; Inc(CurPC); end;
