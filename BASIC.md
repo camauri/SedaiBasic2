@@ -8,10 +8,12 @@
 [████████████████████████████████████████████████··] 96%
 ```
 
-**FreeBASIC keyword set — 562 / 644 implemented (87%)**. **66** of the unimplemented
+**FreeBASIC keyword set — 562 / 644 implemented (87%)**. **69** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
-build/platform directives, FFI) — not runnable keywords for a portable bytecode VM. Of the
-**578 applicable** keywords, **562 (97%)** are implemented. See the
+build/platform directives, FFI, and the raw-allocator operators — `New`/`Delete Overload`,
+`Placement New` — which a managed record model cannot honour) — not runnable keywords for a portable
+bytecode VM. Of the
+**575 applicable** keywords, **562 (98%)** are implemented, and **5** are partial. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1324,8 +1326,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `CLASS...END CLASS` | ✓ | Modelled as a `TYPE` (member access control is not enforced): fields, methods, arrays, construction all behave as for a record. |
 | `UNION...END UNION` | ✓ | Record whose members share storage. Overlap is faithful within a bank — members of the same type alias the same slot (write one, read another of the same type). Members in different banks (int/float/string) occupy distinct slots; cross-bank byte reinterpretation is not modelled (slot-based record model, v1). |
 | `EXTENDS` | ✓ | Single inheritance `TYPE Child EXTENDS Parent`: inherited fields (prefix layout) + methods + reference polymorphism (M4.2); virtual dispatch — an overridden method is selected by the instance's runtime type even through a base-typed variable (M4.3); inherited/ chained constructors & destructors (M4.4). |
-| `EXTENDS WSTRING` | ✗ | Extends an user defined type to inherits Wstring behavior |
-| `EXTENDS ZSTRING` | ✗ | Extends an user defined type to inherits Zstring behavior |
+| `EXTENDS WSTRING` | ~ | `TYPE T EXTENDS WSTRING` parses, and a `T` declaring `OPERATOR T.CAST() AS STRING` converts through that cast in PRINT, `&`, assignment and DIM-initialisation. Not yet applied when passed to a STRING parameter, nor inside the built-in string functions (LEN, UCASE, ...), which still see the record handle. |
+| `EXTENDS ZSTRING` | ~ | `TYPE T EXTENDS ZSTRING` parses, and a `T` declaring `OPERATOR T.CAST() AS STRING` converts through that cast in PRINT, `&`, assignment and DIM-initialisation. Not yet applied when passed to a STRING parameter, nor inside the built-in string functions; `STRPTR`/`SADD`/`LSET`/`RSET`/`SELECT CASE` promotion is not implemented. |
 | `IMPLEMENTS` | ✓ | `TYPE name [EXTENDS base] IMPLEMENTS iface[, ...]` clause accepted and ignored — interfaces are a reserved-but-unimplemented FB feature (the FB compiler itself does not implement them), so the type behaves as an ordinary UDT, matching FB. |
 | `FIELD` | ✓ | `TYPE name FIELD = n` alignment header — accepted and ignored (advisory in the slot-based record model). |
 | `OBJECT` | ✓ | Built-in RTTI base type. `TYPE X EXTENDS Object` gives RTTI; `X IS Object` is true for any derived instance; `DIM v AS Object` is a generic object handle. Modelled as an empty base UDT (type-id dispatch, no vtable pointer field). |
@@ -1584,10 +1586,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `New Expression` | ✓ | `NEW T` / `NEW T(args)` allocates a heap record (runs its constructor) and yields a `T PTR`. Outlives the allocating frame |
-| `New Overload` | ✗ | Constructor overloads apply, but `operator new` is not user-overloadable |
-| `Placement New` | ✗ |  |
+| `New Overload` | N/A | A member `OPERATOR NEW` replaces the *allocation* step with user code returning a raw address. `NEW T` here yields a managed record handle — a slot in the VM's record table, not an address the program could have allocated — so a user allocator cannot be honoured. Constructor overloads do apply. |
+| `Placement New` | N/A | `NEW(address) T` constructs an object at a caller-supplied address. Records live in the VM's managed table, not at raw addresses; the all-raw object model was evaluated and rejected because it conflicts with value semantics, RAII, virtual dispatch and threading. |
 | `Delete Statement` | ✓ | `DELETE p` runs the pointee's destructor and frees the heap record (slot recycled via a free list) |
-| `Delete Overload` | ✗ |  |
+| `Delete Overload` | N/A | The counterpart of `New Overload`: a member `OPERATOR DELETE` replacing the *deallocation* step. `DELETE p` frees a managed record slot, so there is no allocation for user code to take over. Destructors do run. |
 
 #### Iteration Operators
 

@@ -5247,6 +5247,21 @@ begin
     Exit;
   end;
 
+  // FreeBASIC "Operator T.Cast() As String": assigning such a UDT to a STRING converts through the cast,
+  // exactly as PRINT and "&" already do. Without this the assignment fell through to the generic scalar
+  // path, which read the record handle as if it were a string register and stored an empty string --
+  // silently, which is how "Dim As String s : s = myUdt" produced nothing. This is also what makes a
+  // "Type T Extends ZString" carrying a Cast operator usable wherever a string is expected.
+  if (VarRecordTypeName(VarName) = '') and (GetVariableType(VarName) = srtString) and
+     TryEmitUDTCastToString(ExprNode, ExprValue) then
+  begin
+    VarReg := GetOrAllocateVariable(VarName);
+    ExprValue := EnsureStringRegister(ExprValue);
+    if ExprValue.RegIndex <> VarReg.RegIndex then
+      EmitInstruction(ssaCopyString, VarReg, ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+
   // Get or allocate register for this variable
   VarReg := GetOrAllocateVariable(VarName);
 
