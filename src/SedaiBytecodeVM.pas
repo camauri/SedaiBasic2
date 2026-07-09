@@ -110,6 +110,11 @@ type
     // so a stale handle is harmless); contexts/spawn records are freed in the VM destructor.
     FWorkerThreads: array of TObject;
     FWorkerLock: TRTLCriticalSection;
+    // Number of workers spawned and not yet finished. Guarded by FWorkerLock. Backstop against a
+    // runaway spawn (see MAX_LIVE_WORKERS): a miscompiled @sub once resolved to entry PC 0, so every
+    // worker re-ran the whole main program -- including its own THREADCREATE calls -- and the resulting
+    // recursive thread explosion saturated the machine. A compiler bug must not be able to do that.
+    FLiveWorkers: Integer;
     // M5.4: mutex table. Each entry is a heap-allocated TRTLCriticalSection (pointer kept stable so a
     // held lock survives table growth); a Mutexcreate handle is (index + 1), 0 = invalid, nil = destroyed.
     // FMutexTableLock guards only the table (lookup/append), never the user mutex itself.
@@ -442,6 +447,13 @@ type
 
 implementation
 
+const
+  // Ceiling on simultaneously-live THREADCREATE workers. Sized far above any legitimate FreeBASIC
+  // program on a desktop core count, and far below what it takes to wedge the host. It exists so that a
+  // compiler defect (an @sub whose entry PC resolves wrong, a worker that re-enters the module body)
+  // fails the program instead of spawning threads without bound.
+  MAX_LIVE_WORKERS = 64;
+
 type
   // M5.2: one record per spawned worker thread. Carries everything the RTL thread function needs:
   // the VM (shared program/heap/runtime), the worker's own TExecutionContext, the SUB entry PC and
@@ -508,10 +520,20 @@ begin
   GActiveCtx := Spawn.Ctx;
   GSelfHandle := Spawn.Handle;   // M5.5: THREADSELF inside this worker returns its own handle
   try
-    Spawn.VM.RunWorker(Spawn);
-  except
-    // A worker must never propagate an exception past the RTL thread boundary (it would abort the
-    // process). v1: swallow it — the join still completes. (Proper per-thread error reporting: M5.5.)
+    try
+      Spawn.VM.RunWorker(Spawn);
+    except
+      // A worker must never propagate an exception past the RTL thread boundary (it would abort the
+      // process). v1: swallow it — the join still completes. (Proper per-thread error reporting: M5.5.)
+    end;
+  finally
+    // Release this worker's slot against MAX_LIVE_WORKERS even when its body raised.
+    EnterCriticalSection(Spawn.VM.FWorkerLock);
+    try
+      Dec(Spawn.VM.FLiveWorkers);
+    finally
+      LeaveCriticalSection(Spawn.VM.FWorkerLock);
+    end;
   end;
   GActiveCtx := nil;
   Result := 0;
@@ -610,6 +632,7 @@ begin
   FDrainCtx := TExecutionContext.Create;
   FRenderOwnerThreadId := GetCurrentThreadID;
   FHasWorkers := False;
+  FLiveWorkers := 0;
   // M5.2: the main context starts at the program EntryPoint (StartPC = -1); workers override it.
   FCtx.StartPC := -1;
   FDrainCtx.StartPC := -1;
@@ -2355,10 +2378,21 @@ begin
   for Idx := 0 to High(SpawnerCtx.XferStr) do Spawn.Ctx.XferStr[Idx] := SpawnerCtx.XferStr[Idx];
   EnterCriticalSection(FWorkerLock);
   try
+    // Refuse to spawn past the live-worker ceiling. A well-formed program never approaches it (this
+    // machine class runs a handful of workers); blowing past it means a runaway spawn, which without
+    // this guard takes the whole host down rather than just failing the program.
+    if FLiveWorkers >= MAX_LIVE_WORKERS then
+    begin
+      Spawn.Ctx.Free;
+      Spawn.Free;
+      raise Exception.CreateFmt(
+        'THREADCREATE: live worker limit (%d) exceeded -- runaway thread creation', [MAX_LIVE_WORKERS]);
+    end;
     Idx := Length(FWorkerThreads);
     SetLength(FWorkerThreads, Idx + 1);
     FWorkerThreads[Idx] := Spawn;
     FHasWorkers := True;
+    Inc(FLiveWorkers);
     Result := Idx + 1;   // handle (0 = invalid)
   finally
     LeaveCriticalSection(FWorkerLock);
