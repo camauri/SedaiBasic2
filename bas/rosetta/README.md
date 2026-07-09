@@ -129,6 +129,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `longest_common_substring.bas` | <https://rosettacode.org/wiki/Longest_common_substring> |
 | `day_of_the_week.bas` | <https://rosettacode.org/wiki/Day_of_the_week> |
 | `pythagorean_quadruples.bas` | <https://rosettacode.org/wiki/Pythagorean_quadruples> |
+| `real_constants_and_functions.bas` | <https://rosettacode.org/wiki/Real_constants_and_functions> |
 
 ## Running
 
