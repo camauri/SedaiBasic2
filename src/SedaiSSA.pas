@@ -2696,6 +2696,31 @@ begin
           Result := MakeSSARegister(srtString, DestReg);
           EmitInstruction(ssaStrWChr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
+        else if FModernMode and (FuncName = kINPUT) then
+        begin
+          // FreeBASIC INPUT(n [, [#]filenum]) — the function form: read n characters (BYTES; the wide
+          // sibling is WINPUT) from a file, or from the keyboard when no file number is given. The
+          // handle is materialised into an int register (0 = keyboard) so the VM reads it uniformly.
+          if (ArgListNode = nil) or (ArgListNode.NodeType <> antArgumentList) or (ArgListNode.ChildCount < 1) then
+          begin
+            Result := MakeSSAValue(svkNone);
+            Exit;
+          end;
+          ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+          ArgReg := EnsureIntRegister(ArgValue);                   // count
+          if ArgListNode.ChildCount >= 2 then
+          begin
+            ProcessExpression(ArgListNode.GetChild(1), MaskValue);
+            MaskReg := EnsureIntRegister(MaskValue);               // file handle
+          end
+          else
+          begin
+            MaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, MaskReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+          Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+          EmitInstruction(ssaInputChars, Result, ArgReg, MaskReg, MakeSSAValue(svkNone));
+        end
         else if (FuncName = 'ERR$') then
         begin
           // ERR$(n) - returns error message for error code n

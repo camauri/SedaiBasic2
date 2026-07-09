@@ -425,7 +425,7 @@ type
     // Error state for EL, ER, ERR$ system variables
     procedure SetErrorState(ALine, ACode: Integer; const AMessage: string);
     procedure SetErrorProc(const AProcName: string);   // ERFN
-    function ReadWideChars(Count, Handle: Integer): string;  // WINPUT
+    function ReadChars(Count, Handle: Integer; Wide: Boolean): string;  // INPUT() / WINPUT()
     procedure ClearErrorState;
     property LastErrorLine: Integer read GetLastErrorLine;
     property LastErrorCode: Integer read GetLastErrorCode;
@@ -3883,10 +3883,14 @@ begin
   FCtx.LastErrorProc := AProcName;
 end;
 
-function TBytecodeVM.ReadWideChars(Count, Handle: Integer): string;
-// WINPUT(n [, [#]f]): read Count wide characters. A WSTRING here is UTF-8 with codepoint-aware LEN, so a
-// "wide character" is one Unicode codepoint and may span several bytes: keep pulling bytes until Count
-// lead bytes have been seen. A lead byte is anything that is not a UTF-8 continuation byte (10xxxxxx).
+function TBytecodeVM.ReadChars(Count, Handle: Integer; Wide: Boolean): string;
+// Backs both INPUT(n [, [#]f]) and WINPUT(n [, [#]f]).
+//
+// The two differ only in what they count. INPUT counts bytes. WINPUT counts wide characters, and a
+// WSTRING here is UTF-8 with codepoint-aware LEN, so a wide character is one Unicode codepoint and may
+// span several bytes: keep pulling until Count lead bytes have been seen, a lead byte being anything
+// that is not a UTF-8 continuation byte (10xxxxxx). Either way the bytes read are returned whole.
+//
 // Handle = 0 reads from the keyboard (unechoed, like FreeBASIC), otherwise from that file number.
 // Short reads are not an error: end of file simply returns fewer characters, as FreeBASIC does.
 var
@@ -3909,17 +3913,18 @@ begin
     else
     begin
       if not Assigned(FOnFileData) then
-        raise Exception.Create('WINPUT: no file handler assigned');
+        raise Exception.Create('INPUT/WINPUT: no file handler assigned');
       Data := '';
       ErrorCode := 0;
       FOnFileData(Self, 'GET#', Handle, Data, ErrorCode);
       if ErrorCode <> 0 then
-        raise Exception.CreateFmt('WINPUT error %d reading from file %d', [ErrorCode, Handle]);
+        raise Exception.CreateFmt('INPUT/WINPUT error %d reading from file %d', [ErrorCode, Handle]);
       if Data = '' then Break;          // end of file
     end;
     Result := Result + Data;
-    // Count the codepoint only on a lead byte, so a multi-byte character is read whole.
-    if (Length(Data) > 0) and ((Ord(Data[1]) and $C0) <> $80) then
+    // Bytes count one apiece; wide characters count only on a lead byte, so a multi-byte character is
+    // read whole rather than cut in half.
+    if (not Wide) or ((Length(Data) > 0) and ((Ord(Data[1]) and $C0) <> $80)) then
       Inc(Got);
   end;
 end;
@@ -7171,9 +7176,12 @@ begin
           FInputDevice.ClearStopRequest;
         end;
       end;
-    18: // bcWInputChars - WINPUT(n [, [#]f])
+    18: // bcWInputChars - WINPUT(n [, [#]f]): count Unicode codepoints
       Ctx.StringRegs[Instr.Dest] :=
-        ReadWideChars(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);
+        ReadChars(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], True);
+    19: // bcInputChars - INPUT(n [, [#]f]): count bytes
+      Ctx.StringRegs[Instr.Dest] :=
+        ReadChars(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], False);
   else
     raise Exception.CreateFmt('Unknown I/O opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

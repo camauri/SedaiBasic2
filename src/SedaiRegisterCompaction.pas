@@ -406,6 +406,7 @@ begin
     bcLoadERFN,        // ERFN: procedure of the last error (string)
     bcLoadERMN,        // ERMN: module of the last error (string)
     bcWInputChars,     // WINPUT(n[,#f]): Dest = string; Src1/Src2 are int registers (see below)
+    bcInputChars,      // INPUT(n[,#f]): idem
     bcLoadDSS,         // DS$: Commodore disk status message line (string)
     // === GROUP 10: Graphics ===
     bcGraphicSShape,   // SSHAPE A$, x1, y1: capture screen area to string
@@ -475,7 +476,7 @@ begin
     bcRawMemCopy, bcRawMemMove, bcRawClear,
     // === GROUP 1: String operations with int param ===
     bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin, bcStrWChr,
-    bcWInputChars,    // WINPUT(n[,#f]): Src1 = count (int)
+    bcWInputChars, bcInputChars,    // W/INPUT(n[,#f]): Src1 = count (int)
     bcStrMkInt,  // MKI/MKL/MKSHORT/MKLONGINT(n) - Src1 = int value to pack (B3)
     bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - Src1 = count (int)
     bcCommand,  // COMMAND$(index) - Src1 = index (int)
@@ -635,7 +636,7 @@ begin
     // === GROUP 5: Memory operations ===
     bcPoke,           // POKE address, value: Src2 = value (int)
     // === GROUP 6: File I/O ===
-    bcWInputChars,    // WINPUT(n[,#f]): Src2 = file handle (int; 0 = keyboard)
+    bcWInputChars, bcInputChars,    // W/INPUT(n[,#f]): Src2 = file handle (int; 0 = keyboard)
     bcSeekSet,        // SEEK #n, pos: Src2 = position (int)
     bcFileAttr,       // FILEATTR(filenum, returntype): Src2 = returntype (int)
     bcPutBinInt,      // PUT #n: Src2 = int value

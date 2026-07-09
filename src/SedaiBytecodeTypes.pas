@@ -505,6 +505,8 @@ const
   // this VM) from file handle Src2, or from the keyboard when Src2's register holds 0.
   // Dest = string register, Src1 = count register, Src2 = file-handle register.
   bcWInputChars     = bcGroupIO + 18;
+  // INPUT(n [, [#]f]): the byte-oriented sibling of WINPUT. Same operands.
+  bcInputChars      = bcGroupIO + 19;
 
   // === GROUP 5: SPECIAL VARIABLES (0x05xx) ===
   bcLoadTI          = bcGroupSpecial + 0;   // TI: jiffies since start

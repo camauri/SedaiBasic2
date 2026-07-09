@@ -471,6 +471,7 @@ begin
     ssaLoadERFN: Result := bcLoadERFN;
     ssaLoadERMN: Result := bcLoadERMN;
     ssaWInputChars: Result := bcWInputChars;
+    ssaInputChars: Result := bcInputChars;
     ssaLoadDS: Result := bcLoadDS;
     ssaLoadDSS: Result := bcLoadDSS;
     ssaLoadST: Result := bcLoadST;

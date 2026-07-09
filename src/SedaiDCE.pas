@@ -347,7 +347,7 @@ begin
     ssaInput, ssaInputInt, ssaInputFloat, ssaInputString,
     // WINPUT consumes input: it advances the file position (or drains the keyboard buffer), so it must
     // survive even when its result is unused.
-    ssaWInputChars,
+    ssaWInputChars, ssaInputChars,
     ssaGet, ssaGetkey,  // GET/GETKEY wait for input - side effects!
     ssaPrintUsing, ssaPrintUsingStage, ssaPrintUsingRun, ssaPudef:
       Result := True;

@@ -417,6 +417,11 @@ begin
   Context.SetParseRule(ttGraphicsFunction, MakePrefixRule(@StaticParseGraphicsFunction, precCall));
   Context.SetParseRule(ttSpriteFunction, MakePrefixRule(@StaticParseSpriteFunction, precCall));
   Context.SetParseRule(ttInputFunction, MakePrefixRule(@StaticParseInputFunction, precCall));
+  // FreeBASIC INPUT(n [, [#]filenum]) — the FUNCTION form, which reads n characters and returns them.
+  // INPUT lexes as ttInputCommand because its usual role is the INPUT statement; that is parsed by the
+  // statement parser and never reaches here, so a prefix rule in expression position is unambiguous.
+  // ParseStringFunction already builds exactly the node this needs: antFunctionCall "INPUT" + arg list.
+  Context.SetParseRule(ttInputCommand, MakePrefixRule(@StaticParseStringFunction, precCall));
   Context.SetParseRule(ttUsrFunction, MakePrefixRule(@StaticParseUsrFunction, precCall));
   Context.SetParseRule(ttProcedureStart, MakePrefixRule(@StaticParseUserFunction, precCall));
   // M5.2 threading: @subname (proc address) and THREADCREATE(@sub, param) as value expressions.

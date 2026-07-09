@@ -318,6 +318,7 @@ type
     ssaLoadERFN,       // ERFN: Load the name of the procedure in which the last error occurred
     ssaLoadERMN,       // ERMN: Load the name of the module (source file) of the last error
     ssaWInputChars,    // WINPUT(n [, [#]f]): read n wide characters from a file, or from the keyboard
+    ssaInputChars,     // INPUT(n [, [#]f]): read n bytes from a file, or from the keyboard
     ssaLoadDS,         // DS: Commodore disk status code (= last file-operation error code)
     ssaLoadDSS,        // DS$: Commodore disk status message line "NN, MESSAGE,00,00"
     ssaLoadST,         // ST: Kernal I/O status byte (bit 6 = end-of-file on the last GET#)
