@@ -472,10 +472,11 @@ begin
   Context.SetParseRule(ttOpDiv, MakeInfixRule(@StaticParseBinaryOperator, precFactor));
   Context.SetParseRule(ttOpMod, MakeInfixRule(@StaticParseBinaryOperator, precFactor));
   Context.SetParseRule(ttOpIntDiv, MakeInfixRule(@StaticParseBinaryOperator, precFactor));  // \ integer division
-  // Bit shifts (FreeBASIC): looser than +/-, tighter than comparisons.
+  // Bit shifts (FreeBASIC): tighter than +/-, looser than * / \ MOD. Per the FB precedence
+  // table, `a Shl n + 1` parses as `(a Shl n) + 1`, so SHL/SHR bind tighter than binary +/-.
   Context.SetParseRule(ttOpShl, MakeInfixRule(@StaticParseBinaryOperator, precShift));
   Context.SetParseRule(ttOpShr, MakeInfixRule(@StaticParseBinaryOperator, precShift));
-  // String concatenation (FreeBASIC): looser than +/-, tighter than SHL/SHR.
+  // String concatenation (FreeBASIC): looser than +/-, tighter than comparisons.
   Context.SetParseRule(ttOpConcat, MakeInfixRule(@StaticParseBinaryOperator, precConcat));
   Context.SetParseRule(ttOpPow, MakeInfixRule(@StaticParsePower, precPower));
 

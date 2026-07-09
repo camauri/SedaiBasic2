@@ -289,9 +289,9 @@ type
     precAnd,            // AND
     precEquality,       // = <> (comparison)
     precComparison,     // < > <= >=
-    precShift,          // SHL SHR (FreeBASIC: looser than +/-, tighter than comparisons)
-    precConcat,         // & (FreeBASIC string concat: looser than +/-, tighter than SHL/SHR)
+    precConcat,         // & (FreeBASIC string concat: looser than +/-, tighter than comparisons)
     precTerm,           // + -
+    precShift,          // SHL SHR (FreeBASIC: tighter than +/-, looser than * / \ MOD)
     precFactor,         // * / \ MOD
     precUnary,          // - NOT
     precPower,          // ^
