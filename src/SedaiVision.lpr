@@ -62,6 +62,7 @@ uses
   // M5.2 threading: on Unix the cthreads unit MUST be first so BeginThread uses pthreads.
   {$IFDEF UNIX}cthreads,{$ENDIF}
   {$IFDEF WINDOWS}Windows,{$ENDIF}
+  SedaiConsoleState,
   Classes, SysUtils, Variants, TypInfo, Math,
   // Lexer/Parser
   SedaiLexerFSM, SedaiLexerTypes, SedaiLexerToken, SedaiTokenList,
@@ -507,8 +508,7 @@ begin
   try
     // Set console code page to UTF-8 for proper character encoding
     {$IFDEF WINDOWS}
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCP(CP_UTF8);
+    SetupConsoleUTF8;   // saves + restores the parent console's code pages; no-op when redirected
     SetTextCodePage(Output, CP_UTF8);
     SetTextCodePage(Input, CP_UTF8);
     SetMultiByteConversionCodePage(CP_UTF8);

@@ -62,7 +62,7 @@ uses
   // Executor Context
   SedaiExecutorContext, SedaiExecutorTypes, SedaiOutputInterface,
   // I/O Manager
-  SedaiIOManager, SedaiTerminalIO,
+  SedaiIOManager, SedaiTerminalIO, SedaiConsoleState,
   // Optional SDL2 window presenter for `sb --window` (WITH_WINDOW build only; no SDL2 dependency otherwise)
   {$IFDEF WITH_WINDOW}SedaiGraphicsBackend, SedaiWindowPresenter,{$ENDIF}
   // Runner and Serializer (for .basc support)
@@ -1961,10 +1961,12 @@ begin
     // value, so this only affects genuine float edge cases (e.g. an escaping Mandelbrot iterate overflowing).
     SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow, exUnderflow, exPrecision]);
 
-    // Set console code page to UTF-8 for proper character encoding
+    // Set console code page to UTF-8 for proper character encoding. SetupConsoleUTF8 saves the previous
+    // code pages (restored from SedaiConsoleState's finalization) and does nothing at all when stdout is
+    // redirected or piped: the console belongs to the parent shell, and a run that is killed rather than
+    // exiting -- as the regression harness does on timeout -- would never restore it.
     {$IFDEF WINDOWS}
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCP(CP_UTF8);
+    SetupConsoleUTF8;
     SetTextCodePage(Output, CP_UTF8);
     SetTextCodePage(Input, CP_UTF8);
     SetMultiByteConversionCodePage(CP_UTF8);

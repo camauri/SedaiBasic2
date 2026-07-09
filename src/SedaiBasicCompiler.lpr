@@ -43,6 +43,7 @@ program SedaiBasicCompiler;
 
 uses
   {$IFDEF WINDOWS}Windows,{$ENDIF}
+  SedaiConsoleState,
   Classes, SysUtils,
   // Lexer/Parser
   SedaiLexerFSM, SedaiLexerTypes, SedaiLexerToken, SedaiTokenList,
@@ -505,8 +506,7 @@ begin
   try
     // Set console code page to UTF-8
     {$IFDEF WINDOWS}
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCP(CP_UTF8);
+    SetupConsoleUTF8;   // saves + restores the parent console's code pages; no-op when redirected
     {$ENDIF}
 
     // Parse command-line parameters

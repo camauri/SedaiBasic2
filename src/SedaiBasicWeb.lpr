@@ -33,6 +33,7 @@ program SedaiBasicWeb;
 
 uses
   {$IFDEF WINDOWS}Windows,{$ENDIF}
+  SedaiConsoleState,
   Classes, SysUtils, Variants, TypInfo, Math,
   // HTTP Server
   fphttpserver,
@@ -162,8 +163,7 @@ begin
   try
     // Set console code page to UTF-8
     {$IFDEF WINDOWS}
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCP(CP_UTF8);
+    SetupConsoleUTF8;   // saves + restores the parent console's code pages; no-op when redirected
     SetTextCodePage(Output, CP_UTF8);
     SetTextCodePage(Input, CP_UTF8);
     SetMultiByteConversionCodePage(CP_UTF8);
