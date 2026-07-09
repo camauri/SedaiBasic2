@@ -1250,8 +1250,9 @@ var
   FoundIV: Boolean;
   IVSrc1: Boolean;  // True if IV is in Src1, False if in Src2
   AccumReg: Integer;
+  StrideReg: Integer;   // register holding the (constant) accumulator stride, loaded once in the preheader
   AccumRegType: TSSARegisterType;
-  InitInstr, UpdateInstr: TSSAInstruction;
+  InitInstr, UpdateInstr, StrideInstr: TSSAInstruction;
   PreHeader: TSSABasicBlock;
   InsertPos: Integer;
   IVStepInt: Int64;
@@ -1593,6 +1594,27 @@ begin
         InitInstr.Comment := 'SR: accum init';
         PreHeader.Instructions.Insert(InsertPos, InitInstr);
 
+        // Materialize the (constant) stride into its own register in the pre-header, so the per-iteration
+        // update is a register-register add. Emitting "ACCUM = ACCUM + <const>" directly as ssaAddInt with
+        // a CONSTANT Src2 is unsound: the bytecode compiler cannot put an immediate in Src2 of a
+        // register-register add and defaults that operand to R0, so the accumulator would add whatever R0
+        // holds (e.g. the inner loop's index) instead of the stride -- silently miscompiling nested loops.
+        StrideReg := FProgram.AllocRegister(AccumRegType);
+        if AccumRegType = srtInt then
+        begin
+          StrideInstr := TSSAInstruction.Create(ssaLoadConstInt);
+          StrideInstr.Dest := MakeSSARegister(srtInt, StrideReg);
+          StrideInstr.Src1 := MakeSSAConstInt(StrideInt);
+        end
+        else
+        begin
+          StrideInstr := TSSAInstruction.Create(ssaLoadConstFloat);
+          StrideInstr.Dest := MakeSSARegister(srtFloat, StrideReg);
+          StrideInstr.Src1 := MakeSSAConstFloat(StrideFloat);
+        end;
+        StrideInstr.Comment := 'SR: accum stride';
+        PreHeader.Instructions.Insert(InsertPos + 1, StrideInstr);
+
         // 2. Replace multiplication with copy from accumulator
         //    Change: J = I * STRIDE  -->  J = ACCUM (as Copy instruction)
         if AccumRegType = srtInt then
@@ -1620,20 +1642,14 @@ begin
             if InsertPos < 0 then InsertPos := 0;
           end;
 
+          // ACCUM = ACCUM + STRIDE, a register-register add (STRIDE materialized above).
           if AccumRegType = srtInt then
-          begin
-            UpdateInstr := TSSAInstruction.Create(ssaAddInt);
-            UpdateInstr.Dest := MakeSSARegister(srtInt, AccumReg);
-            UpdateInstr.Src1 := MakeSSARegister(srtInt, AccumReg);
-            UpdateInstr.Src2 := MakeSSAConstInt(StrideInt);
-          end
+            UpdateInstr := TSSAInstruction.Create(ssaAddInt)
           else
-          begin
             UpdateInstr := TSSAInstruction.Create(ssaAddFloat);
-            UpdateInstr.Dest := MakeSSARegister(srtFloat, AccumReg);
-            UpdateInstr.Src1 := MakeSSARegister(srtFloat, AccumReg);
-            UpdateInstr.Src2 := MakeSSAConstFloat(StrideFloat);
-          end;
+          UpdateInstr.Dest := MakeSSARegister(AccumRegType, AccumReg);
+          UpdateInstr.Src1 := MakeSSARegister(AccumRegType, AccumReg);
+          UpdateInstr.Src2 := MakeSSARegister(AccumRegType, StrideReg);
           UpdateInstr.Comment := 'SR: accum update';
           Block.Instructions.Insert(InsertPos, UpdateInstr);
         end;
