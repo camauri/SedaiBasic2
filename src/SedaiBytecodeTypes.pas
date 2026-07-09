@@ -501,6 +501,10 @@ const
   // FreeBASIC typed print (B1.5 phase C). Src1 = int register holding the value.
   bcPrintBool       = bcGroupIO + 16;  // print a BOOLEAN as "true"/"false"
   bcPrintUInt       = bcGroupIO + 17;  // print an Int64 as an unsigned 64-bit value
+  // WINPUT(n [, [#]f]): read n wide characters (Unicode codepoints, UTF-8 encoded like every WSTRING in
+  // this VM) from file handle Src2, or from the keyboard when Src2's register holds 0.
+  // Dest = string register, Src1 = count register, Src2 = file-handle register.
+  bcWInputChars     = bcGroupIO + 18;
 
   // === GROUP 5: SPECIAL VARIABLES (0x05xx) ===
   bcLoadTI          = bcGroupSpecial + 0;   // TI: jiffies since start

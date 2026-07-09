@@ -692,6 +692,14 @@ begin
       // whole substring. Only treated as a modifier when "Any" is immediately followed by another
       // expression (otherwise it is a plain identifier argument named ANY). The attribute is inert for
       // calls that don't consult it.
+      // FreeBASIC lets a file number carry an optional '#' sigil wherever one is expected as an
+      // argument: WINPUT(n, #f), EOF(#f), LOF(#f), SEEK(#f). The sigil adds nothing -- the argument is
+      // the same integer either way -- so consume it and parse the number that follows. A '#' can only
+      // begin an argument in this position: a trailing type suffix ("a#") is glued onto the identifier
+      // by the lexer, and preprocessor directives never reach the expression parser.
+      if Context.Check(ttFileHandlePrefix) then
+        Context.Advance;
+
       WasAny := False;
       if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'ANY')
          and Assigned(Context.PeekNext)

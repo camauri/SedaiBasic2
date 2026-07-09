@@ -470,6 +470,7 @@ begin
     ssaLoadERRS: Result := bcLoadERRS;
     ssaLoadERFN: Result := bcLoadERFN;
     ssaLoadERMN: Result := bcLoadERMN;
+    ssaWInputChars: Result := bcWInputChars;
     ssaLoadDS: Result := bcLoadDS;
     ssaLoadDSS: Result := bcLoadDSS;
     ssaLoadST: Result := bcLoadST;

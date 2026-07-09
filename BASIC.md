@@ -2203,8 +2203,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `INPUT #` | ✓ | Reads a list of values from a file or device. |
 | `WRITE #` | ✓ | Writes a list of values to a file as quoted CSV (strings in `"`, comma-separated). |
-| `INPUT()` | ✓ | Reads a number of characters from a file or device. |
-| `WINPUT()` | ✗ | Reads a number of wide characters from a file or device. |
+| `INPUT()` | ✗ | Reads a number of characters from a file or device. (`INPUT` is a statement keyword; the function form needs a primary-expression rule. `WINPUT()` covers the wide variant.) |
+| `WINPUT()` | ✓ | `WINPUT(n, [#]filenum)` — reads n wide characters (Unicode codepoints) from a file. A WSTRING is UTF-8 here, so a character may span several bytes; a short read at end of file returns fewer characters, as in FreeBASIC. |
 | `LINE INPUT #` | ✓ | `LINE INPUT #n, s` reads a whole line of text (commas not split). |
 | `PRINT #` | ✓ |  |
 | `? # (Shortcut for 'PRINT #')` | ✓ | `? #n, ...` is the shortcut for `PRINT #n, ...` (the lexer maps `?` to PRINT). |
@@ -2454,8 +2454,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `INPUT` | ✓ | Reads values from the keyboard buffer. |
 | `LINE INPUT` | ✓ | `LINE INPUT [;][prompt;]var` reads a whole line from the console; `LINE INPUT #n, s` from a file (commas not split). |
-| `INPUT()` | ✓ | Reads a number of characters from the keyboard buffer, file or device. |
-| `WINPUT()` | ✗ | Reads a number of wide characters from the keyboard buffer, file or device. |
+| `INPUT()` | ✗ | Reads a number of characters from the keyboard buffer, file or device. (See the file-I/O section: the function form is not implemented.) |
+| `WINPUT()` | ✓ | `WINPUT(n)` — reads n wide characters from the keyboard, unechoed. Extended keys are not read. (FreeBASIC itself does not read wide characters from the console.) |
 
 #### Reading keys from the keyboard buffer
 

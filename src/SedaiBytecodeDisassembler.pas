@@ -414,6 +414,8 @@ begin
       Line := Format('%4d: %-20s R%d', [Index, 'LoadERFN', Instr.Dest]);
     bcLoadERMN:
       Line := Format('%4d: %-20s R%d', [Index, 'LoadERMN', Instr.Dest]);
+    bcWInputChars:
+      Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'WInputChars', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcCsrlin:
       Line := Format('%4d: %-20s R%d', [Index, 'Csrlin', Instr.Dest]);
     bcLoadCWDS:

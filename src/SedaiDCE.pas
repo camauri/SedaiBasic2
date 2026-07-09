@@ -345,6 +345,9 @@ begin
     ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
     ssaPrintEnd,  // Reset reverse mode - affects display state
     ssaInput, ssaInputInt, ssaInputFloat, ssaInputString,
+    // WINPUT consumes input: it advances the file position (or drains the keyboard buffer), so it must
+    // survive even when its result is unused.
+    ssaWInputChars,
     ssaGet, ssaGetkey,  // GET/GETKEY wait for input - side effects!
     ssaPrintUsing, ssaPrintUsingStage, ssaPrintUsingRun, ssaPudef:
       Result := True;

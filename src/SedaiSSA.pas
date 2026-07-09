@@ -4262,6 +4262,30 @@ begin
           Exit;
         end;
 
+        // FreeBASIC WINPUT(n) / WINPUT(n, [#]filenum): read n wide characters (Unicode codepoints) from a
+        // file, or from the keyboard when no file number is given. Every WSTRING in this VM is UTF-8 with
+        // codepoint-aware LEN, so "wide" here means the VM consumes bytes until it has n codepoints.
+        // The file handle is materialised into an int register (0 = keyboard) so the VM reads it uniformly.
+        if FModernMode and (UpperCase(ArrName) = kWINPUT) and (ArrayIndexOf(ArrName) < 0) and
+           (Node.GetChild(1).ChildCount >= 1) then
+        begin
+          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ArgReg := EnsureIntRegister(ArgValue);                    // count
+          if Node.GetChild(1).ChildCount >= 2 then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(1), MaskValue);
+            MaskReg := EnsureIntRegister(MaskValue);                // file handle
+          end
+          else
+          begin
+            MaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, MaskReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+          Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+          EmitInstruction(ssaWInputChars, Result, ArgReg, MaskReg, MakeSSAValue(svkNone));
+          Exit;
+        end;
+
         // FreeBASIC ENVIRON$(name) / ENVIRON(name): value of an environment variable.
         if FModernMode and ((UpperCase(ArrName) = kENVIRONS) or (UpperCase(ArrName) = kENVIRON)) and
            (ArrayIndexOf(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
@@ -16570,7 +16594,8 @@ begin
           NameU := UpperCase(VarToStr(Node.GetChild(0).Value))
         else
           NameU := UpperCase(VarToStr(Node.Value));
-        Result := (NameU = kWSTR) or (NameU = kWCHR) or (NameU = kWSTRING) or IsWStringVar(NameU);
+        Result := (NameU = kWSTR) or (NameU = kWCHR) or (NameU = kWSTRING) or (NameU = kWINPUT) or
+                  IsWStringVar(NameU);
       end;
   end;
 end;

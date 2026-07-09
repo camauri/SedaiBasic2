@@ -383,6 +383,7 @@ const
   kVARPTR  = 'VARPTR';    // FreeBASIC: VARPTR(v) -> address of a variable (= @v) (intercepted as array-access)
   kPROCPTR = 'PROCPTR';   // FreeBASIC: PROCPTR(p) -> address of a procedure (= @p) (intercepted as array-access)
   kWSTRING = 'WSTRING';   // FreeBASIC: WSTRING type and WSTRING(n,cp) builder function
+  kWINPUT  = 'WINPUT';    // FreeBASIC: WINPUT(n [, [#]f]) — read n wide characters from a file or the keyboard
   kWSPACE  = 'WSPACE';    // N wide spaces (FreeBASIC)
   kVALINT  = 'VALINT';    // string -> Integer
   kVALLNG  = 'VALLNG';    // string -> LongInt
