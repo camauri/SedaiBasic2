@@ -233,6 +233,7 @@ type
     procedure PreAllocateVariables(Node: TASTNode);  // Pre-scan AST to allocate all variable registers
     procedure CollectDeclaredNames(Node: TASTNode);  // Pre-scan AST for names an explicit declaration introduces
     function IsDeclaredName(const VarName: string): Boolean;
+    function BareCallableFunction(const NameU: string): Boolean;  // a FUNCTION invocable with no arguments
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
     procedure ProcessStatement(Node: TASTNode);
     // SUB/FUNCTION (M2): pre-scan the AST to register all declarations up front (so CALL
@@ -1023,6 +1024,30 @@ begin
   Result := FDeclaredNames.IndexOf(UpperCase(VarName)) >= 0;
 end;
 
+function TSSAGenerator.BareCallableFunction(const NameU: string): Boolean;
+// FreeBASIC lets a FUNCTION be called with no parentheses when it needs no arguments: "x = Foo"
+// invokes Foo(). True only for a declared FUNCTION (a SUB yields no value) whose every parameter is
+// omissible -- none, or all carrying a default -- since the bare form supplies no arguments.
+var
+  Decl, ParamList, P: TASTNode;
+  i: Integer;
+begin
+  Result := False;
+  if not FProcDecls.TryGetValue(NameU, Decl) then Exit;
+  if (Decl = nil) or (UpperCase(VarToStr(Decl.Value)) <> 'FUNCTION') then Exit;
+  if Decl.ChildCount >= 2 then
+  begin
+    ParamList := Decl.GetChild(1);
+    if (ParamList <> nil) and (ParamList.NodeType = antParameterList) then
+      for i := 0 to ParamList.ChildCount - 1 do
+      begin
+        P := ParamList.GetChild(i);
+        if P.Attributes.Values['HASDEFAULT'] <> '1' then Exit;   // a required parameter -> not bare-callable
+      end;
+  end;
+  Result := True;
+end;
+
 { PreAllocateVariables - Scan AST to find all BASIC variables and allocate registers
   This separates variable registers from temporary expression registers, preventing conflicts }
 procedure TSSAGenerator.PreAllocateVariables(Node: TASTNode);
@@ -1582,6 +1607,17 @@ begin
       else if TryImplicitThisField(VarName, Node.Token, ArgListNode) then
       begin
         ProcessExpression(ArgListNode, Result);
+        ArgListNode.Free;
+      end
+      // FreeBASIC: a FUNCTION named without parentheses and taking no arguments is a call -- "g = Foo"
+      // runs Foo(). Excluded: the enclosing function's own name (which denotes the return value), and a
+      // name shadowed by a declared variable/parameter. Without this the name resolved as an unbound
+      // variable and read 0.
+      else if (UpperCase(VarName) <> FCurrentProcName) and (not IsDeclaredName(VarName)) and
+              BareCallableFunction(UpperCase(VarName)) then
+      begin
+        ArgListNode := TASTNode.Create(antArgumentList, Node.Token);
+        EmitUserFunctionCall(UpperCase(VarName), ArgListNode, Result);
         ArgListNode.Free;
       end
       else
@@ -6071,6 +6107,8 @@ var
   BlkIdx: Integer;         // M8/FB: innermost open block scope (-1 if none) for block-scoped UDT dtors
   MDtorSlotIdx: Integer;   // V5e: index into FModuleDtorSlots for a module global's handle slot (-1 if none)
   EllipCount: Integer;     // FB ellipsis "lb TO ...": element count taken from the initializer list
+  ScalarCtorInit: Boolean; // "DIM v AS T = <non-T expr>": an implicit conversion via a 1-arg constructor
+  CtorArgs: TASTNode;      // synthesized single-argument list wrapping that initializer
 const
   MAX_ARRAY_ELEMENTS = 125000000;  // 125M elements max (~1GB for 500x500x500 matrix)
 begin
@@ -6220,6 +6258,7 @@ begin
         end;
         Continue;
       end;
+      ScalarCtorInit := False;   // set only in the UDT branch below; keep the builtin path deterministic
       RecUDTIdx := FindUDT(RecTypeName);
       if RecUDTIdx >= 0 then
       begin
@@ -6233,9 +6272,24 @@ begin
                         MakeSSAConstInt(FUDTs[RecUDTIdx].NFloat),
                         MakeSSAConstInt(FUDTs[RecUDTIdx].NStr or (Int64(RecUDTIdx) shl 32)));  // Imm: strCount | typeId<<32
         EmitRecordInit(RecHandleVal, RecUDTIdx);  // allocate any nested-UDT field instances
+        // "DIM v AS T = <expr>" where expr is not itself a T (a scalar, or a different type) and T has a
+        // one-argument constructor: FreeBASIC treats this as the implicit conversion "DIM v AS T = T(expr)".
+        // Route the initializer through the constructor. Without this it fell to the "= expr" assignment
+        // below, which stored the scalar straight into the handle register and corrupted it (AV on use).
+        ScalarCtorInit := (ArrayDeclNode.ChildCount >= 3) and
+                          (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and
+                          (UpperCase(ObjectTypeName(ArrayDeclNode.GetChild(2))) <> UpperCase(RecTypeName)) and
+                          (ResolveConstructorLabel(RecTypeName, '?') <> '');   // a 1-parameter ctor exists
         // M4.4: run the constructor (if any). M4.4b: a "DIM v AS T(args)" attaches the ctor
         // argument list as child[2] (antArgumentList).
-        if (ArrayDeclNode.ChildCount >= 3) and
+        if ScalarCtorInit then
+        begin
+          CtorArgs := TASTNode.Create(antArgumentList, ArrayDeclNode.GetChild(2).Token);
+          CtorArgs.AddChild(ArrayDeclNode.GetChild(2).Clone);
+          EmitConstructorCall(RecHandleVal, RecTypeName, CtorArgs);
+          CtorArgs.Free;
+        end
+        else if (ArrayDeclNode.ChildCount >= 3) and
            (ArrayDeclNode.GetChild(2).NodeType = antArgumentList) then
         begin
           if ArrayDeclNode.GetChild(2).Attributes.Values['TUPLEINIT'] = '1' then
@@ -6280,7 +6334,7 @@ begin
       // value-copy when both sides are UDTs (reuses ProcessAssignment's existing semantics). The
       // synthesized node is transient and freed here; its cloned expression is owned by it.
       if (ArrayDeclNode.ChildCount >= 3) and
-         (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
+         (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and (not ScalarCtorInit) then
       begin
         InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
         InitAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(ArrName),
