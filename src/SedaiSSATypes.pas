@@ -452,6 +452,8 @@ type
                        //   (Dest = result, Src1 = row, Src2 = col, Immediate = colorflag register)
     ssaConLocate,      // MODERN LOCATE row, col: position the console TEXT cursor (Src1 = row, Src2 = col,
                        //   both 1-based). CLASSIC LOCATE is ssaGraphicLocate, the pixel cursor.
+    ssaConViewPrint,   // VIEW PRINT [first TO last]: the text print area (Src1 = first row, Src2 = last row,
+                       //   1-based; 0 in either means "the whole screen")
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 

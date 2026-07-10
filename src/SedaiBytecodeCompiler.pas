@@ -412,6 +412,7 @@ begin
     ssaGfxPoint: Result := bcGfxPoint;
     ssaConScreen: Result := bcConScreen;
     ssaConLocate: Result := bcConLocate;
+    ssaConViewPrint: Result := bcConViewPrint;
     ssaGfxPaint: Result := bcGfxPaint;
     ssaGfxLine: Result := bcGfxLine;
     ssaGfxCircle: Result := bcGfxCircle;

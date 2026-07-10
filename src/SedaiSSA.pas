@@ -511,6 +511,7 @@ type
     procedure ProcessPCopy(Node: TASTNode);          // PCOPY src,dst / SCREENCOPY
     procedure ProcessGfxWindow(Node: TASTNode);      // WINDOW [SCREEN] (x1,y1)-(x2,y2)
     procedure ProcessGfxView(Node: TASTNode);        // VIEW [SCREEN] (x1,y1)-(x2,y2)
+    procedure ProcessViewPrint(Node: TASTNode);      // VIEW PRINT [firstrow TO lastrow]
     procedure ProcessGfxScreen(Node: TASTNode);      // SCREEN mode [, depth, num_pages]
     procedure ProcessColor(Node: TASTNode);
     procedure ProcessSetColor(Node: TASTNode);
@@ -9678,6 +9679,39 @@ begin
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(Y2R, nil);
   Instr.AddPhiSource(MakeSSAConstInt(Flags), nil);
+end;
+
+procedure TSSAGenerator.ProcessViewPrint(Node: TASTNode);
+// VIEW PRINT [firstrow TO lastrow] : the console's text print area, and so its scroll region. Rows are
+// 1-based. Either bound left at 0 means "the whole screen", which is also what a bare VIEW PRINT asks
+// for. "VIEW PRINT n" with no TO is a one-row area, as FreeBASIC reads it.
+var
+  FirstV, LastV, FirstR, LastR: TSSAValue;
+
+  function ZeroReg: TSSAValue;
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount >= 1 then
+  begin
+    ProcessExpression(Node.GetChild(0), FirstV); FirstR := EnsureIntRegister(FirstV);
+    if Node.ChildCount >= 2 then
+    begin
+      ProcessExpression(Node.GetChild(1), LastV); LastR := EnsureIntRegister(LastV);
+    end
+    else
+      LastR := FirstR;
+  end
+  else
+  begin
+    FirstR := ZeroReg;
+    LastR := FirstR;
+  end;
+  EmitInstruction(ssaConViewPrint, MakeSSAValue(svkNone), FirstR, LastR, MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.ProcessGfxView(Node: TASTNode);
@@ -18942,9 +18976,10 @@ begin
     antPCopy: ProcessPCopy(Node);
     antGfxWindow: ProcessGfxWindow(Node);
     antGfxView: ProcessGfxView(Node);
+    antViewPrint: ProcessViewPrint(Node);
     antGfxScreen: ProcessGfxScreen(Node);
     antGfxSetmouse: ProcessGfxSetmouse(Node);
-    antGfxNop: ;  // SCREENLOCK/UNLOCK/SYNC/WINDOWTITLE/VIEW PRINT: accept-and-ignore (no code emitted)
+    antGfxNop: ;  // SCREENLOCK/UNLOCK/SYNC/WINDOWTITLE: accept-and-ignore (no code emitted)
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);
     antWidth: ProcessWidth(Node);

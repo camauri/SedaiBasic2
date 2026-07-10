@@ -8,12 +8,12 @@
 [████████████████████████████████████████████████··] 96%
 ```
 
-**FreeBASIC keyword set — 565 / 645 implemented (88%)**. **69** of the unimplemented
+**FreeBASIC keyword set — 566 / 645 implemented (88%)**. **69** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, FFI, and the raw-allocator operators — `New`/`Delete Overload`,
 `Placement New` — which a managed record model cannot honour) — not runnable keywords for a portable
 bytecode VM. Of the
-**576 applicable** keywords, **565 (98%)** are implemented, and **5** are partial. See the
+**576 applicable** keywords, **566 (98%)** are implemented, and **5** are partial. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1288,9 +1288,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **565 / 645 implemented (88%)**, plus 5 partial (~).
-> Of the 80 not-implemented, 69 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **565 / 576 ≈ 98% of the
+> **Coverage (FreeBASIC keyword set):** **566 / 645 implemented (88%)**, plus 5 partial (~).
+> Of the 79 not-implemented, 69 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **566 / 576 ≈ 98% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -2092,7 +2092,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `CLS` | ✓ | Clears the screen and homes the cursor (alias of `SCNCLR`; resets `POS`/`CSRLIN` to 0). |
 | `WIDTH` | ✓ | Sets or returns the number of rows and columns of the console display. |
-| `VIEW PRINT` | ✗ | Sets the printable area of the console screen. (Deferred: needs a scroll-region console.) |
+| `VIEW PRINT` | ✓ | `VIEW PRINT [firstrow TO lastrow]` sets the console's text print area, and so its scroll region: text wraps at its right edge and scrolls at its bottom, `CLS` clears only it, and the cursor moves to the start of `firstrow`. Rows are 1-based; a bare `VIEW PRINT` restores the whole screen. Shares the print-area machinery with the Commodore v7 `WINDOW` command. |
 
 #### Cursor Color and Positioning
 

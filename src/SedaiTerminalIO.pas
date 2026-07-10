@@ -76,7 +76,11 @@ type
     // bound and never scroll; the model's caret stays inside the grid. Keeping them apart means adding
     // the model changes no existing console behaviour.
     FCells: array of array of TTermCell;
-    FCellX, FCellY: Integer;   // the model's caret: always within [0..FCols-1] x [0..FRows-1]
+    FCellX, FCellY: Integer;   // the model's caret: always within the print area below
+    // The print area (VIEW PRINT / the C128 WINDOW): text wraps at its right edge and scrolls at its
+    // bottom, leaving the rest of the screen alone. Defaults to the whole grid, which is why adding it
+    // changes nothing for a program that never asks for one.
+    FViewTop, FViewBottom, FViewLeft, FViewRight: Integer;   // 0-based, inclusive
     // Optional shared graphics framebuffer (sb --window): when attached, the C128 graphics commands
     // render into it (the software backend's surface, which the window presenter mirrors). nil = the
     // usual headless terminal (graphics are no-ops). Not owned. Viewport-only — no text-on-graphics.
@@ -88,6 +92,7 @@ type
     function ResolveC128Color(Source: UInt32; out UseIndex: Boolean): UInt32;
     // The modelled screen (see FCells)
     procedure AllocCells;
+    procedure ClearView;
     procedure ScrollCellsUp;
     procedure CellNextRow;
     procedure PutCells(const Text: string);
@@ -266,42 +271,51 @@ end;
 { === The modelled screen (see FCells) === }
 
 procedure TTerminalController.AllocCells;
-var
-  R, C: Integer;
 begin
   if (FCols <= 0) or (FRows <= 0) then Exit;
   SetLength(FCells, FRows, FCols);
-  for R := 0 to FRows - 1 do
-    for C := 0 to FCols - 1 do
+  // A fresh screen has no print area of its own: it is the whole grid.
+  FViewTop := 0; FViewBottom := FRows - 1;
+  FViewLeft := 0; FViewRight := FCols - 1;
+  ClearView;
+end;
+
+procedure TTerminalController.ClearView;
+var
+  R, C: Integer;
+begin
+  if Length(FCells) = 0 then Exit;
+  for R := FViewTop to FViewBottom do
+    for C := FViewLeft to FViewRight do
     begin
       FCells[R][C].Ch := ' ';
       FCells[R][C].Fg := FFgIdx;
       FCells[R][C].Bg := FBgIdx;
     end;
-  FCellX := 0;
-  FCellY := 0;
+  FCellX := FViewLeft;
+  FCellY := FViewTop;
 end;
 
 procedure TTerminalController.ScrollCellsUp;
 var
   R, C: Integer;
 begin
-  for R := 0 to FRows - 2 do
-    for C := 0 to FCols - 1 do
+  for R := FViewTop to FViewBottom - 1 do
+    for C := FViewLeft to FViewRight do
       FCells[R][C] := FCells[R + 1][C];
-  for C := 0 to FCols - 1 do
+  for C := FViewLeft to FViewRight do
   begin
-    FCells[FRows - 1][C].Ch := ' ';
-    FCells[FRows - 1][C].Fg := FFgIdx;
-    FCells[FRows - 1][C].Bg := FBgIdx;
+    FCells[FViewBottom][C].Ch := ' ';
+    FCells[FViewBottom][C].Fg := FFgIdx;
+    FCells[FViewBottom][C].Bg := FBgIdx;
   end;
 end;
 
 procedure TTerminalController.CellNextRow;
 begin
-  FCellX := 0;
-  if FCellY >= FRows - 1 then
-    ScrollCellsUp          // at the bottom the screen scrolls; the caret stays on the last row
+  FCellX := FViewLeft;
+  if FCellY >= FViewBottom then
+    ScrollCellsUp          // at the area's bottom the area scrolls; the caret stays on its last row
   else
     Inc(FCellY);
 end;
@@ -316,12 +330,12 @@ begin
   begin
     Ch := Text[i];
     if Ch = #13 then
-      FCellX := 0
+      FCellX := FViewLeft
     else if Ch = #10 then
       CellNextRow
     else
     begin
-      if FCellX >= FCols then CellNextRow;   // wrap at the right margin
+      if FCellX > FViewRight then CellNextRow;   // wrap at the print area's right edge
       FCells[FCellY][FCellX].Ch := Ch;
       FCells[FCellY][FCellX].Fg := FFgIdx;
       FCells[FCellY][FCellX].Bg := FBgIdx;
@@ -384,7 +398,7 @@ begin
   {$ELSE}
   System.Write(#27'[2J'#27'[H');  // ANSI clear + home
   {$ENDIF}
-  AllocCells;   // blank the modelled screen and home its caret
+  ClearView;    // CLS blanks the print area and homes the caret inside it, leaving the area itself set
   FCursorX := 0;
   FCursorY := 0;
 end;
@@ -797,8 +811,21 @@ begin
 end;
 
 procedure TTerminalController.SetWindow(Col1, Row1, Col2, Row2: Integer; DoClear: Boolean);
+// The print area, set by VIEW PRINT and by the Commodore v7 WINDOW command. Nothing is redrawn -- the
+// text already went to stdout -- but the model wraps and scrolls inside it from here on.
+  function Clamp(V, Lo, Hi: Integer): Integer;
+  begin
+    if V < Lo then Result := Lo else if V > Hi then Result := Hi else Result := V;
+  end;
 begin
-  // Not supported in terminal mode
+  if Length(FCells) = 0 then Exit;
+  FViewLeft   := Clamp(Col1, 0, FCols - 1);
+  FViewRight  := Clamp(Col2, FViewLeft, FCols - 1);
+  FViewTop    := Clamp(Row1, 0, FRows - 1);
+  FViewBottom := Clamp(Row2, FViewTop, FRows - 1);
+  FCellX := FViewLeft;
+  FCellY := FViewTop;
+  if DoClear then ClearView;
 end;
 
 function TTerminalController.GetWindowLines: Integer;

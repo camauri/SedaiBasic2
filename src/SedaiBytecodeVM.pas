@@ -7220,6 +7220,22 @@ begin
       if Assigned(FOutputDevice) then
         FOutputDevice.SetCursor(Integer(Ctx.IntRegs[Instr.Src2]) - 1,
                                 Integer(Ctx.IntRegs[Instr.Src1]) - 1);
+    22: // bcConViewPrint - VIEW PRINT [first TO last]: the text print area (scroll region)
+      if Assigned(FOutputDevice) then
+      begin
+        ScreenRow := Integer(Ctx.IntRegs[Instr.Src1]);   // first row, 1-based (0 = whole screen)
+        ScreenCol := Integer(Ctx.IntRegs[Instr.Src2]);   // last row, 1-based
+        if (ScreenRow <= 0) or (ScreenCol <= 0) then
+        begin
+          ScreenRow := 1;
+          ScreenCol := FOutputDevice.GetActualRows;
+        end;
+        if ScreenCol < ScreenRow then ScreenCol := ScreenRow;
+        // The print area spans every column; only the rows are bounded. No clear -- FB leaves the
+        // area's contents alone and only moves the cursor to the start of the first row.
+        FOutputDevice.SetWindow(0, ScreenRow - 1, FOutputDevice.GetActualCols - 1, ScreenCol - 1, False);
+        FOutputDevice.SetCursor(0, ScreenRow - 1);
+      end;
   else
     raise Exception.CreateFmt('Unknown I/O opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

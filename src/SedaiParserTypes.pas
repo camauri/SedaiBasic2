@@ -221,6 +221,7 @@ type
     antPCopy,             // PCOPY src,dst / SCREENCOPY (FreeBASIC page copy; OP attribute)
     antGfxWindow,         // WINDOW [SCREEN] (x1,y1)-(x2,y2) (FreeBASIC logical coordinate system)
     antGfxView,           // VIEW [SCREEN] (x1,y1)-(x2,y2) (FreeBASIC viewport: offset + clip)
+    antViewPrint,         // VIEW PRINT [firstrow TO lastrow] (text print area / scroll region)
     antGfxScreen,         // SCREEN mode [, depth, num_pages] (FreeBASIC numbered graphics mode)
     antGfxSetmouse,       // SETMOUSE [x][,y][,visibility][,clip] (FreeBASIC: set mouse position/visibility)
     antBeep,              // BEEP command (console bell: emits CHR(7))

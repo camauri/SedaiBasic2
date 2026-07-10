@@ -4363,9 +4363,9 @@ begin
     Result := TASTNode.Create(antImageInfo, Token)
   else if CmdName = 'VIEW' then
   begin
-    // FB graphics VIEW [SCREEN] [(x1,y1)-(x2,y2)] vs QB "VIEW PRINT" (text scroll region, deferred).
+    // FB graphics VIEW [SCREEN] [(x1,y1)-(x2,y2)] vs "VIEW PRINT" (the text print area / scroll region).
     if Assigned(Context.PeekNext) and (UpperCase(Context.PeekNext.Value) = 'PRINT') then
-      Result := TASTNode.Create(antGfxNop, Token)        // VIEW PRINT: accept-and-ignore (deferred)
+      Result := TASTNode.Create(antViewPrint, Token)
     else
       Result := TASTNode.Create(antGfxView, Token);
   end
@@ -4723,6 +4723,25 @@ begin
         Context.Advance;
         if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
           ParseExpression;
+      end;
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // VIEW PRINT [firstrow TO lastrow]: the text print area. With no bounds the whole screen is used.
+  // The leading VIEW was consumed by the caller; PRINT is still on the token stream.
+  if Result.NodeType = antViewPrint then
+  begin
+    if UpperCase(Context.CurrentToken.Value) = 'PRINT' then
+      Context.Advance;                                          // PRINT
+    if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+    begin
+      Result.AddChild(ParseExpression);                         // firstrow
+      if Context.Check(ttLoopControl) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = kTO) then
+      begin
+        Context.Advance;                                        // TO
+        Result.AddChild(ParseExpression);                       // lastrow
       end;
     end;
     DoNodeCreated(Result);

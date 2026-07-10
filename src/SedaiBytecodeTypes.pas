@@ -516,6 +516,10 @@ const
   // MODERN LOCATE row, column: position the console TEXT cursor (1-based, as FreeBASIC counts it).
   // Src1 = row register, Src2 = column register. CLASSIC LOCATE is bcGraphicLocate, the pixel cursor.
   bcConLocate       = bcGroupIO + 21;
+  // VIEW PRINT [firstrow TO lastrow]: set the console's text print area (its scroll region). Rows are
+  // 1-based; a 0 in either operand means "the whole screen". The text cursor moves to the start of the
+  // first row. Src1 = first-row register, Src2 = last-row register.
+  bcConViewPrint    = bcGroupIO + 22;
 
   // === GROUP 5: SPECIAL VARIABLES (0x05xx) ===
   bcLoadTI          = bcGroupSpecial + 0;   // TI: jiffies since start
@@ -1761,6 +1765,7 @@ begin
         19: Result := 'InputChars';
         20: Result := 'ConScreen';
         21: Result := 'ConLocate';
+        22: Result := 'ConViewPrint';
       else
         Result := Format('IO_%d', [SubOp]);
       end;

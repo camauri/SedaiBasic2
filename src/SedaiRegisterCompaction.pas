@@ -490,6 +490,7 @@ begin
     bcPrintTab, bcPrintSpc,  // TAB(n) and SPC(n) - Src1 = count register
     bcConScreen,      // SCREEN(row,col[,flag]): Src1 = row (int)
     bcConLocate,      // MODERN LOCATE row, col: Src1 = row (int)
+    bcConViewPrint,   // VIEW PRINT first TO last: Src1 = first row (int)
     // === GROUP 6: Sound operations ===
     bcSoundVol,       // Src1 = volume (int 0-15)
     bcSoundSound,     // Src1 = voice number (int)
@@ -664,6 +665,7 @@ begin
     bcRefStoreInt,  // FreeBASIC pointer store (int) - Src2 = value (int)
     bcConScreen,    // SCREEN(row,col[,flag]): Src2 = column (int)
     bcConLocate,    // MODERN LOCATE row, col: Src2 = column (int)
+    bcConViewPrint, // VIEW PRINT first TO last: Src2 = last row (int)
     // === GROUP 10: Graphics ===
     bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
     bcGraphicWindow,  // Src2 = row1 register (int)
