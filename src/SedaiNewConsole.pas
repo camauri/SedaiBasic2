@@ -318,6 +318,8 @@ type
     procedure GBSetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     function  GBGetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;
     procedure GBDrawLine(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; LineWidth: Integer);
+    procedure GBDrawLineStyled(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Style: Word);
+    procedure GBFillBorder(Surface: TGfxSurface; X, Y: Integer; Color, BorderColor: TGfxColor);
     procedure GBDrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
     procedure GBDrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
     procedure GBFill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
@@ -342,6 +344,8 @@ type
     procedure IGraphicsBackend.SetPixel = GBSetPixel;
     function  IGraphicsBackend.GetPixel = GBGetPixel;
     procedure IGraphicsBackend.DrawLine = GBDrawLine;
+    procedure IGraphicsBackend.DrawLineStyled = GBDrawLineStyled;
+    procedure IGraphicsBackend.FillBorder = GBFillBorder;
     procedure IGraphicsBackend.DrawRect = GBDrawRect;
     procedure IGraphicsBackend.DrawEllipse = GBDrawEllipse;
     procedure IGraphicsBackend.Fill = GBFill;
@@ -3877,6 +3881,39 @@ end;
 procedure TVideoController.GBDrawLine(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; LineWidth: Integer);
 begin
   DrawLine(X1, Y1, X2, Y2, Color);
+end;
+
+procedure TVideoController.GBDrawLineStyled(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Style: Word);
+// FreeBASIC styled (dashed) line: a 16-bit pattern walked along the line, most-significant bit first
+// (pixel 0 -> bit 15, ... pixel 15 -> bit 0), then reused. A set bit draws, a clear bit skips. Bresenham,
+// one pixel per step -- the same rule as the software backend, so a dashed LINE looks identical on sbv.
+var
+  DX, DY, SX, SY, Err, E2, Idx: Integer;
+begin
+  if Style = 0 then Exit;                 // an all-clear pattern draws nothing
+  if Style = $FFFF then begin DrawLine(X1, Y1, X2, Y2, Color); Exit; end;
+  DX := Abs(X2 - X1); DY := -Abs(Y2 - Y1);
+  if X1 < X2 then SX := 1 else SX := -1;
+  if Y1 < Y2 then SY := 1 else SY := -1;
+  Err := DX + DY;
+  Idx := 0;
+  while True do
+  begin
+    if (Style and (Word(1) shl (15 - (Idx and 15)))) <> 0 then
+      SetPixel(X1, Y1, Color);
+    Inc(Idx);
+    if (X1 = X2) and (Y1 = Y2) then Break;
+    E2 := 2 * Err;
+    if E2 >= DY then begin Err := Err + DY; X1 := X1 + SX; end;
+    if E2 <= DX then begin Err := Err + DX; Y1 := Y1 + SY; end;
+  end;
+end;
+
+procedure TVideoController.GBFillBorder(Surface: TGfxSurface; X, Y: Integer; Color, BorderColor: TGfxColor);
+begin
+  // Deferred on this device for the same reason as GBFill: its existing FloodFill is colour-source
+  // based, not direct-colour. The software backend implements the boundary fill; sbv routes PAINT
+  // through this stub until that is unified.
 end;
 
 procedure TVideoController.GBDrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
