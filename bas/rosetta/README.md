@@ -161,6 +161,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `doomsday_rule.bas` | <https://rosettacode.org/wiki/Doomsday_rule> |
 | `arithmetic_complex.bas` | <https://rosettacode.org/wiki/Arithmetic/Complex> |
 | `define_a_primitive_data_type.bas` | <https://rosettacode.org/wiki/Define_a_primitive_data_type> |
+| `cartesian_product_of_two_or_more_lists.bas` | <https://rosettacode.org/wiki/Cartesian_product_of_two_or_more_lists> |
 
 ## Running
 

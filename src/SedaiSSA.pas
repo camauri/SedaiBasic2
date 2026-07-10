@@ -5355,6 +5355,12 @@ begin
                                       or ((Int64(FixedCap) and $FFFF) shl 48)),
                       MakeSSAValue(svkNone));
       EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // Give the record its member-array/nested-UDT backing, as ssaRecordNew does for a plain instance --
+      // AllocSharedRecordBlock only sizes the flat slots. Without this "p->item(i)" reaches an unallocated
+      // member array (handle 0) and faults. Allocate does NOT run the constructor (FreeBASIC gives raw,
+      // zeroed storage), so only the storage is set up. A CALLOCATE(n>1) block only inits its first record
+      // this way -- the linked-list/tree idiom (Allocate, n=1) is the common case.
+      EmitRecordInit(GetOrAllocateVariable(VarName), FixedCap);
       Exit;
     end;
     EmitRawAlloc(ExprNode, ExprValue);
