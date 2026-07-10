@@ -681,6 +681,9 @@ const
   // LINE with a style mask (dashed): Src1=x1, Src2=y1, Dest=x2; Immediate[0-15]=y2, [16-31]=color,
   // [32-47]=style (all int regs), [48-49]=shape flag (0=line, 1=box outline).
   bcGfxLineStyled   = bcGroupGraphics + 62;
+  // SCREENPTR: Dest = raw pointer (RAWPTR_TAG or RAWPTR_REGION_FB, offset 0) to the working page's
+  // pixel bytes. 32bpp, row pitch = width*4, exactly what SCREENINFO reports.
+  bcGfxScreenPtr    = bcGroupGraphics + 63;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===

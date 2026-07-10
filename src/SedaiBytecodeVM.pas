@@ -337,6 +337,9 @@ type
     function AllocSharedRecord(IntC, FloatC, StrC, TypeId: Integer): Int64;
     function AllocSharedRecordBlock(N, IntC, FloatC, StrC, TypeId: Integer): Int64;  // N consecutive shared records (Callocate block)
     procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
+    // Resolve a tagged raw pointer to a real address in its region (byte heap or framebuffer), checking
+    // that NeedBytes bytes fit. Every raw access goes through it.
+    function RawAddr(RawPtr: Int64; NeedBytes: PtrUInt): Pointer;
     // FreeBASIC raw byte heap (Allocate family). All return/take RAWPTR_TAG-tagged byte offsets.
     function RawAlloc(ByteCount: PtrUInt): Int64;
     function StrSAdd(const S: string): Int64;   // SADD(s) -> raw pointer to a NUL-terminated byte copy
@@ -2105,6 +2108,10 @@ var
   dataOfs, sz: PtrUInt;
 begin
   if (RawPtr and RAWPTR_TAG) = 0 then Exit;            // not a raw pointer / NULL
+  // The framebuffer is not heap memory: SCREENPTR does not allocate, so Deallocate must not pretend to
+  // free it. Silently ignoring the call, as FreeBASIC does for a null pointer, is safer than corrupting
+  // the free list with an offset that means nothing in this region.
+  if (RawPtr and RAWPTR_REGION_FB) <> 0 then Exit;
   dataOfs := RawPtr and RAWPTR_OFS_MASK;
   if (dataOfs < 8) or (dataOfs > PtrUInt(Length(FRawHeap))) then Exit;
   EnterCriticalSection(FRawHeapLock);
@@ -2128,6 +2135,9 @@ var
   oldOfs, oldSz, newOfs, copySz: PtrUInt;
 begin
   if (RawPtr and RAWPTR_TAG) = 0 then Exit(RawAlloc(ByteCount));   // realloc(NULL,n) == alloc
+  // Reallocating the framebuffer is meaningless: its size is the screen's, set by SCREENRES.
+  if (RawPtr and RAWPTR_REGION_FB) <> 0 then
+    raise ERangeError.Create('Reallocate: SCREENPTR does not point to allocated memory');
   oldOfs := RawPtr and RAWPTR_OFS_MASK;
   oldSz := PtrUInt((@FRawHeap[oldOfs - 8])^);
   Result := RawAlloc(ByteCount);
@@ -2138,85 +2148,91 @@ begin
   RawFree(RawPtr);
 end;
 
-function TBytecodeVM.RawLoadInt(RawPtr: Int64; TypeCode: Integer): Int64;
+function TBytecodeVM.RawAddr(RawPtr: Int64; NeedBytes: PtrUInt): Pointer;
+// Resolve a tagged raw pointer to a real address inside whichever REGION it names, after checking that
+// NeedBytes bytes starting there actually fit. Every raw load, store and block operation goes through
+// here, so a raw pointer can never address memory the VM does not own.
+//
+// The bounds check is not decoration: RawLoadInt/RawStoreInt used to index FRawHeap with an unchecked
+// offset, so pointer arithmetic that walked off the end of a block read or wrote past the array -- the
+// same memory-unsafety class as the out-of-bounds superinstruction fixed earlier.
 var
   ofs: PtrUInt;
+  Data: PByte;
+  SizeBytes: Integer;
 begin
-  ofs := RawPtr and RAWPTR_OFS_MASK;
-  if (RawPtr and RAWPTR_TAG) = 0 then raise ERangeError.Create('Null or invalid raw pointer dereference');
+  if (RawPtr and RAWPTR_TAG) = 0 then
+    raise ERangeError.Create('Null or invalid raw pointer dereference');
+  ofs := PtrUInt(RawPtr and RAWPTR_OFS_MASK);
+
+  if (RawPtr and RAWPTR_REGION_FB) <> 0 then
+  begin
+    // SCREENPTR region: the working page's framebuffer.
+    if not Assigned(FGraphics) or not FGraphics.SurfaceData(FGfxWorkSurface, Data, SizeBytes) then
+      raise ERangeError.Create('SCREENPTR dereference: no graphics screen (call SCREENRES first)');
+    if (SizeBytes <= 0) or (ofs + NeedBytes > PtrUInt(SizeBytes)) then
+      raise ERangeError.CreateFmt('SCREENPTR dereference out of bounds: offset %d + %d > %d bytes',
+                                  [Int64(ofs), Int64(NeedBytes), Int64(SizeBytes)]);
+    Result := Pointer(Data + ofs);
+    Exit;
+  end;
+
+  // Byte-heap region. Offset 0..7 is the reserved NULL block (see RawAlloc).
+  if (ofs < 8) or (ofs + NeedBytes > PtrUInt(Length(FRawHeap))) then
+    raise ERangeError.CreateFmt('Raw pointer dereference out of bounds: offset %d + %d > %d bytes',
+                                [Int64(ofs), Int64(NeedBytes), Int64(Length(FRawHeap))]);
+  Result := @FRawHeap[ofs];
+end;
+
+function TBytecodeVM.RawLoadInt(RawPtr: Int64; TypeCode: Integer): Int64;
+begin
   case TypeCode of
-    RTC_I8:  Result := PShortInt(@FRawHeap[ofs])^;
-    RTC_I16: Result := PSmallInt(@FRawHeap[ofs])^;
-    RTC_I32: Result := PLongInt(@FRawHeap[ofs])^;
+    RTC_I8:  Result := PShortInt(RawAddr(RawPtr, 1))^;
+    RTC_I16: Result := PSmallInt(RawAddr(RawPtr, 2))^;
+    RTC_I32: Result := PLongInt(RawAddr(RawPtr, 4))^;
   else
-    Result := PInt64(@FRawHeap[ofs])^;
+    Result := PInt64(RawAddr(RawPtr, 8))^;
   end;
 end;
 
 function TBytecodeVM.RawLoadFloat(RawPtr: Int64; TypeCode: Integer): Double;
-var
-  ofs: PtrUInt;
 begin
-  ofs := RawPtr and RAWPTR_OFS_MASK;
-  if (RawPtr and RAWPTR_TAG) = 0 then raise ERangeError.Create('Null or invalid raw pointer dereference');
-  if TypeCode = RTC_SINGLE then Result := PSingle(@FRawHeap[ofs])^
-  else Result := PDouble(@FRawHeap[ofs])^;
+  if TypeCode = RTC_SINGLE then Result := PSingle(RawAddr(RawPtr, 4))^
+  else Result := PDouble(RawAddr(RawPtr, 8))^;
 end;
 
 procedure TBytecodeVM.RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
-var
-  ofs: PtrUInt;
 begin
-  ofs := RawPtr and RAWPTR_OFS_MASK;
-  if (RawPtr and RAWPTR_TAG) = 0 then raise ERangeError.Create('Null or invalid raw pointer dereference');
   case TypeCode of
-    RTC_I8:  PShortInt(@FRawHeap[ofs])^ := ShortInt(Value);
-    RTC_I16: PSmallInt(@FRawHeap[ofs])^ := SmallInt(Value);
-    RTC_I32: PLongInt(@FRawHeap[ofs])^ := LongInt(Value);
+    RTC_I8:  PShortInt(RawAddr(RawPtr, 1))^ := ShortInt(Value);
+    RTC_I16: PSmallInt(RawAddr(RawPtr, 2))^ := SmallInt(Value);
+    RTC_I32: PLongInt(RawAddr(RawPtr, 4))^ := LongInt(Value);
   else
-    PInt64(@FRawHeap[ofs])^ := Value;
+    PInt64(RawAddr(RawPtr, 8))^ := Value;
   end;
 end;
 
 procedure TBytecodeVM.RawStoreFloat(RawPtr: Int64; TypeCode: Integer; Value: Double);
-var
-  ofs: PtrUInt;
 begin
-  ofs := RawPtr and RAWPTR_OFS_MASK;
-  if (RawPtr and RAWPTR_TAG) = 0 then raise ERangeError.Create('Null or invalid raw pointer dereference');
-  if TypeCode = RTC_SINGLE then PSingle(@FRawHeap[ofs])^ := Value
-  else PDouble(@FRawHeap[ofs])^ := Value;
+  if TypeCode = RTC_SINGLE then PSingle(RawAddr(RawPtr, 4))^ := Value
+  else PDouble(RawAddr(RawPtr, 8))^ := Value;
 end;
 
-// FB_MEMCOPY / FB_MEMMOVE: copy ByteCount bytes from SrcPtr to DstPtr on the raw byte heap. Both raw
-// pointers are RAWPTR_TAG-tagged byte offsets. FPC Move is overlap-safe, so this serves both the
-// (non-overlapping) memcopy and the (overlap-safe) memmove semantics.
+// FB_MEMCOPY / FB_MEMMOVE: copy ByteCount bytes from SrcPtr to DstPtr. Both pointers are resolved
+// through RawAddr, so either may name the byte heap or the framebuffer, and both ends are bounds-checked
+// against their own region. FPC Move is overlap-safe, so this serves both the (non-overlapping) memcopy
+// and the (overlap-safe) memmove semantics.
 procedure TBytecodeVM.RawMemCopy(DstPtr, SrcPtr: Int64; ByteCount: PtrUInt);
-var
-  dofs, sofs: PtrUInt;
 begin
   if ByteCount = 0 then Exit;
-  if ((DstPtr and RAWPTR_TAG) = 0) or ((SrcPtr and RAWPTR_TAG) = 0) then
-    raise ERangeError.Create('Null or invalid raw pointer in memory copy');
-  dofs := DstPtr and RAWPTR_OFS_MASK;
-  sofs := SrcPtr and RAWPTR_OFS_MASK;
-  if (dofs + ByteCount > PtrUInt(Length(FRawHeap))) or (sofs + ByteCount > PtrUInt(Length(FRawHeap))) then
-    raise ERangeError.Create('Raw memory copy out of bounds');
-  Move(FRawHeap[sofs], FRawHeap[dofs], ByteCount);
+  Move(RawAddr(SrcPtr, ByteCount)^, RawAddr(DstPtr, ByteCount)^, ByteCount);
 end;
 
-// CLEAR: set ByteCount bytes at DstPtr to Value on the raw byte heap.
+// CLEAR: set ByteCount bytes at DstPtr to Value, in whichever region DstPtr names.
 procedure TBytecodeVM.RawClear(DstPtr: Int64; Value: Byte; ByteCount: PtrUInt);
-var
-  dofs: PtrUInt;
 begin
   if ByteCount = 0 then Exit;
-  if (DstPtr and RAWPTR_TAG) = 0 then
-    raise ERangeError.Create('Null or invalid raw pointer in clear');
-  dofs := DstPtr and RAWPTR_OFS_MASK;
-  if dofs + ByteCount > PtrUInt(Length(FRawHeap)) then
-    raise ERangeError.Create('Raw clear out of bounds');
-  FillChar(FRawHeap[dofs], ByteCount, Value);
+  FillChar(RawAddr(DstPtr, ByteCount)^, ByteCount, Value);
 end;
 
 procedure TBytecodeVM.RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);
@@ -7327,6 +7343,8 @@ var
   JoyBtns, JoyDev, JoyLocal, JoyBtnIdx: Integer;
   JoyAx: array[0..7] of Single;
   JoyV: Single;
+  ScrData: PByte;      // SCREENPTR: working-page pixel bytes (existence check only)
+  ScrSize: Integer;
 begin
   // M5.3: off the render-owner thread, defer to the queue instead of touching SDL. Dormant on
   // the single-threaded path (FHasWorkers = False short-circuits before any thread-id check).
@@ -7725,6 +7743,17 @@ begin
         if (Instr.Immediate and 2) <> 0 then GetY1 := Ctx.IntRegs[Instr.Src2] else GetY1 := FGfxVisiblePage;  // dst page
         if (GetX1 >= 0) and (GetX1 <= High(FGfxPages)) and (GetY1 >= 0) and (GetY1 <= High(FGfxPages)) and (GetX1 <> GetY1) then
           FGraphics.Blit(FGfxPages[GetY1], 0, 0, FGfxPages[GetX1], gbmPSet);
+      end;
+    63: // bcGfxScreenPtr - SCREENPTR: a raw pointer to the working page's framebuffer.
+        //  Offset 0 of the framebuffer REGION of the raw-pointer namespace: dereferencing it goes through
+        //  the ordinary raw load/store path, which bounds-checks against the surface's byte size. FB
+        //  returns 0 when there is no graphics screen; do the same rather than hand out a pointer that
+        //  would only fail later.
+      begin
+        if Assigned(FGraphics) and FGraphics.SurfaceData(FGfxWorkSurface, ScrData, ScrSize) and (ScrSize > 0) then
+          Ctx.IntRegs[Instr.Dest] := RAWPTR_TAG or RAWPTR_REGION_FB
+        else
+          Ctx.IntRegs[Instr.Dest] := 0;
       end;
     44: // bcGfxWindow - WINDOW [SCREEN] (x1,y1)-(x2,y2): set/clear the logical coordinate transform
       if Assigned(FGraphics) then

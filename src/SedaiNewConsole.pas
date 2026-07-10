@@ -314,6 +314,7 @@ type
     procedure GBDestroySurface(Surface: TGfxSurface);
     function  GBSurfaceWidth(Surface: TGfxSurface): Integer;
     function  GBSurfaceHeight(Surface: TGfxSurface): Integer;
+    function  GBSurfaceData(Surface: TGfxSurface; out Data: PByte; out SizeBytes: Integer): Boolean;
     procedure GBSetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     function  GBGetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;
     procedure GBDrawLine(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; LineWidth: Integer);
@@ -337,6 +338,7 @@ type
     procedure IGraphicsBackend.DestroySurface = GBDestroySurface;
     function  IGraphicsBackend.SurfaceWidth = GBSurfaceWidth;
     function  IGraphicsBackend.SurfaceHeight = GBSurfaceHeight;
+    function  IGraphicsBackend.SurfaceData = GBSurfaceData;
     procedure IGraphicsBackend.SetPixel = GBSetPixel;
     function  IGraphicsBackend.GetPixel = GBGetPixel;
     procedure IGraphicsBackend.DrawLine = GBDrawLine;
@@ -3844,6 +3846,24 @@ begin
   M := GBImageMem(Surface);
   if Assigned(M) then M.SetPixel(X, Y, Color)
   else SetPixel(X, Y, Color);   // screen (texture repainted by the render poll)
+end;
+
+function TVideoController.GBSurfaceData(Surface: TGfxSurface; out Data: PByte; out SizeBytes: Integer): Boolean;
+// SCREENPTR. The screen (surface 0) is backed by this controller's own FGraphicsMemory -- the same CPU
+// byte buffer the renderer uploads each frame -- so a program writing through the pointer changes the
+// pixels the next Present shows, exactly as on the headless software backend. Image surfaces (>0) carry
+// their own TGraphicsMemory.
+var M: TGraphicsMemory;
+begin
+  Data := nil; SizeBytes := 0;
+  M := GBImageMem(Surface);
+  if not Assigned(M) then M := FGraphicsMemory;       // surface 0 = the screen
+  Result := Assigned(M) and Assigned(M.GraphicsBuffer) and (M.GraphicsBufferSize > 0);
+  if Result then
+  begin
+    Data := M.GraphicsBuffer;
+    SizeBytes := M.GraphicsBufferSize;
+  end;
 end;
 
 function TVideoController.GBGetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;

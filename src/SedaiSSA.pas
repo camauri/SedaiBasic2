@@ -332,6 +332,7 @@ type
     function IsWStringVar(const Name: string): Boolean;                         // declared WSTRING var (UTF-8, codepoint LEN)?
     function IsWStringExpr(Node: TASTNode): Boolean;                            // expression that yields a WSTRING value?
     function IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;           // Node = ALLOCATE/CALLOCATE/REALLOCATE(...)?
+    function IsScreenPtrExpr(Node: TASTNode): Boolean;                          // Node = SCREENPTR / SCREENPTR()?
     function RawPtrExprName(Node: TASTNode): string;                            // raw pointer var of a raw ptr expr (p, p±n), else ''
     procedure EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);           // p±n raw pointer arithmetic (SizeOf-scaled)
     function RawTypeCodeOf(const PtrName: string): Integer;                      // raw element type code for *p / p[i]
@@ -1426,6 +1427,15 @@ begin
       begin
         Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
         EmitInstruction(ssaCurDir, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Exit;
+      end;
+      // FreeBASIC SCREENPTR used bare (and, below, as SCREENPTR()): a raw pointer to the working page's
+      // framebuffer. It addresses a second REGION of the raw-pointer namespace (see RAWPTR_REGION_FB), so
+      // "*(p + off)" and "p[i]" reach the pixels through the ordinary raw load/store path, bounds-checked.
+      if FModernMode and (UpperCase(VarName) = kSCREENPTR) then
+      begin
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaGfxScreenPtr, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         Exit;
       end;
       // FreeBASIC EXEPATH used bare: directory of the running program.
@@ -4280,6 +4290,14 @@ begin
         begin
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
           EmitInstruction(ssaLoadERMN, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
+        // FreeBASIC SCREENPTR() (parenthesised form).
+        if FModernMode and (UpperCase(ArrName) = kSCREENPTR) and (ArrayIndexOf(ArrName) < 0) then
+        begin
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaGfxScreenPtr, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
         end;
 
@@ -16159,6 +16177,27 @@ begin
     Result := ArrayIndexOf(FuncU) < 0;
 end;
 
+function TSSAGenerator.IsScreenPtrExpr(Node: TASTNode): Boolean;
+// SCREENPTR, bare or parenthesised. It yields a raw pointer -- into the framebuffer region rather than
+// the byte heap, but raw all the same -- so a variable initialised from it must be tracked raw, or
+// "p[i] = c" would lower to the MANAGED pointer path and never reach a pixel.
+var
+  U: string;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do
+    Node := Node.GetChild(0);
+  if Node.NodeType = antIdentifier then
+    U := UpperCase(VarToStr(Node.Value))
+  else if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
+          (Node.GetChild(0).NodeType = antIdentifier) then
+    U := UpperCase(VarToStr(Node.GetChild(0).Value))
+  else
+    Exit;
+  Result := FModernMode and (U = kSCREENPTR) and (ArrayIndexOf(U) < 0);
+end;
+
 procedure TSSAGenerator.EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);
 // Lower "p + n" / "p - n" / "n + p" (raw pointer ± integer) to ptrVal ± n*SizeOf(pointee), a raw byte
 // pointer. The raw pointer side is identified by RawPtrExprName; the other side is the integer index.
@@ -16377,11 +16416,13 @@ var
     if PointerUDTType(TargetU) <> '' then Exit;
     if IsAllocCall(Rhs, FU) then
       MarkRaw(TargetU)
+    else if IsScreenPtrExpr(Rhs) then
+      MarkRaw(TargetU)   // p = ScreenPtr: raw, in the framebuffer region
     else if Rhs.NodeType = antCast then
     begin
       TU := UpperCase(VarToStr(Rhs.Value));
       if (Length(TU) >= 4) and (Copy(TU, Length(TU) - 3, 4) = ' PTR') and (Rhs.ChildCount >= 1) then
-        if IsAllocCall(Rhs.GetChild(0), FU) or
+        if IsAllocCall(Rhs.GetChild(0), FU) or IsScreenPtrExpr(Rhs.GetChild(0)) or
            ((Rhs.GetChild(0).NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.GetChild(0).Value))) then
           MarkRaw(TargetU);
     end

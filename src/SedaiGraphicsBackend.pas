@@ -62,6 +62,9 @@ type
     procedure DestroySurface(Surface: TGfxSurface);
     function  SurfaceWidth(Surface: TGfxSurface): Integer;
     function  SurfaceHeight(Surface: TGfxSurface): Integer;
+    // SCREENPTR: hand out the surface's pixel bytes so the VM can expose them as a raw-pointer region.
+    // 32 bits per pixel, Width*Height*4 bytes, row pitch = Width*4. False when there is no such surface.
+    function  SurfaceData(Surface: TGfxSurface; out Data: PByte; out SizeBytes: Integer): Boolean;
     // --- drawing (target = a surface) ---
     procedure SetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     function  GetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;   // POINT / GET (deterministic)
@@ -104,6 +107,7 @@ type
     procedure DestroySurface(Surface: TGfxSurface);
     function  SurfaceWidth(Surface: TGfxSurface): Integer;
     function  SurfaceHeight(Surface: TGfxSurface): Integer;
+    function  SurfaceData(Surface: TGfxSurface; out Data: PByte; out SizeBytes: Integer): Boolean;
     procedure SetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     function  GetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;
     procedure DrawLine(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; LineWidth: Integer);
@@ -250,6 +254,22 @@ var M: TGraphicsMemory;
 begin
   M := MemoryOf(Surface);
   if Assigned(M) then Result := M.State.Height else Result := 0;
+end;
+
+function TSoftwareGraphicsBackend.SurfaceData(Surface: TGfxSurface; out Data: PByte; out SizeBytes: Integer): Boolean;
+// The drawable surface is always a plain CPU byte buffer here (which is also why SCREENLOCK/SCREENUNLOCK
+// are no-ops), so SCREENPTR can expose it directly. Nothing is copied: a write through the pointer is a
+// write to the pixel the next POINT or Present will read.
+var M: TGraphicsMemory;
+begin
+  Data := nil; SizeBytes := 0;
+  M := MemoryOf(Surface);
+  Result := Assigned(M) and Assigned(M.GraphicsBuffer) and (M.GraphicsBufferSize > 0);
+  if Result then
+  begin
+    Data := M.GraphicsBuffer;
+    SizeBytes := M.GraphicsBufferSize;
+  end;
 end;
 
 procedure TSoftwareGraphicsBackend.SetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);

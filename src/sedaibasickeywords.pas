@@ -384,6 +384,7 @@ const
   kPROCPTR = 'PROCPTR';   // FreeBASIC: PROCPTR(p) -> address of a procedure (= @p) (intercepted as array-access)
   kWSTRING = 'WSTRING';   // FreeBASIC: WSTRING type and WSTRING(n,cp) builder function
   kWINPUT  = 'WINPUT';    // FreeBASIC: WINPUT(n [, [#]f]) — read n wide characters from a file or the keyboard
+  kSCREENPTR = 'SCREENPTR'; // FreeBASIC: address of the working page's framebuffer (a raw pointer)
   kWSPACE  = 'WSPACE';    // N wide spaces (FreeBASIC)
   kVALINT  = 'VALINT';    // string -> Integer
   kVALLNG  = 'VALLNG';    // string -> LongInt

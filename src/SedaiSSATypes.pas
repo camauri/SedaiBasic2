@@ -67,7 +67,20 @@ const
     offset; pointer arithmetic scales by SizeOf(pointee). 0 = NULL (untagged). The raw type code below
     selects the element width/bank at load/store. }
   RAWPTR_TAG = Int64(1) shl 62;
-  RAWPTR_OFS_MASK = RAWPTR_TAG - 1;     // byte offset occupies the low 62 bits
+  { A tagged raw pointer names one of two REGIONS, selected by bit 61:
+
+      region 0 (bit 61 clear)  the VM's byte heap, FRawHeap -- everything the Allocate family returns
+      region 1 (bit 61 set)    the working page's framebuffer -- what SCREENPTR returns
+
+    Both are ordinary byte arrays owned by the VM: no machine address is ever handed to a BASIC program,
+    and every dereference is bounds-checked against the region it names. That is what lets a FreeBASIC
+    program write pixels the way it expects -- "*(p + y*pitch + x*4) = colour" -- without the VM losing
+    memory safety. Pointer arithmetic only adds to the offset, so a pointer never leaves its region.
+
+    Bit 62 is crowded (SHARED_REC_FLAG and BUILTIN_FP_TAG use it in their own namespaces), which is why
+    the framebuffer is a second REGION of the raw-pointer namespace rather than a third tag. }
+  RAWPTR_REGION_FB = Int64(1) shl 61;       // region selector: framebuffer instead of the byte heap
+  RAWPTR_OFS_MASK = RAWPTR_REGION_FB - 1;   // byte offset occupies the low 61 bits
   // Raw element type codes (Immediate of bcRaw{Load,Store}): width + bank.
   RTC_I8 = 1; RTC_I16 = 2; RTC_I32 = 3; RTC_I64 = 4; RTC_SINGLE = 5; RTC_DOUBLE = 6;
 
@@ -259,6 +272,7 @@ type
     ssaPRst,           // PRST: Reset palette to default
     ssaScnClr,         // SCNCLR [mode]: Clear screen (text or graphics)
     ssaGfxScreenRes,   // SCREENRES w,h (FreeBASIC graphics, via IGraphicsBackend)
+    ssaGfxScreenPtr,   // SCREENPTR: raw pointer to the working page's framebuffer
     ssaGfxDrawGML,     // DRAW "..." : FreeBASIC graphics-macro-language string (Src1 = string)
     ssaGfxPointCoord,  // POINTCOORD(n): DRAW pen coordinate (Dest = result, Src1 = selector 0=x/1=y)
     ssaGfxPset,        // PSET (x,y),color

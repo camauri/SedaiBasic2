@@ -137,6 +137,7 @@ type
 
     property State: TGraphicsState read FState write FState;
     property GraphicsBuffer: PByte read FGraphicsBuffer;
+    property GraphicsBufferSize: Integer read FGraphicsBufferSize;   // bytes; 32bpp, Width*Height*4
     property ColorBuffer: PByte read FColorBuffer;
     property Palette[Index: TPaletteIndex]: UInt32 read GetPaletteColor write SetPaletteColor;
   end;

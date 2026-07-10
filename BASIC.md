@@ -8,12 +8,12 @@
 [████████████████████████████████████████████████··] 96%
 ```
 
-**FreeBASIC keyword set — 562 / 644 implemented (87%)**. **69** of the unimplemented
+**FreeBASIC keyword set — 563 / 644 implemented (87%)**. **69** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, FFI, and the raw-allocator operators — `New`/`Delete Overload`,
 `Placement New` — which a managed record model cannot honour) — not runnable keywords for a portable
 bytecode VM. Of the
-**575 applicable** keywords, **562 (98%)** are implemented, and **5** are partial. See the
+**575 applicable** keywords, **563 (98%)** are implemented, and **5** are partial. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -2568,7 +2568,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `SCREENPTR` | ✗ | Gets the address of the working page's framebuffer. |
+| `SCREENPTR` | ✓ | Raw pointer to the working page's pixel bytes (32bpp; row pitch from `SCREENINFO`). Writes through it change what `POINT` reads, and `PSET` changes what it reads — the drawable surface is a CPU buffer, not a copy. It names a second REGION of the raw-pointer namespace, so it is a byte offset the VM bounds-checks, never a machine address; `DEALLOCATE` on it is ignored and `REALLOCATE` rejected. Returns 0 with no graphics screen. |
 | `SCREENLOCK` | ✓ | Parsed; accept-and-ignore (the drawable surface is always a CPU buffer, so no lock is needed). |
 | `SCREENUNLOCK` | ✓ | Parsed; accept-and-ignore (pairs with SCREENLOCK). |
 

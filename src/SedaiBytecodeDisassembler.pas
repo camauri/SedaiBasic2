@@ -418,6 +418,8 @@ begin
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'WInputChars', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcInputChars:
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'InputChars', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcGfxScreenPtr:
+      Line := Format('%4d: %-20s R%d', [Index, 'GfxScreenPtr', Instr.Dest]);
     bcCsrlin:
       Line := Format('%4d: %-20s R%d', [Index, 'Csrlin', Instr.Dest]);
     bcLoadCWDS:
