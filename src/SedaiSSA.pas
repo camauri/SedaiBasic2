@@ -17513,6 +17513,10 @@ begin
       // record of the pointee type.
       if (Result = '') and (ArrayIndexOf(ArrName) < 0) then
         Result := PointerUDTType(ArrName);
+      // "f(args).field" / "f(args).method()": a user FUNCTION whose return type is a UDT. Its return
+      // type is registered under the function's own name (that is what makes "Dim As T x = f(...)" work).
+      if (Result = '') and (ArrayIndexOf(ArrName) < 0) and (FProcedureNames.IndexOf(ArrName) >= 0) then
+        Result := VarRecordTypeName(ArrName);
     end
     // Array-of-UDT MEMBER element "obj.field(i)": the element type is the field's ArrayElemType.
     else if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0).NodeType = antMemberAccess) then
@@ -17794,6 +17798,21 @@ begin
         HandleVal := EmitPointerIndexAddress(ArrName, ObjNode.GetChild(1));
         TypeName := ParentType;
         Result := True;
+        Exit;
+      end;
+      // "f(args).field" / "f(args).method()": a user FUNCTION returning a UDT. Lowering the call yields
+      // the returned record's handle, which is the object of the access. Without this the node matched no
+      // branch and the field read silently produced garbage.
+      if (ArrayIndexOf(ArrName) < 0) and (FProcedureNames.IndexOf(ArrName) >= 0) then
+      begin
+        ParentType := VarRecordTypeName(ArrName);
+        if ParentType <> '' then
+        begin
+          ProcessExpression(ObjNode, HandleVal);
+          HandleVal := EnsureIntRegister(HandleVal);
+          TypeName := ParentType;
+          Result := True;
+        end;
       end;
       Exit;
     end;
