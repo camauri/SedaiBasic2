@@ -114,7 +114,6 @@ single work, but distributing separate works together (aggregation) is permitted
 | `dijkstras_algorithm.bas` | <https://rosettacode.org/wiki/Dijkstra%27s_algorithm> |
 | `apply_a_callback_to_an_array.bas` | <https://rosettacode.org/wiki/Apply_a_callback_to_an_array> |
 | `multiplication_tables.bas` | <https://rosettacode.org/wiki/Multiplication_tables> |
-| `gray_code.bas` | <https://rosettacode.org/wiki/Gray_code> |
 | `nth_root.bas` | <https://rosettacode.org/wiki/Nth_root> |
 | `trigonometric_functions.bas` | <https://rosettacode.org/wiki/Trigonometric_functions> |
 | `semiprime.bas` | <https://rosettacode.org/wiki/Semiprime> |
@@ -132,6 +131,34 @@ single work, but distributing separate works together (aggregation) is permitted
 | `pythagorean_quadruples.bas` | <https://rosettacode.org/wiki/Pythagorean_quadruples> |
 | `real_constants_and_functions.bas` | <https://rosettacode.org/wiki/Real_constants_and_functions> |
 | `chowla_numbers.bas` | <https://rosettacode.org/wiki/Chowla_numbers> |
+| `accumulator_factory.bas` | <https://rosettacode.org/wiki/Accumulator_factory> |
+| `aks_test_for_primes.bas` | <https://rosettacode.org/wiki/AKS_test_for_primes> |
+| `anti_primes.bas` | <https://rosettacode.org/wiki/Anti-primes> |
+| `append_numbers_at_same_position_in_strings.bas` | <https://rosettacode.org/wiki/Append_numbers_at_same_position_in_strings> |
+| `apply_a_digital_filter_direct_form_ii_transposed.bas` | <https://rosettacode.org/wiki/Apply_a_digital_filter_%28direct_form_II_transposed%29> |
+| `array_length.bas` | <https://rosettacode.org/wiki/Array_length> |
+| `attractive_numbers.bas` | <https://rosettacode.org/wiki/Attractive_numbers> |
+| `averages_mean_angle.bas` | <https://rosettacode.org/wiki/Averages/Mean_angle> |
+| `averages_mean_time_of_day.bas` | <https://rosettacode.org/wiki/Averages/Mean_time_of_day> |
+| `averages_pythagorean_means.bas` | <https://rosettacode.org/wiki/Averages/Pythagorean_means> |
+| `averages_root_mean_square.bas` | <https://rosettacode.org/wiki/Averages/Root_mean_square> |
+| `balanced_ternary.bas` | <https://rosettacode.org/wiki/Balanced_ternary> |
+| `base64_decode_data.bas` | <https://rosettacode.org/wiki/Base64_decode_data> |
+| `base_16_numbers_needing_a_to_f.bas` | <https://rosettacode.org/wiki/Base_16_numbers_needing_a_to_f> |
+| `best_shuffle.bas` | <https://rosettacode.org/wiki/Best_shuffle> |
+| `brazilian_numbers.bas` | <https://rosettacode.org/wiki/Brazilian_numbers> |
+| `case_sensitivity_of_identifiers.bas` | <https://rosettacode.org/wiki/Case-sensitivity_of_identifiers> |
+| `chebyshev_coefficients.bas` | <https://rosettacode.org/wiki/Chebyshev_coefficients> |
+| `code_golf.bas` | <https://rosettacode.org/wiki/Code_Golf> |
+| `compare_length_of_two_strings.bas` | <https://rosettacode.org/wiki/Compare_length_of_two_strings> |
+| `compile_time_calculation.bas` | <https://rosettacode.org/wiki/Compile-time_calculation> |
+| `continued_fraction.bas` | <https://rosettacode.org/wiki/Continued_fraction> |
+| `copy_a_string.bas` | <https://rosettacode.org/wiki/Copy_a_string> |
+| `currying.bas` | <https://rosettacode.org/wiki/Currying> |
+| `de_polignac_numbers.bas` | <https://rosettacode.org/wiki/De_Polignac_numbers> |
+| `decimal_floating_point_number_to_binary.bas` | <https://rosettacode.org/wiki/Decimal_floating_point_number_to_binary> |
+| `distinct_power_numbers.bas` | <https://rosettacode.org/wiki/Distinct_power_numbers> |
+| `doomsday_rule.bas` | <https://rosettacode.org/wiki/Doomsday_rule> |
 
 ## Running
 
