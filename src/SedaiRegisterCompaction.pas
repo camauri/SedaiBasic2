@@ -259,6 +259,7 @@ begin
     bcBump,           // BUMP(n): collision bitmask (int)
     bcRspcolor,       // RSPCOLOR(n): multicolor value (int)
     bcRsprite,        // RSPRITE(sprite, attr): sprite attribute (int)
+    bcConScreen,      // SCREEN(row,col[,flag]): Dest = char code or colour attribute (int)
     // === GROUP 10: Graphics ===
     bcGraphicRGBA,    // Dest = RGBA result (int)
     bcGfxPoint,       // POINT(x,y): Dest = pixel color (int)
@@ -487,6 +488,8 @@ begin
     // === GROUP 4: I/O operations ===
     bcPrintInt, bcPrintIntLn, bcPrintBool, bcPrintUInt,
     bcPrintTab, bcPrintSpc,  // TAB(n) and SPC(n) - Src1 = count register
+    bcConScreen,      // SCREEN(row,col[,flag]): Src1 = row (int)
+    bcConLocate,      // MODERN LOCATE row, col: Src1 = row (int)
     // === GROUP 6: Sound operations ===
     bcSoundVol,       // Src1 = volume (int 0-15)
     bcSoundSound,     // Src1 = voice number (int)
@@ -659,6 +662,8 @@ begin
     bcArrayLBound, bcArrayUBound,  // B1.4: Src2 = 0-based dim index (int)
     bcArrayRedim,  // B1.4: REDIM - Src2 = new upper bound (int)
     bcRefStoreInt,  // FreeBASIC pointer store (int) - Src2 = value (int)
+    bcConScreen,    // SCREEN(row,col[,flag]): Src2 = column (int)
+    bcConLocate,    // MODERN LOCATE row, col: Src2 = column (int)
     // === GROUP 10: Graphics ===
     bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
     bcGraphicWindow,  // Src2 = row1 register (int)
@@ -1096,6 +1101,10 @@ begin
 
     // PSET/PAINT (x,y),color: Immediate contains the color register index (int)
     if (OpCode = bcGfxPset) or (OpCode = bcGfxPaint) then
+      MarkIntRegUsed(Instr.Immediate and $FFFF);
+
+    // SCREEN(row,col[,colorflag]): Immediate contains the colorflag register index (int)
+    if OpCode = bcConScreen then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // IMAGECREATE: Immediate contains the fill-colour register index (int)
@@ -1661,6 +1670,7 @@ begin
        (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) or
        (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) or
        (OpCode = bcGfxPset) or (OpCode = bcGfxPaint) or (OpCode = bcGfxImageCreate) or
+       (OpCode = bcConScreen) or   // SCREEN(row,col[,flag]): Immediate[0-15] = colorflag register
        (OpCode = bcSetmouse) then   // SETMOUSE: Immediate[0-15] = visibility register
     begin
       OldReg := Instr.Immediate and $FFFF;

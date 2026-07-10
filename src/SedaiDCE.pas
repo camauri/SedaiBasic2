@@ -367,6 +367,9 @@ begin
     ssaSetEnviron, ssaShell:
       Result := True;
 
+    // Console cursor - moves state the next PRINT depends on
+    ssaConLocate,  // MODERN LOCATE row, col
+
     // Graphics operations - always live (visible side effects on screen)
     ssaChar,  // CHAR mode, col, row, text - writes to screen
     ssaGraphicSetMode, ssaGraphicBox, ssaGraphicCircle, ssaGraphicDraw, ssaGraphicLocate,

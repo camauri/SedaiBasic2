@@ -507,6 +507,15 @@ const
   bcWInputChars     = bcGroupIO + 18;
   // INPUT(n [, [#]f]): the byte-oriented sibling of WINPUT. Same operands.
   bcInputChars      = bcGroupIO + 19;
+  // SCREEN(row, col [, colorflag]): read back a console cell. Rows and columns are 1-based, as FB
+  // documents them. colorflag = 0 yields the character code; otherwise the colour attribute, packed
+  // the way FreeBASIC packs it for a palette console of up to 4 bits per pixel: the high nibble is
+  // the cell background, the low nibble the foreground.
+  // Dest = int result, Src1 = row register, Src2 = column register, Immediate = colorflag register.
+  bcConScreen       = bcGroupIO + 20;
+  // MODERN LOCATE row, column: position the console TEXT cursor (1-based, as FreeBASIC counts it).
+  // Src1 = row register, Src2 = column register. CLASSIC LOCATE is bcGraphicLocate, the pixel cursor.
+  bcConLocate       = bcGroupIO + 21;
 
   // === GROUP 5: SPECIAL VARIABLES (0x05xx) ===
   bcLoadTI          = bcGroupSpecial + 0;   // TI: jiffies since start
@@ -1748,6 +1757,10 @@ begin
         15: Result := 'InputString';
         16: Result := 'PrintBool';
         17: Result := 'PrintUInt';
+        18: Result := 'WInputChars';
+        19: Result := 'InputChars';
+        20: Result := 'ConScreen';
+        21: Result := 'ConLocate';
       else
         Result := Format('IO_%d', [SubOp]);
       end;

@@ -6867,6 +6867,7 @@ var
   InputVal: Double;
   NextTabCol, TabIdx: Integer;
   CmdErr: Integer;  // Error code for CMD-redirected output
+  ScreenCol, ScreenRow: Integer;  // SCREEN(row, col): the cell, converted to the console's 0-based grid
 begin
   CmdErr := 0;
   CmdNewLine := #13;  // CR for file newlines
@@ -7198,6 +7199,27 @@ begin
     19: // bcInputChars - INPUT(n [, [#]f]): count bytes
       Ctx.StringRegs[Instr.Dest] :=
         ReadChars(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], False);
+    20: // bcConScreen - SCREEN(row, col [, colorflag]): read a console cell
+      if Assigned(FOutputDevice) then
+      begin
+        // FB counts rows and columns from 1; the console addresses cells from 0.
+        ScreenCol := Integer(Ctx.IntRegs[Instr.Src2]) - 1;
+        ScreenRow := Integer(Ctx.IntRegs[Instr.Src1]) - 1;
+        if Ctx.IntRegs[Instr.Immediate] = 0 then
+          Ctx.IntRegs[Instr.Dest] := Int64(FOutputDevice.GetCharAt(ScreenCol, ScreenRow))
+        else
+          // Colour attribute, in FreeBASIC's <=4bpp palette-console packing: background in the high
+          // nibble, foreground in the low one.
+          Ctx.IntRegs[Instr.Dest] :=
+            (Int64(FOutputDevice.GetBackColorAt(ScreenCol, ScreenRow) and $0F) shl 4) or
+             Int64(FOutputDevice.GetColorAt(ScreenCol, ScreenRow) and $0F);
+      end
+      else
+        Ctx.IntRegs[Instr.Dest] := 0;
+    21: // bcConLocate - MODERN LOCATE row, col: the console text cursor (1-based)
+      if Assigned(FOutputDevice) then
+        FOutputDevice.SetCursor(Integer(Ctx.IntRegs[Instr.Src2]) - 1,
+                                Integer(Ctx.IntRegs[Instr.Src1]) - 1);
   else
     raise Exception.CreateFmt('Unknown I/O opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;

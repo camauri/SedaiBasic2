@@ -187,6 +187,7 @@ type
     procedure SetCharAt(Col, Row: Integer; Ch: Byte); // Write character at position (PETSCII)
     function GetColorAt(Col, Row: Integer): Byte;     // Read color at position
     procedure SetColorAt(Col, Row: Integer; Color: Byte); // Write color at position
+    function GetBackColorAt(Col, Row: Integer): Byte; // Read background color at position (SCREEN(r,c,1))
 
     // Shape save/load
     function SaveShape(X1, Y1, X2, Y2: Double): string;

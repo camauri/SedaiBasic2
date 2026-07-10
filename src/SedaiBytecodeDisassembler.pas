@@ -418,6 +418,11 @@ begin
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'WInputChars', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcInputChars:
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'InputChars', Instr.Dest, Instr.Src1, Instr.Src2]);
+    bcConScreen:
+      Line := Format('%4d: %-20s R%d, R%d, R%d, R%d', [Index, 'ConScreen', Instr.Dest, Instr.Src1, Instr.Src2,
+                                                       Integer(Instr.Immediate and $FFFF)]);
+    bcConLocate:
+      Line := Format('%4d: %-20s R%d, R%d', [Index, 'ConLocate', Instr.Src1, Instr.Src2]);
     bcGfxScreenPtr:
       Line := Format('%4d: %-20s R%d', [Index, 'GfxScreenPtr', Instr.Dest]);
     bcCsrlin:

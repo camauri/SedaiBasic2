@@ -193,6 +193,7 @@ type
     function GetCharAt(Col, Row: Integer): Byte;
     procedure SetCharAt(Col, Row: Integer; Ch: Byte);
     function GetColorAt(Col, Row: Integer): Byte;
+    function GetBackColorAt(Col, Row: Integer): Byte;
     procedure SetColorAt(Col, Row: Integer; Color: Byte);
 
     // Shape save/load - stub implementations
@@ -825,6 +826,11 @@ begin
 end;
 
 function TWebOutput.GetColorAt(Col, Row: Integer): Byte;
+begin
+  Result := 0;
+end;
+
+function TWebOutput.GetBackColorAt(Col, Row: Integer): Byte;
 begin
   Result := 0;
 end;

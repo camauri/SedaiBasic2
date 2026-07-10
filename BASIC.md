@@ -8,12 +8,12 @@
 [████████████████████████████████████████████████··] 96%
 ```
 
-**FreeBASIC keyword set — 563 / 644 implemented (87%)**. **69** of the unimplemented
+**FreeBASIC keyword set — 565 / 645 implemented (88%)**. **69** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, FFI, and the raw-allocator operators — `New`/`Delete Overload`,
 `Placement New` — which a managed record model cannot honour) — not runnable keywords for a portable
 bytecode VM. Of the
-**575 applicable** keywords, **563 (98%)** are implemented, and **5** are partial. See the
+**576 applicable** keywords, **565 (98%)** are implemented, and **5** are partial. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
 
 ```
@@ -1288,9 +1288,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **491 / 643 implemented (76%)**, plus 1 partial (◐).
-> Of the 151 not-implemented, 71 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **477 / 572 ≈ 83% of the
+> **Coverage (FreeBASIC keyword set):** **565 / 645 implemented (88%)**, plus 5 partial (~).
+> Of the 80 not-implemented, 69 are classified **N/A** (compiler-internal `__FB_*` defines, native
+> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **565 / 576 ≈ 98% of the
 > applicable keywords**.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
@@ -2101,8 +2101,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `COLOR` | ✓ | Changes the foreground and background color of text to be written. |
 | `CSRLIN` | ✓ | Returns the row position of the cursor (VM-tracked, parallels `POS`). |
 | `POS` | ✓ | Returns the column position of the cursor. |
-| `LOCATE` | ✓ | Sets the row and column position of the cursor and its visibility. |
-| `SCREEN (Console)` | ✗ | Gets the character or color attribute at a given location. |
+| `LOCATE` | ✓ | Sets the row and column position of the cursor (1-based). Dialect-aware: in MODERN it moves the **text** cursor, as FreeBASIC defines it; in CLASSIC, `LOCATE x, y` keeps the Commodore v7 meaning and moves the bit-map **pixel** cursor. Cursor visibility (the `state` argument) is not modelled. |
+| `SCREEN (Console)` | ✓ | Gets the character or color attribute at a given location. `SCREEN(row, col)` yields the character code; a non-zero `colorflag` yields the colour attribute, packed as FreeBASIC packs it for a palette console of up to 4 bits per pixel (background in the high nibble, foreground in the low). |
 
 #### Writing Text to the Console
 

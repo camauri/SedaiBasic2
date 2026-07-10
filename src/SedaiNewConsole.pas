@@ -295,6 +295,7 @@ type
     procedure SetCharAt(Col, Row: Integer; Ch: Byte);
     function GetColorAt(Col, Row: Integer): Byte;
     procedure SetColorAt(Col, Row: Integer; Color: Byte);
+    function GetBackColorAt(Col, Row: Integer): Byte;
     // SSHAPE/GSHAPE command support
     function SaveShape(X1, Y1, X2, Y2: Double): string;
     procedure LoadShape(const Data: string; X, Y: Double; Mode: Integer);
@@ -542,6 +543,7 @@ type
     procedure SetCharAt(Col, Row: Integer; Ch: Byte);  // Set character at position (PETSCII)
     function GetColorAt(Col, Row: Integer): Byte;  // Get foreground color at position
     procedure SetColorAt(Col, Row: Integer; Color: Byte);  // Set foreground color at position
+    function GetBackColorAt(Col, Row: Integer): Byte;  // Get background color at position
 
     // Scrollback navigation
     procedure ScrollViewUp(NumLines: Integer = 1);
@@ -816,6 +818,7 @@ type
     procedure SetCharAt(Col, Row: Integer; Ch: Byte);
     function GetColorAt(Col, Row: Integer): Byte;
     procedure SetColorAt(Col, Row: Integer; Color: Byte);
+    function GetBackColorAt(Col, Row: Integer): Byte;
     // SSHAPE/GSHAPE command support
     function SaveShape(X1, Y1, X2, Y2: Double): string;
     procedure LoadShape(const Data: string; X, Y: Double; Mode: Integer);
@@ -2751,6 +2754,12 @@ begin
   // Stub - handled by TConsoleOutputAdapter
 end;
 
+function TVideoController.GetBackColorAt(Col, Row: Integer): Byte;
+begin
+  // Stub - handled by TConsoleOutputAdapter (which owns the text buffer)
+  Result := FBackgroundIndex;
+end;
+
 // === SSHAPE command support (save bitmap area to string) ===
 function TVideoController.SaveShape(X1, Y1, X2, Y2: Double): string;
 var
@@ -4398,6 +4407,17 @@ begin
     Result := FCurrentFGIndex;
 end;
 
+function TTextBuffer.GetBackColorAt(Col, Row: Integer): Byte;
+begin
+  // The cell's own background index, which may be the BG_USE_DEFAULT sentinel: a cell that never had
+  // an explicit background takes the screen's. Resolving that sentinel needs the screen background,
+  // which lives in the video controller, so the caller (TConsoleOutputAdapter) does it.
+  if (Row >= 0) and (Row < FRows) and (Col >= 0) and (Col < FCols) then
+    Result := FCells[Row][Col].BGIndex
+  else
+    Result := BG_USE_DEFAULT;
+end;
+
 procedure TTextBuffer.SetColorAt(Col, Row: Integer; Color: Byte);
 begin
   // Sets foreground color at position
@@ -5949,6 +5969,19 @@ begin
     Result := FTextBuffer.GetColorAt(Col, Row)
   else
     Result := 0;
+end;
+
+function TConsoleOutputAdapter.GetBackColorAt(Col, Row: Integer): Byte;
+begin
+  Result := DEFAULT_BG_INDEX;
+  if not Assigned(FTextBuffer) then Exit;
+  Result := FTextBuffer.GetBackColorAt(Col, Row);
+  // A cell with no explicit background shows the screen's, so report that rather than the sentinel.
+  if Result = BG_USE_DEFAULT then
+    if Assigned(FVideoController) then
+      Result := FVideoController.BackgroundIndex
+    else
+      Result := DEFAULT_BG_INDEX;
 end;
 
 procedure TConsoleOutputAdapter.SetColorAt(Col, Row: Integer; Color: Byte);

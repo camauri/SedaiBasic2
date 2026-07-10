@@ -410,6 +410,8 @@ begin
     ssaGfxDrawGML: Result := bcGfxDrawGML;
     ssaGfxPointCoord: Result := bcGfxPointCoord;
     ssaGfxPoint: Result := bcGfxPoint;
+    ssaConScreen: Result := bcConScreen;
+    ssaConLocate: Result := bcConLocate;
     ssaGfxPaint: Result := bcGfxPaint;
     ssaGfxLine: Result := bcGfxLine;
     ssaGfxCircle: Result := bcGfxCircle;

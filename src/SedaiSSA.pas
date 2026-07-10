@@ -3417,6 +3417,27 @@ begin
         FuncName := UpperCase(VarToStr(Node.Value));
         ArgListNode := Node.GetChild(0);
 
+        // FreeBASIC SCREEN(row, column [, colorflag]): read a console cell back. Rows and columns are
+        // 1-based. colorflag defaults to 0 (the character code); anything else asks for the colour
+        // attribute. The parser only produces this node in MODERN.
+        if (FuncName = kSCREENGFX) and (ArgListNode <> nil) and
+           (ArgListNode.NodeType in [antArgumentList, antExpressionList]) and
+           (ArgListNode.ChildCount >= 2) then
+        begin
+          ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);
+          ProcessExpression(ArgListNode.GetChild(1), MaskValue); MaskReg := EnsureIntRegister(MaskValue);
+          if ArgListNode.ChildCount >= 3 then
+          begin
+            ProcessExpression(ArgListNode.GetChild(2), TempVal);
+            IntRegVal := EnsureIntRegister(TempVal);
+          end
+          else
+            IntRegVal := EnsureIntRegister(MakeSSAConstInt(0));
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaConScreen, Result, ArgReg, MaskReg, IntRegVal);  // Src3=colorflag -> Immediate
+          Exit;
+        end;
+
         // Handle RGBA function specially (4 integer args -> 1 integer result)
         if FuncName = 'RGBA' then
         begin
@@ -10276,10 +10297,16 @@ begin
   else
     YReg := MakeSSAValue(svkNone);
 
-  // Emit ssaGraphicLocate instruction
-  // Dest=None, Src1=x, Src2=y, Src3=None
-  EmitInstruction(ssaGraphicLocate, MakeSSAValue(svkNone),
-                 XReg, YReg, MakeSSAValue(svkNone));
+  // The two dialects mean different things by LOCATE, and each keeps its own.
+  // CLASSIC (C128 v7): "LOCATE x, y" positions the bit-map PIXEL cursor.
+  // MODERN (FreeBASIC): "LOCATE row, column" positions the TEXT cursor, 1-based, on the console.
+  // Child 0 is x in one reading and row in the other -- the operand order is the same, the meaning is not.
+  if FModernMode then
+    EmitInstruction(ssaConLocate, MakeSSAValue(svkNone),
+                   EnsureIntRegister(XReg), EnsureIntRegister(YReg), MakeSSAValue(svkNone))
+  else
+    EmitInstruction(ssaGraphicLocate, MakeSSAValue(svkNone),
+                   XReg, YReg, MakeSSAValue(svkNone));
 end;
 
 { ProcessColor - Handle COLOR command for setting screen area colors

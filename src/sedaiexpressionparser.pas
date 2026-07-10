@@ -75,6 +75,7 @@ type
     function ParseStringFunction(Token: TLexerToken): TASTNode;
     function ParseMemoryFunction(Token: TLexerToken): TASTNode;
     function ParseGraphicsFunction(Token: TLexerToken): TASTNode;
+    function ParseGraphicsCommandForm(Token: TLexerToken): TASTNode;  // FreeBASIC SCREEN(row, col [, flag])
     function ParseSpriteFunction(Token: TLexerToken): TASTNode;
     function ParseInputFunction(Token: TLexerToken): TASTNode;
     function ParseInputFunctionForm(Token: TLexerToken): TASTNode;   // FreeBASIC INPUT(n [, [#]f])
@@ -126,6 +127,7 @@ function StaticParseMathFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseStringFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseMemoryFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseGraphicsFunction(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseGraphicsCommandForm(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseSpriteFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseInputFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseInputFunction(Parser: Pointer; Token: TLexerToken): TObject;
@@ -239,6 +241,11 @@ end;
 function StaticParseGraphicsFunction(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseGraphicsFunction(Token);
+end;
+
+function StaticParseGraphicsCommandForm(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseGraphicsCommandForm(Token);
 end;
 
 function StaticParseSpriteFunction(Parser: Pointer; Token: TLexerToken): TObject;
@@ -426,6 +433,10 @@ begin
   Context.SetParseRule(ttStringFunction, MakePrefixRule(@StaticParseStringFunction, precCall));
   Context.SetParseRule(ttMemoryFunction, MakePrefixRule(@StaticParseMemoryFunction, precCall));
   Context.SetParseRule(ttGraphicsFunction, MakePrefixRule(@StaticParseGraphicsFunction, precCall));
+  // SCREEN is a graphics STATEMENT keyword ("Screen 12"), but FreeBASIC also exposes it as a function
+  // reading back a console cell ("Screen(row, col)"). Only that one command has a function form, so the
+  // rule accepts SCREEN and rejects every other graphics command still standing in expression position.
+  Context.SetParseRule(ttGraphicsCommand, MakePrefixRule(@StaticParseGraphicsCommandForm, precCall));
   Context.SetParseRule(ttSpriteFunction, MakePrefixRule(@StaticParseSpriteFunction, precCall));
   Context.SetParseRule(ttInputFunction, MakePrefixRule(@StaticParseInputFunction, precCall));
   // FreeBASIC INPUT(n [, [#]filenum]) — the FUNCTION form, which reads n characters and returns them.
@@ -1266,6 +1277,21 @@ begin
   end;
 
   DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseGraphicsCommandForm(Token: TLexerToken): TASTNode;
+// A graphics command found where an expression was expected. Exactly one of them has a function form:
+// FreeBASIC's SCREEN(row, column [, colorflag]), which reads a character or colour attribute back out
+// of the console. MODERN only -- Commodore BASIC v7 has no SCREEN at all, so in CLASSIC this stays the
+// syntax error it has always been, and the dialects keep their own semantics.
+begin
+  if (UpperCase(Token.Value) <> kSCREENGFX) or not ModernMode or not Context.Check(ttDelimParOpen) then
+  begin
+    HandleError(Format('Unexpected token "%s"', [Token.Value]), Token);
+    Result := nil;
+    Exit;
+  end;
+  Result := ParseGraphicsFunction(Token);   // antGraphicsFunction "SCREEN" + argument list
 end;
 
 function TExpressionParser.ParseSpriteFunction(Token: TLexerToken): TASTNode;

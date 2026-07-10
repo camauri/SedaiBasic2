@@ -54,6 +54,12 @@ uses
   ;
 
 type
+  { TTermCell - one modelled screen cell (see FCells) }
+  TTermCell = record
+    Ch: Char;
+    Fg, Bg: Byte;   // palette indices
+  end;
+
   { TTerminalController - Console output device (stdout) }
   { NOTE: Using TObject instead of TInterfacedObject because interfaces use CORBA mode (no refcount) }
   TTerminalController = class(TObject, IOutputDevice)
@@ -61,6 +67,16 @@ type
     FInitialized: Boolean;
     FCursorX, FCursorY: Integer;
     FCols, FRows: Integer;
+    // A model of the visible screen, so a program can read back what it printed: SCREEN(row, col) and
+    // the C128 screen RAM at $0400 both go through GetCharAt/GetColorAt. Text still goes straight to
+    // stdout -- this mirrors it, cell by cell, wrapping at the right margin and scrolling at the bottom.
+    //
+    // It carries its own caret (FCellX/FCellY) and deliberately does NOT touch FCursorX/FCursorY, which
+    // count what was handed to the terminal and are what POS/CSRLIN report. Those two grow without
+    // bound and never scroll; the model's caret stays inside the grid. Keeping them apart means adding
+    // the model changes no existing console behaviour.
+    FCells: array of array of TTermCell;
+    FCellX, FCellY: Integer;   // the model's caret: always within [0..FCols-1] x [0..FRows-1]
     // Optional shared graphics framebuffer (sb --window): when attached, the C128 graphics commands
     // render into it (the software backend's surface, which the window presenter mirrors). nil = the
     // usual headless terminal (graphics are no-ops). Not owned. Viewport-only — no text-on-graphics.
@@ -70,6 +86,11 @@ type
     FColorSrc: array[0..6] of Integer;        // RCLR/GETCOLOR readback
     FPcX, FPcY: Integer;                       // pixel cursor (LOCATE/DRAW)
     function ResolveC128Color(Source: UInt32; out UseIndex: Boolean): UInt32;
+    // The modelled screen (see FCells)
+    procedure AllocCells;
+    procedure ScrollCellsUp;
+    procedure CellNextRow;
+    procedure PutCells(const Text: string);
   public
     constructor Create;
     // sb --window: attach the shared graphics surface so C128 graphics draw into the window.
@@ -169,6 +190,7 @@ type
     function GetCharAt(Col, Row: Integer): Byte;
     procedure SetCharAt(Col, Row: Integer; Ch: Byte);
     function GetColorAt(Col, Row: Integer): Byte;
+    function GetBackColorAt(Col, Row: Integer): Byte;
     procedure SetColorAt(Col, Row: Integer; Color: Byte);
   end;
 
@@ -237,6 +259,75 @@ begin
   FCursorY := 0;
   FCols := 80;
   FRows := 25;
+  FBgIdx := 0; FFgIdx := 1;   // the C128 colour sources' defaults, so blank cells start with them
+  AllocCells;
+end;
+
+{ === The modelled screen (see FCells) === }
+
+procedure TTerminalController.AllocCells;
+var
+  R, C: Integer;
+begin
+  if (FCols <= 0) or (FRows <= 0) then Exit;
+  SetLength(FCells, FRows, FCols);
+  for R := 0 to FRows - 1 do
+    for C := 0 to FCols - 1 do
+    begin
+      FCells[R][C].Ch := ' ';
+      FCells[R][C].Fg := FFgIdx;
+      FCells[R][C].Bg := FBgIdx;
+    end;
+  FCellX := 0;
+  FCellY := 0;
+end;
+
+procedure TTerminalController.ScrollCellsUp;
+var
+  R, C: Integer;
+begin
+  for R := 0 to FRows - 2 do
+    for C := 0 to FCols - 1 do
+      FCells[R][C] := FCells[R + 1][C];
+  for C := 0 to FCols - 1 do
+  begin
+    FCells[FRows - 1][C].Ch := ' ';
+    FCells[FRows - 1][C].Fg := FFgIdx;
+    FCells[FRows - 1][C].Bg := FBgIdx;
+  end;
+end;
+
+procedure TTerminalController.CellNextRow;
+begin
+  FCellX := 0;
+  if FCellY >= FRows - 1 then
+    ScrollCellsUp          // at the bottom the screen scrolls; the caret stays on the last row
+  else
+    Inc(FCellY);
+end;
+
+procedure TTerminalController.PutCells(const Text: string);
+var
+  i: Integer;
+  Ch: Char;
+begin
+  if Length(FCells) = 0 then Exit;
+  for i := 1 to Length(Text) do
+  begin
+    Ch := Text[i];
+    if Ch = #13 then
+      FCellX := 0
+    else if Ch = #10 then
+      CellNextRow
+    else
+    begin
+      if FCellX >= FCols then CellNextRow;   // wrap at the right margin
+      FCells[FCellY][FCellX].Ch := Ch;
+      FCells[FCellY][FCellX].Fg := FFgIdx;
+      FCells[FCellY][FCellX].Bg := FBgIdx;
+      Inc(FCellX);
+    end;
+  end;
 end;
 
 function TTerminalController.Initialize(const Title: string; Width: Integer; Height: Integer): Boolean;
@@ -245,6 +336,7 @@ begin
   FRows := Height;
   FCursorX := 0;
   FCursorY := 0;
+  AllocCells;   // the modelled screen follows the requested geometry
   FInitialized := True;
   Result := True;
 end;
@@ -262,12 +354,15 @@ end;
 procedure TTerminalController.Print(const Text: string; ClearBackground: Boolean);
 begin
   System.Write(Text);
+  PutCells(Text);
   Inc(FCursorX, Length(Text));
 end;
 
 procedure TTerminalController.PrintLn(const Text: string; ClearBackground: Boolean);
 begin
   System.WriteLn(Text);
+  PutCells(Text);
+  CellNextRow;
   FCursorX := 0;
   Inc(FCursorY);
 end;
@@ -275,6 +370,7 @@ end;
 procedure TTerminalController.NewLine;
 begin
   System.WriteLn;
+  CellNextRow;
   FCursorX := 0;
   Inc(FCursorY);
 end;
@@ -288,6 +384,7 @@ begin
   {$ELSE}
   System.Write(#27'[2J'#27'[H');  // ANSI clear + home
   {$ENDIF}
+  AllocCells;   // blank the modelled screen and home its caret
   FCursorX := 0;
   FCursorY := 0;
 end;
@@ -301,13 +398,21 @@ procedure TTerminalController.SetCursor(X, Y: Integer);
 begin
   FCursorX := X;
   FCursorY := Y;
-  // Terminal positioning not implemented (would need ANSI sequences)
+  // Terminal positioning not implemented (would need ANSI sequences), but the modelled screen follows,
+  // clamped to the grid, so LOCATE + PRINT + SCREEN(row, col) read back what the program meant to write.
+  if Length(FCells) > 0 then
+  begin
+    FCellX := X; FCellY := Y;
+    if FCellX < 0 then FCellX := 0 else if FCellX > FCols - 1 then FCellX := FCols - 1;
+    if FCellY < 0 then FCellY := 0 else if FCellY > FRows - 1 then FCellY := FRows - 1;
+  end;
 end;
 
 procedure TTerminalController.MoveCursor(DeltaX, DeltaY: Integer);
 begin
   Inc(FCursorX, DeltaX);
   Inc(FCursorY, DeltaY);
+  SetCursor(FCursorX, FCursorY);
 end;
 
 function TTerminalController.GetCursorX: Integer;
@@ -723,22 +828,41 @@ end;
 
 function TTerminalController.GetCharAt(Col, Row: Integer): Byte;
 begin
-  Result := 0;  // Not supported in terminal mode
+  if (Length(FCells) > 0) and (Row >= 0) and (Row < FRows) and (Col >= 0) and (Col < FCols) then
+    Result := Ord(FCells[Row][Col].Ch)
+  else
+    Result := 32;  // space, as the windowed console reports for a cell off the grid
 end;
 
 procedure TTerminalController.SetCharAt(Col, Row: Integer; Ch: Byte);
 begin
-  // Not supported in terminal mode
+  // POKE into the C128 screen RAM: it lands in the model, so a later PEEK reads it back. Nothing is
+  // redrawn -- stdout has already moved on -- but the program's own view of the screen stays coherent.
+  if (Length(FCells) > 0) and (Row >= 0) and (Row < FRows) and (Col >= 0) and (Col < FCols) then
+    FCells[Row][Col].Ch := Chr(Ch);
 end;
 
 function TTerminalController.GetColorAt(Col, Row: Integer): Byte;
 begin
-  Result := 0;  // Not supported in terminal mode
+  if (Length(FCells) > 0) and (Row >= 0) and (Row < FRows) and (Col >= 0) and (Col < FCols) then
+    Result := FCells[Row][Col].Fg
+  else
+    Result := FFgIdx;
+end;
+
+function TTerminalController.GetBackColorAt(Col, Row: Integer): Byte;
+begin
+  if (Length(FCells) > 0) and (Row >= 0) and (Row < FRows) and (Col >= 0) and (Col < FCols) then
+    Result := FCells[Row][Col].Bg
+  else
+    Result := FBgIdx;
 end;
 
 procedure TTerminalController.SetColorAt(Col, Row: Integer; Color: Byte);
 begin
-  // Not supported in terminal mode
+  // POKE into the C128 colour RAM: recorded in the model (see SetCharAt).
+  if (Length(FCells) > 0) and (Row >= 0) and (Row < FRows) and (Col >= 0) and (Col < FCols) then
+    FCells[Row][Col].Fg := Color and $0F;
 end;
 
 { ============================================================================

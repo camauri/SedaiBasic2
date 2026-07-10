@@ -448,6 +448,10 @@ type
     ssaSprload,        // SPRLOAD "file": load all sprites from a JSON file
     ssaSprsize,        // SPRSIZE n, w, h: set sprite dimensions
     ssaSprform,        // SPRFORM n, format: set sprite data format
+    ssaConScreen,      // SCREEN(row, col [, colorflag]): a console cell's char code or colour attribute
+                       //   (Dest = result, Src1 = row, Src2 = col, Immediate = colorflag register)
+    ssaConLocate,      // MODERN LOCATE row, col: position the console TEXT cursor (Src1 = row, Src2 = col,
+                       //   both 1-based). CLASSIC LOCATE is ssaGraphicLocate, the pixel cursor.
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 
