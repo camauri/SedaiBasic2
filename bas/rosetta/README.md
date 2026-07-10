@@ -159,6 +159,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `decimal_floating_point_number_to_binary.bas` | <https://rosettacode.org/wiki/Decimal_floating_point_number_to_binary> |
 | `distinct_power_numbers.bas` | <https://rosettacode.org/wiki/Distinct_power_numbers> |
 | `doomsday_rule.bas` | <https://rosettacode.org/wiki/Doomsday_rule> |
+| `arithmetic_complex.bas` | <https://rosettacode.org/wiki/Arithmetic/Complex> |
 
 ## Running
 

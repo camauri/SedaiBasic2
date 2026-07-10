@@ -234,6 +234,7 @@ type
     procedure CollectDeclaredNames(Node: TASTNode);  // Pre-scan AST for names an explicit declaration introduces
     function IsDeclaredName(const VarName: string): Boolean;
     function BareCallableFunction(const NameU: string): Boolean;  // a FUNCTION invocable with no arguments
+    function ProcHasParamCount(const NameU: string; N: Integer): Boolean;  // decl has exactly N parameters
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
     procedure ProcessStatement(Node: TASTNode);
     // SUB/FUNCTION (M2): pre-scan the AST to register all declarations up front (so CALL
@@ -1024,6 +1025,20 @@ begin
   Result := FDeclaredNames.IndexOf(UpperCase(VarName)) >= 0;
 end;
 
+function TSSAGenerator.ProcHasParamCount(const NameU: string; N: Integer): Boolean;
+// True when the declared SUB/FUNCTION/OPERATOR named NameU has exactly N parameters. Used to tell a
+// unary operator overload from the binary operator of the same symbol (they share a label).
+var
+  Decl, ParamList: TASTNode;
+begin
+  Result := False;
+  if not FProcDecls.TryGetValue(NameU, Decl) then Exit;
+  if (Decl = nil) or (Decl.ChildCount < 2) then Exit;
+  ParamList := Decl.GetChild(1);
+  if (ParamList = nil) or (ParamList.NodeType <> antParameterList) then Exit;
+  Result := ParamList.ChildCount = N;
+end;
+
 function TSSAGenerator.BareCallableFunction(const NameU: string): Boolean;
 // FreeBASIC lets a FUNCTION be called with no parentheses when it needs no arguments: "x = Foo"
 // invokes Foo(). True only for a declared FUNCTION (a SUB yields no value) whose every parameter is
@@ -1777,6 +1792,26 @@ begin
       // Handle unary operators (negation and NOT)
       if Node.ChildCount > 0 then
       begin
+        // Operator overloading: unary "-x" / "Not x" on a UDT with a matching one-parameter
+        // "Operator -(a AS T)" / "Operator Not(a AS T)". Resolved by the operand's static type; the
+        // one-parameter check keeps it distinct from the binary operator of the same symbol.
+        if Assigned(Node.Token) and
+           ((Node.Token.TokenType = ttOpSub) or (Node.Token.TokenType = ttBitwiseNOT)) then
+        begin
+          OpLhsType := ObjectTypeName(Node.GetChild(0));
+          if OpLhsType <> '' then
+          begin
+            OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value));
+            if (OpLabel <> '') and ProcHasParamCount(OpLabel, 1) then
+            begin
+              OpArgs := TASTNode.Create(antArgumentList, Node.Token);
+              OpArgs.AddChild(Node.GetChild(0).Clone);
+              EmitUserFunctionCall(OpLabel, OpArgs, Result);
+              OpArgs.Free;
+              Exit;
+            end;
+          end;
+        end;
         ProcessExpression(Node.GetChild(0), Left);
 
         // Check if this is NOT (bitwise) or negation (-)
@@ -14938,12 +14973,17 @@ begin
         if (Decl.ChildCount >= 2) and (Decl.GetChild(0).NodeType = antIdentifier) then
         begin
           VarName := UpperCase(VarToStr(Decl.GetChild(0).Value));
-          case InferExprBank(Decl.GetChild(1)) of
-            srtString: TypeName := 'STRING';
-            srtInt:    TypeName := 'INTEGER';
-          else
-            TypeName := 'DOUBLE';
-          end;
+          // A UDT-valued initializer (e.g. "Var v = C(5,2)" or "Var v = otherUdt") infers the UDT type,
+          // not a scalar bank: its value is a record, and InferExprBank would see only the int handle and
+          // make v an INTEGER holding that handle. ObjectTypeName reads the type without emitting code.
+          TypeName := ObjectTypeName(Decl.GetChild(1));
+          if TypeName = '' then
+            case InferExprBank(Decl.GetChild(1)) of
+              srtString: TypeName := 'STRING';
+              srtInt:    TypeName := 'INTEGER';
+            else
+              TypeName := 'DOUBLE';
+            end;
           Decl.InsertChild(1, TASTNode.CreateWithValue(antIdentifier, TypeName, Decl.GetChild(0).Token));
           Decl.Attributes.Values['INFER'] := '0';
           RegisterTypedVar(VarName, TypeName);
@@ -17572,12 +17612,22 @@ begin
       if (Result = '') and (ArrayIndexOf(ArrName) < 0) and (FProcedureNames.IndexOf(ArrName) >= 0) then
         Result := VarRecordTypeName(ArrName);
     end
-    // Array-of-UDT MEMBER element "obj.field(i)": the element type is the field's ArrayElemType.
+    // Array-of-UDT MEMBER element "obj.field(i)", or a method call "obj.method(args)": child 0 is a
+    // member access. The element type is the field's ArrayElemType; a method call yields its return type.
     else if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0).NodeType = antMemberAccess) then
     begin
       ParentType := ObjectTypeName(ObjNode.GetChild(0).GetChild(0));
       if ParentType <> '' then
+      begin
         Result := UDTArrayElemType(FindUDT(ParentType), VarToStr(ObjNode.GetChild(0).Value));
+        // "obj.method(args)" returning a UDT: the method's return type is registered under its label, so
+        // "Print obj.method()" reaches its Cast operator and a chained "obj.method().field" resolves.
+        if Result = '' then
+        begin
+          NestedT := ResolveMethodLabel(ParentType, VarToStr(ObjNode.GetChild(0).Value));
+          if NestedT <> '' then Result := VarRecordTypeName(NestedT);
+        end;
+      end;
     end;
   end
   else if ObjNode.NodeType = antMemberAccess then
@@ -17588,6 +17638,12 @@ begin
       Result := NestedT;
       // A pointer field (T PTR) holds a handle to a T — used for chained access "p->nxt->val".
       if Result = '' then Result := UDTFieldPtrPointee(FindUDT(ParentType), VarToStr(ObjNode.Value));
+    end
+    // A no-argument method used bare, "obj.method", returning a UDT (FreeBASIC allows dropping the "()").
+    else if ParentType <> '' then
+    begin
+      NestedT := ResolveMethodLabel(ParentType, VarToStr(ObjNode.Value));
+      if NestedT <> '' then Result := VarRecordTypeName(NestedT);
     end;
   end
   else if ObjNode.NodeType = antBinaryOp then
@@ -17601,6 +17657,21 @@ begin
       begin
         NestedT := ResolveMethodLabel(ParentType, 'OPERATOR' + VarToStr(ObjNode.Token.Value));  // op label
         if NestedT <> '' then Result := VarRecordTypeName(NestedT);   // its UDT return type ('' if scalar)
+      end;
+    end;
+  end
+  else if ObjNode.NodeType = antUnaryOp then
+  begin
+    // A unary overloaded operator "OPERATOR <sym>(a AS T) AS R" yields a value of R. Resolve R when it is
+    // a UDT, so "Print -x" reaches its Cast operator. The one-parameter check keeps it distinct from the
+    // binary operator of the same symbol.
+    if (ObjNode.ChildCount >= 1) and Assigned(ObjNode.Token) then
+    begin
+      ParentType := ObjectTypeName(ObjNode.GetChild(0));
+      if ParentType <> '' then
+      begin
+        NestedT := ResolveMethodLabel(ParentType, 'OPERATOR' + VarToStr(ObjNode.Token.Value));
+        if (NestedT <> '') and ProcHasParamCount(NestedT, 1) then Result := VarRecordTypeName(NestedT);
       end;
     end;
   end;
