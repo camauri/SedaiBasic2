@@ -417,7 +417,9 @@ type
     // UDT element type of an array-of-UDT by name, scope-aware (per-proc array param, then global).
     function ArrayRecordTypeOf(const ArrName: string): string;
     // FreeBASIC "Operator T.Cast() As String": if Node is a UDT with a string cast, invoke it -> string.
+    function CastReturnCode(const RetTypeName: string): string;  // OPERATOR CAST label suffix by return bank
     function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
+    function TryEmitUDTCastToNumber(Node: TASTNode; out Val: TSSAValue): Boolean;  // "Operator Cast() As Integer/Double" in arithmetic
     function HasUDTStringCast(Node: TASTNode): Boolean;  // would TryEmitUDTCastToString fire? (emits nothing)
     procedure ProcessStringExpression(Node: TASTNode; out Val: TSSAValue);  // evaluate where a STRING is expected
     procedure ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
@@ -1212,6 +1214,7 @@ var
   FuncName, VarName: string;
   BareIntercept: Boolean;         // MODERN, and this bare name is NOT a name the program declared
   CastLeft, CastRight: Boolean;   // apply "Operator T.Cast() As String" to this binary operand?
+  NumCast: Boolean;               // arithmetic op: apply a numeric Cast operator to a UDT operand
   RecUDTIdx, RecSlotK: Integer;   // OFFSETOF: UDT index + field scan
   FuncRetType: TSSARegisterType;  // M2: user FUNCTION return type
   MethodObjNode: TASTNode;        // M4.1: object of a method call
@@ -1972,9 +1975,17 @@ begin
         CastLeft := HasUDTStringCast(Node.GetChild(0)) and (InferExprBank(Node.GetChild(1)) = srtString);
         CastRight := HasUDTStringCast(Node.GetChild(1)) and (InferExprBank(Node.GetChild(0)) = srtString);
       end;
-      if not (CastLeft and TryEmitUDTCastToString(Node.GetChild(0), Left)) then
+      // In an arithmetic/bitwise op, a UDT operand with a numeric Cast operator converts through it, so a
+      // custom numeric type works as "udt + n". Not for "&" (string) nor comparisons (handled above via
+      // the string cast / an Operator =). No matching operator overload exists here — that was tried first.
+      NumCast := Node.Token.TokenType in [ttOpAdd, ttOpSub, ttOpMul, ttOpDiv, ttOpIntDiv,
+                                          ttOpMod, ttOpPow, ttOpShl, ttOpShr,
+                                          ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR];
+      if not ((CastLeft and TryEmitUDTCastToString(Node.GetChild(0), Left)) or
+              (NumCast and TryEmitUDTCastToNumber(Node.GetChild(0), Left))) then
         ProcessExpression(Node.GetChild(0), Left);
-      if not (CastRight and TryEmitUDTCastToString(Node.GetChild(1), Right)) then
+      if not ((CastRight and TryEmitUDTCastToString(Node.GetChild(1), Right)) or
+              (NumCast and TryEmitUDTCastToNumber(Node.GetChild(1), Right))) then
         ProcessExpression(Node.GetChild(1), Right);
 
       // PHASE 3 TIER 3: Unwrap register-held constants for constant folding
@@ -17690,19 +17701,57 @@ begin
   ProcessExpression(Node, Val);
 end;
 
+function TSSAGenerator.CastReturnCode(const RetTypeName: string): string;
+// The one-character suffix that encodes an OPERATOR CAST's return bank in its label (see the
+// re-encoding in PreCollectProcedures): '$' string, '#' float, '%' int.
+begin
+  case TypeNameToBank(RetTypeName, '') of
+    srtString: Result := '$';
+    srtFloat:  Result := '#';
+  else
+    Result := '%';
+  end;
+end;
+
+function TSSAGenerator.TryEmitUDTCastToNumber(Node: TASTNode; out Val: TSSAValue): Boolean;
+// FreeBASIC "Operator T.Cast() As Integer/Double": if Node is a UDT of type T whose Cast operator
+// returns a numeric type, invoke it and return the numeric value. Used in arithmetic contexts, so a
+// custom numeric type ("udt + n") behaves like a number. A string-returning Cast is left to the string
+// path. (When a type declares both a numeric and a string Cast the label collides and this sees only
+// the last-declared one; that overload-by-return-type case is a separate, rarer gap.)
+var
+  TypeName, Lbl: string;
+begin
+  Result := False;
+  Val := MakeSSAValue(svkNone);
+  if Node = nil then Exit;
+  TypeName := ObjectTypeName(Node);
+  if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
+  // The cast label carries its return bank as a suffix (see PreCollectProcedures): '%' int, '#' float.
+  // Prefer an int cast, then a float one. A string cast ('$') is not a numeric conversion.
+  Lbl := ResolveMethodLabel(TypeName, 'OPERATORCAST%');
+  if Lbl <> '' then
+    ProcessMethodCall(Node, TypeName, 'OPERATORCAST%', nil, Val)
+  else
+  begin
+    Lbl := ResolveMethodLabel(TypeName, 'OPERATORCAST#');
+    if Lbl = '' then Exit;
+    ProcessMethodCall(Node, TypeName, 'OPERATORCAST#', nil, Val);
+  end;
+  Result := (Val.Kind <> svkNone);
+end;
+
 function TSSAGenerator.HasUDTStringCast(Node: TASTNode): Boolean;
 // The test TryEmitUDTCastToString performs, without emitting anything: does Node name a UDT instance
 // whose type (or an ancestor) defines a string-returning Cast operator?
 var
-  TypeName, Lbl: string;
+  TypeName: string;
 begin
   Result := False;
   if Node = nil then Exit;
   TypeName := ObjectTypeName(Node);
   if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
-  Lbl := ResolveMethodLabel(TypeName, 'OPERATORCAST');
-  if Lbl = '' then Exit;
-  Result := GetVariableType(Lbl) = srtString;
+  Result := ResolveMethodLabel(TypeName, 'OPERATORCAST$') <> '';   // '$' = string-returning cast
 end;
 
 function TSSAGenerator.TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
@@ -17710,17 +17759,15 @@ function TSSAGenerator.TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue
 // whose type (or an ancestor) defines a string-returning Cast operator, invoke it and return the
 // resulting string. Used to convert a UDT to a string in string contexts (PRINT, "&"/"+" concat).
 var
-  TypeName, Lbl: string;
+  TypeName: string;
 begin
   Result := False;
   Val := MakeSSAValue(svkNone);
   if Node = nil then Exit;
   TypeName := ObjectTypeName(Node);                       // UDT type, no code emitted
   if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
-  Lbl := ResolveMethodLabel(TypeName, 'OPERATORCAST');
-  if Lbl = '' then Exit;
-  if GetVariableType(Lbl) <> srtString then Exit;         // only a string-returning cast qualifies here
-  ProcessMethodCall(Node, TypeName, 'OPERATORCAST', nil, Val);
+  if ResolveMethodLabel(TypeName, 'OPERATORCAST$') = '' then Exit;   // '$' = string-returning cast
+  ProcessMethodCall(Node, TypeName, 'OPERATORCAST$', nil, Val);
   Result := (Val.Kind <> svkNone);
 end;
 
@@ -18245,6 +18292,17 @@ begin
      (Node.GetChild(1).NodeType = antParameterList) then
   begin
     Name := Copy(Name, 1, Pos('#', Name)) + CtorSigFromParams(Node.GetChild(1));
+    NameNode.Value := Name;
+  end;
+  // Re-encode "OPERATOR CAST" with its RETURN bank, so a type declaring several casts ("As Integer",
+  // "As String", ...) gets a distinct label per one -- they share parameters (only THIS), so the return
+  // type is what tells them apart. "TYPE.OPERATORCAST" -> "TYPE.OPERATORCAST$" (string) / "%" (int) /
+  // "#" (float). Every cast lookup (TryEmitUDTCastToString / ToNumber) uses the same suffix.
+  if (Length(Name) > Length('.OPERATORCAST')) and
+     (Copy(Name, Length(Name) - Length('.OPERATORCAST') + 1, MaxInt) = '.OPERATORCAST') and
+     (NameNode.ChildCount >= 1) and (NameNode.GetChild(0).NodeType = antIdentifier) then
+  begin
+    Name := Name + CastReturnCode(UpperCase(VarToStr(NameNode.GetChild(0).Value)));
     NameNode.Value := Name;
   end;
   if FProcDecls.ContainsKey(Name) then Exit;  // already registered by the pre-scan

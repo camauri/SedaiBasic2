@@ -160,6 +160,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `distinct_power_numbers.bas` | <https://rosettacode.org/wiki/Distinct_power_numbers> |
 | `doomsday_rule.bas` | <https://rosettacode.org/wiki/Doomsday_rule> |
 | `arithmetic_complex.bas` | <https://rosettacode.org/wiki/Arithmetic/Complex> |
+| `define_a_primitive_data_type.bas` | <https://rosettacode.org/wiki/Define_a_primitive_data_type> |
 
 ## Running
 
