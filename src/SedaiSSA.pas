@@ -416,6 +416,8 @@ type
     function ArrayRecordTypeOf(const ArrName: string): string;
     // FreeBASIC "Operator T.Cast() As String": if Node is a UDT with a string cast, invoke it -> string.
     function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
+    function HasUDTStringCast(Node: TASTNode): Boolean;  // would TryEmitUDTCastToString fire? (emits nothing)
+    procedure ProcessStringExpression(Node: TASTNode; out Val: TSSAValue);  // evaluate where a STRING is expected
     procedure ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
                                 ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic: Boolean = False);
     function TryStaticMethodCall(ObjNode: TASTNode; const MethNm: string;     // TypeName.method(args) (static member, no instance)
@@ -1169,6 +1171,7 @@ var
   OpCode: TSSAOpCode;
   FuncName, VarName: string;
   BareIntercept: Boolean;         // MODERN, and this bare name is NOT a name the program declared
+  CastLeft, CastRight: Boolean;   // apply "Operator T.Cast() As String" to this binary operand?
   RecUDTIdx, RecSlotK: Integer;   // OFFSETOF: UDT index + field scan
   FuncRetType: TSSARegisterType;  // M2: user FUNCTION return type
   MethodObjNode: TASTNode;        // M4.1: object of a method call
@@ -1886,9 +1889,21 @@ begin
       // operator ("Operator T.Cast() As String") is converted through it, so "s & vec" prints the
       // vector's string form instead of its (numeric) handle. Only "&" is treated this way — "+" could
       // be an operator-overload, so it is left to the arithmetic/overload paths.
-      if not ((Node.Token.TokenType = ttOpConcat) and TryEmitUDTCastToString(Node.GetChild(0), Left)) then
+      //
+      // A comparison converts the same way, but only when the OTHER operand is plainly a string: that is
+      // what makes "SELECT CASE udt / CASE ""abc""" work, since SELECT CASE desugars to a chain of "="
+      // comparisons. A UDT compared against a UDT is left alone -- it belongs to an "Operator =", not to
+      // a string conversion.
+      CastLeft := (Node.Token.TokenType = ttOpConcat);
+      CastRight := CastLeft;
+      if Node.Token.TokenType in [ttOpEq, ttOpNeq, ttOpLt, ttOpGt, ttOpLe, ttOpGe] then
+      begin
+        CastLeft := HasUDTStringCast(Node.GetChild(0)) and (InferExprBank(Node.GetChild(1)) = srtString);
+        CastRight := HasUDTStringCast(Node.GetChild(1)) and (InferExprBank(Node.GetChild(0)) = srtString);
+      end;
+      if not (CastLeft and TryEmitUDTCastToString(Node.GetChild(0), Left)) then
         ProcessExpression(Node.GetChild(0), Left);
-      if not ((Node.Token.TokenType = ttOpConcat) and TryEmitUDTCastToString(Node.GetChild(1), Right)) then
+      if not (CastRight and TryEmitUDTCastToString(Node.GetChild(1), Right)) then
         ProcessExpression(Node.GetChild(1), Right);
 
       // PHASE 3 TIER 3: Unwrap register-held constants for constant folding
@@ -2687,17 +2702,25 @@ begin
           // LEN(str) - returns integer length. For a WSTRING argument the result is the Unicode codepoint
           // count (ssaStrLenW) rather than the byte length (ssaStrLen); the UTF-8 storage is the same.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
-          begin
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
-            ArgNode := ArgListNode.GetChild(0);
-          end
+            ArgNode := ArgListNode.GetChild(0)
           else if ArgListNode <> nil then
-          begin
-            ProcessExpression(ArgListNode, ArgValue);
-            ArgNode := ArgListNode;
-          end
+            ArgNode := ArgListNode
           else begin Result := MakeSSAValue(svkNone); Exit; end;
 
+          // LEN of a user-defined type is the size of the type in bytes, NOT a string length: FreeBASIC
+          // calls an "Operator Len" if the type declares one (we have none) and otherwise reports SizeOf.
+          // In particular it does NOT go through "Operator Cast() As String" -- only the string contexts
+          // do. Without this the record handle reached the string register and LEN answered 1.
+          TempStr := ObjectTypeName(ArgNode);
+          if (TempStr <> '') and (FindUDT(TempStr) >= 0) then
+          begin
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(TempStr)),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Exit;
+          end;
+
+          ProcessExpression(ArgNode, ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
@@ -2720,7 +2743,7 @@ begin
           // position, take MID(str, pos, 1) first; then ASC of that single character.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue);    // str
+            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);    // str
             ProcessExpression(ArgListNode.GetChild(1), Arg2Value);   // pos
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureIntRegister(Arg2Value);
@@ -2732,12 +2755,12 @@ begin
           end
           else if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
           begin
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);
             ArgReg := EnsureStringRegister(ArgValue);
           end
           else if ArgListNode <> nil then
           begin
-            ProcessExpression(ArgListNode, ArgValue);
+            ProcessStringExpression(ArgListNode, ArgValue);
             ArgReg := EnsureStringRegister(ArgValue);
           end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
@@ -2977,8 +3000,8 @@ begin
           // to a short prefix rather than searching from the end (use the 2-arg form for from-the-end).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue);   // str
-            ProcessExpression(ArgListNode.GetChild(1), Arg2Value);  // substring / char set
+            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);   // str
+            ProcessStringExpression(ArgListNode.GetChild(1), Arg2Value);  // substring / char set
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureStringRegister(Arg2Value);
             // FreeBASIC "Any" form: the 2nd argument is a character SET; find the last single char in
@@ -3042,7 +3065,7 @@ begin
           // FreeBASIC single-arg string functions: one string in, string out (B1.2).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
           begin
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);
             ArgReg := EnsureStringRegister(ArgValue);
             DestReg := FProgram.AllocRegister(srtString);
             Result := MakeSSARegister(srtString, DestReg);
@@ -3052,7 +3075,7 @@ begin
             if ((FuncName = 'LTRIM') or (FuncName = 'RTRIM') or (FuncName = 'TRIM')) and
                (ArgListNode.ChildCount >= 2) then
             begin
-              ProcessExpression(ArgListNode.GetChild(1), Arg2Value);   // trimset
+              ProcessStringExpression(ArgListNode.GetChild(1), Arg2Value);   // trimset
               Arg2Reg := EnsureStringRegister(Arg2Value);
               if FuncName = 'LTRIM' then TrimMode := 1                  // left
               else if FuncName = 'RTRIM' then TrimMode := 2             // right
@@ -3079,7 +3102,7 @@ begin
           // LEFT$(str, n) - returns leftmost n chars
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue);  // string
+            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);  // string
             ProcessExpression(ArgListNode.GetChild(1), Arg2Value); // count
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureIntRegister(Arg2Value);
@@ -3097,7 +3120,7 @@ begin
           // RIGHT$(str, n) - returns rightmost n chars
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue);  // string
+            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);  // string
             ProcessExpression(ArgListNode.GetChild(1), Arg2Value); // count
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureIntRegister(Arg2Value);
@@ -3123,8 +3146,8 @@ begin
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 3) then
           begin
             ProcessExpression(ArgListNode.GetChild(0), Arg3Value);   // start (numeric)
-            ProcessExpression(ArgListNode.GetChild(1), ArgValue);    // str (haystack)
-            ProcessExpression(ArgListNode.GetChild(2), Arg2Value);   // substr (needle)
+            ProcessStringExpression(ArgListNode.GetChild(1), ArgValue);    // str (haystack)
+            ProcessStringExpression(ArgListNode.GetChild(2), Arg2Value);   // substr (needle)
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureStringRegister(Arg2Value);
             Arg3Reg := EnsureIntRegister(Arg3Value);                 // start in an int register (Src3)
@@ -3134,8 +3157,8 @@ begin
           end
           else if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue);    // str
-            ProcessExpression(ArgListNode.GetChild(1), Arg2Value);   // substr
+            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);    // str
+            ProcessStringExpression(ArgListNode.GetChild(1), Arg2Value);   // substr
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureStringRegister(Arg2Value);
             DestReg := FProgram.AllocRegister(srtInt);
@@ -4229,7 +4252,7 @@ begin
         if FModernMode and ((UpperCase(ArrName) = kSADD) or (UpperCase(ArrName) = kSTRPTR)) and
            (ArrayIndexOf(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
         begin
-          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaStrSAdd, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -4268,7 +4291,7 @@ begin
         if FModernMode and (UpperCase(ArrName) = kFILEEXISTS) and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).ChildCount >= 1) then
         begin
-          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaFileExists, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -4333,7 +4356,7 @@ begin
         begin
           if InferExprBank(Node.GetChild(1).GetChild(0)) = srtString then
           begin
-            ProcessExpression(Node.GetChild(1).GetChild(0), Result);
+            ProcessStringExpression(Node.GetChild(1).GetChild(0), Result);
             Result := EnsureStringRegister(Result);
           end
           else
@@ -4355,7 +4378,7 @@ begin
         if FModernMode and (UpperCase(ArrName) = kFILELEN) and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).ChildCount >= 1) then
         begin
-          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaFileLen, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -4366,7 +4389,7 @@ begin
         if FModernMode and (UpperCase(ArrName) = kFILEDATETIME) and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).ChildCount >= 1) then
         begin
-          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
           EmitInstruction(ssaFileDateTime, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -4440,7 +4463,7 @@ begin
         if FModernMode and ((UpperCase(ArrName) = kENVIRONS) or (UpperCase(ArrName) = kENVIRON)) and
            (ArrayIndexOf(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
         begin
-          ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
           EmitInstruction(ssaEnviron, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -4527,7 +4550,7 @@ begin
           ArgReg := EnsureFloatRegister(ArgValue);          // the number to format
           if Node.GetChild(1).ChildCount >= 2 then
           begin
-            ProcessExpression(Node.GetChild(1).GetChild(1), MaskValue);
+            ProcessStringExpression(Node.GetChild(1).GetChild(1), MaskValue);
             MaskReg := EnsureStringRegister(MaskValue);
           end
           else
@@ -4631,7 +4654,7 @@ begin
           // DATEVALUE(s) / TIMEVALUE(s) -> float serial parsed from a string. Immediate selects.
           if (ArrNameU = kDATEVALUE) or (ArrNameU = kTIMEVALUE) then
           begin
-            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
             ArgReg := EnsureStringRegister(ArgValue);
             Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
             if ArrNameU = kTIMEVALUE then SelImm := 1 else SelImm := 0;
@@ -4641,7 +4664,7 @@ begin
           // ISDATE(s) -> int bool.
           if ArrNameU = kISDATE then
           begin
-            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
             ArgReg := EnsureStringRegister(ArgValue);
             Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
             EmitInstruction(ssaIsDate, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -4686,7 +4709,7 @@ begin
           // DATEPART(interval$, serial) -> int. Src1=string, Src2=float serial.
           if (ArrNameU = kDATEPART) and (Node.GetChild(1).ChildCount >= 2) then
           begin
-            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
             ProcessExpression(Node.GetChild(1).GetChild(1), Arg2Value);
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureFloatRegister(Arg2Value);
@@ -4737,7 +4760,7 @@ begin
           else if ArrNameU = kCVSHORT then SelImm := 2;
           if SelImm > 0 then
           begin
-            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
             ArgReg := EnsureStringRegister(ArgValue);
             Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
             EmitInstruction(ssaStrCvInt, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
@@ -4749,7 +4772,7 @@ begin
           else if ArrNameU = kCVD then SelImm := 8;
           if SelImm > 0 then
           begin
-            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
             ArgReg := EnsureStringRegister(ArgValue);
             Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
             EmitInstruction(ssaStrCvFloat, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
@@ -4951,7 +4974,7 @@ begin
         // Functions with 1 argument: GET$, POST$, GETRAW$, POSTRAW$, HTML$, URL$, HEADER$
         if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
         begin
-          ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+          ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
         end
         else
@@ -5258,7 +5281,7 @@ begin
   FixedCap := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
   if (FixedCap > 0) and not IsSharedScalar(VarName) and not IsAddrLocal(VarName) then
   begin
-    ProcessExpression(ExprNode, ExprValue);
+    ProcessStringExpression(ExprNode, ExprValue);
     ExprValue := EnsureStringRegister(ExprValue);
     FixedCapReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaLoadConstInt, FixedCapReg, MakeSSAConstInt(FixedCap), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -5508,7 +5531,7 @@ begin
     begin
       if Child.ChildCount >= 1 then
       begin
-        ProcessExpression(Child.GetChild(0), ExprValue);
+        ProcessStringExpression(Child.GetChild(0), ExprValue);
         CurrentFormatReg := EnsureStringRegister(ExprValue);
       end;
       Continue;
@@ -6875,7 +6898,7 @@ var
 begin
   if (ArgsNode = nil) or (ArgsNode.ChildCount < 2) then begin Result := MakeSSAValue(svkNone); Exit; end;
   IsW := IsWStringExpr(ArgsNode.GetChild(0));
-  ProcessExpression(ArgsNode.GetChild(0), ArgValue);   // string
+  ProcessStringExpression(ArgsNode.GetChild(0), ArgValue);   // string
   ProcessExpression(ArgsNode.GetChild(1), Arg2Value);  // start
   ArgReg := EnsureStringRegister(ArgValue);
   Arg2Reg := EnsureIntRegister(Arg2Value);
@@ -6910,7 +6933,7 @@ var
   ArgValue, ArgReg: TSSAValue;
 begin
   if (ArgsNode = nil) or (ArgsNode.ChildCount < 1) then begin Result := MakeSSAValue(svkNone); Exit; end;
-  ProcessExpression(ArgsNode.GetChild(0), ArgValue);
+  ProcessStringExpression(ArgsNode.GetChild(0), ArgValue);
   if ArgValue.RegType = srtString then
     Result := EnsureStringRegister(ArgValue)      // already UTF-8 bytes: widen is a no-op on storage
   else
@@ -7362,9 +7385,9 @@ begin
   end;
 
   // Read inputs.
-  ProcessExpression(TargetNode, TextVal); TextReg := EnsureStringRegister(TextVal);
+  ProcessStringExpression(TargetNode, TextVal); TextReg := EnsureStringRegister(TextVal);
   ProcessExpression(StartNode, StartVal); StartReg := EnsureIntRegister(StartVal);
-  ProcessExpression(SourceNode, SrcVal);  SrcReg := EnsureStringRegister(SrcVal);
+  ProcessStringExpression(SourceNode, SrcVal);  SrcReg := EnsureStringRegister(SrcVal);
 
   // source capped to len: LEFT$(source, len) when a length was given.
   if HasLen then
@@ -7421,7 +7444,7 @@ var
   NoneV: TSSAValue;
 begin
   NoneV := MakeSSAValue(svkNone);
-  ProcessExpression(SNode, SVal);   SReg := EnsureStringRegister(SVal);
+  ProcessStringExpression(SNode, SVal);   SReg := EnsureStringRegister(SVal);
   ProcessExpression(IdxNode, IdxVal); IdxReg := EnsureIntRegister(IdxVal);
   OneReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaLoadConstInt, OneReg, MakeSSAConstInt(1), NoneV, NoneV);
@@ -7447,7 +7470,7 @@ var
   AsnNode, TmpRef: TASTNode;
 begin
   NoneV := MakeSSAValue(svkNone);
-  ProcessExpression(SNode, SVal);   SReg := EnsureStringRegister(SVal);
+  ProcessStringExpression(SNode, SVal);   SReg := EnsureStringRegister(SVal);
   ProcessExpression(IdxNode, IdxVal); IdxReg := EnsureIntRegister(IdxVal);
   ProcessExpression(ValNode, ValVal); ValReg := EnsureIntRegister(ValVal);
   // prefix = LEFT$(s, i)   (the first i bytes, before the target)
@@ -7511,8 +7534,8 @@ begin
   SrcNode := Node.GetChild(1);
 
   // Read inputs.
-  ProcessExpression(DstNode, DstVal); DstReg := EnsureStringRegister(DstVal);
-  ProcessExpression(SrcNode, SrcVal); SrcReg := EnsureStringRegister(SrcVal);
+  ProcessStringExpression(DstNode, DstVal); DstReg := EnsureStringRegister(DstVal);
+  ProcessStringExpression(SrcNode, SrcVal); SrcReg := EnsureStringRegister(SrcVal);
 
   // N = LEN(dst): the buffer size to preserve.
   NReg := NI; EmitInstruction(ssaStrLen, NReg, DstReg, NoneV, NoneV);
@@ -10993,7 +11016,7 @@ begin
   end;
 
   // Get filename string
-  ProcessExpression(Node.GetChild(0), FileNameVal);
+  ProcessStringExpression(Node.GetChild(0), FileNameVal);
   FileNameReg := EnsureStringRegister(FileNameVal);
 
   // Emit PLOAD instruction
@@ -11017,7 +11040,7 @@ begin
   end;
 
   // Get filename string
-  ProcessExpression(Node.GetChild(0), FileNameVal);
+  ProcessStringExpression(Node.GetChild(0), FileNameVal);
   FileNameReg := EnsureStringRegister(FileNameVal);
 
   // Emit PSAVE instruction
@@ -11748,7 +11771,7 @@ begin
         fi := i + 1;
         if vi < nVals then
         begin
-          ProcessExpression(ValNodes[vi], ValueVal); Inc(vi);
+          ProcessStringExpression(ValNodes[vi], ValueVal); Inc(vi);
           EmitStrField(EnsureStringRegister(ValueVal), W);
         end;
       end
@@ -11757,7 +11780,7 @@ begin
         Inc(fi);
         if vi < nVals then
         begin
-          ProcessExpression(ValNodes[vi], ValueVal); Inc(vi);
+          ProcessStringExpression(ValNodes[vi], ValueVal); Inc(vi);
           EmitInstruction(ssaPrintString, NoneV, EnsureStringRegister(ValueVal), NoneV, NoneV);
         end;
       end
@@ -11805,7 +11828,7 @@ begin
     // float-formatted every value, so string values printed as 0 (and diverged opt vs no-opt).
     for i := 0 to nVals - 1 do
     begin
-      ProcessExpression(ValNodes[i], ValueVal);
+      ProcessStringExpression(ValNodes[i], ValueVal);
       case ValueVal.RegType of
         srtString: TmpReg := EnsureStringRegister(ValueVal);
         srtInt:    begin
@@ -11819,7 +11842,7 @@ begin
       end;
       EmitInstruction(ssaPrintUsingStage, NoneV, TmpReg, NoneV, NoneV);
     end;
-    ProcessExpression(FmtNode, FormatVal);
+    ProcessStringExpression(FmtNode, FormatVal);
     FormatReg := EnsureStringRegister(FormatVal);
     EmitInstruction(ssaPrintUsingRun, NoneV, FormatReg, NoneV, NoneV);
   end;
@@ -11863,7 +11886,7 @@ begin
   ColVal := EnsureIntRegister(ColVal);
   ProcessExpression(Node.GetChild(2), RowVal);
   RowVal := EnsureIntRegister(RowVal);
-  ProcessExpression(Node.GetChild(3), TextVal);
+  ProcessStringExpression(Node.GetChild(3), TextVal);
   TextVal := EnsureStringRegister(TextVal);
 
   if Node.ChildCount > 4 then
@@ -11898,7 +11921,7 @@ begin
   // The filename is the first child (should be a string expression)
   if Node.ChildCount > 0 then
   begin
-    ProcessExpression(Node.GetChild(0), FilenameVal);
+    ProcessStringExpression(Node.GetChild(0), FilenameVal);
     // Ensure we have a string register
     FilenameReg := EnsureStringRegister(FilenameVal);
   end
@@ -11926,7 +11949,7 @@ begin
   // The filename is the first child (should be a string expression)
   if Node.ChildCount > 0 then
   begin
-    ProcessExpression(Node.GetChild(0), FilenameVal);
+    ProcessStringExpression(Node.GetChild(0), FilenameVal);
     // Ensure we have a string register
     FilenameReg := EnsureStringRegister(FilenameVal);
   end
@@ -11952,7 +11975,7 @@ begin
   // VERIFY "filename"
   if Node.ChildCount > 0 then
   begin
-    ProcessExpression(Node.GetChild(0), FilenameVal);
+    ProcessStringExpression(Node.GetChild(0), FilenameVal);
     FilenameReg := EnsureStringRegister(FilenameVal);
   end
   else
@@ -11975,7 +11998,7 @@ begin
   // BLOAD "filename"
   if Node.ChildCount > 0 then
   begin
-    ProcessExpression(Node.GetChild(0), FilenameVal);
+    ProcessStringExpression(Node.GetChild(0), FilenameVal);
     FilenameReg := EnsureStringRegister(FilenameVal);
   end
   else
@@ -11998,7 +12021,7 @@ begin
   // BSAVE "filename"
   if Node.ChildCount > 0 then
   begin
-    ProcessExpression(Node.GetChild(0), FilenameVal);
+    ProcessStringExpression(Node.GetChild(0), FilenameVal);
     FilenameReg := EnsureStringRegister(FilenameVal);
   end
   else
@@ -12021,7 +12044,7 @@ begin
   // BOOT "filename"
   if Node.ChildCount > 0 then
   begin
-    ProcessExpression(Node.GetChild(0), FilenameVal);
+    ProcessStringExpression(Node.GetChild(0), FilenameVal);
     FilenameReg := EnsureStringRegister(FilenameVal);
   end
   else
@@ -12117,7 +12140,7 @@ begin
   // Parse filename (second child)
   if Node.ChildCount > 1 then
   begin
-    ProcessExpression(Node.GetChild(1), FilenameVal);
+    ProcessStringExpression(Node.GetChild(1), FilenameVal);
     FilenameReg := EnsureStringRegister(FilenameVal);
   end
   else
@@ -12131,7 +12154,7 @@ begin
   // Parse optional mode (third child)
   if Node.ChildCount > 2 then
   begin
-    ProcessExpression(Node.GetChild(2), ModeVal);
+    ProcessStringExpression(Node.GetChild(2), ModeVal);
     ModeReg := EnsureStringRegister(ModeVal);
   end
   else
@@ -12339,7 +12362,7 @@ begin
   // Parse data expression (second child)
   if Node.ChildCount > 1 then
   begin
-    ProcessExpression(Node.GetChild(1), DataVal);
+    ProcessStringExpression(Node.GetChild(1), DataVal);
     DataReg := EnsureStringRegister(DataVal);
   end
   else
@@ -13270,7 +13293,7 @@ begin
   if FCurrentBlock = nil then Exit;
   if Node.ChildCount < 1 then Exit;  { SPRSAVE "filename" }
 
-  ProcessExpression(Node.GetChild(0), FileNameVal);
+  ProcessStringExpression(Node.GetChild(0), FileNameVal);
   FileNameReg := EnsureStringRegister(FileNameVal);
 
   EmitInstruction(ssaSprsave, MakeSSAValue(svkNone),
@@ -13284,7 +13307,7 @@ begin
   if FCurrentBlock = nil then Exit;
   if Node.ChildCount < 1 then Exit;  { SPRLOAD "filename" [, usefilecolors] }
 
-  ProcessExpression(Node.GetChild(0), FileNameVal);
+  ProcessStringExpression(Node.GetChild(0), FileNameVal);
   FileNameReg := EnsureStringRegister(FileNameVal);
 
   // Optional 2nd arg = "use file colours" flag (int register, default 0).
@@ -13389,7 +13412,7 @@ begin
   // LIST [start[-end]]
   if Node.ChildCount > 0 then
   begin
-    ProcessExpression(Node.GetChild(0), RangeVal);
+    ProcessStringExpression(Node.GetChild(0), RangeVal);
     RangeReg := EnsureStringRegister(RangeVal);
   end
   else
@@ -13515,7 +13538,7 @@ begin
   // CATALOG/DIR [path]
   if Node.ChildCount > 0 then
   begin
-    ProcessExpression(Node.GetChild(0), PathVal);
+    ProcessStringExpression(Node.GetChild(0), PathVal);
     PathReg := EnsureStringRegister(PathVal);
   end
   else
@@ -13544,11 +13567,11 @@ begin
   end;
 
   // Process source path
-  ProcessExpression(Node.GetChild(0), SrcVal);
+  ProcessStringExpression(Node.GetChild(0), SrcVal);
   SrcReg := EnsureStringRegister(SrcVal);
 
   // Process destination path
-  ProcessExpression(Node.GetChild(1), DstVal);
+  ProcessStringExpression(Node.GetChild(1), DstVal);
   DstReg := EnsureStringRegister(DstVal);
 
   // Process optional overwrite flag (default 0)
@@ -13582,7 +13605,7 @@ begin
   end;
 
   // Process pattern
-  ProcessExpression(Node.GetChild(0), PatternVal);
+  ProcessStringExpression(Node.GetChild(0), PatternVal);
   PatternReg := EnsureStringRegister(PatternVal);
 
   // Process optional flags (default 0)
@@ -13616,11 +13639,11 @@ begin
   end;
 
   // Process old name
-  ProcessExpression(Node.GetChild(0), OldVal);
+  ProcessStringExpression(Node.GetChild(0), OldVal);
   OldReg := EnsureStringRegister(OldVal);
 
   // Process new name
-  ProcessExpression(Node.GetChild(1), NewVal);
+  ProcessStringExpression(Node.GetChild(1), NewVal);
   NewReg := EnsureStringRegister(NewVal);
 
   EmitInstruction(ssaRenameFile, MakeSSAValue(svkNone), OldReg, NewReg,
@@ -13641,11 +13664,11 @@ begin
   end;
 
   // Process source path
-  ProcessExpression(Node.GetChild(0), SrcVal);
+  ProcessStringExpression(Node.GetChild(0), SrcVal);
   SrcReg := EnsureStringRegister(SrcVal);
 
   // Process destination path
-  ProcessExpression(Node.GetChild(1), DstVal);
+  ProcessStringExpression(Node.GetChild(1), DstVal);
   DstReg := EnsureStringRegister(DstVal);
 
   EmitInstruction(ssaConcat, MakeSSAValue(svkNone), SrcReg, DstReg,
@@ -13665,7 +13688,7 @@ begin
     raise Exception.Create('MKDIR requires a path');
   end;
 
-  ProcessExpression(Node.GetChild(0), PathVal);
+  ProcessStringExpression(Node.GetChild(0), PathVal);
   PathReg := EnsureStringRegister(PathVal);
 
   EmitInstruction(ssaMkdir, MakeSSAValue(svkNone), PathReg,
@@ -13678,7 +13701,7 @@ var
   Val, Reg: TSSAValue;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 1) then Exit;
-  ProcessExpression(Node.GetChild(0), Val);
+  ProcessStringExpression(Node.GetChild(0), Val);
   Reg := EnsureStringRegister(Val);
   EmitInstruction(ssaSetEnviron, MakeSSAValue(svkNone), Reg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
@@ -13689,7 +13712,7 @@ var
   Val, Reg: TSSAValue;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 1) then Exit;
-  ProcessExpression(Node.GetChild(0), Val);
+  ProcessStringExpression(Node.GetChild(0), Val);
   Reg := EnsureStringRegister(Val);
   EmitInstruction(ssaShell, MakeSSAValue(svkNone), Reg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
@@ -13719,7 +13742,7 @@ begin
     raise Exception.Create('CHDIR requires a path');
   end;
 
-  ProcessExpression(Node.GetChild(0), PathVal);
+  ProcessStringExpression(Node.GetChild(0), PathVal);
   PathReg := EnsureStringRegister(PathVal);
 
   EmitInstruction(ssaChdir, MakeSSAValue(svkNone), PathReg,
@@ -13737,7 +13760,7 @@ begin
   if Node.ChildCount < 1 then
     raise Exception.Create('RMDIR requires a path');
 
-  ProcessExpression(Node.GetChild(0), PathVal);
+  ProcessStringExpression(Node.GetChild(0), PathVal);
   PathReg := EnsureStringRegister(PathVal);
 
   EmitInstruction(ssaRmdir, MakeSSAValue(svkNone), PathReg,
@@ -13758,11 +13781,11 @@ begin
   end;
 
   // Process source path
-  ProcessExpression(Node.GetChild(0), SrcVal);
+  ProcessStringExpression(Node.GetChild(0), SrcVal);
   SrcReg := EnsureStringRegister(SrcVal);
 
   // Process destination path
-  ProcessExpression(Node.GetChild(1), DstVal);
+  ProcessStringExpression(Node.GetChild(1), DstVal);
   DstReg := EnsureStringRegister(DstVal);
 
   EmitInstruction(ssaMoveFile, MakeSSAValue(svkNone), SrcReg, DstReg,
@@ -13789,11 +13812,11 @@ begin
     end;
 
     // Process header name
-    ProcessExpression(Node.GetChild(0), NameVal);
+    ProcessStringExpression(Node.GetChild(0), NameVal);
     NameReg := EnsureStringRegister(NameVal);
 
     // Process header value
-    ProcessExpression(Node.GetChild(1), ValueVal);
+    ProcessStringExpression(Node.GetChild(1), ValueVal);
     ValueReg := EnsureStringRegister(ValueVal);
 
     EmitInstruction(ssaWebSetHeader, MakeSSAValue(svkNone), NameReg, ValueReg,
@@ -15476,6 +15499,10 @@ begin
     // so the slot holds an address — do NOT write it back into the argument (mutations already went
     // through the address). Other params (non-byref-ret, or non-int) keep the normal copy-back.
     if IsByrefRetFunc(ParamOwnerName) and (RT = srtInt) then Continue;
+    // A UDT passed to a BYREF STRING parameter was converted through "Operator T.Cast() As String", so
+    // the callee holds a temporary, not the object. Copying the slot back would overwrite the caller's
+    // UDT variable with a string. FreeBASIC binds such a conversion to a temporary too, for this reason.
+    if (RT = srtString) and HasUDTStringCast(ArgExpr) then Continue;
     if ArgExpr.NodeType = antIdentifier then
       // Plain variable arg: copy the slot's final value straight back into it.
       EmitXferLoad(RT, Slot, GetOrAllocateVariable(UpperCase(VarToStr(ArgExpr.Value))))
@@ -17521,6 +17548,34 @@ begin
   end;
 end;
 
+procedure TSSAGenerator.ProcessStringExpression(Node: TASTNode; out Val: TSSAValue);
+// Evaluate Node in a context that expects a STRING. A UDT carrying "Operator T.Cast() As String" --
+// which is how "Type T Extends ZString/WString" is made usable as a string -- converts through that
+// operator here. Without this the record HANDLE reaches the string register: LEN(t) answered 1, and a
+// UDT passed to a STRING parameter arrived as "0". Silently, which is the worst way to be wrong.
+//
+// Everywhere else this is exactly ProcessExpression: TryEmitUDTCastToString emits nothing and returns
+// False unless Node really is such a UDT, so calling it in a string context is free.
+begin
+  if TryEmitUDTCastToString(Node, Val) then Exit;
+  ProcessExpression(Node, Val);
+end;
+
+function TSSAGenerator.HasUDTStringCast(Node: TASTNode): Boolean;
+// The test TryEmitUDTCastToString performs, without emitting anything: does Node name a UDT instance
+// whose type (or an ancestor) defines a string-returning Cast operator?
+var
+  TypeName, Lbl: string;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  TypeName := ObjectTypeName(Node);
+  if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
+  Lbl := ResolveMethodLabel(TypeName, 'OPERATORCAST');
+  if Lbl = '' then Exit;
+  Result := GetVariableType(Lbl) = srtString;
+end;
+
 function TSSAGenerator.TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
 // FreeBASIC conversion operator "Operator T.Cast() As String": if Node evaluates to a UDT instance
 // whose type (or an ancestor) defines a string-returning Cast operator, invoke it and return the
@@ -18203,6 +18258,10 @@ begin
        (ParamList.GetChild(i).Attributes.Values['BYREF'] = '1') and
        (ArgExpr.NodeType = antIdentifier) then
       ArgVal := EmitVarAddress(VarToStr(ArgExpr.Value))
+    else if RT = srtString then
+      // The parameter wants a STRING, so a UDT argument carrying "Operator T.Cast() As String" converts
+      // through it. Without this the record handle was staged into the string slot and the callee saw "0".
+      ProcessStringExpression(ArgExpr, ArgVal)
     else
       ProcessExpression(ArgExpr, ArgVal);
     // Materialize into the parameter's bank register now, so the value survives a nested call in a later
@@ -19203,7 +19262,7 @@ begin
       // SETDATE str / SETTIME str - set the VM-internal current date/time. Node.Value = SETDATE/SETTIME.
       if Node.ChildCount > 0 then
       begin
-        ProcessExpression(Node.GetChild(0), SecondsVal);
+        ProcessStringExpression(Node.GetChild(0), SecondsVal);
         ArgReg := EnsureStringRegister(SecondsVal);
         if UpperCase(VarToStr(Node.Value)) = kSETTIME then SelImm := 1 else SelImm := 0;
         EmitInstruction(ssaSetClock, MakeSSAValue(svkNone), ArgReg,
@@ -19238,7 +19297,7 @@ begin
       begin
         // KEY n, "text" - define key
         ProcessExpression(Node.GetChild(0), KeyNumVal);
-        ProcessExpression(Node.GetChild(1), KeyTextVal);
+        ProcessStringExpression(Node.GetChild(1), KeyTextVal);
         KeyNumReg := EnsureIntRegister(KeyNumVal);
         KeyTextReg := EnsureStringRegister(KeyTextVal);
         EmitInstruction(ssaKey, MakeSSAValue(svkNone), KeyNumReg, KeyTextReg, MakeSSAValue(svkNone));
