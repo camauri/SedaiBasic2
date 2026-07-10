@@ -213,6 +213,10 @@ type
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
     FArrayFuncPtrSig: TStringList;       // array-of-funcptr (DIM As <named funcptr type> a(..)) -> "params|ret" signature, so "a(i)(args)" is an indirect call
     FNeededDispatchers: TStringList;     // M4.3: "TYPE|METHOD" pairs needing a virtual dispatcher
+    FDeclaredNames: TStringList;         // names introduced by an EXPLICIT declaration (DIM/VAR/STATIC/CONST,
+                                         //   procedure parameters). Distinct from FVarMap, which also holds
+                                         //   names bound by PreAllocateVariables merely because they appear
+                                         //   in the source. The MODERN bare-name intercepts consult this.
 
     function GenerateUniqueLabel(const Prefix: string): string;
     function GetVariableType(const VarName: string): TSSARegisterType;
@@ -227,6 +231,8 @@ type
     function DeclareVariable(const VarName: string): TSSAValue;
     function DeclareVariableTyped(const VarName: string; RegType: TSSARegisterType): TSSAValue;  // explicit DIM with a known bank
     procedure PreAllocateVariables(Node: TASTNode);  // Pre-scan AST to allocate all variable registers
+    procedure CollectDeclaredNames(Node: TASTNode);  // Pre-scan AST for names an explicit declaration introduces
+    function IsDeclaredName(const VarName: string): Boolean;
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
     procedure ProcessStatement(Node: TASTNode);
     // SUB/FUNCTION (M2): pre-scan the AST to register all declarations up front (so CALL
@@ -711,6 +717,10 @@ begin
   FBlockHandledVars.CaseSensitive := False;
   FCurrentTopLevelLabels := TStringList.Create;
   FCurrentTopLevelLabels.CaseSensitive := False;
+  FDeclaredNames := TStringList.Create;
+  FDeclaredNames.CaseSensitive := False;
+  FDeclaredNames.Sorted := True;
+  FDeclaredNames.Duplicates := dupIgnore;
   FModernMode := False;            // default CLASSIC; the compile driver flips this for MODERN sources
   SetLength(FScopeStack, 0);
   for DefCh := 'A' to 'Z' do FDefTypeBank[DefCh] := -1;  // DEFtype: no default-by-letter initially
@@ -729,6 +739,7 @@ begin
   FArrayRecordType.Free;
   FArrayFuncPtrSig.Free;
   FNeededDispatchers.Free;
+  FDeclaredNames.Free;
   FCurrentProcLocalRecs.Free;
   FCurrentProcByvalRecs.Free;
   FCurrentProcByrefScalars.Free;
@@ -944,6 +955,71 @@ begin
   end;
 end;
 
+{ CollectDeclaredNames - Scan the AST for every name the program introduces with an EXPLICIT
+  declaration: DIM / VAR / STATIC / REDIM (all of which lower to antDim), CONST, and procedure
+  parameters. The MODERN bare-name intercepts in ProcessExpression consult this set, so a declared
+  name always denotes the variable and never the FreeBASIC builtin that shares its spelling.
+
+  The set is program-wide, not per-scope, and that is the whole point. Resolving the question
+  "is this name a variable?" against the active scope was tried and reverted: it made one spelling
+  mean a variable inside a procedure and a builtin at module level. A name declared anywhere in the
+  program is a variable everywhere in it -- one spelling, one meaning. }
+procedure TSSAGenerator.CollectDeclaredNames(Node: TASTNode);
+var
+  i, k: Integer;
+  Child, AssignNode, ParamList: TASTNode;
+  Nm: string;
+begin
+  if Node = nil then Exit;
+
+  case Node.NodeType of
+    antDim:
+      // DIM holds one antArrayDecl per declared variable; child 0 is the name.
+      for i := 0 to Node.ChildCount - 1 do
+      begin
+        Child := Node.GetChild(i);
+        if (Child.NodeType = antArrayDecl) and (Child.ChildCount >= 1) and
+           (Child.GetChild(0).NodeType = antIdentifier) then
+        begin
+          Nm := UpperCase(VarToStr(Child.GetChild(0).Value));
+          if Nm <> '' then FDeclaredNames.Add(Nm);
+        end;
+      end;
+
+    antConst:
+      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antAssignment) then
+      begin
+        AssignNode := Node.GetChild(0);
+        if (AssignNode.ChildCount >= 1) and (AssignNode.GetChild(0).NodeType = antIdentifier) then
+        begin
+          Nm := UpperCase(VarToStr(AssignNode.GetChild(0).Value));
+          if Nm <> '' then FDeclaredNames.Add(Nm);
+        end;
+      end;
+  end;
+
+  // Parameters declare a name too, whatever declaration node carries the list.
+  for k := 0 to Node.ChildCount - 1 do
+  begin
+    ParamList := Node.GetChild(k);
+    if ParamList.NodeType <> antParameterList then Continue;
+    for i := 0 to ParamList.ChildCount - 1 do
+      if ParamList.GetChild(i).NodeType = antIdentifier then
+      begin
+        Nm := UpperCase(VarToStr(ParamList.GetChild(i).Value));
+        if Nm <> '' then FDeclaredNames.Add(Nm);
+      end;
+  end;
+
+  for i := 0 to Node.ChildCount - 1 do
+    CollectDeclaredNames(Node.GetChild(i));
+end;
+
+function TSSAGenerator.IsDeclaredName(const VarName: string): Boolean;
+begin
+  Result := FDeclaredNames.IndexOf(UpperCase(VarName)) >= 0;
+end;
+
 { PreAllocateVariables - Scan AST to find all BASIC variables and allocate registers
   This separates variable registers from temporary expression registers, preventing conflicts }
 procedure TSSAGenerator.PreAllocateVariables(Node: TASTNode);
@@ -1091,6 +1167,7 @@ var
   DestReg: Integer;
   OpCode: TSSAOpCode;
   FuncName, VarName: string;
+  BareIntercept: Boolean;         // MODERN, and this bare name is NOT a name the program declared
   RecUDTIdx, RecSlotK: Integer;   // OFFSETOF: UDT index + field scan
   FuncRetType: TSSARegisterType;  // M2: user FUNCTION return type
   MethodObjNode: TASTNode;        // M4.1: object of a method call
@@ -1361,21 +1438,29 @@ begin
     antIdentifier:
     begin
       VarName := VarToStr(Node.Value);
-      // FreeBASIC boolean constants: TRUE = -1, FALSE = 0 (MODERN only; in CLASSIC v7 they are
-      // ordinary variables that default to 0, so the dialect gate preserves v7 behaviour).
-      if FModernMode and (UpperCase(VarName) = kTRUE) then
+      // The bare-name intercepts below give a builtin meaning to a name used without parentheses.
+      // They stand aside for any name the program declared explicitly (DIM/VAR/STATIC/CONST/parameter),
+      // so "Dim As Integer curdir" is the variable it plainly asks for rather than being dropped in
+      // silence. FDeclaredNames is program-wide, so a declared spelling means the variable in every
+      // scope: an earlier fix that consulted the active scope made one spelling mean two things and
+      // was reverted. All of this is gated on MODERN -- in CLASSIC v7 these are ordinary identifiers.
+      BareIntercept := FModernMode and not IsDeclaredName(VarName);
+      // FreeBASIC boolean constants: TRUE = -1, FALSE = 0 (in CLASSIC v7 they are ordinary variables
+      // that default to 0, so the dialect gate preserves v7 behaviour).
+      if BareIntercept and (UpperCase(VarName) = kTRUE) then
       begin
         Result := MakeSSAConstInt(-1);
         Exit;
       end;
-      if FModernMode and (UpperCase(VarName) = kFALSE) then
+      if BareIntercept and (UpperCase(VarName) = kFALSE) then
       begin
         Result := MakeSSAConstInt(0);
         Exit;
       end;
       // FreeBASIC crt/math.bi constants (M_PI, M_E, ...): recognised as float literals (the include is a
-      // no-op). The M_ names are specific enough not to shadow a real variable in practice.
-      if FModernMode and MathConstValue(UpperCase(VarName), TempFloat) then
+      // no-op). Unlike the names below these are macros, not reserved words, so a program may legally
+      // declare one -- the BareIntercept guard is what lets it.
+      if BareIntercept and MathConstValue(UpperCase(VarName), TempFloat) then
       begin
         Result := MakeSSAConstFloat(TempFloat);
         Exit;
@@ -1385,7 +1470,7 @@ begin
       // because it depends on the current procedure context (the preprocessor cannot know proc bounds).
       // At module level FB reports "__FB_MAINPROC__". The _NQ_ form yields the same string value (its
       // only distinct use is @__FUNCTION_NQ__ to take a symbol address, which has no meaning here).
-      if FModernMode and ((UpperCase(VarName) = kMACROFUNCTION) or (UpperCase(VarName) = kMACROFUNCTIONNQ)) then
+      if BareIntercept and ((UpperCase(VarName) = kMACROFUNCTION) or (UpperCase(VarName) = kMACROFUNCTIONNQ)) then
       begin
         if FInProcedure then
           Result := MakeSSAConstString(FCurrentProcName)
@@ -1397,33 +1482,20 @@ begin
       // occurred. FreeBASIC declares them as "Function Erfn() As ZString Ptr" and idiomatic code writes
       // "*Erfn()"; SedaiBasic has no ZSTRING PTR, so they yield the name as a STRING directly and the
       // "*" of "*Erfn()" is an identity on a string operand (see the antDeref lowering).
-      // Like CURDIR$/EXEPATH/COMMAND$ below, these bare-name intercepts fire before variable resolution:
-      // in MODERN the names are reserved, as they are in FreeBASIC. Guarding them on "is it already a
-      // variable?" was tried and reverted -- ResolveExisting cannot distinguish a name the program
-      // DECLARED from one bound merely because it appears in the source, and its answer depends on
-      // whether the use sits at module level or inside a procedure. That made the same spelling mean
-      // different things in different scopes, which is worse than reserving the name outright.
-      // (Consequence, shared by the whole family: "Dim As Integer erfn" is silently dropped in MODERN.
-      // A real fix needs the SSA to record which names were explicitly declared.)
-      if FModernMode and (UpperCase(VarName) = kERFN) then
+      if BareIntercept and (UpperCase(VarName) = kERFN) then
       begin
         Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
         EmitInstruction(ssaLoadERFN, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         Exit;
       end;
-      if FModernMode and (UpperCase(VarName) = kERMN) then
+      if BareIntercept and (UpperCase(VarName) = kERMN) then
       begin
         Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
         EmitInstruction(ssaLoadERMN, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         Exit;
       end;
       // FreeBASIC CURDIR$ / CURDIR used bare (no parentheses): the current working directory.
-      // NOTE: no "is it already a variable?" guard here, deliberately. ResolveExisting cannot tell a name
-      // the program DECLARED from one PreAllocateVariables bound merely because it appears in the source
-      // -- and these names appear here, in their own bare form. Guarding on it makes the intercept never
-      // fire. The consequence is that "Dim As Integer curdir" is silently dropped; fixing that properly
-      // needs a record of explicitly-declared names, which the SSA does not keep today.
-      if FModernMode and ((UpperCase(VarName) = kCURDIRS) or (UpperCase(VarName) = kCURDIR)) then
+      if BareIntercept and ((UpperCase(VarName) = kCURDIRS) or (UpperCase(VarName) = kCURDIR)) then
       begin
         Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
         EmitInstruction(ssaCurDir, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -1432,21 +1504,21 @@ begin
       // FreeBASIC SCREENPTR used bare (and, below, as SCREENPTR()): a raw pointer to the working page's
       // framebuffer. It addresses a second REGION of the raw-pointer namespace (see RAWPTR_REGION_FB), so
       // "*(p + off)" and "p[i]" reach the pixels through the ordinary raw load/store path, bounds-checked.
-      if FModernMode and (UpperCase(VarName) = kSCREENPTR) then
+      if BareIntercept and (UpperCase(VarName) = kSCREENPTR) then
       begin
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaGfxScreenPtr, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         Exit;
       end;
       // FreeBASIC EXEPATH used bare: directory of the running program.
-      if FModernMode and (UpperCase(VarName) = kEXEPATH) then
+      if BareIntercept and (UpperCase(VarName) = kEXEPATH) then
       begin
         Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
         EmitInstruction(ssaExePath, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         Exit;
       end;
       // FreeBASIC COMMAND$ / COMMAND used bare = COMMAND$(-1): the whole command line (space-separated args).
-      if FModernMode and ((UpperCase(VarName) = kCOMMAND) or (UpperCase(VarName) = kCOMMANDS)) then
+      if BareIntercept and ((UpperCase(VarName) = kCOMMAND) or (UpperCase(VarName) = kCOMMANDS)) then
       begin
         ArgReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -19455,6 +19527,11 @@ begin
   // so a bare name gets its DEF bank (PreAllocateVariables binds via GetVariableType).
   for DefCh := 'A' to 'Z' do FDefTypeBank[DefCh] := -1;
   CollectDefTypes(AST);
+
+  // Names an explicit declaration introduces, collected BEFORE any lowering: the MODERN bare-name
+  // intercepts (TRUE/FALSE, M_*, CURDIR, EXEPATH, COMMAND, ...) must know them to stand aside.
+  FDeclaredNames.Clear;
+  CollectDeclaredNames(AST);
 
   PreAllocateVariables(AST);
   {$IFDEF DEBUG_SSA}
