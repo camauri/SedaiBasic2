@@ -17705,6 +17705,14 @@ var
 begin
   Result := False;
   TypeName := '';
+  if ObjNode = nil then Exit;
+  // See through parentheses, as ObjectTypeName does. "(*p).field" -- the only way to write the deref,
+  // since "*p.field" parses as "*(p.field)" -- wraps the deref in them. Without this the node matched no
+  // branch below, Result stayed False, and the field read yielded 0. Silently: "(*p).v" and "p->v", which
+  // FreeBASIC defines as the same thing, disagreed.
+  while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do
+    ObjNode := ObjNode.GetChild(0);
+  if ObjNode = nil then Exit;
   if ObjNode.NodeType = antIdentifier then
   begin
     // Record variable (or record-typed parameter): handle is the variable's int register.

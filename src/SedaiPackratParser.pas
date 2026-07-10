@@ -926,7 +926,19 @@ begin
     ttFloat: Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
 
     // === DELIMITERS (when used as standalone expressions) ===
-    ttDelimParOpen,
+    // A statement may also START with '(' and be an assignment: "(*p).field = expr" is the only way to
+    // write a field store through a dereference, since "*p.field" parses as "*(p.field)". Try the
+    // assignment first and fall back to a plain expression statement, exactly as ttOpMul ("*p = expr").
+    ttDelimParOpen:
+      begin
+        SavedIndex := Context.CurrentIndex;
+        Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
+        if not Assigned(Result) then
+        begin
+          Context.CurrentIndex := SavedIndex;
+          Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+        end;
+      end;
     ttDelimParClose: Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
 
     // === BITWISE OPERATORS ===
@@ -1127,6 +1139,13 @@ begin
   begin
     // FreeBASIC pointer-deref assignment "*p = expr": the expression parser's '*' prefix rule builds
     // the antDeref target (it stops before '=', lower precedence).
+    LeftSide := FExpressionParser.ParseExpression(precCall);
+    LhsIsExpr := True;
+  end
+  else if Context.Check(ttDelimParOpen) then
+  begin
+    // "(*p).field = expr", and any other target that opens with a parenthesis. The expression parser
+    // builds antMemberAccess over the parenthesised deref and stops before '=' (lower precedence).
     LeftSide := FExpressionParser.ParseExpression(precCall);
     LhsIsExpr := True;
   end
