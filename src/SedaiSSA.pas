@@ -418,6 +418,7 @@ type
     function ArrayRecordTypeOf(const ArrName: string): string;
     // FreeBASIC "Operator T.Cast() As String": if Node is a UDT with a string cast, invoke it -> string.
     function CastReturnCode(const RetTypeName: string): string;  // OPERATOR CAST label suffix by return bank
+    function DerefPointeeUDTType(Node: TASTNode): string;  // UDT a "*expr" points to (var or Cast(T Ptr,..))
     function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
     function TryEmitUDTCastToNumber(Node: TASTNode; out Val: TSSAValue): Boolean;  // "Operator Cast() As Integer/Double" in arithmetic
     function HasUDTStringCast(Node: TASTNode): Boolean;  // would TryEmitUDTCastToString fire? (emits nothing)
@@ -1362,12 +1363,15 @@ begin
         Result := Left;
         Exit;
       end;
-      // *p where p is a UDT pointer: the value is the record handle itself (managed-reference model),
-      // so *p just evaluates p (no load). Lets "q = *p" alias and "(*p).field" resolve.
-      if (Node.GetChild(0).NodeType = antIdentifier) and
-         (PointerUDTType(VarToStr(Node.GetChild(0).Value)) <> '') then
+      // *expr where expr points to a UDT: the value IS the record handle (managed-reference model), so
+      // *expr just evaluates expr (no load). Covers a bare pointer variable ("q = *p", "(*p).field") and
+      // "*cast(T Ptr, x)" -- the latter otherwise fell to the generic scalar load below, which mis-read
+      // the handle (a shared-region record handle has bit 62 set) as an FArrays pointer and dereferenced
+      // out of bounds.
+      if DerefPointeeUDTType(Node.GetChild(0)) <> '' then
       begin
-        Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.GetChild(0).Value))));
+        ProcessExpression(Node.GetChild(0), Left);
+        Result := EnsureIntRegister(Left);
         Exit;
       end;
       // *p / *(p±n) where p is a RAW (Allocate'd) pointer: load SizeOf(pointee) bytes from the raw heap.
@@ -17699,6 +17703,33 @@ procedure TSSAGenerator.ProcessStringExpression(Node: TASTNode; out Val: TSSAVal
 begin
   if TryEmitUDTCastToString(Node, Val) then Exit;
   ProcessExpression(Node, Val);
+end;
+
+function TSSAGenerator.DerefPointeeUDTType(Node: TASTNode): string;
+// The UDT type a pointer expression points to, for "*expr": a bare UDT-pointer variable, or a
+// "Cast(T Ptr, x)". Empty if the pointee is not a UDT. Lets "*cast(T Ptr, x)" evaluate to the record
+// handle (managed-reference model) rather than a scalar load that would mis-read the handle.
+var
+  U, TN: string;
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do
+    Node := Node.GetChild(0);
+  if Node = nil then Exit;
+  case Node.NodeType of
+    antIdentifier:
+      Result := PointerUDTType(VarToStr(Node.Value));
+    antCast:
+      begin
+        U := UpperCase(VarToStr(Node.Value));   // target type, e.g. "LIST PTR"
+        if (Length(U) >= 4) and (Copy(U, Length(U) - 3, 4) = ' PTR') then
+        begin
+          TN := Trim(Copy(U, 1, Length(U) - 4));
+          if FindUDT(TN) >= 0 then Result := TN;
+        end;
+      end;
+  end;
 end;
 
 function TSSAGenerator.CastReturnCode(const RetTypeName: string): string;
