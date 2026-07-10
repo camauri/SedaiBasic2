@@ -334,6 +334,14 @@ var
           while (p <= Length(S)) and (S[p] in [' ', #9, ')']) do Inc(p);
           if Defs.IndexOfName(nm) >= 0 then Toks.Add('1') else Toks.Add('0');
         end
+        else if id = 'TYPEOF' then
+          // "#if TypeOf(a) = TypeOf(b)" asks a question only the compiler's symbol table can answer,
+          // and this preprocessor runs on text, before any declaration has been seen. Falling through
+          // to the undefined-identifier rule below would silently make every such condition FALSE --
+          // including the ones that should be true. Say so instead. (The statement form,
+          // "Dim As TypeOf(expr) name", is handled by the parser and works.)
+          raise EPreprocessorError.Create(
+            'TypeOf() in a #if condition is not supported: the preprocessor has no type information')
         else if (id = 'AND') or (id = 'OR') or (id = 'NOT') or (id = 'MOD') then
           Toks.Add(id)
         else if Defs.IndexOfName(id) >= 0 then

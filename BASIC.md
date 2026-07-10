@@ -2019,7 +2019,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `END (Block)` | ✓ |  |
 | `OFFSETOF` | ✓ | `OFFSETOF(type, field)` — a field's byte offset (compile-time). Field-index × 8 (exact for all-64-bit UDTs, consistent with `SizeOf`; no FB packing/alignment for narrow fields). |
 | `SIZEOF` | ✓ | `SizeOf(scalar-type / UDT)` byte size; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`. |
-| `TYPEOF` | ~ | `DIM AS TypeOf(expr) name` declares a variable with the type inferred from an expression/variable/literal (like VAR without an initializer). The preprocessor `#if TypeOf(a)=TypeOf(b)` form is deferred. |
+| `TYPEOF` | ~ | `DIM AS TypeOf(expr) name` declares a variable with the type inferred from an expression/variable/literal (like VAR without an initializer). The `#if TypeOf(a)=TypeOf(b)` form is **rejected with an error**, not silently evaluated: this preprocessor runs on text, before any declaration is seen, so it cannot answer the question — and answering it "false" (the undefined-identifier rule) would quietly take the wrong branch. |
 | `LET` | ✓ |  |
 | `REM` | ✓ |  |
 | `OPTION()` | ✓ |  |
