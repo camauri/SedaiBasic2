@@ -2119,7 +2119,16 @@ begin
                       kLIST,
                       // ST: the Commodore I/O status-byte variable — FreeBASIC has no ST, and "st" is a very
                       // common variable name (status / state / step / string temp). Keyword in CLASSIC only.
-                      kST],
+                      kST,
+                      // LN: the Commodore natural logarithm — FreeBASIC spells it LOG (its own manual notes
+                      // the confusion), so "ln" is free there, and real FB code uses it for "length".
+                      kLN,
+                      // DEC: the Commodore v7 "hex string to decimal" function — FreeBASIC has none, and
+                      // "dec" is a common variable name (decimal part, declination).
+                      kDEC,
+                      // RECORD: the Commodore v7 relative-file positioning command — FreeBASIC has none,
+                      // and "record" is a very common identifier for a data row.
+                      kRECORD],
                      kdClassicOnly);
 
   //WriteLn('DEBUG RegisterBasicKeywords: Completed registration of ', GetKeywordCount, ' keywords');
