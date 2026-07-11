@@ -167,6 +167,7 @@ type
     // routed to element 0 of this array, so the value is never a per-thread register.
     FSharedScalarArr: TStringList;       // name (UPPER) -> array index (Objects[]=PtrInt arrayIdx)
     FStaticMembers: TStringList;         // OOP: static member variables "TYPE.FIELD" (UPPER), backed by a shared global scalar
+    FEnumMembers: TStringList;           // FreeBASIC ENUM members (UPPER), backed by a shared global scalar so they are visible inside procedures
     FPointerVars: TStringList;           // FreeBASIC pointers: var name (UPPER) -> pointee type name (e.g. "INTEGER")
     FRefVars: TStringList;               // FreeBASIC reference variables (DIM BYREF r AS T = target): name
                                          // (UPPER) -> pointee type. r's register is int (it carries target's
@@ -310,6 +311,8 @@ type
     procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
     procedure CollectStaticMembers(Node: TASTNode);     // OOP: gather TYPE static member vars, back each with a shared global
     procedure EmitStaticMemberAllocs;                   // OOP: allocate the static members' backing arrays at program start
+    procedure CollectEnumMembers(Node: TASTNode);       // FB: back each module-level ENUM member with a shared global (proc-visible)
+    procedure EmitEnumMemberAllocs;                     // FB: allocate the ENUM members' backing arrays at program start
     procedure EmitSharedScalarAllocs;                   // FB module ctors: pre-size every SHARED-scalar backing array before ctors run
     function StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;  // "TYPE.FIELD" backing name, or '' if not static
     procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
@@ -700,6 +703,8 @@ begin
   FSharedScalarArr := TStringList.Create;
   FStaticMembers := TStringList.Create;
   FStaticMembers.CaseSensitive := False;
+  FEnumMembers := TStringList.Create;
+  FEnumMembers.CaseSensitive := False;
   FPointerVars := TStringList.Create;
   FAddrLocalVars := TStringList.Create;
   FRefVars := TStringList.Create;
@@ -765,6 +770,7 @@ begin
   FSharedVars.Free;
   FSharedScalarArr.Free;
   FStaticMembers.Free;
+  FEnumMembers.Free;
   FPointerVars.Free;
   FAddrLocalVars.Free;
   FRefVars.Free;
@@ -16238,6 +16244,56 @@ begin
   end;
 end;
 
+procedure TSSAGenerator.CollectEnumMembers(Node: TASTNode);
+// FreeBASIC ENUM members are module-wide integer constants: like a module-level CONST they must be
+// visible INSIDE SUB/FUNCTION bodies. The parser lowers an ENUM to a sequence of plain assignments
+// (member = value); left as ordinary module variables, MODERN lexical scope hides them from procedures
+// and the member reads as 0 inside a proc. Back each module-level member with a shared 1-element global
+// int scalar (the same mechanism as DIM SHARED / static members): the member's assignment publishes to
+// the backing, and every reference — including inside procedures — resolves through it (IsSharedScalar
+// routes both reads and writes before scope resolution).
+var
+  i, k, ai: Integer;
+  Decl: TASTNode;
+  VNameU: string;
+begin
+  if Node = nil then Exit;
+  if not FModernMode then Exit;                 // CLASSIC has no procedure scope; leave members as plain globals
+  if Node.NodeType = antProcedureDecl then Exit; // an ENUM inside a SUB/FUNCTION is proc-local, not a global
+  if Node.NodeType = antEnum then
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(k);
+      if (Decl.NodeType = antAssignment) and (Decl.ChildCount >= 1) and
+         (Decl.GetChild(0).NodeType = antIdentifier) then
+      begin
+        VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        if (VNameU = '') or (FSharedScalarArr.IndexOf(VNameU) >= 0) then Continue;
+        ai := FProgram.DeclareArray(VNameU, srtInt, [1]);   // 1-element global int array, same name
+        FSharedScalarArr.AddObject(VNameU, TObject(PtrInt(ai)));
+        FEnumMembers.Add(VNameU);
+      end;
+    end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectEnumMembers(Node.GetChild(i));
+end;
+
+procedure TSSAGenerator.EmitEnumMemberAllocs;
+// Allocate the ENUM members' backing 1-element arrays once at program start (they have no DIM).
+var
+  i, ai: Integer;
+  ArrayRef: TSSAValue;
+begin
+  if FEnumMembers = nil then Exit;
+  for i := 0 to FEnumMembers.Count - 1 do
+  begin
+    ai := PtrInt(FSharedScalarArr.Objects[FSharedScalarArr.IndexOf(FEnumMembers[i])]);
+    ArrayRef := MakeSSAArrayRef(ai, FProgram.GetArray(ai).ElementType);
+    EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
 procedure TSSAGenerator.EmitSharedScalarAllocs;
 // FreeBASIC module constructors run before module-level code, but a SHARED scalar's 1-element backing
 // array is normally sized by its DIM SHARED statement (in the module body, i.e. AFTER the constructors).
@@ -19943,6 +19999,10 @@ begin
   // OOP static member variables: back each "Static x AS t" type field with a shared global scalar.
   FStaticMembers.Clear;
   CollectStaticMembers(AST);
+  // FreeBASIC ENUM members: back each module-level member with a shared global int scalar so it is
+  // visible inside SUB/FUNCTION bodies (MODERN only; CLASSIC has no procedure scope).
+  FEnumMembers.Clear;
+  CollectEnumMembers(AST);
   // FreeBASIC raw pointers: vars assigned from Allocate/CAllocate/Reallocate (and CAST/copies of raw).
   // Iterate to a fixpoint so raw-ness propagates through copies regardless of statement order.
   // (Stage 2 byte-backing of address-taken arrays was withdrawn: a managed/raw mix is unsound at function
@@ -20000,6 +20060,8 @@ begin
 
   // OOP: allocate static member variables' backing arrays at program start (no DIM to trigger it).
   EmitStaticMemberAllocs;
+  // FreeBASIC ENUM members: allocate their backing arrays at program start (they have no DIM either).
+  EmitEnumMemberAllocs;
 
   // PRE-PROCESS DATA STATEMENTS FIRST
   // In BASIC, DATA statements are collected before program execution,
