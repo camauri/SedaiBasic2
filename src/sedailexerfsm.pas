@@ -34,7 +34,7 @@ uses
   SedaiBasicKeywords, SedaiMemoryUtils, SedaiDateTimeUtils;
 
 const
-  MAX_TOKEN_LENGTH = 255;
+  INITIAL_TOKEN_CAPACITY = 256;   // token buffer starts here and doubles on demand (no hard token cap)
 
 type
   { TLexerFSM - Main Finite State Machine Lexer }
@@ -102,7 +102,7 @@ type
     {$ENDIF}
 
     // === STRING BUFFER OPTIMIZATION ===
-    FTokenBuffer: array[0..255] of Char;
+    FTokenBuffer: array of Char;   // grows on demand (INITIAL_TOKEN_CAPACITY, then doubling)
     FTokenLength: Integer;
 
     function GetTokenAt(Index: Integer): TLexerToken;
@@ -1032,10 +1032,16 @@ end;
 
 procedure TLexerFSM.TokenBufferAdd(C: Char);
 begin
-  if FTokenLength >= MAX_TOKEN_LENGTH then
-    raise Exception.CreateFmt('Token too long at line %d (max %d chars) - possible unterminated string',
-      [FCurrentLine, MAX_TOKEN_LENGTH]);
-
+  // Grow on demand rather than capping token length: a long string literal (or any long token) must
+  // lex without a hard limit, as it does in FreeBASIC. The buffer starts at INITIAL_TOKEN_CAPACITY and
+  // doubles; almost every token is short, so a grow is rare and the fast index-write path is unchanged.
+  if FTokenLength >= Length(FTokenBuffer) then
+  begin
+    if Length(FTokenBuffer) = 0 then
+      SetLength(FTokenBuffer, INITIAL_TOKEN_CAPACITY)
+    else
+      SetLength(FTokenBuffer, Length(FTokenBuffer) * 2);
+  end;
   FTokenBuffer[FTokenLength] := C;
   Inc(FTokenLength);
 end;
@@ -1065,8 +1071,8 @@ var
   Len: Integer;
 begin
   Len := Length(S);
-  if Len > High(FTokenBuffer) then
-    Len := High(FTokenBuffer);
+  if Len > Length(FTokenBuffer) then
+    SetLength(FTokenBuffer, Len);        // grow to fit instead of truncating
 
   FTokenLength := Len;
   if Len > 0 then
