@@ -6051,10 +6051,11 @@ var
   IndicesNode: TASTNode;
   Indices: array of TSSAValue;
   i, j, TempReg: Integer;
-  ArrayRef, ExprValue, TempVal, LinearIndex, StrideVal, MulResult, AddResult: TSSAValue;
+  ArrayRef, ExprValue, TempVal, LinearIndex, StrideVal, MulResult, AddResult, ElemHandle: TSSAValue;
   FloatVal: Double;
   IntVal: Int64;
   Stride: Int64;
+  ElemUDT: string;
 begin
   // Array store: A(5) = 10
   // Node structure: antAssignment
@@ -6234,6 +6235,21 @@ begin
   end;
 
   ArrayRef := MakeSSAArrayRef(ArrayIdx, ArrInfo.ElementType);
+
+  // "arr(i) = <UDT value>" for an array-of-UDT: the element already owns a record, so copy the source
+  // record's CONTENTS into it (value semantics). Storing the source HANDLE instead would make every
+  // assigned element alias one record -- e.g. "For j: a(j) = Type(j,0)" left every element equal to the
+  // last. Member stores ("a(i).f = x") take a different path and are unaffected. Only for a MANAGED
+  // array-of-UDT (FArrayRecordType); scalar arrays and raw-pointer arrays keep the plain store.
+  ElemUDT := ArrayRecordTypeOf(ArrName);   // scope-aware: covers array PARAMETERS too, not just DIMs
+  if (ElemUDT <> '') and (FindUDT(ElemUDT) >= 0) and
+     (ExprValue.Kind = svkRegister) and (ExprValue.RegType = srtInt) then
+  begin
+    ElemHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaArrayLoad, ElemHandle, ArrayRef, LinearIndex, MakeSSAValue(svkNone));
+    EmitRecordCopy(ElemHandle, ExprValue, FindUDT(ElemUDT));
+    Exit;
+  end;
 
   // Emit ssaArrayStore instruction with pre-computed linear index
   // Dest = value to store
@@ -7171,9 +7187,10 @@ procedure TSSAGenerator.ProcessSwap(Node: TASTNode);
 // This lowers to the classic T=A:A=B:B=T idiom, which the copy-prop soundness fix already covers.
 var
   LeftNode, RightNode, AsnAB, AsnBTmp, TmpRef: TASTNode;
-  ValA, TmpReg: TSSAValue;
-  TmpName, Suffix: string;
+  ValA, ValB, TmpReg, TmpRec: TSSAValue;
+  TmpName, Suffix, SwapUDT: string;
   CopyOp: TSSAOpCode;
+  SwapUDTIdx: Integer;
 begin
   if Node.ChildCount < 2 then Exit;
   LeftNode := Node.GetChild(0);
@@ -7183,6 +7200,30 @@ begin
   ProcessExpression(LeftNode, ValA);
   // A non-register result means the operand is not an lvalue (e.g. a literal): nothing to swap.
   if ValA.Kind in [svkConstInt, svkConstFloat, svkConstString] then Exit;
+
+  // SWAP of two UDT records (e.g. "Swap p(i), p(j)" over an array-of-UDT): ValA/ValB are record
+  // HANDLES, and array-of-UDT element assignment now value-copies (not handle-copies), so the classic
+  // "tmp=A; A=B; B=tmp" would corrupt tmp (it would alias A's record and be overwritten by "A=B").
+  // Do a proper 3-way CONTENT swap through a temporary record instead.
+  SwapUDT := ObjectTypeName(LeftNode);
+  SwapUDTIdx := FindUDT(SwapUDT);
+  if (SwapUDT <> '') and (SwapUDTIdx >= 0) and (ValA.Kind = svkRegister) and (ValA.RegType = srtInt) then
+  begin
+    ProcessExpression(RightNode, ValB);
+    if (ValB.Kind = svkRegister) and (ValB.RegType = srtInt) then
+    begin
+      TmpRec := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordNew, TmpRec,
+                      MakeSSAConstInt(FUDTs[SwapUDTIdx].NInt),
+                      MakeSSAConstInt(FUDTs[SwapUDTIdx].NFloat),
+                      MakeSSAConstInt(FUDTs[SwapUDTIdx].NStr or (Int64(SwapUDTIdx) shl 32)));
+      EmitRecordInit(TmpRec, SwapUDTIdx);
+      EmitRecordCopy(TmpRec, ValA, SwapUDTIdx);   // tmp = A
+      EmitRecordCopy(ValA, ValB, SwapUDTIdx);     // A   = B
+      EmitRecordCopy(ValB, TmpRec, SwapUDTIdx);   // B   = tmp
+      Exit;
+    end;
+  end;
 
   // Pick a temp whose name-suffix forces the bank matching the snapshot value's type.
   case ValA.RegType of
