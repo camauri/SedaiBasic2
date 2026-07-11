@@ -20058,6 +20058,17 @@ begin
             EmitXferStore(srtInt, XFER_RESULT_SLOT, EmitVarAddress(VarToStr(Node.GetChild(0).Value)))
           else
           begin
+            // FreeBASIC "Return Type(args)" shorthand: the bare Type() carries no <T>, so fill its type
+            // from the FUNCTION's UDT return type (exactly as "Dim v As T = Type(args)" fills it from the
+            // declared type). Without this the constructor keeps an empty type name and the SSA reads it as
+            // an array access -> "Array not declared:" (empty name).
+            if (FCurrentProcRetRecType <> '') and
+               (Node.GetChild(0).Attributes.Values['INFERTYPE'] = '1') and
+               (Node.GetChild(0).ChildCount >= 1) then
+            begin
+              Node.GetChild(0).GetChild(0).Value := FCurrentProcRetRecType;
+              Node.GetChild(0).Attributes.Values['INFERTYPE'] := '';
+            end;
             ProcessExpression(Node.GetChild(0), RetVal);
             // V3: UDT result copied by value into the caller's result instance; scalar via xfer slot.
             if FCurrentProcRetRecType <> '' then
