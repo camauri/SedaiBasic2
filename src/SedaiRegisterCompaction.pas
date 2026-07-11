@@ -941,37 +941,58 @@ begin
   end;
 end;
 
+// The register maps grow on demand to fit any register index, rather than capping at MAX_REGISTERS.
+// A program that uses more than MAX_REGISTERS registers before compaction (e.g. a large array
+// initializer plus many UDT-by-value temporaries) would otherwise leave those high registers
+// unmarked/unremapped, and -- worse -- the identity-mapping loop in BuildCompactMapping would write
+// past the fixed map and corrupt the heap. New slots default to -1 ("unused"), as ScanUsedRegisters
+// initialises them.
 procedure TRegisterCompactor.MarkIntRegUsed(Reg: Integer);
+var
+  j, oldLen: Integer;
 begin
-  if (Reg >= 0) and (Reg < MAX_REGISTERS) then
+  if Reg < 0 then Exit;
+  if Reg > FMaxOldIntReg then
+    FMaxOldIntReg := Reg;
+  if Reg >= Length(FIntRegMap) then
   begin
-    if Reg > FMaxOldIntReg then
-      FMaxOldIntReg := Reg;
-    if Reg < Length(FIntRegMap) then
-      FIntRegMap[Reg] := 0;  // Mark as used (will be remapped later)
+    oldLen := Length(FIntRegMap);
+    SetLength(FIntRegMap, Reg + 1);
+    for j := oldLen to Reg do FIntRegMap[j] := -1;
   end;
+  FIntRegMap[Reg] := 0;  // Mark as used (will be remapped later)
 end;
 
 procedure TRegisterCompactor.MarkFloatRegUsed(Reg: Integer);
+var
+  j, oldLen: Integer;
 begin
-  if (Reg >= 0) and (Reg < MAX_REGISTERS) then
+  if Reg < 0 then Exit;
+  if Reg > FMaxOldFloatReg then
+    FMaxOldFloatReg := Reg;
+  if Reg >= Length(FFloatRegMap) then
   begin
-    if Reg > FMaxOldFloatReg then
-      FMaxOldFloatReg := Reg;
-    if Reg < Length(FFloatRegMap) then
-      FFloatRegMap[Reg] := 0;  // Mark as used
+    oldLen := Length(FFloatRegMap);
+    SetLength(FFloatRegMap, Reg + 1);
+    for j := oldLen to Reg do FFloatRegMap[j] := -1;
   end;
+  FFloatRegMap[Reg] := 0;  // Mark as used
 end;
 
 procedure TRegisterCompactor.MarkStringRegUsed(Reg: Integer);
+var
+  j, oldLen: Integer;
 begin
-  if (Reg >= 0) and (Reg < MAX_REGISTERS) then
+  if Reg < 0 then Exit;
+  if Reg > FMaxOldStringReg then
+    FMaxOldStringReg := Reg;
+  if Reg >= Length(FStringRegMap) then
   begin
-    if Reg > FMaxOldStringReg then
-      FMaxOldStringReg := Reg;
-    if Reg < Length(FStringRegMap) then
-      FStringRegMap[Reg] := 0;  // Mark as used
+    oldLen := Length(FStringRegMap);
+    SetLength(FStringRegMap, Reg + 1);
+    for j := oldLen to Reg do FStringRegMap[j] := -1;
   end;
+  FStringRegMap[Reg] := 0;  // Mark as used
 end;
 
 procedure TRegisterCompactor.ScanUsedRegisters;
@@ -1287,6 +1308,14 @@ begin
   // Variable registers (0..VarRegCount-1) must be preserved with identity mapping
   // because they may be read without explicit write instructions in the bytecode
   VarRegCount := FProgram.GetIntVarRegCount;
+  // The identity-mapping loop below writes FIntRegMap[0..VarRegCount-1]; grow the map so a variable
+  // register count above the map's current length can never write past it (heap corruption).
+  if VarRegCount > Length(FIntRegMap) then
+  begin
+    i := Length(FIntRegMap);
+    SetLength(FIntRegMap, VarRegCount);
+    while i < VarRegCount do begin FIntRegMap[i] := -1; Inc(i); end;
+  end;
 
   // Build compact mapping for int registers
   // First, preserve variable registers (0..VarRegCount-1) with identity mapping
@@ -1311,6 +1340,12 @@ begin
   // Build compact mapping for float registers
   // First, preserve variable registers with identity mapping
   VarRegCount := FProgram.GetFloatVarRegCount;
+  if VarRegCount > Length(FFloatRegMap) then
+  begin
+    i := Length(FFloatRegMap);
+    SetLength(FFloatRegMap, VarRegCount);
+    while i < VarRegCount do begin FFloatRegMap[i] := -1; Inc(i); end;
+  end;
   FNewFloatRegCount := 0;
   for i := 0 to VarRegCount - 1 do
   begin
@@ -1331,6 +1366,12 @@ begin
   // Build compact mapping for string registers
   // First, preserve variable registers with identity mapping
   VarRegCount := FProgram.GetStringVarRegCount;
+  if VarRegCount > Length(FStringRegMap) then
+  begin
+    i := Length(FStringRegMap);
+    SetLength(FStringRegMap, VarRegCount);
+    while i < VarRegCount do begin FStringRegMap[i] := -1; Inc(i); end;
+  end;
   FNewStringRegCount := 0;
   for i := 0 to VarRegCount - 1 do
   begin
