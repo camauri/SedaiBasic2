@@ -965,9 +965,9 @@ end;
 
 function TBytecodeVM.FormatUsingString(const FormatStr: string; Value: Double): string;
 var
-  i, j, TotalWidth, IntDigits, DecDigits: Integer;
+  i, j, TotalWidth, IntDigits, DecDigits, DotPos: Integer;
   HasDollar, FloatDollar, HasCommas, IsNegative: Boolean;
-  IntPart, FormattedInt, FormattedDec: string;
+  IntPart, FormattedInt, FormattedDec, RoundedStr: string;
   AbsValue: Double;
   DollarChar, DecimalChar, FillerChar: Char;
 begin
@@ -1024,21 +1024,23 @@ begin
   IsNegative := Value < 0;
   AbsValue := Abs(Value);
 
-  // Format decimal part
-  if DecDigits > 0 then
+  // Round the WHOLE value to DecDigits decimals, then split into integer and fractional parts. Rounding
+  // Frac() and Trunc() separately dropped the carry when the fractional part rounded up to all zeros:
+  // 11.9999999 gave Frac->"1.000000" (stripped to "000000") + Trunc 11 = "11.000000" instead of
+  // "12.000000". Formatting the whole value first carries into the integer part correctly.
+  RoundedStr := Format('%.*f', [DecDigits, AbsValue]);   // '.' separator (as the split below assumes)
+  DotPos := Pos('.', RoundedStr);
+  if DotPos > 0 then
   begin
-    FormattedDec := Format('%.*f', [DecDigits, Frac(AbsValue)]);
-    // Remove leading "0." from decimal part
-    if Length(FormattedDec) > 2 then
-      FormattedDec := Copy(FormattedDec, 3, Length(FormattedDec) - 2)
-    else
-      FormattedDec := StringOfChar('0', DecDigits);
+    IntPart := Copy(RoundedStr, 1, DotPos - 1);
+    FormattedDec := Copy(RoundedStr, DotPos + 1, Length(RoundedStr) - DotPos);
   end
   else
+  begin
+    IntPart := RoundedStr;
     FormattedDec := '';
-
-  // Format integer part
-  IntPart := IntToStr(Trunc(AbsValue));
+  end;
+  if DecDigits <= 0 then FormattedDec := '';
 
   // Add thousand separators if requested
   if HasCommas then
