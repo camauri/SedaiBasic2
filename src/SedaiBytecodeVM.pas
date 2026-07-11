@@ -197,6 +197,7 @@ type
     FArrayBindStack: array of record SlotId: Integer; ArgId: Integer; Saved: TArrayStorage; Snapshot: TArrayStorage; end;
     FArrayBindTop: Integer;
     FRedimPendingUBs: array of Integer;   // REDIM multi-dim: upper bounds accumulated by bcArrayRedimPush, consumed by bcArrayRedimN
+    FRedimPendingLBs: array of Integer;   // REDIM "lb TO ub" with a RUNTIME lb: lower bounds accumulated (immediate flag on the push)
     FIdxPending: array of Int64;          // runtime multi-dim index: indices accumulated by bcArrayIdxPush, consumed by bcArrayIdxResolve
 
     // UDT/record heap is per-context (FCtx.Records / FCtx.RecordCount) since M5.2b.
@@ -270,7 +271,7 @@ type
     function ArrayBoundsOK(ArrayIdx, LinearIdx: Integer): Boolean; inline;
     procedure EraseArray(ArrayIdx: Integer);                                   // B1.4: ERASE
     procedure RedimArray(ArrayIdx, NewUpper: Integer; Preserve: Boolean; HasNewLower: Boolean = False; NewLower: Integer = 0);  // B1.4: REDIM (1-D)
-    procedure RedimArrayN(ArrayIdx: Integer; const Uppers: array of Integer; Preserve: Boolean); // REDIM multi-dim
+    procedure RedimArrayN(ArrayIdx: Integer; const Uppers: array of Integer; Preserve: Boolean; const Lowers: array of Integer); // REDIM multi-dim
 
     procedure ExecuteIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSpecialVarOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -6250,11 +6251,12 @@ begin
   FArrays[ArrayIdx].TotalSize := NewSize;
 end;
 
-procedure TBytecodeVM.RedimArrayN(ArrayIdx: Integer; const Uppers: array of Integer; Preserve: Boolean);
-// REDIM a(u0, u1, ...) — re-dimension a multi-dimensional array. Keeps each dimension's original lower
-// bound (only the upper bounds change). PRESERVE keeps the flat element order up to the new size (FB
-// preserves the linear layout); otherwise the storage is cleared. Strides stay row-major (computed at
-// access from Dimensions[]).
+procedure TBytecodeVM.RedimArrayN(ArrayIdx: Integer; const Uppers: array of Integer; Preserve: Boolean;
+  const Lowers: array of Integer);
+// REDIM a(l0 TO u0, ...) — re-dimension a multi-dimensional array. Each dimension's lower bound comes
+// from Lowers[d] when supplied (an explicit "lb TO ub" range, possibly a runtime value), else the
+// dimension's original lower bound is kept (a bare "ub"). PRESERVE keeps the flat element order up to
+// the new size; otherwise the storage is cleared. Strides stay row-major (computed at access).
 var
   d, NewSize, k, Lb: Integer;
 begin
@@ -6265,7 +6267,11 @@ begin
     SetLength(FArrays[ArrayIdx].LowerBounds, Length(Uppers));
   for d := 0 to High(Uppers) do
   begin
-    Lb := FArrays[ArrayIdx].LowerBounds[d];   // keep the original lower bound per dimension
+    if d <= High(Lowers) then
+      Lb := Lowers[d]                           // explicit "lb TO ub" (runtime lb supported)
+    else
+      Lb := FArrays[ArrayIdx].LowerBounds[d];   // bare "ub": keep the original lower bound
+    FArrays[ArrayIdx].LowerBounds[d] := Lb;
     k := Uppers[d] - Lb + 1;
     if k < 0 then k := 0;
     FArrays[ArrayIdx].Dimensions[d] := k;
@@ -6522,9 +6528,19 @@ begin
     11: // bcArrayErase - ERASE arr - reset all elements to default, keep size (B1.4)
       EraseArray(Instr.Src1);
     12: // bcArrayRedim - REDIM [PRESERVE] arr([lb TO] ub) (B1.4); Src2=ub reg. Immediate: bit0=preserve,
-        // bit1=has explicit lower bound, bits8+ = that (non-negative) lower bound.
-      RedimArray(Instr.Src1, Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0,
-                 (Instr.Immediate and 2) <> 0, Instr.Immediate shr 8);
+        // bit1=has explicit lower bound, bits8+ = that (non-negative) lower bound. A RUNTIME lower bound
+        // arrives via a preceding bcArrayRedimPush (LB flag) in FRedimPendingLBs and takes precedence.
+      begin
+        if Length(FRedimPendingLBs) > 0 then
+        begin
+          RedimArray(Instr.Src1, Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0,
+                     True, FRedimPendingLBs[0]);
+          SetLength(FRedimPendingLBs, 0);
+        end
+        else
+          RedimArray(Instr.Src1, Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0,
+                     (Instr.Immediate and 2) <> 0, Instr.Immediate shr 8);
+      end;
     // FreeBASIC pointer dereference. Two pointer kinds share these ops, discriminated by bit 63: a
     // record-field pointer (RECPTR_TAG set, so PtrAddr < 0) addresses ResolveRec(handle)^.Data[slot];
     // otherwise the packed address holds (arrayId+1) in the high bits (0 = NULL) and the element offset
@@ -6707,15 +6723,25 @@ begin
           SetLength(FArrayBindStack[FArrayBindTop].Snapshot.StringData, 0);
         end;
       end;
-    27: // bcArrayRedimPush - push one upper bound onto the pending REDIM dimension list
+    27: // bcArrayRedimPush - push one bound onto the pending REDIM list (Immediate bit0 = it is a
+        // RUNTIME lower bound -> the parallel LB list; otherwise an upper bound).
       begin
-        SetLength(FRedimPendingUBs, Length(FRedimPendingUBs) + 1);
-        FRedimPendingUBs[High(FRedimPendingUBs)] := Ctx.IntRegs[Instr.Src1];
+        if (Instr.Immediate and 1) <> 0 then
+        begin
+          SetLength(FRedimPendingLBs, Length(FRedimPendingLBs) + 1);
+          FRedimPendingLBs[High(FRedimPendingLBs)] := Ctx.IntRegs[Instr.Src1];
+        end
+        else
+        begin
+          SetLength(FRedimPendingUBs, Length(FRedimPendingUBs) + 1);
+          FRedimPendingUBs[High(FRedimPendingUBs)] := Ctx.IntRegs[Instr.Src1];
+        end;
       end;
-    28: // bcArrayRedimN - commit a multi-dimensional REDIM using the pushed upper bounds
+    28: // bcArrayRedimN - commit a multi-dimensional REDIM using the pushed upper (and any lower) bounds
       begin
-        RedimArrayN(Instr.Src1, FRedimPendingUBs, (Instr.Immediate and 1) <> 0);
+        RedimArrayN(Instr.Src1, FRedimPendingUBs, (Instr.Immediate and 1) <> 0, FRedimPendingLBs);
         SetLength(FRedimPendingUBs, 0);
+        SetLength(FRedimPendingLBs, 0);
       end;
     29: // bcArrayIdxPush - push one (already lower-bound-adjusted) index for a runtime multi-dim access
       begin
@@ -6817,9 +6843,10 @@ begin
             SetLength(FArrays[PtrAddr].LowerBounds, 0);
             Rec^.IntData[RecSlot] := PtrAddr;
           end;
-          RedimArrayN(PtrAddr, FRedimPendingUBs, (Instr.Immediate and 1) <> 0);
+          RedimArrayN(PtrAddr, FRedimPendingUBs, (Instr.Immediate and 1) <> 0, FRedimPendingLBs);
         end;
         SetLength(FRedimPendingUBs, 0);
+        SetLength(FRedimPendingLBs, 0);
       end;
     45: // bcArrayLBoundInd - LBOUND of a UDT array member (Src1=handle reg, Src2=dim reg)
       begin

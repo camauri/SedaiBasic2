@@ -6956,6 +6956,7 @@ var
   UbValue, UbReg, MHandle, LbVal: TSSAValue;
   MElemBank: TSSARegisterType;
   PreserveFlag, LbImm, FoldedLb, RecPacked: Int64;
+  AllExplicitLb: Boolean;
 begin
   if Node.Attributes.Values['PRESERVE'] = '1' then PreserveFlag := 1 else PreserveFlag := 0;
   for j := 0 to Node.ChildCount - 1 do
@@ -7027,7 +7028,12 @@ begin
         if (LbVal.Kind = svkConstInt) and (LbVal.ConstInt >= 0) then
           LbImm := 2 or (LbVal.ConstInt shl 8)
         else if (LbVal.Kind = svkConstFloat) and (LbVal.ConstFloat >= 0) then
-          LbImm := 2 or (Int64(Trunc(LbVal.ConstFloat)) shl 8);
+          LbImm := 2 or (Int64(Trunc(LbVal.ConstFloat)) shl 8)
+        else
+          // A RUNTIME lower bound (e.g. "Redim a(Lbound(m) To ub)"), or a negative constant that does
+          // not fit the immediate: push the value with the LB flag so bcArrayRedim reads it at run time.
+          EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), EnsureIntRegister(LbVal),
+                          MakeSSAValue(svkNone), MakeSSAConstInt(1));
         DimExpr := DimChild.GetChild(1);
       end
       else
@@ -7041,7 +7047,24 @@ begin
     else
     begin
       // Multi-dim REDIM a(u0, u1, ...): push each upper bound, then commit. The VM accumulates the
-      // bounds (bcArrayRedimPush) and reshapes on commit (bcArrayRedimN), keeping each dim's lower bound.
+      // bounds (bcArrayRedimPush) and reshapes on commit (bcArrayRedimN). When EVERY dimension is an
+      // explicit "lb TO ub" range, also push each lower bound (runtime lb supported) so RedimArrayN
+      // applies them; a mix of "lb TO ub" and bare "ub" keeps the old lower bounds (avoids a misaligned
+      // lb list).
+      AllExplicitLb := DimsNode.ChildCount > 0;
+      for di := 0 to DimsNode.ChildCount - 1 do
+        if DimsNode.GetChild(di).NodeType <> antDimRange then begin AllExplicitLb := False; Break; end;
+      if AllExplicitLb then
+        for di := 0 to DimsNode.ChildCount - 1 do
+        begin
+          DimChild := DimsNode.GetChild(di);
+          if TryConstFoldArrayBound(DimChild.GetChild(0), FoldedLb) then
+            LbVal := MakeSSAConstInt(FoldedLb)
+          else
+            ProcessExpression(DimChild.GetChild(0), LbVal);
+          EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), EnsureIntRegister(LbVal),
+                          MakeSSAValue(svkNone), MakeSSAConstInt(1));
+        end;
       for di := 0 to DimsNode.ChildCount - 1 do
       begin
         DimChild := DimsNode.GetChild(di);
