@@ -194,6 +194,7 @@ type
                                          // a per-frame 1-field record (handle in hidden "<name>$REC"), so the address
                                          // is distinct per recursion level (a module-level @-taken var stays SHARED-backed).
     FByrefRetFuncs: TStringList;         // FreeBASIC BYREF function results: func name (UPPER) -> pointee type name
+    FRawPtrRetFuncs: TStringList;        // FUNCTION returning a raw "<scalar> PTR": func name (UPPER) -> scalar pointee type
     FCurrentProcByrefRet: Boolean;       // lowering a "FUNCTION f() BYREF AS T" (returns an address)
     FVarWidthCode: TStringList;          // B1.5 phase 2: name (UPPER) -> narrow width code (Objects[]=PtrInt 1..7)
     FVarPrintKind: TStringList;          // B1.5 phase C: name (UPPER) -> 1=BOOLEAN, 2=unsigned-64 (print form)
@@ -339,6 +340,8 @@ type
     function RefVarBank(const Name: string): TSSARegisterType;                  // pointee bank of a reference variable
     function IsRawPtr(const Name: string): Boolean;                             // raw (Allocate-backed) pointer var?
     procedure CollectRawPtrVars(Node: TASTNode);                                // pre-scan: mark ptrs assigned from Allocate*
+    procedure CollectRawPtrRetFuncs(Node: TASTNode);                            // pre-scan: FUNCTIONs returning a raw "<scalar> PTR"
+    function IsRawReturnExpr(Node: TASTNode): Boolean;                          // a FUNCTION-return expr that yields a raw byte-heap pointer?
     procedure CollectWStringVars(Node: TASTNode);                               // pre-scan: mark DIM ... AS WSTRING vars
     procedure CollectRedimMultiArrays(Node: TASTNode);                          // pre-scan: arrays in a multi-dim REDIM
     procedure CollectDynamicArrays(Node: TASTNode);                             // pre-scan: dynamic arrays (empty-declared / REDIM target)
@@ -727,6 +730,7 @@ begin
   FFixedLenVars := TStringList.Create;
   FFixedLenVars.CaseSensitive := False;
   FByrefRetFuncs := TStringList.Create;
+  FRawPtrRetFuncs := TStringList.Create;
   FSharedScalarArr.CaseSensitive := False;
   FVarWidthCode := TStringList.Create;
   FVarWidthCode.CaseSensitive := False;
@@ -789,6 +793,7 @@ begin
   FDynamicArrays.Free;
   FFixedLenVars.Free;
   FByrefRetFuncs.Free;
+  FRawPtrRetFuncs.Free;
   FVarWidthCode.Free;
   FVarPrintKind.Free;
   FArrayElemWidth.Free;
@@ -16835,7 +16840,14 @@ begin
   else if (Node.NodeType = antProcAddress) and (Node.ChildCount >= 1) and
           (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
           (Node.GetChild(0).GetChild(0).NodeType = antMemberAccess) then
-    Result := MemberRawPtrPointee(Node.GetChild(0).GetChild(0));
+    Result := MemberRawPtrPointee(Node.GetChild(0).GetChild(0))
+  // f(args) where f is a FUNCTION returning a raw "<scalar> PTR": *f(args) reads/writes the raw heap at
+  // the returned address. A call parses as antArrayAccess(nameIdent, args); f is not a declared array.
+  else if ((Node.NodeType = antArrayAccess) or (Node.NodeType = antFunctionCall)) and
+          (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) and
+          (ArrayIndexOf(VarToStr(Node.GetChild(0).Value)) < 0) and
+          (FRawPtrRetFuncs.IndexOfName(UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) then
+    Result := FRawPtrRetFuncs.Values[UpperCase(VarToStr(Node.GetChild(0).Value))];
 end;
 
 function TSSAGenerator.RawTypeCodeOfPointee(const PointeeType: string): Integer;
@@ -17027,6 +17039,11 @@ var
     end
     else if RawPtrExprName(Rhs) <> '' then
       MarkRaw(TargetU)   // p = q, p = q + n, p = q - n, p = (q): q raw
+    else if ((Rhs.NodeType = antArrayAccess) or (Rhs.NodeType = antFunctionCall)) and
+            (Rhs.ChildCount >= 1) and (Rhs.GetChild(0).NodeType = antIdentifier) and
+            (ArrayIndexOf(VarToStr(Rhs.GetChild(0).Value)) < 0) and
+            (FRawPtrRetFuncs.IndexOfName(UpperCase(VarToStr(Rhs.GetChild(0).Value))) >= 0) then
+      MarkRaw(TargetU)   // p = f(...) where f returns a raw <scalar> pointer
     else if FModernMode and (Rhs.NodeType = antArrayAccess) and (Rhs.ChildCount >= 1) and
             (Rhs.GetChild(0).NodeType = antIdentifier) and
             ((UpperCase(VarToStr(Rhs.GetChild(0).Value)) = kSADD) or
@@ -17055,6 +17072,81 @@ begin
   end;
   for i := 0 to Node.ChildCount - 1 do
     CollectRawPtrVars(Node.GetChild(i));
+end;
+
+function TSSAGenerator.IsRawReturnExpr(Node: TASTNode): Boolean;
+// Syntactic test: does a FUNCTION-return expression yield a RAW byte-heap pointer? Conservative on
+// purpose -- "@g" (the address of a scalar VARIABLE, a managed pointer) is NOT raw, so "return @g" keeps
+// its managed deref, while "return @obj.field[i]" (a raw field element) and "return Allocate(...)" /
+// "return rawvar" are raw. Fixpoint-dependent parts (a raw var/arith) resolve as FRawPtrVars grows.
+var
+  FU: string;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if IsAllocCall(Node, FU) then Exit(True);                 // return Allocate/CAllocate/Reallocate(...)
+  if IsScreenPtrExpr(Node) then Exit(True);
+  // return @obj.field[i]: the address of a raw field element (a member-access base). "@g" (a plain
+  // identifier base) is a managed variable address and is deliberately excluded.
+  if (Node.NodeType = antProcAddress) and (Node.ChildCount >= 1) and
+     (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
+     (Node.GetChild(0).GetChild(0).NodeType = antMemberAccess) then Exit(True);
+  // return a raw pointer variable / raw arithmetic / @rawvar[i] (RawPtrExprName covers these).
+  if RawPtrExprName(Node) <> '' then Exit(True);
+end;
+
+procedure TSSAGenerator.CollectRawPtrRetFuncs(Node: TASTNode);
+// Record every FUNCTION whose declared return type is a raw "<scalar> PTR" AND whose body returns a raw
+// expression (IsRawReturnExpr), as name (UPPER) -> scalar pointee. A deref of such a call reads/writes the
+// raw heap, and a var assigned from such a call is itself raw (CollectRawPtrVars propagates it). Excludes
+// BYREF results (managed lvalue references) and UDT pointees (managed handles). antProcedureDecl: child0 =
+// name identifier, whose child0 is the return-type identifier ("DOUBLE PTR"). Runs in the raw fixpoint, so
+// a function returning a raw LOCAL is caught once that local is marked raw.
+var
+  i: Integer;
+  NameNode: TASTNode;
+  Nm, RetT, Pointee: string;
+
+  function BodyReturnsRaw(N: TASTNode): Boolean;
+  var k: Integer;
+  begin
+    Result := False;
+    if N = nil then Exit;
+    if (N.NodeType = antReturn) and (UpperCase(VarToStr(N.Value)) = 'RETURN') and (N.ChildCount >= 1) then
+      if IsRawReturnExpr(N.GetChild(0)) then Exit(True);
+    for k := 0 to N.ChildCount - 1 do
+    begin
+      if N.GetChild(k).NodeType = antProcedureDecl then Continue;   // a nested proc owns its own returns
+      if BodyReturnsRaw(N.GetChild(k)) then Exit(True);
+    end;
+  end;
+
+begin
+  if Node = nil then Exit;
+  if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) and
+     (Node.GetChild(0).NodeType = antIdentifier) and (Node.Attributes.Values['BYREFRET'] <> '1') then
+  begin
+    NameNode := Node.GetChild(0);
+    Nm := UpperCase(VarToStr(NameNode.Value));
+    if (Nm <> '') and (FRawPtrRetFuncs.IndexOfName(Nm) < 0) and
+       (NameNode.ChildCount >= 1) and (NameNode.GetChild(0).NodeType = antIdentifier) then
+    begin
+      RetT := UpperCase(VarToStr(NameNode.GetChild(0).Value));
+      if (Length(RetT) > 4) and (Copy(RetT, Length(RetT) - 3, 4) = ' PTR') then
+      begin
+        Pointee := Trim(Copy(RetT, 1, Length(RetT) - 4));
+        if (Pointee <> '') and (Pos(' PTR', Pointee) = 0) and (FindUDT(Pointee) < 0) and
+           BodyReturnsRaw(Node) then
+        begin
+          FRawPtrRetFuncs.Add(Nm + '=' + Pointee);
+          FRawCollectChanged := True;   // a new raw-returning function may make more vars raw next round
+        end;
+      end;
+    end;
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectRawPtrRetFuncs(Node.GetChild(i));
 end;
 
 procedure TSSAGenerator.CollectWStringVars(Node: TASTNode);
@@ -18732,6 +18824,8 @@ begin
       Pointee := UpperCase(VarToStr(NameNode.GetChild(0).Value));
     FByrefRetFuncs.Add(Name + '=' + Pointee);
   end;
+  // (FUNCTION returning a raw "<scalar> PTR" is collected earlier by CollectRawPtrRetFuncs, before
+  // CollectRawPtrVars, so a var assigned from such a call can be propagated raw.)
 end;
 
 procedure TSSAGenerator.PreCollectProcedures(Node: TASTNode);
@@ -20220,6 +20314,7 @@ begin
   FRawPtrVars.Clear;
   FWStringVars.Clear;
   FByrefRetFuncs.Clear;
+  FRawPtrRetFuncs.Clear;
   FArrayElemWidth.Clear;
   FUnsigned64Arrays.Clear;
   // FreeBASIC pointers: mark each address-taken (@x) declared scalar SHARED so the next pass backs it
@@ -20238,9 +20333,15 @@ begin
   // (Stage 2 byte-backing of address-taken arrays was withdrawn: a managed/raw mix is unsound at function
   // boundaries — a "T PTR" parameter can receive both a managed @x and a raw @arr/Allocate pointer. So
   // @arr stays managed; only Allocate buffers are raw. CollectAddrTakenArrays is intentionally not called.)
+  // Raw-pointer dataflow to a fixpoint: CollectRawPtrVars marks vars assigned from a raw source (incl. a
+  // raw-returning function), and CollectRawPtrRetFuncs marks a "<scalar> PTR"-returning FUNCTION raw when a
+  // Return expression is raw (Allocate / @field[i] / a raw var). The two feed each other (a function that
+  // returns a raw local, and a var assigned from that function), so both run each round until stable.
+  FRawPtrRetFuncs.Clear;
   repeat
     FRawCollectChanged := False;
     CollectRawPtrVars(AST);
+    CollectRawPtrRetFuncs(AST);
   until not FRawCollectChanged;
   // FreeBASIC WSTRING: record vars/fields declared AS WSTRING so width-aware ops (LEN/MID/...) count by
   // Unicode codepoint. Same srtString bank (UTF-8 storage) → no new register bank, existing ops intact.
