@@ -16667,7 +16667,15 @@ begin
   begin
     Result := RawPtrExprName(Node.GetChild(0));
     if (Result = '') and (Node.Token.TokenType = ttOpAdd) then Result := RawPtrExprName(Node.GetChild(1));
-  end;
+  end
+  // @p[i] where p is a raw pointer: FreeBASIC "@p[i]" ≡ "p + i", a raw pointer of the same element type
+  // (EmitArrayElementAddress emits the SizeOf-scaled byte address). Treat it as the raw pointer p so a
+  // deref of it loads from the byte heap and an assignment "q = @p[i]" carries the raw-ness onto q.
+  else if (Node.NodeType = antProcAddress) and (Node.ChildCount >= 1) and
+          (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
+          (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+          IsRawPtr(VarToStr(Node.GetChild(0).GetChild(0).Value)) then
+    Result := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
 end;
 
 function TSSAGenerator.RawTypeCodeOf(const PtrName: string): Integer;
@@ -17221,7 +17229,18 @@ begin
   ArrName := VarToStr(Node.GetChild(0).Value);
   ArrayIdx := ArrayIndexOf(ArrName);
   if ArrayIdx < 0 then
+  begin
+    // @p[i] where p is a POINTER (a raw Allocate'd buffer, or a managed pointer) rather than a declared
+    // array: FreeBASIC "@p[i]" ≡ "p + i", the very address a "p[i]" deref computes (raw pointers scale the
+    // index by SizeOf(pointee); managed ones do not). Return that address directly instead of failing.
+    if (IsRawPtr(ArrName) or (ManagedPtrPointee(ArrName) <> '')) and
+       (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
+    begin
+      Result := EmitPointerIndexAddress(ArrName, Node.GetChild(1));
+      Exit;
+    end;
     raise Exception.CreateFmt('Cannot take address of element of undeclared array: %s', [ArrName]);
+  end;
   ArrInfo := FProgram.GetArray(ArrayIdx);
   IndicesNode := Node.GetChild(1);  // antExpressionList of indices
 
