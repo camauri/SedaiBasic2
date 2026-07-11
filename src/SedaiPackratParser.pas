@@ -73,6 +73,7 @@ type
     // stream (no line numbers => MODERN); mirrors the SSA's SourceHasLineNumbers gate.
     FModernMode: Boolean;
     FOptionBase: Integer;              // "OPTION BASE n": default lower bound for a bare-upper-bound array DIM (0 or 1)
+    FInitLevelSizes: array of Integer; // array initializer: item count per brace-nesting level (for "..." ellipsis dims)
     FDialectOverride: TParserDialect;  // pdAuto = detect per-Parse; pdModern/pdClassic = forced
     // Dialect-pluggable: per-token statement handlers installed by the active dialect profile.
     // Consulted by ParseStatement before the built-in case; nil entry = no override.
@@ -6599,6 +6600,19 @@ end;
 
 // === STUB IMPLEMENTATIONS ===
 
+function JoinIntCsv(const A: array of Integer): string;
+// Comma-join an integer array ("4,4"), for stashing per-level initializer sizes on an AST attribute.
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to High(A) do
+  begin
+    if i > 0 then Result := Result + ',';
+    Result := Result + IntToStr(A[i]);
+  end;
+end;
+
 function TPackratParser.ParseArrayDeclaration: TASTNode;
 var
   VarName: TASTNode;
@@ -6720,8 +6734,12 @@ begin
     begin
       InitList := TASTNode.Create(antArgumentList, Token);
       // flattens any nested {..} row-major, zero-padding short rows when the dimensions are all constant
+      SetLength(FInitLevelSizes, 0);
       ParseArrayInitBraceGroup(InitList, ConstDimSizes(Dimensions), 0);
       Result.Attributes.Values['ARRAYINIT'] := '1';
+      // Per-level item counts, so a "n TO ..." ellipsis dimension deduces its size from the matching
+      // brace-nesting level (level 0 = dim 0, level 1 = dim 1, ...) rather than the flat element total.
+      InitList.Attributes.Values['LEVELSIZES'] := JoinIntCsv(FInitLevelSizes);
       Result.AddChild(InitList);                      // initializer values (antArgumentList)
     end;
   end;
@@ -6774,14 +6792,20 @@ procedure TPackratParser.ParseArrayInitBraceGroup(InitList: TASTNode; const DimS
 // ProcessDim aggregate-initialises the element from it. A single "(expr)" stays a normal expression.
 var
   ValExpr, TupleNode, PadNode: TASTNode;
-  SavedIdx, TupleDepth, StartCount, Stride, d: Integer;
+  SavedIdx, TupleDepth, StartCount, Stride, d, ItemCount: Integer;
   IsTuple: Boolean;
 begin
   if not Context.Check(ttDelimBraceOpen) then Exit;
   StartCount := InitList.ChildCount;
   Context.Advance;                                    // {
+  // Count the DIRECT items of this group (nested groups OR leaves), recording the largest count seen at
+  // this nesting level. For an ellipsis dimension "n TO ...", the level's item count is the deduced size:
+  // level 0 = outer group's items (dim 0), level 1 = a row's items (dim 1), etc. Uniform (rectangular)
+  // initializers give the same count at every group of a level; a jagged one keeps the widest.
+  ItemCount := 0;
   if not Context.Check(ttDelimBraceClose) then
     repeat
+      Inc(ItemCount);
       if Context.Check(ttDelimBraceOpen) then
         ParseArrayInitBraceGroup(InitList, DimSizes, Level + 1)  // nested row/plane -> flatten in place
       else if Context.Check(ttDelimParOpen) then
@@ -6828,6 +6852,12 @@ begin
       if Context.Check(ttSeparParam) then Context.Advance else Break;
     until Context.CheckAny([ttDelimBraceClose, ttEndOfLine, ttEndOfFile, ttSeparStmt]);
   if Context.Check(ttDelimBraceClose) then Context.Advance;   // }
+
+  // Record this level's item count (widest group wins) for ellipsis-dimension size deduction.
+  if Level > High(FInitLevelSizes) then
+    SetLength(FInitLevelSizes, Level + 1);
+  if ItemCount > FInitLevelSizes[Level] then
+    FInitLevelSizes[Level] := ItemCount;
 
   // Zero-pad a short NESTED group (a row/plane) to its stride so a jagged multi-dim initializer stays
   // row-aligned: FB fills each nested brace into one slot of its dimension and zero-fills the remainder.

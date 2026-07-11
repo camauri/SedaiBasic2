@@ -216,6 +216,7 @@ type
     FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
+    FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
     FArrayFuncPtrSig: TStringList;       // array-of-funcptr (DIM As <named funcptr type> a(..)) -> "params|ret" signature, so "a(i)(args)" is an indirect call
     FNeededDispatchers: TStringList;     // M4.3: "TYPE|METHOD" pairs needing a virtual dispatcher
     FDeclaredNames: TStringList;         // names introduced by an EXPLICIT declaration (DIM/VAR/STATIC/CONST,
@@ -690,6 +691,7 @@ begin
   FVarExplicitType := TStringList.Create;
   FVarExplicitType.CaseSensitive := False;
   FArrayRecordType := TStringList.Create;
+  FArrayScalarType := TStringList.Create;
   FArrayRecordType.CaseSensitive := False;
   FArrayFuncPtrSig := TStringList.Create;
   FArrayFuncPtrSig.CaseSensitive := False;
@@ -765,6 +767,7 @@ begin
   FVarRecordType.Free;
   FVarExplicitType.Free;
   FArrayRecordType.Free;
+  FArrayScalarType.Free;
   FArrayFuncPtrSig.Free;
   FNeededDispatchers.Free;
   FDeclaredNames.Free;
@@ -6240,6 +6243,31 @@ begin
   EmitInstruction(ssaArrayStore, ExprValue, ArrayRef, LinearIndex, MakeSSAValue(svkNone));
 end;
 
+function EllipsisLevelSize(const LevelSizesCsv: string; DimIdx, FlatTotal: Integer): Integer;
+// Return the initializer item count at brace-nesting level DimIdx from a "4,4"-style CSV (per-level
+// sizes recorded by the parser). Falls back to FlatTotal when the CSV is absent or too short (a 1-D
+// initializer, or an unexpectedly-shaped one), preserving the old flat-count behaviour.
+var
+  i, cur, seen: Integer;
+  ch: Char;
+begin
+  Result := FlatTotal;
+  if LevelSizesCsv = '' then Exit;
+  cur := 0; seen := 0;
+  for i := 1 to Length(LevelSizesCsv) do
+  begin
+    ch := LevelSizesCsv[i];
+    if ch = ',' then
+    begin
+      if seen = DimIdx then Exit(cur);
+      Inc(seen); cur := 0;
+    end
+    else if (ch >= '0') and (ch <= '9') then
+      cur := cur * 10 + (Ord(ch) - Ord('0'));
+  end;
+  if seen = DimIdx then Result := cur;   // last field
+end;
+
 procedure TSSAGenerator.ProcessDim(Node: TASTNode);
 var
   ArrName, DeclArrName: string;
@@ -6671,12 +6699,18 @@ begin
 
       if (DimChild.NodeType = antDimRange) and (DimChild.Attributes.Values['ELLIPSIS'] = '1') then
       begin
-        // FreeBASIC ellipsis "lb TO ...": the upper bound is deduced from the initializer element count
-        // (ub = lb + count - 1). An ellipsis bound requires an initializer list.
+        // FreeBASIC ellipsis "lb TO ...": the upper bound is deduced from the initializer (ub = lb + size
+        // - 1). For a MULTI-dim ellipsis the size of dimension i is the initializer's item count at brace-
+        // nesting level i (LEVELSIZES, set by the parser) -- e.g. "m(1 To ..., 1 To ...) = {{a,b},{c,d}}"
+        // is 2x2, not 4x4. A missing/short LEVELSIZES (a 1-D init) falls back to the flat element total.
         EllipCount := 0;
         for k := 0 to ArrayDeclNode.ChildCount - 1 do
           if ArrayDeclNode.GetChild(k).NodeType = antArgumentList then
-          begin EllipCount := ArrayDeclNode.GetChild(k).ChildCount; Break; end;
+          begin
+            EllipCount := EllipsisLevelSize(ArrayDeclNode.GetChild(k).Attributes.Values['LEVELSIZES'],
+                                            i, ArrayDeclNode.GetChild(k).ChildCount);
+            Break;
+          end;
         if EllipCount < 1 then
           raise Exception.CreateFmt('Ellipsis array bound "..." requires an initializer: %s', [ArrName]);
         DimValue := MakeSSAConstInt(LowerBounds[i] + EllipCount - 1);
@@ -7290,6 +7324,9 @@ begin
         begin
           ai := ArrayIndexOf(Nm);
           if ai >= 0 then Result := FProgram.GetArray(ai).ElementType
+          else if FArrayScalarType.IndexOfName(Nm) >= 0 then
+            // The array is not in FProgram yet (VAR type-inference pre-pass): use its recorded element type.
+            Result := TypeNameToBank(FArrayScalarType.Values[Nm], Nm)
           else Result := srtInt;
         end;
       end;
@@ -15285,7 +15322,12 @@ begin
       begin
         TypeName := UpperCase(VarToStr(Decl.GetChild(2).Value));
         if FindUDT(TypeName) >= 0 then
-          FArrayRecordType.Values[UpperCase(VarToStr(Decl.GetChild(0).Value))] := TypeName;
+          FArrayRecordType.Values[UpperCase(VarToStr(Decl.GetChild(0).Value))] := TypeName
+        else
+          // A scalar-element array ("Dim b(..) As Double"): record its element type so VAR type inference
+          // of an expression over its elements (e.g. "Var f = b(i)/b(j)") gets the right bank BEFORE the
+          // array is declared in FProgram -- otherwise the access reads as INTEGER and the value truncates.
+          FArrayScalarType.Values[UpperCase(VarToStr(Decl.GetChild(0).Value))] := TypeName;
       end;
     end;
     Exit;
