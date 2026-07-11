@@ -3693,10 +3693,19 @@ begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antEnd, Token);
   Context.Advance; // Consume END / SYSTEM
-  // FreeBASIC SYSTEM may carry an optional exit code (SYSTEM 0). We have no process exit-code channel,
-  // so it is parsed and discarded; SYSTEM otherwise behaves exactly like END. (END takes no argument.)
+  // FreeBASIC END and SYSTEM both carry an optional exit code ("End 1", "System 0"). We have no process
+  // exit-code channel, so it is parsed and discarded; both otherwise halt the program exactly the same.
+  // SYSTEM (FB-only) accepts any expression. For END, only consume a NUMERIC argument, and only in MODERN:
+  // this cannot mis-eat a block-ender's keyword ("End Sub") should one ever reach here, and CLASSIC v7 END
+  // is always standalone. Without this the exit code was left as a stray literal statement ("Unhandled node
+  // type 0" warning) and ignored anyway.
   if (UpperCase(Token.Value) = kSYSTEM) and
      (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse])) then
+  begin
+    ExitArg := ParseExpression;
+    if Assigned(ExitArg) then ExitArg.Free;
+  end
+  else if FModernMode and Context.CheckAny([ttNumber, ttInteger, ttFloat, ttOpSub, ttDelimParOpen]) then
   begin
     ExitArg := ParseExpression;
     if Assigned(ExitArg) then ExitArg.Free;
