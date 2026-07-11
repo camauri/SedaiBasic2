@@ -7036,7 +7036,22 @@ begin
   Token := Context.CurrentToken;
   // VAR / STATIC share the ttDataDeclaration token with DIM; route to their own parsers.
   if UpperCase(VarToStr(Token.Value)) = kVAR then Exit(ParseVarStatement);
-  if UpperCase(VarToStr(Token.Value)) = kSTATIC then Exit(ParseStaticStatement);
+  if UpperCase(VarToStr(Token.Value)) = kSTATIC then
+  begin
+    // FreeBASIC static member method definition: "Static Sub|Function Type.method(...)". The STATIC
+    // keyword marks the method as callable without an instance (through the type name — the call site
+    // supplies a dummy THIS, see TryStaticMethodCall). The body is an ordinary "Type.method" with an
+    // implicit THIS, so consume STATIC here and let ParseProcedureDecl parse the rest as usual. Any
+    // other "STATIC ..." is a persistent local variable declaration.
+    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) and
+       ((UpperCase(VarToStr(Context.PeekNext.Value)) = kSUB) or
+        (UpperCase(VarToStr(Context.PeekNext.Value)) = kFUNCTION)) then
+    begin
+      Context.Advance;                                 // consume STATIC
+      Exit(ParseProcedureDecl);
+    end;
+    Exit(ParseStaticStatement);
+  end;
   Result := TASTNode.Create(antDim, Token);
   Context.Advance; // Consume DIM
   LeadingTypeOfExpr := nil;   // set when the leading-AS type is "TypeOf(expr)" (inferred in the SSA pre-pass)
