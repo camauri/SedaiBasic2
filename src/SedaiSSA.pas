@@ -283,6 +283,7 @@ type
     procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer);
     function TypeNeedsRecordInit(UDTIdx: Integer): Boolean;   // has member arrays / nested-UDT fields?
     procedure EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer);  // init each of N records  // alloc nested records
+    procedure EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);  // per-element EmitRecordInit over a DIM'd array-of-UDT
     procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
                                   ArgsNode: TASTNode = nil);  // M4.4 (ArgsNode: M4.4b ctor args)
     // Anonymous temporary "TypeName(args)" as an expression -> allocate + construct; returns its handle.
@@ -6891,6 +6892,9 @@ begin
       EmitInstruction(ssaRecordNewArray, MakeSSAValue(svkNone),
                       MakeSSAArrayRef(ArrayIdx, srtInt), MakeSSAConstInt(RecPacked),
                       MakeSSAValue(svkNone));
+      // Each element record is flat; if the element type has member arrays / nested-UDT fields, give every
+      // element that per-instance backing too (else "arr(i).member(j)" hits a handle-0 array).
+      EmitRecordArrayInit(ArrayIdx, RecArrUDTIdx);
     end;
 
     // FreeBASIC array initializer "=> { v0, v1, ... }": store each value into element k (0-based flat
@@ -7145,6 +7149,9 @@ begin
                   or ((Int64(UdtIdx) and $FFFF) shl 48);
         EmitInstruction(ssaRecordNewArray, MakeSSAValue(svkNone),
                         MakeSSAArrayRef(ArrayIdx, srtInt), MakeSSAConstInt(RecPacked), MakeSSAValue(svkNone));
+        // Give the freshly-grown elements their member-array / nested-UDT backing too. The per-element
+        // guard skips any pre-existing (PRESERVE'd) element, so their data is untouched.
+        EmitRecordArrayInit(ArrayIdx, UdtIdx);
       end;
     end;
   end;
@@ -15705,6 +15712,118 @@ begin
                   EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
   EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   BodyBlock.AddSuccessor(CondBlock); CondBlock.AddPredecessor(BodyBlock);
+
+  FCurrentBlock := FProgram.CreateBlock(EndLabel);
+  EndBlock := FCurrentBlock;
+  CondBlock.AddSuccessor(EndBlock); EndBlock.AddPredecessor(CondBlock);
+end;
+
+procedure TSSAGenerator.EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);
+// After an array-of-UDT is dimensioned and its element records allocated (ssaRecordNewArray), give each
+// element the per-instance setup EmitRecordInit provides: member-array backing, nested-UDT field instances,
+// field defaults. RecordNewArrayInit only allocates each element's flat record -- without this an element's
+// member array (or nested-UDT field) keeps a handle-0 backing and "arr(i).member(j)" stores are lost /
+// reads return 0. A runtime loop over the flat element count loads each element's record handle (ssaArrayLoad
+// takes a flat 0-based index) and inits it, so it is dimension-agnostic (1-D and multi-dim) and works for
+// constant or runtime array sizes. Only for element types that actually need init.
+//
+// REDIM-safe: each element is inited only if its first member-array / nested-UDT slot is still 0 (a fresh
+// record zero-fills its int slots; a real backing handle is never 0). So a REDIM [PRESERVE] that grows the
+// array inits only the freshly-appended elements and leaves existing ones -- and their data -- untouched.
+var
+  ArrayRef, One, Acc, DimReg, Ub, Lb, Diff, Cnt, NewAcc: TSSAValue;
+  CmpReg, HandleVal, CounterVar, ProbeVal: TSSAValue;
+  d, DimCount, i, GuardSlot: Integer;
+  CounterName, CondLabel, BodyLabel, InitLabel, IncrLabel, EndLabel: string;
+  PrevBlock, CondBlock, BodyBlock, InitBlock, IncrBlock, EndBlock: TSSABasicBlock;
+begin
+  if not TypeNeedsRecordInit(UDTIdx) then Exit;
+
+  // Slot of the first field that EmitRecordInit populates (member array or nested UDT) -- used as the
+  // "already inited?" probe. TypeNeedsRecordInit is true, so one exists.
+  GuardSlot := -1;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if (FUDTs[UDTIdx].Fields[i].NestedType <> '') or
+       (FUDTs[UDTIdx].Fields[i].IsArray and (FUDTs[UDTIdx].Fields[i].ArrayBounds <> nil)) then
+    begin GuardSlot := FUDTs[UDTIdx].Fields[i].Slot; Break; end;
+  if GuardSlot < 0 then Exit;
+
+  ArrayRef := MakeSSAArrayRef(ArrayIdx, srtInt);
+  DimCount := FProgram.GetArray(ArrayIdx).DimCount;
+  if DimCount < 1 then DimCount := 1;
+
+  // Total (flat) element count = product over dims of (ubound - lbound + 1); mirrors EmitArrayLen. The
+  // bounds are read at runtime, so a runtime-sized array works too.
+  One := EnsureIntRegister(MakeSSAConstInt(1));
+  Acc := EnsureIntRegister(MakeSSAConstInt(1));
+  for d := 0 to DimCount - 1 do
+  begin
+    DimReg := EnsureIntRegister(MakeSSAConstInt(d));
+    Ub := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    Lb := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaArrayUBound, Ub, ArrayRef, DimReg, MakeSSAValue(svkNone));
+    EmitInstruction(ssaArrayLBound, Lb, ArrayRef, DimReg, MakeSSAValue(svkNone));
+    Diff := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, Diff, Ub, Lb, MakeSSAValue(svkNone));
+    Cnt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, Cnt, Diff, One, MakeSSAValue(svkNone));
+    NewAcc := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, NewAcc, Acc, Cnt, MakeSSAValue(svkNone));
+    Acc := NewAcc;
+  end;
+
+  // for counter = 0 to count-1: init the flat element at index counter (if not already inited). The counter
+  // is a real synthesized variable so the SSA gives it the loop PHI (as for a FOR counter).
+  CounterName := '__RECARRINIT%' + IntToStr(FScopeSerial);
+  Inc(FScopeSerial);
+  CounterVar := DeclareVariableTyped(CounterName, srtInt);
+  EmitInstruction(ssaLoadConstInt, CounterVar, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  CondLabel := GenerateUniqueLabel('recarr_cond');
+  BodyLabel := GenerateUniqueLabel('recarr_body');
+  InitLabel := GenerateUniqueLabel('recarr_init');
+  IncrLabel := GenerateUniqueLabel('recarr_incr');
+  EndLabel  := GenerateUniqueLabel('recarr_end');
+
+  PrevBlock := FCurrentBlock;
+  EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // cond: counter < count ?
+  FCurrentBlock := FProgram.CreateBlock(CondLabel);
+  CondBlock := FCurrentBlock;
+  if Assigned(PrevBlock) then begin PrevBlock.AddSuccessor(CondBlock); CondBlock.AddPredecessor(PrevBlock); end;
+  CmpReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpLtInt, CmpReg, EnsureIntRegister(GetOrAllocateVariable(CounterName)), Acc, MakeSSAValue(svkNone));
+  EmitInstruction(ssaJumpIfZero, MakeSSALabel(EndLabel), CmpReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // body: load element handle, probe the guard slot -- if already inited (probe <> 0) skip to incr.
+  FCurrentBlock := FProgram.CreateBlock(BodyLabel);
+  BodyBlock := FCurrentBlock;
+  CondBlock.AddSuccessor(BodyBlock); BodyBlock.AddPredecessor(CondBlock);
+  HandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaArrayLoad, HandleVal, ArrayRef,
+                  EnsureIntRegister(GetOrAllocateVariable(CounterName)), MakeSSAValue(svkNone));
+  ProbeVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRecordLoadInt, ProbeVal, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(GuardSlot));
+  EmitInstruction(ssaJumpIfZero, MakeSSALabel(InitLabel), ProbeVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EmitInstruction(ssaJump, MakeSSALabel(IncrLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // init: this element is fresh -- give it its member-array / nested-UDT backing.
+  FCurrentBlock := FProgram.CreateBlock(InitLabel);
+  InitBlock := FCurrentBlock;
+  BodyBlock.AddSuccessor(InitBlock); InitBlock.AddPredecessor(BodyBlock);
+  EmitRecordInit(HandleVal, UDTIdx);
+  EmitInstruction(ssaJump, MakeSSALabel(IncrLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // incr: counter += 1; loop.
+  FCurrentBlock := FProgram.CreateBlock(IncrLabel);
+  IncrBlock := FCurrentBlock;
+  BodyBlock.AddSuccessor(IncrBlock); IncrBlock.AddPredecessor(BodyBlock);
+  InitBlock.AddSuccessor(IncrBlock); IncrBlock.AddPredecessor(InitBlock);
+  EmitInstruction(ssaAddInt, GetOrAllocateVariable(CounterName),
+                  EnsureIntRegister(GetOrAllocateVariable(CounterName)),
+                  EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+  EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  IncrBlock.AddSuccessor(CondBlock); CondBlock.AddPredecessor(IncrBlock);
 
   FCurrentBlock := FProgram.CreateBlock(EndLabel);
   EndBlock := FCurrentBlock;
