@@ -294,6 +294,9 @@ type
     // (IEEE), it does not trap. Commodore v7 (CLASSIC) raises ?ILLEGAL QUANTITY. Shared by both run
     // loops so the two paths cannot diverge (opt == no-opt).
     function SqrtFloat(X: Double): Double;
+    // Dialect-aware natural log. MODERN (FreeBASIC) Log follows C log: Log(0) = -Inf, Log(negative)
+    // = NaN, no trap. CLASSIC (Commodore v7) raises ?ILLEGAL QUANTITY. Shared by both run loops.
+    function LnFloat(X: Double): Double;
     // File management operations (executed directly in VM)
     procedure ExecuteCopyFile(const Src, Dest: string; Overwrite: Boolean);
     procedure ExecuteScratch(const Pattern: string; Force: Boolean; Silent: Boolean = False);
@@ -5981,10 +5984,7 @@ begin
     3: // bcMathAtn
       Ctx.FloatRegs[Instr.Dest] := ArcTan(Ctx.FloatRegs[Instr.Src1]);
     4: // bcMathLog
-      if Ctx.FloatRegs[Instr.Src1] > 0 then
-        Ctx.FloatRegs[Instr.Dest] := Ln(Ctx.FloatRegs[Instr.Src1])
-      else
-        raise Exception.Create('LOG of non-positive number');
+      Ctx.FloatRegs[Instr.Dest] := LnFloat(Ctx.FloatRegs[Instr.Src1]);
     5: // bcMathExp
       Ctx.FloatRegs[Instr.Dest] := Exp(Ctx.FloatRegs[Instr.Src1]);
     6: // bcMathSqr
@@ -8986,6 +8986,21 @@ begin
   end
   else
     Result := Sqrt(X);
+end;
+
+function TBytecodeVM.LnFloat(X: Double): Double;
+begin
+  // MODERN (FreeBASIC): Log follows C log -- Log(0) = -Inf, Log(negative) = NaN, no trap. CLASSIC
+  // (Commodore v7): ?ILLEGAL QUANTITY. IEEE results come from Math-unit constants (plain assignments,
+  // no FP hardware trap). Shared by both run loops so bcMathLog cannot diverge (opt == no-opt).
+  if X > 0.0 then
+    Result := Ln(X)
+  else if Assigned(FProgram) and FProgram.ModernMode then
+  begin
+    if X = 0.0 then Result := NegInfinity else Result := NaN;
+  end
+  else
+    raise Exception.Create('LOG of non-positive number');
 end;
 
 procedure TBytecodeVM.RaiseFileError(const FBMsg: string; FBCode: Integer; const CBMMsg: string; CBMCode: Integer);

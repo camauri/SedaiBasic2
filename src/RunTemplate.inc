@@ -572,7 +572,7 @@ begin
         bcMathCos: begin FloatRegs[Instr.Dest] := Cos(FloatRegs[Instr.Src1]); Inc(CurPC); end;
         bcMathTan: begin FloatRegs[Instr.Dest] := Tan(FloatRegs[Instr.Src1]); Inc(CurPC); end;
         bcMathExp: begin FloatRegs[Instr.Dest] := Exp(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathLog: begin FloatRegs[Instr.Dest] := Ln(FloatRegs[Instr.Src1]); Inc(CurPC); end;
+        bcMathLog: begin FloatRegs[Instr.Dest] := LnFloat(FloatRegs[Instr.Src1]); Inc(CurPC); end;
         bcMathRnd: begin FloatRegs[Instr.Dest] := Random; Inc(CurPC); end;
         bcMathAtn: begin FloatRegs[Instr.Dest] := ArcTan(FloatRegs[Instr.Src1]); Inc(CurPC); end;
 
