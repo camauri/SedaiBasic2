@@ -71,6 +71,9 @@ type
     Slot: Integer;          // index within that bank's slot array of the instance
     NestedType: string;     // UDT type name if this field is itself a record (else ''); held as an int handle
     PtrPointee: string;     // pointee UDT type if this field is a "T PTR" (else ''); held as an int handle
+    RawPtrPointee: string;  // scalar pointee type if this field is a "<scalar> PTR" (e.g. "DOUBLE" for a
+                            // "Double Ptr" field, else ''): a raw byte-heap pointer, so "obj.field[i]" /
+                            // "*obj.field" / "@obj.field[i]" index and deref onto the raw heap, SizeOf-scaled
     WidthCode: Integer;     // B1.5: narrow width code for a sub-64-bit/SINGLE field (0 = full width)
     IsWString: Boolean;     // WSTRING field: srtString storage (UTF-8) but LEN/MID count by codepoint
     IsArray: Boolean;       // array member (e.g. "Dim As Double m(Any, Any)"): the int slot holds an FArrays handle
@@ -347,9 +350,12 @@ type
     function IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;           // Node = ALLOCATE/CALLOCATE/REALLOCATE(...)?
     function IsScreenPtrExpr(Node: TASTNode): Boolean;                          // Node = SCREENPTR / SCREENPTR()?
     function RawPtrExprName(Node: TASTNode): string;                            // raw pointer var of a raw ptr expr (p, p±n), else ''
+    function RawPtrExprPointee(Node: TASTNode): string;                         // scalar pointee of a raw FIELD ptr expr (obj.field, @obj.field[i]), else ''
     procedure EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);           // p±n raw pointer arithmetic (SizeOf-scaled)
     function RawTypeCodeOf(const PtrName: string): Integer;                      // raw element type code for *p / p[i]
+    function RawTypeCodeOfPointee(const PointeeType: string): Integer;           // raw element type code for a given scalar pointee
     function RawElemSizeOf(const PtrName: string): Int64;                        // SizeOf(pointee) in bytes
+    function RawElemSizeOfPointee(const PointeeType: string): Int64;             // SizeOf(scalar pointee) in bytes
     function TypeSizeBytes(const TypeName: string): Int64;                       // SizeOf(T) in bytes (FB sizes)
     procedure EmitRawAlloc(CallNode: TASTNode; out Result: TSSAValue);           // ALLOCATE/CALLOCATE/REALLOCATE → raw ptr
     procedure EmitRawMemOp(const FuncU: string; ArgsNode: TASTNode; out Result: TSSAValue);  // FB_MEMCOPY/FB_MEMMOVE/CLEAR/FB_MEMCOPYCLEAR
@@ -357,6 +363,8 @@ type
     function AddrLocalBank(const Name: string): TSSARegisterType;               // bank of an @-taken local
     function AddrLocalHandle(const Name: string): TSSAValue;                    // its per-frame record handle (hidden var)
     function UDTFieldPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT of a "T PTR" field, else ''
+    function UDTFieldRawPtrPointee(UDTIdx: Integer; const FieldName: string): string; // scalar pointee of a "<scalar> PTR" field, else ''
+    function MemberRawPtrPointee(Node: TASTNode): string;                          // "obj.field" raw scalar pointer -> pointee type, else ''
     function UDTFieldIsWString(UDTIdx: Integer; const FieldName: string): Boolean;  // field declared AS WSTRING?
     function DerefedType(Node: TASTNode): string;                               // FB type of *<expr> (multi-level aware)
     function DerefOperandBank(Node: TASTNode): TSSARegisterType;                // bank of *<expr> incl. pointer arithmetic (p+n)
@@ -365,6 +373,7 @@ type
     procedure EmitNewObject(Node: TASTNode; out Result: TSSAValue);             // NEW T [(args)] → heap record handle
     procedure EmitDeleteObject(Node: TASTNode);                                 // DELETE p → run destructor on the pointee
     function EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue; // p[i] → address (p + i)
+    function EmitRawFieldIndexAddress(MemberNode, IndicesNode: TASTNode; const PointeeType: string): TSSAValue; // obj.field[i] → raw address
     function EmitVarAddress(const Name: string): TSSAValue;                     // packed address of a backed scalar (0=NULL)
     function IsByrefRetFunc(const Name: string): Boolean;                       // FUNCTION declared BYREF AS T?
     function ByrefRetPointeeBank(const Name: string): TSSARegisterType;         // bank of a byref function's pointee
@@ -1380,6 +1389,26 @@ begin
       begin
         ProcessExpression(Node.GetChild(0), Left);
         Result := EnsureIntRegister(Left);
+        Exit;
+      end;
+      // *obj.field / *(@obj.field[i]) where the field is a raw "<scalar> PTR": load SizeOf(pointee) bytes
+      // from the raw heap at the field's address value. Type-based (a field has no pointer name, so the
+      // name-based RawPtrExprName below cannot resolve it).
+      TempStr := RawPtrExprPointee(Node.GetChild(0));
+      if TempStr <> '' then
+      begin
+        ProcessExpression(Node.GetChild(0), Left);   // field value / @field[i] address = raw byte address
+        Left := EnsureIntRegister(Left);
+        if (TempStr = 'SINGLE') or (TempStr = 'DOUBLE') then
+        begin
+          Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+          EmitInstruction(ssaRawLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(TempStr)));
+        end
+        else
+        begin
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaRawLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(TempStr)));
+        end;
         Exit;
       end;
       // *p / *(p±n) where p is a RAW (Allocate'd) pointer: load SizeOf(pointee) bytes from the raw heap.
@@ -4156,6 +4185,29 @@ begin
           Exit;
         end;
 
+        // obj.field[i] where obj.field is a raw "<scalar> PTR" field: index onto the raw byte heap.
+        // Address = (field value) + i*SizeOf(pointee); load the pointee (float for SINGLE/DOUBLE, else int).
+        if (Node.GetChild(0).NodeType = antMemberAccess) and
+           (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
+        begin
+          TempStr := MemberRawPtrPointee(Node.GetChild(0));
+          if TempStr <> '' then
+          begin
+            Left := EmitRawFieldIndexAddress(Node.GetChild(0), Node.GetChild(1), TempStr);
+            if (TempStr = 'SINGLE') or (TempStr = 'DOUBLE') then
+            begin
+              Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+              EmitInstruction(ssaRawLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(TempStr)));
+            end
+            else
+            begin
+              Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaRawLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(TempStr)));
+            end;
+            Exit;
+          end;
+        end;
+
         // Method call obj.method(args) (M4.1): child0 is a member access whose field is a
         // method of the object's type. Pass the object as the implicit THIS argument.
         if Node.GetChild(0).NodeType = antMemberAccess then
@@ -5112,7 +5164,7 @@ end;
 procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
 var
   VarNode, ExprNode, SharedAssign: TASTNode;
-  VarName, LhsRecType, RhsRecType, AllocFuncU: string;
+  VarName, LhsRecType, RhsRecType, AllocFuncU, RawFieldPointee: string;
   ExprValue, VarReg, SrcRecHandle: TSSAValue;
   CopyOp: TSSAOpCode;
   DerefBank: TSSARegisterType;   // FreeBASIC "*p = expr": bank of the pointee
@@ -5149,6 +5201,28 @@ begin
      TryImplicitThisField(VarToStr(VarNode.Value), VarNode.Token, SharedAssign) then
   begin
     try ProcessMemberStore(SharedAssign, ExprNode); finally SharedAssign.Free; end;
+    Exit;
+  end;
+
+  // FreeBASIC RAW pointer-deref store through a FIELD: "*obj.field = expr" / "*(@obj.field[i]) = expr"
+  // where the field is a raw "<scalar> PTR". Store SizeOf(pointee) bytes to the raw heap. Type-based (a
+  // field has no pointer name, so the name-based RawPtrExprName branch below cannot resolve it).
+  if (VarNode.NodeType = antDeref) and (RawPtrExprPointee(VarNode.GetChild(0)) <> '') then
+  begin
+    RawFieldPointee := RawPtrExprPointee(VarNode.GetChild(0));
+    ProcessExpression(VarNode.GetChild(0), VarReg);
+    VarReg := EnsureIntRegister(VarReg);
+    ProcessExpression(ExprNode, ExprValue);
+    if (RawFieldPointee = 'SINGLE') or (RawFieldPointee = 'DOUBLE') then
+    begin
+      ExprValue := EnsureFloatRegister(ExprValue);
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
+    end
+    else
+    begin
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
+    end;
     Exit;
   end;
 
@@ -5228,6 +5302,29 @@ begin
     else
       ExprValue := EnsureIntRegister(ExprValue);
       EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+    end;
+    Exit;
+  end;
+
+  // FreeBASIC RAW pointer FIELD indexing as an lvalue: "obj.field[i] = expr" where obj.field is a
+  // "<scalar> PTR" field. Store SizeOf(pointee) bytes at (field value) + i*SizeOf(pointee) on the raw heap.
+  if (VarNode.NodeType = antArrayAccess) and (VarNode.ChildCount >= 2) and
+     (VarNode.GetChild(0).NodeType = antMemberAccess) and
+     (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) and
+     (MemberRawPtrPointee(VarNode.GetChild(0)) <> '') then
+  begin
+    RawFieldPointee := MemberRawPtrPointee(VarNode.GetChild(0));
+    VarReg := EmitRawFieldIndexAddress(VarNode.GetChild(0), VarNode.GetChild(1), RawFieldPointee);
+    ProcessExpression(ExprNode, ExprValue);
+    if (RawFieldPointee = 'SINGLE') or (RawFieldPointee = 'DOUBLE') then
+    begin
+      ExprValue := EnsureFloatRegister(ExprValue);
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
+    end
+    else
+    begin
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
     end;
     Exit;
   end;
@@ -14472,6 +14569,40 @@ begin
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].PtrPointee);
 end;
 
+function TSSAGenerator.UDTFieldRawPtrPointee(UDTIdx: Integer; const FieldName: string): string;
+// The scalar pointee type of a "<scalar> PTR" field (a raw byte-heap pointer), or '' — drives raw
+// indexing/deref of "obj.field" (obj.field[i], *obj.field, @obj.field[i]).
+var
+  i: Integer;
+  F: string;
+begin
+  Result := '';
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].RawPtrPointee);
+end;
+
+function TSSAGenerator.MemberRawPtrPointee(Node: TASTNode): string;
+// If Node is a member access "obj.field" whose field is a raw scalar pointer ("<scalar> PTR"), return the
+// scalar pointee type (e.g. "DOUBLE"), else ''. Resolves obj's UDT type via ObjectTypeName so it works for
+// a local/param/global record and a nested "a.b.field".
+var
+  UDTName, FieldName: string;
+  UDTIdx: Integer;
+begin
+  Result := '';
+  if (Node = nil) or (Node.NodeType <> antMemberAccess) or (Node.ChildCount < 1) then Exit;
+  // antMemberAccess carries the field name in its Value; child0 is the object expression.
+  FieldName := UpperCase(VarToStr(Node.Value));
+  if FieldName = '' then Exit;
+  UDTName := ObjectTypeName(Node.GetChild(0));
+  if UDTName = '' then Exit;
+  UDTIdx := FindUDT(UDTName);
+  if UDTIdx < 0 then Exit;
+  Result := UDTFieldRawPtrPointee(UDTIdx, FieldName);
+end;
+
 function TSSAGenerator.UDTFieldIsWString(UDTIdx: Integer; const FieldName: string): Boolean;
 // True if the named field is declared AS WSTRING (so obj.field LEN/MID index by codepoint).
 var
@@ -14591,6 +14722,7 @@ var
   Bank, ArrElemBank: TSSARegisterType;
   cInt, cFloat, cStr, ArrDims: Integer;
   TypeName, FieldName, NestedT, PtrPointeeT, ArrElemType, FuncPtrSigVal: string;
+  RawPtrPointeeT, PointeeScalarT: string;
   IsArrayField: Boolean;
 begin
   if (Idx < 0) or (Idx > High(FUDTs)) then Exit;
@@ -14630,6 +14762,7 @@ begin
       if Assigned(TypeNode) then TypeName := UpperCase(VarToStr(TypeNode.Value));
       NestedT := '';
       PtrPointeeT := '';
+      RawPtrPointeeT := '';
       if (TypeName <> '') and (FindUDT(TypeName) >= 0) then
       begin
         Bank := srtInt;        // nested record field: int handle to the nested instance
@@ -14639,10 +14772,17 @@ begin
       begin
         Bank := TypeNameToBank(TypeName, FieldName);
         // A "T PTR" field where T is a UDT holds an int handle to a heap record. Record the pointee so
-        // chained pointer-field access (p->nxt->val) and p->ptrfield-> resolve correctly.
-        if (Length(TypeName) > 4) and (Copy(TypeName, Length(TypeName) - 3, 4) = ' PTR') and
-           (FindUDT(Trim(Copy(TypeName, 1, Length(TypeName) - 4))) >= 0) then
-          PtrPointeeT := Trim(Copy(TypeName, 1, Length(TypeName) - 4));
+        // chained pointer-field access (p->nxt->val) and p->ptrfield-> resolve correctly. A "T PTR" field
+        // where T is a SCALAR (Double Ptr, Integer Ptr, ...) instead holds a raw byte-heap address, so
+        // record its scalar pointee to drive raw indexing/deref of "obj.field".
+        if (Length(TypeName) > 4) and (Copy(TypeName, Length(TypeName) - 3, 4) = ' PTR') then
+        begin
+          PointeeScalarT := Trim(Copy(TypeName, 1, Length(TypeName) - 4));
+          if FindUDT(PointeeScalarT) >= 0 then
+            PtrPointeeT := PointeeScalarT
+          else if (Pos(' PTR', PointeeScalarT) = 0) then   // single-level scalar pointer only
+            RawPtrPointeeT := PointeeScalarT;
+        end;
       end
       else
         Bank := GetVariableType(FieldName);
@@ -14653,12 +14793,12 @@ begin
       if FieldNode.Attributes.Values['FUNCPTR'] = '1' then
       begin
         FuncPtrSigVal := FieldNode.Attributes.Values['FPPARAMS'] + '|' + FieldNode.Attributes.Values['FPRET'];
-        Bank := srtInt; NestedT := ''; PtrPointeeT := '';
+        Bank := srtInt; NestedT := ''; PtrPointeeT := ''; RawPtrPointeeT := '';
       end
       else if (TypeName <> '') and (FFuncPtrTypes.IndexOfName(TypeName) >= 0) then
       begin
         FuncPtrSigVal := FFuncPtrTypes.Values[TypeName];
-        Bank := srtInt; NestedT := ''; PtrPointeeT := '';
+        Bank := srtInt; NestedT := ''; PtrPointeeT := ''; RawPtrPointeeT := '';
       end;
       // Array member (e.g. "Dim As Double m(Any, Any)"): the field itself is an int handle into the
       // global FArrays table (allocated per instance on REDIM); the element bank comes from the type.
@@ -14676,6 +14816,7 @@ begin
         Bank := srtInt;      // the field slot holds the FArrays handle
         NestedT := '';       // not a nested record (the field itself is the array handle)
         PtrPointeeT := '';
+        RawPtrPointeeT := '';
       end;
       n := Length(FUDTs[Idx].Fields);
       SetLength(FUDTs[Idx].Fields, n + 1);
@@ -14690,6 +14831,7 @@ begin
          (FieldNode.ChildCount >= 2) then
         FUDTs[Idx].Fields[n].DefaultExpr := FieldNode.GetChild(FieldNode.ChildCount - 1);
       FUDTs[Idx].Fields[n].PtrPointee := PtrPointeeT;
+      FUDTs[Idx].Fields[n].RawPtrPointee := RawPtrPointeeT;
       FUDTs[Idx].Fields[n].IsArray := IsArrayField;
       FUDTs[Idx].Fields[n].ArrayElemBank := ArrElemBank;
       FUDTs[Idx].Fields[n].ArrayElemType := ArrElemType;
@@ -16678,12 +16820,30 @@ begin
     Result := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
 end;
 
-function TSSAGenerator.RawTypeCodeOf(const PtrName: string): Integer;
-// Raw element type code for *p / p[i], from the pointer's declared pointee type.
+function TSSAGenerator.RawPtrExprPointee(Node: TASTNode): string;
+// Scalar pointee type of a raw pointer expression whose raw-ness comes from a UDT FIELD (which has no
+// pointer variable name): "obj.field" itself, or "@obj.field[i]". Returns e.g. "DOUBLE", else ''. Used to
+// drive a raw deref by TYPE where RawPtrExprName (name-based) cannot help. Var/arith forms (p, p±n, @p[i])
+// keep going through RawPtrExprName.
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do
+    Node := Node.GetChild(0);
+  if Node.NodeType = antMemberAccess then
+    Result := MemberRawPtrPointee(Node)
+  else if (Node.NodeType = antProcAddress) and (Node.ChildCount >= 1) and
+          (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
+          (Node.GetChild(0).GetChild(0).NodeType = antMemberAccess) then
+    Result := MemberRawPtrPointee(Node.GetChild(0).GetChild(0));
+end;
+
+function TSSAGenerator.RawTypeCodeOfPointee(const PointeeType: string): Integer;
+// Raw element type code for a raw pointer with the given (scalar) pointee type.
 var
   T: string;
 begin
-  T := UpperCase(FPointerVars.Values[UpperCase(PtrName)]);
+  T := UpperCase(PointeeType);
   if (T = 'BYTE') or (T = 'UBYTE') then Result := RTC_I8
   else if (T = 'SHORT') or (T = 'USHORT') then Result := RTC_I16
   else if (T = 'LONG') or (T = 'ULONG') then Result := RTC_I32
@@ -16692,16 +16852,28 @@ begin
   else Result := RTC_I64;   // INTEGER/LONGINT/UINTEGER/ULONGINT (our INTEGER is 64-bit)
 end;
 
-function TSSAGenerator.RawElemSizeOf(const PtrName: string): Int64;
+function TSSAGenerator.RawTypeCodeOf(const PtrName: string): Integer;
+// Raw element type code for *p / p[i], from the pointer's declared pointee type.
+begin
+  Result := RawTypeCodeOfPointee(FPointerVars.Values[UpperCase(PtrName)]);
+end;
+
+function TSSAGenerator.RawElemSizeOfPointee(const PointeeType: string): Int64;
 // SizeOf(pointee) in bytes — scales raw pointer arithmetic and p[i] indexing.
 begin
-  case RawTypeCodeOf(PtrName) of
+  case RawTypeCodeOfPointee(PointeeType) of
     RTC_I8: Result := 1;
     RTC_I16: Result := 2;
     RTC_I32, RTC_SINGLE: Result := 4;
   else
     Result := 8;   // I64 / DOUBLE
   end;
+end;
+
+function TSSAGenerator.RawElemSizeOf(const PtrName: string): Int64;
+// SizeOf(pointee) in bytes — scales raw pointer arithmetic and p[i] indexing.
+begin
+  Result := RawElemSizeOfPointee(FPointerVars.Values[UpperCase(PtrName)]);
 end;
 
 function TSSAGenerator.TypeSizeBytes(const TypeName: string): Int64;
@@ -17225,7 +17397,21 @@ var
   Indices: array of TSSAValue;
   LinearIndex, TempVal, AddResult, StrideVal, MulResult, BaseVal: TSSAValue;
   TempReg, Stride: Integer;
+  RawFieldPointee: string;
 begin
+  // @obj.field[i] where obj.field is a raw "<scalar> PTR" field: FreeBASIC "@field[i]" ≡ "field + i", the
+  // SizeOf-scaled byte address a "field[i]" deref computes. Return it directly (child0 is a member access,
+  // not a declared-array identifier, so the name-based path below would fail).
+  if (Node.GetChild(0).NodeType = antMemberAccess) and
+     (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
+  begin
+    RawFieldPointee := MemberRawPtrPointee(Node.GetChild(0));
+    if RawFieldPointee <> '' then
+    begin
+      Result := EmitRawFieldIndexAddress(Node.GetChild(0), Node.GetChild(1), RawFieldPointee);
+      Exit;
+    end;
+  end;
   ArrName := VarToStr(Node.GetChild(0).Value);
   ArrayIdx := ArrayIndexOf(ArrName);
   if ArrayIdx < 0 then
@@ -17413,6 +17599,31 @@ begin
   end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaAddInt, Result, PtrReg, IdxVal, MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.EmitRawFieldIndexAddress(MemberNode, IndicesNode: TASTNode; const PointeeType: string): TSSAValue;
+// obj.field[i] where obj.field is a raw "<scalar> PTR" field: the byte address (field value) + i*SizeOf
+// (pointee). MemberNode is the "obj.field" member access (its int value is the raw heap address); the
+// index is scaled by the pointee width — like EmitPointerIndexAddress but the base is a field, not a var.
+var
+  BaseVal, IdxVal, SzVal, ScaledIdx: TSSAValue;
+  Sz: Int64;
+begin
+  ProcessExpression(MemberNode, BaseVal);            // field value = raw byte address
+  BaseVal := EnsureIntRegister(BaseVal);
+  ProcessExpression(IndicesNode.GetChild(0), IdxVal);
+  IdxVal := EnsureIntRegister(IdxVal);
+  Sz := RawElemSizeOfPointee(PointeeType);
+  if Sz > 1 then
+  begin
+    SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, SzVal, MakeSSAConstInt(Sz), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    ScaledIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, ScaledIdx, IdxVal, SzVal, MakeSSAValue(svkNone));
+    IdxVal := ScaledIdx;
+  end;
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Result, BaseVal, IdxVal, MakeSSAValue(svkNone));
 end;
 
 function TSSAGenerator.EmitVarAddress(const Name: string): TSSAValue;
