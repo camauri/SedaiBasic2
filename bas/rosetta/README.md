@@ -163,6 +163,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `define_a_primitive_data_type.bas` | <https://rosettacode.org/wiki/Define_a_primitive_data_type> |
 | `cartesian_product_of_two_or_more_lists.bas` | <https://rosettacode.org/wiki/Cartesian_product_of_two_or_more_lists> |
 | `qr_decomposition.bas` | <https://rosettacode.org/wiki/QR_decomposition> |
+| `call_an_object_method.bas` | <https://rosettacode.org/wiki/Call_an_object_method> |
 
 ## Running
 
