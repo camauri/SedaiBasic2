@@ -724,6 +724,7 @@ var
   ArrInfo: TSSAArrayInfo;
   NewDimRegs: array of Integer;
   NewDimRegTypes: array of TSSARegisterType;
+  NewLbRegs: array of Integer;
   VarIndex: TFPHashList;
 
   function RewriteValueBASIC(const Val: TSSAValue): TSSAValue;
@@ -805,6 +806,20 @@ begin
         end;
 
         FProgram.SetArrayDimRegisters(i, NewDimRegs, NewDimRegTypes);
+      end;
+
+      // Rewrite runtime lower-bound registers the same way (they are all int registers).
+      if Length(ArrInfo.LowerBoundRegisters) > 0 then
+      begin
+        SetLength(NewLbRegs, Length(ArrInfo.LowerBoundRegisters));
+        for d := 0 to High(ArrInfo.LowerBoundRegisters) do
+        begin
+          if ArrInfo.LowerBoundRegisters[d] >= 0 then
+            NewLbRegs[d] := RewriteDimRegister(ArrInfo.LowerBoundRegisters[d], srtInt)
+          else
+            NewLbRegs[d] := ArrInfo.LowerBoundRegisters[d];
+        end;
+        FProgram.SetArrayLowerBoundRegisters(i, NewLbRegs);
       end;
     end;
   finally

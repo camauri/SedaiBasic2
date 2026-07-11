@@ -6255,6 +6255,10 @@ var
   DimValues: array of TSSAValue;  // Store dimension values (registers or constants)
   DimRegs: array of Integer;      // Register indices for variable dimensions
   DimRegTypes: array of TSSARegisterType;  // Register types for variable dimensions
+  LowerBoundRegs: array of Integer;   // int reg holding a RUNTIME lower bound per dim (-1 = constant)
+  LbRegVals: array of TSSAValue;      // the lb register SSAValues (attached to ssaArrayDim for DCE)
+  HasVariableLb: Boolean;
+  UbReg: TSSAValue;
   ArrayRef: TSSAValue;
   TotalElements: Int64;
   HasVariableDims: Boolean;
@@ -6619,7 +6623,11 @@ begin
     SetLength(Dimensions, DimCount);
     SetLength(DimValues, DimCount);
     SetLength(LowerBounds, DimCount);
+    SetLength(LowerBoundRegs, DimCount);
+    SetLength(LbRegVals, DimCount);
+    for i := 0 to DimCount - 1 do LowerBoundRegs[i] := -1;
     HasLowerBounds := False;
+    HasVariableLb := False;
     TotalElements := 1;
 
     for i := 0 to DimCount - 1 do
@@ -6641,6 +6649,18 @@ begin
           LowerBounds[i] := Integer(LbVal.ConstInt)
         else if LbVal.Kind = svkConstFloat then
           LowerBounds[i] := Integer(Trunc(LbVal.ConstFloat))
+        else if LbVal.Kind = svkRegister then
+        begin
+          // FreeBASIC runtime lower bound, e.g. "Dim a(Lbound(m) To Ubound(m))" where m is a parameter
+          // array (its bounds are not known until run time). Keep the register: the VM computes the
+          // dimension size ub - lb + 1 and records the actual lb for LBOUND/index adjustment. The upper
+          // bound is forced into a register below so both are available at bcArrayDim.
+          LbVal := EnsureIntRegister(LbVal);
+          LowerBoundRegs[i] := LbVal.RegIndex;
+          LbRegVals[i] := LbVal;
+          LowerBounds[i] := 0;
+          HasVariableLb := True;
+        end
         else
           raise Exception.CreateFmt('Array lower bound must be a constant: %s', [ArrName]);
         if LowerBounds[i] <> 0 then HasLowerBounds := True;
@@ -6665,6 +6685,19 @@ begin
         DimValue := MakeSSAConstInt(FoldedBound)   // Ubound(otherarray, d) as an upper bound
       else
         ProcessExpression(DimExpr, DimValue);
+
+      // A runtime lower bound makes the size (ub - lb + 1) a run-time quantity, so the upper bound must
+      // also reach the VM in a register even when it is a compile-time constant. Materialize it and route
+      // this dimension through the variable-dimension path (DimValue is a register -> Dimensions[i] = 0).
+      if (LowerBoundRegs[i] >= 0) and (DimValue.Kind <> svkRegister) then
+      begin
+        UbReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        if DimValue.Kind = svkConstFloat then
+          EmitInstruction(ssaLoadConstInt, UbReg, MakeSSAConstInt(Trunc(DimValue.ConstFloat)), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else
+          EmitInstruction(ssaLoadConstInt, UbReg, MakeSSAConstInt(DimValue.ConstInt), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        DimValue := UbReg;
+      end;
 
       // Store dimension value for VM (needed for variable dimensions)
       DimValues[i] := DimValue;
@@ -6752,6 +6785,10 @@ begin
     if HasVariableDims then
       FProgram.SetArrayDimRegisters(ArrayIdx, DimRegs, DimRegTypes);
 
+    // Record any RUNTIME lower-bound registers (parallel to DimRegisters).
+    if HasVariableLb then
+      FProgram.SetArrayLowerBoundRegisters(ArrayIdx, LowerBoundRegs);
+
     // Emit ssaArrayDim instruction
     // Dest = not used
     // Src1 = array reference (contains metadata index)
@@ -6770,8 +6807,10 @@ begin
       DimInstr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
       VarDimCount := 0;
       for i := 0 to DimCount - 1 do
-        if DimValues[i].Kind = svkRegister then
-          Inc(VarDimCount);
+      begin
+        if DimValues[i].Kind = svkRegister then Inc(VarDimCount);
+        if LowerBoundRegs[i] >= 0 then Inc(VarDimCount);   // runtime lb register is also a dependency
+      end;
       SetLength(DimInstr.PhiSources, VarDimCount);
       VarDimCount := 0;
       for i := 0 to DimCount - 1 do
@@ -6779,6 +6818,12 @@ begin
         if DimValues[i].Kind = svkRegister then
         begin
           DimInstr.PhiSources[VarDimCount].Value := DimValues[i];
+          DimInstr.PhiSources[VarDimCount].FromBlock := nil;
+          Inc(VarDimCount);
+        end;
+        if LowerBoundRegs[i] >= 0 then
+        begin
+          DimInstr.PhiSources[VarDimCount].Value := LbRegVals[i];
           DimInstr.PhiSources[VarDimCount].FromBlock := nil;
           Inc(VarDimCount);
         end;
@@ -17279,10 +17324,21 @@ end;
 
 function TSSAGenerator.UsesRuntimeLBound(ArrayIdx: Integer; const ArrName: string): Boolean;
 // An element access subtracts the RUNTIME lower bound (bcArrayLBound) when the array's lower bound is not
-// fixed at compile time: an array PARAMETER (aliases the caller's array) or a DYNAMIC array (its bound can
-// change via REDIM). A plain fixed "DIM a(lb TO ub)" keeps the fast compile-time constant subtraction.
+// fixed at compile time: an array PARAMETER (aliases the caller's array), a DYNAMIC array (its bound can
+// change via REDIM), or a "DIM a(Lbound(m) To Ubound(m))" whose lower bound is a runtime value. A plain
+// fixed "DIM a(lb TO ub)" with a constant lb keeps the fast compile-time constant subtraction.
+var
+  Info: TSSAArrayInfo;
+  d: Integer;
 begin
   Result := IsArrayParamSlot(ArrayIdx) or (FDynamicArrays.IndexOf(UpperCase(ArrName)) >= 0);
+  if Result then Exit;
+  if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) then
+  begin
+    Info := FProgram.GetArray(ArrayIdx);
+    for d := 0 to High(Info.LowerBoundRegisters) do
+      if Info.LowerBoundRegisters[d] >= 0 then Exit(True);
+  end;
 end;
 
 function TSSAGenerator.EmitArrayLinearIndex(const Indices: array of TSSAValue;

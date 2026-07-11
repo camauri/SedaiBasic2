@@ -814,13 +814,21 @@ begin
             FArrays[ArrayIdx].ElementType := Byte(ArrInfo.ElementType);
             FArrays[ArrayIdx].DimCount := ArrInfo.DimCount;
             SetLength(FArrays[ArrayIdx].Dimensions, ArrInfo.DimCount);
+            SetLength(FArrays[ArrayIdx].LowerBounds, ArrInfo.DimCount);
             for i := 0 to ArrInfo.DimCount - 1 do
             begin
+              // Effective lower bound: a RUNTIME lb register (FreeBASIC "Lbound(m) To Ubound(m)")
+              // overrides the compile-time constant; recorded for LBOUND/UBOUND and index adjustment.
+              ArrLowerBound := 0;
+              if (i < Length(ArrInfo.LowerBoundRegisters)) and (ArrInfo.LowerBoundRegisters[i] >= 0) then
+                ArrLowerBound := IntRegs[ArrInfo.LowerBoundRegisters[i]]
+              else if i <= High(ArrInfo.LowerBounds) then
+                ArrLowerBound := ArrInfo.LowerBounds[i];
+              FArrays[ArrayIdx].LowerBounds[i] := ArrLowerBound;
+
               if ArrInfo.Dimensions[i] = 0 then
               begin
-                // Variable upper bound: size = ub - lb + 1 (FreeBASIC explicit lower bound, 0 if none).
-                ArrLowerBound := 0;
-                if i <= High(ArrInfo.LowerBounds) then ArrLowerBound := ArrInfo.LowerBounds[i];
+                // Variable upper bound: size = ub - lb + 1.
                 case ArrInfo.DimRegTypes[i] of
                   srtInt: FArrays[ArrayIdx].Dimensions[i] := IntRegs[ArrInfo.DimRegisters[i]] - ArrLowerBound + 1;
                   srtFloat: FArrays[ArrayIdx].Dimensions[i] := Trunc(FloatRegs[ArrInfo.DimRegisters[i]]) - ArrLowerBound + 1;
@@ -829,13 +837,6 @@ begin
               else
                 FArrays[ArrayIdx].Dimensions[i] := ArrInfo.Dimensions[i];
             end;
-            // Record per-dimension lower bounds for LBOUND/UBOUND (B1.4); default 0.
-            SetLength(FArrays[ArrayIdx].LowerBounds, ArrInfo.DimCount);
-            for i := 0 to ArrInfo.DimCount - 1 do
-              if i <= High(ArrInfo.LowerBounds) then
-                FArrays[ArrayIdx].LowerBounds[i] := ArrInfo.LowerBounds[i]
-              else
-                FArrays[ArrayIdx].LowerBounds[i] := 0;
             ProdDims := 1;
             for i := 0 to ArrInfo.DimCount - 1 do
               ProdDims := ProdDims * FArrays[ArrayIdx].Dimensions[i];

@@ -508,6 +508,7 @@ type
     DimRegisters: array of Integer;     // SSA register indices for variable dimensions
     DimRegTypes: array of TSSARegisterType; // Register types for variable dimensions
     LowerBounds: array of Integer;      // FreeBASIC "lb TO ub": constant lower bound per dim (0 if none)
+    LowerBoundRegisters: array of Integer; // SSA int reg holding a RUNTIME lower bound per dim (-1 = constant)
     ArrayIndex: Integer;                 // Index in VM array table
   end;
 
@@ -536,6 +537,7 @@ type
     function DeclareArray(const ArrName: string; ElementType: TSSARegisterType; const Dims: array of Integer): Integer;
     procedure SetArrayDimRegisters(ArrayIdx: Integer; const DimRegs: array of Integer; const DimRegTypes: array of TSSARegisterType);
     procedure SetArrayLowerBounds(ArrayIdx: Integer; const LowerBounds: array of Integer);
+    procedure SetArrayLowerBoundRegisters(ArrayIdx: Integer; const LbRegs: array of Integer);
     function FindArray(const ArrName: string): Integer;
     function GetArray(Index: Integer): TSSAArrayInfo;
     function GetArrayCount: Integer;
@@ -1064,6 +1066,19 @@ begin
   SetLength(FArrays[ArrayIdx].LowerBounds, Length(LowerBounds));
   for i := 0 to High(LowerBounds) do
     FArrays[ArrayIdx].LowerBounds[i] := LowerBounds[i];
+end;
+
+procedure TSSAProgram.SetArrayLowerBoundRegisters(ArrayIdx: Integer; const LbRegs: array of Integer);
+// FreeBASIC "lb TO ub" with a RUNTIME lb (e.g. "Dim a(Lbound(m) To Ubound(m))"): record the SSA int
+// register that holds each dimension's lower bound (-1 = the lower bound is a compile-time constant).
+var
+  i: Integer;
+begin
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) then
+    raise Exception.CreateFmt('Invalid array index: %d', [ArrayIdx]);
+  SetLength(FArrays[ArrayIdx].LowerBoundRegisters, Length(LbRegs));
+  for i := 0 to High(LbRegs) do
+    FArrays[ArrayIdx].LowerBoundRegisters[i] := LbRegs[i];
 end;
 
 function TSSAProgram.FindArray(const ArrName: string): Integer;
