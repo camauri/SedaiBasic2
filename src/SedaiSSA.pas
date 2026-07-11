@@ -5465,6 +5465,9 @@ begin
                                       or ((Int64(FixedCap) and $FFFF) shl 48)),
                       MakeSSAValue(svkNone));
       EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // A SHARED UDT pointer keeps its handle in element 0 of its backing array; publish it there so a
+      // deref from another procedure (or module level) sees the allocated record, not a stale 0.
+      if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
       // Give every record of the block its member-array/nested-UDT backing, as ssaRecordNew does for a
       // plain instance -- AllocSharedRecordBlock only sizes the flat slots. Without this "p->item(i)"
       // reaches an unallocated member array (handle 0) and faults. Allocate does NOT run the constructor
@@ -5474,6 +5477,7 @@ begin
     end;
     EmitRawAlloc(ExprNode, ExprValue);
     EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
     Exit;
   end;
 
@@ -18401,7 +18405,19 @@ begin
       // UDT pointer (DIM p AS T PTR): p's int value IS the record handle (managed-reference model).
       TypeName := PointerUDTType(VarToStr(ObjNode.Value));
       if TypeName = '' then Exit;
-      HandleVal := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(ObjNode.Value))));
+      // A SHARED UDT pointer keeps its handle in element 0 of its backing array (like any shared
+      // scalar), so read it from there: a "Dim Shared As T Ptr p" written inside one procedure and
+      // dereferenced from another (or from module level) must see the same handle. Reading the plain
+      // local register instead yields 0 across the scope boundary -> null deref.
+      if IsSharedScalar(VarToStr(ObjNode.Value)) then
+      begin
+        SharedTmp := MakeSharedScalarAccess(VarToStr(ObjNode.Value), ObjNode.Token);
+        ProcessExpression(SharedTmp, HandleVal);
+        SharedTmp.Free;
+        HandleVal := EnsureIntRegister(HandleVal);
+      end
+      else
+        HandleVal := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(ObjNode.Value))));
       Result := True;
       Exit;
     end;
