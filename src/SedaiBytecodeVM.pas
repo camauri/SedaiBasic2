@@ -290,6 +290,10 @@ type
     // 0/0 -> NaN. Commodore BASIC (CLASSIC) raises ?DIVISION BY ZERO ERROR. Given the numerator, returns
     // the IEEE result in MODERN or raises EZeroDivide in CLASSIC. Used at every float-div-by-zero site.
     function DivZeroFloat(Numerator: Double): Double;
+    // Dialect-aware square root. FreeBASIC (MODERN) Sqr maps to C sqrt: a negative argument yields NaN
+    // (IEEE), it does not trap. Commodore v7 (CLASSIC) raises ?ILLEGAL QUANTITY. Shared by both run
+    // loops so the two paths cannot diverge (opt == no-opt).
+    function SqrtFloat(X: Double): Double;
     // File management operations (executed directly in VM)
     procedure ExecuteCopyFile(const Src, Dest: string; Overwrite: Boolean);
     procedure ExecuteScratch(const Pattern: string; Force: Boolean; Silent: Boolean = False);
@@ -3968,7 +3972,7 @@ begin
     2:  Result := System.Cos(X);
     3:  Result := Math.Tan(X);
     4:  Result := System.ArcTan(X);
-    5:  Result := System.Sqrt(X);
+    5:  Result := SqrtFloat(X);
     6:  Result := System.Exp(X);
     7:  Result := System.Ln(X);
     8:  Result := System.Abs(X);
@@ -5154,7 +5158,7 @@ begin
     130: // bcMulMulFloat: dest = a*b*c
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Src1] * Ctx.FloatRegs[Instr.Src2] * Ctx.FloatRegs[Instr.Immediate];
     131: // bcAddSqrtFloat: dest = sqrt(a+b)
-      Ctx.FloatRegs[Instr.Dest] := Sqrt(Ctx.FloatRegs[Instr.Src1] + Ctx.FloatRegs[Instr.Src2]);
+      Ctx.FloatRegs[Instr.Dest] := SqrtFloat(Ctx.FloatRegs[Instr.Src1] + Ctx.FloatRegs[Instr.Src2]);
 
     // Array Load + Branch - sub-opcodes 140-141. Bounds-guarded: an out-of-bounds read is treated as the
     // element default 0 in MODERN (matching the base load path) — NZ does not branch, Z branches; CLASSIC raises.
@@ -5984,12 +5988,7 @@ begin
     5: // bcMathExp
       Ctx.FloatRegs[Instr.Dest] := Exp(Ctx.FloatRegs[Instr.Src1]);
     6: // bcMathSqr
-      begin
-        if Ctx.FloatRegs[Instr.Src1] < 0 then
-          raise Exception.CreateFmt('Square root of negative number: %.17e', [Ctx.FloatRegs[Instr.Src1]])
-        else
-          Ctx.FloatRegs[Instr.Dest] := Sqrt(Ctx.FloatRegs[Instr.Src1]);
-      end;
+      Ctx.FloatRegs[Instr.Dest] := SqrtFloat(Ctx.FloatRegs[Instr.Src1]);
     7: // bcMathAbs
       Ctx.FloatRegs[Instr.Dest] := Abs(Ctx.FloatRegs[Instr.Src1]);
     8: // bcMathSgn
@@ -8971,6 +8970,22 @@ begin
   end
   else
     raise EZeroDivide.Create('Division by zero');
+end;
+
+function TBytecodeVM.SqrtFloat(X: Double): Double;
+begin
+  // MODERN (FreeBASIC): Sqr of a negative is NaN, taken from a Math-unit constant (a plain assignment,
+  // so it never trips the FP hardware trap FPC leaves unmasked). CLASSIC (Commodore v7): ?ILLEGAL
+  // QUANTITY. Programs rely on "Sqr(-1)" being NaN, e.g. an is-square test over -1-padded data.
+  if X < 0.0 then
+  begin
+    if Assigned(FProgram) and FProgram.ModernMode then
+      Result := NaN
+    else
+      raise Exception.CreateFmt('Square root of negative number: %.17e', [X]);
+  end
+  else
+    Result := Sqrt(X);
 end;
 
 procedure TBytecodeVM.RaiseFileError(const FBMsg: string; FBCode: Integer; const CBMMsg: string; CBMCode: Integer);

@@ -321,7 +321,7 @@ begin
           Inc(CurPC);
         end;
         131: begin // bcAddSqrtFloat: dest = sqrt(a+b)
-          FloatRegs[Instr.Dest] := Sqrt(FloatRegs[Instr.Src1] + FloatRegs[Instr.Src2]);
+          FloatRegs[Instr.Dest] := SqrtFloat(FloatRegs[Instr.Src1] + FloatRegs[Instr.Src2]);
           Inc(CurPC);
         end;
 
@@ -567,7 +567,7 @@ begin
           Inc(CurPC);
         end;
         bcMathInt: begin FloatRegs[Instr.Dest] := Floor(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathSqr: begin FloatRegs[Instr.Dest] := Sqrt(FloatRegs[Instr.Src1]); Inc(CurPC); end;
+        bcMathSqr: begin FloatRegs[Instr.Dest] := SqrtFloat(FloatRegs[Instr.Src1]); Inc(CurPC); end;
         bcMathSin: begin FloatRegs[Instr.Dest] := Sin(FloatRegs[Instr.Src1]); Inc(CurPC); end;
         bcMathCos: begin FloatRegs[Instr.Dest] := Cos(FloatRegs[Instr.Src1]); Inc(CurPC); end;
         bcMathTan: begin FloatRegs[Instr.Dest] := Tan(FloatRegs[Instr.Src1]); Inc(CurPC); end;
