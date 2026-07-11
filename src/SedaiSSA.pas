@@ -274,7 +274,9 @@ type
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
     function VarRecordTypeName(const VarName: string): string;    // '' if not a record var
-    procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer);  // alloc nested records
+    procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer);
+    function TypeNeedsRecordInit(UDTIdx: Integer): Boolean;   // has member arrays / nested-UDT fields?
+    procedure EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer);  // init each of N records  // alloc nested records
     procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
                                   ArgsNode: TASTNode = nil);  // M4.4 (ArgsNode: M4.4b ctor args)
     // Anonymous temporary "TypeName(args)" as an expression -> allocate + construct; returns its handle.
@@ -5355,12 +5357,11 @@ begin
                                       or ((Int64(FixedCap) and $FFFF) shl 48)),
                       MakeSSAValue(svkNone));
       EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      // Give the record its member-array/nested-UDT backing, as ssaRecordNew does for a plain instance --
-      // AllocSharedRecordBlock only sizes the flat slots. Without this "p->item(i)" reaches an unallocated
-      // member array (handle 0) and faults. Allocate does NOT run the constructor (FreeBASIC gives raw,
-      // zeroed storage), so only the storage is set up. A CALLOCATE(n>1) block only inits its first record
-      // this way -- the linked-list/tree idiom (Allocate, n=1) is the common case.
-      EmitRecordInit(GetOrAllocateVariable(VarName), FixedCap);
+      // Give every record of the block its member-array/nested-UDT backing, as ssaRecordNew does for a
+      // plain instance -- AllocSharedRecordBlock only sizes the flat slots. Without this "p->item(i)"
+      // reaches an unallocated member array (handle 0) and faults. Allocate does NOT run the constructor
+      // (FreeBASIC gives raw, zeroed storage), so only the storage is set up.
+      EmitRecordBlockInit(GetOrAllocateVariable(VarName), FixedCapReg, FixedCap);
       Exit;
     end;
     EmitRawAlloc(ExprNode, ExprValue);
@@ -15313,6 +15314,93 @@ begin
                      EnsureIntRegister(DefVal), MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
       end;
     end;
+end;
+
+function TSSAGenerator.TypeNeedsRecordInit(UDTIdx: Integer): Boolean;
+// True when a fresh record of this type needs per-instance setup beyond its flat slots: a member array
+// (its FArrays backing) or a nested-UDT field (its own instance). A flat record needs none, so a block
+// of them is fully usable straight from AllocSharedRecordBlock.
+var
+  i: Integer;
+begin
+  Result := False;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if (FUDTs[UDTIdx].Fields[i].NestedType <> '') or
+       (FUDTs[UDTIdx].Fields[i].IsArray and (FUDTs[UDTIdx].Fields[i].ArrayBounds <> nil)) then
+      Exit(True);
+end;
+
+procedure TSSAGenerator.EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer);
+// Run EmitRecordInit on each of the N consecutive records of a CAllocate/Allocate block, so every one
+// gets its member-array / nested-UDT backing (AllocSharedRecordBlock only sizes the flat slots). Record
+// i's handle is FirstHandle + i -- the indices are consecutive and the SHARED_REC_FLAG bit is untouched
+// by a small add. A flat type needs nothing. A constant count is unrolled; a runtime count loops.
+const
+  UNROLL_MAX = 64;   // beyond this, loop rather than emit N copies of the init sequence
+var
+  i: Integer;
+  Hi, CounterVar, LimitReg, CmpReg: TSSAValue;
+  CondLabel, BodyLabel, EndLabel, CounterName: string;
+  PrevBlock, CondBlock, BodyBlock, EndBlock: TSSABasicBlock;
+begin
+  if not TypeNeedsRecordInit(UDTIdx) then Exit;
+
+  if (CountVal.Kind = svkConstInt) and (CountVal.ConstInt <= UNROLL_MAX) then
+  begin
+    for i := 0 to CountVal.ConstInt - 1 do
+    begin
+      if i = 0 then
+        Hi := FirstHandle
+      else
+      begin
+        Hi := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        // ssaAddInt takes two registers -- materialize the index constant, or it is read as R0.
+        EmitInstruction(ssaAddInt, Hi, EnsureIntRegister(FirstHandle),
+                        EnsureIntRegister(MakeSSAConstInt(i)), MakeSSAValue(svkNone));
+      end;
+      EmitRecordInit(Hi, UDTIdx);
+    end;
+    Exit;
+  end;
+
+  // Runtime (or large constant) count: a counted loop "for c = 0 to count-1: init(first + c)". The counter
+  // is a real synthesized variable so the SSA gives it the loop PHI, exactly as it does for a FOR counter.
+  LimitReg := EnsureIntRegister(CountVal);
+  CounterName := '__RECBLKINIT%' + IntToStr(FScopeSerial);
+  Inc(FScopeSerial);
+  CounterVar := DeclareVariableTyped(CounterName, srtInt);
+  EmitInstruction(ssaLoadConstInt, CounterVar, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  CondLabel := GenerateUniqueLabel('recblk_cond');
+  BodyLabel := GenerateUniqueLabel('recblk_body');
+  EndLabel  := GenerateUniqueLabel('recblk_end');
+
+  PrevBlock := FCurrentBlock;
+  EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  FCurrentBlock := FProgram.CreateBlock(CondLabel);
+  CondBlock := FCurrentBlock;
+  if Assigned(PrevBlock) then begin PrevBlock.AddSuccessor(CondBlock); CondBlock.AddPredecessor(PrevBlock); end;
+  CmpReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpLtInt, CmpReg, EnsureIntRegister(GetOrAllocateVariable(CounterName)), LimitReg, MakeSSAValue(svkNone));
+  EmitInstruction(ssaJumpIfZero, MakeSSALabel(EndLabel), CmpReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  FCurrentBlock := FProgram.CreateBlock(BodyLabel);
+  BodyBlock := FCurrentBlock;
+  CondBlock.AddSuccessor(BodyBlock); BodyBlock.AddPredecessor(CondBlock);
+  Hi := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Hi, EnsureIntRegister(FirstHandle),
+                  EnsureIntRegister(GetOrAllocateVariable(CounterName)), MakeSSAValue(svkNone));
+  EmitRecordInit(Hi, UDTIdx);
+  EmitInstruction(ssaAddInt, GetOrAllocateVariable(CounterName),
+                  EnsureIntRegister(GetOrAllocateVariable(CounterName)),
+                  EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+  EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  BodyBlock.AddSuccessor(CondBlock); CondBlock.AddPredecessor(BodyBlock);
+
+  FCurrentBlock := FProgram.CreateBlock(EndLabel);
+  EndBlock := FCurrentBlock;
+  CondBlock.AddSuccessor(EndBlock); EndBlock.AddPredecessor(CondBlock);
 end;
 
 procedure TSSAGenerator.EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx: Integer; ArgsNode: TASTNode);
