@@ -79,6 +79,13 @@ type
     // Consulted by ParseStatement before the built-in case; nil entry = no override.
     FStmtHandlers: array[TTokenType] of TStatementParseFunc;
     FProfile: TDialectProfile;  // active dialect profile (derived from FModernMode)
+    // Overloading: procedure label (UPPER) -> the FIRST declaration seen with that label, while it is
+    // still un-renamed. A second declaration of the same name means an overload set, and both get a
+    // parameter-bank signature appended to their labels (see ParseProcedureDecl).
+    FProcSeen: TStringList;
+
+    function ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean): string;
+    procedure RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
 
     // Dialect profile application + the per-dialect statement handlers it installs.
     procedure ApplyDialectProfile;
@@ -353,6 +360,9 @@ begin
   // Only complex expressions and nested structures need memoization
   MemoizationMode := mmAdaptive;
   MemoizationThreshold := 3;  // Cache after 3 recursion levels
+
+  FProcSeen := TStringList.Create;
+  FProcSeen.CaseSensitive := False;
 end;
 
 destructor TPackratParser.Destroy;
@@ -363,7 +373,100 @@ begin
   if Assigned(FExpressionParser) then
     FExpressionParser.Free;
 
+  FProcSeen.Free;
+
   inherited Destroy;
+end;
+
+function TPackratParser.ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean): string;
+// One bank character per explicit parameter -- 'S' string, 'F' float, 'I' everything else (integers,
+// pointers and UDT handles, which are int handles). Mirrors the SSA's CtorSigFromParams, which already
+// gives constructors distinct labels; this is the same scheme for FUNCTION/SUB/method overloads.
+//
+// It is done in the PARSER, not in the SSA collector, because the pre-scans that record a procedure's
+// return type run before the collector and must already see the final label.
+var
+  i, First: Integer;
+  p: TASTNode;
+  T, Nm: string;
+  C: Char;
+begin
+  Result := '';
+  if ParamList = nil then Exit;
+  if SkipThis then First := 1 else First := 0;   // a method's implicit THIS sits at index 0
+  for i := First to ParamList.ChildCount - 1 do
+  begin
+    p := ParamList.GetChild(i);
+    T := '';
+    // The type child is at index 0 when present; an untyped "param = default" has only the default
+    // expression as its child, so it carries no type.
+    if (p.ChildCount >= 1) and (p.GetChild(0).NodeType = antIdentifier) and
+       not ((p.Attributes.Values['HASDEFAULT'] = '1') and (p.ChildCount = 1)) then
+      T := UpperCase(VarToStr(p.GetChild(0).Value));
+    if (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then
+      C := 'S'
+    else if (T = 'SINGLE') or (T = 'DOUBLE') then
+      C := 'F'
+    else if T <> '' then
+      C := 'I'
+    else
+    begin
+      // Untyped parameter: fall back to the name's type suffix, as the rest of the pipeline does.
+      Nm := VarToStr(p.Value);
+      if Nm = '' then C := 'I'
+      else if Nm[Length(Nm)] = '$' then C := 'S'
+      else if (Nm[Length(Nm)] = '!') or (Nm[Length(Nm)] = '#') then C := 'F'
+      else C := 'I';
+    end;
+    Result := Result + C;
+  end;
+end;
+
+procedure TPackratParser.RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
+// See the call site in ParseProcedureDecl. Only DEFINITIONS reach here -- a DECLARE (module level or in a
+// TYPE body) is skipped without producing a node -- so a repeated label really is an overload set, never a
+// prototype paired with its definition.
+var
+  Base: string;
+  Idx: Integer;
+  FirstDecl, FirstName, FirstParams: TASTNode;
+begin
+  if (NameNode = nil) or (ParamList = nil) then Exit;
+  Base := UpperCase(VarToStr(NameNode.Value));
+  // Every OPERATOR carries its own discriminator already and must be left alone: the symbol form has
+  // "@<arity>" (above), and the named form -- CAST / LET -- is told apart by its RETURN BANK, a suffix the
+  // SSA collector appends ("T.OPERATORCAST$" / "%"). Two casts of one type share a label HERE, at parse
+  // time, and have no parameters at all, so treating them as an overload set would give both the same
+  // empty signature and break the return-bank scheme. A constructor likewise carries "#<arity>".
+  if (Base = '') or (Pos('.OPERATOR', Base) > 0) or
+     (Pos('#', Base) > 0) or (Pos('@', Base) > 0) or (Pos('~', Base) > 0) then Exit;
+
+  Idx := FProcSeen.IndexOf(Base);
+  if Idx < 0 then
+  begin
+    FProcSeen.AddObject(Base, DeclNode);       // first one: keep the bare label
+    Exit;
+  end;
+
+  // Second (or later) declaration of this name: give it a signature...
+  NameNode.Value := Base + '~' + ProcSigFromParams(ParamList, IsMethod);
+
+  // ...and, the first time only, retroactively give one to the declaration already parsed. Its object is
+  // cleared afterwards so a third overload does not rename it twice.
+  FirstDecl := TASTNode(FProcSeen.Objects[Idx]);
+  if FirstDecl <> nil then
+  begin
+    if (FirstDecl.ChildCount >= 2) and (FirstDecl.GetChild(0).NodeType = antIdentifier) and
+       (FirstDecl.GetChild(1).NodeType = antParameterList) then
+    begin
+      FirstName := FirstDecl.GetChild(0);
+      FirstParams := FirstDecl.GetChild(1);
+      // A method's THIS sits at index 0 of its parameter list; the first declaration is a method exactly
+      // when this one is (they share a qualified "TYPE.NAME" label).
+      FirstName.Value := Base + '~' + ProcSigFromParams(FirstParams, IsMethod);
+    end;
+    FProcSeen.Objects[Idx] := nil;
+  end;
 end;
 
 procedure TPackratParser.SetContext(AContext: TParserContext);
@@ -490,6 +593,7 @@ var
 begin
   FStartTime := Now;
   Result := TParsingResult.Create;
+  FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
 
   try
     // Initialize context
@@ -550,6 +654,7 @@ var
 begin
   FStartTime := Now;
   Result := TParsingResult.Create;
+  FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
 
   try
     // Initialize context
@@ -2275,6 +2380,17 @@ begin
     NameNode.Value := QualName + '#' + IntToStr(ParamList.ChildCount - 1);
 
   Result.AddChild(ParamList);
+
+  // FreeBASIC OVERLOAD: two SUB/FUNCTIONs (or two methods of one type) may share a name and differ only
+  // in their parameter types -- "Function g(As Long)" and "Function g(As Single)", the accumulator-factory
+  // idiom. They produced ONE label, and the SSA's registration keeps the first it sees, so the second was
+  // dropped outright: every call went to the first, and "x.g(2.3)" silently truncated 2.3 to a Long.
+  //
+  // On the SECOND declaration of a name, append a parameter-bank signature to BOTH (the first is still
+  // reachable here, un-renamed) -- "BAR.G~I" / "BAR.G~F". A name declared only once keeps its bare label,
+  // so nothing about a non-overloaded program changes. Constructors ("#sig") and operators ("@arity")
+  // already carry their own discriminator and are left alone.
+  RegisterOverloadLabel(Result, NameNode, ParamList, MethodType <> '');
 
   // FreeBASIC module-level constructor/destructor: "Sub name [()] Constructor [priority]" runs before
   // module-level code; "Destructor [priority]" runs after it (at program end). Only on a plain SUB (not a

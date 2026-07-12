@@ -278,9 +278,12 @@ type
     procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
     function ResolveMethodLabel(const TypeName, MethNm: string): string;  // walk inheritance
+    function ResolveMethodLabelArgs(const TypeName, MethNm: string; ArgsNode: TASTNode): string;  // + overloads
     function ResolveConstructorLabel(const TypeName, ArgSig: string): string;  // M4.4g: by type signature
     function BankToChar(Bank: TSSARegisterType): Char;          // M4.4g: I/F/S bank code for a ctor signature
     function CtorSigFromParams(ParamList: TASTNode): string;    // M4.4g: type signature of a ctor's params
+    function ArgSigFromArgs(ArgsNode: TASTNode): string;        // bank signature of a call's arguments
+    function ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;  // pick an overload
     function FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;  // M4.4h: defaulted ctor
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
@@ -394,7 +397,7 @@ type
     procedure EmitSharedSyncOut;                         // M6: store shared-global registers -> their slots
     procedure EmitSharedSyncIn;                          // M6: load shared-global slots -> their registers
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
-    procedure EmitUserFunctionCall(const Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
+    procedure EmitUserFunctionCall(Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
     function EmitFuncPtrCall(const FPName, Sig: string; ArgListNode: TASTNode): TSSAValue;  // FB function-pointer indirect call
     function EmitIndirectCall(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;  // indirect call through an already-loaded entry-PC value
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
@@ -4292,14 +4295,18 @@ begin
             begin
               ArrayIdx := FindUDT(MethodOwnerType);
               if ArrayIdx >= 0 then TempStr := FUDTs[ArrayIdx].Parent else TempStr := '';
-              if (TempStr <> '') and (ResolveMethodLabel(TempStr, VarToStr(Node.GetChild(0).Value)) <> '') then
+              if (TempStr <> '') and
+                 (ResolveMethodLabelArgs(TempStr, VarToStr(Node.GetChild(0).Value), Node.GetChild(1)) <> '') then
               begin
                 ProcessMethodCall(MethodObjNode, TempStr, VarToStr(Node.GetChild(0).Value),
                                   Node.GetChild(1), Result, True);
                 Exit;
               end;
             end;
-            MethodLabelName := ResolveMethodLabel(MethodOwnerType, VarToStr(Node.GetChild(0).Value));
+            // Overload-aware: an overloaded method has no bare label, so this test must be able to see
+            // the "~<sig>" members too -- otherwise "b.g(5)" fell through as if the type had no g at all.
+            MethodLabelName := ResolveMethodLabelArgs(MethodOwnerType, VarToStr(Node.GetChild(0).Value),
+                                                      Node.GetChild(1));
             if MethodLabelName <> '' then
             begin
               ProcessMethodCall(MethodObjNode, MethodOwnerType, VarToStr(Node.GetChild(0).Value),
@@ -15234,6 +15241,28 @@ begin
     FillOneUDT(i);
 end;
 
+function TSSAGenerator.ResolveMethodLabelArgs(const TypeName, MethNm: string; ArgsNode: TASTNode): string;
+// ResolveMethodLabel, but able to pick between OVERLOADS of the method (which carry a "~<sig>" suffix and
+// therefore have no bare label). Walks the inheritance chain the same way. ArgsNode is the call's argument
+// list WITHOUT the object -- a method's label signature excludes its implicit THIS too, so the two line up.
+var
+  T, Lbl: string;
+  Idx, Guard: Integer;
+begin
+  Result := '';
+  T := UpperCase(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    Lbl := ResolveCallLabel(T + '.' + UpperCase(MethNm), ArgsNode);
+    if Lbl <> '' then Exit(Lbl);
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
 function TSSAGenerator.ResolveMethodLabel(const TypeName, MethNm: string): string;
 // Find a method by walking up the inheritance chain: Child.method, then Parent.method, ...
 var
@@ -15263,6 +15292,48 @@ begin
   else
     Result := 'I';   // int (incl. UDT handles)
   end;
+end;
+
+function TSSAGenerator.ArgSigFromArgs(ArgsNode: TASTNode): string;
+// The bank signature of a CALL's arguments, in the same alphabet the declaration's label uses:
+// 'S' string, 'F' float, 'I' everything else. THIS is not part of it (a method's label signature
+// excludes it too).
+var
+  i: Integer;
+begin
+  Result := '';
+  if ArgsNode = nil then Exit;
+  for i := 0 to ArgsNode.ChildCount - 1 do
+    case InferExprBank(ArgsNode.GetChild(i)) of
+      srtString: Result := Result + 'S';
+      srtFloat:  Result := Result + 'F';
+    else
+      Result := Result + 'I';
+    end;
+end;
+
+function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;
+// Resolve a call to an OVERLOADED procedure. A name declared once keeps its bare label, so the first
+// test settles every non-overloaded program and this costs nothing. An overload set has no bare label
+// at all (the parser gave every member a "~<sig>" suffix), so:
+//   1) exact bank signature -- what tells "g(As Long)" from "g(As Single)" apart;
+//   2) failing that, ARITY (BASIC's loose typing: an int argument may legitimately target a float
+//      parameter and be coerced at staging) -- the first overload with the same parameter count.
+// Returns '' when nothing matches, and the caller reports it as before.
+var
+  Sig, Pref: string;
+  k: Integer;
+begin
+  if FProcDecls.ContainsKey(BaseLabel) then Exit(BaseLabel);
+  Sig := ArgSigFromArgs(ArgsNode);
+  Result := BaseLabel + '~' + Sig;
+  if FProcDecls.ContainsKey(Result) then Exit;
+  Pref := BaseLabel + '~';
+  for k := 0 to FProcedureNames.Count - 1 do
+    if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
+       (Length(FProcedureNames[k]) - Length(Pref) = Length(Sig)) then
+      Exit(FProcedureNames[k]);
+  Result := '';
 end;
 
 function TSSAGenerator.CtorSigFromParams(ParamList: TASTNode): string;
@@ -18401,7 +18472,7 @@ begin
     EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
-procedure TSSAGenerator.EmitUserFunctionCall(const Name: string; ArgsNode: TASTNode;
+procedure TSSAGenerator.EmitUserFunctionCall(Name: string; ArgsNode: TASTNode;
   out Result: TSSAValue);
 // Lower a call to a user FUNCTION/SUB and produce its result value. A scalar result is read from
 // the result transfer slot as before. A UDT result uses V3 return-by-value: the caller allocates
@@ -18414,7 +18485,12 @@ var
   RecType: string;
   UDTIdx: Integer;
   RcHandle, AddrVal: TSSAValue;
+  Resolved: string;
 begin
+  // An OVERLOADED name has no bare label -- every member of the set carries a "~<sig>" suffix -- so pick
+  // the one whose parameter banks match these arguments. A name declared once resolves to itself.
+  Resolved := ResolveCallLabel(Name, ArgsNode);
+  if Resolved <> '' then Name := Resolved;
   RecType := VarRecordTypeName(Name);
   if RecType <> '' then
   begin
@@ -18637,7 +18713,12 @@ begin
         // "Print obj.method()" reaches its Cast operator and a chained "obj.method().field" resolves.
         if Result = '' then
         begin
-          NestedT := ResolveMethodLabel(ParentType, VarToStr(ObjNode.GetChild(0).Value));
+          // Args-aware, so an OVERLOADED method's return type comes from the overload these arguments
+          // actually select (child 1 is the call's argument list).
+          if ObjNode.ChildCount >= 2 then
+            NestedT := ResolveMethodLabelArgs(ParentType, VarToStr(ObjNode.GetChild(0).Value), ObjNode.GetChild(1))
+          else
+            NestedT := ResolveMethodLabelArgs(ParentType, VarToStr(ObjNode.GetChild(0).Value), nil);
           if NestedT <> '' then Result := VarRecordTypeName(NestedT);
         end;
       end;
@@ -18655,7 +18736,7 @@ begin
     // A no-argument method used bare, "obj.method", returning a UDT (FreeBASIC allows dropping the "()").
     else if ParentType <> '' then
     begin
-      NestedT := ResolveMethodLabel(ParentType, VarToStr(ObjNode.Value));
+      NestedT := ResolveMethodLabelArgs(ParentType, VarToStr(ObjNode.Value), nil);   // no-arg overload
       if NestedT <> '' then Result := VarRecordTypeName(NestedT);
     end;
   end
@@ -18815,7 +18896,9 @@ var
   MethodLabel, RetRecType: string;
 begin
   Result := MakeSSAValue(svkNone);
-  MethodLabel := ResolveMethodLabel(ObjType, MethNm);   // static (base) target
+  // Overload-aware: a method declared twice with different parameter types has no bare label, so pick by
+  // the argument banks (ArgsNode carries no THIS, and neither does the label's signature).
+  MethodLabel := ResolveMethodLabelArgs(ObjType, MethNm, ArgsNode);   // static (base) target
   if MethodLabel = '' then Exit;
   RetRecType := VarRecordTypeName(MethodLabel);          // V3: '' unless it returns a UDT by value
 
@@ -18893,7 +18976,7 @@ begin
   if (ObjNode = nil) or (ObjNode.NodeType <> antIdentifier) then Exit;
   TypeName := UpperCase(VarToStr(ObjNode.Value));
   if FindUDT(TypeName) < 0 then Exit;                        // not a declared type name
-  if ResolveMethodLabel(TypeName, MethNm) = '' then Exit;    // type has no such method
+  if ResolveMethodLabelArgs(TypeName, MethNm, ArgsNode) = '' then Exit;   // type has no such method
   DummyThis := TASTNode.CreateWithValue(antLiteral, 0, ObjNode.Token);
   try
     ProcessMethodCall(DummyThis, TypeName, MethNm, ArgsNode, CallResult);
@@ -19110,7 +19193,8 @@ begin
   if not UDTFieldBankSlot(UDTIdx, VarToStr(Node.Value), Bank, Slot, NestedT) then
   begin
     // Not a field — try a no-argument method call obj.method (M4.1), walking inheritance (M4.2).
-    MethodLbl := ResolveMethodLabel(TypeName, VarToStr(Node.Value));
+    // Args-aware with a nil list, so an overload set is searched for its zero-parameter member.
+    MethodLbl := ResolveMethodLabelArgs(TypeName, VarToStr(Node.Value), nil);
     if MethodLbl <> '' then
       ProcessMethodCall(Node.GetChild(0), TypeName, VarToStr(Node.Value), nil, Result);
     Exit;
@@ -19387,6 +19471,15 @@ begin
   if FProcedureNames.IndexOf(Name) < 0 then
     FProcedureNames.Add(Name);
   FProcDecls.AddOrSetValue(Name, Node);
+  // An overload's label carries a parameter-bank signature ("FOO~I"), so its BARE name is nowhere in the
+  // table -- and several places consult FProcedureNames only to tell a call from an array access. Register
+  // the base name too, or "foo(1)" on an overloaded foo would be read as an undeclared array.
+  if Pos('~', Name) > 0 then
+  begin
+    Pointee := Copy(Name, 1, Pos('~', Name) - 1);
+    if FProcedureNames.IndexOf(Pointee) < 0 then
+      FProcedureNames.Add(Pointee);
+  end;
   // FreeBASIC BYREF function result: the function returns an address; record its pointee type (the
   // declared return type, attached as the name node's type child by the parser).
   if (Node.Attributes.Values['BYREFRET'] = '1') and (FByrefRetFuncs.IndexOfName(Name) < 0) then
