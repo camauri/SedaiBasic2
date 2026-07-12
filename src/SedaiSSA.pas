@@ -1069,6 +1069,25 @@ begin
   Result := FDeclaredNames.IndexOf(UpperCase(VarName)) >= 0;
 end;
 
+function PrintKindOfType(const TypeU: string): Integer;
+// 0 = plain signed, 1 = BOOLEAN (prints "true"/"false"), 2 = unsigned 64-bit, 3 = unsigned but NARROW.
+//
+// Kinds 2 and 3 print the same way -- as an unsigned value, which above all means WITHOUT the leading
+// sign space ("Unsigned numbers are printed without a space before them" -- the FB manual's Print page,
+// under Differences from QB). A UByte printed with the space made Rosetta "Four bit adder" emit
+// "0 1 1 1 1" where FreeBASIC emits "01111".
+//
+// They are kept apart because only kind 2 is UNSIGNED-64: IsUnsigned64Expr consults it to select the
+// unsigned compare/divide/mod opcodes, and it is CONTAGIOUS through arithmetic. A narrow unsigned is
+// stored as a positive Int64 and promotes to a SIGNED expression -- "Dim As UByte b = 3 : Print b - 5"
+// is -2 in FreeBASIC -- so letting it taint an expression would print 18446744073709551614 instead.
+begin
+  if TypeU = 'BOOLEAN' then Result := 1
+  else if (TypeU = 'UINTEGER') or (TypeU = 'ULONGINT') then Result := 2
+  else if (TypeU = 'UBYTE') or (TypeU = 'USHORT') or (TypeU = 'ULONG') then Result := 3
+  else Result := 0;
+end;
+
 function OperatorArityCode(NParams: Integer): string;
 // Label suffix that keeps a unary and a binary overload of the SAME operator symbol apart ("@1"/"@2").
 // Declared parameter count, so a free "Operator -(a AS T, b AS T)" is @2 and "Operator -(c AS T)" is @1.
@@ -14595,11 +14614,7 @@ begin
     FVarWidthCode.Objects[Idx] := TObject(PtrInt(W))
   else
     FVarWidthCode.AddObject(Nm, TObject(PtrInt(W)));
-  // Print form (phase C). UByte/UShort/ULong are stored as positive Int64 after narrowing, so they
-  // print correctly as signed already; only the 64-bit unsigned types need the unsigned print form.
-  if T = 'BOOLEAN' then PK := 1
-  else if (T = 'UINTEGER') or (T = 'ULONGINT') then PK := 2
-  else PK := 0;
+  PK := PrintKindOfType(T);
   Idx := FVarPrintKind.IndexOf(Nm);
   if PK = 0 then
   begin
@@ -14624,12 +14639,9 @@ procedure TSSAGenerator.SetPrintKindScoped(const ProcName, VarName, TypeName: st
 // too (kind 0), so the lookup stops at the scoped entry instead of falling back to the leaked one.
 var
   PK, Idx: Integer;
-  Key, T: string;
+  Key: string;
 begin
-  T := UpperCase(TypeName);
-  if T = 'BOOLEAN' then PK := 1
-  else if (T = 'UINTEGER') or (T = 'ULONGINT') then PK := 2
-  else PK := 0;
+  PK := PrintKindOfType(UpperCase(TypeName));
   Key := UpperCase(ProcName) + '|' + UpperCase(VarName);
   Idx := FVarPrintKind.IndexOf(Key);
   if Idx >= 0 then
@@ -14648,13 +14660,11 @@ procedure TSSAGenerator.RecordSharedScalarPrintKind(const VarName, TypeName: str
 // not wrap on store either), and widening this fix to touch every shared store is not the point.
 var
   PK, Idx: Integer;
-  Nm, T: string;
+  Nm: string;
 begin
   Nm := UpperCase(VarName);
-  T := UpperCase(TypeName);
-  if T = 'BOOLEAN' then PK := 1
-  else if (T = 'UINTEGER') or (T = 'ULONGINT') then PK := 2
-  else Exit;                                   // plain signed: nothing to record
+  PK := PrintKindOfType(UpperCase(TypeName));
+  if PK = 0 then Exit;                         // plain signed: nothing to record
   Idx := FVarPrintKind.IndexOf(Nm);
   if Idx >= 0 then
     FVarPrintKind.Objects[Idx] := TObject(PtrInt(PK))

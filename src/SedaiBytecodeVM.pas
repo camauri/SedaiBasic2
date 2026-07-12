@@ -2852,6 +2852,11 @@ begin
     // 10 columns, FreeBASIC 14 ("A comma indicates printing should take place at the next 14 column
     // boundary" -- the FB manual's Print page).
     FConsoleBehavior.CommaTabSize := 14;
+    // A comma zone that would fall past the end of the line wraps to the next one instead, and the
+    // behaviour's line width was still the Commodore 40. A FreeBASIC console is 80 wide (which is what
+    // the terminal device itself already reports), so a PRINT with several comma zones broke in half
+    // around column 40 -- "Print a, "x ="; b, "y ="; c" came out on two lines.
+    FConsoleBehavior.ScreenCols := 80;
   end;
 
   // RESERVE the whole static array-id space up front. Static arrays have compile-time FArrays indices, but
