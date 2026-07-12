@@ -5604,6 +5604,9 @@ begin
       begin
         StartPos := Ctx.IntRegs[Instr.Src2];
         Count := Ctx.IntRegs[Instr.Immediate and $FFFF];
+        // Negative length = the rest of the string, exactly as for the byte-string MID (see above).
+        if (Count < 0) and Assigned(FProgram) and FProgram.ModernMode then
+          Count := Utf8CPCount(Ctx.StringRegs[Instr.Src1]) - StartPos + 1;
         Ctx.StringRegs[Instr.Dest] := Utf8SubCP(Ctx.StringRegs[Instr.Src1], StartPos, Count);
       end;
     29: // bcStrInstrW - INSTR(wstring, sub): codepoint position of first occurrence (0 if none).
@@ -5773,7 +5776,19 @@ begin
         StartPos := Ctx.IntRegs[Instr.Src2];
         Count := Ctx.IntRegs[Instr.Immediate and $FFFF];
         if StartPos < 1 then StartPos := 1;
-        if Count < 0 then Count := 0;
+        // A NEGATIVE length returns the rest of the string in FreeBASIC: "if n < 0 or n >= len(str)
+        // then all of the remaining characters are returned" (manual, Mid function). Clamping it to 0
+        // instead dropped the final field of the common split idiom -- "Mid(s, p + 1, Instr(...) - p - 1)"
+        // computes a negative length on the last token, because Instr returns 0 when it runs out.
+        // CLASSIC keeps the clamp: Commodore v7 has no such rule (it rejects a negative length outright).
+        if Count < 0 then
+        begin
+          if Assigned(FProgram) and FProgram.ModernMode then
+            Count := Length(Ctx.StringRegs[Instr.Src1]) - StartPos + 1
+          else
+            Count := 0;
+          if Count < 0 then Count := 0;
+        end;
         Ctx.StringRegs[Instr.Dest] := Copy(Ctx.StringRegs[Instr.Src1], StartPos, Count);
       end;
     5: // bcStrAsc
