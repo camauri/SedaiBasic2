@@ -2841,6 +2841,13 @@ var
 begin
   FProgram := Program_;
 
+  // PRINT number spacing is dialect-specific. CLASSIC (Commodore v7) pads a non-negative number with a
+  // leading space AND appends a trailing one. FreeBASIC keeps the leading pad but prints NO trailing space
+  // -- the FB manual states the trailing space is a -lang qb trait. Switch the preset for a MODERN program
+  // so its output matches real FreeBASIC character for character.
+  if Assigned(FConsoleBehavior) and Assigned(FProgram) and FProgram.ModernMode then
+    FConsoleBehavior.NumberFormat := nfFreeBASIC;
+
   // RESERVE the whole static array-id space up front. Static arrays have compile-time FArrays indices, but
   // a UDT array member gets its handle at RUNTIME by appending at Length(FArrays). Growing FArrays lazily
   // (only as each static array is DIM'd) let a member array claim an id still owed to a static one — most

@@ -53,7 +53,11 @@ type
     nfMSX,            // Come Commodore
     nfSpectrum,       // Nessuno spazio automatico
     nfAtari,          // Spazio dopo sempre
-    nfCustom          // Usa impostazioni personalizzate
+    nfCustom,         // Usa impostazioni personalizzate
+    // FreeBASIC (-lang fb): leading space for the sign, and NO trailing space. The trailing space is a
+    // QB-dialect trait -- the FB manual's Print page says so outright ("In the -lang qb dialect, an extra
+    // space is printed after numbers") -- so it belongs to CLASSIC (v7), not to MODERN.
+    nfFreeBASIC
   );
 
   { Comportamento INPUT prompt }
@@ -419,6 +423,12 @@ begin
         if FNumberSpaceAfter then
           Suffix := ' ';
       end;
+
+    nfFreeBASIC:
+      begin
+        if NonNeg then Prefix := ' ';   // left padding for the sign
+        Suffix := '';                   // no trailing space (that is the -lang qb behaviour)
+      end;
   end;
 
   // Formatta il numero. NaN/Infinity use the FreeBASIC textual forms ("nan"/"inf"/"-inf") and must skip
@@ -458,6 +468,10 @@ begin
         if FNumberSpaceBefore then Prefix := ' ';
         if FNumberSpaceAfter then Suffix := ' ';
       end;
+    nfFreeBASIC:
+      // The FB manual's Print page, under "Differences from QB": "Unsigned numbers are printed without
+      // a space before them." So an unsigned gets neither the sign padding nor a trailing space.
+      begin Prefix := ''; Suffix := ''; end;
   end;
   Result := Prefix + UIntToStr(Value) + Suffix;
 end;
@@ -487,6 +501,11 @@ begin
       begin
         if FNumberSpaceBefore and NonNeg then Prefix := ' ';
         if FNumberSpaceAfter then Suffix := ' ';
+      end;
+    nfFreeBASIC:
+      begin
+        if NonNeg then Prefix := ' ';   // left padding for the sign
+        Suffix := '';                   // no trailing space (that is the -lang qb behaviour)
       end;
   end;
   Result := Prefix + IntToStr(Value) + Suffix;
