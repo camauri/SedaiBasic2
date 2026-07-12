@@ -660,6 +660,7 @@ begin
     bcArrayStoreIndInt, bcArrayStoreIndFloat, bcArrayStoreIndString,
     bcArrayLBoundInd, bcArrayUBoundInd,  // Src2 = 0-based dim index (int)
     bcArrayCopyContents, bcArrayCopyRecords,  // Src2 = source FArrays handle (int)
+    bcArrayBindInd,  // Src2 = the arg member array's runtime FArrays handle (int); Src1 is an array id, NOT a register
     bcArrayLBound, bcArrayUBound,  // B1.4: Src2 = 0-based dim index (int)
     bcArrayRedim,  // B1.4: REDIM - Src2 = new upper bound (int)
     bcRefStoreInt,  // FreeBASIC pointer store (int) - Src2 = value (int)

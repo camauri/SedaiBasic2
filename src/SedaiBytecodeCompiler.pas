@@ -367,6 +367,7 @@ begin
     ssaRawMemMove: Result := bcRawMemMove;
     ssaRawClear: Result := bcRawClear;
     ssaArrayBind: Result := bcArrayBind;
+    ssaArrayBindInd: Result := bcArrayBindInd;
     ssaArrayBindApply: Result := bcArrayBindApply;
     ssaArrayUnbind: Result := bcArrayUnbind;
     // UDT array members (indirect, handle from register)

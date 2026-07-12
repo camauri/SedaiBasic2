@@ -162,6 +162,8 @@ begin
       Line := Format('%4d: %-20s R%d', [Index, 'CallSubIndirect', Instr.Src1]);
     bcArrayBindApply:
       Line := Format('%4d: %-20s N=%d', [Index, 'ArrayBindApply', Instr.Immediate]);
+    bcArrayBindInd:
+      Line := Format('%4d: %-20s ARR[%d] <- [hR%d]', [Index, 'ArrayBindInd', Instr.Src1, Instr.Src2]);
     bcArrayLoadIndInt, bcArrayLoadIndFloat, bcArrayLoadIndString:
       Line := Format('%4d: %-20s R%d <- [hR%d](R%d)', [Index, 'ArrayLoadInd', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcArrayStoreIndInt, bcArrayStoreIndFloat, bcArrayStoreIndString:

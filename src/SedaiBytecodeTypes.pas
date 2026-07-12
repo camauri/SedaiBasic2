@@ -477,6 +477,7 @@ const
   bcArrayUBoundInd     = bcGroupArray + 46;  // UBOUND of a UDT array member: Dest(int)=lower+size-1 (-1 if unallocated)
   bcArrayCopyContents  = bcGroupArray + 47;  // deep-copy FArrays[IntRegs[Src1]] <- FArrays[IntRegs[Src2]] (independent storage: Dimensions/LowerBounds/*Data via Copy); value semantics of an array UDT member
   bcArrayCopyRecords   = bcGroupArray + 48;  // value-copy an array-of-UDT member: FArrays[IntRegs[Src1]] (dest) gets independent element records each holding a copy of the corresponding FArrays[IntRegs[Src2]] (src) element's contents; Immediate = packed element UDT slot counts
+  bcArrayBindInd       = bcGroupArray + 49;  // Array BYREF param bind whose ARG is a UDT array member: Src1=param array id (immediate), Src2=int reg holding the member's runtime FArrays handle. Otherwise identical to bcArrayBind (pushes the same save-stack entry, committed by bcArrayBindApply, popped by bcArrayUnbind).
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values

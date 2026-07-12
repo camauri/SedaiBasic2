@@ -2841,6 +2841,13 @@ var
 begin
   FProgram := Program_;
 
+  // RESERVE the whole static array-id space up front. Static arrays have compile-time FArrays indices, but
+  // a UDT array member gets its handle at RUNTIME by appending at Length(FArrays). Growing FArrays lazily
+  // (only as each static array is DIM'd) let a member array claim an id still owed to a static one — most
+  // often a param placeholder, which is never DIM'd at all — and the two then ALIAS the same storage.
+  if FProgram.GetArrayCount > Length(FArrays) then
+    SetLength(FArrays, FProgram.GetArrayCount);
+
   // Scan bytecode to determine maximum register indices used
   MaxIntReg := -1;
   MaxFloatReg := -1;
@@ -6321,6 +6328,20 @@ begin
   end;
 end;
 
+procedure ClearArrayStorage(var A: TArrayStorage);
+// Reset a storage record to a well-formed EMPTY array (no dimensions, no data). Field-by-field, not
+// FillChar: the dynamic-array fields are managed and must be released, not zeroed behind the RTL's back.
+begin
+  A.ElementType := 0;
+  A.DimCount := 0;
+  A.TotalSize := 0;
+  SetLength(A.Dimensions, 0);
+  SetLength(A.LowerBounds, 0);
+  SetLength(A.IntData, 0);
+  SetLength(A.FloatData, 0);
+  SetLength(A.StringData, 0);
+end;
+
 procedure TBytecodeVM.ExecuteArrayOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
@@ -6689,6 +6710,32 @@ begin
           FArrayBindStack[FArrayBindTop].ArgId := Instr.Immediate;
           FArrayBindStack[FArrayBindTop].Saved := FArrays[Instr.Src1];        // dyn-array fields share by ref
           FArrayBindStack[FArrayBindTop].Snapshot := FArrays[Instr.Immediate]; // the arg, captured now
+          Inc(FArrayBindTop);
+        end;
+      end;
+    49: // bcArrayBindInd - PHASE 1 bind whose arg is a UDT ARRAY MEMBER: its FArrays handle is only known at
+      begin  // runtime (per instance), so it arrives in a register instead of an immediate. Src1=param id,
+             // Src2=handle reg. Always pushes a save-stack entry — bcArrayBindApply commits a FIXED count and
+             // bcArrayUnbind pops LIFO by SlotId, so skipping a push here would desynchronize both.
+        PtrAddr := Ctx.IntRegs[Instr.Src2];
+        if Instr.Src1 >= 0 then
+        begin
+          if Instr.Src1 > High(FArrays) then SetLength(FArrays, Instr.Src1 + 1);  // grow AFTER reading the handle
+          if FArrayBindTop >= Length(FArrayBindStack) then
+            SetLength(FArrayBindStack, (FArrayBindTop + 1) * 2);
+          FArrayBindStack[FArrayBindTop].SlotId := Instr.Src1;
+          FArrayBindStack[FArrayBindTop].Saved := FArrays[Instr.Src1];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
+          begin
+            FArrayBindStack[FArrayBindTop].ArgId := PtrAddr;
+            FArrayBindStack[FArrayBindTop].Snapshot := FArrays[PtrAddr];   // alias the member's storage
+          end
+          else
+          begin  // handle < 1 = member array never allocated: bind an EMPTY array (UBOUND = -1), and set
+                 // ArgId = -1 so unbind performs no copy-back (there is no caller slot to write to).
+            FArrayBindStack[FArrayBindTop].ArgId := -1;
+            ClearArrayStorage(FArrayBindStack[FArrayBindTop].Snapshot);
+          end;
           Inc(FArrayBindTop);
         end;
       end;

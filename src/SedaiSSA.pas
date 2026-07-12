@@ -260,6 +260,7 @@ type
     procedure LowerDeferredProcedures;
     procedure RegisterArrayParams;   // pre-register array-parameter placeholder arrays (MODERN byref)
     procedure EmitArrayArgBinds(const ProcName: string; ArgListNode: TASTNode; Bind: Boolean);
+    function MemberArrayArgHandle(MemberNode: TASTNode; Emit: Boolean; out HandleReg: TSSAValue): Boolean;
     function ParamArrayMangle(const ProcName, ParamName: string): string;  // per-proc placeholder array name
     function LocalArrayMangle(const ProcName, ArrName: string): string;    // per-proc name for a local array shadowing a module array
     function ArrayIndexOf(const ArrName: string): Integer;  // scope-aware array lookup (proc param placeholder first)
@@ -19035,6 +19036,13 @@ var
   ObjHandle, HandleReg, DimReg, ArgValue, IntRegVal, OneVal: TSSAValue;
 begin
   Result := False;
+  // FreeBASIC spells an array reference either way: "Ubound(o.f)" and "Ubound(o.f())" both mean the whole
+  // member array. The empty-parens form parses as an array ACCESS with no indices — unwrap it to the member
+  // access, otherwise it falls through to the plain-array path and fails as an undeclared array.
+  if (ArrNameNode <> nil) and (ArrNameNode.NodeType = antArrayAccess) and (ArrNameNode.ChildCount >= 1) and
+     (ArrNameNode.GetChild(0).NodeType = antMemberAccess) and
+     ((ArrNameNode.ChildCount < 2) or (ArrNameNode.GetChild(1).ChildCount = 0)) then
+    ArrNameNode := ArrNameNode.GetChild(0);
   if (ArrNameNode = nil) or (ArrNameNode.NodeType <> antMemberAccess) then Exit;
   TypeName := ObjectTypeName(ArrNameNode.GetChild(0));
   if TypeName = '' then Exit;
@@ -19534,9 +19542,10 @@ procedure TSSAGenerator.EmitArrayArgBinds(const ProcName: string; ArgListNode: T
 // (mangled with ProcName); the arg is resolved in the CALLER's scope so a caller can forward its own array
 // parameter.
 var
-  Decl, ParamList, ArgExpr: TASTNode;
+  Decl, ParamList, ArgExpr, MemberNode: TASTNode;
   i, NArgs, ParamId, ArgId: Integer;
   ArgName: string;
+  HandleReg: TSSAValue;
   Params: array of Integer;   // placeholder slot ids actually bound, in order
 begin
   if not (Assigned(ArgListNode) and (ArgListNode.NodeType in [antArgumentList, antExpressionList])) then Exit;
@@ -19551,6 +19560,25 @@ begin
     ParamId := FProgram.FindArray(ParamArrayMangle(ProcName, UpperCase(VarToStr(ParamList.GetChild(i).Value))));
     if ParamId < 0 then Continue;
     ArgExpr := ArgListNode.GetChild(i);
+
+    // "obj.field()" — a UDT ARRAY MEMBER as the argument. It has no entry in the static array table (its
+    // FArrays handle is per instance, allocated at runtime and kept in the record's field), so the name
+    // lookup below cannot see it: bind it from a REGISTER holding that handle instead of a constant id.
+    MemberNode := nil;
+    if (ArgExpr.NodeType = antArrayAccess) and (ArgExpr.ChildCount >= 1) and
+       (ArgExpr.GetChild(0).NodeType = antMemberAccess) then
+      MemberNode := ArgExpr.GetChild(0);
+    if Assigned(MemberNode) then
+    begin
+      if not MemberArrayArgHandle(MemberNode, Bind, HandleReg) then Continue;
+      SetLength(Params, Length(Params) + 1);
+      Params[High(Params)] := ParamId;
+      if Bind then
+        EmitInstruction(ssaArrayBindInd, MakeSSAValue(svkNone), MakeSSAArrayRef(ParamId, srtInt),
+                        HandleReg, MakeSSAValue(svkNone));
+      Continue;
+    end;
+
     if (ArgExpr.NodeType = antArrayAccess) and (ArgExpr.ChildCount >= 1) then
       ArgName := UpperCase(VarToStr(ArgExpr.GetChild(0).Value))
     else
@@ -19573,6 +19601,36 @@ begin
     for i := High(Params) downto 0 do   // reverse: LIFO save-stack
       EmitInstruction(ssaArrayUnbind, MakeSSAValue(svkNone), MakeSSAArrayRef(Params[i], srtInt),
                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.MemberArrayArgHandle(MemberNode: TASTNode; Emit: Boolean; out HandleReg: TSSAValue): Boolean;
+// "obj.field()" passed as an array ARGUMENT: check that field really is an array member of obj's UDT and,
+// when Emit, load its per-instance FArrays handle into an int register (the value bcArrayBindInd binds).
+// Emit=False only validates: the unbind pass must accept exactly the same arguments as the bind pass (the
+// save-stack is popped LIFO by count) but must not re-emit the handle load. Whether the object resolves is
+// therefore NOT part of the verdict — an unresolvable one binds handle 0, which the VM reads as an empty
+// array — so both passes always agree on which arguments are bound.
+var
+  TypeName: string;
+  Slot, DimCount: Integer;
+  ElemBank: TSSARegisterType;
+  ObjHandle: TSSAValue;
+begin
+  Result := False;
+  HandleReg := MakeSSAValue(svkNone);
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  TypeName := ObjectTypeName(MemberNode.GetChild(0));
+  if TypeName = '' then Exit;
+  if not UDTArrayField(FindUDT(TypeName), VarToStr(MemberNode.Value), Slot, ElemBank, DimCount) then Exit;
+  if Emit then
+  begin
+    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    if ResolveRecordObject(MemberNode.GetChild(0), ObjHandle, TypeName) then
+      EmitInstruction(ssaRecordLoadInt, HandleReg, ObjHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot))
+    else
+      EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+  Result := True;
 end;
 
 procedure TSSAGenerator.LowerDeferredProcedures;
