@@ -1387,6 +1387,8 @@ end;
 function TLexerFSM.ProcessNumber: TLexerToken;
 var
  TokenText: string;
+ i: Integer;
+ HasDExp: Boolean;
 begin
  Result := nil;
  TokenText := TokenBufferAsString;
@@ -1396,7 +1398,22 @@ begin
  if FAtLineStart and IsLineNumber(TokenText) then
    Result := CreateToken(ttLineNumber)
  else
+ begin
    Result := CreateToken(ttNumber);
+   // FreeBASIC writes a double-precision exponent with 'D' ("743.1D-13"), meaning exactly what 'E' means.
+   // The numeric conversion only understands 'E', so give the token an explicit normalized value -- its
+   // text is otherwise lifted straight from the source, and a 'D' there made the literal unparsable
+   // (before that, it was dropped entirely and "743.1D-13" silently became the subtraction 743.1-13).
+   HasDExp := False;
+   for i := 1 to Length(TokenText) do
+     if (TokenText[i] = 'D') or (TokenText[i] = 'd') then begin HasDExp := True; Break; end;
+   if HasDExp then
+   begin
+     for i := 1 to Length(TokenText) do
+       if (TokenText[i] = 'D') or (TokenText[i] = 'd') then TokenText[i] := 'E';
+     Result.SetExtractedValue(TokenText);
+   end;
+ end;
 end;
 
 function TLexerFSM.LexAmpBaseLiteral: TLexerToken;
@@ -1795,7 +1812,7 @@ end;
 function TLexerFSM.ParseNumberDigits: Boolean;
 var
   CurrentChar: Char;
-  i: Integer;
+  i, SignLen: Integer;
   HasMantissaDigit: Boolean;
 begin
   Result := False;
@@ -1817,24 +1834,43 @@ begin
   HasMantissaDigit := False;
   for i := 0 to FTokenLength - 1 do
     if (FTokenBuffer[i] >= '0') and (FTokenBuffer[i] <= '9') then begin HasMantissaDigit := True; Break; end;
-  if ((CurrentChar = 'E') or (CurrentChar = 'e')) and HasMantissaDigit then
+  // FreeBASIC spells the exponent with 'E' or with 'D' ("743.1D-13"), the latter forcing DOUBLE precision;
+  // both mean the same magnitude, so normalize 'D' to 'E' -- the numeric conversion only understands 'E',
+  // and a dropped 'D' turned "743.1D-13" into the SUBTRACTION 743.1-13 = 730.1, silently.
+  // The marker may also stand alone with no exponent digits ("123e", "-123.0d"): that is just a
+  // double-precision literal. Only commit to the marker (and to a sign) when a digit really follows, so a
+  // bare 'e'/'d' is dropped rather than left in the buffer as an unparsable "123e".
+  if ((CurrentChar = 'E') or (CurrentChar = 'e') or (CurrentChar = 'D') or (CurrentChar = 'd')) and
+     HasMantissaDigit then
   begin
-    TokenBufferAdd(CurrentChar);
-    AdvanceChar;
-    CurrentChar := GetCurrentChar;
-
-    // Optional sign
-    if (CurrentChar = '+') or (CurrentChar = '-') then
+    SignLen := 0;
+    if (PeekChar(1) = '+') or (PeekChar(1) = '-') then SignLen := 1;
+    if (PeekChar(1 + SignLen) >= '0') and (PeekChar(1 + SignLen) <= '9') then
     begin
+      // Keep the marker VERBATIM in the buffer: a token's text is extracted lazily from the SOURCE by
+      // (start, length), so the buffer only fixes the length -- rewriting a character in it would not
+      // change the token's value. ProcessNumber does the D->E normalization on the value instead.
       TokenBufferAdd(CurrentChar);
-      AdvanceChar;
+      AdvanceChar;                         // consume the marker
       CurrentChar := GetCurrentChar;
-    end;
 
-    // Exponent digits
-    while (CurrentChar >= '0') and (CurrentChar <= '9') do
+      if (CurrentChar = '+') or (CurrentChar = '-') then
+      begin
+        TokenBufferAdd(CurrentChar);
+        AdvanceChar;
+        CurrentChar := GetCurrentChar;
+      end;
+
+      while (CurrentChar >= '0') and (CurrentChar <= '9') do
+      begin
+        TokenBufferAdd(CurrentChar);
+        AdvanceChar;
+        CurrentChar := GetCurrentChar;
+      end;
+    end
+    else
     begin
-      TokenBufferAdd(CurrentChar);
+      // Bare marker: consume it (it belongs to the literal) but add nothing -- the value is the mantissa.
       AdvanceChar;
       CurrentChar := GetCurrentChar;
     end;
@@ -1866,7 +1902,11 @@ begin
   begin
     AdvanceChar;
     if (GetCurrentChar = 'L') or (GetCurrentChar = 'l') then AdvanceChar;     // LL
-  end;
+  end
+  else if C = '%' then
+    AdvanceChar;   // "64%" (Integer). Unambiguous after a number: BASIC's modulo is MOD, never '%'.
+  // NOT '&' (the Long suffix, "64&"): it collides with the concatenation operator and the &H/&O/&B
+  // literal prefix, so a bare trailing '&' stays a concat. Rare enough to leave alone.
 end;
 
 procedure TLexerFSM.ConsumeFloatLiteralSuffix;
