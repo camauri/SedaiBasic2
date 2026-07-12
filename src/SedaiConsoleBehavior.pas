@@ -241,6 +241,46 @@ type
 
 implementation
 
+uses Math;
+
+function FormatDoubleFB(Value: Double): string;
+// FreeBASIC prints a DOUBLE with 16 significant digits -- "3.141592653589793", and it shows the 16th
+// digit even when it is representation noise ("0.9999999999999999", "44.99999999999999").
+//
+// FPC cannot produce that: FloatToStr and FloatToStrF clamp a Double to 15 significant digits whatever
+// precision you ask for (ffGeneral with 16 or 17 both come back with 15, and 0.9999999999999999 comes
+// back as "1"). Str(V:0:N) does render the full expansion, so round at the decimal place that leaves 16
+// significant digits and strip the trailing zeros -- exactly what "%.16g" would print.
+//
+// Only the range where %g chooses FIXED notation is handled here. Outside it the existing exponential
+// form is kept untouched: a value large enough to need it has no fractional part and never reaches this
+// function (every double >= 2^53 is integral, and the caller sends those through IntToStr).
+const
+  SIGDIGITS = 16;
+var
+  Ex, Decimals: Integer;
+  S: string;
+  AV: Double;
+begin
+  AV := Abs(Value);
+  if AV = 0 then Exit('0');
+  Ex := Floor(Log10(AV));
+  // Log10 can land a hair off across a power-of-ten boundary; pin the exponent to the leading digit.
+  if AV >= Power(10.0, Ex + 1) then Inc(Ex);
+  if AV <  Power(10.0, Ex)     then Dec(Ex);
+  if (Ex < -4) or (Ex >= SIGDIGITS) then
+    Exit(FloatToStr(Value));
+  Decimals := SIGDIGITS - 1 - Ex;
+  if Decimals < 0 then Decimals := 0;
+  Str(Value:0:Decimals, S);          // Str always emits '.', independent of the locale
+  if Pos('.', S) > 0 then
+  begin
+    while (S <> '') and (S[Length(S)] = '0') do SetLength(S, Length(S) - 1);
+    if (S <> '') and (S[Length(S)] = '.') then SetLength(S, Length(S) - 1);
+  end;
+  Result := S;
+end;
+
 { TConsoleBehavior }
 
 constructor TConsoleBehavior.Create;
@@ -432,15 +472,24 @@ begin
   end;
 
   // Formatta il numero. NaN/Infinity use the FreeBASIC textual forms ("nan"/"inf"/"-inf") and must skip
-  // Frac/FloatToStr (both trap on non-finite input). '-inf' already carries its sign, so drop the Prefix.
+  // Frac/FloatToStr (both trap on non-finite input). A sign-bit-set NaN prints as "-nan", like C (and
+  // like FreeBASIC, which formats through it); '-nan'/'-inf' already carry their sign, so drop the Prefix.
   if IsNanV then
-    NumStr := 'nan'
+  begin
+    if NonNeg then NumStr := 'nan' else NumStr := '-nan';
+  end
   else if IsInfV then
   begin
     if NonNeg then NumStr := 'inf' else NumStr := '-inf';
   end
   else if Frac(Value) = 0 then
     NumStr := IntToStr(Round(Value))
+  // A DOUBLE prints with 16 significant digits in FreeBASIC; FPC's FloatToStr gives 15, which rounded
+  // the last digit away and made every high-precision program disagree with the reference in its final
+  // place. CLASSIC keeps FloatToStr: the Commodore ROM's own precision is lower still, and widening it
+  // there would change v7 output for no reason.
+  else if FNumberFormat = nfFreeBASIC then
+    NumStr := FormatDoubleFB(Value)
   else
     NumStr := FloatToStr(Value);
 

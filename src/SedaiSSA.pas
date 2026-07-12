@@ -1069,6 +1069,13 @@ begin
   Result := FDeclaredNames.IndexOf(UpperCase(VarName)) >= 0;
 end;
 
+function OperatorArityCode(NParams: Integer): string;
+// Label suffix that keeps a unary and a binary overload of the SAME operator symbol apart ("@1"/"@2").
+// Declared parameter count, so a free "Operator -(a AS T, b AS T)" is @2 and "Operator -(c AS T)" is @1.
+begin
+  Result := '@' + IntToStr(NParams);
+end;
+
 function TSSAGenerator.ProcHasParamCount(const NameU: string; N: Integer): Boolean;
 // True when the declared SUB/FUNCTION/OPERATOR named NameU has exactly N parameters. Used to tell a
 // unary operator overload from the binary operator of the same symbol (they share a label).
@@ -1862,14 +1869,14 @@ begin
       begin
         // Operator overloading: unary "-x" / "Not x" on a UDT with a matching one-parameter
         // "Operator -(a AS T)" / "Operator Not(a AS T)". Resolved by the operand's static type; the
-        // one-parameter check keeps it distinct from the binary operator of the same symbol.
+        // arity-suffixed label ("@1") keeps it distinct from the binary operator of the same symbol.
         if Assigned(Node.Token) and
            ((Node.Token.TokenType = ttOpSub) or (Node.Token.TokenType = ttBitwiseNOT)) then
         begin
           OpLhsType := ObjectTypeName(Node.GetChild(0));
           if OpLhsType <> '' then
           begin
-            OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value));
+            OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(1));
             if (OpLabel <> '') and ProcHasParamCount(OpLabel, 1) then
             begin
               OpArgs := TASTNode.Create(antArgumentList, Node.Token);
@@ -2006,12 +2013,15 @@ begin
       // vector "vec * scalar"): the operator's declared parameter types drive the argument banks in
       // EmitUserFunctionCall. Resolved by the left operand's static type — arithmetic on a UDT handle is
       // never meaningful, so dispatching whenever a matching operator exists is always the right choice.
+      // The "@2" suffix is what picks the BINARY overload: a type that also declares the unary operator
+      // of the same symbol used to share one label with it, and this site then called the unary one with
+      // two arguments -- "x - y" silently evaluated to "-x".
       if (Node.ChildCount >= 2) and Assigned(Node.Token) then
       begin
         OpLhsType := ObjectTypeName(Node.GetChild(0));
         if OpLhsType <> '' then
         begin
-          OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value));
+          OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(2));
           if OpLabel <> '' then
           begin
             OpArgs := TASTNode.Create(antArgumentList, Node.Token);
@@ -18648,7 +18658,7 @@ begin
       ParentType := ObjectTypeName(ObjNode.GetChild(0));
       if (ParentType <> '') and (ObjectTypeName(ObjNode.GetChild(1)) = ParentType) then
       begin
-        NestedT := ResolveMethodLabel(ParentType, 'OPERATOR' + VarToStr(ObjNode.Token.Value));  // op label
+        NestedT := ResolveMethodLabel(ParentType, 'OPERATOR' + VarToStr(ObjNode.Token.Value) + OperatorArityCode(2));
         if NestedT <> '' then Result := VarRecordTypeName(NestedT);   // its UDT return type ('' if scalar)
       end;
     end;
@@ -18656,14 +18666,14 @@ begin
   else if ObjNode.NodeType = antUnaryOp then
   begin
     // A unary overloaded operator "OPERATOR <sym>(a AS T) AS R" yields a value of R. Resolve R when it is
-    // a UDT, so "Print -x" reaches its Cast operator. The one-parameter check keeps it distinct from the
-    // binary operator of the same symbol.
+    // a UDT, so "Print -x" reaches its Cast operator. The "@1" suffix keeps it distinct from the binary
+    // operator of the same symbol.
     if (ObjNode.ChildCount >= 1) and Assigned(ObjNode.Token) then
     begin
       ParentType := ObjectTypeName(ObjNode.GetChild(0));
       if ParentType <> '' then
       begin
-        NestedT := ResolveMethodLabel(ParentType, 'OPERATOR' + VarToStr(ObjNode.Token.Value));
+        NestedT := ResolveMethodLabel(ParentType, 'OPERATOR' + VarToStr(ObjNode.Token.Value) + OperatorArityCode(1));
         if (NestedT <> '') and ProcHasParamCount(NestedT, 1) then Result := VarRecordTypeName(NestedT);
       end;
     end;
@@ -19358,6 +19368,8 @@ begin
     Name := Name + CastReturnCode(UpperCase(VarToStr(NameNode.GetChild(0).Value)));
     NameNode.Value := Name;
   end;
+  // (A symbol OPERATOR already carries its arity in the label -- "@1"/"@2" -- applied by the parser, so
+  // that the return-type pre-scans see the final name. See ParseProcedureDecl.)
   if FProcDecls.ContainsKey(Name) then Exit;  // already registered by the pre-scan
   n := Length(FDeferredProcs);
   SetLength(FDeferredProcs, n + 1);

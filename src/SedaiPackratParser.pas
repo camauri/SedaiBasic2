@@ -1956,6 +1956,7 @@ function TPackratParser.ParseProcedureDecl: TASTNode;
 var
   Token, NameTok, RetTok: TLexerToken;
   Kind, MethodType, QualName, ParamMode, OpSym, OpOwnerType, DecoU, RetTypeName, ParamTypeName, ParamNameU: string;
+  OpSymbolForm: Boolean;   // "OPERATOR <sym>(...)" (arity goes in the label) vs "OPERATOR T.CAST/LET"
   NameNode, ParamList, ParamNode, ThisNode, DefExpr: TASTNode;
 begin
   // SUB|FUNCTION name [ ( params ) ] [AS type] <body> END SUB|FUNCTION
@@ -1968,6 +1969,7 @@ begin
 
   MethodType := '';
   OpSym := '';
+  OpSymbolForm := False;
   if Kind = kOPERATOR then
   begin
     // Two OPERATOR forms:
@@ -1989,6 +1991,7 @@ begin
     else
     begin
       OpSym := Context.CurrentToken.Value;
+      OpSymbolForm := True;                         // "OPERATOR <sym> (...)": arity-overloadable
       Context.Advance;                              // consume the operator symbol
     end;
     NameNode := TASTNode.CreateWithValue(antIdentifier, 'OPERATOR' + OpSym, Token);  // placeholder
@@ -2208,11 +2211,22 @@ begin
   // OPERATOR: now that the parameters are parsed, take the owning type from the first parameter's
   // AS-type and form the label "<T>.OPERATOR<sym>", then treat it as a normal FUNCTION. The binary-op
   // lowering resolves it by the left operand's type.
+  //
+  // The symbol form also carries its ARITY in the label ("@1"/"@2"), exactly as a CONSTRUCTOR carries
+  // its parameter count. A type routinely overloads one symbol both ways -- "Operator -(c As T)" to
+  // negate and "Operator -(a As T, b As T)" to subtract -- and with a single shared label only the
+  // first survived registration: the binary one was dropped, so "x - y" called the unary declaration
+  // with two arguments and quietly evaluated to "-x" (Rosetta "Arithmetic/Complex"). It is done HERE,
+  // in the parser, because the pre-scans that record a procedure's return type run before the SSA
+  // collector and must already see the final label. The named form (CAST/LET) keeps its own scheme:
+  // it takes no explicit parameters, so arity cannot tell two of them apart.
   if (Kind = kOPERATOR) and Assigned(NameNode) and (ParamList.ChildCount >= 1) and
      (ParamList.GetChild(0).ChildCount >= 1) then
   begin
     OpOwnerType := UpperCase(VarToStr(ParamList.GetChild(0).GetChild(0).Value));
     NameNode.Value := OpOwnerType + '.OPERATOR' + OpSym;
+    if OpSymbolForm then
+      NameNode.Value := VarToStr(NameNode.Value) + '@' + IntToStr(ParamList.ChildCount);
     Kind := kFUNCTION;
     Result.Value := kFUNCTION;
   end;
