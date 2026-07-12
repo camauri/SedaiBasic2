@@ -2846,7 +2846,13 @@ begin
   // -- the FB manual states the trailing space is a -lang qb trait. Switch the preset for a MODERN program
   // so its output matches real FreeBASIC character for character.
   if Assigned(FConsoleBehavior) and Assigned(FProgram) and FProgram.ModernMode then
+  begin
     FConsoleBehavior.NumberFormat := nfFreeBASIC;
+    // A comma in PRINT tabs to the next zone, and the zone width is dialect-specific too: Commodore uses
+    // 10 columns, FreeBASIC 14 ("A comma indicates printing should take place at the next 14 column
+    // boundary" -- the FB manual's Print page).
+    FConsoleBehavior.CommaTabSize := 14;
+  end;
 
   // RESERVE the whole static array-id space up front. Static arrays have compile-time FArrays indices, but
   // a UDT array member gets its handle at RUNTIME by appending at Length(FArrays). Growing FArrays lazily

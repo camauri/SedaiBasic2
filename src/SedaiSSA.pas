@@ -15334,7 +15334,11 @@ begin
   if (Node.NodeType = antForLoop) and (Node.Attributes.Values['VARTYPE'] <> '') and
      (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
     RegisterTypedVar(UpperCase(VarToStr(Node.GetChild(0).Value)), Node.Attributes.Values['VARTYPE']);
-  if Node.NodeType = antDim then
+  // antRedim as well as antDim: in FreeBASIC a REDIM may be an array's FIRST and only declaration
+  // ("Redim As block hufflist(0)"), and it parses to the very same antArrayDecl children. Gating on
+  // antDim alone left such an array with no recorded element type, so "r(i).field" never resolved as a
+  // record: reads returned the raw tagged handle and stores went nowhere -- silently.
+  if Node.NodeType in [antDim, antRedim] then
   begin
     for k := 0 to Node.ChildCount - 1 do
     begin
