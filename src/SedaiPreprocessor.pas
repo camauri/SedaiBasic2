@@ -31,7 +31,7 @@ function PreprocessSource(const Src, BaseDir: string; const FileName: string = '
 
 implementation
 
-uses Classes;
+uses Classes, SedaiLexerTypes;   // cVirtualEOL: the separator a multi-line #macro body is joined with
 
 function IsIdentChar(C: Char): Boolean; inline;
 begin
@@ -679,10 +679,14 @@ var
           else if (DName = 'macro') and Emitting then
           begin
             // Multi-line macro: "#macro NAME[(params)]" ... body lines ... "#endmacro".
-            // The body lines are joined with the BASIC statement separator ':' so a single
-            // invocation expands to the whole sequence; with params it becomes a function-like
-            // macro (FnDefs), otherwise an object-like one (Defs). Body lines are consumed here
-            // and replaced by blanks to preserve source line numbers.
+            // The body lines are joined with cVirtualEOL so one invocation expands to the whole
+            // sequence AS SEPARATE LINES (what FreeBASIC does) while still occupying the single
+            // physical line it was invoked from. Joining with ':' instead would be wrong: BASIC puts
+            // every ':'-separated statement after "IF c THEN" into the THEN branch, so a body holding
+            // an inline "IF ... THEN Return" would swallow the rest of the macro whenever the
+            // condition was false. With params it becomes a function-like macro (FnDefs), otherwise
+            // an object-like one (Defs). Body lines are consumed here and replaced by blanks to
+            // preserve source line numbers.
             p := 1;
             while (p <= Length(DRest)) and IsIdentChar(DRest[p]) do Inc(p);
             MacroName := UpperCase(Copy(DRest, 1, p - 1));
@@ -706,7 +710,7 @@ var
               end;
               if Trim(Lines[li]) <> '' then
               begin
-                if MacroBody <> '' then MacroBody := MacroBody + ' : ';
+                if MacroBody <> '' then MacroBody := MacroBody + cVirtualEOL;
                 MacroBody := MacroBody + Trim(Lines[li]);
               end;
               Output.Add('');   // blank placeholder preserves line numbers

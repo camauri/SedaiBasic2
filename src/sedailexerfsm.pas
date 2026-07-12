@@ -411,7 +411,9 @@ begin
   FCharConfig.Delimiters := ['(', ')', '[', ']', '{', '}'];
   FCharConfig.Separators := [',', ';', ':'];
   FCharConfig.Whitespace := [' ', #9];
-  FCharConfig.Newlines := [#10, #13];
+  // cVirtualEOL ends a line without being one: AdvanceChar only counts #13/#10, so a #macro expansion
+  // reads as several lines yet stays on the physical line it was invoked from.
+  FCharConfig.Newlines := [#10, #13, cVirtualEOL];
   FCharConfig.Quotes := ['"'];   // only " delimits strings (BASIC v7 / FreeBASIC); ' is a comment
   FCharConfig.SpecialChars := ['_', '$', '%', '#', '@'];
   FCharConfig.DotChars := ['.'];

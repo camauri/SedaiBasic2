@@ -379,6 +379,15 @@ type
   end;
   PTokenRec = ^TTokenRec;
 
+const
+  // Virtual end-of-line. The preprocessor joins the lines of a multi-line #macro with this instead of a
+  // real newline, so the whole expansion still occupies ONE physical source line (source line numbers in
+  // diagnostics stay true) while the lexer reads it as a sequence of separate lines. It cannot be ':':
+  // in BASIC "IF c THEN a : b" puts BOTH statements in the THEN branch, so a ':'-joined macro body
+  // silently swallows everything after an inline "IF ... THEN" it contains.
+  cVirtualEOL = #11;   // VT: never appears literally in BASIC source
+
+type
   TCharacterConfig = record
     Letters: TCharSet;
     Digits: TCharSet;
