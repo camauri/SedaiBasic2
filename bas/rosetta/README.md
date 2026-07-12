@@ -167,6 +167,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `cramers_rule.bas` | <https://rosettacode.org/wiki/Cramer%27s_rule> |
 | `extended_straddling_checkerboard.bas` | <https://rosettacode.org/wiki/Extended_Straddling_Checkerboard> |
 | `fibonacci_sequence.bas` | <https://rosettacode.org/wiki/Fibonacci_sequence> |
+| `huffman_coding.bas` | <https://rosettacode.org/wiki/Huffman_coding> |
 
 ## Running
 
