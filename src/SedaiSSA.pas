@@ -5534,10 +5534,13 @@ begin
   // FUNCTION result (M2): "fname = expr" inside a FUNCTION body sets the return value.
   // Also accepts the unqualified method name inside a FUNCTION method (M4.1): for a method
   // PT.SUM, "SUM = expr" works (the qualified "PT.SUM = expr" would parse as member access).
+  // And the literal "FUNCTION = expr" (FreeBASIC's canonical spelling): the parser cannot know which
+  // function it sits in, so it emits the reserved word as the target and it resolves here.
   // Evaluate the expression and stage it into the result transfer slot (delivered to the
   // caller on bcReturnSub). QB semantics: execution continues; the actual return is at END.
   if FInProcedure and FCurrentProcIsFunction and
      ((UpperCase(VarName) = FCurrentProcName) or
+      (UpperCase(VarName) = kFUNCTION) or
       (Pos('.', FCurrentProcName) > 0) and
       (UpperCase(VarName) = Copy(FCurrentProcName, Pos('.', FCurrentProcName) + 1, MaxInt))) then
   begin

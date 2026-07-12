@@ -238,6 +238,7 @@ type
     function ParseDoStatement: TASTNode;
     function ParseGotoStatement: TASTNode;
     function ParseGosubStatement: TASTNode;
+    function ParseFunctionResultAssign: TASTNode;
     function ParseReturnStatement: TASTNode;
     function ParseEndStatement: TASTNode;
     function ParseFastStatement: TASTNode;
@@ -839,7 +840,13 @@ begin
     // === PROCEDURES ===
     ttProcedureDefine: Result := Memoize('DefStatement', @ParseDefStatement);
     ttProcedureStart:
-      if (UpperCase(Token.Value) = kSUB) or (UpperCase(Token.Value) = kFUNCTION) or
+      // "FUNCTION = expr" inside a FUNCTION body is FreeBASIC's canonical way to set the result (the
+      // named form "fname = expr" is the other). Only "FUNCTION" followed by "=" is the result
+      // assignment -- anything else starting with FUNCTION is a declaration.
+      if (UpperCase(Token.Value) = kFUNCTION) and Assigned(Context.PeekNext) and
+         (Context.PeekNext.TokenType = ttOpEq) then
+        Result := Memoize('FunctionResultAssign', @ParseFunctionResultAssign)
+      else if (UpperCase(Token.Value) = kSUB) or (UpperCase(Token.Value) = kFUNCTION) or
          (UpperCase(Token.Value) = kCONSTRUCTOR) or (UpperCase(Token.Value) = kDESTRUCTOR) or
          (UpperCase(Token.Value) = kPROPERTY) or (UpperCase(Token.Value) = kOPERATOR) then
         Result := Memoize('ProcedureDecl', @ParseProcedureDecl)
@@ -3626,6 +3633,34 @@ begin
   Target := ParseExpression;
   if Assigned(Target) then
     Result.AddChild(Target);
+  DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParseFunctionResultAssign: TASTNode;
+// FreeBASIC "FUNCTION = expr": set the current FUNCTION's result and CARRY ON (unlike RETURN, which
+// also exits). Lowered as an ordinary assignment whose target is the reserved word FUNCTION -- the SSA
+// already routes "fname = expr" to the result slot and treats this name the same way. The parser has no
+// enclosing-procedure context of its own, so resolving which function this belongs to is left to the SSA.
+var
+  Token: TLexerToken;
+  ExprNode, NameNode: TASTNode;
+begin
+  Token := Context.CurrentToken;
+  Context.Advance;                 // consume FUNCTION
+  Context.Advance;                 // consume '='
+
+  ExprNode := ParseExpression;
+  if not Assigned(ExprNode) then
+  begin
+    HandleError('Expected an expression after "FUNCTION ="', Context.CurrentToken);
+    Result := nil;
+    Exit;
+  end;
+
+  NameNode := TASTNode.CreateWithValue(antIdentifier, kFUNCTION, Token);
+  Result := TASTNode.Create(antAssignment, Token);
+  Result.AddChild(NameNode);
+  Result.AddChild(ExprNode);
   DoNodeCreated(Result);
 end;
 
