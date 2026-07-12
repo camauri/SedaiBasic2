@@ -931,9 +931,14 @@ begin
             IntRegs[Instr.Dest] := IntRegs[Instr.Src1] shl IntRegs[Instr.Src2];
             Inc(CurPC);
           end;
-        bcShr:  // FreeBASIC SHR (logical)
+        bcShr:  // FreeBASIC SHR (arithmetic: a signed operand keeps its sign, "-5 Shr 2" = -2)
           begin
-            IntRegs[Instr.Dest] := IntRegs[Instr.Src1] shr IntRegs[Instr.Src2];
+            IntRegs[Instr.Dest] := ArithShr64(IntRegs[Instr.Src1], IntRegs[Instr.Src2]);
+            Inc(CurPC);
+          end;
+        bcShrUInt:  // SHR on an unsigned operand (UInteger/ULongInt): zero-filling
+          begin
+            IntRegs[Instr.Dest] := LogicalShr64(IntRegs[Instr.Src1], IntRegs[Instr.Src2]);
             Inc(CurPC);
           end;
         bcRandomize:  // RANDOMIZE: seed the RNG (Immediate=1 -> explicit seed in Src1; 0 -> time-based)

@@ -2140,7 +2140,13 @@ begin
             else
               Result := MakeSSAValue(svkNone);
           ttOpShl: Result := MakeSSAConstInt(Left.ConstInt shl Right.ConstInt);
-          ttOpShr: Result := MakeSSAConstInt(Left.ConstInt shr Right.ConstInt);
+          // Fold SHR exactly as the VM runs it, or the optimizer and --no-opt disagree on any
+          // constant negative shift ("-5 Shr 2": arithmetic = -2, FPC's logical = a huge positive).
+          ttOpShr:
+            if IsUnsigned64Expr(Node.GetChild(0)) then
+              Result := MakeSSAConstInt(LogicalShr64(Left.ConstInt, Right.ConstInt))
+            else
+              Result := MakeSSAConstInt(ArithShr64(Left.ConstInt, Right.ConstInt));
         else
           Result := MakeSSAValue(svkNone);
         end;
@@ -2526,7 +2532,12 @@ begin
               OpCode := ssaModInt;
           end;
         end
-        // FreeBASIC \ (integer division), SHL, SHR: always integer; truncate any float operand.
+        // FreeBASIC \ (integer division), SHL, SHR: always integer, so a float operand is converted
+        // first -- by ROUNDING, not truncation. The manual (Operator \): "Float numeric values are
+        // converted to Integer by rounding up or down, and the fractional part of the resulting
+        // quotient is truncated." ssaFloatRound is the same round-to-nearest-even CINT/CLNG use;
+        // ssaFloatToInt (truncation) made "1.5 Shr 1" shift 1 instead of 2, so the standard
+        // FreeBASIC ceil idiom "-((-x*2.0-0.5) Shr 1)" returned 0 for every whole negative x.
         else if (Node.Token.TokenType = ttOpIntDiv) or (Node.Token.TokenType = ttOpShl) or
                 (Node.Token.TokenType = ttOpShr) then
         begin
@@ -2534,14 +2545,14 @@ begin
           begin
             TempReg := FProgram.AllocRegister(srtInt);
             TempVal := MakeSSARegister(srtInt, TempReg);
-            EmitInstruction(ssaFloatToInt, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitInstruction(ssaFloatRound, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
             Left := TempVal;
           end;
           if Right.RegType = srtFloat then
           begin
             TempReg := FProgram.AllocRegister(srtInt);
             TempVal := MakeSSARegister(srtInt, TempReg);
-            EmitInstruction(ssaFloatToInt, TempVal, Right, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitInstruction(ssaFloatRound, TempVal, Right, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
             Right := TempVal;
           end;
           DestReg := FProgram.AllocRegister(srtInt);
@@ -2554,10 +2565,15 @@ begin
             OpCode := ssaDivInt;
           end;
           // Unsigned 64-bit integer division: \ uses QWord div (signed div of a value with the sign
-          // bit set would give the wrong quotient). Shifts keep their existing (logical) semantics.
+          // bit set would give the wrong quotient).
           if (Node.Token.TokenType = ttOpIntDiv) and
              (IsUnsigned64Expr(Node.GetChild(0)) or IsUnsigned64Expr(Node.GetChild(1))) then
             OpCode := ssaDivUInt;
+          // SHR fills the vacated high bits from the SHIFTED operand's signedness: signed copies the
+          // sign bit (ssaShr, arithmetic), unsigned fills with zeros (ssaShrUInt). Only child 0 is
+          // consulted -- child 1 is a bit count, and its type says nothing about the fill.
+          if (Node.Token.TokenType = ttOpShr) and IsUnsigned64Expr(Node.GetChild(0)) then
+            OpCode := ssaShrUInt;
         end
         // Determine result type and allocate register (use hint if compatible)
         else if (Left.RegType = srtFloat) or (Right.RegType = srtFloat) then

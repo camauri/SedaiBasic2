@@ -318,6 +318,7 @@ begin
     ssaNarrowSingle: Result := bcNarrowSingle;   // B1.5: single-precision rounding
     ssaShl: Result := bcShl;                     // FreeBASIC bit shifts
     ssaShr: Result := bcShr;
+    ssaShrUInt: Result := bcShrUInt;
     ssaMutexCreate: Result := bcMutexCreate;    // M5.4: mutex primitives
     ssaMutexLock: Result := bcMutexLock;
     ssaMutexUnlock: Result := bcMutexUnlock;

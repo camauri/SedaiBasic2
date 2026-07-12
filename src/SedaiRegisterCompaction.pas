@@ -204,7 +204,7 @@ begin
     bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat,
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
     // Bitwise operations (result is int)
-    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
+    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr, bcShrUInt,
     // Conversions to int
     bcFloatToInt, bcStringToInt, bcFloatRound,
     bcNarrowInt,   // B1.5: integer width narrowing (Dest=int)
@@ -466,7 +466,7 @@ begin
     // ERROR <n> reads the user error number from Src1
     bcRaiseError,
     // Bitwise operations
-    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
+    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr, bcShrUInt,
     // === GROUP 3: Pointer deref (FreeBASIC): Src1 = address register (always int) ===
     bcRefLoadInt, bcRefLoadFloat, bcRefLoadString,
     bcRefStoreInt, bcRefStoreFloat, bcRefStoreString,
@@ -637,7 +637,7 @@ begin
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt,
     bcCmpLtUInt, bcCmpLeUInt, bcCmpGtUInt, bcCmpGeUInt,
     // Bitwise operations (second operand); shifts: Src2 = shift count
-    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr,
+    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr, bcShrUInt,
     // === GROUP 5: Memory operations ===
     bcPoke,           // POKE address, value: Src2 = value (int)
     // === GROUP 6: File I/O ===

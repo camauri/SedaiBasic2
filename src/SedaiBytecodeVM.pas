@@ -3003,7 +3003,7 @@ begin
         bcLoadConstInt, bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
         bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
         bcDivUInt, bcModUInt, bcCmpLtUInt, bcCmpGtUInt, bcCmpLeUInt, bcCmpGeUInt,
-        bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
+        bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr, bcShrUInt,
         bcRandomize:  // RANDOMIZE: Src1 = seed reg (Dest unused = 0)
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
@@ -4175,7 +4175,11 @@ begin
     bcBitwiseXor: Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] xor Ctx.IntRegs[Instr.Src2];
     bcBitwiseNot: Ctx.IntRegs[Instr.Dest] := not Ctx.IntRegs[Instr.Src1];
     bcShl: Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] shl Ctx.IntRegs[Instr.Src2];  // SHL
-    bcShr: Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] shr Ctx.IntRegs[Instr.Src2];  // SHR (logical)
+    // SHR is ARITHMETIC on a signed operand (FreeBASIC copies the sign bit into the vacated bits:
+    // "-5 Shr 2" = -2). FPC's "shr" is logical, so it needs the helper; the unsigned variant, which
+    // the SSA selects for a UInteger/ULongInt operand, is the zero-filling one.
+    bcShr:     Ctx.IntRegs[Instr.Dest] := ArithShr64(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);
+    bcShrUInt: Ctx.IntRegs[Instr.Dest] := LogicalShr64(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);
     bcRandomize:  // RANDOMIZE: seed the RNG (Immediate=1 -> explicit seed in Src1; 0 -> time-based)
       if Instr.Immediate <> 0 then RandSeed := Cardinal(Ctx.IntRegs[Instr.Src1]) else Randomize;
     // Control flow
