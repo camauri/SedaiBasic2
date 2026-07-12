@@ -638,6 +638,8 @@ begin
     bcCmpLtUInt, bcCmpLeUInt, bcCmpGtUInt, bcCmpGeUInt,
     // Bitwise operations (second operand); shifts: Src2 = shift count
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr, bcShrUInt,
+    // HEX$/OCT/BIN(n, digits): Src2 = the digits width (int; 0 = natural length)
+    bcStrHex, bcStrOct, bcStrBin,
     // === GROUP 5: Memory operations ===
     bcPoke,           // POKE address, value: Src2 = value (int)
     // === GROUP 6: File I/O ===

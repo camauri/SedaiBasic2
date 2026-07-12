@@ -3284,11 +3284,14 @@ begin
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
         end;
 
-        // Int Src1 -> String Dest (CHR$, HEX$, ERR$, SPACE, OCT, BIN, MK*int)
+        // Int Src1 -> String Dest (CHR$, HEX$, ERR$, SPACE, OCT, BIN, MK*int).
+        // HEX/OCT/BIN also take Src2 = the "digits" width register (0 = natural length).
         bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin, bcStrWChr, bcStrMkInt:
         begin
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+          if (Instr.OpCode = bcStrHex) or (Instr.OpCode = bcStrOct) or (Instr.OpCode = bcStrBin) then
+            if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
         end;
 
         // STRING(n,ch) / WSTRING(n,cp): int count (Src1) + int char code/codepoint (Src2) -> String Dest
@@ -5440,6 +5443,20 @@ end;
 // read the longest valid number ([sign] digits [. digits] [ (e|d) [sign] digits ]) and stop at the
 // first unsuitable character (so VAL("10abc")=10, VAL("10.5xy")=10.5). A "&H"/"&O"/"&B" base prefix is
 // parsed as an integer. Returns 0 when no number is present.
+function FitBaseDigits(const S: string; Digits: Int64): string;
+// The optional "digits" width of HEX$/OCT/BIN. FreeBASIC: "if you specify digits > 0, the result string
+// will be exactly that length" -- left-padded with zeros when the value is shorter, cut to the RIGHTMOST
+// digits when it is longer. 0 (the SSA's default when the argument is absent) means the natural length.
+begin
+  Result := S;
+  if Digits <= 0 then Exit;
+  if Length(Result) > Digits then
+    Result := Copy(Result, Length(Result) - Digits + 1, Digits)
+  else
+    while Length(Result) < Digits do
+      Result := '0' + Result;
+end;
+
 function ParseLeadingFloat(const S: string): Double;
 var
   I, J, K, Len, Code: Integer;
@@ -5893,13 +5910,13 @@ begin
       begin
         Ctx.FloatRegs[Instr.Dest] := ParseLeadingFloat(Ctx.StringRegs[Instr.Src1]);
       end;
-    9: // bcStrHex - HEX$(n) - full INT64 range, no leading zeros
+    9: // bcStrHex - HEX$(n[, digits]) - full INT64 range. Src2 = digits width (0 = no leading zeros).
       begin
         S := IntToHex(Ctx.IntRegs[Instr.Src1], 1);  // Minimum 1 digit
         // IntToHex with digits=1 still pads, so trim leading zeros
         while (Length(S) > 1) and (S[1] = '0') do
           Delete(S, 1, 1);
-        Ctx.StringRegs[Instr.Dest] := S;
+        Ctx.StringRegs[Instr.Dest] := FitBaseDigits(S, Ctx.IntRegs[Instr.Src2]);
       end;
     10: // bcStrInstr - INSTR([start,] haystack, needle)
       begin
@@ -5914,10 +5931,10 @@ begin
       end;
     11: // bcStrErr - ERR$(n)
       Ctx.StringRegs[Instr.Dest] := SedaiExecutorErrors.GetErrorCodeDescription(Ctx.IntRegs[Instr.Src1]);
-    19: // bcStrOct - OCT(n) - octal string, no leading zeros, full INT64 range
-      Ctx.StringRegs[Instr.Dest] := IntToBaseStr(Ctx.IntRegs[Instr.Src1], 8);
-    20: // bcStrBin - BIN(n) - binary string, no leading zeros, full INT64 range
-      Ctx.StringRegs[Instr.Dest] := IntToBaseStr(Ctx.IntRegs[Instr.Src1], 2);
+    19: // bcStrOct - OCT(n[, digits]) - octal string, full INT64 range. Src2 = digits width (0 = natural).
+      Ctx.StringRegs[Instr.Dest] := FitBaseDigits(IntToBaseStr(Ctx.IntRegs[Instr.Src1], 8), Ctx.IntRegs[Instr.Src2]);
+    20: // bcStrBin - BIN(n[, digits]) - binary string, full INT64 range. Src2 = digits width (0 = natural).
+      Ctx.StringRegs[Instr.Dest] := FitBaseDigits(IntToBaseStr(Ctx.IntRegs[Instr.Src1], 2), Ctx.IntRegs[Instr.Src2]);
     21: // bcStrValInt - VALINT/VALLNG/VALUINT(s) - parse leading integer (0 if none)
       Ctx.IntRegs[Instr.Dest] := ParseLeadingInt64(Ctx.StringRegs[Instr.Src1]);
   else

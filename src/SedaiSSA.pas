@@ -282,6 +282,7 @@ type
     function ResolveConstructorLabel(const TypeName, ArgSig: string): string;  // M4.4g: by type signature
     function BankToChar(Bank: TSSARegisterType): Char;          // M4.4g: I/F/S bank code for a ctor signature
     function CtorSigFromParams(ParamList: TASTNode): string;    // M4.4g: type signature of a ctor's params
+    function BaseDigitsArg(ArgListNode: TASTNode): TSSAValue;   // HEX$/OCT/BIN optional "digits" width
     function ArgSigFromArgs(ArgsNode: TASTNode): string;        // bank signature of a call's arguments
     function ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;  // pick an overload
     function FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;  // M4.4h: defaulted ctor
@@ -423,6 +424,7 @@ type
     procedure SetPrintKindScoped(const ProcName, VarName, TypeName: string);
     procedure RecordSharedScalarPrintKind(const VarName, TypeName: string);  // DIM SHARED never recorded its type
     function PrintKindOf(const VarName: string): Integer;               // scoped entry wins over the module one
+    function PrintKindOfExpr(Node: TASTNode): Integer;                  // ...also for a call's return type
     function ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;  // narrow by an explicit width code
     function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on scalar store
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
@@ -3088,7 +3090,7 @@ begin
         end
         else if (FuncName = 'HEX$') or (FuncName = 'HEX') or (FuncName = kWHEX) then
         begin
-          // HEX$(n) / HEX(n) / WHEX(n) - hex string (WHEX = wide; ASCII hex digits are identical UTF-8)
+          // HEX$(n[, digits]) / WHEX - hex string (WHEX = wide; ASCII hex digits are identical UTF-8).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
           else if ArgListNode <> nil then
@@ -3098,12 +3100,12 @@ begin
           ArgReg := EnsureIntRegister(ArgValue);
           DestReg := FProgram.AllocRegister(srtString);
           Result := MakeSSARegister(srtString, DestReg);
-          EmitInstruction(ssaStrHex, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          EmitInstruction(ssaStrHex, Result, ArgReg, BaseDigitsArg(ArgListNode), MakeSSAValue(svkNone));
         end
         else if (FuncName = 'OCT') or (FuncName = 'BIN') or (FuncName = kWOCT) or (FuncName = kWBIN) then
         begin
-          // OCT/BIN/WOCT/WBIN(n) - octal/binary string of an integer (no leading zeros). The W* forms are
-          // wide; the digits are ASCII so the bytes are identical to the narrow form.
+          // OCT/BIN(n[, digits]) and the wide W* forms - octal/binary string of an integer. The W* forms
+          // are wide; the digits are ASCII so the bytes are identical to the narrow form.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
           else if ArgListNode <> nil then
@@ -3114,9 +3116,9 @@ begin
           DestReg := FProgram.AllocRegister(srtString);
           Result := MakeSSARegister(srtString, DestReg);
           if (FuncName = 'OCT') or (FuncName = kWOCT) then
-            EmitInstruction(ssaStrOct, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+            EmitInstruction(ssaStrOct, Result, ArgReg, BaseDigitsArg(ArgListNode), MakeSSAValue(svkNone))
           else
-            EmitInstruction(ssaStrBin, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitInstruction(ssaStrBin, Result, ArgReg, BaseDigitsArg(ArgListNode), MakeSSAValue(svkNone));
         end
         else if (FuncName = 'VALINT') or (FuncName = 'VALLNG') or (FuncName = 'VALUINT') or
                 (FuncName = kVALULNG) then
@@ -5907,9 +5909,9 @@ begin
 
     // B1.5 phase C: printing a BOOLEAN variable yields "true"/"false"; a 64-bit unsigned variable
     // (UInteger/ULongInt) prints unsigned. Only the direct `PRINT var` form is special-cased.
-    if (Child.NodeType = antIdentifier) and (ExprValue.RegType = srtInt) then
+    if (ExprValue.RegType = srtInt) then
     begin
-      PKidx := PrintKindOf(VarToStr(Child.Value));   // a same-named var in this procedure wins
+      PKidx := PrintKindOfExpr(Child);   // a same-named var in this procedure wins
       if PKidx > 0 then
       begin
         if PKidx = 1 then
@@ -14681,6 +14683,28 @@ begin
     FUnsigned64Arrays.Add(Nm);
 end;
 
+function TSSAGenerator.PrintKindOfExpr(Node: TASTNode): Integer;
+// The print form of a printable EXPRESSION, not just of a bare variable. A FUNCTION's return type is
+// recorded under its own name, so "Print isOverlapping(a, b)" on a "... As Boolean" function must print
+// "true"/"false" like the variable form does -- it printed -1/0, because only an antIdentifier was ever
+// consulted. A call parsed as an array access carries its name in child 0; a genuine array element lands
+// here too, but an array name is never in the print-kind table (only scalars, parameters and returns).
+begin
+  Result := 0;
+  if Node = nil then Exit;
+  case Node.NodeType of
+    antIdentifier:
+      Result := PrintKindOf(VarToStr(Node.Value));
+    antFunctionCall:
+      Result := PrintKindOf(VarToStr(Node.Value));
+    antArrayAccess:
+      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+        Result := PrintKindOf(VarToStr(Node.GetChild(0).Value));
+    antParentheses:
+      if Node.ChildCount >= 1 then Result := PrintKindOfExpr(Node.GetChild(0));
+  end;
+end;
+
 function TSSAGenerator.PrintKindOf(const VarName: string): Integer;
 // 0 = plain signed, 1 = BOOLEAN, 2 = unsigned-64. A name declared in the procedure being lowered wins:
 // its scoped entry is authoritative (kind 0 included). Falling back to the module-level entry keeps the
@@ -15294,6 +15318,27 @@ begin
   end;
 end;
 
+function TSSAGenerator.BaseDigitsArg(ArgListNode: TASTNode): TSSAValue;
+// The optional "digits" width of HEX$/OCT/BIN. FreeBASIC: "Bin(number, digits)" -- "if you specify
+// digits > 0, the result string will be exactly that length", left-padded with zeros (and cut to the
+// rightmost digits when the value needs more). We parsed the second argument and then ignored it, so
+// "Bin(11, 5)" gave "1011" instead of "01011" and every fixed-width bit string came out short.
+//
+// Always materialised into an int register (0 = no width given), so the VM never reads an operand that
+// was never written.
+var
+  V: TSSAValue;
+begin
+  if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and
+     (ArgListNode.ChildCount >= 2) then
+  begin
+    ProcessExpression(ArgListNode.GetChild(1), V);
+    Result := EnsureIntRegister(V);
+  end
+  else
+    Result := EnsureIntRegister(MakeSSAConstInt(0));
+end;
+
 function TSSAGenerator.ArgSigFromArgs(ArgsNode: TASTNode): string;
 // The bank signature of a CALL's arguments, in the same alphabet the declaration's label uses:
 // 'S' string, 'F' float, 'I' everything else. THIS is not part of it (a method's label signature
@@ -15658,9 +15703,11 @@ begin
       VarName := UpperCase(VarToStr(Node.GetChild(0).Value));
       TypeName := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
       if TypeName <> '' then RegisterTypedVar(VarName, TypeName);
-      // A FUNCTION returning UInteger/ULongInt: record its print-kind under the function name so a call
-      // result (Print f(...) / f(...) in a compare) is recognised as unsigned by IsUnsigned64Expr.
-      if (TypeName = 'UINTEGER') or (TypeName = 'ULONGINT') then
+      // Record the print form under the FUNCTION's own name, so a call RESULT prints like a variable of
+      // that type would: unsigned-64 (recognised by IsUnsigned64Expr), narrow unsigned (no sign space),
+      // or BOOLEAN. The last one is why "Print isOverlapping(a, b)" on a "... As Boolean" function used
+      // to print -1/0 instead of true/false -- only unsigned returns were ever recorded.
+      if PrintKindOfType(TypeName) <> 0 then
         RecordVarWidth(VarName, TypeName);
     end;
     // Record-typed (or explicit-typed) parameters: "param AS type" (M3.1). The parameter
