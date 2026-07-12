@@ -4339,14 +4339,16 @@ begin
 
         // FreeBASIC SIZEOF(T) / LEN(T) — compile-time byte size of a type. The argument is a type name
         // (identifier); a pointer variable argument resolves to pointer size (8). Used for "Allocate(n *
-        // SizeOf(Integer))". (Only the single-identifier form; "SizeOf(T PTR)" needs type-arg parsing.)
+        // SizeOf(Integer))". A POINTER TYPE argument arrives as the single identifier "T PTR" (the parser
+        // folds the juxtaposition, as it does for a DIM) and is likewise 8 bytes.
         if (UpperCase(ArrName) = 'SIZEOF') and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount = 1) and
            (Node.GetChild(1).GetChild(0).NodeType = antIdentifier) then
         begin
           ArrName2 := UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value));
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          if (FPointerVars.IndexOfName(ArrName2) >= 0) or IsRawPtr(ArrName2) then
+          if (FPointerVars.IndexOfName(ArrName2) >= 0) or IsRawPtr(ArrName2) or
+             ((Length(ArrName2) >= 4) and (Copy(ArrName2, Length(ArrName2) - 3, 4) = ' PTR')) then
             EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
           else
             EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(ArrName2)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));

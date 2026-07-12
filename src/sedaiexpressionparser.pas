@@ -85,6 +85,7 @@ type
     function ParseNew(Token: TLexerToken): TASTNode;           // NEW T [(args)] → antNew (FreeBASIC)
     function ParseTypeConstructor(Token: TLexerToken): TASTNode; // type<T>(args) → anonymous UDT temporary
     function ParseCast(Token: TLexerToken): TASTNode;          // CAST/CPTR(type, expr) → antCast
+    function ParseSizeOfPtrType(Token: TLexerToken): TASTNode; // SIZEOF(<type> PTR) → SIZEOF("T PTR"); nil if not a pointer type
     function ParseDeref(Token: TLexerToken): TASTNode;         // *ptr → antDeref (FreeBASIC pointers)
     function ParseThreadCreate(Token: TLexerToken): TASTNode;  // THREADCREATE(@sub, param) (M5.2)
     function ParseThreadSelf(Token: TLexerToken): TASTNode;    // THREADSELF() → antThreadSelf (M5.5)
@@ -869,6 +870,18 @@ begin
   begin
     Result := ParseCast(Token);
     Exit;
+  end;
+
+  // SIZEOF(<type> PTR): the argument is a POINTER TYPE, not an expression -- "Integer Ptr" parses as two
+  // juxtaposed identifiers and died on "Expected ')'". Fold it into the single "INTEGER PTR" identifier the
+  // rest of the pipeline already uses for pointer types (a DIM records exactly that spelling), so SIZEOF
+  // resolves it to the pointer size. Only when a PTR actually follows: SIZEOF(x) over a variable, and
+  // SIZEOF(T) over a plain type, keep their existing paths.
+  if (IdentName = 'SIZEOF') and Context.Check(ttDelimParOpen) and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttIdentifier) then
+  begin
+    Result := ParseSizeOfPtrType(Token);
+    if Assigned(Result) then Exit;
   end;
 
   // Check if this is a user-defined function call (FNxxx followed by parenthesis)
@@ -1656,6 +1669,47 @@ begin
   Result.AddChild(NameNode);
   Result.AddChild(Args);
   DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseSizeOfPtrType(Token: TLexerToken): TASTNode;
+// "SIZEOF(<type> PTR [PTR...])" -> antFunctionCall SIZEOF whose single argument is the type spelled as ONE
+// identifier ("INTEGER PTR"), the same spelling a DIM produces. A speculative parse: it only commits when
+// a PTR really follows the type name, and otherwise rewinds and returns nil so SIZEOF(var) / SIZEOF(T) --
+// which are ordinary expressions -- take their existing path untouched.
+var
+  Saved: Integer;
+  TypeStr: string;
+  Args, NameNode: TASTNode;
+begin
+  Result := nil;
+  Context.SavePosition(Saved);
+  Context.Advance;                                   // consume '('
+  if not Context.Check(ttIdentifier) then begin Context.RestorePosition(Saved); Exit; end;
+  TypeStr := UpperCase(VarToStr(Context.CurrentToken.Value));
+  Context.Advance;                                   // consume the type name
+  if not (Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR')) then
+  begin
+    Context.RestorePosition(Saved);                  // not a pointer type -- leave it to the normal path
+    Exit;
+  end;
+  while Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR') do
+  begin
+    TypeStr := TypeStr + ' PTR';                     // "T PTR PTR" folds too
+    Context.Advance;
+  end;
+  if not Context.Match(ttDelimParClose) then
+  begin
+    Context.RestorePosition(Saved);
+    Exit;
+  end;
+  // Same node shape SIZEOF(T) already produces: antArrayAccess(SIZEOF, antExpressionList(<type>)) -- the
+  // SSA folds it there. Only the type identifier differs ("INTEGER PTR" instead of "INTEGER").
+  Args := TASTNode.Create(antExpressionList, Token);
+  Args.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeStr, Token));
+  NameNode := TASTNode.CreateWithValue(antIdentifier, 'SIZEOF', Token);
+  Result := TASTNode.Create(antArrayAccess, Token);
+  Result.AddChild(NameNode);
+  Result.AddChild(Args);
 end;
 
 function TExpressionParser.ParseCast(Token: TLexerToken): TASTNode;
