@@ -165,6 +165,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `qr_decomposition.bas` | <https://rosettacode.org/wiki/QR_decomposition> |
 | `call_an_object_method.bas` | <https://rosettacode.org/wiki/Call_an_object_method> |
 | `cramers_rule.bas` | <https://rosettacode.org/wiki/Cramer%27s_rule> |
+| `extended_straddling_checkerboard.bas` | <https://rosettacode.org/wiki/Extended_Straddling_Checkerboard> |
 
 ## Running
 
