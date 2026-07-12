@@ -80,6 +80,9 @@ type
     ArrayElemBank: TSSARegisterType;  // element bank of an array member (int/float/string)
     ArrayElemType: string;  // element UDT type name if the array member is an array-of-UDT ("verts(100) As Vertex"),
                             // else ''. Each element is a record handle: allocated per-instance in EmitRecordInit.
+    ArrayElemPtrPointee: string;  // pointee UDT if the array member's elements are UDT POINTERS ("kids(Any) As N Ptr"),
+                            // else ''. Kept apart from ArrayElemType: an element is a handle to a record owned
+                            // ELSEWHERE, so it starts null and EmitRecordInit must NOT allocate one per element.
     ArrayDimCount: Integer; // declared dimension count of an array member (>=1)
     ArrayBounds: TASTNode;  // antDimensions with concrete upper bounds for a FIXED-size array member
                             // ("Dim data(100) As Integer"); nil for an "Any" member (sized by REDIM).
@@ -218,6 +221,7 @@ type
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
     FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
     FArrayFuncPtrSig: TStringList;       // array-of-funcptr (DIM As <named funcptr type> a(..)) -> "params|ret" signature, so "a(i)(args)" is an indirect call
+    FArrayPtrPointee: TStringList;       // array of UDT POINTERS ("DIM As T PTR a(..)", "a() AS T PTR" param) -> T, so "a(i)->field" resolves (params under their mangled name)
     FNeededDispatchers: TStringList;     // M4.3: "TYPE|METHOD" pairs needing a virtual dispatcher
     FDeclaredNames: TStringList;         // names introduced by an EXPLICIT declaration (DIM/VAR/STATIC/CONST,
                                          //   procedure parameters). Distinct from FVarMap, which also holds
@@ -402,6 +406,7 @@ type
                            out Slot: Integer; out ElemBank: TSSARegisterType;
                            out DimCount: Integer): Boolean;   // array member (obj.field(i,j))
     function UDTArrayElemType(UDTIdx: Integer; const FieldName: string): string;  // element UDT type of an array-of-UDT member (else '')
+    function UDTArrayElemPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT when an array member's elements are UDT POINTERS (else '')
     function UDTFuncPtrFieldSig(UDTIdx: Integer; const FieldName: string; out Slot: Integer): string;  // funcptr field signature + slot (else '')
     function UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;  // B1.5: field narrow width
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
@@ -436,6 +441,8 @@ type
     function ObjectTypeName(ObjNode: TASTNode): string;
     // UDT element type of an array-of-UDT by name, scope-aware (per-proc array param, then global).
     function ArrayRecordTypeOf(const ArrName: string): string;
+    function PointeeOfPtrTypeName(const TypeName: string): string;   // "T PTR" -> T when T is a UDT, else ''
+    function ArrayPointerUDTType(const ArrName: string): string;     // array whose ELEMENTS are "T PTR" -> T (scope-aware)
     // FreeBASIC "Operator T.Cast() As String": if Node is a UDT with a string cast, invoke it -> string.
     function CastReturnCode(const RetTypeName: string): string;  // OPERATOR CAST label suffix by return bank
     function DerefPointeeUDTType(Node: TASTNode): string;  // UDT a "*expr" points to (var or Cast(T Ptr,..))
@@ -697,6 +704,8 @@ begin
   FArrayRecordType.CaseSensitive := False;
   FArrayFuncPtrSig := TStringList.Create;
   FArrayFuncPtrSig.CaseSensitive := False;
+  FArrayPtrPointee := TStringList.Create;
+  FArrayPtrPointee.CaseSensitive := False;
   FNeededDispatchers := TStringList.Create;
   FNeededDispatchers.Duplicates := dupIgnore;
   FNeededDispatchers.Sorted := True;
@@ -771,6 +780,7 @@ begin
   FArrayRecordType.Free;
   FArrayScalarType.Free;
   FArrayFuncPtrSig.Free;
+  FArrayPtrPointee.Free;
   FNeededDispatchers.Free;
   FDeclaredNames.Free;
   FCurrentProcLocalRecs.Free;
@@ -6591,6 +6601,11 @@ begin
     // Record the signature so "a(i)(args)" is lowered as an indirect call through the loaded element.
     if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') and (FFuncPtrTypes.IndexOfName(ArrElemTypeName) >= 0) then
       FArrayFuncPtrSig.Values[UpperCase(ArrName)] := FFuncPtrTypes.Values[ArrElemTypeName];
+
+    // Array of UDT POINTERS ("Dim As T Ptr a(..)"): the element is an int holding a record handle.
+    // Record the pointee so "a(i)->field" resolves to record access on the loaded element.
+    if (RecArrUDTIdx < 0) and (PointeeOfPtrTypeName(ArrElemTypeName) <> '') then
+      FArrayPtrPointee.Values[UpperCase(ArrName)] := PointeeOfPtrTypeName(ArrElemTypeName);
 
     // B1.5: remember a narrow element width (DIM a(n) AS BYTE/.../SINGLE) so element stores wrap to it.
     if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') then
@@ -14690,6 +14705,22 @@ begin
       Exit(FUDTs[UDTIdx].Fields[i].ArrayElemType);
 end;
 
+function TSSAGenerator.UDTArrayElemPtrPointee(UDTIdx: Integer; const FieldName: string): string;
+// The pointee UDT of an array member whose elements are UDT pointers ("kids(Any) As N Ptr" -> "N"), else
+// ''. Distinct from UDTArrayElemType (array-of-UDT VALUES): here an element is a handle to a record owned
+// elsewhere, so nothing is allocated per element -- only "obj.field(i)->x" needs the type.
+var
+  i: Integer;
+  F: string;
+begin
+  Result := '';
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if (FUDTs[UDTIdx].Fields[i].Name = F) and FUDTs[UDTIdx].Fields[i].IsArray then
+      Exit(FUDTs[UDTIdx].Fields[i].ArrayElemPtrPointee);
+end;
+
 function TSSAGenerator.UDTFuncPtrFieldSig(UDTIdx: Integer; const FieldName: string; out Slot: Integer): string;
 // The "paramtypes|rettype" signature of a funcptr field ("fn As Function(...) As R"), and its int Slot,
 // else ''. Lets "obj.fn(args)" be lowered as an indirect call through the loaded field value.
@@ -14887,7 +14918,7 @@ var
   FieldNode, TypeNode: TASTNode;
   Bank, ArrElemBank: TSSARegisterType;
   cInt, cFloat, cStr, ArrDims: Integer;
-  TypeName, FieldName, NestedT, PtrPointeeT, ArrElemType, FuncPtrSigVal: string;
+  TypeName, FieldName, NestedT, PtrPointeeT, ArrElemType, ArrElemPtrPointeeT, FuncPtrSigVal: string;
   RawPtrPointeeT, PointeeScalarT: string;
   IsArrayField: Boolean;
 begin
@@ -14972,6 +15003,7 @@ begin
       ArrElemBank := srtInt;
       ArrDims := 1;
       ArrElemType := '';
+      ArrElemPtrPointeeT := '';
       if IsArrayField then
       begin
         ArrElemBank := Bank;
@@ -14979,6 +15011,14 @@ begin
         // Array-of-UDT member ("verts(100) As Vertex"): remember the element UDT type (NestedT held it)
         // so EmitRecordInit can allocate a record per element and access resolves obj.field(i) to a handle.
         if NestedT <> '' then ArrElemType := NestedT;
+        // Array-of-UDT-POINTER member ("kids(Any) As N Ptr"): the elements are handles to records owned
+        // elsewhere. Kept separate from ArrElemType so no record is allocated per element -- only the
+        // pointee TYPE is needed, to resolve "obj.field(i)->x". PtrPointeeT is cleared just below.
+        if PtrPointeeT <> '' then
+        begin
+          ArrElemPtrPointeeT := PtrPointeeT;
+          ArrElemBank := srtInt;   // an element is a HANDLE, not a value of the pointee type
+        end;
         Bank := srtInt;      // the field slot holds the FArrays handle
         NestedT := '';       // not a nested record (the field itself is the array handle)
         PtrPointeeT := '';
@@ -15001,6 +15041,7 @@ begin
       FUDTs[Idx].Fields[n].IsArray := IsArrayField;
       FUDTs[Idx].Fields[n].ArrayElemBank := ArrElemBank;
       FUDTs[Idx].Fields[n].ArrayElemType := ArrElemType;
+      FUDTs[Idx].Fields[n].ArrayElemPtrPointee := ArrElemPtrPointeeT;
       FUDTs[Idx].Fields[n].ArrayDimCount := ArrDims;
       FUDTs[Idx].Fields[n].FuncPtrSig := FuncPtrSigVal;
       // Fixed-size array member ("Dim data(100) As Integer"): the parser keeps the dimension list as an
@@ -18259,6 +18300,36 @@ begin
   end;
 end;
 
+function TSSAGenerator.PointeeOfPtrTypeName(const TypeName: string): string;
+// "T PTR" -> T, but only when T is a user UDT (the managed-reference model applies to those). Anything
+// else -- a scalar pointee, a multi-level "T PTR PTR" -- returns '' and is left to the raw-pointer paths.
+var
+  T: string;
+begin
+  Result := '';
+  T := UpperCase(Trim(TypeName));
+  if (Length(T) < 5) or (Copy(T, Length(T) - 3, 4) <> ' PTR') then Exit;
+  T := Trim(Copy(T, 1, Length(T) - 4));
+  if FindUDT(T) >= 0 then Result := T;
+end;
+
+function TSSAGenerator.ArrayPointerUDTType(const ArrName: string): string;
+// The pointee UDT of an array whose ELEMENTS are UDT pointers ("Dim As T Ptr a(n)", or an
+// "a() As T Ptr" parameter). Scope-aware exactly like ArrayRecordTypeOf: a parameter is recorded under
+// its per-proc mangled name, a DIM under its plain name. Empty when the elements are not UDT pointers.
+var
+  nameU, mangled: string;
+begin
+  Result := '';
+  nameU := UpperCase(ArrName);
+  if FInProcedure then
+  begin
+    mangled := ParamArrayMangle(FCurrentProcName, nameU);
+    if FArrayPtrPointee.IndexOfName(mangled) >= 0 then Exit(FArrayPtrPointee.Values[mangled]);
+  end;
+  if FArrayPtrPointee.IndexOfName(nameU) >= 0 then Result := FArrayPtrPointee.Values[nameU];
+end;
+
 function TSSAGenerator.ArrayRecordTypeOf(const ArrName: string): string;
 // The UDT element type of an array-of-UDT, resolved scope-aware: an array PARAMETER's placeholder is
 // registered under its per-proc mangled name (RegisterArrayParams), so inside a proc body try that name
@@ -18375,6 +18446,10 @@ begin
     begin
       ArrName := UpperCase(VarToStr(ObjNode.GetChild(0).Value));
       Result := ArrayRecordTypeOf(ArrName);   // scope-aware (array-of-UDT parameter too)
+      // "arr(i)->field": the array's ELEMENTS are UDT pointers, so the element is a record of the
+      // pointee type. Mirrors the branch ResolveRecordObject takes to load that element's handle.
+      if Result = '' then
+        Result := ArrayPointerUDTType(ArrName);
       // "type<T>(...)"/"T(...)" anonymous temporary: the "array name" is a UDT type with no array of that
       // name in scope — the node constructs a temporary T (same guard as the codegen hook).
       if (Result = '') and (FindUDT(ArrName) >= 0) and (ArrayIndexOf(ArrName) < 0) then
@@ -18396,6 +18471,10 @@ begin
       if ParentType <> '' then
       begin
         Result := UDTArrayElemType(FindUDT(ParentType), VarToStr(ObjNode.GetChild(0).Value));
+        // "obj.field(i)->x": the member array's elements are UDT POINTERS, so the element is a record of
+        // the pointee type (the loaded element IS its handle, exactly as for an array-of-UDT member).
+        if Result = '' then
+          Result := UDTArrayElemPtrPointee(FindUDT(ParentType), VarToStr(ObjNode.GetChild(0).Value));
         // "obj.method(args)" returning a UDT: the method's return type is registered under its label, so
         // "Print obj.method()" reaches its Cast operator and a chained "obj.method().field" resolves.
         if Result = '' then
@@ -18603,6 +18682,11 @@ begin
     StageCallArgs(MethodLabel, TmpArgs);                 // THIS + declared args (base signature)
     if RetRecType <> '' then
       EmitXferStore(srtInt, XFER_RESULT_HANDLE_SLOT, RcHandle);
+    // Array params are passed by aliasing the callee's placeholder slot to the caller's array, exactly
+    // as for a plain SUB/FUNCTION (EmitUserFunctionCall). TmpArgs lines up 1:1 with the method's params
+    // (THIS at index 0), so the shared helper works here too. Binding also covers the polymorphic path:
+    // the alias is a global slot, independent of how the dispatcher forwards the staged scalars.
+    EmitArrayArgBinds(MethodLabel, TmpArgs, True);
     if (not ForceStatic) and MethodNeedsDispatch(ObjType, MethNm) then
     begin
       // Polymorphic: call the virtual dispatcher (it forwards the staged args + result handle).
@@ -18611,6 +18695,7 @@ begin
     end
     else
       EmitCallSubLabel(ProcedureLabelName(MethodLabel));  // monomorphic / super call: direct static call
+    EmitArrayArgBinds(MethodLabel, TmpArgs, False);       // restore the aliased array slots
     // BYREF: copy explicit-BYREF scalar params back into variable args. TmpArgs aligns 1:1 with the
     // method's params (THIS at index 0, never BYREF), so the shared writeback helper works as-is.
     EmitByrefWriteback(MethodLabel, TmpArgs);
@@ -18738,6 +18823,10 @@ begin
       ParentType := ObjectTypeName(ObjNode.GetChild(0).GetChild(0));
       if ParentType <> '' then
         MemberArrElemType := UDTArrayElemType(FindUDT(ParentType), VarToStr(ObjNode.GetChild(0).Value));
+        // Elements that are UDT POINTERS: the indirect int load below already yields the handle -- only the
+        // TYPE differs, and it is the pointee. (No record is allocated per element for these.)
+        if MemberArrElemType = '' then
+          MemberArrElemType := UDTArrayElemPtrPointee(FindUDT(ParentType), VarToStr(ObjNode.GetChild(0).Value));
       if (MemberArrElemType <> '') and
          IsMemberArrayAccess(ObjNode, MemberArrHandle, MemberArrBank, MemberArrIdx) then
       begin
@@ -18764,6 +18853,21 @@ begin
     TypeName := ArrayRecordTypeOf(ArrName);   // scope-aware (array-of-UDT parameter too)
     if TypeName = '' then
     begin
+      // "arr(i)->field" where the array's ELEMENTS are UDT pointers ("Dim As T Ptr arr(n)", or a
+      // "nodes() As T Ptr" parameter). The element's value IS the record handle -- the same managed-
+      // reference model a pointer variable uses -- so read the element and treat it as the object.
+      // Note this is the array-of-pointers case, NOT "ptr[i]" below (there the NAME is the pointer).
+      // Without it the node matched no branch: reads yielded the raw tagged handle instead of the field
+      // and stores were silently dropped.
+      ParentType := ArrayPointerUDTType(ArrName);
+      if (ParentType <> '') and (ObjNode.ChildCount >= 2) then
+      begin
+        ProcessExpression(ObjNode, HandleVal);      // ordinary int element load (indices, lbounds, binds)
+        HandleVal := EnsureIntRegister(HandleVal);
+        TypeName := ParentType;
+        Result := True;
+        Exit;
+      end;
       // "ptr[i].field": ptr is a pointer to a UDT (a Callocate(n, SizeOf(T)) record block, or a single
       // managed handle). The i-th record's handle is ptr's value + i — records from one Callocate are
       // consecutive shared-region slots, so adding i indexes the i-th (i=0 = ptr itself / a linked-list
@@ -19470,6 +19574,10 @@ begin
         // placeholder is an int array (TypeNameToBank would default an unknown UDT name to float).
         if FindUDT(TypeName) >= 0 then ET := srtInt
         else ET := TypeNameToBank(TypeName, '');
+        // "a() AS T PTR": elements are UDT pointers (int handles). Record the pointee under the same
+        // mangled name the body resolves through, so "a(i)->field" reaches the record.
+        if PointeeOfPtrTypeName(TypeName) <> '' then
+          FArrayPtrPointee.Values[MangledName] := PointeeOfPtrTypeName(TypeName);
       end
       else
       begin
