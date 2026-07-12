@@ -2128,7 +2128,21 @@ begin
                       kDEC,
                       // RECORD: the Commodore v7 relative-file positioning command — FreeBASIC has none,
                       // and "record" is a very common identifier for a data row.
-                      kRECORD],
+                      kRECORD,
+                      // The rest are Commodore BASIC v7 commands with NO FreeBASIC counterpart (checked
+                      // against the FB manual: none of them has a KeyPg page), yet each is an ordinary word
+                      // a FreeBASIC program is entitled to use as an identifier. Reserving them in MODERN
+                      // rejected valid FB code outright — Rosetta's Hashtron_inference simply names a
+                      // variable "cmd". Keyword in CLASSIC, free identifier in MODERN.
+                      kCMD,      // redirect screen output          ("cmd" = command)
+                      kBOX,      // draw a rectangle                ("box" = bounding box)
+                      kSCALE,    // set the graphics coordinate scale
+                      kRENAME,   // rename a disk file              (FB spells it NAME)
+                      kCONCAT,   // concatenate two disk files
+                      kTRAP,     // error trapping                  ("trap" = a handler / a snare)
+                      kPLAY,     // play a music string
+                      kTEMPO,    // set the PLAY tempo
+                      kSOUND],   // emit a tone                     ("sound" = an audio buffer / a flag)
                      kdClassicOnly);
 
   //WriteLn('DEBUG RegisterBasicKeywords: Completed registration of ', GetKeywordCount, ' keywords');
