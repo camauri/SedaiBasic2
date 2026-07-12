@@ -5186,7 +5186,7 @@ end;
 procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
 var
   VarNode, ExprNode, SharedAssign: TASTNode;
-  VarName, LhsRecType, RhsRecType, AllocFuncU, RawFieldPointee: string;
+  VarName, LhsRecType, RhsRecType, DstRecType, AllocFuncU, RawFieldPointee: string;
   ExprValue, VarReg, SrcRecHandle: TSSAValue;
   CopyOp: TSSAOpCode;
   DerefBank: TSSARegisterType;   // FreeBASIC "*p = expr": bank of the pointee
@@ -5602,7 +5602,13 @@ begin
   LhsRecType := VarRecordTypeName(VarName);
   if (LhsRecType <> '') and ResolveRecordObject(ExprNode, SrcRecHandle, RhsRecType) then
   begin
-    VarReg := GetOrAllocateVariable(VarName);          // a's handle (own instance from its DIM)
+    // The destination's handle must be resolved exactly like the source's: a SHARED UDT keeps its
+    // record handle in element 0 of its backing array, not in a plain register (which is why member
+    // stores, PRINT and SWAP -- all of which go through ResolveRecordObject/ProcessExpression -- work
+    // on one). Reading the local register instead yielded handle 0, so the copy landed on whatever
+    // record owns slot 0 (typically a live parameter instance) and the shared variable never changed.
+    if not ResolveRecordObject(VarNode, VarReg, DstRecType) then
+      VarReg := GetOrAllocateVariable(VarName);        // a's handle (own instance from its DIM)
     EmitRecordCopy(VarReg, SrcRecHandle, FindUDT(LhsRecType));
     Exit;
   end;
@@ -6463,7 +6469,23 @@ begin
                           MakeSSAConstInt(FUDTs[RecUDTIdx].NFloat),
                           MakeSSAConstInt(FUDTs[RecUDTIdx].NStr or (Int64(RecUDTIdx) shl 32) or (Int64(1) shl 48)));
           EmitRecordInit(RecHandleVal, RecUDTIdx);
-          if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType = antArgumentList) then
+          // An initializer that is NOT a constructor argument list is either an implicit conversion
+          // through a one-argument constructor ("DIM SHARED v AS T = <scalar>") or a plain "= expr"
+          // value-copy — exactly as in the non-SHARED UDT branch below. This branch handled neither:
+          // it ran the default constructor and dropped the initializer on the floor, so "DIM SHARED
+          // AS T v = other" (or "= f()") left v zeroed, silently.
+          ScalarCtorInit := (ArrayDeclNode.ChildCount >= 3) and
+                            (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and
+                            (UpperCase(ObjectTypeName(ArrayDeclNode.GetChild(2))) <> UpperCase(RecTypeName)) and
+                            (ResolveConstructorLabel(RecTypeName, '?') <> '');   // a 1-parameter ctor exists
+          if ScalarCtorInit then
+          begin
+            CtorArgs := TASTNode.Create(antArgumentList, ArrayDeclNode.GetChild(2).Token);
+            CtorArgs.AddChild(ArrayDeclNode.GetChild(2).Clone);
+            EmitConstructorCall(RecHandleVal, RecTypeName, CtorArgs);
+            CtorArgs.Free;
+          end
+          else if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType = antArgumentList) then
           begin
             if ArrayDeclNode.GetChild(2).Attributes.Values['TUPLEINIT'] = '1' then
               EmitUDTAggregateInit(RecHandleVal, RecUDTIdx, ArrayDeclNode.GetChild(2))  // = (a,b,c) field init
@@ -6473,6 +6495,18 @@ begin
           else
             EmitConstructorCall(RecHandleVal, RecTypeName);
           EmitSharedScalarStoreVal(UpperCase(ArrName), RecHandleVal);  // publish the handle into name(0)
+          // The "= expr" value-copy runs AFTER the handle is published: ProcessAssignment resolves a
+          // SHARED record's destination from element 0 of the backing, which must already hold it.
+          if (not ScalarCtorInit) and (ArrayDeclNode.ChildCount >= 3) and
+             (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
+          begin
+            InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
+            InitAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(ArrName),
+                                                         ArrayDeclNode.GetChild(0).Token));
+            InitAssign.AddChild(ArrayDeclNode.GetChild(2).Clone);
+            ProcessAssignment(InitAssign);
+            InitAssign.Free;
+          end;
           // V5e: a module-global UDT with a destructor stashes its handle in a reserved transfer slot so
           // an END inside any SUB can still destroy it (the same as a non-shared global).
           if not FInProcedure then
