@@ -166,6 +166,7 @@ single work, but distributing separate works together (aggregation) is permitted
 | `call_an_object_method.bas` | <https://rosettacode.org/wiki/Call_an_object_method> |
 | `cramers_rule.bas` | <https://rosettacode.org/wiki/Cramer%27s_rule> |
 | `extended_straddling_checkerboard.bas` | <https://rosettacode.org/wiki/Extended_Straddling_Checkerboard> |
+| `fibonacci_sequence.bas` | <https://rosettacode.org/wiki/Fibonacci_sequence> |
 
 ## Running
 
