@@ -66,6 +66,25 @@
 
 {.$DEFINE DISABLE_REG_COMPACTION}
 
+// COPY COALESCING IS OFF: IT MISCOMPILES.
+//
+// SedaiCopyCoalescing rewrites "d := Copy s" by replacing every use of d with s across the WHOLE
+// program and NOPping the copy. Its header claims a live-range interference check; there is none. Its
+// only guard is "s must not be a user variable", which says nothing about whether s or d is redefined.
+//
+// That is unsound for exactly the instructions the pass exists to remove. PHI elimination gives a PHI
+// target d one copy PER PREDECESSOR: "d := Copy s1" in one, "d := Copy s2" in another. The pass
+// coalesces the first, rewrites EVERY use of d to s1, and deletes that copy -- so on the path through
+// the second predecessor, d is still assigned s2 while the uses now read s1. Wrong value, no diagnostic.
+//
+// Found by the Rosetta sweep (Mayan_numerals): the optimized build dropped and reordered printed items
+// while --no-opt was correct. Guard m392 keeps a reproducer in the corpus, so the differential
+// (opt vs --no-opt) net fails immediately if this is switched back on unchanged.
+//
+// Re-enabling requires a real implementation: single-definition (or dominance) checks on BOTH the copy's
+// destination and its source, or a proper interference graph. Same reasoning that keeps GVN/CSE off.
+{$DEFINE DISABLE_COPY_COAL}
+
 // GVN / CSE are mutually exclusive in the pipeline gating: GVN runs only when
 // DISABLE_CSE is defined, CSE runs only when DISABLE_GVN is defined. With NEITHER
 // defined (the current state) the gating runs NEITHER, so no SSA redundancy pass
