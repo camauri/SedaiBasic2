@@ -416,6 +416,10 @@ type
     function BuiltinFuncPtrOpId(const NameU: string): Integer;          // @Sin/@Cos/... math-builtin funcptr op id (0 if not a builtin)
     function MathConstValue(const NameU: string; out V: Double): Boolean;  // crt/math.bi constants (M_PI, M_E, ...)
     procedure RecordVarWidth(const VarName, TypeName: string);          // B1.5 phase 2: remember a var's width
+    // Print form of a name declared INSIDE a procedure, recorded under "PROC|NAME" (kind 0 included).
+    procedure SetPrintKindScoped(const ProcName, VarName, TypeName: string);
+    procedure RecordSharedScalarPrintKind(const VarName, TypeName: string);  // DIM SHARED never recorded its type
+    function PrintKindOf(const VarName: string): Integer;               // scoped entry wins over the module one
     function ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;  // narrow by an explicit width code
     function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on scalar store
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
@@ -5729,7 +5733,7 @@ var
   Child, ArgNode: TASTNode;
   SeparatorChar, FuncName: string;
   EndsWithSeparator: Boolean;
-  PKidx: Integer;   // B1.5 phase C: print-kind index for a BOOLEAN / unsigned-64 identifier
+  PKidx: Integer;   // B1.5 phase C: print kind of an identifier (0 = signed, 1 = BOOLEAN, 2 = unsigned-64)
 begin
   CurrentFormatReg := MakeSSAValue(svkNone);   // FreeBASIC mid-list "USING fmt" format, once set
   // FreeBASIC console WRITE: quoted-CSV to the screen (child 0 is a placeholder; values are children 1+).
@@ -5869,10 +5873,10 @@ begin
     // (UInteger/ULongInt) prints unsigned. Only the direct `PRINT var` form is special-cased.
     if (Child.NodeType = antIdentifier) and (ExprValue.RegType = srtInt) then
     begin
-      PKidx := FVarPrintKind.IndexOf(UpperCase(VarToStr(Child.Value)));
-      if PKidx >= 0 then
+      PKidx := PrintKindOf(VarToStr(Child.Value));   // a same-named var in this procedure wins
+      if PKidx > 0 then
       begin
-        if PtrInt(FVarPrintKind.Objects[PKidx]) = 1 then
+        if PKidx = 1 then
           EmitInstruction(ssaPrintBool, MakeSSAValue(svkNone), ExprValue,
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone))
         else
@@ -6474,6 +6478,8 @@ begin
           EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
                           MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         RecUDTIdx := FindUDT(RecTypeName);
+        if RecUDTIdx < 0 then
+          RecordSharedScalarPrintKind(UpperCase(ArrName), RecTypeName);  // BOOLEAN / unsigned-64 print form
         if RecUDTIdx >= 0 then
         begin
           // Shared UDT scalar: allocate the record in the SHARED region (immediate bit 48), construct it,
@@ -14593,6 +14599,76 @@ begin
     FVarPrintKind.Objects[Idx] := TObject(PtrInt(PK))
   else
     FVarPrintKind.AddObject(Nm, TObject(PtrInt(PK)));
+  // A local DIM also gets a procedure-scoped entry, which PrintKindOf prefers: the map above is keyed
+  // by BARE NAME, so a "Dim As UInteger z" in one procedure otherwise made every "z" in the program
+  // print (and compare/divide) as unsigned.
+  if FInProcedure and (FCurrentProcName <> '') then
+    SetPrintKindScoped(FCurrentProcName, Nm, T);
+end;
+
+procedure TSSAGenerator.SetPrintKindScoped(const ProcName, VarName, TypeName: string);
+// Record a name's print form under "PROC|NAME". FVarPrintKind is keyed by bare name, so an unsigned
+// declaration in ONE procedure leaked into every same-named variable in the program: Rosetta "Bitwise
+// operations" declares "y As Const UInteger" in rol()/ror(), which made the "y As Integer" of another
+// SUB unsigned -- "-15 Or 3" printed 18446744073709551603 instead of -13. A SIGNED name is recorded
+// too (kind 0), so the lookup stops at the scoped entry instead of falling back to the leaked one.
+var
+  PK, Idx: Integer;
+  Key, T: string;
+begin
+  T := UpperCase(TypeName);
+  if T = 'BOOLEAN' then PK := 1
+  else if (T = 'UINTEGER') or (T = 'ULONGINT') then PK := 2
+  else PK := 0;
+  Key := UpperCase(ProcName) + '|' + UpperCase(VarName);
+  Idx := FVarPrintKind.IndexOf(Key);
+  if Idx >= 0 then
+    FVarPrintKind.Objects[Idx] := TObject(PtrInt(PK))
+  else
+    FVarPrintKind.AddObject(Key, TObject(PtrInt(PK)));
+end;
+
+procedure TSSAGenerator.RecordSharedScalarPrintKind(const VarName, TypeName: string);
+// A SHARED scalar is backed by a 1-element global array, and its DIM branch exits before the typed-
+// scalar bookkeeping ever runs -- so it never recorded its declared type at all. "Dim Shared As
+// ULongInt" therefore printed (and compared/divided) as SIGNED. Record the print form under the bare
+// name for the direct "PRINT v" form, and mark the backing array unsigned as well: a read from inside
+// a procedure goes through that array (MakeSharedScalarAccess), which is what IsUnsigned64Expr sees.
+// The narrowing width is deliberately left alone here -- that is a separate gap (a SHARED Byte does
+// not wrap on store either), and widening this fix to touch every shared store is not the point.
+var
+  PK, Idx: Integer;
+  Nm, T: string;
+begin
+  Nm := UpperCase(VarName);
+  T := UpperCase(TypeName);
+  if T = 'BOOLEAN' then PK := 1
+  else if (T = 'UINTEGER') or (T = 'ULONGINT') then PK := 2
+  else Exit;                                   // plain signed: nothing to record
+  Idx := FVarPrintKind.IndexOf(Nm);
+  if Idx >= 0 then
+    FVarPrintKind.Objects[Idx] := TObject(PtrInt(PK))
+  else
+    FVarPrintKind.AddObject(Nm, TObject(PtrInt(PK)));
+  if (PK = 2) and (FUnsigned64Arrays.IndexOf(Nm) < 0) then
+    FUnsigned64Arrays.Add(Nm);
+end;
+
+function TSSAGenerator.PrintKindOf(const VarName: string): Integer;
+// 0 = plain signed, 1 = BOOLEAN, 2 = unsigned-64. A name declared in the procedure being lowered wins:
+// its scoped entry is authoritative (kind 0 included). Falling back to the module-level entry keeps the
+// previous behaviour for everything a scoped entry does not cover (module variables, FUNCTION results).
+var
+  Idx: Integer;
+begin
+  Result := 0;
+  if FInProcedure and (FCurrentProcName <> '') then
+  begin
+    Idx := FVarPrintKind.IndexOf(FCurrentProcName + '|' + UpperCase(VarName));
+    if Idx >= 0 then Exit(PtrInt(FVarPrintKind.Objects[Idx]));
+  end;
+  Idx := FVarPrintKind.IndexOf(UpperCase(VarName));
+  if Idx >= 0 then Result := PtrInt(FVarPrintKind.Objects[Idx]);
 end;
 
 function TSSAGenerator.ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;
@@ -15542,6 +15618,12 @@ begin
             // signed. Recording just these avoids adding any store-narrowing (their width code is 0).
             if (TypeName = 'UINTEGER') or (TypeName = 'ULONGINT') then
               RecordVarWidth(VarName, TypeName);
+            // EVERY typed parameter also gets a procedure-scoped entry (this pre-pass runs with no
+            // procedure context, so the name is taken from the declaration). A SIGNED one matters just
+            // as much as an unsigned one: it is what stops the bare-name lookup from picking up an
+            // unsigned parameter of the same name declared in some OTHER procedure.
+            if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+              SetPrintKindScoped(UpperCase(VarToStr(Node.GetChild(0).Value)), VarName, TypeName);
           end;
         end;
       end;
@@ -18434,9 +18516,9 @@ begin
     antIdentifier:
       begin
         // Declared UInteger/ULongInt variables are recorded with print-kind 2 (see RecordVarWidth).
-        U := UpperCase(VarToStr(Node.Value));
-        Idx := FVarPrintKind.IndexOf(U);
-        Result := (Idx >= 0) and (PtrInt(FVarPrintKind.Objects[Idx]) = 2);
+        // PrintKindOf, not a bare lookup: a variable of the procedure being lowered wins over a
+        // same-named unsigned one declared elsewhere.
+        Result := PrintKindOf(VarToStr(Node.Value)) = 2;
       end;
     antParentheses, antUnaryOp:
       if Node.ChildCount >= 1 then
