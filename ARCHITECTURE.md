@@ -527,10 +527,15 @@ The optimization pipeline consists of **22 configurable passes** controlled by `
 - **MUST run after DCE**, before bytecode compilation
 - `TSSAProgram.RunPhiElimination`
 
-#### Pass 16: Copy Coalescing (`SedaiCopyCoalescing.pas`)
-- Merges redundant copy operations
-- Reduces register pressure
+#### Pass 16: Copy Coalescing (`SedaiCopyCoalescing.pas`) — **DISABLED: it miscompiles**
+- Merges redundant copy operations; reduces register pressure
 - `TSSAProgram.RunCopyCoalescing: Integer`
+- **Off by default** (`{$DEFINE DISABLE_COPY_COAL}` in `OptimizationFlags.inc`). It replaces every use of
+  a copy's destination with its source across the whole program, with no interference analysis — so a PHI
+  target, which PHI elimination gives one copy *per predecessor*, gets all of its uses rewritten to the
+  source of the *first* copy. On any other incoming path the value is then wrong. Re-enabling requires
+  single-definition/dominance checks on both the copy's destination and its source, or a real interference
+  graph. Guard m392 keeps a reproducer in the differential corpus.
 
 ---
 
@@ -950,7 +955,7 @@ end;
     │  └────────────────────────────────────┘ │
     │  ┌─ Tier 4: Finalization ─────────────┐ │
     │  │  15. PHI Elimination (SSA→copies)  │ │
-    │  │  16. Copy Coalescing               │ │
+    │  │  16. Copy Coalescing  [DISABLED]   │ │
     │  └────────────────────────────────────┘ │
     └─────────────────────────────────────────┘
                 ↓ Optimized SSA IR
@@ -1135,7 +1140,7 @@ SedaiBasic emulates key aspects of the Commodore 128 for compatibility:
 | `SedaiLICM.pas` | Loop-invariant code motion |
 | `SedaiLoopUnroll.pas` | Loop unrolling |
 | `SedaiGosubInlining.pas` | GOSUB inlining |
-| `SedaiCopyCoalescing.pas` | Copy coalescing |
+| `SedaiCopyCoalescing.pas` | Copy coalescing (**disabled**: miscompiles PHI-target copies) |
 | `SedaiSSAConstruction.pas` | SSA construction |
 | `SedaiPhiElimination.pas` | PHI elimination |
 | `SedaiPeephole.pas` | Peephole optimization |
