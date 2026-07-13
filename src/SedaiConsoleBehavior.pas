@@ -472,16 +472,30 @@ begin
       end;
   end;
 
-  // Formatta il numero. NaN/Infinity use the FreeBASIC textual forms ("nan"/"inf"/"-inf") and must skip
-  // Frac/FloatToStr (both trap on non-finite input). A sign-bit-set NaN prints as "-nan", like C (and
-  // like FreeBASIC, which formats through it); '-nan'/'-inf' already carry their sign, so drop the Prefix.
+  // NaN/Infinity must skip Frac/FloatToStr (both trap on non-finite input). FreeBASIC does not render
+  // these itself: it hands them to the platform's C library, so its own output DIFFERS by platform --
+  // MSVCRT on Windows prints "1.#INF" / "-1.#IND" / "1.#QNAN", glibc on Linux prints "inf" / "-nan" /
+  // "nan". Mirroring the platform is therefore not a portability compromise: it is what makes us agree
+  // with the fbc of whichever machine we are on. (Verified against fbc 1.10.1 on win64.) The regression
+  // harness folds the two spellings together, so the corpus stays platform-independent.
+  //
+  // The sign bit tells the two NaNs apart: SET is the "indefinite" an invalid operation produces (0/0,
+  // Sqr of a negative); CLEAR is the quiet NaN the C library's log(-1) returns.
   if IsNanV then
   begin
+    {$IFDEF WINDOWS}
+    if NonNeg then NumStr := '1.#QNAN' else NumStr := '-1.#IND';
+    {$ELSE}
     if NonNeg then NumStr := 'nan' else NumStr := '-nan';
+    {$ENDIF}
   end
   else if IsInfV then
   begin
+    {$IFDEF WINDOWS}
+    if NonNeg then NumStr := '1.#INF' else NumStr := '-1.#INF';
+    {$ELSE}
     if NonNeg then NumStr := 'inf' else NumStr := '-inf';
+    {$ENDIF}
   end
   else if Frac(Value) = 0 then
     NumStr := IntToStr(Round(Value))

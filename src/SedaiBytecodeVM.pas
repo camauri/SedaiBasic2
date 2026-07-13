@@ -460,6 +460,15 @@ type
 
 implementation
 
+function QuietNaN: Double;
+// A NaN with the sign bit CLEAR. FPC's NaN constant has it SET (it is the x86 "indefinite" form, which
+// is what an invalid operation like 0/0 or Sqr(-1) produces, and what prints as "-1.#IND"). The C
+// library's log(-1) returns the sign-clear one, printed "1.#QNAN", and fbc reports it that way too.
+begin
+  Result := NaN;
+  PInt64(@Result)^ := PInt64(@Result)^ and $7FFFFFFFFFFFFFFF;
+end;
+
 function FloatToIntConv(V: Double; Modern: Boolean): Int64; inline;
 // The IMPLICIT float -> int conversion. FreeBASIC ROUNDS to nearest, ties to even -- verified against
 // fbc 1.10.1: 1.5 and 2.5 both convert to 2, 1.7 to 2, -1.5 and -2.5 to -2 -- and it does so wherever
@@ -9151,7 +9160,11 @@ begin
     Result := Ln(X)
   else if Assigned(FProgram) and FProgram.ModernMode then
   begin
-    if X = 0.0 then Result := NegInfinity else Result := NaN;
+    // Log of a negative yields a NaN with the sign bit CLEAR, which is how the C library reports it and
+    // what fbc 1.10.1 prints ("1.#QNAN"). Sqr of a negative, and 0/0, yield the sign-SET "indefinite"
+    // NaN instead ("-1.#IND"), which is FPC's NaN constant as it comes. The distinction is visible only
+    // in the printed text, and it is the text FreeBASIC produces.
+    if X = 0.0 then Result := NegInfinity else Result := QuietNaN;
   end
   else
     raise Exception.Create('LOG of non-positive number');
