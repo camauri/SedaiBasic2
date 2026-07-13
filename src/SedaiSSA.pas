@@ -2190,7 +2190,7 @@ begin
           // Fold SHR exactly as the VM runs it, or the optimizer and --no-opt disagree on any
           // constant negative shift ("-5 Shr 2": arithmetic = -2, FPC's logical = a huge positive).
           ttOpShr:
-            if IsUnsigned64Expr(Node.GetChild(0)) then
+            if IsUnsigned64Expr(Node.GetChild(0)) or (not FModernMode) then
               Result := MakeSSAConstInt(LogicalShr64(Left.ConstInt, Right.ConstInt))
             else
               Result := MakeSSAConstInt(ArithShr64(Left.ConstInt, Right.ConstInt));
@@ -2581,29 +2581,18 @@ begin
               OpCode := ssaModInt;
           end;
         end
-        // FreeBASIC \ (integer division), SHL, SHR: always integer, so a float operand is converted
-        // first -- by ROUNDING, not truncation. The manual (Operator \): "Float numeric values are
-        // converted to Integer by rounding up or down, and the fractional part of the resulting
-        // quotient is truncated." ssaFloatRound is the same round-to-nearest-even CINT/CLNG use;
-        // ssaFloatToInt (truncation) made "1.5 Shr 1" shift 1 instead of 2, so the standard
-        // FreeBASIC ceil idiom "-((-x*2.0-0.5) Shr 1)" returned 0 for every whole negative x.
+        // \ (integer division), SHL, SHR: always integer, so a float operand is converted first. That is
+        // the ordinary implicit conversion, so route it through ToIntValue and let the DIALECT decide --
+        // MODERN rounds (the manual, Operator \: "Float numeric values are converted to Integer by
+        // rounding up or down"), CLASSIC truncates. Rounding is what makes the standard FreeBASIC ceil
+        // idiom "-((-x*2.0-0.5) Shr 1)" work; truncation made it return 0 for every whole negative x.
+        // ToIntValue also folds a CONSTANT operand, which must not reach the conversion opcode: the VM
+        // would read it as a register index.
         else if (Node.Token.TokenType = ttOpIntDiv) or (Node.Token.TokenType = ttOpShl) or
                 (Node.Token.TokenType = ttOpShr) then
         begin
-          if Left.RegType = srtFloat then
-          begin
-            TempReg := FProgram.AllocRegister(srtInt);
-            TempVal := MakeSSARegister(srtInt, TempReg);
-            EmitInstruction(ssaFloatRound, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-            Left := TempVal;
-          end;
-          if Right.RegType = srtFloat then
-          begin
-            TempReg := FProgram.AllocRegister(srtInt);
-            TempVal := MakeSSARegister(srtInt, TempReg);
-            EmitInstruction(ssaFloatRound, TempVal, Right, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-            Right := TempVal;
-          end;
+          Left := ToIntValue(Left);
+          Right := ToIntValue(Right);
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
           case Node.Token.TokenType of
@@ -14587,7 +14576,11 @@ begin
   else if T = 'USHORT' then Result := 4
   else if T = 'LONG' then Result := 5
   else if T = 'ULONG' then Result := 6
-  else if T = 'SINGLE' then Result := 7
+  // SINGLE narrowing is MODERN-only. It goes hand in hand with the single-precision PRINT (7 significant
+  // digits), which is itself part of the FreeBASIC number-format preset -- and CLASSIC does not have that
+  // preset. Narrowing a v7 program's SINGLE without it would put the rounding error on screen (1.65 as
+  // 1.6499...), which is exactly the trap this feature was held back to avoid.
+  else if (T = 'SINGLE') and FModernMode then Result := 7
   else Result := 0;
 end;
 

@@ -4213,10 +4213,14 @@ begin
     bcBitwiseXor: Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] xor Ctx.IntRegs[Instr.Src2];
     bcBitwiseNot: Ctx.IntRegs[Instr.Dest] := not Ctx.IntRegs[Instr.Src1];
     bcShl: Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] shl Ctx.IntRegs[Instr.Src2];  // SHL
-    // SHR is ARITHMETIC on a signed operand (FreeBASIC copies the sign bit into the vacated bits:
-    // "-5 Shr 2" = -2). FPC's "shr" is logical, so it needs the helper; the unsigned variant, which
-    // the SSA selects for a UInteger/ULongInt operand, is the zero-filling one.
-    bcShr:     Ctx.IntRegs[Instr.Dest] := ArithShr64(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);
+    // SHR is ARITHMETIC on a signed operand in MODERN (FreeBASIC copies the sign bit into the vacated
+    // bits: "-5 Shr 2" = -2). FPC's "shr" is logical, so it needs the helper. CLASSIC keeps the logical
+    // shift it has always had -- v7 has no SHR of its own, so there is no reason to move it. The unsigned
+    // variant, which the SSA selects for a UInteger/ULongInt operand, is zero-filling in both.
+    bcShr:     if Assigned(FProgram) and FProgram.ModernMode then
+                 Ctx.IntRegs[Instr.Dest] := ArithShr64(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2])
+               else
+                 Ctx.IntRegs[Instr.Dest] := LogicalShr64(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);
     bcShrUInt: Ctx.IntRegs[Instr.Dest] := LogicalShr64(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);
     bcRandomize:  // RANDOMIZE: seed the RNG (Immediate=1 -> explicit seed in Src1; 0 -> time-based)
       if Instr.Immediate <> 0 then RandSeed := Cardinal(Ctx.IntRegs[Instr.Src1]) else Randomize;

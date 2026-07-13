@@ -938,9 +938,12 @@ begin
             IntRegs[Instr.Dest] := IntRegs[Instr.Src1] shl IntRegs[Instr.Src2];
             Inc(CurPC);
           end;
-        bcShr:  // FreeBASIC SHR (arithmetic: a signed operand keeps its sign, "-5 Shr 2" = -2)
+        bcShr:  // MODERN: arithmetic (a signed operand keeps its sign, "-5 Shr 2" = -2). CLASSIC: logical.
           begin
-            IntRegs[Instr.Dest] := ArithShr64(IntRegs[Instr.Src1], IntRegs[Instr.Src2]);
+            if ModernConv then
+              IntRegs[Instr.Dest] := ArithShr64(IntRegs[Instr.Src1], IntRegs[Instr.Src2])
+            else
+              IntRegs[Instr.Dest] := LogicalShr64(IntRegs[Instr.Src1], IntRegs[Instr.Src2]);
             Inc(CurPC);
           end;
         bcShrUInt:  // SHR on an unsigned operand (UInteger/ULongInt): zero-filling
