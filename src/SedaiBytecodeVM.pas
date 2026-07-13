@@ -7004,9 +7004,10 @@ begin
   CmdNewLine := #13;  // CR for file newlines
   SubOp := Instr.OpCode and $FF;
   case SubOp of
-    0: // bcPrint (float)
+    0: // bcPrint (float). Immediate = 1 when the value is SINGLE-typed: print it with a SINGLE's
+       // 7 significant digits, which is what hides its representation error (8.300000190734863 -> "8.3").
       begin
-        PrintStr := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]);
+        PrintStr := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1], Instr.Immediate = 1);
         if (FCmdHandle > 0) and Assigned(FOnFileData) then
           FOnFileData(Self, 'PRINT#', FCmdHandle, PrintStr, CmdErr)
         else if Assigned(FOutputDevice) then
@@ -7015,9 +7016,9 @@ begin
           Inc(Ctx.CursorCol, Length(PrintStr));
         end;
       end;
-    1: // bcPrintLn (float)
+    1: // bcPrintLn (float); Immediate = 1 -> SINGLE precision, as for bcPrint above
       begin
-        PrintStr := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]);
+        PrintStr := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1], Instr.Immediate = 1);
         if (FCmdHandle > 0) and Assigned(FOnFileData) then
         begin
           FOnFileData(Self, 'PRINT#', FCmdHandle, PrintStr, CmdErr);

@@ -425,6 +425,7 @@ type
     procedure RecordSharedScalarPrintKind(const VarName, TypeName: string);  // DIM SHARED never recorded its type
     function PrintKindOf(const VarName: string): Integer;               // scoped entry wins over the module one
     function PrintKindOfExpr(Node: TASTNode): Integer;                  // ...also for a call's return type
+    function IsSingleExpr(Node: TASTNode): Boolean;                     // SINGLE-typed value (7-digit print)
     function ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;  // narrow by an explicit width code
     function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on scalar store
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
@@ -1075,7 +1076,11 @@ begin
 end;
 
 function PrintKindOfType(const TypeU: string): Integer;
-// 0 = plain signed, 1 = BOOLEAN (prints "true"/"false"), 2 = unsigned 64-bit, 3 = unsigned but NARROW.
+// 0 = plain, 1 = BOOLEAN ("true"/"false"), 2 = unsigned 64-bit, 3 = unsigned but NARROW, 4 = SINGLE.
+//
+// Kind 4 lives in the FLOAT bank, not the int one: it selects a print with a SINGLE's 7 significant
+// digits instead of a DOUBLE's 16, which is what keeps a single's representation error out of sight
+// (8.300000190734863 prints as "8.3", exactly as FreeBASIC shows it).
 //
 // Kinds 2 and 3 print the same way -- as an unsigned value, which above all means WITHOUT the leading
 // sign space ("Unsigned numbers are printed without a space before them" -- the FB manual's Print page,
@@ -1090,6 +1095,7 @@ begin
   if TypeU = 'BOOLEAN' then Result := 1
   else if (TypeU = 'UINTEGER') or (TypeU = 'ULONGINT') then Result := 2
   else if (TypeU = 'UBYTE') or (TypeU = 'USHORT') or (TypeU = 'ULONG') then Result := 3
+  else if TypeU = 'SINGLE' then Result := 4
   else Result := 0;
 end;
 
@@ -5912,7 +5918,7 @@ begin
     if (ExprValue.RegType = srtInt) then
     begin
       PKidx := PrintKindOfExpr(Child);   // a same-named var in this procedure wins
-      if PKidx > 0 then
+      if (PKidx >= 1) and (PKidx <= 3) then   // 4 = SINGLE, a float: handled in the float branch below
       begin
         if PKidx = 1 then
           EmitInstruction(ssaPrintBool, MakeSSAValue(svkNone), ExprValue,
@@ -5938,8 +5944,14 @@ begin
         EmitInstruction(ssaPrintInt, MakeSSAValue(svkNone), ExprValue,
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       srtFloat:
-        EmitInstruction(ssaPrint, MakeSSAValue(svkNone), ExprValue,
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // A SINGLE-typed value prints with a SINGLE's 7 significant digits (Immediate = 1), not a
+        // DOUBLE's 16 -- otherwise the rounding a SINGLE store performs would show up as noise.
+        if IsSingleExpr(Child) then
+          EmitInstruction(ssaPrint, MakeSSAValue(svkNone), ExprValue,
+                         MakeSSAValue(svkNone), MakeSSAConstInt(1))
+        else
+          EmitInstruction(ssaPrint, MakeSSAValue(svkNone), ExprValue,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       srtString:
         EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), ExprValue,
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -14518,13 +14530,12 @@ end;
 
 function TSSAGenerator.TypeNameWidthCode(const TypeName: string): Integer;
 // Map a declared type name to a narrowing width code for STORE narrowing (B1.5). 0 = no narrowing.
-// 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 (Long/ULong are 32-bit in FB).
+// 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 (Long/ULong are 32-bit in FB), 7=single precision.
 // INTEGER/LONGINT (=64-bit here), UINTEGER/ULONGINT and DOUBLE need no bit narrowing.
-// NOTE: SINGLE is intentionally NOT narrowed on store (returns 0): rounding a SINGLE-typed variable
-// to single precision is faithful for storage but exposes the representation error in PRINT (we lack
-// single-precision display formatting, so 1.65 would show as 1.6499...). True single-precision storage
-// is deferred until print formats single-typed values with single precision. The explicit CSNG()
-// conversion still rounds to single (separate path), as the user asked for it explicitly.
+// SINGLE narrowing was held back until PRINT could show a single-typed value with a SINGLE's precision
+// -- rounding the storage without that made the representation error visible (1.65 came out as
+// 1.6499...). PRINT now formats a single-typed value with 7 significant digits, so the storage can be
+// faithful: a SINGLE really rounds on store, and its error stays hidden exactly as it does in FreeBASIC.
 var
   T: string;
 begin
@@ -14535,6 +14546,7 @@ begin
   else if T = 'USHORT' then Result := 4
   else if T = 'LONG' then Result := 5
   else if T = 'ULONG' then Result := 6
+  else if T = 'SINGLE' then Result := 7
   else Result := 0;
 end;
 
@@ -14681,6 +14693,101 @@ begin
     FVarPrintKind.AddObject(Nm, TObject(PtrInt(PK)));
   if (PK = 2) and (FUnsigned64Arrays.IndexOf(Nm) < 0) then
     FUnsigned64Arrays.Add(Nm);
+end;
+
+function TSSAGenerator.IsSingleExpr(Node: TASTNode): Boolean;
+// True when the value of this expression is a SINGLE in FreeBASIC's type rules, and so prints with 7
+// significant digits rather than 16. FreeBASIC widens to the larger operand: SINGLE with an integer (or
+// another SINGLE) stays SINGLE, but SINGLE with a DOUBLE -- and a bare "2.0" literal IS a Double --
+// becomes DOUBLE. So an operation is single only when one side is single and NEITHER side is a double.
+//
+// Without this, narrowing a SINGLE on store would leak its rounding error into every expression built
+// from it: "Dim s As Single = 1.65 : Print s * 2" would show 3.299999952316284 instead of 3.3.
+var
+  AwIdx: Integer;
+
+  function IsDoubleValued(N: TASTNode): Boolean;
+  begin
+    Result := (InferExprBank(N) = srtFloat) and not IsSingleExpr(N);
+  end;
+
+  // "obj.field" on a SINGLE field: a field records its narrowing width, and 7 is single precision.
+  function MemberFieldIsSingle(N: TASTNode): Boolean;
+  var
+    UDTIdx, k: Integer;
+    FldU: string;
+  begin
+    Result := False;
+    if N.ChildCount < 1 then Exit;
+    UDTIdx := FindUDT(ObjectTypeName(N.GetChild(0)));
+    if UDTIdx < 0 then Exit;
+    FldU := UpperCase(VarToStr(N.Value));
+    for k := 0 to High(FUDTs[UDTIdx].Fields) do
+      if UpperCase(FUDTs[UDTIdx].Fields[k].Name) = FldU then
+        Exit(FUDTs[UDTIdx].Fields[k].WidthCode = 7);
+  end;
+
+  // "obj.method(args)" / bare "obj.method": the method's return type is recorded under its LABEL, so
+  // resolve the overload these arguments select and ask for its print kind. Without this the Rosetta
+  // accumulator-factory idiom -- a SINGLE accumulator read back through a method -- printed the raw
+  // double, 8.300000190734863 instead of 8.3.
+  function MethodReturnIsSingle(N: TASTNode): Boolean;
+  var
+    MemberNode, ArgsNode: TASTNode;
+    OwnerT, Lbl: string;
+  begin
+    Result := False;
+    if N.NodeType = antArrayAccess then
+    begin
+      if N.ChildCount < 1 then Exit;
+      MemberNode := N.GetChild(0);
+      if N.ChildCount >= 2 then ArgsNode := N.GetChild(1) else ArgsNode := nil;
+    end
+    else
+    begin
+      MemberNode := N;
+      ArgsNode := nil;
+    end;
+    if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+    OwnerT := ObjectTypeName(MemberNode.GetChild(0));
+    if OwnerT = '' then Exit;
+    Lbl := ResolveMethodLabelArgs(OwnerT, VarToStr(MemberNode.Value), ArgsNode);
+    Result := (Lbl <> '') and (PrintKindOf(Lbl) = 4);
+  end;
+
+begin
+  Result := False;
+  if Node = nil then Exit;
+  case Node.NodeType of
+    antIdentifier, antFunctionCall:
+      Result := PrintKindOf(VarToStr(Node.Value)) = 4;
+    antArrayAccess:
+      if Node.ChildCount >= 1 then
+      begin
+        if Node.GetChild(0).NodeType = antIdentifier then
+        begin
+          // Either a call to a SINGLE-returning FUNCTION, or an element of a SINGLE array (whose element
+          // width is recorded separately -- an array name is never in the print-kind table).
+          Result := PrintKindOf(VarToStr(Node.GetChild(0).Value)) = 4;
+          if not Result then
+          begin
+            AwIdx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value)));
+            Result := (AwIdx >= 0) and (PtrInt(FArrayElemWidth.Objects[AwIdx]) = 7);
+          end;
+        end
+        else if Node.GetChild(0).NodeType = antMemberAccess then
+          Result := MethodReturnIsSingle(Node);   // "obj.method(args)" returning a SINGLE
+      end;
+    antMemberAccess:
+      // Either a SINGLE field, or a no-argument method returning one ("obj.method" with the "()" dropped).
+      Result := MemberFieldIsSingle(Node) or MethodReturnIsSingle(Node);
+    antParentheses, antUnaryOp:
+      if Node.ChildCount >= 1 then Result := IsSingleExpr(Node.GetChild(0));
+    antBinaryOp:
+      if Node.ChildCount >= 2 then
+        Result := (IsSingleExpr(Node.GetChild(0)) or IsSingleExpr(Node.GetChild(1))) and
+                  not IsDoubleValued(Node.GetChild(0)) and not IsDoubleValued(Node.GetChild(1));
+  end;
 end;
 
 function TSSAGenerator.PrintKindOfExpr(Node: TASTNode): Integer;

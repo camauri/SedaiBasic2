@@ -156,7 +156,8 @@ type
     function GetNextTabPosition(CurrentCol: Integer): Integer;
 
     { Formatta un numero secondo le regole correnti }
-    function FormatNumber(Value: Double): string;
+    // AsSingle: format with a SINGLE's precision (7 significant digits) rather than a DOUBLE's 16.
+    function FormatNumber(Value: Double; AsSingle: Boolean = False): string;
 
     { Formatta un intero senza segno a 64 bit (B1.5: UInteger/ULongInt), valore sempre >= 0 }
     function FormatUInt(Value: QWord): string;
@@ -243,20 +244,20 @@ implementation
 
 uses Math;
 
-function FormatDoubleFB(Value: Double): string;
+function FormatDoubleFB(Value: Double; SIGDIGITS: Integer = 16): string;
 // FreeBASIC prints a DOUBLE with 16 significant digits -- "3.141592653589793", and it shows the 16th
-// digit even when it is representation noise ("0.9999999999999999", "44.99999999999999").
+// digit even when it is representation noise ("0.9999999999999999", "44.99999999999999"). A SINGLE gets
+// 7 (its 24-bit mantissa is worth about 7.2 decimal digits), which is what hides its representation
+// error: an accumulator holding 8.300000190734863 prints as "8.3", exactly as FreeBASIC shows it.
 //
-// FPC cannot produce that: FloatToStr and FloatToStrF clamp a Double to 15 significant digits whatever
+// FPC cannot produce 16: FloatToStr and FloatToStrF clamp a Double to 15 significant digits whatever
 // precision you ask for (ffGeneral with 16 or 17 both come back with 15, and 0.9999999999999999 comes
-// back as "1"). Str(V:0:N) does render the full expansion, so round at the decimal place that leaves 16
-// significant digits and strip the trailing zeros -- exactly what "%.16g" would print.
+// back as "1"). Str(V:0:N) does render the full expansion, so round at the decimal place that leaves
+// SIGDIGITS significant digits and strip the trailing zeros -- exactly what "%.<n>g" would print.
 //
 // Only the range where %g chooses FIXED notation is handled here. Outside it the existing exponential
 // form is kept untouched: a value large enough to need it has no fractional part and never reaches this
 // function (every double >= 2^53 is integral, and the caller sends those through IntToStr).
-const
-  SIGDIGITS = 16;
 var
   Ex, Decimals: Integer;
   S: string;
@@ -409,7 +410,7 @@ begin
   end;
 end;
 
-function TConsoleBehavior.FormatNumber(Value: Double): string;
+function TConsoleBehavior.FormatNumber(Value: Double; AsSingle: Boolean = False): string;
 var
   Prefix, Suffix, NumStr: string;
   Bits: Int64;
@@ -489,7 +490,12 @@ begin
   // place. CLASSIC keeps FloatToStr: the Commodore ROM's own precision is lower still, and widening it
   // there would change v7 output for no reason.
   else if FNumberFormat = nfFreeBASIC then
-    NumStr := FormatDoubleFB(Value)
+  begin
+    if AsSingle then
+      NumStr := FormatDoubleFB(Value, 7)      // a SINGLE's mantissa is worth ~7 decimal digits
+    else
+      NumStr := FormatDoubleFB(Value);
+  end
   else
     NumStr := FloatToStr(Value);
 
