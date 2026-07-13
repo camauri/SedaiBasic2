@@ -40,6 +40,8 @@ var
   LElemVal: Double;  // scratch for bounds-guarded array element reads in superinstructions
   // Local copy of TrueValue for comparison operators
   TrueVal: Int64;
+  // Dialect of the implicit float->int conversion, read once (MODERN rounds, CLASSIC truncates)
+  ModernConv: Boolean;
   // Flag for TRAP handler jump (can't use goto from except block)
   TrapTriggered: Boolean;
   // Event polling counter
@@ -72,6 +74,7 @@ begin
   FloatRegs := @Ctx.FloatRegs[0];
   // Local copy of TrueValue for comparison operators
   TrueVal := FTrueValue;
+  ModernConv := Assigned(FProgram) and FProgram.ModernMode;
   // Initialize event polling counter
   EventPollCounter := 0;
 
@@ -517,14 +520,18 @@ begin
 
         // Type conversions
         bcIntToFloat: begin FloatRegs[Instr.Dest] := IntRegs[Instr.Src1]; Inc(CurPC); end;
-        bcFloatToInt: begin IntRegs[Instr.Dest] := Trunc(FloatRegs[Instr.Src1]); Inc(CurPC); end;
+        // Implicit float -> int: MODERN rounds (to nearest, ties to even), CLASSIC truncates. See the
+        // ExecuteInstruction copy for why.
+        bcFloatToInt: begin IntRegs[Instr.Dest] := FloatToIntConv(FloatRegs[Instr.Src1], ModernConv); Inc(CurPC); end;
         // Numeric -> string (FreeBASIC Str() / "&" concat): no leading sign-space, unlike v7 STR$.
         bcIntToString: begin Ctx.StringRegs[Instr.Dest] := IntToStr(IntRegs[Instr.Src1]); Inc(CurPC); end;
         bcFloatToString:
           // FreeBASIC Str()/"&" concat: no leading sign-space AND no trailing field-space (FormatNumber
           // adds both under the Commodore preset). Trim both, matching the ExecuteInstruction path.
+          // Immediate = 1 -> the value is SINGLE-typed: 7 significant digits, as PRINT gives it.
           begin
-            Ctx.StringRegs[Instr.Dest] := Trim(FConsoleBehavior.FormatNumber(FloatRegs[Instr.Src1]));
+            Ctx.StringRegs[Instr.Dest] := Trim(FConsoleBehavior.FormatNumber(FloatRegs[Instr.Src1],
+                                                                             Instr.Immediate = 1));
             Inc(CurPC);
           end;
         bcFloatRound: begin IntRegs[Instr.Dest] := Round(FloatRegs[Instr.Src1]); Inc(CurPC); end;  // CINT (round-to-even)

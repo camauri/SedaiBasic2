@@ -282,6 +282,9 @@ type
     function ResolveConstructorLabel(const TypeName, ArgSig: string): string;  // M4.4g: by type signature
     function BankToChar(Bank: TSSARegisterType): Char;          // M4.4g: I/F/S bank code for a ctor signature
     function CtorSigFromParams(ParamList: TASTNode): string;    // M4.4g: type signature of a ctor's params
+    function EnsureStringRegisterOf(const Val: TSSAValue; SrcNode: TASTNode): TSSAValue;  // SINGLE-aware
+    function ConstFloatToInt(V: Double): Int64;                 // implicit float->int of a CONSTANT
+    function ToIntValue(const V: TSSAValue): TSSAValue;         // ...of any value (const folded or emitted)
     function BaseDigitsArg(ArgListNode: TASTNode): TSSAValue;   // HEX$/OCT/BIN optional "digits" width
     function ArgSigFromArgs(ArgsNode: TASTNode): string;        // bank signature of a call's arguments
     function ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;  // pick an overload
@@ -2477,8 +2480,10 @@ begin
           else if Left.Kind = svkConstFloat then Left := EnsureFloatRegister(Left);
           if Right.Kind = svkConstInt then Right := EnsureIntRegister(Right)
           else if Right.Kind = svkConstFloat then Right := EnsureFloatRegister(Right);
-          Left := EnsureStringRegister(Left);
-          Right := EnsureStringRegister(Right);
+          // A SINGLE operand renders with a SINGLE's 7 significant digits, as PRINT and Str() do -- the
+          // AST node is what says so, since the value itself is just a double in a float register.
+          Left := EnsureStringRegisterOf(Left, Node.GetChild(0));
+          Right := EnsureStringRegisterOf(Right, Node.GetChild(1));
           DestReg := FProgram.AllocRegister(srtString);
           Result := MakeSSARegister(srtString, DestReg);
           EmitInstruction(ssaStrConcat, Result, Left, Right, MakeSSAValue(svkNone));
@@ -3077,7 +3082,12 @@ begin
           else
           begin
             ArgReg := EnsureFloatRegister(ArgValue);
-            EmitInstruction(ssaStrStr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            // Str() of a SINGLE renders 7 significant digits, exactly as PRINT does (Immediate = 1).
+            if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and
+               (ArgListNode.ChildCount >= 1) and IsSingleExpr(ArgListNode.GetChild(0)) then
+              EmitInstruction(ssaStrStr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(1))
+            else
+              EmitInstruction(ssaStrStr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           end;
         end
         else if (FuncName = 'VAL') then
@@ -5131,7 +5141,7 @@ begin
             // Convert float constant to int
             TempReg := FProgram.AllocRegister(srtInt);
             TempVal := MakeSSARegister(srtInt, TempReg);
-            EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(Trunc(Indices[i].ConstFloat)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(ConstFloatToInt(Indices[i].ConstFloat)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
             Indices[i] := TempVal;
           end
           else if (Indices[i].Kind = svkRegister) and (Indices[i].RegType = srtFloat) then
@@ -5720,7 +5730,7 @@ begin
       // Convert float constant to int at compile time (truncate toward zero, matching the runtime
       // ssaFloatToInt path). Without this a float const was loaded straight into an int register
       // (e.g. DIM x AS INTEGER : x = 3.9 stored garbage / 0).
-      ExprValue := MakeSSAConstInt(Trunc(ExprValue.ConstFloat));
+      ExprValue := MakeSSAConstInt(ConstFloatToInt(ExprValue.ConstFloat));
       EmitInstruction(ssaLoadConstInt, VarReg, ExprValue,
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end
@@ -6216,7 +6226,7 @@ begin
       // Convert float constant to int
       TempReg := FProgram.AllocRegister(srtInt);
       TempVal := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(Trunc(Indices[i].ConstFloat)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(ConstFloatToInt(Indices[i].ConstFloat)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       Indices[i] := TempVal;
     end
     else if (Indices[i].Kind = svkRegister) and (Indices[i].RegType = srtFloat) then
@@ -6276,7 +6286,7 @@ begin
     // Int array + Float constant → convert at compile-time
     if ArrInfo.ElementType = srtInt then
     begin
-      IntVal := Trunc(ExprValue.ConstFloat);
+      IntVal := ConstFloatToInt(ExprValue.ConstFloat);
       ExprValue := MakeSSAValue(svkConstInt);
       ExprValue.ConstInt := IntVal;
     end;
@@ -8149,7 +8159,16 @@ begin
       EmitInstruction(ssaLoadConstInt, VarReg, StartValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end
   else if StartValue.Kind = svkConstFloat then
-    EmitInstruction(ssaLoadConstFloat, VarReg, StartValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  begin
+    // An INTEGER counter with a float start: convert the constant (FreeBASIC rounds; see ToIntValue).
+    // Loading the float constant straight into the int register put its bit pattern there -- "For k As
+    // Integer = 1.5 To 3.5" started the loop at 0.
+    if VarReg.RegType = srtInt then
+      EmitInstruction(ssaLoadConstInt, VarReg, MakeSSAConstInt(ConstFloatToInt(StartValue.ConstFloat)),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+    else
+      EmitInstruction(ssaLoadConstFloat, VarReg, StartValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
   else if StartValue.Kind = svkRegister then
   begin
     // StartValue is in a register - must convert type to match VarReg if needed
@@ -8208,9 +8227,20 @@ begin
   end
   else if EndValue.Kind = svkConstFloat then
   begin
-    TempReg := FProgram.AllocRegister(srtFloat);
-    TempVal := MakeSSARegister(srtFloat, TempReg);
-    EmitInstruction(ssaLoadConstFloat, TempVal, EndValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // As for the start value: an INTEGER counter takes the CONVERTED constant, not the float's bits.
+    if VarReg.RegType = srtInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      TempVal := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(ConstFloatToInt(EndValue.ConstFloat)),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+    begin
+      TempReg := FProgram.AllocRegister(srtFloat);
+      TempVal := MakeSSARegister(srtFloat, TempReg);
+      EmitInstruction(ssaLoadConstFloat, TempVal, EndValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
     EndValue := TempVal;
   end
   else if EndValue.Kind = svkRegister then
@@ -8268,9 +8298,20 @@ begin
   end
   else if StepValue.Kind = svkConstFloat then
   begin
-    TempReg := FProgram.AllocRegister(srtFloat);
-    TempVal := MakeSSARegister(srtFloat, TempReg);
-    EmitInstruction(ssaLoadConstFloat, TempVal, StepValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // As for start/end: an INTEGER counter steps by the CONVERTED constant.
+    if VarReg.RegType = srtInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      TempVal := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(ConstFloatToInt(StepValue.ConstFloat)),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+    begin
+      TempReg := FProgram.AllocRegister(srtFloat);
+      TempVal := MakeSSARegister(srtFloat, TempReg);
+      EmitInstruction(ssaLoadConstFloat, TempVal, StepValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
     StepValue := TempVal;
   end
   else if StepValue.Kind = svkRegister then
@@ -9310,7 +9351,7 @@ begin
         // Convert float constant to int for mode parameter
         TempReg := FProgram.AllocRegister(srtInt);
         ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
-        EmitInstruction(ssaLoadConstInt, ParamRegs[i], MakeSSAConstInt(Trunc(ParamValues[i].ConstFloat)),
+        EmitInstruction(ssaLoadConstInt, ParamRegs[i], MakeSSAConstInt(ConstFloatToInt(ParamValues[i].ConstFloat)),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
       else if ParamValues[i].Kind = svkRegister then
@@ -10374,7 +10415,7 @@ begin
         TempReg := FProgram.AllocRegister(srtInt);
         ParamRegs[i] := MakeSSARegister(srtInt, TempReg);
         EmitInstruction(ssaLoadConstInt, ParamRegs[i],
-                       MakeSSAConstInt(Trunc(ParamValues[i].ConstFloat)),
+                       MakeSSAConstInt(ConstFloatToInt(ParamValues[i].ConstFloat)),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
     end
@@ -14865,7 +14906,7 @@ begin
     if Value.Kind = svkConstInt then
       Result := MakeSSAConstInt(NarrowConstInt(Value.ConstInt, W))
     else if Value.Kind = svkConstFloat then
-      Result := MakeSSAConstInt(NarrowConstInt(Trunc(Value.ConstFloat), W))
+      Result := MakeSSAConstInt(NarrowConstInt(ConstFloatToInt(Value.ConstFloat), W))
     else if (Value.Kind = svkRegister) and (Value.RegType = srtInt) then
     begin
       NarrowReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -15422,6 +15463,47 @@ begin
     srtString: Result := 'S';
   else
     Result := 'I';   // int (incl. UDT handles)
+  end;
+end;
+
+function TSSAGenerator.EnsureStringRegisterOf(const Val: TSSAValue; SrcNode: TASTNode): TSSAValue;
+// EnsureStringRegister, but able to render a SINGLE with a SINGLE's 7 significant digits. The value in a
+// float register is just a double -- only the AST node says it came from a single -- so the source node
+// has to come along. Rosetta's accumulator prints its total through PRINT; a program that builds the same
+// number into a string ("[" & s & "]" or Str(s)) must see the same 8.3, not 8.300000190734863.
+begin
+  if (Val.Kind = svkRegister) and (Val.RegType = srtFloat) and IsSingleExpr(SrcNode) then
+  begin
+    Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaFloatToString, Result, Val, MakeSSAValue(svkNone), MakeSSAConstInt(1));
+  end
+  else
+    Result := EnsureStringRegister(Val);
+end;
+
+function TSSAGenerator.ConstFloatToInt(V: Double): Int64;
+// Compile-time half of the IMPLICIT float -> int conversion; must agree with the VM's bcFloatToInt, or a
+// folded constant and a computed value would convert differently. FreeBASIC ROUNDS to nearest, ties to
+// even (fbc 1.10.1: 1.5 and 2.5 both give 2, -1.5 and -2.5 both give -2); Commodore v7 truncates.
+begin
+  if FModernMode then Result := Round(V) else Result := Trunc(V);
+end;
+
+function TSSAGenerator.ToIntValue(const V: TSSAValue): TSSAValue;
+// Convert a value to the int bank for a context that requires one (an integer variable, an array index,
+// an integer parameter, a FOR bound). Folds a constant; otherwise emits the conversion opcode.
+//
+// The constant case is not just an optimisation: emitting ssaFloatToInt with a CONSTANT operand made the
+// VM read Src1 as a register INDEX, so "For k As Integer = 1.5 To 3.5" converted register 1 and register
+// 3 instead of the values, and the loop ran from 0.
+begin
+  Result := V;
+  if V.Kind = svkConstFloat then
+    Result := MakeSSAConstInt(ConstFloatToInt(V.ConstFloat))
+  else if (V.Kind = svkRegister) and (V.RegType = srtFloat) then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaFloatToInt, Result, V, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 end;
 
@@ -18248,7 +18330,7 @@ begin
     else if Indices[i].Kind = svkConstFloat then
     begin
       TempVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(Trunc(Indices[i].ConstFloat)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(ConstFloatToInt(Indices[i].ConstFloat)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       Indices[i] := TempVal;
     end
     else if (Indices[i].Kind = svkRegister) and (Indices[i].RegType = srtFloat) then

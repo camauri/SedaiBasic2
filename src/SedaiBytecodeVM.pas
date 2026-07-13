@@ -460,6 +460,19 @@ type
 
 implementation
 
+function FloatToIntConv(V: Double; Modern: Boolean): Int64; inline;
+// The IMPLICIT float -> int conversion. FreeBASIC ROUNDS to nearest, ties to even -- verified against
+// fbc 1.10.1: 1.5 and 2.5 both convert to 2, 1.7 to 2, -1.5 and -2.5 to -2 -- and it does so wherever
+// the conversion is implicit: assignment, argument passing, an array store, an array INDEX, a FOR bound,
+// a FUNCTION result. Truncation is what Int() and Fix() are for, and they have their own opcodes.
+// Commodore v7 truncates on assignment to an integer variable, so CLASSIC keeps Trunc.
+begin
+  if Modern then
+    Result := Round(V)      // FPC's Round is round-half-to-even, which is what FreeBASIC does
+  else
+    Result := Trunc(V);
+end;
+
 const
   // Ceiling on simultaneously-live THREADCREATE workers. Sized far above any legitimate FreeBASIC
   // program on a desktop core count, and far below what it takes to wedge the host. It exists so that a
@@ -4144,13 +4157,21 @@ begin
     bcPowFloat: Ctx.FloatRegs[Instr.Dest] := Power(Ctx.FloatRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2]);
     bcNegFloat: Ctx.FloatRegs[Instr.Dest] := -Ctx.FloatRegs[Instr.Src1];
     bcIntToFloat: Ctx.FloatRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
-    bcFloatToInt: Ctx.IntRegs[Instr.Dest] := Trunc(Ctx.FloatRegs[Instr.Src1]);
+    // The IMPLICIT float -> int conversion: FreeBASIC ROUNDS (to nearest, ties to even), it does not
+    // truncate. It rounds everywhere the conversion is implicit -- assignment, argument passing, an array
+    // store, an array INDEX, a FOR bound, a FUNCTION result -- so "Dim As Integer i : i = 1.5" is 2, and
+    // "a(1.5)" is element 2. Truncation is what Int() and Fix() are for, and they have their own opcodes.
+    // CLASSIC keeps truncating: Commodore v7 assigns 1.7 to an integer variable as 1.
+    bcFloatToInt: Ctx.IntRegs[Instr.Dest] := FloatToIntConv(Ctx.FloatRegs[Instr.Src1],
+                                                            Assigned(FProgram) and FProgram.ModernMode);
     // Numeric -> string (FreeBASIC Str() / "&" concat): no leading sign-space, unlike v7 STR$.
     bcIntToString: Ctx.StringRegs[Instr.Dest] := IntToStr(Ctx.IntRegs[Instr.Src1]);
     bcFloatToString:
       // FreeBASIC Str()/"&" concat of a float: the number with no leading sign-space and no trailing
-      // field-space (FormatNumber adds both under the Commodore preset).
-      Ctx.StringRegs[Instr.Dest] := Trim(FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]));
+      // field-space (FormatNumber adds both under the Commodore preset). Immediate = 1 when the value is
+      // SINGLE-typed: 7 significant digits, as PRINT gives it.
+      Ctx.StringRegs[Instr.Dest] := Trim(FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1],
+                                                                       Instr.Immediate = 1));
     bcFloatRound: Ctx.IntRegs[Instr.Dest] := Round(Ctx.FloatRegs[Instr.Src1]);  // CINT (round-to-even)
     bcNarrowInt: Ctx.IntRegs[Instr.Dest] := NarrowInt64(Ctx.IntRegs[Instr.Src1], Instr.Immediate);  // B1.5
     bcNarrowSingle: Ctx.FloatRegs[Instr.Dest] := Single(Ctx.FloatRegs[Instr.Src1]);                  // B1.5
@@ -5902,8 +5923,10 @@ begin
       // MODERN (FreeBASIC Str): no spaces at all. CLASSIC (v7 STR$): keep the leading sign-space for a
       // non-negative value, drop the trailing space. (Without this, e.g. Right(Str(638269696),6) picked
       // up the trailing space and returned "69696 " instead of "269696".)
+      // Immediate = 1 when the argument is SINGLE-typed: 7 significant digits, as PRINT gives it.
       if Assigned(FProgram) and FProgram.ModernMode then
-        Ctx.StringRegs[Instr.Dest] := Trim(FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]))
+        Ctx.StringRegs[Instr.Dest] := Trim(FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1],
+                                                                         Instr.Immediate = 1))
       else
         Ctx.StringRegs[Instr.Dest] := TrimRight(FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]));
     8: // bcStrVal - VAL(s): leading floating-point number, FreeBASIC style (leading parse + &H/&O/&B).
