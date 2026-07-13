@@ -174,6 +174,7 @@ type
     FSharedScalarArr: TStringList;       // name (UPPER) -> array index (Objects[]=PtrInt arrayIdx)
     FStaticMembers: TStringList;         // OOP: static member variables "TYPE.FIELD" (UPPER), backed by a shared global scalar
     FEnumMembers: TStringList;           // FreeBASIC ENUM members (UPPER), backed by a shared global scalar so they are visible inside procedures
+    FEnumNames: TStringList;             // FreeBASIC ENUM type names (UPPER): lets "MyEnum.member" resolve to the member
     FPointerVars: TStringList;           // FreeBASIC pointers: var name (UPPER) -> pointee type name (e.g. "INTEGER")
     FRefVars: TStringList;               // FreeBASIC reference variables (DIM BYREF r AS T = target): name
                                          // (UPPER) -> pointee type. r's register is int (it carries target's
@@ -437,6 +438,9 @@ type
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
     // FB implicit THIS: a bare field name in a method body -> synthesized "this.<field>" access.
     function TryImplicitThisField(const VarName: string; const Tok: TLexerToken; out MemberNode: TASTNode): Boolean;
+    // FB: a builtin overloaded for a UDT under its own name ("Operator Abs (v As Vector2D) As Single").
+    function UDTNamedOperatorLabel(const FuncName: string; ArgsNode: TASTNode): string;
+    function TryUDTNamedOperator(const FuncName: string; ArgsNode: TASTNode; out CallResult: TSSAValue): Boolean;
     function BlockHandledKey(const Scope, VarName: string): string;   // "<proc>|<var>" ('' proc = module)
     // FB implicit THIS for a CALL: a bare "m(args)" / a bare property name in a method body -> "this.m(...)".
     function TryImplicitThisMethod(const VarName: string; ArgsNode: TASTNode; const Tok: TLexerToken;
@@ -749,6 +753,8 @@ begin
   FStaticMembers.CaseSensitive := False;
   FEnumMembers := TStringList.Create;
   FEnumMembers.CaseSensitive := False;
+  FEnumNames := TStringList.Create;
+  FEnumNames.CaseSensitive := False;
   FPointerVars := TStringList.Create;
   FAddrLocalVars := TStringList.Create;
   FRefVars := TStringList.Create;
@@ -818,6 +824,7 @@ begin
   FSharedScalarArr.Free;
   FStaticMembers.Free;
   FEnumMembers.Free;
+  FEnumNames.Free;
   FPointerVars.Free;
   FAddrLocalVars.Free;
   FRefVars.Free;
@@ -2683,6 +2690,12 @@ begin
       begin
         FuncName := UpperCase(VarToStr(Node.Value));
         ArgListNode := Node.GetChild(0);
+
+        // FreeBASIC lets a builtin be OVERLOADED for a UDT by name: "Operator Abs (ByRef v As Vector2D)
+        // As Single" makes "Abs(v)" the user's operator, not the numeric intrinsic. Dispatch on the
+        // argument's static type before the intrinsic gets it -- it was being handed the record HANDLE
+        // and dutifully taking its absolute value.
+        if TryUDTNamedOperator(FuncName, ArgListNode, Result) then Exit;
 
         // FreeBASIC function pointer "fp(args)" reaching the function-call node: indirect call.
         if FFuncPtrSigs.IndexOfName(FuncName) >= 0 then
@@ -5278,6 +5291,35 @@ begin
 
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
+
+  // A compound "obj op= rhs" on a UDT that overloads the SELF-operator ("Operator T.*= (rhs As Single)")
+  // calls that operator, which mutates the object in place. The parser desugars every "op=" to
+  // "lhs = lhs op rhs", which is a different thing entirely: there may be no binary "op" for the type at
+  // all, and the desugared form then did arithmetic on the record HANDLE. The parser leaves COMPOUNDOP on
+  // the node so the original shape is still known here.
+  if (Node.Attributes.Values['COMPOUNDOP'] <> '') and (ExprNode.NodeType = antBinaryOp) and
+     (ExprNode.ChildCount >= 2) then
+  begin
+    LhsRecType := ObjectTypeName(VarNode);
+    if LhsRecType <> '' then
+    begin
+      RhsRecType := ResolveMethodLabel(LhsRecType,
+                      'OPERATOR' + UpperCase(Node.Attributes.Values['COMPOUNDOP']) + '=');
+      if RhsRecType <> '' then
+      begin
+        SharedAssign := TASTNode.Create(antArgumentList, Node.Token);
+        try
+          SharedAssign.AddChild(ExprNode.GetChild(1).Clone);      // the ORIGINAL right-hand side
+          ProcessMethodCall(VarNode, LhsRecType,
+                            'OPERATOR' + UpperCase(Node.Attributes.Values['COMPOUNDOP']) + '=',
+                            SharedAssign, ExprValue);
+        finally
+          SharedAssign.Free;
+        end;
+        Exit;
+      end;
+    end;
+  end;
 
   // FreeBASIC shorthand "obj = Type(args)" (no <T>): the type constructor was parsed with an inferred
   // (empty) type name; fill it from the LHS's declared UDT so the SSA builds the right temporary.
@@ -14763,20 +14805,26 @@ var
     Result := (InferExprBank(N) = srtFloat) and not IsSingleExpr(N);
   end;
 
-  // "obj.field" on a SINGLE field: a field records its narrowing width, and 7 is single precision.
-  function MemberFieldIsSingle(N: TASTNode): Boolean;
+  // A SINGLE field: a field records its narrowing width, and 7 is single precision.
+  function UDTFieldIsSingle(const TypeName, FieldName: string): Boolean;
   var
     UDTIdx, k: Integer;
     FldU: string;
   begin
     Result := False;
-    if N.ChildCount < 1 then Exit;
-    UDTIdx := FindUDT(ObjectTypeName(N.GetChild(0)));
+    UDTIdx := FindUDT(TypeName);
     if UDTIdx < 0 then Exit;
-    FldU := UpperCase(VarToStr(N.Value));
+    FldU := UpperCase(FieldName);
     for k := 0 to High(FUDTs[UDTIdx].Fields) do
       if UpperCase(FUDTs[UDTIdx].Fields[k].Name) = FldU then
         Exit(FUDTs[UDTIdx].Fields[k].WidthCode = 7);
+  end;
+
+  // "obj.field" on a SINGLE field.
+  function MemberFieldIsSingle(N: TASTNode): Boolean;
+  begin
+    Result := (N.ChildCount >= 1) and
+              UDTFieldIsSingle(ObjectTypeName(N.GetChild(0)), VarToStr(N.Value));
   end;
 
   // "obj.method(args)" / bare "obj.method": the method's return type is recorded under its LABEL, so
@@ -14811,8 +14859,23 @@ begin
   Result := False;
   if Node = nil then Exit;
   case Node.NodeType of
-    antIdentifier, antFunctionCall:
-      Result := PrintKindOf(VarToStr(Node.Value)) = 4;
+    antIdentifier:
+      begin
+        Result := PrintKindOf(VarToStr(Node.Value)) = 4;
+        // Inside a method body a bare name may be a FIELD (implicit THIS), and a SINGLE field prints with
+        // a single's 7 digits like any other single -- which is what a Cast operator building its string
+        // from "Str(x)" depends on.
+        if (not Result) and (FCurrentThisType <> '') then
+          Result := UDTFieldIsSingle(FCurrentThisType, VarToStr(Node.Value));
+      end;
+    antFunctionCall:
+      begin
+        // A builtin overloaded for a UDT ("Abs(v)" on an "Operator Abs ... As Single") returns whatever
+        // THAT operator returns, not what the intrinsic would.
+        if Node.ChildCount >= 1 then
+          Result := PrintKindOf(UDTNamedOperatorLabel(VarToStr(Node.Value), Node.GetChild(0))) = 4;
+        if not Result then Result := PrintKindOf(VarToStr(Node.Value)) = 4;
+      end;
     antArrayAccess:
       if Node.ChildCount >= 1 then
       begin
@@ -17276,7 +17339,17 @@ var
   VNameU: string;
 begin
   if Node = nil then Exit;
-  if not FModernMode then Exit;                 // CLASSIC has no procedure scope; leave members as plain globals
+  // The enum's NAME is recorded in both dialects: it is what lets "MyEnum.option1" resolve to the member
+  // (ProcessMemberAccess). The shared-global backing below is a MODERN-only concern (procedure scope).
+  if (Node.NodeType = antEnum) and (VarToStr(Node.Value) <> '') and
+     (FEnumNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) then
+    FEnumNames.Add(UpperCase(VarToStr(Node.Value)));
+  if not FModernMode then
+  begin
+    for i := 0 to Node.ChildCount - 1 do
+      CollectEnumMembers(Node.GetChild(i));      // still walk, to reach every enum's name
+    Exit;                                        // CLASSIC has no procedure scope: members stay plain globals
+  end;
   if Node.NodeType = antProcedureDecl then Exit; // an ENUM inside a SUB/FUNCTION is proc-local, not a global
   if Node.NodeType = antEnum then
     for k := 0 to Node.ChildCount - 1 do
@@ -19497,6 +19570,17 @@ var
 begin
   Result := MakeSSAValue(svkNone);
   if Node.ChildCount < 1 then Exit;
+  // FreeBASIC allows an ENUM member to be named through its enum: "MyEnum.option1" is just "option1".
+  // The members are module-wide constants under their bare names, so hand the bare name to the ordinary
+  // identifier path. Without this the qualified form fell through to the UDT member machinery, which had
+  // no such type, and every "E.<member>" answered the same wrong value.
+  if (Node.GetChild(0).NodeType = antIdentifier) and
+     (FEnumNames.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) then
+  begin
+    AccNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Node.Value)), Node.Token);
+    try ProcessExpression(AccNode, Result); finally AccNode.Free; end;
+    Exit;
+  end;
   // OOP static member variable (via type name or instance): read from its shared global scalar.
   SMBack := StaticMemberBackingName(Node.GetChild(0), VarToStr(Node.Value));
   if SMBack <> '' then
@@ -19533,6 +19617,39 @@ begin
   end;
   EmitInstruction(Op, DestVal, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
   Result := DestVal;
+end;
+
+function TSSAGenerator.UDTNamedOperatorLabel(const FuncName: string; ArgsNode: TASTNode): string;
+// Label of a builtin overloaded for a UDT under its own name ("Operator Abs (v As Vector2D) As Single"),
+// or '' if there is none. The operator belongs to its FIRST operand's type, and carries the symbol-form
+// arity suffix, so this is the same lookup the arithmetic operators use.
+var
+  OwnerT: string;
+begin
+  Result := '';
+  if (ArgsNode = nil) or (ArgsNode.ChildCount < 1) then Exit;
+  OwnerT := ObjectTypeName(ArgsNode.GetChild(0));
+  if OwnerT = '' then Exit;
+  Result := ResolveMethodLabel(OwnerT, 'OPERATOR' + UpperCase(FuncName) +
+                               OperatorArityCode(ArgsNode.ChildCount));
+end;
+
+function TSSAGenerator.TryUDTNamedOperator(const FuncName: string; ArgsNode: TASTNode;
+  out CallResult: TSSAValue): Boolean;
+// FreeBASIC lets a builtin be overloaded for a UDT under its own name: "Operator Abs (ByRef v As
+// Vector2D) As Single" makes "Abs(v)" call that operator. The operator's label is the symbol-form one
+// (owner type + "OPERATOR<name>" + arity), so resolving it is the same lookup the arithmetic operators
+// use -- it just has to happen BEFORE the intrinsic claims the call, which was handing the numeric Abs a
+// record HANDLE and taking the absolute value of that.
+var
+  Lbl: string;
+begin
+  Result := False;
+  CallResult := MakeSSAValue(svkNone);
+  Lbl := UDTNamedOperatorLabel(FuncName, ArgsNode);
+  if Lbl = '' then Exit;
+  EmitUserFunctionCall(Lbl, ArgsNode, CallResult);
+  Result := True;
 end;
 
 function TSSAGenerator.BlockHandledKey(const Scope, VarName: string): string;

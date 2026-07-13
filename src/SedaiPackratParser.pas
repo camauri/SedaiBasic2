@@ -1363,6 +1363,11 @@ begin
     Result := TASTNode.Create(antAssignment, SavedToken);
     Result.AddChild(LeftSide);
     Result.AddChild(Expression);
+    // Remember that this assignment CAME FROM a compound "op=". A UDT may overload the self-operator
+    // itself ("Operator Vector2D.*= (rhs As Single)"), which mutates in place and is NOT the same as
+    // "c = c * 3" -- there may be no binary "*" at all, and the desugared form then multiplied the record
+    // HANDLE. The SSA prefers the self-operator when the target is a UDT that has one.
+    Result.Attributes.Values['COMPOUNDOP'] := OpSym;
     DoNodeCreated(Result);
     Exit;
   end;
@@ -2090,12 +2095,17 @@ begin
       MethodType := UpperCase(VarToStr(Context.CurrentToken.Value));
       Context.Advance;                              // <Type>
       Context.Advance;                              // '.'
-      OpSym := UpperCase(VarToStr(Context.CurrentToken.Value));   // operator name (CAST, LET, ...)
+      OpSym := UpperCase(VarToStr(Context.CurrentToken.Value));   // operator name (CAST, LET, *=, ...)
+      // A SELF-operator ("Operator T.*= (rhs)") arrives as the lexer's compound-assign token, whose value
+      // is the bare symbol -- "*", not "*=". Spell the "=" back in, or the operator would be labelled
+      // exactly like the binary "*" and the two could not be told apart.
+      if Context.Check(ttCompoundAssign) then OpSym := OpSym + '=';
       Context.Advance;                              // operator name
     end
     else
     begin
       OpSym := Context.CurrentToken.Value;
+      if Context.Check(ttCompoundAssign) then OpSym := OpSym + '=';   // as above, for the global form
       OpSymbolForm := True;                         // "OPERATOR <sym> (...)": arity-overloadable
       Context.Advance;                              // consume the operator symbol
     end;
@@ -7980,11 +7990,15 @@ begin
   Result := TASTNode.Create(antEnum, Token);
   Context.Advance;                              // consume ENUM
   // Optional enum type name, then an optional "AS <underlying-type>" (FreeBASIC "Enum [name] [As Integer]").
-  // Both are advisory here — enum members are plain integer constants regardless of the declared width. The
-  // name may be a reserved word (a type/colour keyword), so don't require ttIdentifier; exclude AS so a
-  // nameless "Enum As Integer" is not mistaken for a name.
+  // The underlying type is advisory here — enum members are plain integer constants regardless of the
+  // declared width. The NAME is not: FreeBASIC lets a member be reached through it ("MyEnum.option1"), so
+  // keep it on the node. It may be a reserved word (a type/colour keyword), so don't require ttIdentifier;
+  // exclude AS so a nameless "Enum As Integer" is not mistaken for a name.
   if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam, ttEndOfFile, ttAsType]) then
-    Context.Advance;                            // enum type name
+  begin
+    Result.Value := UpperCase(VarToStr(Context.CurrentToken.Value));   // enum type name
+    Context.Advance;
+  end;
   if Context.Check(ttAsType) then
   begin
     Context.Advance;                            // AS
