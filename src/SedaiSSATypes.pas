@@ -1424,6 +1424,13 @@ begin
   finally
     Inliner.Free;
   end;
+  // Inlining a call drops the CFG edge that justified it (InlineCallSite), so a subroutine whose every
+  // call site got inlined is now ORPHANED: no predecessors, and the dominator-tree builder reads that as
+  // a second entry point and refuses to build. DBE runs BEFORE this pass in the pipeline, so nothing would
+  // sweep those blocks up, and the next pass to rebuild the tree (loop unrolling) would fail and be
+  // skipped. Sweep them here, where the orphans are made. Every pipeline -- sb, sbc, the REPL and the
+  // runner -- calls this method, so one place covers them all.
+  if Result > 0 then RunDBE;
 end;
 
 function TSSAProgram.RunConstProp: Integer;

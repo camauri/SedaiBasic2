@@ -419,6 +419,21 @@ begin
       Inc(InsertIdx);
     end;
   end;
+
+  // The CALL is gone, so the edge it justified has to go with it. The call block was wired to the
+  // subroutine entry precisely BECAUSE it called it; with the body pasted in, control no longer goes
+  // there, and leaving the edge behind gives the block two successors with no terminator to explain them
+  // -- exactly what the dominator-tree builder rejects ("ends with <x> but has 2 successors"). The next
+  // pass that rebuilds the tree (loop unrolling, for one) then fails and is silently skipped.
+  // The subroutine's own block stays where it is: other, non-inlined call sites may still reach it, and
+  // dead-block elimination removes it if none do.
+  i := CallBlock.Successors.IndexOf(Sub.EntryBlock);
+  if i >= 0 then
+  begin
+    CallBlock.Successors.Delete(i);
+    j := TSSABasicBlock(Sub.EntryBlock).Predecessors.IndexOf(CallBlock);
+    if j >= 0 then TSSABasicBlock(Sub.EntryBlock).Predecessors.Delete(j);
+  end;
 end;
 
 function TGosubInlining.CloneBlock(OrigBlock: TSSABasicBlock;

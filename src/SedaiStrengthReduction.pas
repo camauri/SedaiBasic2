@@ -149,6 +149,7 @@ type
 
     { Compute all blocks in a natural loop }
     procedure ComputeLoopBlocks(Loop: TLoopInfoSR; BackEdgeSource: TSSABasicBlock);
+    function LoopCallsSubroutine(Loop: TLoopInfoSR): Boolean;  // any GOSUB inside? then the CFG cannot support IV reasoning
 
     { Find basic induction variables in all loops }
     procedure FindInductionVariables;
@@ -195,6 +196,22 @@ begin
   Blocks.Free;
   BackEdgeSources.Free;
   inherited;
+end;
+
+function TStrengthReduction.LoopCallsSubroutine(Loop: TLoopInfoSR): Boolean;
+// Does any block of this loop contain a GOSUB (ssaCall)? See the soundness guard at the IV rewrite: the
+// GOSUB CFG has a call edge and no return edge, so nothing that reasons about flow through it is sound.
+var
+  j, k: Integer;
+  Block: TSSABasicBlock;
+begin
+  Result := False;
+  for j := 0 to Loop.Blocks.Count - 1 do
+  begin
+    Block := TSSABasicBlock(Loop.Blocks[j]);
+    for k := 0 to Block.Instructions.Count - 1 do
+      if Block.Instructions[k].OpCode = ssaCall then Exit(True);
+  end;
 end;
 
 function TLoopInfoSR.ContainsBlock(Block: TSSABasicBlock): Boolean;
@@ -1366,6 +1383,20 @@ begin
   for i := 0 to FLoops.Count - 1 do
   begin
     Loop := TLoopInfoSR(FLoops[i]);
+
+    // SOUNDNESS GUARD (GOSUB): a GOSUB is modelled with a CALL edge to the subroutine and NO edge back --
+    // control returns to the instruction after the call, and the CFG says nothing about it. So the flow
+    // through a GOSUB is not modelled at all, and any "loop" the back-edge detector assembles out of those
+    // edges is fiction: it happily reported one for a program with no loop in it whatsoever. Reasoning
+    // about an induction variable across that is reasoning about a graph that does not describe the
+    // program, and it MISCOMPILED IN SILENCE -- "Y = Y * 5" inside a subroutine was rewritten into a copy
+    // of an accumulator that had never been updated, so a nested GOSUB read a stale value (20 became 10,
+    // opt only; --no-opt was right). Refuse the whole loop if any of its blocks calls a subroutine. The
+    // multiply stays and computes correctly; only the optimization is given up, and only where the CFG
+    // cannot support it.
+    if LoopCallsSubroutine(Loop) then
+      Continue;
+
     PreHeader := FindPreHeader(Loop);
 
     // Scan all blocks in the loop for IV * constant patterns

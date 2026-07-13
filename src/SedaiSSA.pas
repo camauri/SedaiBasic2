@@ -153,6 +153,7 @@ type
     // Context while lowering a procedure body (M2): used to lower "fname = expr" / RETURN expr
     // (FUNCTION result) and EXIT SUB/FUNCTION / RETURN to a frame return.
     FInProcedure: Boolean;
+    FGosubContSerial: Integer;  // unique names for the continuation blocks a GOSUB opens (see ProcessGosub)
     // Bumped by EmitInstruction for every opcode that can put a record into the current frame's record
     // heap: the allocators themselves, and any CALL (a callee can leave a by-value UDT result, or a
     // temporary, behind in ITS caller's records). A block scope compares this across its body to find out
@@ -9241,7 +9242,7 @@ procedure TSSAGenerator.ProcessGosub(Node: TASTNode);
 var
   LabelNode: TASTNode;
   LabelName: string;
-  SourceBlock, TargetBlock: TSSABasicBlock;  // PHASE 3 TIER 3: CFG construction
+  SourceBlock, TargetBlock, ContBlock: TSSABasicBlock;  // PHASE 3 TIER 3: CFG construction
 begin
   if Node.ChildCount = 0 then Exit;
   LabelNode := Node.GetChild(0);
@@ -9266,9 +9267,28 @@ begin
     {$ENDIF}
   end;
 
-  // NOTE: Unlike GOTO, GOSUB does NOT set FCurrentBlock := nil
-  // The fall-through edge LINE_750 → LINE_760 represents where the program counter
-  // continues after RETURN. Variables flow via the RETURN edge (LINE_9030 → LINE_760).
+  // Unlike GOTO, a GOSUB does not end the flow: control comes back, and the block keeps a fall-through
+  // successor for where it comes back TO. That gives the block TWO successors (the subroutine and the
+  // return point), and the CFG only permits that when the block's LAST instruction is the terminator.
+  //
+  // Which it is -- until the GOSUB is followed by more statements on the SAME line. "10 GOSUB 100 : PRINT"
+  // is an everyday Commodore v7 line, and it left the block ending in a PRINT with two successors: the
+  // dominator-tree builder rejected it outright and the program would not compile at all ("Block LINE_10
+  // ends with PrintEnd but has 2 successors"). With the GOSUB alone on its line it always worked, so this
+  // was purely about where the statement sat.
+  //
+  // A call SITE is a block boundary: open a continuation block for the rest of the line, so ssaCall stays
+  // last in its own block and the two successors are the subroutine and this continuation. Blocks are
+  // emitted in creation order, so the continuation lands immediately after the call -- the return address
+  // (the instruction after ssaCall) still points exactly where control has to resume.
+  Inc(FGosubContSerial);
+  ContBlock := FProgram.GetOrCreateBlock('GOSUB_CONT_' + IntToStr(FGosubContSerial));
+  if Assigned(SourceBlock) then
+  begin
+    SourceBlock.AddSuccessor(ContBlock);
+    ContBlock.AddPredecessor(SourceBlock);
+  end;
+  FCurrentBlock := ContBlock;
 end;
 
 { ProcessOnGoto - Handle ON expr GOTO line1, line2, ... statement
