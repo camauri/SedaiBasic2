@@ -117,6 +117,17 @@ type
     Dtors: TStringList;      // "VAR|TYPE" UDT instances to destruct at frame exit (block frames)
     RecMarkEmitted: Boolean; // ssaRecMarkPush emitted for this frame (block frames only)
     IsLoopBody: Boolean;     // this block frame is a loop body (EXIT FOR/DO unwinds down to it inclusive)
+    // A block's record mark (push at entry, pop on every exit path) exists to reclaim the records the
+    // block allocates. A block that allocates NONE does not need it -- and the marks are not free: they
+    // are two more dispatches per iteration, which in a tight loop is a large share of the body. We only
+    // know whether anything was allocated once the body has been lowered, so the push is emitted anyway
+    // and these two fields let us take it back: RecAllocSeq is FRecAllocSeq at block entry, and RecMarkOps
+    // holds EVERY mark instruction emitted for this frame -- the push, the pop at the normal end, and the
+    // pops that early exits (EXIT FOR / RETURN) emit along the way. If nothing allocated, all of them are
+    // rewritten to ssaNop together. All of them: dropping the push while leaving an early-exit pop behind
+    // would pop an ENCLOSING block's mark and reclaim records that are still live.
+    RecAllocSeq: Int64;
+    RecMarkOps: array of TSSAInstruction;
   end;
 
   { SSA Generator - converts AST to SSA IR }
@@ -142,6 +153,11 @@ type
     // Context while lowering a procedure body (M2): used to lower "fname = expr" / RETURN expr
     // (FUNCTION result) and EXIT SUB/FUNCTION / RETURN to a frame return.
     FInProcedure: Boolean;
+    // Bumped by EmitInstruction for every opcode that can put a record into the current frame's record
+    // heap: the allocators themselves, and any CALL (a callee can leave a by-value UDT result, or a
+    // temporary, behind in ITS caller's records). A block scope compares this across its body to find out
+    // whether its record mark is needed at all -- see TScopeFrame.RecAllocSeq.
+    FRecAllocSeq: Int64;
     FCurrentProcName: string;
     // RegisterRecordVars pre-scan only: True while walking a procedure's declaration (its return type,
     // its parameters, and the local DIMs in its body). It is what tells a MODULE-level declaration --
@@ -326,6 +342,8 @@ type
                                                         //   UseSlots=True (END-in-proc): read handles from reserved slots
     function InnermostBlockFrameIdx: Integer;            // M8/FB: topmost skBlock frame index, or -1
     procedure BlockScopeEnter(IsLoopBody: Boolean = False);  // M8: open a block scope (loop/IF/SCOPE) (mark push)
+    function LastEmitted: TSSAInstruction;                   // the instruction EmitInstruction just appended (nil if none)
+    procedure TrackRecMarkOp(FrameIdx: Integer; Instr: TSSAInstruction);  // remember a block's record-mark op, so it can be revoked
     procedure BlockScopeExit;                            // M8: close it (destructors + mark pop, then drop)
     procedure EmitBlockScopeCleanup(Idx: Integer);       // M8: destructors + mark pop for scope Idx (no drop)
     procedure EmitAllBlockScopesCleanup;                 // M8: unwind every active block scope (early frame exit)
@@ -689,6 +707,15 @@ uses SedaiDebug;
 {$ENDIF}
 
 const
+  // Every opcode that can leave a record in the CURRENT frame's record heap. The allocators are obvious;
+  // the CALLS are here because a callee can hand a UDT back by value, or leave a temporary behind, and
+  // those live in the caller's records -- so a block containing a call has to keep its record mark even
+  // though it allocates nothing itself. A block that emits none of these allocates nothing, and its mark
+  // is dead weight (see TScopeFrame.RecAllocSeq). Anything added here later that can allocate MUST be
+  // added to this set, or its records would never be reclaimed.
+  RECORD_ALLOCATING_OPS = [ssaRecordNew, ssaRecordNewArray, ssaRecordNewArrayInd, ssaRecordNewBlock,
+                          ssaCall, ssaCallSub, ssaCallSubIndirect];
+
   // Transfer-register slot reserved for a FUNCTION's return value (per bank). Kept well
   // above any parameter slot count so it never collides with an argument slot.
   XFER_RESULT_SLOT = 255;
@@ -1284,6 +1311,8 @@ begin
   if not Assigned(FCurrentBlock) then
     Exit;
 
+  if OpCode in RECORD_ALLOCATING_OPS then Inc(FRecAllocSeq);
+
   Instr := TSSAInstruction.Create(OpCode);
   Instr.Dest := Dest;
   Instr.Src1 := Src1;
@@ -1292,6 +1321,27 @@ begin
   // Always emit SourceLine for error reporting and TRON trace
   Instr.SourceLine := FCurrentLineNumber;
   FCurrentBlock.AddInstruction(Instr);
+end;
+
+function TSSAGenerator.LastEmitted: TSSAInstruction;
+// The instruction EmitInstruction just appended, or nil if it emitted nothing (it bails out when the
+// block is already terminated). Used to take a reference to a record mark so it can be revoked later.
+begin
+  Result := nil;
+  if Assigned(FCurrentBlock) and (FCurrentBlock.Instructions.Count > 0) then
+    Result := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+end;
+
+procedure TSSAGenerator.TrackRecMarkOp(FrameIdx: Integer; Instr: TSSAInstruction);
+// Remember a record-mark instruction belonging to a block frame, so that BlockScopeExit can revoke the
+// whole set at once if the block turns out to allocate nothing.
+var
+  n: Integer;
+begin
+  if (Instr = nil) or (FrameIdx < 0) or (FrameIdx > High(FScopeStack)) then Exit;
+  n := Length(FScopeStack[FrameIdx].RecMarkOps);
+  SetLength(FScopeStack[FrameIdx].RecMarkOps, n + 1);
+  FScopeStack[FrameIdx].RecMarkOps[n] := Instr;
 end;
 
 // Overload without hint - creates empty hint internally
@@ -17057,6 +17107,11 @@ begin
                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   FScopeStack[High(FScopeStack)].RecMarkEmitted := True;
   FScopeStack[High(FScopeStack)].IsLoopBody := IsLoopBody;
+  // Whether this mark is needed at all is only knowable once the body has been lowered, so remember the
+  // push and the allocation count as of now; BlockScopeExit revokes the whole set if nothing allocated.
+  FScopeStack[High(FScopeStack)].RecAllocSeq := FRecAllocSeq;
+  SetLength(FScopeStack[High(FScopeStack)].RecMarkOps, 0);
+  TrackRecMarkOp(High(FScopeStack), LastEmitted);
 end;
 
 procedure TSSAGenerator.EmitExitLoopCleanup;
@@ -17134,8 +17189,15 @@ begin
       EmitDestructorCall(GetOrAllocateVariable(VName), TName);
     end;
   if FScopeStack[Idx].RecMarkEmitted then
+  begin
     EmitInstruction(ssaRecMarkPop, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // Track it with the frame: this runs for the normal end of the block AND, through
+    // EmitAllBlockScopesCleanup, for every early exit out of it. If the mark turns out to be unnecessary,
+    // BlockScopeExit has to revoke ALL of them -- an orphaned pop would reclaim an enclosing block's
+    // still-live records.
+    TrackRecMarkOp(Idx, LastEmitted);
+  end;
 end;
 
 procedure TSSAGenerator.BlockScopeExit;
@@ -17143,10 +17205,21 @@ procedure TSSAGenerator.BlockScopeExit;
 // live path: if the branch already terminated (GOTO/RETURN/END left FCurrentBlock nil), an early-exit
 // path has emitted its own unwinding (EmitAllBlockScopesCleanup) — here we just drop the frame to keep
 // the scope stack balanced.
+var
+  Idx, k: Integer;
 begin
-  if InnermostBlockFrameIdx < 0 then Exit;
+  Idx := InnermostBlockFrameIdx;
+  if Idx < 0 then Exit;
   if Assigned(FCurrentBlock) then
     EmitBlockScopeCleanup(High(FScopeStack));
+  // The body is fully lowered now, so we finally know: if not a single record-allocating opcode was
+  // emitted inside this block, its record mark reclaims nothing and is pure overhead -- two extra
+  // dispatches per iteration, which in a tight loop is a large share of the whole body. Revoke the push
+  // and EVERY pop together (ssaNop; the bytecode compiler drops those outright). Destructor calls count as
+  // allocations, so a block that has any keeps its mark, exactly as it must.
+  if FScopeStack[Idx].RecMarkEmitted and (FRecAllocSeq = FScopeStack[Idx].RecAllocSeq) then
+    for k := 0 to High(FScopeStack[Idx].RecMarkOps) do
+      FScopeStack[Idx].RecMarkOps[k].OpCode := ssaNop;
   ScopePopFrame;
 end;
 
