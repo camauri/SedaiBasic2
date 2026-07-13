@@ -15006,14 +15006,9 @@ function TSSAGenerator.PrintKindOfExpr(Node: TASTNode): Integer;
 // "true"/"false" like the variable form does -- it printed -1/0, because only an antIdentifier was ever
 // consulted. A call parsed as an array access carries its name in child 0; a genuine array element lands
 // here too, but an array name is never in the print-kind table (only scalars, parameters and returns).
-//
-// NOT handled here, and it needs the LEXER: FreeBASIC gives a DECIMAL integer literal the first type on
-// the ladder Long -> ULong -> LongInt -> ULongInt that holds it, so [2^31, 2^32-1] is a ULONG and prints
-// with NO sign space (we print one). A HEX literal does NOT climb that ladder -- fbc prints &HFFFFFFFF as
-// " 4294967295", sign space and all -- and by the time a literal reaches this AST its "&H.." text is long
-// gone: LexAmpBaseLiteral rewrites the token's value to the decimal string. Telling the two apart takes a
-// base-prefixed marker on the token; keying the rule off the digits alone would strip the sign space from
-// every hex literal in that range, trading one divergence for another.
+var
+  Txt: string;
+  I64, NodeVal: Int64;
 begin
   Result := 0;
   if Node = nil then Exit;
@@ -15027,6 +15022,28 @@ begin
         Result := PrintKindOf(VarToStr(Node.GetChild(0).Value));
     antParentheses:
       if Node.ChildCount >= 1 then Result := PrintKindOfExpr(Node.GetChild(0));
+    antLiteral:
+      // FreeBASIC gives a DECIMAL integer literal the first type on the ladder Long -> ULong -> LongInt ->
+      // ULongInt that holds it, so a literal in [2^31, 2^32-1] is a ULONG -- and an unsigned prints with NO
+      // leading sign space. We printed one, which silently shifted every column after it. Kind 3, not 2: it
+      // is unsigned only in its printed FORM and must not taint the expression into the unsigned-64
+      // compare/divide/mod opcodes (a narrow unsigned promotes to a SIGNED expression in FreeBASIC).
+      //
+      // A base literal is NOT on that ladder -- fbc prints &HFFFFFFFF as " 4294967295", sign space and all
+      // -- and by the time it reaches the AST its "&H.." text is gone (LexAmpBaseLiteral rewrites the value
+      // to the decimal string), so the token's BasePrefixed mark is the only thing that still tells them
+      // apart. Without it, keying off the digits alone would strip the sign space from every hex literal in
+      // the range: one divergence traded for another.
+      if FModernMode and Assigned(Node.Token) and (not Node.Token.BasePrefixed) and
+         (Node.Token.TokenType <> ttStringLiteral) then
+      begin
+        Txt := Trim(VarToStr(Node.Token.Value));
+        // The node's own value must BE the token's number. A synthesized literal (the "name(0)" of a SHARED
+        // scalar access, say) borrows the token of a neighbouring node, so its text says nothing about it.
+        if TryStrToInt64(Txt, I64) and TryStrToInt64(Trim(VarToStr(Node.Value)), NodeVal) and
+           (I64 = NodeVal) and (I64 >= Int64(2147483648)) and (I64 <= Int64(4294967295)) then
+          Result := 3;
+      end;
   end;
 end;
 

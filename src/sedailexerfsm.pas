@@ -1290,6 +1290,8 @@ begin
   // === TRUE LAZY SETUP: DON'T extract value yet! ===
   Result.TokenType := TokenType;
   Result.KeywordInfo := KeywordInfo;
+  Result.BasePrefixed := False;   // pooled object: clear it, or the previous token's "&H.." mark carries over
+
   Result.Line := ATokenLine;
   Result.Column := FTokenStartColumn;
   Result.Position := FTokenStart;
@@ -1465,6 +1467,10 @@ begin
   ConsumeIntLiteralSuffix;   // FreeBASIC typed integer literal: &hFFul, &b1010ULL, ... (dropped)
   Result := CreateToken(ttNumber);
   Result.SetExtractedValue(IntToStr(Val));   // logical value is decimal, not the "&H.." source text
+  // ...which is why the token has to remember that it WAS base-prefixed: with the source text gone it is
+  // indistinguishable from a plain decimal literal, and FreeBASIC's type ladder treats the two differently
+  // (a decimal 4294967295 is an unsigned ULong; &HFFFFFFFF is not).
+  Result.BasePrefixed := True;
 end;
 
 function TLexerFSM.ProcessEscapes(const Raw: string): string;

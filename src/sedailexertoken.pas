@@ -50,6 +50,7 @@ type
     FLength: Integer;
     FKeywordInfo: TKeywordInfo; // Optional keyword reference
     FSourceFile: string;        // Source file name (optional)
+    FBasePrefixed: Boolean;     // "&H../&O../&B.." literal (its value is rewritten to decimal -- see the property)
 
     // Lazy evaluation flags for performance
     FDisplayStringCached: string;
@@ -144,6 +145,12 @@ type
     property Length: Integer read FLength write FLength;
     property KeywordInfo: TKeywordInfo read FKeywordInfo write FKeywordInfo;
     property SourceFile: string read FSourceFile write FSourceFile;
+    // True for an "&H../&O../&B.." integer literal. Its value is rewritten to the decimal string (see
+    // SetExtractedValue below), which makes it look exactly like a plain decimal literal from the AST --
+    // and the two are NOT interchangeable: FreeBASIC's literal type ladder (Long -> ULong -> LongInt ->
+    // ULongInt) applies to decimals only, so "4294967295" is an unsigned ULong while "&HFFFFFFFF" stays
+    // signed. This is the only surviving trace of which one it was.
+    property BasePrefixed: Boolean read FBasePrefixed write FBasePrefixed;
 
     // INTERNAL: Lazy extraction setup (used by lexer)
     procedure SetupLazyExtraction(ExtractorCtx: Pointer; ExtractorFn: TTokenValueExtractor; RecIdx: Integer);
