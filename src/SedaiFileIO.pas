@@ -38,6 +38,35 @@ type
 
 implementation
 
+{$IFDEF WINDOWS}
+// Windows resolves a handful of legacy DOS names to DEVICES rather than files: opening 'LPT1:' or 'PRN'
+// for output hands the bytes to the PRINT SPOOLER, and 'COM1' to the serial port. The filename here comes
+// straight out of the BASIC program, and the sweeps run programs downloaded from the web unattended — so
+// this VM refuses devices and does storage only. The match has to be as loose as the OS's own: a trailing
+// colon, an extension ('LPT1.TXT' is still the printer) and trailing blanks are all ignored by Windows.
+function IsReservedDeviceName(const Filename: string): Boolean;
+var
+  S: string;
+  i, P: Integer;
+begin
+  S := UpperCase(Trim(Filename));
+  // Last path component, without ExtractFileName: that treats ':' as a drive separator and would swallow
+  // the whole of 'LPT1:', leaving nothing to test.
+  for i := Length(S) downto 1 do
+    if (S[i] = '\') or (S[i] = '/') then
+    begin
+      S := Copy(S, i + 1, Length(S) - i);
+      Break;
+    end;
+  P := Pos(':', S); if P > 0 then S := Copy(S, 1, P - 1);
+  P := Pos('.', S); if P > 0 then S := Copy(S, 1, P - 1);
+  S := TrimRight(S);
+  Result := (S = 'CON') or (S = 'PRN') or (S = 'AUX') or (S = 'NUL') or
+            (((Copy(S, 1, 3) = 'COM') or (Copy(S, 1, 3) = 'LPT')) and (Length(S) = 4) and
+             (S[4] >= '1') and (S[4] <= '9'));
+end;
+{$ENDIF}
+
 destructor TVMFileHandler.Destroy;
 begin
   CloseAll;
@@ -71,6 +100,10 @@ begin
 
   if Command = 'DOPEN' then
   begin
+    {$IFDEF WINDOWS}
+    // A device is not a file: refuse it as one (62 = FILE NOT FOUND). See IsReservedDeviceName.
+    if IsReservedDeviceName(Filename) then begin ErrorCode := 62; Exit; end;
+    {$ENDIF}
     if Assigned(FFileHandles[Handle]) then
     begin
       FreeAndNil(FFileHandles[Handle]);
