@@ -361,7 +361,9 @@ type
     function StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;  // "TYPE.FIELD" backing name, or '' if not static
     procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
     // Refinement #2: cross-thread SHARED scalars backed by a 1-element global array.
-    function IsSharedScalar(const Name: string): Boolean;                       // name is a SHARED scalar (array-backed)?
+    function IsSharedScalar(const Name: string): Boolean;                       // name is a SHARED scalar (array-backed)? False when shadowed by a param/local
+    function IsSharedScalarRaw(const Name: string): Boolean;                    // ...as DECLARED, ignoring shadowing (the slot-sync asks HOW it is stored, not WHICH variable is meant)
+    function SharedScalarShadowed(const Name: string): Boolean;                 // ...is a param/local of the procedure being lowered hiding it? (MODERN)
     function MakeSharedScalarAccess(const Name: string; const Tok: TLexerToken): TASTNode;  // build name(0) array-access node
     procedure EmitSharedScalarStoreVal(const Name: string; const Val: TSSAValue);  // store an SSA value into name(0)
     // FreeBASIC pointers: record pointer-var pointee types and back every address-taken (@x) scalar
@@ -17370,7 +17372,51 @@ begin
     CollectSharedVars(Node.GetChild(i));
 end;
 
+function TSSAGenerator.SharedScalarShadowed(const Name: string): Boolean;
+// True if NAME is currently shadowed, inside the procedure being lowered, by a PARAMETER or a local DIM of
+// the same name -- in which case it is that local binding that the code means, not the DIM SHARED global.
+//
+// Walk the scope stack innermost-first and stop AT the procedure root: a binding found on the way is the
+// local one (the prologue binds parameters there, a DIM binds in its block). Anything beyond the proc root
+// is the module namespace, which is where the shared variable itself lives -- looking past it would find
+// the shared name again and report it as its own shadow.
+//
+// MODERN only. CLASSIC has no local scope at all: in Commodore BASIC every name is global, so nothing can
+// shadow anything and the check must stay inert there.
+var
+  f: Integer;
+  nameU: string;
+begin
+  Result := False;
+  if not (FModernMode and FInProcedure) then Exit;
+  nameU := UpperCase(Name);
+  for f := High(FScopeStack) downto 0 do
+  begin
+    if (FScopeStack[f].Bindings <> nil) and (FScopeStack[f].Bindings.IndexOf(nameU) >= 0) then
+      Exit(True);
+    if FScopeStack[f].Kind = skProcRoot then Exit(False);
+  end;
+end;
+
 function TSSAGenerator.IsSharedScalar(const Name: string): Boolean;
+// A DIM SHARED scalar is backed by a 1-element global array, and roughly fifteen call sites ask this
+// question to route a read/write/FOR-counter/string-index through that backing instead of a register.
+//
+// It used to be a BARE-NAME lookup, so it fired even when the name had been shadowed by a parameter or a
+// local DIM: inside "Sub s(h As Integer)" the parameter h read the SHARED h (55 instead of the argument),
+// and worse, a plain "Dim As Integer h = 3" local to a SUB WROTE ITS VALUE INTO THE GLOBAL -- a local
+// silently corrupting a global, with no error. It failed with matching banks too, so it was never the
+// bank-collision bug it looked like. Same family as every other bare-name intercept that forgot to ask
+// the scope stack first: ask it here, once, and all the call sites are fixed together.
+begin
+  Result := IsSharedScalarRaw(Name) and not SharedScalarShadowed(Name);
+end;
+
+function TSSAGenerator.IsSharedScalarRaw(const Name: string): Boolean;
+// Is this name DECLARED as an array-backed SHARED scalar? A property of the declaration, with no regard
+// for what may be shadowing it here -- which is what the shared slot-sync needs to ask, since it is
+// deciding HOW the variable is stored, not WHICH variable a piece of code is talking about. Every other
+// caller wants IsSharedScalar, which does take shadowing into account.
 begin
   Result := (FSharedScalarArr <> nil) and (FSharedScalarArr.IndexOf(UpperCase(Name)) >= 0);
 end;
@@ -18837,7 +18883,10 @@ begin
   if (FSharedVars = nil) or (FSharedVars.Count = 0) then Exit;
   for i := 0 to FSharedVars.Count - 1 do
   begin
-    if IsSharedScalar(FSharedVars[i]) then Continue;   // array-backed: lives in shared FArrays, no slot sync
+    if IsSharedScalarRaw(FSharedVars[i]) then Continue;   // array-backed: lives in shared FArrays, no slot sync
+    // A parameter or a local DIM of this name hides the shared one here, and GetOrAllocateVariable would
+    // hand back THAT register: syncing it would write the local's value straight into the global.
+    if SharedScalarShadowed(FSharedVars[i]) then Continue;
     V := GetOrAllocateVariable(FSharedVars[i]);
     EmitXferStore(V.RegType, PtrInt(FSharedVars.Objects[i]), V);
   end;
@@ -18853,7 +18902,11 @@ begin
   if (FSharedVars = nil) or (FSharedVars.Count = 0) then Exit;
   for i := 0 to FSharedVars.Count - 1 do
   begin
-    if IsSharedScalar(FSharedVars[i]) then Continue;   // array-backed: lives in shared FArrays, no slot sync
+    if IsSharedScalarRaw(FSharedVars[i]) then Continue;   // array-backed: lives in shared FArrays, no slot sync
+    // Shadowed here by a parameter or a local DIM: GetOrAllocateVariable would resolve to THAT register,
+    // and loading the shared slot into it would clobber the local before its first use -- which is exactly
+    // what made "Sub s(h As Integer)" read the shared h instead of its own argument.
+    if SharedScalarShadowed(FSharedVars[i]) then Continue;
     V := GetOrAllocateVariable(FSharedVars[i]);
     EmitXferLoad(V.RegType, PtrInt(FSharedVars.Objects[i]), V);
   end;
