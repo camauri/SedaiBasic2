@@ -304,6 +304,8 @@ type
     procedure EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx: Integer; ArgsNode: TASTNode);
     procedure EmitDestructorCall(const HandleVal: TSSAValue; const TypeName: string);  // V5
     function FindBaseCall(Node: TASTNode): TASTNode;    // M4.4f: the body's explicit BASE call node (or nil)
+    // MODERN: gather the DIM'd UDTs of THIS scope only -- a DIM inside a block belongs to the block.
+    procedure CollectRecordVarsAtThisLevel(Node: TASTNode; Into: TStringList; var Depth: Integer);
     procedure CollectLocalRecordVars(Node: TASTNode);  // V5: gather a proc body's DIM'd local UDTs
     procedure EmitFrameDestructors;                     // V5: dtor calls for the current frame
     procedure EmitByrefParamStore;                      // BYREF: callee — write explicit-BYREF scalar params back to their slots
@@ -435,6 +437,10 @@ type
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
     // FB implicit THIS: a bare field name in a method body -> synthesized "this.<field>" access.
     function TryImplicitThisField(const VarName: string; const Tok: TLexerToken; out MemberNode: TASTNode): Boolean;
+    function BlockHandledKey(const Scope, VarName: string): string;   // "<proc>|<var>" ('' proc = module)
+    // FB implicit THIS for a CALL: a bare "m(args)" / a bare property name in a method body -> "this.m(...)".
+    function TryImplicitThisMethod(const VarName: string; ArgsNode: TASTNode; const Tok: TLexerToken;
+                                   out CallResult: TSSAValue): Boolean;
     // UDT array members obj.field(i,j): the field slot holds an FArrays handle; access is indirect.
     function IsMemberArrayAccess(ArrAccessNode: TASTNode; out HandleReg: TSSAValue;
                                  out ElemBank: TSSARegisterType; out LinIdx: TSSAValue): Boolean;
@@ -1731,6 +1737,13 @@ begin
       begin
         ProcessExpression(ArgListNode, Result);
         ArgListNode.Free;
+      end
+      // ...and a bare name that is a no-argument METHOD or a PROPERTY of the owner type reads
+      // "this.<name>" too -- which is how a property setter reads its own getter (FreeBASIC's own
+      // udt/property example does exactly that, and we read 0 instead).
+      else if TryImplicitThisMethod(VarName, nil, Node.Token, Result) then
+      begin
+        // TryImplicitThisMethod emitted the call and produced its result
       end
       // FreeBASIC: a FUNCTION named without parentheses and taking no arguments is a call -- "g = Foo"
       // runs Foo(). Excluded: the enclosing function's own name (which denotes the return value), and a
@@ -5104,6 +5117,11 @@ begin
           Exit;
         end;
 
+        // FreeBASIC implicit THIS, for a CALL: inside a method body, "m(args)" with no object means
+        // "this.m(args)". Fields already resolved that way; methods did not, so a method calling another
+        // method of its OWN type was read as an array access and died here as "Array not declared".
+        if TryImplicitThisMethod(ArrName, Node.GetChild(1), Node.Token, Result) then Exit;
+
         ArrayIdx := ArrayIndexOf(ArrName);
         if ArrayIdx < 0 then
           raise Exception.CreateFmt('Array not declared: %s', [ArrName]);
@@ -6646,8 +6664,8 @@ begin
         if BlkIdx >= 0 then
         begin
           FScopeStack[BlkIdx].Dtors.Add(UpperCase(ArrName) + '|' + RecTypeName);
-          if FBlockHandledVars.IndexOf(UpperCase(ArrName)) < 0 then
-            FBlockHandledVars.Add(UpperCase(ArrName));
+          if FBlockHandledVars.IndexOf(BlockHandledKey(FCurrentProcName, ArrName)) < 0 then
+            FBlockHandledVars.Add(BlockHandledKey(FCurrentProcName, ArrName));
         end
         // V5e: a true module global (not in a procedure frame, not block-scoped) with a destructor gets
         // its handle stashed in a reserved frame-independent slot, so an END inside any SUB can still
@@ -16513,15 +16531,70 @@ begin
   end;
 end;
 
-procedure TSSAGenerator.CollectLocalRecordVars(Node: TASTNode);
-// V5: recursively gather the DIM'd UDT (record) variables in a procedure body, in textual order,
-// as "VARNAME|TYPENAME" entries in FCurrentProcLocalRecs (used to emit destructor calls at exit).
+procedure TSSAGenerator.CollectRecordVarsAtThisLevel(Node: TASTNode; Into: TStringList; var Depth: Integer);
+// Gather the DIM'd UDT variables that belong to THIS scope -- the ones whose destructor the frame (or the
+// module) has to call -- in textual order, as "VARNAME|TYPENAME".
+//
+// In MODERN a DIM inside a block (a SCOPE, an IF branch, a loop body) is BLOCK-local: it gets its own
+// binding and is destructed at the block's exit, so it is not ours. Collecting it anyway made the frame
+// and the module claim a variable they do not own, and the only defence was a list of bare NAMES to skip
+// -- which meant one "Dim x" inside a SCOPE silenced the destructor of every other "x" in the program.
+// FreeBASIC's own udt/destructor example is exactly that shape, and lost two of its four destructors.
+//
+// So: do not descend into a block. Recurse only through the transparent wrappers, and count FOR/NEXT --
+// a FOR body is a FLAT run of siblings, not a child node, so its DIMs would otherwise look like ours.
+// (The same walk ScanTopLevelLabels does, and for the same reason.)
+//
+// CLASSIC keeps the old full walk: v7 has no block scope, so a DIM in a block IS this scope's variable.
 var
   k, c: Integer;
   Decl: TASTNode;
   VName, TName: string;
 begin
   if Node = nil then Exit;
+  case Node.NodeType of
+    antForLoop: begin Inc(Depth); Exit; end;      // body follows as siblings until antNext
+    antNext:    begin if Depth > 0 then Dec(Depth); Exit; end;
+  end;
+  if (Node.NodeType = antDim) and (Depth = 0) then
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(k);
+      if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 2) and
+         (Decl.GetChild(1).NodeType = antIdentifier) then          // DIM v AS T (typed scalar)
+      begin
+        TName := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        if FindUDT(TName) >= 0 then
+        begin
+          VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+          Into.Add(VName + '|' + TName);
+        end;
+      end;
+    end;
+  // Only the transparent wrappers are followed. Everything else (antIf / antBlock / antDoLoop / ...) is a
+  // block scope of its own, and a procedure declaration collects its locals separately.
+  if Node.NodeType in [antProgram, antStatement, antDim] then
+    for c := 0 to Node.ChildCount - 1 do
+      CollectRecordVarsAtThisLevel(Node.GetChild(c), Into, Depth);
+end;
+
+procedure TSSAGenerator.CollectLocalRecordVars(Node: TASTNode);
+// V5: gather the DIM'd UDT (record) variables of a procedure body, in textual order, as
+// "VARNAME|TYPENAME" entries in FCurrentProcLocalRecs (used to emit destructor calls at exit).
+var
+  k, c, Depth: Integer;
+  Decl: TASTNode;
+  VName, TName: string;
+begin
+  if Node = nil then Exit;
+  if FModernMode then
+  begin
+    Depth := 0;
+    for c := 0 to Node.ChildCount - 1 do
+      CollectRecordVarsAtThisLevel(Node.GetChild(c), FCurrentProcLocalRecs, Depth);
+    Exit;
+  end;
+  // CLASSIC: no block scope -- a DIM anywhere in the body is this frame's variable.
   if Node.NodeType = antDim then
     for k := 0 to Node.ChildCount - 1 do
     begin
@@ -16557,7 +16630,13 @@ begin
       if bar <= 0 then Continue;
       VName := Copy(FCurrentProcLocalRecs[i], 1, bar - 1);
       TName := Copy(FCurrentProcLocalRecs[i], bar + 1, MaxInt);
-      if FBlockHandledVars.IndexOf(VName) >= 0 then Continue;   // M8: destructed block-scoped
+      // M8: already destructed at its BLOCK's exit. In MODERN the collector no longer hands us a
+      // block-scoped DIM at all (it is a separate binding, owned by the block), so there is nothing to
+      // exclude -- and excluding by NAME is what used to silence a same-named variable of THIS scope.
+      // CLASSIC has no block scope: there the block's DIM really is this frame's variable, and the
+      // exclusion is what stops it being destructed twice.
+      if (not FModernMode) and
+         (FBlockHandledVars.IndexOf(BlockHandledKey(FCurrentProcName, VName)) >= 0) then Continue;
       EmitDestructorCall(GetOrAllocateVariable(VName), TName);
     end;
   if (FCurrentProcByvalRecs <> nil) then
@@ -16672,9 +16751,20 @@ var
   k, c: Integer;
   Decl: TASTNode;
   VName, TName: string;
+var
+  Depth: Integer;
 begin
   if Node = nil then Exit;
   if Node.NodeType = antProcedureDecl then Exit;   // proc-local DIMs are not globals
+  if FModernMode then
+  begin
+    // A DIM inside a block is block-local and destructed there -- not the module's. See
+    // CollectRecordVarsAtThisLevel.
+    Depth := 0;
+    CollectRecordVarsAtThisLevel(Node, FModuleRecordVars, Depth);
+    Exit;
+  end;
+  // CLASSIC: no block scope -- a DIM anywhere at module level is a module global.
   if Node.NodeType = antDim then
     for k := 0 to Node.ChildCount - 1 do
     begin
@@ -16818,7 +16908,11 @@ begin
     if bar <= 0 then Continue;
     VName := Copy(FModuleRecordVars[i], 1, bar - 1);
     TName := Copy(FModuleRecordVars[i], bar + 1, MaxInt);
-    if FBlockHandledVars.IndexOf(VName) >= 0 then Continue;   // M8: destructed block-scoped
+    // M8: already destructed at its block's exit -- CLASSIC only, as in EmitFrameDestructors. Module
+    // scope has the empty procedure name, spelled out because this emitter can run from an END inside a
+    // SUB (where FCurrentProcName is that SUB's).
+    if (not FModernMode) and
+       (FBlockHandledVars.IndexOf(BlockHandledKey('', VName)) >= 0) then Continue;
     if UseSlots then
     begin
       slotIdx := FModuleDtorSlots.IndexOf(VName);
@@ -19439,6 +19533,48 @@ begin
   end;
   EmitInstruction(Op, DestVal, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
   Result := DestVal;
+end;
+
+function TSSAGenerator.BlockHandledKey(const Scope, VarName: string): string;
+// Key of "this variable's destructor is handled at its BLOCK's exit, so the frame/module destructor must
+// leave it alone". Scope is the enclosing procedure, or '' for module level: without it, the exclusion was
+// keyed by bare name and one block-scoped "x" silenced every "x" in the program.
+begin
+  Result := UpperCase(Scope) + '|' + UpperCase(VarName);
+end;
+
+function TSSAGenerator.TryImplicitThisMethod(const VarName: string; ArgsNode: TASTNode;
+  const Tok: TLexerToken; out CallResult: TSSAValue): Boolean;
+// FreeBASIC implicit THIS, for a CALL: inside a method / constructor / property body, a bare "m(args)"
+// -- or a bare name denoting a no-argument method or a PROPERTY -- means "this.m(args)".
+//
+// Fields already worked (TryImplicitThisField); calls did not. A method that called another method of its
+// own type was taken for an array access ("Array not declared: GETX"), and a bare property read simply
+// answered 0 -- which is why FreeBASIC's own udt/property example silently did nothing: its Length SETTER
+// reads its Length GETTER ("Dim m As Single = Length"), got 0, and skipped the whole body.
+//
+// Not for the enclosing procedure's OWN name: inside "Property T.Length()", a bare "Length" is the RESULT
+// variable ("Length = Sqr(...)"), not a recursive call. Inside the SETTER (label "T.Length.SET") the same
+// bare name IS the getter, which is exactly the distinction FreeBASIC draws.
+var
+  ThisNode: TASTNode;
+  Existing: TSSAValue;
+begin
+  Result := False;
+  CallResult := MakeSSAValue(svkNone);
+  if FCurrentThisType = '' then Exit;                        // not lowering a method body
+  if FCurrentProcName = UpperCase(FCurrentThisType) + '.' + UpperCase(VarName) then Exit;  // own result
+  if ResolveExisting(VarName, Existing) then Exit;           // a parameter / local DIM shadows it
+  if ArrayIndexOf(VarName) >= 0 then Exit;                   // a real array of that name wins
+  if ResolveMethodLabelArgs(FCurrentThisType, VarName, ArgsNode) = '' then Exit;   // no such method
+
+  ThisNode := TASTNode.CreateWithValue(antIdentifier, 'THIS', Tok);
+  try
+    ProcessMethodCall(ThisNode, FCurrentThisType, VarName, ArgsNode, CallResult);
+  finally
+    ThisNode.Free;
+  end;
+  Result := True;
 end;
 
 function TSSAGenerator.TryImplicitThisField(const VarName: string; const Tok: TLexerToken;
