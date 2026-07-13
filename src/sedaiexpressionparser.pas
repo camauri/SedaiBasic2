@@ -2044,6 +2044,21 @@ begin
     Exit;
   end;
   Context.Advance;   // consume field name
+  // FreeBASIC "base.base.a": BASE names the base SUBOBJECT, so it chains -- base.base is the grandparent
+  // level. It is NOT a field called "base", and building a member access for it would send the SSA looking
+  // for one. Collapse the chain instead: `base` already parsed to THIS marked BASEREF (StaticParseBase),
+  // so another ".base" on it just means one level further up. Carry that as a DEPTH on the same node and
+  // hand the node straight back -- the SSA then climbs BASEREF parents from the type being compiled
+  // (ObjectTypeName) and the record HANDLE stays THIS's, which is what makes this work: the layout is a
+  // prefix, so every level's slots live in the same instance.
+  if (FieldName = 'BASE') and (Left <> nil) and (Left.NodeType = antIdentifier) and
+     (Left.Attributes.Values['BASEREF'] <> '') then
+  begin
+    Left.Attributes.Values['BASEREF'] :=
+      IntToStr(StrToIntDef(Left.Attributes.Values['BASEREF'], 1) + 1);
+    Result := Left;
+    Exit;
+  end;
   Result := TASTNode.CreateWithValue(antMemberAccess, FieldName, Token);
   Result.AddChild(Left);
   DoNodeCreated(Result);

@@ -4331,17 +4331,16 @@ begin
           MethodOwnerType := ObjectTypeName(MethodObjNode);
           if MethodOwnerType <> '' then
           begin
-            // FreeBASIC "base.method()" super call: dispatch non-virtually against the parent type (the
-            // object is `this` marked BASEREF). Resolves the parent's method and calls it directly, so a
-            // derived override does not re-invoke itself.
-            if MethodObjNode.Attributes.Values['BASEREF'] = '1' then
+            // FreeBASIC "base.method()" super call. ObjectTypeName has ALREADY resolved `base` to the
+            // parent type (and `base.base` to its parent, and so on -- it climbs the BASEREF depth), so
+            // there is nothing left to climb here: all this branch adds is NON-VIRTUAL dispatch against
+            // that type, so a derived override does not re-invoke itself.
+            if MethodObjNode.Attributes.Values['BASEREF'] <> '' then
             begin
-              ArrayIdx := FindUDT(MethodOwnerType);
-              if ArrayIdx >= 0 then TempStr := FUDTs[ArrayIdx].Parent else TempStr := '';
-              if (TempStr <> '') and
-                 (ResolveMethodLabelArgs(TempStr, VarToStr(Node.GetChild(0).Value), Node.GetChild(1)) <> '') then
+              if ResolveMethodLabelArgs(MethodOwnerType, VarToStr(Node.GetChild(0).Value),
+                                        Node.GetChild(1)) <> '' then
               begin
-                ProcessMethodCall(MethodObjNode, TempStr, VarToStr(Node.GetChild(0).Value),
+                ProcessMethodCall(MethodObjNode, MethodOwnerType, VarToStr(Node.GetChild(0).Value),
                                   Node.GetChild(1), Result, True);
                 Exit;
               end;
@@ -14825,7 +14824,7 @@ var
     UDTIdx := FindUDT(TypeName);
     if UDTIdx < 0 then Exit;
     FldU := UpperCase(FieldName);
-    for k := 0 to High(FUDTs[UDTIdx].Fields) do
+    for k := High(FUDTs[UDTIdx].Fields) downto 0 do
       if UpperCase(FUDTs[UDTIdx].Fields[k].Name) = FldU then
         Exit(FUDTs[UDTIdx].Fields[k].WidthCode = 7);
   end;
@@ -15062,6 +15061,19 @@ end;
 
 function TSSAGenerator.UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
   out Bank: TSSARegisterType; out Slot: Integer; out NestedType: string): Boolean;
+// Find a field by name. BACKWARDS -- and so does every other by-name field lookup in this family.
+//
+// FillOneUDT lays a derived type out as [parent's fields][its own], with the per-bank slot counters
+// carrying on, so when a derived type REDECLARES a name it gets a slot of its OWN and Fields holds two
+// entries under the same name. FreeBASIC says the derived one SHADOWS the base's, i.e. the LAST match
+// wins; scanning forward returned the base's every time, so all of Parent.a, Child.a and GrandChild.a
+// collapsed onto slot 0 -- each constructor overwrote the previous one's value and the other slots stayed
+// zero (base.bas printed "0 3 3" where fbc prints "18 6 3"). Resolution is against the STATIC type being
+// compiled, so this yields exactly the right level: inside Parent.show() the type is Parent, whose Fields
+// hold only its own 'a'; `base.a` resolves against the parent type (see ObjectTypeName).
+//
+// The loops that ENUMERATE every field (construction, defaults, destructors, SizeOf) must keep running
+// forward and untouched: they have to visit BOTH 'a's, each of which is a real, separate slot.
 var
   i: Integer;
   F: string;
@@ -15070,7 +15082,7 @@ begin
   NestedType := '';
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   F := UpperCase(FieldName);
-  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
     if FUDTs[UDTIdx].Fields[i].Name = F then
     begin
       Bank := FUDTs[UDTIdx].Fields[i].Bank;
@@ -15092,7 +15104,7 @@ begin
   Slot := 0; ElemBank := srtInt; DimCount := 1;
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   F := UpperCase(FieldName);
-  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
     if (FUDTs[UDTIdx].Fields[i].Name = F) and FUDTs[UDTIdx].Fields[i].IsArray then
     begin
       Slot := FUDTs[UDTIdx].Fields[i].Slot;
@@ -15111,7 +15123,7 @@ begin
   Result := '';
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   F := UpperCase(FieldName);
-  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
     if (FUDTs[UDTIdx].Fields[i].Name = F) and FUDTs[UDTIdx].Fields[i].IsArray then
       Exit(FUDTs[UDTIdx].Fields[i].ArrayElemType);
 end;
@@ -15127,7 +15139,7 @@ begin
   Result := '';
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   F := UpperCase(FieldName);
-  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
     if (FUDTs[UDTIdx].Fields[i].Name = F) and FUDTs[UDTIdx].Fields[i].IsArray then
       Exit(FUDTs[UDTIdx].Fields[i].ArrayElemPtrPointee);
 end;
@@ -15142,7 +15154,7 @@ begin
   Result := ''; Slot := 0;
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   F := UpperCase(FieldName);
-  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
     if (FUDTs[UDTIdx].Fields[i].Name = F) and (FUDTs[UDTIdx].Fields[i].FuncPtrSig <> '') then
     begin
       Slot := FUDTs[UDTIdx].Fields[i].Slot;
@@ -15159,7 +15171,7 @@ begin
   Result := 0;
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   F := UpperCase(FieldName);
-  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].WidthCode);
 end;
 
@@ -15173,7 +15185,7 @@ begin
   Result := '';
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   F := UpperCase(FieldName);
-  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].PtrPointee);
 end;
 
@@ -15187,7 +15199,7 @@ begin
   Result := '';
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   F := UpperCase(FieldName);
-  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].RawPtrPointee);
 end;
 
@@ -15220,7 +15232,7 @@ begin
   Result := False;
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   F := UpperCase(FieldName);
-  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].IsWString);
 end;
 
@@ -19092,6 +19104,7 @@ var
   ArrName, ParentType, NestedT: string;
   Bank: TSSARegisterType;
   Slot: Integer;
+  Lvl, BaseIdx: Integer;
 begin
   Result := '';
   if ObjNode = nil then Exit;
@@ -19099,6 +19112,24 @@ begin
   while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do
     ObjNode := ObjNode.GetChild(0);
   if ObjNode = nil then Exit;
+  // FreeBASIC BASE (and BASE.BASE...): `base` names the base SUBOBJECT of the type being compiled, not a
+  // field of it. The parser lowers it to THIS carrying a BASEREF DEPTH, so climb that many EXTENDS levels
+  // from the current type. The record HANDLE stays THIS's, and that is exactly what makes this work: the
+  // layout is a prefix, so a base level's slots ARE slots of this same instance. Resolving the field one
+  // level up is what makes "base.a" the BASE's 'a' once a derived type redeclares the name -- before this,
+  // `base` resolved to the current type and base.a and a were one and the same field.
+  if (ObjNode.NodeType = antIdentifier) and (ObjNode.Attributes.Values['BASEREF'] <> '') then
+  begin
+    Result := UpperCase(FCurrentThisType);
+    for Lvl := 1 to StrToIntDef(ObjNode.Attributes.Values['BASEREF'], 1) do
+    begin
+      BaseIdx := FindUDT(Result);
+      if BaseIdx < 0 then Exit('');
+      Result := UpperCase(FUDTs[BaseIdx].Parent);
+      if Result = '' then Exit('');   // asked for a base level this type does not have
+    end;
+    Exit;
+  end;
   if ObjNode.NodeType = antIdentifier then
   begin
     Result := VarRecordTypeName(VarToStr(ObjNode.Value));
