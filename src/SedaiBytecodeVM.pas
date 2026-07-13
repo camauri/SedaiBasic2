@@ -3348,7 +3348,7 @@ begin
         end;
 
         // INSTR/INSTRREV(haystack$, needle$[, start]) -> int Dest
-        bcStrInstr, bcStrInstrRev, bcStrInstrRevAny, bcStrInstrW, bcStrInstrRevW:
+        bcStrInstr, bcStrInstrRev, bcStrInstrRevAny, bcStrInstrAny, bcStrInstrW, bcStrInstrRevW:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;  // haystack
@@ -5627,7 +5627,7 @@ end;
 procedure TBytecodeVM.ExecuteStringOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
-  Len, StartPos, Count, EnvIdx: Integer;
+  Len, StartPos, Count, EnvIdx, Idx: Integer;
   S, SubStr: string;
   PackInt: Int64;        // B3 serialization scratch (MK*/CV* integer pack/unpack)
   PackSingle: Single;
@@ -5965,6 +5965,25 @@ begin
           Copy(Ctx.StringRegs[Instr.Src1], StartPos, MaxInt));
         if Ctx.IntRegs[Instr.Dest] > 0 then
           Inc(Ctx.IntRegs[Instr.Dest], StartPos - 1);
+      end;
+    48: // bcStrInstrAny - INSTR([start,] str, Any set) -> FIRST position of any char in the set (1-based, 0 if none)
+      begin
+        // The mirror of bcStrInstrRevAny, scanning FORWARD, and it honours a start position exactly as
+        // bcStrInstr does: Immediate is the int register holding the 1-based start (the 2-arg form passes a
+        // register holding 1). An EMPTY set matches nothing -- that is what FreeBASIC returns.
+        S := Ctx.StringRegs[Instr.Src1];
+        SubStr := Ctx.StringRegs[Instr.Src2];   // character set
+        StartPos := Ctx.IntRegs[Instr.Immediate and $FFFF];
+        if StartPos < 1 then StartPos := 1;
+        Len := 0;
+        if SubStr <> '' then
+          for Idx := StartPos to Length(S) do
+            if Pos(S[Idx], SubStr) > 0 then
+            begin
+              Len := Idx;
+              Break;
+            end;
+        Ctx.IntRegs[Instr.Dest] := Len;
       end;
     11: // bcStrErr - ERR$(n)
       Ctx.StringRegs[Instr.Dest] := SedaiExecutorErrors.GetErrorCodeDescription(Ctx.IntRegs[Instr.Src1]);

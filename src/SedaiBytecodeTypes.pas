@@ -373,6 +373,7 @@ const
   bcStrMkFloat      = bcGroupString + 37;  // MKS/MKD - pack float into an IEEE binary string (Dest=string, Src1=float, Imm=byte width)
   bcStrCvInt        = bcGroupString + 38;  // CVI/CVL/CVSHORT/CVLONGINT - unpack int from a binary string (Dest=int, Src1=string, Imm=byte width)
   bcStrCvFloat      = bcGroupString + 39;  // CVS/CVD - unpack float from an IEEE binary string (Dest=float, Src1=string, Imm=byte width)
+  bcStrInstrAny     = bcGroupString + 48;  // INSTR([start,] str, Any set) - FIRST position of any char in set (Dest=int, Src1/Src2=string, Imm=int start reg)
   bcStrWChr         = bcGroupString + 31;  // WCHR(n) - UTF-8 bytes of Unicode codepoint n (Dest=string, Src1=int)
   bcStrWStringN     = bcGroupString + 32;  // WSTRING(n,cp) - n copies of the UTF-8 char for codepoint cp (Dest=string, Src1=int n, Src2=int cp)
 
@@ -1652,6 +1653,7 @@ begin
         22: Result := 'StrString';
         23: Result := 'StrTrimSet';
         24: Result := 'StrInstrRevAny';
+        48: Result := 'StrInstrAny';
         33: Result := 'StrSAdd';
         40: Result := 'FileExists';
         41: Result := 'CurDir';

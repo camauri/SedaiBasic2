@@ -217,6 +217,10 @@ begin
     bcStrAsc,      // ASC(str) returns int ASCII code
     bcStrInstr,    // INSTR(haystack, needle) returns int position
     bcStrInstrRev, // INSTRREV(str, sub) returns int position
+    // Both "Any set" forms return an int position too. bcStrInstrRevAny was MISSING from this list: its
+    // destination register was never marked as used, so the compactor was free to hand the same int
+    // register to something else -- a miscompile waiting for a program that uses INSTRREV(..., Any ...).
+    bcStrInstrRevAny, bcStrInstrAny,
     bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV return int codepoint position
     bcStrValInt,   // VALINT/VALLNG/VALUINT(str) returns int (B1.3)
     bcStrCvInt,    // CVI/CVL/CVSHORT/CVLONGINT(str) returns int (B3 serialization)
@@ -781,6 +785,7 @@ begin
     bcStrInstrRev,  // INSTRREV(str, sub) - str is Src1
     bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV - haystack is Src1
     bcStrInstrRevAny, // INSTRREV(str, Any set) - str is Src1
+    bcStrInstrAny,    // INSTR(str, Any set) - str is Src1
     bcStrTrimSet,   // LTRIM/RTRIM/TRIM(s, set) - s is Src1
     // === GROUP 2: Math operations ===
     bcStrDec,  // DEC(hexstring) - reads string, produces int
@@ -825,6 +830,7 @@ begin
     bcStrInstrRev, // INSTRREV(str, sub) - sub is Src2
     bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV - needle is Src2
     bcStrInstrRevAny, // INSTRREV(str, Any set) - set is Src2
+    bcStrInstrAny,    // INSTR(str, Any set) - set is Src2
     bcStrTrimSet,  // LTRIM/RTRIM/TRIM(s, set) - set is Src2
     // === GROUP 3: Pointer store (FreeBASIC): Src2 = string value ===
     bcRefStoreString,
@@ -1087,8 +1093,8 @@ begin
     if OpCode = bcGraphicSetMode then
       MarkIntRegUsed(Instr.Immediate);
 
-    // bcStrInstr: Immediate = the int register holding the INSTR start position.
-    if OpCode = bcStrInstr then
+    // bcStrInstr / bcStrInstrAny: Immediate = the int register holding the INSTR start position.
+    if (OpCode = bcStrInstr) or (OpCode = bcStrInstrAny) then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // bcGraphicRGBA: Immediate = (B_reg << 16) | A_reg - two int registers
@@ -1560,8 +1566,8 @@ begin
       end;
     end;
 
-    // bcStrInstr: Immediate = the int register holding the INSTR start position. Remap it.
-    if OpCode = bcStrInstr then
+    // bcStrInstr / bcStrInstrAny: Immediate = the int register holding the INSTR start position. Remap it.
+    if (OpCode = bcStrInstr) or (OpCode = bcStrInstrAny) then
     begin
       OldReg := Instr.Immediate and $FFFF;
       if (OldReg >= 0) and (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then

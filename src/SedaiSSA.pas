@@ -313,6 +313,8 @@ type
     function ArgSigFromArgs(ArgsNode: TASTNode): string;        // bank signature of a call's arguments
     function ArgUdtSigFromArgs(ArgsNode: TASTNode): string;     // ...and their UDT type tail (every UDT is an int handle)
     function SigBankPart(const Sig: string): string;            // the bank chars of a signature = its parameter count
+    function IsDeclaredVariable(const Name: string): Boolean;   // a variable wins over a type of the same name
+    function IsTypeNameForLen(const Name: string): Boolean;     // bare identifier that names a TYPE: LEN(T) = SizeOf(T)
     function ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;  // pick an overload
     function FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;  // M4.4h: defaulted ctor
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
@@ -3004,6 +3006,23 @@ begin
             Exit;
           end;
 
+          // LEN of a TYPE NAME -- "Len(Integer)", "Len(xyz)" -- is that type's size in bytes, i.e. exactly
+          // SizeOf. The case above only catches a VARIABLE whose type is a UDT; a bare type name is not a
+          // variable at all, so it fell through to the string path, where an undeclared name reads as an
+          // empty string and LEN answered 1. Only when the name is not a declared variable: a variable
+          // always wins over a type of the same name.
+          if FModernMode and (ArgNode.NodeType = antIdentifier) and (ArgNode.ChildCount = 0) then
+          begin
+            TempStr := UpperCase(VarToStr(ArgNode.Value));
+            if (not IsDeclaredVariable(TempStr)) and IsTypeNameForLen(TempStr) then
+            begin
+              Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(TempStr)),
+                              MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              Exit;
+            end;
+          end;
+
           ProcessExpression(ArgNode, ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
           DestReg := FProgram.AllocRegister(srtInt);
@@ -3437,27 +3456,41 @@ begin
           // substr in str at or after start, else 0. ssaStrInstr carries the start in a THIRD int register
           // (Src3), which the compiler maps to a bytecode register in the Immediate; the 2-arg form passes
           // a materialised constant 1 so the VM always reads a real start register.
+          // FreeBASIC "Any" form: the LAST argument is a character SET, and the answer is the first
+          // position holding ANY of its characters -- not the position of the whole substring. The parser
+          // marks that argument with ANYSET, exactly as it does for INSTRREV (which already honoured it;
+          // only INSTR ignored the mark and searched for the set as a literal substring, so it answered 0).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 3) then
           begin
+            IsAny := ArgListNode.GetChild(2).Attributes.Values['ANYSET'] = '1';
             ProcessExpression(ArgListNode.GetChild(0), Arg3Value);   // start (numeric)
             ProcessStringExpression(ArgListNode.GetChild(1), ArgValue);    // str (haystack)
-            ProcessStringExpression(ArgListNode.GetChild(2), Arg2Value);   // substr (needle)
+            ProcessStringExpression(ArgListNode.GetChild(2), Arg2Value);   // substr (needle) / char set
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureStringRegister(Arg2Value);
             Arg3Reg := EnsureIntRegister(Arg3Value);                 // start in an int register (Src3)
             DestReg := FProgram.AllocRegister(srtInt);
             Result := MakeSSARegister(srtInt, DestReg);
-            EmitInstruction(ssaStrInstr, Result, ArgReg, Arg2Reg, Arg3Reg);
+            if IsAny then
+              EmitInstruction(ssaStrInstrAny, Result, ArgReg, Arg2Reg, Arg3Reg)
+            else
+              EmitInstruction(ssaStrInstr, Result, ArgReg, Arg2Reg, Arg3Reg);
           end
           else if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
+            IsAny := ArgListNode.GetChild(1).Attributes.Values['ANYSET'] = '1';
             ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);    // str
-            ProcessStringExpression(ArgListNode.GetChild(1), Arg2Value);   // substr
+            ProcessStringExpression(ArgListNode.GetChild(1), Arg2Value);   // substr / char set
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureStringRegister(Arg2Value);
             DestReg := FProgram.AllocRegister(srtInt);
             Result := MakeSSARegister(srtInt, DestReg);
-            if IsWStringExpr(ArgListNode.GetChild(0)) then
+            if IsAny then
+            begin
+              Arg3Reg := EnsureIntRegister(MakeSSAConstInt(1));      // start = 1 in a register
+              EmitInstruction(ssaStrInstrAny, Result, ArgReg, Arg2Reg, Arg3Reg);
+            end
+            else if IsWStringExpr(ArgListNode.GetChild(0)) then
               // WSTRING haystack (no start arg): return a codepoint position, not a byte position.
               EmitInstruction(ssaStrInstrW, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone))
             else
@@ -18120,6 +18153,30 @@ begin
   Result := RawElemSizeOfPointee(FPointerVars.Values[UpperCase(PtrName)]);
 end;
 
+function TSSAGenerator.IsDeclaredVariable(const Name: string): Boolean;
+// A name that already denotes a VARIABLE (an explicitly typed DIM, or an array). Used to keep a variable
+// winning over a type of the same name -- a type name is only a type where nothing else claims the name.
+begin
+  Result := (Assigned(FVarExplicitType) and (FVarExplicitType.IndexOf(UpperCase(Name)) >= 0)) or
+            (ArrayIndexOf(Name) >= 0);
+end;
+
+function TSSAGenerator.IsTypeNameForLen(const Name: string): Boolean;
+// True when this bare identifier names a TYPE rather than a value: a builtin scalar type, a pointer type
+// ("T PTR"), or a declared UDT. That is what makes "Len(Integer)" and "Len(xyz)" the SIZE of the type.
+var
+  T: string;
+begin
+  T := UpperCase(Trim(Name));
+  if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(True);
+  T := CanonicalType(T);
+  Result := (T = 'BYTE') or (T = 'UBYTE') or (T = 'BOOLEAN') or (T = 'SHORT') or (T = 'USHORT') or
+            (T = 'LONG') or (T = 'ULONG') or (T = 'INTEGER') or (T = 'UINTEGER') or
+            (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'SINGLE') or (T = 'DOUBLE') or
+            (T = 'STRING') or (T = 'WSTRING') or (T = 'ZSTRING') or
+            (FindUDT(T) >= 0);
+end;
+
 function TSSAGenerator.TypeSizeBytes(const TypeName: string): Int64;
 // SizeOf(T) in bytes for the FreeBASIC SizeOf() operator. Scalars use FB widths (our INTEGER is 64-bit);
 // a "... PTR" or unknown type is pointer-sized (8); a UDT sums its fields' sizes.
@@ -18130,7 +18187,12 @@ begin
   T := UpperCase(Trim(TypeName));
   if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(8);
   T := CanonicalType(T);   // resolve FB TYPE-alias before the builtin/UDT size match
-  if (T = 'BYTE') or (T = 'UBYTE') or (T = 'BOOLEAN') then Result := 1
+  // The string types are what FreeBASIC reports for them, not what our model stores: a STRING is its
+  // 24-byte descriptor (pointer + length + capacity) and a WSTRING is one 2-byte wide character. Both
+  // verified against fbc. Nothing here allocates by these numbers -- they are what SizeOf/LEN must SAY.
+  if T = 'STRING' then Result := 24
+  else if T = 'WSTRING' then Result := 2
+  else if (T = 'BYTE') or (T = 'UBYTE') or (T = 'BOOLEAN') then Result := 1
   else if (T = 'SHORT') or (T = 'USHORT') then Result := 2
   else if (T = 'LONG') or (T = 'ULONG') then Result := 4
   else if T = 'SINGLE' then Result := 4
@@ -21822,6 +21884,17 @@ begin
   // unsigned), and a later clear would wipe them. DIM-scalar widths are (re)recorded during body gen.
   FVarWidthCode.Clear;
   FVarPrintKind.Clear;
+  // FreeBASIC's ASC returns a UINTEGER, so its value is UNSIGNED-64: it prints without the sign space AND
+  // its unsignedness is contagious through arithmetic. fbc settles it beyond doubt -- "Asc("a") - 100"
+  // prints 18446744073709551613, not -3. Registering it under its own name is all it takes: both the print
+  // form (PrintKindOfExpr) and the unsigned opcode selection (IsUnsigned64Expr) look a function call up by
+  // name in this very map.
+  //
+  // MODERN ONLY. In Commodore BASIC v7 ASC returns a plain signed number and keeps the leading sign space,
+  // which is the space every v7 number reserves for its minus sign. That space is not FreeBASIC's to drop
+  // either -- FB drops it only for values whose TYPE is unsigned, which is exactly what changes here.
+  if FModernMode then
+    FVarPrintKind.AddObject('ASC', TObject(PtrInt(2)));
   RegisterRecordVars(AST);
 
   // M6: collect DIM SHARED scalars and assign them dedicated transfer slots (runs after type

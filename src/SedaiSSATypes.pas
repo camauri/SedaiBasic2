@@ -139,6 +139,7 @@ type
     ssaStrString,     // STRING(n,ch) -> n copies of a char (Src1=count int, Src2=charcode int)
     ssaStrTrimSet,    // LTRIM/RTRIM/TRIM(s, set) -> trim substring from ends (Src1/Src2=string, Src3=mode const 0=both/1=left/2=right [|4=Any])
     ssaStrInstrRevAny, // INSTRREV(str, Any set) -> int last position of any char in set (Src1/Src2=string)
+    ssaStrInstrAny,    // INSTR([start,] str, Any set) -> int FIRST position of any char in set (Src3=start reg)
     ssaStrLenW,        // LEN(wstring) -> int Unicode codepoint count (UTF-8 storage; Src1=string)
     ssaStrLeftW,       // LEFT$(wstring, n)  -> first n codepoints (Src1=string, Src2=int)
     ssaStrRightW,      // RIGHT$(wstring, n) -> last n codepoints (Src1=string, Src2=int)
