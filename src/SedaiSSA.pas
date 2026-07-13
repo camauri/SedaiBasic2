@@ -454,7 +454,7 @@ type
     procedure RecordVarWidth(const VarName, TypeName: string);          // B1.5 phase 2: remember a var's width
     // Print form of a name declared INSIDE a procedure, recorded under "PROC|NAME" (kind 0 included).
     procedure SetPrintKindScoped(const ProcName, VarName, TypeName: string);
-    procedure RecordSharedScalarPrintKind(const VarName, TypeName: string);  // DIM SHARED never recorded its type
+    procedure RecordSharedScalarType(const VarName, TypeName: string);       // DIM SHARED never recorded its type (print form + narrow width)
     function PrintKindOf(const VarName: string): Integer;               // scoped entry wins over the module one
     function PrintKindOfExpr(Node: TASTNode): Integer;                  // ...also for a call's return type
     function IsSingleExpr(Node: TASTNode): Boolean;                     // SINGLE-typed value (7-digit print)
@@ -6650,7 +6650,7 @@ begin
                           MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         RecUDTIdx := FindUDT(RecTypeName);
         if RecUDTIdx < 0 then
-          RecordSharedScalarPrintKind(UpperCase(ArrName), RecTypeName);  // BOOLEAN / unsigned-64 print form
+          RecordSharedScalarType(UpperCase(ArrName), RecTypeName);  // print form + narrow store width
         if RecUDTIdx >= 0 then
         begin
           // Shared UDT scalar: allocate the record in the SHARED region (immediate bit 48), construct it,
@@ -14846,21 +14846,35 @@ begin
     FVarPrintKind.AddObject(Key, TObject(PtrInt(PK)));
 end;
 
-procedure TSSAGenerator.RecordSharedScalarPrintKind(const VarName, TypeName: string);
+procedure TSSAGenerator.RecordSharedScalarType(const VarName, TypeName: string);
 // A SHARED scalar is backed by a 1-element global array, and its DIM branch exits before the typed-
 // scalar bookkeeping ever runs -- so it never recorded its declared type at all. "Dim Shared As
 // ULongInt" therefore printed (and compared/divided) as SIGNED. Record the print form under the bare
 // name for the direct "PRINT v" form, and mark the backing array unsigned as well: a read from inside
 // a procedure goes through that array (MakeSharedScalarAccess), which is what IsUnsigned64Expr sees.
-// The narrowing width is deliberately left alone here -- that is a separate gap (a SHARED Byte does
-// not wrap on store either), and widening this fix to touch every shared store is not the point.
+//
+// The NARROWING width belongs here too, and it goes in FArrayElemWidth -- the map ProcessArrayStore
+// consults -- rather than in FVarWidthCode: a store to a SHARED scalar IS an element-0 store to the
+// backing array, so the width has to be keyed the way that store looks it up. Without it "Dim Shared
+// As Byte b : b = 300" kept 300, and (worse, because the print form WAS recorded) an unsigned narrow
+// kept a negative value and then printed it unsigned: "Dim Shared As UByte u : u = -1" showed
+// 18446744073709551615 where FreeBASIC shows 255.
 var
-  PK, Idx: Integer;
+  PK, W, Idx: Integer;
   Nm: string;
 begin
   Nm := UpperCase(VarName);
+  W := TypeNameWidthCode(TypeName);
+  if W <> 0 then
+  begin
+    Idx := FArrayElemWidth.IndexOf(Nm);
+    if Idx >= 0 then
+      FArrayElemWidth.Objects[Idx] := TObject(PtrInt(W))
+    else
+      FArrayElemWidth.AddObject(Nm, TObject(PtrInt(W)));
+  end;
   PK := PrintKindOfType(UpperCase(TypeName));
-  if PK = 0 then Exit;                         // plain signed: nothing to record
+  if PK = 0 then Exit;                         // plain signed: nothing more to record
   Idx := FVarPrintKind.IndexOf(Nm);
   if Idx >= 0 then
     FVarPrintKind.Objects[Idx] := TObject(PtrInt(PK))
