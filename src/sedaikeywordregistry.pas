@@ -2134,6 +2134,7 @@ begin
                       // a FreeBASIC program is entitled to use as an identifier. Reserving them in MODERN
                       // rejected valid FB code outright — Rosetta's Hashtron_inference simply names a
                       // variable "cmd". Keyword in CLASSIC, free identifier in MODERN.
+                      kCLR,      // clear all variables             ("clr" = colour, in graphics code)
                       kCMD,      // redirect screen output          ("cmd" = command)
                       kBOX,      // draw a rectangle                ("box" = bounding box)
                       kSCALE,    // set the graphics coordinate scale
