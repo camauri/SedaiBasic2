@@ -2437,8 +2437,11 @@ begin
   // and return type run before the SSA collector, and if the label changes underneath them they key their
   // entries under a name nobody will look up again. That is what left a "As Single" constructor parameter
   // printing 16 digits and a "As String" one reading 0.
+  // ...and the UDT type TAIL for the same reason a SUB/FUNCTION overload needs one: every UDT is an int
+  // HANDLE, so "Constructor(v As S)" and "Constructor(v As T)" both signed "#I" and the second was
+  // silently discarded. The call site (EmitConstructorCall) rebuilds the tail from its ARGUMENT nodes.
   if (Kind = kCONSTRUCTOR) and Assigned(NameNode) then
-    NameNode.Value := QualName + '#' + ProcSigFromParams(ParamList, True);   // True: skip the implicit THIS
+    NameNode.Value := QualName + '#' + ProcSigFromParams(ParamList, True, True);   // True: skip the implicit THIS
 
   Result.AddChild(ParamList);
 

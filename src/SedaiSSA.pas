@@ -302,7 +302,8 @@ type
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
     function ResolveMethodLabel(const TypeName, MethNm: string): string;  // walk inheritance
     function ResolveMethodLabelArgs(const TypeName, MethNm: string; ArgsNode: TASTNode): string;  // + overloads
-    function ResolveConstructorLabel(const TypeName, ArgSig: string): string;  // M4.4g: by type signature
+    function ResolveConstructorLabel(const TypeName, ArgSig: string;
+                                     const UdtSig: string = ''): string;       // M4.4g: by type signature (+ UDT tail)
     function BankToChar(Bank: TSSARegisterType): Char;          // M4.4g: I/F/S bank code for a ctor signature
     function CtorSigFromParams(ParamList: TASTNode): string;    // M4.4g: type signature of a ctor's params
     function EnsureStringRegisterOf(const Val: TSSAValue; SrcNode: TASTNode): TSSAValue;  // SINGLE-aware
@@ -15846,13 +15847,20 @@ begin
   end;
 end;
 
-function TSSAGenerator.ResolveConstructorLabel(const TypeName, ArgSig: string): string;
+function TSSAGenerator.ResolveConstructorLabel(const TypeName, ArgSig: string;
+  const UdtSig: string = ''): string;
 // M4.4g: find a constructor by TYPE SIGNATURE, walking up the inheritance chain. Each CONSTRUCTOR's
 // label encodes its parameter bank signature as "TYPE.CONSTRUCTOR#<sig>" (e.g. "#II", "#IS", "#"),
-// so same-arity/different-type overloads coexist. Resolution: exact signature match first; if none,
-// fall back to ARITY (BASIC's loose typing — an int arg may target a float/string-prefixed param,
-// coerced at staging): the first ctor of the same parameter count. A subtype with no matching ctor
-// inherits the parent's.
+// so same-arity/different-type overloads coexist. Resolution:
+//   1) exact bank signature PLUS the UDT type tail ("#I:S" vs "#I:T") -- every UDT is an int HANDLE, so
+//      without the tail "Constructor(v As S)" and "Constructor(v As T)" both sign "#I", share one label
+//      and the second is SILENTLY DISCARDED (the same defect m414 fixed for SUB/FUNCTION overloads);
+//   2) exact bank signature -- what tells "(a As Integer)" from "(a As Single)" apart, and what every
+//      type without a by-value UDT ctor parameter still resolves by, exactly as before;
+//   3) ARITY (BASIC's loose typing -- an int arg may target a float/string param, coerced at staging):
+//      the first ctor of the same parameter count. The count is the length of the BANK part, so the type
+//      tail is never mistaken for extra parameters.
+// A subtype with no matching ctor inherits the parent's.
 var
   T, Lbl, Pref: string;
   Idx, Guard, k: Integer;
@@ -15862,14 +15870,20 @@ begin
   Guard := 0;
   while (T <> '') and (Guard < 64) do
   begin
-    // 1) exact signature
+    // 1) exact signature, type tail included
+    if UdtSig <> '' then
+    begin
+      Lbl := T + '.CONSTRUCTOR#' + ArgSig + ':' + UdtSig;
+      if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
+    end;
+    // 2) exact bank signature
     Lbl := T + '.CONSTRUCTOR#' + ArgSig;
     if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
-    // 2) arity fallback: first ctor of T with the same parameter count (= length of its signature)
+    // 3) arity fallback: first ctor of T with the same parameter count
     Pref := T + '.CONSTRUCTOR#';
     for k := 0 to FProcedureNames.Count - 1 do
       if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
-         (Length(FProcedureNames[k]) - Length(Pref) = Length(ArgSig)) then
+         (Length(SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt))) = Length(ArgSig)) then
         Exit(FProcedureNames[k]);
     Idx := FindUDT(T);
     if Idx < 0 then Break;
@@ -16679,7 +16693,7 @@ procedure TSSAGenerator.EmitConstructorCall(const HandleVal: TSSAValue; const Ty
 // each parameter's bank). Evaluating before staging also avoids transfer-slot clobber from a nested
 // call inside an argument expression.
 var
-  Lbl, ArgSig: string;
+  Lbl, ArgSig, UdtSig: string;
   Decl, ParamList, PNode: TASTNode;
   i, Slot, ArgCount, AggUDT: Integer;
   RT: TSSARegisterType;
@@ -16695,7 +16709,12 @@ begin
     ProcessExpression(ArgsNode.GetChild(i), ArgVals[i]);
     ArgSig := ArgSig + BankToChar(ArgVals[i].RegType);
   end;
-  Lbl := ResolveConstructorLabel(TypeName, ArgSig);
+  // The banks alone cannot tell two UDT arguments apart -- both are int HANDLES -- so the record TYPES
+  // come from the argument NODES, which is why they must be read from the AST and not from the staged
+  // values. Without this, "Constructor(v As S)" and "Constructor(v As T)" both resolved to whichever was
+  // declared first, and the ctor then read the wrong record's fields.
+  UdtSig := ArgUdtSigFromArgs(ArgsNode);
+  Lbl := ResolveConstructorLabel(TypeName, ArgSig, UdtSig);
   // M4.4h: if no ctor matches the given count, try one that is callable via default parameters.
   if Lbl = '' then Lbl := FindCtorWithDefaults(TypeName, ArgCount);
   if Lbl = '' then
