@@ -143,6 +143,11 @@ type
     // (FUNCTION result) and EXIT SUB/FUNCTION / RETURN to a frame return.
     FInProcedure: Boolean;
     FCurrentProcName: string;
+    // RegisterRecordVars pre-scan only: True while walking a procedure's declaration (its return type,
+    // its parameters, and the local DIMs in its body). It is what tells a MODULE-level declaration --
+    // the one name that legitimately owns the bare-name entry in FVarExplicitType -- apart from a
+    // procedure-local one. See RegisterTypedVar.
+    FPreScanInProc: Boolean;
     FCurrentProcRetType: TSSARegisterType;
     FCurrentProcIsFunction: Boolean;
     FCurrentProcRetRecType: string;   // V3: UDT type the current FUNCTION returns by value (else '')
@@ -15856,6 +15861,7 @@ var
   i, k: Integer;
   Decl, ParamList, ParamNode: TASTNode;
   VarName, TypeName: string;
+  SavedInProc: Boolean;
 begin
   if Node = nil then Exit;
   // A typed FOR counter ("FOR i AS Integer") pre-registers its bank so a module-level counter is
@@ -15963,6 +15969,11 @@ begin
   end;
   if Node.NodeType = antProcedureDecl then
   begin
+    // Everything from here down -- the return type, the parameters, and the local DIMs of the body --
+    // belongs to a PROCEDURE, not to the module, and so must not seize the bare-name bank entry of a
+    // module variable that merely shares its name (see RegisterTypedVar).
+    SavedInProc := FPreScanInProc;
+    FPreScanInProc := True;
     // FUNCTION return type (M3.2): the name node (child 0) may carry a type child
     // ("FUNCTION f(...) AS rettype") — type the function name so its result slot is correct.
     if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) and
@@ -16034,7 +16045,11 @@ begin
         end;
       end;
     end;
-    // fall through to recurse into the body (local DIMs etc.)
+    // Recurse into the body (local DIMs etc.) with the flag still set, then restore it.
+    for i := 0 to Node.ChildCount - 1 do
+      RegisterRecordVars(Node.GetChild(i));
+    FPreScanInProc := SavedInProc;
+    Exit;
   end;
   for i := 0 to Node.ChildCount - 1 do
     RegisterRecordVars(Node.GetChild(i));
@@ -16042,22 +16057,38 @@ end;
 
 procedure TSSAGenerator.RegisterTypedVar(const VarName, TypeName: string);
 // Record-typed var -> int handle (+ FVarRecordType); builtin-typed -> explicit bank.
+//
+// FVarExplicitType is keyed by BARE NAME, and used to be strictly first-registration-wins. That let a
+// PROCEDURE-LOCAL name claim the entry of a MODULE variable it merely shares a name with: declaring
+// "Sub s(v As String)" ABOVE "Dim As Integer v" registered V as a string, the module DIM then found the
+// key taken and left it alone, and every module-level use of v read the STRING bank -- so it printed
+// empty and "Dim As Integer copy = v" got 0. Not just the printing: the VALUE was wrong, silently, and
+// identically with and without the optimizer, so the OPTDIFF net could not see it. Worse, it depended on
+// DECLARATION ORDER: put the DIM first and the same program was correct.
+//
+// A module-level declaration is therefore AUTHORITATIVE over the bare name -- it is the one that owns it
+// -- while anything inside a procedure keeps the old add-if-absent behaviour. Parameters do not need the
+// bare entry: their bank comes from their own declaration (ParamDeclaredBank) and the prologue binds them
+// in the scope stack, which is why a String parameter kept working even when the map said INTEGER. Locals
+// likewise resolve through the scope stack. Leaving the in-procedure path untouched also keeps FUNCTION
+// return types and overloads exactly as they were (their names are registered under this same flag).
 var
   Bank: TSSARegisterType;
+  Idx: Integer;
 begin
   if VarName = '' then Exit;
   if FindUDT(TypeName) >= 0 then
   begin
     FVarRecordType.Values[VarName] := TypeName;
-    if FVarExplicitType.IndexOf(VarName) < 0 then
-      FVarExplicitType.AddObject(VarName, TObject(PtrInt(Ord(srtInt))));  // handle is int
+    Bank := srtInt;   // a record var holds an int handle
   end
   else
-  begin
     Bank := TypeNameToBank(TypeName, VarName);
-    if FVarExplicitType.IndexOf(VarName) < 0 then
-      FVarExplicitType.AddObject(VarName, TObject(PtrInt(Ord(Bank))));
-  end;
+  Idx := FVarExplicitType.IndexOf(VarName);
+  if Idx < 0 then
+    FVarExplicitType.AddObject(VarName, TObject(PtrInt(Ord(Bank))))
+  else if not FPreScanInProc then
+    FVarExplicitType.Objects[Idx] := TObject(PtrInt(Ord(Bank)));
 end;
 
 function TSSAGenerator.CurrentProcParamType(const VarName: string; out UDTType: string): Boolean;
