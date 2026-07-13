@@ -1381,6 +1381,19 @@ begin
     // so the caller falls back to an expression statement, without recording a syntax error.
     if LhsIsExpr then
     begin
+      // ...unless it is a bare method CALL carrying arguments without parentheses -- "obj.Add 17.5", the
+      // statement form FreeBASIC allows for any SUB. Left as an expression statement, the member access
+      // called the method with NO arguments (which then read whatever was last staged) and the arguments
+      // themselves were orphaned, one "Unhandled node type" warning each.
+      if (LeftSide <> nil) and (LeftSide.NodeType = antMemberAccess) and
+         (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) then
+      begin
+        Result := TASTNode.Create(antArrayAccess, SavedToken);   // the shape a "name(args)" call has
+        Result.AddChild(LeftSide);
+        Result.AddChild(ParseArgumentList);
+        DoNodeCreated(Result);
+        Exit;
+      end;
       if Assigned(LeftSide) then LeftSide.Free;
       Result := nil;
       Exit;
@@ -2386,8 +2399,14 @@ begin
   // Arity-based constructor overloading (M4.4d): encode the explicit-parameter count in the label
   // (THIS excluded) so multiple CONSTRUCTORs of the same type get distinct procedure labels, e.g.
   // "TYPE.CONSTRUCTOR#0", "TYPE.CONSTRUCTOR#2". The call site resolves by argument count.
+  // The signature, not merely the arity: "Constructor sample(a As Integer)" and "(a As Single)" have the
+  // same count and must still get distinct labels. It is spelled out HERE, in the parser, for the same
+  // reason the operator and overload labels are: the pre-scans that record a procedure's parameter banks
+  // and return type run before the SSA collector, and if the label changes underneath them they key their
+  // entries under a name nobody will look up again. That is what left a "As Single" constructor parameter
+  // printing 16 digits and a "As String" one reading 0.
   if (Kind = kCONSTRUCTOR) and Assigned(NameNode) then
-    NameNode.Value := QualName + '#' + IntToStr(ParamList.ChildCount - 1);
+    NameNode.Value := QualName + '#' + ProcSigFromParams(ParamList, True);   // True: skip the implicit THIS
 
   Result.AddChild(ParamList);
 

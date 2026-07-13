@@ -3092,7 +3092,12 @@ begin
           // gives the right text — and, unlike the float formatter, it keeps full 64-bit precision (routing
           // an Int64 through a Double rounds above 2^53). The float path still serves float arguments and
           // the CLASSIC v7 STR$ sign-space form (v7 has no 64-bit integers in practice).
-          if (ArgValue.RegType = srtInt) and FModernMode then
+          // Str() of a STRING is the string itself (FreeBASIC overloads it for every type). We sent it down
+          // the numeric path, which read the string register as a float and produced "0" -- so a UDT
+          // building its text with "Str(a) + ..." on a string parameter lost the parameter.
+          if ArgValue.RegType = srtString then
+            Result := EnsureStringRegister(ArgValue)
+          else if (ArgValue.RegType = srtInt) and FModernMode then
             EmitInstruction(ssaIntToString, Result, EnsureIntRegister(ArgValue), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
           else
           begin
@@ -19923,16 +19928,9 @@ begin
   NameNode := Node.GetChild(0);
   if NameNode.NodeType <> antIdentifier then Exit;
   Name := UpperCase(VarToStr(NameNode.Value));
-  // M4.4g: re-encode a CONSTRUCTOR's label with its parameter TYPE signature (the parser only knew
-  // the arity). "TYPE.CONSTRUCTOR#<arity>" -> "TYPE.CONSTRUCTOR#<sig>" (e.g. "#IS"), so same-arity
-  // different-type overloads get distinct labels. Done here, before keying FProcDecls, so the whole
-  // pipeline (resolution + lowering) sees the signature label.
-  if (Pos('.CONSTRUCTOR#', Name) > 0) and (Node.ChildCount >= 2) and
-     (Node.GetChild(1).NodeType = antParameterList) then
-  begin
-    Name := Copy(Name, 1, Pos('#', Name)) + CtorSigFromParams(Node.GetChild(1));
-    NameNode.Value := Name;
-  end;
+  // (A CONSTRUCTOR's label already carries its parameter TYPE signature -- "TYPE.CONSTRUCTOR#IS" -- put
+  // there by the PARSER, so that the pre-scans which record parameter banks and return types see the final
+  // name. Re-encoding it here, after they had run, keyed their entries under a label nobody looks up.)
   // Re-encode "OPERATOR CAST" with its RETURN bank, so a type declaring several casts ("As Integer",
   // "As String", ...) gets a distinct label per one -- they share parameters (only THIS), so the return
   // type is what tells them apart. "TYPE.OPERATORCAST" -> "TYPE.OPERATORCAST$" (string) / "%" (int) /
