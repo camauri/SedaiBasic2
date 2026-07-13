@@ -15006,6 +15006,14 @@ function TSSAGenerator.PrintKindOfExpr(Node: TASTNode): Integer;
 // "true"/"false" like the variable form does -- it printed -1/0, because only an antIdentifier was ever
 // consulted. A call parsed as an array access carries its name in child 0; a genuine array element lands
 // here too, but an array name is never in the print-kind table (only scalars, parameters and returns).
+//
+// NOT handled here, and it needs the LEXER: FreeBASIC gives a DECIMAL integer literal the first type on
+// the ladder Long -> ULong -> LongInt -> ULongInt that holds it, so [2^31, 2^32-1] is a ULONG and prints
+// with NO sign space (we print one). A HEX literal does NOT climb that ladder -- fbc prints &HFFFFFFFF as
+// " 4294967295", sign space and all -- and by the time a literal reaches this AST its "&H.." text is long
+// gone: LexAmpBaseLiteral rewrites the token's value to the decimal string. Telling the two apart takes a
+// base-prefixed marker on the token; keying the rule off the digits alone would strip the sign space from
+// every hex literal in that range, trading one divergence for another.
 begin
   Result := 0;
   if Node = nil then Exit;

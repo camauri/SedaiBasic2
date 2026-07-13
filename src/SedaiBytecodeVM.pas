@@ -273,6 +273,7 @@ type
     procedure RedimArray(ArrayIdx, NewUpper: Integer; Preserve: Boolean; HasNewLower: Boolean = False; NewLower: Integer = 0);  // B1.4: REDIM (1-D)
     procedure RedimArrayN(ArrayIdx: Integer; const Uppers: array of Integer; Preserve: Boolean; const Lowers: array of Integer); // REDIM multi-dim
 
+    procedure AdvancePrintCol(Ctx: TExecutionContext; Chars: Integer);   // printed text advances the cursor -- and the cursor WRAPS at the right margin
     procedure ExecuteIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSpecialVarOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteGraphicsOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -6944,6 +6945,23 @@ begin
   end;
 end;
 
+procedure TBytecodeVM.AdvancePrintCol(Ctx: TExecutionContext; Chars: Integer);
+// The tracked cursor column is a SCREEN column, so it WRAPS at the right margin: text that runs past the
+// last column continues on the next line, and the column starts over. The counter never did, and the one
+// thing that reads it -- the PRINT comma zone -- then computed its next zone from a column that no screen
+// ever has, decided it fell off the line, and broke the record in half.
+//
+// FreeBASIC does exactly this (verified against fbc, output redirected to a file, 80 columns): after 85
+// characters it pads the comma to column 14 of the WRAPPED line -- 9 spaces, no newline -- while we
+// emitted a newline and restarted at column 0. Note the wrap adds no newline of its own to the stream:
+// on a console the line wraps by itself, and a redirected FreeBASIC writes the characters unbroken. Only
+// the bookkeeping wraps.
+begin
+  Inc(Ctx.CursorCol, Chars);
+  if Assigned(FConsoleBehavior) and (FConsoleBehavior.ScreenCols > 0) then
+    Ctx.CursorCol := Ctx.CursorCol mod FConsoleBehavior.ScreenCols;
+end;
+
 procedure TBytecodeVM.ExecuteIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
@@ -6966,7 +6984,7 @@ begin
         else if Assigned(FOutputDevice) then
         begin
           FOutputDevice.Print(PrintStr);
-          Inc(Ctx.CursorCol, Length(PrintStr));
+          AdvancePrintCol(Ctx, Length(PrintStr));
         end;
       end;
     1: // bcPrintLn (float); Immediate = 1 -> SINGLE precision, as for bcPrint above
@@ -6993,7 +7011,7 @@ begin
         else if Assigned(FOutputDevice) then
         begin
           FOutputDevice.Print(PrintStr);
-          Inc(Ctx.CursorCol, Length(PrintStr));
+          AdvancePrintCol(Ctx, Length(PrintStr));
         end;
       end;
     3: // bcPrintStringLn
@@ -7020,7 +7038,7 @@ begin
         else if Assigned(FOutputDevice) then
         begin
           FOutputDevice.Print(PrintStr);
-          Inc(Ctx.CursorCol, Length(PrintStr));
+          AdvancePrintCol(Ctx, Length(PrintStr));
         end;
       end;
     5: // bcPrintIntLn
@@ -7047,7 +7065,7 @@ begin
         else if Assigned(FOutputDevice) then
         begin
           FOutputDevice.Print(PrintStr);
-          Inc(Ctx.CursorCol, Length(PrintStr));
+          AdvancePrintCol(Ctx, Length(PrintStr));
         end;
       end;
     17: // bcPrintUInt (B1.5): print an Int64 as an unsigned 64-bit value
@@ -7058,7 +7076,7 @@ begin
         else if Assigned(FOutputDevice) then
         begin
           FOutputDevice.Print(PrintStr);
-          Inc(Ctx.CursorCol, Length(PrintStr));
+          AdvancePrintCol(Ctx, Length(PrintStr));
         end;
       end;
     6: // bcPrintComma
@@ -7086,6 +7104,7 @@ begin
             FOutputDevice.Print(' ');
             Inc(Ctx.CursorCol);
           end;
+          AdvancePrintCol(Ctx, 0);   // wrap once the spaces are out (see the TAB branch)
         end
         else if FConsoleBehavior.CommaAction = caNewLine then
         begin
@@ -7102,7 +7121,7 @@ begin
           saSpaceAfter, saSpaceBoth:
             begin
               FOutputDevice.Print(' ');
-              Inc(Ctx.CursorCol);
+              AdvancePrintCol(Ctx, 1);
             end;
           saSpaceBefore: ;
         end;
@@ -7122,6 +7141,9 @@ begin
           Inc(Ctx.CursorCol);
         end;
         // If Ctx.CursorCol >= NextTabCol, do nothing (as per C128 behavior)
+        // Wrap only now that the padding is done: wrapping inside the loop would send the column back to 0
+        // and the loop would never reach NextTabCol.
+        AdvancePrintCol(Ctx, 0);
       end;
     9: // bcPrintSpc
       if Assigned(FOutputDevice) then
@@ -7134,6 +7156,7 @@ begin
           Inc(Ctx.CursorCol);
           Dec(TabIdx);
         end;
+        AdvancePrintCol(Ctx, 0);   // wrap once the spaces are out (see the TAB branch)
       end;
     10: // bcPrintNewLine
       begin
