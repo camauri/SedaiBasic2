@@ -446,7 +446,21 @@ begin
       case Group of
         1: begin Ctx.PC := CurPC; ExecuteStringOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
         2: begin Ctx.PC := CurPC; ExecuteMathOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
-        3: begin Ctx.PC := CurPC; ExecuteArrayOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        // Group 3 (arrays). The ELEMENT-ACCESS opcodes run INLINE here, from the same source text the
+        // handler uses (ArrayHotOps.inc). Delegating them cost a Ctx.PC write, a non-inlined call, a
+        // second case and a Ctx.PC read back -- about 4x the work itself, paid on every element access.
+        // Everything else in group 3 (DIM/REDIM/BIND/pointer ops/...) is rare and still delegates.
+        3: if (Op and $FF) in [3..8] then
+           begin
+             // Element access, run INLINE. The shared branches never touch the PC (that is exactly what
+             // makes them inlinable), so this path advances it itself, like every other inline opcode.
+             case Op and $FF of
+               {$I ArrayHotOps.inc}
+             end;
+             Inc(CurPC);
+           end
+           else
+             begin Ctx.PC := CurPC; ExecuteArrayOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
         4: begin Ctx.PC := CurPC; ExecuteIOOp(Ctx, Instr); if not Ctx.Running then Break; CurPC := Ctx.PC + 1; end;
         5: begin Ctx.PC := CurPC; ExecuteSpecialVarOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
         6: begin Ctx.PC := CurPC; ExecuteFileIOOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
