@@ -5115,6 +5115,24 @@ begin
           else if ArrNameU = kCVSHORT then SelImm := 2;
           if SelImm > 0 then
           begin
+            // A FLOAT argument is not a string to be parsed: CV* takes it "using a BINARY COPY" (the FB
+            // manual's own words) -- "Declare Function CVI ( ByVal f As Double ) As Integer". So CVI(1.125)
+            // is 0x3FF2000000000000, the Double's bit pattern, not the number 1. We ran it through
+            // ProcessStringExpression, which renders the decimal text "1.125" and then unpacks THAT.
+            // The binary copy needs no new opcode: it is exactly MK* followed by CV*, the pair that already
+            // packs and unpacks these bytes. The float's width matches the integer's -- a Double for the
+            // 8-byte forms, a Single for the 4-byte one. CVSHORT has no numeric overload at all (fbc
+            // rejects "CVShort(f)" with a type mismatch), so its 2-byte form stays string-only.
+            if (SelImm >= 4) and (InferExprBank(Node.GetChild(1).GetChild(0)) <> srtString) then
+            begin
+              ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+              TempVal := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+              EmitInstruction(ssaStrMkFloat, TempVal, EnsureFloatRegister(ArgValue),
+                              MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+              Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaStrCvInt, Result, TempVal, MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+              Exit;
+            end;
             ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
             ArgReg := EnsureStringRegister(ArgValue);
             Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -5127,6 +5145,19 @@ begin
           else if ArrNameU = kCVD then SelImm := 8;
           if SelImm > 0 then
           begin
+            // The mirror image: an INTEGER argument is binary-copied into the float, so CVD(&h3FF2000000000000)
+            // is 1.125. CVS reads the LOW 4 bytes of the integer, which is why fbc answers 0 for that same
+            // value and 1.125 for &h3F900000.
+            if InferExprBank(Node.GetChild(1).GetChild(0)) <> srtString then
+            begin
+              ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+              TempVal := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+              EmitInstruction(ssaStrMkInt, TempVal, EnsureIntRegister(ArgValue),
+                              MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+              Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+              EmitInstruction(ssaStrCvFloat, Result, TempVal, MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+              Exit;
+            end;
             ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
             ArgReg := EnsureStringRegister(ArgValue);
             Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
@@ -7616,7 +7647,13 @@ function TSSAGenerator.InferExprBank(Node: TASTNode): TSSARegisterType;
               (Nm = 'HEX') or (Nm = 'OCT') or (Nm = 'BIN') or (Nm = 'WSTR') or
               (Nm = 'WCHR') or (Nm = 'WSPACE') or (Nm = 'FORMAT') or (Nm = 'DATE') or
               (Nm = 'TIME') or (Nm = 'ENVIRON') or (Nm = 'COMMAND') or (Nm = 'INKEY') or
-              (Nm = 'CSTR');
+              (Nm = 'CSTR') or
+              // The MK* packers return a binary STRING. They were missing, and the omission only became
+              // visible once CV* started asking this question to tell a string argument from a numeric one:
+              // "cvl(mkl(-7))" was read as CV-of-a-NUMBER and binary-copied garbage. The differential net
+              // caught it. Any other inference that reaches an MK* leaf (VAR, IIF) was wrong here too.
+              (Nm = 'MKI') or (Nm = 'MKL') or (Nm = 'MKD') or (Nm = 'MKS') or
+              (Nm = 'MKSHORT') or (Nm = 'MKLONGINT');
   end;
 var
   Nm: string;
@@ -12473,7 +12510,17 @@ begin
     fi := 1;
     while fi <= fLen do
     begin
-      if FmtStr[fi] = '\' then
+      // FreeBASIC escape: "_" prints the NEXT character literally, marker or not ("_&" is a plain "&",
+      // "__" a plain "_"). Without it "Print Using "i = _&H&"; Hex(i)" took the FIRST "&" as the string
+      // field, so "&H4241" came out as "_4241H".
+      // MODERN ONLY: Commodore v7 has PRINT USING too, and there "_" is not an escape -- it is an ordinary
+      // character that must print as itself.
+      if FModernMode and (FmtStr[fi] = '_') then
+      begin
+        if fi < fLen then EmitConstStr(FmtStr[fi + 1]);
+        Inc(fi, 2);
+      end
+      else if FmtStr[fi] = '\' then
       begin
         i := fi + 1;
         while (i <= fLen) and (FmtStr[i] <> '\') do Inc(i);
@@ -12521,9 +12568,10 @@ begin
       end
       else
       begin
-        // Literal text up to the next field marker.
+        // Literal text up to the next field marker -- or, in MODERN, up to the next escape.
         i := fi;
-        while (i <= fLen) and not ((FmtStr[i] in ['\', '&', '!']) or IsNumFieldStart(i)) do Inc(i);
+        while (i <= fLen) and not ((FmtStr[i] in ['\', '&', '!']) or IsNumFieldStart(i) or
+                                   (FModernMode and (FmtStr[i] = '_'))) do Inc(i);
         EmitConstStr(Copy(FmtStr, fi, i - fi));
         fi := i;
       end;

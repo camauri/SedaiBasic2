@@ -1177,7 +1177,15 @@ begin
     fi := 1;
     while fi <= fLen do
     begin
-      if FormatStr[fi] = '\' then
+      // FreeBASIC escape: "_" prints the NEXT character literally, marker or not. MODERN only -- in
+      // Commodore v7 PRINT USING there is no escape and "_" prints as itself. (Mirrors ProcessPrintUsing,
+      // the compile-time engine: a constant format never reaches this one, so both must agree.)
+      if Assigned(FProgram) and FProgram.ModernMode and (FormatStr[fi] = '_') then
+      begin
+        if fi < fLen then Result := Result + FormatStr[fi + 1];
+        Inc(fi, 2);
+      end
+      else if FormatStr[fi] = '\' then
       begin
         i := fi + 1;
         while (i <= fLen) and (FormatStr[i] <> '\') do Inc(i);
@@ -1216,7 +1224,8 @@ begin
       else
       begin
         i := fi;
-        while (i <= fLen) and not ((FormatStr[i] in ['\', '&', '!']) or IsNumFieldStart(i)) do Inc(i);
+        while (i <= fLen) and not ((FormatStr[i] in ['\', '&', '!']) or IsNumFieldStart(i) or
+                                   (Assigned(FProgram) and FProgram.ModernMode and (FormatStr[i] = '_'))) do Inc(i);
         Result := Result + Copy(FormatStr, fi, i - fi);   // literal text
         fi := i;
       end;
