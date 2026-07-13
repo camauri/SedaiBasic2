@@ -884,9 +884,12 @@ begin
     if Assigned(Result) then Exit;
   end;
 
-  // Check if this is a user-defined function call (FNxxx followed by parenthesis)
-  // This handles the case where FNSQ(5) is tokenized as a single identifier
-  if (Length(IdentName) > 2) and (Copy(IdentName, 1, 2) = 'FN') and
+  // A call to a Commodore v7 one-line function: "DEF FNA(X) = ..." defines it and "FNA(7)" calls it, so
+  // an identifier that merely STARTS with FN names the function in the rest of it (FNSQ(5) arrives as one
+  // identifier). CLASSIC ONLY. FreeBASIC has no DEF FN whatsoever, so there 'fnCalc' is just a name --
+  // and claiming it here rewrote every fn-prefixed FB call into a call to an undefined v7 function, which
+  // returned 0 with no error at all. 'fn' prefixes are common in FB code; the bug was silent.
+  if not ModernMode and (Length(IdentName) > 2) and (Copy(IdentName, 1, 2) = 'FN') and
      Context.Check(ttDelimParOpen) then
   begin
     // Extract function name (part after FN)

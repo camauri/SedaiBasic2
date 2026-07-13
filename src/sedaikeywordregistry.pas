@@ -2129,6 +2129,15 @@ begin
                       // RECORD: the Commodore v7 relative-file positioning command — FreeBASIC has none,
                       // and "record" is a very common identifier for a data row.
                       kRECORD,
+                      // DEF / FN: the Commodore v7 one-line function, "DEF FNA(X) = ..." defined and
+                      // "FNA(7)" called. FreeBASIC has NO DEF FN — its own manual says so outright
+                      // ("FreeBASIC supports neither DEF FN routines nor this usage of ...", KeyPgStatic),
+                      // fbc rejects "Def FNA(X) = ..." and happily takes "fn" and "def" as ordinary names.
+                      // Reserving them in MODERN broke both spellings, and see also the FN-prefix intercept
+                      // in sedaiexpressionparser (now CLASSIC-only): together they made an FB function
+                      // called fnCalc() return 0, in silence.
+                      kDEF,
+                      kFN,
                       // The rest are Commodore BASIC v7 commands with NO FreeBASIC counterpart (checked
                       // against the FB manual: none of them has a KeyPg page), yet each is an ordinary word
                       // a FreeBASIC program is entitled to use as an identifier. Reserving them in MODERN
