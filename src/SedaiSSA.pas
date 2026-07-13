@@ -310,6 +310,8 @@ type
     function ToIntValue(const V: TSSAValue): TSSAValue;         // ...of any value (const folded or emitted)
     function BaseDigitsArg(ArgListNode: TASTNode): TSSAValue;   // HEX$/OCT/BIN optional "digits" width
     function ArgSigFromArgs(ArgsNode: TASTNode): string;        // bank signature of a call's arguments
+    function ArgUdtSigFromArgs(ArgsNode: TASTNode): string;     // ...and their UDT type tail (every UDT is an int handle)
+    function SigBankPart(const Sig: string): string;            // the bank chars of a signature = its parameter count
     function ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;  // pick an overload
     function FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;  // M4.4h: defaulted ctor
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
@@ -15753,26 +15755,67 @@ begin
     end;
 end;
 
+function TSSAGenerator.ArgUdtSigFromArgs(ArgsNode: TASTNode): string;
+// The UDT-type tail of a call's arguments, in the alphabet the declaration's label uses: the record type
+// name of each argument that IS a record, '-' for every other one (the tail is POSITIONAL). Returns ''
+// when no argument is a record -- that is the case where the declaration carries no tail either.
+var
+  i: Integer;
+  T: string;
+begin
+  Result := '';
+  if ArgsNode = nil then Exit;
+  for i := 0 to ArgsNode.ChildCount - 1 do
+  begin
+    T := UpperCase(ObjectTypeName(ArgsNode.GetChild(i)));   // '' when the argument is not a record
+    if Result <> '' then Result := Result + ',';
+    if T <> '' then Result := Result + T else Result := Result + '-';
+  end;
+  for i := 1 to Length(Result) do
+    if not (Result[i] in ['-', ',']) then Exit;             // at least one real type name: keep the tail
+  Result := '';                                             // all placeholders: no tail, as declared
+end;
+
+function TSSAGenerator.SigBankPart(const Sig: string): string;
+// The bank-character part of a label's signature, i.e. everything before the ':' that introduces the UDT
+// type tail. Its LENGTH is the parameter count, which is what the arity fallback needs.
+var
+  p: Integer;
+begin
+  p := Pos(':', Sig);
+  if p > 0 then Result := Copy(Sig, 1, p - 1) else Result := Sig;
+end;
+
 function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;
 // Resolve a call to an OVERLOADED procedure. A name declared once keeps its bare label, so the first
 // test settles every non-overloaded program and this costs nothing. An overload set has no bare label
 // at all (the parser gave every member a "~<sig>" suffix), so:
-//   1) exact bank signature -- what tells "g(As Long)" from "g(As Single)" apart;
-//   2) failing that, ARITY (BASIC's loose typing: an int argument may legitimately target a float
-//      parameter and be coerced at staging) -- the first overload with the same parameter count.
+//   1) exact bank signature PLUS the UDT type tail -- the only thing that tells "test(As S)" from
+//      "test(As T)" apart, since every UDT is an int handle and both sign "~I";
+//   2) exact bank signature -- what tells "g(As Long)" from "g(As Single)" apart, and what every
+//      overload set without a by-value UDT parameter still resolves by, exactly as before;
+//   3) failing that, ARITY (BASIC's loose typing: an int argument may legitimately target a float
+//      parameter and be coerced at staging) -- the first overload with the same parameter count. The
+//      count is the length of the BANK part: the type tail must not be mistaken for more parameters.
 // Returns '' when nothing matches, and the caller reports it as before.
 var
-  Sig, Pref: string;
+  Sig, UdtSig, Pref: string;
   k: Integer;
 begin
   if FProcDecls.ContainsKey(BaseLabel) then Exit(BaseLabel);
   Sig := ArgSigFromArgs(ArgsNode);
+  UdtSig := ArgUdtSigFromArgs(ArgsNode);
+  if UdtSig <> '' then
+  begin
+    Result := BaseLabel + '~' + Sig + ':' + UdtSig;
+    if FProcDecls.ContainsKey(Result) then Exit;
+  end;
   Result := BaseLabel + '~' + Sig;
   if FProcDecls.ContainsKey(Result) then Exit;
   Pref := BaseLabel + '~';
   for k := 0 to FProcedureNames.Count - 1 do
     if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
-       (Length(FProcedureNames[k]) - Length(Pref) = Length(Sig)) then
+       (Length(SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt))) = Length(Sig)) then
       Exit(FProcedureNames[k]);
   Result := '';
 end;

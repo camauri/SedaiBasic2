@@ -84,7 +84,8 @@ type
     // parameter-bank signature appended to their labels (see ParseProcedureDecl).
     FProcSeen: TStringList;
 
-    function ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean): string;
+    function ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean;
+                               WithTypeNames: Boolean = False): string;
     procedure RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
 
     // Dialect profile application + the per-dialect statement handlers it installs.
@@ -378,21 +379,39 @@ begin
   inherited Destroy;
 end;
 
-function TPackratParser.ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean): string;
+function IsBuiltinTypeName(const N: string): Boolean; forward;
+
+function TPackratParser.ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean;
+                                          WithTypeNames: Boolean): string;
 // One bank character per explicit parameter -- 'S' string, 'F' float, 'I' everything else (integers,
-// pointers and UDT handles, which are int handles). Mirrors the SSA's CtorSigFromParams, which already
-// gives constructors distinct labels; this is the same scheme for FUNCTION/SUB/method overloads.
+// pointers and UDT handles, which are int handles). This is the scheme that tells "g(As Long)" from
+// "g(As Single)" apart, and the one a call site can reproduce from its arguments' banks.
 //
 // It is done in the PARSER, not in the SSA collector, because the pre-scans that record a procedure's
 // return type run before the collector and must already see the final label.
+//
+// WithTypeNames adds a TAIL of UDT type names -- "I:S", "I:T" -- because the bank alphabet alone cannot
+// tell two UDTs apart: every UDT is an int HANDLE, so "Sub test(v As S)" and "Sub test(v As T)" both
+// signed "~I", collided on one label, and the second was SILENTLY DISCARDED (every call went to the
+// first, which then read the wrong record's fields -- an access violation in udt/temp-type3).
+//
+// The tail is appended ONLY when some parameter is a UDT taken BY VALUE, so a program without such an
+// overload keeps byte-identical labels. A POINTER parameter ("T PTR") stays a plain 'I' with a '-' in
+// the tail on purpose: a call site can see the BANK of a pointer argument but cannot reconstruct its
+// pointee type name, and a tail it can never match would push pointer overloads onto the arity
+// fallback -- which would happily pick a different overload of the same arity.
 var
   i, First: Integer;
   p: TASTNode;
-  T, Nm: string;
+  T, Nm, Banks, Names: string;
   C: Char;
+  AnyUDT: Boolean;
 begin
   Result := '';
   if ParamList = nil then Exit;
+  Banks := '';
+  Names := '';
+  AnyUDT := False;
   if SkipThis then First := 1 else First := 0;   // a method's implicit THIS sits at index 0
   for i := First to ParamList.ChildCount - 1 do
   begin
@@ -418,8 +437,21 @@ begin
       else if (Nm[Length(Nm)] = '!') or (Nm[Length(Nm)] = '#') then C := 'F'
       else C := 'I';
     end;
-    Result := Result + C;
+    Banks := Banks + C;
+    if Names <> '' then Names := Names + ',';
+    // A by-value UDT: not builtin, not a pointer, and named. Anything else contributes a placeholder --
+    // the tail is POSITIONAL, so a "-" must hold the slot.
+    if (T <> '') and (not IsBuiltinTypeName(T)) and (Pos(' PTR', T) = 0) then
+    begin
+      Names := Names + T;
+      AnyUDT := True;
+    end
+    else
+      Names := Names + '-';
   end;
+  Result := Banks;
+  if WithTypeNames and AnyUDT then
+    Result := Result + ':' + Names;
 end;
 
 procedure TPackratParser.RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
@@ -449,7 +481,7 @@ begin
   end;
 
   // Second (or later) declaration of this name: give it a signature...
-  NameNode.Value := Base + '~' + ProcSigFromParams(ParamList, IsMethod);
+  NameNode.Value := Base + '~' + ProcSigFromParams(ParamList, IsMethod, True);
 
   // ...and, the first time only, retroactively give one to the declaration already parsed. Its object is
   // cleared afterwards so a third overload does not rename it twice.
@@ -463,7 +495,7 @@ begin
       FirstParams := FirstDecl.GetChild(1);
       // A method's THIS sits at index 0 of its parameter list; the first declaration is a method exactly
       // when this one is (they share a qualified "TYPE.NAME" label).
-      FirstName.Value := Base + '~' + ProcSigFromParams(FirstParams, IsMethod);
+      FirstName.Value := Base + '~' + ProcSigFromParams(FirstParams, IsMethod, True);
     end;
     FProcSeen.Objects[Idx] := nil;
   end;
