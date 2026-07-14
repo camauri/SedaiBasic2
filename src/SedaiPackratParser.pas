@@ -1128,6 +1128,15 @@ begin
         // FreeBASIC console "WRITE v1, v2, ...": quoted-CSV to the screen. WRITE is a bare identifier, so
         // only treat it as the statement when a value follows (not "write = ...", an assignment, nor a
         // bare "write" used as a variable).
+        //
+        // ...except that an ARGUMENT-LESS "Write" IS the statement, and prints an empty line (the manual:
+        // "If no expression list is given, Write outputs a carriage return"). We swallowed it, losing the
+        // blank line. Safe to take in MODERN: fbc reserves the word, so "write" cannot be a variable there
+        // ("Dim write As Integer" -> error 4, Duplicated definition). CLASSIC has no console WRITE at all,
+        // so a bare "write" there stays whatever it was.
+        else if FModernMode and (UpperCase(Token.Value) = kWRITE) and Assigned(Context.PeekNext) and
+                (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+          Result := ParseWriteConsole
         else if (UpperCase(Token.Value) = kWRITE) and Assigned(Context.PeekNext) and
                 (Context.PeekNext.TokenType <> ttOpEq) and (Context.PeekNext.Value <> '=') and
                 not (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then

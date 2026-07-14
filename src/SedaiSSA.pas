@@ -11089,7 +11089,11 @@ var
   XVal, YVal: TSSAValue;
   XReg, YReg: TSSAValue;
 begin
-  if Node.ChildCount < 2 then
+  // MODERN: every argument of LOCATE is optional and defaults to 0, which means "leave that coordinate
+  // alone" -- "Locate 10" sets the row and keeps the column (the VM resolves the 0). CLASSIC's pixel
+  // LOCATE needs both. We rejected the one-argument form in either dialect, printing an error to stderr.
+  if Node.ChildCount < 1 then Exit;
+  if (Node.ChildCount < 2) and (not FModernMode) then
   begin
     WriteLn(StdErr, 'LOCATE: requires x, y coordinates');
     Exit;
@@ -11116,8 +11120,11 @@ begin
   else
     XReg := MakeSSAValue(svkNone);
 
-  // Process Y coordinate
-  ProcessExpression(Node.GetChild(1), YVal);
+  // Process Y coordinate. Absent (MODERN "Locate 10") it is 0 = "keep the current column".
+  if Node.ChildCount >= 2 then
+    ProcessExpression(Node.GetChild(1), YVal)
+  else
+    YVal := MakeSSAConstInt(0);
   if YVal.Kind = svkConstInt then
   begin
     TempReg := FProgram.AllocRegister(srtInt);
@@ -12493,6 +12500,31 @@ var
     EmitInstruction(ssaPrintString, NoneV, TmpReg, NoneV, NoneV);
   end;
 
+  // The value for a STRING field ("&" or "\..\"), which may perfectly well be a NUMBER: FreeBASIC renders
+  // it as its Str() text. The manual's own PRINT USING example does exactly that --
+  //   Print Using "The last day in the year is & \ \"; 31; "December"   ->   "... is 31 Dec"
+  // -- and we processed the value in a STRING context, where a numeric node yields nothing, so the field
+  // came out EMPTY and the 31 vanished in silence. ("!" already went through ProcessExpression.)
+  function StringFieldValue(N: TASTNode): TSSAValue;
+  var V: TSSAValue;
+  begin
+    if InferExprBank(N) = srtString then
+    begin
+      ProcessStringExpression(N, V);
+      Result := EnsureStringRegister(V);
+    end
+    else
+    begin
+      ProcessExpression(N, V);
+      // Materialise a CONSTANT into its register first: EnsureStringRegister knows svkConstString and the
+      // register banks, but not svkConstInt/svkConstFloat -- it fell through them and yielded an empty
+      // string. That is why a literal ("Print Using "&"; 31") stayed blank while a variable worked.
+      if V.Kind = svkConstInt then V := EnsureIntRegister(V)
+      else if V.Kind = svkConstFloat then V := EnsureFloatRegister(V);
+      Result := EnsureStringRegisterOf(V, N);   // renders a SINGLE with a single's 7 digits
+    end;
+  end;
+
   // Print a string value left-justified in a fixed field of width Wid: LEFT(s + SPACE(Wid), Wid).
   procedure EmitStrField(const SReg: TSSAValue; Wid: Integer);
   var WReg, SpaceReg, ConcatReg, LeftReg: TSSAValue;
@@ -12564,8 +12596,7 @@ begin
         fi := i + 1;
         if vi < nVals then
         begin
-          ProcessStringExpression(ValNodes[vi], ValueVal); Inc(vi);
-          EmitStrField(EnsureStringRegister(ValueVal), W);
+          EmitStrField(StringFieldValue(ValNodes[vi]), W); Inc(vi);
         end;
       end
       else if FmtStr[fi] = '&' then
@@ -12573,8 +12604,7 @@ begin
         Inc(fi);
         if vi < nVals then
         begin
-          ProcessStringExpression(ValNodes[vi], ValueVal); Inc(vi);
-          EmitInstruction(ssaPrintString, NoneV, EnsureStringRegister(ValueVal), NoneV, NoneV);
+          EmitInstruction(ssaPrintString, NoneV, StringFieldValue(ValNodes[vi]), NoneV, NoneV); Inc(vi);
         end;
       end
       else if FmtStr[fi] = '!' then

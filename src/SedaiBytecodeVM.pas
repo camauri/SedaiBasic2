@@ -7352,10 +7352,18 @@ begin
       end
       else
         Ctx.IntRegs[Instr.Dest] := 0;
-    21: // bcConLocate - MODERN LOCATE row, col: the console text cursor (1-based)
+    21: // bcConLocate - MODERN LOCATE [row][, col]: the console text cursor (1-based).
+      // Every argument is optional ("Declare Function Locate( row As Long = 0, column As Long = 0, ... )"),
+      // and the default 0 means LEAVE THAT COORDINATE ALONE -- "Locate 10" moves to row 10 and keeps the
+      // column. We required both and rejected the one-argument form outright.
       if Assigned(FOutputDevice) then
-        FOutputDevice.SetCursor(Integer(Ctx.IntRegs[Instr.Src2]) - 1,
-                                Integer(Ctx.IntRegs[Instr.Src1]) - 1);
+      begin
+        ScreenRow := Integer(Ctx.IntRegs[Instr.Src1]);
+        ScreenCol := Integer(Ctx.IntRegs[Instr.Src2]);
+        if ScreenRow <= 0 then ScreenRow := FOutputDevice.GetCursorY + 1;
+        if ScreenCol <= 0 then ScreenCol := FOutputDevice.GetCursorX + 1;
+        FOutputDevice.SetCursor(ScreenCol - 1, ScreenRow - 1);
+      end;
     22: // bcConViewPrint - VIEW PRINT [first TO last]: the text print area (scroll region)
       if Assigned(FOutputDevice) then
       begin
