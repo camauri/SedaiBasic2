@@ -253,33 +253,95 @@ function FormatDoubleFB(Value: Double; SIGDIGITS: Integer = 16): string;
 // FPC cannot produce 16: FloatToStr and FloatToStrF clamp a Double to 15 significant digits whatever
 // precision you ask for (ffGeneral with 16 or 17 both come back with 15, and 0.9999999999999999 comes
 // back as "1"). Str(V:0:N) does render the full expansion, so round at the decimal place that leaves
-// SIGDIGITS significant digits and strip the trailing zeros -- exactly what "%.<n>g" would print.
+// SIGDIGITS significant digits -- exactly what "%.<n>g" would print -- and reformat from THOSE digits.
 //
-// Only the range where %g chooses FIXED notation is handled here. Outside it the existing exponential
-// form is kept untouched: a value large enough to need it has no fractional part and never reaches this
-// function (every double >= 2^53 is integral, and the caller sends those through IntToStr).
+// FreeBASIC chooses fixed vs exponential exactly as %g does, from the decimal exponent alone: it goes
+// exponential when the exponent is < -4 or >= SIGDIGITS, and writes the exponent with a sign and AT LEAST
+// THREE digits ("1e+016", "1e-005", "1e+300"). Both ends used to be wrong here: the small end fell back on
+// FPC's FloatToStr ("1E-10"), and the large end never even arrived -- FormatNumber short-circuits an
+// integral value through IntToStr(Round(Value)), which for anything past 2^63 OVERFLOWS, so every whole
+// double from 1e19 up printed as -9223372036854775808. "Print 1e20" produced garbage.
+//
+// The exponent is re-derived from the ROUNDED digits, not from the raw Log10: rounding can carry into a
+// new decade (9.999999999999999e15 rounds to 16 digits as 1e16 -- fbc prints "1e+016", not
+// "10000000000000000"), and that carry moves the value across the fixed/exponential boundary.
 var
-  Ex, Decimals: Integer;
-  S: string;
-  AV: Double;
+  Ex, Decimals, EPos, i: Integer;
+  S, Digits, Mant: string;
+  Neg, RoundUp: Boolean;
 begin
-  AV := Abs(Value);
-  if AV = 0 then Exit('0');
-  Ex := Floor(Log10(AV));
-  // Log10 can land a hair off across a power-of-ten boundary; pin the exponent to the leading digit.
-  if AV >= Power(10.0, Ex + 1) then Inc(Ex);
-  if AV <  Power(10.0, Ex)     then Dec(Ex);
-  if (Ex < -4) or (Ex >= SIGDIGITS) then
-    Exit(FloatToStr(Value));
-  Decimals := SIGDIGITS - 1 - Ex;
-  if Decimals < 0 then Decimals := 0;
-  Str(Value:0:Decimals, S);          // Str always emits '.', independent of the locale
-  if Pos('.', S) > 0 then
+  if Value = 0 then Exit('0');
+
+  // The digits and the exponent both come from FPC's PLAIN Str, whose format is fixed and full-precision:
+  // "[-]d.dddddddddddddddd E{+|-}xxx" -- 17 significant digits (one more than we need, so the 16th rounds
+  // correctly) and an exponent already sign-padded to three places.
+  //
+  // Str(V:0:N) is NOT usable to get these: it renders fixed, and for a large enough value it gives up and
+  // falls back to scientific anyway ("Str(1e300:0:0)" = " 1.0E+300", losing all the digits). That silent
+  // width limit is why the first attempt at this printed "1.0E+3".
+  Str(Value, S);
+  S := Trim(S);
+  Neg := (S <> '') and (S[1] = '-');
+  if (S <> '') and (S[1] in ['+', '-']) then Delete(S, 1, 1);
+  EPos := Pos('E', S);
+  if EPos = 0 then Exit(FloatToStr(Value));      // not the expected shape: leave it alone
+  Ex := StrToIntDef(Copy(S, EPos + 1, Length(S)), 0);
+  Digits := StringReplace(Copy(S, 1, EPos - 1), '.', '', [rfReplaceAll]);
+  if Digits = '' then Exit('0');
+
+  // Round the significant digits down to SIGDIGITS. A carry out of the leading digit ("99..9" -> "10..0")
+  // moves the value into the next decade -- and that can push it across the fixed/exponential boundary, so
+  // the exponent must be updated BEFORE the choice below (9.999999999999999e15 rounds to 16 digits as 1e16,
+  // which fbc prints "1e+016", not "10000000000000000").
+  if Length(Digits) > SIGDIGITS then
   begin
-    while (S <> '') and (S[Length(S)] = '0') do SetLength(S, Length(S) - 1);
-    if (S <> '') and (S[Length(S)] = '.') then SetLength(S, Length(S) - 1);
+    RoundUp := Digits[SIGDIGITS + 1] >= '5';
+    SetLength(Digits, SIGDIGITS);
+    if RoundUp then
+    begin
+      i := SIGDIGITS;
+      while i >= 1 do
+      begin
+        if Digits[i] < '9' then begin Inc(Digits[i]); Break; end;
+        Digits[i] := '0';
+        Dec(i);
+      end;
+      if i = 0 then
+      begin
+        Digits := '1' + Copy(Digits, 1, SIGDIGITS - 1);
+        Inc(Ex);
+      end;
+    end;
   end;
-  Result := S;
+
+  // FreeBASIC picks fixed vs exponential exactly as "%.<n>g" does, from the decimal exponent alone.
+  if (Ex >= -4) and (Ex < SIGDIGITS) then
+  begin
+    // Fixed. Re-render with Str at the decimal place that leaves SIGDIGITS significant digits, then drop
+    // the zeros it padded out with. (FloatToStr cannot be used: FPC clamps a Double to 15 significant
+    // digits there whatever precision is asked for, and FreeBASIC shows 16 -- "0.9999999999999999".)
+    Decimals := SIGDIGITS - 1 - Ex;
+    if Decimals < 0 then Decimals := 0;
+    Str(Value:0:Decimals, S);
+    S := Trim(S);
+    if Pos('.', S) > 0 then
+    begin
+      while (S <> '') and (S[Length(S)] = '0') do SetLength(S, Length(S) - 1);
+      if (S <> '') and (S[Length(S)] = '.') then SetLength(S, Length(S) - 1);
+    end;
+    Exit(S);
+  end;
+
+  // Exponential, FreeBASIC style: "1e+016", "1.234568e+010", "5e-005", "1e+300".
+  while (Length(Digits) > 1) and (Digits[Length(Digits)] = '0') do
+    SetLength(Digits, Length(Digits) - 1);
+  Mant := Digits[1];
+  if Length(Digits) > 1 then Mant := Mant + '.' + Copy(Digits, 2, Length(Digits));
+  S := IntToStr(Abs(Ex));
+  while Length(S) < 3 do S := '0' + S;      // fbc pads the exponent to at least three digits
+  if Ex >= 0 then S := 'e+' + S else S := 'e-' + S;
+  Result := Mant + S;
+  if Neg then Result := '-' + Result;
 end;
 
 { TConsoleBehavior }
@@ -497,12 +559,16 @@ begin
     if NonNeg then NumStr := 'inf' else NumStr := '-inf';
     {$ENDIF}
   end
-  else if Frac(Value) = 0 then
-    NumStr := IntToStr(Round(Value))
   // A DOUBLE prints with 16 significant digits in FreeBASIC; FPC's FloatToStr gives 15, which rounded
   // the last digit away and made every high-precision program disagree with the reference in its final
   // place. CLASSIC keeps FloatToStr: the Commodore ROM's own precision is lower still, and widening it
   // there would change v7 output for no reason.
+  //
+  // This comes BEFORE the integral-value shortcut below, which used to pre-empt it: FreeBASIC chooses
+  // fixed vs exponential from the MAGNITUDE alone, and 1e16 is integral and fits an Int64 yet still prints
+  // as "1e+016". FormatDoubleFB renders a whole number just as well ("1000000000000000"), so nothing needs
+  // the shortcut here -- and going through it was what made every double past 2^63 print the Int64 overflow
+  // -9223372036854775808.
   else if FNumberFormat = nfFreeBASIC then
   begin
     if AsSingle then
@@ -510,6 +576,10 @@ begin
     else
       NumStr := FormatDoubleFB(Value);
   end
+  // Round() traps (or, under {$Q-}, silently yields Int64.Min) once the value is past 2^63, so the whole
+  // number has to fit an Int64 to be printed as one. Beyond that, FloatToStr's exponential form.
+  else if (Frac(Value) = 0) and (Abs(Value) < 9223372036854775808.0) then
+    NumStr := IntToStr(Round(Value))
   else
     NumStr := FloatToStr(Value);
 
