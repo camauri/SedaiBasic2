@@ -50,6 +50,8 @@ uses
   SedaiGraphicsMemory, SedaiGraphicsPrimitives, SedaiConsoleState
   {$IFDEF WINDOWS}
   , Windows
+  {$ELSE}
+  , termio
   {$ENDIF}
   ;
 
@@ -389,15 +391,31 @@ begin
   Inc(FCursorY);
 end;
 
+function StdoutIsTerminal: Boolean;
+// Is stdout a real console, or has it been redirected into a file or a pipe? CLS has a visible effect
+// only on the former; on the latter there is no screen to clear, and whatever we emit to "clear" it is
+// just garbage IN the data -- FreeBASIC writes nothing at all there. We emitted it unconditionally: a
+// stray blank line on Windows, and on Unix a raw ANSI escape sequence written straight into the file.
+begin
+  {$IFDEF WINDOWS}
+  Result := GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) = FILE_TYPE_CHAR;
+  {$ELSE}
+  Result := IsATTY(StdOutputHandle) <> 0;
+  {$ENDIF}
+end;
+
 procedure TTerminalController.Clear;
 begin
-  // ANSI escape sequence to clear screen (works on most terminals)
-  {$IFDEF WINDOWS}
-  // On Windows, we could use Windows API but for simplicity just print newlines
-  System.WriteLn;
-  {$ELSE}
-  System.Write(#27'[2J'#27'[H');  // ANSI clear + home
-  {$ENDIF}
+  // Only a real terminal gets the clear; a redirected stream gets nothing (see StdoutIsTerminal). The
+  // MODELLED screen is cleared either way -- that is what CSRLIN/POS and the cell grid read back.
+  if StdoutIsTerminal then
+  begin
+    {$IFDEF WINDOWS}
+    System.WriteLn;
+    {$ELSE}
+    System.Write(#27'[2J'#27'[H');  // ANSI clear + home
+    {$ENDIF}
+  end;
   ClearView;    // CLS blanks the print area and homes the caret inside it, leaving the area itself set
   FCursorX := 0;
   FCursorY := 0;
