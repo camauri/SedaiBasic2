@@ -51,6 +51,7 @@ type
     FKeywordInfo: TKeywordInfo; // Optional keyword reference
     FSourceFile: string;        // Source file name (optional)
     FBasePrefixed: Boolean;     // "&H../&O../&B.." literal (its value is rewritten to decimal -- see the property)
+    FSingleSuffixed: Boolean;   // "1.5f" / "1.5!" literal: a SINGLE (the suffix is dropped -- see the property)
 
     // Lazy evaluation flags for performance
     FDisplayStringCached: string;
@@ -151,6 +152,11 @@ type
     // ULongInt) applies to decimals only, so "4294967295" is an unsigned ULong while "&HFFFFFFFF" stays
     // signed. This is the only surviving trace of which one it was.
     property BasePrefixed: Boolean read FBasePrefixed write FBasePrefixed;
+    // True for a float literal written with a SINGLE type suffix ("1.5f", "1.5!"). The suffix is dropped
+    // while lexing -- the value is the number either way -- so nothing downstream could tell "1.5f" from
+    // "1.5", and FreeBASIC types them differently: the first is a Single (prints 7 significant digits and
+    // keeps an expression single), the second a Double. This is the only surviving trace of the suffix.
+    property SingleSuffixed: Boolean read FSingleSuffixed write FSingleSuffixed;
 
     // INTERNAL: Lazy extraction setup (used by lexer)
     procedure SetupLazyExtraction(ExtractorCtx: Pointer; ExtractorFn: TTokenValueExtractor; RecIdx: Integer);

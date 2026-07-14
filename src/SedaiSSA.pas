@@ -2629,7 +2629,22 @@ begin
           Result := MakeSSARegister(srtFloat, DestReg);
           OpCode := ssaPowFloat;
         end
-        // MOD: float if any operand is float, otherwise integer
+        // MOD: in MODERN this is an INTEGER operator -- the missing member of the \ / SHL / SHR family,
+        // which convert a float operand to Integer by ROUNDING (manual, Operator Mod: "Float numeric
+        // values are converted to Integer by rounding up or down"; fbc: 7.4 Mod 2.6 rounds to 7 Mod 3 = 1).
+        // We took the remainder in floating point instead, so it gave 2.2. CLASSIC keeps its float MOD.
+        else if FModernMode and (Node.Token.TokenType = ttOpMod) then
+        begin
+          Left := ToIntValue(Left);
+          Right := ToIntValue(Right);
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          if IsUnsigned64Expr(Node.GetChild(0)) or IsUnsigned64Expr(Node.GetChild(1)) then
+            OpCode := ssaModUInt
+          else
+            OpCode := ssaModInt;
+        end
+        // MOD (CLASSIC): float if any operand is float, otherwise integer
         else if Node.Token.TokenType = ttOpMod then
         begin
           if (Left.RegType = srtFloat) or (Right.RegType = srtFloat) then
@@ -14976,12 +14991,47 @@ function TSSAGenerator.IsSingleExpr(Node: TASTNode): Boolean;
 //
 // Without this, narrowing a SINGLE on store would leak its rounding error into every expression built
 // from it: "Dim s As Single = 1.65 : Print s * 2" would show 3.299999952316284 instead of 3.3.
+//
+// Two operators are NOT covered by that widening rule, and both were getting it wrong in the generous
+// direction (we called their result single when fbc calls it double):
+//   "/"  is declared only as (Single, Single) -> Single and (Double, Double) -> Double, so an INTEGER
+//        operand promotes the pair to Double: "s / 2" is a Double, while "s * 2" stays Single.
+//   "^"  is always Double (pow), whatever the operands.
 var
   AwIdx: Integer;
 
   function IsDoubleValued(N: TASTNode): Boolean;
   begin
     Result := (InferExprBank(N) = srtFloat) and not IsSingleExpr(N);
+  end;
+
+  // The intrinsics whose result is a SINGLE when their argument is one. fbc's math functions are typed
+  // per-argument (the manual only documents the Double signature, but the compiler is the oracle:
+  // "Sqr(s)" on a Single prints 1.111111, not 1.111111048195095). Int/Fix are declared this way outright.
+  function IsSinglePreservingIntrinsic(const Name: string): Boolean;
+  begin
+    Result := Name = 'ABS';
+    if not Result then
+      Result := (Name = 'INT') or (Name = 'FIX') or (Name = 'SQR') or (Name = 'SIN') or (Name = 'COS') or
+                (Name = 'TAN') or (Name = 'ATN') or (Name = 'ASIN') or (Name = 'ACOS') or
+                (Name = 'EXP') or (Name = 'LOG');
+  end;
+
+  // The intrinsics that return a SINGLE whatever they are given: the conversion CSNG, and CVS (declared
+  // "CVS(...) As Single" -- unpacking four bytes back into the single they came from).
+  function IsSingleReturningIntrinsic(const Name: string): Boolean;
+  begin
+    Result := (Name = 'CSNG') or (Name = 'CVS');
+  end;
+
+  // "f(x)" on one of the intrinsics above. Only reached when the name is not a user overload, so a program
+  // that defines its own "Abs" for a UDT keeps its own return type.
+  function IntrinsicCallIsSingle(const Name: string; ArgsNode: TASTNode): Boolean;
+  begin
+    Result := IsSingleReturningIntrinsic(Name);
+    if (not Result) and IsSinglePreservingIntrinsic(Name) and
+       (ArgsNode <> nil) and (ArgsNode.ChildCount >= 1) then
+      Result := IsSingleExpr(ArgsNode.GetChild(0));
   end;
 
   // A SINGLE field: a field records its narrowing width, and 7 is single precision.
@@ -15054,6 +15104,8 @@ begin
         if Node.ChildCount >= 1 then
           Result := PrintKindOf(UDTNamedOperatorLabel(VarToStr(Node.Value), Node.GetChild(0))) = 4;
         if not Result then Result := PrintKindOf(VarToStr(Node.Value)) = 4;
+        if (not Result) and (Node.ChildCount >= 1) then
+          Result := IntrinsicCallIsSingle(UpperCase(VarToStr(Node.Value)), Node.GetChild(0));
       end;
     antArrayAccess:
       if Node.ChildCount >= 1 then
@@ -15068,6 +15120,9 @@ begin
             AwIdx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value)));
             Result := (AwIdx >= 0) and (PtrInt(FArrayElemWidth.Objects[AwIdx]) = 7);
           end;
+          // A call to an intrinsic parses as an array access too ("Sqr(s)" is name + argument list).
+          if (not Result) and (Node.ChildCount >= 2) then
+            Result := IntrinsicCallIsSingle(UpperCase(VarToStr(Node.GetChild(0).Value)), Node.GetChild(1));
         end
         else if Node.GetChild(0).NodeType = antMemberAccess then
           Result := MethodReturnIsSingle(Node);   // "obj.method(args)" returning a SINGLE
@@ -15075,12 +15130,28 @@ begin
     antMemberAccess:
       // Either a SINGLE field, or a no-argument method returning one ("obj.method" with the "()" dropped).
       Result := MemberFieldIsSingle(Node) or MethodReturnIsSingle(Node);
+    antLiteral:
+      // "1.5f" / "1.5!" is a SINGLE literal. The suffix is dropped while lexing, so the token's
+      // SingleSuffixed mark is all that survives to say so. Guarded like the ULong literal rule below: a
+      // SYNTHESIZED literal borrows a neighbouring node's token, whose suffix says nothing about it.
+      Result := Assigned(Node.Token) and Node.Token.SingleSuffixed and
+                (Node.Token.TokenType = ttNumber) and
+                (Trim(VarToStr(Node.Token.Value)) = Trim(VarToStr(Node.Value)));
     antParentheses, antUnaryOp:
       if Node.ChildCount >= 1 then Result := IsSingleExpr(Node.GetChild(0));
     antBinaryOp:
       if Node.ChildCount >= 2 then
-        Result := (IsSingleExpr(Node.GetChild(0)) or IsSingleExpr(Node.GetChild(1))) and
-                  not IsDoubleValued(Node.GetChild(0)) and not IsDoubleValued(Node.GetChild(1));
+      begin
+        if Node.Token.TokenType = ttOpPow then
+          Result := False                     // "^" is pow(): always Double
+        else if Node.Token.TokenType = ttOpDiv then
+          // "/" has no mixed Single/Integer form: an integer operand promotes BOTH to Double. So "s / 2" is
+          // a Double where "s * 2" is a Single -- only Single / Single stays single.
+          Result := IsSingleExpr(Node.GetChild(0)) and IsSingleExpr(Node.GetChild(1))
+        else
+          Result := (IsSingleExpr(Node.GetChild(0)) or IsSingleExpr(Node.GetChild(1))) and
+                    not IsDoubleValued(Node.GetChild(0)) and not IsDoubleValued(Node.GetChild(1));
+      end;
   end;
 end;
 

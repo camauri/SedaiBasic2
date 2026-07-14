@@ -105,6 +105,11 @@ type
     FTokenBuffer: array of Char;   // grows on demand (INITIAL_TOKEN_CAPACITY, then doubling)
     FTokenLength: Integer;
 
+    // Set while lexing a number whose float suffix says SINGLE ("1.5f", "1.5!"); ProcessNumber stamps it
+    // onto the token it builds and clears it. The suffix is scanned before the token object exists, so the
+    // mark cannot be written straight to the token.
+    FPendingSingleSuffix: Boolean;
+
     function GetTokenAt(Index: Integer): TLexerToken;
     function HandleTokenOverflow: TLexerToken;
     function ParseNumberDigits: Boolean;
@@ -1291,6 +1296,7 @@ begin
   Result.TokenType := TokenType;
   Result.KeywordInfo := KeywordInfo;
   Result.BasePrefixed := False;   // pooled object: clear it, or the previous token's "&H.." mark carries over
+  Result.SingleSuffixed := False; // ditto for the "1.5f" mark (ProcessNumber sets it from FPendingSingleSuffix)
 
   Result.Line := ATokenLine;
   Result.Column := FTokenStartColumn;
@@ -1415,7 +1421,11 @@ begin
        if (TokenText[i] = 'D') or (TokenText[i] = 'd') then TokenText[i] := 'E';
      Result.SetExtractedValue(TokenText);
    end;
+   Result.SingleSuffixed := FPendingSingleSuffix;
  end;
+ // Always cleared, on BOTH branches and whichever call site got here: ProcessNumber is reached from FSM
+ // paths that never scan a suffix, and a stale mark would make the NEXT literal a Single.
+ FPendingSingleSuffix := False;
 end;
 
 function TLexerFSM.LexAmpBaseLiteral: TLexerToken;
@@ -1917,19 +1927,29 @@ end;
 
 procedure TLexerFSM.ConsumeFloatLiteralSuffix;
 // FreeBASIC float literal TYPE suffix: 'f'/'F' (Single), 'd'/'D' (Double), '!' (Single), '#' (Double).
-// Consumed and DROPPED (the literal's value is the number itself; the bank is float regardless). A number
-// can never be validly glued to an identifier, so a trailing f/d is an unambiguous suffix. For f/d/F/D we
-// require the following char to be a non-alnum so a VB-style exponent (1.5D10) isn't mistaken for a suffix.
+// The suffix is consumed and dropped from the token text -- the literal's value is the number either way,
+// and the bank is float regardless -- but a SINGLE one is REMEMBERED in FPendingSingleSuffix: it decides
+// the literal's TYPE, and so whether it prints 7 significant digits and keeps an expression single.
+// ProcessNumber, which builds the token, is what stamps it (the token does not exist yet here).
+// A number can never be validly glued to an identifier, so a trailing f/d is an unambiguous suffix. For
+// f/d/F/D we require the following char to be a non-alnum so a VB-style exponent (1.5D10) isn't mistaken
+// for a suffix.
 var C: Char;
 begin
   C := GetCurrentChar;
   if (C = 'f') or (C = 'F') or (C = 'd') or (C = 'D') then
   begin
     if not (PeekChar(1) in ['0'..'9', 'A'..'Z', 'a'..'z', '_']) then
+    begin
+      FPendingSingleSuffix := (C = 'f') or (C = 'F');
       AdvanceChar;
+    end;
   end
   else if (C = '!') or (C = '#') then
+  begin
+    FPendingSingleSuffix := (C = '!');
     AdvanceChar;
+  end;
 end;
 
 // === MAIN LEXING METHOD ===
