@@ -3120,18 +3120,39 @@ begin
         end
         else if (FuncName = kWCHR) then
         begin
-          // WCHR(n) - the wide character for Unicode codepoint n, encoded as UTF-8 bytes (unlike CHR$,
-          // which emits a single raw byte). Single-codepoint form (v1).
+          // WCHR(a [, b, ...]) - the wide character for each Unicode codepoint, encoded as UTF-8 bytes
+          // (unlike CHR$, which emits a single raw byte) and CONCATENATED, exactly as CHR$ does above:
+          // WChr(933, 934, 935) is the three-character string "YFX" in Greek capitals. We read only the
+          // first argument and silently dropped the rest, so the manual's own WCHR example printed one
+          // character where fbc prints three.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+          begin
+            Result := MakeSSAValue(svkNone);
+            for i := 0 to ArgListNode.ChildCount - 1 do
+            begin
+              ProcessExpression(ArgListNode.GetChild(i), ArgValue);
+              ArgReg := EnsureIntRegister(ArgValue);
+              Arg2Value := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));   // this codepoint
+              EmitInstruction(ssaStrWChr, Arg2Value, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              if Result.Kind = svkNone then
+                Result := Arg2Value
+              else
+              begin
+                TempVal := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+                EmitInstruction(ssaStrConcat, TempVal, EnsureStringRegister(Result), Arg2Value, MakeSSAValue(svkNone));
+                Result := TempVal;
+              end;
+            end;
+          end
           else if ArgListNode <> nil then
-            ProcessExpression(ArgListNode, ArgValue)
+          begin
+            ProcessExpression(ArgListNode, ArgValue);
+            ArgReg := EnsureIntRegister(ArgValue);
+            DestReg := FProgram.AllocRegister(srtString);
+            Result := MakeSSARegister(srtString, DestReg);
+            EmitInstruction(ssaStrWChr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
-
-          ArgReg := EnsureIntRegister(ArgValue);
-          DestReg := FProgram.AllocRegister(srtString);
-          Result := MakeSSARegister(srtString, DestReg);
-          EmitInstruction(ssaStrWChr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else if FModernMode and (FuncName = kINPUT) then
         begin
