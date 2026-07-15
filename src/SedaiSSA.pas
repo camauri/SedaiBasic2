@@ -19747,12 +19747,16 @@ begin
   end
   else if ObjNode.NodeType = antBinaryOp then
   begin
-    // An overloaded operator "OPERATOR <sym>(a AS T, b AS T) AS R" yields a value of R. Resolve R when it
-    // is itself a UDT, so a UDT-returning operator chains ("a * (b ^ c)") and prints via its Cast operator.
+    // An overloaded operator "OPERATOR <sym>(a, b) AS R" yields a value of R. Resolve R when it is itself a
+    // UDT, so a UDT-returning operator chains ("a * (b ^ c)", "(a^2) + (b^2)") and prints via its Cast
+    // operator. The operator is owned by a UDT OPERAND: try the LEFT operand's type, then the RIGHT -- a
+    // MIXED-signature operator like "^(meas, double)" has only one UDT side, so requiring BOTH operands to
+    // be the same UDT missed it, and the enclosing operator then failed to resolve (wrong value or AV).
     if (ObjNode.ChildCount >= 2) and Assigned(ObjNode.Token) then
     begin
       ParentType := ObjectTypeName(ObjNode.GetChild(0));
-      if (ParentType <> '') and (ObjectTypeName(ObjNode.GetChild(1)) = ParentType) then
+      if ParentType = '' then ParentType := ObjectTypeName(ObjNode.GetChild(1));
+      if ParentType <> '' then
       begin
         NestedT := ResolveMethodLabel(ParentType, 'OPERATOR' + VarToStr(ObjNode.Token.Value) + OperatorArityCode(2));
         if NestedT <> '' then Result := VarRecordTypeName(NestedT);   // its UDT return type ('' if scalar)
