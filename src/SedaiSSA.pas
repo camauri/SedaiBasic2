@@ -19021,7 +19021,7 @@ var
   Indices: array of TSSAValue;
   LinearIndex, TempVal, AddResult, StrideVal, MulResult, BaseVal: TSSAValue;
   TempReg, Stride: Integer;
-  RawFieldPointee: string;
+  RawFieldPointee, RecTypeName: string;
 begin
   // @obj.field[i] where obj.field is a raw "<scalar> PTR" field: FreeBASIC "@field[i]" ≡ "field + i", the
   // SizeOf-scaled byte address a "field[i]" deref computes. Return it directly (child0 is a member access,
@@ -19051,6 +19051,12 @@ begin
     end;
     raise Exception.CreateFmt('Cannot take address of element of undeclared array: %s', [ArrName]);
   end;
+  // @g(i) where g is an array-of-UDT: FreeBASIC "@g(i)" is a "T Ptr" to element i, and in the managed model
+  // a "T Ptr" IS the record handle (managed-reference, same as p[i]/@p / a returned record). Return element
+  // i's record HANDLE. The packed array-element address computed below would be misread by "p->field" as a
+  // record handle and dereference a bogus slot (an AccessViolation). ResolveRecordObject loads the handle.
+  if ArrayRecordTypeOf(ArrName) <> '' then
+    if ResolveRecordObject(Node, Result, RecTypeName) then Exit;
   ArrInfo := FProgram.GetArray(ArrayIdx);
   IndicesNode := Node.GetChild(1);  // antExpressionList of indices
 
