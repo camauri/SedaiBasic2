@@ -18407,11 +18407,14 @@ begin
 end;
 
 procedure TSSAGenerator.EmitRawAlloc(CallNode: TASTNode; out Result: TSSAValue);
-// Lower ALLOCATE(n)/CALLOCATE(n) → bcRawAlloc(n bytes); REALLOCATE(p,n) → bcRawRealloc(p, n bytes).
-// The byte count is taken verbatim (FreeBASIC Allocate is byte-granular; SizeOf supplies the math).
+// Lower ALLOCATE(n)/CALLOCATE(n) → bcRawAlloc(n bytes); CALLOCATE(count, size) → bcRawAlloc(count*size
+// bytes); REALLOCATE(p,n) → bcRawRealloc(p, n bytes). The single-arg forms are byte-granular (SizeOf
+// supplies the math), but CAllocate's TWO-arg form is calloc(count, elemSize): the byte count is the
+// PRODUCT. Ignoring the second arg under-allocated the block -- a "Callocate(9, SizeOf(Integer))" got 9
+// bytes, not 72, so later stores walked off the end and the next allocation overlapped it.
 var
   FuncU: string;
-  CountV, OldV: TSSAValue;
+  CountV, OldV, SizeV, ProdV: TSSAValue;
   ArgsNode: TASTNode;
 begin
   IsAllocCall(CallNode, FuncU);
@@ -18426,6 +18429,13 @@ begin
   else
   begin
     ProcessExpression(ArgsNode.GetChild(0), CountV); CountV := EnsureIntRegister(CountV);
+    if (FuncU = 'CALLOCATE') and (ArgsNode.ChildCount >= 2) then
+    begin
+      ProcessExpression(ArgsNode.GetChild(1), SizeV); SizeV := EnsureIntRegister(SizeV);
+      ProdV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, ProdV, CountV, SizeV, MakeSSAValue(svkNone));
+      CountV := ProdV;
+    end;
     EmitInstruction(ssaRawAlloc, Result, CountV, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 end;
