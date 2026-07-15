@@ -15235,6 +15235,8 @@ function TSSAGenerator.PrintKindOfExpr(Node: TASTNode): Integer;
 var
   Txt: string;
   I64, NodeVal: Int64;
+  AwIdx, AwCode: Integer;
+  MNode: TASTNode;
 begin
   Result := 0;
   if Node = nil then Exit;
@@ -15244,8 +15246,33 @@ begin
     antFunctionCall:
       Result := PrintKindOf(VarToStr(Node.Value));
     antArrayAccess:
-      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antMemberAccess) then
+      begin
+        // obj.field(i) member-array element: the field's own narrow width says whether it prints unsigned
+        // (UByte/UShort/ULong member array -> no sign space). ObjectTypeName is the no-emit type query.
+        MNode := Node.GetChild(0);
+        AwCode := UDTFieldWidthCode(FindUDT(ObjectTypeName(MNode.GetChild(0))), VarToStr(MNode.Value));
+        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
+      end
+      else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+      begin
         Result := PrintKindOf(VarToStr(Node.GetChild(0).Value));
+        // An element of an array declared AS a NARROW UNSIGNED type (UByte/UShort/ULong) prints unsigned
+        // too -- without the leading sign space, like the scalar form. Array names are never in
+        // FVarPrintKind (only scalars/params/returns), but the element's narrow width IS in FArrayElemWidth:
+        // codes 2/4/6 are u8/u16/u32 (the odd 1/3/5 are the signed widths, which stay signed). Kind 3, not
+        // 2 -- a narrow unsigned is a positive Int64 that promotes to a SIGNED expression, so it must not
+        // reach the unsigned-64 compare/div/mod opcodes.
+        if Result = 0 then
+        begin
+          AwIdx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value)));
+          if AwIdx >= 0 then
+          begin
+            AwCode := PtrInt(FArrayElemWidth.Objects[AwIdx]);
+            if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
+          end;
+        end;
+      end;
     antParentheses:
       if Node.ChildCount >= 1 then Result := PrintKindOfExpr(Node.GetChild(0));
     antLiteral:
