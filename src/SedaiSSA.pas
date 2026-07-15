@@ -5269,6 +5269,15 @@ begin
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
           Left := EmitPointerIndexAddress(ArrName, Node.GetChild(1));
+          // p[i] where the pointee is a UDT: the record's VALUE is its handle (managed-reference model),
+          // and p+i IS that handle for a managed block, so return it directly. A scalar ssaRefLoadInt
+          // would take the record handle (bit 62 set) for a raw pointer address and fault -- the mirror
+          // of the p[i] = <UDT> store in ProcessAssignment. Passing p[i] byval then copies the record.
+          if FindUDT(ManagedPtrPointee(ArrName)) >= 0 then
+          begin
+            Result := EnsureIntRegister(Left);
+            Exit;
+          end;
           FuncRetType := PointeeBankOf(ArrName);
           DestReg := FProgram.AllocRegister(FuncRetType);
           Result := MakeSSARegister(FuncRetType, DestReg);
@@ -5674,6 +5683,17 @@ begin
     VarReg := EmitPointerIndexAddress(VarName, VarNode.GetChild(1));
     DerefBank := PointeeBankOf(VarName);
     ProcessExpression(ExprNode, ExprValue);
+    // "p[i] = <UDT value>" for a pointer-to-UDT: p+i is element i's record handle (managed pointer,
+    // unscaled), so copy the source record's CONTENTS into it -- value semantics, recursive, member
+    // arrays included -- exactly like an array-of-UDT element assignment. The scalar ssaRefStoreInt
+    // below took the record HANDLE (bit 62 set) for a raw pointer address and faulted, and would not
+    // have copied the fields anyway. Only a MANAGED pointee UDT: the pointee bank is srtInt (a handle).
+    DstRecType := ManagedPtrPointee(VarName);
+    if (FindUDT(DstRecType) >= 0) and (ExprValue.Kind = svkRegister) and (ExprValue.RegType = srtInt) then
+    begin
+      EmitRecordCopy(VarReg, ExprValue, FindUDT(DstRecType));
+      Exit;
+    end;
     case DerefBank of
       srtFloat:
         begin
