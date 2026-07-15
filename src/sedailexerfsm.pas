@@ -110,6 +110,11 @@ type
     // mark cannot be written straight to the token.
     FPendingSingleSuffix: Boolean;
 
+    // Set while lexing an integer whose type suffix is '&' (Long, "3000000000&"). Long is a signed 32-bit
+    // type, so the value is WRAPPED to signed 32 bits; unlike the other dropped suffixes this one changes
+    // the value, not just the type. ProcessNumber / LexAmpBaseLiteral apply the wrap and clear the flag.
+    FPendingLongSuffix: Boolean;
+
     function GetTokenAt(Index: Integer): TLexerToken;
     function HandleTokenOverflow: TLexerToken;
     function ParseNumberDigits: Boolean;
@@ -1397,6 +1402,8 @@ var
  TokenText: string;
  i: Integer;
  HasDExp: Boolean;
+ LongVal: Int64;
+ IsIntText: Boolean;
 begin
  Result := nil;
  TokenText := TokenBufferAsString;
@@ -1422,10 +1429,26 @@ begin
      Result.SetExtractedValue(TokenText);
    end;
    Result.SingleSuffixed := FPendingSingleSuffix;
+
+   // '&' Long suffix: Long is signed 32-bit, so wrap the value to signed 32 bits and store the wrapped
+   // decimal (3000000000& -> -1294967296, exactly as fbc). The wrap only applies to an INTEGER literal;
+   // a decimal point or an exponent means it isn't one (an errant '1.5&' just keeps its float value).
+   // Once wrapped the value is an ordinary signed integer, so the normal signed-print path is already
+   // right -- no separate print-kind mark is needed (and it can never re-enter the ULong range, so the
+   // m413 unsigned-decimal rule cannot pick it up).
+   if FPendingLongSuffix then
+   begin
+     IsIntText := True;
+     for i := 1 to Length(TokenText) do
+       if not ((TokenText[i] >= '0') and (TokenText[i] <= '9')) then begin IsIntText := False; Break; end;
+     if IsIntText and TryStrToInt64(TokenText, LongVal) then
+       Result.SetExtractedValue(IntToStr(Int64(LongInt(LongVal and $FFFFFFFF))));
+   end;
  end;
  // Always cleared, on BOTH branches and whichever call site got here: ProcessNumber is reached from FSM
- // paths that never scan a suffix, and a stale mark would make the NEXT literal a Single.
+ // paths that never scan a suffix, and a stale mark would make the NEXT literal a Single/Long.
  FPendingSingleSuffix := False;
+ FPendingLongSuffix := False;
 end;
 
 function TLexerFSM.LexAmpBaseLiteral: TLexerToken;
@@ -1475,6 +1498,13 @@ begin
     TokenBufferAdd(Ch); AdvanceChar;
   end;
   ConsumeIntLiteralSuffix;   // FreeBASIC typed integer literal: &hFFul, &b1010ULL, ... (dropped)
+  // A trailing '&' Long suffix on a base literal (&HFFFFFFFF&) wraps to signed 32 bits, like the decimal
+  // path in ProcessNumber. ProcessNumber never runs for a base literal, so apply and clear the flag here.
+  if FPendingLongSuffix then
+  begin
+    Val := Int64(LongInt(Val and $FFFFFFFF));
+    FPendingLongSuffix := False;
+  end;
   Result := CreateToken(ttNumber);
   Result.SetExtractedValue(IntToStr(Val));   // logical value is decimal, not the "&H.." source text
   // ...which is why the token has to remember that it WAS base-prefixed: with the source text gone it is
@@ -1920,9 +1950,18 @@ begin
     if (GetCurrentChar = 'L') or (GetCurrentChar = 'l') then AdvanceChar;     // LL
   end
   else if C = '%' then
-    AdvanceChar;   // "64%" (Integer). Unambiguous after a number: BASIC's modulo is MOD, never '%'.
-  // NOT '&' (the Long suffix, "64&"): it collides with the concatenation operator and the &H/&O/&B
-  // literal prefix, so a bare trailing '&' stays a concat. Rare enough to leave alone.
+    AdvanceChar   // "64%" (Integer). Unambiguous after a number: BASIC's modulo is MOD, never '%'.
+  else if (C = '&') and (not FLexerOptions.HasLineNumbers) then
+    // '&' is the Long type suffix ("3000000000&"). It reads as a suffix ONLY when it TOUCHES the number
+    // (no space): FreeBASIC's concatenation '&' always has a space before it, so a number lexed up to a
+    // space has already stopped, and this routine only ever sees the char immediately after the digits.
+    // MODERN only: v7 has neither the '&' suffix nor '&' concat (it concatenates strings with '+').
+    // Long is signed 32-bit, so the value gets WRAPPED downstream (ProcessNumber); flag it here.
+    // (The prior '&HFF' base-literal prefix cannot appear here: those digits are already consumed.)
+  begin
+    AdvanceChar;
+    FPendingLongSuffix := True;
+  end;
 end;
 
 procedure TLexerFSM.ConsumeFloatLiteralSuffix;
