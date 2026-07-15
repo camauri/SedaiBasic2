@@ -5936,6 +5936,31 @@ begin
     Exit;
   end;
 
+  // FreeBASIC "Operator T.Cast() As Integer/Double": assigning such a UDT to a NUMERIC scalar converts
+  // through the cast -- the numeric twin of the string case above, and of what arithmetic already does via
+  // NumCast. Without it the assignment fell through to the generic path, which read the record HANDLE as
+  // the value and stored 0: "Dim As Double d = myRational" silently produced 0 while "d = r + 0.0" (the
+  // arithmetic path) gave the right value. (A type declaring BOTH an int and a float cast still prefers the
+  // int one here -- the overload-by-return-type case is a separate, rarer gap, already noted on the helper.)
+  if (VarRecordTypeName(VarName) = '') and (GetVariableType(VarName) in [srtInt, srtFloat]) and
+     (ObjectTypeName(ExprNode) <> '') and TryEmitUDTCastToNumber(ExprNode, ExprValue) then
+  begin
+    VarReg := GetOrAllocateVariable(VarName);
+    if GetVariableType(VarName) = srtFloat then
+    begin
+      ExprValue := EnsureFloatRegister(ExprValue);
+      CopyOp := ssaCopyFloat;
+    end
+    else
+    begin
+      ExprValue := ApplyScalarNarrow(VarName, EnsureIntRegister(ExprValue));
+      CopyOp := ssaCopyInt;
+    end;
+    if ExprValue.RegIndex <> VarReg.RegIndex then
+      EmitInstruction(CopyOp, VarReg, ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+
   // Get or allocate register for this variable
   VarReg := GetOrAllocateVariable(VarName);
 
