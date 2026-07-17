@@ -5870,21 +5870,30 @@ begin
         // Immediate = length register index (low 16 bits)
         StartPos := Ctx.IntRegs[Instr.Src2];
         Count := Ctx.IntRegs[Instr.Immediate and $FFFF];
-        if StartPos < 1 then StartPos := 1;
-        // A NEGATIVE length returns the rest of the string in FreeBASIC: "if n < 0 or n >= len(str)
-        // then all of the remaining characters are returned" (manual, Mid function). Clamping it to 0
-        // instead dropped the final field of the common split idiom -- "Mid(s, p + 1, Instr(...) - p - 1)"
-        // computes a negative length on the last token, because Instr returns 0 when it runs out.
-        // CLASSIC keeps the clamp: Commodore v7 has no such rule (it rejects a negative length outright).
-        if Count < 0 then
+        // FreeBASIC: a start position below 1 yields an EMPTY string (the position is 1-based, and FB does
+        // not clamp it). Clamping to 1 instead returned the first character, so "For n = 0 To Len(s):
+        // Mid(s,n,1)" processed character 1 twice and doubled the leading letter (Rosetta "XML/Output").
+        // CLASSIC v7 keeps the clamp (its MID$ has no such rule).
+        if (StartPos < 1) and Assigned(FProgram) and FProgram.ModernMode then
+          Ctx.StringRegs[Instr.Dest] := ''
+        else
         begin
-          if Assigned(FProgram) and FProgram.ModernMode then
-            Count := Length(Ctx.StringRegs[Instr.Src1]) - StartPos + 1
-          else
-            Count := 0;
-          if Count < 0 then Count := 0;
+          if StartPos < 1 then StartPos := 1;
+          // A NEGATIVE length returns the rest of the string in FreeBASIC: "if n < 0 or n >= len(str)
+          // then all of the remaining characters are returned" (manual, Mid function). Clamping it to 0
+          // instead dropped the final field of the common split idiom -- "Mid(s, p + 1, Instr(...) - p - 1)"
+          // computes a negative length on the last token, because Instr returns 0 when it runs out.
+          // CLASSIC keeps the clamp: Commodore v7 has no such rule (it rejects a negative length outright).
+          if Count < 0 then
+          begin
+            if Assigned(FProgram) and FProgram.ModernMode then
+              Count := Length(Ctx.StringRegs[Instr.Src1]) - StartPos + 1
+            else
+              Count := 0;
+            if Count < 0 then Count := 0;
+          end;
+          Ctx.StringRegs[Instr.Dest] := Copy(Ctx.StringRegs[Instr.Src1], StartPos, Count);
         end;
-        Ctx.StringRegs[Instr.Dest] := Copy(Ctx.StringRegs[Instr.Src1], StartPos, Count);
       end;
     5: // bcStrAsc
       begin
