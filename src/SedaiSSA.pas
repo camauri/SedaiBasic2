@@ -8403,6 +8403,10 @@ begin
     WantBank := TypeNameToBank(Node.Attributes.Values['VARTYPE'], VarName);
     if not (ResolveExisting(VarName, VarReg) and (VarReg.RegType = WantBank)) then
       VarReg := DeclareVariableTyped(VarName, WantBank);
+    // A "FOR i AS UInteger/ULongInt" counter prints unsigned (no leading sign space), and a narrow counter
+    // type wraps on step -- record its width/print-kind like a DIM does, or "For i As UInteger ... Print i"
+    // printed the sign space FreeBASIC omits (Rosetta's digit-count / Wilson's-theorem loops).
+    RecordVarWidth(VarName, Node.Attributes.Values['VARTYPE']);
   end
   else
     VarReg := GetOrAllocateVariable(VarName);
