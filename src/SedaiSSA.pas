@@ -197,6 +197,8 @@ type
     FStaticMembers: TStringList;         // OOP: static member variables "TYPE.FIELD" (UPPER), backed by a shared global scalar
     FEnumMembers: TStringList;           // FreeBASIC ENUM members (UPPER), backed by a shared global scalar so they are visible inside procedures
     FEnumNames: TStringList;             // FreeBASIC ENUM type names (UPPER): lets "MyEnum.member" resolve to the member
+    FEnumMemberType: TStringList;        // ENUM member name (UPPER) -> its enum type name (UPPER): for operator overloading on an enum operand
+    FVarEnumType: TStringList;           // "DIM AS <enum> v" variable (UPPER) -> its enum type name (UPPER): same, for a variable operand
     FPointerVars: TStringList;           // FreeBASIC pointers: var name (UPPER) -> pointee type name (e.g. "INTEGER")
     FRefVars: TStringList;               // FreeBASIC reference variables (DIM BYREF r AS T = target): name
                                          // (UPPER) -> pointee type. r's register is int (it carries target's
@@ -484,6 +486,7 @@ type
     function TryMemberArrayBound(ArrNameNode, ArgListNode: TASTNode; IsLBound: Boolean;
                                  out BoundVal: TSSAValue): Boolean;  // LBOUND/UBOUND(obj.field[, dim])
     // Fold LBOUND/UBOUND(arr[,dim]) to a compile-time constant when arr's target dimension is static.
+    function EnumTypeOfOperand(Node: TASTNode): string;   // enum type name of an enum operand (member/var/param), else '' — for operator overloading
     function TryConstFoldArrayBound(Node: TASTNode; out Val: Int64): Boolean;
     // Resolve a member-access object (a record variable or an array-of-UDT element) to its
     // handle register and UDT type name. False if it is not a record object.
@@ -796,6 +799,10 @@ begin
   FEnumMembers.CaseSensitive := False;
   FEnumNames := TStringList.Create;
   FEnumNames.CaseSensitive := False;
+  FEnumMemberType := TStringList.Create;
+  FEnumMemberType.CaseSensitive := False;
+  FVarEnumType := TStringList.Create;
+  FVarEnumType.CaseSensitive := False;
   FPointerVars := TStringList.Create;
   FAddrLocalVars := TStringList.Create;
   FRefVars := TStringList.Create;
@@ -866,6 +873,8 @@ begin
   FStaticMembers.Free;
   FEnumMembers.Free;
   FEnumNames.Free;
+  FEnumMemberType.Free;
+  FVarEnumType.Free;
   FPointerVars.Free;
   FAddrLocalVars.Free;
   FRefVars.Free;
@@ -1991,6 +2000,7 @@ begin
            ((Node.Token.TokenType = ttOpSub) or (Node.Token.TokenType = ttBitwiseNOT)) then
         begin
           OpLhsType := ObjectTypeName(Node.GetChild(0));
+          if OpLhsType = '' then OpLhsType := EnumTypeOfOperand(Node.GetChild(0));   // unary op overloaded on an enum ("Not i")
           if OpLhsType <> '' then
           begin
             OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(1));
@@ -2136,6 +2146,11 @@ begin
       if (Node.ChildCount >= 2) and Assigned(Node.Token) then
       begin
         OpLhsType := ObjectTypeName(Node.GetChild(0));
+        // A UDT reports through ObjectTypeName; an ENUM operand does not (it is an int value), so try the
+        // enum type too -- "F And i" then dispatches to "Operator And(x As trit, y As trit)" instead of the
+        // builtin bitwise AND. If no such operator exists, ResolveMethodLabel returns '' and the op falls
+        // through to the normal numeric path, so plain enum arithmetic is unaffected.
+        if OpLhsType = '' then OpLhsType := EnumTypeOfOperand(Node.GetChild(0));
         if OpLhsType <> '' then
         begin
           OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(2));
@@ -16505,8 +16520,16 @@ begin
       // "DIM v AS T(args)" also has child[2] = antArgumentList, so accept ChildCount >= 2 here
       // (the array-of-UDT case has child[1] = antDimensions, not antIdentifier, so no overlap).
       if (Decl.ChildCount >= 2) and (Decl.GetChild(1).NodeType = antIdentifier) then
+      begin
         RegisterTypedVar(UpperCase(VarToStr(Decl.GetChild(0).Value)),
-                         UpperCase(VarToStr(Decl.GetChild(1).Value)))
+                         UpperCase(VarToStr(Decl.GetChild(1).Value)));
+        // Remember a non-UDT declared type name (this pre-scan runs before CollectEnumMembers, so the
+        // enum-ness is confirmed at the dispatch site via FEnumNames): a "Dim As <enum> v" operand then
+        // resolves to its enum type for operator-overload dispatch.
+        if FindUDT(UpperCase(VarToStr(Decl.GetChild(1).Value))) < 0 then
+          FVarEnumType.Values[UpperCase(VarToStr(Decl.GetChild(0).Value))] :=
+            UpperCase(VarToStr(Decl.GetChild(1).Value));
+      end
       // DIM name(dims) AS type  -> array of UDT (child[2] = antIdentifier type): record the
       // element type; the array itself is an int (handle) array.
       else if (Decl.ChildCount >= 3) and (Decl.GetChild(2).NodeType = antIdentifier) then
@@ -16585,6 +16608,10 @@ begin
           else if TypeName <> '' then
           begin
             RegisterTypedVar(VarName, TypeName);
+            // A non-UDT-typed parameter's declared type (confirmed an enum at the dispatch site via
+            // FEnumNames): an enum PARAMETER operand ("operator and(x as trit,...)" -> "y and x") then
+            // dispatches to the overload just like an enum variable.
+            if FindUDT(TypeName) < 0 then FVarEnumType.Values[VarName] := TypeName;
             // An unsigned 64-bit parameter (UInteger/ULongInt) prints unsigned and selects the unsigned
             // compare/div/mod forms (IsUnsigned64Expr reads FVarPrintKind=2). Only these two 64-bit types
             // need it — narrower unsigned params are stored as positive Int64 and behave correctly as
@@ -18044,6 +18071,10 @@ begin
         ai := FProgram.DeclareArray(VNameU, srtInt, [1]);   // 1-element global int array, same name
         FSharedScalarArr.AddObject(VNameU, TObject(PtrInt(ai)));
         FEnumMembers.Add(VNameU);
+        // Remember which named enum this member belongs to, so an operand that is a bare enum member
+        // ("F And i") resolves to the enum type for operator-overload dispatch.
+        if VarToStr(Node.Value) <> '' then
+          FEnumMemberType.Values[VNameU] := UpperCase(VarToStr(Node.Value));
       end;
     end;
   for i := 0 to Node.ChildCount - 1 do
@@ -19780,6 +19811,32 @@ begin
             Result := FUnsigned64Arrays.IndexOf(U) >= 0;
         end;
       end;
+  end;
+end;
+
+function TSSAGenerator.EnumTypeOfOperand(Node: TASTNode): string;
+// The enum type name of an operand that is an ENUM value -- a bare enum member ("F"), or a variable /
+// parameter declared "AS <enum>" -- else ''. FreeBASIC lets an operator be overloaded on an enum
+// ("Operator And(x As trit, y As trit)"), and the binary/unary dispatch keys on the left operand's type,
+// which ObjectTypeName reports only for UDT records. This supplies the enum type so such an operator is
+// dispatched instead of the builtin bitwise/arithmetic op. FEnumNames is fully populated by lowering time,
+// so it confirms that a recorded (pre-scan) declared type name really is an enum.
+var
+  nameU, t: string;
+  idx: Integer;
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if Node.NodeType <> antIdentifier then Exit;
+  nameU := UpperCase(VarToStr(Node.Value));
+  idx := FEnumMemberType.IndexOfName(nameU);           // a bare enum member (F/M/T)
+  if idx >= 0 then Exit(FEnumMemberType.ValueFromIndex[idx]);
+  idx := FVarEnumType.IndexOfName(nameU);              // a variable / parameter declared AS <enum>
+  if idx >= 0 then
+  begin
+    t := FVarEnumType.ValueFromIndex[idx];
+    if FEnumNames.IndexOf(t) >= 0 then Result := t;    // confirm the declared type is really an enum
   end;
 end;
 
