@@ -1630,6 +1630,15 @@ function TBytecodeVM.AllocRecord(Ctx: TExecutionContext; IntC, FloatC, StrC, Typ
 // Allocate a record instance (heap block of typed slot arrays) in Ctx's per-thread heap and
 // return its handle (an index into Ctx.Records).
 begin
+  // Reserve handle 0 as the null-pointer sentinel: a real record handle must never be 0, or a pointer
+  // to the first-allocated record ("Dim As T b : Dim As T Ptr p = @b") would carry the value 0 and a
+  // null check ("If p = 0", "While p <> 0") would wrongly see it as null. Index 0 stays an unused empty
+  // slot. The shared-record region already keeps 0 free via SHARED_REC_FLAG (see AllocSharedRecord); this
+  // mirrors that invariant for the per-thread heap. Matches FreeBASIC, where a valid @obj is never 0.
+  // The guard sits here (not at each context reset) so it holds after every frame/block reclaim, which
+  // restore RecordCount to a saved high-water mark that can be 0.
+  if Ctx.RecordCount = 0 then
+    Ctx.RecordCount := 1;
   if Ctx.RecordCount >= Length(Ctx.Records) then
     SetLength(Ctx.Records, (Ctx.RecordCount + 1) * 2);
   Ctx.Records[Ctx.RecordCount].TypeId := TypeId;
