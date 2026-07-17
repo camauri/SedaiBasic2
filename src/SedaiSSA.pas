@@ -17296,6 +17296,23 @@ begin
       StoreAssign.AddChild(ArgExpr.Clone);
       StoreAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, ArgExpr.Token));
       try ProcessArrayStore(StoreAssign); finally StoreAssign.Free; end;
+    end
+    else if ArgExpr.NodeType = antMemberAccess then
+    begin
+      // Member-field lvalue arg "obj.field" / "p->field": load the parameter's final value from the
+      // transfer slot into a bank-typed temp, then store it back through the normal member-store path
+      // (which resolves the object handle and the field slot). Without this a BYREF argument that is a
+      // struct field -- e.g. the canonical "insert(node->left, v)" tree build -- silently dropped the
+      // callee's mutation, so the field kept its pre-call value (usually a null pointer). Mirrors the
+      // array-element branch above; only simple identifier / array-element / member-field args are lvalues.
+      case RT of
+        srtInt:    TmpName := '__BRWTMP%';
+        srtString: TmpName := '__BRWTMP$';
+      else         TmpName := '__BRWTMP!';   // single-precision suffix -> float bank
+      end;
+      EmitXferLoad(RT, Slot, GetOrAllocateVariable(TmpName));
+      StoreAssign := TASTNode.CreateWithValue(antIdentifier, TmpName, ArgExpr.Token);
+      try ProcessMemberStore(ArgExpr, StoreAssign); finally StoreAssign.Free; end;
     end;
     // else: a literal/expression or non-writable arg — left untouched.
   end;
