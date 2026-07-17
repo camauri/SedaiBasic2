@@ -352,7 +352,8 @@ type
     ssaGet,            // GET A$ (non-blocking character input)
     ssaGetkey,         // GETKEY A$ (blocking character input)
     // Formatted output
-    ssaPrintUsing,     // PRINT USING format$; values
+    ssaPrintUsing,     // PRINT USING format$; values (Src2 = FLOAT value)
+    ssaPrintUsingInt,  // PRINT USING with an EXACT integer value (Src2 = INT value): keeps every digit of a LongInt > 2^53
     ssaPrintUsingStage,// stage one already-stringified value for a runtime-format PRINT USING (Src1=string)
     ssaPrintUsingRun,  // run a runtime-format PRINT USING over the staged values (Src1=format string)
     ssaPudef,          // PUDEF format string (redefine PRINT USING symbols)

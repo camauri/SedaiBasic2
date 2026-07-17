@@ -568,6 +568,8 @@ begin
       Line := Format('%4d: %-20s R%d', [Index, 'Getkey', Instr.Dest]);
     bcPrintUsing:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'PrintUsing', Instr.Src1, Instr.Src2]);
+    bcPrintUsingInt:
+      Line := Format('%4d: %-20s R%d, IntR%d', [Index, 'PrintUsingInt', Instr.Src1, Instr.Src2]);
     bcPudef:
       Line := Format('%4d: %-20s R%d', [Index, 'Pudef', Instr.Src1]);
     bcChar:

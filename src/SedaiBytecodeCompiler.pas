@@ -496,6 +496,7 @@ begin
     ssaGetkey: Result := bcGetkey;
     // Formatted output
     ssaPrintUsing: Result := bcPrintUsing;
+    ssaPrintUsingInt: Result := bcPrintUsingInt;
     ssaPrintUsingStage: Result := bcPrintUsingStage;
     ssaPrintUsingRun: Result := bcPrintUsingRun;
     ssaPudef: Result := bcPudef;
@@ -1784,10 +1785,15 @@ begin
     Exit;
   end;
 
-  // Special handling for PRINT USING
-  if Instr.OpCode = ssaPrintUsing then
+  // Special handling for PRINT USING (float value = bcPrintUsing; exact-integer value = bcPrintUsingInt).
+  // Both carry Src1 = format string register, Src2 = value register (float or int bank respectively; the
+  // bank travels with the SSA register's RegType through MapSSARegisterToBytecode).
+  if (Instr.OpCode = ssaPrintUsing) or (Instr.OpCode = ssaPrintUsingInt) then
   begin
-    BCInstr := MakeBytecodeInstruction(bcPrintUsing, 0, 0, 0, 0);
+    if Instr.OpCode = ssaPrintUsingInt then
+      BCInstr := MakeBytecodeInstruction(bcPrintUsingInt, 0, 0, 0, 0)
+    else
+      BCInstr := MakeBytecodeInstruction(bcPrintUsing, 0, 0, 0, 0);
     // Src1 = format string register
     if Instr.Src1.Kind = svkRegister then
       BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);

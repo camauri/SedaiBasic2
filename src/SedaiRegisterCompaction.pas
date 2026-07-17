@@ -646,6 +646,7 @@ begin
     bcStrHex, bcStrOct, bcStrBin,
     // === GROUP 5: Memory operations ===
     bcPoke,           // POKE address, value: Src2 = value (int)
+    bcPrintUsingInt,  // PRINT USING (exact int): Src2 = int value (Src1 = format string)
     // === GROUP 6: File I/O ===
     bcWInputChars, bcInputChars,    // W/INPUT(n[,#f]): Src2 = file handle (int; 0 = keyboard)
     bcSeekSet,        // SEEK #n, pos: Src2 = position (int)
@@ -796,6 +797,7 @@ begin
     // === GROUP 4: I/O operations ===
     bcPrintString, bcPrintStringLn,
     bcPrintUsing,  // PRINT USING - Src1 = format string
+    bcPrintUsingInt,  // PRINT USING (exact int) - Src1 = format string (Src2 = int value, the bank default)
     bcPrintUsingStage,  // stage a stringified value - Src1 = string
     bcPrintUsingRun,    // runtime PRINT USING - Src1 = format string
     // === GROUP 5: Special variables ===

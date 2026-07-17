@@ -372,7 +372,8 @@ type
     procedure RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
     procedure DeepCopyArrayRecords(Ctx: TExecutionContext; DestArr, SrcArr: Int64; PackedCounts: Int64);  // value-copy array-of-UDT member
     procedure CheckFloatValid(Ctx: TExecutionContext; RegIndex: Integer; const OpName: string);
-    function FormatUsingString(const FormatStr: string; Value: Double): string;
+    function FormatUsingString(const FormatStr: string; Value: Double;
+      IsInt: Boolean = False; IntValue: Int64 = 0): string;
     function FormatUsingRuntime(const FormatStr: string): string;   // walk a runtime format over FPUStage
     // M5.1: per-context accessors for the read-only PC/Running/Stopped/LastError* properties.
     function GetPC: Integer;
@@ -994,7 +995,11 @@ begin
   SetLength(FArrays, 0);
 end;
 
-function TBytecodeVM.FormatUsingString(const FormatStr: string; Value: Double): string;
+function TBytecodeVM.FormatUsingString(const FormatStr: string; Value: Double;
+  IsInt: Boolean = False; IntValue: Int64 = 0): string;
+// When IsInt is set the value is an EXACT 64-bit integer (IntValue), not the Double: a LongInt beyond
+// 2^53 (e.g. Pell's 2469645423824185801) prints every digit instead of the Double-rounded 2469645423824185900.
+// The Double path is kept for genuine floats and for a "#.##" field that asks for fractional digits.
 var
   i, j, TotalWidth, IntDigits, DecDigits, DotPos: Integer;
   HasDollar, FloatDollar, HasCommas, IsNegative: Boolean;
@@ -1051,15 +1056,25 @@ begin
     Inc(i);
   end;
 
-  // Handle sign
-  IsNegative := Value < 0;
-  AbsValue := Abs(Value);
-
   // Round the WHOLE value to DecDigits decimals, then split into integer and fractional parts. Rounding
   // Frac() and Trunc() separately dropped the carry when the fractional part rounded up to all zeros:
   // 11.9999999 gave Frac->"1.000000" (stripped to "000000") + Trunc 11 = "11.000000" instead of
   // "12.000000". Formatting the whole value first carries into the integer part correctly.
-  RoundedStr := Format('%.*f', [DecDigits, AbsValue]);   // '.' separator (as the split below assumes)
+  if IsInt then
+  begin
+    // Exact integer: IntToStr keeps every digit (Int64.Min handled -- take the sign off the string rather
+    // than Abs(), which would overflow). A "#.##" field still gets zero fractional digits appended.
+    RoundedStr := IntToStr(IntValue);
+    IsNegative := (RoundedStr <> '') and (RoundedStr[1] = '-');
+    if IsNegative then Delete(RoundedStr, 1, 1);
+    if DecDigits > 0 then RoundedStr := RoundedStr + '.' + StringOfChar('0', DecDigits);
+  end
+  else
+  begin
+    IsNegative := Value < 0;
+    AbsValue := Abs(Value);
+    RoundedStr := Format('%.*f', [DecDigits, AbsValue]);   // '.' separator (as the split below assumes)
+  end;
   DotPos := Pos('.', RoundedStr);
   if DotPos > 0 then
   begin
@@ -4764,11 +4779,15 @@ begin
         // PRINT USING format$; value
         // Src1 = format string register, Src2 = value register
         if Assigned(FOutputDevice) then
-        begin
-          // Apply format string to value
-          // This is a simplified implementation - full PRINT USING is more complex
+          // Src2 is a FLOAT value here; the exact-integer form is bcPrintUsingInt (below).
           FOutputDevice.Print(FormatUsingString(Ctx.StringRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2]));
-        end;
+      end;
+    bcPrintUsingInt:
+      // PRINT USING with an EXACT integer value: Src1 = format string, Src2 = int value. A LongInt beyond
+      // 2^53 keeps every digit instead of being rounded through a Double (Pell's 2469645423824185801).
+      begin
+        if Assigned(FOutputDevice) then
+          FOutputDevice.Print(FormatUsingString(Ctx.StringRegs[Instr.Src1], 0.0, True, Ctx.IntRegs[Instr.Src2]));
       end;
     bcPrintUsingStage:
       // Stage one already-stringified value for a runtime-format PRINT USING (Src1 = string register).

@@ -306,6 +306,7 @@ const
   bcShl              = bcGroupCore + 131;  // SHL: shift left
   bcShr              = bcGroupCore + 132;  // SHR: arithmetic (sign-propagating) shift right
   bcShrUInt          = bcGroupCore + 153;  // SHR on an unsigned operand: logical (zero-filling) shift right
+  bcPrintUsingInt    = bcGroupCore + 154;  // PRINT USING with an EXACT integer value (Src1=format string, Src2=int value)
   bcRandomize        = bcGroupCore + 134;  // RANDOMIZE: seed the RNG (Src1=seed reg; Immediate=1 seed / 0 time-based)
   // Mutexes (M5.4, FreeBASIC API), thin wrappers over TRTLCriticalSection. bcMutexCreate writes a
   // fresh mutex handle into an int register (Dest); Lock/Unlock/Destroy take a handle reg (Src1).
@@ -1631,6 +1632,7 @@ begin
         142: Result := 'Shell';
         149: Result := 'PrintUsingStage';
         150: Result := 'PrintUsingRun';
+        154: Result := 'PrintUsingInt';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

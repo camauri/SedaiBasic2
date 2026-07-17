@@ -349,7 +349,7 @@ begin
     // survive even when its result is unused.
     ssaWInputChars, ssaInputChars,
     ssaGet, ssaGetkey,  // GET/GETKEY wait for input - side effects!
-    ssaPrintUsing, ssaPrintUsingStage, ssaPrintUsingRun, ssaPudef:
+    ssaPrintUsing, ssaPrintUsingInt, ssaPrintUsingStage, ssaPrintUsingRun, ssaPudef:
       Result := True;
 
     // DATA/READ/RESTORE - always live (affects DATA pool state)

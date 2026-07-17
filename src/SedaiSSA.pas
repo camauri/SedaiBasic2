@@ -12609,11 +12609,16 @@ var
     EmitInstruction(ssaPrintString, NoneV, LeftReg, NoneV, NoneV);
   end;
 
-  procedure EmitNumField(const FieldFmt: string; const ValReg: TSSAValue);
+  procedure EmitNumField(const FieldFmt: string; const ValReg: TSSAValue; IsInt: Boolean);
   begin
     FmtReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
     EmitInstruction(ssaLoadConstString, FmtReg, MakeSSAConstString(FieldFmt), NoneV, NoneV);
-    EmitInstruction(ssaPrintUsing, NoneV, FmtReg, ValReg, NoneV);
+    // An exact-integer value goes to ssaPrintUsingInt (Src2 read from the int bank), so a LongInt beyond
+    // 2^53 keeps every digit instead of being rounded through a Double; a float value keeps ssaPrintUsing.
+    if IsInt then
+      EmitInstruction(ssaPrintUsingInt, NoneV, FmtReg, ValReg, NoneV)
+    else
+      EmitInstruction(ssaPrintUsing, NoneV, FmtReg, ValReg, NoneV);
   end;
 
 begin
@@ -12697,8 +12702,16 @@ begin
         fi := i;
         if vi < nVals then
         begin
-          ProcessExpression(ValNodes[vi], ValueVal); Inc(vi);
-          EmitNumField(FieldStr, EnsureFloatRegister(ValueVal));
+          ProcessExpression(ValNodes[vi], ValueVal);
+          // An integer value in a field with no fractional part ("#####") is formatted from its exact
+          // Int64, not a Double -- otherwise a LongInt beyond 2^53 loses its low digits (Pell's equation:
+          // 2469645423824185801 printed as ...185900). A field that asks for decimals ("#.##") or a genuine
+          // float value keeps the Double path.
+          if (InferExprBank(ValNodes[vi]) = srtInt) and (Pos('.', FieldStr) = 0) then
+            EmitNumField(FieldStr, EnsureIntRegister(ValueVal), True)
+          else
+            EmitNumField(FieldStr, EnsureFloatRegister(ValueVal), False);
+          Inc(vi);
         end;
       end
       else
