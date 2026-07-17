@@ -17998,6 +17998,10 @@ begin
       if (Decl.NodeType = antArrayDecl) and (Decl.Attributes.Values['SHARED'] = '1') and
          (Decl.ChildCount >= 2) and (Decl.GetChild(1).NodeType = antIdentifier) then  // typed scalar only
       begin
+        // A type-punned @-taken scalar is RAW-backed (MarkAddressTaken set RAWMODULE, which runs before
+        // this pass): the raw byte slot is its SOLE storage. Skipping it here avoids a double backing (a
+        // parallel float/int array + M6 slot) that would make @/deref resolve against different storage.
+        if Decl.Attributes.Values['RAWMODULE'] = '1' then Continue;
         VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
         AddSharedVarSlot(VNameU);                       // keep the "is shared" marker (scope resolution)
         // Refinement #2: a SHARED scalar is backed by a 1-element global array, so it lives in the shared
@@ -18425,7 +18429,7 @@ begin
             Decl.Attributes.Values['ADDRLOCAL'] := '1';   // per-frame RAW byte slot (recursion-safe, bit-punnable)
             if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
           end
-          else if (VTypeU <> 'STRING') and (Decl.Attributes.Values['SHARED'] <> '1') and
+          else if (VTypeU <> 'STRING') and
                   ScalarIsTypePunned(VNameU, TypeNameToBank(VTypeU, VNameU)) then
           begin
             // TYPE-PUNNED module-level @-taken scalar (a DIFFERENT-bank pointer takes its @): a RAW byte slot
@@ -18433,7 +18437,10 @@ begin
             // (Rosetta signum reads a Single's IEEE754 bits through an Integer Ptr). A same-bank-only scalar
             // falls through to SHARED below, keeping @/VARPTR/BYREF/pointer-param on the managed model (which
             // is sound across call boundaries — a raw address handed to a managed-deref param would fault).
-            // (An explicit DIM SHARED also stays shared: its cross-thread slot-sync and a raw slot would fight.)
+            // An explicit DIM SHARED is included here too: CollectSharedVars skips a RAWMODULE decl, so the
+            // raw slot is the SOLE backing (no double registration). Its address in the shared "<name>$RA"
+            // array makes it cross-procedure visible, exactly what DIM SHARED needs (a same-bank DIM SHARED
+            // stays array-backed with the M6 slot below).
             Decl.Attributes.Values['RAWMODULE'] := '1';
             if FRawModuleScalars.IndexOfName(VNameU) < 0 then FRawModuleScalars.Add(VNameU + '=' + VTypeU);
             if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
