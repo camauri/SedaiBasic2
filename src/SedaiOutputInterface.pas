@@ -80,6 +80,11 @@ type
     procedure NewLine;
     procedure Clear;
     procedure ResetPrintState;  // Reset reverse mode after PRINT (C128 behavior)
+    // Is there a real, visible screen (a console TTY or a graphics window), or is output a redirected
+    // stream? FreeBASIC's SPC/TAB are cursor MOVEMENTS: on a screen they skip over cells (leaving them
+    // blank), but a redirected stream has no cells, so FB emits nothing there. The MODERN Spc/Tab honour
+    // this; a visible device returns True (emit the spaces), a redirected one False (emit nothing).
+    function IsScreenVisible: Boolean;
 
     // Cursor/position control
     procedure SetCursor(X, Y: Integer);

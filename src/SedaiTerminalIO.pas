@@ -113,6 +113,7 @@ type
     procedure NewLine;
     procedure Clear;
     procedure ResetPrintState;
+    function IsScreenVisible: Boolean;
 
     procedure SetCursor(X, Y: Integer);
     procedure MoveCursor(DeltaX, DeltaY: Integer);
@@ -402,6 +403,13 @@ begin
   {$ELSE}
   Result := IsATTY(StdOutputHandle) <> 0;
   {$ENDIF}
+end;
+
+function TTerminalController.IsScreenVisible: Boolean;
+begin
+  // The headless CLI writes to a real screen only when stdout is a console; a redirected file/pipe has no
+  // visible cells, so MODERN SPC/TAB emit nothing there (matching FreeBASIC). Same signal as Clear uses.
+  Result := StdoutIsTerminal;
 end;
 
 procedure TTerminalController.Clear;

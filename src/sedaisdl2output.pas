@@ -194,6 +194,7 @@ type
     procedure NewLine;
     procedure Clear; virtual;
     procedure ResetPrintState;
+    function IsScreenVisible: Boolean;
 
     // Cursor/position control
     procedure SetCursor(X, Y: Integer);
@@ -1642,6 +1643,11 @@ begin
     // RIMANI sull'ultima riga
     FCursorY := FDesiredRows - 1;
   end;
+end;
+
+function TSDL2OutputDevice.IsScreenVisible: Boolean;
+begin
+  Result := True;   // the SDL2 window is a visible screen
 end;
 
 procedure TSDL2OutputDevice.Clear;

@@ -217,6 +217,7 @@ type
     procedure NewLine;
     procedure Clear;
     procedure ResetPrintState;
+    function IsScreenVisible: Boolean;
     procedure SetCursor(X, Y: Integer);
     procedure MoveCursor(DeltaX, DeltaY: Integer);
     function GetCursorX: Integer;
@@ -736,6 +737,7 @@ type
     procedure NewLine;
     procedure Clear;
     procedure ResetPrintState;
+    function IsScreenVisible: Boolean;
     procedure SetCursor(X, Y: Integer);
     procedure MoveCursor(DeltaX, DeltaY: Integer);
     function GetCursorX: Integer;
@@ -2301,6 +2303,11 @@ begin
     // TODO: Implement scrolling
     FCursorY := FModeInfo.TextRows - 1;
   end;
+end;
+
+function TVideoController.IsScreenVisible: Boolean;
+begin
+  Result := True;   // a modelled/rendered text screen -- SPC/TAB skip over real cells
 end;
 
 procedure TVideoController.Clear;
@@ -5493,6 +5500,11 @@ procedure TConsoleOutputAdapter.NewLine;
 begin
   FTextBuffer.NewLine;
   // Present removed - rendering is handled by the periodic render callback
+end;
+
+function TConsoleOutputAdapter.IsScreenVisible: Boolean;
+begin
+  Result := True;   // wraps the modelled video controller -- a visible screen
 end;
 
 procedure TConsoleOutputAdapter.Clear;

@@ -103,6 +103,7 @@ type
     procedure NewLine;
     procedure Clear;
     procedure ResetPrintState;
+    function IsScreenVisible: Boolean;
 
     procedure SetCursor(X, Y: Integer);
     procedure MoveCursor(DeltaX, DeltaY: Integer);
@@ -533,6 +534,11 @@ end;
 procedure TWebOutput.NewLine;
 begin
   FContent.AppendLine;
+end;
+
+function TWebOutput.IsScreenVisible: Boolean;
+begin
+  Result := True;   // the web canvas is a visible screen
 end;
 
 procedure TWebOutput.Clear;

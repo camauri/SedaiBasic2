@@ -7229,7 +7229,11 @@ begin
         end;
       end;
     8: // bcPrintTab
-      if Assigned(FOutputDevice) then
+      // TAB/SPC are cursor MOVEMENTS. FreeBASIC (MODERN) emits them only onto a visible screen -- to a
+      // redirected stream it writes nothing (there are no cells to skip over). CLASSIC v7 always emits the
+      // spaces. So skip the whole thing in MODERN when the device has no visible screen.
+      if Assigned(FOutputDevice) and
+         ((not (Assigned(FProgram) and FProgram.ModernMode)) or FOutputDevice.IsScreenVisible) then
       begin
         // TAB(n) positions cursor at column n (0-indexed)
         // TAB(0) = first column, TAB(20) = 21st column
@@ -7248,7 +7252,8 @@ begin
         AdvancePrintCol(Ctx, 0);
       end;
     9: // bcPrintSpc
-      if Assigned(FOutputDevice) then
+      if Assigned(FOutputDevice) and
+         ((not (Assigned(FProgram) and FProgram.ModernMode)) or FOutputDevice.IsScreenVisible) then
       begin
         // Src1 = register containing space count (always a register from SSA)
         TabIdx := Ctx.IntRegs[Instr.Src1];
