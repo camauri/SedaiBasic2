@@ -6594,18 +6594,32 @@ begin
         end;
       end;
     {$I ArrayHotOps.inc}
-    9: // bcArrayLBound - LBOUND(arr[, dim]) - Src2 = 0-based dim index (B1.4)
+    9: // bcArrayLBound - LBOUND(arr[, dim]) - Src2 = 0-based dim index (B1.4). Dim 0 (index -1) is the
+       // special FreeBASIC query "how many dimensions": LBOUND(arr, 0) is always 1.
       begin
         ArrayIdx := Instr.Src1;
         LinearIdx := Ctx.IntRegs[Instr.Src2];
-        Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx];
+        if LinearIdx < 0 then
+          Ctx.IntRegs[Instr.Dest] := 1
+        else
+          Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx];
       end;
-    10: // bcArrayUBound - UBOUND(arr[, dim]) - upper = lower + size - 1 (B1.4)
+    10: // bcArrayUBound - UBOUND(arr[, dim]) - upper = lower + size - 1 (B1.4). Dim 0 (index -1) is the
+        // FreeBASIC "number of dimensions" query: the count of ALLOCATED dimensions -- a fixed array's rank,
+        // and 0 for a dynamic array not yet dimensioned (TotalSize 0, which reports UBOUND(arr) = -1).
       begin
         ArrayIdx := Instr.Src1;
         LinearIdx := Ctx.IntRegs[Instr.Src2];
-        Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx]
-                                   + FArrays[ArrayIdx].Dimensions[LinearIdx] - 1;
+        if LinearIdx < 0 then
+        begin
+          if FArrays[ArrayIdx].TotalSize > 0 then
+            Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].DimCount
+          else
+            Ctx.IntRegs[Instr.Dest] := 0;
+        end
+        else
+          Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx]
+                                     + FArrays[ArrayIdx].Dimensions[LinearIdx] - 1;
       end;
     11: // bcArrayErase - ERASE arr (B1.4). Immediate 1 = dynamic array (free -> LBound 0/UBound -1);
         // 0 = static array (keep bounds, zero the elements).
