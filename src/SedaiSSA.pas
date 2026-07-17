@@ -453,6 +453,7 @@ type
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
     function TypeNameWidthCode(const TypeName: string): Integer;        // B1.5 phase 2: type -> narrow code
+    function OperandWidthCode(Node: TASTNode): Integer;                 // narrow width code (1..6) of a scalar operand, else 0 (CSIGN/CUNSG)
     function BinaryElemBytes(const VarName: string): Integer;           // byte width of a scalar for binary PUT/GET (from its width code)
     function BuiltinFuncPtrOpId(const NameU: string): Integer;          // @Sin/@Cos/... math-builtin funcptr op id (0 if not a builtin)
     function MathConstValue(const NameU: string; out V: Double): Boolean;  // crt/math.bi constants (M_PI, M_E, ...)
@@ -3605,9 +3606,10 @@ begin
                 (FuncName = 'CUSHORT') or (FuncName = 'CUINT') or (FuncName = 'CULNG') or
                 (FuncName = kCSIGN) or (FuncName = kCUNSG) then
         begin
-          // CSIGN/CUNSG reinterpret the signedness at the source width without narrowing (full 64-bit
-          // here): CSIGN is a signed pass-through, CUNSG yields an unsigned-64 value (its unsignedness is
-          // recognised by IsUnsigned64Expr, driving unsigned compare/div/mod/print).
+          // CSIGN/CUNSG reinterpret the signedness AT THE OPERAND'S WIDTH (see the ConvW block below):
+          // CUnsg(Short -1) is a UShort 65535, CSign(UShort 65535) is a Short -1. A 64-bit / unknown-width
+          // operand keeps the wide form -- CSIGN a signed pass-through, CUNSG an unsigned-64 value whose
+          // unsignedness IsUnsigned64Expr drives into the unsigned compare/div/mod/print.
           // FreeBASIC integer conversion functions: round-to-nearest (banker's rounding)
           // toward an integer result, then wrap/sign-extend to the type's width (B1.5).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
@@ -3623,6 +3625,23 @@ begin
           else if FuncName = 'CUSHORT' then ConvW := 4
           else if FuncName = 'CLNG' then ConvW := 5
           else if FuncName = 'CULNG' then ConvW := 6
+          else if (FuncName = kCSIGN) or (FuncName = kCUNSG) then
+          begin
+            // CSIGN/CUNSG reinterpret the sign AT THE OPERAND'S WIDTH, keeping its size: CUnsg(Short -1) is a
+            // UShort 65535, CSign(UShort 65535) is a Short -1 -- not the 64-bit forms. Take the operand's
+            // narrow width (1..6) and flip only its signedness: CSIGN forces the signed code (1/3/5), CUNSG
+            // the unsigned code (2/4/6). A full 64-bit / unknown-width operand keeps ConvW=0: CSIGN is then a
+            // signed pass-through and CUNSG stays an unsigned-64 value (its unsignedness handled downstream).
+            if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+              ConvW := OperandWidthCode(ArgListNode.GetChild(0))
+            else
+              ConvW := OperandWidthCode(ArgListNode);
+            if ConvW <> 0 then
+              // Same width, flip signedness: base = the width's signed-1 slot (1/3/5 -> 8/16/32-bit).
+              // CSIGN -> signed code base+1 (1/3/5); CUNSG -> unsigned code base+2 (2/4/6).
+              if FuncName = kCSIGN then ConvW := ((ConvW - 1) div 2) * 2 + 1
+              else ConvW := ((ConvW - 1) div 2) * 2 + 2;
+          end
           else ConvW := 0;
 
           if ArgValue.Kind = svkConstFloat then
@@ -14965,6 +14984,66 @@ begin
   else if (N = 'TANH') then Result := 13
   else if (N = 'INT')  or (N = 'FLOOR') then Result := 14
   else Result := 0;
+end;
+
+function TSSAGenerator.OperandWidthCode(Node: TASTNode): Integer;
+// The narrow-integer width code (1..6: s8/u8/s16/u16/s32/u32, see TypeNameWidthCode) of a scalar operand
+// expression -- a declared narrow variable, a narrow array element, or a narrow UDT field. 0 when the
+// operand is full 64-bit (Integer/LongInt/...) or its width is not known. CSIGN/CUNSG use it to reinterpret
+// the sign AT THE OPERAND'S WIDTH: "CUnsg(Short -1)" is a UShort 65535, not the 64-bit 18446744073709551615.
+var
+  idx, InnerW: Integer;
+  MNode: TASTNode;
+  FN: string;
+begin
+  Result := 0;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  case Node.NodeType of
+    antIdentifier:
+    begin
+      idx := FVarWidthCode.IndexOf(UpperCase(VarToStr(Node.Value)));
+      if idx >= 0 then Result := PtrInt(FVarWidthCode.Objects[idx]);
+    end;
+    antArrayAccess:
+      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antMemberAccess) then
+      begin
+        // obj.field(i): a narrow member-array element carries the field's own width.
+        MNode := Node.GetChild(0);
+        Result := UDTFieldWidthCode(FindUDT(ObjectTypeName(MNode.GetChild(0))), VarToStr(MNode.Value));
+      end
+      else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+      begin
+        idx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value)));
+        if idx >= 0 then Result := PtrInt(FArrayElemWidth.Objects[idx]);
+      end;
+    antMemberAccess:
+      Result := UDTFieldWidthCode(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value));
+    antFunctionCall:
+    begin
+      // A nested fixed-width conversion carries its own result width, so "CSign(CUnsg(x))" round-trips: the
+      // inner CUnsg gives x's width made unsigned, the outer CSign flips it back to signed.
+      FN := UpperCase(VarToStr(Node.Value));
+      if      FN = 'CBYTE'   then Result := 1
+      else if FN = 'CUBYTE'  then Result := 2
+      else if FN = 'CSHORT'  then Result := 3
+      else if FN = 'CUSHORT' then Result := 4
+      else if FN = 'CLNG'    then Result := 5
+      else if FN = 'CULNG'   then Result := 6
+      else if (FN = kCSIGN) or (FN = kCUNSG) then
+      begin
+        InnerW := 0;
+        if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antArgumentList) and
+           (Node.GetChild(0).ChildCount >= 1) then
+          InnerW := OperandWidthCode(Node.GetChild(0).GetChild(0));
+        if InnerW <> 0 then
+          if FN = kCSIGN then Result := ((InnerW - 1) div 2) * 2 + 1
+          else Result := ((InnerW - 1) div 2) * 2 + 2;
+      end;
+    end;
+  end;
+  // SINGLE (code 7) is not an integer width -- CSIGN/CUNSG do not apply to it.
+  if (Result < 1) or (Result > 6) then Result := 0;
 end;
 
 function TSSAGenerator.BinaryElemBytes(const VarName: string): Integer;
