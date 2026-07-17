@@ -219,6 +219,8 @@ type
                                          // whose LEN/MID/LEFT/RIGHT count/index by Unicode codepoint (not byte). Assignment/
                                          // concat/copy/PRINT are unchanged (UTF-8 in, UTF-8 out); only width-aware ops differ.
     FAddrTakenScalars: TStringList;      // program-wide @-taken builtin SCALARS (local DIMs + params): name (UPPER) -> type. Raw-backed for bit-exact @/deref (type-punning). Used by CollectRawPtrVars (persistent, unlike per-proc FAddrLocalVars).
+    FRawModuleScalars: TStringList;      // MODULE-level @-taken builtin scalars: name (UPPER) -> type. Raw byte slot whose address lives in a shared int array "<name>$RA" (cross-proc visible), so @/deref are bit-exact like the local case.
+    FScalarPtrBanks: TStringList;        // name (UPPER) -> distinct bank chars of pointers taking its @ (I/F/$). A module scalar is raw-backed (RAWMODULE) ONLY if a DIFFERENT-bank pointer takes its @ (genuine type-punning); a same-bank-only scalar stays SHARED/managed so @/varptr/byref/pointer-param keep working across call boundaries.
     FAddrLocalVars: TStringList;         // @-taken LOCALS (in a SUB/FUNCTION): name (UPPER) -> type name. Backed by
                                          // a per-frame 1-field record (handle in hidden "<name>$REC"), so the address
                                          // is distinct per recursion level (a module-level @-taken var stays SHARED-backed).
@@ -381,6 +383,8 @@ type
     procedure GatherByrefRetFuncNames(Node: TASTNode; Names: TStringList);   // byref-ret funcs with a BYREF param
     procedure MarkByrefRetCallArgs(Node: TASTNode; Names, Dict: TStringList); // mark their call args address-taken
     procedure CollectDimVarBanks(Node: TASTNode; Dict: TStringList);
+    procedure CollectScalarPtrBanks(Node: TASTNode);                            // record, per @-taken scalar, the banks of pointers taking its @ (drives RAWMODULE vs SHARED)
+    function ScalarIsTypePunned(const VNameU: string; Bank: TSSARegisterType): Boolean;  // a DIFFERENT-bank pointer takes @scalar
     procedure MarkAddressTaken(Node: TASTNode; Dict: TStringList; InProc: Boolean = False);
     function PointeeBankOf(const PtrName: string): TSSARegisterType;            // bank of *p from p's declared pointee
     function ManagedPtrPointee(const Name: string): string;                     // pointee type of a managed pointer (per-proc param or DIM'd), else ''
@@ -419,6 +423,10 @@ type
     function AddrLocalType(const Name: string): string;                         // declared type of an @-taken local/param
     function IsRawAddrLocal(const Name: string): Boolean;                       // @-taken NON-string scalar local/param -> raw byte slot
     procedure EmitRawAddrScalarAlloc(const Name: string);                       // allocate its per-frame 8-byte raw slot into the hidden handle
+    function IsRawModuleScalar(const Name: string): Boolean;                    // MODULE-level @-taken non-string scalar (raw byte slot, address in a shared int array)
+    function RawModuleScalarType(const Name: string): string;                   // its declared type
+    function RawModuleAddrArrayId(const Name: string): Integer;                 // shared int array "<name>$RA" holding the raw block address (declares on first use)
+    function RawModuleAddrReg(const Name: string): TSSAValue;                   // load the raw block address from that shared array
     function UDTFieldPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT of a "T PTR" field, else ''
     function UDTFieldRawPtrPointee(UDTIdx: Integer; const FieldName: string): string; // scalar pointee of a "<scalar> PTR" field, else ''
     function MemberRawPtrPointee(Node: TASTNode): string;                          // "obj.field" raw scalar pointer -> pointee type, else ''
@@ -810,6 +818,10 @@ begin
   FPointerVars := TStringList.Create;
   FAddrTakenScalars := TStringList.Create;
   FAddrTakenScalars.CaseSensitive := False;
+  FRawModuleScalars := TStringList.Create;
+  FRawModuleScalars.CaseSensitive := False;
+  FScalarPtrBanks := TStringList.Create;
+  FScalarPtrBanks.CaseSensitive := False;
   FAddrLocalVars := TStringList.Create;
   FRefVars := TStringList.Create;
   FRawPtrVars := TStringList.Create;
@@ -883,6 +895,8 @@ begin
   FVarEnumType.Free;
   FPointerVars.Free;
   FAddrTakenScalars.Free;
+  FRawModuleScalars.Free;
+  FScalarPtrBanks.Free;
   FAddrLocalVars.Free;
   FRefVars.Free;
   FRawPtrVars.Free;
@@ -1464,6 +1478,10 @@ begin
         // and that IS the pointer. Reading/writing through it uses raw load/store at the pointer's declared
         // pointee width, so a Single's bytes can be read as an Integer (type-punning).
         Result := EnsureIntRegister(AddrLocalHandle(VarToStr(Node.Value)))
+      else if IsRawModuleScalar(VarToStr(Node.Value)) then
+        // @module-scalar: the raw slot's byte address lives in the shared "<name>$RA" array; load it -- that
+        // is the pointer, bit-punnable like the local case.
+        Result := RawModuleAddrReg(VarToStr(Node.Value))
       else if IsAddrLocal(VarToStr(Node.Value)) then
       begin
         // @local STRING: a record-field pointer into this frame's backing record (slot 0) — distinct per call.
@@ -1818,6 +1836,17 @@ begin
           end
         else   // STRING keeps the managed record handle
           EmitInstruction(ssaRecordLoadString, Result, AddrLocalHandle(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(0));
+      end
+      // Module-level @-taken scalar: read the declared-width value from its raw slot (address in the shared
+      // "<name>$RA" array). Bit-exact, so a type-punning read through @x sees the same bytes.
+      else if IsRawModuleScalar(VarName) then
+      begin
+        FuncRetType := TypeNameToBank(RawModuleScalarType(VarName), VarName);
+        Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
+        if FuncRetType = srtFloat then
+          EmitInstruction(ssaRawLoadFloat, Result, RawModuleAddrReg(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))))
+        else
+          EmitInstruction(ssaRawLoadInt, Result, RawModuleAddrReg(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))));
       end
       // Refinement #2: a SHARED scalar is backed by a 1-element global array — read element 0 (a live,
       // cross-thread load), not a per-thread register.
@@ -5912,6 +5941,23 @@ begin
     Exit;
   end;
 
+  // Module-level @-taken scalar: store the declared-width value into its raw slot (address in "<name>$RA").
+  if IsRawModuleScalar(VarName) then
+  begin
+    ProcessExpression(ExprNode, ExprValue);
+    if TypeNameToBank(RawModuleScalarType(VarName), VarName) = srtFloat then
+    begin
+      ExprValue := EnsureFloatRegister(ExprValue);
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), RawModuleAddrReg(VarName), ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))));
+    end
+    else
+    begin
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), RawModuleAddrReg(VarName), ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))));
+    end;
+    Exit;
+  end;
+
   // FUNCTION result (M2): "fname = expr" inside a FUNCTION body sets the return value.
   // Also accepts the unqualified method name inside a FUNCTION method (M4.1): for a method
   // PT.SUM, "SUM = expr" works (the qualified "PT.SUM = expr" would parse as member access).
@@ -6837,6 +6883,35 @@ begin
         else
           EmitRawAddrScalarAlloc(UpperCase(ArrName));
         // "DIM v AS T = expr": store the initializer through the record (slot 0), reusing ProcessAssignment.
+        if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
+        begin
+          InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
+          InitAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(ArrName), ArrayDeclNode.GetChild(0).Token));
+          InitAssign.AddChild(ArrayDeclNode.GetChild(2).Clone);
+          ProcessAssignment(InitAssign);
+          InitAssign.Free;
+        end;
+        Continue;
+      end;
+      // Module-level @-taken scalar: allocate an 8-byte raw byte-heap slot and stash its address in the
+      // shared "<name>$RA" int array (element 0), so @/deref reach the exact bytes and every procedure can
+      // find the slot. reads/writes/@ of the name route through that address (raw load/store at the declared
+      // width) -- the type-punnable model, mirroring the local case but with a shared (cross-proc) address.
+      if ArrayDeclNode.Attributes.Values['RAWMODULE'] = '1' then
+      begin
+        ArrayIdx := RawModuleAddrArrayId(UpperCase(ArrName));
+        EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), MakeSSAArrayRef(ArrayIdx, srtInt),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // 8-byte raw block address into RecHandleVal ...
+        UbReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, UbReg, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaRawAlloc, RecHandleVal, UbReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // ... stored into "<name>$RA"[0] (ssaArrayStore takes value first, then array ref, then index).
+        UbReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, UbReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitInstruction(ssaArrayStore, RecHandleVal, MakeSSAArrayRef(ArrayIdx, srtInt), UbReg, MakeSSAValue(svkNone));
+        // "DIM v AS T = expr": write the initializer through the raw slot (ProcessAssignment routes it there).
         if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
         begin
           InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
@@ -18238,6 +18313,89 @@ begin
     CollectDimVarBanks(Node.GetChild(i), Dict);
 end;
 
+procedure TSSAGenerator.CollectScalarPtrBanks(Node: TASTNode);
+// Pass 1.5 (after CollectDimVarBanks, so FPointerVars is populated): for every "<ptr> = @x" / "<ptr> =
+// VARPTR(x)" / "DIM <ptr> AS T PTR = @x", record x -> the pointer's pointee bank. MarkAddressTaken then
+// backs a module scalar with a RAW byte slot ONLY when a DIFFERENT-bank pointer takes its @ (genuine
+// type-punning, e.g. Rosetta signum's "Integer Ptr = @single"); a same-bank-only scalar stays SHARED so
+// @/VARPTR/BYREF/pointer-param keep flowing through the managed model (sound across call boundaries).
+var
+  i: Integer;
+
+  procedure AddBank(const ScalarU, PointeeType: string);
+  var
+    c: string;
+    ch: Char;
+  begin
+    if (ScalarU = '') or (PointeeType = '') then Exit;
+    ch := BankToChar(TypeNameToBank(PointeeType, ''));
+    c := FScalarPtrBanks.Values[ScalarU];
+    if Pos(ch, c) = 0 then FScalarPtrBanks.Values[ScalarU] := c + ch;
+  end;
+
+  // The scalar name behind "@x" (bare address-of, no child subtree) or "VARPTR(x)"; '' otherwise.
+  function AddrOfScalarName(N: TASTNode): string;
+  begin
+    Result := '';
+    if N = nil then Exit;
+    if (N.NodeType = antProcAddress) and (N.ChildCount = 0) then
+      Result := UpperCase(VarToStr(N.Value))
+    else if (N.NodeType = antArrayAccess) and (N.ChildCount >= 2) and
+            (N.GetChild(0).NodeType = antIdentifier) and
+            ((UpperCase(VarToStr(N.GetChild(0).Value)) = kVARPTR) or
+             (UpperCase(VarToStr(N.GetChild(0).Value)) = kPOINTER)) and
+            (N.GetChild(1).ChildCount >= 1) and (N.GetChild(1).GetChild(0).NodeType = antIdentifier) then
+      Result := UpperCase(VarToStr(N.GetChild(1).GetChild(0).Value));
+  end;
+
+var
+  PtrU, PointeeT, TypeNameU: string;
+  Decl: TASTNode;
+begin
+  if Node = nil then Exit;
+  // "<ptr> = @x" / "<ptr> = VARPTR(x)": the pointer's pointee bank comes from FPointerVars.
+  if (Node.NodeType = antAssignment) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) then
+  begin
+    PtrU := UpperCase(VarToStr(Node.GetChild(0).Value));
+    if FPointerVars.IndexOfName(PtrU) >= 0 then
+      AddBank(AddrOfScalarName(Node.GetChild(1)), FPointerVars.Values[PtrU]);
+  end;
+  // "DIM <ptr> AS T PTR = @x": pointee is T (child1 = "T PTR"), initializer is child2.
+  if Node.NodeType = antDim then
+    for i := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(i);
+      if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 3) and
+         (Decl.GetChild(1).NodeType = antIdentifier) then
+      begin
+        TypeNameU := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        if (Length(TypeNameU) >= 4) and (Copy(TypeNameU, Length(TypeNameU) - 3, 4) = ' PTR') then
+        begin
+          PointeeT := Trim(Copy(TypeNameU, 1, Length(TypeNameU) - 4));
+          AddBank(AddrOfScalarName(Decl.GetChild(2)), PointeeT);
+        end;
+      end;
+    end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectScalarPtrBanks(Node.GetChild(i));
+end;
+
+function TSSAGenerator.ScalarIsTypePunned(const VNameU: string; Bank: TSSARegisterType): Boolean;
+// True if some pointer of a bank OTHER than the scalar's own takes its @ (recorded by CollectScalarPtrBanks).
+var
+  banks: string;
+  own: Char;
+  j: Integer;
+begin
+  Result := False;
+  banks := FScalarPtrBanks.Values[VNameU];
+  if banks = '' then Exit;
+  own := BankToChar(Bank);
+  for j := 1 to Length(banks) do
+    if banks[j] <> own then Exit(True);
+end;
+
 procedure TSSAGenerator.MarkAddressTaken(Node: TASTNode; Dict: TStringList; InProc: Boolean);
 // Pass 2: route each typed-scalar DIM whose variable is @-taken. A MODULE-level var is marked SHARED
 // (CollectSharedVars backs it with a 1-element global array — one stable cell, correct lifetime). A var
@@ -18267,8 +18425,21 @@ begin
             Decl.Attributes.Values['ADDRLOCAL'] := '1';   // per-frame RAW byte slot (recursion-safe, bit-punnable)
             if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
           end
+          else if (VTypeU <> 'STRING') and (Decl.Attributes.Values['SHARED'] <> '1') and
+                  ScalarIsTypePunned(VNameU, TypeNameToBank(VTypeU, VNameU)) then
+          begin
+            // TYPE-PUNNED module-level @-taken scalar (a DIFFERENT-bank pointer takes its @): a RAW byte slot
+            // whose address lives in a shared int array, so @/deref are bit-exact just like the local case
+            // (Rosetta signum reads a Single's IEEE754 bits through an Integer Ptr). A same-bank-only scalar
+            // falls through to SHARED below, keeping @/VARPTR/BYREF/pointer-param on the managed model (which
+            // is sound across call boundaries — a raw address handed to a managed-deref param would fault).
+            // (An explicit DIM SHARED also stays shared: its cross-thread slot-sync and a raw slot would fight.)
+            Decl.Attributes.Values['RAWMODULE'] := '1';
+            if FRawModuleScalars.IndexOfName(VNameU) < 0 then FRawModuleScalars.Add(VNameU + '=' + VTypeU);
+            if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
+          end
           else
-            Decl.Attributes.Values['SHARED'] := '1';      // module: one shared 1-element global array
+            Decl.Attributes.Values['SHARED'] := '1';      // module STRING / DIM SHARED / same-bank @: shared array
         end;
       end;
     end;
@@ -18365,6 +18536,7 @@ begin
   ByrefRetNames := TStringList.Create;
   try
     CollectDimVarBanks(Node, Dict);   // collect @-taken names + pointee types
+    CollectScalarPtrBanks(Node);      // per @-taken scalar, the banks of pointers taking its @ (RAWMODULE gate)
     GatherByrefRetFuncNames(Node, ByrefRetNames);
     if ByrefRetNames.Count > 0 then
       MarkByrefRetCallArgs(Node, ByrefRetNames, Dict);   // back the args of byref-return calls
@@ -19209,6 +19381,50 @@ begin
   CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaLoadConstInt, CountReg, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   EmitInstruction(ssaRawAlloc, AddrLocalHandle(UpperCase(Name)), CountReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.IsRawModuleScalar(const Name: string): Boolean;
+// A MODULE-level @-taken builtin scalar (not STRING): backed by a raw byte slot whose address is kept in
+// a SHARED int array, so its @/deref are bit-exact (type-punnable) and visible in every procedure. Never
+// matched for a name shadowed by a local/param (those resolve first), like IsSharedScalar.
+begin
+  Result := (FRawModuleScalars.IndexOfName(UpperCase(Name)) >= 0) and not SharedScalarShadowed(Name);
+end;
+
+function TSSAGenerator.RawModuleScalarType(const Name: string): string;
+var
+  idx: Integer;
+begin
+  Result := 'INTEGER';
+  idx := FRawModuleScalars.IndexOfName(UpperCase(Name));
+  if idx >= 0 then Result := UpperCase(FRawModuleScalars.ValueFromIndex[idx]);
+end;
+
+function TSSAGenerator.RawModuleAddrArrayId(const Name: string): Integer;
+// The shared 1-element INT array "<name>$RA" that holds this module scalar's raw-block address. Declared
+// on first use and registered as a shared scalar so it is cross-procedure visible (like any DIM SHARED).
+var
+  AName: string;
+  idx: Integer;
+begin
+  AName := UpperCase(Name) + '$RA';
+  idx := FSharedScalarArr.IndexOf(AName);
+  if idx >= 0 then Exit(PtrInt(FSharedScalarArr.Objects[idx]));
+  Result := FProgram.DeclareArray(AName, srtInt, [1]);
+  FSharedScalarArr.AddObject(AName, TObject(PtrInt(Result)));
+end;
+
+function TSSAGenerator.RawModuleAddrReg(const Name: string): TSSAValue;
+// Read the raw-block address out of the shared "<name>$RA" array (element 0) into an int register.
+var
+  ArrId: Integer;
+  IdxReg: TSSAValue;
+begin
+  ArrId := RawModuleAddrArrayId(Name);
+  IdxReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, IdxReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaArrayLoad, Result, MakeSSAArrayRef(ArrId, srtInt), IdxReg, MakeSSAValue(svkNone));
 end;
 
 function TSSAGenerator.PointerUDTType(const PtrName: string): string;
@@ -22443,6 +22659,9 @@ begin
   FSharedVars.Clear;
   FSharedScalarArr.Clear;
   FPointerVars.Clear;
+  FScalarPtrBanks.Clear;
+  FAddrTakenScalars.Clear;
+  FRawModuleScalars.Clear;
   FAddrLocalVars.Clear;
   FRawPtrVars.Clear;
   FWStringVars.Clear;
