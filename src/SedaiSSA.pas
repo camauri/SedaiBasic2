@@ -7394,11 +7394,15 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessErase(Node: TASTNode);
-// ERASE arr [, arr ...] (B1.4): reset each named array's elements to default.
+// ERASE arr [, arr ...] (B1.4). FreeBASIC erases the two array kinds differently: a STATIC (fixed-size)
+// array keeps its bounds and only resets its elements to zero/""; a DYNAMIC array (declared "()" or any
+// REDIM target) is FREED -- its storage goes away and it reports LBound 0 / UBound -1 until re-DIMmed.
+// The Immediate flag (1 = dynamic/deallocate, 0 = static/zero) tells the VM which.
 var
   j, ArrayIdx: Integer;
   ArrName: string;
   Child: TASTNode;
+  DynFlag: Int64;
 begin
   for j := 0 to Node.ChildCount - 1 do
   begin
@@ -7408,9 +7412,10 @@ begin
     ArrayIdx := ArrayIndexOf(ArrName);
     if ArrayIdx < 0 then
       raise Exception.CreateFmt('ERASE: array not declared: %s', [ArrName]);
+    if FDynamicArrays.IndexOf(ArrName) >= 0 then DynFlag := 1 else DynFlag := 0;
     EmitInstruction(ssaArrayErase, MakeSSAValue(svkNone),
                     MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType),
-                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                    MakeSSAValue(svkNone), MakeSSAConstInt(DynFlag));
   end;
 end;
 

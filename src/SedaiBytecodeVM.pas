@@ -269,7 +269,7 @@ type
     // CLASSIC (Commodore ?BAD SUBSCRIPT) or an explicit --bounds-check raises; MODERN (FreeBASIC, which
     // does not bounds-check) returns False so the caller yields a default on read / skips the write.
     function ArrayBoundsOK(ArrayIdx, LinearIdx: Integer): Boolean; inline;
-    procedure EraseArray(ArrayIdx: Integer);                                   // B1.4: ERASE
+    procedure EraseArray(ArrayIdx: Integer; Deallocate: Boolean = False);      // B1.4: ERASE (deallocate = dynamic array)
     procedure RedimArray(ArrayIdx, NewUpper: Integer; Preserve: Boolean; HasNewLower: Boolean = False; NewLower: Integer = 0);  // B1.4: REDIM (1-D)
     procedure RedimArrayN(ArrayIdx: Integer; const Uppers: array of Integer; Preserve: Boolean; const Lowers: array of Integer); // REDIM multi-dim
 
@@ -6331,11 +6331,27 @@ end;
 
 // ERASE arr (B1.4): reset every element of an existing array to its default
 // (0 / 0.0 / ""), keeping the current dimensions.
-procedure TBytecodeVM.EraseArray(ArrayIdx: Integer);
+procedure TBytecodeVM.EraseArray(ArrayIdx: Integer; Deallocate: Boolean = False);
+// ERASE. A STATIC array (Deallocate=False) keeps its bounds and only zeroes its elements. A DYNAMIC array
+// (Deallocate=True) is FREED: its storage is released and EVERY dimension reports LBound 0 / UBound -1
+// until a later REDIM grows it again -- exactly as FreeBASIC does (the dimension COUNT is kept, so
+// "UBound(a, 2)" of a freed 2-D array still answers -1, not a stale bound).
 var
-  k: Integer;
+  k, d: Integer;
 begin
   if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then Exit;
+  if Deallocate then
+  begin
+    SetLength(FArrays[ArrayIdx].IntData, 0);
+    SetLength(FArrays[ArrayIdx].FloatData, 0);
+    SetLength(FArrays[ArrayIdx].StringData, 0);
+    for d := 0 to High(FArrays[ArrayIdx].Dimensions) do
+      FArrays[ArrayIdx].Dimensions[d] := 0;        // UBound(d) = LowerBound(d) + 0 - 1 = -1
+    for d := 0 to High(FArrays[ArrayIdx].LowerBounds) do
+      FArrays[ArrayIdx].LowerBounds[d] := 0;       // LBound(d) = 0
+    FArrays[ArrayIdx].TotalSize := 0;
+    Exit;
+  end;
   case FArrays[ArrayIdx].ElementType of
     0: for k := 0 to High(FArrays[ArrayIdx].IntData) do FArrays[ArrayIdx].IntData[k] := 0;
     1: for k := 0 to High(FArrays[ArrayIdx].FloatData) do FArrays[ArrayIdx].FloatData[k] := 0.0;
@@ -6591,8 +6607,9 @@ begin
         Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx]
                                    + FArrays[ArrayIdx].Dimensions[LinearIdx] - 1;
       end;
-    11: // bcArrayErase - ERASE arr - reset all elements to default, keep size (B1.4)
-      EraseArray(Instr.Src1);
+    11: // bcArrayErase - ERASE arr (B1.4). Immediate 1 = dynamic array (free -> LBound 0/UBound -1);
+        // 0 = static array (keep bounds, zero the elements).
+      EraseArray(Instr.Src1, Instr.Immediate <> 0);
     12: // bcArrayRedim - REDIM [PRESERVE] arr([lb TO] ub) (B1.4); Src2=ub reg. Immediate: bit0=preserve,
         // bit1=has explicit lower bound, bits8+ = that (non-negative) lower bound. A RUNTIME lower bound
         // arrives via a preceding bcArrayRedimPush (LB flag) in FRedimPendingLBs and takes precedence.
