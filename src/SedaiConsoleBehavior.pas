@@ -283,8 +283,18 @@ begin
   S := Trim(S);
   Neg := (S <> '') and (S[1] = '-');
   if (S <> '') and (S[1] in ['+', '-']) then Delete(S, 1, 1);
+  // Negative zero: Str(-0.0) drops the sign, but FreeBASIC prints "-0" (the IEEE-754 sign bit is set).
+  // Take the sign from the raw bits so a type-punned -0.0 (Rosetta signum) shows its minus.
+  if (not Neg) and (PInt64(@Value)^ < 0) then Neg := True;
   EPos := Pos('E', S);
-  if EPos = 0 then Exit(FloatToStr(Value));      // not the expected shape: leave it alone
+  if EPos = 0 then
+  begin
+    // Not the expected E-notation shape (e.g. 0.0): leave the digits to FloatToStr, but restore a negative
+    // zero's minus, which FloatToStr(-0.0) drops.
+    S := FloatToStr(Value);
+    if Neg and (S <> '') and (S[1] <> '-') then S := '-' + S;
+    Exit(S);
+  end;
   Ex := StrToIntDef(Copy(S, EPos + 1, Length(S)), 0);
   Digits := StringReplace(Copy(S, 1, EPos - 1), '.', '', [rfReplaceAll]);
   if Digits = '' then Exit('0');
@@ -329,6 +339,8 @@ begin
       while (S <> '') and (S[Length(S)] = '0') do SetLength(S, Length(S) - 1);
       if (S <> '') and (S[Length(S)] = '.') then SetLength(S, Length(S) - 1);
     end;
+    // Restore a negative zero's minus (Str(-0.0:0:n) drops it): FreeBASIC prints "-0".
+    if Neg and (S <> '') and (S[1] <> '-') then S := '-' + S;
     Exit(S);
   end;
 
@@ -489,8 +501,10 @@ begin
   IsInfV := ((Bits shr 52) and $7FF = $7FF) and ((Bits and $000FFFFFFFFFFFFF) =  0);
   if IsNanV then
     NonNeg := Bits >= 0            // sign bit (bit 63); a NaN cannot be ordered-compared safely
+  else if FNumberFormat = nfFreeBASIC then
+    NonNeg := Bits >= 0           // FreeBASIC: negative zero prints "-0" (sign bit, not the ordered compare)
   else
-    NonNeg := Value >= 0;         // ordered comparison is safe for finite values and +/-Inf
+    NonNeg := Value >= 0;         // CLASSIC: ordered comparison (v7 has no "-0"); safe for finite and +/-Inf
 
   case FNumberFormat of
     nfCommodore, nfMSX:
@@ -583,6 +597,9 @@ begin
   else
     NumStr := FloatToStr(Value);
 
+  // Negative zero: its magnitude renders as "0" with no sign, but NonNeg is False (from the sign bit under
+  // nfFreeBASIC), so restore the minus FreeBASIC prints ("-0"). Any ordinary negative already carries it.
+  if (not NonNeg) and (NumStr <> '') and (NumStr[1] <> '-') then NumStr := '-' + NumStr;
   Result := Prefix + NumStr + Suffix;
 end;
 

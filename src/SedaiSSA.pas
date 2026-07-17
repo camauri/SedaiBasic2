@@ -218,6 +218,7 @@ type
     FWStringVars: TStringList;           // FreeBASIC WSTRING vars (UPPER): share the srtString bank but hold UTF-8 bytes
                                          // whose LEN/MID/LEFT/RIGHT count/index by Unicode codepoint (not byte). Assignment/
                                          // concat/copy/PRINT are unchanged (UTF-8 in, UTF-8 out); only width-aware ops differ.
+    FAddrTakenScalars: TStringList;      // program-wide @-taken builtin SCALARS (local DIMs + params): name (UPPER) -> type. Raw-backed for bit-exact @/deref (type-punning). Used by CollectRawPtrVars (persistent, unlike per-proc FAddrLocalVars).
     FAddrLocalVars: TStringList;         // @-taken LOCALS (in a SUB/FUNCTION): name (UPPER) -> type name. Backed by
                                          // a per-frame 1-field record (handle in hidden "<name>$REC"), so the address
                                          // is distinct per recursion level (a module-level @-taken var stays SHARED-backed).
@@ -414,7 +415,10 @@ type
     procedure EmitRawMemOp(const FuncU: string; ArgsNode: TASTNode; out Result: TSSAValue);  // FB_MEMCOPY/FB_MEMMOVE/CLEAR/FB_MEMCOPYCLEAR
     function IsAddrLocal(const Name: string): Boolean;                          // @-taken LOCAL (per-frame record-backed)?
     function AddrLocalBank(const Name: string): TSSARegisterType;               // bank of an @-taken local
-    function AddrLocalHandle(const Name: string): TSSAValue;                    // its per-frame record handle (hidden var)
+    function AddrLocalHandle(const Name: string): TSSAValue;                    // its per-frame record/raw-address handle (hidden var)
+    function AddrLocalType(const Name: string): string;                         // declared type of an @-taken local/param
+    function IsRawAddrLocal(const Name: string): Boolean;                       // @-taken NON-string scalar local/param -> raw byte slot
+    procedure EmitRawAddrScalarAlloc(const Name: string);                       // allocate its per-frame 8-byte raw slot into the hidden handle
     function UDTFieldPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT of a "T PTR" field, else ''
     function UDTFieldRawPtrPointee(UDTIdx: Integer; const FieldName: string): string; // scalar pointee of a "<scalar> PTR" field, else ''
     function MemberRawPtrPointee(Node: TASTNode): string;                          // "obj.field" raw scalar pointer -> pointee type, else ''
@@ -804,6 +808,8 @@ begin
   FVarEnumType := TStringList.Create;
   FVarEnumType.CaseSensitive := False;
   FPointerVars := TStringList.Create;
+  FAddrTakenScalars := TStringList.Create;
+  FAddrTakenScalars.CaseSensitive := False;
   FAddrLocalVars := TStringList.Create;
   FRefVars := TStringList.Create;
   FRawPtrVars := TStringList.Create;
@@ -876,6 +882,7 @@ begin
   FEnumMemberType.Free;
   FVarEnumType.Free;
   FPointerVars.Free;
+  FAddrTakenScalars.Free;
   FAddrLocalVars.Free;
   FRefVars.Free;
   FRawPtrVars.Free;
@@ -1452,9 +1459,14 @@ begin
       else if VarRecordTypeName(VarToStr(Node.Value)) <> '' then
         // @obj where obj is a UDT value variable: its handle IS the pointer (managed-reference model).
         Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.Value))))
+      else if IsRawAddrLocal(VarToStr(Node.Value)) then
+        // @local (raw-backed scalar): the hidden handle already holds the byte-heap address of x's slot,
+        // and that IS the pointer. Reading/writing through it uses raw load/store at the pointer's declared
+        // pointee width, so a Single's bytes can be read as an Integer (type-punning).
+        Result := EnsureIntRegister(AddrLocalHandle(VarToStr(Node.Value)))
       else if IsAddrLocal(VarToStr(Node.Value)) then
       begin
-        // @local: a record-field pointer into this frame's backing record (slot 0) — distinct per call.
+        // @local STRING: a record-field pointer into this frame's backing record (slot 0) — distinct per call.
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaRefAddrField, Result, AddrLocalHandle(VarToStr(Node.Value)),
                         MakeSSAValue(svkNone), MakeSSAConstInt(0));
@@ -1797,12 +1809,15 @@ begin
       begin
         FuncRetType := AddrLocalBank(VarName);
         Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
-        case FuncRetType of
-          srtFloat:  EmitInstruction(ssaRecordLoadFloat, Result, AddrLocalHandle(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(0));
-          srtString: EmitInstruction(ssaRecordLoadString, Result, AddrLocalHandle(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(0));
-        else
-          EmitInstruction(ssaRecordLoadInt, Result, AddrLocalHandle(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(0));
-        end;
+        if IsRawAddrLocal(VarName) then
+          // Raw byte slot: read the declared-width value from the handle's byte address (bit-exact).
+          case FuncRetType of
+            srtFloat: EmitInstruction(ssaRawLoadFloat, Result, EnsureIntRegister(AddrLocalHandle(VarName)), MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))));
+          else
+            EmitInstruction(ssaRawLoadInt, Result, EnsureIntRegister(AddrLocalHandle(VarName)), MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))));
+          end
+        else   // STRING keeps the managed record handle
+          EmitInstruction(ssaRecordLoadString, Result, AddrLocalHandle(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(0));
       end
       // Refinement #2: a SHARED scalar is backed by a 1-element global array — read element 0 (a live,
       // cross-thread load), not a per-thread register.
@@ -5875,12 +5890,24 @@ begin
   if IsAddrLocal(VarName) then
   begin
     ProcessExpression(ExprNode, ExprValue);
-    case AddrLocalBank(VarName) of
-      srtFloat:  begin ExprValue := EnsureFloatRegister(ExprValue);  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), AddrLocalHandle(VarName), ExprValue, MakeSSAConstInt(0)); end;
-      srtString: begin ExprValue := EnsureStringRegister(ExprValue); EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), AddrLocalHandle(VarName), ExprValue, MakeSSAConstInt(0)); end;
-    else
-      ExprValue := EnsureIntRegister(ExprValue);
-      EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), AddrLocalHandle(VarName), ExprValue, MakeSSAConstInt(0));
+    if IsRawAddrLocal(VarName) then
+    begin
+      // Raw byte slot: store the declared-width value at the handle's byte address (matches the raw read/@).
+      if AddrLocalBank(VarName) = srtFloat then
+      begin
+        ExprValue := EnsureFloatRegister(ExprValue);
+        EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(VarName)), ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))));
+      end
+      else
+      begin
+        ExprValue := EnsureIntRegister(ExprValue);
+        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(VarName)), ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))));
+      end;
+    end
+    else   // STRING keeps the managed record handle
+    begin
+      ExprValue := EnsureStringRegister(ExprValue);
+      EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), AddrLocalHandle(VarName), ExprValue, MakeSSAConstInt(0));
     end;
     Exit;
   end;
@@ -6796,15 +6823,19 @@ begin
         // reads/writes/@ route through the record. Type from the AS-type child.
         if FAddrLocalVars.IndexOfName(UpperCase(ArrName)) < 0 then
           FAddrLocalVars.Add(UpperCase(ArrName) + '=' + RecTypeName);
-        RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-        case AddrLocalBank(UpperCase(ArrName)) of
-          srtFloat:  EmitInstruction(ssaRecordNew, RecHandleVal, MakeSSAConstInt(0), MakeSSAConstInt(1), MakeSSAConstInt(0));
-          srtString: EmitInstruction(ssaRecordNew, RecHandleVal, MakeSSAConstInt(0), MakeSSAConstInt(0), MakeSSAConstInt(1));
+        // Back it with an 8-byte RAW byte-heap slot (a fresh block per frame → recursion-safe), and keep the
+        // block's address in the hidden handle. Reads/writes/@ of the name go through this raw address, so
+        // @x is a real byte pointer and a pointer of a DIFFERENT bank can reinterpret x's bytes (type-punning
+        // -- e.g. a Single's IEEE754 bits through an Integer Ptr). The record model kept int/float in
+        // separate stores and could not reinterpret. (String scalars still use a record: no raw string.)
+        if RecTypeName = 'STRING' then
+        begin
+          RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaRecordNew, RecHandleVal, MakeSSAConstInt(0), MakeSSAConstInt(0), MakeSSAConstInt(1));
+          EmitInstruction(ssaCopyInt, AddrLocalHandle(UpperCase(ArrName)), RecHandleVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end
         else
-          EmitInstruction(ssaRecordNew, RecHandleVal, MakeSSAConstInt(1), MakeSSAConstInt(0), MakeSSAConstInt(0));
-        end;
-        EmitInstruction(ssaCopyInt, AddrLocalHandle(UpperCase(ArrName)), RecHandleVal,
-                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          EmitRawAddrScalarAlloc(UpperCase(ArrName));
         // "DIM v AS T = expr": store the initializer through the record (slot 0), reusing ProcessAssignment.
         if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
         begin
@@ -18232,12 +18263,38 @@ begin
         if (Dict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeU) < 0) then
         begin
           if InProc then
-            Decl.Attributes.Values['ADDRLOCAL'] := '1'    // per-frame record-backed (recursion-safe)
+          begin
+            Decl.Attributes.Values['ADDRLOCAL'] := '1';   // per-frame RAW byte slot (recursion-safe, bit-punnable)
+            if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
+          end
           else
             Decl.Attributes.Values['SHARED'] := '1';      // module: one shared 1-element global array
         end;
       end;
     end;
+  // An @-taken PARAMETER (e.g. "@x" of "x As Single"): back it in a per-frame RAW byte slot too, so its
+  // address is real and a pointer of a different bank can reinterpret its bytes (Rosetta signum type-puns a
+  // Single's IEEE754 bits through an Integer Ptr). Params are not DIMs, so mark them here on the list.
+  if Node.NodeType = antProcedureDecl then
+    for k := 0 to Node.ChildCount - 1 do
+      if Node.GetChild(k).NodeType = antParameterList then
+        for i := 0 to Node.GetChild(k).ChildCount - 1 do
+        begin
+          Decl := Node.GetChild(k).GetChild(i);
+          if (Decl.NodeType = antIdentifier) and (Decl.ChildCount >= 1) and
+             (Decl.GetChild(0).NodeType = antIdentifier) then
+          begin
+            VNameU := UpperCase(VarToStr(Decl.Value));
+            VTypeU := UpperCase(VarToStr(Decl.GetChild(0).Value));
+            // Only a @-taken builtin SCALAR param (not a UDT, not a "T PTR", not a STRING -- raw bytes only).
+            if (Dict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeU) < 0) and
+               (Pos(' PTR', VTypeU) = 0) and (VTypeU <> 'STRING') then
+            begin
+              Decl.Attributes.Values['ADDRPARAM'] := '1';
+              if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
+            end;
+          end;
+        end;
   if Node.NodeType = antProcedureDecl then InProc := True;
   for i := 0 to Node.ChildCount - 1 do
     MarkAddressTaken(Node.GetChild(i), Dict, InProc);
@@ -18729,9 +18786,14 @@ var
       TU := UpperCase(VarToStr(Rhs.Value));
       if (Length(TU) >= 4) and (Copy(TU, Length(TU) - 3, 4) = ' PTR') and (Rhs.ChildCount >= 1) then
         if IsAllocCall(Rhs.GetChild(0), FU) or IsScreenPtrExpr(Rhs.GetChild(0)) or
-           ((Rhs.GetChild(0).NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.GetChild(0).Value))) then
+           ((Rhs.GetChild(0).NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.GetChild(0).Value))) or
+           ((Rhs.GetChild(0).NodeType = antProcAddress) and (Rhs.GetChild(0).ChildCount = 0) and
+            (FAddrTakenScalars.IndexOfName(UpperCase(VarToStr(Rhs.GetChild(0).Value))) >= 0)) then
           MarkRaw(TargetU);
     end
+    else if (Rhs.NodeType = antProcAddress) and (Rhs.ChildCount = 0) and
+            (FAddrTakenScalars.IndexOfName(UpperCase(VarToStr(Rhs.Value))) >= 0) then
+      MarkRaw(TargetU)   // p = @x where x is a raw-backed @-taken scalar: a real byte pointer
     else if RawPtrExprName(Rhs) <> '' then
       MarkRaw(TargetU)   // p = q, p = q + n, p = q - n, p = (q): q raw
     else if ((Rhs.NodeType = antArrayAccess) or (Rhs.NodeType = antFunctionCall)) and
@@ -19120,6 +19182,33 @@ begin
   if FVarExplicitType.IndexOf(HName) < 0 then
     FVarExplicitType.AddObject(HName, TObject(PtrInt(Ord(srtInt))));
   Result := GetOrAllocateVariable(HName);
+end;
+
+function TSSAGenerator.AddrLocalType(const Name: string): string;
+var
+  idx: Integer;
+begin
+  Result := 'INTEGER';
+  idx := FAddrLocalVars.IndexOfName(UpperCase(Name));
+  if idx >= 0 then Result := UpperCase(FAddrLocalVars.ValueFromIndex[idx]);
+end;
+
+function TSSAGenerator.IsRawAddrLocal(const Name: string): Boolean;
+// A @-taken local/param scalar backed by a RAW byte slot (every builtin scalar except STRING, which stays
+// a managed handle). Its address is a real byte pointer, so @/deref are bit-exact and type-punnable.
+begin
+  Result := IsAddrLocal(Name) and (AddrLocalType(Name) <> 'STRING');
+end;
+
+procedure TSSAGenerator.EmitRawAddrScalarAlloc(const Name: string);
+// Allocate this @-taken scalar's per-frame 8-byte raw byte-heap slot (enough for any builtin scalar) and
+// store the block's address in the hidden handle. A fresh block per DIM/prologue keeps recursion safe.
+var
+  CountReg: TSSAValue;
+begin
+  CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, CountReg, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EmitInstruction(ssaRawAlloc, AddrLocalHandle(UpperCase(Name)), CountReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
 function TSSAGenerator.PointerUDTType(const PtrName: string): string;
@@ -21355,6 +21444,21 @@ begin
         // different bank (the global name→type map keeps only the first). See ParamDeclaredBank.
         ParamReg := DeclareVariableTyped(VarToStr(ParamNodeJ.Value), RT);
         EmitXferLoad(RT, Slot, ParamReg);
+        // @-taken scalar PARAMETER (ADDRPARAM): give it a per-frame RAW byte slot, seed it with the incoming
+        // value, and route its reads/writes/@ through the raw address -- so "@x" of a Single param is a real
+        // byte pointer and a different-bank pointer can reinterpret its bytes (Rosetta signum). Registered in
+        // FAddrLocalVars (per-proc) so IsAddrLocal/IsRawAddrLocal see it in the body. STRING is excluded
+        // (marked only for non-string scalars); it would keep a managed handle, not raw bytes.
+        if ParamNodeJ.Attributes.Values['ADDRPARAM'] = '1' then
+        begin
+          if FAddrLocalVars.IndexOfName(UpperCase(VarToStr(ParamNodeJ.Value))) < 0 then
+            FAddrLocalVars.Add(UpperCase(VarToStr(ParamNodeJ.Value)) + '=' + UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value)));
+          EmitRawAddrScalarAlloc(UpperCase(VarToStr(ParamNodeJ.Value)));
+          if RT = srtFloat then
+            EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(UpperCase(VarToStr(ParamNodeJ.Value)))), ParamReg, MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(UpperCase(VarToStr(ParamNodeJ.Value))))))
+          else
+            EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(UpperCase(VarToStr(ParamNodeJ.Value)))), ParamReg, MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(UpperCase(VarToStr(ParamNodeJ.Value))))));
+        end;
         // FreeBASIC function-pointer parameter: record its signature so "name(args)" in the body is
         // lowered as an indirect call through the parameter's entry-PC value (int).
         if ParamNodeJ.Attributes.Values['FUNCPTR'] = '1' then
