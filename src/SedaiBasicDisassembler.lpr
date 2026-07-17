@@ -51,7 +51,8 @@ uses
   {$IFDEF WINDOWS}Windows,{$ENDIF}
   SedaiConsoleState,
   Classes, SysUtils, fgl,
-  SedaiBytecodeTypes, SedaiBytecodeSerializer, SedaiSSATypes;
+  SedaiBytecodeTypes, SedaiBytecodeSerializer, SedaiSSATypes,
+  SedaiBytecodeDisassembler;   // shared instruction formatter (single source of truth, shared with sb --disasm)
 
 // Include version information
 {$I Version.inc}
@@ -169,197 +170,6 @@ begin
     Result := IntToStr(Immediate);
 end;
 
-{ Format operands based on instruction opcode }
-function FormatOperands(const Instr: TBytecodeInstruction; Prog: TBytecodeProgram): string;
-var
-  Op: TBytecodeOp;
-begin
-  Result := '';
-
-  // M5.2 threading core opcodes (114-116) — formatted before the >= 100 branch below, which
-  // otherwise misreads any core opcode >= 100 as a superinstruction (a pre-existing sbd quirk).
-  case Instr.OpCode of
-    bcLoadProcAddr: begin Result := Format('R%d = @%d', [Instr.Dest, Instr.Immediate]); Exit; end;
-    bcThreadCreate: begin Result := Format('R%d = thread(@R%d)', [Instr.Dest, Instr.Src1]); Exit; end;
-    bcThreadWait:   begin Result := Format('R%d', [Instr.Src1]); Exit; end;
-    bcThreadSelf:   begin Result := Format('R%d = self', [Instr.Dest]); Exit; end;
-    bcThreadDetach: begin Result := Format('R%d', [Instr.Src1]); Exit; end;
-    bcMutexCreate:  begin Result := Format('R%d = mutex()', [Instr.Dest]); Exit; end;
-    bcMutexLock, bcMutexUnlock, bcMutexDestroy:
-                    begin Result := Format('R%d', [Instr.Src1]); Exit; end;
-    bcCondCreate:   begin Result := Format('R%d = cond()', [Instr.Dest]); Exit; end;
-    bcCondWait:     begin Result := Format('cond=R%d mutex=R%d', [Instr.Src1, Instr.Src2]); Exit; end;
-    bcCondSignal, bcCondBroadcast, bcCondDestroy:
-                    begin Result := Format('R%d', [Instr.Src1]); Exit; end;
-  end;
-
-  // Handle superinstructions (opcodes 100+) separately
-  if Instr.OpCode >= 100 then
-  begin
-    case Instr.OpCode of
-      // Fused compare-and-branch (Int) - opcodes 100-105
-      100..105: Result := Format('R%d, R%d, %d', [Instr.Src1, Instr.Src2, Instr.Immediate]);
-      // Fused compare-and-branch (Float) - opcodes 110-115
-      110..115: Result := Format('R%d, R%d, %d', [Instr.Src1, Instr.Src2, Instr.Immediate]);
-      // Fused arithmetic-to-dest (Int) - opcodes 120-122
-      120..122: Result := Format('R%d, R%d', [Instr.Dest, Instr.Src1]);
-      // Fused arithmetic-to-dest (Float) - opcodes 130-133
-      130..133: Result := Format('R%d, R%d', [Instr.Dest, Instr.Src1]);
-      // Fused constant arithmetic (Int) - opcodes 140-142
-      140..142: Result := Format('R%d, R%d, %d', [Instr.Dest, Instr.Src1, Instr.Immediate]);
-      // Fused constant arithmetic (Float) - opcodes 150-153
-      150..153: Result := Format('R%d, R%d, %f', [Instr.Dest, Instr.Src1, Double(Pointer(@Instr.Immediate)^)]);
-      // Fused compare-zero-and-branch (Int) - opcodes 160-161
-      160, 161: Result := Format('R%d, %d', [Instr.Src1, Instr.Immediate]);
-      // Fused compare-zero-and-branch (Float) - opcodes 170-171
-      170, 171: Result := Format('R%d, %d', [Instr.Src1, Instr.Immediate]);
-      // Fused array-store-constant - opcodes 180-182
-      180: Result := Format('ARR[%d], idx=R%d, %d', [Instr.Src1, Instr.Src2, Instr.Immediate]);
-      181: Result := Format('ARR[%d], idx=R%d, %f', [Instr.Src1, Instr.Src2, Double(Pointer(@Instr.Immediate)^)]);
-      182: Result := Format('ARR[%d], idx=R%d, [%d]', [Instr.Src1, Instr.Src2, Instr.Immediate]);
-      // Fused loop increment-and-branch - opcodes 190-193
-      190..193: Result := Format('R%d, R%d, R%d, %d', [Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-      // FMA - opcodes 200-203
-      200, 201: Result := Format('R%d, R%d, R%d, R%d', [Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-      202, 203: Result := Format('R%d, R%d, R%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
-      // Array Load + Arithmetic - opcodes 210-212
-      210, 211: Result := Format('R%d, ARR[%d], idx=R%d, acc=R%d', [Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-      212: Result := Format('R%d, ARR[%d], idx=R%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
-      // Square-Sum patterns - opcodes 220-221
-      220, 221: Result := Format('R%d, R%d, R%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
-      // Mul-Mul and Add-Sqrt - opcodes 230-231
-      230: Result := Format('R%d, R%d, R%d, R%d', [Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-      231: Result := Format('R%d, R%d, R%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
-      // Array Load + Branch - opcodes 240-241
-      240, 241: Result := Format('ARR[%d], idx=R%d, %d', [Instr.Src1, Instr.Src2, Instr.Immediate]);
-      // Array Swap (Int) - opcode 250
-      250: Result := Format('ARR[%d], idx1=R%d, idx2=R%d', [Instr.Src1, Instr.Src2, Instr.Dest]);
-      // Self-increment/decrement (Int) - opcodes 251-252
-      251, 252: Result := Format('R%d, R%d', [Instr.Dest, Instr.Src1]);
-      // Array Load to register (Int) - opcode 253
-      253: Result := Format('R%d, ARR[%d], idx=R%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
-      // Array Copy/Move Element - opcodes 254-255
-      254: Result := Format('ARR[%d][R%d] = ARR[%d][R%d]', [Instr.Dest, Instr.Src2, Instr.Src1, Instr.Src2]);
-      255: Result := Format('ARR[%d][R%d] = ARR[%d][R%d]', [Instr.Dest, Instr.Src2, Instr.Dest, Instr.Src1]);
-      // Array Reverse Range - opcode 156
-      156: Result := Format('ARR[%d], R%d..R%d', [Instr.Src1, Instr.Src2, Instr.Dest]);
-      // Array Shift Left - opcode 157
-      157: Result := Format('ARR[%d], R%d..R%d', [Instr.Src1, Instr.Src2, Instr.Dest]);
-    else
-      Result := Format('(unknown opcode %d)', [Instr.OpCode]);
-    end;
-    Exit;
-  end;
-
-  Op := TBytecodeOp(Instr.OpCode);
-
-  case Op of
-    bcLoadConstInt:
-      Result := Format('R%d, %d', [Instr.Dest, Instr.Immediate]);
-
-    bcLoadConstFloat:
-      Result := Format('R%d, %f', [Instr.Dest, Double(Pointer(@Instr.Immediate)^)]);
-
-    bcLoadConstString:
-      begin
-        Result := Format('R%d, [%d]', [Instr.Dest, Instr.Immediate]);
-        // Optionally show string value
-        if Assigned(Prog) and Assigned(Prog.StringConstants) and
-           (Instr.Immediate >= 0) and (Instr.Immediate < Prog.StringConstants.Count) then
-          Result := Result + Format(' "%s"', [Prog.StringConstants[Instr.Immediate]]);
-      end;
-
-    bcCopyInt, bcCopyFloat, bcCopyString:
-      Result := Format('R%d, R%d', [Instr.Dest, Instr.Src1]);
-
-    bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt,
-    bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcPowFloat:
-      Result := Format('R%d, R%d, R%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
-
-    bcNegInt, bcNegFloat:
-      Result := Format('R%d, R%d', [Instr.Dest, Instr.Src1]);
-
-    bcIntToFloat, bcFloatToInt:
-      Result := Format('R%d, R%d', [Instr.Dest, Instr.Src1]);
-
-    // Comparison operators
-    bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
-    bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpGtFloat, bcCmpLeFloat, bcCmpGeFloat,
-    bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString:
-      Result := Format('R%d, R%d, R%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
-
-    // Math functions
-    bcMathAbs, bcMathSgn, bcMathInt, bcMathSqr,
-    bcMathSin, bcMathCos, bcMathTan, bcMathExp, bcMathLog:
-      Result := Format('R%d, R%d', [Instr.Dest, Instr.Src1]);
-
-    bcMathRnd:
-      Result := Format('R%d', [Instr.Dest]);
-
-    bcJump, bcCall, bcCallSub:
-      Result := Format('%d', [Instr.Immediate]);
-
-    bcJumpIfZero, bcJumpIfNotZero:
-      Result := Format('R%d, %d', [Instr.Src1, Instr.Immediate]);
-
-    bcXferStoreInt, bcXferStoreFloat, bcXferStoreString:
-      Result := Format('R%d -> X%d', [Instr.Src1, Instr.Immediate]);
-    bcXferLoadInt, bcXferLoadFloat, bcXferLoadString:
-      Result := Format('R%d <- X%d', [Instr.Dest, Instr.Immediate]);
-    bcRecordNew:
-      Result := Format('R%d = rec(i%d,f%d,s%d)', [Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-    bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString:
-      Result := Format('R%d <- [R%d].fld%d', [Instr.Dest, Instr.Src1, Instr.Immediate]);
-    bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString:
-      Result := Format('[R%d].fld%d <- R%d', [Instr.Src1, Instr.Immediate, Instr.Src2]);
-    bcRecordNewArray:
-      Result := Format('ARR[%d] fill records', [Instr.Src1]);
-    bcRecordTypeId:
-      Result := Format('R%d = typeid[R%d]', [Instr.Dest, Instr.Src1]);
-    // (bcLoadProcAddr / bcThreadCreate / bcThreadWait are handled at the top of FormatOperands.)
-
-    bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
-    bcPrintInt, bcPrintIntLn:
-      Result := Format('R%d', [Instr.Src1]);
-
-    bcPrintComma, bcPrintSemicolon, bcPrintNewLine, bcPrintEnd:
-      Result := '';  // No operands
-
-    bcPrintTab, bcPrintSpc:
-      Result := Format('%d', [Instr.Immediate]);
-
-    bcInput, bcInputInt, bcInputFloat, bcInputString:
-      Result := Format('R%d', [Instr.Dest]);
-
-    // Array operations
-    bcArrayDim:
-      Result := Format('ARR[%d]', [Instr.Src1]);
-
-    bcArrayLoad:
-      Result := Format('R%d, ARR[%d], idx=R%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
-
-    bcArrayStore:
-      Result := Format('ARR[%d], idx=R%d, value=R%d', [Instr.Src1, Instr.Src2, Instr.Dest]);
-
-    // Typed array operations
-    bcArrayLoadInt:
-      Result := Format('IntR%d, ARR[%d], idx=IntR%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
-    bcArrayLoadFloat:
-      Result := Format('FloatR%d, ARR[%d], idx=IntR%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
-    bcArrayLoadString:
-      Result := Format('StrR%d, ARR[%d], idx=IntR%d', [Instr.Dest, Instr.Src1, Instr.Src2]);
-    bcArrayStoreInt:
-      Result := Format('ARR[%d], idx=IntR%d, value=IntR%d', [Instr.Src1, Instr.Src2, Instr.Dest]);
-    bcArrayStoreFloat:
-      Result := Format('ARR[%d], idx=IntR%d, value=FloatR%d', [Instr.Src1, Instr.Src2, Instr.Dest]);
-    bcArrayStoreString:
-      Result := Format('ARR[%d], idx=IntR%d, value=StrR%d', [Instr.Src1, Instr.Src2, Instr.Dest]);
-
-    bcEnd, bcStop, bcReturn, bcReturnSub, bcNop:
-      Result := '';  // No operands
-  end;
-end;
-
 { Disassemble bytecode file }
 function DisassembleFile(const InputFile: string; const Options: TDisasmOptions): Boolean;
 var
@@ -372,6 +182,7 @@ var
   OutFile: TextFile;
   UseFile: Boolean;
   Line: string;
+  Disasm: TBytecodeDisassembler;
 
   procedure Output(const S: string);
   begin
@@ -484,29 +295,31 @@ begin
           Output('  ----  ------  ----  ----  ----  -----------------  ----------  -----------');
         end;
 
-        // Disassemble instructions directly (safer than using TBytecodeDisassembler)
-        for i := 0 to BytecodeProgram.GetInstructionCount - 1 do
-        begin
-          Instr := BytecodeProgram.GetInstruction(i);
-          if Options.ShowRaw then
+        // Instruction disassembly goes through the SHARED formatter (TBytecodeDisassembler), the exact same
+        // code "sb --disasm" uses -- so sbd and sb can never decode an opcode differently. (The old local
+        // FormatOperands misread every grouped opcode >= 100 as a superinstruction and printed "unknown
+        // opcode" for ordinary ones like RecordStoreInt/PrintString.) The raw hex table keeps its own layout.
+        Disasm := TBytecodeDisassembler.Create;
+        try
+          for i := 0 to BytecodeProgram.GetInstructionCount - 1 do
           begin
-            Line := Format('%6d    %3d  %4d  %4d  %4d  %17s  %10d  %s',
-              [i,
-               Instr.OpCode,
-               Instr.Dest,
-               Instr.Src1,
-               Instr.Src2,
-               FormatImmediate(Instr.OpCode, Instr.Immediate),
-               BytecodeProgram.GetSourceLine(i),  // SourceLine now from Source Map
-               OpcodeToString(Instr.OpCode)]);
-          end
-          else
-          begin
-            Line := Format('%4d: %-20s', [i, OpcodeToString(Instr.OpCode)]);
-            // Add operands based on opcode
-            Line := Line + FormatOperands(Instr, BytecodeProgram);
+            Instr := BytecodeProgram.GetInstruction(i);
+            if Options.ShowRaw then
+              Line := Format('%6d    %3d  %4d  %4d  %4d  %17s  %10d  %s',
+                [i,
+                 Instr.OpCode,
+                 Instr.Dest,
+                 Instr.Src1,
+                 Instr.Src2,
+                 FormatImmediate(Instr.OpCode, Instr.Immediate),
+                 BytecodeProgram.GetSourceLine(i),  // SourceLine now from Source Map
+                 OpcodeToString(Instr.OpCode)])
+            else
+              Line := Disasm.FormatInstruction(BytecodeProgram, i, Instr);
+            Output(Line);
           end;
-          Output(Line);
+        finally
+          Disasm.Free;
         end;
 
         Output('');

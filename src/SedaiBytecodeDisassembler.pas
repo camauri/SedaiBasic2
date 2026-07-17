@@ -45,6 +45,12 @@ type
 
     function Disassemble(Program_: TBytecodeProgram): string;
     function DisassembleToList(Program_: TBytecodeProgram): TStringList;
+    // Format ONE instruction as "<idx>: <name> <operands> [@Lnn]". This is the single source of truth for
+    // instruction disassembly: both "sb --disasm" and the standalone "sbd" go through it, so the two tools
+    // can never disagree on how an opcode decodes. Program_ (optional) supplies the source-line suffix and
+    // the inline text of a string constant.
+    function FormatInstruction(Program_: TBytecodeProgram; Index: Integer;
+      const Instr: TBytecodeInstruction): string;
   end;
 
 implementation
@@ -63,6 +69,12 @@ begin
 end;
 
 procedure TBytecodeDisassembler.DisassembleInstruction(Index: Integer; const Instr: TBytecodeInstruction);
+begin
+  FOutput.Add(FormatInstruction(FProgram, Index, Instr));
+end;
+
+function TBytecodeDisassembler.FormatInstruction(Program_: TBytecodeProgram; Index: Integer;
+  const Instr: TBytecodeInstruction): string;
 var
   Group: Word;
   SubOp: Word;
@@ -79,7 +91,12 @@ begin
     bcLoadConstFloat:
       Line := Format('%4d: %-20s R%d, %.2f', [Index, 'LoadConstFloat', Instr.Dest, Double(Pointer(@Instr.Immediate)^)]);
     bcLoadConstString:
-      Line := Format('%4d: %-20s R%d, [%d]', [Index, 'LoadConstString', Instr.Dest, Instr.Immediate]);
+      begin
+        Line := Format('%4d: %-20s R%d, [%d]', [Index, 'LoadConstString', Instr.Dest, Instr.Immediate]);
+        if (Program_ <> nil) and Assigned(Program_.StringConstants) and
+           (Instr.Immediate >= 0) and (Instr.Immediate < Program_.StringConstants.Count) then
+          Line := Line + Format(' "%s"', [Program_.StringConstants[Instr.Immediate]]);
+      end;
     bcCopyInt:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'CopyInt', Instr.Dest, Instr.Src1]);
     bcCopyFloat:
@@ -590,10 +607,10 @@ begin
 
   // Append source line number if available (debug mode / TRON)
   // Now using Source Map instead of per-instruction SourceLine field
-  if (FProgram <> nil) and (FProgram.GetSourceLine(Index) > 0) then
-    Line := Line + Format('  @L%d', [FProgram.GetSourceLine(Index)]);
+  if (Program_ <> nil) and (Program_.GetSourceLine(Index) > 0) then
+    Line := Line + Format('  @L%d', [Program_.GetSourceLine(Index)]);
 
-  FOutput.Add(Line);
+  Result := Line;
 end;
 
 function TBytecodeDisassembler.Disassemble(Program_: TBytecodeProgram): string;
