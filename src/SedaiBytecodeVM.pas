@@ -1114,6 +1114,12 @@ begin
   if IsNegative then
     Result := '-' + Result;
 
+  // FreeBASIC/QB field-overflow marker: when the value's integer part has MORE digits than the field's "#"
+  // positions, it does not fit -- FB prints the number in full, prefixed with '%' ("Print Using ""#""; 10"
+  // gives "%10"). The padding below is then a no-op (the result already exceeds the field width).
+  if Length(IntPart) > IntDigits then
+    Result := '%' + Result;
+
   // Calculate target width (IntDigits + decimal point + DecDigits)
   if DecDigits > 0 then
     TotalWidth := IntDigits + 1 + DecDigits
