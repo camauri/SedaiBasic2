@@ -27,6 +27,8 @@ program SedaiBasicVM;
 
 // Include shared optimization flags
 {$I OptimizationFlags.inc}
+// JIT feature flags (hot-loop profiling opt-in)
+{$I JitFlags.inc}
 // Include debug flags (compile-time control of debug code)
 {$I DebugFlags.inc}
 // Include profiler flags
@@ -44,7 +46,7 @@ uses
   // Bytecode VM
   SedaiSSATypes, SedaiSSA,
   SedaiBytecodeTypes, SedaiBytecodeCompiler, SedaiBytecodeVM,
-  SedaiBytecodeDisassembler,
+  SedaiBytecodeDisassembler, SedaiOpcodeTable, SedaiJit,
   // Headless file I/O handler (OPEN/PRINT#/INPUT#/EOF/FREEFILE...) for the CLI VM
   SedaiFileIO,
   // Register Allocation
@@ -363,6 +365,12 @@ var
   // --bounds-check: force array bounds checking on in every dialect (default off; MODERN follows FreeBASIC
   // and skips it, CLASSIC always checks). A debugging aid analogous to FreeBASIC's -exx.
   OptBoundsCheck: Boolean = False;
+  // --jit: compile eligible hot loops to native code (JIT J2/J3).
+  OptJit: Boolean = False;
+  {$IFDEF JIT_PROFILE}
+  // --jit-profile: enable JIT hot-loop back-edge profiling and dump the hot loops after the run (J1).
+  OptJitProfile: Boolean = False;
+  {$ENDIF}
   // Headless file-I/O handler shared by the CLI VM instances (lazily created, freed at exit).
   GFileHandler: TVMFileHandler = nil;
 
@@ -1597,6 +1605,10 @@ begin
       VM.SetInputDevice(Input);
       VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
       VM.BoundsCheck := OptBoundsCheck;  // --bounds-check: hard-error on out-of-bounds array access
+      VM.JitEnabled := OptJit;           // --jit: compile eligible hot loops to native
+      {$IFDEF JIT_PROFILE}
+      VM.JitProfile := OptJitProfile;    // --jit-profile: count loop back-edges (J1)
+      {$ENDIF}
       VM.LoadProgram(BytecodeProgram);
 
       try
@@ -1610,6 +1622,9 @@ begin
         VM.RunFast;  // Use optimized execution loop
         {$ENDIF}
         ExecuteTime := Timer.ElapsedMilliseconds;
+        {$IFDEF JIT_PROFILE}
+        if OptJitProfile then VM.DumpHotLoops;  // JIT J1: report hot loops found by back-edge profiling
+        {$ENDIF}
         FinishVMGraphics(VM);  // sb --window: keep the window open until closed
       except
         on E: Exception do
@@ -1954,6 +1969,7 @@ var
   {$ENDIF}
   i: Integer;
   Param: string;
+  VerifyMsg: string;
 
 begin
   try
@@ -1980,6 +1996,28 @@ begin
 
     // Initialize debug flags from command-line parameters
     InitDebugFlags;
+
+    // VM dispatch plan, milestone M1: one-shot opcode-table self-check (dense-map bijection/coverage).
+    // Diagnostic only; prints the summary and exits without touching the dispatch path.
+    if (ParamCount >= 1) and (LowerCase(ParamStr(1)) = '--verify-opcodes') then
+    begin
+      if VerifyOpcodeTable(VerifyMsg) then
+        WriteLn('opcode-table OK: ', VerifyMsg)
+      else
+        WriteLn('opcode-table FAIL: ', VerifyMsg);
+      Halt(0);
+    end;
+
+    // JIT J2 foundation self-test: emit a tiny native function and call it (proves the
+    // emitter + executable-memory + native-call pipeline works). Prints the result and exits.
+    if (ParamCount >= 1) and (LowerCase(ParamStr(1)) = '--jit-selftest') then
+    begin
+      if JitSelfTest(VerifyMsg) then
+        WriteLn('jit-selftest OK: ', VerifyMsg)
+      else
+        WriteLn('jit-selftest FAIL: ', VerifyMsg);
+      Halt(0);
+    end;
 
     // Parse command-line parameters
     TestFile := '';
@@ -2016,6 +2054,12 @@ begin
         GSSAOptimizationsEnabled := False   // differential-test reference: skip the optimization passes
       else if (Param = '--bounds-check') or (Param = '--boundscheck') then
         OptBoundsCheck := True   // force array bounds checking on (even in MODERN); default follows the dialect
+      else if (Param = '--jit') then
+        OptJit := True   // JIT: compile eligible hot loops to native code (J2/J3)
+      {$IFDEF JIT_PROFILE}
+      else if (Param = '--jit-profile') or (Param = '--jitprofile') then
+        OptJitProfile := True   // JIT J1: profile hot loops (back-edge counts) and dump them after the run
+      {$ENDIF}
       else if Param = '--window' then
         OptWindow := True   // present graphics in an SDL2 window (WITH_WINDOW build only; ignored otherwise)
       else if (Param = '--help') or (Param = '-h') or (Param = '-?') then

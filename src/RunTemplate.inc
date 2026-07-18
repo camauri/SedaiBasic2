@@ -16,14 +16,21 @@
 
 type
   PBytecodeInstruction = ^TBytecodeInstruction;
+  PExecMemA = ^TExecMem;
 var
+  JitOn: Boolean;          // JIT enabled for this run (compiled loops present)
+  JitLoops: PExecMemA;     // @FNativeLoops[0]: JitLoops[CurPC] is the compiled loop at that header, or nil
   Instructions: PBytecodeInstruction;
   InstrCount: Integer;
   CurPC: Integer;  // Current Program Counter (local for speed)
   Instr: TBytecodeInstruction;
   Ctx: TExecutionContext;  // M5.2: active execution context, read once per Run (zero hot-path cost)
   Op: Word;
-  Group: Word;
+  // M2 decode-once dense dispatch: DenseOps[CurPC] is the instruction's dense linear index (built once
+  // by EnsureDenseOps). The loop dispatches on it with a single flat case -- no per-instruction group
+  // extraction and no separate superinstruction branch (the alternation that hurt float-heavy loops).
+  DenseOp: Integer;
+  DenseOps: PWord;
   // Local copies of frequently accessed fields for better register allocation
   IntRegs: PInt64;
   FloatRegs: PDouble;
@@ -46,6 +53,11 @@ var
   TrapTriggered: Boolean;
   // Event polling counter
   EventPollCounter: Integer;
+  {$IFDEF JIT_PROFILE}
+  // J1: local copy of the JIT back-edge-profiling flag; BEBase points at FBackEdgeCount[0].
+  BEProfile: Boolean;
+  BEBase: PInteger;
+  {$ENDIF}
   {$IFDEF DEBUG_MODE}
   CurSourceLine: Integer;  // Current source line from Source Map
   {$ENDIF}
@@ -56,6 +68,18 @@ begin
   if Instructions = nil then raise Exception.Create('Empty program');
 
   InstrCount := FProgram.GetInstructionCount;
+  // M2: ensure the decode-once dense-opcode table matches this program, then bind it register-direct.
+  EnsureDenseOps;
+  if Length(FDenseOps) > 0 then DenseOps := @FDenseOps[0] else DenseOps := nil;
+  // JIT (J2/J3): bind the compiled-loop table. When a loop header PC has a native loop, the interpreter
+  // calls it (runs every iteration natively) and continues at the returned exit PC.
+  JitOn := FJitEnabled and (Length(FNativeLoops) > 0);
+  if JitOn then JitLoops := @FNativeLoops[0] else JitLoops := nil;
+  {$IFDEF JIT_PROFILE}
+  // J1: bind the back-edge profiler (counting is a no-op unless FJitProfile is set).
+  BEProfile := FJitProfile;
+  if BEProfile and (Length(FBackEdgeCount) > 0) then BEBase := @FBackEdgeCount[0] else BEBase := nil;
+  {$ENDIF}
   // M5.2: bind the active execution context once per Run — a worker thread supplies its own via
   // the GActiveCtx threadvar (set by WorkerThreadEntry before calling RunFast); the main thread
   // leaves it nil and uses FCtx. A single read per Run keeps per-instruction access register-direct.
@@ -96,9 +120,18 @@ begin
     try
     while Ctx.Running and (CurPC < InstrCount) do
   begin
+    // JIT (J2/J3): a compiled loop whose header is here runs entirely in native code; it reads/writes
+    // the same register banks, then returns the exit PC. (One predicted-not-taken branch when JIT is off.)
+    if JitOn and (JitLoops[CurPC] <> nil) then
+    begin
+      if FArraysDirty then RebuildJitArrDesc;
+      CurPC := TNativeLoopFn(TExecMem(JitLoops[CurPC]).Ptr)(IntRegs, PInt64(FloatRegs), @FJitArrDesc[0]);
+      System.Continue;
+    end;
+
     Instr := Instructions[CurPC];
     Op := Instr.OpCode;
-    Group := Op shr 8;
+    DenseOp := DenseOps[CurPC];
 
     {$IFDEF DEBUG_MODE}
     // Debugger integration: check for breakpoints and stepping
@@ -153,11 +186,13 @@ begin
       end;
     end;
 
-    // Two-level dispatch: first check group, then sub-opcode
-    // Superinstructions are in group $C8+ (bcGroupSuper = $C800)
-    if Group >= $C8 then
-    begin
-      // Extract sub-opcode for superinstruction dispatch
+    // M2 flat dispatch: ONE case on the dense linear index (DenseOps built once by EnsureDenseOps).
+    // No per-instruction group extraction and no separate superinstruction branch -- the two big case
+    // statements and the alternation between them are gone; each family is a contiguous dense range.
+    // The group-0 and superinstruction BODIES below are byte-identical to the previous nested cases.
+    case DenseOp of
+      // === Superinstructions (dense DENSE_SUPER_BASE + sub, sub = Op and $FF) ===
+      DENSE_SUPER_BASE + 0 .. DENSE_SUPER_BASE + 255:
       case Op and $FF of
         // Fused compare-and-branch (Int) - sub-opcodes 0-5
         0: if IntRegs[Instr.Src1] = IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);  // bcCmpBranchEqInt
@@ -438,39 +473,45 @@ begin
       else
         raise Exception.CreateFmt('Unknown superinstruction sub-opcode %d (full opcode $%.4X) at CurPC=%d', [Op and $FF, Op, CurPC]);
       end;
-    end
-    else
-    begin
-      // Standard bytecode opcodes - dispatch by group
-      // For non-Group 0 opcodes, delegate to specialized handlers
-      case Group of
-        1: begin Ctx.PC := CurPC; ExecuteStringOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
-        2: begin Ctx.PC := CurPC; ExecuteMathOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
-        // Group 3 (arrays). The ELEMENT-ACCESS opcodes run INLINE here, from the same source text the
-        // handler uses (ArrayHotOps.inc). Delegating them cost a Ctx.PC write, a non-inlined call, a
-        // second case and a Ctx.PC read back -- about 4x the work itself, paid on every element access.
-        // Everything else in group 3 (DIM/REDIM/BIND/pointer ops/...) is rare and still delegates.
-        3: if (Op and $FF) in [3..8] then
-           begin
-             // Element access, run INLINE. The shared branches never touch the PC (that is exactly what
-             // makes them inlinable), so this path advances it itself, like every other inline opcode.
-             case Op and $FF of
-               {$I ArrayHotOps.inc}
-             end;
-             Inc(CurPC);
-           end
-           else
-             begin Ctx.PC := CurPC; ExecuteArrayOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
-        4: begin Ctx.PC := CurPC; ExecuteIOOp(Ctx, Instr); if not Ctx.Running then Break; CurPC := Ctx.PC + 1; end;
-        5: begin Ctx.PC := CurPC; ExecuteSpecialVarOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
-        6: begin Ctx.PC := CurPC; ExecuteFileIOOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
-        7: begin Ctx.PC := CurPC; ExecuteSpriteOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
-        {$IFDEF WEB_MODE}
-        8: begin Ctx.PC := CurPC; ExecuteWebOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
-        {$ENDIF}
-        10: begin Ctx.PC := CurPC; ExecuteGraphicsOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
-        11: begin Ctx.PC := CurPC; ExecuteSoundOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
-        0: // Core VM operations - inline for performance
+
+      // === Delegated families (each a contiguous dense range) ===
+      DENSE_STRING_BASE + 0 .. DENSE_STRING_BASE + 48:
+        begin Ctx.PC := CurPC; ExecuteStringOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+      DENSE_MATH_BASE + 0 .. DENSE_MATH_BASE + 35:
+        begin Ctx.PC := CurPC; ExecuteMathOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+      // Group 3 (arrays). The ELEMENT-ACCESS opcodes (sub 3..8) run INLINE here, from the same source
+      // text the handler uses (ArrayHotOps.inc). Everything else in group 3 is rare and still delegates.
+      DENSE_ARRAY_BASE + 3 .. DENSE_ARRAY_BASE + 8:
+        begin
+          // The shared branches never touch the PC, so this path advances it itself.
+          case Op and $FF of
+            {$I ArrayHotOps.inc}
+          end;
+          Inc(CurPC);
+        end;
+      DENSE_ARRAY_BASE + 0 .. DENSE_ARRAY_BASE + 2, DENSE_ARRAY_BASE + 9 .. DENSE_ARRAY_BASE + 49:
+        // The cold array ops (DIM/REDIM/ERASE/BIND/...) may resize or move an array's backing store, so
+        // the JIT's array descriptor must be rebuilt before the next compiled loop reads it.
+        begin Ctx.PC := CurPC; ExecuteArrayOp(Ctx, Instr); FArraysDirty := True; CurPC := Ctx.PC + 1; end;
+      DENSE_IO_BASE + 0 .. DENSE_IO_BASE + 22:
+        begin Ctx.PC := CurPC; ExecuteIOOp(Ctx, Instr); if not Ctx.Running then Break; CurPC := Ctx.PC + 1; end;
+      DENSE_SPECIAL_BASE + 0 .. DENSE_SPECIAL_BASE + 16:
+        begin Ctx.PC := CurPC; ExecuteSpecialVarOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+      DENSE_FILEIO_BASE + 0 .. DENSE_FILEIO_BASE + 26:
+        begin Ctx.PC := CurPC; ExecuteFileIOOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+      DENSE_SPRITE_BASE + 0 .. DENSE_SPRITE_BASE + 16:
+        begin Ctx.PC := CurPC; ExecuteSpriteOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+      {$IFDEF WEB_MODE}
+      DENSE_WEB_BASE + 0 .. DENSE_WEB_BASE + 12:
+        begin Ctx.PC := CurPC; ExecuteWebOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+      {$ENDIF}
+      DENSE_GRAPHICS_BASE + 0 .. DENSE_GRAPHICS_BASE + 63:
+        begin Ctx.PC := CurPC; ExecuteGraphicsOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+      DENSE_SOUND_BASE + 0 .. DENSE_SOUND_BASE + 5:
+        begin Ctx.PC := CurPC; ExecuteSoundOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+
+      // === Core VM operations (group 0, dense == 16-bit value) - inline for performance ===
+      DENSE_CORE_BASE + 0 .. DENSE_CORE_BASE + 154:
           case Op of
         // Load constants - very common
         bcLoadConstInt: begin IntRegs[Instr.Dest] := Instr.Immediate; Inc(CurPC); end;
@@ -598,9 +639,31 @@ begin
         bcMathAtn: begin FloatRegs[Instr.Dest] := ArcTan(FloatRegs[Instr.Src1]); Inc(CurPC); end;
 
         // Control flow
+        {$IFDEF JIT_PROFILE}
+        bcJump:
+          begin
+            if BEProfile and (Instr.Immediate < CurPC) then Inc(BEBase[Instr.Immediate]);  // J1 back-edge
+            CurPC := Instr.Immediate;
+          end;
+        bcJumpIfZero:
+          if IntRegs[Instr.Src1] = 0 then
+          begin
+            if BEProfile and (Instr.Immediate < CurPC) then Inc(BEBase[Instr.Immediate]);  // J1 back-edge
+            CurPC := Instr.Immediate;
+          end
+          else Inc(CurPC);
+        bcJumpIfNotZero:
+          if IntRegs[Instr.Src1] <> 0 then
+          begin
+            if BEProfile and (Instr.Immediate < CurPC) then Inc(BEBase[Instr.Immediate]);  // J1 back-edge
+            CurPC := Instr.Immediate;
+          end
+          else Inc(CurPC);
+        {$ELSE}
         bcJump: CurPC := Instr.Immediate;
         bcJumpIfZero: if IntRegs[Instr.Src1] = 0 then CurPC := Instr.Immediate else Inc(CurPC);
         bcJumpIfNotZero: if IntRegs[Instr.Src1] <> 0 then CurPC := Instr.Immediate else Inc(CurPC);
+        {$ENDIF}
         bcCall:
           begin
             GrowCallStackIfNeeded(Ctx);
@@ -1164,10 +1227,10 @@ begin
       else
         raise Exception.CreateFmt('Unknown Group 0 opcode %d at CurPC=%d', [Op, CurPC]);
       end; // end case Op of (Group 0)
-      else
-        raise Exception.CreateFmt('Unknown opcode group %d (opcode $%.4X) at CurPC=%d', [Group, Op, CurPC]);
-      end; // end case Group of
-    end;
+    else
+      // A dense index with no opcode: a superinstruction hole or an out-of-range value. Illegal.
+      raise Exception.CreateFmt('Unknown/illegal opcode $%.4X (dense %d) at CurPC=%d', [Op, DenseOp, CurPC]);
+    end; // end case DenseOp of
 
     {$IFDEF DEBUG_MODE}
     {$IFDEF ENABLE_PROFILER}

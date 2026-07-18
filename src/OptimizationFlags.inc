@@ -34,7 +34,17 @@
 
 // Master switch: uncomment to disable ALL optimizations
 {.$DEFINE DISABLE_ALL_OPTIMIZATIONS}
-   
+
+// SUPERINSTRUCTIONS DISABLED (strategy decision, 2026-07-18). Superinstruction fusion is a stack-VM
+// optimization: on this register-based 3-operand VM dispatch-per-useful-work is already minimal, so
+// fusing ops removes at most one dispatch while doing the SAME work -- measured net-zero-to-negative on
+// float (n-body +38% slower with float fusion), a small win only for the integer loop-control fusion.
+// The performance strategy is now a JIT for hot loops (float leaves the interpreter entirely); the
+// interpreter handles cold code, where fusion does not matter. So all fusion is off.
+// See job/docs/VM_DISPATCH_E_RIDIMENSIONABILITA.md (superinstruction re-study) and the JIT design doc.
+{$DEFINE DISABLE_SUPERINSTRUCTIONS}
+{$DEFINE DISABLE_ARRAYSTORECONST}
+
 // Individual optimization flags (controlled by master switch)
 // Ordered by execution sequence in the optimization pipeline
 

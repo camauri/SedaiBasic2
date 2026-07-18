@@ -27,6 +27,7 @@ unit SedaiBytecodeVM;
 {$I ConfigFlags.inc}
 {$I DebugFlags.inc}
 {$I ProfilerFlags.inc}
+{$I JitFlags.inc}
 
 interface
 
@@ -35,7 +36,7 @@ uses
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
   SedaiConsoleBehavior, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue,
-  SedaiGraphicsBackend, SedaiInputState
+  SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiJit
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
   {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioTypes, SedaiAudioBackend, SedaiSIDEvo{$ENDIF}
   {$IFDEF WEB_MODE}, SedaiWebIO{$ENDIF};
@@ -147,6 +148,30 @@ type
     FRawFreeCount: Integer;
     FRawHeapLock: TRTLCriticalSection;
     FProgram: TBytecodeProgram;
+    // Decode-once dense dispatch (VM perf plan, milestone M2): the 16-bit (group.sub) opcode of each
+    // instruction, translated ONCE to its dense linear index (Op16ToDense). The hot loop dispatches on
+    // this instead of extracting the group every instruction. Rebuilt when the loaded program changes;
+    // the on-file bytecode and TBytecodeInstruction.OpCode are left untouched (format unchanged).
+    FDenseOps: array of Word;
+    FDenseOpsFor: TBytecodeProgram;   // the program FDenseOps was built for (rebuild guard)
+    {$IFDEF JIT_PROFILE}
+    // JIT hot-loop profiling (milestone J1): per-instruction count of how often a BACKWARD branch
+    // targets that PC. A loop back-edge is a branch to a lower PC, so a high count marks a hot loop
+    // header -- the trigger the JIT will use to decide what to compile. Sized with FDenseOps (per
+    // program). Compile-time gated (JitFlags.inc) so a normal build's hot path is untouched.
+    FBackEdgeCount: array of Integer;
+    FJitProfile: Boolean;
+    {$ENDIF}
+    // JIT (J2/J3): when enabled, eligible hot loops are compiled to native at load. FNativeLoops[PC] is
+    // the compiled loop whose HEADER is at PC (nil if none / not compilable). The interpreter, reaching
+    // such a PC, calls the native function which runs the whole loop and returns the exit PC.
+    FJitEnabled: Boolean;
+    FNativeLoops: array of TExecMem;
+    // Array descriptor table passed to compiled loops: 3 Int64 per array (IntData ptr, FloatData ptr,
+    // Count). Rebuilt from FArrays only when the array set changes (FArraysDirty), so the per-call cost
+    // is a single pointer once the arrays are DIM'd.
+    FJitArrDesc: array of Int64;
+    FArraysDirty: Boolean;
     FOutputDevice: IOutputDevice;
     FGraphics: IGraphicsBackend;     // FreeBASIC graphics phase: operation-level drawing backend (SW headless / SDL2 on sbv)
     FOwnedGraphics: TObject;         // concrete backend object the VM owns and frees (e.g. the software backend on sb)
@@ -283,6 +308,13 @@ type
     {$IFDEF WEB_MODE}
     procedure ExecuteWebOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     {$ENDIF}
+    // Build FDenseOps for the current program if it is not already current (VM perf plan M2).
+    procedure EnsureDenseOps;
+    // JIT (J2/J3): compile every eligible hot loop of the current program to native (called from
+    // EnsureDenseOps when FJitEnabled). Loops with an unsupported opcode are left to the interpreter.
+    procedure BuildJitLoops;
+    // JIT (J3): refresh the array descriptor table from FArrays (base pointers + counts).
+    procedure RebuildJitArrDesc;
     // Raise a dialect-aware filesystem runtime error: FreeBASIC error number + message in MODERN,
     // Commodore error number + '?...' message in CLASSIC. The code reaches ERR via the except handler.
     procedure RaiseFileError(const FBMsg: string; FBCode: Integer; const CBMMsg: string; CBMCode: Integer);
@@ -406,6 +438,13 @@ type
     procedure SetConsoleBehavior(ABehavior: TConsoleBehavior; OwnsBehavior: Boolean = False);
     procedure ApplyPreset(Preset: TConsolePreset);
     function GetConsoleBehavior: TConsoleBehavior;
+    {$IFDEF JIT_PROFILE}
+    // JIT hot-loop profiling (J1): enable back-edge counting, then dump the hot loops after a run.
+    property JitProfile: Boolean read FJitProfile write FJitProfile;
+    procedure DumpHotLoops(Threshold: Integer = 1000);
+    {$ENDIF}
+    // JIT (J2/J3): compile eligible hot loops to native. Set before LoadProgram / run.
+    property JitEnabled: Boolean read FJitEnabled write FJitEnabled;
     procedure Run;       // Default execution - calls RunFast
     procedure RunFast;   // Optimized execution loop - no profiler/debug support
     procedure RunDebug;  // Debug execution loop - TRON trace + profiler support
@@ -804,7 +843,10 @@ begin
 end;
 
 destructor TBytecodeVM.Destroy;
+var
+  JitI: Integer;
 begin
+  for JitI := 0 to High(FNativeLoops) do FNativeLoops[JitI].Free;   // JIT: release executable pages
   FEnvOverrides.Free;
   {$IFDEF WITH_SEDAI_AUDIO}
   // Stop and shutdown SAF audio backend
@@ -5433,6 +5475,136 @@ begin
   // If profiler is attached or debug needed, caller should use RunDebug
   RunFast;
 end;
+
+{ EnsureDenseOps - decode-once dense dispatch table (VM perf plan, milestone M2).
+  Translate every instruction's 16-bit (group.sub) opcode to its dense linear index ONCE, so the hot
+  loop dispatches on a single compact case (no per-instruction group extraction / superinstruction
+  branch). Rebuilt only when the loaded program changes. The on-file bytecode and the in-memory
+  TBytecodeInstruction.OpCode are left untouched -- serialization and disassembly are unaffected. }
+procedure TBytecodeVM.EnsureDenseOps;
+type
+  PBytecodeInstr = ^TBytecodeInstruction;
+var
+  i, n: Integer;
+  Ins: PBytecodeInstr;
+begin
+  if FProgram = nil then Exit;
+  n := FProgram.GetInstructionCount;
+  if (FDenseOpsFor = FProgram) and (Length(FDenseOps) = n) then Exit;
+  SetLength(FDenseOps, n);
+  Ins := PBytecodeInstr(FProgram.GetInstructionsPtr);
+  if Ins <> nil then
+    for i := 0 to n - 1 do
+      FDenseOps[i] := Word(Op16ToDense(Ins[i].OpCode));
+  {$IFDEF JIT_PROFILE}
+  // J1: (re)size the back-edge counters for this program and clear them.
+  SetLength(FBackEdgeCount, n);
+  if n > 0 then FillDWord(FBackEdgeCount[0], n, 0);
+  {$ENDIF}
+  FDenseOpsFor := FProgram;
+  if FJitEnabled then BuildJitLoops;
+end;
+
+{ BuildJitLoops - compile every eligible hot loop of the current program to native (JIT J2/J3). A loop
+  header is the target of a backward branch; its body runs to the LAST branch that jumps back to it.
+  CompileLoop returns nil for any loop with an unsupported opcode, so those stay interpreted. }
+procedure TBytecodeVM.BuildJitLoops;
+type
+  PBcInstr = ^TBytecodeInstruction;
+var
+  i, n, hdr: Integer;
+  Ins: PBcInstr;
+  Op: Word;
+  HeaderEnd: array of Integer;   // header PC -> highest back-edge source (loop end), -1 if not a header
+  Mem: TExecMem;
+begin
+  n := FProgram.GetInstructionCount;
+  for i := 0 to High(FNativeLoops) do FNativeLoops[i].Free;
+  SetLength(FNativeLoops, 0);
+  SetLength(FNativeLoops, n);   // all nil
+  if n = 0 then Exit;
+  Ins := PBcInstr(FProgram.GetInstructionsPtr);
+
+  SetLength(HeaderEnd, n);
+  for i := 0 to n - 1 do HeaderEnd[i] := -1;
+  for i := 0 to n - 1 do
+  begin
+    Op := Ins[i].OpCode;
+    if (Op = bcJump) or (Op = bcJumpIfZero) or (Op = bcJumpIfNotZero) then
+    begin
+      hdr := Integer(Ins[i].Immediate);
+      if (hdr >= 0) and (hdr < i) and (i > HeaderEnd[hdr]) then
+        HeaderEnd[hdr] := i;
+    end;
+  end;
+
+  for hdr := 0 to n - 1 do
+    if HeaderEnd[hdr] >= 0 then
+    begin
+      // Array/sqrt/div may only be compiled when their MODERN edge semantics match the native SSE forms
+      // (no CLASSIC raise, no forced bounds-check).
+      Mem := CompileLoop(Ins, hdr, HeaderEnd[hdr], FTrueValue,
+                         Assigned(FProgram) and FProgram.ModernMode and (not FBoundsCheck));
+      if Mem <> nil then FNativeLoops[hdr] := Mem;
+    end;
+  FArraysDirty := True;   // force a descriptor rebuild before the first compiled loop runs
+end;
+
+procedure TBytecodeVM.RebuildJitArrDesc;
+var
+  a, n: Integer;
+begin
+  n := Length(FArrays);
+  SetLength(FJitArrDesc, n * 3 + 3);   // +3 so @FJitArrDesc[0] is always valid even with no arrays
+  for a := 0 to n - 1 do
+  begin
+    if Length(FArrays[a].IntData) > 0 then
+      FJitArrDesc[a * 3 + 0] := Int64(PtrUInt(@FArrays[a].IntData[0]))
+    else FJitArrDesc[a * 3 + 0] := 0;
+    if Length(FArrays[a].FloatData) > 0 then
+      FJitArrDesc[a * 3 + 1] := Int64(PtrUInt(@FArrays[a].FloatData[0]))
+    else FJitArrDesc[a * 3 + 1] := 0;
+    FJitArrDesc[a * 3 + 2] := FArrays[a].TotalSize;
+  end;
+  FArraysDirty := False;
+end;
+
+{$IFDEF JIT_PROFILE}
+{ DumpHotLoops - report the hot loops found by back-edge profiling (JIT milestone J1).
+  A loop header is a PC that backward branches target often; the loop body runs from the header down to
+  the LAST branch that jumps back to it. Prints each hot header, the body extent, the back-edge count and
+  the source line -- the candidates the JIT will compile. }
+procedure TBytecodeVM.DumpHotLoops(Threshold: Integer);
+type
+  PBytecodeInstr = ^TBytecodeInstruction;
+var
+  i, j, n, EndPC: Integer;
+  Ins: PBytecodeInstr;
+  Op: Word;
+begin
+  if FProgram = nil then Exit;
+  n := FProgram.GetInstructionCount;
+  if Length(FBackEdgeCount) < n then Exit;
+  Ins := PBytecodeInstr(FProgram.GetInstructionsPtr);
+  WriteLn('=== JIT hot-loop profile (back-edge count >= ', Threshold, ') ===');
+  for i := 0 to n - 1 do
+    if FBackEdgeCount[i] >= Threshold then
+    begin
+      // Loop body extent: the highest PC whose branch jumps back to this header.
+      EndPC := i;
+      for j := i + 1 to n - 1 do
+      begin
+        Op := Ins[j].OpCode;
+        if ((Op = bcJump) or (Op = bcJumpIfZero) or (Op = bcJumpIfNotZero)) and
+           (Ins[j].Immediate = i) then
+          EndPC := j;
+      end;
+      WriteLn(Format('  hot loop  PC %d..%d  (%d instr)  back-edges=%d  src line %d',
+        [i, EndPC, EndPC - i + 1, FBackEdgeCount[i], FProgram.GetSourceLine(i)]));
+    end;
+  WriteLn('=== end hot-loop profile ===');
+end;
+{$ENDIF}
 
 { RunFast - Optimized execution loop
   - Direct pointer access to instruction array (no method calls)
