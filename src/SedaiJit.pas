@@ -64,11 +64,16 @@ type
   end;
 
 // Compile the loop body [HeaderPC..EndPC] (inclusive) to native code. Ins points at instruction 0.
-// TrueVal is the VM's TRUE value baked into integer comparisons. AllowUnsafe = MODERN dialect and no
-// forced bounds-check: only then may array access / sqrt / div be compiled (their MODERN edge semantics
-// -- OOB->default, div0->IEEE, sqrt(neg)->NaN -- match the native SSE forms; CLASSIC would raise, so the
-// loop bails). Returns a TExecMem whose Ptr is a TNativeLoopFn, or nil if the loop is not compilable.
-function CompileLoop(Ins: Pointer; HeaderPC, EndPC: Integer; TrueVal: Int64; AllowUnsafe: Boolean): TExecMem;
+// ProgLen is the whole program's instruction count (NativeOff/InRange are indexed by absolute PC so an
+// inlined callee's PCs resolve too). TrueVal is the VM's TRUE value baked into integer comparisons.
+// AllowUnsafe = MODERN dialect and no forced bounds-check: only then may array access / sqrt / div be
+// compiled (their MODERN edge semantics -- OOB->default, div0->IEEE, sqrt(neg)->NaN -- match the native
+// SSE forms; CLASSIC would raise, so the loop bails). XferIntBase/XferFloatBase are the (stable) base
+// addresses of Ctx.XferInt[0]/Ctx.XferFloat[0], baked as immediates so bcXferStore/Load and inlined SUB
+// calls (bcCallSub, milestone J6) need no extra parameter. Returns a TExecMem whose Ptr is a
+// TNativeLoopFn, or nil if the loop is not compilable.
+function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: Int64;
+                     AllowUnsafe: Boolean; XferIntBase, XferFloatBase: PtrUInt): TExecMem;
 
 // J2 self-test: emit  a+b  and call it, proving the emit->exec->call pipeline.
 function JitSelfTest(out Msg: string): Boolean;
@@ -178,10 +183,12 @@ type
     TargetPC: Integer;    // bytecode PC to jump to (or -1 = epilogue)
   end;
 
-function CompileLoop(Ins: Pointer; HeaderPC, EndPC: Integer; TrueVal: Int64; AllowUnsafe: Boolean): TExecMem;
+function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: Int64;
+                     AllowUnsafe: Boolean; XferIntBase, XferFloatBase: PtrUInt): TExecMem;
 var
   E: TX86Emitter;
-  NativeOff: array of Integer;      // bytecode PC -> native offset (indexed HeaderPC..EndPC)
+  NativeOff: array of Integer;      // absolute bytecode PC -> native offset (sized ProgLen)
+  InRange: array of Boolean;        // absolute PC belongs to the compiled code (caller range + inlined callees)
   Fixups: array of TFixup;
   NFix: Integer;
   Prog: PBcInstr;
@@ -190,6 +197,13 @@ var
   Dd, S1, S2: LongWord;              // register byte offsets (index*8)
   EpilogueOff: Integer;
   d, target: Integer;
+  // --- inlined SUB calls (J6): each inlinable bcCallSub in the caller range becomes an inline copy of the
+  // callee body [EntryPC..ReturnPC], emitted all-memory (InCallee) around a native FramePush/Pop. ---
+  InCallee: Boolean;                 // True while emitting a callee body: everything memory-homed, no cache
+  CallPC, CallEntry, CallRet, CallSaveN: array of Integer;   // parallel arrays, one entry per call site
+  NCall: Integer;
+  ScratchBytes: Integer;             // stack bytes reserved for the deepest call site's bank save/restore
+  CurSaveN: Integer;                 // save size of the call site being emitted (read by its ReturnSub)
   // Float register allocation (J4): map a VM float reg -> a native xmm (2..7, no REX) or -1 (memory).
   // Only the volatile-plus-two set xmm2..xmm7 is used; xmm6/xmm7 are callee-saved so they are spilled to
   // the stack in the prologue when allocated. Integer VM regs are allocated to r9..r15 (see ILoc below).
@@ -236,13 +250,16 @@ var
   end;
 
   // --- float register-allocation aware operand access (J4) ---
-  // movsd Wx, <VM float reg vmreg>  (reg-reg if allocated to an xmm, else load from [rsi+off])
+  // movsd Wx, <VM float reg vmreg>  (reg-reg if allocated to an xmm, else load from [rsi+off]).
+  // In callee-inline mode every VM reg is memory-homed (the caller's FLoc must not be consulted).
   procedure FLoad(Wx, vmreg: Integer);
   begin
-    if FLoc[vmreg] >= 0 then
+    if InCallee then
+      E.MemOp([$F2, $0F, $10], Wx, RSI, LongWord(vmreg) * 8)
+    else if FLoc[vmreg] >= 0 then
     begin
       if FLoc[vmreg] <> Wx then
-        E.EmitBytes([$F2, $0F, $10, $C0 or (Wx shl 3) or FLoc[vmreg]]);   // movsd Wx, xmm_src
+        E.EmitBytes([$F2, $0F, $10, $C0 or (Wx shl 3) or FLoc[vmreg]])    // movsd Wx, xmm_src
     end
     else
       E.MemOp([$F2, $0F, $10], Wx, RSI, LongWord(vmreg) * 8);             // movsd Wx, [rsi+off]
@@ -250,7 +267,9 @@ var
   // <op>sd Wx, <VM float reg vmreg>
   procedure FOp(const SseOp: array of Byte; Wx, vmreg: Integer);
   begin
-    if FLoc[vmreg] >= 0 then
+    if InCallee then
+      E.MemOp(SseOp, Wx, RSI, LongWord(vmreg) * 8)
+    else if FLoc[vmreg] >= 0 then
       E.EmitBytes([SseOp[0], SseOp[1], SseOp[2], $C0 or (Wx shl 3) or FLoc[vmreg]])
     else
       E.MemOp(SseOp, Wx, RSI, LongWord(vmreg) * 8);
@@ -258,10 +277,12 @@ var
   // store working xmm Wx -> VM float reg dest
   procedure FStore(vmreg, Wx: Integer);
   begin
-    if FLoc[vmreg] >= 0 then
+    if InCallee then
+      E.MemOp([$F2, $0F, $11], Wx, RSI, LongWord(vmreg) * 8)
+    else if FLoc[vmreg] >= 0 then
     begin
       if FLoc[vmreg] <> Wx then
-        E.EmitBytes([$F2, $0F, $10, $C0 or (FLoc[vmreg] shl 3) or Wx]);   // movsd xmm_dst, Wx
+        E.EmitBytes([$F2, $0F, $10, $C0 or (FLoc[vmreg] shl 3) or Wx])    // movsd xmm_dst, Wx
     end
     else
       E.MemOp([$F2, $0F, $11], Wx, RSI, LongWord(vmreg) * 8);             // movsd [rsi+off], Wx
@@ -310,20 +331,20 @@ var
   // Load VM int reg `vmreg` into scratch native reg `scr` (rax/rcx, always < 8).
   procedure ILoad(scr, vmreg: Integer);
   begin
-    if ILoc[vmreg] >= 0 then MovRR(scr, ILoc[vmreg])
+    if (not InCallee) and (ILoc[vmreg] >= 0) then MovRR(scr, ILoc[vmreg])
     else E.MemOp([$48, $8B], scr, RBX, LongWord(vmreg) * 8);
   end;
   // Store scratch native reg `scr` (< 8) into VM int reg `vmreg`.
   procedure IStore(vmreg, scr: Integer);
   begin
-    if ILoc[vmreg] >= 0 then MovRR(ILoc[vmreg], scr)
+    if (not InCallee) and (ILoc[vmreg] >= 0) then MovRR(ILoc[vmreg], scr)
     else E.MemOp([$48, $89], scr, RBX, LongWord(vmreg) * 8);
   end;
   // ALU op  scr <op> vmreg  (MemForm = full memory-form bytes incl. the $48 REX; scr is rax/rcx < 8).
   procedure IOp(const MemForm: array of Byte; scr, vmreg: Integer);
   var rest: array of Byte; k: Integer;
   begin
-    if ILoc[vmreg] >= 0 then
+    if (not InCallee) and (ILoc[vmreg] >= 0) then
     begin
       SetLength(rest, Length(MemForm) - 1);      // drop MemForm[0] = $48 REX (EmitRR rebuilds it)
       for k := 1 to High(MemForm) do rest[k - 1] := MemForm[k];
@@ -383,6 +404,7 @@ var
   var q: Integer;
   begin
     Result := -1;
+    if InCallee then Exit;    // callee arrays never use the caller's base/count cache registers
     for q := 0 to NCArr - 1 do
       if CArrId[q] = ArrayId then begin Result := q; Exit; end;
   end;
@@ -569,6 +591,271 @@ var
     end;
   end;
 
+  // Save VM register bank [0,N) qwords (BankBase = rbx for int / rsi for float) to the stack scratch area
+  // at [rsp+Disp+i*8]. Replicates FramePush for an inlined SUB call. Uses rax (temp) and rcx (counter);
+  // the loop body is < 128 bytes so the back-branch is a rel8. N < 2^31.
+  procedure EmitSaveBank(BankBase: Byte; Disp: LongWord; N: Integer);
+  var loopStart: Integer;
+  begin
+    if N <= 0 then Exit;
+    E.EmitBytes([$31, $C9]);                                       // xor ecx,ecx
+    loopStart := E.Len;
+    E.EmitBytes([$48, $8B, $04, Byte($C8 or (BankBase and 7))]);   // mov rax,[BankBase+rcx*8]
+    E.EmitBytes([$48, $89, $84, $CC]); E.Emit32(Disp);            // mov [rsp+Disp+rcx*8],rax
+    E.EmitBytes([$48, $FF, $C1]);                                 // inc rcx
+    E.EmitBytes([$48, $81, $F9]); E.Emit32(LongWord(N));          // cmp rcx,N
+    E.EmitBytes([$7C, $00]);                                      // jl rel8 -> loopStart
+    E.PatchByte(E.Len - 1, Byte(loopStart - E.Len));
+  end;
+  // Restore VM register bank [0,N) from the stack scratch (the FramePop counterpart).
+  procedure EmitRestoreBank(BankBase: Byte; Disp: LongWord; N: Integer);
+  var loopStart: Integer;
+  begin
+    if N <= 0 then Exit;
+    E.EmitBytes([$31, $C9]);                                       // xor ecx,ecx
+    loopStart := E.Len;
+    E.EmitBytes([$48, $8B, $84, $CC]); E.Emit32(Disp);           // mov rax,[rsp+Disp+rcx*8]
+    E.EmitBytes([$48, $89, $04, Byte($C8 or (BankBase and 7))]);  // mov [BankBase+rcx*8],rax
+    E.EmitBytes([$48, $FF, $C1]);                                 // inc rcx
+    E.EmitBytes([$48, $81, $F9]); E.Emit32(LongWord(N));          // cmp rcx,N
+    E.EmitBytes([$7C, $00]);                                      // jl rel8 -> loopStart
+    E.PatchByte(E.Len - 1, Byte(loopStart - E.Len));
+  end;
+
+  // Return the call-site index for a bcCallSub at absolute PC apc (populated by BuildCallSites), or -1
+  // if that call was found non-inlinable (then the op stays unsupported and the loop bails).
+  function FindCallSite(apc: Integer): Integer;
+  var k: Integer;
+  begin
+    Result := -1;
+    for k := 0 to NCall - 1 do
+      if CallPC[k] = apc then begin Result := k; Exit; end;
+  end;
+
+  // Emit native code for one bytecode instruction at absolute PC apc. Returns False (bail) on any
+  // unsupported opcode or a bcCallSub that could not be inlined. A bcCallSub emits an inline copy of the
+  // callee body wrapped in a native FramePush/Pop; the callee is compiled all-memory (InCallee).
+  function EmitOne(apc: Integer): Boolean;
+  var cs, cpc: Integer;
+  begin
+    Result := False;
+    I := @Prog[apc];
+    JitDiagCurOp := I^.OpCode; JitDiagCurPC := apc;   // last op seen -> the culprit if we bail below
+    Dd := LongWord(I^.Dest) * 8;
+    S1 := LongWord(I^.Src1) * 8;
+    S2 := LongWord(I^.Src2) * 8;
+    case I^.OpCode of
+      bcLoadConstInt:
+        if (not InCallee) and (ILoc[I^.Dest] >= 0) then
+          MovImm64(ILoc[I^.Dest], I^.Immediate)                    // mov gpr, imm64
+        else
+        begin
+          MovImm64(RAX, I^.Immediate);                             // mov rax, imm64
+          E.MemOp([$48, $89], RAX, RBX, Dd);                       // mov [rbx+d],rax
+        end;
+      bcLoadConstFloat:
+        begin
+          E.EmitBytes([$48, $B8]); E.Emit64(QWord(I^.Immediate));  // mov rax, rawbits
+          E.EmitBytes([$66, $48, $0F, $6E, $C0]);                  // movq xmm0, rax
+          FStore(I^.Dest, XMM0);                                   // -> xmm reg or [rsi+d]
+        end;
+      bcCopyInt:
+        if (not InCallee) and (ILoc[I^.Dest] >= 0) and (ILoc[I^.Src1] >= 0) then
+          MovRR(ILoc[I^.Dest], ILoc[I^.Src1])   // reg-reg copy in one move
+        else
+        begin
+          ILoad(RAX, I^.Src1);
+          IStore(I^.Dest, RAX);
+        end;
+      bcCopyFloat:
+        begin
+          FLoad(XMM0, I^.Src1);
+          FStore(I^.Dest, XMM0);
+        end;
+      bcAddInt:
+        begin
+          ILoad(RAX, I^.Src1);
+          IOp([$48, $03], RAX, I^.Src2);            // add rax, src2
+          IStore(I^.Dest, RAX);
+        end;
+      bcSubInt:
+        begin
+          ILoad(RAX, I^.Src1);
+          IOp([$48, $2B], RAX, I^.Src2);            // sub rax, src2
+          IStore(I^.Dest, RAX);
+        end;
+      bcMulInt:
+        begin
+          ILoad(RAX, I^.Src1);
+          IOp([$48, $0F, $AF], RAX, I^.Src2);       // imul rax, src2
+          IStore(I^.Dest, RAX);
+        end;
+      bcAddFloat: FloatBin([$F2, $0F, $58]);        // addsd
+      bcSubFloat: FloatBin([$F2, $0F, $5C]);        // subsd
+      bcMulFloat: FloatBin([$F2, $0F, $59]);        // mulsd
+      // Array / sqrt / div: MODERN edge semantics only (AllowUnsafe); otherwise bail.
+      bcDivFloat: if AllowUnsafe then FloatBin([$F2, $0F, $5E]) else Exit;   // divsd (IEEE = MODERN)
+      bcMathSqr:
+        if AllowUnsafe then
+        begin
+          FOp([$F2, $0F, $51], XMM0, I^.Src1);          // sqrtsd xmm0, <s1>
+          FStore(I^.Dest, XMM0);
+        end
+        else Exit;
+      bcIntToFloat:
+        begin
+          if (not InCallee) and (ILoc[I^.Src1] >= 0) then
+          begin
+            gpr := ILoc[I^.Src1];
+            E.Emit8($F2);
+            if gpr >= 8 then E.Emit8($49) else E.Emit8($48);   // REX.W (+B)
+            E.EmitBytes([$0F, $2A]);
+            E.Emit8($C0 or (XMM0 shl 3) or (gpr and 7));        // cvtsi2sd xmm0, gpr
+          end
+          else
+          begin
+            E.EmitBytes([$F2, $48, $0F, $2A]);                  // cvtsi2sd xmm0, [rbx+s1]
+            E.Emit8($80 or (XMM0 shl 3) or RBX); E.Emit32(S1);
+          end;
+          FStore(I^.Dest, XMM0);
+        end;
+      bcArrayLoadFloat:  if AllowUnsafe then ArrLoadF(I^.Src1, I^.Src2, I^.Dest) else Exit;
+      bcArrayStoreFloat: if AllowUnsafe then ArrStoreF(I^.Src1, I^.Src2, I^.Dest) else Exit;
+      bcArrayLoadInt:    if AllowUnsafe then ArrLoadI(I^.Src1, I^.Src2, I^.Dest) else Exit;
+      bcArrayStoreInt:   if AllowUnsafe then ArrStoreI(I^.Src1, I^.Src2, I^.Dest) else Exit;
+      bcCmpLtInt: IntCmp($9C);                      // setl
+      bcCmpLeInt: IntCmp($9E);                      // setle
+      bcCmpGtInt: IntCmp($9F);                      // setg
+      bcCmpGeInt: IntCmp($9D);                      // setge
+      bcCmpEqInt: IntCmp($94);                      // sete
+      bcCmpNeInt: IntCmp($95);                      // setne
+      // Transfer registers (args / result): XferInt/XferFloat bases are baked as immediates into rdx.
+      bcXferStoreInt:
+        begin
+          ILoad(RAX, I^.Src1);
+          MovImm64(RDX, Int64(XferIntBase));
+          E.MemOp([$48, $89], RAX, RDX, LongWord(I^.Immediate) * 8);       // mov [rdx+slot*8], rax
+        end;
+      bcXferStoreFloat:
+        begin
+          FLoad(XMM0, I^.Src1);
+          MovImm64(RDX, Int64(XferFloatBase));
+          E.MemOp([$F2, $0F, $11], XMM0, RDX, LongWord(I^.Immediate) * 8);  // movsd [rdx+slot*8], xmm0
+        end;
+      bcXferLoadInt:
+        begin
+          MovImm64(RDX, Int64(XferIntBase));
+          E.MemOp([$48, $8B], RAX, RDX, LongWord(I^.Immediate) * 8);        // mov rax, [rdx+slot*8]
+          IStore(I^.Dest, RAX);
+        end;
+      bcXferLoadFloat:
+        begin
+          MovImm64(RDX, Int64(XferFloatBase));
+          E.MemOp([$F2, $0F, $10], XMM0, RDX, LongWord(I^.Immediate) * 8);  // movsd xmm0, [rdx+slot*8]
+          FStore(I^.Dest, XMM0);
+        end;
+      // Block-scoped record marks: a no-op here -- a loop we compile allocates no records (bcRecordNew is
+      // unsupported and bails), so RecordCount is invariant across the mark and reclaiming to it is exact.
+      bcRecMarkPush, bcRecMarkPop: ;
+      // Inlined SUB call (J6): FramePush (native bank save) + inline callee body (all-memory) + FramePop.
+      bcCallSub:
+        begin
+          cs := FindCallSite(apc);
+          if cs < 0 then Exit;                       // not inlinable -> bail
+          CurSaveN := CallSaveN[cs];
+          EmitSaveBank(RBX, 0, CurSaveN);                       // save int bank [0,CurSaveN)
+          EmitSaveBank(RSI, LongWord(CurSaveN) * 8, CurSaveN);  // save float bank [0,CurSaveN)
+          InCallee := True;
+          for cpc := CallEntry[cs] to CallRet[cs] do
+          begin
+            NativeOff[cpc] := E.Len;
+            if not EmitOne(cpc) then begin InCallee := False; Exit; end;
+          end;
+          InCallee := False;
+        end;
+      bcReturnSub:
+        if InCallee then
+        begin
+          EmitRestoreBank(RBX, 0, CurSaveN);                       // restore int bank
+          EmitRestoreBank(RSI, LongWord(CurSaveN) * 8, CurSaveN);  // restore float bank -> fall through
+        end
+        else
+          Exit;                                      // a bare RETURN at loop top level is not compilable
+      bcJump:
+        begin
+          target := Integer(I^.Immediate);
+          if InRange[target] then JmpRel(target)
+          else
+          begin
+            E.EmitBytes([$B8]); E.Emit32(LongWord(target));   // mov eax, target (exit PC)
+            JmpRel(-1);                                        // jmp epilogue
+          end;
+        end;
+      bcJumpIfZero, bcJumpIfNotZero:
+        begin
+          target := Integer(I^.Immediate);
+          ILoad(RAX, I^.Src1);                      // rax := condition (reg or [rbx+s1])
+          E.EmitBytes([$48, $85, $C0]);             // test rax,rax
+          if InRange[target] then
+          begin
+            if I^.OpCode = bcJumpIfZero then JccRel($84, target)   // jz
+            else JccRel($85, target);                              // jnz
+          end
+          else
+          begin
+            // Conditional EXIT: skip over the exit sequence when the branch is NOT taken.
+            if I^.OpCode = bcJumpIfZero then E.EmitBytes([$75, $00])   // jnz short +len(exit)
+            else E.EmitBytes([$74, $00]);                             // jz  short +len(exit)
+            d := E.Len;                               // start of the exit sequence
+            E.EmitBytes([$B8]); E.Emit32(LongWord(target));   // mov eax, target
+            JmpRel(-1);                                        // jmp epilogue
+            E.PatchByte(d - 1, Byte(E.Len - d));               // patch the skip displacement
+          end;
+        end;
+    else
+      // Unsupported opcode -> bail: the whole loop stays interpreted.
+      Exit;
+    end;
+    Result := True;
+  end;
+
+  // Pre-scan the caller range for inlinable bcCallSub sites: locate each callee's single ReturnSub,
+  // reject nested calls / string / record ops, compute the frame save size, and mark the callee PCs as
+  // in-range so their internal jumps resolve as internal (not loop exits).
+  procedure BuildCallSites;
+  var q, r, ep, rp, md: Integer; J: PBcInstr; ok: Boolean;
+  begin
+    NCall := 0;
+    ScratchBytes := 0;
+    for q := HeaderPC to EndPC do
+    begin
+      if Prog[q].OpCode <> bcCallSub then Continue;
+      ep := Integer(Prog[q].Immediate);
+      if (ep < 0) or (ep >= ProgLen) then Continue;    // out of range -> not inlinable
+      rp := -1; ok := True; md := 0; r := ep;
+      while r < ProgLen do
+      begin
+        J := @Prog[r];
+        if J^.OpCode = bcReturnSub then begin rp := r; Break; end;
+        case J^.OpCode of
+          bcCallSub, bcCallSubIndirect,                 // no nested calls in V1
+          bcXferStoreString, bcXferLoadString,          // no string transfer
+          bcRecordNew, bcRecordNewArray: begin ok := False; Break; end;   // no record allocation
+        end;
+        if J^.Dest > md then md := J^.Dest;
+        Inc(r);
+      end;
+      if (rp < 0) or (not ok) then Continue;
+      Inc(NCall);
+      SetLength(CallPC, NCall); SetLength(CallEntry, NCall);
+      SetLength(CallRet, NCall); SetLength(CallSaveN, NCall);
+      CallPC[NCall - 1] := q; CallEntry[NCall - 1] := ep; CallRet[NCall - 1] := rp;
+      CallSaveN[NCall - 1] := md + 1;                  // save [0,maxDest+1) of each bank
+      for r := ep to rp do InRange[r] := True;
+      if (md + 1) * 16 > ScratchBytes then ScratchBytes := (md + 1) * 16;
+    end;
+  end;
+
 begin
   Result := nil;
   Prog := PBcInstr(Ins);
@@ -578,8 +865,14 @@ begin
   // op whitelist below), but also refuse loops longer than a sane cap.
   if EndPC - HeaderPC > 4096 then Exit;
 
+  if ProgLen <= EndPC then Exit;      // NativeOff/InRange are indexed by absolute PC
   E := TX86Emitter.Create;
-  SetLength(NativeOff, EndPC - HeaderPC + 1);
+  SetLength(NativeOff, ProgLen);
+  SetLength(InRange, ProgLen);
+  for d := 0 to ProgLen - 1 do InRange[d] := False;
+  for d := HeaderPC to EndPC do InRange[d] := True;
+  InCallee := False;
+  BuildCallSites;                     // find inlinable bcCallSub, mark callee ranges, size the stack scratch
   NFix := 0;
 
   // --- float register allocation (J4): assign xmm2..xmm7 to the used VM float regs, spill the rest ---
@@ -703,136 +996,18 @@ begin
       if CArrCount[ci] >= 0 then R8LoadR(CArrCount[ci], LongWord(CArrId[ci]) * 24 + 16);
     end;
 
-    // --- body ---
+    // Reserve stack scratch for inlined SUB frame save/restore (sits below the xmm6/7 save area; rsp is
+    // stable through the body so the scratch is at a fixed [rsp+0..ScratchBytes) offset).
+    if ScratchBytes > 0 then
+    begin
+      E.EmitBytes([$48, $81, $EC]); E.Emit32(LongWord(ScratchBytes));   // sub rsp, ScratchBytes
+    end;
+
+    // --- body --- (each instruction is emitted by EmitOne; a bcCallSub emits its callee inline)
     for pc := HeaderPC to EndPC do
     begin
-      NativeOff[pc - HeaderPC] := E.Len;
-      I := @Prog[pc];
-      JitDiagCurOp := I^.OpCode; JitDiagCurPC := pc;   // last op seen -> the culprit if we bail below
-      Dd := LongWord(I^.Dest) * 8;
-      S1 := LongWord(I^.Src1) * 8;
-      S2 := LongWord(I^.Src2) * 8;
-      case I^.OpCode of
-        bcLoadConstInt:
-          if ILoc[I^.Dest] >= 0 then
-            MovImm64(ILoc[I^.Dest], I^.Immediate)                    // mov gpr, imm64
-          else
-          begin
-            MovImm64(RAX, I^.Immediate);                             // mov rax, imm64
-            E.MemOp([$48, $89], RAX, RBX, Dd);                       // mov [rbx+d],rax
-          end;
-        bcLoadConstFloat:
-          begin
-            E.EmitBytes([$48, $B8]); E.Emit64(QWord(I^.Immediate));  // mov rax, rawbits
-            E.EmitBytes([$66, $48, $0F, $6E, $C0]);                  // movq xmm0, rax
-            FStore(I^.Dest, XMM0);                                   // -> xmm reg or [rsi+d]
-          end;
-        bcCopyInt:
-          if (ILoc[I^.Dest] >= 0) and (ILoc[I^.Src1] >= 0) then
-            MovRR(ILoc[I^.Dest], ILoc[I^.Src1])   // reg-reg copy in one move
-          else
-          begin
-            ILoad(RAX, I^.Src1);
-            IStore(I^.Dest, RAX);
-          end;
-        bcCopyFloat:
-          begin
-            FLoad(XMM0, I^.Src1);
-            FStore(I^.Dest, XMM0);
-          end;
-        bcAddInt:
-          begin
-            ILoad(RAX, I^.Src1);
-            IOp([$48, $03], RAX, I^.Src2);            // add rax, src2
-            IStore(I^.Dest, RAX);
-          end;
-        bcSubInt:
-          begin
-            ILoad(RAX, I^.Src1);
-            IOp([$48, $2B], RAX, I^.Src2);            // sub rax, src2
-            IStore(I^.Dest, RAX);
-          end;
-        bcMulInt:
-          begin
-            ILoad(RAX, I^.Src1);
-            IOp([$48, $0F, $AF], RAX, I^.Src2);       // imul rax, src2
-            IStore(I^.Dest, RAX);
-          end;
-        bcAddFloat: FloatBin([$F2, $0F, $58]);        // addsd
-        bcSubFloat: FloatBin([$F2, $0F, $5C]);        // subsd
-        bcMulFloat: FloatBin([$F2, $0F, $59]);        // mulsd
-        // Array / sqrt / div: MODERN edge semantics only (AllowUnsafe); otherwise bail.
-        bcDivFloat: if AllowUnsafe then FloatBin([$F2, $0F, $5E]) else Exit;   // divsd (IEEE = MODERN)
-        bcMathSqr:
-          if AllowUnsafe then
-          begin
-            FOp([$F2, $0F, $51], XMM0, I^.Src1);          // sqrtsd xmm0, <s1>
-            FStore(I^.Dest, XMM0);
-          end
-          else Exit;
-        bcIntToFloat:
-          begin
-            if ILoc[I^.Src1] >= 0 then
-            begin
-              gpr := ILoc[I^.Src1];
-              E.Emit8($F2);
-              if gpr >= 8 then E.Emit8($49) else E.Emit8($48);   // REX.W (+B)
-              E.EmitBytes([$0F, $2A]);
-              E.Emit8($C0 or (XMM0 shl 3) or (gpr and 7));        // cvtsi2sd xmm0, gpr
-            end
-            else
-            begin
-              E.EmitBytes([$F2, $48, $0F, $2A]);                  // cvtsi2sd xmm0, [rbx+s1]
-              E.Emit8($80 or (XMM0 shl 3) or RBX); E.Emit32(S1);
-            end;
-            FStore(I^.Dest, XMM0);
-          end;
-        bcArrayLoadFloat:  if AllowUnsafe then ArrLoadF(I^.Src1, I^.Src2, I^.Dest) else Exit;
-        bcArrayStoreFloat: if AllowUnsafe then ArrStoreF(I^.Src1, I^.Src2, I^.Dest) else Exit;
-        bcArrayLoadInt:    if AllowUnsafe then ArrLoadI(I^.Src1, I^.Src2, I^.Dest) else Exit;
-        bcArrayStoreInt:   if AllowUnsafe then ArrStoreI(I^.Src1, I^.Src2, I^.Dest) else Exit;
-        bcCmpLtInt: IntCmp($9C);                      // setl
-        bcCmpLeInt: IntCmp($9E);                      // setle
-        bcCmpGtInt: IntCmp($9F);                      // setg
-        bcCmpGeInt: IntCmp($9D);                      // setge
-        bcCmpEqInt: IntCmp($94);                      // sete
-        bcCmpNeInt: IntCmp($95);                      // setne
-        bcJump:
-          begin
-            target := Integer(I^.Immediate);
-            if (target >= HeaderPC) and (target <= EndPC) then JmpRel(target)
-            else
-            begin
-              E.EmitBytes([$B8]); E.Emit32(LongWord(target));   // mov eax, target (exit PC)
-              JmpRel(-1);                                        // jmp epilogue
-            end;
-          end;
-        bcJumpIfZero, bcJumpIfNotZero:
-          begin
-            target := Integer(I^.Immediate);
-            ILoad(RAX, I^.Src1);                      // rax := condition (reg or [rbx+s1])
-            E.EmitBytes([$48, $85, $C0]);             // test rax,rax
-            if (target >= HeaderPC) and (target <= EndPC) then
-            begin
-              if I^.OpCode = bcJumpIfZero then JccRel($84, target)   // jz
-              else JccRel($85, target);                              // jnz
-            end
-            else
-            begin
-              // Conditional EXIT: skip over the exit sequence when the branch is NOT taken.
-              if I^.OpCode = bcJumpIfZero then E.EmitBytes([$75, $00])   // jnz short +len(exit)
-              else E.EmitBytes([$74, $00]);                             // jz  short +len(exit)
-              d := E.Len;                               // start of the exit sequence
-              E.EmitBytes([$B8]); E.Emit32(LongWord(target));   // mov eax, target
-              JmpRel(-1);                                        // jmp epilogue
-              // patch the short-jump displacement (skip over the exit sequence just emitted)
-              E.PatchByte(d - 1, Byte(E.Len - d));
-            end;
-          end;
-      else
-        // Unsupported opcode -> bail: the whole loop stays interpreted.
-        Exit;   // (finally frees E)
-      end;
+      NativeOff[pc] := E.Len;
+      if not EmitOne(pc) then Exit;
     end;
 
     // Fall-through past the last body instruction is also a loop exit to EndPC+1.
@@ -849,6 +1024,11 @@ begin
     for fi := 0 to FMaxReg do
       if FLoc[fi] >= 0 then
         E.MemOp([$F2, $0F, $11], FLoc[fi], RSI, LongWord(fi) * 8);  // movsd [rsi+fi*8], xmm_alloc
+    // Release the inlined-call scratch (brings rsp back to the xmm6/7 save area).
+    if ScratchBytes > 0 then
+    begin
+      E.EmitBytes([$48, $81, $C4]); E.Emit32(LongWord(ScratchBytes));   // add rsp, ScratchBytes
+    end;
     // Restore callee-saved xmm and the stack.
     if SaveX6 or SaveX7 then
     begin
@@ -871,7 +1051,7 @@ begin
       if Fixups[pc].TargetPC = -1 then
         target := EpilogueOff
       else
-        target := NativeOff[Fixups[pc].TargetPC - HeaderPC];
+        target := NativeOff[Fixups[pc].TargetPC];   // absolute PC (covers inlined-callee targets too)
       E.Patch32(Fixups[pc].PatchOff, LongWord(target - (Fixups[pc].PatchOff + 4)));
     end;
 

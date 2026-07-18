@@ -5543,8 +5543,11 @@ begin
     begin
       // Array/sqrt/div may only be compiled when their MODERN edge semantics match the native SSE forms
       // (no CLASSIC raise, no forced bounds-check).
-      Mem := CompileLoop(Ins, hdr, HeaderEnd[hdr], FTrueValue,
-                         Assigned(FProgram) and FProgram.ModernMode and (not FBoundsCheck));
+      // Xfer bank bases are baked into the native code as immediates (bcXferStore/Load + inlined SUB
+      // calls); FCtx.XferInt/XferFloat are SetLength'd once at init, so their [0] address is stable.
+      Mem := CompileLoop(Ins, hdr, HeaderEnd[hdr], n, FTrueValue,
+                         Assigned(FProgram) and FProgram.ModernMode and (not FBoundsCheck),
+                         PtrUInt(@FCtx.XferInt[0]), PtrUInt(@FCtx.XferFloat[0]));
       if Mem <> nil then FNativeLoops[hdr] := Mem;
       if GetEnvironmentVariable('JIT_DIAG') <> '' then
       begin
