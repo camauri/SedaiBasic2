@@ -559,6 +559,7 @@ var
         bcXferLoadFloat:   T(J^.Dest);               // Dest = value moved from the transfer slot
         bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
           begin T(J^.Src1); T(J^.Src2); end;         // float operands (Dest is an int reg -> ScanI)
+        bcFloatToInt: T(J^.Src1);                    // float input (Dest is an int reg -> ScanI)
       end;
     end;
   end;
@@ -590,6 +591,7 @@ var
         bcXferLoadInt:  T(J^.Dest);                  // Dest = value moved from the transfer slot
         bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
           T(J^.Dest);                                // float compare writes an int result reg
+        bcFloatToInt: T(J^.Dest);                    // float->int writes an int result reg
         bcJumpIfZero, bcJumpIfNotZero: T(J^.Src1);
       end;
     end;
@@ -754,6 +756,17 @@ var
           end;
           FStore(I^.Dest, XMM0);
         end;
+      // Implicit float->int (assignment/index/FOR bound/arg): MODERN rounds half-to-even, which is exactly
+      // cvtsd2si under the default MXCSR round-to-nearest mode (the same mode FPC's Round reads). CLASSIC
+      // truncates (Trunc) -- that needs a dialect flag we do not carry, so a non-MODERN loop bails.
+      bcFloatToInt:
+        if AllowUnsafe then
+        begin
+          FLoad(XMM0, I^.Src1);                        // xmm0 = V
+          E.EmitBytes([$F2, $48, $0F, $2D, $C0]);      // cvtsd2si rax, xmm0
+          IStore(I^.Dest, RAX);
+        end
+        else Exit;
       bcArrayLoadFloat:  if AllowUnsafe then ArrLoadF(I^.Src1, I^.Src2, I^.Dest) else Exit;
       bcArrayStoreFloat: if AllowUnsafe then ArrStoreF(I^.Src1, I^.Src2, I^.Dest) else Exit;
       bcArrayLoadInt:    if AllowUnsafe then ArrLoadI(I^.Src1, I^.Src2, I^.Dest) else Exit;
