@@ -488,8 +488,9 @@ var
   function CArrIdx(ArrayId: Integer): Integer;
   var q: Integer;
   begin
+    // The cache holds loop-invariant base pointers / counts, valid from both the caller and an inlined
+    // callee (J6c). Safe in InCallee: the cached value is the array's base/count, not a caller register.
     Result := -1;
-    if InCallee then Exit;    // callee arrays never use the caller's base/count cache registers
     for q := 0 to NCArr - 1 do
       if CArrId[q] = ArrayId then begin Result := q; Exit; end;
   end;
@@ -660,33 +661,41 @@ var
 
   // Collect the distinct arrays accessed in the loop (with their descriptor base offset and use count),
   // so the invariant base/count loads can be hoisted into registers (J5c). Src1 of an array op is the
-  // array id (a constant), Src2 the index.
+  // array id (a constant), Src2 the index. The descriptor base/count are loop-invariant for the whole
+  // native invocation, so the SAME cached registers serve accesses in the caller range AND in every inlined
+  // callee body (J6c) -- the callee's index still comes from memory, only the invariant base/count are shared.
   procedure ScanArr;
-  var q, k, off, aid: Integer; J: PBcInstr;
+    procedure ScanRange(lo, hi: Integer);
+    var q, k, off, aid: Integer; J: PBcInstr;
+    begin
+      for q := lo to hi do
+      begin
+        J := @Prog[q];
+        case J^.OpCode of
+          bcArrayLoadFloat, bcArrayStoreFloat: off := 8;
+          bcArrayLoadInt,   bcArrayStoreInt:   off := 0;
+        else
+          continue;
+        end;
+        aid := J^.Src1;
+        k := 0;
+        while (k < NCArr) and (CArrId[k] <> aid) do Inc(k);
+        if k = NCArr then
+        begin
+          Inc(NCArr);
+          SetLength(CArrId, NCArr); SetLength(CArrOff, NCArr); SetLength(CArrUses, NCArr);
+          SetLength(CArrBase, NCArr); SetLength(CArrCount, NCArr);
+          CArrId[k] := aid; CArrOff[k] := off; CArrUses[k] := 0;
+          CArrBase[k] := -1; CArrCount[k] := -1;
+        end;
+        Inc(CArrUses[k]);
+      end;
+    end;
+  var c: Integer;
   begin
     NCArr := 0;
-    for q := HeaderPC to EndPC do
-    begin
-      J := @Prog[q];
-      case J^.OpCode of
-        bcArrayLoadFloat, bcArrayStoreFloat: off := 8;
-        bcArrayLoadInt,   bcArrayStoreInt:   off := 0;
-      else
-        continue;
-      end;
-      aid := J^.Src1;
-      k := 0;
-      while (k < NCArr) and (CArrId[k] <> aid) do Inc(k);
-      if k = NCArr then
-      begin
-        Inc(NCArr);
-        SetLength(CArrId, NCArr); SetLength(CArrOff, NCArr); SetLength(CArrUses, NCArr);
-        SetLength(CArrBase, NCArr); SetLength(CArrCount, NCArr);
-        CArrId[k] := aid; CArrOff[k] := off; CArrUses[k] := 0;
-        CArrBase[k] := -1; CArrCount[k] := -1;
-      end;
-      Inc(CArrUses[k]);
-    end;
+    ScanRange(HeaderPC, EndPC);
+    for c := 0 to NCall - 1 do ScanRange(CallEntry[c], CallRet[c]);   // include inlined callee arrays
   end;
 
   // Save VM register bank [0,N) qwords (BankBase = rbx for int / rsi for float) to the stack scratch area
