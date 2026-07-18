@@ -5517,7 +5517,12 @@ var
   Op: Word;
   HeaderEnd: array of Integer;   // header PC -> highest back-edge source (loop end), -1 if not a header
   Mem: TExecMem;
+  RecTmp: TRecordStorage;        // to derive TRecordStorage layout for the JIT record accessor (J13)
+  RecSz, RIntOff, RFloatOff: Integer;
 begin
+  RecSz := SizeOf(TRecordStorage);
+  RIntOff := Integer(PtrUInt(@RecTmp.IntData) - PtrUInt(@RecTmp));
+  RFloatOff := Integer(PtrUInt(@RecTmp.FloatData) - PtrUInt(@RecTmp));
   n := FProgram.GetInstructionCount;
   for i := 0 to High(FNativeLoops) do FNativeLoops[i].Free;
   SetLength(FNativeLoops, 0);
@@ -5545,9 +5550,12 @@ begin
       // (no CLASSIC raise, no forced bounds-check).
       // Xfer bank bases are baked into the native code as immediates (bcXferStore/Load + inlined SUB
       // calls); FCtx.XferInt/XferFloat are SetLength'd once at init, so their [0] address is stable.
+      // @FCtx.Records is the address of the record-heap field (stable across resizes; the accessor derefs
+      // it at run time for the current base). Shared-record handles deopt, so no lock is baked in.
       Mem := CompileLoop(Ins, hdr, HeaderEnd[hdr], n, FTrueValue,
                          Assigned(FProgram) and FProgram.ModernMode and (not FBoundsCheck),
-                         PtrUInt(@FCtx.XferInt[0]), PtrUInt(@FCtx.XferFloat[0]));
+                         PtrUInt(@FCtx.XferInt[0]), PtrUInt(@FCtx.XferFloat[0]),
+                         PtrUInt(@FCtx.Records), RecSz, RIntOff, RFloatOff);
       if Mem <> nil then FNativeLoops[hdr] := Mem;
       if GetEnvironmentVariable('JIT_DIAG') <> '' then
       begin

@@ -70,10 +70,14 @@ type
 // compiled (their MODERN edge semantics -- OOB->default, div0->IEEE, sqrt(neg)->NaN -- match the native
 // SSE forms; CLASSIC would raise, so the loop bails). XferIntBase/XferFloatBase are the (stable) base
 // addresses of Ctx.XferInt[0]/Ctx.XferFloat[0], baked as immediates so bcXferStore/Load and inlined SUB
-// calls (bcCallSub, milestone J6) need no extra parameter. Returns a TExecMem whose Ptr is a
+// calls (bcCallSub, milestone J6) need no extra parameter. RecFieldAddr is @Ctx.Records (the address of the
+// record-heap dynamic-array field, stable across resizes; dereferenced at run time to get the current base);
+// RecSize/RecIntOff/RecFloatOff are SizeOf(TRecordStorage) and the byte offsets of its IntData/FloatData
+// fields, so record field access (J13) needs no hardcoded layout. Returns a TExecMem whose Ptr is a
 // TNativeLoopFn, or nil if the loop is not compilable.
 function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: Int64;
-                     AllowUnsafe: Boolean; XferIntBase, XferFloatBase: PtrUInt): TExecMem;
+                     AllowUnsafe: Boolean; XferIntBase, XferFloatBase: PtrUInt;
+                     RecFieldAddr: PtrUInt; RecSize, RecIntOff, RecFloatOff: Integer): TExecMem;
 
 // J2 self-test: emit  a+b  and call it, proving the emit->exec->call pipeline.
 function JitSelfTest(out Msg: string): Boolean;
@@ -184,7 +188,8 @@ type
   end;
 
 function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: Int64;
-                     AllowUnsafe: Boolean; XferIntBase, XferFloatBase: PtrUInt): TExecMem;
+                     AllowUnsafe: Boolean; XferIntBase, XferFloatBase: PtrUInt;
+                     RecFieldAddr: PtrUInt; RecSize, RecIntOff, RecFloatOff: Integer): TExecMem;
 var
   E: TX86Emitter;
   NativeOff: array of Integer;      // absolute bytecode PC -> native offset (sized ProgLen)
@@ -680,6 +685,53 @@ var
     end;
   end;
 
+  // Record field access (J13): Ctx.Records[handle].{Int,Float}Data[slot]. A SHARED_REC_FLAG handle (bit 62)
+  // routes to the locked cross-thread region -> deopt to the interpreter. A plain handle indexes the stable
+  // per-thread heap: deref @Ctx.Records to the current base, add handle*RecSize, load the field data pointer
+  // (a dynamic array = a pointer) at its offset, then load/store [fieldptr + slot*8]. No handle/slot bounds
+  // check, matching the interpreter (range checks off). HandleReg = Src1, ValDstReg = Dest/Src2, Slot = Imm.
+  procedure RecAccess(apc, HandleReg, Slot, ValDstReg: Integer; IsFloat, IsStore: Boolean);
+  var p: Integer;
+  begin
+    ILoad(RAX, HandleReg);                          // rax = handle
+    E.EmitBytes([$48, $0F, $BA, $E0, 62]);          // bt rax, 62  (SHARED_REC_FLAG = 1 shl 62)
+    E.EmitBytes([$73, $00]); p := E.Len - 1;        // jnc +over  (CF=0 -> not shared -> fast path)
+    DeoptTo(apc);                                    // shared record -> interpreter (takes the lock)
+    E.PatchByte(p, Byte(E.Len - (p + 1)));
+    MovImm64(RDX, Int64(RecFieldAddr));             // rdx = &Ctx.Records (address of the dyn-array field)
+    E.EmitBytes([$48, $8B, $12]);                    // mov rdx, [rdx]  -> current @Records[0]
+    E.EmitBytes([$48, $69, $C0]); E.Emit32(LongWord(RecSize));   // imul rax, rax, RecSize
+    E.EmitBytes([$48, $01, $C2]);                    // add rdx, rax    -> @Records[handle]
+    E.EmitBytes([$48, $8B, $8A]);                    // mov rcx, [rdx + fieldoff]  -> field data pointer
+    if IsFloat then E.Emit32(LongWord(RecFloatOff)) else E.Emit32(LongWord(RecIntOff));
+    if IsStore then
+    begin
+      if IsFloat then
+      begin
+        FLoad(XMM0, ValDstReg);
+        E.EmitBytes([$F2, $0F, $11, $81]); E.Emit32(LongWord(Slot) * 8);   // movsd [rcx+slot*8], xmm0
+      end
+      else
+      begin
+        ILoad(RAX, ValDstReg);
+        E.EmitBytes([$48, $89, $81]); E.Emit32(LongWord(Slot) * 8);        // mov [rcx+slot*8], rax
+      end;
+    end
+    else
+    begin
+      if IsFloat then
+      begin
+        E.EmitBytes([$F2, $0F, $10, $81]); E.Emit32(LongWord(Slot) * 8);   // movsd xmm0, [rcx+slot*8]
+        FStore(ValDstReg, XMM0);
+      end
+      else
+      begin
+        E.EmitBytes([$48, $8B, $81]); E.Emit32(LongWord(Slot) * 8);        // mov rax, [rcx+slot*8]
+        IStore(ValDstReg, RAX);
+      end;
+    end;
+  end;
+
   // Scan the loop for FLOAT register operands. Mark=False: compute FMaxReg. Mark=True: flag each used
   // float reg as -2 in FLoc (candidate for allocation).
   procedure ScanF(Mark: Boolean);
@@ -701,6 +753,8 @@ var
         bcArrayStoreFloat: T(J^.Dest);               // Dest = stored VALUE (float)
         bcXferStoreFloat:  T(J^.Src1);               // Src1 = value moved to the transfer slot
         bcXferLoadFloat:   T(J^.Dest);               // Dest = value moved from the transfer slot
+        bcRecordLoadFloat: T(J^.Dest);               // Dest = loaded record field (float)
+        bcRecordStoreFloat: T(J^.Src2);              // Src2 = stored VALUE (float); Src1 = handle (int)
         bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
           begin T(J^.Src1); T(J^.Src2); end;         // float operands (Dest is an int reg -> ScanI)
         bcFloatToInt: T(J^.Src1);                    // float input (Dest is an int reg -> ScanI)
@@ -736,6 +790,9 @@ var
         bcArrayLoadInt, bcArrayStoreInt: begin T(J^.Dest); T(J^.Src2); end;  // Dest=result/value, Src2=index
         bcXferStoreInt: T(J^.Src1);                  // Src1 = value moved to the transfer slot
         bcXferLoadInt:  T(J^.Dest);                  // Dest = value moved from the transfer slot
+        bcRecordLoadInt:    begin T(J^.Dest); T(J^.Src1); end;   // Dest=field value, Src1=handle
+        bcRecordStoreInt:   begin T(J^.Src1); T(J^.Src2); end;   // Src1=handle, Src2=stored value
+        bcRecordLoadFloat, bcRecordStoreFloat: T(J^.Src1);       // Src1=handle (int); value is a float reg
         bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
           T(J^.Dest);                                // float compare writes an int result reg
         bcFloatToInt: T(J^.Dest);                    // float->int writes an int result reg
@@ -1032,6 +1089,12 @@ var
       bcArrayStoreInt:
         if AllowUnsafe then ArrStoreI(apc, I^.Src1, I^.Src2, I^.Dest, False)
         else if InCallee then Exit else ArrStoreI(apc, I^.Src1, I^.Src2, I^.Dest, True);
+      // Record field access: a shared-record handle deopts (locked region), which is unsafe inside an
+      // inlined callee -> bail there. Slot = Immediate; handle = Src1; value/dest = Dest (load) / Src2 (store).
+      bcRecordLoadInt:    if InCallee then Exit else RecAccess(apc, I^.Src1, Integer(I^.Immediate), I^.Dest, False, False);
+      bcRecordLoadFloat:  if InCallee then Exit else RecAccess(apc, I^.Src1, Integer(I^.Immediate), I^.Dest, True,  False);
+      bcRecordStoreInt:   if InCallee then Exit else RecAccess(apc, I^.Src1, Integer(I^.Immediate), I^.Src2, False, True);
+      bcRecordStoreFloat: if InCallee then Exit else RecAccess(apc, I^.Src1, Integer(I^.Immediate), I^.Src2, True,  True);
       bcCmpLtInt: IntCmp($9C);                      // setl
       bcCmpLeInt: IntCmp($9E);                      // setle
       bcCmpGtInt: IntCmp($9F);                      // setg
