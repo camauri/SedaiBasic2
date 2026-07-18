@@ -1030,7 +1030,7 @@ var
   // unsupported opcode or a bcCallSub that could not be inlined. A bcCallSub emits an inline copy of the
   // callee body wrapped in a native FramePush/Pop; the callee is compiled all-memory (InCallee).
   function EmitOne(apc: Integer): Boolean;
-  var cs, cpc, ck: Integer;
+  var cs, cpc, ck, pOk, pOk2: Integer;
   begin
     Result := False;
     I := @Prog[apc];
@@ -1107,15 +1107,48 @@ var
       bcAddFloat: FloatBin([$F2, $0F, $58]);        // addsd
       bcSubFloat: FloatBin([$F2, $0F, $5C]);        // subsd
       bcMulFloat: FloatBin([$F2, $0F, $59]);        // mulsd
-      // Array / sqrt / div: MODERN edge semantics only (AllowUnsafe); otherwise bail.
-      bcDivFloat: if AllowUnsafe then FloatBin([$F2, $0F, $5E]) else Exit;   // divsd (IEEE = MODERN)
+      // Float divide. MODERN follows IEEE (divsd: x/0 = +/-Inf, 0/0 = NaN), so it compiles unconditionally.
+      // CLASSIC raises ?DIVISION BY ZERO only on an exact-zero divisor (the interpreter tests `= 0.0`); guard
+      // the divisor and deopt to the interpreter on zero. A NaN divisor is not zero -> divide (yields NaN,
+      // matching the interpreter). Inside an inlined callee a deopt is unsafe (native frame lost) -> bail.
+      bcDivFloat:
+        if AllowUnsafe then FloatBin([$F2, $0F, $5E])          // divsd (IEEE = MODERN)
+        else if InCallee then Exit
+        else
+        begin
+          FLoad(XMM1, I^.Src2);                                // xmm1 = divisor
+          E.EmitBytes([$0F, $57, $C0]);                        // xorps xmm0, xmm0   (0.0)
+          E.EmitBytes([$66, $0F, $2E, $C8]);                   // ucomisd xmm1, xmm0
+          E.EmitBytes([$7A, $00]); pOk := E.Len - 1;           // jp  @ok  (NaN divisor -> divide)
+          E.EmitBytes([$75, $00]); pOk2 := E.Len - 1;          // jne @ok  (divisor <> 0 -> divide)
+          DeoptTo(apc);                                        // divisor == 0 -> interpreter raises
+          E.PatchByte(pOk, Byte(E.Len - (pOk + 1)));
+          E.PatchByte(pOk2, Byte(E.Len - (pOk2 + 1)));
+          FLoad(XMM0, I^.Src1);                                // xmm0 = dividend
+          E.EmitBytes([$F2, $0F, $5E, $C1]);                   // divsd xmm0, xmm1
+          FStore(I^.Dest, XMM0);
+        end;
+      // Square root. MODERN (FreeBASIC) Sqr of a negative is NaN (no trap) -> sqrtsd unconditionally. CLASSIC
+      // raises ?ILLEGAL QUANTITY on a negative operand; guard operand >= 0 and deopt otherwise (a NaN operand
+      // fails the ordered compare too and deopts, where the interpreter reproduces NaN). Callee -> bail.
       bcMathSqr:
         if AllowUnsafe then
         begin
           FOp([$F2, $0F, $51], XMM0, I^.Src1);          // sqrtsd xmm0, <s1>
           FStore(I^.Dest, XMM0);
         end
-        else Exit;
+        else if InCallee then Exit
+        else
+        begin
+          FLoad(XMM0, I^.Src1);                          // xmm0 = X
+          E.EmitBytes([$0F, $57, $C9]);                  // xorps xmm1, xmm1   (0.0)
+          E.EmitBytes([$66, $0F, $2E, $C1]);             // ucomisd xmm0, xmm1
+          E.EmitBytes([$73, $00]); pOk := E.Len - 1;     // jae @ok  (X >= 0 ordered -> sqrt)
+          DeoptTo(apc);                                  // X < 0 (or NaN) -> interpreter
+          E.PatchByte(pOk, Byte(E.Len - (pOk + 1)));
+          E.EmitBytes([$F2, $0F, $51, $C0]);             // sqrtsd xmm0, xmm0
+          FStore(I^.Dest, XMM0);
+        end;
       bcIntToFloat:
         begin
           if IAlloc(I^.Src1) >= 0 then
