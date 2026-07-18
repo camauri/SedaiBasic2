@@ -248,6 +248,16 @@ var
     AddFixup(E.Len, TargetPC);
     E.Emit32(0);
   end;
+  // Deopt: leave the native loop and resume the interpreter at absolute PC apc (mov eax,apc; jmp epilogue).
+  // The epilogue flushes the allocated registers to memory, so the interpreter re-executes apc with correct
+  // state -- used to defer the rare/faulting cases (div-by-zero raise, LBOUND/UBOUND of a non-first dim) to
+  // the interpreter. NOT valid inside an inlined callee (its native frame would be lost), so callers guard
+  // on InCallee before emitting one.
+  procedure DeoptTo(apc: Integer);
+  begin
+    E.EmitBytes([$B8]); E.Emit32(LongWord(apc));   // mov eax, apc
+    JmpRel(-1);                                     // jmp epilogue
+  end;
 
   // --- float register-allocation aware operand access (J4) ---
   // movsd Wx, <VM float reg vmreg>  (reg-reg if allocated to an xmm, else load from [rsi+off]).
@@ -406,6 +416,33 @@ var
     FStore(I^.Dest, XMM0);
   end;
 
+  // Integer DIV / MOD (signed, truncating toward zero -- matches FPC div/mod and x86 idiv). The interpreter
+  // RAISES on a zero divisor, and x86 idiv faults on both /0 and the INT64_MIN/-1 overflow; guard both and
+  // deopt to `apc` so the interpreter reproduces the exact behaviour (raise, or FPC's overflow result).
+  // WantRemainder selects mod (rdx) vs div (rax). Divisor in rcx, dividend in rax; rdx is clobbered.
+  procedure DivMod(apc: Integer; WantRemainder: Boolean);
+  var p1, p2, p3: Integer;
+  begin
+    ILoad(RAX, I^.Src1);                          // rax = dividend
+    ILoad(RCX, I^.Src2);                          // rcx = divisor
+    E.EmitBytes([$48, $85, $C9]);                 // test rcx, rcx
+    E.EmitBytes([$75, $00]); p1 := E.Len - 1;     // jnz over-deopt
+    DeoptTo(apc);                                  // divisor == 0 -> interpreter raises
+    E.PatchByte(p1, Byte(E.Len - (p1 + 1)));
+    E.EmitBytes([$48, $83, $F9, $FF]);            // cmp rcx, -1
+    E.EmitBytes([$75, $00]); p2 := E.Len - 1;     // jne skip the INT_MIN overflow guard
+    E.EmitBytes([$48, $BA]); E.Emit64(QWord($8000000000000000));  // mov rdx, INT64_MIN
+    E.EmitBytes([$48, $39, $D0]);                 // cmp rax, rdx
+    E.EmitBytes([$75, $00]); p3 := E.Len - 1;     // jne over-deopt
+    DeoptTo(apc);                                  // INT64_MIN / -1 -> interpreter (matches FPC exactly)
+    E.PatchByte(p3, Byte(E.Len - (p3 + 1)));
+    E.PatchByte(p2, Byte(E.Len - (p2 + 1)));
+    E.EmitBytes([$48, $99]);                      // cqo   (sign-extend rax into rdx:rax)
+    E.EmitBytes([$48, $F7, $F9]);                 // idiv rcx
+    if WantRemainder then IStore(I^.Dest, RDX)    // mod -> remainder
+    else IStore(I^.Dest, RAX);                    // div -> quotient
+  end;
+
   // mov <reg>, [r8 + disp32]   (REX.W + REX.B; r8 = array descriptor base)
   // mov <reg (rax/rcx/rdx, <8)>, [r8+disp]   (REX.W + REX.B for r8 base)
   procedure R8Load(RegField: Byte; Disp: LongWord);
@@ -426,6 +463,27 @@ var
     E.Emit32(Disp);
   end;
 
+  // LBOUND / UBOUND of a 1-D array (dim 0). Src1 = array id (constant), Src2 = the dim register. The
+  // interpreter special-cases dim<0 (rank query) and reads per-dim bounds for dim>0; only dim==0 is handled
+  // natively (LBOUND = descriptor LBound; UBOUND = LBound + Count - 1), anything else deopts to `apc`.
+  procedure ArrBound(apc, ArrayId: Integer; WantUpper: Boolean);
+  var p1: Integer;
+  begin
+    ILoad(RCX, I^.Src2);                          // rcx = dim
+    E.EmitBytes([$48, $85, $C9]);                 // test rcx, rcx
+    E.EmitBytes([$74, $00]); p1 := E.Len - 1;     // jz dim0  (dim == 0 -> native)
+    DeoptTo(apc);                                  // dim != 0 (rank query / other dim) -> interpreter
+    E.PatchByte(p1, Byte(E.Len - (p1 + 1)));
+    R8Load(RAX, LongWord(ArrayId) * 32 + 24);     // rax = LBound (dim 0)
+    if WantUpper then
+    begin
+      R8Load(RDX, LongWord(ArrayId) * 32 + 16);   // rdx = Count
+      E.EmitBytes([$48, $01, $D0]);               // add rax, rdx
+      E.EmitBytes([$48, $FF, $C8]);               // dec rax      (UBOUND = LBound + Count - 1)
+    end;
+    IStore(I^.Dest, RAX);
+  end;
+
   // --- array base/count caching (J5c): index into the per-loop cache, or -1 if this array is not cached ---
   function CArrIdx(ArrayId: Integer): Integer;
   var q: Integer;
@@ -442,7 +500,7 @@ var
       EmitRR([$3B], RCX, CountReg)                          // cmp rcx, CountReg
     else
     begin
-      R8Load(RDX, LongWord(ArrayId) * 24 + 16);             // mov rdx, Count
+      R8Load(RDX, LongWord(ArrayId) * 32 + 16);             // mov rdx, Count
       E.EmitBytes([$48, $39, $D1]);                          // cmp rcx, rdx
     end;
   end;
@@ -450,7 +508,7 @@ var
   function ArrBaseReg(ArrayId, Off, CachedBase: Integer): Integer;
   begin
     if CachedBase >= 0 then Result := CachedBase
-    else begin R8Load(RDX, LongWord(ArrayId) * 24 + LongWord(Off)); Result := RDX; end;
+    else begin R8Load(RDX, LongWord(ArrayId) * 32 + LongWord(Off)); Result := RDX; end;
   end;
   // Emit a load/store of xmm0/rax to [BaseReg + rcx*8].  BaseReg may be rdx or any r8..r15 (REX.B).
   procedure ArrDataAccess(IsFloat, IsStore: Boolean; BaseReg: Integer);
@@ -581,7 +639,10 @@ var
       case J^.OpCode of
         bcLoadConstInt: T(J^.Dest);
         bcCopyInt: begin T(J^.Dest); T(J^.Src1); end;
-        bcAddInt, bcSubInt, bcMulInt: begin T(J^.Dest); T(J^.Src1); T(J^.Src2); end;
+        bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt:
+          begin T(J^.Dest); T(J^.Src1); T(J^.Src2); end;
+        bcNarrowInt: begin T(J^.Dest); T(J^.Src1); end;
+        bcArrayLBound, bcArrayUBound: begin T(J^.Dest); T(J^.Src2); end;  // Dest=result, Src2=dim
         bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt, bcCmpEqInt, bcCmpNeInt:
           begin T(J^.Dest); T(J^.Src1); T(J^.Src2); end;
         bcIntToFloat: T(J^.Src1);                    // int input (Dest is float)
@@ -727,6 +788,26 @@ var
           IOp([$48, $0F, $AF], RAX, I^.Src2);       // imul rax, src2
           IStore(I^.Dest, RAX);
         end;
+      // Integer div/mod deopt to the interpreter on the faulting cases -- not valid inside an inlined
+      // callee (its native frame would be lost on the deopt), so bail there.
+      bcDivInt: if InCallee then Exit else DivMod(apc, False);
+      bcModInt: if InCallee then Exit else DivMod(apc, True);
+      bcNarrowInt:
+        begin
+          ILoad(RAX, I^.Src1);
+          case I^.Immediate of
+            1: E.EmitBytes([$48, $0F, $BE, $C0]);   // s8:  movsx rax, al
+            2: E.EmitBytes([$0F, $B6, $C0]);        // u8:  movzx eax, al
+            3: E.EmitBytes([$48, $0F, $BF, $C0]);   // s16: movsx rax, ax
+            4: E.EmitBytes([$0F, $B7, $C0]);        // u16: movzx eax, ax
+            5: E.EmitBytes([$48, $63, $C0]);        // s32: movsxd rax, eax
+            6: E.EmitBytes([$89, $C0]);             // u32: mov eax, eax (zero-extends)
+            // else: width code 0/unknown -> value unchanged
+          end;
+          IStore(I^.Dest, RAX);
+        end;
+      bcArrayLBound: if InCallee then Exit else ArrBound(apc, I^.Src1, False);
+      bcArrayUBound: if InCallee then Exit else ArrBound(apc, I^.Src1, True);
       bcAddFloat: FloatBin([$F2, $0F, $58]);        // addsd
       bcSubFloat: FloatBin([$F2, $0F, $5C]);        // subsd
       bcMulFloat: FloatBin([$F2, $0F, $59]);        // mulsd
@@ -1046,8 +1127,8 @@ begin
     // Load the cached array base pointers / counts from the descriptor (r8) -- loop-invariant.
     for ci := 0 to NCArr - 1 do
     begin
-      if CArrBase[ci]  >= 0 then R8LoadR(CArrBase[ci],  LongWord(CArrId[ci]) * 24 + LongWord(CArrOff[ci]));
-      if CArrCount[ci] >= 0 then R8LoadR(CArrCount[ci], LongWord(CArrId[ci]) * 24 + 16);
+      if CArrBase[ci]  >= 0 then R8LoadR(CArrBase[ci],  LongWord(CArrId[ci]) * 32 + LongWord(CArrOff[ci]));
+      if CArrCount[ci] >= 0 then R8LoadR(CArrCount[ci], LongWord(CArrId[ci]) * 32 + 16);
     end;
 
     // Reserve stack scratch for inlined SUB frame save/restore (sits below the xmm6/7 save area; rsp is

@@ -5567,17 +5567,23 @@ procedure TBytecodeVM.RebuildJitArrDesc;
 var
   a, n: Integer;
 begin
+  // 4 Int64 per array (32 bytes): IntData ptr, FloatData ptr, Count (TotalSize), lower bound of dim 0.
+  // LBound lets the JIT compile LBOUND/UBOUND(arr) for a 1-D array (dim 0); other dims / the rank query
+  // deopt to the interpreter.
   n := Length(FArrays);
-  SetLength(FJitArrDesc, n * 3 + 3);   // +3 so @FJitArrDesc[0] is always valid even with no arrays
+  SetLength(FJitArrDesc, n * 4 + 4);   // +4 so @FJitArrDesc[0] is always valid even with no arrays
   for a := 0 to n - 1 do
   begin
     if Length(FArrays[a].IntData) > 0 then
-      FJitArrDesc[a * 3 + 0] := Int64(PtrUInt(@FArrays[a].IntData[0]))
-    else FJitArrDesc[a * 3 + 0] := 0;
+      FJitArrDesc[a * 4 + 0] := Int64(PtrUInt(@FArrays[a].IntData[0]))
+    else FJitArrDesc[a * 4 + 0] := 0;
     if Length(FArrays[a].FloatData) > 0 then
-      FJitArrDesc[a * 3 + 1] := Int64(PtrUInt(@FArrays[a].FloatData[0]))
-    else FJitArrDesc[a * 3 + 1] := 0;
-    FJitArrDesc[a * 3 + 2] := FArrays[a].TotalSize;
+      FJitArrDesc[a * 4 + 1] := Int64(PtrUInt(@FArrays[a].FloatData[0]))
+    else FJitArrDesc[a * 4 + 1] := 0;
+    FJitArrDesc[a * 4 + 2] := FArrays[a].TotalSize;
+    if Length(FArrays[a].LowerBounds) > 0 then
+      FJitArrDesc[a * 4 + 3] := FArrays[a].LowerBounds[0]
+    else FJitArrDesc[a * 4 + 3] := 0;
   end;
   FArraysDirty := False;
 end;
