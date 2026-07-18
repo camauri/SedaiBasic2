@@ -528,6 +528,8 @@ var
         bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat: begin T(J^.Dest); T(J^.Src1); T(J^.Src2); end;
         bcArrayLoadFloat:  T(J^.Dest);               // Dest = loaded float
         bcArrayStoreFloat: T(J^.Dest);               // Dest = stored VALUE (float)
+        bcXferStoreFloat:  T(J^.Src1);               // Src1 = value moved to the transfer slot
+        bcXferLoadFloat:   T(J^.Dest);               // Dest = value moved from the transfer slot
       end;
     end;
   end;
@@ -555,6 +557,8 @@ var
         bcIntToFloat: T(J^.Src1);                    // int input (Dest is float)
         bcArrayLoadFloat, bcArrayStoreFloat: T(J^.Src2);   // Src2 = index; Src1 is the array id
         bcArrayLoadInt, bcArrayStoreInt: begin T(J^.Dest); T(J^.Src2); end;  // Dest=result/value, Src2=index
+        bcXferStoreInt: T(J^.Src1);                  // Src1 = value moved to the transfer slot
+        bcXferLoadInt:  T(J^.Dest);                  // Dest = value moved from the transfer slot
         bcJumpIfZero, bcJumpIfNotZero: T(J^.Src1);
       end;
     end;
