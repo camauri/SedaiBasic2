@@ -238,6 +238,11 @@ var
   NCArr2: Integer;
   CallerGpr: array of Integer;   // distinct native GPRs the caller uses (to preserve around every callee)
   NCallerGpr, GprSaveDisp: Integer;
+  // Callee integer register allocation (J6f): while emitting an inlined callee, its hottest int regs get a
+  // native GPR (r9..r15, shared with the callee array cache by use-count priority), so the inner-loop index
+  // no longer reloads from memory on every array access. Non-allocated callee int regs stay memory-homed.
+  ILoc2: array of Integer;
+  ICalleeMax: Integer;
   // Sparse frame save (J6e): an inlined callee runs all-memory, so it can only corrupt a caller register
   // whose home is MEMORY (not allocated to a native reg). Save/restore ONLY those around the callee instead
   // of the whole bank -- the allocated caller regs live in r9-r15/xmm2-7, which the callee never touches.
@@ -356,27 +361,43 @@ var
     E.Emit8($80 or ((natreg and 7) shl 3) or RBX);
     E.Emit32(disp);
   end;
+  // Native GPR allocated to VM int reg vmreg in the CURRENT context (caller ILoc, or callee ILoc2 while
+  // inlining), or -1 = memory-homed.
+  function IAlloc(vmreg: Integer): Integer;
+  begin
+    if InCallee then
+    begin
+      if vmreg <= ICalleeMax then Result := ILoc2[vmreg] else Result := -1;
+    end
+    else
+      Result := ILoc[vmreg];
+  end;
   // Load VM int reg `vmreg` into scratch native reg `scr` (rax/rcx, always < 8).
   procedure ILoad(scr, vmreg: Integer);
+  var n: Integer;
   begin
-    if (not InCallee) and (ILoc[vmreg] >= 0) then MovRR(scr, ILoc[vmreg])
+    n := IAlloc(vmreg);
+    if n >= 0 then MovRR(scr, n)
     else E.MemOp([$48, $8B], scr, RBX, LongWord(vmreg) * 8);
   end;
   // Store scratch native reg `scr` (< 8) into VM int reg `vmreg`.
   procedure IStore(vmreg, scr: Integer);
+  var n: Integer;
   begin
-    if (not InCallee) and (ILoc[vmreg] >= 0) then MovRR(ILoc[vmreg], scr)
+    n := IAlloc(vmreg);
+    if n >= 0 then MovRR(n, scr)
     else E.MemOp([$48, $89], scr, RBX, LongWord(vmreg) * 8);
   end;
   // ALU op  scr <op> vmreg  (MemForm = full memory-form bytes incl. the $48 REX; scr is rax/rcx < 8).
   procedure IOp(const MemForm: array of Byte; scr, vmreg: Integer);
-  var rest: array of Byte; k: Integer;
+  var rest: array of Byte; k, n: Integer;
   begin
-    if (not InCallee) and (ILoc[vmreg] >= 0) then
+    n := IAlloc(vmreg);
+    if n >= 0 then
     begin
       SetLength(rest, Length(MemForm) - 1);      // drop MemForm[0] = $48 REX (EmitRR rebuilds it)
       for k := 1 to High(MemForm) do rest[k - 1] := MemForm[k];
-      EmitRR(rest, scr, ILoc[vmreg]);
+      EmitRR(rest, scr, n);
     end
     else
       E.MemOp(MemForm, scr, RBX, LongWord(vmreg) * 8);
@@ -842,14 +863,26 @@ var
     ScanRange(lo, hi);
   end;
 
-  // Build the inlined callee's DEDICATED array cache (J6d Stage 2) over its body [ep..rp]: collect its
-  // arrays with use counts, then hand the whole r9..r15 pool (freed by saving the caller's GPRs around the
-  // callee) to base+count of the most-used arrays, base first. Any callee-saved GPR (r12..r15) it claims is
-  // reported so the prologue preserves it; the assignment is deterministic (recomputed identically at emit).
+  // Build the inlined callee's dedicated GPR plan (J6d array cache + J6f int regalloc) over its body
+  // [ep..rp]. The whole r9..r15 pool is free (the caller's GPRs are saved around the callee), so hand it to
+  // the highest-use candidates -- each an array base, an array count, or a callee int register -- by use
+  // count. The inner-loop index thus lands in a register instead of reloading from memory on every access.
+  // Deterministic (recomputed identically at emit); a callee-saved GPR (r12..r15) claimed is marked SaveGpr.
   procedure AllocCalleeArr(ep, rp: Integer);
-  var q, k, off, aid, a, b, poolN: Integer; J: PBcInstr;
+  var q, k, off, aid, a, b, poolN, gp: Integer; J: PBcInstr;
+    IntUses: array of Integer;
+    CandUses, CandKind, CandRef: array of Integer;   // kind 0=int reg, 1=array base, 2=array count
+    NCand: Integer;
     procedure Swap(var x, y: Integer); var t: Integer; begin t := x; x := y; y := t; end;
+    procedure IU(r: Word);                             // count a callee int-reg use
+    begin if IntUses[r] >= 0 then Inc(IntUses[r]); end;
+    procedure AddCand(Kind, Ref, UseN: Integer);
+    begin
+      Inc(NCand); SetLength(CandUses, NCand); SetLength(CandKind, NCand); SetLength(CandRef, NCand);
+      CandUses[NCand-1] := UseN; CandKind[NCand-1] := Kind; CandRef[NCand-1] := Ref;
+    end;
   begin
+    // --- collect arrays with use counts (base+count candidates) ---
     NCArr2 := 0;
     for q := ep to rp do
     begin
@@ -873,25 +906,67 @@ var
       end;
       Inc(CArr2Uses[k]);
     end;
-    // priority = descending use count (selection sort; NCArr2 is tiny)
-    for a := 0 to NCArr2 - 2 do
-      for b := a + 1 to NCArr2 - 1 do
-        if CArr2Uses[b] > CArr2Uses[a] then
-        begin
-          Swap(CArr2Id[a], CArr2Id[b]); Swap(CArr2Off[a], CArr2Off[b]); Swap(CArr2Uses[a], CArr2Uses[b]);
-        end;
-    // assign r9..r15 (IntPool[0..6]) as base then count for each array in priority order
-    poolN := 0;
-    for a := 0 to NCArr2 - 1 do
+    // --- collect callee int registers with use counts ---
+    ICalleeMax := -1;
+    for q := ep to rp do
     begin
-      if poolN <= 6 then begin CArr2Base[a]  := IntPool[poolN]; Inc(poolN); end;
-      if poolN <= 6 then begin CArr2Count[a] := IntPool[poolN]; Inc(poolN); end;
+      J := @Prog[q];
+      case J^.OpCode of
+        bcLoadConstInt, bcFloatToInt: if J^.Dest > ICalleeMax then ICalleeMax := J^.Dest;
+        bcCopyInt, bcNarrowInt: begin if J^.Dest > ICalleeMax then ICalleeMax := J^.Dest; if J^.Src1 > ICalleeMax then ICalleeMax := J^.Src1; end;
+        bcAddInt, bcSubInt, bcMulInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt, bcCmpEqInt, bcCmpNeInt:
+          begin if J^.Dest > ICalleeMax then ICalleeMax := J^.Dest; if J^.Src1 > ICalleeMax then ICalleeMax := J^.Src1; if J^.Src2 > ICalleeMax then ICalleeMax := J^.Src2; end;
+        bcIntToFloat, bcJumpIfZero, bcJumpIfNotZero: if J^.Src1 > ICalleeMax then ICalleeMax := J^.Src1;
+        bcArrayLoadFloat, bcArrayStoreFloat: if J^.Src2 > ICalleeMax then ICalleeMax := J^.Src2;
+        bcArrayLoadInt, bcArrayStoreInt: begin if J^.Dest > ICalleeMax then ICalleeMax := J^.Dest; if J^.Src2 > ICalleeMax then ICalleeMax := J^.Src2; end;
+        bcXferStoreInt: if J^.Src1 > ICalleeMax then ICalleeMax := J^.Src1;
+        bcXferLoadInt:  if J^.Dest > ICalleeMax then ICalleeMax := J^.Dest;
+      end;
     end;
-    // any callee-saved GPR (r12..r15) the cache claims must be preserved by the prologue
-    for a := 0 to NCArr2 - 1 do
+    SetLength(ILoc2, ICalleeMax + 2);
+    SetLength(IntUses, ICalleeMax + 2);
+    for a := 0 to High(ILoc2) do begin ILoc2[a] := -1; IntUses[a] := 0; end;
+    for q := ep to rp do
     begin
-      if CArr2Base[a]  >= 12 then SaveGpr[CArr2Base[a]]  := True;
-      if CArr2Count[a] >= 12 then SaveGpr[CArr2Count[a]] := True;
+      J := @Prog[q];
+      case J^.OpCode of
+        bcLoadConstInt, bcFloatToInt: IU(J^.Dest);
+        bcCopyInt, bcNarrowInt: begin IU(J^.Dest); IU(J^.Src1); end;
+        bcAddInt, bcSubInt, bcMulInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt, bcCmpEqInt, bcCmpNeInt:
+          begin IU(J^.Dest); IU(J^.Src1); IU(J^.Src2); end;
+        bcIntToFloat, bcJumpIfZero, bcJumpIfNotZero: IU(J^.Src1);
+        bcArrayLoadFloat, bcArrayStoreFloat: IU(J^.Src2);
+        bcArrayLoadInt, bcArrayStoreInt: begin IU(J^.Dest); IU(J^.Src2); end;
+        bcXferStoreInt: IU(J^.Src1);
+        bcXferLoadInt:  IU(J^.Dest);
+      end;
+    end;
+    // --- unified candidate list, sorted by use count (base added before count for tie priority) ---
+    NCand := 0;
+    for a := 0 to NCArr2 - 1 do begin AddCand(1, a, CArr2Uses[a]); AddCand(2, a, CArr2Uses[a]); end;
+    for a := 0 to ICalleeMax do if IntUses[a] > 0 then AddCand(0, a, IntUses[a]);
+    for a := 0 to NCand - 2 do
+      for b := a + 1 to NCand - 1 do
+        if CandUses[b] > CandUses[a] then
+        begin Swap(CandUses[a], CandUses[b]); Swap(CandKind[a], CandKind[b]); Swap(CandRef[a], CandRef[b]); end;
+    // --- assign r9..r15 to the top candidates ---
+    poolN := 0;
+    for a := 0 to NCand - 1 do
+    begin
+      if poolN > 6 then Break;
+      gp := IntPool[poolN];
+      case CandKind[a] of
+        0: begin if ILoc2[CandRef[a]] < 0 then begin ILoc2[CandRef[a]] := gp; Inc(poolN); end; end;
+        1: begin if CArr2Base[CandRef[a]]  < 0 then begin CArr2Base[CandRef[a]]  := gp; Inc(poolN); end; end;
+        2: begin if CArr2Count[CandRef[a]] < 0 then begin CArr2Count[CandRef[a]] := gp; Inc(poolN); end; end;
+      end;
+    end;
+    for a := 9 to 15 do
+    begin
+      b := 0;
+      for k := 0 to NCArr2 - 1 do if (CArr2Base[k] = a) or (CArr2Count[k] = a) then b := 1;
+      for k := 0 to ICalleeMax do if ILoc2[k] = a then b := 1;
+      if (b = 1) and (a >= 12) then SaveGpr[a] := True;   // callee-saved GPR claimed -> prologue preserves it
     end;
   end;
 
@@ -965,8 +1040,8 @@ var
     S2 := LongWord(I^.Src2) * 8;
     case I^.OpCode of
       bcLoadConstInt:
-        if (not InCallee) and (ILoc[I^.Dest] >= 0) then
-          MovImm64(ILoc[I^.Dest], I^.Immediate)                    // mov gpr, imm64
+        if IAlloc(I^.Dest) >= 0 then
+          MovImm64(IAlloc(I^.Dest), I^.Immediate)                  // mov gpr, imm64
         else
         begin
           MovImm64(RAX, I^.Immediate);                             // mov rax, imm64
@@ -979,8 +1054,8 @@ var
           FStore(I^.Dest, XMM0);                                   // -> xmm reg or [rsi+d]
         end;
       bcCopyInt:
-        if (not InCallee) and (ILoc[I^.Dest] >= 0) and (ILoc[I^.Src1] >= 0) then
-          MovRR(ILoc[I^.Dest], ILoc[I^.Src1])   // reg-reg copy in one move
+        if (IAlloc(I^.Dest) >= 0) and (IAlloc(I^.Src1) >= 0) then
+          MovRR(IAlloc(I^.Dest), IAlloc(I^.Src1))   // reg-reg copy in one move
         else
         begin
           ILoad(RAX, I^.Src1);
@@ -1043,9 +1118,9 @@ var
         else Exit;
       bcIntToFloat:
         begin
-          if (not InCallee) and (ILoc[I^.Src1] >= 0) then
+          if IAlloc(I^.Src1) >= 0 then
           begin
-            gpr := ILoc[I^.Src1];
+            gpr := IAlloc(I^.Src1);
             E.Emit8($F2);
             if gpr >= 8 then E.Emit8($49) else E.Emit8($48);   // REX.W (+B)
             E.EmitBytes([$0F, $2A]);
