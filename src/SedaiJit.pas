@@ -208,7 +208,6 @@ var
   CallPC, CallEntry, CallRet, CallSaveN: array of Integer;   // parallel arrays, one entry per call site
   NCall: Integer;
   ScratchBytes: Integer;             // stack bytes reserved for the deepest call site's bank save/restore
-  CurSaveN: Integer;                 // save size of the call site being emitted (read by its ReturnSub)
   // Float register allocation (J4): map a VM float reg -> a native xmm (2..7, no REX) or -1 (memory).
   // Only the volatile-plus-two set xmm2..xmm7 is used; xmm6/xmm7 are callee-saved so they are spilled to
   // the stack in the prologue when allocated. Integer VM regs are allocated to r9..r15 (see ILoc below).
@@ -239,6 +238,12 @@ var
   NCArr2: Integer;
   CallerGpr: array of Integer;   // distinct native GPRs the caller uses (to preserve around every callee)
   NCallerGpr, GprSaveDisp: Integer;
+  // Sparse frame save (J6e): an inlined callee runs all-memory, so it can only corrupt a caller register
+  // whose home is MEMORY (not allocated to a native reg). Save/restore ONLY those around the callee instead
+  // of the whole bank -- the allocated caller regs live in r9-r15/xmm2-7, which the callee never touches.
+  // For a loop whose caller regs are all allocated (e.g. n-body's main loop) this list is empty: no copy.
+  SaveIntRegs, SaveFloatRegs: array of Integer;
+  NSaveInt, NSaveFloat: Integer;
 
   procedure AddFixup(AOff, ATarget: Integer);
   begin
@@ -915,35 +920,25 @@ var
     end;
   end;
 
-  // Save VM register bank [0,N) qwords (BankBase = rbx for int / rsi for float) to the stack scratch area
-  // at [rsp+Disp+i*8]. Replicates FramePush for an inlined SUB call. Uses rax (temp) and rcx (counter);
-  // the loop body is < 128 bytes so the back-branch is a rel8. N < 2^31.
-  procedure EmitSaveBank(BankBase: Byte; Disp: LongWord; N: Integer);
-  var loopStart: Integer;
+  // Sparse frame save/restore (J6e): save the listed memory-homed caller regs (raw qwords, rax scratch)
+  // to the stack scratch at [rsp+Disp+i*8]. Restore is the reverse. Emits nothing when the list is empty.
+  procedure EmitSaveSparse(BankBase: Byte; const Regs: array of Integer; NRegs: Integer; Disp: LongWord);
+  var i: Integer;
   begin
-    if N <= 0 then Exit;
-    E.EmitBytes([$31, $C9]);                                       // xor ecx,ecx
-    loopStart := E.Len;
-    E.EmitBytes([$48, $8B, $04, Byte($C8 or (BankBase and 7))]);   // mov rax,[BankBase+rcx*8]
-    E.EmitBytes([$48, $89, $84, $CC]); E.Emit32(Disp);            // mov [rsp+Disp+rcx*8],rax
-    E.EmitBytes([$48, $FF, $C1]);                                 // inc rcx
-    E.EmitBytes([$48, $81, $F9]); E.Emit32(LongWord(N));          // cmp rcx,N
-    E.EmitBytes([$7C, $00]);                                      // jl rel8 -> loopStart
-    E.PatchByte(E.Len - 1, Byte(loopStart - E.Len));
+    for i := 0 to NRegs - 1 do
+    begin
+      E.MemOp([$48, $8B], RAX, BankBase, LongWord(Regs[i]) * 8);     // mov rax, [bank+reg*8]
+      E.EmitBytes([$48, $89, $84, $24]); E.Emit32(Disp + LongWord(i) * 8);  // mov [rsp+Disp+i*8], rax
+    end;
   end;
-  // Restore VM register bank [0,N) from the stack scratch (the FramePop counterpart).
-  procedure EmitRestoreBank(BankBase: Byte; Disp: LongWord; N: Integer);
-  var loopStart: Integer;
+  procedure EmitRestoreSparse(BankBase: Byte; const Regs: array of Integer; NRegs: Integer; Disp: LongWord);
+  var i: Integer;
   begin
-    if N <= 0 then Exit;
-    E.EmitBytes([$31, $C9]);                                       // xor ecx,ecx
-    loopStart := E.Len;
-    E.EmitBytes([$48, $8B, $84, $CC]); E.Emit32(Disp);           // mov rax,[rsp+Disp+rcx*8]
-    E.EmitBytes([$48, $89, $04, Byte($C8 or (BankBase and 7))]);  // mov [BankBase+rcx*8],rax
-    E.EmitBytes([$48, $FF, $C1]);                                 // inc rcx
-    E.EmitBytes([$48, $81, $F9]); E.Emit32(LongWord(N));          // cmp rcx,N
-    E.EmitBytes([$7C, $00]);                                      // jl rel8 -> loopStart
-    E.PatchByte(E.Len - 1, Byte(loopStart - E.Len));
+    for i := 0 to NRegs - 1 do
+    begin
+      E.EmitBytes([$48, $8B, $84, $24]); E.Emit32(Disp + LongWord(i) * 8);  // mov rax, [rsp+Disp+i*8]
+      E.MemOp([$48, $89], RAX, BankBase, LongWord(Regs[i]) * 8);     // mov [bank+reg*8], rax
+    end;
   end;
 
   // Return the call-site index for a bcCallSub at absolute PC apc (populated by BuildCallSites), or -1
@@ -1140,9 +1135,10 @@ var
         begin
           cs := FindCallSite(apc);
           if cs < 0 then Exit;                       // not inlinable -> bail
-          CurSaveN := CallSaveN[cs];
-          EmitSaveBank(RBX, 0, CurSaveN);                       // save int bank [0,CurSaveN)
-          EmitSaveBank(RSI, LongWord(CurSaveN) * 8, CurSaveN);  // save float bank [0,CurSaveN)
+          // Save only the caller's MEMORY-HOMED regs (J6e): the callee can corrupt those memory slots; the
+          // caller's allocated regs live in native registers the callee never touches.
+          EmitSaveSparse(RBX, SaveIntRegs, NSaveInt, 0);
+          EmitSaveSparse(RSI, SaveFloatRegs, NSaveFloat, LongWord(NSaveInt) * 8);
           EmitSaveCallerGpr;                                    // free r9..r15 for the callee's array cache
           AllocCalleeArr(CallEntry[cs], CallRet[cs]);          // build CArr2 (same result as the pre-pass)
           for ck := 0 to NCArr2 - 1 do                         // load the callee cache from the descriptor
@@ -1162,8 +1158,8 @@ var
         if InCallee then
         begin
           EmitRestoreCallerGpr;                                    // restore the caller's GPRs
-          EmitRestoreBank(RBX, 0, CurSaveN);                       // restore int bank
-          EmitRestoreBank(RSI, LongWord(CurSaveN) * 8, CurSaveN);  // restore float bank -> fall through
+          EmitRestoreSparse(RBX, SaveIntRegs, NSaveInt, 0);       // restore memory-homed caller int regs
+          EmitRestoreSparse(RSI, SaveFloatRegs, NSaveFloat, LongWord(NSaveInt) * 8);  // ...and float
         end
         else
           Exit;                                      // a bare RETURN at loop top level is not compilable
@@ -1258,6 +1254,7 @@ begin
   for d := 0 to ProgLen - 1 do InRange[d] := False;
   for d := HeaderPC to EndPC do InRange[d] := True;
   InCallee := False;
+  NSaveInt := 0; NSaveFloat := 0;     // J6e: sparse-save lists, filled by the allocation overflow branches
   BuildCallSites;                     // find inlinable bcCallSub, mark callee ranges, size the stack scratch
   NFix := 0;
 
@@ -1279,7 +1276,10 @@ begin
         Inc(NextXmm);
       end
       else
-        FLoc[fi] := -1;                     // overflow -> memory-homed
+      begin
+        FLoc[fi] := -1;                     // overflow -> memory-homed (used but no xmm)
+        Inc(NSaveFloat); SetLength(SaveFloatRegs, NSaveFloat); SaveFloatRegs[NSaveFloat - 1] := fi;
+      end;
     end;
 
   // --- integer GPR allocation (J5): r9/r10/r11 (volatile) then r12..r15 (callee-saved) ---
@@ -1302,7 +1302,10 @@ begin
         Inc(NextGpr);
       end
       else
-        ILoc[ii] := -1;                     // overflow -> memory-homed
+      begin
+        ILoc[ii] := -1;                     // overflow -> memory-homed (used but no GPR)
+        Inc(NSaveInt); SetLength(SaveIntRegs, NSaveInt); SaveIntRegs[NSaveInt - 1] := ii;
+      end;
     end;
 
   // --- array base/count caching (J5c LICM): hand the GPRs left free after int allocation to the
@@ -1358,8 +1361,11 @@ begin
     end;
   for ci := 0 to NCall - 1 do
     AllocCalleeArr(CallEntry[ci], CallRet[ci]);   // sets SaveGpr for callee-saved cache regs
-  // Scratch layout: [0, MaxSaveN*16) memory-bank save, then [GprSaveDisp, +NCallerGpr*8) caller-GPR save.
-  GprSaveDisp := ScratchBytes;                     // ScratchBytes here == MaxSaveN*16 (set by BuildCallSites)
+  // Sparse frame-save lists (J6e) were built during allocation (the overflow branches): SaveIntRegs /
+  // SaveFloatRegs hold exactly the USED caller regs that got no native register. For n-body's fully-allocated
+  // main loop both are empty -> no per-call bank copy at all.
+  // Scratch layout: [0, (NSaveInt+NSaveFloat)*8) sparse bank save, then [GprSaveDisp, +NCallerGpr*8) GPR save.
+  GprSaveDisp := (NSaveInt + NSaveFloat) * 8;
   ScratchBytes := GprSaveDisp + NCallerGpr * 8;
 
   try
