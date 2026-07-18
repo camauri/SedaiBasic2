@@ -249,6 +249,15 @@ var
   // For a loop whose caller regs are all allocated (e.g. n-body's main loop) this list is empty: no copy.
   SaveIntRegs, SaveFloatRegs: array of Integer;
   NSaveInt, NSaveFloat: Integer;
+  // Inlined GOSUB (bcCall): a classic GOSUB shares the caller's register frame (no FramePush), so its body
+  // [GEntry..GRet] is emitted inline with the all-memory model. The caller's allocated regs are spilled to
+  // their home slots before the body and reloaded after, so the body reads/writes shared variables through
+  // memory consistently. Deopt-prone ops that could leave a NON-terminal path (integer div/mod, LBOUND/
+  // UBOUND, an out-of-region jump) bail; the only deopts left in an inlinable body are the terminal CLASSIC
+  // traps (array OOB, Sqr of a negative, divide by zero) which raise and never return.
+  InGosub: Boolean;
+  GEntry, GRet, GCallPC: array of Integer;   // one entry per inlinable GOSUB site
+  NGosub: Integer;
 
   procedure AddFixup(AOff, ATarget: Integer);
   begin
@@ -287,7 +296,7 @@ var
   // In callee-inline mode every VM reg is memory-homed (the caller's FLoc must not be consulted).
   procedure FLoad(Wx, vmreg: Integer);
   begin
-    if InCallee then
+    if InCallee or InGosub then
       E.MemOp([$F2, $0F, $10], Wx, RSI, LongWord(vmreg) * 8)
     else if FLoc[vmreg] >= 0 then
     begin
@@ -300,7 +309,7 @@ var
   // <op>sd Wx, <VM float reg vmreg>
   procedure FOp(const SseOp: array of Byte; Wx, vmreg: Integer);
   begin
-    if InCallee then
+    if InCallee or InGosub then
       E.MemOp(SseOp, Wx, RSI, LongWord(vmreg) * 8)
     else if FLoc[vmreg] >= 0 then
       E.EmitBytes([SseOp[0], SseOp[1], SseOp[2], $C0 or (Wx shl 3) or FLoc[vmreg]])
@@ -310,7 +319,7 @@ var
   // store working xmm Wx -> VM float reg dest
   procedure FStore(vmreg, Wx: Integer);
   begin
-    if InCallee then
+    if InCallee or InGosub then
       E.MemOp([$F2, $0F, $11], Wx, RSI, LongWord(vmreg) * 8)
     else if FLoc[vmreg] >= 0 then
     begin
@@ -365,7 +374,9 @@ var
   // inlining), or -1 = memory-homed.
   function IAlloc(vmreg: Integer): Integer;
   begin
-    if InCallee then
+    if InGosub then
+      Result := -1                         // inlined GOSUB body: everything memory-homed (shared frame)
+    else if InCallee then
     begin
       if vmreg <= ICalleeMax then Result := ILoc2[vmreg] else Result := -1;
     end
@@ -1026,6 +1037,15 @@ var
       if CallPC[k] = apc then begin Result := k; Exit; end;
   end;
 
+  // Return the GOSUB-site index for a bcCall at absolute PC apc (populated by BuildGosubSites), or -1.
+  function FindGosubSite(apc: Integer): Integer;
+  var k: Integer;
+  begin
+    Result := -1;
+    for k := 0 to NGosub - 1 do
+      if GCallPC[k] = apc then begin Result := k; Exit; end;
+  end;
+
   // Emit native code for one bytecode instruction at absolute PC apc. Returns False (bail) on any
   // unsupported opcode or a bcCallSub that could not be inlined. A bcCallSub emits an inline copy of the
   // callee body wrapped in a native FramePush/Pop; the callee is compiled all-memory (InCallee).
@@ -1086,8 +1106,8 @@ var
         end;
       // Integer div/mod deopt to the interpreter on the faulting cases -- not valid inside an inlined
       // callee (its native frame would be lost on the deopt), so bail there.
-      bcDivInt: if InCallee then Exit else DivMod(apc, False);
-      bcModInt: if InCallee then Exit else DivMod(apc, True);
+      bcDivInt: if InCallee or InGosub then Exit else DivMod(apc, False);
+      bcModInt: if InCallee or InGosub then Exit else DivMod(apc, True);
       bcNarrowInt:
         begin
           ILoad(RAX, I^.Src1);
@@ -1102,8 +1122,8 @@ var
           end;
           IStore(I^.Dest, RAX);
         end;
-      bcArrayLBound: if InCallee then Exit else ArrBound(apc, I^.Src1, False);
-      bcArrayUBound: if InCallee then Exit else ArrBound(apc, I^.Src1, True);
+      bcArrayLBound: if InCallee or InGosub then Exit else ArrBound(apc, I^.Src1, False);
+      bcArrayUBound: if InCallee or InGosub then Exit else ArrBound(apc, I^.Src1, True);
       bcAddFloat: FloatBin([$F2, $0F, $58]);        // addsd
       bcSubFloat: FloatBin([$F2, $0F, $5C]);        // subsd
       bcMulFloat: FloatBin([$F2, $0F, $59]);        // mulsd
@@ -1270,12 +1290,38 @@ var
         end
         else
           Exit;                                      // a bare RETURN at loop top level is not compilable
+      // Inlined GOSUB (classic): the body shares the caller frame, so no FramePush -- just spill the caller's
+      // allocated regs to their home slots, emit the body all-memory, then reload them (it may have written
+      // shared variables through memory). A deopt inside is only reachable on a terminal CLASSIC trap.
+      bcCall:
+        begin
+          cs := FindGosubSite(apc);
+          if cs < 0 then Exit;                       // not inlinable -> bail
+          for ck := 0 to High(ILoc) do
+            if ILoc[ck] >= 0 then StoreRegMem(ILoc[ck], LongWord(ck) * 8);
+          for ck := 0 to High(FLoc) do
+            if FLoc[ck] >= 0 then E.MemOp([$F2, $0F, $11], FLoc[ck], RSI, LongWord(ck) * 8);
+          InGosub := True;
+          for cpc := GEntry[cs] to GRet[cs] do
+          begin
+            NativeOff[cpc] := E.Len;
+            if not EmitOne(cpc) then begin InGosub := False; Exit; end;
+          end;
+          InGosub := False;
+          for ck := 0 to High(ILoc) do
+            if ILoc[ck] >= 0 then LoadRegMem(ILoc[ck], LongWord(ck) * 8);
+          for ck := 0 to High(FLoc) do
+            if FLoc[ck] >= 0 then E.MemOp([$F2, $0F, $10], FLoc[ck], RSI, LongWord(ck) * 8);
+        end;
+      bcReturn:
+        if not InGosub then Exit;                    // top-level RETURN not compilable; in-body = terminator
       bcJump:
         begin
           target := Integer(I^.Immediate);
           if InRange[target] then JmpRel(target)
           else
           begin
+            if InGosub then Exit;                              // a deopt out of an inlined GOSUB is unsafe
             E.EmitBytes([$B8]); E.Emit32(LongWord(target));   // mov eax, target (exit PC)
             JmpRel(-1);                                        // jmp epilogue
           end;
@@ -1292,6 +1338,7 @@ var
           end
           else
           begin
+            if InGosub then Exit;                    // a conditional deopt out of an inlined GOSUB is unsafe
             // Conditional EXIT: skip over the exit sequence when the branch is NOT taken.
             if I^.OpCode = bcJumpIfZero then E.EmitBytes([$75, $00])   // jnz short +len(exit)
             else E.EmitBytes([$74, $00]);                             // jz  short +len(exit)
@@ -1345,6 +1392,44 @@ var
     end;
   end;
 
+  // Pre-scan for inlinable classic GOSUB (bcCall) sites: locate the single terminating bcReturn, reject
+  // nested calls / string / record ops, and mark the body PCs in-range. A target reached from more than one
+  // call site in the loop is skipped (its body would be emitted twice, breaking forward-jump fixups). Any
+  // remaining unsafe op (integer div/mod, LBOUND/UBOUND, a jump out of the body) makes the emit bail.
+  procedure BuildGosubSites;
+  var q, r, ep, rp, cnt, k2: Integer; J: PBcInstr; ok: Boolean;
+  begin
+    NGosub := 0;
+    for q := HeaderPC to EndPC do
+    begin
+      if Prog[q].OpCode <> bcCall then Continue;
+      ep := Integer(Prog[q].Immediate);
+      if (ep < 0) or (ep >= ProgLen) then Continue;    // out of range -> not inlinable
+      if (ep >= HeaderPC) and (ep <= EndPC) then Continue;   // target inside the loop -> skip (overlap)
+      cnt := 0;                                         // reject targets reached from >1 site (double-emit)
+      for k2 := HeaderPC to EndPC do
+        if (Prog[k2].OpCode = bcCall) and (Integer(Prog[k2].Immediate) = ep) then Inc(cnt);
+      if cnt <> 1 then Continue;
+      rp := -1; ok := True; r := ep;
+      while r < ProgLen do
+      begin
+        J := @Prog[r];
+        if J^.OpCode = bcReturn then begin rp := r; Break; end;
+        case J^.OpCode of
+          bcCall, bcCallSub, bcCallSubIndirect, bcReturnSub,   // no nested calls / SUB returns
+          bcXferStoreString, bcXferLoadString,                 // no string transfer
+          bcRecordNew, bcRecordNewArray: begin ok := False; Break; end;   // no record allocation
+        end;
+        Inc(r);
+      end;
+      if (rp < 0) or (not ok) then Continue;
+      Inc(NGosub);
+      SetLength(GCallPC, NGosub); SetLength(GEntry, NGosub); SetLength(GRet, NGosub);
+      GCallPC[NGosub - 1] := q; GEntry[NGosub - 1] := ep; GRet[NGosub - 1] := rp;
+      for r := ep to rp do InRange[r] := True;
+    end;
+  end;
+
 begin
   Result := nil;
   Prog := PBcInstr(Ins);
@@ -1361,8 +1446,10 @@ begin
   for d := 0 to ProgLen - 1 do InRange[d] := False;
   for d := HeaderPC to EndPC do InRange[d] := True;
   InCallee := False;
+  InGosub := False;
   NSaveInt := 0; NSaveFloat := 0;     // J6e: sparse-save lists, filled by the allocation overflow branches
   BuildCallSites;                     // find inlinable bcCallSub, mark callee ranges, size the stack scratch
+  BuildGosubSites;                    // find inlinable classic GOSUB (bcCall), mark body ranges in-range
   NFix := 0;
 
   // --- float register allocation (J4): assign xmm2..xmm7 to the used VM float regs, spill the rest ---
