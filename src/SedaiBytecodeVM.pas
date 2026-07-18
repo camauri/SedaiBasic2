@@ -5554,6 +5554,7 @@ begin
       // it at run time for the current base). Shared-record handles deopt, so no lock is baked in.
       Mem := CompileLoop(Ins, hdr, HeaderEnd[hdr], n, FTrueValue,
                          Assigned(FProgram) and FProgram.ModernMode and (not FBoundsCheck),
+                         Assigned(FProgram) and FProgram.ModernMode,
                          PtrUInt(@FCtx.XferInt[0]), PtrUInt(@FCtx.XferFloat[0]),
                          PtrUInt(@FCtx.Records), RecSz, RIntOff, RFloatOff);
       if Mem <> nil then FNativeLoops[hdr] := Mem;

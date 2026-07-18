@@ -76,7 +76,7 @@ type
 // fields, so record field access (J13) needs no hardcoded layout. Returns a TExecMem whose Ptr is a
 // TNativeLoopFn, or nil if the loop is not compilable.
 function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: Int64;
-                     AllowUnsafe: Boolean; XferIntBase, XferFloatBase: PtrUInt;
+                     AllowUnsafe, Modern: Boolean; XferIntBase, XferFloatBase: PtrUInt;
                      RecFieldAddr: PtrUInt; RecSize, RecIntOff, RecFloatOff: Integer): TExecMem;
 
 // J2 self-test: emit  a+b  and call it, proving the emit->exec->call pipeline.
@@ -188,7 +188,7 @@ type
   end;
 
 function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: Int64;
-                     AllowUnsafe: Boolean; XferIntBase, XferFloatBase: PtrUInt;
+                     AllowUnsafe, Modern: Boolean; XferIntBase, XferFloatBase: PtrUInt;
                      RecFieldAddr: PtrUInt; RecSize, RecIntOff, RecFloatOff: Integer): TExecMem;
 var
   E: TX86Emitter;
@@ -1133,17 +1133,16 @@ var
           end;
           FStore(I^.Dest, XMM0);
         end;
-      // Implicit float->int (assignment/index/FOR bound/arg): MODERN rounds half-to-even, which is exactly
-      // cvtsd2si under the default MXCSR round-to-nearest mode (the same mode FPC's Round reads). CLASSIC
-      // truncates (Trunc) -- that needs a dialect flag we do not carry, so a non-MODERN loop bails.
+      // Implicit float->int (assignment/index/FOR bound/arg). MODERN rounds half-to-even = cvtsd2si under
+      // the default MXCSR round-to-nearest mode (the same mode FPC's Round reads). CLASSIC truncates toward
+      // zero = cvttsd2si (matches FPC's Trunc). Depends only on the dialect, not on bounds-checking.
       bcFloatToInt:
-        if AllowUnsafe then
         begin
           FLoad(XMM0, I^.Src1);                        // xmm0 = V
-          E.EmitBytes([$F2, $48, $0F, $2D, $C0]);      // cvtsd2si rax, xmm0
+          if Modern then E.EmitBytes([$F2, $48, $0F, $2D, $C0])   // cvtsd2si rax, xmm0   (round)
+          else           E.EmitBytes([$F2, $48, $0F, $2C, $C0]);  // cvttsd2si rax, xmm0  (truncate)
           IStore(I^.Dest, RAX);
-        end
-        else Exit;
+        end;
       // Arrays: MODERN + no forced check -> in-place (OOB = default). CLASSIC / --bounds-check -> compile
       // with an OOB deopt to the interpreter (which raises), except inside an inlined callee where a deopt
       // is unsafe (native frame lost) -> bail.
