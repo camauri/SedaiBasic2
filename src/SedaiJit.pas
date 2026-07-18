@@ -78,6 +78,7 @@ implementation
 // x86-64 register numbers
 const
   RAX = 0; RCX = 1; RDX = 2; RBX = 3; RSI = 6; R8 = 8;
+  R9 = 9; R10 = 10; R11 = 11; R12 = 12; R13 = 13; R14 = 14; R15 = 15;
   XMM0 = 0; XMM1 = 1;
 
 { ---------------- executable memory ---------------- }
@@ -185,10 +186,16 @@ var
   d, target: Integer;
   // Float register allocation (J4): map a VM float reg -> a native xmm (2..7, no REX) or -1 (memory).
   // Only the volatile-plus-two set xmm2..xmm7 is used; xmm6/xmm7 are callee-saved so they are spilled to
-  // the stack in the prologue when allocated. Integer VM regs stay memory-homed (next increment).
+  // the stack in the prologue when allocated. Integer VM regs are allocated to r9..r15 (see ILoc below).
   FLoc: array of Integer;
   FMaxReg, NextXmm, fi: Integer;
   SaveX6, SaveX7: Boolean;
+  // Integer register allocation (J5): map a VM int reg -> a native GPR (r9..r15) or -1 (memory-homed).
+  // Pool order: r9/r10/r11 (volatile) first, then r12..r15 (callee-saved, push/pop'd when used).
+  ILoc: array of Integer;
+  IMaxReg, NextGpr, ii, gpr: Integer;
+  IntPool: array[0..6] of Integer;
+  SaveGpr: array[0..15] of Boolean;
 
   procedure AddFixup(AOff, ATarget: Integer);
   begin
@@ -244,11 +251,77 @@ var
       E.MemOp([$F2, $0F, $11], Wx, RSI, LongWord(vmreg) * 8);             // movsd [rsi+off], Wx
   end;
 
+  // --- integer GPR register-allocation helpers (J5) ---
+  // Reg-reg instruction: REX.W (+R if regField>=8)(+B if rmReg>=8), Op..., ModRM(mod=11, regField, rmReg).
+  procedure EmitRR(const Op: array of Byte; regField, rmReg: Integer);
+  var rex: Byte; k: Integer;
+  begin
+    rex := $48;
+    if regField >= 8 then rex := rex or $04;    // REX.R
+    if rmReg    >= 8 then rex := rex or $01;     // REX.B
+    E.Emit8(rex);
+    for k := 0 to High(Op) do E.Emit8(Op[k]);
+    E.Emit8($C0 or ((regField and 7) shl 3) or (rmReg and 7));
+  end;
+  // mov <native dst>, <native src>   (89 = mov r/m64,r64 : reg field = src, rm field = dst)
+  procedure MovRR(dst, src: Integer);
+  begin EmitRR([$89], src, dst); end;
+  // mov <native reg>, imm64
+  procedure MovImm64(natreg: Integer; imm: Int64);
+  var rex: Byte;
+  begin
+    rex := $48; if natreg >= 8 then rex := rex or $01;   // REX.B
+    E.Emit8(rex); E.Emit8($B8 or (natreg and 7)); E.Emit64(QWord(imm));
+  end;
+  // mov <native reg>, [rbx+disp]   (entry load; REX.W + REX.R if reg>=8; rbx base, mod=10 disp32)
+  procedure LoadRegMem(natreg: Integer; disp: LongWord);
+  var rex: Byte;
+  begin
+    rex := $48; if natreg >= 8 then rex := rex or $04;   // REX.R
+    E.Emit8(rex); E.Emit8($8B);
+    E.Emit8($80 or ((natreg and 7) shl 3) or RBX);        // mod=10 reg=natreg rm=rbx(3)
+    E.Emit32(disp);
+  end;
+  // mov [rbx+disp], <native reg>   (exit store)
+  procedure StoreRegMem(natreg: Integer; disp: LongWord);
+  var rex: Byte;
+  begin
+    rex := $48; if natreg >= 8 then rex := rex or $04;   // REX.R
+    E.Emit8(rex); E.Emit8($89);
+    E.Emit8($80 or ((natreg and 7) shl 3) or RBX);
+    E.Emit32(disp);
+  end;
+  // Load VM int reg `vmreg` into scratch native reg `scr` (rax/rcx, always < 8).
+  procedure ILoad(scr, vmreg: Integer);
+  begin
+    if ILoc[vmreg] >= 0 then MovRR(scr, ILoc[vmreg])
+    else E.MemOp([$48, $8B], scr, RBX, LongWord(vmreg) * 8);
+  end;
+  // Store scratch native reg `scr` (< 8) into VM int reg `vmreg`.
+  procedure IStore(vmreg, scr: Integer);
+  begin
+    if ILoc[vmreg] >= 0 then MovRR(ILoc[vmreg], scr)
+    else E.MemOp([$48, $89], scr, RBX, LongWord(vmreg) * 8);
+  end;
+  // ALU op  scr <op> vmreg  (MemForm = full memory-form bytes incl. the $48 REX; scr is rax/rcx < 8).
+  procedure IOp(const MemForm: array of Byte; scr, vmreg: Integer);
+  var rest: array of Byte; k: Integer;
+  begin
+    if ILoc[vmreg] >= 0 then
+    begin
+      SetLength(rest, Length(MemForm) - 1);      // drop MemForm[0] = $48 REX (EmitRR rebuilds it)
+      for k := 1 to High(MemForm) do rest[k - 1] := MemForm[k];
+      EmitRR(rest, scr, ILoc[vmreg]);
+    end
+    else
+      E.MemOp(MemForm, scr, RBX, LongWord(vmreg) * 8);
+  end;
+
   // Integer comparison Rd = (Rs1 <cc> Rs2) ? TrueVal : 0
   procedure IntCmp(SetCC: Byte);
   begin
-    E.MemOp([$48, $8B], RAX, RBX, S1);      // mov rax,[rbx+s1]
-    E.MemOp([$48, $3B], RAX, RBX, S2);      // cmp rax,[rbx+s2]
+    ILoad(RAX, I^.Src1);                    // mov rax, src1
+    IOp([$48, $3B], RAX, I^.Src2);          // cmp rax, src2
     E.EmitBytes([$0F, SetCC, $C0]);         // setcc al
     E.EmitBytes([$0F, $B6, $C0]);           // movzx eax,al   (rax = 0/1)
     if TrueVal = -1 then
@@ -258,7 +331,7 @@ var
       // TrueVal is some other value: rax := (rax<>0) ? TrueVal : 0  via imul
       E.EmitBytes([$48, $69, $C0]); E.Emit32(LongWord(TrueVal and $FFFFFFFF));  // imul rax,rax,imm32
     end;
-    E.MemOp([$48, $89], RAX, RBX, Dd);      // mov [rbx+d],rax
+    IStore(I^.Dest, RAX);                   // dest := rax
   end;
 
   // Float op:  Rd = Rs1 <sse> Rs2   (compute in xmm0, honouring register allocation of the operands)
@@ -282,7 +355,7 @@ var
   procedure ArrLoadF(ArrayId, IdxReg, DstReg: Integer);
   var pOOB, pDone: Integer;
   begin
-    E.MemOp([$48, $8B], RCX, RBX, LongWord(IdxReg) * 8);     // mov rcx,[rbx+idx]
+    ILoad(RCX, IdxReg);                                     // rcx := index (reg or [rbx+idx])
     R8Load(RDX, LongWord(ArrayId) * 24 + 16);               // mov rdx, Count
     E.EmitBytes([$48, $39, $D1]);                            // cmp rcx, rdx
     E.EmitBytes([$73, $00]); pOOB := E.Len - 1;             // jae oob (unsigned: idx<0 or >=Count)
@@ -299,13 +372,45 @@ var
   procedure ArrStoreF(ArrayId, IdxReg, ValReg: Integer);
   var pSkip: Integer;
   begin
-    E.MemOp([$48, $8B], RCX, RBX, LongWord(IdxReg) * 8);     // mov rcx,[rbx+idx]
+    ILoad(RCX, IdxReg);                                     // rcx := index (reg or [rbx+idx])
     R8Load(RDX, LongWord(ArrayId) * 24 + 16);               // mov rdx, Count
     E.EmitBytes([$48, $39, $D1]);                            // cmp rcx, rdx
     E.EmitBytes([$73, $00]); pSkip := E.Len - 1;           // jae skip
     R8Load(RDX, LongWord(ArrayId) * 24 + 8);                // mov rdx, FloatData base
     FLoad(XMM0, ValReg);                                     // xmm0 := FloatRegs[Val] (reg or memory)
     E.EmitBytes([$F2, $0F, $11, $04, $CA]);                  // movsd [rdx+rcx*8],xmm0
+    E.PatchByte(pSkip, Byte(E.Len - (pSkip + 1)));
+  end;
+
+  // IntRegs[Dst] := arr[idx]  (OOB -> 0, MODERN). Int arrays are Int64-per-element (IntData at desc+0);
+  // the interpreter stores the raw register value (narrowing happens on a separate op), so this is exact.
+  procedure ArrLoadI(ArrayId, IdxReg, DstReg: Integer);
+  var pOOB, pDone: Integer;
+  begin
+    ILoad(RCX, IdxReg);                                     // rcx := index
+    R8Load(RDX, LongWord(ArrayId) * 24 + 16);               // mov rdx, Count
+    E.EmitBytes([$48, $39, $D1]);                            // cmp rcx, rdx
+    E.EmitBytes([$73, $00]); pOOB := E.Len - 1;            // jae oob (unsigned: idx<0 or >=Count)
+    R8Load(RDX, LongWord(ArrayId) * 24 + 0);                // mov rdx, IntData base
+    E.EmitBytes([$48, $8B, $04, $CA]);                       // mov rax,[rdx+rcx*8]
+    E.EmitBytes([$EB, $00]); pDone := E.Len - 1;           // jmp done
+    E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
+    E.EmitBytes([$48, $31, $C0]);                            // xor rax,rax  -> 0
+    E.PatchByte(pDone, Byte(E.Len - (pDone + 1)));
+    IStore(DstReg, RAX);                                    // IntRegs[Dst] := rax (reg or memory)
+  end;
+
+  // arr[idx] := IntRegs[Val]  (OOB -> dropped, MODERN).
+  procedure ArrStoreI(ArrayId, IdxReg, ValReg: Integer);
+  var pSkip: Integer;
+  begin
+    ILoad(RCX, IdxReg);                                     // rcx := index
+    R8Load(RDX, LongWord(ArrayId) * 24 + 16);               // mov rdx, Count
+    E.EmitBytes([$48, $39, $D1]);                            // cmp rcx, rdx
+    E.EmitBytes([$73, $00]); pSkip := E.Len - 1;           // jae skip
+    R8Load(RDX, LongWord(ArrayId) * 24 + 0);                // mov rdx, IntData base
+    ILoad(RAX, ValReg);                                     // rax := IntRegs[Val]
+    E.EmitBytes([$48, $89, $04, $CA]);                       // mov [rdx+rcx*8],rax
     E.PatchByte(pSkip, Byte(E.Len - (pSkip + 1)));
   end;
 
@@ -328,6 +433,34 @@ var
         bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat: begin T(J^.Dest); T(J^.Src1); T(J^.Src2); end;
         bcArrayLoadFloat:  T(J^.Dest);               // Dest = loaded float
         bcArrayStoreFloat: T(J^.Dest);               // Dest = stored VALUE (float)
+      end;
+    end;
+  end;
+
+  // Scan the loop for INTEGER register operands. Mark=False: compute IMaxReg. Mark=True: flag each
+  // used int reg as -2 in ILoc (allocation candidate). CAUTION: for bcArrayLoad/StoreFloat, Src1 is
+  // the array id (a constant), NOT a register -- only Src2 (the index) is an int register.
+  procedure ScanI(Mark: Boolean);
+  var q: Integer; J: PBcInstr;
+    procedure T(r: Word);
+    begin
+      if Mark then ILoc[r] := -2
+      else if r > IMaxReg then IMaxReg := r;
+    end;
+  begin
+    for q := HeaderPC to EndPC do
+    begin
+      J := @Prog[q];
+      case J^.OpCode of
+        bcLoadConstInt: T(J^.Dest);
+        bcCopyInt: begin T(J^.Dest); T(J^.Src1); end;
+        bcAddInt, bcSubInt, bcMulInt: begin T(J^.Dest); T(J^.Src1); T(J^.Src2); end;
+        bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt, bcCmpEqInt, bcCmpNeInt:
+          begin T(J^.Dest); T(J^.Src1); T(J^.Src2); end;
+        bcIntToFloat: T(J^.Src1);                    // int input (Dest is float)
+        bcArrayLoadFloat, bcArrayStoreFloat: T(J^.Src2);   // Src2 = index; Src1 is the array id
+        bcArrayLoadInt, bcArrayStoreInt: begin T(J^.Dest); T(J^.Src2); end;  // Dest=result/value, Src2=index
+        bcJumpIfZero, bcJumpIfNotZero: T(J^.Src1);
       end;
     end;
   end;
@@ -366,10 +499,38 @@ begin
         FLoc[fi] := -1;                     // overflow -> memory-homed
     end;
 
+  // --- integer GPR allocation (J5): r9/r10/r11 (volatile) then r12..r15 (callee-saved) ---
+  IntPool[0] := R9;  IntPool[1] := R10; IntPool[2] := R11;
+  IntPool[3] := R12; IntPool[4] := R13; IntPool[5] := R14; IntPool[6] := R15;
+  for gpr := 0 to 15 do SaveGpr[gpr] := False;
+  IMaxReg := -1;
+  ScanI(False);                             // compute IMaxReg
+  SetLength(ILoc, IMaxReg + 2);
+  for ii := 0 to High(ILoc) do ILoc[ii] := -1;
+  if IMaxReg >= 0 then ScanI(True);         // mark used regs as -2
+  NextGpr := 0;
+  for ii := 0 to IMaxReg do
+    if ILoc[ii] = -2 then
+    begin
+      if NextGpr <= 6 then
+      begin
+        ILoc[ii] := IntPool[NextGpr];
+        if IntPool[NextGpr] >= 12 then SaveGpr[IntPool[NextGpr]] := True;  // callee-saved
+        Inc(NextGpr);
+      end
+      else
+        ILoc[ii] := -1;                     // overflow -> memory-homed
+    end;
+
   try
     // --- prologue ---  (Win64: rcx=IntRegs, rdx=FloatRegs; SysV: rdi/rsi)
     E.EmitBytes([$53]);                       // push rbx
     E.EmitBytes([$56]);                       // push rsi
+    // Save the callee-saved GPRs (r12..r15) that got allocated (both ABIs: r12..r15 are non-volatile).
+    if SaveGpr[R12] then E.EmitBytes([$41, $54]);   // push r12
+    if SaveGpr[R13] then E.EmitBytes([$41, $55]);   // push r13
+    if SaveGpr[R14] then E.EmitBytes([$41, $56]);   // push r14
+    if SaveGpr[R15] then E.EmitBytes([$41, $57]);   // push r15
     {$IFDEF WINDOWS}
     E.EmitBytes([$48, $89, $CB]);             // mov rbx, rcx    (arg0 = IntRegs)
     E.EmitBytes([$48, $89, $D6]);             // mov rsi, rdx    (arg1 = FloatRegs)
@@ -391,6 +552,10 @@ begin
     for fi := 0 to FMaxReg do
       if FLoc[fi] >= 0 then
         E.MemOp([$F2, $0F, $10], FLoc[fi], RSI, LongWord(fi) * 8);  // movsd xmm_alloc, [rsi+fi*8]
+    // Load the allocated VM int regs from memory into their native GPR.
+    for ii := 0 to IMaxReg do
+      if ILoc[ii] >= 0 then
+        LoadRegMem(ILoc[ii], LongWord(ii) * 8);                     // mov gpr, [rbx+ii*8]
 
     // --- body ---
     for pc := HeaderPC to EndPC do
@@ -402,8 +567,11 @@ begin
       S2 := LongWord(I^.Src2) * 8;
       case I^.OpCode of
         bcLoadConstInt:
+          if ILoc[I^.Dest] >= 0 then
+            MovImm64(ILoc[I^.Dest], I^.Immediate)                    // mov gpr, imm64
+          else
           begin
-            E.EmitBytes([$48, $B8]); E.Emit64(QWord(I^.Immediate));  // mov rax, imm64
+            MovImm64(RAX, I^.Immediate);                             // mov rax, imm64
             E.MemOp([$48, $89], RAX, RBX, Dd);                       // mov [rbx+d],rax
           end;
         bcLoadConstFloat:
@@ -413,9 +581,12 @@ begin
             FStore(I^.Dest, XMM0);                                   // -> xmm reg or [rsi+d]
           end;
         bcCopyInt:
+          if (ILoc[I^.Dest] >= 0) and (ILoc[I^.Src1] >= 0) then
+            MovRR(ILoc[I^.Dest], ILoc[I^.Src1])   // reg-reg copy in one move
+          else
           begin
-            E.MemOp([$48, $8B], RAX, RBX, S1);
-            E.MemOp([$48, $89], RAX, RBX, Dd);
+            ILoad(RAX, I^.Src1);
+            IStore(I^.Dest, RAX);
           end;
         bcCopyFloat:
           begin
@@ -424,21 +595,21 @@ begin
           end;
         bcAddInt:
           begin
-            E.MemOp([$48, $8B], RAX, RBX, S1);
-            E.MemOp([$48, $03], RAX, RBX, S2);        // add rax,[rbx+s2]
-            E.MemOp([$48, $89], RAX, RBX, Dd);
+            ILoad(RAX, I^.Src1);
+            IOp([$48, $03], RAX, I^.Src2);            // add rax, src2
+            IStore(I^.Dest, RAX);
           end;
         bcSubInt:
           begin
-            E.MemOp([$48, $8B], RAX, RBX, S1);
-            E.MemOp([$48, $2B], RAX, RBX, S2);        // sub rax,[rbx+s2]
-            E.MemOp([$48, $89], RAX, RBX, Dd);
+            ILoad(RAX, I^.Src1);
+            IOp([$48, $2B], RAX, I^.Src2);            // sub rax, src2
+            IStore(I^.Dest, RAX);
           end;
         bcMulInt:
           begin
-            E.MemOp([$48, $8B], RAX, RBX, S1);
-            E.MemOp([$48, $0F, $AF], RAX, RBX, S2);   // imul rax,[rbx+s2]
-            E.MemOp([$48, $89], RAX, RBX, Dd);
+            ILoad(RAX, I^.Src1);
+            IOp([$48, $0F, $AF], RAX, I^.Src2);       // imul rax, src2
+            IStore(I^.Dest, RAX);
           end;
         bcAddFloat: FloatBin([$F2, $0F, $58]);        // addsd
         bcSubFloat: FloatBin([$F2, $0F, $5C]);        // subsd
@@ -454,12 +625,25 @@ begin
           else Exit;
         bcIntToFloat:
           begin
-            E.EmitBytes([$F2, $48, $0F, $2A]);            // cvtsi2sd xmm0, [rbx+s1]  (int is memory)
-            E.Emit8($80 or (XMM0 shl 3) or RBX); E.Emit32(S1);
+            if ILoc[I^.Src1] >= 0 then
+            begin
+              gpr := ILoc[I^.Src1];
+              E.Emit8($F2);
+              if gpr >= 8 then E.Emit8($49) else E.Emit8($48);   // REX.W (+B)
+              E.EmitBytes([$0F, $2A]);
+              E.Emit8($C0 or (XMM0 shl 3) or (gpr and 7));        // cvtsi2sd xmm0, gpr
+            end
+            else
+            begin
+              E.EmitBytes([$F2, $48, $0F, $2A]);                  // cvtsi2sd xmm0, [rbx+s1]
+              E.Emit8($80 or (XMM0 shl 3) or RBX); E.Emit32(S1);
+            end;
             FStore(I^.Dest, XMM0);
           end;
         bcArrayLoadFloat:  if AllowUnsafe then ArrLoadF(I^.Src1, I^.Src2, I^.Dest) else Exit;
         bcArrayStoreFloat: if AllowUnsafe then ArrStoreF(I^.Src1, I^.Src2, I^.Dest) else Exit;
+        bcArrayLoadInt:    if AllowUnsafe then ArrLoadI(I^.Src1, I^.Src2, I^.Dest) else Exit;
+        bcArrayStoreInt:   if AllowUnsafe then ArrStoreI(I^.Src1, I^.Src2, I^.Dest) else Exit;
         bcCmpLtInt: IntCmp($9C);                      // setl
         bcCmpLeInt: IntCmp($9E);                      // setle
         bcCmpGtInt: IntCmp($9F);                      // setg
@@ -479,7 +663,7 @@ begin
         bcJumpIfZero, bcJumpIfNotZero:
           begin
             target := Integer(I^.Immediate);
-            E.MemOp([$48, $8B], RAX, RBX, S1);        // mov rax,[rbx+s1]
+            ILoad(RAX, I^.Src1);                      // rax := condition (reg or [rbx+s1])
             E.EmitBytes([$48, $85, $C0]);             // test rax,rax
             if (target >= HeaderPC) and (target <= EndPC) then
             begin
@@ -508,8 +692,12 @@ begin
     E.EmitBytes([$B8]); E.Emit32(LongWord(EndPC + 1));   // mov eax, EndPC+1
     JmpRel(-1);
 
-    // --- epilogue --- (rax already holds the exit PC)
+    // --- epilogue --- (rax already holds the exit PC; the writebacks below do not touch rax)
     EpilogueOff := E.Len;
+    // Write the allocated VM int regs back to memory so the interpreter sees their final values.
+    for ii := 0 to IMaxReg do
+      if ILoc[ii] >= 0 then
+        StoreRegMem(ILoc[ii], LongWord(ii) * 8);                   // mov [rbx+ii*8], gpr
     // Write the allocated float regs back to memory so the interpreter sees their final values.
     for fi := 0 to FMaxReg do
       if FLoc[fi] >= 0 then
@@ -521,6 +709,11 @@ begin
       if SaveX7 then E.EmitBytes([$F2, $0F, $10, $7C, $24, $08]); // movsd xmm7, [rsp+8]
       E.EmitBytes([$48, $83, $C4, $10]);                          // add rsp, 16
     end;
+    // Restore the callee-saved GPRs (reverse of the prologue push order).
+    if SaveGpr[R15] then E.EmitBytes([$41, $5F]);   // pop r15
+    if SaveGpr[R14] then E.EmitBytes([$41, $5E]);   // pop r14
+    if SaveGpr[R13] then E.EmitBytes([$41, $5D]);   // pop r13
+    if SaveGpr[R12] then E.EmitBytes([$41, $5C]);   // pop r12
     E.EmitBytes([$5E]);          // pop rsi
     E.EmitBytes([$5B]);          // pop rbx
     E.EmitBytes([$C3]);          // ret
