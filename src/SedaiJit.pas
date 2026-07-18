@@ -563,67 +563,121 @@ var
     end;
   end;
 
-  // FloatRegs[Dst] := arr[idx]  (OOB -> 0.0, MODERN). ArrayId is a compile-time constant.
-  procedure ArrLoadF(ArrayId, IdxReg, DstReg: Integer);
+  // Bounds behaviour depends on the dialect. MODERN + no forced check (Classic=False): out of bounds ->
+  // default (read 0 / drop store), matching FreeBASIC. CLASSIC or --bounds-check (Classic=True): the
+  // interpreter RAISES, so the JIT deopts to the array op's PC and lets the interpreter reproduce the exact
+  // error. `cmp rcx,count` must already be emitted; this emits the in-bounds guard for the CLASSIC path.
+  procedure EmitClassicBoundsGuard(apc: Integer);
+  var p: Integer;
+  begin
+    E.EmitBytes([$72, $00]); p := E.Len - 1;               // jb +over  (unsigned: idx<count -> in bounds)
+    DeoptTo(apc);                                           // OOB -> interpreter raises ERangeError
+    E.PatchByte(p, Byte(E.Len - (p + 1)));
+  end;
+
+  // FloatRegs[Dst] := arr[idx]. ArrayId is a compile-time constant.
+  procedure ArrLoadF(apc, ArrayId, IdxReg, DstReg: Integer; Classic: Boolean);
   var pOOB, pDone, ix, baseR: Integer;
   begin
     ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index (reg or [rbx+idx])
     if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
-    E.EmitBytes([$73, $00]); pOOB := E.Len - 1;             // jae oob (unsigned: idx<0 or >=Count)
-    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 8, ActiveBase(ix)) else baseR := ArrBaseReg(ArrayId, 8, -1);
-    ArrDataAccess(True, False, baseR);                      // movsd xmm0, [base+rcx*8]
-    E.EmitBytes([$EB, $00]); pDone := E.Len - 1;            // jmp done
-    E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
-    E.EmitBytes([$0F, $57, $C0]);                            // xorps xmm0,xmm0  -> 0.0
-    E.PatchByte(pDone, Byte(E.Len - (pDone + 1)));
+    if ix >= 0 then baseR := ActiveBase(ix) else baseR := -1;
+    if Classic then
+    begin
+      EmitClassicBoundsGuard(apc);
+      baseR := ArrBaseReg(ArrayId, 8, baseR);
+      ArrDataAccess(True, False, baseR);                    // movsd xmm0, [base+rcx*8]
+    end
+    else
+    begin
+      E.EmitBytes([$73, $00]); pOOB := E.Len - 1;           // jae oob
+      baseR := ArrBaseReg(ArrayId, 8, baseR);
+      ArrDataAccess(True, False, baseR);
+      E.EmitBytes([$EB, $00]); pDone := E.Len - 1;          // jmp done
+      E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
+      E.EmitBytes([$0F, $57, $C0]);                          // xorps xmm0,xmm0  -> 0.0
+      E.PatchByte(pDone, Byte(E.Len - (pDone + 1)));
+    end;
     FStore(DstReg, XMM0);                                    // FloatRegs[Dst] := xmm0 (reg or memory)
   end;
 
-  // arr[idx] := FloatRegs[Val]  (OOB -> dropped, MODERN).
-  procedure ArrStoreF(ArrayId, IdxReg, ValReg: Integer);
+  // arr[idx] := FloatRegs[Val].
+  procedure ArrStoreF(apc, ArrayId, IdxReg, ValReg: Integer; Classic: Boolean);
   var pSkip, ix, baseR: Integer;
   begin
     ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index (reg or [rbx+idx])
     if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
-    E.EmitBytes([$73, $00]); pSkip := E.Len - 1;           // jae skip
-    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 8, ActiveBase(ix)) else baseR := ArrBaseReg(ArrayId, 8, -1);
-    FLoad(XMM0, ValReg);                                     // xmm0 := FloatRegs[Val] (reg or memory)
-    ArrDataAccess(True, True, baseR);                       // movsd [base+rcx*8], xmm0
-    E.PatchByte(pSkip, Byte(E.Len - (pSkip + 1)));
+    if ix >= 0 then baseR := ActiveBase(ix) else baseR := -1;
+    if Classic then
+    begin
+      EmitClassicBoundsGuard(apc);
+      baseR := ArrBaseReg(ArrayId, 8, baseR);
+      FLoad(XMM0, ValReg);
+      ArrDataAccess(True, True, baseR);                     // movsd [base+rcx*8], xmm0
+    end
+    else
+    begin
+      E.EmitBytes([$73, $00]); pSkip := E.Len - 1;          // jae skip
+      baseR := ArrBaseReg(ArrayId, 8, baseR);
+      FLoad(XMM0, ValReg);
+      ArrDataAccess(True, True, baseR);
+      E.PatchByte(pSkip, Byte(E.Len - (pSkip + 1)));
+    end;
   end;
 
-  // IntRegs[Dst] := arr[idx]  (OOB -> 0, MODERN). Int arrays are Int64-per-element (IntData at desc+0);
-  // the interpreter stores the raw register value (narrowing happens on a separate op), so this is exact.
-  procedure ArrLoadI(ArrayId, IdxReg, DstReg: Integer);
+  // IntRegs[Dst] := arr[idx]. Int arrays are Int64-per-element (IntData at desc+0); the interpreter stores
+  // the raw register value (narrowing happens on a separate op), so this is exact.
+  procedure ArrLoadI(apc, ArrayId, IdxReg, DstReg: Integer; Classic: Boolean);
   var pOOB, pDone, ix, baseR: Integer;
   begin
     ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index
     if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
-    E.EmitBytes([$73, $00]); pOOB := E.Len - 1;            // jae oob (unsigned: idx<0 or >=Count)
-    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 0, ActiveBase(ix)) else baseR := ArrBaseReg(ArrayId, 0, -1);
-    ArrDataAccess(False, False, baseR);                    // mov rax, [base+rcx*8]
-    E.EmitBytes([$EB, $00]); pDone := E.Len - 1;           // jmp done
-    E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
-    E.EmitBytes([$48, $31, $C0]);                            // xor rax,rax  -> 0
-    E.PatchByte(pDone, Byte(E.Len - (pDone + 1)));
+    if ix >= 0 then baseR := ActiveBase(ix) else baseR := -1;
+    if Classic then
+    begin
+      EmitClassicBoundsGuard(apc);
+      baseR := ArrBaseReg(ArrayId, 0, baseR);
+      ArrDataAccess(False, False, baseR);                   // mov rax, [base+rcx*8]
+    end
+    else
+    begin
+      E.EmitBytes([$73, $00]); pOOB := E.Len - 1;           // jae oob
+      baseR := ArrBaseReg(ArrayId, 0, baseR);
+      ArrDataAccess(False, False, baseR);
+      E.EmitBytes([$EB, $00]); pDone := E.Len - 1;          // jmp done
+      E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
+      E.EmitBytes([$48, $31, $C0]);                          // xor rax,rax  -> 0
+      E.PatchByte(pDone, Byte(E.Len - (pDone + 1)));
+    end;
     IStore(DstReg, RAX);                                    // IntRegs[Dst] := rax (reg or memory)
   end;
 
-  // arr[idx] := IntRegs[Val]  (OOB -> dropped, MODERN).
-  procedure ArrStoreI(ArrayId, IdxReg, ValReg: Integer);
+  // arr[idx] := IntRegs[Val].
+  procedure ArrStoreI(apc, ArrayId, IdxReg, ValReg: Integer; Classic: Boolean);
   var pSkip, ix, baseR: Integer;
   begin
     ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index
     if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
-    E.EmitBytes([$73, $00]); pSkip := E.Len - 1;           // jae skip
-    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 0, ActiveBase(ix)) else baseR := ArrBaseReg(ArrayId, 0, -1);
-    ILoad(RAX, ValReg);                                     // rax := IntRegs[Val]
-    ArrDataAccess(False, True, baseR);                     // mov [base+rcx*8], rax
-    E.PatchByte(pSkip, Byte(E.Len - (pSkip + 1)));
+    if ix >= 0 then baseR := ActiveBase(ix) else baseR := -1;
+    if Classic then
+    begin
+      EmitClassicBoundsGuard(apc);
+      baseR := ArrBaseReg(ArrayId, 0, baseR);
+      ILoad(RAX, ValReg);
+      ArrDataAccess(False, True, baseR);                    // mov [base+rcx*8], rax
+    end
+    else
+    begin
+      E.EmitBytes([$73, $00]); pSkip := E.Len - 1;          // jae skip
+      baseR := ArrBaseReg(ArrayId, 0, baseR);
+      ILoad(RAX, ValReg);
+      ArrDataAccess(False, True, baseR);
+      E.PatchByte(pSkip, Byte(E.Len - (pSkip + 1)));
+    end;
   end;
 
   // Scan the loop for FLOAT register operands. Mark=False: compute FMaxReg. Mark=True: flag each used
@@ -963,10 +1017,21 @@ var
           IStore(I^.Dest, RAX);
         end
         else Exit;
-      bcArrayLoadFloat:  if AllowUnsafe then ArrLoadF(I^.Src1, I^.Src2, I^.Dest) else Exit;
-      bcArrayStoreFloat: if AllowUnsafe then ArrStoreF(I^.Src1, I^.Src2, I^.Dest) else Exit;
-      bcArrayLoadInt:    if AllowUnsafe then ArrLoadI(I^.Src1, I^.Src2, I^.Dest) else Exit;
-      bcArrayStoreInt:   if AllowUnsafe then ArrStoreI(I^.Src1, I^.Src2, I^.Dest) else Exit;
+      // Arrays: MODERN + no forced check -> in-place (OOB = default). CLASSIC / --bounds-check -> compile
+      // with an OOB deopt to the interpreter (which raises), except inside an inlined callee where a deopt
+      // is unsafe (native frame lost) -> bail.
+      bcArrayLoadFloat:
+        if AllowUnsafe then ArrLoadF(apc, I^.Src1, I^.Src2, I^.Dest, False)
+        else if InCallee then Exit else ArrLoadF(apc, I^.Src1, I^.Src2, I^.Dest, True);
+      bcArrayStoreFloat:
+        if AllowUnsafe then ArrStoreF(apc, I^.Src1, I^.Src2, I^.Dest, False)
+        else if InCallee then Exit else ArrStoreF(apc, I^.Src1, I^.Src2, I^.Dest, True);
+      bcArrayLoadInt:
+        if AllowUnsafe then ArrLoadI(apc, I^.Src1, I^.Src2, I^.Dest, False)
+        else if InCallee then Exit else ArrLoadI(apc, I^.Src1, I^.Src2, I^.Dest, True);
+      bcArrayStoreInt:
+        if AllowUnsafe then ArrStoreI(apc, I^.Src1, I^.Src2, I^.Dest, False)
+        else if InCallee then Exit else ArrStoreI(apc, I^.Src1, I^.Src2, I^.Dest, True);
       bcCmpLtInt: IntCmp($9C);                      // setl
       bcCmpLeInt: IntCmp($9E);                      // setle
       bcCmpGtInt: IntCmp($9F);                      // setg
@@ -1180,8 +1245,7 @@ begin
   // --- array base/count caching (J5c LICM): hand the GPRs left free after int allocation to the
   // loop-invariant array base pointers and counts, most-used arrays first (base then count each). ---
   NCArr := 0;
-  if AllowUnsafe then                        // arrays are only compiled under AllowUnsafe anyway
-  begin
+  begin                                        // arrays now compile in CLASSIC too (OOB -> deopt), so cache always
     for gpr := 0 to 15 do GprUsed[gpr] := False;
     for ii := 0 to IMaxReg do
       if ILoc[ii] >= 0 then GprUsed[ILoc[ii]] := True;
