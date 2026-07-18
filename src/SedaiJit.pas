@@ -354,21 +354,48 @@ var
       E.MemOp(MemForm, scr, RBX, LongWord(vmreg) * 8);
   end;
 
+  // al holds 0/1 -> IntRegs[Dest] := (al<>0) ? TrueVal : 0 (shared by the int and float comparisons).
+  procedure CmpBoolToDest;
+  begin
+    E.EmitBytes([$0F, $B6, $C0]);           // movzx eax,al   (rax = 0/1)
+    if TrueVal = -1 then
+      E.EmitBytes([$48, $F7, $D8])          // neg rax        (0/-1)
+    else if TrueVal <> 1 then
+      begin E.EmitBytes([$48, $69, $C0]); E.Emit32(LongWord(TrueVal and $FFFFFFFF)); end;  // imul rax,rax,imm32
+    IStore(I^.Dest, RAX);                   // dest := rax
+  end;
+
   // Integer comparison Rd = (Rs1 <cc> Rs2) ? TrueVal : 0
   procedure IntCmp(SetCC: Byte);
   begin
     ILoad(RAX, I^.Src1);                    // mov rax, src1
     IOp([$48, $3B], RAX, I^.Src2);          // cmp rax, src2
     E.EmitBytes([$0F, SetCC, $C0]);         // setcc al
-    E.EmitBytes([$0F, $B6, $C0]);           // movzx eax,al   (rax = 0/1)
-    if TrueVal = -1 then
-      E.EmitBytes([$48, $F7, $D8])          // neg rax        (0/-1)
-    else if TrueVal <> 1 then
-    begin
-      // TrueVal is some other value: rax := (rax<>0) ? TrueVal : 0  via imul
-      E.EmitBytes([$48, $69, $C0]); E.Emit32(LongWord(TrueVal and $FFFFFFFF));  // imul rax,rax,imm32
+    CmpBoolToDest;
+  end;
+
+  // Float comparison Rd = (Rs1 <cc> Rs2) ? TrueVal : 0, with the interpreter's ORDERED IEEE semantics
+  // (a NaN operand makes <,<=,>,>=,= false and <> true). ucomisd A,B sets CF=1 if A<B (or unordered),
+  // ZF=1 if A==B (or unordered), PF=1 if unordered. Lt/Le/Gt/Ge reduce to seta/setae with an operand swap
+  // (seta/setae are false when unordered); Eq/Ne need the parity flag to exclude/include the NaN case.
+  // Kind: 0=Lt 1=Le 2=Gt 3=Ge 4=Eq 5=Ne.
+  procedure FloatCmp(Kind: Integer);
+  begin
+    FLoad(XMM0, I^.Src1);                    // xmm0 = a
+    FLoad(XMM1, I^.Src2);                    // xmm1 = b
+    case Kind of
+      0: begin E.EmitBytes([$66, $0F, $2E, $C8]); E.EmitBytes([$0F, $97, $C0]); end;  // a<b : ucomisd b,a ; seta  al
+      1: begin E.EmitBytes([$66, $0F, $2E, $C8]); E.EmitBytes([$0F, $93, $C0]); end;  // a<=b: ucomisd b,a ; setae al
+      2: begin E.EmitBytes([$66, $0F, $2E, $C1]); E.EmitBytes([$0F, $97, $C0]); end;  // a>b : ucomisd a,b ; seta  al
+      3: begin E.EmitBytes([$66, $0F, $2E, $C1]); E.EmitBytes([$0F, $93, $C0]); end;  // a>=b: ucomisd a,b ; setae al
+      4: begin E.EmitBytes([$66, $0F, $2E, $C1]);                                     // a=b : ucomisd a,b
+               E.EmitBytes([$0F, $94, $C0]); E.EmitBytes([$0F, $9B, $C1]);            //       sete al ; setnp cl
+               E.EmitBytes([$20, $C8]); end;                                          //       and al,cl (equal AND ordered)
+      5: begin E.EmitBytes([$66, $0F, $2E, $C1]);                                     // a<>b: ucomisd a,b
+               E.EmitBytes([$0F, $95, $C0]); E.EmitBytes([$0F, $9A, $C1]);            //       setne al ; setp cl
+               E.EmitBytes([$08, $C8]); end;                                          //       or al,cl (not-equal OR unordered)
     end;
-    IStore(I^.Dest, RAX);                   // dest := rax
+    CmpBoolToDest;
   end;
 
   // Float op:  Rd = Rs1 <sse> Rs2   (compute in xmm0, honouring register allocation of the operands)
@@ -530,6 +557,8 @@ var
         bcArrayStoreFloat: T(J^.Dest);               // Dest = stored VALUE (float)
         bcXferStoreFloat:  T(J^.Src1);               // Src1 = value moved to the transfer slot
         bcXferLoadFloat:   T(J^.Dest);               // Dest = value moved from the transfer slot
+        bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
+          begin T(J^.Src1); T(J^.Src2); end;         // float operands (Dest is an int reg -> ScanI)
       end;
     end;
   end;
@@ -559,6 +588,8 @@ var
         bcArrayLoadInt, bcArrayStoreInt: begin T(J^.Dest); T(J^.Src2); end;  // Dest=result/value, Src2=index
         bcXferStoreInt: T(J^.Src1);                  // Src1 = value moved to the transfer slot
         bcXferLoadInt:  T(J^.Dest);                  // Dest = value moved from the transfer slot
+        bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
+          T(J^.Dest);                                // float compare writes an int result reg
         bcJumpIfZero, bcJumpIfNotZero: T(J^.Src1);
       end;
     end;
@@ -733,6 +764,12 @@ var
       bcCmpGeInt: IntCmp($9D);                      // setge
       bcCmpEqInt: IntCmp($94);                      // sete
       bcCmpNeInt: IntCmp($95);                      // setne
+      bcCmpLtFloat: FloatCmp(0);
+      bcCmpLeFloat: FloatCmp(1);
+      bcCmpGtFloat: FloatCmp(2);
+      bcCmpGeFloat: FloatCmp(3);
+      bcCmpEqFloat: FloatCmp(4);
+      bcCmpNeFloat: FloatCmp(5);
       // Transfer registers (args / result): XferInt/XferFloat bases are baked as immediates into rdx.
       bcXferStoreInt:
         begin
