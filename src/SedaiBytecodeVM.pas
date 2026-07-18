@@ -5546,6 +5546,16 @@ begin
       Mem := CompileLoop(Ins, hdr, HeaderEnd[hdr], FTrueValue,
                          Assigned(FProgram) and FProgram.ModernMode and (not FBoundsCheck));
       if Mem <> nil then FNativeLoops[hdr] := Mem;
+      if GetEnvironmentVariable('JIT_DIAG') <> '' then
+      begin
+        if Mem <> nil then
+          WriteLn(ErrOutput, Format('[JIT] loop PC %d..%d (%d instr, src line %d): NATIVE',
+            [hdr, HeaderEnd[hdr], HeaderEnd[hdr] - hdr + 1, FProgram.GetSourceLine(hdr)]))
+        else
+          WriteLn(ErrOutput, Format('[JIT] loop PC %d..%d (%d instr, src line %d): BAIL at PC %d op %d (src line %d)',
+            [hdr, HeaderEnd[hdr], HeaderEnd[hdr] - hdr + 1, FProgram.GetSourceLine(hdr),
+             JitDiagCurPC, JitDiagCurOp, FProgram.GetSourceLine(JitDiagCurPC)]));
+      end;
     end;
   FArraysDirty := True;   // force a descriptor rebuild before the first compiled loop runs
 end;

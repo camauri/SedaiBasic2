@@ -73,6 +73,12 @@ function CompileLoop(Ins: Pointer; HeaderPC, EndPC: Integer; TrueVal: Int64; All
 // J2 self-test: emit  a+b  and call it, proving the emit->exec->call pipeline.
 function JitSelfTest(out Msg: string): Boolean;
 
+// Diagnostic (set to the last opcode/PC processed by CompileLoop): when a loop bails, these hold the
+// culprit. Read by BuildJitLoops under the JIT_DIAG env var. Not thread-safe; diagnostics only.
+var
+  JitDiagCurOp: Word = 0;
+  JitDiagCurPC: Integer = -1;
+
 implementation
 
 // x86-64 register numbers
@@ -196,6 +202,16 @@ var
   IMaxReg, NextGpr, ii, gpr: Integer;
   IntPool: array[0..6] of Integer;
   SaveGpr: array[0..15] of Boolean;
+  GprUsed: array[0..15] of Boolean;  // which native GPRs are claimed (int alloc + array-base cache)
+  // Array base/count caching (J5c LICM): a compiled loop's array descriptor is fixed for the whole
+  // native invocation, so the base pointer and element count are loop-invariant. Cache them in the GPRs
+  // left free after int allocation, removing two descriptor loads from every array access.
+  CArrId: array of Integer;      // distinct array ids used in the loop
+  CArrOff: array of Integer;     // descriptor base offset: 0 (int arrays) or 8 (float arrays)
+  CArrUses: array of Integer;    // access count (for priority)
+  CArrBase: array of Integer;    // assigned GPR holding the base pointer, or -1
+  CArrCount: array of Integer;   // assigned GPR holding the element count, or -1
+  NCArr, ci, cj, ct: Integer;
 
   procedure AddFixup(AOff, ATarget: Integer);
   begin
@@ -343,6 +359,7 @@ var
   end;
 
   // mov <reg>, [r8 + disp32]   (REX.W + REX.B; r8 = array descriptor base)
+  // mov <reg (rax/rcx/rdx, <8)>, [r8+disp]   (REX.W + REX.B for r8 base)
   procedure R8Load(RegField: Byte; Disp: LongWord);
   begin
     E.Emit8($49);
@@ -350,17 +367,73 @@ var
     E.Emit8($80 or ((RegField and 7) shl 3));   // modrm mod=10 reg=RegField rm=000 (r8 low bits)
     E.Emit32(Disp);
   end;
+  // mov <native reg (0..15)>, [r8+disp]   (adds REX.R for r9..r15; used to load cached bases/counts)
+  procedure R8LoadR(reg: Integer; Disp: LongWord);
+  var rex: Byte;
+  begin
+    rex := $49;                                  // REX.W + REX.B (base r8)
+    if reg >= 8 then rex := rex or $04;          // REX.R
+    E.Emit8(rex); E.Emit8($8B);
+    E.Emit8($80 or ((reg and 7) shl 3));         // mod=10 reg=reg rm=000 (r8)
+    E.Emit32(Disp);
+  end;
+
+  // --- array base/count caching (J5c): index into the per-loop cache, or -1 if this array is not cached ---
+  function CArrIdx(ArrayId: Integer): Integer;
+  var q: Integer;
+  begin
+    Result := -1;
+    for q := 0 to NCArr - 1 do
+      if CArrId[q] = ArrayId then begin Result := q; Exit; end;
+  end;
+  // Emit `cmp rcx, <count>` using the cached count reg if present, else reloading Count into rdx.
+  procedure ArrCountCmp(ArrayId, CountReg: Integer);
+  begin
+    if CountReg >= 0 then
+      EmitRR([$3B], RCX, CountReg)                          // cmp rcx, CountReg
+    else
+    begin
+      R8Load(RDX, LongWord(ArrayId) * 24 + 16);             // mov rdx, Count
+      E.EmitBytes([$48, $39, $D1]);                          // cmp rcx, rdx
+    end;
+  end;
+  // Return the register holding the array base: the cached one, or rdx after reloading from the descriptor.
+  function ArrBaseReg(ArrayId, Off, CachedBase: Integer): Integer;
+  begin
+    if CachedBase >= 0 then Result := CachedBase
+    else begin R8Load(RDX, LongWord(ArrayId) * 24 + LongWord(Off)); Result := RDX; end;
+  end;
+  // Emit a load/store of xmm0/rax to [BaseReg + rcx*8].  BaseReg may be rdx or any r8..r15 (REX.B).
+  procedure ArrDataAccess(IsFloat, IsStore: Boolean; BaseReg: Integer);
+  var sib: Byte;
+  begin
+    sib := $C8 or (BaseReg and 7);               // scale=8 (11), index=rcx (001), base=BaseReg&7
+    if IsFloat then
+    begin
+      E.Emit8($F2);
+      if BaseReg >= 8 then E.Emit8($41);         // REX.B
+      E.Emit8($0F);
+      if IsStore then E.Emit8($11) else E.Emit8($10);
+      E.Emit8($04); E.Emit8(sib);                // movsd xmm0, [base+rcx*8]  (or store)
+    end
+    else
+    begin
+      if BaseReg >= 8 then E.Emit8($49) else E.Emit8($48);   // REX.W (+B)
+      if IsStore then E.Emit8($89) else E.Emit8($8B);
+      E.Emit8($04); E.Emit8(sib);                // mov rax, [base+rcx*8]  (or store)
+    end;
+  end;
 
   // FloatRegs[Dst] := arr[idx]  (OOB -> 0.0, MODERN). ArrayId is a compile-time constant.
   procedure ArrLoadF(ArrayId, IdxReg, DstReg: Integer);
-  var pOOB, pDone: Integer;
+  var pOOB, pDone, ix, baseR: Integer;
   begin
+    ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index (reg or [rbx+idx])
-    R8Load(RDX, LongWord(ArrayId) * 24 + 16);               // mov rdx, Count
-    E.EmitBytes([$48, $39, $D1]);                            // cmp rcx, rdx
+    if ix >= 0 then ArrCountCmp(ArrayId, CArrCount[ix]) else ArrCountCmp(ArrayId, -1);
     E.EmitBytes([$73, $00]); pOOB := E.Len - 1;             // jae oob (unsigned: idx<0 or >=Count)
-    R8Load(RDX, LongWord(ArrayId) * 24 + 8);                // mov rdx, FloatData base
-    E.EmitBytes([$F2, $0F, $10, $04, $CA]);                  // movsd xmm0,[rdx+rcx*8]
+    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 8, CArrBase[ix]) else baseR := ArrBaseReg(ArrayId, 8, -1);
+    ArrDataAccess(True, False, baseR);                      // movsd xmm0, [base+rcx*8]
     E.EmitBytes([$EB, $00]); pDone := E.Len - 1;            // jmp done
     E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
     E.EmitBytes([$0F, $57, $C0]);                            // xorps xmm0,xmm0  -> 0.0
@@ -370,29 +443,29 @@ var
 
   // arr[idx] := FloatRegs[Val]  (OOB -> dropped, MODERN).
   procedure ArrStoreF(ArrayId, IdxReg, ValReg: Integer);
-  var pSkip: Integer;
+  var pSkip, ix, baseR: Integer;
   begin
+    ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index (reg or [rbx+idx])
-    R8Load(RDX, LongWord(ArrayId) * 24 + 16);               // mov rdx, Count
-    E.EmitBytes([$48, $39, $D1]);                            // cmp rcx, rdx
+    if ix >= 0 then ArrCountCmp(ArrayId, CArrCount[ix]) else ArrCountCmp(ArrayId, -1);
     E.EmitBytes([$73, $00]); pSkip := E.Len - 1;           // jae skip
-    R8Load(RDX, LongWord(ArrayId) * 24 + 8);                // mov rdx, FloatData base
+    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 8, CArrBase[ix]) else baseR := ArrBaseReg(ArrayId, 8, -1);
     FLoad(XMM0, ValReg);                                     // xmm0 := FloatRegs[Val] (reg or memory)
-    E.EmitBytes([$F2, $0F, $11, $04, $CA]);                  // movsd [rdx+rcx*8],xmm0
+    ArrDataAccess(True, True, baseR);                       // movsd [base+rcx*8], xmm0
     E.PatchByte(pSkip, Byte(E.Len - (pSkip + 1)));
   end;
 
   // IntRegs[Dst] := arr[idx]  (OOB -> 0, MODERN). Int arrays are Int64-per-element (IntData at desc+0);
   // the interpreter stores the raw register value (narrowing happens on a separate op), so this is exact.
   procedure ArrLoadI(ArrayId, IdxReg, DstReg: Integer);
-  var pOOB, pDone: Integer;
+  var pOOB, pDone, ix, baseR: Integer;
   begin
+    ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index
-    R8Load(RDX, LongWord(ArrayId) * 24 + 16);               // mov rdx, Count
-    E.EmitBytes([$48, $39, $D1]);                            // cmp rcx, rdx
+    if ix >= 0 then ArrCountCmp(ArrayId, CArrCount[ix]) else ArrCountCmp(ArrayId, -1);
     E.EmitBytes([$73, $00]); pOOB := E.Len - 1;            // jae oob (unsigned: idx<0 or >=Count)
-    R8Load(RDX, LongWord(ArrayId) * 24 + 0);                // mov rdx, IntData base
-    E.EmitBytes([$48, $8B, $04, $CA]);                       // mov rax,[rdx+rcx*8]
+    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 0, CArrBase[ix]) else baseR := ArrBaseReg(ArrayId, 0, -1);
+    ArrDataAccess(False, False, baseR);                    // mov rax, [base+rcx*8]
     E.EmitBytes([$EB, $00]); pDone := E.Len - 1;           // jmp done
     E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
     E.EmitBytes([$48, $31, $C0]);                            // xor rax,rax  -> 0
@@ -402,15 +475,15 @@ var
 
   // arr[idx] := IntRegs[Val]  (OOB -> dropped, MODERN).
   procedure ArrStoreI(ArrayId, IdxReg, ValReg: Integer);
-  var pSkip: Integer;
+  var pSkip, ix, baseR: Integer;
   begin
+    ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index
-    R8Load(RDX, LongWord(ArrayId) * 24 + 16);               // mov rdx, Count
-    E.EmitBytes([$48, $39, $D1]);                            // cmp rcx, rdx
+    if ix >= 0 then ArrCountCmp(ArrayId, CArrCount[ix]) else ArrCountCmp(ArrayId, -1);
     E.EmitBytes([$73, $00]); pSkip := E.Len - 1;           // jae skip
-    R8Load(RDX, LongWord(ArrayId) * 24 + 0);                // mov rdx, IntData base
+    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 0, CArrBase[ix]) else baseR := ArrBaseReg(ArrayId, 0, -1);
     ILoad(RAX, ValReg);                                     // rax := IntRegs[Val]
-    E.EmitBytes([$48, $89, $04, $CA]);                       // mov [rdx+rcx*8],rax
+    ArrDataAccess(False, True, baseR);                     // mov [base+rcx*8], rax
     E.PatchByte(pSkip, Byte(E.Len - (pSkip + 1)));
   end;
 
@@ -462,6 +535,37 @@ var
         bcArrayLoadInt, bcArrayStoreInt: begin T(J^.Dest); T(J^.Src2); end;  // Dest=result/value, Src2=index
         bcJumpIfZero, bcJumpIfNotZero: T(J^.Src1);
       end;
+    end;
+  end;
+
+  // Collect the distinct arrays accessed in the loop (with their descriptor base offset and use count),
+  // so the invariant base/count loads can be hoisted into registers (J5c). Src1 of an array op is the
+  // array id (a constant), Src2 the index.
+  procedure ScanArr;
+  var q, k, off, aid: Integer; J: PBcInstr;
+  begin
+    NCArr := 0;
+    for q := HeaderPC to EndPC do
+    begin
+      J := @Prog[q];
+      case J^.OpCode of
+        bcArrayLoadFloat, bcArrayStoreFloat: off := 8;
+        bcArrayLoadInt,   bcArrayStoreInt:   off := 0;
+      else
+        continue;
+      end;
+      aid := J^.Src1;
+      k := 0;
+      while (k < NCArr) and (CArrId[k] <> aid) do Inc(k);
+      if k = NCArr then
+      begin
+        Inc(NCArr);
+        SetLength(CArrId, NCArr); SetLength(CArrOff, NCArr); SetLength(CArrUses, NCArr);
+        SetLength(CArrBase, NCArr); SetLength(CArrCount, NCArr);
+        CArrId[k] := aid; CArrOff[k] := off; CArrUses[k] := 0;
+        CArrBase[k] := -1; CArrCount[k] := -1;
+      end;
+      Inc(CArrUses[k]);
     end;
   end;
 
@@ -522,6 +626,42 @@ begin
         ILoc[ii] := -1;                     // overflow -> memory-homed
     end;
 
+  // --- array base/count caching (J5c LICM): hand the GPRs left free after int allocation to the
+  // loop-invariant array base pointers and counts, most-used arrays first (base then count each). ---
+  NCArr := 0;
+  if AllowUnsafe then                        // arrays are only compiled under AllowUnsafe anyway
+  begin
+    for gpr := 0 to 15 do GprUsed[gpr] := False;
+    for ii := 0 to IMaxReg do
+      if ILoc[ii] >= 0 then GprUsed[ILoc[ii]] := True;
+    ScanArr;
+    // selection sort the parallel arrays by use count, descending (NCArr is tiny)
+    for ci := 0 to NCArr - 2 do
+      for cj := ci + 1 to NCArr - 1 do
+        if CArrUses[cj] > CArrUses[ci] then
+        begin
+          ct := CArrId[ci];    CArrId[ci]    := CArrId[cj];    CArrId[cj]    := ct;
+          ct := CArrOff[ci];   CArrOff[ci]   := CArrOff[cj];   CArrOff[cj]   := ct;
+          ct := CArrUses[ci];  CArrUses[ci]  := CArrUses[cj];  CArrUses[cj]  := ct;
+        end;
+    // assign base then count for each array in priority order, from the free r9..r15
+    for ci := 0 to NCArr - 1 do
+    begin
+      for ct := 0 to 6 do                    // base
+        if (CArrBase[ci] < 0) and (not GprUsed[IntPool[ct]]) then
+        begin
+          CArrBase[ci] := IntPool[ct]; GprUsed[IntPool[ct]] := True;
+          if IntPool[ct] >= 12 then SaveGpr[IntPool[ct]] := True;
+        end;
+      for ct := 0 to 6 do                    // count
+        if (CArrCount[ci] < 0) and (not GprUsed[IntPool[ct]]) then
+        begin
+          CArrCount[ci] := IntPool[ct]; GprUsed[IntPool[ct]] := True;
+          if IntPool[ct] >= 12 then SaveGpr[IntPool[ct]] := True;
+        end;
+    end;
+  end;
+
   try
     // --- prologue ---  (Win64: rcx=IntRegs, rdx=FloatRegs; SysV: rdi/rsi)
     E.EmitBytes([$53]);                       // push rbx
@@ -556,12 +696,19 @@ begin
     for ii := 0 to IMaxReg do
       if ILoc[ii] >= 0 then
         LoadRegMem(ILoc[ii], LongWord(ii) * 8);                     // mov gpr, [rbx+ii*8]
+    // Load the cached array base pointers / counts from the descriptor (r8) -- loop-invariant.
+    for ci := 0 to NCArr - 1 do
+    begin
+      if CArrBase[ci]  >= 0 then R8LoadR(CArrBase[ci],  LongWord(CArrId[ci]) * 24 + LongWord(CArrOff[ci]));
+      if CArrCount[ci] >= 0 then R8LoadR(CArrCount[ci], LongWord(CArrId[ci]) * 24 + 16);
+    end;
 
     // --- body ---
     for pc := HeaderPC to EndPC do
     begin
       NativeOff[pc - HeaderPC] := E.Len;
       I := @Prog[pc];
+      JitDiagCurOp := I^.OpCode; JitDiagCurPC := pc;   // last op seen -> the culprit if we bail below
       Dd := LongWord(I^.Dest) * 8;
       S1 := LongWord(I^.Src1) * 8;
       S2 := LongWord(I^.Src2) * 8;
