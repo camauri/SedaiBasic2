@@ -226,6 +226,14 @@ var
   CArrBase: array of Integer;    // assigned GPR holding the base pointer, or -1
   CArrCount: array of Integer;   // assigned GPR holding the element count, or -1
   NCArr, ci, cj, ct: Integer;
+  // Callee-dedicated array cache (J6d Stage 2): while emitting an inlined callee, the caller's live GPRs are
+  // saved to the stack scratch, freeing the whole r9..r15 pool for the callee's OWN array base/count cache
+  // (CArr2*), loaded at the inline entry. This gives an array-heavy inlined SUB far more cached arrays than
+  // the handful of GPRs left free after the caller's allocation. Restored at the callee's ReturnSub.
+  CArr2Id, CArr2Off, CArr2Uses, CArr2Base, CArr2Count: array of Integer;
+  NCArr2: Integer;
+  CallerGpr: array of Integer;   // distinct native GPRs the caller uses (to preserve around every callee)
+  NCallerGpr, GprSaveDisp: Integer;
 
   procedure AddFixup(AOff, ATarget: Integer);
   begin
@@ -484,16 +492,26 @@ var
     IStore(I^.Dest, RAX);
   end;
 
-  // --- array base/count caching (J5c): index into the per-loop cache, or -1 if this array is not cached ---
+  // --- array base/count caching (J5c): index into the ACTIVE cache, or -1 if this array is not cached.
+  // The active cache is the callee-dedicated CArr2 while emitting an inlined callee (J6d), else the caller
+  // cache CArr. Both hold loop-invariant base/count values, so they are safe from either context. ---
   function CArrIdx(ArrayId: Integer): Integer;
   var q: Integer;
   begin
-    // The cache holds loop-invariant base pointers / counts, valid from both the caller and an inlined
-    // callee (J6c). Safe in InCallee: the cached value is the array's base/count, not a caller register.
     Result := -1;
-    for q := 0 to NCArr - 1 do
-      if CArrId[q] = ArrayId then begin Result := q; Exit; end;
+    if InCallee then
+    begin
+      for q := 0 to NCArr2 - 1 do
+        if CArr2Id[q] = ArrayId then begin Result := q; Exit; end;
+    end
+    else
+      for q := 0 to NCArr - 1 do
+        if CArrId[q] = ArrayId then begin Result := q; Exit; end;
   end;
+  function ActiveBase(ix: Integer): Integer;   // cached base GPR for active-cache index ix (-1 = not cached)
+  begin if InCallee then Result := CArr2Base[ix] else Result := CArrBase[ix]; end;
+  function ActiveCount(ix: Integer): Integer;  // cached count GPR for active-cache index ix (-1 = not cached)
+  begin if InCallee then Result := CArr2Count[ix] else Result := CArrCount[ix]; end;
   // Emit `cmp rcx, <count>` using the cached count reg if present, else reloading Count into rdx.
   procedure ArrCountCmp(ArrayId, CountReg: Integer);
   begin
@@ -512,23 +530,36 @@ var
     else begin R8Load(RDX, LongWord(ArrayId) * 32 + LongWord(Off)); Result := RDX; end;
   end;
   // Emit a load/store of xmm0/rax to [BaseReg + rcx*8].  BaseReg may be rdx or any r8..r15 (REX.B).
-  procedure ArrDataAccess(IsFloat, IsStore: Boolean; BaseReg: Integer);
+  // A SIB base whose low 3 bits are 101 (rbp / r13) has no mod=00 encoding -- that slot means "disp32, no
+  // base" -- so such a base needs mod=01 with an explicit disp8=0. EmitSib emits the right ModRM+SIB(+disp8).
+  procedure EmitSib(BaseReg: Integer);
   var sib: Byte;
   begin
     sib := $C8 or (BaseReg and 7);               // scale=8 (11), index=rcx (001), base=BaseReg&7
+    if (BaseReg and 7) = 5 then
+    begin
+      E.Emit8($44); E.Emit8(sib); E.Emit8($00);  // mod=01 (disp8) rm=100 (SIB), disp8 = 0
+    end
+    else
+    begin
+      E.Emit8($04); E.Emit8(sib);                // mod=00 rm=100 (SIB)
+    end;
+  end;
+  procedure ArrDataAccess(IsFloat, IsStore: Boolean; BaseReg: Integer);
+  begin
     if IsFloat then
     begin
       E.Emit8($F2);
       if BaseReg >= 8 then E.Emit8($41);         // REX.B
       E.Emit8($0F);
       if IsStore then E.Emit8($11) else E.Emit8($10);
-      E.Emit8($04); E.Emit8(sib);                // movsd xmm0, [base+rcx*8]  (or store)
+      EmitSib(BaseReg);                          // movsd xmm0, [base+rcx*8]  (or store)
     end
     else
     begin
       if BaseReg >= 8 then E.Emit8($49) else E.Emit8($48);   // REX.W (+B)
       if IsStore then E.Emit8($89) else E.Emit8($8B);
-      E.Emit8($04); E.Emit8(sib);                // mov rax, [base+rcx*8]  (or store)
+      EmitSib(BaseReg);                          // mov rax, [base+rcx*8]  (or store)
     end;
   end;
 
@@ -538,9 +569,9 @@ var
   begin
     ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index (reg or [rbx+idx])
-    if ix >= 0 then ArrCountCmp(ArrayId, CArrCount[ix]) else ArrCountCmp(ArrayId, -1);
+    if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
     E.EmitBytes([$73, $00]); pOOB := E.Len - 1;             // jae oob (unsigned: idx<0 or >=Count)
-    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 8, CArrBase[ix]) else baseR := ArrBaseReg(ArrayId, 8, -1);
+    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 8, ActiveBase(ix)) else baseR := ArrBaseReg(ArrayId, 8, -1);
     ArrDataAccess(True, False, baseR);                      // movsd xmm0, [base+rcx*8]
     E.EmitBytes([$EB, $00]); pDone := E.Len - 1;            // jmp done
     E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
@@ -555,9 +586,9 @@ var
   begin
     ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index (reg or [rbx+idx])
-    if ix >= 0 then ArrCountCmp(ArrayId, CArrCount[ix]) else ArrCountCmp(ArrayId, -1);
+    if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
     E.EmitBytes([$73, $00]); pSkip := E.Len - 1;           // jae skip
-    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 8, CArrBase[ix]) else baseR := ArrBaseReg(ArrayId, 8, -1);
+    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 8, ActiveBase(ix)) else baseR := ArrBaseReg(ArrayId, 8, -1);
     FLoad(XMM0, ValReg);                                     // xmm0 := FloatRegs[Val] (reg or memory)
     ArrDataAccess(True, True, baseR);                       // movsd [base+rcx*8], xmm0
     E.PatchByte(pSkip, Byte(E.Len - (pSkip + 1)));
@@ -570,9 +601,9 @@ var
   begin
     ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index
-    if ix >= 0 then ArrCountCmp(ArrayId, CArrCount[ix]) else ArrCountCmp(ArrayId, -1);
+    if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
     E.EmitBytes([$73, $00]); pOOB := E.Len - 1;            // jae oob (unsigned: idx<0 or >=Count)
-    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 0, CArrBase[ix]) else baseR := ArrBaseReg(ArrayId, 0, -1);
+    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 0, ActiveBase(ix)) else baseR := ArrBaseReg(ArrayId, 0, -1);
     ArrDataAccess(False, False, baseR);                    // mov rax, [base+rcx*8]
     E.EmitBytes([$EB, $00]); pDone := E.Len - 1;           // jmp done
     E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
@@ -587,9 +618,9 @@ var
   begin
     ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index
-    if ix >= 0 then ArrCountCmp(ArrayId, CArrCount[ix]) else ArrCountCmp(ArrayId, -1);
+    if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
     E.EmitBytes([$73, $00]); pSkip := E.Len - 1;           // jae skip
-    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 0, CArrBase[ix]) else baseR := ArrBaseReg(ArrayId, 0, -1);
+    if ix >= 0 then baseR := ArrBaseReg(ArrayId, 0, ActiveBase(ix)) else baseR := ArrBaseReg(ArrayId, 0, -1);
     ILoad(RAX, ValReg);                                     // rax := IntRegs[Val]
     ArrDataAccess(False, True, baseR);                     // mov [base+rcx*8], rax
     E.PatchByte(pSkip, Byte(E.Len - (pSkip + 1)));
@@ -659,16 +690,15 @@ var
     end;
   end;
 
-  // Collect the distinct arrays accessed in the loop (with their descriptor base offset and use count),
-  // so the invariant base/count loads can be hoisted into registers (J5c). Src1 of an array op is the
-  // array id (a constant), Src2 the index. The descriptor base/count are loop-invariant for the whole
-  // native invocation, so the SAME cached registers serve accesses in the caller range AND in every inlined
-  // callee body (J6c) -- the callee's index still comes from memory, only the invariant base/count are shared.
-  procedure ScanArr;
-    procedure ScanRange(lo, hi: Integer);
+  // Collect the distinct arrays accessed in the loop range (with descriptor base offset + use count) so the
+  // invariant base/count loads can be hoisted into registers (J5c). Src1 of an array op is the array id (a
+  // constant), Src2 the index. The caller uses this over [HeaderPC..EndPC]; an inlined callee builds its own
+  // dedicated cache with AllocCalleeArr over its body (J6d).
+  procedure ScanArrRange(lo, hi: Integer);
+    procedure ScanRange(lo2, hi2: Integer);
     var q, k, off, aid: Integer; J: PBcInstr;
     begin
-      for q := lo to hi do
+      for q := lo2 to hi2 do
       begin
         J := @Prog[q];
         case J^.OpCode of
@@ -691,11 +721,87 @@ var
         Inc(CArrUses[k]);
       end;
     end;
-  var c: Integer;
   begin
     NCArr := 0;
-    ScanRange(HeaderPC, EndPC);
-    for c := 0 to NCall - 1 do ScanRange(CallEntry[c], CallRet[c]);   // include inlined callee arrays
+    ScanRange(lo, hi);
+  end;
+
+  // Build the inlined callee's DEDICATED array cache (J6d Stage 2) over its body [ep..rp]: collect its
+  // arrays with use counts, then hand the whole r9..r15 pool (freed by saving the caller's GPRs around the
+  // callee) to base+count of the most-used arrays, base first. Any callee-saved GPR (r12..r15) it claims is
+  // reported so the prologue preserves it; the assignment is deterministic (recomputed identically at emit).
+  procedure AllocCalleeArr(ep, rp: Integer);
+  var q, k, off, aid, a, b, poolN: Integer; J: PBcInstr;
+    procedure Swap(var x, y: Integer); var t: Integer; begin t := x; x := y; y := t; end;
+  begin
+    NCArr2 := 0;
+    for q := ep to rp do
+    begin
+      J := @Prog[q];
+      case J^.OpCode of
+        bcArrayLoadFloat, bcArrayStoreFloat: off := 8;
+        bcArrayLoadInt,   bcArrayStoreInt:   off := 0;
+      else
+        continue;
+      end;
+      aid := J^.Src1;
+      k := 0;
+      while (k < NCArr2) and (CArr2Id[k] <> aid) do Inc(k);
+      if k = NCArr2 then
+      begin
+        Inc(NCArr2);
+        SetLength(CArr2Id, NCArr2); SetLength(CArr2Off, NCArr2); SetLength(CArr2Uses, NCArr2);
+        SetLength(CArr2Base, NCArr2); SetLength(CArr2Count, NCArr2);
+        CArr2Id[k] := aid; CArr2Off[k] := off; CArr2Uses[k] := 0;
+        CArr2Base[k] := -1; CArr2Count[k] := -1;
+      end;
+      Inc(CArr2Uses[k]);
+    end;
+    // priority = descending use count (selection sort; NCArr2 is tiny)
+    for a := 0 to NCArr2 - 2 do
+      for b := a + 1 to NCArr2 - 1 do
+        if CArr2Uses[b] > CArr2Uses[a] then
+        begin
+          Swap(CArr2Id[a], CArr2Id[b]); Swap(CArr2Off[a], CArr2Off[b]); Swap(CArr2Uses[a], CArr2Uses[b]);
+        end;
+    // assign r9..r15 (IntPool[0..6]) as base then count for each array in priority order
+    poolN := 0;
+    for a := 0 to NCArr2 - 1 do
+    begin
+      if poolN <= 6 then begin CArr2Base[a]  := IntPool[poolN]; Inc(poolN); end;
+      if poolN <= 6 then begin CArr2Count[a] := IntPool[poolN]; Inc(poolN); end;
+    end;
+    // any callee-saved GPR (r12..r15) the cache claims must be preserved by the prologue
+    for a := 0 to NCArr2 - 1 do
+    begin
+      if CArr2Base[a]  >= 12 then SaveGpr[CArr2Base[a]]  := True;
+      if CArr2Count[a] >= 12 then SaveGpr[CArr2Count[a]] := True;
+    end;
+  end;
+
+  // Save / restore the caller's live GPRs (CallerGpr) around an inlined callee, to/from the stack scratch at
+  // GprSaveDisp, so the callee may use the whole r9..r15 pool for its dedicated array cache.
+  procedure EmitSaveCallerGpr;
+  var i, N: Integer;
+  begin
+    for i := 0 to NCallerGpr - 1 do
+    begin
+      N := CallerGpr[i];                                         // mov [rsp+disp], rN
+      if N >= 8 then E.Emit8($4C) else E.Emit8($48);            // REX.W (+R for r8..r15)
+      E.Emit8($89); E.Emit8($84 or ((N and 7) shl 3)); E.Emit8($24);
+      E.Emit32(LongWord(GprSaveDisp + i * 8));
+    end;
+  end;
+  procedure EmitRestoreCallerGpr;
+  var i, N: Integer;
+  begin
+    for i := 0 to NCallerGpr - 1 do
+    begin
+      N := CallerGpr[i];                                         // mov rN, [rsp+disp]
+      if N >= 8 then E.Emit8($4C) else E.Emit8($48);
+      E.Emit8($8B); E.Emit8($84 or ((N and 7) shl 3)); E.Emit8($24);
+      E.Emit32(LongWord(GprSaveDisp + i * 8));
+    end;
   end;
 
   // Save VM register bank [0,N) qwords (BankBase = rbx for int / rsi for float) to the stack scratch area
@@ -743,7 +849,7 @@ var
   // unsupported opcode or a bcCallSub that could not be inlined. A bcCallSub emits an inline copy of the
   // callee body wrapped in a native FramePush/Pop; the callee is compiled all-memory (InCallee).
   function EmitOne(apc: Integer): Boolean;
-  var cs, cpc: Integer;
+  var cs, cpc, ck: Integer;
   begin
     Result := False;
     I := @Prog[apc];
@@ -909,6 +1015,13 @@ var
           CurSaveN := CallSaveN[cs];
           EmitSaveBank(RBX, 0, CurSaveN);                       // save int bank [0,CurSaveN)
           EmitSaveBank(RSI, LongWord(CurSaveN) * 8, CurSaveN);  // save float bank [0,CurSaveN)
+          EmitSaveCallerGpr;                                    // free r9..r15 for the callee's array cache
+          AllocCalleeArr(CallEntry[cs], CallRet[cs]);          // build CArr2 (same result as the pre-pass)
+          for ck := 0 to NCArr2 - 1 do                         // load the callee cache from the descriptor
+          begin
+            if CArr2Base[ck]  >= 0 then R8LoadR(CArr2Base[ck],  LongWord(CArr2Id[ck]) * 32 + LongWord(CArr2Off[ck]));
+            if CArr2Count[ck] >= 0 then R8LoadR(CArr2Count[ck], LongWord(CArr2Id[ck]) * 32 + 16);
+          end;
           InCallee := True;
           for cpc := CallEntry[cs] to CallRet[cs] do
           begin
@@ -920,6 +1033,7 @@ var
       bcReturnSub:
         if InCallee then
         begin
+          EmitRestoreCallerGpr;                                    // restore the caller's GPRs
           EmitRestoreBank(RBX, 0, CurSaveN);                       // restore int bank
           EmitRestoreBank(RSI, LongWord(CurSaveN) * 8, CurSaveN);  // restore float bank -> fall through
         end
@@ -1071,7 +1185,7 @@ begin
     for gpr := 0 to 15 do GprUsed[gpr] := False;
     for ii := 0 to IMaxReg do
       if ILoc[ii] >= 0 then GprUsed[ILoc[ii]] := True;
-    ScanArr;
+    ScanArrRange(HeaderPC, EndPC);
     // selection sort the parallel arrays by use count, descending (NCArr is tiny)
     for ci := 0 to NCArr - 2 do
       for cj := ci + 1 to NCArr - 1 do
@@ -1098,6 +1212,28 @@ begin
         end;
     end;
   end;
+
+  // --- inlined-callee dedicated array cache setup (J6d Stage 2) ---
+  // CallerGpr = the caller's live GPRs (its int allocation + its shared array cache) that must be preserved
+  // around every inlined callee so the callee may reuse the whole r9..r15 pool. Run AllocCalleeArr per call
+  // site now (before the prologue) so a callee-saved GPR its cache claims is pushed; recomputed at emit.
+  NCallerGpr := 0;
+  if NCall > 0 then
+    for gpr := 9 to 15 do
+    begin
+      ct := 0;
+      for ii := 0 to IMaxReg do if ILoc[ii] = gpr then ct := 1;
+      for ci := 0 to NCArr - 1 do if (CArrBase[ci] = gpr) or (CArrCount[ci] = gpr) then ct := 1;
+      if ct = 1 then
+      begin
+        Inc(NCallerGpr); SetLength(CallerGpr, NCallerGpr); CallerGpr[NCallerGpr - 1] := gpr;
+      end;
+    end;
+  for ci := 0 to NCall - 1 do
+    AllocCalleeArr(CallEntry[ci], CallRet[ci]);   // sets SaveGpr for callee-saved cache regs
+  // Scratch layout: [0, MaxSaveN*16) memory-bank save, then [GprSaveDisp, +NCallerGpr*8) caller-GPR save.
+  GprSaveDisp := ScratchBytes;                     // ScratchBytes here == MaxSaveN*16 (set by BuildCallSites)
+  ScratchBytes := GprSaveDisp + NCallerGpr * 8;
 
   try
     // --- prologue ---  (Win64: rcx=IntRegs, rdx=FloatRegs; SysV: rdi/rsi)
