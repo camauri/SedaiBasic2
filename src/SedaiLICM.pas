@@ -101,8 +101,17 @@ type
     { Check if a value is defined outside the loop }
     function IsDefinedOutsideLoop(const Val: TSSAValue; Loop: TLoopInfo): Boolean;
 
-    { Check if instruction is loop-invariant }
+    { Check if instruction is loop-invariant (CLASSIC path) }
     function IsInvariant(const Instr: TSSAInstruction; Loop: TLoopInfo): Boolean;
+
+    { Phase A MODERN fixpoint helpers }
+    function DefinedInsideLoop(const Val: TSSAValue; Loop: TLoopInfo): Boolean;
+    function AllUsesInsideLoop(const Val: TSSAValue; Loop: TLoopInfo): Boolean;
+    function UniquelyDefinedInLoop(const Instr: TSSAInstruction; Loop: TLoopInfo): Boolean;
+    function BlockDominatesAllLatches(Block: TSSABasicBlock; Loop: TLoopInfo): Boolean;
+    function OperandInvariantModern(const Val: TSSAValue; Loop: TLoopInfo; ToHoist: TFPList): Boolean;
+    function IsCandidateModern(const Instr: TSSAInstruction; Block: TSSABasicBlock; Loop: TLoopInfo; ToHoist: TFPList): Boolean;
+    procedure CollectInvariantsModern(Loop: TLoopInfo; ToHoist, OriginalBlocks: TFPList);
 
     { Check if an array is modified anywhere in the loop }
     function IsArrayModifiedInLoop(ArrayIndex: Integer; Loop: TLoopInfo): Boolean;
@@ -736,29 +745,18 @@ begin
   // causing VV to be 0 only on the first outer iteration.
   //
   // The safe approach: don't hoist anything with a register destination.
-  if FProgram.GlobalVariableSemantics then
+  // CLASSIC-only path (MODERN routes through CollectInvariantsModern instead). In CLASSIC every value is
+  // Version=0 with global-by-name semantics, so a register-dest hoist is never safe: never hoist a
+  // register-dest instruction. Only constant-dest forms fall through.
+  if Instr.Dest.Kind = svkRegister then
   begin
-    // CLASSIC (Version=0 everywhere): unchanged — never hoist a register-dest instruction.
-    if Instr.Dest.Kind = svkRegister then
-    begin
-      {$IFDEF DEBUG_LICM}
-      if DebugLICM then
-        WriteLn('[LICM] Skipping hoist in GlobalVariableSemantics: dest is register r',
-                Instr.Dest.RegIndex, '_v', Instr.Dest.Version,
-                ' (unsafe in BASIC semantics)');
-      {$ENDIF}
-      Exit(False);
-    end;
-  end
-  else
-  begin
-    // MODERN (Phase A): enable ONLY loop-invariant array-load hoisting for now (the n-body prize:
-    // px(i) invariant in an inner loop). The array-load path below still checks IsArrayModifiedInLoop
-    // and index invariance via the versioned def-scan. General register-dest hoisting over versioned
-    // values is deferred: a naive lift miscompiled 11 corpus cases (UDT/ptr/forcounter), so it needs a
-    // precise use-def/PHI-aware invariance check before it can be trusted.
-    if (Instr.Dest.Kind = svkRegister) and (Instr.OpCode <> ssaArrayLoad) then
-      Exit(False);
+    {$IFDEF DEBUG_LICM}
+    if DebugLICM then
+      WriteLn('[LICM] Skipping hoist in GlobalVariableSemantics: dest is register r',
+              Instr.Dest.RegIndex, '_v', Instr.Dest.Version,
+              ' (unsafe in BASIC semantics)');
+    {$ENDIF}
+    Exit(False);
   end;
 
   // Special handling for array loads:
@@ -815,6 +813,235 @@ begin
   Result := True;
 end;
 
+// ---------------------------------------------------------------------------
+// Phase A MODERN loop-invariant fixpoint
+//
+// The CLASSIC path above can never hoist a register-dest instruction (global-by-name Version=0
+// semantics). MODERN produces confined, versioned SSA where proc-local scalars and compiler temps
+// carry real dataflow identity, so a proper invariance fixpoint is sound. Key soundness facts:
+//   * Volatile cross-frame channels (SHARED, @-taken/raw) are only ever read via ArrayLoad/RawLoad and
+//     written via ArrayStore/RawStore ops. A read's result temp is DEFINED INSIDE the loop, so it fails
+//     the invariance test; the aliased store is not in the safe-to-hoist whitelist and never moves. Thus
+//     a hoistable register-dest arithmetic operand/dest is always a proc-local scalar or a pure temp.
+//   * Zero-trip safety is enforced per candidate via AllUsesInsideLoop: only values dead outside the loop
+//     are relocated, so materializing them once in the preheader is unobservable even on an empty loop.
+// ---------------------------------------------------------------------------
+
+function LICMRegMatches(const A, B: TSSAValue): Boolean; inline;
+begin
+  Result := (A.Kind = svkRegister) and (B.Kind = svkRegister) and
+            (A.RegType = B.RegType) and (A.RegIndex = B.RegIndex) and
+            (A.Version = B.Version);
+end;
+
+function TLoopInvariantCodeMotion.DefinedInsideLoop(const Val: TSSAValue; Loop: TLoopInfo): Boolean;
+var
+  i, j: Integer;
+  Block: TSSABasicBlock;
+begin
+  Result := False;
+  if Val.Kind <> svkRegister then Exit;
+  for i := 0 to Loop.Blocks.Count - 1 do
+  begin
+    Block := TSSABasicBlock(Loop.Blocks[i]);
+    for j := 0 to Block.Instructions.Count - 1 do
+      // Dest also covers PHI results (a PHI's Dest is its defined register).
+      if LICMRegMatches(Block.Instructions[j].Dest, Val) then
+        Exit(True);
+  end;
+end;
+
+function TLoopInvariantCodeMotion.AllUsesInsideLoop(const Val: TSSAValue; Loop: TLoopInfo): Boolean;
+var
+  i, j, k: Integer;
+  Block: TSSABasicBlock;
+  Instr: TSSAInstruction;
+begin
+  Result := False;
+  if Val.Kind <> svkRegister then Exit;
+  for i := 0 to FProgram.Blocks.Count - 1 do
+  begin
+    Block := FProgram.Blocks[i];
+    if Loop.ContainsBlock(Block) then Continue;  // uses within the loop are fine
+    for j := 0 to Block.Instructions.Count - 1 do
+    begin
+      Instr := Block.Instructions[j];
+      if LICMRegMatches(Instr.Src1, Val) then Exit;
+      if LICMRegMatches(Instr.Src2, Val) then Exit;
+      if LICMRegMatches(Instr.Src3, Val) then Exit;
+      for k := 0 to High(Instr.PhiSources) do
+        if LICMRegMatches(Instr.PhiSources[k].Value, Val) then Exit;  // loop-exit PHI source = live-out
+    end;
+  end;
+  Result := True;
+end;
+
+function TLoopInvariantCodeMotion.OperandInvariantModern(const Val: TSSAValue; Loop: TLoopInfo;
+  ToHoist: TFPList): Boolean;
+var
+  i: Integer;
+begin
+  case Val.Kind of
+    svkNone, svkConstInt, svkConstFloat, svkConstString, svkLabel:
+      Result := True;
+    svkRegister:
+      begin
+        // Invariant if its defining instruction is already scheduled for hoisting (it will be
+        // materialized in the preheader)...
+        for i := 0 to ToHoist.Count - 1 do
+          if LICMRegMatches(TSSAInstruction(ToHoist[i]).Dest, Val) then
+            Exit(True);
+        // ...or it is never (re)defined inside the loop (parameters, outer-scope values, and constants
+        // materialized before the loop are stable across iterations). A volatile channel read through
+        // ArrayLoad/RawLoad produces a temp DEFINED inside the loop, so it correctly fails here.
+        Result := not DefinedInsideLoop(Val, Loop);
+      end;
+  else
+    Result := False;
+  end;
+end;
+
+function TLoopInvariantCodeMotion.UniquelyDefinedInLoop(const Instr: TSSAInstruction; Loop: TLoopInfo): Boolean;
+var
+  i, j: Integer;
+  Block: TSSABasicBlock;
+  Other: TSSAInstruction;
+begin
+  // True iff no OTHER instruction in the loop defines Instr.Dest. A versioned SSA value (Version>0) always
+  // satisfies this; the check exists to reject Version=0 loop-carried variables that have several defs
+  // (e.g. an inner counter's `k = 1` init and `k = k + 1` update both live in the enclosing loop). Moving
+  // one def of such a variable out of the loop drops its per-iteration reset — a miscompile.
+  Result := False;
+  for i := 0 to Loop.Blocks.Count - 1 do
+  begin
+    Block := TSSABasicBlock(Loop.Blocks[i]);
+    for j := 0 to Block.Instructions.Count - 1 do
+    begin
+      Other := Block.Instructions[j];
+      if (Other <> Instr) and LICMRegMatches(Other.Dest, Instr.Dest) then Exit;
+    end;
+  end;
+  Result := True;
+end;
+
+function TLoopInvariantCodeMotion.BlockDominatesAllLatches(Block: TSSABasicBlock; Loop: TLoopInfo): Boolean;
+var
+  DomTree: TDominatorTree;
+  i: Integer;
+begin
+  // True iff Block executes on every complete iteration (it dominates every back-edge source). Hoisting is
+  // restricted to such blocks so we never speculate a conditionally-executed instruction into the preheader:
+  // besides the classic exception-safety rule, lifting a value used only on one branch stretches its live
+  // range across the whole loop and collides with the static register allocator (which miscolors the
+  // extended range). Body blocks not guarded by an inner IF dominate the latch; then/else arms do not.
+  Result := False;
+  if Loop.BackEdgeSources.Count = 0 then Exit;
+  DomTree := TDominatorTree(FProgram.GetDomTree);
+  if not Assigned(DomTree) then Exit;
+  try
+    for i := 0 to Loop.BackEdgeSources.Count - 1 do
+      if not DomTree.IsDom(Block, TSSABasicBlock(Loop.BackEdgeSources[i])) then Exit;
+  except
+    // A block absent from the (pre-modification) tree: be conservative.
+    Exit;
+  end;
+  Result := True;
+end;
+
+function TLoopInvariantCodeMotion.IsCandidateModern(const Instr: TSSAInstruction; Block: TSSABasicBlock;
+  Loop: TLoopInfo; ToHoist: TFPList): Boolean;
+begin
+  Result := False;
+  if not IsSafeToHoist(Instr) then Exit;
+
+  // ⚠️ Phase A gate: hoist ONLY ssaArrayLoad for now. The invariance analysis below is general and
+  // SSA-correct (the fixpoint chains through constant loads and intermediate temps). Enabling the general
+  // scalar path reaches 469/470 on the corpus; the failures are NOT the register allocator (A3) as first
+  // suspected, but pre-existing latent register-typing bugs that hoisting exposes by changing the register
+  // assignment. Two were found:
+  //   1. FIXED — float FOR-loop comparison results were typed in the float bank while the VM writes them
+  //      to IntRegs (SedaiSSA.pas ~8793/8823/8847/8881, now srtInt). This resolved m10 and m394_shr.
+  //   2. OPEN — m392_copycoal: two const strings (a named Const and a literal) collide in one string
+  //      register, so a StrConcat reads the wrong constant. It surfaces only via the general hoisting's
+  //      allocation shift. Until that is fixed too, restrict to array loads (the committed b6c6516
+  //      behavior, the n-body prize) which stay bit-identical. To re-enable the general path, delete the
+  //      next two lines. See job/docs/PIANO_FASE_A_SSA_VERSIONING.md.
+  if Instr.OpCode <> ssaArrayLoad then
+    Exit;
+
+  // Never speculatively hoist trapping integer div/mod (raise on /0 or INT_MIN div -1). MODERN float
+  // div/pow yield inf/nan instead of trapping, so those remain hoistable.
+  if Instr.OpCode in [ssaDivInt, ssaModInt] then Exit;
+  // Must produce a relocatable register value...
+  if Instr.Dest.Kind <> svkRegister then Exit;
+  // ...sited on every iteration's path (not under a conditional inside the loop)...
+  if not BlockDominatesAllLatches(Block, Loop) then Exit;
+  // ...with a single definition inside the loop (else it is a multiply-assigned Version=0 variable whose
+  // per-iteration reassignment must stay in the loop)...
+  if not UniquelyDefinedInLoop(Instr, Loop) then Exit;
+  // ...that is dead outside the loop (zero-trip safety).
+  if not AllUsesInsideLoop(Instr.Dest, Loop) then Exit;
+
+  if Instr.OpCode = ssaArrayLoad then
+  begin
+    // Src1 = array id (constant), Src2 = linear index. Invariant iff the array is not modified in the
+    // loop and the index is loop-invariant.
+    if Instr.Src1.Kind <> svkConstInt then Exit;
+    if IsArrayModifiedInLoop(Instr.Src1.ConstInt, Loop) then Exit;
+    Result := OperandInvariantModern(Instr.Src2, Loop, ToHoist);
+    Exit;
+  end;
+
+  Result := OperandInvariantModern(Instr.Src1, Loop, ToHoist) and
+            OperandInvariantModern(Instr.Src2, Loop, ToHoist) and
+            OperandInvariantModern(Instr.Src3, Loop, ToHoist);
+end;
+
+procedure TLoopInvariantCodeMotion.CollectInvariantsModern(Loop: TLoopInfo; ToHoist, OriginalBlocks: TFPList);
+var
+  i, j, Iterations: Integer;
+  Block: TSSABasicBlock;
+  Instr: TSSAInstruction;
+  Changed: Boolean;
+begin
+  // Fixpoint: repeatedly admit instructions whose operands are all invariant (constant, defined outside
+  // the loop, or produced by an already-admitted instruction), until nothing new is found. Admission
+  // order is a valid def-before-use topological order: an instruction is only admitted once every operand
+  // def is either outside the loop or already in ToHoist, so its producers always precede it.
+  Iterations := 0;
+  repeat
+    Changed := False;
+    Inc(Iterations);
+    if Iterations > 50 then
+    begin
+      {$IFDEF DEBUG_LICM}
+      if DebugLICM then WriteLn('[LICM] WARNING: MODERN fixpoint iteration limit');
+      {$ENDIF}
+      Break;
+    end;
+    for i := 0 to Loop.Blocks.Count - 1 do
+    begin
+      Block := TSSABasicBlock(Loop.Blocks[i]);
+      if Block = Loop.Header then Continue;  // header holds PHIs / the loop guard
+      for j := 0 to Block.Instructions.Count - 1 do
+      begin
+        Instr := Block.Instructions[j];
+        if ToHoist.IndexOf(Pointer(Instr)) >= 0 then Continue;
+        if IsCandidateModern(Instr, Block, Loop, ToHoist) then
+        begin
+          ToHoist.Add(Pointer(Instr));
+          OriginalBlocks.Add(Pointer(Block));
+          Changed := True;
+          {$IFDEF DEBUG_LICM}
+          if DebugLICM then
+            WriteLn('[LICM]   MODERN invariant: ', Instr.ToString, ' from ', Block.LabelName);
+          {$ENDIF}
+        end;
+      end;
+    end;
+  until not Changed;
+end;
+
 function TLoopInvariantCodeMotion.CloneInstruction(const Instr: TSSAInstruction): TSSAInstruction;
 begin
   // Use built-in Clone method from TSSAInstruction
@@ -843,7 +1070,15 @@ begin
   ToHoist := TFPList.Create;
   OriginalBlocks := TFPList.Create;
   try
-    // Multi-pass: find invariants until no more found
+    if not FProgram.GlobalVariableSemantics then
+    begin
+      // MODERN (Phase A): version-aware invariance fixpoint (admits constant loads, temps and versioned
+      // proc-local scalars, chaining through intermediate temps).
+      CollectInvariantsModern(Loop, ToHoist, OriginalBlocks);
+    end
+    else
+    begin
+    // CLASSIC: multi-pass conservative scan via IsInvariant (never hoists a register-dest instruction).
     Iterations := 0;
     repeat
       Changed := False;
@@ -886,6 +1121,7 @@ begin
         end;
       end;
     until not Changed;
+    end;  // CLASSIC branch
 
     // Clone and insert into pre-header (before the jump)
     InsertPos := Loop.PreHeader.Instructions.Count - 1;  // Before final jump

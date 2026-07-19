@@ -8790,18 +8790,23 @@ begin
     else
       EmitInstruction(ssaLoadConstFloat, TempVal, MakeSSAConstFloat(0.0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 
-    StepSignReg := FProgram.AllocRegister(VarReg.RegType);
+    // The comparison RESULT is always an int boolean: bcCmp*Float writes Ctx.IntRegs[Dest] and
+    // bcJumpIf* reads Ctx.IntRegs[Src], so the result register must live in the int bank. Typing it as
+    // VarReg.RegType (srtFloat for a float counter) puts it in the float bank while the VM accesses the
+    // int bank at that index — a latent collision that LICM hoisting exposes (an unrelated int value that
+    // the allocator places at the same int index gets clobbered by the loop-condition compare).
+    StepSignReg := FProgram.AllocRegister(srtInt);
     if VarReg.RegType = srtInt then
-      EmitInstruction(ssaCmpLtInt, MakeSSARegister(VarReg.RegType, StepSignReg), StepValue, TempVal, MakeSSAValue(svkNone))
+      EmitInstruction(ssaCmpLtInt, MakeSSARegister(srtInt, StepSignReg), StepValue, TempVal, MakeSSAValue(svkNone))
     else
-      EmitInstruction(ssaCmpLtFloat, MakeSSARegister(VarReg.RegType, StepSignReg), StepValue, TempVal, MakeSSAValue(svkNone));
+      EmitInstruction(ssaCmpLtFloat, MakeSSARegister(srtInt, StepSignReg), StepValue, TempVal, MakeSSAValue(svkNone));
 
     // Generate two condition labels
     UseLELabel := GenerateUniqueLabel('for_cond_le');
     UseGELabel := GenerateUniqueLabel('for_cond_ge');
 
     // Jump to GE label if STEP < 0
-    EmitInstruction(ssaJumpIfNotZero, MakeSSALabel(UseGELabel), MakeSSARegister(VarReg.RegType, StepSignReg),
+    EmitInstruction(ssaJumpIfNotZero, MakeSSALabel(UseGELabel), MakeSSARegister(srtInt, StepSignReg),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 
     // ===== LE Condition Block (STEP >= 0) =====
@@ -8820,12 +8825,12 @@ begin
       {$ENDIF}
     end;
 
-    CmpReg := FProgram.AllocRegister(VarReg.RegType);
+    CmpReg := FProgram.AllocRegister(srtInt);  // comparison result is an int boolean (see note above)
     if VarReg.RegType = srtInt then
-      EmitInstruction(ssaCmpLeInt, MakeSSARegister(VarReg.RegType, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone))
+      EmitInstruction(ssaCmpLeInt, MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone))
     else
-      EmitInstruction(ssaCmpLeFloat, MakeSSARegister(VarReg.RegType, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone));
-    EmitInstruction(ssaJumpIfZero, MakeSSALabel(EndLabel), MakeSSARegister(VarReg.RegType, CmpReg),
+      EmitInstruction(ssaCmpLeFloat, MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone));
+    EmitInstruction(ssaJumpIfZero, MakeSSALabel(EndLabel), MakeSSARegister(srtInt, CmpReg),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     EmitInstruction(ssaJump, MakeSSALabel(BodyLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 
@@ -8844,12 +8849,12 @@ begin
       {$ENDIF}
     end;
 
-    CmpReg := FProgram.AllocRegister(VarReg.RegType);
+    CmpReg := FProgram.AllocRegister(srtInt);  // comparison result is an int boolean (see note above)
     if VarReg.RegType = srtInt then
-      EmitInstruction(ssaCmpGeInt, MakeSSARegister(VarReg.RegType, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone))
+      EmitInstruction(ssaCmpGeInt, MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone))
     else
-      EmitInstruction(ssaCmpGeFloat, MakeSSARegister(VarReg.RegType, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone));
-    EmitInstruction(ssaJumpIfZero, MakeSSALabel(EndLabel), MakeSSARegister(VarReg.RegType, CmpReg),
+      EmitInstruction(ssaCmpGeFloat, MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone));
+    EmitInstruction(ssaJumpIfZero, MakeSSALabel(EndLabel), MakeSSARegister(srtInt, CmpReg),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     // Fallthrough to body
   end
@@ -8878,27 +8883,27 @@ begin
     end;
 
     // Compare loop variable with end value
-    CmpReg := FProgram.AllocRegister(VarReg.RegType);
+    CmpReg := FProgram.AllocRegister(srtInt);  // comparison result is an int boolean (see note above)
 
     if StepIsNegative then
     begin
       // Negative step: use >= comparison
       if VarReg.RegType = srtInt then
-        EmitInstruction(ssaCmpGeInt, MakeSSARegister(VarReg.RegType, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone))
+        EmitInstruction(ssaCmpGeInt, MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone))
       else
-        EmitInstruction(ssaCmpGeFloat, MakeSSARegister(VarReg.RegType, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone));
+        EmitInstruction(ssaCmpGeFloat, MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone));
     end
     else
     begin
       // Positive or zero step: use <= comparison
       if VarReg.RegType = srtInt then
-        EmitInstruction(ssaCmpLeInt, MakeSSARegister(VarReg.RegType, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone))
+        EmitInstruction(ssaCmpLeInt, MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone))
       else
-        EmitInstruction(ssaCmpLeFloat, MakeSSARegister(VarReg.RegType, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone));
+        EmitInstruction(ssaCmpLeFloat, MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone));
     end;
 
     // Jump to body if condition is true (!=0), otherwise jump to end
-    EmitInstruction(ssaJumpIfZero, MakeSSALabel(EndLabel), MakeSSARegister(VarReg.RegType, CmpReg),
+    EmitInstruction(ssaJumpIfZero, MakeSSALabel(EndLabel), MakeSSARegister(srtInt, CmpReg),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
