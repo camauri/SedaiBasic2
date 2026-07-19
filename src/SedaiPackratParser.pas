@@ -8270,6 +8270,60 @@ var
   Token, NameTok, TypeTok: TLexerToken;
   Assignment, ValueNode, ArrayDecl: TASTNode;
   TypeName: string;
+
+  // Best-effort bank of an untyped CONST initializer that is NOT a plain literal — a string-returning
+  // intrinsic (Chr, Left, Str, ...), a '$'-suffixed name/call, or a concatenation of such. Without this a
+  // "Const lr = Chr(188)" defaults to DOUBLE: a float register holding a string, which later flows through
+  // a cross-bank CopyFloat (and a CopyFloat over a string PHI at an IIF merge) — a latent mismatch the
+  // optimizer's register reassignment can turn into a wrong-register read.
+  function ValueIsString(N: TASTNode): Boolean;
+  var Nm: string;
+  begin
+    Result := False;
+    if N = nil then Exit;
+    case N.NodeType of
+      antLiteral: Result := VarIsStr(N.Value);
+      antIdentifier:
+        begin
+          Nm := UpperCase(VarToStr(N.Value));
+          Result := (Nm <> '') and (Nm[Length(Nm)] = '$');
+        end;
+      antArrayAccess, antFunctionCall:
+        if (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) then
+        begin
+          Nm := UpperCase(VarToStr(N.GetChild(0).Value));
+          Result := ((Nm <> '') and (Nm[Length(Nm)] = '$')) or
+                    (Nm = 'CHR') or (Nm = 'MID') or (Nm = 'LEFT') or (Nm = 'RIGHT') or
+                    (Nm = 'STRING') or (Nm = 'SPACE') or (Nm = 'STR') or (Nm = 'HEX') or
+                    (Nm = 'OCT') or (Nm = 'BIN') or (Nm = 'TRIM') or (Nm = 'LTRIM') or
+                    (Nm = 'RTRIM') or (Nm = 'UCASE') or (Nm = 'LCASE') or (Nm = 'WCHR') or
+                    (Nm = 'WSTR') or (Nm = 'WSPACE') or (Nm = 'CSTR') or (Nm = 'FORMAT');
+        end;
+      antBinaryOp:
+        Result := (N.ChildCount >= 2) and (ValueIsString(N.GetChild(0)) or ValueIsString(N.GetChild(1)));
+    end;
+  end;
+
+  // Bank of an untyped CONST from its initializer: string literal / string-valued expression -> STRING;
+  // numeric literal with fraction or exponent -> DOUBLE; other numeric literal -> LONGINT; unknown -> DOUBLE.
+  function InferConstTypeName(V: TASTNode): string;
+  begin
+    Result := 'DOUBLE';
+    if V = nil then Exit;
+    if V.NodeType = antLiteral then
+    begin
+      if VarIsStr(V.Value) then
+        Result := 'STRING'
+      else if (Pos('.', VarToStr(V.Value)) > 0) or
+              (Pos('E', UpperCase(VarToStr(V.Value))) > 0) then
+        Result := 'DOUBLE'
+      else
+        Result := 'LONGINT';
+    end
+    else if ValueIsString(V) then
+      Result := 'STRING';
+  end;
+
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antConst, Token);
@@ -8379,17 +8433,7 @@ begin
     Exit;
   end;
   ValueNode := Assignment.GetChild(1).Clone;          // the constant value (assignment freed below)
-  TypeName := 'DOUBLE';
-  if ValueNode.NodeType = antLiteral then
-  begin
-    if VarIsStr(ValueNode.Value) then
-      TypeName := 'STRING'
-    else if (Pos('.', VarToStr(ValueNode.Value)) > 0) or
-            (Pos('E', UpperCase(VarToStr(ValueNode.Value))) > 0) then
-      TypeName := 'DOUBLE'
-    else
-      TypeName := 'LONGINT';
-  end;
+  TypeName := InferConstTypeName(ValueNode);
   NameTok := Assignment.GetChild(0).Token;
   Result.Free;                                        // discard the antConst; emit a typed SHARED DIM
   ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
@@ -8403,6 +8447,40 @@ begin
   Assignment.Free;
   Result := TASTNode.Create(antDim, Token);
   Result.AddChild(ArrayDecl);
+  // Multi-constant list: "CONST a = v1, b = v2, ...". Each further comma-separated constant gets the SAME
+  // lowering (typed scalar DIM, per-value bank inference, SHARED in MODERN). Previously everything after
+  // the first constant was left in the token stream and re-parsed as a PLAIN assignment — an untyped,
+  // non-shared module variable: not constant, invisible inside procedures, and bank-inferred from the
+  // NAME (float default) instead of the value, so "Const hb = Chr(205), vb = Chr(186)" left hb/vb as
+  // floats silently printing 0 (m392).
+  while Context.Check(ttSeparParam) do
+  begin
+    Context.Advance;                                  // ','
+    if not Context.Check(ttIdentifier) then
+    begin
+      HandleError('Expected constant name after "," in CONST list', Context.CurrentToken);
+      Break;
+    end;
+    NameTok := Context.CurrentToken;
+    Context.Advance;                                  // name
+    if not Context.Match(ttOpEq) then
+    begin
+      HandleError('Expected "=" after CONST name', Context.CurrentToken);
+      Break;
+    end;
+    ValueNode := ParseExpression;
+    if not Assigned(ValueNode) then
+    begin
+      HandleError('Expected value after CONST =', Context.CurrentToken);
+      Break;
+    end;
+    ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
+    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
+    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, InferConstTypeName(ValueNode), NameTok));
+    ArrayDecl.AddChild(ValueNode);
+    if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';
+    Result.AddChild(ArrayDecl);
+  end;
   DoNodeCreated(Result);
 end;
 

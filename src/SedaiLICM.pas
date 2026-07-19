@@ -954,21 +954,15 @@ begin
   Result := False;
   if not IsSafeToHoist(Instr) then Exit;
 
-  // ⚠️ Phase A gate: hoist ONLY ssaArrayLoad for now. The invariance analysis below is general and
-  // SSA-correct (the fixpoint chains through constant loads and intermediate temps). Enabling the general
-  // scalar path reaches 469/470 on the corpus; the failures are NOT the register allocator (A3) as first
-  // suspected, but pre-existing latent register-typing bugs that hoisting exposes by changing the register
-  // assignment. Two were found:
-  //   1. FIXED — float FOR-loop comparison results were typed in the float bank while the VM writes them
-  //      to IntRegs (SedaiSSA.pas ~8793/8823/8847/8881, now srtInt). This resolved m10 and m394_shr.
-  //   2. OPEN — m392_copycoal: two const strings (a named Const and a literal) collide in one string
-  //      register, so a StrConcat reads the wrong constant. It surfaces only via the general hoisting's
-  //      allocation shift. Until that is fixed too, restrict to array loads (the committed b6c6516
-  //      behavior, the n-body prize) which stay bit-identical. To re-enable the general path, delete the
-  //      next two lines. See job/docs/PIANO_FASE_A_SSA_VERSIONING.md.
-  if Instr.OpCode <> ssaArrayLoad then
-    Exit;
-
+  // General scalar hoisting is ON (Phase A). The fixpoint below is SSA-correct and chains through
+  // constant loads and intermediate temps. Getting here required fixing two latent register-TYPING bugs
+  // that the hoisting's allocation shift exposed (NOT the register allocator, as first suspected):
+  //   1. Float FOR-loop comparison results were typed in the float bank while the VM writes booleans to
+  //      IntRegs (SedaiSSA.pas FOR condition sites, now srtInt) — resolved m10/m394.
+  //   2. In a multi-constant "Const a = v1, b = v2, ..." every constant after the first was left as a
+  //      plain float-banked assignment (SedaiPackratParser.ParseConstStatement, now lowered per-element
+  //      with value-inferred banks) — resolved m392 and a silent wrong-output bug (box chars printed 0).
+  // If a new OPTDIFF ever bisects to this pass, suspect another latent bank-typing mismatch FIRST.
   // Never speculatively hoist trapping integer div/mod (raise on /0 or INT_MIN div -1). MODERN float
   // div/pow yield inf/nan instead of trapping, so those remain hoistable.
   if Instr.OpCode in [ssaDivInt, ssaModInt] then Exit;
