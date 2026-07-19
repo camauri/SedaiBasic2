@@ -173,16 +173,10 @@ var
   i, j: Integer;
   Temp: TLoopInfo;
 begin
-  // Phase A: not yet version-aware; it miscompiles on the versioned SSA that MODERN now produces (it
-  // relies on the stale VarRegMap surrogate). It is output-preserving, so skipping it on a versioned
-  // program keeps MODERN bit-identical to baseline while CLASSIC (Version=0) keeps the optimization.
-  // Re-enable once made version-aware (Phase A follow-on). See job/docs/PIANO_FASE_A_SSA_VERSIONING.md.
-  if not FProgram.GlobalVariableSemantics then
-  begin
-    Result := 0;
-    Exit;
-  end;
-
+  // Phase A: version-aware. Runs in BOTH dialects now. CLASSIC (all Version=0) keeps the old
+  // conservative behavior (see the guards in IsInvariant/IsDefinedOutsideLoop); MODERN can hoist
+  // loop-invariant computations over VERSIONED proc-local scalars (single-definition SSA values),
+  // which unblocks array-load hoisting (e.g. px(i) invariant in an inner loop).
   {$IFDEF DEBUG_LICM}
   if DebugLICM then
     WriteLn('[LICM] Running loop-invariant code motion...');
@@ -656,10 +650,10 @@ begin
   if Val.Kind in [svkConstInt, svkConstFloat, svkConstString, svkLabel, svkNone] then
     Exit(True);
 
-  // CRITICAL: User variables with GlobalVariableSemantics (Version=0) cannot be
-  // reliably determined as loop-invariant because all definitions have same version.
-  // Conservatively treat them as NOT outside loop (don't hoist)
-  if IsUserVariable(Val) then
+  // Version=0 user variables cannot be reliably located (all definitions share version 0), so treat
+  // them conservatively as NOT outside the loop. A VERSIONED value (Version>0, MODERN proc-local) is a
+  // real SSA single-definition, so it falls through to the exact def-scan below.
+  if (Val.Version = 0) and IsUserVariable(Val) then
   begin
     {$IFDEF DEBUG_LICM}
     if DebugLICM then
@@ -744,6 +738,7 @@ begin
   // The safe approach: don't hoist anything with a register destination.
   if FProgram.GlobalVariableSemantics then
   begin
+    // CLASSIC (Version=0 everywhere): unchanged — never hoist a register-dest instruction.
     if Instr.Dest.Kind = svkRegister then
     begin
       {$IFDEF DEBUG_LICM}
@@ -754,6 +749,16 @@ begin
       {$ENDIF}
       Exit(False);
     end;
+  end
+  else
+  begin
+    // MODERN (Phase A): enable ONLY loop-invariant array-load hoisting for now (the n-body prize:
+    // px(i) invariant in an inner loop). The array-load path below still checks IsArrayModifiedInLoop
+    // and index invariance via the versioned def-scan. General register-dest hoisting over versioned
+    // values is deferred: a naive lift miscompiled 11 corpus cases (UDT/ptr/forcounter), so it needs a
+    // precise use-def/PHI-aware invariance check before it can be trusted.
+    if (Instr.Dest.Kind = svkRegister) and (Instr.OpCode <> ssaArrayLoad) then
+      Exit(False);
   end;
 
   // Special handling for array loads:
