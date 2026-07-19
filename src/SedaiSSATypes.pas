@@ -527,6 +527,9 @@ type
     FDomTreeObj: TObject;       // PHASE 3 TIER 2: Actually TDominatorTree (avoid circular dependency)
     FDomTreeValid: Boolean;     // PHASE 3 TIER 2: Flag for lazy rebuild
     FGlobalVariableSemantics: Boolean;  // True = BASIC mode (Version=0), False = SSA mode (versioning)
+    // Phase A: per-register versionability. Only proc-local scalars (MODERN) are marked; module-level /
+    // SHARED / @-taken and everything in CLASSIC stay unmarked -> Version=0 volatile. Indexed [bank][idx].
+    FVersionableRegs: array[TSSARegisterType] of array of Boolean;
   public
     constructor Create;
     destructor Destroy; override;
@@ -538,6 +541,9 @@ type
     procedure AddVariable(const VarName: string);
     procedure MapVariableToRegister(const VarName: string; RegType: TSSARegisterType; RegIndex: Integer);
     function GetVariableRegister(const VarName: string; out RegType: TSSARegisterType; out RegIndex: Integer): Boolean;
+    procedure AddVersionableReg(RegType: TSSARegisterType; RegIndex: Integer);  // Phase A: mark a proc-local scalar
+    function IsRegVersionable(RegType: TSSARegisterType; RegIndex: Integer): Boolean;  // Phase A
+    procedure ExcludeArrayDescriptorRegsFromVersioning;  // Phase A: dim/bound regs are referenced out-of-band
     function DeclareArray(const ArrName: string; ElementType: TSSARegisterType; const Dims: array of Integer): Integer;
     procedure SetArrayDimRegisters(ArrayIdx: Integer; const DimRegs: array of Integer; const DimRegTypes: array of TSSARegisterType);
     procedure SetArrayLowerBounds(ArrayIdx: Integer; const LowerBounds: array of Integer);
@@ -991,6 +997,59 @@ begin
   FVarRegMap.Values[VarName] := IntToStr(Ord(RegType)) + ':' + IntToStr(RegIndex);
 end;
 
+procedure TSSAProgram.AddVersionableReg(RegType: TSSARegisterType; RegIndex: Integer);
+var
+  OldLen, NewLen, i: Integer;
+begin
+  // Phase A: mark (bank, idx) as a proc-local scalar eligible for SSA versioning (MODERN only).
+  if RegIndex < 0 then Exit;
+  OldLen := Length(FVersionableRegs[RegType]);
+  if RegIndex >= OldLen then
+  begin
+    NewLen := (RegIndex + 1) * 2;
+    SetLength(FVersionableRegs[RegType], NewLen);
+    for i := OldLen to NewLen - 1 do
+      FVersionableRegs[RegType][i] := False;
+  end;
+  FVersionableRegs[RegType][RegIndex] := True;
+end;
+
+function TSSAProgram.IsRegVersionable(RegType: TSSARegisterType; RegIndex: Integer): Boolean;
+begin
+  Result := (RegIndex >= 0) and (RegIndex < Length(FVersionableRegs[RegType])) and
+            FVersionableRegs[RegType][RegIndex];
+end;
+
+procedure TSSAProgram.ExcludeArrayDescriptorRegsFromVersioning;
+var
+  a, i, idx: Integer;
+  rt: TSSARegisterType;
+begin
+  // Phase A: an array descriptor stores the SSA register numbers of its runtime dimension sizes and
+  // lower bounds (DimRegisters/LowerBoundRegisters). Those registers are read out-of-band by the array
+  // machinery (not through SSA dataflow), so if versioning splits them the descriptor ends up pointing
+  // at a base-version register that is never written -> bounds/sizes read as 0. Keep them Version=0.
+  for a := 0 to High(FArrays) do
+  begin
+    for i := 0 to High(FArrays[a].DimRegisters) do
+    begin
+      idx := FArrays[a].DimRegisters[i];
+      if (idx >= 0) and (i <= High(FArrays[a].DimRegTypes)) then
+      begin
+        rt := FArrays[a].DimRegTypes[i];
+        if idx < Length(FVersionableRegs[rt]) then
+          FVersionableRegs[rt][idx] := False;
+      end;
+    end;
+    for i := 0 to High(FArrays[a].LowerBoundRegisters) do
+    begin
+      idx := FArrays[a].LowerBoundRegisters[i];
+      if (idx >= 0) and (idx < Length(FVersionableRegs[srtInt])) then
+        FVersionableRegs[srtInt][idx] := False;
+    end;
+  end;
+end;
+
 function TSSAProgram.GetVariableRegister(const VarName: string; out RegType: TSSARegisterType; out RegIndex: Integer): Boolean;
 var
   RegStr: string;
@@ -1238,8 +1297,9 @@ begin
   end;
 
   //WriteLn;
-  // BASIC has global variable semantics (modifications in GOSUB persist after RETURN)
-  SSAConstr := TSSAConstruction.Create(Self, TDominatorTree(FDomTreeObj), True);
+  // BASIC has global variable semantics (modifications in GOSUB persist after RETURN).
+  // Phase A: the generator sets FGlobalVariableSemantics per dialect (True=CLASSIC, False=MODERN).
+  SSAConstr := TSSAConstruction.Create(Self, TDominatorTree(FDomTreeObj), FGlobalVariableSemantics);
   try
     SSAConstr.Run;
   finally

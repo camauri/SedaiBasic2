@@ -1030,6 +1030,14 @@ begin
     internalName := VarName + '@' + IntToStr(FScopeSerial);
     FProgram.AddVariable(internalName);
     FProgram.MapVariableToRegister(internalName, RegType, RegIndex);
+    // Phase A: a proc-local scalar (scope-frame binding, isolated by proc-root) is safe to SSA-version.
+    // Module-level (else branch below) and CLASSIC (never here) stay Version=0 volatile. @-taken/raw
+    // locals are excluded later if they regress (they live in raw byte slots, see m446).
+    // A record/UDT handle (a DIM'd record var, a record-typed parameter, or the implicit method THIS)
+    // is used out-of-band by the per-instance member-array machinery: versioning it splits the handle
+    // across registers so a member-array access via one version cannot see the instance sized/written
+    // via another (m226/m314). Keep every record handle Version=0 volatile.
+    FProgram.AddVersionableReg(RegType, RegIndex);
   end
   else
   begin
@@ -22620,6 +22628,13 @@ begin
   FProgram := TSSAProgram.Create;
   FLabelCounter := 0;
 
+  // Phase A: drive SSA versioning by dialect. MODERN (FreeBASIC, lexical scope) gets versioned SSA so
+  // GVN/CSE/LICM can distinguish definitions; CLASSIC (v7, global-by-name + GOSUB) stays on Version=0
+  // global semantics (unchanged, bit-identical). Register allocation uses the version-aware static
+  // BASIC allocator for BOTH dialects (see SedaiRegAlloc: one physical reg per version, safe spill).
+  // See job/docs/PIANO_FASE_A_SSA_VERSIONING.md.
+  FProgram.GlobalVariableSemantics := not FModernMode;
+
   // FreeBASIC NAMESPACE: flatten namespace blocks into mangled, module-level declarations before any
   // pre-scan walks the AST. No-op when the program has no NAMESPACE (keyword is MODERN-only anyway).
   FlattenNamespaces(AST);
@@ -22819,6 +22834,11 @@ begin
 
   // FB lexical scope: release the module frame (and any frame left dangling by an error path).
   while Length(FScopeStack) > 0 do ScopePopFrame;
+
+  // Phase A: array dimension/lower-bound registers are captured into descriptors and read out-of-band,
+  // so they must not be SSA-versioned. All descriptors now exist (incl. proc-local from the lowered
+  // procedure bodies above), so exclude them before SSA construction versions anything.
+  FProgram.ExcludeArrayDescriptorRegsFromVersioning;
 
   Result := FProgram;
 end;

@@ -84,6 +84,8 @@ type
     VersionCounter: Integer;   // Next version number
     LastVersion: Integer;      // Last assigned version (fallback)
     VersionStack: TIntegerStack; // Stack of versions for scoped semantics
+    Versionable: Boolean;      // Phase A: True only for proc-local scalars (MODERN). Module-level /
+                               // SHARED / @-taken stay Version=0 volatile. CLASSIC: always False.
   end;
 
   { SSA Construction - converts non-SSA IR to proper SSA with PHI functions }
@@ -344,6 +346,9 @@ begin
   // Lazy allocation: only create VersionStack when scoped semantics are used
   // With GlobalVariableSemantics=True (BASIC), this is NEVER used!
   FVarInfo[Result].VersionStack := nil;
+  // Phase A: version this register only if the generator marked it a proc-local scalar (MODERN).
+  // CLASSIC never marks any (FVersionableRegs empty) -> Versionable=False -> Version=0, unchanged.
+  FVarInfo[Result].Versionable := FProgram.IsRegVersionable(RegType, RegIndex);
 
   // Store in lookup array (index+1 to distinguish from not-found)
   FVarLookup[TypeIdx, RegIndex] := Result + 1;
@@ -681,7 +686,11 @@ begin
       AddUse(Instr.Src3);
 
       // CRITICAL FIX: Some instructions USE their Dest operand instead of DEFINING it!
-      if OpIn(Instr.OpCode, [ssaArrayStore, ssaPrint, ssaPrintLn]) then
+      // Member-array indirect stores also carry the stored VALUE in Dest (Src1=handle, Src2=index),
+      // so Dest is a USE, not a def — else versioning renames the value operand to a fresh version and
+      // the store reads an undefined register (m226/m314: storing a versioned param into obj.field(i)).
+      if OpIn(Instr.OpCode, [ssaArrayStore, ssaArrayStoreIndInt, ssaArrayStoreIndFloat,
+                             ssaArrayStoreIndString, ssaPrint, ssaPrintLn]) then
         AddUse(Instr.Dest);
     end;
   end;
@@ -860,8 +869,9 @@ end;
 
 function TSSAConstruction.NewVersion(VarIdx: Integer): Integer;
 begin
-  // Global variable semantics: skip versioning (all use Version=0)
-  if FGlobalVariableSemantics then
+  // Phase A: version only proc-local scalars. Module-level/SHARED/@-taken stay Version=0.
+  // (CLASSIC: no var is Versionable, and RenameBlock's fast path never calls this anyway.)
+  if (VarIdx < 0) or (VarIdx >= FVarInfoCount) or (not FVarInfo[VarIdx].Versionable) then
   begin
     Result := 0;
     Exit;
@@ -875,8 +885,8 @@ end;
 
 function TSSAConstruction.CurrentVersion(VarIdx: Integer): Integer;
 begin
-  // Global variable semantics: all variables use Version=0
-  if FGlobalVariableSemantics then
+  // Phase A: non-versionable (module-level/SHARED/@-taken, and all CLASSIC vars) use Version=0.
+  if (VarIdx < 0) or (VarIdx >= FVarInfoCount) or (not FVarInfo[VarIdx].Versionable) then
   begin
     Result := 0;
     Exit;
@@ -897,8 +907,8 @@ end;
 
 procedure TSSAConstruction.PushVersion(VarIdx: Integer; Version: Integer);
 begin
-  // Global variable semantics: no need to track versions
-  if FGlobalVariableSemantics then
+  // Phase A: only versionable (proc-local) vars track a version stack.
+  if (VarIdx < 0) or (VarIdx >= FVarInfoCount) or (not FVarInfo[VarIdx].Versionable) then
     Exit;
 
   // Scoped semantics: update LastVersion and push to stack
@@ -914,8 +924,8 @@ end;
 
 procedure TSSAConstruction.PopVersion(VarIdx: Integer);
 begin
-  // Global semantics: NO-OP (versions must persist)
-  if FGlobalVariableSemantics then
+  // Phase A: only versionable (proc-local) vars track a version stack.
+  if (VarIdx < 0) or (VarIdx >= FVarInfoCount) or (not FVarInfo[VarIdx].Versionable) then
     Exit;
 
   // Scoped semantics: pop from stack
@@ -1035,7 +1045,11 @@ begin
     if Instr.Dest.Kind = svkRegister then
     begin
       // Check if this instruction USES Dest (not defines it)
-      if OpIn(Instr.OpCode, [ssaArrayStore, ssaPrint, ssaPrintLn]) then
+      // Member-array indirect stores also carry the stored VALUE in Dest (Src1=handle, Src2=index),
+      // so Dest is a USE, not a def — else versioning renames the value operand to a fresh version and
+      // the store reads an undefined register (m226/m314: storing a versioned param into obj.field(i)).
+      if OpIn(Instr.OpCode, [ssaArrayStore, ssaArrayStoreIndInt, ssaArrayStoreIndFloat,
+                             ssaArrayStoreIndString, ssaPrint, ssaPrintLn]) then
       begin
         // USE Dest - with global semantics keep Version=0
         if not FGlobalVariableSemantics then

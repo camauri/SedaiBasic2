@@ -151,6 +151,16 @@ end;
 
 function TAlgebraicSimplification.Run: Integer;
 begin
+  // Phase A: not yet version-aware; its user-variable guard uses the stale VarRegMap surrogate, which
+  // misclassifies versioned MODERN values. It is output-preserving, so skipping it on a versioned
+  // program keeps MODERN bit-identical to baseline while CLASSIC (Version=0) keeps the optimization.
+  // Re-enable once made version-aware (Phase A follow-on). See job/docs/PIANO_FASE_A_SSA_VERSIONING.md.
+  if not FProgram.GlobalVariableSemantics then
+  begin
+    Result := 0;
+    Exit;
+  end;
+
   {$IFDEF DEBUG_ALGEBRAIC}
   if DebugAlgebraic then
     WriteLn('[Algebraic] Running algebraic simplification...');

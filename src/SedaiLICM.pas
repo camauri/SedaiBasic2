@@ -173,6 +173,16 @@ var
   i, j: Integer;
   Temp: TLoopInfo;
 begin
+  // Phase A: not yet version-aware; it miscompiles on the versioned SSA that MODERN now produces (it
+  // relies on the stale VarRegMap surrogate). It is output-preserving, so skipping it on a versioned
+  // program keeps MODERN bit-identical to baseline while CLASSIC (Version=0) keeps the optimization.
+  // Re-enable once made version-aware (Phase A follow-on). See job/docs/PIANO_FASE_A_SSA_VERSIONING.md.
+  if not FProgram.GlobalVariableSemantics then
+  begin
+    Result := 0;
+    Exit;
+  end;
+
   {$IFDEF DEBUG_LICM}
   if DebugLICM then
     WriteLn('[LICM] Running loop-invariant code motion...');

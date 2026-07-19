@@ -257,19 +257,23 @@ begin
   Exit;
   {$ENDIF}
 
-  // DUAL MODE: Choose allocation strategy based on GlobalVariableSemantics
-  if FProgram.GlobalVariableSemantics then
+  // Phase A: the version-aware static BASIC allocator handles BOTH dialects. It keys every value on
+  // (RegType, RegIndex, Version), so with MODERN versioning ON each SSA version gets its own physical
+  // register (SSA-correct, non-coalesced) and overflow spills safely to indices >= MAX_*_REGS. This
+  // sidesteps the Linear-Scan path below, which is an unfinished stub (textual live intervals that
+  // ignore the CFG + a spill path that emits negative register indices no downstream stage handles).
+  // The Linear-Scan code is kept, unreachable, as a reference skeleton for the future AOT backend (B),
+  // which will do real whole-function register allocation. See job/docs/PIANO_FASE_A_SSA_VERSIONING.md.
   begin
-    // BASIC mode: Static variable allocation (no SSA versioning required)
     {$IFDEF DEBUG_REGALLOC}
     if DebugRegAlloc then
-      WriteLn('[RegAlloc] Running BASIC Variable Allocation (GlobalVariableSemantics=True)...');
+      WriteLn('[RegAlloc] Running version-aware BASIC Variable Allocation (both dialects)...');
     {$ENDIF}
     Result := RunBASICAllocation;
     Exit;
   end;
 
-  // SSA mode: Linear Scan allocation (requires SSA versioning)
+  // SSA mode: Linear Scan allocation (requires SSA versioning) -- UNREACHABLE (see above)
   {$IFDEF DEBUG_REGALLOC}
   if DebugRegAlloc then
     WriteLn('[RegAlloc] Running Linear Scan register allocation (SSA mode)...');

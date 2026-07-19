@@ -240,6 +240,16 @@ end;
 
 function TStrengthReduction.Run: Integer;
 begin
+  // Phase A: not yet version-aware; its induction-variable / const-value analysis miscompiles on the
+  // versioned SSA that MODERN now produces. It is output-preserving, so skipping it on a versioned
+  // program keeps MODERN bit-identical to baseline while CLASSIC (Version=0) keeps the optimization.
+  // Re-enable once made version-aware (Phase A follow-on). See job/docs/PIANO_FASE_A_SSA_VERSIONING.md.
+  if not FProgram.GlobalVariableSemantics then
+  begin
+    Result := 0;
+    Exit;
+  end;
+
   {$IFDEF DEBUG_STRENGTH}
   if DebugStrength then
     WriteLn('[StrengthRed] Running strength reduction...');
