@@ -111,3 +111,13 @@
 //   - GVN on:  uncomment {$DEFINE DISABLE_CSE} below.
 //   - CSE on:  define DISABLE_GVN instead.
 {.$DEFINE DISABLE_CSE}
+// Re-tested 2026-07-20 on the Phase A versioned-SSA pipeline (general LICM + StrengthReduction +
+// Algebraic active): enabling GVN now produces 6 OPTDIFFs, so the 2026-06-20 "byte-identical" result no
+// longer holds — the richer SSA gives GVN real matches, and two soundness gaps surface:
+//   (a) CLASSIC (m406_deffn_classic): every value is Version=0, so the SSA identity GVN numbers on is
+//       degenerate — a value is reused across a redefinition. GVN can never be sound in CLASSIC as-is;
+//       any future enable must gate it to MODERN (versioned) programs only.
+//   (b) In-place string mutation (m80_midstmt): "Mid(s,..) = .." mutates its OPERAND, which value
+//       numbering does not model — loads of s before/after the statement get the same value number.
+//       Ops with operand side effects need a kill in the value table.
+// Keep OFF until both are addressed; yield on the line-per-block CFG is still expected to be small.
