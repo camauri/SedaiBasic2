@@ -398,15 +398,21 @@ begin
   // the sequential fallthrough chain is NOT enough — that chain stops at the first terminator, so any
   // worker with a FOR/IF in it got truncated, the body's blocks were dropped, and the resulting
   // bytecode ran off into the main program (bcThreadCreate spawning at PC 0 -> recursive thread bomb).
+  // The same rationale extends to EVERY dynamically-referenced label, not only PROC_: an
+  // ON ERROR GOTO handler (ssaOnError) or a RESUME <label> target has no static CFG edge
+  // into it either, and keeping only the labeled block itself (IsBlockReferenced) truncates
+  // any handler whose body spans more than one block - an IF inside the handler ends the
+  // fall-through chain, the continuation block holding the statements after it was dropped,
+  // and its jumps were emitted with target -1 = an out-of-bounds PC at run time (silent:
+  // identical in opt and --no-opt, invisible to the differential net).
   for i := 0 to FProgram.Blocks.Count - 1 do
   begin
     Block := FProgram.Blocks[i];
-    if (not FReachable[i]) and Block.LabelName.StartsWith('PROC_') and
-       (FReferencedLabels.IndexOf(Block.LabelName) >= 0) then
+    if (not FReachable[i]) and (FReferencedLabels.IndexOf(Block.LabelName) >= 0) then
     begin
       {$IFDEF DEBUG_DBE}
       if DebugDBE then
-        WriteLn('[DBE] Seeding DFS from address-taken procedure ', Block.LabelName);
+        WriteLn('[DBE] Seeding DFS from dynamically-referenced block ', Block.LabelName);
       {$ENDIF}
       DFS(i);
     end;
