@@ -147,9 +147,13 @@ begin
     end;
 
     // AOT (plan B): a whole compiled function registered at this entry PC runs natively on the
-    // same banks and returns the resume PC (its bcReturnSub/bcEnd, or a deopt PC).
+    // same banks and returns the resume PC (its bcReturnSub/bcEnd, or a deopt PC). The array
+    // descriptor pointer is refreshed per call (the rebuild may reallocate the table).
     if AotOn and (AotFuncs[CurPC] <> nil) then
     begin
+      if FArraysDirty then RebuildJitArrDesc;
+      if Length(FJitArrDesc) > 0 then LocalAotCtx.ArrDesc := @FJitArrDesc[0]
+      else LocalAotCtx.ArrDesc := nil;
       CurPC := TNativeFuncFn(TExecMem(AotFuncs[CurPC]).Ptr)(IntRegs, PInt64(FloatRegs), @LocalAotCtx);
       System.Continue;
     end;

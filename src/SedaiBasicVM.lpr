@@ -1626,6 +1626,7 @@ begin
       if OptAot then
       begin
         AotFuncList := AotCompileProgram(SSAProgram, BytecodeProgram, OptTrueValue,
+                                         BytecodeProgram.ModernMode and not OptBoundsCheck,
                                          GetEnvironmentVariable('AOT_DIAG') = '1');
         for AotI := 0 to High(AotFuncList) do
           VM.RegisterAotFunc(AotFuncList[AotI].EntryPC, AotFuncList[AotI].Mem);

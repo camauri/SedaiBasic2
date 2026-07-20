@@ -34,6 +34,8 @@ type
   TAotCtx = record
     XferInt: PInt64;     // offset 0
     XferFloat: PInt64;   // offset 8
+    ArrDesc: PInt64;     // offset 16: @FJitArrDesc[0] (4x Int64/array: IntData, FloatData, Count, LBound),
+                         // refreshed per call after the dirty rebuild - same table the loop JIT uses
   end;
   PAotCtx = ^TAotCtx;
 
@@ -69,9 +71,12 @@ procedure AotSurvey(SSAProg: TSSAProgram; Prog: TBytecodeProgram);
 
 // Compile every eligible region to native code (B1a: static frequency register
 // assignment, deopt only for trapping ops). TrueVal is the VM's TRUE (-1);
-// the dialect comes from Prog.ModernMode. Diag prints per-region compile results.
+// the dialect comes from Prog.ModernMode. AllowUnsafe = MODERN and no forced
+// bounds check: array OOB takes the FreeBASIC default path natively; otherwise
+// array accesses guard and deopt so the interpreter raises. Diag prints
+// per-region compile results.
 function AotCompileProgram(SSAProg: TSSAProgram; Prog: TBytecodeProgram;
-                           TrueVal: Int64; Diag: Boolean): TAotFuncs;
+                           TrueVal: Int64; AllowUnsafe, Diag: Boolean): TAotFuncs;
 
 implementation
 
@@ -98,7 +103,11 @@ begin
     ssaLabel, ssaNop, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferStoreInt, ssaXferStoreFloat,
     ssaReturnSub, ssaEnd, ssaStop,
-    ssaRecMarkPush, ssaRecMarkPop:
+    ssaRecMarkPush, ssaRecMarkPop,
+    // B2: 1-D int/float array element access + dim-0 bound queries (string-element
+    // arrays are rejected by the classifier/prescan; multi-dim access goes through
+    // ssaArrayIdxPush/Resolve, which are not in the set, so those regions bail).
+    ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound:
       Result := True;
   else
     Result := False;
@@ -203,6 +212,24 @@ begin
             begin
               Regions[r].Eligible := False;
               Regions[r].BailReason := 'jump-out:' + Instr.Dest.LabelName;
+            end
+            // B2 array ops: the id must be a compile-time array ref and the element bank
+            // int/float (string elements are managed - interpreter only).
+            else if (Instr.OpCode = ssaArrayLoad) or (Instr.OpCode = ssaArrayStore) or
+                    (Instr.OpCode = ssaArrayLBound) or (Instr.OpCode = ssaArrayUBound) then
+            begin
+              if (Instr.Src1.Kind <> svkArrayRef) or (Instr.Src1.ArrayIndex < 0) or
+                 (Instr.Src1.ArrayIndex >= SSAProg.GetArrayCount) then
+              begin
+                Regions[r].Eligible := False;
+                Regions[r].BailReason := 'array-shape:' + OpName(Instr.OpCode);
+              end
+              else if ((Instr.OpCode = ssaArrayLoad) or (Instr.OpCode = ssaArrayStore)) and
+                      (SSAProg.GetArray(Instr.Src1.ArrayIndex).ElementType = srtString) then
+              begin
+                Regions[r].Eligible := False;
+                Regions[r].BailReason := 'string-array';
+              end;
             end;
           end;
           Inc(o);
@@ -259,7 +286,7 @@ end;
 // any condition the B1a subset cannot honor (the region stays interpreted).
 function AotCompileRegion(SSAProg: TSSAProgram; Prog: TBytecodeProgram;
                           const Region: TAotRegion; TrueVal: Int64;
-                          Modern: Boolean; out BailWhy: string): TExecMem;
+                          Modern, AllowUnsafe: Boolean; out BailWhy: string): TExecMem;
 const
   IntPool: array[0..6] of Integer = (R9, R10, R11, R12, R13, R14, R15);
 type
@@ -268,9 +295,14 @@ var
   E: TX86Emitter;
   ILoc, FLoc: array of Integer;         // final VM reg -> native reg (or -1)
   IUse, FUse: array of Integer;         // usage counts
-  MaxIReg, MaxFReg: Integer;
+  AUse: array of Integer;               // array id -> element-access count (J5c/J6f cache)
+  MaxIReg, MaxFReg, MaxArrId: Integer;
   IAllocd, FAllocd: array of Integer;   // allocated VM regs in pool order
   NIAlloc, NFAlloc: Integer;
+  // Array descriptor cache: base/count of hot arrays held in leftover GPRs for the whole
+  // invocation (stable: no DIM/REDIM/ERASE in the op set). Read-only - never flushed.
+  NACache: Integer;
+  ACacheId, ACacheKind, ACacheReg: array of Integer;   // kind 0 = data base, 1 = count
   SaveGpr: array[R12..R15] of Boolean;
   SaveX6, SaveX7: Boolean;
   BlockOff: array of Integer;           // block index -> native offset
@@ -279,6 +311,7 @@ var
   EpiOff: Integer;
   OK: Boolean;
   HasRecMark, HasDeopt: Boolean;
+  ArrClassic: Boolean;                  // array OOB raises (CLASSIC / --bounds-check) -> guard + deopt
   Cur: TSSAInstruction;
   CurOrd: Integer;                      // ordinal of Cur (indexes the SSA->PC map)
   LabelIdx: TStringList;                // region-local label -> block-list index
@@ -557,6 +590,153 @@ var
     else E.MemOp([$49, $8B], RDX, R8, 0);
   end;
 
+  { --- B2 arrays: descriptor via ctx (never a baked address), JIT-identical semantics --- }
+
+  function CachedBase(ArrayId: Integer): Integer;
+  var q: Integer;
+  begin
+    Result := -1;
+    for q := 0 to NACache - 1 do
+      if (ACacheId[q] = ArrayId) and (ACacheKind[q] = 0) then Exit(ACacheReg[q]);
+  end;
+  function CachedCount(ArrayId: Integer): Integer;
+  var q: Integer;
+  begin
+    Result := -1;
+    for q := 0 to NACache - 1 do
+      if (ACacheId[q] = ArrayId) and (ACacheKind[q] = 1) then Exit(ACacheReg[q]);
+  end;
+
+  // SIB element access [BaseReg + rcx*8] (scale 8, index rcx). Base low-3 = 101 (rbp/r13)
+  // has no mod=00 form -> mod=01 disp8=0 (the JIT's EmitSib fix; kept although the AOT
+  // base is always rdx, so a future cached-base upgrade cannot re-trip it).
+  procedure AotSib(BaseReg: Integer);
+  var sib: Byte;
+  begin
+    sib := $C8 or (BaseReg and 7);
+    if (BaseReg and 7) = 5 then
+    begin E.Emit8($44); E.Emit8(sib); E.Emit8($00); end
+    else
+    begin E.Emit8($04); E.Emit8(sib); end;
+  end;
+  procedure AotArrData(IsFloat, IsStore: Boolean; BaseReg: Integer);
+  begin
+    if IsFloat then
+    begin
+      E.Emit8($F2);
+      if BaseReg >= 8 then E.Emit8($41);
+      E.Emit8($0F);
+      if IsStore then E.Emit8($11) else E.Emit8($10);
+      AotSib(BaseReg);                             // movsd xmm0 <-> [base+rcx*8]
+    end
+    else
+    begin
+      if BaseReg >= 8 then E.Emit8($49) else E.Emit8($48);
+      if IsStore then E.Emit8($89) else E.Emit8($8B);
+      AotSib(BaseReg);                             // mov rax <-> [base+rcx*8]
+    end;
+  end;
+  // Element load/store with the interpreter's dialect bounds semantics. Sequence:
+  // rcx = index; rdx = desc table (ctx); rax = Count; unsigned cmp; then either the
+  // CLASSIC guard (OOB -> deopt, interpreter raises) or the MODERN default path
+  // (load 0 / drop store); rdx is reused for the data base after the compare.
+  procedure AotArrAccess(IsFloat, IsStore: Boolean; ArrayId, IdxReg, ValReg, apc: Integer);
+  var pOOB, pDone, DataOff, cbase, ccount, baseR: Integer;
+    procedure EmitBase;   // leave the data base register in baseR (cached GPR or reloaded rdx)
+    begin
+      if cbase >= 0 then baseR := cbase
+      else
+      begin
+        E.MemOp([$48, $8B], RDX, RDX, LongWord(ArrayId) * 32 + LongWord(DataOff));
+        baseR := RDX;
+      end;
+    end;
+  begin
+    if IsFloat then DataOff := 8 else DataOff := 0;
+    cbase := CachedBase(ArrayId);
+    ccount := CachedCount(ArrayId);
+    ILoad(RCX, IdxReg);                                            // rcx = index
+    if (cbase < 0) or (ccount < 0) then
+      E.MemOp([$49, $8B], RDX, R8, 16);                            // rdx = ctx.ArrDesc
+    if ccount >= 0 then
+      EmitRR([$3B], RCX, ccount)                                   // cmp rcx, cachedCount
+    else
+    begin
+      E.MemOp([$48, $8B], RAX, RDX, LongWord(ArrayId) * 32 + 16);  // rax = Count
+      E.EmitBytes([$48, $39, $C1]);                                // cmp rcx, rax
+    end;
+    if ArrClassic then
+    begin
+      E.EmitBytes([$72, $00]); pOOB := E.Len - 1;                  // jb +over (in bounds)
+      ExitTo(apc);                                                 // OOB -> interpreter raises
+      E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
+      EmitBase;
+      if IsStore then
+      begin
+        if IsFloat then FLoad(XMM0, ValReg) else ILoad(RAX, ValReg);
+        AotArrData(IsFloat, True, baseR);
+      end
+      else
+        AotArrData(IsFloat, False, baseR);
+    end
+    else if IsStore then
+    begin
+      E.EmitBytes([$73, $00]); pOOB := E.Len - 1;                  // jae skip (store dropped)
+      EmitBase;
+      if IsFloat then FLoad(XMM0, ValReg) else ILoad(RAX, ValReg);
+      AotArrData(IsFloat, True, baseR);
+      E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
+    end
+    else
+    begin
+      E.EmitBytes([$73, $00]); pOOB := E.Len - 1;                  // jae oob
+      EmitBase;
+      AotArrData(IsFloat, False, baseR);
+      E.EmitBytes([$EB, $00]); pDone := E.Len - 1;                 // jmp done
+      E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
+      if IsFloat then E.EmitBytes([$0F, $57, $C0])                 // xorps xmm0,xmm0
+      else E.EmitBytes([$48, $31, $C0]);                           // xor rax,rax
+      E.PatchByte(pDone, Byte(E.Len - (pDone + 1)));
+    end;
+    if not IsStore then
+    begin
+      if IsFloat then FStore(ValReg, XMM0) else IStore(ValReg, RAX);
+    end;
+  end;
+  // LBOUND/UBOUND with a runtime dim: only dim 0 is native (LBound at +24; UBOUND =
+  // LBound + Count - 1); any other dim (rank query, per-dim bounds) deopts (JIT J10).
+  procedure AotArrBound(apc, ArrayId: Integer; WantUpper: Boolean);
+  var p1: Integer;
+  begin
+    if Cur.Src2.Kind = svkConstInt then
+      MovImm64(RCX, Cur.Src2.ConstInt)
+    else
+    begin
+      ILoad(RCX, IReg(Cur.Src2)); if not OK then Exit;
+    end;
+    E.EmitBytes([$48, $85, $C9]);                                  // test rcx, rcx
+    E.EmitBytes([$74, $00]); p1 := E.Len - 1;                      // jz dim0
+    ExitTo(apc);
+    E.PatchByte(p1, Byte(E.Len - (p1 + 1)));
+    E.MemOp([$49, $8B], RDX, R8, 16);                              // rdx = ctx.ArrDesc
+    E.MemOp([$48, $8B], RAX, RDX, LongWord(ArrayId) * 32 + 24);    // rax = LBound
+    if WantUpper then
+    begin
+      E.MemOp([$48, $8B], RDX, RDX, LongWord(ArrayId) * 32 + 16);  // rdx = Count
+      E.EmitBytes([$48, $01, $D0]);                                // add rax, rdx
+      E.EmitBytes([$48, $FF, $C8]);                                // dec rax
+    end;
+    IStore(IReg(Cur.Dest), RAX);
+  end;
+  // Array id of the current instruction (Src1 must be a compile-time array ref).
+  function ArrId: Integer;
+  begin
+    Result := -1;
+    if (Cur.Src1.Kind <> svkArrayRef) or (Cur.Src1.ArrayIndex < 0) or
+       (Cur.Src1.ArrayIndex >= SSAProg.GetArrayCount) then Fail('array-shape')
+    else Result := Cur.Src1.ArrayIndex;
+  end;
+
   { --- prescan: usage counts, deopt needs, structural checks --- }
   procedure Prescan;
   var
@@ -619,6 +799,33 @@ var
           ssaXferLoadInt, ssaXferLoadFloat: CountVal(Ins.Dest);
           ssaXferStoreInt, ssaXferStoreFloat: CountVal(Ins.Src1);
           ssaNarrowInt: begin CountVal(Ins.Dest); CountVal(Ins.Src1); end;
+          ssaArrayLoad, ssaArrayStore:
+          begin
+            if (Ins.Src1.Kind <> svkArrayRef) or (Ins.Src1.ArrayIndex < 0) or
+               (Ins.Src1.ArrayIndex >= SSAProg.GetArrayCount) then Fail('array-shape')
+            else if SSAProg.GetArray(Ins.Src1.ArrayIndex).ElementType = srtString then
+              Fail('string-array')
+            else
+            begin
+              if ArrClassic then
+              begin
+                HasDeopt := True;
+                if Prog.GetSsaPc(o) < 0 then Fail('no-pc-arr');
+              end;
+              CountVal(Ins.Dest); CountVal(Ins.Src2);
+              if Ins.Src1.ArrayIndex > MaxArrId then MaxArrId := Ins.Src1.ArrayIndex;
+              if Ins.Src1.ArrayIndex >= Length(AUse) then
+                SetLength(AUse, Ins.Src1.ArrayIndex * 2 + 8);
+              Inc(AUse[Ins.Src1.ArrayIndex]);
+            end;
+          end;
+          ssaArrayLBound, ssaArrayUBound:
+          begin
+            HasDeopt := True;                       // dim <> 0 deopts even in MODERN
+            if Prog.GetSsaPc(o) < 0 then Fail('no-pc-bound');
+            CountVal(Ins.Dest);
+            if Ins.Src2.Kind = svkRegister then CountVal(Ins.Src2);
+          end;
         else
           begin
             CountVal(Ins.Dest);
@@ -648,20 +855,43 @@ var
   end;
 
   procedure Allocate;
-  var r, k, best, bestUse: Integer;
-      Taken: array of Boolean;
+  var r, k, id, best, bestUse, bestKind: Integer;
+      Taken, TakenAB, TakenAC: array of Boolean;
   begin
-    // Ints: most-used first onto r9..r15 (greedy selection sort over use counts).
+    // GPRs r9..r15: UNIFIED candidate pool by use count (the JIT's J6f model) - VM int
+    // registers (kind -1) compete with array descriptor slots (kind 0 = data base,
+    // kind 1 = count; base preferred over count of the same array at equal frequency).
     SetLength(Taken, MaxIReg + 1);
+    SetLength(TakenAB, MaxArrId + 1);
+    SetLength(TakenAC, MaxArrId + 1);
     for k := 0 to High(IntPool) do
     begin
-      best := -1; bestUse := 0;
+      best := -1; bestUse := 0; bestKind := -2;
       for r := 0 to MaxIReg do
-        if (not Taken[r]) and (IUse[r] > bestUse) then begin best := r; bestUse := IUse[r]; end;
-      if best < 0 then Break;
-      Taken[best] := True;
-      ILoc[best] := IntPool[k];
-      IAllocd[NIAlloc] := best; Inc(NIAlloc);
+        if (not Taken[r]) and (IUse[r] > bestUse) then
+        begin best := r; bestUse := IUse[r]; bestKind := -1; end;
+      for id := 0 to MaxArrId do
+      begin
+        if (not TakenAB[id]) and (AUse[id] > bestUse) then
+        begin best := id; bestUse := AUse[id]; bestKind := 0; end;
+        if (not TakenAC[id]) and (AUse[id] > bestUse) then
+        begin best := id; bestUse := AUse[id]; bestKind := 1; end;
+      end;
+      if bestKind = -2 then Break;
+      if bestKind = -1 then
+      begin
+        Taken[best] := True;
+        ILoc[best] := IntPool[k];
+        IAllocd[NIAlloc] := best; Inc(NIAlloc);
+      end
+      else
+      begin
+        if bestKind = 0 then TakenAB[best] := True else TakenAC[best] := True;
+        ACacheId[NACache] := best;
+        ACacheKind[NACache] := bestKind;
+        ACacheReg[NACache] := IntPool[k];
+        Inc(NACache);
+      end;
       if IntPool[k] >= R12 then SaveGpr[IntPool[k]] := True;
     end;
     // Floats: most-used first onto xmm2..xmm7.
@@ -877,6 +1107,39 @@ var
         E.MemOp([$F2, $0F, $11], XMM0, RDX, LongWord(w) * 8);
       end;
 
+      ssaArrayLoad:
+      begin
+        d := ArrId; if not OK then Exit;
+        apc := -1;
+        if ArrClassic then begin apc := NeedPC; if not OK then Exit; end;
+        if SSAProg.GetArray(d).ElementType = srtFloat then
+          AotArrAccess(True, False, d, IReg(Cur.Src2), FReg(Cur.Dest), apc)
+        else
+          AotArrAccess(False, False, d, IReg(Cur.Src2), IReg(Cur.Dest), apc);
+      end;
+      ssaArrayStore:
+      begin
+        d := ArrId; if not OK then Exit;
+        apc := -1;
+        if ArrClassic then begin apc := NeedPC; if not OK then Exit; end;
+        if SSAProg.GetArray(d).ElementType = srtFloat then
+          AotArrAccess(True, True, d, IReg(Cur.Src2), FReg(Cur.Dest), apc)
+        else
+          AotArrAccess(False, True, d, IReg(Cur.Src2), IReg(Cur.Dest), apc);
+      end;
+      ssaArrayLBound:
+      begin
+        d := ArrId; if not OK then Exit;
+        apc := NeedPC; if not OK then Exit;
+        AotArrBound(apc, d, False);
+      end;
+      ssaArrayUBound:
+      begin
+        d := ArrId; if not OK then Exit;
+        apc := NeedPC; if not OK then Exit;
+        AotArrBound(apc, d, True);
+      end;
+
       ssaReturnSub, ssaEnd, ssaStop:
       begin
         apc := NeedPC; if not OK then Exit;
@@ -895,10 +1158,15 @@ begin
   LabelIdx := nil;
   BailWhy := '';
   OK := True;
+  ArrClassic := not AllowUnsafe;
   HasRecMark := False; HasDeopt := False;
-  MaxIReg := -1; MaxFReg := -1;
-  SetLength(IUse, 16); SetLength(FUse, 16);
+  MaxIReg := -1; MaxFReg := -1; MaxArrId := -1;
+  SetLength(IUse, 16); SetLength(FUse, 16); SetLength(AUse, 8);
   NFix := 0; NIAlloc := 0; NFAlloc := 0;
+  NACache := 0;
+  SetLength(ACacheId, Length(IntPool));
+  SetLength(ACacheKind, Length(IntPool));
+  SetLength(ACacheReg, Length(IntPool));
   SaveX6 := False; SaveX7 := False;
   FillChar(SaveGpr, SizeOf(SaveGpr), 0);
 
@@ -947,6 +1215,23 @@ begin
       LoadRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       E.MemOp([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+    // Array descriptor cache loads: base/count of the hot arrays, invariant for the whole
+    // invocation (no DIM/REDIM/ERASE in the op set). The data-base offset follows the
+    // element bank (+0 IntData / +8 FloatData); count at +16.
+    if NACache > 0 then
+    begin
+      E.MemOp([$49, $8B], RDX, R8, 16);            // rdx = ctx.ArrDesc
+      for k := 0 to NACache - 1 do
+      begin
+        if ACacheKind[k] = 1 then b := 16
+        else if SSAProg.GetArray(ACacheId[k]).ElementType = srtFloat then b := 8
+        else b := 0;
+        TargetOff := $48; if ACacheReg[k] >= 8 then TargetOff := TargetOff or $04;  // REX.W (+R)
+        E.Emit8(Byte(TargetOff)); E.Emit8($8B);
+        E.Emit8($80 or ((ACacheReg[k] and 7) shl 3) or RDX);
+        E.Emit32(LongWord(ACacheId[k]) * 32 + LongWord(b));
+      end;
+    end;
 
     // Body: blocks in order (fall-through preserved by contiguous emission).
     CurOrd := Region.FirstOrdinal;
@@ -1000,7 +1285,7 @@ begin
 end;
 
 function AotCompileProgram(SSAProg: TSSAProgram; Prog: TBytecodeProgram;
-                           TrueVal: Int64; Diag: Boolean): TAotFuncs;
+                           TrueVal: Int64; AllowUnsafe, Diag: Boolean): TAotFuncs;
 var
   Regions: TAotRegions;
   r, n: Integer;
@@ -1015,7 +1300,7 @@ begin
   begin
     if not Regions[r].Eligible then Continue;
     if Regions[r].EntryPC < 0 then Continue;
-    Mem := AotCompileRegion(SSAProg, Prog, Regions[r], TrueVal, Prog.ModernMode, Why);
+    Mem := AotCompileRegion(SSAProg, Prog, Regions[r], TrueVal, Prog.ModernMode, AllowUnsafe, Why);
     if Mem <> nil then
     begin
       Result[n].EntryPC := Regions[r].EntryPC;

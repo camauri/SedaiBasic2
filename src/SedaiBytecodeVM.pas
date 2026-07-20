@@ -5606,6 +5606,9 @@ begin
   begin
     FNativeFuncs[EntryPC].Free;
     FNativeFuncs[EntryPC] := TExecMem(Mem);
+    // Force a descriptor rebuild before the first native call: with --aot alone (no --jit)
+    // nothing else may have primed FJitArrDesc yet.
+    FArraysDirty := True;
   end
   else
     Mem.Free;
