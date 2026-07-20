@@ -740,6 +740,13 @@ begin
   FCtx.FrameSaveIntTop := 0;
   FCtx.FrameSaveFloatTop := 0;
   FCtx.FrameSaveStrTop := 0;
+  // -1 = not measured yet, so FramePush falls back to the whole bank. LoadProgram replaces these
+  // with the program's real widths, which are legitimately 0 for a bank it never touches -- which
+  // is why 0 must NOT read as "unmeasured" (that cost 256 float copies per call in an int-only
+  // program, the residual call overhead after the first pass at this).
+  FCtx.FrameSaveIntCount := -1;
+  FCtx.FrameSaveFloatCount := -1;
+  FCtx.FrameSaveStrCount := -1;
   FCtx.FrameRecBaseTop := 0;
   FCtx.BlockRecMarkTop := 0;
   SetLength(FCtx.Records, 0);
@@ -1649,11 +1656,12 @@ procedure TBytecodeVM.FramePush(Ctx: TExecutionContext);
 var
   i, NI, NF, NS: Integer;
 begin
-  // A non-positive width means "not measured for this context" (any path that runs bytecode
-  // without going through LoadProgram): fall back to the whole bank, the historical behaviour.
-  NI := Ctx.FrameSaveIntCount;    if (NI <= 0) or (NI > Ctx.IntRegCount) then NI := Ctx.IntRegCount;
-  NF := Ctx.FrameSaveFloatCount;  if (NF <= 0) or (NF > Ctx.FloatRegCount) then NF := Ctx.FloatRegCount;
-  NS := Ctx.FrameSaveStrCount;    if (NS <= 0) or (NS > Ctx.StringRegCount) then NS := Ctx.StringRegCount;
+  // A NEGATIVE width means "not measured for this context" (any path that runs bytecode without
+  // going through LoadProgram): fall back to the whole bank, the historical behaviour. Zero is a
+  // real width -- a bank the program never touches -- and must save nothing.
+  NI := Ctx.FrameSaveIntCount;    if (NI < 0) or (NI > Ctx.IntRegCount) then NI := Ctx.IntRegCount;
+  NF := Ctx.FrameSaveFloatCount;  if (NF < 0) or (NF > Ctx.FloatRegCount) then NF := Ctx.FloatRegCount;
+  NS := Ctx.FrameSaveStrCount;    if (NS < 0) or (NS > Ctx.StringRegCount) then NS := Ctx.StringRegCount;
   // Grow save stacks if needed (defensive; usually sized once).
   if Ctx.FrameSaveIntTop + NI > Length(Ctx.FrameSaveInt) then
     SetLength(Ctx.FrameSaveInt, Ctx.FrameSaveIntTop + NI + 256);
@@ -1685,9 +1693,9 @@ procedure TBytecodeVM.FramePop(Ctx: TExecutionContext);
 var
   i, NI, NF, NS: Integer;
 begin
-  NI := Ctx.FrameSaveIntCount;    if (NI <= 0) or (NI > Ctx.IntRegCount) then NI := Ctx.IntRegCount;
-  NF := Ctx.FrameSaveFloatCount;  if (NF <= 0) or (NF > Ctx.FloatRegCount) then NF := Ctx.FloatRegCount;
-  NS := Ctx.FrameSaveStrCount;    if (NS <= 0) or (NS > Ctx.StringRegCount) then NS := Ctx.StringRegCount;
+  NI := Ctx.FrameSaveIntCount;    if (NI < 0) or (NI > Ctx.IntRegCount) then NI := Ctx.IntRegCount;
+  NF := Ctx.FrameSaveFloatCount;  if (NF < 0) or (NF > Ctx.FloatRegCount) then NF := Ctx.FloatRegCount;
+  NS := Ctx.FrameSaveStrCount;    if (NS < 0) or (NS > Ctx.StringRegCount) then NS := Ctx.StringRegCount;
   Dec(Ctx.FrameSaveIntTop, NI);
   for i := 0 to NI - 1 do
     Ctx.IntRegs[i] := Ctx.FrameSaveInt[Ctx.FrameSaveIntTop + i];
@@ -4006,6 +4014,13 @@ begin
   FCtx.FrameSaveIntTop := 0;
   FCtx.FrameSaveFloatTop := 0;
   FCtx.FrameSaveStrTop := 0;
+  // -1 = not measured yet, so FramePush falls back to the whole bank. LoadProgram replaces these
+  // with the program's real widths, which are legitimately 0 for a bank it never touches -- which
+  // is why 0 must NOT read as "unmeasured" (that cost 256 float copies per call in an int-only
+  // program, the residual call overhead after the first pass at this).
+  FCtx.FrameSaveIntCount := -1;
+  FCtx.FrameSaveFloatCount := -1;
+  FCtx.FrameSaveStrCount := -1;
   FCtx.FrameRecBaseTop := 0;
   FCtx.BlockRecMarkTop := 0;
   SetLength(FCtx.Records, 0);
