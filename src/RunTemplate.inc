@@ -715,7 +715,7 @@ begin
         // register banks so the callee has its own locals and recursion works.
         bcCallSub:
           begin
-            FramePush(Ctx);
+            FramePush(Ctx, Instr.Immediate);   // narrow the snapshot to what this callee can clobber
             GrowCallStackIfNeeded(Ctx);
             Ctx.CallStack[Ctx.CallStackPtr] := CurPC + 1;
             Inc(Ctx.CallStackPtr);
@@ -733,7 +733,8 @@ begin
           end
           else
           begin
-            FramePush(Ctx);
+            // Indirect call: the entry PC is in the register, not the Immediate.
+            FramePush(Ctx, IntRegs[Instr.Src1]);
             GrowCallStackIfNeeded(Ctx);
             Ctx.CallStack[Ctx.CallStackPtr] := CurPC + 1;
             Inc(Ctx.CallStackPtr);

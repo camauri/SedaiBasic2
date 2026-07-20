@@ -173,6 +173,11 @@ type
     // or a deopt PC). Populated by RegisterAotFunc from the host after the bytecode passes.
     FAotEnabled: Boolean;
     FNativeFuncs: array of TExecMem;
+    // Per-procedure frame-clobber widths, indexed by procedure entry PC (built by
+    // BuildProcFrameWidths in LoadProgram). Length 0 = not built -> program-wide width.
+    FProcWidthInt: array of Integer;
+    FProcWidthFloat: array of Integer;
+    FProcWidthStr: array of Integer;
     // Array descriptor table passed to compiled loops: 3 Int64 per array (IntData ptr, FloatData ptr,
     // Count). Rebuilt from FArrays only when the array set changes (FArraysDirty), so the per-call cost
     // is a single pointer once the arrays are DIM'd.
@@ -352,8 +357,12 @@ type
     procedure InitializeRegisters;
     procedure ClearAllVariables;
     procedure EnsureRegisterCapacity(Ctx: TExecutionContext; RegType: TSSARegisterType; MinIndex: Integer);
-    procedure FramePush(Ctx: TExecutionContext);   // bcCallSub: snapshot whole register banks
-    procedure FramePop(Ctx: TExecutionContext);    // bcReturnSub: restore whole register banks
+    // bcCallSub: snapshot the registers the callee at TargetPC can touch (-1 = unknown target,
+    // e.g. an indirect call: falls back to the program-wide width). bcReturnSub restores exactly
+    // what was pushed, reading the width back off the frame-width stack.
+    procedure FramePush(Ctx: TExecutionContext; TargetPC: Integer = -1);
+    procedure FramePop(Ctx: TExecutionContext);
+    procedure BuildProcFrameWidths;
     procedure GrowCallStackIfNeeded(Ctx: TExecutionContext); inline;  // auto-grow return-addr stack (deep recursion)
     // M5.2 OS threading: spawn/join workers running their own TExecutionContext over the shared
     // program/heap (FreeBASIC shared-memory model). SetupWorkerContext sizes a fresh context's banks;
@@ -747,6 +756,7 @@ begin
   FCtx.FrameSaveIntCount := -1;
   FCtx.FrameSaveFloatCount := -1;
   FCtx.FrameSaveStrCount := -1;
+  FCtx.FrameWidthTop := 0;
   FCtx.FrameRecBaseTop := 0;
   FCtx.BlockRecMarkTop := 0;
   SetLength(FCtx.Records, 0);
@@ -1646,7 +1656,129 @@ begin
     SetLength(Ctx.CallStack, Length(Ctx.CallStack) * 2 + 16);
 end;
 
-procedure TBytecodeVM.FramePush(Ctx: TExecutionContext);
+procedure TBytecodeVM.BuildProcFrameWidths;
+// A call only has to protect the registers its callee - and everything that callee can reach -
+// might touch. Compute that per procedure entry PC: first the highest register index appearing in
+// each procedure's own instruction range (reads included, a conservative superset of what it
+// writes), then a fixpoint over static bcCallSub targets so a caller covers its callees too. Any
+// procedure containing an INDIRECT call gets the program-wide width, since its target is unknown.
+// Falls back to the program-wide width everywhere if the proc map is unusable.
+var
+  NProc, NInstr, i, p, PcStart, PcEnd, Tgt, TgtIdx: Integer;
+  Instr: TBytecodeInstruction;
+  Op, Grp: Word;
+  Entry: array of Integer;          // procedure index -> entry PC
+  WI, WF, WS: array of Integer;     // procedure index -> widths (register count per bank)
+  Unknown: array of Boolean;        // procedure makes an indirect call -> program-wide
+  Changed: Boolean;
+  Rounds: Integer;
+
+  function ProcIndexAt(PC: Integer): Integer;   // last entry at or before PC, -1 = module level
+  var k: Integer;
+  begin
+    Result := -1;
+    for k := 0 to NProc - 1 do
+      if (Entry[k] >= 0) and (Entry[k] <= PC) then Result := k else if Entry[k] > PC then Break;
+  end;
+  procedure Note(pi: Integer; Bank: Integer; RegIdx: Integer);
+  begin
+    if (pi < 0) or (RegIdx < 0) then Exit;
+    case Bank of
+      0: if RegIdx + 1 > WI[pi] then WI[pi] := RegIdx + 1;
+      1: if RegIdx + 1 > WF[pi] then WF[pi] := RegIdx + 1;
+      2: if RegIdx + 1 > WS[pi] then WS[pi] := RegIdx + 1;
+    end;
+  end;
+
+begin
+  SetLength(FProcWidthInt, 0); SetLength(FProcWidthFloat, 0); SetLength(FProcWidthStr, 0);
+  if FProgram = nil then Exit;
+  NInstr := FProgram.GetInstructionCount;
+  NProc := FProgram.GetProcMapCount;
+  if (NInstr = 0) or (NProc = 0) then Exit;
+
+  SetLength(Entry, NProc); SetLength(WI, NProc); SetLength(WF, NProc); SetLength(WS, NProc);
+  SetLength(Unknown, NProc);
+  for p := 0 to NProc - 1 do
+  begin
+    Entry[p] := FProgram.GetProcMapStart(p);
+    WI[p] := 0; WF[p] := 0; WS[p] := 0; Unknown[p] := False;
+  end;
+
+  // Pass 1: own footprint per procedure. The register banks an opcode touches are not uniform, so
+  // instead of re-deriving per-opcode operand shapes (the trap that would silently under-save), be
+  // deliberately coarse: credit Dest/Src1/Src2 to EVERY bank. Widths stay well under the
+  // program-wide maximum for small procedures, which is where the win is, and can never under-save.
+  for p := 0 to NProc - 1 do
+  begin
+    PcStart := Entry[p];
+    // NB: System.Continue, not Continue -- inside a TBytecodeVM method the bare name resolves to
+    // the class's own Continue method (the BASIC CONT command), which raises "CAN'T CONTINUE".
+    if PcStart < 0 then begin Unknown[p] := True; System.Continue; end;
+    if p + 1 < NProc then PcEnd := FProgram.GetProcMapStart(p + 1) - 1 else PcEnd := NInstr - 1;
+    if PcEnd >= NInstr then PcEnd := NInstr - 1;
+    for i := PcStart to PcEnd do
+    begin
+      Instr := FProgram.GetInstruction(i);
+      Op := Instr.OpCode;
+      Grp := Op shr 8;
+      Note(p, 0, Instr.Dest); Note(p, 1, Instr.Dest); Note(p, 2, Instr.Dest);
+      Note(p, 0, Instr.Src1); Note(p, 1, Instr.Src1); Note(p, 2, Instr.Src1);
+      Note(p, 0, Instr.Src2); Note(p, 1, Instr.Src2); Note(p, 2, Instr.Src2);
+      // An indirect call, a thread spawn or an error jump can land anywhere: give up on this one.
+      if (Op = Ord(bcCallSubIndirect)) or (Op = Ord(bcThreadCreate)) or
+         (Op = Ord(bcOnError)) or (Op = Ord(bcResumeLabel)) or (Op = Ord(bcResume)) or
+         (Op = Ord(bcTrap)) or (Grp = $05) then
+        Unknown[p] := True;
+    end;
+  end;
+
+  // Pass 2: fixpoint over static call edges - a caller must cover everything its callees touch.
+  Rounds := 0;
+  repeat
+    Changed := False;
+    Inc(Rounds);
+    for p := 0 to NProc - 1 do
+    begin
+      PcStart := Entry[p];
+      if PcStart < 0 then System.Continue;
+      if p + 1 < NProc then PcEnd := FProgram.GetProcMapStart(p + 1) - 1 else PcEnd := NInstr - 1;
+      if PcEnd >= NInstr then PcEnd := NInstr - 1;
+      for i := PcStart to PcEnd do
+      begin
+        Instr := FProgram.GetInstruction(i);
+        if Instr.OpCode <> Ord(bcCallSub) then System.Continue;
+        Tgt := Instr.Immediate;
+        TgtIdx := ProcIndexAt(Tgt);
+        if (TgtIdx < 0) or (Entry[TgtIdx] <> Tgt) then begin
+          if not Unknown[p] then begin Unknown[p] := True; Changed := True; end;
+          System.Continue;
+        end;
+        if Unknown[TgtIdx] and not Unknown[p] then begin Unknown[p] := True; Changed := True; end;
+        if WI[TgtIdx] > WI[p] then begin WI[p] := WI[TgtIdx]; Changed := True; end;
+        if WF[TgtIdx] > WF[p] then begin WF[p] := WF[TgtIdx]; Changed := True; end;
+        if WS[TgtIdx] > WS[p] then begin WS[p] := WS[TgtIdx]; Changed := True; end;
+      end;
+    end;
+  until (not Changed) or (Rounds > NProc + 2);
+
+  // Publish, indexed by entry PC. Unknown (or a fixpoint that did not settle) = program-wide.
+  SetLength(FProcWidthInt, NInstr); SetLength(FProcWidthFloat, NInstr); SetLength(FProcWidthStr, NInstr);
+  for i := 0 to NInstr - 1 do
+  begin
+    FProcWidthInt[i] := -1; FProcWidthFloat[i] := -1; FProcWidthStr[i] := -1;
+  end;
+  for p := 0 to NProc - 1 do
+  begin
+    if (Entry[p] < 0) or (Entry[p] >= NInstr) then System.Continue;
+    if Unknown[p] or (Rounds > NProc + 2) then System.Continue;    // leave -1 = program-wide
+    FProcWidthInt[Entry[p]] := WI[p];
+    FProcWidthFloat[Entry[p]] := WF[p];
+    FProcWidthStr[Entry[p]] := WS[p];
+  end;
+end;
+
+procedure TBytecodeVM.FramePush(Ctx: TExecutionContext; TargetPC: Integer);
 // Snapshot the live part of each register bank onto the flat per-bank save stacks (one frame).
 // The saved width is Ctx.FrameSave*Count (the highest register index the program's bytecode
 // mentions, +1) rather than the whole 256-slot-floor bank: registers above that are never read
@@ -1662,6 +1794,14 @@ begin
   NI := Ctx.FrameSaveIntCount;    if (NI < 0) or (NI > Ctx.IntRegCount) then NI := Ctx.IntRegCount;
   NF := Ctx.FrameSaveFloatCount;  if (NF < 0) or (NF > Ctx.FloatRegCount) then NF := Ctx.FloatRegCount;
   NS := Ctx.FrameSaveStrCount;    if (NS < 0) or (NS > Ctx.StringRegCount) then NS := Ctx.StringRegCount;
+  // Narrow further to what THIS callee can clobber, when that is known (static target, no indirect
+  // call anywhere in its reachable set). Never widens: the program-wide width stays the ceiling.
+  if (TargetPC >= 0) and (TargetPC < Length(FProcWidthInt)) and (FProcWidthInt[TargetPC] >= 0) then
+  begin
+    if FProcWidthInt[TargetPC] < NI then NI := FProcWidthInt[TargetPC];
+    if FProcWidthFloat[TargetPC] < NF then NF := FProcWidthFloat[TargetPC];
+    if FProcWidthStr[TargetPC] < NS then NS := FProcWidthStr[TargetPC];
+  end;
   // Grow save stacks if needed (defensive; usually sized once).
   if Ctx.FrameSaveIntTop + NI > Length(Ctx.FrameSaveInt) then
     SetLength(Ctx.FrameSaveInt, Ctx.FrameSaveIntTop + NI + 256);
@@ -1678,6 +1818,18 @@ begin
   for i := 0 to NS - 1 do
     Ctx.FrameSaveStr[Ctx.FrameSaveStrTop + i] := Ctx.StringRegs[i];
   Inc(Ctx.FrameSaveStrTop, NS);
+  // Remember this frame's widths so FramePop restores exactly what was saved (widths differ per
+  // callee, so they cannot be recomputed at pop time).
+  if Ctx.FrameWidthTop >= Length(Ctx.FrameWidthInt) then
+  begin
+    SetLength(Ctx.FrameWidthInt, Ctx.FrameWidthTop + 256);
+    SetLength(Ctx.FrameWidthFloat, Ctx.FrameWidthTop + 256);
+    SetLength(Ctx.FrameWidthStr, Ctx.FrameWidthTop + 256);
+  end;
+  Ctx.FrameWidthInt[Ctx.FrameWidthTop] := NI;
+  Ctx.FrameWidthFloat[Ctx.FrameWidthTop] := NF;
+  Ctx.FrameWidthStr[Ctx.FrameWidthTop] := NS;
+  Inc(Ctx.FrameWidthTop);
   // RAII (V2): remember where this frame's record allocations begin.
   if Ctx.FrameRecBaseTop >= Length(Ctx.FrameRecBase) then
     SetLength(Ctx.FrameRecBase, Ctx.FrameRecBaseTop + 256);
@@ -1693,9 +1845,22 @@ procedure TBytecodeVM.FramePop(Ctx: TExecutionContext);
 var
   i, NI, NF, NS: Integer;
 begin
-  NI := Ctx.FrameSaveIntCount;    if (NI < 0) or (NI > Ctx.IntRegCount) then NI := Ctx.IntRegCount;
-  NF := Ctx.FrameSaveFloatCount;  if (NF < 0) or (NF > Ctx.FloatRegCount) then NF := Ctx.FloatRegCount;
-  NS := Ctx.FrameSaveStrCount;    if (NS < 0) or (NS > Ctx.StringRegCount) then NS := Ctx.StringRegCount;
+  // Widths come off the frame-width stack: they are per-callee, so they cannot be recomputed here.
+  // An empty stack means the frame was pushed before this bookkeeping existed (or the stack was
+  // unwound by an error jump): fall back to the context-wide widths, as FramePush would have used.
+  if Ctx.FrameWidthTop > 0 then
+  begin
+    Dec(Ctx.FrameWidthTop);
+    NI := Ctx.FrameWidthInt[Ctx.FrameWidthTop];
+    NF := Ctx.FrameWidthFloat[Ctx.FrameWidthTop];
+    NS := Ctx.FrameWidthStr[Ctx.FrameWidthTop];
+  end
+  else
+  begin
+    NI := Ctx.FrameSaveIntCount;    if (NI < 0) or (NI > Ctx.IntRegCount) then NI := Ctx.IntRegCount;
+    NF := Ctx.FrameSaveFloatCount;  if (NF < 0) or (NF > Ctx.FloatRegCount) then NF := Ctx.FloatRegCount;
+    NS := Ctx.FrameSaveStrCount;    if (NS < 0) or (NS > Ctx.StringRegCount) then NS := Ctx.StringRegCount;
+  end;
   Dec(Ctx.FrameSaveIntTop, NI);
   for i := 0 to NI - 1 do
     Ctx.IntRegs[i] := Ctx.FrameSaveInt[Ctx.FrameSaveIntTop + i];
@@ -2488,6 +2653,7 @@ begin
   WCtx.FrameSaveIntCount := FCtx.FrameSaveIntCount;
   WCtx.FrameSaveFloatCount := FCtx.FrameSaveFloatCount;
   WCtx.FrameSaveStrCount := FCtx.FrameSaveStrCount;
+  WCtx.FrameWidthTop := 0;   // the worker's own frame-width stack starts empty
   SetLength(WCtx.IntRegs, WCtx.IntRegCount);
   SetLength(WCtx.FloatRegs, WCtx.FloatRegCount);
   SetLength(WCtx.StringRegs, WCtx.StringRegCount);
@@ -3889,6 +4055,14 @@ begin
   FCtx.FrameSaveIntCount := MaxIntReg + 1;
   FCtx.FrameSaveFloatCount := MaxFloatReg + 1;
   FCtx.FrameSaveStrCount := MaxStringReg + 1;
+
+  // Narrow further per callee: a call only has to protect what its callee subtree can touch.
+  // Any failure here is not fatal - the empty tables simply mean "program-wide width everywhere".
+  try
+    BuildProcFrameWidths;
+  except
+    SetLength(FProcWidthInt, 0); SetLength(FProcWidthFloat, 0); SetLength(FProcWidthStr, 0);
+  end;
 end;
 
 procedure TBytecodeVM.ClearProgram;
@@ -4021,6 +4195,7 @@ begin
   FCtx.FrameSaveIntCount := -1;
   FCtx.FrameSaveFloatCount := -1;
   FCtx.FrameSaveStrCount := -1;
+  FCtx.FrameWidthTop := 0;
   FCtx.FrameRecBaseTop := 0;
   FCtx.BlockRecMarkTop := 0;
   SetLength(FCtx.Records, 0);
@@ -4380,7 +4555,7 @@ begin
     // register banks so the callee has its own locals and recursion works.
     bcCallSub:
       begin
-        FramePush(Ctx);
+        FramePush(Ctx, Instr.Immediate);   // narrow the snapshot to what this callee can clobber
         GrowCallStackIfNeeded(Ctx);
         Ctx.CallStack[Ctx.CallStackPtr] := Ctx.PC;
         Inc(Ctx.CallStackPtr);
@@ -4395,7 +4570,7 @@ begin
           Ctx.XferFloat[255] := ComputeBuiltinFP(HandleNum64 and $FF, Ctx.XferFloat[0])   // 255 = XFER_RESULT_SLOT
         else
         begin
-          FramePush(Ctx);
+          FramePush(Ctx, HandleNum64);   // indirect: the entry PC is the register value
           GrowCallStackIfNeeded(Ctx);
           Ctx.CallStack[Ctx.CallStackPtr] := Ctx.PC;
           Inc(Ctx.CallStackPtr);

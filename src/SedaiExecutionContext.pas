@@ -99,6 +99,14 @@ type
     FrameSaveIntCount: Integer;
     FrameSaveFloatCount: Integer;
     FrameSaveStrCount: Integer;
+    // Per-frame widths actually pushed, so FramePop restores exactly what FramePush saved. A call
+    // only has to protect the registers its CALLEE (and everything the callee calls) can touch,
+    // which is usually far below the program-wide width - the caller of a two-line SUB should not
+    // pay for the biggest procedure in the program. Pushed by FramePush, read by FramePop.
+    FrameWidthInt: array of Integer;
+    FrameWidthFloat: array of Integer;
+    FrameWidthStr: array of Integer;
+    FrameWidthTop: Integer;
 
     // --- Record reclamation marks (RAII, V2 frame / M8 block) ---
     FrameRecBase: array of Integer;
