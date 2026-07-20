@@ -36,7 +36,7 @@ uses
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
   SedaiConsoleBehavior, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue,
-  SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiJit
+  SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiJit, SedaiAot
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
   {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioTypes, SedaiAudioBackend, SedaiSIDEvo{$ENDIF}
   {$IFDEF WEB_MODE}, SedaiWebIO{$ENDIF};
@@ -167,6 +167,12 @@ type
     // such a PC, calls the native function which runs the whole loop and returns the exit PC.
     FJitEnabled: Boolean;
     FNativeLoops: array of TExecMem;
+    // AOT (plan B): whole SSA functions compiled to native, registered under their ENTRY PC.
+    // The dispatch check fires on the iteration after bcCallSub has already done FramePush,
+    // so the native function needs no frame handling; it returns the resume PC (bcReturnSub
+    // or a deopt PC). Populated by RegisterAotFunc from the host after the bytecode passes.
+    FAotEnabled: Boolean;
+    FNativeFuncs: array of TExecMem;
     // Array descriptor table passed to compiled loops: 3 Int64 per array (IntData ptr, FloatData ptr,
     // Count). Rebuilt from FArrays only when the array set changes (FArraysDirty), so the per-call cost
     // is a single pointer once the arrays are DIM'd.
@@ -445,6 +451,9 @@ type
     {$ENDIF}
     // JIT (J2/J3): compile eligible hot loops to native. Set before LoadProgram / run.
     property JitEnabled: Boolean read FJitEnabled write FJitEnabled;
+    property AotEnabled: Boolean read FAotEnabled write FAotEnabled;
+    // AOT: adopt a compiled function (ownership passes to the VM) under its entry PC.
+    procedure RegisterAotFunc(EntryPC: Integer; Mem: TObject);
     procedure Run;       // Default execution - calls RunFast
     procedure RunFast;   // Optimized execution loop - no profiler/debug support
     procedure RunDebug;  // Debug execution loop - TRON trace + profiler support
@@ -847,6 +856,7 @@ var
   JitI: Integer;
 begin
   for JitI := 0 to High(FNativeLoops) do FNativeLoops[JitI].Free;   // JIT: release executable pages
+  for JitI := 0 to High(FNativeFuncs) do FNativeFuncs[JitI].Free;   // AOT: release executable pages
   FEnvOverrides.Free;
   {$IFDEF WITH_SEDAI_AUDIO}
   // Stop and shutdown SAF audio backend
@@ -2944,6 +2954,11 @@ var
   MaxIntReg, MaxFloatReg, MaxStringReg: Integer;
 begin
   FProgram := Program_;
+
+  // AOT: functions compiled for a previous program are keyed by its PCs - drop them.
+  // The host re-registers (RegisterAotFunc) after loading the new program.
+  for i := 0 to High(FNativeFuncs) do FNativeFuncs[i].Free;
+  SetLength(FNativeFuncs, 0);
 
   // PRINT number spacing is dialect-specific. CLASSIC (Commodore v7) pads a non-negative number with a
   // leading space AND appends a trailing one. FreeBASIC keeps the leading pad but prints NO trailing space
@@ -5570,6 +5585,30 @@ begin
       end;
     end;
   FArraysDirty := True;   // force a descriptor rebuild before the first compiled loop runs
+end;
+
+procedure TBytecodeVM.RegisterAotFunc(EntryPC: Integer; Mem: TObject);
+var
+  i: Integer;
+begin
+  if (FProgram = nil) or (Mem = nil) then
+  begin
+    Mem.Free;
+    Exit;
+  end;
+  if Length(FNativeFuncs) <> FProgram.GetInstructionCount then
+  begin
+    for i := 0 to High(FNativeFuncs) do FNativeFuncs[i].Free;
+    SetLength(FNativeFuncs, 0);
+    SetLength(FNativeFuncs, FProgram.GetInstructionCount);   // all nil
+  end;
+  if (EntryPC >= 0) and (EntryPC < Length(FNativeFuncs)) then
+  begin
+    FNativeFuncs[EntryPC].Free;
+    FNativeFuncs[EntryPC] := TExecMem(Mem);
+  end
+  else
+    Mem.Free;
 end;
 
 procedure TBytecodeVM.RebuildJitArrDesc;

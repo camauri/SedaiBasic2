@@ -367,6 +367,7 @@ var
   OptBoundsCheck: Boolean = False;
   // --jit: compile eligible hot loops to native code (JIT J2/J3).
   OptJit: Boolean = False;
+  OptAot: Boolean = False;
   {$IFDEF JIT_PROFILE}
   // --jit-profile: enable JIT hot-loop back-edge profiling and dump the hot loops after the run (J1).
   OptJitProfile: Boolean = False;
@@ -546,6 +547,8 @@ var
   i, removed: Integer;
   ErrorSourceLine: Integer;
   ShowBanners: Boolean;
+  AotFuncList: TAotFuncs;
+  AotI: Integer;
   {$IFDEF ENABLE_PROFILER}
   Profiler: TProfiler;
   ProfMode: TProfilerMode;
@@ -1617,6 +1620,18 @@ begin
       {$ENDIF}
       VM.LoadProgram(BytecodeProgram);
 
+      // === AOT (plan B, B1) ===
+      // Compile eligible whole SSA functions to native and register them under their
+      // entry PCs. Needs both the SSA program and the FINAL bytecode (PC/register maps).
+      if OptAot then
+      begin
+        AotFuncList := AotCompileProgram(SSAProgram, BytecodeProgram, OptTrueValue,
+                                         GetEnvironmentVariable('AOT_DIAG') = '1');
+        for AotI := 0 to High(AotFuncList) do
+          VM.RegisterAotFunc(AotFuncList[AotI].EntryPC, AotFuncList[AotI].Mem);
+        VM.AotEnabled := Length(AotFuncList) > 0;
+      end;
+
       try
         Timer := CreateHiResTimer;
         {$IFDEF ENABLE_PROFILER}
@@ -2062,6 +2077,8 @@ begin
         OptBoundsCheck := True   // force array bounds checking on (even in MODERN); default follows the dialect
       else if (Param = '--jit') then
         OptJit := True   // JIT: compile eligible hot loops to native code (J2/J3)
+      else if (Param = '--aot') then
+        OptAot := True   // AOT (plan B): compile eligible whole SSA functions to native
       {$IFDEF JIT_PROFILE}
       else if (Param = '--jit-profile') or (Param = '--jitprofile') then
         OptJitProfile := True   // JIT J1: profile hot loops (back-edge counts) and dump them after the run

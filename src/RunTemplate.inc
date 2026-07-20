@@ -20,6 +20,11 @@ type
 var
   JitOn: Boolean;          // JIT enabled for this run (compiled loops present)
   JitLoops: PExecMemA;     // @FNativeLoops[0]: JitLoops[CurPC] is the compiled loop at that header, or nil
+  // AOT (plan B): whole compiled functions keyed by entry PC. The check fires on the dispatch
+  // iteration after bcCallSub has done FramePush, so the native function needs no frame logic.
+  AotOn: Boolean;
+  AotFuncs: PExecMemA;     // @FNativeFuncs[0]
+  LocalAotCtx: TAotCtx;    // per-Run transfer-bank bases of the ACTIVE context (worker-safe)
   Instructions: PBytecodeInstruction;
   InstrCount: Integer;
   CurPC: Integer;  // Current Program Counter (local for speed)
@@ -96,6 +101,18 @@ begin
   // Get direct pointers to register arrays
   IntRegs := @Ctx.IntRegs[0];
   FloatRegs := @Ctx.FloatRegs[0];
+  // AOT: bind the compiled-function table and this context's transfer-bank bases (built per
+  // Run and passed per call, NEVER baked into code: a worker must see its own banks).
+  AotOn := FAotEnabled and (Length(FNativeFuncs) > 0) and
+           (Length(Ctx.XferInt) > 0) and (Length(Ctx.XferFloat) > 0);
+  if AotOn then
+  begin
+    AotFuncs := @FNativeFuncs[0];
+    LocalAotCtx.XferInt := @Ctx.XferInt[0];
+    LocalAotCtx.XferFloat := @Ctx.XferFloat[0];
+  end
+  else
+    AotFuncs := nil;
   // Local copy of TrueValue for comparison operators
   TrueVal := FTrueValue;
   ModernConv := Assigned(FProgram) and FProgram.ModernMode;
@@ -126,6 +143,14 @@ begin
     begin
       if FArraysDirty then RebuildJitArrDesc;
       CurPC := TNativeLoopFn(TExecMem(JitLoops[CurPC]).Ptr)(IntRegs, PInt64(FloatRegs), @FJitArrDesc[0]);
+      System.Continue;
+    end;
+
+    // AOT (plan B): a whole compiled function registered at this entry PC runs natively on the
+    // same banks and returns the resume PC (its bcReturnSub/bcEnd, or a deopt PC).
+    if AotOn and (AotFuncs[CurPC] <> nil) then
+    begin
+      CurPC := TNativeFuncFn(TExecMem(AotFuncs[CurPC]).Ptr)(IntRegs, PInt64(FloatRegs), @LocalAotCtx);
       System.Continue;
     end;
 
