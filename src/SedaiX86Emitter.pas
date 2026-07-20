@@ -25,9 +25,41 @@ uses
 
 // x86-64 register numbers (hardware encoding; REX.R/B extend to r8-r15)
 const
-  RAX = 0; RCX = 1; RDX = 2; RBX = 3; RSI = 6; R8 = 8;
+  RAX = 0; RCX = 1; RDX = 2; RBX = 3; RSP = 4; RBP = 5; RSI = 6; RDI = 7; R8 = 8;
   R9 = 9; R10 = 10; R11 = 11; R12 = 12; R13 = 13; R14 = 14; R15 = 15;
   XMM0 = 0; XMM1 = 1;
+
+{ ---- ABI register classes (C2) -------------------------------------------------------
+  Which registers survive a call is the ONLY thing that differs between the two ABIs we
+  target, and it differs a lot: Win64 keeps xmm6-xmm15 across a call, System V keeps NO
+  xmm register at all. Anything that emits a call (the runtime-helper lowering that gives
+  the AOT full program coverage) must ask these, never hard-code a register list -- and
+  must not be "fixed" by allocating only callee-saved registers, which would give Linux
+  systematically worse codegen than Windows.
+  GPR shorthand: 1 shl <reg number>. -------------------------------------------------- }
+const
+  // Callee-saved (survive a call). Win64: rbx rbp rdi rsi r12-r15. SysV: rbx rbp r12-r15
+  // (rdi/rsi are argument registers there, hence volatile).
+  {$IFDEF WINDOWS}
+  ABI_GPR_CALLEE_SAVED = (1 shl RBX) or (1 shl RBP) or (1 shl RDI) or (1 shl RSI) or
+                         (1 shl R12) or (1 shl R13) or (1 shl R14) or (1 shl R15);
+  ABI_XMM_FIRST_CALLEE_SAVED = 6;    // xmm6..xmm15 survive a call
+  ABI_SHADOW_SPACE = 32;             // bytes the caller must reserve for the callee
+  {$ELSE}
+  ABI_GPR_CALLEE_SAVED = (1 shl RBX) or (1 shl RBP) or
+                         (1 shl R12) or (1 shl R13) or (1 shl R14) or (1 shl R15);
+  ABI_XMM_FIRST_CALLEE_SAVED = 16;   // none: every xmm is caller-saved in System V
+  ABI_SHADOW_SPACE = 0;
+  {$ENDIF}
+  // Integer argument registers, in order (arg0, arg1, ...).
+  {$IFDEF WINDOWS}
+  ABI_ARG0 = RCX; ABI_ARG1 = RDX; ABI_ARG2 = R8; ABI_ARG3 = R9;
+  {$ELSE}
+  ABI_ARG0 = RDI; ABI_ARG1 = RSI; ABI_ARG2 = RDX; ABI_ARG3 = RCX;
+  {$ENDIF}
+
+function GprIsCalleeSaved(Reg: Integer): Boolean; inline;
+function XmmIsCalleeSaved(Reg: Integer): Boolean; inline;
 
 type
   TX86Emitter = class
@@ -59,6 +91,18 @@ type
   end;
 
 implementation
+
+{ ---------------- ABI register classes ---------------- }
+
+function GprIsCalleeSaved(Reg: Integer): Boolean;
+begin
+  Result := (Reg >= 0) and (Reg <= 15) and ((ABI_GPR_CALLEE_SAVED shr Reg) and 1 <> 0);
+end;
+
+function XmmIsCalleeSaved(Reg: Integer): Boolean;
+begin
+  Result := (Reg >= ABI_XMM_FIRST_CALLEE_SAVED) and (Reg <= 15);
+end;
 
 { ---------------- executable memory ---------------- }
 
