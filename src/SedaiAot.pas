@@ -48,6 +48,10 @@ type
     // reason rbx/rsi can be kept), so it is set once with the others and never refreshed.
     StrRegs: Pointer;    // offset 48: @Ctx.StringRegs[0], base of the managed-string bank
     StrCmp: Pointer;     // offset 56: @AotStrCmp (a, b, kind) -> 1/0
+    StrAssign: Pointer;  // offset 64: @AotStrAssign (dstSlot, srcVal) - copy
+    StrLoadConst: Pointer; // offset 72: @AotStrLoadConst (dstSlot, VMSelf, imm)
+    StrConcat: Pointer;  // offset 80: @AotStrConcat (dstSlot, aVal, bVal)
+    StrLen: Pointer;     // offset 88: @AotStrLen (sVal) -> length
   end;
   PAotCtx = ^TAotCtx;
 
@@ -61,6 +65,10 @@ const
   AOTCTX_CTXOBJ    = 40;
   AOTCTX_STRREGS   = 48;
   AOTCTX_STRCMP    = 56;
+  AOTCTX_STRASSIGN = 64;
+  AOTCTX_STRLOADCONST = 72;
+  AOTCTX_STRCONCAT = 80;
+  AOTCTX_STRLEN    = 88;
 
   // Helper return contract. Normally the helper returns the bytecode PC that follows the
   // instruction it ran; native code compares against the PC it expects and keeps going.
@@ -161,6 +169,9 @@ begin
     // allocation, no refcount, so the string operands stay in their bank and only the int Dest
     // is register-allocated. (No Le/Ge: the parser rewrites them to Gt/Lt with swapped operands.)
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
+    // C5: the string bank ops that dominate hot string loops - each a leaf call to a Pascal
+    // primitive (copy/const-load/concat are managed assignments; len returns an int).
+    ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
     ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,
     ssaShl, ssaShr, ssaShrUInt,
     ssaMathSqr,
@@ -266,14 +277,41 @@ begin
   Result := True;
 end;
 
+// Shape check for the C5 native string ops: the operands the emitted code reads as registers
+// must actually BE registers of the expected bank (a rare const operand falls back to the helper
+// rather than failing the region at emit time). Shared by classifier/prescan/emitter so the three
+// agree, exactly like AotArrayNativeOK.
+function AotStringNativeOK(const Ins: TSSAInstruction): Boolean;
+  function IsStr(const V: TSSAValue): Boolean;
+  begin Result := (V.Kind = svkRegister) and (V.RegType = srtString); end;
+  function IsInt(const V: TSSAValue): Boolean;
+  begin Result := (V.Kind = svkRegister) and (V.RegType = srtInt); end;
+begin
+  case Ins.OpCode of
+    ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
+      Result := IsInt(Ins.Dest) and IsStr(Ins.Src1) and IsStr(Ins.Src2);
+    ssaCopyString:      Result := IsStr(Ins.Dest) and IsStr(Ins.Src1);
+    ssaLoadConstString: Result := IsStr(Ins.Dest);
+    ssaStrConcat:       Result := IsStr(Ins.Dest) and IsStr(Ins.Src1) and IsStr(Ins.Src2);
+    ssaStrLen:          Result := IsInt(Ins.Dest) and IsStr(Ins.Src1);
+  else
+    Result := False;
+  end;
+end;
+
 // Is this SSA op one the AOT lowers natively? Combines the op set with the per-op shape
 // conditions, so callers get a single yes/no and the helper picks up everything else.
 function AotIsNative(SSAProg: TSSAProgram; const Ins: TSSAInstruction): Boolean;
 begin
   Result := IsB1Op(Ins.OpCode);
-  if Result and ((Ins.OpCode = ssaArrayLoad) or (Ins.OpCode = ssaArrayStore) or
-                 (Ins.OpCode = ssaArrayLBound) or (Ins.OpCode = ssaArrayUBound)) then
-    Result := AotArrayNativeOK(SSAProg, Ins);
+  if not Result then Exit;
+  case Ins.OpCode of
+    ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound:
+      Result := AotArrayNativeOK(SSAProg, Ins);
+    ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
+    ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen:
+      Result := AotStringNativeOK(Ins);
+  end;
 end;
 
 // Can SSA ordinal AOrd be handed to the helper? Three conditions, all conservative:
@@ -649,6 +687,24 @@ var
     rex := $48; if natreg >= 8 then rex := rex or $01;
     E.Emit8(rex); E.Emit8($B8 or (natreg and 7)); E.Emit64(QWord(imm));
   end;
+  // lea dst, [base+disp32]. Used for &StringRegs[i] (base is always rax here, so no SIB case).
+  procedure Lea(dst, base: Integer; disp: LongWord);
+  var rex: Byte;
+  begin
+    rex := $48; if dst >= 8 then rex := rex or $04; if base >= 8 then rex := rex or $01;
+    E.Emit8(rex); E.Emit8($8D);
+    E.Emit8($80 or ((dst and 7) shl 3) or (base and 7)); E.Emit32(disp);
+  end;
+  // mov dst, [base+disp32] with a REX computed for either register being an extended reg (r8-r15).
+  // MemOp bakes REX into its opcode bytes, which is fine for fixed regs but not for an ABI arg
+  // register that is r8 on Win64 (needs REX.R) - so the string emitters use this instead.
+  procedure MovLoad(dst, base: Integer; disp: LongWord);
+  var rex: Byte;
+  begin
+    rex := $48; if dst >= 8 then rex := rex or $04; if base >= 8 then rex := rex or $01;
+    E.Emit8(rex); E.Emit8($8B);
+    E.Emit8($80 or ((dst and 7) shl 3) or (base and 7)); E.Emit32(disp);
+  end;
   procedure LoadRegMem(natreg: Integer; disp: LongWord);   // mov natreg,[rbx+disp]
   var rex: Byte;
   begin
@@ -959,6 +1015,14 @@ var
       if not XmmIsCalleeSaved(FLoc[FAllocd[k]]) then
         E.MemOp([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
   end;
+  // After a native leaf call: restore the base regs the call may have clobbered (r8 ctx, rsi
+  // FloatRegs), then the caller-saved allocated registers (rbx is callee-saved and survives).
+  procedure StrCallEpilogue;
+  begin
+    FrameLoad(R8, SlotCtxSave);
+    FrameLoad(RSI, SlotFltSave);
+    ReloadVolatiles;
+  end;
 
   // C5: bcCmp*String lowered to a leaf call to AotStrCmp. Kind 0=Eq 1=Ne 2=Lt 3=Gt. The two
   // string operands stay in the StringRegs bank; the emitted code reads their slot values and
@@ -978,10 +1042,72 @@ var
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRCMP);          // rax = ctx.StrCmp (call target)
     MovImm64(ABI_ARG2, Kind);                             // arg2 = kind (may clobber r8 on Win64)
     E.EmitBytes([$FF, $D0]);                              // call rax
-    FrameLoad(R8, SlotCtxSave);                           // r8 (ctx) is volatile everywhere
-    FrameLoad(RSI, SlotFltSave);                          // rsi (FloatRegs) is volatile in System V
-    ReloadVolatiles;
+    StrCallEpilogue;
     CmpBoolToDest;                                        // al (0/1) -> Dest := TrueVal/0
+  end;
+
+  // C5: StringRegs[dest] := StringRegs[src] (managed copy) via AotStrAssign(&dst, srcVal).
+  procedure EmitStrCopy;
+  var d, s: Integer;
+  begin
+    d := SReg(Cur.Dest); s := SReg(Cur.Src1); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);         // rax = bank base
+    Lea(ABI_ARG0, RAX, LongWord(d) * 8);                  // arg0 = &StringRegs[dest]
+    E.MemOp([$48, $8B], ABI_ARG1, RAX, LongWord(s) * 8);  // arg1 = StringRegs[src] (value)
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRASSIGN);       // rax = primitive
+    E.EmitBytes([$FF, $D0]);                              // call rax
+    StrCallEpilogue;
+  end;
+
+  // C5: StringRegs[dest] := StringConstants[imm] via AotStrLoadConst(&dst, VMSelf, imm). The
+  // constant index lives in the BYTECODE instruction (assigned by the compiler), not the SSA.
+  procedure EmitStrLoadConst(apc: Integer);
+  var d: Integer; imm: Int64;
+  begin
+    d := SReg(Cur.Dest); if not OK then Exit;
+    imm := Prog.GetInstruction(apc).Immediate;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);         // rax = bank base
+    Lea(ABI_ARG0, RAX, LongWord(d) * 8);                  // arg0 = &StringRegs[dest]
+    E.MemOp([$49, $8B], ABI_ARG1, R8, AOTCTX_VMSELF);     // arg1 = VMSelf (before r8 clobber)
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRLOADCONST);    // rax = primitive (before r8 clobber)
+    MovImm64(ABI_ARG2, imm);                              // arg2 = imm (may clobber r8 on Win64)
+    E.EmitBytes([$FF, $D0]);                              // call rax
+    StrCallEpilogue;
+  end;
+
+  // C5: StringRegs[dest] := StringRegs[a] + StringRegs[b] via AotStrConcat(&dst, aVal, bVal).
+  // Unlike the others, arg2 is a MEMORY load into a register that is r8 (ctx) on Win64, so the
+  // ctx would be gone before the primitive address could be read from it. The primitive is
+  // therefore staged in r11 (volatile everywhere, never an arg, safe as scratch between the
+  // spill and reload) BEFORE arg2 clobbers r8.
+  procedure EmitStrConcat;
+  var d, a, b: Integer;
+  begin
+    d := SReg(Cur.Dest); a := SReg(Cur.Src1); b := SReg(Cur.Src2); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);         // rax = bank base
+    E.MemOp([$4D, $8B], R11, R8, AOTCTX_STRCONCAT);       // r11 = primitive (before r8 clobber)
+    Lea(ABI_ARG0, RAX, LongWord(d) * 8);                  // arg0 = &StringRegs[dest]
+    MovLoad(ABI_ARG1, RAX, LongWord(a) * 8);              // arg1 = StringRegs[a] (value)
+    MovLoad(ABI_ARG2, RAX, LongWord(b) * 8);              // arg2 = StringRegs[b] (may clobber r8)
+    E.EmitBytes([$41, $FF, $D3]);                         // call r11
+    StrCallEpilogue;
+  end;
+
+  // C5: IntRegs[dest] := Length(StringRegs[src]) via AotStrLen(srcVal) -> rax.
+  procedure EmitStrLen;
+  var s: Integer;
+  begin
+    s := SReg(Cur.Src1); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);         // rax = bank base
+    E.MemOp([$48, $8B], ABI_ARG0, RAX, LongWord(s) * 8);  // arg0 = StringRegs[src] (value)
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRLEN);          // rax = primitive
+    E.EmitBytes([$FF, $D0]);                              // call rax
+    StrCallEpilogue;
+    IStore(IReg(Cur.Dest), RAX);                          // rax = length -> int Dest
   end;
 
   procedure LoadXferBase(FloatBank: Boolean);
@@ -1388,14 +1514,25 @@ var
             CountVal(Ins.Dest);
             if Ins.Src2.Kind = svkRegister then CountVal(Ins.Src2);
           end;
-          ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
+          ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
+          ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen:
           begin
-            // C5: a leaf call (AotStrCmp). Only the int Dest is register-allocated; the string
-            // operands are read from the bank by the emitted code, so they are NOT counted
-            // (CountVal rejects string operands outright). The call needs a call-ready frame
-            // but always completes natively, so it sets the frame flag without a deopt hazard.
-            HasHelperCall := True;
-            CountVal(Ins.Dest);
+            // C5: a native leaf call to a string primitive. String operands stay in the bank
+            // (not register-allocated, not counted - CountVal rejects them); only an int Dest
+            // (compare result / LEN) is counted. The call needs a call-ready frame but always
+            // completes natively, so it sets the frame flag WITHOUT a deopt hazard. A non-native
+            // shape (e.g. a const operand) falls back to the helper rather than bailing here.
+            if not AotIsNative(SSAProg, Ins) then NoteHelperOp
+            else
+            begin
+              HasHelperCall := True;
+              if (Ins.OpCode = ssaStrLen) or (Ins.OpCode = ssaCmpEqString) or
+                 (Ins.OpCode = ssaCmpNeString) or (Ins.OpCode = ssaCmpLtString) or
+                 (Ins.OpCode = ssaCmpGtString) then
+                CountVal(Ins.Dest);                 // the int result
+              if (Ins.OpCode = ssaLoadConstString) and (Prog.GetSsaPc(o) < 0) then
+                Fail('no-pc-strconst');             // needs the bytecode Immediate
+            end;
           end;
         else
           if AotIsNative(SSAProg, Ins) then
@@ -1649,6 +1786,11 @@ var
 
       ssaCmpEqString: EmitStrCmp(0); ssaCmpNeString: EmitStrCmp(1);
       ssaCmpLtString: EmitStrCmp(2); ssaCmpGtString: EmitStrCmp(3);
+
+      ssaCopyString: EmitStrCopy;
+      ssaLoadConstString: begin apc := NeedPC; if OK then EmitStrLoadConst(apc); end;
+      ssaStrConcat: EmitStrConcat;
+      ssaStrLen: EmitStrLen;
 
       ssaJump, ssaJumpIfZero, ssaJumpIfNotZero:
       begin

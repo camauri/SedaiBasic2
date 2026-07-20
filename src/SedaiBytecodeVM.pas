@@ -5901,6 +5901,40 @@ begin
   if r then Result := 1 else Result := 0;
 end;
 
+{ C5 string leaf primitives. Each does ONE bank operation the AOT would otherwise route through
+  AotExecOne, in Pascal, so refcount/allocation stay correct and codepage-agnostic. dstSlot is
+  the ADDRESS of a StringRegs element (&StringRegs[dest]); srcVal/aVal/bVal are element VALUES
+  (the AnsiString data pointer or nil), read natively from the bank by the emitted code. The
+  managed assignment `PAnsiString(dstSlot)^ := ...` is exactly what the interpreter's
+  `StringRegs[Dest] := ...` compiles to (incref new, decref old), so behaviour is bit-identical,
+  including dst aliasing a source. cdecl to match the emitted call sites; reached through TAotCtx
+  so no address is baked. Global functions in this unit see TBytecodeVM's private fields, like
+  AotExecOne does. }
+procedure AotStrAssign(dstSlot, srcVal: Pointer); cdecl;
+begin
+  PAnsiString(dstSlot)^ := AnsiString(srcVal);
+end;
+
+procedure AotStrLoadConst(dstSlot, VMSelf: Pointer; imm: PtrInt); cdecl;
+var VM: TBytecodeVM;
+begin
+  VM := TBytecodeVM(VMSelf);
+  // Out of range leaves dst unchanged, exactly as bcLoadConstString does (never happens for a
+  // valid program, but the two paths must agree).
+  if (imm >= 0) and (imm < VM.FProgram.StringConstants.Count) then
+    PAnsiString(dstSlot)^ := VM.FProgram.StringConstants[imm];
+end;
+
+procedure AotStrConcat(dstSlot, aVal, bVal: Pointer); cdecl;
+begin
+  PAnsiString(dstSlot)^ := AnsiString(aVal) + AnsiString(bVal);
+end;
+
+function AotStrLen(sVal: Pointer): PtrInt; cdecl;
+begin
+  Result := Length(AnsiString(sVal));
+end;
+
 { Resolve what a compiled AOT function returned (C3). Normally that is just the resume PC and
   this is a compare and a return; the two negative sentinels mean a runtime helper hit
   something native code cannot finish.

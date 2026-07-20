@@ -122,6 +122,10 @@ begin
     if Length(Ctx.StringRegs) > 0 then LocalAotCtx.StrRegs := @Ctx.StringRegs[0]
     else LocalAotCtx.StrRegs := nil;
     LocalAotCtx.StrCmp := @AotStrCmp;
+    LocalAotCtx.StrAssign := @AotStrAssign;
+    LocalAotCtx.StrLoadConst := @AotStrLoadConst;
+    LocalAotCtx.StrConcat := @AotStrConcat;
+    LocalAotCtx.StrLen := @AotStrLen;
   end
   else
     AotFuncs := nil;
