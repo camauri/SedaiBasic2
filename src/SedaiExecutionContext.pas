@@ -89,6 +89,16 @@ type
     FrameSaveIntTop: Integer;
     FrameSaveFloatTop: Integer;
     FrameSaveStrTop: Integer;
+    // How many slots per bank a call frame actually snapshots. The banks are allocated with a
+    // 256-slot floor (MIN_REGISTER_SLOTS), but a program only ever touches registers below the
+    // maximum index its bytecode mentions, so saving the whole bank is pure cost - and for the
+    // STRING bank it is refcounted-copy cost, which dominated the per-call overhead. Set by
+    // LoadProgram from the same whole-program scan that sizes the banks (and raised with them if
+    // a bank grows); 0 until then, and FramePush clamps to the bank size, so a stale/zero value
+    // can only ever save LESS than the bank, never out of range.
+    FrameSaveIntCount: Integer;
+    FrameSaveFloatCount: Integer;
+    FrameSaveStrCount: Integer;
 
     // --- Record reclamation marks (RAII, V2 frame / M8 block) ---
     FrameRecBase: array of Integer;

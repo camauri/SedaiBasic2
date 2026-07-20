@@ -1640,28 +1640,36 @@ begin
 end;
 
 procedure TBytecodeVM.FramePush(Ctx: TExecutionContext);
-// Snapshot the whole register banks onto the flat per-bank save stacks (one frame).
-// Counts are invariant during a run (banks are sized before execution), so bcReturnSub
-// pops exactly the same number of slots.
+// Snapshot the live part of each register bank onto the flat per-bank save stacks (one frame).
+// The saved width is Ctx.FrameSave*Count (the highest register index the program's bytecode
+// mentions, +1) rather than the whole 256-slot-floor bank: registers above that are never read
+// or written, so not saving them is unobservable - and it removes 256 refcounted string copies
+// per call, which dominated the SUB/FUNCTION call cost. The widths are invariant during a run,
+// so bcReturnSub pops exactly what was pushed.
 var
-  i: Integer;
+  i, NI, NF, NS: Integer;
 begin
+  // A non-positive width means "not measured for this context" (any path that runs bytecode
+  // without going through LoadProgram): fall back to the whole bank, the historical behaviour.
+  NI := Ctx.FrameSaveIntCount;    if (NI <= 0) or (NI > Ctx.IntRegCount) then NI := Ctx.IntRegCount;
+  NF := Ctx.FrameSaveFloatCount;  if (NF <= 0) or (NF > Ctx.FloatRegCount) then NF := Ctx.FloatRegCount;
+  NS := Ctx.FrameSaveStrCount;    if (NS <= 0) or (NS > Ctx.StringRegCount) then NS := Ctx.StringRegCount;
   // Grow save stacks if needed (defensive; usually sized once).
-  if Ctx.FrameSaveIntTop + Ctx.IntRegCount > Length(Ctx.FrameSaveInt) then
-    SetLength(Ctx.FrameSaveInt, Ctx.FrameSaveIntTop + Ctx.IntRegCount + 256);
-  if Ctx.FrameSaveFloatTop + Ctx.FloatRegCount > Length(Ctx.FrameSaveFloat) then
-    SetLength(Ctx.FrameSaveFloat, Ctx.FrameSaveFloatTop + Ctx.FloatRegCount + 256);
-  if Ctx.FrameSaveStrTop + Ctx.StringRegCount > Length(Ctx.FrameSaveStr) then
-    SetLength(Ctx.FrameSaveStr, Ctx.FrameSaveStrTop + Ctx.StringRegCount + 256);
-  for i := 0 to Ctx.IntRegCount - 1 do
+  if Ctx.FrameSaveIntTop + NI > Length(Ctx.FrameSaveInt) then
+    SetLength(Ctx.FrameSaveInt, Ctx.FrameSaveIntTop + NI + 256);
+  if Ctx.FrameSaveFloatTop + NF > Length(Ctx.FrameSaveFloat) then
+    SetLength(Ctx.FrameSaveFloat, Ctx.FrameSaveFloatTop + NF + 256);
+  if Ctx.FrameSaveStrTop + NS > Length(Ctx.FrameSaveStr) then
+    SetLength(Ctx.FrameSaveStr, Ctx.FrameSaveStrTop + NS + 256);
+  for i := 0 to NI - 1 do
     Ctx.FrameSaveInt[Ctx.FrameSaveIntTop + i] := Ctx.IntRegs[i];
-  Inc(Ctx.FrameSaveIntTop, Ctx.IntRegCount);
-  for i := 0 to Ctx.FloatRegCount - 1 do
+  Inc(Ctx.FrameSaveIntTop, NI);
+  for i := 0 to NF - 1 do
     Ctx.FrameSaveFloat[Ctx.FrameSaveFloatTop + i] := Ctx.FloatRegs[i];
-  Inc(Ctx.FrameSaveFloatTop, Ctx.FloatRegCount);
-  for i := 0 to Ctx.StringRegCount - 1 do
+  Inc(Ctx.FrameSaveFloatTop, NF);
+  for i := 0 to NS - 1 do
     Ctx.FrameSaveStr[Ctx.FrameSaveStrTop + i] := Ctx.StringRegs[i];
-  Inc(Ctx.FrameSaveStrTop, Ctx.StringRegCount);
+  Inc(Ctx.FrameSaveStrTop, NS);
   // RAII (V2): remember where this frame's record allocations begin.
   if Ctx.FrameRecBaseTop >= Length(Ctx.FrameRecBase) then
     SetLength(Ctx.FrameRecBase, Ctx.FrameRecBaseTop + 256);
@@ -1673,18 +1681,21 @@ begin
 end;
 
 procedure TBytecodeVM.FramePop(Ctx: TExecutionContext);
-// Restore the whole register banks from the top frame on the save stacks.
+// Restore the live part of each register bank from the top frame (same widths FramePush used).
 var
-  i: Integer;
+  i, NI, NF, NS: Integer;
 begin
-  Dec(Ctx.FrameSaveIntTop, Ctx.IntRegCount);
-  for i := 0 to Ctx.IntRegCount - 1 do
+  NI := Ctx.FrameSaveIntCount;    if (NI <= 0) or (NI > Ctx.IntRegCount) then NI := Ctx.IntRegCount;
+  NF := Ctx.FrameSaveFloatCount;  if (NF <= 0) or (NF > Ctx.FloatRegCount) then NF := Ctx.FloatRegCount;
+  NS := Ctx.FrameSaveStrCount;    if (NS <= 0) or (NS > Ctx.StringRegCount) then NS := Ctx.StringRegCount;
+  Dec(Ctx.FrameSaveIntTop, NI);
+  for i := 0 to NI - 1 do
     Ctx.IntRegs[i] := Ctx.FrameSaveInt[Ctx.FrameSaveIntTop + i];
-  Dec(Ctx.FrameSaveFloatTop, Ctx.FloatRegCount);
-  for i := 0 to Ctx.FloatRegCount - 1 do
+  Dec(Ctx.FrameSaveFloatTop, NF);
+  for i := 0 to NF - 1 do
     Ctx.FloatRegs[i] := Ctx.FrameSaveFloat[Ctx.FrameSaveFloatTop + i];
-  Dec(Ctx.FrameSaveStrTop, Ctx.StringRegCount);
-  for i := 0 to Ctx.StringRegCount - 1 do
+  Dec(Ctx.FrameSaveStrTop, NS);
+  for i := 0 to NS - 1 do
     Ctx.StringRegs[i] := Ctx.FrameSaveStr[Ctx.FrameSaveStrTop + i];
   // RAII (V2): release the records this frame allocated (locals/temporaries) by rolling the
   // high-water mark back. Slots become reusable by the next AllocRecord. A UDT result has already
@@ -2465,6 +2476,10 @@ begin
   WCtx.IntRegCount := FCtx.IntRegCount;
   WCtx.FloatRegCount := FCtx.FloatRegCount;
   WCtx.StringRegCount := FCtx.StringRegCount;
+  // A worker pushes/pops its own call frames, so it needs the same saved widths as the main context.
+  WCtx.FrameSaveIntCount := FCtx.FrameSaveIntCount;
+  WCtx.FrameSaveFloatCount := FCtx.FrameSaveFloatCount;
+  WCtx.FrameSaveStrCount := FCtx.FrameSaveStrCount;
   SetLength(WCtx.IntRegs, WCtx.IntRegCount);
   SetLength(WCtx.FloatRegs, WCtx.FloatRegCount);
   SetLength(WCtx.StringRegs, WCtx.StringRegCount);
@@ -3860,6 +3875,12 @@ begin
   if MaxStringReg >= 0 then
     EnsureRegisterCapacity(FCtx, srtString, MaxStringReg);
 
+  // Call frames only need to snapshot the registers the program can actually touch: the same
+  // scan that sized the banks gives the highest index per bank, and the banks keep their
+  // 256-slot floor. Saving the whole floor cost 256 refcounted string copies per call.
+  FCtx.FrameSaveIntCount := MaxIntReg + 1;
+  FCtx.FrameSaveFloatCount := MaxFloatReg + 1;
+  FCtx.FrameSaveStrCount := MaxStringReg + 1;
 end;
 
 procedure TBytecodeVM.ClearProgram;
