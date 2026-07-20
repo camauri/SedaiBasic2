@@ -8324,6 +8324,71 @@ var
       Result := 'STRING';
   end;
 
+  // Comma-separated continuation of a CONST list: ", name [As type] = value, ...". Shared by all three
+  // CONST spellings: the leading-AS form passes the list-wide type (a per-item AS is not part of that
+  // syntax), the name-first and bare forms allow a per-item AS and fall back to per-value bank inference
+  // when it is absent (fbc-verified: the type of one item does NOT carry over to the next). Without this
+  // the typed forms lowered only the FIRST constant and everything after the comma was re-parsed as a
+  // plain assignment (same defect the bare form had, m392).
+  procedure ParseConstListTail(DimNode: TASTNode; const ListTypeName: string; AllowItemType: Boolean);
+  var
+    ItemName, ItemTypeTok: TLexerToken;
+    ItemType: string;
+    ItemValue, Decl: TASTNode;
+  begin
+    while Context.Check(ttSeparParam) do
+    begin
+      Context.Advance;                                // ','
+      if not Context.Check(ttIdentifier) then
+      begin
+        HandleError('Expected constant name after "," in CONST list', Context.CurrentToken);
+        Exit;
+      end;
+      ItemName := Context.CurrentToken;
+      Context.Advance;                                // name
+      ItemType := '';
+      ItemTypeTok := ItemName;
+      if AllowItemType and Context.Check(ttAsType) then
+      begin
+        Context.Advance;                              // AS
+        ItemTypeTok := Context.CurrentToken;
+        ItemType := 'INTEGER';
+        if Context.Check(ttIdentifier) then
+        begin
+          ItemType := UpperCase(ParseDottedName);     // element type
+          // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
+          while (Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR')) or
+                Context.Check(ttOpMul) do
+          begin Context.Advance; ItemType := ItemType + ' PTR'; end;
+        end;
+      end;
+      if not Context.Match(ttOpEq) then
+      begin
+        HandleError('Expected "=" after CONST name', Context.CurrentToken);
+        Exit;
+      end;
+      ItemValue := ParseExpression;
+      if not Assigned(ItemValue) then
+      begin
+        HandleError('Expected value after CONST =', Context.CurrentToken);
+        Exit;
+      end;
+      if ItemType = '' then
+      begin
+        if ListTypeName <> '' then
+          ItemType := ListTypeName
+        else
+          ItemType := InferConstTypeName(ItemValue);
+      end;
+      Decl := TASTNode.Create(antArrayDecl, ItemName);
+      Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(ItemName.Value), ItemName));
+      Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, ItemType, ItemTypeTok));
+      Decl.AddChild(ItemValue);
+      if FModernMode then Decl.Attributes.Values['SHARED'] := '1';
+      DimNode.AddChild(Decl);
+    end;
+  end;
+
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antConst, Token);
@@ -8371,6 +8436,7 @@ begin
     if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';     // FB: a module-level CONST is globally visible
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
+    ParseConstListTail(Result, TypeName, False);      // "Const As T a = 1, b = 2, ...": T applies to the whole list
     DoNodeCreated(Result);
     Exit;
   end;
@@ -8413,6 +8479,7 @@ begin
     if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';     // FB: a module-level CONST is globally visible
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
+    ParseConstListTail(Result, '', True);             // "Const a As T = 1, b As U = 2, ...": per-item type or inference
     DoNodeCreated(Result);
     Exit;
   end;
@@ -8452,35 +8519,8 @@ begin
   // the first constant was left in the token stream and re-parsed as a PLAIN assignment — an untyped,
   // non-shared module variable: not constant, invisible inside procedures, and bank-inferred from the
   // NAME (float default) instead of the value, so "Const hb = Chr(205), vb = Chr(186)" left hb/vb as
-  // floats silently printing 0 (m392).
-  while Context.Check(ttSeparParam) do
-  begin
-    Context.Advance;                                  // ','
-    if not Context.Check(ttIdentifier) then
-    begin
-      HandleError('Expected constant name after "," in CONST list', Context.CurrentToken);
-      Break;
-    end;
-    NameTok := Context.CurrentToken;
-    Context.Advance;                                  // name
-    if not Context.Match(ttOpEq) then
-    begin
-      HandleError('Expected "=" after CONST name', Context.CurrentToken);
-      Break;
-    end;
-    ValueNode := ParseExpression;
-    if not Assigned(ValueNode) then
-    begin
-      HandleError('Expected value after CONST =', Context.CurrentToken);
-      Break;
-    end;
-    ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
-    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
-    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, InferConstTypeName(ValueNode), NameTok));
-    ArrayDecl.AddChild(ValueNode);
-    if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';
-    Result.AddChild(ArrayDecl);
-  end;
+  // floats silently printing 0 (m392). A later item may carry its own "As type" (form 1 of the syntax).
+  ParseConstListTail(Result, '', True);
   DoNodeCreated(Result);
 end;
 
