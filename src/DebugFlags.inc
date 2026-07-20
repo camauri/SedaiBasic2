@@ -99,6 +99,7 @@
 {.$DEFINE DEBUG_CLEANUP}
 {.$DEFINE DEBUG_CONSOLE}     // Interactive console (SDL2) debug
 {.$DEFINE DEBUG_AUDIO}      // Audio subsystem debug (WITH_SEDAI_AUDIO required)
+{.$DEFINE DEBUG_AOTTRACE}   // AOT: trace every runtime-helper call and native return (AOT_TRACE=1)
 
 { ============================================================================
   AUTO-ENABLE ALL FLAGS WHEN DEBUG_ALL IS SET
@@ -123,6 +124,7 @@
   {$DEFINE DEBUG_BYTECODE}
   {$DEFINE DEBUG_VM}
   {$DEFINE DEBUG_CLEANUP}
+  {$DEFINE DEBUG_AOTTRACE}
   {$DEFINE DEBUG_CONSOLE}
   {$DEFINE DEBUG_AUDIO}
 {$ENDIF}

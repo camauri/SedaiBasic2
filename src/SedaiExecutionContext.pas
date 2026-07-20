@@ -163,6 +163,11 @@ type
     // dispatch loop is sensitive enough to layout that not perturbing it is worth doing.)
     AotPendingExc: TObject;     // acquired exception object, owned until re-raised (nil = none)
     AotFaultPC: Integer;        // bytecode PC to resume/report at when a sentinel comes back
+    // Set by AotSettle immediately before it re-raises, consumed (and cleared) by the run
+    // loop's exception handler. Needed because that handler otherwise blames the PC the loop
+    // variable happens to hold - which, for an exception raised out of the AOT call site, is
+    // the region's ENTRY, not the instruction that failed. -1 = no AOT raise pending.
+    AotRaisePC: Integer;
   end;
 
 implementation

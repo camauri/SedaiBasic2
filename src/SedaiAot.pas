@@ -67,7 +67,12 @@ type
   // The one-instruction runtime helper (C3). Executes bytecode instruction PC on Ctx with the
   // interpreter's existing slow path and returns the next PC, or one of the sentinels above.
   // cdecl: emitted code follows the platform C ABI.
-  TAotExecOneFn = function(VMSelf, CtxObj: Pointer; PC: PtrInt): PtrInt; cdecl;
+  //
+  // AotCtx is the caller's own context record, passed back so the helper can REFRESH it: an
+  // instruction like DIM/REDIM/ERASE reallocates the array descriptor table, which would leave
+  // the pointer native code is holding stale (C4 - this is what made array programs read zeros
+  // once ssaArrayDim started going through the helper).
+  TAotExecOneFn = function(VMSelf, CtxObj: Pointer; PC: PtrInt; AotCtx: PAotCtx): PtrInt; cdecl;
 
   // A compiled function: same bank pointers as the loop JIT plus the AOT context in
   // the third argument register. Returns the bytecode PC where the interpreter
@@ -151,11 +156,6 @@ begin
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferStoreInt, ssaXferStoreFloat,
     ssaReturnSub, ssaEnd, ssaStop,
     ssaRecMarkPush, ssaRecMarkPop,
-    // C3: no native form, lowered to a runtime-helper call (see IsHelperOp).
-    ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
-    ssaPrintInt, ssaPrintIntLn, ssaPrintBool, ssaPrintUInt,
-    ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
-    ssaPrintEnd,
     // B2: 1-D int/float array element access + dim-0 bound queries (string-element
     // arrays are rejected by the classifier/prescan; multi-dim access goes through
     // ssaArrayIdxPush/Resolve, which are not in the set, so those regions bail).
@@ -166,26 +166,126 @@ begin
   end;
 end;
 
-// C3/C4: ops with no native lowering that are executed by calling back into the interpreter
-// (AotExecOne) for exactly one bytecode instruction. This is the list being grown one family
-// at a time until the bail disappears; it is deliberately NOT "everything not in IsB1Op",
-// because each family has to be validated (aot_validate full + the regression guards) before
-// it is trusted - see PIANO_B1_AOT_DESIGN §5.7, rollout order.
-//
-// PRINT first, per the plan: it is pure side effect (no result register), it cannot move the
-// PC, and it is the family whose output a bit-identical diff checks most directly. String
-// operands are fine precisely BECAUSE the helper reads the banks itself - native code never
-// holds a string register.
-function IsHelperOp(Op: TSSAOpCode): Boolean;
+{ ---- C4: which ops the runtime helper may run --------------------------------------------
+  C3 routed one hand-picked family (PRINT). C4 inverts the default: anything without a native
+  lowering goes to the helper, EXCEPT what is proven unable to survive the trip. The gate is
+  applied to the BYTECODE opcode, not the SSA opcode, because what actually runs is
+  ExecuteInstruction on one bytecode instruction - so the question "can this be executed by
+  the helper" has a precise answer that does not depend on guessing the lowering.
+
+  ⚠️ The reason a deny-list is even needed: ExecuteInstruction's group-0 `case` has NO `else`,
+  so an opcode it does not handle is a SILENT NO-OP, not an error. The list below was derived
+  mechanically - for every group, the opcodes declared in SedaiBytecodeTypes minus those named
+  in that group's handler - and it is exactly 24 opcodes:
+
+    * group 0 (18): threads, mutexes, condition variables (they need run-loop state the helper
+      has no access to), bcLoadProcAddr, the legacy bcLoadVar/bcStoreVar, bcStringToFloat/Int;
+    * group 3 (6): the TYPED array accessors, which live only in the interpreter's inline case.
+
+  Everything else - groups 1,2,4,5,6,7,10,11 and all 58 superinstructions - is fully covered by
+  ExecuteInstruction and its per-group handlers, verified the same way.
+
+  If this list ever drifts, the failure mode is a silent wrong answer, so re-derive it (not by
+  eye) whenever an opcode is added: compare the group's declarations against its handler. }
+function AotHelperUnsafeOp(BcOp: Word): Boolean;
 begin
-  case Op of
-    ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
-    ssaPrintInt, ssaPrintIntLn, ssaPrintBool, ssaPrintUInt,
-    ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
-    ssaPrintEnd:
+  case BcOp of
+    // Group 0: no handler in ExecuteInstruction -> would silently do nothing.
+    bcThreadCreate, bcThreadDetach, bcThreadSelf, bcThreadWait,
+    bcMutexCreate, bcMutexDestroy, bcMutexLock, bcMutexUnlock,
+    bcCondCreate, bcCondDestroy, bcCondSignal, bcCondBroadcast, bcCondWait,
+    bcLoadProcAddr, bcLoadVar, bcStoreVar, bcStringToFloat, bcStringToInt,
+    // Group 3: typed array accessors are handled only by the interpreter's inline case,
+    // not by ExecuteArrayOp.
+    bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
+    bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
+    // ⛔ Call and return: the two dispatchers store the return address with DIFFERENT
+    // conventions, and mixing them corrupts the call stack.
+    //   RunTemplate  pushes CurPC + 1 and returns to the popped value verbatim.
+    //   ExecuteInstruction pushes Ctx.PC and expects its caller to add 1 on return.
+    // Both are self-consistent; neither survives being paired with the other. A call pushed
+    // by the helper and returned from by the interpreter jumps back ONTO the call, which
+    // re-runs the whole callee - which is exactly what this cost to find. Routing them buys
+    // nothing anyway: the helper moves the PC, so native execution would deopt immediately.
+    // Native call sites are B3's job, not the helper's.
+    bcCall, bcReturn, bcCallSub, bcCallSubIndirect, bcReturnSub,
+    // ⛔ RESUME: the ONLY three handlers in ExecuteInstruction that set Ctx.PC and then return
+    // WITHOUT the usual "target - 1" convention ("Exit; // Don't increment PC"), so the
+    // helper's uniform "next PC = Ctx.PC + 1" is off by one for them. Worse, RunTemplate does
+    // not merely differ in convention: its RESUME NEXT resumes at the next BASIC LINE
+    // (FindPCAfterLine), a different semantic altogether. Error resumption stays interpreted.
+    bcResume, bcResumeNext, bcResumeLabel,
+    // ⛔ TRON/TROFF switch the VM between RunFast and RunDebug, which only the run loop can do
+    // (it breaks out and re-enters through the other one). ExecuteInstruction just flips the
+    // flag, so via the helper tracing would silently never engage.
+    bcTron, bcTroff,
+    // ⛔ The multi-dimensional index sequence: bcArrayIdxPush accumulates indices into VM
+    // state that a later Resolve consumes. That makes the sequence, not the instruction, the
+    // unit of correctness - and a helper call can hand control back to the interpreter in the
+    // middle of one (a moved PC, a sentinel), leaving a half-built index list that the
+    // interpreter then adds to, so Resolve linearises the wrong subscripts. Whole regions
+    // using runtime multi-dim indexing stay interpreted, as they did before C4.
+    bcArrayIdxPush, bcArrayIdxResolve, bcArrayIdxResolveInd:
       Result := True;
   else
     Result := False;
+  end;
+end;
+
+// Can this array op take the NATIVE path? It needs a compile-time array ref, and for element
+// access an int/float element bank (string elements are managed - interpreter only). Shared by
+// the classifier, the prescan and the emitter so the three cannot disagree about which
+// instructions are native; when it says no, the op falls back to the runtime helper.
+function AotArrayNativeOK(SSAProg: TSSAProgram; const Ins: TSSAInstruction): Boolean;
+begin
+  Result := False;
+  if (Ins.Src1.Kind <> svkArrayRef) or (Ins.Src1.ArrayIndex < 0) or
+     (Ins.Src1.ArrayIndex >= SSAProg.GetArrayCount) then Exit;
+  if ((Ins.OpCode = ssaArrayLoad) or (Ins.OpCode = ssaArrayStore)) and
+     (SSAProg.GetArray(Ins.Src1.ArrayIndex).ElementType = srtString) then Exit;
+  // ⚠️ ONE DIMENSION ONLY. The descriptor carries the element COUNT, not per-dimension
+  // extents, so the bound lowering computes UBound = LBound + Count - 1 - true for a vector,
+  // nonsense for a matrix (DIM m(3,4) would answer 19 instead of 3).
+  //
+  // This was a latent bug in the B2 lowering, not something C4 introduced: it simply could
+  // never fire while every region holding a multi-dim array bailed for some other reason.
+  // Widening the compiled set is what exposed it, and the same will be true of the next ones.
+  if SSAProg.GetArray(Ins.Src1.ArrayIndex).DimCount <> 1 then Exit;
+  Result := True;
+end;
+
+// Is this SSA op one the AOT lowers natively? Combines the op set with the per-op shape
+// conditions, so callers get a single yes/no and the helper picks up everything else.
+function AotIsNative(SSAProg: TSSAProgram; const Ins: TSSAInstruction): Boolean;
+begin
+  Result := IsB1Op(Ins.OpCode);
+  if Result and ((Ins.OpCode = ssaArrayLoad) or (Ins.OpCode = ssaArrayStore) or
+                 (Ins.OpCode = ssaArrayLBound) or (Ins.OpCode = ssaArrayUBound)) then
+    Result := AotArrayNativeOK(SSAProg, Ins);
+end;
+
+// Can SSA ordinal AOrd be handed to the helper? Three conditions, all conservative:
+// it emitted bytecode at all; it emitted EXACTLY ONE instruction (the helper runs one, so a
+// 1:N lowering would silently skip N-1); and that instruction is one the helper can execute.
+// Ordinals that emit nothing (labels, nops) map to -1 and are skipped when looking ahead.
+function AotHelperRoutable(Prog: TBytecodeProgram; AOrd: Integer): Boolean;
+type
+  PInstr = ^TBytecodeInstruction;
+var
+  apc, q, nxt: Integer;
+  Instrs: PInstr;
+begin
+  Result := False;
+  if Prog = nil then Exit;
+  apc := Prog.GetSsaPc(AOrd);
+  if apc < 0 then Exit;
+  Instrs := PInstr(Prog.GetInstructionsPtr);
+  if (Instrs = nil) or (apc >= Prog.GetInstructionCount) then Exit;
+  if AotHelperUnsafeOp(Instrs[apc].OpCode) then Exit;
+  for q := AOrd + 1 to AOrd + 64 do
+  begin
+    nxt := Prog.GetSsaPc(q);
+    if nxt >= 0 then Exit(nxt = apc + 1);
   end;
 end;
 
@@ -293,38 +393,25 @@ begin
             Regions[r].EligibleNoCalls := False;
           if Regions[r].Eligible then
           begin
-            if not IsB1Op(Instr.OpCode) then
-            begin
-              Regions[r].Eligible := False;
-              Regions[r].BailReason := OpName(Instr.OpCode);
-            end
-            // A jump leaving the region means the region is not a self-contained
-            // function (interleaved code, computed flow): not compilable as a unit.
-            else if ((Instr.OpCode = ssaJump) or (Instr.OpCode = ssaJumpIfZero) or
-                     (Instr.OpCode = ssaJumpIfNotZero)) and
-                    (Instr.Dest.Kind = svkLabel) and
-                    (RegionLabels.IndexOf(Instr.Dest.LabelName) < 0) then
+            // A jump leaving the region means the region is not a self-contained function
+            // (interleaved code, computed flow): still a hard bail. The helper could in
+            // principle run it and deopt at the target, but the native lowering for jumps is
+            // block-relative and would have to be bypassed per-instruction - not this stage.
+            if ((Instr.OpCode = ssaJump) or (Instr.OpCode = ssaJumpIfZero) or
+                (Instr.OpCode = ssaJumpIfNotZero)) and
+               (Instr.Dest.Kind = svkLabel) and
+               (RegionLabels.IndexOf(Instr.Dest.LabelName) < 0) then
             begin
               Regions[r].Eligible := False;
               Regions[r].BailReason := 'jump-out:' + Instr.Dest.LabelName;
             end
-            // B2 array ops: the id must be a compile-time array ref and the element bank
-            // int/float (string elements are managed - interpreter only).
-            else if (Instr.OpCode = ssaArrayLoad) or (Instr.OpCode = ssaArrayStore) or
-                    (Instr.OpCode = ssaArrayLBound) or (Instr.OpCode = ssaArrayUBound) then
+            // C4: no native lowering is no longer a bail - it becomes a runtime-helper call,
+            // provided the helper can actually run that bytecode instruction. Only what fails
+            // BOTH paths still takes the whole region down.
+            else if not (AotIsNative(SSAProg, Instr) or AotHelperRoutable(Prog, o)) then
             begin
-              if (Instr.Src1.Kind <> svkArrayRef) or (Instr.Src1.ArrayIndex < 0) or
-                 (Instr.Src1.ArrayIndex >= SSAProg.GetArrayCount) then
-              begin
-                Regions[r].Eligible := False;
-                Regions[r].BailReason := 'array-shape:' + OpName(Instr.OpCode);
-              end
-              else if ((Instr.OpCode = ssaArrayLoad) or (Instr.OpCode = ssaArrayStore)) and
-                      (SSAProg.GetArray(Instr.Src1.ArrayIndex).ElementType = srtString) then
-              begin
-                Regions[r].Eligible := False;
-                Regions[r].BailReason := 'string-array';
-              end;
+              Regions[r].Eligible := False;
+              Regions[r].BailReason := OpName(Instr.OpCode);
             end;
           end;
           Inc(o);
@@ -772,23 +859,6 @@ var
     end;
   end;
 
-  // True when SSA ordinal AOrd emitted exactly one bytecode instruction, which is the
-  // precondition for handing it to AotExecOne (the helper runs one). Ordinals that emit
-  // nothing (labels, nops) map to -1 and are skipped: what decides is the next ordinal that
-  // DID emit. Conservative - "cannot tell" is a bail, never an assumption.
-  function LowersOneToOne(AOrd: Integer): Boolean;
-  var apc, q, nxt: Integer;
-  begin
-    Result := False;
-    apc := Prog.GetSsaPc(AOrd);
-    if apc < 0 then Exit;
-    for q := AOrd + 1 to AOrd + 64 do
-    begin
-      nxt := Prog.GetSsaPc(q);
-      if nxt >= 0 then Exit(nxt = apc + 1);
-    end;
-  end;
-
   // Call AotExecOne for the bytecode instruction at apc, then decide whether native
   // execution may continue.
   //
@@ -809,9 +879,11 @@ var
     for k := 0 to NFAlloc - 1 do
       E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
 
-    // 2. Arguments, read from the ctx record BEFORE r8 is clobbered (it is an argument
-    //    register on Win64 and volatile on both ABIs).
-    E.MemOp([$49, $8B], RAX, R8, AOTCTX_EXECONE);                 // rax = ctx.ExecOne
+    // 2. Arguments, all read from the ctx record BEFORE r8 is clobbered - it is an argument
+    //    register on Win64 (arg2) and volatile on both ABIs. arg3 is the ctx record itself, so
+    //    the helper can refresh the array descriptor pointer we re-read in step 4.
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_EXECONE);                 // rax  = ctx.ExecOne
+    MovRR(ABI_ARG3, R8);                                          // arg3 = ctx
     E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);             // arg0 = ctx.VMSelf
     E.MemOp([$49, $8B], ABI_ARG1, R8, AOTCTX_CTXOBJ);             // arg1 = ctx.CtxObj
     if ABI_ARG2 >= 8 then E.Emit8($49) else E.Emit8($48);         // arg2 = apc (sign-extended)
@@ -1165,6 +1237,22 @@ var
         else Fail('string-operand');
       end;
     end;
+    // C4: this instruction will be a runtime-helper call. Operands are deliberately NOT
+    // counted - the helper reads and writes them in the banks, so pinning them to a machine
+    // register would only add a flush/reload, and it is what lets STRING operands through at
+    // all (CountVal rejects those outright).
+    procedure NoteHelperOp;
+    begin
+      if not AotHelperRoutable(Prog, o) then
+        Fail('helper:' + OpName(Ins.OpCode))
+      else
+      begin
+        HasHelperCall := True;
+        // A helper call can hand the rest of the invocation back to the interpreter (a moved
+        // PC or a sentinel), so it carries a deopt's hazard and obeys the same rules.
+        HasDeopt := True;
+      end;
+    end;
   begin
     o := Region.FirstOrdinal;
     for b := Region.FirstBlock to Region.LastBlock do
@@ -1201,10 +1289,9 @@ var
           ssaNarrowInt: begin CountVal(Ins.Dest); CountVal(Ins.Src1); end;
           ssaArrayLoad, ssaArrayStore:
           begin
-            if (Ins.Src1.Kind <> svkArrayRef) or (Ins.Src1.ArrayIndex < 0) or
-               (Ins.Src1.ArrayIndex >= SSAProg.GetArrayCount) then Fail('array-shape')
-            else if SSAProg.GetArray(Ins.Src1.ArrayIndex).ElementType = srtString then
-              Fail('string-array')
+            // A shape the native path cannot take (computed array ref, string elements) is no
+            // longer fatal: it falls back to the helper like any other non-native op.
+            if not AotIsNative(SSAProg, Ins) then NoteHelperOp
             else
             begin
               if ArrClassic then
@@ -1219,28 +1306,6 @@ var
               Inc(AUse[Ins.Src1.ArrayIndex]);
             end;
           end;
-          ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
-          ssaPrintInt, ssaPrintIntLn, ssaPrintBool, ssaPrintUInt,
-          ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
-          ssaPrintEnd:
-          begin
-            // C3 helper call. Operands are deliberately NOT counted: the helper reads them
-            // from the banks, so holding them in a machine register would only cost a
-            // flush/reload - and it is what lets a string operand through at all (CountVal
-            // fails those). Two things must hold for the call to be legal:
-            if Prog.GetSsaPc(o) < 0 then Fail('no-pc-helper:' + OpName(Ins.OpCode))
-            // ...and the op must lower to EXACTLY ONE bytecode instruction, because the
-            // helper runs exactly one. A 1:N lowering would silently skip the rest.
-            else if not LowersOneToOne(o) then Fail('helper-not-1to1:' + OpName(Ins.OpCode))
-            else
-            begin
-              HasHelperCall := True;
-              // A helper call can hand the rest of the invocation to the interpreter (moved
-              // PC or a sentinel), so it carries the same hazard as a deopt and must obey the
-              // same rule: skipped RecMark pushes would unbalance the record-mark stack.
-              HasDeopt := True;
-            end;
-          end;
           ssaArrayLBound, ssaArrayUBound:
           begin
             HasDeopt := True;                       // dim <> 0 deopts even in MODERN
@@ -1249,12 +1314,15 @@ var
             if Ins.Src2.Kind = svkRegister then CountVal(Ins.Src2);
           end;
         else
+          if AotIsNative(SSAProg, Ins) then
           begin
             CountVal(Ins.Dest);
             if Ins.Src1.Kind = svkRegister then CountVal(Ins.Src1);
             if Ins.Src2.Kind = svkRegister then CountVal(Ins.Src2);
             if Ins.Src3.Kind = svkRegister then CountVal(Ins.Src3);
-          end;
+          end
+          else
+            NoteHelperOp;
         end;
         if not OK then Exit;
         Inc(o);
@@ -1338,19 +1406,22 @@ var
       p1: Integer;
       bits: Int64;
   begin
+    // C4: anything the native path does not cover becomes ONE runtime-helper call. Deciding
+    // it here, before the case, keeps a single entry point for the fallback - so an op with a
+    // native form that its operands do not fit (a string-element array, a computed array ref)
+    // takes the same road as an op with no native form at all. Prescan agreed already, using
+    // the same two predicates; the Fail is defence, not a path.
+    if not AotIsNative(SSAProg, Cur) then
+    begin
+      if not AotHelperRoutable(Prog, CurOrd) then
+      begin Fail('helper:' + OpName(Cur.OpCode)); Exit; end;
+      apc := NeedPC; if not OK then Exit;
+      EmitHelperCall(apc);
+      Exit;
+    end;
     case Cur.OpCode of
       ssaLabel, ssaNop, ssaRecMarkPush, ssaRecMarkPop: ;
 
-      // C3: no native lowering - hand this one bytecode instruction to the interpreter.
-      // Prescan already established the PC exists and the lowering is 1:1.
-      ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
-      ssaPrintInt, ssaPrintIntLn, ssaPrintBool, ssaPrintUInt,
-      ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
-      ssaPrintEnd:
-      begin
-        apc := NeedPC; if not OK then Exit;
-        EmitHelperCall(apc);
-      end;
 
       ssaLoadConstInt:
       begin
@@ -1579,6 +1650,8 @@ var
         ExitTo(apc);   // interpreter executes the bcReturnSub/bcEnd itself (FramePop etc.)
       end;
     else
+      // Unreachable: IsB1Op and this case list are the same set, and everything else was
+      // routed to the helper above.
       Fail('op:' + OpName(Cur.OpCode));
     end;
   end;

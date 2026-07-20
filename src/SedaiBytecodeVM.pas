@@ -23,9 +23,14 @@ unit SedaiBytecodeVM;
 
 {$mode ObjFPC}{$H+}
 // The dispatch loop is alignment-fragile: unrelated code growth elsewhere in the binary
-// moved n-body by 14% (measured, C3). Pin the alignment so timings reflect the code, not
-// where the linker happened to place it.
-{$CODEALIGN PROC=64,LOOP=32,JUMP=16}
+// moves n-body several % with no change to what the loop executes (C3: 14%; C4: 5%). Pinning
+// the alignment makes timings reflect the code rather than where the linker placed it.
+// LOOP=128 was tuned on n-body: the interpreter improves monotonically 32->64->128 (C4 delta
+// vs C3 5.3%->3.6%->2.8%) and plateaus at 128 (256 is within noise, more padding). It does NOT
+// fully close the gap - RunFast is a genuinely different-sized procedure once the AOT helper
+// machinery grows, so its loop lands at different offsets. Closing it for good needs the
+// dispatch loop in its own unit; see PIANO_B1_AOT_DESIGN §5.8.
+{$CODEALIGN PROC=64,LOOP=128,JUMP=16}
 {$interfaces CORBA}
 {$codepage UTF8}
 {$I ConfigFlags.inc}
@@ -5824,7 +5829,7 @@ end;
 
   Emitted code reaches it through TAotCtx.ExecOne - never a baked address, so a worker
   thread running the same compiled function passes its own VM/context pair. }
-function AotExecOne(VMSelf, CtxObj: Pointer; PC: PtrInt): PtrInt; cdecl;
+function AotExecOne(VMSelf, CtxObj: Pointer; PC: PtrInt; AotCtx: PAotCtx): PtrInt; cdecl;
 type
   PInstr = ^TBytecodeInstruction;
 var
@@ -5835,7 +5840,27 @@ begin
   C := TExecutionContext(CtxObj);
   try
     C.PC := PC;
+    {$IFDEF DEBUG_AOTTRACE}
+    // build.ps1 -Target sb -DebugFlags AOTTRACE, then AOT_TRACE=1 at runtime. Compiled out
+    // otherwise: this unit's code size is not free, it moves the dispatch loop around
+    // (see PIANO_B1_AOT_DESIGN §5.7).
+    if GetEnvironmentVariable('AOT_TRACE') <> '' then
+      WriteLn(ErrOutput, '[AOT] helper PC=', PC, ' op=$',
+              IntToHex(PInstr(VM.FProgram.GetInstructionsPtr)[PC].OpCode, 4));
+    {$ENDIF}
     VM.ExecuteInstruction(C, PInstr(VM.FProgram.GetInstructionsPtr)[PC]);
+    // Refresh what the instruction may have invalidated underneath the caller. DIM/REDIM/ERASE
+    // rebuild the array descriptor table and can move it, and native code caches element base
+    // pointers read from it - so the table is rebuilt here, while we are on an interpreter
+    // frame, and the pointer is handed back through the context the caller re-reads after the
+    // call. (The register banks need no such care: they are sized once by LoadProgram and
+    // never reallocated during a run, so rbx/rsi stay valid.)
+    if AotCtx <> nil then
+    begin
+      if VM.FArraysDirty then VM.RebuildJitArrDesc;
+      if Length(VM.FJitArrDesc) > 0 then AotCtx^.ArrDesc := @VM.FJitArrDesc[0]
+      else AotCtx^.ArrDesc := nil;
+    end;
     // A handler that clears Running (CTRL+C, quit, a failed ASSERT) must stop the run loop,
     // not just this instruction - native code cannot do that, so bounce out to the interpreter.
     if not C.Running then
@@ -5866,6 +5891,10 @@ function TBytecodeVM.AotSettle(C: TExecutionContext; R: PtrInt): Integer;
 var
   E: TObject;
 begin
+  {$IFDEF DEBUG_AOTTRACE}
+  if GetEnvironmentVariable('AOT_TRACE') <> '' then
+    WriteLn(ErrOutput, '[AOT] native returned ', R);
+  {$ENDIF}
   if R >= 0 then Exit(Integer(R));
   Result := C.AotFaultPC;
   C.PC := Result;
@@ -5873,6 +5902,9 @@ begin
   begin
     E := C.AotPendingExc;
     C.AotPendingExc := nil;
+    // Tell the run loop's handler which instruction actually failed: from its point of view
+    // the raise comes out of the AOT call site, whose CurPC is the region entry.
+    C.AotRaisePC := Result;
     if E <> nil then raise E;
     // Sentinel with nothing parked: cannot happen, but resuming beats raising nil.
     Exit;
@@ -7066,6 +7098,15 @@ var
   PtrOffset, RecSlot: Integer;
   Rec: PRecordStorage;
 begin
+  // This is the COLD array path - DIM/REDIM/ERASE/BIND and friends, any of which can resize or
+  // move an array's backing store; the hot typed accessors never come through here. So the
+  // JIT/AOT descriptor table must be rebuilt before the next compiled code reads it.
+  //
+  // Marked HERE rather than only at the interpreter's call site, which is where it used to
+  // live: with the AOT runtime helper there is now a second caller, and a flag set by one
+  // caller is a semantic the other silently loses. It cost a real bug to learn - compiled code
+  // kept reading the pre-DIM descriptor and every array element came back 0.
+  FArraysDirty := True;
   SubOp := Instr.OpCode and $FF;
   case SubOp of
     0: // bcArrayLoad (generic, deprecated)

@@ -93,6 +93,7 @@ begin
   // PC of the SUB it runs (StartPC set in RunWorker), with a synthetic call frame already primed.
   if Ctx.StartPC >= 0 then CurPC := Ctx.StartPC else CurPC := FProgram.EntryPoint;
   Ctx.Running := True;  // Mark VM as running
+  Ctx.AotRaisePC := -1; // no AOT-raised exception pending (0 would read as "PC 0")
   // M5.3: the main thread is the render owner (only it may touch the SDL device). A worker
   // (GActiveCtx <> nil) must never steal ownership; its graphics ops defer to the owner's draw queue.
   if GActiveCtx = nil then
@@ -529,9 +530,10 @@ begin
           Inc(CurPC);
         end;
       DENSE_ARRAY_BASE + 0 .. DENSE_ARRAY_BASE + 2, DENSE_ARRAY_BASE + 9 .. DENSE_ARRAY_BASE + 49:
-        // The cold array ops (DIM/REDIM/ERASE/BIND/...) may resize or move an array's backing store, so
-        // the JIT's array descriptor must be rebuilt before the next compiled loop reads it.
-        begin Ctx.PC := CurPC; ExecuteArrayOp(Ctx, Instr); FArraysDirty := True; CurPC := Ctx.PC + 1; end;
+        // Cold array ops (DIM/REDIM/ERASE/BIND/...) may resize or move an array's backing store; the
+        // descriptor rebuild is triggered inside ExecuteArrayOp itself (it has two callers now - here
+        // and the AOT helper - so the flag lives with the op, not the call site).
+        begin Ctx.PC := CurPC; ExecuteArrayOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
       DENSE_IO_BASE + 0 .. DENSE_IO_BASE + 22:
         begin Ctx.PC := CurPC; ExecuteIOOp(Ctx, Instr); if not Ctx.Running then Break; CurPC := Ctx.PC + 1; end;
       DENSE_SPECIAL_BASE + 0 .. DENSE_SPECIAL_BASE + 16:
@@ -1288,6 +1290,20 @@ begin
   except
     on E: Exception do
     begin
+      // Ctx.PC is not maintained instruction by instruction during fast dispatch - it holds
+      // whatever the last thing that synced it left there - but it IS what the host reads to
+      // report an error ("ERROR during VM execution at PC="). Point it at the instruction that
+      // actually raised, so the report names the culprit rather than the last slow-path op that
+      // happened to write the field. Without this the reported PC is incidental, and an AOT
+      // helper call (which syncs Ctx.PC at its own instruction) reports a different one from
+      // the interpreter for the very same error. An exception re-raised out of the AOT call
+      // site names its own culprit, since CurPC there is only the region entry.
+      if Ctx.AotRaisePC >= 0 then
+      begin
+        CurPC := Ctx.AotRaisePC;
+        Ctx.AotRaisePC := -1;
+      end;
+      Ctx.PC := CurPC;
       // Check if a TRAP handler is set and we're not already in an error handler
       // (to prevent infinite recursion if exception occurs during error handling).
       // TrapLine > 0: classic line-number handler (TRAP / ON ERROR GOTO <line>).
