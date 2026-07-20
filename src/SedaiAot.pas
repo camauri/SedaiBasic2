@@ -76,6 +76,12 @@ function AotSliceAndClassify(SSAProg: TSSAProgram; Prog: TBytecodeProgram): TAot
 // AOT_DIAG=1 printout: per-region verdict + summary + map cross-check warnings.
 procedure AotSurvey(SSAProg: TSSAProgram; Prog: TBytecodeProgram);
 
+// Diagnostics from the last region compiled (liveness, C1). Not thread-safe; reporting only.
+var
+  AotDiagPeakLiveInt: Integer = 0;
+  AotDiagPeakLiveFloat: Integer = 0;
+  AotDiagLivenessOK: Boolean = False;
+
 // Compile every eligible region to native code (B1a: static frequency register
 // assignment, deopt only for trapping ops). TrueVal is the VM's TRUE (-1);
 // the dialect comes from Prog.ModernMode. AllowUnsafe = MODERN and no forced
@@ -373,6 +379,8 @@ var
   OK: Boolean;
   HasRecMark, HasDeopt: Boolean;
   ArrClassic: Boolean;                  // array OOB raises (CLASSIC / --bounds-check) -> guard + deopt
+  LivenessOK: Boolean;                  // C1: the liveness fixpoint converged
+  PeakLiveInt, PeakLiveFloat: Integer;  // C1: peak simultaneously-live values per bank
   Cur: TSSAInstruction;
   CurOrd: Integer;                      // ordinal of Cur (indexes the SSA->PC map)
   LabelIdx: TStringList;                // region-local label -> block-list index
@@ -799,6 +807,153 @@ var
   end;
 
   { --- prescan: usage counts, deopt needs, structural checks --- }
+  { --- C1: liveness (PIANO_B1_AOT_DESIGN section 5.3) ---------------------------------
+    Backward dataflow over the region's CFG, per bank, on FINAL register indexes:
+      live_out(B) = union of live_in(S) for every successor S inside the region
+      live_in(B)  = use(B) + (live_out(B) - def(B))
+    Iterated to a fixpoint over blocks in reverse region order (a couple of passes for
+    reducible loops). What it is FOR: knowing which values are live ACROSS a call site,
+    so that when unsupported ops become runtime-helper calls we spill only those - the
+    same rule on Win64 and SysV, where the volatile-register sets differ but the question
+    ("what survives the call?") does not. It is also the base the linear-scan allocator,
+    native calls and range analysis all need. Computed here, not yet consumed: this pass
+    must not change a single emitted byte. --------------------------------------------- }
+  procedure ComputeLiveness;
+  var
+    nb, bi, k, pass, si, r2: Integer;
+    Blk, Succ: TSSABasicBlock;
+    Ins: TSSAInstruction;
+    Changed: Boolean;
+    // Per region-relative block index: bitsets as plain boolean arrays (register counts are
+    // small - MAX_*_REGS is 32/32/16 before compaction, and post-compaction indexes are dense).
+    UseI, DefI, InI, OutI: array of array of Boolean;
+    UseF, DefF, InF, OutF: array of array of Boolean;
+
+    function RegionIdx(B: TSSABasicBlock): Integer;   // -1 = outside this region
+    var q: Integer;
+    begin
+      Result := -1;
+      for q := Region.FirstBlock to Region.LastBlock do
+        if SSAProg.Blocks[q] = B then Exit(q - Region.FirstBlock);
+    end;
+    // An operand READ: a use, unless the same instruction already defined it in this block.
+    procedure MarkUse(const V: TSSAValue);
+    var r: Integer;
+    begin
+      if V.Kind <> svkRegister then Exit;
+      if V.RegType = srtInt then
+      begin
+        r := Prog.AotRemapIntReg(V.RegIndex);
+        if (r >= 0) and (r <= MaxIReg) and not DefI[bi][r] then UseI[bi][r] := True;
+      end
+      else if V.RegType = srtFloat then
+      begin
+        r := Prog.AotRemapFloatReg(V.RegIndex);
+        if (r >= 0) and (r <= MaxFReg) and not DefF[bi][r] then UseF[bi][r] := True;
+      end;
+    end;
+    procedure MarkDef(const V: TSSAValue);
+    var r: Integer;
+    begin
+      if V.Kind <> svkRegister then Exit;
+      if V.RegType = srtInt then
+      begin
+        r := Prog.AotRemapIntReg(V.RegIndex);
+        if (r >= 0) and (r <= MaxIReg) then DefI[bi][r] := True;
+      end
+      else if V.RegType = srtFloat then
+      begin
+        r := Prog.AotRemapFloatReg(V.RegIndex);
+        if (r >= 0) and (r <= MaxFReg) then DefF[bi][r] := True;
+      end;
+    end;
+  begin
+    nb := Region.LastBlock - Region.FirstBlock + 1;
+    if (nb <= 0) or (MaxIReg < 0) and (MaxFReg < 0) then Exit;
+    SetLength(UseI, nb); SetLength(DefI, nb); SetLength(InI, nb); SetLength(OutI, nb);
+    SetLength(UseF, nb); SetLength(DefF, nb); SetLength(InF, nb); SetLength(OutF, nb);
+    for k := 0 to nb - 1 do
+    begin
+      SetLength(UseI[k], MaxIReg + 1); SetLength(DefI[k], MaxIReg + 1);
+      SetLength(InI[k], MaxIReg + 1);  SetLength(OutI[k], MaxIReg + 1);
+      SetLength(UseF[k], MaxFReg + 1); SetLength(DefF[k], MaxFReg + 1);
+      SetLength(InF[k], MaxFReg + 1);  SetLength(OutF[k], MaxFReg + 1);
+    end;
+
+    // Local use/def per block, in program order.
+    for bi := 0 to nb - 1 do
+    begin
+      Blk := SSAProg.Blocks[Region.FirstBlock + bi];
+      for k := 0 to Blk.Instructions.Count - 1 do
+      begin
+        Ins := Blk.Instructions[k];
+        // Reads first, then the definition: a self-referencing "d := d + 1" is a use AND a def.
+        MarkUse(Ins.Src1); MarkUse(Ins.Src2); MarkUse(Ins.Src3);
+        // These opcodes carry a USE in Dest, not a definition (the canonical exception list -
+        // SedaiSSAConstruction: array stores and prints read Dest).
+        if (Ins.OpCode = ssaArrayStore) or (Ins.OpCode = ssaPrint) or (Ins.OpCode = ssaPrintLn) or
+           (Ins.OpCode = ssaXferStoreInt) or (Ins.OpCode = ssaXferStoreFloat) then
+          MarkUse(Ins.Dest)
+        else
+          MarkDef(Ins.Dest);
+      end;
+    end;
+
+    // Backward fixpoint.
+    pass := 0;
+    repeat
+      Changed := False;
+      Inc(pass);
+      for bi := nb - 1 downto 0 do
+      begin
+        Blk := SSAProg.Blocks[Region.FirstBlock + bi];
+        // out = union of successors' in. A successor outside the region is an exit and
+        // contributes nothing, which is correct: the epilogue flushes every allocated
+        // register to the banks before leaving.
+        for si := 0 to Blk.Successors.Count - 1 do
+        begin
+          Succ := TSSABasicBlock(Blk.Successors[si]);
+          k := RegionIdx(Succ);
+          if k < 0 then System.Continue;
+          for r2 := 0 to MaxIReg do
+            if InI[k][r2] and not OutI[bi][r2] then begin OutI[bi][r2] := True; Changed := True; end;
+          for r2 := 0 to MaxFReg do
+            if InF[k][r2] and not OutF[bi][r2] then begin OutF[bi][r2] := True; Changed := True; end;
+        end;
+        for r2 := 0 to MaxIReg do
+          if (UseI[bi][r2] or (OutI[bi][r2] and not DefI[bi][r2])) and not InI[bi][r2] then
+          begin InI[bi][r2] := True; Changed := True; end;
+        for r2 := 0 to MaxFReg do
+          if (UseF[bi][r2] or (OutF[bi][r2] and not DefF[bi][r2])) and not InF[bi][r2] then
+          begin InF[bi][r2] := True; Changed := True; end;
+      end;
+    until (not Changed) or (pass > nb + 2);
+    LivenessOK := pass <= nb + 2;
+
+    // Register pressure: the peak number of simultaneously live values per bank. It is the
+    // number the allocator and the future helper-call spill logic both care about, and it is
+    // a checkable output of the dataflow (0 would mean the pass did nothing).
+    PeakLiveInt := 0; PeakLiveFloat := 0;
+    for bi := 0 to nb - 1 do
+    begin
+      k := 0;
+      for r2 := 0 to MaxIReg do if InI[bi][r2] then Inc(k);
+      if k > PeakLiveInt then PeakLiveInt := k;
+      k := 0;
+      for r2 := 0 to MaxIReg do if OutI[bi][r2] then Inc(k);
+      if k > PeakLiveInt then PeakLiveInt := k;
+      k := 0;
+      for r2 := 0 to MaxFReg do if InF[bi][r2] then Inc(k);
+      if k > PeakLiveFloat then PeakLiveFloat := k;
+      k := 0;
+      for r2 := 0 to MaxFReg do if OutF[bi][r2] then Inc(k);
+      if k > PeakLiveFloat then PeakLiveFloat := k;
+    end;
+    AotDiagPeakLiveInt := PeakLiveInt;
+    AotDiagPeakLiveFloat := PeakLiveFloat;
+    AotDiagLivenessOK := LivenessOK;
+  end;
+
   procedure Prescan;
   var
     b, j, o: Integer;
@@ -1235,6 +1390,11 @@ begin
   Prescan;
   if not OK then Exit;
 
+  // C1: liveness. Computed here, consumed from C3 on (helper-call spilling) - it must not
+  // change a single emitted byte today.
+  LivenessOK := False; PeakLiveInt := 0; PeakLiveFloat := 0;
+  ComputeLiveness;
+
   SetLength(ILoc, MaxIReg + 1); for k := 0 to MaxIReg do ILoc[k] := -1;
   SetLength(FLoc, MaxFReg + 1); for k := 0 to MaxFReg do FLoc[k] := -1;
   SetLength(IAllocd, Length(IntPool)); SetLength(FAllocd, 6);
@@ -1368,7 +1528,10 @@ begin
       Result[n].Mem := Mem;
       Inc(n);
       if Diag then
-        WriteLn(ErrOutput, Format('[AOT] compiled %-24s entryPC=%d', [Regions[r].Name, Regions[r].EntryPC]));
+        WriteLn(ErrOutput, Format('[AOT] compiled %-24s entryPC=%-6d liveness=%s peakLive int=%d float=%d',
+                                  [Regions[r].Name, Regions[r].EntryPC,
+                                   BoolToStr(AotDiagLivenessOK, 'ok', 'NOT-CONVERGED'),
+                                   AotDiagPeakLiveInt, AotDiagPeakLiveFloat]));
     end
     else if Diag then
       WriteLn(ErrOutput, Format('[AOT] compile-bail %-20s (%s)', [Regions[r].Name, Why]));
