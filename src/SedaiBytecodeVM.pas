@@ -5876,6 +5876,31 @@ begin
   end;
 end;
 
+{ AotStrCmp (C5): the leaf primitive the AOT calls for bcCmp*String instead of routing the whole
+  instruction through AotExecOne. a and b are the two StringRegs slot VALUES (AnsiString data
+  pointers or nil), read natively from the bank by the emitted code; Kind selects the relation
+  (0=Eq 1=Ne 2=Lt 3=Gt - Le/Ge do not exist here, the parser rewrites them to Gt/Lt with the
+  operands swapped). Returns 1/0, which the native code turns into TrueVal/0.
+
+  The params are Pointer, not string: a hard AnsiString typecast reinterprets the pointer without
+  creating a managed temporary, so nothing is incref'd or decref'd - the comparison only reads the
+  bytes, exactly as the interpreter's `StringRegs[i] = StringRegs[j]` does. cdecl to match the
+  emitted call site; this is a global function (same address for every worker), reached through
+  TAotCtx.StrCmp like the other primitives so no address is ever baked into the code. }
+function AotStrCmp(a, b: Pointer; Kind: PtrInt): PtrInt; cdecl;
+var r: Boolean;
+begin
+  case Kind of
+    0: r := AnsiString(a) =  AnsiString(b);
+    1: r := AnsiString(a) <> AnsiString(b);
+    2: r := AnsiString(a) <  AnsiString(b);
+    3: r := AnsiString(a) >  AnsiString(b);
+  else
+    r := False;
+  end;
+  if r then Result := 1 else Result := 0;
+end;
+
 { Resolve what a compiled AOT function returned (C3). Normally that is just the resume PC and
   this is a compare and a return; the two negative sentinels mean a runtime helper hit
   something native code cannot finish.

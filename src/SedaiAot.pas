@@ -42,6 +42,12 @@ type
     ExecOne: Pointer;    // offset 24: @AotExecOne (the one-instruction helper)
     VMSelf: Pointer;     // offset 32: the TBytecodeVM instance
     CtxObj: Pointer;     // offset 40: the ACTIVE TExecutionContext
+    // C5 native string lowering. The string bank base and the leaf primitives the emitted
+    // code calls directly instead of routing bcCmp*String etc. through AotExecOne. StrRegs is
+    // stable for the run (the banks are sized once by LoadProgram, never reallocated - the same
+    // reason rbx/rsi can be kept), so it is set once with the others and never refreshed.
+    StrRegs: Pointer;    // offset 48: @Ctx.StringRegs[0], base of the managed-string bank
+    StrCmp: Pointer;     // offset 56: @AotStrCmp (a, b, kind) -> 1/0
   end;
   PAotCtx = ^TAotCtx;
 
@@ -53,6 +59,8 @@ const
   AOTCTX_EXECONE   = 24;
   AOTCTX_VMSELF    = 32;
   AOTCTX_CTXOBJ    = 40;
+  AOTCTX_STRREGS   = 48;
+  AOTCTX_STRCMP    = 56;
 
   // Helper return contract. Normally the helper returns the bytecode PC that follows the
   // instruction it ran; native code compares against the PC it expects and keeps going.
@@ -149,6 +157,10 @@ begin
     ssaCmpEqInt, ssaCmpNeInt, ssaCmpLtInt, ssaCmpGtInt, ssaCmpLeInt, ssaCmpGeInt,
     ssaCmpLtUInt, ssaCmpGtUInt, ssaCmpLeUInt, ssaCmpGeUInt,
     ssaCmpEqFloat, ssaCmpNeFloat, ssaCmpLtFloat, ssaCmpGtFloat, ssaCmpLeFloat, ssaCmpGeFloat,
+    // C5: string comparisons lower to a leaf call (AotStrCmp) that produces an int - no
+    // allocation, no refcount, so the string operands stay in their bank and only the int Dest
+    // is register-allocated. (No Le/Ge: the parser rewrites them to Gt/Lt with swapped operands.)
+    ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
     ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,
     ssaShl, ssaShr, ssaShrUInt,
     ssaMathSqr,
@@ -582,6 +594,17 @@ var
     if V.Kind <> svkConstInt then Fail('const-operand:' + OpName(Cur.OpCode))
     else Result := V.ConstInt;
   end;
+  // C5: a string operand's slot index in the StringRegs bank (never register-allocated).
+  function SReg(const V: TSSAValue): Integer;
+  begin
+    Result := 0;
+    if (V.Kind <> svkRegister) or (V.RegType <> srtString) then
+      Fail('str-operand:' + OpName(Cur.OpCode))
+    else begin
+      Result := Prog.AotRemapStringReg(V.RegIndex);
+      if Result < 0 then Fail('unmapped-str:' + OpName(Cur.OpCode));
+    end;
+  end;
 
   { --- emission helpers (mirrors of the loop JIT's validated encoders) --- }
 
@@ -907,6 +930,58 @@ var
     //    interpreter with that value in rax, which is already the epilogue's contract.
     E.EmitBytes([$48, $3D]); E.Emit32(LongWord(apc + 1));         // cmp rax, apc+1
     JccRel($85, -1);                                              // jne epilogue
+  end;
+
+  // C5: caller-saved spill around a native leaf call (the string primitives). Only the
+  // ABI-VOLATILE allocated registers need it - callee-saved ones survive the call - and the
+  // bank slot is their canonical home, so the round-trip goes through the banks, exactly like
+  // the helper flush but skipping every callee-saved register. ALL volatiles are reloaded (not
+  // trimmed by liveness): the epilogue flushes every allocated register unconditionally, so a
+  // register left holding a clobbered value would be flushed into its bank. Trimming the reload
+  // is a separate, careful change (see the helper-hot-loop note in the AOT design doc).
+  procedure SpillVolatiles;
+  var k: Integer;
+  begin
+    for k := 0 to NIAlloc - 1 do
+      if not GprIsCalleeSaved(ILoc[IAllocd[k]]) then
+        StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
+    for k := 0 to NFAlloc - 1 do
+      if not XmmIsCalleeSaved(FLoc[FAllocd[k]]) then
+        E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+  end;
+  procedure ReloadVolatiles;
+  var k: Integer;
+  begin
+    for k := 0 to NIAlloc - 1 do
+      if not GprIsCalleeSaved(ILoc[IAllocd[k]]) then
+        LoadRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
+    for k := 0 to NFAlloc - 1 do
+      if not XmmIsCalleeSaved(FLoc[FAllocd[k]]) then
+        E.MemOp([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+  end;
+
+  // C5: bcCmp*String lowered to a leaf call to AotStrCmp. Kind 0=Eq 1=Ne 2=Lt 3=Gt. The two
+  // string operands stay in the StringRegs bank; the emitted code reads their slot values and
+  // passes them as pointers. Always completes natively (a comparison cannot raise) - no deopt.
+  procedure EmitStrCmp(Kind: Integer);
+  var s1, s2: Integer;
+  begin
+    s1 := SReg(Cur.Src1); s2 := SReg(Cur.Src2); if not OK then Exit;
+    // Save caller-saved allocated regs BEFORE arg setup clobbers the base regs (on System V
+    // arg1 IS rsi, the float bank base that SpillVolatiles reads through).
+    SpillVolatiles;
+    // Read both operand pointers and the primitive address out of the ctx (r8) BEFORE arg2
+    // clobbers r8 on Win64; base regs are reloaded from the frame after the call.
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);         // rax = ctx.StrRegs (bank base)
+    E.MemOp([$48, $8B], ABI_ARG0, RAX, LongWord(s1) * 8); // arg0 = StringRegs[s1]
+    E.MemOp([$48, $8B], ABI_ARG1, RAX, LongWord(s2) * 8); // arg1 = StringRegs[s2]
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRCMP);          // rax = ctx.StrCmp (call target)
+    MovImm64(ABI_ARG2, Kind);                             // arg2 = kind (may clobber r8 on Win64)
+    E.EmitBytes([$FF, $D0]);                              // call rax
+    FrameLoad(R8, SlotCtxSave);                           // r8 (ctx) is volatile everywhere
+    FrameLoad(RSI, SlotFltSave);                          // rsi (FloatRegs) is volatile in System V
+    ReloadVolatiles;
+    CmpBoolToDest;                                        // al (0/1) -> Dest := TrueVal/0
   end;
 
   procedure LoadXferBase(FloatBank: Boolean);
@@ -1313,6 +1388,15 @@ var
             CountVal(Ins.Dest);
             if Ins.Src2.Kind = svkRegister then CountVal(Ins.Src2);
           end;
+          ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
+          begin
+            // C5: a leaf call (AotStrCmp). Only the int Dest is register-allocated; the string
+            // operands are read from the bank by the emitted code, so they are NOT counted
+            // (CountVal rejects string operands outright). The call needs a call-ready frame
+            // but always completes natively, so it sets the frame flag without a deopt hazard.
+            HasHelperCall := True;
+            CountVal(Ins.Dest);
+          end;
         else
           if AotIsNative(SSAProg, Ins) then
           begin
@@ -1562,6 +1646,9 @@ var
       ssaCmpLtFloat: FloatCmp(0); ssaCmpLeFloat: FloatCmp(1);
       ssaCmpGtFloat: FloatCmp(2); ssaCmpGeFloat: FloatCmp(3);
       ssaCmpEqFloat: FloatCmp(4); ssaCmpNeFloat: FloatCmp(5);
+
+      ssaCmpEqString: EmitStrCmp(0); ssaCmpNeString: EmitStrCmp(1);
+      ssaCmpLtString: EmitStrCmp(2); ssaCmpGtString: EmitStrCmp(3);
 
       ssaJump, ssaJumpIfZero, ssaJumpIfNotZero:
       begin

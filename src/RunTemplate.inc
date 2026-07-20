@@ -117,6 +117,11 @@ begin
     LocalAotCtx.ExecOne := @AotExecOne;
     LocalAotCtx.VMSelf := Self;
     LocalAotCtx.CtxObj := Ctx;
+    // C5: native string lowering. The string bank base (stable for the run) and the leaf
+    // primitives the compiled code calls directly for the hot string ops.
+    if Length(Ctx.StringRegs) > 0 then LocalAotCtx.StrRegs := @Ctx.StringRegs[0]
+    else LocalAotCtx.StrRegs := nil;
+    LocalAotCtx.StrCmp := @AotStrCmp;
   end
   else
     AotFuncs := nil;
