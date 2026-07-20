@@ -46,7 +46,7 @@ uses
   // Bytecode VM
   SedaiSSATypes, SedaiSSA,
   SedaiBytecodeTypes, SedaiBytecodeCompiler, SedaiBytecodeVM,
-  SedaiBytecodeDisassembler, SedaiOpcodeTable, SedaiJit,
+  SedaiBytecodeDisassembler, SedaiOpcodeTable, SedaiJit, SedaiAot,
   // Headless file I/O handler (OPEN/PRINT#/INPUT#/EOF/FREEFILE...) for the CLI VM
   SedaiFileIO,
   // Register Allocation
@@ -1505,6 +1505,12 @@ begin
     end;
     {$ENDIF}
     {$ENDIF}
+
+    // === AOT SURVEY (B1-S3, diagnostics only) ===
+    // Slices the SSA program into function regions and reports which are compilable
+    // with the B1 scalar set (stderr). No codegen yet; gated by the env var.
+    if GetEnvironmentVariable('AOT_DIAG') = '1' then
+      AotSurvey(SSAProgram, BytecodeProgram);
 
     // === DISASSEMBLY (Optional) ===
     if OptDisasm then
