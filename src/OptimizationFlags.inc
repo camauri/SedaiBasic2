@@ -110,14 +110,13 @@
 // To toggle:
 //   - GVN on:  uncomment {$DEFINE DISABLE_CSE} below.
 //   - CSE on:  define DISABLE_GVN instead.
-{.$DEFINE DISABLE_CSE}
-// Re-tested 2026-07-20 on the Phase A versioned-SSA pipeline (general LICM + StrengthReduction +
-// Algebraic active): enabling GVN now produces 6 OPTDIFFs, so the 2026-06-20 "byte-identical" result no
-// longer holds — the richer SSA gives GVN real matches, and two soundness gaps surface:
-//   (a) CLASSIC (m406_deffn_classic): every value is Version=0, so the SSA identity GVN numbers on is
-//       degenerate — a value is reused across a redefinition. GVN can never be sound in CLASSIC as-is;
-//       any future enable must gate it to MODERN (versioned) programs only.
-//   (b) In-place string mutation (m80_midstmt): "Mid(s,..) = .." mutates its OPERAND, which value
-//       numbering does not model — loads of s before/after the statement get the same value number.
-//       Ops with operand side effects need a kill in the value table.
-// Keep OFF until both are addressed; yield on the line-per-block CFG is still expected to be small.
+{$DEFINE DISABLE_CSE}
+// GVN ENABLED 2026-07-20 (Phase A versioned-SSA pipeline) after making it sound:
+//   (a) value numbering is restricted to SINGLE-ASSIGNMENT names, checked directly on a whole-program
+//       def count (TGVNPass.BuildDefCounts/IsSingleDef) — covers CLASSIC Version=0 variables (m406),
+//       MODERN multi-def temps, and MID-statement string rebuilds (m80) with one criterion;
+//   (b) potentially-TRAPPING ops are excluded (their runtime error is observable under ON ERROR, so
+//       every occurrence must re-execute — m138): integer div/mod always; float div/pow, FloatToInt,
+//       Sqr/Log/Exp only in CLASSIC (MODERN is IEEE and stays pure).
+// Verified: corpus 470/470, 0 OPTDIFF, JIT net 0 mismatch; benchmark bytecode byte-identical to
+// GVN-off (their redundancies are loop-variant); cross-line scalar dedup works (3x "x*y+1" -> 1 mul).

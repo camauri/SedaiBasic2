@@ -92,12 +92,16 @@ type
 
   TGVNPass = class
   private
+    type
+      TDefCountMap = specialize TDictionary<string, Integer>;
+  private
     FScopedTable: TScopedGVNTable;
     FDomTree: TDominatorTree;
     FProgram: TSSAProgram;
     FReplacements: Integer;  // Count of values replaced
     FCurrentBlock: TSSABasicBlock;  // Current block being processed
     FPhiDefinedRegs: TStringList;   // Registers defined by PHI functions (loop-variant)
+    FDefCounts: TDefCountMap;       // (RegType:RegIndex:Version) -> number of defining instructions
 
     { Process a single basic block }
     procedure ProcessBlock(Block: TSSABasicBlock);
@@ -119,6 +123,12 @@ type
 
     { Collect all PHI-defined registers from the program }
     procedure CollectPhiDefinedRegisters;
+
+    { Count how many instructions define each register (whole program) }
+    procedure BuildDefCounts;
+
+    { True iff the value is a constant/none, or a register written by exactly ONE instruction }
+    function IsSingleDef(const Value: TSSAValue): Boolean;
 
     { DFS traversal of dominator tree with proper scope management
       Values computed in a block are visible to all dominated blocks }
@@ -227,12 +237,14 @@ begin
   FPhiDefinedRegs := TStringList.Create;
   FPhiDefinedRegs.Sorted := True;
   FPhiDefinedRegs.Duplicates := dupIgnore;
+  FDefCounts := TDefCountMap.Create;
   FReplacements := 0;
   FCurrentBlock := nil;
 end;
 
 destructor TGVNPass.Destroy;
 begin
+  FDefCounts.Free;
   FPhiDefinedRegs.Free;
   FScopedTable.Free;
   inherited Destroy;
@@ -277,6 +289,55 @@ begin
     WriteLn(Format('[GVN] Found %d PHI-defined registers (loop-variant)',
       [FPhiDefinedRegs.Count]));
   {$ENDIF}
+end;
+
+procedure TGVNPass.BuildDefCounts;
+var
+  i, j: Integer;
+  Block: TSSABasicBlock;
+  Instr: TSSAInstruction;
+  Key: string;
+  Cnt: Integer;
+begin
+  { Value numbering is only sound over SINGLE-ASSIGNMENT names: a register written by more than one
+    instruction (every CLASSIC user variable at Version=0, MODERN Version=0 loop-carried temps, a string
+    rebuilt by a MID statement, ...) does not denote one value, so both hashing its uses and inserting it
+    as a canonical value are wrong — the classic failure is reusing a value straight across a
+    redefinition (m406_deffn_classic) or across an in-place string rewrite (m80_midstmt). Instead of
+    trusting Version>0 or dialect flags, count the defs directly: it is the exact property we need. }
+  FDefCounts.Clear;
+  for i := 0 to FProgram.Blocks.Count - 1 do
+  begin
+    Block := FProgram.Blocks[i];
+    for j := 0 to Block.Instructions.Count - 1 do
+    begin
+      Instr := Block.Instructions[j];
+      if Instr.Dest.Kind <> svkRegister then Continue;
+      // Mirror the SSA renamer's authoritative "Dest is a USE" list (SedaiSSAConstruction): these
+      // opcodes carry a VALUE operand in the Dest field and define nothing.
+      case Instr.OpCode of
+        ssaArrayStore, ssaArrayStoreIndInt, ssaArrayStoreIndFloat,
+        ssaArrayStoreIndString, ssaPrint, ssaPrintLn:
+          Continue;
+      else
+        Key := Format('%d:%d:%d', [Ord(Instr.Dest.RegType), Instr.Dest.RegIndex, Instr.Dest.Version]);
+        if FDefCounts.TryGetValue(Key, Cnt) then
+          FDefCounts[Key] := Cnt + 1
+        else
+          FDefCounts.Add(Key, 1);
+      end;
+    end;
+  end;
+end;
+
+function TGVNPass.IsSingleDef(const Value: TSSAValue): Boolean;
+var
+  Cnt: Integer;
+begin
+  if Value.Kind <> svkRegister then Exit(True);   // constants/labels/none are immutable
+  Result := FDefCounts.TryGetValue(
+              Format('%d:%d:%d', [Ord(Value.RegType), Value.RegIndex, Value.Version]), Cnt)
+            and (Cnt = 1);
 end;
 
 function TGVNPass.IsLoopVariant(const Value: TSSAValue): Boolean;
@@ -347,15 +408,29 @@ begin
   }
 
   case Instr.OpCode of
+    // TRAPPING ops are NOT pure: eliminating a later occurrence also eliminates its runtime error, which
+    // is observable under ON ERROR/RESUME (m138_onerror: the second "a \ b" must raise div-by-zero AGAIN
+    // to reach its handler). Integer div/mod can raise in both dialects (div by zero, INT_MIN/-1) —
+    // never value-number them. Same reasoning as LICM's no-speculative-div rule.
+    ssaDivInt, ssaModInt:
+      Result := False;
+
     // Arithmetic operations (pure functions)
-    ssaAddInt, ssaSubInt, ssaMulInt, ssaDivInt, ssaModInt, ssaNegInt,
-    ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat, ssaPowFloat, ssaNegFloat:
+    ssaAddInt, ssaSubInt, ssaMulInt, ssaNegInt,
+    ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaNegFloat:
       Result := True;
 
-    // Conversions (pure functions)
-    ssaIntToFloat, ssaFloatToInt, ssaIntToString, ssaFloatToString,
+    // Float divide/power: MODERN follows IEEE (div0 -> inf/nan, pure); CLASSIC RAISES on division by
+    // zero / bad domain, so each occurrence must re-execute there.
+    ssaDivFloat, ssaPowFloat:
+      Result := not FProgram.GlobalVariableSemantics;
+
+    // Conversions (pure in MODERN; ssaFloatToInt can raise OVERFLOW in CLASSIC)
+    ssaIntToFloat, ssaIntToString, ssaFloatToString,
     ssaStringToInt, ssaStringToFloat:
       Result := True;
+    ssaFloatToInt:
+      Result := not FProgram.GlobalVariableSemantics;
 
     // Comparisons (pure functions)
     ssaCmpEqInt, ssaCmpNeInt, ssaCmpLtInt, ssaCmpGtInt, ssaCmpLeInt, ssaCmpGeInt,
@@ -374,11 +449,13 @@ begin
     ssaStrMkInt, ssaStrMkFloat, ssaStrCvInt, ssaStrCvFloat:
       Result := True;
 
-    // Math functions (pure functions)
-    ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathLog, ssaMathExp,
-    ssaMathSqr, ssaMathAbs, ssaMathSgn, ssaMathInt,
-    ssaMathLog10, ssaMathLog2, ssaMathLogN:
+    // Math functions: always pure in MODERN (IEEE nan/inf); in CLASSIC Sqr(neg)/Log(<=0)/Exp-overflow
+    // RAISE, so those must re-execute per occurrence there.
+    ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn,
+    ssaMathAbs, ssaMathSgn, ssaMathInt:
       Result := True;
+    ssaMathSqr, ssaMathLog, ssaMathExp, ssaMathLog10, ssaMathLog2, ssaMathLogN:
+      Result := not FProgram.GlobalVariableSemantics;
 
     // Constants - DO NOT value number!
     // LoadConst instructions are already optimal and removing them can create
@@ -421,6 +498,15 @@ begin
 
   // Skip instructions without destination register
   if Instr.Dest.Kind <> svkRegister then
+    Exit;
+
+  // SOUNDNESS: only single-assignment names may take part in value numbering — an operand's register
+  // name must denote ONE value for the hash to mean anything, and the Dest must never be rewritten for
+  // its insertion as a canonical value to stay valid in dominated blocks. Checked directly on def
+  // counts (BuildDefCounts), which covers CLASSIC Version=0 variables, multi-def MODERN temps and
+  // MID-statement string rebuilds uniformly.
+  if not (IsSingleDef(Instr.Dest) and IsSingleDef(Instr.Src1) and
+          IsSingleDef(Instr.Src2) and IsSingleDef(Instr.Src3)) then
     Exit;
 
   // CRITICAL FIX: Skip instructions that use loop-variant values (PHI-defined)
@@ -572,6 +658,9 @@ begin
   // CRITICAL: Collect all PHI-defined registers before processing
   // These registers are loop-variant and must be excluded from GVN
   CollectPhiDefinedRegisters;
+
+  // Count definitions per register: value numbering is restricted to single-assignment names.
+  BuildDefCounts;
 
   // Get dominator tree
   DomTreeObj := Prog.GetDomTree;
