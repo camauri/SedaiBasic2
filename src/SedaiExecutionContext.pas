@@ -148,6 +148,21 @@ type
     // per-thread because each thread owns its heap (no cross-thread reclamation, S16.4).
     Records: array of TRecordStorage;
     RecordCount: Integer;
+
+    // --- AOT runtime-helper handoff (C3, PIANO_B1_AOT_DESIGN §5.6) ---
+    // An exception must never unwind through AOT-generated frames: they carry no unwind
+    // info. The helper that runs one bytecode instruction for native code catches
+    // everything, parks the exception object here, and returns a sentinel; the AOT call
+    // site in RunTemplate re-raises it inside the interpreter's own try..except, which is
+    // what knows about ON ERROR / TRAP / Err / RESUME. Per-context, so a worker thread
+    // carries its own pending exception.
+    //
+    // Declared last: they are touched once per fault, while the fields above are the
+    // interpreter's hot state, and appending avoids shifting every following field's offset.
+    // (Measured as free either way - but see [[dispatch-alignment-fragility]]: this binary's
+    // dispatch loop is sensitive enough to layout that not perturbing it is worth doing.)
+    AotPendingExc: TObject;     // acquired exception object, owned until re-raised (nil = none)
+    AotFaultPC: Integer;        // bytecode PC to resume/report at when a sentinel comes back
   end;
 
 implementation

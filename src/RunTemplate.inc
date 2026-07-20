@@ -110,6 +110,12 @@ begin
     AotFuncs := @FNativeFuncs[0];
     LocalAotCtx.XferInt := @Ctx.XferInt[0];
     LocalAotCtx.XferFloat := @Ctx.XferFloat[0];
+    // C3: the runtime-helper triple. Compiled code calls back into the interpreter for ops
+    // with no native form, and must reach THIS run's VM/context pair - hence per-Run here
+    // rather than baked into the code (a worker executes the same bytes on its own context).
+    LocalAotCtx.ExecOne := @AotExecOne;
+    LocalAotCtx.VMSelf := Self;
+    LocalAotCtx.CtxObj := Ctx;
   end
   else
     AotFuncs := nil;
@@ -154,7 +160,11 @@ begin
       if FArraysDirty then RebuildJitArrDesc;
       if Length(FJitArrDesc) > 0 then LocalAotCtx.ArrDesc := @FJitArrDesc[0]
       else LocalAotCtx.ArrDesc := nil;
-      CurPC := TNativeFuncFn(TExecMem(AotFuncs[CurPC]).Ptr)(IntRegs, PInt64(FloatRegs), @LocalAotCtx);
+      // AotSettle resolves the C3 sentinels, out of line on purpose: this is the interpreter's
+      // hot loop, and its speed is measurably sensitive to code layout - see
+      // job/docs/PIANO_B1_AOT_DESIGN.md §5.7 - so it stays as small as it was.
+      CurPC := AotSettle(Ctx,
+        TNativeFuncFn(TExecMem(AotFuncs[CurPC]).Ptr)(IntRegs, PInt64(FloatRegs), @LocalAotCtx));
       System.Continue;
     end;
 

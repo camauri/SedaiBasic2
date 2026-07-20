@@ -36,8 +36,38 @@ type
     XferFloat: PInt64;   // offset 8
     ArrDesc: PInt64;     // offset 16: @FJitArrDesc[0] (4x Int64/array: IntData, FloatData, Count, LBound),
                          // refreshed per call after the dirty rebuild - same table the loop JIT uses
+    // C3 runtime-helper triple. Emitted code loads all three from here, never from a baked
+    // constant: the VM instance is shared but the CONTEXT is per-worker, so a thread must
+    // see its own. Offsets are part of the codegen contract (AOTCTX_* below).
+    ExecOne: Pointer;    // offset 24: @AotExecOne (the one-instruction helper)
+    VMSelf: Pointer;     // offset 32: the TBytecodeVM instance
+    CtxObj: Pointer;     // offset 40: the ACTIVE TExecutionContext
   end;
   PAotCtx = ^TAotCtx;
+
+const
+  // Field offsets in TAotCtx, as the emitted [r8+disp] loads use them.
+  AOTCTX_XFERINT   = 0;
+  AOTCTX_XFERFLOAT = 8;
+  AOTCTX_ARRDESC   = 16;
+  AOTCTX_EXECONE   = 24;
+  AOTCTX_VMSELF    = 32;
+  AOTCTX_CTXOBJ    = 40;
+
+  // Helper return contract. Normally the helper returns the bytecode PC that follows the
+  // instruction it ran; native code compares against the PC it expects and keeps going.
+  // Anything else leaves to the interpreter at the returned PC. These two values are not
+  // PCs at all and are handled specially at the AOT call site in RunTemplate:
+  AOT_HELPER_EXC  = PtrInt(-1);   // the instruction raised: exception parked in Ctx.AotPendingExc,
+                                  // culprit PC in Ctx.AotFaultPC -> re-raise there
+  AOT_HELPER_HALT = PtrInt(-2);   // the instruction cleared Ctx.Running (CTRL+C, quit, failed
+                                  // ASSERT): resume PC in Ctx.AotFaultPC -> leave the run loop
+
+type
+  // The one-instruction runtime helper (C3). Executes bytecode instruction PC on Ctx with the
+  // interpreter's existing slow path and returns the next PC, or one of the sentinels above.
+  // cdecl: emitted code follows the platform C ABI.
+  TAotExecOneFn = function(VMSelf, CtxObj: Pointer; PC: PtrInt): PtrInt; cdecl;
 
   // A compiled function: same bank pointers as the loop JIT plus the AOT context in
   // the third argument register. Returns the bytecode PC where the interpreter
@@ -81,6 +111,10 @@ var
   AotDiagPeakLiveInt: Integer = 0;
   AotDiagPeakLiveFloat: Integer = 0;
   AotDiagLivenessOK: Boolean = False;
+  // C3: runtime-helper calls emitted in the last region. Also the coverage delta this stage
+  // bought: a region reporting helpers>0 is one that could not compile at all before, since
+  // a single op outside the native set used to bail the whole function.
+  AotDiagHelperCalls: Integer = 0;
 
 // Compile every eligible region to native code (B1a: static frequency register
 // assignment, deopt only for trapping ops). TrueVal is the VM's TRUE (-1);
@@ -117,10 +151,38 @@ begin
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferStoreInt, ssaXferStoreFloat,
     ssaReturnSub, ssaEnd, ssaStop,
     ssaRecMarkPush, ssaRecMarkPop,
+    // C3: no native form, lowered to a runtime-helper call (see IsHelperOp).
+    ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
+    ssaPrintInt, ssaPrintIntLn, ssaPrintBool, ssaPrintUInt,
+    ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
+    ssaPrintEnd,
     // B2: 1-D int/float array element access + dim-0 bound queries (string-element
     // arrays are rejected by the classifier/prescan; multi-dim access goes through
     // ssaArrayIdxPush/Resolve, which are not in the set, so those regions bail).
     ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+// C3/C4: ops with no native lowering that are executed by calling back into the interpreter
+// (AotExecOne) for exactly one bytecode instruction. This is the list being grown one family
+// at a time until the bail disappears; it is deliberately NOT "everything not in IsB1Op",
+// because each family has to be validated (aot_validate full + the regression guards) before
+// it is trusted - see PIANO_B1_AOT_DESIGN §5.7, rollout order.
+//
+// PRINT first, per the plan: it is pure side effect (no result register), it cannot move the
+// PC, and it is the family whose output a bit-identical diff checks most directly. String
+// operands are fine precisely BECAUSE the helper reads the banks itself - native code never
+// holds a string register.
+function IsHelperOp(Op: TSSAOpCode): Boolean;
+begin
+  case Op of
+    ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
+    ssaPrintInt, ssaPrintIntLn, ssaPrintBool, ssaPrintUInt,
+    ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
+    ssaPrintEnd:
       Result := True;
   else
     Result := False;
@@ -381,6 +443,14 @@ var
   ArrClassic: Boolean;                  // array OOB raises (CLASSIC / --bounds-check) -> guard + deopt
   LivenessOK: Boolean;                  // C1: the liveness fixpoint converged
   PeakLiveInt, PeakLiveFloat: Integer;  // C1: peak simultaneously-live values per bank
+  // C3 helper calls. The region stops being a leaf function as soon as one is emitted, which
+  // is what forces a real frame: 16-byte alignment at the call and the callee's shadow space.
+  HasHelperCall: Boolean;
+  NHelperCalls: Integer;                // helper calls actually emitted (diagnostics)
+  FrameSize: Integer;                   // bytes subtracted from rsp after the pushes (0 = leaf)
+  SlotXmm: Integer;                     // [rsp+SlotXmm]   xmm6/xmm7 save area (-1 = none)
+  SlotCtxSave: Integer;                 // [rsp+SlotCtxSave] the TAotCtx pointer (r8 is volatile)
+  SlotFltSave: Integer;                 // [rsp+SlotFltSave] the FloatRegs base (rsi is volatile in SysV)
   Cur: TSSAInstruction;
   CurOrd: Integer;                      // ordinal of Cur (indexes the SSA->PC map)
   LabelIdx: TStringList;                // region-local label -> block-list index
@@ -653,6 +723,120 @@ var
     IStore(IReg(Cur.Dest), RAX);
   end;
   // Load the Xfer bank base (slot 0 = XferInt, 1 = XferFloat) from the AOT ctx (r8) into rdx.
+  { --- C3: runtime-helper call ------------------------------------------------------------ }
+
+  // [rsp+disp32]. Not MemOp: rsp is the one base whose ModRM rm field (100) means "a SIB
+  // byte follows", so the operand needs an explicit SIB $24 (index=none, base=rsp).
+  procedure FrameMem(const Op: array of Byte; natreg: Integer; disp: Integer);
+  var rex: Byte; k: Integer;
+  begin
+    rex := $48; if natreg >= 8 then rex := rex or $04;
+    E.Emit8(rex);
+    for k := 0 to High(Op) do E.Emit8(Op[k]);
+    E.Emit8($80 or ((natreg and 7) shl 3) or RSP);   // mod=10, rm=100 -> SIB
+    E.Emit8($24);                                    // SIB: no index, base = rsp
+    E.Emit32(LongWord(disp));
+  end;
+  procedure FrameStore(natreg, disp: Integer);   // mov [rsp+disp], natreg
+  begin FrameMem([$89], natreg, disp); end;
+  procedure FrameLoad(natreg, disp: Integer);    // mov natreg, [rsp+disp]
+  begin FrameMem([$8B], natreg, disp); end;
+  // movsd xmm <-> [rsp+disp]. Its own encoder because the $F2 prefix goes BEFORE any REX,
+  // which FrameMem's REX-first order cannot express (and xmm0-7 need no REX here anyway).
+  procedure FrameXmm(IsStore: Boolean; Wx, disp: Integer);
+  begin
+    E.Emit8($F2); E.Emit8($0F);
+    if IsStore then E.Emit8($11) else E.Emit8($10);
+    E.Emit8($80 or ((Wx and 7) shl 3) or RSP);
+    E.Emit8($24);
+    E.Emit32(LongWord(disp));
+  end;
+
+  // Load the cached array descriptor slots (data base / element count) from ctx.ArrDesc.
+  // Invariant for a whole invocation, so the prologue does this once - but a helper call
+  // clobbers the registers holding them, so it has to be repeatable.
+  procedure ReloadArrayCache;
+  var k, b: Integer; rex: Byte;
+  begin
+    if NACache = 0 then Exit;
+    E.MemOp([$49, $8B], RDX, R8, AOTCTX_ARRDESC);   // rdx = ctx.ArrDesc
+    for k := 0 to NACache - 1 do
+    begin
+      if ACacheKind[k] = 1 then b := 16
+      else if SSAProg.GetArray(ACacheId[k]).ElementType = srtFloat then b := 8
+      else b := 0;
+      rex := $48; if ACacheReg[k] >= 8 then rex := rex or $04;   // REX.W (+R)
+      E.Emit8(rex); E.Emit8($8B);
+      E.Emit8($80 or ((ACacheReg[k] and 7) shl 3) or RDX);
+      E.Emit32(LongWord(ACacheId[k]) * 32 + LongWord(b));
+    end;
+  end;
+
+  // True when SSA ordinal AOrd emitted exactly one bytecode instruction, which is the
+  // precondition for handing it to AotExecOne (the helper runs one). Ordinals that emit
+  // nothing (labels, nops) map to -1 and are skipped: what decides is the next ordinal that
+  // DID emit. Conservative - "cannot tell" is a bail, never an assumption.
+  function LowersOneToOne(AOrd: Integer): Boolean;
+  var apc, q, nxt: Integer;
+  begin
+    Result := False;
+    apc := Prog.GetSsaPc(AOrd);
+    if apc < 0 then Exit;
+    for q := AOrd + 1 to AOrd + 64 do
+    begin
+      nxt := Prog.GetSsaPc(q);
+      if nxt >= 0 then Exit(nxt = apc + 1);
+    end;
+  end;
+
+  // Call AotExecOne for the bytecode instruction at apc, then decide whether native
+  // execution may continue.
+  //
+  // The flush/reload around the call is NOT the ABI spill the plan sketched, and is not
+  // optional: the helper runs an interpreter handler that reads and writes the register
+  // BANKS, so every value native code is holding in a machine register has to be in memory
+  // before the call and re-read after it. That requirement subsumes caller-saved-register
+  // preservation entirely, which is why no ABI register list appears here. (Liveness (C1)
+  // can later trim the RELOAD side to values still live after the call; the flush side is
+  // semantic and stays.)
+  procedure EmitHelperCall(apc: Integer);
+  var k: Integer;
+  begin
+    Inc(NHelperCalls);
+    // 1. Flush every allocated VM register to its bank slot (same stores as the epilogue).
+    for k := 0 to NIAlloc - 1 do
+      StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
+    for k := 0 to NFAlloc - 1 do
+      E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+
+    // 2. Arguments, read from the ctx record BEFORE r8 is clobbered (it is an argument
+    //    register on Win64 and volatile on both ABIs).
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_EXECONE);                 // rax = ctx.ExecOne
+    E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);             // arg0 = ctx.VMSelf
+    E.MemOp([$49, $8B], ABI_ARG1, R8, AOTCTX_CTXOBJ);             // arg1 = ctx.CtxObj
+    if ABI_ARG2 >= 8 then E.Emit8($49) else E.Emit8($48);         // arg2 = apc (sign-extended)
+    E.Emit8($C7); E.Emit8($C0 or (ABI_ARG2 and 7)); E.Emit32(LongWord(apc));
+    E.EmitBytes([$FF, $D0]);                                      // call rax
+
+    // 3. Restore our base registers from the frame. rbx (IntRegs) is callee-saved on both
+    //    ABIs and survives; rsi (FloatRegs) does not in System V, and r8 (ctx) never does.
+    FrameLoad(R8, SlotCtxSave);
+    FrameLoad(RSI, SlotFltSave);
+
+    // 4. Re-read the banks: the helper may have written any of them.
+    for k := 0 to NIAlloc - 1 do
+      LoadRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
+    for k := 0 to NFAlloc - 1 do
+      E.MemOp([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+    ReloadArrayCache;
+
+    // 5. Continue natively only if the helper landed exactly where this code expects.
+    //    Anything else - a moved PC, or one of the negative sentinels - leaves to the
+    //    interpreter with that value in rax, which is already the epilogue's contract.
+    E.EmitBytes([$48, $3D]); E.Emit32(LongWord(apc + 1));         // cmp rax, apc+1
+    JccRel($85, -1);                                              // jne epilogue
+  end;
+
   procedure LoadXferBase(FloatBank: Boolean);
   begin
     if FloatBank then E.MemOp([$49, $8B], RDX, R8, 8)
@@ -1035,6 +1219,28 @@ var
               Inc(AUse[Ins.Src1.ArrayIndex]);
             end;
           end;
+          ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
+          ssaPrintInt, ssaPrintIntLn, ssaPrintBool, ssaPrintUInt,
+          ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
+          ssaPrintEnd:
+          begin
+            // C3 helper call. Operands are deliberately NOT counted: the helper reads them
+            // from the banks, so holding them in a machine register would only cost a
+            // flush/reload - and it is what lets a string operand through at all (CountVal
+            // fails those). Two things must hold for the call to be legal:
+            if Prog.GetSsaPc(o) < 0 then Fail('no-pc-helper:' + OpName(Ins.OpCode))
+            // ...and the op must lower to EXACTLY ONE bytecode instruction, because the
+            // helper runs exactly one. A 1:N lowering would silently skip the rest.
+            else if not LowersOneToOne(o) then Fail('helper-not-1to1:' + OpName(Ins.OpCode))
+            else
+            begin
+              HasHelperCall := True;
+              // A helper call can hand the rest of the invocation to the interpreter (moved
+              // PC or a sentinel), so it carries the same hazard as a deopt and must obey the
+              // same rule: skipped RecMark pushes would unbalance the record-mark stack.
+              HasDeopt := True;
+            end;
+          end;
           ssaArrayLBound, ssaArrayUBound:
           begin
             HasDeopt := True;                       // dim <> 0 deopts even in MODERN
@@ -1134,6 +1340,17 @@ var
   begin
     case Cur.OpCode of
       ssaLabel, ssaNop, ssaRecMarkPush, ssaRecMarkPop: ;
+
+      // C3: no native lowering - hand this one bytecode instruction to the interpreter.
+      // Prescan already established the PC exists and the lowering is 1:1.
+      ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
+      ssaPrintInt, ssaPrintIntLn, ssaPrintBool, ssaPrintUInt,
+      ssaPrintComma, ssaPrintSemicolon, ssaPrintTab, ssaPrintSpc, ssaPrintNewLine,
+      ssaPrintEnd:
+      begin
+        apc := NeedPC; if not OK then Exit;
+        EmitHelperCall(apc);
+      end;
 
       ssaLoadConstInt:
       begin
@@ -1375,7 +1592,7 @@ begin
   BailWhy := '';
   OK := True;
   ArrClassic := not AllowUnsafe;
-  HasRecMark := False; HasDeopt := False;
+  HasRecMark := False; HasDeopt := False; HasHelperCall := False; NHelperCalls := 0;
   MaxIReg := -1; MaxFReg := -1; MaxArrId := -1;
   SetLength(IUse, 16); SetLength(FUse, 16); SetLength(AUse, 8);
   NFix := 0; NIAlloc := 0; NFAlloc := 0;
@@ -1413,7 +1630,23 @@ begin
     SetLength(BlockOff, SSAProg.Blocks.Count);
     for k := 0 to High(BlockOff) do BlockOff[k] := -1;
 
-    // Prologue (leaf function; Win64: rcx=IntRegs rdx=FloatRegs r8=AotCtx; SysV: rdi/rsi/rdx).
+    // Frame layout. A region with no helper call stays a leaf and keeps exactly the frame it
+    // has always had (nothing, or 16 bytes for xmm6/7) - the validated codegen must not move
+    // because of a feature it does not use. A region that DOES call needs, on top of that,
+    // the callee's shadow space, a slot for each base register the ABI lets a callee clobber,
+    // and enough padding that rsp is 16-byte aligned at the call.
+    if HasHelperCall then FrameSize := ABI_SHADOW_SPACE else FrameSize := 0;
+    SlotXmm := -1; SlotCtxSave := -1; SlotFltSave := -1;
+    if SaveX6 or SaveX7 then begin SlotXmm := FrameSize; Inc(FrameSize, 16); end;
+    if HasHelperCall then
+    begin
+      SlotCtxSave := FrameSize; SlotFltSave := FrameSize + 8; Inc(FrameSize, 16);
+      // rsp is 8 (mod 16) on entry and moves by 8 per push; pad so the `call` sees 0.
+      k := 2; for b := R12 to R15 do if SaveGpr[b] then Inc(k);
+      Inc(FrameSize, ((8 + 8 * k) - FrameSize) mod 16);
+    end;
+
+    // Prologue (Win64: rcx=IntRegs rdx=FloatRegs r8=AotCtx; SysV: rdi/rsi/rdx).
     E.Emit8($53);                                    // push rbx
     E.Emit8($56);                                    // push rsi
     for k := R12 to R15 do
@@ -1425,34 +1658,25 @@ begin
     E.EmitBytes([$48, $89, $FB]);                    // mov rbx, rdi
     E.EmitBytes([$49, $89, $D0]);                    // mov r8, rdx
     {$ENDIF}
-    if SaveX6 or SaveX7 then
+    if FrameSize > 0 then
     begin
-      E.EmitBytes([$48, $83, $EC, $10]);             // sub rsp, 16
-      if SaveX6 then E.EmitBytes([$F2, $0F, $11, $34, $24]);        // movsd [rsp], xmm6
-      if SaveX7 then E.EmitBytes([$F2, $0F, $11, $7C, $24, $08]);   // movsd [rsp+8], xmm7
+      E.EmitBytes([$48, $81, $EC]); E.Emit32(LongWord(FrameSize));  // sub rsp, FrameSize
+      if SaveX6 then FrameXmm(True, 6, SlotXmm);
+      if SaveX7 then FrameXmm(True, 7, SlotXmm + 8);
+      if HasHelperCall then
+      begin
+        FrameStore(R8, SlotCtxSave);                 // the ctx pointer: r8 is volatile everywhere
+        FrameStore(RSI, SlotFltSave);                // the FloatRegs base: rsi is volatile in SysV
+      end;
     end;
     // Entry loads of the allocated registers.
     for k := 0 to NIAlloc - 1 do
       LoadRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       E.MemOp([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
-    // Array descriptor cache loads: base/count of the hot arrays, invariant for the whole
-    // invocation (no DIM/REDIM/ERASE in the op set). The data-base offset follows the
-    // element bank (+0 IntData / +8 FloatData); count at +16.
-    if NACache > 0 then
-    begin
-      E.MemOp([$49, $8B], RDX, R8, 16);            // rdx = ctx.ArrDesc
-      for k := 0 to NACache - 1 do
-      begin
-        if ACacheKind[k] = 1 then b := 16
-        else if SSAProg.GetArray(ACacheId[k]).ElementType = srtFloat then b := 8
-        else b := 0;
-        TargetOff := $48; if ACacheReg[k] >= 8 then TargetOff := TargetOff or $04;  // REX.W (+R)
-        E.Emit8(Byte(TargetOff)); E.Emit8($8B);
-        E.Emit8($80 or ((ACacheReg[k] and 7) shl 3) or RDX);
-        E.Emit32(LongWord(ACacheId[k]) * 32 + LongWord(b));
-      end;
-    end;
+    // Array descriptor cache: base/count of the hot arrays, invariant for the whole
+    // invocation (no DIM/REDIM/ERASE in the op set).
+    ReloadArrayCache;
 
     // Body: blocks in order (fall-through preserved by contiguous emission).
     CurOrd := Region.FirstOrdinal;
@@ -1475,11 +1699,11 @@ begin
       StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
-    if SaveX6 or SaveX7 then
+    if FrameSize > 0 then
     begin
-      if SaveX6 then E.EmitBytes([$F2, $0F, $10, $34, $24]);        // movsd xmm6, [rsp]
-      if SaveX7 then E.EmitBytes([$F2, $0F, $10, $7C, $24, $08]);   // movsd xmm7, [rsp+8]
-      E.EmitBytes([$48, $83, $C4, $10]);             // add rsp, 16
+      if SaveX6 then FrameXmm(False, 6, SlotXmm);
+      if SaveX7 then FrameXmm(False, 7, SlotXmm + 8);
+      E.EmitBytes([$48, $81, $C4]); E.Emit32(LongWord(FrameSize));  // add rsp, FrameSize
     end;
     for k := R15 downto R12 do
       if SaveGpr[k] then begin E.Emit8($41); E.Emit8($5C + (k - R12)); end;
@@ -1496,6 +1720,7 @@ begin
       E.Patch32(Fixups[k].PatchOff, LongWord(TargetOff - (Fixups[k].PatchOff + 4)));
     end;
 
+    AotDiagHelperCalls := NHelperCalls;
     Result := TExecMem.Create(E);
     if Result.Ptr = nil then begin FreeAndNil(Result); Fail('exec-alloc'); end;
   finally
@@ -1528,10 +1753,11 @@ begin
       Result[n].Mem := Mem;
       Inc(n);
       if Diag then
-        WriteLn(ErrOutput, Format('[AOT] compiled %-24s entryPC=%-6d liveness=%s peakLive int=%d float=%d',
+        WriteLn(ErrOutput, Format('[AOT] compiled %-24s entryPC=%-6d liveness=%s peakLive int=%d float=%d helpers=%d',
                                   [Regions[r].Name, Regions[r].EntryPC,
                                    BoolToStr(AotDiagLivenessOK, 'ok', 'NOT-CONVERGED'),
-                                   AotDiagPeakLiveInt, AotDiagPeakLiveFloat]));
+                                   AotDiagPeakLiveInt, AotDiagPeakLiveFloat,
+                                   AotDiagHelperCalls]));
     end
     else if Diag then
       WriteLn(ErrOutput, Format('[AOT] compile-bail %-20s (%s)', [Regions[r].Name, Why]));

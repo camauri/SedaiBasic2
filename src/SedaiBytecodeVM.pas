@@ -22,6 +22,10 @@
 unit SedaiBytecodeVM;
 
 {$mode ObjFPC}{$H+}
+// The dispatch loop is alignment-fragile: unrelated code growth elsewhere in the binary
+// moved n-body by 14% (measured, C3). Pin the alignment so timings reflect the code, not
+// where the linker happened to place it.
+{$CODEALIGN PROC=64,LOOP=32,JUMP=16}
 {$interfaces CORBA}
 {$codepage UTF8}
 {$I ConfigFlags.inc}
@@ -463,6 +467,9 @@ type
     property AotEnabled: Boolean read FAotEnabled write FAotEnabled;
     // AOT: adopt a compiled function (ownership passes to the VM) under its entry PC.
     procedure RegisterAotFunc(EntryPC: Integer; Mem: TObject);
+    // AOT: turn a compiled function's return value into the PC to resume at, handling the
+    // C3 helper sentinels. Out of line on purpose - see the implementation comment.
+    function AotSettle(C: TExecutionContext; R: PtrInt): Integer;
     procedure Run;       // Default execution - calls RunFast
     procedure RunFast;   // Optimized execution loop - no profiler/debug support
     procedure RunDebug;  // Debug execution loop - TRON trace + profiler support
@@ -5796,6 +5803,83 @@ begin
       end;
     end;
   FArraysDirty := True;   // force a descriptor rebuild before the first compiled loop runs
+end;
+
+{ ---------------- AOT runtime helper (C3, PIANO_B1_AOT_DESIGN §5.6/§5.7) ----------------
+  The lowering that gives the AOT full program coverage: an SSA op with no native form
+  becomes a call to this, which runs THAT ONE bytecode instruction on the interpreter's
+  existing slow path and hands back the PC to continue at.
+
+  Two things make it safe to call from code we generated ourselves:
+
+  * It catches everything. An FPC exception unwinding through an AOT frame would be
+    undefined behaviour - those frames have no unwind info - so the exception stops here,
+    is parked on the context (per-worker, never on the VM), and comes back as a sentinel
+    the AOT call site in RunTemplate turns into a real `raise` inside the interpreter's
+    try..except. ON ERROR / TRAP / Err / RESUME keep working, unchanged and unaware.
+  * It reports control flow by PC. Ctx.PC is the interpreter's own channel for "the flow
+    moved" (jump, call, return, RESUME), so reading it back after the handler covers every
+    case without enumerating opcodes: native code continues only when the next PC is the
+    one it statically expected, and otherwise leaves to the interpreter there.
+
+  Emitted code reaches it through TAotCtx.ExecOne - never a baked address, so a worker
+  thread running the same compiled function passes its own VM/context pair. }
+function AotExecOne(VMSelf, CtxObj: Pointer; PC: PtrInt): PtrInt; cdecl;
+type
+  PInstr = ^TBytecodeInstruction;
+var
+  VM: TBytecodeVM;
+  C: TExecutionContext;
+begin
+  VM := TBytecodeVM(VMSelf);
+  C := TExecutionContext(CtxObj);
+  try
+    C.PC := PC;
+    VM.ExecuteInstruction(C, PInstr(VM.FProgram.GetInstructionsPtr)[PC]);
+    // A handler that clears Running (CTRL+C, quit, a failed ASSERT) must stop the run loop,
+    // not just this instruction - native code cannot do that, so bounce out to the interpreter.
+    if not C.Running then
+    begin
+      C.AotFaultPC := C.PC + 1;
+      Exit(AOT_HELPER_HALT);
+    end;
+    Result := C.PC + 1;
+  except
+    C.AotPendingExc := TObject(AcquireExceptionObject);
+    C.AotFaultPC := PC;
+    Result := AOT_HELPER_EXC;
+  end;
+end;
+
+{ Resolve what a compiled AOT function returned (C3). Normally that is just the resume PC and
+  this is a compare and a return; the two negative sentinels mean a runtime helper hit
+  something native code cannot finish.
+
+  This lives in its own method rather than at the call site in RunTemplate because
+  RunFast/RunDebug are the interpreter's hot loop, and this binary's dispatch speed is
+  measurably sensitive to code layout (job/docs/PIANO_B1_AOT_DESIGN.md §5.7). Keeping the
+  loop's source as small as it was is cheap insurance; nothing here is on a hot path.
+
+  Raising from here is still correct: the caller invokes it inside its try..except, so the
+  exception surfaces exactly where ON ERROR / TRAP / Err / RESUME are handled. }
+function TBytecodeVM.AotSettle(C: TExecutionContext; R: PtrInt): Integer;
+var
+  E: TObject;
+begin
+  if R >= 0 then Exit(Integer(R));
+  Result := C.AotFaultPC;
+  C.PC := Result;
+  if R = AOT_HELPER_EXC then
+  begin
+    E := C.AotPendingExc;
+    C.AotPendingExc := nil;
+    if E <> nil then raise E;
+    // Sentinel with nothing parked: cannot happen, but resuming beats raising nil.
+    Exit;
+  end;
+  // AOT_HELPER_HALT: the instruction ended the run. Clearing Running exits the loop through
+  // its own condition, so the template needs no break of its own.
+  C.Running := False;
 end;
 
 procedure TBytecodeVM.RegisterAotFunc(EntryPC: Integer; Mem: TObject);
