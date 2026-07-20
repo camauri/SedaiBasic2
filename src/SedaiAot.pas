@@ -59,6 +59,13 @@ type
     EntryPC: Integer;                // final bytecode PC of the first emitted instruction (-1 = none)
     Eligible: Boolean;               // every op is in the B1 scalar set and all jumps stay inside
     BailReason: string;              // first offender ('' when eligible)
+    // B3 survey: what this region would need for a NATIVE call site (see PIANO_B1_AOT_DESIGN §4).
+    CallTargets: array of string;    // PROC_ names this region calls (static targets only)
+    HasIndirectCall: Boolean;        // an indirect call: never eligible for a native call site
+    EligibleNoCalls: Boolean;        // every op except ssaCallSub is in the set
+    // True when the ONLY thing keeping this region out is its calls, and every target is itself
+    // eligible - i.e. exactly what B3 would unlock. Filled by AotMarkB3Candidates.
+    B3Candidate: Boolean;
   end;
   TAotRegions = array of TAotRegion;
 
@@ -142,6 +149,10 @@ var
       EntryPC := -1;
       Eligible := True;
       BailReason := '';
+      SetLength(CallTargets, 0);
+      HasIndirectCall := False;
+      EligibleNoCalls := True;
+      B3Candidate := False;
     end;
     Inc(NRegions);
   end;
@@ -196,6 +207,22 @@ begin
           // Entry PC = first instruction of the region that emitted bytecode.
           if (Regions[r].EntryPC < 0) and (Prog <> nil) then
             Regions[r].EntryPC := Prog.GetSsaPc(o);
+          // B3 survey: record the call shape regardless of eligibility, so we can report how
+          // many regions a native call site (PIANO_B1_AOT_DESIGN section 4) would unlock.
+          if Instr.OpCode = ssaCallSubIndirect then
+            Regions[r].HasIndirectCall := True
+          else if Instr.OpCode = ssaCallSub then
+          begin
+            if Instr.Dest.Kind = svkLabel then
+            begin
+              SetLength(Regions[r].CallTargets, Length(Regions[r].CallTargets) + 1);
+              Regions[r].CallTargets[High(Regions[r].CallTargets)] := Instr.Dest.LabelName;
+            end
+            else
+              Regions[r].HasIndirectCall := True;
+          end
+          else if not IsB1Op(Instr.OpCode) then
+            Regions[r].EligibleNoCalls := False;
           if Regions[r].Eligible then
           begin
             if not IsB1Op(Instr.OpCode) then
@@ -239,17 +266,45 @@ begin
   finally
     RegionLabels.Free;
   end;
+
+  // B3 survey: a region is a candidate if calls are the ONLY thing stopping it, it makes no
+  // indirect call, and every target it calls is itself compilable (or a candidate). Fixpoint,
+  // so a chain caller -> mid -> leaf is credited once mid becomes a candidate.
+  for r := 0 to NRegions - 1 do
+    Regions[r].B3Candidate := (not Regions[r].Eligible) and Regions[r].EligibleNoCalls and
+                              (not Regions[r].HasIndirectCall) and (Length(Regions[r].CallTargets) > 0);
+  repeat
+    Ordinal := 0;   // reused as "changed" counter
+    for r := 0 to NRegions - 1 do
+    begin
+      if not Regions[r].B3Candidate then Continue;
+      for i := 0 to High(Regions[r].CallTargets) do
+      begin
+        // Target name is the PROC_ label; regions are named without the prefix.
+        o := -1;
+        for j := 0 to NRegions - 1 do
+          if 'PROC_' + Regions[j].Name = Regions[r].CallTargets[i] then begin o := j; Break; end;
+        if (o < 0) or not (Regions[o].Eligible or Regions[o].B3Candidate) then
+        begin
+          Regions[r].B3Candidate := False;
+          Inc(Ordinal);
+          Break;
+        end;
+      end;
+    end;
+  until Ordinal = 0;
+
   Result := Regions;
 end;
 
 procedure AotSurvey(SSAProg: TSSAProgram; Prog: TBytecodeProgram);
 var
   Regions: TAotRegions;
-  r, NElig: Integer;
+  r, NElig, NB3: Integer;
   ProcAtEntry: string;
 begin
   Regions := AotSliceAndClassify(SSAProg, Prog);
-  NElig := 0;
+  NElig := 0; NB3 := 0;
   for r := 0 to High(Regions) do
   begin
     with Regions[r] do
@@ -259,6 +314,12 @@ begin
         Inc(NElig);
         WriteLn(ErrOutput, Format('[AOT] %-24s blocks=%-4d instrs=%-5d entryPC=%-6d NATIVE',
                                   [Name, LastBlock - FirstBlock + 1, InstrCount, EntryPC]));
+      end
+      else if B3Candidate then
+      begin
+        Inc(NB3);
+        WriteLn(ErrOutput, Format('[AOT] %-24s blocks=%-4d instrs=%-5d entryPC=%-6d BAIL %s  <- B3-CANDIDATE (calls only)',
+                                  [Name, LastBlock - FirstBlock + 1, InstrCount, EntryPC, BailReason]));
       end
       else
         WriteLn(ErrOutput, Format('[AOT] %-24s blocks=%-4d instrs=%-5d entryPC=%-6d BAIL %s',
@@ -273,8 +334,8 @@ begin
       end;
     end;
   end;
-  WriteLn(ErrOutput, Format('[AOT] survey: %d/%d regions eligible (B1 scalar set)',
-                            [NElig, Length(Regions)]));
+  WriteLn(ErrOutput, Format('[AOT] survey: %d/%d regions eligible (B1+B2 set), %d more would need only B3 native calls',
+                            [NElig, Length(Regions), NB3]));
 end;
 
 { ============================ B1a code generation ============================ }
