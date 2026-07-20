@@ -2078,6 +2078,7 @@ var
   Block: TSSABasicBlock;
   Instr: TSSAInstruction;
   i, j, BCReg: Integer;
+  BCIndexBefore: Integer;
   RegType: TSSARegisterType;
   IntVarCount, FloatVarCount, StringVarCount: Integer;
   VarRegStr: string;
@@ -2157,6 +2158,7 @@ begin
   end;
 
   // Pass 1: Compile instructions and record label positions
+  FProgram.ResetSsaPcMap;
   for i := 0 to SSAProgram.Blocks.Count - 1 do
   begin
     Block := SSAProgram.Blocks[i];
@@ -2171,8 +2173,17 @@ begin
     for j := 0 to Block.Instructions.Count - 1 do
     begin
       Instr := Block.Instructions[j];
+      // AOT SSA->PC map: one entry per SSA instruction (labels/nops included, so the ordinal
+      // matches any same-order walk of the SSA program) = PC of the first instruction emitted
+      // for it, or -1 when nothing was emitted. Lowering is in-order, so recording the
+      // pre-emission count is exact even for the rare 1:2 lowerings.
+      BCIndexBefore := FProgram.GetInstructionCount;
       if Instr.OpCode <> ssaLabel then
         CompileInstruction(Instr);
+      if FProgram.GetInstructionCount > BCIndexBefore then
+        FProgram.AppendSsaPc(BCIndexBefore)
+      else
+        FProgram.AppendSsaPc(-1);
     end;
   end;
 

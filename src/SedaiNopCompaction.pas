@@ -242,6 +242,9 @@ begin
   // Step 4: Adjust source map (for RESUME NEXT and GetSourceLine)
   FProgram.AdjustSourceMap(FIndexMap);
 
+  // Step 4b: Adjust the AOT SSA->PC map (removed instructions become -1, see AdjustSsaPcMap)
+  FProgram.AdjustSsaPcMap(FIndexMap);
+
   // Step 5: Compact the instruction array
   CompactInstructions;
 

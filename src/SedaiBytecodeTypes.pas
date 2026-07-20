@@ -902,6 +902,21 @@ type
     FProcMapCount: Integer;
     // Name of the source file this program was compiled from (ERMN). Set by the host.
     FModuleName: string;
+    // AOT support (plan B, PIANO_B1_AOT_DESIGN): SSA instruction ordinal (program order, counting
+    // EVERY SSA instruction, labels/nops included) -> FINAL bytecode PC of the first instruction
+    // emitted for it, or -1 when nothing was emitted or it was later removed by NOP compaction.
+    // Appended by the bytecode compiler during emission; remapped by NOP compaction. A removed
+    // instruction maps to -1 (NOT to the next survivor: re-executing a later PC would skip the op,
+    // so the AOT must treat -1 as "no reliable deopt PC" and bail).
+    FSsaPcMap: array of Integer;
+    FSsaPcCount: Integer;
+    // AOT support: final per-bank register remaps captured from Register Compaction (old -> new,
+    // -1 = unused). Empty until that pass runs; identity for indexes < the *VarRegCount by that
+    // pass's invariant. An SSA (post-regalloc) register composed through this map is the exact
+    // bank index the interpreter uses.
+    FAotIntRegMap: array of Integer;
+    FAotFloatRegMap: array of Integer;
+    FAotStringRegMap: array of Integer;
   public
     property ModernMode: Boolean read FModernMode write FModernMode;
     property ModuleName: string read FModuleName write FModuleName;
@@ -947,6 +962,16 @@ type
     function GetProcedure(Index: Integer): TProcDescriptor;
     function GetProcedureCount: Integer;
     function FindProcedure(const Name: string): Integer;  // -1 if not found
+    // AOT mapping API (see the FSsaPcMap/FAotRegMap field comments)
+    procedure ResetSsaPcMap;
+    procedure AppendSsaPc(PC: Integer);
+    function GetSsaPc(Ordinal: Integer): Integer;
+    function GetSsaPcCount: Integer;
+    procedure AdjustSsaPcMap(const IndexMap: array of Integer);  // NOP compaction: removed -> -1
+    procedure SetAotRegMaps(const IntMap, FloatMap, StringMap: array of Integer);
+    function AotRemapIntReg(OldReg: Integer): Integer;
+    function AotRemapFloatReg(OldReg: Integer): Integer;
+    function AotRemapStringReg(OldReg: Integer): Integer;
     property StringConstants: TStringList read FStringConstants;
     property EntryPoint: Integer read FEntryPoint write FEntryPoint;
   end;
@@ -1357,6 +1382,89 @@ begin
   SetLength(FInstructions, 0);
   // Note: We do NOT clear FLabelLines or FSourceMap here
   // as they will be adjusted by the NOP compaction pass
+end;
+
+{ ---- AOT mapping API (plan B) ---- }
+
+procedure TBytecodeProgram.ResetSsaPcMap;
+begin
+  SetLength(FSsaPcMap, 0);
+  FSsaPcCount := 0;
+end;
+
+procedure TBytecodeProgram.AppendSsaPc(PC: Integer);
+begin
+  if FSsaPcCount >= Length(FSsaPcMap) then
+    SetLength(FSsaPcMap, FSsaPcCount * 2 + 256);
+  FSsaPcMap[FSsaPcCount] := PC;
+  Inc(FSsaPcCount);
+end;
+
+function TBytecodeProgram.GetSsaPc(Ordinal: Integer): Integer;
+begin
+  if (Ordinal >= 0) and (Ordinal < FSsaPcCount) then
+    Result := FSsaPcMap[Ordinal]
+  else
+    Result := -1;
+end;
+
+function TBytecodeProgram.GetSsaPcCount: Integer;
+begin
+  Result := FSsaPcCount;
+end;
+
+procedure TBytecodeProgram.AdjustSsaPcMap(const IndexMap: array of Integer);
+var
+  i, OldPC: Integer;
+begin
+  // Unlike jump targets (which forward to the next survivor), a removed instruction maps to -1:
+  // re-executing a LATER PC would skip the op's effect, so -1 = "no reliable deopt PC" (AOT bails).
+  for i := 0 to FSsaPcCount - 1 do
+  begin
+    OldPC := FSsaPcMap[i];
+    if OldPC < 0 then Continue;
+    if OldPC < Length(IndexMap) then
+      FSsaPcMap[i] := IndexMap[OldPC]
+    else
+      FSsaPcMap[i] := -1;
+  end;
+end;
+
+procedure TBytecodeProgram.SetAotRegMaps(const IntMap, FloatMap, StringMap: array of Integer);
+var
+  i: Integer;
+begin
+  SetLength(FAotIntRegMap, Length(IntMap));
+  for i := 0 to High(IntMap) do FAotIntRegMap[i] := IntMap[i];
+  SetLength(FAotFloatRegMap, Length(FloatMap));
+  for i := 0 to High(FloatMap) do FAotFloatRegMap[i] := FloatMap[i];
+  SetLength(FAotStringRegMap, Length(StringMap));
+  for i := 0 to High(StringMap) do FAotStringRegMap[i] := StringMap[i];
+end;
+
+function TBytecodeProgram.AotRemapIntReg(OldReg: Integer): Integer;
+begin
+  // Identity when the pass has not run (map empty) or the index is beyond the scanned range.
+  if (OldReg >= 0) and (OldReg < Length(FAotIntRegMap)) then
+    Result := FAotIntRegMap[OldReg]
+  else
+    Result := OldReg;
+end;
+
+function TBytecodeProgram.AotRemapFloatReg(OldReg: Integer): Integer;
+begin
+  if (OldReg >= 0) and (OldReg < Length(FAotFloatRegMap)) then
+    Result := FAotFloatRegMap[OldReg]
+  else
+    Result := OldReg;
+end;
+
+function TBytecodeProgram.AotRemapStringReg(OldReg: Integer): Integer;
+begin
+  if (OldReg >= 0) and (OldReg < Length(FAotStringRegMap)) then
+    Result := FAotStringRegMap[OldReg]
+  else
+    Result := OldReg;
 end;
 
 procedure TBytecodeProgram.SetVarRegCounts(IntCount, FloatCount, StringCount: Integer);

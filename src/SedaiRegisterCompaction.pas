@@ -2261,6 +2261,11 @@ begin
   // Step 4: Rewrite array metadata (DimRegisters for variable-sized arrays)
   RewriteArrayMetadata;
 
+  // Step 5: Hand the per-bank remaps to the program for the AOT backend (they would
+  // otherwise die with this object; the AOT composes post-regalloc SSA register
+  // indexes through them to get the exact bank indexes the interpreter uses).
+  FProgram.SetAotRegMaps(FIntRegMap, FFloatRegMap, FStringRegMap);
+
   // Calculate reduction
   OldTotal := (FMaxOldIntReg + 1) + (FMaxOldFloatReg + 1) + (FMaxOldStringReg + 1);
   NewTotal := FNewIntRegCount + FNewFloatRegCount + FNewStringRegCount;
