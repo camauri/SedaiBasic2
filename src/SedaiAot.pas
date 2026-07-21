@@ -638,6 +638,11 @@ var
   ILoc, FLoc: array of Integer;         // final VM reg -> native reg (or -1)
   IUse, FUse: array of Integer;         // usage counts
   AUse: array of Integer;               // array id -> element-access count (J5c/J6f cache)
+  ArrCountNeeded: array of Boolean;     // array id -> has a non-BoundsSafe access (grown with AUse):
+                                        // the cached COUNT is consumed only by the non-safe compare;
+                                        // a safe access reads just the base and AotArrBound reads the
+                                        // descriptor directly - caching the count of an all-safe array
+                                        // wastes a GPR a base could use (reload avoided per access).
   MaxIReg, MaxFReg, MaxArrId: Integer;
   IAllocd, FAllocd: array of Integer;   // allocated VM regs in pool order
   NIAlloc, NFAlloc: Integer;
@@ -1851,8 +1856,13 @@ var
               CountVal(Ins.Dest); CountVal(Ins.Src2);
               if Ins.Src1.ArrayIndex > MaxArrId then MaxArrId := Ins.Src1.ArrayIndex;
               if Ins.Src1.ArrayIndex >= Length(AUse) then
+              begin
                 SetLength(AUse, Ins.Src1.ArrayIndex * 2 + 8);
+                SetLength(ArrCountNeeded, Length(AUse));
+              end;
               Inc(AUse[Ins.Src1.ArrayIndex], UseW);   // loop-weighted, like CountVal
+              if not Ins.BoundsSafe then
+                ArrCountNeeded[Ins.Src1.ArrayIndex] := True;
             end;
           end;
           ssaArrayLBound, ssaArrayUBound:
@@ -1969,9 +1979,13 @@ var
         begin best := r; bestUse := IUse[r]; bestKind := -1; end;
       for id := 0 to MaxArrId do
       begin
+        // For a BASE, AUse is exactly the dynamic reload count avoided by caching (one reload
+        // per access, loop-weighted). A COUNT competes only when some non-safe access will
+        // actually read it - an all-BoundsSafe array's count slot would be dead weight.
         if (not TakenAB[id]) and (AUse[id] > bestUse) then
         begin best := id; bestUse := AUse[id]; bestKind := 0; end;
-        if (not TakenAC[id]) and (AUse[id] > bestUse) then
+        if (not TakenAC[id]) and (id <= High(ArrCountNeeded)) and ArrCountNeeded[id] and
+           (AUse[id] > bestUse) then
         begin best := id; bestUse := AUse[id]; bestKind := 1; end;
       end;
       if bestKind = -2 then Break;
@@ -2342,6 +2356,7 @@ begin
   SetLength(IUse, 16); SetLength(FUse, 16); SetLength(AUse, 8);
   NFix := 0; NIAlloc := 0; NFAlloc := 0;
   NACache := 0;
+  SetLength(ArrCountNeeded, 0); SetLength(ArrCountNeeded, 8);
   SetLength(ACacheId, Length(IntPool));
   SetLength(ACacheKind, Length(IntPool));
   SetLength(ACacheReg, Length(IntPool));
