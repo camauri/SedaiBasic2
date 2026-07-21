@@ -1683,6 +1683,73 @@ var
     b, j, o: Integer;
     Blk: TSSABasicBlock;
     Ins: TSSAInstruction;
+    UseW: Integer;                      // current block's loop-depth weight (B1b-lite)
+    BlockW: array of Integer;           // region-relative block index -> weight
+
+    // B1b-lite: weight use counts by loop depth, so the greedy allocator stops preferring
+    // init-code registers (many STATIC occurrences, run once) over hot-loop registers (few
+    // occurrences, run a million times). A backward jump to block T from block B marks the
+    // contiguous interval [T..B] as a loop body - exact for the reducible, contiguously
+    // laid-out loops FOR/WHILE/DO produce. Deduped per header (a CONTINUE adds a second
+    // back edge to the same header, which must not double the weight): each header applies
+    // one x8 over [header..furthest back-jump source], capped at x512 (3 nesting levels).
+    procedure ComputeBlockWeights;
+    var
+      L: TStringList;
+      bb, jj, d, t, w: Integer;
+      HdrT, HdrEnd: array of Integer;
+      NHdr: Integer;
+      B2: TSSABasicBlock;
+      I2: TSSAInstruction;
+    begin
+      SetLength(BlockW, Region.LastBlock - Region.FirstBlock + 1);
+      for bb := 0 to High(BlockW) do BlockW[bb] := 1;
+      NHdr := 0;
+      SetLength(HdrT, 8); SetLength(HdrEnd, 8);
+      L := TStringList.Create;
+      try
+        L.Sorted := True;
+        L.Duplicates := dupIgnore;
+        for bb := Region.FirstBlock to Region.LastBlock do
+          if SSAProg.Blocks[bb].LabelName <> '' then
+            L.AddObject(SSAProg.Blocks[bb].LabelName, TObject(PtrInt(bb)));
+        for bb := Region.FirstBlock to Region.LastBlock do
+        begin
+          B2 := SSAProg.Blocks[bb];
+          for jj := 0 to B2.Instructions.Count - 1 do
+          begin
+            I2 := B2.Instructions[jj];
+            if (I2.OpCode <> ssaJump) and (I2.OpCode <> ssaJumpIfZero) and
+               (I2.OpCode <> ssaJumpIfNotZero) then Continue;
+            if I2.Dest.Kind <> svkLabel then Continue;
+            d := L.IndexOf(I2.Dest.LabelName);
+            if d < 0 then Continue;
+            t := PtrInt(L.Objects[d]);
+            if t > bb then Continue;                     // forward edge: not a loop
+            for d := 0 to NHdr - 1 do
+              if HdrT[d] = t then
+              begin
+                if bb > HdrEnd[d] then HdrEnd[d] := bb;  // same header: widen, don't re-count
+                t := -1;
+                Break;
+              end;
+            if t < 0 then Continue;
+            if NHdr >= Length(HdrT) then
+            begin SetLength(HdrT, NHdr * 2); SetLength(HdrEnd, NHdr * 2); end;
+            HdrT[NHdr] := t; HdrEnd[NHdr] := bb; Inc(NHdr);
+          end;
+        end;
+      finally
+        L.Free;
+      end;
+      for d := 0 to NHdr - 1 do
+        for bb := HdrT[d] to HdrEnd[d] do
+        begin
+          w := BlockW[bb - Region.FirstBlock];
+          if w < 512 then BlockW[bb - Region.FirstBlock] := w * 8;
+        end;
+    end;
+
     procedure CountVal(const V: TSSAValue);
     var r: Integer;
     begin
@@ -1693,14 +1760,14 @@ var
           if r < 0 then begin Fail('unmapped-reg'); Exit; end;
           if r > MaxIReg then MaxIReg := r;
           if r >= Length(IUse) then SetLength(IUse, r * 2 + 16);
-          Inc(IUse[r]);
+          Inc(IUse[r], UseW);
         end;
         srtFloat: begin
           r := Prog.AotRemapFloatReg(V.RegIndex);
           if r < 0 then begin Fail('unmapped-reg'); Exit; end;
           if r > MaxFReg then MaxFReg := r;
           if r >= Length(FUse) then SetLength(FUse, r * 2 + 16);
-          Inc(FUse[r]);
+          Inc(FUse[r], UseW);
         end;
         else Fail('string-operand');
       end;
@@ -1722,10 +1789,13 @@ var
       end;
     end;
   begin
+    ComputeBlockWeights;
+    UseW := 1;
     o := Region.FirstOrdinal;
     for b := Region.FirstBlock to Region.LastBlock do
     begin
       Blk := SSAProg.Blocks[b];
+      UseW := BlockW[b - Region.FirstBlock];
       for j := 0 to Blk.Instructions.Count - 1 do
       begin
         Ins := Blk.Instructions[j];
@@ -1782,7 +1852,7 @@ var
               if Ins.Src1.ArrayIndex > MaxArrId then MaxArrId := Ins.Src1.ArrayIndex;
               if Ins.Src1.ArrayIndex >= Length(AUse) then
                 SetLength(AUse, Ins.Src1.ArrayIndex * 2 + 8);
-              Inc(AUse[Ins.Src1.ArrayIndex]);
+              Inc(AUse[Ins.Src1.ArrayIndex], UseW);   // loop-weighted, like CountVal
             end;
           end;
           ssaArrayLBound, ssaArrayUBound:
