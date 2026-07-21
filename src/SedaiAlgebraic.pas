@@ -78,9 +78,14 @@ type
     FProgram: TSSAProgram;
     FSimplifications: Integer;
     FConstMap: TFPHashList;  // Key: "RegIndex:Version" → Value: PSSAValueWrapper (constant value)
+    FUserVarKeys: TFPHashList;         // Set of exact VarRegMap values ("RegType:RegIndex")
+    FUserVarRegIndex: array of Boolean; // RegIndex → mapped to a user variable in ANY bank
 
     { Make string key from register value: "RegIndex:Version" }
     function MakeRegKey(const RegVal: TSSAValue): string; inline;
+
+    { Precompute the user-variable lookup structures from FProgram.VarRegMap }
+    procedure BuildUserVarIndex;
 
     { Build map of registers that hold known constant values }
     procedure BuildConstantMap;
@@ -131,6 +136,7 @@ begin
   FProgram := Prog;
   FSimplifications := 0;
   FConstMap := TFPHashList.Create;
+  FUserVarKeys := TFPHashList.Create;
 end;
 
 destructor TAlgebraicSimplification.Destroy;
@@ -146,6 +152,7 @@ begin
       Dispose(P);
   end;
   FConstMap.Free;
+  FUserVarKeys.Free;
   inherited;
 end;
 
@@ -163,10 +170,13 @@ begin
     WriteLn('[Algebraic] Running algebraic simplification...');
   {$ENDIF}
 
-  // Step 1: Build constant map (track registers holding constant values)
+  // Step 1: Precompute the user-variable lookup (VarRegMap does not change during this pass)
+  BuildUserVarIndex;
+
+  // Step 2: Build constant map (track registers holding constant values)
   BuildConstantMap;
 
-  // Step 2: Simplify using algebraic rules
+  // Step 3: Simplify using algebraic rules
   SimplifyBlocks;
 
   {$IFDEF DEBUG_ALGEBRAIC}
@@ -268,10 +278,37 @@ begin
   {$ENDIF}
 end;
 
+procedure TAlgebraicSimplification.BuildUserVarIndex;
+var
+  i, ColonPos, RegIdx: Integer;
+  MappedKey: string;
+begin
+  // VarRegMap values are "RegType:RegIndex". Precompute:
+  //   - FUserVarKeys: hash set of the exact values (exact-key queries)
+  //   - FUserVarRegIndex: bitmap of every mapped RegIndex, bank-blind
+  //     (matches the historical "any bank" scan for "RegIndex:Version" queries)
+  for i := 0 to FProgram.VarRegMap.Count - 1 do
+  begin
+    MappedKey := FProgram.VarRegMap.ValueFromIndex[i];
+    if FUserVarKeys.FindIndexOf(MappedKey) < 0 then
+      FUserVarKeys.Add(MappedKey, Pointer(1));
+
+    ColonPos := Pos(':', MappedKey);
+    if ColonPos > 0 then
+    begin
+      RegIdx := StrToIntDef(Copy(MappedKey, ColonPos + 1, Length(MappedKey)), -1);
+      if RegIdx >= 0 then
+      begin
+        if RegIdx >= Length(FUserVarRegIndex) then
+          SetLength(FUserVarRegIndex, RegIdx + 1);
+        FUserVarRegIndex[RegIdx] := True;
+      end;
+    end;
+  end;
+end;
+
 function TAlgebraicSimplification.IsUserVariable(const VarKey: string): Boolean;
 var
-  i: Integer;
-  MappedKey: string;
   RegIdx: Integer;
   ColonPos: Integer;
 begin
@@ -279,47 +316,20 @@ begin
   // VarKey can be in two formats:
   //   - From MakeRegKey: "RegIndex:Version" (e.g., "5:0")
   //   - From SimplifyArithmetic: "RegType:RegIndex" (e.g., "1:5")
-  // FProgram.VarRegMap stores: "RegType:RegIndex"
-  //
-  // We need to extract RegIndex from VarKey and check against VarRegMap values
+  // Lookup structures are precomputed from VarRegMap by BuildUserVarIndex.
   Result := False;
 
-  // Extract second number from VarKey (after the colon)
-  // This works for both formats: "RegIndex:Version" → get RegIndex, "RegType:RegIndex" → get RegIndex
   ColonPos := Pos(':', VarKey);
   if ColonPos = 0 then Exit;
 
-  // For "RegType:RegIndex" format from SimplifyArithmetic, check directly
-  for i := 0 to FProgram.VarRegMap.Count - 1 do
-  begin
-    MappedKey := FProgram.VarRegMap.ValueFromIndex[i];
-    if MappedKey = VarKey then
-    begin
-      Result := True;
-      Exit;
-    end;
-  end;
+  // Exact "RegType:RegIndex" match (SimplifyArithmetic queries)
+  if FUserVarKeys.FindIndexOf(VarKey) >= 0 then
+    Exit(True);
 
-  // For "RegIndex:Version" format from BuildConstantMap/MakeRegKey, extract RegIndex and check
-  // MakeRegKey produces "RegIndex:Version", but VarRegMap stores "RegType:RegIndex"
-  // So we need to check if any VarRegMap value ends with the same RegIndex
+  // "RegIndex:Version" queries: the leading number is a RegIndex; a register is a
+  // user variable if that index is mapped in ANY bank (conservative, as before)
   RegIdx := StrToIntDef(Copy(VarKey, 1, ColonPos - 1), -1);
-  if RegIdx < 0 then Exit;
-
-  for i := 0 to FProgram.VarRegMap.Count - 1 do
-  begin
-    MappedKey := FProgram.VarRegMap.ValueFromIndex[i];
-    // MappedKey is "RegType:RegIndex" - extract RegIndex (after colon)
-    ColonPos := Pos(':', MappedKey);
-    if ColonPos > 0 then
-    begin
-      if StrToIntDef(Copy(MappedKey, ColonPos + 1, Length(MappedKey)), -1) = RegIdx then
-      begin
-        Result := True;
-        Exit;
-      end;
-    end;
-  end;
+  Result := (RegIdx >= 0) and (RegIdx < Length(FUserVarRegIndex)) and FUserVarRegIndex[RegIdx];
 end;
 
 function TAlgebraicSimplification.ResolveToConst(const Val: TSSAValue; out ConstVal: TSSAValue): Boolean;
