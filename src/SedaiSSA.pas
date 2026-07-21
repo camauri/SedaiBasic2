@@ -540,6 +540,14 @@ type
     function TryFastDeclaredIdentifier(Node: TASTNode; out Res: TSSAValue): Boolean;
     procedure ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
     procedure ProcessAssignment(Node: TASTNode);
+    function TryCompoundSelfOp(Node, VarNode, ExprNode: TASTNode): Boolean;
+    procedure FillInferredCtorType(VarNode, ExprNode: TASTNode);
+    procedure ProcessDerefStore(VarNode, ExprNode: TASTNode);
+    procedure ProcessIndexedStore(Node, VarNode, ExprNode: TASTNode);
+    procedure ProcessSpecialVarAssign(VarNode, ExprNode: TASTNode);
+    function TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
+    function TryFixedLenStore(const VarName: string; ExprNode: TASTNode): Boolean;
+    function TryRecordCopyAssign(VarNode, ExprNode: TASTNode; const VarName: string): Boolean;
     procedure ProcessArrayStore(Node: TASTNode);
     procedure ProcessPrint(Node: TASTNode);
     procedure ProcessInput(Node: TASTNode);
@@ -5642,14 +5650,14 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
+// Frame diet (same disease as ProcessExpression/ProcessStatement): the rare lvalue shapes and
+// probes live in their own Try*/Process* frames below, so THIS frame — entered for every
+// assignment — keeps only the managed locals of the common scalar path.
 var
   VarNode, ExprNode, SharedAssign: TASTNode;
-  VarName, LhsRecType, RhsRecType, DstRecType, AllocFuncU, RawFieldPointee: string;
-  ExprValue, VarReg, SrcRecHandle: TSSAValue;
+  VarName: string;
+  ExprValue, VarReg: TSSAValue;
   CopyOp: TSSAOpCode;
-  DerefBank: TSSARegisterType;   // FreeBASIC "*p = expr": bank of the pointee
-  FixedCap: Integer;             // fixed-length string capacity (DIM s AS STRING/WSTRING * n)
-  FixedCapReg, FixedTrunc: TSSAValue;
 begin
   // SSAPROF: entry stamp for the lvalue-probe head bucket. Captured HERE, not at the antAssignment
   // call site: antConst / DIM initializers also route through this procedure, and a stale call-site
@@ -5662,47 +5670,12 @@ begin
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
 
-  // A compound "obj op= rhs" on a UDT that overloads the SELF-operator ("Operator T.*= (rhs As Single)")
-  // calls that operator, which mutates the object in place. The parser desugars every "op=" to
-  // "lhs = lhs op rhs", which is a different thing entirely: there may be no binary "op" for the type at
-  // all, and the desugared form then did arithmetic on the record HANDLE. The parser leaves COMPOUNDOP on
-  // the node so the original shape is still known here.
-  if (Node.Attributes.Values['COMPOUNDOP'] <> '') and (ExprNode.NodeType = antBinaryOp) and
-     (ExprNode.ChildCount >= 2) then
-  begin
-    LhsRecType := ObjectTypeName(VarNode);
-    if LhsRecType <> '' then
-    begin
-      RhsRecType := ResolveMethodLabel(LhsRecType,
-                      'OPERATOR' + UpperCase(Node.Attributes.Values['COMPOUNDOP']) + '=');
-      if RhsRecType <> '' then
-      begin
-        SharedAssign := TASTNode.Create(antArgumentList, Node.Token);
-        try
-          SharedAssign.AddChild(ExprNode.GetChild(1).Clone);      // the ORIGINAL right-hand side
-          ProcessMethodCall(VarNode, LhsRecType,
-                            'OPERATOR' + UpperCase(Node.Attributes.Values['COMPOUNDOP']) + '=',
-                            SharedAssign, ExprValue);
-        finally
-          SharedAssign.Free;
-        end;
-        Exit;
-      end;
-    end;
-  end;
+  // A compound "obj op= rhs" on a UDT that overloads the SELF-operator: handled in its own frame.
+  if TryCompoundSelfOp(Node, VarNode, ExprNode) then
+    Exit;
 
-  // FreeBASIC shorthand "obj = Type(args)" (no <T>): the type constructor was parsed with an inferred
-  // (empty) type name; fill it from the LHS's declared UDT so the SSA builds the right temporary.
-  if (ExprNode.NodeType = antArrayAccess) and (ExprNode.Attributes.Values['INFERTYPE'] = '1') and
-     (ExprNode.ChildCount >= 1) then
-  begin
-    LhsRecType := ObjectTypeName(VarNode);
-    if LhsRecType <> '' then
-    begin
-      ExprNode.GetChild(0).Value := LhsRecType;
-      ExprNode.Attributes.Values['INFERTYPE'] := '';
-    end;
-  end;
+  // FreeBASIC shorthand "obj = Type(args)" (no <T>): fill the inferred ctor type from the LHS.
+  FillInferredCtorType(VarNode, ExprNode);
 
   // Record field store: obj.field = expr (M3)
   if VarNode.NodeType = antMemberAccess then
@@ -5719,220 +5692,25 @@ begin
     Exit;
   end;
 
-  // FreeBASIC RAW pointer-deref store through a FIELD: "*obj.field = expr" / "*(@obj.field[i]) = expr"
-  // where the field is a raw "<scalar> PTR". Store SizeOf(pointee) bytes to the raw heap. Type-based (a
-  // field has no pointer name, so the name-based RawPtrExprName branch below cannot resolve it).
-  if (VarNode.NodeType = antDeref) and (RawPtrExprPointee(VarNode.GetChild(0)) <> '') then
-  begin
-    RawFieldPointee := RawPtrExprPointee(VarNode.GetChild(0));
-    ProcessExpression(VarNode.GetChild(0), VarReg);
-    VarReg := EnsureIntRegister(VarReg);
-    ProcessExpression(ExprNode, ExprValue);
-    if (RawFieldPointee = 'SINGLE') or (RawFieldPointee = 'DOUBLE') then
-    begin
-      ExprValue := EnsureFloatRegister(ExprValue);
-      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
-    end
-    else
-    begin
-      ExprValue := EnsureIntRegister(ExprValue);
-      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
-    end;
-    Exit;
-  end;
-
-  // FreeBASIC RAW pointer-deref store: "*p = expr" / "*(p±n) = expr" where p is Allocate'd → store
-  // SizeOf(T) bytes to the raw heap at the (arithmetic-scaled) byte address.
-  if (VarNode.NodeType = antDeref) and (RawPtrExprName(VarNode.GetChild(0)) <> '') then
-  begin
-    AllocFuncU := RawPtrExprName(VarNode.GetChild(0));   // reuse local for the raw pointer name
-    ProcessExpression(VarNode.GetChild(0), VarReg);
-    VarReg := EnsureIntRegister(VarReg);
-    ProcessExpression(ExprNode, ExprValue);
-    if PointeeBankOf(AllocFuncU) = srtFloat then
-    begin
-      ExprValue := EnsureFloatRegister(ExprValue);
-      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(AllocFuncU)));
-    end
-    else
-    begin
-      ExprValue := EnsureIntRegister(ExprValue);
-      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(AllocFuncU)));
-    end;
-    Exit;
-  end;
-
-  // FreeBASIC pointer-deref store: *p = expr. Store the value into the pointee cell at p's address
-  // (= p's int value). The pointee bank comes from p's declared pointer type.
+  // FreeBASIC pointer-deref store, all shapes ("*obj.field", "*p" raw, "*p" managed): own frame.
   if VarNode.NodeType = antDeref then
   begin
-    ProcessExpression(VarNode.GetChild(0), VarReg);
-    VarReg := EnsureIntRegister(VarReg);
-    DerefBank := DerefOperandBank(VarNode.GetChild(0));
-    ProcessExpression(ExprNode, ExprValue);
-    case DerefBank of
-      srtFloat:
-        begin
-          ExprValue := EnsureFloatRegister(ExprValue);
-          EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
-        end;
-      srtString:
-        begin
-          ExprValue := EnsureStringRegister(ExprValue);
-          EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
-        end;
-    else
-      ExprValue := EnsureIntRegister(ExprValue);
-      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
-    end;
+    ProcessDerefStore(VarNode, ExprNode);
     Exit;
   end;
 
-  // FreeBASIC BYREF function result as an lvalue: "f(args) = expr". The call returns the address of
-  // the referenced variable; store expr through it (parsed like an array access / call target).
-  if (VarNode.NodeType = antArrayAccess) and (VarNode.ChildCount >= 1) and
-     (VarNode.GetChild(0).NodeType = antIdentifier) and
-     IsByrefRetFunc(VarToStr(VarNode.GetChild(0).Value)) then
-  begin
-    VarName := VarToStr(VarNode.GetChild(0).Value);
-    if VarNode.ChildCount >= 2 then
-      EmitProcedureCall(VarName, VarNode.GetChild(1))
-    else
-      EmitProcedureCall(VarName, nil);
-    VarReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitXferLoad(srtInt, XFER_RESULT_SLOT, VarReg);   // VarReg = returned address
-    DerefBank := ByrefRetPointeeBank(VarName);
-    ProcessExpression(ExprNode, ExprValue);
-    case DerefBank of
-      srtFloat:
-        begin
-          ExprValue := EnsureFloatRegister(ExprValue);
-          EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
-        end;
-      srtString:
-        begin
-          ExprValue := EnsureStringRegister(ExprValue);
-          EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
-        end;
-    else
-      ExprValue := EnsureIntRegister(ExprValue);
-      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
-    end;
-    Exit;
-  end;
-
-  // FreeBASIC RAW pointer FIELD indexing as an lvalue: "obj.field[i] = expr" where obj.field is a
-  // "<scalar> PTR" field. Store SizeOf(pointee) bytes at (field value) + i*SizeOf(pointee) on the raw heap.
-  if (VarNode.NodeType = antArrayAccess) and (VarNode.ChildCount >= 2) and
-     (VarNode.GetChild(0).NodeType = antMemberAccess) and
-     (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) and
-     (MemberRawPtrPointee(VarNode.GetChild(0)) <> '') then
-  begin
-    RawFieldPointee := MemberRawPtrPointee(VarNode.GetChild(0));
-    VarReg := EmitRawFieldIndexAddress(VarNode.GetChild(0), VarNode.GetChild(1), RawFieldPointee);
-    ProcessExpression(ExprNode, ExprValue);
-    if (RawFieldPointee = 'SINGLE') or (RawFieldPointee = 'DOUBLE') then
-    begin
-      ExprValue := EnsureFloatRegister(ExprValue);
-      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
-    end
-    else
-    begin
-      ExprValue := EnsureIntRegister(ExprValue);
-      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
-    end;
-    Exit;
-  end;
-
-  // FreeBASIC RAW pointer indexing as an lvalue: "p[i] = expr" where p is Allocate'd. Store SizeOf(T)
-  // bytes at p + i*SizeOf(T) into the raw heap.
-  if (VarNode.NodeType = antArrayAccess) and (VarNode.ChildCount >= 2) and
-     (VarNode.GetChild(0).NodeType = antIdentifier) and
-     (ArrayIndexOf(VarToStr(VarNode.GetChild(0).Value)) < 0) and
-     IsRawPtr(VarToStr(VarNode.GetChild(0).Value)) and
-     (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
-  begin
-    VarName := VarToStr(VarNode.GetChild(0).Value);
-    VarReg := EmitPointerIndexAddress(VarName, VarNode.GetChild(1));
-    ProcessExpression(ExprNode, ExprValue);
-    if PointeeBankOf(VarName) = srtFloat then
-    begin
-      ExprValue := EnsureFloatRegister(ExprValue);
-      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(VarName)));
-    end
-    else
-    begin
-      ExprValue := EnsureIntRegister(ExprValue);
-      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(VarName)));
-    end;
-    Exit;
-  end;
-
-  // FreeBASIC pointer indexing as an lvalue: "p[i] = expr" (also "p(i) = expr") ≡ *(p + i) = expr.
-  if (VarNode.NodeType = antArrayAccess) and (VarNode.ChildCount >= 2) and
-     (VarNode.GetChild(0).NodeType = antIdentifier) and
-     (ArrayIndexOf(VarToStr(VarNode.GetChild(0).Value)) < 0) and
-     (ManagedPtrPointee(VarToStr(VarNode.GetChild(0).Value)) <> '') and
-     (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
-  begin
-    VarName := VarToStr(VarNode.GetChild(0).Value);
-    VarReg := EmitPointerIndexAddress(VarName, VarNode.GetChild(1));
-    DerefBank := PointeeBankOf(VarName);
-    ProcessExpression(ExprNode, ExprValue);
-    // "p[i] = <UDT value>" for a pointer-to-UDT: p+i is element i's record handle (managed pointer,
-    // unscaled), so copy the source record's CONTENTS into it -- value semantics, recursive, member
-    // arrays included -- exactly like an array-of-UDT element assignment. The scalar ssaRefStoreInt
-    // below took the record HANDLE (bit 62 set) for a raw pointer address and faulted, and would not
-    // have copied the fields anyway. Only a MANAGED pointee UDT: the pointee bank is srtInt (a handle).
-    DstRecType := ManagedPtrPointee(VarName);
-    if (FindUDT(DstRecType) >= 0) and (ExprValue.Kind = svkRegister) and (ExprValue.RegType = srtInt) then
-    begin
-      EmitRecordCopy(VarReg, ExprValue, FindUDT(DstRecType));
-      Exit;
-    end;
-    case DerefBank of
-      srtFloat:
-        begin
-          ExprValue := EnsureFloatRegister(ExprValue);
-          EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
-        end;
-      srtString:
-        begin
-          ExprValue := EnsureStringRegister(ExprValue);
-          EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
-        end;
-    else
-      ExprValue := EnsureIntRegister(ExprValue);
-      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
-    end;
-    Exit;
-  end;
-
-  // Check if target is array access (array store)
+  // Indexed lvalue, all shapes (BYREF-ret call, raw field/ptr indexing, managed ptr indexing,
+  // plain array store): own frame.
   if VarNode.NodeType = antArrayAccess then
   begin
-    ProcessArrayStore(Node);
+    ProcessIndexedStore(Node, VarNode, ExprNode);
     Exit;
   end;
 
-  // Check if target is special variable (TI$ can be assigned)
+  // Special variable lvalue (TI$ = ... ; DT$/TI are read-only): own frame.
   if VarNode.NodeType = antSpecialVariable then
   begin
-    VarName := UpperCase(VarToStr(VarNode.Value));
-    if VarName = 'TI$' then
-    begin
-      // TI$ = "HHMMSS" - set time offset
-      ProcessExpression(ExprNode, ExprValue);
-      // Ensure we have a string register
-      if ExprValue.Kind = svkConstString then
-      begin
-        VarReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-        EmitInstruction(ssaLoadConstString, VarReg, ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-        ExprValue := VarReg;
-      end;
-      EmitInstruction(ssaStoreTIS, MakeSSAValue(svkNone), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    end;
-    // DT$ and TI are read-only - ignore assignments
+    ProcessSpecialVarAssign(VarNode, ExprNode);
     Exit;
   end;
 
@@ -5961,70 +5739,13 @@ begin
     Exit;
   end;
 
-  // FreeBASIC raw heap: "p = Allocate(n)" / "CAllocate(n)" / "Reallocate(q,n)" — allocate/resize a byte
-  // block and store the raw pointer (a RAWPTR_TAG byte offset) into p.
-  if IsAllocCall(ExprNode, AllocFuncU) then
-  begin
-    // Option B (raw-UDT-deref): when p is a pointer to a UDT ("Dim As T Ptr p = Callocate/Allocate(...)"),
-    // allocate a MANAGED record instance rather than a raw byte block, so "p->field" — which already
-    // lowers to managed record access via PointerUDTType — resolves against real storage. This is the
-    // FreeBASIC linked-list/tree idiom; the count/size arguments are ignored (one record, zero-initialized
-    // by EmitRecordInit). p is NOT marked raw (see CollectRawPtrVars), so it stays a managed handle. Scalar
-    // /byte pointees keep the raw byte-heap path below. REALLOCATE of a UDT pointer stays raw (rare).
-    LhsRecType := PointerUDTType(VarName);
-    if (LhsRecType <> '') and (AllocFuncU <> 'REALLOCATE') then
-    begin
-      FixedCap := FindUDT(LhsRecType);
-      // Record COUNT: CALLOCATE(count, SizeOf(T)) allocates a block of `count` records (arg 0); ALLOCATE
-      // (single byte-count arg) allocates one. A block of N CONSECUTIVE shared records makes "p[i]" (p + i)
-      // index the i-th; a single record covers the linked-list/tree node case. Both live in the shared
-      // region (handle non-zero, honours "p <> 0"; persists past the frame like Allocate).
-      if (UpperCase(AllocFuncU) = 'CALLOCATE') and (ExprNode.ChildCount >= 2) and
-         (ExprNode.GetChild(1).ChildCount >= 2) then
-        ProcessExpression(ExprNode.GetChild(1).GetChild(0), FixedCapReg)   // the element count
-      else
-        FixedCapReg := MakeSSAConstInt(1);
-      ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaRecordNewBlock, ExprValue, EnsureIntRegister(FixedCapReg),
-                      MakeSSAConstInt((Int64(FUDTs[FixedCap].NInt) and $FFFF)
-                                      or ((Int64(FUDTs[FixedCap].NFloat) and $FFFF) shl 16)
-                                      or ((Int64(FUDTs[FixedCap].NStr) and $FFFF) shl 32)
-                                      or ((Int64(FixedCap) and $FFFF) shl 48)),
-                      MakeSSAValue(svkNone));
-      EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      // A SHARED UDT pointer keeps its handle in element 0 of its backing array; publish it there so a
-      // deref from another procedure (or module level) sees the allocated record, not a stale 0.
-      if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
-      // Give every record of the block its member-array/nested-UDT backing, as ssaRecordNew does for a
-      // plain instance -- AllocSharedRecordBlock only sizes the flat slots. Without this "p->item(i)"
-      // reaches an unallocated member array (handle 0) and faults. Allocate does NOT run the constructor
-      // (FreeBASIC gives raw, zeroed storage), so only the storage is set up.
-      EmitRecordBlockInit(GetOrAllocateVariable(VarName), FixedCapReg, FixedCap);
-      Exit;
-    end;
-    EmitRawAlloc(ExprNode, ExprValue);
-    EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
+  // FreeBASIC raw heap: "p = Allocate/CAllocate/Reallocate(...)": own frame (probe included).
+  if TryAllocAssign(VarName, ExprNode) then
     Exit;
-  end;
 
-  // Fixed-length string (DIM s AS STRING/WSTRING * n): truncate the assigned value to the capacity
-  // (codepoints for a WSTRING, bytes otherwise). Plain string scalars only — SHARED/@-taken fall through.
-  FixedCap := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
-  if (FixedCap > 0) and not IsSharedScalar(VarName) and not IsAddrLocal(VarName) then
-  begin
-    ProcessStringExpression(ExprNode, ExprValue);
-    ExprValue := EnsureStringRegister(ExprValue);
-    FixedCapReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, FixedCapReg, MakeSSAConstInt(FixedCap), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    FixedTrunc := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-    if IsWStringVar(VarName) then
-      EmitInstruction(ssaStrLeftW, FixedTrunc, ExprValue, FixedCapReg, MakeSSAValue(svkNone))
-    else
-      EmitInstruction(ssaStrLeft, FixedTrunc, ExprValue, FixedCapReg, MakeSSAValue(svkNone));
-    EmitInstruction(ssaCopyString, GetOrAllocateVariable(VarName), FixedTrunc, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // Fixed-length string (DIM s AS STRING/WSTRING * n): own frame (capacity probe included).
+  if TryFixedLenStore(VarName, ExprNode) then
     Exit;
-  end;
 
   // Refinement #2: a builtin SHARED scalar is backed by a 1-element global array — store to element 0 (a
   // live cross-thread write), reusing the array-store lowering. A SHARED UDT scalar is excluded here: its
@@ -6134,23 +5855,9 @@ begin
     Exit;
   end;
 
-  // Value-semantics record assignment (FreeBASIC): "a = b" between UDT variables copies b's fields
-  // into a's own instance (memberwise, recursive for nested UDTs) — it does NOT alias the handle.
-  // The source may be a record var, array element or member access (ResolveRecordObject handles
-  // those); a function-call source returning a UDT is covered later (return-by-value increment).
-  LhsRecType := VarRecordTypeName(VarName);
-  if (LhsRecType <> '') and ResolveRecordObject(ExprNode, SrcRecHandle, RhsRecType) then
-  begin
-    // The destination's handle must be resolved exactly like the source's: a SHARED UDT keeps its
-    // record handle in element 0 of its backing array, not in a plain register (which is why member
-    // stores, PRINT and SWAP -- all of which go through ResolveRecordObject/ProcessExpression -- work
-    // on one). Reading the local register instead yielded handle 0, so the copy landed on whatever
-    // record owns slot 0 (typically a live parameter instance) and the shared variable never changed.
-    if not ResolveRecordObject(VarNode, VarReg, DstRecType) then
-      VarReg := GetOrAllocateVariable(VarName);        // a's handle (own instance from its DIM)
-    EmitRecordCopy(VarReg, SrcRecHandle, FindUDT(LhsRecType));
+  // Value-semantics record assignment (FreeBASIC): "a = b" between UDT variables — own frame.
+  if TryRecordCopyAssign(VarNode, ExprNode, VarName) then
     Exit;
-  end;
 
   // FreeBASIC "Operator T.Cast() As String": assigning such a UDT to a STRING converts through the cast,
   // exactly as PRINT and "&" already do. Without this the assignment fell through to the generic scalar
@@ -6286,6 +5993,393 @@ begin
   ProfQPC(ProfTailT1);
   Inc(ProfTailTicks, ProfTailT1 - ProfTailT0);
   {$ENDIF}
+end;
+
+function TSSAGenerator.TryCompoundSelfOp(Node, VarNode, ExprNode: TASTNode): Boolean;
+// A compound "obj op= rhs" on a UDT that overloads the SELF-operator ("Operator T.*= (rhs As Single)")
+// calls that operator, which mutates the object in place. The parser desugars every "op=" to
+// "lhs = lhs op rhs", which is a different thing entirely: there may be no binary "op" for the type at
+// all, and the desugared form then did arithmetic on the record HANDLE. The parser leaves COMPOUNDOP on
+// the node so the original shape is still known here.
+var
+  LhsRecType, OpLabel: string;
+  ArgsNode: TASTNode;
+  CallResult: TSSAValue;
+begin
+  Result := False;
+  if (Node.Attributes.Values['COMPOUNDOP'] <> '') and (ExprNode.NodeType = antBinaryOp) and
+     (ExprNode.ChildCount >= 2) then
+  begin
+    LhsRecType := ObjectTypeName(VarNode);
+    if LhsRecType <> '' then
+    begin
+      OpLabel := ResolveMethodLabel(LhsRecType,
+                   'OPERATOR' + UpperCase(Node.Attributes.Values['COMPOUNDOP']) + '=');
+      if OpLabel <> '' then
+      begin
+        ArgsNode := TASTNode.Create(antArgumentList, Node.Token);
+        try
+          ArgsNode.AddChild(ExprNode.GetChild(1).Clone);      // the ORIGINAL right-hand side
+          ProcessMethodCall(VarNode, LhsRecType,
+                            'OPERATOR' + UpperCase(Node.Attributes.Values['COMPOUNDOP']) + '=',
+                            ArgsNode, CallResult);
+        finally
+          ArgsNode.Free;
+        end;
+        Result := True;
+      end;
+    end;
+  end;
+end;
+
+procedure TSSAGenerator.FillInferredCtorType(VarNode, ExprNode: TASTNode);
+// FreeBASIC shorthand "obj = Type(args)" (no <T>): the type constructor was parsed with an inferred
+// (empty) type name; fill it from the LHS's declared UDT so the SSA builds the right temporary.
+var
+  LhsRecType: string;
+begin
+  if (ExprNode.NodeType = antArrayAccess) and (ExprNode.Attributes.Values['INFERTYPE'] = '1') and
+     (ExprNode.ChildCount >= 1) then
+  begin
+    LhsRecType := ObjectTypeName(VarNode);
+    if LhsRecType <> '' then
+    begin
+      ExprNode.GetChild(0).Value := LhsRecType;
+      ExprNode.Attributes.Values['INFERTYPE'] := '';
+    end;
+  end;
+end;
+
+procedure TSSAGenerator.ProcessDerefStore(VarNode, ExprNode: TASTNode);
+// "*<expr> = expr" in all its shapes. Probe order preserved from the historical inline cascade:
+// raw FIELD pointee (type-based), raw pointer by NAME (Allocate'd), then the managed deref.
+var
+  RawFieldPointee, RawPtrName: string;
+  VarReg, ExprValue: TSSAValue;
+  DerefBank: TSSARegisterType;
+begin
+  // FreeBASIC RAW pointer-deref store through a FIELD: "*obj.field = expr" / "*(@obj.field[i]) = expr"
+  // where the field is a raw "<scalar> PTR". Store SizeOf(pointee) bytes to the raw heap. Type-based (a
+  // field has no pointer name, so the name-based RawPtrExprName branch below cannot resolve it).
+  if RawPtrExprPointee(VarNode.GetChild(0)) <> '' then
+  begin
+    RawFieldPointee := RawPtrExprPointee(VarNode.GetChild(0));
+    ProcessExpression(VarNode.GetChild(0), VarReg);
+    VarReg := EnsureIntRegister(VarReg);
+    ProcessExpression(ExprNode, ExprValue);
+    if (RawFieldPointee = 'SINGLE') or (RawFieldPointee = 'DOUBLE') then
+    begin
+      ExprValue := EnsureFloatRegister(ExprValue);
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
+    end
+    else
+    begin
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
+    end;
+    Exit;
+  end;
+
+  // FreeBASIC RAW pointer-deref store: "*p = expr" / "*(p±n) = expr" where p is Allocate'd → store
+  // SizeOf(T) bytes to the raw heap at the (arithmetic-scaled) byte address.
+  if RawPtrExprName(VarNode.GetChild(0)) <> '' then
+  begin
+    RawPtrName := RawPtrExprName(VarNode.GetChild(0));
+    ProcessExpression(VarNode.GetChild(0), VarReg);
+    VarReg := EnsureIntRegister(VarReg);
+    ProcessExpression(ExprNode, ExprValue);
+    if PointeeBankOf(RawPtrName) = srtFloat then
+    begin
+      ExprValue := EnsureFloatRegister(ExprValue);
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(RawPtrName)));
+    end
+    else
+    begin
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(RawPtrName)));
+    end;
+    Exit;
+  end;
+
+  // FreeBASIC pointer-deref store: *p = expr. Store the value into the pointee cell at p's address
+  // (= p's int value). The pointee bank comes from p's declared pointer type.
+  ProcessExpression(VarNode.GetChild(0), VarReg);
+  VarReg := EnsureIntRegister(VarReg);
+  DerefBank := DerefOperandBank(VarNode.GetChild(0));
+  ProcessExpression(ExprNode, ExprValue);
+  case DerefBank of
+    srtFloat:
+      begin
+        ExprValue := EnsureFloatRegister(ExprValue);
+        EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+      end;
+    srtString:
+      begin
+        ExprValue := EnsureStringRegister(ExprValue);
+        EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+      end;
+  else
+    ExprValue := EnsureIntRegister(ExprValue);
+    EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+  end;
+end;
+
+procedure TSSAGenerator.ProcessIndexedStore(Node, VarNode, ExprNode: TASTNode);
+// "<name-or-field>(...)/[...] = expr". Probe order preserved from the historical inline cascade:
+// BYREF-ret call lvalue, raw FIELD indexing, raw pointer indexing, managed pointer indexing,
+// then the plain array store.
+var
+  VarName, RawFieldPointee, DstRecType: string;
+  VarReg, ExprValue: TSSAValue;
+  DerefBank: TSSARegisterType;
+begin
+  // FreeBASIC BYREF function result as an lvalue: "f(args) = expr". The call returns the address of
+  // the referenced variable; store expr through it (parsed like an array access / call target).
+  if (VarNode.ChildCount >= 1) and (VarNode.GetChild(0).NodeType = antIdentifier) and
+     IsByrefRetFunc(VarToStr(VarNode.GetChild(0).Value)) then
+  begin
+    VarName := VarToStr(VarNode.GetChild(0).Value);
+    if VarNode.ChildCount >= 2 then
+      EmitProcedureCall(VarName, VarNode.GetChild(1))
+    else
+      EmitProcedureCall(VarName, nil);
+    VarReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitXferLoad(srtInt, XFER_RESULT_SLOT, VarReg);   // VarReg = returned address
+    DerefBank := ByrefRetPointeeBank(VarName);
+    ProcessExpression(ExprNode, ExprValue);
+    case DerefBank of
+      srtFloat:
+        begin
+          ExprValue := EnsureFloatRegister(ExprValue);
+          EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+        end;
+      srtString:
+        begin
+          ExprValue := EnsureStringRegister(ExprValue);
+          EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+        end;
+    else
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+    end;
+    Exit;
+  end;
+
+  // FreeBASIC RAW pointer FIELD indexing as an lvalue: "obj.field[i] = expr" where obj.field is a
+  // "<scalar> PTR" field. Store SizeOf(pointee) bytes at (field value) + i*SizeOf(pointee) on the raw heap.
+  if (VarNode.ChildCount >= 2) and
+     (VarNode.GetChild(0).NodeType = antMemberAccess) and
+     (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) and
+     (MemberRawPtrPointee(VarNode.GetChild(0)) <> '') then
+  begin
+    RawFieldPointee := MemberRawPtrPointee(VarNode.GetChild(0));
+    VarReg := EmitRawFieldIndexAddress(VarNode.GetChild(0), VarNode.GetChild(1), RawFieldPointee);
+    ProcessExpression(ExprNode, ExprValue);
+    if (RawFieldPointee = 'SINGLE') or (RawFieldPointee = 'DOUBLE') then
+    begin
+      ExprValue := EnsureFloatRegister(ExprValue);
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
+    end
+    else
+    begin
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
+    end;
+    Exit;
+  end;
+
+  // FreeBASIC RAW pointer indexing as an lvalue: "p[i] = expr" where p is Allocate'd. Store SizeOf(T)
+  // bytes at p + i*SizeOf(T) into the raw heap.
+  if (VarNode.ChildCount >= 2) and
+     (VarNode.GetChild(0).NodeType = antIdentifier) and
+     (ArrayIndexOf(VarToStr(VarNode.GetChild(0).Value)) < 0) and
+     IsRawPtr(VarToStr(VarNode.GetChild(0).Value)) and
+     (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
+  begin
+    VarName := VarToStr(VarNode.GetChild(0).Value);
+    VarReg := EmitPointerIndexAddress(VarName, VarNode.GetChild(1));
+    ProcessExpression(ExprNode, ExprValue);
+    if PointeeBankOf(VarName) = srtFloat then
+    begin
+      ExprValue := EnsureFloatRegister(ExprValue);
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(VarName)));
+    end
+    else
+    begin
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOf(VarName)));
+    end;
+    Exit;
+  end;
+
+  // FreeBASIC pointer indexing as an lvalue: "p[i] = expr" (also "p(i) = expr") ≡ *(p + i) = expr.
+  if (VarNode.ChildCount >= 2) and
+     (VarNode.GetChild(0).NodeType = antIdentifier) and
+     (ArrayIndexOf(VarToStr(VarNode.GetChild(0).Value)) < 0) and
+     (ManagedPtrPointee(VarToStr(VarNode.GetChild(0).Value)) <> '') and
+     (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
+  begin
+    VarName := VarToStr(VarNode.GetChild(0).Value);
+    VarReg := EmitPointerIndexAddress(VarName, VarNode.GetChild(1));
+    DerefBank := PointeeBankOf(VarName);
+    ProcessExpression(ExprNode, ExprValue);
+    // "p[i] = <UDT value>" for a pointer-to-UDT: p+i is element i's record handle (managed pointer,
+    // unscaled), so copy the source record's CONTENTS into it -- value semantics, recursive, member
+    // arrays included -- exactly like an array-of-UDT element assignment. The scalar ssaRefStoreInt
+    // below took the record HANDLE (bit 62 set) for a raw pointer address and faulted, and would not
+    // have copied the fields anyway. Only a MANAGED pointee UDT: the pointee bank is srtInt (a handle).
+    DstRecType := ManagedPtrPointee(VarName);
+    if (FindUDT(DstRecType) >= 0) and (ExprValue.Kind = svkRegister) and (ExprValue.RegType = srtInt) then
+    begin
+      EmitRecordCopy(VarReg, ExprValue, FindUDT(DstRecType));
+      Exit;
+    end;
+    case DerefBank of
+      srtFloat:
+        begin
+          ExprValue := EnsureFloatRegister(ExprValue);
+          EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+        end;
+      srtString:
+        begin
+          ExprValue := EnsureStringRegister(ExprValue);
+          EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+        end;
+    else
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+    end;
+    Exit;
+  end;
+
+  // Plain array store
+  ProcessArrayStore(Node);
+end;
+
+procedure TSSAGenerator.ProcessSpecialVarAssign(VarNode, ExprNode: TASTNode);
+// Special variable as an lvalue: TI$ can be assigned; DT$ and TI are read-only (ignored).
+var
+  VarName: string;
+  ExprValue, VarReg: TSSAValue;
+begin
+  VarName := UpperCase(VarToStr(VarNode.Value));
+  if VarName = 'TI$' then
+  begin
+    // TI$ = "HHMMSS" - set time offset
+    ProcessExpression(ExprNode, ExprValue);
+    // Ensure we have a string register
+    if ExprValue.Kind = svkConstString then
+    begin
+      VarReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaLoadConstString, VarReg, ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      ExprValue := VarReg;
+    end;
+    EmitInstruction(ssaStoreTIS, MakeSSAValue(svkNone), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+function TSSAGenerator.TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
+// FreeBASIC raw heap: "p = Allocate(n)" / "CAllocate(n)" / "Reallocate(q,n)" — allocate/resize a byte
+// block and store the raw pointer (a RAWPTR_TAG byte offset) into p. Probe included.
+var
+  AllocFuncU, LhsRecType: string;
+  ExprValue, CountReg: TSSAValue;
+  UDTIdx: Integer;
+begin
+  Result := False;
+  if not IsAllocCall(ExprNode, AllocFuncU) then Exit;
+  Result := True;
+
+  // Option B (raw-UDT-deref): when p is a pointer to a UDT ("Dim As T Ptr p = Callocate/Allocate(...)"),
+  // allocate a MANAGED record instance rather than a raw byte block, so "p->field" — which already
+  // lowers to managed record access via PointerUDTType — resolves against real storage. This is the
+  // FreeBASIC linked-list/tree idiom; the count/size arguments are ignored (one record, zero-initialized
+  // by EmitRecordInit). p is NOT marked raw (see CollectRawPtrVars), so it stays a managed handle. Scalar
+  // /byte pointees keep the raw byte-heap path below. REALLOCATE of a UDT pointer stays raw (rare).
+  LhsRecType := PointerUDTType(VarName);
+  if (LhsRecType <> '') and (AllocFuncU <> 'REALLOCATE') then
+  begin
+    UDTIdx := FindUDT(LhsRecType);
+    // Record COUNT: CALLOCATE(count, SizeOf(T)) allocates a block of `count` records (arg 0); ALLOCATE
+    // (single byte-count arg) allocates one. A block of N CONSECUTIVE shared records makes "p[i]" (p + i)
+    // index the i-th; a single record covers the linked-list/tree node case. Both live in the shared
+    // region (handle non-zero, honours "p <> 0"; persists past the frame like Allocate).
+    if (UpperCase(AllocFuncU) = 'CALLOCATE') and (ExprNode.ChildCount >= 2) and
+       (ExprNode.GetChild(1).ChildCount >= 2) then
+      ProcessExpression(ExprNode.GetChild(1).GetChild(0), CountReg)   // the element count
+    else
+      CountReg := MakeSSAConstInt(1);
+    ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordNewBlock, ExprValue, EnsureIntRegister(CountReg),
+                    MakeSSAConstInt((Int64(FUDTs[UDTIdx].NInt) and $FFFF)
+                                    or ((Int64(FUDTs[UDTIdx].NFloat) and $FFFF) shl 16)
+                                    or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
+                                    or ((Int64(UDTIdx) and $FFFF) shl 48)),
+                    MakeSSAValue(svkNone));
+    EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // A SHARED UDT pointer keeps its handle in element 0 of its backing array; publish it there so a
+    // deref from another procedure (or module level) sees the allocated record, not a stale 0.
+    if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
+    // Give every record of the block its member-array/nested-UDT backing, as ssaRecordNew does for a
+    // plain instance -- AllocSharedRecordBlock only sizes the flat slots. Without this "p->item(i)"
+    // reaches an unallocated member array (handle 0) and faults. Allocate does NOT run the constructor
+    // (FreeBASIC gives raw, zeroed storage), so only the storage is set up.
+    EmitRecordBlockInit(GetOrAllocateVariable(VarName), CountReg, UDTIdx);
+    Exit;
+  end;
+  EmitRawAlloc(ExprNode, ExprValue);
+  EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
+end;
+
+function TSSAGenerator.TryFixedLenStore(const VarName: string; ExprNode: TASTNode): Boolean;
+// Fixed-length string (DIM s AS STRING/WSTRING * n): truncate the assigned value to the capacity
+// (codepoints for a WSTRING, bytes otherwise). Plain string scalars only — SHARED/@-taken fall through.
+var
+  FixedCap: Integer;
+  ExprValue, FixedCapReg, FixedTrunc: TSSAValue;
+begin
+  Result := False;
+  FixedCap := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
+  if (FixedCap > 0) and not IsSharedScalar(VarName) and not IsAddrLocal(VarName) then
+  begin
+    ProcessStringExpression(ExprNode, ExprValue);
+    ExprValue := EnsureStringRegister(ExprValue);
+    FixedCapReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, FixedCapReg, MakeSSAConstInt(FixedCap), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    FixedTrunc := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    if IsWStringVar(VarName) then
+      EmitInstruction(ssaStrLeftW, FixedTrunc, ExprValue, FixedCapReg, MakeSSAValue(svkNone))
+    else
+      EmitInstruction(ssaStrLeft, FixedTrunc, ExprValue, FixedCapReg, MakeSSAValue(svkNone));
+    EmitInstruction(ssaCopyString, GetOrAllocateVariable(VarName), FixedTrunc, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Result := True;
+  end;
+end;
+
+function TSSAGenerator.TryRecordCopyAssign(VarNode, ExprNode: TASTNode; const VarName: string): Boolean;
+// Value-semantics record assignment (FreeBASIC): "a = b" between UDT variables copies b's fields
+// into a's own instance (memberwise, recursive for nested UDTs) — it does NOT alias the handle.
+// The source may be a record var, array element or member access (ResolveRecordObject handles
+// those); a function-call source returning a UDT is covered later (return-by-value increment).
+var
+  LhsRecType, RhsRecType, DstRecType: string;
+  SrcRecHandle, VarReg: TSSAValue;
+begin
+  Result := False;
+  LhsRecType := VarRecordTypeName(VarName);
+  if (LhsRecType <> '') and ResolveRecordObject(ExprNode, SrcRecHandle, RhsRecType) then
+  begin
+    // The destination's handle must be resolved exactly like the source's: a SHARED UDT keeps its
+    // record handle in element 0 of its backing array, not in a plain register (which is why member
+    // stores, PRINT and SWAP -- all of which go through ResolveRecordObject/ProcessExpression -- work
+    // on one). Reading the local register instead yielded handle 0, so the copy landed on whatever
+    // record owns slot 0 (typically a live parameter instance) and the shared variable never changed.
+    if not ResolveRecordObject(VarNode, VarReg, DstRecType) then
+      VarReg := GetOrAllocateVariable(VarName);        // a's handle (own instance from its DIM)
+    EmitRecordCopy(VarReg, SrcRecHandle, FindUDT(LhsRecType));
+    Result := True;
+  end;
 end;
 
 procedure TSSAGenerator.ProcessPrint(Node: TASTNode);
