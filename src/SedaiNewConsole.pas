@@ -29,7 +29,9 @@ unit SedaiNewConsole;
 interface
 
 uses
-  Classes, SysUtils, Variants, Math, SDL2, SDL2_ttf, TypInfo,
+  // SedaiSDL2Dyn AFTER SDL2/SDL2_ttf: SDL functions resolve to its runtime-loaded pointers
+  // (no static SDL2.dll import in headless sb); types/constants keep coming from the bindings.
+  Classes, SysUtils, Variants, Math, SDL2, SDL2_ttf, SedaiSDL2Dyn, TypInfo,
   SedaiOutputInterface, SedaiGraphicsModes, SedaiGraphicsTypes,
   SedaiGraphicsMemory, SedaiGraphicsPrimitives, SedaiGraphicsBackend,
   SedaiInputState,
@@ -1065,10 +1067,13 @@ begin
   for i := 0 to MaxAxes - 1 do Axes[i] := -1000.0;
   Result := False;
   if (Id < 0) or (Id > 15) then Exit;
+  // Joystick reads reach SDL without the display path: bind on demand (a headless machine
+  // without the SDL2 library simply reports "no joystick").
+  if not EnsureSDL2Bound then Exit;
   if SDL_WasInit(SDL_INIT_JOYSTICK) = 0 then SDL_InitSubSystem(SDL_INIT_JOYSTICK);
   if GVConJoy[Id] = nil then
   begin
-    if Id >= SDL_NumJoysticks then Exit;
+    if Id >= SDL_NumJoysticks() then Exit;
     GVConJoy[Id] := SDL_JoystickOpen(Id);
     if GVConJoy[Id] = nil then Exit;
   end;
@@ -1335,7 +1340,7 @@ end;
 function TVideoController.InitializeSDL: Boolean;
 begin
   // When SDL is already up (e.g. a fullscreen/mode switch that destroys only the
-  // window/renderer) skip re-init: re-calling SDL_Init/TTF_Init is unnecessary, and
+  // window/renderer) skip re-init: re-calling SDL_Init/TTF_Init() is unnecessary, and
   // the matching CleanupSDL(False) deliberately avoids SDL_Quit so the SAF audio
   // subsystem keeps running across the toggle.
   if FSDLInitialized then
@@ -1346,15 +1351,30 @@ begin
 
   Result := False;
 
+  // Runtime SDL2 binding: load + bind on first use (the static import would tax every
+  // headless launch). Failure here degrades exactly like a failed SDL_Init.
+  if not EnsureSDL2Bound then
+  begin
+    WriteLn('SDL_Init failed: ', SDL_LibName, ' not found');
+    Exit;
+  end;
+
   if SDL_Init(SDL_INIT_VIDEO) < 0 then
   begin
     WriteLn('SDL_Init failed: ', SDL_GetError);
     Exit;
   end;
 
-  if TTF_Init < 0 then
+  if not SDL2DynTTFAvailable then
   begin
-    WriteLn('TTF_Init failed: ', SDL_GetError);
+    WriteLn('TTF_Init() failed: ', TTF_LibName, ' not found');
+    SDL_Quit;
+    Exit;
+  end;
+
+  if TTF_Init() < 0 then
+  begin
+    WriteLn('TTF_Init() failed: ', SDL_GetError);
     SDL_Quit;
     Exit;
   end;
@@ -3755,7 +3775,7 @@ procedure TVideoController.MaybePresentGraphics;
 begin
   if FGraphicsTexture = nil then Exit;
   // Unsigned wrap-safe elapsed check; also presents on the first call (tick 0).
-  if (FLastGfxPresentTick = 0) or ((SDL_GetTicks - FLastGfxPresentTick) >= 16) then
+  if (FLastGfxPresentTick = 0) or ((SDL_GetTicks() - FLastGfxPresentTick) >= 16) then
   begin
     RenderGraphicsTexture;
     Present;  // with PRESENTVSYNC this BLOCKS ~16ms until the next vblank
@@ -3764,7 +3784,7 @@ begin
     // ~16ms and every subsequent shape would present+block again (defeating the
     // throttle -> 256 boxes back to ~4s). Reading the clock here means the next
     // 16ms window is measured from real drawing, so fast loops coalesce.
-    FLastGfxPresentTick := SDL_GetTicks;
+    FLastGfxPresentTick := SDL_GetTicks();
   end;
 end;
 
@@ -6617,7 +6637,7 @@ begin
   // Force the cursor visible so the first post-toggle frame shows it regardless of
   // the blink phase (UpdateCursor still suppresses it while a program is running).
   FCursorVisible := True;
-  FLastCursorBlink := SDL_GetTicks;
+  FLastCursorBlink := SDL_GetTicks();
 
   RenderScreen;
   UpdateCursor;
@@ -6629,7 +6649,7 @@ var
   CurrentTime: Cardinal;
 begin
   Result := False;
-  CurrentTime := SDL_GetTicks;
+  CurrentTime := SDL_GetTicks();
 
   // Toggle cursor visibility every 500ms (C64 timing)
   if CurrentTime - FLastCursorBlink >= CURSOR_BLINK_MS then
@@ -10122,11 +10142,11 @@ begin
   begin
     FProgramInputHandler.ToggleFullscreenRequested := False;
     ToggleFullscreen;
-    FLastVMRenderTick := SDL_GetTicks;  // avoid an immediate double render this tick
+    FLastVMRenderTick := SDL_GetTicks();  // avoid an immediate double render this tick
   end;
 
   // Periodic rendering (~60 FPS)
-  Now := SDL_GetTicks;
+  Now := SDL_GetTicks();
   if (Now - FLastVMRenderTick) >= 16 then
   begin
     // Update sprite auto-movement
@@ -10146,7 +10166,7 @@ end;
 procedure TSedaiNewConsole.BeginVMExecution;
 begin
   FCursorEnabled := False;  // Hide cursor during program execution
-  FLastVMRenderTick := SDL_GetTicks;
+  FLastVMRenderTick := SDL_GetTicks();
   FBytecodeVM.EventPollCallback := @HandleVMEventPoll;
   FBytecodeVM.SpriteEditorCallback := @RunSpriteEditor;
 end;
@@ -11862,7 +11882,7 @@ begin
     FVideoController.SetPaletteColor(PalI, SavedPal[PalI]);
 
   // Repaint the program's screen so the editor view is not left on screen.
-  FLastVMRenderTick := SDL_GetTicks;
+  FLastVMRenderTick := SDL_GetTicks();
   RenderScreen;
   UpdateCursor;
   FVideoController.Present;
@@ -11875,7 +11895,7 @@ begin
   begin
     // Reset blink state so cursor appears immediately
     FCursorVisible := True;
-    FLastCursorBlink := SDL_GetTicks;
+    FLastCursorBlink := SDL_GetTicks();
   end;
 end;
 
@@ -12288,8 +12308,8 @@ begin
 
         SDL_KEYDOWN:
           begin
-            // Get modifier state using SDL_GetModState for reliable detection
-            KeyMod := SDL_GetModState;
+            // Get modifier state using SDL_GetModState() for reliable detection
+            KeyMod := SDL_GetModState();
             CtrlDown := (KeyMod and KMOD_CTRL) <> 0;
             AltDown := (KeyMod and KMOD_ALT) <> 0;
 

@@ -17,8 +17,11 @@ unit SedaiSpriteEngine;
 interface
 
 uses
+  // SedaiSDL2Dyn AFTER SDL2: SDL functions resolve to its runtime-loaded pointers (no static
+  // SDL2.dll import in headless sb). The renderer only ever arrives from an SDL-initialized
+  // console, so the pointers are always bound before any call here.
   SysUtils, Classes, fpjson, jsonparser,
-  SDL2, Math, SedaiSpriteTypes, SedaiOutputInterface;
+  SDL2, SedaiSDL2Dyn, Math, SedaiSpriteTypes, SedaiOutputInterface;
 
 type
   TPaletteResolverFunc = function(Index: Byte): TSDL_Color of object;

@@ -18,7 +18,10 @@ unit SedaiUIWidgets;
 interface
 
 uses
-  SysUtils, ctypes, sdl2, sdl2_ttf;
+  // SedaiSDL2Dyn AFTER the bindings: SDL functions resolve to its runtime-loaded pointers (no
+  // static SDL2.dll import in headless sb). The renderer only ever arrives from an
+  // SDL-initialized console, so the pointers are always bound before any call here.
+  SysUtils, ctypes, sdl2, sdl2_ttf, SedaiSDL2Dyn;
 
 type
   TSedaiUI = class

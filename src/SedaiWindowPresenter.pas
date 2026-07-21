@@ -30,7 +30,7 @@ interface
 
 {$IFDEF WITH_WINDOW}
 uses
-  SysUtils, Math, SDL2, SedaiGraphicsBackend, SedaiGraphicsMemory, SedaiInputState;
+  SysUtils, Math, SDL2, SedaiSDL2Dyn, SedaiGraphicsBackend, SedaiGraphicsMemory, SedaiInputState;
 
 type
   TWindowPresenter = class
@@ -84,7 +84,7 @@ begin
   X := -1; Y := -1; Wheel := 0; Buttons := 0;
   Result := False;
   SDL_PumpEvents;
-  Focus := SDL_GetMouseFocus;
+  Focus := SDL_GetMouseFocus();
   if Focus = nil then Exit;
   if (GActiveWindow <> nil) and (Focus <> GActiveWindow) then Exit;
   st := SDL_GetMouseState(@sx, @sy);
@@ -122,7 +122,7 @@ begin
   if SDL_WasInit(SDL_INIT_JOYSTICK) = 0 then SDL_InitSubSystem(SDL_INIT_JOYSTICK);
   if GJoy[Id] = nil then
   begin
-    if Id >= SDL_NumJoysticks then Exit;
+    if Id >= SDL_NumJoysticks() then Exit;
     GJoy[Id] := SDL_JoystickOpen(Id);
     if GJoy[Id] = nil then Exit;
   end;
@@ -140,6 +140,10 @@ end;
 constructor TWindowPresenter.Create(ABackend: TSoftwareGraphicsBackend; const Title: string);
 begin
   inherited Create;
+  // Runtime SDL2 binding (see SedaiSDL2Dyn): --window explicitly asks for a window, so a
+  // missing SDL2 library is a hard error here, not a polite degrade.
+  if not EnsureSDL2Bound then
+    raise Exception.Create('--window requires ' + SDL_LibName + ', which was not found');
   FBackend := ABackend;
   FClosed := False;
   FTexW := 0; FTexH := 0;

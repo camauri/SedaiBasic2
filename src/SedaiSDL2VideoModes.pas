@@ -28,7 +28,9 @@ unit SedaiSDL2VideoModes;
 interface
 
 uses
-  Classes, SysUtils, SDL2;
+  // SedaiSDL2Dyn AFTER SDL2: SDL functions resolve to its runtime-loaded pointers
+  // (no static SDL2.dll import in headless sb); types/constants keep coming from the binding.
+  Classes, SysUtils, SDL2, SedaiSDL2Dyn;
 
 type
   TSDL2VideoModeInfo = record
@@ -152,6 +154,10 @@ var
 begin
   Result := False;
   SetLength(FModes, 0);
+
+  // Runtime SDL2 binding (see SedaiSDL2Dyn): no library, no modes.
+  if not EnsureSDL2Bound then
+    Exit;
 
   // Ensure SDL2 video is initialized
   if SDL_WasInit(SDL_INIT_VIDEO) = 0 then
