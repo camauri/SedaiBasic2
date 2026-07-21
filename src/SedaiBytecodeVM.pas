@@ -288,6 +288,7 @@ type
     {$ENDIF}
     {$IFDEF WITH_SEDAI_AUDIO}
     FAudioInitialized: Boolean;
+    FAudioStartTried: Boolean;   // lazy init: device open attempted (failure is not retried per-op)
     FAudioBackend: TSedaiAudioBackend;   // SAF audio backend
     FSIDEvo: TSedaiSIDEvo;       // SID emulator for advanced audio
     FAudioTempo: Integer;        // Current tempo (0-255, default 8)
@@ -296,6 +297,7 @@ type
       Waveform: Integer;
       PulseWidth: Single;
     end;
+    procedure EnsureAudioStarted; // open the device on the FIRST audio op, not at VM creation
     procedure ExecutePlayString(Ctx: TExecutionContext; const MusicStr: string);
     procedure CooperativeSleep(Ctx: TExecutionContext; Milliseconds: Integer);
     {$ENDIF}
@@ -812,57 +814,13 @@ begin
   FCtx.InErrorHandler := False;
   InitializeRegisters;
   {$IFDEF WITH_SEDAI_AUDIO}
-  // Initialize SAF audio backend
+  // Audio device open is LAZY (EnsureAudioStarted, first audio op): opening the backend and
+  // starting its callback thread costs tens of ms, paid at every sb launch by programs that
+  // never play a note - the whole regression harness included.
   FAudioInitialized := False;
+  FAudioStartTried := False;
   FAudioBackend := nil;
-
-  // Create SIDEvo instance
-  FSIDEvo := TSedaiSIDEvo.Create;
-  FSIDEvo.Initialize(1);  // 1 group = 8 voices
-
-  // Set global reference for callback
-  GSIDEvoInstance := FSIDEvo;
-
-  // Create and configure SAF audio backend
-  {$IFDEF DEBUG_AUDIO}
-  WriteLn('[DEBUG_AUDIO] Creating TSedaiAudioBackend...');
-  {$ENDIF}
-  FAudioBackend := TSedaiAudioBackend.Create;
-  FAudioBackend.SetSampleRate(AUDIO_SAMPLE_RATE);
-  FAudioBackend.SetDesiredBufferSize(AUDIO_BUFFER_SIZE);
-  FAudioBackend.SetChannels(2);  // Stereo output
-  FAudioBackend.SetCallback(@SAFAudioCallback, nil);
-  FAudioBackend.SetMode(bmCallback);
-
-  {$IFDEF DEBUG_AUDIO}
-  WriteLn('[DEBUG_AUDIO] Calling FAudioBackend.Initialize...');
-  {$ENDIF}
-  if FAudioBackend.Initialize then
-  begin
-    {$IFDEF DEBUG_AUDIO}
-    WriteLn('[DEBUG_AUDIO] Initialize OK, calling Start...');
-    {$ENDIF}
-    if FAudioBackend.Start then
-    begin
-      FAudioInitialized := True;
-      {$IFDEF DEBUG_AUDIO}
-      WriteLn('[DEBUG_AUDIO] SAF Audio initialized and started OK');
-      WriteLn('[DEBUG_AUDIO]   Sample rate: ', FAudioBackend.SampleRate);
-      WriteLn('[DEBUG_AUDIO]   Buffer size: ', FAudioBackend.BufferSize);
-      WriteLn('[DEBUG_AUDIO]   Mode: bmCallback');
-      {$ENDIF}
-    end
-    {$IFDEF DEBUG_AUDIO}
-    else
-      WriteLn('[DEBUG_AUDIO] FAudioBackend.Start FAILED')
-    {$ENDIF}
-    ;
-  end
-  {$IFDEF DEBUG_AUDIO}
-  else
-    WriteLn('[DEBUG_AUDIO] SAF Audio initialization FAILED')
-  {$ENDIF}
-  ;
+  FSIDEvo := nil;
 
   FAudioTempo := 8;  // Default tempo (C128 default)
 
@@ -9055,6 +9013,55 @@ begin
   end;
 end;
 
+{$IFDEF WITH_SEDAI_AUDIO}
+procedure TBytecodeVM.EnsureAudioStarted;
+begin
+  // Lazy device open, moved verbatim from the constructor: the first audio op pays it once;
+  // a failed open is not retried (FAudioStartTried), matching the old "failed at startup"
+  // behavior where every handler just saw FAudioInitialized = False.
+  if FAudioStartTried then Exit;
+  FAudioStartTried := True;
+
+  FSIDEvo := TSedaiSIDEvo.Create;
+  FSIDEvo.Initialize(1);  // 1 group = 8 voices
+  GSIDEvoInstance := FSIDEvo;
+
+  {$IFDEF DEBUG_AUDIO}
+  WriteLn('[DEBUG_AUDIO] Creating TSedaiAudioBackend...');
+  {$ENDIF}
+  FAudioBackend := TSedaiAudioBackend.Create;
+  FAudioBackend.SetSampleRate(AUDIO_SAMPLE_RATE);
+  FAudioBackend.SetDesiredBufferSize(AUDIO_BUFFER_SIZE);
+  FAudioBackend.SetChannels(2);  // Stereo output
+  FAudioBackend.SetCallback(@SAFAudioCallback, nil);
+  FAudioBackend.SetMode(bmCallback);
+
+  {$IFDEF DEBUG_AUDIO}
+  WriteLn('[DEBUG_AUDIO] Calling FAudioBackend.Initialize...');
+  {$ENDIF}
+  if FAudioBackend.Initialize then
+  begin
+    if FAudioBackend.Start then
+    begin
+      FAudioInitialized := True;
+      {$IFDEF DEBUG_AUDIO}
+      WriteLn('[DEBUG_AUDIO] SAF Audio initialized and started OK');
+      {$ENDIF}
+    end
+    {$IFDEF DEBUG_AUDIO}
+    else
+      WriteLn('[DEBUG_AUDIO] FAudioBackend.Start FAILED')
+    {$ENDIF}
+    ;
+  end
+  {$IFDEF DEBUG_AUDIO}
+  else
+    WriteLn('[DEBUG_AUDIO] SAF Audio initialization FAILED')
+  {$ENDIF}
+  ;
+end;
+{$ENDIF}
+
 procedure TBytecodeVM.ExecuteSoundOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
@@ -9068,6 +9075,9 @@ var
   SweepUp: Boolean;
   {$ENDIF}
 begin
+  {$IFDEF WITH_SEDAI_AUDIO}
+  EnsureAudioStarted;   // lazy device open: only programs that reach an audio op pay it
+  {$ENDIF}
   SubOp := Instr.OpCode and $FF;
   case SubOp of
     0: // bcSoundVol
