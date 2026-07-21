@@ -1184,6 +1184,22 @@ begin
       {$ENDIF}
       {$ENDIF}
 
+      {$IFNDEF DISABLE_RANGE_ANALYSIS}
+      // B4 bounds-check elimination: prove array accesses in-bounds and mark them
+      // BoundsSafe. After DCE (instruction positions are final), before PHI
+      // elimination (the induction-variable proof needs the PHIs). Sets a hint
+      // only - the instruction stream is untouched.
+      try
+        SSAProgram.RunRangeAnalysis;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Range analysis failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      {$ENDIF}
+
       // PHI ELIMINATION - FINAL PASS BEFORE BYTECODE COMPILATION
       // CRITICAL: Must run AFTER DCE so dead PHI nodes are already removed
       // This converts remaining live PHI functions to Copy instructions

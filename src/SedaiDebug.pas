@@ -64,6 +64,7 @@ var
   DebugLICM: Boolean = False;
   DebugAlgebraic: Boolean = False;
   DebugStrength: Boolean = False;
+  DebugRange: Boolean = False;
   DebugConstProp: Boolean = False;
   DebugCopyProp: Boolean = False;
   DebugCopyCoal: Boolean = False;
@@ -107,6 +108,7 @@ begin
       {$IFDEF DEBUG_LICM}DebugLICM := True;{$ENDIF}
       {$IFDEF DEBUG_ALGEBRAIC}DebugAlgebraic := True;{$ENDIF}
       {$IFDEF DEBUG_STRENGTH}DebugStrength := True;{$ENDIF}
+      {$IFDEF DEBUG_RANGE}DebugRange := True;{$ENDIF}
       {$IFDEF DEBUG_CONSTPROP}DebugConstProp := True;{$ENDIF}
       {$IFDEF DEBUG_COPYPROP}DebugCopyProp := True;{$ENDIF}
       {$IFDEF DEBUG_COPYCOAL}DebugCopyCoal := True;{$ENDIF}
@@ -140,6 +142,9 @@ begin
     {$ENDIF}
     {$IFDEF DEBUG_STRENGTH}
     else if Param = '--debug-strength' then DebugStrength := True
+    {$ENDIF}
+    {$IFDEF DEBUG_RANGE}
+    else if Param = '--debug-range' then DebugRange := True
     {$ENDIF}
     {$IFDEF DEBUG_CONSTPROP}
     else if Param = '--debug-constprop' then DebugConstProp := True
@@ -184,7 +189,7 @@ end;
 function AnyDebugActive: Boolean;
 begin
   Result := DebugAll or DebugSSA or DebugGVN or DebugCSE or DebugDCE or
-            DebugLICM or DebugAlgebraic or DebugStrength or DebugConstProp or
+            DebugLICM or DebugAlgebraic or DebugStrength or DebugRange or DebugConstProp or
             DebugCopyProp or DebugCopyCoal or DebugPhiElim or DebugRegAlloc or
             DebugPeephole or DebugSuperInstr or DebugDomTree or DebugDBE or
             DebugBytecode or DebugVM or DebugCleanup;

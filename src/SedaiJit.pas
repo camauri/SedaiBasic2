@@ -506,15 +506,23 @@ var
     E.PatchByte(p, Byte(E.Len - (p + 1)));
   end;
 
-  // FloatRegs[Dst] := arr[idx]. ArrayId is a compile-time constant.
-  procedure ArrLoadF(apc, ArrayId, IdxReg, DstReg: Integer; Classic: Boolean);
+  // FloatRegs[Dst] := arr[idx]. ArrayId is a compile-time constant. Safe = B4 range analysis
+  // proved idx in [0, TotalSize) (BC_BOUNDS_SAFE_FLAG on the instruction): no compare, no
+  // guard, no deopt - just the data access. Classic is irrelevant when Safe (nothing can trip).
+  procedure ArrLoadF(apc, ArrayId, IdxReg, DstReg: Integer; Classic, Safe: Boolean);
   var pOOB, pDone, ix, baseR: Integer;
   begin
     ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index (reg or [rbx+idx])
-    if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
+    if not Safe then
+      if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
     if ix >= 0 then baseR := ActiveBase(ix) else baseR := -1;
-    if Classic then
+    if Safe then
+    begin
+      baseR := ArrBaseReg(ArrayId, 8, baseR);
+      ArrDataAccess(True, False, baseR);                    // movsd xmm0, [base+rcx*8]
+    end
+    else if Classic then
     begin
       EmitClassicBoundsGuard(apc);
       baseR := ArrBaseReg(ArrayId, 8, baseR);
@@ -534,14 +542,21 @@ var
   end;
 
   // arr[idx] := FloatRegs[Val].
-  procedure ArrStoreF(apc, ArrayId, IdxReg, ValReg: Integer; Classic: Boolean);
+  procedure ArrStoreF(apc, ArrayId, IdxReg, ValReg: Integer; Classic, Safe: Boolean);
   var pSkip, ix, baseR: Integer;
   begin
     ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index (reg or [rbx+idx])
-    if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
+    if not Safe then
+      if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
     if ix >= 0 then baseR := ActiveBase(ix) else baseR := -1;
-    if Classic then
+    if Safe then
+    begin
+      baseR := ArrBaseReg(ArrayId, 8, baseR);
+      FLoad(XMM0, ValReg);
+      ArrDataAccess(True, True, baseR);                     // movsd [base+rcx*8], xmm0
+    end
+    else if Classic then
     begin
       EmitClassicBoundsGuard(apc);
       baseR := ArrBaseReg(ArrayId, 8, baseR);
@@ -560,14 +575,20 @@ var
 
   // IntRegs[Dst] := arr[idx]. Int arrays are Int64-per-element (IntData at desc+0); the interpreter stores
   // the raw register value (narrowing happens on a separate op), so this is exact.
-  procedure ArrLoadI(apc, ArrayId, IdxReg, DstReg: Integer; Classic: Boolean);
+  procedure ArrLoadI(apc, ArrayId, IdxReg, DstReg: Integer; Classic, Safe: Boolean);
   var pOOB, pDone, ix, baseR: Integer;
   begin
     ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index
-    if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
+    if not Safe then
+      if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
     if ix >= 0 then baseR := ActiveBase(ix) else baseR := -1;
-    if Classic then
+    if Safe then
+    begin
+      baseR := ArrBaseReg(ArrayId, 0, baseR);
+      ArrDataAccess(False, False, baseR);                   // mov rax, [base+rcx*8]
+    end
+    else if Classic then
     begin
       EmitClassicBoundsGuard(apc);
       baseR := ArrBaseReg(ArrayId, 0, baseR);
@@ -587,14 +608,21 @@ var
   end;
 
   // arr[idx] := IntRegs[Val].
-  procedure ArrStoreI(apc, ArrayId, IdxReg, ValReg: Integer; Classic: Boolean);
+  procedure ArrStoreI(apc, ArrayId, IdxReg, ValReg: Integer; Classic, Safe: Boolean);
   var pSkip, ix, baseR: Integer;
   begin
     ix := CArrIdx(ArrayId);
     ILoad(RCX, IdxReg);                                     // rcx := index
-    if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
+    if not Safe then
+      if ix >= 0 then ArrCountCmp(ArrayId, ActiveCount(ix)) else ArrCountCmp(ArrayId, -1);
     if ix >= 0 then baseR := ActiveBase(ix) else baseR := -1;
-    if Classic then
+    if Safe then
+    begin
+      baseR := ArrBaseReg(ArrayId, 0, baseR);
+      ILoad(RAX, ValReg);
+      ArrDataAccess(False, True, baseR);                    // mov [base+rcx*8], rax
+    end
+    else if Classic then
     begin
       EmitClassicBoundsGuard(apc);
       baseR := ArrBaseReg(ArrayId, 0, baseR);
@@ -1087,19 +1115,25 @@ var
         end;
       // Arrays: MODERN + no forced check -> in-place (OOB = default). CLASSIC / --bounds-check -> compile
       // with an OOB deopt to the interpreter (which raises), except inside an inlined callee where a deopt
-      // is unsafe (native frame lost) -> bail.
+      // is unsafe (native frame lost) -> bail. B4: an access the range analysis PROVED in-bounds
+      // (BC_BOUNDS_SAFE_FLAG in Immediate) needs no compare/guard/deopt at all - and therefore
+      // compiles even in the Classic-inside-inlined-callee case that otherwise bails.
       bcArrayLoadFloat:
-        if AllowUnsafe then ArrLoadF(apc, I^.Src1, I^.Src2, I^.Dest, False)
-        else if InCallee then Exit else ArrLoadF(apc, I^.Src1, I^.Src2, I^.Dest, True);
+        if (I^.Immediate and BC_BOUNDS_SAFE_FLAG) <> 0 then ArrLoadF(apc, I^.Src1, I^.Src2, I^.Dest, False, True)
+        else if AllowUnsafe then ArrLoadF(apc, I^.Src1, I^.Src2, I^.Dest, False, False)
+        else if InCallee then Exit else ArrLoadF(apc, I^.Src1, I^.Src2, I^.Dest, True, False);
       bcArrayStoreFloat:
-        if AllowUnsafe then ArrStoreF(apc, I^.Src1, I^.Src2, I^.Dest, False)
-        else if InCallee then Exit else ArrStoreF(apc, I^.Src1, I^.Src2, I^.Dest, True);
+        if (I^.Immediate and BC_BOUNDS_SAFE_FLAG) <> 0 then ArrStoreF(apc, I^.Src1, I^.Src2, I^.Dest, False, True)
+        else if AllowUnsafe then ArrStoreF(apc, I^.Src1, I^.Src2, I^.Dest, False, False)
+        else if InCallee then Exit else ArrStoreF(apc, I^.Src1, I^.Src2, I^.Dest, True, False);
       bcArrayLoadInt:
-        if AllowUnsafe then ArrLoadI(apc, I^.Src1, I^.Src2, I^.Dest, False)
-        else if InCallee then Exit else ArrLoadI(apc, I^.Src1, I^.Src2, I^.Dest, True);
+        if (I^.Immediate and BC_BOUNDS_SAFE_FLAG) <> 0 then ArrLoadI(apc, I^.Src1, I^.Src2, I^.Dest, False, True)
+        else if AllowUnsafe then ArrLoadI(apc, I^.Src1, I^.Src2, I^.Dest, False, False)
+        else if InCallee then Exit else ArrLoadI(apc, I^.Src1, I^.Src2, I^.Dest, True, False);
       bcArrayStoreInt:
-        if AllowUnsafe then ArrStoreI(apc, I^.Src1, I^.Src2, I^.Dest, False)
-        else if InCallee then Exit else ArrStoreI(apc, I^.Src1, I^.Src2, I^.Dest, True);
+        if (I^.Immediate and BC_BOUNDS_SAFE_FLAG) <> 0 then ArrStoreI(apc, I^.Src1, I^.Src2, I^.Dest, False, True)
+        else if AllowUnsafe then ArrStoreI(apc, I^.Src1, I^.Src2, I^.Dest, False, False)
+        else if InCallee then Exit else ArrStoreI(apc, I^.Src1, I^.Src2, I^.Dest, True, False);
       // Record field access: a shared-record handle deopts (locked region), which is unsafe inside an
       // inlined callee -> bail there. Slot = Immediate; handle = Src1; value/dest = Dest (load) / Src2 (store).
       bcRecordLoadInt:    if InCallee then Exit else RecAccess(apc, I^.Src1, Integer(I^.Immediate), I^.Dest, False, False);

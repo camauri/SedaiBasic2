@@ -73,6 +73,14 @@ begin
   FOutput.Add(FormatInstruction(FProgram, Index, Instr));
 end;
 
+function BoundsSafeSuffix(const Instr: TBytecodeInstruction): string;
+begin
+  if (Instr.Immediate and BC_BOUNDS_SAFE_FLAG) <> 0 then
+    Result := '  ; safe'
+  else
+    Result := '';
+end;
+
 function TBytecodeDisassembler.FormatInstruction(Program_: TBytecodeProgram; Index: Integer;
   const Instr: TBytecodeInstruction): string;
 var
@@ -365,18 +373,20 @@ begin
       Line := Format('%4d: %-20s ARR[%d], R%d, R%d', [Index, 'ArrayStore', Instr.Src1, Instr.Src2, Instr.Dest]);
     bcArrayDim:
       Line := Format('%4d: %-20s ARR[%d]', [Index, 'ArrayDim', Instr.Src1]);
+    // " safe" = B4 range analysis proved the index in-bounds (BC_BOUNDS_SAFE_FLAG
+    // in Immediate); native backends elide the bounds guard on these.
     bcArrayLoadInt:
-      Line := Format('%4d: %-20s R%d, ARR[%d], R%d', [Index, 'ArrayLoadInt', Instr.Dest, Instr.Src1, Instr.Src2]);
+      Line := Format('%4d: %-20s R%d, ARR[%d], R%d%s', [Index, 'ArrayLoadInt', Instr.Dest, Instr.Src1, Instr.Src2, BoundsSafeSuffix(Instr)]);
     bcArrayLoadFloat:
-      Line := Format('%4d: %-20s R%d, ARR[%d], R%d', [Index, 'ArrayLoadFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
+      Line := Format('%4d: %-20s R%d, ARR[%d], R%d%s', [Index, 'ArrayLoadFloat', Instr.Dest, Instr.Src1, Instr.Src2, BoundsSafeSuffix(Instr)]);
     bcArrayLoadString:
-      Line := Format('%4d: %-20s R%d, ARR[%d], R%d', [Index, 'ArrayLoadString', Instr.Dest, Instr.Src1, Instr.Src2]);
+      Line := Format('%4d: %-20s R%d, ARR[%d], R%d%s', [Index, 'ArrayLoadString', Instr.Dest, Instr.Src1, Instr.Src2, BoundsSafeSuffix(Instr)]);
     bcArrayStoreInt:
-      Line := Format('%4d: %-20s ARR[%d], R%d, R%d', [Index, 'ArrayStoreInt', Instr.Src1, Instr.Src2, Instr.Dest]);
+      Line := Format('%4d: %-20s ARR[%d], R%d, R%d%s', [Index, 'ArrayStoreInt', Instr.Src1, Instr.Src2, Instr.Dest, BoundsSafeSuffix(Instr)]);
     bcArrayStoreFloat:
-      Line := Format('%4d: %-20s ARR[%d], R%d, R%d', [Index, 'ArrayStoreFloat', Instr.Src1, Instr.Src2, Instr.Dest]);
+      Line := Format('%4d: %-20s ARR[%d], R%d, R%d%s', [Index, 'ArrayStoreFloat', Instr.Src1, Instr.Src2, Instr.Dest, BoundsSafeSuffix(Instr)]);
     bcArrayStoreString:
-      Line := Format('%4d: %-20s ARR[%d], R%d, R%d', [Index, 'ArrayStoreString', Instr.Src1, Instr.Src2, Instr.Dest]);
+      Line := Format('%4d: %-20s ARR[%d], R%d, R%d%s', [Index, 'ArrayStoreString', Instr.Src1, Instr.Src2, Instr.Dest, BoundsSafeSuffix(Instr)]);
 
     // === GROUP 4: I/O OPERATIONS (0x04xx) ===
     bcPrint:

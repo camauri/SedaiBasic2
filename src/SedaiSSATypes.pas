@@ -474,6 +474,11 @@ type
     PhiSources: array of TSSAPhiSource;  // For ssaPhi: list of (value, block) pairs
     Comment: string;
     SourceLine: Integer;
+    // B4 range analysis: on ssaArrayLoad/ssaArrayStore, the linear index is PROVEN to lie in
+    // [0, TotalSize) for an array whose extent is a compile-time constant that cannot change.
+    // Purely an optimization hint: the interpreter still checks (it ignores this), native
+    // backends (AOT/JIT) may elide their bounds guard. Set only by SedaiRangeAnalysis.
+    BoundsSafe: Boolean;
     constructor Create(AOpCode: TSSAOpCode);
     function ToString: string; override;
     function Clone: TSSAInstruction;
@@ -556,6 +561,7 @@ type
     function GetDomTree: TObject;  // PHASE 3 TIER 2: Get dominator tree (cast to TDominatorTree in implementation)
     function RunDBE: Integer;  // Dead block elimination - removes unreachable blocks (returns removed block count)
     procedure RunSSAConstruction;  // PHASE 3: Convert to proper SSA with PHI functions and versioning
+    function RunRangeAnalysis: Integer;  // B4: prove array accesses in-bounds, set BoundsSafe (AFTER DCE, BEFORE PHI elimination - needs the PHIs)
     procedure RunPhiElimination;  // FINAL PASS: Convert PHI functions to copy instructions (BEFORE bytecode compilation)
     function RunGVN: Integer;  // PHASE 3 TIER 2: Run Global Value Numbering optimization (returns replacements count)
     function RunCSE: Integer;  // Common subexpression elimination (returns eliminated count)
@@ -603,7 +609,7 @@ implementation
 
 uses TypInfo, SedaiDominators, SedaiSSAConstruction, SedaiPhiElimination, SedaiGVN, SedaiCSE, SedaiCopyProp,
      SedaiAlgebraic, SedaiStrengthReduction, SedaiGosubInlining, SedaiConstProp, SedaiConstPropAggressive,
-     SedaiDBE, SedaiDCE, SedaiLICM, SedaiLoopUnroll, SedaiCopyCoalescing
+     SedaiDBE, SedaiDCE, SedaiLICM, SedaiLoopUnroll, SedaiCopyCoalescing, SedaiRangeAnalysis
      {$IF DEFINED(DEBUG_CLEANUP) OR DEFINED(DEBUG_DOMTREE) OR DEFINED(DEBUG_GVN) OR DEFINED(DEBUG_CSE) OR DEFINED(DEBUG_COPYPROP) OR DEFINED(DEBUG_ALGEBRAIC) OR DEFINED(DEBUG_STRENGTH) OR DEFINED(DEBUG_CONSTPROP) OR DEFINED(DEBUG_DBE) OR DEFINED(DEBUG_DCE) OR DEFINED(DEBUG_LICM) OR DEFINED(DEBUG_COPYCOAL) OR DEFINED(DEBUG_SSA)}, SedaiDebug{$ENDIF};
 
 constructor TSSAInstruction.Create(AOpCode: TSSAOpCode);
@@ -617,6 +623,7 @@ begin
   SetLength(PhiSources, 0);  // Initialize empty PHI sources
   Comment := '';
   SourceLine := 0;
+  BoundsSafe := False;
 end;
 
 procedure TSSAInstruction.AddPhiSource(const Val: TSSAValue; FromBlock: TSSABasicBlock);
@@ -676,6 +683,7 @@ begin
 
   Result.Comment := Comment;
   Result.SourceLine := SourceLine;
+  Result.BoundsSafe := BoundsSafe;
 end;
 
 constructor TSSABasicBlock.Create(const ALabel: string);
@@ -1306,6 +1314,27 @@ begin
     SSAConstr.Free;
   end;
   //WriteLn;
+end;
+
+function TSSAProgram.RunRangeAnalysis: Integer;
+var
+  RA: TRangeAnalysis;
+begin
+  { B4 bounds-check elimination: prove array accesses in-bounds and set the
+    BoundsSafe hint on ssaArrayLoad/ssaArrayStore. Changes no instruction
+    stream. Must run AFTER the transforming passes (positions are final) and
+    BEFORE PHI elimination (the induction-variable proof needs the PHIs).
+    The interpreter ignores the flag - only the AOT/JIT backends consume it. }
+  Result := 0;
+  if not GSSAOptimizationsEnabled then Exit;
+  BuildDominatorTree;   // CFG may have changed since the last build (LICM etc.)
+  if not FDomTreeValid then Exit;
+  RA := TRangeAnalysis.Create(Self);
+  try
+    Result := RA.Run;
+  finally
+    RA.Free;
+  end;
 end;
 
 procedure TSSAProgram.RunPhiElimination;

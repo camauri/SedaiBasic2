@@ -506,6 +506,9 @@ begin
       try SSAProgram.RunAlgebraic; except end;
       try SSAProgram.RunStrengthReduction; except end;
       try SSAProgram.RunDCE; except end;
+      {$IFNDEF DISABLE_RANGE_ANALYSIS}
+      try SSAProgram.RunRangeAnalysis; except end;   // B4 hints (needs the PHIs)
+      {$ENDIF}
       try SSAProgram.RunPhiElimination; except end;
       try SSAProgram.RunCopyCoalescing; except end;
 

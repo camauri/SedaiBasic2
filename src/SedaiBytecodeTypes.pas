@@ -420,6 +420,11 @@ const
   bcMathAtanh       = bcGroupMath + 35;  // ATANH(x) - inverse hyperbolic tangent (|x| < 1)
 
   // === GROUP 3: ARRAY OPERATIONS (0x03xx) ===
+  // B4 bounds-check elimination: on bcArrayLoad*/bcArrayStore* the Immediate field is
+  // otherwise unused (always 0); bit 0 set means the SSA range analysis PROVED the linear
+  // index lies in [0, TotalSize). The interpreter ignores it (always checks); the JIT and
+  // AOT backends elide their bounds guard when set.
+  BC_BOUNDS_SAFE_FLAG = 1;
   bcArrayLoad       = bcGroupArray + 0;   // Generic (deprecated)
   bcArrayStore      = bcGroupArray + 1;   // Generic (deprecated)
   bcArrayDim        = bcGroupArray + 2;

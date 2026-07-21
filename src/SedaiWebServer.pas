@@ -432,6 +432,9 @@ begin
         {$IFNDEF DISABLE_DCE}
         SSAProgram.RunDCE;
         {$ENDIF}
+        {$IFNDEF DISABLE_RANGE_ANALYSIS}
+        SSAProgram.RunRangeAnalysis;   // B4 hints (needs the PHIs)
+        {$ENDIF}
         {$IFNDEF DISABLE_PHI_ELIM}
         {$IFNDEF DISABLE_SSA_CONSTRUCTION}
         SSAProgram.RunPhiElimination;

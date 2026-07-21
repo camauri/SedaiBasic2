@@ -456,6 +456,11 @@ begin
         try SSAProgram.RunDCE; except end;
         {$ENDIF}
 
+        // B4 bounds-check elimination hints (after DCE, before PHI elimination)
+        {$IFNDEF DISABLE_RANGE_ANALYSIS}
+        try SSAProgram.RunRangeAnalysis; except end;
+        {$ENDIF}
+
         // PHI Elimination
         {$IFNDEF DISABLE_PHI_ELIM}
         {$IFNDEF DISABLE_SSA_CONSTRUCTION}

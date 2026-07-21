@@ -45,6 +45,7 @@
     --debug-licm         Loop-Invariant Code Motion debug
     --debug-algebraic    Algebraic Simplification debug
     --debug-strength     Strength Reduction debug
+    --debug-range        B4 Range Analysis (bounds-check elimination) debug
     --debug-constprop    Constant Propagation debug
     --debug-copyprop     Copy Propagation debug
     --debug-copycoal     Copy Coalescing debug
@@ -85,6 +86,7 @@
 {.$DEFINE DEBUG_LICM}
 {.$DEFINE DEBUG_ALGEBRAIC}
 {.$DEFINE DEBUG_STRENGTH}
+{.$DEFINE DEBUG_RANGE}      // B4 range analysis (bounds-check elimination) debug
 {.$DEFINE DEBUG_CONSTPROP}
 {.$DEFINE DEBUG_COPYPROP}
 {.$DEFINE DEBUG_COPYCOAL}
@@ -112,6 +114,7 @@
   {$DEFINE DEBUG_LICM}
   {$DEFINE DEBUG_ALGEBRAIC}
   {$DEFINE DEBUG_STRENGTH}
+  {$DEFINE DEBUG_RANGE}
   {$DEFINE DEBUG_CONSTPROP}
   {$DEFINE DEBUG_COPYPROP}
   {$DEFINE DEBUG_COPYCOAL}
@@ -153,6 +156,9 @@
   {$DEFINE ANY_DEBUG_ENABLED}
 {$ENDIF}
 {$IFDEF DEBUG_ALGEBRAIC}
+  {$DEFINE ANY_DEBUG_ENABLED}
+{$ENDIF}
+{$IFDEF DEBUG_RANGE}
   {$DEFINE ANY_DEBUG_ENABLED}
 {$ENDIF}
 {$IFDEF DEBUG_STRENGTH}

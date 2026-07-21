@@ -2014,6 +2014,11 @@ begin
   // ssaRecordNewBlock: Dest = first handle, Src1 = count register (mapped normally); Src2 const = packed counts.
   if Instr.OpCode = ssaRecordNewBlock then
     BCInstr.Immediate := Instr.Src2.ConstInt;
+  // B4 bounds-check elimination: array load/store carries no Src3, so Immediate is free
+  // (always 0 here). BoundsSafe (proven by SedaiRangeAnalysis) rides bit 0 for the JIT;
+  // the interpreter ignores Immediate on these opcodes and keeps checking.
+  if OpIn(Instr.OpCode, [ssaArrayLoad, ssaArrayStore]) and Instr.BoundsSafe then
+    BCInstr.Immediate := BC_BOUNDS_SAFE_FLAG;
 
   {$IFDEF DEBUG_BYTECODE}
   if DebugBytecode and OpIn(Instr.OpCode, [ssaPrintInt, ssaLoadEL, ssaLoadER]) then

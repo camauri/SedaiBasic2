@@ -1166,7 +1166,10 @@ var
   // rcx = index; rdx = desc table (ctx); rax = Count; unsigned cmp; then either the
   // CLASSIC guard (OOB -> deopt, interpreter raises) or the MODERN default path
   // (load 0 / drop store); rdx is reused for the data base after the compare.
-  procedure AotArrAccess(IsFloat, IsStore: Boolean; ArrayId, IdxReg, ValReg, apc: Integer);
+  // Safe = B4 range analysis proved the index in [0, TotalSize): no count load, no
+  // compare, no guard - dialect is irrelevant because the check could never trip.
+  procedure AotArrAccess(IsFloat, IsStore: Boolean; ArrayId, IdxReg, ValReg, apc: Integer;
+                         Safe: Boolean);
   var pOOB, pDone, DataOff, cbase, ccount, baseR: Integer;
     procedure EmitBase;   // leave the data base register in baseR (cached GPR or reloaded rdx)
     begin
@@ -1182,6 +1185,23 @@ var
     cbase := CachedBase(ArrayId);
     ccount := CachedCount(ArrayId);
     ILoad(RCX, IdxReg);                                            // rcx = index
+    if Safe then
+    begin
+      if cbase < 0 then
+        E.MemOp([$49, $8B], RDX, R8, 16);                          // rdx = ctx.ArrDesc
+      EmitBase;
+      if IsStore then
+      begin
+        if IsFloat then FLoad(XMM0, ValReg) else ILoad(RAX, ValReg);
+        AotArrData(IsFloat, True, baseR);
+      end
+      else
+      begin
+        AotArrData(IsFloat, False, baseR);
+        if IsFloat then FStore(ValReg, XMM0) else IStore(ValReg, RAX);
+      end;
+      Exit;
+    end;
     if (cbase < 0) or (ccount < 0) then
       E.MemOp([$49, $8B], RDX, R8, 16);                            // rdx = ctx.ArrDesc
     if ccount >= 0 then
@@ -1495,7 +1515,9 @@ var
             if not AotIsNative(SSAProg, Ins) then NoteHelperOp
             else
             begin
-              if ArrClassic then
+              // B4: a proven-safe access emits no guard, so it needs no deopt PC even
+              // under CLASSIC. Same condition as the emitter (they must agree).
+              if ArrClassic and not Ins.BoundsSafe then
               begin
                 HasDeopt := True;
                 if Prog.GetSsaPc(o) < 0 then Fail('no-pc-arr');
@@ -1844,21 +1866,22 @@ var
       begin
         d := ArrId; if not OK then Exit;
         apc := -1;
-        if ArrClassic then begin apc := NeedPC; if not OK then Exit; end;
+        // B4: a proven-safe access needs no deopt PC even under CLASSIC (the guard is elided).
+        if ArrClassic and not Cur.BoundsSafe then begin apc := NeedPC; if not OK then Exit; end;
         if SSAProg.GetArray(d).ElementType = srtFloat then
-          AotArrAccess(True, False, d, IReg(Cur.Src2), FReg(Cur.Dest), apc)
+          AotArrAccess(True, False, d, IReg(Cur.Src2), FReg(Cur.Dest), apc, Cur.BoundsSafe)
         else
-          AotArrAccess(False, False, d, IReg(Cur.Src2), IReg(Cur.Dest), apc);
+          AotArrAccess(False, False, d, IReg(Cur.Src2), IReg(Cur.Dest), apc, Cur.BoundsSafe);
       end;
       ssaArrayStore:
       begin
         d := ArrId; if not OK then Exit;
         apc := -1;
-        if ArrClassic then begin apc := NeedPC; if not OK then Exit; end;
+        if ArrClassic and not Cur.BoundsSafe then begin apc := NeedPC; if not OK then Exit; end;
         if SSAProg.GetArray(d).ElementType = srtFloat then
-          AotArrAccess(True, True, d, IReg(Cur.Src2), FReg(Cur.Dest), apc)
+          AotArrAccess(True, True, d, IReg(Cur.Src2), FReg(Cur.Dest), apc, Cur.BoundsSafe)
         else
-          AotArrAccess(False, True, d, IReg(Cur.Src2), IReg(Cur.Dest), apc);
+          AotArrAccess(False, True, d, IReg(Cur.Src2), IReg(Cur.Dest), apc, Cur.BoundsSafe);
       end;
       ssaArrayLBound:
       begin
