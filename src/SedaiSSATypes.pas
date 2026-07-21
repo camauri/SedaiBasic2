@@ -22,8 +22,10 @@
 unit SedaiSSATypes;
 
 {$mode ObjFPC}{$H+}
+{$modeswitch advancedrecords}
 {$interfaces CORBA}
 {$codepage UTF8}
+{$inline on}
 {$I DebugFlags.inc}
 
 interface
@@ -102,17 +104,38 @@ type
   { Forward declarations }
   TSSABasicBlock = class;
 
+  { TSSAValue is a POD record on purpose: it used to carry three ansistrings inline, and since
+    it is a local (often several) in nearly every SSA-generation procedure and is passed by
+    value four times per EmitInstruction, FPC's per-call zero-init + RTTI-finalization of those
+    strings dominated the whole compile pipeline (measured ~24 us of prologue/epilogue on the
+    big ProcessExpression frame against ~0.25 us of body). The strings now live in a process-wide
+    interned pool (append-only, id 0 = '') and the record stores integer ids; the VarName /
+    ConstString / LabelName properties keep every use site source-compatible. FillChar-to-zero
+    still yields a value whose three names read as '' (id 0). NOT thread-safe: compilation is
+    single-threaded (VM worker threads execute bytecode, they never compile). }
   TSSAValue = record
+  public
     Kind: TSSAValueKind;
     RegType: TSSARegisterType;
     RegIndex: Integer;
     Version: Integer;      // SSA versioning: R0_1, R0_2, etc. (0 = unversioned/legacy)
-    VarName: string;
     ConstInt: Int64;
     ConstFloat: Double;
-    ConstString: string;
-    LabelName: string;
     ArrayIndex: Integer;  // For svkArrayRef: index into FArrays
+    VarNameId: Integer;      // pool id of the variable name ('' = 0)
+    ConstStringId: Integer;  // pool id of the string constant ('' = 0)
+    LabelNameId: Integer;    // pool id of the label name ('' = 0)
+  private
+    function GetVarName: string; inline;
+    procedure SetVarName(const AValue: string); inline;
+    function GetConstString: string; inline;
+    procedure SetConstString(const AValue: string); inline;
+    function GetLabelName: string; inline;
+    procedure SetLabelName(const AValue: string); inline;
+  public
+    property VarName: string read GetVarName write SetVarName;
+    property ConstString: string read GetConstString write SetConstString;
+    property LabelName: string read GetLabelName write SetLabelName;
   end;
 
   TSSAOpCode = (
@@ -583,6 +606,11 @@ type
     property VarRegMap: TStringList read FVarRegMap;  // Access to variable→register mapping (for SSA construction)
     property GlobalVariableSemantics: Boolean read FGlobalVariableSemantics write FGlobalVariableSemantics;
   end;
+
+{ SSA string pool (see the TSSAValue comment). Interning an empty string is id 0; ids are
+  append-only and process-wide (deduplicated, so REPL re-compiles do not grow it unboundedly). }
+function SSAPoolIntern(const S: string): Integer;
+function SSAPoolGet(Id: Integer): string;
 
 function MakeSSAValue(Kind: TSSAValueKind): TSSAValue;
 function MakeSSARegister(RegType: TSSARegisterType; RegIndex: Integer): TSSAValue;
@@ -1761,6 +1789,119 @@ begin
   if Shift <= 0 then Exit(V);
   if Shift > 63 then Exit(0);
   Result := Int64(QWord(V) shr QWord(Shift));
+end;
+
+{ SSA string pool: open-addressing hash (FNV-1a, linear probing, grow at 60% load) over an
+  append-only id → string array. A dedicated table instead of TFPHashList because the latter
+  keys on SHORTSTRINGS: two BASIC string literals longer than 255 chars that share a prefix
+  would silently intern to the same id. Single-threaded by design (see TSSAValue). }
+var
+  PoolStrings: array of string;   // id → string; slot 0 reserved for ''
+  PoolCount: Integer = 0;
+  PoolBuckets: array of Integer;  // hash slot → id+1 (0 = empty)
+
+function PoolHashOf(const S: string): Cardinal;
+var
+  i: Integer;
+begin
+  Result := 2166136261;
+  for i := 1 to Length(S) do
+    Result := (Result xor Byte(S[i])) * 16777619;
+end;
+
+procedure PoolGrow;
+var
+  OldBuckets: array of Integer;
+  i, Id: Integer;
+  Slot, Mask: Cardinal;
+begin
+  OldBuckets := PoolBuckets;
+  PoolBuckets := nil;
+  if Length(OldBuckets) = 0 then
+    SetLength(PoolBuckets, 1024)
+  else
+    SetLength(PoolBuckets, Length(OldBuckets) * 2);
+  // SetLength zero-fills fresh buckets
+  Mask := Cardinal(Length(PoolBuckets) - 1);
+  for i := 0 to High(OldBuckets) do
+    if OldBuckets[i] <> 0 then
+    begin
+      Id := OldBuckets[i];
+      Slot := PoolHashOf(PoolStrings[Id - 1]) and Mask;
+      while PoolBuckets[Slot] <> 0 do
+        Slot := (Slot + 1) and Mask;
+      PoolBuckets[Slot] := Id;
+    end;
+end;
+
+function SSAPoolIntern(const S: string): Integer;
+var
+  Slot, Mask: Cardinal;
+  Id: Integer;
+begin
+  if S = '' then Exit(0);
+  if PoolCount = 0 then
+  begin
+    SetLength(PoolStrings, 64);
+    PoolStrings[0] := '';           // id 0 = ''
+    PoolCount := 1;
+    PoolGrow;
+  end
+  else if (PoolCount * 5) div 3 >= Length(PoolBuckets) then   // load > 60%
+    PoolGrow;
+
+  Mask := Cardinal(Length(PoolBuckets) - 1);
+  Slot := PoolHashOf(S) and Mask;
+  while PoolBuckets[Slot] <> 0 do
+  begin
+    Id := PoolBuckets[Slot];
+    if PoolStrings[Id - 1] = S then
+      Exit(Id - 1);
+    Slot := (Slot + 1) and Mask;
+  end;
+  // Not found: append
+  if PoolCount >= Length(PoolStrings) then
+    SetLength(PoolStrings, Length(PoolStrings) * 2);
+  PoolStrings[PoolCount] := S;
+  PoolBuckets[Slot] := PoolCount + 1;
+  Result := PoolCount;
+  Inc(PoolCount);
+end;
+
+function SSAPoolGet(Id: Integer): string;
+begin
+  if (Id <= 0) or (Id >= PoolCount) then Exit('');
+  Result := PoolStrings[Id];
+end;
+
+function TSSAValue.GetVarName: string;
+begin
+  Result := SSAPoolGet(VarNameId);
+end;
+
+procedure TSSAValue.SetVarName(const AValue: string);
+begin
+  VarNameId := SSAPoolIntern(AValue);
+end;
+
+function TSSAValue.GetConstString: string;
+begin
+  Result := SSAPoolGet(ConstStringId);
+end;
+
+procedure TSSAValue.SetConstString(const AValue: string);
+begin
+  ConstStringId := SSAPoolIntern(AValue);
+end;
+
+function TSSAValue.GetLabelName: string;
+begin
+  Result := SSAPoolGet(LabelNameId);
+end;
+
+procedure TSSAValue.SetLabelName(const AValue: string);
+begin
+  LabelNameId := SSAPoolIntern(AValue);
 end;
 
 function MakeSSAValue(Kind: TSSAValueKind): TSSAValue;
