@@ -60,7 +60,13 @@ uses
 
 const
   BASC_MAGIC: array[0..3] of AnsiChar = 'BASC';
-  BASC_VERSION = 1;
+  // v2: the arrays table carries the FULL per-dimension metadata (dim registers + types,
+  // lower bounds, lower-bound registers). v1 saved only the constant sizes, so any array
+  // with a runtime-computed dimension - e.g. "Dim px(0 To NBODIES-1)" where NBODIES is a
+  // Const materialized into a register - loaded as "undefined variable dimension" and the
+  // program died at its first ArrayDim. v1 files still load (missing fields default to
+  // "constant dims only", exactly the old behavior).
+  BASC_VERSION = 2;
 
   // Flags
   BASC_FLAG_DEBUG_INFO = $0001;  // Contains source line mapping (always included)
@@ -188,6 +194,7 @@ var
   IsArray: Byte;
   DimCount: LongWord;
   DimSize: LongWord;
+  DimReg: Integer;
 begin
   // Validate program
   if not Assigned(Program_) then
@@ -255,6 +262,23 @@ begin
         DimSize := ArrInfo.Dimensions[j];
         Stream.WriteBuffer(DimSize, SizeOf(DimSize));
       end;
+      // v2: full per-dimension metadata. The parallel arrays may be shorter than DimCount
+      // (they grow lazily); absent entries write the "constant dimension" defaults.
+      for j := 0 to DimCount - 1 do
+      begin
+        if j <= High(ArrInfo.DimRegisters) then DimReg := ArrInfo.DimRegisters[j]
+        else DimReg := -1;
+        Stream.WriteBuffer(DimReg, SizeOf(DimReg));
+        if j <= High(ArrInfo.DimRegTypes) then RegType := Byte(ArrInfo.DimRegTypes[j])
+        else RegType := Byte(srtInt);
+        Stream.WriteBuffer(RegType, SizeOf(RegType));
+        if j <= High(ArrInfo.LowerBounds) then DimReg := ArrInfo.LowerBounds[j]
+        else DimReg := 0;
+        Stream.WriteBuffer(DimReg, SizeOf(DimReg));
+        if j <= High(ArrInfo.LowerBoundRegisters) then DimReg := ArrInfo.LowerBoundRegisters[j]
+        else DimReg := -1;
+        Stream.WriteBuffer(DimReg, SizeOf(DimReg));
+      end;
       Stream.WriteBuffer(ArrInfo.ArrayIndex, SizeOf(ArrInfo.ArrayIndex));
     except
       on E: Exception do
@@ -317,6 +341,7 @@ var
   Checksum: LongWord;
   RegType, IsArray: Byte;
   DimCount, DimSize: LongWord;
+  DimReg: Integer;
 begin
   Result := TBytecodeProgram.Create;
   try
@@ -370,6 +395,33 @@ begin
       begin
         Stream.ReadBuffer(DimSize, SizeOf(DimSize));
         ArrInfo.Dimensions[j] := DimSize;
+      end;
+      // v2: full per-dimension metadata (dim registers/types, lower bounds and their
+      // registers). A v1 file has none: leave the "constant dims only" defaults.
+      SetLength(ArrInfo.DimRegisters, DimCount);
+      SetLength(ArrInfo.DimRegTypes, DimCount);
+      SetLength(ArrInfo.LowerBounds, DimCount);
+      SetLength(ArrInfo.LowerBoundRegisters, DimCount);
+      for j := 0 to DimCount - 1 do
+      begin
+        if Header.Version >= 2 then
+        begin
+          Stream.ReadBuffer(DimReg, SizeOf(DimReg));
+          ArrInfo.DimRegisters[j] := DimReg;
+          Stream.ReadBuffer(RegType, SizeOf(RegType));
+          ArrInfo.DimRegTypes[j] := TSSARegisterType(RegType);
+          Stream.ReadBuffer(DimReg, SizeOf(DimReg));
+          ArrInfo.LowerBounds[j] := DimReg;
+          Stream.ReadBuffer(DimReg, SizeOf(DimReg));
+          ArrInfo.LowerBoundRegisters[j] := DimReg;
+        end
+        else
+        begin
+          ArrInfo.DimRegisters[j] := -1;
+          ArrInfo.DimRegTypes[j] := srtInt;
+          ArrInfo.LowerBounds[j] := 0;
+          ArrInfo.LowerBoundRegisters[j] := -1;
+        end;
       end;
       Stream.ReadBuffer(ArrInfo.ArrayIndex, SizeOf(ArrInfo.ArrayIndex));
       Result.AddArrayInfo(ArrInfo);
