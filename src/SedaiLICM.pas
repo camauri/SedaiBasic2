@@ -76,6 +76,10 @@ type
     FLoops: TObjectList;  // Owns TLoopInfo objects
     FDominatorMap: TFPHashList;  // Maps TSSABasicBlock → TSSABasicBlock (block → idom)
     FHoistedCount: Integer;
+    FUserVarByBank: array[TSSARegisterType] of array of Boolean;  // RegIndex → mapped to a user variable
+
+    { Precompute the user-variable bitmap from FProgram.VarRegMap }
+    procedure BuildUserVarIndex;
 
     { Build dominator map from program's dominator tree }
     procedure BuildDominatorMap;
@@ -190,6 +194,9 @@ begin
   if DebugLICM then
     WriteLn('[LICM] Running loop-invariant code motion...');
   {$ENDIF}
+
+  // Step 0: Precompute the user-variable bitmap (VarRegMap does not change during this pass)
+  BuildUserVarIndex;
 
   // Step 1: Build dominator map
   BuildDominatorMap;
@@ -626,27 +633,35 @@ begin
   Result := False;
 end;
 
-function TLoopInvariantCodeMotion.IsUserVariable(const Val: TSSAValue): Boolean;
+procedure TLoopInvariantCodeMotion.BuildUserVarIndex;
 var
-  i: Integer;
-  VarKey, MappedKey: string;
+  i, ColonPos, RegIdx, TypeOrd: Integer;
+  MappedKey: string;
 begin
-  // Only registers can be user variables
-  if Val.Kind <> svkRegister then
-    Exit(False);
-
-  // Build key: "RegType:RegIndex" (without Version - VarRegMap uses this format)
-  VarKey := IntToStr(Ord(Val.RegType)) + ':' + IntToStr(Val.RegIndex);
-
-  // Check if this register maps to a BASIC user variable
+  // VarRegMap values are "RegType:RegIndex". Decode each once into a per-bank bitmap so
+  // IsUserVariable is an array lookup instead of a linear scan with string building per query.
   for i := 0 to FProgram.VarRegMap.Count - 1 do
   begin
     MappedKey := FProgram.VarRegMap.ValueFromIndex[i];
-    if MappedKey = VarKey then
-      Exit(True);
+    ColonPos := Pos(':', MappedKey);
+    if ColonPos = 0 then Continue;
+    TypeOrd := StrToIntDef(Copy(MappedKey, 1, ColonPos - 1), -1);
+    RegIdx := StrToIntDef(Copy(MappedKey, ColonPos + 1, Length(MappedKey)), -1);
+    if (TypeOrd < Ord(Low(TSSARegisterType))) or (TypeOrd > Ord(High(TSSARegisterType))) or
+       (RegIdx < 0) then
+      Continue;
+    if RegIdx >= Length(FUserVarByBank[TSSARegisterType(TypeOrd)]) then
+      SetLength(FUserVarByBank[TSSARegisterType(TypeOrd)], RegIdx + 1);
+    FUserVarByBank[TSSARegisterType(TypeOrd)][RegIdx] := True;
   end;
+end;
 
-  Result := False;
+function TLoopInvariantCodeMotion.IsUserVariable(const Val: TSSAValue): Boolean;
+begin
+  // Only registers can be user variables; the bitmap is precomputed by BuildUserVarIndex.
+  Result := (Val.Kind = svkRegister) and
+            (Val.RegIndex >= 0) and (Val.RegIndex < Length(FUserVarByBank[Val.RegType])) and
+            FUserVarByBank[Val.RegType][Val.RegIndex];
 end;
 
 function TLoopInvariantCodeMotion.IsDefinedOutsideLoop(const Val: TSSAValue; Loop: TLoopInfo): Boolean;
