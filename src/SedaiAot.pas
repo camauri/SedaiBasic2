@@ -677,6 +677,8 @@ var
   SlotFltSave: Integer;                 // [rsp+SlotFltSave] the FloatRegs base (rsi is volatile in SysV)
   Cur: TSSAInstruction;
   CurOrd: Integer;                      // ordinal of Cur (indexes the SSA->PC map)
+  CurBlkIdx: Integer;                   // absolute block index of Cur (set by the emit loop)
+  CurIsBlockLast: Boolean;              // Cur is its block's last instruction (jump elision)
   LabelIdx: TStringList;                // region-local label -> block-list index
   HelperOps: TStringList;               // diagnostics: op name of every helper call emitted
 
@@ -2242,7 +2244,14 @@ var
         d := LabelIdx.IndexOf(Cur.Dest.LabelName);
         if d < 0 then begin Fail('jump-target'); Exit; end;
         d := PtrInt(LabelIdx.Objects[d]);
-        if Cur.OpCode = ssaJump then JmpRel(d)
+        // An unconditional jump to the NEXT block in emission order is a fall-through:
+        // emitting it produced a taken "jmp +0" (byte-proven: 16 executed per n-body driver
+        // step at the intermediate nest levels). Elide it - only when it is the block's last
+        // instruction, so nothing after it in this block could be skipped. Every other jump
+        // still resolves through the same end-of-emission fixups, so no target moves.
+        if (Cur.OpCode = ssaJump) and (d = CurBlkIdx + 1) and CurIsBlockLast then
+          { fall through }
+        else if Cur.OpCode = ssaJump then JmpRel(d)
         else
         begin
           ILoad(RAX, IReg(Cur.Src1)); if not OK then Exit;
@@ -2449,6 +2458,8 @@ begin
       for j := 0 to Blk.Instructions.Count - 1 do
       begin
         Cur := Blk.Instructions[j];
+        CurBlkIdx := b;
+        CurIsBlockLast := j = Blk.Instructions.Count - 1;
         EmitInstruction;
         if not OK then Exit;
         Inc(CurOrd);
