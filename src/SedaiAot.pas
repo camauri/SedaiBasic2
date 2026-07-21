@@ -52,6 +52,11 @@ type
     StrLoadConst: Pointer; // offset 72: @AotStrLoadConst (dstSlot, VMSelf, imm)
     StrConcat: Pointer;  // offset 80: @AotStrConcat (dstSlot, aVal, bVal)
     StrLen: Pointer;     // offset 88: @AotStrLen (sVal) -> length
+    // B3 native call site: the Pascal primitive that replicates bcCallSub around a call to
+    // the callee's compiled function (FramePush + return-PC push, the compiled call, then
+    // FramePop + pop when the callee reached its bcReturnSub). Reached through the ctx like
+    // every other primitive - never a baked address.
+    CallSub: Pointer;    // offset 96: @AotCallSub (ctx, calleeEntryPC, bcCallSubPC) -> PC/sentinel
   end;
   PAotCtx = ^TAotCtx;
 
@@ -69,6 +74,7 @@ const
   AOTCTX_STRLOADCONST = 72;
   AOTCTX_STRCONCAT = 80;
   AOTCTX_STRLEN    = 88;
+  AOTCTX_CALLSUB   = 96;
 
   // Helper return contract. Normally the helper returns the bytecode PC that follows the
   // instruction it ran; native code compares against the PC it expects and keeps going.
@@ -78,6 +84,12 @@ const
                                   // culprit PC in Ctx.AotFaultPC -> re-raise there
   AOT_HELPER_HALT = PtrInt(-2);   // the instruction cleared Ctx.Running (CTRL+C, quit, failed
                                   // ASSERT): resume PC in Ctx.AotFaultPC -> leave the run loop
+  // B3: AotCallSub's "call completed" value, consumed by the CALLER's native code (never seen
+  // by AotSettle): the callee ran to its bcReturnSub and the frame is popped - continue
+  // natively after the call. Any non-negative return is a deopt PC instead (the callee handed
+  // the rest of the invocation to the interpreter, frame still pushed); the two negative
+  // helper sentinels pass through unchanged.
+  AOT_CALL_OK     = PtrInt(-3);
 
 type
   // The one-instruction runtime helper (C3). Executes bytecode instruction PC on Ctx with the
@@ -94,6 +106,11 @@ type
   // the third argument register. Returns the bytecode PC where the interpreter
   // resumes (the function's bcReturnSub / bcEnd, or a deopt PC).
   TNativeFuncFn = function(IntRegs, FloatRegs: PInt64; Ctx: PAotCtx): PtrInt;
+
+  // B3 native call-site primitive (implemented in SedaiBytecodeVM next to AotExecOne so it can
+  // reach the VM's private FramePush/FramePop/FNativeFuncs). Replicates bcCallSub for a callee
+  // that is itself compiled; returns AOT_CALL_OK, a deopt PC, or a helper sentinel.
+  TAotCallSubFn = function(AotCtx: PAotCtx; CalleeEntryPC, BcCallSubPC: PtrInt): PtrInt; cdecl;
 
   TAotFuncEntry = record
     EntryPC: Integer;
@@ -143,8 +160,13 @@ var
 // bounds check: array OOB takes the FreeBASIC default path natively; otherwise
 // array accesses guard and deopt so the interpreter raises. Diag prints
 // per-region compile results.
+// SkipMain: engine arbitration for the COMBINED --aot --jit mode. The loop JIT can only see
+// (and inline callees into) loops that run in the interpreter's dispatch loop; an AOT-compiled
+// MAIN steals the module-level hot loop from it and replaces loop inlining with a native call
+// per iteration - measured 2x slower on n-body. Until AOT does its own inlining, the split
+// that wins is: JIT owns MAIN (module loops, inlining), AOT owns the procedures.
 function AotCompileProgram(SSAProg: TSSAProgram; Prog: TBytecodeProgram;
-                           TrueVal: Int64; AllowUnsafe, Diag: Boolean): TAotFuncs;
+                           TrueVal: Int64; AllowUnsafe, Diag, SkipMain: Boolean): TAotFuncs;
 
 implementation
 
@@ -303,6 +325,11 @@ end;
 // conditions, so callers get a single yes/no and the helper picks up everything else.
 function AotIsNative(SSAProg: TSSAProgram; const Ins: TSSAInstruction): Boolean;
 begin
+  // B3: a STATIC call is a native call site (AotCallSub replicates bcCallSub in Pascal and
+  // invokes the callee's compiled function, falling back to the interpreter at run time when
+  // the callee is not compiled). Indirect calls (ssaCallSubIndirect) and GOSUB (ssaCall) are
+  // NOT: the target is a runtime value / the return convention differs.
+  if Ins.OpCode = ssaCallSub then Exit(Ins.Dest.Kind = svkLabel);
   Result := IsB1Op(Ins.OpCode);
   if not Result then Exit;
   case Ins.OpCode of
@@ -575,8 +602,14 @@ var
   Fixups: array of TFix;
   NFix: Integer;
   EpiOff: Integer;
+  // B3: second epilogue entry that SKIPS the register flush (fixup target -2). Used after
+  // AotCallSub returns a non-OK value: the caller's registers were already flushed before the
+  // call and the CALLEE has since written the banks - re-flushing would overwrite the callee's
+  // results with stale caller values. Does the same stack teardown and returns rax.
+  BareEpiOff: Integer;
   OK: Boolean;
   HasRecMark, HasDeopt: Boolean;
+  RecMarkRoutable: Boolean;             // every recmark op can go through the helper (see below)
   ArrClassic: Boolean;                  // array OOB raises (CLASSIC / --bounds-check) -> guard + deopt
   LivenessOK: Boolean;                  // C1: the liveness fixpoint converged
   PeakLiveInt, PeakLiveFloat: Integer;  // C1: peak simultaneously-live values per bank
@@ -986,6 +1019,48 @@ var
     //    interpreter with that value in rax, which is already the epilogue's contract.
     E.EmitBytes([$48, $3D]); E.Emit32(LongWord(apc + 1));         // cmp rax, apc+1
     JccRel($85, -1);                                              // jne epilogue
+  end;
+
+  // B3: native call site for ssaCallSub. The arguments were already staged into the xfer
+  // slots by the preceding (native) XferStore ops and the result comes back through them.
+  // AotCallSub replicates bcCallSub in Pascal (FramePush + return-PC push), invokes the
+  // callee's COMPILED function on the same banks, and on a clean bcReturnSub performs the
+  // return (FramePop + pop) and yields AOT_CALL_OK; every other outcome (callee not
+  // compiled, deopt inside the callee, helper sentinel) hands the rest of the invocation
+  // to the interpreter, so the call site carries a deopt's hazard (prescan sets HasDeopt).
+  procedure EmitCallSubNative(apc, calleePC: Integer);
+  var k: Integer;
+  begin
+    Inc(NHelperCalls);
+    // 1. Flush ALL allocated registers to the banks: the callee runs on the same banks
+    //    through rbx/rsi and clobbers them freely.
+    for k := 0 to NIAlloc - 1 do
+      StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
+    for k := 0 to NFAlloc - 1 do
+      E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+    // 2. Arguments. Read the primitive address from the ctx BEFORE any argument setup can
+    //    clobber r8 (it is arg2 on Win64 and volatile on both ABIs) - the C5 concat lesson.
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_CALLSUB);              // rax  = ctx.CallSub
+    MovRR(ABI_ARG0, R8);                                       // arg0 = ctx
+    MovImm64(ABI_ARG1, calleePC);                              // arg1 = callee entry PC
+    MovImm64(ABI_ARG2, apc);                                   // arg2 = bcCallSub PC (last: may clobber r8)
+    E.EmitBytes([$FF, $D0]);                                   // call rax
+    // 3. Restore our base registers (r8/rsi are volatile; rbx survives).
+    FrameLoad(R8, SlotCtxSave);
+    FrameLoad(RSI, SlotFltSave);
+    // 4. Continue natively only on a completed call. Anything else leaves through the BARE
+    //    epilogue with rax as is: our registers were flushed before the call and the callee
+    //    has since written the banks - the normal epilogue's re-flush would corrupt them.
+    E.EmitBytes([$48, $3D]); E.Emit32(LongWord(AOT_CALL_OK));  // cmp rax, AOT_CALL_OK
+    JccRel($85, -2);                                           // jne bare-epilogue
+    // 5. Re-read the banks and the array cache: the callee may have written any register,
+    //    and a DIM/REDIM inside it may have moved the descriptor table (AotCallSub
+    //    refreshed ctx.ArrDesc while still on a Pascal frame).
+    for k := 0 to NIAlloc - 1 do
+      LoadRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
+    for k := 0 to NFAlloc - 1 do
+      E.MemOp([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+    ReloadArrayCache;
   end;
 
   // C5: caller-saved spill around a native leaf call (the string primitives). Only the
@@ -1484,7 +1559,16 @@ var
         Ins := Blk.Instructions[j];
         case Ins.OpCode of
           ssaLabel, ssaNop: ;
-          ssaRecMarkPush, ssaRecMarkPop: HasRecMark := True;
+          ssaRecMarkPush, ssaRecMarkPop:
+          begin
+            // In a region with NO deopt hazard the marks are skipped (the whole invocation
+            // is native, so both push and pop are elided together: balance holds and
+            // reclamation is deferred to FramePop). With a deopt hazard they are routed
+            // through the helper instead, so the mark stack stays balanced no matter where
+            // the interpreter takes over - decided after the scan, when HasDeopt is final.
+            HasRecMark := True;
+            if not AotHelperRoutable(Prog, o) then RecMarkRoutable := False;
+          end;
           ssaJump: ;
           ssaJumpIfZero, ssaJumpIfNotZero: CountVal(Ins.Src1);
           ssaReturnSub, ssaEnd, ssaStop:
@@ -1536,6 +1620,21 @@ var
             CountVal(Ins.Dest);
             if Ins.Src2.Kind = svkRegister then CountVal(Ins.Src2);
           end;
+          ssaCallSub:
+          begin
+            // B3: a native call site. Needs a call-ready frame; AotCallSub can hand the rest
+            // of the invocation to the interpreter (callee not compiled, deopt inside the
+            // callee, exception), so it carries a deopt's hazard - same recmark rule as the
+            // helpers. The bcCallSub PC is required both as the fallback resume point and to
+            // read the callee entry PC out of the instruction's Immediate at emit time.
+            if Ins.Dest.Kind <> svkLabel then NoteHelperOp   // indirect: not routable -> bail
+            else
+            begin
+              HasHelperCall := True;
+              HasDeopt := True;
+              if Prog.GetSsaPc(o) < 0 then Fail('no-pc-callsub');
+            end;
+          end;
           ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
           ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen:
           begin
@@ -1571,9 +1670,17 @@ var
         Inc(o);
       end;
     end;
-    // A mid-function deopt hands the REST of the invocation to the interpreter; skipped
-    // RecMark pushes would then unbalance the record-mark stack -> not compilable.
-    if HasRecMark and HasDeopt then Fail('recmark+deopt');
+    // A mid-function deopt hands the REST of the invocation to the interpreter; SKIPPED
+    // RecMark pushes would then unbalance the record-mark stack. So with both present the
+    // marks are NOT skipped: they run through the helper (real push/pop, order preserved),
+    // which also needs a call-ready frame. B3 made this the common case (every region whose
+    // loop body contains a call carries marks AND a deopt hazard - the old hard bail here
+    // would have kept MAIN uncompilable).
+    if HasRecMark and HasDeopt then
+    begin
+      if not RecMarkRoutable then Fail('recmark-route');
+      HasHelperCall := True;
+    end;
     // The region's last instruction must leave natively (no fall-through off the end).
     Blk := SSAProg.Blocks[Region.LastBlock];
     if Blk.Instructions.Count = 0 then Fail('empty-last-block')
@@ -1663,7 +1770,18 @@ var
       Exit;
     end;
     case Cur.OpCode of
-      ssaLabel, ssaNop, ssaRecMarkPush, ssaRecMarkPop: ;
+      ssaLabel, ssaNop: ;
+
+      // Record-scope marks: skipped in a deopt-free region (push and pop elide together,
+      // reclamation deferred to FramePop), routed through the helper when a deopt could
+      // strand the interpreter against an unbalanced mark stack. Same HasDeopt the prescan
+      // saw - the two must agree.
+      ssaRecMarkPush, ssaRecMarkPop:
+        if HasDeopt then
+        begin
+          apc := NeedPC; if not OK then Exit;
+          EmitHelperCall(apc);
+        end;
 
 
       ssaLoadConstInt:
@@ -1862,6 +1980,20 @@ var
         E.MemOp([$F2, $0F, $11], XMM0, RDX, LongWord(w) * 8);
       end;
 
+      // B3: native call site. The callee entry PC is the resolved label sitting in the
+      // bcCallSub instruction's Immediate (the jump-fixup pass filled it in).
+      ssaCallSub:
+      begin
+        if Cur.Dest.Kind <> svkLabel then Fail('callsub-shape')
+        else
+        begin
+          apc := NeedPC; if not OK then Exit;
+          d := Integer(Prog.GetInstruction(apc).Immediate);
+          if (d < 0) or (d >= Prog.GetInstructionCount) then Fail('callsub-target')
+          else EmitCallSubNative(apc, d);
+        end;
+      end;
+
       ssaArrayLoad:
       begin
         d := ArrId; if not OK then Exit;
@@ -1918,6 +2050,7 @@ begin
   OK := True;
   ArrClassic := not AllowUnsafe;
   HasRecMark := False; HasDeopt := False; HasHelperCall := False; NHelperCalls := 0;
+  RecMarkRoutable := True;
   MaxIReg := -1; MaxFReg := -1; MaxArrId := -1;
   SetLength(IUse, 16); SetLength(FUse, 16); SetLength(AUse, 8);
   NFix := 0; NIAlloc := 0; NFAlloc := 0;
@@ -2024,6 +2157,8 @@ begin
       StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+    // B3 bare epilogue: same teardown, no flush (see the declaration comment).
+    BareEpiOff := E.Len;
     if FrameSize > 0 then
     begin
       if SaveX6 then FrameXmm(False, 6, SlotXmm);
@@ -2036,10 +2171,11 @@ begin
     E.Emit8($5B);                                    // pop rbx
     E.Emit8($C3);                                    // ret
 
-    // Patch jump fixups (block targets or the epilogue).
+    // Patch jump fixups (block targets, the epilogue, or the bare epilogue).
     for k := 0 to NFix - 1 do
     begin
       if Fixups[k].TargetBlock = -1 then TargetOff := EpiOff
+      else if Fixups[k].TargetBlock = -2 then TargetOff := BareEpiOff
       else TargetOff := BlockOff[Fixups[k].TargetBlock];
       if TargetOff < 0 then begin Fail('fixup-target'); Exit; end;
       E.Patch32(Fixups[k].PatchOff, LongWord(TargetOff - (Fixups[k].PatchOff + 4)));
@@ -2056,7 +2192,7 @@ begin
 end;
 
 function AotCompileProgram(SSAProg: TSSAProgram; Prog: TBytecodeProgram;
-                           TrueVal: Int64; AllowUnsafe, Diag: Boolean): TAotFuncs;
+                           TrueVal: Int64; AllowUnsafe, Diag, SkipMain: Boolean): TAotFuncs;
 var
   Regions: TAotRegions;
   r, n: Integer;
@@ -2071,6 +2207,12 @@ begin
   begin
     if not Regions[r].Eligible then Continue;
     if Regions[r].EntryPC < 0 then Continue;
+    if SkipMain and (Regions[r].Name = 'MAIN') then
+    begin
+      if Diag then
+        WriteLn(ErrOutput, '[AOT] skip MAIN (combined mode: the loop JIT owns module-level loops)');
+      Continue;
+    end;
     Mem := AotCompileRegion(SSAProg, Prog, Regions[r], TrueVal, Prog.ModernMode, AllowUnsafe, Why);
     if Mem <> nil then
     begin

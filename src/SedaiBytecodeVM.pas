@@ -5876,6 +5876,78 @@ begin
   end;
 end;
 
+const
+  // B3: cap on native-to-native call nesting. Each level consumes real machine stack (the
+  // callee's native frame plus this Pascal frame); the interpreter's call stack lives on the
+  // heap and auto-grows, so past the cap AotCallSub DECLINES the call - the caller falls back
+  // to the interpreted bcCallSub, which unwinds the whole native chain to the run loop and
+  // re-enters the callee natively from there at depth ~0. Deep recursion therefore costs one
+  // full unwind per cap-many levels and stays correct (m449 exercises this).
+  AOT_CALLSUB_MAX_DEPTH = 1500;
+
+{ AotCallSub (B3, road A): the native call site for a STATIC bcCallSub whose callee is itself
+  compiled. Replicates the interpreter's bcCallSub exactly - FramePush (bank snapshot narrowed
+  to the callee's clobber width) + return-PC push - then invokes the callee's compiled function
+  on the same banks. When the callee comes back AT its bcReturnSub (which its native code does
+  not execute - returns are exit points), the return half is performed here (pop + FramePop,
+  the interpreter's order) and AOT_CALL_OK tells the caller to continue natively. Everything
+  else hands the rest of the invocation to the interpreter: callee not compiled / depth cap ->
+  decline BEFORE any state change (return BcCallSubPC, the interpreter re-runs the call); a
+  deopt PC from inside the callee -> pass it through with frame and return address still
+  pushed (the callee's eventual interpreted bcReturnSub pops them); the two negative helper
+  sentinels -> pass through untouched. The caller's native code exits through its BARE
+  epilogue on any non-OK value: its registers were flushed before the call and the callee has
+  since written the banks. Reached through TAotCtx.CallSub - never a baked address. }
+function AotCallSub(AotCtx: PAotCtx; CalleeEntryPC, BcCallSubPC: PtrInt): PtrInt; cdecl;
+type
+  PInstr = ^TBytecodeInstruction;
+var
+  VM: TBytecodeVM;
+  C: TExecutionContext;
+  Fn: TExecMem;
+  RetPC: PtrInt;
+begin
+  VM := TBytecodeVM(AotCtx^.VMSelf);
+  C := TExecutionContext(AotCtx^.CtxObj);
+  if (CalleeEntryPC < 0) or (CalleeEntryPC >= Length(VM.FNativeFuncs)) then
+    Exit(BcCallSubPC);
+  Fn := VM.FNativeFuncs[CalleeEntryPC];
+  if (Fn = nil) or (C.AotCallDepth >= AOT_CALLSUB_MAX_DEPTH) then
+    Exit(BcCallSubPC);
+  try
+    VM.FramePush(C, Integer(CalleeEntryPC));
+    VM.GrowCallStackIfNeeded(C);
+    C.CallStack[C.CallStackPtr] := Integer(BcCallSubPC) + 1;
+    Inc(C.CallStackPtr);
+  except
+    // FramePush/Grow can allocate; a raise here must not unwind through native frames.
+    C.AotPendingExc := TObject(AcquireExceptionObject);
+    C.AotFaultPC := BcCallSubPC;
+    Exit(AOT_HELPER_EXC);
+  end;
+  // Same refresh the run loop performs before invoking a native function.
+  if VM.FArraysDirty then VM.RebuildJitArrDesc;
+  if Length(VM.FJitArrDesc) > 0 then AotCtx^.ArrDesc := @VM.FJitArrDesc[0]
+  else AotCtx^.ArrDesc := nil;
+  Inc(C.AotCallDepth);
+  RetPC := TNativeFuncFn(Fn.Ptr)(@C.IntRegs[0], PInt64(@C.FloatRegs[0]), AotCtx);
+  Dec(C.AotCallDepth);
+  // A DIM/REDIM/ERASE inside the callee may have rebuilt/moved the descriptor table the
+  // caller's cached bases came from; refresh while still on a Pascal frame.
+  if VM.FArraysDirty then VM.RebuildJitArrDesc;
+  if Length(VM.FJitArrDesc) > 0 then AotCtx^.ArrDesc := @VM.FJitArrDesc[0]
+  else AotCtx^.ArrDesc := nil;
+  if RetPC < 0 then Exit(RetPC);   // helper sentinel from inside the callee: frame stays pushed
+  if (RetPC < VM.FProgram.GetInstructionCount) and
+     (PInstr(VM.FProgram.GetInstructionsPtr)[RetPC].OpCode = bcReturnSub) then
+  begin
+    Dec(C.CallStackPtr);           // the interpreter's bcReturnSub order: pop, then FramePop
+    VM.FramePop(C);
+    Exit(AOT_CALL_OK);
+  end;
+  Result := RetPC;                 // deopt inside the callee: frame + return address stay
+end;
+
 { AotStrCmp (C5): the leaf primitive the AOT calls for bcCmp*String instead of routing the whole
   instruction through AotExecOne. a and b are the two StringRegs slot VALUES (AnsiString data
   pointers or nil), read natively from the bank by the emitted code; Kind selects the relation

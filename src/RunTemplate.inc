@@ -126,6 +126,7 @@ begin
     LocalAotCtx.StrLoadConst := @AotStrLoadConst;
     LocalAotCtx.StrConcat := @AotStrConcat;
     LocalAotCtx.StrLen := @AotStrLen;
+    LocalAotCtx.CallSub := @AotCallSub;   // B3: native call site primitive
   end
   else
     AotFuncs := nil;

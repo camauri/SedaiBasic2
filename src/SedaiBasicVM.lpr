@@ -1643,7 +1643,8 @@ begin
       begin
         AotFuncList := AotCompileProgram(SSAProgram, BytecodeProgram, OptTrueValue,
                                          BytecodeProgram.ModernMode and not OptBoundsCheck,
-                                         GetEnvironmentVariable('AOT_DIAG') = '1');
+                                         GetEnvironmentVariable('AOT_DIAG') = '1',
+                                         OptJit);  // combined mode: JIT owns MAIN (see AotCompileProgram)
         for AotI := 0 to High(AotFuncList) do
           VM.RegisterAotFunc(AotFuncList[AotI].EntryPC, AotFuncList[AotI].Mem);
         VM.AotEnabled := Length(AotFuncList) > 0;

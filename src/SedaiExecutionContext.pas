@@ -168,6 +168,13 @@ type
     // variable happens to hold - which, for an exception raised out of the AOT call site, is
     // the region's ENTRY, not the instruction that failed. -1 = no AOT raise pending.
     AotRaisePC: Integer;
+    // B3: nesting depth of native-to-native calls (AotCallSub frames on the PASCAL stack).
+    // The interpreter's call stack lives on the heap and auto-grows, but each native call
+    // level also consumes real machine stack; past the cap AotCallSub declines the call and
+    // the caller falls back to the interpreted bcCallSub, which unwinds the whole native
+    // chain and re-enters the callee natively from the run loop at depth ~0 - correct, and
+    // amortized to one unwind per cap-many levels on deep recursion.
+    AotCallDepth: Integer;
   end;
 
 implementation
