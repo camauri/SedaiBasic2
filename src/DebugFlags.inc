@@ -103,6 +103,7 @@
 {.$DEFINE DEBUG_CONSOLE}     // Interactive console (SDL2) debug
 {.$DEFINE DEBUG_AUDIO}      // Audio subsystem debug (WITH_SEDAI_AUDIO required)
 {.$DEFINE DEBUG_AOTTRACE}   // AOT: trace every runtime-helper call and native return (AOT_TRACE=1)
+{.$DEFINE DEBUG_SSAPROF}    // SSA pipeline profiler: phase/per-proc/per-statement timers (SSA_PROF=1; Windows-only)
 
 { ============================================================================
   AUTO-ENABLE ALL FLAGS WHEN DEBUG_ALL IS SET

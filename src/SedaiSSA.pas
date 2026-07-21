@@ -535,6 +535,7 @@ type
     procedure FixForwardReferences;  // PHASE 3 TIER 3: Fix forward GOTO/GOSUB references
     procedure ProcessExpression(Node: TASTNode; out Result: TSSAValue); overload;
     procedure ProcessExpression(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue); overload;
+    procedure ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
     procedure ProcessAssignment(Node: TASTNode);
     procedure ProcessArrayStore(Node: TASTNode);
     procedure ProcessPrint(Node: TASTNode);
@@ -729,6 +730,26 @@ implementation
 
 {$IFDEF DEBUG_SSA}
 uses SedaiDebug;
+{$ENDIF}
+
+{ SSA pipeline profiler (build.ps1 -DebugFlags SSAPROF + env SSA_PROF=1): phase timers in
+  Generate, per-procedure lowering timers, and per-statement accumulators for the assignment
+  path. Compiled OUT entirely without the flag - release builds carry zero overhead. QPC is
+  Windows-only; the flag self-disables elsewhere. }
+{$IFDEF DEBUG_SSAPROF}{$IFNDEF WINDOWS}{$UNDEF DEBUG_SSAPROF}{$ENDIF}{$ENDIF}
+{$IFDEF DEBUG_SSAPROF}
+function ProfQPC(out c: Int64): LongBool; stdcall; external 'kernel32' name 'QueryPerformanceCounter';
+function ProfQPF(out f: Int64): LongBool; stdcall; external 'kernel32' name 'QueryPerformanceFrequency';
+var
+  ProfAssignTicks: Int64 = 0; ProfAssignN: Integer = 0;
+  ProfAssignT0, ProfAssignT1: Int64;
+  ProfExprTicks: Int64 = 0; ProfExprN: Integer = 0; ProfExprDepth: Integer = 0;
+  ProfExprT0, ProfExprT1: Int64;
+  ProfHeadTicks: Int64 = 0; ProfHeadT1: Int64;
+  ProfCascTicks: Int64 = 0; ProfCascT1: Int64; ProfCascN: Integer = 0;
+  ProfTailTicks: Int64 = 0; ProfTailT0, ProfTailT1: Int64;
+  ProfAllocTicks: Int64 = 0; ProfAllocT1: Int64;
+  ProfCallTicks: Int64 = 0;
 {$ENDIF}
 
 const
@@ -1403,8 +1424,29 @@ begin
   ProcessExpression(Node, Result, EmptyHint);
 end;
 
-// Main implementation with destination hint
+// Thin dispatcher in front of the full lowering. The full body below declares ~60 locals of
+// which dozens are managed (strings, TSSAValue records carrying three strings each), and FPC
+// zero-initializes and RTTI-finalizes every one of them on EVERY call - measured at ~24 us of
+// prologue/epilogue per call against ~0.25 us of actual work, the single largest cost of the
+// whole SSA generation. Numeric literals - the most common leaf by far - are lowered here in a
+// frame with no managed locals and never touch the big frame.
 procedure TSSAGenerator.ProcessExpression(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
+begin
+  if (Node <> nil) and (Node.NodeType = antLiteral) and VarIsNumeric(Node.Value) then
+  begin
+    // Same rule as the full body's antLiteral branch: bank keyed off the Variant type, not the
+    // value, so 1.0 stays a float (1.0/3.0 must not fold as 1 div 3).
+    if VarIsFloat(Node.Value) then
+      Result := MakeSSAConstFloat(Double(Node.Value))
+    else
+      Result := MakeSSAConstInt(Int64(Node.Value));
+    Exit;
+  end;
+  ProcessExpressionFull(Node, Result, DestHint);
+end;
+
+// Main implementation with destination hint
+procedure TSSAGenerator.ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
 var
   Left, Right: TSSAValue;
   DestReg: Integer;
@@ -1466,6 +1508,13 @@ begin
     Result := MakeSSAValue(svkNone);
     Exit;
   end;
+
+  // SSAPROF: accumulate top-level expression time (depth guard for recursion).
+  {$IFDEF DEBUG_SSAPROF}
+  if ProfExprDepth = 0 then ProfQPC(ProfExprT0);
+  Inc(ProfExprDepth);
+  try
+  {$ENDIF}
 
   case Node.NodeType of
     antProcAddress:
@@ -5549,6 +5598,19 @@ begin
   else
     Result := MakeSSAValue(svkNone);
   end;
+
+  // SSAPROF
+  {$IFDEF DEBUG_SSAPROF}
+  finally
+    Dec(ProfExprDepth);
+    if ProfExprDepth = 0 then
+    begin
+      ProfQPC(ProfExprT1);
+      Inc(ProfExprTicks, ProfExprT1 - ProfExprT0);
+      Inc(ProfExprN);
+    end;
+  end;
+  {$ENDIF}
 end;
 
 procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
@@ -5843,6 +5905,12 @@ begin
   if VarNode.NodeType <> antIdentifier then Exit;
   VarName := VarToStr(VarNode.Value);
 
+  // SSAPROF: ticks spent in the lvalue-shape probes above (entry -> here).
+  {$IFDEF DEBUG_SSAPROF}
+  ProfQPC(ProfHeadT1);
+  Inc(ProfHeadTicks, ProfHeadT1 - ProfAssignT0);
+  {$ENDIF}
+
   // BYREF reference variable (DIM BYREF r AS T = target): assigning to r stores through the address it
   // carries (mutating target), not into r's own register — so "r = v" writes target.
   if IsRefVar(VarName) then
@@ -6090,11 +6158,26 @@ begin
     Exit;
   end;
 
+  // SSAPROF: ticks spent in the per-name probe cascade (head waypoint -> here).
+  {$IFDEF DEBUG_SSAPROF}
+  ProfQPC(ProfCascT1);
+  Inc(ProfCascTicks, ProfCascT1 - ProfHeadT1);
+  Inc(ProfCascN);
+  {$ENDIF}
+
   // Get or allocate register for this variable
   VarReg := GetOrAllocateVariable(VarName);
+  {$IFDEF DEBUG_SSAPROF}
+  ProfQPC(ProfAllocT1);
+  Inc(ProfAllocTicks, ProfAllocT1 - ProfCascT1);   // GetOrAllocateVariable alone
+  {$ENDIF}
 
   // Evaluate expression with destination hint to avoid unnecessary copies
   ProcessExpression(ExprNode, ExprValue, VarReg);
+  {$IFDEF DEBUG_SSAPROF}
+  ProfQPC(ProfTailT0);   // store-block start (post expr)
+  Inc(ProfCallTicks, ProfTailT0 - ProfAllocT1);    // the FULL ProcessExpression call (prologue included)
+  {$ENDIF}
 
   // B1.5 phase 2: if VarName was DIM'd with a sub-64-bit integer type or SINGLE, wrap/round the
   // value to that width before storing (FreeBASIC narrows at the store). No-op for wide/untracked
@@ -6165,6 +6248,10 @@ begin
     end;
   end;
   // else: ExprValue is already in VarReg thanks to hint - no copy needed!
+  {$IFDEF DEBUG_SSAPROF}
+  ProfQPC(ProfTailT1);
+  Inc(ProfTailTicks, ProfTailT1 - ProfTailT0);
+  {$ENDIF}
 end;
 
 procedure TSSAGenerator.ProcessPrint(Node: TASTNode);
@@ -21682,6 +21769,9 @@ var
   Name, LabelName, ParentType: string;
   RT: TSSARegisterType;
   ParamReg, LcHandle: TSSAValue;
+  {$IFDEF DEBUG_SSAPROF}
+  ProfProcT0, ProfProcT1, ProfProcFq: Int64;
+  {$ENDIF}
 begin
   for i := 0 to High(FDeferredProcs) do
   begin
@@ -21690,6 +21780,11 @@ begin
     NameNode := Proc.GetChild(0);
     if NameNode.NodeType <> antIdentifier then Continue;
     Name := UpperCase(VarToStr(NameNode.Value));
+    // SSAPROF
+    {$IFDEF DEBUG_SSAPROF}
+    if GetEnvironmentVariable('SSA_PROF') <> '' then
+      ProfQPC(ProfProcT0);
+    {$ENDIF}
     LabelName := ProcedureLabelName(Name);
 
     // Establish procedure context (for "fname = expr" results, RETURN, EXIT SUB/FUNCTION).
@@ -21908,6 +22003,16 @@ begin
     FCurrentProcRetRecType := '';
     FCurrentResultHandle := MakeSSAValue(svkNone);
     FCurrentProcLocalRecs.Clear;
+    // SSAPROF
+    {$IFDEF DEBUG_SSAPROF}
+    if GetEnvironmentVariable('SSA_PROF') <> '' then
+    begin
+      ProfQPC(ProfProcT1);
+      ProfQPF(ProfProcFq);
+      WriteLn(ErrOutput, '[SSAPROF]   proc ', Name, ' ',
+              ((ProfProcT1 - ProfProcT0) * 1000.0 / ProfProcFq):0:3, ' ms');
+    end;
+    {$ENDIF}
   end;
 end;
 
@@ -22102,7 +22207,19 @@ begin
         end;
       end;
     end;
-    antAssignment: ProcessAssignment(Node);
+    antAssignment:
+    begin
+      // SSAPROF
+      {$IFDEF DEBUG_SSAPROF}
+      ProfQPC(ProfAssignT0);
+      ProcessAssignment(Node);
+      ProfQPC(ProfAssignT1);
+      Inc(ProfAssignTicks, ProfAssignT1 - ProfAssignT0);
+      Inc(ProfAssignN);
+      {$ELSE}
+      ProcessAssignment(Node);
+      {$ENDIF}
+    end;
     antConst:
     begin
       // CONST is just an assignment with a constant value
@@ -22691,7 +22808,24 @@ var
   LastBlock: TSSABasicBlock;
   LastInstr: TSSAInstruction;
   DefCh: Char;
+  {$IFDEF DEBUG_SSAPROF}
+  ProfT0, ProfFreq: Int64;
+  ProfOn: Boolean;
+  procedure Mark(const What: string);
+  var c: Int64;
+  begin
+    if not ProfOn then Exit;
+    ProfQPC(c);
+    WriteLn(ErrOutput, '[SSAPROF] ', What, ' ', ((c - ProfT0) * 1000.0 / ProfFreq):0:3, ' ms');
+    ProfT0 := c;
+  end;
+  {$ENDIF}
 begin
+  {$IFDEF DEBUG_SSAPROF}
+  ProfOn := GetEnvironmentVariable('SSA_PROF') <> '';
+  ProfT0 := 0; ProfFreq := 1;
+  if ProfOn then begin ProfQPF(ProfFreq); ProfQPC(ProfT0); end;
+  {$ENDIF}
   FProgram := TSSAProgram.Create;
   FLabelCounter := 0;
 
@@ -22842,7 +22976,9 @@ begin
 
   // PRE-COLLECT SUB/FUNCTION DECLARATIONS so CALL sites can resolve parameter info even
   // for procedures defined later in the source (forward references).
+  {$IFDEF DEBUG_SSAPROF}Mark('collectors');{$ENDIF}
   PreCollectProcedures(AST);
+  {$IFDEF DEBUG_SSAPROF}Mark('precollect-procs');{$ENDIF}
   // Register array-parameter placeholder arrays now (procs are collected), BEFORE any module code or
   // body is lowered, so every call site's bind and every body's array access resolve the placeholder.
   RegisterArrayParams;
@@ -22866,7 +23002,9 @@ begin
 
   // Process AST (DATA statements will be skipped since they're already processed).
   // SUB/FUNCTION declarations are collected (not lowered) during this walk.
+  {$IFDEF DEBUG_SSAPROF}Mark('pre-lowering');{$ENDIF}
   ProcessStatement(AST);
+  {$IFDEF DEBUG_SSAPROF}Mark('module-lowering');{$ENDIF}
 
   // Add END to the LAST MODULE block, BEFORE procedure bodies are appended, so module
   // flow halts at END and never falls through into the procedure region.
@@ -22891,6 +23029,7 @@ begin
 
   // Lower SUB/FUNCTION bodies into their own block region (after the module END).
   LowerDeferredProcedures;
+  {$IFDEF DEBUG_SSAPROF}Mark('proc-lowering');{$ENDIF}
 
   // M4.3: synthesize virtual-dispatch procedures for every polymorphic (type, method) used.
   GenerateDispatchers;
@@ -22906,6 +23045,22 @@ begin
   // so they must not be SSA-versioned. All descriptors now exist (incl. proc-local from the lowered
   // procedure bodies above), so exclude them before SSA construction versions anything.
   FProgram.ExcludeArrayDescriptorRegsFromVersioning;
+  {$IFDEF DEBUG_SSAPROF}Mark('post-fixes');{$ENDIF}
+  // SSAPROF: accumulated shares.
+  {$IFDEF DEBUG_SSAPROF}
+  if ProfOn then
+  begin
+    WriteLn(ErrOutput, '[SSAPROF] assign-total ', (ProfAssignTicks * 1000.0 / ProfFreq):0:3,
+            ' ms over ', ProfAssignN, ' stmts (lvalue-probe head ',
+            (ProfHeadTicks * 1000.0 / ProfFreq):0:3, ' ms, name-probe cascade ',
+            (ProfCascTicks * 1000.0 / ProfFreq):0:3, ' ms over ', ProfCascN,
+            ', store-tail ', (ProfTailTicks * 1000.0 / ProfFreq):0:3, ' ms, alloc ',
+            (ProfAllocTicks * 1000.0 / ProfFreq):0:3, ' ms, expr-call ',
+            (ProfCallTicks * 1000.0 / ProfFreq):0:3, ' ms)');
+    WriteLn(ErrOutput, '[SSAPROF] expr-total   ', (ProfExprTicks * 1000.0 / ProfFreq):0:3,
+            ' ms over ', ProfExprN, ' top-level exprs');
+  end;
+  {$ENDIF}
 
   Result := FProgram;
 end;
