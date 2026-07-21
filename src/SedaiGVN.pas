@@ -93,15 +93,16 @@ type
   TGVNPass = class
   private
     type
-      TDefCountMap = specialize TDictionary<string, Integer>;
+      TDefCountMap = specialize TDictionary<Int64, Integer>;
+      TRegKeySet = specialize TDictionary<Int64, Boolean>;
   private
     FScopedTable: TScopedGVNTable;
     FDomTree: TDominatorTree;
     FProgram: TSSAProgram;
     FReplacements: Integer;  // Count of values replaced
     FCurrentBlock: TSSABasicBlock;  // Current block being processed
-    FPhiDefinedRegs: TStringList;   // Registers defined by PHI functions (loop-variant)
-    FDefCounts: TDefCountMap;       // (RegType:RegIndex:Version) -> number of defining instructions
+    FPhiDefinedRegs: TRegKeySet;    // Registers defined by PHI functions (loop-variant)
+    FDefCounts: TDefCountMap;       // packed (RegType,RegIndex,Version) -> number of defining instructions
 
     { Process a single basic block }
     procedure ProcessBlock(Block: TSSABasicBlock);
@@ -230,13 +231,18 @@ end;
 
 { TGVNPass }
 
+{ Pack a register identity (bank, index, version) into one Int64 - the guard-path maps used to
+  key on Format('%d:%d:%d') strings, built afresh for EVERY query (up to four per instruction). }
+function RegKey64(const V: TSSAValue): Int64; inline;
+begin
+  Result := Int64(Ord(V.RegType)) or (Int64(V.RegIndex) shl 2) or (Int64(V.Version) shl 32);
+end;
+
 constructor TGVNPass.Create;
 begin
   inherited Create;
   FScopedTable := TScopedGVNTable.Create;
-  FPhiDefinedRegs := TStringList.Create;
-  FPhiDefinedRegs.Sorted := True;
-  FPhiDefinedRegs.Duplicates := dupIgnore;
+  FPhiDefinedRegs := TRegKeySet.Create;
   FDefCounts := TDefCountMap.Create;
   FReplacements := 0;
   FCurrentBlock := nil;
@@ -255,7 +261,6 @@ var
   i, j: Integer;
   Block: TSSABasicBlock;
   Instr: TSSAInstruction;
-  RegKey: string;
 begin
   { Collect all registers that are defined by PHI functions.
     These registers are "loop-variant" - their values change across
@@ -274,12 +279,7 @@ begin
       begin
         // Record this register as PHI-defined
         if Instr.Dest.Kind = svkRegister then
-        begin
-          RegKey := Format('%d:%d:%d', [Ord(Instr.Dest.RegType),
-                                        Instr.Dest.RegIndex,
-                                        Instr.Dest.Version]);
-          FPhiDefinedRegs.Add(RegKey);
-        end;
+          FPhiDefinedRegs.AddOrSetValue(RegKey64(Instr.Dest), True);
       end;
     end;
   end;
@@ -296,7 +296,7 @@ var
   i, j: Integer;
   Block: TSSABasicBlock;
   Instr: TSSAInstruction;
-  Key: string;
+  Key: Int64;
   Cnt: Integer;
 begin
   { Value numbering is only sound over SINGLE-ASSIGNMENT names: a register written by more than one
@@ -320,7 +320,7 @@ begin
         ssaArrayStoreIndString, ssaPrint, ssaPrintLn:
           Continue;
       else
-        Key := Format('%d:%d:%d', [Ord(Instr.Dest.RegType), Instr.Dest.RegIndex, Instr.Dest.Version]);
+        Key := RegKey64(Instr.Dest);
         if FDefCounts.TryGetValue(Key, Cnt) then
           FDefCounts[Key] := Cnt + 1
         else
@@ -335,23 +335,13 @@ var
   Cnt: Integer;
 begin
   if Value.Kind <> svkRegister then Exit(True);   // constants/labels/none are immutable
-  Result := FDefCounts.TryGetValue(
-              Format('%d:%d:%d', [Ord(Value.RegType), Value.RegIndex, Value.Version]), Cnt)
-            and (Cnt = 1);
+  Result := FDefCounts.TryGetValue(RegKey64(Value), Cnt) and (Cnt = 1);
 end;
 
 function TGVNPass.IsLoopVariant(const Value: TSSAValue): Boolean;
-var
-  RegKey: string;
 begin
   { Check if a value is loop-variant (defined by a PHI function) }
-  Result := False;
-
-  if Value.Kind <> svkRegister then
-    Exit;
-
-  RegKey := Format('%d:%d:%d', [Ord(Value.RegType), Value.RegIndex, Value.Version]);
-  Result := FPhiDefinedRegs.IndexOf(RegKey) >= 0;
+  Result := (Value.Kind = svkRegister) and FPhiDefinedRegs.ContainsKey(RegKey64(Value));
 end;
 
 function TGVNPass.UsesLoopVariantValue(Instr: TSSAInstruction): Boolean;
@@ -367,6 +357,28 @@ begin
     Exit(True);
 end;
 
+{ Cheap, exact operand encoding for the value hash. Replaces SSAValueToString, which paid RTTI
+  (GetEnumName), Format and FloatToStr per operand on every numerable instruction. Every kind gets
+  a distinct prefix so no two different values can share a key. Floats key on their BIT PATTERN
+  (FloatToStr rounded to 15 digits, so two distinct doubles could collide and merge - keying on the
+  bits partitions strictly finer, which is always sound). String/label constants key on their pool
+  id, which the interned pool makes exact. }
+function ValueHashPart(const V: TSSAValue): string; inline;
+begin
+  case V.Kind of
+    svkRegister:
+      Result := 'r' + IntToStr(Ord(V.RegType)) + '.' + IntToStr(V.RegIndex) + '.' + IntToStr(V.Version);
+    svkConstInt: Result := 'i' + IntToStr(V.ConstInt);
+    svkConstFloat: Result := 'f' + IntToStr(PInt64(@V.ConstFloat)^);
+    svkConstString: Result := 's' + IntToStr(V.ConstStringId);
+    svkVariable: Result := 'v' + IntToStr(V.VarNameId);
+    svkLabel: Result := 'l' + IntToStr(V.LabelNameId);
+    svkArrayRef: Result := 'a' + IntToStr(V.ArrayIndex);
+  else
+    Result := '?';
+  end;
+end;
+
 function TGVNPass.ComputeValueHash(Instr: TSSAInstruction): string;
 begin
   { Compute a hash key that uniquely identifies the value computed by this instruction.
@@ -376,19 +388,19 @@ begin
     - Same source operands (by value, not register)
 
     Example:
-      R1 = Add R0, R0  → Hash = "Add:R0:R0"
-      R2 = Add R0, R0  → Hash = "Add:R0:R0"  (same! can reuse R1)
+      R1 = Add R0, R0  → Hash = "43:r0.1.2:r0.1.2"
+      R2 = Add R0, R0  → same key: can reuse R1
   }
 
-  Result := SSAOpCodeToString(Instr.OpCode);
+  Result := IntToStr(Ord(Instr.OpCode));
 
   // Append source operands
   if Instr.Src1.Kind <> svkNone then
-    Result := Result + ':' + SSAValueToString(Instr.Src1);
+    Result := Result + ':' + ValueHashPart(Instr.Src1);
   if Instr.Src2.Kind <> svkNone then
-    Result := Result + ':' + SSAValueToString(Instr.Src2);
+    Result := Result + ':' + ValueHashPart(Instr.Src2);
   if Instr.Src3.Kind <> svkNone then
-    Result := Result + ':' + SSAValueToString(Instr.Src3);
+    Result := Result + ':' + ValueHashPart(Instr.Src3);
 end;
 
 function TGVNPass.IsValueNumberable(Instr: TSSAInstruction): Boolean;
