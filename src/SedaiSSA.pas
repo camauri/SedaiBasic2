@@ -275,6 +275,8 @@ type
     function ProcHasParamCount(const NameU: string; N: Integer): Boolean;  // decl has exactly N parameters
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
     procedure ProcessStatement(Node: TASTNode);
+    procedure ProcessStatementFull(Node: TASTNode);
+    procedure StartStatementLineBlock(LineNode: TASTNode);
     // SUB/FUNCTION (M2): pre-scan the AST to register all declarations up front (so CALL
     // sites resolve parameter info even for procedures defined later); collect a declaration
     // for deferred lowering; lower a CALL site; lower all bodies after the module END.
@@ -746,7 +748,7 @@ var
   ProfAssignT0, ProfAssignT1: Int64;
   ProfExprTicks: Int64 = 0; ProfExprN: Integer = 0; ProfExprDepth: Integer = 0;
   ProfExprT0, ProfExprT1: Int64;
-  ProfHeadTicks: Int64 = 0; ProfHeadT1: Int64;
+  ProfHeadTicks: Int64 = 0; ProfHeadT1: Int64; ProfAsgEntryT0: Int64;
   ProfCascTicks: Int64 = 0; ProfCascT1: Int64; ProfCascN: Integer = 0;
   ProfTailTicks: Int64 = 0; ProfTailT0, ProfTailT1: Int64;
   ProfAllocTicks: Int64 = 0; ProfAllocT1: Int64;
@@ -5649,6 +5651,12 @@ var
   FixedCap: Integer;             // fixed-length string capacity (DIM s AS STRING/WSTRING * n)
   FixedCapReg, FixedTrunc: TSSAValue;
 begin
+  // SSAPROF: entry stamp for the lvalue-probe head bucket. Captured HERE, not at the antAssignment
+  // call site: antConst / DIM initializers also route through this procedure, and a stale call-site
+  // stamp made the head bucket print garbage.
+  {$IFDEF DEBUG_SSAPROF}
+  ProfQPC(ProfAsgEntryT0);
+  {$ENDIF}
   if Node.ChildCount < 2 then Exit;
 
   VarNode := Node.GetChild(0);
@@ -5934,7 +5942,7 @@ begin
   // SSAPROF: ticks spent in the lvalue-shape probes above (entry -> here).
   {$IFDEF DEBUG_SSAPROF}
   ProfQPC(ProfHeadT1);
-  Inc(ProfHeadTicks, ProfHeadT1 - ProfAssignT0);
+  Inc(ProfHeadTicks, ProfHeadT1 - ProfAsgEntryT0);
   {$ENDIF}
 
   // BYREF reference variable (DIM BYREF r AS T = target): assigning to r stores through the address it
@@ -22042,7 +22050,111 @@ begin
   end;
 end;
 
+procedure TSSAGenerator.StartStatementLineBlock(LineNode: TASTNode);
+// CLASSIC line-number header of a statement: open (or re-enter) the LINE_<n> block with a
+// fall-through edge from the previous block. Lives in its own frame so ProcessStatement's
+// dispatcher stays free of managed locals (the label string).
+var
+  LabelName: string;
+  PrevBlock, NewBlock: TSSABasicBlock;
+begin
+  LabelName := 'LINE_' + IntToStr(Integer(LineNode.Value));
+
+  // PHASE 3 TIER 3: Save previous block before creating new one
+  PrevBlock := FCurrentBlock;
+
+  // Get existing or create new block for this line (prevents duplicate blocks)
+  FCurrentBlock := FProgram.GetOrCreateBlock(LabelName);
+  NewBlock := FCurrentBlock;
+
+  // PHASE 3 TIER 3: Add fall-through edge PrevBlock → NewBlock
+  if Assigned(PrevBlock) and Assigned(NewBlock) and (PrevBlock <> NewBlock) then
+  begin
+    PrevBlock.AddSuccessor(NewBlock);
+    NewBlock.AddPredecessor(PrevBlock);
+    {$IFDEF DEBUG_SSA}
+    if DebugSSA then
+      WriteLn('[SSA] Edge: ', PrevBlock.LabelName, ' → ', NewBlock.LabelName, ' (fall-through)');
+    {$ENDIF}
+  end;
+end;
+
 procedure TSSAGenerator.ProcessStatement(Node: TASTNode);
+// Thin dispatcher in front of the full statement lowering — same disease and cure as the
+// ProcessExpression pair above: the full body declares a dozen managed locals (TSSAValue
+// records carrying three strings each) that FPC zero-initializes and RTTI-finalizes on
+// EVERY call, for every "x = 1". This frame has NO managed locals. The arms below are PURE
+// DUPLICATES of one-line delegation arms in ProcessStatementFull — if you ever add inline
+// code to one of those arms there, remove it from here (or it will be shadowed silently).
+// Every other statement falls through to ProcessStatementFull, which stays the single
+// complete dispatcher. The statement HEADER (Modern line stamp + CLASSIC line-number block)
+// runs HERE for every statement; ProcessStatementFull must only be called from this wrapper.
+var
+  i: Integer;
+begin
+  if Node = nil then Exit;
+
+  // MODERN (FreeBASIC, no line numbers): stamp each statement's physical source line into
+  // FCurrentLineNumber so emitted instructions carry it in the source map. This makes ERL and
+  // RESUME NEXT work (both rely on GetSourceLine / FindPCAfterLine). CLASSIC keeps using the
+  // BASIC line numbers set by antLineNumber in ProcessStatementFull.
+  if FModernMode and (Node.SourceLine > 0) then
+    FCurrentLineNumber := Node.SourceLine;
+
+  // Handle line numbers (string work lives in the helper's frame)
+  if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antLineNumber) then
+    StartStatementLineBlock(Node.GetChild(0));
+
+  case Node.NodeType of
+    antAssignment:
+    begin
+      // SSAPROF
+      {$IFDEF DEBUG_SSAPROF}
+      ProfQPC(ProfAssignT0);
+      ProcessAssignment(Node);
+      ProfQPC(ProfAssignT1);
+      Inc(ProfAssignTicks, ProfAssignT1 - ProfAssignT0);
+      Inc(ProfAssignN);
+      {$ELSE}
+      ProcessAssignment(Node);
+      {$ENDIF}
+    end;
+    antPrint: ProcessPrint(Node);
+    antInput: ProcessInput(Node);
+    antDim: ProcessDim(Node);
+    antErase: ProcessErase(Node);
+    antRedim: ProcessRedim(Node);
+    antSwap: ProcessSwap(Node);
+    antDefType: ProcessDefType(Node);
+    antMidStatement: ProcessMidStatement(Node);
+    antLSet: ProcessLRSetStatement(Node, True);
+    antRSet: ProcessLRSetStatement(Node, False);
+    antDef: ProcessDefFn(Node);
+    antForLoop: ProcessForLoop(Node);
+    antDoLoop: ProcessDoLoop(Node);
+    antBlock: ProcessBlock(Node);
+    antNext: ProcessNext(Node);
+    antIf: ProcessIfStatement(Node);
+    antGoto: ProcessGoto(Node);
+    antGosub: ProcessGosub(Node);
+    antOnGoto: ProcessOnGoto(Node);
+    antOnGosub: ProcessOnGosub(Node);
+    antProcedureDecl: CollectProcedureDecl(Node);
+    antProcedureCall: ProcessProcedureCall(Node);
+    antTypeDecl: ;  // UDT declaration: registered in the pre-scan (RegisterUDTs); nothing to emit.
+    antProgram, antStatement, antThen, antElse:
+      for i := 0 to Node.ChildCount - 1 do
+        ProcessStatement(Node.GetChild(i));
+  else
+    ProcessStatementFull(Node);
+  end;
+end;
+
+procedure TSSAGenerator.ProcessStatementFull(Node: TASTNode);
+// Full statement lowering. ONLY callable from the ProcessStatement wrapper, which has
+// already run the statement header (Modern line stamp + CLASSIC line-number block) and
+// intercepts the hot delegation-only arms; the duplicated arms below are kept so this
+// case remains the complete, single source of truth.
 var
   LineNum: Integer;
   LabelName: string;
@@ -22064,38 +22176,6 @@ var
   OpCode: TSSAOpCode;     // M5.4: selected mutex op
 begin
   if Node = nil then Exit;
-
-  // MODERN (FreeBASIC, no line numbers): stamp each statement's physical source line into
-  // FCurrentLineNumber so emitted instructions carry it in the source map. This makes ERL and
-  // RESUME NEXT work (both rely on GetSourceLine / FindPCAfterLine). CLASSIC keeps using the
-  // BASIC line numbers set by antLineNumber below.
-  if FModernMode and (Node.SourceLine > 0) then
-    FCurrentLineNumber := Node.SourceLine;
-
-  // Handle line numbers
-  if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antLineNumber) then
-  begin
-    LineNum := Integer(Node.GetChild(0).Value);
-    LabelName := 'LINE_' + IntToStr(LineNum);
-
-    // PHASE 3 TIER 3: Save previous block before creating new one
-    PrevBlock := FCurrentBlock;
-
-    // Get existing or create new block for this line (prevents duplicate blocks)
-    FCurrentBlock := FProgram.GetOrCreateBlock(LabelName);
-    NewBlock := FCurrentBlock;
-
-    // PHASE 3 TIER 3: Add fall-through edge PrevBlock → NewBlock
-    if Assigned(PrevBlock) and Assigned(NewBlock) and (PrevBlock <> NewBlock) then
-    begin
-      PrevBlock.AddSuccessor(NewBlock);
-      NewBlock.AddPredecessor(PrevBlock);
-      {$IFDEF DEBUG_SSA}
-      if DebugSSA then
-        WriteLn('[SSA] Edge: ', PrevBlock.LabelName, ' → ', NewBlock.LabelName, ' (fall-through)');
-      {$ENDIF}
-    end;
-  end;
 
   case Node.NodeType of
     antThreadWait, antThreadDetach:
