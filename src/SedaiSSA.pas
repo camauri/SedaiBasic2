@@ -535,6 +535,7 @@ type
     procedure FixForwardReferences;  // PHASE 3 TIER 3: Fix forward GOTO/GOSUB references
     procedure ProcessExpression(Node: TASTNode; out Result: TSSAValue); overload;
     procedure ProcessExpression(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue); overload;
+    function TryFastDeclaredIdentifier(Node: TASTNode; out Res: TSSAValue): Boolean;
     procedure ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
     procedure ProcessAssignment(Node: TASTNode);
     procedure ProcessArrayStore(Node: TASTNode);
@@ -1432,17 +1433,42 @@ end;
 // frame with no managed locals and never touch the big frame.
 procedure TSSAGenerator.ProcessExpression(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
 begin
-  if (Node <> nil) and (Node.NodeType = antLiteral) and VarIsNumeric(Node.Value) then
+  if Node <> nil then
   begin
-    // Same rule as the full body's antLiteral branch: bank keyed off the Variant type, not the
-    // value, so 1.0 stays a float (1.0/3.0 must not fold as 1 div 3).
-    if VarIsFloat(Node.Value) then
-      Result := MakeSSAConstFloat(Double(Node.Value))
-    else
-      Result := MakeSSAConstInt(Int64(Node.Value));
-    Exit;
+    if (Node.NodeType = antLiteral) and VarIsNumeric(Node.Value) then
+    begin
+      // Same rule as the full body's antLiteral branch: bank keyed off the Variant type, not the
+      // value, so 1.0 stays a float (1.0/3.0 must not fold as 1 div 3).
+      if VarIsFloat(Node.Value) then
+        Result := MakeSSAConstFloat(Double(Node.Value))
+      else
+        Result := MakeSSAConstInt(Int64(Node.Value));
+      Exit;
+    end;
+    if (Node.NodeType = antIdentifier) and TryFastDeclaredIdentifier(Node, Result) then
+      Exit;
   end;
   ProcessExpressionFull(Node, Result, DestHint);
+end;
+
+function TSSAGenerator.TryFastDeclaredIdentifier(Node: TASTNode; out Res: TSSAValue): Boolean;
+// Second dispatcher fast path: a bare identifier the program DECLARED, resolved without entering
+// the big frame. Mirrors the full antIdentifier branch: a declared name disables every bare-name
+// intercept and the bare-FUNCTION call (both gated on "not IsDeclaredName"), so only the special
+// storage routes remain — each is asked here, and any hit falls back to the full branch, which
+// re-runs the chain in its original order. Method bodies (implicit THIS field/property) bail out
+// wholesale on FCurrentThisType.
+var
+  VarName: string;
+begin
+  Result := False;
+  VarName := VarToStr(Node.Value);
+  if not IsDeclaredName(VarName) then Exit;
+  if FCurrentThisType <> '' then Exit;
+  if IsAddrParam(VarName) or IsRefVar(VarName) or IsAddrLocal(VarName) or
+     IsRawModuleScalar(VarName) or IsSharedScalar(VarName) then Exit;
+  Res := GetOrAllocateVariable(VarName);
+  Result := True;
 end;
 
 // Main implementation with destination hint
