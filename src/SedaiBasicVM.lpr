@@ -752,6 +752,20 @@ begin
       TimeConstProp := 0; TimeCopyProp := 0; TimeLICM := 0; TimeLoopUnroll := 0;
       TimeDCE := 0; TimePhiElim := 0; TimeCopyCoal := 0; TimeRegAlloc := 0;
 
+      {$IFNDEF DISABLE_SUB_INLINING}
+      // SUB/FUNCTION INLINING (unification) - flatten small leaf calls FIRST, so the
+      // clones go through versioning and every later pass like hand-written code.
+      try
+        SSAProgram.RunSubInlining;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Sub inlining failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      {$ENDIF}
+
       {$IFNDEF DISABLE_DBE}
       // DEAD BLOCK ELIMINATION - Remove unreachable blocks BEFORE dominator tree
       // CRITICAL: Must run BEFORE dominator tree because dominator tree requires

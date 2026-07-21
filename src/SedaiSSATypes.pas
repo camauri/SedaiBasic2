@@ -561,6 +561,7 @@ type
     function GetDomTree: TObject;  // PHASE 3 TIER 2: Get dominator tree (cast to TDominatorTree in implementation)
     function RunDBE: Integer;  // Dead block elimination - removes unreachable blocks (returns removed block count)
     procedure RunSSAConstruction;  // PHASE 3: Convert to proper SSA with PHI functions and versioning
+    function RunSubInlining: Integer;    // Unification: inline small leaf SUB/FUNCTIONs (IMMEDIATELY after SSA generation, before every other pass)
     function RunRangeAnalysis: Integer;  // B4: prove array accesses in-bounds, set BoundsSafe (AFTER DCE, BEFORE PHI elimination - needs the PHIs)
     procedure RunPhiElimination;  // FINAL PASS: Convert PHI functions to copy instructions (BEFORE bytecode compilation)
     function RunGVN: Integer;  // PHASE 3 TIER 2: Run Global Value Numbering optimization (returns replacements count)
@@ -609,7 +610,8 @@ implementation
 
 uses TypInfo, SedaiDominators, SedaiSSAConstruction, SedaiPhiElimination, SedaiGVN, SedaiCSE, SedaiCopyProp,
      SedaiAlgebraic, SedaiStrengthReduction, SedaiGosubInlining, SedaiConstProp, SedaiConstPropAggressive,
-     SedaiDBE, SedaiDCE, SedaiLICM, SedaiLoopUnroll, SedaiCopyCoalescing, SedaiRangeAnalysis
+     SedaiDBE, SedaiDCE, SedaiLICM, SedaiLoopUnroll, SedaiCopyCoalescing, SedaiRangeAnalysis,
+     SedaiSubInlining
      {$IF DEFINED(DEBUG_CLEANUP) OR DEFINED(DEBUG_DOMTREE) OR DEFINED(DEBUG_GVN) OR DEFINED(DEBUG_CSE) OR DEFINED(DEBUG_COPYPROP) OR DEFINED(DEBUG_ALGEBRAIC) OR DEFINED(DEBUG_STRENGTH) OR DEFINED(DEBUG_CONSTPROP) OR DEFINED(DEBUG_DBE) OR DEFINED(DEBUG_DCE) OR DEFINED(DEBUG_LICM) OR DEFINED(DEBUG_COPYCOAL) OR DEFINED(DEBUG_SSA)}, SedaiDebug{$ENDIF};
 
 constructor TSSAInstruction.Create(AOpCode: TSSAOpCode);
@@ -1314,6 +1316,24 @@ begin
     SSAConstr.Free;
   end;
   //WriteLn;
+end;
+
+function TSSAProgram.RunSubInlining: Integer;
+var
+  Inliner: TSubInliner;
+begin
+  { Unification: flatten small leaf SUB/FUNCTION calls before anything else runs,
+    so the clones are versioned/optimized like inline code and every engine
+    (interpreter, JIT, AOT) sees call-free hot paths. Gated on the optimizer
+    switch: a bug here shows up in the opt-vs-no-opt differential net. }
+  Result := 0;
+  if not GSSAOptimizationsEnabled then Exit;
+  Inliner := TSubInliner.Create(Self);
+  try
+    Result := Inliner.Run;
+  finally
+    Inliner.Free;
+  end;
 end;
 
 function TSSAProgram.RunRangeAnalysis: Integer;

@@ -378,6 +378,9 @@ begin
 
         // === SSA OPTIMIZATIONS ===
         {$IFNDEF DISABLE_DBE}
+        {$IFNDEF DISABLE_SUB_INLINING}
+        try SSAProgram.RunSubInlining; except end;   // unification: before everything
+        {$ENDIF}
         try SSAProgram.RunDBE; except end;
         {$ENDIF}
 

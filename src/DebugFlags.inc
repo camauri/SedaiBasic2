@@ -87,6 +87,7 @@
 {.$DEFINE DEBUG_ALGEBRAIC}
 {.$DEFINE DEBUG_STRENGTH}
 {.$DEFINE DEBUG_RANGE}      // B4 range analysis (bounds-check elimination) debug
+{.$DEFINE DEBUG_INLINE}     // SUB/FUNCTION inlining debug
 {.$DEFINE DEBUG_CONSTPROP}
 {.$DEFINE DEBUG_COPYPROP}
 {.$DEFINE DEBUG_COPYCOAL}

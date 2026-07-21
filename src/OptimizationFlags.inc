@@ -50,6 +50,7 @@
 
 {$IFDEF DISABLE_ALL_OPTIMIZATIONS}
   {$DEFINE DISABLE_CONSTANT_FOLDING}   // Skip constant folding in SSA generation
+  {$DEFINE DISABLE_SUB_INLINING}       // Skip SUB/FUNCTION inlining (unification pass, pre-everything)
   {$DEFINE DISABLE_DBE}                // Skip dead block elimination
   {$DEFINE DISABLE_DOMINATOR_TREE}     // Skip dominator tree construction
   {$DEFINE DISABLE_SSA_CONSTRUCTION}   // Skip Semi-Pruned SSA construction (PHI + versioning)
@@ -76,6 +77,13 @@
 {$ENDIF}
 
 {.$DEFINE DISABLE_REG_COMPACTION}
+
+// SUB INLINING (unification pass, 2026-07-21): small LEAF SUB/FUNCTIONs are flattened into
+// their call sites right after SSA generation, with per-site register renaming - every engine
+// wins (measured: interp -9%, --aot -33% on n-body; the AOT nearly reaches the JIT without
+// bytecode-level inlining). V1 excludes UDT/record callees and local-array callees (see
+// SedaiSubInlining's header). Uncomment to disable.
+{.$DEFINE DISABLE_SUB_INLINING}
 
 // B4 RANGE ANALYSIS (bounds-check elimination hints for the AOT/JIT backends).
 // The interpreter ignores the hint (it always checks), so this pass cannot

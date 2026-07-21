@@ -65,6 +65,7 @@ var
   DebugAlgebraic: Boolean = False;
   DebugStrength: Boolean = False;
   DebugRange: Boolean = False;
+  DebugInline: Boolean = False;
   DebugConstProp: Boolean = False;
   DebugCopyProp: Boolean = False;
   DebugCopyCoal: Boolean = False;
@@ -109,6 +110,7 @@ begin
       {$IFDEF DEBUG_ALGEBRAIC}DebugAlgebraic := True;{$ENDIF}
       {$IFDEF DEBUG_STRENGTH}DebugStrength := True;{$ENDIF}
       {$IFDEF DEBUG_RANGE}DebugRange := True;{$ENDIF}
+      {$IFDEF DEBUG_INLINE}DebugInline := True;{$ENDIF}
       {$IFDEF DEBUG_CONSTPROP}DebugConstProp := True;{$ENDIF}
       {$IFDEF DEBUG_COPYPROP}DebugCopyProp := True;{$ENDIF}
       {$IFDEF DEBUG_COPYCOAL}DebugCopyCoal := True;{$ENDIF}
@@ -145,6 +147,9 @@ begin
     {$ENDIF}
     {$IFDEF DEBUG_RANGE}
     else if Param = '--debug-range' then DebugRange := True
+    {$ENDIF}
+    {$IFDEF DEBUG_INLINE}
+    else if Param = '--debug-inline' then DebugInline := True
     {$ENDIF}
     {$IFDEF DEBUG_CONSTPROP}
     else if Param = '--debug-constprop' then DebugConstProp := True

@@ -415,6 +415,9 @@ begin
       {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
       try
         {$IFNDEF DISABLE_DBE}
+        {$IFNDEF DISABLE_SUB_INLINING}
+        SSAProgram.RunSubInlining;   // unification: before everything
+        {$ENDIF}
         SSAProgram.RunDBE;
         {$ENDIF}
         {$IFNDEF DISABLE_DOMINATOR_TREE}

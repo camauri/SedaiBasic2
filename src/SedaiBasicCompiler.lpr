@@ -260,6 +260,9 @@ begin
         // Dead Block Elimination
         {$IFNDEF DISABLE_DBE}
         try
+          {$IFNDEF DISABLE_SUB_INLINING}
+          try SSAProgram.RunSubInlining; except end;   // unification: before everything
+          {$ENDIF}
           SSAProgram.RunDBE;
         except
           on E: Exception do
