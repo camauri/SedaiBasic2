@@ -64,6 +64,7 @@ const
 
   // Flags
   BASC_FLAG_DEBUG_INFO = $0001;  // Contains source line mapping (always included)
+  BASC_FLAG_MODERN     = $0002;  // Program compiled from a Modern/FreeBASIC source (no line numbers)
 
 type
   { TBascHeader - File header structure }
@@ -197,6 +198,8 @@ begin
   Move(BASC_MAGIC[0], Header.Magic[0], 4);
   Header.Version := BASC_VERSION;
   Header.Flags := BASC_FLAG_DEBUG_INFO;  // Source line info is always included in instructions
+  if Program_.ModernMode then
+    Header.Flags := Header.Flags or BASC_FLAG_MODERN;
 
   Header.InstructionCount := Program_.GetInstructionCount;
   if Assigned(Program_.StringConstants) then
@@ -330,6 +333,9 @@ begin
       raise EBytecodeSerializerError.CreateFmt(
         'Unsupported .basc version: %d (max supported: %d)',
         [Header.Version, BASC_VERSION]);
+
+    // Restore the source dialect (older files have the flag clear => classic, as before)
+    Result.ModernMode := (Header.Flags and BASC_FLAG_MODERN) <> 0;
 
     // Read string constants
     for i := 0 to Header.StringConstCount - 1 do

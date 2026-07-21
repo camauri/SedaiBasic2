@@ -45,6 +45,10 @@ uses
   {$IFDEF WINDOWS}Windows,{$ENDIF}
   SedaiConsoleState,
   Classes, SysUtils,
+  // Preprocessor (runs before lexing)
+  SedaiPreprocessor,
+  // Dialect auto-detection (line numbers => classic, otherwise Modern)
+  SedaiRunner,
   // Lexer/Parser
   SedaiLexerFSM, SedaiLexerTypes, SedaiLexerToken, SedaiTokenList,
   SedaiParserTypes, SedaiAST, SedaiParserContext, SedaiParserResults,
@@ -141,11 +145,14 @@ var
   BytecodeProgram: TBytecodeProgram;
   Serializer: TBytecodeSerializer;
   i, removed: Integer;
+  HasLineNums: Boolean;
   {$IFNDEF DISABLE_REG_ALLOC}
   RegAlloc: TLinearScanAllocator;
   {$ENDIF}
 begin
   Result := False;
+  SSAProgram := nil;
+  BytecodeProgram := nil;
 
   // Load source
   if Verbose then
@@ -177,13 +184,29 @@ begin
     if Verbose and (removed > 0) then
       WriteLn('Pre-filter: removed ', removed, ' fence line(s)');
 
+    // === PREPROCESSOR === (FreeBASIC #define/#undef/#ifdef/#ifndef/#else/#endif/#include).
+    // Pure text->text pass before lexing; #include paths resolve relative to the source file.
+    try
+      Source.Text := PreprocessSource(Source.Text, ExtractFilePath(ExpandFileName(SourceFile)), SourceFile);
+    except
+      on E: EPreprocessorError do
+      begin
+        WriteLn('ERROR: ', E.Message);
+        Exit;
+      end;
+    end;
+
+    // Dialect auto-selected by content: a program that uses line numbers is classic;
+    // otherwise FreeBASIC/Modern (mirrors sb's inline pipeline and TSedaiRunner).
+    HasLineNums := TSedaiRunner.SourceHasLineNumbers(Source.Text);
+
     // === LEXING ===
     if Verbose then
       WriteLn('Lexing...');
 
     Lexer := TLexerFSM.Create;
     try
-      Lexer.SetHasLineNumbers(True);
+      Lexer.SetHasLineNumbers(HasLineNums);
       Lexer.SetRequireSpacesBetweenTokens(True);
       Lexer.SetCaseSensitive(False);
       Lexer.Source := Source.Text;
@@ -237,6 +260,9 @@ begin
 
       SSAGen := TSSAGenerator.Create;
       try
+        // Dialect gate for FB lexical scope: MODERN when the source has no line numbers
+        // (mirrors the lexer config above), CLASSIC otherwise.
+        SSAGen.ModernMode := not HasLineNums;
         try
           SSAProgram := SSAGen.Generate(ParserResult.AST);
 
@@ -404,6 +430,11 @@ begin
               WriteLn('ERROR: Bytecode compilation failed!');
               Exit;
             end;
+            // Record the source dialect so the VM can pick dialect-aware behaviour when
+            // running the .basc (mirrors SSAGen.ModernMode above; persisted by the serializer).
+            BytecodeProgram.ModernMode := not HasLineNums;
+            // ERMN reports the module an error came from: the source file's name, as FreeBASIC does.
+            BytecodeProgram.ModuleName := ExtractFileName(SourceFile);
           except
             on E: Exception do
             begin
