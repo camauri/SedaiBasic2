@@ -74,6 +74,7 @@ type
     function Inlinable(FirstB, LastB: Integer): Boolean;
     function InlineSite(CallBlockIdx, CallInstrIdx: Integer;
                         const ProcLabel: string): Boolean;
+    procedure ElideDeadRecMarks;
   public
     constructor Create(AProgram: TSSAProgram);
     function Run: Integer;   // number of call sites inlined
@@ -337,6 +338,65 @@ begin
   end;
 end;
 
+procedure TSubInliner.ElideDeadRecMarks;
+// Record-scope marks are emitted at generation time whenever a block scope CONTAINS a
+// record-allocating op - and calls are in that set, so every loop body with a call
+// carries a RecMarkPush/Pop pair. Once inlining removes the calls, those marks are pure
+// stack noise: with no allocation between any push and any pop, RecordCount never moves,
+// so every pop clamps to an unchanged value. They are also expensive noise - in an AOT
+// region with a deopt hazard each mark becomes a runtime-helper call with a full register
+// flush/reload, twice per loop iteration on the n-body's driver loop.
+//
+// Elision granularity is the whole PROCEDURE REGION (MAIN or a PROC_ range): if a region
+// holds at least one mark and ZERO record-allocating ops, every mark in it is removed.
+// Pairing does not need to be tracked: the generator emits structurally balanced
+// push/pops on every path (including EXIT unwinds), so removing all of them leaves the
+// mark stack at its entry depth throughout - outer scopes see nothing.
+const
+  ALLOC_OPS: array[0..6] of TSSAOpCode = (
+    ssaRecordNew, ssaRecordNewArray, ssaRecordNewArrayInd, ssaRecordNewBlock,
+    ssaCall, ssaCallSub, ssaCallSubIndirect);
+var
+  b, j, RegionStart: Integer;
+  Blk: TSSABasicBlock;
+  Ins: TSSAInstruction;
+  HasMark, HasAlloc: Boolean;
+
+  procedure FlushRegion(FromB, ToB: Integer);
+  var rb, rj: Integer;
+  begin
+    if not (HasMark and not HasAlloc) then Exit;
+    for rb := FromB to ToB do
+      for rj := 0 to FProgram.Blocks[rb].Instructions.Count - 1 do
+        if OpIn(FProgram.Blocks[rb].Instructions[rj].OpCode,
+                [ssaRecMarkPush, ssaRecMarkPop]) then
+          FProgram.Blocks[rb].Instructions[rj].OpCode := ssaNop;
+  end;
+
+begin
+  RegionStart := 0;
+  HasMark := False;
+  HasAlloc := False;
+  for b := 0 to FProgram.Blocks.Count - 1 do
+  begin
+    Blk := FProgram.Blocks[b];
+    if (b > 0) and (Copy(Blk.LabelName, 1, 5) = 'PROC_') then
+    begin
+      FlushRegion(RegionStart, b - 1);
+      RegionStart := b;
+      HasMark := False;
+      HasAlloc := False;
+    end;
+    for j := 0 to Blk.Instructions.Count - 1 do
+    begin
+      Ins := Blk.Instructions[j];
+      if OpIn(Ins.OpCode, [ssaRecMarkPush, ssaRecMarkPop]) then HasMark := True
+      else if OpIn(Ins.OpCode, ALLOC_OPS) then HasAlloc := True;
+    end;
+  end;
+  FlushRegion(RegionStart, FProgram.Blocks.Count - 1);
+end;
+
 function TSubInliner.Run: Integer;
 var
   b, j: Integer;
@@ -366,6 +426,9 @@ begin
   if Result > 0 then
     for b := 0 to FProgram.Blocks.Count - 1 do
       FProgram.Blocks[b].BlockIndex := b;
+  // Marks orphaned by the removed calls become pure (and expensive) stack noise.
+  if Result > 0 then
+    ElideDeadRecMarks;
   {$IFDEF DEBUG_INLINE}
   if DebugInline and (Result > 0) then
     for b := 0 to FProgram.Blocks.Count - 1 do
