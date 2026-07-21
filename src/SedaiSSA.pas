@@ -499,6 +499,7 @@ type
                                  out BoundVal: TSSAValue): Boolean;  // LBOUND/UBOUND(obj.field[, dim])
     // Fold LBOUND/UBOUND(arr[,dim]) to a compile-time constant when arr's target dimension is static.
     function EnumTypeOfOperand(Node: TASTNode): string;   // enum type name of an enum operand (member/var/param), else '' — for operator overloading
+    function ResolveScalarLeftOperatorLabel(LeftNode: TASTNode; const OpMeth: string): string; // "2.0 * udt": operator label owned by a builtin scalar type
     function TryConstFoldArrayBound(Node: TASTNode; out Val: Int64): Boolean;
     // Resolve a member-access object (a record variable or an array-of-UDT element) to its
     // handle register and UDT type name. False if it is not a record object.
@@ -1453,7 +1454,7 @@ var
   RevLen, RevSum, RevOne, RevCnt, RevPrefix: TSSAValue;  // INSTRREV(str,sub,start) lowering temps
   TrimMode: Integer;  // bcStrTrimSet mode: 0/1/2 side (both/left/right) | 4 = Any (char-set) form
   IsAny: Boolean;     // FreeBASIC "Any" modifier on the set/substring argument
-  OpLhsType, OpLabel: string;  // operator overloading: UDT operand type + resolved operator label
+  OpLhsType, OpRhsType, OpLabel: string;  // operator overloading: UDT operand types + resolved operator label
   OpArgs: TASTNode;
   AddrNode: TASTNode;          // VARPTR/PROCPTR: synthesized "@arg" node lowered via the address path
   // User function handling
@@ -2203,18 +2204,31 @@ begin
         // builtin bitwise AND. If no such operator exists, ResolveMethodLabel returns '' and the op falls
         // through to the normal numeric path, so plain enum arithmetic is unaffected.
         if OpLhsType = '' then OpLhsType := EnumTypeOfOperand(Node.GetChild(0));
+        OpLabel := '';
         if OpLhsType <> '' then
+          OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(2))
+        else
         begin
-          OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(2));
-          if OpLabel <> '' then
-          begin
-            OpArgs := TASTNode.Create(antArgumentList, Node.Token);
-            OpArgs.AddChild(Node.GetChild(0).Clone);
-            OpArgs.AddChild(Node.GetChild(1).Clone);
-            EmitUserFunctionCall(OpLabel, OpArgs, Result);
-            OpArgs.Free;
-            Exit;
-          end;
+          // "scalar <op> UDT" ("2.0 * v"): the matching operator's first parameter is the SCALAR, so
+          // its label is owned by a builtin type name (DOUBLE.OPERATOR*@2) and the left-type dispatch
+          // above cannot see it. Looking the label up by the RIGHT operand's type instead would find
+          // the MIRRORED overload ("Operator *(v As vec, c As Double)") and call it with swapped
+          // arguments -- wrong for any non-commutative operator -- so the owner must stay the left
+          // operand's (scalar) type. Guarded on the right operand being a UDT/enum.
+          OpRhsType := ObjectTypeName(Node.GetChild(1));
+          if OpRhsType = '' then OpRhsType := EnumTypeOfOperand(Node.GetChild(1));
+          if OpRhsType <> '' then
+            OpLabel := ResolveScalarLeftOperatorLabel(Node.GetChild(0),
+                         'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(2));
+        end;
+        if OpLabel <> '' then
+        begin
+          OpArgs := TASTNode.Create(antArgumentList, Node.Token);
+          OpArgs.AddChild(Node.GetChild(0).Clone);
+          OpArgs.AddChild(Node.GetChild(1).Clone);
+          EmitUserFunctionCall(OpLabel, OpArgs, Result);
+          OpArgs.Free;
+          Exit;
         end;
       end;
 
@@ -20162,6 +20176,54 @@ begin
   begin
     t := FVarEnumType.ValueFromIndex[idx];
     if FEnumNames.IndexOf(t) >= 0 then Result := t;    // confirm the declared type is really an enum
+  end;
+end;
+
+function TSSAGenerator.ResolveScalarLeftOperatorLabel(LeftNode: TASTNode; const OpMeth: string): string;
+// "2.0 * v" with "Operator *(c As Double, a As vec)": an operator's label is owned by its FIRST
+// parameter's declared type, so this one lives under DOUBLE.OPERATOR*@2 and dispatching by the left
+// operand's UDT type can never find it. Resolve a scalar left operand by trying the builtin type
+// names of its own bank as owners, then the other numeric bank (FreeBASIC's implicit numeric
+// promotion: "2 * v" must still reach the Double overload). Only meaningful when the RIGHT operand
+// is a UDT/enum -- the caller guards that; a hit cannot hijack plain arithmetic because these labels
+// exist only when the user declared such an operator (FreeBASIC requires a UDT parameter anyway).
+const
+  FloatOwners: array[0..1] of string = ('DOUBLE', 'SINGLE');
+  IntOwners: array[0..10] of string = ('INTEGER', 'LONG', 'LONGINT', 'UINTEGER', 'ULONGINT',
+                                       'ULONG', 'SHORT', 'USHORT', 'BYTE', 'UBYTE', 'BOOLEAN');
+var
+  i: Integer;
+begin
+  Result := '';
+  case InferExprBank(LeftNode) of
+    srtString:
+      Result := ResolveMethodLabel('STRING', OpMeth);
+    srtFloat:
+      begin
+        for i := 0 to High(FloatOwners) do
+        begin
+          Result := ResolveMethodLabel(FloatOwners[i], OpMeth);
+          if Result <> '' then Exit;
+        end;
+        for i := 0 to High(IntOwners) do
+        begin
+          Result := ResolveMethodLabel(IntOwners[i], OpMeth);
+          if Result <> '' then Exit;
+        end;
+      end;
+  else  // srtInt and anything handle-like that fell through the UDT/enum checks
+    begin
+      for i := 0 to High(IntOwners) do
+      begin
+        Result := ResolveMethodLabel(IntOwners[i], OpMeth);
+        if Result <> '' then Exit;
+      end;
+      for i := 0 to High(FloatOwners) do
+      begin
+        Result := ResolveMethodLabel(FloatOwners[i], OpMeth);
+        if Result <> '' then Exit;
+      end;
+    end;
   end;
 end;
 
