@@ -55,7 +55,7 @@ unit SedaiLICM;
 interface
 
 uses
-  Classes, SysUtils, Contnrs, SedaiSSATypes, SedaiDominators;
+  Classes, SysUtils, Contnrs, Generics.Collections, SedaiSSATypes, SedaiDominators;
 
 type
   { TLoopInfo - Information about a natural loop }
@@ -72,14 +72,29 @@ type
   { TLoopInvariantCodeMotion - LICM optimizer }
   TLoopInvariantCodeMotion = class
   private
+    type
+      TDefBlockMap = specialize TDictionary<Int64, TSSABasicBlock>;
+      TKeyCountMap = specialize TDictionary<Int64, Integer>;
+      TKeySet = specialize TDictionary<Int64, Boolean>;
+  private
     FProgram: TSSAProgram;
     FLoops: TObjectList;  // Owns TLoopInfo objects
     FDominatorMap: TFPHashList;  // Maps TSSABasicBlock → TSSABasicBlock (block → idom)
     FHoistedCount: Integer;
     FUserVarByBank: array[TSSARegisterType] of array of Boolean;  // RegIndex → mapped to a user variable
+    { Per-loop query maps, rebuilt by BuildLoopMaps at the start of each HoistInvariants call
+      (collection never moves instructions, so they stay exact for the whole collection). They
+      collapse the historical per-query block scans - the whole cost of this pass - to O(1). }
+    FFirstDefIV: TDefBlockMap;    // (RegIndex,Version) → FIRST defining block in program order
+    FLoopDefCount: TKeyCountMap;  // (RegType,RegIndex,Version) → number of defs inside the loop
+    FLoopUsedOutside: TKeySet;    // (RegType,RegIndex,Version) used by any instruction OUTSIDE the loop
+    FLoopModArrays: TKeySet;      // array ids stored to inside the loop
 
     { Precompute the user-variable bitmap from FProgram.VarRegMap }
     procedure BuildUserVarIndex;
+
+    { Rebuild the per-loop query maps (one program scan) }
+    procedure BuildLoopMaps(Loop: TLoopInfo);
 
     { Build dominator map from program's dominator tree }
     procedure BuildDominatorMap;
@@ -171,12 +186,20 @@ begin
   FLoops := TObjectList.Create(True);  // Owns TLoopInfo objects
   FDominatorMap := TFPHashList.Create;
   FHoistedCount := 0;
+  FFirstDefIV := TDefBlockMap.Create;
+  FLoopDefCount := TKeyCountMap.Create;
+  FLoopUsedOutside := TKeySet.Create;
+  FLoopModArrays := TKeySet.Create;
 end;
 
 destructor TLoopInvariantCodeMotion.Destroy;
 begin
   FLoops.Free;
   FDominatorMap.Free;
+  FFirstDefIV.Free;
+  FLoopDefCount.Free;
+  FLoopUsedOutside.Free;
+  FLoopModArrays.Free;
   inherited;
 end;
 
@@ -600,37 +623,24 @@ begin
   end;
 end;
 
+{ Packed map keys. TIV mirrors LICMRegMatches (bank + index + version); IV deliberately drops the
+  bank, mirroring IsDefinedOutsideLoop's historical index+version-only match. }
+function LICMKeyTIV(const V: TSSAValue): Int64; inline;
+begin
+  Result := Int64(Ord(V.RegType)) or (Int64(V.RegIndex) shl 2) or (Int64(V.Version) shl 32);
+end;
+
+function LICMKeyIV(const V: TSSAValue): Int64; inline;
+begin
+  Result := Int64(V.RegIndex) or (Int64(V.Version) shl 32);
+end;
+
 function TLoopInvariantCodeMotion.IsArrayModifiedInLoop(ArrayIndex: Integer; Loop: TLoopInfo): Boolean;
-var
-  Block: TSSABasicBlock;
-  Instr: TSSAInstruction;
-  i, j: Integer;
 begin
   { Check if any ssaArrayStore in the loop modifies the same array.
-    ArrayIndex is stored in Src1 for both ssaArrayLoad and ssaArrayStore. }
-
-  for i := 0 to Loop.Blocks.Count - 1 do
-  begin
-    Block := TSSABasicBlock(Loop.Blocks[i]);
-    for j := 0 to Block.Instructions.Count - 1 do
-    begin
-      Instr := Block.Instructions[j];
-      if Instr.OpCode = ssaArrayStore then
-      begin
-        // Check if it's the same array (ArrayIndex in Src1)
-        if (Instr.Src1.Kind = svkConstInt) and (Instr.Src1.ConstInt = ArrayIndex) then
-        begin
-          {$IFDEF DEBUG_LICM}
-          if DebugLICM then
-            WriteLn('[LICM] Array ', ArrayIndex, ' is modified in loop at block ', Block.LabelName);
-          {$ENDIF}
-          Exit(True);
-        end;
-      end;
-    end;
-  end;
-
-  Result := False;
+    ArrayIndex is stored in Src1 for both ssaArrayLoad and ssaArrayStore.
+    The store set is precomputed per loop by BuildLoopMaps. }
+  Result := FLoopModArrays.ContainsKey(Int64(ArrayIndex));
 end;
 
 procedure TLoopInvariantCodeMotion.BuildUserVarIndex;
@@ -667,8 +677,6 @@ end;
 function TLoopInvariantCodeMotion.IsDefinedOutsideLoop(const Val: TSSAValue; Loop: TLoopInfo): Boolean;
 var
   Block: TSSABasicBlock;
-  Instr: TSSAInstruction;
-  i, j: Integer;
 begin
   // Constants are always outside
   if Val.Kind in [svkConstInt, svkConstFloat, svkConstString, svkLabel, svkNone] then
@@ -686,28 +694,12 @@ begin
     Exit(False);
   end;
 
-  // For registers, find where they're defined
+  // For registers, look up the first defining block (precomputed by BuildLoopMaps; the key
+  // matches RegIndex AND Version - historically bank-blind, kept that way).
   if Val.Kind = svkRegister then
   begin
-    for i := 0 to FProgram.Blocks.Count - 1 do
-    begin
-      Block := FProgram.Blocks[i];
-
-      for j := 0 to Block.Instructions.Count - 1 do
-      begin
-        Instr := Block.Instructions[j];
-
-        // Match both RegIndex AND Version
-        if (Instr.Dest.Kind = svkRegister) and
-           (Instr.Dest.RegIndex = Val.RegIndex) and
-           (Instr.Dest.Version = Val.Version) then
-        begin
-          // Found definition - is it outside the loop?
-          Result := not Loop.ContainsBlock(Block);
-          Exit;
-        end;
-      end;
-    end;
+    if FFirstDefIV.TryGetValue(LICMKeyIV(Val), Block) then
+      Exit(not Loop.ContainsBlock(Block));
 
     // CRITICAL FIX: Definition not found = CONSERVATIVELY assume INSIDE loop
     // This prevents hoisting instructions that depend on PHI nodes or
@@ -849,46 +841,72 @@ begin
             (A.Version = B.Version);
 end;
 
-function TLoopInvariantCodeMotion.DefinedInsideLoop(const Val: TSSAValue; Loop: TLoopInfo): Boolean;
-var
-  i, j: Integer;
-  Block: TSSABasicBlock;
-begin
-  Result := False;
-  if Val.Kind <> svkRegister then Exit;
-  for i := 0 to Loop.Blocks.Count - 1 do
-  begin
-    Block := TSSABasicBlock(Loop.Blocks[i]);
-    for j := 0 to Block.Instructions.Count - 1 do
-      // Dest also covers PHI results (a PHI's Dest is its defined register).
-      if LICMRegMatches(Block.Instructions[j].Dest, Val) then
-        Exit(True);
-  end;
-end;
-
-function TLoopInvariantCodeMotion.AllUsesInsideLoop(const Val: TSSAValue; Loop: TLoopInfo): Boolean;
+procedure TLoopInvariantCodeMotion.BuildLoopMaps(Loop: TLoopInfo);
 var
   i, j, k: Integer;
   Block: TSSABasicBlock;
   Instr: TSSAInstruction;
+  InLoop: Boolean;
+  Key: Int64;
+  Cnt: Integer;
 begin
-  Result := False;
-  if Val.Kind <> svkRegister then Exit;
+  FFirstDefIV.Clear;
+  FLoopDefCount.Clear;
+  FLoopUsedOutside.Clear;
+  FLoopModArrays.Clear;
   for i := 0 to FProgram.Blocks.Count - 1 do
   begin
     Block := FProgram.Blocks[i];
-    if Loop.ContainsBlock(Block) then Continue;  // uses within the loop are fine
+    InLoop := Loop.ContainsBlock(Block);
     for j := 0 to Block.Instructions.Count - 1 do
     begin
       Instr := Block.Instructions[j];
-      if LICMRegMatches(Instr.Src1, Val) then Exit;
-      if LICMRegMatches(Instr.Src2, Val) then Exit;
-      if LICMRegMatches(Instr.Src3, Val) then Exit;
-      for k := 0 to High(Instr.PhiSources) do
-        if LICMRegMatches(Instr.PhiSources[k].Value, Val) then Exit;  // loop-exit PHI source = live-out
+      if Instr.Dest.Kind = svkRegister then
+      begin
+        // First definition in program order decides IsDefinedOutsideLoop, exactly as the
+        // historical scan did (multi-def Version=0 names answer by their first def).
+        Key := LICMKeyIV(Instr.Dest);
+        if not FFirstDefIV.ContainsKey(Key) then
+          FFirstDefIV.Add(Key, Block);
+        if InLoop then
+        begin
+          Key := LICMKeyTIV(Instr.Dest);
+          if FLoopDefCount.TryGetValue(Key, Cnt) then
+            FLoopDefCount[Key] := Cnt + 1
+          else
+            FLoopDefCount.Add(Key, 1);
+        end;
+      end;
+      if InLoop then
+      begin
+        if (Instr.OpCode = ssaArrayStore) and (Instr.Src1.Kind = svkConstInt) then
+          FLoopModArrays.AddOrSetValue(Instr.Src1.ConstInt, True);
+      end
+      else
+      begin
+        if Instr.Src1.Kind = svkRegister then FLoopUsedOutside.AddOrSetValue(LICMKeyTIV(Instr.Src1), True);
+        if Instr.Src2.Kind = svkRegister then FLoopUsedOutside.AddOrSetValue(LICMKeyTIV(Instr.Src2), True);
+        if Instr.Src3.Kind = svkRegister then FLoopUsedOutside.AddOrSetValue(LICMKeyTIV(Instr.Src3), True);
+        for k := 0 to High(Instr.PhiSources) do
+          if Instr.PhiSources[k].Value.Kind = svkRegister then
+            FLoopUsedOutside.AddOrSetValue(LICMKeyTIV(Instr.PhiSources[k].Value), True);
+      end;
     end;
   end;
-  Result := True;
+end;
+
+function TLoopInvariantCodeMotion.DefinedInsideLoop(const Val: TSSAValue; Loop: TLoopInfo): Boolean;
+begin
+  // Dest also covers PHI results (a PHI's Dest is its defined register).
+  Result := (Val.Kind = svkRegister) and FLoopDefCount.ContainsKey(LICMKeyTIV(Val));
+end;
+
+function TLoopInvariantCodeMotion.AllUsesInsideLoop(const Val: TSSAValue; Loop: TLoopInfo): Boolean;
+begin
+  // A use in a loop-exit PHI source counts as live-out (BuildLoopMaps records PhiSources too).
+  Result := False;
+  if Val.Kind <> svkRegister then Exit;
+  Result := not FLoopUsedOutside.ContainsKey(LICMKeyTIV(Val));
 end;
 
 function TLoopInvariantCodeMotion.OperandInvariantModern(const Val: TSSAValue; Loop: TLoopInfo;
@@ -918,25 +936,15 @@ end;
 
 function TLoopInvariantCodeMotion.UniquelyDefinedInLoop(const Instr: TSSAInstruction; Loop: TLoopInfo): Boolean;
 var
-  i, j: Integer;
-  Block: TSSABasicBlock;
-  Other: TSSAInstruction;
+  Cnt: Integer;
 begin
   // True iff no OTHER instruction in the loop defines Instr.Dest. A versioned SSA value (Version>0) always
   // satisfies this; the check exists to reject Version=0 loop-carried variables that have several defs
   // (e.g. an inner counter's `k = 1` init and `k = k + 1` update both live in the enclosing loop). Moving
   // one def of such a variable out of the loop drops its per-iteration reset — a miscompile.
-  Result := False;
-  for i := 0 to Loop.Blocks.Count - 1 do
-  begin
-    Block := TSSABasicBlock(Loop.Blocks[i]);
-    for j := 0 to Block.Instructions.Count - 1 do
-    begin
-      Other := Block.Instructions[j];
-      if (Other <> Instr) and LICMRegMatches(Other.Dest, Instr.Dest) then Exit;
-    end;
-  end;
-  Result := True;
+  // Instr itself is in the loop and counted, so "no other def" = a count of exactly one.
+  if Instr.Dest.Kind <> svkRegister then Exit(True);
+  Result := FLoopDefCount.TryGetValue(LICMKeyTIV(Instr.Dest), Cnt) and (Cnt = 1);
 end;
 
 function TLoopInvariantCodeMotion.BlockDominatesAllLatches(Block: TSSABasicBlock; Loop: TLoopInfo): Boolean;
@@ -1075,6 +1083,10 @@ begin
     {$ENDIF}
     Exit;
   end;
+
+  // One program scan builds every per-loop query map; collection below never moves
+  // instructions, so the maps stay exact until the clone/extract phase at the end.
+  BuildLoopMaps(Loop);
 
   ToHoist := TFPList.Create;
   OriginalBlocks := TFPList.Create;
