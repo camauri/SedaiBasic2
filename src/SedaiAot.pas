@@ -67,6 +67,12 @@ type
     StrAsc: Pointer;     // offset 128: @AotStrAsc  (sVal) -> code of first byte (0 if empty)
     StrChr: Pointer;     // offset 136: @AotStrChr  (dstSlot, code)
     StrInstr: Pointer;   // offset 144: @AotStrInstr (hayVal, needleVal, start) -> 1-based pos
+    // Str()/Val() leaf primitives: dialect-independent handlers (IntToStr / leading-number
+    // parse), hot in string benchmarks. Float Str() stays on the helper - its handler needs
+    // the console-behavior object (dialect trim + SINGLE digits).
+    StrIntToStr: Pointer; // offset 152: @AotIntToString (dstSlot, v)
+    StrVal: Pointer;      // offset 160: @AotStrVal (sVal) -> Double (xmm0)
+    StrValInt: Pointer;   // offset 168: @AotStrValInt (sVal) -> Int64
   end;
   PAotCtx = ^TAotCtx;
 
@@ -91,6 +97,9 @@ const
   AOTCTX_STRASC    = 128;
   AOTCTX_STRCHR    = 136;
   AOTCTX_STRINSTR  = 144;
+  AOTCTX_STRINTTOSTR = 152;
+  AOTCTX_STRVAL    = 160;
+  AOTCTX_STRVALINT = 168;
 
   // Helper return contract. Normally the helper returns the bytecode PC that follows the
   // instruction it ran; native code compares against the PC it expects and keeps going.
@@ -169,6 +178,9 @@ var
   // bought: a region reporting helpers>0 is one that could not compile at all before, since
   // a single op outside the native set used to bail the whole function.
   AotDiagHelperCalls: Integer = 0;
+  // Which ops those helper calls execute, as "name*count" pairs - the first thing to read
+  // when hunting a hot-loop helper (a cold DIM/PRINT is fine, a per-iteration op is not).
+  AotDiagHelperOps: string = '';
 
 // Compile every eligible region to native code (B1a: static frequency register
 // assignment, deopt only for trapping ops). TrueVal is the VM's TRUE (-1);
@@ -212,6 +224,9 @@ begin
     ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
     // C5 residuals: byte-string substring/char/search primitives (W codepoint ops excluded).
     ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrChr, ssaStrInstr,
+    // Str() of an int and Val(): dialect-independent leaf primitives (float Str() stays on
+    // the helper - it needs the console-behavior object).
+    ssaIntToString, ssaStrVal, ssaStrValInt,
     ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,
     ssaShl, ssaShr, ssaShrUInt,
     ssaMathSqr,
@@ -326,6 +341,8 @@ function AotStringNativeOK(const Ins: TSSAInstruction): Boolean;
   begin Result := (V.Kind = svkRegister) and (V.RegType = srtString); end;
   function IsInt(const V: TSSAValue): Boolean;
   begin Result := (V.Kind = svkRegister) and (V.RegType = srtInt); end;
+  function IsFlt(const V: TSSAValue): Boolean;
+  begin Result := (V.Kind = svkRegister) and (V.RegType = srtFloat); end;
 begin
   case Ins.OpCode of
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
@@ -343,6 +360,9 @@ begin
     ssaStrChr:          Result := IsStr(Ins.Dest) and IsInt(Ins.Src1);
     ssaStrInstr:
       Result := IsInt(Ins.Dest) and IsStr(Ins.Src1) and IsStr(Ins.Src2) and IsInt(Ins.Src3);
+    ssaIntToString:     Result := IsStr(Ins.Dest) and IsInt(Ins.Src1);
+    ssaStrVal:          Result := IsFlt(Ins.Dest) and IsStr(Ins.Src1);
+    ssaStrValInt:       Result := IsInt(Ins.Dest) and IsStr(Ins.Src1);
   else
     Result := False;
   end;
@@ -364,7 +384,8 @@ begin
       Result := AotArrayNativeOK(SSAProg, Ins);
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
     ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
-    ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrChr, ssaStrInstr:
+    ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrChr, ssaStrInstr,
+    ssaIntToString, ssaStrVal, ssaStrValInt:
       Result := AotStringNativeOK(Ins);
   end;
 end;
@@ -652,6 +673,7 @@ var
   Cur: TSSAInstruction;
   CurOrd: Integer;                      // ordinal of Cur (indexes the SSA->PC map)
   LabelIdx: TStringList;                // region-local label -> block-list index
+  HelperOps: TStringList;               // diagnostics: op name of every helper call emitted
 
   procedure Fail(const Why: string);
   begin
@@ -1023,6 +1045,7 @@ var
   var k: Integer;
   begin
     Inc(NHelperCalls);
+    HelperOps.Add(OpName(Cur.OpCode));
     // 1. Flush every allocated VM register to its bank slot (same stores as the epilogue).
     for k := 0 to NIAlloc - 1 do
       StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
@@ -1293,6 +1316,42 @@ var
     MovLoad(ABI_ARG1, RAX, LongWord(nee) * 8);
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRINSTR);
     ILoadArg(ABI_ARG2, st);
+    E.EmitBytes([$FF, $D0]);
+    StrCallEpilogue;
+    IStore(d, RAX);
+  end;
+  procedure EmitIntToStr;  // StringRegs[dest] := IntToStr(IntRegs[src]) - Str() of an int
+  var d, v: Integer;
+  begin
+    d := SReg(Cur.Dest); v := IReg(Cur.Src1); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);
+    Lea(ABI_ARG0, RAX, LongWord(d) * 8);                  // arg0 = &StringRegs[dest]
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRINTTOSTR);     // rax = primitive (before r8 clobber)
+    ILoadArg(ABI_ARG1, v);                                // arg1 = value (may clobber r8 on Win64)
+    E.EmitBytes([$FF, $D0]);
+    StrCallEpilogue;
+  end;
+  procedure EmitStrVal;    // FloatRegs[dest] := ParseLeadingFloat(StringRegs[src])
+  var d, s: Integer;
+  begin
+    d := FReg(Cur.Dest); s := SReg(Cur.Src1); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);
+    E.MemOp([$48, $8B], ABI_ARG0, RAX, LongWord(s) * 8);  // arg0 = value
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRVAL);
+    E.EmitBytes([$FF, $D0]);
+    StrCallEpilogue;       // reloads volatile xmm2..5 from the banks; xmm0 (the result) survives
+    FStore(d, XMM0);
+  end;
+  procedure EmitStrValInt; // IntRegs[dest] := ParseLeadingInt64(StringRegs[src])
+  var d, s: Integer;
+  begin
+    d := IReg(Cur.Dest); s := SReg(Cur.Src1); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);
+    E.MemOp([$48, $8B], ABI_ARG0, RAX, LongWord(s) * 8);  // arg0 = value
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRVALINT);
     E.EmitBytes([$FF, $D0]);
     StrCallEpilogue;
     IStore(d, RAX);
@@ -1750,7 +1809,8 @@ var
           end;
           ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
           ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
-          ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrChr, ssaStrInstr:
+          ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrChr, ssaStrInstr,
+          ssaIntToString, ssaStrVal, ssaStrValInt:
           begin
             // C5: a native leaf call to a string primitive. String operands stay in the bank
             // (not register-allocated, not counted - CountVal rejects them); only INT operands
@@ -1773,6 +1833,10 @@ var
                   CountVal(Ins.Src1);                              // the char code
                 ssaStrInstr:
                   begin CountVal(Ins.Dest); CountVal(Ins.Src3); end;   // result + start
+                ssaIntToString:
+                  CountVal(Ins.Src1);                              // the int value
+                ssaStrVal, ssaStrValInt:
+                  CountVal(Ins.Dest);                              // the parsed number
               end;
               if (Ins.OpCode = ssaLoadConstString) and (Prog.GetSsaPc(o) < 0) then
                 Fail('no-pc-strconst');             // needs the bytecode Immediate
@@ -2059,6 +2123,9 @@ var
       ssaStrMid:   EmitStrMid;
       ssaStrAsc:   EmitStrAsc;
       ssaStrChr:   EmitStrChr;
+      ssaIntToString: EmitIntToStr;
+      ssaStrVal:      EmitStrVal;
+      ssaStrValInt:   EmitStrValInt;
       ssaStrInstr: EmitStrInstr;
 
       ssaJump, ssaJumpIfZero, ssaJumpIfNotZero:
@@ -2204,6 +2271,8 @@ begin
   SetLength(IAllocd, Length(IntPool)); SetLength(FAllocd, 6);
   Allocate;
 
+  HelperOps := TStringList.Create;
+
   // Region-local label -> block-list index (see the jump case for why not BlockIndex).
   LabelIdx := TStringList.Create;
   LabelIdx.Sorted := True;
@@ -2311,11 +2380,22 @@ begin
     end;
 
     AotDiagHelperCalls := NHelperCalls;
+    AotDiagHelperOps := '';
+    for k := 0 to HelperOps.Count - 1 do
+      if (k = 0) or (HelperOps[k] <> HelperOps[k - 1]) then
+      begin
+        if AotDiagHelperOps <> '' then AotDiagHelperOps := AotDiagHelperOps + ' ';
+        AotDiagHelperOps := AotDiagHelperOps + HelperOps[k];
+        j := 1;
+        while (k + j < HelperOps.Count) and (HelperOps[k + j] = HelperOps[k]) do Inc(j);
+        if j > 1 then AotDiagHelperOps := AotDiagHelperOps + '*' + IntToStr(j);
+      end;
     Result := TExecMem.Create(E);
     if Result.Ptr = nil then begin FreeAndNil(Result); Fail('exec-alloc'); end;
   finally
     E.Free;
     LabelIdx.Free;
+    HelperOps.Free;
     if (Result = nil) and (BailWhy = '') then BailWhy := 'unknown';
   end;
 end;
@@ -2349,11 +2429,15 @@ begin
       Result[n].Mem := Mem;
       Inc(n);
       if Diag then
+      begin
         WriteLn(ErrOutput, Format('[AOT] compiled %-24s entryPC=%-6d liveness=%s peakLive int=%d float=%d helpers=%d',
                                   [Regions[r].Name, Regions[r].EntryPC,
                                    BoolToStr(AotDiagLivenessOK, 'ok', 'NOT-CONVERGED'),
                                    AotDiagPeakLiveInt, AotDiagPeakLiveFloat,
                                    AotDiagHelperCalls]));
+        if AotDiagHelperOps <> '' then
+          WriteLn(ErrOutput, '[AOT]   helper ops: ' + AotDiagHelperOps);
+      end;
     end
     else if Diag then
       WriteLn(ErrOutput, Format('[AOT] compile-bail %-20s (%s)', [Regions[r].Name, Why]));

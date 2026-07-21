@@ -6072,6 +6072,28 @@ begin
   if Result > 0 then Inc(Result, start - 1);
 end;
 
+{ Str() of an int and Val(): the bcIntToString/bcStrVal/bcStrValInt handlers are
+  dialect-independent one-liners over these library parsers (defined further down;
+  forward-declared here so the primitives can sit with their C5 siblings). Float Str()
+  stays on the runtime helper: its handler needs the console-behavior object. }
+function ParseLeadingInt64(const S: string): Int64; forward;
+function ParseLeadingFloat(const S: string): Double; forward;
+
+procedure AotIntToString(dstSlot: Pointer; v: Int64); cdecl;
+begin
+  PAnsiString(dstSlot)^ := IntToStr(v);
+end;
+
+function AotStrVal(sVal: Pointer): Double; cdecl;
+begin
+  Result := ParseLeadingFloat(AnsiString(sVal));
+end;
+
+function AotStrValInt(sVal: Pointer): Int64; cdecl;
+begin
+  Result := ParseLeadingInt64(AnsiString(sVal));
+end;
+
 { Resolve what a compiled AOT function returned (C3). Normally that is just the resume PC and
   this is a compare and a return; the two negative sentinels mean a runtime helper hit
   something native code cannot finish.

@@ -137,6 +137,9 @@ begin
     LocalAotCtx.StrAsc := @AotStrAsc;
     LocalAotCtx.StrChr := @AotStrChr;
     LocalAotCtx.StrInstr := @AotStrInstr;
+    LocalAotCtx.StrIntToStr := @AotIntToString;
+    LocalAotCtx.StrVal := @AotStrVal;
+    LocalAotCtx.StrValInt := @AotStrValInt;
   end
   else
     AotFuncs := nil;
