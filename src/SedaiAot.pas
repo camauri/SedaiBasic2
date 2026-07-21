@@ -57,6 +57,16 @@ type
     // FramePop + pop when the callee reached its bcReturnSub). Reached through the ctx like
     // every other primitive - never a baked address.
     CallSub: Pointer;    // offset 96: @AotCallSub (ctx, calleeEntryPC, bcCallSubPC) -> PC/sentinel
+    // C5 residuals: byte-string substring/char/search primitives. StrMid is dialect-variant
+    // (MODERN: start<1 -> '', negative length -> rest of string; CLASSIC: clamps both), so the
+    // run loop installs @AotStrMidModern or @AotStrMidClassic per program - the emitted code
+    // stays dialect-blind.
+    StrLeft: Pointer;    // offset 104: @AotStrLeft  (dstSlot, sVal, n)
+    StrRight: Pointer;   // offset 112: @AotStrRight (dstSlot, sVal, n)
+    StrMid: Pointer;     // offset 120: @AotStrMid{Modern|Classic} (dstSlot, sVal, start, len)
+    StrAsc: Pointer;     // offset 128: @AotStrAsc  (sVal) -> code of first byte (0 if empty)
+    StrChr: Pointer;     // offset 136: @AotStrChr  (dstSlot, code)
+    StrInstr: Pointer;   // offset 144: @AotStrInstr (hayVal, needleVal, start) -> 1-based pos
   end;
   PAotCtx = ^TAotCtx;
 
@@ -75,6 +85,12 @@ const
   AOTCTX_STRCONCAT = 80;
   AOTCTX_STRLEN    = 88;
   AOTCTX_CALLSUB   = 96;
+  AOTCTX_STRLEFT   = 104;
+  AOTCTX_STRRIGHT  = 112;
+  AOTCTX_STRMID    = 120;
+  AOTCTX_STRASC    = 128;
+  AOTCTX_STRCHR    = 136;
+  AOTCTX_STRINSTR  = 144;
 
   // Helper return contract. Normally the helper returns the bytecode PC that follows the
   // instruction it ran; native code compares against the PC it expects and keeps going.
@@ -194,6 +210,8 @@ begin
     // C5: the string bank ops that dominate hot string loops - each a leaf call to a Pascal
     // primitive (copy/const-load/concat are managed assignments; len returns an int).
     ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
+    // C5 residuals: byte-string substring/char/search primitives (W codepoint ops excluded).
+    ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrChr, ssaStrInstr,
     ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,
     ssaShl, ssaShr, ssaShrUInt,
     ssaMathSqr,
@@ -316,6 +334,15 @@ begin
     ssaLoadConstString: Result := IsStr(Ins.Dest);
     ssaStrConcat:       Result := IsStr(Ins.Dest) and IsStr(Ins.Src1) and IsStr(Ins.Src2);
     ssaStrLen:          Result := IsInt(Ins.Dest) and IsStr(Ins.Src1);
+    // C5 residuals (byte-string ops only; the W codepoint family stays on the helper).
+    ssaStrLeft, ssaStrRight:
+      Result := IsStr(Ins.Dest) and IsStr(Ins.Src1) and IsInt(Ins.Src2);
+    ssaStrMid:
+      Result := IsStr(Ins.Dest) and IsStr(Ins.Src1) and IsInt(Ins.Src2) and IsInt(Ins.Src3);
+    ssaStrAsc:          Result := IsInt(Ins.Dest) and IsStr(Ins.Src1);
+    ssaStrChr:          Result := IsStr(Ins.Dest) and IsInt(Ins.Src1);
+    ssaStrInstr:
+      Result := IsInt(Ins.Dest) and IsStr(Ins.Src1) and IsStr(Ins.Src2) and IsInt(Ins.Src3);
   else
     Result := False;
   end;
@@ -336,7 +363,8 @@ begin
     ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound:
       Result := AotArrayNativeOK(SSAProg, Ins);
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
-    ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen:
+    ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
+    ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrChr, ssaStrInstr:
       Result := AotStringNativeOK(Ins);
   end;
 end;
@@ -763,6 +791,16 @@ var
     if n >= 0 then MovRR(scr, n)
     else E.MemOp([$48, $8B], scr, RBX, LongWord(vmreg) * 8);
   end;
+  // ILoad for an ABI ARGUMENT register: arg2/arg3 are r8/r9 on Win64, and ILoad's memory
+  // path bakes REX $48 (low-register form) - loading into r8 would actually encode rax.
+  // MovRR (via EmitRR) and MovLoad both compute the REX for extended targets.
+  procedure ILoadArg(argReg, vmreg: Integer);
+  var n: Integer;
+  begin
+    n := IAlloc(vmreg);
+    if n >= 0 then MovRR(argReg, n)
+    else MovLoad(argReg, RBX, LongWord(vmreg) * 8);
+  end;
   procedure IStore(vmreg, scr: Integer);
   var n: Integer;
   begin
@@ -1183,6 +1221,81 @@ var
     E.EmitBytes([$FF, $D0]);                              // call rax
     StrCallEpilogue;
     IStore(IReg(Cur.Dest), RAX);                          // rax = length -> int Dest
+  end;
+
+  // C5 residuals: substring/char/search leaf primitives. Staging discipline: every bank
+  // read (string slots via rax) happens FIRST; the primitive address is loaded into RAX
+  // right after (r8 still intact); INT operands are loaded into their arg registers LAST -
+  // on Win64 arg2 is r8 (clobbers the ctx, already consumed) and arg3 is r9, which sits in
+  // the allocation POOL, so it must be written only after every operand read. r11 is NOT
+  // used as a stage here (unlike concat): it is in the pool too and an int operand could
+  // live there.
+  procedure EmitStrSlice(CtxOff: Integer);   // ssaStrLeft/ssaStrRight: (dstSlot, sVal, n)
+  var d, s, n: Integer;
+  begin
+    d := SReg(Cur.Dest); s := SReg(Cur.Src1); n := IReg(Cur.Src2); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);         // rax = bank base
+    Lea(ABI_ARG0, RAX, LongWord(d) * 8);                  // arg0 = &StringRegs[dest]
+    MovLoad(ABI_ARG1, RAX, LongWord(s) * 8);              // arg1 = StringRegs[src] (value)
+    E.MemOp([$49, $8B], RAX, R8, CtxOff);                 // rax = primitive (before r8 clobber)
+    ILoadArg(ABI_ARG2, n);                                // arg2 = length (clobbers r8 on Win64)
+    E.EmitBytes([$FF, $D0]);                              // call rax
+    StrCallEpilogue;
+  end;
+  procedure EmitStrMid;
+  var d, s, st, ln: Integer;
+  begin
+    d := SReg(Cur.Dest); s := SReg(Cur.Src1);
+    st := IReg(Cur.Src2); ln := IReg(Cur.Src3); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);
+    Lea(ABI_ARG0, RAX, LongWord(d) * 8);
+    MovLoad(ABI_ARG1, RAX, LongWord(s) * 8);
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRMID);
+    ILoadArg(ABI_ARG2, st);                               // start
+    ILoadArg(ABI_ARG3, ln);                               // length: r9 (pool) written LAST
+    E.EmitBytes([$FF, $D0]);
+    StrCallEpilogue;
+  end;
+  procedure EmitStrAsc;    // IntRegs[dest] := code of StringRegs[src][1] (0 if empty)
+  var d, s: Integer;
+  begin
+    d := IReg(Cur.Dest); s := SReg(Cur.Src1); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);
+    E.MemOp([$48, $8B], ABI_ARG0, RAX, LongWord(s) * 8);  // arg0 = value
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRASC);
+    E.EmitBytes([$FF, $D0]);
+    StrCallEpilogue;
+    IStore(d, RAX);
+  end;
+  procedure EmitStrChr;    // StringRegs[dest] := Chr(code and $FF)
+  var d, c: Integer;
+  begin
+    d := SReg(Cur.Dest); c := IReg(Cur.Src1); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);
+    Lea(ABI_ARG0, RAX, LongWord(d) * 8);
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRCHR);
+    ILoadArg(ABI_ARG1, c);
+    E.EmitBytes([$FF, $D0]);
+    StrCallEpilogue;
+  end;
+  procedure EmitStrInstr;  // IntRegs[dest] := Instr(start, hay, needle)
+  var d, hay, nee, st: Integer;
+  begin
+    d := IReg(Cur.Dest); hay := SReg(Cur.Src1);
+    nee := SReg(Cur.Src2); st := IReg(Cur.Src3); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);
+    MovLoad(ABI_ARG0, RAX, LongWord(hay) * 8);
+    MovLoad(ABI_ARG1, RAX, LongWord(nee) * 8);
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRINSTR);
+    ILoadArg(ABI_ARG2, st);
+    E.EmitBytes([$FF, $D0]);
+    StrCallEpilogue;
+    IStore(d, RAX);
   end;
 
   procedure LoadXferBase(FloatBank: Boolean);
@@ -1636,21 +1749,31 @@ var
             end;
           end;
           ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
-          ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen:
+          ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
+          ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrChr, ssaStrInstr:
           begin
             // C5: a native leaf call to a string primitive. String operands stay in the bank
-            // (not register-allocated, not counted - CountVal rejects them); only an int Dest
-            // (compare result / LEN) is counted. The call needs a call-ready frame but always
-            // completes natively, so it sets the frame flag WITHOUT a deopt hazard. A non-native
-            // shape (e.g. a const operand) falls back to the helper rather than bailing here.
+            // (not register-allocated, not counted - CountVal rejects them); only INT operands
+            // (results, lengths, positions, char codes) are counted. The call needs a call-ready
+            // frame but always completes natively, so it sets the frame flag WITHOUT a deopt
+            // hazard. A non-native shape (e.g. a const operand) falls back to the helper.
             if not AotIsNative(SSAProg, Ins) then NoteHelperOp
             else
             begin
               HasHelperCall := True;
-              if (Ins.OpCode = ssaStrLen) or (Ins.OpCode = ssaCmpEqString) or
-                 (Ins.OpCode = ssaCmpNeString) or (Ins.OpCode = ssaCmpLtString) or
-                 (Ins.OpCode = ssaCmpGtString) then
-                CountVal(Ins.Dest);                 // the int result
+              case Ins.OpCode of
+                ssaStrLen, ssaCmpEqString, ssaCmpNeString, ssaCmpLtString,
+                ssaCmpGtString, ssaStrAsc:
+                  CountVal(Ins.Dest);                              // the int result
+                ssaStrLeft, ssaStrRight:
+                  CountVal(Ins.Src2);                              // the length
+                ssaStrMid:
+                  begin CountVal(Ins.Src2); CountVal(Ins.Src3); end;   // start + length
+                ssaStrChr:
+                  CountVal(Ins.Src1);                              // the char code
+                ssaStrInstr:
+                  begin CountVal(Ins.Dest); CountVal(Ins.Src3); end;   // result + start
+              end;
               if (Ins.OpCode = ssaLoadConstString) and (Prog.GetSsaPc(o) < 0) then
                 Fail('no-pc-strconst');             // needs the bytecode Immediate
             end;
@@ -1931,6 +2054,12 @@ var
       ssaLoadConstString: begin apc := NeedPC; if OK then EmitStrLoadConst(apc); end;
       ssaStrConcat: EmitStrConcat;
       ssaStrLen: EmitStrLen;
+      ssaStrLeft:  EmitStrSlice(AOTCTX_STRLEFT);
+      ssaStrRight: EmitStrSlice(AOTCTX_STRRIGHT);
+      ssaStrMid:   EmitStrMid;
+      ssaStrAsc:   EmitStrAsc;
+      ssaStrChr:   EmitStrChr;
+      ssaStrInstr: EmitStrInstr;
 
       ssaJump, ssaJumpIfZero, ssaJumpIfNotZero:
       begin

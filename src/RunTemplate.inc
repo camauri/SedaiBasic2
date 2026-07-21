@@ -127,6 +127,16 @@ begin
     LocalAotCtx.StrConcat := @AotStrConcat;
     LocalAotCtx.StrLen := @AotStrLen;
     LocalAotCtx.CallSub := @AotCallSub;   // B3: native call site primitive
+    // C5 residuals. StrMid is dialect-variant: install the flavor once per run.
+    LocalAotCtx.StrLeft := @AotStrLeft;
+    LocalAotCtx.StrRight := @AotStrRight;
+    if Assigned(FProgram) and FProgram.ModernMode then
+      LocalAotCtx.StrMid := @AotStrMidModern
+    else
+      LocalAotCtx.StrMid := @AotStrMidClassic;
+    LocalAotCtx.StrAsc := @AotStrAsc;
+    LocalAotCtx.StrChr := @AotStrChr;
+    LocalAotCtx.StrInstr := @AotStrInstr;
   end
   else
     AotFuncs := nil;

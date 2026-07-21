@@ -6007,6 +6007,71 @@ begin
   Result := Length(AnsiString(sVal));
 end;
 
+{ C5 residuals: substring/char/search leaf primitives, each the EXACT expression of the
+  corresponding ExecuteStringOp handler (byte-string ops; the W codepoint family stays on
+  the runtime helper). Copy() builds a NEW string before the managed assignment, so a dst
+  that aliases the source is safe, as everywhere else in this family. StrMid is dialect-
+  variant: the run loop installs the Modern or Classic flavor per program (TAotCtx.StrMid). }
+procedure AotStrLeft(dstSlot, sVal: Pointer; n: PtrInt); cdecl;
+begin
+  if n < 0 then n := 0;
+  PAnsiString(dstSlot)^ := Copy(AnsiString(sVal), 1, n);
+end;
+
+procedure AotStrRight(dstSlot, sVal: Pointer; n: PtrInt); cdecl;
+var
+  L: PtrInt;
+begin
+  L := Length(AnsiString(sVal));
+  if n < 0 then n := 0;
+  if n > L then n := L;
+  PAnsiString(dstSlot)^ := Copy(AnsiString(sVal), L - n + 1, n);
+end;
+
+procedure AotStrMidModern(dstSlot, sVal: Pointer; start, cnt: PtrInt); cdecl;
+begin
+  // FreeBASIC: start < 1 yields '' (no clamp); a negative length means "rest of string".
+  if start < 1 then
+  begin
+    PAnsiString(dstSlot)^ := '';
+    Exit;
+  end;
+  if cnt < 0 then
+  begin
+    cnt := Length(AnsiString(sVal)) - start + 1;
+    if cnt < 0 then cnt := 0;
+  end;
+  PAnsiString(dstSlot)^ := Copy(AnsiString(sVal), start, cnt);
+end;
+
+procedure AotStrMidClassic(dstSlot, sVal: Pointer; start, cnt: PtrInt); cdecl;
+begin
+  // Commodore v7 clamps both (see bcStrMid).
+  if start < 1 then start := 1;
+  if cnt < 0 then cnt := 0;
+  PAnsiString(dstSlot)^ := Copy(AnsiString(sVal), start, cnt);
+end;
+
+function AotStrAsc(sVal: Pointer): PtrInt; cdecl;
+begin
+  if Length(AnsiString(sVal)) > 0 then
+    Result := Ord(AnsiString(sVal)[1])
+  else
+    Result := 0;
+end;
+
+procedure AotStrChr(dstSlot: Pointer; code: PtrInt); cdecl;
+begin
+  PAnsiString(dstSlot)^ := Chr(code and $FF);
+end;
+
+function AotStrInstr(hayVal, needleVal: Pointer; start: PtrInt): PtrInt; cdecl;
+begin
+  if start < 1 then start := 1;
+  Result := Pos(AnsiString(needleVal), Copy(AnsiString(hayVal), start, MaxInt));
+  if Result > 0 then Inc(Result, start - 1);
+end;
+
 { Resolve what a compiled AOT function returned (C3). Normally that is just the resume PC and
   this is a compare and a return; the two negative sentinels mean a runtime helper hit
   something native code cannot finish.
