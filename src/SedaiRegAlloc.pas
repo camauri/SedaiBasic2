@@ -61,7 +61,7 @@ unit SedaiRegAlloc;
 interface
 
 uses
-  Classes, SysUtils, Contnrs, SedaiSSATypes;
+  Classes, SysUtils, Generics.Collections, Contnrs, SedaiSSATypes;
 
 const
   // Physical register limits per type
@@ -163,6 +163,15 @@ implementation
 {$IFDEF DEBUG_REGALLOC}
 uses SedaiDebug;
 {$ENDIF}
+
+type
+  TRegInfoMap = specialize TDictionary<Int64, TVariableInfo>;
+
+{ Pack a register identity (bank, index, version) into one Int64 map key }
+function RegAllocKey(RegType: TSSARegisterType; RegIdx, RegVer: Integer): Int64; inline;
+begin
+  Result := Int64(Ord(RegType)) or (Int64(RegIdx) shl 2) or (Int64(RegVer) shl 32);
+end;
 
 { Helper function for sorting intervals by start position }
 function CompareIntervals(Item1, Item2: Pointer): Integer;
@@ -599,17 +608,14 @@ var
   Block: TSSABasicBlock;
   Instr: TSSAInstruction;
   VarInfo: TVariableInfo;
-  VarIndex: TFPHashList;
+  VarIndex: TRegInfoMap;
 
   function FindOrCreateVarInfo(RegType: TSSARegisterType; RegIdx, RegVer: Integer): TVariableInfo;
-  var
-    Key: string;
-    Ptr: Pointer;
   begin
-    Key := IntToStr(Ord(RegType)) + ':' + IntToStr(RegIdx) + ':' + IntToStr(RegVer);
-    Ptr := VarIndex.Find(Key);
-    if Ptr <> nil then
-      Exit(TVariableInfo(Ptr));
+    // Packed Int64 key: this lookup runs for every operand of every instruction, and the
+    // historical three-IntToStr string key dominated the whole pass.
+    if VarIndex.TryGetValue(RegAllocKey(RegType, RegIdx, RegVer), Result) then
+      Exit;
 
     if RegVer = 0 then
       VarName := 'r' + IntToStr(RegIdx)
@@ -618,7 +624,7 @@ var
 
     Result := TVariableInfo.Create(VarName, RegType, RegIdx, RegVer);
     VarList.Add(Result);
-    VarIndex.Add(Key, Result);
+    VarIndex.Add(RegAllocKey(RegType, RegIdx, RegVer), Result);
   end;
 
   procedure CountUsage(const Val: TSSAValue); inline;
@@ -633,7 +639,7 @@ var
 
 begin
   VarList := TObjectList.Create(True);
-  VarIndex := TFPHashList.Create;
+  VarIndex := TRegInfoMap.Create;
   try
     for i := 0 to FProgram.Blocks.Count - 1 do
     begin
@@ -729,46 +735,39 @@ var
   NewDimRegs: array of Integer;
   NewDimRegTypes: array of TSSARegisterType;
   NewLbRegs: array of Integer;
-  VarIndex: TFPHashList;
+  VarIndex: TRegInfoMap;
 
   function RewriteValueBASIC(const Val: TSSAValue): TSSAValue;
   var
-    Key: string;
-    Ptr: Pointer;
+    Info: TVariableInfo;
   begin
     Result := Val;
     if Val.Kind <> svkRegister then Exit;
 
-    Key := IntToStr(Ord(Val.RegType)) + ':' + IntToStr(Val.RegIndex) + ':' + IntToStr(Val.Version);
-    Ptr := VarIndex.Find(Key);
-    if Ptr <> nil then
+    if VarIndex.TryGetValue(RegAllocKey(Val.RegType, Val.RegIndex, Val.Version), Info) then
     begin
-      VarInfo := TVariableInfo(Ptr);
-      Result.RegIndex := VarInfo.PhysicalReg;
+      Result.RegIndex := Info.PhysicalReg;
       Result.Version := 0;
     end;
   end;
 
   function RewriteDimRegister(VirtReg: Integer; RegType: TSSARegisterType): Integer;
   var
-    Key: string;
-    Ptr: Pointer;
+    Info: TVariableInfo;
   begin
     Result := VirtReg;
-    Key := IntToStr(Ord(RegType)) + ':' + IntToStr(VirtReg) + ':0';
-    Ptr := VarIndex.Find(Key);
-    if Ptr <> nil then
-      Result := TVariableInfo(Ptr).PhysicalReg;
+    if VarIndex.TryGetValue(RegAllocKey(RegType, VirtReg, 0), Info) then
+      Result := Info.PhysicalReg;
   end;
 
 begin
-  // Build hash index for O(1) lookup
-  VarIndex := TFPHashList.Create;
+  // Build hash index for O(1) lookup (packed Int64 keys - see ComputeVariableUsage)
+  VarIndex := TRegInfoMap.Create;
   try
     for i := 0 to VarList.Count - 1 do
     begin
       VarInfo := TVariableInfo(VarList[i]);
-      VarIndex.Add(IntToStr(Ord(VarInfo.RegType)) + ':' + IntToStr(VarInfo.VirtualReg) + ':' + IntToStr(VarInfo.Version), VarInfo);
+      VarIndex.Add(RegAllocKey(VarInfo.RegType, VarInfo.VirtualReg, VarInfo.Version), VarInfo);
     end;
 
     for i := 0 to FProgram.Blocks.Count - 1 do
