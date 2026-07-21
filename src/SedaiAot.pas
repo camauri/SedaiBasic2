@@ -2057,8 +2057,29 @@ var
         FStore(FReg(Cur.Dest), XMM0);
       end;
 
-      ssaCopyInt: begin ILoad(RAX, IReg(Cur.Src1)); IStore(IReg(Cur.Dest), RAX); end;
-      ssaCopyFloat: begin FLoad(XMM0, FReg(Cur.Src1)); FStore(FReg(Cur.Dest), XMM0); end;
+      // A copy whose ends are both machine-allocated is ONE reg-reg move (the JIT's bcCopyInt
+      // fast path): the RAX/XMM0 staging costs a second move per copy, and the int one is the
+      // PHI-elimination copy of every FOR counter - one extra instruction per loop iteration,
+      // the byte-proven cause of the AOT-vs-JIT gap on the pure-int microbench.
+      ssaCopyInt:
+      begin
+        d := IReg(Cur.Dest); p1 := IReg(Cur.Src1); if not OK then Exit;
+        if (IAlloc(d) >= 0) and (IAlloc(p1) >= 0) then
+          MovRR(IAlloc(d), IAlloc(p1))
+        else
+        begin ILoad(RAX, p1); IStore(d, RAX); end;
+      end;
+      ssaCopyFloat:
+      begin
+        d := FReg(Cur.Dest); p1 := FReg(Cur.Src1); if not OK then Exit;
+        if (FAlloc(d) >= 0) and (FAlloc(p1) >= 0) then
+        begin
+          if FAlloc(d) <> FAlloc(p1) then                       // movsd xmm_d, xmm_s (pool is xmm2..7, no REX)
+            E.EmitBytes([$F2, $0F, $10, $C0 or (FAlloc(d) shl 3) or FAlloc(p1)]);
+        end
+        else
+        begin FLoad(XMM0, p1); FStore(d, XMM0); end;
+      end;
 
       ssaAddInt: begin ILoad(RAX, IReg(Cur.Src1)); IOp([$48, $03], RAX, IReg(Cur.Src2)); IStore(IReg(Cur.Dest), RAX); end;
       ssaSubInt: begin ILoad(RAX, IReg(Cur.Src1)); IOp([$48, $2B], RAX, IReg(Cur.Src2)); IStore(IReg(Cur.Dest), RAX); end;
