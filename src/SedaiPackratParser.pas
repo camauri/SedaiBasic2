@@ -154,6 +154,7 @@ type
 
     // === CORE PARSING METHODS ===
     function ParseProgram: TASTNode;
+    procedure DedupNumberedLines(ProgramNode: TASTNode);
     function ParseStatement: TASTNode;
 
     function ParseAssignmentStatement: TASTNode;
@@ -791,7 +792,105 @@ begin
    end;
  end;
 
+ // CLASSIC replace semantics: a repeated line number REPLACES the earlier line, as on a real
+ // C128 (typing the listing: last definition wins, at the number's slot). Without this both
+ // versions were lowered and the duplicated LINE_<n> label crashed the dominator pass.
+ DedupNumberedLines(Result);
+
  DoNodeCreated(Result);
+end;
+
+procedure TPackratParser.DedupNumberedLines(ProgramNode: TASTNode);
+// A "line group" is an antLineNumber child plus the statements that follow it, up to the next
+// antLineNumber (children before the first line number - the MODERN case - form an untouched
+// unnumbered group, so this pass is inert on programs without line numbers). When the same
+// number appears more than once, the LAST group's content wins and lands at the FIRST group's
+// position (the C128 program store is keyed by line number, so for an otherwise-ordered
+// listing that slot is where the number belongs); every other group with that number is
+// dropped and freed. Line numbers nested inside BEGIN/BEND blocks are children of the block
+// statement, not of the program node, and are deliberately out of scope here.
+var
+  GroupNum, GroupStart, GroupCnt: array of Integer;
+  GCount, i, g, w, n: Integer;
+  HasDup: Boolean;
+  Node: TASTNode;
+  Keep, Drop: TFPList;
+  Emitted: array of Boolean;
+begin
+  // Collect the groups.
+  GCount := 0;
+  SetLength(GroupNum, 8); SetLength(GroupStart, 8); SetLength(GroupCnt, 8);
+  for i := 0 to ProgramNode.ChildCount - 1 do
+  begin
+    Node := ProgramNode.GetChild(i);
+    if (Node.NodeType = antLineNumber) or (GCount = 0) then
+    begin
+      if GCount >= Length(GroupNum) then
+      begin
+        SetLength(GroupNum, GCount * 2); SetLength(GroupStart, GCount * 2);
+        SetLength(GroupCnt, GCount * 2);
+      end;
+      if Node.NodeType = antLineNumber then
+        GroupNum[GCount] := StrToIntDef(VarToStr(Node.Value), 0)
+      else
+        GroupNum[GCount] := -1;   // unnumbered prefix (MODERN / mixed leading statements)
+      GroupStart[GCount] := i;
+      GroupCnt[GCount] := 0;
+      Inc(GCount);
+    end;
+    Inc(GroupCnt[GCount - 1]);
+  end;
+
+  // Any duplicate number? (Corpus programs are small; the quadratic scan only runs on the
+  // group table, not the statements.)
+  HasDup := False;
+  for g := 1 to GCount - 1 do
+    if GroupNum[g] >= 0 then
+      for w := 0 to g - 1 do
+        if GroupNum[w] = GroupNum[g] then begin HasDup := True; Break; end;
+  if not HasDup then Exit;
+
+  Keep := TFPList.Create;
+  Drop := TFPList.Create;
+  try
+    SetLength(Emitted, GCount);
+    for g := 0 to GCount - 1 do Emitted[g] := False;
+    for g := 0 to GCount - 1 do
+    begin
+      if Emitted[g] then System.Continue;
+      if GroupNum[g] < 0 then
+        w := g
+      else
+      begin
+        // Winner = the last group with this number; mark every occurrence as handled.
+        w := g;
+        for n := g + 1 to GCount - 1 do
+          if GroupNum[n] = GroupNum[g] then begin w := n; Emitted[n] := True; end;
+      end;
+      Emitted[g] := True;
+      for i := GroupStart[w] to GroupStart[w] + GroupCnt[w] - 1 do
+        Keep.Add(ProgramNode.GetChild(i));
+    end;
+
+    // Everything not kept gets freed.
+    for i := 0 to ProgramNode.ChildCount - 1 do
+    begin
+      Node := ProgramNode.GetChild(i);
+      if Keep.IndexOf(Node) < 0 then Drop.Add(Node);
+    end;
+
+    // Rebuild the child list without freeing the survivors, then free the dropped subtrees.
+    ProgramNode.Children.OwnsObjects := False;
+    ProgramNode.Children.Clear;
+    for i := 0 to Keep.Count - 1 do
+      ProgramNode.Children.Add(TASTNode(Keep[i]));
+    ProgramNode.Children.OwnsObjects := True;
+    for i := 0 to Drop.Count - 1 do
+      TASTNode(Drop[i]).Free;
+  finally
+    Keep.Free;
+    Drop.Free;
+  end;
 end;
 
 function TPackratParser.ParseStatement: TASTNode;
