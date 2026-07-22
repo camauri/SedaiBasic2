@@ -79,6 +79,10 @@ type
     FTokenStartColumn: Integer;
     FTokenText: string;
     FAtLineStart: Boolean;
+    // Type of the last token emitted by CreateToken. Used to decide whether a two-letter
+    // DOS alias (MD/CD/...) sits at statement-head position (command) or inside an
+    // expression (variable). ttEndOfLine before the first token of the source.
+    FLastEmittedType: TTokenType;
     FInComment: Boolean;
 
     // === STRING CACHE OPTIMIZATION ===
@@ -334,6 +338,7 @@ begin
   FCurrentLine := 1;
   FCurrentColumn := 1;
   FAtLineStart := True;
+  FLastEmittedType := ttEndOfLine;
   FInComment := False;
   FTokenStart := 1;
   FTokenStartLine := 1;
@@ -438,7 +443,11 @@ procedure TLexerFSM.InitializeLexerOptions;
 begin
   FLexerOptions.HasLineNumbers := True;
   FLexerOptions.LineNumbersRequired := False;
-  FLexerOptions.MaxLineNumber := 65535;
+  // A number above the cap at the start of a line silently lexes as a plain literal, which
+  // derails every statement after it (stray-literal warnings, statements glued to the wrong
+  // line). 65535 was far too low for generated programs; everything downstream (parser, SSA
+  // labels, source map, .basc) stores BASIC line numbers as Integer.
+  FLexerOptions.MaxLineNumber := 999999999;
   FLexerOptions.RequireSpacesBetweenTokens := False;
   FLexerOptions.CaseSensitive := False;
   FLexerOptions.AllowUnicodeIdentifiers := False;
@@ -1316,6 +1325,8 @@ begin
 
   Inc(FTokensProcessed);
 
+  FLastEmittedType := TokenType;
+
   if TokenType = ttEndOfLine then
     FAtLineStart := True
   else
@@ -1352,7 +1363,7 @@ function TLexerFSM.ProcessIdentifier: TLexerToken;
 var
   Match: TKeywordMatchResult;
   TokenText: string;
-  OrigLen, Rewind: Integer;
+  OrigLen, Rewind, PeekPos: Integer;
 begin
   Result := nil;
 
@@ -1379,6 +1390,34 @@ begin
     begin
       Result := CreateToken(ttIdentifier);
       Exit;
+    end;
+
+    // Commodore-DOS shortcut aliases (MD/CD/RD/CP/MV - exactly the two-letter ttFileManagement
+    // keywords) are extensions of ours: neither BASIC v7 nor FreeBASIC reserves these names, and
+    // real CLASSIC programs use them as variables (DIM MD(1,1), PRINT CD). The command form only
+    // ever appears at STATEMENT-HEAD position (after a line number, ':', THEN or ELSE), so
+    // anywhere else - inside an expression, after PRINT, on the right of '=' - the name is an
+    // identifier. At statement head it is still a variable when the next non-blank character is
+    // '(' (array element assignment) or '=' (scalar assignment). A string variable "MD$" already
+    // lexes as one identifier token (the suffix is part of the name) and never reaches this
+    // check. The full names (MKDIR/CHDIR/RMDIR/COPY/MOVE) stay hard keywords.
+    if Assigned(Match.KeywordInfo) and
+       (Match.KeywordInfo.TokenType = ttFileManagement) and (Match.MatchedLength = 2) then
+    begin
+      if not (FLastEmittedType in [ttEndOfLine, ttLineNumber, ttSeparStmt,
+                                   ttConditionalThen, ttConditionalElse]) then
+      begin
+        Result := CreateToken(ttIdentifier);
+        Exit;
+      end;
+      PeekPos := FCurrentPosition;
+      while (PeekPos <= FSourceLength) and (FSource[PeekPos] in [' ', #9]) do
+        Inc(PeekPos);
+      if (PeekPos <= FSourceLength) and (FSource[PeekPos] in ['(', '=']) then
+      begin
+        Result := CreateToken(ttIdentifier);
+        Exit;
+      end;
     end;
 
     // Spaceless mode: rewind cursor if keyword is prefix of longer token
@@ -2902,6 +2941,7 @@ begin
   FCurrentColumn := 1;
   FCurrentState := lsInitial;
   FAtLineStart := True;
+  FLastEmittedType := ttEndOfLine;
   FInComment := False;
   ResetToken;
 
@@ -3061,7 +3101,7 @@ procedure TLexerFSM.ConfigureForClassicBasic;
 begin
   FLexerOptions.HasLineNumbers := True;
   FLexerOptions.LineNumbersRequired := False;
-  FLexerOptions.MaxLineNumber := 65535;
+  FLexerOptions.MaxLineNumber := 999999999;  // see InitializeLexerOptions
   FLexerOptions.RequireSpacesBetweenTokens := False;
   FLexerOptions.CaseSensitive := False;
   FLexerOptions.AllowUnicodeIdentifiers := False;
