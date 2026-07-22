@@ -50,6 +50,11 @@ unit SedaiBytecodeSerializer;
   ├────────────────────────────────┤
   │ Bytecode Instructions          │
   │  - Packed TBytecodeInstruction │
+  ├────────────────────────────────┤
+  │ v3: Error metadata             │
+  │  - ModuleName (string)         │
+  │  - ProcMapCount: u32           │
+  │  - For each: StartPC + Name    │
   └────────────────────────────────┘
   ============================================================================ }
 
@@ -66,7 +71,10 @@ const
   // Const materialized into a register - loaded as "undefined variable dimension" and the
   // program died at its first ArrayDim. v1 files still load (missing fields default to
   // "constant dims only", exactly the old behavior).
-  BASC_VERSION = 2;
+  // v3: appends the error-reporting metadata - ModuleName (ERMN) and the procedure map
+  // (PC -> procedure name, ERFN) - after the instructions. Without it a .basc run reported
+  // ERFN/ERMN as empty. v1/v2 files still load (metadata stays empty, the old behavior).
+  BASC_VERSION = 3;
 
   // Flags
   BASC_FLAG_DEBUG_INFO = $0001;  // Contains source line mapping (always included)
@@ -128,29 +136,34 @@ begin
   FIncludeDebugInfo := True;  // Include source line info by default
 end;
 
+// Runtime strings are UTF-8 bytes end to end (the lexer extracts UTF-8 source verbatim and the
+// VM prints bytes verbatim), so the file format stores those bytes UNCONVERTED. The old
+// UTF8Encode/UTF8Decode pair went through an implicit ansistring<->unicode conversion using the
+// string's DECLARED codepage - on a process whose default codepage is not UTF-8 (sbc), that
+// re-encoded the already-UTF-8 bytes as if they were CP1252 and every non-ASCII constant
+// reached the .basc double-encoded ("café" -> "cafÃ©").
 procedure TBytecodeSerializer.WriteString(Stream: TStream; const S: string);
 var
   Len: LongWord;
-  UTF8Str: UTF8String;
 begin
-  UTF8Str := UTF8Encode(S);
-  Len := Length(UTF8Str);
+  Len := Length(S);
   Stream.WriteBuffer(Len, SizeOf(Len));
   if Len > 0 then
-    Stream.WriteBuffer(UTF8Str[1], Len);
+    Stream.WriteBuffer(S[1], Len);
 end;
 
 function TBytecodeSerializer.ReadString(Stream: TStream): string;
 var
   Len: LongWord;
-  UTF8Str: UTF8String;
 begin
   Stream.ReadBuffer(Len, SizeOf(Len));
   if Len > 0 then
   begin
-    SetLength(UTF8Str, Len);
-    Stream.ReadBuffer(UTF8Str[1], Len);
-    Result := UTF8Decode(UTF8Str);
+    SetLength(Result, Len);
+    Stream.ReadBuffer(Result[1], Len);
+    // Declare the bytes as UTF-8 without converting them, so later implicit conversions
+    // (if any) start from the truth instead of the OS default codepage.
+    SetCodePage(RawByteString(Result), CP_UTF8, False);
   end
   else
     Result := '';
@@ -304,6 +317,17 @@ begin
         raise EBytecodeSerializerError.CreateFmt('Error writing instruction %d: %s', [i, E.Message]);
     end;
   end;
+
+  // v3: error-reporting metadata - ERMN (module name) and the ERFN procedure map.
+  WriteString(Stream, Program_.ModuleName);
+  DimCount := Program_.GetProcMapCount;
+  Stream.WriteBuffer(DimCount, SizeOf(DimCount));
+  for i := 0 to Integer(DimCount) - 1 do
+  begin
+    DimReg := Program_.GetProcMapStart(i);
+    Stream.WriteBuffer(DimReg, SizeOf(DimReg));
+    WriteString(Stream, Program_.GetProcMapName(i));
+  end;
 end;
 
 procedure TBytecodeSerializer.SaveToFile(Program_: TBytecodeProgram; const FileName: string);
@@ -438,6 +462,19 @@ begin
       Stream.ReadBuffer(Instr.Immediate, SizeOf(Instr.Immediate));
       Stream.ReadBuffer(SourceLine, SizeOf(SourceLine));  // Read from file
       Result.AddInstructionWithLine(Instr, SourceLine);   // Store in Source Map
+    end;
+
+    // v3: error-reporting metadata (ERMN module name + ERFN procedure map).
+    // Older files simply have none: both stay empty, which was the old behavior.
+    if Header.Version >= 3 then
+    begin
+      Result.ModuleName := ReadString(Stream);
+      Stream.ReadBuffer(DimCount, SizeOf(DimCount));
+      for i := 0 to Integer(DimCount) - 1 do
+      begin
+        Stream.ReadBuffer(DimReg, SizeOf(DimReg));
+        Result.AddProcRange(DimReg, ReadString(Stream));
+      end;
     end;
 
     // Validate checksum

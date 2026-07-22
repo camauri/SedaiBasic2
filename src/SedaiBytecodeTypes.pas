@@ -954,6 +954,7 @@ type
     // Enumerate the proc map (entries are in emission order, so entry i spans up to entry i+1).
     function GetProcMapCount: Integer;
     function GetProcMapStart(Index: Integer): Integer;   // -1 if out of range or no longer addressable
+    function GetProcMapName(Index: Integer): string;     // '' if out of range
     // Label lines API - for REM and other non-code lines that can be jump targets
     procedure AddLabelLine(LineNum: Integer; PC: Integer);
     procedure AdjustLabelLines(const IndexMap: array of Integer);  // Adjust PCs after NOP compaction
@@ -1403,6 +1404,14 @@ begin
     Result := FProcMap[Index].StartPC
   else
     Result := -1;
+end;
+
+function TBytecodeProgram.GetProcMapName(Index: Integer): string;
+begin
+  if (Index >= 0) and (Index < FProcMapCount) then
+    Result := FProcMap[Index].Name
+  else
+    Result := '';
 end;
 
 { ---- AOT mapping API (plan B) ---- }
