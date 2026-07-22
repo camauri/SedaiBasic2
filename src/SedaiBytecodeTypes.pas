@@ -1764,6 +1764,11 @@ begin
         131: Result := 'Shl';
         132: Result := 'Shr';
         153: Result := 'ShrUInt';
+        134: Result := 'Randomize';
+        135: Result := 'OnError';
+        136: Result := 'ResumeLabel';
+        137: Result := 'Rmdir';
+        138: Result := 'RaiseError';
         139: Result := 'Assert';
         140: Result := 'CallSubIndirect';
         141: Result := 'SetEnviron';

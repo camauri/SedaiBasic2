@@ -4900,10 +4900,12 @@ begin
       end;
     bcRaiseError:
       begin
-        // ERROR <n> - raise a user runtime error number n. The run-loop except handler reads the
+        // ERROR <n> - raise a runtime error number n. The run-loop except handler reads the
         // code into ERR and transfers to any active ON ERROR / TRAP handler (or aborts if none).
+        // Known codes report their standard BASIC message (e.g. 10 -> NEXT WITHOUT FOR, also
+        // reached by the compiler's orphan-NEXT lowering); unknown ones fall back to "ERROR n".
         raise TExecutorRuntimeException.CreateWithCode(
-          'Error ' + IntToStr(Ctx.IntRegs[Instr.Src1]), Ctx.IntRegs[Instr.Src1]);
+          GetErrorCodeDescription(Ctx.IntRegs[Instr.Src1]), Ctx.IntRegs[Instr.Src1]);
       end;
     bcNop: ;
     bcClear: ClearAllVariables;

@@ -75,6 +75,10 @@ type
     FOptionBase: Integer;              // "OPTION BASE n": default lower bound for a bare-upper-bound array DIM (0 or 1)
     FInitLevelSizes: array of Integer; // array initializer: item count per brace-nesting level (for "..." ellipsis dims)
     FDialectOverride: TParserDialect;  // pdAuto = detect per-Parse; pdModern/pdClassic = forced
+    // Number of ParseDoStatement body parses currently on the call stack. A bare LOOP that
+    // reaches ParseLoopEndStatement while this is > 0 sits inside a nested construct of an
+    // open DO (single-line IF branch): in CLASSIC it is that loop's back-edge, not an error.
+    FDoParseDepth: Integer;
     // Dialect-pluggable: per-token statement handlers installed by the active dialect profile.
     // Consulted by ParseStatement before the built-in case; nil entry = no override.
     FStmtHandlers: array[TTokenType] of TStatementParseFunc;
@@ -3862,8 +3866,14 @@ begin
   end;
 
   // Parse body until LOOP (nesting-aware: a nested flat FOR...NEXT is consumed, not mistaken
-  // for the terminator).
+  // for the terminator). NOTE: the body is NOT bounded by EndIndex - that scan counts the
+  // kind words of "Exit Do, Do" as loop openers, so its index is only reliable as a
+  // "no LOOP anywhere" check. If a single-line IF branch consumes the closing LOOP (CLASSIC
+  // "DO : ... : IF c THEN ... : LOOP"), the body absorbs the rest of the program and the
+  // loop is marked open-ended below - flow stays linear because the DO emits no back-jump.
+  Inc(FDoParseDepth);
   Body := ParseLoopBody;
+  Dec(FDoParseDepth);
   if Assigned(Body) then
     Result.AddChild(Body);
 
@@ -3881,7 +3891,13 @@ begin
 
       Condition := ParseExpression;
     end;
-  end;
+  end
+  else
+    // The matching LOOP was consumed INSIDE the body — i.e. in a single-line IF branch, where
+    // it lowered to CONTINUE DO (the loop's only back-edge, exactly a C128's LOOP statement).
+    // The DO gets NO automatic back-jump: when the branch does not take, execution falls
+    // through past the end of the body, like a C128 whose LOOP statement never executes.
+    Result.Attributes.Values['OpenEnded'] := '1';
 
   // Add condition as second child (if present)
   if Assigned(Condition) then
@@ -4311,6 +4327,40 @@ var
 begin
   Token := Context.CurrentToken;
   EndKeyword := UpperCase(Token.Value);
+
+  // CLASSIC branch-LOOP: ParseDoStatement consumes its structural closer directly, so a LOOP
+  // that arrives HERE while a DO body parse is on the stack sits inside a nested construct —
+  // in practice a single-line IF branch ("DO : ... : IF c THEN ... : LOOP"). On a C128 the
+  // LOOP statement is simply "jump back to the matching DO", so lower it as CONTINUE DO
+  // (whose target for an unconditioned DO is the body top, and for DO WHILE/UNTIL the
+  // condition re-test). A conditioned LOOP UNTIL/WHILE in branch position is rejected loudly.
+  if (EndKeyword = 'LOOP') and (FDoParseDepth > 0) and (not FModernMode) then
+  begin
+    Context.Advance; // Consume LOOP
+    if Context.Check(ttLoopControl) then
+    begin
+      HandleError('LOOP UNTIL/WHILE inside a conditional branch is not supported', Token);
+      Result := nil;
+      Exit;
+    end;
+    Result := TASTNode.Create(antReturn, Token);
+    Result.Value := kCONTINUE + ' ' + kDO;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // CLASSIC: an unmatched NEXT is NOT a compile error on a C128 - it raises ?NEXT WITHOUT FOR
+  // at RUNTIME, if and when executed (and it is trappable). Emit the orphan antNext node; the
+  // SSA lowers it to the error raise. MODERN keeps the strict compile-time rejection (fbc does).
+  if (EndKeyword = 'NEXT') and (not FModernMode) and (not FValidationStacks.HasActiveLoop) then
+  begin
+    Result := TASTNode.Create(antNext, Token);
+    Context.Advance; // Consume NEXT
+    if Context.Check(ttIdentifier) then
+      Context.Advance; // Consume variable name
+    DoNodeCreated(Result);
+    Exit;
+  end;
 
   // *** VALIDATE LOOP END ***
   if not FValidationStacks.ValidateLoopEnd(EndKeyword) then
@@ -9260,9 +9310,25 @@ begin
   begin
     Token := Context.CurrentToken;
 
-    // Skip line numbers and EOL — they remain at root level.
-    if Context.Match(ttLineNumber) or Context.Match(ttEndOfLine) then
+    // A line number inside the body becomes a body child (SSA opens its LINE_<n> block there),
+    // so GOTO/GOSUB targets inside a multi-line DO body resolve - and when an open-ended DO
+    // absorbs the rest of a CLASSIC program, every later line keeps its label. (They used to
+    // be silently dropped here.)
+    if Context.Check(ttLineNumber) then
+    begin
+      Result.AddChild(TASTNode.CreateWithValue(antLineNumber, Token.Value, Token));
+      Context.SetCurrentBasicLine(StrToIntDef(Token.Value, 0), BuildSourceLine(Context));
+      Context.Advance;
       Continue;
+    end;
+    if Context.Match(ttEndOfLine) then
+    begin
+      // Same duty as ParseProgram's EOL handling: a completed single-line IF closes at end of
+      // line (with ELSE lookahead for multi-line blocks). Without this, an IF inside the body
+      // stayed open across the swallowed EOL and died as "IF statement never closed".
+      PopCompletedIfsAtEOL;
+      Continue;
+    end;
 
     if Token.TokenType = ttLoopBlockEnd then
     begin
@@ -9275,7 +9341,17 @@ begin
           Result.AddChild(Statement);
         Continue;
       end;
-      // Otherwise (LOOP/WEND, or NEXT with no open FOR) this is our terminator.
+      // CLASSIC: a NEXT with no open FOR is a body STATEMENT (it lowers to the runtime
+      // ?NEXT WITHOUT FOR raise), never this loop's terminator - treating it as one made
+      // ParseDoStatement swallow the token silently. MODERN keeps the strict behavior.
+      if (UpperCase(Token.Value) = kNEXT) and (not FModernMode) then
+      begin
+        Statement := ParseStatement;        // orphan antNext (raise when executed)
+        if Assigned(Statement) then
+          Result.AddChild(Statement);
+        Continue;
+      end;
+      // Otherwise (LOOP/WEND, or MODERN NEXT with no open FOR) this is our terminator.
       Break;
     end;
 

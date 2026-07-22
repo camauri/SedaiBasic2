@@ -34,7 +34,8 @@ interface
 uses
   Classes, SysUtils, StrUtils, Variants, Math, Generics.Collections,
   SedaiLexerTypes, SedaiLexerToken, SedaiParserTypes, SedaiAST,
-  SedaiSSATypes, SedaiBasicKeywords, SedaiNamespace, SedaiStaticLocals;
+  SedaiSSATypes, SedaiBasicKeywords, SedaiNamespace, SedaiStaticLocals,
+  SedaiExecutorErrors;   // runtime error codes (ERR_NEXT_WITHOUT_FOR for the orphan-NEXT raise)
 
 type
   { Loop info for FOR/NEXT implementation }
@@ -9186,6 +9187,7 @@ var
   ConditionPosition: string;
   IsWhileLoop: Boolean;
   HasCondition: Boolean;
+  IsOpenEnded: Boolean;
   i: Integer;
   LoopInfo: TLoopInfo;
 begin
@@ -9206,6 +9208,11 @@ begin
   ConditionPosition := Node.Attributes.Values['ConditionPosition'];
   IsWhileLoop := (ConditionType = 'WHILE');
   HasCondition := (ConditionType <> '');
+  // CLASSIC open-ended DO: its LOOP sits inside a single-line IF branch (lowered there to
+  // CONTINUE DO = the loop's only back-edge). The body gets NO automatic back-jump: when the
+  // branch does not take, execution falls through to the code after the loop, exactly like a
+  // C128 whose LOOP statement never executes.
+  IsOpenEnded := Node.Attributes.Values['OpenEnded'] = '1';
 
   // Generate labels
   BodyLabel := GenerateUniqueLabel('do_body');
@@ -9304,9 +9311,14 @@ begin
     end;
     BlockScopeExit;    // M8: destruct + reclaim the body's DIM'd UDTs before the back-edge
 
-    // Jump back to condition check
-    EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone),
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // Jump back to condition check — unless open-ended (branch-LOOP is the only back-edge:
+    // end of body falls OUT of the loop).
+    if IsOpenEnded then
+      EmitInstruction(ssaJump, MakeSSALabel(EndLabel), MakeSSAValue(svkNone),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+    else
+      EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 
     // End block
     FCurrentBlock := FProgram.CreateBlock(EndLabel);
@@ -9393,9 +9405,14 @@ begin
     end
     else
     begin
-      // Infinite loop: DO ... LOOP (no condition)
-      EmitInstruction(ssaJump, MakeSSALabel(BodyLabel), MakeSSAValue(svkNone),
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // Infinite loop: DO ... LOOP (no condition). Open-ended: the branch-LOOP (CONTINUE DO)
+      // is the only back-edge, so the end of the body falls OUT of the loop instead.
+      if IsOpenEnded then
+        EmitInstruction(ssaJump, MakeSSALabel(EndLabel), MakeSSAValue(svkNone),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      else
+        EmitInstruction(ssaJump, MakeSSALabel(BodyLabel), MakeSSAValue(svkNone),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 
       // End label for potential EXIT statements
       FCurrentBlock := FProgram.CreateBlock(EndLabel);
@@ -9461,8 +9478,20 @@ var
   TempVal: TSSAValue;
   BodyBlock, CondBlock, EndBlock, ContBlock: TSSABasicBlock;  // PHASE 3 TIER 3: CFG construction
 begin
-  // Pop loop info from stack
-  if Length(FLoopStack) = 0 then Exit;  // Error: NEXT without FOR
+  // NEXT with no active FOR: on a C128 this raises ?NEXT WITHOUT FOR ERROR when executed (and
+  // it is trappable). Compiled code has no runtime FOR stack, so the orphan NEXT lowers to the
+  // error raise itself - it errors if and when reached, like the real machine, instead of the
+  // old silent no-op. A non-FOR entry on top (a NEXT inside a DO body whose FOR, if any, is
+  // outside) is the same error: the C128 looks for a FOR entry and finds a DO. (A NEXT
+  // lexically paired with a FOR keeps working through any control flow, GOSUB included,
+  // because the pairing is resolved at compile time.)
+  if (Length(FLoopStack) = 0) or (FLoopStack[High(FLoopStack)].LoopKind <> lkFor) then
+  begin
+    EmitInstruction(ssaRaiseError, MakeSSAValue(svkNone),
+                   EnsureIntRegister(MakeSSAConstInt(ERR_NEXT_WITHOUT_FOR)),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
   LoopInfo := FLoopStack[High(FLoopStack)];
   SetLength(FLoopStack, Length(FLoopStack) - 1);
 
@@ -22503,7 +22532,11 @@ begin
     begin
       ExitKind := UpperCase(VarToStr(Node.Value));   // 'EXIT[ kind]' / 'CONTINUE[ kind]' / 'RETURN'
       IsExitStmt := Assigned(Node.Token) and (UpperCase(Node.Token.Value) = kEXIT);
-      IsContinueStmt := Assigned(Node.Token) and (UpperCase(Node.Token.Value) = kCONTINUE);
+      // A CLASSIC branch-LOOP ("DO : ... : IF c THEN ... : LOOP") lowers to a CONTINUE DO node
+      // whose TOKEN is the LOOP keyword, so the statement kind must also be read from the
+      // node VALUE, not only from the token.
+      IsContinueStmt := (Assigned(Node.Token) and (UpperCase(Node.Token.Value) = kCONTINUE)) or
+                        (Copy(ExitKind, 1, Length(kCONTINUE)) = kCONTINUE);
       if IsContinueStmt then
       begin
         // FreeBASIC CONTINUE: skip the rest of the current iteration and jump to a loop's continue point
