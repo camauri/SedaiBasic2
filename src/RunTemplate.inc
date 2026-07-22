@@ -78,7 +78,10 @@ begin
   if Length(FDenseOps) > 0 then DenseOps := @FDenseOps[0] else DenseOps := nil;
   // JIT (J2/J3): bind the compiled-loop table. When a loop header PC has a native loop, the interpreter
   // calls it (runs every iteration natively) and continues at the returned exit PC.
-  JitOn := FJitEnabled and (Length(FNativeLoops) > 0);
+  // Thread-safety gate: compiled loops bake absolute addresses of the MAIN context's banks
+  // (XferInt/Records), so only the main thread may enter them. A worker (GActiveCtx <> nil)
+  // runs interpreted — or AOT, whose code is context-relative (TAotCtx) and thus worker-safe.
+  JitOn := FJitEnabled and (Length(FNativeLoops) > 0) and (GActiveCtx = nil);
   if JitOn then JitLoops := @FNativeLoops[0] else JitLoops := nil;
   {$IFDEF JIT_PROFILE}
   // J1: bind the back-edge profiler (counting is a no-op unless FJitProfile is set).
