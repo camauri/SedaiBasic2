@@ -1946,6 +1946,18 @@ begin
                 WriteLn('Failing instruction: ', BytecodeOpToString(TBytecodeOp(OpCode)),
                         ' Dest=', Dest, ' Src1=', Src1, ' Src2=', Src2);
               end;
+              // Same context dump as the run-from-source error handler: a program must
+              // report errors identically whether launched from .bas or from .basc.
+              WriteLn;
+              WriteLn('Bytecode context (PC-7 to PC+2):');
+              for i := Max(0, VM.PC - 7) to Min(BytecodeProgram.GetInstructionCount - 1, VM.PC + 2) do
+              begin
+                with BytecodeProgram.GetInstruction(i) do
+                begin
+                  Write(Format('%4d: %-15s', [i, BytecodeOpToString(TBytecodeOp(OpCode))]));
+                  WriteLn(Format(' Dest=%3d Src1=%3d Src2=%3d Imm=%d', [Dest, Src1, Src2, Immediate]));
+                end;
+              end;
             end;
             Exit;
           end;
