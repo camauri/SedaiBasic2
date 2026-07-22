@@ -744,6 +744,8 @@ begin
   // M5.2: the main context starts at the program EntryPoint (StartPC = -1); workers override it.
   FCtx.StartPC := -1;
   FDrainCtx.StartPC := -1;
+  FCtx.ModeSwitchPC := -1;
+  FDrainCtx.ModeSwitchPC := -1;
   SetLength(FWorkerThreads, 0);
   InitCriticalSection(FWorkerLock);
   SetLength(FMutexes, 0);
@@ -2664,6 +2666,7 @@ begin
   Spawn := TWorkerSpawn.Create;
   Spawn.VM := Self;
   Spawn.Ctx := TExecutionContext.Create;
+  Spawn.Ctx.ModeSwitchPC := -1;  // no TRON/TROFF switch pending (0 would read as "resume at PC 0")
   Spawn.EntryPC := EntryPC;
   Spawn.Joined := False;
   Spawn.Detached := False;

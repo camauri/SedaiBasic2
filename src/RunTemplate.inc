@@ -94,7 +94,14 @@ begin
   if GActiveCtx <> nil then Ctx := GActiveCtx else Ctx := FCtx;
   // The main context starts at the program EntryPoint (StartPC = -1); a worker starts at the entry
   // PC of the SUB it runs (StartPC set in RunWorker), with a synthetic call frame already primed.
-  if Ctx.StartPC >= 0 then CurPC := Ctx.StartPC else CurPC := FProgram.EntryPoint;
+  // A pending TRON/TROFF mode switch overrides both: the other run loop handed control over
+  // mid-program and execution must CONTINUE, not restart (one-shot, consumed here).
+  if Ctx.ModeSwitchPC >= 0 then
+  begin
+    CurPC := Ctx.ModeSwitchPC;
+    Ctx.ModeSwitchPC := -1;
+  end
+  else if Ctx.StartPC >= 0 then CurPC := Ctx.StartPC else CurPC := FProgram.EntryPoint;
   Ctx.Running := True;  // Mark VM as running
   Ctx.AotRaisePC := -1; // no AOT-raised exception pending (0 would read as "PC 0")
   // M5.3: the main thread is the render owner (only it may touch the SDL device). A worker
@@ -1120,7 +1127,7 @@ begin
             Ctx.LastSourceLine := 0;
             {$IFNDEF DEBUG_MODE}
             // In RunFast: switch to RunDebug for trace support
-            Ctx.PC := CurPC + 1;  // Continue from next instruction
+            Ctx.ModeSwitchPC := CurPC + 1;  // RunDebug continues from the next instruction
             Ctx.Running := False; // Signal to exit main loop
             Break;             // Exit loop, then call RunDebug
             {$ELSE}
@@ -1132,7 +1139,7 @@ begin
             Ctx.TraceActive := False;
             {$IFDEF DEBUG_MODE}
             // In RunDebug: switch to RunFast for speed
-            Ctx.PC := CurPC + 1;  // Continue from next instruction
+            Ctx.ModeSwitchPC := CurPC + 1;  // RunFast continues from the next instruction
             Ctx.Running := False; // Signal to exit main loop
             Break;             // Exit loop, then call RunFast
             {$ELSE}

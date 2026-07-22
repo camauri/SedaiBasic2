@@ -72,6 +72,11 @@ type
     // M5.2: where this context's run loop starts. The main context uses -1 (= program EntryPoint);
     // a worker sets it to the entry PC of the SUB it runs, so Run begins at the worker's procedure.
     StartPC: Integer;
+    // One-shot resume PC for a TRON/TROFF mode switch: RunFast/RunDebug hand control to each
+    // other mid-program, and the re-entered loop must CONTINUE here rather than restart at
+    // StartPC/EntryPoint. Consumed (reset to -1) at Run entry; -1 = no switch pending.
+    // (Distinct from ResumePC below, which belongs to TRAP/RESUME error handling.)
+    ModeSwitchPC: Integer;
     Running: Boolean;
     Stopped: Boolean;           // True if stopped by STOP command (can CONT)
     StoppedPC: Integer;         // PC to resume from when CONT is called
