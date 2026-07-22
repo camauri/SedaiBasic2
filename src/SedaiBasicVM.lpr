@@ -2044,6 +2044,12 @@ begin
     DefaultSystemCodePage := CP_UTF8;
     {$ENDIF}
 
+    // Force BASIC-compatible number formatting process-wide. The lexer's constructor sets the
+    // same thing, but a .basc run never creates a lexer -- without this, PRINT of a float
+    // followed the OS locale (e.g. a comma decimal separator on an Italian system).
+    DefaultFormatSettings.DecimalSeparator := '.';
+    DefaultFormatSettings.ThousandSeparator := ',';
+
     // Initialize random number generator
     Randomize;
 

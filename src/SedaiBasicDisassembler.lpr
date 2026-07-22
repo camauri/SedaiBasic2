@@ -355,6 +355,12 @@ begin
     SetupConsoleUTF8;   // saves + restores the parent console's code pages; no-op when redirected
     {$ENDIF}
 
+    // Force BASIC-compatible number formatting: sbd never creates a lexer (which is where
+    // the separator is otherwise set), so float constants in the listing would follow the
+    // OS locale (e.g. a comma decimal separator on an Italian system).
+    DefaultFormatSettings.DecimalSeparator := '.';
+    DefaultFormatSettings.ThousandSeparator := ',';
+
     // Initialize options with defaults
     FillChar(Options, SizeOf(Options), 0);
     Options.ShowHeader := True;
