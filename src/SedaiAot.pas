@@ -993,7 +993,12 @@ var
     n := FAlloc(vmreg);
     if n >= 0 then
     begin
-      if n <> Wx then E.EmitBytes([$F2, $0F, $10, $C0 or (Wx shl 3) or n]);
+      // Register-to-register copy uses movaps, not movsd. movsd xmm,xmm MERGES (low 64 only),
+      // so it is a partial-register write: not move-eliminated and false-dependent on the
+      // destination's upper bits. movaps copies all 128 bits, is move-eliminated on Ivy Bridge+
+      // (zero uop), and the upper half is never read by any scalar-double op - so the whole
+      // xmm0 round-trip a dynamic-allocated op still emits costs nothing.
+      if n <> Wx then E.EmitBytes([$0F, $28, $C0 or (Wx shl 3) or n]);   // movaps Wx, n
     end
     else E.MemOp([$F2, $0F, $10], Wx, RSI, LongWord(vmreg) * 8);
   end;
@@ -1012,7 +1017,7 @@ var
     n := FAlloc(vmreg);
     if n >= 0 then
     begin
-      if n <> Wx then E.EmitBytes([$F2, $0F, $10, $C0 or (n shl 3) or Wx]);
+      if n <> Wx then E.EmitBytes([$0F, $28, $C0 or (n shl 3) or Wx]);   // movaps n, Wx (see FLoad)
     end
     else E.MemOp([$F2, $0F, $11], Wx, RSI, LongWord(vmreg) * 8);
   end;
@@ -2698,8 +2703,8 @@ var
         d := FReg(Cur.Dest); p1 := FReg(Cur.Src1); if not OK then Exit;
         if (FAlloc(d) >= 0) and (FAlloc(p1) >= 0) then
         begin
-          if FAlloc(d) <> FAlloc(p1) then                       // movsd xmm_d, xmm_s (pool is xmm2..7, no REX)
-            E.EmitBytes([$F2, $0F, $10, $C0 or (FAlloc(d) shl 3) or FAlloc(p1)]);
+          if FAlloc(d) <> FAlloc(p1) then                       // movaps xmm_d, xmm_s (move-eliminated; see FLoad)
+            E.EmitBytes([$0F, $28, $C0 or (FAlloc(d) shl 3) or FAlloc(p1)]);
         end
         else
         begin FLoad(XMM0, p1); FStore(d, XMM0); end;
