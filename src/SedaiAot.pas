@@ -973,7 +973,14 @@ var
       EmitRR(rest, scr, n);
     end
     else
-      E.MemOp(MemForm, scr, RBX, LongWord(vmreg) * 8);
+    begin
+      // Memory operand. MemForm[0] is REX.W; MemOp bakes it verbatim, so add REX.R here for an
+      // extended scratch (r8..r15) - the in-place int path uses pool GPRs as the accumulator.
+      SetLength(rest, Length(MemForm));
+      for k := 0 to High(MemForm) do rest[k] := MemForm[k];
+      if scr >= 8 then rest[0] := rest[0] or $04;
+      E.MemOp(rest, scr, RBX, LongWord(vmreg) * 8);
+    end;
   end;
   function FAlloc(vmreg: Integer): Integer;
   begin
@@ -1087,6 +1094,35 @@ var
     else
     begin
       FLoad(XMM0, s1); FOp(SseOp, XMM0, s2); FStore(d, XMM0);       // non-commutative dest==src2
+    end;
+  end;
+  // Integer analogue of FloatBin: dest := src1 <op> src2 computed in place in the dest's GPR home
+  // when it has one (rax scratch round-trip only for a memory-homed dest or the non-commutative
+  // dest==src2 alias). MemForm is the [$48, opcode...] memory-form encoding; IOp/ILoadArg build
+  // the right REX for the extended pool GPRs.
+  procedure IntBin(const MemForm: array of Byte; Commutative: Boolean);
+  var Hd, Hs1, Hs2, d, s1, s2: Integer;
+  begin
+    d := IReg(Cur.Dest); s1 := IReg(Cur.Src1); s2 := IReg(Cur.Src2); if not OK then Exit;
+    Hd := IAlloc(d);
+    if Hd < 0 then
+    begin
+      ILoad(RAX, s1); IOp(MemForm, RAX, s2); IStore(d, RAX);        // memory-homed dest
+      Exit;
+    end;
+    Hs1 := IAlloc(s1); Hs2 := IAlloc(s2);
+    if Hd = Hs1 then
+      IOp(MemForm, Hd, s2)                                          // Hd already holds src1
+    else if Commutative and (Hd = Hs2) then
+      IOp(MemForm, Hd, s1)                                          // Hd holds src2, op commutes
+    else if Hd <> Hs2 then
+    begin
+      ILoadArg(Hd, s1);                                            // Hd <- src1 (extended-safe load)
+      IOp(MemForm, Hd, s2);                                        // Hd := src1 op src2
+    end
+    else
+    begin
+      ILoad(RAX, s1); IOp(MemForm, RAX, s2); IStore(d, RAX);        // non-commutative dest==src2
     end;
   end;
   // Signed div/mod with the interpreter's raise semantics via deopt (JIT J10 pattern).
@@ -2735,9 +2771,9 @@ var
         begin FLoad(XMM0, p1); FStore(d, XMM0); end;
       end;
 
-      ssaAddInt: begin ILoad(RAX, IReg(Cur.Src1)); IOp([$48, $03], RAX, IReg(Cur.Src2)); IStore(IReg(Cur.Dest), RAX); end;
-      ssaSubInt: begin ILoad(RAX, IReg(Cur.Src1)); IOp([$48, $2B], RAX, IReg(Cur.Src2)); IStore(IReg(Cur.Dest), RAX); end;
-      ssaMulInt: begin ILoad(RAX, IReg(Cur.Src1)); IOp([$48, $0F, $AF], RAX, IReg(Cur.Src2)); IStore(IReg(Cur.Dest), RAX); end;
+      ssaAddInt: IntBin([$48, $03], True);
+      ssaSubInt: IntBin([$48, $2B], False);
+      ssaMulInt: IntBin([$48, $0F, $AF], True);
       ssaNegInt: begin ILoad(RAX, IReg(Cur.Src1)); E.EmitBytes([$48, $F7, $D8]); IStore(IReg(Cur.Dest), RAX); end;
       ssaDivInt:  begin apc := NeedPC; if OK then DivModSigned(apc, False); end;
       ssaModInt:  begin apc := NeedPC; if OK then DivModSigned(apc, True); end;
