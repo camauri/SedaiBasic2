@@ -15154,6 +15154,32 @@ var
   Instr: TSSAInstruction;
   TargetBlock: TSSABasicBlock;
   TargetLabel: string;
+
+  // CLASSIC: a jump/GOSUB to a line number that does not exist is NOT a compile error on a
+  // C128 (there is no compile phase) - it raises a trappable ?UNDEF'D STATEMENT ERROR when
+  // the statement executes. The unresolved jump is retargeted to a synthetic block (shared
+  // per missing line) that raises ERR_UNDEFINED_STATEMENT; its instructions carry the
+  // jump's source line so the report reads like the C128's "IN <line>".
+  function GetUndefLineTarget(const MissingLabel: string; SrcLine: Integer): TSSABasicBlock;
+  var
+    UndefLabel: string;
+    SavedBlock: TSSABasicBlock;
+    n: Integer;
+  begin
+    UndefLabel := 'UNDEF_' + MissingLabel;
+    Result := FProgram.FindBlock(UndefLabel);
+    if Assigned(Result) then Exit;
+    Result := FProgram.CreateBlock(UndefLabel);
+    SavedBlock := FCurrentBlock;
+    FCurrentBlock := Result;
+    EmitInstruction(ssaRaiseError, MakeSSAValue(svkNone),
+                   EnsureIntRegister(MakeSSAConstInt(ERR_UNDEFINED_STATEMENT)),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    FCurrentBlock := SavedBlock;
+    for n := 0 to Result.Instructions.Count - 1 do
+      Result.Instructions[n].SourceLine := SrcLine;
+  end;
+
 begin
   {$IFDEF DEBUG_SSA}
   if DebugSSA then
@@ -15198,13 +15224,23 @@ begin
           end;
         end
         // A user GOTO/GOSUB/ON ... (or CALL) to a line number, label or procedure that
-        // was never defined. Without this guard the unresolved label resolves to PC 0 at
+        // was never defined. Without a fix here the unresolved label resolves to PC 0 at
         // bytecode time, sending control back to the program start: that turns a stray
         // GOSUB into an unbounded recursion that overflows the return stack (access
         // violation). Internal compiler labels never carry these prefixes, so the prefix
-        // filter limits the diagnostic to genuine user targets.
+        // filter limits the handling to genuine user targets. A LINE_ target only exists
+        // in CLASSIC, where the faithful C128 behavior is a RUNTIME ?UNDEF'D STATEMENT
+        // (see GetUndefLineTarget); MODERN labels/procedures stay compile errors like fbc.
         else if (Copy(TargetLabel, 1, 5) = 'LINE_') then
-          raise Exception.CreateFmt('Undefined line number: %s', [Copy(TargetLabel, 6, MaxInt)])
+        begin
+          TargetBlock := GetUndefLineTarget(TargetLabel, Instr.SourceLine);
+          Instr.Dest := MakeSSALabel(TargetBlock.LabelName);
+          if Block.Successors.IndexOf(TargetBlock) = -1 then
+          begin
+            Block.AddSuccessor(TargetBlock);
+            TargetBlock.AddPredecessor(Block);
+          end;
+        end
         else if (Copy(TargetLabel, 1, 6) = 'LABEL_') then
           raise Exception.CreateFmt('Undefined label: %s', [Copy(TargetLabel, 7, MaxInt)])
         else if (Copy(TargetLabel, 1, 5) = 'PROC_') then

@@ -32,7 +32,8 @@ uses
   SedaiLexerTypes, SedaiLexerToken, SedaiTokenList, SedaiParserTypes,
   SedaiAST, SedaiParserContext, SedaiParserResults, SedaiParserErrors,
   SedaiPackratCore, SedaiExpressionParser, SedaiParserValidation,
-  SedaiExecutorTypes, SedaiBasicKeywords;
+  SedaiExecutorTypes, SedaiBasicKeywords,
+  SedaiExecutorErrors;  // runtime error codes for the CLASSIC orphan LOOP/WEND/UNTIL raises
 
 type
   // Dialect selection for the parser. pdAuto (default) detects the dialect from the token
@@ -4349,6 +4350,32 @@ begin
     Exit;
   end;
 
+  // CLASSIC runtime rejection, like a real C128 (which has no compile phase at all): a LOOP
+  // with no DO anywhere raises ?LOOP WITHOUT DO and an orphan WEND raises ?SYNTAX - both at
+  // RUNTIME, if and when the statement executes, and both trappable. The statement lowers to
+  // the error raise itself (antErrorStmt with a literal code). MODERN keeps the strict
+  // compile-time rejection below, like fbc.
+  if (not FModernMode) and
+     (((EndKeyword = 'LOOP') and (FDoParseDepth = 0)) or
+      ((EndKeyword = kWEND) and (not FValidationStacks.HasActiveLoop))) then
+  begin
+    Context.Advance; // Consume LOOP/WEND
+    Result := TASTNode.Create(antErrorStmt, Token);
+    if EndKeyword = 'LOOP' then
+      Result.AddChild(TASTNode.CreateWithValue(antLiteral, ERR_LOOP_WITHOUT_DO, Token))
+    else
+      Result.AddChild(TASTNode.CreateWithValue(antLiteral, ERR_SYNTAX, Token));
+    // A trailing UNTIL/WHILE condition on an orphan LOOP is consumed and discarded (the raise
+    // aborts the statement before any condition could matter, exactly like the C128).
+    if Context.Check(ttLoopControl) then
+    begin
+      Context.Advance;
+      ParseExpression.Free;
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
   // CLASSIC: an unmatched NEXT is NOT a compile error on a C128 - it raises ?NEXT WITHOUT FOR
   // at RUNTIME, if and when executed (and it is trappable). Emit the orphan antNext node; the
   // SSA lowers it to the error raise. MODERN keeps the strict compile-time rejection (fbc does).
@@ -4393,8 +4420,17 @@ begin
     Exit;
   end;
 
-  // A bare TO/STEP/UNTIL at statement start is a stray loop-control keyword: consume it
-  // as a no-op statement (legacy tolerance).
+  // A bare TO/STEP/UNTIL at statement start is a stray loop-control keyword. CLASSIC lowers
+  // it to a runtime ?SYNTAX ERROR raise - a C128 accepts the line at entry and errors when it
+  // executes (trappable). MODERN keeps the old no-op tolerance.
+  if not FModernMode then
+  begin
+    Result := TASTNode.Create(antErrorStmt, Token);
+    Result.AddChild(TASTNode.CreateWithValue(antLiteral, ERR_SYNTAX, Token));
+    Context.Advance; // Consume TO/STEP/UNTIL
+    DoNodeCreated(Result);
+    Exit;
+  end;
   Result := TASTNode.Create(antStatement, Token);
   Context.Advance; // Consume TO/STEP/UNTIL
   DoNodeCreated(Result);
@@ -6785,12 +6821,14 @@ begin
   Result := TASTNode.Create(antStatement, Token);
   Context.Advance; // Consume SYS
 
-  // Parse address parameter
+  // Parse and DISCARD the address: sb cannot execute 6502 machine language, so SYS is a
+  // deliberate no-op. The address must not stay attached as a child - antStatement is a
+  // transparent wrapper whose children are processed as STATEMENTS, so a kept address
+  // expression leaked into statement position ("[SSA] WARNING: Unhandled node type 0").
   if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
   begin
     Address := ParseExpression;
-    if Assigned(Address) then
-      Result.AddChild(Address);
+    Address.Free;
   end;
 
   DoNodeCreated(Result);

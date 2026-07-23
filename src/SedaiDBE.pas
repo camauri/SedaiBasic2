@@ -516,11 +516,17 @@ begin
       if IsBlockReferenced(Block) then
       begin
         // This block is referenced - mark it and all following blocks as "keep"
-        // until we hit a block that has explicit control flow (not fallthrough)
+        // until we hit a block that has explicit control flow (not fallthrough).
+        // Each kept block is a DFS SEED, not just a flag: its CFG successors must
+        // survive too. The physical walk alone broke conditional flow inside a
+        // dynamically-reached handler - "IF ER=17 THEN RESUME 200" ends its block
+        // with ssaResume (a chain terminator), so the IF's fall-through/skip block
+        // and every line after it were pruned, leaving the JumpIfZero targeting a
+        // removed block (bytecode jump to -1, control fell into garbage).
         j := i;
         while j < FProgram.Blocks.Count do
         begin
-          FReachable[j] := True;
+          DFS(j);
           Block := FProgram.Blocks[j];
           {$IFDEF DEBUG_DBE}
           if DebugDBE then

@@ -1219,8 +1219,11 @@ begin
             // RESUME [line] - Resume at error line or specified line
             if Ctx.InErrorHandler then
             begin
-              // Check if Src1 contains a line number (non-zero register = line number)
-              if Instr.Src1 <> 0 then
+              // Register form: Immediate = -1 flags "line number in Src1" (register 0 is a
+              // perfectly valid register - the old Src1 <> 0 test alone silently degraded
+              // RESUME <line> to plain RESUME when the line landed in R0). Src1 <> 0 is kept
+              // as a fallback for .basc files predating the flag.
+              if (Instr.Immediate = -1) or (Instr.Src1 <> 0) then
               begin
                 // RESUME <line> - jump to specified line
                 CurPC := FProgram.FindPCForLine(IntRegs[Instr.Src1]);

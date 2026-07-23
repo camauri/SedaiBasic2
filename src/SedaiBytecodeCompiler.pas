@@ -1886,7 +1886,13 @@ begin
   begin
     BCInstr := MakeBytecodeInstruction(bcResume, 0, 0, 0, 0);
     if Instr.Src1.Kind = svkRegister then
-      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version)
+    begin
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+      // Explicit register-form flag: the VM used to discriminate on Src1 > 0, which silently
+      // degraded "RESUME <line>" to a plain RESUME whenever the line number happened to live
+      // in register 0 - the handler resumed at the FAULTING statement and looped forever.
+      BCInstr.Immediate := -1;
+    end
     else if Instr.Src1.Kind = svkConstInt then
       BCInstr.Immediate := Instr.Src1.ConstInt;
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);

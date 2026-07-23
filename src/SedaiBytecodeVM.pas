@@ -4846,15 +4846,18 @@ begin
         // RESUME [line] - Resume at error line or specified line
         if Ctx.InErrorHandler then
         begin
-          if Instr.Immediate > 0 then
-          begin
-            // RESUME <line> with constant line number in Immediate
-            Ctx.PC := FindPCForSourceLine(Instr.Immediate);
-          end
-          else if Instr.Src1 > 0 then
+          // Immediate = -1 flags "line number in Src1" (register 0 is valid - the old
+          // Src1 > 0 test alone silently degraded RESUME <line> to plain RESUME when the
+          // line landed in R0). Src1 > 0 is kept as a fallback for older .basc files.
+          if (Instr.Immediate = -1) or (Instr.Src1 > 0) then
           begin
             // RESUME <line> with line number in register
             Ctx.PC := FindPCForSourceLine(Ctx.IntRegs[Instr.Src1]);
+          end
+          else if Instr.Immediate > 0 then
+          begin
+            // RESUME <line> with constant line number in Immediate
+            Ctx.PC := FindPCForSourceLine(Instr.Immediate);
           end
           else if Ctx.ResumePC >= 0 then
           begin
