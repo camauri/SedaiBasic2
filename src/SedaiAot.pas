@@ -1125,6 +1125,31 @@ var
       ILoad(RAX, s1); IOp(MemForm, RAX, s2); IStore(d, RAX);        // non-commutative dest==src2
     end;
   end;
+  // dest(int) := cvt(src1 float). Op2 is the two opcode bytes after the F2/REX.W prefix
+  // (2D = cvtsd2si round, 2C = cvttsd2si truncate). Writes the dest GPR directly when it has a
+  // home - no xmm0 load, no store - reading src1 as a register or straight from its bank slot.
+  procedure CvtFloatToInt(const Op2: array of Byte);
+  var Hd, hs1, d, s1: Integer; rex: Byte;
+  begin
+    d := IReg(Cur.Dest); s1 := FReg(Cur.Src1); if not OK then Exit;
+    Hd := IAlloc(d);
+    if Hd < 0 then
+    begin
+      FLoad(XMM0, s1);
+      E.EmitBytes([$F2, $48, Op2[0], Op2[1], $C0]);                 // cvt rax, xmm0
+      IStore(d, RAX);
+      Exit;
+    end;
+    rex := $48; if Hd >= 8 then rex := rex or $04;                  // REX.R for extended dest GPR
+    hs1 := FAlloc(s1);
+    E.Emit8($F2); E.Emit8(rex); E.Emit8(Op2[0]); E.Emit8(Op2[1]);
+    if hs1 >= 0 then
+      E.Emit8($C0 or ((Hd and 7) shl 3) or hs1)                     // cvt Hd, xmm_src
+    else
+    begin
+      E.Emit8($80 or ((Hd and 7) shl 3) or RSI); E.Emit32(LongWord(s1) * 8);   // cvt Hd, [rsi+off]
+    end;
+  end;
   // Signed div/mod with the interpreter's raise semantics via deopt (JIT J10 pattern).
   procedure DivModSigned(apc: Integer; WantRemainder: Boolean);
   var p1, p2: Integer;
@@ -2702,6 +2727,8 @@ var
       apc: Integer;
       p1: Integer;
       bits: Int64;
+      Hd, Hs, s1v: Integer;   // in-place unary/conversion: dest home, src home, src VM reg
+      rexb: Byte;
   begin
     // C4: anything the native path does not cover becomes ONE runtime-helper call. Deciding
     // it here, before the case, keeps a single entry point for the fallback - so an op with a
@@ -2774,7 +2801,19 @@ var
       ssaAddInt: IntBin([$48, $03], True);
       ssaSubInt: IntBin([$48, $2B], False);
       ssaMulInt: IntBin([$48, $0F, $AF], True);
-      ssaNegInt: begin ILoad(RAX, IReg(Cur.Src1)); E.EmitBytes([$48, $F7, $D8]); IStore(IReg(Cur.Dest), RAX); end;
+      ssaNegInt:
+      begin
+        d := IReg(Cur.Dest); s1v := IReg(Cur.Src1); if not OK then Exit;
+        Hd := IAlloc(d);
+        if Hd >= 0 then
+        begin
+          if IAlloc(s1v) <> Hd then ILoadArg(Hd, s1v);              // Hd <- src1 (skip if already there)
+          rexb := $48; if Hd >= 8 then rexb := rexb or $01;         // REX.B
+          E.Emit8(rexb); E.Emit8($F7); E.Emit8($D8 or (Hd and 7));  // neg Hd (in place)
+        end
+        else
+        begin ILoad(RAX, s1v); E.EmitBytes([$48, $F7, $D8]); IStore(d, RAX); end;
+      end;
       ssaDivInt:  begin apc := NeedPC; if OK then DivModSigned(apc, False); end;
       ssaModInt:  begin apc := NeedPC; if OK then DivModSigned(apc, True); end;
       ssaDivUInt: begin apc := NeedPC; if OK then DivModUnsigned(apc, False); end;
@@ -2804,49 +2843,62 @@ var
       end;
       ssaNegFloat:
       begin
-        FLoad(XMM0, FReg(Cur.Src1));
+        d := FReg(Cur.Dest); s1v := FReg(Cur.Src1); if not OK then Exit;
+        Hd := FAlloc(d);
         MovImm64(RAX, Int64($8000000000000000));
-        E.EmitBytes([$66, $48, $0F, $6E, $C8]);        // movq xmm1, rax
-        E.EmitBytes([$66, $0F, $57, $C1]);             // xorpd xmm0, xmm1
-        FStore(FReg(Cur.Dest), XMM0);
+        E.EmitBytes([$66, $48, $0F, $6E, $C8]);        // movq xmm1, rax (sign mask)
+        if Hd >= 0 then
+        begin
+          FLoad(Hd, s1v);                              // Hd <- src1 (movaps; skipped if Hd==src1 home)
+          E.EmitBytes([$66, $0F, $57, $C0 or (Hd shl 3) or 1]);   // xorpd Hd, xmm1 (in place)
+        end
+        else
+        begin
+          FLoad(XMM0, s1v);
+          E.EmitBytes([$66, $0F, $57, $C1]);           // xorpd xmm0, xmm1
+          FStore(d, XMM0);
+        end;
       end;
       ssaMathSqr:
       begin
-        FLoad(XMM0, FReg(Cur.Src1));
+        d := FReg(Cur.Dest); s1v := FReg(Cur.Src1); if not OK then Exit;
+        Hd := FAlloc(d);
         if not Modern then
         begin
           // CLASSIC raises on Sqr(neg): sign bit set (incl. -0.0, where the interpreter
-          // is also the safe path) -> deopt.
+          // is also the safe path) -> deopt. Needs src1 in xmm0 for the check, so scratch path.
+          FLoad(XMM0, s1v);
           apc := NeedPC; if not OK then Exit;
           E.EmitBytes([$66, $48, $0F, $7E, $C0]);      // movq rax, xmm0
           E.EmitBytes([$48, $85, $C0]);                // test rax, rax
           E.EmitBytes([$79, $00]); p1 := E.Len - 1;    // jns +ok
           ExitTo(apc);
           E.PatchByte(p1, Byte(E.Len - (p1 + 1)));
-        end;
-        E.EmitBytes([$F2, $0F, $51, $C0]);             // sqrtsd xmm0, xmm0
-        FStore(FReg(Cur.Dest), XMM0);
+          E.EmitBytes([$F2, $0F, $51, $C0]);           // sqrtsd xmm0, xmm0
+          FStore(d, XMM0);
+        end
+        else if Hd >= 0 then
+          FOp([$F2, $0F, $51], Hd, s1v)                // sqrtsd Hd, <src1>  (2-operand, in place)
+        else
+        begin FLoad(XMM0, s1v); E.EmitBytes([$F2, $0F, $51, $C0]); FStore(d, XMM0); end;
       end;
 
       ssaIntToFloat:
       begin
+        d := FReg(Cur.Dest); if not OK then Exit;
+        Hd := FAlloc(d);
         ILoad(RAX, IReg(Cur.Src1));
-        E.EmitBytes([$F2, $48, $0F, $2A, $C0]);        // cvtsi2sd xmm0, rax
-        FStore(FReg(Cur.Dest), XMM0);
+        if Hd >= 0 then
+          E.EmitBytes([$F2, $48, $0F, $2A, $C0 or (Hd shl 3)])   // cvtsi2sd Hd, rax (in place)
+        else
+        begin E.EmitBytes([$F2, $48, $0F, $2A, $C0]); FStore(d, XMM0); end;
       end;
       ssaFloatToInt:
       begin
-        FLoad(XMM0, FReg(Cur.Src1));
-        if Modern then E.EmitBytes([$F2, $48, $0F, $2D, $C0])   // cvtsd2si (round-to-even)
-        else E.EmitBytes([$F2, $48, $0F, $2C, $C0]);            // cvttsd2si (truncate)
-        IStore(IReg(Cur.Dest), RAX);
+        if Modern then CvtFloatToInt([$0F, $2D])       // cvtsd2si (round-to-even)
+        else CvtFloatToInt([$0F, $2C]);                // cvttsd2si (truncate)
       end;
-      ssaFloatRound:
-      begin
-        FLoad(XMM0, FReg(Cur.Src1));
-        E.EmitBytes([$F2, $48, $0F, $2D, $C0]);        // cvtsd2si (CINT: round-to-even)
-        IStore(IReg(Cur.Dest), RAX);
-      end;
+      ssaFloatRound: CvtFloatToInt([$0F, $2D]);        // CINT: round-to-even
       ssaNarrowSingle:
       begin
         FLoad(XMM0, FReg(Cur.Src1));
