@@ -193,6 +193,10 @@ var
   AotDiagFloatTotal: Int64 = 0;
   AotDiagIntResident: Int64 = 0;
   AotDiagIntTotal: Int64 = 0;
+  // Simulated resident traffic under a linear-scan (live-range) allocator with the same pool
+  // size - the go/no-go for building the real thing. Conservative lower bound (see the sim).
+  AotDiagFloatLinScan: Int64 = 0;
+  AotDiagIntLinScan: Int64 = 0;
   AotDiagLivenessOK: Boolean = False;
   // C3: runtime-helper calls emitted in the last region. Also the coverage delta this stage
   // bought: a region reporting helpers>0 is one that could not compile at all before, since
@@ -1588,7 +1592,83 @@ var
     UseI, DefI, InI, OutI: array of array of Boolean;
     UseF, DefF, InF, OutF: array of array of Boolean;
     CurLiveI, CurLiveF: array of Boolean;             // mid-block live set (peak measurement)
-    used: array of Boolean; kk, bestr: Integer; bestv, totF, topF, totI, topI: Int64;  // TEMP payoff probe
+    used: array of Boolean; kk, bestr: Integer; bestv, totF, topF, totI, topI: Int64;  // payoff probe
+
+    // Linear-scan RESIDENCY SIMULATION for one bank: how much loop-weighted register use a real
+    // live-range allocator with `nregs` machine registers would keep resident, versus the static
+    // top-nregs the AOT pins today. Model: interval per slot = [first touch .. last touch] in
+    // region emission order (linear, so it over-approximates liveness across control flow -> more
+    // pressure -> the reclaim it reports is a LOWER BOUND); greedy scan, on overflow evict the
+    // active slot with the least loop-weighted use (whole-interval spill, another conservatism).
+    function LinScanResident(isFloat: Boolean; maxr, nregs: Integer): Int64;
+    var
+      first, last, ordr, active: array of Integer;
+      spilled: array of Boolean;
+      nord, activeCount, pp, bb, jj, a, w, mi, ins2, rr, tmp: Integer;
+      B2: TSSABasicBlock; I2: TSSAInstruction;
+
+      function Wt(r: Integer): Integer; inline;
+      begin if isFloat then Wt := FUse[r] else Wt := IUse[r]; end;
+
+      procedure Touch(const V: TSSAValue; atPos: Integer);
+      var q: Integer;
+      begin
+        if V.Kind <> svkRegister then Exit;
+        if isFloat then begin if V.RegType <> srtFloat then Exit; q := Prog.AotRemapFloatReg(V.RegIndex); end
+        else begin if V.RegType <> srtInt then Exit; q := Prog.AotRemapIntReg(V.RegIndex); end;
+        if (q < 0) or (q > maxr) then Exit;
+        if atPos < first[q] then first[q] := atPos;
+        if atPos > last[q] then last[q] := atPos;
+      end;
+    begin
+      LinScanResident := 0;
+      if maxr < 0 then Exit;
+      SetLength(first, maxr + 1); SetLength(last, maxr + 1); SetLength(spilled, maxr + 1);
+      for rr := 0 to maxr do begin first[rr] := MaxInt; last[rr] := -1; spilled[rr] := False; end;
+      // Assign a linear position to every instruction and record each slot's touch span.
+      pp := 0;
+      for bb := 0 to nb - 1 do
+      begin
+        B2 := SSAProg.Blocks[Region.FirstBlock + bb];
+        for jj := 0 to B2.Instructions.Count - 1 do
+        begin
+          I2 := B2.Instructions[jj];
+          Touch(I2.Src1, pp); Touch(I2.Src2, pp); Touch(I2.Src3, pp); Touch(I2.Dest, pp);
+          for a := 0 to High(I2.PhiSources) do Touch(I2.PhiSources[a].Value, pp);
+          Inc(pp);
+        end;
+      end;
+      // Order the touched slots by interval start.
+      nord := 0; SetLength(ordr, maxr + 1);
+      for rr := 0 to maxr do if last[rr] >= 0 then begin ordr[nord] := rr; Inc(nord); end;
+      for a := 1 to nord - 1 do                                  // insertion sort by first[]
+      begin
+        tmp := ordr[a]; w := a - 1;
+        while (w >= 0) and (first[ordr[w]] > first[tmp]) do begin ordr[w + 1] := ordr[w]; Dec(w); end;
+        ordr[w + 1] := tmp;
+      end;
+      // Greedy linear scan.
+      SetLength(active, nregs + 1); activeCount := 0;
+      for a := 0 to nord - 1 do
+      begin
+        rr := ordr[a];
+        w := 0;                                                  // expire intervals that ended
+        for ins2 := 0 to activeCount - 1 do
+          if last[active[ins2]] >= first[rr] then begin active[w] := active[ins2]; Inc(w); end;
+        activeCount := w;
+        if activeCount < nregs then begin active[activeCount] := rr; Inc(activeCount); end
+        else
+        begin
+          mi := 0;                                               // evict the least-used live slot
+          for ins2 := 1 to activeCount - 1 do
+            if Wt(active[ins2]) < Wt(active[mi]) then mi := ins2;
+          if Wt(rr) > Wt(active[mi]) then begin spilled[active[mi]] := True; active[mi] := rr; end
+          else spilled[rr] := True;
+        end;
+      end;
+      for rr := 0 to maxr do
+        if (last[rr] >= 0) and not spilled[rr] then LinScanResident := LinScanResident + Wt(rr);
+    end;
 
     // Mark an operand read as live in the mid-block replay set (diagnostic only).
     procedure MidMarkUse(const V: TSSAValue; var LiveI, LiveF: array of Boolean);
@@ -1807,6 +1887,8 @@ var
     end;
     AotDiagFloatResident := topF; AotDiagFloatTotal := totF;
     AotDiagIntResident := topI; AotDiagIntTotal := totI;
+    AotDiagFloatLinScan := LinScanResident(True, MaxFReg, 6);
+    AotDiagIntLinScan := LinScanResident(False, MaxIReg, 7);
     AotDiagLivenessOK := LivenessOK;
   end;
 
@@ -2683,13 +2765,15 @@ begin
         if AotDiagHelperOps <> '' then
           WriteLn(ErrOutput, '[AOT]   helper ops: ' + AotDiagHelperOps);
         if AotDiagFloatTotal > 0 then
-          WriteLn(ErrOutput, Format('[AOT]   float traffic: resident=%d spilled-tail=%d (%.1f%% memory-resident)',
-            [AotDiagFloatResident, AotDiagFloatTotal - AotDiagFloatResident,
-             100.0 * (AotDiagFloatTotal - AotDiagFloatResident) / AotDiagFloatTotal]));
+          WriteLn(ErrOutput, Format('[AOT]   float traffic: static-resident=%d (%.1f%% mem) -> linscan-resident=%d (%.1f%% mem)  recovers %.1f%% of tail',
+            [AotDiagFloatResident, 100.0 * (AotDiagFloatTotal - AotDiagFloatResident) / AotDiagFloatTotal,
+             AotDiagFloatLinScan, 100.0 * (AotDiagFloatTotal - AotDiagFloatLinScan) / AotDiagFloatTotal,
+             100.0 * (AotDiagFloatLinScan - AotDiagFloatResident) / (AotDiagFloatTotal - AotDiagFloatResident + 0.0001)]));
         if AotDiagIntTotal > 0 then
-          WriteLn(ErrOutput, Format('[AOT]   int traffic:   resident=%d spilled-tail=%d (%.1f%% memory-resident)',
-            [AotDiagIntResident, AotDiagIntTotal - AotDiagIntResident,
-             100.0 * (AotDiagIntTotal - AotDiagIntResident) / AotDiagIntTotal]));
+          WriteLn(ErrOutput, Format('[AOT]   int traffic:   static-resident=%d (%.1f%% mem) -> linscan-resident=%d (%.1f%% mem)  recovers %.1f%% of tail',
+            [AotDiagIntResident, 100.0 * (AotDiagIntTotal - AotDiagIntResident) / AotDiagIntTotal,
+             AotDiagIntLinScan, 100.0 * (AotDiagIntTotal - AotDiagIntLinScan) / AotDiagIntTotal,
+             100.0 * (AotDiagIntLinScan - AotDiagIntResident) / (AotDiagIntTotal - AotDiagIntResident + 0.0001)]));
       end;
     end
     else if Diag then
