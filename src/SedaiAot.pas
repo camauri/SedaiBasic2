@@ -747,6 +747,15 @@ var
   DynFFree: array of array of Integer;  // region position -> VM float regs whose last touch is here
   DynFCur: array[0..7] of Integer;      // xmm index -> VM float reg currently resident there (-1 free)
   DynPos: Integer;                      // running region position during emission
+  // Same scheme for integers (c). The GPR pool r9..r15 is shared with the array-descriptor cache,
+  // so the dynamic pool is IntPool MINUS the GPRs Allocate handed to array bases/counts; those
+  // stay pinned for the whole invocation. Scratch is rax/rcx/rdx (never in the pool), the GPR
+  // analogue of xmm0/xmm1 for floats.
+  DynIActive: Boolean;
+  DynIHomeReg: array of Integer;        // region position -> VM int reg defined here that gets a home (-1)
+  DynIHomeGpr: array of Integer;        // region position -> the GPR (R9..R15) assigned to it
+  DynIFree: array of array of Integer;  // region position -> VM int regs whose last touch is here
+  DynICur: array[0..15] of Integer;     // GPR number -> VM int reg currently resident there (-1 free)
 
   procedure Fail(const Why: string);
   begin
@@ -841,10 +850,36 @@ var
       if DynFCur[x] >= 0 then
         E.MemOp([$F2, $0F, $10], x, RSI, LongWord(DynFCur[x]) * 8);   // movsd xmm x, [rsi+reg*8]
   end;
+  // AOT_DYNF int counterpart: store / reload the dynamically-resident int temps through the int
+  // bank (rbx). Pool GPRs are r9..r15; the store/load helpers bake the right REX for extended regs.
+  // mov [rbx+reg*8], g / mov g, [rbx+reg*8] emitted raw (StoreRegMem/LoadRegMem are defined below
+  // this point; the pool GPRs are all >= r8 so REX.R is always set).
+  procedure FlushResidentI;
+  var g: Integer;
+  begin
+    if not DynIActive then Exit;
+    for g := R9 to R15 do
+      if DynICur[g] >= 0 then
+      begin
+        E.Emit8($4C); E.Emit8($89);                                    // REX.WR, mov r/m,r
+        E.Emit8($80 or ((g and 7) shl 3) or RBX); E.Emit32(LongWord(DynICur[g]) * 8);
+      end;
+  end;
+  procedure ReloadResidentI;
+  var g: Integer;
+  begin
+    if not DynIActive then Exit;
+    for g := R9 to R15 do
+      if DynICur[g] >= 0 then
+      begin
+        E.Emit8($4C); E.Emit8($8B);                                    // REX.WR, mov r,r/m
+        E.Emit8($80 or ((g and 7) shl 3) or RBX); E.Emit32(LongWord(DynICur[g]) * 8);
+      end;
+  end;
 
   procedure ExitTo(apc: Integer);
   begin
-    FlushResidentF;                                 // dynamic float temps -> banks (epilogue won't)
+    FlushResidentF; FlushResidentI;                 // dynamic temps -> banks (epilogue won't)
     E.EmitBytes([$B8]); E.Emit32(LongWord(apc));   // mov eax, apc
     JmpRel(-1);                                     // jmp epilogue
   end;
@@ -1156,7 +1191,7 @@ var
       StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
-    FlushResidentF;                                              // AOT_DYNF: dynamic float temps too
+    FlushResidentF; FlushResidentI;                             // AOT_DYNF: dynamic temps too
 
     // 2. Arguments, all read from the ctx record BEFORE r8 is clobbered - it is an argument
     //    register on Win64 (arg2) and volatile on both ABIs. arg3 is the ctx record itself, so
@@ -1179,7 +1214,7 @@ var
       LoadRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       E.MemOp([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
-    ReloadResidentF;                                             // AOT_DYNF: dynamic float temps too
+    ReloadResidentF; ReloadResidentI;                           // AOT_DYNF: dynamic temps too
     ReloadArrayCache;
 
     // 5. Continue natively only if the helper landed exactly where this code expects.
@@ -1206,7 +1241,7 @@ var
       StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
-    FlushResidentF;                                           // AOT_DYNF: dynamic float temps too
+    FlushResidentF; FlushResidentI;                           // AOT_DYNF: dynamic temps too
     // 2. Arguments. Read the primitive address from the ctx BEFORE any argument setup can
     //    clobber r8 (it is arg2 on Win64 and volatile on both ABIs) - the C5 concat lesson.
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_CALLSUB);              // rax  = ctx.CallSub
@@ -1229,7 +1264,7 @@ var
       LoadRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       E.MemOp([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
-    ReloadResidentF;                                          // AOT_DYNF: dynamic float temps too
+    ReloadResidentF; ReloadResidentI;                         // AOT_DYNF: dynamic temps too
     ReloadArrayCache;
   end;
 
@@ -1249,7 +1284,7 @@ var
     for k := 0 to NFAlloc - 1 do
       if not XmmIsCalleeSaved(FLoc[FAllocd[k]]) then
         E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
-    FlushResidentF;
+    FlushResidentF; FlushResidentI;
   end;
   procedure ReloadVolatiles;
   var k: Integer;
@@ -1268,7 +1303,7 @@ var
     FrameLoad(R8, SlotCtxSave);
     FrameLoad(RSI, SlotFltSave);
     ReloadVolatiles;
-    ReloadResidentF;
+    ReloadResidentF; ReloadResidentI;
   end;
 
   // C5: bcCmp*String lowered to a leaf call to AotStrCmp. Kind 0=Eq 1=Ne 2=Lt 3=Gt. The two
@@ -2383,7 +2418,10 @@ var
       for i2 := 0 to B2.Instructions.Count - 1 do
       begin
         Ins2 := B2.Instructions[i2];
-        if (Ins2.OpCode = ssaDivFloat) or (Ins2.OpCode = ssaMathSqr) then Exit(False);
+        case Ins2.OpCode of
+          ssaDivFloat, ssaMathSqr,
+          ssaDivInt, ssaModInt, ssaDivUInt, ssaModUInt: Exit(False);   // ~20-40 cycle latency
+        end;
       end;
     end;
     Result := True;
@@ -2483,6 +2521,114 @@ var
     for r := 0 to MaxFReg do FLoc[r] := -1;            // drop static float homes; go fully dynamic
     NFAlloc := 0;
     SaveX6 := used6; SaveX7 := used7;
+  end;
+
+  // (c) Integer counterpart of PlanDynFloat. Identical scheme; the only difference is the pool:
+  // r9..r15 MINUS the GPRs Allocate pinned to array descriptors (ACacheReg), which stay reserved
+  // for the whole invocation. Scratch stays rax/rcx/rdx. Overrides the static int homes on
+  // activation but leaves the array cache alone.
+  procedure PlanDynInt;
+  var
+    totpos, nbk, bi, kk, pp, r, a, x, xf, mode, np: Integer;
+    Blk: TSSABasicBlock; Ins: TSSAInstruction;
+    blkOf, firstDef, firstUse, lastTouch, cand, poolG, activeG: array of Integer;
+    ncand: Integer; usedAny, isDef, taken: Boolean;
+
+    procedure Note(const V: TSSAValue; pos: Integer; asDef: Boolean);
+    var q: Integer;
+    begin
+      if (V.Kind <> svkRegister) or (V.RegType <> srtInt) then Exit;
+      q := Prog.AotRemapIntReg(V.RegIndex);
+      if (q < 0) or (q > MaxIReg) then Exit;
+      if blkOf[q] = -1 then blkOf[q] := bi else if blkOf[q] <> bi then blkOf[q] := -2;
+      if pos > lastTouch[q] then lastTouch[q] := pos;
+      if asDef then begin if pos < firstDef[q] then firstDef[q] := pos; end
+      else begin if pos < firstUse[q] then firstUse[q] := pos; end;
+    end;
+
+  begin
+    DynIActive := False;
+    for a := 0 to 15 do DynICur[a] := -1;
+    mode := AotDynFloatMode;
+    if mode = 2 then Exit;
+    if MaxIReg < 0 then Exit;
+    if (mode = 0) and not RegionThroughputBound then Exit;
+
+    // Build the dynamic pool: IntPool GPRs not reserved by the array-descriptor cache.
+    SetLength(poolG, Length(IntPool)); np := 0;
+    for a := 0 to High(IntPool) do
+    begin
+      taken := False;
+      for kk := 0 to NACache - 1 do if ACacheReg[kk] = IntPool[a] then begin taken := True; Break; end;
+      if not taken then begin poolG[np] := IntPool[a]; Inc(np); end;
+    end;
+    if np = 0 then Exit;
+    SetLength(poolG, np); SetLength(activeG, np);
+
+    nbk := Region.LastBlock - Region.FirstBlock + 1;
+    totpos := 0;
+    for bi := 0 to nbk - 1 do Inc(totpos, SSAProg.Blocks[Region.FirstBlock + bi].Instructions.Count);
+    if totpos = 0 then Exit;
+
+    SetLength(blkOf, MaxIReg + 1); SetLength(firstDef, MaxIReg + 1);
+    SetLength(firstUse, MaxIReg + 1); SetLength(lastTouch, MaxIReg + 1);
+    for r := 0 to MaxIReg do begin blkOf[r] := -1; firstDef[r] := MaxInt; firstUse[r] := MaxInt; lastTouch[r] := -1; end;
+
+    pp := 0;
+    for bi := 0 to nbk - 1 do
+    begin
+      Blk := SSAProg.Blocks[Region.FirstBlock + bi];
+      for kk := 0 to Blk.Instructions.Count - 1 do
+      begin
+        Ins := Blk.Instructions[kk];
+        Note(Ins.Src1, pp, False); Note(Ins.Src2, pp, False); Note(Ins.Src3, pp, False);
+        for a := 0 to High(Ins.PhiSources) do Note(Ins.PhiSources[a].Value, pp, False);
+        isDef := not ((Ins.OpCode = ssaArrayStore) or (Ins.OpCode = ssaPrint) or (Ins.OpCode = ssaPrintLn) or
+                      (Ins.OpCode = ssaXferStoreInt) or (Ins.OpCode = ssaXferStoreFloat));
+        Note(Ins.Dest, pp, isDef);
+        Inc(pp);
+      end;
+    end;
+
+    SetLength(DynIHomeReg, totpos); SetLength(DynIHomeGpr, totpos); SetLength(DynIFree, totpos);
+    for pp := 0 to totpos - 1 do begin DynIHomeReg[pp] := -1; SetLength(DynIFree[pp], 0); end;
+
+    usedAny := False;
+    for bi := 0 to nbk - 1 do
+    begin
+      Blk := SSAProg.Blocks[Region.FirstBlock + bi];
+      ncand := 0; SetLength(cand, MaxIReg + 1);
+      for r := 0 to MaxIReg do
+        if (blkOf[r] = bi) and (firstDef[r] < MaxInt) and (firstUse[r] < MaxInt) and (firstDef[r] < firstUse[r]) then
+        begin cand[ncand] := r; Inc(ncand); end;
+      for a := 1 to ncand - 1 do
+      begin
+        x := cand[a]; kk := a - 1;
+        while (kk >= 0) and (firstDef[cand[kk]] > firstDef[x]) do begin cand[kk + 1] := cand[kk]; Dec(kk); end;
+        cand[kk + 1] := x;
+      end;
+      for x := 0 to np - 1 do activeG[x] := -1;
+      for a := 0 to ncand - 1 do
+      begin
+        r := cand[a];
+        for x := 0 to np - 1 do
+          if (activeG[x] >= 0) and (lastTouch[activeG[x]] < firstDef[r]) then activeG[x] := -1;
+        xf := -1;
+        for x := 0 to np - 1 do if activeG[x] < 0 then begin xf := x; Break; end;
+        if xf < 0 then System.Continue;
+        activeG[xf] := r;
+        DynIHomeReg[firstDef[r]] := r; DynIHomeGpr[firstDef[r]] := poolG[xf];
+        SetLength(DynIFree[lastTouch[r]], Length(DynIFree[lastTouch[r]]) + 1);
+        DynIFree[lastTouch[r]][High(DynIFree[lastTouch[r]])] := r;
+        usedAny := True;
+        if poolG[xf] >= R12 then SaveGpr[poolG[xf]] := True;
+      end;
+    end;
+
+    if not usedAny then Exit;
+    DynIActive := True;
+    for r := 0 to MaxIReg do ILoc[r] := -1;            // drop static int homes; array cache stays
+    NIAlloc := 0;
   end;
 
   procedure EmitInstruction;
@@ -2848,6 +2994,7 @@ begin
   SetLength(IAllocd, Length(IntPool)); SetLength(FAllocd, 6);
   Allocate;
   PlanDynFloat;   // AOT_DYNF: may replace the static float homes with a within-block dynamic schedule
+  PlanDynInt;     // AOT_DYNF (c): same for the integer GPR pool (minus the array-descriptor cache)
 
   HelperOps := TStringList.Create;
 
@@ -2924,16 +3071,21 @@ begin
         Cur := Blk.Instructions[j];
         CurBlkIdx := b;
         CurIsBlockLast := j = Blk.Instructions.Count - 1;
-        // AOT_DYNF start event: the temp defined here becomes resident in its xmm BEFORE the
-        // instruction is emitted, so its defining FStore writes that xmm.
+        // AOT_DYNF start event: the temp defined here becomes resident in its home BEFORE the
+        // instruction is emitted, so its defining store writes that register.
         if DynFActive and (DynFHomeReg[DynPos] >= 0) then
         begin
           FLoc[DynFHomeReg[DynPos]] := DynFHomeXmm[DynPos];
           DynFCur[DynFHomeXmm[DynPos]] := DynFHomeReg[DynPos];
         end;
+        if DynIActive and (DynIHomeReg[DynPos] >= 0) then
+        begin
+          ILoc[DynIHomeReg[DynPos]] := DynIHomeGpr[DynPos];
+          DynICur[DynIHomeGpr[DynPos]] := DynIHomeReg[DynPos];
+        end;
         EmitInstruction;
         if not OK then Exit;
-        // AOT_DYNF free events: temps whose last touch was this instruction leave their xmm
+        // AOT_DYNF free events: temps whose last touch was this instruction leave their home
         // AFTER it is emitted (the last use has just read them). No bank store - they are dead.
         if DynFActive then
           for k := 0 to High(DynFFree[DynPos]) do
@@ -2941,6 +3093,13 @@ begin
             w := FLoc[DynFFree[DynPos][k]];
             if (w >= 0) and (DynFCur[w] = DynFFree[DynPos][k]) then DynFCur[w] := -1;
             FLoc[DynFFree[DynPos][k]] := -1;
+          end;
+        if DynIActive then
+          for k := 0 to High(DynIFree[DynPos]) do
+          begin
+            w := ILoc[DynIFree[DynPos][k]];
+            if (w >= 0) and (DynICur[w] = DynIFree[DynPos][k]) then DynICur[w] := -1;
+            ILoc[DynIFree[DynPos][k]] := -1;
           end;
         Inc(DynPos);
         Inc(CurOrd);
