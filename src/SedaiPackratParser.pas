@@ -6458,6 +6458,20 @@ begin
     Result.Attributes.Values['HASPOS'] := '1';
     Result.AddChild(P);   // child 2 = position
   end;
+  // Optional COUNT ("Get #f, , *p, 5"): consumed and attached, so it can never leak into
+  // statement position as a stray literal ("[SSA] WARNING: Unhandled node type 0"). The
+  // counted-transfer SEMANTICS (N elements into raw memory / whole arrays) is the pending
+  // Random-Access family work; until then the count is evaluated and its value unused.
+  if Context.Check(ttSeparParam) then
+  begin
+    Context.Advance;
+    P := ParseExpression;
+    if Assigned(P) then
+    begin
+      Result.Attributes.Values['HASCOUNT'] := '1';
+      Result.AddChild(P);   // last child = count
+    end;
+  end;
   DoNodeCreated(Result);
 end;
 
