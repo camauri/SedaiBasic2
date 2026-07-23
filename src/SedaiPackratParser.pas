@@ -8316,6 +8316,17 @@ begin
   else if (KwU = 'DEFSNG') or (KwU = 'DEFDBL') then Bank := 1
   else Bank := 0;   // DEFINT/DEFLNG/DEFBYTE/DEFSHORT/DEFLNGINT -> int bank
   Result := TASTNode.CreateWithValue(antDefType, Bank, Token);
+  // The SPECIFIC type matters beyond the bank: Len/SizeOf of a def-typed variable report the
+  // declared width (DefLng x -> Len(x) = 4, not 8). Carried as an attribute for the SSA.
+  if KwU = 'DEFLNG' then Result.Attributes.Values['TYPENAME'] := 'LONG'
+  else if KwU = 'DEFSNG' then Result.Attributes.Values['TYPENAME'] := 'SINGLE'
+  else if KwU = 'DEFDBL' then Result.Attributes.Values['TYPENAME'] := 'DOUBLE'
+  else if KwU = 'DEFBYTE' then Result.Attributes.Values['TYPENAME'] := 'BYTE'
+  else if KwU = 'DEFSHORT' then Result.Attributes.Values['TYPENAME'] := 'SHORT'
+  else if KwU = 'DEFLNGINT' then Result.Attributes.Values['TYPENAME'] := 'LONGINT'
+  else if KwU = 'DEFUINT' then Result.Attributes.Values['TYPENAME'] := 'UINTEGER'
+  else if KwU = 'DEFSTR' then Result.Attributes.Values['TYPENAME'] := 'STRING'
+  else Result.Attributes.Values['TYPENAME'] := 'INTEGER';   // DEFINT
   Context.Advance;  // consume DEFxxx
   Letters := '';
   while Context.Check(ttIdentifier) and (Length(Context.CurrentToken.Value) > 0) do

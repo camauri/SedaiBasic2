@@ -234,6 +234,7 @@ type
     FUnsigned64Arrays: TStringList;      // array names (UPPER) whose element type is UInteger/ULongInt (unsigned-64)
     FSwapTempSeq: Integer;               // SWAP: unique counter for synthesized snapshot temp names
     FDefTypeBank: array['A'..'Z'] of Integer;  // DEFINT/DEFSTR...: initial letter -> bank (0/1/2), -1=unset
+    FDefTypeName: array['A'..'Z'] of string;   // ...and the SPECIFIC type name ('LONG', 'SINGLE'...) for Len/SizeOf widths
     FInDispatcher: Boolean;              // M6: true while emitting a virtual dispatcher (skip shared sync)
     FBlockHandledVars: TStringList;      // M8: var names destructed block-scoped (excluded from frame/module dtors)
     FCurrentTopLevelLabels: TStringList;  // GOTO-unwind: names of labels at block-depth 0 in the current frame
@@ -475,6 +476,7 @@ type
     function BuiltinFuncPtrOpId(const NameU: string): Integer;          // @Sin/@Cos/... math-builtin funcptr op id (0 if not a builtin)
     function MathConstValue(const NameU: string; out V: Double): Boolean;  // crt/math.bi constants (M_PI, M_E, ...)
     procedure RecordVarWidth(const VarName, TypeName: string);          // B1.5 phase 2: remember a var's width
+    function DeclaredScalarLenBytes(const Name: string): Int64;         // Len(numeric var) = declared type size; -1 = keep the string path
     // Print form of a name declared INSIDE a procedure, recorded under "PROC|NAME" (kind 0 included).
     procedure SetPrintKindScoped(const ProcName, VarName, TypeName: string);
     procedure RecordSharedScalarType(const VarName, TypeName: string);       // DIM SHARED never recorded its type (print form + narrow width)
@@ -890,7 +892,7 @@ begin
   FDeclaredNames.Duplicates := dupIgnore;
   FModernMode := False;            // default CLASSIC; the compile driver flips this for MODERN sources
   SetLength(FScopeStack, 0);
-  for DefCh := 'A' to 'Z' do FDefTypeBank[DefCh] := -1;  // DEFtype: no default-by-letter initially
+  for DefCh := 'A' to 'Z' do begin FDefTypeBank[DefCh] := -1; FDefTypeName[DefCh] := ''; end;  // DEFtype: no default-by-letter initially
 end;
 
 destructor TSSAGenerator.Destroy;
@@ -3267,6 +3269,17 @@ begin
             begin
               Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
               EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(TempStr)),
+                              MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              Exit;
+            end;
+            // LEN of a declared NUMERIC/pointer variable is the SIZE of its declared type
+            // (fbc: Byte->1, Short->2, Integer->8, Single->4, Ptr->8...), NOT a string length.
+            // The old fallthrough coerced the number to a string and answered 1.
+            TempInt := DeclaredScalarLenBytes(TempStr);
+            if TempInt >= 0 then
+            begin
+              Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TempInt),
                               MakeSSAValue(svkNone), MakeSSAValue(svkNone));
               Exit;
             end;
@@ -8010,17 +8023,24 @@ end;
 procedure TSSAGenerator.ProcessDefType(Node: TASTNode);
 // DEFINT/DEFSTR... : record the default bank for each covered initial letter. Consulted by
 // GetVariableType for a bare name (no suffix / no explicit type) declared after this point.
+// The SPECIFIC type name (TYPENAME attribute) is kept too: Len of a def-typed variable
+// reports that type's width (DefLng x -> 4), which the bank alone cannot tell.
 var
   Bank, i: Integer;
-  Letters: string;
+  Letters, TypeName: string;
   c: Char;
 begin
   Bank := Integer(Node.Value);
   Letters := Node.Attributes.Values['LETTERS'];
+  TypeName := Node.Attributes.Values['TYPENAME'];
   for i := 1 to Length(Letters) do
   begin
     c := UpCase(Letters[i]);
-    if (c >= 'A') and (c <= 'Z') then FDefTypeBank[c] := Bank;
+    if (c >= 'A') and (c <= 'Z') then
+    begin
+      FDefTypeBank[c] := Bank;
+      FDefTypeName[c] := TypeName;
+    end;
   end;
 end;
 
@@ -15646,6 +15666,44 @@ begin
     5, 6: Result := 4;
   else   Result := 8;
   end;
+end;
+
+function TSSAGenerator.DeclaredScalarLenBytes(const Name: string): Int64;
+// FreeBASIC Len(v) of a declared NUMERIC or POINTER scalar is SizeOf of its DECLARED type
+// (fbc-verified, examples/manual/variable/dim: Byte->1, Short->2, Integer->8, Single->4,
+// any Ptr->8, Boolean->1). Returns -1 when Len must keep the string-length path: string bank
+// (variable/fixed-length strings measure their content), arrays, undeclared names, CLASSIC
+// (v7 LEN is string-only). The declared kind is reassembled from the same registries the
+// store-narrowing and print machinery maintain: FPointerVars, FVarWidthCode (1..7 = the
+// sub-64-bit kinds + Single), FVarPrintKind (1 = Boolean); a declared wide numeric is 8.
+var
+  Nm: string;
+  idx: Integer;
+begin
+  Result := -1;
+  if not FModernMode then Exit;
+  Nm := UpperCase(Name);
+  if (not IsDeclaredVariable(Nm)) or (ArrayIndexOf(Nm) >= 0) then Exit;
+  if FPointerVars.IndexOfName(Nm) >= 0 then Exit(8);
+  if GetVariableType(Nm) = srtString then Exit;
+  idx := FVarWidthCode.IndexOf(Nm);
+  if idx >= 0 then
+    case PtrInt(FVarWidthCode.Objects[idx]) of
+      1, 2: Exit(1);       // Byte / UByte
+      3, 4: Exit(2);       // Short / UShort
+      5, 6: Exit(4);       // Long / ULong
+      7:    Exit(4);       // Single
+    end;
+  idx := FVarPrintKind.IndexOf(Nm);
+  if (idx >= 0) and (PtrInt(FVarPrintKind.Objects[idx]) = 1) then Exit(1);   // Boolean
+  // DEFtype fallback: a suffix-less name whose initial carries a DEFLNG/DEFSNG/... default is
+  // that type's size (DefLng x -> 4). Keyed on the def-letter table alone: an explicit
+  // same-initial "Dim c As Integer" under a DefLng range would be mis-sized here - accepted
+  // corner (the width registries hold nothing for wide explicit types to tell them apart).
+  if (Nm[Length(Nm)] <> '$') and (Nm[Length(Nm)] <> '%') and
+     (Nm[1] >= 'A') and (Nm[1] <= 'Z') and (FDefTypeName[Nm[1]] <> '') then
+    Exit(TypeSizeBytes(FDefTypeName[Nm[1]]));
+  Result := 8;             // Integer / UInteger / LongInt / ULongInt / Double
 end;
 
 procedure TSSAGenerator.RecordVarWidth(const VarName, TypeName: string);
@@ -23359,7 +23417,7 @@ begin
 
   // FreeBASIC DEFINT/DEFSTR...: collect default-type-by-initial BEFORE pre-allocating variables,
   // so a bare name gets its DEF bank (PreAllocateVariables binds via GetVariableType).
-  for DefCh := 'A' to 'Z' do FDefTypeBank[DefCh] := -1;
+  for DefCh := 'A' to 'Z' do begin FDefTypeBank[DefCh] := -1; FDefTypeName[DefCh] := ''; end;
   CollectDefTypes(AST);
 
   // Names an explicit declaration introduces, collected BEFORE any lowering: the MODERN bare-name
