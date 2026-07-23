@@ -173,6 +173,12 @@ procedure AotSurvey(SSAProg: TSSAProgram; Prog: TBytecodeProgram);
 var
   AotDiagPeakLiveInt: Integer = 0;
   AotDiagPeakLiveFloat: Integer = 0;
+  // How many DISTINCT VM registers the region touches, per bank. Read next to peakLive it says
+  // whether register pressure is real or an artefact of the SSA allocator: peak-live 3 floats
+  // spread over dozens of distinct VM registers means the values would all fit in the xmm pool
+  // if they were reused, and every access beyond the 6 pooled ones is pure memory traffic.
+  AotDiagDistinctInt: Integer = 0;
+  AotDiagDistinctFloat: Integer = 0;
   AotDiagLivenessOK: Boolean = False;
   // C3: runtime-helper calls emitted in the last region. Also the coverage delta this stage
   // bought: a region reporting helpers>0 is one that could not compile at all before, since
@@ -854,6 +860,14 @@ var
   begin
     if vmreg <= MaxFReg then Result := FLoc[vmreg] else Result := -1;
   end;
+  // MEASURED AND REJECTED (23 Jul 2026): caching "which VM float register xmm0 currently holds"
+  // and dropping the redundant FLoad of the next float op in a chain (~37% of consecutive
+  // float-op pairs on the n-body forward dest->src1) buys NOTHING - interleaved A/B on one
+  // binary, best-of-9: 0.679 s with, 0.671 s without. The two reasons it cannot pay here: the
+  // hottest float registers are already bound to xmm2..xmm7, so the "elided" load was a
+  // register-to-register movsd the renamer executes for free; and for a memory-resident
+  // register the load right after its store is served by the hardware store buffer anyway.
+  // Do not re-attempt without new evidence; the float traffic that costs is elsewhere.
   procedure FLoad(Wx, vmreg: Integer);
   var n: Integer;
   begin
@@ -1682,6 +1696,15 @@ var
     end;
     AotDiagPeakLiveInt := PeakLiveInt;
     AotDiagPeakLiveFloat := PeakLiveFloat;
+    // Distinct VM registers actually touched, per bank (IUse/FUse are the region's use counts).
+    // Reported beside peakLive because the two together say whether the pool is too small or the
+    // VALUES are spread too thin: 6 xmm cover a peak of 3 live floats easily -- unless they are
+    // scattered over dozens of never-reused register numbers, which is memory traffic by
+    // construction, and no amount of x86-side work can take it back.
+    AotDiagDistinctInt := 0;
+    for r2 := 0 to MaxIReg do if IUse[r2] > 0 then Inc(AotDiagDistinctInt);
+    AotDiagDistinctFloat := 0;
+    for r2 := 0 to MaxFReg do if FUse[r2] > 0 then Inc(AotDiagDistinctFloat);
     AotDiagLivenessOK := LivenessOK;
   end;
 
@@ -2547,10 +2570,12 @@ begin
       Inc(n);
       if Diag then
       begin
-        WriteLn(ErrOutput, Format('[AOT] compiled %-24s entryPC=%-6d liveness=%s peakLive int=%d float=%d helpers=%d',
+        WriteLn(ErrOutput, Format('[AOT] compiled %-24s entryPC=%-6d liveness=%s peakLive int=%d float=%d ' +
+                                  'distinct int=%d float=%d helpers=%d',
                                   [Regions[r].Name, Regions[r].EntryPC,
                                    BoolToStr(AotDiagLivenessOK, 'ok', 'NOT-CONVERGED'),
                                    AotDiagPeakLiveInt, AotDiagPeakLiveFloat,
+                                   AotDiagDistinctInt, AotDiagDistinctFloat,
                                    AotDiagHelperCalls]));
         if AotDiagHelperOps <> '' then
           WriteLn(ErrOutput, '[AOT]   helper ops: ' + AotDiagHelperOps);
