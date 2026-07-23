@@ -1150,13 +1150,17 @@ begin
     Exit;
   end;
 
-  // Parse arguments if any
+  // Parse arguments if any. An EMPTY pair of parentheses still gets an (empty) argument list: the SSA
+  // function dispatch only runs for ChildCount > 0, so without it "FreeFile()" fell through to the
+  // generic call path and evaluated to 0, while bare "FreeFile" worked.
   if not Context.Check(ttDelimParClose) then
   begin
     Args := ParseArgumentList;
     if Assigned(Args) then
       Result.AddChild(Args);
-  end;
+  end
+  else
+    Result.AddChild(TASTNode.Create(antArgumentList, Token));
 
   // Consume closing parenthesis
   if not Context.Match(ttDelimParClose) then
@@ -1204,13 +1208,16 @@ begin
     Exit;
   end;
 
-  // Parse arguments if any
+  // Parse arguments if any; an empty pair of parentheses still gets an empty argument list, so that
+  // "Date()" reaches the same SSA dispatch as bare "Date" (see ParseMathFunction).
   if not Context.Check(ttDelimParClose) then
   begin
     Args := ParseArgumentList;
     if Assigned(Args) then
       Result.AddChild(Args);
-  end;
+  end
+  else
+    Result.AddChild(TASTNode.Create(antArgumentList, Token));
 
   // Consume closing parenthesis
   if not Context.Match(ttDelimParClose) then

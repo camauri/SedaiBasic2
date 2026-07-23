@@ -361,6 +361,7 @@ begin
     ssaGetFile, ssaInputFile, ssaPrintFile, ssaPrintFileNewLine, ssaPrintFileComma,
     ssaCmd, ssaAppend, ssaDclear, ssaRecord, ssaFileQuery, ssaFileAttr, ssaFileSetEof, ssaSeekSet, ssaInputFileLine,
     ssaPutBinInt, ssaPutBinFloat, ssaGetBinInt, ssaGetBinFloat, ssaPutBinStr, ssaGetBinStr,
+    ssaPutBinMem, ssaGetBinMem, ssaPutBinArray, ssaGetBinArray, ssaPutBinPad, ssaGetBinSkip,
     // File management commands
     ssaLoad, ssaSave, ssaVerify, ssaBload, ssaBsave, ssaBoot,
     ssaScratch, ssaCopyFile, ssaRenameFile, ssaMkdir, ssaChdir, ssaRmdir, ssaMoveFile, ssaConcat,

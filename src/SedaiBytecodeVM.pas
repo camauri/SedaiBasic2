@@ -9654,8 +9654,11 @@ var
   HandleName, Filename, Mode, Data: string;
   BinI: Int64;
   BinF: Double;
+  BinS: Single;
   BinLen: Longint;
   BinWidth: Integer;   // binary PUT/GET element byte width (from the variable's declared type)
+  BinCount, BinBank, k: Integer;
+  BinArr: ^TArrayStorage;
 begin
   { Group 6: File I/O operations (0x06xx)
     Opcodes:
@@ -10056,11 +10059,19 @@ begin
         else raise Exception.Create('PUT command not supported: no handler assigned');
       end;
 
-    20: // bcPutBinFloat - PUT #n: write 8 bytes of a double (Src1=handle, Src2=float value)
+    20: // bcPutBinFloat - PUT #n: write a double (8 bytes) or, with Immediate = 4, a SINGLE
+        //   (Src1=handle, Src2=float value). A "Dim As Single" is 4 bytes on file, like fbc.
       begin
         HandleNum := Ctx.IntRegs[Instr.Src1];
         BinF := Ctx.FloatRegs[Instr.Src2];
-        SetLength(Data, 8); Move(BinF, Data[1], 8);
+        if Instr.Immediate = 4 then
+        begin
+          BinS := BinF; SetLength(Data, 4); Move(BinS, Data[1], 4);
+        end
+        else
+        begin
+          SetLength(Data, 8); Move(BinF, Data[1], 8);
+        end;
         if Assigned(FOnFileData) then
         begin
           FOnFileData(Self, 'PUTBIN', HandleNum, Data, ErrorCode);
@@ -10086,49 +10097,200 @@ begin
         else raise Exception.Create('GET command not supported: no handler assigned');
       end;
 
-    22: // bcGetBinFloat - GET #n: read 8 bytes into a double (Dest=float value, Src1=handle)
+    22: // bcGetBinFloat - GET #n: read a double, or a SINGLE with Immediate = 4 (Dest=float, Src1=handle)
       begin
         HandleNum := Ctx.IntRegs[Instr.Src1];
         if Assigned(FOnFileData) then
         begin
-          Data := '8'; FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
-          if Length(Data) >= 8 then Move(Data[1], BinF, 8) else BinF := 0;
+          BinWidth := 8; if Instr.Immediate = 4 then BinWidth := 4;
+          Data := IntToStr(BinWidth); FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
+          BinF := 0;
+          if Length(Data) >= BinWidth then
+          begin
+            if BinWidth = 4 then begin Move(Data[1], BinS, 4); BinF := BinS; end
+            else Move(Data[1], BinF, 8);
+          end;
           if Instr.Dest >= 0 then Ctx.FloatRegs[Instr.Dest] := BinF;
         end
         else raise Exception.Create('GET command not supported: no handler assigned');
       end;
 
-    23: // bcPutBinStr - PUT #n: write a string as [int32 length][bytes] (Src1=handle, Src2=string value)
+    23: // bcPutBinStr - PUT #n: write the string's RAW bytes, no length prefix (fbc-verified).
+        //   Src1=handle, Src2=string value, Immediate=field width (0 = the string's own length;
+        //   > 0 = a fixed-length field, NUL-padded or cut — a UDT "String * n" member).
       begin
         HandleNum := Ctx.IntRegs[Instr.Src1];
-        BinLen := Length(Ctx.StringRegs[Instr.Src2]);
-        SetLength(HandleName, 4); Move(BinLen, HandleName[1], 4);
-        Data := HandleName + Ctx.StringRegs[Instr.Src2];
-        if Assigned(FOnFileData) then
+        Data := Ctx.StringRegs[Instr.Src2];
+        BinWidth := Instr.Immediate;
+        if BinWidth > 0 then
+        begin
+          if Length(Data) > BinWidth then SetLength(Data, BinWidth);
+          while Length(Data) < BinWidth do Data := Data + #0;
+        end;
+        if Assigned(FOnFileData) and (Length(Data) > 0) then
         begin
           FOnFileData(Self, 'PUTBIN', HandleNum, Data, ErrorCode);
           if ErrorCode <> 0 then raise Exception.CreateFmt('PUT error %d to file %d', [ErrorCode, HandleNum]);
         end
-        else raise Exception.Create('PUT command not supported: no handler assigned');
+        else if not Assigned(FOnFileData) then
+          raise Exception.Create('PUT command not supported: no handler assigned');
       end;
 
-    24: // bcGetBinStr - GET #n: read a length-prefixed string (Dest=string value, Src1=handle)
+    24: // bcGetBinStr - GET #n: read RAW bytes into a string (Dest=string value, Src1=handle).
+        //   Immediate = field width; 0 means "as many bytes as the destination string currently
+        //   holds", which is FreeBASIC's rule for a variable-length string (Len(s) bytes read).
+        //   A fixed-width field (> 0) is cut at its first NUL, like a "String * n" member.
       begin
         HandleNum := Ctx.IntRegs[Instr.Src1];
         if Assigned(FOnFileData) then
         begin
-          Data := '4'; FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
-          if Length(Data) >= 4 then Move(Data[1], BinLen, 4) else BinLen := 0;
-          if BinLen < 0 then BinLen := 0;
-          if BinLen > 0 then
+          BinWidth := Instr.Immediate;
+          if BinWidth <= 0 then
           begin
-            Data := IntToStr(BinLen);
+            if Instr.Dest >= 0 then BinWidth := Length(Ctx.StringRegs[Instr.Dest]) else BinWidth := 0;
+          end;
+          if BinWidth > 0 then
+          begin
+            Data := IntToStr(BinWidth);
             FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
+            while Length(Data) < BinWidth do Data := Data + #0;   // short read at EOF: zero-fill
           end
           else Data := '';
+          if Instr.Immediate > 0 then
+          begin
+            BinLen := Pos(#0, Data);
+            if BinLen > 0 then SetLength(Data, BinLen - 1);
+          end;
           if Instr.Dest >= 0 then Ctx.StringRegs[Instr.Dest] := Data;
         end
         else raise Exception.Create('GET command not supported: no handler assigned');
+      end;
+
+    28, 29: // bcPutBinMem / bcGetBinMem - counted transfer between the file and RAW memory
+            //   ("Put #f, , *p, n"): Src1=handle, Src2=raw pointer reg, Immediate=byte-count REG.
+            //   RawAddr validates the region and the whole span, so a bad count raises instead of
+            //   walking off the heap.
+      begin
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        BinI := Ctx.IntRegs[Instr.Src2];
+        BinCount := Ctx.IntRegs[Instr.Immediate];
+        if BinCount < 0 then BinCount := 0;
+        if not Assigned(FOnFileData) then
+          raise Exception.Create('GET/PUT command not supported: no handler assigned');
+        if BinCount > 0 then
+        begin
+          if SubOp = 28 then
+          begin
+            SetLength(Data, BinCount);
+            Move(RawAddr(BinI, PtrUInt(BinCount))^, Data[1], BinCount);
+            FOnFileData(Self, 'PUTBIN', HandleNum, Data, ErrorCode);
+            if ErrorCode <> 0 then raise Exception.CreateFmt('PUT error %d to file %d', [ErrorCode, HandleNum]);
+          end
+          else
+          begin
+            Data := IntToStr(BinCount);
+            FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
+            while Length(Data) < BinCount do Data := Data + #0;   // short read at EOF: zero-fill
+            Move(Data[1], RawAddr(BinI, PtrUInt(BinCount))^, BinCount);
+          end;
+        end;
+      end;
+
+    30, 31: // bcPutBinArray / bcGetBinArray - whole array ("Put #f, , a()"): every element at its
+            //   DECLARED width, not the 8-byte VM slot. Src1=handle, Src2=array id (immediate),
+            //   Immediate = width or (bank shl 8), bank 0 = int, 1 = float.
+      begin
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        BinWidth := Instr.Immediate and $FF;
+        BinBank := (Instr.Immediate shr 8) and $FF;
+        if (BinWidth < 1) or (BinWidth > 8) then BinWidth := 8;
+        if not Assigned(FOnFileData) then
+          raise Exception.Create('GET/PUT command not supported: no handler assigned');
+        if (Instr.Src2 < Length(FArrays)) then
+        begin
+          BinArr := @FArrays[Instr.Src2];
+          BinCount := BinArr^.TotalSize;
+          if BinCount < 0 then BinCount := 0;
+          if BinCount > 0 then
+          begin
+            if SubOp = 30 then
+            begin
+              SetLength(Data, BinCount * BinWidth);
+              for k := 0 to BinCount - 1 do
+                if BinBank = 1 then
+                begin
+                  if BinWidth = 4 then
+                  begin
+                    BinS := BinArr^.FloatData[k]; Move(BinS, Data[k * 4 + 1], 4);
+                  end
+                  else
+                  begin
+                    BinF := BinArr^.FloatData[k]; Move(BinF, Data[k * 8 + 1], 8);
+                  end;
+                end
+                else
+                begin
+                  BinI := BinArr^.IntData[k];
+                  Move(BinI, Data[k * BinWidth + 1], BinWidth);   // little-endian low bytes
+                end;
+              FOnFileData(Self, 'PUTBIN', HandleNum, Data, ErrorCode);
+              if ErrorCode <> 0 then raise Exception.CreateFmt('PUT error %d to file %d', [ErrorCode, HandleNum]);
+            end
+            else
+            begin
+              Data := IntToStr(BinCount * BinWidth);
+              FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
+              while Length(Data) < BinCount * BinWidth do Data := Data + #0;   // short read at EOF
+              for k := 0 to BinCount - 1 do
+                if BinBank = 1 then
+                begin
+                  if BinWidth = 4 then
+                  begin
+                    Move(Data[k * 4 + 1], BinS, 4); BinArr^.FloatData[k] := BinS;
+                  end
+                  else
+                  begin
+                    Move(Data[k * 8 + 1], BinF, 8); BinArr^.FloatData[k] := BinF;
+                  end;
+                end
+                else
+                begin
+                  BinI := 0;
+                  Move(Data[k * BinWidth + 1], BinI, BinWidth);
+                  // Sign-extend a narrow SIGNED element back to the 64-bit slot (Byte/Short/Long).
+                  case BinWidth of
+                    1: BinI := Int64(ShortInt(Byte(BinI)));
+                    2: BinI := Int64(SmallInt(Word(BinI)));
+                    4: BinI := Int64(LongInt(LongWord(BinI)));
+                  end;
+                  BinArr^.IntData[k] := BinI;
+                end;
+            end;
+          end;
+        end;
+      end;
+
+    32: // bcPutBinPad - write Immediate NUL bytes (UDT record image alignment padding)
+      begin
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        BinCount := Instr.Immediate;
+        if (BinCount > 0) and Assigned(FOnFileData) then
+        begin
+          Data := StringOfChar(#0, BinCount);
+          FOnFileData(Self, 'PUTBIN', HandleNum, Data, ErrorCode);
+          if ErrorCode <> 0 then raise Exception.CreateFmt('PUT error %d to file %d', [ErrorCode, HandleNum]);
+        end;
+      end;
+
+    33: // bcGetBinSkip - skip Immediate bytes (UDT record image alignment padding)
+      begin
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        BinCount := Instr.Immediate;
+        if (BinCount > 0) and Assigned(FOnFileData) then
+        begin
+          Data := IntToStr(BinCount);
+          FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
+        end;
       end;
 
   else

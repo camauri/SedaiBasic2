@@ -535,6 +535,12 @@ begin
     ssaGetBinFloat: Result := bcGetBinFloat;
     ssaPutBinStr: Result := bcPutBinStr;
     ssaGetBinStr: Result := bcGetBinStr;
+    ssaPutBinMem: Result := bcPutBinMem;
+    ssaGetBinMem: Result := bcGetBinMem;
+    ssaPutBinArray: Result := bcPutBinArray;
+    ssaGetBinArray: Result := bcGetBinArray;
+    ssaPutBinPad: Result := bcPutBinPad;
+    ssaGetBinSkip: Result := bcGetBinSkip;
     // Sprite commands
     ssaSprite: Result := bcSprite;
     ssaMovsprAbs: Result := bcMovsprAbs;
@@ -1980,6 +1986,10 @@ begin
   // Handle Src2
   if Instr.Src2.Kind = svkRegister then
     BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version)
+  // Whole-array file transfers (bcPut/GetBinArray) name their array in Src2, the way bcArrayBind
+  // names one in Src1: an array id is an immediate, never a register (and so is never remapped).
+  else if Instr.Src2.Kind = svkArrayRef then
+    BCInstr.Src2 := Instr.Src2.ArrayIndex
   else if Instr.Src2.Kind = svkConstInt then
   begin
     // CRITICAL FIX: Binary ops don't support immediate constants in Src2!

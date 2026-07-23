@@ -65,6 +65,8 @@ type
     BodyNode: TASTNode;     // AST node for the function body expression
   end;
 
+  TInt64Array = array of Int64;   // byte offsets of a UDT's fields in its C layout (UDTCLayout)
+
   { UDT/record type info (M3). Each field maps to a (bank, slot) within the record block. }
   TUDTField = record
     Name: string;
@@ -76,6 +78,9 @@ type
                             // "Double Ptr" field, else ''): a raw byte-heap pointer, so "obj.field[i]" /
                             // "*obj.field" / "@obj.field[i]" index and deref onto the raw heap, SizeOf-scaled
     WidthCode: Integer;     // B1.5: narrow width code for a sub-64-bit/SINGLE field (0 = full width)
+    StrCapacity: Integer;   // declared capacity of a fixed-length string field ("As String * 20" -> 20;
+                            // 0 = variable-length). Storage stays variable-length (advisory), but the
+                            // C BYTE LAYOUT of the type needs it: fbc gives such a field n+1 bytes.
     IsWString: Boolean;     // WSTRING field: srtString storage (UTF-8) but LEN/MID count by codepoint
     IsArray: Boolean;       // array member (e.g. "Dim As Double m(Any, Any)"): the int slot holds an FArrays handle
     ArrayElemBank: TSSARegisterType;  // element bank of an array member (int/float/string)
@@ -103,6 +108,8 @@ type
     Node: TASTNode;                // the antTypeDecl (to fill fields on demand, parent-first)
     Filled: Boolean;               // M4.2: fields resolved (cycle-safe fill guard)
     IsUnion: Boolean;              // UNION: all fields of the same bank overlap (share slot 0)
+    FieldAlign: Integer;           // "TYPE t FIELD = n": max alignment of any member in the C layout
+                                   // (1 = fully packed). 0 = not given, i.e. natural alignment.
   end;
 
   { Lexical scope frame (FreeBASIC -lang fb scoping, MODERN mode only). The scope stack runs
@@ -473,6 +480,11 @@ type
     function TypeNameWidthCode(const TypeName: string): Integer;        // B1.5 phase 2: type -> narrow code
     function OperandWidthCode(Node: TASTNode): Integer;                 // narrow width code (1..6) of a scalar operand, else 0 (CSIGN/CUNSG)
     function BinaryElemBytes(const VarName: string): Integer;           // byte width of a scalar for binary PUT/GET (from its width code)
+    function BinaryElemBytesOfWidthCode(W: Integer): Integer;           // width code (1..7) -> byte width
+    procedure UDTFieldCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);   // one field's C size/alignment
+    function UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;  // fbc's C layout of a UDT
+    function EmitBinFileBlock(IsGet: Boolean; const HandleReg: TSSAValue;
+                              ValueNode, CountNode: TASTNode): Boolean;  // GET/PUT #n of a whole array / raw memory block
     function BuiltinFuncPtrOpId(const NameU: string): Integer;          // @Sin/@Cos/... math-builtin funcptr op id (0 if not a builtin)
     function MathConstValue(const NameU: string; out V: Double): Boolean;  // crt/math.bi constants (M_PI, M_E, ...)
     procedure RecordVarWidth(const VarName, TypeName: string);          // B1.5 phase 2: remember a var's width
@@ -13899,7 +13911,7 @@ end;
 procedure TSSAGenerator.ProcessGetFile(Node: TASTNode);
 var
   HandleVal, HandleReg, VarReg: TSSAValue;
-  HandleChild, VarChild: TASTNode;
+  HandleChild, VarChild, CountChild: TASTNode;
   VarName: string;
   HandleStr: string;
   HandleNum: Integer;
@@ -13930,11 +13942,20 @@ begin
       EmitInstruction(ssaSeekSet, MakeSSAValue(svkNone), HandleReg, EnsureIntRegister(HandleVal), MakeSSAValue(svkNone));
     end;
     VarChild := Node.GetChild(1);
+    // Non-scalar targets first: a whole array "a()", or a counted raw-memory block "*p[, n]" / "p[i][, n]".
+    // The optional count is the LAST child when HASCOUNT is set (the parser appends it).
+    CountChild := nil;
+    if (Node.Attributes.Values['HASCOUNT'] = '1') and (Node.ChildCount >= 3) then
+      CountChild := Node.GetChild(Node.ChildCount - 1);
+    if EmitBinFileBlock(True, HandleReg, VarChild, CountChild) then Exit;
     VarReg := GetOrAllocateVariable(string(VarChild.Value));
     if VarReg.RegType = srtFloat then
-      EmitInstruction(ssaGetBinFloat, VarReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      // SINGLE reads 4 bytes on file, DOUBLE 8 (Immediate = width), as fbc lays them out.
+      EmitInstruction(ssaGetBinFloat, VarReg, HandleReg, MakeSSAValue(svkNone),
+                      MakeSSAConstInt(BinaryElemBytes(string(VarChild.Value))))
     else if VarReg.RegType = srtString then
-      EmitInstruction(ssaGetBinStr, VarReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      // FreeBASIC reads Len(s) RAW bytes into a variable-length string: width 0 = "its current length".
+      EmitInstruction(ssaGetBinStr, VarReg, HandleReg, MakeSSAValue(svkNone), MakeSSAConstInt(0))
     else
       // Read exactly the variable's declared width (BYTE=1, SHORT=2, LONG=4, else 8); Immediate = byte count.
       EmitInstruction(ssaGetBinInt, VarReg, HandleReg, MakeSSAValue(svkNone),
@@ -14129,7 +14150,7 @@ end;
 procedure TSSAGenerator.ProcessPrintFile(Node: TASTNode);
 var
   HandleVal, HandleReg, ExprVal, ExprReg: TSSAValue;
-  HandleChild, Child: TASTNode;
+  HandleChild, Child, PutCountChild: TASTNode;
   i: Integer;
   SeparatorChar: string;
   HandleStr: string;
@@ -14207,11 +14228,21 @@ begin
     end;
     if Node.ChildCount >= 2 then
     begin
+      // Non-scalar sources first: a whole array "a()", or a counted raw-memory block "*p[, n]".
+      // The optional count is the LAST child when HASCOUNT is set (the parser appends it).
+      PutCountChild := nil;
+      if (Node.Attributes.Values['HASCOUNT'] = '1') and (Node.ChildCount >= 3) then
+        PutCountChild := Node.GetChild(Node.ChildCount - 1);
+      if EmitBinFileBlock(False, HandleReg, Node.GetChild(1), PutCountChild) then Exit;
       ProcessExpression(Node.GetChild(1), ExprVal);   // the value to write
       if (ExprVal.Kind = svkConstFloat) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtFloat)) then
-        EmitInstruction(ssaPutBinFloat, MakeSSAValue(svkNone), HandleReg, EnsureFloatRegister(ExprVal), MakeSSAValue(svkNone))
+        // SINGLE writes 4 bytes, DOUBLE 8 (Immediate = width), as fbc lays them out.
+        EmitInstruction(ssaPutBinFloat, MakeSSAValue(svkNone), HandleReg, EnsureFloatRegister(ExprVal),
+                        MakeSSAConstInt(BinaryElemBytes(VarToStr(Node.GetChild(1).Value))))
       else if (ExprVal.Kind = svkConstString) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtString)) then
-        EmitInstruction(ssaPutBinStr, MakeSSAValue(svkNone), HandleReg, EnsureStringRegister(ExprVal), MakeSSAValue(svkNone))
+        // A string writes its RAW bytes, no length prefix (width 0 = its own length) — fbc-verified.
+        EmitInstruction(ssaPutBinStr, MakeSSAValue(svkNone), HandleReg, EnsureStringRegister(ExprVal),
+                        MakeSSAConstInt(0))
       else
         // Write exactly the value's declared width when it is a simple variable (BYTE=1, SHORT=2, LONG=4,
         // else 8); a non-variable expression's name is not in the width map, so it defaults to 8.
@@ -15683,12 +15714,243 @@ begin
   W := 0;
   idx := FVarWidthCode.IndexOf(UpperCase(VarName));
   if idx >= 0 then W := PtrInt(FVarWidthCode.Objects[idx]);
+  Result := BinaryElemBytesOfWidthCode(W);   // includes SINGLE (code 7) = 4 bytes, for the float form
+end;
+
+procedure TSSAGenerator.UDTFieldCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);
+// Byte size and alignment of ONE field in the C layout fbc gives the type. Mirrors fbc exactly on the
+// shapes we can lay out (verified against fbc's own binary output):
+//   "String * n"  -> n + 1 bytes (declared characters + NUL terminator), alignment 1
+//   Byte/Short/Long/Single/Integer/Double  -> their FB widths
+//   any pointer / handle / nested-or-array member -> 8 bytes
+// A variable-length STRING member is a 24-byte descriptor to fbc and cannot be transferred field-wise;
+// callers that need a faithful image must reject the type (see UDTCLayout).
+var
+  F: TUDTField;
+begin
+  F := FUDTs[UDTIdx].Fields[FieldIdx];
+  if (F.Bank = srtString) and (F.StrCapacity > 0) then
+  begin
+    Size := F.StrCapacity + 1; Align := 1; Exit;    // fixed-length string: chars + NUL, byte-aligned
+  end;
+  if F.Bank = srtString then begin Size := 24; Align := 8; Exit; end;   // string descriptor
+  if F.IsArray or (F.NestedType <> '') or (F.PtrPointee <> '') or
+     (F.RawPtrPointee <> '') or (F.FuncPtrSig <> '') then
+  begin
+    Size := 8; Align := 8; Exit;
+  end;
+  Size := BinaryElemBytesOfWidthCode(F.WidthCode);
+  Align := Size;
+end;
+
+function TSSAGenerator.UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;
+// The C byte layout of a UDT: the offset of every field plus the type's total size, exactly as fbc
+// lays it out. Each field starts at the next multiple of its own alignment (capped by "FIELD = n"),
+// and the whole type is rounded up to the largest alignment used -- which is why "String * 32 + Double"
+// is 48 bytes (33 + 7 padding + 8) while the same pair under "Field = 1" is 41.
+// Returns False when the type has a shape whose image we cannot reproduce (a variable-length string,
+// an array or nested-record member): those hold a pointer/descriptor in C, not the data.
+var
+  i, n: Integer;
+  Sz, Al, MaxAl, Ofs: Int64;
+begin
+  Result := False;
+  SetLength(Offsets, 0); TotalSize := 0;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  if FUDTs[UDTIdx].IsUnion then Exit;   // overlapping members: not a sequential image
+  n := Length(FUDTs[UDTIdx].Fields);
+  SetLength(Offsets, n);
+  MaxAl := 1; Ofs := 0;
+  for i := 0 to n - 1 do
+  begin
+    with FUDTs[UDTIdx].Fields[i] do
+      if IsArray or (NestedType <> '') or ((Bank = srtString) and (StrCapacity <= 0)) then Exit;
+    UDTFieldCShape(UDTIdx, i, Sz, Al);
+    if (FUDTs[UDTIdx].FieldAlign > 0) and (Al > FUDTs[UDTIdx].FieldAlign) then
+      Al := FUDTs[UDTIdx].FieldAlign;
+    if Al < 1 then Al := 1;
+    if Al > MaxAl then MaxAl := Al;
+    if (Ofs mod Al) <> 0 then Ofs := Ofs + (Al - (Ofs mod Al));
+    Offsets[i] := Ofs;
+    Ofs := Ofs + Sz;
+  end;
+  if (Ofs mod MaxAl) <> 0 then Ofs := Ofs + (MaxAl - (Ofs mod MaxAl));
+  TotalSize := Ofs;
+  Result := n > 0;
+end;
+
+function TSSAGenerator.BinaryElemBytesOfWidthCode(W: Integer): Integer;
+// Byte width of a declared narrow type from its width code: Byte/UByte=1, Short/UShort=2,
+// Long/ULong=4, Single=4; anything else (Integer/LongInt/Double) is a full 8-byte slot.
+begin
   case W of
     1, 2: Result := 1;
     3, 4: Result := 2;
-    5, 6: Result := 4;
+    5, 6, 7: Result := 4;
   else   Result := 8;
   end;
+end;
+
+function TSSAGenerator.EmitBinFileBlock(IsGet: Boolean; const HandleReg: TSSAValue;
+                                        ValueNode, CountNode: TASTNode): Boolean;
+// FreeBASIC "Get/Put #f, [pos], <target> [, count]" for the targets that are NOT a single scalar.
+// Returns False when the target is an ordinary scalar, so the caller keeps its own path.
+//
+//   a()      whole array — EVERY element, each at its DECLARED width ("Dim a(3) As Long" is 4 bytes
+//            per element, not the 8-byte VM slot). fbc forbids a count here, and so do we.
+//   *p       a dereferenced RAW pointer (Allocate'd byte heap, which has a true C layout): count
+//   p[i]     elements of SizeOf(pointee) bytes starting at that address; count defaults to 1.
+//
+// Both were silently wrong before: the lowering only ever looked at the child's NAME and read/wrote
+// one 8-byte scalar, so "Put #f, , a()" wrote 8 bytes instead of count * elemsize, and the count of
+// "Get #f, , *p, 5" was parsed and ignored.
+var
+  BaseNode, IdxList: TASTNode;
+  PtrName, RecType: string;
+  ArrIdx, W, Bank, NIdx, WIdx, UIdx: Integer;
+  ElemSize, TotalSz, Cur, PadTo: Int64;
+  AddrVal, CntVal, BytesReg, ElemReg, RecHandle, FieldReg: TSSAValue;
+  Offsets: TInt64Array;
+  Op: TSSAOpCode;
+begin
+  Result := False;
+  if not Assigned(ValueNode) then Exit;
+  while (ValueNode.NodeType = antParentheses) and (ValueNode.ChildCount >= 1) do
+    ValueNode := ValueNode.GetChild(0);
+
+  // --- whole array: "a()" parses as antArrayAccess with an EMPTY index list ---
+  if (ValueNode.NodeType = antArrayAccess) and (ValueNode.ChildCount >= 2) and
+     (ValueNode.GetChild(0).NodeType = antIdentifier) then
+  begin
+    IdxList := ValueNode.GetChild(1);
+    NIdx := 0;
+    if Assigned(IdxList) then NIdx := IdxList.ChildCount;
+    ArrIdx := ArrayIndexOf(VarToStr(ValueNode.GetChild(0).Value));
+    if (NIdx = 0) and (ArrIdx >= 0) then
+    begin
+      W := 0;
+      WIdx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(ValueNode.GetChild(0).Value)));
+      if WIdx >= 0 then W := PtrInt(FArrayElemWidth.Objects[WIdx]);
+      Bank := 0;
+      if FProgram.GetArray(ArrIdx).ElementType = srtFloat then Bank := 1;
+      if FProgram.GetArray(ArrIdx).ElementType = srtString then Exit;   // no C layout for string arrays
+      // An array of UDTs stores record HANDLES in its int slots, not the records: transferring them
+      // would write meaningless numbers. Leave it to the scalar path rather than corrupt the file.
+      if ArrayRecordTypeOf(VarToStr(ValueNode.GetChild(0).Value)) <> '' then Exit;
+      if IsGet then Op := ssaGetBinArray else Op := ssaPutBinArray;
+      EmitInstruction(Op, MakeSSAValue(svkNone),
+                      HandleReg, MakeSSAArrayRef(ArrIdx, FProgram.GetArray(ArrIdx).ElementType),
+                      MakeSSAConstInt(BinaryElemBytesOfWidthCode(W) or (Bank shl 8)));
+      Exit(True);
+    end;
+  end;
+
+  // --- a whole UDT instance: "Put #f, , u" / "Get #f, , This" ---
+  RecType := ObjectTypeName(ValueNode);
+  if (RecType <> '') and (FindUDT(RecType) >= 0) then
+  begin
+    UIdx := FindUDT(RecType);
+    if UDTCLayout(UIdx, Offsets, TotalSz) and ResolveRecordObject(ValueNode, RecHandle, RecType) then
+    begin
+      Cur := 0;
+      for NIdx := 0 to High(FUDTs[UIdx].Fields) do
+      begin
+        UDTFieldCShape(UIdx, NIdx, ElemSize, PadTo);
+        // Alignment hole before this field: written as NULs / skipped over, so the image stays
+        // byte-identical to the one a C struct write produces.
+        if Offsets[NIdx] > Cur then
+        begin
+          if IsGet then Op := ssaGetBinSkip else Op := ssaPutBinPad;
+          EmitInstruction(Op, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(Offsets[NIdx] - Cur));
+          Cur := Offsets[NIdx];
+        end;
+        case FUDTs[UIdx].Fields[NIdx].Bank of
+          srtFloat:  FieldReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+          srtString: FieldReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        else         FieldReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        end;
+        if IsGet then
+        begin
+          case FUDTs[UIdx].Fields[NIdx].Bank of
+            srtFloat:  EmitInstruction(ssaGetBinFloat, FieldReg, HandleReg, MakeSSAValue(svkNone), MakeSSAConstInt(ElemSize));
+            srtString: EmitInstruction(ssaGetBinStr, FieldReg, HandleReg, MakeSSAValue(svkNone), MakeSSAConstInt(ElemSize));
+          else         EmitInstruction(ssaGetBinInt, FieldReg, HandleReg, MakeSSAValue(svkNone), MakeSSAConstInt(ElemSize));
+          end;
+          case FUDTs[UIdx].Fields[NIdx].Bank of
+            srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), RecHandle, FieldReg,
+                                       MakeSSAConstInt(FUDTs[UIdx].Fields[NIdx].Slot));
+            srtString: EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), RecHandle, FieldReg,
+                                       MakeSSAConstInt(FUDTs[UIdx].Fields[NIdx].Slot));
+          else         EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), RecHandle, FieldReg,
+                                       MakeSSAConstInt(FUDTs[UIdx].Fields[NIdx].Slot));
+          end;
+        end
+        else
+        begin
+          case FUDTs[UIdx].Fields[NIdx].Bank of
+            srtFloat:  EmitInstruction(ssaRecordLoadFloat, FieldReg, RecHandle, MakeSSAValue(svkNone),
+                                       MakeSSAConstInt(FUDTs[UIdx].Fields[NIdx].Slot));
+            srtString: EmitInstruction(ssaRecordLoadString, FieldReg, RecHandle, MakeSSAValue(svkNone),
+                                       MakeSSAConstInt(FUDTs[UIdx].Fields[NIdx].Slot));
+          else         EmitInstruction(ssaRecordLoadInt, FieldReg, RecHandle, MakeSSAValue(svkNone),
+                                       MakeSSAConstInt(FUDTs[UIdx].Fields[NIdx].Slot));
+          end;
+          case FUDTs[UIdx].Fields[NIdx].Bank of
+            srtFloat:  EmitInstruction(ssaPutBinFloat, MakeSSAValue(svkNone), HandleReg, FieldReg, MakeSSAConstInt(ElemSize));
+            srtString: EmitInstruction(ssaPutBinStr, MakeSSAValue(svkNone), HandleReg, FieldReg, MakeSSAConstInt(ElemSize));
+          else         EmitInstruction(ssaPutBinInt, MakeSSAValue(svkNone), HandleReg, FieldReg, MakeSSAConstInt(ElemSize));
+          end;
+        end;
+        Cur := Cur + ElemSize;
+      end;
+      // Trailing alignment padding of the whole type.
+      if TotalSz > Cur then
+      begin
+        if IsGet then Op := ssaGetBinSkip else Op := ssaPutBinPad;
+        EmitInstruction(Op, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAConstInt(TotalSz - Cur));
+      end;
+      Exit(True);
+    end;
+  end;
+
+  // --- raw memory: "*p" or "p[i]" where p is a RAW pointer (Allocate'd buffer) ---
+  BaseNode := nil;
+  if (ValueNode.NodeType = antDeref) and (ValueNode.ChildCount >= 1) then
+    BaseNode := ValueNode.GetChild(0)
+  else if (ValueNode.NodeType = antArrayAccess) and (ValueNode.ChildCount >= 2) and
+          (ValueNode.GetChild(0).NodeType = antIdentifier) and
+          (ArrayIndexOf(VarToStr(ValueNode.GetChild(0).Value)) < 0) then
+    BaseNode := ValueNode.GetChild(0);
+  if BaseNode = nil then Exit;
+  PtrName := RawPtrExprName(BaseNode);
+  if PtrName = '' then Exit;
+  ElemSize := RawElemSizeOf(PtrName);
+  if ElemSize <= 0 then Exit;
+
+  // Address of the first element: the pointer value itself for "*p", the scaled element address
+  // for "p[i]" (EmitPointerIndexAddress already multiplies by SizeOf(pointee)).
+  if ValueNode.NodeType = antDeref then
+    ProcessExpression(BaseNode, AddrVal)
+  else
+    AddrVal := EmitPointerIndexAddress(VarToStr(BaseNode.Value), ValueNode.GetChild(1));
+
+  // Byte count = count * SizeOf(pointee); count defaults to 1. Always materialised in a register:
+  // the Immediate field carries the byte-count REGISTER index (bcRawMemCopy's convention).
+  BytesReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if Assigned(CountNode) then
+  begin
+    ProcessExpression(CountNode, CntVal);
+    ElemReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, ElemReg, MakeSSAConstInt(ElemSize), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ssaMulInt, BytesReg, EnsureIntRegister(CntVal), ElemReg, MakeSSAValue(svkNone));
+  end
+  else
+    EmitInstruction(ssaLoadConstInt, BytesReg, MakeSSAConstInt(ElemSize), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  if IsGet then Op := ssaGetBinMem else Op := ssaPutBinMem;
+  EmitInstruction(Op, MakeSSAValue(svkNone), HandleReg, EnsureIntRegister(AddrVal), BytesReg);
+  Result := True;
 end;
 
 function TSSAGenerator.DeclaredScalarLenBytes(const Name: string): Int64;
@@ -16395,6 +16657,7 @@ begin
   FUDTs[n].Node := nil;
   FUDTs[n].Filled := True;     // empty: nothing to fill
   FUDTs[n].IsUnion := False;
+  FUDTs[n].FieldAlign := 0;
 end;
 
 procedure TSSAGenerator.CollectUDTNames(Node: TASTNode);
@@ -16431,6 +16694,7 @@ begin
       FUDTs[n].Node := Node;
       FUDTs[n].Filled := False;
       FUDTs[n].IsUnion := (Node.Attributes.Values['UNION'] = '1');  // UNION: overlap same-bank fields
+      FUDTs[n].FieldAlign := StrToIntDef(Node.Attributes.Values['FIELDALIGN'], 0);  // "FIELD = n" packing
     end;
     Exit;
   end;
@@ -16607,6 +16871,8 @@ begin
       if IsArrayField then
         FUDTs[Idx].Fields[n].ArrayBounds := ConcreteArrayBounds(FieldNode);
       FUDTs[Idx].Fields[n].IsWString := (TypeName = 'WSTRING');  // codepoint LEN/MID on obj.field
+      // "As String * n" capacity: only the C layout uses it (see UDTCLayout).
+      FUDTs[Idx].Fields[n].StrCapacity := StrToIntDef(FieldNode.Attributes.Values['FIXEDLEN'], 0);
       if NestedT = '' then
         FUDTs[Idx].Fields[n].WidthCode := TypeNameWidthCode(TypeName)  // B1.5: narrow field on store
       else
@@ -19328,10 +19594,12 @@ end;
 
 function TSSAGenerator.TypeSizeBytes(const TypeName: string): Int64;
 // SizeOf(T) in bytes for the FreeBASIC SizeOf() operator. Scalars use FB widths (our INTEGER is 64-bit);
-// a "... PTR" or unknown type is pointer-sized (8); a UDT sums its fields' sizes.
+// a "... PTR" or unknown type is pointer-sized (8); a UDT is its C layout size (UDTCLayout).
 var
   T: string;
   u, j: Integer;
+  LayoutOffsets: TInt64Array;
+  LayoutSize: Int64;
 begin
   T := UpperCase(Trim(TypeName));
   if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(8);
@@ -19351,13 +19619,21 @@ begin
     u := FindUDT(T);
     if u >= 0 then
     begin
-      Result := 0;
-      for j := 0 to High(FUDTs[u].Fields) do
-        case FUDTs[u].Fields[j].Bank of
-          srtFloat: Result := Result + 8;
-          srtString: Result := Result + 8;   // string field = handle/pointer-sized in our model
-        else Result := Result + 8;
-        end;
+      // SizeOf(T) of a UDT is the size fbc's C layout gives it (alignment padding included, "FIELD = n"
+      // honoured) whenever every member has a reproducible shape; a type holding a variable-length
+      // string / array / nested record falls back to the historic one-slot-per-field sum.
+      if UDTCLayout(u, LayoutOffsets, LayoutSize) then
+        Result := LayoutSize
+      else
+      begin
+        Result := 0;
+        for j := 0 to High(FUDTs[u].Fields) do
+          case FUDTs[u].Fields[j].Bank of
+            srtFloat: Result := Result + 8;
+            srtString: Result := Result + 8;   // string field = handle/pointer-sized in our model
+          else Result := Result + 8;
+          end;
+      end;
       if Result = 0 then Result := 8;
     end
     else

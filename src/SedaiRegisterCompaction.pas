@@ -556,6 +556,8 @@ begin
     bcAssert,        // ASSERT/ASSERTWARN: Src1 = condition (int)
     bcGetBinInt, bcGetBinFloat, bcPutBinInt, bcPutBinFloat,  // Src1 = handle (int)
     bcGetBinStr, bcPutBinStr,                                // Src1 = handle (int)
+    // Counted/whole-array/padding binary transfers: Src1 = handle (int)
+    bcPutBinMem, bcGetBinMem, bcPutBinArray, bcGetBinArray, bcPutBinPad, bcGetBinSkip,
     bcArrayRedimPush,                        // REDIM multi-dim: Src1 = upper bound (int)
     bcArrayIdxPush,                          // runtime multi-dim index: Src1 = index (int)
     // UDT array members (indirect): Src1 = the FArrays HANDLE register (load/store/idx-resolve),
@@ -636,6 +638,9 @@ begin
     bcRawRealloc, bcRawStoreInt,
     // FB_MEMCOPY/FB_MEMMOVE: Src2 = source pointer; CLEAR: Src2 = byte value — all int.
     bcRawMemCopy, bcRawMemMove, bcRawClear,
+    // Counted file<->raw-memory transfer: Src2 = raw pointer (int). NOTE bcPut/GetBinArray are
+    // deliberately NOT here: their Src2 is an array ID immediate, not a register.
+    bcPutBinMem, bcGetBinMem,
     // Condition variables (M5.4): CondWait's Src2 is the mutex handle (int).
     bcCondWait,
     // === GROUP 0: Core VM operations ===
@@ -1154,7 +1159,9 @@ begin
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // FB_MEMCOPY/FB_MEMMOVE/CLEAR: Immediate contains the byte-count register index (int)
-    if (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) then
+    // PUT/GET #n, , *p, n: same convention — Immediate is the byte-count register index.
+    if (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) or
+       (OpCode = bcPutBinMem) or (OpCode = bcGetBinMem) then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // PSET/PAINT (x,y),color: Immediate contains the color register index (int)
@@ -1770,6 +1777,7 @@ begin
     if (OpCode = bcStrMid) or (OpCode = bcStrMidW) or
        (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) or
        (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) or
+       (OpCode = bcPutBinMem) or (OpCode = bcGetBinMem) or   // PUT/GET #n, , *p, n: byte-count register
        (OpCode = bcGfxPset) or (OpCode = bcGfxPaint) or (OpCode = bcGfxImageCreate) or
        (OpCode = bcConScreen) or   // SCREEN(row,col[,flag]): Immediate[0-15] = colorflag register
        (OpCode = bcSetmouse) then   // SETMOUSE: Immediate[0-15] = visibility register

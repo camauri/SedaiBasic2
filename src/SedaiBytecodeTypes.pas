@@ -579,11 +579,28 @@ const
   bcPutBinFloat     = bcGroupFileIO + 20;   // PUT #n: write 8 bytes of a double  (Src1=handle, Src2=float value)
   bcGetBinInt       = bcGroupFileIO + 21;   // GET #n: read 8 bytes into an integer (Dest=int value, Src1=handle)
   bcGetBinFloat     = bcGroupFileIO + 22;   // GET #n: read 8 bytes into a double  (Dest=float value, Src1=handle)
-  bcPutBinStr       = bcGroupFileIO + 23;   // PUT #n: write a string as [int32 length][bytes] (Src1=handle, Src2=string value)
-  bcGetBinStr       = bcGroupFileIO + 24;   // GET #n: read a length-prefixed string (Dest=string value, Src1=handle)
+  // PUT/GET #n of a STRING are RAW bytes, no length prefix (fbc-verified: "Put #f,,s" of "Hello"
+  // is exactly the 5 characters). Immediate = fixed field width: 0 = the string's natural length
+  // (PUT) / its CURRENT length (GET, FreeBASIC reads Len(s) bytes); > 0 = a fixed-length field,
+  // padded with NULs on write and cut at the first NUL on read (UDT "String * n" members).
+  bcPutBinStr       = bcGroupFileIO + 23;   // PUT #n: Src1=handle, Src2=string value, Immediate=field width
+  bcGetBinStr       = bcGroupFileIO + 24;   // GET #n: Dest=string value, Src1=handle, Immediate=field width
   bcFileAttr        = bcGroupFileIO + 25;   // FILEATTR(filenum, returntype) -> int info (Dest=int result, Src1=handle, Src2=returntype)
   bcFileSetEof      = bcGroupFileIO + 26;   // FILESETEOF filenum: truncate/extend to current position (Dest=int status, Src1=handle)
   bcPrintFileComma  = bcGroupFileIO + 27;   // PRINT# comma: pad SPACES in the FILE to the next 14-column zone (Src1=handle; fbc-verified in-file zones). The VM tracks a per-handle column.
+  // Counted transfers between a file and RAW memory ("Get #f, , *p, n" / "Put #f, , p[0], n"): the raw
+  // byte heap has a real C layout, so this is a straight block copy of a byte count computed by the
+  // compiler as n * SizeOf(pointee). Immediate = the byte-count REGISTER index (as bcRawMemCopy).
+  bcPutBinMem       = bcGroupFileIO + 28;   // PUT #n: Src1=handle, Src2=raw ptr reg, Immediate=byte-count reg
+  bcGetBinMem       = bcGroupFileIO + 29;   // GET #n: Src1=handle, Src2=raw ptr reg, Immediate=byte-count reg
+  // Whole-array transfers ("Get/Put #f, , a()"): every element of the array, at its DECLARED element
+  // width (Long = 4 bytes, not the 8-byte VM slot). Src2 = array id (an immediate, like bcArrayBind),
+  // Immediate = element byte width or (bank shl 8) with bank 0 = int, 1 = float.
+  bcPutBinArray     = bcGroupFileIO + 30;   // PUT #n: Src1=handle, Src2=array id, Immediate=width|bank
+  bcGetBinArray     = bcGroupFileIO + 31;   // GET #n: Src1=handle, Src2=array id, Immediate=width|bank
+  // Alignment padding inside a UDT record image: write / skip Immediate bytes.
+  bcPutBinPad       = bcGroupFileIO + 32;   // PUT #n: Src1=handle, Immediate=count of NUL bytes to write
+  bcGetBinSkip      = bcGroupFileIO + 33;   // GET #n: Src1=handle, Immediate=count of bytes to skip
 
   // === GROUP 7: SPRITE OPERATIONS (0x07xx) ===
   // Sprite commands

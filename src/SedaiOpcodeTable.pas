@@ -40,7 +40,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 505 {$IFDEF WEB_MODE} + 12 {$ENDIF};
+  OPCODE_LIST_COUNT = 511 {$IFDEF WEB_MODE} + 12 {$ENDIF};
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -101,7 +101,8 @@ const
     bcPrintFile, bcCmd, bcAppend, bcDclear, bcRecord, bcPrintFileNewLine,
     bcPrintFileFloat, bcPrintFileInt, bcInputFileFloat, bcInputFileInt, bcFileQuery, bcSeekSet,
     bcInputFileLine, bcPutBinInt, bcPutBinFloat, bcGetBinInt, bcGetBinFloat, bcPutBinStr,
-    bcGetBinStr, bcFileAttr, bcFileSetEof, bcPrintFileComma, bcSprite, bcMovsprAbs, bcMovsprRel,
+    bcGetBinStr, bcFileAttr, bcFileSetEof, bcPrintFileComma, bcPutBinMem, bcGetBinMem, bcPutBinArray,
+    bcGetBinArray, bcPutBinPad, bcGetBinSkip, bcSprite, bcMovsprAbs, bcMovsprRel,
     bcMovsprPolar, bcMovsprAuto, bcSprcolor, bcSprsav, bcCollision, bcBump,
     bcRspcolor, bcRsppos, bcRsprite, bcSpriteDef, bcSprSaveFile, bcSprLoadFile,
     bcSprSize, bcSprForm, bcGraphicRGBA, bcGraphicSetMode, bcGraphicBox, bcGraphicCircle,
@@ -145,20 +146,20 @@ const
   DENSE_ARRAY_BASE    = 240;  // group 3  (52)          -> 240..291 (bcRawLoad/StoreZStr = subs 50/51)
   DENSE_IO_BASE       = 292;  // group 4  (23)          -> 292..314
   DENSE_SPECIAL_BASE  = 315;  // group 5  (17)          -> 315..331
-  DENSE_FILEIO_BASE   = 332;  // group 6  (28)          -> 332..359 (bcPrintFileComma = sub 27)
-  DENSE_SPRITE_BASE   = 360;  // group 7  (17)          -> 360..376
+  DENSE_FILEIO_BASE   = 332;  // group 6  (34)          -> 332..365 (bcGetBinSkip = sub 33)
+  DENSE_SPRITE_BASE   = 366;  // group 7  (17)          -> 366..382
   {$IFDEF WEB_MODE}
   // group 8 (web, subs 1..12) inserts a 13-slot block, shifting graphics/sound/super up by 13.
-  DENSE_WEB_BASE      = 377;  // 377..389 (12 used, slot 0 a hole)
-  DENSE_GRAPHICS_BASE = 390;  // group 10 (64)          -> 390..453
-  DENSE_SOUND_BASE    = 454;  // group 11 (6)           -> 454..459
-  DENSE_SUPER_BASE    = 460;  // group 200 (256 slots)  -> 460..715
-  DENSE_TOTAL         = 716;  // N (with web)
+  DENSE_WEB_BASE      = 383;  // 383..395 (12 used, slot 0 a hole)
+  DENSE_GRAPHICS_BASE = 396;  // group 10 (64)          -> 396..459
+  DENSE_SOUND_BASE    = 460;  // group 11 (6)           -> 460..465
+  DENSE_SUPER_BASE    = 466;  // group 200 (256 slots)  -> 466..721
+  DENSE_TOTAL         = 722;  // N (with web)
   {$ELSE}
-  DENSE_GRAPHICS_BASE = 377;  // group 10 (64)          -> 377..440
-  DENSE_SOUND_BASE    = 441;  // group 11 (6)           -> 441..446
-  DENSE_SUPER_BASE    = 447;  // group 200 (256 slots)  -> 447..702 (58 used, 198 holes)
-  DENSE_TOTAL         = 703;  // N
+  DENSE_GRAPHICS_BASE = 383;  // group 10 (64)          -> 383..446
+  DENSE_SOUND_BASE    = 447;  // group 11 (6)           -> 447..452
+  DENSE_SUPER_BASE    = 453;  // group 200 (256 slots)  -> 453..708 (58 used, 198 holes)
+  DENSE_TOTAL         = 709;  // N
   {$ENDIF}
 
 var

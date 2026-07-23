@@ -74,6 +74,9 @@ type
     // stream (no line numbers => MODERN); mirrors the SSA's SourceHasLineNumbers gate.
     FModernMode: Boolean;
     FOptionBase: Integer;              // "OPTION BASE n": default lower bound for a bare-upper-bound array DIM (0 or 1)
+    // Constant capacity of the last "As String * n" TYPE-field type parsed (0 = none). Set by
+    // ParseRecordFieldType, consumed when that field's node is built.
+    FLastFieldFixedLen: Integer;
     FInitLevelSizes: array of Integer; // array initializer: item count per brace-nesting level (for "..." ellipsis dims)
     FDialectOverride: TParserDialect;  // pdAuto = detect per-Parse; pdModern/pdClassic = forced
     // Number of ParseDoStatement body parses currently on the call stack. A bare LOOP that
@@ -1249,6 +1252,12 @@ begin
         // statement form). SEEK is a bare identifier here.
         else if (UpperCase(Token.Value) = kSEEK) and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
+          Result := ParseSeekStatement
+        // The '#' is OPTIONAL in FreeBASIC: "Seek f, 100" is the same statement. In statement position
+        // a bare file number (identifier or literal) can only be the statement form — the FUNCTION form
+        // is always parenthesised, "Seek(f)", and an assignment to a variable named seek starts with '='.
+        else if FModernMode and (UpperCase(Token.Value) = kSEEK) and Assigned(Context.PeekNext) and
+                (Context.PeekNext.TokenType in [ttIdentifier, ttNumber, ttInteger]) then
           Result := ParseSeekStatement
         // FreeBASIC graphics "PUT (x,y), src [, mode]" — PUT is a bare identifier; the leading '('
         // (vs '#') selects the graphics blit form.
@@ -3141,6 +3150,8 @@ begin
 end;
 
 function TPackratParser.ParseRecordFieldType: string;
+var
+  FixedLenExpr: TASTNode;
 // Parse an in-TYPE field type after AS: a (dotted) type name, an optional "PTR" suffix (stored as an
 // int handle), and an optional fixed-length "* n" (advisory in v1). Returns '' if no type token follows.
 begin
@@ -3157,11 +3168,19 @@ begin
       Result := Result + ' PTR';
       Context.Advance;                            // consume PTR
     end;
-    // FreeBASIC fixed-length string field "AS STRING * n": consume the length (advisory in v1).
+    // FreeBASIC fixed-length string field "AS STRING * n". The storage stays variable-length
+    // (advisory), but a CONSTANT capacity is remembered: the field's byte layout on file depends
+    // on it (fbc writes n+1 bytes, the declared characters plus the NUL terminator).
     if Context.Check(ttOpMul) then
     begin
       Context.Advance;                            // '*'
-      FExpressionParser.ParseExpression(precCall).Free;   // length operand (discarded)
+      FixedLenExpr := FExpressionParser.ParseExpression(precCall);
+      if Assigned(FixedLenExpr) then
+      begin
+        if FixedLenExpr.NodeType = antLiteral then
+          FLastFieldFixedLen := StrToIntDef(VarToStr(FixedLenExpr.Value), 0);
+        FixedLenExpr.Free;
+      end;
     end;
   end;
 end;
@@ -3246,15 +3265,23 @@ begin
     end;
   end;
 
-  // FreeBASIC field alignment header: "TYPE name [EXTENDS base] FIELD = n". Advisory in our slot-based
-  // record model (no exposed byte layout) — accept and ignore the alignment value. FIELD is not a
-  // reserved word; require the following '=' so a member named "field" (in the body) is unaffected.
+  // FreeBASIC field alignment header: "TYPE name [EXTENDS base] FIELD = n". Our record STORAGE is
+  // slot-based and unaffected, but the value is recorded: the C byte layout the binary GET/PUT of a
+  // whole instance writes is packed to it ("Field = 1" = no padding at all). FIELD is not a reserved
+  // word; require the following '=' so a member named "field" (in the body) is unaffected.
   if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'FIELD') and
      Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpEq) then
   begin
     Context.Advance;                                // consume FIELD
     Context.Advance;                                // consume '='
-    FExpressionParser.ParseExpression(precCall).Free;  // consume & discard the alignment value
+    FieldDefault := FExpressionParser.ParseExpression(precCall);
+    if Assigned(FieldDefault) then
+    begin
+      if FieldDefault.NodeType = antLiteral then
+        Result.Attributes.Values['FIELDALIGN'] := VarToStr(FieldDefault.Value);
+      FieldDefault.Free;
+      FieldDefault := nil;
+    end;
   end;
 
   // FreeBASIC IMPLEMENTS clause: "TYPE name [EXTENDS base] IMPLEMENTS iface[, iface...]". Interfaces are
@@ -3344,6 +3371,7 @@ begin
     // Consume it — the field grammar below handles both "As type name(dims)" and "name(dims) As type".
     if TokU = kDIM then Context.Advance;
     FieldTypeName := '';                            // empty => infer by suffix
+    FLastFieldFixedLen := 0;                        // "As String * n" capacity of THIS field (0 = none)
     LeadingType := False;
     FpIsFP := False; FpParams := ''; FpRet := '';   // funcptr field ("fn As Function(...) As R")
     ArrDimNode := nil;
@@ -3407,6 +3435,10 @@ begin
         FieldNode.Attributes.Values['FPRET'] := FpRet;
       end;
       if IsStaticField then FieldNode.Attributes.Values['STATIC'] := '1';
+      // "As String * n": the declared capacity. Storage stays variable-length (advisory), but the
+      // BINARY layout needs it — fbc gives such a field n+1 bytes on file (the NUL terminator).
+      if FLastFieldFixedLen > 0 then
+        FieldNode.Attributes.Values['FIXEDLEN'] := IntToStr(FLastFieldFixedLen);
       if Assigned(ArrDimNode) then
       begin
         FieldNode.Attributes.Values['ARRAYFIELD'] := '1';
@@ -5786,6 +5818,18 @@ begin
     //         DOPEN #MYFILE, "filename" [, mode$]
     //         DCLOSE #1
     //         DCLOSE #MYFILE
+
+    // FreeBASIC "Close" with NO file number closes EVERY open file — the same thing RESET/DCLEAR
+    // does, so it becomes that node. CLASSIC is untouched: Commodore BASIC always wants a number,
+    // and a bare CLOSE there stays the syntax error it has always been.
+    if FModernMode and ((CmdName = 'CLOSE') or (CmdName = 'DCLOSE')) and
+       Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+    begin
+      Result.Free;
+      Result := TASTNode.Create(antDclear, Token);
+      DoNodeCreated(Result);
+      Exit;
+    end;
 
     // Expect # prefix
     if Context.Check(ttFileHandlePrefix) then

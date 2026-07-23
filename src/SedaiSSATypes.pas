@@ -430,7 +430,10 @@ type
     ssaInputFileLine,  // LINE INPUT# file, string var: read a whole line (Dest=string var, Src1=handle)
     ssaPutBinInt, ssaPutBinFloat,    // PUT #n: write 8 bytes of an int/double (Src1=handle, Src2=value)
     ssaGetBinInt, ssaGetBinFloat,    // GET #n: read 8 bytes into an int/double (Dest=value, Src1=handle)
-    ssaPutBinStr, ssaGetBinStr,      // PUT/GET #n: length-prefixed string (value, Src1=handle)
+    ssaPutBinStr, ssaGetBinStr,      // PUT/GET #n: RAW string bytes (value, Src1=handle, Src3=field width: 0 = natural/current length)
+    ssaPutBinMem, ssaGetBinMem,      // PUT/GET #n, , *p, n: raw memory block (Src1=handle, Src2=raw ptr, Src3=byte count reg)
+    ssaPutBinArray, ssaGetBinArray,  // PUT/GET #n, , a(): whole array (Src1=handle, Src2=array ref, Src3=elem width | bank shl 8)
+    ssaPutBinPad, ssaGetBinSkip,     // UDT record image alignment: write/skip Src3 bytes (Src1=handle)
     // Sprite commands
     ssaSprite,         // SPRITE n [,on] [,color] [,priority] [,xscale] [,yscale] [,mode]
     ssaMovsprAbs,      // MOVSPR n, x, y: Position sprite at absolute coordinates
