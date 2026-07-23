@@ -561,6 +561,8 @@ begin
     ssaRenumber: Result := bcRenumber;
     ssaCatalog: Result := bcCatalog;
     // File management commands
+    ssaRawLoadZStr: Result := bcRawLoadZStr;
+    ssaRawStoreZStr: Result := bcRawStoreZStr;
     ssaCopyFile: Result := bcCopyFile;
     ssaScratch: Result := bcScratch;
     ssaRenameFile: Result := bcRenameFile;

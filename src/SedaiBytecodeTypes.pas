@@ -486,6 +486,11 @@ const
   bcArrayCopyContents  = bcGroupArray + 47;  // deep-copy FArrays[IntRegs[Src1]] <- FArrays[IntRegs[Src2]] (independent storage: Dimensions/LowerBounds/*Data via Copy); value semantics of an array UDT member
   bcArrayCopyRecords   = bcGroupArray + 48;  // value-copy an array-of-UDT member: FArrays[IntRegs[Src1]] (dest) gets independent element records each holding a copy of the corresponding FArrays[IntRegs[Src2]] (src) element's contents; Immediate = packed element UDT slot counts
   bcArrayBindInd       = bcGroupArray + 49;  // Array BYREF param bind whose ARG is a UDT array member: Src1=param array id (immediate), Src2=int reg holding the member's runtime FArrays handle. Otherwise identical to bcArrayBind (pushes the same save-stack entry, committed by bcArrayBindApply, popped by bcArrayUnbind).
+  // C-string view of the raw byte heap: "*p" where p is a ZSTRING PTR (or WSTRING PTR) reads/writes a
+  // NUL-terminated string AT the pointed address, FreeBASIC-style. Immediate: 0 = ZSTRING (bytes),
+  // 1 = WSTRING (UCS-2 units, converted from/to our uniform UTF-8 managed strings).
+  bcRawLoadZStr        = bcGroupArray + 50;  // Dest(str) = C string at RawAddr(IntRegs[Src1]) up to NUL
+  bcRawStoreZStr       = bcGroupArray + 51;  // bytes of StringRegs[Src2] + NUL -> RawAddr(IntRegs[Src1])
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values
@@ -1888,6 +1893,8 @@ begin
         33: Result := 'RawClear';
         34: Result := 'ArrayBind';
         35: Result := 'ArrayUnbind';
+        50: Result := 'RawLoadZStr';
+        51: Result := 'RawStoreZStr';
       else
         Result := Format('Array_%d', [SubOp]);
       end;

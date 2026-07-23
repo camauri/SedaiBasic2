@@ -399,6 +399,7 @@ begin
     bcArrayLoadString,  // Typed array load (string) - Dest is WRITTEN
     bcArrayLoadIndString,  // UDT array member load (string) - Dest is WRITTEN
     bcRefLoadString,    // FreeBASIC pointer deref (string) - Dest = value loaded
+    bcRawLoadZStr,      // *p (ZSTRING/WSTRING PTR) - Dest = the C string read
     // === GROUP 4: I/O operations ===
     bcInputString,
     bcGet,             // GET A$ / INKEY$ - Dest = char read (string), "" if none
@@ -478,6 +479,7 @@ begin
     // raw heap: Src1 = byte count (alloc) / raw pointer (free/realloc/load/store) — all int
     bcRawAlloc, bcRawFree, bcRawRealloc,
     bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat,
+    bcRawLoadZStr, bcRawStoreZStr,   // C-string view: Src1 = raw pointer (int)
     // FB_MEMCOPY/FB_MEMMOVE/CLEAR: Src1 = destination raw pointer (int)
     bcRawMemCopy, bcRawMemMove, bcRawClear,
     // === GROUP 1: String operations with int param ===
@@ -845,6 +847,7 @@ begin
     bcDopen, bcOpen,  // Src2 = filename (string)
     bcAppend,         // Src2 = data (string)
     bcPutBinStr,      // PUT #n: Src2 = string value
+    bcRawStoreZStr,   // *p = s (ZSTRING/WSTRING PTR) - Src2 = the string written
     // === GROUP 0: file management (two-path commands) - Src2 = destination/new-name string.
     // The whole family was missing from these classifiers: its registers were neither marked
     // used nor rewritten, so any non-identity map made the command read a stale index.

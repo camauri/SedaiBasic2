@@ -255,6 +255,8 @@ type
     // FreeBASIC raw byte heap (Allocate family).
     ssaRawAlloc, ssaRawFree, ssaRawRealloc,
     ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat,
+    ssaRawLoadZStr,    // *p (ZSTRING/WSTRING PTR): Dest(str) = C string at the raw address; Src3 const: 0=bytes, 1=UCS-2
+    ssaRawStoreZStr,   // *p = s: write StringRegs bytes + NUL at the raw address; Src3 const: 0=bytes, 1=UCS-2
     ssaRawMemCopy, ssaRawMemMove, ssaRawClear,   // FB_MEMCOPY/FB_MEMMOVE/CLEAR raw-memory block ops
     ssaArrayBind, ssaArrayUnbind,   // array BYREF param: alias/restore a param array slot to a caller's array
     ssaArrayBindApply,              // commit the pending array binds of one call (two-phase: snapshot args, then alias) — Immediate=count

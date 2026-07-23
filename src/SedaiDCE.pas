@@ -291,7 +291,7 @@ begin
     ssaRecordNew, ssaRecordNewArray, ssaRecordNewArrayInd, ssaRecordNewBlock, ssaRecordFree,
     ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
     // FreeBASIC raw heap: alloc/free/realloc and stores mutate the heap; loads are pure (kept if used).
-    ssaRawAlloc, ssaRawFree, ssaRawRealloc, ssaRawStoreInt, ssaRawStoreFloat,
+    ssaRawAlloc, ssaRawFree, ssaRawRealloc, ssaRawStoreInt, ssaRawStoreFloat, ssaRawStoreZStr,
     // FB_MEMCOPY/FB_MEMMOVE/CLEAR mutate the raw heap — side-effecting, never elide.
     ssaRawMemCopy, ssaRawMemMove, ssaRawClear,
     // Array BYREF param bind/unbind alias VM array slots — side-effecting, never elide.

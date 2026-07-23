@@ -564,7 +564,7 @@ begin
           end;
           Inc(CurPC);
         end;
-      DENSE_ARRAY_BASE + 0 .. DENSE_ARRAY_BASE + 2, DENSE_ARRAY_BASE + 9 .. DENSE_ARRAY_BASE + 49:
+      DENSE_ARRAY_BASE + 0 .. DENSE_ARRAY_BASE + 2, DENSE_ARRAY_BASE + 9 .. DENSE_ARRAY_BASE + 51:
         // Cold array ops (DIM/REDIM/ERASE/BIND/...) may resize or move an array's backing store; the
         // descriptor rebuild is triggered inside ExecuteArrayOp itself (it has two callers now - here
         // and the AOT helper - so the flag lives with the op, not the call site).

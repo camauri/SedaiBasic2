@@ -40,7 +40,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 502 {$IFDEF WEB_MODE} + 12 {$ENDIF};
+  OPCODE_LIST_COUNT = 504 {$IFDEF WEB_MODE} + 12 {$ENDIF};
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -90,7 +90,7 @@ const
     bcArrayIdxResolve, bcRawMemCopy, bcRawMemMove, bcRawClear, bcArrayBind, bcArrayUnbind,
     bcArrayBindApply, bcArrayLoadIndInt, bcArrayLoadIndFloat, bcArrayLoadIndString, bcArrayStoreIndInt, bcArrayStoreIndFloat,
     bcArrayStoreIndString, bcArrayIdxResolveInd, bcMemberArrayRedim, bcArrayLBoundInd, bcArrayUBoundInd, bcArrayCopyContents,
-    bcArrayCopyRecords, bcArrayBindInd, bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
+    bcArrayCopyRecords, bcArrayBindInd, bcRawLoadZStr, bcRawStoreZStr, bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
     bcPrintInt, bcPrintIntLn, bcPrintComma, bcPrintSemicolon, bcPrintTab, bcPrintSpc,
     bcPrintNewLine, bcPrintEnd, bcInput, bcInputInt, bcInputFloat, bcInputString,
     bcPrintBool, bcPrintUInt, bcWInputChars, bcInputChars, bcConScreen, bcConLocate,
@@ -142,23 +142,23 @@ const
   DENSE_CORE_BASE     = 0;    // group 0  (155 opcodes) -> dense 0..154
   DENSE_STRING_BASE   = 155;  // group 1  (49)          -> 155..203
   DENSE_MATH_BASE     = 204;  // group 2  (36)          -> 204..239
-  DENSE_ARRAY_BASE    = 240;  // group 3  (50)          -> 240..289
-  DENSE_IO_BASE       = 290;  // group 4  (23)          -> 290..312
-  DENSE_SPECIAL_BASE  = 313;  // group 5  (17)          -> 313..329
-  DENSE_FILEIO_BASE   = 330;  // group 6  (27)          -> 330..356
-  DENSE_SPRITE_BASE   = 357;  // group 7  (17)          -> 357..373
+  DENSE_ARRAY_BASE    = 240;  // group 3  (52)          -> 240..291 (bcRawLoad/StoreZStr = subs 50/51)
+  DENSE_IO_BASE       = 292;  // group 4  (23)          -> 292..314
+  DENSE_SPECIAL_BASE  = 315;  // group 5  (17)          -> 315..331
+  DENSE_FILEIO_BASE   = 332;  // group 6  (27)          -> 332..358
+  DENSE_SPRITE_BASE   = 359;  // group 7  (17)          -> 359..375
   {$IFDEF WEB_MODE}
   // group 8 (web, subs 1..12) inserts a 13-slot block, shifting graphics/sound/super up by 13.
-  DENSE_WEB_BASE      = 374;  // 374..386 (12 used, slot 0 a hole)
-  DENSE_GRAPHICS_BASE = 387;  // group 10 (64)          -> 387..450
-  DENSE_SOUND_BASE    = 451;  // group 11 (6)           -> 451..456
-  DENSE_SUPER_BASE    = 457;  // group 200 (256 slots)  -> 457..712
-  DENSE_TOTAL         = 713;  // N (with web)
+  DENSE_WEB_BASE      = 376;  // 376..388 (12 used, slot 0 a hole)
+  DENSE_GRAPHICS_BASE = 389;  // group 10 (64)          -> 389..452
+  DENSE_SOUND_BASE    = 453;  // group 11 (6)           -> 453..458
+  DENSE_SUPER_BASE    = 459;  // group 200 (256 slots)  -> 459..714
+  DENSE_TOTAL         = 715;  // N (with web)
   {$ELSE}
-  DENSE_GRAPHICS_BASE = 374;  // group 10 (64)          -> 374..437
-  DENSE_SOUND_BASE    = 438;  // group 11 (6)           -> 438..443
-  DENSE_SUPER_BASE    = 444;  // group 200 (256 slots)  -> 444..699 (58 used, 198 holes)
-  DENSE_TOTAL         = 700;  // N
+  DENSE_GRAPHICS_BASE = 376;  // group 10 (64)          -> 376..439
+  DENSE_SOUND_BASE    = 440;  // group 11 (6)           -> 440..445
+  DENSE_SUPER_BASE    = 446;  // group 200 (256 slots)  -> 446..701 (58 used, 198 holes)
+  DENSE_TOTAL         = 702;  // N
   {$ENDIF}
 
 var

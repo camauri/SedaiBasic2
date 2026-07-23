@@ -1721,6 +1721,19 @@ begin
         ArrName2 := RawPtrExprName(Node.GetChild(0));
         ProcessExpression(Node.GetChild(0), Left);   // raw byte address (arithmetic already scaled)
         Left := EnsureIntRegister(Left);
+        // ZSTRING/WSTRING pointee: "*p" IS the C string at the pointed address (read to the NUL),
+        // FreeBASIC-style - not an 8-byte scalar load. WSTRING stores UCS-2 units on the heap and
+        // converts to/from our uniform UTF-8 managed strings (Src3: 0 = bytes, 1 = UCS-2).
+        TempStr := UpperCase(FPointerVars.Values[UpperCase(ArrName2)]);
+        if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') then
+        begin
+          Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+          if TempStr = 'WSTRING' then
+            EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(1))
+          else
+            EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(0));
+          Exit;
+        end;
         if PointeeBankOf(ArrName2) = srtFloat then
         begin
           Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
@@ -6173,6 +6186,18 @@ begin
     ProcessExpression(VarNode.GetChild(0), VarReg);
     VarReg := EnsureIntRegister(VarReg);
     ProcessExpression(ExprNode, ExprValue);
+    // ZSTRING/WSTRING pointee: "*p = s" writes the string's characters + NUL at the pointed
+    // address (WSTRING as UCS-2 units), FreeBASIC-style - not a scalar store.
+    RawFieldPointee := UpperCase(FPointerVars.Values[UpperCase(RawPtrName)]);
+    if (RawFieldPointee = 'ZSTRING') or (RawFieldPointee = 'WSTRING') then
+    begin
+      ExprValue := EnsureStringRegister(ExprValue);
+      if RawFieldPointee = 'WSTRING' then
+        EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(1))
+      else
+        EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(0));
+      Exit;
+    end;
     if PointeeBankOf(RawPtrName) = srtFloat then
     begin
       ExprValue := EnsureFloatRegister(ExprValue);
@@ -20745,6 +20770,14 @@ begin
     Result := VarRecordTypeName(VarToStr(ObjNode.Value));
     if Result = '' then Result := PointerUDTType(VarToStr(ObjNode.Value));  // UDT pointer: p.field / p->field
   end
+  else if ObjNode.NodeType = antCast then
+  begin
+    // CPtr/Cast(T Ptr, x)->field (or Cast(T, x).field): the cast names the type outright.
+    Result := UpperCase(VarToStr(ObjNode.Value));
+    if (Length(Result) > 4) and (Copy(Result, Length(Result) - 3, 4) = ' PTR') then
+      Result := Trim(Copy(Result, 1, Length(Result) - 4));
+    if FindUDT(Result) < 0 then Result := '';
+  end
   else if ObjNode.NodeType = antDeref then
     Result := PointerUDTType(VarToStr(ObjNode.GetChild(0).Value))           // (*p).field
   else if ObjNode.NodeType = antArrayAccess then
@@ -21084,6 +21117,24 @@ begin
   while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do
     ObjNode := ObjNode.GetChild(0);
   if ObjNode = nil then Exit;
+  // CPtr/Cast(T Ptr, x)->field: the CAST names the record type outright, and a UDT-pointer
+  // cast is a value passthrough, so the cast's int value IS the record handle. Without this
+  // branch the base matched nothing, the field read fell to the generic path and yielded
+  // garbage - "CPtr(Vehicle Ptr, p)->Name" through an Object Ptr parameter printed 1.
+  if (ObjNode.NodeType = antCast) and (ObjNode.ChildCount >= 1) then
+  begin
+    TypeName := UpperCase(VarToStr(ObjNode.Value));
+    if (Length(TypeName) > 4) and (Copy(TypeName, Length(TypeName) - 3, 4) = ' PTR') then
+      TypeName := Trim(Copy(TypeName, 1, Length(TypeName) - 4));
+    if FindUDT(TypeName) >= 0 then
+    begin
+      ProcessExpression(ObjNode, HandleVal);   // pointer cast = passthrough of the handle
+      HandleVal := EnsureIntRegister(HandleVal);
+      Result := True;
+      Exit;
+    end;
+    TypeName := '';
+  end;
   if ObjNode.NodeType = antIdentifier then
   begin
     // Record variable (or record-typed parameter): handle is the variable's int register.

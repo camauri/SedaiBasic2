@@ -428,6 +428,8 @@ type
     function RawRealloc(RawPtr: Int64; ByteCount: PtrUInt): Int64;
     function RawLoadInt(RawPtr: Int64; TypeCode: Integer): Int64;
     function RawLoadFloat(RawPtr: Int64; TypeCode: Integer): Double;
+    function RawLoadZStrVal(RawPtr: Int64; Wide: Boolean): string;      // C string at the raw address, up to NUL
+    procedure RawStoreZStrVal(RawPtr: Int64; const S: string; Wide: Boolean);  // chars + NUL at the raw address
     procedure RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
     procedure RawStoreFloat(RawPtr: Int64; TypeCode: Integer; Value: Double);
     procedure RawMemCopy(DstPtr, SrcPtr: Int64; ByteCount: PtrUInt);  // FB_MEMCOPY/FB_MEMMOVE: copy ByteCount bytes on the raw heap
@@ -2487,6 +2489,64 @@ function TBytecodeVM.RawLoadFloat(RawPtr: Int64; TypeCode: Integer): Double;
 begin
   if TypeCode = RTC_SINGLE then Result := PSingle(RawAddr(RawPtr, 4))^
   else Result := PDouble(RawAddr(RawPtr, 8))^;
+end;
+
+function TBytecodeVM.RawLoadZStrVal(RawPtr: Int64; Wide: Boolean): string;
+// "*p" where p is a ZSTRING PTR (Wide=False) or WSTRING PTR (Wide=True): the C string AT the
+// pointed address, read up to the NUL terminator - never past the end of the byte heap (a block
+// missing its NUL yields the bytes to the region end instead of walking off it). WSTRING is
+// stored as UCS-2 units and converted to the VM's uniform UTF-8 managed string.
+var
+  P: PByte;
+  ofs, Limit, n: PtrUInt;
+  W: UnicodeString;
+  PW: PWord;
+begin
+  P := PByte(RawAddr(RawPtr, 1));                      // validates region + at least one byte
+  ofs := PtrUInt(RawPtr and RAWPTR_OFS_MASK);
+  if (RawPtr and RAWPTR_REGION_FB) <> 0 then
+    Limit := 0                                          // a framebuffer is not text: empty string
+  else
+    Limit := PtrUInt(Length(FRawHeap)) - ofs;
+  if not Wide then
+  begin
+    n := 0;
+    while (n < Limit) and (P[n] <> 0) do Inc(n);
+    SetLength(Result, n);
+    if n > 0 then Move(P^, Result[1], n);
+  end
+  else
+  begin
+    PW := PWord(P);
+    n := 0;
+    while (n * 2 + 1 < Limit) and (PW[n] <> 0) do Inc(n);
+    SetLength(W, n);
+    if n > 0 then Move(PW^, W[1], n * 2);
+    Result := UTF8Encode(W);
+  end;
+end;
+
+procedure TBytecodeVM.RawStoreZStrVal(RawPtr: Int64; const S: string; Wide: Boolean);
+// "*p = s" where p is a ZSTRING/WSTRING PTR: the string's characters + NUL terminator at the
+// pointed address. Bounds-checked as a whole through RawAddr - an overflowing store raises
+// instead of corrupting the heap (fbc would silently overrun).
+var
+  P: PByte;
+  W: UnicodeString;
+begin
+  if not Wide then
+  begin
+    P := PByte(RawAddr(RawPtr, PtrUInt(Length(S)) + 1));
+    if Length(S) > 0 then Move(S[1], P^, Length(S));
+    P[Length(S)] := 0;
+  end
+  else
+  begin
+    W := UTF8Decode(S);
+    P := PByte(RawAddr(RawPtr, PtrUInt(Length(W)) * 2 + 2));
+    if Length(W) > 0 then Move(W[1], P^, PtrUInt(Length(W)) * 2);
+    PWord(P)[Length(W)] := 0;
+  end;
 end;
 
 procedure TBytecodeVM.RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
@@ -7596,6 +7656,10 @@ begin
       end;
     33: // bcRawClear - CLEAR(dst, value, bytes)
       RawClear(Ctx.IntRegs[Instr.Src1], Byte(Ctx.IntRegs[Instr.Src2]), PtrUInt(Ctx.IntRegs[Instr.Immediate]));
+    50: // bcRawLoadZStr - Dest(str) = C string at RawAddr(IntRegs[Src1]); Imm 1 = WSTRING (UCS-2)
+      Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate = 1);
+    51: // bcRawStoreZStr - StringRegs[Src2] chars + NUL -> RawAddr(IntRegs[Src1]); Imm 1 = WSTRING
+      RawStoreZStrVal(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1);
     34: // bcArrayBind - array BYREF param (PHASE 1): save FArrays[Src1] and snapshot the arg FArrays[Immediate],
       begin  // but DEFER the alias to bcArrayBindApply. Two-phase so a batch of binds that swaps arrays
              // (recursive "proc(a(),b())" -> "proc(b(),a())", where param and arg slots coincide) reads every
