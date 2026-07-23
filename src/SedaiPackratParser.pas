@@ -6748,7 +6748,7 @@ var
   Token, T: TLexerToken;
   CmdName, ExprText: string;
   HasParen: Boolean;
-  StartIdx, EndIdx, i: Integer;
+  StartIdx, EndIdx, i, PrevLine, PrevEnd: Integer;
   Cond: TASTNode;
 begin
   Token := Context.CurrentToken;
@@ -6765,13 +6765,26 @@ begin
     StartIdx := Context.CurrentIndex;
     Cond := ParseExpression;
     EndIdx := Context.CurrentIndex;
+    // Reconstruct the expression's SOURCE spacing from the token columns: fbc's diagnostic
+    // prints the text as written ("a=1", not "a = 1"), and the assert examples are compared
+    // byte for byte against it. Tokens on a later line (continuations) join with one space.
     ExprText := '';
+    PrevLine := -1;
+    PrevEnd := -1;
     for i := StartIdx to EndIdx - 1 do
     begin
       T := Context.TokenList.GetTokenDirect(i);
       if not Assigned(T) then Continue;
-      if ExprText <> '' then ExprText := ExprText + ' ';
+      if ExprText <> '' then
+      begin
+        if (T.Line = PrevLine) and (T.Column > PrevEnd) then
+          ExprText := ExprText + StringOfChar(' ', T.Column - PrevEnd)
+        else if T.Line <> PrevLine then
+          ExprText := ExprText + ' ';
+      end;
       ExprText := ExprText + T.Value;
+      PrevLine := T.Line;
+      PrevEnd := T.Column + Length(T.Value);
     end;
     if HasParen and (Context.CurrentToken.Value = ')') then Context.Advance;
     if CmdName = kASSERT then

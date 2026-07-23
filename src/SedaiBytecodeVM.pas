@@ -4685,12 +4685,17 @@ begin
     bcAssert:
       begin
         // ASSERT/ASSERTWARN: if the condition (Src1) is 0 (false), print the pre-built diagnostic
-        // (Src2). For ASSERT (Immediate bit 0 set) the program also halts; ASSERTWARN continues.
+        // (Src2), prefixed by the module path - fbc -eassert prints "path(line): assertion failed
+        // at FUNC: expr" and the path half only exists at run time (the program's ModuleName).
+        // For ASSERT (Immediate bit 0 set) the program also halts; ASSERTWARN continues.
         if Ctx.IntRegs[Instr.Src1] = 0 then
         begin
           if Assigned(FOutputDevice) then
           begin
-            FOutputDevice.Print(Ctx.StringRegs[Instr.Src2]);
+            if Assigned(FProgram) then
+              FOutputDevice.Print(FProgram.ModuleName + Ctx.StringRegs[Instr.Src2])
+            else
+              FOutputDevice.Print(Ctx.StringRegs[Instr.Src2]);
             FOutputDevice.NewLine;
           end;
           if (Instr.Immediate and 1) <> 0 then

@@ -13696,10 +13696,10 @@ end;
 
 procedure TSSAGenerator.ProcessAssert(Node: TASTNode; Halt: Boolean);
 // FreeBASIC ASSERT(expr) / ASSERTWARN(expr): if the condition evaluates to 0 (false), print a
-// diagnostic and — for ASSERT — halt the program. The whole message (function name, source line and
-// the stringized expression) is known at compile time and baked into a string constant; only the
-// conditional print/halt happens at run time. The source file name is not threaded to codegen, so it
-// is omitted from the message (a documented deviation from FB's "file(line): ..." prefix).
+// diagnostic and — for ASSERT — halt the program. The message follows fbc -eassert byte for byte
+// ("path(line): assertion failed at FUNC: expr", verified live): everything after the path is
+// known at compile time and baked into a string constant; the VM prefixes the program's
+// ModuleName (the source path, which codegen does not see) when it prints.
 var
   CondVal, CondReg, MsgReg: TSSAValue;
   FuncName, Msg: string;
@@ -13710,7 +13710,7 @@ begin
 
   if FInProcedure then FuncName := FCurrentProcName else FuncName := kFBMAINPROC;
   if Node.Token <> nil then LineNum := Node.Token.Line else LineNum := FCurrentLineNumber;
-  Msg := 'assertion failed at ' + FuncName + ' (line ' + IntToStr(LineNum) + ')';
+  Msg := '(' + IntToStr(LineNum) + '): assertion failed at ' + FuncName;
   if VarToStr(Node.Value) <> '' then Msg := Msg + ': ' + VarToStr(Node.Value);
 
   ProcessExpression(Node.GetChild(0), CondVal);
