@@ -146,6 +146,8 @@ var
   Serializer: TBytecodeSerializer;
   i, removed: Integer;
   HasLineNums: Boolean;
+  US: string;            // uppercased RAW source for the '#lang "qb"' detection
+  QBLangDetected: Boolean;
   {$IFNDEF DISABLE_REG_ALLOC}
   RegAlloc: TLinearScanAllocator;
   {$ENDIF}
@@ -187,6 +189,12 @@ begin
     // === PREPROCESSOR === (FreeBASIC #define/#undef/#ifdef/#ifndef/#else/#endif/#include).
     // Pure text->text pass before lexing; #include paths resolve relative to the source file.
     try
+      // -lang qb ('#lang "qb"' / the '$lang: "qb" metacommand) takes QB PRINT number spacing
+      // (FB zone width + TRAILING space after numerics, fbc-verified; fblite does NOT). Detected
+      // on the RAW text: the preprocessor strips both directive forms before the old site ran.
+      US := UpperCase(Source.Text);
+      QBLangDetected := (Pos('#LANG "QB"', US) > 0) or (Pos('$LANG: "QB"', US) > 0) or
+                        (Pos('$LANG:"QB"', US) > 0) or (Pos('#LANG"QB"', US) > 0);
       Source.Text := PreprocessSource(Source.Text, ExtractFilePath(ExpandFileName(SourceFile)), SourceFile);
     except
       on E: EPreprocessorError do
@@ -440,6 +448,8 @@ begin
             {$ELSE}
             BytecodeProgram.ModuleName := SourceFile;
             {$ENDIF}
+            BytecodeProgram.QBLang := QBLangDetected;
+
           except
             on E: Exception do
             begin

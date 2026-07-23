@@ -521,6 +521,7 @@ begin
     ssaInputFile: Result := bcInputFile;
     ssaPrintFile: Result := bcPrintFile;
     ssaPrintFileNewLine: Result := bcPrintFileNewLine;
+    ssaPrintFileComma: Result := bcPrintFileComma;
     ssaCmd: Result := bcCmd;
     ssaFileQuery: Result := bcFileQuery;
     ssaFileAttr: Result := bcFileAttr;

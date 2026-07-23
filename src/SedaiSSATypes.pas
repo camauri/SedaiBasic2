@@ -421,6 +421,7 @@ type
     ssaDclear,         // DCLEAR: Close all open file handles
     ssaRecord,         // RECORD #handle, position: Seek to position in file
     ssaPrintFileNewLine, // PRINT# newline: Write CR to file (handle in Src1)
+    ssaPrintFileComma,   // PRINT# comma: pad spaces in the FILE to the next 14-column zone (handle in Src1)
     ssaFileQuery,      // EOF/FREEFILE/LOF/LOC/SEEK(n) -> int (Src1=handle, Src3=query code immediate)
     ssaFileAttr,       // FILEATTR(filenum, returntype) -> int (Src1=handle, Src2=returntype)
     ssaFileSetEof,     // FILESETEOF filenum -> truncate/extend to current position (Src1=handle, Dest=int status)

@@ -14247,14 +14247,13 @@ begin
     if Child.NodeType = antSeparator then
     begin
       SeparatorChar := VarToStr(Child.Value);
-      // For file output, separators are handled similarly to screen
-      // Comma = tab, Semicolon = no separator
+      // A comma pads spaces to the next 14-column zone IN THE FILE (fbc-verified from the
+      // fileio/print example's bleh.dat). The old lowering emitted the CONSOLE comma op here,
+      // leaking the zone padding to stdout while the file got none. A semicolon is simply
+      // no separator - and no console op either.
       if SeparatorChar = ',' then
-        EmitInstruction(ssaPrintComma, MakeSSAValue(svkNone),
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
-      else if SeparatorChar = ';' then
-        EmitInstruction(ssaPrintSemicolon, MakeSSAValue(svkNone),
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitInstruction(ssaPrintFileComma, MakeSSAValue(svkNone),
+                       HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       Continue;
     end;
 

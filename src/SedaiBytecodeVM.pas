@@ -228,6 +228,9 @@ type
     FTimeOffset: Int64;     // TI$ offset in milliseconds from real time
     FClockOffsetDays: Double; // FreeBASIC SETDATE/SETTIME offset (days) applied to NOW/DATE/TIME/TIMER
     FEnvOverrides: TStringList; // SETENVIRON "NAME=value" overrides, consulted by ENVIRON$ before the OS environment
+    // PRINT# per-handle output column, for the in-file comma zones (fbc pads the FILE to
+    // 14-column boundaries). Grown on demand; a newline resets its handle's column.
+    FFilePrintCols: array of Integer;
     FDrawPenX, FDrawPenY: Integer; // FreeBASIC DRAW "..." (GML) pen position, in logical (WINDOW) coordinates; read by POINTCOORD
     FLastFrameTick: QWord;  // Last FRAME sync tick for drift-free timing
     // Function key definitions (1-12)
@@ -428,6 +431,9 @@ type
     function RawRealloc(RawPtr: Int64; ByteCount: PtrUInt): Int64;
     function RawLoadInt(RawPtr: Int64; TypeCode: Integer): Int64;
     function RawLoadFloat(RawPtr: Int64; TypeCode: Integer): Double;
+    procedure FilePrintColAdvance(Handle: Integer; const Data: string);
+    procedure FilePrintColSet(Handle, Col: Integer);
+    function FilePrintColGet(Handle: Integer): Integer;
     function RawLoadZStrVal(RawPtr: Int64; Wide: Boolean): string;      // C string at the raw address, up to NUL
     procedure RawStoreZStrVal(RawPtr: Int64; const S: string; Wide: Boolean);  // chars + NUL at the raw address
     procedure RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
@@ -2491,6 +2497,33 @@ begin
   else Result := PDouble(RawAddr(RawPtr, 8))^;
 end;
 
+procedure TBytecodeVM.FilePrintColSet(Handle, Col: Integer);
+begin
+  if (Handle < 0) or (Handle > 4095) then Exit;   // defensive cap; real handles are tiny
+  if Handle > High(FFilePrintCols) then SetLength(FFilePrintCols, Handle + 1);
+  FFilePrintCols[Handle] := Col;
+end;
+
+function TBytecodeVM.FilePrintColGet(Handle: Integer): Integer;
+begin
+  if (Handle < 0) or (Handle > High(FFilePrintCols)) then Exit(0);
+  Result := FFilePrintCols[Handle];
+end;
+
+procedure TBytecodeVM.FilePrintColAdvance(Handle: Integer; const Data: string);
+// Advance the handle's column by the written text; a CR/LF inside resets to the tail length.
+var
+  i, LastNL: Integer;
+begin
+  LastNL := 0;
+  for i := Length(Data) downto 1 do
+    if (Data[i] = #13) or (Data[i] = #10) then begin LastNL := i; Break; end;
+  if LastNL > 0 then
+    FilePrintColSet(Handle, Length(Data) - LastNL)
+  else
+    FilePrintColSet(Handle, FilePrintColGet(Handle) + Length(Data));
+end;
+
 function TBytecodeVM.RawLoadZStrVal(RawPtr: Int64; Wide: Boolean): string;
 // "*p" where p is a ZSTRING PTR (Wide=False) or WSTRING PTR (Wide=True): the C string AT the
 // pointed address, read up to the NUL terminator - never past the end of the byte heap (a block
@@ -3196,7 +3229,13 @@ begin
   // so its output matches real FreeBASIC character for character.
   if Assigned(FConsoleBehavior) and Assigned(FProgram) and FProgram.ModernMode then
   begin
-    FConsoleBehavior.NumberFormat := nfFreeBASIC;
+    // -lang qb sources keep the FB zone width but ADD the trailing space after numerics
+    // ("In the -lang qb dialect, an extra space is printed after numbers" - fbc-verified
+    // live: ' 15 ' then zone pad). nfCommodore is exactly that spacing rule.
+    if FProgram.QBLang then
+      FConsoleBehavior.NumberFormat := nfCommodore
+    else
+      FConsoleBehavior.NumberFormat := nfFreeBASIC;
     // A comma in PRINT tabs to the next zone, and the zone width is dialect-specific too: Commodore uses
     // 10 columns, FreeBASIC 14 ("A comma indicates printing should take place at the next 14 column
     // boundary" -- the FB manual's Print page).
@@ -9749,11 +9788,26 @@ begin
         if Assigned(FOnFileData) then
         begin
           FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);
+          FilePrintColAdvance(HandleNum, Data);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('PRINT# error %d writing to file: %d', [ErrorCode, HandleNum]);
         end
         else
           raise Exception.Create('PRINT# command not supported: no handler assigned');
+      end;
+
+    27: // bcPrintFileComma - pad spaces in the FILE to the next 14-column zone (fbc-verified:
+        // "Print #1, a, b" writes the zone padding INTO the file; it used to leak to stdout).
+      begin
+        HandleNum := Ctx.IntRegs[Instr.Src1];
+        Data := StringOfChar(' ', 14 - (FilePrintColGet(HandleNum) mod 14));
+        if Assigned(FOnFileData) then
+        begin
+          FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);
+          FilePrintColAdvance(HandleNum, Data);
+          if ErrorCode <> 0 then
+            raise Exception.CreateFmt('PRINT# error %d writing to file: %d', [ErrorCode, HandleNum]);
+        end;
       end;
 
     7: // bcCmd - CMD file [, expr]
@@ -9827,15 +9881,20 @@ begin
           raise Exception.Create('RECORD command not supported: no handler assigned');
       end;
 
-    11: // bcPrintFileNewLine - Write CR (newline) to file
+    11: // bcPrintFileNewLine - newline to file (dialect-specific line ending)
       begin
-        { PRINT# newline - Write CHR$(13) to file
-          Src1 = file handle register (int) }
+        { PRINT# newline. CLASSIC writes CHR$(13) alone - real C128 DOS files end lines with a
+          bare CR. MODERN writes the platform line ending like fbc does (CRLF on Windows, LF
+          elsewhere - bleh.dat from the fbc-built fileio/print example ends lines CR LF). }
         HandleNum := Ctx.IntRegs[Instr.Src1];
-        Data := #13;  // Carriage return (C128 BASIC behavior)
+        if Assigned(FProgram) and FProgram.ModernMode then
+          Data := LineEnding
+        else
+          Data := #13;  // Carriage return (C128 BASIC behavior)
         if Assigned(FOnFileData) then
         begin
           FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);
+          FilePrintColSet(HandleNum, 0);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('PRINT# newline error %d writing to file: %d', [ErrorCode, HandleNum]);
         end
@@ -9853,6 +9912,7 @@ begin
         if Assigned(FOnFileData) then
         begin
           FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);
+          FilePrintColAdvance(HandleNum, Data);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('PRINT# error %d writing float to file: %d', [ErrorCode, HandleNum]);
         end
@@ -9870,6 +9930,7 @@ begin
         if Assigned(FOnFileData) then
         begin
           FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);
+          FilePrintColAdvance(HandleNum, Data);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('PRINT# error %d writing int to file: %d', [ErrorCode, HandleNum]);
         end

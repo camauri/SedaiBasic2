@@ -548,6 +548,8 @@ begin
     // === GROUP 6: File I/O operations ===
     bcDopen, bcDclose, bcOpen, bcClose,  // Src1 = handle (int)
     bcGetFile, bcInputFile, bcPrintFile,     // Src1 = handle (int)
+    bcPrintFileComma,                        // PRINT# comma zone pad - Src1 = handle (int)
+    bcPrintFileNewLine,                      // PRINT# newline - Src1 = handle (int); was missing from the classifier
     bcInputFileFloat, bcInputFileInt,        // Src1 = handle (int)
     bcPrintFileFloat, bcPrintFileInt,        // Src1 = handle (int)
     bcFileQuery, bcFileAttr, bcFileSetEof, bcSeekSet, bcInputFileLine, // Src1 = handle (int)

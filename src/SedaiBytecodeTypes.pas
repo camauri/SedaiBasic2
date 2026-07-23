@@ -583,6 +583,7 @@ const
   bcGetBinStr       = bcGroupFileIO + 24;   // GET #n: read a length-prefixed string (Dest=string value, Src1=handle)
   bcFileAttr        = bcGroupFileIO + 25;   // FILEATTR(filenum, returntype) -> int info (Dest=int result, Src1=handle, Src2=returntype)
   bcFileSetEof      = bcGroupFileIO + 26;   // FILESETEOF filenum: truncate/extend to current position (Dest=int status, Src1=handle)
+  bcPrintFileComma  = bcGroupFileIO + 27;   // PRINT# comma: pad SPACES in the FILE to the next 14-column zone (Src1=handle; fbc-verified in-file zones). The VM tracks a per-handle column.
 
   // === GROUP 7: SPRITE OPERATIONS (0x07xx) ===
   // Sprite commands
@@ -912,6 +913,7 @@ type
     FProcMapCount: Integer;
     // Name of the source file this program was compiled from (ERMN). Set by the host.
     FModuleName: string;
+    FQBLang: Boolean;      // source declared -lang qb ('#lang "qb"' / '$lang: "qb"): QB PRINT spacing
     // AOT support (plan B, PIANO_B1_AOT_DESIGN): SSA instruction ordinal (program order, counting
     // EVERY SSA instruction, labels/nops included) -> FINAL bytecode PC of the first instruction
     // emitted for it, or -1 when nothing was emitted or it was later removed by NOP compaction.
@@ -930,6 +932,7 @@ type
   public
     property ModernMode: Boolean read FModernMode write FModernMode;
     property ModuleName: string read FModuleName write FModuleName;
+    property QBLang: Boolean read FQBLang write FQBLang;
     constructor Create;
     destructor Destroy; override;
     procedure AddInstruction(const Instr: TBytecodeInstruction);
@@ -1070,6 +1073,7 @@ begin
   SetLength(FProcMap, 0);
   FProcMapCount := 0;
   FModuleName := '';
+  FQBLang := False;
   FStringConstants := TStringList.Create;
   FStringConstants.CaseSensitive := True;  // IMPORTANT: "n" and "N" are different!
   FEntryPoint := 0;
@@ -1949,6 +1953,7 @@ begin
         9: Result := 'Dclear';
         10: Result := 'Record';
         11: Result := 'PrintFileNewLine';
+        27: Result := 'PrintFileComma';
         12: Result := 'PrintFileFloat';
         13: Result := 'PrintFileInt';
         25: Result := 'FileAttr';

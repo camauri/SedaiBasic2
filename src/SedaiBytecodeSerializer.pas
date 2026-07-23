@@ -79,6 +79,7 @@ const
   // Flags
   BASC_FLAG_DEBUG_INFO = $0001;  // Contains source line mapping (always included)
   BASC_FLAG_MODERN     = $0002;  // Program compiled from a Modern/FreeBASIC source (no line numbers)
+  BASC_FLAG_QBLANG     = $0004;  // Source declared -lang qb: QB PRINT number spacing (trailing space)
 
 type
   { TBascHeader - File header structure }
@@ -220,6 +221,8 @@ begin
   Header.Flags := BASC_FLAG_DEBUG_INFO;  // Source line info is always included in instructions
   if Program_.ModernMode then
     Header.Flags := Header.Flags or BASC_FLAG_MODERN;
+  if Program_.QBLang then
+    Header.Flags := Header.Flags or BASC_FLAG_QBLANG;
 
   Header.InstructionCount := Program_.GetInstructionCount;
   if Assigned(Program_.StringConstants) then
@@ -385,6 +388,7 @@ begin
 
     // Restore the source dialect (older files have the flag clear => classic, as before)
     Result.ModernMode := (Header.Flags and BASC_FLAG_MODERN) <> 0;
+    Result.QBLang := (Header.Flags and BASC_FLAG_QBLANG) <> 0;
 
     // Read string constants
     for i := 0 to Header.StringConstCount - 1 do

@@ -573,7 +573,7 @@ begin
         begin Ctx.PC := CurPC; ExecuteIOOp(Ctx, Instr); if not Ctx.Running then Break; CurPC := Ctx.PC + 1; end;
       DENSE_SPECIAL_BASE + 0 .. DENSE_SPECIAL_BASE + 16:
         begin Ctx.PC := CurPC; ExecuteSpecialVarOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
-      DENSE_FILEIO_BASE + 0 .. DENSE_FILEIO_BASE + 26:
+      DENSE_FILEIO_BASE + 0 .. DENSE_FILEIO_BASE + 27:
         begin Ctx.PC := CurPC; ExecuteFileIOOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
       DENSE_SPRITE_BASE + 0 .. DENSE_SPRITE_BASE + 16:
         begin Ctx.PC := CurPC; ExecuteSpriteOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
