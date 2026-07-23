@@ -1058,11 +1058,36 @@ var
     end;
     CmpBoolToDest;
   end;
-  procedure FloatBin(const SseOp: array of Byte);
+  // dest := src1 <op> src2. When dest has a machine home we compute IN PLACE - directly into
+  // that register - instead of round-tripping through the xmm0 scratch: the accumulator form
+  // dest==src1 collapses to a single `<op>sd Hd, src2`, and the general homed case drops the
+  // final store. Commutative ops (add/mul) may also fold dest==src2. The only case that still
+  // needs the scratch is a non-commutative op whose dest aliases src2 (loading src1 into the
+  // dest home would clobber src2 before the op reads it), plus a memory-homed dest.
+  procedure FloatBin(const SseOp: array of Byte; Commutative: Boolean);
+  var Hd, Hs1, Hs2, d, s1, s2: Integer;
   begin
-    FLoad(XMM0, FReg(Cur.Src1));
-    FOp(SseOp, XMM0, FReg(Cur.Src2));
-    FStore(FReg(Cur.Dest), XMM0);
+    d := FReg(Cur.Dest); s1 := FReg(Cur.Src1); s2 := FReg(Cur.Src2); if not OK then Exit;
+    Hd := FAlloc(d);
+    if Hd < 0 then
+    begin
+      FLoad(XMM0, s1); FOp(SseOp, XMM0, s2); FStore(d, XMM0);       // memory-homed dest
+      Exit;
+    end;
+    Hs1 := FAlloc(s1); Hs2 := FAlloc(s2);
+    if Hd = Hs1 then
+      FOp(SseOp, Hd, s2)                                            // Hd already holds src1
+    else if Commutative and (Hd = Hs2) then
+      FOp(SseOp, Hd, s1)                                            // Hd holds src2, op commutes
+    else if Hd <> Hs2 then
+    begin
+      FLoad(Hd, s1);                                               // Hd <- src1
+      FOp(SseOp, Hd, s2);                                          // Hd := src1 op src2
+    end
+    else
+    begin
+      FLoad(XMM0, s1); FOp(SseOp, XMM0, s2); FStore(d, XMM0);       // non-commutative dest==src2
+    end;
   end;
   // Signed div/mod with the interpreter's raise semantics via deopt (JIT J10 pattern).
   procedure DivModSigned(apc: Integer; WantRemainder: Boolean);
@@ -2719,12 +2744,12 @@ var
       ssaDivUInt: begin apc := NeedPC; if OK then DivModUnsigned(apc, False); end;
       ssaModUInt: begin apc := NeedPC; if OK then DivModUnsigned(apc, True); end;
 
-      ssaAddFloat: FloatBin([$F2, $0F, $58]);
-      ssaSubFloat: FloatBin([$F2, $0F, $5C]);
-      ssaMulFloat: FloatBin([$F2, $0F, $59]);
+      ssaAddFloat: FloatBin([$F2, $0F, $58], True);
+      ssaSubFloat: FloatBin([$F2, $0F, $5C], False);
+      ssaMulFloat: FloatBin([$F2, $0F, $59], True);
       ssaDivFloat:
       begin
-        if Modern then FloatBin([$F2, $0F, $5E])
+        if Modern then FloatBin([$F2, $0F, $5E], False)
         else
         begin
           // CLASSIC raises on a zero divisor: catch +-0.0 (bits shifted left of the sign
