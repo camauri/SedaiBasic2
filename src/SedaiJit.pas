@@ -35,24 +35,28 @@ type
   TExecMem = SedaiX86Emitter.TExecMem;
 
   // A compiled loop: call with the two register-bank base pointers + the array descriptor table
-  // (4x Int64/array: IntData ptr, FloatData ptr, Count, LBound); returns the exit PC.
-  TNativeLoopFn = function(IntRegs, FloatRegs: PInt64; ArrDesc: Pointer): PtrInt;
+  // (4x Int64/array: IntData ptr, FloatData ptr, Count, LBound) + the EXECUTING context object.
+  // Returns the exit PC. Ctx makes the code thread-agnostic: the Xfer banks and the record heap
+  // are read through it at run time (field offsets baked, addresses NOT), so any context - main
+  // or THREADCREATE worker - can run the same native loop on its own state.
+  TNativeLoopFn = function(IntRegs, FloatRegs: PInt64; ArrDesc: Pointer; Ctx: Pointer): PtrInt;
 
 // Compile the loop body [HeaderPC..EndPC] (inclusive) to native code. Ins points at instruction 0.
 // ProgLen is the whole program's instruction count (NativeOff/InRange are indexed by absolute PC so an
 // inlined callee's PCs resolve too). TrueVal is the VM's TRUE value baked into integer comparisons.
 // AllowUnsafe = MODERN dialect and no forced bounds-check: only then may array access / sqrt / div be
 // compiled (their MODERN edge semantics -- OOB->default, div0->IEEE, sqrt(neg)->NaN -- match the native
-// SSE forms; CLASSIC would raise, so the loop bails). XferIntBase/XferFloatBase are the (stable) base
-// addresses of Ctx.XferInt[0]/Ctx.XferFloat[0], baked as immediates so bcXferStore/Load and inlined SUB
-// calls (bcCallSub, milestone J6) need no extra parameter. RecFieldAddr is @Ctx.Records (the address of the
-// record-heap dynamic-array field, stable across resizes; dereferenced at run time to get the current base);
+// SSE forms; CLASSIC would raise, so the loop bails). XferIntOff/XferFloatOff/RecordsOff are the byte
+// offsets of the XferInt/XferFloat/Records dynamic-array FIELDS inside TExecutionContext: the emitted
+// code loads the current data pointer from [ctx + off] at run time (the ctx object arrives as the 4th
+// call argument), so the native code holds NO context-specific address and is safe for any thread's
+// context - the old design baked the MAIN context's absolute addresses and corrupted worker state.
 // RecSize/RecIntOff/RecFloatOff are SizeOf(TRecordStorage) and the byte offsets of its IntData/FloatData
 // fields, so record field access (J13) needs no hardcoded layout. Returns a TExecMem whose Ptr is a
 // TNativeLoopFn, or nil if the loop is not compilable.
 function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: Int64;
-                     AllowUnsafe, Modern: Boolean; XferIntBase, XferFloatBase: PtrUInt;
-                     RecFieldAddr: PtrUInt; RecSize, RecIntOff, RecFloatOff: Integer): TExecMem;
+                     AllowUnsafe, Modern: Boolean; XferIntOff, XferFloatOff: Integer;
+                     RecordsOff: Integer; RecSize, RecIntOff, RecFloatOff: Integer): TExecMem;
 
 // J2 self-test: emit  a+b  and call it, proving the emit->exec->call pipeline.
 function JitSelfTest(out Msg: string): Boolean;
@@ -77,8 +81,8 @@ type
   end;
 
 function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: Int64;
-                     AllowUnsafe, Modern: Boolean; XferIntBase, XferFloatBase: PtrUInt;
-                     RecFieldAddr: PtrUInt; RecSize, RecIntOff, RecFloatOff: Integer): TExecMem;
+                     AllowUnsafe, Modern: Boolean; XferIntOff, XferFloatOff: Integer;
+                     RecordsOff: Integer; RecSize, RecIntOff, RecFloatOff: Integer): TExecMem;
 var
   E: TX86Emitter;
   NativeOff: array of Integer;      // absolute bytecode PC -> native offset (sized ProgLen)
@@ -127,6 +131,7 @@ var
   NCArr2: Integer;
   CallerGpr: array of Integer;   // distinct native GPRs the caller uses (to preserve around every callee)
   NCallerGpr, GprSaveDisp: Integer;
+  CtxDisp: Integer;                  // [rsp+CtxDisp] holds the Ctx object pointer (4th call argument)
   // Callee integer register allocation (J6f): while emitting an inlined callee, its hottest int regs get a
   // native GPR (r9..r15, shared with the callee array cache by use-count priority), so the inner-loop index
   // no longer reloads from memory on every array access. Non-allocated callee int regs stay memory-homed.
@@ -240,6 +245,15 @@ var
   begin
     rex := $48; if natreg >= 8 then rex := rex or $01;   // REX.B
     E.Emit8(rex); E.Emit8($B8 or (natreg and 7)); E.Emit64(QWord(imm));
+  end;
+  // rdx = the current data pointer of a context dynamic-array field: loads the Ctx object from its
+  // stack slot, then the field at fieldOff (a dynamic array field IS the data pointer). Used by the
+  // Xfer-bank and record-heap accessors - per-context state read through the 4th call argument, so
+  // the emitted code holds no context-specific address (thread-agnostic, unlike the old baked bases).
+  procedure LoadCtxFieldRdx(fieldOff: Integer);
+  begin
+    E.EmitBytes([$48, $8B, $94, $24]); E.Emit32(LongWord(CtxDisp));   // mov rdx, [rsp+CtxDisp]
+    E.EmitBytes([$48, $8B, $92]); E.Emit32(LongWord(fieldOff));       // mov rdx, [rdx+fieldOff]
   end;
   // mov <native reg>, [rbx+disp]   (entry load; REX.W + REX.R if reg>=8; rbx base, mod=10 disp32)
   procedure LoadRegMem(natreg: Integer; disp: LongWord);
@@ -652,8 +666,7 @@ var
     E.EmitBytes([$73, $00]); p := E.Len - 1;        // jnc +over  (CF=0 -> not shared -> fast path)
     DeoptTo(apc);                                    // shared record -> interpreter (takes the lock)
     E.PatchByte(p, Byte(E.Len - (p + 1)));
-    MovImm64(RDX, Int64(RecFieldAddr));             // rdx = &Ctx.Records (address of the dyn-array field)
-    E.EmitBytes([$48, $8B, $12]);                    // mov rdx, [rdx]  -> current @Records[0]
+    LoadCtxFieldRdx(RecordsOff);                     // rdx = current @Ctx.Records[0] (via the ctx slot)
     E.EmitBytes([$48, $69, $C0]); E.Emit32(LongWord(RecSize));   // imul rax, rax, RecSize
     E.EmitBytes([$48, $01, $C2]);                    // add rdx, rax    -> @Records[handle]
     E.EmitBytes([$48, $8B, $8A]);                    // mov rcx, [rdx + fieldoff]  -> field data pointer
@@ -1152,28 +1165,29 @@ var
       bcCmpGeFloat: FloatCmp(3);
       bcCmpEqFloat: FloatCmp(4);
       bcCmpNeFloat: FloatCmp(5);
-      // Transfer registers (args / result): XferInt/XferFloat bases are baked as immediates into rdx.
+      // Transfer registers (args / result): the executing context's Xfer banks, read through the
+      // ctx slot at run time (per-context - a worker uses its own banks, not the main's).
       bcXferStoreInt:
         begin
           ILoad(RAX, I^.Src1);
-          MovImm64(RDX, Int64(XferIntBase));
+          LoadCtxFieldRdx(XferIntOff);
           E.MemOp([$48, $89], RAX, RDX, LongWord(I^.Immediate) * 8);       // mov [rdx+slot*8], rax
         end;
       bcXferStoreFloat:
         begin
           FLoad(XMM0, I^.Src1);
-          MovImm64(RDX, Int64(XferFloatBase));
+          LoadCtxFieldRdx(XferFloatOff);
           E.MemOp([$F2, $0F, $11], XMM0, RDX, LongWord(I^.Immediate) * 8);  // movsd [rdx+slot*8], xmm0
         end;
       bcXferLoadInt:
         begin
-          MovImm64(RDX, Int64(XferIntBase));
+          LoadCtxFieldRdx(XferIntOff);
           E.MemOp([$48, $8B], RAX, RDX, LongWord(I^.Immediate) * 8);        // mov rax, [rdx+slot*8]
           IStore(I^.Dest, RAX);
         end;
       bcXferLoadFloat:
         begin
-          MovImm64(RDX, Int64(XferFloatBase));
+          LoadCtxFieldRdx(XferFloatOff);
           E.MemOp([$F2, $0F, $10], XMM0, RDX, LongWord(I^.Immediate) * 8);  // movsd xmm0, [rdx+slot*8]
           FStore(I^.Dest, XMM0);
         end;
@@ -1481,9 +1495,12 @@ begin
   // Sparse frame-save lists (J6e) were built during allocation (the overflow branches): SaveIntRegs /
   // SaveFloatRegs hold exactly the USED caller regs that got no native register. For n-body's fully-allocated
   // main loop both are empty -> no per-call bank copy at all.
-  // Scratch layout: [0, (NSaveInt+NSaveFloat)*8) sparse bank save, then [GprSaveDisp, +NCallerGpr*8) GPR save.
+  // Scratch layout: [0, (NSaveInt+NSaveFloat)*8) sparse bank save, then [GprSaveDisp, +NCallerGpr*8)
+  // GPR save, then the 8-byte ctx slot at CtxDisp (always present: the Xfer/record accessors read the
+  // Ctx object pointer from it; rsp is stable through the body so the offset is fixed).
   GprSaveDisp := (NSaveInt + NSaveFloat) * 8;
-  ScratchBytes := GprSaveDisp + NCallerGpr * 8;
+  CtxDisp := GprSaveDisp + NCallerGpr * 8;
+  ScratchBytes := CtxDisp + 8;
 
   try
     // --- prologue ---  (Win64: rcx=IntRegs, rdx=FloatRegs; SysV: rdi/rsi)
@@ -1498,10 +1515,15 @@ begin
     E.EmitBytes([$48, $89, $CB]);             // mov rbx, rcx    (arg0 = IntRegs)
     E.EmitBytes([$48, $89, $D6]);             // mov rsi, rdx    (arg1 = FloatRegs)
     // arg2 (ArrDesc) is already in r8 on Win64.
+    E.EmitBytes([$4C, $89, $CA]);             // mov rdx, r9     (arg3 = Ctx - grabbed into rdx NOW:
+                                              // r9 is in the r9..r15 allocation pool and the entry
+                                              // loads below would clobber it. rdx stays untouched
+                                              // until the ctx slot store after the scratch reserve.)
     {$ELSE}
     E.EmitBytes([$48, $89, $FB]);             // mov rbx, rdi    (arg0 = IntRegs)
     E.EmitBytes([$48, $89, $F6]);             // mov rsi, rsi    (arg1 = FloatRegs, already in rsi)
     E.EmitBytes([$49, $89, $D0]);             // mov r8, rdx     (arg2 = ArrDesc)
+    E.EmitBytes([$48, $89, $CA]);             // mov rdx, rcx    (arg3 = Ctx, same reasoning as Win64)
     {$ENDIF}
 
     // Save the callee-saved xmm6/xmm7 (Win64) if they were allocated, then load the allocated VM float
@@ -1526,12 +1548,15 @@ begin
       if CArrCount[ci] >= 0 then R8LoadR(CArrCount[ci], LongWord(CArrId[ci]) * 32 + 16);
     end;
 
-    // Reserve stack scratch for inlined SUB frame save/restore (sits below the xmm6/7 save area; rsp is
-    // stable through the body so the scratch is at a fixed [rsp+0..ScratchBytes) offset).
+    // Reserve stack scratch for inlined SUB frame save/restore + the ctx slot (sits below the xmm6/7
+    // save area; rsp is stable through the body so the scratch is at a fixed [rsp+0..ScratchBytes)
+    // offset). ScratchBytes is always > 0 now (the ctx slot), so the reserve is unconditional.
     if ScratchBytes > 0 then
     begin
       E.EmitBytes([$48, $81, $EC]); E.Emit32(LongWord(ScratchBytes));   // sub rsp, ScratchBytes
     end;
+    // Park the Ctx object pointer (still in rdx from the argument moves) in its slot.
+    E.EmitBytes([$48, $89, $94, $24]); E.Emit32(LongWord(CtxDisp));     // mov [rsp+CtxDisp], rdx
 
     // --- body --- (each instruction is emitted by EmitOne; a bcCallSub emits its callee inline)
     for pc := HeaderPC to EndPC do

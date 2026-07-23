@@ -5777,15 +5777,18 @@ begin
     begin
       // Array/sqrt/div may only be compiled when their MODERN edge semantics match the native SSE forms
       // (no CLASSIC raise, no forced bounds-check).
-      // Xfer bank bases are baked into the native code as immediates (bcXferStore/Load + inlined SUB
-      // calls); FCtx.XferInt/XferFloat are SetLength'd once at init, so their [0] address is stable.
-      // @FCtx.Records is the address of the record-heap field (stable across resizes; the accessor derefs
-      // it at run time for the current base). Shared-record handles deopt, so no lock is baked in.
+      // Per-context state (Xfer banks, record heap) is reached through the EXECUTING context, passed
+      // as the native function's 4th argument: only the class FIELD OFFSETS are baked, never an
+      // address - so the same native loop is correct for the main context AND for THREADCREATE
+      // workers (this is what allowed the "main context only" JIT gate to go). Shared-record handles
+      // deopt, so no lock is baked in.
       Mem := CompileLoop(Ins, hdr, HeaderEnd[hdr], n, FTrueValue,
                          Assigned(FProgram) and FProgram.ModernMode and (not FBoundsCheck),
                          Assigned(FProgram) and FProgram.ModernMode,
-                         PtrUInt(@FCtx.XferInt[0]), PtrUInt(@FCtx.XferFloat[0]),
-                         PtrUInt(@FCtx.Records), RecSz, RIntOff, RFloatOff);
+                         Integer(PtrUInt(@FCtx.XferInt) - PtrUInt(Pointer(FCtx))),
+                         Integer(PtrUInt(@FCtx.XferFloat) - PtrUInt(Pointer(FCtx))),
+                         Integer(PtrUInt(@FCtx.Records) - PtrUInt(Pointer(FCtx))),
+                         RecSz, RIntOff, RFloatOff);
       if Mem <> nil then FNativeLoops[hdr] := Mem;
       if GetEnvironmentVariable('JIT_DIAG') <> '' then
       begin
