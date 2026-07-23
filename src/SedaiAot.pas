@@ -233,13 +233,20 @@ implementation
 
 uses TypInfo;
 
-// AOT_DYNF gate, read once. When on, AotCompileRegion allocates block-local float temporaries
-// to xmm dynamically instead of pinning the six hottest for the whole region.
-function AotDynFloatEnabled: Boolean;
+// AOT_DYNF gate, read once. Tri-state: 0 = AUTO (default: enable per region only where the
+// dynamic float allocator pays - see PlanDynFloat's throughput-bound test), 1 = force ON every
+// region (A/B and testing), 2 = force OFF (A/B baseline; static homes, byte-identical to before).
+function AotDynFloatMode: Integer;
+var s: string;
 begin
   if GAotDynFloatState < 0 then
-    if GetEnvironmentVariable('AOT_DYNF') <> '' then GAotDynFloatState := 1 else GAotDynFloatState := 0;
-  Result := GAotDynFloatState = 1;
+  begin
+    s := GetEnvironmentVariable('AOT_DYNF');
+    if s = '' then GAotDynFloatState := 0
+    else if s = '0' then GAotDynFloatState := 2
+    else GAotDynFloatState := 1;
+  end;
+  Result := GAotDynFloatState;
 end;
 
 // The B1 op set: scalar int/float compute + control flow + the Xfer scalar forms
@@ -2336,9 +2343,55 @@ var
   // first use, so no read hits an unwritten xmm - the implicit-zero hazard). Each admitted temp
   // holds one xmm for [firstDef .. lastTouch]; the greedy scan never evicts a started interval
   // (on overflow the newcomer stays in the bank), so an xmm holds exactly one temp at a time.
+  // AUTO-enable test: the dynamic allocator reclaims float memory traffic, which only moves the
+  // clock when the loop is THROUGHPUT-bound. A hot loop carrying a float divide or sqrt is
+  // LATENCY-bound (divsd/sqrtsd ~20 cycles): the reclaimed traffic hides under that latency and
+  // costs nothing, so dynamic allocation is neutral-to-slightly-negative (n-body). We therefore
+  // skip a region whose LOOP blocks contain ssaDivFloat/ssaMathSqr. Conservative: a cold divide
+  // in a non-loop block does not disqualify, and a false negative only forgoes a win, never
+  // regresses. Loop membership = any back edge (a successor at region index <= this block).
+  function RegionThroughputBound: Boolean;
+  var bi2, si, i2, ri, sIdx, lo: Integer;
+      B2, Sx: TSSABasicBlock; Ins2: TSSAInstruction;
+      inLoop: array of Boolean;
+    function RegIdxOf(B: TSSABasicBlock): Integer;
+    var q: Integer;
+    begin
+      Result := -1;
+      for q := Region.FirstBlock to Region.LastBlock do
+        if SSAProg.Blocks[q] = B then Exit(q - Region.FirstBlock);
+    end;
+  begin
+    ri := Region.LastBlock - Region.FirstBlock + 1;
+    SetLength(inLoop, ri);
+    for bi2 := 0 to ri - 1 do inLoop[bi2] := False;
+    for bi2 := 0 to ri - 1 do
+    begin
+      B2 := SSAProg.Blocks[Region.FirstBlock + bi2];
+      for si := 0 to B2.Successors.Count - 1 do
+      begin
+        Sx := TSSABasicBlock(B2.Successors[si]);
+        sIdx := RegIdxOf(Sx);
+        if (sIdx >= 0) and (sIdx <= bi2) then                 // back edge: [sIdx..bi2] is a loop
+          for lo := sIdx to bi2 do inLoop[lo] := True;
+      end;
+    end;
+    for bi2 := 0 to ri - 1 do
+    begin
+      if not inLoop[bi2] then System.Continue;
+      B2 := SSAProg.Blocks[Region.FirstBlock + bi2];
+      for i2 := 0 to B2.Instructions.Count - 1 do
+      begin
+        Ins2 := B2.Instructions[i2];
+        if (Ins2.OpCode = ssaDivFloat) or (Ins2.OpCode = ssaMathSqr) then Exit(False);
+      end;
+    end;
+    Result := True;
+  end;
+
   procedure PlanDynFloat;
   var
-    totpos, nbk, bi, kk, pp, r, a, x, xf: Integer;
+    totpos, nbk, bi, kk, pp, r, a, x, xf, mode: Integer;
     Blk: TSSABasicBlock; Ins: TSSAInstruction;
     blkOf, firstDef, firstUse, lastTouch, cand: array of Integer;
     activeReg: array[2..7] of Integer;
@@ -2359,8 +2412,10 @@ var
   begin
     DynFActive := False;
     for a := 0 to 7 do DynFCur[a] := -1;
-    if not AotDynFloatEnabled then Exit;
+    mode := AotDynFloatMode;
+    if mode = 2 then Exit;                                     // forced off
     if MaxFReg < 0 then Exit;
+    if (mode = 0) and not RegionThroughputBound then Exit;     // auto: skip latency-bound regions
     nbk := Region.LastBlock - Region.FirstBlock + 1;
     totpos := 0;
     for bi := 0 to nbk - 1 do Inc(totpos, SSAProg.Blocks[Region.FirstBlock + bi].Instructions.Count);
