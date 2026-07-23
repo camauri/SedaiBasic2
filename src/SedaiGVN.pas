@@ -128,6 +128,15 @@ type
     { Count how many instructions define each register (whole program) }
     procedure BuildDefCounts;
 
+    { Poison (def-count := 2) every single-def register whose def does NOT dominate every use.
+      Single-def alone is NOT single-assignment: a register can be READ before its one def runs
+      (the read sees the bank's implicit zero). "Dim n As Integer : Print Abs(n) : n = -69 :
+      Print Abs(n)" has one def of n, so both IntToFloat(n) hashed identically and GVN merged
+      them - the second Abs read the STALE conversion of the implicit zero (printed 0, not 69).
+      An explicit initializer emits a second def and was never affected; the implicit-zero path
+      (MODERN Dim without '= x', every CLASSIC variable) was. Runs after FDomTree is available. }
+    procedure PoisonUseBeforeDef;
+
     { True iff the value is a constant/none, or a register written by exactly ONE instruction }
     function IsSingleDef(const Value: TSSAValue): Boolean;
 
@@ -336,6 +345,98 @@ var
 begin
   if Value.Kind <> svkRegister then Exit(True);   // constants/labels/none are immutable
   Result := FDefCounts.TryGetValue(RegKey64(Value), Cnt) and (Cnt = 1);
+end;
+
+procedure TGVNPass.PoisonUseBeforeDef;
+type
+  TDefSite = record
+    Block: TSSABasicBlock;
+    Pos: Integer;
+  end;
+  TDefSiteMap = specialize TDictionary<Int64, TDefSite>;
+var
+  Sites: TDefSiteMap;
+  i, j, k: Integer;
+  Block: TSSABasicBlock;
+  Instr: TSSAInstruction;
+  Key: Int64;
+  Site: TDefSite;
+  Cnt: Integer;
+
+  procedure CheckUse(const V: TSSAValue; UseBlock: TSSABasicBlock; UsePos: Integer);
+  begin
+    if V.Kind <> svkRegister then Exit;
+    Key := RegKey64(V);
+    if not (FDefCounts.TryGetValue(Key, Cnt) and (Cnt = 1)) then Exit;   // only single-def matters
+    if not Sites.TryGetValue(Key, Site) then
+    begin
+      FDefCounts[Key] := 2;   // defensive: a counted def we failed to locate
+      Exit;
+    end;
+    // Same block: the def must come strictly BEFORE the use ("n = n + 1" reads the pre-def
+    // value in the same instruction, so UsePos = def pos also poisons). Different block: the
+    // def's block must dominate the use's block.
+    if Site.Block = UseBlock then
+    begin
+      if UsePos <= Site.Pos then FDefCounts[Key] := 2;
+    end
+    else if not FDomTree.IsDom(Site.Block, UseBlock) then
+      FDefCounts[Key] := 2;
+  end;
+
+begin
+  Sites := TDefSiteMap.Create;
+  try
+    // Sweep 1: record the def site of every (still) single-def register. The def-detection
+    // mirror of BuildDefCounts: Dest is a def except for the Dest-as-USE opcodes.
+    for i := 0 to FProgram.Blocks.Count - 1 do
+    begin
+      Block := FProgram.Blocks[i];
+      for j := 0 to Block.Instructions.Count - 1 do
+      begin
+        Instr := Block.Instructions[j];
+        if Instr.Dest.Kind <> svkRegister then Continue;
+        case Instr.OpCode of
+          ssaArrayStore, ssaArrayStoreIndInt, ssaArrayStoreIndFloat,
+          ssaArrayStoreIndString, ssaPrint, ssaPrintLn:
+            Continue;
+        else
+          Key := RegKey64(Instr.Dest);
+          if FDefCounts.TryGetValue(Key, Cnt) and (Cnt = 1) then
+          begin
+            Site.Block := Block;
+            Site.Pos := j;
+            Sites.AddOrSetValue(Key, Site);
+          end;
+        end;
+      end;
+    end;
+    // Sweep 2: every register USE must be dominated by its single def, or the register is
+    // poisoned. PHI sources are uses at the END of their predecessor block.
+    for i := 0 to FProgram.Blocks.Count - 1 do
+    begin
+      Block := FProgram.Blocks[i];
+      for j := 0 to Block.Instructions.Count - 1 do
+      begin
+        Instr := Block.Instructions[j];
+        CheckUse(Instr.Src1, Block, j);
+        CheckUse(Instr.Src2, Block, j);
+        CheckUse(Instr.Src3, Block, j);
+        case Instr.OpCode of
+          ssaArrayStore, ssaArrayStoreIndInt, ssaArrayStoreIndFloat,
+          ssaArrayStoreIndString, ssaPrint, ssaPrintLn:
+            CheckUse(Instr.Dest, Block, j);
+        end;
+        for k := 0 to High(Instr.PhiSources) do
+          if Instr.PhiSources[k].FromBlock <> nil then
+            CheckUse(Instr.PhiSources[k].Value, Instr.PhiSources[k].FromBlock, MaxInt)
+          else
+            CheckUse(Instr.PhiSources[k].Value, Block, j);
+      end;
+    end;
+  finally
+    Sites.Free;
+  end;
 end;
 
 function TGVNPass.IsLoopVariant(const Value: TSSAValue): Boolean;
@@ -687,6 +788,11 @@ begin
   end;
 
   FDomTree := TDominatorTree(DomTreeObj);
+
+  // Single-def is not enough: the one def must also DOMINATE every use (a use-before-def
+  // reads the bank's implicit zero and must not share the def's value number). Needs the
+  // dominator tree, hence after the assignment above.
+  PoisonUseBeforeDef;
 
   // STEP 4: Traverse blocks in preorder
   {$IFDEF DEBUG_GVN}
