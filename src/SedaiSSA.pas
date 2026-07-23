@@ -1502,7 +1502,7 @@ var
   ArgValue, ArgReg: TSSAValue;
   MaskValue, MaskReg: TSSAValue;   // FORMAT(num, mask): the mask string operand
   TempReg, IntReg: Integer;
-  IntRegVal, TempVal: TSSAValue;
+  IntRegVal, TempVal, TempVal2: TSSAValue;
   ArgListNode: TASTNode;
   TempFloat: Double;
   TempInt: Integer;
@@ -1687,6 +1687,31 @@ begin
         end;
         Exit;
       end;
+      // *Cast/CPtr(T Ptr, x) over a RAW address: the CAST's pointee decides the width AND the
+      // signedness of the load, not x's declared pointee - that is the whole point of the cast
+      // ("*CPtr(Byte Ptr, @int32holding_&h80)" reads ONE signed byte: fbc prints -128, and the
+      // old path read x's full declared width, printing 128). Guarded on RawPtrExprName so only
+      // genuinely raw addresses take it; packed/managed addresses keep the generic path below.
+      if (DerefTarget.NodeType = antCast) and (RawPtrExprName(DerefTarget) <> '') then
+      begin
+        TempStr := DerefedType(DerefTarget);
+        if TempStr <> '' then
+        begin
+          ProcessExpression(DerefTarget, Left);
+          Left := EnsureIntRegister(Left);
+          if (TempStr = 'SINGLE') or (TempStr = 'DOUBLE') then
+          begin
+            Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+            EmitInstruction(ssaRawLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(TempStr)));
+          end
+          else
+          begin
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaRawLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(TempStr)));
+          end;
+          Exit;
+        end;
+      end;
       // *p / *(p±n) where p is a RAW (Allocate'd) pointer: load SizeOf(pointee) bytes from the raw heap.
       // RawPtrExprName resolves the pointer var (for its element type) through the arithmetic.
       if RawPtrExprName(Node.GetChild(0)) <> '' then
@@ -1718,6 +1743,46 @@ begin
         srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       else
         EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+      // *Cast/CPtr(T Ptr, x) over a MANAGED (packed-slot) address: the slot is read whole, but the
+      // cast asks for T's view of it - reinterpret the LOW bytes at T's width and signedness, like
+      // little-endian memory would ("*CPtr(Byte Ptr, @int32holding_&h80)": fbc prints -128, the
+      // whole-slot read said 128). Int-family pointees only; a cross-bank pun needs a raw backing
+      // (the @-taken-scalar raw path) and keeps the whole-slot behavior here.
+      if (DerefTarget.NodeType = antCast) and (FuncRetType = srtInt) then
+      begin
+        TempStr := DerefedType(DerefTarget);
+        DestReg := 0;   // reused as the shift width for the sign-extending pointee views
+        TempVal2 := MakeSSAValue(svkNone);
+        case TempStr of
+          'BYTE':  DestReg := 56;
+          'SHORT': DestReg := 48;
+          'LONG':  DestReg := 32;
+          'UBYTE', 'USHORT', 'ULONG':
+          begin
+            // Binary-op constants must live in registers (the translator has no Src2 immediates).
+            TempVal2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            if TempStr = 'UBYTE' then
+              EmitInstruction(ssaLoadConstInt, TempVal2, MakeSSAConstInt($FF), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+            else if TempStr = 'USHORT' then
+              EmitInstruction(ssaLoadConstInt, TempVal2, MakeSSAConstInt($FFFF), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+            else
+              EmitInstruction(ssaLoadConstInt, TempVal2, MakeSSAConstInt($FFFFFFFF), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Left := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaBitwiseAnd, Left, Result, TempVal2, MakeSSAValue(svkNone));
+            Result := Left;
+          end;
+        end;
+        if DestReg > 0 then
+        begin
+          // Sign extension: (v SHL n) SHR n - our integer SHR is arithmetic on the int bank.
+          TempVal2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, TempVal2, MakeSSAConstInt(DestReg), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Left := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaShl, Left, Result, TempVal2, MakeSSAValue(svkNone));
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaShr, Result, Left, TempVal2, MakeSSAValue(svkNone));
+        end;
       end;
     end;
 
@@ -8250,7 +8315,7 @@ procedure TSSAGenerator.EmitBitMacro(const FuncName: string; ArgsNode: TASTNode;
 //   BITSET(x, b)   = x OR  (1 SHL b)         BITRESET(x, b) = x AND NOT (1 SHL b)
 //   CBOOL(x)       = -1 if x <> 0 else 0     (matches the VM's -1/0 boolean convention)
 var
-  V0, V1, A0, A1, Tmp, OneShl, NotShl: TSSAValue;
+  V0, V1, A0, A1, Tmp, Tmp2, OneShl, NotShl: TSSAValue;
 
   function NewIntReg: TSSAValue;
   begin
@@ -8297,7 +8362,10 @@ begin
     begin
       Tmp := NewIntReg;
       EmitInstruction(ssaShr, Tmp, A0, A1, MakeSSAValue(svkNone));            // x SHR b
-      EmitInstruction(ssaBitwiseAnd, Result, Tmp, IntConst(1), MakeSSAValue(svkNone));   // AND 1
+      Tmp2 := NewIntReg;
+      EmitInstruction(ssaBitwiseAnd, Tmp2, Tmp, IntConst(1), MakeSSAValue(svkNone));   // AND 1
+      // fbc returns a BOOLEAN result: -1 when the bit is set, 0 when clear (not the raw bit).
+      EmitInstruction(ssaCmpNeInt, Result, Tmp2, IntConst(0), MakeSSAValue(svkNone));
     end
     else if FuncName = kBITSET then
     begin
@@ -19839,6 +19907,15 @@ begin
   begin
     // *(*inner): the type of *inner must itself be a pointer; deref it one more level.
     T := DerefedType(Node.GetChild(0));
+    if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+      Result := Trim(Copy(T, 1, Length(T) - 4));
+  end
+  else if Node.NodeType = antCast then
+  begin
+    // *CPtr(T Ptr, x) / *Cast(T Ptr, x): the cast names the pointee outright - the deref must
+    // read at T's width and signedness, not at the width of x's original declaration
+    // ("*CPtr(Byte Ptr, @int32val)" reads ONE signed byte: fbc prints -128 for &h80).
+    T := UpperCase(VarToStr(Node.Value));
     if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
       Result := Trim(Copy(T, 1, Length(T) - 4));
   end
