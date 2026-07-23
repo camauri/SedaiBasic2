@@ -195,7 +195,7 @@ var
     else if FLoc[vmreg] >= 0 then
     begin
       if FLoc[vmreg] <> Wx then
-        E.EmitBytes([$F2, $0F, $10, $C0 or (Wx shl 3) or FLoc[vmreg]])    // movsd Wx, xmm_src
+        E.EmitBytes([$0F, $28, $C0 or (Wx shl 3) or FLoc[vmreg]])         // movaps Wx, xmm_src
     end
     else
       E.MemOp([$F2, $0F, $10], Wx, RSI, LongWord(vmreg) * 8);             // movsd Wx, [rsi+off]
@@ -218,7 +218,7 @@ var
     else if FLoc[vmreg] >= 0 then
     begin
       if FLoc[vmreg] <> Wx then
-        E.EmitBytes([$F2, $0F, $10, $C0 or (FLoc[vmreg] shl 3) or Wx])    // movsd xmm_dst, Wx
+        E.EmitBytes([$0F, $28, $C0 or (FLoc[vmreg] shl 3) or Wx])         // movaps xmm_dst, Wx
     end
     else
       E.MemOp([$F2, $0F, $11], Wx, RSI, LongWord(vmreg) * 8);             // movsd [rsi+off], Wx
