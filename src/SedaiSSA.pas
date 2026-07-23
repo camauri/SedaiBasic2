@@ -11164,15 +11164,14 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessBeep(Node: TASTNode);
-// BEEP (FreeBASIC/QB): ring the console bell. Lowered to printing the BEL character (CHR 7) with no
-// newline — no dedicated opcode needed. On a terminal this beeps; headless it emits the byte.
-var
-  R: TSSAValue;
+// BEEP (FreeBASIC/QB): ring the console bell. fbc's Beep writes NOTHING to stdout - redirected
+// output stays empty (verified: the fbc-built example produces zero bytes) - it beeps through
+// the console/speaker API. Printing CHR(7) here put a stray byte in every captured output, so
+// the statement is a deliberate NO-OP for the byte stream. Deviation: on an interactive
+// console the audible bell is lost too (no bell hook in IOutputDevice yet - add one there if
+// it is ever missed, never by printing the byte).
 begin
   if FCurrentBlock = nil then Exit;
-  R := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-  EmitInstruction(ssaLoadConstString, R, MakeSSAConstString(Chr(7)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-  EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), R, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
 { ProcessBox - Handle BOX command for drawing rectangles

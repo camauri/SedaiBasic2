@@ -267,6 +267,53 @@ begin
   Rest := Trim(Copy(s, p, MaxInt));
 end;
 
+var
+  // The full source text of the module being preprocessed, for SourceDeclaresSymbol below.
+  // Set by PreprocessSource before Expand; the preprocessor is single-threaded by design.
+  GPPSourceForDefined: string = '';
+
+function SourceDeclaresSymbol(const Nm: string): Boolean;
+// fbc's Defined() answers TRUE for COMPILER-level symbols too, not only #defines: a Const, a
+// Dim/Redim/Static variable, a Sub/Function name (fbc-verified: examples/manual/prepro/defined
+// expects a Const and a Dim to count). This preprocessor runs on TEXT before any symbol table
+// exists, so the question is answered by a declaration-shaped scan: a line whose first word is
+// a declaring keyword and that contains Nm as a whole word. A name inside a same-line comment
+// or string can false-positive - accepted for a #if convenience predicate.
+var
+  L: TStringList;
+  i, p, q: Integer;
+  U, W: string;
+begin
+  Result := False;
+  if Nm = '' then Exit;
+  L := TStringList.Create;
+  try
+    L.Text := GPPSourceForDefined;
+    for i := 0 to L.Count - 1 do
+    begin
+      U := UpperCase(TrimLeft(L[i]));
+      p := 1;
+      while (p <= Length(U)) and IsIdentChar(U[p]) do Inc(p);
+      W := Copy(U, 1, p - 1);
+      if (W = 'CONST') or (W = 'DIM') or (W = 'REDIM') or (W = 'STATIC') or (W = 'VAR') or
+         (W = 'SUB') or (W = 'FUNCTION') or (W = 'DECLARE') or (W = 'TYPE') or
+         (W = 'ENUM') or (W = 'COMMON') then
+      begin
+        q := Pos(Nm, U);
+        while q > 0 do
+        begin
+          if ((q = 1) or not IsIdentChar(U[q - 1])) and
+             ((q + Length(Nm) > Length(U)) or not IsIdentChar(U[q + Length(Nm)])) then
+            Exit(True);
+          q := Pos(Nm, U, q + 1);
+        end;
+      end;
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
 // Evaluate a #if / #elif constant integer expression. Supports: decimal and &H/&O/&B literals;
 // defined(NAME) / defined NAME; bare macro names (-> their integer value, or 0 if undefined or
 // non-numeric); parentheses; unary "-"/"+" and NOT/"!"; "*" "/" "\" MOD; "+" "-"; comparisons
@@ -332,7 +379,10 @@ var
           while (q <= Length(S)) and IsIdentChar(S[q]) do Inc(q);
           nm := UpperCase(Copy(S, p, q - p)); p := q;
           while (p <= Length(S)) and (S[p] in [' ', #9, ')']) do Inc(p);
-          if Defs.IndexOfName(nm) >= 0 then Toks.Add('1') else Toks.Add('0');
+          if (Defs.IndexOfName(nm) >= 0) or SourceDeclaresSymbol(nm) then
+            Toks.Add('1')
+          else
+            Toks.Add('0');
         end
         else if id = 'TYPEOF' then
           // "#if TypeOf(a) = TypeOf(b)" asks a question only the compiler's symbol table can answer,
@@ -525,10 +575,67 @@ var
   Active, Taken: array of Boolean;
   NowDT: TDateTime;      // captured once for __DATE__/__DATE_ISO__/__TIME__
   PathStr: string;       // module directory for __PATH__
+  EscapeOn: Boolean;     // OPTION ESCAPE seen: plain "..." strings become escaped from here on
 
   function Emitting: Boolean;
   begin
     Result := (Length(Active) = 0) or Active[High(Active)];
+  end;
+
+  // OPTION ESCAPE (fblite/qb): from this statement on, ESCAPE SEQUENCES ARE PROCESSED in plain
+  // double-quoted strings ("\\" prints one backslash - fbc-verified). Escaping lives in the
+  // LEXER's !"..." handling and tokens are cut before the parser could flip any mode, so the
+  // preprocessor - which runs first and is line-based - rewrites every plain opening quote to
+  // the !"..." form instead. $"..." (raw) and already-!"..." strings are left alone, and the
+  // scan stops at a ' comment. Inside a rewritten string, \x escapes and doubled "" are
+  // skipped so the closing quote is found exactly where the lexer will find it.
+  function ApplyEscapeRewrite(const S: string): string;
+  var
+    i: Integer;
+    InStr: Boolean;
+  begin
+    Result := '';
+    InStr := False;
+    i := 1;
+    while i <= Length(S) do
+    begin
+      if not InStr then
+      begin
+        if S[i] = '''' then begin Result := Result + Copy(S, i, MaxInt); Exit; end;  // comment tail
+        if S[i] = '"' then
+        begin
+          if (Length(Result) = 0) or
+             ((Result[Length(Result)] <> '!') and (Result[Length(Result)] <> '$')) then
+            Result := Result + '!';
+          InStr := True;
+        end;
+        Result := Result + S[i];
+        Inc(i);
+      end
+      else
+      begin
+        if (S[i] = '\') and (i < Length(S)) then
+        begin
+          Result := Result + S[i] + S[i + 1]; Inc(i, 2); Continue;
+        end;
+        if (S[i] = '"') and (i < Length(S)) and (S[i + 1] = '"') then
+        begin
+          Result := Result + '""'; Inc(i, 2); Continue;
+        end;
+        if S[i] = '"' then InStr := False;
+        Result := Result + S[i];
+        Inc(i);
+      end;
+    end;
+  end;
+
+  // True if the line's statement text is OPTION ESCAPE (leading whitespace tolerated).
+  function IsOptionEscapeLine(const Trimmed: string): Boolean;
+  var
+    U: string;
+  begin
+    U := UpperCase(Trimmed);
+    Result := (Copy(U, 1, 6) = 'OPTION') and (Pos('ESCAPE', U) > 0) and (Pos('"', U) = 0);
   end;
 
   procedure Expand(const Text, Dir: string);
@@ -761,7 +868,13 @@ var
           Output.Add('');
         end
         else if Emitting then
-          Output.Add(SubstituteMacros(Raw, Defs, FnDefs))
+        begin
+          if IsOptionEscapeLine(Trimmed) then EscapeOn := True;   // takes effect from THIS line on
+          if EscapeOn then
+            Output.Add(ApplyEscapeRewrite(SubstituteMacros(Raw, Defs, FnDefs)))
+          else
+            Output.Add(SubstituteMacros(Raw, Defs, FnDefs));
+        end
         else
           Output.Add('');   // excluded line — blank placeholder preserves line numbers
         Inc(li);
@@ -780,8 +893,10 @@ var
 begin
   // Fast path: no preprocessor directive and no intrinsic-define usage -> return unchanged (zero
   // overhead for normal code). '#' covers all directives; '__' covers bare __FB_*__ intrinsic
-  // macros; '$ covers the QuickBASIC '$INCLUDE metacommand.
-  if (Pos('#', Src) = 0) and (Pos('__', Src) = 0) and (Pos('''$', Src) = 0) then
+  // macros; '$ covers the QuickBASIC '$INCLUDE metacommand; 'scape'/'SCAPE' covers OPTION
+  // ESCAPE, whose string rewrite lives here (a false hit merely runs the preprocessor).
+  if (Pos('#', Src) = 0) and (Pos('__', Src) = 0) and (Pos('''$', Src) = 0) and
+     (Pos('scape', Src) = 0) and (Pos('SCAPE', Src) = 0) then
     Exit(Src);
 
   Defs := TStringList.Create;
@@ -806,6 +921,8 @@ begin
     Defs.Values['__PATH__'] := '"' + PathStr + '"';
     SetLength(Active, 0);
     SetLength(Taken, 0);
+    EscapeOn := False;
+    GPPSourceForDefined := Src;   // lets defined() see Const/Dim/proc declarations, like fbc
     Expand(Src, BaseDir);
     Result := Output.Text;
   finally
