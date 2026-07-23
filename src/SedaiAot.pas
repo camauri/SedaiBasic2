@@ -185,6 +185,14 @@ var
   // zero hot-loop spill, collapsing the distinct-register memory traffic to nothing.
   AotDiagMaxLiveInt: Integer = 0;
   AotDiagMaxLiveFloat: Integer = 0;
+  // Loop-weighted register traffic already resident (top pool-size slots the static home
+  // allocator pins) vs the spilled tail. A large spilled-tail with a SMALL maxLive is the
+  // signature of the static allocator's inability to time-multiplex a machine register across
+  // disjoint-lifetime values - exactly the traffic a linear-scan allocator would reclaim.
+  AotDiagFloatResident: Int64 = 0;
+  AotDiagFloatTotal: Int64 = 0;
+  AotDiagIntResident: Int64 = 0;
+  AotDiagIntTotal: Int64 = 0;
   AotDiagLivenessOK: Boolean = False;
   // C3: runtime-helper calls emitted in the last region. Also the coverage delta this stage
   // bought: a region reporting helpers>0 is one that could not compile at all before, since
@@ -1580,6 +1588,7 @@ var
     UseI, DefI, InI, OutI: array of array of Boolean;
     UseF, DefF, InF, OutF: array of array of Boolean;
     CurLiveI, CurLiveF: array of Boolean;             // mid-block live set (peak measurement)
+    used: array of Boolean; kk, bestr: Integer; bestv, totF, topF, totI, topI: Int64;  // TEMP payoff probe
 
     // Mark an operand read as live in the mid-block replay set (diagnostic only).
     procedure MidMarkUse(const V: TSSAValue; var LiveI, LiveF: array of Boolean);
@@ -1775,6 +1784,29 @@ var
     for r2 := 0 to MaxIReg do if IUse[r2] > 0 then Inc(AotDiagDistinctInt);
     AotDiagDistinctFloat := 0;
     for r2 := 0 to MaxFReg do if FUse[r2] > 0 then Inc(AotDiagDistinctFloat);
+
+    // Payoff probe: loop-weighted use already resident (top pool-size slots the static
+    // allocator pins) vs the spilled tail. Computed always (a few thousand iterations),
+    // printed only under Diag. A large tail with small maxLive => linear-scan opportunity.
+    totF := 0; topF := 0; totI := 0; topI := 0;
+    for r2 := 0 to MaxFReg do totF := totF + FUse[r2];
+    SetLength(used, MaxFReg + 1);
+    for kk := 1 to 6 do
+    begin
+      bestr := -1; bestv := 0;
+      for r2 := 0 to MaxFReg do if (not used[r2]) and (FUse[r2] > bestv) then begin bestr := r2; bestv := FUse[r2]; end;
+      if bestr < 0 then Break; used[bestr] := True; topF := topF + bestv;
+    end;
+    for r2 := 0 to MaxIReg do totI := totI + IUse[r2];
+    SetLength(used, 0); SetLength(used, MaxIReg + 1);
+    for kk := 1 to 7 do
+    begin
+      bestr := -1; bestv := 0;
+      for r2 := 0 to MaxIReg do if (not used[r2]) and (IUse[r2] > bestv) then begin bestr := r2; bestv := IUse[r2]; end;
+      if bestr < 0 then Break; used[bestr] := True; topI := topI + bestv;
+    end;
+    AotDiagFloatResident := topF; AotDiagFloatTotal := totF;
+    AotDiagIntResident := topI; AotDiagIntTotal := totI;
     AotDiagLivenessOK := LivenessOK;
   end;
 
@@ -2650,6 +2682,14 @@ begin
                                    AotDiagHelperCalls]));
         if AotDiagHelperOps <> '' then
           WriteLn(ErrOutput, '[AOT]   helper ops: ' + AotDiagHelperOps);
+        if AotDiagFloatTotal > 0 then
+          WriteLn(ErrOutput, Format('[AOT]   float traffic: resident=%d spilled-tail=%d (%.1f%% memory-resident)',
+            [AotDiagFloatResident, AotDiagFloatTotal - AotDiagFloatResident,
+             100.0 * (AotDiagFloatTotal - AotDiagFloatResident) / AotDiagFloatTotal]));
+        if AotDiagIntTotal > 0 then
+          WriteLn(ErrOutput, Format('[AOT]   int traffic:   resident=%d spilled-tail=%d (%.1f%% memory-resident)',
+            [AotDiagIntResident, AotDiagIntTotal - AotDiagIntResident,
+             100.0 * (AotDiagIntTotal - AotDiagIntResident) / AotDiagIntTotal]));
       end;
     end
     else if Diag then
