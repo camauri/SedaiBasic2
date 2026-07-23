@@ -365,6 +365,14 @@ type
     procedure ExecuteChdir(const Path: string);
     procedure ExecuteRmdir(const Path: string);
     procedure ExecuteMoveFile(const Src, Dest: string);
+    // FreeBASIC function forms of the filesystem commands: same actions as the Execute* statement
+    // handlers but NEVER raise - they return the fbc-verified error code instead (Immediate = -1
+    // dispatch in ExecuteInstruction).
+    function FsChdirCode(const Path: string): Integer;    // 0 ok, -1 failure
+    function FsMkdirCode(const Path: string): Integer;    // 0 ok, -1 failure (incl. already exists)
+    function FsRmdirCode(const Path: string): Integer;    // 0 ok, -1 failure
+    function FsKillCode(const FileName: string): Integer; // 0 ok, 2 not found, 13 delete failed
+    function FsCopyFileCode(const Src, Dest: string): Integer; // 0 ok, 1 failure; always overwrites
     procedure InitializeRegisters;
     procedure ClearAllVariables;
     procedure EnsureRegisterCapacity(Ctx: TExecutionContext; RegType: TSSARegisterType; MinIndex: Integer);
@@ -5252,13 +5260,24 @@ begin
     // === FILE MANAGEMENT COMMANDS (executed directly in VM) ===
     bcCopyFile:
       begin
-        // COPY "src", "dest" [, overwrite]
-        // Src1 = source path, Src2 = dest path, Dest = overwrite flag (int reg)
-        ExecuteCopyFile(Ctx.StringRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2],
-                       Ctx.IntRegs[Instr.Dest] <> 0);
+        // COPY/FILECOPY "src", "dest" [, overwrite]
+        // Src1 = source path, Src2 = dest path, Immediate = overwrite flag INT REGISTER index
+        // (that is where the compiler has always put Src3 - the old code read the flag from
+        // IntRegs[Dest] with Dest=0, i.e. whatever garbage R0 held). Immediate = -1 is the
+        // FreeBASIC function form FileCopy(src, dst): always overwrite, error code into Dest.
+        if Instr.Immediate = -1 then
+          Ctx.IntRegs[Instr.Dest] := FsCopyFileCode(Ctx.StringRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2])
+        else
+          ExecuteCopyFile(Ctx.StringRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2],
+                         Ctx.IntRegs[Instr.Immediate] <> 0);
       end;
 
     bcScratch:
+      if Instr.Immediate = -1 then
+        // FreeBASIC function form Kill(file): delete one file, error code into Dest
+        // (0 ok, 2 file not found, 13 delete failed) - no v7 prompt/pattern semantics.
+        Ctx.IntRegs[Instr.Dest] := FsKillCode(Ctx.StringRegs[Instr.Src1])
+      else
       begin
         // SCRATCH "pattern" [, flags]
         // Src1 = pattern, Src2 = flags (int reg): 1 = silent, 2 = force, 3 = both
@@ -5282,11 +5301,12 @@ begin
       end;
 
     bcMkdir:
-      begin
-        // MKDIR "path"
-        // Src1 = path
+      // Immediate = -1: FreeBASIC function form MkDir(path) - error code into Dest (0/-1).
+      if Instr.Immediate = -1 then
+        Ctx.IntRegs[Instr.Dest] := FsMkdirCode(Ctx.StringRegs[Instr.Src1])
+      else
+        // MKDIR "path" - Src1 = path
         ExecuteMkdir(Ctx.StringRegs[Instr.Src1]);
-      end;
 
     bcSetEnviron:
       begin
@@ -5296,24 +5316,29 @@ begin
       end;
 
     bcShell:
-      begin
-        // SHELL cmd: run the command through the platform shell. Dest (if used) receives the exit code.
-        Ctx.IntRegs[Instr.Dest] := RunShellCommand(Ctx.StringRegs[Instr.Src1]);
-      end;
+      // SHELL cmd: run the command through the platform shell. Immediate = -1 is the FreeBASIC
+      // function form Shell(cmd): exit code into Dest. The STATEMENT form must NOT touch Dest -
+      // it is 0 there, and the old unconditional store clobbered live int register R0.
+      if Instr.Immediate = -1 then
+        Ctx.IntRegs[Instr.Dest] := RunShellCommand(Ctx.StringRegs[Instr.Src1])
+      else
+        RunShellCommand(Ctx.StringRegs[Instr.Src1]);
 
     bcChdir:
-      begin
-        // CHDIR "path"
-        // Src1 = path
+      // Immediate = -1: FreeBASIC function form ChDir(path) - error code into Dest (0/-1).
+      if Instr.Immediate = -1 then
+        Ctx.IntRegs[Instr.Dest] := FsChdirCode(Ctx.StringRegs[Instr.Src1])
+      else
+        // CHDIR "path" - Src1 = path
         ExecuteChdir(Ctx.StringRegs[Instr.Src1]);
-      end;
 
     bcRmdir:
-      begin
-        // RMDIR "path" (FreeBASIC/QB) - remove an empty directory
-        // Src1 = path
+      // Immediate = -1: FreeBASIC function form RmDir(path) - error code into Dest (0/-1).
+      if Instr.Immediate = -1 then
+        Ctx.IntRegs[Instr.Dest] := FsRmdirCode(Ctx.StringRegs[Instr.Src1])
+      else
+        // RMDIR "path" (FreeBASIC/QB) - remove an empty directory; Src1 = path
         ExecuteRmdir(Ctx.StringRegs[Instr.Src1]);
-      end;
 
     bcMoveFile:
       begin
@@ -10417,6 +10442,59 @@ begin
     ExecuteCopyFile(Src, DstFullPath, False);
     if not SysUtils.DeleteFile(Src) then
       RaiseFileError('File I/O error', FBERR_FILE_IO, '?CANNOT DELETE SOURCE AFTER MOVE', ERR_FILE_ACCESS);
+  end;
+end;
+
+function TBytecodeVM.FsChdirCode(const Path: string): Integer;
+begin
+  if SetCurrentDir(Path) then Result := 0 else Result := -1;
+end;
+
+function TBytecodeVM.FsMkdirCode(const Path: string): Integer;
+begin
+  // fbc: creating an existing directory fails with -1 (CreateDir already covers that case).
+  if CreateDir(Path) then Result := 0 else Result := -1;
+end;
+
+function TBytecodeVM.FsRmdirCode(const Path: string): Integer;
+begin
+  if RemoveDir(Path) then Result := 0 else Result := -1;
+end;
+
+function TBytecodeVM.FsKillCode(const FileName: string): Integer;
+begin
+  // fbc returns the C runtime's errno: 2 (ENOENT) for a missing file - the case programs
+  // actually test for - and an access-class error otherwise (13 = EACCES).
+  if not FileExists(FileName) then
+    Result := 2
+  else if SysUtils.DeleteFile(FileName) then
+    Result := 0
+  else
+    Result := 13;
+end;
+
+function TBytecodeVM.FsCopyFileCode(const Src, Dest: string): Integer;
+var
+  SrcStream, DstStream: TFileStream;
+begin
+  // fbc: 0 on success, 1 on any error; an existing destination is always overwritten.
+  Result := 1;
+  if not FileExists(Src) then Exit;
+  try
+    SrcStream := TFileStream.Create(Src, fmOpenRead or fmShareDenyWrite);
+    try
+      DstStream := TFileStream.Create(Dest, fmCreate);
+      try
+        DstStream.CopyFrom(SrcStream, SrcStream.Size);
+        Result := 0;
+      finally
+        DstStream.Free;
+      end;
+    finally
+      SrcStream.Free;
+    end;
+  except
+    Result := 1;
   end;
 end;
 

@@ -6019,7 +6019,9 @@ begin
     // FreeBASIC/QB filesystem mutation: KILL deletes a file (= SCRATCH), FILECOPY copies (= COPY),
     // RMDIR removes a directory (new).
     'KILL': Result := TASTNode.Create(antScratch, Token);
-    'FILECOPY': Result := TASTNode.Create(antCopy, Token);
+    // FILECOPY stamps its name as the node value: the shared antCopy lowering reads it to pick
+    // the overwrite default (FreeBASIC FILECOPY always overwrites; v7 COPY does not).
+    'FILECOPY': Result := TASTNode.CreateWithValue(antCopy, CmdName, Token);
     'RMDIR', 'RD': Result := TASTNode.Create(antRmdir, Token);
   else
     Result := TASTNode.Create(antStatement, Token);

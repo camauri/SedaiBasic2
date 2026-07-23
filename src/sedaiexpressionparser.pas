@@ -76,6 +76,7 @@ type
     function ParseMemoryFunction(Token: TLexerToken): TASTNode;
     function ParseGraphicsFunction(Token: TLexerToken): TASTNode;
     function ParseGraphicsCommandForm(Token: TLexerToken): TASTNode;  // FreeBASIC SCREEN(row, col [, flag])
+    function ParseFsFunctionForm(Token: TLexerToken): TASTNode;  // FreeBASIC ChDir/MkDir/RmDir/Kill/FileCopy/Shell(...) -> error code
     function ParseSpriteFunction(Token: TLexerToken): TASTNode;
     function ParseInputFunction(Token: TLexerToken): TASTNode;
     function ParseInputFunctionForm(Token: TLexerToken): TASTNode;   // FreeBASIC INPUT(n [, [#]f])
@@ -129,6 +130,7 @@ function StaticParseStringFunction(Parser: Pointer; Token: TLexerToken): TObject
 function StaticParseMemoryFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseGraphicsFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseGraphicsCommandForm(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseFsFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseSpriteFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseInputFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseInputFunction(Parser: Pointer; Token: TLexerToken): TObject;
@@ -247,6 +249,11 @@ end;
 function StaticParseGraphicsCommandForm(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseGraphicsCommandForm(Token);
+end;
+
+function StaticParseFsFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseFsFunctionForm(Token);
 end;
 
 function StaticParseSpriteFunction(Parser: Pointer; Token: TLexerToken): TObject;
@@ -438,6 +445,12 @@ begin
   // reading back a console cell ("Screen(row, col)"). Only that one command has a function form, so the
   // rule accepts SCREEN and rejects every other graphics command still standing in expression position.
   Context.SetParseRule(ttGraphicsCommand, MakePrefixRule(@StaticParseGraphicsCommandForm, precCall));
+  // FreeBASIC gives the filesystem commands a FUNCTION form returning the error code as a Long:
+  // ChDir/MkDir/RmDir/Kill/FileCopy(...) and Shell(...) -> exit code. The commands lex as
+  // ttFileManagement (their usual role is the statement, parsed by the statement parser and never
+  // reaching here), so a prefix rule fires only in expression position. MODERN only, and only for
+  // the commands FreeBASIC actually exposes as functions - anything else stays a syntax error.
+  Context.SetParseRule(ttFileManagement, MakePrefixRule(@StaticParseFsFunctionForm, precCall));
   Context.SetParseRule(ttSpriteFunction, MakePrefixRule(@StaticParseSpriteFunction, precCall));
   Context.SetParseRule(ttInputFunction, MakePrefixRule(@StaticParseInputFunction, precCall));
   // FreeBASIC INPUT(n [, [#]filenum]) — the FUNCTION form, which reads n characters and returns them.
@@ -1308,6 +1321,42 @@ begin
     Exit;
   end;
   Result := ParseGraphicsFunction(Token);   // antGraphicsFunction "SCREEN" + argument list
+end;
+
+function TExpressionParser.ParseFsFunctionForm(Token: TLexerToken): TASTNode;
+// A filesystem command found where an expression was expected. FreeBASIC exposes a FUNCTION form of
+// ChDir/MkDir/RmDir/Kill/FileCopy (returning 0 on success, an error code on failure) and of Shell
+// (returning the command's exit code). MODERN only: Commodore BASIC v7 has no function forms, so in
+// CLASSIC this stays the syntax error it has always been. Arguments become direct children.
+var
+  FuncName: string;
+begin
+  FuncName := UpperCase(Token.Value);
+  if (not ModernMode) or (not Context.Check(ttDelimParOpen)) or
+     ((FuncName <> kCHDIR) and (FuncName <> kMKDIR) and (FuncName <> kRMDIR) and
+      (FuncName <> kKILL) and (FuncName <> kFILECOPY) and (FuncName <> kSHELL)) then
+  begin
+    HandleError(Format('Unexpected token "%s"', [Token.Value]), Token);
+    Result := nil;
+    Exit;
+  end;
+
+  Result := TASTNode.CreateWithValue(antFsFunction, FuncName, Token);
+  Context.Advance;  // Consume '('
+  Result.AddChild(ParseExpression);
+  if Context.Check(ttSeparParam) then
+  begin
+    Context.Advance;  // Consume ','
+    Result.AddChild(ParseExpression);
+  end;
+  if not Context.Match(ttDelimParClose) then
+  begin
+    HandleError('Expected ")" after function arguments', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+  DoNodeCreated(Result);
 end;
 
 function TExpressionParser.ParseSpriteFunction(Token: TLexerToken): TASTNode;

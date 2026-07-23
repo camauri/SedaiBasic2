@@ -650,6 +650,7 @@ begin
     // === GROUP 6: File I/O ===
     bcWInputChars, bcInputChars,    // W/INPUT(n[,#f]): Src2 = file handle (int; 0 = keyboard)
     bcSeekSet,        // SEEK #n, pos: Src2 = position (int)
+    bcScratch,        // SCRATCH "pattern", flags: Src2 = flags (int; bit0 silent, bit1 force)
     bcFileAttr,       // FILEATTR(filenum, returntype): Src2 = returntype (int)
     bcPutBinInt,      // PUT #n: Src2 = int value
     // === GROUP 1: String operations with int second param ===
@@ -776,6 +777,10 @@ begin
     bcEnviron,   // ENVIRON$(name) - Src1 = name string
     bcSetEnviron, // SETENVIRON "NAME=value" - Src1 = string
     bcShell,      // SHELL cmd - Src1 = command string
+    // File management family - Src1 = path/pattern/source string. The whole family was
+    // missing from these classifiers (registers neither marked used nor rewritten).
+    bcLoad, bcSave, bcVerify, bcBload, bcBsave, bcCatalog,
+    bcCopyFile, bcScratch, bcRenameFile, bcConcat, bcMkdir, bcChdir, bcRmdir, bcMoveFile,
     bcGfxDrawGML, // DRAW "..." - Src1 = GML string
     bcStrFormat, // FORMAT(num, mask) - Src1 = mask string
 
@@ -840,6 +845,10 @@ begin
     bcDopen, bcOpen,  // Src2 = filename (string)
     bcAppend,         // Src2 = data (string)
     bcPutBinStr,      // PUT #n: Src2 = string value
+    // === GROUP 0: file management (two-path commands) - Src2 = destination/new-name string.
+    // The whole family was missing from these classifiers: its registers were neither marked
+    // used nor rewritten, so any non-identity map made the command read a stale index.
+    bcCopyFile, bcRenameFile, bcConcat, bcMoveFile,
     // === GROUP 0: ASSERT/ASSERTWARN — Src2 = message (string) ===
     bcAssert:
       Result := True;
@@ -1097,6 +1106,16 @@ begin
 
     // bcStrInstr / bcStrInstrAny: Immediate = the int register holding the INSTR start position.
     if (OpCode = bcStrInstr) or (OpCode = bcStrInstrAny) then
+      MarkIntRegUsed(Instr.Immediate and $FFFF);
+
+    // Filesystem-command function forms (Immediate = -1): Dest = int register receiving the
+    // error/exit code. The statement form of bcCopyFile instead carries the overwrite-flag
+    // INT REGISTER index in Immediate (>= 0).
+    if ((OpCode = bcChdir) or (OpCode = bcMkdir) or (OpCode = bcRmdir) or
+        (OpCode = bcScratch) or (OpCode = bcCopyFile) or (OpCode = bcShell)) and
+       (Instr.Immediate = -1) then
+      MarkIntRegUsed(Instr.Dest);
+    if (OpCode = bcCopyFile) and (Instr.Immediate >= 0) then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // bcGraphicRGBA: Immediate = (B_reg << 16) | A_reg - two int registers
@@ -1573,6 +1592,29 @@ begin
     begin
       OldReg := Instr.Immediate and $FFFF;
       if (OldReg >= 0) and (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
+      begin
+        Instr.Immediate := FIntRegMap[OldReg];
+        Modified := True;
+      end;
+    end;
+
+    // Filesystem-command function forms (Immediate = -1): Dest = int register receiving the
+    // error/exit code - remap it through the int map (mirrors the scan-side mark).
+    if ((OpCode = bcChdir) or (OpCode = bcMkdir) or (OpCode = bcRmdir) or
+        (OpCode = bcScratch) or (OpCode = bcCopyFile) or (OpCode = bcShell)) and
+       (Instr.Immediate = -1) then
+    begin
+      if (Instr.Dest < Length(FIntRegMap)) and (FIntRegMap[Instr.Dest] >= 0) then
+      begin
+        Instr.Dest := FIntRegMap[Instr.Dest];
+        Modified := True;
+      end;
+    end;
+    // Statement-form bcCopyFile: Immediate = overwrite-flag INT REGISTER index (>= 0). Remap it.
+    if (OpCode = bcCopyFile) and (Instr.Immediate >= 0) then
+    begin
+      OldReg := Instr.Immediate and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then
       begin
         Instr.Immediate := FIntRegMap[OldReg];
         Modified := True;

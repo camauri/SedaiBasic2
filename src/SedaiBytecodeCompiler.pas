@@ -2025,6 +2025,15 @@ begin
   // the interpreter ignores Immediate on these opcodes and keeps checking.
   if OpIn(Instr.OpCode, [ssaArrayLoad, ssaArrayStore]) and Instr.BoundsSafe then
     BCInstr.Immediate := BC_BOUNDS_SAFE_FLAG;
+  // FreeBASIC function form of the filesystem commands (ChDir/MkDir/RmDir/Kill=Scratch/
+  // FileCopy/Shell): the SAME opcode as the statement form, discriminated by Immediate = -1,
+  // with Dest = the int register receiving the error/exit code (the VM stores the code
+  // instead of raising). Statement forms leave Immediate at 0 - except ssaCopyFile, whose
+  // statement form carries the overwrite-flag REGISTER index there (always >= 0, mapped
+  // above from Src3), which is why the marker is -1 and not a bit.
+  if OpIn(Instr.OpCode, [ssaChdir, ssaMkdir, ssaRmdir, ssaScratch, ssaCopyFile, ssaShell]) and
+     (Instr.Dest.Kind = svkRegister) then
+    BCInstr.Immediate := -1;
 
   {$IFDEF DEBUG_BYTECODE}
   if DebugBytecode and OpIn(Instr.OpCode, [ssaPrintInt, ssaLoadEL, ssaLoadER]) then

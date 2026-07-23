@@ -76,6 +76,9 @@ type
     antGraphicsFunction,
     antSpriteFunction,
     antInputFunction,
+    antFsFunction,        // FreeBASIC function form of a filesystem command: ChDir/MkDir/RmDir/Kill/
+                          // Name/FileCopy/Shell(...) as an expression returning the error code (Long).
+                          // Node value = canonical command name; children = argument expressions.
     antUsrFunction,
     antUserFunction,      // User-defined function call (FN)
     {$IFDEF WEB_MODE}

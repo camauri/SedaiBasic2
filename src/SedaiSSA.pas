@@ -701,6 +701,7 @@ type
     procedure ProcessCatalog(Node: TASTNode);
     // File management commands (executed directly in VM)
     procedure ProcessCopyFile(Node: TASTNode);
+    function ProcessFsFunction(Node: TASTNode): TSSAValue;
     procedure ProcessScratch(Node: TASTNode);
     procedure ProcessRenameFile(Node: TASTNode);
     procedure ProcessConcat(Node: TASTNode);
@@ -4430,6 +4431,11 @@ begin
         Result := MakeSSAValue(svkNone);
     end;
 
+    antFsFunction:
+      // FreeBASIC function form of a filesystem command: ChDir/MkDir/RmDir/Kill/FileCopy/Shell(...)
+      // as a value expression returning the error code. Dedicated method: keeps this frame lean.
+      Result := ProcessFsFunction(Node);
+
     antInputFunction:
     begin
       // Handle input functions: RWINDOW, POS, etc.
@@ -8136,6 +8142,9 @@ begin
         Result := srtInt;
     antIdentifier:
       Result := GetVariableType(VarToStr(Node.Value));
+    antFsFunction:
+      // ChDir/MkDir/RmDir/Kill/FileCopy/Shell(...) function form: error/exit code, a Long.
+      Result := srtInt;
     antFunctionCall:
       begin
         // Function-call leaf (SPACE(n), LEFT(s,n), STR(x), CHR(c), a user FUNCTION, ...). A '$' suffix or a
@@ -14876,7 +14885,10 @@ begin
   ProcessStringExpression(Node.GetChild(1), DstVal);
   DstReg := EnsureStringRegister(DstVal);
 
-  // Process optional overwrite flag (default 0)
+  // Process optional overwrite flag. The default is per-dialect: FreeBASIC's FILECOPY ALWAYS
+  // overwrites an existing destination (fbc-verified), while the v7 COPY command defaults to
+  // not overwriting (C128 DOS raises FILE EXISTS). The two share this lowering; the keyword
+  // that produced the node tells them apart.
   if Node.ChildCount > 2 then
   begin
     ProcessExpression(Node.GetChild(2), OverwriteVal);
@@ -14885,11 +14897,65 @@ begin
   else
   begin
     OverwriteReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, OverwriteReg, MakeSSAConstInt(0),
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    if UpperCase(VarToStr(Node.Value)) = kFILECOPY then
+      EmitInstruction(ssaLoadConstInt, OverwriteReg, MakeSSAConstInt(1),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+    else
+      EmitInstruction(ssaLoadConstInt, OverwriteReg, MakeSSAConstInt(0),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
   EmitInstruction(ssaCopyFile, MakeSSAValue(svkNone), SrcReg, DstReg, OverwriteReg);
+end;
+
+function TSSAGenerator.ProcessFsFunction(Node: TASTNode): TSSAValue;
+// FreeBASIC function form of a filesystem command (parser guarantees MODERN and the name set):
+// ChDir/MkDir/RmDir/Kill/FileCopy(...) -> error code, Shell(cmd) -> exit code. Emits the SAME SSA
+// op as the statement form but WITH an int Dest; the bytecode compiler marks that as the function
+// form (Immediate = -1) and the VM stores the code instead of raising.
+var
+  FuncName: string;
+  V1, V2: TSSAValue;
+  R1, R2, Flags: TSSAValue;
+begin
+  FuncName := UpperCase(VarToStr(Node.Value));
+  if (FCurrentBlock = nil) or (Node.ChildCount < 1) or (Node.GetChild(0) = nil) then
+    raise Exception.CreateFmt('%s() requires an argument', [FuncName]);
+
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  ProcessStringExpression(Node.GetChild(0), V1);
+  R1 := EnsureStringRegister(V1);
+
+  if FuncName = kCHDIR then
+    EmitInstruction(ssaChdir, Result, R1, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  else if FuncName = kMKDIR then
+    EmitInstruction(ssaMkdir, Result, R1, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  else if FuncName = kRMDIR then
+    EmitInstruction(ssaRmdir, Result, R1, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  else if FuncName = kSHELL then
+    EmitInstruction(ssaShell, Result, R1, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  else if FuncName = kKILL then
+  begin
+    // Kill(file): Src2 keeps the statement encoding (flags int register), pinned to 0 -
+    // the function form has no v7 prompt/force semantics, it just reports the code.
+    Flags := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, Flags, MakeSSAConstInt(0),
+                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ssaScratch, Result, R1, Flags, MakeSSAValue(svkNone));
+  end
+  else if FuncName = kFILECOPY then
+  begin
+    if (Node.ChildCount < 2) or (Node.GetChild(1) = nil) then
+      raise Exception.Create('FILECOPY() requires source and destination');
+    ProcessStringExpression(Node.GetChild(1), V2);
+    R2 := EnsureStringRegister(V2);
+    // No Src3 here: the statement form carries the overwrite flag REGISTER in Immediate, the
+    // function form needs Immediate free for the -1 marker. FreeBASIC's FileCopy() always
+    // overwrites, so the VM's function-form branch hardcodes it.
+    EmitInstruction(ssaCopyFile, Result, R1, R2, MakeSSAValue(svkNone));
+  end
+  else
+    raise Exception.CreateFmt('Unsupported filesystem function: %s', [FuncName]);
 end;
 
 procedure TSSAGenerator.ProcessScratch(Node: TASTNode);
