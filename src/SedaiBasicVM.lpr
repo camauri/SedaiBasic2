@@ -2213,6 +2213,16 @@ begin
       Exit;
     end;
 
+    // Convenience: "sb hello" finds "hello.bas" (then "hello.basc"). Only when the name as typed
+    // does not exist, so an explicit "sb hello.bas" still wins and a real path is never shadowed.
+    if not FileExists(TestFile) then
+    begin
+      if FileExists(TestFile + '.bas') then
+        TestFile := TestFile + '.bas'
+      else if FileExists(TestFile + '.basc') then
+        TestFile := TestFile + '.basc';
+    end;
+
     // Check if file exists
     if not FileExists(TestFile) then
     begin
