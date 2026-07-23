@@ -203,6 +203,10 @@ var
   AotDiagFloatBlockLocal: Int64 = 0;
   AotDiagFloatBlockLocalCount: Integer = 0;
   AotDiagLivenessOK: Boolean = False;
+  // AOT_DYNF=1 enables the within-block dynamic float allocator (see AotCompileRegion). -1 =
+  // env not yet read. Default OFF: the static-home codegen is emitted byte-for-byte as before,
+  // so the two can be A/B'd on one binary.
+  GAotDynFloatState: Integer = -1;
   // C3: runtime-helper calls emitted in the last region. Also the coverage delta this stage
   // bought: a region reporting helpers>0 is one that could not compile at all before, since
   // a single op outside the native set used to bail the whole function.
@@ -228,6 +232,15 @@ function AotCompileProgram(SSAProg: TSSAProgram; Prog: TBytecodeProgram;
 implementation
 
 uses TypInfo;
+
+// AOT_DYNF gate, read once. When on, AotCompileRegion allocates block-local float temporaries
+// to xmm dynamically instead of pinning the six hottest for the whole region.
+function AotDynFloatEnabled: Boolean;
+begin
+  if GAotDynFloatState < 0 then
+    if GetEnvironmentVariable('AOT_DYNF') <> '' then GAotDynFloatState := 1 else GAotDynFloatState := 0;
+  Result := GAotDynFloatState = 1;
+end;
 
 // The B1 op set: scalar int/float compute + control flow + the Xfer scalar forms
 // (parameter prologue / result epilogue) + frame record marks (no-ops in a function
@@ -711,6 +724,23 @@ var
   LabelIdx: TStringList;                // region-local label -> block-list index
   HelperOps: TStringList;               // diagnostics: op name of every helper call emitted
 
+  // Dynamic within-block float allocation (AOT_DYNF). A machine xmm is time-multiplexed across
+  // block-local temporaries with disjoint lifetimes, keeping the hot float traffic the static
+  // home allocator leaves in memory in registers instead. Correctness rests on two invariants
+  // checked when a temp is admitted: it is BLOCK-LOCAL (all touches in one block, not live-out,
+  // so nothing crosses a block boundary and the epilogue/other blocks never see it) and
+  // DEF-BEFORE-USE (its first touch is the defining store, so no use reads the xmm before it is
+  // written - the implicit-zero-read hazard). FLoc is then updated as emission walks positions:
+  // set at the def, cleared at the last touch. The four sites that hand values to the
+  // interpreter/callee through the banks (helper call, native call-sub, C5 leaf call, deopt
+  // exit) flush the currently-resident set first.
+  DynFActive: Boolean;
+  DynFHomeReg: array of Integer;        // region position -> VM float reg defined here that gets a home (-1)
+  DynFHomeXmm: array of Integer;        // region position -> the xmm (2..7) assigned to it
+  DynFFree: array of array of Integer;  // region position -> VM float regs whose last touch is here
+  DynFCur: array[0..7] of Integer;      // xmm index -> VM float reg currently resident there (-1 free)
+  DynPos: Integer;                      // running region position during emission
+
   procedure Fail(const Why: string);
   begin
     if OK then BailWhy := Why;
@@ -782,8 +812,32 @@ var
   end;
   // Exit to the interpreter at absolute bytecode PC (deopt and normal exits alike):
   // the epilogue flushes the allocated registers, so the interpreter resumes coherent.
+  // AOT_DYNF: store / reload every dynamically-resident float temp to/from its bank slot. The
+  // flush makes the banks coherent for anything that reads them through rsi (the interpreter on
+  // a deopt, a helper handler, a callee); the reload brings the values back into their xmm to
+  // continue native. Emission-time DynFCur is a faithful map of runtime residency at this
+  // position (the schedule is deterministic per linear position), so the emitted stores match
+  // exactly what is live in registers here. No-op unless the dynamic allocator is active.
+  procedure FlushResidentF;
+  var x: Integer;
+  begin
+    if not DynFActive then Exit;
+    for x := 2 to 7 do
+      if DynFCur[x] >= 0 then
+        E.MemOp([$F2, $0F, $11], x, RSI, LongWord(DynFCur[x]) * 8);   // movsd [rsi+reg*8], xmm x
+  end;
+  procedure ReloadResidentF;
+  var x: Integer;
+  begin
+    if not DynFActive then Exit;
+    for x := 2 to 7 do
+      if DynFCur[x] >= 0 then
+        E.MemOp([$F2, $0F, $10], x, RSI, LongWord(DynFCur[x]) * 8);   // movsd xmm x, [rsi+reg*8]
+  end;
+
   procedure ExitTo(apc: Integer);
   begin
+    FlushResidentF;                                 // dynamic float temps -> banks (epilogue won't)
     E.EmitBytes([$B8]); E.Emit32(LongWord(apc));   // mov eax, apc
     JmpRel(-1);                                     // jmp epilogue
   end;
@@ -1095,6 +1149,7 @@ var
       StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+    FlushResidentF;                                              // AOT_DYNF: dynamic float temps too
 
     // 2. Arguments, all read from the ctx record BEFORE r8 is clobbered - it is an argument
     //    register on Win64 (arg2) and volatile on both ABIs. arg3 is the ctx record itself, so
@@ -1117,6 +1172,7 @@ var
       LoadRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       E.MemOp([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+    ReloadResidentF;                                             // AOT_DYNF: dynamic float temps too
     ReloadArrayCache;
 
     // 5. Continue natively only if the helper landed exactly where this code expects.
@@ -1143,6 +1199,7 @@ var
       StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+    FlushResidentF;                                           // AOT_DYNF: dynamic float temps too
     // 2. Arguments. Read the primitive address from the ctx BEFORE any argument setup can
     //    clobber r8 (it is arg2 on Win64 and volatile on both ABIs) - the C5 concat lesson.
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_CALLSUB);              // rax  = ctx.CallSub
@@ -1165,6 +1222,7 @@ var
       LoadRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       E.MemOp([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+    ReloadResidentF;                                          // AOT_DYNF: dynamic float temps too
     ReloadArrayCache;
   end;
 
@@ -1184,6 +1242,7 @@ var
     for k := 0 to NFAlloc - 1 do
       if not XmmIsCalleeSaved(FLoc[FAllocd[k]]) then
         E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+    FlushResidentF;
   end;
   procedure ReloadVolatiles;
   var k: Integer;
@@ -1202,6 +1261,7 @@ var
     FrameLoad(R8, SlotCtxSave);
     FrameLoad(RSI, SlotFltSave);
     ReloadVolatiles;
+    ReloadResidentF;
   end;
 
   // C5: bcCmp*String lowered to a leaf call to AotStrCmp. Kind 0=Eq 1=Ne 2=Lt 3=Gt. The two
@@ -2269,6 +2329,107 @@ var
     end;
   end;
 
+  // AOT_DYNF: build the within-block dynamic float schedule. Runs after Allocate and OVERRIDES
+  // its static float homes only if it admits at least one temp; otherwise the static homes stand
+  // (a region with no block-local float temporaries must not regress). A temp is admitted when
+  // it is block-local (all touches in one block) AND def-before-use (its first def precedes its
+  // first use, so no read hits an unwritten xmm - the implicit-zero hazard). Each admitted temp
+  // holds one xmm for [firstDef .. lastTouch]; the greedy scan never evicts a started interval
+  // (on overflow the newcomer stays in the bank), so an xmm holds exactly one temp at a time.
+  procedure PlanDynFloat;
+  var
+    totpos, nbk, bi, kk, pp, r, a, x, xf: Integer;
+    Blk: TSSABasicBlock; Ins: TSSAInstruction;
+    blkOf, firstDef, firstUse, lastTouch, cand: array of Integer;
+    activeReg: array[2..7] of Integer;
+    ncand: Integer; usedAny, used6, used7, isDef: Boolean;
+
+    procedure Note(const V: TSSAValue; pos: Integer; asDef: Boolean);
+    var q: Integer;
+    begin
+      if (V.Kind <> svkRegister) or (V.RegType <> srtFloat) then Exit;
+      q := Prog.AotRemapFloatReg(V.RegIndex);
+      if (q < 0) or (q > MaxFReg) then Exit;
+      if blkOf[q] = -1 then blkOf[q] := bi else if blkOf[q] <> bi then blkOf[q] := -2;
+      if pos > lastTouch[q] then lastTouch[q] := pos;
+      if asDef then begin if pos < firstDef[q] then firstDef[q] := pos; end
+      else begin if pos < firstUse[q] then firstUse[q] := pos; end;
+    end;
+
+  begin
+    DynFActive := False;
+    for a := 0 to 7 do DynFCur[a] := -1;
+    if not AotDynFloatEnabled then Exit;
+    if MaxFReg < 0 then Exit;
+    nbk := Region.LastBlock - Region.FirstBlock + 1;
+    totpos := 0;
+    for bi := 0 to nbk - 1 do Inc(totpos, SSAProg.Blocks[Region.FirstBlock + bi].Instructions.Count);
+    if totpos = 0 then Exit;
+
+    SetLength(blkOf, MaxFReg + 1); SetLength(firstDef, MaxFReg + 1);
+    SetLength(firstUse, MaxFReg + 1); SetLength(lastTouch, MaxFReg + 1);
+    for r := 0 to MaxFReg do begin blkOf[r] := -1; firstDef[r] := MaxInt; firstUse[r] := MaxInt; lastTouch[r] := -1; end;
+
+    // Pass 1: linear positions and per-slot touch spans (def vs use distinguished).
+    pp := 0;
+    for bi := 0 to nbk - 1 do
+    begin
+      Blk := SSAProg.Blocks[Region.FirstBlock + bi];
+      for kk := 0 to Blk.Instructions.Count - 1 do
+      begin
+        Ins := Blk.Instructions[kk];
+        Note(Ins.Src1, pp, False); Note(Ins.Src2, pp, False); Note(Ins.Src3, pp, False);
+        for a := 0 to High(Ins.PhiSources) do Note(Ins.PhiSources[a].Value, pp, False);
+        isDef := not ((Ins.OpCode = ssaArrayStore) or (Ins.OpCode = ssaPrint) or (Ins.OpCode = ssaPrintLn) or
+                      (Ins.OpCode = ssaXferStoreInt) or (Ins.OpCode = ssaXferStoreFloat));
+        Note(Ins.Dest, pp, isDef);
+        Inc(pp);
+      end;
+    end;
+
+    SetLength(DynFHomeReg, totpos); SetLength(DynFHomeXmm, totpos); SetLength(DynFFree, totpos);
+    for pp := 0 to totpos - 1 do begin DynFHomeReg[pp] := -1; SetLength(DynFFree[pp], 0); end;
+
+    usedAny := False; used6 := False; used7 := False;
+    // Pass 2: per-block greedy linear scan over admitted temps.
+    for bi := 0 to nbk - 1 do
+    begin
+      Blk := SSAProg.Blocks[Region.FirstBlock + bi];
+      ncand := 0; SetLength(cand, MaxFReg + 1);
+      for r := 0 to MaxFReg do
+        if (blkOf[r] = bi) and (firstDef[r] < MaxInt) and (firstUse[r] < MaxInt) and (firstDef[r] < firstUse[r]) then
+        begin cand[ncand] := r; Inc(ncand); end;
+      for a := 1 to ncand - 1 do                      // insertion sort by firstDef
+      begin
+        x := cand[a]; kk := a - 1;
+        while (kk >= 0) and (firstDef[cand[kk]] > firstDef[x]) do begin cand[kk + 1] := cand[kk]; Dec(kk); end;
+        cand[kk + 1] := x;
+      end;
+      for x := 2 to 7 do activeReg[x] := -1;
+      for a := 0 to ncand - 1 do
+      begin
+        r := cand[a];
+        for x := 2 to 7 do                            // expire intervals that ended before r's def
+          if (activeReg[x] >= 0) and (lastTouch[activeReg[x]] < firstDef[r]) then activeReg[x] := -1;
+        xf := -1;
+        for x := 2 to 7 do if activeReg[x] < 0 then begin xf := x; Break; end;
+        if xf < 0 then System.Continue;               // pool full: r stays in the bank
+        activeReg[xf] := r;
+        DynFHomeReg[firstDef[r]] := r; DynFHomeXmm[firstDef[r]] := xf;
+        SetLength(DynFFree[lastTouch[r]], Length(DynFFree[lastTouch[r]]) + 1);
+        DynFFree[lastTouch[r]][High(DynFFree[lastTouch[r]])] := r;
+        usedAny := True;
+        if xf = 6 then used6 := True; if xf = 7 then used7 := True;
+      end;
+    end;
+
+    if not usedAny then Exit;                          // keep the static homes Allocate set
+    DynFActive := True;
+    for r := 0 to MaxFReg do FLoc[r] := -1;            // drop static float homes; go fully dynamic
+    NFAlloc := 0;
+    SaveX6 := used6; SaveX7 := used7;
+  end;
+
   procedure EmitInstruction;
   var d, w: Integer;
       apc: Integer;
@@ -2597,7 +2758,7 @@ var
   end;
 
 var
-  b, j, k, TargetOff: Integer;
+  b, j, k, w, TargetOff: Integer;
   Blk: TSSABasicBlock;
 begin
   Result := nil;
@@ -2631,6 +2792,7 @@ begin
   SetLength(FLoc, MaxFReg + 1); for k := 0 to MaxFReg do FLoc[k] := -1;
   SetLength(IAllocd, Length(IntPool)); SetLength(FAllocd, 6);
   Allocate;
+  PlanDynFloat;   // AOT_DYNF: may replace the static float homes with a within-block dynamic schedule
 
   HelperOps := TStringList.Create;
 
@@ -2697,6 +2859,7 @@ begin
 
     // Body: blocks in order (fall-through preserved by contiguous emission).
     CurOrd := Region.FirstOrdinal;
+    DynPos := 0;
     for b := Region.FirstBlock to Region.LastBlock do
     begin
       Blk := SSAProg.Blocks[b];
@@ -2706,8 +2869,25 @@ begin
         Cur := Blk.Instructions[j];
         CurBlkIdx := b;
         CurIsBlockLast := j = Blk.Instructions.Count - 1;
+        // AOT_DYNF start event: the temp defined here becomes resident in its xmm BEFORE the
+        // instruction is emitted, so its defining FStore writes that xmm.
+        if DynFActive and (DynFHomeReg[DynPos] >= 0) then
+        begin
+          FLoc[DynFHomeReg[DynPos]] := DynFHomeXmm[DynPos];
+          DynFCur[DynFHomeXmm[DynPos]] := DynFHomeReg[DynPos];
+        end;
         EmitInstruction;
         if not OK then Exit;
+        // AOT_DYNF free events: temps whose last touch was this instruction leave their xmm
+        // AFTER it is emitted (the last use has just read them). No bank store - they are dead.
+        if DynFActive then
+          for k := 0 to High(DynFFree[DynPos]) do
+          begin
+            w := FLoc[DynFFree[DynPos][k]];
+            if (w >= 0) and (DynFCur[w] = DynFFree[DynPos][k]) then DynFCur[w] := -1;
+            FLoc[DynFFree[DynPos][k]] := -1;
+          end;
+        Inc(DynPos);
         Inc(CurOrd);
       end;
     end;
