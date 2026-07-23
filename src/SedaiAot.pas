@@ -197,6 +197,11 @@ var
   // size - the go/no-go for building the real thing. Conservative lower bound (see the sim).
   AotDiagFloatLinScan: Int64 = 0;
   AotDiagIntLinScan: Int64 = 0;
+  // Loop-weighted use of BLOCK-LOCAL float temporaries (every touch in one block, neither
+  // live-in nor live-out). This is the low-risk hybrid's ceiling: these can go to a within-block
+  // dynamic xmm pool with zero bank traffic and no cross-block consistency hazard.
+  AotDiagFloatBlockLocal: Int64 = 0;
+  AotDiagFloatBlockLocalCount: Integer = 0;
   AotDiagLivenessOK: Boolean = False;
   // C3: runtime-helper calls emitted in the last region. Also the coverage delta this stage
   // bought: a region reporting helpers>0 is one that could not compile at all before, since
@@ -1593,6 +1598,18 @@ var
     UseF, DefF, InF, OutF: array of array of Boolean;
     CurLiveI, CurLiveF: array of Boolean;             // mid-block live set (peak measurement)
     used: array of Boolean; kk, bestr: Integer; bestv, totF, topF, totI, topI: Int64;  // payoff probe
+    blkOf: array of Integer;                          // per float slot: single touch block / -2 many
+
+    // Record which block(s) touch a float slot (block-local ceiling measurement).
+    procedure NoteFloatBlk(const V: TSSAValue; bidx: Integer);
+    var q: Integer;
+    begin
+      if (V.Kind <> svkRegister) or (V.RegType <> srtFloat) then Exit;
+      q := Prog.AotRemapFloatReg(V.RegIndex);
+      if (q < 0) or (q > MaxFReg) then Exit;
+      if blkOf[q] = -1 then blkOf[q] := bidx
+      else if blkOf[q] <> bidx then blkOf[q] := -2;
+    end;
 
     // Linear-scan RESIDENCY SIMULATION for one bank: how much loop-weighted register use a real
     // live-range allocator with `nregs` machine registers would keep resident, versus the static
@@ -1889,6 +1906,28 @@ var
     AotDiagIntResident := topI; AotDiagIntTotal := totI;
     AotDiagFloatLinScan := LinScanResident(True, MaxFReg, 6);
     AotDiagIntLinScan := LinScanResident(False, MaxIReg, 7);
+
+    // Hybrid ceiling: block-local float temporaries (single block, not live-in/out of it).
+    SetLength(blkOf, MaxFReg + 1);
+    for r2 := 0 to MaxFReg do blkOf[r2] := -1;   // -1 = untouched, >=0 = single block, -2 = many
+    for bi := 0 to nb - 1 do
+    begin
+      Blk := SSAProg.Blocks[Region.FirstBlock + bi];
+      for k := 0 to Blk.Instructions.Count - 1 do
+      begin
+        Ins := Blk.Instructions[k];
+        NoteFloatBlk(Ins.Src1, bi); NoteFloatBlk(Ins.Src2, bi); NoteFloatBlk(Ins.Src3, bi);
+        NoteFloatBlk(Ins.Dest, bi);
+        for k2 := 0 to High(Ins.PhiSources) do NoteFloatBlk(Ins.PhiSources[k2].Value, bi);
+      end;
+    end;
+    AotDiagFloatBlockLocal := 0; AotDiagFloatBlockLocalCount := 0;
+    for r2 := 0 to MaxFReg do
+      if (blkOf[r2] >= 0) and not InF[blkOf[r2]][r2] and not OutF[blkOf[r2]][r2] then
+      begin
+        AotDiagFloatBlockLocal := AotDiagFloatBlockLocal + FUse[r2];
+        Inc(AotDiagFloatBlockLocalCount);
+      end;
     AotDiagLivenessOK := LivenessOK;
   end;
 
@@ -2769,6 +2808,10 @@ begin
             [AotDiagFloatResident, 100.0 * (AotDiagFloatTotal - AotDiagFloatResident) / AotDiagFloatTotal,
              AotDiagFloatLinScan, 100.0 * (AotDiagFloatTotal - AotDiagFloatLinScan) / AotDiagFloatTotal,
              100.0 * (AotDiagFloatLinScan - AotDiagFloatResident) / (AotDiagFloatTotal - AotDiagFloatResident + 0.0001)]));
+        if AotDiagFloatTotal > 0 then
+          WriteLn(ErrOutput, Format('[AOT]   float block-local temps: %d slots, use=%d (%.1f%% of total) - the low-risk hybrid ceiling',
+            [AotDiagFloatBlockLocalCount, AotDiagFloatBlockLocal,
+             100.0 * AotDiagFloatBlockLocal / AotDiagFloatTotal]));
         if AotDiagIntTotal > 0 then
           WriteLn(ErrOutput, Format('[AOT]   int traffic:   static-resident=%d (%.1f%% mem) -> linscan-resident=%d (%.1f%% mem)  recovers %.1f%% of tail',
             [AotDiagIntResident, 100.0 * (AotDiagIntTotal - AotDiagIntResident) / AotDiagIntTotal,
