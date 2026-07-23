@@ -1010,7 +1010,13 @@ begin
   LogVerbose('ParseLogicalNot');
   {$ENDIF}
 
-  Operand := ParseExpression(precUnary);
+  // NOT binds BELOW the comparisons in every BASIC (fbc and Commodore v7 alike):
+  // "Not a = b" is "Not (a = b)", not "(Not a) = b". The operand floor is precEquality -
+  // with this parser's ">= floor consumes" convention that swallows every comparison and
+  // everything tighter, and stops at And/Or/Xor/Eqv/Imp, which NOT is tighter than
+  // ("Not a = b And c" is "(Not (a = b)) And c", fbc-verified). The old floor (precUnary)
+  // made NOT grab only the primary, silently flipping every "If Not x = y" ever written.
+  Operand := ParseExpression(precEquality);
   if not Assigned(Operand) then
   begin
     Result := nil;
