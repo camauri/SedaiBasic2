@@ -179,6 +179,12 @@ var
   // if they were reused, and every access beyond the 6 pooled ones is pure memory traffic.
   AotDiagDistinctInt: Integer = 0;
   AotDiagDistinctFloat: Integer = 0;
+  // TRUE peak of simultaneously-live values, measured mid-block (not just at block boundaries
+  // like peakLive). This is the number that decides the linear-scan payoff: if maxLive <= pool
+  // size (7 gpr / 6 xmm) a live-range allocator can keep EVERY live value in a register with
+  // zero hot-loop spill, collapsing the distinct-register memory traffic to nothing.
+  AotDiagMaxLiveInt: Integer = 0;
+  AotDiagMaxLiveFloat: Integer = 0;
   AotDiagLivenessOK: Boolean = False;
   // C3: runtime-helper calls emitted in the last region. Also the coverage delta this stage
   // bought: a region reporting helpers>0 is one that could not compile at all before, since
@@ -1565,7 +1571,7 @@ var
     must not change a single emitted byte. --------------------------------------------- }
   procedure ComputeLiveness;
   var
-    nb, bi, k, pass, si, r2: Integer;
+    nb, bi, k, k2, pass, si, r2: Integer;
     Blk, Succ: TSSABasicBlock;
     Ins: TSSAInstruction;
     Changed: Boolean;
@@ -1573,6 +1579,24 @@ var
     // small - MAX_*_REGS is 32/32/16 before compaction, and post-compaction indexes are dense).
     UseI, DefI, InI, OutI: array of array of Boolean;
     UseF, DefF, InF, OutF: array of array of Boolean;
+    CurLiveI, CurLiveF: array of Boolean;             // mid-block live set (peak measurement)
+
+    // Mark an operand read as live in the mid-block replay set (diagnostic only).
+    procedure MidMarkUse(const V: TSSAValue; var LiveI, LiveF: array of Boolean);
+    var rr: Integer;
+    begin
+      if V.Kind <> svkRegister then Exit;
+      if V.RegType = srtInt then
+      begin
+        rr := Prog.AotRemapIntReg(V.RegIndex);
+        if (rr >= 0) and (rr <= MaxIReg) then LiveI[rr] := True;
+      end
+      else if V.RegType = srtFloat then
+      begin
+        rr := Prog.AotRemapFloatReg(V.RegIndex);
+        if (rr >= 0) and (rr <= MaxFReg) then LiveF[rr] := True;
+      end;
+    end;
 
     function RegionIdx(B: TSSABasicBlock): Integer;   // -1 = outside this region
     var q: Integer;
@@ -1696,6 +1720,52 @@ var
     end;
     AotDiagPeakLiveInt := PeakLiveInt;
     AotDiagPeakLiveFloat := PeakLiveFloat;
+    // TRUE mid-block peak: replay each block backward from its live-out set (per-instruction),
+    // so a value born and consumed inside the block counts. This is the number a linear-scan
+    // allocator has to fit; peakLive above only samples block boundaries and understates it.
+    AotDiagMaxLiveInt := PeakLiveInt; AotDiagMaxLiveFloat := PeakLiveFloat;
+    for bi := 0 to nb - 1 do
+    begin
+      Blk := SSAProg.Blocks[Region.FirstBlock + bi];
+      // Seed the live set with live-out, then walk instructions in reverse: an operand read
+      // makes the reg live, a def (Dest, minus the use-in-Dest exceptions) kills it above.
+      SetLength(CurLiveI, MaxIReg + 1); SetLength(CurLiveF, MaxFReg + 1);
+      for r2 := 0 to MaxIReg do CurLiveI[r2] := OutI[bi][r2];
+      for r2 := 0 to MaxFReg do CurLiveF[r2] := OutF[bi][r2];
+      for k := Blk.Instructions.Count - 1 downto 0 do
+      begin
+        Ins := Blk.Instructions[k];
+        // Def kills liveness above this point (before adding this instruction's own reads).
+        if not ((Ins.OpCode = ssaArrayStore) or (Ins.OpCode = ssaPrint) or (Ins.OpCode = ssaPrintLn) or
+                (Ins.OpCode = ssaXferStoreInt) or (Ins.OpCode = ssaXferStoreFloat)) then
+        begin
+          if Ins.Dest.Kind = svkRegister then
+          begin
+            if Ins.Dest.RegType = srtInt then
+            begin
+              r2 := Prog.AotRemapIntReg(Ins.Dest.RegIndex);
+              if (r2 >= 0) and (r2 <= MaxIReg) then CurLiveI[r2] := False;
+            end
+            else if Ins.Dest.RegType = srtFloat then
+            begin
+              r2 := Prog.AotRemapFloatReg(Ins.Dest.RegIndex);
+              if (r2 >= 0) and (r2 <= MaxFReg) then CurLiveF[r2] := False;
+            end;
+          end;
+        end;
+        MidMarkUse(Ins.Src1, CurLiveI, CurLiveF);
+        MidMarkUse(Ins.Src2, CurLiveI, CurLiveF);
+        MidMarkUse(Ins.Src3, CurLiveI, CurLiveF);
+        if (Ins.OpCode = ssaArrayStore) or (Ins.OpCode = ssaPrint) or (Ins.OpCode = ssaPrintLn) or
+           (Ins.OpCode = ssaXferStoreInt) or (Ins.OpCode = ssaXferStoreFloat) then
+          MidMarkUse(Ins.Dest, CurLiveI, CurLiveF);
+        // Cardinality AT this program point (values live across this instruction boundary).
+        k2 := 0; for r2 := 0 to MaxIReg do if CurLiveI[r2] then Inc(k2);
+        if k2 > AotDiagMaxLiveInt then AotDiagMaxLiveInt := k2;
+        k2 := 0; for r2 := 0 to MaxFReg do if CurLiveF[r2] then Inc(k2);
+        if k2 > AotDiagMaxLiveFloat then AotDiagMaxLiveFloat := k2;
+      end;
+    end;
     // Distinct VM registers actually touched, per bank (IUse/FUse are the region's use counts).
     // Reported beside peakLive because the two together say whether the pool is too small or the
     // VALUES are spread too thin: 6 xmm cover a peak of 3 live floats easily -- unless they are
@@ -2571,10 +2641,11 @@ begin
       if Diag then
       begin
         WriteLn(ErrOutput, Format('[AOT] compiled %-24s entryPC=%-6d liveness=%s peakLive int=%d float=%d ' +
-                                  'distinct int=%d float=%d helpers=%d',
+                                  'maxLive int=%d float=%d distinct int=%d float=%d helpers=%d',
                                   [Regions[r].Name, Regions[r].EntryPC,
                                    BoolToStr(AotDiagLivenessOK, 'ok', 'NOT-CONVERGED'),
                                    AotDiagPeakLiveInt, AotDiagPeakLiveFloat,
+                                   AotDiagMaxLiveInt, AotDiagMaxLiveFloat,
                                    AotDiagDistinctInt, AotDiagDistinctFloat,
                                    AotDiagHelperCalls]));
         if AotDiagHelperOps <> '' then
