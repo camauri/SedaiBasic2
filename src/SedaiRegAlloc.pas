@@ -1059,6 +1059,9 @@ begin
       FreeAndNil(Colouring);       // diagnostic only: report, then allocate as before
   end;
   FReuseColouring := Colouring;
+  // Tell the downstream engines the merge really ran (not merely that the gate is set: the
+  // analysis bails on enormous CFGs). The AOT arbitrates its own dynamic allocator against it.
+  FProgram.RegisterMergeApplied := Colouring <> nil;
   try
 
   {$IFDEF DEBUG_REGALLOC}

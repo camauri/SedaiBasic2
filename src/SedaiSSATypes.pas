@@ -564,6 +564,10 @@ type
     // Phase A: per-register versionability. Only proc-local scalars (MODERN) are marked; module-level /
     // SHARED / @-taken and everything in CLASSIC stay unmarked -> Version=0 volatile. Indexed [bank][idx].
     FVersionableRegs: array[TSSARegisterType] of array of Boolean;
+    // Set by the register allocator when the REGREUSE interference merge actually ran, i.e. when
+    // values with disjoint live ranges were given a SHARED register number. The AOT reads it to
+    // arbitrate against its own within-block dynamic allocator - see RegisterMergeApplied.
+    FRegisterMergeApplied: Boolean;
   public
     constructor Create;
     destructor Destroy; override;
@@ -611,6 +615,14 @@ type
     property Labels: TStringList read FLabels;
     property VarRegMap: TStringList read FVarRegMap;  // Access to variable→register mapping (for SSA construction)
     property GlobalVariableSemantics: Boolean read FGlobalVariableSemantics write FGlobalVariableSemantics;
+    // True once the REGREUSE merge has given values with disjoint live ranges a shared register
+    // number. The AOT's within-block dynamic allocator (AOT_DYNF) is ANTAGONISTIC to it, not
+    // additive: DYNF only admits block-local single-def temps and holds an xmm for
+    // [firstDef..lastTouch] without ever evicting, while a merged register is multi-def and
+    // long-lived - so it pins a machine register for the whole block and starves the rest.
+    // Measured (--aot, best-of-3, ms): n-body static 639 / DYNF 399 / merge 360 / BOTH 699;
+    // floatpoly 491 / 346 / 255 / 660; arraysum 556 / 484 / 337 / 727. "Both" is always the worst.
+    property RegisterMergeApplied: Boolean read FRegisterMergeApplied write FRegisterMergeApplied;
   end;
 
 { SSA string pool (see the TSSAValue comment). Interning an empty string is id 0; ids are

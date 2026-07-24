@@ -207,6 +207,12 @@ var
   // env not yet read. Default OFF: the static-home codegen is emitted byte-for-byte as before,
   // so the two can be A/B'd on one binary.
   GAotDynFloatState: Integer = -1;
+  // Which of the two register strategies actually ran for the last region compiled, and whether
+  // the AUTO arbitration was the reason. Without this the choice is only observable on a
+  // stopwatch - and the two are antagonistic, so reading it wrong costs a whole campaign.
+  AotDiagDynFActive: Boolean = False;
+  AotDiagDynIActive: Boolean = False;
+  AotDiagMergeApplied: Boolean = False;
   // C3: runtime-helper calls emitted in the last region. Also the coverage delta this stage
   // bought: a region reporting helpers>0 is one that could not compile at all before, since
   // a single op outside the native set used to bail the whole function.
@@ -2477,7 +2483,19 @@ var
   // in a non-loop block does not disqualify, and a false negative only forgoes a win, never
   // regresses. Loop membership = any back edge (a successor at region index <= this block).
   function RegionThroughputBound: Boolean;
-  var bi2, si, i2, ri, sIdx, lo: Integer;
+  // Is this region's time going into THROUGHPUT (register traffic worth recovering) or into the
+  // LATENCY of a few long operations (where the traffic is free, hidden under the stalls)?
+  //
+  // The first cut answered "any div/sqrt inside a loop => latency-bound" and bailed. That was
+  // tuned BEFORE the movaps fix and in-place computation, and it is now too coarse: one division
+  // in a loop of forty other operations does not make the region latency-bound. On n-body AUTO
+  // switched the allocator OFF and left 639 ms on the table where forcing it on gives 399.
+  //
+  // So count instead: a region is latency-bound only when the long-latency operations are a
+  // sizable FRACTION of the loop's arithmetic. The threshold is deliberately generous - being
+  // wrong here costs some of a speed-up, never correctness (the allocator is output-identical).
+  const LATENCY_NUM = 1; LATENCY_DEN = 8;    // >= 1/8 of the loop's arithmetic is long-latency
+  var bi2, si, i2, ri, sIdx, lo, nLat, nArith: Integer;
       B2, Sx: TSSABasicBlock; Ins2: TSSAInstruction;
       inLoop: array of Boolean;
     function RegIdxOf(B: TSSABasicBlock): Integer;
@@ -2502,6 +2520,7 @@ var
           for lo := sIdx to bi2 do inLoop[lo] := True;
       end;
     end;
+    nLat := 0; nArith := 0;
     for bi2 := 0 to ri - 1 do
     begin
       if not inLoop[bi2] then System.Continue;
@@ -2511,11 +2530,28 @@ var
         Ins2 := B2.Instructions[i2];
         case Ins2.OpCode of
           ssaDivFloat, ssaMathSqr,
-          ssaDivInt, ssaModInt, ssaDivUInt, ssaModUInt: Exit(False);   // ~20-40 cycle latency
+          ssaDivInt, ssaModInt, ssaDivUInt, ssaModUInt:                // ~20-40 cycle latency
+            begin Inc(nLat); Inc(nArith); end;
+          // The work the register traffic competes with: everything the dynamic allocator can
+          // keep in a machine register. Loads, copies, compares and array element access count -
+          // they are exactly what pays for having a home.
+          ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaNegFloat, ssaPowFloat,
+          ssaAddInt, ssaSubInt, ssaMulInt, ssaNegInt,
+          ssaLoadConstInt, ssaLoadConstFloat, ssaCopyInt, ssaCopyFloat,
+          ssaIntToFloat, ssaFloatToInt,
+          ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,
+          ssaCmpEqInt, ssaCmpNeInt, ssaCmpLtInt, ssaCmpGtInt, ssaCmpLeInt, ssaCmpGeInt,
+          ssaCmpEqFloat, ssaCmpNeFloat, ssaCmpLtFloat, ssaCmpGtFloat, ssaCmpLeFloat, ssaCmpGeFloat,
+          ssaArrayLoad, ssaArrayStore,
+          ssaArrayLoadIndInt, ssaArrayLoadIndFloat,
+          ssaArrayStoreIndInt, ssaArrayStoreIndFloat:
+            Inc(nArith);
         end;
       end;
     end;
-    Result := True;
+    // No loop arithmetic at all: nothing to recover either way, keep the historic answer (a region
+    // with no long-latency op was throughput-bound before this change too).
+    Result := (nArith = 0) or (nLat * LATENCY_DEN < nArith * LATENCY_NUM);
   end;
 
   procedure PlanDynFloat;
@@ -2544,6 +2580,14 @@ var
     mode := AotDynFloatMode;
     if mode = 2 then Exit;                                     // forced off
     if MaxFReg < 0 then Exit;
+    // AUTO arbitration against the REGREUSE merge. The two are ANTAGONISTIC, not additive: DYNF
+    // admits only block-local single-def temps and holds an xmm for [firstDef..lastTouch] without
+    // evicting, whereas a merged register is multi-def and long-lived - so it pins a machine
+    // register for the whole block and starves the others. Measured, both on is always the WORST
+    // of the four combinations (n-body 699 against 360 for the merge alone). The merge also beats
+    // the static allocation everywhere it was measured, so when it ran, it wins. AOT_DYNF=1 still
+    // forces DYNF on, which is what makes the A/B measurable on one binary.
+    if (mode = 0) and SSAProg.RegisterMergeApplied then Exit;
     if (mode = 0) and not RegionThroughputBound then Exit;     // auto: skip latency-bound regions
     nbk := Region.LastBlock - Region.FirstBlock + 1;
     totpos := 0;
@@ -2643,6 +2687,7 @@ var
     mode := AotDynFloatMode;
     if mode = 2 then Exit;
     if MaxIReg < 0 then Exit;
+    if (mode = 0) and SSAProg.RegisterMergeApplied then Exit;  // see PlanDynFloat: antagonistic
     if (mode = 0) and not RegionThroughputBound then Exit;
 
     // Build the dynamic pool: IntPool GPRs not reserved by the array-descriptor cache.
@@ -3113,6 +3158,9 @@ begin
   Allocate;
   PlanDynFloat;   // AOT_DYNF: may replace the static float homes with a within-block dynamic schedule
   PlanDynInt;     // AOT_DYNF (c): same for the integer GPR pool (minus the array-descriptor cache)
+  AotDiagDynFActive := DynFActive;
+  AotDiagDynIActive := DynIActive;
+  AotDiagMergeApplied := SSAProg.RegisterMergeApplied;
 
   HelperOps := TStringList.Create;
 
@@ -3315,6 +3363,15 @@ begin
                                    AotDiagHelperCalls]));
         if AotDiagHelperOps <> '' then
           WriteLn(ErrOutput, '[AOT]   helper ops: ' + AotDiagHelperOps);
+        // Which register strategy this region got. "merge" and "dynf" are mutually exclusive by
+        // arbitration in AUTO (they are antagonistic, never additive); "static" means the region
+        // got the plain static homes, either because AUTO judged it latency-bound or because
+        // nothing qualified for the dynamic pool.
+        WriteLn(ErrOutput, Format('[AOT]   registers: %s (dynf float=%s int=%s, regreuse merge=%s)',
+          [BoolToStr(AotDiagMergeApplied, 'merge',
+             BoolToStr(AotDiagDynFActive or AotDiagDynIActive, 'dynf', 'static')),
+           BoolToStr(AotDiagDynFActive, 'on', 'off'), BoolToStr(AotDiagDynIActive, 'on', 'off'),
+           BoolToStr(AotDiagMergeApplied, 'on', 'off')]));
         if AotDiagFloatTotal > 0 then
           WriteLn(ErrOutput, Format('[AOT]   float traffic: static-resident=%d (%.1f%% mem) -> linscan-resident=%d (%.1f%% mem)  recovers %.1f%% of tail',
             [AotDiagFloatResident, 100.0 * (AotDiagFloatTotal - AotDiagFloatResident) / AotDiagFloatTotal,
