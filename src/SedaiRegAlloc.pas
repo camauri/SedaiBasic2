@@ -105,6 +105,11 @@ type
     FFreeStringRegs: array[0..MAX_STRING_REGS-1] of Boolean;
     FNextSpillSlot: Integer;
     FSpillCount: Integer;
+    FReuseColouring: specialize TDictionary<Int64, Integer>;   // phase 2: key -> shared register number
+                                                               // (nil = allocate one number per value)
+    FReuseColourCount: array[TSSARegisterType] of Integer;     // colours used per bank: anything the
+                                                               // colouring did not cover is numbered ABOVE
+                                                               // them, never into their range
 
     { Compute live intervals for all virtual registers }
     procedure ComputeLiveIntervals;
@@ -156,9 +161,10 @@ type
       live-range-aware allocator would save. It changes nothing (byte-identical output) until
       the numbers say the merge is worth its risk.
 
-      Set REGREUSE_DIAG=1 to print the report; unset it costs one getenv per compilation. ------ }
+      REGREUSE_DIAG=1 prints the report; REGREUSE=1 applies the merge (phase 2, default off). ---- }
     function ReuseDiagEnabled: Boolean;
-    procedure ReportReusePotential;
+    function ReuseMergeEnabled: Boolean;
+    function ComputeReuseColouring(Map: specialize TDictionary<Int64, Integer>; Report: Boolean): Boolean;
 
     { Compute usage frequency for all BASIC variables }
     procedure ComputeVariableUsage(out VarList: TObjectList);
@@ -595,7 +601,93 @@ begin
   Result := GetEnvironmentVariable('REGREUSE_DIAG') = '1';
 end;
 
-procedure TLinearScanAllocator.ReportReusePotential;
+function TLinearScanAllocator.ReuseMergeEnabled: Boolean;
+// Tri-state gate, the same shape AOT_DYNF uses: REGREUSE=1 forces the merge on, =0 forces it off,
+// unset keeps the historic one-number-per-value allocation. Default OFF until the nets say otherwise.
+begin
+  Result := GetEnvironmentVariable('REGREUSE') = '1';
+end;
+
+function OpIsMergeSafe(Op: TSSAOpCode): Boolean;
+// May a register TOUCHED by this opcode take part in the merge at all?
+//
+// The first cut of phase 2 asked the narrower question -- "does this opcode read its Dest?" -- and
+// the nets answered with 16 failures: the graphics family, the error-handler paths and parts of file
+// I/O all move values through channels this liveness does not model (a TRAP handler is entered from
+// anywhere, so its CFG edges do not exist; several ops carry operands in fields the analysis reads
+// as definitions). Enumerating what is unsafe is the losing side of that bet -- a missed opcode is a
+// silent miscompile, and the failures proved the enumeration incomplete.
+//
+// So the polarity is inverted: only registers whose EVERY mention is one of the plainly-modelled
+// opcodes below may be merged. Everything else is pinned. A new opcode then costs a missed merge,
+// never a wrong one. This is the same shape as C4's mechanically-derived deny-list, but with the
+// safe default -- and it keeps the target, since the loops that matter (n-body, floatpoly, intpoly,
+// arraysum) are arithmetic, copies, loads, comparisons and array reads.
+begin
+  case Op of
+    ssaLoadConstInt, ssaLoadConstFloat,
+    ssaCopyInt, ssaCopyFloat,
+    ssaAddInt, ssaSubInt, ssaMulInt, ssaDivInt, ssaModInt, ssaNegInt,
+    ssaDivUInt, ssaModUInt,
+    ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat, ssaModFloat, ssaPowFloat, ssaNegFloat,
+    ssaIntToFloat, ssaFloatToInt,
+    ssaCmpEqInt, ssaCmpNeInt, ssaCmpLtInt, ssaCmpGtInt, ssaCmpLeInt, ssaCmpGeInt,
+    ssaCmpLtUInt, ssaCmpGtUInt, ssaCmpLeUInt, ssaCmpGeUInt,
+    ssaCmpEqFloat, ssaCmpNeFloat, ssaCmpLtFloat, ssaCmpGtFloat, ssaCmpLeFloat, ssaCmpGeFloat,
+    ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,
+    // Array element access: the load writes its Dest, the store carries the VALUE there and is
+    // handled as a read (DestIsPureDef). The hot loops are array updates, so leaving these out
+    // pinned most of what the merge exists for.
+    ssaArrayLoad, ssaArrayStore,
+    ssaArrayLoadIndInt, ssaArrayLoadIndFloat,
+    ssaArrayStoreIndInt, ssaArrayStoreIndFloat,
+    // PRINT reads its operand and writes nothing (verified against the derived read-Dest list).
+    ssaPrint, ssaPrintLn, ssaPrintInt, ssaPrintIntLn:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+function DestIsPureDef(Op: TSSAOpCode): Boolean;
+// Does this opcode's Dest field WRITE a value and never read one?
+//
+// It is not a rhetorical question: several opcodes carry an INPUT in Dest (the graphics family puts
+// a coordinate there, ssaArrayStore the value being stored) and several read the incoming value
+// before overwriting it (bcGetBinStr reads Len(dest) to know how many bytes to read -- the very op
+// this session touched). Treating those as definitions would let liveness end a value that is still
+// needed, and the merge would then hand its register to somebody else. Silently.
+//
+// So the list is DERIVED, never eyeballed -- the same rule C4's helper deny-list follows. Regenerate
+// with, from the repository root:
+//
+//   awk '/^    [0-9]+: *\/\/ *bc[A-Za-z0-9_]+/ { match($0,/bc[A-Za-z0-9_]+/); cur=substr($0,RSTART,RLENGTH) }
+//        /Regs\[Instr\.Dest\]/ { l=$0
+//          if (l ~ /Regs\[Instr\.Dest\] *:=/) { r=l; sub(/.*Regs\[Instr\.Dest\] *:=/,"",r); if (r !~ /Regs\[Instr\.Dest\]/) next }
+//          if (l ~ /WriteLn|StdErr/) next; if (cur != "") print cur }' src/SedaiBytecodeVM.pas | sort -u
+//
+// then map each bytecode name back through the "ssaX: Result := bcY" table in SedaiBytecodeCompiler.
+// For every opcode below, Dest is treated as a pure USE: correct when it is an input, and merely
+// conservative (a longer live range) when it is a read-modify-write.
+//
+// The "To"/"Self" accumulator superinstructions (bcAddIntTo, bcMulFloatTo, ...) do read their Dest
+// but never appear here: the bytecode peephole fuses them AFTER register allocation, out of reach
+// of this analysis.
+begin
+  case Op of
+    ssaArrayStore, ssaArrayStoreIndInt, ssaArrayStoreIndFloat, ssaArrayStoreIndString,
+    ssaGetBinStr, ssaStrInstr, ssaPrintFile, ssaSetColor,
+    ssaGraphicBox, ssaGraphicCircle, ssaGraphicDraw, ssaGraphicGShape, ssaGraphicPaint,
+    ssaGraphicScale, ssaGraphicWindow, ssaGfxCircleEx, ssaGfxLineStyled,
+    ssaMovsprAbs, ssaMovsprAuto, ssaMovsprPolar, ssaMovsprRel,
+    ssaSprite, ssaSprsize, ssaSoundSound, ssaSoundFilter:
+      Result := False;
+  else
+    Result := True;
+  end;
+end;
+
+function TLinearScanAllocator.ComputeReuseColouring(Map: specialize TDictionary<Int64, Integer>; Report: Boolean): Boolean;
 // Liveness over the CFG + interference graph + greedy colouring, per bank. Reports how many VM
 // registers a live-range-aware allocator would need where the current one needs one per value.
 // MEASUREMENT ONLY -- nothing here writes to the program.
@@ -619,7 +711,7 @@ var
   NKeys, NB, bi, ii, si, k, kk, pass, DefKey: Integer;
   Blk, Succ: TSSABasicBlock;
   Ins: TSSAInstruction;
-  Changed, HasGosub: Boolean;
+  Changed, HasGosub, HasHandler: Boolean;
   BUse, BDef, BIn, BOut: array of array of Boolean;   // [block][key]
   Live: array of Boolean;                             // mid-block live set
   Pinned: array of Boolean;                           // never merge (see notes above)
@@ -628,6 +720,10 @@ var
   UsedCol: array of Boolean;
   Distinct, Colours: array[TSSARegisterType] of Integer;
   PinnedN, LiveAcrossGosub, sidx: Integer;
+  HasDef: array of Boolean;      // a key with no definition anywhere is pinned (invisible live-in)
+  UseCount: array of Integer;    // mentions per key: hot values are coloured first, keeping low indexes
+  Order: array of Integer;
+  PinBase: array[TSSARegisterType] of Integer;
   Bank: TSSARegisterType;
 
   function KeyOf(const V: TSSAValue): Integer;
@@ -672,6 +768,7 @@ var
 
 begin
   NB := FProgram.Blocks.Count;
+  Result := False;
   if NB = 0 then Exit;
   NKeys := 0;
   SetLength(Keys, 256);
@@ -683,6 +780,7 @@ begin
     // Pass 0: intern every register the instruction stream mentions, and collect per-block use/def.
     // (Two passes over the blocks: the first only to size the bitsets, since interning grows NKeys.)
     HasGosub := False;
+    HasHandler := False;
     for bi := 0 to NB - 1 do
     begin
       Blk := FProgram.Blocks[bi];
@@ -692,6 +790,14 @@ begin
         KeyOf(Ins.Dest); KeyOf(Ins.Src1); KeyOf(Ins.Src2); KeyOf(Ins.Src3);
         for k := 0 to High(Ins.PhiSources) do KeyOf(Ins.PhiSources[k].Value);
         if (Ins.OpCode = ssaCall) or (Ins.OpCode = ssaReturn) then HasGosub := True;   // GOSUB lowers to ssaCall
+        // An error handler is entered from ANYWHERE -- TRAP/ON ERROR install it and any faulting
+        // instruction jumps to it -- and none of those edges exist in the CFG. Liveness computed
+        // without them is not a description of this program, so no register in it may be merged.
+        // Found the honest way: the first cut left m448 and aot_b1_deopt_diverror failing.
+        // (a plain chain, not a set: TSSAOpCode has well over the 256 elements a Pascal set holds)
+        if (Ins.OpCode = ssaTrap) or (Ins.OpCode = ssaOnError) or (Ins.OpCode = ssaResume) or
+           (Ins.OpCode = ssaResumeNext) or (Ins.OpCode = ssaResumeLabel) then
+          HasHandler := True;
       end;
     end;
     if NKeys = 0 then Exit;
@@ -710,6 +816,21 @@ begin
       SetLength(BIn[bi], NKeys); SetLength(BOut[bi], NKeys);
     end;
     SetLength(Pinned, NKeys); SetLength(Colour, NKeys); SetLength(Live, NKeys);
+    SetLength(HasDef, NKeys); SetLength(UseCount, NKeys);
+    // Mentions per key, for the colouring order: the hottest values must keep the low indexes,
+    // which is what the AOT and the JIT pin.
+    for bi := 0 to NB - 1 do
+    begin
+      Blk := FProgram.Blocks[bi];
+      for ii := 0 to Blk.Instructions.Count - 1 do
+      begin
+        Ins := Blk.Instructions[ii];
+        k := KeyOf(Ins.Dest); if k >= 0 then Inc(UseCount[k]);
+        k := KeyOf(Ins.Src1); if k >= 0 then Inc(UseCount[k]);
+        k := KeyOf(Ins.Src2); if k >= 0 then Inc(UseCount[k]);
+        k := KeyOf(Ins.Src3); if k >= 0 then Inc(UseCount[k]);
+      end;
+    end;
     SetLength(Adj, NKeys);
     for k := 0 to NKeys - 1 do Adj[k] := TFPList.Create;
 
@@ -726,7 +847,48 @@ begin
         for k := 0 to High(Ins.PhiSources) do
           if (Ins.PhiSources[k].FromBlock <> nil) and BlkIdx.TryGetValue(Pointer(Ins.PhiSources[k].FromBlock), si) then
             NoteUse(Ins.PhiSources[k].Value, si);
-        if Ins.Dest.Kind = svkRegister then NoteDef(Ins.Dest, bi);
+        // Dest is a definition only for the opcodes that truly only write it (see DestIsPureDef);
+        // for the rest it carries an input, or the incoming value, and counts as a use.
+        if Ins.Dest.Kind = svkRegister then
+        begin
+          if DestIsPureDef(Ins.OpCode) then
+          begin
+            NoteDef(Ins.Dest, bi);
+            k := KeyOf(Ins.Dest);
+            if k >= 0 then HasDef[k] := True;
+          end
+          else
+            NoteUse(Ins.Dest, bi);
+        end;
+      end;
+    end;
+
+    // A key never DEFINED anywhere is live in from somewhere this analysis cannot see (a parameter,
+    // a global written through a call). With no definition it collects no interference edges either,
+    // so it would happily merge with anything: pin it.
+    for k := 0 to NKeys - 1 do
+      if not HasDef[k] then Pinned[k] := True;
+
+    // A program with an error handler gets NO merging at all: see the note at HasHandler.
+    if HasHandler then
+      for k := 0 to NKeys - 1 do Pinned[k] := True;
+
+    // Pin every register that any opcode outside the modelled set touches (see OpIsMergeSafe).
+    for bi := 0 to NB - 1 do
+    begin
+      Blk := FProgram.Blocks[bi];
+      for ii := 0 to Blk.Instructions.Count - 1 do
+      begin
+        Ins := Blk.Instructions[ii];
+        if OpIsMergeSafe(Ins.OpCode) then Continue;
+        k := KeyOf(Ins.Dest); if k >= 0 then Pinned[k] := True;
+        k := KeyOf(Ins.Src1); if k >= 0 then Pinned[k] := True;
+        k := KeyOf(Ins.Src2); if k >= 0 then Pinned[k] := True;
+        k := KeyOf(Ins.Src3); if k >= 0 then Pinned[k] := True;
+        for si := 0 to High(Ins.PhiSources) do
+        begin
+          k := KeyOf(Ins.PhiSources[si].Value); if k >= 0 then Pinned[k] := True;
+        end;
       end;
     end;
 
@@ -779,12 +941,17 @@ begin
       begin
         Ins := Blk.Instructions[ii];
         DefKey := -1;
-        if Ins.Dest.Kind = svkRegister then DefKey := KeyOf(Ins.Dest);
+        if (Ins.Dest.Kind = svkRegister) and DestIsPureDef(Ins.OpCode) then DefKey := KeyOf(Ins.Dest);
         if DefKey >= 0 then
         begin
           for k := 0 to NKeys - 1 do
             if Live[k] then Interfere(DefKey, k);
           Live[DefKey] := False;
+        end
+        // Dest carries an input for this opcode: it is a read, so the value stays live above it.
+        else if Ins.Dest.Kind = svkRegister then
+        begin
+          k := KeyOf(Ins.Dest); if k >= 0 then Live[k] := True;
         end;
         // A value live across a GOSUB is live over an edge the CFG does not have: never merge it.
         if (Ins.OpCode = ssaCall) or (Ins.OpCode = ssaReturn) then
@@ -798,40 +965,70 @@ begin
     end;
     for k := 0 to NKeys - 1 do if Pinned[k] then Inc(PinnedN);
 
-    // Greedy colouring per bank, pinned registers first (each takes a colour of its own).
+    // Colouring, per bank, in TWO phases.
+    //  1. Every PINNED register takes a colour of its own, and those colours are then off limits:
+    //     a pinned register is one whose live range this analysis does not trust, so it must not
+    //     share a number with anybody, not even with someone it appears not to interfere with.
+    //  2. The rest are coloured greedily (first fit above the pinned block), MOST-USED FIRST, so
+    //     the hot values keep the low indexes the AOT and JIT pin.
     for k := 0 to NKeys - 1 do Colour[k] := -1;
     for Bank := Low(TSSARegisterType) to High(TSSARegisterType) do
-    begin Distinct[Bank] := 0; Colours[Bank] := 0; end;
-    SetLength(UsedCol, NKeys + 1);
+    begin Distinct[Bank] := 0; Colours[Bank] := 0; PinBase[Bank] := 0; end;
     for k := 0 to NKeys - 1 do
     begin
       Inc(Distinct[Keys[k].Bank]);
       if Pinned[k] then
       begin
-        Colour[k] := Colours[Keys[k].Bank];
-        Inc(Colours[Keys[k].Bank]);
-        Continue;
+        Colour[k] := PinBase[Keys[k].Bank];
+        Inc(PinBase[Keys[k].Bank]);
+        if Colour[k] + 1 > Colours[Keys[k].Bank] then Colours[Keys[k].Bank] := Colour[k] + 1;
       end;
-      for kk := 0 to NKeys do UsedCol[kk] := False;
+    end;
+
+    SetLength(Order, NKeys);
+    for k := 0 to NKeys - 1 do Order[k] := k;
+    for k := 1 to NKeys - 1 do              // insertion sort by descending use count
+    begin
+      si := Order[k]; kk := k - 1;
+      while (kk >= 0) and (UseCount[Order[kk]] < UseCount[si]) do
+      begin Order[kk + 1] := Order[kk]; Dec(kk); end;
+      Order[kk + 1] := si;
+    end;
+
+    SetLength(UsedCol, NKeys + 2);
+    for ii := 0 to NKeys - 1 do
+    begin
+      k := Order[ii];
+      if Pinned[k] then Continue;
+      for kk := 0 to NKeys + 1 do UsedCol[kk] := False;
       for kk := 0 to Adj[k].Count - 1 do
       begin
         si := PtrInt(Adj[k][kk]);
         if (Colour[si] >= 0) and (Colour[si] <= NKeys) then UsedCol[Colour[si]] := True;
       end;
-      si := 0;
+      si := PinBase[Keys[k].Bank];          // never reuse a pinned register's number
       while (si <= NKeys) and UsedCol[si] do Inc(si);
       Colour[k] := si;
       if si + 1 > Colours[Keys[k].Bank] then Colours[Keys[k].Bank] := si + 1;
     end;
 
-    WriteLn('[RegReuse] blocks=', NB, ' registers=', NKeys, ' fixpoint passes=', pass,
-            ' pinned=', PinnedN, ' (live across GOSUB: ', LiveAcrossGosub, ')',
-            {$IFDEF DEBUG_REGALLOC}'' {$ELSE}'' {$ENDIF});
-    WriteLn('[RegReuse]   int   : ', Distinct[srtInt], ' distinct -> ', Colours[srtInt], ' needed');
-    WriteLn('[RegReuse]   float : ', Distinct[srtFloat], ' distinct -> ', Colours[srtFloat], ' needed');
-    WriteLn('[RegReuse]   string: ', Distinct[srtString], ' distinct -> ', Colours[srtString], ' needed');
-    if HasGosub then
-      WriteLn('[RegReuse]   NOTE: the program uses GOSUB -- values live across one are pinned');
+    if Map <> nil then
+      for k := 0 to NKeys - 1 do
+        Map.AddOrSetValue(RegAllocKey(Keys[k].Bank, Keys[k].Idx, Keys[k].Ver), Colour[k]);
+    for Bank := Low(TSSARegisterType) to High(TSSARegisterType) do
+      FReuseColourCount[Bank] := Colours[Bank];
+    Result := True;
+
+    if Report then
+    begin
+      WriteLn('[RegReuse] blocks=', NB, ' registers=', NKeys, ' fixpoint passes=', pass,
+              ' pinned=', PinnedN, ' (live across a call: ', LiveAcrossGosub, ')');
+      WriteLn('[RegReuse]   int   : ', Distinct[srtInt], ' distinct -> ', Colours[srtInt], ' needed');
+      WriteLn('[RegReuse]   float : ', Distinct[srtFloat], ' distinct -> ', Colours[srtFloat], ' needed');
+      WriteLn('[RegReuse]   string: ', Distinct[srtString], ' distinct -> ', Colours[srtString], ' needed');
+      if HasGosub then
+        WriteLn('[RegReuse]   NOTE: the program calls -- values live across a call are pinned');
+    end;
 
     for k := 0 to NKeys - 1 do Adj[k].Free;
   finally
@@ -843,9 +1040,22 @@ end;
 function TLinearScanAllocator.RunBASICAllocation: Integer;
 var
   VarList: TObjectList;
+  Colouring: specialize TDictionary<Int64, Integer>;
 begin
-  if ReuseDiagEnabled then
-    ReportReusePotential;
+  // Phase 2: with REGREUSE=1, values with disjoint live ranges share a register number. The
+  // colouring is computed on the pre-allocation keys and consumed by AllocateBASICVariables; if
+  // the analysis bails (an enormous CFG) the historic one-number-per-value path runs unchanged.
+  Colouring := nil;
+  if ReuseMergeEnabled or ReuseDiagEnabled then
+  begin
+    Colouring := specialize TDictionary<Int64, Integer>.Create;
+    if not ComputeReuseColouring(Colouring, ReuseDiagEnabled) then
+      FreeAndNil(Colouring)
+    else if not ReuseMergeEnabled then
+      FreeAndNil(Colouring);       // diagnostic only: report, then allocate as before
+  end;
+  FReuseColouring := Colouring;
+  try
 
   {$IFDEF DEBUG_REGALLOC}
   if DebugRegAlloc then
@@ -870,6 +1080,11 @@ begin
     {$ENDIF}
   finally
     VarList.Free;
+  end;
+
+  finally
+    FReuseColouring := nil;
+    Colouring.Free;
   end;
 end;
 
@@ -964,6 +1179,26 @@ begin
   for i := 0 to VarList.Count - 1 do
   begin
     VarInfo := TVariableInfo(VarList[i]);
+
+    // Phase 2 (REGREUSE=1): the interference colouring already decided which values may share a
+    // number. Take it verbatim -- values with disjoint live ranges land on the same register, and
+    // the count collapses to what the program actually needs at once (n-body float: 247 -> 8).
+    if FReuseColouring <> nil then
+    begin
+      if FReuseColouring.TryGetValue(RegAllocKey(VarInfo.RegType, VarInfo.VirtualReg, VarInfo.Version),
+                                     PhysReg) then
+      begin
+        VarInfo.PhysicalReg := PhysReg;
+        Continue;
+      end;
+      // Not in the colouring (the analysis never saw it): give it a private number ABOVE every
+      // colour of its bank. Falling through to GetFreeRegister would hand out 0..31 again and
+      // collide with the colours -- two values sharing a register with no interference analysis
+      // behind it, which is the whole failure mode this pass exists to avoid.
+      VarInfo.PhysicalReg := FReuseColourCount[VarInfo.RegType];
+      Inc(FReuseColourCount[VarInfo.RegType]);
+      Continue;
+    end;
 
     // Try to get a free physical register for this type
     PhysReg := GetFreeRegister(VarInfo.RegType);
