@@ -5595,7 +5595,7 @@ end;
 function TPackratParser.ParseFileOperationStatement: TASTNode;
 var
   Token: TLexerToken;
-  Param, HandleNode: TASTNode;
+  Param, HandleNode, LenExpr: TASTNode;
   CmdName, ModeStr, MW: string;
   C64Name, C64Rest, C64Base: string;   // C64 OPEN lf,dev,sa,"name[,type][,mode]" decoding
   C64Dev, C64Sa, C64FileName: TASTNode;
@@ -5752,7 +5752,11 @@ begin
       else if MW = kOUTPUT then ModeStr := 'W'
       else if MW = kAPPEND then ModeStr := 'A'
       else if MW = kBINARY then ModeStr := 'B'
-      else if MW = kRANDOM then ModeStr := 'B'
+      // RANDOM: a record-oriented file. The mode the runtime wants is "L<reclen>" (the same relative-file
+      // mode the CLASSIC DOPEN uses), but "Len = <expr>" below may be any expression -- SizeOf(rec) in
+      // FreeBASIC's own example -- so the length is left as a CHILD and the mode string is completed in
+      // the SSA. A bare "L" (no Len clause) means FreeBASIC's default record length of 128.
+      else if MW = kRANDOM then ModeStr := 'L'
       else HandleError('Expected INPUT/OUTPUT/APPEND/BINARY/RANDOM after FOR', Token);
       Context.Advance;            // mode word
     end;
@@ -5797,15 +5801,21 @@ begin
       HandleNode := FoldFileHandlePostfix(HandleNode);
     end
     else begin HandleError('Expected file number after AS', Token); Exit; end;
-    if UpperCase(Context.CurrentToken.Value) = kLEN then   // optional "LEN = reclen" (RANDOM): ignored v1
+    LenExpr := nil;
+    if UpperCase(Context.CurrentToken.Value) = kLEN then    // optional "LEN = reclen" (RANDOM)
     begin
       Context.Advance;
       if Context.Check(ttOpEq) then Context.Advance;
-      ParseExpression.Free;
+      LenExpr := ParseExpression;
     end;
     Result.AddChild(HandleNode);                            // child 0 = handle
     Result.AddChild(Param);                                 // child 1 = filename
     Result.AddChild(TASTNode.CreateWithValue(antLiteral, ModeStr, Token));  // child 2 = mode$
+    // child 3 = record length expression (RANDOM only; the SSA appends it to the "L" mode).
+    if LenExpr <> nil then
+    begin
+      if ModeStr = 'L' then Result.AddChild(LenExpr) else LenExpr.Free;
+    end;
     DoNodeCreated(Result);
     Exit;
   end;

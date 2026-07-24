@@ -247,8 +247,16 @@ begin
     Data := IntToStr(FS.Position + 1)
   else if Command = 'SEEKSET' then
   begin
-    // SEEK #n, pos statement: set the 1-based position.
-    try FS.Position := StrToInt64(Data) - 1; except ErrorCode := 63; end;
+    // SEEK #n, pos statement: set the 1-based position. "The position is given in RECORDS if the file
+    // was opened in Random access mode, in bytes in any other case" (FB manual, KeyPgSeekset) -- which
+    // is also how "Put #n, recno, rec" and "Get #n, recno, rec" address a random-access file, since both
+    // position through this command.
+    try
+      if FRecordLens[Handle] > 0 then
+        FS.Position := (StrToInt64(Data) - 1) * FRecordLens[Handle]
+      else
+        FS.Position := StrToInt64(Data) - 1;
+    except ErrorCode := 63; end;
   end
   else if Command = 'GET#' then
   begin

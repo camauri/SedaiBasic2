@@ -13799,6 +13799,7 @@ procedure TSSAGenerator.ProcessDopen(Node: TASTNode);
 var
   HandleVal, FilenameVal, ModeVal: TSSAValue;
   HandleReg, FilenameReg, ModeReg: TSSAValue;
+  RecLenVal, RecLenStr, RecLenTrim: TSSAValue;   // FOR RANDOM: "L" + LEN = <expr>
   HandleNameIdx: Integer;
   HandleChild: TASTNode;
   HandleStr: string;
@@ -13893,6 +13894,30 @@ begin
   begin
     ProcessStringExpression(Node.GetChild(2), ModeVal);
     ModeReg := EnsureStringRegister(ModeVal);
+    // "OPEN ... FOR RANDOM ... LEN = <expr>": the parser leaves the mode as a bare "L" and the record
+    // length as child 3, because the length may be any expression (SizeOf(rec) in FreeBASIC's own
+    // example). Complete the runtime mode string here: "L" + the length, which is the relative-file
+    // mode the file layer already understands (positions are then RECORD numbers, not bytes).
+    // No LEN clause -> FreeBASIC's default record length of 128.
+    if (Node.GetChild(2).NodeType = antLiteral) and (UpperCase(VarToStr(Node.GetChild(2).Value)) = 'L') then
+    begin
+      if Node.ChildCount > 3 then
+      begin
+        ProcessExpression(Node.GetChild(3), RecLenVal);
+        RecLenStr := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaStrStr, RecLenStr, EnsureFloatRegister(RecLenVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        RecLenTrim := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaStrTrim, RecLenTrim, RecLenStr, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+      begin
+        RecLenTrim := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaLoadConstString, RecLenTrim, MakeSSAConstString('128'), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+      RecLenVal := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaStrConcat, RecLenVal, ModeReg, RecLenTrim, MakeSSAValue(svkNone));
+      ModeReg := RecLenVal;
+    end;
   end
   else
   begin
