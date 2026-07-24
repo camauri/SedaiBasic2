@@ -82,6 +82,9 @@ type
                             // 0 = variable-length). Storage stays variable-length (advisory), but the
                             // C BYTE LAYOUT of the type needs it: fbc gives such a field n+1 bytes.
     IsWString: Boolean;     // WSTRING field: srtString storage (UTF-8) but LEN/MID count by codepoint
+    IsZString: Boolean;     // ZSTRING field: like a WSTRING it keeps VARIABLE-length semantics (no padding
+                            // to StrCapacity, LEN is the content length) and occupies n bytes in the C
+                            // layout -- not n+1: for a ZSTRING the terminator is inside the declared n
     IsArray: Boolean;       // array member (e.g. "Dim As Double m(Any, Any)"): the int slot holds an FArrays handle
     ArrayElemBank: TSSARegisterType;  // element bank of an array member (int/float/string)
     ArrayElemType: string;  // element UDT type name if the array member is an array-of-UDT ("verts(100) As Vertex"),
@@ -484,6 +487,7 @@ type
     function UDTFuncPtrFieldSig(UDTIdx: Integer; const FieldName: string; out Slot: Integer): string;  // funcptr field signature + slot (else '')
     function UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;  // B1.5: field narrow width
     function UDTFieldStrCapacity(UDTIdx: Integer; const FieldName: string; out Wide: Boolean): Integer;
+    function TryUDTFieldSizeConst(Node: TASTNode; CLayoutSize: Boolean; out Size: Int64): Boolean;
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
     function TypeNameWidthCode(const TypeName: string): Integer;        // B1.5 phase 2: type -> narrow code
@@ -1549,6 +1553,7 @@ var
   ValCode: Integer;
   ConvW: Integer;   // B1.5: integer-narrowing width code for a Cxxx conversion (0 = full width)
   SelImm: Integer;  // date/time function selector encoded in the opcode Immediate
+  FieldSzConst: Int64;   // LEN/SIZEOF of a UDT field: compile-time byte size
   NarrowReg: TSSAValue;
   NegReg, FloorReg: TSSAValue;   // FLOOR/CEIL lowering (via Int and float negation)
   // Array access variables
@@ -3298,11 +3303,31 @@ begin
             ArgNode := ArgListNode
           else begin Result := MakeSSAValue(svkNone); Exit; end;
 
+          // LEN of a UDT FIELD: "Len(TypeName.field)" is the field's size in the type's C layout, while
+          // "Len(instance.field)" is the value's length (the declared capacity of a fixed-length string,
+          // the declared width of a numeric). Both are compile-time constants; a variable-length string
+          // field returns False here and keeps the runtime string-length path below.
+          if TryUDTFieldSizeConst(ArgNode, False, FieldSzConst) then
+          begin
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(FieldSzConst),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Exit;
+          end;
+
           // LEN of a user-defined type is the size of the type in bytes, NOT a string length: FreeBASIC
           // calls an "Operator Len" if the type declares one (we have none) and otherwise reports SizeOf.
           // In particular it does NOT go through "Operator Cast() As String" -- only the string contexts
           // do. Without this the record handle reached the string register and LEN answered 1.
           TempStr := ObjectTypeName(ArgNode);
+          // A UDT TYPE NAME wins over a variable of the same spelling, which is what fbc does inside
+          // LEN/SIZEOF (it says so out loud: "Ambigious len(), referring to type Q, instead of variable
+          // Q"). Everywhere else the variable still wins -- and so does it here for a BUILTIN type name,
+          // where the existing rule stands (see the bare-type-name branch below).
+          if (TempStr = '') and (ArgNode <> nil) and (ArgNode.NodeType = antIdentifier) and
+             (ArgNode.ChildCount = 0) and FModernMode and
+             (FindUDT(UpperCase(VarToStr(ArgNode.Value))) >= 0) then
+            TempStr := UpperCase(VarToStr(ArgNode.Value));
           if (TempStr <> '') and (FindUDT(TempStr) >= 0) then
           begin
             Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -4897,13 +4922,33 @@ begin
         // folds the juxtaposition, as it does for a DIM) and is likewise 8 bytes.
         if (UpperCase(ArrName) = 'SIZEOF') and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount = 1) and
-           (Node.GetChild(1).GetChild(0).NodeType = antIdentifier) then
+           (Node.GetChild(1).GetChild(0).NodeType in [antIdentifier, antMemberAccess]) then
         begin
+          // SIZEOF(x.field) — of an instance or through the type name alike — is the field's size in
+          // the type's C layout ("String * n" -> n+1). LEN of the same field on an INSTANCE is instead
+          // the value's length; the two forms are distinguished in TryUDTFieldSizeConst.
+          if TryUDTFieldSizeConst(Node.GetChild(1).GetChild(0), True, FieldSzConst) then
+          begin
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(FieldSzConst), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Exit;
+          end;
+          if Node.GetChild(1).GetChild(0).NodeType <> antIdentifier then
+            Exit;    // a member access we cannot size: fall out rather than answer nonsense
           ArrName2 := UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value));
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           if (FPointerVars.IndexOfName(ArrName2) >= 0) or IsRawPtr(ArrName2) or
              ((Length(ArrName2) >= 4) and (Copy(ArrName2, Length(ArrName2) - 3, 4) = ' PTR')) then
             EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+          // SIZEOF of a VARIABLE is the size of its declared type, not of the handle/slot holding it:
+          // a UDT instance answers its type's C size (fbc: SizeOf(q1) = SizeOf(Q)), a declared numeric
+          // or pointer scalar its declared width. A type NAME still wins over a same-named variable.
+          else if (FindUDT(ArrName2) < 0) and (VarRecordTypeName(ArrName2) <> '') then
+            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(VarRecordTypeName(ArrName2))),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+          else if (FindUDT(ArrName2) < 0) and (DeclaredScalarLenBytes(ArrName2) >= 0) then
+            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(DeclaredScalarLenBytes(ArrName2)),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone))
           else
             EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(ArrName2)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
@@ -6550,7 +6595,7 @@ begin
       begin
         // Plain "String * n" fields only — a WSTRING field is variable-length (see UDTFieldStrCapacity).
         if (FUDTs[UIdx].Fields[k].Bank = srtString) and (FUDTs[UIdx].Fields[k].StrCapacity > 0) and
-           (not FUDTs[UIdx].Fields[k].IsWString) then
+           (not FUDTs[UIdx].Fields[k].IsWString) and (not FUDTs[UIdx].Fields[k].IsZString) then
           Result := FUDTs[UIdx].Fields[k].StrCapacity;
         Exit;
       end;
@@ -15987,9 +16032,13 @@ var
   F: TUDTField;
 begin
   F := FUDTs[UDTIdx].Fields[FieldIdx];
-  if (F.Bank = srtString) and (F.StrCapacity > 0) then
+  if (F.Bank = srtString) and (F.StrCapacity > 0) and (not F.IsZString) then
   begin
     Size := F.StrCapacity + 1; Align := 1; Exit;    // fixed-length string: chars + NUL, byte-aligned
+  end;
+  if (F.Bank = srtString) and (F.StrCapacity > 0) and F.IsZString then
+  begin
+    Size := F.StrCapacity; Align := 1; Exit;        // ZSTRING * n: the terminator is inside the n
   end;
   if F.Bank = srtString then begin Size := 24; Align := 8; Exit; end;   // string descriptor
   if F.IsArray or (F.NestedType <> '') or (F.PtrPointee <> '') or
@@ -16844,9 +16893,69 @@ begin
     begin
       // Only a plain "String * n" field carries the padded fixed-length storage: a WSTRING field keeps
       // variable-length semantics, exactly as a WSTRING scalar does (see TryFixedLenStore).
-      if (FUDTs[UDTIdx].Fields[i].Bank = srtString) and (not FUDTs[UDTIdx].Fields[i].IsWString) then
+      if (FUDTs[UDTIdx].Fields[i].Bank = srtString) and (not FUDTs[UDTIdx].Fields[i].IsWString) and
+         (not FUDTs[UDTIdx].Fields[i].IsZString) then
         Result := FUDTs[UDTIdx].Fields[i].StrCapacity;
       Exit;
+    end;
+end;
+
+function TSSAGenerator.TryUDTFieldSizeConst(Node: TASTNode; CLayoutSize: Boolean; out Size: Int64): Boolean;
+// Compile-time size of "x.field", the two forms fbc distinguishes (verified on a Q with
+// "s As String * 3 / d As Double / b As Byte"):
+//   SIZEOF(anything.field) and LEN(TypeName.field) -> the field's size in the type's C LAYOUT
+//     (a "String * n" occupies n+1 bytes: characters + terminator)          s=4  d=8  b=1
+//   LEN(instance.field)    -> the VALUE's length: n for a fixed-length string, the declared
+//     width for a numeric field                                             s=3  d=8  b=1
+// CLayoutSize selects the first form. Returns False (nothing emitted) when the node is not a member
+// access on a resolvable UDT, or when LEN must keep its runtime path (a variable-length string field).
+//
+// The TYPE NAME wins over a variable of the same spelling, as it does in fbc: with "Dim a6 As A6",
+// "Len(a6.f)" answers the C field size, not the value's length. (That collision is exactly why fbc
+// looked self-contradictory here: two programs declaring the same type disagreed only because one
+// named its variable after the type.)
+var
+  UIdx, k: Integer;
+  BaseName, FieldU: string;
+  Align: Int64;
+begin
+  Result := False;
+  Size := 0;
+  if (Node = nil) or (Node.NodeType <> antMemberAccess) or (Node.ChildCount < 1) then Exit;
+  UIdx := -1;
+  if Node.GetChild(0).NodeType = antIdentifier then
+  begin
+    BaseName := UpperCase(VarToStr(Node.GetChild(0).Value));
+    UIdx := FindUDT(BaseName);                       // "TypeName.field": the type form
+    if UIdx >= 0 then CLayoutSize := True;           // LEN of a type-qualified field is its C size
+  end;
+  if UIdx < 0 then
+    UIdx := FindUDT(ObjectTypeName(Node.GetChild(0)));   // "instance.field"
+  if UIdx < 0 then Exit;
+  FieldU := UpperCase(VarToStr(Node.Value));
+  for k := 0 to High(FUDTs[UIdx].Fields) do
+    if FUDTs[UIdx].Fields[k].Name = FieldU then
+    begin
+      if CLayoutSize then
+      begin
+        UDTFieldCShape(UIdx, k, Size, Align);
+        Exit(True);
+      end;
+      // LEN of an instance field: the value's length.
+      if FUDTs[UIdx].Fields[k].Bank = srtString then
+      begin
+        // A plain "String * n" field always measures n; a WSTRING field is variable-length even when
+        // declared with a capacity (same rule as a WSTRING scalar), so LEN keeps its runtime path.
+        if (FUDTs[UIdx].Fields[k].StrCapacity > 0) and (not FUDTs[UIdx].Fields[k].IsWString) and (not FUDTs[UIdx].Fields[k].IsZString) then
+        begin
+          Size := FUDTs[UIdx].Fields[k].StrCapacity;
+          Exit(True);
+        end;
+        Exit;                                          // variable-length: runtime string length
+      end;
+      if FUDTs[UIdx].Fields[k].IsArray or (FUDTs[UIdx].Fields[k].NestedType <> '') then Exit;
+      UDTFieldCShape(UIdx, k, Size, Align);            // numeric/pointer: the declared width
+      Exit(True);
     end;
 end;
 
@@ -17151,11 +17260,12 @@ begin
       if IsArrayField then
         FUDTs[Idx].Fields[n].ArrayBounds := ConcreteArrayBounds(FieldNode);
       FUDTs[Idx].Fields[n].IsWString := (TypeName = 'WSTRING');  // codepoint LEN/MID on obj.field
+      FUDTs[Idx].Fields[n].IsZString := (TypeName = 'ZSTRING');  // variable-length, n bytes in C
       // "As String * n" capacity: the C layout uses it (see UDTCLayout) AND the field's storage is
       // padded to it, exactly as a fixed-length scalar's is (see TryFixedLenStore's header comment).
       FUDTs[Idx].Fields[n].StrCapacity := StrToIntDef(FieldNode.Attributes.Values['FIXEDLEN'], 0);
       if (FUDTs[Idx].Fields[n].Bank = srtString) and (FUDTs[Idx].Fields[n].StrCapacity > 0) and
-         (not FUDTs[Idx].Fields[n].IsWString) then
+         (not FUDTs[Idx].Fields[n].IsWString) and (not FUDTs[Idx].Fields[n].IsZString) then
         FHasFixedLenFields := True;
       if NestedT = '' then
         FUDTs[Idx].Fields[n].WidthCode := TypeNameWidthCode(TypeName)  // B1.5: narrow field on store
@@ -17947,7 +18057,8 @@ begin
   if FHasFixedLenFields then
     for i := 0 to High(FUDTs[UDTIdx].Fields) do
       if (FUDTs[UDTIdx].Fields[i].Bank = srtString) and (FUDTs[UDTIdx].Fields[i].StrCapacity > 0) and
-         (not FUDTs[UDTIdx].Fields[i].IsArray) and (not FUDTs[UDTIdx].Fields[i].IsWString) then
+         (not FUDTs[UDTIdx].Fields[i].IsArray) and (not FUDTs[UDTIdx].Fields[i].IsWString) and
+         (not FUDTs[UDTIdx].Fields[i].IsZString) then
       begin
         DefVal := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
         EmitFixedLenInit(DefVal, FUDTs[UDTIdx].Fields[i].StrCapacity, False);
