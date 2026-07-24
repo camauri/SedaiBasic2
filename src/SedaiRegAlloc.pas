@@ -603,7 +603,36 @@ end;
 
 function TLinearScanAllocator.ReuseMergeEnabled: Boolean;
 // Tri-state gate, the same shape AOT_DYNF uses: REGREUSE=1 forces the merge on, =0 forces it off,
-// unset keeps the historic one-number-per-value allocation. Default OFF until the nets say otherwise.
+// unset takes the default.
+//
+// ⛔ The default is OFF: flipping it was ATTEMPTED on 2026-07-24 and REVERTED the same session,
+// because the FreeBASIC example sweep - the only net that runs real third-party programs - found
+// a REAL miscompile that every other net missed (corpus 496/496, AOT/JIT/combined 0 mismatch each,
+// basc sweep 730/2/0 were ALL green with the merge on):
+//
+//   * control/for-next2 hangs printing -1 forever. -1 is TRUE, so a comparison's result is being
+//     printed where the loop variable should be: the merge gave one register to two values whose
+//     live ranges overlap. That is a defect of the interference analysis itself, not of the
+//     program - it must be understood before the gate moves.
+//   * strings/lset-udt prints 0 instead of 1234. That one is a PRE-EXISTING bug the merge merely
+//     reveals (LSet on a UDT is lowered through the string path and only worked because the int
+//     and string banks happened to be numbered in parallel), same shape as the KEY bug.
+//
+// The performance case for flipping is strong and stands (measured best-of-N, interleaved A/B on
+// one binary, output bit-identical, fbc thermometer ~200 ms) - which is exactly why the blocker is
+// recorded here rather than the numbers alone:
+//
+//   interpreter  n-body -5%   arraysum -19%   sieve  -9%
+//   --jit        n-body -11%  arraysum -26%   sieve  -4%
+//   --aot        n-body -11%  floatpoly -24%  arraysum -27%  sieve -20%
+//   combined     n-body -7%   floatpoly -23%  arraysum -30%
+//
+// The losses are intpoly (+12%) and, marginally, cvtpoly (+6%) and strops (+3%) - integer-heavy
+// loops whose post-merge pressure still exceeds the 7 usable GPRs, where merging only lengthens
+// live ranges. Nobody has a per-region rule for that yet (see the note in RunBASICAllocation).
+//
+// ⚠️ LESSON, the same one Copy Coalescing taught: for a register allocator the net that decides is
+// REAL PROGRAMS. Every in-house net was green.
 begin
   Result := GetEnvironmentVariable('REGREUSE') = '1';
 end;
