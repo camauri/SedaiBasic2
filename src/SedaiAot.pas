@@ -230,10 +230,17 @@ var
 // SkipMain: engine arbitration for the COMBINED --aot --jit mode. The loop JIT can only see
 // (and inline callees into) loops that run in the interpreter's dispatch loop; an AOT-compiled
 // MAIN steals the module-level hot loop from it and replaces loop inlining with a native call
-// per iteration - measured 2x slower on n-body. Until AOT does its own inlining, the split
-// that wins is: JIT owns MAIN (module loops, inlining), AOT owns the procedures.
+// per iteration - measured 2x slower on n-body BACK THEN. Since that measurement the AOT gained
+// movaps copies, in-place computation and the dynamic register allocator, and on n-body it is now
+// the FASTEST profile (404 ms against the JIT's 606), so the arbitration is worth re-deciding.
+// AotSkipMainDefault reads the current verdict; AOT_MAIN=1/0 overrides it, which is what makes the
+// two arrangements A/B-able on one binary.
 function AotCompileProgram(SSAProg: TSSAProgram; Prog: TBytecodeProgram;
                            TrueVal: Int64; AllowUnsafe, Diag, SkipMain: Boolean): TAotFuncs;
+
+// Should the AOT leave MAIN to the JIT in combined mode? Tri-state env override AOT_MAIN
+// (1 = AOT takes MAIN, 0 = AOT skips it); with the variable unset the compiled-in default wins.
+function AotSkipMainDefault(CombinedMode: Boolean): Boolean;
 
 implementation
 
@@ -253,6 +260,21 @@ begin
     else GAotDynFloatState := 1;
   end;
   Result := GAotDynFloatState;
+end;
+
+function AotSkipMainDefault(CombinedMode: Boolean): Boolean;
+// Engine arbitration for --aot --jit. Outside combined mode there is nothing to arbitrate: the
+// AOT always takes MAIN. Inside it, the historic answer was "leave MAIN to the JIT", because an
+// AOT MAIN replaced the JIT's loop inlining with a native call per iteration. That verdict was
+// measured before movaps, in-place computation and the dynamic allocator; with those in, the AOT
+// owns MAIN faster than the JIT does, so the default is to take it. AOT_MAIN overrides either way.
+var s: string;
+begin
+  if not CombinedMode then Exit(False);
+  s := GetEnvironmentVariable('AOT_MAIN');
+  if s = '1' then Result := False          // AOT takes MAIN
+  else if s = '0' then Result := True      // historic split: JIT owns MAIN
+  else Result := False;                    // default: AOT takes MAIN
 end;
 
 // The B1 op set: scalar int/float compute + control flow + the Xfer scalar forms
