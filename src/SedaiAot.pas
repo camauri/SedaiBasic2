@@ -220,6 +220,20 @@ var
   // Which ops those helper calls execute, as "name*count" pairs - the first thing to read
   // when hunting a hot-loop helper (a cold DIM/PRINT is fine, a per-iteration op is not).
   AotDiagHelperOps: string = '';
+  // B1b interval model, measured on the last region compiled. The pair to read is (webs,
+  // maxOverlap): webs is how many independent VALUES the region really has where the static
+  // allocator sees "distinct" register NUMBERS, and maxOverlap is how many of them are live at
+  // once - the number a machine pool has to fit. maxOverlap <= pool means everything can be
+  // resident; webs >> distinct means the merge really did stack values on shared numbers, which
+  // is exactly what splitting takes back apart.
+  AotDiagLsWebsInt: Integer = 0;
+  AotDiagLsWebsFloat: Integer = 0;
+  AotDiagLsRanges: Integer = 0;
+  AotDiagLsMaxOverInt: Integer = 0;
+  AotDiagLsMaxOverFloat: Integer = 0;
+  AotDiagLsCross: Integer = 0;        // (edge, register) pairs a value crosses: the upper bound on
+                                      // the resolution moves the CFG can demand
+  AotDiagLsWhy: string = '';          // empty = the model was built
 
 // Compile every eligible region to native code (B1a: static frequency register
 // assignment, deopt only for trapping ops). TrueVal is the VM's TRUE (-1);
@@ -710,6 +724,36 @@ const
   IntPool: array[0..6] of Integer = (R9, R10, R11, R12, R13, R14, R15);
 type
   TFix = record PatchOff, TargetBlock: Integer; end;  // TargetBlock -1 = epilogue
+  // B1b, the linear-scan model. A RANGE is one contiguous run of linear positions, inside ONE
+  // block, over which a VM register holds a value. A register's lifetime is a set of ranges, and
+  // the gaps between them are the holes an allocator is allowed to give away - which is the whole
+  // point: the REGREUSE merge deliberately gives one register number to values with disjoint
+  // lifetimes, and the AOT's one-home-per-region allocation then reads that as a single long life.
+  // Splitting reads it back apart.
+  //
+  // Ranges connected by liveness across a CFG edge (live-out of P, live-in of S) carry ONE value
+  // and are unioned into a WEB. A web is the allocation unit: fully resident in a machine register
+  // or fully memory-homed. Between two webs of the same register there is, by construction, a
+  // point where the value is dead - so nothing flows between them and they need no move.
+  TLsRange = record
+    Bank: Integer;             // 0 = int, 1 = float
+    Reg: Integer;              // final VM bank index (post register-compaction remap)
+    Blk: Integer;              // region-relative block
+    PStart, PEnd: Integer;     // inclusive linear positions
+    OpensOnUse: Boolean;       // the first touch READS: the value must already be somewhere
+    LiveIn, LiveOut: Boolean;  // crosses the block's entry / exit edge
+    Web: Integer;              // union-find parent, then the web id
+    Weight: Int64;             // loop-weighted touches inside the range
+  end;
+  TLsWeb = record
+    Bank, Reg: Integer;
+    PStart, PEnd: Integer;     // span, holes included
+    NRange: Integer;
+    Weight: Int64;             // loop-weighted touches: what an eviction costs
+    NeedsLoad: Boolean;        // opens on a use -> the value arrives through the bank
+    HasDef: Boolean;           // written while resident -> the bank copy goes stale
+    Home: Integer;             // machine register (-1 = stays memory-homed)
+  end;
 var
   E: TX86Emitter;
   ILoc, FLoc: array of Integer;         // final VM reg -> native reg (or -1)
@@ -744,6 +788,27 @@ var
   ArrClassic: Boolean;                  // array OOB raises (CLASSIC / --bounds-check) -> guard + deopt
   LivenessOK: Boolean;                  // C1: the liveness fixpoint converged
   PeakLiveInt, PeakLiveFloat: Integer;  // C1: peak simultaneously-live values per bank
+  // C1 (B1b): the liveness RESULT, kept for the whole region instead of dying with
+  // ComputeLiveness. The interval builder and the linear-scan allocator both read it, and the
+  // alternative - running the fixpoint again per consumer - is the same work twice on a pass that
+  // already iterates to convergence. Indexed [region-relative block][final bank index].
+  UseI, DefI, InI, OutI: array of array of Boolean;
+  UseF, DefF, InF, OutF: array of array of Boolean;
+  LiveNB: Integer;                      // block count the arrays above are sized for; 0 means
+                                        // ComputeLiveness bailed and they must not be read
+  BlockW: array of Integer;             // region-relative block -> loop-depth weight (Prescan);
+                                        // the interval builder weights its ranges with the same
+                                        // numbers the static allocator ranks registers by
+  // B1b interval model (see the TLsRange/TLsWeb declarations). Built once per region, consumed by
+  // the linear-scan allocator; LsOK = False means it bailed and every consumer must stand down.
+  LsPos0: array of Integer;             // region-relative block -> its first linear position
+  LsNPos: Integer;                      // linear positions in the region (one per instruction)
+  LsRanges: array of TLsRange;
+  LsNRange: Integer;
+  LsWebs: array of TLsWeb;
+  LsNWeb: Integer;
+  LsOK: Boolean;
+  LsWhy: string;                        // why the model was not built (diagnostics)
   // C3 helper calls. The region stops being a leaf function as soon as one is emitted, which
   // is what forces a real frame: 16-byte alignment at the call and the callee's shadow space.
   HasHelperCall: Boolean;
@@ -1813,10 +1878,8 @@ var
     Blk, Succ: TSSABasicBlock;
     Ins: TSSAInstruction;
     Changed: Boolean;
-    // Per region-relative block index: bitsets as plain boolean arrays (register counts are
-    // small - MAX_*_REGS is 32/32/16 before compaction, and post-compaction indexes are dense).
-    UseI, DefI, InI, OutI: array of array of Boolean;
-    UseF, DefF, InF, OutF: array of array of Boolean;
+    // (The per-block use/def/in/out bitsets are fields of the region now - see the declaration
+    // beside PeakLive*: B1b's interval builder reads them after this pass returns.)
     CurLiveI, CurLiveF: array of Boolean;             // mid-block live set (peak measurement)
     used: array of Boolean; kk, bestr: Integer; bestv, totF, topF, totI, topI: Int64;  // payoff probe
     blkOf: array of Integer;                          // per float slot: single touch block / -2 many
@@ -1966,6 +2029,7 @@ var
   begin
     nb := Region.LastBlock - Region.FirstBlock + 1;
     if (nb <= 0) or (MaxIReg < 0) and (MaxFReg < 0) then Exit;
+    LiveNB := nb;
     SetLength(UseI, nb); SetLength(DefI, nb); SetLength(InI, nb); SetLength(OutI, nb);
     SetLength(UseF, nb); SetLength(DefF, nb); SetLength(InF, nb); SetLength(OutF, nb);
     for k := 0 to nb - 1 do
@@ -2152,13 +2216,314 @@ var
     AotDiagLivenessOK := LivenessOK;
   end;
 
+  { --- B1b: build the live intervals ----------------------------------------------------------
+    Turns the liveness bitsets into RANGES (see TLsRange) and unions the ranges that carry the
+    same value across CFG edges into WEBS (see TLsWeb).
+
+    Where the splitting happens: a definition of a register that is DEAD at that point starts a
+    new range, and that range is never unioned with the previous one - nothing flows between them.
+    A definition that also READS the register ("d := d + 1") does not split: the read is a use of
+    the incoming value, so the range continues. This is the "def .. last use before the next def"
+    rule, and it is what undoes the live-range lengthening the REGREUSE merge introduces: the
+    merge hands one register number to several values, and this reads them back apart.
+
+    Position numbering is the region's linear emission order - the same running index the emit
+    loop keeps in DynPos - so a schedule expressed in these positions can be replayed there
+    directly.
+
+    MEASUREMENT ONLY at this stage: nothing here changes an emitted byte. ------------------- }
+  procedure BuildIntervals;
+  var
+    nb, bi, j, p, r, k, si, bank, maxr, nreg, rid, wid, tot: Integer;
+    Blk, Succ: TSSABasicBlock;
+    Ins: TSSAInstruction;
+    W: Int64;
+    OpenR: array of Integer;                  // reg -> currently open range (-1 = none)
+    ReadHere: array of Boolean;               // reg -> read by the instruction being walked
+    FirstR, LastR: array of array of Integer; // [block][reg] -> first / last range in that block
+    RootOf: array of Integer;                 // range -> its union-find root, resolved up front
+    WebOf: array of Integer;                  // range root -> web id (-1 = not assigned yet)
+    Cover: array of Integer;                  // per position: ranges covering it (difference array)
+
+    function BankReg(const V: TSSAValue; out rr: Integer): Boolean;
+    // Is this operand a register of the bank being walked, and which final index is it?
+    begin
+      Result := False; rr := -1;
+      if V.Kind <> svkRegister then Exit;
+      if (bank = 0) and (V.RegType = srtInt) then
+        rr := Prog.AotRemapIntReg(V.RegIndex)
+      else if (bank = 1) and (V.RegType = srtFloat) then
+        rr := Prog.AotRemapFloatReg(V.RegIndex)
+      else
+        Exit;
+      Result := (rr >= 0) and (rr <= maxr);
+    end;
+
+    function NewRange(rr, ablk, apos: Integer; onUse, isLiveIn: Boolean): Integer;
+    begin
+      if LsNRange >= Length(LsRanges) then SetLength(LsRanges, LsNRange * 2 + 64);
+      Result := LsNRange;
+      LsRanges[Result].Bank := bank;
+      LsRanges[Result].Reg := rr;
+      LsRanges[Result].Blk := ablk;
+      LsRanges[Result].PStart := apos;
+      LsRanges[Result].PEnd := apos;
+      LsRanges[Result].OpensOnUse := onUse;
+      LsRanges[Result].LiveIn := isLiveIn;
+      LsRanges[Result].LiveOut := False;
+      LsRanges[Result].Web := Result;         // union-find: its own root until unioned
+      LsRanges[Result].Weight := 0;
+      Inc(LsNRange);
+      if FirstR[ablk][rr] < 0 then FirstR[ablk][rr] := Result;
+      LastR[ablk][rr] := Result;
+    end;
+
+    function Find(x: Integer): Integer;
+    begin
+      while LsRanges[x].Web <> x do
+      begin
+        LsRanges[x].Web := LsRanges[LsRanges[x].Web].Web;   // path halving
+        x := LsRanges[x].Web;
+      end;
+      Result := x;
+    end;
+
+    procedure Union(a, b: Integer);
+    var ra, rb: Integer;
+    begin
+      if (a < 0) or (b < 0) then Exit;
+      ra := Find(a); rb := Find(b);
+      if ra <> rb then LsRanges[rb].Web := ra;
+    end;
+
+  begin
+    LsOK := False; LsWhy := ''; LsNRange := 0; LsNWeb := 0;
+    if not LivenessOK then begin LsWhy := 'liveness'; Exit; end;
+    nb := LiveNB;
+    if nb <= 0 then begin LsWhy := 'no-liveness'; Exit; end;
+
+    // Linear positions, and the two shapes this model does not describe.
+    SetLength(LsPos0, nb);
+    LsNPos := 0;
+    for bi := 0 to nb - 1 do
+    begin
+      Blk := SSAProg.Blocks[Region.FirstBlock + bi];
+      LsPos0[bi] := LsNPos;
+      // An EMPTY block would need a range with no position to carry a value across it, and every
+      // consumer downstream indexes by position. Rare enough to refuse rather than special-case.
+      if Blk.Instructions.Count = 0 then begin LsWhy := 'empty-block'; Exit; end;
+      Inc(LsNPos, Blk.Instructions.Count);
+      for j := 0 to Blk.Instructions.Count - 1 do
+        // A real PHI is gone by register allocation. If one survived, its operands would be live
+        // over EDGES rather than at a position, which this position-indexed model cannot say.
+        // (The PhiSources ARRAY, on the other hand, is alive and well as an extra-operand vector -
+        // ssaArrayDim carries the dimension registers there so DCE can see them, and the graphics
+        // family its 4th operand onwards. Those are ordinary uses; see the walk below.)
+        if TSSAInstruction(Blk.Instructions[j]).OpCode = ssaPhi then
+        begin LsWhy := 'phi'; Exit; end;
+    end;
+    if LsNPos = 0 then begin LsWhy := 'no-positions'; Exit; end;
+
+    SetLength(LsRanges, 256);
+    AotDiagLsCross := 0;
+
+    for bank := 0 to 1 do
+    begin
+      if bank = 0 then maxr := MaxIReg else maxr := MaxFReg;
+      if maxr < 0 then System.Continue;
+      nreg := maxr + 1;
+      // Guard: the per-block tables are blocks x registers. A huge region is not worth gigabytes
+      // for an optimisation; it stays on the static homes, exactly as today.
+      if Int64(nb) * nreg > 8 * 1000 * 1000 then begin LsWhy := 'too-large'; Exit; end;
+
+      SetLength(OpenR, nreg); SetLength(ReadHere, nreg);
+      SetLength(FirstR, 0); SetLength(LastR, 0);
+      SetLength(FirstR, nb); SetLength(LastR, nb);
+      for bi := 0 to nb - 1 do
+      begin
+        SetLength(FirstR[bi], nreg); SetLength(LastR[bi], nreg);
+        for r := 0 to nreg - 1 do begin FirstR[bi][r] := -1; LastR[bi][r] := -1; end;
+      end;
+
+      for bi := 0 to nb - 1 do
+      begin
+        Blk := SSAProg.Blocks[Region.FirstBlock + bi];
+        W := BlockW[bi];
+        for r := 0 to nreg - 1 do OpenR[r] := -1;
+        // Live-in values are already somewhere when the block starts: open their range at the
+        // block's first position, reading (a load, if the predecessors left them in the bank).
+        for r := 0 to nreg - 1 do
+          if ((bank = 0) and InI[bi][r]) or ((bank = 1) and InF[bi][r]) then
+            OpenR[r] := NewRange(r, bi, LsPos0[bi], True, True);
+
+        for j := 0 to Blk.Instructions.Count - 1 do
+        begin
+          Ins := Blk.Instructions[j];
+          p := LsPos0[bi] + j;
+          for r := 0 to nreg - 1 do ReadHere[r] := False;
+
+          // Reads first, then the write - the order liveness uses, and the reason "d := d + 1"
+          // counts as a use of the incoming value.
+          if BankReg(Ins.Src1, r) then ReadHere[r] := True;
+          if BankReg(Ins.Src2, r) then ReadHere[r] := True;
+          if BankReg(Ins.Src3, r) then ReadHere[r] := True;
+          // The canonical exception list (identical to ComputeLiveness): for these opcodes Dest
+          // carries an INPUT, not a definition.
+          if ((Ins.OpCode = ssaArrayStore) or (Ins.OpCode = ssaPrint) or (Ins.OpCode = ssaPrintLn) or
+              (Ins.OpCode = ssaXferStoreInt) or (Ins.OpCode = ssaXferStoreFloat)) and
+             BankReg(Ins.Dest, r) then
+            ReadHere[r] := True;
+          // Operands beyond the third live in the PhiSources vector (ssaArrayDim's dimension
+          // registers, the graphics family's tail). ComputeLiveness does NOT count them, so a
+          // register used ONLY there looks dead to the dataflow. Counting them here can therefore
+          // open a range where liveness says nothing is live - which is exactly right, and safe,
+          // because a range that opens on a use loads from the bank, and the bank is authoritative
+          // whenever a value is not resident (every web that writes stores back when it ends).
+          for k := 0 to High(Ins.PhiSources) do
+            if BankReg(Ins.PhiSources[k].Value, r) then ReadHere[r] := True;
+
+          for r := 0 to nreg - 1 do
+            if ReadHere[r] then
+            begin
+              // A read with nothing open reads a value this analysis never saw defined (a region
+              // live-in, or one of the invisible-use shapes). Opening on a use is the honest
+              // description: it says the value has to come from the bank.
+              if OpenR[r] < 0 then OpenR[r] := NewRange(r, bi, p, True, False);
+              LsRanges[OpenR[r]].PEnd := p;
+              LsRanges[OpenR[r]].Weight := LsRanges[OpenR[r]].Weight + W;
+            end;
+
+          if not ((Ins.OpCode = ssaArrayStore) or (Ins.OpCode = ssaPrint) or (Ins.OpCode = ssaPrintLn) or
+                  (Ins.OpCode = ssaXferStoreInt) or (Ins.OpCode = ssaXferStoreFloat)) then
+            if BankReg(Ins.Dest, r) then
+            begin
+              if ReadHere[r] then
+              begin
+                // Read-modify-write: the incoming value is this instruction's input, so the range
+                // runs on. NOT a split point.
+                LsRanges[OpenR[r]].PEnd := p;
+              end
+              else
+              begin
+                // A definition while the register is dead (or holding a value whose last use is
+                // behind us): THE split point. The old range keeps the end its last use gave it.
+                OpenR[r] := NewRange(r, bi, p, False, False);
+                LsRanges[OpenR[r]].Weight := LsRanges[OpenR[r]].Weight + W;
+              end;
+            end;
+        end;
+
+        // Anything live out of the block has to survive to the block's last position.
+        p := LsPos0[bi] + Blk.Instructions.Count - 1;
+        for r := 0 to nreg - 1 do
+          if (OpenR[r] >= 0) and (((bank = 0) and OutI[bi][r]) or ((bank = 1) and OutF[bi][r])) then
+          begin
+            LsRanges[OpenR[r]].PEnd := p;
+            LsRanges[OpenR[r]].LiveOut := True;
+          end;
+      end;
+
+      // Union across CFG edges: a value live out of P and live in to S is ONE value.
+      for bi := 0 to nb - 1 do
+      begin
+        Blk := SSAProg.Blocks[Region.FirstBlock + bi];
+        for si := 0 to Blk.Successors.Count - 1 do
+        begin
+          Succ := TSSABasicBlock(Blk.Successors[si]);
+          k := -1;
+          for j := Region.FirstBlock to Region.LastBlock do
+            if SSAProg.Blocks[j] = Succ then begin k := j - Region.FirstBlock; Break; end;
+          if k < 0 then System.Continue;                  // leaves the region: an exit
+          for r := 0 to nreg - 1 do
+            if ((bank = 0) and OutI[bi][r] and InI[k][r]) or
+               ((bank = 1) and OutF[bi][r] and InF[k][r]) then
+            begin
+              Union(LastR[bi][r], FirstR[k][r]);
+              Inc(AotDiagLsCross);
+            end;
+        end;
+      end;
+    end;
+
+    // Compact the union-find roots into dense web ids and summarise each web.
+    // Resolve every range's ROOT first, in its own pass: rewriting Web from "union-find parent"
+    // to "web id" while Find is still being called walks a later query into a web id it reads as
+    // a parent index - and the first id that is not a valid range index is -1, which is a read
+    // off the front of the array. (Found the honest way: a range check error on m271.)
+    SetLength(RootOf, LsNRange);
+    for k := 0 to LsNRange - 1 do RootOf[k] := Find(k);
+    SetLength(WebOf, LsNRange);
+    for k := 0 to LsNRange - 1 do WebOf[k] := -1;
+    SetLength(LsWebs, LsNRange);
+    LsNWeb := 0;
+    for k := 0 to LsNRange - 1 do
+    begin
+      rid := RootOf[k];
+      if WebOf[rid] < 0 then
+      begin
+        wid := LsNWeb; Inc(LsNWeb);
+        WebOf[rid] := wid;
+        LsWebs[wid].Bank := LsRanges[k].Bank;
+        LsWebs[wid].Reg := LsRanges[k].Reg;
+        LsWebs[wid].PStart := LsRanges[k].PStart;
+        LsWebs[wid].PEnd := LsRanges[k].PEnd;
+        LsWebs[wid].NRange := 0;
+        LsWebs[wid].Weight := 0;
+        LsWebs[wid].NeedsLoad := False;
+        LsWebs[wid].HasDef := False;
+        LsWebs[wid].Home := -1;
+      end;
+      wid := WebOf[rid];
+      Inc(LsWebs[wid].NRange);
+      LsWebs[wid].Weight := LsWebs[wid].Weight + LsRanges[k].Weight;
+      if LsRanges[k].PStart < LsWebs[wid].PStart then LsWebs[wid].PStart := LsRanges[k].PStart;
+      if LsRanges[k].PEnd > LsWebs[wid].PEnd then LsWebs[wid].PEnd := LsRanges[k].PEnd;
+      // A range that opens on a use and is NOT fed by a predecessor inside the web means the value
+      // reaches this web through the bank.
+      if LsRanges[k].OpensOnUse and not LsRanges[k].LiveIn then LsWebs[wid].NeedsLoad := True;
+      if LsRanges[k].LiveIn and (LsRanges[k].Blk = 0) then LsWebs[wid].NeedsLoad := True;
+      if not LsRanges[k].OpensOnUse then LsWebs[wid].HasDef := True;
+    end;
+    // Rewrite each range's Web field from "union-find parent" to "web id" - from here on it is
+    // an index into LsWebs, and Find must not be called again.
+    for k := 0 to LsNRange - 1 do LsRanges[k].Web := WebOf[RootOf[k]];
+
+    // Peak overlap per bank, over the RANGES (holes excluded, which is the point): the number a
+    // machine register pool actually has to fit.
+    AotDiagLsMaxOverInt := 0; AotDiagLsMaxOverFloat := 0;
+    for bank := 0 to 1 do
+    begin
+      SetLength(Cover, 0); SetLength(Cover, LsNPos + 2);
+      for k := 0 to LsNRange - 1 do
+        if LsRanges[k].Bank = bank then
+        begin
+          Inc(Cover[LsRanges[k].PStart]);
+          Dec(Cover[LsRanges[k].PEnd + 1]);
+        end;
+      tot := 0;
+      for p := 0 to LsNPos - 1 do
+      begin
+        Inc(tot, Cover[p]);
+        if bank = 0 then
+        begin if tot > AotDiagLsMaxOverInt then AotDiagLsMaxOverInt := tot; end
+        else
+          if tot > AotDiagLsMaxOverFloat then AotDiagLsMaxOverFloat := tot;
+      end;
+    end;
+
+    AotDiagLsWebsInt := 0; AotDiagLsWebsFloat := 0;
+    for k := 0 to LsNWeb - 1 do
+      if LsWebs[k].Bank = 0 then Inc(AotDiagLsWebsInt) else Inc(AotDiagLsWebsFloat);
+    AotDiagLsRanges := LsNRange;
+    LsOK := True;
+  end;
+
   procedure Prescan;
   var
     b, j, o: Integer;
     Blk: TSSABasicBlock;
     Ins: TSSAInstruction;
     UseW: Integer;                      // current block's loop-depth weight (B1b-lite)
-    BlockW: array of Integer;           // region-relative block index -> weight
 
     // B1b-lite: weight use counts by loop depth, so the greedy allocator stops preferring
     // init-code registers (many STATIC occurrences, run once) over hot-loop registers (few
@@ -3172,7 +3537,13 @@ begin
   // C1: liveness. Computed here, consumed from C3 on (helper-call spilling) - it must not
   // change a single emitted byte today.
   LivenessOK := False; PeakLiveInt := 0; PeakLiveFloat := 0;
+  LiveNB := 0;
   ComputeLiveness;
+
+  // B1b: the interval model. Built from the liveness above and Prescan's block weights; measured
+  // and reported now, consumed by the linear-scan allocator.
+  BuildIntervals;
+  AotDiagLsWhy := LsWhy;
 
   SetLength(ILoc, MaxIReg + 1); for k := 0 to MaxIReg do ILoc[k] := -1;
   SetLength(FLoc, MaxFReg + 1); for k := 0 to MaxFReg do FLoc[k] := -1;
@@ -3403,6 +3774,15 @@ begin
           WriteLn(ErrOutput, Format('[AOT]   float block-local temps: %d slots, use=%d (%.1f%% of total) - the low-risk hybrid ceiling',
             [AotDiagFloatBlockLocalCount, AotDiagFloatBlockLocal,
              100.0 * AotDiagFloatBlockLocal / AotDiagFloatTotal]));
+        // B1b interval model. Read (webs vs distinct) and (maxOverlap vs pool): the first says how
+        // much the one-home-per-register allocation is conflating, the second whether what is
+        // really live at once fits the machine pool at all.
+        if AotDiagLsWhy = '' then
+          WriteLn(ErrOutput, Format('[AOT]   intervals: webs int=%d float=%d (ranges=%d) maxOverlap int=%d float=%d edge-crossings=%d',
+            [AotDiagLsWebsInt, AotDiagLsWebsFloat, AotDiagLsRanges,
+             AotDiagLsMaxOverInt, AotDiagLsMaxOverFloat, AotDiagLsCross]))
+        else
+          WriteLn(ErrOutput, '[AOT]   intervals: not built (' + AotDiagLsWhy + ')');
         if AotDiagIntTotal > 0 then
           WriteLn(ErrOutput, Format('[AOT]   int traffic:   static-resident=%d (%.1f%% mem) -> linscan-resident=%d (%.1f%% mem)  recovers %.1f%% of tail',
             [AotDiagIntResident, 100.0 * (AotDiagIntTotal - AotDiagIntResident) / AotDiagIntTotal,
