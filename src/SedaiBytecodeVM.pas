@@ -10156,11 +10156,11 @@ begin
             while Length(Data) < BinWidth do Data := Data + #0;   // short read at EOF: zero-fill
           end
           else Data := '';
-          if Instr.Immediate > 0 then
-          begin
-            BinLen := Pos(#0, Data);
-            if BinLen > 0 then SetLength(Data, BinLen - 1);
-          end;
+          // A fixed-width field is "n characters + NUL terminator" on file (fbc's C layout for a
+          // "String * n" member): keep the n characters, padding included — the destination is a
+          // fixed-length buffer, which holds exactly n bytes.
+          if (Instr.Immediate > 0) and (Length(Data) > 0) then
+            SetLength(Data, Length(Data) - 1);
           if Instr.Dest >= 0 then Ctx.StringRegs[Instr.Dest] := Data;
         end
         else raise Exception.Create('GET command not supported: no handler assigned');

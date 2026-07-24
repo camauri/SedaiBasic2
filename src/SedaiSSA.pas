@@ -217,6 +217,14 @@ type
                                          // raw byte heap (SizeOf-scaled), not the managed FArrays/record path.
     FFixedLenVars: TStringList;          // fixed-length string vars (UPPER) -> capacity (DIM s AS STRING/WSTRING * n);
                                          // assignments truncate to the capacity (codepoints if also a WSTRING).
+    FZStringVars: TStringList;           // "DIM z AS ZSTRING * n" (UPPER) -> max CHARACTERS (n-1): stores
+                                         // truncate to it, but the value stays variable-length (no padding).
+    FRawFixedLenNode: TASTNode;          // the ONE expression node whose fixed-length read must stay RAW (padded to
+                                         // its capacity) instead of converting to its variable-length form. Matched
+                                         // by node identity, set by ProcessExprFixedRaw around a buffer-aware
+                                         // consumer's operand (LEN/PRINT/LEFT/MID/... and the binary file transfers).
+    FHasFixedLenFields: Boolean;         // any declared UDT has a fixed-length string field -> member reads/stores
+                                         // must consider the pad/convert pair (a cheap global bail otherwise).
     FRedimMultiArrays: TStringList;      // array names (UPPER) that appear in a multi-dim REDIM → their multi-dim
                                          // element access computes the linear index from RUNTIME dimensions
                                          // (push/resolve), since REDIM changes the strides; others stay const-folded.
@@ -475,6 +483,7 @@ type
     function UDTArrayElemPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT when an array member's elements are UDT POINTERS (else '')
     function UDTFuncPtrFieldSig(UDTIdx: Integer; const FieldName: string; out Slot: Integer): string;  // funcptr field signature + slot (else '')
     function UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;  // B1.5: field narrow width
+    function UDTFieldStrCapacity(UDTIdx: Integer; const FieldName: string; out Wide: Boolean): Integer;
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
     function TypeNameWidthCode(const TypeName: string): Integer;        // B1.5 phase 2: type -> narrow code
@@ -562,6 +571,14 @@ type
     procedure ProcessSpecialVarAssign(VarNode, ExprNode: TASTNode);
     function TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
     function TryFixedLenStore(const VarName: string; ExprNode: TASTNode): Boolean;
+    function AnyFixedLen: Boolean; inline;
+    function FixedLenCapOfNode(Node: TASTNode; out Wide: Boolean): Integer;
+    function EmitFixedLenPad(const Src: TSSAValue; Cap: Integer; Wide: Boolean): TSSAValue;
+    function EmitFixedLenToVarLen(const Src: TSSAValue; Wide: Boolean): TSSAValue;
+    function MaybeFixedLenRead(Node: TASTNode; const Src: TSSAValue): TSSAValue;
+    procedure ProcessExprFixedRaw(Node: TASTNode; out Res: TSSAValue);
+    procedure ProcessStringExprFixedRaw(Node: TASTNode; out Res: TSSAValue);
+    procedure EmitFixedLenInit(const Dest: TSSAValue; Cap: Integer; Wide: Boolean);
     function TryRecordCopyAssign(VarNode, ExprNode: TASTNode; const VarName: string): Boolean;
     procedure ProcessArrayStore(Node: TASTNode);
     procedure ProcessPrint(Node: TASTNode);
@@ -882,6 +899,10 @@ begin
   FDynamicArrays.CaseSensitive := False;
   FFixedLenVars := TStringList.Create;
   FFixedLenVars.CaseSensitive := False;
+  FZStringVars := TStringList.Create;
+  FZStringVars.CaseSensitive := False;
+  FRawFixedLenNode := nil;
+  FHasFixedLenFields := False;
   FByrefRetFuncs := TStringList.Create;
   FRawPtrRetFuncs := TStringList.Create;
   FSharedScalarArr.CaseSensitive := False;
@@ -953,6 +974,7 @@ begin
   FRedimMultiArrays.Free;
   FDynamicArrays.Free;
   FFixedLenVars.Free;
+  FZStringVars.Free;
   FByrefRetFuncs.Free;
   FRawPtrRetFuncs.Free;
   FVarWidthCode.Free;
@@ -1494,6 +1516,9 @@ begin
   if IsAddrParam(VarName) or IsRefVar(VarName) or IsAddrLocal(VarName) or
      IsRawModuleScalar(VarName) or IsSharedScalar(VarName) then Exit;
   Res := GetOrAllocateVariable(VarName);
+  // A fixed-length string ("Dim s As String * n") is stored NUL-padded to its capacity; reading it in
+  // an ordinary (variable-length) context stops at the first NUL. No-op for every other variable.
+  if AnyFixedLen then Res := MaybeFixedLenRead(Node, Res);
   Result := True;
 end;
 
@@ -2069,8 +2094,12 @@ begin
         ArgListNode.Free;
       end
       else
-        // Return the register assigned to this variable
+      begin
+        // Return the register assigned to this variable. A fixed-length string converts to its
+        // variable-length form here (see TryFixedLenStore's header); no-op for every other variable.
         Result := GetOrAllocateVariable(VarName);
+        if AnyFixedLen then Result := MaybeFixedLenRead(Node, Result);
+      end;
     end;
 
     antSpecialVariable:
@@ -3310,7 +3339,8 @@ begin
             end;
           end;
 
-          ProcessExpression(ArgNode, ArgValue);
+          // LEN of a fixed-length string is its declared capacity: read the raw padded buffer.
+          ProcessExprFixedRaw(ArgNode, ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
@@ -3333,7 +3363,7 @@ begin
           // position, take MID(str, pos, 1) first; then ASC of that single character.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
-            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);    // str
+            ProcessStringExprFixedRaw(ArgListNode.GetChild(0), ArgValue);  // str (raw buffer if fixed-length)
             ProcessExpression(ArgListNode.GetChild(1), Arg2Value);   // pos
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureIntRegister(Arg2Value);
@@ -3621,7 +3651,7 @@ begin
           // to a short prefix rather than searching from the end (use the 2-arg form for from-the-end).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
-            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);   // str
+            ProcessStringExprFixedRaw(ArgListNode.GetChild(0), ArgValue); // str (raw if fixed-length)
             ProcessStringExpression(ArgListNode.GetChild(1), Arg2Value);  // substring / char set
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureStringRegister(Arg2Value);
@@ -3686,7 +3716,13 @@ begin
           // FreeBASIC single-arg string functions: one string in, string out (B1.2).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
           begin
-            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);
+            // fbc splits this group on a fixed-length operand: UCASE/LCASE work on the raw padded
+            // buffer (so "UCase(w)" keeps the NULs), while the TRIM family takes the converted,
+            // variable-length form (Trim of a padded "hi" is "hi", not "hi" + NULs).
+            if (FuncName = 'UCASE') or (FuncName = 'UCASE$') or (FuncName = 'LCASE') or (FuncName = 'LCASE$') then
+              ProcessStringExprFixedRaw(ArgListNode.GetChild(0), ArgValue)
+            else
+              ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);
             ArgReg := EnsureStringRegister(ArgValue);
             DestReg := FProgram.AllocRegister(srtString);
             Result := MakeSSARegister(srtString, DestReg);
@@ -3723,7 +3759,7 @@ begin
           // LEFT$(str, n) - returns leftmost n chars
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
-            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);  // string
+            ProcessStringExprFixedRaw(ArgListNode.GetChild(0), ArgValue);  // string (raw buffer if fixed-length)
             ProcessExpression(ArgListNode.GetChild(1), Arg2Value); // count
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureIntRegister(Arg2Value);
@@ -3741,7 +3777,7 @@ begin
           // RIGHT$(str, n) - returns rightmost n chars
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
-            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);  // string
+            ProcessStringExprFixedRaw(ArgListNode.GetChild(0), ArgValue);  // string (raw buffer if fixed-length)
             ProcessExpression(ArgListNode.GetChild(1), Arg2Value); // count
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureIntRegister(Arg2Value);
@@ -3772,7 +3808,7 @@ begin
           begin
             IsAny := ArgListNode.GetChild(2).Attributes.Values['ANYSET'] = '1';
             ProcessExpression(ArgListNode.GetChild(0), Arg3Value);   // start (numeric)
-            ProcessStringExpression(ArgListNode.GetChild(1), ArgValue);    // str (haystack)
+            ProcessStringExprFixedRaw(ArgListNode.GetChild(1), ArgValue);  // str (haystack; raw if fixed-length)
             ProcessStringExpression(ArgListNode.GetChild(2), Arg2Value);   // substr (needle) / char set
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureStringRegister(Arg2Value);
@@ -3787,7 +3823,7 @@ begin
           else if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
             IsAny := ArgListNode.GetChild(1).Attributes.Values['ANYSET'] = '1';
-            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue);    // str
+            ProcessStringExprFixedRaw(ArgListNode.GetChild(0), ArgValue);  // str (raw if fixed-length)
             ProcessStringExpression(ArgListNode.GetChild(1), Arg2Value);   // substr / char set
             ArgReg := EnsureStringRegister(ArgValue);
             Arg2Reg := EnsureStringRegister(Arg2Value);
@@ -6454,16 +6490,207 @@ begin
   if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
 end;
 
+// ============================================================================================
+// FreeBASIC fixed-length strings ("String * n" / "WString * n")
+//
+// fbc stores such a variable as a NUL-TERMINATED BUFFER of exactly n characters: a shorter value is
+// NUL-padded, a longer one is cut. Everything follows from that single fact, and the two halves are
+// what these helpers emit:
+//   * STORAGE (EmitFixedLenPad / EmitFixedLenInit) — every store lands padded to n, and a bare DIM
+//     starts as n NULs. LEN is then n, PRINT emits all n bytes, LEFT/MID/RIGHT/UCASE/INSTR/ASC see
+//     the padding and a binary PUT writes the declared field width — all for free, since the value
+//     in the register IS the buffer.
+//   * CONVERSION (EmitFixedLenToVarLen) — reading one into a variable-length context stops at the
+//     first NUL: "q = s", "s & x", a comparison, a ByVal argument and TRIM all see only the
+//     characters before the terminator. This is the DEFAULT for a read, so every context we do not
+//     classify keeps the pre-padding behaviour; the buffer-aware consumers opt out by lowering their
+//     operand through ProcessExprFixedRaw.
+// Both are composed from existing opcodes (like LSET/RSET) — no new bytecode.
+// ============================================================================================
+
+function TSSAGenerator.AnyFixedLen: Boolean;
+// Global bail: a program with no fixed-length variable and no fixed-length UDT field never pays for
+// any of this (one integer test on the read path).
+begin
+  Result := (FFixedLenVars.Count > 0) or FHasFixedLenFields;
+end;
+
+function TSSAGenerator.FixedLenCapOfNode(Node: TASTNode; out Wide: Boolean): Integer;
+// Declared capacity of a fixed-length string RVALUE (0 = not one): a plain scalar "Dim s As String * n"
+// or a UDT field "As String * n". SHARED / @-taken scalars are excluded exactly as TryFixedLenStore
+// excludes them — their stores never pad, so their reads must not convert either.
+var
+  UIdx, k: Integer;
+  VarName, TypeName: string;
+begin
+  Result := 0;
+  Wide := False;
+  if (Node = nil) or (not AnyFixedLen) then Exit;
+  if (Node.NodeType = antIdentifier) and (Node.ChildCount = 0) then
+  begin
+    VarName := VarToStr(Node.Value);
+    Result := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
+    if Result > 0 then
+    begin
+      if IsSharedScalar(VarName) or IsAddrLocal(VarName) or IsRefVar(VarName) or IsAddrParam(VarName) then
+        Result := 0
+      else
+        Wide := IsWStringVar(VarName);
+    end;
+    Exit;
+  end;
+  if FHasFixedLenFields and (Node.NodeType = antMemberAccess) and (Node.ChildCount >= 1) then
+  begin
+    TypeName := ObjectTypeName(Node.GetChild(0));
+    if TypeName = '' then Exit;
+    UIdx := FindUDT(TypeName);
+    if UIdx < 0 then Exit;
+    for k := 0 to High(FUDTs[UIdx].Fields) do
+      if SameText(FUDTs[UIdx].Fields[k].Name, VarToStr(Node.Value)) then
+      begin
+        // Plain "String * n" fields only — a WSTRING field is variable-length (see UDTFieldStrCapacity).
+        if (FUDTs[UIdx].Fields[k].Bank = srtString) and (FUDTs[UIdx].Fields[k].StrCapacity > 0) and
+           (not FUDTs[UIdx].Fields[k].IsWString) then
+          Result := FUDTs[UIdx].Fields[k].StrCapacity;
+        Exit;
+      end;
+  end;
+end;
+
+function TSSAGenerator.EmitFixedLenPad(const Src: TSSAValue; Cap: Integer; Wide: Boolean): TSSAValue;
+// value -> exactly Cap characters (cut when longer, NUL-padded when shorter):
+//   capped = LEFT(src, Cap) : pad = STRING(Cap - LEN(capped), 0) : result = capped + pad
+// Counts are codepoints for a WSTRING (a NUL is one codepoint, one UTF-8 byte).
+var
+  NoneV, CapV, Capped, LenV, PadN, ZeroV, Pad: TSSAValue;
+begin
+  NoneV := MakeSSAValue(svkNone);
+  CapV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, CapV, MakeSSAConstInt(Cap), NoneV, NoneV);
+  Capped := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  if Wide then EmitInstruction(ssaStrLeftW, Capped, Src, CapV, NoneV)
+  else EmitInstruction(ssaStrLeft, Capped, Src, CapV, NoneV);
+  LenV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if Wide then EmitInstruction(ssaStrLenW, LenV, Capped, NoneV, NoneV)
+  else EmitInstruction(ssaStrLen, LenV, Capped, NoneV, NoneV);
+  PadN := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaSubInt, PadN, CapV, LenV, NoneV);
+  ZeroV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, ZeroV, MakeSSAConstInt(0), NoneV, NoneV);
+  Pad := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  if Wide then EmitInstruction(ssaStrWStringN, Pad, PadN, ZeroV, NoneV)
+  else EmitInstruction(ssaStrString, Pad, PadN, ZeroV, NoneV);
+  Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaStrConcat, Result, Capped, Pad, NoneV);
+end;
+
+procedure TSSAGenerator.EmitFixedLenInit(const Dest: TSSAValue; Cap: Integer; Wide: Boolean);
+// A declared-but-unassigned fixed-length string is Cap NULs (fbc prints all n bytes of it and LEN is n).
+var
+  NoneV, CntV, ZeroV: TSSAValue;
+begin
+  NoneV := MakeSSAValue(svkNone);
+  CntV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, CntV, MakeSSAConstInt(Cap), NoneV, NoneV);
+  ZeroV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, ZeroV, MakeSSAConstInt(0), NoneV, NoneV);
+  if Wide then EmitInstruction(ssaStrWStringN, Dest, CntV, ZeroV, NoneV)
+  else EmitInstruction(ssaStrString, Dest, CntV, ZeroV, NoneV);
+end;
+
+function TSSAGenerator.EmitFixedLenToVarLen(const Src: TSSAValue; Wide: Boolean): TSSAValue;
+// The buffer's variable-length form: everything before the first NUL.
+//   result = LEFT(src, INSTR(src + CHR(0), CHR(0)) - 1)
+// Appending one NUL makes the search always hit, so no branch is needed (position >= 1 always).
+var
+  NoneV, ZStr, Probe, OneV, PosV, CutV: TSSAValue;
+begin
+  NoneV := MakeSSAValue(svkNone);
+  ZStr := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaLoadConstString, ZStr, MakeSSAConstString(#0), NoneV, NoneV);
+  Probe := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaStrConcat, Probe, Src, ZStr, NoneV);
+  OneV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, OneV, MakeSSAConstInt(1), NoneV, NoneV);
+  PosV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if Wide then EmitInstruction(ssaStrInstrW, PosV, Probe, ZStr, NoneV)
+  else EmitInstruction(ssaStrInstr, PosV, Probe, ZStr, OneV);
+  CutV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaSubInt, CutV, PosV, OneV, NoneV);
+  Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  if Wide then EmitInstruction(ssaStrLeftW, Result, Src, CutV, NoneV)
+  else EmitInstruction(ssaStrLeft, Result, Src, CutV, NoneV);
+end;
+
+function TSSAGenerator.MaybeFixedLenRead(Node: TASTNode; const Src: TSSAValue): TSSAValue;
+// Read hook: a fixed-length rvalue converts to its variable-length form unless this exact node was
+// marked raw by a buffer-aware consumer (ProcessExprFixedRaw).
+var
+  Cap: Integer;
+  Wide: Boolean;
+begin
+  Result := Src;
+  if (not AnyFixedLen) or (Node = nil) or (Node = FRawFixedLenNode) then Exit;
+  Cap := FixedLenCapOfNode(Node, Wide);
+  if Cap > 0 then
+    Result := EmitFixedLenToVarLen(Src, Wide);
+end;
+
+procedure TSSAGenerator.ProcessExprFixedRaw(Node: TASTNode; out Res: TSSAValue);
+// Lower an operand whose consumer wants the RAW fixed-length buffer (LEN, PRINT, LEFT/MID/RIGHT,
+// UCASE/LCASE, INSTR/INSTRREV, ASC, binary PUT/GET). The mark is by node IDENTITY, so a fixed-length
+// variable nested deeper in the operand ("Left(w & "x", 2)") still converts, as fbc does.
+var
+  Save: TASTNode;
+begin
+  if not AnyFixedLen then
+  begin
+    ProcessExpression(Node, Res);
+    Exit;
+  end;
+  Save := FRawFixedLenNode;
+  FRawFixedLenNode := Node;
+  try
+    ProcessExpression(Node, Res);
+  finally
+    FRawFixedLenNode := Save;
+  end;
+end;
+
+procedure TSSAGenerator.ProcessStringExprFixedRaw(Node: TASTNode; out Res: TSSAValue);
+// ProcessExprFixedRaw for the sites that lower their operand through the string-coercing entry point.
+var
+  Save: TASTNode;
+begin
+  if not AnyFixedLen then
+  begin
+    ProcessStringExpression(Node, Res);
+    Exit;
+  end;
+  Save := FRawFixedLenNode;
+  FRawFixedLenNode := Node;
+  try
+    ProcessStringExpression(Node, Res);
+  finally
+    FRawFixedLenNode := Save;
+  end;
+end;
+
 function TSSAGenerator.TryFixedLenStore(const VarName: string; ExprNode: TASTNode): Boolean;
-// Fixed-length string (DIM s AS STRING/WSTRING * n): truncate the assigned value to the capacity
-// (codepoints for a WSTRING, bytes otherwise). Plain string scalars only — SHARED/@-taken fall through.
+// Fixed-length string (DIM s AS STRING/WSTRING * n): store the value padded/cut to exactly the
+// declared capacity (codepoints for a WSTRING, bytes otherwise). Plain string scalars only —
+// SHARED/@-taken fall through (FixedLenCapOfNode excludes those from the read side to match).
 var
   FixedCap: Integer;
   ExprValue, FixedCapReg, FixedTrunc: TSSAValue;
 begin
   Result := False;
-  FixedCap := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
-  if (FixedCap > 0) and not IsSharedScalar(VarName) and not IsAddrLocal(VarName) then
+  if IsSharedScalar(VarName) or IsAddrLocal(VarName) then Exit;
+  // "ZSTRING/WSTRING * n": truncate to n-1 characters (the nth cell is the terminator) and store as an
+  // ordinary variable-length string — no padding, so LEN stays the content length as fbc reports it.
+  // Codepoints for a WSTRING, bytes for a ZSTRING.
+  FixedCap := StrToIntDef(FZStringVars.Values[UpperCase(VarName)], -1);
+  if FixedCap >= 0 then
   begin
     ProcessStringExpression(ExprNode, ExprValue);
     ExprValue := EnsureStringRegister(ExprValue);
@@ -6475,6 +6702,16 @@ begin
     else
       EmitInstruction(ssaStrLeft, FixedTrunc, ExprValue, FixedCapReg, MakeSSAValue(svkNone));
     EmitInstruction(ssaCopyString, GetOrAllocateVariable(VarName), FixedTrunc, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit(True);
+  end;
+  FixedCap := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
+  if FixedCap > 0 then
+  begin
+    ProcessStringExpression(ExprNode, ExprValue);
+    ExprValue := EnsureStringRegister(ExprValue);
+    EmitInstruction(ssaCopyString, GetOrAllocateVariable(VarName),
+                    EmitFixedLenPad(ExprValue, FixedCap, IsWStringVar(VarName)),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Result := True;
   end;
 end;
@@ -6607,7 +6844,9 @@ begin
       Continue;
     end;
 
-    ProcessExpression(Child, ExprValue);
+    // PRINT of a fixed-length string emits all n bytes of its buffer, NULs included (fbc), so the item
+    // is lowered raw rather than converted at the first NUL.
+    ProcessExprFixedRaw(Child, ExprValue);
 
     // If expression is a constant, load it into a register first
     if ExprValue.Kind in [svkConstInt, svkConstFloat, svkConstString] then
@@ -6717,6 +6956,7 @@ var
   VarName: string;
   VarNames: array of string;
   VarCount: Integer;
+  InFixCap: Integer;   // fixed-length capacity of a string target (0 = variable-length)
   IsMultiple: Boolean;
 begin
   // INPUT has structure: optional prompt string, separator, variable names
@@ -6811,12 +7051,23 @@ begin
           EmitInstruction(ssaInputFloat, VarReg, MakeSSAValue(svkNone),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       srtString:
-        if i = 0 then
-          EmitInstruction(ssaInputString, VarReg, PromptReg,
-                         MakeSSAValue(svkNone), MakeSSAValue(svkNone))
-        else
-          EmitInstruction(ssaInputString, VarReg, MakeSSAValue(svkNone),
-                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        begin
+          if i = 0 then
+            EmitInstruction(ssaInputString, VarReg, PromptReg,
+                           MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+          else
+            EmitInstruction(ssaInputString, VarReg, MakeSSAValue(svkNone),
+                           MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          // INPUT writes the variable's register directly, bypassing the assignment path: a
+          // fixed-length target must still end up padded/cut to its capacity.
+          if AnyFixedLen and not (IsSharedScalar(VarName) or IsAddrLocal(VarName)) then
+          begin
+            InFixCap := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
+            if InFixCap > 0 then
+              EmitInstruction(ssaCopyString, VarReg, EmitFixedLenPad(VarReg, InFixCap, False),
+                              MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+        end;
     end;
   end;
 end;
@@ -7152,6 +7403,7 @@ var
   BlkIdx: Integer;         // M8/FB: innermost open block scope (-1 if none) for block-scoped UDT dtors
   MDtorSlotIdx: Integer;   // V5e: index into FModuleDtorSlots for a module global's handle slot (-1 if none)
   EllipCount: Integer;     // FB ellipsis "lb TO ...": element count taken from the initializer list
+  FixLenCap: Integer;      // "DIM s AS STRING * n": declared capacity (0 = variable-length)
   ScalarCtorInit: Boolean; // "DIM v AS T = <non-T expr>": an implicit conversion via a 1-arg constructor
   CtorArgs: TASTNode;      // synthesized single-argument list wrapping that initializer
 const
@@ -7436,6 +7688,11 @@ begin
         begin
           DeclareVariableTyped(UpperCase(ArrName), TypeNameToBank(RecTypeName, UpperCase(ArrName)));
           RecordVarWidth(UpperCase(ArrName), RecTypeName);  // B1.5 phase 2: narrow on store to a sub-64-bit type
+          // "DIM s AS STRING * n" with no initializer starts as n NULs — fbc's buffer is allocated at its
+          // full capacity, so LEN is n and PRINT emits all n bytes before anything is ever assigned.
+          FixLenCap := StrToIntDef(FFixedLenVars.Values[UpperCase(ArrName)], 0);
+          if (FixLenCap > 0) and not IsSharedScalar(UpperCase(ArrName)) and not IsAddrLocal(UpperCase(ArrName)) then
+            EmitFixedLenInit(GetOrAllocateVariable(UpperCase(ArrName)), FixLenCap, IsWStringVar(ArrName));
         end;
       // M4.4e: general initializer "DIM v AS T = expr" — child[2] is the init expression (not the
       // ctor-args antArgumentList). After allocation/construction, assign it: a scalar store, or a
@@ -8178,7 +8435,7 @@ var
 begin
   if (ArgsNode = nil) or (ArgsNode.ChildCount < 2) then begin Result := MakeSSAValue(svkNone); Exit; end;
   IsW := IsWStringExpr(ArgsNode.GetChild(0));
-  ProcessStringExpression(ArgsNode.GetChild(0), ArgValue);   // string
+  ProcessStringExprFixedRaw(ArgsNode.GetChild(0), ArgValue);   // string (raw buffer if fixed-length)
   ProcessExpression(ArgsNode.GetChild(1), Arg2Value);  // start
   ArgReg := EnsureStringRegister(ArgValue);
   Arg2Reg := EnsureIntRegister(Arg2Value);
@@ -14234,7 +14491,8 @@ begin
       if (Node.Attributes.Values['HASCOUNT'] = '1') and (Node.ChildCount >= 3) then
         PutCountChild := Node.GetChild(Node.ChildCount - 1);
       if EmitBinFileBlock(False, HandleReg, Node.GetChild(1), PutCountChild) then Exit;
-      ProcessExpression(Node.GetChild(1), ExprVal);   // the value to write
+      // A fixed-length string writes its whole buffer (all n bytes, NULs included), so it is lowered raw.
+      ProcessExprFixedRaw(Node.GetChild(1), ExprVal);   // the value to write
       if (ExprVal.Kind = svkConstFloat) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtFloat)) then
         // SINGLE writes 4 bytes, DOUBLE 8 (Immediate = width), as fbc lays them out.
         EmitInstruction(ssaPutBinFloat, MakeSSAValue(svkNone), HandleReg, EnsureFloatRegister(ExprVal),
@@ -16570,6 +16828,28 @@ begin
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].WidthCode);
 end;
 
+function TSSAGenerator.UDTFieldStrCapacity(UDTIdx: Integer; const FieldName: string; out Wide: Boolean): Integer;
+// Declared capacity of an "As String/WString * n" field (0 = variable-length / not found). Its storage
+// is padded to that capacity, exactly as a fixed-length scalar's is.
+var
+  i: Integer;
+  F: string;
+begin
+  Result := 0;
+  Wide := False;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
+    if FUDTs[UDTIdx].Fields[i].Name = F then
+    begin
+      // Only a plain "String * n" field carries the padded fixed-length storage: a WSTRING field keeps
+      // variable-length semantics, exactly as a WSTRING scalar does (see TryFixedLenStore).
+      if (FUDTs[UDTIdx].Fields[i].Bank = srtString) and (not FUDTs[UDTIdx].Fields[i].IsWString) then
+        Result := FUDTs[UDTIdx].Fields[i].StrCapacity;
+      Exit;
+    end;
+end;
+
 function TSSAGenerator.UDTFieldPtrPointee(UDTIdx: Integer; const FieldName: string): string;
 // The pointee UDT type of a "T PTR" field (held as an int handle), or '' — used to resolve chained
 // pointer-field access such as "node->nxt->val".
@@ -16871,8 +17151,12 @@ begin
       if IsArrayField then
         FUDTs[Idx].Fields[n].ArrayBounds := ConcreteArrayBounds(FieldNode);
       FUDTs[Idx].Fields[n].IsWString := (TypeName = 'WSTRING');  // codepoint LEN/MID on obj.field
-      // "As String * n" capacity: only the C layout uses it (see UDTCLayout).
+      // "As String * n" capacity: the C layout uses it (see UDTCLayout) AND the field's storage is
+      // padded to it, exactly as a fixed-length scalar's is (see TryFixedLenStore's header comment).
       FUDTs[Idx].Fields[n].StrCapacity := StrToIntDef(FieldNode.Attributes.Values['FIXEDLEN'], 0);
+      if (FUDTs[Idx].Fields[n].Bank = srtString) and (FUDTs[Idx].Fields[n].StrCapacity > 0) and
+         (not FUDTs[Idx].Fields[n].IsWString) then
+        FHasFixedLenFields := True;
       if NestedT = '' then
         FUDTs[Idx].Fields[n].WidthCode := TypeNameWidthCode(TypeName)  // B1.5: narrow field on store
       else
@@ -17658,6 +17942,18 @@ var
   DimsN, UbExpr: TASTNode;
 begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  // "As String * n" fields start as n NULs: the buffer exists at full capacity from construction, so a
+  // PUT of the instance writes the declared field width even for a field never assigned (fbc's layout).
+  if FHasFixedLenFields then
+    for i := 0 to High(FUDTs[UDTIdx].Fields) do
+      if (FUDTs[UDTIdx].Fields[i].Bank = srtString) and (FUDTs[UDTIdx].Fields[i].StrCapacity > 0) and
+         (not FUDTs[UDTIdx].Fields[i].IsArray) and (not FUDTs[UDTIdx].Fields[i].IsWString) then
+      begin
+        DefVal := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitFixedLenInit(DefVal, FUDTs[UDTIdx].Fields[i].StrCapacity, False);
+        EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), HandleVal, DefVal,
+                        MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+      end;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
     if FUDTs[UDTIdx].Fields[i].NestedType <> '' then
     begin
@@ -19916,10 +20212,23 @@ begin
     if (P <> nil) and (UpperCase(VarToStr(P.Value)) = 'WSTRING') then
       MarkW(VarToStr(Node.GetChild(0).Value));
     // Fixed-length string capacity (DIM s AS STRING/WSTRING * n): record a positive constant capacity so
-    // ProcessAssignment truncates stores. Only the scalar form carries a numeric FIXEDLEN attribute.
+    // stores pad/truncate to it. Only the scalar form carries a numeric FIXEDLEN attribute.
+    // ZSTRING and WSTRING are NOT of that kind (fbc-verified): "ZString * n" / "WString * n" give an
+    // n-CELL buffer holding at most n-1 characters plus the terminator, and behave as variable-length
+    // strings everywhere else — LEN is the content length, not n, and no padding is stored. Only
+    // "String * n" holds n characters plus a terminator. So those two only truncate, to n-1.
     if (Node.GetChild(1).NodeType = antIdentifier) and (Node.Attributes.IndexOfName('FIXEDLEN') >= 0) and
        (StrToIntDef(Node.Attributes.Values['FIXEDLEN'], -1) > 0) then
-      FFixedLenVars.Values[UpperCase(VarToStr(Node.GetChild(0).Value))] := Node.Attributes.Values['FIXEDLEN'];
+    begin
+      if (UpperCase(VarToStr(Node.GetChild(1).Value)) = 'ZSTRING') or
+         (UpperCase(VarToStr(Node.GetChild(1).Value)) = 'WSTRING') then
+      begin
+        FZStringVars.Values[UpperCase(VarToStr(Node.GetChild(0).Value))] :=
+          IntToStr(StrToIntDef(Node.Attributes.Values['FIXEDLEN'], 1) - 1);
+      end
+      else
+        FFixedLenVars.Values[UpperCase(VarToStr(Node.GetChild(0).Value))] := Node.Attributes.Values['FIXEDLEN'];
+    end;
   end;
   // FUNCTION ... AS WSTRING : child0 = name node, its child0 = return-type identifier.
   if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) then
@@ -21622,6 +21931,9 @@ begin
     Op := ssaRecordLoadInt;
   end;
   EmitInstruction(Op, DestVal, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+  // A fixed-length string FIELD ("As String * n") is stored NUL-padded to its capacity, like a
+  // fixed-length scalar: an ordinary read converts at the first NUL (see TryFixedLenStore's header).
+  if (Bank = srtString) and AnyFixedLen then DestVal := MaybeFixedLenRead(Node, DestVal);
   Result := DestVal;
 end;
 
@@ -21729,8 +22041,9 @@ procedure TSSAGenerator.ProcessMemberStore(MemberNode, ExprNode: TASTNode);
 // but a PROPERTY setter (FreeBASIC), lower a method call obj.<prop>.SET(expr) instead.
 var
   TypeName, NestedT, SMBack: string;
-  UDTIdx, Slot: Integer;
+  UDTIdx, Slot, FixCap: Integer;
   Bank: TSSARegisterType;
+  FixWide: Boolean;
   HandleVal, ExprVal, DummyVal: TSSAValue;
   Op: TSSAOpCode;
   SetterArgs, StoreAssign: TASTNode;
@@ -21768,7 +22081,13 @@ begin
   // B1.5: a field declared with a narrow integer type or SINGLE wraps/rounds the value on store.
   case Bank of
     srtFloat:  begin ExprVal := EnsureFloatRegister(ExprVal);  ExprVal := ApplyNarrowCode(UDTFieldWidthCode(UDTIdx, VarToStr(MemberNode.Value)), ExprVal); Op := ssaRecordStoreFloat; end;
-    srtString: begin ExprVal := EnsureStringRegister(ExprVal); Op := ssaRecordStoreString; end;
+    srtString: begin
+                 ExprVal := EnsureStringRegister(ExprVal);
+                 // "As String * n" field: store padded/cut to exactly n, as fbc's buffer is.
+                 FixCap := UDTFieldStrCapacity(UDTIdx, VarToStr(MemberNode.Value), FixWide);
+                 if FixCap > 0 then ExprVal := EmitFixedLenPad(ExprVal, FixCap, FixWide);
+                 Op := ssaRecordStoreString;
+               end;
   else
     begin ExprVal := EnsureIntRegister(ExprVal); ExprVal := ApplyNarrowCode(UDTFieldWidthCode(UDTIdx, VarToStr(MemberNode.Value)), ExprVal); Op := ssaRecordStoreInt; end;
   end;
@@ -23716,6 +24035,8 @@ begin
   // FreeBASIC WSTRING: record vars/fields declared AS WSTRING so width-aware ops (LEN/MID/...) count by
   // Unicode codepoint. Same srtString bank (UTF-8 storage) → no new register bank, existing ops intact.
   FFixedLenVars.Clear;
+  FZStringVars.Clear;
+  FRawFixedLenNode := nil;
   CollectWStringVars(AST);
   // REDIM multi-dim: an array re-dimensioned with >1 dimension must compute its element linear index
   // from RUNTIME dimensions (strides change on REDIM). Collect those array names; their multi-dim access

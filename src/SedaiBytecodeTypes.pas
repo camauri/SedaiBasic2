@@ -1148,10 +1148,18 @@ begin
 end;
 
 function TBytecodeProgram.AddStringConstant(const Str: string): Integer;
+// Byte-exact de-duplication. TStringList.IndexOf compares through the Ansi* helpers, which treat a
+// string holding an embedded NUL as ending there: "" and CHR(0) hashed to the same entry, so whichever
+// literal was interned second silently took the first one's VALUE. Constants are few and the previous
+// IndexOf was itself a linear scan, so an exact scan costs the same.
+var
+  i: Integer;
 begin
-  Result := FStringConstants.IndexOf(Str);
-  if Result = -1 then
-    Result := FStringConstants.Add(Str);
+  for i := 0 to FStringConstants.Count - 1 do
+    if (Length(FStringConstants[i]) = Length(Str)) and
+       ((Length(Str) = 0) or CompareMem(Pointer(FStringConstants[i]), Pointer(Str), Length(Str))) then
+      Exit(i);
+  Result := FStringConstants.Add(Str);
 end;
 
 function TBytecodeProgram.GetInstruction(Index: Integer): TBytecodeInstruction;
