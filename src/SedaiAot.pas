@@ -207,6 +207,14 @@ var
   // env not yet read. Default OFF: the static-home codegen is emitted byte-for-byte as before,
   // so the two can be A/B'd on one binary.
   GAotDynFloatState: Integer = -1;
+  // AOT_LINSCAN=1 enables the interval allocator (B1b). -1 = env not yet read.
+  GAotLinScanState: Integer = -1;
+  // Did the interval allocator actually run for the last region, and what did it place?
+  AotDiagLinScanActive: Boolean = False;
+  AotDiagLsPlacedInt: Integer = 0;
+  AotDiagLsPlacedFloat: Integer = 0;
+  AotDiagLsSpilledInt: Integer = 0;
+  AotDiagLsSpilledFloat: Integer = 0;
   // Which of the two register strategies actually ran for the last region compiled, and whether
   // the AUTO arbitration was the reason. Without this the choice is only observable on a
   // stopwatch - and the two are antagonistic, so reading it wrong costs a whole campaign.
@@ -274,6 +282,23 @@ begin
     else GAotDynFloatState := 1;
   end;
   Result := GAotDynFloatState;
+end;
+
+// AOT_LINSCAN gate, read once. Tri-state with the same shape as AOT_DYNF: 1 = force ON,
+// 2 = force OFF (byte-identical baseline, which is what makes every measurement an A/B on ONE
+// binary). The default is OFF while the nets that decide - the FB example sweep above all - have
+// not been run with it on: this is a register allocator, and the lesson Copy Coalescing and the
+// first REGREUSE flip both taught is that the net that decides is REAL PROGRAMS.
+function AotLinScanMode: Integer;
+var s: string;
+begin
+  if GAotLinScanState < 0 then
+  begin
+    s := GetEnvironmentVariable('AOT_LINSCAN');
+    if (s = '') or (s = '0') then GAotLinScanState := 2
+    else GAotLinScanState := 1;
+  end;
+  Result := GAotLinScanState;
 end;
 
 function AotSkipMainDefault(CombinedMode: Boolean): Boolean;
@@ -741,6 +766,10 @@ type
     Blk: Integer;              // region-relative block
     PStart, PEnd: Integer;     // inclusive linear positions
     OpensOnUse: Boolean;       // the first touch READS: the value must already be somewhere
+    Wrote: Boolean;            // something WRITES the register inside this range. Not the negation
+                               // of OpensOnUse: "d := d + 1" reads the incoming value, so the range
+                               // runs on rather than splitting - and it is still a write, so the
+                               // bank copy still goes stale and still has to be written back.
     LiveIn, LiveOut: Boolean;  // crosses the block's entry / exit edge
     Web: Integer;              // union-find parent, then the web id
     Weight: Int64;             // loop-weighted touches inside the range
@@ -752,8 +781,17 @@ type
     Weight: Int64;             // loop-weighted touches: what an eviction costs
     NeedsLoad: Boolean;        // opens on a use -> the value arrives through the bank
     HasDef: Boolean;           // written while resident -> the bank copy goes stale
+    // Entry points the value can reach WITHOUT passing through this web: a block where it is live
+    // in but some predecessor does not have it live out, or a use of a value the dataflow never
+    // saw defined. On such a path the machine register holds something else entirely - which is
+    // why a web with an uncovered entry anywhere except its own start is not placed at all.
+    NUncov: Integer;
+    UncovPos: Integer;         // position of the lowest uncovered entry (-1 = none)
     Home: Integer;             // machine register (-1 = stays memory-homed)
+    StoreEarly: Boolean;       // its last position is a terminator: write back BEFORE it, or the
+                               // store lands after the branch and never runs
   end;
+  TLsEventList = array of array of Integer;   // linear position -> web ids
 var
   E: TX86Emitter;
   ILoc, FLoc: array of Integer;         // final VM reg -> native reg (or -1)
@@ -849,6 +887,14 @@ var
   DynIHomeGpr: array of Integer;        // region position -> the GPR (R9..R15) assigned to it
   DynIFree: array of array of Integer;  // region position -> VM int regs whose last touch is here
   DynICur: array[0..15] of Integer;     // GPR number -> VM int reg currently resident there (-1 free)
+  // B1b: the interval allocator's schedule. Same idea as DynF*/DynI* - events indexed by linear
+  // position - but a position can start SEVERAL webs at once (every value live in to a block starts
+  // its range at the block's first position), so these are lists, and they carry a WEB id rather
+  // than a register: the web record already says which register, which machine register, whether
+  // the value arrives through the bank and whether it has to be written back.
+  LsActive: Boolean;
+  LsTakeAt: TLsEventList;               // position -> web ids that take their machine home here
+  LsFreeAt: TLsEventList;               // position -> web ids whose life ends here
 
   procedure Fail(const Why: string);
   begin
@@ -927,10 +973,14 @@ var
   // continue native. Emission-time DynFCur is a faithful map of runtime residency at this
   // position (the schedule is deterministic per linear position), so the emitted stores match
   // exactly what is live in registers here. No-op unless the dynamic allocator is active.
+  // The four routines below keep the DYNAMIC residency (AOT_DYNF's within-block temps and B1b's
+  // interval webs, which share DynFCur/DynICur as their runtime map) in step with the banks
+  // wherever a value leaves this code's hands: a runtime helper, a native call, a leaf string
+  // primitive, a deopt exit.
   procedure FlushResidentF;
   var x: Integer;
   begin
-    if not DynFActive then Exit;
+    if not (DynFActive or LsActive) then Exit;
     for x := 2 to 7 do
       if DynFCur[x] >= 0 then
         E.MemOp([$F2, $0F, $11], x, RSI, LongWord(DynFCur[x]) * 8);   // movsd [rsi+reg*8], xmm x
@@ -938,7 +988,7 @@ var
   procedure ReloadResidentF;
   var x: Integer;
   begin
-    if not DynFActive then Exit;
+    if not (DynFActive or LsActive) then Exit;
     for x := 2 to 7 do
       if DynFCur[x] >= 0 then
         E.MemOp([$F2, $0F, $10], x, RSI, LongWord(DynFCur[x]) * 8);   // movsd xmm x, [rsi+reg*8]
@@ -950,7 +1000,7 @@ var
   procedure FlushResidentI;
   var g: Integer;
   begin
-    if not DynIActive then Exit;
+    if not (DynIActive or LsActive) then Exit;
     for g := R9 to R15 do
       if DynICur[g] >= 0 then
       begin
@@ -961,7 +1011,7 @@ var
   procedure ReloadResidentI;
   var g: Integer;
   begin
-    if not DynIActive then Exit;
+    if not (DynIActive or LsActive) then Exit;
     for g := R9 to R15 do
       if DynICur[g] >= 0 then
       begin
@@ -2244,6 +2294,9 @@ var
     RootOf: array of Integer;                 // range -> its union-find root, resolved up front
     WebOf: array of Integer;                  // range root -> web id (-1 = not assigned yet)
     Cover: array of Integer;                  // per position: ranges covering it (difference array)
+    RangeUncov: array of Boolean;             // range -> reachable without passing through its web
+    CoveredIn: array of array of Boolean;     // [block][reg] live-in and every predecessor has it
+    HasPred: array of Boolean;                // block -> has at least one in-region predecessor
 
     function BankReg(const V: TSSAValue; out rr: Integer): Boolean;
     // Is this operand a register of the bank being walked, and which final index is it?
@@ -2269,6 +2322,7 @@ var
       LsRanges[Result].PStart := apos;
       LsRanges[Result].PEnd := apos;
       LsRanges[Result].OpensOnUse := onUse;
+      LsRanges[Result].Wrote := not onUse;
       LsRanges[Result].LiveIn := isLiveIn;
       LsRanges[Result].LiveOut := False;
       LsRanges[Result].Web := Result;         // union-find: its own root until unioned
@@ -2400,8 +2454,9 @@ var
               if ReadHere[r] then
               begin
                 // Read-modify-write: the incoming value is this instruction's input, so the range
-                // runs on. NOT a split point.
+                // runs on. NOT a split point - but it IS a write.
                 LsRanges[OpenR[r]].PEnd := p;
+                LsRanges[OpenR[r]].Wrote := True;
               end
               else
               begin
@@ -2423,7 +2478,18 @@ var
           end;
       end;
 
-      // Union across CFG edges: a value live out of P and live in to S is ONE value.
+      // Union across CFG edges: a value live out of P and live in to S is ONE value. The same walk
+      // answers the COVERAGE question: is every path into S carrying this value, or can control
+      // arrive with the register holding something else? Only a covered entry may inherit a
+      // machine home; an uncovered one is where the bank's value (the implicit zero of a variable
+      // never assigned on that path, among others) has to be readable.
+      SetLength(CoveredIn, 0); SetLength(CoveredIn, nb);
+      SetLength(HasPred, 0); SetLength(HasPred, nb);
+      for bi := 0 to nb - 1 do
+      begin
+        SetLength(CoveredIn[bi], nreg);
+        for r := 0 to nreg - 1 do CoveredIn[bi][r] := True;
+      end;
       for bi := 0 to nb - 1 do
       begin
         Blk := SSAProg.Blocks[Region.FirstBlock + bi];
@@ -2434,15 +2500,46 @@ var
           for j := Region.FirstBlock to Region.LastBlock do
             if SSAProg.Blocks[j] = Succ then begin k := j - Region.FirstBlock; Break; end;
           if k < 0 then System.Continue;                  // leaves the region: an exit
+          // An edge back into the region's ENTRY block is not a value-carrying edge. A
+          // self-recursive function has one - the call site's successor is its own entry - and
+          // following it would let liveness conclude that the parameter "arrives" already in a
+          // machine register on entry, when the entry is reached from the CALLER, through the
+          // banks. (Found the honest way: a recursive Fib returning a pointer-shaped integer.)
+          if k = 0 then System.Continue;
+          HasPred[k] := True;
           for r := 0 to nreg - 1 do
-            if ((bank = 0) and OutI[bi][r] and InI[k][r]) or
-               ((bank = 1) and OutF[bi][r] and InF[k][r]) then
+            if ((bank = 0) and InI[k][r]) or ((bank = 1) and InF[k][r]) then
             begin
-              Union(LastR[bi][r], FirstR[k][r]);
-              Inc(AotDiagLsCross);
+              if ((bank = 0) and OutI[bi][r]) or ((bank = 1) and OutF[bi][r]) then
+              begin
+                Union(LastR[bi][r], FirstR[k][r]);
+                Inc(AotDiagLsCross);
+              end
+              else
+                CoveredIn[k][r] := False;                 // arrives here without the value
             end;
         end;
       end;
+
+      // Mark the uncovered ranges. Two shapes: a live-in with an incomplete set of predecessors
+      // (the region's entry block among them - its live-ins come from outside, through the bank),
+      // and a mid-block read of something the dataflow never saw defined.
+      SetLength(RangeUncov, LsNRange);
+      for k := 0 to LsNRange - 1 do
+        if LsRanges[k].Bank = bank then
+        begin
+          if LsRanges[k].LiveIn then
+          begin
+            // The region's entry block is always entered from OUTSIDE - that is what makes it the
+            // entry - so whatever is live in there arrives through the banks, whether or not some
+            // block inside the region also names it as a successor.
+            if (LsRanges[k].Blk = 0) or (not HasPred[LsRanges[k].Blk]) or
+               (not CoveredIn[LsRanges[k].Blk][LsRanges[k].Reg]) then
+              RangeUncov[k] := True;
+          end
+          else if LsRanges[k].OpensOnUse then
+            RangeUncov[k] := True;
+        end;
     end;
 
     // Compact the union-find roots into dense web ids and summarise each web.
@@ -2471,18 +2568,23 @@ var
         LsWebs[wid].Weight := 0;
         LsWebs[wid].NeedsLoad := False;
         LsWebs[wid].HasDef := False;
+        LsWebs[wid].NUncov := 0;
+        LsWebs[wid].UncovPos := -1;
         LsWebs[wid].Home := -1;
+        LsWebs[wid].StoreEarly := False;
       end;
       wid := WebOf[rid];
       Inc(LsWebs[wid].NRange);
       LsWebs[wid].Weight := LsWebs[wid].Weight + LsRanges[k].Weight;
       if LsRanges[k].PStart < LsWebs[wid].PStart then LsWebs[wid].PStart := LsRanges[k].PStart;
       if LsRanges[k].PEnd > LsWebs[wid].PEnd then LsWebs[wid].PEnd := LsRanges[k].PEnd;
-      // A range that opens on a use and is NOT fed by a predecessor inside the web means the value
-      // reaches this web through the bank.
-      if LsRanges[k].OpensOnUse and not LsRanges[k].LiveIn then LsWebs[wid].NeedsLoad := True;
-      if LsRanges[k].LiveIn and (LsRanges[k].Blk = 0) then LsWebs[wid].NeedsLoad := True;
-      if not LsRanges[k].OpensOnUse then LsWebs[wid].HasDef := True;
+      if LsRanges[k].Wrote then LsWebs[wid].HasDef := True;
+      if RangeUncov[k] then
+      begin
+        Inc(LsWebs[wid].NUncov);
+        if (LsWebs[wid].UncovPos < 0) or (LsRanges[k].PStart < LsWebs[wid].UncovPos) then
+          LsWebs[wid].UncovPos := LsRanges[k].PStart;
+      end;
     end;
     // Rewrite each range's Web field from "union-find parent" to "web id" - from here on it is
     // an index into LsWebs, and Find must not be called again.
@@ -2515,6 +2617,14 @@ var
     for k := 0 to LsNWeb - 1 do
       if LsWebs[k].Bank = 0 then Inc(AotDiagLsWebsInt) else Inc(AotDiagLsWebsFloat);
     AotDiagLsRanges := LsNRange;
+    if GetEnvironmentVariable('LS_DUMP') = '1' then
+      for k := 0 to LsNRange - 1 do
+        WriteLn(ErrOutput, Format('[LSR] range %d web=%d bank=%d reg=%d blk=%d [%d..%d] onUse=%s wrote=%s in=%s out=%s uncov=%s haspred=%s',
+          [k, LsRanges[k].Web, LsRanges[k].Bank, LsRanges[k].Reg, LsRanges[k].Blk,
+           LsRanges[k].PStart, LsRanges[k].PEnd,
+           BoolToStr(LsRanges[k].OpensOnUse, 'y', 'n'), BoolToStr(LsRanges[k].Wrote, 'y', 'n'),
+           BoolToStr(LsRanges[k].LiveIn, 'y', 'n'), BoolToStr(LsRanges[k].LiveOut, 'y', 'n'),
+           BoolToStr(RangeUncov[k], 'y', 'n'), BoolToStr(HasPred[LsRanges[k].Blk], 'y', 'n')]));
     LsOK := True;
   end;
 
@@ -2966,6 +3076,9 @@ var
     for a := 0 to 7 do DynFCur[a] := -1;
     mode := AotDynFloatMode;
     if mode = 2 then Exit;                                     // forced off
+    if LsActive then Exit;                                     // B1b ran: it SUBSUMES this pass -
+                                                               // a block-local single-def temp is
+                                                               // just a short web
     if MaxFReg < 0 then Exit;
     // AUTO arbitration against the REGREUSE merge. The two are ANTAGONISTIC, not additive: DYNF
     // admits only block-local single-def temps and holds an xmm for [firstDef..lastTouch] without
@@ -3073,6 +3186,7 @@ var
     for a := 0 to 15 do DynICur[a] := -1;
     mode := AotDynFloatMode;
     if mode = 2 then Exit;
+    if LsActive then Exit;                                     // subsumed by B1b, see PlanDynFloat
     if MaxIReg < 0 then Exit;
     if (mode = 0) and SSAProg.RegisterMergeApplied then Exit;  // see PlanDynFloat: antagonistic
     if (mode = 0) and not RegionThroughputBound then Exit;
@@ -3152,6 +3266,289 @@ var
     DynIActive := True;
     for r := 0 to MaxIReg do ILoc[r] := -1;            // drop static int homes; array cache stays
     NIAlloc := 0;
+  end;
+
+  { --- B1b: the interval allocator ------------------------------------------------------------
+    A linear scan over the WEBS BuildIntervals produced, instead of over register numbers. What it
+    buys, and why the two mechanisms it replaces could not:
+
+      * Allocate gives a VM register ONE home for the whole region, ranked by use count. A register
+        the REGREUSE merge loaded with five different values therefore holds a machine register for
+        the union of their lifetimes, and the four it starves are the reason the merge costs
+        intpoly 12%.
+      * PlanDynFloat/PlanDynInt only admit a temp that is BLOCK-LOCAL and SINGLE-DEF, which a
+        merged register never is - so with the merge on they admit nothing, and the two are
+        arbitrated against each other rather than composed.
+
+    A web is neither: it is one value, with a real lifetime, and it can start and end anywhere. So
+    the same six xmm can carry a hundred and forty-nine successive float values instead of six.
+
+    First cut deliberately: a web is placed WHOLE, or not at all. Splitting a web when the pool
+    overflows (and resolving the resulting location changes on CFG edges with moves) is the next
+    step, and it is the one that needs the trampolines - as long as a value keeps ONE home for its
+    whole life, its location is the same at both ends of every edge and no resolution is needed.
+
+    The safety invariant, which is what makes this bearable at all: THE BANK IS AUTHORITATIVE
+    whenever a value is not resident. A web that writes is written back when it releases its home,
+    so any read the analysis never saw - and this codebase has a whole class of those, operands
+    that lower to register 0, opcodes that touch registers they do not name - finds the right value
+    in the bank, exactly as it does today. Residency only ever caches. ------------------------- }
+  procedure PlanLinScan;
+  var
+    mode, i, j, k, w, x, r, np, bank, nplaced, nspill: Integer;
+    poolG: array of Integer;              // int: IntPool minus the array-descriptor cache
+    poolN: Integer;
+    activeW: array of Integer;            // pool slot -> web id resident there (-1 = free)
+    ordw: array of Integer;               // web ids, sorted by start position
+    WebMap: array of Integer;             // old web id -> canonical web id after the overlap merge
+    taken: Boolean;
+    minSlot: Integer;
+    minW: Int64;
+
+    procedure PushAt(var Slot: TLsEventList; pos, wid: Integer);
+    begin
+      SetLength(Slot[pos], Length(Slot[pos]) + 1);
+      Slot[pos][High(Slot[pos])] := wid;
+    end;
+
+    function CrossesCall(wid: Integer): Boolean;
+    // DIAGNOSTIC PROBE (LS_NOCALL=1): refuse any web whose life spans a position that hands
+    // control away - a runtime helper or a native call-sub.
+    var b2, lo, q: Integer; B3: TSSABasicBlock;
+    begin
+      Result := False;
+      for b2 := 0 to LiveNB - 1 do
+      begin
+        B3 := TSSABasicBlock(SSAProg.Blocks[Region.FirstBlock + b2]);
+        lo := LsPos0[b2];
+        for q := 0 to B3.Instructions.Count - 1 do
+          if (lo + q >= LsWebs[wid].PStart) and (lo + q <= LsWebs[wid].PEnd) then
+            if (TSSAInstruction(B3.Instructions[q]).OpCode = ssaCallSub) or
+               (not AotIsNative(SSAProg, TSSAInstruction(B3.Instructions[q]))) then
+              Exit(True);
+      end;
+    end;
+
+    function InstrAt(pos: Integer): TSSAInstruction;
+    var b2, lo: Integer; B3: TSSABasicBlock;
+    begin
+      Result := nil;
+      for b2 := 0 to LiveNB - 1 do
+      begin
+        B3 := TSSABasicBlock(SSAProg.Blocks[Region.FirstBlock + b2]);
+        lo := LsPos0[b2];
+        if (pos >= lo) and (pos < lo + B3.Instructions.Count) then
+          Exit(TSSAInstruction(B3.Instructions[pos - lo]));
+      end;
+    end;
+
+    function EndsOnTerminator(pos: Integer): Boolean;
+    // The write-back of a web whose last position is a jump has to be emitted BEFORE it, or it
+    // lands after the branch and never runs. Safe: a store does not disturb the register the
+    // terminator is about to read, and a terminator never defines one.
+    var Ins2: TSSAInstruction;
+    begin
+      // A chain, not a set: TSSAOpCode has well past the 256 elements a Pascal set holds.
+      Ins2 := InstrAt(pos);
+      Result := (Ins2 <> nil) and
+                ((Ins2.OpCode = ssaJump) or (Ins2.OpCode = ssaJumpIfZero) or
+                 (Ins2.OpCode = ssaJumpIfNotZero) or (Ins2.OpCode = ssaReturn) or
+                 (Ins2.OpCode = ssaReturnSub) or (Ins2.OpCode = ssaEnd) or (Ins2.OpCode = ssaStop));
+    end;
+
+    function StartsOnHelper(wid: Integer): Boolean;
+    // Does this web's first position belong to an instruction that hands the work to a runtime
+    // helper (or to a native call-sub)?
+    //
+    // It matters because a helper does its work THROUGH THE BANKS: the emitted call flushes the
+    // resident registers first and re-reads them after. The take event happens BEFORE the
+    // instruction, so a web starting there would have its machine register flushed while it still
+    // holds nothing - writing garbage over the bank slot the helper is about to read or write.
+    // The cure is not to refuse the web but to LOAD at the take: the flush then writes back what
+    // it read, and the reload afterwards picks up whatever the helper produced.
+    var Ins2: TSSAInstruction;
+    begin
+      Ins2 := InstrAt(LsWebs[wid].PStart);
+      Result := (Ins2 <> nil) and ((Ins2.OpCode = ssaCallSub) or not AotIsNative(SSAProg, Ins2));
+    end;
+
+    function WebPlaceable(wid: Integer): Boolean;
+    // May this web hold a machine register for its whole life?
+    //
+    // Only if every path that reaches a point where the value is live has passed through the web -
+    // otherwise the register holds an unrelated value where the program expects the bank's (which
+    // for a BASIC variable never assigned on that path is its implicit zero, an OBSERVABLE value:
+    // "Dim n : Print n" prints 0).
+    //
+    // One uncovered entry is allowed, and only if it is the web's own start: there a load makes
+    // the register agree with the bank before anything reads it. That single case is the common
+    // and valuable one - the region's entry block, whose live-ins arrive from outside through the
+    // banks. Anything else stays memory-homed, exactly as it is today.
+    begin
+      Result := (LsWebs[wid].NUncov = 0) or
+                ((LsWebs[wid].NUncov = 1) and (LsWebs[wid].UncovPos = LsWebs[wid].PStart));
+      if Result and (GetEnvironmentVariable('LS_NOCALL') = '1') and CrossesCall(wid) then
+        Result := False;
+      if Result and (GetEnvironmentVariable('LS_ONLYW') <> '') and
+         (GetEnvironmentVariable('LS_ONLYW') <> IntToStr(wid)) then
+        Result := False;
+      if Result then
+        LsWebs[wid].NeedsLoad := (LsWebs[wid].NUncov = 1) or StartsOnHelper(wid);
+    end;
+
+  begin
+    LsActive := False;
+    mode := AotLinScanMode;
+    if mode = 2 then Exit;                                  // forced off: byte-identical baseline
+    // DIAGNOSTIC: restrict the allocator to one region, to bisect a failure to its compiland.
+    if (GetEnvironmentVariable('LS_REGION') <> '') and
+       (GetEnvironmentVariable('LS_REGION') <> Region.Name) then Exit;
+    if not LsOK then Exit;
+    if LsNWeb = 0 then Exit;
+    // Sorting and the per-register merge are quadratic in the worst case; a region with this many
+    // webs is not one where a register allocator decides the clock.
+    if LsNWeb > 20000 then Exit;
+
+    // (1) Two webs of the SAME VM register whose SPANS overlap must not get different homes: the
+    // emitter keeps one FLoc/ILoc entry per register, so at any position a register can only be in
+    // one place. It happens when one web has a hole another web's life falls into. Merge them and
+    // let the pair share a home - a small loss of precision for an invariant worth having.
+    SetLength(WebMap, LsNWeb);
+    for i := 0 to LsNWeb - 1 do WebMap[i] := i;
+    for i := 0 to LsNWeb - 1 do
+    begin
+      if WebMap[i] <> i then System.Continue;
+      for j := i + 1 to LsNWeb - 1 do
+      begin
+        if WebMap[j] <> j then System.Continue;
+        if (LsWebs[j].Bank <> LsWebs[i].Bank) or (LsWebs[j].Reg <> LsWebs[i].Reg) then System.Continue;
+        if (LsWebs[j].PStart > LsWebs[i].PEnd) or (LsWebs[i].PStart > LsWebs[j].PEnd) then System.Continue;
+        WebMap[j] := i;
+        if LsWebs[j].PStart < LsWebs[i].PStart then LsWebs[i].PStart := LsWebs[j].PStart;
+        if LsWebs[j].PEnd > LsWebs[i].PEnd then LsWebs[i].PEnd := LsWebs[j].PEnd;
+        LsWebs[i].Weight := LsWebs[i].Weight + LsWebs[j].Weight;
+        LsWebs[i].NeedsLoad := LsWebs[i].NeedsLoad or LsWebs[j].NeedsLoad;
+        LsWebs[i].HasDef := LsWebs[i].HasDef or LsWebs[j].HasDef;
+        LsWebs[j].Home := -2;                               // absorbed: never placed on its own
+      end;
+    end;
+    // The merge above can widen a span across another already-absorbed one; one more sweep settles
+    // the common case, and anything it misses is caught by the overlap check in the scan itself.
+    for i := 0 to LsNWeb - 1 do
+      if WebMap[i] <> i then
+        while WebMap[WebMap[i]] <> WebMap[i] do WebMap[i] := WebMap[WebMap[i]];
+
+    // (2) The pools. Float is xmm2..7 as always; int is IntPool minus the GPRs Allocate pinned to
+    // array descriptors, which stay reserved for the whole invocation.
+    SetLength(poolG, Length(IntPool)); poolN := 0;
+    for i := 0 to High(IntPool) do
+    begin
+      taken := False;
+      for j := 0 to NACache - 1 do if ACacheReg[j] = IntPool[i] then begin taken := True; Break; end;
+      if not taken then begin poolG[poolN] := IntPool[i]; Inc(poolN); end;
+    end;
+
+    // (3) The scan, per bank: webs by start position, expire what ended strictly BEFORE this one
+    // starts (a web releasing at position p must not hand its register to one starting at p - the
+    // release is emitted after the instruction, the take before it), then first free slot, and on
+    // overflow evict the lightest active if this web is heavier.
+    SetLength(LsTakeAt, 0); SetLength(LsFreeAt, 0);
+    SetLength(LsTakeAt, LsNPos); SetLength(LsFreeAt, LsNPos);
+    nplaced := 0; nspill := 0;
+    AotDiagLsPlacedInt := 0; AotDiagLsPlacedFloat := 0;
+    AotDiagLsSpilledInt := 0; AotDiagLsSpilledFloat := 0;
+
+    for bank := 0 to 1 do
+    begin
+      if bank = 0 then np := poolN else np := 6;            // xmm2..7
+      if np <= 0 then System.Continue;
+
+      SetLength(ordw, 0); SetLength(ordw, LsNWeb);
+      k := 0;
+      for i := 0 to LsNWeb - 1 do
+        if (LsWebs[i].Bank = bank) and (WebMap[i] = i) and WebPlaceable(i) then
+        begin ordw[k] := i; Inc(k); end;
+      if k = 0 then System.Continue;
+      for i := 1 to k - 1 do                                // insertion sort by start position
+      begin
+        x := ordw[i]; j := i - 1;
+        while (j >= 0) and (LsWebs[ordw[j]].PStart > LsWebs[x].PStart) do
+        begin ordw[j + 1] := ordw[j]; Dec(j); end;
+        ordw[j + 1] := x;
+      end;
+
+      SetLength(activeW, 0); SetLength(activeW, np);
+      for i := 0 to np - 1 do activeW[i] := -1;
+
+      for i := 0 to k - 1 do
+      begin
+        w := ordw[i];
+        for x := 0 to np - 1 do
+          if (activeW[x] >= 0) and (LsWebs[activeW[x]].PEnd < LsWebs[w].PStart) then activeW[x] := -1;
+        r := -1;
+        for x := 0 to np - 1 do if activeW[x] < 0 then begin r := x; Break; end;
+        if r < 0 then
+        begin
+          minSlot := 0; minW := -1;
+          for x := 0 to np - 1 do
+            if (minW < 0) or (LsWebs[activeW[x]].Weight < minW) then
+            begin minSlot := x; minW := LsWebs[activeW[x]].Weight; end;
+          if LsWebs[w].Weight > minW then
+          begin
+            LsWebs[activeW[minSlot]].Home := -1;            // evicted: stays memory-homed
+            Inc(nspill);
+            Dec(nplaced);
+            if bank = 0 then
+            begin Inc(AotDiagLsSpilledInt); Dec(AotDiagLsPlacedInt); end
+            else
+            begin Inc(AotDiagLsSpilledFloat); Dec(AotDiagLsPlacedFloat); end;
+            r := minSlot;
+          end
+          else
+          begin
+            LsWebs[w].Home := -1;
+            Inc(nspill);
+            if bank = 0 then Inc(AotDiagLsSpilledInt) else Inc(AotDiagLsSpilledFloat);
+            System.Continue;
+          end;
+        end;
+        activeW[r] := w;
+        if bank = 0 then LsWebs[w].Home := poolG[r] else LsWebs[w].Home := r + 2;
+        Inc(nplaced);
+        if bank = 0 then Inc(AotDiagLsPlacedInt) else Inc(AotDiagLsPlacedFloat);
+      end;
+    end;
+
+    if nplaced <= 0 then Exit;                              // nothing to gain: keep the static homes
+
+    // (4) Turn the placements into position events. An evicted web has Home = -1 and contributes
+    // none, so its register simply stays in the bank exactly as it does today.
+    for i := 0 to LsNWeb - 1 do
+      if (WebMap[i] = i) and (LsWebs[i].Home >= 0) then
+      begin
+        LsWebs[i].StoreEarly := LsWebs[i].HasDef and EndsOnTerminator(LsWebs[i].PEnd);
+        if GetEnvironmentVariable('LS_DUMP') = '1' then
+          WriteLn(ErrOutput, Format('[LS] web %d bank=%d reg=%d [%d..%d] home=%d load=%s def=%s w=%d uncov=%d@%d nr=%d',
+            [i, LsWebs[i].Bank, LsWebs[i].Reg, LsWebs[i].PStart, LsWebs[i].PEnd, LsWebs[i].Home,
+             BoolToStr(LsWebs[i].NeedsLoad, 'y', 'n'), BoolToStr(LsWebs[i].HasDef, 'y', 'n'),
+             LsWebs[i].Weight, LsWebs[i].NUncov, LsWebs[i].UncovPos, LsWebs[i].NRange]));
+        PushAt(LsTakeAt, LsWebs[i].PStart, i);
+        PushAt(LsFreeAt, LsWebs[i].PEnd, i);
+        if LsWebs[i].Bank = 1 then
+        begin
+          if LsWebs[i].Home = 6 then SaveX6 := True;
+          if LsWebs[i].Home = 7 then SaveX7 := True;
+        end
+        else if LsWebs[i].Home >= R12 then SaveGpr[LsWebs[i].Home] := True;
+      end;
+
+    LsActive := True;
+    // The interval schedule REPLACES the static homes: everything it does not place stays in the
+    // bank, and nothing is loaded on entry or flushed on exit for a register that has no home for
+    // the whole region. Same handover PlanDynFloat makes, for the same reason.
+    for i := 0 to MaxFReg do FLoc[i] := -1;
+    for i := 0 to MaxIReg do ILoc[i] := -1;
+    NFAlloc := 0; NIAlloc := 0;
   end;
 
   procedure EmitInstruction;
@@ -3509,7 +3906,7 @@ var
   end;
 
 var
-  b, j, k, w, TargetOff: Integer;
+  b, j, k, w, d, TargetOff: Integer;
   Blk: TSSABasicBlock;
 begin
   Result := nil;
@@ -3549,10 +3946,12 @@ begin
   SetLength(FLoc, MaxFReg + 1); for k := 0 to MaxFReg do FLoc[k] := -1;
   SetLength(IAllocd, Length(IntPool)); SetLength(FAllocd, 6);
   Allocate;
+  PlanLinScan;    // AOT_LINSCAN (B1b): may replace the static homes with a per-INTERVAL schedule
   PlanDynFloat;   // AOT_DYNF: may replace the static float homes with a within-block dynamic schedule
   PlanDynInt;     // AOT_DYNF (c): same for the integer GPR pool (minus the array-descriptor cache)
   AotDiagDynFActive := DynFActive;
   AotDiagDynIActive := DynIActive;
+  AotDiagLinScanActive := LsActive;
   AotDiagMergeApplied := SSAProg.RegisterMergeApplied;
 
   HelperOps := TStringList.Create;
@@ -3642,6 +4041,41 @@ begin
           ILoc[DynIHomeReg[DynPos]] := DynIHomeGpr[DynPos];
           DynICur[DynIHomeGpr[DynPos]] := DynIHomeReg[DynPos];
         end;
+        // B1b start events: every web starting here takes its machine home BEFORE the instruction,
+        // so a defining store writes it. A web that opens on a USE - the region's entry live-ins,
+        // and anything starting on a helper-routed op, which does its work through the banks -
+        // reads the bank first, which is what makes the machine register agree with it.
+        //
+        if LsActive then
+          for k := 0 to High(LsTakeAt[DynPos]) do
+          begin
+            w := LsTakeAt[DynPos][k];
+            if LsWebs[w].Bank = 1 then
+            begin
+              FLoc[LsWebs[w].Reg] := LsWebs[w].Home;
+              DynFCur[LsWebs[w].Home] := LsWebs[w].Reg;
+              if LsWebs[w].NeedsLoad then
+                E.MemOp([$F2, $0F, $10], LsWebs[w].Home, RSI, LongWord(LsWebs[w].Reg) * 8);
+            end
+            else
+            begin
+              ILoc[LsWebs[w].Reg] := LsWebs[w].Home;
+              DynICur[LsWebs[w].Home] := LsWebs[w].Reg;
+              if LsWebs[w].NeedsLoad then
+                LoadRegMem(LsWebs[w].Home, LongWord(LsWebs[w].Reg) * 8);
+            end;
+          end;
+        // A web ending on a terminator writes back before the branch is emitted (StoreEarly).
+        if LsActive then
+          for k := 0 to High(LsFreeAt[DynPos]) do
+          begin
+            w := LsFreeAt[DynPos][k];
+            if not LsWebs[w].StoreEarly then System.Continue;
+            if LsWebs[w].Bank = 1 then
+              E.MemOp([$F2, $0F, $11], LsWebs[w].Home, RSI, LongWord(LsWebs[w].Reg) * 8)
+            else
+              StoreRegMem(LsWebs[w].Home, LongWord(LsWebs[w].Reg) * 8);
+          end;
         EmitInstruction;
         if not OK then Exit;
         // AOT_DYNF free events: temps whose last touch was this instruction leave their home
@@ -3659,6 +4093,35 @@ begin
             w := ILoc[DynIFree[DynPos][k]];
             if (w >= 0) and (DynICur[w] = DynIFree[DynPos][k]) then DynICur[w] := -1;
             ILoc[DynIFree[DynPos][k]] := -1;
+          end;
+        // B1b end events: the value's last use has just been emitted, so the machine register goes
+        // back to the pool. Residency must not outlive the live range - outside it, no path
+        // guarantees what the register holds, and the next flush at a helper or an exit would
+        // write that into the bank.
+        //
+        // A web that WROTE its register writes it back here. That store is the price of this
+        // allocator, and the measurement says it IS the price: skipping it (unsound) brings a
+        // 12-42% regression back to parity. It buys the invariant everything else rests on - the
+        // bank is authoritative for every value that is not resident - which is what lets a read
+        // this analysis never saw still find the right value.
+        if LsActive then
+          for k := 0 to High(LsFreeAt[DynPos]) do
+          begin
+            w := LsFreeAt[DynPos][k];
+            if LsWebs[w].Bank = 1 then
+            begin
+              if LsWebs[w].HasDef and not LsWebs[w].StoreEarly then
+                E.MemOp([$F2, $0F, $11], LsWebs[w].Home, RSI, LongWord(LsWebs[w].Reg) * 8);
+              if DynFCur[LsWebs[w].Home] = LsWebs[w].Reg then DynFCur[LsWebs[w].Home] := -1;
+              FLoc[LsWebs[w].Reg] := -1;
+            end
+            else
+            begin
+              if LsWebs[w].HasDef and not LsWebs[w].StoreEarly then
+                StoreRegMem(LsWebs[w].Home, LongWord(LsWebs[w].Reg) * 8);
+              if DynICur[LsWebs[w].Home] = LsWebs[w].Reg then DynICur[LsWebs[w].Home] := -1;
+              ILoc[LsWebs[w].Reg] := -1;
+            end;
           end;
         Inc(DynPos);
         Inc(CurOrd);
@@ -3778,9 +4241,14 @@ begin
         // much the one-home-per-register allocation is conflating, the second whether what is
         // really live at once fits the machine pool at all.
         if AotDiagLsWhy = '' then
+        begin
           WriteLn(ErrOutput, Format('[AOT]   intervals: webs int=%d float=%d (ranges=%d) maxOverlap int=%d float=%d edge-crossings=%d',
             [AotDiagLsWebsInt, AotDiagLsWebsFloat, AotDiagLsRanges,
-             AotDiagLsMaxOverInt, AotDiagLsMaxOverFloat, AotDiagLsCross]))
+             AotDiagLsMaxOverInt, AotDiagLsMaxOverFloat, AotDiagLsCross]));
+          if AotDiagLinScanActive then
+            WriteLn(ErrOutput, Format('[AOT]   linscan: ACTIVE, placed int=%d float=%d, memory-homed int=%d float=%d',
+              [AotDiagLsPlacedInt, AotDiagLsPlacedFloat, AotDiagLsSpilledInt, AotDiagLsSpilledFloat]));
+        end
         else
           WriteLn(ErrOutput, '[AOT]   intervals: not built (' + AotDiagLsWhy + ')');
         if AotDiagIntTotal > 0 then
