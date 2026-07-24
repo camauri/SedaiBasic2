@@ -290,23 +290,39 @@ end;
 // not been run with it on: this is a register allocator, and the lesson Copy Coalescing and the
 // first REGREUSE flip both taught is that the net that decides is REAL PROGRAMS.
 function FloatPoolTop: Integer;
-// Highest xmm the allocators may hand out. AOT_FPOOL=<n> asks for n registers, xmm2..(n+1).
+// Highest xmm the allocators may hand out. AOT_FPOOL=<n> asks for n registers, xmm2..(n+1);
+// AOT_FPOOL=6 restores the historic pool exactly, which is what makes every measurement below an
+// A/B on a single binary.
 //
-// The default is 6 (xmm2..7), the historic pool. Widening it is now POSSIBLE - every float
-// encoding in this unit goes through SseRR/SseMem/SseWRex, which grow a REX prefix for xmm8-15 -
-// and the measurement that made it worth doing is the slope downwards: with 4 xmm instead of 6,
+// The default is the FULL pool, xmm2..15, since 2026-07-25. What made it worth the REX prefix on
+// every float encoding in this unit was the slope downwards: with 4 registers instead of 6,
 // floatpoly costs +58% and n-body +9%. The pool is the binding constraint, not the allocation
-// policy: after the REGREUSE merge the peak simultaneously-live float count is 8 on n-body and 19
+// policy - after the REGREUSE merge the peak simultaneously-live float count is 8 on n-body and 19
 // on floatpoly, against the 6 registers there were to give.
 //
-// xmm6-15 are callee-saved on Win64, so each one handed out costs a save/restore pair in the
-// prologue - which is why this is measured per benchmark before the default moves.
+// Interleaved A/B, best-of-5, on one binary, every run's output compared against the baseline:
+//
+//   bench       --aot  6 -> 14      --aot --jit  6 -> 14
+//   n-body      347 -> 329  -5%     354 -> 327  -7%
+//   floatpoly   241 -> 226  -6%     241 -> 227  -5%
+//   intpoly     640 -> 643   0%     646 -> 645   0%
+//   cvtpoly     530 -> 528   0%     538 -> 533   0%
+//   arraysum    320 -> 324  +1%     327 -> 325   0%
+//   sieve       644 -> 648   0%     642 -> 641   0%
+//   strops      547 -> 542   0%     544 -> 546   0%
+//   nbody_v7  12255 ->12280   0%    894 -> 899   0%
+//
+// Two clear wins where the float pressure is, nothing worse than noise anywhere else, and the
+// output bit-identical in every cell. xmm6-15 are callee-saved on Win64, so each register handed
+// out costs a save/restore pair in the prologue - which is why the flat rows are the ones to read:
+// a region that does not need the extra registers does not pay for them, because SaveXmm is set
+// only for a register the pool ACTUALLY gives to a value.
 var s: string; n: Integer;
 begin
-  Result := 7;
+  Result := 15;
   s := GetEnvironmentVariable('AOT_FPOOL');
   if s = '' then Exit;
-  n := StrToIntDef(s, 6);
+  n := StrToIntDef(s, 14);
   if (n >= 1) and (n <= 14) then Result := 1 + n;
 end;
 
