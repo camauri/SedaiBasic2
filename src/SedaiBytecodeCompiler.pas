@@ -2047,6 +2047,14 @@ begin
   if OpIn(Instr.OpCode, [ssaChdir, ssaMkdir, ssaRmdir, ssaScratch, ssaCopyFile, ssaShell]) and
      (Instr.Dest.Kind = svkRegister) then
     BCInstr.Immediate := -1;
+  // KEY: "KEY n" (clear) and "KEY" (list) carry NO text operand, but an absent Src2 lowers to
+  // register 0 - a perfectly valid string register. The VM discriminated on
+  // "Src2 < StringRegCount", which is always true, so a clear copied whatever string happened to
+  // live in R0 into the function key table. Same class of bug as the RESUME register-form flag
+  // above: mark the no-text form explicitly. Polarity chosen so old .basc files (Immediate = 0,
+  // Src2 = the text register) keep decoding as the define form.
+  if (Instr.OpCode = ssaKey) and (Instr.Src2.Kind <> svkRegister) then
+    BCInstr.Immediate := -1;
 
   {$IFDEF DEBUG_BYTECODE}
   if DebugBytecode and OpIn(Instr.OpCode, [ssaPrintInt, ssaLoadEL, ssaLoadER]) then

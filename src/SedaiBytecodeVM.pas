@@ -4912,11 +4912,14 @@ begin
         end
         else if (KeyNum >= 1) and (KeyNum <= 12) then
         begin
-          // Define or clear function key
-          if Instr.Src2 < Ctx.StringRegCount then
-            FFunctionKeys[KeyNum] := Ctx.StringRegs[Instr.Src2]
+          // Define or clear function key. Immediate = -1 marks the no-text form ("KEY n"):
+          // an absent operand lowers to register 0, which is a valid string register, so
+          // "Src2 < StringRegCount" could never tell a clear from a define and copied whatever
+          // string lived in R0 into the table.
+          if (Instr.Immediate = -1) or (Instr.Src2 >= Ctx.StringRegCount) then
+            FFunctionKeys[KeyNum] := ''  // Clear key
           else
-            FFunctionKeys[KeyNum] := '';  // Clear key
+            FFunctionKeys[KeyNum] := Ctx.StringRegs[Instr.Src2];
         end;
       end;
     bcTron:
