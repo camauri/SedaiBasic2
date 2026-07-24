@@ -289,6 +289,27 @@ end;
 // binary). The default is OFF while the nets that decide - the FB example sweep above all - have
 // not been run with it on: this is a register allocator, and the lesson Copy Coalescing and the
 // first REGREUSE flip both taught is that the net that decides is REAL PROGRAMS.
+function FloatPoolTop: Integer;
+// Highest xmm the allocators may hand out. AOT_FPOOL=<n> asks for n registers, xmm2..(n+1).
+//
+// The default is 6 (xmm2..7), the historic pool. Widening it is now POSSIBLE - every float
+// encoding in this unit goes through SseRR/SseMem/SseWRex, which grow a REX prefix for xmm8-15 -
+// and the measurement that made it worth doing is the slope downwards: with 4 xmm instead of 6,
+// floatpoly costs +58% and n-body +9%. The pool is the binding constraint, not the allocation
+// policy: after the REGREUSE merge the peak simultaneously-live float count is 8 on n-body and 19
+// on floatpoly, against the 6 registers there were to give.
+//
+// xmm6-15 are callee-saved on Win64, so each one handed out costs a save/restore pair in the
+// prologue - which is why this is measured per benchmark before the default moves.
+var s: string; n: Integer;
+begin
+  Result := 7;
+  s := GetEnvironmentVariable('AOT_FPOOL');
+  if s = '' then Exit;
+  n := StrToIntDef(s, 6);
+  if (n >= 1) and (n <= 14) then Result := 1 + n;
+end;
+
 function AotLinScanMode: Integer;
 var s: string;
 begin
@@ -810,7 +831,9 @@ var
   NACache: Integer;
   ACacheId, ACacheKind, ACacheReg: array of Integer;   // kind 0 = data base, 1 = count
   SaveGpr: array[R12..R15] of Boolean;
-  SaveX6, SaveX7: Boolean;
+  SaveXmm: array[6..15] of Boolean;     // xmm6-15 are callee-saved on Win64: one 8-byte frame
+                                        // slot each, saved only when the pool actually hands
+                                        // the register out
   BlockOff: array of Integer;           // block index -> native offset
   Fixups: array of TFix;
   NFix: Integer;
@@ -852,7 +875,8 @@ var
   HasHelperCall: Boolean;
   NHelperCalls: Integer;                // helper calls actually emitted (diagnostics)
   FrameSize: Integer;                   // bytes subtracted from rsp after the pushes (0 = leaf)
-  SlotXmm: Integer;                     // [rsp+SlotXmm]   xmm6/xmm7 save area (-1 = none)
+  SlotXmm: Integer;                     // [rsp+SlotXmm]   xmm6..15 save area, 8 bytes per
+                                        // register in ascending order (-1 = none)
   SlotCtxSave: Integer;                 // [rsp+SlotCtxSave] the TAotCtx pointer (r8 is volatile)
   SlotFltSave: Integer;                 // [rsp+SlotFltSave] the FloatRegs base (rsi is volatile in SysV)
   Cur: TSSAInstruction;
@@ -876,7 +900,7 @@ var
   DynFHomeReg: array of Integer;        // region position -> VM float reg defined here that gets a home (-1)
   DynFHomeXmm: array of Integer;        // region position -> the xmm (2..7) assigned to it
   DynFFree: array of array of Integer;  // region position -> VM float regs whose last touch is here
-  DynFCur: array[0..7] of Integer;      // xmm index -> VM float reg currently resident there (-1 free)
+  DynFCur: array[0..15] of Integer;     // xmm index -> VM float reg currently resident there (-1 free)
   DynPos: Integer;                      // running region position during emission
   // Same scheme for integers (c). The GPR pool r9..r15 is shared with the array-descriptor cache,
   // so the dynamic pool is IntPool MINUS the GPRs Allocate handed to array bases/counts; those
@@ -973,6 +997,53 @@ var
   // continue native. Emission-time DynFCur is a faithful map of runtime residency at this
   // position (the schedule is deterministic per linear position), so the emitted stores match
   // exactly what is live in registers here. No-op unless the dynamic allocator is active.
+  { --- SSE encodings that also work for xmm8-15 -----------------------------------------------
+    An SSE instruction is <legacy prefix> [REX] 0F <op> <ModRM>: the REX byte goes AFTER the
+    F2/F3/66 prefix and BEFORE the 0F escape, which is why these cannot be expressed by prepending
+    bytes to the emitter's generic MemOp. When neither register is extended NO REX is emitted, so
+    every encoding this unit produced before comes out byte for byte identical - that is what makes
+    routing the float emitter through here a zero-behaviour change, and what lets the pool grow
+    past xmm7 afterwards. ------------------------------------------------------------------- }
+  procedure SseRR(const Op: array of Byte; RegField, RmReg: Integer);
+  var i, rex: Integer;
+  begin
+    i := 0;
+    while (i < Length(Op)) and ((Op[i] = $F2) or (Op[i] = $F3) or (Op[i] = $66)) do
+    begin E.Emit8(Op[i]); Inc(i); end;
+    rex := 0;
+    if RegField >= 8 then rex := rex or $04;         // REX.R
+    if RmReg    >= 8 then rex := rex or $01;         // REX.B
+    if rex <> 0 then E.Emit8($40 or rex);
+    while i < Length(Op) do begin E.Emit8(Op[i]); Inc(i); end;
+    E.Emit8($C0 or ((RegField and 7) shl 3) or (RmReg and 7));
+  end;
+
+  // The REX.W forms that cross the banks (cvtsi2sd xmm, r64): F2 REX.W[R][B] 0F <op> ModRM.
+  procedure SseWRex(const Op: array of Byte; XmmReg, GprReg: Integer);
+  var rex: Byte;
+  begin
+    rex := $48;
+    if XmmReg >= 8 then rex := rex or $04;
+    if GprReg >= 8 then rex := rex or $01;
+    E.Emit8($F2); E.Emit8(rex); E.Emit8(Op[0]); E.Emit8(Op[1]);
+    E.Emit8($C0 or ((XmmReg and 7) shl 3) or (GprReg and 7));
+  end;
+
+  procedure SseMem(const Op: array of Byte; RegField, BaseReg: Integer; Disp: LongWord);
+  var i, rex: Integer;
+  begin
+    i := 0;
+    while (i < Length(Op)) and ((Op[i] = $F2) or (Op[i] = $F3) or (Op[i] = $66)) do
+    begin E.Emit8(Op[i]); Inc(i); end;
+    rex := 0;
+    if RegField >= 8 then rex := rex or $04;
+    if BaseReg  >= 8 then rex := rex or $01;
+    if rex <> 0 then E.Emit8($40 or rex);
+    while i < Length(Op) do begin E.Emit8(Op[i]); Inc(i); end;
+    E.Emit8($80 or ((RegField and 7) shl 3) or (BaseReg and 7));
+    E.Emit32(Disp);
+  end;
+
   // The four routines below keep the DYNAMIC residency (AOT_DYNF's within-block temps and B1b's
   // interval webs, which share DynFCur/DynICur as their runtime map) in step with the banks
   // wherever a value leaves this code's hands: a runtime helper, a native call, a leaf string
@@ -981,17 +1052,17 @@ var
   var x: Integer;
   begin
     if not (DynFActive or LsActive) then Exit;
-    for x := 2 to 7 do
+    for x := 2 to 15 do
       if DynFCur[x] >= 0 then
-        E.MemOp([$F2, $0F, $11], x, RSI, LongWord(DynFCur[x]) * 8);   // movsd [rsi+reg*8], xmm x
+        SseMem([$F2, $0F, $11], x, RSI, LongWord(DynFCur[x]) * 8);   // movsd [rsi+reg*8], xmm x
   end;
   procedure ReloadResidentF;
   var x: Integer;
   begin
     if not (DynFActive or LsActive) then Exit;
-    for x := 2 to 7 do
+    for x := 2 to 15 do
       if DynFCur[x] >= 0 then
-        E.MemOp([$F2, $0F, $10], x, RSI, LongWord(DynFCur[x]) * 8);   // movsd xmm x, [rsi+reg*8]
+        SseMem([$F2, $0F, $10], x, RSI, LongWord(DynFCur[x]) * 8);   // movsd xmm x, [rsi+reg*8]
   end;
   // AOT_DYNF int counterpart: store / reload the dynamically-resident int temps through the int
   // bank (rbx). Pool GPRs are r9..r15; the store/load helpers bake the right REX for extended regs.
@@ -1148,18 +1219,18 @@ var
       // destination's upper bits. movaps copies all 128 bits, is move-eliminated on Ivy Bridge+
       // (zero uop), and the upper half is never read by any scalar-double op - so the whole
       // xmm0 round-trip a dynamic-allocated op still emits costs nothing.
-      if n <> Wx then E.EmitBytes([$0F, $28, $C0 or (Wx shl 3) or n]);   // movaps Wx, n
+      if n <> Wx then SseRR([$0F, $28], Wx, n);                          // movaps Wx, n
     end
-    else E.MemOp([$F2, $0F, $10], Wx, RSI, LongWord(vmreg) * 8);
+    else SseMem([$F2, $0F, $10], Wx, RSI, LongWord(vmreg) * 8);
   end;
   procedure FOp(const SseOp: array of Byte; Wx, vmreg: Integer);
   var n: Integer;
   begin
     n := FAlloc(vmreg);
     if n >= 0 then
-      E.EmitBytes([SseOp[0], SseOp[1], SseOp[2], $C0 or (Wx shl 3) or n])
+      SseRR([SseOp[0], SseOp[1], SseOp[2]], Wx, n)
     else
-      E.MemOp(SseOp, Wx, RSI, LongWord(vmreg) * 8);
+      SseMem(SseOp, Wx, RSI, LongWord(vmreg) * 8);
   end;
   procedure FStore(vmreg, Wx: Integer);
   var n: Integer;
@@ -1167,9 +1238,9 @@ var
     n := FAlloc(vmreg);
     if n >= 0 then
     begin
-      if n <> Wx then E.EmitBytes([$0F, $28, $C0 or (n shl 3) or Wx]);   // movaps n, Wx (see FLoad)
+      if n <> Wx then SseRR([$0F, $28], n, Wx);                          // movaps n, Wx (see FLoad)
     end
-    else E.MemOp([$F2, $0F, $11], Wx, RSI, LongWord(vmreg) * 8);
+    else SseMem([$F2, $0F, $11], Wx, RSI, LongWord(vmreg) * 8);
   end;
 
   // al holds 0/1 -> dest := TrueVal/0 (dest = current instruction's Dest int reg).
@@ -1285,9 +1356,10 @@ var
     end;
     rex := $48; if Hd >= 8 then rex := rex or $04;                  // REX.R for extended dest GPR
     hs1 := FAlloc(s1);
+    if hs1 >= 8 then rex := rex or $01;                             // REX.B for extended xmm source
     E.Emit8($F2); E.Emit8(rex); E.Emit8(Op2[0]); E.Emit8(Op2[1]);
     if hs1 >= 0 then
-      E.Emit8($C0 or ((Hd and 7) shl 3) or hs1)                     // cvt Hd, xmm_src
+      E.Emit8($C0 or ((Hd and 7) shl 3) or (hs1 and 7))             // cvt Hd, xmm_src
     else
     begin
       E.Emit8($80 or ((Hd and 7) shl 3) or RSI); E.Emit32(LongWord(s1) * 8);   // cvt Hd, [rsi+off]
@@ -1378,7 +1450,9 @@ var
   // which FrameMem's REX-first order cannot express (and xmm0-7 need no REX here anyway).
   procedure FrameXmm(IsStore: Boolean; Wx, disp: Integer);
   begin
-    E.Emit8($F2); E.Emit8($0F);
+    E.Emit8($F2);
+    if Wx >= 8 then E.Emit8($44);                    // REX.R
+    E.Emit8($0F);
     if IsStore then E.Emit8($11) else E.Emit8($10);
     E.Emit8($80 or ((Wx and 7) shl 3) or RSP);
     E.Emit8($24);
@@ -1424,7 +1498,7 @@ var
     for k := 0 to NIAlloc - 1 do
       StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
-      E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+      SseMem([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
     FlushResidentF; FlushResidentI;                             // AOT_DYNF: dynamic temps too
 
     // 2. Arguments, all read from the ctx record BEFORE r8 is clobbered - it is an argument
@@ -1447,7 +1521,7 @@ var
     for k := 0 to NIAlloc - 1 do
       LoadRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
-      E.MemOp([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+      SseMem([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
     ReloadResidentF; ReloadResidentI;                           // AOT_DYNF: dynamic temps too
     ReloadArrayCache;
 
@@ -1474,7 +1548,7 @@ var
     for k := 0 to NIAlloc - 1 do
       StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
-      E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+      SseMem([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
     FlushResidentF; FlushResidentI;                           // AOT_DYNF: dynamic temps too
     // 2. Arguments. Read the primitive address from the ctx BEFORE any argument setup can
     //    clobber r8 (it is arg2 on Win64 and volatile on both ABIs) - the C5 concat lesson.
@@ -1497,7 +1571,7 @@ var
     for k := 0 to NIAlloc - 1 do
       LoadRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
-      E.MemOp([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+      SseMem([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
     ReloadResidentF; ReloadResidentI;                         // AOT_DYNF: dynamic temps too
     ReloadArrayCache;
   end;
@@ -1517,7 +1591,7 @@ var
         StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       if not XmmIsCalleeSaved(FLoc[FAllocd[k]]) then
-        E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+        SseMem([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
     FlushResidentF; FlushResidentI;
   end;
   procedure ReloadVolatiles;
@@ -1528,7 +1602,7 @@ var
         LoadRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       if not XmmIsCalleeSaved(FLoc[FAllocd[k]]) then
-        E.MemOp([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+        SseMem([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
   end;
   // After a native leaf call: restore the base regs the call may have clobbered (r8 ctx, rsi
   // FloatRegs), then the caller-saved allocated registers (rbx is callee-saved and survives).
@@ -2950,8 +3024,11 @@ var
       if IntPool[k] >= R12 then SaveGpr[IntPool[k]] := True;
     end;
     // Floats: most-used first onto xmm2..xmm7.
+    // AOT_FPOOL SHRINKS the pool (probe): the slope of "how much does one xmm less cost" is what
+    // says whether paying for xmm8-15 - which every float encoding would have to grow a REX prefix
+    // for - can buy anything. Never widens; values above 6 are ignored.
     SetLength(Taken, 0); SetLength(Taken, MaxFReg + 1);
-    for k := 2 to 7 do
+    for k := 2 to FloatPoolTop do
     begin
       best := -1; bestUse := 0;
       for r := 0 to MaxFReg do
@@ -2960,8 +3037,7 @@ var
       Taken[best] := True;
       FLoc[best] := k;
       FAllocd[NFAlloc] := best; Inc(NFAlloc);
-      if k = 6 then SaveX6 := True;
-      if k = 7 then SaveX7 := True;
+      if k >= 6 then SaveXmm[k] := True;
     end;
   end;
 
@@ -3056,8 +3132,9 @@ var
     totpos, nbk, bi, kk, pp, r, a, x, xf, mode: Integer;
     Blk: TSSABasicBlock; Ins: TSSAInstruction;
     blkOf, firstDef, firstUse, lastTouch, cand: array of Integer;
-    activeReg: array[2..7] of Integer;
-    ncand: Integer; usedAny, used6, used7, isDef: Boolean;
+    activeReg: array[2..15] of Integer;
+    ncand: Integer; usedAny, isDef: Boolean;
+    usedX: array[6..15] of Boolean;
 
     procedure Note(const V: TSSAValue; pos: Integer; asDef: Boolean);
     var q: Integer;
@@ -3073,7 +3150,9 @@ var
 
   begin
     DynFActive := False;
-    for a := 0 to 7 do DynFCur[a] := -1;
+    // The WHOLE map: the residency scans run to xmm15 now, and an entry left uninitialised there
+    // is a bank index the next flush would happily store an untouched xmm into.
+    for a := 0 to 15 do DynFCur[a] := -1;
     mode := AotDynFloatMode;
     if mode = 2 then Exit;                                     // forced off
     if LsActive then Exit;                                     // B1b ran: it SUBSUMES this pass -
@@ -3118,7 +3197,7 @@ var
     SetLength(DynFHomeReg, totpos); SetLength(DynFHomeXmm, totpos); SetLength(DynFFree, totpos);
     for pp := 0 to totpos - 1 do begin DynFHomeReg[pp] := -1; SetLength(DynFFree[pp], 0); end;
 
-    usedAny := False; used6 := False; used7 := False;
+    usedAny := False; FillChar(usedX, SizeOf(usedX), 0);
     // Pass 2: per-block greedy linear scan over admitted temps.
     for bi := 0 to nbk - 1 do
     begin
@@ -3133,21 +3212,21 @@ var
         while (kk >= 0) and (firstDef[cand[kk]] > firstDef[x]) do begin cand[kk + 1] := cand[kk]; Dec(kk); end;
         cand[kk + 1] := x;
       end;
-      for x := 2 to 7 do activeReg[x] := -1;
+      for x := 2 to FloatPoolTop do activeReg[x] := -1;
       for a := 0 to ncand - 1 do
       begin
         r := cand[a];
-        for x := 2 to 7 do                            // expire intervals that ended before r's def
+        for x := 2 to FloatPoolTop do                 // expire intervals that ended before r's def
           if (activeReg[x] >= 0) and (lastTouch[activeReg[x]] < firstDef[r]) then activeReg[x] := -1;
         xf := -1;
-        for x := 2 to 7 do if activeReg[x] < 0 then begin xf := x; Break; end;
+        for x := 2 to FloatPoolTop do if activeReg[x] < 0 then begin xf := x; Break; end;
         if xf < 0 then System.Continue;               // pool full: r stays in the bank
         activeReg[xf] := r;
         DynFHomeReg[firstDef[r]] := r; DynFHomeXmm[firstDef[r]] := xf;
         SetLength(DynFFree[lastTouch[r]], Length(DynFFree[lastTouch[r]]) + 1);
         DynFFree[lastTouch[r]][High(DynFFree[lastTouch[r]])] := r;
         usedAny := True;
-        if xf = 6 then used6 := True; if xf = 7 then used7 := True;
+        if xf >= 6 then usedX[xf] := True;
       end;
     end;
 
@@ -3155,7 +3234,7 @@ var
     DynFActive := True;
     for r := 0 to MaxFReg do FLoc[r] := -1;            // drop static float homes; go fully dynamic
     NFAlloc := 0;
-    SaveX6 := used6; SaveX7 := used7;
+    for x := 6 to 15 do SaveXmm[x] := usedX[x];
   end;
 
   // (c) Integer counterpart of PlanDynFloat. Identical scheme; the only difference is the pool:
@@ -3460,7 +3539,7 @@ var
 
     for bank := 0 to 1 do
     begin
-      if bank = 0 then np := poolN else np := 6;            // xmm2..7
+      if bank = 0 then np := poolN else np := FloatPoolTop - 1;   // xmm2..FloatPoolTop
       if np <= 0 then System.Continue;
 
       SetLength(ordw, 0); SetLength(ordw, LsNWeb);
@@ -3536,8 +3615,7 @@ var
         PushAt(LsFreeAt, LsWebs[i].PEnd, i);
         if LsWebs[i].Bank = 1 then
         begin
-          if LsWebs[i].Home = 6 then SaveX6 := True;
-          if LsWebs[i].Home = 7 then SaveX7 := True;
+          if LsWebs[i].Home >= 6 then SaveXmm[LsWebs[i].Home] := True;
         end
         else if LsWebs[i].Home >= R12 then SaveGpr[LsWebs[i].Home] := True;
       end;
@@ -3621,7 +3699,7 @@ var
         if (FAlloc(d) >= 0) and (FAlloc(p1) >= 0) then
         begin
           if FAlloc(d) <> FAlloc(p1) then                       // movaps xmm_d, xmm_s (move-eliminated; see FLoad)
-            E.EmitBytes([$0F, $28, $C0 or (FAlloc(d) shl 3) or FAlloc(p1)]);
+            SseRR([$0F, $28], FAlloc(d), FAlloc(p1));
         end
         else
         begin FLoad(XMM0, p1); FStore(d, XMM0); end;
@@ -3679,7 +3757,7 @@ var
         if Hd >= 0 then
         begin
           FLoad(Hd, s1v);                              // Hd <- src1 (movaps; skipped if Hd==src1 home)
-          E.EmitBytes([$66, $0F, $57, $C0 or (Hd shl 3) or 1]);   // xorpd Hd, xmm1 (in place)
+          SseRR([$66, $0F, $57], Hd, 1);                          // xorpd Hd, xmm1 (in place)
         end
         else
         begin
@@ -3718,7 +3796,7 @@ var
         Hd := FAlloc(d);
         ILoad(RAX, IReg(Cur.Src1));
         if Hd >= 0 then
-          E.EmitBytes([$F2, $48, $0F, $2A, $C0 or (Hd shl 3)])   // cvtsi2sd Hd, rax (in place)
+          SseWRex([$0F, $2A], Hd, RAX)                           // cvtsi2sd Hd, rax (in place)
         else
         begin E.EmitBytes([$F2, $48, $0F, $2A, $C0]); FStore(d, XMM0); end;
       end;
@@ -3827,7 +3905,7 @@ var
       begin
         w := CInt(Cur.Src3); if not OK then Exit;
         LoadXferBase(True);
-        E.MemOp([$F2, $0F, $10], XMM0, RDX, LongWord(w) * 8);
+        SseMem([$F2, $0F, $10], XMM0, RDX, LongWord(w) * 8);
         FStore(FReg(Cur.Dest), XMM0);
       end;
       ssaXferStoreInt:
@@ -3842,7 +3920,7 @@ var
         w := CInt(Cur.Src3); if not OK then Exit;
         LoadXferBase(True);
         FLoad(XMM0, FReg(Cur.Src1));
-        E.MemOp([$F2, $0F, $11], XMM0, RDX, LongWord(w) * 8);
+        SseMem([$F2, $0F, $11], XMM0, RDX, LongWord(w) * 8);
       end;
 
       // B3: native call site. The callee entry PC is the resolved label sitting in the
@@ -3924,7 +4002,7 @@ begin
   SetLength(ACacheId, Length(IntPool));
   SetLength(ACacheKind, Length(IntPool));
   SetLength(ACacheReg, Length(IntPool));
-  SaveX6 := False; SaveX7 := False;
+  FillChar(SaveXmm, SizeOf(SaveXmm), 0);
   FillChar(SaveGpr, SizeOf(SaveGpr), 0);
 
   CurOrd := Region.FirstOrdinal;   // Prescan uses its own ordinal; keep for NeedPC in emission
@@ -3944,7 +4022,7 @@ begin
 
   SetLength(ILoc, MaxIReg + 1); for k := 0 to MaxIReg do ILoc[k] := -1;
   SetLength(FLoc, MaxFReg + 1); for k := 0 to MaxFReg do FLoc[k] := -1;
-  SetLength(IAllocd, Length(IntPool)); SetLength(FAllocd, 6);
+  SetLength(IAllocd, Length(IntPool)); SetLength(FAllocd, 14);
   Allocate;
   PlanLinScan;    // AOT_LINSCAN (B1b): may replace the static homes with a per-INTERVAL schedule
   PlanDynFloat;   // AOT_DYNF: may replace the static float homes with a within-block dynamic schedule
@@ -3976,7 +4054,13 @@ begin
     // and enough padding that rsp is 16-byte aligned at the call.
     if HasHelperCall then FrameSize := ABI_SHADOW_SPACE else FrameSize := 0;
     SlotXmm := -1; SlotCtxSave := -1; SlotFltSave := -1;
-    if SaveX6 or SaveX7 then begin SlotXmm := FrameSize; Inc(FrameSize, 16); end;
+    w := 0;
+    for k := 6 to 15 do if SaveXmm[k] then Inc(w);
+    if w > 0 then
+    begin
+      SlotXmm := FrameSize;
+      Inc(FrameSize, ((w * 8) + 15) and not 15);      // keep the frame 16-byte aligned
+    end;
     if HasHelperCall then
     begin
       SlotCtxSave := FrameSize; SlotFltSave := FrameSize + 8; Inc(FrameSize, 16);
@@ -4000,8 +4084,9 @@ begin
     if FrameSize > 0 then
     begin
       E.EmitBytes([$48, $81, $EC]); E.Emit32(LongWord(FrameSize));  // sub rsp, FrameSize
-      if SaveX6 then FrameXmm(True, 6, SlotXmm);
-      if SaveX7 then FrameXmm(True, 7, SlotXmm + 8);
+      w := 0;
+      for k := 6 to 15 do
+        if SaveXmm[k] then begin FrameXmm(True, k, SlotXmm + w * 8); Inc(w); end;
       if HasHelperCall then
       begin
         FrameStore(R8, SlotCtxSave);                 // the ctx pointer: r8 is volatile everywhere
@@ -4012,7 +4097,7 @@ begin
     for k := 0 to NIAlloc - 1 do
       LoadRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
-      E.MemOp([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+      SseMem([$F2, $0F, $10], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
     // Array descriptor cache: base/count of the hot arrays, invariant for the whole
     // invocation (no DIM/REDIM/ERASE in the op set).
     ReloadArrayCache;
@@ -4055,7 +4140,7 @@ begin
               FLoc[LsWebs[w].Reg] := LsWebs[w].Home;
               DynFCur[LsWebs[w].Home] := LsWebs[w].Reg;
               if LsWebs[w].NeedsLoad then
-                E.MemOp([$F2, $0F, $10], LsWebs[w].Home, RSI, LongWord(LsWebs[w].Reg) * 8);
+                SseMem([$F2, $0F, $10], LsWebs[w].Home, RSI, LongWord(LsWebs[w].Reg) * 8);
             end
             else
             begin
@@ -4072,7 +4157,7 @@ begin
             w := LsFreeAt[DynPos][k];
             if not LsWebs[w].StoreEarly then System.Continue;
             if LsWebs[w].Bank = 1 then
-              E.MemOp([$F2, $0F, $11], LsWebs[w].Home, RSI, LongWord(LsWebs[w].Reg) * 8)
+              SseMem([$F2, $0F, $11], LsWebs[w].Home, RSI, LongWord(LsWebs[w].Reg) * 8)
             else
               StoreRegMem(LsWebs[w].Home, LongWord(LsWebs[w].Reg) * 8);
           end;
@@ -4111,7 +4196,7 @@ begin
             if LsWebs[w].Bank = 1 then
             begin
               if LsWebs[w].HasDef and not LsWebs[w].StoreEarly then
-                E.MemOp([$F2, $0F, $11], LsWebs[w].Home, RSI, LongWord(LsWebs[w].Reg) * 8);
+                SseMem([$F2, $0F, $11], LsWebs[w].Home, RSI, LongWord(LsWebs[w].Reg) * 8);
               if DynFCur[LsWebs[w].Home] = LsWebs[w].Reg then DynFCur[LsWebs[w].Home] := -1;
               FLoc[LsWebs[w].Reg] := -1;
             end
@@ -4133,13 +4218,14 @@ begin
     for k := 0 to NIAlloc - 1 do
       StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
-      E.MemOp([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
+      SseMem([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
     // B3 bare epilogue: same teardown, no flush (see the declaration comment).
     BareEpiOff := E.Len;
     if FrameSize > 0 then
     begin
-      if SaveX6 then FrameXmm(False, 6, SlotXmm);
-      if SaveX7 then FrameXmm(False, 7, SlotXmm + 8);
+      w := 0;
+      for k := 6 to 15 do
+        if SaveXmm[k] then begin FrameXmm(False, k, SlotXmm + w * 8); Inc(w); end;
       E.EmitBytes([$48, $81, $C4]); E.Emit32(LongWord(FrameSize));  // add rsp, FrameSize
     end;
     for k := R15 downto R12 do
