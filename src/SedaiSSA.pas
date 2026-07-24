@@ -9728,7 +9728,16 @@ begin
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
 
-    // Body block
+    // Body block. The fall-through edge starts at the block the conditional branch was actually
+    // EMITTED into, which is NOT necessarily CondBlock: an expression can open blocks of its own
+    // (IIf compiles to a branch, so does short-circuit logic), leaving FCurrentBlock somewhere
+    // further down the chain. Wiring the edge to CondBlock instead left the body reachable only
+    // through a spurious edge from the block where the condition STARTED, and the real test block
+    // with no fall-through successor at all - a CFG that is not the program. Liveness computed on
+    // it says the loop variable is dead across the test, which is how the register-reuse merge
+    // came to share one register between the loop variable and a comparison temporary
+    // (control/for-next2 printed -1 forever). Every consumer of this CFG was equally misinformed.
+    CondBlock := FCurrentBlock;
     FCurrentBlock := FProgram.CreateBlock(BodyLabel);
     BodyBlock := FCurrentBlock;
 

@@ -597,8 +597,10 @@ end;
 { === BASIC Variable Allocation Implementation === }
 
 function TLinearScanAllocator.ReuseDiagEnabled: Boolean;
+// =1 reports the summary and the shared colours; =2 adds the per-block liveness dump.
 begin
-  Result := GetEnvironmentVariable('REGREUSE_DIAG') = '1';
+  Result := (GetEnvironmentVariable('REGREUSE_DIAG') = '1') or
+            (GetEnvironmentVariable('REGREUSE_DIAG') = '2');
 end;
 
 function TLinearScanAllocator.ReuseMergeEnabled: Boolean;
@@ -1061,6 +1063,43 @@ begin
       WriteLn('[RegReuse]   string: ', Distinct[srtString], ' distinct -> ', Colours[srtString], ' needed');
       if HasGosub then
         WriteLn('[RegReuse]   NOTE: the program calls -- values live across a call are pinned');
+      // REGREUSE_DIAG=2: per-block liveness dump. A wrong merge is always a liveness that does not
+      // describe the program, and this is what shows WHERE (use/def/in/out per block, plus the
+      // successor edges the fixpoint actually followed).
+      if GetEnvironmentVariable('REGREUSE_DIAG') = '2' then
+        for bi := 0 to NB - 1 do
+        begin
+          Blk := FProgram.Blocks[bi];
+          Write('[RegReuse] b', bi, ' (', Blk.Instructions.Count, ' ins) succ=');
+          for si := 0 to Blk.Successors.Count - 1 do
+            if BlkIdx.TryGetValue(Pointer(TSSABasicBlock(Blk.Successors[si])), sidx) then
+              Write(' b', sidx)
+            else
+              Write(' <UNMAPPED>');
+          Write('  use='); for k := 0 to NKeys - 1 do if BUse[bi][k] then Write(' r', Keys[k].Idx, '_v', Keys[k].Ver);
+          Write('  def='); for k := 0 to NKeys - 1 do if BDef[bi][k] then Write(' r', Keys[k].Idx, '_v', Keys[k].Ver);
+          Write('  in=');  for k := 0 to NKeys - 1 do if BIn[bi][k]  then Write(' r', Keys[k].Idx, '_v', Keys[k].Ver);
+          Write('  out='); for k := 0 to NKeys - 1 do if BOut[bi][k] then Write(' r', Keys[k].Idx, '_v', Keys[k].Ver);
+          WriteLn;
+        end;
+      // Per-key detail: which pre-allocation (bank, index, version) keys ended up SHARING a
+      // colour. Without this the only way to see a wrong merge is to read the disassembly and
+      // guess - and a wrong merge is exactly what this pass must never produce.
+      for Bank := Low(TSSARegisterType) to High(TSSARegisterType) do
+        for si := 0 to Colours[Bank] - 1 do
+        begin
+          kk := 0;
+          for k := 0 to NKeys - 1 do
+            if (Keys[k].Bank = Bank) and (Colour[k] = si) then Inc(kk);
+          if kk > 1 then
+          begin
+            Write('[RegReuse]   ', SSARegisterTypeToString(Bank), ' colour ', si, ' shared by:');
+            for k := 0 to NKeys - 1 do
+              if (Keys[k].Bank = Bank) and (Colour[k] = si) then
+                Write(' r', Keys[k].Idx, '_v', Keys[k].Ver, '(uses=', UseCount[k], ')');
+            WriteLn;
+          end;
+        end;
     end;
 
     for k := 0 to NKeys - 1 do Adj[k].Free;
