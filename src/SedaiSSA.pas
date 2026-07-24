@@ -584,6 +584,7 @@ type
     procedure ProcessStringExprFixedRaw(Node: TASTNode; out Res: TSSAValue);
     procedure EmitFixedLenInit(const Dest: TSSAValue; Cap: Integer; Wide: Boolean);
     function TryRecordCopyAssign(VarNode, ExprNode: TASTNode; const VarName: string): Boolean;
+    function TryLRSetRecord(DstNode, SrcNode: TASTNode): Boolean;   // LSET between two UDT instances
     procedure ProcessArrayStore(Node: TASTNode);
     procedure ProcessPrint(Node: TASTNode);
     procedure ProcessInput(Node: TASTNode);
@@ -9101,6 +9102,75 @@ begin
   AsnNode.Free;
 end;
 
+function TSSAGenerator.TryLRSetRecord(DstNode, SrcNode: TASTNode): Boolean;
+// "LSET dst, src" where BOTH sides are UDT instances (FreeBASIC; RSET has no UDT form - fbc
+// rejects it with "Invalid data types"). fbc overlays the source's storage onto the destination's,
+// truncating when the source is larger and ZERO-FILLING the destination's remainder:
+//
+//   Type T1 : x As Integer : y As Integer : End Type      Dim a As T1, b As T2
+//   Type T2 : z As Integer : End Type                      b.z = 1234 : LSet a, b
+//   -> a.x = 1234, a.y = 0                                 (verified against fbc)
+//
+// fbc defines this on the C BYTE LAYOUT of the two types. Our records are stored as TYPED SLOTS,
+// not as contiguous bytes, so a byte-exact reinterpretation is not expressible here: the copy is
+// POSITIONAL, field i of the source into field i of the destination when the two sit in the same
+// bank, and destination fields with no counterpart are zeroed. That agrees with fbc whenever
+// corresponding fields have the same bank and width - which is the case this statement is used for
+// - and differs only when a type reinterprets bytes across differing field widths.
+//
+// Array and nested-record members are left alone rather than guessed at: overlaying them would
+// mean sharing or fabricating storage, and no FB program in the corpus does this.
+var
+  DstHandle, SrcHandle, Tmp: TSSAValue;
+  DstType, SrcType: string;
+  DstIdx, SrcIdx, i: Integer;
+  DField, SField: TUDTField;
+  LoadOp, StoreOp: TSSAOpCode;
+  Copied: Boolean;
+begin
+  Result := False;
+  if not ResolveRecordObject(DstNode, DstHandle, DstType) then Exit;
+  if not ResolveRecordObject(SrcNode, SrcHandle, SrcType) then Exit;
+  DstIdx := FindUDT(DstType);
+  SrcIdx := FindUDT(SrcType);
+  if (DstIdx < 0) or (SrcIdx < 0) then Exit;
+
+  for i := 0 to High(FUDTs[DstIdx].Fields) do
+  begin
+    DField := FUDTs[DstIdx].Fields[i];
+    if DField.IsArray or (DField.NestedType <> '') then Continue;   // see the note above
+    case DField.Bank of
+      srtInt:    begin LoadOp := ssaRecordLoadInt;    StoreOp := ssaRecordStoreInt;    end;
+      srtFloat:  begin LoadOp := ssaRecordLoadFloat;  StoreOp := ssaRecordStoreFloat;  end;
+      else       begin LoadOp := ssaRecordLoadString; StoreOp := ssaRecordStoreString; end;
+    end;
+    Copied := False;
+    if i <= High(FUDTs[SrcIdx].Fields) then
+    begin
+      SField := FUDTs[SrcIdx].Fields[i];
+      if (SField.Bank = DField.Bank) and (not SField.IsArray) and (SField.NestedType = '') then
+      begin
+        Tmp := MakeSSARegister(DField.Bank, FProgram.AllocRegister(DField.Bank));
+        EmitInstruction(LoadOp, Tmp, SrcHandle, MakeSSAValue(svkNone), MakeSSAConstInt(SField.Slot));
+        EmitInstruction(StoreOp, MakeSSAValue(svkNone), DstHandle, Tmp, MakeSSAConstInt(DField.Slot));
+        Copied := True;
+      end;
+    end;
+    if not Copied then
+    begin
+      // No counterpart in the source: fbc leaves those bytes zeroed.
+      Tmp := MakeSSARegister(DField.Bank, FProgram.AllocRegister(DField.Bank));
+      case DField.Bank of
+        srtInt:   EmitInstruction(ssaLoadConstInt, Tmp, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        srtFloat: EmitInstruction(ssaLoadConstFloat, Tmp, MakeSSAConstFloat(0.0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        else      EmitInstruction(ssaLoadConstString, Tmp, MakeSSAConstString(''), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+      EmitInstruction(StoreOp, MakeSSAValue(svkNone), DstHandle, Tmp, MakeSSAConstInt(DField.Slot));
+    end;
+  end;
+  Result := True;
+end;
+
 procedure TSSAGenerator.ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
 // LSET/RSET dst, src (FreeBASIC/QBasic): justify src into dst's string buffer, preserving dst's
 // current length. src is truncated from the right if longer than the buffer, else padded with
@@ -9129,6 +9199,13 @@ begin
   NoneV := MakeSSAValue(svkNone);
   DstNode := Node.GetChild(0);
   SrcNode := Node.GetChild(1);
+
+  // LSET between two UDT instances is a different statement that happens to share the keyword: it
+  // overlays the source onto the destination's storage instead of justifying a string. Handled
+  // first, because falling through to the string path below converts the record HANDLES with
+  // IntToString and then assigns one handle to the other - which only ever produced the right
+  // answer because the int and string banks happened to hand out matching numbers.
+  if IsLeft and TryLRSetRecord(DstNode, SrcNode) then Exit;
 
   // Read inputs.
   ProcessStringExpression(DstNode, DstVal); DstReg := EnsureStringRegister(DstVal);
