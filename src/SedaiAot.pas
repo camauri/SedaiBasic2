@@ -326,6 +326,36 @@ begin
   if (n >= 1) and (n <= 14) then Result := 1 + n;
 end;
 
+function IntPoolCount(Avail: Integer): Integer;
+// How many of the GPR pool's registers the allocators may hand out. VM int registers and the
+// array-descriptor cache compete for the same set, which is why adding two pays more than the
+// marginal slope suggested: it relieves both. AOT_IPOOL=7 restores the historic r9..r15 pool
+// exactly, which is what makes the measurement an A/B on a single binary.
+//
+// The default is the full pool since 2026-07-25. Interleaved A/B, best-of-5, output compared on
+// every run, both engine profiles, fbc thermometer 193 ms:
+//
+//   bench       --aot  7 -> 9       --aot --jit  7 -> 9
+//   n-body      326 -> 310  -4%     340 -> 315  -7%
+//   intpoly     642 -> 609  -5%     650 -> 615  -5%
+//   sieve       647 -> 626  -3%     653 -> 631  -3%
+//   arraysum    324 -> 315  -2%     331 -> 321  -3%
+//   cvtpoly     537 -> 528  -1%     535 -> 534   0%
+//   strops      549 -> 539  -1%     547 -> 541  -1%
+//   floatpoly   224 -> 224   0%     229 -> 226  -1%
+//   nbody_v7  12257 ->12233  0%     912 -> 905   0%
+//
+// Seven of eight improve, nothing regresses, output bit-identical in all sixteen cells - a broader
+// win than the float pool's, which only moved the two float-bound programs.
+var s: string; n: Integer;
+begin
+  Result := Avail;
+  s := GetEnvironmentVariable('AOT_IPOOL');
+  if s = '' then Exit;
+  n := StrToIntDef(s, Avail);
+  if (n >= 1) and (n <= Avail) then Result := n;
+end;
+
 function AotLinScanMode: Integer;
 var s: string;
 begin
@@ -783,7 +813,13 @@ function AotCompileRegion(SSAProg: TSSAProgram; Prog: TBytecodeProgram;
                           const Region: TAotRegion; TrueVal: Int64;
                           Modern, AllowUnsafe: Boolean; out BailWhy: string): TExecMem;
 const
-  IntPool: array[0..6] of Integer = (R9, R10, R11, R12, R13, R14, R15);
+  // The GPR pool, in the order Allocate hands registers out. r9..r15 first (never callee-saved
+  // except r12-r15, and free of ABI meaning here), then the two the emitter never needed: rdi -
+  // which is ABI_ARG0 on System V, so it thrashes around calls there, and callee-saved on Win64 -
+  // and rbp, which this codegen does not use as a frame pointer (everything is rsp-relative).
+  // Neither can appear as a ModRM BASE here (pool registers are only ever a reg field or a
+  // mod=11 rm), so rbp's disp-less encoding trap never arises.
+  IntPool: array[0..8] of Integer = (R9, R10, R11, R12, R13, R14, R15, RDI, RBP);
 type
   TFix = record PatchOff, TargetBlock: Integer; end;  // TargetBlock -1 = epilogue
   // B1b, the linear-scan model. A RANGE is one contiguous run of linear positions, inside ONE
@@ -846,7 +882,7 @@ var
   // invocation (stable: no DIM/REDIM/ERASE in the op set). Read-only - never flushed.
   NACache: Integer;
   ACacheId, ACacheKind, ACacheReg: array of Integer;   // kind 0 = data base, 1 = count
-  SaveGpr: array[R12..R15] of Boolean;
+  SaveGpr: array[0..15] of Boolean;     // GPRs this region must preserve for ITS caller
   SaveXmm: array[6..15] of Boolean;     // xmm6-15 are callee-saved on Win64: one 8-byte frame
                                         // slot each, saved only when the pool actually hands
                                         // the register out
@@ -3005,7 +3041,7 @@ var
     SetLength(Taken, MaxIReg + 1);
     SetLength(TakenAB, MaxArrId + 1);
     SetLength(TakenAC, MaxArrId + 1);
-    for k := 0 to High(IntPool) do
+    for k := 0 to IntPoolCount(Length(IntPool)) - 1 do
     begin
       best := -1; bestUse := 0; bestKind := -2;
       for r := 0 to MaxIReg do
@@ -3037,7 +3073,7 @@ var
         ACacheReg[NACache] := IntPool[k];
         Inc(NACache);
       end;
-      if IntPool[k] >= R12 then SaveGpr[IntPool[k]] := True;
+      if GprIsCalleeSaved(IntPool[k]) then SaveGpr[IntPool[k]] := True;
     end;
     // Floats: most-used first onto xmm2..xmm7.
     // AOT_FPOOL SHRINKS the pool (probe): the slope of "how much does one xmm less cost" is what
@@ -3288,7 +3324,7 @@ var
 
     // Build the dynamic pool: IntPool GPRs not reserved by the array-descriptor cache.
     SetLength(poolG, Length(IntPool)); np := 0;
-    for a := 0 to High(IntPool) do
+    for a := 0 to IntPoolCount(Length(IntPool)) - 1 do
     begin
       taken := False;
       for kk := 0 to NACache - 1 do if ACacheReg[kk] = IntPool[a] then begin taken := True; Break; end;
@@ -3353,7 +3389,7 @@ var
         SetLength(DynIFree[lastTouch[r]], Length(DynIFree[lastTouch[r]]) + 1);
         DynIFree[lastTouch[r]][High(DynIFree[lastTouch[r]])] := r;
         usedAny := True;
-        if poolG[xf] >= R12 then SaveGpr[poolG[xf]] := True;
+        if GprIsCalleeSaved(poolG[xf]) then SaveGpr[poolG[xf]] := True;
       end;
     end;
 
@@ -3536,7 +3572,7 @@ var
     // (2) The pools. Float is xmm2..7 as always; int is IntPool minus the GPRs Allocate pinned to
     // array descriptors, which stay reserved for the whole invocation.
     SetLength(poolG, Length(IntPool)); poolN := 0;
-    for i := 0 to High(IntPool) do
+    for i := 0 to IntPoolCount(Length(IntPool)) - 1 do
     begin
       taken := False;
       for j := 0 to NACache - 1 do if ACacheReg[j] = IntPool[i] then begin taken := True; Break; end;
@@ -3633,7 +3669,7 @@ var
         begin
           if LsWebs[i].Home >= 6 then SaveXmm[LsWebs[i].Home] := True;
         end
-        else if LsWebs[i].Home >= R12 then SaveGpr[LsWebs[i].Home] := True;
+        else if GprIsCalleeSaved(LsWebs[i].Home) then SaveGpr[LsWebs[i].Home] := True;
       end;
 
     LsActive := True;
@@ -4081,15 +4117,19 @@ begin
     begin
       SlotCtxSave := FrameSize; SlotFltSave := FrameSize + 8; Inc(FrameSize, 16);
       // rsp is 8 (mod 16) on entry and moves by 8 per push; pad so the `call` sees 0.
-      k := 2; for b := R12 to R15 do if SaveGpr[b] then Inc(k);
+      k := 2; for b := 0 to 15 do if SaveGpr[b] then Inc(k);
       Inc(FrameSize, ((8 + 8 * k) - FrameSize) mod 16);
     end;
 
     // Prologue (Win64: rcx=IntRegs rdx=FloatRegs r8=AotCtx; SysV: rdi/rsi/rdx).
     E.Emit8($53);                                    // push rbx
     E.Emit8($56);                                    // push rsi
-    for k := R12 to R15 do
-      if SaveGpr[k] then begin E.Emit8($41); E.Emit8($54 + (k - R12)); end;
+    for k := 0 to 15 do
+      if SaveGpr[k] then
+      begin
+        if k >= 8 then E.Emit8($41);                 // REX.B for r8-r15
+        E.Emit8($50 or (k and 7));                   // push k
+      end;
     {$IFDEF WINDOWS}
     E.EmitBytes([$48, $89, $CB]);                    // mov rbx, rcx
     E.EmitBytes([$48, $89, $D6]);                    // mov rsi, rdx
@@ -4244,8 +4284,12 @@ begin
         if SaveXmm[k] then begin FrameXmm(False, k, SlotXmm + w * 8); Inc(w); end;
       E.EmitBytes([$48, $81, $C4]); E.Emit32(LongWord(FrameSize));  // add rsp, FrameSize
     end;
-    for k := R15 downto R12 do
-      if SaveGpr[k] then begin E.Emit8($41); E.Emit8($5C + (k - R12)); end;
+    for k := 15 downto 0 do
+      if SaveGpr[k] then
+      begin
+        if k >= 8 then E.Emit8($41);
+        E.Emit8($58 or (k and 7));                   // pop k
+      end;
     E.Emit8($5E);                                    // pop rsi
     E.Emit8($5B);                                    // pop rbx
     E.Emit8($C3);                                    // ret
