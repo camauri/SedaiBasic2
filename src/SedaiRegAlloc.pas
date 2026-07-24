@@ -141,6 +141,25 @@ type
     { Run static BASIC variable allocation }
     function RunBASICAllocation: Integer;
 
+    { --- Register REUSE analysis (phase 1: measurement only) -------------------------------
+      The version-aware allocator below gives every (bank, index, version) its OWN number and
+      never reuses a number once its value is dead: on the n-body MAIN that is 247 distinct
+      float registers against a peak of 3 simultaneously live. Everything downstream inherits
+      that count -- the AOT and the JIT can only pin a handful of VM registers in machine
+      registers, so nearly every value round-trips through the bank arrays.
+
+      Merging registers with DISJOINT live ranges is what fixes it, and is exactly what
+      [[copycoal-miscompile]] shows must never be done without real interference analysis:
+      Copy Coalescing replaced a copy's destination with its source program-wide and broke the
+      per-predecessor copies PHI elimination emits. So the analysis comes FIRST, and on its own:
+      this pass computes liveness over the CFG, builds the interference graph and REPORTS what a
+      live-range-aware allocator would save. It changes nothing (byte-identical output) until
+      the numbers say the merge is worth its risk.
+
+      Set REGREUSE_DIAG=1 to print the report; unset it costs one getenv per compilation. ------ }
+    function ReuseDiagEnabled: Boolean;
+    procedure ReportReusePotential;
+
     { Compute usage frequency for all BASIC variables }
     procedure ComputeVariableUsage(out VarList: TObjectList);
 
@@ -571,10 +590,263 @@ end;
 
 { === BASIC Variable Allocation Implementation === }
 
+function TLinearScanAllocator.ReuseDiagEnabled: Boolean;
+begin
+  Result := GetEnvironmentVariable('REGREUSE_DIAG') = '1';
+end;
+
+procedure TLinearScanAllocator.ReportReusePotential;
+// Liveness over the CFG + interference graph + greedy colouring, per bank. Reports how many VM
+// registers a live-range-aware allocator would need where the current one needs one per value.
+// MEASUREMENT ONLY -- nothing here writes to the program.
+//
+// Soundness notes that the eventual merge must honour (recorded here while they are fresh):
+//  * GOSUB: the CFG has no return edge, so liveness ACROSS a GOSUB describes a graph that is not
+//    the program. Any register live across one is reported separately and must never be merged.
+//  * Registers named OUTSIDE the instruction stream -- an array's runtime dimension and lower-bound
+//    registers -- have no visible use, so they are pinned (treated as live everywhere).
+//  * A value with no definition in the function (a parameter, a module global reached through a
+//    call) must be pinned for the same reason: its live-in point is invisible here.
+type
+  TKeyRec = record Bank: TSSARegisterType; Idx, Ver: Integer; end;
+var
+  KeyMap: specialize TDictionary<Int64, Integer>;
+  BlkIdx: specialize TDictionary<Pointer, Integer>;   // block -> its POSITION in the list. The block's
+                                                      // own BlockIndex field is maintained for SSA
+                                                      // construction and is not guaranteed to still
+                                                      // match after the optimization passes ran.
+  Keys: array of TKeyRec;
+  NKeys, NB, bi, ii, si, k, kk, pass, DefKey: Integer;
+  Blk, Succ: TSSABasicBlock;
+  Ins: TSSAInstruction;
+  Changed, HasGosub: Boolean;
+  BUse, BDef, BIn, BOut: array of array of Boolean;   // [block][key]
+  Live: array of Boolean;                             // mid-block live set
+  Pinned: array of Boolean;                           // never merge (see notes above)
+  Adj: array of TFPList;                              // interference graph (key -> neighbour keys)
+  Colour: array of Integer;
+  UsedCol: array of Boolean;
+  Distinct, Colours: array[TSSARegisterType] of Integer;
+  PinnedN, LiveAcrossGosub, sidx: Integer;
+  Bank: TSSARegisterType;
+
+  function KeyOf(const V: TSSAValue): Integer;
+  // Interning: every (bank, index, version) the program mentions gets a dense id. -1 = not a register.
+  var
+    Kk2: Int64;
+  begin
+    Result := -1;
+    if V.Kind <> svkRegister then Exit;
+    Kk2 := RegAllocKey(V.RegType, V.RegIndex, V.Version);
+    if not KeyMap.TryGetValue(Kk2, Result) then
+    begin
+      Result := NKeys;
+      KeyMap.Add(Kk2, Result);
+      if NKeys >= Length(Keys) then SetLength(Keys, NKeys * 2 + 64);
+      Keys[NKeys].Bank := V.RegType; Keys[NKeys].Idx := V.RegIndex; Keys[NKeys].Ver := V.Version;
+      Inc(NKeys);
+    end;
+  end;
+
+  procedure NoteUse(const V: TSSAValue; b: Integer);
+  var q: Integer;
+  begin
+    q := KeyOf(V);
+    if (q >= 0) and (not BDef[b][q]) then BUse[b][q] := True;   // used before any def in this block
+  end;
+
+  procedure NoteDef(const V: TSSAValue; b: Integer);
+  var q: Integer;
+  begin
+    q := KeyOf(V);
+    if q >= 0 then BDef[b][q] := True;
+  end;
+
+  procedure Interfere(a, b2: Integer);
+  begin
+    if (a < 0) or (b2 < 0) or (a = b2) then Exit;
+    if Keys[a].Bank <> Keys[b2].Bank then Exit;      // separate banks never share a number
+    Adj[a].Add(Pointer(PtrInt(b2)));
+    Adj[b2].Add(Pointer(PtrInt(a)));
+  end;
+
+begin
+  NB := FProgram.Blocks.Count;
+  if NB = 0 then Exit;
+  NKeys := 0;
+  SetLength(Keys, 256);
+  KeyMap := specialize TDictionary<Int64, Integer>.Create;
+  BlkIdx := specialize TDictionary<Pointer, Integer>.Create;
+  try
+    for bi := 0 to NB - 1 do
+      BlkIdx.AddOrSetValue(Pointer(FProgram.Blocks[bi]), bi);
+    // Pass 0: intern every register the instruction stream mentions, and collect per-block use/def.
+    // (Two passes over the blocks: the first only to size the bitsets, since interning grows NKeys.)
+    HasGosub := False;
+    for bi := 0 to NB - 1 do
+    begin
+      Blk := FProgram.Blocks[bi];
+      for ii := 0 to Blk.Instructions.Count - 1 do
+      begin
+        Ins := Blk.Instructions[ii];
+        KeyOf(Ins.Dest); KeyOf(Ins.Src1); KeyOf(Ins.Src2); KeyOf(Ins.Src3);
+        for k := 0 to High(Ins.PhiSources) do KeyOf(Ins.PhiSources[k].Value);
+        if (Ins.OpCode = ssaCall) or (Ins.OpCode = ssaReturn) then HasGosub := True;   // GOSUB lowers to ssaCall
+      end;
+    end;
+    if NKeys = 0 then Exit;
+    // Guard: the bitsets are blocks x keys. test_cfg_large is 100k blocks; refuse rather than
+    // allocate gigabytes for a diagnostic.
+    if (Int64(NB) * NKeys) > 40 * 1000 * 1000 then
+    begin
+      WriteLn('[RegReuse] skipped: ', NB, ' blocks x ', NKeys, ' registers is too large to analyse');
+      Exit;
+    end;
+
+    SetLength(BUse, NB); SetLength(BDef, NB); SetLength(BIn, NB); SetLength(BOut, NB);
+    for bi := 0 to NB - 1 do
+    begin
+      SetLength(BUse[bi], NKeys); SetLength(BDef[bi], NKeys);
+      SetLength(BIn[bi], NKeys); SetLength(BOut[bi], NKeys);
+    end;
+    SetLength(Pinned, NKeys); SetLength(Colour, NKeys); SetLength(Live, NKeys);
+    SetLength(Adj, NKeys);
+    for k := 0 to NKeys - 1 do Adj[k] := TFPList.Create;
+
+    for bi := 0 to NB - 1 do
+    begin
+      Blk := FProgram.Blocks[bi];
+      for ii := 0 to Blk.Instructions.Count - 1 do
+      begin
+        Ins := Blk.Instructions[ii];
+        // Reads first, then the write: an instruction that reads and writes the same register
+        // ("r = r + 1") must count the read as a use of the incoming value.
+        NoteUse(Ins.Src1, bi); NoteUse(Ins.Src2, bi); NoteUse(Ins.Src3, bi);
+        // A PHI's operands are live out of the PREDECESSOR, not of this block.
+        for k := 0 to High(Ins.PhiSources) do
+          if (Ins.PhiSources[k].FromBlock <> nil) and BlkIdx.TryGetValue(Pointer(Ins.PhiSources[k].FromBlock), si) then
+            NoteUse(Ins.PhiSources[k].Value, si);
+        if Ins.Dest.Kind = svkRegister then NoteDef(Ins.Dest, bi);
+      end;
+    end;
+
+    // Pin the registers whose liveness this analysis cannot see.
+    PinnedN := 0;
+    for si := 0 to FProgram.GetArrayCount - 1 do
+    begin
+      for k := 0 to High(FProgram.GetArray(si).DimRegisters) do
+        if FProgram.GetArray(si).DimRegisters[k] >= 0 then
+          for kk := 0 to NKeys - 1 do
+            if (Keys[kk].Bank = FProgram.GetArray(si).DimRegTypes[k]) and
+               (Keys[kk].Idx = FProgram.GetArray(si).DimRegisters[k]) then Pinned[kk] := True;
+      for k := 0 to High(FProgram.GetArray(si).LowerBoundRegisters) do
+        if FProgram.GetArray(si).LowerBoundRegisters[k] >= 0 then
+          for kk := 0 to NKeys - 1 do
+            if (Keys[kk].Bank = srtInt) and (Keys[kk].Idx = FProgram.GetArray(si).LowerBoundRegisters[k]) then
+              Pinned[kk] := True;
+    end;
+
+    // Backward dataflow to a fixpoint: out(B) = U in(S) for S in succ(B); in(B) = use(B) + (out(B) - def(B)).
+    pass := 0;
+    repeat
+      Changed := False;
+      Inc(pass);
+      for bi := NB - 1 downto 0 do
+      begin
+        Blk := FProgram.Blocks[bi];
+        for si := 0 to Blk.Successors.Count - 1 do
+        begin
+          Succ := TSSABasicBlock(Blk.Successors[si]);
+          if not BlkIdx.TryGetValue(Pointer(Succ), sidx) then Continue;
+          for k := 0 to NKeys - 1 do
+            if BIn[sidx][k] and (not BOut[bi][k]) then
+            begin BOut[bi][k] := True; Changed := True; end;
+        end;
+        for k := 0 to NKeys - 1 do
+          if (BUse[bi][k] or (BOut[bi][k] and (not BDef[bi][k]))) and (not BIn[bi][k]) then
+          begin BIn[bi][k] := True; Changed := True; end;
+      end;
+    until (not Changed) or (pass > 200);
+
+    // Interference: walk each block backwards from its live-out set. At a definition, the value
+    // being defined interferes with everything else live at that point.
+    LiveAcrossGosub := 0;
+    for bi := 0 to NB - 1 do
+    begin
+      Blk := FProgram.Blocks[bi];
+      for k := 0 to NKeys - 1 do Live[k] := BOut[bi][k];
+      for ii := Blk.Instructions.Count - 1 downto 0 do
+      begin
+        Ins := Blk.Instructions[ii];
+        DefKey := -1;
+        if Ins.Dest.Kind = svkRegister then DefKey := KeyOf(Ins.Dest);
+        if DefKey >= 0 then
+        begin
+          for k := 0 to NKeys - 1 do
+            if Live[k] then Interfere(DefKey, k);
+          Live[DefKey] := False;
+        end;
+        // A value live across a GOSUB is live over an edge the CFG does not have: never merge it.
+        if (Ins.OpCode = ssaCall) or (Ins.OpCode = ssaReturn) then
+          for k := 0 to NKeys - 1 do
+            if Live[k] and (not Pinned[k]) then
+            begin Pinned[k] := True; Inc(LiveAcrossGosub); end;
+        k := KeyOf(Ins.Src1); if k >= 0 then Live[k] := True;
+        k := KeyOf(Ins.Src2); if k >= 0 then Live[k] := True;
+        k := KeyOf(Ins.Src3); if k >= 0 then Live[k] := True;
+      end;
+    end;
+    for k := 0 to NKeys - 1 do if Pinned[k] then Inc(PinnedN);
+
+    // Greedy colouring per bank, pinned registers first (each takes a colour of its own).
+    for k := 0 to NKeys - 1 do Colour[k] := -1;
+    for Bank := Low(TSSARegisterType) to High(TSSARegisterType) do
+    begin Distinct[Bank] := 0; Colours[Bank] := 0; end;
+    SetLength(UsedCol, NKeys + 1);
+    for k := 0 to NKeys - 1 do
+    begin
+      Inc(Distinct[Keys[k].Bank]);
+      if Pinned[k] then
+      begin
+        Colour[k] := Colours[Keys[k].Bank];
+        Inc(Colours[Keys[k].Bank]);
+        Continue;
+      end;
+      for kk := 0 to NKeys do UsedCol[kk] := False;
+      for kk := 0 to Adj[k].Count - 1 do
+      begin
+        si := PtrInt(Adj[k][kk]);
+        if (Colour[si] >= 0) and (Colour[si] <= NKeys) then UsedCol[Colour[si]] := True;
+      end;
+      si := 0;
+      while (si <= NKeys) and UsedCol[si] do Inc(si);
+      Colour[k] := si;
+      if si + 1 > Colours[Keys[k].Bank] then Colours[Keys[k].Bank] := si + 1;
+    end;
+
+    WriteLn('[RegReuse] blocks=', NB, ' registers=', NKeys, ' fixpoint passes=', pass,
+            ' pinned=', PinnedN, ' (live across GOSUB: ', LiveAcrossGosub, ')',
+            {$IFDEF DEBUG_REGALLOC}'' {$ELSE}'' {$ENDIF});
+    WriteLn('[RegReuse]   int   : ', Distinct[srtInt], ' distinct -> ', Colours[srtInt], ' needed');
+    WriteLn('[RegReuse]   float : ', Distinct[srtFloat], ' distinct -> ', Colours[srtFloat], ' needed');
+    WriteLn('[RegReuse]   string: ', Distinct[srtString], ' distinct -> ', Colours[srtString], ' needed');
+    if HasGosub then
+      WriteLn('[RegReuse]   NOTE: the program uses GOSUB -- values live across one are pinned');
+
+    for k := 0 to NKeys - 1 do Adj[k].Free;
+  finally
+    KeyMap.Free;
+    BlkIdx.Free;
+  end;
+end;
+
 function TLinearScanAllocator.RunBASICAllocation: Integer;
 var
   VarList: TObjectList;
 begin
+  if ReuseDiagEnabled then
+    ReportReusePotential;
+
   {$IFDEF DEBUG_REGALLOC}
   if DebugRegAlloc then
     WriteLn('[RegAlloc] Computing BASIC variable usage statistics...');
