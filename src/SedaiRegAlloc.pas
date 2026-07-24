@@ -607,22 +607,27 @@ function TLinearScanAllocator.ReuseMergeEnabled: Boolean;
 // Tri-state gate, the same shape AOT_DYNF uses: REGREUSE=1 forces the merge on, =0 forces it off,
 // unset takes the default.
 //
-// ⛔ The default is OFF: flipping it was ATTEMPTED on 2026-07-24 and REVERTED the same session,
-// because the FreeBASIC example sweep - the only net that runs real third-party programs - found
-// a REAL miscompile that every other net missed (corpus 496/496, AOT/JIT/combined 0 mismatch each,
-// basc sweep 730/2/0 were ALL green with the merge on):
+// The default is ON since 2026-07-24. Flipping it was attempted, REVERTED the same day, and then
+// re-done once the two things the revert exposed were understood - neither of which was a defect
+// of the merge:
 //
-//   * control/for-next2 hangs printing -1 forever. -1 is TRUE, so a comparison's result is being
-//     printed where the loop variable should be: the merge gave one register to two values whose
-//     live ranges overlap. That is a defect of the interference analysis itself, not of the
-//     program - it must be understood before the gate moves.
-//   * strings/lset-udt prints 0 instead of 1234. That one is a PRE-EXISTING bug the merge merely
-//     reveals (LSet on a UDT is lowered through the string path and only worked because the int
-//     and string banks happened to be numbered in parallel), same shape as the KEY bug.
+//   * control/for-next2 hung printing -1 (TRUE) forever: a comparison's result reaching PRINT where
+//     the loop variable belonged. The CAUSE was a malformed CFG - a top-tested DO whose condition
+//     opens blocks of its own (IIf) wired its body edge to the block the condition STARTED in
+//     rather than the one the branch was emitted into. Liveness then read a graph that was not the
+//     program and called the loop variable dead across the test. Fixed in ProcessDoLoop; every
+//     other consumer of that CFG (LICM, DCE, GVN, range analysis) had been misinformed too.
+//   * strings/lset-udt printed 0 instead of 1234: LSET on a UDT was not implemented and fell
+//     through to the STRING path, which only ever worked because the int and string banks happened
+//     to hand out matching register numbers. The merge destroys that coincidence. Implemented.
 //
-// The performance case for flipping is strong and stands (measured best-of-N, interleaved A/B on
-// one binary, output bit-identical, fbc thermometer ~200 ms) - which is exactly why the blocker is
-// recorded here rather than the numbers alone:
+// Only after both were closed does the FB example sweep - the net that runs real third-party
+// programs, and the one that rejected the first attempt - return the SAME counts and the SAME diff
+// list with the merge on as with it off.
+//
+// The performance case (measured best-of-N, interleaved A/B on one binary, output bit-identical,
+// fbc thermometer ~200 ms). The merge is not an AOT affair: it shrinks the register BANKS, so
+// every profile pays less traffic, the interpreter included:
 //
 //   interpreter  n-body -5%   arraysum -19%   sieve  -9%
 //   --jit        n-body -11%  arraysum -26%   sieve  -4%
@@ -631,12 +636,18 @@ function TLinearScanAllocator.ReuseMergeEnabled: Boolean;
 //
 // The losses are intpoly (+12%) and, marginally, cvtpoly (+6%) and strops (+3%) - integer-heavy
 // loops whose post-merge pressure still exceeds the 7 usable GPRs, where merging only lengthens
-// live ranges. Nobody has a per-region rule for that yet (see the note in RunBASICAllocation).
+// live ranges. Nobody has a per-region rule for that yet (see the note in RunBASICAllocation), and
+// with the wins reaching -30% the flat default is worth its three regressions.
 //
-// ⚠️ LESSON, the same one Copy Coalescing taught: for a register allocator the net that decides is
-// REAL PROGRAMS. Every in-house net was green.
+// REGREUSE=0 restores the historic one-number-per-value allocation exactly, which is what makes
+// every measurement above an A/B on a single binary.
+//
+// ⚠️ LESSON, the same one Copy Coalescing taught, and the reason this gate moved only on the second
+// attempt: for a register allocator the net that decides is REAL PROGRAMS. When the first attempt
+// was reverted, corpus 496/496, AOT 0/700, JIT 0/706, combined 0/700 and basc 730/2/0 were ALL
+// green with the merge on.
 begin
-  Result := GetEnvironmentVariable('REGREUSE') = '1';
+  Result := GetEnvironmentVariable('REGREUSE') <> '0';
 end;
 
 function OpIsMergeSafe(Op: TSSAOpCode): Boolean;
