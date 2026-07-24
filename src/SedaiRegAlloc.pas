@@ -805,7 +805,11 @@ begin
     // allocate gigabytes for a diagnostic.
     if (Int64(NB) * NKeys) > 40 * 1000 * 1000 then
     begin
-      WriteLn('[RegReuse] skipped: ', NB, ' blocks x ', NKeys, ' registers is too large to analyse');
+      // Gated: this used to print unconditionally, so an enormous program (test_cfg_large) emitted a
+      // line on the source run that the .basc run -- which never allocates -- could not emit, and the
+      // round-trip sweep reported a DIFF that was the diagnostic talking, not the program.
+      if Report then
+        WriteLn('[RegReuse] skipped: ', NB, ' blocks x ', NKeys, ' registers is too large to analyse');
       Exit;
     end;
 
