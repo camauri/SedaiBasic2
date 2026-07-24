@@ -3657,6 +3657,14 @@ var
     for i := 0 to LsNWeb - 1 do
       if (WebMap[i] = i) and (LsWebs[i].Home >= 0) then
       begin
+        // LS_NOWB=1: UNSOUND PROBE, and the only way to price the work that would make it sound.
+        // It drops every write-back, which is what a perfect oracle for "this value is a pure
+        // temporary, dead for good after its last use" would let the allocator do. What it cannot
+        // tell apart is the value that OUTLIVES the region - and that distinction cannot be
+        // invented here: the AOT's liveness treats an out-of-region successor as "nothing is
+        // live", so it writes everything back out of prudence. The information has to come from
+        // the SSA. This flag measures what buying it would be worth.
+        if GetEnvironmentVariable('LS_NOWB') = '1' then LsWebs[i].HasDef := False;
         LsWebs[i].StoreEarly := LsWebs[i].HasDef and EndsOnTerminator(LsWebs[i].PEnd);
         if GetEnvironmentVariable('LS_DUMP') = '1' then
           WriteLn(ErrOutput, Format('[LS] web %d bank=%d reg=%d [%d..%d] home=%d load=%s def=%s w=%d uncov=%d@%d nr=%d',
