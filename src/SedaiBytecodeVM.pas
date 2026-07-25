@@ -193,6 +193,10 @@ type
     FProcWidthInt: array of Int64;
     FProcWidthFloat: array of Int64;
     FProcWidthStr: array of Int64;
+    // Per CALL SITE (indexed by the bcCallSub's own PC), the integer registers this caller still
+    // needs when the callee returns, packed the same way; -1 = not analysed, no caller-side
+    // narrowing. Intersected with the callee footprint above: only registers in BOTH need saving.
+    FCallLiveInt: array of Int64;
     // Array descriptor table passed to compiled loops: 3 Int64 per array (IntData ptr, FloatData ptr,
     // Count). Rebuilt from FArrays only when the array set changes (FArraysDirty), so the per-call cost
     // is a single pointer once the arrays are DIM'd.
@@ -388,9 +392,10 @@ type
     // bcCallSub: snapshot the registers the callee at TargetPC can touch (-1 = unknown target,
     // e.g. an indirect call: falls back to the program-wide width). bcReturnSub restores exactly
     // what was pushed, reading the width back off the frame-width stack.
-    procedure FramePush(Ctx: TExecutionContext; TargetPC: Integer = -1);
+    procedure FramePush(Ctx: TExecutionContext; TargetPC: Integer = -1; CallPC: Integer = -1);
     procedure FramePop(Ctx: TExecutionContext);
     procedure BuildProcFrameWidths;
+    procedure BuildCallSiteLiveness;
     procedure GrowCallStackIfNeeded(Ctx: TExecutionContext); inline;  // auto-grow return-addr stack (deep recursion)
     // M5.2 OS threading: spawn/join workers running their own TExecutionContext over the shared
     // program/heap (FreeBASIC shared-memory model). SetupWorkerContext sizes a fresh context's banks;
@@ -1674,6 +1679,9 @@ var
   // the range computable, and the block move exists to keep the range's index arithmetic from
   // eating what the range saves.
   GFrameRangeNarrow: Integer = 1;
+  // FRAMELIVE=0 drops the caller-side half: the snapshot is then whatever the callee can touch,
+  // without asking whether this caller still needs it.
+  GFrameLiveNarrow: Integer = 1;
 
 function BcTouchesOnlyIntBank(Op: Word): Boolean;
 begin
@@ -1709,9 +1717,8 @@ const
   IW_DEST    = 1;   // writes Ctx.IntRegs[Dest], nothing else in the bank
   IW_NONE    = 2;   // writes no integer register at all
 
-function BcIntWriteShape(Op: Word): Integer;
+function BcIntWriteShapeRaw(Op: Word): Integer;
 begin
-  if GFrameRangeNarrow <> 1 then Exit(IW_UNKNOWN);
   case Op of
     bcLoadConstInt, bcCopyInt,
     bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
@@ -1728,6 +1735,39 @@ begin
       Result := IW_NONE;
   else
     Result := IW_UNKNOWN;
+  end;
+end;
+
+function BcIntWriteShape(Op: Word): Integer;   // gated view, used by the width/base scan
+begin
+  if GFrameRangeNarrow <> 1 then Result := IW_UNKNOWN else Result := BcIntWriteShapeRaw(Op);
+end;
+
+{ Which Src fields an opcode READS from the integer bank - the read-side twin of BcIntWriteShape,
+  and the one whose polarity is dangerous. Everywhere else in this file an opcode missing from a list
+  costs a missed narrowing; here, declaring an operand absent when the opcode really reads it would
+  let the liveness below call a register dead while its value is still needed, which is a silent
+  miscompile. Every member below is checked against its interpreter implementation, and an opcode
+  that is not listed makes its whole procedure ineligible rather than being guessed at. }
+const
+  US_UNKNOWN = -1;
+  US_NONE    = 0;
+  US_SRC1    = 1;
+  US_SRC2    = 2;
+
+function BcIntUseShape(Op: Word): Integer;
+begin
+  case Op of
+    bcLoadConstInt, bcXferLoadInt, bcJump, bcNop, bcCallSub, bcReturnSub:
+      Result := US_NONE;
+    bcCopyInt, bcNegInt, bcBitwiseNot, bcXferStoreInt, bcJumpIfZero, bcJumpIfNotZero:
+      Result := US_SRC1;
+    bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt,
+    bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
+    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr:
+      Result := US_SRC1 or US_SRC2;
+  else
+    Result := US_UNKNOWN;
   end;
 end;
 
@@ -1901,10 +1941,157 @@ begin
   end;
 end;
 
+procedure TBytecodeVM.BuildCallSiteLiveness;
+// What a call has to protect is not what the callee can WRITE - it is what the CALLER still needs
+// afterwards. This computes, per call site, the integer registers live ACROSS the call (backward
+// liveness over the calling procedure's own instruction range) and publishes the range; FramePush
+// intersects it with the callee footprint from BuildProcFrameWidths, and the intersection is what
+// gets copied. On naive recursive Fibonacci the callee footprint is ten registers and the live-across
+// set is ONE: everything else the callee writes, the caller has already finished with.
+//
+// The two sets answer genuinely different questions, and only their intersection has to be saved:
+// a register the callee never writes keeps the caller's value anyway, and a register the caller
+// never reads again may be left in whatever state the callee leaves it.
+//
+// Deliberately restricted to procedures where EVERY instruction has an audited operand shape and
+// known control flow. Unlike the width computation - where an unaudited opcode merely costs a missed
+// narrowing - liveness must see every READ to be sound, so an unaudited opcode disqualifies its
+// whole procedure rather than being guessed at. That currently means integer procedures; anything
+// with a float, string, array or I/O opcode keeps the callee-footprint behaviour.
+var
+  NProc, NInstr, p, i, k, w, Words, RegCount, Lo, Hi, Tgt, PcStart, PcEnd, Rounds: Integer;
+  Instr: TBytecodeInstruction;
+  Op: Word;
+  Live: array of QWord;      // LiveIn per instruction, (i - PcStart) * Words + w
+  Out_: array of QWord;      // scratch: LiveOut of the instruction being processed
+  Eligible: Boolean;
+  Changed: Boolean;
+  Def, Use1, Use2, Shape, UShape: Integer;
+  Bit: QWord;
+
+  procedure SetBit(var A: array of QWord; Base, Reg: Integer);
+  begin
+    if (Reg < 0) or (Reg >= RegCount) then Exit;
+    A[Base + (Reg shr 6)] := A[Base + (Reg shr 6)] or (QWord(1) shl (Reg and 63));
+  end;
+
+begin
+  SetLength(FCallLiveInt, 0);
+  if (FProgram = nil) or (GFrameLiveNarrow <> 1) then Exit;
+  NInstr := FProgram.GetInstructionCount;
+  NProc := FProgram.GetProcMapCount;
+  if (NInstr = 0) or (NProc = 0) then Exit;
+  SetLength(FCallLiveInt, NInstr);
+  for i := 0 to NInstr - 1 do FCallLiveInt[i] := -1;
+
+  for p := 0 to NProc - 1 do
+  begin
+    PcStart := FProgram.GetProcMapStart(p);
+    if PcStart < 0 then System.Continue;
+    if p + 1 < NProc then PcEnd := FProgram.GetProcMapStart(p + 1) - 1 else PcEnd := NInstr - 1;
+    if PcEnd >= NInstr then PcEnd := NInstr - 1;
+    if PcEnd < PcStart then System.Continue;
+
+    // Eligibility and register bound in one scan: every opcode audited on both sides, every branch
+    // target inside this procedure, and no path falling out of its last instruction.
+    Eligible := True;
+    RegCount := 0;
+    for i := PcStart to PcEnd do
+    begin
+      Instr := FProgram.GetInstruction(i);
+      Op := Instr.OpCode;
+      if (BcIntWriteShapeRaw(Op) = IW_UNKNOWN) or (BcIntUseShape(Op) = US_UNKNOWN) then
+      begin Eligible := False; Break; end;
+      if (Op = Ord(bcJump)) or (Op = Ord(bcJumpIfZero)) or (Op = Ord(bcJumpIfNotZero)) then
+      begin
+        Tgt := Instr.Immediate;
+        if (Tgt < PcStart) or (Tgt > PcEnd) then begin Eligible := False; Break; end;
+      end;
+      if (i = PcEnd) and (Op <> Ord(bcReturnSub)) and (Op <> Ord(bcJump)) then
+      begin Eligible := False; Break; end;   // falls out of the range: successors unknown
+      if Instr.Dest + 1 > RegCount then RegCount := Instr.Dest + 1;
+      if Instr.Src1 + 1 > RegCount then RegCount := Instr.Src1 + 1;
+      if Instr.Src2 + 1 > RegCount then RegCount := Instr.Src2 + 1;
+    end;
+    if not Eligible or (RegCount <= 0) then System.Continue;
+
+    Words := (RegCount + 63) div 64;
+    SetLength(Live, (PcEnd - PcStart + 1) * Words);
+    for k := 0 to Length(Live) - 1 do Live[k] := 0;
+    SetLength(Out_, Words);
+
+    // Backward fixpoint. LiveIn = (LiveOut - Def) + Use; LiveOut = union of the successors' LiveIn.
+    // Iterating backwards converges in a couple of rounds on structured code; the cap is a backstop.
+    Rounds := 0;
+    repeat
+      Changed := False;
+      Inc(Rounds);
+      for i := PcEnd downto PcStart do
+      begin
+        Instr := FProgram.GetInstruction(i);
+        Op := Instr.OpCode;
+        for w := 0 to Words - 1 do Out_[w] := 0;
+        // Successors: the branch target, the fall-through, or neither for a return.
+        if (Op = Ord(bcJump)) then
+        begin
+          for w := 0 to Words - 1 do Out_[w] := Live[(Instr.Immediate - PcStart) * Words + w];
+        end
+        else if (Op = Ord(bcJumpIfZero)) or (Op = Ord(bcJumpIfNotZero)) then
+        begin
+          for w := 0 to Words - 1 do
+            Out_[w] := Live[(Instr.Immediate - PcStart) * Words + w] or
+                       Live[(i + 1 - PcStart) * Words + w];
+        end
+        else if Op <> Ord(bcReturnSub) then
+          for w := 0 to Words - 1 do Out_[w] := Live[(i + 1 - PcStart) * Words + w];
+
+        // A call site's live-OUT is what this frame still needs when the callee returns: publish it
+        // before Def/Use turn it into the instruction's live-IN.
+        if Op = Ord(bcCallSub) then
+        begin
+          Lo := -1; Hi := -1;
+          for k := 0 to RegCount - 1 do
+          begin
+            Bit := Out_[k shr 6] shr (k and 63);
+            if (Bit and 1) <> 0 then
+            begin
+              if Lo < 0 then Lo := k;
+              Hi := k;
+            end;
+          end;
+          if Lo < 0 then FCallLiveInt[i] := 0                       // nothing live: save nothing
+          else FCallLiveInt[i] := (Int64(Hi + 1) shl 32) or Int64(Lo);
+        end;
+
+        Shape := BcIntWriteShapeRaw(Op);
+        UShape := BcIntUseShape(Op);
+        Def := -1; Use1 := -1; Use2 := -1;
+        if Shape = IW_DEST then Def := Instr.Dest;
+        if (UShape and US_SRC1) <> 0 then Use1 := Instr.Src1;
+        if (UShape and US_SRC2) <> 0 then Use2 := Instr.Src2;
+        if (Def >= 0) and (Def < RegCount) then
+          Out_[Def shr 6] := Out_[Def shr 6] and not (QWord(1) shl (Def and 63));
+        SetBit(Out_, 0, Use1);
+        SetBit(Out_, 0, Use2);
+        for w := 0 to Words - 1 do
+          if Live[(i - PcStart) * Words + w] <> Out_[w] then
+          begin
+            Live[(i - PcStart) * Words + w] := Out_[w];
+            Changed := True;
+          end;
+      end;
+    until (not Changed) or (Rounds > 64);
+    // A fixpoint that did not settle publishes nothing: the entries stay -1 and the call sites keep
+    // the callee-footprint behaviour.
+    if Rounds > 64 then
+      for i := PcStart to PcEnd do FCallLiveInt[i] := -1;
+  end;
+end;
+
 var
   GFrameSaveNoStr: Integer = 0;   // measurement probe, set from FRAMESAVE_NOSTR at startup
 
-procedure TBytecodeVM.FramePush(Ctx: TExecutionContext; TargetPC: Integer);
+procedure TBytecodeVM.FramePush(Ctx: TExecutionContext; TargetPC: Integer; CallPC: Integer);
 // Snapshot the live part of each register bank onto the flat per-bank save stacks (one frame).
 // The saved width is Ctx.FrameSave*Count (the highest register index the program's bytecode
 // mentions, +1) rather than the whole 256-slot-floor bank: registers above that are never read
@@ -1945,6 +2132,19 @@ begin
     PW := FProcWidthStr[TargetPC];
     if PW shr 32 < NS then NS := PW shr 32;
     BS := PW and $FFFFFFFF; if BS > NS then BS := NS;
+  end;
+  // Caller side: intersect with what THIS call site still needs afterwards. Sound for an unknown
+  // callee too - a register the caller never reads again needs no protection whatever the callee
+  // does with it - but only computed for procedures whose every opcode is audited.
+  if (CallPC >= 0) and (CallPC < Length(FCallLiveInt)) then
+  begin
+    PW := FCallLiveInt[CallPC];
+    if PW >= 0 then
+    begin
+      if PW shr 32 < NI then NI := PW shr 32;
+      if (PW and $FFFFFFFF) > BI then BI := PW and $FFFFFFFF;
+      if BI > NI then BI := NI;              // nothing live across: the range is empty
+    end;
   end;
   // Grow save stacks if needed (defensive; usually sized once).
   if Ctx.FrameSaveIntTop + (NI - BI) > Length(Ctx.FrameSaveInt) then
@@ -4323,9 +4523,11 @@ begin
   // Any failure here is not fatal - the empty tables simply mean "program-wide width everywhere".
   try
     BuildProcFrameWidths;
+    BuildCallSiteLiveness;   // ...and again by what each CALL SITE still needs after the call
   except
     SetLength(FProcWidthInt, 0); SetLength(FProcWidthFloat, 0); SetLength(FProcWidthStr, 0);
-    end;
+    SetLength(FCallLiveInt, 0);
+  end;
 end;
 
 procedure TBytecodeVM.ClearProgram;
@@ -4818,7 +5020,7 @@ begin
     // register banks so the callee has its own locals and recursion works.
     bcCallSub:
       begin
-        FramePush(Ctx, Instr.Immediate);   // narrow the snapshot to what this callee can clobber
+        FramePush(Ctx, Instr.Immediate, Ctx.PC);   // narrowed by callee footprint AND caller liveness
         GrowCallStackIfNeeded(Ctx);
         Ctx.CallStack[Ctx.CallStackPtr] := Ctx.PC;
         Inc(Ctx.CallStackPtr);
@@ -4833,7 +5035,7 @@ begin
           Ctx.XferFloat[255] := ComputeBuiltinFP(HandleNum64 and $FF, Ctx.XferFloat[0])   // 255 = XFER_RESULT_SLOT
         else
         begin
-          FramePush(Ctx, HandleNum64);   // indirect: the entry PC is the register value
+          FramePush(Ctx, HandleNum64, Ctx.PC);   // indirect: the entry PC is the register value
           GrowCallStackIfNeeded(Ctx);
           Ctx.CallStack[Ctx.CallStackPtr] := Ctx.PC;
           Inc(Ctx.CallStackPtr);
@@ -6258,7 +6460,7 @@ begin
     Exit(BcCallSubPC);
   SI := C.FrameSaveIntTop; SF := C.FrameSaveFloatTop; SS := C.FrameSaveStrTop;
   try
-    VM.FramePush(C, Integer(CalleeEntryPC));
+    VM.FramePush(C, Integer(CalleeEntryPC), Integer(BcCallSubPC));
     VM.GrowCallStackIfNeeded(C);
     C.CallStack[C.CallStackPtr] := Integer(BcCallSubPC) + 1;
     Inc(C.CallStackPtr);
@@ -11224,6 +11426,7 @@ initialization
   if GetEnvironmentVariable('FRAMESAVE_NOSTR') = '1' then GFrameSaveNoStr := 1;
   if GetEnvironmentVariable('FRAMEBANK') = '0' then GFrameBankNarrow := 0;
   if GetEnvironmentVariable('FRAMERANGE') = '0' then GFrameRangeNarrow := 0;
+  if GetEnvironmentVariable('FRAMELIVE') = '0' then GFrameLiveNarrow := 0;
 
 finalization
   AotCallProfReport;
