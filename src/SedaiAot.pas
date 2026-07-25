@@ -3658,6 +3658,10 @@ var
       if (WebMap[i] = i) and (LsWebs[i].Home >= 0) then
       begin
         // LS_NOWB=1: UNSOUND PROBE, and the only way to price the work that would make it sound.
+        // ⚠️ Being unsound is not theoretical - on intpoly it MISCOMPILES, so that benchmark's
+        // "ceiling" is not a measurement at all. Check the output of every cell before reading a
+        // number out of this flag; the first table taken with it did not, and reported a 15% win
+        // on a program that was computing something else.
         // It drops every write-back, which is what a perfect oracle for "this value is a pure
         // temporary, dead for good after its last use" would let the allocator do. What it cannot
         // tell apart is the value that OUTLIVES the region - and that distinction cannot be
