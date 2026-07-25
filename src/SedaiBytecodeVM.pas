@@ -184,9 +184,15 @@ type
     FNativeFuncs: array of TExecMem;
     // Per-procedure frame-clobber widths, indexed by procedure entry PC (built by
     // BuildProcFrameWidths in LoadProgram). Length 0 = not built -> program-wide width.
-    FProcWidthInt: array of Integer;
-    FProcWidthFloat: array of Integer;
-    FProcWidthStr: array of Integer;
+    // Each entry packs BOTH ends of the range the callee can touch, (width shl 32) or base, with -1
+    // for "unknown - use the program-wide width". The banks are shared by the whole program and a
+    // procedure's registers are numbered above its caller's, so the part worth saving is a RANGE:
+    // starting at 0 copies registers the callee provably cannot reach. Packed rather than kept in
+    // three more arrays because FramePush is hot enough that three extra loads per call cost more
+    // than the copies the narrower range saves.
+    FProcWidthInt: array of Int64;
+    FProcWidthFloat: array of Int64;
+    FProcWidthStr: array of Int64;
     // Array descriptor table passed to compiled loops: 3 Int64 per array (IntData ptr, FloatData ptr,
     // Count). Rebuilt from FArrays only when the array set changes (FArraysDirty), so the per-call cost
     // is a single pointer once the arrays are DIM'd.
@@ -1662,6 +1668,12 @@ end;
   below - the call instruction itself touches no bank. }
 var
   GFrameBankNarrow: Integer = 1;  // FRAMEBANK=0 restores the coarse all-banks footprint
+  // One gate for the whole slice: FRAMERANGE=0 restores the historic snapshot exactly - a prefix
+  // [0, width) copied element by element. The three parts (write set, range, block move) are not
+  // independently useful, so they are not independently switchable: the write set exists to make
+  // the range computable, and the block move exists to keep the range's index arithmetic from
+  // eating what the range saves.
+  GFrameRangeNarrow: Integer = 1;
 
 function BcTouchesOnlyIntBank(Op: Word): Boolean;
 begin
@@ -1679,6 +1691,46 @@ begin
   end;
 end;
 
+{ True for the opcodes VERIFIED to write no integer register other than Instr.Dest.
+  The frame snapshot exists to protect the CALLER's values, so what a callee READS is irrelevant to
+  it: a register the callee never writes still holds the caller's value when the callee returns, and
+  restoring it would be a copy of itself. (Nor does the callee see anything different: FramePush only
+  COPIES the banks aside, it never clears them, so an unwritten register reads the same either way.)
+  The width may therefore be the callee's WRITE set instead of every index it mentions.
+  Soundness rests on one claim, checked opcode by opcode against the interpreter: none of these
+  writes Ctx.IntRegs at an index other than Dest. Same safe polarity as BcTouchesOnlyIntBank above -
+  an opcode missing from this list keeps its reads counted, costing a missed narrowing and never a
+  missed save. Crediting Dest for the opcodes that do not use it (a jump, a transfer store) costs
+  nothing: an absent operand lowers to register 0, which the smallest frame already covers.
+  The membership happens to match BcTouchesOnlyIntBank today, but the two answer different questions
+  (which BANKS an opcode touches vs. WHERE in the integer bank it writes), so they are kept apart. }
+const
+  IW_UNKNOWN = 0;   // not audited: credit Dest, Src1 and Src2, as before
+  IW_DEST    = 1;   // writes Ctx.IntRegs[Dest], nothing else in the bank
+  IW_NONE    = 2;   // writes no integer register at all
+
+function BcIntWriteShape(Op: Word): Integer;
+begin
+  if GFrameRangeNarrow <> 1 then Exit(IW_UNKNOWN);
+  case Op of
+    bcLoadConstInt, bcCopyInt,
+    bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
+    bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
+    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
+    bcXferLoadInt:
+      Result := IW_DEST;
+    // Dest is not an operand of these at all. Saying so matters for the LOW end of the range and
+    // only there: an absent operand lowers to register 0 ([[absent-operand-lowers-to-r0]]), so
+    // crediting it would pin every procedure's base to 0 and undo the narrowing. bcXferStoreInt
+    // writes the transfer bank, which is not part of the snapshot; bcCallSub's callee is folded in
+    // by the fixpoint below.
+    bcXferStoreInt, bcJump, bcJumpIfZero, bcJumpIfNotZero, bcNop, bcCallSub, bcReturnSub:
+      Result := IW_NONE;
+  else
+    Result := IW_UNKNOWN;
+  end;
+end;
+
 procedure TBytecodeVM.BuildProcFrameWidths;
 // A call only has to protect the registers its callee - and everything that callee can reach -
 // might touch. Compute that per procedure entry PC: first the highest register index appearing in
@@ -1691,8 +1743,10 @@ var
   Instr: TBytecodeInstruction;
   Op, Grp: Word;
   Entry: array of Integer;          // procedure index -> entry PC
-  WI, WF, WS: array of Integer;     // procedure index -> widths (register count per bank)
+  WI, WF, WS: array of Integer;     // procedure index -> widths (one past the highest index used)
+  LI, LF, LS: array of Integer;     // procedure index -> lowest index used (MaxInt = bank untouched)
   Unknown: array of Boolean;        // procedure makes an indirect call -> program-wide
+  BaseUnsafe: array of Boolean;     // procedure contains a GOSUB -> its range scan is incomplete
   Changed: Boolean;
   Rounds: Integer;
 
@@ -1707,9 +1761,18 @@ var
   begin
     if (pi < 0) or (RegIdx < 0) then Exit;
     case Bank of
-      0: if RegIdx + 1 > WI[pi] then WI[pi] := RegIdx + 1;
-      1: if RegIdx + 1 > WF[pi] then WF[pi] := RegIdx + 1;
-      2: if RegIdx + 1 > WS[pi] then WS[pi] := RegIdx + 1;
+      0: begin
+           if RegIdx + 1 > WI[pi] then WI[pi] := RegIdx + 1;
+           if RegIdx < LI[pi] then LI[pi] := RegIdx;
+         end;
+      1: begin
+           if RegIdx + 1 > WF[pi] then WF[pi] := RegIdx + 1;
+           if RegIdx < LF[pi] then LF[pi] := RegIdx;
+         end;
+      2: begin
+           if RegIdx + 1 > WS[pi] then WS[pi] := RegIdx + 1;
+           if RegIdx < LS[pi] then LS[pi] := RegIdx;
+         end;
     end;
   end;
 
@@ -1721,11 +1784,13 @@ begin
   if (NInstr = 0) or (NProc = 0) then Exit;
 
   SetLength(Entry, NProc); SetLength(WI, NProc); SetLength(WF, NProc); SetLength(WS, NProc);
-  SetLength(Unknown, NProc);
+  SetLength(LI, NProc); SetLength(LF, NProc); SetLength(LS, NProc);
+  SetLength(Unknown, NProc); SetLength(BaseUnsafe, NProc);
   for p := 0 to NProc - 1 do
   begin
     Entry[p] := FProgram.GetProcMapStart(p);
-    WI[p] := 0; WF[p] := 0; WS[p] := 0; Unknown[p] := False;
+    WI[p] := 0; WF[p] := 0; WS[p] := 0; Unknown[p] := False; BaseUnsafe[p] := False;
+    LI[p] := MaxInt; LF[p] := MaxInt; LS[p] := MaxInt;
   end;
 
   // Pass 1: own footprint per procedure. The register banks an opcode touches are not uniform, so
@@ -1749,9 +1814,18 @@ begin
       // for opcodes NOT proven integer-only: charging a purely integer procedure the program's
       // string width is what made fib copy five REFCOUNTED strings per call for strings it never
       // touches - 54 of its ~214 cycles of frame snapshot, measured with AOT_CALLPROF.
-      Note(p, 0, Instr.Dest);
-      Note(p, 0, Instr.Src1);
-      Note(p, 0, Instr.Src2);
+      // Integer bank: the callee's WRITE set where that is proven (see BcIntWriteShape), every
+      // index mentioned otherwise.
+      case BcIntWriteShape(Op) of
+        IW_DEST: Note(p, 0, Instr.Dest);
+        IW_NONE: ;
+      else
+        begin
+          Note(p, 0, Instr.Dest);
+          Note(p, 0, Instr.Src1);
+          Note(p, 0, Instr.Src2);
+        end;
+      end;
       if not BcTouchesOnlyIntBank(Op) then
       begin
         Note(p, 1, Instr.Dest); Note(p, 2, Instr.Dest);
@@ -1763,7 +1837,14 @@ begin
          (Op = Ord(bcOnError)) or (Op = Ord(bcResumeLabel)) or (Op = Ord(bcResume)) or
          (Op = Ord(bcTrap)) or (Grp = $05) then
         Unknown[p] := True;
+      // A GOSUB shares the caller's register frame and its body can sit OUTSIDE this procedure's
+      // instruction range, so the range scan never sees what it writes. That is survivable for the
+      // widths (the program-wide ceiling still applies below the maximum) but not for the base,
+      // which would skip low registers the GOSUB body writes: keep base 0 for such a procedure.
+      if (Op = Ord(bcCall)) or (Op = Ord(bcReturn)) then
+        BaseUnsafe[p] := True;
     end;
+    if BaseUnsafe[p] then begin LI[p] := 0; LF[p] := 0; LS[p] := 0; end;
   end;
 
   // Pass 2: fixpoint over static call edges - a caller must cover everything its callees touch.
@@ -1791,6 +1872,11 @@ begin
         if WI[TgtIdx] > WI[p] then begin WI[p] := WI[TgtIdx]; Changed := True; end;
         if WF[TgtIdx] > WF[p] then begin WF[p] := WF[TgtIdx]; Changed := True; end;
         if WS[TgtIdx] > WS[p] then begin WS[p] := WS[TgtIdx]; Changed := True; end;
+        // The saved range has to COVER the callee's, so the low end moves down as the high end
+        // moves up.
+        if LI[TgtIdx] < LI[p] then begin LI[p] := LI[TgtIdx]; Changed := True; end;
+        if LF[TgtIdx] < LF[p] then begin LF[p] := LF[TgtIdx]; Changed := True; end;
+        if LS[TgtIdx] < LS[p] then begin LS[p] := LS[TgtIdx]; Changed := True; end;
       end;
     end;
   until (not Changed) or (Rounds > NProc + 2);
@@ -1805,9 +1891,13 @@ begin
   begin
     if (Entry[p] < 0) or (Entry[p] >= NInstr) then System.Continue;
     if Unknown[p] or (Rounds > NProc + 2) then System.Continue;    // leave -1 = program-wide
-    FProcWidthInt[Entry[p]] := WI[p];
-    FProcWidthFloat[Entry[p]] := WF[p];
-    FProcWidthStr[Entry[p]] := WS[p];
+    // A bank left untouched keeps base 0: its width is 0 too, so the range is empty either way.
+    if (GFrameRangeNarrow <> 1) or (LI[p] = MaxInt) then LI[p] := 0;
+    if (GFrameRangeNarrow <> 1) or (LF[p] = MaxInt) then LF[p] := 0;
+    if (GFrameRangeNarrow <> 1) or (LS[p] = MaxInt) then LS[p] := 0;
+    FProcWidthInt[Entry[p]] := (Int64(WI[p]) shl 32) or Int64(LI[p]);
+    FProcWidthFloat[Entry[p]] := (Int64(WF[p]) shl 32) or Int64(LF[p]);
+    FProcWidthStr[Entry[p]] := (Int64(WS[p]) shl 32) or Int64(LS[p]);
   end;
 end;
 
@@ -1822,8 +1912,10 @@ procedure TBytecodeVM.FramePush(Ctx: TExecutionContext; TargetPC: Integer);
 // per call, which dominated the SUB/FUNCTION call cost. The widths are invariant during a run,
 // so bcReturnSub pops exactly what was pushed.
 var
-  i, NI, NF, NS: Integer;
+  i, NI, NF, NS, BI, BF, BS: Integer;
+  PW: Int64;
 begin
+  BI := 0; BF := 0; BS := 0;
   // A NEGATIVE width means "not measured for this context" (any path that runs bytecode without
   // going through LoadProgram): fall back to the whole bank, the historical behaviour. Zero is a
   // real width -- a bank the program never touches -- and must save nothing.
@@ -1840,26 +1932,48 @@ begin
   // call anywhere in its reachable set). Never widens: the program-wide width stays the ceiling.
   if (TargetPC >= 0) and (TargetPC < Length(FProcWidthInt)) and (FProcWidthInt[TargetPC] >= 0) then
   begin
-    if FProcWidthInt[TargetPC] < NI then NI := FProcWidthInt[TargetPC];
-    if FProcWidthFloat[TargetPC] < NF then NF := FProcWidthFloat[TargetPC];
-    if FProcWidthStr[TargetPC] < NS then NS := FProcWidthStr[TargetPC];
+    // Both ends come out of one load per bank: width in the high half, base in the low half. The
+    // base is where the snapshot STARTS - registers below it belong to the caller's own frame and
+    // the callee cannot name them. Clamped to the width, so the range is never negative if a probe
+    // above (FRAMESAVE_NOSTR) has already zeroed a bank.
+    PW := FProcWidthInt[TargetPC];
+    if PW shr 32 < NI then NI := PW shr 32;
+    BI := PW and $FFFFFFFF; if BI > NI then BI := NI;
+    PW := FProcWidthFloat[TargetPC];
+    if PW shr 32 < NF then NF := PW shr 32;
+    BF := PW and $FFFFFFFF; if BF > NF then BF := NF;
+    PW := FProcWidthStr[TargetPC];
+    if PW shr 32 < NS then NS := PW shr 32;
+    BS := PW and $FFFFFFFF; if BS > NS then BS := NS;
   end;
   // Grow save stacks if needed (defensive; usually sized once).
-  if Ctx.FrameSaveIntTop + NI > Length(Ctx.FrameSaveInt) then
-    SetLength(Ctx.FrameSaveInt, Ctx.FrameSaveIntTop + NI + 256);
-  if Ctx.FrameSaveFloatTop + NF > Length(Ctx.FrameSaveFloat) then
-    SetLength(Ctx.FrameSaveFloat, Ctx.FrameSaveFloatTop + NF + 256);
-  if Ctx.FrameSaveStrTop + NS > Length(Ctx.FrameSaveStr) then
-    SetLength(Ctx.FrameSaveStr, Ctx.FrameSaveStrTop + NS + 256);
-  for i := 0 to NI - 1 do
-    Ctx.FrameSaveInt[Ctx.FrameSaveIntTop + i] := Ctx.IntRegs[i];
-  Inc(Ctx.FrameSaveIntTop, NI);
-  for i := 0 to NF - 1 do
-    Ctx.FrameSaveFloat[Ctx.FrameSaveFloatTop + i] := Ctx.FloatRegs[i];
-  Inc(Ctx.FrameSaveFloatTop, NF);
-  for i := 0 to NS - 1 do
-    Ctx.FrameSaveStr[Ctx.FrameSaveStrTop + i] := Ctx.StringRegs[i];
-  Inc(Ctx.FrameSaveStrTop, NS);
+  if Ctx.FrameSaveIntTop + (NI - BI) > Length(Ctx.FrameSaveInt) then
+    SetLength(Ctx.FrameSaveInt, Ctx.FrameSaveIntTop + (NI - BI) + 256);
+  if Ctx.FrameSaveFloatTop + (NF - BF) > Length(Ctx.FrameSaveFloat) then
+    SetLength(Ctx.FrameSaveFloat, Ctx.FrameSaveFloatTop + (NF - BF) + 256);
+  if Ctx.FrameSaveStrTop + (NS - BS) > Length(Ctx.FrameSaveStr) then
+    SetLength(Ctx.FrameSaveStr, Ctx.FrameSaveStrTop + (NS - BS) + 256);
+  // Int and float are plain scalars, so the snapshot is a block move - one memcpy per bank instead
+  // of an indexed loop. Strings cannot be: each copy is a refcount update.
+  if GFrameRangeNarrow = 1 then
+  begin
+    if NI > BI then
+      Move(Ctx.IntRegs[BI], Ctx.FrameSaveInt[Ctx.FrameSaveIntTop], (NI - BI) * SizeOf(Int64));
+    if NF > BF then
+      Move(Ctx.FloatRegs[BF], Ctx.FrameSaveFloat[Ctx.FrameSaveFloatTop], (NF - BF) * SizeOf(Double));
+  end
+  else
+  begin
+    for i := 0 to NI - 1 do                    // gate off: the historic prefix copy, verbatim
+      Ctx.FrameSaveInt[Ctx.FrameSaveIntTop + i] := Ctx.IntRegs[i];
+    for i := 0 to NF - 1 do
+      Ctx.FrameSaveFloat[Ctx.FrameSaveFloatTop + i] := Ctx.FloatRegs[i];
+  end;
+  Inc(Ctx.FrameSaveIntTop, NI - BI);
+  Inc(Ctx.FrameSaveFloatTop, NF - BF);
+  for i := BS to NS - 1 do
+    Ctx.FrameSaveStr[Ctx.FrameSaveStrTop + (i - BS)] := Ctx.StringRegs[i];
+  Inc(Ctx.FrameSaveStrTop, NS - BS);
   // Remember this frame's widths so FramePop restores exactly what was saved (widths differ per
   // callee, so they cannot be recomputed at pop time).
   if Ctx.FrameWidthTop >= Length(Ctx.FrameWidthInt) then
@@ -1868,9 +1982,12 @@ begin
     SetLength(Ctx.FrameWidthFloat, Ctx.FrameWidthTop + 256);
     SetLength(Ctx.FrameWidthStr, Ctx.FrameWidthTop + 256);
   end;
-  Ctx.FrameWidthInt[Ctx.FrameWidthTop] := NI;
-  Ctx.FrameWidthFloat[Ctx.FrameWidthTop] := NF;
-  Ctx.FrameWidthStr[Ctx.FrameWidthTop] := NS;
+  // Both ends of the saved range in one slot: (width shl 32) or base. See the field declaration -
+  // a separate base stack is three more array writes here and three more reads in FramePop, and
+  // that traffic costs more than the copies the narrower range saves.
+  Ctx.FrameWidthInt[Ctx.FrameWidthTop] := (Int64(NI) shl 32) or Int64(BI);
+  Ctx.FrameWidthFloat[Ctx.FrameWidthTop] := (Int64(NF) shl 32) or Int64(BF);
+  Ctx.FrameWidthStr[Ctx.FrameWidthTop] := (Int64(NS) shl 32) or Int64(BS);
   Inc(Ctx.FrameWidthTop);
   // RAII (V2): remember where this frame's record allocations begin.
   if Ctx.FrameRecBaseTop >= Length(Ctx.FrameRecBase) then
@@ -1885,17 +2002,19 @@ end;
 procedure TBytecodeVM.FramePop(Ctx: TExecutionContext);
 // Restore the live part of each register bank from the top frame (same widths FramePush used).
 var
-  i, NI, NF, NS: Integer;
+  i, NI, NF, NS, BI, BF, BS: Integer;
+  PW: Int64;
 begin
   // Widths come off the frame-width stack: they are per-callee, so they cannot be recomputed here.
   // An empty stack means the frame was pushed before this bookkeeping existed (or the stack was
   // unwound by an error jump): fall back to the context-wide widths, as FramePush would have used.
+  BI := 0; BF := 0; BS := 0;
   if Ctx.FrameWidthTop > 0 then
   begin
     Dec(Ctx.FrameWidthTop);
-    NI := Ctx.FrameWidthInt[Ctx.FrameWidthTop];
-    NF := Ctx.FrameWidthFloat[Ctx.FrameWidthTop];
-    NS := Ctx.FrameWidthStr[Ctx.FrameWidthTop];
+    PW := Ctx.FrameWidthInt[Ctx.FrameWidthTop];   NI := PW shr 32; BI := PW and $FFFFFFFF;
+    PW := Ctx.FrameWidthFloat[Ctx.FrameWidthTop]; NF := PW shr 32; BF := PW and $FFFFFFFF;
+    PW := Ctx.FrameWidthStr[Ctx.FrameWidthTop];   NS := PW shr 32; BS := PW and $FFFFFFFF;
   end
   else
   begin
@@ -1903,15 +2022,25 @@ begin
     NF := Ctx.FrameSaveFloatCount;  if (NF < 0) or (NF > Ctx.FloatRegCount) then NF := Ctx.FloatRegCount;
     NS := Ctx.FrameSaveStrCount;    if (NS < 0) or (NS > Ctx.StringRegCount) then NS := Ctx.StringRegCount;
   end;
-  Dec(Ctx.FrameSaveIntTop, NI);
-  for i := 0 to NI - 1 do
-    Ctx.IntRegs[i] := Ctx.FrameSaveInt[Ctx.FrameSaveIntTop + i];
-  Dec(Ctx.FrameSaveFloatTop, NF);
-  for i := 0 to NF - 1 do
-    Ctx.FloatRegs[i] := Ctx.FrameSaveFloat[Ctx.FrameSaveFloatTop + i];
-  Dec(Ctx.FrameSaveStrTop, NS);
-  for i := 0 to NS - 1 do
-    Ctx.StringRegs[i] := Ctx.FrameSaveStr[Ctx.FrameSaveStrTop + i];
+  Dec(Ctx.FrameSaveIntTop, NI - BI);
+  Dec(Ctx.FrameSaveFloatTop, NF - BF);
+  if GFrameRangeNarrow = 1 then
+  begin
+    if NI > BI then
+      Move(Ctx.FrameSaveInt[Ctx.FrameSaveIntTop], Ctx.IntRegs[BI], (NI - BI) * SizeOf(Int64));
+    if NF > BF then
+      Move(Ctx.FrameSaveFloat[Ctx.FrameSaveFloatTop], Ctx.FloatRegs[BF], (NF - BF) * SizeOf(Double));
+  end
+  else
+  begin
+    for i := 0 to NI - 1 do                    // gate off: the historic prefix copy, verbatim
+      Ctx.IntRegs[i] := Ctx.FrameSaveInt[Ctx.FrameSaveIntTop + i];
+    for i := 0 to NF - 1 do
+      Ctx.FloatRegs[i] := Ctx.FrameSaveFloat[Ctx.FrameSaveFloatTop + i];
+  end;
+  Dec(Ctx.FrameSaveStrTop, NS - BS);
+  for i := BS to NS - 1 do
+    Ctx.StringRegs[i] := Ctx.FrameSaveStr[Ctx.FrameSaveStrTop + (i - BS)];
   // RAII (V2): release the records this frame allocated (locals/temporaries) by rolling the
   // high-water mark back. Slots become reusable by the next AllocRecord. A UDT result has already
   // been copied into the caller-allocated instance (which lives below this frame's mark).
@@ -4196,7 +4325,7 @@ begin
     BuildProcFrameWidths;
   except
     SetLength(FProcWidthInt, 0); SetLength(FProcWidthFloat, 0); SetLength(FProcWidthStr, 0);
-  end;
+    end;
 end;
 
 procedure TBytecodeVM.ClearProgram;
@@ -11094,6 +11223,7 @@ end;
 initialization
   if GetEnvironmentVariable('FRAMESAVE_NOSTR') = '1' then GFrameSaveNoStr := 1;
   if GetEnvironmentVariable('FRAMEBANK') = '0' then GFrameBankNarrow := 0;
+  if GetEnvironmentVariable('FRAMERANGE') = '0' then GFrameRangeNarrow := 0;
 
 finalization
   AotCallProfReport;

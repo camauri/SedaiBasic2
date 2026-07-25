@@ -108,9 +108,14 @@ type
     // only has to protect the registers its CALLEE (and everything the callee calls) can touch,
     // which is usually far below the program-wide width - the caller of a two-line SUB should not
     // pay for the biggest procedure in the program. Pushed by FramePush, read by FramePop.
-    FrameWidthInt: array of Integer;
-    FrameWidthFloat: array of Integer;
-    FrameWidthStr: array of Integer;
+    // The saved part of a bank is a RANGE, not a prefix: a procedure's registers are numbered above
+    // its caller's, so saving from 0 copies registers the callee provably cannot reach. Each entry
+    // therefore packs BOTH ends, (width shl 32) or base - deliberately packed rather than kept in
+    // three more arrays, because a separate base stack costs three more pushes and three more pops
+    // of dynamic-array traffic per call, which measured MORE than the copies it saves.
+    FrameWidthInt: array of Int64;
+    FrameWidthFloat: array of Int64;
+    FrameWidthStr: array of Int64;
     FrameWidthTop: Integer;
 
     // --- Record reclamation marks (RAII, V2 frame / M8 block) ---
