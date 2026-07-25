@@ -1773,6 +1773,9 @@ begin
   end;
 end;
 
+var
+  GFrameSaveNoStr: Integer = 0;   // measurement probe, set from FRAMESAVE_NOSTR at startup
+
 procedure TBytecodeVM.FramePush(Ctx: TExecutionContext; TargetPC: Integer);
 // Snapshot the live part of each register bank onto the flat per-bank save stacks (one frame).
 // The saved width is Ctx.FrameSave*Count (the highest register index the program's bytecode
@@ -1789,6 +1792,12 @@ begin
   NI := Ctx.FrameSaveIntCount;    if (NI < 0) or (NI > Ctx.IntRegCount) then NI := Ctx.IntRegCount;
   NF := Ctx.FrameSaveFloatCount;  if (NF < 0) or (NF > Ctx.FloatRegCount) then NF := Ctx.FloatRegCount;
   NS := Ctx.FrameSaveStrCount;    if (NS < 0) or (NS > Ctx.StringRegCount) then NS := Ctx.StringRegCount;
+  // MEASUREMENT PROBE (FRAMESAVE_NOSTR=1): drop the string half of the frame snapshot. Unsound in
+  // general - a callee that writes a string register would corrupt the caller - but SOUND for a
+  // program that touches no string, which is how it is used: to price the refcounted copies that
+  // the coarse per-procedure width charges to procedures that never see a string. Verify the
+  // output of any program measured with it (the LS_NOWB lesson).
+  if GFrameSaveNoStr = 1 then NS := 0;
   // Narrow further to what THIS callee can clobber, when that is known (static target, no indirect
   // call anywhere in its reachable set). Never widens: the program-wide width stays the ceiling.
   if (TargetPC >= 0) and (TargetPC < Length(FProcWidthInt)) and (FProcWidthInt[TargetPC] >= 0) then
@@ -6006,6 +6015,58 @@ const
   sentinels -> pass through untouched. The caller's native code exits through its BARE
   epilogue on any non-OK value: its registers were flushed before the call and the callee has
   since written the banks. Reached through TAotCtx.CallSub - never a baked address. }
+{ ---- AOT_CALLPROF: where the cycles of a native call ACTUALLY go ----------------------------
+  Attribution, not estimation. fib(36) measures ~300 cycles per call while the parts visible in the
+  source add up to a fraction of that, so the missing cost has to be located before anything is
+  rewritten. Off unless AOT_CALLPROF=1; the only cost when off is one integer test per call.
+  Phases, measured with RDTSC and reported net of the instrument's own overhead (calibrated at
+  startup by reading the counter twice back to back):
+    push   entry -> after FramePush + call-stack push        (bank snapshot + bookkeeping)
+    callee the compiled function itself                      (its prologue, body and epilogue)
+    pop    after the callee -> exit                          (descriptor refresh + FramePop)
+  Plus the EXACT number of bank elements FramePush copied, taken from the save-stack tops rather
+  than recomputed, so it cannot disagree with what actually happened. }
+{$push}{$asmmode intel}
+function AotRdTsc: QWord; assembler; nostackframe;
+asm
+  rdtsc
+  shl rdx, 32
+  or  rax, rdx
+end;
+{$pop}
+
+var
+  GCallProf: Integer = -1;         // -1 unread, 0 off, 1 on
+  GCPCalls: QWord = 0;
+  GCPTotal: QWord = 0;
+  GCPPush: QWord = 0;
+  GCPCallee: QWord = 0;
+  GCPPop: QWord = 0;
+  GCPBankI: QWord = 0;
+  GCPBankF: QWord = 0;
+  GCPBankS: QWord = 0;
+  GCPTscOverhead: QWord = 0;       // cycles charged by one RdTsc read, measured
+
+function AotCallProfOn: Boolean; inline;
+var i: Integer; a, b, lo: QWord;
+begin
+  if GCallProf < 0 then
+  begin
+    if GetEnvironmentVariable('AOT_CALLPROF') = '1' then GCallProf := 1 else GCallProf := 0;
+    if GCallProf = 1 then
+    begin
+      lo := High(QWord);
+      for i := 1 to 1000 do
+      begin
+        a := AotRdTsc; b := AotRdTsc;
+        if (b - a) < lo then lo := b - a;
+      end;
+      GCPTscOverhead := lo;
+    end;
+  end;
+  Result := GCallProf = 1;
+end;
+
 function AotCallSub(AotCtx: PAotCtx; CalleeEntryPC, BcCallSubPC: PtrInt): PtrInt; cdecl;
 type
   PInstr = ^TBytecodeInstruction;
@@ -6014,7 +6075,13 @@ var
   C: TExecutionContext;
   Fn: TExecMem;
   RetPC: PtrInt;
+  Prof: Boolean;
+  T0, T1, T2, T3: QWord;
+  SI, SF, SS: Integer;
 begin
+  Prof := AotCallProfOn;
+  T0 := 0; T1 := 0; T2 := 0;
+  if Prof then T0 := AotRdTsc;
   VM := TBytecodeVM(AotCtx^.VMSelf);
   C := TExecutionContext(AotCtx^.CtxObj);
   if (CalleeEntryPC < 0) or (CalleeEntryPC >= Length(VM.FNativeFuncs)) then
@@ -6022,6 +6089,7 @@ begin
   Fn := VM.FNativeFuncs[CalleeEntryPC];
   if (Fn = nil) or (C.AotCallDepth >= AOT_CALLSUB_MAX_DEPTH) then
     Exit(BcCallSubPC);
+  SI := C.FrameSaveIntTop; SF := C.FrameSaveFloatTop; SS := C.FrameSaveStrTop;
   try
     VM.FramePush(C, Integer(CalleeEntryPC));
     VM.GrowCallStackIfNeeded(C);
@@ -6037,9 +6105,17 @@ begin
   if VM.FArraysDirty then VM.RebuildJitArrDesc;
   if Length(VM.FJitArrDesc) > 0 then AotCtx^.ArrDesc := @VM.FJitArrDesc[0]
   else AotCtx^.ArrDesc := nil;
+  if Prof then
+  begin
+    T1 := AotRdTsc;
+    Inc(GCPBankI, QWord(C.FrameSaveIntTop - SI));
+    Inc(GCPBankF, QWord(C.FrameSaveFloatTop - SF));
+    Inc(GCPBankS, QWord(C.FrameSaveStrTop - SS));
+  end;
   Inc(C.AotCallDepth);
   RetPC := TNativeFuncFn(Fn.Ptr)(@C.IntRegs[0], PInt64(@C.FloatRegs[0]), AotCtx);
   Dec(C.AotCallDepth);
+  if Prof then T2 := AotRdTsc;
   // A DIM/REDIM/ERASE inside the callee may have rebuilt/moved the descriptor table the
   // caller's cached bases came from; refresh while still on a Pascal frame.
   if VM.FArraysDirty then VM.RebuildJitArrDesc;
@@ -6051,6 +6127,15 @@ begin
   begin
     Dec(C.CallStackPtr);           // the interpreter's bcReturnSub order: pop, then FramePop
     VM.FramePop(C);
+    if Prof then
+    begin
+      T3 := AotRdTsc;
+      Inc(GCPCalls);
+      Inc(GCPPush,   T1 - T0 - GCPTscOverhead);
+      Inc(GCPCallee, T2 - T1 - GCPTscOverhead);
+      Inc(GCPPop,    T3 - T2 - GCPTscOverhead);
+      Inc(GCPTotal,  T3 - T0 - 3 * GCPTscOverhead);
+    end;
     Exit(AOT_CALL_OK);
   end;
   Result := RetPC;                 // deopt inside the callee: frame + return address stay
@@ -10948,5 +11033,30 @@ begin
   end;
 end;
 {$ENDIF}
+
+procedure AotCallProfReport;
+var n: QWord;
+begin
+  if GCallProf <> 1 then Exit;
+  n := GCPCalls;
+  if n = 0 then Exit;
+  WriteLn(ErrOutput, '');
+  WriteLn(ErrOutput, '[CALLPROF] native calls through AotCallSub: ', n,
+                     '   (RdTsc overhead calibrated at ', GCPTscOverhead, ' cycles/read)');
+  WriteLn(ErrOutput, Format('[CALLPROF]   total   %8.1f cycles/call', [GCPTotal / n]));
+  WriteLn(ErrOutput, Format('[CALLPROF]     push  %8.1f   (FramePush bank snapshot + call-stack push)', [GCPPush / n]));
+  WriteLn(ErrOutput, Format('[CALLPROF]     callee%8.1f   (the compiled function: prologue, body, epilogue)', [GCPCallee / n]));
+  WriteLn(ErrOutput, Format('[CALLPROF]     pop   %8.1f   (descriptor refresh + FramePop)', [GCPPop / n]));
+  WriteLn(ErrOutput, Format('[CALLPROF]   bank elements copied per call: int=%.2f float=%.2f string=%.2f',
+                            [GCPBankI / n, GCPBankF / n, GCPBankS / n]));
+  WriteLn(ErrOutput, '[CALLPROF]   NB "total" excludes the CALLER-side flush/reload, which is');
+  WriteLn(ErrOutput, '[CALLPROF]   emitted code around the call and is charged to the caller.');
+end;
+
+initialization
+  if GetEnvironmentVariable('FRAMESAVE_NOSTR') = '1' then GFrameSaveNoStr := 1;
+
+finalization
+  AotCallProfReport;
 
 end.
