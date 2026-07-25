@@ -370,6 +370,12 @@ begin
   if (n >= 1) and (n <= Avail) then Result := n;
 end;
 
+function AotRsiPoolEnabled: Boolean;
+// AOT_RSI=0 keeps rsi reserved even in a float-free region (the A/B baseline on one binary).
+begin
+  Result := GetEnvironmentVariable('AOT_RSI') <> '0';
+end;
+
 function AotLinScanMode: Integer;
 var s: string;
 begin
@@ -833,7 +839,9 @@ const
   // and rbp, which this codegen does not use as a frame pointer (everything is rsp-relative).
   // Neither can appear as a ModRM BASE here (pool registers are only ever a reg field or a
   // mod=11 rm), so rbp's disp-less encoding trap never arises.
-  IntPool: array[0..8] of Integer = (R9, R10, R11, R12, R13, R14, R15, RDI, RBP);
+  // ...and rsi LAST, which is only ever handed out to a region that touches no float register
+  // at all: there the FloatRegs base it normally holds is dead weight. See RsiIsPool.
+  IntPool: array[0..9] of Integer = (R9, R10, R11, R12, R13, R14, R15, RDI, RBP, RSI);
 type
   TFix = record PatchOff, TargetBlock: Integer; end;  // TargetBlock -1 = epilogue
   // B1b, the linear-scan model. A RANGE is one contiguous run of linear positions, inside ONE
@@ -923,6 +931,8 @@ var
   UseF, DefF, InF, OutF: array of array of Boolean;
   LiveNB: Integer;                      // block count the arrays above are sized for; 0 means
                                         // ComputeLiveness bailed and they must not be read
+  RsiIsPool: Boolean;                   // the region has no float registers, so rsi is not the
+                                        // FloatRegs base here and can carry a value instead
   BlockW: array of Integer;             // region-relative block -> loop-depth weight (Prescan);
                                         // the interval builder weights its ranges with the same
                                         // numbers the static allocator ranks registers by
@@ -1589,7 +1599,7 @@ var
     // 3. Restore our base registers from the frame. rbx (IntRegs) is callee-saved on both
     //    ABIs and survives; rsi (FloatRegs) does not in System V, and r8 (ctx) never does.
     FrameLoad(R8, SlotCtxSave);
-    FrameLoad(RSI, SlotFltSave);
+    if not RsiIsPool then FrameLoad(RSI, SlotFltSave);   // float-free region: rsi carries a VALUE
 
     // 4. Re-read the banks: the helper may have written any of them.
     for k := 0 to NIAlloc - 1 do
@@ -1633,7 +1643,7 @@ var
     E.EmitBytes([$FF, $D0]);                                   // call rax
     // 3. Restore our base registers (r8/rsi are volatile; rbx survives).
     FrameLoad(R8, SlotCtxSave);
-    FrameLoad(RSI, SlotFltSave);
+    if not RsiIsPool then FrameLoad(RSI, SlotFltSave);   // float-free region: rsi carries a VALUE
     // 4. Continue natively only on a completed call. Anything else leaves through the BARE
     //    epilogue with rax as is: our registers were flushed before the call and the callee
     //    has since written the banks - the normal epilogue's re-flush would corrupt them.
@@ -1683,7 +1693,7 @@ var
   procedure StrCallEpilogue;
   begin
     FrameLoad(R8, SlotCtxSave);
-    FrameLoad(RSI, SlotFltSave);
+    if not RsiIsPool then FrameLoad(RSI, SlotFltSave);   // float-free region: rsi carries a VALUE
     ReloadVolatiles;
     ReloadResidentF; ReloadResidentI;
   end;
@@ -3063,7 +3073,7 @@ var
     SetLength(Taken, MaxIReg + 1);
     SetLength(TakenAB, MaxArrId + 1);
     SetLength(TakenAC, MaxArrId + 1);
-    for k := 0 to IntPoolCount(Length(IntPool)) - 1 do
+    for k := 0 to IntPoolCount(Length(IntPool) - Ord(not RsiIsPool)) - 1 do
     begin
       best := -1; bestUse := 0; bestKind := -2;
       for r := 0 to MaxIReg do
@@ -3095,7 +3105,9 @@ var
         ACacheReg[NACache] := IntPool[k];
         Inc(NACache);
       end;
-      if GprIsCalleeSaved(IntPool[k]) then SaveGpr[IntPool[k]] := True;
+      // rbx and rsi are pushed by name in the prologue; SaveGpr must not push them a second time.
+      if GprIsCalleeSaved(IntPool[k]) and (IntPool[k] <> RSI) and (IntPool[k] <> RBX) then
+        SaveGpr[IntPool[k]] := True;
     end;
     // Floats: most-used first onto xmm2..xmm7.
     // AOT_FPOOL SHRINKS the pool (probe): the slope of "how much does one xmm less cost" is what
@@ -3346,7 +3358,7 @@ var
 
     // Build the dynamic pool: IntPool GPRs not reserved by the array-descriptor cache.
     SetLength(poolG, Length(IntPool)); np := 0;
-    for a := 0 to IntPoolCount(Length(IntPool)) - 1 do
+    for a := 0 to IntPoolCount(Length(IntPool) - Ord(not RsiIsPool)) - 1 do
     begin
       taken := False;
       for kk := 0 to NACache - 1 do if ACacheReg[kk] = IntPool[a] then begin taken := True; Break; end;
@@ -3411,7 +3423,7 @@ var
         SetLength(DynIFree[lastTouch[r]], Length(DynIFree[lastTouch[r]]) + 1);
         DynIFree[lastTouch[r]][High(DynIFree[lastTouch[r]])] := r;
         usedAny := True;
-        if GprIsCalleeSaved(poolG[xf]) then SaveGpr[poolG[xf]] := True;
+        if GprIsCalleeSaved(poolG[xf]) and (poolG[xf] <> RSI) then SaveGpr[poolG[xf]] := True;
       end;
     end;
 
@@ -3602,7 +3614,7 @@ var
     // (2) The pools. Float is xmm2..7 as always; int is IntPool minus the GPRs Allocate pinned to
     // array descriptors, which stay reserved for the whole invocation.
     SetLength(poolG, Length(IntPool)); poolN := 0;
-    for i := 0 to IntPoolCount(Length(IntPool)) - 1 do
+    for i := 0 to IntPoolCount(Length(IntPool) - Ord(not RsiIsPool)) - 1 do
     begin
       taken := False;
       for j := 0 to NACache - 1 do if ACacheReg[j] = IntPool[i] then begin taken := True; Break; end;
@@ -3723,7 +3735,8 @@ var
         begin
           if LsWebs[i].Home >= 6 then SaveXmm[LsWebs[i].Home] := True;
         end
-        else if GprIsCalleeSaved(LsWebs[i].Home) then SaveGpr[LsWebs[i].Home] := True;
+        else if GprIsCalleeSaved(LsWebs[i].Home) and (LsWebs[i].Home <> RSI) then
+          SaveGpr[LsWebs[i].Home] := True;
       end;
 
     LsActive := True;
@@ -4119,6 +4132,13 @@ begin
   // change a single emitted byte today.
   AotDiagMemAccI := 0; AotDiagMemAccF := 0; AotDiagCodeW := 0;
   LivenessOK := False; PeakLiveInt := 0; PeakLiveFloat := 0;
+  // rsi normally holds the FloatRegs base. A region that touches NO float register never needs
+  // it, and then it is simply a tenth GPR - which is where the AOT's remaining pressure is: on
+  // n-body 98.8% of the bank traffic is integer, and the integer-only benchmarks (intpoly, sieve,
+  // arraysum) are exactly the ones with 20-28 values live against the pool. Nothing is
+  // re-addressed: the register is only handed out where its usual job does not exist.
+  // The prologue pushes rsi by name either way, so the caller's value is preserved regardless.
+  RsiIsPool := (MaxFReg < 0) and AotRsiPoolEnabled;
   LiveNB := 0;
   ComputeLiveness;
 
@@ -4201,7 +4221,8 @@ begin
       if HasHelperCall then
       begin
         FrameStore(R8, SlotCtxSave);                 // the ctx pointer: r8 is volatile everywhere
-        FrameStore(RSI, SlotFltSave);                // the FloatRegs base: rsi is volatile in SysV
+        if not RsiIsPool then
+          FrameStore(RSI, SlotFltSave);              // the FloatRegs base: rsi is volatile in SysV
       end;
     end;
     // Entry loads of the allocated registers.
