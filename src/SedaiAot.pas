@@ -278,9 +278,56 @@ function AotCompileProgram(SSAProg: TSSAProgram; Prog: TBytecodeProgram;
 // (1 = AOT takes MAIN, 0 = AOT skips it); with the variable unset the compiled-in default wins.
 function AotSkipMainDefault(CombinedMode: Boolean): Boolean;
 
+// Hand the emitter the TExecutionContext/TRecordStorage layout so a record FIELD access can be
+// lowered natively instead of routed to the helper (the JIT has done this since J13). Only offsets
+// are taken, never an address: the emitted code reads the current record base from the context it
+// is given, so one compiled function serves the main context and a THREADCREATE worker alike.
+// Until this is called the offsets are zero and every record op keeps going through the helper,
+// which is the safe default for any caller that does not supply them.
+//
+// Why it matters: a helper call is not just a call. AotHelperCall flushes EVERY allocated VM
+// register to its bank slot before it and reloads them all after, so with a ten-register pool one
+// record field access costs about twenty memory operations. job/tests/bench/intrec_fb.bas takes
+// FOUR of them per iteration (three field reads and one write) in a loop body of ~25 instructions -
+// which is why --aot is only 1.8x the interpreter on that program against 27x on n-body.
+procedure AotSetRecordLayout(RecordsOff, RecSize, RecIntOff, RecFloatOff, SharedRecOff: Integer);
+
 implementation
 
 uses TypInfo;
+
+// Record layout handed in by AotSetRecordLayout. Zero = "not supplied", which keeps every record op
+// on the helper. Compilation is single-threaded (the same reason the SSA name pool is), so unit
+// state is safe here.
+var
+  GRecordsOff: Integer = 0;
+  GRecSize: Integer = 0;
+  GRecIntOff: Integer = 0;
+  GRecFloatOff: Integer = 0;
+  GSharedRecOff: Integer = 0;
+  GRecNativeState: Integer = -1;   // -1 unread, 0 off, 1 on
+  GNoThreads: Boolean = False;     // program creates no thread: the shared region cannot grow under us
+
+procedure AotSetRecordLayout(RecordsOff, RecSize, RecIntOff, RecFloatOff, SharedRecOff: Integer);
+begin
+  GRecordsOff := RecordsOff;
+  GRecSize := RecSize;
+  GRecIntOff := RecIntOff;
+  GRecFloatOff := RecFloatOff;
+  GSharedRecOff := SharedRecOff;
+end;
+
+// Native record field access, gated so the two arrangements are A/B-able on ONE binary:
+// AOT_RECNAT=0 forces every record op back onto the helper (the historical behaviour).
+function AotRecNative: Boolean;
+begin
+  if GRecNativeState < 0 then
+  begin
+    if GetEnvironmentVariable('AOT_RECNAT') = '0' then GRecNativeState := 0
+    else GRecNativeState := 1;
+  end;
+  Result := (GRecNativeState = 1) and (GRecSize > 0);
+end;
 
 // AOT_DYNF gate, read once. Tri-state: 0 = AUTO (default: enable per region only where the
 // dynamic float allocator pays - see PlanDynFloat's throughput-bound test), 1 = force ON every
@@ -437,6 +484,9 @@ begin
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferStoreInt, ssaXferStoreFloat,
     ssaReturnSub, ssaEnd, ssaStop,
     ssaRecMarkPush, ssaRecMarkPop,
+    // Record FIELD access: Ctx.Records[handle].{Int,Float}Data[slot]. Native only when the layout
+    // was supplied (AotSetRecordLayout) - AotIsNative checks that. A shared-region handle deopts.
+    ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordStoreInt, ssaRecordStoreFloat,
     // B2: 1-D int/float array element access + dim-0 bound queries (string-element
     // arrays are rejected by the classifier/prescan; multi-dim access goes through
     // ssaArrayIdxPush/Resolve, which are not in the set, so those regions bail).
@@ -585,6 +635,9 @@ begin
   case Ins.OpCode of
     ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound:
       Result := AotArrayNativeOK(SSAProg, Ins);
+    ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordStoreInt, ssaRecordStoreFloat:
+      // Needs the record layout AND a constant slot: the slot is baked into the displacement.
+      Result := AotRecNative and (Ins.Src3.Kind = svkConstInt);
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
     ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
     ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrChr, ssaStrInstr,
@@ -2034,6 +2087,84 @@ var
       if IsFloat then FStore(ValReg, XMM0) else IStore(ValReg, RAX);
     end;
   end;
+  // Record field access, ported from the JIT's J13 (SedaiJit.RecAccess) - same shape, same guard,
+  // AOT deopt instead of the JIT's.
+  //
+  // Ctx.Records[handle].{Int,Float}Data[slot]. A SHARED_REC_FLAG handle (bit 62) belongs to the
+  // locked cross-thread region and leaves to the interpreter, which takes the lock. A plain handle
+  // indexes the per-thread heap: deref the ctx object's Records FIELD to the current base (never a
+  // baked address - the dynamic array moves when it grows, and a worker has its own), add
+  // handle*RecSize, load the field's data pointer, then load or store at [ptr + slot*8].
+  //
+  // No handle or slot bounds check, which matches the interpreter exactly (it indexes with range
+  // checks off). The slot is a compile-time constant, so it rides in the displacement.
+  //
+  // HandleReg = Src1, value = Dest (load) or Src2 (store), Slot = Src3 const.
+  procedure AotRecAccess(apc, HandleReg, Slot, ValReg: Integer; IsFloat, IsStore: Boolean);
+  var p, pJoin: Integer;
+  begin
+    ILoad(RAX, HandleReg);                          // rax = handle
+    E.EmitBytes([$48, $0F, $BA, $E0, 62]);          // bt rax, 62   (SHARED_REC_FLAG = 1 shl 62)
+    E.EmitBytes([$73, $00]); p := E.Len - 1;        // jnc +plain   (CF=0 -> per-context heap)
+    // --- shared region ---
+    // EVERY record of an array of UDT lives here (AllocSharedRecord), which is exactly the shape of
+    // real BASIC code, so deopting here would give up the whole point: measured, a deopt-only
+    // version made intrec_fb 84% SLOWER than the helper it replaced, because every one of its four
+    // per-iteration field accesses left to the interpreter.
+    // Each shared record is its own heap block with a STABLE pointer; the VM's lock exists only to
+    // guard the array of those pointers while it GROWS. So this is safe without the lock precisely
+    // when no other thread can grow it - hence the whole-program "creates no thread" gate.
+    if GNoThreads then
+    begin
+      E.EmitBytes([$48, $0F, $BA, $F0, 62]);        // btr rax, 62  -> shared-region index
+      E.MemOp([$49, $8B], RDX, R8, AOTCTX_VMSELF);  // rdx = the TBytecodeVM instance
+      E.EmitBytes([$48, $8B, $92]); E.Emit32(LongWord(GSharedRecOff));  // rdx = FSharedRecords base
+      E.EmitBytes([$48, $8B, $14, $C2]);            // mov rdx, [rdx + rax*8]  -> PRecordStorage
+      E.EmitBytes([$EB, $00]); pJoin := E.Len - 1;  // jmp +join (rdx already points at the record)
+    end
+    else
+    begin
+      ExitTo(apc);                                   // threads present -> interpreter takes the lock
+      pJoin := -1;
+    end;
+    E.PatchByte(p, Byte(E.Len - (p + 1)));
+    // --- per-context heap ---
+    E.MemOp([$49, $8B], RDX, R8, AOTCTX_CTXOBJ);     // rdx = ctx.CtxObj (the TExecutionContext)
+    E.EmitBytes([$48, $8B, $92]); E.Emit32(LongWord(GRecordsOff));  // rdx = [rdx+RecordsOff] = base
+    E.EmitBytes([$48, $69, $C0]); E.Emit32(LongWord(GRecSize));     // imul rax, rax, RecSize
+    E.EmitBytes([$48, $01, $C2]);                    // add rdx, rax  -> @Records[handle]
+    if pJoin >= 0 then E.PatchByte(pJoin, Byte(E.Len - (pJoin + 1)));
+    // --- join: rdx = PRecordStorage either way ---
+    E.EmitBytes([$48, $8B, $8A]);                    // mov rcx, [rdx + fieldoff] = data pointer
+    if IsFloat then E.Emit32(LongWord(GRecFloatOff)) else E.Emit32(LongWord(GRecIntOff));
+    if IsStore then
+    begin
+      if IsFloat then
+      begin
+        FLoad(XMM0, ValReg);
+        E.EmitBytes([$F2, $0F, $11, $81]); E.Emit32(LongWord(Slot) * 8);   // movsd [rcx+slot*8], xmm0
+      end
+      else
+      begin
+        ILoad(RAX, ValReg);
+        E.EmitBytes([$48, $89, $81]); E.Emit32(LongWord(Slot) * 8);        // mov [rcx+slot*8], rax
+      end;
+    end
+    else
+    begin
+      if IsFloat then
+      begin
+        E.EmitBytes([$F2, $0F, $10, $81]); E.Emit32(LongWord(Slot) * 8);   // movsd xmm0, [rcx+slot*8]
+        FStore(ValReg, XMM0);
+      end
+      else
+      begin
+        E.EmitBytes([$48, $8B, $81]); E.Emit32(LongWord(Slot) * 8);        // mov rax, [rcx+slot*8]
+        IStore(ValReg, RAX);
+      end;
+    end;
+  end;
+
   // LBOUND/UBOUND with a runtime dim: only dim 0 is native (LBound at +24; UBOUND =
   // LBound + Count - 1); any other dim (rank query, per-dim bounds) deopts (JIT J10).
   procedure AotArrBound(apc, ArrayId: Integer; WantUpper: Boolean);
@@ -4077,6 +4208,22 @@ var
         else
           AotArrAccess(False, True, d, IReg(Cur.Src2), IReg(Cur.Dest), apc, Cur.BoundsSafe);
       end;
+      ssaRecordLoadInt, ssaRecordLoadFloat:
+      begin
+        apc := NeedPC; if not OK then Exit;          // a shared-region handle leaves here
+        if Cur.OpCode = ssaRecordLoadFloat then
+          AotRecAccess(apc, IReg(Cur.Src1), Cur.Src3.ConstInt, FReg(Cur.Dest), True, False)
+        else
+          AotRecAccess(apc, IReg(Cur.Src1), Cur.Src3.ConstInt, IReg(Cur.Dest), False, False);
+      end;
+      ssaRecordStoreInt, ssaRecordStoreFloat:
+      begin
+        apc := NeedPC; if not OK then Exit;
+        if Cur.OpCode = ssaRecordStoreFloat then
+          AotRecAccess(apc, IReg(Cur.Src1), Cur.Src3.ConstInt, FReg(Cur.Src2), True, True)
+        else
+          AotRecAccess(apc, IReg(Cur.Src1), Cur.Src3.ConstInt, IReg(Cur.Src2), False, True);
+      end;
       ssaArrayLBound:
       begin
         d := ArrId; if not OK then Exit;
@@ -4415,6 +4562,20 @@ var
   Why: string;
 begin
   Result := nil;
+  n := 0;
+  // Whole-program gate for the native SHARED-record path: without a second thread nothing can grow
+  // the shared-pointer array while compiled code indexes it, so the VM's lock is not needed there.
+  GNoThreads := True;
+  for r := 0 to SSAProg.Blocks.Count - 1 do
+  begin
+    for n := 0 to SSAProg.Blocks[r].Instructions.Count - 1 do
+      if SSAProg.Blocks[r].Instructions[n].OpCode in [ssaThreadCreate, ssaCallSubIndirect] then
+      begin
+        GNoThreads := False;
+        Break;
+      end;
+    if not GNoThreads then Break;
+  end;
   n := 0;
   Regions := AotSliceAndClassify(SSAProg, Prog);
   SetLength(Result, Length(Regions));

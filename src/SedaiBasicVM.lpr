@@ -558,6 +558,7 @@ var
   ShowBanners: Boolean;
   AotFuncList: TAotFuncs;
   AotI: Integer;
+  AotRecordsOff, AotRecSize, AotRecIntOff, AotRecFloatOff, AotSharedRecOff: Integer;
   {$IFDEF ENABLE_PROFILER}
   Profiler: TProfiler;
   ProfMode: TProfilerMode;
@@ -1733,6 +1734,11 @@ begin
       // entry PCs. Needs both the SSA program and the FINAL bytecode (PC/register maps).
       if OptAot then
       begin
+        // Hand the emitter the record-heap layout so a field access lowers natively instead of
+        // paying a helper call (which flushes and reloads the whole register pool around itself).
+        // Offsets only - the compiled code reads the live base from the context it is given.
+        VM.GetRecordLayout(AotRecordsOff, AotRecSize, AotRecIntOff, AotRecFloatOff, AotSharedRecOff);
+        AotSetRecordLayout(AotRecordsOff, AotRecSize, AotRecIntOff, AotRecFloatOff, AotSharedRecOff);
         AotFuncList := AotCompileProgram(SSAProgram, BytecodeProgram, OptTrueValue,
                                          BytecodeProgram.ModernMode and not OptBoundsCheck,
                                          GetEnvironmentVariable('AOT_DIAG') = '1',

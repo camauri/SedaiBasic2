@@ -490,6 +490,13 @@ type
     property AotEnabled: Boolean read FAotEnabled write FAotEnabled;
     // AOT: adopt a compiled function (ownership passes to the VM) under its entry PC.
     procedure RegisterAotFunc(EntryPC: Integer; Mem: TObject);
+    { Layout the native back ends need to reach a record field without a helper: the offset of the
+      Records dynamic-array FIELD inside TExecutionContext, plus SizeOf(TRecordStorage) and the
+      offsets of its IntData/FloatData fields. Only offsets travel, never an address - the emitted
+      code loads the current base from the context it is handed, which is what makes one compiled
+      function correct for the main context and for a THREADCREATE worker alike (see
+      jit-thread-unsafe). The JIT already derives these inline for J13; the AOT gets them here. }
+    procedure GetRecordLayout(out RecordsOff, RecSize, RecIntOff, RecFloatOff, SharedRecOff: Integer);
     // AOT: turn a compiled function's return value into the PC to resume at, handling the
     // C3 helper sentinels. Out of line on purpose - see the implementation comment.
     function AotSettle(C: TExecutionContext; R: PtrInt): Integer;
@@ -6231,6 +6238,21 @@ begin
   // AOT_HELPER_HALT: the instruction ended the run. Clearing Running exits the loop through
   // its own condition, so the template needs no break of its own.
   C.Running := False;
+end;
+
+procedure TBytecodeVM.GetRecordLayout(out RecordsOff, RecSize, RecIntOff, RecFloatOff,
+  SharedRecOff: Integer);
+var
+  RecTmp: TRecordStorage;
+begin
+  RecordsOff  := Integer(PtrUInt(@FCtx.Records) - PtrUInt(Pointer(FCtx)));
+  RecSize     := SizeOf(TRecordStorage);
+  RecIntOff   := Integer(PtrUInt(@RecTmp.IntData) - PtrUInt(@RecTmp));
+  RecFloatOff := Integer(PtrUInt(@RecTmp.FloatData) - PtrUInt(@RecTmp));
+  // The shared region is an array of POINTERS on the VM instance, reached through ctx.VMSelf. Every
+  // record of an ARRAY OF UDT lives there (AllocSharedRecord), which is the common case in real
+  // BASIC, so a native path that handled only the per-context heap would miss all of it.
+  SharedRecOff := Integer(PtrUInt(@FSharedRecords) - PtrUInt(Pointer(Self)));
 end;
 
 procedure TBytecodeVM.RegisterAotFunc(EntryPC: Integer; Mem: TObject);
