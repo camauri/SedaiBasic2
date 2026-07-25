@@ -95,20 +95,42 @@ type
     type
       TDefCountMap = specialize TDictionary<Int64, Integer>;
       TRegKeySet = specialize TDictionary<Int64, Boolean>;
+      TLocalValueMap = specialize TDictionary<string, TSSAValue>;
+      TConstRegMap = specialize TDictionary<Int64, string>;
+      TRegValueMap = specialize TDictionary<Int64, TSSAValue>;
   private
     FScopedTable: TScopedGVNTable;
+    { Value table for STATE-DEPENDENT reads (array element loads, LBOUND/UBOUND). Their result is not
+      a function of their operands alone, so the scoped dominator table is the wrong home for them:
+      A dominating B does NOT mean no store or REDIM ran on some path from A to B. This table is
+      BLOCK-LOCAL and is emptied by any instruction that is not a proven non-writer, so a reuse can
+      only ever be a straight-line one with nothing in between that could have changed the state. }
+    FBlockTable: TLocalValueMap;
     FDomTree: TDominatorTree;
     FProgram: TSSAProgram;
     FReplacements: Integer;  // Count of values replaced
     FCurrentBlock: TSSABasicBlock;  // Current block being processed
     FPhiDefinedRegs: TRegKeySet;    // Registers defined by PHI functions (loop-variant)
     FDefCounts: TDefCountMap;       // packed (RegType,RegIndex,Version) -> number of defining instructions
+    FConstRegs: TConstRegMap;       // single-def constant register -> its hash part (see BuildConstRegs)
+    { Register rewritten into a copy -> the canonical register it now copies. Without this the pass
+      is not transitive: it rewrites a redundant instruction as "Copy canonical" but leaves every
+      LATER instruction reading the copy's own name, so a computation over a value this same pass
+      just proved redundant hashes differently from the one over the canonical value and survives.
+      That is what kept the four "index - LBOUND(a,d)" subtractions of an array-parameter loop alive
+      even after their four LBOUND reads had been collapsed into one. Resolving uses through this map
+      costs nothing at runtime: it only decides hash EQUALITY, no operand is rewritten here. }
+    FCanonRegs: TRegValueMap;
 
     { Process a single basic block }
     procedure ProcessBlock(Block: TSSABasicBlock);
 
     { Process a single instruction within a block }
     procedure ProcessInstruction(Instr: TSSAInstruction);
+
+    { Turn a redundant instruction into a copy of the value that already computed it }
+    procedure RewriteAsCopy(Instr: TSSAInstruction; const ExistingValue: TSSAValue;
+      const Hash: string);
 
     { Compute hash key for an instruction's value }
     function ComputeValueHash(Instr: TSSAInstruction): string;
@@ -127,6 +149,12 @@ type
 
     { Count how many instructions define each register (whole program) }
     procedure BuildDefCounts;
+
+    { Map every single-def register loaded with a literal to that literal's hash part }
+    procedure BuildConstRegs;
+
+    { Operand encoding for the value hash, with constant registers resolved to their value }
+    function HashPart(const V: TSSAValue): string;
 
     { Poison (def-count := 2) every single-def register whose def does NOT dominate every use.
       Single-def alone is NOT single-assignment: a register can be READ before its one def runs
@@ -247,20 +275,91 @@ begin
   Result := Int64(Ord(V.RegType)) or (Int64(V.RegIndex) shl 2) or (Int64(V.Version) shl 32);
 end;
 
+{ True for the reads whose result depends on program STATE (array contents, array bounds) and not on
+  their operands alone. They are value-numbered in the BLOCK-LOCAL table, never in the scoped one. }
+function IsStateDependentRead(Op: TSSAOpCode): Boolean; inline;
+begin
+  Result := Op in [ssaArrayLoad, ssaArrayLBound, ssaArrayUBound];
+end;
+
+{ True for an instruction that must EMPTY the block-local table: anything that could store into an
+  array, reshape one, or hand control to code that does either.
+
+  The polarity is deliberate and is the lesson OpIsMergeSafe already paid for in SedaiRegAlloc: the
+  whitelist names the operations PROVEN not to write, and everything else - including every opcode
+  added after this was written - is a barrier. A missing entry costs a missed reuse; a wrong entry
+  costs a silent miscompile. Note this is about WRITES only, so the pure readers stay on the list
+  (a RecordLoad between two array reads must not throw them away, and it sits exactly there in the
+  hot loop of an array-of-UDT program). }
+function IsMemoryBarrier(Op: TSSAOpCode): Boolean;
+begin
+  case Op of
+    // Structure and control flow within a procedure (a CALL is NOT here: the callee can do anything)
+    ssaPhi, ssaLabel, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
+    // Register-only moves and materialisations
+    ssaLoadConstInt, ssaLoadConstFloat, ssaLoadConstString,
+    ssaCopyInt, ssaCopyFloat, ssaCopyString,
+    // Integer / float arithmetic
+    ssaAddInt, ssaSubInt, ssaMulInt, ssaDivInt, ssaModInt, ssaNegInt,
+    ssaDivUInt, ssaModUInt,
+    ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat, ssaModFloat, ssaPowFloat, ssaNegFloat,
+    ssaShl, ssaShr, ssaShrUInt,
+    ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,
+    // Conversions and width changes
+    ssaIntToFloat, ssaFloatToInt, ssaIntToString, ssaFloatToString,
+    ssaStringToInt, ssaStringToFloat, ssaFloatRound, ssaNarrowInt, ssaNarrowSingle,
+    // Comparisons
+    ssaCmpEqInt, ssaCmpNeInt, ssaCmpLtInt, ssaCmpGtInt, ssaCmpLeInt, ssaCmpGeInt,
+    ssaCmpLtUInt, ssaCmpGtUInt, ssaCmpLeUInt, ssaCmpGeUInt,
+    ssaCmpEqFloat, ssaCmpNeFloat, ssaCmpLtFloat, ssaCmpGtFloat, ssaCmpLeFloat, ssaCmpGeFloat,
+    ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
+    // Value-producing string builders (they allocate a result string, they never write user memory)
+    ssaStrConcat, ssaStrLen, ssaStrLenW, ssaStrLeft, ssaStrRight, ssaStrMid,
+    ssaStrLeftW, ssaStrRightW, ssaStrMidW, ssaStrInstrW, ssaStrInstrRevW, ssaStrWChr, ssaStrWStringN,
+    ssaStrAsc, ssaStrChr, ssaStrStr, ssaStrVal, ssaStrHex, ssaStrInstr,
+    ssaStrLTrim, ssaStrRTrim, ssaStrTrim, ssaStrUCase, ssaStrLCase, ssaStrInstrRev,
+    ssaStrSpace, ssaStrString, ssaStrTrimSet, ssaStrInstrRevAny, ssaStrInstrAny,
+    ssaStrOct, ssaStrBin, ssaStrValInt, ssaStrDec,
+    ssaStrMkInt, ssaStrMkFloat, ssaStrCvInt, ssaStrCvFloat,
+    // Math
+    ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathLog, ssaMathExp,
+    ssaMathSqr, ssaMathAbs, ssaMathSgn, ssaMathInt,
+    ssaMathLog10, ssaMathLog2, ssaMathLogN,
+    ssaMathAcos, ssaMathAsin, ssaMathAtan2, ssaMathFix, ssaMathFrac,
+    ssaMathSinh, ssaMathCosh, ssaMathTanh, ssaMathAsinh, ssaMathAcosh, ssaMathAtanh,
+    // Pure READS - they observe state, they do not change it
+    ssaArrayLoad, ssaArrayLBound, ssaArrayUBound,
+    ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString,
+    ssaArrayLoadIndInt, ssaArrayLoadIndFloat, ssaArrayLoadIndString,
+    ssaRefLoadInt, ssaRefLoadFloat, ssaRefLoadString,
+    ssaRawLoadInt, ssaRawLoadFloat, ssaRawLoadZStr,
+    ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString:
+      Result := False;
+  else
+    Result := True;
+  end;
+end;
+
 constructor TGVNPass.Create;
 begin
   inherited Create;
   FScopedTable := TScopedGVNTable.Create;
+  FBlockTable := TLocalValueMap.Create;
   FPhiDefinedRegs := TRegKeySet.Create;
   FDefCounts := TDefCountMap.Create;
+  FConstRegs := TConstRegMap.Create;
+  FCanonRegs := TRegValueMap.Create;
   FReplacements := 0;
   FCurrentBlock := nil;
 end;
 
 destructor TGVNPass.Destroy;
 begin
+  FCanonRegs.Free;
+  FConstRegs.Free;
   FDefCounts.Free;
   FPhiDefinedRegs.Free;
+  FBlockTable.Free;
   FScopedTable.Free;
   inherited Destroy;
 end;
@@ -450,6 +549,33 @@ begin
   { Check if any source operand of this instruction is loop-variant }
   Result := False;
 
+  { Answers "must this instruction be confined to the BLOCK-LOCAL table?", not "is it unsafe?".
+
+    Reuse across blocks is sound here even for a loop-variant operand, and the guards that make it so
+    are already in place:
+
+      * every operand and the Dest are SINGLE-DEF program-wide (BuildDefCounts), and
+      * every single-def register's def DOMINATES all its uses (PoisonUseBeforeDef),
+      * the scoped table only ever offers a canonical value whose block DOMINATES the current one.
+
+    Take the canonical instruction A and the redundant B (same opcode, same operand NAMES), A
+    dominating B, and let D be the single def of some operand. D dominates A. For D to run again
+    between A and B, control must leave A, reach D and come back; but every path from D to B goes
+    through A (A dominates B), so the last D before B is still followed by A before B. Hence A's
+    Dest holds exactly what B would compute, and nothing can overwrite it - A is its only def.
+
+    What is NOT sound across blocks is the COST. A value built from a loop-varying operand is
+    recomputed every iteration by definition, so reusing one from a different block means keeping it
+    live across the loop latch - and with Copy Coalescing disabled ([[copycoal-miscompile]]) the
+    parallel copies PHI elimination then emits are permanent. Measured on nbody_fb: numbering the
+    "i + 1" of the loop CONDITION together with the "i + 1" of the increment removes one AddInt and
+    adds a THREE-copy rotation, +2.3% on --aot. Confining these to one block keeps every
+    straight-line redundancy - which is where the array-parameter subscripts sit, four in a row in
+    the same block - and gives up only the ones that would have stretched a live range.
+
+    So: loop-variant operand => block-local table. Same-block reuse cannot lengthen a live range
+    across the latch, and it needs no argument about iterations at all. }
+
   if (Instr.Src1.Kind <> svkNone) and IsLoopVariant(Instr.Src1) then
     Exit(True);
   if (Instr.Src2.Kind <> svkNone) and IsLoopVariant(Instr.Src2) then
@@ -480,6 +606,73 @@ begin
   end;
 end;
 
+procedure TGVNPass.BuildConstRegs;
+var
+  i, j: Integer;
+  Block: TSSABasicBlock;
+  Instr: TSSAInstruction;
+begin
+  { Two registers holding the SAME literal are the same value, but the instructions that load them
+    are not value-numbered (a constant is cheaper to rematerialise than to keep alive in a register,
+    which is why LoadConst is excluded from numbering below). Without this map that decision also
+    hides every computation OVER those constants: the SSA generator allocates a fresh register per
+    occurrence, so "LBOUND(a, dim0)" emitted at two different subscripts gets two different dimension
+    registers and the two reads hash differently - and so, in turn, do the index subtractions and the
+    element loads built on them. Resolving a constant register to its VALUE in the hash fixes that
+    without materialising a single extra live range: only the hash changes, and the rewrite still
+    copies from the canonical register, which dominates.
+    Restricted to single-def registers - a name written twice does not denote one value. }
+  FConstRegs.Clear;
+  for i := 0 to FProgram.Blocks.Count - 1 do
+  begin
+    Block := FProgram.Blocks[i];
+    for j := 0 to Block.Instructions.Count - 1 do
+    begin
+      Instr := Block.Instructions[j];
+      if Instr.Dest.Kind <> svkRegister then Continue;
+      if not IsSingleDef(Instr.Dest) then Continue;
+      case Instr.OpCode of
+        ssaLoadConstInt:
+          if Instr.Src1.Kind = svkConstInt then
+            FConstRegs.AddOrSetValue(RegKey64(Instr.Dest), 'i' + IntToStr(Instr.Src1.ConstInt));
+        ssaLoadConstFloat:
+          if Instr.Src1.Kind = svkConstFloat then
+            FConstRegs.AddOrSetValue(RegKey64(Instr.Dest),
+              'f' + IntToStr(PInt64(@Instr.Src1.ConstFloat)^));
+        ssaLoadConstString:
+          if Instr.Src1.Kind = svkConstString then
+            FConstRegs.AddOrSetValue(RegKey64(Instr.Dest), 's' + IntToStr(Instr.Src1.ConstStringId));
+      end;
+    end;
+  end;
+end;
+
+function TGVNPass.HashPart(const V: TSSAValue): string;
+var
+  Canon, Next: TSSAValue;
+  Hops: Integer;
+begin
+  Canon := V;
+  // Follow the canonical chain. Each hop maps a register this pass turned into a copy onto the
+  // register it copies, so the chain is acyclic by construction (the canonical value was inserted
+  // strictly earlier); the counter is a cheap backstop, not a correctness argument.
+  // NOTE: the result of TryGetValue goes to a SEPARATE variable. An `out` parameter is zeroed on
+  // entry by FPC, so reading the lookup straight into Canon would destroy it on the FAILING call -
+  // leaving Kind = svkNone, which ValueHashPart encodes as '?', so every operand in the program
+  // would hash alike and match anything. Guard m466 (job/tests/bas/gvn_paramarray_store.bas).
+  Hops := 0;
+  while (Canon.Kind = svkRegister) and (Hops < 16) do
+  begin
+    if not FCanonRegs.TryGetValue(RegKey64(Canon), Next) then Break;
+    Canon := Next;
+    Inc(Hops);
+  end;
+
+  if (Canon.Kind = svkRegister) and FConstRegs.TryGetValue(RegKey64(Canon), Result) then
+    Exit;
+  Result := ValueHashPart(Canon);
+end;
+
 function TGVNPass.ComputeValueHash(Instr: TSSAInstruction): string;
 begin
   { Compute a hash key that uniquely identifies the value computed by this instruction.
@@ -497,11 +690,11 @@ begin
 
   // Append source operands
   if Instr.Src1.Kind <> svkNone then
-    Result := Result + ':' + ValueHashPart(Instr.Src1);
+    Result := Result + ':' + HashPart(Instr.Src1);
   if Instr.Src2.Kind <> svkNone then
-    Result := Result + ':' + ValueHashPart(Instr.Src2);
+    Result := Result + ':' + HashPart(Instr.Src2);
   if Instr.Src3.Kind <> svkNone then
-    Result := Result + ':' + ValueHashPart(Instr.Src3);
+    Result := Result + ':' + HashPart(Instr.Src3);
 end;
 
 function TGVNPass.IsValueNumberable(Instr: TSSAInstruction): Boolean;
@@ -590,9 +783,17 @@ begin
     ssaCopyInt, ssaCopyFloat, ssaCopyString:
       Result := False;
 
-    // Array loads (pure if no intervening stores)
-    ssaArrayLoad:
-      Result := True;  // Note: requires dominance check in practice
+    // State-dependent reads. Reuse is confined to the block-local table (see IsStateDependentRead),
+    // which is emptied by anything that could store or reshape, so "no intervening stores" is
+    // ENFORCED here rather than assumed.
+    //
+    // LBOUND/UBOUND earn their place: on an array PARAMETER the callee cannot know the caller's
+    // lower bound, so EVERY subscript lowers to "index - LBOUND(a, d)" and a loop body re-reads the
+    // same descriptor field once per access. Numbering them collapses those to one, which in turn
+    // makes the index subtractions and element loads textually identical so they collapse too - and
+    // then LICM can lift the single survivor out of the loop entirely.
+    ssaArrayLoad, ssaArrayLBound, ssaArrayUBound:
+      Result := True;
 
     // Everything else is unsafe
     else
@@ -622,21 +823,23 @@ begin
           IsSingleDef(Instr.Src2) and IsSingleDef(Instr.Src3)) then
     Exit;
 
-  // CRITICAL FIX: Skip instructions that use loop-variant values (PHI-defined)
-  // These values change across loop iterations, so we cannot safely reuse
-  // computations that depend on them from previous iterations.
-  if UsesLoopVariantValue(Instr) then
-  begin
-    {$IFDEF DEBUG_GVN}
-    if DebugGVN then
-      WriteLn(Format('[GVN] Skipping loop-variant instruction: %s (uses PHI-defined value)',
-        [SSAValueToString(Instr.Dest)]));
-    {$ENDIF}
-    Exit;
-  end;
-
   // Compute hash for this instruction's value
   Hash := ComputeValueHash(Instr);
+
+  // Two families answer from the BLOCK-LOCAL table only. ProcessBlock empties that table on entry to
+  // the block and again at every barrier, so a hit there means: same block, earlier instruction, and
+  // nothing in between that could store into an array or reshape one.
+  //   * a STATE-DEPENDENT read, because its value is not a function of its operands (soundness);
+  //   * anything built on a LOOP-VARIANT value, because reusing one across blocks only stretches a
+  //     live range over the loop latch (cost - see UsesLoopVariantValue).
+  if IsStateDependentRead(Instr.OpCode) or UsesLoopVariantValue(Instr) then
+  begin
+    if FBlockTable.TryGetValue(Hash, ExistingValue) then
+      RewriteAsCopy(Instr, ExistingValue, Hash)
+    else
+      FBlockTable.AddOrSetValue(Hash, Instr.Dest);
+    Exit;
+  end;
 
   // STEP 5: Lookup in scoped hash table
   if FScopedTable.Lookup(Hash, ExistingValue) then
@@ -645,46 +848,46 @@ begin
 
       STEP 6: Dominance check
       In a correct preorder traversal, if the value exists in the scoped table,
-      it MUST dominate the current instruction (by construction of the scope stack).
-
-      However, we add an explicit check for array loads to handle potential
-      aliasing issues. }
-
-    if (Instr.OpCode = ssaArrayLoad) then
-    begin
-      // For array loads, be conservative (Step 6 requirement)
-      // In practice, we'd check if there's an intervening store
-      // For now, we skip GVN on array loads (Phase 3 Tier 1 handles this via LICM)
-      FScopedTable.Insert(Hash, Instr.Dest);
-      Exit;
-    end;
-
-    {$IFDEF DEBUG_GVN}
-    // Replace this instruction's result with the existing value
-    if DebugGVN then
-      WriteLn(Format('[GVN] Replacing %s with %s (hash: %s)',
-        [SSAValueToString(Instr.Dest), SSAValueToString(ExistingValue), Hash]));
-    {$ENDIF}
-
-    // Convert to a Copy instruction with correct type
-    case Instr.Dest.RegType of
-      srtInt:    Instr.OpCode := ssaCopyInt;
-      srtFloat:  Instr.OpCode := ssaCopyFloat;
-      srtString: Instr.OpCode := ssaCopyString;
-    end;
-
-    Instr.Src1 := ExistingValue;
-    Instr.Src2 := MakeSSAValue(svkNone);
-    Instr.Src3 := MakeSSAValue(svkNone);
-    Instr.Comment := 'GVN: reuse';
-
-    Inc(FReplacements);
+      it MUST dominate the current instruction (by construction of the scope stack). }
+    RewriteAsCopy(Instr, ExistingValue, Hash);
   end
   else
   begin
     // STEP 5: Insert into current scope
     FScopedTable.Insert(Hash, Instr.Dest);
   end;
+end;
+
+procedure TGVNPass.RewriteAsCopy(Instr: TSSAInstruction; const ExistingValue: TSSAValue;
+  const Hash: string);
+begin
+  {$IFDEF DEBUG_GVN}
+  if DebugGVN then
+    WriteLn(Format('[GVN] Replacing %s with %s (hash: %s)',
+      [SSAValueToString(Instr.Dest), SSAValueToString(ExistingValue), Hash]));
+  {$ELSE}
+  if Hash = '' then ;  // parameter is only read by the debug trace
+  {$ENDIF}
+
+  // Convert to a Copy instruction with correct type
+  case Instr.Dest.RegType of
+    srtInt:    Instr.OpCode := ssaCopyInt;
+    srtFloat:  Instr.OpCode := ssaCopyFloat;
+    srtString: Instr.OpCode := ssaCopyString;
+  end;
+
+  Instr.Src1 := ExistingValue;
+  Instr.Src2 := MakeSSAValue(svkNone);
+  Instr.Src3 := MakeSSAValue(svkNone);
+  Instr.Comment := 'GVN: reuse';
+
+  // From here on this Dest IS the canonical value, so every later instruction reading it must hash
+  // as if it read the canonical register. Only single-def Dests reach this point, so the mapping
+  // holds everywhere the register is live.
+  if Instr.Dest.Kind = svkRegister then
+    FCanonRegs.AddOrSetValue(RegKey64(Instr.Dest), ExistingValue);
+
+  Inc(FReplacements);
 end;
 
 procedure TGVNPass.TraverseDomTree(Block: TSSABasicBlock);
@@ -748,10 +951,18 @@ begin
       [Block.LabelName, Block.Instructions.Count]));
   {$ENDIF}
 
+  // The state-dependent table never survives a block boundary: entering a block says nothing about
+  // which of its predecessors ran, nor what they stored.
+  FBlockTable.Clear;
+
   // Process each instruction in block
   for i := 0 to Block.Instructions.Count - 1 do
   begin
     Instr := Block.Instructions[i];
+    // Barrier FIRST: an instruction that can write or reshape invalidates the reads recorded before
+    // it, including - conservatively - its own operands' worth of state.
+    if IsMemoryBarrier(Instr.OpCode) then
+      FBlockTable.Clear;
     ProcessInstruction(Instr);
   end;
 end;
@@ -793,6 +1004,10 @@ begin
   // reads the bank's implicit zero and must not share the def's value number). Needs the
   // dominator tree, hence after the assignment above.
   PoisonUseBeforeDef;
+
+  // Constant registers are keyed on IsSingleDef, so this must follow the poisoning above.
+  BuildConstRegs;
+  FCanonRegs.Clear;
 
   // STEP 4: Traverse blocks in preorder
   {$IFDEF DEBUG_GVN}

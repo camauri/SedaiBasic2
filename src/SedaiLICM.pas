@@ -89,6 +89,7 @@ type
     FLoopDefCount: TKeyCountMap;  // (RegType,RegIndex,Version) → number of defs inside the loop
     FLoopUsedOutside: TKeySet;    // (RegType,RegIndex,Version) used by any instruction OUTSIDE the loop
     FLoopModArrays: TKeySet;      // array ids stored to inside the loop
+    FLoopReshapesArrays: Boolean; // the loop can change some array's SHAPE (bounds), see BuildLoopMaps
 
     { Precompute the user-variable bitmap from FProgram.VarRegMap }
     procedure BuildUserVarIndex;
@@ -617,6 +618,15 @@ begin
     ssaArrayLoad:
       Result := True;
 
+    // LBOUND/UBOUND read the array's SHAPE, not its contents, so element stores do not disturb them
+    // and they are invariant in any loop that cannot move a bound. The safety check is in
+    // IsCandidateModern (FLoopReshapesArrays). This matters far beyond an explicit LBOUND in the
+    // source: EVERY subscript on an array PARAMETER lowers to "index - LBOUND(a, d)" (the callee
+    // cannot know the caller's lower bound), so a hot loop over an array argument re-reads the same
+    // descriptor field on every access - four times per iteration in job/tests/bench/intrec_fb.bas.
+    ssaArrayLBound, ssaArrayUBound:
+      Result := True;
+
     // Everything else - NOT safe
     else
       Result := False;
@@ -854,6 +864,7 @@ begin
   FLoopDefCount.Clear;
   FLoopUsedOutside.Clear;
   FLoopModArrays.Clear;
+  FLoopReshapesArrays := False;
   for i := 0 to FProgram.Blocks.Count - 1 do
   begin
     Block := FProgram.Blocks[i];
@@ -881,6 +892,21 @@ begin
       begin
         if (Instr.OpCode = ssaArrayStore) and (Instr.Src1.Kind = svkConstInt) then
           FLoopModArrays.AddOrSetValue(Instr.Src1.ConstInt, True);
+        // An array's SHAPE (its bounds) is fixed for the whole loop unless the loop itself can change
+        // it. That is what makes LBOUND/UBOUND hoistable. Everything that can move a bound counts:
+        // DIM/REDIM/ERASE on any array (including a UDT member array), and the BYREF param binding
+        // ops, which re-point a parameter slot at another array. A CALL counts too - the callee can
+        // REDIM a module array or rebind a slot, and the CFG carries no return edge to model it
+        // (the same reason the register merge pins values live across a call). One flag for all
+        // arrays, not a per-id set: these ops are rare inside a hot loop, and a bind names the
+        // PARAMETER slot rather than the array the caller passed, so a per-id set would under-report.
+        case Instr.OpCode of
+          ssaArrayDim, ssaArrayErase, ssaArrayRedim, ssaArrayRedimPush, ssaArrayRedimN,
+          ssaMemberArrayRedim,
+          ssaArrayBind, ssaArrayUnbind, ssaArrayBindApply, ssaArrayBindInd,
+          ssaCall, ssaCallSub, ssaCallSubIndirect, ssaThreadCreate:
+            FLoopReshapesArrays := True;
+        end;
       end
       else
       begin
@@ -1005,6 +1031,17 @@ begin
     // loop and the index is loop-invariant.
     if Instr.Src1.Kind <> svkConstInt then Exit;
     if IsArrayModifiedInLoop(Instr.Src1.ConstInt, Loop) then Exit;
+    Result := OperandInvariantModern(Instr.Src2, Loop, ToHoist);
+    Exit;
+  end;
+
+  if Instr.OpCode in [ssaArrayLBound, ssaArrayUBound] then
+  begin
+    // Src1 = svkArrayRef (a compile-time array id, not a value), Src2 = the dimension register.
+    // A bound is invariant iff nothing in the loop can reshape an array; element stores are
+    // irrelevant, so IsArrayModifiedInLoop deliberately does NOT apply here.
+    if FLoopReshapesArrays then Exit;
+    if Instr.Src1.Kind <> svkArrayRef then Exit;
     Result := OperandInvariantModern(Instr.Src2, Loop, ToHoist);
     Exit;
   end;
