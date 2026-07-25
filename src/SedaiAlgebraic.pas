@@ -92,6 +92,7 @@ type
 
     { Check if register key maps to a BASIC user variable }
     function IsUserVariable(const VarKey: string): Boolean;
+    function IsUserVarExact(const V: TSSAValue): Boolean;
 
     { Resolve register to constant value if available }
     function ResolveToConst(const Val: TSSAValue; out ConstVal: TSSAValue): Boolean;
@@ -188,9 +189,16 @@ end;
 
 function TAlgebraicSimplification.MakeRegKey(const RegVal: TSSAValue): string;
 begin
-  // Create unique key: "RegIndex:Version"
-  // This ensures R5:1 and R5:2 are treated as different registers (SSA versioning)
-  Result := IntToStr(RegVal.RegIndex) + ':' + IntToStr(RegVal.Version);
+  // Unique key: "RegType:RegIndex:Version".
+  //
+  // The BANK is not optional. Without it an int register and a float register with the same index
+  // and version share one entry, and the constant map answers with whichever was recorded first -
+  // so "7.6 \ 2" resolved its divisor to the 1.0 living at the same index in the float bank, the
+  // division collapsed to a copy, and the program printed the numerator (8 instead of 4). This is
+  // the register bank-typing class this pass's own header warns about; it stayed latent only while
+  // the user-variable guard was excluding nearly every constant from the map. Guard m394.
+  Result := IntToStr(Ord(RegVal.RegType)) + ':' + IntToStr(RegVal.RegIndex) + ':' +
+            IntToStr(RegVal.Version);
 end;
 
 procedure TAlgebraicSimplification.BuildConstantMap;
@@ -198,7 +206,7 @@ var
   Block: TSSABasicBlock;
   Instr: TSSAInstruction;
   i, j: Integer;
-  DestKey, SrcKey: string;
+  DestKey, SrcKey, UserKey: string;
   P, PSrc: PSSAValueWrapper;
   ConstVal: TSSAValue;
 begin
@@ -221,10 +229,30 @@ begin
       begin
         DestKey := MakeRegKey(Instr.Dest);
 
-        // Check if this register maps to a BASIC user variable
-        // If it does, skip tracking (user vars can change value, not true constants)
-        if IsUserVariable(DestKey) then
-          Continue;  // Skip this LoadConst, don't add to FConstMap
+        // Skip only a register whose name does not denote ONE value: an UNVERSIONED user variable.
+        // "I% = 0" at the head of a FOR loop is not a constant, and under global-by-name semantics
+        // there is no way to tell it apart from a real one - hence the skip.
+        // A versioned destination (MODERN) is a genuine single definition and is safe to record.
+        // The old test ignored the version, and worse, its "RegIndex:Version" branch matches on the
+        // INDEX ALONE across every bank, so a compiler temp merely sharing an index with some user
+        // variable was excluded too - which on small programs is most of them.
+        // CLASSIC keeps the historical "RegIndex:Version" query, whose fallback matches on the INDEX
+        // ALONE across every bank - deliberately conservative there, and left untouched. MODERN asks
+        // the exact "RegType:RegIndex" question, so a compiler temp is no longer mistaken for a user
+        // variable just because it happens to share an index with one.
+        if Instr.Dest.Version = 0 then
+        begin
+          if FProgram.GlobalVariableSemantics then
+          begin
+            // CLASSIC keeps the historical index-only match, which needs the OLD two-part key:
+            // IsUserVariable reads the leading number as a RegIndex, and MakeRegKey now leads with
+            // the bank.
+            UserKey := IntToStr(Instr.Dest.RegIndex) + ':' + IntToStr(Instr.Dest.Version);
+            if IsUserVariable(UserKey) then Continue;
+          end
+          else
+            if IsUserVarExact(Instr.Dest) then Continue;
+        end;
 
         // Allocate and store the constant value
         New(P);
@@ -305,6 +333,20 @@ begin
       end;
     end;
   end;
+end;
+
+function TAlgebraicSimplification.IsUserVarExact(const V: TSSAValue): Boolean;
+begin
+  // Exact "is THIS register (bank + index) mapped to a user variable" - no index-only fallback.
+  //
+  // It exists because IsUserVariable below takes a STRING in either of two formats and cannot tell
+  // them apart: given the exact key "1:5" it first tries a literal lookup, then falls through to
+  // parsing the leading number as a RegIndex - so it tests FUserVarRegIndex[1], reading the BANK as
+  // an index. Bank ordinals are 0..2 and any program with a couple of variables maps those indices,
+  // so the fallback answered TRUE for practically every exact query and silently disabled the
+  // caller. Ask the typed question instead of encoding it in a string.
+  Result := (V.Kind = svkRegister) and
+            (FUserVarKeys.FindIndexOf(IntToStr(Ord(V.RegType)) + ':' + IntToStr(V.RegIndex)) >= 0);
 end;
 
 function TAlgebraicSimplification.IsUserVariable(const VarKey: string): Boolean;
@@ -406,28 +448,51 @@ var
 begin
   Result := Instr;
 
-  // CRITICAL: Do NOT optimize operations involving BASIC user variables
-  // With GlobalVariableSemantics (Version=0), we cannot safely determine constant values
-  // Example: I% + 1 where I%=0 looks like 0+1, but I% is a loop variable, not a constant
-  if (Instr.Src1.Kind = svkRegister) then
+  // Do NOT optimize an operand whose register name does not denote ONE value.
+  //
+  // The property that matters is VERSIONING, not "is this a user variable". Under
+  // GlobalVariableSemantics every value is Version=0 and a register name is global-by-name, so
+  // "I% + 1" can look like "0 + 1" while I% is a loop counter - hence the guard. A VERSIONED value
+  // (Version>0, MODERN proc-local SSA) is a real single definition, and BuildConstantMap is keyed on
+  // RegIndex:Version, so its answer for such an operand is exact.
+  //
+  // The guard used to test only "is it in VarRegMap", ignoring the version. In CLASSIC that is the
+  // same test. In MODERN it excluded EVERY declared scalar, which is nearly every operand - and the
+  // pass was measured inert on 910 of 910 corpus programs, with "Print 7 * 1 + 0 - 0" reaching the
+  // bytecode as three live multiplications and additions. Keeping the Version=0 half preserves
+  // CLASSIC behaviour exactly.
+  // CLASSIC only. Under global-by-name semantics a register name does not denote one value, so the
+  // pass refuses outright to touch an expression mentioning a user variable.
+  //
+  // In MODERN this blanket guard is both WRONG-HEADED and totally disabling. Wrong-headed because
+  // the identities below - x*1, x+0, x-0, x/1 - hold for ANY x: they need to know that the OTHER
+  // operand is the constant, and nothing whatsoever about x. Disabling because it excluded every
+  // declared scalar, which is nearly every operand: the pass was measured inert on 910 of 910
+  // corpus programs. What must not happen is mistaking a user variable FOR a constant, and that
+  // decision belongs to BuildConstantMap (which refuses to record an unversioned user variable) -
+  // not here. Every IsZero/IsOne test below resolves through that map, so the protection stands.
+  if FProgram.GlobalVariableSemantics then
   begin
-    VarKey := IntToStr(Ord(Instr.Src1.RegType)) + ':' + IntToStr(Instr.Src1.RegIndex);
-    if IsUserVariable(VarKey) then
-      Exit(Instr);  // Don't optimize, return original instruction
-  end;
+    if (Instr.Src1.Kind = svkRegister) then
+    begin
+      VarKey := IntToStr(Ord(Instr.Src1.RegType)) + ':' + IntToStr(Instr.Src1.RegIndex);
+      if IsUserVariable(VarKey) then
+        Exit(Instr);  // Don't optimize, return original instruction
+    end;
 
-  if (Instr.Src2.Kind = svkRegister) then
-  begin
-    VarKey := IntToStr(Ord(Instr.Src2.RegType)) + ':' + IntToStr(Instr.Src2.RegIndex);
-    if IsUserVariable(VarKey) then
-      Exit(Instr);  // Don't optimize, return original instruction
-  end;
+    if (Instr.Src2.Kind = svkRegister) then
+    begin
+      VarKey := IntToStr(Ord(Instr.Src2.RegType)) + ':' + IntToStr(Instr.Src2.RegIndex);
+      if IsUserVariable(VarKey) then
+        Exit(Instr);  // Don't optimize, return original instruction
+    end;
 
-  if (Instr.Src3.Kind = svkRegister) then
-  begin
-    VarKey := IntToStr(Ord(Instr.Src3.RegType)) + ':' + IntToStr(Instr.Src3.RegIndex);
-    if IsUserVariable(VarKey) then
-      Exit(Instr);  // Don't optimize, return original instruction
+    if (Instr.Src3.Kind = svkRegister) then
+    begin
+      VarKey := IntToStr(Ord(Instr.Src3.RegType)) + ':' + IntToStr(Instr.Src3.RegIndex);
+      if IsUserVariable(VarKey) then
+        Exit(Instr);  // Don't optimize, return original instruction
+    end;
   end;
 
   NewInstr := Instr.Clone;

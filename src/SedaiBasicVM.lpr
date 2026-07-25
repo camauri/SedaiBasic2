@@ -544,6 +544,13 @@ var
   TimeStrength, TimeGosubInline, TimeConstProp, TimeCopyProp, TimeLICM: Double;
   TimeLoopUnroll, TimeDCE, TimePhiElim, TimeCopyCoal, TimeRegAlloc: Double;
   PassTimer: THiResTimer;
+  // Per-pass EFFECT (when OptStats is enabled), collected by PassMark below. The timings alone
+  // cannot tell a pass that is working from one that fires on nothing - both cost a fraction of a
+  // millisecond and look the same in the breakdown. This records whether the SSA program actually
+  // changed, and by how many instructions.
+  PassEffect: TStringList;
+  PassPrevHash: QWord;
+  PassPrevCount: Integer;
   i, removed: Integer;
   ErrorSourceLine: Integer;
   US: string;            // uppercased RAW source for the '#lang "qb"' detection
@@ -560,9 +567,36 @@ var
   RegAlloc: TLinearScanAllocator;
   SpillCount: Integer;
   {$ENDIF}
+
+  // Record what a pass actually DID, by comparing the SSA program's content fingerprint before and
+  // after it. Called right after each pass's timing line, so the two answer different questions:
+  // the timer says what the pass cost, this says whether it earned it. A pass reported as "inert"
+  // rewrote nothing at all on this program - which is not automatically a defect (many passes
+  // legitimately find no opportunity in a given program), but a pass inert across the whole corpus
+  // is the signature of the GVN bug found on 2026-07-25: sound, timed, and doing nothing.
+  procedure PassMark(const AName: string);
+  var
+    H: QWord;
+    Cnt, Delta: Integer;
+  begin
+    if not OptStats then Exit;
+    if not Assigned(SSAProgram) then Exit;
+    H := SSAProgram.Fingerprint(Cnt);
+    Delta := Cnt - PassPrevCount;
+    if H = PassPrevHash then
+      PassEffect.Add(Format('    %-14s inert     (%5d instrs)', [AName + ':', Cnt]))
+    else
+      // FPC's Format has no '+' flag - the sign goes in by hand.
+      PassEffect.Add(Format('    %-14s CHANGED   (%5d instrs, %s%d)',
+        [AName + ':', Cnt, Copy('+', 1, Ord(Delta >= 0)), Delta]));
+    PassPrevHash := H;
+    PassPrevCount := Cnt;
+  end;
+
 begin
   // Determine if we should show banners (any option enabled)
   ShowBanners := OptVerbose or OptDumpAST or OptDisasm or OptStats or AnyDebugActive;
+  PassEffect := nil;   // several early-exit paths run before it is created
 
   if ShowBanners then
   begin
@@ -759,6 +793,9 @@ begin
       TimeCSE := 0; TimeAlgebraic := 0; TimeStrength := 0; TimeGosubInline := 0;
       TimeConstProp := 0; TimeCopyProp := 0; TimeLICM := 0; TimeLoopUnroll := 0;
       TimeDCE := 0; TimePhiElim := 0; TimeCopyCoal := 0; TimeRegAlloc := 0;
+      // Baseline for the per-pass effect report (see PassMark)
+      PassEffect := TStringList.Create;
+      if OptStats then PassPrevHash := SSAProgram.Fingerprint(PassPrevCount);
 
       {$IFNDEF DISABLE_SUB_INLINING}
       // SUB/FUNCTION INLINING (unification) - flatten small leaf calls FIRST, so the
@@ -796,6 +833,7 @@ begin
         end;
       end;
       if OptStats then TimeDBE := PassTimer.ElapsedMilliseconds;
+      PassMark('DBE');
       {$ELSE}
       {$IFDEF DEBUG_DBE}
       if DebugDBE then
@@ -829,6 +867,7 @@ begin
         end;
       end;
       if OptStats then TimeDomTree := PassTimer.ElapsedMilliseconds;
+      PassMark('Dom Tree');
 
       // PHASE 3: Semi-Pruned SSA Construction with versioning
       {$IFNDEF DISABLE_SSA_CONSTRUCTION}
@@ -844,6 +883,7 @@ begin
         end;
       end;
       if OptStats then TimeSSAConstr := PassTimer.ElapsedMilliseconds;
+      PassMark('SSA Constr');
       {$ELSE}
       {$IFDEF DEBUG_SSA}
       if DebugSSA then
@@ -887,6 +927,7 @@ begin
         end;
       end;
       if OptStats then TimeGVN := PassTimer.ElapsedMilliseconds;
+      PassMark('GVN');
       {$ELSE}
       {$IFDEF DEBUG_GVN}
       if DebugGVN then
@@ -929,6 +970,7 @@ begin
         end;
       end;
       if OptStats then TimeCSE := PassTimer.ElapsedMilliseconds;
+      PassMark('CSE');
       {$ELSE}
       {$IFDEF DEBUG_CSE}
       if DebugCSE then
@@ -970,6 +1012,7 @@ begin
         end;
       end;
       if OptStats then TimeAlgebraic := PassTimer.ElapsedMilliseconds;
+      PassMark('Algebraic');
       {$ELSE}
       {$IFDEF DEBUG_ALGEBRAIC}
       if DebugAlgebraic then
@@ -1001,6 +1044,7 @@ begin
         end;
       end;
       if OptStats then TimeStrength := PassTimer.ElapsedMilliseconds;
+      PassMark('Strength');
       {$ELSE}
       {$IFDEF DEBUG_STRENGTH}
       if DebugStrength then
@@ -1032,6 +1076,7 @@ begin
         end;
       end;
       if OptStats then TimeGosubInline := PassTimer.ElapsedMilliseconds;
+      PassMark('GOSUB Inline');
       {$ELSE}
       {$IFDEF DEBUG_SSA}
       if DebugSSA then
@@ -1065,6 +1110,7 @@ begin
         end;
       end;
       if OptStats then TimeConstProp := PassTimer.ElapsedMilliseconds;
+      PassMark('Const Prop');
       {$ELSE}
       {$IFDEF DEBUG_CONSTPROP}
       if DebugConstProp then
@@ -1096,6 +1142,7 @@ begin
         end;
       end;
       if OptStats then TimeCopyProp := PassTimer.ElapsedMilliseconds;
+      PassMark('Copy Prop');
       {$ELSE}
       {$IFDEF DEBUG_COPYPROP}
       if DebugCopyProp then
@@ -1127,6 +1174,7 @@ begin
         end;
       end;
       if OptStats then TimeLICM := PassTimer.ElapsedMilliseconds;
+      PassMark('LICM');
       {$ELSE}
       {$IFDEF DEBUG_LICM}
       if DebugLICM then
@@ -1163,6 +1211,7 @@ begin
         end;
       end;
       if OptStats then TimeLoopUnroll := PassTimer.ElapsedMilliseconds;
+      PassMark('Loop Unroll');
       {$ELSE}
       {$IFDEF DEBUG_SSA}
       if DebugSSA then
@@ -1195,6 +1244,7 @@ begin
         end;
       end;
       if OptStats then TimeDCE := PassTimer.ElapsedMilliseconds;
+      PassMark('DCE');
       {$ELSE}
       {$IFDEF DEBUG_DCE}
       if DebugDCE then
@@ -1246,6 +1296,7 @@ begin
         end;
       end;
       if OptStats then TimePhiElim := PassTimer.ElapsedMilliseconds;
+      PassMark('PHI Elim');
       {$ELSE}
       {$IFDEF DEBUG_PHIELIM}
       if DebugPhiElim then
@@ -1289,6 +1340,7 @@ begin
         end;
       end;
       if OptStats then TimeCopyCoal := PassTimer.ElapsedMilliseconds;
+      PassMark('Copy Coal');
       {$ELSE}
       {$IFDEF DEBUG_COPYCOAL}
       if DebugCopyCoal then
@@ -1333,6 +1385,7 @@ begin
         RegAlloc.Free;
       end;
       if OptStats then TimeRegAlloc := PassTimer.ElapsedMilliseconds;
+      PassMark('Reg Alloc');
       {$ELSE}
       {$IFDEF DEBUG_REGALLOC}
       if DebugRegAlloc then
@@ -1605,12 +1658,20 @@ begin
         WriteLn(Format('    PHI Elim:      %8.3f ms', [TimePhiElim]));
         WriteLn(Format('    Copy Coal:     %8.3f ms', [TimeCopyCoal]));
         WriteLn(Format('    Reg Alloc:     %8.3f ms', [TimeRegAlloc]));
+        // What each pass actually DID. A timing says what a pass cost; this says whether it earned
+        // it. "inert" = the pass rewrote nothing at all on this program.
+        if Assigned(PassEffect) and (PassEffect.Count > 0) then
+        begin
+          WriteLn('  Per-pass effect:');
+          for i := 0 to PassEffect.Count - 1 do WriteLn(PassEffect[i]);
+        end;
         WriteLn(Format('Compilation time: %s', [FormatTimeEx(CompileTime)]));
         WriteLn(Format('Total time:       %s', [FormatTimeEx(SSATime + OptTime + CompileTime)]));
       end;
       // Cleanup without VM
       BytecodeProgram.Free;
       SSAProgram.Free;
+      FreeAndNil(PassEffect);
       ParserResult.Free;
       Lexer.Free;
     end
@@ -1766,6 +1827,13 @@ begin
         WriteLn(Format('    PHI Elim:      %8.3f ms', [TimePhiElim]));
         WriteLn(Format('    Copy Coal:     %8.3f ms', [TimeCopyCoal]));
         WriteLn(Format('    Reg Alloc:     %8.3f ms', [TimeRegAlloc]));
+        // What each pass actually DID. A timing says what a pass cost; this says whether it earned
+        // it. "inert" = the pass rewrote nothing at all on this program.
+        if Assigned(PassEffect) and (PassEffect.Count > 0) then
+        begin
+          WriteLn('  Per-pass effect:');
+          for i := 0 to PassEffect.Count - 1 do WriteLn(PassEffect[i]);
+        end;
         WriteLn(Format('Compilation time: %s', [FormatTimeEx(CompileTime)]));
         WriteLn(Format('Execution time:   %s', [FormatTimeEx(ExecuteTime)]));
         WriteLn(Format('Total time:       %s', [FormatTimeEx(SSATime + OptTime + CompileTime + ExecuteTime)]));
@@ -1804,6 +1872,7 @@ begin
         VM.Free;
         BytecodeProgram.Free;
         SSAProgram.Free;
+        FreeAndNil(PassEffect);
       end;
 
       ParserResult.Free;

@@ -610,6 +610,14 @@ type
     function RunLoopUnrolling: Integer;  // Loop unrolling (returns unrolled loop count)
     function RunCopyCoalescing: Integer;  // Copy coalescing (returns coalesced copy count)
     procedure PrintSSA;  // Dump SSA for debugging
+    { Content fingerprint of the whole program: instruction count plus a hash over every opcode and
+      operand. Its ONLY purpose is to answer, per optimization pass, "did this actually change
+      anything?" - a question the per-pass TIMINGS cannot answer, because a pass that fires on
+      nothing costs the same tenth of a millisecond as one doing real work and looks identical in
+      the breakdown. That is exactly how GVN sat in the pipeline being almost inert: it ran, it was
+      sound, it was timed, and it was rewriting almost nothing (see the 2026-07-25 work on
+      LBOUND/subscript redundancy). Diagnostic only - nothing in the compiler reads it. }
+    function Fingerprint(out AInstrCount: Integer): QWord;
     property Blocks: TSSABasicBlockList read FBlocks;
     property Variables: TStringList read FVariables;
     property Labels: TStringList read FLabels;
@@ -2016,6 +2024,60 @@ begin
   else
     Result := '???';
   end;
+end;
+
+function TSSAProgram.Fingerprint(out AInstrCount: Integer): QWord;
+// FNV-1a over every instruction's opcode and operands. Cheap enough to call around each pass in a
+// diagnostic run, and exact enough that an unchanged hash means the pass rewrote NOTHING.
+const
+  FNV_OFFSET = QWord(14695981039346656037);
+  FNV_PRIME  = QWord(1099511628211);
+var
+  b, i, k: Integer;
+  Block: TSSABasicBlock;
+  Instr: TSSAInstruction;
+  H: QWord;
+
+  procedure Mix(V: QWord); inline;
+  begin
+    H := (H xor V) * FNV_PRIME;
+  end;
+
+  procedure MixVal(const Val: TSSAValue); inline;
+  begin
+    Mix(QWord(Ord(Val.Kind)));
+    Mix(QWord(Ord(Val.RegType)));
+    Mix(QWord(Val.RegIndex));
+    Mix(QWord(Val.Version));
+    Mix(QWord(Val.ConstInt));
+    Mix(PQWord(@Val.ConstFloat)^);
+    Mix(QWord(Val.ArrayIndex));
+    Mix(QWord(Val.VarNameId));
+    Mix(QWord(Val.ConstStringId));
+    Mix(QWord(Val.LabelNameId));
+  end;
+
+begin
+  H := FNV_OFFSET;
+  AInstrCount := 0;
+  for b := 0 to FBlocks.Count - 1 do
+  begin
+    Block := FBlocks[b];
+    Mix(QWord(b));
+    for i := 0 to Block.Instructions.Count - 1 do
+    begin
+      Instr := Block.Instructions[i];
+      Inc(AInstrCount);
+      Mix(QWord(Ord(Instr.OpCode)));
+      MixVal(Instr.Dest);
+      MixVal(Instr.Src1);
+      MixVal(Instr.Src2);
+      MixVal(Instr.Src3);   // no Immediate at SSA level: it is the bytecode encoding downstream
+      for k := 0 to High(Instr.PhiSources) do
+        MixVal(Instr.PhiSources[k].Value);
+    end;
+  end;
+  Result := H;
 end;
 
 procedure TSSAProgram.PrintSSA;
