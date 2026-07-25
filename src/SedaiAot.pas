@@ -215,6 +215,20 @@ var
   AotDiagLsPlacedFloat: Integer = 0;
   AotDiagLsSpilledInt: Integer = 0;
   AotDiagLsSpilledFloat: Integer = 0;
+  // The traffic the interval schedule ACTUALLY emits, weighted by the loop depth of the block it
+  // lands in - which is the only version of the number that means anything, since one store in a
+  // loop body outweighs fifty in the prologue. Read against the static homes, which emit neither
+  // inside a loop: this is the whole account of what the allocator pays for what it saves.
+  AotDiagLsLoads: Integer = 0;
+  AotDiagLsStores: Integer = 0;
+  AotDiagLsLoadW: Int64 = 0;
+  AotDiagLsStoreW: Int64 = 0;
+  // Loop-weighted operand accesses the EMITTED code sends to the banks, counted where the decision
+  // is actually made (FAlloc/IAlloc answering "no home"). This is the number that compares two
+  // allocators honestly - the residency figures elsewhere model a policy, this counts instructions.
+  AotDiagMemAccI: Int64 = 0;
+  AotDiagMemAccF: Int64 = 0;
+  AotDiagCodeW: Int64 = 0;      // loop-weighted bytes of emitted code
   // Which of the two register strategies actually ran for the last region compiled, and whether
   // the AUTO arbitration was the reason. Without this the choice is only observable on a
   // stopwatch - and the two are antagonistic, so reading it wrong costs a whole campaign.
@@ -1203,6 +1217,12 @@ var
   function IAlloc(vmreg: Integer): Integer;
   begin
     if vmreg <= MaxIReg then Result := ILoc[vmreg] else Result := -1;
+    // The account that decides between two allocators: how much loop-weighted operand traffic the
+    // EMITTED code sends to the bank. A register with no home HERE is a memory access at this
+    // point, and the block's loop weight is what it is worth. The residency figures above model a
+    // policy; this one counts instructions.
+    if (Result < 0) and (CurBlkIdx >= Region.FirstBlock) and (CurBlkIdx <= Region.LastBlock) then
+      AotDiagMemAccI := AotDiagMemAccI + BlockW[CurBlkIdx - Region.FirstBlock];
   end;
   procedure ILoad(scr, vmreg: Integer);       // scratch (rax/rcx/rdx) := VM int reg
   var n: Integer;
@@ -1251,6 +1271,8 @@ var
   function FAlloc(vmreg: Integer): Integer;
   begin
     if vmreg <= MaxFReg then Result := FLoc[vmreg] else Result := -1;
+    if (Result < 0) and (CurBlkIdx >= Region.FirstBlock) and (CurBlkIdx <= Region.LastBlock) then
+      AotDiagMemAccF := AotDiagMemAccF + BlockW[CurBlkIdx - Region.FirstBlock];
   end;
   // MEASURED AND REJECTED (23 Jul 2026): caching "which VM float register xmm0 currently holds"
   // and dropping the redundant FLoad of the next float op in a chain (~37% of consecutive
@@ -3460,6 +3482,14 @@ var
       end;
     end;
 
+    function BlockWeightAt(pos: Integer): Int64;
+    var b2: Integer;
+    begin
+      Result := 1;
+      for b2 := LiveNB - 1 downto 0 do
+        if pos >= LsPos0[b2] then Exit(BlockW[b2]);
+    end;
+
     function InstrAt(pos: Integer): TSSAInstruction;
     var b2, lo: Integer; B3: TSSABasicBlock;
     begin
@@ -3588,6 +3618,8 @@ var
     nplaced := 0; nspill := 0;
     AotDiagLsPlacedInt := 0; AotDiagLsPlacedFloat := 0;
     AotDiagLsSpilledInt := 0; AotDiagLsSpilledFloat := 0;
+    AotDiagLsLoads := 0; AotDiagLsStores := 0;
+    AotDiagLsLoadW := 0; AotDiagLsStoreW := 0;
 
     for bank := 0 to 1 do
     begin
@@ -3675,6 +3707,16 @@ var
             [i, LsWebs[i].Bank, LsWebs[i].Reg, LsWebs[i].PStart, LsWebs[i].PEnd, LsWebs[i].Home,
              BoolToStr(LsWebs[i].NeedsLoad, 'y', 'n'), BoolToStr(LsWebs[i].HasDef, 'y', 'n'),
              LsWebs[i].Weight, LsWebs[i].NUncov, LsWebs[i].UncovPos, LsWebs[i].NRange]));
+        if LsWebs[i].NeedsLoad then
+        begin
+          Inc(AotDiagLsLoads);
+          AotDiagLsLoadW := AotDiagLsLoadW + BlockWeightAt(LsWebs[i].PStart);
+        end;
+        if LsWebs[i].HasDef then
+        begin
+          Inc(AotDiagLsStores);
+          AotDiagLsStoreW := AotDiagLsStoreW + BlockWeightAt(LsWebs[i].PEnd);
+        end;
         PushAt(LsTakeAt, LsWebs[i].PStart, i);
         PushAt(LsFreeAt, LsWebs[i].PEnd, i);
         if LsWebs[i].Bank = 1 then
@@ -4075,6 +4117,7 @@ begin
 
   // C1: liveness. Computed here, consumed from C3 on (helper-call spilling) - it must not
   // change a single emitted byte today.
+  AotDiagMemAccI := 0; AotDiagMemAccF := 0; AotDiagCodeW := 0;
   LivenessOK := False; PeakLiveInt := 0; PeakLiveFloat := 0;
   LiveNB := 0;
   ComputeLiveness;
@@ -4229,8 +4272,13 @@ begin
             else
               StoreRegMem(LsWebs[w].Home, LongWord(LsWebs[w].Reg) * 8);
           end;
+        d := E.Len;
         EmitInstruction;
         if not OK then Exit;
+        // Loop-weighted EMITTED CODE SIZE: how many bytes actually execute per iteration of the
+        // hottest loop. When two allocators send the SAME operand traffic to the banks, this is
+        // what is left to explain a clock difference between them.
+        AotDiagCodeW := AotDiagCodeW + Int64(E.Len - d) * BlockW[b - Region.FirstBlock];
         // AOT_DYNF free events: temps whose last touch was this instruction leave their home
         // AFTER it is emitted (the last use has just read them). No bank store - they are dead.
         if DynFActive then
@@ -4398,14 +4446,20 @@ begin
         // B1b interval model. Read (webs vs distinct) and (maxOverlap vs pool): the first says how
         // much the one-home-per-register allocation is conflating, the second whether what is
         // really live at once fits the machine pool at all.
+        WriteLn(ErrOutput, Format('[AOT]   emitted bank traffic (loop-weighted): int=%d float=%d  code bytes=%d',
+          [AotDiagMemAccI, AotDiagMemAccF, AotDiagCodeW]));
         if AotDiagLsWhy = '' then
         begin
           WriteLn(ErrOutput, Format('[AOT]   intervals: webs int=%d float=%d (ranges=%d) maxOverlap int=%d float=%d edge-crossings=%d',
             [AotDiagLsWebsInt, AotDiagLsWebsFloat, AotDiagLsRanges,
              AotDiagLsMaxOverInt, AotDiagLsMaxOverFloat, AotDiagLsCross]));
           if AotDiagLinScanActive then
+          begin
             WriteLn(ErrOutput, Format('[AOT]   linscan: ACTIVE, placed int=%d float=%d, memory-homed int=%d float=%d',
               [AotDiagLsPlacedInt, AotDiagLsPlacedFloat, AotDiagLsSpilledInt, AotDiagLsSpilledFloat]));
+            WriteLn(ErrOutput, Format('[AOT]   linscan traffic: loads=%d (loop-weighted %d)  stores=%d (loop-weighted %d)',
+              [AotDiagLsLoads, AotDiagLsLoadW, AotDiagLsStores, AotDiagLsStoreW]));
+          end;
         end
         else
           WriteLn(ErrOutput, '[AOT]   intervals: not built (' + AotDiagLsWhy + ')');
