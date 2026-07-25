@@ -1651,6 +1651,34 @@ begin
     SetLength(Ctx.CallStack, Length(Ctx.CallStack) * 2 + 16);
 end;
 
+{ True for the opcodes PROVEN to read and write nothing but the integer bank.
+  Used by the per-procedure frame widths below to stop charging a purely integer procedure the
+  float and string widths of the whole program. The polarity is the one OpIsMergeSafe already paid
+  for: an opcode missing from this list costs a missed NARROWING, never a missed save - so a new
+  opcode is safe by default. Deliberately short: it covers the shapes that dominate call-heavy code
+  (integer arithmetic, comparisons, branches, argument transfer and the call itself), and anything
+  else keeps the old conservative behaviour.
+  bcCallSub is here because the CALLEE's own footprint is folded in separately by the fixpoint
+  below - the call instruction itself touches no bank. }
+var
+  GFrameBankNarrow: Integer = 1;  // FRAMEBANK=0 restores the coarse all-banks footprint
+
+function BcTouchesOnlyIntBank(Op: Word): Boolean;
+begin
+  if GFrameBankNarrow <> 1 then Exit(False);
+  case Op of
+    bcLoadConstInt, bcCopyInt,
+    bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
+    bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
+    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
+    bcXferStoreInt, bcXferLoadInt,
+    bcJump, bcJumpIfZero, bcJumpIfNotZero, bcNop, bcCallSub, bcReturnSub:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
 procedure TBytecodeVM.BuildProcFrameWidths;
 // A call only has to protect the registers its callee - and everything that callee can reach -
 // might touch. Compute that per procedure entry PC: first the highest register index appearing in
@@ -1717,9 +1745,19 @@ begin
       Instr := FProgram.GetInstruction(i);
       Op := Instr.OpCode;
       Grp := Op shr 8;
-      Note(p, 0, Instr.Dest); Note(p, 1, Instr.Dest); Note(p, 2, Instr.Dest);
-      Note(p, 0, Instr.Src1); Note(p, 1, Instr.Src1); Note(p, 2, Instr.Src1);
-      Note(p, 0, Instr.Src2); Note(p, 1, Instr.Src2); Note(p, 2, Instr.Src2);
+      // The integer bank stays fully conservative. The float and string banks are credited only
+      // for opcodes NOT proven integer-only: charging a purely integer procedure the program's
+      // string width is what made fib copy five REFCOUNTED strings per call for strings it never
+      // touches - 54 of its ~214 cycles of frame snapshot, measured with AOT_CALLPROF.
+      Note(p, 0, Instr.Dest);
+      Note(p, 0, Instr.Src1);
+      Note(p, 0, Instr.Src2);
+      if not BcTouchesOnlyIntBank(Op) then
+      begin
+        Note(p, 1, Instr.Dest); Note(p, 2, Instr.Dest);
+        Note(p, 1, Instr.Src1); Note(p, 2, Instr.Src1);
+        Note(p, 1, Instr.Src2); Note(p, 2, Instr.Src2);
+      end;
       // An indirect call, a thread spawn or an error jump can land anywhere: give up on this one.
       if (Op = Ord(bcCallSubIndirect)) or (Op = Ord(bcThreadCreate)) or
          (Op = Ord(bcOnError)) or (Op = Ord(bcResumeLabel)) or (Op = Ord(bcResume)) or
@@ -11055,6 +11093,7 @@ end;
 
 initialization
   if GetEnvironmentVariable('FRAMESAVE_NOSTR') = '1' then GFrameSaveNoStr := 1;
+  if GetEnvironmentVariable('FRAMEBANK') = '0' then GFrameBankNarrow := 0;
 
 finalization
   AotCallProfReport;
