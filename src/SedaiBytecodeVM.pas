@@ -6293,6 +6293,16 @@ begin
              JitDiagCurPC, JitDiagCurOp, FProgram.GetSourceLine(JitDiagCurPC)]));
       end;
     end;
+  // Nothing compiled - no loop, or every candidate bailed - so drop the table entirely. The run
+  // loop arms its per-instruction native check on `Length(FNativeLoops) > 0`, and that check is a
+  // load from a PC-indexed array on EVERY interpreted instruction, sharing cache with the dense
+  // opcode table read beside it. Keeping an all-nil table around therefore taxes the interpreter
+  // for a JIT that has nothing to offer: measured at ~4% on a program with no loop at all
+  // (recursive fib, where a `--jit` run was slower than the same program without the flag).
+  hdr := -1;
+  for i := 0 to n - 1 do
+    if FNativeLoops[i] <> nil then begin hdr := i; Break; end;
+  if hdr < 0 then SetLength(FNativeLoops, 0);
   FArraysDirty := True;   // force a descriptor rebuild before the first compiled loop runs
 end;
 
