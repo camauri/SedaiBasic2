@@ -541,8 +541,9 @@ The optimization pipeline consists of **22 configurable passes** controlled by `
 
 ### Bytecode-Level Optimizations (6 passes)
 
-#### Pass 17: Register Allocation (`SedaiRegAllocator.pas`)
-- **Linear scan** algorithm with liveness analysis
+#### Pass 17: Register Allocation (`SedaiRegAlloc.pas`)
+- **Version-aware allocation** plus a live-range MERGE (see section 7 - the unit is named after a
+  linear-scan skeleton that is not the code that runs)
 - Separate allocation for Int, Float, String registers
 - Spilling strategy for register exhaustion
 
@@ -858,11 +859,51 @@ end;
 ## 7. REGISTER ALLOCATION
 
 ### Source Files
-- `SedaiRegAllocator.pas`
+- `SedaiRegAlloc.pas`
 
 ### Strategy
 
-Allocation uses **linear scan** with liveness analysis.
+**Not linear scan**, despite the unit's name and the `TLinearScanAllocator` class in it: that
+Poletto-Sarkar skeleton is unreachable, kept as a reference. What runs is:
+
+1. **Version-aware allocation** - every SSA (bank, index, version) gets its own register number.
+2. **Live-range merge** (`REGREUSE`, default ON) - liveness over the CFG to a fixpoint, an
+   interference graph, and a greedy colouring per bank, so values whose lifetimes are disjoint
+   SHARE a number. On the n-body benchmark that collapses 247 distinct float registers to 8.
+   Registers whose liveness the analysis cannot see are pinned and never merged: values live across
+   a call (the CFG has no return edge), an array's runtime dimension and lower-bound registers, keys
+   with no definition, everything in a program with an error handler, and anything touched by an
+   opcode outside the modelled set. `REGREUSE=0` restores the historic one-number-per-value
+   allocation exactly.
+
+The register file this produces is what the interpreter, the JIT and the AOT all consume, which is
+why the merge speeds up every profile rather than just the compiled ones.
+
+### Machine registers in the AOT (`SedaiAot.pas`)
+
+A second, independent allocation maps those VM register numbers onto x86-64 registers when a region
+is compiled natively. Assignment is static per region, by loop-weighted use count:
+
+| bank | pool | notes |
+|---|---|---|
+| float | `xmm2..xmm15` | `xmm0/xmm1` are scratch; `xmm6-15` are callee-saved on Win64 and get one 8-byte frame slot each, taken only for a register actually handed out |
+| int | `r9..r15`, `rdi`, `rbp`, and `rsi` | `rax/rcx/rdx` are scratch, `rbx` is the IntRegs base, `r8` the context. `rdi` is ABI_ARG0 on System V. `rsi` normally holds the FloatRegs base and joins the pool ONLY in a region that touches no float register at all |
+
+VM registers with no machine home stay memory-homed in their bank, which is always coherent: the
+banks are the canonical location, and every point that hands control away - a runtime helper, a
+native call-sub, a leaf string primitive, a deopt exit - flushes the resident registers first and
+re-reads them after.
+
+`AOT_FPOOL=<n>` and `AOT_IPOOL=<n>` shrink the two pools, and `AOT_RSI=0` keeps rsi reserved; each
+restores the previous behaviour exactly, so a change here can always be A/B'd on ONE binary.
+
+⚠️ What the pools are worth is not uniform, and the measurements are worth knowing before enlarging
+anything: **machine registers pay where there is a dependency-latency chain, not where there is
+memory traffic**. The float pool going 6→14 bought n-body 5% and floatpoly 6%; the integer pool
+going 7→9 bought seven of eight benchmarks 1-7%. But a purpose-built integer record/array workload
+with 26 values live at once is FLAT from 3 to 10 registers: the banks are an L1-resident array and
+the out-of-order engine absorbs those accesses. An interval (linear-scan) allocator was built and
+measured against this and is slower - it is present but gated off behind `AOT_LINSCAN`.
 
 #### Register Limits
 - R0 (Int accumulator) - RESERVED for VM
@@ -970,7 +1011,7 @@ end;
     ┌─────────────────────────────────────────┐
     │  BYTECODE OPTIMIZATION (6 passes)       │
     │                                         │
-    │  17. Register Allocation (linear scan)  │
+    │  17. Register Allocation (+ merge)       │
     │  18. Peephole Pass 1 (copy elim, jumps) │
     │  19. Superinstruction Fusion            │
     │      - Compare+Branch → BranchXX        │
@@ -1147,7 +1188,7 @@ SedaiBasic emulates key aspects of the Commodore 128 for compatibility:
 | `SedaiSuperinstructions.pas` | Superinstruction fusion |
 | `SedaiNopCompaction.pas` | NOP removal |
 | `SedaiRegisterCompaction.pas` | Register compaction |
-| `SedaiRegAllocator.pas` | Register allocation |
+| `SedaiRegAlloc.pas` | Register allocation (version-aware + live-range merge) |
 
 ### Subsystems
 | File | Description |
