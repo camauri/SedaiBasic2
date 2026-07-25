@@ -2018,6 +2018,15 @@ begin
         VM.SetInputDevice(Input);
         VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
         VM.BoundsCheck := OptBoundsCheck;  // --bounds-check: hard-error on out-of-bounds array access
+        // --jit works here exactly as it does for a source run: the loop JIT compiles from the
+        // BYTECODE, which is all a .basc has. Without this assignment the flag was accepted and
+        // silently ignored, and a .basc ran fully interpreted - 17.6 s against 0.93 s on n-body.
+        // (--aot is a different story and stays out: it compiles from the SSA program, which only
+        // exists when compiling from source. A .basc carries no SSA.)
+        VM.JitEnabled := OptJit;
+        {$IFDEF JIT_PROFILE}
+        VM.JitProfile := OptJitProfile;
+        {$ENDIF}
         VM.LoadProgram(BytecodeProgram);
 
         try
