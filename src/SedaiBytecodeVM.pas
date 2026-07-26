@@ -206,6 +206,14 @@ type
     // Per entry PC: the integer range a RELOCATABLE procedure occupies, packed (hi shl 32) or lo;
     // -1 = this procedure keeps the copying frame. Built by BuildProcFrameBases.
     FProcFrameBase: array of Int64;
+    // FAST-RELOCATION table. The common case of a relocated call - a callee that touches neither the
+    // float nor the string bank - needs exactly two numbers, and reading them used to cost four
+    // lookups across three arrays (FProcFrameBase, then FProcWidths' three width fields, each with
+    // its own Length check). Here they are precomputed into ONE Int64 per entry PC: the frame WIDTH
+    // in the high half, its lowest register index in the low half; -1 = not eligible for the fast
+    // path, take the general one. FramePush/FramePop were 65.7 cycles of a 205-cycle call while
+    // copying nothing at all - the cost was the bookkeeping, not the bytes.
+    FFrameFast: array of Int64;
     // Filled only when FRAMEMARK=0, to reproduce the historic three-array lookup on ONE binary.
     FProcWidthInt: array of Int64;
     FProcWidthFloat: array of Int64;
@@ -1757,6 +1765,9 @@ var
   // FRAMEBANK_SHAPE=0 restores the BINARY float/string width rule (credit both banks for anything
   // not proven integer-only) instead of the per-bank write shapes. For a one-binary A/B.
   GFrameBankShape: Integer = 1;
+  // FRAME_FAST=0 disables the precomputed fast-relocation table and its paired FramePop exit, so
+  // the same binary runs the general path for every call. For the A/B.
+  GFrameFast: Integer = 1;
 
 function BcTouchesOnlyIntBank(Op: Word): Boolean;
 begin
@@ -2402,6 +2413,15 @@ begin
   // Pass 2: eligibility, per unit (module level is never a callee, so it is skipped).
   SetLength(FProcFrameBase, NInstr);
   for i := 0 to NInstr - 1 do FProcFrameBase[i] := -1;
+  // The fast table is only ever consulted when the frame-mark stack is the bookkeeping in use;
+  // leaving it EMPTY under FRAMEMARK=0 or FRAME_FAST=0 makes the length test in FramePush fail and
+  // sends every call down the general path, with no second gate to check per call.
+  SetLength(FFrameFast, 0);
+  if (GFrameMark = 1) and (GFrameFast = 1) then
+  begin
+    SetLength(FFrameFast, NInstr);
+    for i := 0 to NInstr - 1 do FFrameFast[i] := -1;
+  end;
   SetLength(Elig, NUnit); SetLength(ELo, NUnit); SetLength(EHi, NUnit); SetLength(EWhy, NUnit);
   for p := 0 to NUnit - 1 do
   begin
@@ -2518,6 +2538,13 @@ begin
     // half, the lowest in the low half. A relocated frame starts at the high-water mark and is
     // Hi-Lo slots wide, so the view delta is HighWater - Lo.
     FProcFrameBase[UStart[p]] := (Int64(EHi[p]) shl 32) or Int64(ELo[p]);
+    // Fast path eligibility, decided ONCE here instead of per call: a relocatable callee that also
+    // leaves the float and string banks alone has nothing to copy, so its whole frame is the pointer
+    // slide. Store the WIDTH (not the high end) so FramePush adds instead of subtracting.
+    if (Length(FFrameFast) > 0) and (UStart[p] < Length(FProcWidths)) and
+       (FProcWidths[UStart[p]].WInt >= 0) and
+       ((FProcWidths[UStart[p]].WFloat shr 32) = 0) and ((FProcWidths[UStart[p]].WStr shr 32) = 0) then
+      FFrameFast[UStart[p]] := (Int64(EHi[p] - ELo[p]) shl 32) or Int64(ELo[p]);
   end;
 end;
 
@@ -2690,6 +2717,40 @@ var
   Reloc: Boolean;
   SaveDelta, SaveHw, NewDelta, NewHw: Integer;
 begin
+  // FAST RELOCATION. One table read decides it, because the answer was precomputed: a callee proven
+  // relocatable that touches neither the float nor the string bank has nothing to copy, so its whole
+  // frame is a pointer slide plus the marks FramePop needs. This used to be reached through four
+  // lookups across three arrays and wrote seven mark fields; measured on fib, FramePush and FramePop
+  // together were 65.7 cycles of a 205-cycle call while copying ZERO bytes.
+  // WInt = -1 is the sentinel that lets FramePop take its own fast path: a general frame always
+  // writes a non-negative packed width there, including a relocated one that still copies floats.
+  if (TargetPC >= 0) and (TargetPC < Length(FFrameFast)) then
+  begin
+    PW := FFrameFast[TargetPC];
+    if PW >= 0 then
+    begin
+      FBHi := PW shr 32;                        // frame WIDTH, precomputed as Hi - Lo
+      FBLo := PW and $FFFFFFFF;                 // its lowest register index
+      if Ctx.RegHwI + FBHi <= Ctx.RegFrameCap then
+      begin
+        if Ctx.FrameMarkTop >= Length(Ctx.FrameMarks) then
+          SetLength(Ctx.FrameMarks, Ctx.FrameMarkTop + 256);
+        with Ctx.FrameMarks[Ctx.FrameMarkTop] do
+        begin
+          SaveDeltaI := Ctx.RegDeltaI;
+          SaveHwI := Ctx.RegHwI;
+          WInt := -1;                           // nothing copied, and nothing to read back
+          RecBase := Ctx.RecordCount;
+          BlockMark := Ctx.BlockRecMarkTop;
+        end;
+        Inc(Ctx.FrameMarkTop);
+        Ctx.RegDeltaI := Ctx.RegHwI - FBLo;
+        Inc(Ctx.RegHwI, FBHi);
+        Ctx.IntRegs := @Ctx.IntRegsMem[Ctx.RegDeltaI];
+        Exit;
+      end;
+    end;
+  end;
   BI := 0; BF := 0; BS := 0;
   Reloc := False; SaveDelta := -1; SaveHw := 0; NewDelta := 0; NewHw := 0;
   // FRAME RELOCATION. When the callee is one of the procedures BuildProcFrameBases proved
@@ -2898,6 +2959,20 @@ begin
   begin
     Dec(Ctx.FrameMarkTop);
     Mark := @Ctx.FrameMarks[Ctx.FrameMarkTop];
+    // FAST PATH, paired with the one in FramePush: the sentinel says this frame copied nothing at
+    // all, so there are no widths to unpack, no save-stack tops to move and no banks to restore -
+    // slide the view back, hand the record slots back, done. Everything else falls through to the
+    // general path below, including a relocated frame that still copied floats or strings.
+    if Mark^.WInt < 0 then
+    begin
+      Ctx.RegDeltaI := Mark^.SaveDeltaI;
+      Ctx.RegHwI := Mark^.SaveHwI;
+      Ctx.IntRegs := @Ctx.IntRegsMem[Mark^.SaveDeltaI];
+      if Mark^.RecBase < Ctx.RecordCount then
+        Ctx.RecordCount := Mark^.RecBase;
+      Ctx.BlockRecMarkTop := Mark^.BlockMark;
+      Exit;
+    end;
     // A RELOCATED frame restored nothing and copied nothing: slide the view back to the caller's
     // offset, hand its slots back to the high-water mark, and skip the bank restore entirely (its
     // widths were written as zero, so the code below is a no-op either way - but the record
@@ -12205,6 +12280,7 @@ initialization
   if GetEnvironmentVariable('FRAMEBASE') = '0' then GFrameBase := 0;
   if GetEnvironmentVariable('FRAMEBASE_WIDE') = '0' then GFrameBaseWide := 0;
   if GetEnvironmentVariable('FRAMEBANK_SHAPE') = '0' then GFrameBankShape := 0;
+  if GetEnvironmentVariable('FRAME_FAST') = '0' then GFrameFast := 0;
   if GetEnvironmentVariable('FRAMEBASE_DIAG') = '1' then GFrameBaseDiag := 1;
 
 finalization
