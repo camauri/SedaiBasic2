@@ -105,6 +105,7 @@ type
 
     { Check if edge (From -> Target) is a back-edge }
     function IsBackEdge(From, Target: TSSABasicBlock): Boolean;
+    function IsCallEdge(From, Target: TSSABasicBlock): Boolean;   // recursion, not a loop
 
     { Compute all blocks in a natural loop }
     procedure ComputeLoopBlocks(Loop: TLoopInfo; BackEdgeSource: TSSABasicBlock);
@@ -357,7 +358,16 @@ begin
     begin
       Succ := TSSABasicBlock(Block.Successors[j]);
 
-      if IsBackEdge(Block, Succ) then
+      // A back edge that is a CALL edge is not a loop, it is recursion, and hoisting out of it
+      // means computing a value once for ALL activations instead of once per activation. That is
+      // not the same thing: the hoisted value then lives in the outermost frame and every deeper
+      // activation reads it from there, which is only survivable because the call frame machinery
+      // copies it back and forth on every call. On naive recursive Fibonacci that hoist moves ONE
+      // LoadConstInt out of the body and buys, in exchange, exactly the one integer this VM still
+      // copies per call - a net loss. It also splits the procedure's entry into two call targets
+      // (the preheader and the body, the recursive calls entering below the hoist), which makes
+      // the hoisted register cross-activation state and blocks frame relocation entirely.
+      if IsBackEdge(Block, Succ) and (not IsCallEdge(Block, Succ)) then
       begin
         // Check if we already have a loop with this header
         Found := False;
@@ -385,6 +395,23 @@ begin
         end;
       end;
     end;
+  end;
+end;
+
+function TLoopInvariantCodeMotion.IsCallEdge(From, Target: TSSABasicBlock): Boolean;
+// True when From reaches Target by CALLING it: the edge exists because of an ssaCall/ssaCallSub
+// naming Target's label, not because control falls or branches there.
+var
+  i: Integer;
+  Instr: TSSAInstruction;
+begin
+  Result := False;
+  if (From = nil) or (Target = nil) then Exit;
+  for i := 0 to From.Instructions.Count - 1 do
+  begin
+    Instr := TSSAInstruction(From.Instructions[i]);
+    if (Instr.OpCode = ssaCallSub) or (Instr.OpCode = ssaCall) then
+      if Instr.Dest.LabelName = Target.LabelName then Exit(True);
   end;
 end;
 

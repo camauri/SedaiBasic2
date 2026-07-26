@@ -1739,12 +1739,11 @@ var
   // and measuring this change across two builds moved unrelated benchmarks by 4-12% in the same
   // direction, which is the alignment effect, not the change.
   GFrameMark: Integer = 1;
-  // FRAME RELOCATION, per-procedure opt-in. FRAMEBASE=1 turns it on; DEFAULT OFF, and it stays off
-  // until the analysis in BuildProcFrameBases is sound: with the gate on, the regression finds 2
-  // FAIL + 4 OPTDIFF (m389 pointer arrays, m435 byref member write-back, m448 error handler,
-  // aot_b1_deopt_diverror), so at least one of the four eligibility conditions admits a procedure
-  // it must not. Off, the machinery is inert - FramePush takes one extra integer test per call.
-  GFrameBase: Integer = 0;
+  // FRAME RELOCATION, per-procedure opt-in: an eligible callee runs on fresh slots above every
+  // live frame instead of having its register range copied out of the way. DEFAULT ON;
+  // FRAMEBASE=0 restores the copying frame everywhere. See BuildProcFrameBases for the five
+  // conditions a procedure has to meet - one that fails any of them simply keeps copying.
+  GFrameBase: Integer = 1;
   // FRAMEBASE_DIAG=1 prints, per procedure, whether it is relocatable and if not WHICH condition
   // refused it. The first version of this analysis found nothing at all and looked exactly like a
   // working one from the outside.
@@ -2065,10 +2064,15 @@ var
   IsTarget: array of Boolean;       // PC is the entry of some call: only there can a frame start
   UStart, UEnd: array of Integer;   // unit index -> instruction range
   Owner: array of Integer;          // register index -> owning unit (-1 free, -2 shared)
-  WrittenBy: array of Integer;      // register index -> unit that writes it (-1 none)
+  WrittenBy: array of Integer;      // register index -> unit that writes it (-1 none, -2 many)
+  ExternallyRead: array of Boolean; // register carries a value INTO some unit from outside it
+  WStamp: array of Integer;         // register -> unit whose own write set contains it
   MaxReg: Integer;
-  UD, U1, U2, Ok: Boolean;
+  UD, U1, U2, Ok, ChangedU: Boolean;
   Why: string;
+  Elig: array of Boolean;           // unit -> relocatable (before and after the callee fixpoint)
+  ELo, EHi: array of Integer;       // unit -> its private integer range
+  EWhy: array of string;            // unit -> why it was refused (diagnostic only)
 
   procedure Claim(u, RegIdx: Integer);
   begin
@@ -2118,6 +2122,18 @@ begin
     Instr := FProgram.GetInstruction(i);
     if (Instr.OpCode = Ord(bcCallSub)) or (Instr.OpCode = Ord(bcLoadProcAddr)) then
       if (Instr.Immediate >= 0) and (Instr.Immediate < NInstr) then IsTarget[Instr.Immediate] := True;
+    // PROGRAM-WIDE veto: an armed error handler jumps straight to its PC without unwinding the
+    // frame stack, so a trap taken inside a relocated frame would run the handler on the CALLEE's
+    // slid view - reading the handler's own registers at the wrong addresses. Nothing local to a
+    // procedure can see this coming, so a program that arms a handler anywhere relocates nothing.
+    // (Same veto the register-reuse merge already carries, for the same reason.)
+    if (Instr.OpCode = Ord(bcOnError)) or (Instr.OpCode = Ord(bcTrap)) or
+       (Instr.OpCode = Ord(bcResume)) or (Instr.OpCode = Ord(bcResumeLabel)) then
+    begin
+      if GFrameBaseDiag = 1 then
+        WriteLn(ErrOutput, '[FRAMEBASE] program arms an error handler: relocation disabled');
+      Exit;
+    end;
   end;
 
   // Units: a map entry that nothing calls is absorbed into the one before it. Unit NUnit is module
@@ -2131,7 +2147,13 @@ begin
     if PcStart < 0 then System.Continue;
     if p + 1 < NProc then PcEnd := FProgram.GetProcMapStart(p + 1) - 1 else PcEnd := NInstr - 1;
     if PcEnd >= NInstr then PcEnd := NInstr - 1;
-    if (NUnit > 0) and (not IsTarget[PcStart]) then
+    // An EMPTY map entry (PcEnd < PcStart) is two entries at the same PC: LICM registers a
+    // preheader even when it hoisted nothing into it. Absorbing it would be harmless; starting a
+    // unit on it is not - the eligibility loop below never runs, so nothing refuses it and it
+    // publishes a ZERO-WIDTH frame whose delta slides the view by the whole bank. That is exactly
+    // how m389 and m435 died.
+    if PcEnd < PcStart then System.Continue;
+    if (NUnit > 0) and ((not IsTarget[PcStart]) or (UEnd[NUnit - 1] < UStart[NUnit - 1])) then
       UEnd[NUnit - 1] := PcEnd                       // absorb: a preheader, or any uncalled tail
     else
     begin
@@ -2149,8 +2171,8 @@ begin
   // Pass 1: ownership, walked by RANGE rather than by asking "which unit owns this PC?" per
   // instruction - that question answered with a scan is how LICM and Strength Reduction came to be
   // 92% of compile time.
-  SetLength(Owner, MaxReg + 1); SetLength(WrittenBy, MaxReg + 1);
-  for i := 0 to MaxReg do begin Owner[i] := -1; WrittenBy[i] := -1; end;
+  SetLength(Owner, MaxReg + 1); SetLength(WrittenBy, MaxReg + 1); SetLength(WStamp, MaxReg + 1);
+  for i := 0 to MaxReg do begin Owner[i] := -1; WrittenBy[i] := -1; WStamp[i] := -1; end;
   for p := 0 to NUnit do
     for i := UStart[p] to UEnd[p] do
     begin
@@ -2160,19 +2182,64 @@ begin
       if U1 then Claim(p, Instr.Src1);
       if U2 then Claim(p, Instr.Src2);
       if BcIntWriteShapeRaw(Instr.OpCode) = IW_DEST then
-        if (Instr.Dest >= 0) and (Instr.Dest <= MaxReg) then WrittenBy[Instr.Dest] := p;
+        if (Instr.Dest >= 0) and (Instr.Dest <= MaxReg) then
+        begin
+          if WrittenBy[Instr.Dest] = -1 then WrittenBy[Instr.Dest] := p
+          else if WrittenBy[Instr.Dest] <> p then WrittenBy[Instr.Dest] := -2;
+        end;
     end;
+
+  // Which registers carry a value INTO a unit from outside it - a unit reading a register it never
+  // writes is reading someone else's value, so that register is a global under another name. This
+  // is the set relocation must not disturb, and it is the RIGHT question: "is this register private
+  // to one procedure?" is not, because the register allocator legitimately reuses one index in two
+  // procedures whose live ranges do not overlap, and a relocated frame cannot hurt the caller in any
+  // case - it never writes the caller's slots at all.
+  SetLength(ExternallyRead, MaxReg + 1);
+  for i := 0 to MaxReg do ExternallyRead[i] := False;
+  for p := 0 to NUnit do
+  begin
+    // Stamp this unit's own writes first: "does p write r?" cannot be asked of the program-wide
+    // WrittenBy, which collapses to -2 the moment two units share an index - and the allocator
+    // shares indices routinely, so asking it there marks every reused register as external and
+    // refuses everything.
+    for i := UStart[p] to UEnd[p] do
+    begin
+      Instr := FProgram.GetInstruction(i);
+      if BcIntWriteShapeRaw(Instr.OpCode) = IW_DEST then
+        if (Instr.Dest >= 0) and (Instr.Dest <= MaxReg) then WStamp[Instr.Dest] := p;
+    end;
+    for i := UStart[p] to UEnd[p] do
+    begin
+      Instr := FProgram.GetInstruction(i);
+      IntOperands(Instr.OpCode, UD, U1, U2);
+      if U1 and (Instr.Src1 >= 0) and (Instr.Src1 <= MaxReg) and (WStamp[Instr.Src1] <> p) then
+        ExternallyRead[Instr.Src1] := True;
+      if U2 and (Instr.Src2 >= 0) and (Instr.Src2 <= MaxReg) and (WStamp[Instr.Src2] <> p) then
+        ExternallyRead[Instr.Src2] := True;
+    end;
+  end;
 
   // Pass 2: eligibility, per unit (module level is never a callee, so it is skipped).
   SetLength(FProcFrameBase, NInstr);
   for i := 0 to NInstr - 1 do FProcFrameBase[i] := -1;
+  SetLength(Elig, NUnit); SetLength(ELo, NUnit); SetLength(EHi, NUnit); SetLength(EWhy, NUnit);
   for p := 0 to NUnit - 1 do
   begin
+    Elig[p] := False; ELo[p] := 0; EHi[p] := 0; EWhy[p] := 'not analysed';
     PcStart := UStart[p]; PcEnd := UEnd[p];
-    if (PcStart < 0) or (PcStart >= NInstr) then System.Continue;
+    if (PcStart < 0) or (PcStart >= NInstr) or (PcEnd < PcStart) then System.Continue;
     if (PcStart >= Length(FProcWidths)) or (FProcWidths[PcStart].WInt < 0) then System.Continue;
     Lo := MaxInt; Hi := 0;
     Ok := True; Why := '';
+    // This unit's OWN write set, stamped with its index: "does p write r?" is a per-unit question
+    // and the program-wide WrittenBy cannot answer it once two units share an index.
+    for i := PcStart to PcEnd do
+    begin
+      Instr := FProgram.GetInstruction(i);
+      if BcIntWriteShapeRaw(Instr.OpCode) = IW_DEST then
+        if (Instr.Dest >= 0) and (Instr.Dest <= MaxReg) then WStamp[Instr.Dest] := p;
+    end;
     for i := PcStart to PcEnd do
     begin
       Instr := FProgram.GetInstruction(i);
@@ -2184,14 +2251,19 @@ begin
       if BcIntUseShape(Op) = US_UNKNOWN then
       begin Ok := False; Why := Format('unaudited read shape: op $%x at pc %d', [Op, i]); Break; end;
       IntOperands(Op, UD, U1, U2);
-      // (3) a register read but never written here carries a value from outside this activation.
-      if U1 and (Instr.Src1 >= 0) and (Instr.Src1 <= MaxReg) and (WrittenBy[Instr.Src1] <> p) then
+      // (3) a register this unit reads but never writes carries a value from outside the
+      // activation - the caller's, or an outer activation's - and a relocated frame starts on
+      // fresh slots, so that value would not be there.
+      if U1 and (Instr.Src1 >= 0) and (Instr.Src1 <= MaxReg) and (WStamp[Instr.Src1] <> p) then
       begin Ok := False;
         Why := Format('reads R%d never written here (op $%x pc %d)', [Instr.Src1, Op, i]); Break; end;
-      if U2 and (Instr.Src2 >= 0) and (Instr.Src2 <= MaxReg) and (WrittenBy[Instr.Src2] <> p) then
+      if U2 and (Instr.Src2 >= 0) and (Instr.Src2 <= MaxReg) and (WStamp[Instr.Src2] <> p) then
       begin Ok := False;
         Why := Format('reads R%d never written here (op $%x pc %d)', [Instr.Src2, Op, i]); Break; end;
-      // (2) privacy, over reads AND writes, and only over operands the opcode really has.
+      // (2) nothing this unit WRITES may be a register somebody else reads for its value: that
+      // write has to land at the absolute address the reader will look at, and a relocated frame
+      // would put it somewhere else. Reads and writes of the same index by an unrelated unit are
+      // fine - the allocator reuses indices across procedures whose live ranges are disjoint.
       for r := 0 to 2 do
       begin
         case r of
@@ -2200,26 +2272,63 @@ begin
         else  begin if not U2 then System.Continue; i2 := Instr.Src2; end;
         end;
         if (i2 < 0) or (i2 > MaxReg) then System.Continue;
-        if Owner[i2] <> p then
+        if (r = 0) and ExternallyRead[i2] then
         begin Ok := False;
-          Why := Format('R%d not private (owner=%d, op $%x pc %d)', [i2, Owner[i2], Op, i]); Break; end;
+          Why := Format('writes R%d which another unit reads (op $%x pc %d)', [i2, Op, i]); Break; end;
         if i2 < Lo then Lo := i2;
         if i2 + 1 > Hi then Hi := i2 + 1;
       end;
       if not Ok then Break;
     end;
+    // A frame with no integer registers of its own has nothing to relocate, and its delta would be
+    // HighWater - MaxInt. Refuse it rather than publish a zero-width frame.
+    if Ok and ((Lo = MaxInt) or (Hi <= Lo)) then
+    begin Ok := False; Why := 'no integer registers of its own'; end;
+    Elig[p] := Ok; ELo[p] := Lo; EHi[p] := Hi; EWhy[p] := Why;
+  end;
+
+  // (5) Every static callee of a relocated unit must be relocatable too - a FIXPOINT, because
+  // refusing one unit can refuse its callers. Without this the scheme is unsound in a way no local
+  // test can see: the view is per-context, so a non-relocated callee invoked from a relocated
+  // caller would run with the CALLER's delta still applied and address its own absolute registers
+  // - and any global it touches - at slid addresses. Self-recursion satisfies the condition, which
+  // is the case that matters.
+  repeat
+    ChangedU := False;
+    for p := 0 to NUnit - 1 do
+    begin
+      if not Elig[p] then System.Continue;
+      for i := UStart[p] to UEnd[p] do
+      begin
+        Instr := FProgram.GetInstruction(i);
+        if Instr.OpCode <> Ord(bcCallSub) then System.Continue;
+        i2 := -1;
+        for r := 0 to NUnit - 1 do
+          if UStart[r] = Instr.Immediate then begin i2 := r; Break; end;
+        if (i2 < 0) or (not Elig[i2]) then
+        begin
+          Elig[p] := False; ChangedU := True;
+          EWhy[p] := Format('calls a non-relocatable unit at pc %d', [Instr.Immediate]);
+          Break;
+        end;
+      end;
+    end;
+  until not ChangedU;
+
+  for p := 0 to NUnit - 1 do
+  begin
     if GFrameBaseDiag = 1 then
-      if Ok then
+      if Elig[p] then
         WriteLn(ErrOutput, Format('[FRAMEBASE] unit %d @pc %d..%d (%s): RELOCATABLE, int range [%d,%d)',
-                                  [p, PcStart, PcEnd, FProgram.GetProcMapName(p), Lo, Hi]))
+                                  [p, UStart[p], UEnd[p], FProgram.GetProcMapName(p), ELo[p], EHi[p]]))
       else
-        WriteLn(ErrOutput, Format('[FRAMEBASE] unit %d @pc %d..%d: no - %s', [p, PcStart, PcEnd, Why]));
-    if not Ok then System.Continue;
-    if Lo = MaxInt then begin Lo := 0; Hi := 0; end;
+        WriteLn(ErrOutput, Format('[FRAMEBASE] unit %d @pc %d..%d: no - %s',
+                                  [p, UStart[p], UEnd[p], EWhy[p]]));
+    if not Elig[p] then System.Continue;
     // Published per entry PC, packed like the widths: one past the highest index used in the high
     // half, the lowest in the low half. A relocated frame starts at the high-water mark and is
     // Hi-Lo slots wide, so the view delta is HighWater - Lo.
-    FProcFrameBase[PcStart] := (Int64(Hi) shl 32) or Int64(Lo);
+    FProcFrameBase[UStart[p]] := (Int64(EHi[p]) shl 32) or Int64(ELo[p]);
   end;
 end;
 
@@ -11867,7 +11976,7 @@ initialization
   if GetEnvironmentVariable('FRAMERANGE') = '0' then GFrameRangeNarrow := 0;
   if GetEnvironmentVariable('FRAMELIVE') = '0' then GFrameLiveNarrow := 0;
   if GetEnvironmentVariable('FRAMEMARK') = '0' then GFrameMark := 0;
-  if GetEnvironmentVariable('FRAMEBASE') = '1' then GFrameBase := 1;   // default OFF: see above
+  if GetEnvironmentVariable('FRAMEBASE') = '0' then GFrameBase := 0;
   if GetEnvironmentVariable('FRAMEBASE_DIAG') = '1' then GFrameBaseDiag := 1;
 
 finalization
