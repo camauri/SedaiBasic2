@@ -81,21 +81,27 @@ type
     FLoops: TObjectList;  // Owns TLoopInfo objects
     FDominatorMap: TFPHashList;  // Maps TSSABasicBlock → TSSABasicBlock (block → idom)
     FHoistedCount: Integer;
+    FProgMapsHoists: Integer;   // FHoistedCount when the program-wide maps were built (-1 = never)
+    FProgMapsBlocks: Integer;   // and the block count then - a hoist adds a pre-header
     FUserVarByBank: array[TSSARegisterType] of array of Boolean;  // RegIndex → mapped to a user variable
     { Per-loop query maps, rebuilt by BuildLoopMaps at the start of each HoistInvariants call
       (collection never moves instructions, so they stay exact for the whole collection). They
       collapse the historical per-query block scans - the whole cost of this pass - to O(1). }
     FFirstDefIV: TDefBlockMap;    // (RegIndex,Version) → FIRST defining block in program order
+    FTotalUse: TKeyCountMap;      // (RegType,RegIndex,Version) → uses in the WHOLE program
+    FLoopUseInside: TKeyCountMap; // ... and uses inside the current loop; outside = total - inside
     FLoopDefCount: TKeyCountMap;  // (RegType,RegIndex,Version) → number of defs inside the loop
-    FLoopUsedOutside: TKeySet;    // (RegType,RegIndex,Version) used by any instruction OUTSIDE the loop
     FLoopModArrays: TKeySet;      // array ids stored to inside the loop
     FLoopReshapesArrays: Boolean; // the loop can change some array's SHAPE (bounds), see BuildLoopMaps
 
     { Precompute the user-variable bitmap from FProgram.VarRegMap }
     procedure BuildUserVarIndex;
 
-    { Rebuild the per-loop query maps (one program scan) }
+    { Rebuild the per-loop query maps - scans the LOOP's blocks only }
     procedure BuildLoopMaps(Loop: TLoopInfo);
+
+    { Rebuild the program-wide maps if the program has changed since they were built }
+    procedure EnsureProgramMaps;
 
     { Build dominator map from program's dominator tree }
     procedure BuildDominatorMap;
@@ -128,6 +134,7 @@ type
     { Phase A MODERN fixpoint helpers }
     function DefinedInsideLoop(const Val: TSSAValue; Loop: TLoopInfo): Boolean;
     function AllUsesInsideLoop(const Val: TSSAValue; Loop: TLoopInfo): Boolean;
+    function UsedOutsideLoop(const Val: TSSAValue): Boolean;
     function UniquelyDefinedInLoop(const Instr: TSSAInstruction; Loop: TLoopInfo): Boolean;
     function BlockDominatesAllLatches(Block: TSSABasicBlock; Loop: TLoopInfo): Boolean;
     function OperandInvariantModern(const Val: TSSAValue; Loop: TLoopInfo; ToHoist: TFPList): Boolean;
@@ -210,9 +217,12 @@ begin
   FLoops := TObjectList.Create(True);  // Owns TLoopInfo objects
   FDominatorMap := TFPHashList.Create;
   FHoistedCount := 0;
+  FProgMapsHoists := -1;
+  FProgMapsBlocks := -1;
   FFirstDefIV := TDefBlockMap.Create;
   FLoopDefCount := TKeyCountMap.Create;
-  FLoopUsedOutside := TKeySet.Create;
+  FTotalUse := TKeyCountMap.Create;
+  FLoopUseInside := TKeyCountMap.Create;
   FLoopModArrays := TKeySet.Create;
 end;
 
@@ -222,7 +232,8 @@ begin
   FDominatorMap.Free;
   FFirstDefIV.Free;
   FLoopDefCount.Free;
-  FLoopUsedOutside.Free;
+  FTotalUse.Free;
+  FLoopUseInside.Free;
   FLoopModArrays.Free;
   inherited;
 end;
@@ -906,26 +917,47 @@ begin
             (A.Version = B.Version);
 end;
 
-procedure TLoopInvariantCodeMotion.BuildLoopMaps(Loop: TLoopInfo);
+function TLoopInvariantCodeMotion.UsedOutsideLoop(const Val: TSSAValue): Boolean;
+// "Is this register read anywhere but inside the current loop?" answered by subtraction rather than
+// by scanning everything that is not the loop: total uses in the program, minus uses in the loop.
+// The totals are program-wide and survive from loop to loop, which is what takes this pass from
+// O(loops x program) down to O(program + sum of loop sizes).
+var Key: Int64; Tot, Ins: Integer;
+begin
+  Key := LICMKeyTIV(Val);
+  if not FTotalUse.TryGetValue(Key, Tot) then Tot := 0;
+  if not FLoopUseInside.TryGetValue(Key, Ins) then Ins := 0;
+  Result := Tot > Ins;
+end;
+
+procedure TLoopInvariantCodeMotion.EnsureProgramMaps;
+// The two maps that do NOT depend on which loop is being processed: the first definition of each
+// name in program order, and how many times each name is used anywhere. Rebuilt only when the
+// program has actually changed - which, now that a pre-header is only created for a loop that
+// hoists something, does not happen at all for a loop that finds nothing invariant.
 var
-  i, j, k: Integer;
+  i, j, k, Cnt: Integer;
   Block: TSSABasicBlock;
   Instr: TSSAInstruction;
-  InLoop: Boolean;
   Key: Int64;
-  Cnt: Integer;
+
+  procedure CountUse(const V: TSSAValue);
+  var K2: Int64; C2: Integer;
+  begin
+    if V.Kind <> svkRegister then Exit;
+    K2 := LICMKeyTIV(V);
+    if FTotalUse.TryGetValue(K2, C2) then FTotalUse[K2] := C2 + 1
+    else FTotalUse.Add(K2, 1);
+  end;
+
 begin
+  if (FProgMapsHoists = FHoistedCount) and (FProgMapsBlocks = FProgram.Blocks.Count) then Exit;
   FFirstDefIV.Clear;
-  FLoopDefCount.Clear;
-  FLoopUsedOutside.Clear;
-  FLoopModArrays.Clear;
-  FLoopReshapesArrays := False;
-  if LicmDiagOn then Inc(GLicmMapCalls);
+  FTotalUse.Clear;
   for i := 0 to FProgram.Blocks.Count - 1 do
   begin
     Block := FProgram.Blocks[i];
     if LicmDiagOn then Inc(GLicmMapInstrs, Block.Instructions.Count);
-    InLoop := Loop.ContainsBlock(Block);
     for j := 0 to Block.Instructions.Count - 1 do
     begin
       Instr := Block.Instructions[j];
@@ -936,43 +968,82 @@ begin
         Key := LICMKeyIV(Instr.Dest);
         if not FFirstDefIV.ContainsKey(Key) then
           FFirstDefIV.Add(Key, Block);
-        if InLoop then
-        begin
-          Key := LICMKeyTIV(Instr.Dest);
-          if FLoopDefCount.TryGetValue(Key, Cnt) then
-            FLoopDefCount[Key] := Cnt + 1
-          else
-            FLoopDefCount.Add(Key, 1);
-        end;
       end;
-      if InLoop then
+      CountUse(Instr.Src1);
+      CountUse(Instr.Src2);
+      CountUse(Instr.Src3);
+      for k := 0 to High(Instr.PhiSources) do
+        CountUse(Instr.PhiSources[k].Value);
+    end;
+  end;
+  FProgMapsHoists := FHoistedCount;
+  FProgMapsBlocks := FProgram.Blocks.Count;
+  if False then begin Cnt := 0; Cnt := Cnt; end;
+end;
+
+procedure TLoopInvariantCodeMotion.BuildLoopMaps(Loop: TLoopInfo);
+// Everything that depends on WHICH loop is being processed, built from the loop's own blocks. This
+// used to walk the entire program for every loop: on a 14k-line program that was 1632 loops x 48k
+// instructions = 78.7 million visits, to hoist nothing at all.
+var
+  j, k, Cnt: Integer;
+  Block: TSSABasicBlock;
+  Instr: TSSAInstruction;
+  i: Integer;
+  Key: Int64;
+
+  procedure CountInsideUse(const V: TSSAValue);
+  var K2: Int64; C2: Integer;
+  begin
+    if V.Kind <> svkRegister then Exit;
+    K2 := LICMKeyTIV(V);
+    if FLoopUseInside.TryGetValue(K2, C2) then FLoopUseInside[K2] := C2 + 1
+    else FLoopUseInside.Add(K2, 1);
+  end;
+
+begin
+  EnsureProgramMaps;
+  FLoopDefCount.Clear;
+  FLoopUseInside.Clear;
+  FLoopModArrays.Clear;
+  FLoopReshapesArrays := False;
+  if LicmDiagOn then Inc(GLicmMapCalls);
+  for i := 0 to Loop.Blocks.Count - 1 do
+  begin
+    Block := TSSABasicBlock(Loop.Blocks[i]);
+    if LicmDiagOn then Inc(GLicmMapInstrs, Block.Instructions.Count);
+    for j := 0 to Block.Instructions.Count - 1 do
+    begin
+      Instr := Block.Instructions[j];
+      if Instr.Dest.Kind = svkRegister then
       begin
-        if (Instr.OpCode = ssaArrayStore) and (Instr.Src1.Kind = svkConstInt) then
-          FLoopModArrays.AddOrSetValue(Instr.Src1.ConstInt, True);
-        // An array's SHAPE (its bounds) is fixed for the whole loop unless the loop itself can change
-        // it. That is what makes LBOUND/UBOUND hoistable. Everything that can move a bound counts:
-        // DIM/REDIM/ERASE on any array (including a UDT member array), and the BYREF param binding
-        // ops, which re-point a parameter slot at another array. A CALL counts too - the callee can
-        // REDIM a module array or rebind a slot, and the CFG carries no return edge to model it
-        // (the same reason the register merge pins values live across a call). One flag for all
-        // arrays, not a per-id set: these ops are rare inside a hot loop, and a bind names the
-        // PARAMETER slot rather than the array the caller passed, so a per-id set would under-report.
-        case Instr.OpCode of
-          ssaArrayDim, ssaArrayErase, ssaArrayRedim, ssaArrayRedimPush, ssaArrayRedimN,
-          ssaMemberArrayRedim,
-          ssaArrayBind, ssaArrayUnbind, ssaArrayBindApply, ssaArrayBindInd,
-          ssaCall, ssaCallSub, ssaCallSubIndirect, ssaThreadCreate:
-            FLoopReshapesArrays := True;
-        end;
-      end
-      else
-      begin
-        if Instr.Src1.Kind = svkRegister then FLoopUsedOutside.AddOrSetValue(LICMKeyTIV(Instr.Src1), True);
-        if Instr.Src2.Kind = svkRegister then FLoopUsedOutside.AddOrSetValue(LICMKeyTIV(Instr.Src2), True);
-        if Instr.Src3.Kind = svkRegister then FLoopUsedOutside.AddOrSetValue(LICMKeyTIV(Instr.Src3), True);
-        for k := 0 to High(Instr.PhiSources) do
-          if Instr.PhiSources[k].Value.Kind = svkRegister then
-            FLoopUsedOutside.AddOrSetValue(LICMKeyTIV(Instr.PhiSources[k].Value), True);
+        Key := LICMKeyTIV(Instr.Dest);
+        if FLoopDefCount.TryGetValue(Key, Cnt) then
+          FLoopDefCount[Key] := Cnt + 1
+        else
+          FLoopDefCount.Add(Key, 1);
+      end;
+      CountInsideUse(Instr.Src1);
+      CountInsideUse(Instr.Src2);
+      CountInsideUse(Instr.Src3);
+      for k := 0 to High(Instr.PhiSources) do
+        CountInsideUse(Instr.PhiSources[k].Value);
+      if (Instr.OpCode = ssaArrayStore) and (Instr.Src1.Kind = svkConstInt) then
+        FLoopModArrays.AddOrSetValue(Instr.Src1.ConstInt, True);
+      // An array's SHAPE (its bounds) is fixed for the whole loop unless the loop itself can change
+      // it. That is what makes LBOUND/UBOUND hoistable. Everything that can move a bound counts:
+      // DIM/REDIM/ERASE on any array (including a UDT member array), and the BYREF param binding
+      // ops, which re-point a parameter slot at another array. A CALL counts too - the callee can
+      // REDIM a module array or rebind a slot, and the CFG carries no return edge to model it
+      // (the same reason the register merge pins values live across a call). One flag for all
+      // arrays, not a per-id set: these ops are rare inside a hot loop, and a bind names the
+      // PARAMETER slot rather than the array the caller passed, so a per-id set would under-report.
+      case Instr.OpCode of
+        ssaArrayDim, ssaArrayErase, ssaArrayRedim, ssaArrayRedimPush, ssaArrayRedimN,
+        ssaMemberArrayRedim,
+        ssaArrayBind, ssaArrayUnbind, ssaArrayBindApply, ssaArrayBindInd,
+        ssaCall, ssaCallSub, ssaCallSubIndirect, ssaThreadCreate:
+          FLoopReshapesArrays := True;
       end;
     end;
   end;
@@ -989,7 +1060,7 @@ begin
   // A use in a loop-exit PHI source counts as live-out (BuildLoopMaps records PhiSources too).
   Result := False;
   if Val.Kind <> svkRegister then Exit;
-  Result := not FLoopUsedOutside.ContainsKey(LICMKeyTIV(Val));
+  Result := not UsedOutsideLoop(Val);
 end;
 
 function TLoopInvariantCodeMotion.OperandInvariantModern(const Val: TSSAValue; Loop: TLoopInfo;
