@@ -83,6 +83,14 @@ type
     Returns True if the VM should stop (e.g. the window was closed). }
   TSpriteEditorCallback = function(SpriteNum: Integer): Boolean of object;
 
+  { The three bank ranges a procedure entered at this PC can clobber, each packed as
+    (width shl 32) or base; Int = -1 means "not analysed", use the program-wide width. }
+  TProcWidth = record
+    WInt: Int64;
+    WFloat: Int64;
+    WStr: Int64;
+  end;
+
   { Array storage structure }
   TArrayStorage = record
     ElementType: Byte;        // 0=Int, 1=Float, 2=String (maps to TSSARegisterType)
@@ -190,6 +198,12 @@ type
     // starting at 0 copies registers the callee provably cannot reach. Packed rather than kept in
     // three more arrays because FramePush is hot enough that three extra loads per call cost more
     // than the copies the narrower range saves.
+    // One record per instruction rather than three parallel arrays: FramePush reads all three ends
+    // for the SAME index, so parallel arrays meant three field loads, three Length() checks and
+    // three cache lines to answer one question. Int stays first: it is the field the "is this entry
+    // known?" test reads.
+    FProcWidths: array of TProcWidth;
+    // Filled only when FRAMEMARK=0, to reproduce the historic three-array lookup on ONE binary.
     FProcWidthInt: array of Int64;
     FProcWidthFloat: array of Int64;
     FProcWidthStr: array of Int64;
@@ -806,7 +820,8 @@ begin
   FCtx.FrameSaveIntCount := -1;
   FCtx.FrameSaveFloatCount := -1;
   FCtx.FrameSaveStrCount := -1;
-  FCtx.FrameWidthTop := 0;
+  FCtx.FrameMarkTop := 0;
+  FCtx.FrameWidthTop := 0;      // FRAMEMARK=0 layout
   FCtx.FrameRecBaseTop := 0;
   FCtx.BlockRecMarkTop := 0;
   SetLength(FCtx.Records, 0);
@@ -1682,6 +1697,13 @@ var
   // FRAMELIVE=0 drops the caller-side half: the snapshot is then whatever the callee can touch,
   // without asking whether this caller still needs it.
   GFrameLiveNarrow: Integer = 1;
+  // FRAMEMARK=0 restores the historic DATA LAYOUT of the frame bookkeeping: five parallel stacks
+  // instead of one stack of records, and three parallel per-procedure width arrays instead of one
+  // array of records. Semantics are identical either way - this gate exists only so the layout can
+  // be A/B'd on ONE binary. It has to be: two separately linked builds differ in code alignment,
+  // and measuring this change across two builds moved unrelated benchmarks by 4-12% in the same
+  // direction, which is the alignment effect, not the change.
+  GFrameMark: Integer = 1;
 
 function BcTouchesOnlyIntBank(Op: Word): Boolean;
 begin
@@ -1817,6 +1839,7 @@ var
   end;
 
 begin
+  SetLength(FProcWidths, 0);
   SetLength(FProcWidthInt, 0); SetLength(FProcWidthFloat, 0); SetLength(FProcWidthStr, 0);
   if FProgram = nil then Exit;
   NInstr := FProgram.GetInstructionCount;
@@ -1922,10 +1945,16 @@ begin
   until (not Changed) or (Rounds > NProc + 2);
 
   // Publish, indexed by entry PC. Unknown (or a fixpoint that did not settle) = program-wide.
-  SetLength(FProcWidthInt, NInstr); SetLength(FProcWidthFloat, NInstr); SetLength(FProcWidthStr, NInstr);
+  SetLength(FProcWidths, NInstr);
   for i := 0 to NInstr - 1 do
+    with FProcWidths[i] do begin WInt := -1; WFloat := -1; WStr := -1; end;
+  if GFrameMark = 0 then          // gate: the historic three parallel arrays, filled alongside
   begin
-    FProcWidthInt[i] := -1; FProcWidthFloat[i] := -1; FProcWidthStr[i] := -1;
+    SetLength(FProcWidthInt, NInstr); SetLength(FProcWidthFloat, NInstr); SetLength(FProcWidthStr, NInstr);
+    for i := 0 to NInstr - 1 do
+    begin
+      FProcWidthInt[i] := -1; FProcWidthFloat[i] := -1; FProcWidthStr[i] := -1;
+    end;
   end;
   for p := 0 to NProc - 1 do
   begin
@@ -1935,9 +1964,18 @@ begin
     if (GFrameRangeNarrow <> 1) or (LI[p] = MaxInt) then LI[p] := 0;
     if (GFrameRangeNarrow <> 1) or (LF[p] = MaxInt) then LF[p] := 0;
     if (GFrameRangeNarrow <> 1) or (LS[p] = MaxInt) then LS[p] := 0;
-    FProcWidthInt[Entry[p]] := (Int64(WI[p]) shl 32) or Int64(LI[p]);
-    FProcWidthFloat[Entry[p]] := (Int64(WF[p]) shl 32) or Int64(LF[p]);
-    FProcWidthStr[Entry[p]] := (Int64(WS[p]) shl 32) or Int64(LS[p]);
+    with FProcWidths[Entry[p]] do
+    begin
+      WInt := (Int64(WI[p]) shl 32) or Int64(LI[p]);
+      WFloat := (Int64(WF[p]) shl 32) or Int64(LF[p]);
+      WStr := (Int64(WS[p]) shl 32) or Int64(LS[p]);
+    end;
+    if GFrameMark = 0 then
+    begin
+      FProcWidthInt[Entry[p]] := (Int64(WI[p]) shl 32) or Int64(LI[p]);
+      FProcWidthFloat[Entry[p]] := (Int64(WF[p]) shl 32) or Int64(LF[p]);
+      FProcWidthStr[Entry[p]] := (Int64(WS[p]) shl 32) or Int64(LS[p]);
+    end;
   end;
 end;
 
@@ -2101,6 +2139,7 @@ procedure TBytecodeVM.FramePush(Ctx: TExecutionContext; TargetPC: Integer; CallP
 var
   i, NI, NF, NS, BI, BF, BS: Integer;
   PW: Int64;
+  PWidth: ^TProcWidth;
 begin
   BI := 0; BF := 0; BS := 0;
   // A NEGATIVE width means "not measured for this context" (any path that runs bytecode without
@@ -2117,19 +2156,36 @@ begin
   if GFrameSaveNoStr = 1 then NS := 0;
   // Narrow further to what THIS callee can clobber, when that is known (static target, no indirect
   // call anywhere in its reachable set). Never widens: the program-wide width stays the ceiling.
-  if (TargetPC >= 0) and (TargetPC < Length(FProcWidthInt)) and (FProcWidthInt[TargetPC] >= 0) then
+  if GFrameMark = 0 then
+  begin
+    // Gate: the historic three-array lookup, verbatim - three field loads, three Length() checks.
+    if (TargetPC >= 0) and (TargetPC < Length(FProcWidthInt)) and (FProcWidthInt[TargetPC] >= 0) then
+    begin
+      PW := FProcWidthInt[TargetPC];
+      if PW shr 32 < NI then NI := PW shr 32;
+      BI := PW and $FFFFFFFF; if BI > NI then BI := NI;
+      PW := FProcWidthFloat[TargetPC];
+      if PW shr 32 < NF then NF := PW shr 32;
+      BF := PW and $FFFFFFFF; if BF > NF then BF := NF;
+      PW := FProcWidthStr[TargetPC];
+      if PW shr 32 < NS then NS := PW shr 32;
+      BS := PW and $FFFFFFFF; if BS > NS then BS := NS;
+    end;
+  end
+  else if (TargetPC >= 0) and (TargetPC < Length(FProcWidths)) and (FProcWidths[TargetPC].WInt >= 0) then
   begin
     // Both ends come out of one load per bank: width in the high half, base in the low half. The
     // base is where the snapshot STARTS - registers below it belong to the caller's own frame and
     // the callee cannot name them. Clamped to the width, so the range is never negative if a probe
-    // above (FRAMESAVE_NOSTR) has already zeroed a bank.
-    PW := FProcWidthInt[TargetPC];
+    // above (FRAMESAVE_NOSTR) has already zeroed a bank. All three come off ONE cache line.
+    PWidth := @FProcWidths[TargetPC];
+    PW := PWidth^.WInt;
     if PW shr 32 < NI then NI := PW shr 32;
     BI := PW and $FFFFFFFF; if BI > NI then BI := NI;
-    PW := FProcWidthFloat[TargetPC];
+    PW := PWidth^.WFloat;
     if PW shr 32 < NF then NF := PW shr 32;
     BF := PW and $FFFFFFFF; if BF > NF then BF := NF;
-    PW := FProcWidthStr[TargetPC];
+    PW := PWidth^.WStr;
     if PW shr 32 < NS then NS := PW shr 32;
     BS := PW and $FFFFFFFF; if BS > NS then BS := NS;
   end;
@@ -2174,29 +2230,45 @@ begin
   for i := BS to NS - 1 do
     Ctx.FrameSaveStr[Ctx.FrameSaveStrTop + (i - BS)] := Ctx.StringRegs[i];
   Inc(Ctx.FrameSaveStrTop, NS - BS);
-  // Remember this frame's widths so FramePop restores exactly what was saved (widths differ per
-  // callee, so they cannot be recomputed at pop time).
-  if Ctx.FrameWidthTop >= Length(Ctx.FrameWidthInt) then
+  // Remember everything FramePop needs, in ONE entry: the three bank ranges (widths differ per
+  // callee, so they cannot be recomputed at pop time), where this frame's record allocations begin
+  // (RAII V2) and the block-mark depth on entry (M8). One growth check and one cache line instead
+  // of the five arrays this replaced - which is where the cycles of a call actually were.
+  if GFrameMark = 1 then
   begin
-    SetLength(Ctx.FrameWidthInt, Ctx.FrameWidthTop + 256);
-    SetLength(Ctx.FrameWidthFloat, Ctx.FrameWidthTop + 256);
-    SetLength(Ctx.FrameWidthStr, Ctx.FrameWidthTop + 256);
+    if Ctx.FrameMarkTop >= Length(Ctx.FrameMarks) then
+      SetLength(Ctx.FrameMarks, Ctx.FrameMarkTop + 256);
+    with Ctx.FrameMarks[Ctx.FrameMarkTop] do
+    begin
+      WInt := (Int64(NI) shl 32) or Int64(BI);
+      WFloat := (Int64(NF) shl 32) or Int64(BF);
+      WStr := (Int64(NS) shl 32) or Int64(BS);
+      RecBase := Ctx.RecordCount;
+      BlockMark := Ctx.BlockRecMarkTop;
+    end;
+    Inc(Ctx.FrameMarkTop);
+  end
+  else
+  begin
+    // FRAMEMARK=0: the historic five-array layout, verbatim, for a one-binary A/B.
+    if Ctx.FrameWidthTop >= Length(Ctx.FrameWidthInt) then
+    begin
+      SetLength(Ctx.FrameWidthInt, Ctx.FrameWidthTop + 256);
+      SetLength(Ctx.FrameWidthFloat, Ctx.FrameWidthTop + 256);
+      SetLength(Ctx.FrameWidthStr, Ctx.FrameWidthTop + 256);
+    end;
+    Ctx.FrameWidthInt[Ctx.FrameWidthTop] := (Int64(NI) shl 32) or Int64(BI);
+    Ctx.FrameWidthFloat[Ctx.FrameWidthTop] := (Int64(NF) shl 32) or Int64(BF);
+    Ctx.FrameWidthStr[Ctx.FrameWidthTop] := (Int64(NS) shl 32) or Int64(BS);
+    Inc(Ctx.FrameWidthTop);
+    if Ctx.FrameRecBaseTop >= Length(Ctx.FrameRecBase) then
+      SetLength(Ctx.FrameRecBase, Ctx.FrameRecBaseTop + 256);
+    if Ctx.FrameRecBaseTop >= Length(Ctx.FrameBlockMarkTop) then
+      SetLength(Ctx.FrameBlockMarkTop, Ctx.FrameRecBaseTop + 256);
+    Ctx.FrameRecBase[Ctx.FrameRecBaseTop] := Ctx.RecordCount;
+    Ctx.FrameBlockMarkTop[Ctx.FrameRecBaseTop] := Ctx.BlockRecMarkTop;
+    Inc(Ctx.FrameRecBaseTop);
   end;
-  // Both ends of the saved range in one slot: (width shl 32) or base. See the field declaration -
-  // a separate base stack is three more array writes here and three more reads in FramePop, and
-  // that traffic costs more than the copies the narrower range saves.
-  Ctx.FrameWidthInt[Ctx.FrameWidthTop] := (Int64(NI) shl 32) or Int64(BI);
-  Ctx.FrameWidthFloat[Ctx.FrameWidthTop] := (Int64(NF) shl 32) or Int64(BF);
-  Ctx.FrameWidthStr[Ctx.FrameWidthTop] := (Int64(NS) shl 32) or Int64(BS);
-  Inc(Ctx.FrameWidthTop);
-  // RAII (V2): remember where this frame's record allocations begin.
-  if Ctx.FrameRecBaseTop >= Length(Ctx.FrameRecBase) then
-    SetLength(Ctx.FrameRecBase, Ctx.FrameRecBaseTop + 256);
-  if Ctx.FrameRecBaseTop >= Length(Ctx.FrameBlockMarkTop) then
-    SetLength(Ctx.FrameBlockMarkTop, Ctx.FrameRecBaseTop + 256);
-  Ctx.FrameRecBase[Ctx.FrameRecBaseTop] := Ctx.RecordCount;
-  Ctx.FrameBlockMarkTop[Ctx.FrameRecBaseTop] := Ctx.BlockRecMarkTop;  // M8: remember the block-mark depth
-  Inc(Ctx.FrameRecBaseTop);
 end;
 
 procedure TBytecodeVM.FramePop(Ctx: TExecutionContext);
@@ -2204,12 +2276,23 @@ procedure TBytecodeVM.FramePop(Ctx: TExecutionContext);
 var
   i, NI, NF, NS, BI, BF, BS: Integer;
   PW: Int64;
+  Mark: PFrameMark;
 begin
-  // Widths come off the frame-width stack: they are per-callee, so they cannot be recomputed here.
-  // An empty stack means the frame was pushed before this bookkeeping existed (or the stack was
-  // unwound by an error jump): fall back to the context-wide widths, as FramePush would have used.
+  // Everything comes off the one frame-mark stack: the ranges are per-callee, so they cannot be
+  // recomputed here. An empty stack means the frame was pushed before this bookkeeping existed (or
+  // the stack was unwound by an error jump): fall back to the context-wide widths, as FramePush
+  // would have used, and skip the record reclamation (there is no mark to roll back to).
   BI := 0; BF := 0; BS := 0;
-  if Ctx.FrameWidthTop > 0 then
+  Mark := nil;
+  if (GFrameMark = 1) and (Ctx.FrameMarkTop > 0) then
+  begin
+    Dec(Ctx.FrameMarkTop);
+    Mark := @Ctx.FrameMarks[Ctx.FrameMarkTop];
+    PW := Mark^.WInt;   NI := PW shr 32; BI := PW and $FFFFFFFF;
+    PW := Mark^.WFloat; NF := PW shr 32; BF := PW and $FFFFFFFF;
+    PW := Mark^.WStr;   NS := PW shr 32; BS := PW and $FFFFFFFF;
+  end
+  else if (GFrameMark = 0) and (Ctx.FrameWidthTop > 0) then
   begin
     Dec(Ctx.FrameWidthTop);
     PW := Ctx.FrameWidthInt[Ctx.FrameWidthTop];   NI := PW shr 32; BI := PW and $FFFFFFFF;
@@ -2244,12 +2327,18 @@ begin
   // RAII (V2): release the records this frame allocated (locals/temporaries) by rolling the
   // high-water mark back. Slots become reusable by the next AllocRecord. A UDT result has already
   // been copied into the caller-allocated instance (which lives below this frame's mark).
-  if Ctx.FrameRecBaseTop > 0 then
+  if Mark <> nil then
+  begin
+    if Mark^.RecBase < Ctx.RecordCount then
+      Ctx.RecordCount := Mark^.RecBase;
+    // M8: discard any block marks this frame left dangling (e.g. EXIT SUB from inside a loop).
+    Ctx.BlockRecMarkTop := Mark^.BlockMark;
+  end
+  else if (GFrameMark = 0) and (Ctx.FrameRecBaseTop > 0) then
   begin
     Dec(Ctx.FrameRecBaseTop);
     if Ctx.FrameRecBase[Ctx.FrameRecBaseTop] < Ctx.RecordCount then
       Ctx.RecordCount := Ctx.FrameRecBase[Ctx.FrameRecBaseTop];
-    // M8: discard any block marks this frame left dangling (e.g. EXIT SUB from inside a loop).
     Ctx.BlockRecMarkTop := Ctx.FrameBlockMarkTop[Ctx.FrameRecBaseTop];
   end;
 end;
@@ -3109,7 +3198,9 @@ begin
   WCtx.FrameSaveIntCount := FCtx.FrameSaveIntCount;
   WCtx.FrameSaveFloatCount := FCtx.FrameSaveFloatCount;
   WCtx.FrameSaveStrCount := FCtx.FrameSaveStrCount;
-  WCtx.FrameWidthTop := 0;   // the worker's own frame-width stack starts empty
+  WCtx.FrameMarkTop := 0;    // the worker's own frame-mark stack starts empty
+  WCtx.FrameWidthTop := 0;   // FRAMEMARK=0 layout
+  WCtx.FrameRecBaseTop := 0;
   SetLength(WCtx.IntRegs, WCtx.IntRegCount);
   SetLength(WCtx.FloatRegs, WCtx.FloatRegCount);
   SetLength(WCtx.StringRegs, WCtx.StringRegCount);
@@ -3126,7 +3217,6 @@ begin
   WCtx.FrameSaveIntTop := 0;
   WCtx.FrameSaveFloatTop := 0;
   WCtx.FrameSaveStrTop := 0;
-  WCtx.FrameRecBaseTop := 0;
   WCtx.BlockRecMarkTop := 0;
   SetLength(WCtx.Records, 0);
   WCtx.RecordCount := 0;
@@ -4525,6 +4615,7 @@ begin
     BuildProcFrameWidths;
     BuildCallSiteLiveness;   // ...and again by what each CALL SITE still needs after the call
   except
+    SetLength(FProcWidths, 0);
     SetLength(FProcWidthInt, 0); SetLength(FProcWidthFloat, 0); SetLength(FProcWidthStr, 0);
     SetLength(FCallLiveInt, 0);
   end;
@@ -4660,7 +4751,8 @@ begin
   FCtx.FrameSaveIntCount := -1;
   FCtx.FrameSaveFloatCount := -1;
   FCtx.FrameSaveStrCount := -1;
-  FCtx.FrameWidthTop := 0;
+  FCtx.FrameMarkTop := 0;
+  FCtx.FrameWidthTop := 0;      // FRAMEMARK=0 layout
   FCtx.FrameRecBaseTop := 0;
   FCtx.BlockRecMarkTop := 0;
   SetLength(FCtx.Records, 0);
@@ -6415,7 +6507,7 @@ end;
 {$pop}
 
 var
-  GCallProf: Integer = -1;         // -1 unread, 0 off, 1 on
+  GCallProf: Integer = -1;         // -1 unread, 0 off, 1 on, 2 on + sub-phases
   GCPCalls: QWord = 0;
   GCPTotal: QWord = 0;
   GCPPush: QWord = 0;
@@ -6425,14 +6517,25 @@ var
   GCPBankF: QWord = 0;
   GCPBankS: QWord = 0;
   GCPTscOverhead: QWord = 0;       // cycles charged by one RdTsc read, measured
+  // AOT_CALLPROF=2 only: the push and pop phases split into their parts. Six extra RdTsc reads
+  // per call, so with these on the phase totals above are NOT comparable to a =1 run - read the
+  // shares, not the absolutes. Off by default for exactly that reason.
+  GCPPre: QWord = 0;               // entry -> before FramePush   (dispatch checks, callee lookup)
+  GCPFrameP: QWord = 0;            // FramePush alone
+  GCPStack: QWord = 0;             // GrowCallStackIfNeeded + return-PC push
+  GCPArrIn: QWord = 0;             // descriptor refresh BEFORE the callee
+  GCPArrOut: QWord = 0;            // descriptor refresh AFTER the callee
+  GCPFrameQ: QWord = 0;            // return-PC pop + FramePop + the bcReturnSub test
 
 function AotCallProfOn: Boolean; inline;
 var i: Integer; a, b, lo: QWord;
 begin
   if GCallProf < 0 then
   begin
-    if GetEnvironmentVariable('AOT_CALLPROF') = '1' then GCallProf := 1 else GCallProf := 0;
-    if GCallProf = 1 then
+    if GetEnvironmentVariable('AOT_CALLPROF') = '1' then GCallProf := 1
+    else if GetEnvironmentVariable('AOT_CALLPROF') = '2' then GCallProf := 2
+    else GCallProf := 0;
+    if GCallProf > 0 then
     begin
       lo := High(QWord);
       for i := 1 to 1000 do
@@ -6443,7 +6546,7 @@ begin
       GCPTscOverhead := lo;
     end;
   end;
-  Result := GCallProf = 1;
+  Result := GCallProf > 0;
 end;
 
 function AotCallSub(AotCtx: PAotCtx; CalleeEntryPC, BcCallSubPC: PtrInt): PtrInt; cdecl;
@@ -6454,12 +6557,14 @@ var
   C: TExecutionContext;
   Fn: TExecMem;
   RetPC: PtrInt;
-  Prof: Boolean;
+  Prof, Fine: Boolean;
   T0, T1, T2, T3: QWord;
+  Ta, Tb, Tc, Td: QWord;
   SI, SF, SS: Integer;
 begin
   Prof := AotCallProfOn;
-  T0 := 0; T1 := 0; T2 := 0;
+  Fine := GCallProf = 2;
+  T0 := 0; T1 := 0; T2 := 0; Ta := 0; Tb := 0; Tc := 0; Td := 0;
   if Prof then T0 := AotRdTsc;
   VM := TBytecodeVM(AotCtx^.VMSelf);
   C := TExecutionContext(AotCtx^.CtxObj);
@@ -6469,11 +6574,14 @@ begin
   if (Fn = nil) or (C.AotCallDepth >= AOT_CALLSUB_MAX_DEPTH) then
     Exit(BcCallSubPC);
   SI := C.FrameSaveIntTop; SF := C.FrameSaveFloatTop; SS := C.FrameSaveStrTop;
+  if Fine then Ta := AotRdTsc;
   try
     VM.FramePush(C, Integer(CalleeEntryPC), Integer(BcCallSubPC));
+    if Fine then Tb := AotRdTsc;
     VM.GrowCallStackIfNeeded(C);
     C.CallStack[C.CallStackPtr] := Integer(BcCallSubPC) + 1;
     Inc(C.CallStackPtr);
+    if Fine then Tc := AotRdTsc;
   except
     // FramePush/Grow can allocate; a raise here must not unwind through native frames.
     C.AotPendingExc := TObject(AcquireExceptionObject);
@@ -6490,6 +6598,13 @@ begin
     Inc(GCPBankI, QWord(C.FrameSaveIntTop - SI));
     Inc(GCPBankF, QWord(C.FrameSaveFloatTop - SF));
     Inc(GCPBankS, QWord(C.FrameSaveStrTop - SS));
+    if Fine then
+    begin
+      Inc(GCPPre,    Ta - T0 - GCPTscOverhead);
+      Inc(GCPFrameP, Tb - Ta - GCPTscOverhead);
+      Inc(GCPStack,  Tc - Tb - GCPTscOverhead);
+      Inc(GCPArrIn,  T1 - Tc - GCPTscOverhead);
+    end;
   end;
   Inc(C.AotCallDepth);
   RetPC := TNativeFuncFn(Fn.Ptr)(@C.IntRegs[0], PInt64(@C.FloatRegs[0]), AotCtx);
@@ -6500,6 +6615,7 @@ begin
   if VM.FArraysDirty then VM.RebuildJitArrDesc;
   if Length(VM.FJitArrDesc) > 0 then AotCtx^.ArrDesc := @VM.FJitArrDesc[0]
   else AotCtx^.ArrDesc := nil;
+  if Fine then Td := AotRdTsc;
   if RetPC < 0 then Exit(RetPC);   // helper sentinel from inside the callee: frame stays pushed
   if (RetPC < VM.FProgram.GetInstructionCount) and
      (PInstr(VM.FProgram.GetInstructionsPtr)[RetPC].OpCode = bcReturnSub) then
@@ -6514,6 +6630,11 @@ begin
       Inc(GCPCallee, T2 - T1 - GCPTscOverhead);
       Inc(GCPPop,    T3 - T2 - GCPTscOverhead);
       Inc(GCPTotal,  T3 - T0 - 3 * GCPTscOverhead);
+      if Fine then
+      begin
+        Inc(GCPArrOut, Td - T2 - GCPTscOverhead);
+        Inc(GCPFrameQ, T3 - Td - GCPTscOverhead);
+      end;
     end;
     Exit(AOT_CALL_OK);
   end;
@@ -11416,7 +11537,7 @@ end;
 procedure AotCallProfReport;
 var n: QWord;
 begin
-  if GCallProf <> 1 then Exit;
+  if GCallProf <= 0 then Exit;
   n := GCPCalls;
   if n = 0 then Exit;
   WriteLn(ErrOutput, '');
@@ -11426,6 +11547,17 @@ begin
   WriteLn(ErrOutput, Format('[CALLPROF]     push  %8.1f   (FramePush bank snapshot + call-stack push)', [GCPPush / n]));
   WriteLn(ErrOutput, Format('[CALLPROF]     callee%8.1f   (the compiled function: prologue, body, epilogue)', [GCPCallee / n]));
   WriteLn(ErrOutput, Format('[CALLPROF]     pop   %8.1f   (descriptor refresh + FramePop)', [GCPPop / n]));
+  if GCallProf = 2 then
+  begin
+    WriteLn(ErrOutput, '[CALLPROF]   sub-phases (AOT_CALLPROF=2: six extra reads per call, so the');
+    WriteLn(ErrOutput, '[CALLPROF]   absolutes above are inflated - read these as SHARES):');
+    WriteLn(ErrOutput, Format('[CALLPROF]       pre       %8.1f   (VM/ctx loads, callee lookup, depth cap)', [GCPPre / n]));
+    WriteLn(ErrOutput, Format('[CALLPROF]       FramePush %8.1f', [GCPFrameP / n]));
+    WriteLn(ErrOutput, Format('[CALLPROF]       callstack %8.1f   (grow check + return-PC push)', [GCPStack / n]));
+    WriteLn(ErrOutput, Format('[CALLPROF]       arrdesc-in%8.1f   (FArraysDirty + ArrDesc rebase)', [GCPArrIn / n]));
+    WriteLn(ErrOutput, Format('[CALLPROF]       arrdesc-ou%8.1f   (same again, after the callee)', [GCPArrOut / n]));
+    WriteLn(ErrOutput, Format('[CALLPROF]       FramePop  %8.1f   (return-PC pop + FramePop + bcReturnSub test)', [GCPFrameQ / n]));
+  end;
   WriteLn(ErrOutput, Format('[CALLPROF]   bank elements copied per call: int=%.2f float=%.2f string=%.2f',
                             [GCPBankI / n, GCPBankF / n, GCPBankS / n]));
   WriteLn(ErrOutput, '[CALLPROF]   NB "total" excludes the CALLER-side flush/reload, which is');
@@ -11437,6 +11569,7 @@ initialization
   if GetEnvironmentVariable('FRAMEBANK') = '0' then GFrameBankNarrow := 0;
   if GetEnvironmentVariable('FRAMERANGE') = '0' then GFrameRangeNarrow := 0;
   if GetEnvironmentVariable('FRAMELIVE') = '0' then GFrameLiveNarrow := 0;
+  if GetEnvironmentVariable('FRAMEMARK') = '0' then GFrameMark := 0;
 
 finalization
   AotCallProfReport;

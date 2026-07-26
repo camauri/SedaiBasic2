@@ -54,6 +54,19 @@ type
   end;
   PRecordStorage = ^TRecordStorage;   // M5.2c: stable pointer to a record (per-thread or shared region)
 
+  { One call frame's bookkeeping, pushed by FramePush and read back by FramePop. 32 bytes, so two
+    frames share a cache line - see the FrameMarks field for why this is one record and not the
+    five parallel arrays it replaced. WInt/WFloat/WStr each pack (width shl 32) or base, the two
+    ends of the bank range this frame snapshotted. }
+  TFrameMark = record
+    WInt: Int64;
+    WFloat: Int64;
+    WStr: Int64;
+    RecBase: Integer;      // Ctx.RecordCount on entry: the frame's records die at pop
+    BlockMark: Integer;    // Ctx.BlockRecMarkTop on entry: discards block marks the frame leaked
+  end;
+  PFrameMark = ^TFrameMark;
+
   TExecutionContext = class
   public
     // --- Register banks (one working set per context) ---
@@ -104,26 +117,42 @@ type
     FrameSaveIntCount: Integer;
     FrameSaveFloatCount: Integer;
     FrameSaveStrCount: Integer;
-    // Per-frame widths actually pushed, so FramePop restores exactly what FramePush saved. A call
-    // only has to protect the registers its CALLEE (and everything the callee calls) can touch,
-    // which is usually far below the program-wide width - the caller of a two-line SUB should not
-    // pay for the biggest procedure in the program. Pushed by FramePush, read by FramePop.
-    // The saved part of a bank is a RANGE, not a prefix: a procedure's registers are numbered above
-    // its caller's, so saving from 0 copies registers the callee provably cannot reach. Each entry
-    // therefore packs BOTH ends, (width shl 32) or base - deliberately packed rather than kept in
-    // three more arrays, because a separate base stack costs three more pushes and three more pops
-    // of dynamic-array traffic per call, which measured MORE than the copies it saves.
+    // Everything one call frame records, in ONE 32-byte entry. This used to be FIVE parallel
+    // dynamic arrays (three widths + the record base + the block mark) pushed and popped in
+    // lockstep, and that layout - not the copying - was what a call actually cost: five field
+    // loads, five Length() checks and five writes landing on five different cache lines to record
+    // what is one small struct. AOT_CALLPROF attributed ~93 of the ~127 non-callee cycles of a
+    // native call to FramePush/FramePop on a program that copies ONE integer per call, i.e. to
+    // pointer chasing, not to bank traffic. One array of records makes it one length check and one
+    // cache line per frame; two frames share a line.
+    //
+    // W* pack BOTH ends of the saved range, (width shl 32) or base. The saved part of a bank is a
+    // RANGE, not a prefix: a procedure's registers are numbered above its caller's, so saving from
+    // 0 copies registers the callee provably cannot reach. Packing beats a separate base stack -
+    // that measured MORE in extra traffic than the copies it saved.
+    //
+    // A call only has to protect the registers its CALLEE (and everything the callee calls) can
+    // touch, which is usually far below the program-wide width: the caller of a two-line SUB should
+    // not pay for the biggest procedure in the program. Pushed by FramePush, read by FramePop.
+    FrameMarks: array of TFrameMark;
+    FrameMarkTop: Integer;
+    // The five arrays the entry above replaced, kept ONLY so FRAMEMARK=0 can reproduce the historic
+    // layout for an A/B on ONE binary. Two separately linked binaries differ in code alignment, and
+    // this project has measured 14% from code that never ran, so a layout change cannot be judged by
+    // comparing two builds. Dead unless the gate is off.
     FrameWidthInt: array of Int64;
     FrameWidthFloat: array of Int64;
     FrameWidthStr: array of Int64;
     FrameWidthTop: Integer;
-
-    // --- Record reclamation marks (RAII, V2 frame / M8 block) ---
     FrameRecBase: array of Integer;
+    FrameBlockMarkTop: array of Integer;
     FrameRecBaseTop: Integer;
+
+    // --- Record reclamation marks (RAII, M8 block) ---
+    // The FRAME-level marks moved into TFrameMark above; these are the per-BLOCK ones, which are
+    // pushed and popped on a different schedule and stay separate.
     BlockRecMark: array of Integer;
     BlockRecMarkTop: Integer;
-    FrameBlockMarkTop: array of Integer;   // BlockRecMarkTop saved per frame
 
     // --- Transfer slots (M2): carry args/result across a call's frame save/restore ---
     XferInt: array of Int64;
