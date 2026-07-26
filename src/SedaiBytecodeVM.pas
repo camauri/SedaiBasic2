@@ -1748,6 +1748,12 @@ var
   // refused it. The first version of this analysis found nothing at all and looked exactly like a
   // working one from the outside.
   GFrameBaseDiag: Integer = 0;
+  // FRAMEBASE_WIDE=0 restores the v1 rule that only a procedure touching NOTHING but the integer
+  // bank could be relocated. With it on (default), a procedure that also uses float, string or
+  // record opcodes relocates its INTEGER frame and keeps COPYING the other two banks exactly as
+  // before - the callee reaches those at absolute addresses, which the existing snapshot already
+  // protects. Only the integer view slides, so nothing else about the scheme changes.
+  GFrameBaseWide: Integer = 1;
 
 function BcTouchesOnlyIntBank(Op: Word): Boolean;
 begin
@@ -1790,14 +1796,40 @@ begin
     bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
-    bcXferLoadInt:
+    bcXferLoadInt,
+    // Opcodes whose OTHER operands live in the float or string bank but whose Dest is an integer.
+    // A comparison is the shape that matters here: it reads two floats and writes a truth value
+    // into the integer bank, so it writes Dest and reads nothing of ours.
+    bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpGtFloat, bcCmpLeFloat, bcCmpGeFloat,
+    bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,   // no Le/Ge form exists
+    bcFloatToInt, bcFloatRound, bcNarrowInt,
+    bcRecordLoadInt, bcRecordTypeId, bcRecordNew, bcRecordNewBlock,
+    // Array element and bound reads. The array itself lives in FArrays, a bank of its own that is
+    // never relocated, so an array opcode is transparent to the sliding view: only its register
+    // operands matter here. Src1 is the array ID (an immediate), Src2 the index register.
+    bcArrayLoadInt, bcArrayLBound, bcArrayUBound:
       Result := IW_DEST;
     // Dest is not an operand of these at all. Saying so matters for the LOW end of the range and
     // only there: an absent operand lowers to register 0 ([[absent-operand-lowers-to-r0]]), so
     // crediting it would pin every procedure's base to 0 and undo the narrowing. bcXferStoreInt
     // writes the transfer bank, which is not part of the snapshot; bcCallSub's callee is folded in
     // by the fixpoint below.
-    bcXferStoreInt, bcJump, bcJumpIfZero, bcJumpIfNotZero, bcNop, bcCallSub, bcReturnSub:
+    bcXferStoreInt, bcJump, bcJumpIfZero, bcJumpIfNotZero, bcNop, bcCallSub, bcReturnSub,
+    // Purely float/string opcodes: their Dest indexes ANOTHER bank, so crediting it here would
+    // reserve an integer register that is not one. The banks are numbered in parallel, which is
+    // exactly why this has to be said explicitly rather than inferred from the operand fields.
+    bcLoadConstFloat, bcLoadConstString, bcCopyFloat, bcCopyString, bcNarrowSingle,
+    bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcNegFloat,
+    bcXferLoadFloat, bcXferLoadString, bcXferStoreFloat, bcXferStoreString,
+    bcIntToFloat, bcIntToString,
+    bcRecordLoadFloat, bcRecordLoadString,
+    bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString, bcRecordFree,
+    bcArrayLoadFloat, bcArrayLoadString,
+    bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
+    // Binding an array BYREF parameter moves entries between FArrays slots and a save stack of its
+    // own. bcArrayBind/Unbind/BindApply name their arrays by immediate and touch no register at all;
+    // bcArrayBindInd takes the member's runtime handle from Src2.
+    bcArrayBind, bcArrayUnbind, bcArrayBindApply, bcArrayBindInd, bcArrayErase:
       Result := IW_NONE;
   else
     Result := IW_UNKNOWN;
@@ -1820,17 +1852,49 @@ const
   US_NONE    = 0;
   US_SRC1    = 1;
   US_SRC2    = 2;
+  // Dest is not always a destination. An array store carries the VALUE to be stored in the Dest
+  // field and READS it (see bcArrayStoreInt in RunTemplate.inc), so without this axis the only two
+  // answers available - "writes Dest" and "touches nothing" - are both wrong, and the second one is
+  // wrong in the direction that kills a live register.
+  US_DEST    = 4;
 
 function BcIntUseShape(Op: Word): Integer;
 begin
   case Op of
-    bcLoadConstInt, bcXferLoadInt, bcJump, bcNop, bcCallSub, bcReturnSub:
+    bcLoadConstInt, bcXferLoadInt, bcJump, bcNop, bcCallSub, bcReturnSub,
+    // Nothing of these reaches the integer bank: operands and result are all float or string.
+    bcLoadConstFloat, bcLoadConstString, bcCopyFloat, bcCopyString, bcNarrowSingle,
+    bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcNegFloat,
+    bcXferLoadFloat, bcXferLoadString, bcXferStoreFloat, bcXferStoreString,
+    // Read two floats or two strings, write an integer truth value: the reads are not ours.
+    bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpGtFloat, bcCmpLeFloat, bcCmpGeFloat,
+    bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,   // no Le/Ge form exists
+    bcFloatToInt, bcFloatRound,
+    // Src1/Src2 are the slot COUNTS passed straight to AllocRecord, not register indices.
+    bcRecordNew,
+    // Arrays named by immediate only.
+    bcArrayBind, bcArrayUnbind, bcArrayBindApply, bcArrayErase:
       Result := US_NONE;
-    bcCopyInt, bcNegInt, bcBitwiseNot, bcXferStoreInt, bcJumpIfZero, bcJumpIfNotZero:
+    bcCopyInt, bcNegInt, bcBitwiseNot, bcXferStoreInt, bcJumpIfZero, bcJumpIfNotZero,
+    bcIntToFloat, bcIntToString, bcNarrowInt,
+    // Src1 is the record HANDLE, which lives in the integer bank whatever the field's type is;
+    // the slot number is an immediate. Verified one by one against ResolveRec in RunTemplate.inc.
+    bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString, bcRecordTypeId,
+    bcRecordStoreFloat, bcRecordStoreString, bcRecordFree, bcRecordNewBlock:
       Result := US_SRC1;
+    // Src2 is the element index (or the member handle for BindInd); Src1 is an immediate array id.
+    bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
+    bcArrayLBound, bcArrayUBound, bcArrayBindInd,
+    // A float or string element store reads its index from Src2 and its VALUE from the other bank.
+    bcArrayStoreFloat, bcArrayStoreString:
+      Result := US_SRC2;
+    // ... but an INTEGER element store reads the value from Dest, in our bank.
+    bcArrayStoreInt:
+      Result := US_SRC2 or US_DEST;
     bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt,
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
-    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr:
+    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr,
+    bcRecordStoreInt:   // Src1 = handle, Src2 = the integer value being stored
       Result := US_SRC1 or US_SRC2;
   else
     Result := US_UNKNOWN;
@@ -2068,7 +2132,7 @@ var
   ExternallyRead: array of Boolean; // register carries a value INTO some unit from outside it
   WStamp: array of Integer;         // register -> unit whose own write set contains it
   MaxReg: Integer;
-  UD, U1, U2, Ok, ChangedU: Boolean;
+  UD, UDR, U1, U2, Ok, ChangedU: Boolean;
   Why: string;
   Elig: array of Boolean;           // unit -> relocatable (before and after the callee fixpoint)
   ELo, EHi: array of Integer;       // unit -> its private integer range
@@ -2085,13 +2149,14 @@ var
     register 0, which is a perfectly valid index, so crediting it makes every procedure containing
     a call "touch" R0 and share it with everyone - which is exactly how the first version of this
     analysis found nothing at all. Unaudited shapes answer YES, which can only cost eligibility. }
-  procedure IntOperands(Op: Word; out UD, U1, U2: Boolean);
+  procedure IntOperands(Op: Word; out UD, UDR, U1, U2: Boolean);
   var us: Integer;
   begin
-    UD := BcIntWriteShapeRaw(Op) <> IW_NONE;
+    UD := BcIntWriteShapeRaw(Op) <> IW_NONE;          // Dest WRITTEN (or unaudited)
     us := BcIntUseShape(Op);
     U1 := (us = US_UNKNOWN) or ((us and US_SRC1) <> 0);
     U2 := (us = US_UNKNOWN) or ((us and US_SRC2) <> 0);
+    UDR := (us = US_UNKNOWN) or ((us and US_DEST) <> 0);   // Dest READ (an array element store)
   end;
 
 begin
@@ -2177,8 +2242,8 @@ begin
     for i := UStart[p] to UEnd[p] do
     begin
       Instr := FProgram.GetInstruction(i);
-      IntOperands(Instr.OpCode, UD, U1, U2);
-      if UD then Claim(p, Instr.Dest);
+      IntOperands(Instr.OpCode, UD, UDR, U1, U2);
+      if UD or UDR then Claim(p, Instr.Dest);
       if U1 then Claim(p, Instr.Src1);
       if U2 then Claim(p, Instr.Src2);
       if BcIntWriteShapeRaw(Instr.OpCode) = IW_DEST then
@@ -2212,11 +2277,14 @@ begin
     for i := UStart[p] to UEnd[p] do
     begin
       Instr := FProgram.GetInstruction(i);
-      IntOperands(Instr.OpCode, UD, U1, U2);
+      IntOperands(Instr.OpCode, UD, UDR, U1, U2);
       if U1 and (Instr.Src1 >= 0) and (Instr.Src1 <= MaxReg) and (WStamp[Instr.Src1] <> p) then
         ExternallyRead[Instr.Src1] := True;
       if U2 and (Instr.Src2 >= 0) and (Instr.Src2 <= MaxReg) and (WStamp[Instr.Src2] <> p) then
         ExternallyRead[Instr.Src2] := True;
+      // A read through the Dest field counts exactly like the other two.
+      if UDR and (Instr.Dest >= 0) and (Instr.Dest <= MaxReg) and (WStamp[Instr.Dest] <> p) then
+        ExternallyRead[Instr.Dest] := True;
     end;
   end;
 
@@ -2244,13 +2312,18 @@ begin
     begin
       Instr := FProgram.GetInstruction(i);
       Op := Instr.OpCode;
-      // (1) integer-only, and (4) no GOSUB / indirect control flow.
-      if (not BcTouchesOnlyIntBank(Op)) or (Op = Ord(bcCall)) or (Op = Ord(bcReturn)) or
+      // (1) the opcode's effect on the INTEGER bank must be audited, and (4) no GOSUB / indirect
+      // control flow. What matters is not that the opcode is integer-only but that we know exactly
+      // which integer registers it writes: a float multiply touches none of ours and is as safe to
+      // relocate around as a jump. An unaudited opcode still refuses the whole unit.
+      if (GFrameBaseWide <> 1) and (not BcTouchesOnlyIntBank(Op)) then
+      begin Ok := False; Why := Format('not int-only: op $%x at pc %d', [Op, i]); Break; end;
+      if (BcIntWriteShapeRaw(Op) = IW_UNKNOWN) or (Op = Ord(bcCall)) or (Op = Ord(bcReturn)) or
          (Op = Ord(bcCallSubIndirect)) or (Op = Ord(bcThreadCreate)) then
-      begin Ok := False; Why := Format('not int-only/indirect: op $%x at pc %d', [Op, i]); Break; end;
+      begin Ok := False; Why := Format('unaudited write shape/indirect: op $%x at pc %d', [Op, i]); Break; end;
       if BcIntUseShape(Op) = US_UNKNOWN then
       begin Ok := False; Why := Format('unaudited read shape: op $%x at pc %d', [Op, i]); Break; end;
-      IntOperands(Op, UD, U1, U2);
+      IntOperands(Op, UD, UDR, U1, U2);
       // (3) a register this unit reads but never writes carries a value from outside the
       // activation - the caller's, or an outer activation's - and a relocated frame starts on
       // fresh slots, so that value would not be there.
@@ -2260,6 +2333,9 @@ begin
       if U2 and (Instr.Src2 >= 0) and (Instr.Src2 <= MaxReg) and (WStamp[Instr.Src2] <> p) then
       begin Ok := False;
         Why := Format('reads R%d never written here (op $%x pc %d)', [Instr.Src2, Op, i]); Break; end;
+      if UDR and (Instr.Dest >= 0) and (Instr.Dest <= MaxReg) and (WStamp[Instr.Dest] <> p) then
+      begin Ok := False;
+        Why := Format('reads R%d (Dest) never written here (op $%x pc %d)', [Instr.Dest, Op, i]); Break; end;
       // (2) nothing this unit WRITES may be a register somebody else reads for its value: that
       // write has to land at the absolute address the reader will look at, and a relocated frame
       // would put it somewhere else. Reads and writes of the same index by an unrelated unit are
@@ -2267,12 +2343,14 @@ begin
       for r := 0 to 2 do
       begin
         case r of
-          0: begin if not UD then System.Continue; i2 := Instr.Dest; end;
+          0: begin if not (UD or UDR) then System.Continue; i2 := Instr.Dest; end;
           1: begin if not U1 then System.Continue; i2 := Instr.Src1; end;
         else  begin if not U2 then System.Continue; i2 := Instr.Src2; end;
         end;
         if (i2 < 0) or (i2 > MaxReg) then System.Continue;
-        if (r = 0) and ExternallyRead[i2] then
+        // Only a WRITE through Dest can strand another unit's reader; a read through it is just
+        // one more index this unit's range has to cover.
+        if (r = 0) and UD and ExternallyRead[i2] then
         begin Ok := False;
           Why := Format('writes R%d which another unit reads (op $%x pc %d)', [i2, Op, i]); Break; end;
         if i2 < Lo then Lo := i2;
@@ -2357,7 +2435,7 @@ var
   Out_: array of QWord;      // scratch: LiveOut of the instruction being processed
   Eligible: Boolean;
   Changed: Boolean;
-  Def, Use1, Use2, Shape, UShape: Integer;
+  Def, Use1, Use2, Use3, Shape, UShape: Integer;
   Bit: QWord;
 
   procedure SetBit(var A: array of QWord; Base, Reg: Integer);
@@ -2456,14 +2534,18 @@ begin
 
         Shape := BcIntWriteShapeRaw(Op);
         UShape := BcIntUseShape(Op);
-        Def := -1; Use1 := -1; Use2 := -1;
+        Def := -1; Use1 := -1; Use2 := -1; Use3 := -1;
         if Shape = IW_DEST then Def := Instr.Dest;
         if (UShape and US_SRC1) <> 0 then Use1 := Instr.Src1;
         if (UShape and US_SRC2) <> 0 then Use2 := Instr.Src2;
+        // An array element store READS the value out of its Dest field. Missing this would let the
+        // liveness call that register dead across a call and drop it from the snapshot.
+        if (UShape and US_DEST) <> 0 then Use3 := Instr.Dest;
         if (Def >= 0) and (Def < RegCount) then
           Out_[Def shr 6] := Out_[Def shr 6] and not (QWord(1) shl (Def and 63));
         SetBit(Out_, 0, Use1);
         SetBit(Out_, 0, Use2);
+        SetBit(Out_, 0, Use3);
         for w := 0 to Words - 1 do
           if Live[(i - PcStart) * Words + w] <> Out_[w] then
           begin
@@ -2494,35 +2576,56 @@ var
   FBLo, FBHi: Integer;
   PW: Int64;
   PWidth: ^TProcWidth;
+  Reloc: Boolean;
+  SaveDelta, SaveHw, NewDelta, NewHw: Integer;
 begin
   BI := 0; BF := 0; BS := 0;
+  Reloc := False; SaveDelta := -1; SaveHw := 0; NewDelta := 0; NewHw := 0;
   // FRAME RELOCATION. When the callee is one of the procedures BuildProcFrameBases proved
-  // relocatable, its whole activation runs on fresh slots above every live frame: slide the view
-  // and copy NOTHING. The delta is HighWater - Lo, so the frame lands exactly at the high-water
-  // mark whatever its lowest register index happens to be. Falls through to the copying path if
-  // the region is full, which is a slowdown and never a wrong answer.
-  if (GFrameBase = 1) and (TargetPC >= 0) and (TargetPC < Length(FProcFrameBase)) and
-     (FProcFrameBase[TargetPC] >= 0) then
+  // relocatable, its INTEGER activation runs on fresh slots above every live frame: slide the view
+  // and copy no integers at all. The delta is HighWater - Lo, so the frame lands exactly at the
+  // high-water mark whatever its lowest register index happens to be. Falls through to the copying
+  // path if the region is full, which is a slowdown and never a wrong answer.
+  // The float and string banks are NOT relocated: a relocatable callee may now touch them (see
+  // GFrameBaseWide), and it reaches them at absolute addresses, so they keep being snapshotted
+  // exactly as they always were. Only the integer half of this frame becomes free.
+  // Gated on GFrameMark because a relocated frame has nowhere but the frame-mark stack to record
+  // the view it has to slide back to.
+  if (GFrameBase = 1) and (GFrameMark = 1) and (TargetPC >= 0) and
+     (TargetPC < Length(FProcFrameBase)) and (FProcFrameBase[TargetPC] >= 0) then
   begin
     PW := FProcFrameBase[TargetPC];
     FBHi := PW shr 32; FBLo := PW and $FFFFFFFF;  // separate locals: falling through must not
     if Ctx.RegHwI + (FBHi - FBLo) <= Ctx.RegFrameCap then   // disturb the copying path's BI/NI
     begin
-      if Ctx.FrameMarkTop >= Length(Ctx.FrameMarks) then
-        SetLength(Ctx.FrameMarks, Ctx.FrameMarkTop + 256);
-      with Ctx.FrameMarks[Ctx.FrameMarkTop] do
+      Reloc := True;
+      SaveDelta := Ctx.RegDeltaI;                 // >= 0 marks this frame as RELOCATED
+      SaveHw := Ctx.RegHwI;
+      NewDelta := Ctx.RegHwI - FBLo;
+      NewHw := Ctx.RegHwI + (FBHi - FBLo);
+      // FAST PATH, and the only one this scheme had at first: a callee that touches neither the
+      // float nor the string bank has nothing left to copy, so its whole frame is a pointer slide.
+      // Worth testing for rather than folding into the general path - it is the recursive
+      // integer function, which is where relocation earns its keep.
+      if (TargetPC < Length(FProcWidths)) and (FProcWidths[TargetPC].WInt >= 0) and
+         ((FProcWidths[TargetPC].WFloat shr 32) = 0) and ((FProcWidths[TargetPC].WStr shr 32) = 0) then
       begin
-        SaveDeltaI := Ctx.RegDeltaI;              // >= 0 marks this frame as RELOCATED
-        SaveHwI := Ctx.RegHwI;
-        WInt := 0; WFloat := 0; WStr := 0;        // nothing was copied, so nothing is restored
-        RecBase := Ctx.RecordCount;
-        BlockMark := Ctx.BlockRecMarkTop;
+        if Ctx.FrameMarkTop >= Length(Ctx.FrameMarks) then
+          SetLength(Ctx.FrameMarks, Ctx.FrameMarkTop + 256);
+        with Ctx.FrameMarks[Ctx.FrameMarkTop] do
+        begin
+          SaveDeltaI := SaveDelta;
+          SaveHwI := SaveHw;
+          WInt := 0; WFloat := 0; WStr := 0;      // nothing was copied, so nothing is restored
+          RecBase := Ctx.RecordCount;
+          BlockMark := Ctx.BlockRecMarkTop;
+        end;
+        Inc(Ctx.FrameMarkTop);
+        Ctx.RegDeltaI := NewDelta;
+        Ctx.RegHwI := NewHw;
+        Ctx.IntRegs := @Ctx.IntRegsMem[NewDelta];
+        Exit;
       end;
-      Inc(Ctx.FrameMarkTop);
-      Ctx.RegDeltaI := Ctx.RegHwI - FBLo;
-      Inc(Ctx.RegHwI, FBHi - FBLo);
-      Ctx.IntRegs := @Ctx.IntRegsMem[Ctx.RegDeltaI];
-      Exit;
     end;
   end;
   // A NEGATIVE width means "not measured for this context" (any path that runs bytecode without
@@ -2585,6 +2688,9 @@ begin
       if BI > NI then BI := NI;              // nothing live across: the range is empty
     end;
   end;
+  // A relocated frame copies no integers whatever the widths say - the callee is about to run on
+  // slots the caller does not own. The float and string ranges computed above still apply.
+  if Reloc then begin NI := 0; BI := 0; end;
   // Grow save stacks if needed (defensive; usually sized once).
   if Ctx.FrameSaveIntTop + (NI - BI) > Length(Ctx.FrameSaveInt) then
     SetLength(Ctx.FrameSaveInt, Ctx.FrameSaveIntTop + (NI - BI) + 256);
@@ -2628,9 +2734,18 @@ begin
       WStr := (Int64(NS) shl 32) or Int64(BS);
       RecBase := Ctx.RecordCount;
       BlockMark := Ctx.BlockRecMarkTop;
-      SaveDeltaI := -1;                 // this frame COPIED: pop must not slide the view back
+      SaveDeltaI := SaveDelta;          // -1 = this frame COPIED: pop must not slide the view back
+      SaveHwI := SaveHw;
     end;
     Inc(Ctx.FrameMarkTop);
+    // Slide the integer view only now: the copies above had to read the CALLER's float and string
+    // banks, and FramePop undoes this from the mark just written.
+    if Reloc then
+    begin
+      Ctx.RegDeltaI := NewDelta;
+      Ctx.RegHwI := NewHw;
+      Ctx.IntRegs := @Ctx.IntRegsMem[NewDelta];
+    end;
   end
   else
   begin
@@ -11977,6 +12092,7 @@ initialization
   if GetEnvironmentVariable('FRAMELIVE') = '0' then GFrameLiveNarrow := 0;
   if GetEnvironmentVariable('FRAMEMARK') = '0' then GFrameMark := 0;
   if GetEnvironmentVariable('FRAMEBASE') = '0' then GFrameBase := 0;
+  if GetEnvironmentVariable('FRAMEBASE_WIDE') = '0' then GFrameBaseWide := 0;
   if GetEnvironmentVariable('FRAMEBASE_DIAG') = '1' then GFrameBaseDiag := 1;
 
 finalization
