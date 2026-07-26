@@ -205,6 +205,13 @@ type
     // shared-memory model). Maps the UPPER-case name -> its array index. Every read/write of the name is
     // routed to element 0 of this array, so the value is never a per-thread register.
     FSharedScalarArr: TStringList;       // name (UPPER) -> array index (Objects[]=PtrInt arrayIdx)
+    // A module-level CONST lowers to a SHARED DIM (for procedure visibility), and every SHARED scalar
+    // gets a 1-element backing array - so a CONST used to be READ FROM MEMORY at every use, inside hot
+    // loops included (+18.6% interpreted against the same literal). A constant needs its NAME visible at
+    // compile time, not a shared cell at run time. This maps the UPPER-case name to its literal value,
+    // encoded as 'I:<int>' / 'F:<float>' / 'S:<text>', and reads fold to that immediate. The backing is
+    // still declared and initialised, so anything else that resolves through it is unaffected.
+    FModuleConstVals: TStringList;       // name (UPPER) -> 'I:'/'F:'/'S:' + literal text
     FStaticMembers: TStringList;         // OOP: static member variables "TYPE.FIELD" (UPPER), backed by a shared global scalar
     FEnumMembers: TStringList;           // FreeBASIC ENUM members (UPPER), backed by a shared global scalar so they are visible inside procedures
     FEnumNames: TStringList;             // FreeBASIC ENUM type names (UPPER): lets "MyEnum.member" resolve to the member
@@ -395,6 +402,7 @@ type
     procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
     // Refinement #2: cross-thread SHARED scalars backed by a 1-element global array.
     function IsSharedScalar(const Name: string): Boolean;                       // name is a SHARED scalar (array-backed)? False when shadowed by a param/local
+    function ModuleConstInt(const Name: string; out V: Int64): Boolean;         // name is a module CONST with an integer literal value? (folds to an immediate)
     function IsSharedScalarRaw(const Name: string): Boolean;                    // ...as DECLARED, ignoring shadowing (the slot-sync asks HOW it is stored, not WHICH variable is meant)
     function SharedScalarShadowed(const Name: string): Boolean;                 // ...is a param/local of the procedure being lowered hiding it? (MODERN)
     function MakeSharedScalarAccess(const Name: string; const Tok: TLexerToken): TASTNode;  // build name(0) array-access node
@@ -876,6 +884,8 @@ begin
   FSharedVars := TStringList.Create;
   FSharedVars.CaseSensitive := False;
   FSharedScalarArr := TStringList.Create;
+  FModuleConstVals := TStringList.Create;
+  FModuleConstVals.CaseSensitive := False;
   FStaticMembers := TStringList.Create;
   FStaticMembers.CaseSensitive := False;
   FEnumMembers := TStringList.Create;
@@ -963,6 +973,7 @@ begin
   FModuleDtorSlots.Free;
   FSharedVars.Free;
   FSharedScalarArr.Free;
+  FModuleConstVals.Free;
   FStaticMembers.Free;
   FEnumMembers.Free;
   FEnumNames.Free;
@@ -1534,6 +1545,7 @@ var
   DestReg: Integer;
   OpCode: TSSAOpCode;
   FuncName, VarName: string;
+  ConstIntVal: Int64;             // value of a module CONST folded into an immediate
   BareIntercept: Boolean;         // MODERN, and this bare name is NOT a name the program declared
   CastLeft, CastRight: Boolean;   // apply "Operator T.Cast() As String" to this binary operand?
   NumCast: Boolean;               // arithmetic op: apply a numeric Cast operator to a UDT operand
@@ -2069,6 +2081,10 @@ begin
       end
       // Refinement #2: a SHARED scalar is backed by a 1-element global array — read element 0 (a live,
       // cross-thread load), not a per-thread register.
+      // A module CONST is not a variable: fold the read to its value. Guarded by the same shadowing
+      // test the shared-scalar path uses, so a parameter or local of the same name still wins.
+      else if ModuleConstInt(VarName, ConstIntVal) then
+        Result := MakeSSAConstInt(ConstIntVal)
       else if IsSharedScalar(VarName) then
       begin
         ArgListNode := MakeSharedScalarAccess(VarName, Node.Token);
@@ -19310,6 +19326,15 @@ begin
         if Decl.Attributes.Values['RAWMODULE'] = '1' then Continue;
         VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
         AddSharedVarSlot(VNameU);                       // keep the "is shared" marker (scope resolution)
+        // CONST with an integer literal: remember the value so every READ folds to an immediate.
+        // The backing array below is still declared and initialised - anything that resolves through
+        // it keeps working - but the hot path stops loading a constant from memory. Integer literals
+        // only for now: a float would have to round-trip through text, and a string literal needs its
+        // ttStringLiteral token to avoid being re-read as a number ("5" is a string, not 5).
+        if (Decl.Attributes.Values['CONSTDECL'] = '1') and (Decl.ChildCount >= 3) and
+           (Decl.GetChild(2).NodeType = antLiteral) and VarIsNumeric(Decl.GetChild(2).Value) and
+           not VarIsFloat(Decl.GetChild(2).Value) then
+          FModuleConstVals.Values[VNameU] := IntToStr(Int64(Decl.GetChild(2).Value));
         // Refinement #2: a SHARED scalar is backed by a 1-element global array, so it lives in the shared
         // FArrays and is visible/live across threads. A builtin scalar stores its value; a UDT scalar
         // stores its (int) record handle — the record itself is allocated in the shared region at DIM.
@@ -19367,6 +19392,23 @@ function TSSAGenerator.IsSharedScalar(const Name: string): Boolean;
 // the scope stack first: ask it here, once, and all the call sites are fixed together.
 begin
   Result := IsSharedScalarRaw(Name) and not SharedScalarShadowed(Name);
+end;
+
+function TSSAGenerator.ModuleConstInt(const Name: string; out V: Int64): Boolean;
+// A module-level CONST whose value is an integer literal. Reads of it fold to that immediate instead
+// of loading element 0 of the SHARED backing array it is otherwise stored in. Shadowing is asked the
+// same way IsSharedScalar asks it: a parameter or local DIM of the same name is a different variable.
+var idx: Integer; sv: string;
+begin
+  V := 0;
+  Result := False;
+  if FModuleConstVals = nil then Exit;
+  idx := FModuleConstVals.IndexOfName(UpperCase(Name));
+  if idx < 0 then Exit;
+  if SharedScalarShadowed(Name) then Exit;
+  sv := FModuleConstVals.ValueFromIndex[idx];
+  if not TryStrToInt64(sv, V) then Exit;
+  Result := True;
 end;
 
 function TSSAGenerator.IsSharedScalarRaw(const Name: string): Boolean;

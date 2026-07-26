@@ -8715,6 +8715,7 @@ begin
     ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, TypeTok));
     ArrayDecl.AddChild(ValueNode);
     if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';     // FB: a module-level CONST is globally visible
+    ArrayDecl.Attributes.Values['CONSTDECL'] := '1';  // a CONST, not a variable: the SSA folds it to an immediate
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
     ParseConstListTail(Result, TypeName, False);      // "Const As T a = 1, b = 2, ...": T applies to the whole list
@@ -8758,6 +8759,7 @@ begin
     ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, TypeTok));
     ArrayDecl.AddChild(ValueNode);
     if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';     // FB: a module-level CONST is globally visible
+    ArrayDecl.Attributes.Values['CONSTDECL'] := '1';  // a CONST, not a variable: the SSA folds it to an immediate
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
     ParseConstListTail(Result, '', True);             // "Const a As T = 1, b As U = 2, ...": per-item type or inference
@@ -8792,6 +8794,7 @@ begin
   // CLASSIC (line-numbered Commodore BASIC) has no separate procedure scope and its execution model does
   // not use the shared-scalar backing array; marking it SHARED there breaks the const (m: stress.bas).
   if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';
+  ArrayDecl.Attributes.Values['CONSTDECL'] := '1';    // a CONST, not a variable: the SSA folds it to an immediate
   Assignment.Free;
   Result := TASTNode.Create(antDim, Token);
   Result.AddChild(ArrayDecl);
