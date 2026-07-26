@@ -214,6 +214,12 @@ type
     // path, take the general one. FramePush/FramePop were 65.7 cycles of a 205-cycle call while
     // copying nothing at all - the cost was the bookkeeping, not the bytes.
     FFrameFast: array of Int64;
+    // True only when EVERY call target in the program has a fast frame. The fast call primitive
+    // falls back to the general one for a callee that has not, and that fallback costs a second
+    // jump per call - measured +5.9% on fibf, whose recursive function copies floats. So the
+    // specialised primitive is installed only where nothing will take the fallback: all-or-nothing
+    // per program, which keeps fib's -21.5% without making anyone else pay for it.
+    FAllCalleesFast: Boolean;
     // Filled only when FRAMEMARK=0, to reproduce the historic three-array lookup on ONE binary.
     FProcWidthInt: array of Int64;
     FProcWidthFloat: array of Int64;
@@ -1768,6 +1774,8 @@ var
   // FRAME_FAST=0 disables the precomputed fast-relocation table and its paired FramePop exit, so
   // the same binary runs the general path for every call. For the A/B.
   GFrameFast: Integer = 1;
+  // AOT_FASTCALL=0 installs the general native call primitive for every call, as before.
+  GAotFastCall: Integer = 1;
 
 function BcTouchesOnlyIntBank(Op: Word): Boolean;
 begin
@@ -2537,6 +2545,14 @@ begin
     end;
   until not ChangedU;
 
+  // Program-wide: does every unit that something CALLS have a fast frame?
+  FAllCalleesFast := True;
+  for p := 0 to NUnit - 1 do
+    if IsTarget[UStart[p]] and
+       not ((UStart[p] < Length(FProcWidths)) and (FProcWidths[UStart[p]].WInt >= 0) and
+            ((FProcWidths[UStart[p]].WFloat shr 32) = 0) and
+            ((FProcWidths[UStart[p]].WStr shr 32) = 0) and Elig[p]) then
+      FAllCalleesFast := False;
   for p := 0 to NUnit - 1 do
   begin
     if GFrameBaseDiag = 1 then
@@ -7282,6 +7298,101 @@ begin
     end;
   end;
   Result := GCallProf > 0;
+end;
+
+function AotCallSub(AotCtx: PAotCtx; CalleeEntryPC, BcCallSubPC: PtrInt): PtrInt; cdecl; forward;
+
+{ AotCallSubFast: the same call site as AotCallSub, for the case that is worth specialising - a
+  callee whose frame is a POINTER SLIDE. Measured on fib, a native call costs ~205 cycles, of which
+  FramePush and FramePop were 65.7 while copying nothing at all; the fast frame took that to ~24, and
+  what is left of the Pascal side is mostly the calls themselves. So here the frame push and pop are
+  INLINED rather than called, and everything that exists for the general case is gone: no profiling
+  branches, no save-stack bookkeeping (nothing is saved), no width unpacking (there are no widths).
+
+  Eligibility is decided by the CALLER at compile time - FFrameFast[calleePC] >= 0 - so this routine
+  may assume it. The two things it still has to check are the two that are only knowable at run time:
+  the callee may not be compiled yet, and the relocation region may be full. Either way it falls back
+  to the general primitive, which is always correct.
+
+  DUPLICATED SEMANTICS, deliberately and narrowly: this is the fast half of FramePush/FramePop
+  written out. If that fast path changes, this must change with it - the guard is that both are
+  driven by the same FFrameFast table and the same sentinel (WInt = -1). }
+function AotCallSubFast(AotCtx: PAotCtx; CalleeEntryPC, BcCallSubPC: PtrInt): PtrInt; cdecl;
+type
+  PInstr = ^TBytecodeInstruction;
+var
+  VM: TBytecodeVM;
+  C: TExecutionContext;
+  Fn: TExecMem;
+  RetPC: PtrInt;
+  PW: Int64;
+  FBHi, FBLo, SaveDelta, SaveHw: Integer;
+begin
+  VM := TBytecodeVM(AotCtx^.VMSelf);
+  C := TExecutionContext(AotCtx^.CtxObj);
+  if (CalleeEntryPC < 0) or (CalleeEntryPC >= Length(VM.FNativeFuncs)) then
+    Exit(BcCallSubPC);
+  Fn := VM.FNativeFuncs[CalleeEntryPC];
+  if (Fn = nil) or (C.AotCallDepth >= AOT_CALLSUB_MAX_DEPTH) then
+    Exit(BcCallSubPC);
+  // The frame, inlined. One table read gives both numbers; the region check is also what bounds
+  // recursion here, exactly as in FramePush.
+  PW := VM.FFrameFast[CalleeEntryPC];
+  if PW < 0 then Exit(AotCallSub(AotCtx, CalleeEntryPC, BcCallSubPC));   // not fast after all
+  FBHi := PW shr 32; FBLo := PW and $FFFFFFFF;
+  if C.RegHwI + FBHi > C.RegFrameCap then
+    Exit(AotCallSub(AotCtx, CalleeEntryPC, BcCallSubPC));                // region full: copy instead
+  try
+    if C.FrameMarkTop >= Length(C.FrameMarks) then
+      SetLength(C.FrameMarks, C.FrameMarkTop + 256);
+    VM.GrowCallStackIfNeeded(C);
+  except
+    C.AotPendingExc := TObject(AcquireExceptionObject);
+    C.AotFaultPC := BcCallSubPC;
+    Exit(AOT_HELPER_EXC);
+  end;
+  SaveDelta := C.RegDeltaI;
+  SaveHw := C.RegHwI;
+  with C.FrameMarks[C.FrameMarkTop] do
+  begin
+    SaveDeltaI := SaveDelta;
+    SaveHwI := SaveHw;
+    WInt := -1;                       // the sentinel FramePop's fast path answers to
+    RecBase := C.RecordCount;
+    BlockMark := C.BlockRecMarkTop;
+  end;
+  Inc(C.FrameMarkTop);
+  C.RegDeltaI := SaveHw - FBLo;
+  C.RegHwI := SaveHw + FBHi;
+  C.IntRegs := @C.IntRegsMem[C.RegDeltaI];
+  C.CallStack[C.CallStackPtr] := Integer(BcCallSubPC) + 1;
+  Inc(C.CallStackPtr);
+  if VM.FArraysDirty then VM.RebuildJitArrDesc;
+  if Length(VM.FJitArrDesc) > 0 then AotCtx^.ArrDesc := @VM.FJitArrDesc[0]
+  else AotCtx^.ArrDesc := nil;
+  Inc(C.AotCallDepth);
+  RetPC := TNativeFuncFn(Fn.Ptr)(C.IntRegs, PInt64(@C.FloatRegs[0]), AotCtx);
+  Dec(C.AotCallDepth);
+  if VM.FArraysDirty then VM.RebuildJitArrDesc;
+  if Length(VM.FJitArrDesc) > 0 then AotCtx^.ArrDesc := @VM.FJitArrDesc[0]
+  else AotCtx^.ArrDesc := nil;
+  if RetPC < 0 then Exit(RetPC);      // helper sentinel: the frame stays pushed, as in the general one
+  if (RetPC < VM.FProgram.GetInstructionCount) and
+     (PInstr(VM.FProgram.GetInstructionsPtr)[RetPC].OpCode = bcReturnSub) then
+  begin
+    Dec(C.CallStackPtr);              // pop, then the frame - the interpreter's bcReturnSub order
+    Dec(C.FrameMarkTop);
+    with C.FrameMarks[C.FrameMarkTop] do
+    begin
+      C.RegDeltaI := SaveDeltaI;
+      C.RegHwI := SaveHwI;
+      C.IntRegs := @C.IntRegsMem[SaveDeltaI];
+      if RecBase < C.RecordCount then C.RecordCount := RecBase;
+      C.BlockRecMarkTop := BlockMark;
+    end;
+    Exit(AOT_CALL_OK);
+  end;
+  Result := RetPC;                    // deopt inside the callee: frame + return address stay
 end;
 
 function AotCallSub(AotCtx: PAotCtx; CalleeEntryPC, BcCallSubPC: PtrInt): PtrInt; cdecl;
@@ -12312,6 +12423,7 @@ initialization
   if GetEnvironmentVariable('FRAMEBASE_WIDE') = '1' then GFrameBaseWide := 1;
   if GetEnvironmentVariable('FRAMEBANK_SHAPE') = '0' then GFrameBankShape := 0;
   if GetEnvironmentVariable('FRAME_FAST') = '0' then GFrameFast := 0;
+  if GetEnvironmentVariable('AOT_FASTCALL') = '0' then GAotFastCall := 0;
   if GetEnvironmentVariable('FRAMEBASE_DIAG') = '1' then GFrameBaseDiag := 1;
 
 finalization

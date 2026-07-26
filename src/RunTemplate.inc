@@ -140,7 +140,11 @@ begin
     LocalAotCtx.StrLoadConst := @AotStrLoadConst;
     LocalAotCtx.StrConcat := @AotStrConcat;
     LocalAotCtx.StrLen := @AotStrLen;
-    LocalAotCtx.CallSub := @AotCallSub;   // B3: native call site primitive
+    // B3: native call site primitive. The FAST one specialises the case worth specialising - a
+    // callee whose frame is a pointer slide - and falls back to the general one for everything
+    // else, so it is correct for any program. AOT_FASTCALL=0 restores the general one always.
+    if (GAotFastCall = 1) and FAllCalleesFast then LocalAotCtx.CallSub := @AotCallSubFast
+    else LocalAotCtx.CallSub := @AotCallSub;
     // C5 residuals. StrMid is dialect-variant: install the flavor once per run.
     LocalAotCtx.StrLeft := @AotStrLeft;
     LocalAotCtx.StrRight := @AotStrRight;
