@@ -64,13 +64,27 @@ type
     WStr: Int64;
     RecBase: Integer;      // Ctx.RecordCount on entry: the frame's records die at pop
     BlockMark: Integer;    // Ctx.BlockRecMarkTop on entry: discards block marks the frame leaked
+    // Frame base: the caller's view offset and high-water, restored at pop. DeltaI = -1 marks a
+    // frame that did NOT relocate (the copying path ran instead), so pop knows not to slide back.
+    SaveDeltaI: Integer;
+    SaveHwI: Integer;
   end;
   PFrameMark = ^TFrameMark;
 
   TExecutionContext = class
   public
     // --- Register banks (one working set per context) ---
-    IntRegs: array of Int64;
+    // IntRegsMem OWNS the integer bank; IntRegs is a rebasable VIEW into it, and is what every
+    // access site indexes. Splitting the two is what makes a call frame relocatable: instead of
+    // COPYING the callee's register range out of the way (which is what a call has always done
+    // here, because the banks are global and a second activation of the same procedure reuses the
+    // same indices), an eligible call slides the view up by a delta and the callee's accesses land
+    // in fresh slots. Every path benefits at once and none of them changes: the run loop caches
+    // this pointer, the JIT and the AOT receive it as their first argument, and the interpreter's
+    // slow path indexes it through Ctx. Only SetLength/Length touch IntRegsMem - and every
+    // reallocation must refresh IntRegs, or the view dangles.
+    IntRegsMem: array of Int64;
+    IntRegs: PInt64;
     FloatRegs: array of Double;
     StringRegs: array of string;
     TempIntRegs: array of Int64;
@@ -79,6 +93,13 @@ type
     IntRegCount: Integer;       // Current size of int register arrays
     FloatRegCount: Integer;     // Current size of float register arrays
     StringRegCount: Integer;    // Current size of string register arrays
+    // Frame base (integer bank). RegDeltaI is how far the view above is slid from the allocation;
+    // RegHwI is the first slot above every live frame, i.e. where the next relocated frame starts.
+    // Both are per-context, so a worker keeps its own. RegFrameCap is where the relocatable region
+    // ends: a call that would run past it falls back to the copying frame, which is always correct.
+    RegDeltaI: Integer;
+    RegHwI: Integer;
+    RegFrameCap: Integer;
 
     // --- Program counter / run state ---
     PC: Integer;

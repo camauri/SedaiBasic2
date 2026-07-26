@@ -203,6 +203,9 @@ type
     // three cache lines to answer one question. Int stays first: it is the field the "is this entry
     // known?" test reads.
     FProcWidths: array of TProcWidth;
+    // Per entry PC: the integer range a RELOCATABLE procedure occupies, packed (hi shl 32) or lo;
+    // -1 = this procedure keeps the copying frame. Built by BuildProcFrameBases.
+    FProcFrameBase: array of Int64;
     // Filled only when FRAMEMARK=0, to reproduce the historic three-array lookup on ONE binary.
     FProcWidthInt: array of Int64;
     FProcWidthFloat: array of Int64;
@@ -408,7 +411,12 @@ type
     // what was pushed, reading the width back off the frame-width stack.
     procedure FramePush(Ctx: TExecutionContext; TargetPC: Integer = -1; CallPC: Integer = -1);
     procedure FramePop(Ctx: TExecutionContext);
+    // Size the integer bank to LogicalCount slots PLUS the relocatable frame region above them,
+    // then reset the view to offset 0. Every reallocation of IntRegsMem must go through here, or
+    // Ctx.IntRegs is left dangling into the freed block.
+    procedure SizeIntBank(Ctx: TExecutionContext; LogicalCount: Integer);
     procedure BuildProcFrameWidths;
+    procedure BuildProcFrameBases;
     procedure BuildCallSiteLiveness;
     procedure GrowCallStackIfNeeded(Ctx: TExecutionContext); inline;  // auto-grow return-addr stack (deep recursion)
     // M5.2 OS threading: spawn/join workers running their own TExecutionContext over the shared
@@ -949,7 +957,10 @@ begin
   Cmd.Instr := Instr;
   // Copy the producer's whole register banks so the owner can read any operand the handler
   // touches without per-opcode marshaling. (M5.2 may narrow this to the touched registers.)
-  Cmd.IntRegs := Copy(Ctx.IntRegs, 0, Ctx.IntRegCount);
+  // From the VIEW, not the allocation: a relocated frame's operands live at the view's offset.
+  SetLength(Cmd.IntRegs, Ctx.IntRegCount);
+  if Ctx.IntRegCount > 0 then
+    Move(Ctx.IntRegs^, Cmd.IntRegs[0], Ctx.IntRegCount * SizeOf(Int64));
   Cmd.FloatRegs := Copy(Ctx.FloatRegs, 0, Ctx.FloatRegCount);
   Cmd.StringRegs := Copy(Ctx.StringRegs, 0, Ctx.StringRegCount);
   FDrawQueue.Enqueue(Cmd);
@@ -970,7 +981,10 @@ begin
   begin
     // Replay each command against its register snapshot via the scratch context, which is
     // passed explicitly to the opcode handlers (M5.2 parameter-threading).
-    FDrainCtx.IntRegs := Items[i].IntRegs;
+    FDrainCtx.IntRegsMem := Items[i].IntRegs;
+    if Length(FDrainCtx.IntRegsMem) > 0 then FDrainCtx.IntRegs := @FDrainCtx.IntRegsMem[0]
+    else FDrainCtx.IntRegs := nil;
+    FDrainCtx.RegDeltaI := 0;                 // a replayed snapshot is already flat
     FDrainCtx.FloatRegs := Items[i].FloatRegs;
     FDrainCtx.StringRegs := Items[i].StringRegs;
     FDrainCtx.IntRegCount := Length(Items[i].IntRegs);
@@ -1030,6 +1044,27 @@ begin
     Result := '';
 end;
 
+{ The relocatable region that sits above the logical integer bank. A frame-base call slides the
+  view into it instead of copying the callee's registers out of the way; a call that would run past
+  the end falls back to the copying frame, so this is a performance bound, not a correctness one.
+  16384 slots = 128 KB, and a small recursive procedure uses a handful of slots per level, so it
+  covers recursion far deeper than the AOT's own 1500-level cap. }
+const
+  FRAME_REGION_SLOTS = 16384;
+
+procedure TBytecodeVM.SizeIntBank(Ctx: TExecutionContext; LogicalCount: Integer);
+var i, Total: Integer;
+begin
+  Ctx.IntRegCount := LogicalCount;
+  Total := LogicalCount + FRAME_REGION_SLOTS;
+  SetLength(Ctx.IntRegsMem, Total);
+  for i := 0 to Total - 1 do Ctx.IntRegsMem[i] := 0;
+  Ctx.RegDeltaI := 0;
+  Ctx.RegHwI := LogicalCount;      // the first slot no logical register can name
+  Ctx.RegFrameCap := Total;
+  Ctx.IntRegs := @Ctx.IntRegsMem[0];
+end;
+
 procedure TBytecodeVM.InitializeRegisters;
 var i: Integer;
 begin
@@ -1038,7 +1073,7 @@ begin
   FCtx.FloatRegCount := MIN_REGISTER_SLOTS;
   FCtx.StringRegCount := MIN_REGISTER_SLOTS;
 
-  SetLength(FCtx.IntRegs, FCtx.IntRegCount);
+  SizeIntBank(FCtx, FCtx.IntRegCount);
   SetLength(FCtx.FloatRegs, FCtx.FloatRegCount);
   SetLength(FCtx.StringRegs, FCtx.StringRegCount);
   SetLength(FCtx.TempIntRegs, FCtx.IntRegCount);
@@ -1704,6 +1739,16 @@ var
   // and measuring this change across two builds moved unrelated benchmarks by 4-12% in the same
   // direction, which is the alignment effect, not the change.
   GFrameMark: Integer = 1;
+  // FRAME RELOCATION, per-procedure opt-in. FRAMEBASE=1 turns it on; DEFAULT OFF, and it stays off
+  // until the analysis in BuildProcFrameBases is sound: with the gate on, the regression finds 2
+  // FAIL + 4 OPTDIFF (m389 pointer arrays, m435 byref member write-back, m448 error handler,
+  // aot_b1_deopt_diverror), so at least one of the four eligibility conditions admits a procedure
+  // it must not. Off, the machinery is inert - FramePush takes one extra integer test per call.
+  GFrameBase: Integer = 0;
+  // FRAMEBASE_DIAG=1 prints, per procedure, whether it is relocatable and if not WHICH condition
+  // refused it. The first version of this analysis found nothing at all and looked exactly like a
+  // working one from the outside.
+  GFrameBaseDiag: Integer = 0;
 
 function BcTouchesOnlyIntBank(Op: Word): Boolean;
 begin
@@ -1977,6 +2022,205 @@ begin
       FProcWidthStr[Entry[p]] := (Int64(WS[p]) shl 32) or Int64(LS[p]);
     end;
   end;
+  BuildProcFrameBases;
+end;
+
+{ Which procedures may have their integer frame RELOCATED instead of copied.
+
+  The banks are global and a procedure's registers keep the same indices at every depth, so a second
+  activation of the same procedure lands on the first one - which is the only reason a call has ever
+  had to snapshot anything. Sliding the bank view up by a delta for the callee's whole activation
+  removes the need entirely: its accesses land in fresh slots and nothing is copied or restored.
+
+  That is only sound if EVERY register the procedure touches is one the slide is allowed to move.
+  Four conditions, all conservative in the safe direction - a procedure that cannot be proven simply
+  keeps the copying frame, which is always correct:
+
+  1. INTEGER-ONLY. Every opcode in the range must satisfy BcTouchesOnlyIntBank, so the float and
+     string banks are provably untouched and only the integer view has to slide. (The float bank
+     could follow the same scheme; the string bank could not without a second view, because the AOT
+     reaches it through a ctx field rather than an argument.)
+  2. PRIVATE REGISTERS. Every index the procedure touches must be touched by NO other procedure and
+     not by module level. A register shared with anyone else is a global under another name, and
+     sliding the view would silently redirect reads of it. This is the condition that rules out
+     SHARED scalars, and it is computed over reads AND writes - unlike the frame WIDTH, which is a
+     write-set question (an unwritten register keeps the caller's value, so it needs no protection;
+     but it very much needs to stay at its absolute address).
+  3. NO UPWARD-EXPOSED READ. Every integer register the procedure reads must also be written by it
+     somewhere. A register read but never written carries a value from outside this activation -
+     the caller's, or a previous activation's - and a relocated frame starts on fresh slots, so
+     that value would not be there. This is what protects anything with call-to-call persistence.
+  4. NO GOSUB, NO INDIRECT CONTROL FLOW. Already computed as BaseUnsafe/Unknown by the width pass:
+     a GOSUB body sits outside the procedure's instruction range, so the scan never sees what it
+     touches, and an indirect call or error jump can land anywhere.
+
+  Note what is NOT required: that the callees be relocatable too. A relocated frame sits above every
+  logical register index, so a non-relocated callee running at its absolute indices cannot collide
+  with it. The two schemes nest freely. }
+procedure TBytecodeVM.BuildProcFrameBases;
+var
+  NInstr, NProc, NUnit, p, i, r, i2, PcStart, PcEnd, Lo, Hi: Integer;
+  Instr: TBytecodeInstruction;
+  Op: Word;
+  IsTarget: array of Boolean;       // PC is the entry of some call: only there can a frame start
+  UStart, UEnd: array of Integer;   // unit index -> instruction range
+  Owner: array of Integer;          // register index -> owning unit (-1 free, -2 shared)
+  WrittenBy: array of Integer;      // register index -> unit that writes it (-1 none)
+  MaxReg: Integer;
+  UD, U1, U2, Ok: Boolean;
+  Why: string;
+
+  procedure Claim(u, RegIdx: Integer);
+  begin
+    if (RegIdx < 0) or (RegIdx > MaxReg) then Exit;
+    if Owner[RegIdx] = -1 then Owner[RegIdx] := u
+    else if Owner[RegIdx] <> u then Owner[RegIdx] := -2;
+  end;
+  { Which of Dest/Src1/Src2 this opcode really touches in the INTEGER bank. Asking the raw operand
+    fields instead would be wrong in the one way that matters here: an absent operand lowers to
+    register 0, which is a perfectly valid index, so crediting it makes every procedure containing
+    a call "touch" R0 and share it with everyone - which is exactly how the first version of this
+    analysis found nothing at all. Unaudited shapes answer YES, which can only cost eligibility. }
+  procedure IntOperands(Op: Word; out UD, U1, U2: Boolean);
+  var us: Integer;
+  begin
+    UD := BcIntWriteShapeRaw(Op) <> IW_NONE;
+    us := BcIntUseShape(Op);
+    U1 := (us = US_UNKNOWN) or ((us and US_SRC1) <> 0);
+    U2 := (us = US_UNKNOWN) or ((us and US_SRC2) <> 0);
+  end;
+
+begin
+  SetLength(FProcFrameBase, 0);
+  if (FProgram = nil) or (GFrameBase <> 1) then Exit;
+  NInstr := FProgram.GetInstructionCount;
+  NProc := FProgram.GetProcMapCount;
+  if (NInstr = 0) or (NProc = 0) then Exit;
+
+  // Widest index any instruction names, so the ownership tables can be flat arrays.
+  MaxReg := 0;
+  SetLength(IsTarget, NInstr);
+  for i := 0 to NInstr - 1 do
+  begin
+    Instr := FProgram.GetInstruction(i);
+    if Instr.Dest > MaxReg then MaxReg := Instr.Dest;
+    if Instr.Src1 > MaxReg then MaxReg := Instr.Src1;
+    if Instr.Src2 > MaxReg then MaxReg := Instr.Src2;
+    IsTarget[i] := False;
+  end;
+  // An activation can only begin where something calls, so those PCs - not the procedure map - are
+  // what partitions the program here. The map is FINER than the call graph: LICM registers a
+  // procedure's preheader as its own entry ("FIB_prehead"), and treating that as a separate
+  // procedure makes every hoisted constant look SHARED between it and the body, which refused
+  // every candidate there was. bcLoadProcAddr counts too: its target can be reached indirectly.
+  for i := 0 to NInstr - 1 do
+  begin
+    Instr := FProgram.GetInstruction(i);
+    if (Instr.OpCode = Ord(bcCallSub)) or (Instr.OpCode = Ord(bcLoadProcAddr)) then
+      if (Instr.Immediate >= 0) and (Instr.Immediate < NInstr) then IsTarget[Instr.Immediate] := True;
+  end;
+
+  // Units: a map entry that nothing calls is absorbed into the one before it. Unit NUnit is module
+  // level (everything below the first entry), so a register shared between a SUB and the module
+  // body reads as shared rather than as the SUB's private property.
+  SetLength(UStart, NProc + 1); SetLength(UEnd, NProc + 1);
+  NUnit := 0;
+  for p := 0 to NProc - 1 do
+  begin
+    PcStart := FProgram.GetProcMapStart(p);
+    if PcStart < 0 then System.Continue;
+    if p + 1 < NProc then PcEnd := FProgram.GetProcMapStart(p + 1) - 1 else PcEnd := NInstr - 1;
+    if PcEnd >= NInstr then PcEnd := NInstr - 1;
+    if (NUnit > 0) and (not IsTarget[PcStart]) then
+      UEnd[NUnit - 1] := PcEnd                       // absorb: a preheader, or any uncalled tail
+    else
+    begin
+      UStart[NUnit] := PcStart; UEnd[NUnit] := PcEnd; Inc(NUnit);
+    end;
+  end;
+  if NUnit = 0 then Exit;
+  UStart[NUnit] := 0; UEnd[NUnit] := UStart[0] - 1;  // module level
+  if GFrameBaseDiag = 1 then
+    for p := 0 to NProc - 1 do
+      WriteLn(ErrOutput, Format('[FRAMEBASE] map %d: pc %d "%s" isTarget=%s',
+                                [p, FProgram.GetProcMapStart(p), FProgram.GetProcMapName(p),
+                                 BoolToStr(IsTarget[FProgram.GetProcMapStart(p)], True)]));
+
+  // Pass 1: ownership, walked by RANGE rather than by asking "which unit owns this PC?" per
+  // instruction - that question answered with a scan is how LICM and Strength Reduction came to be
+  // 92% of compile time.
+  SetLength(Owner, MaxReg + 1); SetLength(WrittenBy, MaxReg + 1);
+  for i := 0 to MaxReg do begin Owner[i] := -1; WrittenBy[i] := -1; end;
+  for p := 0 to NUnit do
+    for i := UStart[p] to UEnd[p] do
+    begin
+      Instr := FProgram.GetInstruction(i);
+      IntOperands(Instr.OpCode, UD, U1, U2);
+      if UD then Claim(p, Instr.Dest);
+      if U1 then Claim(p, Instr.Src1);
+      if U2 then Claim(p, Instr.Src2);
+      if BcIntWriteShapeRaw(Instr.OpCode) = IW_DEST then
+        if (Instr.Dest >= 0) and (Instr.Dest <= MaxReg) then WrittenBy[Instr.Dest] := p;
+    end;
+
+  // Pass 2: eligibility, per unit (module level is never a callee, so it is skipped).
+  SetLength(FProcFrameBase, NInstr);
+  for i := 0 to NInstr - 1 do FProcFrameBase[i] := -1;
+  for p := 0 to NUnit - 1 do
+  begin
+    PcStart := UStart[p]; PcEnd := UEnd[p];
+    if (PcStart < 0) or (PcStart >= NInstr) then System.Continue;
+    if (PcStart >= Length(FProcWidths)) or (FProcWidths[PcStart].WInt < 0) then System.Continue;
+    Lo := MaxInt; Hi := 0;
+    Ok := True; Why := '';
+    for i := PcStart to PcEnd do
+    begin
+      Instr := FProgram.GetInstruction(i);
+      Op := Instr.OpCode;
+      // (1) integer-only, and (4) no GOSUB / indirect control flow.
+      if (not BcTouchesOnlyIntBank(Op)) or (Op = Ord(bcCall)) or (Op = Ord(bcReturn)) or
+         (Op = Ord(bcCallSubIndirect)) or (Op = Ord(bcThreadCreate)) then
+      begin Ok := False; Why := Format('not int-only/indirect: op $%x at pc %d', [Op, i]); Break; end;
+      if BcIntUseShape(Op) = US_UNKNOWN then
+      begin Ok := False; Why := Format('unaudited read shape: op $%x at pc %d', [Op, i]); Break; end;
+      IntOperands(Op, UD, U1, U2);
+      // (3) a register read but never written here carries a value from outside this activation.
+      if U1 and (Instr.Src1 >= 0) and (Instr.Src1 <= MaxReg) and (WrittenBy[Instr.Src1] <> p) then
+      begin Ok := False;
+        Why := Format('reads R%d never written here (op $%x pc %d)', [Instr.Src1, Op, i]); Break; end;
+      if U2 and (Instr.Src2 >= 0) and (Instr.Src2 <= MaxReg) and (WrittenBy[Instr.Src2] <> p) then
+      begin Ok := False;
+        Why := Format('reads R%d never written here (op $%x pc %d)', [Instr.Src2, Op, i]); Break; end;
+      // (2) privacy, over reads AND writes, and only over operands the opcode really has.
+      for r := 0 to 2 do
+      begin
+        case r of
+          0: begin if not UD then System.Continue; i2 := Instr.Dest; end;
+          1: begin if not U1 then System.Continue; i2 := Instr.Src1; end;
+        else  begin if not U2 then System.Continue; i2 := Instr.Src2; end;
+        end;
+        if (i2 < 0) or (i2 > MaxReg) then System.Continue;
+        if Owner[i2] <> p then
+        begin Ok := False;
+          Why := Format('R%d not private (owner=%d, op $%x pc %d)', [i2, Owner[i2], Op, i]); Break; end;
+        if i2 < Lo then Lo := i2;
+        if i2 + 1 > Hi then Hi := i2 + 1;
+      end;
+      if not Ok then Break;
+    end;
+    if GFrameBaseDiag = 1 then
+      if Ok then
+        WriteLn(ErrOutput, Format('[FRAMEBASE] unit %d @pc %d..%d (%s): RELOCATABLE, int range [%d,%d)',
+                                  [p, PcStart, PcEnd, FProgram.GetProcMapName(p), Lo, Hi]))
+      else
+        WriteLn(ErrOutput, Format('[FRAMEBASE] unit %d @pc %d..%d: no - %s', [p, PcStart, PcEnd, Why]));
+    if not Ok then System.Continue;
+    if Lo = MaxInt then begin Lo := 0; Hi := 0; end;
+    // Published per entry PC, packed like the widths: one past the highest index used in the high
+    // half, the lowest in the low half. A relocated frame starts at the high-water mark and is
+    // Hi-Lo slots wide, so the view delta is HighWater - Lo.
+    FProcFrameBase[PcStart] := (Int64(Hi) shl 32) or Int64(Lo);
+  end;
 end;
 
 procedure TBytecodeVM.BuildCallSiteLiveness;
@@ -2138,10 +2382,40 @@ procedure TBytecodeVM.FramePush(Ctx: TExecutionContext; TargetPC: Integer; CallP
 // so bcReturnSub pops exactly what was pushed.
 var
   i, NI, NF, NS, BI, BF, BS: Integer;
+  FBLo, FBHi: Integer;
   PW: Int64;
   PWidth: ^TProcWidth;
 begin
   BI := 0; BF := 0; BS := 0;
+  // FRAME RELOCATION. When the callee is one of the procedures BuildProcFrameBases proved
+  // relocatable, its whole activation runs on fresh slots above every live frame: slide the view
+  // and copy NOTHING. The delta is HighWater - Lo, so the frame lands exactly at the high-water
+  // mark whatever its lowest register index happens to be. Falls through to the copying path if
+  // the region is full, which is a slowdown and never a wrong answer.
+  if (GFrameBase = 1) and (TargetPC >= 0) and (TargetPC < Length(FProcFrameBase)) and
+     (FProcFrameBase[TargetPC] >= 0) then
+  begin
+    PW := FProcFrameBase[TargetPC];
+    FBHi := PW shr 32; FBLo := PW and $FFFFFFFF;  // separate locals: falling through must not
+    if Ctx.RegHwI + (FBHi - FBLo) <= Ctx.RegFrameCap then   // disturb the copying path's BI/NI
+    begin
+      if Ctx.FrameMarkTop >= Length(Ctx.FrameMarks) then
+        SetLength(Ctx.FrameMarks, Ctx.FrameMarkTop + 256);
+      with Ctx.FrameMarks[Ctx.FrameMarkTop] do
+      begin
+        SaveDeltaI := Ctx.RegDeltaI;              // >= 0 marks this frame as RELOCATED
+        SaveHwI := Ctx.RegHwI;
+        WInt := 0; WFloat := 0; WStr := 0;        // nothing was copied, so nothing is restored
+        RecBase := Ctx.RecordCount;
+        BlockMark := Ctx.BlockRecMarkTop;
+      end;
+      Inc(Ctx.FrameMarkTop);
+      Ctx.RegDeltaI := Ctx.RegHwI - FBLo;
+      Inc(Ctx.RegHwI, FBHi - FBLo);
+      Ctx.IntRegs := @Ctx.IntRegsMem[Ctx.RegDeltaI];
+      Exit;
+    end;
+  end;
   // A NEGATIVE width means "not measured for this context" (any path that runs bytecode without
   // going through LoadProgram): fall back to the whole bank, the historical behaviour. Zero is a
   // real width -- a bank the program never touches -- and must save nothing.
@@ -2245,6 +2519,7 @@ begin
       WStr := (Int64(NS) shl 32) or Int64(BS);
       RecBase := Ctx.RecordCount;
       BlockMark := Ctx.BlockRecMarkTop;
+      SaveDeltaI := -1;                 // this frame COPIED: pop must not slide the view back
     end;
     Inc(Ctx.FrameMarkTop);
   end
@@ -2288,6 +2563,16 @@ begin
   begin
     Dec(Ctx.FrameMarkTop);
     Mark := @Ctx.FrameMarks[Ctx.FrameMarkTop];
+    // A RELOCATED frame restored nothing and copied nothing: slide the view back to the caller's
+    // offset, hand its slots back to the high-water mark, and skip the bank restore entirely (its
+    // widths were written as zero, so the code below is a no-op either way - but the record
+    // reclamation still has to run).
+    if Mark^.SaveDeltaI >= 0 then
+    begin
+      Ctx.RegDeltaI := Mark^.SaveDeltaI;
+      Ctx.RegHwI := Mark^.SaveHwI;
+      Ctx.IntRegs := @Ctx.IntRegsMem[Ctx.RegDeltaI];
+    end;
     PW := Mark^.WInt;   NI := PW shr 32; BI := PW and $FFFFFFFF;
     PW := Mark^.WFloat; NF := PW shr 32; BF := PW and $FFFFFFFF;
     PW := Mark^.WStr;   NS := PW shr 32; BS := PW and $FFFFFFFF;
@@ -3201,7 +3486,7 @@ begin
   WCtx.FrameMarkTop := 0;    // the worker's own frame-mark stack starts empty
   WCtx.FrameWidthTop := 0;   // FRAMEMARK=0 layout
   WCtx.FrameRecBaseTop := 0;
-  SetLength(WCtx.IntRegs, WCtx.IntRegCount);
+  SizeIntBank(WCtx, WCtx.IntRegCount);
   SetLength(WCtx.FloatRegs, WCtx.FloatRegCount);
   SetLength(WCtx.StringRegs, WCtx.StringRegCount);
   SetLength(WCtx.TempIntRegs, WCtx.IntRegCount);
@@ -3589,7 +3874,7 @@ end;
 
 procedure TBytecodeVM.EnsureRegisterCapacity(Ctx: TExecutionContext; RegType: TSSARegisterType; MinIndex: Integer);
 var
-  OldSize, NewSize, i: Integer;
+  OldSize, NewSize, i, Shift: Integer;
 begin
   case RegType of
     srtInt:
@@ -3606,16 +3891,25 @@ begin
           raise Exception.CreateFmt('Register index %d exceeds maximum %d for integer registers',
                                     [MinIndex, MAX_REGISTER_SLOTS - 1]);
 
-        // Grow both working and temp register arrays
-        SetLength(Ctx.IntRegs, NewSize);
+        // Grow both working and temp register arrays. The integer bank carries the relocatable
+        // frame region above the logical slots, so growing the logical part has to SLIDE that
+        // region up by the same amount - any frame currently relocated into it is live, and its
+        // view offset moves with it. Doing this wrong would corrupt an in-flight recursion rather
+        // than fail visibly, so the region is moved before the new logical slots are cleared.
+        Shift := NewSize - OldSize;
+        SetLength(Ctx.IntRegsMem, NewSize + FRAME_REGION_SLOTS);
         SetLength(Ctx.TempIntRegs, NewSize);
-
-        // Initialize new slots to zero
+        if Ctx.RegHwI > OldSize then                      // frames are live in the region
+          Move(Ctx.IntRegsMem[OldSize], Ctx.IntRegsMem[NewSize], (Ctx.RegHwI - OldSize) * SizeOf(Int64));
         for i := OldSize to NewSize - 1 do
         begin
-          Ctx.IntRegs[i] := 0;
+          Ctx.IntRegsMem[i] := 0;
           Ctx.TempIntRegs[i] := 0;
         end;
+        if Ctx.RegDeltaI > 0 then Inc(Ctx.RegDeltaI, Shift);
+        if Ctx.RegHwI > OldSize then Inc(Ctx.RegHwI, Shift) else Ctx.RegHwI := NewSize;
+        Ctx.RegFrameCap := NewSize + FRAME_REGION_SLOTS;
+        Ctx.IntRegs := @Ctx.IntRegsMem[Ctx.RegDeltaI];    // the view must follow the reallocation
 
         Ctx.IntRegCount := NewSize;
       end;
@@ -6607,7 +6901,10 @@ begin
     end;
   end;
   Inc(C.AotCallDepth);
-  RetPC := TNativeFuncFn(Fn.Ptr)(@C.IntRegs[0], PInt64(@C.FloatRegs[0]), AotCtx);
+  // C.IntRegs is the context's VIEW: if FramePush relocated this frame it already points at the
+  // callee's fresh slots, so the compiled code (which takes the bank base as its first argument
+  // and addresses everything off it) needs no change at all to run relocated.
+  RetPC := TNativeFuncFn(Fn.Ptr)(C.IntRegs, PInt64(@C.FloatRegs[0]), AotCtx);
   Dec(C.AotCallDepth);
   if Prof then T2 := AotRdTsc;
   // A DIM/REDIM/ERASE inside the callee may have rebuilt/moved the descriptor table the
@@ -11570,6 +11867,8 @@ initialization
   if GetEnvironmentVariable('FRAMERANGE') = '0' then GFrameRangeNarrow := 0;
   if GetEnvironmentVariable('FRAMELIVE') = '0' then GFrameLiveNarrow := 0;
   if GetEnvironmentVariable('FRAMEMARK') = '0' then GFrameMark := 0;
+  if GetEnvironmentVariable('FRAMEBASE') = '1' then GFrameBase := 1;   // default OFF: see above
+  if GetEnvironmentVariable('FRAMEBASE_DIAG') = '1' then GFrameBaseDiag := 1;
 
 finalization
   AotCallProfReport;

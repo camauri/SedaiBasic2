@@ -39,6 +39,7 @@ var
   // Local copies of frequently accessed fields for better register allocation
   IntRegs: PInt64;
   FloatRegs: PDouble;
+  NextPC: Integer;          // indirect call target, read before FramePush can slide the view
   ArrayIdx, LinearIdx, ArrLowerBound: Integer;
   InputStr, PrintStr: string;
   InputVal: Double;
@@ -110,8 +111,10 @@ begin
   if GActiveCtx = nil then
     FRenderOwnerThreadId := GetCurrentThreadID;
 
-  // Get direct pointers to register arrays
-  IntRegs := @Ctx.IntRegs[0];
+  // Get direct pointers to register arrays. The integer one is the context's rebasable VIEW, not
+  // the allocation: a frame-base call slides it, so every FramePush/FramePop below has to re-read
+  // it (and so does anything that can grow the bank).
+  IntRegs := Ctx.IntRegs;
   FloatRegs := @Ctx.FloatRegs[0];
   // AOT: bind the compiled-function table and this context's transfer-bank bases (built per
   // Run and passed per call, NEVER baked into code: a worker must see its own banks).
@@ -763,6 +766,7 @@ begin
         bcCallSub:
           begin
             FramePush(Ctx, Instr.Immediate, CurPC);   // narrowed by callee footprint AND caller liveness
+            IntRegs := Ctx.IntRegs;                   // may have slid to a relocated frame
             GrowCallStackIfNeeded(Ctx);
             Ctx.CallStack[Ctx.CallStackPtr] := CurPC + 1;
             Inc(Ctx.CallStackPtr);
@@ -781,14 +785,16 @@ begin
           else
           begin
             // Indirect call: the entry PC is in the register, not the Immediate.
-            FramePush(Ctx, IntRegs[Instr.Src1], CurPC);
+            NextPC := IntRegs[Instr.Src1];            // read BEFORE the view can slide
+            FramePush(Ctx, NextPC, CurPC);
+            IntRegs := Ctx.IntRegs;
             GrowCallStackIfNeeded(Ctx);
             Ctx.CallStack[Ctx.CallStackPtr] := CurPC + 1;
             Inc(Ctx.CallStackPtr);
             {$IFDEF DEBUG_MODE}
             if Assigned(FDebugger) then FDebugger.NotifyCall;
             {$ENDIF}
-            CurPC := IntRegs[Instr.Src1];
+            CurPC := NextPC;
           end;
         bcReturnSub:
           begin
@@ -798,6 +804,7 @@ begin
             {$ENDIF}
             CurPC := Ctx.CallStack[Ctx.CallStackPtr];
             FramePop(Ctx);
+            IntRegs := Ctx.IntRegs;                   // may have slid back to the caller's frame
           end;
         // OS threading (M5.2, FreeBASIC API).
         bcLoadProcAddr:
