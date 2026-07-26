@@ -146,6 +146,7 @@ type
 
     { Check if edge (From -> Target) is a back-edge }
     function IsBackEdge(From, Target: TSSABasicBlock): Boolean;
+    function IsCallEdge(From, Target: TSSABasicBlock): Boolean;   // recursion, not a loop
 
     { Compute all blocks in a natural loop }
     procedure ComputeLoopBlocks(Loop: TLoopInfoSR; BackEdgeSource: TSSABasicBlock);
@@ -809,6 +810,26 @@ begin
   {$ENDIF}
 end;
 
+function TStrengthReduction.IsCallEdge(From, Target: TSSABasicBlock): Boolean;
+// True when From reaches Target by CALLING it. Such an edge is recursion, not a loop: the "body"
+// it closes is a whole activation of the procedure, and treating it as a loop lets a loop pass
+// reason about values that belong to DIFFERENT activations as if they were successive iterations
+// of one. (LICM did exactly that and hoisted a per-activation value into a preheader the recursive
+// calls then entered below - see the frame-relocation work.)
+var
+  i: Integer;
+  Instr: TSSAInstruction;
+begin
+  Result := False;
+  if (From = nil) or (Target = nil) then Exit;
+  for i := 0 to From.Instructions.Count - 1 do
+  begin
+    Instr := TSSAInstruction(From.Instructions[i]);
+    if (Instr.OpCode = ssaCallSub) or (Instr.OpCode = ssaCall) then
+      if Instr.Dest.LabelName = Target.LabelName then Exit(True);
+  end;
+end;
+
 function TStrengthReduction.IsBackEdge(From, Target: TSSABasicBlock): Boolean;
 var
   Dom, NextDom: TSSABasicBlock;
@@ -891,7 +912,7 @@ begin
     begin
       Succ := TSSABasicBlock(Block.Successors[j]);
 
-      if IsBackEdge(Block, Succ) then
+      if IsBackEdge(Block, Succ) and (not IsCallEdge(Block, Succ)) then
       begin
         // Check if we already have a loop with this header
         Found := False;
