@@ -166,6 +166,7 @@ type
     { Check if edge (From -> Target) is a back-edge }
     procedure EnsureDefIndex;
     function DefOf(const Val: TSSAValue): PSRDefInfo;
+    procedure AbsorbDefChange(const OldInstr, NewInstr: TSSAInstruction);
     function IsBackEdge(From, Target: TSSABasicBlock): Boolean;
     function IsCallEdge(From, Target: TSSABasicBlock): Boolean;   // recursion, not a loop
 
@@ -377,6 +378,41 @@ begin
   end;
   FDefIdxStamp := FReductions;
   Inc(GSRRebuilds);
+end;
+
+procedure TStrengthReduction.AbsorbDefChange(const OldInstr, NewInstr: TSSAInstruction);
+// Fold a single rewritten instruction INTO the def index instead of throwing the index away.
+// The index used to be invalidated on FReductions, and ReduceBlocks bumps that once per reduction,
+// so a 14k-line program rebuilt the whole table 1632 times - 8.7 of the pass's 10.1 seconds, doing
+// again the exact work the index existed to avoid. Almost none of those rebuilds could change an
+// answer: a reduction turns MulInt d,x,2 into AddInt d,x,x, and d was "computed" (so not a
+// constant) before and after.
+//
+// Exact rather than approximate: a register with more than one definition already answers "not a
+// constant" from Defs alone, so only the single-definition case carries information, and there the
+// new opcode and Src1 simply replace the old ones. Anything unexpected - the rewrite moving the
+// destination, or an index not built yet - falls back to a rebuild by leaving the stamp stale.
+var D: PSRDefInfo; t: Integer;
+begin
+  if FDefIdxStamp < 0 then Exit;                       // never built: nothing to absorb into
+  if (OldInstr.Dest.Kind <> svkRegister) or (NewInstr.Dest.Kind <> svkRegister) then Exit;
+  if (OldInstr.Dest.RegType <> NewInstr.Dest.RegType) or
+     (OldInstr.Dest.RegIndex <> NewInstr.Dest.RegIndex) then Exit;   // dest moved: rebuild
+  // NB: read the table DIRECTLY, not through DefOf - DefOf calls EnsureDefIndex, which would
+  // rebuild the very table this is here to preserve (the stamp is already stale at this point,
+  // the reduction having bumped FReductions before returning).
+  t := Ord(NewInstr.Dest.RegType);
+  if (t < 0) or (t > 2) then Exit;
+  if (NewInstr.Dest.RegIndex < 0) or (NewInstr.Dest.RegIndex >= Length(FDefIdx[t])) then Exit;
+  D := @FDefIdx[t][NewInstr.Dest.RegIndex];
+  if D^.Defs = 1 then
+  begin
+    D^.Op := NewInstr.OpCode;
+    D^.Src1 := NewInstr.Src1;
+    D^.Computed := not OpIn(NewInstr.OpCode, [ssaLoadConstInt, ssaLoadConstFloat,
+                                              ssaCopyInt, ssaCopyFloat, ssaIntToFloat]);
+  end;
+  FDefIdxStamp := FReductions;                         // the index now matches the program again
 end;
 
 function TStrengthReduction.DefOf(const Val: TSSAValue): PSRDefInfo;
@@ -715,7 +751,10 @@ begin
 
       // Apply if changed
       if NewInstr.OpCode <> Instr.OpCode then
+      begin
+        AbsorbDefChange(Instr, NewInstr);   // BEFORE the swap: Instr is freed by the assignment
         Block.Instructions[j] := NewInstr;
+      end;
     end;
   end;
 end;
