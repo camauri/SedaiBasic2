@@ -155,6 +155,24 @@ implementation
 
 uses SedaiDebug;
 
+var
+  // LICM_DIAG=1: where this pass's time actually goes. It is 20 of the 36 seconds it takes to
+  // compile a 14k-line program and the two suspects recorded in the docs both turned out to be
+  // false, so the next move had to be a measurement rather than another guess.
+  GLicmDiag: Integer = -1;
+  GLicmLoops: Integer = 0;
+  GLicmMapCalls: Integer = 0;
+  GLicmMapInstrs: Int64 = 0;      // instructions visited by BuildLoopMaps, summed over all calls
+  GLicmTFind, GLicmTSort, GLicmTMaps, GLicmTHoist: QWord;
+
+function LicmDiagOn: Boolean;
+begin
+  if GLicmDiag < 0 then
+    if GetEnvironmentVariable('LICM_DIAG') = '1' then GLicmDiag := 1 else GLicmDiag := 0;
+  Result := GLicmDiag = 1;
+end;
+
+
 { TLoopInfo }
 
 constructor TLoopInfo.Create(AHeader: TSSABasicBlock);
@@ -284,6 +302,7 @@ begin
   end;
   {$ENDIF}
 
+  if LicmDiagOn then GLicmLoops := FLoops.Count;
   // Step 4: Process each loop (now in innermost-first order)
   for i := 0 to FLoops.Count - 1 do
   begin
@@ -294,9 +313,11 @@ begin
     {$ENDIF}
 
     // Create pre-header with proper CFG wiring
-    CreatePreHeader(Loop);
-
-    // Hoist invariants
+    // NB: the pre-header is NOT created here. It used to be, for every loop, before anything knew
+    // whether there would be a single instruction to put in it - and on a 14k-line program that
+    // meant 1632 pre-header blocks and 1632 jumps added to carry ZERO hoisted instructions, which
+    // every pass after this one then had to walk and the bytecode had to hold. HoistInvariants now
+    // creates it only when it has something to hoist.
     HoistInvariants(Loop);
   end;
 
@@ -309,6 +330,9 @@ begin
   if DebugLICM then
     WriteLn('[LICM] Hoisted ', FHoistedCount, ' instructions');
   {$ENDIF}
+  if LicmDiagOn then
+    WriteLn(ErrOutput, Format('[LICM_DIAG] loops=%d  BuildLoopMaps calls=%d  instructions visited=%d  hoisted=%d  (program has %d blocks)',
+                              [GLicmLoops, GLicmMapCalls, GLicmMapInstrs, FHoistedCount, FProgram.Blocks.Count]));
   Result := FHoistedCount;
 end;
 
@@ -896,9 +920,11 @@ begin
   FLoopUsedOutside.Clear;
   FLoopModArrays.Clear;
   FLoopReshapesArrays := False;
+  if LicmDiagOn then Inc(GLicmMapCalls);
   for i := 0 to FProgram.Blocks.Count - 1 do
   begin
     Block := FProgram.Blocks[i];
+    if LicmDiagOn then Inc(GLicmMapInstrs, Block.Instructions.Count);
     InLoop := Loop.ContainsBlock(Block);
     for j := 0 to Block.Instructions.Count - 1 do
     begin
@@ -1143,15 +1169,6 @@ var
   Changed: Boolean;
   Iterations: Integer;
 begin
-  if not Assigned(Loop.PreHeader) then
-  begin
-    {$IFDEF DEBUG_LICM}
-    if DebugLICM then
-      WriteLn('[LICM] No pre-header for ', Loop.Header.LabelName, ' - skipping');
-    {$ENDIF}
-    Exit;
-  end;
-
   // One program scan builds every per-loop query map; collection below never moves
   // instructions, so the maps stay exact until the clone/extract phase at the end.
   BuildLoopMaps(Loop);
@@ -1211,6 +1228,14 @@ begin
       end;
     until not Changed;
     end;  // CLASSIC branch
+
+    // Nothing invariant: leave the CFG exactly as it was. Creating a pre-header here anyway is
+    // what made this pass add 1632 empty blocks to a program it hoisted nothing out of.
+    if ToHoist.Count = 0 then Exit;
+
+    // Only now is the pre-header worth its cost.
+    if not Assigned(Loop.PreHeader) then CreatePreHeader(Loop);
+    if not Assigned(Loop.PreHeader) then Exit;    // CreatePreHeader declines (no entry predecessor)
 
     // Clone and insert into pre-header (before the jump)
     InsertPos := Loop.PreHeader.Instructions.Count - 1;  // Before final jump
