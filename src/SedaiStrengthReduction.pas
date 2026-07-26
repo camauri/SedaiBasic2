@@ -81,6 +81,17 @@ uses
   Classes, SysUtils, Contnrs, SedaiSSATypes, SedaiDominators;
 
 type
+  { What defines a register, for the constant resolvers. A register is usable as a constant only
+    when it has EXACTLY ONE definition (see RegisterReassignedNonConst), so "the first definition
+    found by scanning" and "the only definition" are the same thing - which is why one entry per
+    register is enough to reproduce the old scans exactly. }
+  TSRDefInfo = record
+    Defs: Integer;              // how many instructions write this register
+    Computed: Boolean;          // at least one of them is not a const load / copy / int->float
+    Op: TSSAOpCode;             // the single definition's opcode (valid only when Defs = 1)
+    Src1: TSSAValue;            // and its Src1
+  end;
+  PSRDefInfo = ^TSRDefInfo;
   { TInductionVariable - Basic induction variable info }
   TInductionVariable = record
     VarRegIndex: Integer;     // Register index of the IV
@@ -108,6 +119,14 @@ type
   private
     FProgram: TSSAProgram;
     FReductions: Integer;
+    // Def index: one entry per (register bank, index), rebuilt whenever this pass mutates the
+    // program. It replaces three full program scans per QUERY - RegisterReassignedNonConst, then
+    // GetConstInt's two passes - with one scan per rebuild. Those scans were 18 of the 43 seconds
+    // it took to compile a 14k-line program, for a pass whose net effect on it is zero
+    // instructions: the cost was never the work, it was asking a per-value question with a
+    // program-wide search.
+    FDefIdx: array[0..2] of array of TSRDefInfo;
+    FDefIdxStamp: Integer;        // FReductions when the index was built (-1 = never)
     FLoops: TObjectList;  // Owns TLoopInfoSR objects
     FDominatorMap: TFPHashList;
     FInductionVars: array of TInductionVariable;
@@ -145,6 +164,8 @@ type
     procedure FindLoops;
 
     { Check if edge (From -> Target) is a back-edge }
+    procedure EnsureDefIndex;
+    function DefOf(const Val: TSSAValue): PSRDefInfo;
     function IsBackEdge(From, Target: TSSABasicBlock): Boolean;
     function IsCallEdge(From, Target: TSSABasicBlock): Boolean;   // recursion, not a loop
 
@@ -227,6 +248,7 @@ begin
   inherited Create;
   FProgram := Prog;
   FReductions := 0;
+  FDefIdxStamp := -1;                  // never built; FReductions starts at 0, so this forces a build
   FLoops := TObjectList.Create(True);  // Owns TLoopInfoSR objects
   FDominatorMap := TFPHashList.Create;
   SetLength(FInductionVars, 0);
@@ -277,271 +299,172 @@ begin
   Result := FReductions;
 end;
 
+procedure TStrengthReduction.EnsureDefIndex;
+// Rebuild the def index if this pass has changed the program since it was built. Strength reduction
+// rewrites instructions as it goes, so a cached answer from before a rewrite would be stale; keying
+// the cache on FReductions makes that impossible to forget.
+var
+  MaxIdx: array[0..2] of Integer;
+  bi, ii, tt: Integer;
+  Block: TSSABasicBlock;
+  Instr: TSSAInstruction;
+begin
+  if FDefIdxStamp = FReductions then Exit;
+  for tt := 0 to 2 do MaxIdx[tt] := -1;
+  for bi := 0 to FProgram.Blocks.Count - 1 do
+  begin
+    Block := FProgram.Blocks[bi];
+    for ii := 0 to Block.Instructions.Count - 1 do
+    begin
+      Instr := Block.Instructions[ii];
+      if Instr.Dest.Kind = svkRegister then
+      begin
+        tt := Ord(Instr.Dest.RegType);
+        if (tt >= 0) and (tt <= 2) and (Instr.Dest.RegIndex > MaxIdx[tt]) then
+          MaxIdx[tt] := Instr.Dest.RegIndex;
+      end;
+    end;
+  end;
+  for tt := 0 to 2 do
+  begin
+    SetLength(FDefIdx[tt], MaxIdx[tt] + 1);
+    for ii := 0 to MaxIdx[tt] do
+    begin
+      FDefIdx[tt][ii].Defs := 0;
+      FDefIdx[tt][ii].Computed := False;
+    end;
+  end;
+  for bi := 0 to FProgram.Blocks.Count - 1 do
+  begin
+    Block := FProgram.Blocks[bi];
+    for ii := 0 to Block.Instructions.Count - 1 do
+    begin
+      Instr := Block.Instructions[ii];
+      if Instr.Dest.Kind <> svkRegister then System.Continue;
+      tt := Ord(Instr.Dest.RegType);
+      if (tt < 0) or (tt > 2) then System.Continue;
+      if (Instr.Dest.RegIndex < 0) or (Instr.Dest.RegIndex > MaxIdx[tt]) then System.Continue;
+      with FDefIdx[tt][Instr.Dest.RegIndex] do
+      begin
+        Inc(Defs);
+        if not OpIn(Instr.OpCode, [ssaLoadConstInt, ssaLoadConstFloat,
+                                   ssaCopyInt, ssaCopyFloat, ssaIntToFloat]) then
+          Computed := True;
+        if Defs = 1 then begin Op := Instr.OpCode; Src1 := Instr.Src1; end;
+      end;
+    end;
+  end;
+  FDefIdxStamp := FReductions;
+end;
+
+function TStrengthReduction.DefOf(const Val: TSSAValue): PSRDefInfo;
+var t: Integer;
+begin
+  Result := nil;
+  if Val.Kind <> svkRegister then Exit;
+  EnsureDefIndex;
+  t := Ord(Val.RegType);
+  if (t < 0) or (t > 2) then Exit;
+  if (Val.RegIndex < 0) or (Val.RegIndex >= Length(FDefIdx[t])) then Exit;
+  Result := @FDefIdx[t][Val.RegIndex];
+end;
+
 function TStrengthReduction.RegisterReassignedNonConst(const Val: TSSAValue): Boolean;
 // A register may be treated as a compile-time constant by GetConstInt/GetConstFloat ONLY if it is
 // written exactly once, by a constant load (or a copy/int->float that those resolvers chase). A
-// register that is also written by an arithmetic instruction — typically a loop accumulator like
-// `C = 0 : ... : C = C + K` — is NOT constant; reporting its initial 0 as a constant made strength
+// register that is also written by an arithmetic instruction - typically a loop accumulator like
+// `C = 0 : ... : C = C + K` - is NOT constant; reporting its initial 0 as a constant made strength
 // reduction turn `B * C` into `IV * 0` (a zero-stride accumulator), miscompiling the result. This
 // returns True for such registers so the const resolvers reject them.
-var
-  i, j, defs: Integer;
-  Block: TSSABasicBlock;
-  Instr: TSSAInstruction;
+// Answered from the def index rather than by scanning the program per query - same answer, see
+// EnsureDefIndex for why that mattered.
+var D: PSRDefInfo;
 begin
   Result := False;
   if Val.Kind <> svkRegister then Exit;
-  defs := 0;
-  for i := 0 to FProgram.Blocks.Count - 1 do
-  begin
-    Block := FProgram.Blocks[i];
-    for j := 0 to Block.Instructions.Count - 1 do
-    begin
-      Instr := Block.Instructions[j];
-      if (Instr.Dest.Kind = svkRegister) and
-         (Instr.Dest.RegType = Val.RegType) and (Instr.Dest.RegIndex = Val.RegIndex) then
-      begin
-        Inc(defs);
-        if not OpIn(Instr.OpCode, [ssaLoadConstInt, ssaLoadConstFloat,
-                                 ssaCopyInt, ssaCopyFloat, ssaIntToFloat]) then
-          Exit(True);   // computed (e.g. Add/Mul) -> not a constant
-      end;
-    end;
-  end;
-  Result := (defs <> 1);   // 0 defs (unknown) or >1 def (reassigned / merged) -> not a safe constant
+  D := DefOf(Val);
+  if D = nil then Exit(True);          // never written here: not a safe constant
+  Result := D^.Computed or (D^.Defs <> 1);
 end;
 
 function TStrengthReduction.GetConstInt(const Val: TSSAValue; out ConstVal: Int64): Boolean;
+// Chases a register back to a compile-time integer. The old form scanned every block twice (once
+// for a LoadConstInt, once for a Copy) on top of RegisterReassignedNonConst's own scan; since a
+// register that gets past that guard has exactly ONE definition, both scans could only ever find
+// that definition, so the index gives the identical answer.
 var
-  Block: TSSABasicBlock;
-  Instr: TSSAInstruction;
-  i, j: Integer;
-  SourceReg: TSSAValue;
+  D: PSRDefInfo;
+  Depth: Integer;
+  V: TSSAValue;
 begin
   Result := False;
-
-  // Check if it's an inline constant
   if Val.Kind = svkConstInt then
   begin
     ConstVal := Val.ConstInt;
-    Result := True;
-    Exit;
+    Exit(True);
   end;
-
-  // Check if it's a register loaded with a constant
-  if Val.Kind = svkRegister then
+  if Val.Kind <> svkRegister then Exit;
+  V := Val;
+  // Bounded: a Copy chain can in principle close a cycle, which the recursive form would have
+  // followed forever.
+  for Depth := 0 to 31 do
   begin
-    if RegisterReassignedNonConst(Val) then Exit;   // accumulator / computed reg -> not constant
-    {$IFDEF DEBUG_STRENGTH}
-    if DebugStrength then
-      WriteLn('[StrengthRed] GetConstInt: Looking for INT[', Val.RegIndex, '] (RegType=', Ord(Val.RegType), ')');
-    {$ENDIF}
-
-    // Pass 1: Look for direct LoadConstInt
-    for i := 0 to FProgram.Blocks.Count - 1 do
+    if RegisterReassignedNonConst(V) then Exit(False);
+    D := DefOf(V);
+    if D = nil then Exit(False);
+    if (D^.Op = ssaLoadConstInt) and (D^.Src1.Kind = svkConstInt) then
     begin
-      Block := FProgram.Blocks[i];
-      for j := 0 to Block.Instructions.Count - 1 do
-      begin
-        Instr := Block.Instructions[j];
-
-        // Check if this instruction loads an int constant into our register
-        if (Instr.OpCode = ssaLoadConstInt) and
-           (Instr.Dest.Kind = svkRegister) and
-           (Instr.Dest.RegType = Val.RegType) and
-           (Instr.Dest.RegIndex = Val.RegIndex) and
-           (Instr.Src1.Kind = svkConstInt) then
-        begin
-          ConstVal := Instr.Src1.ConstInt;
-          {$IFDEF DEBUG_STRENGTH}
-          if DebugStrength then
-            WriteLn('[StrengthRed] GetConstInt: Found! Value=', ConstVal);
-          {$ENDIF}
-          Result := True;
-          Exit;
-        end;
-      end;
+      ConstVal := D^.Src1.ConstInt;
+      Exit(True);
     end;
-
-    // Pass 2: Look for Copy from a constant register (one level of indirection)
-    for i := 0 to FProgram.Blocks.Count - 1 do
+    if (D^.Op = ssaCopyInt) and (D^.Src1.Kind = svkRegister) then
     begin
-      Block := FProgram.Blocks[i];
-      for j := 0 to Block.Instructions.Count - 1 do
-      begin
-        Instr := Block.Instructions[j];
-
-        // Check for Copy that writes to our register
-        if (Instr.OpCode = ssaCopyInt) and
-           (Instr.Dest.Kind = svkRegister) and
-           (Instr.Dest.RegType = Val.RegType) and
-           (Instr.Dest.RegIndex = Val.RegIndex) and
-           (Instr.Src1.Kind = svkRegister) then
-        begin
-          // Recursively check if source is a constant
-          SourceReg := Instr.Src1;
-          if GetConstInt(SourceReg, ConstVal) then
-          begin
-            {$IFDEF DEBUG_STRENGTH}
-            if DebugStrength then
-              WriteLn('[StrengthRed] GetConstInt: Found via Copy! Value=', ConstVal);
-            {$ENDIF}
-            Result := True;
-            Exit;
-          end;
-        end;
-      end;
+      V := D^.Src1;                     // one level of indirection, as the old pass 2 did
+      System.Continue;
     end;
-
-    {$IFDEF DEBUG_STRENGTH}
-    if DebugStrength then
-    begin
-      WriteLn('[StrengthRed] GetConstInt: NOT FOUND');
-      // Dump all LoadConstInt instructions
-      WriteLn('[StrengthRed]   All LoadConstInt instructions:');
-      for i := 0 to FProgram.Blocks.Count - 1 do
-      begin
-        Block := FProgram.Blocks[i];
-        for j := 0 to Block.Instructions.Count - 1 do
-        begin
-          Instr := Block.Instructions[j];
-          if Instr.OpCode = ssaLoadConstInt then
-            WriteLn('[StrengthRed]     ', Instr.ToString);
-        end;
-      end;
-    end;
-    {$ENDIF}
+    Exit(False);
   end;
 end;
 
 function TStrengthReduction.GetConstFloat(const Val: TSSAValue; out ConstVal: Double): Boolean;
+// Float twin of GetConstInt. The old form scanned every block looking for a LoadConstFloat, a
+// LoadConstInt or an IntToFloat writing this register, first match winning; with exactly one
+// definition to find, the index answers the same question directly.
 var
-  Block: TSSABasicBlock;
-  Instr: TSSAInstruction;
-  i, j: Integer;
+  D: PSRDefInfo;
   TempInt: Int64;
 begin
   Result := False;
-
-  // Check if it's an inline constant
   if Val.Kind = svkConstFloat then
   begin
     ConstVal := Val.ConstFloat;
-    Result := True;
-    {$IFDEF DEBUG_STRENGTH}
-    if DebugStrength then
-      WriteLn('[StrengthRed] GetConstFloat: Found inline float constant: ', ConstVal:0:2);
-    {$ENDIF}
-    Exit;
+    Exit(True);
   end;
-
-  // Check if it's an int constant that should be treated as float
   if Val.Kind = svkConstInt then
   begin
     ConstVal := Double(Val.ConstInt);
-    Result := True;
-    {$IFDEF DEBUG_STRENGTH}
-    if DebugStrength then
-      WriteLn('[StrengthRed] GetConstFloat: Found inline int constant: ', ConstVal:0:2);
-    {$ENDIF}
-    Exit;
+    Exit(True);
   end;
-
-  // Check if it's a register loaded with a constant
-  if Val.Kind = svkRegister then
+  if Val.Kind <> svkRegister then Exit;
+  if RegisterReassignedNonConst(Val) then Exit;
+  D := DefOf(Val);
+  if D = nil then Exit;
+  if (D^.Op = ssaLoadConstFloat) and (D^.Src1.Kind = svkConstFloat) then
   begin
-    if RegisterReassignedNonConst(Val) then Exit;   // accumulator / computed reg -> not constant
-    {$IFDEF DEBUG_STRENGTH}
-    if DebugStrength then
-      WriteLn('[StrengthRed] GetConstFloat: Searching for register F', Val.RegIndex, ' in LoadConst instructions...');
-    {$ENDIF}
-
-    // Scan all blocks to find LoadConstFloat instruction for this register
-    for i := 0 to FProgram.Blocks.Count - 1 do
-    begin
-      Block := FProgram.Blocks[i];
-      for j := 0 to Block.Instructions.Count - 1 do
-      begin
-        Instr := Block.Instructions[j];
-
-        // Check if this instruction loads a float constant into our register
-        if (Instr.OpCode = ssaLoadConstFloat) and
-           (Instr.Dest.Kind = svkRegister) and
-           (Instr.Dest.RegType = Val.RegType) and
-           (Instr.Dest.RegIndex = Val.RegIndex) and
-           (Instr.Src1.Kind = svkConstFloat) then
-        begin
-          ConstVal := Instr.Src1.ConstFloat;
-          Result := True;
-          {$IFDEF DEBUG_STRENGTH}
-          if DebugStrength then
-            WriteLn('[StrengthRed] GetConstFloat: Found LoadConstFloat F', Val.RegIndex, ' = ', ConstVal:0:2);
-          {$ENDIF}
-          Exit;
-        end;
-
-        // Check if this instruction loads an int constant into our register
-        if (Instr.OpCode = ssaLoadConstInt) and
-           (Instr.Dest.Kind = svkRegister) and
-           (Instr.Dest.RegType = Val.RegType) and
-           (Instr.Dest.RegIndex = Val.RegIndex) and
-           (Instr.Src1.Kind = svkConstInt) then
-        begin
-          ConstVal := Double(Instr.Src1.ConstInt);
-          Result := True;
-          {$IFDEF DEBUG_STRENGTH}
-          if DebugStrength then
-            WriteLn('[StrengthRed] GetConstFloat: Found LoadConstInt F', Val.RegIndex, ' = ', ConstVal:0:2);
-          {$ENDIF}
-          Exit;
-        end;
-
-        // Check if this instruction converts int register to float (IntToFloat)
-        // and track back to find the int constant
-        if (Instr.OpCode = ssaIntToFloat) and
-           (Instr.Dest.Kind = svkRegister) and
-           (Instr.Dest.RegType = Val.RegType) and
-           (Instr.Dest.RegIndex = Val.RegIndex) and
-           (Instr.Src1.Kind = svkRegister) then
-        begin
-          // Recursively check if Src1 (the int register) contains a constant
-          if GetConstInt(Instr.Src1, TempInt) then
-          begin
-            ConstVal := Double(TempInt);
-            Result := True;
-            {$IFDEF DEBUG_STRENGTH}
-            if DebugStrength then
-              WriteLn('[StrengthRed] GetConstFloat: Found IntToFloat F', Val.RegIndex, ' from I', Instr.Src1.RegIndex, ' = ', ConstVal:0:2);
-            {$ENDIF}
-            Exit;
-          end;
-        end;
-      end;
-    end;
-
-    {$IFDEF DEBUG_STRENGTH}
-    if DebugStrength then
-    begin
-      WriteLn('[StrengthRed] GetConstFloat: Register F', Val.RegIndex, ' NOT FOUND in any LoadConst');
-      WriteLn('[StrengthRed]   Dumping ALL instructions that write to F', Val.RegIndex, ':');
-      // Debug: show all instructions that write to this register
-      for i := 0 to FProgram.Blocks.Count - 1 do
-      begin
-        Block := FProgram.Blocks[i];
-        for j := 0 to Block.Instructions.Count - 1 do
-        begin
-          Instr := Block.Instructions[j];
-          if (Instr.Dest.Kind = svkRegister) and
-             (Instr.Dest.RegType = Val.RegType) and
-             (Instr.Dest.RegIndex = Val.RegIndex) then
-          begin
-            WriteLn('[StrengthRed]     ', SSAOpCodeToString(Instr.OpCode), ' F', Val.RegIndex);
-          end;
-        end;
-      end;
-    end;
-    {$ENDIF}
+    ConstVal := D^.Src1.ConstFloat;
+    Exit(True);
   end;
+  if (D^.Op = ssaLoadConstInt) and (D^.Src1.Kind = svkConstInt) then
+  begin
+    ConstVal := Double(D^.Src1.ConstInt);
+    Exit(True);
+  end;
+  if (D^.Op = ssaIntToFloat) and (D^.Src1.Kind = svkRegister) then
+    if GetConstInt(D^.Src1, TempInt) then
+    begin
+      ConstVal := Double(TempInt);
+      Exit(True);
+    end;
 end;
 
 function TStrengthReduction.IsPowerOfTwo(N: Int64; out Log2: Integer): Boolean;
