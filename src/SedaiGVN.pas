@@ -106,6 +106,19 @@ type
       BLOCK-LOCAL and is emptied by any instruction that is not a proven non-writer, so a reuse can
       only ever be a straight-line one with nothing in between that could have changed the state. }
     FBlockTable: TLocalValueMap;
+    // DESCRIPTOR reads (LBOUND/UBOUND) get their own block-local table, because what invalidates
+    // them is not what invalidates an element read. Storing into an array element, or into a
+    // record field, cannot change an array's bounds - only DIM/REDIM/ERASE/BIND or a call can.
+    // Sharing one table made intrec's hot loop recompute LBOUND(a,0) four times per iteration:
+    // the RecordStore between two accesses emptied the table, so the second LBOUND never saw the
+    // first, and with it died the index subtraction and the element load that depend on it.
+    FBoundTable: TLocalValueMap;
+    // Loop-variant ARITHMETIC. It is confined to the block for COST, not for soundness (reusing it
+    // across blocks only stretches a live range over the latch), so unlike a memory read it must
+    // NOT be thrown away at a store: its value is a function of its operands, and both it and they
+    // are single-def. Sharing the state-dependent table meant intrec recomputed the same
+    // 'index - lbound' four times per iteration, once after each RecordStore.
+    FLoopVarTable: TLocalValueMap;
     FDomTree: TDominatorTree;
     FProgram: TSSAProgram;
     FReplacements: Integer;  // Count of values replaced
@@ -291,6 +304,52 @@ end;
   costs a silent miscompile. Note this is about WRITES only, so the pure readers stay on the list
   (a RecordLoad between two array reads must not throw them away, and it sits exactly there in the
   hot loop of an array-of-UDT program). }
+function IsMemoryBarrier(Op: TSSAOpCode): Boolean; forward;
+
+function IsDescriptorRead(Op: TSSAOpCode): Boolean; inline;
+// Reads of an array's SHAPE rather than of its data. Their value changes only when the array is
+// dimensioned, resized, erased or rebound - not when an element or a record field is written.
+begin
+  Result := Op in [ssaArrayLBound, ssaArrayUBound, ssaArrayLBoundInd, ssaArrayUBoundInd];
+end;
+
+function IsReshapeBarrier(Op: TSSAOpCode): Boolean;
+// Does this instruction possibly change some array's SHAPE? Same safe polarity as IsMemoryBarrier:
+// the listed opcodes are the ones PROVEN harmless to a descriptor, everything else answers yes.
+// It is IsMemoryBarrier's safe set plus the data writes and reads, which move values around
+// without touching any bound: an element store, a record field store, and every load.
+begin
+  if not IsMemoryBarrier(Op) then Exit(False);      // already proven harmless to everything
+  case Op of
+    ssaArrayStore, ssaArrayStoreIndInt, ssaArrayStoreIndFloat, ssaArrayStoreIndString,
+    ssaArrayLoad, ssaArrayLoadIndInt, ssaArrayLoadIndFloat, ssaArrayLoadIndString,
+    ssaArrayLBound, ssaArrayUBound, ssaArrayLBoundInd, ssaArrayUBoundInd,
+    ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
+    ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString,
+    ssaRecordTypeId:
+      Result := False;
+  else
+    Result := True;
+  end;
+end;
+
+function IsElementBarrier(Op: TSSAOpCode): Boolean;
+// Can this instruction change an array ELEMENT? Same safe polarity again: only the opcodes proven
+// harmless answer no. It is IsMemoryBarrier's safe set plus the RECORD accesses, which live in a
+// different structure entirely - an array of UDT holds handles, and writing a field through a
+// handle cannot change the handle stored in the array. Without this, intrec re-loaded the same
+// element four times per iteration, once after each field store.
+begin
+  if not IsMemoryBarrier(Op) then Exit(False);
+  case Op of
+    ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
+    ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString, ssaRecordTypeId:
+      Result := False;
+  else
+    Result := True;
+  end;
+end;
+
 function IsMemoryBarrier(Op: TSSAOpCode): Boolean;
 begin
   case Op of
@@ -345,6 +404,8 @@ begin
   inherited Create;
   FScopedTable := TScopedGVNTable.Create;
   FBlockTable := TLocalValueMap.Create;
+  FBoundTable := TLocalValueMap.Create;
+  FLoopVarTable := TLocalValueMap.Create;
   FPhiDefinedRegs := TRegKeySet.Create;
   FDefCounts := TDefCountMap.Create;
   FConstRegs := TConstRegMap.Create;
@@ -360,6 +421,8 @@ begin
   FDefCounts.Free;
   FPhiDefinedRegs.Free;
   FBlockTable.Free;
+  FBoundTable.Free;
+  FLoopVarTable.Free;
   FScopedTable.Free;
   inherited Destroy;
 end;
@@ -832,6 +895,25 @@ begin
   //   * a STATE-DEPENDENT read, because its value is not a function of its operands (soundness);
   //   * anything built on a LOOP-VARIANT value, because reusing one across blocks only stretches a
   //     live range over the loop latch (cost - see UsesLoopVariantValue).
+  // A descriptor read answers from its own table, which survives element and field stores.
+  if IsDescriptorRead(Instr.OpCode) then
+  begin
+    if FBoundTable.TryGetValue(Hash, ExistingValue) then
+      RewriteAsCopy(Instr, ExistingValue, Hash)
+    else
+      FBoundTable.AddOrSetValue(Hash, Instr.Dest);
+    Exit;
+  end;
+  // Loop-variant arithmetic that reads no memory: block-local, but it outlives the stores in the
+  // block, because nothing a store does can change what its operands compute to.
+  if (not IsStateDependentRead(Instr.OpCode)) and UsesLoopVariantValue(Instr) then
+  begin
+    if FLoopVarTable.TryGetValue(Hash, ExistingValue) then
+      RewriteAsCopy(Instr, ExistingValue, Hash)
+    else
+      FLoopVarTable.AddOrSetValue(Hash, Instr.Dest);
+    Exit;
+  end;
   if IsStateDependentRead(Instr.OpCode) or UsesLoopVariantValue(Instr) then
   begin
     if FBlockTable.TryGetValue(Hash, ExistingValue) then
@@ -954,6 +1036,8 @@ begin
   // The state-dependent table never survives a block boundary: entering a block says nothing about
   // which of its predecessors ran, nor what they stored.
   FBlockTable.Clear;
+  FBoundTable.Clear;
+  FLoopVarTable.Clear;
 
   // Process each instruction in block
   for i := 0 to Block.Instructions.Count - 1 do
@@ -961,8 +1045,11 @@ begin
     Instr := Block.Instructions[i];
     // Barrier FIRST: an instruction that can write or reshape invalidates the reads recorded before
     // it, including - conservatively - its own operands' worth of state.
-    if IsMemoryBarrier(Instr.OpCode) then
+    if IsElementBarrier(Instr.OpCode) then
       FBlockTable.Clear;
+    // ...and the descriptor table only for something that can actually reshape an array.
+    if IsReshapeBarrier(Instr.OpCode) then
+      FBoundTable.Clear;
     ProcessInstruction(Instr);
   end;
 end;
