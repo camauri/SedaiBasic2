@@ -198,6 +198,19 @@ type
 
 implementation
 
+var
+  // SR_DIAG=1: attribution inside this pass, now that it is the dominant one (10.1 s of 14.4).
+  GSRDiag: Integer = -1;
+  GSRRebuilds: Integer = 0;
+
+function SRDiagOn: Boolean;
+begin
+  if GSRDiag < 0 then
+    if GetEnvironmentVariable('SR_DIAG') = '1' then GSRDiag := 1 else GSRDiag := 0;
+  Result := GSRDiag = 1;
+end;
+
+
 {$IFDEF DEBUG_STRENGTH}
 uses SedaiDebug;
 {$ENDIF}
@@ -262,6 +275,7 @@ begin
 end;
 
 function TStrengthReduction.Run: Integer;
+var T0, T1: QWord;
 begin
   // Phase A: runs in BOTH dialects. The MODERN miscompiles that once forced a skip here were not this
   // pass's fault: they were latent register bank-typing bugs (float FOR-comparison results typed in the
@@ -276,19 +290,26 @@ begin
   {$ENDIF}
 
   // Phase 1: Simple pattern-based reductions (x*2 → x+x, etc.)
+  if SRDiagOn then T0 := GetTickCount64;
   ReduceBlocks;
+  if SRDiagOn then begin T1 := GetTickCount64; WriteLn(ErrOutput, '[SR_DIAG] ReduceBlocks ', T1-T0, ' ms  (idx rebuilds=', GSRRebuilds, ')'); end;
 
   // Phase 2: Loop-based induction variable strength reduction
   // Transforms: FOR I = init TO n: J = I * const -> J starts at init*const, stride = step*const
+  if SRDiagOn then T0 := GetTickCount64;
   BuildDominatorMap;
+  if SRDiagOn then begin T1 := GetTickCount64; WriteLn(ErrOutput, '[SR_DIAG] BuildDominatorMap ', T1-T0, ' ms'); T0 := T1; end;
   if FDominatorMap.Count > 0 then
   begin
     FindLoops;
+    if SRDiagOn then begin T1 := GetTickCount64; WriteLn(ErrOutput, '[SR_DIAG] FindLoops ', T1-T0, ' ms  loops=', FLoops.Count); T0 := T1; end;
     if FLoops.Count > 0 then
     begin
       FindInductionVariables;
+      if SRDiagOn then begin T1 := GetTickCount64; WriteLn(ErrOutput, '[SR_DIAG] FindInductionVariables ', T1-T0, ' ms  ivs=', Length(FInductionVars)); T0 := T1; end;
       if Length(FInductionVars) > 0 then
         ReduceIVMultiplications;
+      if SRDiagOn then begin T1 := GetTickCount64; WriteLn(ErrOutput, '[SR_DIAG] ReduceIVMultiplications ', T1-T0, ' ms  (idx rebuilds=', GSRRebuilds, ')'); end;
     end;
   end;
 
@@ -355,6 +376,7 @@ begin
     end;
   end;
   FDefIdxStamp := FReductions;
+  Inc(GSRRebuilds);
 end;
 
 function TStrengthReduction.DefOf(const Val: TSSAValue): PSRDefInfo;
