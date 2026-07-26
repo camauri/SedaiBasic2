@@ -1754,6 +1754,9 @@ var
   // before - the callee reaches those at absolute addresses, which the existing snapshot already
   // protects. Only the integer view slides, so nothing else about the scheme changes.
   GFrameBaseWide: Integer = 1;
+  // FRAMEBANK_SHAPE=0 restores the BINARY float/string width rule (credit both banks for anything
+  // not proven integer-only) instead of the per-bank write shapes. For a one-binary A/B.
+  GFrameBankShape: Integer = 1;
 
 function BcTouchesOnlyIntBank(Op: Word): Boolean;
 begin
@@ -1839,6 +1842,104 @@ end;
 function BcIntWriteShape(Op: Word): Integer;   // gated view, used by the width/base scan
 begin
   if GFrameRangeNarrow <> 1 then Result := IW_UNKNOWN else Result := BcIntWriteShapeRaw(Op);
+end;
+
+{ The same question as BcIntWriteShapeRaw, asked of the FLOAT and STRING banks: which registers of
+  that bank can this opcode write? The frame width is a WRITE-set question - a register the callee
+  never writes still holds the caller's value when it returns - so an opcode that writes nothing in
+  a bank costs that bank nothing.
+
+  This replaces a BINARY test. Until now the widths asked only "is this opcode integer-only?", and
+  anything that was not credited Dest, Src1 and Src2 to the float and string banks TOGETHER. A
+  purely float opcode therefore dragged in the STRING bank: a recursive function returning a double
+  copied five REFCOUNTED strings per call for strings it never touches, which measured -19.5% on
+  fibf(30) when probed away with FRAMESAVE_NOSTR. It is the same defect the per-bank widths fixed
+  for integer procedures, left standing for float ones.
+
+  ⚠️ POLARITY - this is the dangerous direction. Saying BW_NONE for an opcode that DOES write the
+  bank means the caller's value is not saved and does not come back: a silent miscompile. Every
+  entry below is verified against its implementation in RunTemplate.inc. An opcode that is not
+  listed answers BW_UNKNOWN and keeps the old, coarse behaviour, which costs a missed narrowing and
+  never a missed save. Note what is NOT here: the whole string group ($01xx), all of I/O and
+  graphics, and anything else unaudited - those still credit everything, exactly as before. }
+const
+  BW_UNKNOWN = 0;   // not audited: credit Dest, Src1 and Src2 to this bank, as before
+  BW_DEST    = 1;   // writes this bank at Dest, and nowhere else in it
+  BW_NONE    = 2;   // writes nothing in this bank at all
+
+function BcFloatWriteShape(Op: Word): Integer;
+begin
+  // FRAMEBANK_SHAPE=0 restores the binary "integer-only?" test on one binary: everything not
+  // proven integer-only answers UNKNOWN and credits all three operands to both banks, as before.
+  if (GFrameBankNarrow <> 1) or (GFrameBankShape <> 1) then
+  begin
+    if BcTouchesOnlyIntBank(Op) then Exit(BW_NONE) else Exit(BW_UNKNOWN);
+  end;
+  case Op of
+    // Dest is a float register.
+    bcLoadConstFloat, bcCopyFloat, bcNarrowSingle,
+    bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcNegFloat,
+    bcIntToFloat, bcXferLoadFloat, bcRecordLoadFloat, bcArrayLoadFloat:
+      Result := BW_DEST;
+    // Integer-only work, plus the opcodes that READ a float and write elsewhere: a comparison
+    // writes the integer bank, a transfer store writes the transfer bank, an array or record store
+    // writes that array or record. None of them leaves a float register changed.
+    bcLoadConstInt, bcCopyInt,
+    bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
+    bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
+    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
+    bcXferStoreInt, bcXferLoadInt, bcJump, bcJumpIfZero, bcJumpIfNotZero, bcNop,
+    bcCallSub, bcReturnSub,
+    bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpGtFloat, bcCmpLeFloat, bcCmpGeFloat,
+    bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
+    bcFloatToInt, bcFloatRound, bcNarrowInt,
+    bcLoadConstString, bcCopyString, bcXferLoadString, bcXferStoreString, bcXferStoreFloat,
+    bcIntToString,
+    bcRecordNew, bcRecordNewBlock, bcRecordLoadInt, bcRecordLoadString, bcRecordTypeId,
+    bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString, bcRecordFree,
+    bcArrayLoadInt, bcArrayLoadString, bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
+    bcArrayLBound, bcArrayUBound, bcArrayBind, bcArrayUnbind, bcArrayBindApply,
+    bcArrayBindInd, bcArrayErase:
+      Result := BW_NONE;
+  else
+    Result := BW_UNKNOWN;
+  end;
+end;
+
+function BcStrWriteShape(Op: Word): Integer;
+begin
+  if (GFrameBankNarrow <> 1) or (GFrameBankShape <> 1) then
+  begin
+    if BcTouchesOnlyIntBank(Op) then Exit(BW_NONE) else Exit(BW_UNKNOWN);
+  end;
+  case Op of
+    // Dest is a string register. Every one of these is a refcounted assignment, which is why the
+    // string bank is the expensive one to get wrong in either direction.
+    bcLoadConstString, bcCopyString, bcXferLoadString, bcRecordLoadString, bcArrayLoadString,
+    bcIntToString:
+      Result := BW_DEST;
+    bcLoadConstInt, bcCopyInt,
+    bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
+    bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
+    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
+    bcXferStoreInt, bcXferLoadInt, bcJump, bcJumpIfZero, bcJumpIfNotZero, bcNop,
+    bcCallSub, bcReturnSub,
+    // The float family, which is the point of this function: none of it touches a string.
+    bcLoadConstFloat, bcCopyFloat, bcNarrowSingle,
+    bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcNegFloat,
+    bcIntToFloat, bcXferLoadFloat, bcXferStoreFloat,
+    bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpGtFloat, bcCmpLeFloat, bcCmpGeFloat,
+    bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
+    bcFloatToInt, bcFloatRound, bcNarrowInt, bcXferStoreString,
+    bcRecordNew, bcRecordNewBlock, bcRecordLoadInt, bcRecordLoadFloat, bcRecordTypeId,
+    bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString, bcRecordFree,
+    bcArrayLoadInt, bcArrayLoadFloat, bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
+    bcArrayLBound, bcArrayUBound, bcArrayBind, bcArrayUnbind, bcArrayBindApply,
+    bcArrayBindInd, bcArrayErase:
+      Result := BW_NONE;
+  else
+    Result := BW_UNKNOWN;
+  end;
 end;
 
 { Which Src fields an opcode READS from the integer bank - the read-side twin of BcIntWriteShape,
@@ -1997,11 +2098,21 @@ begin
           Note(p, 0, Instr.Src2);
         end;
       end;
-      if not BcTouchesOnlyIntBank(Op) then
-      begin
-        Note(p, 1, Instr.Dest); Note(p, 2, Instr.Dest);
-        Note(p, 1, Instr.Src1); Note(p, 2, Instr.Src1);
-        Note(p, 1, Instr.Src2); Note(p, 2, Instr.Src2);
+      // Float and string banks: same write-set question as the integer bank above, asked per bank.
+      // This used to be one BINARY test - "integer-only?" - that credited both banks together, so a
+      // purely float opcode dragged in the STRING width and a recursive function returning a double
+      // copied five refcounted strings per call it never touched (-19.5% on fibf when probed away).
+      case BcFloatWriteShape(Op) of
+        BW_DEST: Note(p, 1, Instr.Dest);
+        BW_NONE: ;
+      else
+        begin Note(p, 1, Instr.Dest); Note(p, 1, Instr.Src1); Note(p, 1, Instr.Src2); end;
+      end;
+      case BcStrWriteShape(Op) of
+        BW_DEST: Note(p, 2, Instr.Dest);
+        BW_NONE: ;
+      else
+        begin Note(p, 2, Instr.Dest); Note(p, 2, Instr.Src1); Note(p, 2, Instr.Src2); end;
       end;
       // An indirect call, a thread spawn or an error jump can land anywhere: give up on this one.
       if (Op = Ord(bcCallSubIndirect)) or (Op = Ord(bcThreadCreate)) or
@@ -12093,6 +12204,7 @@ initialization
   if GetEnvironmentVariable('FRAMEMARK') = '0' then GFrameMark := 0;
   if GetEnvironmentVariable('FRAMEBASE') = '0' then GFrameBase := 0;
   if GetEnvironmentVariable('FRAMEBASE_WIDE') = '0' then GFrameBaseWide := 0;
+  if GetEnvironmentVariable('FRAMEBANK_SHAPE') = '0' then GFrameBankShape := 0;
   if GetEnvironmentVariable('FRAMEBASE_DIAG') = '1' then GFrameBaseDiag := 1;
 
 finalization
