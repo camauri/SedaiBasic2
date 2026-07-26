@@ -1761,7 +1761,7 @@ var
   // record opcodes relocates its INTEGER frame and keeps COPYING the other two banks exactly as
   // before - the callee reaches those at absolute addresses, which the existing snapshot already
   // protects. Only the integer view slides, so nothing else about the scheme changes.
-  GFrameBaseWide: Integer = 1;
+  GFrameBaseWide: Integer = 0;
   // FRAMEBANK_SHAPE=0 restores the BINARY float/string width rule (credit both banks for anything
   // not proven integer-only) instead of the per-bank write shapes. For a one-binary A/B.
   GFrameBankShape: Integer = 1;
@@ -1843,7 +1843,17 @@ begin
     // Binding an array BYREF parameter moves entries between FArrays slots and a save stack of its
     // own. bcArrayBind/Unbind/BindApply name their arrays by immediate and touch no register at all;
     // bcArrayBindInd takes the member's runtime handle from Src2.
-    bcArrayBind, bcArrayUnbind, bcArrayBindApply, bcArrayBindInd, bcArrayErase:
+    bcArrayBind, bcArrayUnbind, bcArrayBindApply, bcArrayBindInd, bcArrayErase,
+    // The PRINT family writes no register at all - it formats an operand and sends it to the
+    // output device. Classifying it matters more than it looks: an unaudited opcode counts as
+    // READING its operands in the INTEGER bank, and the banks are numbered in parallel, so a
+    // module-level 'PrintString R4' was making the integer R4 look externally read - which
+    // refused relocation for every procedure that writes integer R4 (fibf, and its whole shape).
+    // INPUT and SCREEN/LOCATE/VIEW PRINT are deliberately left unaudited: they write registers,
+    // and bcConScreen even uses Immediate as a register INDEX.
+    bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn, bcPrintInt, bcPrintIntLn,
+    bcPrintComma, bcPrintSemicolon, bcPrintTab, bcPrintSpc, bcPrintNewLine, bcPrintEnd,
+    bcPrintBool, bcPrintUInt:
       Result := IW_NONE;
   else
     Result := IW_UNKNOWN;
@@ -1985,14 +1995,19 @@ begin
     // Src1/Src2 are the slot COUNTS passed straight to AllocRecord, not register indices.
     bcRecordNew,
     // Arrays named by immediate only.
-    bcArrayBind, bcArrayUnbind, bcArrayBindApply, bcArrayErase:
+    bcArrayBind, bcArrayUnbind, bcArrayBindApply, bcArrayErase,
+    // PRINT of a float or a string, and the pure layout ops: nothing of ours is read.
+    bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
+    bcPrintComma, bcPrintSemicolon, bcPrintNewLine, bcPrintEnd:
       Result := US_NONE;
     bcCopyInt, bcNegInt, bcBitwiseNot, bcXferStoreInt, bcJumpIfZero, bcJumpIfNotZero,
     bcIntToFloat, bcIntToString, bcNarrowInt,
     // Src1 is the record HANDLE, which lives in the integer bank whatever the field's type is;
     // the slot number is an immediate. Verified one by one against ResolveRec in RunTemplate.inc.
     bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString, bcRecordTypeId,
-    bcRecordStoreFloat, bcRecordStoreString, bcRecordFree, bcRecordNewBlock:
+    bcRecordStoreFloat, bcRecordStoreString, bcRecordFree, bcRecordNewBlock,
+    // ...and PRINT of an integer value, or a TAB/SPC count, reads it from Src1.
+    bcPrintInt, bcPrintIntLn, bcPrintBool, bcPrintUInt, bcPrintTab, bcPrintSpc:
       Result := US_SRC1;
     // Src2 is the element index (or the member handle for BindInd); Src1 is an immediate array id.
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
@@ -2447,8 +2462,6 @@ begin
       // control flow. What matters is not that the opcode is integer-only but that we know exactly
       // which integer registers it writes: a float multiply touches none of ours and is as safe to
       // relocate around as a jump. An unaudited opcode still refuses the whole unit.
-      if (GFrameBaseWide <> 1) and (not BcTouchesOnlyIntBank(Op)) then
-      begin Ok := False; Why := Format('not int-only: op $%x at pc %d', [Op, i]); Break; end;
       if (BcIntWriteShapeRaw(Op) = IW_UNKNOWN) or (Op = Ord(bcCall)) or (Op = Ord(bcReturn)) or
          (Op = Ord(bcCallSubIndirect)) or (Op = Ord(bcThreadCreate)) then
       begin Ok := False; Why := Format('unaudited write shape/indirect: op $%x at pc %d', [Op, i]); Break; end;
@@ -2534,6 +2547,24 @@ begin
         WriteLn(ErrOutput, Format('[FRAMEBASE] unit %d @pc %d..%d: no - %s',
                                   [p, UStart[p], UEnd[p], EWhy[p]]));
     if not Elig[p] then System.Continue;
+    // MEASURED: relocating a frame that still copies floats or strings COSTS instead of paying.
+    // fibf, made eligible by classifying the PRINT family, came out +3.5% --aot and +2.0%
+    // interpreted AGAINST the copying frame - after the call-site liveness its integer range was
+    // already half a register, so the slide's bookkeeping bought nothing while the general
+    // path's extra work stayed. The whole win is the FAST path: fib, which copies nothing at
+    // all, is -27.5%. So publish a frame base ONLY where the fast path applies.
+    // FRAMEBASE_WIDE=1 publishes the rest too, to re-measure this decision on one binary.
+    if (GFrameBaseWide <> 1) and
+       not ((UStart[p] < Length(FProcWidths)) and (FProcWidths[UStart[p]].WInt >= 0) and
+            ((FProcWidths[UStart[p]].WFloat shr 32) = 0) and
+            ((FProcWidths[UStart[p]].WStr shr 32) = 0)) then
+    begin
+      if GFrameBaseDiag = 1 then
+        WriteLn(ErrOutput, Format('[FRAMEBASE] unit %d @pc %d..%d: relocatable but NOT fast'
+                                  + ' (copies float/string) - keeping the copying frame',
+                                  [p, UStart[p], UEnd[p]]));
+      System.Continue;
+    end;
     // Published per entry PC, packed like the widths: one past the highest index used in the high
     // half, the lowest in the low half. A relocated frame starts at the high-water mark and is
     // Hi-Lo slots wide, so the view delta is HighWater - Lo.
@@ -12278,7 +12309,7 @@ initialization
   if GetEnvironmentVariable('FRAMELIVE') = '0' then GFrameLiveNarrow := 0;
   if GetEnvironmentVariable('FRAMEMARK') = '0' then GFrameMark := 0;
   if GetEnvironmentVariable('FRAMEBASE') = '0' then GFrameBase := 0;
-  if GetEnvironmentVariable('FRAMEBASE_WIDE') = '0' then GFrameBaseWide := 0;
+  if GetEnvironmentVariable('FRAMEBASE_WIDE') = '1' then GFrameBaseWide := 1;
   if GetEnvironmentVariable('FRAMEBANK_SHAPE') = '0' then GFrameBankShape := 0;
   if GetEnvironmentVariable('FRAME_FAST') = '0' then GFrameFast := 0;
   if GetEnvironmentVariable('FRAMEBASE_DIAG') = '1' then GFrameBaseDiag := 1;
