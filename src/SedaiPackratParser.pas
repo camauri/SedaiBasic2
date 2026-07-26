@@ -83,6 +83,15 @@ type
     // reaches ParseLoopEndStatement while this is > 0 sits inside a nested construct of an
     // open DO (single-line IF branch): in CLASSIC it is that loop's back-edge, not an error.
     FDoParseDepth: Integer;
+    // Names declared with CONST (UPPER). A constant is not an lvalue: assigning to one is an error
+    // in FreeBASIC ("error 119: Cannot modify a constant") and used to be silently accepted here,
+    // because a module-level CONST lowers to a DIM and was therefore an ordinary variable.
+    FConstNames: TStringList;
+    // True while ParseConstStatement is parsing the declaration itself. One of its three forms reads
+    // the "name = value" part with ParseAssignmentStatement, so without this the rejection below
+    // fires on the DECLARATION of a constant whose name was already declared in another scope
+    // (two procedures may each have their own "Const localc = ...").
+    FInConstDecl: Boolean;
     // Dialect-pluggable: per-token statement handlers installed by the active dialect profile.
     // Consulted by ParseStatement before the built-in case; nil entry = no override.
     FStmtHandlers: array[TTokenType] of TStatementParseFunc;
@@ -373,6 +382,8 @@ begin
 
   FProcSeen := TStringList.Create;
   FProcSeen.CaseSensitive := False;
+  FConstNames := TStringList.Create;
+  FConstNames.CaseSensitive := False;
 end;
 
 destructor TPackratParser.Destroy;
@@ -384,6 +395,7 @@ begin
     FExpressionParser.Free;
 
   FProcSeen.Free;
+  FConstNames.Free;
 
   inherited Destroy;
 end;
@@ -635,6 +647,7 @@ begin
   FStartTime := Now;
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
+  FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
 
   try
     // Initialize context
@@ -696,6 +709,7 @@ begin
   FStartTime := Now;
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
+  FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
 
   try
     // Initialize context
@@ -1437,6 +1451,14 @@ begin
   begin
     // *** SAVE THE TOKEN BEFORE ADVANCING ***
     SavedToken := Context.CurrentToken;
+    // A CONST is not an lvalue. fbc rejects this outright (error 119); we used to accept it, because
+    // a module CONST lowered to a plain DIM and so really was a writable variable.
+    if FModernMode and (not FInConstDecl) and (FConstNames.IndexOf(UpperCase(Token.Value)) >= 0) then
+    begin
+      HandleError('Cannot modify a constant: ' + UpperCase(Token.Value), Token);
+      Result := nil;
+      Exit;
+    end;
     LeftSide := TASTNode.CreateWithValue(antIdentifier, UpperCase(Token.Value), Token);
     Context.Advance; // Consume identifier
     //WriteLn('DEBUG: Consumed identifier, next token: "', Context.CurrentToken.Value, '"');
@@ -1915,7 +1937,8 @@ begin
   SavedToken := Context.CurrentToken;
   Context.Advance; // Consume LET (if present)
 
-  // Parse assignment expression
+  // Parse assignment expression. NOT wrapped in FInConstDecl: "Let K = 9" on a constant must be
+  // rejected exactly like the bare form.
   Assignment := ParseAssignmentStatement;
   if Assigned(Assignment) and (Assignment.NodeType = antAssignment) then
     Result := Assignment
@@ -8716,6 +8739,8 @@ begin
     ArrayDecl.AddChild(ValueNode);
     if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';     // FB: a module-level CONST is globally visible
     ArrayDecl.Attributes.Values['CONSTDECL'] := '1';  // a CONST, not a variable: the SSA folds it to an immediate
+    if FConstNames.IndexOf(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))) < 0 then
+      FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
     ParseConstListTail(Result, TypeName, False);      // "Const As T a = 1, b = 2, ...": T applies to the whole list
@@ -8760,6 +8785,8 @@ begin
     ArrayDecl.AddChild(ValueNode);
     if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';     // FB: a module-level CONST is globally visible
     ArrayDecl.Attributes.Values['CONSTDECL'] := '1';  // a CONST, not a variable: the SSA folds it to an immediate
+    if FConstNames.IndexOf(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))) < 0 then
+      FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
     ParseConstListTail(Result, '', True);             // "Const a As T = 1, b As U = 2, ...": per-item type or inference
@@ -8773,7 +8800,12 @@ begin
   // procedures, so e.g. "Const pi = 3.14159" used inside a function read as 0). The bank is inferred from
   // the value: a string literal -> STRING; a numeric literal with a fractional part or exponent -> DOUBLE;
   // any other numeric literal -> LONGINT; a non-literal value expression -> DOUBLE.
-  Assignment := ParseAssignmentStatement;
+  FInConstDecl := True;
+  try
+    Assignment := ParseAssignmentStatement;
+  finally
+    FInConstDecl := False;
+  end;
   if not (Assigned(Assignment) and (Assignment.NodeType = antAssignment) and (Assignment.ChildCount >= 2)) then
   begin
     HandleError('Expected assignment after CONST', Token);
@@ -8795,6 +8827,8 @@ begin
   // not use the shared-scalar backing array; marking it SHARED there breaks the const (m: stress.bas).
   if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';
   ArrayDecl.Attributes.Values['CONSTDECL'] := '1';    // a CONST, not a variable: the SSA folds it to an immediate
+  if FConstNames.IndexOf(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))) < 0 then
+    FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
   Assignment.Free;
   Result := TASTNode.Create(antDim, Token);
   Result.AddChild(ArrayDecl);
