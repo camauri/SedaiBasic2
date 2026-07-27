@@ -601,7 +601,106 @@ type
     property SpriteEditorCallback: TSpriteEditorCallback read FSpriteEditorCallback write FSpriteEditorCallback;
   end;
 
+// DATE LOCALISATION, opt-in and OFF by default.
+//
+// fbc answers from the SYSTEM LOCALE: on an Italian machine MonthName(11) is "novembre" and
+// DateValue accepts "28-11-2005" while rejecting "2005-11-28". We answer DETERMINISTICALLY - English
+// names, ISO-ish parsing - because an output that changes with the machine's regional settings cannot
+// be diffed, and the test baselines would stop being portable between Windows and Linux.
+//
+// Both behaviours are legitimate, so this chooses. Deterministic stays the default; locale mode is for
+// running unmodified FreeBASIC programs that expect their own regional conventions. It is a RUNTIME
+// switch on purpose: an existing FB program contains no SedaiBasic directive, so a source-level option
+// could never help it. A source-level OPTION is meant to layer on top of this later - it needs the
+// .basc format to carry the setting, or compiling with sbc and running with sb would silently lose it.
+//
+// Affects: MONTHNAME/WEEKDAYNAME, the "mmm/mmmm/ddd/dddd" masks of FORMAT, and the DATEVALUE/
+// TIMEVALUE/ISDATE string parsers (locale first, ISO second).
+procedure SetDateLocaleMode(Enabled: Boolean);
+function DateLocaleMode: Boolean;
+
 implementation
+
+var
+  // -1 = not read yet, 0 = deterministic (default), 1 = follow the system locale.
+  GDateLocale: Integer = -1;
+
+procedure SetDateLocaleMode(Enabled: Boolean);
+begin
+  if Enabled then GDateLocale := 1 else GDateLocale := 0;
+end;
+
+function DateLocaleMode: Boolean;
+begin
+  if GDateLocale < 0 then
+    if GetEnvironmentVariable('SB_DATE_LOCALE') = '1' then GDateLocale := 1 else GDateLocale := 0;
+  Result := GDateLocale = 1;
+end;
+
+function LocaleMonthName(n: Integer; Full: Boolean): string;
+// FPC keeps the running locale's names in FormatSettings; index 1..12.
+begin
+  Result := '';
+  if (n < 1) or (n > 12) then Exit;
+  if Full then Result := FormatSettings.LongMonthNames[n]
+  else Result := FormatSettings.ShortMonthNames[n];
+end;
+
+function LocaleDateFields(const S: string; out Y, Mo, D: Integer): Boolean;
+// Split a date on '-', '/' or '.' into three integers and assign them in the LOCALE's FIELD ORDER,
+// taken from FormatSettings.ShortDateFormat.
+//
+// TryStrToDate cannot do this job: it insists on the locale's SEPARATOR too, so an Italian machine
+// rejects "28-11-2005" while accepting "28/11/2005". fbc accepts both, because what the locale
+// decides is the ORDER of the fields, not the punctuation between them.
+var
+  f: array[0..2] of string;
+  n, i, v: array[0..2] of Integer;
+  k, p, pd, pm, py: Integer;
+  c: Char;
+  fmt: string;
+begin
+  Result := False;
+  Y := 0; Mo := 0; D := 0;
+  k := 0; f[0] := ''; f[1] := ''; f[2] := '';
+  for p := 1 to Length(S) do
+  begin
+    c := S[p];
+    if (c = '-') or (c = '/') or (c = '.') then
+    begin
+      Inc(k);
+      if k > 2 then Exit;
+    end
+    else
+      f[k] := f[k] + c;
+  end;
+  if k <> 2 then Exit;
+  for p := 0 to 2 do
+  begin
+    v[p] := StrToIntDef(Trim(f[p]), -1);
+    if v[p] < 0 then Exit;
+  end;
+  fmt := LowerCase(FormatSettings.ShortDateFormat);
+  pd := Pos('d', fmt); pm := Pos('m', fmt); py := Pos('y', fmt);
+  if (pd = 0) or (pm = 0) or (py = 0) then begin pd := 1; pm := 2; py := 3; end;
+  // Rank the three positions: n[j] = how many of the others come before field j.
+  n[0] := 0; n[1] := 0; n[2] := 0;
+  i[0] := pd; i[1] := pm; i[2] := py;
+  for p := 0 to 2 do
+    for k := 0 to 2 do
+      if (k <> p) and (i[k] < i[p]) then Inc(n[p]);
+  D := v[n[0]]; Mo := v[n[1]]; Y := v[n[2]];
+  Result := True;
+end;
+
+function LocaleDayName(n: Integer; Full: Boolean): string;
+// n: 1=Sunday..7=Saturday, which is also FPC's indexing.
+begin
+  Result := '';
+  if (n < 1) or (n > 7) then Exit;
+  if Full then Result := FormatSettings.LongDayNames[n]
+  else Result := FormatSettings.ShortDayNames[n];
+end;
 
 function QuietNaN: Double;
 // A NaN with the sign bit CLEAR. FPC's NaN constant has it SET (it is the x86 "indefinite" form, which
@@ -3450,6 +3549,7 @@ var
 
   function MonName(n: Integer; full: Boolean): string;
   begin
+    if DateLocaleMode then Exit(LocaleMonthName(n, full));
     case n of
       1: Result := 'January';  2: Result := 'February'; 3: Result := 'March';     4: Result := 'April';
       5: Result := 'May';      6: Result := 'June';     7: Result := 'July';      8: Result := 'August';
@@ -3461,6 +3561,7 @@ var
 
   function DayName(n: Integer; full: Boolean): string;   // n: 1=Sunday .. 7=Saturday
   begin
+    if DateLocaleMode then Exit(LocaleDayName(n, full));
     case n of
       1: Result := 'Sunday';   2: Result := 'Monday'; 3: Result := 'Tuesday'; 4: Result := 'Wednesday';
       5: Result := 'Thursday'; 6: Result := 'Friday'; 7: Result := 'Saturday';
@@ -8175,7 +8276,12 @@ begin
     35: // bcDateName - MONTHNAME(n) / WEEKDAYNAME(n). Immediate 0=month (1..12), 1=weekday (1=Sunday..7=Saturday).
       begin
         Count := Ctx.IntRegs[Instr.Src1];   // the 1-based index
-        if Instr.Immediate = 1 then
+        if DateLocaleMode then
+        begin
+          if Instr.Immediate = 1 then S := LocaleDayName(Count, True)
+          else S := LocaleMonthName(Count, True);
+        end
+        else if Instr.Immediate = 1 then
         begin
           case Count of
             1: S := 'Sunday';   2: S := 'Monday';  3: S := 'Tuesday'; 4: S := 'Wednesday';
@@ -8451,7 +8557,15 @@ begin
   else begin ds := w; ts := ''; end;
   if ds <> '' then
   begin
-    if (Pos('-', ds) > 0) and (SplitInts(ds, '-', y, mo, d) >= 3) and TryEncodeDate(y, mo, d, dpart) then
+    // Locale mode asks the SYSTEM parser first, so "28-11-2005" reads as dd-mm-yyyy where that is the
+    // regional convention - which is what fbc does. Deterministic mode keeps ISO-ish first and falls
+    // back to the locale only for what it does not recognise, so the same source gives the same answer
+    // on every machine.
+    if DateLocaleMode and LocaleDateFields(ds, y, mo, d) and TryEncodeDate(y, mo, d, dpart) then
+      haveD := True
+    else if DateLocaleMode and TryStrToDate(ds, dpart) then
+      haveD := True
+    else if (Pos('-', ds) > 0) and (SplitInts(ds, '-', y, mo, d) >= 3) and TryEncodeDate(y, mo, d, dpart) then
       haveD := True
     else if (Pos('/', ds) > 0) and (SplitInts(ds, '/', y, mo, d) >= 3) and TryEncodeDate(y, mo, d, dpart) then
       haveD := True

@@ -412,6 +412,9 @@ begin
   WriteLn('  --no-exec           Compile only, do not execute (useful with --disasm)');
   WriteLn('  --no-opt            Skip the SSA/bytecode optimization passes (differential testing)');
   WriteLn('  --bounds-check      Hard-error on out-of-bounds array access (MODERN too; default follows dialect)');
+  WriteLn('  --date-locale       Month/day names and date parsing follow the SYSTEM locale (as fbc does).');
+  WriteLn('                        Default is deterministic: English names, ISO-ish dates, same everywhere.');
+  WriteLn('                        Also settable with SB_DATE_LOCALE=1; the flag wins over it.');
   WriteLn('  --stats             Show execution statistics');
   WriteLn('  --true-value=N      Set TRUE value for comparisons (-1 or 1, default: -1)');
   WriteLn('                        -1 = Commodore BASIC style (default)');
@@ -2243,6 +2246,10 @@ begin
         GSSAOptimizationsEnabled := False   // differential-test reference: skip the optimization passes
       else if (Param = '--bounds-check') or (Param = '--boundscheck') then
         OptBoundsCheck := True   // force array bounds checking on (even in MODERN); default follows the dialect
+      else if (Param = '--date-locale') or (Param = '--datelocale') then
+        SetDateLocaleMode(True)  // month/day names and date parsing follow the SYSTEM locale, as fbc does
+      else if (Param = '--date-deterministic') then
+        SetDateLocaleMode(False) // explicit default: English names, ISO-ish parsing, same on every machine
       else if (Param = '--jit') then
         OptJit := True   // JIT: compile eligible hot loops to native code (J2/J3)
       else if (Param = '--aot') then
