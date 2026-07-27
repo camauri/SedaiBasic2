@@ -81,6 +81,13 @@ type
     UseBlockCount: Integer;              // Number of blocks with uses (for IsLiveAt check)
     DefBlockOffset: Integer;   // Offset into FBoolPool for DefBlockSet (FBlockCount booleans)
     UseBlockOffset: Integer;   // Offset into FBoolPool for UseBlockSet (FBlockCount booleans)
+    // Is there a block where this variable is READ before anything in that block writes it? That is
+    // the only reason a PHI can ever be needed: an upward-exposed use is a use of a value that came
+    // in from a predecessor. Without it the variable is never live-in anywhere and no merge exists
+    // to make. WITH it - and this is the case the old shortcut missed - one definition block is
+    // enough, as soon as that block is a loop body reading its own previous value ("s = s + i").
+    UpwardExposed: Boolean;
+    KilledStamp: Integer;      // block stamp of the last def seen while scanning a block
     VersionCounter: Integer;   // Next version number
     LastVersion: Integer;      // Last assigned version (fallback)
     VersionStack: TIntegerStack; // Stack of versions for scoped semantics
@@ -163,6 +170,19 @@ implementation
 {$IFDEF DEBUG_SSA}
 uses SedaiDebug;
 {$ENDIF}
+
+var
+  // Gate for placing PHIs for a variable defined in a SINGLE block (see InsertPhiFunctions), read
+  // once: -1 unknown, 0 = PHIDF=0, the old unconditional skip (which MISCOMPILES an uninitialised
+  // accumulator - kept only to price the fix on one binary), 1 = ask the dominance frontier.
+  GSingleDefPhi: Integer = -1;
+
+function SingleDefNeedsPhi: Boolean;
+begin
+  if GSingleDefPhi < 0 then
+    if GetEnvironmentVariable('PHIDF') = '0' then GSingleDefPhi := 0 else GSingleDefPhi := 1;
+  Result := GSingleDefPhi = 1;
+end;
 
 { TIntegerStack }
 
@@ -337,6 +357,8 @@ begin
   SetLength(FVarInfo[Result].DefBlocks, 4);  // Most vars defined in 1-4 blocks
   FVarInfo[Result].DefBlockCount := 0;
   FVarInfo[Result].UseBlockCount := 0;
+  FVarInfo[Result].UpwardExposed := False;
+  FVarInfo[Result].KilledStamp := -1;
   FVarInfo[Result].DefBlockOffset := FBoolPoolNextOffset;
   FVarInfo[Result].UseBlockOffset := FBoolPoolNextOffset + FBlockCount;
   FBoolPoolNextOffset := FBoolPoolNextOffset + 2 * FBlockCount;
@@ -664,6 +686,32 @@ var
       FBoolPool[FVarInfo[Idx].UseBlockOffset + BlockIdx] := True;
       Inc(FVarInfo[Idx].UseBlockCount);  // Just count, don't store list
     end;
+    // Upward-exposed IN A BLOCK THAT ALSO DEFINES IT: nothing in this block has written the
+    // variable yet, and this block does write it later (or in this very instruction). That block
+    // therefore reads a value it will itself overwrite - which, inside a loop, is the value from
+    // the previous iteration, and the only thing a PHI can supply.
+    //
+    // Deliberately NOT the full textbook "globals" set (any upward-exposed use anywhere): that also
+    // catches a variable written in one block and read in another, whose PHIs are placed at the
+    // frontier whether or not it is live there. It is more correct in principle, and it cost n-body
+    // 53% of its native time by changing the shape the bounds-check analysis matches on - for a
+    // shape no test has ever shown to be wrong. Narrow to the defect actually demonstrated.
+    // CollectDefinitions has already run, so the def-block set is complete here.
+    if (FVarInfo[Idx].KilledStamp <> BlockIdx) and
+       FBoolPool[FVarInfo[Idx].DefBlockOffset + BlockIdx] then
+      FVarInfo[Idx].UpwardExposed := True;
+  end;
+
+  procedure AddKill(const Val: TSSAValue);
+  // Mark the variable written in this block. Called AFTER the instruction's uses, because an
+  // instruction reads its sources before it writes its destination: "s = s + i" is an upward-exposed
+  // use of s in the same instruction that defines it.
+  var
+    Idx: Integer;
+  begin
+    if Val.Kind <> svkRegister then Exit;
+    Idx := GetOrCreateVarIndex(Val.RegType, Val.RegIndex);
+    FVarInfo[Idx].KilledStamp := BlockIdx;
   end;
 
 begin
@@ -691,7 +739,10 @@ begin
       // the store reads an undefined register (m226/m314: storing a versioned param into obj.field(i)).
       if OpIn(Instr.OpCode, [ssaArrayStore, ssaArrayStoreIndInt, ssaArrayStoreIndFloat,
                              ssaArrayStoreIndString, ssaPrint, ssaPrintLn]) then
-        AddUse(Instr.Dest);
+        AddUse(Instr.Dest)
+      else
+        // Same opcode classification CollectDefinitions uses; the kill comes after the uses.
+        AddKill(Instr.Dest);
     end;
   end;
 
@@ -753,9 +804,43 @@ begin
       Continue;
     end;
 
-    // CRITICAL OPTIMIZATION: Skip variables defined in only ONE block
-    // They can NEVER need PHI functions (PHI merges values from different paths)
-    if FVarInfo[i].DefBlockCount = 1 then
+    // Skip variables whose single definition block can reach no join point.
+    //
+    // This used to skip EVERY variable defined in one block, on the reasoning that "a PHI merges
+    // values from different paths". It does - and one definition block is enough to produce them,
+    // as soon as that block sits inside a LOOP: the definition reaches the header along the back
+    // edge while the entry edge still carries the value from before the loop. The victim is the
+    // commonest shape in BASIC, an accumulator that is never initialised:
+    //
+    //     Dim As Integer i, s        ' s has NO def outside the loop
+    //     For i = 1 To 5 : s = s + i : Next i
+    //     Return s                   ' gave 5 (the last term), fbc gives 15
+    //
+    // No PHI was placed for s, so the loop-carried value was never merged: every iteration read a
+    // register that nothing ever wrote. Silent, and independent of the optimizer (--no-opt too).
+    // It only bites a variable whose ONLY definition is inside the loop AND that reads itself
+    // there, which is why an explicit "Dim As Integer s = 0" hid it.
+    //
+    // The shortcut is kept, with the condition that actually holds: a PHI can only ever be needed
+    // for a variable with an UPWARD-EXPOSED use - read, in some block, before anything in that
+    // block writes it. Without one the variable is never live-in anywhere and there is no merge to
+    // make; with one, a single definition block is enough. That is exactly the accumulator above,
+    // whose read and write are the same instruction.
+    //
+    // The dominance frontier would also be a correct screen and was tried first: it is far too
+    // coarse. It places PHIs for every temporary defined inside a loop, live at the header or not,
+    // and cost intrec's interpreter +104% and n-body's AOT +63% for nothing. Liveness is the
+    // question; the frontier only says where.
+    //
+    // PHIDF=0 restores the old unconditional skip, so the two can be A/B'd on one binary. It
+    // MISCOMPILES - it is there to price the fix, not to be used.
+    // Restricted to VERSIONABLE variables (proc-local scalars, MODERN). An unversioned variable has
+    // exactly one name, so its loop-carried value is carried by the register itself and there is
+    // nothing for a PHI to merge - the same program at module level was always right. Keeping them
+    // out leaves CLASSIC byte-identical.
+    if (FVarInfo[i].DefBlockCount = 1) and
+       ((not SingleDefNeedsPhi) or (not FVarInfo[i].UpwardExposed) or
+        (not FVarInfo[i].Versionable)) then
     begin
       Inc(PhiCount);  // Count as processed but skip PlacePhiForVariable
       Continue;
