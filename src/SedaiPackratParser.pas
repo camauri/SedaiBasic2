@@ -126,6 +126,7 @@ type
     function FindMatchingNext: Integer;
     function FindMatchingEnd(StartToken: TTokenType): Integer;
     function ParseDimensionList: TASTNode;
+    procedure SkipTypeQualifiers;
     procedure SetOptions(AValue: TParserOptions);
 
     // Helper for error reporting
@@ -2431,6 +2432,7 @@ begin
         if Context.Check(ttAsType) then
         begin
           Context.Advance;                        // AS
+          SkipTypeQualifiers;                     // FB: "As Const <type>"
           // FreeBASIC "AS CONST <type>": a read-only (immutable) parameter. Immutability is not enforced
           // here, so consume and ignore the CONST qualifier and take the type that follows — otherwise
           // CONST (a keyword, not an identifier) is skipped and the parameter is left untyped (mis-banked
@@ -2550,6 +2552,7 @@ begin
   if (Kind = kFUNCTION) and Context.Check(ttAsType) and Assigned(NameNode) then
   begin
     Context.Advance;                              // AS
+    SkipTypeQualifiers;                     // FB: "As Const <type>"
     if Context.Check(ttIdentifier) then
     begin
       RetTok := Context.CurrentToken;
@@ -3049,6 +3052,7 @@ begin
       if Context.Check(ttAsType) then
       begin
         Context.Advance;                             // AS
+        SkipTypeQualifiers;                     // FB: "As Const <type>"
         if Context.Check(ttIdentifier) then PT := UpperCase(ParseDottedName);
         // Keep the "PTR" suffix on the parameter type (a "T PTR" param is an int address, not a T value).
         // Dropping it recorded a "Cat Ptr" parameter as "Cat", so the indirect call staged the argument
@@ -3071,6 +3075,7 @@ begin
   if IsFunc and Context.Check(ttAsType) then
   begin
     Context.Advance;                                 // AS
+    SkipTypeQualifiers;                     // FB: "As Const <type>"
     if Context.Check(ttIdentifier) then Node.Attributes.Values['FPRET'] := UpperCase(ParseDottedName);
     // Keep the "PTR" suffix on the return type too (a "T PTR" return is an int address).
     while UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR' do
@@ -3402,6 +3407,7 @@ begin
     if Context.Check(ttAsType) then
     begin
       Context.Advance;                              // AS
+      SkipTypeQualifiers;                     // FB: "As Const <type>"
       FieldTypeName := ParseRecordFieldType;
       LeadingType := True;
     end;
@@ -3425,6 +3431,7 @@ begin
       if (not LeadingType) and Context.Check(ttAsType) then
       begin
         Context.Advance;                            // AS
+        SkipTypeQualifiers;                     // FB: "As Const <type>"
         // FreeBASIC funcptr field "fn As Function(params) As R" / "As Sub(params)": record the signature
         // (int-banked entry PC) instead of a type name; "obj.fn(args)" is lowered as an indirect call.
         if Context.Check(ttProcedureStart) then
@@ -3666,6 +3673,7 @@ begin
   if Context.Check(ttAsType) then
   begin
     Context.Advance;                                // AS
+    SkipTypeQualifiers;                     // FB: "As Const <type>"
     if UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST' then Context.Advance;   // CONST
   end;
   Selector := ParseExpression;
@@ -3817,6 +3825,7 @@ begin
   if Context.Check(ttAsType) then
   begin
     Context.Advance;                              // AS
+    SkipTypeQualifiers;                     // FB: "As Const <type>"
     if Context.Check(ttIdentifier) then
     begin
       ForVarType := ParseDottedName;
@@ -5810,6 +5819,7 @@ begin
     end;
     if (UpperCase(Context.CurrentToken.Value) = kAS) or Context.Check(ttAsType) then
       Context.Advance;            // AS
+      SkipTypeQualifiers;                     // FB: "As Const <type>"
     if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
       Context.Advance;            // optional '#'
     if Context.Check(ttNumber) or Context.Check(ttInteger) then
@@ -7237,6 +7247,7 @@ begin
   if Context.Check(ttAsType) then
   begin
     Context.Advance;                                // AS
+    SkipTypeQualifiers;                     // FB: "As Const <type>"
     if Context.Check(ttIdentifier) then
     begin
       TypeTok := Context.CurrentToken;
@@ -7406,6 +7417,22 @@ begin
         InitList.AddChild(PadNode);
       end;
   end;
+end;
+
+procedure TPackratParser.SkipTypeQualifiers;
+// FreeBASIC lets a type be qualified read-only: "Dim y As Const Integer = 2", "ByRef x As Const
+// Integer", "Function f() ByRef As Const ZString". The qualifier binds to the TYPE, so it appears
+// exactly where a type name is expected - and every one of those sites checked for an identifier and
+// gave up on the keyword.
+//
+// ACCEPTED, NOT ENFORCED. The declaration parses and the program runs; assigning to such a variable
+// is not yet rejected the way fbc rejects it. That is a deliberate first step, not an oversight: the
+// examples demonstrate USING const data, and const-correctness is a separate piece of work with its
+// own diagnostics.
+begin
+  while Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttConstant) and
+        (UpperCase(Context.CurrentToken.Value) = 'CONST') do
+    Context.Advance;
 end;
 
 function TPackratParser.ParseDimensionList: TASTNode;
@@ -7635,6 +7662,7 @@ begin
   if LeadingAS then
   begin
     Context.Advance;                          // AS
+    SkipTypeQualifiers;                     // FB: "As Const <type>"
     // FreeBASIC "DIM AS TypeOf(expr) name": the type is inferred from an expression. Capture the
     // expression; each declared name gets it as child[1] with TYPEOF='1' and the concrete type is
     // resolved in the SSA pre-pass (like VAR's INFER, but with no initializer).
@@ -7743,6 +7771,7 @@ begin
         NameTok := Context.CurrentToken;
         Context.Advance;                       // name
         Context.Advance;                       // AS
+        SkipTypeQualifiers;                     // FB: "As Const <type>"
         // FreeBASIC function-pointer variable "DIM fp AS FUNCTION(...) AS ret": int-banked (holds an
         // entry PC); the signature is captured on a scratch node and copied onto the decl below.
         FuncPtrSigNode := nil;
@@ -8027,6 +8056,7 @@ begin
   if Context.Check(ttAsType) then
   begin
     Context.Advance;                                 // AS
+    SkipTypeQualifiers;                     // FB: "As Const <type>"
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected type name after AS', Context.CurrentToken);
@@ -8073,6 +8103,7 @@ begin
       Break;
     end;
     Context.Advance;                                 // AS
+    SkipTypeQualifiers;                     // FB: "As Const <type>"
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected type name after AS', Context.CurrentToken);
@@ -8172,6 +8203,7 @@ begin
   if RedimLeadingAS then
   begin
     Context.Advance;                          // AS
+    SkipTypeQualifiers;                     // FB: "As Const <type>"
     if Context.Check(ttIdentifier) then
     begin
       RedimTypeTok := Context.CurrentToken;
@@ -8358,6 +8390,7 @@ begin
   if Context.Check(ttAsType) then
   begin
     Context.Advance;                            // AS
+    SkipTypeQualifiers;                     // FB: "As Const <type>"
     if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam, ttEndOfFile]) then
       Context.Advance;                          // underlying integer type name
   end;
@@ -8655,6 +8688,7 @@ var
       if AllowItemType and Context.Check(ttAsType) then
       begin
         Context.Advance;                              // AS
+        SkipTypeQualifiers;                     // FB: "As Const <type>"
         ItemTypeTok := Context.CurrentToken;
         ItemType := 'INTEGER';
         if Context.Check(ttIdentifier) then
@@ -8704,6 +8738,7 @@ begin
   if Context.Check(ttAsType) then
   begin
     Context.Advance;                                  // AS
+    SkipTypeQualifiers;                     // FB: "As Const <type>"
     TypeTok := Context.CurrentToken;
     TypeName := 'INTEGER';
     if Context.Check(ttIdentifier) then
@@ -8757,6 +8792,7 @@ begin
     NameTok := Context.CurrentToken;
     Context.Advance;                                  // name
     Context.Advance;                                  // AS
+    SkipTypeQualifiers;                     // FB: "As Const <type>"
     TypeTok := Context.CurrentToken;
     TypeName := 'INTEGER';
     if Context.Check(ttIdentifier) then

@@ -2271,6 +2271,18 @@ begin
             AdvanceChar;
             Result := CreateToken(ttOpEq);
           end
+          else if GetCurrentChar = '>' then
+          begin
+            // FreeBASIC's "=>" initializer sign: "Dim As WString * 13 s => "hello"". The manual offers
+            // it as the alternative to plain '=' so a declaration does not read like an expression, and
+            // it means exactly the same thing - so it is folded here into one '=' and every place that
+            // accepts an initializer gets it for free, instead of each one having to peek for the '>'.
+            // Safe because "= >" is not a valid sequence otherwise: >= <= <> are their own tokens, and
+            // a comparison always has an operand between the two signs.
+            TokenBufferAdd(GetCurrentChar);
+            AdvanceChar;
+            Result := CreateToken(ttOpEq);
+          end
           else
             Result := CreateToken(ttOpEq); // Single =
           {$IFDEF DEBUG}
