@@ -173,6 +173,16 @@ type
     StoreIndex: Integer;      // position inside StoreBlock
   end;
 
+  // A scalar parameter that every call site supplies with the SAME literal. "Sub Foo(a(), n)" walked
+  // with "For i = 1 To n" is how BASIC scans an array, and the extent being known buys nothing while
+  // the LIMIT is an unknown parameter. Arguments ride the transfer bank: the caller stores into a
+  // slot right before ssaCallSub, the callee loads it in its entry block.
+  TCallParam = record
+    Entry: TSSABasicBlock;    // the callee's entry block
+    Slot: Integer;
+    Val: Int64;
+  end;
+
   TRangeAnalysis = class
   private
     FProgram: TSSAProgram;
@@ -181,6 +191,7 @@ type
     FDefRecs: array of TDefRec;
     FLoops: array of TLoopRec;
     FArrFacts: array of TArrFact;
+    FCallParams: array of TCallParam;
     FHasErrFlow: Boolean;       // ON ERROR / RESUME / TRAP present -> analysis disabled
     {$IFDEF DEBUG_RANGE}
     FStepWhy: string;           // why TraceStep gave up (diagnostics only)
@@ -192,6 +203,9 @@ type
     procedure BuildDefMap;
     procedure BuildArrayFacts;
     procedure BuildLoops;
+    procedure BuildCallArgs;
+    function EntryParamConst(Blk: TSSABasicBlock; Slot: Integer; out V: Int64): Boolean;
+    function XferSlotRange(Blk: TSSABasicBlock; Idx, Slot, Depth: Integer): TRange;
     function LoopOfHeader(H: TSSABasicBlock): Integer;
     function MkRange(ALo, AHi: Int64): TRange;
     function Unknown: TRange;
@@ -262,6 +276,19 @@ begin
   if GBindExtent < 0 then
     if GetEnvironmentVariable('B4BIND') = '0' then GBindExtent := 0 else GBindExtent := 1;
   Result := GBindExtent = 1;
+end;
+
+var
+  // Gate for reading a value out of a transfer slot - a procedure ARGUMENT (see XferSlotRange and
+  // BuildCallArgs), read once: -1 unknown, 0 = B4ARG=0, arguments stay opaque (the historical rule),
+  // 1 = follow them.
+  GArgRange: Integer = -1;
+
+function ArgumentRangeEnabled: Boolean;
+begin
+  if GArgRange < 0 then
+    if GetEnvironmentVariable('B4ARG') = '0' then GArgRange := 0 else GArgRange := 1;
+  Result := GArgRange = 1;
 end;
 
 constructor TRangeAnalysis.Create(AProgram: TSSAProgram);
@@ -636,6 +663,226 @@ begin
   if DebugRange then
     WriteLn('[Range] eligible arrays: ', DimSeen, '/', Length(FArrFacts));
   {$ENDIF}
+end;
+
+function TRangeAnalysis.EntryParamConst(Blk: TSSABasicBlock; Slot: Integer; out V: Int64): Boolean;
+var
+  k: Integer;
+begin
+  Result := False;
+  V := 0;
+  for k := 0 to High(FCallParams) do
+    if (FCallParams[k].Entry = Blk) and (FCallParams[k].Slot = Slot) then
+    begin
+      V := FCallParams[k].Val;
+      Exit(True);
+    end;
+end;
+
+function TRangeAnalysis.XferSlotRange(Blk: TSSABasicBlock; Idx, Slot, Depth: Integer): TRange;
+// What does this transfer slot hold at this point? Walk BACKWARD to the store that put it there.
+//
+// This is not an interprocedural question at all, and that is the point: the SSA inliner takes the
+// callee's body into the caller, but the argument still round-trips through the transfer bank -
+// XferStore in the caller, XferLoad in what used to be the prologue. So "Sub Foo(a(), n)" called
+// with a constant keeps an UNKNOWN loop limit even after inlining, purely because the value passes
+// through a slot the analysis could not read.
+//
+// Sound because the walk stops at anything that could have written the slot behind our back:
+//   * any CALL (a callee stages its own arguments through these same slots);
+//   * a store to the same slot - that one IS the value;
+//   * a block with anything other than exactly one predecessor, so the path walked is the only path
+//     that reaches the load, and the last store on it is the one that executed.
+// Capped at 4 blocks, which also stops a unique-predecessor chain that loops.
+var
+  Cur: TSSABasicBlock;
+  i, hops: Integer;
+  Ins: TSSAInstruction;
+begin
+  Result := Unknown;
+  if Depth > MAX_DEPTH then Exit;
+  Cur := Blk;
+  i := Idx - 1;
+  for hops := 0 to 4 do
+  begin
+    while i >= 0 do
+    begin
+      Ins := Cur.Instructions[i];
+      if OpIn(Ins.OpCode, [ssaCall, ssaCallSub, ssaCallSubIndirect]) then Exit;
+      if (Ins.OpCode = ssaXferStoreInt) and (Ins.Src3.Kind = svkConstInt) and
+         (Ins.Src3.ConstInt = Slot) then
+        Exit(EvalRange(Ins.Src1, Cur, i, Depth + 1));
+      Dec(i);
+    end;
+    if Cur.Predecessors.Count <> 1 then Exit;
+    Cur := TSSABasicBlock(Cur.Predecessors[0]);
+    i := Cur.Instructions.Count - 1;
+  end;
+end;
+
+procedure TRangeAnalysis.BuildCallArgs;
+// Interprocedural, and deliberately the narrowest useful shape: a scalar INT parameter that EVERY
+// call site supplies with the same literal. That is enough for "Sub Foo(a(), n)" called as
+// "Foo(a(), N)", which is how BASIC walks an array and which no amount of extent knowledge could
+// prove while the loop's limit stayed unknown.
+//
+// SOUNDNESS SCREENS, all required:
+//   * the whole analysis is off if the program can call through a POINTER (ssaCallSubIndirect) or
+//     takes a procedure's address (ssaLoadProcAddr): either can reach a procedure with arguments
+//     this scan never sees;
+//   * EVERY predecessor of the entry block must be a block that ends in a call to it - a procedure
+//     reachable any other way (fall-through, GOTO) receives whatever the slot happened to hold;
+//   * the staging store must sit in the SAME block as the call (blocks are basic, so the last store
+//     to a slot before the call is the one that reaches it). A call site whose store is elsewhere
+//     drops the whole slot, not just itself;
+//   * the value must be a literal at every site, and the same one. A recursive call passing "n-1"
+//     fails this and takes the parameter with it - which is correct: the value is not invariant.
+const
+  MAX_BACK = 64;      // argument staging sits immediately before the call
+var
+  b, i, j, k, p, nEntries: Integer;
+  Blk, Entry, PredB: TSSABasicBlock;
+  Ins: TSSAInstruction;
+  Entries: TFPList;
+  Slots: array of Integer;
+  Vals: array of Int64;
+  Seen: array of Boolean;
+  First: Boolean;
+  C: Int64;
+  Ok: Boolean;
+
+  function LiveBlock(B2: TSSABasicBlock): Boolean;
+  // Is this block still part of the program? FindBlock answers from a label map that can outlive the
+  // block itself - an inlined procedure's original body is removed from Blocks, and walking the
+  // predecessors of a stale one is how this pass first crashed ("List index out of bounds").
+  var m: Integer;
+  begin
+    Result := False;
+    if not Assigned(B2) then Exit;
+    for m := 0 to FProgram.Blocks.Count - 1 do
+      if FProgram.Blocks[m] = B2 then Exit(True);
+  end;
+
+  function CallTargetOf(B2: TSSABasicBlock; out Idx: Integer): TSSABasicBlock;
+  // The ssaCallSub that ends this block, and the entry block it names.
+  var m: Integer;
+  begin
+    Result := nil; Idx := -1;
+    if not Assigned(B2) then Exit;
+    for m := B2.Instructions.Count - 1 downto 0 do
+      if B2.Instructions[m].OpCode = ssaCallSub then
+      begin
+        if B2.Instructions[m].Dest.Kind <> svkLabel then Exit;
+        Result := FProgram.FindBlock(B2.Instructions[m].Dest.LabelName);
+        if not LiveBlock(Result) then Result := nil;
+        Idx := m;
+        Exit;
+      end;
+  end;
+
+  procedure ScanSite(CallBlk: TSSABasicBlock; CallIdx: Integer);
+  // Collect slot -> literal for one call site, then intersect with what previous sites gave.
+  var
+    m, s, q, lo: Integer;
+    Ins2: TSSAInstruction;
+    LocalSlot: array of Integer;
+    LocalVal: array of Int64;
+    found: Boolean;
+  begin
+    SetLength(LocalSlot, 0); SetLength(LocalVal, 0);
+    lo := CallIdx - MAX_BACK; if lo < 0 then lo := 0;
+    for m := CallIdx - 1 downto lo do
+    begin
+      Ins2 := CallBlk.Instructions[m];
+      if Ins2.OpCode <> ssaXferStoreInt then Continue;
+      if Ins2.Src3.Kind <> svkConstInt then Continue;
+      s := Ins2.Src3.ConstInt;
+      found := False;
+      for q := 0 to High(LocalSlot) do
+        if LocalSlot[q] = s then begin found := True; Break; end;
+      if found then Continue;              // a later store already won this slot
+      if not ConstOf(Ins2.Src1, C) then Continue;
+      SetLength(LocalSlot, Length(LocalSlot) + 1);
+      SetLength(LocalVal, Length(LocalVal) + 1);
+      LocalSlot[High(LocalSlot)] := s;
+      LocalVal[High(LocalVal)] := C;
+    end;
+    if First then
+    begin
+      SetLength(Slots, Length(LocalSlot)); SetLength(Vals, Length(LocalVal));
+      for q := 0 to High(LocalSlot) do begin Slots[q] := LocalSlot[q]; Vals[q] := LocalVal[q]; end;
+      SetLength(Seen, Length(Slots));
+      First := False;
+      Exit;
+    end;
+    // Intersect: a slot survives only if this site gives it the same literal.
+    for q := 0 to High(Slots) do
+    begin
+      if Slots[q] < 0 then Continue;
+      found := False;
+      for s := 0 to High(LocalSlot) do
+        if (LocalSlot[s] = Slots[q]) and (LocalVal[s] = Vals[q]) then begin found := True; Break; end;
+      if not found then Slots[q] := -1;
+    end;
+  end;
+
+begin
+  SetLength(FCallParams, 0);
+  if not ArgumentRangeEnabled then Exit;
+  // Screen 1: any call through a pointer, or any procedure whose address is taken, and we stop.
+  for b := 0 to FProgram.Blocks.Count - 1 do
+  begin
+    Blk := FProgram.Blocks[b];
+    for i := 0 to Blk.Instructions.Count - 1 do
+      if OpIn(Blk.Instructions[i].OpCode, [ssaCallSubIndirect, ssaLoadProcAddr]) then Exit;
+  end;
+  Entries := TFPList.Create;
+  try
+    // Distinct call targets.
+    for b := 0 to FProgram.Blocks.Count - 1 do
+    begin
+      Entry := CallTargetOf(FProgram.Blocks[b], i);
+      if Assigned(Entry) and (Entries.IndexOf(Entry) < 0) then Entries.Add(Entry);
+    end;
+    nEntries := Entries.Count;
+    for k := 0 to nEntries - 1 do
+    begin
+      Entry := TSSABasicBlock(Entries[k]);
+      // Screen 2: every way into this block must be a call to it.
+      Ok := Entry.Predecessors.Count > 0;
+      for p := 0 to Entry.Predecessors.Count - 1 do
+      begin
+        PredB := TSSABasicBlock(Entry.Predecessors[p]);
+        // A predecessor can itself be stale for the same reason - check before touching it.
+        if not LiveBlock(PredB) then begin Ok := False; Break; end;
+        if CallTargetOf(PredB, i) <> Entry then begin Ok := False; Break; end;
+      end;
+      if not Ok then Continue;
+      First := True;
+      SetLength(Slots, 0); SetLength(Vals, 0);
+      for p := 0 to Entry.Predecessors.Count - 1 do
+      begin
+        PredB := TSSABasicBlock(Entry.Predecessors[p]);
+        if CallTargetOf(PredB, i) <> Entry then Continue;
+        ScanSite(PredB, i);
+      end;
+      for j := 0 to High(Slots) do
+        if Slots[j] >= 0 then
+        begin
+          SetLength(FCallParams, Length(FCallParams) + 1);
+          FCallParams[High(FCallParams)].Entry := Entry;
+          FCallParams[High(FCallParams)].Slot := Slots[j];
+          FCallParams[High(FCallParams)].Val := Vals[j];
+          {$IFDEF DEBUG_RANGE}
+          if DebugRange then
+            WriteLn('[Range] param @', Entry.LabelName, ' slot ', Slots[j], ' = ', Vals[j],
+                    ' at all ', Entry.Predecessors.Count, ' call sites');
+          {$ENDIF}
+        end;
+    end;
+  finally
+    Entries.Free;
+  end;
 end;
 
 procedure TRangeAnalysis.BuildLoops;
@@ -1472,7 +1719,7 @@ function TRangeAnalysis.DefValueRange(Instr: TSSAInstruction; Blk: TSSABasicBloc
 // where EvalRange cannot pick a def itself). Operand positions are the def's.
 var
   DimR: TRange;
-  Ub: Int64;
+  Ub, PV: Int64;
 begin
   Result := Unknown;
   if Depth > MAX_DEPTH then Exit;
@@ -1493,6 +1740,19 @@ begin
                          EvalRange(Instr.Src2, Blk, InstrIdx, Depth + 1));
     ssaArrayLoad:
       Result := BackingLoadRange(Instr, Blk, InstrIdx, Depth);
+    // A scalar parameter every call site supplies with the same literal (see BuildCallArgs). Only in
+    // the callee's ENTRY block: that is where the prologue reads its arguments, and it is the only
+    // point at which the slot is known to still hold what the call staged.
+    ssaXferLoadInt:
+      if ArgumentRangeEnabled and (Instr.Src3.Kind = svkConstInt) then
+      begin
+        // The call that survived as a call: every site staged the same literal.
+        if EntryParamConst(Blk, Instr.Src3.ConstInt, PV) then
+          Result := MkRange(PV, PV)
+        else
+          // The call the inliner already absorbed: the store is right there in the stream.
+          Result := XferSlotRange(Blk, InstrIdx, Instr.Src3.ConstInt, Depth);
+      end;
     // LBOUND(arr, 0) on an array whose declared lower bound is a compile-time constant. This is not
     // an optional refinement: the subscript of an array PARAMETER lowers to "index - LBOUND(arr, 0)"
     // because the callee cannot know the caller's lower bound, so without this every index reached
@@ -1578,6 +1838,9 @@ begin
     {$ENDIF}
     Exit;
   end;
+  // Before the array facts: their extents can come from a Const backing whose value is staged like
+  // any other argument, and the loop screens below read parameter ranges too.
+  BuildCallArgs;
   BuildArrayFacts;
   BuildLoops;
   for b := 0 to FProgram.Blocks.Count - 1 do
