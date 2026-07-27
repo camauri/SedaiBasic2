@@ -178,6 +178,17 @@ type
     FPreScanInProc: Boolean;
     FCurrentProcRetType: TSSARegisterType;
     FCurrentProcIsFunction: Boolean;
+    // The default-initialisation of the scalar result slot, emitted at the top of every FUNCTION
+    // (FreeBASIC: an unset result reads 0 / ""). A function whose every reachable exit stages its own
+    // result never observes it -- and it is not free: it is TWO more dispatches per ACTIVATION, which
+    // on a recursive function is around a tenth of the whole body. Whether any exit leaves it unset is
+    // only knowable once the body has been lowered, so it is emitted anyway and these fields let us take
+    // it back: the two instructions to revoke, and the tally NoteFrameReturn keeps of the reachable
+    // frame returns and of how many of them staged a result. See ProcessProcedure.
+    FResultInitOp: TSSAInstruction;       // the ssaXferStore* into XFER_RESULT_SLOT (nil = nothing to revoke)
+    FResultInitConstOp: TSSAInstruction;  // the load of the zero it stores, when one was materialised
+    FResultExits: Integer;                // reachable ssaReturnSub emitted in this function
+    FResultExitsStaged: Integer;          // ... of which staged the result on the same path
     FCurrentProcRetRecType: string;   // V3: UDT type the current FUNCTION returns by value (else '')
     FCurrentResultHandle: TSSAValue;  // V3: register holding the caller's result-instance handle
     FCurrentProcLocalRecs: TStringList;  // V5: "VARNAME|TYPENAME" of the proc's DIM'd local UDTs
@@ -384,6 +395,7 @@ type
     procedure BlockScopeEnter(IsLoopBody: Boolean = False);  // M8: open a block scope (loop/IF/SCOPE) (mark push)
     function LastEmitted: TSSAInstruction;                   // the instruction EmitInstruction just appended (nil if none)
     procedure TrackRecMarkOp(FrameIdx: Integer; Instr: TSSAInstruction);  // remember a block's record-mark op, so it can be revoked
+    procedure NoteFrameReturn(ResultStaged: Boolean);    // tally a reachable frame return, for the result-init revocation
     procedure BlockScopeExit;                            // M8: close it (destructors + mark pop, then drop)
     procedure EmitBlockScopeCleanup(Idx: Integer);       // M8: destructors + mark pop for scope Idx (no drop)
     procedure EmitAllBlockScopesCleanup;                 // M8: unwind every active block scope (early frame exit)
@@ -829,6 +841,18 @@ const
   // bcCallSub frame save/restore). Assigned from this base upward, per bank — kept well below the
   // result slots (254/255) and above any realistic argument-slot count (parameters use slots 0..N).
   SHARED_SLOT_BASE = 128;
+
+var
+  // Tri-state gate for the result-default revocation (see NoteFrameReturn), read once: -1 unknown,
+  // 0 = RETINIT=0, keep every default as it was historically emitted, 1 = revoke the dead ones.
+  GResultInitElide: Integer = -1;
+
+function ResultInitElide: Boolean;
+begin
+  if GResultInitElide < 0 then
+    if GetEnvironmentVariable('RETINIT') = '0' then GResultInitElide := 0 else GResultInitElide := 1;
+  Result := GResultInitElide = 1;
+end;
 
 constructor TSSAGenerator.Create;
 var
@@ -1476,6 +1500,18 @@ begin
   n := Length(FScopeStack[FrameIdx].RecMarkOps);
   SetLength(FScopeStack[FrameIdx].RecMarkOps, n + 1);
   FScopeStack[FrameIdx].RecMarkOps[n] := Instr;
+end;
+
+procedure TSSAGenerator.NoteFrameReturn(ResultStaged: Boolean);
+// Record one reachable frame return of the FUNCTION being lowered, and whether the path that reaches it
+// staged the result slot itself. ProcessProcedure revokes the entry default-initialisation only when
+// EVERY reachable return staged one -- an EXIT FUNCTION, a bare RETURN or a fall-off-the-end body all
+// leave the slot as the prologue set it, and the caller would otherwise read the PREVIOUS call's value.
+// Silent when there is no initialisation to revoke (a SUB, a UDT-by-value or BYREF result).
+begin
+  if FResultInitOp = nil then Exit;
+  Inc(FResultExits);
+  if ResultStaged then Inc(FResultExitsStaged);
 end;
 
 // Overload without hint - creates empty hint internally
@@ -23070,7 +23106,8 @@ var
   Proc, NameNode, ParamList, ParamNodeJ, BaseCallNode: TASTNode;
   Name, LabelName, ParentType: string;
   RT: TSSARegisterType;
-  ParamReg, LcHandle: TSSAValue;
+  ParamReg, LcHandle, RetZeroReg: TSSAValue;
+  TrailingReturnLive: Boolean;
   {$IFDEF DEBUG_SSAPROF}
   ProfProcT0, ProfProcT1, ProfProcFq: Int64;
   {$ENDIF}
@@ -23097,6 +23134,10 @@ begin
     FCurrentProcByrefRet := IsByrefRetFunc(Name);         // BYREF result: the function returns an address
     FCurrentProcRetRecType := VarRecordTypeName(Name);   // V3: '' unless it returns a UDT by value
     FCurrentResultHandle := MakeSSAValue(svkNone);
+    FResultInitOp := nil;                                 // result-init revocation: nothing emitted yet for THIS proc
+    FResultInitConstOp := nil;
+    FResultExits := 0;
+    FResultExitsStaged := 0;
     FCurrentProcLocalRecs.Clear;                          // V5: gather DIM'd local UDTs for dtors
     FCurrentProcByvalRecs.Clear;                          // V5d: BYVAL UDT param copies (filled in prologue)
     FCurrentProcByrefScalars.Clear;                       // BYREF: explicit-BYREF scalar params (filled in prologue)
@@ -23240,13 +23281,28 @@ begin
     // XFER_RESULT_SLOT is global VM state reused across calls, so a function that exits without setting
     // its result (EXIT FUNCTION / fall-through) would otherwise return the PREVIOUS call's value. A
     // UDT-by-value result (handled above) and a BYREF-return address both have their own paths.
+    // It is TWO instructions per activation, so the constant is materialised here rather than inside
+    // EmitXferStore: that way BOTH are known and NoteFrameReturn's tally can revoke them together when
+    // no exit can be reached with the result still unset (see ProcessProcedure's tail).
     if FCurrentProcIsFunction and (FCurrentProcRetRecType = '') and (not FCurrentProcByrefRet) then
     begin
       case FCurrentProcRetType of
-        srtFloat:  EmitXferStore(srtFloat,  XFER_RESULT_SLOT, MakeSSAConstFloat(0.0));
-        srtString: EmitXferStore(srtString, XFER_RESULT_SLOT, MakeSSAConstString(''));
-      else         EmitXferStore(srtInt,    XFER_RESULT_SLOT, MakeSSAConstInt(0));
+        srtFloat:  RetZeroReg := EnsureFloatRegister(MakeSSAConstFloat(0.0));
+        srtString: RetZeroReg := EnsureStringRegister(MakeSSAConstString(''));
+      else         RetZeroReg := EnsureIntRegister(MakeSSAConstInt(0));
       end;
+      // Only a plain constant load counts as ours to revoke: if Ensure*Register found the value already
+      // in a register (or emitted something else), leaving that instruction alone costs one instruction,
+      // while revoking a stranger's would cost a live value.
+      FResultInitConstOp := LastEmitted;
+      if (FResultInitConstOp <> nil) and
+         not ((FResultInitConstOp.OpCode in [ssaLoadConstInt, ssaLoadConstFloat, ssaLoadConstString]) and
+              (FResultInitConstOp.Dest.Kind = svkRegister) and (RetZeroReg.Kind = svkRegister) and
+              (FResultInitConstOp.Dest.RegType = RetZeroReg.RegType) and
+              (FResultInitConstOp.Dest.RegIndex = RetZeroReg.RegIndex)) then
+        FResultInitConstOp := nil;
+      EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, RetZeroReg);
+      FResultInitOp := LastEmitted;
     end;
 
     // M6: prologue — load shared globals from their slots into their registers, so the body sees the
@@ -23289,14 +23345,35 @@ begin
     for j := 2 to Proc.ChildCount - 1 do
       ProcessStatement(Proc.GetChild(j));
 
-    // Guarantee a trailing return frame (covers a fall-off-the-end body).
-    if not Assigned(FCurrentBlock) then
+    // Guarantee a trailing return frame (covers a fall-off-the-end body). When the body already
+    // terminated every path (FCurrentBlock nil), this one sits in a FRESH block nothing branches to:
+    // it is unreachable, so it must not be counted as an exit that leaves the result unset.
+    TrailingReturnLive := Assigned(FCurrentBlock);
+    if not TrailingReturnLive then
       FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel(LabelName + '_END'));
     EmitFrameDestructors;   // V5: destroy local UDTs on the fall-through exit path
     EmitSharedSyncOut;      // M6: publish shared-global changes to their slots before returning
     EmitByrefParamStore;    // BYREF: publish explicit-BYREF scalar params back to their slots
     EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    if TrailingReturnLive then
+      NoteFrameReturn(False);   // falling off the end returns the default (or an "fname = expr" store)
+    // The body is fully lowered now, so we finally know whether the prologue's result default can ever
+    // be observed: if every reachable frame return staged a result of its own, it cannot, and the two
+    // instructions that set it are dead weight on EVERY activation. Revoke them together (ssaNop; the
+    // bytecode compiler drops those outright). A function with no reachable return at all -- and any
+    // path that did NOT stage: EXIT FUNCTION, a bare RETURN, a fall-through end, or an "fname = expr"
+    // whose store this tally does not see -- keeps the default, which is what FreeBASIC requires.
+    // RETINIT=0 keeps every default (the historical emission), so the two arrangements are A/B-able on
+    // ONE binary: the gate only skips this revocation, nothing upstream of it.
+    if (FResultInitOp <> nil) and (FResultExits > 0) and (FResultExits = FResultExitsStaged) and
+       ResultInitElide then
+    begin
+      FResultInitOp.OpCode := ssaNop;
+      if FResultInitConstOp <> nil then FResultInitConstOp.OpCode := ssaNop;
+    end;
+    FResultInitOp := nil;
+    FResultInitConstOp := nil;
     if FModernMode then ScopePopFrame;   // FB scope: close the procedure-root frame
     FCurrentBlock := nil;   // procedure body terminated
     FInProcedure := False;
@@ -23724,6 +23801,7 @@ begin
           EmitByrefParamStore;    // BYREF: publish explicit-BYREF scalar params back to their slots
           EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          NoteFrameReturn(False);   // EXIT FUNCTION returns whatever the slot holds -- keep the default
           FCurrentBlock := nil;
         end
         else if Length(FLoopStack) > 0 then
@@ -23757,6 +23835,7 @@ begin
           EmitByrefParamStore;    // BYREF: publish explicit-BYREF scalar params back to their slots
           EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          NoteFrameReturn(False);   // bare EXIT stages nothing -- keep the default
           FCurrentBlock := nil;
         end
         else
@@ -23809,6 +23888,9 @@ begin
         EmitByrefParamStore;    // BYREF: publish explicit-BYREF scalar params back to their slots
         EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // "RETURN expr" in a scalar FUNCTION staged the result just above; a bare RETURN did not, and
+        // leaves the prologue's default standing. (NoteFrameReturn is silent unless there is one.)
+        NoteFrameReturn((Node.ChildCount > 0) and FCurrentProcIsFunction);
         FCurrentBlock := nil;
       end
       else
