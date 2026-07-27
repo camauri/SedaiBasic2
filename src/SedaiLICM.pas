@@ -543,7 +543,29 @@ begin
     begin
       Pred := TSSABasicBlock(Loop.Header.Predecessors[i]);
       if not Loop.ContainsBlock(Pred) then
+      begin
+        // A predecessor that reaches the header by CALLING it is not an entry edge, and this
+        // routine would treat it as one: further down it rewrites every jump target in Pred that
+        // names the header, and a bcCallSub carries its target in Dest exactly like a jump. The
+        // call would then land on the pre-header, which becomes the procedure's entry point (the
+        // frame diagnostic shows it as "<PROC>_prehead isTarget=True", with the real entry
+        // isTarget=False) -- and whatever LICM hoists there is written in one frame unit and read
+        // in another, with nothing to keep it alive across the calls in between. The value only
+        // survives by accident of which register the allocator happened to pick.
+        // A header reached by a call is not a loop header at all: it is one end of a call/return
+        // cycle, the same shape strength reduction and loop unroll had to stop taking for a loop.
+        // Decline the whole pre-header - the caller already handles Loop.PreHeader staying nil.
+        if IsCallEdge(Pred, Loop.Header) then
+        begin
+          {$IFDEF DEBUG_LICM}
+          if DebugLICM then
+            WriteLn('[LICM] Loop ', Loop.Header.LabelName,
+                    ' is entered by a CALL from ', Pred.LabelName, ' - no pre-header');
+          {$ENDIF}
+          Exit;
+        end;
         EntryPreds.Add(Pointer(Pred));
+      end;
     end;
 
     // If no entry predecessors or only one that's already effectively a pre-header, skip
