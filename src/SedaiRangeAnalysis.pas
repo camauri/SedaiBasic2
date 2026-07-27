@@ -142,6 +142,26 @@ type
     SymExtent: Boolean;
     SymUb: TSSAValue;         // the dimension register: size = SymUb - SymLb + 1
     SymLb: Int64;
+    // ARRAY PARAMETERS. A procedure's array parameter is a PLACEHOLDER slot that a call site aliases
+    // to the caller's array (ssaArrayBind, the caller's id in Src3). Neither side could be proven:
+    // the placeholder has no extent of its own, and the caller's array was disqualified outright for
+    // being passed anywhere. On real programs that is where most unproven accesses live - 83% of them
+    // on the Rosetta corpus - and it is pure bounds check: the two hot loops, one over a parameter
+    // and one over a module array, are instruction-for-instruction identical apart from the "safe"
+    // mark, and the parameter one runs 37% slower on --aot.
+    // So the placeholder borrows the extent of what is bound to it, when every bind site agrees.
+    // Declared lower bound of dimension 0, when it is a compile-time constant. Needed because the
+    // subscript of an array PARAMETER lowers to "index - LBOUND(arr, 0)": the callee cannot know the
+    // caller's lower bound, so the generator reads it at runtime and the index becomes opaque. Once
+    // the placeholder knows what it is bound to, that read has a known value.
+    LbKnown: Int64;
+    LbIsKnown: Boolean;
+    Sound: Boolean;           // passed every screen EXCEPT the passed-to-a-procedure one
+    PassedToProc: Boolean;    // named as an argument by some ssaArrayBind (caller side)
+    SizeKnown: Int64;         // constant extent, computed whether or not the array is Eligible
+    BindTarget: Integer;      // caller array bound to this placeholder: -1 none, -2 conflicting
+    BindCount: Integer;
+    BindOpaque: Boolean;      // bound from a runtime handle (ssaArrayBindInd): extent unknowable
     DimBlock: TSSABasicBlock; // block of the single ssaArrayDim
     DimIndex: Integer;        // its index inside DimBlock
     // Single-store tracking (const-backing forwarding): a size-1 array written
@@ -229,6 +249,19 @@ begin
   if GSymExtent < 0 then
     if GetEnvironmentVariable('B4SYM') = '0' then GSymExtent := 0 else GSymExtent := 1;
   Result := GSymExtent = 1;
+end;
+
+var
+  // Gate for giving a procedure's array PARAMETER the extent of what is bound to it (see the
+  // placeholder screen in BuildArrayFacts), read once: -1 unknown, 0 = B4BIND=0, no placeholder is
+  // ever eligible (the historical rule), 1 = borrow the extent when every bind site agrees.
+  GBindExtent: Integer = -1;
+
+function PlaceholderExtentEnabled: Boolean;
+begin
+  if GBindExtent < 0 then
+    if GetEnvironmentVariable('B4BIND') = '0' then GBindExtent := 0 else GBindExtent := 1;
+  Result := GBindExtent = 1;
 end;
 
 constructor TRangeAnalysis.Create(AProgram: TSSAProgram);
@@ -338,11 +371,15 @@ procedure TRangeAnalysis.BuildArrayFacts;
 const
   // Ops that may carry an svkArrayRef WITHOUT invalidating the constant-extent
   // proof. Anything else touching the array excludes it (default-deny).
-  BENIGN: array[0..6] of TSSAOpCode = (
+  BENIGN: array[0..8] of TSSAOpCode = (
     ssaArrayLoad, ssaArrayStore, ssaArrayDim, ssaArrayLBound, ssaArrayUBound,
-    ssaArrayIdxPush, ssaArrayIdxResolve);
+    ssaArrayIdxPush, ssaArrayIdxResolve,
+    // The bind pair names the PLACEHOLDER in Src1. It does not reshape anything - it aliases, and
+    // the alias is exactly what the placeholder's extent is inferred FROM (see BindTarget below), so
+    // it must not disqualify it. ssaArrayBindInd stays out on purpose: it binds a runtime handle.
+    ssaArrayBind, ssaArrayUnbind);
 var
-  a, b, i, d, DimSeen: Integer;
+  a, b, bt, i, d, DimSeen: Integer;
   Info: TSSAArrayInfo;
   Blk: TSSABasicBlock;
   Instr: TSSAInstruction;
@@ -356,7 +393,7 @@ var
   begin
     if (ArrId < 0) or (ArrId > High(FArrFacts)) then Exit;
     if not OpIn(Op, BENIGN) then
-      FArrFacts[ArrId].Eligible := False;
+      FArrFacts[ArrId].Sound := False;
   end;
 
   procedure TouchOperand(const V: TSSAValue; Op: TSSAOpCode);
@@ -369,6 +406,14 @@ begin
   for a := 0 to High(FArrFacts) do
   begin
     FArrFacts[a].Eligible := True;    // tentative; the screens below clear it
+    FArrFacts[a].LbKnown := 0;
+    FArrFacts[a].LbIsKnown := False;
+    FArrFacts[a].Sound := True;       // ditto, minus the passed-to-a-procedure screen
+    FArrFacts[a].PassedToProc := False;
+    FArrFacts[a].SizeKnown := 0;
+    FArrFacts[a].BindTarget := -1;
+    FArrFacts[a].BindCount := 0;
+    FArrFacts[a].BindOpaque := False;
     FArrFacts[a].TotalSize := 0;
     FArrFacts[a].SymExtent := False;
     FArrFacts[a].SymLb := 0;
@@ -390,16 +435,38 @@ begin
       TouchOperand(Instr.Src1, Instr.OpCode);
       TouchOperand(Instr.Src2, Instr.OpCode);
       TouchOperand(Instr.Src3, Instr.OpCode);
+      // A bind records BOTH sides: the caller's array is passed to a procedure (which today ends its
+      // own eligibility, unchanged), and the callee's PLACEHOLDER learns what it is aliased to.
       if (Instr.OpCode = ssaArrayBind) and (Instr.Src3.Kind = svkConstInt) and
          (Instr.Src3.ConstInt >= 0) and (Instr.Src3.ConstInt <= High(FArrFacts)) then
-        FArrFacts[Instr.Src3.ConstInt].Eligible := False;
+      begin
+        FArrFacts[Instr.Src3.ConstInt].PassedToProc := True;
+        if Instr.Src1.Kind = svkArrayRef then
+        begin
+          a := Instr.Src1.ArrayIndex;
+          if (a >= 0) and (a <= High(FArrFacts)) then
+          begin
+            Inc(FArrFacts[a].BindCount);
+            if FArrFacts[a].BindCount = 1 then
+              FArrFacts[a].BindTarget := Instr.Src3.ConstInt
+            else if FArrFacts[a].BindTarget <> Instr.Src3.ConstInt then
+              FArrFacts[a].BindTarget := -2;   // bound to different arrays: no single extent
+          end;
+        end;
+      end;
+      // Bound from a RUNTIME handle (a UDT array member): nothing can be known about the extent.
+      if (Instr.OpCode = ssaArrayBindInd) and (Instr.Src1.Kind = svkArrayRef) then
+      begin
+        a := Instr.Src1.ArrayIndex;
+        if (a >= 0) and (a <= High(FArrFacts)) then FArrFacts[a].BindOpaque := True;
+      end;
       if (Instr.OpCode = ssaArrayDim) and (Instr.Src1.Kind = svkArrayRef) then
       begin
         a := Instr.Src1.ArrayIndex;
         if (a >= 0) and (a <= High(FArrFacts)) then
         begin
           if FArrFacts[a].DimBlock <> nil then
-            FArrFacts[a].Eligible := False   // second DIM: extent no longer single-valued
+            FArrFacts[a].Sound := False   // second DIM: extent no longer single-valued
           else
           begin
             FArrFacts[a].DimBlock := Blk;
@@ -420,10 +487,16 @@ begin
       end;
     end;
   end;
-  // An array never DIM'd is never proven (its descriptor may be empty).
+  // An array never DIM'd is never proven (its descriptor may be empty) - except a placeholder, whose
+  // extent comes from the array bound to it and which is resolved after the size screen below.
+  // NOTE: having a DIM is NOT part of Sound. Sound means "only benign ops touch it, and it is not
+  // dimensioned twice" - a placeholder satisfies that and has no DIM at all, which is the whole
+  // point. The DIM requirement belongs to the arrays that carry their own extent.
   for a := 0 to High(FArrFacts) do
-    if FArrFacts[a].DimBlock = nil then
-      FArrFacts[a].Eligible := False;
+    // The caller-side rule, unchanged in effect: an array passed to a procedure is not proven for
+    // its OWN accesses. Its extent facts now survive, because the placeholder needs them.
+    FArrFacts[a].Eligible := FArrFacts[a].Sound and (FArrFacts[a].DimBlock <> nil) and
+                             not FArrFacts[a].PassedToProc;
   // Size screen: constant extents only, no runtime lower bounds. A dimension is
   // static if Dimensions[d] > 0 (compile-time size) OR its dim register - the
   // generator materializes even a CONSTANT upper bound into a register ("Dim
@@ -434,7 +507,10 @@ begin
   DimSeen := 0;
   for a := 0 to High(FArrFacts) do
   begin
-    if not FArrFacts[a].Eligible then Continue;
+    // Sound, not Eligible: an array passed to a procedure still needs its extent computed, because
+    // the placeholder aliased to it borrows exactly that. A DIM is required here (this screen reads
+    // the declared extent); a placeholder has none and is handled after this loop.
+    if not (FArrFacts[a].Sound and (FArrFacts[a].DimBlock <> nil)) then Continue;
     Info := FProgram.GetArray(a);
     {$IFDEF DEBUG_RANGE}
     if DebugRange then
@@ -450,6 +526,16 @@ begin
     for d := 0 to High(Info.LowerBoundRegisters) do
       if Info.LowerBoundRegisters[d] >= 0 then HasLbRegs := True;
     if HasLbRegs then Continue;
+    // No runtime lower bounds past this point, so dimension 0's is declared and constant. An ABSENT
+    // entry means the default 0 - "Dim d(0 To N-1)" records no lower bound at all, and reading that
+    // as "unknown" silently cost every zero-based array its placeholder proof. Same default the
+    // extent computation below uses.
+    if Info.DimCount >= 1 then
+    begin
+      if 0 <= High(Info.LowerBounds) then FArrFacts[a].LbKnown := Info.LowerBounds[0]
+      else FArrFacts[a].LbKnown := 0;
+      FArrFacts[a].LbIsKnown := True;
+    end;
     Total := 1;
     for d := 0 to Info.DimCount - 1 do
     begin
@@ -488,7 +574,7 @@ begin
         UbVal := MakeSSARegister(srtInt, Info.DimRegisters[0]);
         if FindDef(UbVal, UbDef) then
         begin
-          FArrFacts[a].Eligible := True;
+          FArrFacts[a].Eligible := not FArrFacts[a].PassedToProc;
           FArrFacts[a].SymExtent := True;
           FArrFacts[a].SymUb := UbVal;
           if 0 <= High(Info.LowerBounds) then FArrFacts[a].SymLb := Info.LowerBounds[0];
@@ -503,10 +589,49 @@ begin
       end;
       Continue;
     end;
-    FArrFacts[a].Eligible := True;
+    FArrFacts[a].SizeKnown := Total;                          // kept even when not Eligible
+    FArrFacts[a].Eligible := not FArrFacts[a].PassedToProc;
     FArrFacts[a].TotalSize := Total;
     Inc(DimSeen);
   end;
+  // Placeholder screen: a procedure's array parameter borrows the extent of what is bound to it.
+  // Requirements, each one a soundness screen:
+  //   * at least one ssaArrayBind, and every one of them names the SAME caller array (BindTarget
+  //     goes to -2 the moment two disagree) - otherwise there is no single extent to speak of;
+  //   * never bound from a runtime handle (ssaArrayBindInd);
+  //   * the placeholder itself passed the ordinary screens - the bind pair is benign FOR IT by
+  //     definition, since it aliases rather than reshapes;
+  //   * the target has a COMPILE-TIME extent and passed its own screens.
+  // The dominance anchor is the TARGET's DIM, not the bind: the extent is established there, the
+  // access touches that same memory, and a module-level DIM dominates procedure bodies through the
+  // call edges this CFG has. A SYMBOLIC extent is deliberately not forwarded - the register naming
+  // it is not in scope inside the callee.
+  // B4BIND=0 restores the old behaviour (no placeholder is ever eligible) for a one-binary A/B.
+  if PlaceholderExtentEnabled then
+    for a := 0 to High(FArrFacts) do
+    begin
+      if FArrFacts[a].Eligible or FArrFacts[a].BindOpaque then Continue;
+      if (FArrFacts[a].BindCount = 0) or (FArrFacts[a].BindTarget < 0) then Continue;
+      if not FArrFacts[a].Sound then Continue;
+      bt := FArrFacts[a].BindTarget;
+      if (bt < 0) or (bt > High(FArrFacts)) then Continue;
+      if not FArrFacts[bt].Sound then Continue;
+      if FArrFacts[bt].SizeKnown <= 0 then Continue;
+      if FArrFacts[bt].DimBlock = nil then Continue;
+      if not FArrFacts[bt].LbIsKnown then Continue;   // the callee reads LBOUND: it must be knowable
+      FArrFacts[a].Eligible := True;
+      FArrFacts[a].TotalSize := FArrFacts[bt].SizeKnown;
+      FArrFacts[a].LbKnown := FArrFacts[bt].LbKnown;
+      FArrFacts[a].LbIsKnown := True;
+      FArrFacts[a].DimBlock := FArrFacts[bt].DimBlock;
+      FArrFacts[a].DimIndex := FArrFacts[bt].DimIndex;
+      Inc(DimSeen);
+      {$IFDEF DEBUG_RANGE}
+      if DebugRange then
+        WriteLn('[Range] arr=', a, ' "', FProgram.GetArray(a).Name, '" PLACEHOLDER bound to arr=', bt,
+                ' size=', FArrFacts[a].TotalSize, ' (', FArrFacts[a].BindCount, ' bind sites)');
+      {$ENDIF}
+    end;
   {$IFDEF DEBUG_RANGE}
   if DebugRange then
     WriteLn('[Range] eligible arrays: ', DimSeen, '/', Length(FArrFacts));
@@ -1345,6 +1470,9 @@ function TRangeAnalysis.DefValueRange(Instr: TSSAInstruction; Blk: TSSABasicBloc
                                       InstrIdx, Depth: Integer): TRange;
 // Range of the value a specific DEF assigns (used for multi-def registers,
 // where EvalRange cannot pick a def itself). Operand positions are the def's.
+var
+  DimR: TRange;
+  Ub: Int64;
 begin
   Result := Unknown;
   if Depth > MAX_DEPTH then Exit;
@@ -1365,6 +1493,41 @@ begin
                          EvalRange(Instr.Src2, Blk, InstrIdx, Depth + 1));
     ssaArrayLoad:
       Result := BackingLoadRange(Instr, Blk, InstrIdx, Depth);
+    // LBOUND(arr, 0) on an array whose declared lower bound is a compile-time constant. This is not
+    // an optional refinement: the subscript of an array PARAMETER lowers to "index - LBOUND(arr, 0)"
+    // because the callee cannot know the caller's lower bound, so without this every index reached
+    // through a parameter is UNKNOWN no matter how well the extent is understood.
+    ssaArrayLBound:
+      if (Instr.Src1.Kind = svkArrayRef) and (Instr.Src1.ArrayIndex >= 0) and
+         (Instr.Src1.ArrayIndex <= High(FArrFacts)) and
+         FArrFacts[Instr.Src1.ArrayIndex].LbIsKnown and
+         FArrFacts[Instr.Src1.ArrayIndex].Eligible then
+      begin
+        // Dimension 0 only: that is the one whose lower bound the fact records.
+        DimR := EvalRange(Instr.Src2, Blk, InstrIdx, Depth + 1);
+        if DimR.Known and (DimR.Lo = 0) and (DimR.Hi = 0) then
+          Result := MkRange(FArrFacts[Instr.Src1.ArrayIndex].LbKnown,
+                            FArrFacts[Instr.Src1.ArrayIndex].LbKnown);
+      end;
+    // UBOUND(arr, 0) = Lb + Size - 1 for a 1-D array of known extent. "For i = LBound(a) To
+    // UBound(a)" is the idiomatic way to walk an array parameter, and it is the shape that becomes
+    // provable once the placeholder knows what it is bound to.
+    ssaArrayUBound:
+      if (Instr.Src1.Kind = svkArrayRef) and (Instr.Src1.ArrayIndex >= 0) and
+         (Instr.Src1.ArrayIndex <= High(FArrFacts)) and
+         FArrFacts[Instr.Src1.ArrayIndex].LbIsKnown and
+         FArrFacts[Instr.Src1.ArrayIndex].Eligible and
+         (FArrFacts[Instr.Src1.ArrayIndex].TotalSize > 0) and
+         (FProgram.GetArray(Instr.Src1.ArrayIndex).DimCount = 1) then
+      begin
+        DimR := EvalRange(Instr.Src2, Blk, InstrIdx, Depth + 1);
+        if DimR.Known and (DimR.Lo = 0) and (DimR.Hi = 0) then
+        begin
+          Ub := FArrFacts[Instr.Src1.ArrayIndex].LbKnown +
+                FArrFacts[Instr.Src1.ArrayIndex].TotalSize - 1;
+          Result := MkRange(Ub, Ub);
+        end;
+      end;
   end;
 end;
 
