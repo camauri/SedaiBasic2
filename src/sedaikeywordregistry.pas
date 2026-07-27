@@ -2120,6 +2120,17 @@ begin
                       // ST: the Commodore I/O status-byte variable — FreeBASIC has no ST, and "st" is a very
                       // common variable name (status / state / step / string temp). Keyword in CLASSIC only.
                       kST,
+                      // The rest of the Commodore RESERVED VARIABLES, for exactly the same reason as ST:
+                      // FreeBASIC has none of them, and each is an ordinary two-letter name an FB program
+                      // is entitled to use. This was not theory - all SEVEN dates/ examples in the manual
+                      // failed to parse, and not one of them is about a reserved variable: they simply name
+                      // their date serial "ds" ("Dim ds As Long = DateSerial(...)").
+                      kDS,       // disk status code                ("ds" = date serial, data set, distance)
+                      kDSS,      // disk status message
+                      kTI,       // jiffies since power-on          ("ti" = time, title, tile index)
+                      kTIS,      // 24h clock string
+                      kER,       // last error code                 ("er" = error, but FB spells it ERR)
+                      kEL,       // last error line                 ("el" = element, ell; FB spells it ERL)
                       // LN: the Commodore natural logarithm — FreeBASIC spells it LOG (its own manual notes
                       // the confusion), so "ln" is free there, and real FB code uses it for "length".
                       kLN,

@@ -8399,10 +8399,10 @@ function ParseDateSerial(const S: string; out DT: TDateTime): Boolean;
 // platforms/locales: "yyyy-mm-dd", "yyyy/mm/dd", "hh:mm[:ss]", or "<date> <time>". Anything else falls
 // back to the locale parser. Used by DATEVALUE/TIMEVALUE/ISDATE.
 var
-  ds, ts, w: string;
+  ds, ts, w, up: string;
   sp, y, mo, d, hh, mi, ss: Integer;
   dpart, tpart: TDateTime;
-  haveD, haveT: Boolean;
+  haveD, haveT, isAM, isPM: Boolean;
 
   function SplitInts(const Str: string; Sep: Char; out a, b, c: Integer): Integer;
   // Split Str on Sep into up to 3 integer fields; returns the field count (2 or 3), or -1 if a/b are
@@ -8431,6 +8431,20 @@ begin
   w := Trim(S);
   if w = '' then Exit;
   haveD := False; haveT := False; dpart := 0; tpart := 0;
+  // 12-hour marker, stripped BEFORE anything else looks at the string. Two things went wrong without
+  // this: "07:12:28AM" split into 07/12/"28AM", and StrToIntDef gave the seconds as 0; and
+  // "07:12:28 AM" split on the SPACE, so "07:12:28" was handed to the date parser, which failed and
+  // took the whole value with it. PM was simply ignored.
+  isAM := False; isPM := False;
+  if Length(w) >= 2 then
+  begin
+    up := UpperCase(w);
+    if Copy(up, Length(up) - 1, 2) = 'PM' then
+    begin isPM := True; w := Trim(Copy(w, 1, Length(w) - 2)); end
+    else if Copy(up, Length(up) - 1, 2) = 'AM' then
+    begin isAM := True; w := Trim(Copy(w, 1, Length(w) - 2)); end;
+    if w = '' then Exit;
+  end;
   sp := Pos(' ', w);
   if sp > 0 then begin ds := Trim(Copy(w, 1, sp - 1)); ts := Trim(Copy(w, sp + 1, Length(w))); end
   else if Pos(':', w) > 0 then begin ds := ''; ts := w; end
@@ -8456,6 +8470,13 @@ begin
       Exit;
   end;
   if not (haveD or haveT) then Exit;
+  // Apply the 12-hour marker to the encoded fraction: 0.5 is exactly noon, so "before noon" is the
+  // whole test. 12:30 PM stays 12:30 and 12:30 AM becomes 00:30, which is the rule VB and FB follow.
+  if haveT then
+  begin
+    if isPM and (tpart < 0.5) then tpart := tpart + 0.5
+    else if isAM and (tpart >= 0.5) then tpart := tpart - 0.5;
+  end;
   DT := dpart + tpart;
   Result := True;
 end;
