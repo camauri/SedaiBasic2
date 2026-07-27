@@ -1023,13 +1023,33 @@ begin
 end;
 
 function TSSAProgram.FindBlock(const LabelName: string): TSSABasicBlock;
-var Idx: Integer;
+// The label map stores an INDEX into FBlocks, and blocks get REMOVED (DBE, DCE, inlining). A stale
+// index either walks off the end - "List index out of bounds", which is how this was found - or,
+// far worse, lands on a live block that is not the one asked for and hands it back in silence.
+// So the index is verified against the label before it is trusted, and a mismatch falls back to a
+// scan; only a label that names no live block returns nil.
+var
+  Idx, i: Integer;
+  B: TSSABasicBlock;
 begin
+  Result := nil;
   Idx := FLabels.IndexOf(LabelName);
-  if Idx >= 0 then
-    Result := FBlocks[PtrInt(FLabels.Objects[Idx])]
-  else
-    Result := nil;
+  if Idx < 0 then Exit;
+  i := PtrInt(FLabels.Objects[Idx]);
+  if (i >= 0) and (i < FBlocks.Count) then
+  begin
+    B := TSSABasicBlock(FBlocks[i]);
+    if Assigned(B) and (B.LabelName = LabelName) then Exit(B);
+  end;
+  for i := 0 to FBlocks.Count - 1 do
+  begin
+    B := TSSABasicBlock(FBlocks[i]);
+    if Assigned(B) and (B.LabelName = LabelName) then
+    begin
+      FLabels.Objects[Idx] := TObject(PtrInt(i));   // repair the map on the way out
+      Exit(B);
+    end;
+  end;
 end;
 
 function TSSAProgram.GetOrCreateBlock(const LabelName: string): TSSABasicBlock;
