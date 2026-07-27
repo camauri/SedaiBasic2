@@ -53,6 +53,10 @@
   Index side - interval analysis on the SSA value of the linear index:
     - constants, CopyInt, AddInt/SubInt/MulInt compose intervals
       (saturating: anything beyond +/-2^40 degrades to unknown);
+    - wherever a literal is REQUIRED rather than merely composed (the FOR
+      step, a loop-invariant limit), it is resolved through up to 3 CopyInt
+      hops as well: with constants value-numbered, only the FIRST occurrence
+      of a literal is an ssaLoadConstInt and every later one is a copy of it;
     - Const-backing forwarding: a Const lives in a size-1 backing array
       written by exactly one entry-block store - a load from it yields
       the stored value's range (strict rules, see BackingLoadRange);
@@ -150,6 +154,9 @@ type
     FLoops: array of TLoopRec;
     FArrFacts: array of TArrFact;
     FHasErrFlow: Boolean;       // ON ERROR / RESUME / TRAP present -> analysis disabled
+    {$IFDEF DEBUG_RANGE}
+    FStepWhy: string;           // why TraceStep gave up (diagnostics only)
+    {$ENDIF}
     function DefKey(const V: TSSAValue): string; inline;
     function FindDefIdx(const V: TSSAValue): Integer;                 // head index, -1 = no def
     function FindDef(const V: TSSAValue; out D: TDefRec): Boolean;    // True only if SINGLE def
@@ -611,17 +618,48 @@ begin
 end;
 
 function TRangeAnalysis.ConstOf(const X: TSSAValue; out CV: Int64): Boolean;
+// A literal operand, or a single-def register that holds one - through up to 3
+// CopyInt hops, exactly like TraceStep/StepOfDef do for the counter itself.
+// The hops are NOT cosmetic: once GVN value-numbers constants, the second and
+// later occurrences of a literal stop being their own ssaLoadConstInt and
+// become a copy of the canonical one, so a FOR step written "i + 1" reaches
+// here as "i + (copy of the program's canonical 1)". Without the hops the
+// induction variable is rejected and every array access it indexes keeps its
+// bounds check - which cost n-body's native path 52%.
+// Sound by construction: every hop goes through FindDef, which answers only for
+// SINGLE-def registers, so the copied value cannot have been reassigned.
 var
   DK: TDefRec;
+  V: TSSAValue;
+  Hops: Integer;
 begin
   Result := False;
   CV := 0;
   if X.Kind = svkConstInt then begin CV := X.ConstInt; Exit(True); end;
-  if FindDef(X, DK) and (DK.Instr.OpCode = ssaLoadConstInt) and
-     (DK.Instr.Src1.Kind = svkConstInt) then
+  V := X;
+  for Hops := 0 to 3 do
   begin
-    CV := DK.Instr.Src1.ConstInt;
-    Result := True;
+    if not FindDef(V, DK) then Exit;
+    case DK.Instr.OpCode of
+      ssaLoadConstInt:
+        begin
+          if DK.Instr.Src1.Kind <> svkConstInt then Exit;
+          CV := DK.Instr.Src1.ConstInt;
+          Exit(True);
+        end;
+      ssaCopyInt:
+        begin
+          if DK.Instr.Src1.Kind = svkConstInt then
+          begin
+            CV := DK.Instr.Src1.ConstInt;
+            Exit(True);
+          end;
+          if DK.Instr.Src1.Kind <> svkRegister then Exit;
+          V := DK.Instr.Src1;
+        end;
+    else
+      Exit;
+    end;
   end;
 end;
 
@@ -634,14 +672,27 @@ var
   V: TSSAValue;
   Hops: Integer;
   C: Int64;
+  {$IFDEF DEBUG_RANGE}
+  D2: TDefRec;
+  DI: Integer;
+  {$ENDIF}
 begin
   Result := False;
   Step := 0;
   V := LatchVal;
   Hops := 0;
+  {$IFDEF DEBUG_RANGE}
+  FStepWhy := 'hops exhausted';
+  {$ENDIF}
   while Hops <= 3 do
   begin
-    if not FindDef(V, D) then Exit;
+    if not FindDef(V, D) then
+    begin
+      {$IFDEF DEBUG_RANGE}
+      FStepWhy := 'no single def of latch reg' + IntToStr(V.RegIndex) + ':' + IntToStr(V.Version);
+      {$ENDIF}
+      Exit;
+    end;
     case D.Instr.OpCode of
       ssaCopyInt:
         begin
@@ -654,15 +705,45 @@ begin
           begin Step := C; Exit(True); end;
           if SameReg(D.Instr.Src2, PhiDest) and ConstOf(D.Instr.Src1, C) then
           begin Step := C; Exit(True); end;
+          {$IFDEF DEBUG_RANGE}
+          if SameReg(D.Instr.Src1, PhiDest) then
+          begin
+            if D.Instr.Src2.Kind <> svkRegister then
+              FStepWhy := 'add: src2 kind ' + IntToStr(Ord(D.Instr.Src2.Kind))
+            else if not FindDef(D.Instr.Src2, D2) then
+            begin
+              DI := FindDefIdx(D.Instr.Src2);
+              if DI < 0 then
+                FStepWhy := 'add: src2 reg' + IntToStr(D.Instr.Src2.RegIndex) + ':' +
+                            IntToStr(D.Instr.Src2.Version) + ' has NO def'
+              else
+                FStepWhy := 'add: src2 reg' + IntToStr(D.Instr.Src2.RegIndex) + ':' +
+                            IntToStr(D.Instr.Src2.Version) + ' defs=' +
+                            IntToStr(FDefRecs[DI].Count);
+            end
+            else
+              FStepWhy := 'add: src2 def is ' + SSAOpCodeToString(D2.Instr.OpCode);
+          end
+          else if SameReg(D.Instr.Src2, PhiDest) then
+            FStepWhy := 'add: src1 not const'
+          else
+            FStepWhy := 'add: neither operand is the phi';
+          {$ENDIF}
           Exit;
         end;
       ssaSubInt:
         begin
           if SameReg(D.Instr.Src1, PhiDest) and ConstOf(D.Instr.Src2, C) then
           begin Step := -C; Exit(True); end;
+          {$IFDEF DEBUG_RANGE}
+          FStepWhy := 'sub: not phi-const';
+          {$ENDIF}
           Exit;
         end;
     else
+      {$IFDEF DEBUG_RANGE}
+      FStepWhy := 'latch def is ' + SSAOpCodeToString(D.Instr.OpCode);
+      {$ENDIF}
       Exit;
     end;
   end;
@@ -875,7 +956,15 @@ begin
     end;
   end;
   if (NIn <> 1) or (NOut <> 1) then begin Why('phi sources not 1-in/1-out'); Exit; end;
-  if not TraceStep(LatchVal, Phi.Dest, Step) then begin Why('latch not phi+const'); Exit; end;
+  if not TraceStep(LatchVal, Phi.Dest, Step) then
+  begin
+    {$IFDEF DEBUG_RANGE}
+    Why('latch not phi+const [' + FStepWhy + ']');
+    {$ELSE}
+    Why('latch not phi+const');
+    {$ENDIF}
+    Exit;
+  end;
   if Step = 0 then begin Why('step 0'); Exit; end;
   if not FindGuard(H, li, Phi.Dest, Cmp) then begin Why('no guard on phi'); Exit; end;
   IR := EvalRange(InitVal, InitBlock, -1, Depth + 1);
