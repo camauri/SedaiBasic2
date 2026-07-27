@@ -64,9 +64,17 @@ type
   private
     FStack: TMapStack;
     FInitialStackDepth: Integer;
+    // Lowest scope Lookup may reach. A CALL is an edge in this CFG, so a procedure body is DOMINATED
+    // by the module code that calls it -- but dominance there does not mean the caller's register
+    // still holds its value when the callee reads it: a call installs a new frame. The floor is
+    // raised on entry to a procedure body so nothing outside it can be reused inside. See
+    // TraverseDomTree.
+    FFloor: Integer;
   public
     constructor Create;
     destructor Destroy; override;
+    function Depth: Integer;                       // number of open scopes
+    function SetFloor(NewFloor: Integer): Integer; // raise/restore the lookup floor, returns the old one
 
     { Push a new scope (entering a dominator subtree) }
     procedure PushScope;
@@ -119,6 +127,14 @@ type
     // are single-def. Sharing the state-dependent table meant intrec recomputed the same
     // 'index - lbound' four times per iteration, once after each RecordStore.
     FLoopVarTable: TLocalValueMap;
+    { Constants get their OWN block-local table, and it is emptied at every CALL. A literal reloaded
+      into a second register is the same value anywhere, so dominance would license reuse across the
+      whole dominated subtree - but the register that carries it would then have to survive whatever
+      lies between, and a CALL installs a new frame: what the callee does to that register is not
+      this pass's business to predict. Confined to the block and cut at every call, the reuse needs
+      no argument about frames at all - nothing between the two occurrences can write the register,
+      because a single-def name has exactly one writer and no call intervenes. }
+    FConstTable: TLocalValueMap;
     FDomTree: TDominatorTree;
     FProgram: TSSAProgram;
     FReplacements: Integer;  // Count of values replaced
@@ -134,6 +150,12 @@ type
       even after their four LBOUND reads had been collapsed into one. Resolving uses through this map
       costs nothing at runtime: it only decides hash EQUALITY, no operand is rewritten here. }
     FCanonRegs: TRegValueMap;
+    { Labels that some ssaCall/ssaCallSub names as its target, i.e. the entry blocks of procedure
+      bodies. A call IS an edge in this CFG, so those blocks are dominated by the module code that
+      calls them - and reuse across that edge is NOT sound: a call installs a new frame, and the
+      caller's registers only survive it by accident of allocation. Collected once per Run, so the
+      traversal pays a set lookup per block instead of a scan of every predecessor. }
+    FProcEntryLabels: TStringList;
 
     { Process a single basic block }
     procedure ProcessBlock(Block: TSSABasicBlock);
@@ -165,6 +187,9 @@ type
 
     { Map every single-def register loaded with a literal to that literal's hash part }
     procedure BuildConstRegs;
+
+    { Collect the labels reached by a CALL — the entry blocks of procedure bodies }
+    procedure BuildProcEntryLabels;
 
     { Operand encoding for the value hash, with constant registers resolved to their value }
     function HashPart(const V: TSSAValue): string;
@@ -239,13 +264,25 @@ begin
   Map.Free;
 end;
 
+function TScopedGVNTable.Depth: Integer;
+begin
+  Result := FStack.Count;
+end;
+
+function TScopedGVNTable.SetFloor(NewFloor: Integer): Integer;
+begin
+  Result := FFloor;
+  FFloor := NewFloor;
+end;
+
 function TScopedGVNTable.Lookup(const Hash: string; out Value: TSSAValue): Boolean;
 var
   i: Integer;
   Map: TValueMap;
 begin
-  // Search from top (most recent scope) to bottom (oldest scope)
-  for i := FStack.Count - 1 downto 0 do
+  // Search from top (most recent scope) down to the floor (see FFloor: never below the procedure
+  // body currently being processed).
+  for i := FStack.Count - 1 downto FFloor do
   begin
     Map := FStack[i];
     if Map.TryGetValue(Hash, Value) then
@@ -406,10 +443,14 @@ begin
   FBlockTable := TLocalValueMap.Create;
   FBoundTable := TLocalValueMap.Create;
   FLoopVarTable := TLocalValueMap.Create;
+  FConstTable := TLocalValueMap.Create;
   FPhiDefinedRegs := TRegKeySet.Create;
   FDefCounts := TDefCountMap.Create;
   FConstRegs := TConstRegMap.Create;
   FCanonRegs := TRegValueMap.Create;
+  FProcEntryLabels := TStringList.Create;
+  FProcEntryLabels.Sorted := True;         // IndexOf is a binary search: one per block in the traversal
+  FProcEntryLabels.Duplicates := dupIgnore;
   FReplacements := 0;
   FCurrentBlock := nil;
 end;
@@ -417,14 +458,47 @@ end;
 destructor TGVNPass.Destroy;
 begin
   FCanonRegs.Free;
+  FProcEntryLabels.Free;
   FConstRegs.Free;
   FDefCounts.Free;
   FPhiDefinedRegs.Free;
   FBlockTable.Free;
   FBoundTable.Free;
   FLoopVarTable.Free;
+  FConstTable.Free;
   FScopedTable.Free;
   inherited Destroy;
+end;
+
+var
+  // Gate for constant value numbering, read once. -1 = not read yet; then:
+  //   0 = the historical exclusion (constants are never numbered), for a one-binary A/B;
+  //   1 = numbered but confined to the block and cut at every call (see FConstTable). Kept as the
+  //       conservative fallback: it needs no argument about frames at all. Costs most of the yield
+  //       (fib and sieve go to zero), so it is not the default;
+  //   2 = numbered on DOMINANCE, like every other pure value. THE DEFAULT.
+  // Mode 2 did miscompile once, and the cause was NOT here: LICM was redirecting a bcCallSub onto a
+  // loop pre-header and hoisting values across a frame-unit boundary, so a register carrying a
+  // literal across a call survived only by accident of allocation. Fixed in CreatePreHeader; this
+  // pass merely made the collision likely instead of unlikely.
+  GGVNConst: Integer = -1;
+
+function GVNConstMode: Integer;
+var S: string;
+begin
+  if GGVNConst < 0 then
+  begin
+    S := GetEnvironmentVariable('GVNCONST');
+    if S = '0' then GGVNConst := 0
+    else if S = '1' then GGVNConst := 1
+    else GGVNConst := 2;
+  end;
+  Result := GGVNConst;
+end;
+
+function GVNNumbersConstants: Boolean;
+begin
+  Result := GVNConstMode <> 0;
 end;
 
 procedure TGVNPass.CollectPhiDefinedRegisters;
@@ -669,6 +743,32 @@ begin
   end;
 end;
 
+procedure TGVNPass.BuildProcEntryLabels;
+// Every label named as the target of an ssaCall/ssaCallSub. Those blocks are the entry points of
+// procedure bodies, and the edge that reaches them is a CALL, not a branch: the dominator tree says
+// the calling code dominates the body, but a call installs a new frame, so a value computed before
+// the call must not be reused inside it. TraverseDomTree raises the lookup floor there.
+var
+  i, j: Integer;
+  Block: TSSABasicBlock;
+  Instr: TSSAInstruction;
+  Lbl: string;
+begin
+  FProcEntryLabels.Clear;
+  for i := 0 to FProgram.Blocks.Count - 1 do
+  begin
+    Block := FProgram.Blocks[i];
+    for j := 0 to Block.Instructions.Count - 1 do
+    begin
+      Instr := Block.Instructions[j];
+      if (Instr.OpCode <> ssaCallSub) and (Instr.OpCode <> ssaCall) then Continue;
+      Lbl := Instr.Dest.LabelName;
+      if (Lbl <> '') and (FProcEntryLabels.IndexOf(Lbl) < 0) then
+        FProcEntryLabels.Add(Lbl);
+    end;
+  end;
+end;
+
 procedure TGVNPass.BuildConstRegs;
 var
   i, j: Integer;
@@ -826,14 +926,21 @@ begin
     ssaMathSqr, ssaMathLog, ssaMathExp, ssaMathLog10, ssaMathLog2, ssaMathLogN:
       Result := not FProgram.GlobalVariableSemantics;
 
-    // Constants - DO NOT value number!
-    // LoadConst instructions are already optimal and removing them can create
-    // dependencies that break when Superinstructions fuses Arith+Copy patterns.
-    // The fused instruction expects the constant register to be valid, but if
-    // GVN replaced LoadConst with Copy, the source register may not exist after
-    // other optimizations eliminate it.
+    // Constants. The two reasons they were excluded no longer hold, and the second was never a
+    // reason at all on THIS machine:
+    //   * "Superinstructions fuses Arith+Copy and the fused instruction expects the constant register
+    //     to be valid" - fusion has been off since 18 July and was measured to have to stay off (its
+    //     mere presence in the run loop costs every program). A live pass cannot keep paying for a
+    //     dead one.
+    //   * "a constant is cheaper to rematerialise than to keep alive in a register" - true for a
+    //     machine with a fixed register file and a spiller. Here a register is a slot in an array:
+    //     keeping one alive costs NOTHING, while rematerialising costs a full DISPATCH (~10 ns), the
+    //     single most expensive thing the interpreter does. The textbook trade-off is INVERTED.
+    // A recursive body reloads its literals once per ACTIVATION and cannot hoist them (there is no
+    // "outside"), so this is where the reload actually shows: fib loads the literal 2 twice per call.
+    // GVNCONST=0 restores the historical exclusion for a one-binary A/B.
     ssaLoadConstInt, ssaLoadConstFloat, ssaLoadConstString:
-      Result := False;
+      Result := GVNNumbersConstants;
 
     // Copy operations - DO NOT value number!
     // Many distinct BASIC variables are initialised from the same source (e.g.
@@ -888,6 +995,19 @@ begin
 
   // Compute hash for this instruction's value
   Hash := ComputeValueHash(Instr);
+
+  // Constants answer from their own block-local table, cut at every call (see FConstTable). Checked
+  // before everything else: a LoadConst is neither state-dependent nor loop-variant, so it would
+  // otherwise fall through to the scoped table and be reusable across the whole dominated subtree.
+  if (GVNConstMode = 1) and
+     (Instr.OpCode in [ssaLoadConstInt, ssaLoadConstFloat, ssaLoadConstString]) then
+  begin
+    if FConstTable.TryGetValue(Hash, ExistingValue) then
+      RewriteAsCopy(Instr, ExistingValue, Hash)
+    else
+      FConstTable.AddOrSetValue(Hash, Instr.Dest);
+    Exit;
+  end;
 
   // Two families answer from the BLOCK-LOCAL table only. ProcessBlock empties that table on entry to
   // the block and again at every barrier, so a hit there means: same block, earlier instruction, and
@@ -975,7 +1095,7 @@ end;
 procedure TGVNPass.TraverseDomTree(Block: TSSABasicBlock);
 var
   Children: TFPList;
-  i: Integer;
+  i, SavedFloor: Integer;
   ChildBlock: TSSABasicBlock;
 begin
   { DFS traversal of dominator tree with proper scope management:
@@ -997,6 +1117,17 @@ begin
   // Push scope for this block and its dominated subtree
   FScopedTable.PushScope;
 
+  { A procedure body is dominated by the code that CALLS it, because a call is an edge here — but
+    the callee runs on a new frame, so a value the caller computed is not available to it: the
+    register only still holds it by accident of allocation, and the frame save/restore and the frame
+    BASE RELOCATION are both free to move it. Reuse across that edge is exactly the kind of
+    dominance-shaped argument that is true about control flow and false about storage. So the body
+    starts from an empty view: nothing below this scope may be looked up until the subtree is done.
+    (Restored, not zeroed, because procedure bodies can nest in the dominator tree.) }
+  SavedFloor := -1;
+  if FProcEntryLabels.IndexOf(Block.LabelName) >= 0 then
+    SavedFloor := FScopedTable.SetFloor(FScopedTable.Depth - 1);
+
   // Process instructions in this block
   ProcessBlock(Block);
 
@@ -1015,6 +1146,9 @@ begin
       Children.Free;
     end;
   end;
+
+  if SavedFloor >= 0 then
+    FScopedTable.SetFloor(SavedFloor);
 
   // Pop scope when leaving this subtree
   FScopedTable.PopScope;
@@ -1038,6 +1172,7 @@ begin
   FBlockTable.Clear;
   FBoundTable.Clear;
   FLoopVarTable.Clear;
+  FConstTable.Clear;
 
   // Process each instruction in block
   for i := 0 to Block.Instructions.Count - 1 do
@@ -1050,6 +1185,9 @@ begin
     // ...and the descriptor table only for something that can actually reshape an array.
     if IsReshapeBarrier(Instr.OpCode) then
       FBoundTable.Clear;
+    // A call is the barrier for constants: past it, this pass cannot say what the register holds.
+    if Instr.OpCode in [ssaCall, ssaCallSub, ssaCallSubIndirect] then
+      FConstTable.Clear;
     ProcessInstruction(Instr);
   end;
 end;
@@ -1094,6 +1232,7 @@ begin
 
   // Constant registers are keyed on IsSingleDef, so this must follow the poisoning above.
   BuildConstRegs;
+  BuildProcEntryLabels;
   FCanonRegs.Clear;
 
   // STEP 4: Traverse blocks in preorder
