@@ -133,7 +133,15 @@ type
   end;
   TArrFact = record
     Eligible: Boolean;
-    TotalSize: Int64;         // product of constant extents
+    TotalSize: Int64;         // product of constant extents (0 when the extent is symbolic)
+    // SYMBOLIC EXTENT (1-D only). "Dim a(1 To n)" with n a runtime value is the commonest array
+    // declaration in BASIC and had no proof at all: TotalSize is unknown, so every access kept its
+    // check. It does not need to be known. When the loop runs over the array's OWN extent - the
+    // guard's limit is the SAME single-def value as the dimension register - the extent cancels out
+    // of the inequality and what is left is constant arithmetic. See ProveSymbolic.
+    SymExtent: Boolean;
+    SymUb: TSSAValue;         // the dimension register: size = SymUb - SymLb + 1
+    SymLb: Int64;
     DimBlock: TSSABasicBlock; // block of the single ssaArrayDim
     DimIndex: Integer;        // its index inside DimBlock
     // Single-store tracking (const-backing forwarding): a size-1 array written
@@ -187,6 +195,9 @@ type
     function TryUnversionedIV(const V: TSSAValue; UseBlock: TSSABasicBlock;
                               UseIndex, Depth: Integer): TRange;
     function TraceStep(const LatchVal, PhiDest: TSSAValue; out Step: Int64): Boolean;
+    function SameValueThroughCopies(const A, B: TSSAValue): Boolean;
+    function ProveSymbolic(const V: TSSAValue; UseBlock: TSSABasicBlock;
+                           UseIndex, a: Integer): Boolean;
     function SelfPhi(Phi: TSSAInstruction): Boolean;
     function StepOfDef(Ins: TSSAInstruction; const V: TSSAValue; out Step: Int64): Boolean;
   public
@@ -207,6 +218,18 @@ const
   // Int64 overflow while covering any realistic array extent.
   RANGE_MAX = Int64(1) shl 40;
   MAX_DEPTH = 12;
+
+var
+  // Gate for the symbolic-extent proof (see TArrFact.SymExtent), read once: -1 unknown,
+  // 0 = B4SYM=0, constant extents only (the historical rule), 1 = symbolic extents too.
+  GSymExtent: Integer = -1;
+
+function SymbolicExtentEnabled: Boolean;
+begin
+  if GSymExtent < 0 then
+    if GetEnvironmentVariable('B4SYM') = '0' then GSymExtent := 0 else GSymExtent := 1;
+  Result := GSymExtent = 1;
+end;
 
 constructor TRangeAnalysis.Create(AProgram: TSSAProgram);
 begin
@@ -347,6 +370,8 @@ begin
   begin
     FArrFacts[a].Eligible := True;    // tentative; the screens below clear it
     FArrFacts[a].TotalSize := 0;
+    FArrFacts[a].SymExtent := False;
+    FArrFacts[a].SymLb := 0;
     FArrFacts[a].DimBlock := nil;
     FArrFacts[a].StoreCount := 0;
     FArrFacts[a].StoreInstr := nil;
@@ -450,7 +475,34 @@ begin
       Total := Total * SizeD;
       if Total > High(Integer) then begin Total := 0; Break; end;
     end;
-    if Total <= 0 then Continue;
+    if Total <= 0 then
+    begin
+      // No compile-time size. If the array is 1-D and its extent is ONE single-def int register,
+      // the size is unknown but NAMED, and an access indexed by a loop over that same name still
+      // proves (ProveSymbolic). This is "Dim a(1 To n)" - the commonest declaration in BASIC, and
+      // until now the one with no proof at all. B4SYM=0 restores the constants-only rule.
+      if SymbolicExtentEnabled and (Info.DimCount = 1) and (not HasLbRegs) and
+         (Length(Info.DimRegisters) > 0) and (Info.DimRegisters[0] >= 0) and
+         (Length(Info.DimRegTypes) > 0) and (Info.DimRegTypes[0] = srtInt) then
+      begin
+        UbVal := MakeSSARegister(srtInt, Info.DimRegisters[0]);
+        if FindDef(UbVal, UbDef) then
+        begin
+          FArrFacts[a].Eligible := True;
+          FArrFacts[a].SymExtent := True;
+          FArrFacts[a].SymUb := UbVal;
+          if 0 <= High(Info.LowerBounds) then FArrFacts[a].SymLb := Info.LowerBounds[0];
+          FArrFacts[a].TotalSize := 0;
+          Inc(DimSeen);
+          {$IFDEF DEBUG_RANGE}
+          if DebugRange then
+            WriteLn('[Range] arr=', a, ' "', Info.Name, '" SYMBOLIC extent reg',
+                    Info.DimRegisters[0], ' lb=', FArrFacts[a].SymLb);
+          {$ENDIF}
+        end;
+      end;
+      Continue;
+    end;
     FArrFacts[a].Eligible := True;
     FArrFacts[a].TotalSize := Total;
     Inc(DimSeen);
@@ -975,6 +1027,136 @@ begin
   {$ENDIF}
 end;
 
+function TRangeAnalysis.SameValueThroughCopies(const A, B: TSSAValue): Boolean;
+// Do these two operands denote the SAME value? Registers are followed through up to 3 CopyInt hops
+// on either side, each taken only via FindDef (single-def), so "same name" really does mean "same
+// value". The generator copies a parameter into a fresh temp before comparing against it, which is
+// why the hops are needed at all: "Dim p(1 To n)" and "For i = 1 To n" reach here as two different
+// register names for the one n.
+  function Root(V: TSSAValue): TSSAValue;
+  var DD: TDefRec; k: Integer;
+  begin
+    for k := 0 to 3 do
+    begin
+      if V.Kind <> svkRegister then Break;
+      if not FindDef(V, DD) then Break;
+      if DD.Instr.OpCode <> ssaCopyInt then Break;
+      if DD.Instr.Src1.Kind = svkNone then Break;
+      V := DD.Instr.Src1;
+    end;
+    Result := V;
+  end;
+var
+  X, Y: TSSAValue;
+begin
+  X := Root(A);
+  Y := Root(B);
+  if (X.Kind = svkConstInt) and (Y.Kind = svkConstInt) then Exit(X.ConstInt = Y.ConstInt);
+  Result := SameReg(X, Y);
+end;
+
+function TRangeAnalysis.ProveSymbolic(const V: TSSAValue; UseBlock: TSSABasicBlock;
+                                      UseIndex, a: Integer): Boolean;
+// SYMBOLIC EXTENT: prove an access in bounds when the array's size is NOT known at compile time.
+// "Dim a(1 To n)" is the commonest array declaration in BASIC and had no proof at all. It does not
+// need one: when the loop runs over the array's OWN extent, the unknown cancels.
+//
+//   the guard gives     counter <= U        (CmpLe)   or   counter <= U-1  (CmpLt)
+//   the index is        counter + Off       (Off collected by peeling constants off the subscript,
+//                                            e.g. the "- LBOUND" the generator emits)
+//   the array holds     0 .. U - SymLb
+//   so the test is      Off + (0|-1) <= -SymLb        -- U is GONE.
+//
+// What must still be checked numerically is the LOW end (the counter's init) and the direction.
+// Requirements, each one a soundness screen and not a convenience:
+//   * the index resolves to a loop-header PHI through copies and CONSTANT offsets only;
+//   * the use is guarded - in the loop, not the header - so the compare held for this value;
+//   * the step is positive (the decreasing case would need the other end of the guard);
+//   * the guard's limit is the SAME value as the dimension register, and its def is OUTSIDE the
+//     loop (as GuardedRange demands) so the extent cannot move under the counter;
+//   * the array is 1-D: with more dimensions the linear index is a product and nothing cancels.
+var
+  Cur, InitVal, LatchVal: TSSAValue;
+  Off, C, Step, MaxOff: Int64;
+  hops, li, k, NIn, NOut: Integer;
+  D, LimDef: TDefRec;
+  H, InitBlock: TSSABasicBlock;
+  PhiI: TSSAInstruction;
+  Cmp: TSSAInstruction;
+  IR: TRange;
+  Peeling: Boolean;
+begin
+  Result := False;
+  if (a < 0) or (a > High(FArrFacts)) or not FArrFacts[a].SymExtent then Exit;
+  // 1. Peel copies and constant offsets: index = base + Off.
+  Cur := V;
+  Off := 0;
+  Peeling := True;
+  hops := 0;
+  while Peeling and (hops <= 4) do
+  begin
+    Inc(hops);
+    if Cur.Kind <> svkRegister then Exit;
+    if not FindDef(Cur, D) then Exit;
+    case D.Instr.OpCode of
+      ssaCopyInt: Cur := D.Instr.Src1;
+      ssaAddInt:
+        if ConstOf(D.Instr.Src2, C) then begin Off := Off + C; Cur := D.Instr.Src1; end
+        else if ConstOf(D.Instr.Src1, C) then begin Off := Off + C; Cur := D.Instr.Src2; end
+        else Exit;
+      ssaSubInt:
+        if ConstOf(D.Instr.Src2, C) then begin Off := Off - C; Cur := D.Instr.Src1; end
+        else Exit;
+      ssaPhi: Peeling := False;
+    else
+      Exit;
+    end;
+  end;
+  if Peeling then Exit;                       // never reached a phi within the hop budget
+  PhiI := D.Instr;
+  H := D.Block;
+  // 2. The phi must be a loop header's, in a sound loop, and the use must be guarded by it.
+  li := LoopOfHeader(H);
+  if li < 0 then Exit;
+  if not FLoops[li].Sound then Exit;
+  if (UseBlock = H) or (FLoops[li].Blocks.IndexOf(UseBlock) < 0) then Exit;
+  if Length(PhiI.PhiSources) <> 2 then Exit;
+  NIn := 0; NOut := 0;
+  InitVal := PhiI.Src1; LatchVal := PhiI.Src1; InitBlock := nil;
+  for k := 0 to 1 do
+  begin
+    if PhiI.PhiSources[k].FromBlock = nil then Exit;
+    if FLoops[li].Blocks.IndexOf(PhiI.PhiSources[k].FromBlock) >= 0 then
+    begin LatchVal := PhiI.PhiSources[k].Value; Inc(NIn); end
+    else
+    begin InitVal := PhiI.PhiSources[k].Value; InitBlock := PhiI.PhiSources[k].FromBlock; Inc(NOut); end;
+  end;
+  if (NIn <> 1) or (NOut <> 1) then Exit;
+  if not TraceStep(LatchVal, PhiI.Dest, Step) then Exit;
+  if Step <= 0 then Exit;
+  if not FindGuard(H, li, PhiI.Dest, Cmp) then Exit;
+  // 3. The guard's limit IS the array's upper bound, and it is loop-invariant.
+  if Cmp.Src2.Kind = svkRegister then
+  begin
+    if not FindDef(Cmp.Src2, LimDef) then Exit;
+    if FLoops[li].Blocks.IndexOf(LimDef.Block) >= 0 then Exit;
+  end;
+  if not SameValueThroughCopies(Cmp.Src2, FArrFacts[a].SymUb) then Exit;
+  // 4. The high end, with the unknown cancelled out.
+  case Cmp.OpCode of
+    ssaCmpLeInt: MaxOff := Off;
+    ssaCmpLtInt: MaxOff := Off - 1;
+  else
+    Exit;
+  end;
+  if MaxOff > -FArrFacts[a].SymLb then Exit;
+  // 5. The low end is ordinary arithmetic: with a positive step the counter never goes below init.
+  IR := EvalRange(InitVal, InitBlock, -1, 0);
+  if not IR.Known then Exit;
+  if IR.Lo + Off < 0 then Exit;
+  Result := True;
+end;
+
 function TRangeAnalysis.TryUnversionedIV(const V: TSSAValue; UseBlock: TSSABasicBlock;
                                          UseIndex, Depth: Integer): TRange;
 // UNVERSIONED induction variable (module-level scalars, CLASSIC): register V
@@ -1251,6 +1433,30 @@ begin
       else
         DomOK := FDomTree.IsDom(FArrFacts[a].DimBlock, Blk);
       if not DomOK then Continue;
+      // Symbolic extents are proven on their own path: TotalSize is 0 there, so the numeric test
+      // below can never fire for them and the two are mutually exclusive by construction.
+      if FArrFacts[a].SymExtent then
+      begin
+        if ProveSymbolic(Instr.Src2, Blk, i, a) then
+        begin
+          Instr.BoundsSafe := True;
+          Inc(Result);
+          {$IFDEF DEBUG_RANGE}
+          if DebugRange then
+            WriteLn('[Range] SAFE ', SSAOpCodeToString(Instr.OpCode), ' arr=', a,
+                    ' SYMBOLIC (the loop runs over the array''s own extent) @', Blk.LabelName);
+          {$ENDIF}
+        end
+        else
+        begin
+          {$IFDEF DEBUG_RANGE}
+          if DebugRange then
+            WriteLn('[Range] unsafe ', SSAOpCodeToString(Instr.OpCode), ' arr=', a,
+                    ' symbolic proof failed @', Blk.LabelName);
+          {$ENDIF}
+        end;
+        Continue;
+      end;
       R := EvalRange(Instr.Src2, Blk, i, 0);
       if R.Known and (R.Lo >= 0) and (R.Hi < FArrFacts[a].TotalSize) then
       begin
