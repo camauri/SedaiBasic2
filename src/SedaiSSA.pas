@@ -822,14 +822,28 @@ var
 {$ENDIF}
 
 const
-  // Every opcode that can leave a record in the CURRENT frame's record heap. The allocators are obvious;
-  // the CALLS are here because a callee can hand a UDT back by value, or leave a temporary behind, and
-  // those live in the caller's records -- so a block containing a call has to keep its record mark even
-  // though it allocates nothing itself. A block that emits none of these allocates nothing, and its mark
-  // is dead weight (see TScopeFrame.RecAllocSeq). Anything added here later that can allocate MUST be
-  // added to this set, or its records would never be reclaimed.
-  RECORD_ALLOCATING_OPS = [ssaRecordNew, ssaRecordNewArray, ssaRecordNewArrayInd, ssaRecordNewBlock,
-                          ssaCall, ssaCallSub, ssaCallSubIndirect];
+  // Every opcode that can leave a record in the CURRENT frame's record heap. A block that emits none
+  // of these allocates nothing, and its mark is dead weight (see TScopeFrame.RecAllocSeq). Anything
+  // added here later that can allocate MUST be added, or its records would never be reclaimed.
+  //
+  // ssaCall STAYS: it lowers to bcCall (GOSUB), which has NO frame, so whatever the routine allocates
+  // really does land above the caller's high-water mark and only the block mark can reclaim it.
+  //
+  // ssaCallSub / ssaCallSubIndirect used to be here too, on the argument that a callee can hand a UDT
+  // back by value or leave a temporary behind. Neither survives contact with the frame machinery:
+  //   * FramePush snapshots Ctx.RecordCount into the frame mark and FramePop restores it, so a
+  //     callee's records are ALREADY reclaimed at its own bcReturnSub - before the caller's
+  //     bcRecMarkPop could look at them;
+  //   * a UDT returned by value is copied into an instance the CALLER allocates, with its own
+  //     ssaRecordNew emitted right there (EmitUserFunctionCall) - which counts here on its own merit,
+  //     so a block that receives one keeps its mark anyway.
+  // The AOT reached the same conclusion independently and acts on it: in a region with no deopt hazard
+  // it elides both marks because "reclamation is deferred to FramePop".
+  // The cost of the old rule was two dispatches per iteration of EVERY loop body containing a call -
+  // the most common call-heavy shape there is. RECMARKCALL=1 restores it for a one-binary A/B.
+  RECORD_ALLOCATING_OPS = [ssaRecordNew, ssaRecordNewArray, ssaRecordNewArrayInd,
+                           ssaRecordNewBlock, ssaCall];
+  RECORD_ALLOCATING_CALL_OPS = [ssaCallSub, ssaCallSubIndirect];
 
   // Transfer-register slot reserved for a FUNCTION's return value (per bank). Kept well
   // above any parameter slot count so it never collides with an argument slot.
@@ -854,11 +868,27 @@ begin
   Result := GResultInitElide = 1;
 end;
 
+var
+  // Tri-state gate for counting a SUB/FUNCTION call as record-allocating in the CALLER's block (see
+  // RECORD_ALLOCATING_OPS_BASE), read once: -1 unknown, 1 = RECMARKCALL=1, the historical set (a call
+  // keeps the block's mark), 0 = calls do not, because FramePop already reclaims what they allocate.
+  GRecMarkCall: Integer = -1;
+
+function RecMarkCallsAllocate: Boolean;
+// Read once. Called from the generator's constructor so the emit path can test GRecMarkCall
+// directly - EmitInstruction runs for every instruction of every program.
+begin
+  if GRecMarkCall < 0 then
+    if GetEnvironmentVariable('RECMARKCALL') = '1' then GRecMarkCall := 1 else GRecMarkCall := 0;
+  Result := GRecMarkCall = 1;
+end;
+
 constructor TSSAGenerator.Create;
 var
   DefCh: Char;
 begin
   inherited Create;
+  RecMarkCallsAllocate;             // force the gate read before the first EmitInstruction
   FProgram := nil;
   FCurrentBlock := nil;
   FLabelCounter := 0;
@@ -1469,7 +1499,8 @@ begin
   if not Assigned(FCurrentBlock) then
     Exit;
 
-  if OpCode in RECORD_ALLOCATING_OPS then Inc(FRecAllocSeq);
+  if (OpCode in RECORD_ALLOCATING_OPS) or
+     ((GRecMarkCall = 1) and (OpCode in RECORD_ALLOCATING_CALL_OPS)) then Inc(FRecAllocSeq);
 
   Instr := TSSAInstruction.Create(OpCode);
   Instr.Dest := Dest;
