@@ -127,6 +127,7 @@ type
     function FindMatchingEnd(StartToken: TTokenType): Integer;
     function ParseDimensionList: TASTNode;
     procedure SkipTypeQualifiers;
+    function AtPointerSuffix: Boolean;   // FB: the current token is "PTR" (or its synonym "POINTER")
     procedure SetOptions(AValue: TParserOptions);
 
     // Helper for error reporting
@@ -2452,7 +2453,7 @@ begin
             // taken as the next parameter, so every parameter after a pointer one is mis-slotted (its
             // transfer slot no longer matches the caller's staging). Applies to array-of-pointer params
             // ("a() As T PTR") too.
-            while Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR') do
+            while AtPointerSuffix do
             begin
               ParamTypeName := ParamTypeName + ' PTR';
               Context.Advance;                      // consume PTR
@@ -2559,7 +2560,7 @@ begin
       RetTypeName := ParseDottedName;               // dotted: namespace-qualified return type
       // FreeBASIC pointer return type: "<type> PTR" (e.g. "FUNCTION f() AS Tree PTR"). Consume the PTR
       // suffix and keep it on the type name so the pre-scan records a pointer (int-handle) return.
-      while Context.Check(ttIdentifier) and (UpCase(Context.CurrentToken.Value) = 'PTR') do
+      while AtPointerSuffix do
       begin
         RetTypeName := RetTypeName + ' PTR';
         Context.Advance;                            // consume PTR
@@ -3057,7 +3058,7 @@ begin
         // Keep the "PTR" suffix on the parameter type (a "T PTR" param is an int address, not a T value).
         // Dropping it recorded a "Cat Ptr" parameter as "Cat", so the indirect call staged the argument
         // with UDT (by-value/handle) semantics instead of passing the pointer, corrupting the callee's arg.
-        while UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR' do
+        while AtPointerSuffix do
         begin PT := PT + ' PTR'; Context.Advance; end;
       end;
       if PT <> '' then
@@ -3078,7 +3079,7 @@ begin
     SkipTypeQualifiers;                     // FB: "As Const <type>"
     if Context.Check(ttIdentifier) then Node.Attributes.Values['FPRET'] := UpperCase(ParseDottedName);
     // Keep the "PTR" suffix on the return type too (a "T PTR" return is an int address).
-    while UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR' do
+    while AtPointerSuffix do
     begin Node.Attributes.Values['FPRET'] := Node.Attributes.Values['FPRET'] + ' PTR'; Context.Advance; end;
   end;
   Result := True;
@@ -3191,7 +3192,7 @@ begin
     Result := ParseDottedName;                    // dotted: namespace-qualified field type
     // FreeBASIC pointer field "<type> PTR": stored as an int handle. Capturing the suffix keeps a
     // self-referential field (e.g. "NXT AS NODE PTR") from being treated as a nested record.
-    while Context.Check(ttIdentifier) and (UpCase(Context.CurrentToken.Value) = 'PTR') do
+    while AtPointerSuffix do
     begin
       Result := Result + ' PTR';
       Context.Advance;                            // consume PTR
@@ -3265,7 +3266,7 @@ begin
         (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
     begin
       AliasType := ParseDottedName;
-      while Context.Check(ttIdentifier) and (UpCase(Context.CurrentToken.Value) = 'PTR') do
+      while AtPointerSuffix do
       begin
         AliasType := AliasType + ' PTR';
         Context.Advance;                            // consume PTR
@@ -3829,7 +3830,7 @@ begin
     if Context.Check(ttIdentifier) then
     begin
       ForVarType := ParseDottedName;
-      while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+      while AtPointerSuffix do
       begin
         ForVarType := ForVarType + ' PTR';
         Context.Advance;
@@ -7435,6 +7436,23 @@ begin
     Context.Advance;
 end;
 
+function TPackratParser.AtPointerSuffix: Boolean;
+// True when the current token is FreeBASIC's pointer-type suffix. fbc spells it either "PTR" or the
+// synonym "POINTER" - "Dim p As ZString Pointer" is the manual's own wording - and both are reserved
+// there, so in a TYPE position the word can only be the suffix.
+//
+// MODERN only. In CLASSIC, POINTER(v) is the Commodore spelling of VARPTR and has to stay a bare name
+// (SedaiSSA intercepts it as address-of), which is why the synonym is gated on the dialect and "PTR"
+// is not: v7 has no pointer types at all.
+var
+  W: string;
+begin
+  Result := False;
+  if not Context.Check(ttIdentifier) then Exit;
+  W := UpperCase(VarToStr(Context.CurrentToken.Value));
+  Result := (W = kPTR) or (FModernMode and (W = kPOINTER));
+end;
+
 function TPackratParser.ParseDimensionList: TASTNode;
 var
   Dimension, UpperExpr, RangeNode: TASTNode;
@@ -7687,7 +7705,7 @@ begin
     end;
     SharedTypeTok := Context.CurrentToken;
     SharedTypeName := ParseDottedName;
-    while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+    while AtPointerSuffix do
     begin
       SharedTypeName := SharedTypeName + ' PTR';
       Context.Advance;                        // consume PTR
@@ -7799,7 +7817,7 @@ begin
           DimTypeName := ParseDottedName;          // dotted: namespace-qualified type ("Forms.Point")
           // FreeBASIC pointer type: "<type> PTR" (one or more PTR). A pointer is stored as an int handle
           // (the address); the suffix is kept on the type name so the SSA records the pointee bank.
-          while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+          while AtPointerSuffix do
           begin
             DimTypeName := DimTypeName + ' PTR';
             Context.Advance;                       // consume PTR
@@ -8064,7 +8082,7 @@ begin
     end;
     TypeTok := Context.CurrentToken;
     StaticTypeName := ParseDottedName;
-    while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+    while AtPointerSuffix do
     begin StaticTypeName := StaticTypeName + ' PTR'; Context.Advance; end;
     repeat
       if not Context.Check(ttIdentifier) then Break;
@@ -8111,7 +8129,7 @@ begin
     end;
     TypeTok := Context.CurrentToken;
     StaticTypeName := ParseDottedName;               // dotted: namespace-qualified type
-    while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+    while AtPointerSuffix do
     begin
       StaticTypeName := StaticTypeName + ' PTR';
       Context.Advance;                               // consume PTR
@@ -8208,7 +8226,7 @@ begin
     begin
       RedimTypeTok := Context.CurrentToken;
       RedimTypeName := UpperCase(ParseDottedName);
-      while Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PTR') do
+      while AtPointerSuffix do
       begin RedimTypeName := RedimTypeName + ' PTR'; Context.Advance; end;
     end;
   end;
@@ -8695,7 +8713,7 @@ var
         begin
           ItemType := UpperCase(ParseDottedName);     // element type
           // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
-          while (Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR')) or
+          while AtPointerSuffix or
                 Context.Check(ttOpMul) do
           begin Context.Advance; ItemType := ItemType + ' PTR'; end;
         end;
@@ -8745,7 +8763,7 @@ begin
     begin
       TypeName := UpperCase(ParseDottedName);         // element type
       // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
-      while (Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR')) or
+      while AtPointerSuffix or
             Context.Check(ttOpMul) do
       begin Context.Advance; TypeName := TypeName + ' PTR'; end;
     end;
@@ -8799,7 +8817,7 @@ begin
     begin
       TypeName := UpperCase(ParseDottedName);         // element type
       // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
-      while (Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR')) or
+      while AtPointerSuffix or
             Context.Check(ttOpMul) do
       begin Context.Advance; TypeName := TypeName + ' PTR'; end;
     end;

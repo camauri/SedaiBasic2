@@ -247,6 +247,7 @@ const
   kSLOW    = 'SLOW';
   kFETCH   = 'FETCH';
   kPOINTER = 'POINTER';
+  kPTR     = 'PTR';      // FreeBASIC: the pointer-type suffix ("As Integer Ptr"); POINTER is its synonym
   kRREG    = 'RREG';
   kUSR     = 'USR';
 

@@ -310,6 +310,8 @@ type
     procedure CollectDeclaredNames(Node: TASTNode);  // Pre-scan AST for names an explicit declaration introduces
     function IsDeclaredName(const VarName: string): Boolean;
     function BareCallableFunction(const NameU: string): Boolean;  // a FUNCTION invocable with no arguments
+    function ProcReturnPtrUDT(const NameU: string): string;       // pointee UDT of a "FUNCTION f(...) AS T PTR", else ''
+    function ManagedPtrArithUDT(Node: TASTNode): string;          // pointee UDT of "p", "(p)", "p±n", "n+p" for a managed UDT pointer
     function ProcHasParamCount(const NameU: string; N: Integer): Boolean;  // decl has exactly N parameters
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
     procedure ProcessStatement(Node: TASTNode);
@@ -450,6 +452,7 @@ type
     function IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;           // Node = ALLOCATE/CALLOCATE/REALLOCATE(...)?
     function IsScreenPtrExpr(Node: TASTNode): Boolean;                          // Node = SCREENPTR / SCREENPTR()?
     function RawPtrExprName(Node: TASTNode): string;                            // raw pointer var of a raw ptr expr (p, p±n), else ''
+    function IsStrDataPtrExpr(Node: TASTNode): Boolean;                         // SADD(s)/STRPTR(s), and that ± an offset
     function RawPtrExprPointee(Node: TASTNode): string;                         // scalar pointee of a raw FIELD ptr expr (obj.field, @obj.field[i]), else ''
     procedure EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);           // p±n raw pointer arithmetic (SizeOf-scaled)
     function RawTypeCodeOf(const PtrName: string): Integer;                      // raw element type code for *p / p[i]
@@ -1356,6 +1359,49 @@ begin
   Result := ParamList.ChildCount = N;
 end;
 
+function TSSAGenerator.ManagedPtrArithUDT(Node: TASTNode): string;
+// Pointee UDT of a managed-pointer ARITHMETIC expression: "p", "(p)", "p ± n", "n + p". A UDT pointer
+// carries a record handle and the records of one Callocate block are consecutive, so "p + k" is the k-th
+// record - the very value "p[k]" computes. "(p+1)->field" therefore has a type, and without knowing it
+// the access resolved to nothing: the read yielded the HANDLE and the store was dropped in silence.
+//
+// Deliberately name-based (ManagedPtrPointee), not ObjectTypeName: a UDT VALUE in a "+" is an overloaded
+// OPERATOR, a different thing entirely, and it must keep its own resolution below.
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do
+    Node := Node.GetChild(0);
+  if Node.NodeType = antIdentifier then
+    Result := PointerUDTType(VarToStr(Node.Value))
+  else if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) and Assigned(Node.Token) and
+          ((Node.Token.TokenType = ttOpAdd) or (Node.Token.TokenType = ttOpSub)) then
+  begin
+    Result := ManagedPtrArithUDT(Node.GetChild(0));
+    if (Result = '') and (Node.Token.TokenType = ttOpAdd) then Result := ManagedPtrArithUDT(Node.GetChild(1));
+  end;
+end;
+
+function TSSAGenerator.ProcReturnPtrUDT(const NameU: string): string;
+// Pointee UDT of a FUNCTION declared "AS T PTR", else ''. The return type is an antIdentifier child of
+// the declaration's NAME node (the parser keeps the " PTR" suffix on it), and nothing else records it:
+// FPointerVars holds DIM'd variables only, so "f(a)->field" had no way to learn that the call yields a
+// record handle and printed the handle itself.
+var
+  Decl, NameNode: TASTNode;
+  T: string;
+begin
+  Result := '';
+  if not FProcDecls.TryGetValue(NameU, Decl) then Exit;
+  if (Decl = nil) or (Decl.ChildCount < 1) then Exit;
+  NameNode := Decl.GetChild(0);
+  if (NameNode = nil) or (NameNode.ChildCount < 1) or (NameNode.GetChild(0).NodeType <> antIdentifier) then Exit;
+  T := UpperCase(VarToStr(NameNode.GetChild(0).Value));
+  if (Length(T) <= 4) or (Copy(T, Length(T) - 3, 4) <> ' PTR') then Exit;
+  T := Trim(Copy(T, 1, Length(T) - 4));
+  if FindUDT(T) >= 0 then Result := T;
+end;
+
 function TSSAGenerator.BareCallableFunction(const NameU: string): Boolean;
 // FreeBASIC lets a FUNCTION be called with no parentheses when it needs no arguments: "x = Foo"
 // invokes Foo(). True only for a declared FUNCTION (a SUB yields no value) whose every parameter is
@@ -1835,6 +1881,17 @@ begin
           end;
           Exit;
         end;
+      end;
+      // *SADD(s) / *(STRPTR(s)±n) with no pointer variable in between: STRPTR is declared "ZString Ptr"
+      // in fbc, so the deref is the C string at that address - the same load a ZSTRING-pointee variable
+      // gets below, reached here by the EXPRESSION's type because there is no name to look up.
+      if IsStrDataPtrExpr(Node.GetChild(0)) then
+      begin
+        ProcessExpression(Node.GetChild(0), Left);
+        Left := EnsureIntRegister(Left);
+        Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(0));
+        Exit;
       end;
       // *p / *(p±n) where p is a RAW (Allocate'd) pointer: load SizeOf(pointee) bytes from the raw heap.
       // RawPtrExprName resolves the pointer var (for its element type) through the arithmetic.
@@ -20169,6 +20226,32 @@ begin
     Result := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
 end;
 
+function TSSAGenerator.IsStrDataPtrExpr(Node: TASTNode): Boolean;
+// True for a byte-heap pointer to a string's data: SADD(s) / STRPTR(s), "(that)", and that ± an offset.
+// The manual's own idiom is "p = StrPtr(text) + 6", so stopping at the bare call left the ARITHMETIC form
+// unmarked: p stayed a managed pointer and "*p" was decoded as an array handle instead of a raw address.
+// (RawPtrExprName covers p±n once p is a raw VARIABLE; this covers the call itself inside the same shape.)
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do
+    Node := Node.GetChild(0);
+  if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) and Assigned(Node.Token) and
+     ((Node.Token.TokenType = ttOpAdd) or (Node.Token.TokenType = ttOpSub)) then
+  begin
+    Result := IsStrDataPtrExpr(Node.GetChild(0));
+    if (not Result) and (Node.Token.TokenType = ttOpAdd) then Result := IsStrDataPtrExpr(Node.GetChild(1));
+    Exit;
+  end;
+  // A call parses as antArrayAccess(nameIdent, args); SADD/STRPTR are not registered keywords, so a
+  // same-named declared array must keep winning.
+  Result := FModernMode and (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
+            (Node.GetChild(0).NodeType = antIdentifier) and
+            ((UpperCase(VarToStr(Node.GetChild(0).Value)) = kSADD) or
+             (UpperCase(VarToStr(Node.GetChild(0).Value)) = kSTRPTR)) and
+            (ArrayIndexOf(VarToStr(Node.GetChild(0).Value)) < 0);
+end;
+
 function TSSAGenerator.RawPtrExprPointee(Node: TASTNode): string;
 // Scalar pointee type of a raw pointer expression whose raw-ness comes from a UDT FIELD (which has no
 // pointer variable name): "obj.field" itself, or "@obj.field[i]". Returns e.g. "DOUBLE", else ''. Used to
@@ -20442,12 +20525,8 @@ var
             (ArrayIndexOf(VarToStr(Rhs.GetChild(0).Value)) < 0) and
             (FRawPtrRetFuncs.IndexOfName(UpperCase(VarToStr(Rhs.GetChild(0).Value))) >= 0) then
       MarkRaw(TargetU)   // p = f(...) where f returns a raw <scalar> pointer
-    else if FModernMode and (Rhs.NodeType = antArrayAccess) and (Rhs.ChildCount >= 1) and
-            (Rhs.GetChild(0).NodeType = antIdentifier) and
-            ((UpperCase(VarToStr(Rhs.GetChild(0).Value)) = kSADD) or
-             (UpperCase(VarToStr(Rhs.GetChild(0).Value)) = kSTRPTR)) and
-            (ArrayIndexOf(VarToStr(Rhs.GetChild(0).Value)) < 0) then
-      MarkRaw(TargetU);   // p = SADD(s)/STRPTR(s): a raw byte-heap pointer -> deref p[i] onto the byte heap
+    else if IsStrDataPtrExpr(Rhs) then
+      MarkRaw(TargetU);   // p = SADD(s)/STRPTR(s), or that ± n: a raw byte-heap pointer -> deref onto the byte heap
   end;
 
 begin
@@ -21752,7 +21831,12 @@ begin
       // "f(args).field" / "f(args).method()": a user FUNCTION whose return type is a UDT. Its return
       // type is registered under the function's own name (that is what makes "Dim As T x = f(...)" work).
       if (Result = '') and (ArrayIndexOf(ArrName) < 0) and (FProcedureNames.IndexOf(ArrName) >= 0) then
+      begin
         Result := VarRecordTypeName(ArrName);
+        // "f(args)->field" where f returns "T PTR": the returned int is the record handle, so the object's
+        // type is the POINTEE. Only the UDT-value return was known here.
+        if Result = '' then Result := ProcReturnPtrUDT(ArrName);
+      end;
     end
     // Array-of-UDT MEMBER element "obj.field(i)", or a method call "obj.method(args)": child 0 is a
     // member access. The element type is the field's ArrayElemType; a method call yields its return type.
@@ -21804,7 +21888,10 @@ begin
     // operator. The operator is owned by a UDT OPERAND: try the LEFT operand's type, then the RIGHT -- a
     // MIXED-signature operator like "^(meas, double)" has only one UDT side, so requiring BOTH operands to
     // be the same UDT missed it, and the enclosing operator then failed to resolve (wrong value or AV).
-    if (ObjNode.ChildCount >= 2) and Assigned(ObjNode.Token) then
+    // "(p + k)->field": managed UDT-pointer arithmetic, not an operator overload. Asked first because a
+    // pointer operand can never select an OPERATOR + in FreeBASIC.
+    Result := ManagedPtrArithUDT(ObjNode);
+    if (Result = '') and (ObjNode.ChildCount >= 2) and Assigned(ObjNode.Token) then
     begin
       ParentType := ObjectTypeName(ObjNode.GetChild(0));
       if ParentType = '' then ParentType := ObjectTypeName(ObjNode.GetChild(1));
@@ -22123,6 +22210,16 @@ begin
       HandleVal := GetOrAllocateVariable(UpperCase(VarToStr(ObjNode.Value)));
     Result := True;
   end
+  else if ObjNode.NodeType = antBinaryOp then
+  begin
+    // "(p + k)->field": p is a managed UDT pointer, so p + k IS the k-th record's handle (unscaled, the
+    // same value EmitPointerIndexAddress computes for "p[k]"). Evaluating the arithmetic yields it.
+    TypeName := ManagedPtrArithUDT(ObjNode);
+    if TypeName = '' then Exit;
+    ProcessExpression(ObjNode, HandleVal);
+    HandleVal := EnsureIntRegister(HandleVal);
+    Result := True;
+  end
   else if ObjNode.NodeType = antDeref then
   begin
     // (*p).field where p is a UDT pointer: the deref yields p's handle directly.
@@ -22206,6 +22303,10 @@ begin
       if (ArrayIndexOf(ArrName) < 0) and (FProcedureNames.IndexOf(ArrName) >= 0) then
       begin
         ParentType := VarRecordTypeName(ArrName);
+        // "f(args)->field" where f returns "T PTR": the returned int IS the record handle, exactly as for
+        // a pointer variable. Only the UDT-VALUE return was known here, so the pointer-returning form fell
+        // through and the access silently yielded the handle instead of the field.
+        if ParentType = '' then ParentType := ProcReturnPtrUDT(ArrName);
         if ParentType <> '' then
         begin
           ProcessExpression(ObjNode, HandleVal);

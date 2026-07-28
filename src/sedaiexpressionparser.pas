@@ -87,6 +87,7 @@ type
     function ParseTypeConstructor(Token: TLexerToken): TASTNode; // type<T>(args) → anonymous UDT temporary
     function ParseCast(Token: TLexerToken): TASTNode;          // CAST/CPTR(type, expr) → antCast
     function ParseSizeOfPtrType(Token: TLexerToken): TASTNode; // SIZEOF(<type> PTR) → SIZEOF("T PTR"); nil if not a pointer type
+    function AtPointerSuffix: Boolean;                         // FB: the current token is "PTR" (or its synonym "POINTER")
     function ParseDeref(Token: TLexerToken): TASTNode;         // *ptr → antDeref (FreeBASIC pointers)
     function ParseThreadCreate(Token: TLexerToken): TASTNode;  // THREADCREATE(@sub, param) (M5.2)
     function ParseThreadSelf(Token: TLexerToken): TASTNode;    // THREADSELF() → antThreadSelf (M5.5)
@@ -1736,6 +1737,19 @@ begin
   DoNodeCreated(Result);
 end;
 
+function TExpressionParser.AtPointerSuffix: Boolean;
+// True when the current token is FreeBASIC's pointer-type suffix, spelled either "PTR" or the synonym
+// "POINTER". MODERN only: in CLASSIC, POINTER(v) is the Commodore spelling of VARPTR. Mirrors
+// TPackratParser.AtPointerSuffix - the two parsers read the same type positions.
+var
+  W: string;
+begin
+  Result := False;
+  if not Context.Check(ttIdentifier) then Exit;
+  W := UpperCase(VarToStr(Context.CurrentToken.Value));
+  Result := (W = kPTR) or (ModernMode and (W = kPOINTER));
+end;
+
 function TExpressionParser.ParseSizeOfPtrType(Token: TLexerToken): TASTNode;
 // "SIZEOF(<type> PTR [PTR...])" -> antFunctionCall SIZEOF whose single argument is the type spelled as ONE
 // identifier ("INTEGER PTR"), the same spelling a DIM produces. A speculative parse: it only commits when
@@ -1752,12 +1766,12 @@ begin
   if not Context.Check(ttIdentifier) then begin Context.RestorePosition(Saved); Exit; end;
   TypeStr := UpperCase(VarToStr(Context.CurrentToken.Value));
   Context.Advance;                                   // consume the type name
-  if not (Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR')) then
+  if not AtPointerSuffix then
   begin
     Context.RestorePosition(Saved);                  // not a pointer type -- leave it to the normal path
     Exit;
   end;
-  while Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PTR') do
+  while AtPointerSuffix do
   begin
     TypeStr := TypeStr + ' PTR';                     // "T PTR PTR" folds too
     Context.Advance;
@@ -1793,7 +1807,13 @@ begin
     else
     begin
       if (TypeStr <> '') and (TypeStr[Length(TypeStr)] <> '.') then TypeStr := TypeStr + ' ';
-      TypeStr := TypeStr + UpperCase(Context.CurrentToken.Value);
+      // "CPtr(ZString Pointer, p)": POINTER is fbc's synonym of PTR, and only the rest of the pipeline's
+      // spelling ("T PTR") is understood downstream. Normalise it here, where it can only be the suffix
+      // (a type name already stands to its left).
+      if (TypeStr <> '') and AtPointerSuffix then
+        TypeStr := TypeStr + kPTR
+      else
+        TypeStr := TypeStr + UpperCase(Context.CurrentToken.Value);
     end;
     Context.Advance;
   end;
