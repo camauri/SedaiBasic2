@@ -6570,8 +6570,10 @@ function TSSAGenerator.TryAllocAssign(const VarName: string; ExprNode: TASTNode)
 // block and store the raw pointer (a RAWPTR_TAG byte offset) into p. Probe included.
 var
   AllocFuncU, LhsRecType: string;
-  ExprValue, CountReg: TSSAValue;
+  ExprValue, CountReg, BytesVal, SizeVal, ProdReg: TSSAValue;
   UDTIdx: Integer;
+  AllocOffsets: TInt64Array;
+  AllocElemSize: Int64;
 begin
   Result := False;
   if not IsAllocCall(ExprNode, AllocFuncU) then Exit;
@@ -6591,11 +6593,39 @@ begin
     // (single byte-count arg) allocates one. A block of N CONSECUTIVE shared records makes "p[i]" (p + i)
     // index the i-th; a single record covers the linked-list/tree node case. Both live in the shared
     // region (handle non-zero, honours "p <> 0"; persists past the frame like Allocate).
+    // How many records? FreeBASIC's CAllocate is calloc's shape with a DEFAULTED second argument
+    // (Declare Function CAllocate (ByVal count As UInteger, ByVal size As UInteger = 1)), so the
+    // manual's own idiom passes ONE argument holding the TOTAL BYTE COUNT:
+    //     the_rectangle = CAllocate( 5 * Len( rect_type ) )
+    // Reading that single argument as a record count gave 5*Len(T) records; ignoring it, as this did,
+    // gave exactly ONE - so p[0] worked and every other index walked off the end of the allocation
+    // into an Access Violation. That is the manual's udt/with-2, and any C-style array of UDTs.
+    //
+    // Both forms are the same question in bytes, so ask it that way: records = total bytes DIV the
+    // type's C-layout size, floored at 1. With "CAllocate(n, Len(T))" the division gives n back; with
+    // "CAllocate(n * Len(T))" it gives n; with Allocate's single byte count it gives the right number
+    // too instead of assuming one.
+    // TWO-argument "CAllocate(count, size)" keeps reading argument 0 as the count, exactly as before:
+    // that form was already right, and the guards m367/m428 pin it. Only the ONE-argument form is
+    // reinterpreted, because only it was wrong.
+    CountReg := MakeSSAConstInt(1);
     if (UpperCase(AllocFuncU) = 'CALLOCATE') and (ExprNode.ChildCount >= 2) and
        (ExprNode.GetChild(1).ChildCount >= 2) then
-      ProcessExpression(ExprNode.GetChild(1).GetChild(0), CountReg)   // the element count
-    else
-      CountReg := MakeSSAConstInt(1);
+      ProcessExpression(ExprNode.GetChild(1).GetChild(0), CountReg)
+    else if (ExprNode.ChildCount >= 2) and (ExprNode.GetChild(1).ChildCount = 1) and
+       UDTCLayout(UDTIdx, AllocOffsets, AllocElemSize) and (AllocElemSize > 0) then
+    begin
+      ProcessExpression(ExprNode.GetChild(1).GetChild(0), BytesVal);
+      // Divide ROUNDING UP - "(bytes + size - 1) \ size" - so any non-zero request yields at least
+      // one usable instance. That matters for the linked-list idiom "p = Allocate(Len(T))" if Len ever
+      // rounds below the layout size, and it costs one add.
+      ProdReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, ProdReg, EnsureIntRegister(BytesVal),
+                      EnsureIntRegister(MakeSSAConstInt(AllocElemSize - 1)), MakeSSAValue(svkNone));
+      CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaDivInt, CountReg, ProdReg,
+                      EnsureIntRegister(MakeSSAConstInt(AllocElemSize)), MakeSSAValue(svkNone));
+    end;
     ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaRecordNewBlock, ExprValue, EnsureIntRegister(CountReg),
                     MakeSSAConstInt((Int64(FUDTs[UDTIdx].NInt) and $FFFF)
