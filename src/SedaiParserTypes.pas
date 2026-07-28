@@ -195,6 +195,8 @@ type
     antBoot,              // BOOT command (load and run bytecode)
     antCatalog,           // CATALOG/DIR command
     antDelete,            // DELETE command (delete program lines)
+    antLetList,           // FreeBASIC "Let(a, b, ...) = udt": destructure a UDT into the listed lvalues
+    antProcSig,           // a bare "Sub(...)"/"Function(...) As T" signature (value = parameter count)
     antRenumber,          // RENUMBER command (renumber program lines)
     antCopy,              // COPY/CP command (copy file)
     antScratch,           // SCRATCH command (delete file)

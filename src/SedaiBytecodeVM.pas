@@ -503,6 +503,7 @@ type
     procedure FilePrintColSet(Handle, Col: Integer);
     function FilePrintColGet(Handle: Integer): Integer;
     function RawLoadZStrVal(RawPtr: Int64; Wide: Boolean): string;      // C string at the raw address, up to NUL
+    function RawLoadBytesVal(RawPtr: Int64; Count: Integer): string;    // exactly Count bytes at the raw address
     procedure RawStoreZStrVal(RawPtr: Int64; const S: string; Wide: Boolean);  // chars + NUL at the raw address
     procedure RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
     procedure RawStoreFloat(RawPtr: Int64; TypeCode: Integer; Value: Double);
@@ -3883,6 +3884,19 @@ begin
     Result := Result or faArchive;
 end;
 
+function TBytecodeVM.RawLoadBytesVal(RawPtr: Int64; Count: Integer): string;
+// Exactly Count bytes at the raw address, terminator or not: a fixed-length string FIELD of a UDT laid
+// over raw memory occupies its declared width whatever it contains.
+var
+  P: PByte;
+begin
+  Result := '';
+  if Count <= 0 then Exit;
+  P := PByte(RawAddr(RawPtr, PtrUInt(Count)));    // validates the whole span
+  SetLength(Result, Count);
+  Move(P^, Result[1], Count);
+end;
+
 function TBytecodeVM.RawLoadZStrVal(RawPtr: Int64; Wide: Boolean): string;
 // "*p" where p is a ZSTRING PTR (Wide=False) or WSTRING PTR (Wide=True): the C string AT the
 // pointed address, read up to the NUL terminator - never past the end of the byte heap (a block
@@ -6026,6 +6040,11 @@ begin
           Ctx.XferFloat[255] := ComputeBuiltinFP(HandleNum64 and $FF, Ctx.XferFloat[0])   // 255 = XFER_RESULT_SLOT
         else
         begin
+          // A function pointer that was never assigned holds 0, and anything outside the program is not
+          // an entry point either: jumping there ran whatever bytes followed and surfaced as an access
+          // violation somewhere else entirely. Report it where it happens.
+          if (HandleNum64 <= 0) or (HandleNum64 >= FProgram.GetInstructionCount) then
+            raise ERangeError.Create('Call through an unset or invalid procedure pointer');
           FramePush(Ctx, HandleNum64, Ctx.PC);   // indirect: the entry PC is the register value
           GrowCallStackIfNeeded(Ctx);
           Ctx.CallStack[Ctx.CallStackPtr] := Ctx.PC;
@@ -9432,8 +9451,14 @@ begin
       end;
     33: // bcRawClear - CLEAR(dst, value, bytes)
       RawClear(Ctx.IntRegs[Instr.Src1], Byte(Ctx.IntRegs[Instr.Src2]), PtrUInt(Ctx.IntRegs[Instr.Immediate]));
-    50: // bcRawLoadZStr - Dest(str) = C string at RawAddr(IntRegs[Src1]); Imm 1 = WSTRING (UCS-2)
-      Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate = 1);
+    50: // bcRawLoadZStr - Dest(str) = C string at RawAddr(IntRegs[Src1]); Imm 1 = WSTRING (UCS-2).
+        // Immediate >= 2 asks for EXACTLY (Immediate - 2) bytes instead of "up to the terminator": that
+        // is what a fixed-length string FIELD of a UDT laid over raw memory is - n bytes, terminator or
+        // not, which is why "As String*5 sig" over "GIF89a" reads "GIF89" and misses a character.
+      if Instr.Immediate >= 2 then
+        Ctx.StringRegs[Instr.Dest] := RawLoadBytesVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate - 2)
+      else
+        Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate = 1);
     51: // bcRawStoreZStr - StringRegs[Src2] chars + NUL -> RawAddr(IntRegs[Src1]); Imm 1 = WSTRING
       RawStoreZStrVal(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1);
     34: // bcArrayBind - array BYREF param (PHASE 1): save FArrays[Src1] and snapshot the arg FArrays[Immediate],

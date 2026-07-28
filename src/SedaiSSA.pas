@@ -243,6 +243,7 @@ type
                                          // (UPPER) -> pointee type. r's register is int (it carries target's
                                          // address); reads/writes auto-dereference, like a BYREF-return param.
     FRawCollectChanged: Boolean;         // CollectRawPtrVars fixpoint: a new raw var was discovered this pass
+    FRawUDTPtrs: TStringList;            // "T PTR" vars holding a RAW address (a UDT laid over bytes) -> T
     FRawPtrVars: TStringList;            // FreeBASIC raw pointers: var (UPPER) ever assigned from Allocate/CAllocate/
                                          // Reallocate. Its value is a RAWPTR_TAG byte offset → deref/arithmetic use the
                                          // raw byte heap (SizeOf-scaled), not the managed FArrays/record path.
@@ -356,6 +357,7 @@ type
     function IsArrayParamSlot(Idx: Integer): Boolean;
     function EmitParamArrayLBoundSub(const Idx: TSSAValue; ArrayIdx, Dim: Integer): TSSAValue;
     function ProcedureLabelName(const Name: string): string;
+    function OverloadNameForArity(const Name: string; Arity: Integer): string;  // @name of an OVERLOAD set
     // UDT/record support (M3)
     procedure RegisterUDTs(Node: TASTNode);        // pre-scan TYPE declarations (2 passes)
     procedure EnsureObjectBaseType;                // OOP: register the built-in empty OBJECT base type (RTTI root)
@@ -483,6 +485,7 @@ type
     function AddrLocalHandle(const Name: string): TSSAValue;                    // its per-frame record/raw-address handle (hidden var)
     function AddrLocalType(const Name: string): string;                         // declared type of an @-taken local/param
     function IsRawAddrLocal(const Name: string): Boolean;                       // @-taken NON-string scalar local/param -> raw byte slot
+    function RawZStringBufBytes(const Name: string): Integer;                   // @-taken "ZSTRING * n" buffer -> n bytes, else 0
     procedure EmitRawAddrScalarAlloc(const Name: string);                       // allocate its per-frame 8-byte raw slot into the hidden handle
     function IsRawModuleScalar(const Name: string): Boolean;                    // MODULE-level @-taken non-string scalar (raw byte slot, address in a shared int array)
     function RawModuleScalarType(const Name: string): string;                   // its declared type
@@ -514,6 +517,7 @@ type
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
     procedure EmitUserFunctionCall(Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
     function EmitFuncPtrCall(const FPName, Sig: string; ArgListNode: TASTNode): TSSAValue;  // FB function-pointer indirect call
+    function DerefFuncPtrSig(Node: TASTNode): string;   // "*pf" of a "<funcptr type> Ptr" -> its signature
     function EmitIndirectCall(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;  // indirect call through an already-loaded entry-PC value
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
     function CanonicalType(const TypeName: string): string;   // resolve FB TYPE-alias chain to its base
@@ -639,6 +643,9 @@ type
     procedure ProcessDefType(Node: TASTNode);
     procedure CollectDefTypes(Node: TASTNode);
     procedure ProcessMidStatement(Node: TASTNode);
+    function UDTFieldBankOf(MemberNode: TASTNode): TSSARegisterType;   // bank of the field a member access names
+    function ParamPointeeType(const Name: string): string;   // pointee of a "<T> Ptr" PARAMETER of the current proc
+    function IsStringArgForBytePtrParam(ParamNode, ArgNode: TASTNode): Boolean;  // string arg -> byte-pointer param
     function EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
     procedure EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
     procedure ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
@@ -782,6 +789,8 @@ type
     procedure ProcessList(Node: TASTNode);
     procedure ProcessNew(Node: TASTNode);
     procedure ProcessDelete(Node: TASTNode);
+    function MakeFieldAccess(ObjNode: TASTNode; const FieldName: string; Token: TLexerToken): TASTNode;
+    procedure ProcessLetList(Node: TASTNode);   // FreeBASIC "Let(a, b, ...) = udt" destructuring
     procedure ProcessRenumber(Node: TASTNode);
     procedure ProcessCatalog(Node: TASTNode);
     // File management commands (executed directly in VM)
@@ -789,6 +798,12 @@ type
     function ProcessFsFunction(Node: TASTNode): TSSAValue;
     function ByrefRetCallName(Node: TASTNode): string;   // call to a BYREF-returning FUNCTION? -> its resolved label
     function EmitByrefRetAddress(Node: TASTNode): TSSAValue;   // ...lowered to the ADDRESS it returns
+    function RawUDTPtrType(const Name: string): string;   // "T PTR" holding a RAW address -> T
+    function FoldIntNode(Node: TASTNode; out Val: Int64): Boolean;        // literal integer arithmetic, no side effects
+    function UDTFieldArrayShape(UDTIdx, FieldIdx: Integer; out Count, ElemBytes: Int64): Boolean;
+    function UDTCLayoutRaw(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;
+    function TryEmitRawUDTMemberArray(MemberNode: TASTNode; Emit: Boolean; out ArrId: Integer): Boolean;
+    function TryEmitRawUDTField(ObjNode: TASTNode; const FieldName: string; out Value: TSSAValue): Boolean;
     function EmitDir(Node: TASTNode): TSSAValue;   // FreeBASIC DIR: start/continue a directory walk
     function TryEmitCvaMacro(const NameU: string; ArgsNode: TASTNode;
                              Tok: TLexerToken; out Value: TSSAValue): Boolean;  // CVA_START/ARG/COPY/END
@@ -1001,6 +1016,8 @@ begin
   FScalarPtrBanks.CaseSensitive := False;
   FAddrLocalVars := TStringList.Create;
   FRefVars := TStringList.Create;
+  FRawUDTPtrs := TStringList.Create;
+  FRawUDTPtrs.CaseSensitive := False;
   FRawPtrVars := TStringList.Create;
   FWStringVars := TStringList.Create;
   FWStringVars.CaseSensitive := False;
@@ -1087,6 +1104,7 @@ begin
   FAddrLocalVars.Free;
   FRefVars.Free;
   FRawPtrVars.Free;
+  FRawUDTPtrs.Free;
   FWStringVars.Free;
   FRedimMultiArrays.Free;
   FDynamicArrays.Free;
@@ -1702,6 +1720,8 @@ end;
 // Main implementation with destination hint
 procedure TSSAGenerator.ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
 var
+  ThisFieldNode: TASTNode;   // synthesized "this.<field>" for an implicit-THIS subscript
+  ImplicitCallNode: TASTNode;  // synthesized "this.<field>(args)" for an implicit-THIS funcptr call
   Left, Right: TSSAValue;
   DestReg: Integer;
   OpCode: TSSAOpCode;
@@ -1781,7 +1801,24 @@ begin
       // (CollectAddressTakenVars); its packed address is (arrayId+1) shl POINTER_ARRAY_SHIFT so 0
       // stays a NULL sentinel. A child is present for @arr(i) (index list → array element) and
       // @obj.field (member access → record-field pointer).
-      if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antMemberAccess) then
+      // "@Type.method": the entry PC of a member procedure named through its TYPE (a STATIC member sub
+      // has no instance, so this is the only way to point at it). Tried before the field path, which
+      // would otherwise report "object is not a record" for a type NAME.
+      if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antMemberAccess) and
+         (Node.GetChild(0).ChildCount >= 1) and
+         (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+         (FindUDT(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))) >= 0) and
+         (ResolveMethodLabel(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)),
+                             VarToStr(Node.GetChild(0).Value)) <> '') then
+      begin
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadProcAddr, Result,
+                        MakeSSALabel(ProcedureLabelName(
+                          ResolveMethodLabel(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)),
+                                             VarToStr(Node.GetChild(0).Value)))),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antMemberAccess) then
         EmitFieldAddress(Node.GetChild(0), Result)
       else if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antArrayAccess) then
         EmitArrayElementAddress(Node.GetChild(0), Result)
@@ -1825,7 +1862,8 @@ begin
         // block so an address-taken-only SUB is not dead-block-eliminated.
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaLoadProcAddr, Result,
-                        MakeSSALabel(ProcedureLabelName(VarToStr(Node.Value))),
+                        MakeSSALabel(ProcedureLabelName(OverloadNameForArity(VarToStr(Node.Value),
+                                     StrToIntDef(Node.Attributes.Values['SIGARITY'], -1)))),
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
     end;
@@ -1885,6 +1923,23 @@ begin
         ProcessExpression(Node.GetChild(0), Left);
         Result := EnsureIntRegister(Left);
         Exit;
+      end;
+      // "*p" where p is declared "ZSTRING PTR" / "WSTRING PTR": the pointee is a C STRING, so the value
+      // is its CHARACTERS, read at the address up to the terminator. Any other reading of it - a scalar
+      // load of eight bytes, say - takes the address itself for data. This is how a string reaches a
+      // procedure declared "ByVal r As ZString Ptr".
+      if (DerefTarget.NodeType = antIdentifier) then
+      begin
+        TempStr := UpperCase(FPointerVars.Values[UpperCase(VarToStr(DerefTarget.Value))]);
+        if TempStr = '' then TempStr := ParamPointeeType(VarToStr(DerefTarget.Value));
+        if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') then
+        begin
+          ProcessExpression(DerefTarget, Left);
+          Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+          EmitInstruction(ssaRawLoadZStr, Result, EnsureIntRegister(Left), MakeSSAValue(svkNone),
+                          MakeSSAConstInt(Ord(TempStr = 'WSTRING')));
+          Exit;
+        end;
       end;
       // *obj.field / *(@obj.field[i]) where the field is a raw "<scalar> PTR": load SizeOf(pointee) bytes
       // from the raw heap at the field's address value. Type-based (a field has no pointer name, so the
@@ -2241,7 +2296,11 @@ begin
       begin
         FuncRetType := AddrLocalBank(VarName);
         Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
-        if IsRawAddrLocal(VarName) then
+        if RawZStringBufBytes(VarName) > 0 then
+          // A character buffer: the C string living in it, read at its address.
+          EmitInstruction(ssaRawLoadZStr, Result, EnsureIntRegister(AddrLocalHandle(VarName)),
+                          MakeSSAValue(svkNone), MakeSSAConstInt(Ord(AddrLocalType(VarName) = 'WSTRING')))
+        else if IsRawAddrLocal(VarName) then
           // Raw byte slot: read the declared-width value from the handle's byte address (bit-exact).
           case FuncRetType of
             srtFloat: EmitInstruction(ssaRawLoadFloat, Result, EnsureIntRegister(AddrLocalHandle(VarName)), MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))));
@@ -2257,7 +2316,11 @@ begin
       begin
         FuncRetType := TypeNameToBank(RawModuleScalarType(VarName), VarName);
         Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
-        if FuncRetType = srtFloat then
+        if FuncRetType = srtString then
+          // A ZSTRING/WSTRING buffer: the C string living in it, read at its address (to the terminator).
+          EmitInstruction(ssaRawLoadZStr, Result, RawModuleAddrReg(VarName), MakeSSAValue(svkNone),
+                          MakeSSAConstInt(Ord(RawModuleScalarType(VarName) = 'WSTRING')))
+        else if FuncRetType = srtFloat then
           EmitInstruction(ssaRawLoadFloat, Result, RawModuleAddrReg(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))))
         else
           EmitInstruction(ssaRawLoadInt, Result, RawModuleAddrReg(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))));
@@ -5050,6 +5113,17 @@ begin
           end;
         end;
 
+        // "obj.s[i]" - the byte subscript on a STRING FIELD, which is neither a method call nor an
+        // array member: it must be tested before both, or the subscript is read as an element index into
+        // the field's (nonexistent) array handle and answers the HANDLE.
+        if (Node.GetChild(0).NodeType = antMemberAccess) and
+           (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) and
+           (UDTFieldBankOf(Node.GetChild(0)) = srtString) then
+        begin
+          Result := EmitStringByteRead(Node.GetChild(0), Node.GetChild(1).GetChild(0));
+          Exit;
+        end;
+
         // Method call obj.method(args) (M4.1): child0 is a member access whose field is a
         // method of the object's type. Pass the object as the implicit THIS argument.
         if Node.GetChild(0).NodeType = antMemberAccess then
@@ -5110,6 +5184,22 @@ begin
             TempVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
             EmitInstruction(ssaRecordLoadInt, TempVal, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RecSlotK));
             Result := EmitIndirectCall(TempVal, TempStr, Node.GetChild(1));
+            Exit;
+          end;
+        end;
+
+        // "(*pf)(args)" - a call through a POINTER TO a function pointer. FreeBASIC needs the
+        // parentheses (otherwise PTR would bind to the return type), so the callee arrives here as a
+        // parenthesised expression rather than a name. Its value IS the entry PC; the signature comes
+        // from the pointer's declared pointee type. Without this the whole call evaluated to NOTHING and
+        // the PRINT around it printed nothing at all, silently.
+        if (Node.GetChild(0).NodeType = antParentheses) and (Node.GetChild(0).ChildCount >= 1) then
+        begin
+          TempStr := DerefFuncPtrSig(Node.GetChild(0).GetChild(0));
+          if TempStr <> '' then
+          begin
+            ProcessExpression(Node.GetChild(0), TempVal);
+            Result := EmitIndirectCall(EnsureIntRegister(TempVal), TempStr, Node.GetChild(1));
             Exit;
           end;
         end;
@@ -5661,6 +5751,12 @@ begin
             AddrNode := TASTNode.Create(antProcAddress, ArgNode.Token);
             AddrNode.AddChild(ArgNode.Clone);
           end;
+          // "ProcPtr(p, Sub(...))" (fbc 1.09+): the second argument is a SIGNATURE that names which
+          // OVERLOAD of p to take. Its parameter count is all that separates them here.
+          if (Node.GetChild(1).ChildCount >= 2) and
+             (Node.GetChild(1).GetChild(1).NodeType = antProcSig) then
+            AddrNode.Attributes.Values['SIGARITY'] :=
+              IntToStr(StrToIntDef(VarToStr(Node.GetChild(1).GetChild(1).Value), -1));
           ProcessExpression(AddrNode, Result);
           AddrNode.Free;
           Exit;
@@ -5967,10 +6063,42 @@ begin
           Exit;
         end;
 
+        // ...and inside a method body the same subscript with no object: "s[i]" means "this.s[i]".
+        if (ArrayIndexOf(ArrName) < 0) and (Node.GetChild(1).NodeType = antExpressionList) and
+           (Node.GetChild(1).ChildCount = 1) and
+           TryImplicitThisField(ArrName, Node.Token, ThisFieldNode) then
+        begin
+          if UDTFieldBankOf(ThisFieldNode) = srtString then
+          begin
+            Result := EmitStringByteRead(ThisFieldNode, Node.GetChild(1).GetChild(0));
+            ThisFieldNode.Free;
+            Exit;
+          end;
+          ThisFieldNode.Free;
+        end;
+
         // FreeBASIC implicit THIS, for a CALL: inside a method body, "m(args)" with no object means
         // "this.m(args)". Fields already resolved that way; methods did not, so a method calling another
         // method of its OWN type was read as an array access and died here as "Array not declared".
         if TryImplicitThisMethod(ArrName, Node.GetChild(1), Node.Token, Result) then Exit;
+
+        // ...and a bare FUNCPTR FIELD called with arguments: "handler_func(This)" inside a method means
+        // "this.handler_func(This)", an indirect call through the field's entry PC. Only the METHOD form
+        // was resolved through THIS, so a type that dispatches through a member function pointer - the
+        // whole point of that idiom - died here as an undeclared array.
+        if (ArrayIndexOf(ArrName) < 0) and TryImplicitThisField(ArrName, Node.Token, ThisFieldNode) then
+        begin
+          if UDTFuncPtrFieldSig(FindUDT(ObjectTypeName(ThisFieldNode.GetChild(0))), ArrName, RecSlotK) <> '' then
+          begin
+            ImplicitCallNode := TASTNode.Create(antArrayAccess, Node.Token);
+            ImplicitCallNode.AddChild(ThisFieldNode);            // owned by the temp node now
+            ImplicitCallNode.AddChild(Node.GetChild(1).Clone);
+            ProcessExpression(ImplicitCallNode, Result);
+            ImplicitCallNode.Free;
+            Exit;
+          end;
+          ThisFieldNode.Free;
+        end;
 
         ArrayIdx := ArrayIndexOf(ArrName);
         if ArrayIdx < 0 then
@@ -6242,7 +6370,12 @@ begin
   if IsAddrLocal(VarName) then
   begin
     ProcessExpression(ExprNode, ExprValue);
-    if IsRawAddrLocal(VarName) then
+    if RawZStringBufBytes(VarName) > 0 then
+      // A character buffer: write the string's BYTES into it, terminator included, so a pointer aimed at
+      // the same address reads what the program put there.
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(VarName)),
+                      EnsureStringRegister(ExprValue), MakeSSAConstInt(Ord(AddrLocalType(VarName) = 'WSTRING')))
+    else if IsRawAddrLocal(VarName) then
     begin
       // Raw byte slot: store the declared-width value at the handle's byte address (matches the raw read/@).
       if AddrLocalBank(VarName) = srtFloat then
@@ -6268,6 +6401,15 @@ begin
   if IsRawModuleScalar(VarName) then
   begin
     ProcessExpression(ExprNode, ExprValue);
+    if TypeNameToBank(RawModuleScalarType(VarName), VarName) = srtString then
+    begin
+      // A ZSTRING/WSTRING buffer: write the string's BYTES into it, terminator included, so a pointer
+      // aimed at the same address reads what the program put there.
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), RawModuleAddrReg(VarName),
+                      EnsureStringRegister(ExprValue),
+                      MakeSSAConstInt(Ord(RawModuleScalarType(VarName) = 'WSTRING')));
+      Exit;
+    end;
     if TypeNameToBank(RawModuleScalarType(VarName), VarName) = srtFloat then
     begin
       ExprValue := EnsureFloatRegister(ExprValue);
@@ -7047,7 +7189,8 @@ var
   ExprValue, FixedCapReg, FixedTrunc: TSSAValue;
 begin
   Result := False;
-  if IsSharedScalar(VarName) or IsAddrLocal(VarName) then Exit;
+  if IsSharedScalar(VarName) and not IsRawModuleScalar(VarName) then Exit;
+  if IsAddrLocal(VarName) and (RawZStringBufBytes(VarName) <= 0) then Exit;
   // "ZSTRING/WSTRING * n": truncate to n-1 characters (the nth cell is the terminator) and store as an
   // ordinary variable-length string — no padding, so LEN stays the content length as fbc reports it.
   // Codepoints for a WSTRING, bytes for a ZSTRING.
@@ -7072,8 +7215,24 @@ begin
     // differ only for a program that takes the ADDRESS and reads past the NUL, which needs a raw model
     // this type does not have yet.) EmitFixedLenToVarLen is the same conversion a fixed-length buffer
     // already used in a variable-length context - one implementation, not two.
-    FixedTrunc := EmitFixedLenToVarLen(FixedTrunc, IsWStringVar(VarName));
-    EmitInstruction(ssaCopyString, GetOrAllocateVariable(VarName), FixedTrunc, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // ...but a RAW-BACKED buffer must NOT be cut on the store: fbc copies the source's BYTES into it,
+    // embedded NULs and all, and only stops at the terminator when it later READS the buffer as a C
+    // string. Cutting here lost every byte past the first NUL, so a GIF header stored into a
+    // "ZString * 11" kept 7 of its 10 bytes and its last field read as zero. The raw read already ends
+    // at the terminator, so LEN and PRINT still answer what fbc answers.
+    if not (IsRawModuleScalar(VarName) or (RawZStringBufBytes(VarName) > 0)) then
+      FixedTrunc := EmitFixedLenToVarLen(FixedTrunc, IsWStringVar(VarName));
+    // An @-taken buffer keeps its characters in RAW BYTES, not in a string register: that is the whole
+    // point of having taken its address. Truncation above still applies - it decides WHAT is written -
+    // only the destination differs.
+    if IsRawModuleScalar(VarName) then
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), RawModuleAddrReg(VarName),
+                      EnsureStringRegister(FixedTrunc), MakeSSAConstInt(Ord(IsWStringVar(VarName))))
+    else if RawZStringBufBytes(VarName) > 0 then
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(VarName)),
+                      EnsureStringRegister(FixedTrunc), MakeSSAConstInt(Ord(IsWStringVar(VarName))))
+    else
+      EmitInstruction(ssaCopyString, GetOrAllocateVariable(VarName), FixedTrunc, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit(True);
   end;
   FixedCap := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
@@ -7495,6 +7654,7 @@ end;
 
 procedure TSSAGenerator.ProcessArrayStore(Node: TASTNode);
 var
+  ThisFieldNode: TASTNode;   // synthesized "this.<field>" for an implicit-THIS subscript
   TargetNode, ExprNode: TASTNode;
   ArrName: string;
   ArrayIdx: Integer;
@@ -7523,6 +7683,17 @@ begin
   if TargetNode.NodeType <> antArrayAccess then Exit;
   if TargetNode.ChildCount < 2 then Exit;
 
+  // "obj.s[i] = c" - the byte subscript on a STRING FIELD, which is NOT an array member: it must be
+  // tested before the member-array store below, or the subscript is read as an element index into the
+  // field's (nonexistent) array handle and the assignment quietly does nothing.
+  if (TargetNode.GetChild(0).NodeType = antMemberAccess) and
+     (TargetNode.GetChild(1).NodeType = antExpressionList) and (TargetNode.GetChild(1).ChildCount = 1) and
+     (UDTFieldBankOf(TargetNode.GetChild(0)) = srtString) then
+  begin
+    EmitStringByteWrite(TargetNode.GetChild(0), TargetNode.GetChild(1).GetChild(0), ExprNode, Node.Token);
+    Exit;
+  end;
+
   // UDT array member store obj.field(i,j) = expr: the array root is a member access -> indirect store.
   if TargetNode.GetChild(0).NodeType = antMemberAccess then
   begin
@@ -7533,6 +7704,20 @@ begin
   // Get array name
   if TargetNode.GetChild(0).NodeType <> antIdentifier then Exit;
   ArrName := VarToStr(TargetNode.GetChild(0).Value);
+
+  // ...and inside a method body the same write with no object: "s[i] = c" means "this.s[i] = c".
+  if (ArrayIndexOf(ArrName) < 0) and (TargetNode.GetChild(1).NodeType = antExpressionList) and
+     (TargetNode.GetChild(1).ChildCount = 1) and
+     TryImplicitThisField(ArrName, Node.Token, ThisFieldNode) then
+  begin
+    if UDTFieldBankOf(ThisFieldNode) = srtString then
+    begin
+      EmitStringByteWrite(ThisFieldNode, TargetNode.GetChild(1).GetChild(0), ExprNode, Node.Token);
+      ThisFieldNode.Free;
+      Exit;
+    end;
+    ThisFieldNode.Free;
+  end;
 
   // FreeBASIC string subscript write "s[i] = c" on a scalar STRING variable: set the byte at the
   // 0-based index i. Not an array, not a pointer -> a string byte write. A SHARED scalar string is
@@ -7745,7 +7930,7 @@ var
   HasLowerBounds: Boolean;
   LbVal: TSSAValue;
   FoldedBound: Int64;
-  DimCount, i, j, ArrayIdx, WIdx: Integer;
+  DimCount, i, j, ArrayIdx, WIdx, InitBytes: Integer;
   DimValue: TSSAValue;
   DimValues: array of TSSAValue;  // Store dimension values (registers or constants)
   DimRegs: array of Integer;      // Register indices for variable dimensions
@@ -7885,9 +8070,18 @@ begin
         ArrayIdx := RawModuleAddrArrayId(UpperCase(ArrName));
         EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), MakeSSAArrayRef(ArrayIdx, srtInt),
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-        // 8-byte raw block address into RecHandleVal ...
+        // Raw block address into RecHandleVal. A fixed-length ZSTRING/WSTRING is a CHARACTER BUFFER and
+        // needs its DECLARED size: an 8-byte slot silently dropped everything past the eighth byte, so a
+        // "ZString * 11" holding a GIF header lost its last field.
+        InitBytes := StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0);
+        if InitBytes > 0 then
+        begin
+          if UpperCase(VarToStr(ArrayDeclNode.GetChild(1).Value)) = 'WSTRING' then InitBytes := InitBytes * 2;
+        end
+        else
+          InitBytes := 8;
         UbReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-        EmitInstruction(ssaLoadConstInt, UbReg, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitInstruction(ssaLoadConstInt, UbReg, MakeSSAConstInt(InitBytes), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaRawAlloc, RecHandleVal, UbReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         // ... stored into "<name>$RA"[0] (ssaArrayStore takes value first, then array ref, then index).
@@ -7951,7 +8145,10 @@ begin
           end
           else if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType = antArgumentList) then
           begin
-            if ArrayDeclNode.GetChild(2).Attributes.Values['TUPLEINIT'] = '1' then
+            // A one-element "= (x)" resolves a CONSTRUCTOR first (EmitConstructorCall falls back to the
+            // field-wise form when none matches), so a type built from a single value still runs its ctor.
+            if (ArrayDeclNode.GetChild(2).Attributes.Values['TUPLEINIT'] = '1') and
+               (ArrayDeclNode.GetChild(2).Attributes.Values['TUPLE1'] <> '1') then
               EmitUDTAggregateInit(RecHandleVal, RecUDTIdx, ArrayDeclNode.GetChild(2))  // = (a,b,c) field init
             else
               EmitConstructorCall(RecHandleVal, RecTypeName, ArrayDeclNode.GetChild(2));
@@ -8024,7 +8221,10 @@ begin
         else if (ArrayDeclNode.ChildCount >= 3) and
            (ArrayDeclNode.GetChild(2).NodeType = antArgumentList) then
         begin
-          if ArrayDeclNode.GetChild(2).Attributes.Values['TUPLEINIT'] = '1' then
+          // A one-element "= (x)" resolves a CONSTRUCTOR first (EmitConstructorCall falls back to the
+          // field-wise form when none matches), so a type built from a single value still runs its ctor.
+          if (ArrayDeclNode.GetChild(2).Attributes.Values['TUPLEINIT'] = '1') and
+             (ArrayDeclNode.GetChild(2).Attributes.Values['TUPLE1'] <> '1') then
             EmitUDTAggregateInit(RecHandleVal, RecUDTIdx, ArrayDeclNode.GetChild(2))  // = (a,b,c) field init
           else
             EmitConstructorCall(RecHandleVal, RecTypeName, ArrayDeclNode.GetChild(2));
@@ -9366,6 +9566,61 @@ begin
   AsnNode.AddChild(TmpRef);
   ProcessAssignment(AsnNode);
   AsnNode.Free;
+end;
+
+function TSSAGenerator.UDTFieldBankOf(MemberNode: TASTNode): TSSARegisterType;
+// The storage bank of the field a member access names, or srtInt when it names no known field.
+var
+  UDTIdx, i: Integer;
+begin
+  Result := srtInt;
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  UDTIdx := FindUDT(ObjectTypeName(MemberNode.GetChild(0)));
+  if UDTIdx < 0 then Exit;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if UpperCase(FUDTs[UDTIdx].Fields[i].Name) = UpperCase(VarToStr(MemberNode.Value)) then
+      Exit(FUDTs[UDTIdx].Fields[i].Bank);
+end;
+
+function TSSAGenerator.ParamPointeeType(const Name: string): string;
+// The pointee type of a PARAMETER declared "<T> Ptr" in the procedure being lowered, or ''. Parameters
+// are not in FPointerVars (only DIMs are), so a pointer that arrives as an argument had no declared
+// pointee to consult.
+var
+  Decl, ParamList, P: TASTNode;
+  i: Integer;
+  T: string;
+begin
+  Result := '';
+  if FCurrentProcName = '' then Exit;
+  if not (FProcDecls.TryGetValue(FCurrentProcName, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2)) then Exit;
+  ParamList := Decl.GetChild(1);
+  for i := 0 to ParamList.ChildCount - 1 do
+  begin
+    P := ParamList.GetChild(i);
+    if UpperCase(VarToStr(P.Value)) <> UpperCase(Name) then Continue;
+    if P.ChildCount < 1 then Exit;
+    T := UpperCase(VarToStr(P.GetChild(0).Value));
+    if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+      Result := Trim(Copy(T, 1, Length(T) - 4));
+    Exit;
+  end;
+end;
+
+function TSSAGenerator.IsStringArgForBytePtrParam(ParamNode, ArgNode: TASTNode): Boolean;
+// True when a STRING-valued argument meets a parameter declared as a pointer to BYTES - a ZSTRING,
+// BYTE/UBYTE or ANY pointer - the conversion FreeBASIC performs by passing the address of the string.
+var
+  PT: string;
+begin
+  Result := False;
+  if (ParamNode = nil) or (ArgNode = nil) or (ParamNode.ChildCount < 1) then Exit;
+  PT := UpperCase(VarToStr(ParamNode.GetChild(0).Value));
+  if (PT <> 'ZSTRING PTR') and (PT <> 'BYTE PTR') and (PT <> 'UBYTE PTR') and (PT <> 'ANY PTR') then Exit;
+  Result := (ArgNode.NodeType = antLiteral) and Assigned(ArgNode.Token) and
+            (ArgNode.Token.TokenType = ttStringLiteral);
+  if not Result then
+    Result := (ArgNode.NodeType = antIdentifier) and (GetVariableType(VarToStr(ArgNode.Value)) = srtString);
 end;
 
 function TSSAGenerator.EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
@@ -15887,6 +16142,77 @@ begin
                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
+function TSSAGenerator.MakeFieldAccess(ObjNode: TASTNode; const FieldName: string;
+  Token: TLexerToken): TASTNode;
+// "<obj>.<field>" as a fresh AST node over a COPY of the object expression (the caller keeps its own).
+begin
+  Result := TASTNode.CreateWithValue(antMemberAccess, UpperCase(FieldName), Token);
+  Result.AddChild(ObjNode.Clone);
+end;
+
+procedure TSSAGenerator.ProcessLetList(Node: TASTNode);
+// FreeBASIC "Let(a, b, ...) = src": the destination list mirrors the SHAPE of the source type's own
+// initializer, which for a type that EXTENDS another is "(base, own-field-1, ..., own-field-n)". So
+// "Let(c, i1, i2) = gc" gives c the whole Child part of gc and i1/i2 gc's OWN two fields - it does NOT
+// walk the flattened field list, which would have handed i1/i2 the Child fields instead (fbc rejects the
+// flat form outright: "Invalid assignment/conversion, at the 1st element of LET()").
+//
+// Lowered as synthesised per-field assignments through ProcessAssignment, so every destination form an
+// ordinary assignment accepts (a local, a SHARED scalar, a field, an array element) works here too.
+var
+  Targets, SrcNode, Dst, Asg: TASTNode;
+  SrcType, DstType: string;
+  SrcUDT, DstUDT, BaseUDT, t, k, FirstOwn: Integer;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 2) then Exit;
+  Targets := Node.GetChild(0);
+  SrcNode := Node.GetChild(1);
+  SrcType := ObjectTypeName(SrcNode);
+  SrcUDT := FindUDT(SrcType);
+  if SrcUDT < 0 then
+    raise Exception.Create('LET(...) = requires a UDT on the right-hand side');
+
+  // The inherited fields come first in our layout, so the source's OWN fields start right after the
+  // base's. A type with no base (or with the empty OBJECT root) owns all of them.
+  FirstOwn := 0;
+  BaseUDT := FindUDT(UpperCase(FUDTs[SrcUDT].Parent));
+  if BaseUDT >= 0 then FirstOwn := Length(FUDTs[BaseUDT].Fields);
+
+  t := 0;
+  // Element 0 is the BASE OBJECT when the source type extends one. The destination may be any ancestor
+  // (fbc accepts "Let(p, ...) = gc" with p a Parent), so copy the fields the DESTINATION declares.
+  if (FirstOwn > 0) and (Targets.ChildCount > 0) then
+  begin
+    Dst := Targets.GetChild(0);
+    DstType := ObjectTypeName(Dst);
+    DstUDT := FindUDT(DstType);
+    if DstUDT < 0 then
+      raise Exception.Create('LET(...) = : the first element must receive the base object');
+    for k := 0 to High(FUDTs[DstUDT].Fields) do
+    begin
+      if k > High(FUDTs[SrcUDT].Fields) then Break;
+      Asg := TASTNode.Create(antAssignment, Node.Token);
+      Asg.AddChild(MakeFieldAccess(Dst, FUDTs[DstUDT].Fields[k].Name, Node.Token));
+      Asg.AddChild(MakeFieldAccess(SrcNode, FUDTs[SrcUDT].Fields[k].Name, Node.Token));
+      ProcessAssignment(Asg);
+      Asg.Free;
+    end;
+    t := 1;
+  end;
+
+  // ...and the rest take the source type's OWN fields, in declaration order.
+  k := FirstOwn;
+  while (t < Targets.ChildCount) and (k <= High(FUDTs[SrcUDT].Fields)) do
+  begin
+    Asg := TASTNode.Create(antAssignment, Node.Token);
+    Asg.AddChild(Targets.GetChild(t).Clone);
+    Asg.AddChild(MakeFieldAccess(SrcNode, FUDTs[SrcUDT].Fields[k].Name, Node.Token));
+    ProcessAssignment(Asg);
+    Asg.Free;
+    Inc(t); Inc(k);
+  end;
+end;
+
 procedure TSSAGenerator.ProcessDelete(Node: TASTNode);
 var
   StartVal, EndVal, StartReg, EndReg: TSSAValue;
@@ -16208,6 +16534,283 @@ begin
   EmitProcedureCall(Nm, Args);
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitXferLoad(srtInt, XFER_RESULT_SLOT, Result);
+end;
+
+function TSSAGenerator.RawUDTPtrType(const Name: string): string;
+// The pointee UDT of a "T PTR" variable that holds a RAW ADDRESS rather than a record handle, or ''.
+begin
+  Result := '';
+  if FRawUDTPtrs = nil then Exit;
+  Result := UpperCase(FRawUDTPtrs.Values[UpperCase(Name)]);
+end;
+
+function TSSAGenerator.FoldIntNode(Node: TASTNode; out Val: Int64): Boolean;
+// Constant-fold an integer expression built of literals, parentheses, unary minus and + - * \: enough for
+// the bound of a fixed-size array member ("sig(0 To 6-1)"), which must be known to lay the type over bytes.
+var
+  A, B: Int64;
+begin
+  Result := False; Val := 0;
+  if Node = nil then Exit;
+  case Node.NodeType of
+    antParentheses:
+      if Node.ChildCount >= 1 then Result := FoldIntNode(Node.GetChild(0), Val);
+    antLiteral:
+      Result := TryStrToInt64(Trim(VarToStr(Node.Value)), Val);
+    antIdentifier:
+      Result := ModuleConstInt(UpperCase(VarToStr(Node.Value)), Val);
+    antUnaryOp:
+      if (Node.ChildCount >= 1) and Assigned(Node.Token) and (Node.Token.TokenType = ttOpSub) then
+        if FoldIntNode(Node.GetChild(0), A) then begin Val := -A; Result := True; end;
+    antBinaryOp:
+      if (Node.ChildCount >= 2) and Assigned(Node.Token) and
+         FoldIntNode(Node.GetChild(0), A) and FoldIntNode(Node.GetChild(1), B) then
+        case Node.Token.TokenType of
+          ttOpAdd: begin Val := A + B; Result := True; end;
+          ttOpSub: begin Val := A - B; Result := True; end;
+          ttOpMul: begin Val := A * B; Result := True; end;
+          ttOpIntDiv: if B <> 0 then begin Val := A div B; Result := True; end;
+        end;
+  end;
+end;
+
+function TSSAGenerator.UDTFieldArrayShape(UDTIdx, FieldIdx: Integer; out Count, ElemBytes: Int64): Boolean;
+// A FIXED-size, one-dimensional array member of a SCALAR type: its element count and element byte width.
+// Anything else (an "Any" member sized by REDIM, more than one dimension, an array of records or of
+// strings) has no byte image we can lay over raw memory.
+var
+  F: TUDTField;
+  Lb, Ub: Int64;
+  D: TASTNode;
+begin
+  Result := False; Count := 0; ElemBytes := 0;
+  F := FUDTs[UDTIdx].Fields[FieldIdx];
+  if not F.IsArray then Exit;
+  if (F.ArrayBounds = nil) or (F.ArrayBounds.ChildCount <> 1) then Exit;
+  if F.ArrayElemBank = srtString then Exit;
+  if (F.ArrayElemType <> '') or (F.ArrayElemPtrPointee <> '') then Exit;
+  D := F.ArrayBounds.GetChild(0);
+  Lb := 0;
+  if D.NodeType = antDimRange then
+  begin
+    if D.ChildCount < 2 then Exit;
+    if not FoldIntNode(D.GetChild(0), Lb) then Exit;
+    if not FoldIntNode(D.GetChild(1), Ub) then Exit;
+  end
+  else if not FoldIntNode(D, Ub) then Exit;
+  if Ub < Lb then Exit;
+  Count := Ub - Lb + 1;
+  ElemBytes := BinaryElemBytesOfWidthCode(F.WidthCode);
+  if F.ArrayElemBank = srtFloat then
+    if F.WidthCode <> 7 then ElemBytes := 8;
+  Result := (Count > 0) and (ElemBytes > 0);
+end;
+
+function TSSAGenerator.UDTCLayoutRaw(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;
+// The C byte layout of a type that is being laid OVER RAW MEMORY. Same rule as UDTCLayout, but a
+// fixed-size scalar array member is accepted and occupies its elements INLINE - which is what it is in C,
+// and the whole point of "sig(0 To 5) As UByte" over a file header. UDTCLayout itself stays strict: it
+// serves binary GET/PUT, where an array member is a separate transfer and must not silently change shape.
+var
+  i, n: Integer;
+  Sz, Al, MaxAl, Ofs, Cnt, EB: Int64;
+begin
+  Result := False;
+  SetLength(Offsets, 0); TotalSize := 0;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  if FUDTs[UDTIdx].IsUnion then Exit;
+  n := Length(FUDTs[UDTIdx].Fields);
+  SetLength(Offsets, n);
+  MaxAl := 1; Ofs := 0;
+  for i := 0 to n - 1 do
+  begin
+    if FUDTs[UDTIdx].Fields[i].IsArray then
+    begin
+      if not UDTFieldArrayShape(UDTIdx, i, Cnt, EB) then Exit;
+      Sz := Cnt * EB; Al := EB;
+    end
+    else
+    begin
+      with FUDTs[UDTIdx].Fields[i] do
+        if (NestedType <> '') or ((Bank = srtString) and (StrCapacity <= 0)) then Exit;
+      UDTFieldCShape(UDTIdx, i, Sz, Al);
+    end;
+    if (FUDTs[UDTIdx].FieldAlign > 0) and (Al > FUDTs[UDTIdx].FieldAlign) then
+      Al := FUDTs[UDTIdx].FieldAlign;
+    if Al < 1 then Al := 1;
+    if Al > MaxAl then MaxAl := Al;
+    if (Ofs mod Al) <> 0 then Ofs := Ofs + (Al - (Ofs mod Al));
+    Offsets[i] := Ofs;
+    Ofs := Ofs + Sz;
+  end;
+  if (Ofs mod MaxAl) <> 0 then Ofs := Ofs + (MaxAl - (Ofs mod MaxAl));
+  TotalSize := Ofs;
+  Result := n > 0;
+end;
+
+function TSSAGenerator.TryEmitRawUDTMemberArray(MemberNode: TASTNode; Emit: Boolean;
+  out ArrId: Integer): Boolean;
+// "h->arr()" as an array ARGUMENT where h holds a RAW ADDRESS: there is no per-instance array handle to
+// bind - the elements are bytes at a byte offset - so COPY them into a hidden array and bind that. The
+// copy is read-only in effect: a callee that writes to the parameter changes the copy, not the memory.
+// FreeBASIC would alias it; nothing in the manual's own example does, and a wrong ALIAS is worse than a
+// missing one here (the alternative was reading a byte offset as a record handle, which faulted).
+var
+  PtrName, TypeName, HiddenName: string;
+  UDTIdx, FieldIdx, i, k: Integer;
+  Offsets: TInt64Array;
+  TotalSize, Cnt, EB: Int64;
+  BaseVal, AddrVal, OffVal, ElemVal, IdxVal, UbVal: TSSAValue;
+  Bank: TSSARegisterType;
+begin
+  Result := False; ArrId := -1;
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  if MemberNode.GetChild(0).NodeType <> antIdentifier then Exit;
+  PtrName := UpperCase(VarToStr(MemberNode.GetChild(0).Value));
+  TypeName := RawUDTPtrType(PtrName);
+  if TypeName = '' then Exit;
+  UDTIdx := FindUDT(TypeName);
+  if UDTIdx < 0 then Exit;
+  if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then Exit;
+  FieldIdx := -1;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if UpperCase(FUDTs[UDTIdx].Fields[i].Name) = UpperCase(VarToStr(MemberNode.Value)) then
+      begin FieldIdx := i; Break; end;
+  if (FieldIdx < 0) or (FieldIdx > High(Offsets)) then Exit;
+  if not UDTFieldArrayShape(UDTIdx, FieldIdx, Cnt, EB) then Exit;
+  if Cnt > 4096 then Exit;      // the copy is UNROLLED: refuse rather than emit a huge prologue
+
+  Bank := FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemBank;
+  HiddenName := PtrName + '$' + UpperCase(VarToStr(MemberNode.Value)) + '$RAWCOPY';
+  ArrId := FProgram.FindArray(HiddenName);
+  if ArrId < 0 then ArrId := FProgram.DeclareArray(HiddenName, Bank, [Integer(Cnt)]);
+  Result := True;
+  if not Emit then Exit;
+
+  UbVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, UbVal, MakeSSAConstInt(Cnt - 1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), MakeSSAArrayRef(ArrId, Bank), UbVal, MakeSSAValue(svkNone));
+
+  ProcessExpression(MemberNode.GetChild(0), BaseVal);
+  BaseVal := EnsureIntRegister(BaseVal);
+  for k := 0 to Cnt - 1 do
+  begin
+    OffVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, OffVal, MakeSSAConstInt(Offsets[FieldIdx] + k * EB),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    AddrVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, AddrVal, BaseVal, OffVal, MakeSSAValue(svkNone));
+    if Bank = srtFloat then
+    begin
+      ElemVal := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+      if EB = 4 then
+        EmitInstruction(ssaRawLoadFloat, ElemVal, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_SINGLE))
+      else
+        EmitInstruction(ssaRawLoadFloat, ElemVal, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_DOUBLE));
+    end
+    else
+    begin
+      ElemVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      case EB of
+        1: EmitInstruction(ssaRawLoadInt, ElemVal, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I8));
+        2: EmitInstruction(ssaRawLoadInt, ElemVal, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I16));
+        4: EmitInstruction(ssaRawLoadInt, ElemVal, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I32));
+      else
+        EmitInstruction(ssaRawLoadInt, ElemVal, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
+      end;
+      // A raw load sign-extends; an UNSIGNED element must not come back negative.
+      if (EB < 8) and (FUDTs[UDTIdx].Fields[FieldIdx].WidthCode mod 2 = 0) then
+      begin
+        OffVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, OffVal, MakeSSAConstInt((Int64(1) shl (EB * 8)) - 1),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        AddrVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaBitwiseAnd, AddrVal, ElemVal, OffVal, MakeSSAValue(svkNone));
+        ElemVal := AddrVal;
+      end;
+    end;
+    IdxVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, IdxVal, MakeSSAConstInt(k), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ssaArrayStore, ElemVal, MakeSSAArrayRef(ArrId, Bank), IdxVal, MakeSSAValue(svkNone));
+  end;
+end;
+
+function TSSAGenerator.TryEmitRawUDTField(ObjNode: TASTNode; const FieldName: string;
+  out Value: TSSAValue): Boolean;
+// "h->field" where h holds a RAW ADDRESS: read the field at its C-LAYOUT BYTE OFFSET, with the width and
+// signedness its declaration gives it. This is what a UDT laid over raw memory means, and it is the only
+// way to honour it: our records are handles into a table, and the bytes here belong to something else.
+//
+// Declines - leaving the managed path alone - for a type whose image we cannot lay out (a variable-length
+// string, an array or a nested record member): UDTCLayout answers False for exactly those.
+var
+  PtrName, TypeName: string;
+  UDTIdx, FieldIdx, i: Integer;
+  Offsets: TInt64Array;
+  TotalSize, Sz, Al: Int64;
+  BaseVal, AddrVal, OffVal: TSSAValue;
+  F: TUDTField;
+begin
+  Result := False;
+  Value := MakeSSAValue(svkNone);
+  if (ObjNode = nil) or (ObjNode.NodeType <> antIdentifier) then Exit;
+  PtrName := UpperCase(VarToStr(ObjNode.Value));
+  TypeName := RawUDTPtrType(PtrName);
+  if TypeName = '' then Exit;
+  UDTIdx := FindUDT(TypeName);
+  if UDTIdx < 0 then Exit;
+  if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then Exit;
+  FieldIdx := -1;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if UpperCase(FUDTs[UDTIdx].Fields[i].Name) = UpperCase(FieldName) then begin FieldIdx := i; Break; end;
+  if (FieldIdx < 0) or (FieldIdx > High(Offsets)) then Exit;
+  if FUDTs[UDTIdx].Fields[FieldIdx].IsArray then Exit;   // an array member is bound, not loaded
+
+  ProcessExpression(ObjNode, BaseVal);
+  BaseVal := EnsureIntRegister(BaseVal);
+  if Offsets[FieldIdx] = 0 then
+    AddrVal := BaseVal
+  else
+  begin
+    // ssaAddInt takes REGISTERS: a constant operand lowers to register 0, which silently adds whatever
+    // happens to live there instead of the field's offset.
+    OffVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, OffVal, MakeSSAConstInt(Offsets[FieldIdx]),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    AddrVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, AddrVal, BaseVal, OffVal, MakeSSAValue(svkNone));
+  end;
+
+  F := FUDTs[UDTIdx].Fields[FieldIdx];
+  UDTFieldCShape(UDTIdx, FieldIdx, Sz, Al);
+  if F.Bank = srtString then
+  begin
+    // A fixed-length string field is its DECLARED width of bytes, terminator or not.
+    Value := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaRawLoadZStr, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(2 + F.StrCapacity));
+  end
+  else if F.Bank = srtFloat then
+  begin
+    Value := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    if Sz = 4 then
+      EmitInstruction(ssaRawLoadFloat, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_SINGLE))
+    else
+      EmitInstruction(ssaRawLoadFloat, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_DOUBLE));
+  end
+  else
+  begin
+    // The raw type code follows the field's BYTE WIDTH, which is what its declaration gave it: a UShort
+    // field is two bytes at its offset, not eight.
+    Value := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    case Sz of
+      1: EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I8));
+      2: EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I16));
+      4: EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I32));
+    else
+      EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
+    end;
+  end;
+  Result := True;
 end;
 
 function TSSAGenerator.EmitDir(Node: TASTNode): TSSAValue;
@@ -16789,6 +17392,27 @@ end;
 function TSSAGenerator.ProcedureLabelName(const Name: string): string;
 begin
   Result := 'PROC_' + UpperCase(Name);
+end;
+
+function TSSAGenerator.OverloadNameForArity(const Name: string; Arity: Integer): string;
+// The member of an OVERLOAD set to take the address of. An overload set has no bare label - every member
+// carries a "~<sig>" suffix - so "@s" / "ProcPtr(s)" had nothing to point at and died as an undefined
+// procedure. With a signature argument ("ProcPtr(s, Sub(ByVal i As Integer))", fbc 1.09+) the parameter
+// COUNT picks the member; without one, the first declared member, which is what a program with a single
+// candidate means. Returns Name unchanged when it is not an overload set.
+var
+  Pref, BankPart: string;
+  k: Integer;
+begin
+  Result := Name;
+  if FProcDecls.ContainsKey(UpperCase(Name)) then Exit;
+  Pref := UpperCase(Name) + '~';
+  for k := 0 to FProcedureNames.Count - 1 do
+    if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
+    begin
+      BankPart := SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt));
+      if (Arity < 0) or (Length(BankPart) = Arity) then Exit(FProcedureNames[k]);
+    end;
 end;
 
 function TSSAGenerator.NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;
@@ -17544,7 +18168,18 @@ begin
     antFunctionCall:
       Result := PrintKindOf(VarToStr(Node.Value));
     antArrayAccess:
-      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antMemberAccess) then
+      // "s[i]" on a STRING - a variable or a FIELD - is the BYTE at that index: a UByte, and an unsigned
+      // value prints with NO leading sign space. Tested first, because a string FIELD also matches the
+      // member-array branch below.
+      if FModernMode and (Node.ChildCount >= 2) and (Node.GetChild(1).ChildCount = 1) and
+         (((Node.GetChild(0).NodeType = antIdentifier) and
+           (GetVariableType(UpperCase(VarToStr(Node.GetChild(0).Value))) = srtString) and
+           ((ArrayIndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) < 0) or
+            IsSharedScalar(UpperCase(VarToStr(Node.GetChild(0).Value))))) or
+          ((Node.GetChild(0).NodeType = antMemberAccess) and
+           (UDTFieldBankOf(Node.GetChild(0)) = srtString))) then
+        Result := 3
+      else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antMemberAccess) then
       begin
         // obj.field(i) member-array element: the field's own narrow width says whether it prints unsigned
         // (UByte/UShort/ULong member array -> no sign space). ObjectTypeName is the no-emit type query.
@@ -17570,6 +18205,28 @@ begin
             if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
           end;
         end;
+        // "p[i]" through a POINTER to a narrow UNSIGNED type prints unsigned too: the pointee's type is
+        // the element's type. Only declared arrays were covered, so bytes read through a UByte Ptr came
+        // out with a sign space fbc does not print.
+        if (Result = 0) and FModernMode then
+        begin
+          AwCode := TypeNameWidthCode(UpperCase(FPointerVars.Values[UpperCase(VarToStr(Node.GetChild(0).Value))]));
+          if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
+        end;
+      end;
+    antMemberAccess:
+      // "obj.field" of a NARROW UNSIGNED type (UByte/UShort/ULong) prints unsigned - no leading sign
+      // space - exactly like the scalar and the member-ARRAY-element forms above. Only the element form
+      // was covered, so every unsigned FIELD printed a sign space and shifted each following comma zone
+      // by one column. Kind 3, not 2: a narrow unsigned promotes to a SIGNED expression in FreeBASIC and
+      // must not reach the unsigned-64 compare/divide/mod opcodes.
+      // MODERN only: dropping the sign space is FreeBASIC's rule for unsigned types. Commodore BASIC
+      // prints every number with the sign position occupied, and a CLASSIC program that happens to use
+      // an UBYTE field must keep that column (see the m75 guard).
+      if FModernMode and (Node.ChildCount >= 1) then
+      begin
+        AwCode := UDTFieldWidthCode(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value));
+        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
       end;
     antParentheses:
       if Node.ChildCount >= 1 then Result := PrintKindOfExpr(Node.GetChild(0));
@@ -19404,9 +20061,20 @@ procedure TSSAGenerator.EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx:
 var
   i, Slot: Integer;
   ArgVal: TSSAValue;
+  SrcType: string;
   Bank: TSSARegisterType;
 begin
   if (UDTIdx < 0) or (ArgsNode = nil) then Exit;
+  // "Dim As T b = (a)" where a is itself a T: fbc reads that as a value COPY, not as "store a into the
+  // first field" - the one-element list is resolved by the element's TYPE. Anything else (a literal, a
+  // scalar) is the field-wise form below.
+  if (ArgsNode.ChildCount = 1) and
+     IsSubtypeOf(UpperCase(ObjectTypeName(ArgsNode.GetChild(0))), UpperCase(FUDTs[UDTIdx].Name)) then
+  begin
+    if ResolveRecordObject(ArgsNode.GetChild(0), ArgVal, SrcType) then
+      EmitRecordCopy(HandleVal, ArgVal, UDTIdx);
+    Exit;
+  end;
   for i := 0 to ArgsNode.ChildCount - 1 do
   begin
     if i > High(FUDTs[UDTIdx].Fields) then Break;
@@ -19490,6 +20158,14 @@ begin
     // "Dim As V3 v = V3(1,2,3)" on a plain UDT) sets its fields in declaration order from the args (which
     // were already evaluated above into ArgVals — store them, do not re-evaluate).
     AggUDT := FindUDT(TypeName);
+    // "T(x)" / "= (x)" where x is itself a T and the type has no constructor: a value COPY, not "store
+    // the record's handle into the first field" (which is what a positional store of an int handle is).
+    if (AggUDT >= 0) and (ArgCount = 1) and
+       IsSubtypeOf(UpperCase(ObjectTypeName(ArgsNode.GetChild(0))), UpperCase(TypeName)) then
+    begin
+      EmitRecordCopy(HandleVal, EnsureIntRegister(ArgVals[0]), AggUDT);
+      Exit;
+    end;
     if AggUDT >= 0 then
       for i := 0 to ArgCount - 1 do
       begin
@@ -19511,6 +20187,16 @@ begin
     begin
       if i + 1 >= ParamList.ChildCount then Break;  // defensive: arity already matched the resolution
       Slot := ParamBankAndSlot(ParamList, i + 1, RT);  // +1: skip the implicit THIS parameter
+      // A STRING argument for a byte-POINTER parameter is passed by ADDRESS (see StageCallArgs): the
+      // constructor stages its own arguments, so the conversion has to be made here too.
+      if (RT = srtInt) and (ArgVals[i].RegType = srtString) and
+         IsStringArgForBytePtrParam(ParamList.GetChild(i + 1), ArgsNode.GetChild(i)) then
+      begin
+        DefVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaStrSAdd, DefVal, EnsureStringRegister(ArgVals[i]),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        ArgVals[i] := DefVal;
+      end;
       EmitXferStore(RT, Slot, ArgVals[i]);          // coerced to the parameter's bank
     end;
     // M4.4h: fill any trailing parameters the call omitted with their default values (evaluated here,
@@ -20719,6 +21405,17 @@ begin
             Decl.Attributes.Values['ADDRLOCAL'] := '1';   // per-frame RAW byte slot (recursion-safe, bit-punnable)
             if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
           end
+          // A fixed-length ZSTRING/WSTRING is a CHARACTER BUFFER: taking its address means "give me the
+          // bytes", which only a raw slot can honour. It never looked type-punned - a pointer to it is
+          // the same (string) bank - so it stayed a managed SHARED cell and "@z" answered a packed array
+          // address instead of a byte pointer. The manual's udt/type2 starts exactly there.
+          else if ((VTypeU = 'ZSTRING') or (VTypeU = 'WSTRING')) and
+                  (StrToIntDef(Decl.Attributes.Values['FIXEDLEN'], 0) > 0) then
+          begin
+            Decl.Attributes.Values['RAWMODULE'] := '1';
+            if FRawModuleScalars.IndexOfName(VNameU) < 0 then
+              FRawModuleScalars.Add(VNameU + '=' + VTypeU);
+          end
           else if (VTypeU <> 'STRING') and
                   ScalarIsTypePunned(VNameU, TypeNameToBank(VTypeU, VNameU)) then
           begin
@@ -20997,6 +21694,17 @@ begin
     Result := RawPtrExprName(Node.GetChild(0));
     if (Result = '') and (Node.Token.TokenType = ttOpAdd) then Result := RawPtrExprName(Node.GetChild(1));
   end
+  // A pointer CAST is a value passthrough, so "CPtr(UByte Ptr, @z)" is as raw as what it wraps.
+  else if (Node.NodeType = antCast) and (Node.ChildCount >= 1) then
+    Result := RawPtrExprName(Node.GetChild(0))
+  // "@x" where x is a RAW-BACKED scalar or buffer: its address is a real byte pointer, so a deref or a
+  // cast through it is a raw access. Without this, "*CPtr(UByte Ptr, @z)" fell to the managed pointer
+  // path and the tagged address was decoded as an array handle.
+  else if (Node.NodeType = antProcAddress) and (Node.ChildCount = 0) and
+          (Node.Value <> Null) and
+          (IsRawModuleScalar(VarToStr(Node.Value)) or (RawZStringBufBytes(VarToStr(Node.Value)) > 0) or
+           IsRawAddrLocal(VarToStr(Node.Value))) then
+    Result := UpperCase(VarToStr(Node.Value))
   // @p[i] where p is a raw pointer: FreeBASIC "@p[i]" ≡ "p + i", a raw pointer of the same element type
   // (EmitArrayElementAddress emits the SizeOf-scaled byte address). Treat it as the raw pointer p so a
   // deref of it loads from the byte heap and an assignment "q = @p[i]" carries the raw-ness onto q.
@@ -21281,8 +21989,20 @@ var
     // raw byte offset (ProcessAssignment allocates a record for it, "p->field" is managed access). So do
     // NOT mark such a var raw — that would (wrongly) route p[i]/*p onto the byte heap. Scalar/byte pointees
     // still go raw. (PointerUDTType reads FPointerVars, populated by CollectAddressTakenVars before this.)
-    if PointerUDTType(TargetU) <> '' then Exit;
-    if IsAllocCall(Rhs, FU) then
+    if PointerUDTType(TargetU) <> '' then
+    begin
+      // ...unless it is being pointed at RAW MEMORY. "Dim As hdr Ptr h = CPtr(hdr Ptr, @z)" lays the TYPE
+      // over bytes that are not a record: the value is an ADDRESS, and reading a field means reading at
+      // its C-layout OFFSET. Treating it as a managed handle indexed the record table with a byte offset
+      // - an unchecked wild read, because SHARED_REC_FLAG and RAWPTR_TAG are the same bit.
+      if (RawPtrExprName(Rhs) <> '') or IsStrDataPtrExpr(Rhs) then
+        if FRawUDTPtrs.IndexOfName(TargetU) < 0 then
+          FRawUDTPtrs.Add(TargetU + '=' + PointerUDTType(TargetU));
+      Exit;
+    end;
+    if (Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1') then
+      MarkRaw(TargetU)   // p = New T[n]: a byte block, indexed and freed raw
+    else if IsAllocCall(Rhs, FU) then
       MarkRaw(TargetU)
     else if IsScreenPtrExpr(Rhs) then
       MarkRaw(TargetU)   // p = ScreenPtr: raw, in the framebuffer region
@@ -21714,14 +22434,38 @@ begin
   Result := IsAddrLocal(Name) and (AddrLocalType(Name) <> 'STRING');
 end;
 
+function TSSAGenerator.RawZStringBufBytes(const Name: string): Integer;
+// An @-taken "ZSTRING * n" / "WSTRING * n" is a CHARACTER BUFFER, not a scalar: n bytes (n wide units
+// for a WSTRING) that another pointer may read as raw memory. Answers its size in bytes, or 0.
+//
+// Without this such a variable got the same 8-byte slot every @-taken scalar gets, and its value was
+// stored there as an 8-byte INTEGER - so "@z" pointed at eight bytes of nothing and anything reading
+// through that pointer read garbage. It is the first line of the manual's udt/type2.
+var
+  Nm: string;
+  Chars: Integer;
+begin
+  Result := 0;
+  Nm := UpperCase(Name);
+  if not IsAddrLocal(Nm) then Exit;
+  if (AddrLocalType(Nm) <> 'ZSTRING') and (AddrLocalType(Nm) <> 'WSTRING') then Exit;
+  Chars := StrToIntDef(FZStringVars.Values[Nm], 0);       // stored as n-1 characters
+  if Chars <= 0 then Exit;
+  if AddrLocalType(Nm) = 'WSTRING' then Result := (Chars + 1) * 2 else Result := Chars + 1;
+end;
+
 procedure TSSAGenerator.EmitRawAddrScalarAlloc(const Name: string);
 // Allocate this @-taken scalar's per-frame 8-byte raw byte-heap slot (enough for any builtin scalar) and
 // store the block's address in the hidden handle. A fresh block per DIM/prologue keeps recursion safe.
 var
   CountReg: TSSAValue;
+  NBytes: Integer;
 begin
+  // A fixed-length ZSTRING/WSTRING buffer needs its DECLARED size, not a scalar's eight bytes.
+  NBytes := RawZStringBufBytes(Name);
+  if NBytes <= 0 then NBytes := 8;
   CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaLoadConstInt, CountReg, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EmitInstruction(ssaLoadConstInt, CountReg, MakeSSAConstInt(NBytes), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   EmitInstruction(ssaRawAlloc, AddrLocalHandle(UpperCase(Name)), CountReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
@@ -21978,11 +22722,36 @@ procedure TSSAGenerator.EmitNewObject(Node: TASTNode; out Result: TSSAValue);
 var
   NewType: string;
   UDTIdx: Integer;
+  CountVal, ElemVal, BytesVal: TSSAValue;
 begin
   NewType := UpperCase(VarToStr(Node.Value));
   UDTIdx := FindUDT(NewType);
+  // "New T[n]": n contiguous elements of T on the byte heap, and the value IS the address of the first.
+  // A record handle cannot express that - the elements have to be adjacent for "p[i]" to walk them - so
+  // this form allocates raw, exactly like "Allocate(n * SizeOf(T))", and Delete[] frees the block.
+  if Node.Attributes.Values['NEWARRAY'] = '1' then
+  begin
+    if Node.ChildCount < 1 then
+      raise Exception.Create('NEW T[n] needs an element count');
+    ProcessExpression(Node.GetChild(0), CountVal);
+    ElemVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, ElemVal, MakeSSAConstInt(TypeSizeBytes(NewType)),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    BytesVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, BytesVal, EnsureIntRegister(CountVal), ElemVal, MakeSSAValue(svkNone));
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRawAlloc, Result, BytesVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
   if UDTIdx < 0 then
     raise Exception.CreateFmt('NEW requires a known TYPE, got "%s"', [NewType]);
+  // "New (addr) T(args)" - PLACEMENT new. Our records are managed handles in a table, not objects at an
+  // address the program chose, so the object cannot be built ON the given memory: evaluate the address
+  // expression (it may have side effects) and construct an ordinary instance. The program's own view is
+  // right in everything except the ADDRESS - "Print ap, r" shows two different values where fbc shows
+  // one - and that comparison is meaningless across runs anyway.
+  if Node.Attributes.Values['PLACEMENT'] = '1' then
+    ProcessExpression(Node.GetChild(Node.ChildCount - 1), CountVal);
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRecordNew, Result,
                   MakeSSAConstInt(FUDTs[UDTIdx].NInt), MakeSSAConstInt(FUDTs[UDTIdx].NFloat),
@@ -22005,6 +22774,15 @@ begin
   if Node.GetChild(0).NodeType <> antIdentifier then
     raise Exception.Create('DELETE expects a pointer variable');
   PtrName := VarToStr(Node.GetChild(0).Value);
+  // "Delete[] p" (and "Delete p" on a RAW pointer): the pointee is a byte block, not a record - free the
+  // block. Only a managed UDT pointer has a destructor and a record slot to recycle.
+  if (Node.Attributes.Values['NEWARRAY'] = '1') or
+     ((PointerUDTType(PtrName) = '') and IsRawPtr(PtrName)) then
+  begin
+    HandleReg := EnsureIntRegister(GetOrAllocateVariable(UpperCase(PtrName)));
+    EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
   PtrType := PointerUDTType(PtrName);
   if PtrType = '' then
     raise Exception.CreateFmt('DELETE expects a UDT pointer, "%s" is not one', [PtrName]);
@@ -22269,8 +23047,48 @@ end;
 
 function TSSAGenerator.EmitFuncPtrCall(const FPName, Sig: string; ArgListNode: TASTNode): TSSAValue;
 // Indirect call through a funcptr VARIABLE: FPName holds a procedure entry PC (assigned from @func).
+// Read it the way any other read of that name is read: once the program takes ITS address ("pf = @f")
+// the variable is raw-backed and its value no longer lives in the register GetOrAllocateVariable hands
+// back. That register was zero, so the call jumped to PC 0 - back to the top of the module, printing
+// forever - which is what "Print f(123)" did in the same program as "pf = @f".
+var
+  PCVal, Idx0: TSSAValue;
+  ai: Integer;
 begin
-  Result := EmitIndirectCall(EnsureIntRegister(GetOrAllocateVariable(FPName)), Sig, ArgListNode);
+  PCVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if IsRawAddrLocal(FPName) then
+    EmitInstruction(ssaRawLoadInt, PCVal, EnsureIntRegister(AddrLocalHandle(UpperCase(FPName))),
+                    MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64))
+  else if IsRawModuleScalar(FPName) then
+    EmitInstruction(ssaRawLoadInt, PCVal, RawModuleAddrReg(UpperCase(FPName)),
+                    MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64))
+  else if IsSharedScalar(UpperCase(FPName)) then
+  begin
+    // A SHARED scalar lives in element 0 of its backing array, not in a register. "pf = @f" is enough to
+    // make f one of those, and reading the register instead gave 0: the call jumped to PC 0, back to the
+    // top of the module, printing forever. The load is emitted here rather than routed through
+    // ProcessExpression("f(0)") because that shape is itself read as an indirect CALL through f.
+    ai := PtrInt(FSharedScalarArr.Objects[FSharedScalarArr.IndexOf(UpperCase(FPName))]);
+    Idx0 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, Idx0, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ssaArrayLoad, PCVal, MakeSSAArrayRef(ai, srtInt), Idx0, MakeSSAValue(svkNone));
+  end
+  else
+    PCVal := GetOrAllocateVariable(UpperCase(FPName));
+  Result := EmitIndirectCall(EnsureIntRegister(PCVal), Sig, ArgListNode);
+end;
+
+function TSSAGenerator.DerefFuncPtrSig(Node: TASTNode): string;
+// The funcptr signature reached by DEREFERENCING Node: "*pf" where pf is declared "As <named funcptr
+// type> Ptr" gives that type's "params|ret". '' when Node is not such a dereference.
+var
+  PtrName: string;
+begin
+  Result := '';
+  if (Node = nil) or (Node.NodeType <> antDeref) or (Node.ChildCount < 1) then Exit;
+  if Node.GetChild(0).NodeType <> antIdentifier then Exit;
+  PtrName := UpperCase(VarToStr(Node.GetChild(0).Value));
+  Result := FFuncPtrTypes.Values[UpperCase(FPointerVars.Values[PtrName])];
 end;
 
 function TSSAGenerator.EmitIndirectCall(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;
@@ -23199,6 +24017,8 @@ begin
     try ProcessExpression(AccNode, Result); finally AccNode.Free; end;
     Exit;
   end;
+  // "h->field" where h holds a RAW ADDRESS: the field lives at a byte offset, not in a record slot.
+  if TryEmitRawUDTField(Node.GetChild(0), VarToStr(Node.Value), Result) then Exit;
   TypeName := ObjectTypeName(Node.GetChild(0));
   if TypeName = '' then
   begin
@@ -23778,7 +24598,7 @@ var
   Decl, ParamList, ArgExpr, ParamI: TASTNode;
   i, NArgs, Slot, NStage: Integer;
   RT: TSSARegisterType;
-  ArgVal: TSSAValue;
+  ArgVal, TempVal2: TSSAValue;
   StageSlots: array of Integer;
   StageRTs: array of TSSARegisterType;
   StageVals: array of TSSAValue;
@@ -23805,6 +24625,14 @@ begin
     if ParamList.GetChild(i).Attributes.Values['ARRAY'] = '1' then Continue;
     ArgExpr := ArgListNode.GetChild(i);
     Slot := ParamBankAndSlot(ParamList, i, RT);
+    // "test( Type(1, 2) )": the temporary's type is INFERRED, and here it comes from the PARAMETER's
+    // declared type. Without it the constructor had an empty type name and died as "Array not declared".
+    if (ArgExpr.NodeType = antArrayAccess) and (ArgExpr.Attributes.Values['INFERTYPE'] = '1') and
+       (ArgExpr.ChildCount >= 1) and (ParamList.GetChild(i).ChildCount >= 1) then
+    begin
+      ArgExpr.GetChild(0).Value := UpperCase(VarToStr(ParamList.GetChild(i).GetChild(0).Value));
+      ArgExpr.Attributes.Values['INFERTYPE'] := '';
+    end;
     // BYREF-return function with a BYREF (int) param: pass the ADDRESS of the argument variable, not its
     // value, so the function can return a reference into the caller's variable (min(a,b)=0). Gated to
     // int-banked params (address and slot are both int). The arg was address-backed by
@@ -23820,6 +24648,18 @@ begin
     else if (RT = srtInt) and (ParamList.GetChild(i).Attributes.Values['BYREF'] = '1') and
             (ByrefRetCallName(ArgExpr) <> '') then
       ArgVal := EmitByrefRetAddress(ArgExpr)
+    // A STRING argument for a "ZSTRING PTR" / "BYTE PTR" / "ANY PTR" parameter: FreeBASIC passes the
+    // string's ADDRESS, which is what SADD/STRPTR yield here. Without it the string register's INDEX was
+    // staged into the int slot and the callee dereferenced address 1. A FOR over a UDT iterator built
+    // from string literals is exactly this conversion.
+    else if (RT = srtInt) and IsStringArgForBytePtrParam(ParamList.GetChild(i), ArgExpr) then
+    begin
+      ProcessStringExpression(ArgExpr, ArgVal);
+      ArgVal := EnsureStringRegister(ArgVal);
+      TempVal2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaStrSAdd, TempVal2, ArgVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      ArgVal := TempVal2;
+    end
     else if RT = srtString then
       // The parameter wants a STRING, so a UDT argument carrying "Operator T.Cast() As String" converts
       // through it. Without this the record handle was staged into the string slot and the callee saw "0".
@@ -24091,7 +24931,7 @@ procedure TSSAGenerator.EmitArrayArgBinds(const ProcName: string; ArgListNode: T
 // parameter.
 var
   Decl, ParamList, ArgExpr, MemberNode: TASTNode;
-  i, NArgs, ParamId, ArgId: Integer;
+  i, NArgs, ParamId, ArgId, RawArrId: Integer;
   ArgName: string;
   HandleReg: TSSAValue;
   Params: array of Integer;   // placeholder slot ids actually bound, in order
@@ -24118,6 +24958,17 @@ begin
       MemberNode := ArgExpr.GetChild(0);
     if Assigned(MemberNode) then
     begin
+      // "h->arr()" where h holds a RAW ADDRESS: no per-instance handle exists — bind a hidden copy of
+      // the bytes at the member's offset (filled here, just before the call).
+      if TryEmitRawUDTMemberArray(MemberNode, Bind, RawArrId) then
+      begin
+        SetLength(Params, Length(Params) + 1);
+        Params[High(Params)] := ParamId;
+        if Bind then
+          EmitInstruction(ssaArrayBind, MakeSSAValue(svkNone), MakeSSAArrayRef(ParamId, srtInt),
+                          MakeSSAValue(svkNone), MakeSSAConstInt(RawArrId));
+        Continue;
+      end;
       if not MemberArrayArgHandle(MemberNode, Bind, HandleReg) then Continue;
       SetLength(Params, Length(Params) + 1);
       Params[High(Params)] := ParamId;
@@ -25291,6 +26142,7 @@ begin
     antList: ProcessList(Node);
     antNew: ProcessNew(Node);
     antDelete: ProcessDelete(Node);
+    antLetList: ProcessLetList(Node);
     antRenumber: ProcessRenumber(Node);
     antCatalog: ProcessCatalog(Node);
     // File management commands

@@ -623,8 +623,19 @@ function TPackratParser.ParseDeleteStatement: TASTNode;
 // "DELETE p" — run the destructor of the pointee and free it. child0 = the pointer expression.
 var
   PtrExpr: TASTNode;
+var
+  ArrayForm: Boolean;
 begin
   Context.Advance;   // consume DELETE
+  // "Delete[] p" frees what "New T[n]" allocated. The brackets are empty - they only say "this was an
+  // ARRAY allocation" - so consume them and remember which form this is.
+  ArrayForm := False;
+  if Context.Check(ttDelimBrackOpen) then
+  begin
+    Context.Advance;
+    if Context.Check(ttDelimBrackClose) then Context.Advance;
+    ArrayForm := True;
+  end;
   PtrExpr := FExpressionParser.ParseExpression(precCall);
   if not Assigned(PtrExpr) then
   begin
@@ -632,6 +643,7 @@ begin
     Exit(nil);
   end;
   Result := TASTNode.Create(antDelete, Context.CurrentToken);
+  if ArrayForm then Result.Attributes.Values['NEWARRAY'] := '1';
   Result.AddChild(PtrExpr);
 end;
 
@@ -1975,11 +1987,46 @@ end;
 
 function TPackratParser.ParseLetStatement: TASTNode;
 var
-  Assignment: TASTNode;
+  Assignment, Targets, Tgt: TASTNode;
   SavedToken: TLexerToken;
 begin
   SavedToken := Context.CurrentToken;
   Context.Advance; // Consume LET (if present)
+
+  // FreeBASIC "Let(a, b, ...) = udt": DESTRUCTURING. The parenthesised list is a list of DESTINATIONS,
+  // not an expression, so it cannot go through the ordinary assignment parse (which would read "(a, b)"
+  // as one expression and stop at the comma). antLetList: child0 = the target list, child1 = the source.
+  if Context.Check(ttDelimParOpen) and FModernMode then
+  begin
+    Context.Advance;                                     // (
+    Targets := TASTNode.Create(antExpressionList, SavedToken);
+    repeat
+      Tgt := FExpressionParser.ParseExpression;
+      if not Assigned(Tgt) then Break;
+      Targets.AddChild(Tgt);
+      if Context.Check(ttSeparParam) then Context.Advance else Break;
+    until Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]);
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" after the LET target list', Context.CurrentToken);
+      Targets.Free; Exit(nil);
+    end;
+    if not Context.Match(ttOpEq) then
+    begin
+      HandleError('Expected "=" after the LET target list', Context.CurrentToken);
+      Targets.Free; Exit(nil);
+    end;
+    Assignment := FExpressionParser.ParseExpression;
+    if not Assigned(Assignment) then
+    begin
+      HandleError('Expected a source value after "="', Context.CurrentToken);
+      Targets.Free; Exit(nil);
+    end;
+    Result := TASTNode.Create(antLetList, SavedToken);
+    Result.AddChild(Targets);
+    Result.AddChild(Assignment);
+    Exit;
+  end;
 
   // Parse assignment expression. NOT wrapped in FInConstDecl: "Let K = 9" on a constant must be
   // rejected exactly like the bare form.
@@ -3291,6 +3338,36 @@ begin
   // The type name must be a plain identifier; a reserved word (e.g. the graphics keyword
   // CIRCLE/BOX/LINE) is not a valid type name — report it cleanly instead of silently bailing
   // and leaving the stream misaligned (which can derail later parsing).
+  // ...but FreeBASIC also writes the alias with the type FIRST and the NAME last:
+  //   "Type As Function(ByVal As Integer) As Integer function_alias"
+  // Same declaration as "Type function_alias As Function(...) As Integer", read the other way round, so
+  // parse the type here and pick the name up afterwards.
+  if (not IsUnion) and Context.Check(ttAsType) then
+  begin
+    Context.Advance;                                // consume AS
+    Result := TASTNode.CreateWithValue(antTypeDecl, '', Token);
+    if Context.Check(ttProcedureStart) and TryParseProcPtrType(Result) then
+      AliasType := 'INTEGER'
+    else
+    begin
+      AliasType := ParseDottedName;
+      while AtPointerSuffix do
+      begin
+        AliasType := AliasType + ' PTR';
+        Context.Advance;
+      end;
+    end;
+    if not Context.Check(ttIdentifier) then
+    begin
+      HandleError('Expected the alias name after the type', Context.CurrentToken);
+      Result.Free; Result := nil; Exit;
+    end;
+    Result.Value := UpperCase(Context.CurrentToken.Value);
+    Context.Advance;
+    Result.Attributes.Values['ALIAS'] := UpperCase(AliasType);
+    DoNodeCreated(Result);
+    Exit;
+  end;
   if not Context.Check(ttIdentifier) then
   begin
     HandleError(Format('"%s" is a reserved word and cannot be used as a type name',
@@ -7829,11 +7906,13 @@ var
   FixedCapVal: Int64;   // folded "* n" capacity
   Token, NameTok, TypeTok, SharedTypeTok: TLexerToken;
   ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode, FuncPtrSigNode, LeadingTypeOfExpr: TASTNode;
-  IsShared, IsByref, LeadingAS, IsTuple: Boolean;
+  SharedFpNode: TASTNode;   // leading-AS "Dim As Sub(...) g": the shared funcptr signature
+  IsShared, IsByref, LeadingAS, IsTuple, HadComma: Boolean;
   DimTypeName, SharedTypeName, SharedFixedLen: string;
   SavedIdx, TupleDepth: Integer;
 begin
   Token := Context.CurrentToken;
+  SharedFpNode := nil;
   // VAR / STATIC share the ttDataDeclaration token with DIM; route to their own parsers.
   if UpperCase(VarToStr(Token.Value)) = kVAR then Exit(ParseVarStatement);
   if UpperCase(VarToStr(Token.Value)) = kSTATIC then
@@ -7894,6 +7973,28 @@ begin
     end
     else
     begin
+    // "Dim As Sub(...) g" / "Dim As Function(...) As R f": the leading-AS spelling of a function-pointer
+    // variable. Only the trailing form ("Dim f As Function(...)") parsed the signature here, so the
+    // leading one stopped at a type name that is a KEYWORD.
+    if Context.Check(ttProcedureStart) then
+    begin
+      SharedTypeTok := Context.CurrentToken;
+      SharedFpNode := TASTNode.Create(antArrayDecl, SharedTypeTok);
+      if TryParseProcPtrType(SharedFpNode) then
+      begin
+        SharedTypeName := 'INTEGER';          // a procedure entry PC, like the named funcptr TYPE alias
+        SharedFixedLen := '';
+      end
+      else
+      begin
+        SharedFpNode.Free; SharedFpNode := nil;
+        HandleError('Expected type name after AS', Context.CurrentToken);
+        DoNodeCreated(Result);
+        Exit;
+      end;
+    end
+    else
+    begin
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected type name after AS', Context.CurrentToken);
@@ -7922,6 +8023,7 @@ begin
         InitExpr.Free;
       end;
     end;
+    end;   // end of the non-funcptr leading-AS type parse
     end;   // end of the non-TypeOf leading-AS type parse
   end;
 
@@ -8038,13 +8140,21 @@ begin
       end;
       // Leading-AS fixed-length string capacity ("DIM AS STRING * n name") applies to each name.
       if LeadingAS and (SharedFixedLen <> '') then ArrayDecl.Attributes.Values['FIXEDLEN'] := SharedFixedLen;
-      // Transfer a captured function-pointer signature (see above) onto the declaration node.
+      // Transfer a captured function-pointer signature (see above) onto the declaration node. The
+      // leading-AS spelling shares ONE signature across every name in the list, so it is copied rather
+      // than consumed (SharedFpNode is freed once, after the loop).
       if Assigned(FuncPtrSigNode) then
       begin
         ArrayDecl.Attributes.Values['FUNCPTR'] := '1';
         ArrayDecl.Attributes.Values['FPPARAMS'] := FuncPtrSigNode.Attributes.Values['FPPARAMS'];
         ArrayDecl.Attributes.Values['FPRET'] := FuncPtrSigNode.Attributes.Values['FPRET'];
         FuncPtrSigNode.Free; FuncPtrSigNode := nil;
+      end
+      else if LeadingAS and Assigned(SharedFpNode) then
+      begin
+        ArrayDecl.Attributes.Values['FUNCPTR'] := '1';
+        ArrayDecl.Attributes.Values['FPPARAMS'] := SharedFpNode.Attributes.Values['FPPARAMS'];
+        ArrayDecl.Attributes.Values['FPRET'] := SharedFpNode.Attributes.Values['FPRET'];
       end;
       // FreeBASIC reference variable: "DIM BYREF r AS T = target". Require "= target" and store @target
       // as child[2] (an antProcAddress), so the SSA backs the target's stable address and binds r to it;
@@ -8119,12 +8229,27 @@ begin
           // only then is it a tuple. Without one, fall through to the normal (full) expression parse.
           SavedIdx := Context.CurrentIndex;
           Context.Advance;                   // step past '(' for the scan
-          TupleDepth := 1; IsTuple := False;
+          TupleDepth := 1; IsTuple := False; HadComma := False;
           while (TupleDepth > 0) and (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) do
           begin
             if Context.Check(ttDelimParOpen) then Inc(TupleDepth)
-            else if Context.Check(ttDelimParClose) then Dec(TupleDepth)
-            else if Context.Check(ttSeparParam) and (TupleDepth = 1) then begin IsTuple := True; Break; end;
+            else if Context.Check(ttDelimParClose) then
+            begin
+              Dec(TupleDepth);
+              // ...and a SINGLE-element group is an initializer list too when the declared type is a UDT
+              // and the parentheses span the WHOLE initializer: "Dim As UDT1 u = (1)" sets the first
+              // field. Requiring a comma made that one a parenthesised EXPRESSION, and a scalar stored
+              // into a record variable left the record's handle showing (the manual's control/iif4).
+              // The whole-initializer test keeps "= (x + y) \ 2" an expression, comma or not.
+              if (TupleDepth = 0) and (not IsBuiltinTypeName(DimTypeName)) then
+              begin
+                Context.Advance;
+                if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttSeparParam]) then IsTuple := True;
+                Break;
+              end;
+            end
+            else if Context.Check(ttSeparParam) and (TupleDepth = 1) then
+              begin IsTuple := True; HadComma := True; Break; end;
             Context.Advance;
           end;
           Context.CurrentIndex := SavedIdx;  // rewind to the '('
@@ -8133,6 +8258,11 @@ begin
             Context.Advance;                 // (
             CtorArgs := TASTNode.Create(antArgumentList, Context.CurrentToken);
             CtorArgs.Attributes.Values['TUPLEINIT'] := '1';   // UDT aggregate field init
+            if not HadComma then
+              // A SINGLE-element group is ambiguous: "= (1)" is a field list, but "= (""A.x"")" on a type
+              // with a matching CONSTRUCTOR is a construction. Mark it so the SSA resolves a constructor
+              // first and only aggregates when none matches.
+              CtorArgs.Attributes.Values['TUPLE1'] := '1';
             repeat
               ArgExpr := FExpressionParser.ParseExpression;
               if not Assigned(ArgExpr) then Break;
@@ -8207,6 +8337,7 @@ begin
   until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
 
   if Assigned(LeadingTypeOfExpr) then LeadingTypeOfExpr.Free;   // clones are on each decl; free the original
+  if Assigned(SharedFpNode) then SharedFpNode.Free;             // one signature shared by every name above
   DoNodeCreated(Result);
 end;
 

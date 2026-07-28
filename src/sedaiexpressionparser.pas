@@ -86,6 +86,7 @@ type
     function ParseUserFunction(Token: TLexerToken): TASTNode;
     function ParseProcAddress(Token: TLexerToken): TASTNode;   // @subname → antProcAddress (M5.2)
     function ParseNew(Token: TLexerToken): TASTNode;           // NEW T [(args)] → antNew (FreeBASIC)
+    function ParseProcSignature(Token: TLexerToken): TASTNode; // bare "Sub(...)"/"Function(...) As T" signature
     function ParseTypeConstructor(Token: TLexerToken): TASTNode; // type<T>(args) → anonymous UDT temporary
     function ParseCast(Token: TLexerToken): TASTNode;          // CAST/CPTR(type, expr) → antCast
     function ParseSizeOfPtrType(Token: TLexerToken): TASTNode; // SIZEOF(<type> PTR) → SIZEOF("T PTR"); nil if not a pointer type
@@ -1768,6 +1769,38 @@ begin
   DoNodeCreated(Result);
 end;
 
+function TExpressionParser.ParseProcSignature(Token: TLexerToken): TASTNode;
+// A bare procedure SIGNATURE used as a value: "Sub()", "Sub(ByVal i As Integer)", "Function(...) As T".
+// It names one overload of a procedure; the only thing that distinguishes the overloads here is the
+// PARAMETER COUNT, which the node carries as its value. Tokens are consumed to the closing ')' (and past
+// a trailing "As <type>" for the FUNCTION form) without interpreting the parameter declarations.
+var
+  Depth, NParams: Integer;
+begin
+  Result := TASTNode.CreateWithValue(antProcSig, 0, Token);
+  Context.Advance;                       // (
+  Depth := 1; NParams := 0;
+  while (Depth > 0) and not Context.CheckAny([ttEndOfLine, ttEndOfFile]) do
+  begin
+    if Context.Check(ttDelimParOpen) then Inc(Depth)
+    else if Context.Check(ttDelimParClose) then
+    begin
+      Dec(Depth);
+      if Depth = 0 then begin Context.Advance; Break; end;
+    end
+    else if Context.Check(ttSeparParam) and (Depth = 1) then Inc(NParams)
+    else if (Depth = 1) and (NParams = 0) then NParams := 1;   // any token inside = at least one param
+    Context.Advance;
+  end;
+  if Context.Check(ttAsType) then          // "... As <ret>" of the FUNCTION form
+  begin
+    Context.Advance;
+    if not Context.IsAtEnd then Context.Advance;
+  end;
+  Result.Value := NParams;
+  DoNodeCreated(Result);
+end;
+
 function TExpressionParser.ParseUserFunction(Token: TLexerToken): TASTNode;
 var
   FnName: string;
@@ -1776,6 +1809,17 @@ var
 begin
   // FN is already consumed, now we expect the function name (identifier)
   // Format: FNname(arg)  or  FN name(arg)  depending on tokenizer
+
+  // ...unless this is a bare SIGNATURE rather than a call: "ProcPtr(s, Sub())" and
+  // "ProcPtr(s, Sub(ByVal i As Integer))" name an OVERLOAD by its parameter list (fbc 1.09+). The FN
+  // handler owns SUB/FUNCTION as a prefix, so without this the '(' that follows read as a call and the
+  // whole statement failed to parse.
+  if (UpperCase(Token.Value) = 'SUB') or (UpperCase(Token.Value) = 'FUNCTION') then
+    if Context.Check(ttDelimParOpen) then
+    begin
+      Result := ParseProcSignature(Token);
+      Exit;
+    end;
 
   if not Context.Check(ttIdentifier) then
   begin
@@ -1877,16 +1921,53 @@ function TExpressionParser.ParseNew(Token: TLexerToken): TASTNode;
 // name, then an optional parenthesised constructor argument list. Lowers to antNew(value = type name,
 // child0 = antArgumentList of ctor args when present). SSA allocates a heap record and runs its ctor.
 var
-  ArgList: TASTNode;
+  ArgList, PlaceExpr: TASTNode;
 begin
+  // FreeBASIC "placement new": "New (addr) T(args)" constructs at an address the caller already owns.
+  // Read and keep the address expression; the type name follows it.
+  PlaceExpr := nil;
+  if Context.Check(ttDelimParOpen) then
+  begin
+    Context.Advance;                          // (
+    PlaceExpr := ParseExpression;
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" after the placement address', Context.CurrentToken);
+      if Assigned(PlaceExpr) then PlaceExpr.Free;
+      Result := nil; Exit;
+    end;
+  end;
   if not Context.Check(ttIdentifier) then
   begin
     HandleError('Expected a TYPE name after NEW', Context.CurrentToken);
+    if Assigned(PlaceExpr) then PlaceExpr.Free;
     Result := nil;
     Exit;
   end;
   Result := TASTNode.CreateWithValue(antNew, UpperCase(Context.CurrentToken.Value), Token);
   Context.Advance;  // consume the type name
+  // FreeBASIC "New T[n]": n CONTIGUOUS elements, and the result is a pointer to the first. Without this
+  // the "[n]" stayed behind as a postfix index on the allocation itself, so "New Integer[100]" allocated
+  // ONE thing and every element past the first ran off it.
+  if Context.Check(ttDelimBrackOpen) then
+  begin
+    Context.Advance;                          // [
+    ArgList := ParseExpression;
+    if not Assigned(ArgList) then
+    begin
+      HandleError('Expected an element count after "["', Context.CurrentToken);
+      Result.Free; Result := nil; Exit;
+    end;
+    if not Context.Match(ttDelimBrackClose) then
+    begin
+      HandleError('Expected "]" after the element count', Context.CurrentToken);
+      ArgList.Free; Result.Free; Result := nil; Exit;
+    end;
+    Result.Attributes.Values['NEWARRAY'] := '1';
+    Result.AddChild(ArgList);                 // child0 = the element count
+    DoNodeCreated(Result);
+    Exit;
+  end;
   if Context.Check(ttDelimParOpen) then
   begin
     Context.Advance;  // consume '('
@@ -1901,6 +1982,11 @@ begin
       Result.Free; Result := nil; Exit;
     end;
     if Assigned(ArgList) then Result.AddChild(ArgList);
+  end;
+  if Assigned(PlaceExpr) then
+  begin
+    Result.Attributes.Values['PLACEMENT'] := '1';
+    Result.AddChild(PlaceExpr);               // last child = the placement address
   end;
   DoNodeCreated(Result);
 end;
