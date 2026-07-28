@@ -10496,8 +10496,12 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessNext(Node: TASTNode);
+// "Next j, i" closes several loops at once, innermost first: the parser counts them onto the node and
+// the closing below simply repeats. Done by RE-ENTERING with the count decremented, so every loop is
+// closed by exactly the same code path as a lone NEXT.
 var
   LoopInfo: TLoopInfo;
+  RemainingNext: Integer;
   NewVarReg: Integer;
   TempReg: Integer;
   TempVal: TSSAValue;
@@ -10519,6 +10523,7 @@ begin
   end;
   LoopInfo := FLoopStack[High(FLoopStack)];
   SetLength(FLoopStack, Length(FLoopStack) - 1);
+  RemainingNext := StrToIntDef(Node.Attributes.Values['NEXTCOUNT'], 1);
 
   // M8: close this loop body's block scope (destruct its DIM'd UDTs + reclaim) before the back-edge.
   BlockScopeExit;
@@ -10659,6 +10664,13 @@ begin
     if DebugSSA then
       WriteLn('[SSA] Edge: ', CondBlock.LabelName, ' → ', EndBlock.LabelName, ' (false)');
     {$ENDIF}
+  end;
+  // "Next j, i": close the next loop out with the same code, one fewer to go.
+  if RemainingNext > 1 then
+  begin
+    Node.Attributes.Values['NEXTCOUNT'] := IntToStr(RemainingNext - 1);
+    ProcessNext(Node);
+    Node.Attributes.Values['NEXTCOUNT'] := IntToStr(RemainingNext);   // restore: the node may be re-walked
   end;
 end;
 
@@ -23201,7 +23213,14 @@ begin
     // Args-aware with a nil list, so an overload set is searched for its zero-parameter member.
     MethodLbl := ResolveMethodLabelArgs(TypeName, VarToStr(Node.Value), nil);
     if MethodLbl <> '' then
-      ProcessMethodCall(Node.GetChild(0), TypeName, VarToStr(Node.Value), nil, Result);
+      // "base.method" written WITHOUT parentheses is the same super call as "base.method()", and it
+      // needs the same NON-VIRTUAL dispatch: ObjectTypeName has already resolved `base` to the parent
+      // type, but a virtual call would go back through the instance's runtime type and land on the
+      // override that is making the call. "Return Base.H & " <- B"" then recursed until the stack gave
+      // out - a HANG, on the shape the feature exists for. The parenthesised form had the guard; this
+      // one did not.
+      ProcessMethodCall(Node.GetChild(0), TypeName, VarToStr(Node.Value), nil, Result,
+                        Node.GetChild(0).Attributes.Values['BASEREF'] <> '');
     Exit;
   end;
   if not ResolveRecordObject(Node.GetChild(0), HandleVal, TypeName) then Exit;

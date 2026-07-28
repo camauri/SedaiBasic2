@@ -6813,6 +6813,12 @@ begin
         // FreeBASIC function form FileCopy(src, dst): always overwrite, error code into Dest.
         if Instr.Immediate = -1 then
           Ctx.IntRegs[Instr.Dest] := FsCopyFileCode(Ctx.StringRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2])
+        else if FProgram.ModernMode then
+          // FreeBASIC's FILECOPY STATEMENT does not stop the program when the copy fails - it answers
+          // through the function form, or not at all. Raising here made "FileCopy "source.txt", ..." on
+          // a missing file an abort where fbc simply carries on. CLASSIC's COPY keeps its Commodore
+          // behaviour: a failed disk copy is a runtime error there.
+          FsCopyFileCode(Ctx.StringRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2])
         else
           ExecuteCopyFile(Ctx.StringRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2],
                          Ctx.IntRegs[Instr.Immediate] <> 0);

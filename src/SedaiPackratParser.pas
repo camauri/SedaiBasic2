@@ -991,6 +991,21 @@ begin
  // FreeBASIC forward declaration "DECLARE SUB|FUNCTION ...": our parser resolves calls via a pre-pass
  // over the real definitions, so a forward declaration is a no-op — skip the rest of the line. (Without
  // this, module-level DECLARE falls through to identifier/assignment parsing and hangs.)
+ // FreeBASIC OOP decorators on a DEFINITION: "Virtual Destructor T()", "Abstract Function ...",
+ // "Override Sub ...". Inside a TYPE body they sit after DECLARE, which is skipped wholesale; at module
+ // level they lead the definition itself, and an unknown leading identifier was read as an assignment
+ // target ("Expected = in assignment"). Consume the decorator and let the procedure parse - the
+ // dispatch it asks for is already what a method call does.
+ if (Token.TokenType = ttIdentifier) and
+    ((UpperCase(Token.Value) = 'VIRTUAL') or (UpperCase(Token.Value) = 'ABSTRACT') or
+     (UpperCase(Token.Value) = 'OVERRIDE')) and
+    Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) then
+ begin
+   Context.Advance;                    // the decorator
+   Result := ParseStatement;           // ...and the SUB/FUNCTION/DESTRUCTOR that follows
+   Exit;
+ end;
+
  if (Token.TokenType = ttIdentifier) and (UpperCase(Token.Value) = 'DECLARE') then
  begin
    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
@@ -4441,6 +4456,7 @@ end;
 
 function TPackratParser.ParseLoopEndStatement: TASTNode;
 var
+  NextCount: Integer;   // "Next j, i": how many loops this one closes
   Token: TLexerToken;
   EndKeyword: string;
 begin
@@ -4519,7 +4535,23 @@ begin
 
   // Optional variable after NEXT
   if (EndKeyword = 'NEXT') and Context.Check(ttIdentifier) then
+  begin
     Context.Advance; // Consume variable name
+    // "Next j, i" closes SEVERAL loops at once, innermost first - one NEXT written for each. Only the
+    // first was consumed, so the comma and the outer counter were left to be parsed as a statement, and
+    // the outer FOR never found its NEXT at all. The extra closings ride on the node; the SSA repeats
+    // the loop-closing for each, and each one validates its own loop end here.
+    NextCount := 1;
+    while Context.Check(ttSeparParam) do
+    begin
+      Context.Advance;                            // ','
+      if not Context.Check(ttIdentifier) then Break;
+      Context.Advance;                            // the outer counter's name
+      if not FValidationStacks.ValidateLoopEnd(EndKeyword) then Break;
+      Inc(NextCount);
+    end;
+    if NextCount > 1 then Result.Attributes.Values['NEXTCOUNT'] := IntToStr(NextCount);
+  end;
 
   DoNodeCreated(Result);
 end;

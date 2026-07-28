@@ -308,6 +308,21 @@ begin
     Value := PPConstIntStr(ArgsStr, Defs);
     Exit;
   end;
+  if NameU = '__FB_QUOTE__' then
+  begin
+    // The argument as a STRING LITERAL: "#define X __FB_QUOTE__( Print "hello" )" makes X printable
+    // text, and __FB_UNQUOTE__ turns it back into code. Any embedded quote is doubled, as BASIC wants.
+    Value := '"' + StringReplace(Trim(ArgsStr), '"', '""', [rfReplaceAll]) + '"';
+    Exit;
+  end;
+  if NameU = '__FB_UNQUOTE__' then
+  begin
+    // ...and back: strip one layer of quoting, so the text becomes code again.
+    Value := Trim(ArgsStr);
+    if (Length(Value) >= 2) and (Value[1] = '"') and (Value[Length(Value)] = '"') then
+      Value := StringReplace(Copy(Value, 2, Length(Value) - 2), '""', '"', [rfReplaceAll]);
+    Exit;
+  end;
   if NameU = '__FB_IIF__' then
   begin
     SplitMacroArgs(ArgsStr, Args, N);
@@ -321,9 +336,9 @@ begin
   Result := False;
 end;
 
-function SubstituteMacros(const Line: string; Defs, FnDefs: TStringList): string;
+function SubstituteMacros(const Line: string; Defs, FnDefs: TStringList; Depth: Integer): string;
 var
-  i, j, k, idx, depth: Integer;
+  i, j, k, idx, ParenDepth: Integer;
   Word, ArgsStr, BuiltinVal: string;
   InStr: Boolean;
 begin
@@ -353,23 +368,23 @@ begin
       // not shadow it with a #define.
       if (j <= Length(Line)) and (Line[j] = '(') and (Copy(UpperCase(Word), 1, 5) = '__FB_') then
       begin
-        depth := 0; ArgsStr := '';
+        ParenDepth := 0; ArgsStr := '';
         k := j + 1;
         while k <= Length(Line) do
         begin
-          if (Line[k] = '(') then Inc(depth)
+          if (Line[k] = '(') then Inc(ParenDepth)
           else if (Line[k] = ')') then
           begin
-            if depth = 0 then Break;
-            Dec(depth);
+            if ParenDepth = 0 then Break;
+            Dec(ParenDepth);
           end;
           ArgsStr := ArgsStr + Line[k];
           Inc(k);
         end;
-        if TryPPBuiltin(UpperCase(Word), SubstituteMacros(ArgsStr, Defs, FnDefs), Defs, FnDefs, BuiltinVal) then
+        if TryPPBuiltin(UpperCase(Word), SubstituteMacros(ArgsStr, Defs, FnDefs, Depth + 1), Defs, FnDefs, BuiltinVal) then
         begin
           if (k <= Length(Line)) and (Line[k] = ')') then Inc(k);
-          Result := Result + SubstituteMacros(BuiltinVal, Defs, FnDefs);
+          Result := Result + SubstituteMacros(BuiltinVal, Defs, FnDefs, Depth + 1);
           i := k;
           Continue;
         end;
@@ -384,28 +399,35 @@ begin
       if (idx >= 0) and (k <= Length(Line)) and (Line[k] = '(') then
       begin
         j := k;
-        depth := 0; ArgsStr := '';
+        ParenDepth := 0; ArgsStr := '';
         Inc(j);   // skip '('
         while j <= Length(Line) do
         begin
-          if (Line[j] = '(') then Inc(depth)
+          if (Line[j] = '(') then Inc(ParenDepth)
           else if (Line[j] = ')') then
           begin
-            if depth = 0 then Break;
-            Dec(depth);
+            if ParenDepth = 0 then Break;
+            Dec(ParenDepth);
           end;
           ArgsStr := ArgsStr + Line[j];
           Inc(j);
         end;
         if (j <= Length(Line)) and (Line[j] = ')') then Inc(j);   // skip ')'
         // Expand the body (param substitution), then re-run object-like substitution on the result.
-        Result := Result + SubstituteMacros(ExpandFnBody(FnDefs.ValueFromIndex[idx], ArgsStr), Defs, FnDefs);
+        Result := Result + SubstituteMacros(ExpandFnBody(FnDefs.ValueFromIndex[idx], ArgsStr), Defs, FnDefs, Depth + 1);
         i := j;
         Continue;
       end;
       idx := Defs.IndexOfName(UpperCase(Word));
       if idx >= 0 then
-        Result := Result + Defs.ValueFromIndex[idx]
+        // An object-like macro's VALUE is itself macro text: "#define X __FB_QUOTE__( Print "hi" )"
+        // means nothing until the built-in inside it runs. Appending the value raw left it unexpanded,
+        // so the macro's own body reached the parser. Re-scanned, with a depth cap so a macro that
+        // names itself stops instead of spinning.
+        if Depth < 32 then
+          Result := Result + SubstituteMacros(Defs.ValueFromIndex[idx], Defs, FnDefs, Depth + 1)
+        else
+          Result := Result + Defs.ValueFromIndex[idx]
       else
         Result := Result + Word;
       i := j;
@@ -1184,10 +1206,10 @@ var
             // the rest of the line VERBATIM, trailing blanks included: fbc echoes exactly what was
             // written, and "#print Release mode " really does end in a space.
             WriteLn(StdErr, SubstituteMacros(TrimRight(DRest) +
-                            Copy(Raw, Length(TrimRight(Raw)) + 1, MaxInt), Defs, FnDefs))
+                            Copy(Raw, Length(TrimRight(Raw)) + 1, MaxInt), Defs, FnDefs, 0))
           else if (DName = 'error') and Emitting then
             // #error msg — abort compilation with a macro-expanded diagnostic.
-            raise EPreprocessorError.Create(Trim(SubstituteMacros(DRest, Defs, FnDefs)))
+            raise EPreprocessorError.Create(Trim(SubstituteMacros(DRest, Defs, FnDefs, 0)))
           else if (DName = 'assert') and Emitting then
           begin
             // #assert <expr> — abort compilation if the constant integer expression is false.
@@ -1201,9 +1223,9 @@ var
         begin
           if IsOptionEscapeLine(Trimmed) then EscapeOn := True;   // takes effect from THIS line on
           if EscapeOn then
-            ExpandedLine := ApplyEscapeRewrite(SubstituteMacros(Raw, Defs, FnDefs))
+            ExpandedLine := ApplyEscapeRewrite(SubstituteMacros(Raw, Defs, FnDefs, 0))
           else
-            ExpandedLine := SubstituteMacros(Raw, Defs, FnDefs);
+            ExpandedLine := SubstituteMacros(Raw, Defs, FnDefs, 0);
           // A #macro body may hold DIRECTIVES of its own - "#print", "#if", "#define" - and FreeBASIC
           // runs them when the macro is INVOKED. Our expansion produced the body as ordinary text, so a
           // '#' arrived at the parser and the whole program died on "Unexpected token #". The body
