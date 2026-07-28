@@ -10166,10 +10166,17 @@ begin
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
-  // PHASE 3 TIER 3: Add back-edge BodyBlock → CondBlock
+  // PHASE 3 TIER 3: Add back-edge BodyBlock → CondBlock.
+  // BodyBlock can be NIL, and then there is simply NO back edge: the body ended in something that
+  // terminates the block - an unconditional EXIT FOR, GOTO or RETURN - so control cannot reach the
+  // increment and test again. Dereferencing it crashed the COMPILER on
+  //   For i = ... : For j = ... : Exit For : Next j : Next i
+  // which is not an exotic shape at all; it only needs the EXIT to be unconditional, since
+  // "If c Then Exit For" leaves the fall-through path (and the block) alive.
+  // The ContUsed branch above already guards this way; this site had lost it.
   BodyBlock := FCurrentBlock;
   CondBlock := FProgram.FindBlock(LoopInfo.CondLabel);
-  if Assigned(CondBlock) then
+  if Assigned(CondBlock) and Assigned(BodyBlock) then
   begin
     BodyBlock.AddSuccessor(CondBlock);
     CondBlock.AddPredecessor(BodyBlock);
