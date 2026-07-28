@@ -307,6 +307,20 @@ const
   bcShr              = bcGroupCore + 132;  // SHR: arithmetic (sign-propagating) shift right
   bcShrUInt          = bcGroupCore + 153;  // SHR on an unsigned operand: logical (zero-filling) shift right
   bcPrintUsingInt    = bcGroupCore + 154;  // PRINT USING with an EXACT integer value (Src1=format string, Src2=int value)
+  // FreeBASIC variadic arguments (CVA_*). A variadic call stages its SURPLUS arguments into a stack of
+  // tagged slots, one FRAME per call, and the callee walks that frame with an ordinary integer cursor -
+  // which is why CVA_LIST is an Integer here, CVA_COPY is a copy and CVA_END is nothing at all.
+  bcVarArgCtl        = bcGroupCore + 155;  // Immediate 0 = open a frame (caller, before staging), 1 = close it (after the call)
+  // One PUSH per bank rather than one carrying the bank in Immediate: the register compactor classifies
+  // an operand's bank PER OPCODE, so a single push would have had a Src1 of three different banks and no
+  // classifier could describe it - a mistake this file has already paid for twice.
+  bcVarArgPushInt    = bcGroupCore + 156;  // stage one surplus argument: Src1 = int value
+  bcVarArgPushFloat  = bcGroupCore + 157;  // Src1 = float value
+  bcVarArgPushStr    = bcGroupCore + 158;  // Src1 = string value
+  bcVarArgBase       = bcGroupCore + 159;  // Dest(int) = cursor at the first argument of the CURRENT frame (CVA_START)
+  bcVarArgGetInt     = bcGroupCore + 160;  // Dest(int)   = slot at cursor Src1, converted (CVA_ARG)
+  bcVarArgGetFloat   = bcGroupCore + 161;  // Dest(float) = slot at cursor Src1, converted
+  bcVarArgGetStr     = bcGroupCore + 162;  // Dest(str)   = slot at cursor Src1, converted
   bcRandomize        = bcGroupCore + 134;  // RANDOMIZE: seed the RNG (Src1=seed reg; Immediate=1 seed / 0 time-based)
   // Mutexes (M5.4, FreeBASIC API), thin wrappers over TRTLCriticalSection. bcMutexCreate writes a
   // fresh mutex handle into an int register (Dest); Lock/Unlock/Destroy take a handle reg (Src1).
@@ -1820,6 +1834,14 @@ begin
         149: Result := 'PrintUsingStage';
         150: Result := 'PrintUsingRun';
         154: Result := 'PrintUsingInt';
+        155: Result := 'VarArgCtl';
+        156: Result := 'VarArgPushInt';
+        157: Result := 'VarArgPushFloat';
+        158: Result := 'VarArgPushStr';
+        159: Result := 'VarArgBase';
+        160: Result := 'VarArgGetInt';
+        161: Result := 'VarArgGetFloat';
+        162: Result := 'VarArgGetStr';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

@@ -279,6 +279,13 @@ type
     // it, "Dir()" steps it, and it ends when the entries run out (fbc has no handle to close). The
     // attributes of the entry just returned are kept here too, because DIR reports them through a byref
     // argument and we read them back with a second opcode instead.
+    // FreeBASIC variadic arguments (CVA_*): the SURPLUS arguments of a variadic call, one FRAME per
+    // call. The callee walks a frame with an ordinary integer cursor, which is why CVA_LIST lowers to
+    // an Integer, CVA_COPY to a copy and CVA_END to nothing. A slot carries its BANK because the
+    // caller knows the type and the callee names it again in CVA_ARG - and the two may disagree, as
+    // they may in C, so the read converts.
+    FVarArgs: array of record IntVal: Int64; FloatVal: Double; StrVal: string; Bank: Byte; end;
+    FVarArgFrames: array of Integer;   // stack of frame bases; the top one is what CVA_START answers
     FDirRec: TSearchRec;
     FDirOpen: Boolean;
     FDirMask: Integer;
@@ -5805,6 +5812,7 @@ var
   Ch: Char;
   InQuotes: Boolean;
   HandleNum64: Int64;   // indirect-call target (entry PC, or a BUILTIN_FP_TAG @Sin sentinel)
+  VaIdx: Integer;       // CVA_ARG: cursor into the variadic slot stack
 begin
   // Two-level dispatch: extract group from high byte
   Group := Instr.OpCode shr 8;
@@ -6390,6 +6398,69 @@ begin
         // reached by the compiler's orphan-NEXT lowering); unknown ones fall back to "ERROR n".
         raise TExecutorRuntimeException.CreateWithCode(
           GetErrorCodeDescription(Ctx.IntRegs[Instr.Src1]), Ctx.IntRegs[Instr.Src1]);
+      end;
+    // === FreeBASIC variadic arguments (CVA_*) ===
+    bcVarArgCtl:
+      if Instr.Immediate = 0 then
+      begin
+        // The CALLER opens a frame just before staging the surplus arguments.
+        SetLength(FVarArgFrames, Length(FVarArgFrames) + 1);
+        FVarArgFrames[High(FVarArgFrames)] := Length(FVarArgs);
+      end
+      else if Length(FVarArgFrames) > 0 then
+      begin
+        // ...and closes it once the call returns, discarding that call's slots.
+        SetLength(FVarArgs, FVarArgFrames[High(FVarArgFrames)]);
+        SetLength(FVarArgFrames, Length(FVarArgFrames) - 1);
+      end;
+    bcVarArgPushInt, bcVarArgPushFloat, bcVarArgPushStr:
+      begin
+        SetLength(FVarArgs, Length(FVarArgs) + 1);
+        with FVarArgs[High(FVarArgs)] do
+        begin
+          IntVal := 0; FloatVal := 0; StrVal := '';
+          case Instr.OpCode of
+            bcVarArgPushFloat: begin Bank := 1; FloatVal := Ctx.FloatRegs[Instr.Src1]; end;
+            bcVarArgPushStr:   begin Bank := 2; StrVal := Ctx.StringRegs[Instr.Src1]; end;
+          else                 begin Bank := 0; IntVal := Ctx.IntRegs[Instr.Src1]; end;
+          end;
+        end;
+      end;
+    bcVarArgBase:
+      // CVA_START: the cursor at the first argument of the frame this call opened.
+      if Length(FVarArgFrames) > 0 then
+        Ctx.IntRegs[Instr.Dest] := FVarArgFrames[High(FVarArgFrames)]
+      else
+        Ctx.IntRegs[Instr.Dest] := 0;
+    bcVarArgGetInt, bcVarArgGetFloat, bcVarArgGetStr:
+      begin
+        // CVA_ARG: the slot AT the cursor, converted to the type the callee named. Reading past the
+        // end answers a zero/empty value rather than faulting: C would be undefined here, and a
+        // diagnosable nothing is the better of the two.
+        VaIdx := Integer(Ctx.IntRegs[Instr.Src1]);
+        if (VaIdx < 0) or (VaIdx > High(FVarArgs)) then
+        begin
+          case Instr.OpCode of
+            bcVarArgGetFloat: Ctx.FloatRegs[Instr.Dest] := 0;
+            bcVarArgGetStr:   Ctx.StringRegs[Instr.Dest] := '';
+          else Ctx.IntRegs[Instr.Dest] := 0;
+          end;
+        end
+        else
+          case Instr.OpCode of
+            bcVarArgGetFloat:
+              if FVarArgs[VaIdx].Bank = 1 then Ctx.FloatRegs[Instr.Dest] := FVarArgs[VaIdx].FloatVal
+              else if FVarArgs[VaIdx].Bank = 2 then Ctx.FloatRegs[Instr.Dest] := StrToFloatDef(FVarArgs[VaIdx].StrVal, 0)
+              else Ctx.FloatRegs[Instr.Dest] := FVarArgs[VaIdx].IntVal;
+            bcVarArgGetStr:
+              if FVarArgs[VaIdx].Bank = 2 then Ctx.StringRegs[Instr.Dest] := FVarArgs[VaIdx].StrVal
+              else if FVarArgs[VaIdx].Bank = 1 then Ctx.StringRegs[Instr.Dest] := Trim(FConsoleBehavior.FormatNumber(FVarArgs[VaIdx].FloatVal, False))
+              else Ctx.StringRegs[Instr.Dest] := IntToStr(FVarArgs[VaIdx].IntVal);
+          else
+            if FVarArgs[VaIdx].Bank = 1 then Ctx.IntRegs[Instr.Dest] := Trunc(FVarArgs[VaIdx].FloatVal)
+            else if FVarArgs[VaIdx].Bank = 2 then Ctx.IntRegs[Instr.Dest] := StrToInt64Def(FVarArgs[VaIdx].StrVal, 0)
+            else Ctx.IntRegs[Instr.Dest] := FVarArgs[VaIdx].IntVal;
+          end;
       end;
     bcNop: ;
     bcClear: ClearAllVariables;

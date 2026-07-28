@@ -513,6 +513,14 @@ begin
     ssaOpenFunc: Result := bcOpenFunc;
     ssaDirSearch: Result := bcDirSearch;
     ssaDirAttr: Result := bcDirAttr;
+    ssaVarArgCtl: Result := bcVarArgCtl;
+    ssaVarArgPushInt: Result := bcVarArgPushInt;
+    ssaVarArgPushFloat: Result := bcVarArgPushFloat;
+    ssaVarArgPushStr: Result := bcVarArgPushStr;
+    ssaVarArgBase: Result := bcVarArgBase;
+    ssaVarArgGetInt: Result := bcVarArgGetInt;
+    ssaVarArgGetFloat: Result := bcVarArgGetFloat;
+    ssaVarArgGetStr: Result := bcVarArgGetStr;
     ssaDclose: Result := bcDclose;
     ssaOpen: Result := bcOpen;
     ssaClose: Result := bcClose;

@@ -326,6 +326,10 @@ type
     // Stage arguments into transfer slots and emit ssaCallSub (shared by CALL and FUNCTION).
     procedure EmitProcedureCall(const Name: string; ArgListNode: TASTNode);
     procedure StageCallArgs(const ParamOwnerName: string; ArgListNode: TASTNode);  // args -> xfer
+    function ProcIsVariadic(const NameU: string): Boolean;                        // declared "(..., ...)"
+    function ProcDeclaredParamCount(const NameU: string): Integer;
+    procedure EmitVarArgStage(const NameU: string; ArgListNode: TASTNode);        // stage the SURPLUS arguments
+    procedure EmitVarArgClose(const NameU: string);                               // discard them after the call
     procedure EmitCallSubLabel(const LabelName: string);  // ssaCallSub(label) + block split
     // OOP virtual dispatch (M4.3)
     function IsSubtypeOf(const U, T: string): Boolean;
@@ -763,6 +767,10 @@ type
     procedure ProcessCopyFile(Node: TASTNode);
     function ProcessFsFunction(Node: TASTNode): TSSAValue;
     function EmitDir(Node: TASTNode): TSSAValue;   // FreeBASIC DIR: start/continue a directory walk
+    function TryEmitCvaMacro(const NameU: string; ArgsNode: TASTNode;
+                             Tok: TLexerToken; out Value: TSSAValue): Boolean;  // CVA_START/ARG/COPY/END
+    function EmitCvaArg(A0, A1: TASTNode; Tok: TLexerToken; ForceString: Boolean): TSSAValue;
+    function CvaArgStrPointee(Node: TASTNode): Boolean;   // "Cva_Arg(a, ZString Ptr)"?
     procedure ProcessScratch(Node: TASTNode);
     procedure ProcessRenameFile(Node: TASTNode);
     procedure ProcessConcat(Node: TASTNode);
@@ -1884,6 +1892,16 @@ begin
           end;
           Exit;
         end;
+      end;
+      // "*Cva_Arg(args, ZString Ptr)": the deref and the fetch are one step - see EmitCvaArg.
+      if FModernMode and CvaArgStrPointee(Node.GetChild(0)) then
+      begin
+        DerefTarget := Node.GetChild(0);
+        while (DerefTarget.NodeType = antParentheses) and (DerefTarget.ChildCount >= 1) do
+          DerefTarget := DerefTarget.GetChild(0);
+        Result := EmitCvaArg(DerefTarget.GetChild(1).GetChild(0), DerefTarget.GetChild(1).GetChild(1),
+                             Node.Token, True);
+        Exit;
       end;
       // *SADD(s) / *(STRPTR(s)±n) with no pointer variable in between: STRPTR is declared "ZString Ptr"
       // in fbc, so the deref is the C string at that address - the same load a ZSTRING-pointee variable
@@ -5193,6 +5211,13 @@ begin
           EmitWStr(Node.GetChild(1), Result);
           Exit;
         end;
+
+        // FreeBASIC variadic-argument macros: CVA_START/CVA_ARG/CVA_COPY/CVA_END. They parse as array
+        // accesses (none is a registered keyword), and a statement-level one reaches here too - the
+        // statement dispatcher lowers a bare call through ProcessExpression and discards the result.
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and
+           TryEmitCvaMacro(UpperCase(ArrName), Node.GetChild(1), Node.Token, Result) then
+          Exit;
 
         // FreeBASIC SADD(s) / STRPTR(s): raw byte-heap pointer to a NUL-terminated copy of the string's
         // bytes (a read-only snapshot — the managed string has no stable mutable buffer address). STRPTR
@@ -8799,7 +8824,11 @@ begin
       if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
       begin
         Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
-        if (Length(Nm) > 0) and ((Nm[Length(Nm)] = '$') or IsBareStringFunc(Nm)) then
+        // CVA_ARG(args, T) answers a value of T: the second argument IS the type name.
+        if (Nm = kCVAARG) and (ArrayIndexOf(Nm) < 0) and (Node.ChildCount >= 2) and
+           (Node.GetChild(1).ChildCount >= 2) and (Node.GetChild(1).GetChild(1).NodeType = antIdentifier) then
+          Result := TypeNameToBank(UpperCase(VarToStr(Node.GetChild(1).GetChild(1).Value)), '')
+        else if (Length(Nm) > 0) and ((Nm[Length(Nm)] = '$') or IsBareStringFunc(Nm)) then
           Result := srtString
         else
         begin
@@ -15713,6 +15742,123 @@ const
   // against fbc, not assumed: "Dir("*")" lists the ordinary files INCLUDING read-only ones, no directories.
   FB_ATTR_NORMAL = $21;
 
+function TSSAGenerator.TryEmitCvaMacro(const NameU: string; ArgsNode: TASTNode;
+  Tok: TLexerToken; out Value: TSSAValue): Boolean;
+// FreeBASIC's variadic-argument macros, over the model described on bcVarArgCtl: a variadic call stages
+// its SURPLUS arguments into a frame of tagged slots, and CVA_LIST is an integer CURSOR into that frame.
+// That choice is what collapses three of the four macros into nothing much:
+//
+//   Cva_Start(args, lastnamed)  args = the frame's base. The second argument names the last DECLARED
+//                               parameter, which is how C finds the stack position; here the frame
+//                               already knows where it starts, so it is accepted and ignored.
+//   Cva_Arg(args, T)            the slot AT the cursor, converted to T - then the cursor advances,
+//                               which is an ordinary "args = args + 1" on an ordinary variable.
+//   Cva_Copy(dst, src)          a copy of the cursor. That IS the copy semantics.
+//   Cva_End(args)               nothing to release.
+var
+  A0, A1: TASTNode;
+  TypeU: string;
+  Bank: TSSARegisterType;
+  CurVal, TmpVal: TSSAValue;
+  Assign, Call, Add: TASTNode;
+  Op: TSSAOpCode;
+begin
+  Result := False;
+  Value := MakeSSAValue(svkNone);
+  if (NameU <> kCVASTART) and (NameU <> kCVAARG) and (NameU <> kCVACOPY) and (NameU <> kCVAEND) then Exit;
+  Result := True;
+  A0 := nil; A1 := nil;
+  if Assigned(ArgsNode) then
+  begin
+    if ArgsNode.ChildCount >= 1 then A0 := ArgsNode.GetChild(0);
+    if ArgsNode.ChildCount >= 2 then A1 := ArgsNode.GetChild(1);
+  end;
+  if A0 = nil then Exit;
+
+  if NameU = kCVAEND then Exit;   // nothing is allocated, so nothing is released
+
+  if NameU = kCVASTART then
+  begin
+    // args = <base of the frame this call opened>
+    Call := TASTNode.CreateWithValue(antFsFunction, '__CVABASE', Tok);
+    Assign := TASTNode.Create(antAssignment, Tok);
+    Assign.AddChild(A0.Clone);
+    Assign.AddChild(Call);
+    try ProcessStatement(Assign); finally Assign.Free; end;
+    Exit;
+  end;
+
+  if NameU = kCVACOPY then
+  begin
+    if A1 = nil then Exit;
+    Assign := TASTNode.Create(antAssignment, Tok);
+    Assign.AddChild(A0.Clone);
+    Assign.AddChild(A1.Clone);
+    try ProcessStatement(Assign); finally Assign.Free; end;
+    Exit;
+  end;
+
+  Value := EmitCvaArg(A0, A1, Tok, False);
+end;
+
+function TSSAGenerator.CvaArgStrPointee(Node: TASTNode): Boolean;
+// True for "Cva_Arg(args, ZString Ptr)" / "WString Ptr" - the shape a variadic printf uses to pick up a
+// STRING argument. It matters because our slot holds the string ITSELF, not an address: see EmitCvaArg.
+var
+  T: string;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) then Exit;
+  if (Node.GetChild(0).NodeType <> antIdentifier) or
+     (UpperCase(VarToStr(Node.GetChild(0).Value)) <> kCVAARG) then Exit;
+  if (Node.GetChild(1).ChildCount < 2) or (Node.GetChild(1).GetChild(1).NodeType <> antIdentifier) then Exit;
+  T := UpperCase(VarToStr(Node.GetChild(1).GetChild(1).Value));
+  Result := (T = 'ZSTRING PTR') or (T = 'WSTRING PTR');
+end;
+
+function TSSAGenerator.EmitCvaArg(A0, A1: TASTNode; Tok: TLexerToken; ForceString: Boolean): TSSAValue;
+// CVA_ARG(args, T): the slot AT the cursor, converted to T, and then the cursor advances.
+//
+// ForceString is the "*Cva_Arg(args, ZString Ptr)" case. In C that argument is an ADDRESS and the star
+// reads the string at it; here a variadic string argument is staged as the string itself, so the star
+// and the fetch are ONE step and the answer is simply that slot. Splitting them would mean inventing an
+// address for a value the VM keeps in a string register.
+var
+  TypeU: string;
+  Bank: TSSARegisterType;
+  CurVal, TmpVal: TSSAValue;
+  Assign, Add: TASTNode;
+  Op: TSSAOpCode;
+begin
+  TypeU := '';
+  if (A1 <> nil) and (A1.NodeType = antIdentifier) then TypeU := UpperCase(VarToStr(A1.Value));
+  if ForceString then Bank := srtString else Bank := TypeNameToBank(TypeU, '');
+  ProcessExpression(A0, CurVal);                 // the cursor
+  CurVal := EnsureIntRegister(CurVal);
+  case Bank of
+    srtFloat:  Op := ssaVarArgGetFloat;
+    srtString: Op := ssaVarArgGetStr;
+  else         Op := ssaVarArgGetInt;
+  end;
+  TmpVal := MakeSSARegister(Bank, FProgram.AllocRegister(Bank));
+  EmitInstruction(Op, TmpVal, CurVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // ...and the cursor moves on. Written as the assignment the programmer never had to write, so it
+  // goes through the ordinary store path and works for a local, a SHARED, or a BYREF parameter alike.
+  // The synthesised "+" carries A0's OWN token, not the caller's: a binary-op node whose token is an
+  // operator is lowered from that TOKEN, so building it with the deref's "*" quietly produced
+  // "args = args * 1" - the cursor never moved and every CVA_ARG read the first slot again.
+  Add := TASTNode.CreateWithValue(antBinaryOp, '+', A0.Token);
+  Add.AddChild(A0.Clone);
+  Add.AddChild(TASTNode.CreateWithValue(antLiteral, 1, A0.Token));
+  Assign := TASTNode.Create(antAssignment, Tok);
+  Assign.AddChild(A0.Clone);
+  Assign.AddChild(Add);
+  try ProcessStatement(Assign); finally Assign.Free; end;
+  Result := TmpVal;
+end;
+
 function TSSAGenerator.EmitDir(Node: TASTNode): TSSAValue;
 // FreeBASIC DIR, all four shapes:
 //   Dir(spec)                    start a walk with the default mask (fbNormal), first entry
@@ -15785,6 +15931,13 @@ begin
   if FCurrentBlock = nil then
     raise Exception.CreateFmt('%s() outside a block', [FuncName]);
   if FuncName = kDIR then Exit(EmitDir(Node));
+  if FuncName = '__CVABASE' then
+  begin
+    // Internal, emitted by TryEmitCvaMacro alone: CVA_START's answer.
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaVarArgBase, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
   if FuncName = '__DIRATTR' then
   begin
     // Internal, emitted by EmitDir alone: the attributes of the entry DIR last returned.
@@ -17143,6 +17296,9 @@ begin
   if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
     Exit(srtInt);
   T := CanonicalType(T);   // resolve FB TYPE-alias (e.g. "int32" -> "LONG") before the builtin match
+  // FreeBASIC CVA_LIST: the handle of a variadic argument list. Here that IS an integer cursor into
+  // the call's staged arguments, which is what makes CVA_COPY an ordinary copy and CVA_END nothing.
+  if T = kCVALIST then Exit(srtInt);
   if (T = 'INTEGER') or (T = 'LONG') or (T = 'SHORT') or (T = 'BYTE') or
      (T = 'UBYTE') or (T = 'USHORT') or (T = 'UINTEGER') or (T = 'ULONG') or
      (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'BOOLEAN') then
@@ -21676,10 +21832,12 @@ begin
                     MakeSSAConstInt(FUDTs[UDTIdx].NStr or (Int64(UDTIdx) shl 32)));
     EmitRecordInit(RcHandle, UDTIdx);                 // allocate nested-UDT members (no ctor calls)
     StageCallArgs(Name, ArgsNode);                    // evaluate args first (inner calls finish)
+    EmitVarArgStage(Name, ArgsNode);                  // variadic: the surplus arguments into their own frame
     EmitArrayArgBinds(Name, ArgsNode, True);          // array params: alias each to the caller's array (as EmitProcedureCall)
     EmitXferStore(srtInt, XFER_RESULT_HANDLE_SLOT, RcHandle);
     EmitCallSubLabel(ProcedureLabelName(Name));
     EmitArrayArgBinds(Name, ArgsNode, False);         // restore the aliased array slots after the call returns
+    EmitVarArgClose(Name);
     EmitByrefWriteback(Name, ArgsNode);   // BYREF: copy explicit-BYREF scalar params back into variable args
     Result := RcHandle;
   end
@@ -22998,6 +23156,75 @@ begin
   EmitInstruction(Op, DestReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
 end;
 
+function TSSAGenerator.ProcIsVariadic(const NameU: string): Boolean;
+// True for a procedure declared with FreeBASIC's variadic tail, "Sub s cdecl(count As Integer, ...)".
+var
+  Decl: TASTNode;
+begin
+  Result := FProcDecls.TryGetValue(NameU, Decl) and Assigned(Decl) and
+            (Decl.Attributes.Values['VARIADIC'] = '1');
+end;
+
+function TSSAGenerator.ProcDeclaredParamCount(const NameU: string): Integer;
+var
+  Decl: TASTNode;
+begin
+  Result := 0;
+  if FProcDecls.TryGetValue(NameU, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) and
+     (Decl.GetChild(1).NodeType = antParameterList) then
+    Result := Decl.GetChild(1).ChildCount;
+end;
+
+procedure TSSAGenerator.EmitVarArgStage(const NameU: string; ArgListNode: TASTNode);
+// The SURPLUS arguments of a variadic call - everything past the declared parameters - into a frame of
+// tagged slots the callee walks with CVA_ARG. Emitted before the call; EmitVarArgClose discards them
+// after it returns, which is what keeps the frame stack balanced across nesting and recursion.
+//
+// A frame is opened even when there are NO surplus arguments: "proc(1)" on a variadic proc is legal, and
+// its CVA_START must answer an empty frame rather than the caller's.
+var
+  i, NDecl: Integer;
+  ArgVal: TSSAValue;
+  Op: TSSAOpCode;
+begin
+  if not ProcIsVariadic(NameU) then Exit;
+  EmitInstruction(ssaVarArgCtl, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                  MakeSSAValue(svkNone), MakeSSAConstInt(0));
+  if not (Assigned(ArgListNode) and (ArgListNode.NodeType in [antArgumentList, antExpressionList])) then Exit;
+  NDecl := ProcDeclaredParamCount(NameU);
+  for i := NDecl to ArgListNode.ChildCount - 1 do
+  begin
+    case InferExprBank(ArgListNode.GetChild(i)) of
+      srtFloat:
+        begin
+          ProcessExpression(ArgListNode.GetChild(i), ArgVal);
+          ArgVal := EnsureFloatRegister(ArgVal);
+          Op := ssaVarArgPushFloat;
+        end;
+      srtString:
+        begin
+          ProcessStringExpression(ArgListNode.GetChild(i), ArgVal);
+          ArgVal := EnsureStringRegister(ArgVal);
+          Op := ssaVarArgPushStr;
+        end;
+    else
+      begin
+        ProcessExpression(ArgListNode.GetChild(i), ArgVal);
+        ArgVal := EnsureIntRegister(ArgVal);
+        Op := ssaVarArgPushInt;
+      end;
+    end;
+    EmitInstruction(Op, MakeSSAValue(svkNone), ArgVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+procedure TSSAGenerator.EmitVarArgClose(const NameU: string);
+begin
+  if not ProcIsVariadic(NameU) then Exit;
+  EmitInstruction(ssaVarArgCtl, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                  MakeSSAValue(svkNone), MakeSSAConstInt(1));
+end;
+
 procedure TSSAGenerator.StageCallArgs(const ParamOwnerName: string; ArgListNode: TASTNode);
 // Evaluate each argument, coerce to the parameter's type, and stage it into the matching transfer slot.
 // The parameter layout is taken from ParamOwnerName's declaration (so a virtual call stages per the base
@@ -23130,9 +23357,11 @@ begin
   if not Assigned(FCurrentBlock) then
     FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('call'));
   StageCallArgs(Name, ArgListNode);
+  EmitVarArgStage(Name, ArgListNode);            // variadic: the surplus arguments into their own frame
   EmitArrayArgBinds(Name, ArgListNode, True);    // array params: alias each to the caller's array
   EmitCallSubLabel(ProcedureLabelName(Name));
   EmitArrayArgBinds(Name, ArgListNode, False);   // restore the aliased array slots after the call returns
+  EmitVarArgClose(Name);
   EmitByrefWriteback(Name, ArgListNode);   // BYREF: copy explicit-BYREF scalar params back into variable args
 end;
 

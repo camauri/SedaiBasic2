@@ -248,6 +248,12 @@ const
   kFETCH   = 'FETCH';
   kPOINTER = 'POINTER';
   kPTR     = 'PTR';      // FreeBASIC: the pointer-type suffix ("As Integer Ptr"); POINTER is its synonym
+  // FreeBASIC variadic arguments: the list handle type and the five macros that walk it.
+  kCVALIST  = 'CVA_LIST';
+  kCVASTART = 'CVA_START';
+  kCVAARG   = 'CVA_ARG';
+  kCVACOPY  = 'CVA_COPY';
+  kCVAEND   = 'CVA_END';
   kRREG    = 'RREG';
   kUSR     = 'USR';
 

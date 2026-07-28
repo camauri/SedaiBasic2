@@ -2488,6 +2488,14 @@ begin
         end;
         ParamList.AddChild(ParamNode);
       end
+      // FreeBASIC variadic tail "...": the declaration accepts any number of further arguments. It used
+      // to fall into the defensive skip below, so the dots vanished and the procedure looked ordinary -
+      // the surplus arguments at every call site were then dropped in silence.
+      else if Context.Check(ttOpDot) then
+      begin
+        while Context.Check(ttOpDot) do Context.Advance;        // "..."
+        Result.Attributes.Values['VARIADIC'] := '1';
+      end
       else
         Context.Advance;                          // skip unexpected token (defensive)
       if Context.Check(ttSeparParam) then

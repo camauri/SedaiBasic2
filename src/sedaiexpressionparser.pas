@@ -2221,7 +2221,8 @@ end;
 function TExpressionParser.ParseArrayAccess(Left: TASTNode; Token: TLexerToken): TASTNode;
 var
   Indices: TASTNode;
-  FuncName: string;
+  FuncName, TypeStr: string;
+  TypeTok: TLexerToken;
 begin
   {$IFDEF DEBUG}
   LogVerbose('ParseArrayAccess');
@@ -2234,6 +2235,7 @@ begin
   end;
 
   // *** CRITICO: Distingui tra array access e function call ***
+  FuncName := '';
   if Assigned(Left) and (Left.NodeType = antIdentifier) then
   begin
     FuncName := UpperCase(VarToStr(Left.Value));
@@ -2249,7 +2251,31 @@ begin
   end;
 
   // Parse indices/arguments
-  if not Context.Check(ttDelimParClose) then
+  //
+  // CVA_ARG(args, T) names a TYPE as its second argument, and a POINTER type - "Cva_Arg(args, ZString
+  // Ptr)" in the manual's own printf example - is two juxtaposed identifiers that die on "Expected ')'".
+  // Fold it into the single "ZSTRING PTR" identifier the rest of the pipeline uses for pointer types,
+  // exactly as SIZEOF(<type> PTR) already does.
+  if (FuncName = kCVAARG) and ModernMode and (not Context.Check(ttDelimParClose)) then
+  begin
+    Indices := TASTNode.Create(antExpressionList);
+    Indices.AddChild(ParseExpression);                         // the CVA_LIST cursor
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;                                         // ','
+      if Context.Check(ttIdentifier) then
+      begin
+        TypeStr := UpperCase(VarToStr(Context.CurrentToken.Value));
+        TypeTok := Context.CurrentToken;
+        Context.Advance;
+        while AtPointerSuffix do begin TypeStr := TypeStr + ' ' + kPTR; Context.Advance; end;
+        Indices.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeStr, TypeTok));
+      end
+      else
+        Indices.AddChild(ParseExpression);
+    end;
+  end
+  else if not Context.Check(ttDelimParClose) then
   begin
     Indices := ParseExpressionList(ttSeparParam);
     if not Assigned(Indices) then

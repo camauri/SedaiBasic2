@@ -594,7 +594,7 @@ begin
         begin Ctx.PC := CurPC; ExecuteSoundOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
 
       // === Core VM operations (group 0, dense == 16-bit value) - inline for performance ===
-      DENSE_CORE_BASE + 0 .. DENSE_CORE_BASE + 154:
+      DENSE_CORE_BASE + 0 .. DENSE_CORE_BASE + 162:
           case Op of
         // Load constants - very common
         bcLoadConstInt: begin IntRegs[Instr.Dest] := Instr.Immediate; Inc(CurPC); end;
@@ -1309,6 +1309,10 @@ begin
         // File management commands
         bcCopyFile, bcScratch, bcRenameFile, bcConcat, bcMkdir, bcChdir, bcRmdir, bcMoveFile,
         bcSetEnviron, bcShell,
+        // Variadic arguments (CVA_*): rare, and the run loop is paid for by EVERY instruction, so they
+        // stay out of it and go through the slow path like the file and system operations above.
+        bcVarArgCtl, bcVarArgPushInt, bcVarArgPushFloat, bcVarArgPushStr, bcVarArgBase,
+        bcVarArgGetInt, bcVarArgGetFloat, bcVarArgGetStr,
         bcRaiseError:
           begin
             Ctx.PC := CurPC;

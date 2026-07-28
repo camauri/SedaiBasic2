@@ -413,6 +413,15 @@ type
     ssaOpenFunc,       // FreeBASIC Open(...) as an EXPRESSION: Dest = error code (0 = ok) instead of raising
     ssaDirSearch,      // FreeBASIC DIR: Dest(str) = first (Src3=0) / next (Src3=1) matching entry, "" when done
     ssaDirAttr,        // FreeBASIC DIR: Dest(int) = attributes of the entry ssaDirSearch last returned
+    // FreeBASIC variadic arguments (CVA_*).
+    ssaVarArgCtl,      // Src3 const: 0 = open a frame (caller, before staging), 1 = close it after the call
+    ssaVarArgPushInt,  // stage one surplus argument: Src1 = int value
+    ssaVarArgPushFloat,// Src1 = float value
+    ssaVarArgPushStr,  // Src1 = string value
+    ssaVarArgBase,     // Dest(int) = cursor at the first argument of the current frame (CVA_START)
+    ssaVarArgGetInt,   // Dest(int)   = slot at cursor Src1 (CVA_ARG)
+    ssaVarArgGetFloat, // Dest(float) = slot at cursor Src1
+    ssaVarArgGetStr,
     ssaDclose,         // DCLOSE #handle: Close disk file
     ssaOpen,           // OPEN (legacy C64/C128 style, maps to DOPEN)
     ssaClose,          // CLOSE (legacy C64/C128 style, maps to DCLOSE)

@@ -246,6 +246,8 @@ begin
     bcFileSetEof,    // FILESETEOF filenum -> int status result
     bcOpenFunc,      // Open(...) FUNCTION form -> int error code in Dest
     bcDirAttr,       // DIR: attributes of the entry just returned -> int Dest
+    bcVarArgBase,    // CVA_START: the cursor at the frame's first argument -> int Dest
+    bcVarArgGetInt,  // CVA_ARG of an integer type -> int Dest
     bcGetBinInt,     // GET #n binary -> int Dest
     bcArrayIdxResolve,  // runtime multi-dim index -> int Dest (linear index)
     bcArrayLoadIndInt,      // UDT array member load (int) - Dest is WRITTEN
@@ -327,6 +329,7 @@ begin
     bcIntToFloat, bcStringToFloat,
     bcNarrowSingle,  // B1.5: single-precision rounding (Dest=float)
     bcGetBinFloat,   // GET #n binary -> float Dest
+    bcVarArgGetFloat,  // CVA_ARG of a float type -> float Dest
     // === GROUP 1: String operations ===
     bcStrVal,      // VAL(str) - string to float
     bcStrCvFloat,  // CVS/CVD(str) - binary string to float (B3 serialization)
@@ -388,6 +391,7 @@ begin
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrSpace,  // B1.2: string dest
     bcCurDir, bcEnviron, bcExePath, bcCommand,  // CURDIR$ / ENVIRON$(name) / EXEPATH / COMMAND$(index) - string dest
     bcDirSearch,   // DIR(spec, mask) / DIR() - the matching entry's name, string dest
+    bcVarArgGetStr,   // CVA_ARG of a string type - string dest
     bcStrFormat,  // FORMAT(num, mask) - string dest
     bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - string dest
     bcStrTrimSet, // LTRIM/RTRIM/TRIM(s,set) - string dest
@@ -533,6 +537,8 @@ begin
     bcScnClr,         // Src1 = mode register (int)
     bcSetColor,       // Src1 = source register (int)
     bcGetColor,       // Src1 = source index (int)
+    bcVarArgGetInt, bcVarArgGetFloat, bcVarArgGetStr,   // CVA_ARG: Src1 = the cursor (int)
+    bcVarArgPushInt,   // staging a surplus argument: Src1 = the int value
     // === SUPERINSTRUCTIONS ===
     // Fused arithmetic-to-dest (Int): Src1 is int operand
     bcAddIntTo, bcSubIntTo, bcMulIntTo,
@@ -585,6 +591,7 @@ begin
   case OpCode of
     // SUB/FUNCTION transfer-register store (M2): Src1 is the float register read.
     bcXferStoreFloat,
+    bcVarArgPushFloat,   // staging a surplus argument: Src1 = the float value
     // === GROUP 0: Core VM operations ===
     // Float arithmetic
     bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcModFloat, bcNegFloat, bcPowFloat,
@@ -778,6 +785,7 @@ begin
   case OpCode of
     // SUB/FUNCTION transfer-register store (M2): Src1 is the string register read.
     bcXferStoreString,
+    bcVarArgPushStr,     // staging a surplus argument: Src1 = the string value
     // === GROUP 0: Core VM operations ===
     bcCopyString,
     // String comparison (first operand)
