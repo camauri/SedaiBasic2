@@ -528,7 +528,8 @@ type
     function BuiltinFuncPtrOpId(const NameU: string): Integer;          // @Sin/@Cos/... math-builtin funcptr op id (0 if not a builtin)
     function MathConstValue(const NameU: string; out V: Double): Boolean;  // crt/math.bi constants (M_PI, M_E, ...)
     procedure RecordVarWidth(const VarName, TypeName: string);          // B1.5 phase 2: remember a var's width
-    function DeclaredScalarLenBytes(const Name: string): Int64;         // Len(numeric var) = declared type size; -1 = keep the string path
+    function DeclaredScalarLenBytes(const Name: string): Int64;
+    function FixedLenVarSizeBytes(const Name: string): Int64;   // SizeOf of a "* n" string var, else -1         // Len(numeric var) = declared type size; -1 = keep the string path
     // Print form of a name declared INSIDE a procedure, recorded under "PROC|NAME" (kind 0 included).
     procedure SetPrintKindScoped(const ProcName, VarName, TypeName: string);
     procedure RecordSharedScalarType(const VarName, TypeName: string);       // DIM SHARED never recorded its type (print form + narrow width)
@@ -5147,6 +5148,9 @@ begin
                             MakeSSAValue(svkNone), MakeSSAValue(svkNone))
           else if (FindUDT(ArrName2) < 0) and (DeclaredScalarLenBytes(ArrName2) >= 0) then
             EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(DeclaredScalarLenBytes(ArrName2)),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+          else if (FindUDT(ArrName2) < 0) and (FixedLenVarSizeBytes(ArrName2) >= 0) then
+            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(FixedLenVarSizeBytes(ArrName2)),
                             MakeSSAValue(svkNone), MakeSSAValue(svkNone))
           else
             EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(ArrName2)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -16839,6 +16843,34 @@ begin
   if IsGet then Op := ssaGetBinMem else Op := ssaPutBinMem;
   EmitInstruction(Op, MakeSSAValue(svkNone), HandleReg, EnsureIntRegister(AddrVal), BytesReg);
   Result := True;
+end;
+
+function TSSAGenerator.FixedLenVarSizeBytes(const Name: string): Int64;
+// SizeOf of a FIXED-LENGTH string variable, in bytes, or -1 when the name is not one.
+//
+// The three families differ, and all three were answering 8 - the width of the slot that HOLDS the
+// string, which is exactly what SizeOf is not asking about. Measured against fbc:
+//   Dim As ZString * 13   ->  13   (n bytes; the capacity is n-1 characters plus the NUL)
+//   Dim As WString * 13   ->  26   (n wide units, 2 bytes each)
+//   Dim As String  * 13   ->  14   (n characters plus the terminator fbc keeps)
+// Len is unaffected: it measures the CONTENT and already agreed.
+var
+  Nm: string;
+  Cap: Int64;
+begin
+  Result := -1;
+  if not FModernMode then Exit;
+  Nm := UpperCase(Name);
+  Cap := StrToIntDef(FFixedLenVars.Values[Nm], 0);
+  if Cap <= 0 then
+  begin
+    // ZSTRING and WSTRING vars share one registry, and it holds CHARACTERS (n-1), so the declared n is
+    // Cap+1 - bytes for a ZSTRING, 2-byte units for a WSTRING.
+    Cap := StrToIntDef(FZStringVars.Values[Nm], 0);
+    if Cap <= 0 then Exit;
+    if IsWStringVar(Nm) then Exit((Cap + 1) * 2) else Exit(Cap + 1);
+  end;
+  Result := Cap + 1;   // "String * n": the n characters plus the terminator fbc keeps
 end;
 
 function TSSAGenerator.DeclaredScalarLenBytes(const Name: string): Int64;
