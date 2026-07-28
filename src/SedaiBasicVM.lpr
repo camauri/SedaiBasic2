@@ -556,7 +556,6 @@ var
   PassPrevCount: Integer;
   i, removed: Integer;
   ErrorSourceLine: Integer;
-  US: string;            // uppercased RAW source for the '#lang "qb"' detection
   QBLangDetected: Boolean;
   ShowBanners: Boolean;
   AotFuncList: TAotFuncs;
@@ -660,9 +659,7 @@ begin
       // -lang qb ('#lang "qb"' / the '$lang: "qb" metacommand) takes QB PRINT number spacing
       // (FB zone width + TRAILING space after numerics, fbc-verified; fblite does NOT). Detected
       // on the RAW text: the preprocessor strips both directive forms before the old site ran.
-      US := UpperCase(Source.Text);
-      QBLangDetected := (Pos('#LANG "QB"', US) > 0) or (Pos('$LANG: "QB"', US) > 0) or
-                        (Pos('$LANG:"QB"', US) > 0) or (Pos('#LANG"QB"', US) > 0);
+      QBLangDetected := DetectQBLang(Source.Text);
       Source.Text := PreprocessSource(Source.Text, ExtractFilePath(ExpandFileName(SourceFile)), SourceFile);
     except
       on E: EPreprocessorError do

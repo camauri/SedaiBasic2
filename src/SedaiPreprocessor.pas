@@ -28,10 +28,43 @@ type
   EPreprocessorError = class(Exception);
 
 function PreprocessSource(const Src, BaseDir: string; const FileName: string = ''): string;
+function DetectQBLang(const Src: string): Boolean;
 
 implementation
 
 uses Classes, SedaiLexerTypes;   // cVirtualEOL: the separator a multi-line #macro body is joined with
+
+function DetectQBLang(const Src: string): Boolean;
+// Does this source select the QB dialect, '#lang "qb"' or the '$lang: "qb" metacommand?
+//
+// Line by line, and anchored at the START of the line: a DIRECTIVE is one, and searching the whole text
+// for the substring found it inside comments and in the middle of ordinary lines. A file whose header
+// comment merely MENTIONS '$lang: "qb" was compiled in the qb dialect - which changes PRINT spacing for
+// every number in it, and says nothing about itself while doing so.
+//
+// Detected on the RAW text, before preprocessing: that pass strips both directive forms.
+var
+  L: TStringList;
+  i: Integer;
+  T: string;
+begin
+  Result := False;
+  L := TStringList.Create;
+  try
+    L.Text := Src;
+    for i := 0 to L.Count - 1 do
+    begin
+      T := UpperCase(TrimLeft(L[i]));
+      if (Length(T) > 0) and (T[1] = '''') then T := TrimLeft(Copy(T, 2, MaxInt));  // '$lang metacommand
+      T := StringReplace(T, ' ', '', [rfReplaceAll]);
+      if (Copy(T, 1, 11) = '#LANG"QB"') or (Copy(T, 1, 12) = '$LANG:"QB"') or
+         (Copy(T, 1, 9) = '#LANG"QB"') or (Copy(T, 1, 10) = '$LANG:"QB"') then
+        Exit(True);
+    end;
+  finally
+    L.Free;
+  end;
+end;
 
 function IsIdentChar(C: Char): Boolean; inline;
 begin
@@ -64,13 +97,24 @@ end;
 // the contents of "..." string literals. A match must be a full identifier (word boundaries).
 // Split a function-like macro argument string into top-level arguments (commas inside nested parens or
 // string literals do not separate). Returns the count; Args holds the trimmed argument texts.
-procedure SplitMacroArgs(const S: string; out Args: array of string; out Count: Integer);
+procedure SplitMacroArgs(const S: string; out Args: array of string; out Count: Integer;
+                         Starts: PInteger = nil);
+// Starts (optional) receives the 1-based offset in S where each argument's RAW text begins. A variadic
+// macro parameter needs that: "#rest" must stringize what was WRITTEN, commas, gaps and all, and the
+// trimmed pieces cannot be glued back into it - "a, , b" and "a,,b" would come out the same.
 var
   i, depth: Integer;
   cur: string;
   InStr: Boolean;
+  ArgStart: Integer;
+
+  procedure NoteStart;
+  begin
+    if (Starts <> nil) and (Count <= High(Args)) then Starts[Count] := ArgStart;
+  end;
+
 begin
-  Count := 0; cur := ''; depth := 0; InStr := False;
+  Count := 0; cur := ''; depth := 0; InStr := False; ArgStart := 1;
   for i := 1 to Length(S) do
   begin
     if InStr then
@@ -84,13 +128,15 @@ begin
     else if (S[i] = ',') and (depth = 0) then
     begin
       if Count <= High(Args) then Args[Count] := Trim(cur);
-      Inc(Count); cur := '';
+      NoteStart;
+      Inc(Count); cur := ''; ArgStart := i + 1;
     end
     else cur := cur + S[i];
   end;
   if (Trim(cur) <> '') or (Count > 0) then
   begin
     if Count <= High(Args) then Args[Count] := Trim(cur);
+    NoteStart;
     Inc(Count);
   end;
 end;
@@ -103,7 +149,8 @@ var
   ParamList, Body, Word: string;
   Params: array of string;
   Args: array[0..63] of string;
-  PCount, ACount: Integer;
+  Starts: array[0..63] of Integer;
+  PCount, ACount, VarIdx: Integer;
   InStr: Boolean;
 
   function ParamIndex(const W: string): Integer;
@@ -139,7 +186,29 @@ begin
     SetLength(Params, PCount + 1); Params[PCount] := Trim(Copy(ParamList, i, j - i)); Inc(PCount);
     i := j + 1;
   end;
-  SplitMacroArgs(ArgsStr, Args, ACount);
+  // FreeBASIC variadic macro parameter, "#macro m(a, rest...)": the last parameter's name carries the
+  // ellipsis, and it stands for EVERY remaining argument, written exactly as they were written. Without
+  // this the name never matched a parameter, so "#rest" stayed a literal "#rest" in the body and the
+  // expansion was nonsense - and the no-argument call "m(5)" left it behind to be read as a value.
+  VarIdx := -1;
+  for k := 0 to PCount - 1 do
+    if (Length(Params[k]) > 3) and (Copy(Params[k], Length(Params[k]) - 2, 3) = '...') then
+    begin
+      Params[k] := TrimRight(Copy(Params[k], 1, Length(Params[k]) - 3));
+      VarIdx := k;
+    end;
+  SplitMacroArgs(ArgsStr, Args, ACount, @Starts[0]);
+  // The variadic parameter takes the RAW remainder of the argument text (empty when nothing was passed).
+  if VarIdx >= 0 then
+  begin
+    if (VarIdx < ACount) and (VarIdx <= High(Args)) then
+      Args[VarIdx] := Trim(Copy(ArgsStr, Starts[VarIdx], MaxInt))
+    else if VarIdx <= High(Args) then
+    begin
+      Args[VarIdx] := '';
+      if ACount <= VarIdx then ACount := VarIdx + 1;   // so the parameter resolves to the empty text
+    end;
+  end;
   // Replace each whole-identifier parameter with its argument, handling the FreeBASIC preprocessor
   // operators: "#param" stringizes the argument; "a ## b" pastes the surrounding tokens together.
   Result := ''; i := 1; InStr := False;
@@ -908,8 +977,11 @@ var
               RegisterEmulatedHeader(FileName, Defs);
           end
           else if (DName = 'print') and Emitting then
-            // #print msg — emit a compile-time diagnostic (macro-expanded) to stderr.
-            WriteLn(StdErr, SubstituteMacros(DRest, Defs, FnDefs))
+            // #print msg — emit a compile-time diagnostic (macro-expanded) to stderr. The message is
+            // the rest of the line VERBATIM, trailing blanks included: fbc echoes exactly what was
+            // written, and "#print Release mode " really does end in a space.
+            WriteLn(StdErr, SubstituteMacros(TrimRight(DRest) +
+                            Copy(Raw, Length(TrimRight(Raw)) + 1, MaxInt), Defs, FnDefs))
           else if (DName = 'error') and Emitting then
             // #error msg — abort compilation with a macro-expanded diagnostic.
             raise EPreprocessorError.Create(Trim(SubstituteMacros(DRest, Defs, FnDefs)))

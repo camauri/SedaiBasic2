@@ -4599,10 +4599,12 @@ begin
   if Assigned(FConsoleBehavior) and Assigned(FProgram) and FProgram.ModernMode then
   begin
     // -lang qb sources keep the FB zone width but ADD the trailing space after numerics
-    // ("In the -lang qb dialect, an extra space is printed after numbers" - fbc-verified
-    // live: ' 15 ' then zone pad). nfCommodore is exactly that spacing rule.
+    // ("In the -lang qb dialect, an extra space is printed after numbers" - fbc-verified live: ' 15 '
+    // then zone pad). Only after an INTEGER, though: a Single or a Double keeps the leading sign pad
+    // and nothing after it, which is what nfQB says and nfCommodore (real v7, where a float gets the
+    // trailing space too) does not.
     if FProgram.QBLang then
-      FConsoleBehavior.NumberFormat := nfCommodore
+      FConsoleBehavior.NumberFormat := nfQB
     else
       FConsoleBehavior.NumberFormat := nfFreeBASIC;
     // A comma in PRINT tabs to the next zone, and the zone width is dialect-specific too: Commodore uses

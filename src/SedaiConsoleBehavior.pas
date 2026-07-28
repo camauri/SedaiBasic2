@@ -57,7 +57,12 @@ type
     // FreeBASIC (-lang fb): leading space for the sign, and NO trailing space. The trailing space is a
     // QB-dialect trait -- the FB manual's Print page says so outright ("In the -lang qb dialect, an extra
     // space is printed after numbers") -- so it belongs to CLASSIC (v7), not to MODERN.
-    nfFreeBASIC
+    nfFreeBASIC,
+    // FreeBASIC's -lang qb: the trailing space is back, but ONLY after an INTEGER. A Single or a Double
+    // keeps the leading sign pad and nothing after it - measured against fbc, which prints "E 24 !" for
+    // an Integer 24 and "E 24!" for a Single 24, same digits, same statement. It is the DECLARED TYPE
+    // that decides, so the split falls exactly where FormatInt and FormatNumber already part company.
+    nfQB
   );
 
   { Comportamento INPUT prompt }
@@ -518,6 +523,12 @@ begin
         // Spazio dopo sempre
         Suffix := ' ';
       end;
+    nfQB:
+      begin
+        // -lang qb, FLOAT: the sign pad, and NOTHING after it. Only integers get the trailing space.
+        if NonNeg then Prefix := ' ' else Prefix := '';
+        Suffix := '';
+      end;
 
     nfSpectrum:
       begin
@@ -613,7 +624,10 @@ begin
   Prefix := '';
   Suffix := '';
   case FNumberFormat of
-    nfCommodore, nfMSX:
+    nfCommodore, nfMSX,
+    // The qb dialect has no unsigned types (fbc rejects "As UInteger" outright), so this arm is
+    // unreachable; it sits with the integers so the preset is never silently half-defined.
+    nfQB:
       begin Prefix := ' '; Suffix := ' '; end;     // non-negative -> leading space
     nfSpectrum:
       begin Prefix := ''; Suffix := ''; end;
@@ -644,7 +658,7 @@ begin
   Suffix := '';
   NonNeg := Value >= 0;
   case FNumberFormat of
-    nfCommodore, nfMSX:
+    nfCommodore, nfMSX, nfQB:
       begin
         if NonNeg then Prefix := ' ';   // leading space in place of the sign
         Suffix := ' ';
