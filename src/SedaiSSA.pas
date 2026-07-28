@@ -262,6 +262,7 @@ type
                                          // a per-frame 1-field record (handle in hidden "<name>$REC"), so the address
                                          // is distinct per recursion level (a module-level @-taken var stays SHARED-backed).
     FByrefRetFuncs: TStringList;         // FreeBASIC BYREF function results: func name (UPPER) -> pointee type name
+    FByrefRetValue: TStringList;         // ...of those, the ones that return a NON-addressable expression (value return)
     FRawPtrRetFuncs: TStringList;        // FUNCTION returning a raw "<scalar> PTR": func name (UPPER) -> scalar pointee type
     FCurrentProcByrefRet: Boolean;       // lowering a "FUNCTION f() BYREF AS T" (returns an address)
     FVarWidthCode: TStringList;          // B1.5 phase 2: name (UPPER) -> narrow width code (Objects[]=PtrInt 1..7)
@@ -491,6 +492,8 @@ type
     function EmitVarAddress(const Name: string): TSSAValue;                     // packed address of a backed scalar (0=NULL)
     function IsByrefRetFunc(const Name: string): Boolean;                       // FUNCTION declared BYREF AS T?
     function ByrefRetPointeeBank(const Name: string): TSSARegisterType;         // bank of a byref function's pointee
+    function ByrefRetByAddress(const Name: string): Boolean;                    // ...and is the reference actually an ADDRESS?
+    function BodyReturnsNonAddressable(Decl: TASTNode): Boolean;                // a return with no address to take?
     // FB lexical scope (MODERN only). ScopePushFrame/ScopePopFrame manage FScopeStack; the block
     // variants emit the M8 record-mark instructions. Inert in CLASSIC mode (callers gate on FModernMode).
     procedure ScopePushFrame(Kind: TScopeKind);
@@ -767,6 +770,8 @@ type
     // File management commands (executed directly in VM)
     procedure ProcessCopyFile(Node: TASTNode);
     function ProcessFsFunction(Node: TASTNode): TSSAValue;
+    function ByrefRetCallName(Node: TASTNode): string;   // call to a BYREF-returning FUNCTION? -> its resolved label
+    function EmitByrefRetAddress(Node: TASTNode): TSSAValue;   // ...lowered to the ADDRESS it returns
     function EmitDir(Node: TASTNode): TSSAValue;   // FreeBASIC DIR: start/continue a directory walk
     function TryEmitCvaMacro(const NameU: string; ArgsNode: TASTNode;
                              Tok: TLexerToken; out Value: TSSAValue): Boolean;  // CVA_START/ARG/COPY/END
@@ -987,6 +992,8 @@ begin
   FRawFixedLenNode := nil;
   FHasFixedLenFields := False;
   FByrefRetFuncs := TStringList.Create;
+  FByrefRetValue := TStringList.Create;
+  FByrefRetValue.CaseSensitive := False;
   FRawPtrRetFuncs := TStringList.Create;
   FSharedScalarArr.CaseSensitive := False;
   FVarWidthCode := TStringList.Create;
@@ -1060,6 +1067,7 @@ begin
   FFixedLenVars.Free;
   FZStringVars.Free;
   FByrefRetFuncs.Free;
+  FByrefRetValue.Free;
   FRawPtrRetFuncs.Free;
   FVarWidthCode.Free;
   FVarPrintKind.Free;
@@ -6549,7 +6557,7 @@ begin
   // FreeBASIC BYREF function result as an lvalue: "f(args) = expr". The call returns the address of
   // the referenced variable; store expr through it (parsed like an array access / call target).
   if (VarNode.ChildCount >= 1) and (VarNode.GetChild(0).NodeType = antIdentifier) and
-     IsByrefRetFunc(VarToStr(VarNode.GetChild(0).Value)) then
+     ByrefRetByAddress(VarToStr(VarNode.GetChild(0).Value)) then
   begin
     VarName := VarToStr(VarNode.GetChild(0).Value);
     if VarNode.ChildCount >= 2 then
@@ -15863,6 +15871,45 @@ begin
   Result := TmpVal;
 end;
 
+function TSSAGenerator.ByrefRetCallName(Node: TASTNode): string;
+// If Node is a CALL to a function declared "ByRef As T", return its resolved label; else ''. A call
+// parses as antArrayAccess(nameIdent, args) unless the name is a declared array.
+var
+  Nm, Resolved: string;
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if not (Node.NodeType in [antArrayAccess, antFunctionCall]) then Exit;
+  if (Node.ChildCount < 1) or (Node.GetChild(0).NodeType <> antIdentifier) then Exit;
+  Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
+  if ArrayIndexOf(Nm) >= 0 then Exit;
+  if Node.ChildCount >= 2 then
+  begin
+    Resolved := ResolveCallLabel(Nm, Node.GetChild(1));
+    if Resolved <> '' then Nm := Resolved;
+  end;
+  if ByrefRetByAddress(Nm) then Result := Nm;
+end;
+
+function TSSAGenerator.EmitByrefRetAddress(Node: TASTNode): TSSAValue;
+// Lower a call to a BYREF-returning function and yield the ADDRESS it returns, with no dereference.
+// That address IS the result: dereferencing is what the ordinary rvalue use does afterwards, and what
+// a BYREF parameter must NOT do - passing the value there breaks the reference chain, which is the
+// whole point of "power2( power2( I ) )".
+var
+  Nm: string;
+  Args: TASTNode;
+begin
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  Nm := ByrefRetCallName(Node);
+  Args := nil;
+  if Node.ChildCount >= 2 then Args := Node.GetChild(1);
+  EmitProcedureCall(Nm, Args);
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitXferLoad(srtInt, XFER_RESULT_SLOT, Result);
+end;
+
 function TSSAGenerator.EmitDir(Node: TASTNode): TSSAValue;
 // FreeBASIC DIR, all four shapes:
 //   Dir(spec)                    start a walk with the default mask (fbNormal), first entry
@@ -19314,7 +19361,7 @@ begin
     // BYREF-return function: an int BYREF param was passed by ADDRESS (StageCallArgs), not copy-in/out,
     // so the slot holds an address — do NOT write it back into the argument (mutations already went
     // through the address). Other params (non-byref-ret, or non-int) keep the normal copy-back.
-    if IsByrefRetFunc(ParamOwnerName) and (RT = srtInt) then Continue;
+    if ByrefRetByAddress(ParamOwnerName) and (RT = srtInt) then Continue;
     // A UDT passed to a BYREF STRING parameter was converted through "Operator T.Cast() As String", so
     // the callee holds a temporary, not the object. Copying the slot back would overwrite the caller's
     // UDT variable with a string. FreeBASIC binds such a conversion to a temporary too, for this reason.
@@ -19430,24 +19477,30 @@ begin
 end;
 
 procedure TSSAGenerator.EmitModuleConstructors;
-// FreeBASIC: run each module constructor before module-level code, in definition order. (The optional
-// integer priority that orders multiple constructors is parsed but not yet honoured — rare in practice.)
+// FreeBASIC: run each module constructor before module-level code, LAST DEFINED FIRST - and each module
+// destructor at program end in the mirror order, first defined first. Measured against fbc on
+// examples/manual/procs/mod-ctor, which defines two of each and prints the order it gets:
+//   Constructor2, Constructor1, <module code>, Destructor1, Destructor2
+// We ran both the other way round. It is the LIFO discipline seen from the constructor end, and the
+// destructors are its mirror, so getting one right and the other wrong was not possible: they were both
+// simply reversed. (The optional integer priority that orders multiple constructors is parsed but not
+// yet honoured - rare in practice.)
 var
   i: Integer;
 begin
   if (FModuleCtors = nil) or (FModuleCtors.Count = 0) then Exit;
-  for i := 0 to FModuleCtors.Count - 1 do
+  for i := FModuleCtors.Count - 1 downto 0 do
     EmitProcedureCall(FModuleCtors[i], nil);
 end;
 
 procedure TSSAGenerator.EmitModuleProcDestructors;
-// FreeBASIC: run each module destructor at program end, in reverse definition order (after the module's
-// global-UDT destructors).
+// The mirror of EmitModuleConstructors: first defined, first destroyed (after the module's global-UDT
+// destructors).
 var
   i: Integer;
 begin
   if (FModuleDtors = nil) or (FModuleDtors.Count = 0) then Exit;
-  for i := FModuleDtors.Count - 1 downto 0 do
+  for i := 0 to FModuleDtors.Count - 1 do
     EmitProcedureCall(FModuleDtors[i], nil);
 end;
 
@@ -21656,6 +21709,49 @@ begin
   Result := FByrefRetFuncs.IndexOfName(UpperCase(Name)) >= 0;
 end;
 
+function TSSAGenerator.BodyReturnsNonAddressable(Decl: TASTNode): Boolean;
+// Does this procedure body ever hand back something that has no address - a literal, or any expression
+// that is not a plain variable name? "Function = s" can be a reference; "Function = "abcd"" cannot.
+// Conservative by construction: one such return makes the whole function a value return.
+  function Scan(N: TASTNode): Boolean;
+  var
+    i: Integer;
+    Tgt: TASTNode;
+  begin
+    Result := False;
+    if N = nil then Exit;
+    // "Function = expr" / "<procname> = expr" is an assignment whose target is the result name;
+    // "Return expr" is antReturn with the expression as its child.
+    if (N.NodeType = antReturn) and (N.ChildCount >= 1) then
+      Result := N.GetChild(0).NodeType <> antIdentifier
+    else if (N.NodeType = antAssignment) and (N.ChildCount >= 2) then
+    begin
+      Tgt := N.GetChild(0);
+      if (Tgt.NodeType = antIdentifier) and (UpperCase(VarToStr(Tgt.Value)) = kFUNCTION) then
+        Result := N.GetChild(1).NodeType <> antIdentifier;
+    end;
+    if Result then Exit;
+    for i := 0 to N.ChildCount - 1 do
+      if Scan(N.GetChild(i)) then Exit(True);
+  end;
+begin
+  Result := Scan(Decl);
+end;
+
+function TSSAGenerator.ByrefRetByAddress(const Name: string): Boolean;
+// A "FUNCTION f() BYREF AS T" returns a reference, and this machinery represents one as the ADDRESS of
+// the returned VARIABLE. That works for every bank - a SHARED string returned byref is written through
+// in ptr3_byrefret - but only while there IS a variable to take the address of.
+//
+// "Function f() ByRef As Const ZString : Function = "abcd"" returns a LITERAL. fbc hands back a pointer
+// into its statically allocated data; we have no address for it, and the old code returned 0 and
+// dereferenced it. Such a function returns by VALUE instead, which is indistinguishable from the
+// reference: a literal is not something a caller can write through. The decision is per FUNCTION, taken
+// when the declaration is collected, because the CALLER has to make the same one and only sees the name.
+begin
+  Result := IsByrefRetFunc(Name) and (FByrefRetValue.IndexOf(UpperCase(Name)) < 0);
+end;
+
 function TSSAGenerator.ByrefRetPointeeBank(const Name: string): TSSARegisterType;
 var
   idx: Integer;
@@ -21873,7 +21969,7 @@ begin
     EmitByrefWriteback(Name, ArgsNode);   // BYREF: copy explicit-BYREF scalar params back into variable args
     Result := RcHandle;
   end
-  else if IsByrefRetFunc(Name) then
+  else if ByrefRetByAddress(Name) then
   begin
     // FreeBASIC BYREF result used as an rvalue: the function returns an address; load it and then
     // dereference through it to read the pointee value. (Lvalue use "(f())=rhs" is handled in
@@ -23087,6 +23183,10 @@ begin
     if (NameNode.ChildCount >= 1) and (NameNode.GetChild(0).NodeType = antIdentifier) then
       Pointee := UpperCase(VarToStr(NameNode.GetChild(0).Value));
     FByrefRetFuncs.Add(Name + '=' + Pointee);
+    // ...and whether it can be a reference AT ALL: a body that returns something with no address (a
+    // literal, an expression) has to return by value, and the caller must agree - see ByrefRetByAddress.
+    if BodyReturnsNonAddressable(Node) and (FByrefRetValue.IndexOf(Name) < 0) then
+      FByrefRetValue.Add(Name);
   end;
   // (FUNCTION returning a raw "<scalar> PTR" is collected earlier by CollectRawPtrRetFuncs, before
   // CollectRawPtrVars, so a var assigned from such a call can be propagated raw.)
@@ -23302,10 +23402,17 @@ begin
     // value, so the function can return a reference into the caller's variable (min(a,b)=0). Gated to
     // int-banked params (address and slot are both int). The arg was address-backed by
     // CollectAddressTakenVars; EmitVarAddress yields its stable packed address.
-    if IsByrefRetFunc(ParamOwnerName) and (RT = srtInt) and
+    if ByrefRetByAddress(ParamOwnerName) and (RT = srtInt) and
        (ParamList.GetChild(i).Attributes.Values['BYREF'] = '1') and
        (ArgExpr.NodeType = antIdentifier) then
       ArgVal := EmitVarAddress(VarToStr(ArgExpr.Value))
+    // ...and when the argument is ITSELF a call to a byref-returning function, its result already IS an
+    // address: stage that, undereferenced. Otherwise the ordinary rvalue path loads the pointee and the
+    // callee receives a VALUE where it expects a reference - "power2( power2( I ) )" then used 4 as an
+    // address. Cascading byref returns is the shape the feature exists for.
+    else if (RT = srtInt) and (ParamList.GetChild(i).Attributes.Values['BYREF'] = '1') and
+            (ByrefRetCallName(ArgExpr) <> '') then
+      ArgVal := EmitByrefRetAddress(ArgExpr)
     else if RT = srtString then
       // The parameter wants a STRING, so a UDT argument carrying "Operator T.Cast() As String" converts
       // through it. Without this the record handle was staged into the string slot and the callee saw "0".
@@ -23701,7 +23808,7 @@ begin
     FCurrentProcName := Name;
     FCurrentProcIsFunction := (UpperCase(VarToStr(Proc.Value)) = kFUNCTION);
     FCurrentProcRetType := GetVariableType(Name);
-    FCurrentProcByrefRet := IsByrefRetFunc(Name);         // BYREF result: the function returns an address
+    FCurrentProcByrefRet := ByrefRetByAddress(Name);      // BYREF result: the function returns an address
     FCurrentProcRetRecType := VarRecordTypeName(Name);   // V3: '' unless it returns a UDT by value
     FCurrentResultHandle := MakeSSAValue(svkNone);
     FResultInitOp := nil;                                 // result-init revocation: nothing emitted yet for THIS proc
@@ -24919,6 +25026,7 @@ begin
   FRawPtrVars.Clear;
   FWStringVars.Clear;
   FByrefRetFuncs.Clear;
+  FByrefRetValue.Clear;
   FRawPtrRetFuncs.Clear;
   FArrayElemWidth.Clear;
   FUnsigned64Arrays.Clear;

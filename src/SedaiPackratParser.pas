@@ -7465,6 +7465,23 @@ var
   W: string;
 begin
   Result := False;
+  // "<type> CONST PTR" - a CONSTANT POINTER, as opposed to the "AS CONST <type>" that SkipTypeQualifiers
+  // already eats (a pointer to constant data). The qualifier sits BETWEEN the type and the suffix, so no
+  // amount of skipping before the type reaches it: "Dim p As Integer Const Ptr" parsed as a plain
+  // INTEGER, the PTR was lost with it, and "*p" then dereferenced a variable that was never a pointer.
+  // Consumed HERE, in the predicate, because every caller advances past the PTR immediately after - and
+  // there are fifteen of them.
+  if Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttConstant) and
+     (UpperCase(Context.CurrentToken.Value) = 'CONST') and Assigned(Context.PeekNext) and
+     (Context.PeekNext.TokenType = ttIdentifier) then
+  begin
+    W := UpperCase(VarToStr(Context.PeekNext.Value));
+    if (W = kPTR) or (FModernMode and (W = kPOINTER)) then
+    begin
+      Context.Advance;                   // consume CONST; the caller consumes the PTR that follows
+      Exit(True);
+    end;
+  end;
   if not Context.Check(ttIdentifier) then Exit;
   W := UpperCase(VarToStr(Context.CurrentToken.Value));
   Result := (W = kPTR) or (FModernMode and (W = kPOINTER));
