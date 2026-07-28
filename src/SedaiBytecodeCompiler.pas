@@ -511,6 +511,8 @@ begin
     // Disk file I/O
     ssaDopen: Result := bcDopen;
     ssaOpenFunc: Result := bcOpenFunc;
+    ssaDirSearch: Result := bcDirSearch;
+    ssaDirAttr: Result := bcDirAttr;
     ssaDclose: Result := bcDclose;
     ssaOpen: Result := bcOpen;
     ssaClose: Result := bcClose;

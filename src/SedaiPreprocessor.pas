@@ -500,6 +500,32 @@ begin
   end;
 end;
 
+procedure RegisterEmulatedHeader(const FileName: string; Defs: TStringList);
+// A FreeBASIC header we do not ship, but whose CONTENT we implement anyway.
+//
+// An #include of a file that is not there is dropped in silence, which is the right thing for headers
+// that only declare things we provide natively - but not for one that #defines CONSTANTS. A program
+// that includes "dir.bi" and then passes fbDirectory to DIR would be passing an undefined name, i.e.
+// zero: a different search that runs perfectly happily and lists the wrong entries.
+//
+// So the few headers that are pure constants are emulated here, and ONLY when the include actually
+// asks for them - a program that never includes dir.bi keeps fbDirectory as an ordinary name it may
+// declare itself, exactly as under fbc. Keys are UPPER: the macro lookup upper-cases the word.
+var
+  Base: string;
+begin
+  Base := LowerCase(ExtractFileName(FileName));
+  if Base = 'dir.bi' then
+  begin
+    Defs.Values['FBREADONLY']  := '&h01';
+    Defs.Values['FBHIDDEN']    := '&h02';
+    Defs.Values['FBSYSTEM']    := '&h04';
+    Defs.Values['FBDIRECTORY'] := '&h10';
+    Defs.Values['FBARCHIVE']   := '&h20';
+    Defs.Values['FBNORMAL']    := '(&h01 or &h20)';
+  end;
+end;
+
 procedure RegisterIntrinsicDefines(Defs: TStringList);
 // Pre-populate the macro table with FreeBASIC compiler intrinsic defines, so FB programs that use
 // conditional compilation (#if __FB_WIN32__ / #ifdef __FB_64BIT__ / #if __FB_VER_MAJOR__ >= 1) take
@@ -576,6 +602,7 @@ var
   NowDT: TDateTime;      // captured once for __DATE__/__DATE_ISO__/__TIME__
   PathStr: string;       // module directory for __PATH__
   EscapeOn: Boolean;     // OPTION ESCAPE seen: plain "..." strings become escaped from here on
+  IncOnce: TStringList;  // full paths already spliced by an "#include Once" (that is what ONCE means)
 
   function Emitting: Boolean;
   begin
@@ -647,6 +674,7 @@ var
     IsFn: Boolean;
     ParentEmit, Cond: Boolean;
     IncText: TStringList;
+    IncludeOnce: Boolean;   // "#include Once": splice this path at most one time
     SavedStackTop: Integer;
   begin
     SavedStackTop := High(Active);   // remember depth so includes can't leak unbalanced conditionals
@@ -682,7 +710,9 @@ var
               finally
                 IncText.Free;
               end;
-            end;
+            end
+            else
+              RegisterEmulatedHeader(FileName, Defs);
           end;
           Output.Add('');   // the metacommand line itself produces no output
           Inc(li);
@@ -836,21 +866,46 @@ var
           end
           else if (DName = 'include') and Emitting then
           begin
+            // The name is what stands between the QUOTES, not the whole rest of the line: a trailing
+            // "'" comment is ordinary on an include ('#include "dir.bi" ' provides the constants' is
+            // the manual's own wording) and used to become part of the path, so the file was never
+            // found and the include silently did nothing.
             FileName := Trim(DRest);
+            // "#include Once "file"": the modifier asks for the file to be spliced at most once. Every
+            // one of these used to keep ONCE as part of the path, so the file was never found and the
+            // include did nothing at all - in silence, which for a header of CONSTANTS means every one
+            // of them reads as zero.
+            IncludeOnce := (Length(FileName) >= 4) and (UpperCase(Copy(FileName, 1, 4)) = 'ONCE') and
+                           ((Length(FileName) = 4) or (FileName[5] in [' ', #9, '"']));
+            if IncludeOnce then FileName := Trim(Copy(FileName, 5, MaxInt));
             if (Length(FileName) >= 2) and (FileName[1] = '"') then
-              FileName := Copy(FileName, 2, Length(FileName) - 2);
+            begin
+              p := Pos('"', Copy(FileName, 2, MaxInt));
+              if p > 0 then FileName := Copy(FileName, 2, p - 1)
+              else FileName := Copy(FileName, 2, Length(FileName) - 1);
+            end
+            else
+              FileName := Trim(StripDirectiveComment(FileName));   // unquoted form
             FullPath := FileName;
             if not FileExists(FullPath) then FullPath := IncludeTrailingPathDelimiter(Dir) + FileName;
             if FileExists(FullPath) then
             begin
-              IncText := TStringList.Create;
-              try
-                IncText.LoadFromFile(FullPath);
-                Expand(IncText.Text, ExtractFilePath(ExpandFileName(FullPath)));
-              finally
-                IncText.Free;
+              if IncludeOnce and (IncOnce.IndexOf(UpperCase(ExpandFileName(FullPath))) >= 0) then
+                IncText := nil                                  // already spliced: ONCE means once
+              else
+              begin
+                if IncludeOnce then IncOnce.Add(UpperCase(ExpandFileName(FullPath)));
+                IncText := TStringList.Create;
+                try
+                  IncText.LoadFromFile(FullPath);
+                  Expand(IncText.Text, ExtractFilePath(ExpandFileName(FullPath)));
+                finally
+                  IncText.Free;
+                end;
               end;
-            end;
+            end
+            else
+              RegisterEmulatedHeader(FileName, Defs);
           end
           else if (DName = 'print') and Emitting then
             // #print msg — emit a compile-time diagnostic (macro-expanded) to stderr.
@@ -900,6 +955,8 @@ begin
     Exit(Src);
 
   Defs := TStringList.Create;
+
+  IncOnce := TStringList.Create;
   FnDefs := TStringList.Create;
   Output := TStringList.Create;
   try
@@ -927,6 +984,7 @@ begin
     Result := Output.Text;
   finally
     Defs.Free;
+    IncOnce.Free;
     FnDefs.Free;
     Output.Free;
   end;

@@ -411,6 +411,8 @@ type
     // Disk file I/O
     ssaDopen,          // DOPEN #handle, "filename" [, mode$]: Open disk file
     ssaOpenFunc,       // FreeBASIC Open(...) as an EXPRESSION: Dest = error code (0 = ok) instead of raising
+    ssaDirSearch,      // FreeBASIC DIR: Dest(str) = first (Src3=0) / next (Src3=1) matching entry, "" when done
+    ssaDirAttr,        // FreeBASIC DIR: Dest(int) = attributes of the entry ssaDirSearch last returned
     ssaDclose,         // DCLOSE #handle: Close disk file
     ssaOpen,           // OPEN (legacy C64/C128 style, maps to DOPEN)
     ssaClose,          // CLOSE (legacy C64/C128 style, maps to DCLOSE)

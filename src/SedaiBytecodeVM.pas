@@ -275,6 +275,14 @@ type
     FTimeOffset: Int64;     // TI$ offset in milliseconds from real time
     FClockOffsetDays: Double; // FreeBASIC SETDATE/SETTIME offset (days) applied to NOW/DATE/TIME/TIMER
     FEnvOverrides: TStringList; // SETENVIRON "NAME=value" overrides, consulted by ENVIRON$ before the OS environment
+    // FreeBASIC DIR: ONE directory walk is open at a time, exactly as in fbc - "Dir(spec, mask)" starts
+    // it, "Dir()" steps it, and it ends when the entries run out (fbc has no handle to close). The
+    // attributes of the entry just returned are kept here too, because DIR reports them through a byref
+    // argument and we read them back with a second opcode instead.
+    FDirRec: TSearchRec;
+    FDirOpen: Boolean;
+    FDirMask: Integer;
+    FDirAttr: Int64;
     // PRINT# per-handle output column, for the in-file comma zones (fbc pads the FILE to
     // 14-column boundaries). Grown on demand; a newline resets its handle's column.
     FFilePrintCols: array of Integer;
@@ -1025,6 +1033,7 @@ begin
   for JitI := 0 to High(FNativeLoops) do FNativeLoops[JitI].Free;   // JIT: release executable pages
   for JitI := 0 to High(FNativeFuncs) do FNativeFuncs[JitI].Free;   // AOT: release executable pages
   FEnvOverrides.Free;
+  if FDirOpen then begin FindClose(FDirRec); FDirOpen := False; end;   // a DIR walk the program never finished
   {$IFDEF WITH_SEDAI_AUDIO}
   // Stop and shutdown SAF audio backend
   if Assigned(FAudioBackend) then
@@ -3845,6 +3854,26 @@ begin
     FilePrintColSet(Handle, Length(Data) - LastNL)
   else
     FilePrintColSet(Handle, FilePrintColGet(Handle) + Length(Data));
+end;
+
+function DirAllowedAttrs(Mask: Integer): Integer;
+// The attribute bits a DIR entry may carry and still be returned, for a given FreeBASIC attrib_mask.
+//
+// FreeBASIC's rule is not the DOS one and not a plain intersection; it was read off the oracle with a
+// directory holding a plain file, a read-only file, a hidden file and a subdirectory, over twelve masks:
+//
+//   mask 0     -> plain files only          mask fbDirectory       -> DIRECTORIES ONLY, no plain files
+//   fbReadOnly -> plain + the read-only     fbDirectory Or fbArchive -> directories AND plain files
+//   fbHidden   -> plain + the hidden        all bits               -> everything
+//
+// So: an entry is returned when every bit it carries is allowed, ARCHIVE being allowed implicitly --
+// except when the mask asks for directories, where archive is NOT implied and the plain files (which
+// all carry it on Windows) drop out. Both halves of that are observable, which is why it is spelled out
+// here rather than folded into FindFirst's own mask.
+begin
+  Result := Mask;
+  if (Mask and faDirectory) = 0 then
+    Result := Result or faArchive;
 end;
 
 function TBytecodeVM.RawLoadZStrVal(RawPtr: Int64; Wide: Boolean): string;
@@ -11914,6 +11943,38 @@ begin
           FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
         end;
       end;
+
+    35: // bcDirSearch - DIR(spec, mask) starts a walk (Immediate 0), DIR() steps it (Immediate 1).
+      begin
+        if Instr.Immediate = 0 then
+        begin
+          if FDirOpen then begin FindClose(FDirRec); FDirOpen := False; end;   // a new search cancels the old one
+          FDirMask := Integer(Ctx.IntRegs[Instr.Src2]);
+          FDirOpen := FindFirst(Ctx.StringRegs[Instr.Src1], faAnyFile, FDirRec) = 0;
+        end
+        else if FDirOpen then
+          if FindNext(FDirRec) <> 0 then begin FindClose(FDirRec); FDirOpen := False; end;
+        // Filter here rather than through FindFirst's own mask, because FreeBASIC's rule is its own and
+        // was read off the oracle: an entry is returned when every attribute bit it carries is one the
+        // mask allows, with ARCHIVE allowed implicitly -- EXCEPT when the mask asks for directories, and
+        // then archive is not implied and plain files drop out. That is what makes "Dir("*", fbDirectory)"
+        // list directories ALONE while "fbDirectory Or fbArchive" lists both, and it fits all twelve
+        // mask/entry combinations measured against fbc.
+        while FDirOpen and ((FDirRec.Attr and not DirAllowedAttrs(FDirMask)) <> 0) do
+          if FindNext(FDirRec) <> 0 then begin FindClose(FDirRec); FDirOpen := False; end;
+        if FDirOpen then
+        begin
+          Ctx.StringRegs[Instr.Dest] := FDirRec.Name;
+          FDirAttr := FDirRec.Attr;
+        end
+        else
+        begin
+          Ctx.StringRegs[Instr.Dest] := '';
+          FDirAttr := 0;
+        end;
+      end;
+    36: // bcDirAttr - the attributes of the entry bcDirSearch last returned (0 once the walk is over)
+      Ctx.IntRegs[Instr.Dest] := FDirAttr;
 
   else
     raise Exception.CreateFmt('Unknown file I/O opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);

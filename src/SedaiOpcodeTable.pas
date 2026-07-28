@@ -40,7 +40,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 512 {$IFDEF WEB_MODE} + 12 {$ENDIF};
+  OPCODE_LIST_COUNT = 514 {$IFDEF WEB_MODE} + 12 {$ENDIF};
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -102,7 +102,7 @@ const
     bcPrintFileFloat, bcPrintFileInt, bcInputFileFloat, bcInputFileInt, bcFileQuery, bcSeekSet,
     bcInputFileLine, bcPutBinInt, bcPutBinFloat, bcGetBinInt, bcGetBinFloat, bcPutBinStr,
     bcGetBinStr, bcFileAttr, bcFileSetEof, bcPrintFileComma, bcPutBinMem, bcGetBinMem, bcPutBinArray,
-    bcGetBinArray, bcPutBinPad, bcGetBinSkip, bcOpenFunc, bcSprite, bcMovsprAbs, bcMovsprRel,
+    bcGetBinArray, bcPutBinPad, bcGetBinSkip, bcOpenFunc, bcDirSearch, bcDirAttr, bcSprite, bcMovsprAbs, bcMovsprRel,
     bcMovsprPolar, bcMovsprAuto, bcSprcolor, bcSprsav, bcCollision, bcBump,
     bcRspcolor, bcRsppos, bcRsprite, bcSpriteDef, bcSprSaveFile, bcSprLoadFile,
     bcSprSize, bcSprForm, bcGraphicRGBA, bcGraphicSetMode, bcGraphicBox, bcGraphicCircle,
@@ -146,20 +146,20 @@ const
   DENSE_ARRAY_BASE    = 240;  // group 3  (52)          -> 240..291 (bcRawLoad/StoreZStr = subs 50/51)
   DENSE_IO_BASE       = 292;  // group 4  (23)          -> 292..314
   DENSE_SPECIAL_BASE  = 315;  // group 5  (17)          -> 315..331
-  DENSE_FILEIO_BASE   = 332;  // group 6  (35)          -> 332..366 (bcOpenFunc = sub 34)
-  DENSE_SPRITE_BASE   = 367;  // group 7  (17)          -> 367..383
+  DENSE_FILEIO_BASE   = 332;  // group 6  (37)          -> 332..368 (bcDirAttr = sub 36)
+  DENSE_SPRITE_BASE   = 369;  // group 7  (17)          -> 369..385
   {$IFDEF WEB_MODE}
   // group 8 (web, subs 1..12) inserts a 13-slot block, shifting graphics/sound/super up by 13.
-  DENSE_WEB_BASE      = 384;  // 384..396 (12 used, slot 0 a hole)
-  DENSE_GRAPHICS_BASE = 397;  // group 10 (64)          -> 397..460
-  DENSE_SOUND_BASE    = 461;  // group 11 (6)           -> 461..466
-  DENSE_SUPER_BASE    = 467;  // group 200 (256 slots)  -> 467..722
-  DENSE_TOTAL         = 723;  // N (with web)
+  DENSE_WEB_BASE      = 386;  // 386..398 (12 used, slot 0 a hole)
+  DENSE_GRAPHICS_BASE = 399;  // group 10 (64)          -> 399..462
+  DENSE_SOUND_BASE    = 463;  // group 11 (6)           -> 463..468
+  DENSE_SUPER_BASE    = 469;  // group 200 (256 slots)  -> 469..724
+  DENSE_TOTAL         = 725;  // N (with web)
   {$ELSE}
-  DENSE_GRAPHICS_BASE = 384;  // group 10 (64)          -> 384..447
-  DENSE_SOUND_BASE    = 448;  // group 11 (6)           -> 448..453
-  DENSE_SUPER_BASE    = 454;  // group 200 (256 slots)  -> 454..709 (58 used, 198 holes)
-  DENSE_TOTAL         = 710;  // N
+  DENSE_GRAPHICS_BASE = 386;  // group 10 (64)          -> 386..449
+  DENSE_SOUND_BASE    = 450;  // group 11 (6)           -> 450..455
+  DENSE_SUPER_BASE    = 456;  // group 200 (256 slots)  -> 456..711 (58 used, 198 holes)
+  DENSE_TOTAL         = 712;  // N
   {$ENDIF}
 
 var

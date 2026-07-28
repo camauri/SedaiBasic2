@@ -606,6 +606,11 @@ const
   // one's Immediate already carries the mode register (and the register compactor remaps it as such), so
   // there is no free field to discriminate on, and an unused Dest of 0 is a valid register index.
   bcOpenFunc        = bcGroupFileIO + 34;   // Dest=int error code, Src1=handle, Src2=filename, Immediate=mode reg
+  // FreeBASIC DIR: a STATEFUL directory walk. "Dir(spec, mask)" starts one and yields the first entry;
+  // "Dir()" yields the next; "" ends it. The attributes of the entry just returned are read separately,
+  // so each opcode has exactly one destination and one bank.
+  bcDirSearch       = bcGroupFileIO + 35;   // Dest=string name (""=no more), Src1=spec, Src2=mask reg, Immediate 0=first 1=next
+  bcDirAttr         = bcGroupFileIO + 36;   // Dest=int attributes of the entry bcDirSearch last returned
 
   // === GROUP 7: SPRITE OPERATIONS (0x07xx) ===
   // Sprite commands
@@ -1989,6 +1994,8 @@ begin
         25: Result := 'FileAttr';
         26: Result := 'FileSetEof';
         34: Result := 'OpenFunc';
+        35: Result := 'DirSearch';
+        36: Result := 'DirAttr';
       else
         Result := Format('FileIO_%d', [SubOp]);
       end;

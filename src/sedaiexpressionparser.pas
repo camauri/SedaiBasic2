@@ -1389,7 +1389,8 @@ begin
   FuncName := UpperCase(Token.Value);
   if (not ModernMode) or (not Context.Check(ttDelimParOpen)) or
      ((FuncName <> kCHDIR) and (FuncName <> kMKDIR) and (FuncName <> kRMDIR) and
-      (FuncName <> kKILL) and (FuncName <> kFILECOPY) and (FuncName <> kSHELL)) then
+      (FuncName <> kKILL) and (FuncName <> kFILECOPY) and (FuncName <> kSHELL) and
+      (FuncName <> kDIR)) then
   begin
     HandleError(Format('Unexpected token "%s"', [Token.Value]), Token);
     Result := nil;
@@ -1398,6 +1399,25 @@ begin
 
   Result := TASTNode.CreateWithValue(antFsFunction, FuncName, Token);
   Context.Advance;  // Consume '('
+  // DIR is the one that answers a STRING, and the only one with an empty form: "Dir()" continues the
+  // walk a previous "Dir(spec, ...)" started. It takes up to three arguments, the third being the
+  // out-attributes variable, so the fixed one-or-two shape below does not fit it.
+  if FuncName = kDIR then
+  begin
+    while not Context.Check(ttDelimParClose) do
+    begin
+      Result.AddChild(ParseExpression);
+      if not Context.Check(ttSeparParam) then Break;
+      Context.Advance;                                // ','
+    end;
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" after DIR arguments', Context.CurrentToken);
+      Result.Free; Result := nil; Exit;
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
   Result.AddChild(ParseExpression);
   if Context.Check(ttSeparParam) then
   begin

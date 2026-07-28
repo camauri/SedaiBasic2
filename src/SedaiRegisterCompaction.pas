@@ -245,6 +245,7 @@ begin
     bcFileAttr,      // FILEATTR(filenum, returntype) -> int result
     bcFileSetEof,    // FILESETEOF filenum -> int status result
     bcOpenFunc,      // Open(...) FUNCTION form -> int error code in Dest
+    bcDirAttr,       // DIR: attributes of the entry just returned -> int Dest
     bcGetBinInt,     // GET #n binary -> int Dest
     bcArrayIdxResolve,  // runtime multi-dim index -> int Dest (linear index)
     bcArrayLoadIndInt,      // UDT array member load (int) - Dest is WRITTEN
@@ -386,6 +387,7 @@ begin
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING codepoint substrings - string dest
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrSpace,  // B1.2: string dest
     bcCurDir, bcEnviron, bcExePath, bcCommand,  // CURDIR$ / ENVIRON$(name) / EXEPATH / COMMAND$(index) - string dest
+    bcDirSearch,   // DIR(spec, mask) / DIR() - the matching entry's name, string dest
     bcStrFormat,  // FORMAT(num, mask) - string dest
     bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - string dest
     bcStrTrimSet, // LTRIM/RTRIM/TRIM(s,set) - string dest
@@ -660,6 +662,7 @@ begin
     // === GROUP 6: File I/O ===
     bcWInputChars, bcInputChars,    // W/INPUT(n[,#f]): Src2 = file handle (int; 0 = keyboard)
     bcSeekSet,        // SEEK #n, pos: Src2 = position (int)
+    bcDirSearch,      // DIR(spec, mask): Src2 = the attribute mask (int)
     bcScratch,        // SCRATCH "pattern", flags: Src2 = flags (int; bit0 silent, bit1 force)
     bcFileAttr,       // FILEATTR(filenum, returntype): Src2 = returntype (int)
     bcPutBinInt,      // PUT #n: Src2 = int value
@@ -793,6 +796,7 @@ begin
     bcCopyFile, bcScratch, bcRenameFile, bcConcat, bcMkdir, bcChdir, bcRmdir, bcMoveFile,
     bcGfxDrawGML, // DRAW "..." - Src1 = GML string
     bcStrFormat, // FORMAT(num, mask) - Src1 = mask string
+    bcDirSearch, // DIR(spec, mask) - Src1 = the file spec (string; unused by the CONTINUE form)
 
     bcStrVal,    // VAL(str) - reads string, produces float
     bcStrValInt, // VALINT/VALLNG/VALUINT(str) - reads string, produces int

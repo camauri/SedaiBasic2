@@ -762,6 +762,7 @@ type
     // File management commands (executed directly in VM)
     procedure ProcessCopyFile(Node: TASTNode);
     function ProcessFsFunction(Node: TASTNode): TSSAValue;
+    function EmitDir(Node: TASTNode): TSSAValue;   // FreeBASIC DIR: start/continue a directory walk
     procedure ProcessScratch(Node: TASTNode);
     procedure ProcessRenameFile(Node: TASTNode);
     procedure ProcessConcat(Node: TASTNode);
@@ -8778,7 +8779,8 @@ begin
       Result := GetVariableType(VarToStr(Node.Value));
     antFsFunction:
       // ChDir/MkDir/RmDir/Kill/FileCopy/Shell(...) function form: error/exit code, a Long.
-      Result := srtInt;
+      // DIR is the exception: it answers the matching entry's NAME.
+      if UpperCase(VarToStr(Node.Value)) = kDIR then Result := srtString else Result := srtInt;
     antOpenFunc:
       // Open(...) function form: the error code, a Long.
       Result := srtInt;
@@ -15706,6 +15708,69 @@ begin
   EmitInstruction(ssaCopyFile, MakeSSAValue(svkNone), SrcReg, DstReg, OverwriteReg);
 end;
 
+const
+  // FreeBASIC's default attrib_mask for DIR, from dir.bi: fbNormal = fbReadOnly Or fbArchive. Measured
+  // against fbc, not assumed: "Dir("*")" lists the ordinary files INCLUDING read-only ones, no directories.
+  FB_ATTR_NORMAL = $21;
+
+function TSSAGenerator.EmitDir(Node: TASTNode): TSSAValue;
+// FreeBASIC DIR, all four shapes:
+//   Dir(spec)                    start a walk with the default mask (fbNormal), first entry
+//   Dir(spec, mask)              start a walk with an explicit mask
+//   Dir(spec, mask, out_attrib)  ...and report the entry's attributes through the variable
+//   Dir([out_attrib])            continue the walk; "" when the entries run out
+// The CONTINUE form is told apart by its first argument NOT being a string: "Dir(a)" with an integer
+// variable is the continue-and-report form, which is how the manual's own dirfolder example loops.
+//
+// The out-attributes argument is a byref result in fbc. Here the walk opcode has one destination and
+// one bank, and the attributes are read back with a second opcode - so this synthesises the assignment
+// the programmer wrote, which also means any lvalue the assignment path accepts works.
+var
+  SpecVal, MaskVal, SpecReg, MaskReg: TSSAValue;
+  AttrNode, Assign, Call: TASTNode;
+  IsStart: Boolean;
+begin
+  IsStart := (Node.ChildCount >= 1) and (Node.GetChild(0) <> nil) and
+             (InferExprBank(Node.GetChild(0)) = srtString);
+  AttrNode := nil;
+  Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  if IsStart then
+  begin
+    ProcessStringExpression(Node.GetChild(0), SpecVal);
+    SpecReg := EnsureStringRegister(SpecVal);
+    if (Node.ChildCount >= 2) and (Node.GetChild(1) <> nil) then
+    begin
+      ProcessExpression(Node.GetChild(1), MaskVal);
+      MaskReg := EnsureIntRegister(MaskVal);
+    end
+    else
+    begin
+      // fbc's default attrib_mask is fbNormal = fbReadOnly Or fbArchive: "Dir("*")" lists the ordinary
+      // files INCLUDING the read-only ones, and no directories. Measured, not assumed.
+      MaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, MaskReg, MakeSSAConstInt(FB_ATTR_NORMAL),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    if Node.ChildCount >= 3 then AttrNode := Node.GetChild(2);
+    EmitInstruction(ssaDirSearch, Result, SpecReg, MaskReg, MakeSSAConstInt(0));
+  end
+  else
+  begin
+    if (Node.ChildCount >= 1) and (Node.GetChild(0) <> nil) then AttrNode := Node.GetChild(0);
+    EmitInstruction(ssaDirSearch, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(1));
+  end;
+  // "out_attrib = <attributes of the entry just returned>", emitted AFTER the walk step so it reports
+  // that entry and not the previous one.
+  if AttrNode <> nil then
+  begin
+    Call := TASTNode.CreateWithValue(antFsFunction, '__DIRATTR', Node.Token);
+    Assign := TASTNode.Create(antAssignment, Node.Token);
+    Assign.AddChild(AttrNode.Clone);
+    Assign.AddChild(Call);
+    try ProcessStatement(Assign); finally Assign.Free; end;
+  end;
+end;
+
 function TSSAGenerator.ProcessFsFunction(Node: TASTNode): TSSAValue;
 // FreeBASIC function form of a filesystem command (parser guarantees MODERN and the name set):
 // ChDir/MkDir/RmDir/Kill/FileCopy(...) -> error code, Shell(cmd) -> exit code. Emits the SAME SSA
@@ -15717,7 +15782,17 @@ var
   R1, R2, Flags: TSSAValue;
 begin
   FuncName := UpperCase(VarToStr(Node.Value));
-  if (FCurrentBlock = nil) or (Node.ChildCount < 1) or (Node.GetChild(0) = nil) then
+  if FCurrentBlock = nil then
+    raise Exception.CreateFmt('%s() outside a block', [FuncName]);
+  if FuncName = kDIR then Exit(EmitDir(Node));
+  if FuncName = '__DIRATTR' then
+  begin
+    // Internal, emitted by EmitDir alone: the attributes of the entry DIR last returned.
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaDirAttr, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+  if (Node.ChildCount < 1) or (Node.GetChild(0) = nil) then
     raise Exception.CreateFmt('%s() requires an argument', [FuncName]);
 
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
