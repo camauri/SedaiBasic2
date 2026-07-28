@@ -131,6 +131,9 @@ const
   kDEFLNG  = 'DEFLNG';
   kDEFBYTE = 'DEFBYTE';
   kDEFSHORT = 'DEFSHORT';
+  kDEFUBYTE = 'DEFUBYTE';    // FreeBASIC: default UBYTE type by initial letter
+  kDEFUSHORT = 'DEFUSHORT';  // FreeBASIC: default USHORT type by initial letter
+  kDEFUINT2 = 'DEFUINT';     // FreeBASIC: default UINTEGER type by initial letter
   kDEFLNGINT = 'DEFLNGINT';
   kDEFLONGINT = 'DEFLONGINT';   // FreeBASIC: default LONGINT type by initial letter (int bank)
   kDEFULONGINT = 'DEFULONGINT'; // FreeBASIC: default ULONGINT type by initial letter (int bank)
@@ -233,6 +236,8 @@ const
   kSYS     = 'SYS';
   kWAIT    = 'WAIT';
   kRUN     = 'RUN';
+  kCHAIN   = 'CHAIN';        // FreeBASIC: Chain(prog) - run another program (not reserved)
+  kEXEC    = 'EXEC';         // FreeBASIC: Exec(prog, args) - run a program, -1 if it cannot start
   kNEW     = 'NEW';
   kLIST    = 'LIST';
   kEDIT    = 'EDIT';     // Edit a single program line

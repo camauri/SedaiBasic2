@@ -1707,6 +1707,9 @@ begin
  RegisterKeyword(kDEFLNG,  ttDefType,         'Default LONG type by initial letter (FreeBASIC)',    kcData);
  RegisterKeyword(kDEFBYTE, ttDefType,         'Default BYTE type by initial letter (FreeBASIC)',    kcData);
  RegisterKeyword(kDEFSHORT,ttDefType,         'Default SHORT type by initial letter (FreeBASIC)',   kcData);
+ RegisterKeyword(kDEFUBYTE,ttDefType,         'Default UBYTE type by initial letter (FreeBASIC)',   kcData);
+ RegisterKeyword(kDEFUSHORT,ttDefType,        'Default USHORT type by initial letter (FreeBASIC)',  kcData);
+ RegisterKeyword(kDEFUINT2,ttDefType,         'Default UINTEGER type by initial letter (FreeBASIC)',kcData);
  RegisterKeyword(kDEFLNGINT,ttDefType,        'Default LONGINT type by initial letter (FreeBASIC)', kcData);
  RegisterKeyword(kDEFLONGINT,ttDefType,       'Default LONGINT type by initial letter (FreeBASIC)', kcData);
  RegisterKeyword(kDEFULONGINT,ttDefType,      'Default ULONGINT type by initial letter (FreeBASIC)',kcData);
@@ -2085,6 +2088,7 @@ begin
   // Commodore v7 has no CONTINUE (CONT is separate)/LSET/RSET/ENUM/DEF* , so this is safe.
   SetKeywordsDialect([kCONTINUE, kLSET, kRSET, kENUM, kNAMESPACE, kSCOPE, kVAR, kSTATIC,
                       kDEFINT, kDEFLNG, kDEFBYTE, kDEFSHORT, kDEFLNGINT, kDEFLONGINT, kDEFULONGINT, kDEFSNG, kDEFDBL, kDEFSTR,
+                      kDEFUBYTE, kDEFUSHORT, kDEFUINT2,
                       kNOW, kTIMER, kDATEFN, kTIMEFN, kSETDATE, kSETTIME],
                      kdModernOnly);
 

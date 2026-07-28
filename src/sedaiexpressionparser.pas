@@ -78,6 +78,7 @@ type
     function ParseGraphicsCommandForm(Token: TLexerToken): TASTNode;  // FreeBASIC SCREEN(row, col [, flag])
     function ParseFsFunctionForm(Token: TLexerToken): TASTNode;  // FreeBASIC ChDir/MkDir/RmDir/Kill/FileCopy/Shell(...) -> error code
     function ParseOpenFunctionForm(Token: TLexerToken): TASTNode; // FreeBASIC Open(...) -> error code
+    function ParseRunFunctionForm(Token: TLexerToken): TASTNode;  // FreeBASIC Run(prog) -> -1 if it cannot start
     function ParseSpriteFunction(Token: TLexerToken): TASTNode;
     function ParseInputFunction(Token: TLexerToken): TASTNode;
     function ParseInputFunctionForm(Token: TLexerToken): TASTNode;   // FreeBASIC INPUT(n [, [#]f])
@@ -134,6 +135,7 @@ function StaticParseGraphicsFunction(Parser: Pointer; Token: TLexerToken): TObje
 function StaticParseGraphicsCommandForm(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseFsFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseOpenFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseRunFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseSpriteFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseInputFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseInputFunction(Parser: Pointer; Token: TLexerToken): TObject;
@@ -262,6 +264,11 @@ end;
 function StaticParseOpenFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseOpenFunctionForm(Token);
+end;
+
+function StaticParseRunFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseRunFunctionForm(Token);
 end;
 
 function StaticParseSpriteFunction(Parser: Pointer; Token: TLexerToken): TObject;
@@ -463,6 +470,9 @@ begin
   // a family that is otherwise entirely statements (LOAD/SAVE/CLOSE/...), so this rule can only fire in
   // expression position - and it accepts OPEN alone, so the others keep their syntax error.
   Context.SetParseRule(ttFileOperation, MakePrefixRule(@StaticParseOpenFunctionForm, precCall));
+  // FreeBASIC Run(program) as a value. RUN lexes as ttProgramRun (its v7 role is the RUN command,
+  // parsed at statement level), so a prefix rule here only fires in expression position.
+  Context.SetParseRule(ttProgramRun, MakePrefixRule(@StaticParseRunFunctionForm, precCall));
   Context.SetParseRule(ttSpriteFunction, MakePrefixRule(@StaticParseSpriteFunction, precCall));
   Context.SetParseRule(ttInputFunction, MakePrefixRule(@StaticParseInputFunction, precCall));
   // FreeBASIC INPUT(n [, [#]filenum]) — the FUNCTION form, which reads n characters and returns them.
@@ -1259,6 +1269,16 @@ begin
 
   Result := TASTNode.CreateWithValue(antFunctionCall, Token.Value, Token);
 
+  // FreeBASIC FRE takes no argument and is written BARE: "Dim mem As UInteger = Fre". Demanding the
+  // parentheses turned the manual's own example into a syntax error. (The parenthesised "Fre(0)" form
+  // still parses through the ordinary path below - v7 spells it that way.)
+  if (UpperCase(VarToStr(Token.Value)) = kFRE) and (not Context.Check(ttDelimParOpen)) then
+  begin
+    Result.AddChild(TASTNode.Create(antArgumentList, Token));
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
   // Consume opening parenthesis
   if not Context.Match(ttDelimParOpen) then
   begin
@@ -1431,6 +1451,40 @@ begin
     Result := nil;
     Exit;
   end;
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseRunFunctionForm(Token: TLexerToken): TASTNode;
+// FreeBASIC "Run(program)" as an expression: launch it, answering -1 when it cannot be started. RUN is a
+// reserved word (the Commodore RUN command), so it needs a rule of its own; CHAIN and EXEC are not
+// reserved and reach the SSA as ordinary calls. MODERN only - v7 RUN is a statement and takes no value.
+var
+  Args: TASTNode;
+begin
+  Result := nil;
+  if (not ModernMode) or (not Context.Check(ttDelimParOpen)) then
+  begin
+    HandleError(Format('Unexpected token "%s"', [Token.Value]), Token);
+    Exit;
+  end;
+  Context.Advance;                          // '('
+  Args := TASTNode.Create(antExpressionList, Token);
+  Args.AddChild(ParseExpression);
+  if Context.Check(ttSeparParam) then
+  begin
+    Context.Advance;
+    Args.AddChild(ParseExpression);
+  end;
+  if not Context.Match(ttDelimParClose) then
+  begin
+    HandleError('Expected ")" to close RUN(...)', Context.CurrentToken);
+    Args.Free;
+    Exit;
+  end;
+  // The same node shape an ordinary call has, so the SSA's RUN/CHAIN/EXEC intercept sees one thing.
+  Result := TASTNode.Create(antArrayAccess, Token);
+  Result.AddChild(TASTNode.CreateWithValue(antIdentifier, kRUN, Token));
+  Result.AddChild(Args);
   DoNodeCreated(Result);
 end;
 

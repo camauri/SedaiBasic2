@@ -2055,9 +2055,16 @@ begin
   // instead of raising). Statement forms leave Immediate at 0 - except ssaCopyFile, whose
   // statement form carries the overwrite-flag REGISTER index there (always >= 0, mapped
   // above from Src3), which is why the marker is -1 and not a bit.
-  if OpIn(Instr.OpCode, [ssaChdir, ssaMkdir, ssaRmdir, ssaScratch, ssaCopyFile, ssaShell]) and
+  if OpIn(Instr.OpCode, [ssaChdir, ssaMkdir, ssaRmdir, ssaScratch, ssaCopyFile, ssaShell,
+                         ssaRenameFile]) and
      (Instr.Dest.Kind = svkRegister) then
     BCInstr.Immediate := -1;
+  // RUN / CHAIN / EXEC take the same opcode as SHELL with a marker of their OWN (-2): they launch a
+  // PROGRAM, not a shell command line, and answer -1 when it cannot be started. The SSA asks for it by
+  // putting -2 in Src3, which the mapping above has already turned into the Immediate - so restore it
+  // after the function-form marker has overwritten it.
+  if (Instr.OpCode = ssaShell) and (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = -2) then
+    BCInstr.Immediate := -2;
   // KEY: "KEY n" (clear) and "KEY" (list) carry NO text operand, but an absent Src2 lowers to
   // register 0 - a perfectly valid string register. The VM discriminated on
   // "Src2 < StringRegCount", which is always true, so a clear copied whatever string happened to

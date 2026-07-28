@@ -255,10 +255,76 @@ begin
   end;
 end;
 
+function PPConstIntStr(const Expr: string; Defs: TStringList): string; forward;
+
+function TryPPBuiltin(const NameU, ArgsStr: string; Defs, FnDefs: TStringList;
+                      out Value: string): Boolean;
+// FreeBASIC's built-in FUNCTION-LIKE preprocessor macros. They are part of the preprocessor, not of the
+// language, so they cannot be expressed as ordinary #defines - each needs the argument LIST itself:
+//
+//   __FB_JOIN__(a, b)              paste, the "##" operator in call form
+//   __FB_ARG_COUNT__(args...)      how many top-level arguments were passed
+//   __FB_ARG_EXTRACT__(n, args...) the n-th of them, zero-based
+//   __FB_EVAL__(expr)              evaluate a constant integer expression NOW, so its VALUE (not its
+//                                  text) can be used as another macro's argument
+//   __FB_IIF__(c, a, b)            pick a branch at compile time
+//   __FB_UNIQUEID__ / _PUSH_ / _POP_   a generated identifier, and a stack of them
+//
+// Without them a program using one compiled the macro's own name into the output, which is why they
+// showed up as DIFFs rather than as errors.
+var
+  Args: array[0..63] of string;
+  N, Idx: Integer;
+  Cond: string;
+begin
+  Result := True;
+  Value := '';
+  if NameU = '__FB_JOIN__' then
+  begin
+    SplitMacroArgs(ArgsStr, Args, N);
+    if N >= 2 then Value := Trim(Args[0]) + Trim(Args[1])
+    else if N = 1 then Value := Trim(Args[0]);
+    Exit;
+  end;
+  if NameU = '__FB_ARG_COUNT__' then
+  begin
+    SplitMacroArgs(ArgsStr, Args, N);
+    if Trim(ArgsStr) = '' then N := 0;
+    Value := IntToStr(N);
+    Exit;
+  end;
+  if NameU = '__FB_ARG_EXTRACT__' then
+  begin
+    SplitMacroArgs(ArgsStr, Args, N);
+    if N >= 1 then
+    begin
+      Idx := StrToIntDef(Trim(PPConstIntStr(Args[0], Defs)), -1);
+      if (Idx >= 0) and (Idx + 1 < N) and (Idx + 1 <= High(Args)) then Value := Trim(Args[Idx + 1]);
+    end;
+    Exit;
+  end;
+  if NameU = '__FB_EVAL__' then
+  begin
+    Value := PPConstIntStr(ArgsStr, Defs);
+    Exit;
+  end;
+  if NameU = '__FB_IIF__' then
+  begin
+    SplitMacroArgs(ArgsStr, Args, N);
+    if N >= 3 then
+    begin
+      Cond := PPConstIntStr(Args[0], Defs);
+      if StrToInt64Def(Trim(Cond), 0) <> 0 then Value := Trim(Args[1]) else Value := Trim(Args[2]);
+    end;
+    Exit;
+  end;
+  Result := False;
+end;
+
 function SubstituteMacros(const Line: string; Defs, FnDefs: TStringList): string;
 var
-  i, j, idx, depth: Integer;
-  Word, ArgsStr: string;
+  i, j, k, idx, depth: Integer;
+  Word, ArgsStr, BuiltinVal: string;
   InStr: Boolean;
 begin
   Result := '';
@@ -283,10 +349,41 @@ begin
       j := i;
       while (j <= Length(Line)) and IsIdentChar(Line[j]) do Inc(j);
       Word := Copy(Line, i, j - i);
+      // A BUILT-IN function-like macro is tried first: it is the preprocessor's own, and a program may
+      // not shadow it with a #define.
+      if (j <= Length(Line)) and (Line[j] = '(') and (Copy(UpperCase(Word), 1, 5) = '__FB_') then
+      begin
+        depth := 0; ArgsStr := '';
+        k := j + 1;
+        while k <= Length(Line) do
+        begin
+          if (Line[k] = '(') then Inc(depth)
+          else if (Line[k] = ')') then
+          begin
+            if depth = 0 then Break;
+            Dec(depth);
+          end;
+          ArgsStr := ArgsStr + Line[k];
+          Inc(k);
+        end;
+        if TryPPBuiltin(UpperCase(Word), SubstituteMacros(ArgsStr, Defs, FnDefs), Defs, FnDefs, BuiltinVal) then
+        begin
+          if (k <= Length(Line)) and (Line[k] = ')') then Inc(k);
+          Result := Result + SubstituteMacros(BuiltinVal, Defs, FnDefs);
+          i := k;
+          Continue;
+        end;
+      end;
       // Function-like macro: NAME immediately followed by '(' — expand with its arguments.
       idx := FnDefs.IndexOfName(UpperCase(Word));
-      if (idx >= 0) and (j <= Length(Line)) and (Line[j] = '(') then
+      // A space between the macro name and its arguments is ordinary FreeBASIC - the manual writes
+      // "concat (12,34)" - and demanding the parenthesis immediately after the name left the invocation
+      // unexpanded, so the macro's own name reached the parser.
+      k := j;
+      while (k <= Length(Line)) and (Line[k] in [' ', #9]) do Inc(k);
+      if (idx >= 0) and (k <= Length(Line)) and (Line[k] = '(') then
       begin
+        j := k;
         depth := 0; ArgsStr := '';
         Inc(j);   // skip '('
         while j <= Length(Line) do
@@ -388,7 +485,20 @@ end;
 // non-numeric); parentheses; unary "-"/"+" and NOT/"!"; "*" "/" "\" MOD; "+" "-"; comparisons
 // "=" "==" "<>" "!=" "<" "<=" ">" ">="; AND/"&&"; OR/"||". Nonzero result => take the branch. On any
 // problem it returns False (safe default: branch not taken).
+function EvalPPExprInt(const RawExpr: string; Defs: TStringList; out V: Int64): Boolean; forward;
+
 function EvalPPExpr(const RawExpr: string; Defs: TStringList): Boolean;
+// #if / #elseif: the expression as a CONDITION.
+var
+  V: Int64;
+begin
+  Result := EvalPPExprInt(RawExpr, Defs, V) and (V <> 0);
+end;
+
+function EvalPPExprInt(const RawExpr: string; Defs: TStringList; out V: Int64): Boolean;
+// ...and as a VALUE, which is what "__FB_EVAL__(expr)" needs: it substitutes the RESULT of a constant
+// integer expression, so another macro can take it as an argument. False when there is nothing to
+// evaluate. The two entry points share one parser - the condition is simply "the value is non-zero".
 var
   Toks: TStringList;
   TPos: Integer;
@@ -558,15 +668,46 @@ var
 
 begin
   Result := False;
+  V := 0;
   Toks := TStringList.Create;
   try
     Tokenize(RawExpr, 0);
     if Toks.Count = 0 then Exit;
     TPos := 0;
-    Result := ParseOr <> 0;
+    V := ParseOr;
+    Result := True;
   finally
     Toks.Free;
   end;
+end;
+
+function PPConstIntStr(const Expr: string; Defs: TStringList): string;
+// The value of a constant INTEGER expression as text, or the expression unchanged when it is not one.
+//
+// "Not one" has to be tested up front: the expression tokenizer resolves an unknown identifier to 0, so
+// asking it to evaluate "4 * Atn(1)" would answer 0 - a wrong VALUE where the honest answer is "I do not
+// fold this". So an identifier that is not a known macro means: leave the text alone. (fbc's own
+// __FB_EVAL__ does fold floats and intrinsics; we fold integers, and say so by not pretending.)
+var
+  V: Int64;
+  i, j: Integer;
+  W: string;
+begin
+  Result := Trim(Expr);
+  i := 1;
+  while i <= Length(Expr) do
+    if Expr[i] in ['A'..'Z', 'a'..'z', '_'] then
+    begin
+      j := i;
+      while (j <= Length(Expr)) and IsIdentChar(Expr[j]) do Inc(j);
+      W := UpperCase(Copy(Expr, i, j - i));
+      if (W <> 'MOD') and (W <> 'AND') and (W <> 'OR') and (W <> 'NOT') and
+         (W <> 'SHL') and (W <> 'SHR') and (Defs.IndexOfName(W) < 0) then Exit;
+      i := j;
+    end
+    else
+      Inc(i);
+  if EvalPPExprInt(Expr, Defs, V) then Result := IntToStr(V);
 end;
 
 procedure RegisterEmulatedHeader(const FileName: string; Defs: TStringList);
@@ -676,10 +817,64 @@ var
   FileStr: string;       // top-level source path, in the platform's own spelling
   EscapeOn: Boolean;     // OPTION ESCAPE seen: plain "..." strings become escaped from here on
   IncOnce: TStringList;  // full paths already spliced by an "#include Once" (that is what ONCE means)
+  ExpandedLine: string;  // a source line after macro substitution
+  FReprocessDepth: Integer;   // guard against a macro whose expansion expands to itself
 
   function Emitting: Boolean;
   begin
     Result := (Length(Active) = 0) or Active[High(Active)];
+  end;
+
+  // Forward: ReprocessExpansion feeds a macro expansion back through Expand, which is declared below.
+  procedure Expand(const Text, Dir: string); forward;
+
+  function ExpandedLineHasDirective(const S: string): Boolean;
+  // Does this expanded line hold a preprocessor directive in one of its cVirtualEOL segments? Only a
+  // MACRO expansion can produce one (a directive written directly in the source was handled above), so
+  // the test is cheap and fires almost never.
+  var
+    i: Integer;
+    Seg: string;
+  begin
+    Result := False;
+    if Pos('#', S) = 0 then Exit;
+    Seg := '';
+    for i := 1 to Length(S) do
+      if S[i] = cVirtualEOL then
+      begin
+        if (Trim(Seg) <> '') and (TrimLeft(Seg)[1] = '#') then Exit(True);
+        Seg := '';
+      end
+      else
+        Seg := Seg + S[i];
+    Result := (Trim(Seg) <> '') and (TrimLeft(Seg)[1] = '#');
+  end;
+
+  function ReprocessExpansion(const S, ADir: string): string;
+  // Run a macro expansion that contains directives back through Expand, then rejoin whatever CODE
+  // survived into the single physical line the invocation occupies. Directives leave blanks behind
+  // (that is how they preserve line numbers), so the join drops them.
+  var
+    Txt: string;
+    i, Base: Integer;
+  begin
+    if FReprocessDepth > 32 then Exit(S);   // a macro that expands to itself: stop rather than spin
+    Inc(FReprocessDepth);
+    try
+      Txt := StringReplace(S, cVirtualEOL, sLineBreak, [rfReplaceAll]);
+      Base := Output.Count;
+      Expand(Txt, ADir);
+      Result := '';
+      for i := Base to Output.Count - 1 do
+        if Trim(Output[i]) <> '' then
+        begin
+          if Result <> '' then Result := Result + cVirtualEOL;
+          Result := Result + Output[i];
+        end;
+      while Output.Count > Base do Output.Delete(Output.Count - 1);
+    finally
+      Dec(FReprocessDepth);
+    end;
   end;
 
   // OPTION ESCAPE (fblite/qb): from this statement on, ESCAPE SEQUENCES ARE PROCESSED in plain
@@ -900,6 +1095,10 @@ var
             p := 1;
             while (p <= Length(DRest)) and IsIdentChar(DRest[p]) do Inc(p);
             MacroName := UpperCase(Copy(DRest, 1, p - 1));
+            // "#macro m ( arg1, arg2 )": FreeBASIC allows space before the parameter list, and the
+            // manual writes it that way. Testing the very next character made such a macro OBJECT-like,
+            // so an invocation expanded to the raw body and its arguments leaked out as code.
+            while (p <= Length(DRest)) and (DRest[p] in [' ', #9]) do Inc(p);
             IsFn := (p <= Length(DRest)) and (DRest[p] = '(');
             Params := '';
             if IsFn then
@@ -1002,9 +1201,19 @@ var
         begin
           if IsOptionEscapeLine(Trimmed) then EscapeOn := True;   // takes effect from THIS line on
           if EscapeOn then
-            Output.Add(ApplyEscapeRewrite(SubstituteMacros(Raw, Defs, FnDefs)))
+            ExpandedLine := ApplyEscapeRewrite(SubstituteMacros(Raw, Defs, FnDefs))
           else
-            Output.Add(SubstituteMacros(Raw, Defs, FnDefs));
+            ExpandedLine := SubstituteMacros(Raw, Defs, FnDefs);
+          // A #macro body may hold DIRECTIVES of its own - "#print", "#if", "#define" - and FreeBASIC
+          // runs them when the macro is INVOKED. Our expansion produced the body as ordinary text, so a
+          // '#' arrived at the parser and the whole program died on "Unexpected token #". The body
+          // expands to several lines joined with cVirtualEOL, so a directive is recognisable as a
+          // SEGMENT that starts with '#': when one is there, the expansion goes back through this same
+          // loop (conditionals, macro table and all) and only the surviving CODE comes out.
+          if ExpandedLineHasDirective(ExpandedLine) then
+            Output.Add(ReprocessExpansion(ExpandedLine, Dir))
+          else
+            Output.Add(ExpandedLine);
         end
         else
           Output.Add('');   // excluded line — blank placeholder preserves line numbers
@@ -1033,6 +1242,7 @@ begin
   Defs := TStringList.Create;
 
   IncOnce := TStringList.Create;
+  FReprocessDepth := 0;
   FnDefs := TStringList.Create;
   Output := TStringList.Create;
   try

@@ -1008,15 +1008,22 @@ begin
    if (UpperCase(Token.Value) = 'EXTERN') and Assigned(Context.PeekNext) and
       (Context.PeekNext.TokenType = ttStringLiteral) then
    begin
-     Context.Advance;   // EXTERN  ("lang" block form -> skip to END EXTERN)
-     while not Context.Check(ttEndOfFile) do
-     begin
-       if Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
-          (Context.PeekNext.TokenType = ttIdentifier) and
-          (UpperCase(Context.PeekNext.Value) = 'EXTERN') then
-       begin Context.Advance; Context.Advance; Break; end;   // consume END EXTERN
-       Context.Advance;
-     end;
+     // `EXTERN "lang"` ... `END EXTERN` is a LINKAGE wrapper, not a container: the declarations inside it
+     // are ordinary declarations of this module and fbc compiles them. Skipping to END EXTERN threw them
+     // away, so a SUB declared in such a block did not exist and every call to it failed ("Array not
+     // declared"). Consume the header and the terminator only, and let the body parse where it stands.
+     Context.Advance;                     // EXTERN
+     if Context.Check(ttStringLiteral) then Context.Advance;   // the "C" / "Windows" linkage name
+     Result := nil;
+     Exit;
+   end
+   else if (UpperCase(Token.Value) = 'EXTERN') and Assigned(Context.PeekNext) and
+           (Context.PeekNext.TokenType = ttIdentifier) and
+           (UpperCase(Context.PeekNext.Value) = 'EXTERN') then
+   begin
+     Context.Advance; Context.Advance;    // (defensive: a stray "EXTERN EXTERN")
+     Result := nil;
+     Exit;
    end
    else
      while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
@@ -4149,6 +4156,16 @@ begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antEnd, Token);
   Context.Advance; // Consume END / SYSTEM
+  // "END EXTERN" closes a linkage block whose body is parsed where it stands (see the EXTERN handler):
+  // there is nothing to end, so consume the word and emit nothing. Without this the bare END halted the
+  // program at the closing line of the block.
+  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'EXTERN') then
+  begin
+    Context.Advance;
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
   // FreeBASIC END and SYSTEM both carry an optional exit code ("End 1", "System 0"). We have no process
   // exit-code channel, so it is parsed and discarded; both otherwise halt the program exactly the same.
   // SYSTEM (FB-only) accepts any expression. For END, only consume a NUMERIC argument, and only in MODERN:
@@ -7092,8 +7109,28 @@ begin
         Context.Advance;                               // consume the base value
       end;
     end
-    else if Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttIdentifier) then
-      Context.Advance;
+    // Every other OPTION is a compiler switch we accept and do not act on: DYNAMIC / STATIC (default
+    // array storage - we allow REDIM either way), GOSUB (enables GOSUB in fblite, which we always
+    // support), BYVAL / BYREF (the fblite default passing convention), EXPLICIT, PRIVATE, ESCAPE.
+    // The option NAME is usually a reserved word, not an identifier - "Option Static" is STATIC, "Option
+    // GoSub" is GOSUB - so testing for an identifier left the keyword in the stream to be parsed as a
+    // statement of its own, and the program died on it.
+    else if Assigned(Context.CurrentToken) and
+            ((Context.CurrentToken.TokenType = ttIdentifier) or Assigned(Context.CurrentToken.KeywordInfo)) then
+    begin
+      // OPTION NOKEYWORD <word> takes a second one: the keyword being removed from the symbol table.
+      // Consumed so the statement parses; the word itself stays reserved (un-reserving it would have to
+      // reach back into the LEXER, which has already classified every later occurrence).
+      if UpperCase(Context.CurrentToken.Value) = 'NOKEYWORD' then
+      begin
+        Context.Advance;
+        if Assigned(Context.CurrentToken) and
+           ((Context.CurrentToken.TokenType = ttIdentifier) or Assigned(Context.CurrentToken.KeywordInfo)) then
+          Context.Advance;
+      end
+      else
+        Context.Advance;
+    end;
   end;
 
   DoNodeCreated(Result);
@@ -8607,6 +8644,8 @@ begin
   else if KwU = 'DEFDBL' then Result.Attributes.Values['TYPENAME'] := 'DOUBLE'
   else if KwU = 'DEFBYTE' then Result.Attributes.Values['TYPENAME'] := 'BYTE'
   else if KwU = 'DEFSHORT' then Result.Attributes.Values['TYPENAME'] := 'SHORT'
+  else if KwU = 'DEFUBYTE' then Result.Attributes.Values['TYPENAME'] := 'UBYTE'
+  else if KwU = 'DEFUSHORT' then Result.Attributes.Values['TYPENAME'] := 'USHORT'
   else if KwU = 'DEFLNGINT' then Result.Attributes.Values['TYPENAME'] := 'LONGINT'
   else if KwU = 'DEFUINT' then Result.Attributes.Values['TYPENAME'] := 'UINTEGER'
   else if KwU = 'DEFSTR' then Result.Attributes.Values['TYPENAME'] := 'STRING'

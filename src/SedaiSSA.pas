@@ -5269,6 +5269,37 @@ begin
            TryEmitCvaMacro(UpperCase(ArrName), Node.GetChild(1), Node.Token, Result) then
           Exit;
 
+        // FreeBASIC NAME / RUN / CHAIN / EXEC: function forms that answer a code instead of raising.
+        // None of the four is a reserved word (NAME is intercepted by-name for its "Name a As b"
+        // statement form), so each arrives here as an array access and used to die as "Array not
+        // declared". MODERN only.
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) and
+           ((UpperCase(ArrName) = kNAME) or (UpperCase(ArrName) = kRUN) or
+            (UpperCase(ArrName) = kCHAIN) or (UpperCase(ArrName) = kEXEC)) then
+        begin
+          ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          ArgReg := EnsureStringRegister(ArgValue);
+          if Node.GetChild(1).ChildCount >= 2 then
+          begin
+            ProcessStringExpression(Node.GetChild(1).GetChild(1), TempVal);
+            IntRegVal := EnsureStringRegister(TempVal);
+          end
+          else
+          begin
+            IntRegVal := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+            EmitInstruction(ssaLoadConstString, IntRegVal, MakeSSAConstString(''),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          if UpperCase(ArrName) = kNAME then
+            // Name(old, new): rename, 0 on success. Src2 is the new name, not an argument list.
+            EmitInstruction(ssaRenameFile, Result, ArgReg, IntRegVal, MakeSSAConstInt(-1))
+          else
+            // Run / Chain / Exec: launch a PROGRAM, -1 when it cannot be started.
+            EmitInstruction(ssaShell, Result, ArgReg, IntRegVal, MakeSSAConstInt(-2));
+          Exit;
+        end;
+
         // FreeBASIC SADD(s) / STRPTR(s): raw byte-heap pointer to a NUL-terminated copy of the string's
         // bytes (a read-only snapshot — the managed string has no stable mutable buffer address). STRPTR
         // returns a pointer to the string data, equivalent to SADD for var-length strings. MODERN, not an array.

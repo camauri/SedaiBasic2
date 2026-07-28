@@ -6833,11 +6833,19 @@ begin
       end;
 
     bcRenameFile:
+      // RENAME "old", "new" - Src1 = old name, Src2 = new name. Immediate = -1 is FreeBASIC's function
+      // form Name(old, new), which answers 0 or an error code instead of raising.
+      if Instr.Immediate = -1 then
       begin
-        // RENAME "old", "new"
-        // Src1 = old name, Src2 = new name
+        if not FileExists(Ctx.StringRegs[Instr.Src1]) then
+          Ctx.IntRegs[Instr.Dest] := 2                      // no such file
+        else if RenameFile(Ctx.StringRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2]) then
+          Ctx.IntRegs[Instr.Dest] := 0
+        else
+          Ctx.IntRegs[Instr.Dest] := 1;
+      end
+      else
         ExecuteRenameFile(Ctx.StringRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2]);
-      end;
 
     bcConcat:
       begin
@@ -6865,7 +6873,21 @@ begin
       // SHELL cmd: run the command through the platform shell. Immediate = -1 is the FreeBASIC
       // function form Shell(cmd): exit code into Dest. The STATEMENT form must NOT touch Dest -
       // it is 0 there, and the old unconditional store clobbered live int register R0.
-      if Instr.Immediate = -1 then
+      //
+      // Immediate = -2 is RUN / CHAIN / EXEC: the same launch, but of a PROGRAM rather than a shell
+      // command line, and FreeBASIC answers -1 when it cannot be started at all. Going through the
+      // shell would answer the shell's own "command not found" code instead, so the file is checked
+      // first - which also means a missing program is never handed to a shell to interpret.
+      if Instr.Immediate = -2 then
+      begin
+        if not FileExists(Ctx.StringRegs[Instr.Src1]) then
+          Ctx.IntRegs[Instr.Dest] := -1
+        else if Ctx.StringRegs[Instr.Src2] <> '' then
+          Ctx.IntRegs[Instr.Dest] := RunShellCommand(Ctx.StringRegs[Instr.Src1] + ' ' + Ctx.StringRegs[Instr.Src2])
+        else
+          Ctx.IntRegs[Instr.Dest] := RunShellCommand(Ctx.StringRegs[Instr.Src1]);
+      end
+      else if Instr.Immediate = -1 then
         Ctx.IntRegs[Instr.Dest] := RunShellCommand(Ctx.StringRegs[Instr.Src1])
       else
         RunShellCommand(Ctx.StringRegs[Instr.Src1]);

@@ -1135,8 +1135,9 @@ begin
     // error/exit code. The statement form of bcCopyFile instead carries the overwrite-flag
     // INT REGISTER index in Immediate (>= 0).
     if ((OpCode = bcChdir) or (OpCode = bcMkdir) or (OpCode = bcRmdir) or
-        (OpCode = bcScratch) or (OpCode = bcCopyFile) or (OpCode = bcShell)) and
-       (Instr.Immediate = -1) then
+        (OpCode = bcScratch) or (OpCode = bcCopyFile) or (OpCode = bcShell) or
+        (OpCode = bcRenameFile)) and
+       ((Instr.Immediate = -1) or ((OpCode = bcShell) and (Instr.Immediate = -2))) then
       MarkIntRegUsed(Instr.Dest);
     if (OpCode = bcCopyFile) and (Instr.Immediate >= 0) then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
