@@ -7012,6 +7012,16 @@ begin
       EmitInstruction(ssaStrLeftW, FixedTrunc, ExprValue, FixedCapReg, MakeSSAValue(svkNone))
     else
       EmitInstruction(ssaStrLeft, FixedTrunc, ExprValue, FixedCapReg, MakeSSAValue(svkNone));
+    // ...and a ZSTRING/WSTRING is a C STRING: it ENDS at the first NUL. Storing
+    // "abc" + Chr(0) + "def" into a "ZString * 11" leaves a THREE-character string, and fbc's LEN and
+    // PRINT say so; we kept all seven, because our storage is a managed string and nothing cut it.
+    //
+    // Cut on the STORE rather than on every read: past the terminator the bytes are unreachable through
+    // any ZSTRING operation, so the two give the same answer and this costs nothing at each use. (They
+    // differ only for a program that takes the ADDRESS and reads past the NUL, which needs a raw model
+    // this type does not have yet.) EmitFixedLenToVarLen is the same conversion a fixed-length buffer
+    // already used in a variable-length context - one implementation, not two.
+    FixedTrunc := EmitFixedLenToVarLen(FixedTrunc, IsWStringVar(VarName));
     EmitInstruction(ssaCopyString, GetOrAllocateVariable(VarName), FixedTrunc, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit(True);
   end;

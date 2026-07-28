@@ -128,6 +128,7 @@ type
     function ParseDimensionList: TASTNode;
     procedure SkipTypeQualifiers;
     function AtPointerSuffix: Boolean;   // FB: the current token is "PTR" (or its synonym "POINTER")
+    function TryConstIntExpr(N: TASTNode; out V: Int64): Boolean;   // fold a constant integer expression
     procedure SetOptions(AValue: TParserOptions);
 
     // Helper for error reporting
@@ -3199,6 +3200,7 @@ end;
 
 function TPackratParser.ParseRecordFieldType: string;
 var
+  FixedCapVal: Int64;   // folded "* n" capacity
   FixedLenExpr: TASTNode;
 // Parse an in-TYPE field type after AS: a (dotted) type name, an optional "PTR" suffix (stored as an
 // int handle), and an optional fixed-length "* n" (advisory in v1). Returns '' if no type token follows.
@@ -3225,8 +3227,7 @@ begin
       FixedLenExpr := FExpressionParser.ParseExpression(precCall);
       if Assigned(FixedLenExpr) then
       begin
-        if FixedLenExpr.NodeType = antLiteral then
-          FLastFieldFixedLen := StrToIntDef(VarToStr(FixedLenExpr.Value), 0);
+        if TryConstIntExpr(FixedLenExpr, FixedCapVal) then FLastFieldFixedLen := FixedCapVal;
         FixedLenExpr.Free;
       end;
     end;
@@ -7464,6 +7465,54 @@ begin
     Context.Advance;
 end;
 
+function TPackratParser.TryConstIntExpr(N: TASTNode; out V: Int64): Boolean;
+// Fold a constant integer expression made of literals, parentheses and + - * \ over them.
+//
+// It exists for the fixed-length capacity of a string declaration, which the manual routinely writes as
+// an expression: "Dim As ZString*(10+1) z", "As String*(6-1) sig". Only a bare literal was recognised,
+// so those declarations recorded "capacity present but unknown" and every question about the SIZE of
+// such a variable fell back to the width of the handle. The truncation on assignment was equally blind.
+var
+  A, B: Int64;
+  Op: string;
+begin
+  Result := False;
+  V := 0;
+  if N = nil then Exit;
+  case N.NodeType of
+    antLiteral:
+      begin
+        if VarIsOrdinal(N.Value) then begin V := N.Value; Exit(True); end;
+        Result := TryStrToInt64(VarToStr(N.Value), V);
+      end;
+    antParentheses:
+      if N.ChildCount >= 1 then Result := TryConstIntExpr(N.GetChild(0), V);
+    antUnaryOp:
+      if (N.ChildCount >= 1) and Assigned(N.Token) and (N.Token.TokenType = ttOpSub) then
+      begin
+        Result := TryConstIntExpr(N.GetChild(0), A);
+        if Result then V := -A;
+      end;
+    antBinaryOp:
+      if (N.ChildCount >= 2) and Assigned(N.Token) then
+      begin
+        if not TryConstIntExpr(N.GetChild(0), A) then Exit;
+        if not TryConstIntExpr(N.GetChild(1), B) then Exit;
+        Op := VarToStr(N.Value);
+        case N.Token.TokenType of
+          ttOpAdd: begin V := A + B; Result := True; end;
+          ttOpSub: begin V := A - B; Result := True; end;
+          ttOpMul: begin V := A * B; Result := True; end;
+          ttOpIntDiv: if B <> 0 then begin V := A div B; Result := True; end;
+        else
+          if Op = '+' then begin V := A + B; Result := True; end
+          else if Op = '-' then begin V := A - B; Result := True; end
+          else if Op = '*' then begin V := A * B; Result := True; end;
+        end;
+      end;
+  end;
+end;
+
 function TPackratParser.AtPointerSuffix: Boolean;
 // True when the current token is FreeBASIC's pointer-type suffix. fbc spells it either "PTR" or the
 // synonym "POINTER" - "Dim p As ZString Pointer" is the manual's own wording - and both are reserved
@@ -7678,6 +7727,7 @@ end;
 
 function TPackratParser.ParseDimStatement: TASTNode;
 var
+  FixedCapVal: Int64;   // folded "* n" capacity
   Token, NameTok, TypeTok, SharedTypeTok: TLexerToken;
   ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode, FuncPtrSigNode, LeadingTypeOfExpr: TASTNode;
   IsShared, IsByref, LeadingAS, IsTuple: Boolean;
@@ -7765,7 +7815,7 @@ begin
       InitExpr := FExpressionParser.ParseExpression(precCall);   // length operand (no binary ops)
       if Assigned(InitExpr) then
       begin
-        if InitExpr.NodeType = antLiteral then SharedFixedLen := VarToStr(InitExpr.Value)
+        if TryConstIntExpr(InitExpr, FixedCapVal) then SharedFixedLen := IntToStr(FixedCapVal)
         else SharedFixedLen := '-1';          // present but non-constant -> advisory
         InitExpr.Free;
       end;
@@ -7939,8 +7989,8 @@ begin
         begin
           // Record the capacity. A constant literal becomes the number (the SSA truncates assignments
           // to it); a non-constant capacity stays advisory ('1' = present but unknown).
-          if InitExpr.NodeType = antLiteral then
-            ArrayDecl.Attributes.Values['FIXEDLEN'] := VarToStr(InitExpr.Value)
+          if TryConstIntExpr(InitExpr, FixedCapVal) then
+            ArrayDecl.Attributes.Values['FIXEDLEN'] := IntToStr(FixedCapVal)
           else
             ArrayDecl.Attributes.Values['FIXEDLEN'] := '-1';   // present but non-constant -> advisory
           InitExpr.Free;
