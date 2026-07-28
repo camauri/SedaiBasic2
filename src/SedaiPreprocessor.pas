@@ -614,6 +614,9 @@ begin
   Defs.Values['__FB_LANG__']    := '"fb"';
   Defs.Values['__FB_MT__']      := '-1';   // multithreading runtime is available
   Defs.Values['__FB_OUT_EXE__'] := '-1';   // programs are run (executable-like target)
+  // fbc defines this while compiling the module that holds the program's entry point. There is exactly
+  // one module here - sb compiles and runs a single source - so it is always the main one.
+  Defs.Values['__FB_MAIN__']    := '-1';
   {$IFDEF DEBUG}
   Defs.Values['__FB_DEBUG__']   := '-1';
   {$ENDIF}
@@ -670,6 +673,7 @@ var
   Active, Taken: array of Boolean;
   NowDT: TDateTime;      // captured once for __DATE__/__DATE_ISO__/__TIME__
   PathStr: string;       // module directory for __PATH__
+  FileStr: string;       // top-level source path, in the platform's own spelling
   EscapeOn: Boolean;     // OPTION ESCAPE seen: plain "..." strings become escaped from here on
   IncOnce: TStringList;  // full paths already spliced by an "#include Once" (that is what ONCE means)
 
@@ -1034,9 +1038,14 @@ begin
   try
     RegisterIntrinsicDefines(Defs);   // FreeBASIC compiler intrinsic defines (__FB_*__)
     // __FILE__ expands to the top-level source file name (string literal); empty if unknown.
-    Defs.Values['__FILE__'] := '"' + FileName + '"';
+    // In the PLATFORM's spelling: the name arrives here however the caller wrote it, and on Windows a
+    // program that prints __FILE__ got forward slashes where fbc gives backslashes. The path is the
+    // same path; only the separator was ours rather than the system's.
+    FileStr := FileName;
+    if FileStr <> '' then FileStr := ExpandFileName(FileStr);
+    Defs.Values['__FILE__'] := '"' + FileStr + '"';
     // __FILE_NQ__: same file name WITHOUT the surrounding quotes (FreeBASIC "no quotes" form).
-    Defs.Values['__FILE_NQ__'] := FileName;
+    Defs.Values['__FILE_NQ__'] := FileStr;
     // Compilation date/time intrinsics (string literals). SedaiBasic compiles-then-runs in one
     // process, so "compilation time" is captured here, once, when preprocessing starts.
     NowDT := Now;
