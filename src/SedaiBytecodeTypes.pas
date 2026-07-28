@@ -601,6 +601,11 @@ const
   // Alignment padding inside a UDT record image: write / skip Immediate bytes.
   bcPutBinPad       = bcGroupFileIO + 32;   // PUT #n: Src1=handle, Immediate=count of NUL bytes to write
   bcGetBinSkip      = bcGroupFileIO + 33;   // GET #n: Src1=handle, Immediate=count of bytes to skip
+  // FreeBASIC's FUNCTION form of OPEN: same operands as bcDopen, plus a DESTINATION that receives the
+  // error code (0 = success) INSTEAD of raising. A separate opcode rather than a flag on bcDopen: that
+  // one's Immediate already carries the mode register (and the register compactor remaps it as such), so
+  // there is no free field to discriminate on, and an unused Dest of 0 is a valid register index.
+  bcOpenFunc        = bcGroupFileIO + 34;   // Dest=int error code, Src1=handle, Src2=filename, Immediate=mode reg
 
   // === GROUP 7: SPRITE OPERATIONS (0x07xx) ===
   // Sprite commands
@@ -1983,6 +1988,7 @@ begin
         13: Result := 'PrintFileInt';
         25: Result := 'FileAttr';
         26: Result := 'FileSetEof';
+        34: Result := 'OpenFunc';
       else
         Result := Format('FileIO_%d', [SubOp]);
       end;

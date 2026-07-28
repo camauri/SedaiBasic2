@@ -11276,10 +11276,14 @@ begin
   ErrorCode := 0;
 
   case SubOp of
-    0, 2: // bcDopen, bcOpen
+    0, 2, 34: // bcDopen, bcOpen, bcOpenFunc
       begin
         // DOPEN #handle, "filename" [, mode$]
         // Src1 = handle, Src2 = filename, Immediate = mode register (or 0)
+        //
+        // bcOpenFunc is FreeBASIC's FUNCTION form: the SAME open, except that the error code is DELIVERED
+        // in Dest instead of raising - "If Open(f For Input As #1) <> 0 Then" is how a FreeBASIC program
+        // handles a missing file. It shares this arm so the two forms can never drift apart.
         HandleNum := Ctx.IntRegs[Instr.Src1];
         Filename := Ctx.StringRegs[Instr.Src2];
 
@@ -11295,13 +11299,23 @@ begin
         HandleName := '';
 
         FIOStatus := 0;   // ST (Commodore): a fresh file open clears the I/O status (no EOF yet)
+        if SubOp = 34 then Ctx.IntRegs[Instr.Dest] := 0;   // function form: 0 until proven otherwise
         // Commodore OPEN to a device/command channel (no filename, e.g. OPEN 1,8,15) is a no-op here:
         // there is no drive to command, so opening nothing must not raise.
         if Filename = '' then Exit;
         if Assigned(FOnDiskFile) then
         begin
           FOnDiskFile(Self, 'DOPEN', HandleNum, HandleName, Filename, Mode, ErrorCode);
-          if ErrorCode <> 0 then
+          if SubOp = 34 then
+            // The FUNCTION form is FreeBASIC's, so it answers with FreeBASIC's code, not the Commodore
+            // one the statement form raises: 62 FILE NOT FOUND is fbc's 2, and the two failure codes the
+            // file layer can otherwise return are its 3 (file I/O error). The statement form is untouched.
+            case ErrorCode of
+              0:      Ctx.IntRegs[Instr.Dest] := 0;
+              62:     Ctx.IntRegs[Instr.Dest] := 2;
+            else      Ctx.IntRegs[Instr.Dest] := 3;
+            end
+          else if ErrorCode <> 0 then
             raise Exception.CreateFmt('DOPEN error %d opening file: %s', [ErrorCode, Filename]);
         end
         else

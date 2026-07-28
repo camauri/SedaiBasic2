@@ -5633,6 +5633,7 @@ var
   C64Name, C64Rest, C64Base: string;   // C64 OPEN lf,dev,sa,"name[,type][,mode]" decoding
   C64Dev, C64Sa, C64FileName: TASTNode;
   C64CommaPos: Integer;
+  AccessRead: Boolean;
 begin
   Token := Context.CurrentToken;
   CmdName := UpperCase(Token.Value);
@@ -5800,13 +5801,21 @@ begin
       Context.Advance;            // ENCODING
       if Context.Check(ttStringLiteral) then Context.Advance;   // "ascii" / "utf8" / "utf16" / ...
     end;
-    // Optional "ACCESS {READ | WRITE | READ WRITE}" clause (FreeBASIC): accepted and ignored — the VM's
-    // file model does not enforce share/access rights.
+    // Optional "ACCESS {READ | WRITE | READ WRITE}" clause (FreeBASIC). Only READ-alone changes anything
+    // we model: it makes the open READ-ONLY, so a MISSING file is an error where a plain "For Binary"
+    // would create it. It is carried on the mode string as a trailing '<'. WRITE and READ WRITE keep the
+    // mode's own behaviour (the VM enforces no share rights).
     if UpperCase(Context.CurrentToken.Value) = kACCESS then
     begin
       Context.Advance;            // ACCESS
-      if UpperCase(Context.CurrentToken.Value) = kREAD then Context.Advance;
-      if UpperCase(Context.CurrentToken.Value) = kWRITE then Context.Advance;
+      AccessRead := False;
+      if UpperCase(Context.CurrentToken.Value) = kREAD then
+      begin AccessRead := True; Context.Advance; end;
+      if UpperCase(Context.CurrentToken.Value) = kWRITE then
+      begin AccessRead := False; Context.Advance; end;
+      // Not on RANDOM: there the mode is 'L' and the record length is appended to it in the SSA, so a
+      // marker in between would be read as part of the number.
+      if AccessRead and (ModeStr <> 'L') then ModeStr := ModeStr + '<';
     end;
     // Optional lock_type clause (FreeBASIC): "SHARED" or "LOCK {READ|WRITE|READ WRITE}" — accepted and
     // ignored (single-process VM, no file locking).

@@ -77,6 +77,7 @@ type
     function ParseGraphicsFunction(Token: TLexerToken): TASTNode;
     function ParseGraphicsCommandForm(Token: TLexerToken): TASTNode;  // FreeBASIC SCREEN(row, col [, flag])
     function ParseFsFunctionForm(Token: TLexerToken): TASTNode;  // FreeBASIC ChDir/MkDir/RmDir/Kill/FileCopy/Shell(...) -> error code
+    function ParseOpenFunctionForm(Token: TLexerToken): TASTNode; // FreeBASIC Open(...) -> error code
     function ParseSpriteFunction(Token: TLexerToken): TASTNode;
     function ParseInputFunction(Token: TLexerToken): TASTNode;
     function ParseInputFunctionForm(Token: TLexerToken): TASTNode;   // FreeBASIC INPUT(n [, [#]f])
@@ -132,6 +133,7 @@ function StaticParseMemoryFunction(Parser: Pointer; Token: TLexerToken): TObject
 function StaticParseGraphicsFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseGraphicsCommandForm(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseFsFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseOpenFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseSpriteFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseInputFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseInputFunction(Parser: Pointer; Token: TLexerToken): TObject;
@@ -255,6 +257,11 @@ end;
 function StaticParseFsFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseFsFunctionForm(Token);
+end;
+
+function StaticParseOpenFunctionForm(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseOpenFunctionForm(Token);
 end;
 
 function StaticParseSpriteFunction(Parser: Pointer; Token: TLexerToken): TObject;
@@ -452,6 +459,10 @@ begin
   // reaching here), so a prefix rule fires only in expression position. MODERN only, and only for
   // the commands FreeBASIC actually exposes as functions - anything else stays a syntax error.
   Context.SetParseRule(ttFileManagement, MakePrefixRule(@StaticParseFsFunctionForm, precCall));
+  // FreeBASIC also gives OPEN a FUNCTION form returning the error code. OPEN lexes as ttFileOperation,
+  // a family that is otherwise entirely statements (LOAD/SAVE/CLOSE/...), so this rule can only fire in
+  // expression position - and it accepts OPEN alone, so the others keep their syntax error.
+  Context.SetParseRule(ttFileOperation, MakePrefixRule(@StaticParseOpenFunctionForm, precCall));
   Context.SetParseRule(ttSpriteFunction, MakePrefixRule(@StaticParseSpriteFunction, precCall));
   Context.SetParseRule(ttInputFunction, MakePrefixRule(@StaticParseInputFunction, precCall));
   // FreeBASIC INPUT(n [, [#]filenum]) — the FUNCTION form, which reads n characters and returns them.
@@ -1366,6 +1377,130 @@ begin
   if not Context.Match(ttDelimParClose) then
   begin
     HandleError('Expected ")" after function arguments', Context.CurrentToken);
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseOpenFunctionForm(Token: TLexerToken): TASTNode;
+// FreeBASIC's FUNCTION form of OPEN: the whole OPEN syntax inside parentheses, yielding the error code
+// (0 = success) instead of raising.
+//
+//   If Open("file.ext" For Binary Access Read As #1) = 0 Then ...
+//   If 0 <> Open(filename, For Output, As filenum) Then ...
+//
+// Same node shape the statement builds (0=handle, 1=filename, 2=mode$, 3=reclen), so the SSA lowers one
+// description of OPEN either way; only the opcode differs. The clauses may be separated by COMMAS here -
+// fbc's own manual writes the form both ways - so a comma between clauses is consumed and ignored.
+//
+// MODERN only. OPEN lexes as ttFileOperation, a family that is otherwise all statements, so this rule
+// fires only in expression position and only for OPEN: every other member stays the syntax error it was.
+var
+  Param, HandleNode, LenExpr: TASTNode;
+  ModeStr, MW: string;
+  AccessRead: Boolean;
+
+  procedure SkipClauseComma;
+  begin
+    if Context.Check(ttSeparParam) then Context.Advance;
+  end;
+
+  function AtWord(const W: string): Boolean;
+  begin
+    Result := UpperCase(VarToStr(Context.CurrentToken.Value)) = W;
+  end;
+
+begin
+  Result := nil;
+  if (not ModernMode) or (UpperCase(Token.Value) <> kOPEN) or (not Context.Check(ttDelimParOpen)) then
+  begin
+    HandleError(Format('Unexpected token "%s"', [Token.Value]), Token);
+    Exit;
+  end;
+  Context.Advance;                                  // '('
+  Param := ParseExpression;                         // filename
+  if not Assigned(Param) then
+  begin
+    HandleError('Expected a filename in OPEN(...)', Context.CurrentToken);
+    Exit;
+  end;
+
+  ModeStr := 'R';
+  SkipClauseComma;
+  if AtWord(kFOR) then
+  begin
+    Context.Advance;                                // FOR
+    MW := UpperCase(VarToStr(Context.CurrentToken.Value));
+    if MW = kINPUT then ModeStr := 'R'
+    else if MW = kOUTPUT then ModeStr := 'W'
+    else if MW = kAPPEND then ModeStr := 'A'
+    else if MW = kBINARY then ModeStr := 'B'
+    else if MW = kRANDOM then ModeStr := 'L'        // "L"+reclen is completed in the SSA, as for the statement
+    else
+    begin
+      HandleError('Expected INPUT/OUTPUT/APPEND/BINARY/RANDOM after FOR', Context.CurrentToken);
+      Param.Free; Exit;
+    end;
+    Context.Advance;                                // mode word
+  end;
+  // ENCODING / ACCESS / lock clauses: accepted and ignored, exactly as the statement accepts them.
+  SkipClauseComma;
+  if AtWord(kENCODING) then
+  begin
+    Context.Advance;
+    if Context.Check(ttStringLiteral) then Context.Advance;
+  end;
+  SkipClauseComma;
+  if AtWord(kACCESS) then
+  begin
+    Context.Advance;
+    AccessRead := False;
+    if AtWord(kREAD) then begin AccessRead := True; Context.Advance; end;
+    if AtWord(kWRITE) then begin AccessRead := False; Context.Advance; end;
+    // Read-only: a missing file is an error (see SedaiFileIO). Not on RANDOM, whose mode 'L' carries the
+    // record length appended in the SSA.
+    if AccessRead and (ModeStr <> 'L') then ModeStr := ModeStr + '<';
+  end;
+  SkipClauseComma;
+  if AtWord(kSHARED) then
+    Context.Advance
+  else if AtWord(kLOCK) then
+  begin
+    Context.Advance;
+    if AtWord(kREAD) then Context.Advance;
+    if AtWord(kWRITE) then Context.Advance;
+  end;
+  SkipClauseComma;
+  if AtWord(kAS) or Context.Check(ttAsType) then Context.Advance;
+  if Context.Check(ttFileHandlePrefix) or (VarToStr(Context.CurrentToken.Value) = '#') then
+    Context.Advance;                                // optional '#'
+  HandleNode := ParseExpression(precCall);          // file number: a literal or any scalar expression
+  if not Assigned(HandleNode) then
+  begin
+    HandleError('Expected a file number after AS in OPEN(...)', Context.CurrentToken);
+    Param.Free; Exit;
+  end;
+  LenExpr := nil;
+  if AtWord(kLEN) then                              // optional "LEN = reclen" (RANDOM)
+  begin
+    Context.Advance;
+    if Context.Check(ttOpEq) then Context.Advance;
+    LenExpr := ParseExpression;
+  end;
+
+  Result := TASTNode.CreateWithValue(antOpenFunc, kOPEN, Token);
+  Result.AddChild(HandleNode);                                            // 0 = handle
+  Result.AddChild(Param);                                                 // 1 = filename
+  Result.AddChild(TASTNode.CreateWithValue(antLiteral, ModeStr, Token));  // 2 = mode$
+  if Assigned(LenExpr) then
+  begin
+    if ModeStr = 'L' then Result.AddChild(LenExpr) else LenExpr.Free;     // 3 = reclen (RANDOM only)
+  end;
+  if not Context.Match(ttDelimParClose) then
+  begin
+    HandleError('Expected ")" to close OPEN(...)', Context.CurrentToken);
     Result.Free;
     Result := nil;
     Exit;

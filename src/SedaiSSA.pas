@@ -729,6 +729,7 @@ type
     procedure ProcessBoot(Node: TASTNode);
     // Disk file I/O
     procedure ProcessDopen(Node: TASTNode);
+    procedure EmitOpen(Node: TASTNode; AsFunction: Boolean; out ResultVal: TSSAValue);
     procedure ProcessDclose(Node: TASTNode);
     procedure ProcessFileSetEof(Node: TASTNode);
     procedure ProcessAssert(Node: TASTNode; Halt: Boolean);
@@ -4741,6 +4742,11 @@ begin
       // as a value expression returning the error code. Dedicated method: keeps this frame lean.
       Result := ProcessFsFunction(Node);
 
+    antOpenFunc:
+      // FreeBASIC function form of OPEN: the same lowering the statement gets, delivering the error
+      // code as this expression's value instead of raising.
+      EmitOpen(Node, True, Result);
+
     antInputFunction:
     begin
       // Handle input functions: RWINDOW, POS, etc.
@@ -8739,6 +8745,9 @@ begin
       Result := GetVariableType(VarToStr(Node.Value));
     antFsFunction:
       // ChDir/MkDir/RmDir/Kill/FileCopy/Shell(...) function form: error/exit code, a Long.
+      Result := srtInt;
+    antOpenFunc:
+      // Open(...) function form: the error code, a Long.
       Result := srtInt;
     antFunctionCall:
       begin
@@ -14059,6 +14068,18 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessDopen(Node: TASTNode);
+// OPEN as a STATEMENT: a failed open raises.
+var
+  Ignored: TSSAValue;
+begin
+  EmitOpen(Node, False, Ignored);
+end;
+
+procedure TSSAGenerator.EmitOpen(Node: TASTNode; AsFunction: Boolean; out ResultVal: TSSAValue);
+// The ONE lowering of OPEN, for both of FreeBASIC's forms. AsFunction = True is the expression
+// form: identical operands, and the error code is DELIVERED in ResultVal instead of raising.
+// Sharing the body is the point - the clause handling (mode words, "L"+reclen for RANDOM) is
+// intricate enough that two copies would drift.
 var
   HandleVal, FilenameVal, ModeVal: TSSAValue;
   HandleReg, FilenameReg, ModeReg: TSSAValue;
@@ -14191,8 +14212,19 @@ begin
   end;
 
   // Emit DOPEN instruction
-  // Dest = none, Src1 = handle, Src2 = filename, Src3 = mode
-  EmitInstruction(ssaDopen, MakeSSAValue(svkNone), HandleReg, FilenameReg, ModeReg);
+  // Dest = none (statement) / int error code (function form), Src1 = handle, Src2 = filename, Src3 = mode
+  ResultVal := MakeSSAValue(svkNone);
+  // The non-raising opcode is used for the STATEMENT too in MODERN, discarding its result: a FreeBASIC
+  // "Open f For Input As #1" on a missing file does NOT stop the program - fbc leaves the handle closed
+  // and the next LOF(1) answers 0, which is exactly why the language also offers the function form.
+  // CLASSIC keeps bcDopen and its raise: on a Commodore, a failed DOPEN is a ?FILE NOT FOUND error.
+  if AsFunction or FModernMode then
+  begin
+    ResultVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaOpenFunc, ResultVal, HandleReg, FilenameReg, ModeReg);
+  end
+  else
+    EmitInstruction(ssaDopen, MakeSSAValue(svkNone), HandleReg, FilenameReg, ModeReg);
 end;
 
 procedure TSSAGenerator.ProcessDclose(Node: TASTNode);

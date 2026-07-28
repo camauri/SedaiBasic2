@@ -11,7 +11,10 @@ unit SedaiFileIO;
   understands both the legacy C64/C128 commands (DOPEN/DCLOSE/PRINT#/INPUT#/GET#/
   APPEND/RECORD) and the FreeBASIC additions surfaced via OnFileData query commands
   (LINEINPUT#, EOF, FREEFILE, LOF, LOC, SEEK, SEEKSET, WRITE#). Mode string letters:
-  'R' read, 'W' write/truncate, 'A' append, 'B' binary (read+write, no truncate). }
+  'R' read, 'W' write/truncate, 'A' append, 'B' binary (read+write, no truncate).
+  A trailing '<' is FreeBASIC's "ACCESS READ": read-only, and - the part that shows -
+  a MISSING file is an error instead of being created. It is a separate marker rather
+  than an 'R' so that FILEATTR keeps reporting the mode letter fbc reports. }
 
 {$mode objfpc}{$H+}
 
@@ -126,13 +129,19 @@ begin
       end;
       Exit;
     end;
+    // "ACCESS READ" (trailing '<') never creates: "Open f For Binary Access Read As #h" on a missing
+    // file is an error in fbc, where a plain "For Binary" creates the file. Checked BEFORE the mode
+    // letters, since 'B' alone would otherwise create it.
     if not FileExists(Filename) and
-       (Pos('W', M) = 0) and (Pos('A', M) = 0) and (Pos('B', M) = 0) then
+       ((Pos('<', M) > 0) or
+        ((Pos('W', M) = 0) and (Pos('A', M) = 0) and (Pos('B', M) = 0))) then
     begin
       ErrorCode := 62;  // FILE NOT FOUND (read of a missing file)
       Exit;
     end;
-    if Pos('W', M) > 0 then
+    if Pos('<', M) > 0 then
+      FileMode := fmOpenRead or fmShareDenyNone
+    else if Pos('W', M) > 0 then
       FileMode := fmCreate
     else if (Pos('A', M) > 0) or (Pos('B', M) > 0) then
     begin

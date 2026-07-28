@@ -244,6 +244,7 @@ begin
     bcFileQuery,     // EOF/FREEFILE/LOF/LOC/SEEK -> int result
     bcFileAttr,      // FILEATTR(filenum, returntype) -> int result
     bcFileSetEof,    // FILESETEOF filenum -> int status result
+    bcOpenFunc,      // Open(...) FUNCTION form -> int error code in Dest
     bcGetBinInt,     // GET #n binary -> int Dest
     bcArrayIdxResolve,  // runtime multi-dim index -> int Dest (linear index)
     bcArrayLoadIndInt,      // UDT array member load (int) - Dest is WRITTEN
@@ -546,7 +547,7 @@ begin
     // Fused array element operations: Src1 = src_idx_reg for MoveElement
     bcArrayMoveElement,
     // === GROUP 6: File I/O operations ===
-    bcDopen, bcDclose, bcOpen, bcClose,  // Src1 = handle (int)
+    bcDopen, bcOpenFunc, bcDclose, bcOpen, bcClose,  // Src1 = handle (int)
     bcGetFile, bcInputFile, bcPrintFile,     // Src1 = handle (int)
     bcPrintFileComma,                        // PRINT# comma zone pad - Src1 = handle (int)
     bcPrintFileNewLine,                      // PRINT# newline - Src1 = handle (int); was missing from the classifier
@@ -851,7 +852,7 @@ begin
     // === GROUP 3: Pointer store (FreeBASIC): Src2 = string value ===
     bcRefStoreString,
     // === GROUP 6: File I/O operations ===
-    bcDopen, bcOpen,  // Src2 = filename (string)
+    bcDopen, bcOpenFunc, bcOpen,  // Src2 = filename (string)
     bcAppend,         // Src2 = data (string)
     bcPutBinStr,      // PUT #n: Src2 = string value
     bcRawStoreZStr,   // *p = s (ZSTRING/WSTRING PTR) - Src2 = the string written
@@ -964,7 +965,7 @@ begin
     during register compaction. }
   case OpCode of
     // DOPEN: Immediate = mode string register
-    bcDopen, bcOpen:
+    bcDopen, bcOpenFunc, bcOpen:
       Result := True;
   else
     Result := False;

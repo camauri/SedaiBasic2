@@ -79,6 +79,9 @@ type
     antFsFunction,        // FreeBASIC function form of a filesystem command: ChDir/MkDir/RmDir/Kill/
                           // Name/FileCopy/Shell(...) as an expression returning the error code (Long).
                           // Node value = canonical command name; children = argument expressions.
+    antOpenFunc,          // FreeBASIC function form of OPEN: "Open(file For Binary Access Read As #1)"
+                          // as an expression RETURNING the error code instead of raising. Same children
+                          // as antDopen (0=handle, 1=filename, 2=mode$, 3=reclen for RANDOM).
     antUsrFunction,
     antUserFunction,      // User-defined function call (FN)
     {$IFDEF WEB_MODE}

@@ -410,6 +410,7 @@ type
     ssaMoveFile,       // MOVE/MV "src","dest": Move file
     // Disk file I/O
     ssaDopen,          // DOPEN #handle, "filename" [, mode$]: Open disk file
+    ssaOpenFunc,       // FreeBASIC Open(...) as an EXPRESSION: Dest = error code (0 = ok) instead of raising
     ssaDclose,         // DCLOSE #handle: Close disk file
     ssaOpen,           // OPEN (legacy C64/C128 style, maps to DOPEN)
     ssaClose,          // CLOSE (legacy C64/C128 style, maps to DCLOSE)

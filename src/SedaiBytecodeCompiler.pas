@@ -510,6 +510,7 @@ begin
     ssaBoot: Result := bcBoot;
     // Disk file I/O
     ssaDopen: Result := bcDopen;
+    ssaOpenFunc: Result := bcOpenFunc;
     ssaDclose: Result := bcDclose;
     ssaOpen: Result := bcOpen;
     ssaClose: Result := bcClose;
