@@ -127,6 +127,7 @@ type
     function FindMatchingEnd(StartToken: TTokenType): Integer;
     function ParseDimensionList: TASTNode;
     procedure SkipTypeQualifiers;
+    function SkipTypeQualifiersConst: Boolean;   // ...and report whether CONST was one of them
     function AtPointerSuffix: Boolean;   // FB: the current token is "PTR" (or its synonym "POINTER")
     function TryConstIntExpr(N: TASTNode; out V: Int64): Boolean;   // fold a constant integer expression
     procedure SetOptions(AValue: TParserOptions);
@@ -427,15 +428,17 @@ function TPackratParser.ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean
 var
   i, First: Integer;
   p: TASTNode;
-  T, Nm, Banks, Names: string;
+  T, Nm, Banks, Names, Consts: string;
   C: Char;
-  AnyUDT: Boolean;
+  AnyUDT, AnyConst: Boolean;
 begin
   Result := '';
   if ParamList = nil then Exit;
   Banks := '';
   Names := '';
+  Consts := '';
   AnyUDT := False;
+  AnyConst := False;
   if SkipThis then First := 1 else First := 0;   // a method's implicit THIS sits at index 0
   for i := First to ParamList.ChildCount - 1 do
   begin
@@ -462,6 +465,13 @@ begin
       else C := 'I';
     end;
     Banks := Banks + C;
+    if p.Attributes.Values['CONSTP'] = '1' then
+    begin
+      Consts := Consts + 'C';
+      AnyConst := True;
+    end
+    else
+      Consts := Consts + '-';
     if Names <> '' then Names := Names + ',';
     // A by-value UDT: not builtin, not a pointer, and named. Anything else contributes a placeholder --
     // the tail is POSITIONAL, so a "-" must hold the slot.
@@ -476,6 +486,11 @@ begin
   Result := Banks;
   if WithTypeNames and AnyUDT then
     Result := Result + ':' + Names;
+  // A CONST tail, appended only when some parameter carries the qualifier - so a program without a
+  // const/non-const overload pair keeps byte-identical labels, exactly as the UDT tail does. It is
+  // POSITIONAL ('C' or '-' per parameter) because the call site has to reproduce it from its arguments.
+  if AnyConst then
+    Result := Result + '!' + Consts;
 end;
 
 procedure TPackratParser.RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
@@ -2438,7 +2453,8 @@ begin
         if Context.Check(ttAsType) then
         begin
           Context.Advance;                        // AS
-          SkipTypeQualifiers;                     // FB: "As Const <type>"
+          if SkipTypeQualifiersConst then         // FB: "As Const <type>" - part of the SIGNATURE
+            ParamNode.Attributes.Values['CONSTP'] := '1';
           // FreeBASIC "AS CONST <type>": a read-only (immutable) parameter. Immutability is not enforced
           // here, so consume and ignore the CONST qualifier and take the type that follows — otherwise
           // CONST (a keyword, not an identifier) is skipped and the parameter is left untyped (mis-banked
@@ -7460,9 +7476,22 @@ procedure TPackratParser.SkipTypeQualifiers;
 // examples demonstrate USING const data, and const-correctness is a separate piece of work with its
 // own diagnostics.
 begin
+  SkipTypeQualifiersConst;
+end;
+
+function TPackratParser.SkipTypeQualifiersConst: Boolean;
+// SkipTypeQualifiers, reporting whether a CONST was among what it skipped. The qualifier is still not
+// ENFORCED, but it is no longer invisible: FreeBASIC OVERLOADS on it - "foo(ByRef n As Integer)" and
+// "foo(ByRef n As Const Integer)" are two procedures, and the argument's own constness picks between
+// them. Dropping the word silently made the two collide on one label and the second was discarded.
+begin
+  Result := False;
   while Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttConstant) and
         (UpperCase(Context.CurrentToken.Value) = 'CONST') do
+  begin
+    Result := True;
     Context.Advance;
+  end;
 end;
 
 function TPackratParser.TryConstIntExpr(N: TASTNode; out V: Int64): Boolean;
@@ -7727,6 +7756,7 @@ end;
 
 function TPackratParser.ParseDimStatement: TASTNode;
 var
+  NameIsConst: Boolean;   // "As Const <type>" on this declaration
   FixedCapVal: Int64;   // folded "* n" capacity
   Token, NameTok, TypeTok, SharedTypeTok: TLexerToken;
   ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode, FuncPtrSigNode, LeadingTypeOfExpr: TASTNode;
@@ -7771,11 +7801,14 @@ begin
   // FreeBASIC "leading-AS" form: "DIM [SHARED] AS <type> name1[, name2, ...] [= init]" — the type comes
   // first and is shared by every name in the list (e.g. "DIM AS STRING ch = MID(s,1,1)"). Parse the
   // shared type once here; each declaration in the loop below is then just "name [= init]".
+  NameIsConst := False;
   LeadingAS := Context.Check(ttAsType);
   if LeadingAS then
   begin
     Context.Advance;                          // AS
-    SkipTypeQualifiers;                     // FB: "As Const <type>"
+    // "As Const <type>": not enforced, but part of the variable's identity for OVERLOAD RESOLUTION -
+    // a const argument selects the const overload. Remembered now, not just skipped.
+    NameIsConst := SkipTypeQualifiersConst;
     // FreeBASIC "DIM AS TypeOf(expr) name": the type is inferred from an expression. Capture the
     // expression; each declared name gets it as child[1] with TYPEOF='1' and the concrete type is
     // resolved in the SSA pre-pass (like VAR's INFER, but with no initializer).
@@ -7884,7 +7917,7 @@ begin
         NameTok := Context.CurrentToken;
         Context.Advance;                       // name
         Context.Advance;                       // AS
-        SkipTypeQualifiers;                     // FB: "As Const <type>"
+        NameIsConst := SkipTypeQualifiersConst;   // see the leading-AS note above
         // FreeBASIC function-pointer variable "DIM fp AS FUNCTION(...) AS ret": int-banked (holds an
         // entry PC); the signature is captured on a scratch node and copied onto the decl below.
         FuncPtrSigNode := nil;
@@ -7920,6 +7953,7 @@ begin
         end;
       end;
       ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
+      if NameIsConst then ArrayDecl.Attributes.Values['CONSTV'] := '1';
       VarNameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
       ArrayDecl.AddChild(VarNameNode);
       if LeadingAS and Assigned(LeadingTypeOfExpr) then

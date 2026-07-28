@@ -197,6 +197,11 @@ type
     FCurrentProcRetRecType: string;   // V3: UDT type the current FUNCTION returns by value (else '')
     FCurrentResultHandle: TSSAValue;  // V3: register holding the caller's result-instance handle
     FCurrentProcLocalRecs: TStringList;  // V5: "VARNAME|TYPENAME" of the proc's DIM'd local UDTs
+    // Names DECLARED at module level and not SHARED, and the names this procedure declares of its
+    // own. A module DIM is invisible inside a SUB, so its declared TYPE must be invisible too.
+    FModuleOnlyVars: TStringList;
+    FConstVars: TStringList;             // "Dim x As Const T" (UPPER): const for OVERLOAD resolution
+    FCurrentProcDeclNames: TStringList;
     FCurrentProcByvalRecs: TStringList;  // V5d: "VARNAME|TYPENAME" of the proc's BYVAL UDT param copies
     FCurrentProcByrefScalars: TStringList;  // BYREF: explicit-BYREF scalar params; Objects[] = packed (RT<<16 | slot)
                                             //        their final register value is written back to the slot at each return
@@ -372,6 +377,7 @@ type
     function SigBankPart(const Sig: string): string;            // the bank chars of a signature = its parameter count
     function IsDeclaredVariable(const Name: string): Boolean;   // a variable wins over a type of the same name
     function IsTypeNameForLen(const Name: string): Boolean;     // bare identifier that names a TYPE: LEN(T) = SizeOf(T)
+    function ArgConstSigFromArgs(ArgsNode: TASTNode): string;   // positional 'C'/'-' of const arguments
     function ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;  // pick an overload
     function FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;  // M4.4h: defaulted ctor
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
@@ -594,6 +600,8 @@ type
     // Map parameter at Index (within ParamList) to its transfer-bank type and per-bank slot.
     function ParamBankAndSlot(ParamList: TASTNode; Index: Integer; out RT: TSSARegisterType): Integer;
     function ParamDeclaredBank(ParamNode: TASTNode): TSSARegisterType;  // scalar param bank from its OWN decl (no global name collision)
+    function ModuleTypeHiddenHere(const NameU: string): Boolean;   // a module DIM's TYPE, invisible in this proc?
+    procedure CollectProcDeclaredNames(Node: TASTNode);            // names this proc declares of its own
     function CurrentProcParamType(const VarName: string; out UDTType: string): Boolean;  // is VarName a param of the current proc? UDTType = its UDT ('' if not a UDT)
     function CurrentProcLocalRecType(const VarName: string): string;  // UDT type of a DIM'd local UDT of the current proc (shadows the global map), else ''
     procedure EmitXferStore(RT: TSSARegisterType; Slot: Integer; const Val: TSSAValue);
@@ -950,6 +958,12 @@ begin
   FNeededDispatchers.Duplicates := dupIgnore;
   FNeededDispatchers.Sorted := True;
   FCurrentProcLocalRecs := TStringList.Create;
+  FConstVars := TStringList.Create;
+  FConstVars.CaseSensitive := False;
+  FModuleOnlyVars := TStringList.Create;
+  FModuleOnlyVars.CaseSensitive := False;
+  FCurrentProcDeclNames := TStringList.Create;
+  FCurrentProcDeclNames.CaseSensitive := False;
   FCurrentProcByvalRecs := TStringList.Create;
   FCurrentProcByrefScalars := TStringList.Create;
   FCurrentProcAddrParams := TStringList.Create;
@@ -1044,6 +1058,9 @@ begin
   FNeededDispatchers.Free;
   FDeclaredNames.Free;
   FCurrentProcLocalRecs.Free;
+  FModuleOnlyVars.Free;
+  FConstVars.Free;
+  FCurrentProcDeclNames.Free;
   FCurrentProcByvalRecs.Free;
   FCurrentProcByrefScalars.Free;
   FCurrentProcAddrParams.Free;
@@ -1104,6 +1121,9 @@ begin
   if Assigned(FVarExplicitType) then
   begin
     Idx := FVarExplicitType.IndexOf(UpperCase(VarName));
+    // ...unless the only declaration is a plain module DIM and we are inside a procedure that does not
+    // declare this name itself. That declaration is invisible here (FreeBASIC scope), so its TYPE is too.
+    if (Idx >= 0) and ModuleTypeHiddenHere(UpperCase(VarName)) then Idx := -1;
     if Idx >= 0 then
       Exit(TSSARegisterType(PtrInt(FVarExplicitType.Objects[Idx])));
   end;
@@ -18366,6 +18386,36 @@ begin
   if p > 0 then Result := Copy(Sig, 1, p - 1) else Result := Sig;
 end;
 
+function TSSAGenerator.ArgConstSigFromArgs(ArgsNode: TASTNode): string;
+// The positional const signature of a call's arguments - 'C' for an argument that is a const-declared
+// variable, '-' for anything else - or '' when none of them is const. It mirrors what
+// ProcSigFromParams appends for a procedure whose parameters carry "As Const", and it exists because
+// FreeBASIC OVERLOADS on the qualifier: "foo(ByRef n As Integer)" and "foo(ByRef n As Const Integer)"
+// are two procedures, and the ARGUMENT decides.
+var
+  i: Integer;
+  A: TASTNode;
+  Any: Boolean;
+begin
+  Result := '';
+  Any := False;
+  if not (Assigned(ArgsNode) and (ArgsNode.NodeType in [antArgumentList, antExpressionList])) then Exit;
+  for i := 0 to ArgsNode.ChildCount - 1 do
+  begin
+    A := ArgsNode.GetChild(i);
+    while Assigned(A) and (A.NodeType = antParentheses) and (A.ChildCount >= 1) do A := A.GetChild(0);
+    if Assigned(A) and (A.NodeType = antIdentifier) and
+       (FConstVars.IndexOf(UpperCase(VarToStr(A.Value))) >= 0) then
+    begin
+      Result := Result + 'C';
+      Any := True;
+    end
+    else
+      Result := Result + '-';
+  end;
+  if not Any then Result := '';
+end;
+
 function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;
 // Resolve a call to an OVERLOADED procedure. A name declared once keeps its bare label, so the first
 // test settles every non-overloaded program and this costs nothing. An overload set has no bare label
@@ -18379,12 +18429,25 @@ function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTN
 //      count is the length of the BANK part: the type tail must not be mistaken for more parameters.
 // Returns '' when nothing matches, and the caller reports it as before.
 var
-  Sig, UdtSig, Pref: string;
+  Sig, UdtSig, ConstSig, Pref: string;
   k: Integer;
 begin
   if FProcDecls.ContainsKey(BaseLabel) then Exit(BaseLabel);
   Sig := ArgSigFromArgs(ArgsNode);
   UdtSig := ArgUdtSigFromArgs(ArgsNode);
+  ConstSig := ArgConstSigFromArgs(ArgsNode);
+  // A const ARGUMENT prefers the const overload; everything else falls through to the same order as
+  // before, so a program without such a pair resolves exactly as it did.
+  if ConstSig <> '' then
+  begin
+    if UdtSig <> '' then
+    begin
+      Result := BaseLabel + '~' + Sig + ':' + UdtSig + '!' + ConstSig;
+      if FProcDecls.ContainsKey(Result) then Exit;
+    end;
+    Result := BaseLabel + '~' + Sig + '!' + ConstSig;
+    if FProcDecls.ContainsKey(Result) then Exit;
+  end;
   if UdtSig <> '' then
   begin
     Result := BaseLabel + '~' + Sig + ':' + UdtSig;
@@ -18633,6 +18696,16 @@ begin
   // ("Redim As block hufflist(0)"), and it parses to the very same antArrayDecl children. Gating on
   // antDim alone left such an array with no recorded element type, so "r(i).field" never resolved as a
   // record: reads returned the raw tagged handle and stores went nowhere -- silently.
+  // "Dim x As Const T": remember the name. The qualifier is not enforced, but FreeBASIC OVERLOADS on it,
+  // and the call site has to reproduce the callee's signature from its ARGUMENTS.
+  if Node.NodeType in [antDim, antRedim] then
+    for k := 0 to Node.ChildCount - 1 do
+      if (Node.GetChild(k).NodeType = antArrayDecl) and 
+         (Node.GetChild(k).Attributes.Values['CONSTV'] = '1') and
+         (Node.GetChild(k).ChildCount >= 1) and
+         (Node.GetChild(k).GetChild(0).NodeType = antIdentifier) and
+         (FConstVars.IndexOf(UpperCase(VarToStr(Node.GetChild(k).GetChild(0).Value))) < 0) then
+        FConstVars.Add(UpperCase(VarToStr(Node.GetChild(k).GetChild(0).Value)));
   if Node.NodeType in [antDim, antRedim] then
   begin
     for k := 0 to Node.ChildCount - 1 do
@@ -18860,6 +18933,53 @@ begin
     FVarExplicitType.AddObject(VarName, TObject(PtrInt(Ord(Bank))))
   else if not FPreScanInProc then
     FVarExplicitType.Objects[Idx] := TObject(PtrInt(Ord(Bank)));
+  // A declaration made at MODULE level is remembered as such. FreeBASIC hides a plain module DIM from
+  // every procedure - resolution already stops at the procedure root for a non-shared name, which is why
+  // the VALUE is right - but its declared TYPE lived in this map, keyed by bare name, and leaked in
+  // anyway. An implicitly-used name inside a SUB was then banked as the module variable of the same
+  // name: right value, wrong type. DIM SHARED is a different thing and stays visible.
+  if (not FPreScanInProc) and (not IsSharedScalar(VarName)) and
+     (FModuleOnlyVars.IndexOf(VarName) < 0) then
+    FModuleOnlyVars.Add(VarName);
+end;
+
+function TSSAGenerator.ModuleTypeHiddenHere(const NameU: string): Boolean;
+// Is NameU's declared type a MODULE declaration that this procedure cannot see? True only while a
+// procedure is being lowered, for a name that was declared at module level (not SHARED) and is not
+// declared by this procedure - as a parameter, a local, or THIS.
+begin
+  Result := False;
+  if FCurrentProcName = '' then Exit;                  // module level: the declaration is in scope
+  if FModuleOnlyVars = nil then Exit;
+  if FModuleOnlyVars.IndexOf(NameU) < 0 then Exit;     // not a module-only declaration
+  if IsSharedScalar(NameU) then Exit;                  // DIM SHARED is visible everywhere
+  if (FCurrentProcDeclNames <> nil) and (FCurrentProcDeclNames.IndexOf(NameU) >= 0) then Exit;
+  Result := True;
+end;
+
+procedure TSSAGenerator.CollectProcDeclaredNames(Node: TASTNode);
+// Every name this procedure declares of its own: parameters, and any DIM/STATIC/VAR in its body. Used
+// only to answer "does the procedure own this name" when deciding whether a module declaration's TYPE
+// is visible here (ModuleTypeHiddenHere). Deliberately flat - block scoping does not matter for the
+// question, which is about the MODULE declaration being hidden, not about which local wins.
+var
+  i: Integer;
+  Decl: TASTNode;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType in [antDim, antParameterList] then
+    for i := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(i);
+      if Decl = nil then Continue;
+      if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 1) and
+         (Decl.GetChild(0).NodeType = antIdentifier) then
+        FCurrentProcDeclNames.Add(UpperCase(VarToStr(Decl.GetChild(0).Value)))
+      else if Decl.NodeType = antIdentifier then
+        FCurrentProcDeclNames.Add(UpperCase(VarToStr(Decl.Value)));
+    end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectProcDeclaredNames(Node.GetChild(i));
 end;
 
 function TSSAGenerator.CurrentProcParamType(const VarName: string; out UDTType: string): Boolean;
@@ -24061,6 +24181,8 @@ begin
     FAddrLocalVars.Clear;                                 // @-taken locals of THIS proc (filled by ProcessDim)
     CollectTopLevelLabels(Proc, 2);                       // GOTO-unwind: this proc's block-depth-0 labels (body starts at child 2)
     CollectLocalRecordVars(Proc);
+    FCurrentProcDeclNames.Clear;
+    CollectProcDeclaredNames(Proc);
     // Method body (M4.1): the owner type (before the '.') is THIS's type while lowering here.
     if Pos('.', Name) > 0 then
       FCurrentThisType := Copy(Name, 1, Pos('.', Name) - 1)
