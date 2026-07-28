@@ -1334,12 +1334,42 @@ begin
 end;
 
 function TExpressionParser.ParseGraphicsCommandForm(Token: TLexerToken): TASTNode;
-// A graphics command found where an expression was expected. Exactly one of them has a function form:
-// FreeBASIC's SCREEN(row, column [, colorflag]), which reads a character or colour attribute back out
-// of the console. MODERN only -- Commodore BASIC v7 has no SCREEN at all, so in CLASSIC this stays the
-// syntax error it has always been, and the dialects keep their own semantics.
+// A graphics command found where an expression was expected. Three of them have a function form in
+// FreeBASIC, and all three are MODERN only -- Commodore BASIC v7 has none of them, so in CLASSIC this
+// stays the syntax error it has always been and the dialects keep their own semantics:
+//   SCREEN(row, column [, colorflag])  reads a character or colour attribute out of the console
+//   COLOR()                            the current colours, foreground in LoWord, background in HiWord
+//   WIDTH                              the console size, columns in LoWord, rows in HiWord
+// COLOR and WIDTH take NO arguments; WIDTH is written bare, without even the parentheses, so the rule
+// must accept a keyword standing alone in expression position. They become the internal helpers the
+// SSA composes from the existing read-back opcodes - there is no packing opcode, and none is needed.
+var
+  Cmd: string;
+  ArgList: TASTNode;
 begin
-  if (UpperCase(Token.Value) <> kSCREENGFX) or not ModernMode or not Context.Check(ttDelimParOpen) then
+  Cmd := UpperCase(Token.Value);
+  if ModernMode and ((Cmd = kCOLOR) or (Cmd = kWIDTH)) then
+  begin
+    if Context.Check(ttDelimParOpen) then
+    begin
+      Context.Advance;                                  // '('
+      if not Context.Match(ttDelimParClose) then
+      begin
+        HandleError(Format('%s() takes no arguments', [Cmd]), Context.CurrentToken);
+        Result := nil;
+        Exit;
+      end;
+    end;
+    ArgList := TASTNode.Create(antArgumentList, Token);  // empty: both helpers are nullary
+    if Cmd = kCOLOR then
+      Result := TASTNode.CreateWithValue(antGraphicsFunction, '__COLORPACK', Token)
+    else
+      Result := TASTNode.CreateWithValue(antGraphicsFunction, '__WIDTHPACK', Token);
+    Result.AddChild(ArgList);
+    DoNodeCreated(Result);
+    Exit;
+  end;
+  if (Cmd <> kSCREENGFX) or not ModernMode or not Context.Check(ttDelimParOpen) then
   begin
     HandleError(Format('Unexpected token "%s"', [Token.Value]), Token);
     Result := nil;

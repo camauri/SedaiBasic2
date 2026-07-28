@@ -238,6 +238,12 @@ type
     FOwnedGraphics: TObject;         // concrete backend object the VM owns and frees (e.g. the software backend on sb)
     FGfxForeColor: UInt32;           // current FreeBASIC draw foreground (COLOR fg); omitted-colour default
     FGfxBackColor: UInt32;           // current FreeBASIC draw background (COLOR ,bg)
+    // The same COLOR statement, remembered as the TEXT attribute the console form of FreeBASIC's
+    // "Color()" reads back (foreground in the low word, background in the high word). Kept apart from
+    // the draw colours because their DEFAULTS differ and both defaults are observable: a fresh fbc
+    // console reports 7 on 0, while an untouched draw colour is white on black.
+    FConColorFg: Int64;
+    FConColorBg: Int64;
     FGfxWorkSurface: Integer;        // FreeBASIC page flipping: cached surface all draw ops target (= FGfxPages[FGfxWorkPage])
     // FreeBASIC "PSET img,(x,y)" etc.: a per-statement drawing target. When active, drawing ops (PSET/LINE/
     // CIRCLE/PAINT/POINT) target this image surface instead of the work page. Set/cleared by bcGfxSetTarget.
@@ -889,6 +895,8 @@ begin
   // FreeBASIC draw colours: white foreground, opaque-black background (match the SCREENRES surface clear).
   FGfxForeColor := $FFFFFFFF;
   FGfxBackColor := $000000FF;
+  FConColorFg := 7;   // fbc's console defaults, which "Color()" reports before any COLOR statement
+  FConColorBg := 0;
   // FreeBASIC page flipping: single page (the screen) until SCREENRES requests more.
   FGfxWorkSurface := GFX_SCREEN_SURFACE;
   FGfxWorkPage := 0;
@@ -10411,15 +10419,21 @@ begin
         FGraphics.ResetPalette;
     34: // bcGfxColor - COLOR [fg][,bg] : set current draw colours (Immediate bit0=hasFg, bit1=hasBg)
       begin
-        if (Instr.Immediate and 1) <> 0 then FGfxForeColor := UInt32(Ctx.IntRegs[Instr.Src1]);
-        if (Instr.Immediate and 2) <> 0 then FGfxBackColor := UInt32(Ctx.IntRegs[Instr.Src2]);
+        if (Instr.Immediate and 1) <> 0 then
+        begin FGfxForeColor := UInt32(Ctx.IntRegs[Instr.Src1]); FConColorFg := Ctx.IntRegs[Instr.Src1]; end;
+        if (Instr.Immediate and 2) <> 0 then
+        begin FGfxBackColor := UInt32(Ctx.IntRegs[Instr.Src2]); FConColorBg := Ctx.IntRegs[Instr.Src2]; end;
       end;
-    35: // bcGfxForeColor - read the current draw colour (Immediate 0 = foreground, 1 = background). The
-        //   omitted-colour default for PSET (foreground) and PRESET (background).
-      if Instr.Immediate = 1 then
-        Ctx.IntRegs[Instr.Dest] := Int64(FGfxBackColor)
+    35: // bcGfxForeColor - read the current colour. Immediate 0 = draw foreground, 1 = draw background
+        //   (the omitted-colour defaults for PSET and PRESET); 2 = console foreground, 3 = console
+        //   background, which is what FreeBASIC's "Color()" packs into its result.
+      case Instr.Immediate of
+        1: Ctx.IntRegs[Instr.Dest] := Int64(FGfxBackColor);
+        2: Ctx.IntRegs[Instr.Dest] := FConColorFg;
+        3: Ctx.IntRegs[Instr.Dest] := FConColorBg;
       else
         Ctx.IntRegs[Instr.Dest] := Int64(FGfxForeColor);
+      end;
     36: // bcGfxImageCreate - IMAGECREATE(w,h[,color]) -> handle (Immediate = fill colour reg)
       if Assigned(FGraphics) then
         Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.CreateSurface(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],

@@ -1698,6 +1698,7 @@ var
   Stride: Int64;
   // RGBA function handling
   RVal, GVal, BVal, AVal: TSSAValue;
+  LoPart, HiPart, ShiftAmt: TSSAValue;   // Color()/Width: the two halves and the 16-bit pack shift
   RGBAResult: Int64;
   RReg, GReg, BReg, AReg: TSSAValue;
   // String function handling
@@ -4471,6 +4472,38 @@ begin
           end
           else
             raise Exception.Create('__SCRINFO requires 1 argument');
+        end
+        else if (FuncName = '__COLORPACK') or (FuncName = '__WIDTHPACK') then
+        begin
+          // FreeBASIC's nullary function forms, packed into one Long the way fbc packs them:
+          //   Color() -> foreground in the LOW word, background in the HIGH word
+          //   Width   -> columns    in the LOW word, rows       in the HIGH word
+          // Both are composed from read-back opcodes that already exist (the current draw colours, and
+          // RWINDOW's window size), so neither needs an opcode of its own. LoWord/HiWord on the result
+          // are what the programs actually call, and those are already implemented.
+          LoPart := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          HiPart := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          if FuncName = '__COLORPACK' then
+          begin
+            EmitInstruction(ssaGfxForeColor, LoPart, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(2));  // console fg
+            EmitInstruction(ssaGfxForeColor, HiPart, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(3));  // console bg
+          end
+          else
+          begin
+            ArgReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitInstruction(ssaGraphicRwindow, LoPart, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));   // 1 = cols
+            ArgReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, ArgReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitInstruction(ssaGraphicRwindow, HiPart, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));   // 0 = rows
+          end;
+          ShiftAmt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, ShiftAmt, MakeSSAConstInt(16), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          RVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaShl, RVal, HiPart, ShiftAmt, MakeSSAValue(svkNone));
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaBitwiseOr, Result, LoPart, RVal, MakeSSAValue(svkNone));
         end
         else if FuncName = 'PMAP' then
         begin
