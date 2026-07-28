@@ -56,6 +56,11 @@ type
     EndLabel: string;
     ContLabel: string;          // CONTINUE target (FOR: increment; DO-top/WHILE: cond; DO-bottom: bottom cond; infinite: body)
     ContUsed: Boolean;          // True if a CONTINUE in the body referenced ContLabel (gates a dedicated block)
+    // FreeBASIC iterator loop ("For i As T = a To b" where T declares Operator For/Step/Next): the type
+    // drives the loop, so NEXT closes it with a STEP OPERATOR call instead of an addition. Empty type
+    // name = an ordinary numeric FOR.
+    IterType: string;           // T, or '' when this is not a type-driven loop
+    IterHasStep: Boolean;       // the source wrote STEP, so the one-argument operators are used
   end;
 
   { User-defined function info for DEF FN }
@@ -650,6 +655,10 @@ type
     procedure EmitIsCheck(ObjNode: TASTNode; const TypeName: string; out Result: TSSAValue);
     procedure ProcessForLoop(Node: TASTNode);
     procedure ProcessDoLoop(Node: TASTNode);
+    function TryProcessForLoopUDT(Node: TASTNode): Boolean;   // "For i As T = a To b": Operator For/Step/Next
+    function IterOperatorLabel(const TypeName, OpName: string; NArgs: Integer): string;
+    function EmitIterOperatorCall(const Lbl: string; const ThisH: TSSAValue;
+                                 const A1, A2: TSSAValue): TSSAValue;
     procedure ProcessBlock(Node: TASTNode);
     procedure ProcessDefFn(Node: TASTNode);
     procedure ProcessNext(Node: TASTNode);
@@ -2633,11 +2642,20 @@ begin
         CastRight := HasUDTStringCast(Node.GetChild(1)) and (InferExprBank(Node.GetChild(0)) = srtString);
       end;
       // In an arithmetic/bitwise op, a UDT operand with a numeric Cast operator converts through it, so a
-      // custom numeric type works as "udt + n". Not for "&" (string) nor comparisons (handled above via
-      // the string cast / an Operator =). No matching operator overload exists here — that was tried first.
+      // custom numeric type works as "udt + n". Not for "&", which is the string side. No matching
+      // operator overload exists here — that was tried first.
+      //
+      // COMPARISONS take the same conversion, and leaving them out was a silent wrong answer rather than
+      // a missing feature: two UDT operands fell through to comparing their record HANDLES, which are
+      // small ascending integers, so "a <= b" answered by allocation order and looked plausible. The
+      // manual's fraction iterator tests its loop with "This <= end_cond" and nothing else - the type
+      // declares no comparison operator at all, only "Operator Cast() As Double" - so the loop never
+      // ended. A type with no numeric Cast is unaffected: TryEmitUDTCastToNumber declines and the
+      // handle comparison (identity) stays, which is all we ever had for those.
       NumCast := Node.Token.TokenType in [ttOpAdd, ttOpSub, ttOpMul, ttOpDiv, ttOpIntDiv,
                                           ttOpMod, ttOpPow, ttOpShl, ttOpShr,
-                                          ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR];
+                                          ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR,
+                                          ttOpEq, ttOpNeq, ttOpLt, ttOpGt, ttOpLe, ttOpGe];
       if not ((CastLeft and TryEmitUDTCastToString(Node.GetChild(0), Left)) or
               (NumCast and TryEmitUDTCastToNumber(Node.GetChild(0), Left))) then
         ProcessExpression(Node.GetChild(0), Left);
@@ -9495,6 +9513,172 @@ begin
   AsnNode.Free;
 end;
 
+function TSSAGenerator.IterOperatorLabel(const TypeName, OpName: string; NArgs: Integer): string;
+// The label of an iteration operator, preferring the arity the loop asks for and falling back to the
+// other one. FreeBASIC declares each of FOR/STEP/NEXT twice - with the step variable and without - and
+// a type may declare either or both, so a loop written WITH Step still works against a type that only
+// implements the implicit form, and the other way round.
+begin
+  Result := TypeName + '.OPERATOR' + OpName + '@' + IntToStr(NArgs);
+  if FProcDecls.ContainsKey(Result) then Exit;
+  if NArgs > 0 then Result := TypeName + '.OPERATOR' + OpName + '@' + IntToStr(NArgs - 1)
+  else Result := TypeName + '.OPERATOR' + OpName + '@1';
+  if not FProcDecls.ContainsKey(Result) then Result := '';
+end;
+
+function TSSAGenerator.EmitIterOperatorCall(const Lbl: string; const ThisH: TSSAValue;
+  const A1, A2: TSSAValue): TSSAValue;
+// Call an iteration operator on ThisH. Same protocol a constructor call uses: the instance handle into
+// THIS's slot, then each argument into its declared parameter slot, coerced to that parameter's bank.
+// A NEXT is a FUNCTION and its result comes back through the result slot; FOR and STEP are SUBs.
+var
+  Decl, ParamList: TASTNode;
+  Slot: Integer;
+  RT: TSSARegisterType;
+
+  procedure StageArg(Idx: Integer; const V: TSSAValue);
+  begin
+    if V.Kind = svkNone then Exit;
+    if Idx >= ParamList.ChildCount then Exit;
+    Slot := ParamBankAndSlot(ParamList, Idx, RT);
+    EmitXferStore(RT, Slot, V);
+  end;
+
+begin
+  Result := MakeSSAValue(svkNone);
+  if Lbl = '' then Exit;
+  if not (FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2)) then Exit;
+  ParamList := Decl.GetChild(1);
+  EmitXferStore(srtInt, 0, ThisH);        // the implicit THIS
+  StageArg(1, A1);
+  StageArg(2, A2);
+  EmitCallSubLabel(ProcedureLabelName(Lbl));
+  if UpperCase(VarToStr(Decl.Value)) = kFUNCTION then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitXferLoad(srtInt, XFER_RESULT_SLOT, Result);
+  end;
+end;
+
+function TSSAGenerator.TryProcessForLoopUDT(Node: TASTNode): Boolean;
+// FreeBASIC "For i As T = start To limit [Step stp]" where T declares Operator For/Step/Next: the TYPE
+// drives the iteration. The expansion is fbc's, measured on examples/manual/udt/step:
+//
+//     i = T(start) : cond = T(limit) : stp = T(stepexpr)
+//     i.for(stp)
+//     while i.next(cond, stp)          <- NEXT is the TEST, and it is asked FIRST
+//         <body>
+//         i.step(stp)
+//     wend
+//
+// The three bounds are CONSTRUCTED, which is what makes "For i As T = 10 To 1 Step -1" mean anything:
+// 10, 1 and -1 are ordinary numbers that the type's constructor converts.
+//
+// Only the HEAD is emitted here. An antForLoop carries no body - the parser leaves the following
+// statements in the stream and NEXT closes the loop - so the STEP call and the back edge are emitted by
+// ProcessNext, which recognises the loop by LoopInfo.IterType.
+var
+  TypeName, VarName: string;
+  IterH, CondH, StepH, CmpVal, VarReg: TSSAValue;
+  CondLabel, BodyLabel, EndLabel: string;
+  PrevBlock, CondBlock, BodyBlock: TSSABasicBlock;
+  LoopInfo: TLoopInfo;
+  HasStep: Boolean;
+  NArgs: Integer;
+
+  // "For i As T = start To limit": each bound is CONVERTED to T - which is what makes
+  // "For i As T = 10 To 1 Step -1" mean anything, since 10, 1 and -1 are ordinary numbers the type's
+  // constructor takes. A bound that is ALREADY a T is used as it stands: the manual's fraction iterator
+  // writes "For i As fraction = fraction(1,1) To fraction(4,1)", and wrapping those in another
+  // constructor built fraction(fraction(...)) - every field zero, and a loop that never ended.
+  function MakeBound(Expr: TASTNode): TSSAValue;
+  var
+    L: TASTNode;
+  begin
+    Result := MakeSSAValue(svkNone);
+    if (Expr <> nil) and (UpperCase(ObjectTypeName(Expr)) = TypeName) then
+    begin
+      ProcessExpression(Expr, Result);
+      Result := EnsureIntRegister(Result);
+      Exit;
+    end;
+    L := TASTNode.Create(antExpressionList, Node.Token);
+    try
+      if Expr <> nil then L.AddChild(Expr.Clone);
+      EmitUDTTemporary(TypeName, L, Result);
+    finally
+      L.Free;
+    end;
+  end;
+
+begin
+  Result := False;
+  TypeName := UpperCase(Node.Attributes.Values['VARTYPE']);
+  if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
+  // A type with no iteration NEXT is not an iterator: leave it to the numeric path below.
+  if (IterOperatorLabel(TypeName, kNEXT, 2) = '') then Exit;
+  Result := True;
+
+  VarName := UpperCase(VarToStr(Node.GetChild(0).Value));
+  HasStep := Node.ChildCount > 3;
+  if HasStep then NArgs := 1 else NArgs := 0;
+
+  IterH := MakeBound(Node.GetChild(1));
+  VarReg := DeclareVariableTyped(VarName, srtInt);      // the loop variable IS the iterator instance
+  EmitInstruction(ssaCopyInt, VarReg, IterH, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  CondH := MakeBound(Node.GetChild(2));
+  if HasStep then StepH := MakeBound(Node.GetChild(3)) else StepH := MakeSSAValue(svkNone);
+
+  EmitIterOperatorCall(IterOperatorLabel(TypeName, kFOR, NArgs), VarReg, StepH, MakeSSAValue(svkNone));
+
+  CondLabel := GenerateUniqueLabel('forit_cond');
+  BodyLabel := GenerateUniqueLabel('forit_body');
+  EndLabel  := GenerateUniqueLabel('forit_end');
+
+  LoopInfo.LoopKind := lkFor;
+  LoopInfo.VarName := VarName;
+  LoopInfo.VarReg := VarReg;
+  LoopInfo.EndValue := CondH;
+  LoopInfo.StepValue := StepH;
+  LoopInfo.StepIsNegative := False;
+  LoopInfo.NeedRuntimeCheck := False;
+  LoopInfo.CondLabel := CondLabel;
+  LoopInfo.CondLabelGE := '';
+  LoopInfo.BodyLabel := BodyLabel;
+  LoopInfo.EndLabel := EndLabel;
+  LoopInfo.ContLabel := CondLabel;
+  LoopInfo.ContUsed := False;
+  LoopInfo.IterType := TypeName;
+  LoopInfo.IterHasStep := HasStep;
+  SetLength(FLoopStack, Length(FLoopStack) + 1);
+  FLoopStack[High(FLoopStack)] := LoopInfo;
+
+  PrevBlock := FCurrentBlock;
+  EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  FCurrentBlock := FProgram.CreateBlock(CondLabel);
+  CondBlock := FCurrentBlock;
+  if Assigned(PrevBlock) then
+  begin
+    PrevBlock.AddSuccessor(CondBlock);
+    CondBlock.AddPredecessor(PrevBlock);
+  end;
+
+  CmpVal := EmitIterOperatorCall(IterOperatorLabel(TypeName, kNEXT, NArgs + 1), VarReg, CondH, StepH);
+  CmpVal := EnsureIntRegister(CmpVal);
+  EmitInstruction(ssaJumpIfZero, MakeSSALabel(EndLabel), CmpVal,
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // The branch may have been emitted further down the chain than CondBlock (an argument expression can
+  // open blocks of its own) - take the edge from where we actually are. See ProcessDoLoop's note.
+  CondBlock := FCurrentBlock;
+  FCurrentBlock := FProgram.CreateBlock(BodyLabel);
+  BodyBlock := FCurrentBlock;
+  CondBlock.AddSuccessor(BodyBlock);
+  BodyBlock.AddPredecessor(CondBlock);
+  BlockScopeEnter(True);
+end;
+
 procedure TSSAGenerator.ProcessForLoop(Node: TASTNode);
 var
   VarName: string;
@@ -9515,6 +9699,9 @@ var
 begin
   if Node.ChildCount < 3 then Exit;
   if Node.GetChild(0).NodeType <> antIdentifier then Exit;
+  // "For i As T = ..." where T declares Operator For/Step/Next: the TYPE drives the loop, not the
+  // numeric machinery below.
+  if TryProcessForLoopUDT(Node) then Exit;
 
   VarName := VarToStr(Node.GetChild(0).Value);
   // Honor an explicit "FOR i AS <type>" counter type. A suffixless name otherwise defaults to the float
@@ -10274,6 +10461,46 @@ begin
 
   // M8: close this loop body's block scope (destruct its DIM'd UDTs + reclaim) before the back-edge.
   BlockScopeExit;
+
+  // A type-driven loop steps through its own OPERATOR and re-tests at the condition block, which
+  // already holds the NEXT call. Nothing of the numeric increment below applies to it.
+  if LoopInfo.IterType <> '' then
+  begin
+    if LoopInfo.ContUsed then
+    begin
+      ContBlock := FProgram.CreateBlock(LoopInfo.ContLabel);
+      if Assigned(FCurrentBlock) then
+      begin
+        FCurrentBlock.AddSuccessor(ContBlock);
+        ContBlock.AddPredecessor(FCurrentBlock);
+      end;
+      FCurrentBlock := ContBlock;
+    end;
+    if LoopInfo.IterHasStep then
+      EmitIterOperatorCall(IterOperatorLabel(LoopInfo.IterType, kSTEP, 1), LoopInfo.VarReg,
+                           LoopInfo.StepValue, MakeSSAValue(svkNone))
+    else
+      EmitIterOperatorCall(IterOperatorLabel(LoopInfo.IterType, kSTEP, 0), LoopInfo.VarReg,
+                           MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    BodyBlock := FCurrentBlock;
+    EmitInstruction(ssaJump, MakeSSALabel(LoopInfo.CondLabel), MakeSSAValue(svkNone),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    CondBlock := FProgram.FindBlock(LoopInfo.CondLabel);
+    if Assigned(BodyBlock) and Assigned(CondBlock) then
+    begin
+      BodyBlock.AddSuccessor(CondBlock);
+      CondBlock.AddPredecessor(BodyBlock);
+    end;
+    EndBlock := FProgram.CreateBlock(LoopInfo.EndLabel);
+    CondBlock := FProgram.FindBlock(LoopInfo.CondLabel);
+    if Assigned(CondBlock) then
+    begin
+      CondBlock.AddSuccessor(EndBlock);
+      EndBlock.AddPredecessor(CondBlock);
+    end;
+    FCurrentBlock := EndBlock;
+    Exit;
+  end;
 
   // CONTINUE FOR lands here (after the per-iteration block cleanup, at the increment). Only emitted
   // when a CONTINUE referenced it; otherwise the increment stays inline and the bytecode is unchanged.

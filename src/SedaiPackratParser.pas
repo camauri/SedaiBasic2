@@ -1103,8 +1103,12 @@ begin
       // "FUNCTION = expr" inside a FUNCTION body is FreeBASIC's canonical way to set the result (the
       // named form "fname = expr" is the other). Only "FUNCTION" followed by "=" is the result
       // assignment -- anything else starting with FUNCTION is a declaration.
-      if (UpperCase(Token.Value) = kFUNCTION) and Assigned(Context.PeekNext) and
-         (Context.PeekNext.TokenType = ttOpEq) then
+      // "OPERATOR = expr" inside an operator body sets its RESULT, exactly as "FUNCTION = expr" does in a
+      // function - it is how a Cast or an arithmetic operator hands its value back, and it is what the
+      // manual writes. Told apart from a declaration the same way: a following '=' can only be the
+      // assignment (a declaration continues with a symbol or "<Type>.").
+      if ((UpperCase(Token.Value) = kFUNCTION) or (UpperCase(Token.Value) = kOPERATOR)) and
+         Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpEq) then
         Result := Memoize('FunctionResultAssign', @ParseFunctionResultAssign)
       else if (UpperCase(Token.Value) = kSUB) or (UpperCase(Token.Value) = kFUNCTION) or
          (UpperCase(Token.Value) = kCONSTRUCTOR) or (UpperCase(Token.Value) = kDESTRUCTOR) or
@@ -2542,7 +2546,14 @@ begin
     OpOwnerType := UpperCase(VarToStr(ParamList.GetChild(0).GetChild(0).Value));
     NameNode.Value := OpOwnerType + '.OPERATOR' + OpSym;
     if OpSymbolForm then
-      NameNode.Value := VarToStr(NameNode.Value) + '@' + IntToStr(ParamList.ChildCount);
+      NameNode.Value := VarToStr(NameNode.Value) + '@' + IntToStr(ParamList.ChildCount)
+    // The ITERATION operators are the named form's exception: FreeBASIC defines each of FOR/STEP/NEXT
+    // twice, once with the step variable and once without ("implicit step"), and a type routinely
+    // declares BOTH - examples/manual/udt/step-char-iterator does. One shared label would drop the
+    // second declaration in silence, exactly as it did for the symbol operators before they carried
+    // their arity. Counted WITHOUT the implicit THIS, so it reads as the source writes it.
+    else if (OpSym = kFOR) or (OpSym = kSTEP) or (OpSym = kNEXT) then
+      NameNode.Value := VarToStr(NameNode.Value) + '@' + IntToStr(ParamList.ChildCount - 1);
     Kind := kFUNCTION;
     Result.Value := kFUNCTION;
   end;
