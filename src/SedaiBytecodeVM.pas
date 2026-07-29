@@ -8131,6 +8131,44 @@ begin
     Result := 0;
 end;
 
+{ ASC(MID$(s, start, len)) fused, the compiled counterpart of the bcStrAscMid arm. Dialect-variant
+  for the same reason StrMid is: MODERN yields '' for a start below 1 and reads "rest of string" from
+  a negative length, CLASSIC clamps both. The run loop installs the right one per program, so the
+  emitted code stays dialect-blind.
+
+  ⚠️ Without these, the fused opcode fell to the GENERIC per-instruction helper - which flushes and
+  reloads the whole register pool - and since it sits in a per-character loop that was SLOWER than
+  leaving the region interpreted: reverse-complement's --aot went from faster than the interpreter to
+  1.2x slower. A new opcode is not finished until the native backends know it. }
+function AotStrAscMidModern(sVal: Pointer; start, ignored, cnt: PtrInt): PtrInt; cdecl;
+// ⚠️ 'ignored' exists so that START and LEN land in the 3rd and 4th ABI registers (r8, r9 on
+// Win64) instead of the 2nd (rdx). rdx CAN hold a pooled value, so writing it before reading the
+// other operand clobbered one - and that is exactly how the first version returned 0 for "s[i]".
+// r8 is the context register and therefore never pooled, so it is safe as a destination; r9 is
+// written last. Same argument that makes EmitStrMid safe. Do not 'clean up' this parameter.
+var
+  S: AnsiString;
+begin
+  Result := 0;
+  if start < 1 then Exit;                       // FB: below 1 is an empty substring, not char 1
+  S := AnsiString(sVal);
+  if cnt < 0 then cnt := Length(S) - start + 1; // negative length = the rest of the string
+  if (cnt <= 0) or (start > Length(S)) then Exit;
+  Result := Ord(S[start]);
+end;
+
+function AotStrAscMidClassic(sVal: Pointer; start, ignored, cnt: PtrInt): PtrInt; cdecl;
+var
+  S: AnsiString;
+begin
+  Result := 0;
+  if start < 1 then start := 1;                 // CLASSIC clamps the start
+  if cnt < 0 then cnt := 0;                     // ...and rejects a negative length
+  S := AnsiString(sVal);
+  if (cnt <= 0) or (start > Length(S)) then Exit;
+  Result := Ord(S[start]);
+end;
+
 procedure AotStrChr(dstSlot: Pointer; code: PtrInt); cdecl;
 begin
   AssignChar(PAnsiString(dstSlot)^, code and $FF);

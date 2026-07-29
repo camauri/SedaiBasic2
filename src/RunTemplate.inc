@@ -162,6 +162,10 @@ begin
     // StringData slot (see TAotCtx). Only ever called where an out-of-range index cannot raise.
     LocalAotCtx.ArrLoadStr := @AotArrLoadStr;
     LocalAotCtx.ArrStoreStr := @AotArrStoreStr;
+    if Assigned(FProgram) and FProgram.ModernMode then
+      LocalAotCtx.StrAscMid := @AotStrAscMidModern
+    else
+      LocalAotCtx.StrAscMid := @AotStrAscMidClassic;
   end
   else
     AotFuncs := nil;

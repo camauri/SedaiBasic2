@@ -79,6 +79,8 @@ type
     // emitted array access in BOTH backends.
     ArrLoadStr: Pointer;  // offset 176: @AotArrLoadStr  (dstSlot, VMSelf, arrIdx, idx)
     ArrStoreStr: Pointer; // offset 184: @AotArrStoreStr (VMSelf, arrIdx, srcVal, idx)
+    // ASC(MID$(...)) fused. Dialect-variant like StrMid, installed per program.
+    StrAscMid: Pointer;   // offset 192: @AotStrAscMid{Modern|Classic} (sVal, ignored, start, len) -> code
   end;
   PAotCtx = ^TAotCtx;
 
@@ -98,6 +100,7 @@ const
   AOTCTX_STRLEN    = 88;
   AOTCTX_ARRLOADSTR  = 176;
   AOTCTX_ARRSTORESTR = 184;
+  AOTCTX_STRASCMID   = 192;
   AOTCTX_CALLSUB   = 96;
   AOTCTX_STRLEFT   = 104;
   AOTCTX_STRRIGHT  = 112;
@@ -487,7 +490,7 @@ begin
     // primitive (copy/const-load/concat are managed assignments; len returns an int).
     ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
     // C5 residuals: byte-string substring/char/search primitives (W codepoint ops excluded).
-    ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrChr, ssaStrInstr,
+    ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr, ssaStrInstr,
     // Str() of an int and Val(): dialect-independent leaf primitives (float Str() stays on
     // the helper - it needs the console-behavior object).
     ssaIntToString, ssaStrVal, ssaStrValInt,
@@ -627,6 +630,8 @@ begin
     // C5 residuals (byte-string ops only; the W codepoint family stays on the helper).
     ssaStrLeft, ssaStrRight:
       Result := IsStr(Ins.Dest) and IsStr(Ins.Src1) and IsInt(Ins.Src2);
+    ssaStrAscMid:       Result := IsInt(Ins.Dest) and IsStr(Ins.Src1) and
+                                  IsInt(Ins.Src2) and IsInt(Ins.Src3);
     ssaStrMid:
       Result := IsStr(Ins.Dest) and IsStr(Ins.Src1) and IsInt(Ins.Src2) and IsInt(Ins.Src3);
     ssaStrAsc:          Result := IsInt(Ins.Dest) and IsStr(Ins.Src1);
@@ -660,7 +665,7 @@ begin
       Result := AotRecNative and (Ins.Src3.Kind = svkConstInt);
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
     ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
-    ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrChr, ssaStrInstr,
+    ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr, ssaStrInstr,
     ssaIntToString, ssaStrVal, ssaStrValInt:
       Result := AotStringNativeOK(Ins);
   end;
@@ -1311,6 +1316,22 @@ var
     if (Result < 0) and (CurBlkIdx >= Region.FirstBlock) and (CurBlkIdx <= Region.LastBlock) then
       AotDiagMemAccI := AotDiagMemAccI + BlockW[CurBlkIdx - Region.FirstBlock];
   end;
+  // ILoadArg is only valid BEFORE the sequence clobbers anything: SpillVolatiles writes the
+  // volatile-homed values to the bank but leaves ILoc pointing at the machine register, so ILoadArg
+  // still reads that register - and a leaf-call sequence typically overwrites rax (bank base) and
+  // rcx/rdx/r8/r9 (the ABI slots) on the way. Reading an operand after that gave the BANK BASE
+  // POINTER as an integer operand: "s[i]" answered 0 because its start arrived as 0x1_0004_2380.
+  //
+  // After a spill the truth is: a CALLEE-SAVED home still holds the value (nothing here touches
+  // those), everything else is authoritative in the bank. This variant asks that question, so the
+  // caller no longer has to get an ordering right that nothing checks.
+  procedure ILoadArgSpilled(argReg, vmreg: Integer);
+  var n: Integer;
+  begin
+    n := IAlloc(vmreg);
+    if (n >= 0) and GprIsCalleeSaved(n) then MovRR(argReg, n)
+    else MovLoad(argReg, RBX, LongWord(vmreg) * 8);
+  end;
   procedure ILoad(scr, vmreg: Integer);       // scratch (rax/rcx/rdx) := VM int reg
   var n: Integer;
   begin
@@ -1911,7 +1932,7 @@ var
   procedure EmitArrLoadStr(ArrayId, IdxReg, DstSlot: Integer);
   begin
     SpillVolatiles;
-    ILoadArg(ABI_ARG3, IdxReg);                              // arg3 = index, read FIRST (see above)
+    ILoadArgSpilled(ABI_ARG3, IdxReg);                       // arg3 = index (spill-safe read)
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);            // rax = string bank base
     Lea(ABI_ARG0, RAX, LongWord(DstSlot) * 8);               // arg0 = &StringRegs[dest]
     E.MemOp([$49, $8B], ABI_ARG1, R8, AOTCTX_VMSELF);        // arg1 = the TBytecodeVM
@@ -1926,7 +1947,7 @@ var
   procedure EmitArrStoreStr(ArrayId, IdxReg, SrcSlot: Integer);
   begin
     SpillVolatiles;
-    ILoadArg(ABI_ARG3, IdxReg);                              // arg3 = index, read FIRST
+    ILoadArgSpilled(ABI_ARG3, IdxReg);                       // arg3 = index (spill-safe read)
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);            // rax = string bank base
     E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);        // arg0 = the TBytecodeVM
     E.MemOp([$4D, $8B], R11, R8, AOTCTX_ARRSTORESTR);        // r11 = primitive (last ctx read)
@@ -1934,6 +1955,29 @@ var
     MovLoad(ABI_ARG2, RAX, LongWord(SrcSlot) * 8);           // arg2 = StringRegs[src] (clobbers ctx)
     E.EmitBytes([$41, $FF, $D3]);                            // call r11
     StrCallEpilogue;
+  end;
+
+  // IntRegs[dest] := Asc(Mid(StringRegs[src], start, len)) in one call, without building the
+  // substring. Same argument discipline as EmitStrMid: the string operand is read from the bank
+  // through rax, the primitive is fetched from the context BEFORE arg2 clobbers r8 on Win64, and
+  // the pooled arg3 is written last.
+  procedure EmitStrAscMid;
+  var d, s, st, ln: Integer;
+  begin
+    d := IReg(Cur.Dest); s := SReg(Cur.Src1);
+    st := IReg(Cur.Src2); ln := IReg(Cur.Src3); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);         // rax = string bank base
+    E.MemOp([$4D, $8B], R11, R8, AOTCTX_STRASCMID);       // r11 = primitive (last ctx read)
+    MovLoad(ABI_ARG0, RAX, LongWord(s) * 8);              // arg0 = StringRegs[src] (value)
+    // arg1 (rdx) is left ALONE and the primitive ignores it: rdx can hold a pooled value, and
+    // writing it before reading the other int operand is what returned 0 for "s[i]". The two ints
+    // go to r8 (never pooled - it is the ctx register) and r9 (written LAST), exactly as EmitStrMid.
+    ILoadArgSpilled(ABI_ARG1, st);                        // arg1 = start
+    ILoadArgSpilled(ABI_ARG3, ln);                        // arg3 = length
+    E.EmitBytes([$41, $FF, $D3]);                         // call r11
+    StrCallEpilogue;
+    IStore(d, RAX);                                       // the code comes back in rax
   end;
 
   procedure EmitStrAsc;    // IntRegs[dest] := code of StringRegs[src][1] (0 if empty)
@@ -3199,7 +3243,7 @@ var
           end;
           ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
           ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
-          ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrChr, ssaStrInstr,
+          ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr, ssaStrInstr,
           ssaIntToString, ssaStrVal, ssaStrValInt:
           begin
             // C5: a native leaf call to a string primitive. String operands stay in the bank
@@ -3219,6 +3263,8 @@ var
                   CountVal(Ins.Src2);                              // the length
                 ssaStrMid:
                   begin CountVal(Ins.Src2); CountVal(Ins.Src3); end;   // start + length
+                ssaStrAscMid:
+                  begin CountVal(Ins.Dest); CountVal(Ins.Src2); CountVal(Ins.Src3); end; // code + start + len
                 ssaStrChr:
                   CountVal(Ins.Src1);                              // the char code
                 ssaStrInstr:
@@ -4188,6 +4234,7 @@ var
       ssaStrLeft:  EmitStrSlice(AOTCTX_STRLEFT);
       ssaStrRight: EmitStrSlice(AOTCTX_STRRIGHT);
       ssaStrMid:   EmitStrMid;
+      ssaStrAscMid: EmitStrAscMid;
       ssaStrAsc:   EmitStrAsc;
       ssaStrChr:   EmitStrChr;
       ssaIntToString: EmitIntToStr;
