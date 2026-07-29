@@ -1447,6 +1447,26 @@ begin
   end;
 end;
 
+function TouchesStrReg(Ins: TSSAInstruction; Reg: Integer): Boolean;
+// Does this instruction read OR write string register Reg, in any field? Deliberately blunt: it
+// answers "leave this alone" for anything that so much as mentions the register, including PHI
+// sources. Being over-eager here only declines a fusion; being under-eager would move a write
+// across something that observes it.
+var
+  k: Integer;
+
+  function Hits(const V: TSSAValue): Boolean;
+  begin
+    Result := (V.Kind = svkRegister) and (V.RegType = srtString) and (V.RegIndex = Reg);
+  end;
+
+begin
+  Result := Hits(Ins.Dest) or Hits(Ins.Src1) or Hits(Ins.Src2) or Hits(Ins.Src3);
+  if Result then Exit;
+  for k := 0 to High(Ins.PhiSources) do
+    if Hits(Ins.PhiSources[k].Value) then Exit(True);
+end;
+
 function TSSAProgram.RunStringTempFusion: Integer;
 // Fuse "<string producer> T, ..." + "CopyString D, T" into "<string producer> D, ...".
 //
@@ -1472,9 +1492,10 @@ function TSSAProgram.RunStringTempFusion: Integer;
 // Counting defs as well as uses matters because PHI elimination has already broken single
 // assignment for the variables it lowered.
 var
-  b, i, k, T, D: Integer;
+  b, i, k, k2, T, D: Integer;
+  Ok: Boolean;
   Blk: TSSABasicBlock;
-  Prod, Cp: TSSAInstruction;
+  Prod, Cp, Mid: TSSAInstruction;
   DefCount, UseCount: array of Integer;
 
   procedure Bump(var Arr: array of Integer; const V: TSSAValue);
@@ -1517,36 +1538,58 @@ begin
     while i < Blk.Instructions.Count - 1 do
     begin
       Prod := TSSAInstruction(Blk.Instructions[i]);
-      Cp   := TSSAInstruction(Blk.Instructions[i + 1]);
-      if (Cp.OpCode = ssaCopyString) and
-         (Prod.Dest.Kind = svkRegister) and (Prod.Dest.RegType = srtString) and
-         (Cp.Src1.Kind = svkRegister) and (Cp.Src1.RegType = srtString) and
-         (Cp.Dest.Kind = svkRegister) and (Cp.Dest.RegType = srtString) and
-         (Cp.Src1.RegIndex = Prod.Dest.RegIndex) and
-         (Cp.Dest.RegIndex <> Prod.Dest.RegIndex) and
+      if (Prod.Dest.Kind = svkRegister) and (Prod.Dest.RegType = srtString) and
+         (Prod.Dest.RegIndex >= 0) and (Prod.Dest.RegIndex <= High(DefCount)) and
          (Prod.OpCode <> ssaCopyString) and
-         not (Prod.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString, ssaPhi]) then
+         not (Prod.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString, ssaPhi]) and
+         (DefCount[Prod.Dest.RegIndex] = 1) and (UseCount[Prod.Dest.RegIndex] = 1) then
       begin
         T := Prod.Dest.RegIndex;
-        D := Cp.Dest.RegIndex;
-        if (T >= 0) and (T <= High(DefCount)) and (D >= 0) and
-           (DefCount[T] = 1) and (UseCount[T] = 1) then
+        // Find the copy that consumes T. It does NOT have to be the next instruction: T has exactly
+        // one definition and one use, so nothing between can read or write it, and a basic block has
+        // no control flow inside it. Requiring adjacency was simply too strong -- reverse-complement
+        // puts "col += 1" and its test between the concatenation and the copy, and the whole benefit
+        // was lost for that shape.
+        k := -1;
+        for D := i + 1 to Blk.Instructions.Count - 1 do
         begin
-          Prod.Dest := Cp.Dest;
-          Blk.Instructions.Delete(i + 1);
-          Cp.Free;
-          Inc(Result);
-          Continue;                 // the instruction now at i+1 is new: re-test this position
+          Cp := TSSAInstruction(Blk.Instructions[D]);
+          if (Cp.OpCode = ssaCopyString) and (Cp.Src1.Kind = svkRegister) and
+             (Cp.Src1.RegType = srtString) and (Cp.Src1.RegIndex = T) then
+          begin
+            k := D;
+            Break;
+          end;
+        end;
+        if k > i then
+        begin
+          Cp := TSSAInstruction(Blk.Instructions[k]);
+          if (Cp.Dest.Kind = svkRegister) and (Cp.Dest.RegType = srtString) and
+             (Cp.Dest.RegIndex >= 0) and (Cp.Dest.RegIndex <> T) then
+          begin
+            D := Cp.Dest.RegIndex;
+            // What DOES have to hold: nothing between may touch the DESTINATION. Writing D earlier
+            // than the copy did would be observed by an intervening read of D, and would be undone
+            // by an intervening write to it.
+            Ok := True;
+            for k2 := i + 1 to k - 1 do
+            begin
+              Mid := TSSAInstruction(Blk.Instructions[k2]);
+              if TouchesStrReg(Mid, D) then begin Ok := False; Break; end;
+            end;
+            if Ok then
+            begin
+              Prod.Dest := Cp.Dest;
+              Blk.Instructions.Delete(k);
+              Cp.Free;
+              Inc(Result);
+            end;
+          end;
         end;
       end;
       Inc(i);
     end;
   end;
-  // STRFUSE_DIAG=1 reports what the pass actually did. There are three SSA pipelines and each wraps
-  // its passes in "try ... except end", so "it silently did nothing" and "it raised" look identical
-  // from outside. Reporting from INSIDE the pass covers all three at once.
-  if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
-    WriteLn(ErrOutput, '[StrFuse] ', Result, ' pair(s) fused; string regs=', FNextRegister[srtString]);
 end;
 
 procedure TSSAProgram.RunPhiElimination;
