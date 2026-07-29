@@ -53,6 +53,9 @@ type
     StringData: array of string;
   end;
   PRecordStorage = ^TRecordStorage;   // M5.2c: stable pointer to a record (per-thread or shared region)
+  // The shared region's index -> record table. Named so an outgrown copy can be RETIRED (kept alive)
+  // rather than freed: that is what lets a handle lookup run without taking the region's lock.
+  TSharedRecArray = array of PRecordStorage;
 
   { One call frame's bookkeeping, pushed by FramePush and read back by FramePop. 32 bytes, so two
     frames share a cache line - see the FrameMarks field for why this is one record and not the

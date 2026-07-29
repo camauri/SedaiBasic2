@@ -148,11 +148,18 @@ type
     // thread's per-context heap, so any thread routes field access to the same instance. Each entry is a
     // separately heap-allocated record (stable pointer → a handle stays valid when the outer array grows).
     // A handle with SHARED_REC_FLAG set indexes here; otherwise it indexes the active context's heap.
-    FSharedRecords: array of PRecordStorage;
+    FSharedRecords: TSharedRecArray;
     FSharedRecordCount: Integer;
     FSharedRecFreeList: array of Integer;  // DELETE: indices of freed shared records, reused by NEW
     FSharedRecFreeCount: Integer;
     FSharedRecLock: TRTLCriticalSection;
+    // Every pointer array this table ever OUTGREW, kept alive until the program is unloaded.
+    // Growing used to be SetLength, which reallocates: a reader holding the old base could have it
+    // freed underneath, and THAT is the only reason looking a handle up ever needed the lock. Retiring
+    // the old array instead of freeing it makes the lookup safe without one — a live handle's entry is
+    // present and valid in every array from the one current when it was issued onwards.
+    FSharedRetired: array of TSharedRecArray;
+    FSharedRecLockFree: Boolean;   // gate: SHAREDREC_LOCK=1 restores the per-access lock (A/B)
     // FreeBASIC raw memory (Allocate/Deallocate/...): a VM-internal byte heap. A raw pointer is a byte
     // OFFSET into FRawHeap (tagged with RAWPTR_TAG so it is distinct from managed FArrays/record
     // pointers). Each block carries an 8-byte size header just below the returned offset; freed blocks
@@ -480,6 +487,7 @@ type
     procedure CleanupConds;     // free any surviving condition variables (destructor)
     function AllocRecord(Ctx: TExecutionContext; IntC, FloatC, StrC, TypeId: Integer): Integer;  // M3: new record instance -> handle
     // M5.2c: allocate in the shared region (cross-thread); ResolveRec routes a handle to its record.
+    procedure GrowSharedRecords(NeedLen: Integer);
     function AllocSharedRecord(IntC, FloatC, StrC, TypeId: Integer): Int64;
     function AllocSharedRecordBlock(N, IntC, FloatC, StrC, TypeId: Integer): Int64;  // N consecutive shared records (Callocate block)
     procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
@@ -948,6 +956,10 @@ begin
   InitCriticalSection(FCondTableLock);
   SetLength(FSharedRecords, 0);
   FSharedRecordCount := 0;
+  SetLength(FSharedRetired, 0);
+  // Default ON. SHAREDREC_LOCK=1 puts the per-access lock back, so the two can be timed against each
+  // other on ONE binary instead of two builds (see ab-needs-a-built-baseline).
+  FSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
   InitCriticalSection(FSharedRecLock);
   InitCriticalSection(FRawHeapLock);
   FRawHeapTop := 0;
@@ -3233,6 +3245,33 @@ begin
   Inc(Ctx.RecordCount);
 end;
 
+procedure TBytecodeVM.GrowSharedRecords(NeedLen: Integer);
+// Grow the shared region's index -> record table WITHOUT ever freeing the array a reader might be
+// holding. SetLength would reallocate and release the old block; a lock-free ResolveRec running on
+// another thread could then dereference freed memory. So: allocate a new array, copy, and RETIRE the
+// old one (kept alive until the program is unloaded) instead of letting it go.
+//
+// Geometric growth, so the retired copies total about the same as the final table - a few hundred KB
+// for a program allocating millions of records, paid once. Callers hold FSharedRecLock: only the
+// LOOKUP is lock-free, growth is still serialised.
+var
+  NewArr: TSharedRecArray;
+  i, NewLen, n: Integer;
+begin
+  NewLen := NeedLen * 2;
+  if NewLen < 64 then NewLen := 64;
+  SetLength(NewArr, NewLen);
+  for i := 0 to Length(FSharedRecords) - 1 do
+    NewArr[i] := FSharedRecords[i];
+  if Length(FSharedRecords) > 0 then
+  begin
+    n := Length(FSharedRetired);
+    SetLength(FSharedRetired, n + 1);
+    FSharedRetired[n] := FSharedRecords;   // keep the old block alive; never freed while loaded
+  end;
+  FSharedRecords := NewArr;
+end;
+
 function TBytecodeVM.AllocSharedRecord(IntC, FloatC, StrC, TypeId: Integer): Int64;
 // M5.2c: allocate a record in the cross-thread shared region and return a SHARED_REC_FLAG-tagged
 // handle. Each record is its own heap block (stable pointer), so a handle survives the outer array
@@ -3258,7 +3297,7 @@ begin
     begin
       Idx := FSharedRecordCount;
       if Idx >= Length(FSharedRecords) then
-        SetLength(FSharedRecords, (Idx + 1) * 2);
+        GrowSharedRecords(Idx + 1);
       Inc(FSharedRecordCount);
     end;
     FSharedRecords[Idx] := R;
@@ -3299,9 +3338,24 @@ function TBytecodeVM.ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordS
 begin
   if (Handle and SHARED_REC_FLAG) <> 0 then
   begin
-    EnterCriticalSection(FSharedRecLock);
-    Result := FSharedRecords[Handle and SHARED_REC_MASK];
-    LeaveCriticalSection(FSharedRecLock);
+    // Lock-free by default. The lock here never protected the RECORD (its pointer is stable and field
+    // access was already outside the lock) - only the pointer ARRAY, which SetLength could reallocate
+    // and free under a reader. GrowSharedRecords retires the old array instead of freeing it, so this
+    // read is always into live memory, and the entry for a live handle is valid in every array from
+    // the one current when the handle was issued onwards.
+    //
+    // It is worth what it costs to reason about: this runs on EVERY field access of a shared record,
+    // not just on New/Delete. Walking a tree of N nodes takes the region lock ~8 times per node
+    // against 2 for allocating and freeing it, so the per-access lock was ~80% of the traffic, and
+    // with several worker threads it was contended traffic.
+    if FSharedRecLockFree then
+      Result := FSharedRecords[Handle and SHARED_REC_MASK]
+    else
+    begin
+      EnterCriticalSection(FSharedRecLock);
+      Result := FSharedRecords[Handle and SHARED_REC_MASK];
+      LeaveCriticalSection(FSharedRecLock);
+    end;
   end
   else
     Result := @Ctx.Records[Handle];
@@ -3330,6 +3384,10 @@ begin
   FSharedRecordCount := 0;
   SetLength(FSharedRecFreeList, 0);
   FSharedRecFreeCount := 0;
+  // The retired pointer arrays hold no records of their own (every live record was disposed through
+  // the current table above) - they were kept alive only so a lock-free lookup could never read freed
+  // memory. Nothing can be looking any more, so release them.
+  SetLength(FSharedRetired, 0);
 end;
 
 // ===== FreeBASIC raw byte heap =====
@@ -4030,7 +4088,7 @@ begin
       SetLength(R^.FloatData, FloatC);
       SetLength(R^.StringData, StrC);
       if FSharedRecordCount >= Length(FSharedRecords) then
-        SetLength(FSharedRecords, (FSharedRecordCount + 1) * 2);
+        GrowSharedRecords(FSharedRecordCount + 1);
       FSharedRecords[FSharedRecordCount] := R;
       Inc(FSharedRecordCount);
     end;
