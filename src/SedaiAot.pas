@@ -4565,6 +4565,16 @@ begin
   n := 0;
   // Whole-program gate for the native SHARED-record path: without a second thread nothing can grow
   // the shared-pointer array while compiled code indexes it, so the VM's lock is not needed there.
+  //
+  // ⛔ MEASURED AND REJECTED (29 Jul 2026): lifting this gate is worth ZERO, do not retry it blind.
+  // Once the VM stopped freeing the outgrown pointer array the gate's original reason was gone, so
+  // the obvious next step was to drop it and let compiled code index the shared region even with
+  // threads about. On binary-trees -- whose MAKETREE/CHECKTREE/FREETREE regions ARE native, so the
+  // gate really did apply -- it measured -1.6% against a 1.2% null floor. Nothing.
+  // The reason is that removing the per-access LOCK (see ResolveRec) already made the deopt cheap:
+  // what dominates binary-trees now is AllocSharedRecord, four mallocs and a global lock per node.
+  // Revisit only once allocation is fixed and the benchmark is traversal-bound again -- and measure
+  // it then, because it buys cross-thread exposure in compiled code that nothing currently pays for.
   GNoThreads := True;
   for r := 0 to SSAProg.Blocks.Count - 1 do
   begin
