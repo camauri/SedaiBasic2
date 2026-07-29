@@ -1716,7 +1716,8 @@ begin
     // Slices the SSA program into function regions and reports which are compilable
     // with the B1 scalar set (stderr). No codegen yet; gated by the env var.
     if GetEnvironmentVariable('AOT_DIAG') = '1' then
-      AotSurvey(SSAProgram, BytecodeProgram);
+      AotSurvey(SSAProgram, BytecodeProgram,
+                BytecodeProgram.ModernMode and not OptBoundsCheck);  // same gate the compiler uses
 
     // === DISASSEMBLY (Optional) ===
     if OptDisasm then

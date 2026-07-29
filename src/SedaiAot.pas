@@ -73,6 +73,12 @@ type
     StrIntToStr: Pointer; // offset 152: @AotIntToString (dstSlot, v)
     StrVal: Pointer;      // offset 160: @AotStrVal (sVal) -> Double (xmm0)
     StrValInt: Pointer;   // offset 168: @AotStrValInt (sVal) -> Int64
+    // A STRING array element is managed, so it is reached through a primitive rather than by
+    // address: the descriptor in ArrDesc has no StringData slot (its four Int64 are IntData,
+    // FloatData, Count, LBound) and widening it would change the *32 stride baked into every
+    // emitted array access in BOTH backends.
+    ArrLoadStr: Pointer;  // offset 176: @AotArrLoadStr  (dstSlot, VMSelf, arrIdx, idx)
+    ArrStoreStr: Pointer; // offset 184: @AotArrStoreStr (VMSelf, arrIdx, srcVal, idx)
   end;
   PAotCtx = ^TAotCtx;
 
@@ -90,6 +96,8 @@ const
   AOTCTX_STRLOADCONST = 72;
   AOTCTX_STRCONCAT = 80;
   AOTCTX_STRLEN    = 88;
+  AOTCTX_ARRLOADSTR  = 176;
+  AOTCTX_ARRSTORESTR = 184;
   AOTCTX_CALLSUB   = 96;
   AOTCTX_STRLEFT   = 104;
   AOTCTX_STRRIGHT  = 112;
@@ -167,7 +175,7 @@ type
 function AotSliceAndClassify(SSAProg: TSSAProgram; Prog: TBytecodeProgram): TAotRegions;
 
 // AOT_DIAG=1 printout: per-region verdict + summary + map cross-check warnings.
-procedure AotSurvey(SSAProg: TSSAProgram; Prog: TBytecodeProgram);
+procedure AotSurvey(SSAProg: TSSAProgram; Prog: TBytecodeProgram; AllowUnsafe: Boolean);
 
 // Diagnostics from the last region compiled (liveness, C1). Not thread-safe; reporting only.
 var
@@ -307,6 +315,12 @@ var
   GSharedRecOff: Integer = 0;
   GRecNativeState: Integer = -1;   // -1 unread, 0 off, 1 on
   GNoThreads: Boolean = False;     // program creates no thread: the shared region cannot grow under us
+  // A STRING array element can be reached natively (through AotStrAssign) only when an
+  // out-of-range index cannot RAISE: the helper would throw across a compiled frame that is not
+  // registered for unwinding. That is exactly AllowUnsafe (MODERN, no forced bounds check), which
+  // is also what ArrClassic is derived from - so the classifier, the prescan and the emitter all
+  // read THIS, and cannot disagree about which instructions are native.
+  GArrStrNative: Boolean = False;
 
 procedure AotSetRecordLayout(RecordsOff, RecSize, RecIntOff, RecFloatOff, SharedRecOff: Integer);
 begin
@@ -572,8 +586,14 @@ begin
   Result := False;
   if (Ins.Src1.Kind <> svkArrayRef) or (Ins.Src1.ArrayIndex < 0) or
      (Ins.Src1.ArrayIndex >= SSAProg.GetArrayCount) then Exit;
+  // A string element is MANAGED: the assignment has to go through AotStrAssign for the refcount,
+  // which is fine (the same primitive every native string op uses) - but only where an
+  // out-of-range index cannot raise. Before this, ONE such access took the whole region down, and
+  // since a "Dim Shared" scalar is array-backed, a single shared string variable was enough to
+  // leave a program entirely interpreted: 7 of the CLBG regions bailed here.
   if ((Ins.OpCode = ssaArrayLoad) or (Ins.OpCode = ssaArrayStore)) and
-     (SSAProg.GetArray(Ins.Src1.ArrayIndex).ElementType = srtString) then Exit;
+     (SSAProg.GetArray(Ins.Src1.ArrayIndex).ElementType = srtString) and
+     not (GArrStrNative or Ins.BoundsSafe) then Exit;
   // ⚠️ ONE DIMENSION ONLY. The descriptor carries the element COUNT, not per-dimension
   // extents, so the bound lowering computes UBound = LBound + Count - 1 - true for a vector,
   // nonsense for a matrix (DIM m(3,4) would answer 19 instead of 3).
@@ -834,12 +854,16 @@ begin
   Result := Regions;
 end;
 
-procedure AotSurvey(SSAProg: TSSAProgram; Prog: TBytecodeProgram);
+procedure AotSurvey(SSAProg: TSSAProgram; Prog: TBytecodeProgram; AllowUnsafe: Boolean);
 var
   Regions: TAotRegions;
   r, NElig, NB3: Integer;
   ProcAtEntry: string;
 begin
+  // The survey runs BEFORE the real compilation, so it has to set the same gate the compiler will;
+  // otherwise AOT_DIAG reports an eligibility nobody actually gets. A diagnostic that disagrees with
+  // reality is worse than none - it cost an afternoon earlier today.
+  GArrStrNative := AllowUnsafe;
   Regions := AotSliceAndClassify(SSAProg, Prog);
   NElig := 0; NB3 := 0;
   for r := 0 to High(Regions) do
@@ -1872,6 +1896,46 @@ var
     E.EmitBytes([$FF, $D0]);
     StrCallEpilogue;
   end;
+  // A managed STRING array element, through the ctx primitives. Two ordering constraints, both
+  // learned from the string emitters above: on Win64 ABI_ARG2 IS r8, the context register, so
+  // everything read out of the context must be read BEFORE arg2 is written; and ABI_ARG3 is r9,
+  // which lives in the allocation pool, so it is written LAST.
+  // ⛔ ORDER IS THE WHOLE PROBLEM HERE, and getting it wrong miscompiled silently: the array
+  // initializer "{ "a","c",... }" lost exactly one element, so fasta dropped every 'c'.
+  // The rule that makes it safe: read the INDEX FIRST, while every pooled register still holds what
+  // the allocator says it holds. ILoadArg may copy from a pooled machine register, and my earlier
+  // version wrote arg1 (rdx) and arg2 (r8) BEFORE reading it - so an index living in one of those
+  // was read back as the array id. Reading it first means nothing written afterwards can matter:
+  // everything else comes either from the context (r8, read before it is overwritten last) or from
+  // the string bank base in rax, and neither is in the allocation pool.
+  procedure EmitArrLoadStr(ArrayId, IdxReg, DstSlot: Integer);
+  begin
+    SpillVolatiles;
+    ILoadArg(ABI_ARG3, IdxReg);                              // arg3 = index, read FIRST (see above)
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);            // rax = string bank base
+    Lea(ABI_ARG0, RAX, LongWord(DstSlot) * 8);               // arg0 = &StringRegs[dest]
+    E.MemOp([$49, $8B], ABI_ARG1, R8, AOTCTX_VMSELF);        // arg1 = the TBytecodeVM
+    E.MemOp([$4D, $8B], R11, R8, AOTCTX_ARRLOADSTR);         // r11 = primitive (last ctx read)
+    MovImm64(ABI_ARG2, ArrayId);                             // arg2 = array id (clobbers r8/ctx LAST)
+    E.EmitBytes([$41, $FF, $D3]);                            // call r11
+    StrCallEpilogue;
+  end;
+
+  // Signature deliberately (VMSelf, arrIdx, srcVal, idx): the index is the LAST argument so it can
+  // be the FIRST thing loaded, into r9, without anything else needing to be in place yet.
+  procedure EmitArrStoreStr(ArrayId, IdxReg, SrcSlot: Integer);
+  begin
+    SpillVolatiles;
+    ILoadArg(ABI_ARG3, IdxReg);                              // arg3 = index, read FIRST
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);            // rax = string bank base
+    E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);        // arg0 = the TBytecodeVM
+    E.MemOp([$4D, $8B], R11, R8, AOTCTX_ARRSTORESTR);        // r11 = primitive (last ctx read)
+    MovImm64(ABI_ARG1, ArrayId);                             // arg1 = array id
+    MovLoad(ABI_ARG2, RAX, LongWord(SrcSlot) * 8);           // arg2 = StringRegs[src] (clobbers ctx)
+    E.EmitBytes([$41, $FF, $D3]);                            // call r11
+    StrCallEpilogue;
+  end;
+
   procedure EmitStrAsc;    // IntRegs[dest] := code of StringRegs[src][1] (0 if empty)
   var d, s: Integer;
   begin
@@ -3086,7 +3150,20 @@ var
                 HasDeopt := True;
                 if Prog.GetSsaPc(o) < 0 then Fail('no-pc-arr');
               end;
-              CountVal(Ins.Dest); CountVal(Ins.Src2);
+              // A STRING element is reached through a ctx primitive, exactly like the string
+              // leaf ops below: the string operand stays in the bank and must NOT be counted
+              // (CountVal rejects string registers outright, which is what made the whole
+              // region bail with 'string-operand' the first time this path was opened). The
+              // call needs a call-ready frame but always completes natively - no deopt hazard.
+              if SSAProg.GetArray(Ins.Src1.ArrayIndex).ElementType = srtString then
+              begin
+                HasHelperCall := True;
+                CountVal(Ins.Src2);                    // the index only
+              end
+              else
+              begin
+                CountVal(Ins.Dest); CountVal(Ins.Src2);
+              end;
               if Ins.Src1.ArrayIndex > MaxArrId then MaxArrId := Ins.Src1.ArrayIndex;
               if Ins.Src1.ArrayIndex >= Length(AUse) then
               begin
@@ -4193,7 +4270,9 @@ var
         apc := -1;
         // B4: a proven-safe access needs no deopt PC even under CLASSIC (the guard is elided).
         if ArrClassic and not Cur.BoundsSafe then begin apc := NeedPC; if not OK then Exit; end;
-        if SSAProg.GetArray(d).ElementType = srtFloat then
+        if SSAProg.GetArray(d).ElementType = srtString then
+          EmitArrLoadStr(d, IReg(Cur.Src2), SReg(Cur.Dest))
+        else if SSAProg.GetArray(d).ElementType = srtFloat then
           AotArrAccess(True, False, d, IReg(Cur.Src2), FReg(Cur.Dest), apc, Cur.BoundsSafe)
         else
           AotArrAccess(False, False, d, IReg(Cur.Src2), IReg(Cur.Dest), apc, Cur.BoundsSafe);
@@ -4203,7 +4282,9 @@ var
         d := ArrId; if not OK then Exit;
         apc := -1;
         if ArrClassic and not Cur.BoundsSafe then begin apc := NeedPC; if not OK then Exit; end;
-        if SSAProg.GetArray(d).ElementType = srtFloat then
+        if SSAProg.GetArray(d).ElementType = srtString then
+          EmitArrStoreStr(d, IReg(Cur.Src2), SReg(Cur.Dest))
+        else if SSAProg.GetArray(d).ElementType = srtFloat then
           AotArrAccess(True, True, d, IReg(Cur.Src2), FReg(Cur.Dest), apc, Cur.BoundsSafe)
         else
           AotArrAccess(False, True, d, IReg(Cur.Src2), IReg(Cur.Dest), apc, Cur.BoundsSafe);
@@ -4586,6 +4667,10 @@ begin
       end;
     if not GNoThreads then Break;
   end;
+  // Must be set BEFORE AotSliceAndClassify: the classifier reads it through AotArrayNativeOK, and
+  // the emitter reads the same global later. If the two saw different values a region would be
+  // accepted and then fail at emit time.
+  GArrStrNative := AllowUnsafe;
   n := 0;
   Regions := AotSliceAndClassify(SSAProg, Prog);
   SetLength(Result, Length(Regions));

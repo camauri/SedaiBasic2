@@ -7940,6 +7940,39 @@ begin
   PAnsiString(dstSlot)^ := AnsiString(srcVal);
 end;
 
+procedure AotArrLoadStr(dstSlot, VMSelf: Pointer; ArrIdx, Idx: PtrInt); cdecl;
+// StringRegs[dest] := FArrays[ArrIdx].StringData[Idx], the EXACT expression of the interpreter's
+// inline bcArrayLoadString arm - out of range yields '', as it does there. The two must agree; the
+// differential interp-vs-aot net (aot_validate) is what guards the pair.
+//
+// A string element is MANAGED, so the assignment goes through the same refcounted path every native
+// string op uses. Only ever reached where an out-of-range index cannot RAISE (GArrStrNative), because
+// an exception thrown here would unwind through a compiled frame that is not registered for it.
+var
+  VM: TBytecodeVM;
+begin
+  VM := TBytecodeVM(VMSelf);
+  if (Idx >= 0) and (Idx < VM.FArrays[ArrIdx].TotalSize) then
+    PAnsiString(dstSlot)^ := VM.FArrays[ArrIdx].StringData[Idx]
+  else
+    PAnsiString(dstSlot)^ := '';
+end;
+
+procedure AotArrStoreStr(VMSelf: Pointer; ArrIdx: PtrInt; srcVal: Pointer; Idx: PtrInt); cdecl;
+// FArrays[ArrIdx].StringData[Idx] := StringRegs[src], mirroring the interpreter's inline
+// bcArrayStoreString arm: an out-of-range store is DROPPED there, so it is dropped here.
+//
+// The INDEX is the last parameter on purpose: it lets the emitter load it into the last ABI
+// register before touching anything else, which is what keeps a pooled index from being clobbered
+// (see EmitArrStoreStr - getting this order wrong lost one array element and nothing complained).
+var
+  VM: TBytecodeVM;
+begin
+  VM := TBytecodeVM(VMSelf);
+  if (Idx >= 0) and (Idx < VM.FArrays[ArrIdx].TotalSize) then
+    VM.FArrays[ArrIdx].StringData[Idx] := AnsiString(srcVal);
+end;
+
 procedure AotStrLoadConst(dstSlot, VMSelf: Pointer; imm: PtrInt); cdecl;
 var VM: TBytecodeVM;
 begin

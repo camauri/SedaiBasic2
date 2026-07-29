@@ -158,6 +158,10 @@ begin
     LocalAotCtx.StrIntToStr := @AotIntToString;
     LocalAotCtx.StrVal := @AotStrVal;
     LocalAotCtx.StrValInt := @AotStrValInt;
+    // Managed STRING array element: reached through a primitive because the array descriptor has no
+    // StringData slot (see TAotCtx). Only ever called where an out-of-range index cannot raise.
+    LocalAotCtx.ArrLoadStr := @AotArrLoadStr;
+    LocalAotCtx.ArrStoreStr := @AotArrStoreStr;
   end
   else
     AotFuncs := nil;
