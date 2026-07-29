@@ -8065,6 +8065,8 @@ var
   EllipCount: Integer;     // FB ellipsis "lb TO ...": element count taken from the initializer list
   FixLenCap: Integer;      // "DIM s AS STRING * n": declared capacity (0 = variable-length)
   ScalarCtorInit: Boolean; // "DIM v AS T = <non-T expr>": an implicit conversion via a 1-arg constructor
+  HasScalarInit: Boolean;  // the declaration carries "= expr" (so no implicit zero is needed)
+  ZeroDest: TSSAValue;     // destination of the implicit zero for an uninitialised builtin scalar
   CtorArgs: TASTNode;      // synthesized single-argument list wrapping that initializer
 const
   MAX_ARRAY_ELEMENTS = 125000000;  // 125M elements max (~1GB for 500x500x500 matrix)
@@ -8291,6 +8293,11 @@ begin
         Continue;
       end;
       ScalarCtorInit := False;   // set only in the UDT branch below; keep the builtin path deterministic
+      // Does this declaration carry its own initializer? Same test the initializer store below uses, read
+      // once here so the builtin-scalar path can tell "Dim x As Integer" (needs the implicit zero) from
+      // "Dim x As Integer = e" (the store IS the initialisation, and a zero before it would be dead).
+      HasScalarInit := (ArrayDeclNode.ChildCount >= 3) and
+                       (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList);
       RecUDTIdx := FindUDT(RecTypeName);
       if RecUDTIdx >= 0 then
       begin
@@ -8367,7 +8374,33 @@ begin
           // full capacity, so LEN is n and PRINT emits all n bytes before anything is ever assigned.
           FixLenCap := StrToIntDef(FFixedLenVars.Values[UpperCase(ArrName)], 0);
           if (FixLenCap > 0) and not IsSharedScalar(UpperCase(ArrName)) and not IsAddrLocal(UpperCase(ArrName)) then
-            EmitFixedLenInit(GetOrAllocateVariable(UpperCase(ArrName)), FixLenCap, IsWStringVar(ArrName));
+            EmitFixedLenInit(GetOrAllocateVariable(UpperCase(ArrName)), FixLenCap, IsWStringVar(ArrName))
+          // A local declared WITHOUT an initializer is zero in FreeBASIC, and it must be zero again on
+          // EVERY entry. Nothing used to emit that: the value was simply whatever the register held, which
+          // reads as 0 only the first time a FRESH register is used. So "Dim As Integer acc" followed by
+          // "acc = acc + 1" in a loop kept the PREVIOUS call's total -- silently, and wrongly.
+          // It stayed hidden because a non-inlined callee usually got a register nobody else wrote; the
+          // SUB INLINER made it visible by mapping the callee's registers into the caller's space, where
+          // an enclosing loop reuses them. The inliner was the messenger, not the cause: it runs as a
+          // unification pass BEFORE everything, so --no-opt inlines too and the OPTDIFF net -- which only
+          // compares opt against --no-opt -- is blind to the whole class.
+          // STATIC is excluded: in FreeBASIC it keeps its value across calls, which is the opposite rule.
+          else if FModernMode and (FixLenCap = 0) and (not HasScalarInit) and
+                  (ArrayDeclNode.Attributes.Values['STATIC'] <> '1') and
+                  not IsSharedScalar(UpperCase(ArrName)) and not IsAddrLocal(UpperCase(ArrName)) and
+                  not IsRefVar(UpperCase(ArrName)) then
+          begin
+            ZeroDest := GetOrAllocateVariable(UpperCase(ArrName));
+            case TypeNameToBank(RecTypeName, UpperCase(ArrName)) of
+              srtFloat:  EmitInstruction(ssaLoadConstFloat, ZeroDest, MakeSSAConstFloat(0),
+                                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              srtString: EmitInstruction(ssaLoadConstString, ZeroDest, MakeSSAConstString(''),
+                                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            else
+              EmitInstruction(ssaLoadConstInt, ZeroDest, MakeSSAConstInt(0),
+                              MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            end;
+          end;
         end;
       // M4.4e: general initializer "DIM v AS T = expr" — child[2] is the init expression (not the
       // ctor-args antArgumentList). After allocation/construction, assign it: a scalar store, or a
