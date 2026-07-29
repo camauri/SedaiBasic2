@@ -155,6 +155,8 @@ type
     ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,
     ssaStrConcat, ssaStrLen, ssaStrLeft, ssaStrRight, ssaStrMid,
     ssaStrAsc, ssaStrChr, ssaStrStr, ssaStrVal, ssaStrHex, ssaStrInstr, ssaStrErr,
+    // Asc(Mid(s, start, len)) without building the substring - see bcStrAscMid.
+    ssaStrAscMid,
     // FreeBASIC string functions (B1.2): single string arg -> string result.
     ssaStrLTrim, ssaStrRTrim, ssaStrTrim, ssaStrUCase, ssaStrLCase,
     ssaStrInstrRev,   // INSTRREV(s, sub) -> int (last occurrence)
@@ -613,6 +615,7 @@ type
     function RunRangeAnalysis: Integer;  // B4: prove array accesses in-bounds, set BoundsSafe (AFTER DCE, BEFORE PHI elimination - needs the PHIs)
     procedure RunPhiElimination;  // FINAL PASS: Convert PHI functions to copy instructions (BEFORE bytecode compilation)
     function RunStringTempFusion: Integer;  // write string results straight into their destination
+    function RunAscMidFusion: Integer;      // Asc(Mid(s,i,n)) without building the substring
     function RunGVN: Integer;  // PHASE 3 TIER 2: Run Global Value Numbering optimization (returns replacements count)
     function RunCSE: Integer;  // Common subexpression elimination (returns eliminated count)
     function RunCopyProp: Integer;  // Copy propagation (returns replacement count)
@@ -1447,6 +1450,13 @@ begin
   end;
 end;
 
+function WritesSSAReg(Ins: TSSAInstruction; RT: TSSARegisterType; Reg: Integer): Boolean;
+// Does this instruction WRITE that register? Dest is the write field; the store family also reads
+// Dest, but for "is the value still the one the Mid saw" a write is what matters.
+begin
+  Result := (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = RT) and (Ins.Dest.RegIndex = Reg);
+end;
+
 function TouchesStrReg(Ins: TSSAInstruction; Reg: Integer): Boolean;
 // Does this instruction read OR write string register Reg, in any field? Deliberately blunt: it
 // answers "leave this alone" for anything that so much as mentions the register, including PHI
@@ -1465,6 +1475,128 @@ begin
   if Result then Exit;
   for k := 0 to High(Ins.PhiSources) do
     if Hits(Ins.PhiSources[k].Value) then Exit(True);
+end;
+
+function TSSAProgram.RunAscMidFusion: Integer;
+// Rewrite "T = Mid(s, start, len)" + "D = Asc(T)" into the single "D = AscMid(s, start, len)".
+//
+// Reading ONE character was allocating a one-character string to hold it, and measurement says the
+// allocation is the whole cost of a string primitive here: Mid of 1 char and Mid of 128 cost the
+// same. It is the hot loop of reverse-complement ("Asc(Mid(s, i, 1))") and of k-nucleotide, and
+// FreeBASIC's own "s[i]" lowers to exactly this pair too, so both forms gain.
+//
+// Same safety rule as the temp fusion: the substring must have ONE definition and ONE use, so
+// nothing else can observe it, and both must be in the same block with nothing touching the
+// destination in between. bcStrAscMid takes bcStrMid's operands unchanged - the answer is the FIRST
+// byte of the substring, so the length still matters (it decides whether the substring is empty)
+// and no assumption that it equals 1 is needed.
+var
+  b, i, k, k2, T, NUses, Last: Integer;
+  Ok, AllAsc: Boolean;
+  Blk: TSSABasicBlock;
+  Prod, Cons, Mid: TSSAInstruction;
+  DefCount, UseCount: array of Integer;
+
+  procedure Bump(var Arr: array of Integer; const V: TSSAValue);
+  begin
+    if (V.Kind = svkRegister) and (V.RegType = srtString) and
+       (V.RegIndex >= 0) and (V.RegIndex <= High(Arr)) then
+      Inc(Arr[V.RegIndex]);
+  end;
+
+begin
+  Result := 0;
+  SetLength(DefCount, FNextRegister[srtString] + 1);
+  SetLength(UseCount, FNextRegister[srtString] + 1);
+  for i := 0 to High(DefCount) do begin DefCount[i] := 0; UseCount[i] := 0; end;
+  for b := 0 to Blocks.Count - 1 do
+  begin
+    Blk := TSSABasicBlock(Blocks[b]);
+    for i := 0 to Blk.Instructions.Count - 1 do
+    begin
+      Prod := TSSAInstruction(Blk.Instructions[i]);
+      Bump(DefCount, Prod.Dest);
+      Bump(UseCount, Prod.Src1);
+      Bump(UseCount, Prod.Src2);
+      Bump(UseCount, Prod.Src3);
+      for k := 0 to High(Prod.PhiSources) do
+        Bump(UseCount, Prod.PhiSources[k].Value);
+      if Prod.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString] then
+        Bump(UseCount, Prod.Dest);
+    end;
+  end;
+
+  for b := 0 to Blocks.Count - 1 do
+  begin
+    Blk := TSSABasicBlock(Blocks[b]);
+    i := 0;
+    while i < Blk.Instructions.Count - 1 do
+    begin
+      Prod := TSSAInstruction(Blk.Instructions[i]);
+      if (Prod.OpCode = ssaStrMid) and
+         (Prod.Dest.Kind = svkRegister) and (Prod.Dest.RegType = srtString) and
+         (Prod.Dest.RegIndex >= 0) and (Prod.Dest.RegIndex <= High(DefCount)) and
+         (DefCount[Prod.Dest.RegIndex] = 1) and (UseCount[Prod.Dest.RegIndex] >= 1) then
+      begin
+        T := Prod.Dest.RegIndex;
+        // Collect EVERY consumer of the substring in this block, and require that they are ALL Asc.
+        // GVN merges identical Mid() calls, so one temporary commonly feeds several Asc - insisting
+        // on a single use declined exactly the shapes this exists for. Rewriting all of them is just
+        // as sound: each one only ever wanted the first byte.
+        NUses := 0; AllAsc := True; Last := -1;
+        for k := i + 1 to Blk.Instructions.Count - 1 do
+        begin
+          Cons := TSSAInstruction(Blk.Instructions[k]);
+          if TouchesStrReg(Cons, T) then
+          begin
+            Inc(NUses);
+            Last := k;
+            if not ((Cons.OpCode = ssaStrAsc) and (Cons.Src1.Kind = svkRegister) and
+                    (Cons.Src1.RegType = srtString) and (Cons.Src1.RegIndex = T)) then
+            begin
+              AllAsc := False;
+              Break;
+            end;
+          end;
+        end;
+        // Every use program-wide must be accounted for here, or a consumer in another block would be
+        // left reading a substring nobody builds any more.
+        if AllAsc and (NUses > 0) and (NUses = UseCount[T]) then
+        begin
+          // The Mid's operands have to still hold their values at each Asc, so nothing in between
+          // may WRITE the source string, the start or the length.
+          Ok := True;
+          for k2 := i + 1 to Last do
+          begin
+            Mid := TSSAInstruction(Blk.Instructions[k2]);
+            if (Prod.Src1.Kind = svkRegister) and WritesSSAReg(Mid, Prod.Src1.RegType, Prod.Src1.RegIndex) then begin Ok := False; Break; end;
+            if (Prod.Src2.Kind = svkRegister) and WritesSSAReg(Mid, Prod.Src2.RegType, Prod.Src2.RegIndex) then begin Ok := False; Break; end;
+            if (Prod.Src3.Kind = svkRegister) and WritesSSAReg(Mid, Prod.Src3.RegType, Prod.Src3.RegIndex) then begin Ok := False; Break; end;
+          end;
+          if Ok then
+          begin
+            for k := i + 1 to Blk.Instructions.Count - 1 do
+            begin
+              Cons := TSSAInstruction(Blk.Instructions[k]);
+              if (Cons.OpCode = ssaStrAsc) and (Cons.Src1.Kind = svkRegister) and
+                 (Cons.Src1.RegType = srtString) and (Cons.Src1.RegIndex = T) then
+              begin
+                Cons.OpCode := ssaStrAscMid;
+                Cons.Src1 := Prod.Src1;
+                Cons.Src2 := Prod.Src2;
+                Cons.Src3 := Prod.Src3;
+                Inc(Result);
+              end;
+            end;
+            Blk.Instructions.Delete(i);
+            Prod.Free;
+            Continue;
+          end;
+        end;
+      end;
+      Inc(i);
+    end;
+  end;
 end;
 
 function TSSAProgram.RunStringTempFusion: Integer;

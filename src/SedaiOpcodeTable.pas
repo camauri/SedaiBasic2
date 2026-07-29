@@ -40,7 +40,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 525 {$IFDEF WEB_MODE} + 12 {$ENDIF};
+  OPCODE_LIST_COUNT = 526 {$IFDEF WEB_MODE} + 12 {$ENDIF};
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -70,7 +70,7 @@ const
     bcVarArgBase, bcVarArgGetInt, bcVarArgGetFloat, bcVarArgGetStr,
     bcRandomize, bcMutexCreate, bcMutexLock, bcMutexUnlock, bcMutexDestroy, bcCondCreate,
     bcCondWait, bcCondSignal, bcCondBroadcast, bcCondDestroy, bcAssert, bcStrConcat,
-    bcStrLen, bcStrLeft, bcStrRight, bcStrMid, bcStrAsc, bcStrChr,
+    bcStrLen, bcStrLeft, bcStrRight, bcStrMid, bcStrAsc, bcStrAscMid, bcStrChr,
     bcStrStr, bcStrVal, bcStrHex, bcStrInstr, bcStrErr, bcStrLTrim,
     bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrInstrRev, bcStrSpace,
     bcStrOct, bcStrBin, bcStrValInt, bcStrString, bcStrTrimSet, bcStrInstrRevAny,
@@ -144,25 +144,25 @@ const
   // Values below are for the default (no-WEB_MODE) build: web opcodes are gated out, so group 8 takes
   // no dense range and graphics/sound/super sit where they do here.
   DENSE_CORE_BASE     = 0;    // group 0  (163 opcodes) -> dense 0..162
-  DENSE_STRING_BASE   = 163;  // group 1  (49)          -> 163..211
-  DENSE_MATH_BASE     = 214;  // group 2  (36)          -> 212..247
-  DENSE_ARRAY_BASE    = 250;  // group 3  (52)          -> 248..299 (bcRawLoad/StoreZStr = subs 50/51)
-  DENSE_IO_BASE       = 302;  // group 4  (23)          -> 300..322
-  DENSE_SPECIAL_BASE  = 325;  // group 5  (17)          -> 323..339
-  DENSE_FILEIO_BASE   = 342;  // group 6  (37)          -> 340..376 (bcDirAttr = sub 36)
-  DENSE_SPRITE_BASE   = 379;  // group 7  (17)          -> 377..393
+  DENSE_STRING_BASE   = 163;  // group 1  (50)          -> 163..212 (bcStrAscMid = sub 51)
+  DENSE_MATH_BASE     = 215;  // group 2  (36)          -> 213..248
+  DENSE_ARRAY_BASE    = 251;  // group 3  (52)          -> 249..300 (bcRawLoad/StoreZStr = subs 50/51)
+  DENSE_IO_BASE       = 303;  // group 4  (23)          -> 301..323
+  DENSE_SPECIAL_BASE  = 326;  // group 5  (17)          -> 324..340
+  DENSE_FILEIO_BASE   = 343;  // group 6  (37)          -> 341..377 (bcDirAttr = sub 36)
+  DENSE_SPRITE_BASE   = 380;  // group 7  (17)          -> 378..394
   {$IFDEF WEB_MODE}
   // group 8 (web, subs 1..12) inserts a 13-slot block, shifting graphics/sound/super up by 13.
-  DENSE_WEB_BASE      = 396;  // 394..406 (12 used, slot 0 a hole)
-  DENSE_GRAPHICS_BASE = 409;  // group 10 (65)          -> 407..471
-  DENSE_SOUND_BASE    = 474;  // group 11 (6)           -> 472..477
-  DENSE_SUPER_BASE    = 480;  // group 200 (256 slots)  -> 478..733
-  DENSE_TOTAL         = 736;  // N (with web)
+  DENSE_WEB_BASE      = 397;  // 395..407 (12 used, slot 0 a hole)
+  DENSE_GRAPHICS_BASE = 410;  // group 10 (65)          -> 408..472
+  DENSE_SOUND_BASE    = 475;  // group 11 (6)           -> 473..478
+  DENSE_SUPER_BASE    = 481;  // group 200 (256 slots)  -> 479..734
+  DENSE_TOTAL         = 737;  // N (with web)
   {$ELSE}
-  DENSE_GRAPHICS_BASE = 396;  // group 10 (65)          -> 394..458
-  DENSE_SOUND_BASE    = 461;  // group 11 (6)           -> 459..464
-  DENSE_SUPER_BASE    = 467;  // group 200 (256 slots)  -> 465..720 (58 used, 198 holes)
-  DENSE_TOTAL         = 723;  // N
+  DENSE_GRAPHICS_BASE = 397;  // group 10 (65)          -> 395..459
+  DENSE_SOUND_BASE    = 462;  // group 11 (6)           -> 460..465
+  DENSE_SUPER_BASE    = 468;  // group 200 (256 slots)  -> 466..721 (58 used, 198 holes)
+  DENSE_TOTAL         = 724;  // N
   {$ENDIF}
 
 var

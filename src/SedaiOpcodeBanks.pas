@@ -109,7 +109,7 @@ begin
     // String comparison (first operand)
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
     // === GROUP 1: String operations ===
-    bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrLen, bcStrLenW, bcStrAsc, bcStrSAdd,
+    bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrLen, bcStrLenW, bcStrAsc, bcStrAscMid, bcStrSAdd,
     bcFileExists, bcFileLen, bcFileDateTime,  // FILEEXISTS/FILELEN/FILEDATETIME(path): Src1 = path string
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src1 = source string
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string

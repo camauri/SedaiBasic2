@@ -211,6 +211,7 @@ begin
     ssaStrRight: Result := bcStrRight;
     ssaStrMid: Result := bcStrMid;
     ssaStrAsc: Result := bcStrAsc;
+    ssaStrAscMid: Result := bcStrAscMid;
     ssaStrChr: Result := bcStrChr;
     ssaStrStr: Result := bcStrStr;
     ssaStrVal: Result := bcStrVal;

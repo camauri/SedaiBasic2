@@ -450,6 +450,8 @@ begin
         // SedaiImmediateCompiler). See SedaiRunner for why it must be on the SSA, not the bytecode.
         if GetEnvironmentVariable('STRFUSE') <> '0' then
           try SSAProgram.RunStringTempFusion; except end;
+          try SSAProgram.RunAscMidFusion; except end;
+          try SSAProgram.RunStringTempFusion; except end;
         {$IFNDEF DISABLE_REG_ALLOC}
         RegAlloc := TLinearScanAllocator.Create(SSAProgram);
         try

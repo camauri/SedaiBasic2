@@ -8804,6 +8804,34 @@ begin
           AssignSubstr(Ctx.StringRegs[Instr.Dest], Ctx.StringRegs[Instr.Src1], StartPos, Count);
         end;
       end;
+    51: // bcStrAscMid - ASC(MID$(s, start, len)) without building the substring.
+      begin
+        // The answer is the FIRST byte of that substring, so all the substring rules matter only
+        // insofar as they decide whether it is EMPTY. Every branch below mirrors bcStrMid's, in the
+        // same order, followed by bcStrAsc's "empty yields 0" - the two arms must not drift apart.
+        StartPos := Ctx.IntRegs[Instr.Src2];
+        Count := Ctx.IntRegs[Instr.Immediate and $FFFF];
+        S := Ctx.StringRegs[Instr.Src1];
+        if (StartPos < 1) and Assigned(FProgram) and FProgram.ModernMode then
+          Ctx.IntRegs[Instr.Dest] := 0        // FB: a start below 1 is an empty string, not the first char
+        else
+        begin
+          if StartPos < 1 then StartPos := 1;  // CLASSIC clamps
+          if Count < 0 then
+          begin
+            // FB: a negative length means "the rest of the string"; CLASSIC rejects it (length 0).
+            if Assigned(FProgram) and FProgram.ModernMode then
+              Count := Length(S) - StartPos + 1
+            else
+              Count := 0;
+            if Count < 0 then Count := 0;
+          end;
+          if (Count <= 0) or (StartPos > Length(S)) then
+            Ctx.IntRegs[Instr.Dest] := 0
+          else
+            Ctx.IntRegs[Instr.Dest] := Ord(S[StartPos]);
+        end;
+      end;
     5: // bcStrAsc
       begin
         S := Ctx.StringRegs[Instr.Src1];

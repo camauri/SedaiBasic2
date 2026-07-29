@@ -1452,6 +1452,8 @@ begin
       // added to only some of them silently does nothing on the paths it missed.
       if GetEnvironmentVariable('STRFUSE') <> '0' then
         try SSAProgram.RunStringTempFusion; except end;
+        try SSAProgram.RunAscMidFusion; except end;
+        try SSAProgram.RunStringTempFusion; except end;
 
       // REGISTER ALLOCATION - Allocate physical registers to virtual registers
       // Uses Linear Scan algorithm (O(n log n) complexity)

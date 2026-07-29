@@ -215,6 +215,7 @@ begin
     bcFileExists,  // FILEEXISTS(path) returns int (-1/0)
     bcFileLen,     // FILELEN(path) returns int (size in bytes)
     bcStrAsc,      // ASC(str) returns int ASCII code
+    bcStrAscMid,   // ASC(MID$(s,start,len)) fused - also an int destination
     bcStrInstr,    // INSTR(haystack, needle) returns int position
     bcStrInstrRev, // INSTRREV(str, sub) returns int position
     // Both "Any set" forms return an int position too. bcStrInstrRevAny was MISSING from this list: its
@@ -623,6 +624,7 @@ begin
     bcStrLeft, bcStrRight,  // LEFT$/RIGHT$(str, len) - len is Src2 (int)
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src2 = codepoint count/start (int)
     bcStrMid,  // Mid$(str, start, length) - start is Src1, length is Src2
+    bcStrAscMid,  // ASC(MID$(...)) fused: Src2 = start position (int), like bcStrMid
     bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - Src2 = char code/codepoint (int)
     // === GROUP 2: Date/time: DATESERIAL/TIMESERIAL Src2 = month/minute (int); DATEADD Src2 = number ===
     bcDateSerial, bcTimeSerial, bcDateAdd,
@@ -1014,7 +1016,7 @@ begin
 
     // bcStrMid/bcStrMidW: Immediate contains length register index (int)
     // MID$(str, start, length) - start is Src2, length is in Immediate
-    if (OpCode = bcStrMid) or (OpCode = bcStrMidW) then
+    if (OpCode = bcStrMid) or (OpCode = bcStrMidW) or (OpCode = bcStrAscMid) then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // bcDateSerial/bcTimeSerial: Immediate contains the 3rd arg (day/second) register index (int)
@@ -1647,7 +1649,7 @@ begin
     // bcStrMid/bcStrMidW: Immediate contains length register index (int)
     // MID$(str, start, length) - start is Src2, length is in Immediate
     // bcDateSerial/bcTimeSerial: Immediate contains the 3rd arg (day/second) register index (int)
-    if (OpCode = bcStrMid) or (OpCode = bcStrMidW) or
+    if (OpCode = bcStrMid) or (OpCode = bcStrMidW) or (OpCode = bcStrAscMid) or
        (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) or
        (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) or
        (OpCode = bcPutBinMem) or (OpCode = bcGetBinMem) or   // PUT/GET #n, , *p, n: byte-count register

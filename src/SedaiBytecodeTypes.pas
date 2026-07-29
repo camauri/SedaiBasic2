@@ -345,6 +345,11 @@ const
   bcStrRight        = bcGroupString + 3;
   bcStrMid          = bcGroupString + 4;
   bcStrAsc          = bcGroupString + 5;
+  // ASC(MID$(s, start, len)) fused: the answer is the FIRST byte of that substring, so the
+  // substring never has to exist. Same operands as bcStrMid (Src1=string, Src2=start reg,
+  // Immediate=length reg) but an INT destination. Reading one character used to allocate a
+  // one-character string, and that allocation - not the read - is what it cost.
+  bcStrAscMid       = bcGroupString + 51;
   bcStrChr          = bcGroupString + 6;
   bcStrStr          = bcGroupString + 7;
   bcStrVal          = bcGroupString + 8;
@@ -1900,6 +1905,7 @@ begin
         3: Result := 'StrRight';
         4: Result := 'StrMid';
         5: Result := 'StrAsc';
+       51: Result := 'StrAscMid';
         6: Result := 'StrChr';
         7: Result := 'StrStr';
         8: Result := 'StrVal';
