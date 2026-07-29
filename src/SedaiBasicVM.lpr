@@ -1444,6 +1444,15 @@ begin
       {$ENDIF}
       {$ENDIF}
 
+      // STRING TEMP FUSION - let a string primitive write straight into its destination register,
+      // instead of a temporary that the next instruction copies. See TSSAProgram.RunStringTempFusion:
+      // it must run HERE, on the SSA, because the AOT compiles from this form -- doing it on the
+      // bytecode instead desynchronised the two and miscompiled Str() under --aot.
+      // ⚠️ This program has its OWN SSA pipeline: there are nine such sites in the tree, and a pass
+      // added to only some of them silently does nothing on the paths it missed.
+      if GetEnvironmentVariable('STRFUSE') <> '0' then
+        try SSAProgram.RunStringTempFusion; except end;
+
       // REGISTER ALLOCATION - Allocate physical registers to virtual registers
       // Uses Linear Scan algorithm (O(n log n) complexity)
       // CRITICAL: Must run AFTER PHI Elimination (no more PHI nodes)

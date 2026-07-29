@@ -446,6 +446,10 @@ begin
         {$IFNDEF DISABLE_COPY_COAL}
         SSAProgram.RunCopyCoalescing;
         {$ENDIF}
+        // String temp fusion, kept in step with the other two SSA pipelines (SedaiRunner and
+        // SedaiImmediateCompiler). See SedaiRunner for why it must be on the SSA, not the bytecode.
+        if GetEnvironmentVariable('STRFUSE') <> '0' then
+          try SSAProgram.RunStringTempFusion; except end;
         {$IFNDEF DISABLE_REG_ALLOC}
         RegAlloc := TLinearScanAllocator.Create(SSAProgram);
         try

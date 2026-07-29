@@ -239,6 +239,11 @@ begin
       try SSAProgram.RunDBE; except end;
       try SSAProgram.RunConstProp; except end;
       try SSAProgram.RunDCE; except end;
+      // String temp fusion: same pass the full pipeline runs, kept here too. ⚠ This unit alone has
+      // THREE compile paths (CompileStatement, CompileFromAST, CompileProgram); adding a pass to one
+      // of them and assuming "sb ran it" is how this one first appeared to do nothing at all.
+      if GetEnvironmentVariable('STRFUSE') <> '0' then
+        try SSAProgram.RunStringTempFusion; except end;
 
       // Register Allocation
       RegAlloc := TLinearScanAllocator.Create(SSAProgram);
@@ -337,6 +342,11 @@ begin
     try SSAProgram.RunDBE; except end;
     try SSAProgram.RunConstProp; except end;
     try SSAProgram.RunDCE; except end;
+    // String temp fusion: same pass the full pipeline runs, kept here too. ⚠ This unit alone has
+    // THREE compile paths (CompileStatement, CompileFromAST, CompileProgram); adding a pass to one
+    // of them and assuming "sb ran it" is how this one first appeared to do nothing at all.
+    if GetEnvironmentVariable('STRFUSE') <> '0' then
+      try SSAProgram.RunStringTempFusion; except end;
 
     // Register Allocation
     RegAlloc := TLinearScanAllocator.Create(SSAProgram);
@@ -511,6 +521,12 @@ begin
       {$ENDIF}
       try SSAProgram.RunPhiElimination; except end;
       try SSAProgram.RunCopyCoalescing; except end;
+      // String temp fusion -- see SedaiRunner for why it lives on the SSA and not in the bytecode
+      // peephole. ⚠️ There are THREE SSA pipelines (here, SedaiRunner, SedaiWebServer) and this is
+      // the one "sb program.bas" actually takes: a pass added to only one of them silently does
+      // nothing where it matters most.
+      if GetEnvironmentVariable('STRFUSE') <> '0' then
+        try SSAProgram.RunStringTempFusion; except end;
 
       // Register Allocation
       RegAlloc := TLinearScanAllocator.Create(SSAProgram);

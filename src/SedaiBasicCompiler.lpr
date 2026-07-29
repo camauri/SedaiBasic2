@@ -403,6 +403,10 @@ begin
         try SSAProgram.RunCopyCoalescing; except end;
         {$ENDIF}
 
+        // String temp fusion -- see TSSAProgram.RunStringTempFusion.
+        if GetEnvironmentVariable('STRFUSE') <> '0' then
+          try SSAProgram.RunStringTempFusion; except end;
+
         // Register Allocation
         {$IFNDEF DISABLE_REG_ALLOC}
         RegAlloc := TLinearScanAllocator.Create(SSAProgram);

@@ -612,6 +612,7 @@ type
     function RunSubInlining: Integer;    // Unification: inline small leaf SUB/FUNCTIONs (IMMEDIATELY after SSA generation, before every other pass)
     function RunRangeAnalysis: Integer;  // B4: prove array accesses in-bounds, set BoundsSafe (AFTER DCE, BEFORE PHI elimination - needs the PHIs)
     procedure RunPhiElimination;  // FINAL PASS: Convert PHI functions to copy instructions (BEFORE bytecode compilation)
+    function RunStringTempFusion: Integer;  // write string results straight into their destination
     function RunGVN: Integer;  // PHASE 3 TIER 2: Run Global Value Numbering optimization (returns replacements count)
     function RunCSE: Integer;  // Common subexpression elimination (returns eliminated count)
     function RunCopyProp: Integer;  // Copy propagation (returns replacement count)
@@ -1444,6 +1445,108 @@ begin
   finally
     RA.Free;
   end;
+end;
+
+function TSSAProgram.RunStringTempFusion: Integer;
+// Fuse "<string producer> T, ..." + "CopyString D, T" into "<string producer> D, ...".
+//
+// Every string primitive writes a fresh TEMPORARY that the next instruction copies into the
+// variable, so "s = s + x" becomes
+//     StrConcat   T, s, x
+//     CopyString  s, T
+// That is a dispatch per operation, and worse: the buffer ends up SHARED between T and s, so its
+// reference count is never 1 and the VM can never append in place. Removing the copy is what makes
+// "s = s + x" linear instead of quadratic (see AppendString in SedaiBytecodeVM).
+//
+// ⛔ THIS MUST LIVE AT SSA LEVEL, not in the bytecode peephole. The AOT compiles from SSA and
+// installs its native code over the bytecode's PC ranges; a pass that rewrites only the bytecode
+// leaves the two describing different programs, and the result is a silent miscompile -- "Str(123)"
+// came out as the empty string under --aot while the interpreter printed it correctly. Emitting the
+// bytecode from the FUSED SSA keeps both views identical by construction.
+//
+// Run BEFORE register allocation: afterwards a temporary's register is reused by other values, so
+// "read exactly once" would be false almost everywhere and the fusion would never fire.
+//
+// Safety: the temporary must have EXACTLY ONE definition and EXACTLY ONE use (that copy), and the
+// two must be adjacent in the same block, so no control flow can reach one without the other.
+// Counting defs as well as uses matters because PHI elimination has already broken single
+// assignment for the variables it lowered.
+var
+  b, i, k, T, D: Integer;
+  Blk: TSSABasicBlock;
+  Prod, Cp: TSSAInstruction;
+  DefCount, UseCount: array of Integer;
+
+  procedure Bump(var Arr: array of Integer; const V: TSSAValue);
+  begin
+    if (V.Kind = svkRegister) and (V.RegType = srtString) and
+       (V.RegIndex >= 0) and (V.RegIndex <= High(Arr)) then
+      Inc(Arr[V.RegIndex]);
+  end;
+
+begin
+  Result := 0;
+  SetLength(DefCount, FNextRegister[srtString] + 1);
+  SetLength(UseCount, FNextRegister[srtString] + 1);
+  for i := 0 to High(DefCount) do begin DefCount[i] := 0; UseCount[i] := 0; end;
+
+  // Census first: every definition and every use of every string register, program-wide.
+  for b := 0 to Blocks.Count - 1 do
+  begin
+    Blk := TSSABasicBlock(Blocks[b]);
+    for i := 0 to Blk.Instructions.Count - 1 do
+    begin
+      Prod := TSSAInstruction(Blk.Instructions[i]);
+      Bump(DefCount, Prod.Dest);
+      Bump(UseCount, Prod.Src1);
+      Bump(UseCount, Prod.Src2);
+      Bump(UseCount, Prod.Src3);
+      for k := 0 to High(Prod.PhiSources) do
+        Bump(UseCount, Prod.PhiSources[k].Value);
+      // An instruction that READS its own Dest (a store carrying the value there) counts as a use
+      // too; treating it as a pure definition would let the fusion overwrite a live value.
+      if Prod.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString] then
+        Bump(UseCount, Prod.Dest);
+    end;
+  end;
+
+  for b := 0 to Blocks.Count - 1 do
+  begin
+    Blk := TSSABasicBlock(Blocks[b]);
+    i := 0;
+    while i < Blk.Instructions.Count - 1 do
+    begin
+      Prod := TSSAInstruction(Blk.Instructions[i]);
+      Cp   := TSSAInstruction(Blk.Instructions[i + 1]);
+      if (Cp.OpCode = ssaCopyString) and
+         (Prod.Dest.Kind = svkRegister) and (Prod.Dest.RegType = srtString) and
+         (Cp.Src1.Kind = svkRegister) and (Cp.Src1.RegType = srtString) and
+         (Cp.Dest.Kind = svkRegister) and (Cp.Dest.RegType = srtString) and
+         (Cp.Src1.RegIndex = Prod.Dest.RegIndex) and
+         (Cp.Dest.RegIndex <> Prod.Dest.RegIndex) and
+         (Prod.OpCode <> ssaCopyString) and
+         not (Prod.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString, ssaPhi]) then
+      begin
+        T := Prod.Dest.RegIndex;
+        D := Cp.Dest.RegIndex;
+        if (T >= 0) and (T <= High(DefCount)) and (D >= 0) and
+           (DefCount[T] = 1) and (UseCount[T] = 1) then
+        begin
+          Prod.Dest := Cp.Dest;
+          Blk.Instructions.Delete(i + 1);
+          Cp.Free;
+          Inc(Result);
+          Continue;                 // the instruction now at i+1 is new: re-test this position
+        end;
+      end;
+      Inc(i);
+    end;
+  end;
+  // STRFUSE_DIAG=1 reports what the pass actually did. There are three SSA pipelines and each wraps
+  // its passes in "try ... except end", so "it silently did nothing" and "it raised" look identical
+  // from outside. Reporting from INSIDE the pass covers all three at once.
+  if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+    WriteLn(ErrOutput, '[StrFuse] ', Result, ' pair(s) fused; string regs=', FNextRegister[srtString]);
 end;
 
 procedure TSSAProgram.RunPhiElimination;

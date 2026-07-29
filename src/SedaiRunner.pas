@@ -484,6 +484,21 @@ begin
         try SSAProgram.RunCopyCoalescing; except end;
         {$ENDIF}
 
+        // String temp fusion: let a string primitive write straight into its destination register.
+        // Here, on the SSA, and not in the bytecode peephole -- the AOT compiles from THIS form, so
+        // rewriting only the bytecode would leave the two describing different programs (it did, and
+        // it miscompiled Str() under --aot). Before register allocation, while a temporary still has
+        // exactly one definition and one use. STRFUSE=0 turns it off.
+        if GetEnvironmentVariable('STRFUSE') <> '0' then
+        begin
+          if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+            // Deliberately NOT inside the try: a pass that raises must say so. Wrapping this one in
+            // "except end" like its neighbours is how the last defect stayed invisible.
+            WriteLn(ErrOutput, '[StrFuse] fused ', SSAProgram.RunStringTempFusion, ' pair(s)')
+          else
+            try SSAProgram.RunStringTempFusion; except end;
+        end;
+
         // Register Allocation
         {$IFNDEF DISABLE_REG_ALLOC}
         RegAlloc := TLinearScanAllocator.Create(SSAProgram);
