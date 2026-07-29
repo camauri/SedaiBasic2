@@ -898,6 +898,13 @@ begin
     FStringRegMap[i] := -1;
   end;
 
+  // String registers a bytecode pass RESERVED: no instruction names them any more, but the SSA the
+  // AOT compiles from still does, and the AOT translates its registers through THIS map. Dropping
+  // one makes the AOT bail on the whole region ("unmapped-str"), which is how the string-temp fusion
+  // cost pidigits its native MAIN. Cheap: a handful of slots that are never read.
+  for i := 0 to FProgram.ReservedStringRegCount - 1 do
+    MarkStringRegUsed(FProgram.ReservedStringReg(i));
+
   // Scan all instructions
   for i := 0 to FProgram.GetInstructionCount - 1 do
   begin

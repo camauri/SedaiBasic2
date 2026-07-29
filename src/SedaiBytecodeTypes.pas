@@ -983,6 +983,11 @@ type
     FAotIntRegMap: array of Integer;
     FAotFloatRegMap: array of Integer;
     FAotStringRegMap: array of Integer;
+    // String registers the BYTECODE no longer mentions but the SSA still does. The AOT compiles from
+    // SSA yet translates its registers through the map the register COMPACTOR builds from bytecode,
+    // so a peephole that deletes a register's last use makes the compactor drop it (-> -1) while SSA
+    // keeps naming it, and the region bails with "unmapped-str". Reserving it keeps a slot alive.
+    FReservedStrRegs: array of Integer;
   public
     property ModernMode: Boolean read FModernMode write FModernMode;
     property ModuleName: string read FModuleName write FModuleName;
@@ -1043,6 +1048,10 @@ type
     function AotRemapIntReg(OldReg: Integer): Integer;
     function AotRemapFloatReg(OldReg: Integer): Integer;
     function AotRemapStringReg(OldReg: Integer): Integer;
+    { A string register that must keep a slot even though no bytecode instruction names it any more }
+    procedure ReserveStringReg(Reg: Integer);
+    function ReservedStringRegCount: Integer;
+    function ReservedStringReg(Index: Integer): Integer;
     property StringConstants: TStringList read FStringConstants;
     property EntryPoint: Integer read FEntryPoint write FEntryPoint;
   end;
@@ -1558,6 +1567,31 @@ begin
     Result := FAotFloatRegMap[OldReg]
   else
     Result := OldReg;
+end;
+
+procedure TBytecodeProgram.ReserveStringReg(Reg: Integer);
+var
+  i, n: Integer;
+begin
+  if Reg < 0 then Exit;
+  for i := 0 to High(FReservedStrRegs) do
+    if FReservedStrRegs[i] = Reg then Exit;
+  n := Length(FReservedStrRegs);
+  SetLength(FReservedStrRegs, n + 1);
+  FReservedStrRegs[n] := Reg;
+end;
+
+function TBytecodeProgram.ReservedStringRegCount: Integer;
+begin
+  Result := Length(FReservedStrRegs);
+end;
+
+function TBytecodeProgram.ReservedStringReg(Index: Integer): Integer;
+begin
+  if (Index >= 0) and (Index < Length(FReservedStrRegs)) then
+    Result := FReservedStrRegs[Index]
+  else
+    Result := -1;
 end;
 
 function TBytecodeProgram.AotRemapStringReg(OldReg: Integer): Integer;

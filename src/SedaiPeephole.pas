@@ -123,7 +123,14 @@ begin
   inherited Create;
   FProgram := AProgram;
   FOptimizedCount := 0;
-  FFuseStringTemps := GetEnvironmentVariable('STRFUSE') <> '0';
+  // ⛔ OFF BY DEFAULT, and it must stay off until the fusion moves to the SSA level.
+  // Rewriting BYTECODE here desynchronises it from the SSA the AOT compiles from: the AOT then
+  // installs native code generated from the UNFUSED SSA over the PC ranges of the FUSED bytecode.
+  // The result is a silent miscompile -- "Str(123)" came out as the empty string under --aot while
+  // the interpreter printed it correctly. run_regress cannot see this (it never runs --aot); only
+  // aot_validate can, and it found 8 programs.
+  // STRFUSE=1 opts in, for measuring the interpreter-side win (which is large and real).
+  FFuseStringTemps := GetEnvironmentVariable('STRFUSE') = '1';
 end;
 
 destructor TPeepholeOptimizer.Destroy;
@@ -302,6 +309,11 @@ begin
   if ReadsStringReg(Prod, T) then Dec(Reads);
   if Reads <> 0 then Exit;
 
+  // T now has no bytecode use left, but the SSA the AOT compiles from still names it -- and the AOT
+  // translates SSA registers through the map the register COMPACTOR builds from BYTECODE. Without
+  // this, the compactor drops T (-> -1) and the whole region bails with "unmapped-str", which cost
+  // pidigits its native MAIN and doubled its --aot time. Measured, not guessed.
+  FProgram.ReserveStringReg(T);
   Prod.Dest := D;
   FProgram.SetInstruction(Index, Prod);
   MakeNop(Index + 1);
