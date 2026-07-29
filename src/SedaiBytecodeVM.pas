@@ -8003,6 +8003,41 @@ begin
     D := Copy(S, Start, Cnt);
 end;
 
+procedure AppendString(var D: AnsiString; const S: AnsiString);
+// D := D + S, GROWING D in place when nothing else shares its buffer.
+//
+// This is the difference between linear and quadratic. "D := D + S" builds a whole new string of
+// Length(D) + Length(S) and copies BOTH parts into it, every time; over n appends that is O(n^2)
+// bytes moved. SetLength on an unshared buffer hands the work to the allocator's realloc, which
+// usually extends the block in place and moves nothing, so only the new bytes are copied: O(n).
+//
+// FPC does exactly this for a plain "s := s + x" on a variable, but it cannot see the shape through
+// StringRegs[i] where i is a run-time index -- so we spell it out. Reachable only because the
+// peephole now writes the concatenation straight into the accumulator's register.
+//
+// The unshared test is what makes it CORRECT, not just fast: growing a buffer somebody else is
+// holding would rewrite their string too. When it is shared we fall back to the plain concatenation,
+// which allocates and therefore separates them.
+var
+  OldLen, AddLen: SizeInt;
+begin
+  AddLen := Length(S);
+  if AddLen = 0 then Exit;
+  OldLen := Length(D);
+  if OldLen = 0 then
+  begin
+    D := S;
+    Exit;
+  end;
+  if (Pointer(D) <> Pointer(S)) and (StringRefCount(D) = 1) then
+  begin
+    SetLength(D, OldLen + AddLen);
+    Move(S[1], D[OldLen + 1], AddLen);
+  end
+  else
+    D := D + S;
+end;
+
 procedure AssignChar(var D: AnsiString; Code: Byte);
 // D := Chr(Code), reusing D's buffer. Same reasoning as AssignSubstr: CHR$ measured 182 ms per
 // million calls, essentially all of it the allocation of a one-byte string. When the destination
@@ -8537,7 +8572,18 @@ begin
   SubOp := Instr.OpCode and $FF;  // Extract sub-opcode (low byte)
   case SubOp of
     0: // bcStrConcat
-      Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Src1] + Ctx.StringRegs[Instr.Src2];
+      // "s = s + x" is THE string idiom, and written as a plain concatenation it is QUADRATIC: each
+      // iteration allocates a buffer the size of the whole accumulator and copies it. Pascal's own
+      // "s := s + x" is linear because FPC recognises the self-append and grows in place, but that
+      // recognition cannot fire through StringRegs[i] with an index only known at run time.
+      // So detect the shape here. It is reachable at all only because the peephole now fuses the
+      // temporary away (OptimizeStringTempCopy): before that, Dest was always a fresh temp, never
+      // Src1, and the accumulator's buffer was shared besides -- so a grow in place would have been
+      // both unreachable and wrong.
+      if (Instr.Dest = Instr.Src1) and (Instr.Dest <> Instr.Src2) then
+        AppendString(Ctx.StringRegs[Instr.Dest], Ctx.StringRegs[Instr.Src2])
+      else
+        Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Src1] + Ctx.StringRegs[Instr.Src2];
     1: // bcStrLen
       Ctx.IntRegs[Instr.Dest] := Length(Ctx.StringRegs[Instr.Src1]);
     25: // bcStrLenW - LEN(wstring): Unicode codepoint count of the UTF-8 byte storage.
