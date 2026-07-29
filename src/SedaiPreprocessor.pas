@@ -256,6 +256,39 @@ begin
 end;
 
 function PPConstIntStr(const Expr: string; Defs: TStringList): string; forward;
+function QuerySymbol(What: Integer; const Sym: string; Defs: TStringList): string; forward;
+
+var
+  // __FB_UNIQUEID_* state: one stack of generated identifiers per stack NAME. These names are a
+  // namespace of their own (the manual is explicit about it), so they must not share the #define
+  // table. Reset at the start of every PreprocessSource: the ids are per COMPILATION, and a REPL that
+  // preprocesses twice would otherwise keep counting up from the previous program.
+  GUniqueIdStacks: TStringList = nil;
+  GUniqueIdSerial: Integer = 0;
+
+function TokenPos(const Hay, Needle: string): Integer;
+// Position of Needle in Hay as a WHOLE TOKEN (delimited by non-identifier characters), or 0. A plain
+// Pos() would find "verso" inside "versus" and split the argument at the wrong place -- and silently,
+// since the result is still a well-formed piece of text.
+var
+  p: Integer;
+begin
+  Result := 0;
+  if (Needle = '') or (Hay = '') then Exit;
+  p := 1;
+  repeat
+    // Search from p onwards without StrUtils: Pos on the tail, then map the offset back.
+    if p > Length(Hay) then Exit;
+    Result := Pos(Needle, Copy(Hay, p, MaxInt));
+    if Result = 0 then Exit;
+    p := p + Result - 1;
+    Result := 0;
+    if ((p = 1) or not IsIdentChar(Hay[p - 1])) and
+       ((p + Length(Needle) > Length(Hay)) or not IsIdentChar(Hay[p + Length(Needle)])) then
+      Exit(p);
+    Inc(p);
+  until False;
+end;
 
 function TryPPBuiltin(const NameU, ArgsStr: string; Defs, FnDefs: TStringList;
                       out Value: string): Boolean;
@@ -330,6 +363,66 @@ begin
     begin
       Cond := PPConstIntStr(Args[0], Defs);
       if StrToInt64Def(Trim(Cond), 0) <> 0 then Value := Trim(Args[1]) else Value := Trim(Args[2]);
+    end;
+    Exit;
+  end;
+  // __FB_ARG_LEFTOF__(arg, sep [, ret]) / __FB_ARG_RIGHTOF__: split ONE argument around a separator
+  // token and return the side asked for. The manual requires the separator to be SPACED in the
+  // argument's text ("1 versus 2"), which is what makes a purely textual split well-defined -- the
+  // separator is a whole token, never a substring of one, so "verso" never matches inside "versus".
+  // When the separator is absent the result is the optional third argument, or nothing.
+  if (NameU = '__FB_ARG_LEFTOF__') or (NameU = '__FB_ARG_RIGHTOF__') then
+  begin
+    SplitMacroArgs(ArgsStr, Args, N);
+    if N < 2 then Exit;
+    if N >= 3 then Value := Trim(Args[2]) else Value := '';
+    Idx := TokenPos(Args[0], Trim(Args[1]));
+    if Idx <= 0 then Exit;                     // separator not found: the default answer stands
+    if NameU = '__FB_ARG_LEFTOF__' then
+      Value := Trim(Copy(Args[0], 1, Idx - 1))
+    else
+      Value := Trim(Copy(Args[0], Idx + Length(Trim(Args[1])), MaxInt));
+    Exit;
+  end;
+  // __FB_UNIQUEID_PUSH__(stk) / __FB_UNIQUEID__(stk) / __FB_UNIQUEID_POP__(stk): a compile-time stack
+  // of generated identifiers, one stack per name. PUSH mints a fresh one, the bare macro reads the top
+  // WITHOUT changing the stack, POP drops it. The names live in their own namespace (they are not
+  // #defines), so they are kept apart from Defs; an empty or never-filled stack reads as nothing.
+  // fbc mints them as "Lt_xxxx" and the manual says so, so the same shape is used here: a program may
+  // legitimately print one.
+  // __FB_QUERY_SYMBOL__(what, sym): ask what fbc's symbol table would say about sym. See QuerySymbol.
+  if NameU = '__FB_QUERY_SYMBOL__' then
+  begin
+    SplitMacroArgs(ArgsStr, Args, N);
+    if N >= 2 then
+      // The query selector may itself be a macro/constant expression ("fbc.FB_QUERY_SYMBOL.symbclass"
+      // resolves through the emulated header), so fold it before switching on it. Only the low byte is
+      // the query; the high byte is a lookup FILTER we do not model.
+      Value := QuerySymbol(StrToIntDef(Trim(PPConstIntStr(Args[0], Defs)), -1) and $FF,
+                           Args[1], Defs);
+    Exit;
+  end;
+  if (NameU = '__FB_UNIQUEID_PUSH__') or (NameU = '__FB_UNIQUEID__') or (NameU = '__FB_UNIQUEID_POP__') then
+  begin
+    Cond := UpperCase(Trim(ArgsStr));          // the stack name
+    if Cond = '' then Exit;
+    Idx := GUniqueIdStacks.IndexOf(Cond);
+    if NameU = '__FB_UNIQUEID_PUSH__' then
+    begin
+      if Idx < 0 then Idx := GUniqueIdStacks.AddObject(Cond, TStringList.Create);
+      Inc(GUniqueIdSerial);
+      TStringList(GUniqueIdStacks.Objects[Idx]).Add(Format('Lt_%.4d', [GUniqueIdSerial]));
+      Value := '';                             // PUSH is a statement, it expands to nothing
+      Exit;
+    end;
+    if Idx < 0 then Exit;                      // never filled: empty text
+    with TStringList(GUniqueIdStacks.Objects[Idx]) do
+    begin
+      if Count = 0 then Exit;
+      if NameU = '__FB_UNIQUEID__' then
+        Value := Strings[Count - 1]            // top, stack unchanged
+      else
+        Delete(Count - 1);                     // POP expands to nothing
     end;
     Exit;
   end;
@@ -459,6 +552,172 @@ var
   // The full source text of the module being preprocessed, for SourceDeclaresSymbol below.
   // Set by PreprocessSource before Expand; the preprocessor is single-threaded by design.
   GPPSourceForDefined: string = '';
+
+function DeclaredNameOfLine(const U: string; out Kind, TypeName: string): string;
+// Read ONE upper-cased source line as a declaration and return the NAME it declares ('' if it declares
+// nothing). Kind is the declaring keyword; TypeName the "As <type>" it gives, when there is one.
+//
+// The name has to be located POSITIONALLY, not by searching the line: "Dim x As T" mentions both x and
+// T, and a search for T would find that line and call T a variable. That is exactly the case the
+// manual's own example tests ("isUDT(T)" true, "isVariable(T)" false).
+var
+  p, q: Integer;
+  W: string;
+
+  procedure SkipSpace;
+  begin
+    while (p <= Length(U)) and (U[p] = ' ') do Inc(p);
+  end;
+
+  function NextWord: string;
+  begin
+    SkipSpace;
+    q := p;
+    while (p <= Length(U)) and IsIdentChar(U[p]) do Inc(p);
+    Result := Copy(U, q, p - q);
+  end;
+
+begin
+  Result := ''; Kind := ''; TypeName := '';
+  p := 1;
+  W := NextWord;
+  if W = 'DECLARE' then W := NextWord;                 // "Declare Sub f(...)": the kind follows
+  if (W = 'PRIVATE') or (W = 'PUBLIC') then W := NextWord;
+  Kind := W;
+  if (W = 'TYPE') or (W = 'UNION') or (W = 'ENUM') or (W = 'CLASS') then
+  begin
+    Result := NextWord;                                // "Type T", "Enum e"
+    Exit;
+  end;
+  if (W = 'SUB') or (W = 'FUNCTION') or (W = 'PROPERTY') then
+  begin
+    Result := NextWord;
+    Exit;
+  end;
+  if (W = 'CONST') or (W = 'DIM') or (W = 'STATIC') or (W = 'VAR') or (W = 'COMMON') or
+     (W = 'REDIM') then
+  begin
+    SkipSpace;
+    if Copy(U, p, 7) = ' SHARED' then Inc(p, 7);
+    W := NextWord;
+    if W = 'SHARED' then W := NextWord;
+    if W = 'AS' then
+    begin
+      // Type-first form "Dim As T name": read the type, then the name.
+      TypeName := NextWord;
+      while (p <= Length(U)) and (Copy(U, p, 4) = ' PTR') do begin TypeName := TypeName + ' PTR'; Inc(p, 4); end;
+      Result := NextWord;
+    end
+    else
+    begin
+      // Name-first form "Dim name As T" (the type is optional).
+      Result := W;
+      SkipSpace;
+      if NextWord = 'AS' then TypeName := NextWord;
+    end;
+    Exit;
+  end;
+  Kind := '';
+end;
+
+function QuerySymbol(What: Integer; const Sym: string; Defs: TStringList): string;
+// __FB_QUERY_SYMBOL__(what, sym): what fbc answers from its symbol table, answered here from the
+// SOURCE. Our preprocessor runs on text, before any symbol table exists, so the classification is a
+// declaration-shaped scan - the same footing SourceDeclaresSymbol already stands on for Defined().
+// Encodings follow inc/fbc-int/symbol.bi: 0 symbclass, 1 datatype, 2 dataclass, 3/4 typename, 6 exists.
+const
+  SC_VAR = 1; SC_CONST = 2; SC_PROC = 3; SC_DEFINE = 5; SC_ENUM = 9; SC_STRUCT = 10;
+  DC_INTEGER = 0; DC_FPOINT = 1; DC_STRING = 2; DC_UDT = 3; DC_PROC = 4; DC_UNKNOWN = 5;
+  DT_VOID = 0; DT_BOOLEAN = 1; DT_BYTE = 2; DT_UBYTE = 3; DT_SHORT = 5; DT_USHORT = 6;
+  DT_INTEGER = 8; DT_UINT = 9; DT_ENUM = 10; DT_LONG = 11; DT_ULONG = 12; DT_LONGINT = 13;
+  DT_ULONGINT = 14; DT_SINGLE = 15; DT_DOUBLE = 16; DT_STRING = 17; DT_STRUCT = 20;
+  DT_FUNCTION = 22; DT_POINTER = 24;
+var
+  L: TStringList;
+  i, SymClass, DataClass, DataType: Integer;
+  SymU, Nm, Kind, TypeName, FoundType: string;
+
+  procedure ClassifyType(const T: string);
+  begin
+    FoundType := T;
+    if T = '' then begin DataClass := DC_UNKNOWN; DataType := DT_VOID; Exit; end;
+    if Pos(' PTR', T) > 0 then begin DataClass := DC_INTEGER; DataType := DT_POINTER; Exit; end;
+    DataClass := DC_INTEGER;
+    if      T = 'BOOLEAN'   then DataType := DT_BOOLEAN
+    else if T = 'BYTE'      then DataType := DT_BYTE
+    else if T = 'UBYTE'     then DataType := DT_UBYTE
+    else if T = 'SHORT'     then DataType := DT_SHORT
+    else if T = 'USHORT'    then DataType := DT_USHORT
+    else if T = 'INTEGER'   then DataType := DT_INTEGER
+    else if T = 'UINTEGER'  then DataType := DT_UINT
+    else if T = 'LONG'      then DataType := DT_LONG
+    else if T = 'ULONG'     then DataType := DT_ULONG
+    else if T = 'LONGINT'   then DataType := DT_LONGINT
+    else if T = 'ULONGINT'  then DataType := DT_ULONGINT
+    else if T = 'SINGLE'    then begin DataType := DT_SINGLE; DataClass := DC_FPOINT; end
+    else if T = 'DOUBLE'    then begin DataType := DT_DOUBLE; DataClass := DC_FPOINT; end
+    else if (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then
+                                 begin DataType := DT_STRING; DataClass := DC_STRING; end
+    else begin DataType := DT_STRUCT; DataClass := DC_UDT; end;   // a declared TYPE name
+  end;
+
+begin
+  Result := '0';
+  SymU := UpperCase(Trim(Sym));
+  if SymU = '' then Exit;
+  SymClass := 0; DataClass := DC_UNKNOWN; DataType := DT_VOID; FoundType := '';
+
+  // A #define is a symbol too, and it is the one kind we hold outright rather than infer.
+  if Defs.IndexOfName(SymU) >= 0 then
+  begin
+    SymClass := SC_DEFINE;
+    DataClass := DC_INTEGER; DataType := DT_INTEGER;
+  end;
+
+  if SymClass = 0 then
+  begin
+    L := TStringList.Create;
+    try
+      L.Text := GPPSourceForDefined;
+      for i := 0 to L.Count - 1 do
+      begin
+        Nm := DeclaredNameOfLine(UpperCase(TrimLeft(L[i])), Kind, TypeName);
+        if Nm <> SymU then Continue;
+        if (Kind = 'TYPE') or (Kind = 'UNION') or (Kind = 'CLASS') then
+        begin
+          SymClass := SC_STRUCT; DataClass := DC_UDT; DataType := DT_STRUCT; FoundType := SymU;
+        end
+        else if Kind = 'ENUM' then
+        begin
+          SymClass := SC_ENUM; DataClass := DC_INTEGER; DataType := DT_ENUM; FoundType := SymU;
+        end
+        else if (Kind = 'SUB') or (Kind = 'FUNCTION') or (Kind = 'PROPERTY') then
+        begin
+          SymClass := SC_PROC; DataClass := DC_PROC; DataType := DT_FUNCTION;
+        end
+        else if Kind = 'CONST' then
+        begin
+          SymClass := SC_CONST; ClassifyType(TypeName);
+        end
+        else
+        begin
+          SymClass := SC_VAR; ClassifyType(TypeName);
+        end;
+        Break;
+      end;
+    finally
+      L.Free;
+    end;
+  end;
+
+  case What of
+    0: Result := IntToStr(SymClass);                       // symbclass
+    1: Result := IntToStr(DataType);                       // datatype
+    2: Result := IntToStr(DataClass);                      // dataclass
+    3, 4: Result := FoundType;                             // typename / typenameid
+    6: if SymClass <> 0 then Result := '-1' else Result := '0';   // exists
+  end;
+end;
 
 function SourceDeclaresSymbol(const Nm: string): Boolean;
 // fbc's Defined() answers TRUE for COMPILER-level symbols too, not only #defines: a Const, a
@@ -732,7 +991,7 @@ begin
   if EvalPPExprInt(Expr, Defs, V) then Result := IntToStr(V);
 end;
 
-procedure RegisterEmulatedHeader(const FileName: string; Defs: TStringList);
+procedure RegisterEmulatedHeader(const FileName: string; Defs, FnDefs: TStringList);
 // A FreeBASIC header we do not ship, but whose CONTENT we implement anyway.
 //
 // An #include of a file that is not there is dropped in silence, which is the right thing for headers
@@ -747,6 +1006,43 @@ var
   Base: string;
 begin
   Base := LowerCase(ExtractFileName(FileName));
+  // fbc-int/symbol.bi exposes __FB_QUERY_SYMBOL__ through convenience macros. The real header wraps
+  // everything in "namespace FBC" and reaches the selectors as "fbc.FB_QUERY_SYMBOL.symbclass"; what a
+  // program actually WRITES are the isXXX macros, so those are what is emulated - with the selector
+  // folded in as a literal. Values follow the header's own enums (symbclass=0, dataclass=2, datatype=1).
+  if (Base = 'symbol.bi') and (Pos('fbc-int', LowerCase(FileName)) > 0) then
+  begin
+    // The isXXX convenience macros, as function-like macros ("params"#1"body"), exactly as a #define
+    // of the same shape would have registered them.
+    FnDefs.Values['ISVARIABLE']        := 'sym'#1'(__FB_QUERY_SYMBOL__(0, sym) = 1)';
+    FnDefs.Values['ISCONST']           := 'sym'#1'(__FB_QUERY_SYMBOL__(0, sym) = 2)';
+    FnDefs.Values['ISPROCEDURE']       := 'sym'#1'(__FB_QUERY_SYMBOL__(0, sym) = 3)';
+    FnDefs.Values['ISNAMESPACE']       := 'sym'#1'(__FB_QUERY_SYMBOL__(0, sym) = 8)';
+    FnDefs.Values['ISENUM']            := 'sym'#1'(__FB_QUERY_SYMBOL__(0, sym) = 9)';
+    FnDefs.Values['ISUDT']             := 'sym'#1'(__FB_QUERY_SYMBOL__(0, sym) = 10)';
+    FnDefs.Values['ISDATACLASSINTEGER']:= 'sym'#1'(__FB_QUERY_SYMBOL__(2, sym) = 0)';
+    FnDefs.Values['ISDATACLASSFLOAT']  := 'sym'#1'(__FB_QUERY_SYMBOL__(2, sym) = 1)';
+    FnDefs.Values['ISDATACLASSSTRING'] := 'sym'#1'(__FB_QUERY_SYMBOL__(2, sym) = 2)';
+    FnDefs.Values['ISDATACLASSUDT']    := 'sym'#1'(__FB_QUERY_SYMBOL__(2, sym) = 3)';
+    FnDefs.Values['ISDATACLASSPROC']   := 'sym'#1'(__FB_QUERY_SYMBOL__(2, sym) = 4)';
+    FnDefs.Values['ISTYPEINTEGER']     := 'sym'#1'(__FB_QUERY_SYMBOL__(1, sym) = 8)';
+    FnDefs.Values['ISTYPEDOUBLE']      := 'sym'#1'(__FB_QUERY_SYMBOL__(1, sym) = 16)';
+    FnDefs.Values['ISTYPESINGLE']      := 'sym'#1'(__FB_QUERY_SYMBOL__(1, sym) = 15)';
+    FnDefs.Values['ISTYPESTRING']      := 'sym'#1'(__FB_QUERY_SYMBOL__(1, sym) = 17)';
+    FnDefs.Values['ISSYMBOL']          := 'sym'#1'(__FB_QUERY_SYMBOL__(6, sym))';
+    Defs.Values['FB_SYMBCLASS_VAR']       := '1';
+    Defs.Values['FB_SYMBCLASS_CONST']     := '2';
+    Defs.Values['FB_SYMBCLASS_PROC']      := '3';
+    Defs.Values['FB_SYMBCLASS_NAMESPACE'] := '8';
+    Defs.Values['FB_SYMBCLASS_ENUM']      := '9';
+    Defs.Values['FB_SYMBCLASS_STRUCT']    := '10';
+    Defs.Values['FB_DATACLASS_INTEGER']   := '0';
+    Defs.Values['FB_DATACLASS_FPOINT']    := '1';
+    Defs.Values['FB_DATACLASS_FLOAT']     := '1';
+    Defs.Values['FB_DATACLASS_STRING']    := '2';
+    Defs.Values['FB_DATACLASS_UDT']       := '3';
+    Defs.Values['FB_DATACLASS_PROC']      := '4';
+  end;
   if Base = 'dir.bi' then
   begin
     Defs.Values['FBREADONLY']  := '&h01';
@@ -780,6 +1076,13 @@ begin
   // fbc defines this while compiling the module that holds the program's entry point. There is exactly
   // one module here - sb compiles and runs a single source - so it is always the main one.
   Defs.Values['__FB_MAIN__']    := '-1';
+  // __FB_ARGC__ / __FB_ARGV__ are the parameters of fbc's implicit main, so their VALUE is only known
+  // when the program runs - a preprocessor constant cannot carry it. They expand instead to the
+  // expression that fetches it, through two index selectors of COMMAND$ that no user spelling can
+  // reach (see TBytecodeVM.CommandLine). ARGV yields the raw address of a vector of pointers, which is
+  // what "ZString Ptr Ptr" holds, so "*argv[i]" reads the i-th argument exactly as the manual shows.
+  Defs.Values['__FB_ARGC__']    := 'CInt(COMMAND$(-2))';
+  Defs.Values['__FB_ARGV__']    := 'CPtr(ZString Ptr Ptr, __FB_ARGVPTR__)';
   {$IFDEF DEBUG}
   Defs.Values['__FB_DEBUG__']   := '-1';
   {$ENDIF}
@@ -841,6 +1144,7 @@ var
   IncOnce: TStringList;  // full paths already spliced by an "#include Once" (that is what ONCE means)
   ExpandedLine: string;  // a source line after macro substitution
   FReprocessDepth: Integer;   // guard against a macro whose expansion expands to itself
+  UidK: Integer;         // scratch: clearing the __FB_UNIQUEID_* stacks at entry
 
   function Emitting: Boolean;
   begin
@@ -1002,7 +1306,7 @@ var
               end;
             end
             else
-              RegisterEmulatedHeader(FileName, Defs);
+              RegisterEmulatedHeader(FileName, Defs, FnDefs);
           end;
           Output.Add('');   // the metacommand line itself produces no output
           Inc(li);
@@ -1199,7 +1503,7 @@ var
               end;
             end
             else
-              RegisterEmulatedHeader(FileName, Defs);
+              RegisterEmulatedHeader(FileName, Defs, FnDefs);
           end
           else if (DName = 'print') and Emitting then
             // #print msg — emit a compile-time diagnostic (macro-expanded) to stderr. The message is
@@ -1262,6 +1566,14 @@ begin
     Exit(Src);
 
   Defs := TStringList.Create;
+
+  // __FB_UNIQUEID_* stacks are per COMPILATION: start each one empty, and restart the counter, so the
+  // same source always yields the same identifiers (a REPL preprocessing twice would otherwise drift).
+  if GUniqueIdStacks = nil then GUniqueIdStacks := TStringList.Create;
+  for UidK := 0 to GUniqueIdStacks.Count - 1 do
+    TStringList(GUniqueIdStacks.Objects[UidK]).Free;
+  GUniqueIdStacks.Clear;
+  GUniqueIdSerial := 0;
 
   IncOnce := TStringList.Create;
   FReprocessDepth := 0;

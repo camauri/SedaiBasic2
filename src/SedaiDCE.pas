@@ -379,7 +379,7 @@ begin
     ssaGraphicSShape, ssaGraphicGShape, ssaGraphicGList, ssaPLoad, ssaPSave, ssaPRst, ssaScnClr,
     ssaGfxScreenRes, ssaGfxPset, ssaGfxPaint, ssaGfxPaintBorder, ssaGfxSetTarget, ssaGfxLine, ssaGfxLineStyled, ssaGfxCircle, ssaGfxCircleEx, ssaGfxDrawGML,
     ssaGfxPalette, ssaGfxPaletteReset, ssaGfxColor,
-    ssaGfxImageCreate, ssaGfxImageDestroy, ssaGfxGet, ssaGfxPut,
+    ssaGfxImageCreate, ssaGfxImageDestroy, ssaGfxGet, ssaGfxPut, ssaGfxImageConvertRow,
     ssaGfxScreenSet, ssaGfxPCopy, ssaGfxWindow, ssaGfxView, ssaGfxScreen,
     // GETMOUSE snapshot / SETMOUSE mutate external state; __MOUSEAXIS reads the mutable cache and must
     // keep program order with the snapshot (no reorder/CSE) -> all three are treated as side-effecting.

@@ -100,6 +100,20 @@ type
     // still un-renamed. A second declaration of the same name means an overload set, and both get a
     // parameter-bank signature appended to their labels (see ParseProcedureDecl).
     FProcSeen: TStringList;
+    // OOP: methods a TYPE body declared STATIC ("Declare Static Sub f(...)"), as "TYPE.METHOD" keys.
+    // A static member procedure has NO implicit THIS, so its out-of-line definition ("Sub T.f(...)")
+    // must not be given one -- otherwise every call passes its arguments one position too far right,
+    // and taking its address (@T.f) yields a procedure whose arity does not match the call.
+    // FreeBASIC requires the declaration to precede the definition, so a single forward pass suffices.
+    FTypeStaticMethods: TStringList;
+    // OOP: the DEFAULT ARGUMENTS a TYPE body's "Declare ..." line gave a method, keyed "TYPE.METHOD".
+    // FreeBASIC states them on the DECLARATION, never on the out-of-line definition — so a definition
+    // read on its own looks like it has none, and "Dim v As T" then found no constructor callable with
+    // zero arguments and left the object unconstructed. Each entry's object is an antArgumentList with
+    // one child per parameter: the default expression, or a NODEF placeholder.
+    FTypeMethodDefaults: TStringList;
+    procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
+    procedure ClearTypeMethodDefaults;
 
     function ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean;
                                WithTypeNames: Boolean = False): string;
@@ -126,6 +140,8 @@ type
     function FindMatchingNext: Integer;
     function FindMatchingEnd(StartToken: TTokenType): Integer;
     function ParseDimensionList: TASTNode;
+    procedure ParseInTypeMethodDecl(TypeNode: TASTNode);   // one "Declare ..." line inside a TYPE body
+    function NoDefaultPlaceholder(Tok: TLexerToken): TASTNode;
     procedure SkipTypeQualifiers;
     function SkipTypeQualifiersConst: Boolean;   // ...and report whether CONST was one of them
     function AtPointerSuffix: Boolean;   // FB: the current token is "PTR" (or its synonym "POINTER")
@@ -388,6 +404,10 @@ begin
   FProcSeen.CaseSensitive := False;
   FConstNames := TStringList.Create;
   FConstNames.CaseSensitive := False;
+  FTypeStaticMethods := TStringList.Create;
+  FTypeStaticMethods.CaseSensitive := False;
+  FTypeMethodDefaults := TStringList.Create;
+  FTypeMethodDefaults.CaseSensitive := False;
 end;
 
 destructor TPackratParser.Destroy;
@@ -400,6 +420,9 @@ begin
 
   FProcSeen.Free;
   FConstNames.Free;
+  FTypeStaticMethods.Free;
+  ClearTypeMethodDefaults;
+  FTypeMethodDefaults.Free;
 
   inherited Destroy;
 end;
@@ -678,6 +701,8 @@ begin
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
+  FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
+  ClearTypeMethodDefaults;   // ...and the declared default arguments
 
   try
     // Initialize context
@@ -740,6 +765,8 @@ begin
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
+  FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
+  ClearTypeMethodDefaults;   // ...and the declared default arguments
 
   try
     // Initialize context
@@ -1157,7 +1184,11 @@ begin
       // function - it is how a Cast or an arithmetic operator hands its value back, and it is what the
       // manual writes. Told apart from a declaration the same way: a following '=' can only be the
       // assignment (a declaration continues with a symbol or "<Type>.").
-      if ((UpperCase(Token.Value) = kFUNCTION) or (UpperCase(Token.Value) = kOPERATOR)) and
+      // "PROPERTY = expr" is the same statement inside a property GETTER: the manual's static-member
+      // example ends its getter with "Property = This.ID", which parsed as a declaration and stopped the
+      // whole file at "Expected a name after PROPERTY".
+      if ((UpperCase(Token.Value) = kFUNCTION) or (UpperCase(Token.Value) = kOPERATOR) or
+          (UpperCase(Token.Value) = kPROPERTY)) and
          Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpEq) then
         Result := Memoize('FunctionResultAssign', @ParseFunctionResultAssign)
       else if (UpperCase(Token.Value) = kSUB) or (UpperCase(Token.Value) = kFUNCTION) or
@@ -2382,6 +2413,14 @@ begin
       // exactly like the binary "*" and the two could not be told apart.
       if Context.Check(ttCompoundAssign) then OpSym := OpSym + '=';
       Context.Advance;                              // operator name
+      // The INDEX operator "Operator T.[] (i) ByRef As E" is written with two delimiter tokens, not one
+      // name: '[' was taken as the whole operator and the ']' left behind derailed the statement. It is a
+      // method with an implicit THIS, like CAST and LET, so it only needs its name spelled whole.
+      if (OpSym = '[') and Context.Check(ttDelimBrackClose) then
+      begin
+        OpSym := '[]';
+        Context.Advance;                            // ']'
+      end;
     end
     else
     begin
@@ -2464,7 +2503,10 @@ begin
 
   ParamList := TASTNode.Create(antParameterList, Token);
   // Implicit THIS parameter for methods: THIS AS <Type> (record handle), first in the list.
-  if MethodType <> '' then
+  // ...except for a STATIC member procedure, which is called WITHOUT an instance: the TYPE body declared
+  // it "Declare Static Sub f(...)", so giving its definition a THIS would shift every argument one slot
+  // to the right and give @Type.f an arity no call site matches.
+  if (MethodType <> '') and (FTypeStaticMethods.IndexOf(QualName) < 0) then
   begin
     ThisNode := TASTNode.CreateWithValue(antIdentifier, 'THIS', Token);
     ThisNode.AddChild(TASTNode.CreateWithValue(antIdentifier, MethodType, Token));
@@ -2694,6 +2736,13 @@ begin
   // ...and the UDT type TAIL for the same reason a SUB/FUNCTION overload needs one: every UDT is an int
   // HANDLE, so "Constructor(v As S)" and "Constructor(v As T)" both signed "#I" and the second was
   // silently discarded. The call site (EmitConstructorCall) rebuilds the tail from its ARGUMENT nodes.
+  // FreeBASIC states a method's DEFAULT ARGUMENTS on its in-TYPE declaration, never here. Replay them
+  // onto the definition before anything reads the parameter list: the label signature is unaffected
+  // (defaults do not change a parameter's bank), but every "callable with N arguments" question asked
+  // downstream — starting with whether a constructor can run with none — is decided by this list.
+  if MethodType <> '' then
+    ApplyDeclaredDefaults(QualName, ParamList, FTypeStaticMethods.IndexOf(QualName) < 0);
+
   if (Kind = kCONSTRUCTOR) and Assigned(NameNode) then
     NameNode.Value := QualName + '#' + ProcSigFromParams(ParamList, True, True);   // True: skip the implicit THIS
 
@@ -3319,10 +3368,144 @@ begin
   end;
 end;
 
+procedure TPackratParser.ParseInTypeMethodDecl(TypeNode: TASTNode);
+// One "Declare [Virtual|Abstract|Static|Const] Sub|Function|Property|Operator|Constructor|Destructor
+// name(...) [As ret]" line inside a TYPE body, with DECLARE already consumed. Nothing is emitted: the
+// method is defined out of line. Only the two decorators that change how the DEFINITION reads are
+// recorded, then the rest of the line is skipped exactly as before.
+//   ABSTRACT<NAME> on the antTypeDecl -> the type declares NAME with no body of its own.
+//   FTypeStaticMethods "TYPE.NAME"    -> NAME is a static member (no implicit THIS).
+var
+  DecoU, MethName, Key: string;
+  IsAbstract, IsStatic: Boolean;
+  Depth, ParamIdx: Integer;
+  Defs, DefExpr: TASTNode;
+begin
+  IsAbstract := False;
+  IsStatic := False;
+  // Decorators sit between DECLARE and the SUB/FUNCTION/... keyword and arrive as plain identifiers.
+  while Context.Check(ttIdentifier) do
+  begin
+    DecoU := UpperCase(VarToStr(Context.CurrentToken.Value));
+    if DecoU = 'ABSTRACT' then IsAbstract := True
+    else if DecoU = 'STATIC' then IsStatic := True
+    else if (DecoU <> 'VIRTUAL') and (DecoU <> 'CONST') and (DecoU <> 'OVERRIDE') then Break;
+    Context.Advance;
+  end;
+  MethName := '';
+  if Context.Check(ttProcedureStart) then
+  begin
+    MethName := UpperCase(VarToStr(Context.CurrentToken.Value));
+    Context.Advance;                                  // SUB / FUNCTION / PROPERTY / ...
+    // CONSTRUCTOR and DESTRUCTOR ARE the method name; everything else names one next. A method name
+    // may be a reserved word (LEN, TYPE, NAME...), so accept any alphabetic token — but not '(', which
+    // is where a constructor's parameter list starts.
+    if (MethName <> kCONSTRUCTOR) and (MethName <> kDESTRUCTOR) then
+    begin
+      if Context.Check(ttIdentifier) or
+         ((not Context.Check(ttDelimParOpen)) and (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
+          (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_'])) then
+      begin
+        MethName := UpperCase(VarToStr(Context.CurrentToken.Value));
+        Context.Advance;
+      end
+      else
+        MethName := '';       // OPERATOR <symbol>: not a name we track here
+    end;
+  end;
+  if MethName <> '' then
+  begin
+    if IsAbstract and Assigned(TypeNode) then
+      TypeNode.Attributes.Values['ABSTRACT' + MethName] := '1';
+    if IsStatic and Assigned(TypeNode) then
+      FTypeStaticMethods.Add(UpperCase(VarToStr(TypeNode.Value)) + '.' + MethName);
+  end;
+  // Walk what is left of the declaration, collecting the parameters' DEFAULT values on the way — they
+  // are stated here and nowhere else, and the definition needs them. Parenthesis depth is tracked so a
+  // ',' or '=' inside a nested expression is not read as a parameter boundary, and so a ':' inside a
+  // default expression is not mistaken for the statement separator.
+  Depth := 0;
+  ParamIdx := 0;
+  Defs := nil;
+  while not Context.Check(ttEndOfFile) do
+  begin
+    if Context.Check(ttDelimParOpen) then Inc(Depth)
+    else if Context.Check(ttDelimParClose) then Dec(Depth)
+    else if (Depth <= 0) and (Context.CheckAny([ttEndOfLine, ttSeparStmt]) or AtEndType) then Break
+    else if (Depth = 1) and Context.Check(ttSeparParam) then Inc(ParamIdx)
+    else if (Depth = 1) and Context.Check(ttOpEq) and (MethName <> '') then
+    begin
+      Context.Advance;                              // '='
+      DefExpr := FExpressionParser.ParseExpression;
+      if Assigned(DefExpr) then
+      begin
+        if Defs = nil then Defs := TASTNode.Create(antArgumentList, Context.CurrentToken);
+        while Defs.ChildCount < ParamIdx do         // parameters before this one have no default
+          Defs.AddChild(NoDefaultPlaceholder(Context.CurrentToken));
+        if Defs.ChildCount = ParamIdx then Defs.AddChild(DefExpr) else DefExpr.Free;
+      end;
+      Continue;                                     // ParseExpression already consumed the value
+    end;
+    Context.Advance;
+  end;
+  if Assigned(Defs) then
+  begin
+    Key := UpperCase(VarToStr(TypeNode.Value)) + '.' + MethName;
+    if FTypeMethodDefaults.IndexOf(Key) >= 0 then Defs.Free   // overload: first declaration wins (v1)
+    else FTypeMethodDefaults.AddObject(Key, Defs);
+  end;
+end;
+
+function TPackratParser.NoDefaultPlaceholder(Tok: TLexerToken): TASTNode;
+// Filler for a parameter position that carries no default, so the recorded list stays index-aligned
+// with the parameter list it will be replayed onto.
+begin
+  Result := TASTNode.CreateWithValue(antIdentifier, '', Tok);
+  Result.Attributes.Values['NODEF'] := '1';
+end;
+
+procedure TPackratParser.ClearTypeMethodDefaults;
+var
+  i: Integer;
+begin
+  for i := 0 to FTypeMethodDefaults.Count - 1 do
+    if Assigned(FTypeMethodDefaults.Objects[i]) then
+      TASTNode(FTypeMethodDefaults.Objects[i]).Free;
+  FTypeMethodDefaults.Clear;
+end;
+
+procedure TPackratParser.ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode;
+  SkipThis: Boolean);
+// Replay onto a method's DEFINITION the default arguments its in-TYPE declaration gave it. FreeBASIC
+// allows them only on the declaration, so without this the definition — the only thing the rest of the
+// pipeline sees — reports no defaults at all: "Constructor T(k As Integer = 5)" then had no form
+// callable with zero arguments, and "Dim v As T" silently skipped construction altogether.
+// A default already written on the definition (which fbc rejects, but we are lenient) wins.
+var
+  Defs, P, D: TASTNode;
+  Idx, i, First: Integer;
+begin
+  Idx := FTypeMethodDefaults.IndexOf(QualName);
+  if Idx < 0 then Exit;
+  Defs := TASTNode(FTypeMethodDefaults.Objects[Idx]);
+  if (Defs = nil) or (ParamList = nil) then Exit;
+  if SkipThis then First := 1 else First := 0;
+  for i := 0 to Defs.ChildCount - 1 do
+  begin
+    if First + i >= ParamList.ChildCount then Break;
+    D := Defs.GetChild(i);
+    if D.Attributes.Values['NODEF'] = '1' then Continue;
+    P := ParamList.GetChild(First + i);
+    if P.Attributes.Values['HASDEFAULT'] = '1' then Continue;
+    P.AddChild(D.Clone);                            // last child = default-value expression
+    P.Attributes.Values['HASDEFAULT'] := '1';
+  end;
+end;
+
 function TPackratParser.ParseRecordDecl(IsUnion: Boolean): TASTNode;
 var
   Token, NameTok, FieldTok: TLexerToken;
-  FieldNode, TypeNode, ArrDimNode, FieldDefault, FpTmp: TASTNode;
+  FieldNode, TypeNode, ArrDimNode, FieldDefault, FpTmp, NestedEnum: TASTNode;
   PrevIdx, NestedUnionDepth: Integer;
   FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
   IsStaticField, LeadingType, FpIsFP: Boolean;
@@ -3490,6 +3673,17 @@ begin
       Continue;
     end;
     if (NestedUnionDepth = 0) and AtEndType then Break;
+    // FreeBASIC nested ENUM inside a TYPE: "Type T : Enum e : a : b : End Enum : ... : End Type". Its
+    // members are ordinary module-wide constants (reachable bare, or as "T.e.member"), not fields — so
+    // parse it as the statement it is and hang it on the type node. Left to the field grammar below, the
+    // ENUM keyword was read as a FIELD NAME and every member came out worth ZERO, which made a
+    // "Select Case" over them pick the first arm every time.
+    if Context.Check(ttEnum) then
+    begin
+      NestedEnum := ParseEnumStatement;
+      if Assigned(NestedEnum) then Result.AddChild(NestedEnum);
+      Continue;
+    end;
     PrevIdx := Context.CurrentIndex;
     TokU := UpperCase(VarToStr(Context.CurrentToken.Value));
     // FreeBASIC access specifiers inside a TYPE: "Public:" / "Private:" / "Protected:". Access is not
@@ -3502,11 +3696,18 @@ begin
       Continue;
     end;
     // FreeBASIC in-TYPE method declaration: "Declare [Virtual|Abstract|Static] Sub|Function ...". Methods
-    // are defined out-of-line (SUB Type.method); skip the declaration line (consume to end of statement).
+    // are defined out-of-line (SUB Type.method), so the declaration itself emits nothing — but two of its
+    // decorators change how the DEFINITION must be read, and skipping the line wholesale threw them away:
+    //   ABSTRACT — the method has NO body on this type. Nothing declares it anywhere the SSA can see, so
+    //     a call on a base-typed handle resolved to no label at all and was dropped in silence (the PRINT
+    //     around it then showed a stale register). Recorded on the antTypeDecl so virtual dispatch can be
+    //     built from the OVERRIDES alone.
+    //   STATIC — the method has no implicit THIS; its definition must not be given one.
+    // Everything else on the line (parameters, calling convention, OVERRIDE, ALIAS) is still skipped.
     if TokU = 'DECLARE' then
     begin
-      while (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) and (not AtEndType) do
-        Context.Advance;
+      Context.Advance;                              // consume DECLARE
+      ParseInTypeMethodDecl(Result);
       Continue;
     end;
     // FreeBASIC lets CONSTRUCTOR / DESTRUCTOR / OPERATOR / PROPERTY be introduced in the TYPE body
@@ -3522,14 +3723,18 @@ begin
     end;
     // FreeBASIC static member variable: "Static field AS type" — one storage shared by all instances.
     // Consume the STATIC prefix and mark the field; the SSA backs it with a module-global, not a slot.
+    // ...in BOTH spellings: "Static countID As Integer" (name first) and "Static As Integer countID"
+    // (type first, the form the manual's own example uses). Only the first was recognised, so the second
+    // declared a field literally named STATIC and left countID typeless.
     IsStaticField := False;
     if (TokU = 'STATIC') and Assigned(Context.PeekNext) and
-       ((Context.PeekNext.TokenType = ttIdentifier) or
+       ((Context.PeekNext.TokenType = ttIdentifier) or (Context.PeekNext.TokenType = ttAsType) or
         ((Length(VarToStr(Context.PeekNext.Value)) > 0) and
          (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']))) then
     begin
       Context.Advance;                              // consume STATIC
       IsStaticField := True;
+      TokU := UpperCase(VarToStr(Context.CurrentToken.Value));   // re-read: a DIM may follow STATIC
     end;
     // FreeBASIC allows an in-TYPE field to be introduced with a leading DIM ("Dim As Double m(Any,Any)").
     // Consume it — the field grammar below handles both "As type name(dims)" and "name(dims) As type".
@@ -5038,6 +5243,8 @@ begin
     Result := TASTNode.Create(antPalette, Token)
   else if CmdName = 'IMAGEDESTROY' then
     Result := TASTNode.Create(antImageDestroy, Token)
+  else if CmdName = 'IMAGECONVERTROW' then
+    Result := TASTNode.Create(antImageConvertRow, Token)
   else if CmdName = 'IMAGEINFO' then
     Result := TASTNode.Create(antImageInfo, Token)
   else if CmdName = 'VIEW' then
@@ -5283,6 +5490,21 @@ begin
       else Break;
     end;
     if Context.Check(ttDelimParClose) then Context.Advance;      // optional ')'
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // FreeBASIC IMAGECONVERTROW src, src_bpp, dst, dst_bpp, width [, isrgb] -- a SUB, so it is a comma
+  // list of expressions (optionally parenthesised, as any FB SUB call may be).
+  if Result.NodeType = antImageConvertRow then
+  begin
+    if Context.Check(ttDelimParOpen) then Context.Advance;
+    repeat
+      Result.AddChild(ParseExpression);
+      if not Context.Check(ttSeparParam) then Break;
+      Context.Advance;
+    until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]);
+    if Context.Check(ttDelimParClose) then Context.Advance;
     DoNodeCreated(Result);
     Exit;
   end;
@@ -5883,7 +6105,23 @@ begin
   if ((CmdName = 'DOPEN') or (CmdName = 'OPEN')) and
      not (Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#')) then
   begin
-    Param := ParseExpression;     // FB filename OR C64 logical file number
+    // FreeBASIC DEVICE names stand where a filename would: "Open Cons For Input As #1" is the standard
+    // way to read stdin, and CLBG's reverse-complement / k-nucleotide / regex-redux are all built on it.
+    // The device is a bare WORD, not a string, so left to the expression parser it becomes an undeclared
+    // variable - an empty filename, and an open that silently reads nothing. Turned into a literal the
+    // runtime recognises instead.
+    if Context.Check(ttIdentifier) and
+       ((UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONS') or
+        (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'SCRN') or
+        (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'ERR')) and
+       Assigned(Context.PeekNext) and (UpperCase(VarToStr(Context.PeekNext.Value)) = kFOR) then
+    begin
+      Param := TASTNode.CreateWithValue(antLiteral,
+                 UpperCase(VarToStr(Context.CurrentToken.Value)) + ':', Context.CurrentToken);
+      Context.Advance;            // the device name
+    end
+    else
+      Param := ParseExpression;   // FB filename OR C64 logical file number
     if not Assigned(Param) then begin HandleError('Expected filename after OPEN', Token); Exit; end;
 
     // Commodore OPEN lf, dev [, sa [, "name[,type][,mode]"]] : the first arg is the logical file number
@@ -6628,8 +6866,25 @@ begin
     else if ModeStr = 'OR' then ModeOrd := 4
     else if ModeStr = 'XOR' then ModeOrd := 5
     else if ModeStr = 'ADD' then ModeOrd := 6
-    else ModeOrd := 0;                                        // CUSTOM/unknown -> PSET fallback
+    else if ModeStr = 'CUSTOM' then ModeOrd := 7
+    else ModeOrd := 0;                                        // unknown -> PSET fallback
     Context.Advance;                                          // mode keyword
+    // CUSTOM takes a user FUNCTION and an optional parameter pointer:
+    //   Put (x,y), src, Custom, fn [, param]
+    // The function is called once per pixel with (source_pixel, destination_pixel, parameter) and its
+    // return value is what gets drawn. Both are kept as ordinary expression children so the SSA can
+    // build the per-pixel loop out of them; without parsing them here the blit had no function to call
+    // and the mode silently degraded to PSET.
+    if ModeOrd = 7 then
+    begin
+      if Context.Check(ttSeparParam) then Context.Advance;    // ','
+      Result.AddChild(ParseExpression);                       // child 3: function pointer
+      if Context.Check(ttSeparParam) then
+      begin
+        Context.Advance;                                      // ','
+        Result.AddChild(ParseExpression);                     // child 4: parameter (optional)
+      end;
+    end;
   end;
   Result.Attributes.Values['MODE'] := IntToStr(ModeOrd);
   DoNodeCreated(Result);
@@ -7907,6 +8162,7 @@ var
   Token, NameTok, TypeTok, SharedTypeTok: TLexerToken;
   ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode, FuncPtrSigNode, LeadingTypeOfExpr: TASTNode;
   SharedFpNode: TASTNode;   // leading-AS "Dim As Sub(...) g": the shared funcptr signature
+  MemberAccess, StaticDef: TASTNode;   // "Dim As T Type.member = init": static member definition
   IsShared, IsByref, LeadingAS, IsTuple, HadComma: Boolean;
   DimTypeName, SharedTypeName, SharedFixedLen: string;
   SavedIdx, TupleDepth: Integer;
@@ -8070,6 +8326,44 @@ begin
         end;
         NameTok := Context.CurrentToken;
         Context.Advance;                       // name
+        // FreeBASIC STATIC MEMBER DEFINITION: "Dim As Integer UDT.countID = 0" at module level gives the
+        // type's static member its one storage. The name is DOTTED, which the scalar grammar below cannot
+        // read — it handed the '.' to the expression parser and the whole file failed to parse. Our static
+        // members are already backed by a shared global declared with the TYPE, so the definition is worth
+        // exactly its initializer: an assignment to that member, or nothing at all.
+        if Context.Check(ttOpDot) and (Result.ChildCount = 0) then
+        begin
+          Context.Advance;                     // '.'
+          if Context.Check(ttIdentifier) or
+             ((Length(VarToStr(Context.CurrentToken.Value)) > 0) and
+              (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_'])) then
+          begin
+            MemberAccess := TASTNode.CreateWithValue(antMemberAccess,
+                              UpperCase(VarToStr(Context.CurrentToken.Value)), Context.CurrentToken);
+            MemberAccess.AddChild(TASTNode.CreateWithValue(antIdentifier,
+                              UpperCase(VarToStr(NameTok.Value)), NameTok));
+            Context.Advance;                   // field name
+            if Context.Check(ttOpEq) then
+            begin
+              Context.Advance;                 // '='
+              InitExpr := FExpressionParser.ParseExpression;
+              if Assigned(InitExpr) then
+              begin
+                StaticDef := TASTNode.Create(antAssignment, NameTok);
+                StaticDef.AddChild(MemberAccess);
+                StaticDef.AddChild(InitExpr);
+                Result.Free;
+                Result := StaticDef;
+                DoNodeCreated(Result);
+                Exit;
+              end;
+            end;
+            MemberAccess.Free;                 // no initializer: the declaration alone emits nothing
+            Result.Free;
+            Result := nil;
+            Exit;
+          end;
+        end;
         DimTypeName := SharedTypeName;
         TypeTok := SharedTypeTok;
       end

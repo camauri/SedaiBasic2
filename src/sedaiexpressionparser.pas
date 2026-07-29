@@ -2454,6 +2454,11 @@ begin
 
   // *** DECISION: ALWAYS create antArrayAccess - the executor will decide ***
   Result := TASTNode.Create(antArrayAccess, Token);
+  // ...except that the two bracketings are NOT interchangeable for a UDT: "v(i)" is a call or an array
+  // element, while "v[i]" is FreeBASIC's INDEX OPERATOR, which a type overloads with "Operator []".
+  // Both spellings produce this one node, so the shape has to be recorded or the operator could never
+  // be told from an ordinary call.
+  if Token.TokenType = ttDelimBrackOpen then Result.Attributes.Values['BRACKET'] := '1';
   Result.AddChild(Left);
   Result.AddChild(Indices);
   DoNodeCreated(Result);

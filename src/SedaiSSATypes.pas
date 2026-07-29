@@ -189,6 +189,8 @@ type
     ssaStrOct,        // OCT(n) -> octal string
     ssaStrBin,        // BIN(n) -> binary string
     ssaStrValInt,     // VALINT/VALLNG/VALUINT(s) -> integer
+    ssaRegexCount,    // REGEXCOUNT(s, pattern) -> number of non-overlapping matches
+    ssaRegexReplace,  // REGEXREPLACE(s, pattern, repl) -> string with every match replaced
     ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathLog, ssaMathExp,
     ssaMathSqr, ssaMathAbs, ssaMathSgn, ssaMathInt, ssaMathRnd,
     ssaMathLog10, ssaMathLog2, ssaMathLogN,  // Additional log functions
@@ -301,6 +303,7 @@ type
     ssaScnClr,         // SCNCLR [mode]: Clear screen (text or graphics)
     ssaGfxScreenRes,   // SCREENRES w,h (FreeBASIC graphics, via IGraphicsBackend)
     ssaGfxScreenPtr,   // SCREENPTR: raw pointer to the working page's framebuffer
+  ssaGfxImageConvertRow,  // IMAGECONVERTROW(src,src_bpp,dst,dst_bpp,width[,isrgb]): convert one pixel row
     ssaGfxDrawGML,     // DRAW "..." : FreeBASIC graphics-macro-language string (Src1 = string)
     ssaGfxPointCoord,  // POINTCOORD(n): DRAW pen coordinate (Dest = result, Src1 = selector 0=x/1=y)
     ssaGfxPset,        // PSET (x,y),color

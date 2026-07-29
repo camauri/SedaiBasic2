@@ -471,6 +471,9 @@ const
   kRGB     = 'RGB';      // FreeBASIC: opaque colour value RGB(r, g, b) = RGBA(r, g, b, 255)
   kPALETTE = 'PALETTE';  // FreeBASIC: set/get/reset a palette entry
   kIMAGECREATE  = 'IMAGECREATE';   // FreeBASIC: allocate an image surface -> handle
+  kREGEXCOUNT   = 'REGEXCOUNT';   // REGEXCOUNT(s, pattern) -> non-overlapping match count
+  kREGEXREPLACE = 'REGEXREPLACE'; // REGEXREPLACE(s, pattern, repl) -> every match replaced
+  kIMAGECONVERTROW = 'IMAGECONVERTROW';  // FreeBASIC: convert one row of pixels between colour depths
   kIMAGEDESTROY = 'IMAGEDESTROY';  // FreeBASIC: free an image surface
   kIMAGEINFO    = 'IMAGEINFO';     // FreeBASIC: query an image surface (width/height)
   kSCREENINFO   = 'SCREENINFO';    // FreeBASIC: query the current graphics screen (width/height/depth)

@@ -27,6 +27,12 @@ type
   TVMFileHandler = class
   private
     FFileHandles: array[1..15] of TFileStream;
+    // FreeBASIC standard DEVICES opened as ordinary handles: "Open Cons For Input As #1" is how a
+    // program reads stdin, and CLBG's reverse-complement / k-nucleotide / regex-redux are all written
+    // that way. A device has no TFileStream - the bytes come from System.Input and go to System.Output -
+    // so it needs its own marker, and the handle counts as open while FFileHandles stays nil.
+    //   1 = CONS (stdin when opened For Input, stdout when For Output)   2 = SCRN (stdout)   3 = ERR (stderr)
+    FDeviceKind: array[1..15] of Integer;
     FFileModes: array[1..15] of string;
     FRecordLens: array[1..15] of Integer;   // relative-file record length per handle (0 = not relative)
   public
@@ -103,6 +109,24 @@ begin
 
   if Command = 'DOPEN' then
   begin
+    // A FreeBASIC standard device, marked as such by the parser. No file is opened: the handle is bound
+    // to the process's own streams. This must come BEFORE the reserved-name refusal below, which exists
+    // to stop a PROGRAM from reaching the printer or a serial port by naming a DOS device in a string -
+    // a different thing entirely from the language's own CONS/SCRN/ERR.
+    if (Filename = 'CONS:') or (Filename = 'SCRN:') or (Filename = 'ERR:') then
+    begin
+      if Assigned(FFileHandles[Handle]) then
+      begin
+        FreeAndNil(FFileHandles[Handle]);
+        FFileModes[Handle] := '';
+      end;
+      if Filename = 'CONS:' then FDeviceKind[Handle] := 1
+      else if Filename = 'SCRN:' then FDeviceKind[Handle] := 2
+      else FDeviceKind[Handle] := 3;
+      FFileModes[Handle] := UpperCase(Mode);
+      FRecordLens[Handle] := 0;
+      Exit;
+    end;
     {$IFDEF WINDOWS}
     // A device is not a file: refuse it as one (62 = FILE NOT FOUND). See IsReservedDeviceName.
     if IsReservedDeviceName(Filename) then begin ErrorCode := 62; Exit; end;
@@ -166,6 +190,7 @@ begin
       FreeAndNil(FFileHandles[Handle]);
       FFileModes[Handle] := '';
     end;
+    FDeviceKind[Handle] := 0;      // ...and release the handle if it was a device
     FRecordLens[Handle] := 0;
   end;
 end;
@@ -220,6 +245,32 @@ begin
         end;
       end;
     Exit;
+  end;
+
+  // A standard DEVICE handle (CONS/SCRN/ERR) has no stream behind it: serve it from the process's own
+  // input and output before the "is there a TFileStream?" test below, which would call it "not open".
+  if (Handle >= 1) and (Handle <= 15) and (FDeviceKind[Handle] <> 0) then
+  begin
+    if Command = 'EOF' then
+    begin
+      if (FDeviceKind[Handle] = 1) and System.Eof(System.Input) then Data := '-1' else Data := '0';
+      Exit;
+    end;
+    if (Command = 'INPUT#') or (Command = 'LINEINPUT#') then
+    begin
+      if System.Eof(System.Input) then begin Data := ''; ErrorCode := 62; Exit; end;
+      System.ReadLn(System.Input, Line);
+      Data := Line;
+      Exit;
+    end;
+    if (Command = 'PRINT#') or (Command = 'WRITE#') or (Command = 'CMD') or (Command = 'APPEND') then
+    begin
+      if FDeviceKind[Handle] = 3 then System.Write(System.ErrOutput, Data)
+      else System.Write(System.Output, Data);
+      Exit;
+    end;
+    if Command = 'DCLOSE' then begin FDeviceKind[Handle] := 0; FFileModes[Handle] := ''; Exit; end;
+    Exit;   // LOF/LOC/SEEK and the record commands mean nothing on a device
   end;
 
   if (Handle < 1) or (Handle > 15) or (not Assigned(FFileHandles[Handle])) then

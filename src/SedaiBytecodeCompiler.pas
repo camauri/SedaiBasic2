@@ -230,6 +230,8 @@ begin
     ssaStrOct: Result := bcStrOct;       // B1.3 numeric<->string conversions
     ssaStrBin: Result := bcStrBin;
     ssaStrValInt: Result := bcStrValInt;
+    ssaRegexCount: Result := bcRegexCount;
+    ssaRegexReplace: Result := bcRegexReplace;
     ssaStrErr: Result := bcStrErr;
     // Math functions
     ssaMathAbs: Result := bcMathAbs;
@@ -478,6 +480,7 @@ begin
     ssaLoadERMN: Result := bcLoadERMN;
     ssaWInputChars: Result := bcWInputChars;
     ssaGfxScreenPtr: Result := bcGfxScreenPtr;
+    ssaGfxImageConvertRow: Result := bcGfxImageConvertRow;
     ssaInputChars: Result := bcInputChars;
     ssaLoadDS: Result := bcLoadDS;
     ssaLoadDSS: Result := bcLoadDSS;
@@ -715,6 +718,7 @@ var
   BCIndex: Integer;
   ArrayIdx: Integer;
   TempRegIdx: Integer;
+  PhiIdx: Integer;            // IMAGECONVERTROW: walks the four packed-immediate phi sources
   // For RGBA handling
   ARegMapped, BRegMapped: Integer;
 begin
@@ -1537,6 +1541,27 @@ begin
       BCInstr.Immediate := BCInstr.Immediate or
         ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[3].Value.RegType,
           Instr.PhiSources[3].Value.RegIndex, Instr.PhiSources[3].Value.Version)) and $FFFF) shl 48);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // FreeBASIC IMAGECONVERTROW: Src1=src address, Src2=dst address; Immediate packs src_bpp
+  // (PhiSources[0], bits 0-15), dst_bpp ([1], 16-31), width ([2], 32-47) and isrgb ([3], 48-63),
+  // all integer registers — the same packing bcGfxCircleEx and bcGfxLineStyled use above.
+  if Instr.OpCode = ssaGfxImageConvertRow then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcGfxImageConvertRow, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    BCInstr.Immediate := 0;
+    for PhiIdx := 0 to 3 do
+      if (Length(Instr.PhiSources) > PhiIdx) and (Instr.PhiSources[PhiIdx].Value.Kind = svkRegister) then
+        BCInstr.Immediate := BCInstr.Immediate or
+          ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[PhiIdx].Value.RegType,
+            Instr.PhiSources[PhiIdx].Value.RegIndex, Instr.PhiSources[PhiIdx].Value.Version)) and $FFFF)
+           shl (16 * PhiIdx));
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;

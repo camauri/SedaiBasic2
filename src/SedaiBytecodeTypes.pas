@@ -389,6 +389,12 @@ const
   bcStrCvInt        = bcGroupString + 38;  // CVI/CVL/CVSHORT/CVLONGINT - unpack int from a binary string (Dest=int, Src1=string, Imm=byte width)
   bcStrCvFloat      = bcGroupString + 39;  // CVS/CVD - unpack float from an IEEE binary string (Dest=float, Src1=string, Imm=byte width)
   bcStrInstrAny     = bcGroupString + 48;  // INSTR([start,] str, Any set) - FIRST position of any char in set (Dest=int, Src1/Src2=string, Imm=int start reg)
+  // Regular expressions, backed by FPC's own RegExpr unit - no external dependency. FreeBASIC has no
+  // regex of its own (its CLBG program borrows PCRE2), so these are a SedaiBasic extension, and the
+  // reason they exist rather than a matcher written in BASIC: a benchmark that measures a hand-rolled
+  // matcher measures the matcher, while Python and Lua are measuring a regex engine written in C.
+  bcRegexCount      = bcGroupString + 49;  // REGEXCOUNT(s, pattern) - non-overlapping matches (Dest=int, Src1/Src2=string)
+  bcRegexReplace    = bcGroupString + 50;  // REGEXREPLACE(s, pattern, repl) - replace all (Dest=string, Src1/Src2=string, Imm=repl string reg)
   bcStrWChr         = bcGroupString + 31;  // WCHR(n) - UTF-8 bytes of Unicode codepoint n (Dest=string, Src1=int)
   bcStrWStringN     = bcGroupString + 32;  // WSTRING(n,cp) - n copies of the UTF-8 char for codepoint cp (Dest=string, Src1=int n, Src2=int cp)
 
@@ -753,6 +759,13 @@ const
   // SCREENPTR: Dest = raw pointer (RAWPTR_TAG or RAWPTR_REGION_FB, offset 0) to the working page's
   // pixel bytes. 32bpp, row pitch = width*4, exactly what SCREENINFO reports.
   bcGfxScreenPtr    = bcGroupGraphics + 63;
+  // IMAGECONVERTROW(src, src_bpp, dst, dst_bpp, width [, isrgb]): convert one row of pixels between
+  // colour depths on the raw heap. SIX operands, so the two addresses take Src1/Src2 and the four
+  // small integers are packed as REGISTER INDICES into the 64-bit Immediate, 16 bits each - the same
+  // packing bcGfxCircleEx and bcGfxLineStyled already use.
+  //   Src1 = src address reg, Src2 = dst address reg
+  //   Immediate[0-15] = src_bpp reg, [16-31] = dst_bpp reg, [32-47] = width reg, [48-63] = isrgb reg
+  bcGfxImageConvertRow = bcGroupGraphics + 64;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -1865,6 +1878,8 @@ begin
         23: Result := 'StrTrimSet';
         24: Result := 'StrInstrRevAny';
         48: Result := 'StrInstrAny';
+        49: Result := 'RegexCount';
+        50: Result := 'RegexReplace';
         33: Result := 'StrSAdd';
         40: Result := 'FileExists';
         41: Result := 'CurDir';
@@ -2125,6 +2140,7 @@ begin
         60: Result := 'GfxPaintBorder';
         61: Result := 'GfxSetTarget';
         62: Result := 'GfxLineStyled';
+        64: Result := 'GfxImageConvertRow';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

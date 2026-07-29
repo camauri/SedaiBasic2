@@ -223,6 +223,7 @@ begin
     bcStrInstrRevAny, bcStrInstrAny,
     bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV return int codepoint position
     bcStrValInt,   // VALINT/VALLNG/VALUINT(str) returns int (B1.3)
+    bcRegexCount,  // REGEXCOUNT(s, pattern) returns an int count
     bcStrCvInt,    // CVI/CVL/CVSHORT/CVLONGINT(str) returns int (B3 serialization)
     // === GROUP 2: Date/time -> int ===
     bcDateDecode,  // YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY(serial) -> int
@@ -393,6 +394,7 @@ begin
     bcDirSearch,   // DIR(spec, mask) / DIR() - the matching entry's name, string dest
     bcVarArgGetStr,   // CVA_ARG of a string type - string dest
     bcStrFormat,  // FORMAT(num, mask) - string dest
+    bcRegexReplace,  // REGEXREPLACE(s, pattern, repl) - string dest
     bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - string dest
     bcStrTrimSet, // LTRIM/RTRIM/TRIM(s,set) - string dest
     bcStrStr,    // STR$(n) - number to string
@@ -514,7 +516,7 @@ begin
     bcGraphicWindow,  // Src1 = col1 register (int)
     bcGraphicCircle,  // Src1 = color register (int)
     bcGraphicPaint,   // Src1 = source register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled, bcGfxCircle, bcGfxCircleEx,
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled, bcGfxCircle, bcGfxCircleEx, bcGfxImageConvertRow,
     bcGfxSetTarget,  // SETTARGET: Src1 = image handle (int)  // FreeBASIC graphics: Src1 = w / x / x1 (int)
     bcGfxPalette, bcGfxPalGet,  // PALETTE: Src1 = index (int)
     bcGfxColor,  // COLOR: Src1 = foreground (int)
@@ -699,7 +701,7 @@ begin
     bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
     bcGraphicWindow,  // Src2 = row1 register (int)
     bcGraphicCircle,  // Src2 = x register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled, bcGfxCircle, bcGfxCircleEx,  // FreeBASIC graphics: Src2 = h / y / y1 (int)
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled, bcGfxCircle, bcGfxCircleEx, bcGfxImageConvertRow,  // FreeBASIC graphics: Src2 = h / y / y1 (int)
     bcGfxPalette,  // PALETTE set: Src2 = packed colour (int)
     bcGfxColor,  // COLOR: Src2 = background (int)
     bcGfxImageCreate,  // IMAGECREATE: Src2 = h (int)
@@ -814,6 +816,7 @@ begin
     bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV - haystack is Src1
     bcStrInstrRevAny, // INSTRREV(str, Any set) - str is Src1
     bcStrInstrAny,    // INSTR(str, Any set) - str is Src1
+    bcRegexCount, bcRegexReplace,   // REGEX*(s, pattern, ...) - the subject is Src1
     bcStrTrimSet,   // LTRIM/RTRIM/TRIM(s, set) - s is Src1
     // === GROUP 2: Math operations ===
     bcStrDec,  // DEC(hexstring) - reads string, produces int
@@ -860,6 +863,7 @@ begin
     bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV - needle is Src2
     bcStrInstrRevAny, // INSTRREV(str, Any set) - set is Src2
     bcStrInstrAny,    // INSTR(str, Any set) - set is Src2
+    bcRegexCount, bcRegexReplace,   // REGEX*(s, pattern, ...) - the pattern is Src2
     bcStrTrimSet,  // LTRIM/RTRIM/TRIM(s, set) - set is Src2
     // === GROUP 3: Pointer store (FreeBASIC): Src2 = string value ===
     bcRefStoreString,
@@ -978,6 +982,9 @@ begin
   case OpCode of
     // DOPEN: Immediate = mode string register
     bcDopen, bcOpenFunc, bcOpen:
+      Result := True;
+    // REGEXREPLACE: Immediate = the REPLACEMENT string register (subject and pattern are Src1/Src2)
+    bcRegexReplace:
       Result := True;
   else
     Result := False;
@@ -1235,6 +1242,16 @@ begin
       MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);   // color
       MarkIntRegUsed((Instr.Immediate shr 32) and $FFFF);   // start°
       MarkIntRegUsed((Instr.Immediate shr 48) and $FFFF);   // end°
+    end;
+
+    // IMAGECONVERTROW: Immediate [0-15]=src_bpp, [16-31]=dst_bpp, [32-47]=width, [48-63]=isrgb (int regs).
+    // Src1/Src2 (the two addresses) are covered by the ordinary Src lists.
+    if OpCode = bcGfxImageConvertRow then
+    begin
+      MarkIntRegUsed(Instr.Immediate and $FFFF);            // src_bpp
+      MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);   // dst_bpp
+      MarkIntRegUsed((Instr.Immediate shr 32) and $FFFF);   // width
+      MarkIntRegUsed((Instr.Immediate shr 48) and $FFFF);   // isrgb
     end;
 
     // GET: Immediate [0-15]=x2, [16-31]=y2, [32-47]=dst handle (all int regs)

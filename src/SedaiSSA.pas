@@ -274,6 +274,7 @@ type
                                          // is distinct per recursion level (a module-level @-taken var stays SHARED-backed).
     FByrefRetFuncs: TStringList;         // FreeBASIC BYREF function results: func name (UPPER) -> pointee type name
     FByrefRetValue: TStringList;         // ...of those, the ones that return a NON-addressable expression (value return)
+    FByrefRetRaw: TStringList;           // ...and the ones whose address is a RAW byte-heap one ("Return buf[i]")
     FRawPtrRetFuncs: TStringList;        // FUNCTION returning a raw "<scalar> PTR": func name (UPPER) -> scalar pointee type
     FCurrentProcByrefRet: Boolean;       // lowering a "FUNCTION f() BYREF AS T" (returns an address)
     FVarWidthCode: TStringList;          // B1.5 phase 2: name (UPPER) -> narrow width code (Objects[]=PtrInt 1..7)
@@ -365,6 +366,9 @@ type
     procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
     function ResolveMethodLabel(const TypeName, MethNm: string): string;  // walk inheritance
+    function DeclaresAbstractMethod(const TypeName, MethNm: string): Boolean;  // OOP: "Declare Abstract ..."
+    function AnyOverrideLabel(const TypeName, MethNm: string): string;    // ...some concrete override of it
+    function HasCallableMethod(const TypeName, MethNm: string; ArgsNode: TASTNode): Boolean;
     function ResolveMethodLabelArgs(const TypeName, MethNm: string; ArgsNode: TASTNode): string;  // + overloads
     function ResolveConstructorLabel(const TypeName, ArgSig: string;
                                      const UdtSig: string = ''): string;       // M4.4g: by type signature (+ UDT tail)
@@ -389,6 +393,8 @@ type
     function TypeNeedsRecordInit(UDTIdx: Integer): Boolean;   // has member arrays / nested-UDT fields?
     procedure EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer);  // init each of N records  // alloc nested records
     procedure EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);  // per-element EmitRecordInit over a DIM'd array-of-UDT
+    procedure EmitRecordArrayConstruct(ArrayIdx: Integer; const TypeName: string;
+                                       FromFlatIndex: Integer);  // ...and the CONSTRUCTOR on each element
     procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
                                   ArgsNode: TASTNode = nil);  // M4.4 (ArgsNode: M4.4b ctor args)
     // Anonymous temporary "TypeName(args)" as an expression -> allocate + construct; returns its handle.
@@ -401,6 +407,7 @@ type
     procedure CollectRecordVarsAtThisLevel(Node: TASTNode; Into: TStringList; var Depth: Integer);
     procedure CollectLocalRecordVars(Node: TASTNode);  // V5: gather a proc body's DIM'd local UDTs
     procedure EmitFrameDestructors;                     // V5: dtor calls for the current frame
+    procedure EmitBaseDestructorChain;                  // OOP: ~Derived() ends by running ~Base()
     procedure EmitByrefParamStore;                      // BYREF: callee — write explicit-BYREF scalar params back to their slots
     procedure EmitByrefWriteback(const ParamOwnerName: string; ArgListNode: TASTNode);  // BYREF: caller — copy slots back into variable args
     procedure CollectModuleRecordVars(Node: TASTNode);  // V5b: gather module-scope DIM'd UDTs (skip procs)
@@ -504,6 +511,16 @@ type
     function EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue; // p[i] → address (p + i)
     function EmitRawFieldIndexAddress(MemberNode, IndicesNode: TASTNode; const PointeeType: string): TSSAValue; // obj.field[i] → raw address
     function EmitVarAddress(const Name: string): TSSAValue;                     // packed address of a backed scalar (0=NULL)
+    // FreeBASIC index operator "v[i]" on a UDT, and the addressable element a BYREF one returns.
+    function TryEmitIndexedElementAddress(Node: TASTNode; out Addr: TSSAValue): Boolean;
+    function IndexOperatorLabel(Node: TASTNode; out ObjType: string): string;
+    function TryEmitIndexOperator(Node: TASTNode; out Value: TSSAValue): Boolean;
+    function ProcessIndexOperatorStore(VarNode, ExprNode: TASTNode): Boolean;
+    function EmitByrefRetDeref(const AddrVal: TSSAValue; const Lbl: string): TSSAValue;
+    procedure EmitByrefRetStore(const AddrVal, Val: TSSAValue; const Lbl: string);
+    function ByrefRetPointeeType(const Name: string): string;
+    function ByrefRetIsRaw(const Name: string): Boolean;
+    function BodyReturnsRawIndexedElement(Decl: TASTNode): Boolean;
     function IsByrefRetFunc(const Name: string): Boolean;                       // FUNCTION declared BYREF AS T?
     function ByrefRetPointeeBank(const Name: string): TSSARegisterType;         // bank of a byref function's pointee
     function ByrefRetByAddress(const Name: string): Boolean;                    // ...and is the reference actually an ADDRESS?
@@ -715,6 +732,8 @@ type
     procedure ProcessGfxSetmouse(Node: TASTNode);    // SETMOUSE [x][,y][,visibility][,clip]
     procedure ProcessGfxGet(Node: TASTNode);         // GET (x1,y1)-(x2,y2), dst
     procedure ProcessGfxPut(Node: TASTNode);         // PUT (x,y), src [, mode]
+    procedure ProcessGfxPutCustom(Node: TASTNode);   // ...CUSTOM: a per-pixel loop calling a user function
+    procedure ProcessImageConvertRow(Node: TASTNode); // IMAGECONVERTROW src,src_bpp,dst,dst_bpp,w[,isrgb]
     procedure ProcessScreenInfo(Node: TASTNode);     // SCREENINFO w, h [, depth, ...]
     procedure ProcessScreenSet(Node: TASTNode);      // SCREENSET work[,visible] / FLIP
     procedure ProcessPCopy(Node: TASTNode);          // PCOPY src,dst / SCREENCOPY
@@ -896,6 +915,11 @@ const
                            ssaRecordNewBlock, ssaCall];
   RECORD_ALLOCATING_CALL_OPS = [ssaCallSub, ssaCallSubIndirect];
 
+  // Internal name the __FB_ARGV__ macro expands to: the RAW address of the argument vector. It exists
+  // as a NAME so the raw-pointer pre-scan can recognise it (see IsScreenPtrExpr, which it joins); the
+  // double underscores keep it out of any program's namespace, like fbc's own.
+  ARGV_PTR_NAME = '__FB_ARGVPTR__';
+
   // Transfer-register slot reserved for a FUNCTION's return value (per bank). Kept well
   // above any parameter slot count so it never collides with an argument slot.
   XFER_RESULT_SLOT = 255;
@@ -1034,6 +1058,8 @@ begin
   FByrefRetFuncs := TStringList.Create;
   FByrefRetValue := TStringList.Create;
   FByrefRetValue.CaseSensitive := False;
+  FByrefRetRaw := TStringList.Create;
+  FByrefRetRaw.CaseSensitive := False;
   FRawPtrRetFuncs := TStringList.Create;
   FSharedScalarArr.CaseSensitive := False;
   FVarWidthCode := TStringList.Create;
@@ -1112,6 +1138,7 @@ begin
   FZStringVars.Free;
   FByrefRetFuncs.Free;
   FByrefRetValue.Free;
+  FByrefRetRaw.Free;
   FRawPtrRetFuncs.Free;
   FVarWidthCode.Free;
   FVarPrintKind.Free;
@@ -1941,6 +1968,19 @@ begin
           Exit;
         end;
       end;
+      // "*p[i]" where p is a pointer to C STRINGS ("ZString Ptr Ptr", the shape of a C argv): the
+      // element is the address of one string, so the dereference reads its CHARACTERS. The rule above
+      // only recognised a bare pointer NAME, so this composed form fell through to the managed-pointer
+      // load and raised "invalid pointer" on a perfectly good raw address.
+      TempStr := UpperCase(DerefedType(Node.GetChild(0)));
+      if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') then
+      begin
+        ProcessExpression(Node.GetChild(0), Left);
+        Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaRawLoadZStr, Result, EnsureIntRegister(Left), MakeSSAValue(svkNone),
+                        MakeSSAConstInt(Ord(TempStr = 'WSTRING')));
+        Exit;
+      end;
       // *obj.field / *(@obj.field[i]) where the field is a raw "<scalar> PTR": load SizeOf(pointee) bytes
       // from the raw heap at the field's address value. Type-based (a field has no pointer name, so the
       // name-based RawPtrExprName below cannot resolve it).
@@ -2245,6 +2285,23 @@ begin
       begin
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaGfxScreenPtr, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Exit;
+      end;
+      // The address half of __FB_ARGV__. It is a name of its own -- not the macro's own text -- for the
+      // same reason SCREENPTR is one: a RAW pointer has to be RECOGNISABLE to the raw-pointer pre-scan
+      // (CollectRawPtrVars), and "CPtr(ZString Ptr Ptr, CLngInt(COMMAND$(-3)))" is just an expression to
+      // it. Without the name, "argv[i]" lowered to the MANAGED pointer path and faulted on a good address.
+      if BareIntercept and (UpperCase(VarName) = ARGV_PTR_NAME) then
+      begin
+        TempVal := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaCommand, TempVal, EnsureIntRegister(MakeSSAConstInt(-3)),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // ssaStrValInt, NOT the generic string->int coercion: that one goes through VAL, which is a
+        // DOUBLE, and a raw address is a 62-bit value that a double's 53-bit mantissa silently rounds.
+        // The pointer came back mangled and the bounds check caught it - a lucky catch, since a rounded
+        // address inside the heap would simply have read the wrong bytes.
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaStrValInt, Result, TempVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         Exit;
       end;
       // FreeBASIC EXEPATH used bare: directory of the running program.
@@ -4090,6 +4147,37 @@ begin
         else if (FuncName = 'MID$') then
           // MID$(str, start [,length]) - v7 substring function (works in both dialects).
           EmitMidSubstring(ArgListNode, Result)
+        else if (FuncName = kREGEXCOUNT) or (FuncName = kREGEXREPLACE) then
+        begin
+          // REGEXCOUNT(s, pattern) -> int ; REGEXREPLACE(s, pattern, repl) -> string.
+          // Backed by FPC's RegExpr in the VM. Subject and pattern ride in Src1/Src2; the replacement
+          // (a third STRING) goes in the Immediate as a string register, the same shape DOPEN uses for
+          // its mode - the register compactor is told about it, or it would remap it as an integer.
+          if (ArgListNode = nil) or not (ArgListNode.NodeType in [antArgumentList, antExpressionList]) or
+             (ArgListNode.ChildCount < 2) then
+            raise Exception.Create(FuncName + ' requires (subject, pattern[, replacement])');
+          ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+          ArgReg := EnsureStringRegister(ArgValue);
+          ProcessExpression(ArgListNode.GetChild(1), MaskValue);
+          MaskReg := EnsureStringRegister(MaskValue);
+          if FuncName = kREGEXCOUNT then
+          begin
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaRegexCount, Result, ArgReg, MaskReg, MakeSSAValue(svkNone));
+          end
+          else
+          begin
+            if ArgListNode.ChildCount >= 3 then
+            begin
+              ProcessExpression(ArgListNode.GetChild(2), TempVal);
+              TempVal := EnsureStringRegister(TempVal);
+            end
+            else
+              TempVal := EnsureStringRegister(MakeSSAConstString(''));
+            Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+            EmitInstruction(ssaRegexReplace, Result, ArgReg, MaskReg, TempVal);
+          end;
+        end
         else if (FuncName = 'INSTR') then
         begin
           // FreeBASIC "INSTR( [start,] str, substr )": the OPTIONAL start comes FIRST. Two args = (str,
@@ -5076,6 +5164,11 @@ begin
           Exit;
         end;
 
+        // FreeBASIC INDEX OPERATOR "v[i]" on a UDT that declares "Operator [] (i) ByRef As E". Tested
+        // first: the node is shaped like any other indexed access, so every rule below would read the
+        // object as an array or a call and answer with its handle.
+        if TryEmitIndexOperator(Node, Result) then Exit;
+
         // Dispatch table "arr(i)(args)": child0 is itself an array access into an array of function
         // pointers ("Dim As <named funcptr type> arr(..)"). Evaluate arr(i) to the element's entry-PC
         // value and lower an indirect call through it with the array's recorded signature.
@@ -5148,9 +5241,7 @@ begin
             end;
             // Overload-aware: an overloaded method has no bare label, so this test must be able to see
             // the "~<sig>" members too -- otherwise "b.g(5)" fell through as if the type had no g at all.
-            MethodLabelName := ResolveMethodLabelArgs(MethodOwnerType, VarToStr(Node.GetChild(0).Value),
-                                                      Node.GetChild(1));
-            if MethodLabelName <> '' then
+            if HasCallableMethod(MethodOwnerType, VarToStr(Node.GetChild(0).Value), Node.GetChild(1)) then
             begin
               ProcessMethodCall(MethodObjNode, MethodOwnerType, VarToStr(Node.GetChild(0).Value),
                                 Node.GetChild(1), Result);
@@ -6449,6 +6540,12 @@ begin
         EmitXferStore(srtInt, XFER_RESULT_SLOT, EmitVarAddress(VarToStr(ExprNode.Value)));
       Exit;
     end;
+    // "Operator = This.buf[i]" — the same addressable element the RETURN form accepts.
+    if FCurrentProcByrefRet and TryEmitIndexedElementAddress(ExprNode, ExprValue) then
+    begin
+      EmitXferStore(srtInt, XFER_RESULT_SLOT, ExprValue);
+      Exit;
+    end;
     ProcessExpression(ExprNode, ExprValue);
     // V3: a UDT result is copied (by value) into the caller-allocated result instance; a scalar
     // result is staged into the result transfer slot as before.
@@ -6765,6 +6862,12 @@ var
   VarReg, ExprValue: TSSAValue;
   DerefBank: TSSARegisterType;
 begin
+  // FreeBASIC INDEX OPERATOR as an lvalue: "v[i] = expr" on a UDT declaring "Operator [] ByRef As E".
+  // The operator call yields the element's ADDRESS; store through it, exactly as the byref-function
+  // lvalue below does. This is what the operator is FOR — without it the assignment fell through to the
+  // array-store path, which had no array and dropped the write in silence.
+  if ProcessIndexOperatorStore(VarNode, ExprNode) then Exit;
+
   // FreeBASIC BYREF function result as an lvalue: "f(args) = expr". The call returns the address of
   // the referenced variable; store expr through it (parsed like an array access / call target).
   if (VarNode.ChildCount >= 1) and (VarNode.GetChild(0).NodeType = antIdentifier) and
@@ -8694,11 +8797,36 @@ begin
             TupleCtor.AddChild(TupleArgs);
             InitAssign.AddChild(TupleCtor);
           end
+          // A SCALAR element in the list of an array whose type has a constructor is that constructor's
+          // ARGUMENT, not a value to store: "Dim o(1 To 4) As T => { ht_B, ht_default }" builds o(1) as
+          // T(ht_B). Stored as-is it went into the element's HANDLE slot and the object stayed unbuilt.
+          // Wrapping it as the "T(arg)" temporary the branch above already knows how to place keeps one
+          // construction path for both spellings.
+          else if (ObjectTypeName(InitElemNode) = '') and
+                  (FindCtorWithDefaults(ArrElemTypeName, 1) <> '') then
+          begin
+            TupleCtor := TASTNode.Create(antArrayAccess, Node.Token);
+            TupleCtor.AddChild(TASTNode.CreateWithValue(antIdentifier, ArrElemTypeName, Node.Token));
+            TupleArgs := TASTNode.Create(antExpressionList, Node.Token);
+            TupleArgs.AddChild(InitElemNode.Clone);
+            TupleCtor.AddChild(TupleArgs);
+            InitAssign.AddChild(TupleCtor);
+          end
           else
             InitAssign.AddChild(InitElemNode.Clone);
           try ProcessArrayStore(InitAssign); finally InitAssign.Free; end;
         end;
-    end;
+      // Whatever the list did not reach keeps the DEFAULT constructor, as in FreeBASIC ("the 4th array
+      // item will be _Object.handlertype.ht_default"). The elements the list DID reach were built with
+      // their own arguments just above, so construction starts past them.
+      if Assigned(InitVals) then
+        EmitRecordArrayConstruct(ArrayIdx, ArrElemTypeName, InitVals.ChildCount)
+      else
+        EmitRecordArrayConstruct(ArrayIdx, ArrElemTypeName, 0);
+    end
+    // No initializer at all: every element gets the default constructor.
+    else if RecArrUDTIdx >= 0 then
+      EmitRecordArrayConstruct(ArrayIdx, FUDTs[RecArrUDTIdx].Name, 0);
   end;
 end;
 
@@ -12146,13 +12274,177 @@ var
   Mode: Int64;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 3) then Exit;
+  Mode := StrToIntDef(Node.Attributes.Values['MODE'], 0);
+  // CUSTOM is not a blend FORMULA, it is a user FUNCTION called once per pixel - so it cannot be a mode
+  // ordinal handed to the backend, which knows nothing of the interpreter. It is lowered here instead,
+  // as an ordinary loop over the source image built from opcodes that already exist (POINT with an image
+  // target, POINT on the work page, an indirect call, PSET). That keeps the whole thing inside the VM's
+  // own dispatch: no callback from the graphics runtime back into the interpreter, which is the one
+  // mechanism this design does not have.
+  if (Mode = 7) and (Node.ChildCount >= 4) then
+  begin
+    ProcessGfxPutCustom(Node);
+    Exit;
+  end;
   ProcessExpression(Node.GetChild(0), XV); XR := EnsureIntRegister(XV);
   ProcessExpression(Node.GetChild(1), YV); YR := EnsureIntRegister(YV);
   ProcessExpression(Node.GetChild(2), SV); SR := EnsureIntRegister(SV);
-  Mode := StrToIntDef(Node.Attributes.Values['MODE'], 0);
+  if Mode = 7 then Mode := 0;                   // CUSTOM without a function: PSET, as the backend does
   EmitInstruction(ssaGfxPut, MakeSSAValue(svkNone), XR, YR, SR);
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(MakeSSAConstInt(Mode), nil);
+end;
+
+procedure TSSAGenerator.ProcessImageConvertRow(Node: TASTNode);
+// IMAGECONVERTROW src, src_bpp, dst, dst_bpp, width [, isrgb] -- convert one row of pixels between
+// colour depths. SIX operands: the two addresses ride in Src1/Src2 and the four small integers are
+// packed as REGISTER INDICES into the 64-bit Immediate, the same packing bcGfxCircleEx and
+// bcGfxLineStyled use (so the register compactor already knows the shape - it just has to be told
+// this opcode has it too, which is the step the opcode checklist warns is easy to miss).
+var
+  SrcV, DstV, BppSrc, BppDst, WidV, RgbV: TSSAValue;
+  Instr: TSSAInstruction;
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 5) then Exit;
+  ProcessExpression(Node.GetChild(0), SrcV);   SrcV   := EnsureIntRegister(SrcV);
+  ProcessExpression(Node.GetChild(2), DstV);   DstV   := EnsureIntRegister(DstV);
+  ProcessExpression(Node.GetChild(1), BppSrc); BppSrc := EnsureIntRegister(BppSrc);
+  ProcessExpression(Node.GetChild(3), BppDst); BppDst := EnsureIntRegister(BppDst);
+  ProcessExpression(Node.GetChild(4), WidV);   WidV   := EnsureIntRegister(WidV);
+  if Node.ChildCount >= 6 then
+  begin
+    ProcessExpression(Node.GetChild(5), RgbV);
+    RgbV := EnsureIntRegister(RgbV);
+  end
+  else
+    RgbV := EnsureIntRegister(MakeSSAConstInt(1));      // isrgb defaults to 1
+  // The four extra registers travel as PHI SOURCES, not as indices baked into the Immediate here: an
+  // SSA register index is NOT the bytecode one, and the bytecode compiler is what maps them
+  // (MapSSARegisterToBytecode). Packing them at this stage produced an instruction that read whatever
+  // happened to live at those bytecode indices - which was zero, silently.
+  EmitInstruction(ssaGfxImageConvertRow, MakeSSAValue(svkNone), SrcV, DstV, MakeSSAValue(svkNone));
+  Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+  Instr.AddPhiSource(BppSrc, nil);
+  Instr.AddPhiSource(BppDst, nil);
+  Instr.AddPhiSource(WidV, nil);
+  Instr.AddPhiSource(RgbV, nil);
+end;
+
+procedure TSSAGenerator.ProcessGfxPutCustom(Node: TASTNode);
+// PUT (x,y), src, Custom, fn [, param] -- the per-pixel loop described in ProcessGfxPut.
+//
+//   for j = 0 to imgHeight-1 : for i = 0 to imgWidth-1
+//       sp = POINT(i, j) with the target set to the source image
+//       dp = POINT(x+i, y+j) on the work page
+//       r  = fn(sp, dp, param)          ' three int arguments, int result
+//       PSET (x+i, y+j), r
+//
+// The call is staged by hand rather than through EmitIndirectCall: the arguments are VALUES already in
+// registers (two pixels just read), not AST nodes, and the signature is fixed by FreeBASIC
+// ("(ULong, ULong, Any Ptr) As ULong") so the slots are known - three int slots in, result slot out.
+var
+  XV, YV, SV, FnV, ParamV: TSSAValue;
+  XR, YR, SR, FnR, ParamR: TSSAValue;
+  WV, HV, IVar, JVar, CmpV, SpV, DpV, RV, PxV, PyV: TSSAValue;
+  OuterCond, OuterBody, InnerCond, InnerBody, OuterEnd, InnerEnd: string;
+  PrevBlock, BOC, BOB, BIC, BIB, BOE, BIE: TSSABasicBlock;
+  Serial: Integer;
+begin
+  ProcessExpression(Node.GetChild(0), XV); XR := EnsureIntRegister(XV);
+  ProcessExpression(Node.GetChild(1), YV); YR := EnsureIntRegister(YV);
+  ProcessExpression(Node.GetChild(2), SV); SR := EnsureIntRegister(SV);
+  ProcessExpression(Node.GetChild(3), FnV); FnR := EnsureIntRegister(FnV);
+  if Node.ChildCount >= 5 then
+  begin
+    ProcessExpression(Node.GetChild(4), ParamV);
+    ParamR := EnsureIntRegister(ParamV);
+  end
+  else
+    ParamR := EnsureIntRegister(MakeSSAConstInt(0));   // "if omitted, its value will be zero"
+
+  WV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaGfxImageInfo, WV, SR, MakeSSAValue(svkNone), MakeSSAConstInt(0));   // width
+  HV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaGfxImageInfo, HV, SR, MakeSSAValue(svkNone), MakeSSAConstInt(1));   // height
+
+  Serial := FScopeSerial; Inc(FScopeSerial);
+  IVar := DeclareVariableTyped('__PUTCUSTX%' + IntToStr(Serial), srtInt);
+  JVar := DeclareVariableTyped('__PUTCUSTY%' + IntToStr(Serial), srtInt);
+  EmitInstruction(ssaLoadConstInt, JVar, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  OuterCond := GenerateUniqueLabel('putc_ocond');
+  OuterBody := GenerateUniqueLabel('putc_obody');
+  InnerCond := GenerateUniqueLabel('putc_icond');
+  InnerBody := GenerateUniqueLabel('putc_ibody');
+  InnerEnd  := GenerateUniqueLabel('putc_iend');
+  OuterEnd  := GenerateUniqueLabel('putc_oend');
+
+  PrevBlock := FCurrentBlock;
+  EmitInstruction(ssaJump, MakeSSALabel(OuterCond), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // outer cond: j < height ?
+  FCurrentBlock := FProgram.CreateBlock(OuterCond); BOC := FCurrentBlock;
+  if Assigned(PrevBlock) then begin PrevBlock.AddSuccessor(BOC); BOC.AddPredecessor(PrevBlock); end;
+  CmpV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpLtInt, CmpV, EnsureIntRegister(GetOrAllocateVariable('__PUTCUSTY%' + IntToStr(Serial))), HV, MakeSSAValue(svkNone));
+  EmitInstruction(ssaJumpIfZero, MakeSSALabel(OuterEnd), CmpV, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // outer body: i = 0, then the inner loop
+  FCurrentBlock := FProgram.CreateBlock(OuterBody); BOB := FCurrentBlock;
+  BOC.AddSuccessor(BOB); BOB.AddPredecessor(BOC);
+  EmitInstruction(ssaLoadConstInt, IVar, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EmitInstruction(ssaJump, MakeSSALabel(InnerCond), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // inner cond: i < width ?
+  FCurrentBlock := FProgram.CreateBlock(InnerCond); BIC := FCurrentBlock;
+  BOB.AddSuccessor(BIC); BIC.AddPredecessor(BOB);
+  CmpV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpLtInt, CmpV, EnsureIntRegister(GetOrAllocateVariable('__PUTCUSTX%' + IntToStr(Serial))), WV, MakeSSAValue(svkNone));
+  EmitInstruction(ssaJumpIfZero, MakeSSALabel(InnerEnd), CmpV, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // inner body: the pixel itself
+  FCurrentBlock := FProgram.CreateBlock(InnerBody); BIB := FCurrentBlock;
+  BIC.AddSuccessor(BIB); BIB.AddPredecessor(BIC);
+  // source pixel: point the draw target at the image, read, put it back (the POINT(x,y,img) protocol)
+  EmitInstruction(ssaGfxSetTarget, MakeSSAValue(svkNone), SR, MakeSSAValue(svkNone), MakeSSAConstInt(1));
+  SpV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaGfxPoint, SpV, EnsureIntRegister(GetOrAllocateVariable('__PUTCUSTX%' + IntToStr(Serial))),
+                  EnsureIntRegister(GetOrAllocateVariable('__PUTCUSTY%' + IntToStr(Serial))), MakeSSAValue(svkNone));
+  EmitInstruction(ssaGfxSetTarget, MakeSSAValue(svkNone), EnsureIntRegister(MakeSSAConstInt(0)),
+                  MakeSSAValue(svkNone), MakeSSAConstInt(0));
+  // destination pixel at (x+i, y+j)
+  PxV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, PxV, XR, EnsureIntRegister(GetOrAllocateVariable('__PUTCUSTX%' + IntToStr(Serial))), MakeSSAValue(svkNone));
+  PyV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, PyV, YR, EnsureIntRegister(GetOrAllocateVariable('__PUTCUSTY%' + IntToStr(Serial))), MakeSSAValue(svkNone));
+  DpV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaGfxPoint, DpV, PxV, PyV, MakeSSAValue(svkNone));
+  // r = fn(source_pixel, destination_pixel, parameter)
+  EmitXferStore(srtInt, 0, SpV);
+  EmitXferStore(srtInt, 1, DpV);
+  EmitXferStore(srtInt, 2, ParamR);
+  EmitInstruction(ssaCallSubIndirect, MakeSSAValue(svkNone), FnR, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  RV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitXferLoad(srtInt, XFER_RESULT_SLOT, RV);
+  EmitInstruction(ssaGfxPset, MakeSSAValue(svkNone), PxV, PyV, RV);
+  // i += 1
+  EmitInstruction(ssaAddInt, GetOrAllocateVariable('__PUTCUSTX%' + IntToStr(Serial)),
+                  EnsureIntRegister(GetOrAllocateVariable('__PUTCUSTX%' + IntToStr(Serial))),
+                  EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+  EmitInstruction(ssaJump, MakeSSALabel(InnerCond), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  BIB.AddSuccessor(BIC); BIC.AddPredecessor(BIB);
+
+  // inner end: j += 1, back to the outer test
+  FCurrentBlock := FProgram.CreateBlock(InnerEnd); BIE := FCurrentBlock;
+  BIC.AddSuccessor(BIE); BIE.AddPredecessor(BIC);
+  EmitInstruction(ssaAddInt, GetOrAllocateVariable('__PUTCUSTY%' + IntToStr(Serial)),
+                  EnsureIntRegister(GetOrAllocateVariable('__PUTCUSTY%' + IntToStr(Serial))),
+                  EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+  EmitInstruction(ssaJump, MakeSSALabel(OuterCond), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  BIE.AddSuccessor(BOC); BOC.AddPredecessor(BIE);
+
+  FCurrentBlock := FProgram.CreateBlock(OuterEnd); BOE := FCurrentBlock;
+  BOC.AddSuccessor(BOE); BOE.AddPredecessor(BOC);
 end;
 
 procedure TSSAGenerator.ProcessScreenInfo(Node: TASTNode);
@@ -16536,6 +16828,146 @@ begin
   EmitXferLoad(srtInt, XFER_RESULT_SLOT, Result);
 end;
 
+function TSSAGenerator.TryEmitIndexedElementAddress(Node: TASTNode; out Addr: TSSAValue): Boolean;
+// "<raw pointer expression>[i]" as an ADDRESSABLE place: emit the element's address on the raw byte
+// heap and answer True. Two spellings reach here — "obj.field[i]" (a "<scalar> PTR" MEMBER, which is
+// how a smart pointer keeps its buffer) and "p[i]" (a "<scalar> PTR" variable). Anything else is not
+// addressable and answers False, leaving the caller's ordinary value path alone.
+var
+  Pointee: string;
+begin
+  Result := False;
+  Addr := MakeSSAValue(svkNone);
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) then Exit;
+  if (Node.GetChild(1).NodeType <> antExpressionList) or (Node.GetChild(1).ChildCount <> 1) then Exit;
+  if Node.GetChild(0).NodeType = antMemberAccess then
+  begin
+    Pointee := MemberRawPtrPointee(Node.GetChild(0));
+    if Pointee = '' then Exit;
+    Addr := EmitRawFieldIndexAddress(Node.GetChild(0), Node.GetChild(1), Pointee);
+    Exit(True);
+  end;
+  if Node.GetChild(0).NodeType = antIdentifier then
+  begin
+    Pointee := UpperCase(FPointerVars.Values[UpperCase(VarToStr(Node.GetChild(0).Value))]);
+    if (Pointee = '') or (FindUDT(Pointee) >= 0) or (Pos(' PTR', Pointee) > 0) then Exit;
+    Addr := EmitPointerIndexAddress(VarToStr(Node.GetChild(0).Value), Node.GetChild(1));
+    Exit(True);
+  end;
+end;
+
+function TSSAGenerator.ProcessIndexOperatorStore(VarNode, ExprNode: TASTNode): Boolean;
+// "v[i] = expr" through a UDT's BYREF index operator: call it for the element's address, then store the
+// value through that address. Answers False (emitting nothing) when this is not such an assignment.
+// A NON-byref index operator returns a copy, which is not assignable — fbc rejects that, and so do we
+// by leaving the statement to the paths below.
+var
+  Lbl, ObjType: string;
+  AddrVal, ExprValue: TSSAValue;
+begin
+  Result := False;
+  Lbl := IndexOperatorLabel(VarNode, ObjType);
+  if (Lbl = '') or not ByrefRetByAddress(Lbl) then Exit;
+  ProcessMethodCall(VarNode.GetChild(0), ObjType, 'OPERATOR[]', VarNode.GetChild(1), AddrVal);
+  AddrVal := EnsureIntRegister(AddrVal);
+  ProcessExpression(ExprNode, ExprValue);
+  EmitByrefRetStore(AddrVal, ExprValue, Lbl);
+  Result := True;
+end;
+
+function TSSAGenerator.IndexOperatorLabel(Node: TASTNode; out ObjType: string): string;
+// The "Operator [] " of the type of Node's indexed object, or ''. Only the SQUARE-bracket spelling
+// qualifies: "v(i)" on a UDT is a call or an array element, "v[i]" is the index operator, and both
+// arrive as the same node shape.
+begin
+  Result := '';
+  ObjType := '';
+  if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) then Exit;
+  if Node.Attributes.Values['BRACKET'] <> '1' then Exit;
+  ObjType := ObjectTypeName(Node.GetChild(0));
+  if ObjType = '' then Exit;
+  Result := ResolveMethodLabel(ObjType, 'OPERATOR[]');
+end;
+
+function TSSAGenerator.TryEmitIndexOperator(Node: TASTNode; out Value: TSSAValue): Boolean;
+// Read through a UDT's index operator: "v[i]" lowers to the method call "v.Operator[](i)". When the
+// operator returns BYREF (the usual declaration, and the only one that makes "v[i] = x" possible) the
+// call hands back an ADDRESS, so the read has to dereference it in the pointee's bank.
+var
+  Lbl, ObjType: string;
+begin
+  Result := False;
+  Value := MakeSSAValue(svkNone);
+  Lbl := IndexOperatorLabel(Node, ObjType);
+  if Lbl = '' then Exit;
+  ProcessMethodCall(Node.GetChild(0), ObjType, 'OPERATOR[]', Node.GetChild(1), Value);
+  if ByrefRetByAddress(Lbl) then
+    Value := EmitByrefRetDeref(EnsureIntRegister(Value), Lbl);
+  Result := True;
+end;
+
+function TSSAGenerator.EmitByrefRetDeref(const AddrVal: TSSAValue; const Lbl: string): TSSAValue;
+// Read the value a BYREF-returning procedure referred to, through the address it handed back — with the
+// right instruction family for the KIND of address it is: a RAW byte-heap one (ssaRawLoad, which knows
+// the pointee's width) or a backed variable's packed one (ssaRefLoad).
+var
+  Bank: TSSARegisterType;
+begin
+  Bank := ByrefRetPointeeBank(Lbl);
+  Result := MakeSSARegister(Bank, FProgram.AllocRegister(Bank));
+  if ByrefRetIsRaw(Lbl) then
+  begin
+    if Bank = srtFloat then
+      EmitInstruction(ssaRawLoadFloat, Result, AddrVal, MakeSSAValue(svkNone),
+                      MakeSSAConstInt(RawTypeCodeOfPointee(ByrefRetPointeeType(Lbl))))
+    else
+      EmitInstruction(ssaRawLoadInt, Result, AddrVal, MakeSSAValue(svkNone),
+                      MakeSSAConstInt(RawTypeCodeOfPointee(ByrefRetPointeeType(Lbl))));
+    Exit;
+  end;
+  case Bank of
+    srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  else         EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+procedure TSSAGenerator.EmitByrefRetStore(const AddrVal, Val: TSSAValue; const Lbl: string);
+// The write half of the same protocol: store Val through a BYREF-returned address, raw or packed.
+var
+  Bank: TSSARegisterType;
+begin
+  Bank := ByrefRetPointeeBank(Lbl);
+  if ByrefRetIsRaw(Lbl) then
+  begin
+    if Bank = srtFloat then
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), AddrVal, EnsureFloatRegister(Val),
+                      MakeSSAConstInt(RawTypeCodeOfPointee(ByrefRetPointeeType(Lbl))))
+    else
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, EnsureIntRegister(Val),
+                      MakeSSAConstInt(RawTypeCodeOfPointee(ByrefRetPointeeType(Lbl))));
+    Exit;
+  end;
+  case Bank of
+    srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), AddrVal, EnsureFloatRegister(Val), MakeSSAValue(svkNone));
+    srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), AddrVal, EnsureStringRegister(Val), MakeSSAValue(svkNone));
+  else         EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), AddrVal, EnsureIntRegister(Val), MakeSSAValue(svkNone));
+  end;
+end;
+
+function TSSAGenerator.ByrefRetPointeeType(const Name: string): string;
+// The declared pointee TYPE NAME of a BYREF-returning procedure ('' if unknown) — the raw load/store
+// need the width, which the bank alone does not carry (BYTE and INTEGER share it).
+var
+  idx: Integer;
+begin
+  Result := '';
+  idx := FByrefRetFuncs.IndexOfName(UpperCase(Name));
+  if idx >= 0 then Result := UpperCase(FByrefRetFuncs.ValueFromIndex[idx]);
+end;
+
 function TSSAGenerator.RawUDTPtrType(const Name: string): string;
 // The pointee UDT of a "T PTR" variable that holds a RAW ADDRESS rather than a record handle, or ''.
 begin
@@ -18964,6 +19396,56 @@ begin
   end;
 end;
 
+function TSSAGenerator.DeclaresAbstractMethod(const TypeName, MethNm: string): Boolean;
+// FreeBASIC "Declare Abstract Function f() As T": the type declares f but gives it NO body — every
+// concrete subtype must override it. The declaration is recorded on the antTypeDecl by the parser
+// (there is no procedure to record it on), and it is INHERITED: a middle type that neither redeclares
+// nor overrides f still has an abstract f. Walks the chain like ResolveMethodLabel.
+var
+  T, m: string;
+  Idx, Guard: Integer;
+begin
+  Result := False;
+  T := UpperCase(TypeName);
+  m := UpperCase(MethNm);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    if Assigned(FUDTs[Idx].Node) and
+       (FUDTs[Idx].Node.Attributes.Values['ABSTRACT' + m] = '1') then Exit(True);
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
+function TSSAGenerator.HasCallableMethod(const TypeName, MethNm: string; ArgsNode: TASTNode): Boolean;
+// True when "obj.MethNm(args)" on a TypeName-typed object names a method that can be called — either a
+// resolvable body (the ordinary case) or an ABSTRACT declaration backed by at least one override, which
+// has no body to resolve but is still a legal call. Call sites test this before handing over to
+// ProcessMethodCall; testing the label alone made an abstract call look like no method at all, and the
+// expression was then dropped without a word.
+begin
+  Result := (ResolveMethodLabelArgs(TypeName, MethNm, ArgsNode) <> '') or
+            (DeclaresAbstractMethod(TypeName, MethNm) and (AnyOverrideLabel(TypeName, MethNm) <> ''));
+end;
+
+function TSSAGenerator.AnyOverrideLabel(const TypeName, MethNm: string): string;
+// The label of SOME concrete override of MethNm within TypeName's subtree. An abstract method has no
+// body to resolve against, yet the call site still needs a signature to stage arguments with and a
+// return type to read the result from — every override shares them, so the first one answers for all.
+var
+  i: Integer;
+  m: string;
+begin
+  Result := '';
+  m := UpperCase(MethNm);
+  for i := 0 to High(FUDTs) do
+    if IsSubtypeOf(FUDTs[i].Name, TypeName) and FProcDecls.ContainsKey(FUDTs[i].Name + '.' + m) then
+      Exit(FUDTs[i].Name + '.' + m);
+end;
+
 function TSSAGenerator.BankToChar(Bank: TSSARegisterType): Char;
 // M4.4g: one-char code of a register bank for a constructor type signature.
 begin
@@ -19304,7 +19786,11 @@ var
 begin
   Result := False;
   baseLbl := ResolveMethodLabel(TypeName, MethNm);
-  if baseLbl = '' then Exit;
+  // No body anywhere up the chain, but the type DECLARES the method abstract: the call is polymorphic
+  // by construction — the only bodies that exist are the overrides. Without this the call resolved to
+  // no label at all and was dropped in silence.
+  if baseLbl = '' then
+    Exit(DeclaresAbstractMethod(TypeName, MethNm) and (AnyOverrideLabel(TypeName, MethNm) <> ''));
   m := UpperCase(MethNm);
   for i := 0 to High(FUDTs) do
     if IsSubtypeOf(FUDTs[i].Name, TypeName) and
@@ -19331,7 +19817,11 @@ begin
     T := Copy(FNeededDispatchers[d], 1, Pos('|', FNeededDispatchers[d]) - 1);
     m := Copy(FNeededDispatchers[d], Pos('|', FNeededDispatchers[d]) + 1, MaxInt);
     BaseLbl := ResolveMethodLabel(T, m);
-    if BaseLbl = '' then Continue;
+    // An ABSTRACT method has no base body to fall back on. The dispatcher is still built — the overrides
+    // are the only implementations there are — and it simply has no default arm: a handle whose type-id
+    // matches none of them returns without calling anything, which is the same "pure virtual, never
+    // instantiated" situation fbc rejects at compile time.
+    if (BaseLbl = '') and not DeclaresAbstractMethod(T, m) then Continue;
     DispLbl := ProcedureLabelName('VDISP.' + T + '.' + m);
 
     FCurrentBlock := FProgram.GetOrCreateBlock(DispLbl);
@@ -19367,8 +19857,10 @@ begin
         FCurrentBlock := FProgram.GetOrCreateBlock(NextLabel);  // continue with the next test
       end;
 
-    // Default: no subtype matched — call the statically resolved base method, then return.
-    EmitCallSubLabel(ProcedureLabelName(BaseLbl));
+    // Default: no subtype matched — call the statically resolved base method, then return. An abstract
+    // declaration has no such method: fall straight through to the return.
+    if BaseLbl <> '' then
+      EmitCallSubLabel(ProcedureLabelName(BaseLbl));
     EmitInstruction(ssaReturnSub, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     FCurrentBlock := nil;
   end;
@@ -20054,6 +20546,93 @@ begin
   CondBlock.AddSuccessor(EndBlock); EndBlock.AddPredecessor(CondBlock);
 end;
 
+procedure TSSAGenerator.EmitRecordArrayConstruct(ArrayIdx: Integer; const TypeName: string;
+  FromFlatIndex: Integer);
+// Run the DEFAULT constructor on every element of a DIM'd array-of-UDT, from flat index FromFlatIndex on.
+// "Dim a(1 To 3) As T" declares THREE objects, and FreeBASIC constructs each one: only the scalar case
+// was ever constructed here, so every element of an array came up with its fields at 0 -- a member
+// function pointer among them read as procedure 0, which is the module entry point, and calling it
+// re-ran the program.
+// The loop is the same runtime shape EmitRecordArrayInit uses (flat count from the bounds, so it covers
+// multi-dim and runtime-sized arrays alike); FromFlatIndex skips the leading elements an initializer
+// list has already constructed with arguments of their own.
+var
+  ArrayRef, One, Acc, DimReg, Ub, Lb, Diff, Cnt, NewAcc: TSSAValue;
+  CmpReg, HandleVal, CounterVar: TSSAValue;
+  d, DimCount: Integer;
+  CounterName, CondLabel, BodyLabel, IncrLabel, EndLabel: string;
+  PrevBlock, CondBlock, BodyBlock, IncrBlock, EndBlock: TSSABasicBlock;
+begin
+  // Nothing to run without a constructor callable with NO arguments — which includes one whose every
+  // parameter carries a default ("Constructor(ht As handlertype = ht_default)"), the form this example
+  // is built on. Testing the exact empty signature alone declared that type constructor-less.
+  if (ResolveConstructorLabel(TypeName, '') = '') and (FindCtorWithDefaults(TypeName, 0) = '') then Exit;
+  ArrayRef := MakeSSAArrayRef(ArrayIdx, srtInt);
+  DimCount := FProgram.GetArray(ArrayIdx).DimCount;
+  if DimCount < 1 then DimCount := 1;
+
+  One := EnsureIntRegister(MakeSSAConstInt(1));
+  Acc := EnsureIntRegister(MakeSSAConstInt(1));
+  for d := 0 to DimCount - 1 do
+  begin
+    DimReg := EnsureIntRegister(MakeSSAConstInt(d));
+    Ub := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    Lb := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaArrayUBound, Ub, ArrayRef, DimReg, MakeSSAValue(svkNone));
+    EmitInstruction(ssaArrayLBound, Lb, ArrayRef, DimReg, MakeSSAValue(svkNone));
+    Diff := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, Diff, Ub, Lb, MakeSSAValue(svkNone));
+    Cnt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, Cnt, Diff, One, MakeSSAValue(svkNone));
+    NewAcc := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, NewAcc, Acc, Cnt, MakeSSAValue(svkNone));
+    Acc := NewAcc;
+  end;
+
+  CounterName := '__RECARRCTOR%' + IntToStr(FScopeSerial);
+  Inc(FScopeSerial);
+  CounterVar := DeclareVariableTyped(CounterName, srtInt);
+  EmitInstruction(ssaLoadConstInt, CounterVar, MakeSSAConstInt(FromFlatIndex),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  CondLabel := GenerateUniqueLabel('recarrctor_cond');
+  BodyLabel := GenerateUniqueLabel('recarrctor_body');
+  IncrLabel := GenerateUniqueLabel('recarrctor_incr');
+  EndLabel  := GenerateUniqueLabel('recarrctor_end');
+
+  PrevBlock := FCurrentBlock;
+  EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  FCurrentBlock := FProgram.CreateBlock(CondLabel);
+  CondBlock := FCurrentBlock;
+  if Assigned(PrevBlock) then begin PrevBlock.AddSuccessor(CondBlock); CondBlock.AddPredecessor(PrevBlock); end;
+  CmpReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpLtInt, CmpReg, EnsureIntRegister(GetOrAllocateVariable(CounterName)), Acc, MakeSSAValue(svkNone));
+  EmitInstruction(ssaJumpIfZero, MakeSSALabel(EndLabel), CmpReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // body: load this element's record handle and construct it.
+  FCurrentBlock := FProgram.CreateBlock(BodyLabel);
+  BodyBlock := FCurrentBlock;
+  CondBlock.AddSuccessor(BodyBlock); BodyBlock.AddPredecessor(CondBlock);
+  HandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaArrayLoad, HandleVal, ArrayRef,
+                  EnsureIntRegister(GetOrAllocateVariable(CounterName)), MakeSSAValue(svkNone));
+  EmitConstructorCall(HandleVal, TypeName, nil);
+  EmitInstruction(ssaJump, MakeSSALabel(IncrLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  FCurrentBlock := FProgram.CreateBlock(IncrLabel);
+  IncrBlock := FCurrentBlock;
+  BodyBlock.AddSuccessor(IncrBlock); IncrBlock.AddPredecessor(BodyBlock);
+  EmitInstruction(ssaAddInt, GetOrAllocateVariable(CounterName),
+                  EnsureIntRegister(GetOrAllocateVariable(CounterName)),
+                  EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+  EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  IncrBlock.AddSuccessor(CondBlock); CondBlock.AddPredecessor(IncrBlock);
+
+  FCurrentBlock := FProgram.CreateBlock(EndLabel);
+  EndBlock := FCurrentBlock;
+  CondBlock.AddSuccessor(EndBlock); EndBlock.AddPredecessor(CondBlock);
+end;
+
 procedure TSSAGenerator.EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx: Integer; ArgsNode: TASTNode);
 // FreeBASIC aggregate initialization "Dim As T v = (a, b, c)" and "Type<T>(a, b, c)": a UDT with no
 // constructor is initialized field-by-field — store each value into the field at the same position (in
@@ -20234,7 +20813,17 @@ begin
   if Lbl <> '' then
   begin
     EmitXferStore(srtInt, 0, HandleVal);
-    EmitCallSubLabel(ProcedureLabelName(Lbl));
+    // A destructor is dispatched on the instance's RUNTIME type like any other method: "Delete p" through
+    // a base-typed pointer must run the DERIVED destructor (which then chains up to this one). Resolving
+    // it statically ran the base's body and nothing else, so a derived object was announced as destroyed
+    // by the wrong destructor — and its own was never called at all.
+    if MethodNeedsDispatch(TypeName, 'DESTRUCTOR') then
+    begin
+      FNeededDispatchers.Add(UpperCase(TypeName) + '|DESTRUCTOR');
+      EmitCallSubLabel(ProcedureLabelName('VDISP.' + UpperCase(TypeName) + '.DESTRUCTOR'));
+    end
+    else
+      EmitCallSubLabel(ProcedureLabelName(Lbl));
   end;
   // 2) then destroy nested-UDT members, reverse declaration order (inherited fields included — they
   //    are part of FUDTs[UDTIdx].Fields via the prefix layout, so a single pass covers the whole object).
@@ -20385,6 +20974,29 @@ begin
       TName := Copy(FCurrentProcByvalRecs[i], bar + 1, MaxInt);
       EmitDestructorCall(GetOrAllocateVariable(VName), TName);
     end;
+  EmitBaseDestructorChain;
+end;
+
+procedure TSSAGenerator.EmitBaseDestructorChain;
+// Inside a DESTRUCTOR body, the base subobject is destroyed after this type's own body has run — the
+// mirror image of the constructor prologue, which builds the base FIRST. Nothing did this: only the
+// most-derived destructor ran, so "Delete d" printed the dog's line and neither the animal's nor the
+// root's. The call is deliberately STATIC (ResolveMethodLabel, not the dispatcher): the runtime type is
+// the derived one, and dispatching would call this very destructor again, forever.
+// Only the base's BODY is invoked, not EmitDestructorCall: with EXTENDS the inherited fields sit at the
+// same prefix slots of THIS object, so the nested-member pass this frame already ran covered them.
+var
+  OwnerUDT: Integer;
+  ParentLbl: string;
+begin
+  if FCurrentThisType = '' then Exit;
+  if Pos('.DESTRUCTOR', UpperCase(FCurrentProcName)) <= 0 then Exit;
+  OwnerUDT := FindUDT(FCurrentThisType);
+  if (OwnerUDT < 0) or (FUDTs[OwnerUDT].Parent = '') then Exit;
+  ParentLbl := ResolveMethodLabel(FUDTs[OwnerUDT].Parent, 'DESTRUCTOR');
+  if ParentLbl = '' then Exit;
+  EmitXferStore(srtInt, 0, GetOrAllocateVariable('THIS'));
+  EmitCallSubLabel(ProcedureLabelName(ParentLbl));
 end;
 
 procedure TSSAGenerator.EmitByrefParamStore;
@@ -20453,8 +21065,26 @@ begin
     // UDT variable with a string. FreeBASIC binds such a conversion to a temporary too, for this reason.
     if (RT = srtString) and HasUDTStringCast(ArgExpr) then Continue;
     if ArgExpr.NodeType = antIdentifier then
+    begin
       // Plain variable arg: copy the slot's final value straight back into it.
-      EmitXferLoad(RT, Slot, GetOrAllocateVariable(UpperCase(VarToStr(ArgExpr.Value))))
+      // ...but a SHARED scalar does not LIVE in a register: it is backed by element 0 of a global array
+      // (see IsSharedScalar), and every ordinary read/write of it is routed there. Writing the register
+      // alone left the backing untouched, so the callee's changes vanished the moment the caller read
+      // the variable again - silently, and only for SHARED arguments. That is what made a bignum's
+      // limb COUNT stop updating in pidigits while the limbs themselves updated fine.
+      if IsSharedScalar(UpperCase(VarToStr(ArgExpr.Value))) then
+      begin
+        case RT of
+          srtInt:    TmpName := '__BRWTMP%';
+          srtString: TmpName := '__BRWTMP$';
+        else         TmpName := '__BRWTMP!';
+        end;
+        EmitXferLoad(RT, Slot, GetOrAllocateVariable(TmpName));
+        EmitSharedScalarStoreVal(UpperCase(VarToStr(ArgExpr.Value)), GetOrAllocateVariable(TmpName));
+      end
+      else
+        EmitXferLoad(RT, Slot, GetOrAllocateVariable(UpperCase(VarToStr(ArgExpr.Value))));
+    end
     else if (ArgExpr.NodeType = antArrayAccess) and (ArgExpr.ChildCount >= 2) and
             (ArgExpr.GetChild(0).NodeType = antIdentifier) and
             (ArrayIndexOf(VarToStr(ArgExpr.GetChild(0).Value)) >= 0) then
@@ -21606,8 +22236,23 @@ end;
 function TSSAGenerator.IsRawPtr(const Name: string): Boolean;
 // A pointer variable whose value is a raw byte-heap offset (it was assigned from Allocate/CAllocate/
 // Reallocate). Its deref and arithmetic use the raw heap (SizeOf-scaled), not the managed path.
+var
+  Pointee: string;
 begin
   Result := FRawPtrVars.IndexOf(UpperCase(Name)) >= 0;
+  if Result then Exit;
+  // ...and a "T Ptr Ptr" PARAMETER is raw by construction. The managed model pairs a "T Ptr" with a
+  // RECORD of type T; a "T Ptr Ptr" has no record to be a handle to, so its value can only be an
+  // address. This is what a C argv is ("ZString Ptr Ptr"), and a parameter is exactly the case no
+  // assignment scan ever sees: the manual's __FB_ARGV__ example passes the vector to a SUB, and there
+  // the pointer arrived unclassified and took the managed path.
+  // ...but ONLY a parameter. A DIM'd "T Ptr Ptr" IS visible to CollectRawPtrVars, which knows the two
+  // address families apart: "pp = @p" (the address of a managed pointer VARIABLE, a packed address)
+  // is not a byte-heap offset, and derefing it raw fails outright. Let the scan rule on those.
+  if FCurrentProcPtrParams = nil then Exit;
+  if FCurrentProcPtrParams.IndexOfName(UpperCase(Name)) < 0 then Exit;
+  Pointee := UpperCase(ManagedPtrPointee(Name));
+  Result := (Length(Pointee) > 4) and (Copy(Pointee, Length(Pointee) - 3, 4) = ' PTR');
 end;
 
 function TSSAGenerator.IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;
@@ -21640,7 +22285,7 @@ begin
     U := UpperCase(VarToStr(Node.GetChild(0).Value))
   else
     Exit;
-  Result := FModernMode and (U = kSCREENPTR) and (ArrayIndexOf(U) < 0);
+  Result := FModernMode and ((U = kSCREENPTR) or (U = ARGV_PTR_NAME)) and (ArrayIndexOf(U) < 0);
 end;
 
 procedure TSSAGenerator.EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);
@@ -22565,6 +23210,16 @@ begin
     else if (Node.GetChild(1).NodeType = antIdentifier) and
             (ManagedPtrPointee(VarToStr(Node.GetChild(1).Value)) <> '') then
       Result := DerefedType(Node.GetChild(1));
+  end
+  else if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
+          (Node.GetChild(0).NodeType = antIdentifier) then
+  begin
+    // "*p[i]" on a MULTI-LEVEL pointer: p[i] is itself of p's pointee type, so dereferencing it strips
+    // one more PTR level. Only the composed spelling was missing -- "q = p[i] : *q" already worked, in
+    // two statements, which is what made the gap look like a deref bug rather than a typing one.
+    T := UpperCase(ManagedPtrPointee(VarToStr(Node.GetChild(0).Value)));
+    if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+      Result := Trim(Copy(T, 1, Length(T) - 4));
   end;
 end;
 
@@ -22887,6 +23542,59 @@ begin
   Result := FByrefRetFuncs.IndexOfName(UpperCase(Name)) >= 0;
 end;
 
+function IsAddressableReturn(N: TASTNode): Boolean;
+// Does this returned expression name a place with an address? A bare variable does; so does an element
+// reached through the SQUARE-bracket index of a pointer ("This.buf[i]"), which is what a BYREF index
+// operator hands back. Anything else — a literal, arithmetic, a call — has no address to return.
+// Deliberately shape-based: this runs in the declaration pre-scan, where no type information exists yet.
+begin
+  Result := False;
+  if N = nil then Exit;
+  while (N.NodeType = antParentheses) and (N.ChildCount >= 1) do N := N.GetChild(0);
+  if N.NodeType = antIdentifier then Exit(True);
+  Result := (N.NodeType = antArrayAccess) and (N.Attributes.Values['BRACKET'] = '1') and
+            (N.ChildCount >= 2) and
+            (N.GetChild(0).NodeType in [antIdentifier, antMemberAccess]);
+end;
+
+function TSSAGenerator.BodyReturnsRawIndexedElement(Decl: TASTNode): Boolean;
+// Does this BYREF-returning body hand back an element reached through a square-bracket index — i.e. a
+// RAW byte-heap address rather than a backed variable's packed one? See the call site for why the two
+// must be told apart.
+  function Scan(N: TASTNode): Boolean;
+  var
+    i: Integer;
+    Ret, Tgt: TASTNode;
+  begin
+    Result := False;
+    if N = nil then Exit;
+    Ret := nil;
+    if (N.NodeType = antReturn) and (N.ChildCount >= 1) then
+      Ret := N.GetChild(0)
+    else if (N.NodeType = antAssignment) and (N.ChildCount >= 2) then
+    begin
+      Tgt := N.GetChild(0);
+      if (Tgt.NodeType = antIdentifier) and
+         ((UpperCase(VarToStr(Tgt.Value)) = kFUNCTION) or (UpperCase(VarToStr(Tgt.Value)) = kOPERATOR)) then
+        Ret := N.GetChild(1);
+    end;
+    if Assigned(Ret) then
+    begin
+      while (Ret.NodeType = antParentheses) and (Ret.ChildCount >= 1) do Ret := Ret.GetChild(0);
+      if (Ret.NodeType = antArrayAccess) and (Ret.Attributes.Values['BRACKET'] = '1') then Exit(True);
+    end;
+    for i := 0 to N.ChildCount - 1 do
+      if Scan(N.GetChild(i)) then Exit(True);
+  end;
+begin
+  Result := Scan(Decl);
+end;
+
+function TSSAGenerator.ByrefRetIsRaw(const Name: string): Boolean;
+begin
+  Result := FByrefRetRaw.IndexOf(UpperCase(Name)) >= 0;
+end;
+
 function TSSAGenerator.BodyReturnsNonAddressable(Decl: TASTNode): Boolean;
 // Does this procedure body ever hand back something that has no address - a literal, or any expression
 // that is not a plain variable name? "Function = s" can be a reference; "Function = "abcd"" cannot.
@@ -22901,12 +23609,13 @@ function TSSAGenerator.BodyReturnsNonAddressable(Decl: TASTNode): Boolean;
     // "Function = expr" / "<procname> = expr" is an assignment whose target is the result name;
     // "Return expr" is antReturn with the expression as its child.
     if (N.NodeType = antReturn) and (N.ChildCount >= 1) then
-      Result := N.GetChild(0).NodeType <> antIdentifier
+      Result := not IsAddressableReturn(N.GetChild(0))
     else if (N.NodeType = antAssignment) and (N.ChildCount >= 2) then
     begin
       Tgt := N.GetChild(0);
-      if (Tgt.NodeType = antIdentifier) and (UpperCase(VarToStr(Tgt.Value)) = kFUNCTION) then
-        Result := N.GetChild(1).NodeType <> antIdentifier;
+      if (Tgt.NodeType = antIdentifier) and
+         ((UpperCase(VarToStr(Tgt.Value)) = kFUNCTION) or (UpperCase(VarToStr(Tgt.Value)) = kOPERATOR)) then
+        Result := not IsAddressableReturn(N.GetChild(1));
     end;
     if Result then Exit;
     for i := 0 to N.ChildCount - 1 do
@@ -23691,6 +24400,12 @@ begin
   // Overload-aware: a method declared twice with different parameter types has no bare label, so pick by
   // the argument banks (ArgsNode carries no THIS, and neither does the label's signature).
   MethodLabel := ResolveMethodLabelArgs(ObjType, MethNm, ArgsNode);   // static (base) target
+  // An ABSTRACT method has no static target at all: the declaring type gives it no body. Borrow the
+  // signature and return type of one of its overrides — every override must match the declaration, so
+  // any of them stages the same arguments and returns into the same slot. The call itself still goes
+  // through the dispatcher below (MethodNeedsDispatch answers True for exactly this case).
+  if MethodLabel = '' then
+    MethodLabel := AnyOverrideLabel(ObjType, MethNm);
   if MethodLabel = '' then Exit;
   RetRecType := VarRecordTypeName(MethodLabel);          // V3: '' unless it returns a UDT by value
 
@@ -24002,7 +24717,9 @@ begin
   // The members are module-wide constants under their bare names, so hand the bare name to the ordinary
   // identifier path. Without this the qualified form fell through to the UDT member machinery, which had
   // no such type, and every "E.<member>" answered the same wrong value.
-  if (Node.GetChild(0).NodeType = antIdentifier) and
+  // ...and an enum NESTED IN A TYPE is named through both ("Type.enumname.member"), so the qualifier may
+  // itself be a member access whose last segment is the enum name. Same answer: the bare member.
+  if ((Node.GetChild(0).NodeType = antIdentifier) or (Node.GetChild(0).NodeType = antMemberAccess)) and
      (FEnumNames.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) then
   begin
     AccNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Node.Value)), Node.Token);
@@ -24031,8 +24748,7 @@ begin
   begin
     // Not a field — try a no-argument method call obj.method (M4.1), walking inheritance (M4.2).
     // Args-aware with a nil list, so an overload set is searched for its zero-parameter member.
-    MethodLbl := ResolveMethodLabelArgs(TypeName, VarToStr(Node.Value), nil);
-    if MethodLbl <> '' then
+    if HasCallableMethod(TypeName, VarToStr(Node.Value), nil) then
       // "base.method" written WITHOUT parentheses is the same super call as "base.method()", and it
       // needs the same NON-VIRTUAL dispatch: ObjectTypeName has already resolved `base` to the parent
       // type, but a virtual call would go back through the instance's runtime type and land on the
@@ -24414,6 +25130,13 @@ begin
     // literal, an expression) has to return by value, and the caller must agree - see ByrefRetByAddress.
     if BodyReturnsNonAddressable(Node) and (FByrefRetValue.IndexOf(Name) < 0) then
       FByrefRetValue.Add(Name);
+    // ...and WHICH KIND of address it is. There are two, and they are not interchangeable: the packed
+    // address of a backed VARIABLE, read and written with ssaRefLoad/Store, and a RAW BYTE-HEAP address
+    // (tagged in bit 62), which those two reject outright — dereferencing one raised "invalid pointer".
+    // A body returning "buf[i]" hands back the second kind. Decided here, with the same shape test the
+    // addressability question uses, because the CALLER must agree and is lowered first.
+    if BodyReturnsRawIndexedElement(Node) and (FByrefRetRaw.IndexOf(Name) < 0) then
+      FByrefRetRaw.Add(Name);
   end;
   // (FUNCTION returning a raw "<scalar> PTR" is collected earlier by CollectRawPtrRetFuncs, before
   // CollectRawPtrVars, so a var assigned from such a call can be propagated raw.)
@@ -25423,7 +26146,12 @@ begin
     antOnGosub: ProcessOnGosub(Node);
     antProcedureDecl: CollectProcedureDecl(Node);
     antProcedureCall: ProcessProcedureCall(Node);
-    antTypeDecl: ;  // UDT declaration: registered in the pre-scan (RegisterUDTs); nothing to emit.
+    antTypeDecl:
+      // UDT declaration: registered in the pre-scan (RegisterUDTs); nothing to emit — except a nested
+      // ENUM, whose members are module constants and still need their values assigned.
+      for i := 0 to Node.ChildCount - 1 do
+        if Node.GetChild(i).NodeType = antEnum then
+          ProcessStatement(Node.GetChild(i));
     antProgram, antStatement, antThen, antElse:
       for i := 0 to Node.ChildCount - 1 do
         ProcessStatement(Node.GetChild(i));
@@ -25572,7 +26300,11 @@ begin
     antProcedureCall:
       ProcessProcedureCall(Node);
     antTypeDecl:
-      ;  // UDT declaration: registered in the pre-scan (RegisterUDTs); nothing to emit here.
+      // UDT declaration: registered in the pre-scan (RegisterUDTs); nothing to emit here — except a
+      // nested ENUM, whose members are module constants and still need their values assigned.
+      for i := 0 to Node.ChildCount - 1 do
+        if Node.GetChild(i).NodeType = antEnum then
+          ProcessStatement(Node.GetChild(i));
     antMemberAccess, antArrayAccess, antFunctionCall, antGraphicsFunction:
       // Statement-level call for side effects (e.g. obj.method(args), a function/array expression used
       // as a statement, or GETMOUSE(x,y) called for its by-reference writes). Lower and discard the result.
@@ -25656,6 +26388,7 @@ begin
     antPalette: ProcessPalette(Node);
     antGfxColor: ProcessGfxColor(Node);
     antImageDestroy: ProcessImageDestroy(Node);
+    antImageConvertRow: ProcessImageConvertRow(Node);
     antImageInfo: ProcessImageInfo(Node);
     antGfxGet: ProcessGfxGet(Node);
     antGfxPut: ProcessGfxPut(Node);
@@ -25798,6 +26531,12 @@ begin
             EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(GetOrAllocateVariable(VarToStr(Node.GetChild(0).Value))))
           else if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) then
             EmitXferStore(srtInt, XFER_RESULT_SLOT, EmitVarAddress(VarToStr(Node.GetChild(0).Value)))
+          // ...and an INDEXED byte on the raw heap is just as addressable as a named variable:
+          // "Operator T.[] (i) ByRef As Byte : Return This.buf[i]" is the whole point of an index
+          // operator, and only a bare name was ever recognised here.
+          else if FCurrentProcByrefRet and
+                  TryEmitIndexedElementAddress(Node.GetChild(0), RetVal) then
+            EmitXferStore(srtInt, XFER_RESULT_SLOT, RetVal)
           else
           begin
             // FreeBASIC "Return Type(args)" shorthand: the bare Type() carries no <T>, so fill its type
@@ -26544,10 +27283,33 @@ begin
         Result := MakeSSARegister(srtInt, TempReg);
         EmitInstruction(ssaFloatToInt, Result, Val, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
+      else if Val.RegType = srtString then
+      begin
+        // A STRING asked for as an integer is VAL(s), rounded - the coercion FreeBASIC performs when a
+        // string reaches an integer context. Handing the string register back unchanged (what this did,
+        // under a comment predicting "will likely cause error later") produced no error at all: the
+        // caller went on to use a STRING register index as an INT one. "Print CInt(""3"")" looked
+        // right, because PRINT read it back in the bank it was really in - but "CInt(""3"") - 1"
+        // answered -1 and "CInt(""3"") + 10" answered 33, silently, in any expression around it.
+        FloatReg := FProgram.AllocRegister(srtFloat);
+        FloatRegVal := MakeSSARegister(srtFloat, FloatReg);
+        EmitInstruction(ssaStrVal, FloatRegVal, Val, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        TempReg := FProgram.AllocRegister(srtInt);
+        Result := MakeSSARegister(srtInt, TempReg);
+        // Round, not truncate: the same rounding an assignment to an Integer performs.
+        EmitInstruction(ssaFloatRound, Result, FloatRegVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
       else
-        // String or other - return as-is (will likely cause error later)
+        // Neither int, float nor string (an untyped/absent value): nothing to convert.
         Result := Val;
     end;
+    // A string LITERAL never became a register at all, so it missed the conversion above and reached
+    // its use still a string: this is the "CInt(""3"") - 1 = -1" half of the same defect. Materialise
+    // it and take the same route, rather than folding it here with a second copy of VAL's rules -
+    // FreeBASIC's VAL parses a LEADING number ("12abc" is 12, "&H1F" is 31), and a private
+    // reimplementation of that would be free to drift from the one the VM actually runs.
+    svkConstString:
+      Result := EnsureIntRegister(EnsureStringRegister(Val));
   else
     // For other kinds, return as-is
     Result := Val;

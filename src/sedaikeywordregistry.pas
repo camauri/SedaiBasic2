@@ -1880,6 +1880,9 @@ begin
  RegisterKeyword(kIMAGECREATE,  ttGraphicsFunction, 'FreeBASIC: allocate an image surface -> handle', kcGraphicsHandling);
  RegisterKeyword(kIMAGEDESTROY, ttGraphicsCommand,  'FreeBASIC: free an image surface',               kcGraphicsHandling);
  RegisterKeyword(kIMAGEINFO,    ttGraphicsCommand,  'FreeBASIC: query an image surface width/height', kcGraphicsHandling);
+ RegisterKeyword(kREGEXCOUNT,   ttStringFunction, 'Regular-expression match count',   kcStringFunctions);
+ RegisterKeyword(kREGEXREPLACE, ttStringFunction, 'Regular-expression replace all',   kcStringFunctions);
+ RegisterKeyword(kIMAGECONVERTROW, ttGraphicsCommand, 'FreeBASIC: convert a pixel row between colour depths', kcGraphicsHandling);
  RegisterKeyword(kSCREENINFO,   ttGraphicsCommand,  'FreeBASIC: query the graphics screen width/height/depth', kcGraphicsHandling);
  RegisterKeyword(kSCREENLOCK,   ttGraphicsCommand,  'FreeBASIC: begin direct screen access (no-op)',  kcGraphicsHandling);
  RegisterKeyword(kSCREENUNLOCK, ttGraphicsCommand,  'FreeBASIC: end direct screen access (no-op)',    kcGraphicsHandling);

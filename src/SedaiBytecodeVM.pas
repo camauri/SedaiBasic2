@@ -41,7 +41,7 @@ unit SedaiBytecodeVM;
 interface
 
 uses
-  Classes, SysUtils, Math, Variants, StrUtils, DateUtils,
+  Classes, SysUtils, Math, Variants, StrUtils, DateUtils, RegExpr,
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
   SedaiConsoleBehavior, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue,
@@ -491,6 +491,7 @@ type
     function StrSAdd(const S: string): Int64;   // SADD(s) -> raw pointer to a NUL-terminated byte copy
     function FormatNumber(Value: Double; const Mask: string): string;  // FORMAT(num, mask) -> formatted string (numeric masks)
     function FormatDateMask(Value: Double; const Mask: string): string;  // FORMAT(serial, mask) -> date/time formatted string
+    procedure ImageConvertRowExec(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);  // IMAGECONVERTROW
     function CommandLine(Index: Integer): string;  // COMMAND$(index) -> command-line argument(s)
     function DiskStatusString: string;  // DS$ -> Commodore disk status line "NN, MESSAGE,00,00"
     function FileLength(const Path: string): Int64;   // FILELEN(path) -> file size in bytes (0 if absent)
@@ -5575,13 +5576,107 @@ begin
     FProgramArgs[i] := Args[i];
 end;
 
+procedure TBytecodeVM.ImageConvertRowExec(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+// IMAGECONVERTROW(src, src_bpp, dst, dst_bpp, width [, isrgb]): copy one row of pixels from one raw
+// address to another, converting the colour information to the destination's depth.
+//
+// Both ends live on the raw heap (or the framebuffer region), so every access goes through RawLoadInt/
+// RawStoreInt, which bounds-check their own region: a width that runs off the row is caught rather
+// than silently reading whatever follows.
+//
+// Depths, per the manual: source 1-8 (paletted), 24 or 32; destination 1-8, 16 or 32. Paletted values
+// are palette INDICES and are looked up through the current palette when the destination is a
+// full-colour depth; a paletted destination takes the index through unchanged (fbc requires the two
+// palettes to match, and we cannot check that either). isrgb = 0 swaps red and blue.
+var
+  SrcAddr, DstAddr: Int64;
+  SrcBpp, DstBpp, Width, IsRgb, i: Integer;
+  Px, R, G, B, A: Int64;
+
+  function ReadPixel(Idx: Integer): Int64;
+  begin
+    case SrcBpp of
+      24: Result := RawLoadInt(SrcAddr + Idx * 3, RTC_I32) and $00FFFFFF;
+      32: Result := RawLoadInt(SrcAddr + Idx * 4, RTC_I32) and $FFFFFFFF;
+    else  Result := RawLoadInt(SrcAddr + Idx, RTC_I8) and $FF;   // 1..8 bpp: one palette index per byte
+    end;
+  end;
+
+begin
+  SrcAddr := Ctx.IntRegs[Instr.Src1];
+  DstAddr := Ctx.IntRegs[Instr.Src2];
+  SrcBpp  := Ctx.IntRegs[Instr.Immediate and $FFFF];
+  DstBpp  := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];
+  Width   := Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF];
+  IsRgb   := Ctx.IntRegs[(Instr.Immediate shr 48) and $FFFF];
+  if (Width <= 0) or (SrcAddr = 0) or (DstAddr = 0) then Exit;
+
+  for i := 0 to Width - 1 do
+  begin
+    Px := ReadPixel(i);
+    if SrcBpp <= 8 then
+    begin
+      if DstBpp <= 8 then
+      begin
+        RawStoreInt(DstAddr + i, RTC_I8, Px);        // paletted -> paletted: the index travels as-is
+        Continue;
+      end;
+      if Assigned(FGraphics) then Px := Int64(FGraphics.GetPaletteColor(Integer(Px)))
+      else Px := 0;
+    end;
+    // Engine layout is ABGR ($AABBGGRR), so R is the low byte and B the high one of the colour.
+    R := Px and $FF;
+    G := (Px shr 8) and $FF;
+    B := (Px shr 16) and $FF;
+    if SrcBpp = 32 then A := (Px shr 24) and $FF else A := $FF;
+    if IsRgb = 0 then begin Px := R; R := B; B := Px; end;   // "the channels are the other way round"
+    case DstBpp of
+      16: // RGB565: red in the HIGH bits (11-15), green 5-10, blue 0-4. That layout is the standard's,
+          // not a choice - fbc packs it the same way, so this half is comparable byte for byte.
+        RawStoreInt(DstAddr + i * 2, RTC_I16,
+                    ((R shr 3) shl 11) or ((G shr 2) shl 5) or (B shr 3));
+      32:
+        RawStoreInt(DstAddr + i * 4, RTC_I32, R or (G shl 8) or (B shl 16) or (A shl 24));
+    else
+      RawStoreInt(DstAddr + i, RTC_I8, R);           // a full-colour source into a paletted row
+    end;
+  end;
+end;
+
 function TBytecodeVM.CommandLine(Index: Integer): string;
 // COMMAND$(index): index < 0 -> the whole command line (program args, space-separated); 0 -> the
 // executable name; n >= 1 -> the n-th program argument ('' if out of range). FProgramArgs holds the
 // arguments only (arg 1 at FProgramArgs[0]); the interpreter/script name is excluded.
+//
+// Two indices below that are NOT a COMMAND$ the user can write: they carry FreeBASIC's __FB_ARGC__ and
+// __FB_ARGV__, which are values of the implicit main and have no spelling of their own. Both are
+// RUNTIME facts, so neither can be a preprocessor constant; and neither is worth an opcode of its own
+// (see the opcode checklist: compose from what exists unless there is no field left to discriminate
+// with). The index field was free below -1, so the macros expand to COMMAND$(-2)/(-3) and convert.
+//   -2 -> argc, as decimal text: the argument count INCLUDING the program name, as fbc counts it.
+//   -3 -> argv, as decimal text: the raw address of a freshly built vector of pointers to NUL-
+//         terminated copies of the arguments, so "*argv[i]" reads the i-th one.
 var
   i: Integer;
+  Vec, SPtr: Int64;
 begin
+  if Index = -2 then
+    Exit(IntToStr(Length(FProgramArgs) + 1));      // + the program name, which is argv[0]
+  if Index = -3 then
+  begin
+    // Built on demand and owned by the raw heap. One allocation for the vector plus one per argument;
+    // they live as long as the program does, which is what a C argv is entitled to assume.
+    Vec := RawAlloc(PtrUInt((Length(FProgramArgs) + 1) * SizeOf(Int64)));
+    if (Vec and RAWPTR_TAG) = 0 then Exit('0');
+    SPtr := StrSAdd(ParamStr(0));
+    RawStoreInt(Vec, RTC_I64, SPtr);
+    for i := 0 to High(FProgramArgs) do
+    begin
+      SPtr := StrSAdd(FProgramArgs[i]);
+      RawStoreInt(Vec + (i + 1) * SizeOf(Int64), RTC_I64, SPtr);
+    end;
+    Exit(IntToStr(Vec));
+  end;
   if Index < 0 then
   begin
     Result := '';
@@ -7812,10 +7907,60 @@ end;
   the runtime helper). Copy() builds a NEW string before the managed assignment, so a dst
   that aliases the source is safe, as everywhere else in this family. StrMid is dialect-
   variant: the run loop installs the Modern or Classic flavor per program (TAotCtx.StrMid). }
+procedure AssignSubstr(var D: AnsiString; const S: AnsiString; Start, Cnt: SizeInt);
+// D := Copy(S, Start, Cnt), but REUSING D's buffer when nothing else shares it.
+//
+// The obvious "D := Copy(S, Start, Cnt)" allocates a fresh buffer on every call and frees the old
+// one, and measurement says that the allocation - not the copying - is what a string primitive costs
+// here: MID$ of ONE character and MID$ of 128 both cost the same 131 ns, and a raw GetMem/FreeMem
+// pair alone is 48 ns. SetLength on an unshared string reuses the block instead: 30 ns against
+// Copy's 66. Every per-character loop in the string benchmarks pays this on every single character.
+//
+// The reuse is only taken when D's buffer is UNSHARED and is not S's own buffer. Letting SetLength
+// handle a shared buffer instead would be correct but slower than what it replaces: SetLength copies
+// the old contents into the new block before we overwrite them, so a shared destination paid for a
+// copy of bytes nobody wanted. Reading the refcount first and falling back to Copy avoids that.
+begin
+  if Cnt <= 0 then
+  begin
+    D := '';
+    Exit;
+  end;
+  if Start < 1 then Start := 1;
+  if Start + Cnt - 1 > Length(S) then
+  begin
+    Cnt := Length(S) - Start + 1;
+    if Cnt <= 0 then
+    begin
+      D := '';
+      Exit;
+    end;
+  end;
+  if (Pointer(D) <> nil) and (Pointer(D) <> Pointer(S)) and (StringRefCount(D) = 1) then
+  begin
+    SetLength(D, Cnt);
+    Move(S[Start], D[1], Cnt);
+  end
+  else
+    D := Copy(S, Start, Cnt);
+end;
+
+procedure AssignChar(var D: AnsiString; Code: Byte);
+// D := Chr(Code), reusing D's buffer. Same reasoning as AssignSubstr: CHR$ measured 182 ms per
+// million calls, essentially all of it the allocation of a one-byte string. When the destination
+// register already holds an unshared single character - which is exactly what a CHR$ in a loop
+// does every time round - this writes one byte and touches the heap not at all.
+begin
+  if (Pointer(D) <> nil) and (Length(D) = 1) and (StringRefCount(D) = 1) then
+    PByte(Pointer(D))^ := Code
+  else
+    D := Chr(Code);
+end;
+
 procedure AotStrLeft(dstSlot, sVal: Pointer; n: PtrInt); cdecl;
 begin
   if n < 0 then n := 0;
-  PAnsiString(dstSlot)^ := Copy(AnsiString(sVal), 1, n);
+  AssignSubstr(PAnsiString(dstSlot)^, AnsiString(sVal), 1, n);
 end;
 
 procedure AotStrRight(dstSlot, sVal: Pointer; n: PtrInt); cdecl;
@@ -7825,7 +7970,7 @@ begin
   L := Length(AnsiString(sVal));
   if n < 0 then n := 0;
   if n > L then n := L;
-  PAnsiString(dstSlot)^ := Copy(AnsiString(sVal), L - n + 1, n);
+  AssignSubstr(PAnsiString(dstSlot)^, AnsiString(sVal), L - n + 1, n);
 end;
 
 procedure AotStrMidModern(dstSlot, sVal: Pointer; start, cnt: PtrInt); cdecl;
@@ -7841,7 +7986,7 @@ begin
     cnt := Length(AnsiString(sVal)) - start + 1;
     if cnt < 0 then cnt := 0;
   end;
-  PAnsiString(dstSlot)^ := Copy(AnsiString(sVal), start, cnt);
+  AssignSubstr(PAnsiString(dstSlot)^, AnsiString(sVal), start, cnt);
 end;
 
 procedure AotStrMidClassic(dstSlot, sVal: Pointer; start, cnt: PtrInt); cdecl;
@@ -7849,7 +7994,7 @@ begin
   // Commodore v7 clamps both (see bcStrMid).
   if start < 1 then start := 1;
   if cnt < 0 then cnt := 0;
-  PAnsiString(dstSlot)^ := Copy(AnsiString(sVal), start, cnt);
+  AssignSubstr(PAnsiString(dstSlot)^, AnsiString(sVal), start, cnt);
 end;
 
 function AotStrAsc(sVal: Pointer): PtrInt; cdecl;
@@ -7862,7 +8007,7 @@ end;
 
 procedure AotStrChr(dstSlot: Pointer; code: PtrInt); cdecl;
 begin
-  PAnsiString(dstSlot)^ := Chr(code and $FF);
+  AssignChar(PAnsiString(dstSlot)^, code and $FF);
 end;
 
 function AotStrInstr(hayVal, needleVal: Pointer; start: PtrInt): PtrInt; cdecl;
@@ -7877,6 +8022,59 @@ end;
   forward-declared here so the primitives can sit with their C5 siblings). Float Str()
   stays on the runtime helper: its handler needs the console-behavior object. }
 function ParseLeadingInt64(const S: string): Int64; forward;
+
+function RegexCountMatches(const S, Pattern: string): Int64;
+// REGEXCOUNT: how many NON-OVERLAPPING matches of Pattern are in S. Backed by FPC's own RegExpr, so a
+// program gets a real regex engine rather than something hand-rolled - the point of having it at all.
+// A malformed pattern answers 0 rather than aborting the program, matching how the string builtins
+// around it treat bad input.
+var
+  R: TRegExpr;
+begin
+  Result := 0;
+  if (Pattern = '') or (S = '') then Exit;
+  R := TRegExpr.Create;
+  try
+    try
+      // '.' must NOT match a newline. TRegExpr defaults ModifierS to TRUE, PCRE and Python default it
+      // to false, and patterns are written for the latter: ">.*\n" is meant to eat one description
+      // line, and with the dot matching newlines it ate the entire input in one go.
+      R.ModifierS := False;
+      R.Expression := Pattern;
+      if R.Exec(S) then
+        repeat
+          Inc(Result);
+        until not R.ExecNext;
+    except
+      Result := 0;
+    end;
+  finally
+    R.Free;
+  end;
+end;
+
+function RegexReplaceAll(const S, Pattern, Repl: string): string;
+// REGEXREPLACE: every match of Pattern in S replaced by Repl. The replacement is LITERAL text (no \1
+// group references): the substitutions this is built for are plain, and taking the text as-is means a
+// replacement containing a backslash cannot silently turn into something else.
+var
+  R: TRegExpr;
+begin
+  Result := S;
+  if Pattern = '' then Exit;
+  R := TRegExpr.Create;
+  try
+    try
+      R.ModifierS := False;      // as in RegexCountMatches: '.' stops at end of line
+      R.Expression := Pattern;
+      Result := R.Replace(S, Repl, False);
+    except
+      Result := S;
+    end;
+  finally
+    R.Free;
+  end;
+end;
 function ParseLeadingFloat(const S: string): Double; forward;
 
 procedure AotIntToString(dstSlot: Pointer; v: Int64); cdecl;
@@ -8461,7 +8659,7 @@ begin
       begin
         Len := Ctx.IntRegs[Instr.Src2];
         if Len < 0 then Len := 0;
-        Ctx.StringRegs[Instr.Dest] := Copy(Ctx.StringRegs[Instr.Src1], 1, Len);
+        AssignSubstr(Ctx.StringRegs[Instr.Dest], Ctx.StringRegs[Instr.Src1], 1, Len);
       end;
     3: // bcStrRight
       begin
@@ -8469,7 +8667,7 @@ begin
         S := Ctx.StringRegs[Instr.Src1];
         if Len < 0 then Len := 0;
         if Len > Length(S) then Len := Length(S);
-        Ctx.StringRegs[Instr.Dest] := Copy(S, Length(S) - Len + 1, Len);
+        AssignSubstr(Ctx.StringRegs[Instr.Dest], S, Length(S) - Len + 1, Len);
       end;
     4: // bcStrMid - MID$(s, start, len)
       begin
@@ -8499,7 +8697,7 @@ begin
               Count := 0;
             if Count < 0 then Count := 0;
           end;
-          Ctx.StringRegs[Instr.Dest] := Copy(Ctx.StringRegs[Instr.Src1], StartPos, Count);
+          AssignSubstr(Ctx.StringRegs[Instr.Dest], Ctx.StringRegs[Instr.Src1], StartPos, Count);
         end;
       end;
     5: // bcStrAsc
@@ -8511,7 +8709,7 @@ begin
           Ctx.IntRegs[Instr.Dest] := 0;
       end;
     6: // bcStrChr
-      Ctx.StringRegs[Instr.Dest] := Chr(Ctx.IntRegs[Instr.Src1] and $FF);
+      AssignChar(Ctx.StringRegs[Instr.Dest], Ctx.IntRegs[Instr.Src1] and $FF);
     12: // bcStrLTrim - LTRIM(s)
       Ctx.StringRegs[Instr.Dest] := TrimLeft(Ctx.StringRegs[Instr.Src1]);
     13: // bcStrRTrim - RTRIM(s)
@@ -8652,6 +8850,11 @@ begin
       Ctx.StringRegs[Instr.Dest] := FitBaseDigits(IntToBaseStr(Ctx.IntRegs[Instr.Src1], 2), Ctx.IntRegs[Instr.Src2]);
     21: // bcStrValInt - VALINT/VALLNG/VALUINT(s) - parse leading integer (0 if none)
       Ctx.IntRegs[Instr.Dest] := ParseLeadingInt64(Ctx.StringRegs[Instr.Src1]);
+    49: // bcRegexCount - REGEXCOUNT(s, pattern): non-overlapping matches
+      Ctx.IntRegs[Instr.Dest] := RegexCountMatches(Ctx.StringRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2]);
+    50: // bcRegexReplace - REGEXREPLACE(s, pattern, repl): every match replaced (repl in the Immediate string reg)
+      Ctx.StringRegs[Instr.Dest] := RegexReplaceAll(Ctx.StringRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2],
+                                                    Ctx.StringRegs[Instr.Immediate]);
   else
     raise Exception.CreateFmt('Unknown string opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
@@ -10677,6 +10880,8 @@ begin
         else
           Ctx.IntRegs[Instr.Dest] := 0;
       end;
+    64: // bcGfxImageConvertRow - IMAGECONVERTROW(src, src_bpp, dst, dst_bpp, width [, isrgb])
+      ImageConvertRowExec(Ctx, Instr);
     44: // bcGfxWindow - WINDOW [SCREEN] (x1,y1)-(x2,y2): set/clear the logical coordinate transform
       if Assigned(FGraphics) then
       begin

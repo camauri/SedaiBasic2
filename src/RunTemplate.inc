@@ -557,7 +557,7 @@ begin
       end;
 
       // === Delegated families (each a contiguous dense range) ===
-      DENSE_STRING_BASE + 0 .. DENSE_STRING_BASE + 48:
+      DENSE_STRING_BASE + 0 .. DENSE_STRING_BASE + 50:
         begin Ctx.PC := CurPC; ExecuteStringOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
       DENSE_MATH_BASE + 0 .. DENSE_MATH_BASE + 35:
         begin Ctx.PC := CurPC; ExecuteMathOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
@@ -588,7 +588,7 @@ begin
       DENSE_WEB_BASE + 0 .. DENSE_WEB_BASE + 12:
         begin Ctx.PC := CurPC; ExecuteWebOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
       {$ENDIF}
-      DENSE_GRAPHICS_BASE + 0 .. DENSE_GRAPHICS_BASE + 63:
+      DENSE_GRAPHICS_BASE + 0 .. DENSE_GRAPHICS_BASE + 64:
         begin Ctx.PC := CurPC; ExecuteGraphicsOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
       DENSE_SOUND_BASE + 0 .. DENSE_SOUND_BASE + 5:
         begin Ctx.PC := CurPC; ExecuteSoundOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;

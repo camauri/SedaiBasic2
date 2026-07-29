@@ -220,6 +220,7 @@ type
     antPalette,           // PALETTE [GET] [index, r, g, b] (FreeBASIC; OP attribute = SET/GET/RESET)
     antGfxColor,          // COLOR [fg][,bg] (FreeBASIC graphics draw colour; HASFG/HASBG attributes)
     antImageDestroy,      // IMAGEDESTROY handle (FreeBASIC)
+    antImageConvertRow,   // IMAGECONVERTROW src, src_bpp, dst, dst_bpp, width [, isrgb] (FreeBASIC)
     antImageInfo,         // IMAGEINFO handle, w, h (FreeBASIC)
     antGfxGet,            // GET (x1,y1)-(x2,y2), dst (FreeBASIC: capture screen rect to image)
     antGfxPut,            // PUT (x,y), src [, mode] (FreeBASIC: blit image to screen)

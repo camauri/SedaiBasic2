@@ -384,6 +384,97 @@ begin
   AVM.OnFileData := @GFileHandler.FileData;
 end;
 
+{ Keyword coverage self-check (--kw-check <list>).
+
+  For every name in the list, report what THIS build's front end makes of it. The verdict comes from
+  the real lexer, not from a table kept by hand: a name the lexer does not know comes back as
+  ttIdentifier, and anything else is a keyword it recognises. That is the whole point -- an inventory
+  maintained separately from the compiler drifts the moment a keyword is added, and BASIC.md's table
+  had drifted by 22 entries before this existed.
+
+  Two things it deliberately does NOT claim:
+    - "recognised" is not "implemented". A keyword accepted and ignored on purpose (EXPORT, the build
+      directives) is recognised, and says so; whether the SEMANTICS are right is what the manual's own
+      examples answer, which is the companion half of kwcheck.ps1.
+    - a MULTI-WORD entry from the manual's index ("Select Case", "Print #", "For...Next") is reported
+      per LEADING word, since that is the token the lexer decides on.
+
+  Lines may carry a "# comment" tail and blank lines are skipped, so the manual's extracted index can
+  be fed in as-is. Output is one TAB-separated record per name, for a script to aggregate. }
+procedure KwCheckReport(const ListFile: string);
+var
+  Names: TStringList;
+  Lexer: TLexerFSM;
+  Toks: TTokenList;
+  i, HashPos, Known, Unknown: Integer;
+  Nm, Lead, Verdict, Expanded: string;
+begin
+  if not FileExists(ListFile) then
+  begin
+    WriteLn(ErrOutput, 'kw-check: list file not found: ', ListFile);
+    Halt(2);
+  end;
+  Names := TStringList.Create;
+  try
+    Names.LoadFromFile(ListFile);
+    Known := 0;
+    Unknown := 0;
+    for i := 0 to Names.Count - 1 do
+    begin
+      Nm := Names[i];
+      HashPos := Pos('#', Nm);
+      // A leading '#' is a PREPROCESSOR directive and part of the name; only a later one is a comment.
+      if HashPos > 1 then Nm := Copy(Nm, 1, HashPos - 1);
+      Nm := Trim(Nm);
+      if Nm = '' then Continue;
+      // Decide on the LEADING word: "Select Case" is two tokens, and it is the first that tells the
+      // lexer a statement is starting.
+      Lead := Nm;
+      if Pos(' ', Lead) > 0 then Lead := Copy(Lead, 1, Pos(' ', Lead) - 1);
+      if Pos('.', Lead) > 0 then Lead := Copy(Lead, 1, Pos('.', Lead) - 1);   // "For...Next"
+      if Lead = '' then Continue;
+
+      Verdict := 'UNKNOWN';
+      Lexer := TLexerFSM.Create;
+      try
+        Lexer.SetHasLineNumbers(False);          // MODERN: this inventory is the FreeBASIC keyword set
+        Lexer.SetCaseSensitive(False);
+        Lexer.Source := Lead;
+        Toks := Lexer.ScanAllTokensFast;
+        if Assigned(Toks) and (Toks.Count > 0) then
+        begin
+          if Toks[0].TokenType = ttIdentifier then
+            Verdict := 'UNKNOWN'
+          else
+            Verdict := GetEnumName(TypeInfo(TTokenType), Ord(Toks[0].TokenType));
+        end;
+      finally
+        Lexer.Free;
+      end;
+      // The lexer is not the whole front end: the __FB_* family are PREPROCESSOR macros and never
+      // reach it as keywords at all. Asking only the lexer reported every one of them unknown -- 90
+      // false gaps, which is what made the first version of this report unusable. A macro answers by
+      // EXPANDING: preprocess the bare name and see whether it comes back as something else.
+      if Verdict = 'UNKNOWN' then
+      begin
+        Expanded := PreprocessSource(Lead, '');
+        if Trim(Expanded) <> Lead then Verdict := 'ppMacro'
+        else
+        begin
+          Expanded := PreprocessSource(Lead + '(a,b)', '');    // function-like macro
+          if Trim(Expanded) <> Lead + '(a,b)' then Verdict := 'ppMacro';
+        end;
+      end;
+      if Verdict = 'UNKNOWN' then Inc(Unknown) else Inc(Known);
+      WriteLn(Nm, #9, Verdict);
+    end;
+    WriteLn(ErrOutput, Format('kw-check: %d names, %d recognised, %d unknown',
+                              [Known + Unknown, Known, Unknown]));
+  finally
+    Names.Free;
+  end;
+end;
+
 { Print version banner }
 procedure PrintVersion;
 begin
@@ -2194,6 +2285,17 @@ begin
         WriteLn('opcode-table OK: ', VerifyMsg)
       else
         WriteLn('opcode-table FAIL: ', VerifyMsg);
+      Halt(0);
+    end;
+
+    // Keyword coverage self-check: read a list of names (one per line) and report, for each, whether
+    // THIS build's front end knows it. The answer comes from the real lexer -- a name it does not know
+    // comes back as ttIdentifier, anything else is a keyword it recognises -- so the check can never
+    // drift from the compiler the way a hand-maintained table does. Diagnostic only; prints and exits.
+    // Companion tool: job/tests/tools/kwcheck.ps1, which feeds it the FreeBASIC manual's own index.
+    if (ParamCount >= 2) and (LowerCase(ParamStr(1)) = '--kw-check') then
+    begin
+      KwCheckReport(ParamStr(2));
       Halt(0);
     end;
 

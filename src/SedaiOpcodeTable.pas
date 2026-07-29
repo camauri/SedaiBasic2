@@ -40,7 +40,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 522 {$IFDEF WEB_MODE} + 12 {$ENDIF};
+  OPCODE_LIST_COUNT = 525 {$IFDEF WEB_MODE} + 12 {$ENDIF};
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -118,6 +118,7 @@ const
     bcGfxScreen, bcMultikey, bcGetmouse, bcMouseAxis, bcSetmouse, bcGetJoystick,
     bcJoyBtn, bcJoyAxis, bcStick, bcStrig, bcGfxDrawGML, bcGfxPointCoord,
     bcGfxCircleEx, bcGfxPaintBorder, bcGfxSetTarget, bcGfxLineStyled, bcGfxScreenPtr, bcScnClr,
+  bcGfxImageConvertRow, bcRegexCount, bcRegexReplace,
     bcSoundVol, bcSoundSound, bcSoundEnvelope, bcSoundTempo, bcSoundPlay, bcSoundFilter,
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
     bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
@@ -144,24 +145,24 @@ const
   // no dense range and graphics/sound/super sit where they do here.
   DENSE_CORE_BASE     = 0;    // group 0  (163 opcodes) -> dense 0..162
   DENSE_STRING_BASE   = 163;  // group 1  (49)          -> 163..211
-  DENSE_MATH_BASE     = 212;  // group 2  (36)          -> 212..247
-  DENSE_ARRAY_BASE    = 248;  // group 3  (52)          -> 248..299 (bcRawLoad/StoreZStr = subs 50/51)
-  DENSE_IO_BASE       = 300;  // group 4  (23)          -> 300..322
-  DENSE_SPECIAL_BASE  = 323;  // group 5  (17)          -> 323..339
-  DENSE_FILEIO_BASE   = 340;  // group 6  (37)          -> 340..376 (bcDirAttr = sub 36)
-  DENSE_SPRITE_BASE   = 377;  // group 7  (17)          -> 377..393
+  DENSE_MATH_BASE     = 214;  // group 2  (36)          -> 212..247
+  DENSE_ARRAY_BASE    = 250;  // group 3  (52)          -> 248..299 (bcRawLoad/StoreZStr = subs 50/51)
+  DENSE_IO_BASE       = 302;  // group 4  (23)          -> 300..322
+  DENSE_SPECIAL_BASE  = 325;  // group 5  (17)          -> 323..339
+  DENSE_FILEIO_BASE   = 342;  // group 6  (37)          -> 340..376 (bcDirAttr = sub 36)
+  DENSE_SPRITE_BASE   = 379;  // group 7  (17)          -> 377..393
   {$IFDEF WEB_MODE}
   // group 8 (web, subs 1..12) inserts a 13-slot block, shifting graphics/sound/super up by 13.
-  DENSE_WEB_BASE      = 394;  // 394..406 (12 used, slot 0 a hole)
-  DENSE_GRAPHICS_BASE = 407;  // group 10 (64)          -> 407..470
-  DENSE_SOUND_BASE    = 471;  // group 11 (6)           -> 471..476
-  DENSE_SUPER_BASE    = 477;  // group 200 (256 slots)  -> 477..732
-  DENSE_TOTAL         = 733;  // N (with web)
+  DENSE_WEB_BASE      = 396;  // 394..406 (12 used, slot 0 a hole)
+  DENSE_GRAPHICS_BASE = 409;  // group 10 (65)          -> 407..471
+  DENSE_SOUND_BASE    = 474;  // group 11 (6)           -> 472..477
+  DENSE_SUPER_BASE    = 480;  // group 200 (256 slots)  -> 478..733
+  DENSE_TOTAL         = 736;  // N (with web)
   {$ELSE}
-  DENSE_GRAPHICS_BASE = 394;  // group 10 (64)          -> 394..457
-  DENSE_SOUND_BASE    = 458;  // group 11 (6)           -> 458..463
-  DENSE_SUPER_BASE    = 464;  // group 200 (256 slots)  -> 464..719 (58 used, 198 holes)
-  DENSE_TOTAL         = 720;  // N
+  DENSE_GRAPHICS_BASE = 396;  // group 10 (65)          -> 394..458
+  DENSE_SOUND_BASE    = 461;  // group 11 (6)           -> 459..464
+  DENSE_SUPER_BASE    = 467;  // group 200 (256 slots)  -> 465..720 (58 used, 198 holes)
+  DENSE_TOTAL         = 723;  // N
   {$ENDIF}
 
 var
