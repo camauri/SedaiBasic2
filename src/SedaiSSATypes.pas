@@ -157,6 +157,9 @@ type
     ssaStrAsc, ssaStrChr, ssaStrStr, ssaStrVal, ssaStrHex, ssaStrInstr, ssaStrErr,
     // Asc(Mid(s, start, len)) without building the substring - see bcStrAscMid.
     ssaStrAscMid,
+    // "acc + Mid(tab, k, 1)" without building the one-character substring - see bcStrConcatCharAt.
+    // Dest := Src1 + Src2[Src3]; when Dest IS Src1 the VM grows the accumulator in place.
+    ssaStrConcatCharAt,
     // FreeBASIC string functions (B1.2): single string arg -> string result.
     ssaStrLTrim, ssaStrRTrim, ssaStrTrim, ssaStrUCase, ssaStrLCase,
     ssaStrInstrRev,   // INSTRREV(s, sub) -> int (last occurrence)
@@ -615,6 +618,7 @@ type
     function RunRangeAnalysis: Integer;  // B4: prove array accesses in-bounds, set BoundsSafe (AFTER DCE, BEFORE PHI elimination - needs the PHIs)
     procedure RunPhiElimination;  // FINAL PASS: Convert PHI functions to copy instructions (BEFORE bytecode compilation)
     function RunStringTempFusion: Integer;  // write string results straight into their destination
+    function RunConcatCharFusion: Integer;  // "acc + Mid(tab,k,1)" -> one instruction, no substring
     function RunAscMidFusion: Integer;      // Asc(Mid(s,i,n)) without building the substring
     function RunGVN: Integer;  // PHASE 3 TIER 2: Run Global Value Numbering optimization (returns replacements count)
     function RunCSE: Integer;  // Common subexpression elimination (returns eliminated count)
@@ -1594,6 +1598,183 @@ begin
             // fusion -- which is why further Asc(Mid()) sites looked like they "resisted" fusion.
             Blk.Instructions.Delete(i);
             Continue;
+          end;
+        end;
+      end;
+      Inc(i);
+    end;
+  end;
+end;
+
+function TSSAProgram.RunConcatCharFusion: Integer;
+// Fuse "T = Mid(tab, k, 1)" + "D = Concat(acc, T)" into "D = ConcatCharAt(acc, tab, k)".
+//
+// "acc += Mid(tab, k, 1)" is the inner line of reverse-complement, and it pays for a whole string to
+// carry ONE byte: measured against the same loop with the character already in hand, building it
+// costs about 49 ns of the 87 the line takes. bcStrConcatCharAt reads the byte straight out of the
+// table, and when the destination is the accumulator it grows it in place instead of rebuilding it.
+//
+// The length must be exactly 1: that is what lets the fused arm skip bcStrMid's negative-length
+// rules. A literal 1 is accepted, and so is an int register whose ONLY definition is LoadConstInt 1
+// -- which is the form that actually reaches here, since the constant is materialised into a
+// register long before this pass runs.
+//
+// Safety, as in the two fusions above: the substring must have exactly one definition and one use
+// (the concatenation), both in the same block, and nothing in between may write the operands the
+// fused instruction will read LATER than the original did.
+var
+  b, i, k, k2, T: Integer;
+  Ok: Boolean;
+  Blk: TSSABasicBlock;
+  Prod, Cons, Mid: TSSAInstruction;
+  DefCount, UseCount: array of Integer;
+  IntDefs: array of Integer;      // (int reg, version) -> count of definitions
+  IntConst: array of Int64;       // ...and the value, when that single definition is LoadConstInt
+  MaxVer, VStride: Integer;
+
+  function StrKey(const V: TSSAValue): Integer;
+  begin
+    if (V.Kind = svkRegister) and (V.RegType = srtString) and
+       (V.RegIndex >= 0) and (V.Version >= 0) and (V.Version <= MaxVer) then
+      Result := V.RegIndex * VStride + V.Version
+    else
+      Result := -1;
+  end;
+
+  function IntKey(const V: TSSAValue): Integer;
+  begin
+    if (V.Kind = svkRegister) and (V.RegType = srtInt) and
+       (V.RegIndex >= 0) and (V.Version >= 0) and (V.Version <= MaxVer) then
+      Result := V.RegIndex * VStride + V.Version
+    else
+      Result := -1;
+  end;
+
+  procedure BumpStr(var Arr: array of Integer; const V: TSSAValue);
+  var Key: Integer;
+  begin
+    Key := StrKey(V);
+    if (Key >= 0) and (Key <= High(Arr)) then Inc(Arr[Key]);
+  end;
+
+  // Is this operand the literal 1, directly or through a register defined exactly once by
+  // LoadConstInt 1?
+  function IsLengthOne(const V: TSSAValue): Boolean;
+  var Key: Integer;
+  begin
+    if V.Kind = svkConstInt then Exit(V.ConstInt = 1);
+    Key := IntKey(V);
+    Result := (Key >= 0) and (Key <= High(IntDefs)) and (IntDefs[Key] = 1) and (IntConst[Key] = 1);
+  end;
+
+begin
+  Result := 0;
+  // ⛔ DEFAULT OFF, and the measurement says why. Replacing "Mid(tab,k,1)" + "concat" with this
+  // single instruction is SLOWER (reverse-complement interp +23%, --aot +11%), because the premise
+  // was wrong: AssignSubstr already reuses the temporary's buffer, so the Mid it removes was not
+  // paying for an allocation -- while "string + char" introduces one. The fusion only wins once the
+  // destination IS the accumulator, and that needs the copy that closes the loop-carried PHI to be
+  // coalesced away, which is a separate (and riskier) piece of work. STRCHARFUSE=1 turns it on for
+  // whoever picks that up; until then the opcode stays unused rather than costing.
+  if GetEnvironmentVariable('STRCHARFUSE') <> '1' then Exit;
+  MaxVer := 0;
+  for b := 0 to Blocks.Count - 1 do
+  begin
+    Blk := TSSABasicBlock(Blocks[b]);
+    for i := 0 to Blk.Instructions.Count - 1 do
+    begin
+      Prod := TSSAInstruction(Blk.Instructions[i]);
+      if (Prod.Dest.Kind = svkRegister) and (Prod.Dest.Version > MaxVer) then MaxVer := Prod.Dest.Version;
+      if (Prod.Src1.Kind = svkRegister) and (Prod.Src1.Version > MaxVer) then MaxVer := Prod.Src1.Version;
+      if (Prod.Src2.Kind = svkRegister) and (Prod.Src2.Version > MaxVer) then MaxVer := Prod.Src2.Version;
+      if (Prod.Src3.Kind = svkRegister) and (Prod.Src3.Version > MaxVer) then MaxVer := Prod.Src3.Version;
+      for k := 0 to High(Prod.PhiSources) do
+        if (Prod.PhiSources[k].Value.Kind = svkRegister) and (Prod.PhiSources[k].Value.Version > MaxVer) then
+          MaxVer := Prod.PhiSources[k].Value.Version;
+    end;
+  end;
+  VStride := MaxVer + 1;
+
+  SetLength(DefCount, (FNextRegister[srtString] + 1) * VStride);
+  SetLength(UseCount, (FNextRegister[srtString] + 1) * VStride);
+  for i := 0 to High(DefCount) do begin DefCount[i] := 0; UseCount[i] := 0; end;
+  SetLength(IntDefs, (FNextRegister[srtInt] + 1) * VStride);
+  SetLength(IntConst, Length(IntDefs));
+  for i := 0 to High(IntDefs) do begin IntDefs[i] := 0; IntConst[i] := 0; end;
+
+  for b := 0 to Blocks.Count - 1 do
+  begin
+    Blk := TSSABasicBlock(Blocks[b]);
+    for i := 0 to Blk.Instructions.Count - 1 do
+    begin
+      Prod := TSSAInstruction(Blk.Instructions[i]);
+      BumpStr(DefCount, Prod.Dest);
+      BumpStr(UseCount, Prod.Src1);
+      BumpStr(UseCount, Prod.Src2);
+      BumpStr(UseCount, Prod.Src3);
+      for k := 0 to High(Prod.PhiSources) do
+        BumpStr(UseCount, Prod.PhiSources[k].Value);
+      if Prod.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString] then
+        BumpStr(UseCount, Prod.Dest);
+      // Track integer definitions, so a length held in a register can still be recognised as 1.
+      k2 := IntKey(Prod.Dest);
+      if (k2 >= 0) and (k2 <= High(IntDefs)) then
+      begin
+        Inc(IntDefs[k2]);
+        if (Prod.OpCode = ssaLoadConstInt) and (Prod.Src1.Kind = svkConstInt) then
+          IntConst[k2] := Prod.Src1.ConstInt
+        else
+          IntConst[k2] := MaxInt;   // defined by something else: never equal to 1
+      end;
+    end;
+  end;
+
+  for b := 0 to Blocks.Count - 1 do
+  begin
+    Blk := TSSABasicBlock(Blocks[b]);
+    i := 0;
+    while i < Blk.Instructions.Count - 1 do
+    begin
+      Prod := TSSAInstruction(Blk.Instructions[i]);
+      T := -1;
+      if (Prod.OpCode = ssaStrMid) and (Prod.Dest.Kind = svkRegister) and
+         (Prod.Dest.RegType = srtString) and IsLengthOne(Prod.Src3) and
+         (Prod.Src1.Kind = svkRegister) and (Prod.Src1.RegType = srtString) then
+        T := StrKey(Prod.Dest);
+      if (T >= 0) and (T <= High(DefCount)) and (DefCount[T] = 1) and (UseCount[T] = 1) then
+      begin
+        // The single use must be a concatenation in this block that takes T as its RIGHT operand:
+        // "acc + Mid(...)". The mirrored shape "Mid(...) + acc" is a different instruction and is
+        // left alone.
+        k := -1;
+        for k2 := i + 1 to Blk.Instructions.Count - 1 do
+        begin
+          Cons := TSSAInstruction(Blk.Instructions[k2]);
+          if (Cons.OpCode = ssaStrConcat) and (StrKey(Cons.Src2) = T) then begin k := k2; Break; end;
+          if (StrKey(Cons.Src1) = T) or (StrKey(Cons.Src3) = T) then Break;   // used the other way
+        end;
+        if k > i then
+        begin
+          Cons := TSSAInstruction(Blk.Instructions[k]);
+          // The fused instruction reads the table and the index at the CONCATENATION's position
+          // instead of the Mid's, so nothing in between may have written them.
+          Ok := True;
+          for k2 := i + 1 to k - 1 do
+          begin
+            Mid := TSSAInstruction(Blk.Instructions[k2]);
+            if (Prod.Src1.Kind = svkRegister) and WritesSSAReg(Mid, Prod.Src1.RegType, Prod.Src1.RegIndex) then begin Ok := False; Break; end;
+            if (Prod.Src2.Kind = svkRegister) and WritesSSAReg(Mid, Prod.Src2.RegType, Prod.Src2.RegIndex) then begin Ok := False; Break; end;
+          end;
+          if Ok then
+          begin
+            Cons.OpCode := ssaStrConcatCharAt;
+            // Src1 stays the accumulator; Src2 becomes the table and Src3 the index.
+            Cons.Src2 := Prod.Src1;
+            Cons.Src3 := Prod.Src2;
+            // ⛔ Delete frees it: Instructions owns its objects (see RunAscMidFusion).
+            Blk.Instructions.Delete(i);
+            Inc(Result);
+            Continue;                 // i now indexes the instruction after the deleted Mid
           end;
         end;
       end;

@@ -855,9 +855,18 @@ const
   bcArrayLoadIntBranchNZ = bcGroupSuper + 140;
   bcArrayLoadIntBranchZ  = bcGroupSuper + 141;
 
-  // Additional superinstructions (sub-opcodes 150-157, 250-255)
+  // Additional superinstructions (sub-opcodes 150-158, 250-255)
   bcArrayReverseRange = bcGroupSuper + 156;
   bcArrayShiftLeft    = bcGroupSuper + 157;
+  // "acc + MID$(tab, k, 1)" fused: Dest = Src1 + the single byte tab[k], with no one-character
+  // string ever built. Dest=string, Src1=string (the accumulator), Src2=string (the table),
+  // Immediate=int register holding the 1-based index. When Dest and Src1 are the same register
+  // the accumulator grows IN PLACE, which is the whole point of the shape "outLine += Mid(...)".
+  //
+  // It lives in the superinstruction group deliberately: it IS a fusion of two opcodes, and the
+  // group already owns 256 dense slots, so filling a hole here moves no DENSE_*_BASE. Adding a
+  // sub-opcode to the string group instead would shift every base after it.
+  bcStrConcatCharAt   = bcGroupSuper + 158;
   bcArraySwapInt      = bcGroupSuper + 250;
   bcAddIntSelf        = bcGroupSuper + 251;
   bcSubIntSelf        = bcGroupSuper + 252;
@@ -2249,6 +2258,7 @@ begin
         141: Result := 'ArrayLoadIntBranchZ';
         156: Result := 'ArrayReverseRange';
         157: Result := 'ArrayShiftLeft';
+        158: Result := 'StrConcatCharAt';
         250: Result := 'ArraySwapInt';
         251: Result := 'AddIntSelf';
         252: Result := 'SubIntSelf';

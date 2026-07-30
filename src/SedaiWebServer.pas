@@ -453,6 +453,7 @@ begin
           try SSAProgram.RunStringTempFusion; except end;
           try SSAProgram.RunAscMidFusion; except end;
           try SSAProgram.RunStringTempFusion; except end;
+          try SSAProgram.RunConcatCharFusion; except end;
         end;
         {$IFNDEF DISABLE_REG_ALLOC}
         RegAlloc := TLinearScanAllocator.Create(SSAProgram);

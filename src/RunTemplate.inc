@@ -166,6 +166,10 @@ begin
       LocalAotCtx.StrAscMid := @AotStrAscMidModern
     else
       LocalAotCtx.StrAscMid := @AotStrAscMidClassic;
+    if Assigned(FProgram) and FProgram.ModernMode then
+      LocalAotCtx.StrConcatCharAt := @AotStrConcatCharAtModern
+    else
+      LocalAotCtx.StrConcatCharAt := @AotStrConcatCharAtClassic;
   end
   else
     AotFuncs := nil;
@@ -559,6 +563,11 @@ begin
             end;
             Inc(CurPC);
           end; // bcArrayMoveElement
+
+        // "acc + MID$(tab,k,1)" fused - sub-opcode 158. DELEGATED on purpose: the body is string
+        // work, and inlining bodies here is what made every program slower when the whole
+        // superinstruction set was inline. One delegated instruction still replaces two.
+        158: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr); CurPC := Ctx.PC + 1; end;
 
       else
         raise Exception.CreateFmt('Unknown superinstruction sub-opcode %d (full opcode $%.4X) at CurPC=%d', [Op and $FF, Op, CurPC]);

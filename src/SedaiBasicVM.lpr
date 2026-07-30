@@ -1471,6 +1471,13 @@ begin
           if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
             WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunStringTempFusion (2nd): ', E.Message);
         end;
+        // Last: it consumes a Mid whose temporary the fusions above have already had their chance
+        // at. Gated OFF inside the pass itself (STRCHARFUSE=1 to enable) - see the note there.
+        try SSAProgram.RunConcatCharFusion;
+        except on E: Exception do
+          if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+            WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunConcatCharFusion: ', E.Message);
+        end;
       end;
 
       // REGISTER ALLOCATION - Allocate physical registers to virtual registers

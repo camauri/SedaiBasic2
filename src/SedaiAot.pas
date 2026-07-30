@@ -81,6 +81,9 @@ type
     ArrStoreStr: Pointer; // offset 184: @AotArrStoreStr (VMSelf, arrIdx, srcVal, idx)
     // ASC(MID$(...)) fused. Dialect-variant like StrMid, installed per program.
     StrAscMid: Pointer;   // offset 192: @AotStrAscMid{Modern|Classic} (sVal, ignored, start, len) -> code
+    // "acc + MID$(tab, k, 1)" fused. Dialect-variant for the same reason as StrMid: only the rule
+    // that decides whether the one-character substring is EMPTY differs between the two.
+    StrConcatCharAt: Pointer; // offset 200: @AotStrConcatCharAt{Modern|Classic} (dstSlot, accVal, tabVal, k)
   end;
   PAotCtx = ^TAotCtx;
 
@@ -101,6 +104,7 @@ const
   AOTCTX_ARRLOADSTR  = 176;
   AOTCTX_ARRSTORESTR = 184;
   AOTCTX_STRASCMID   = 192;
+  AOTCTX_STRCONCATCHARAT = 200;
   AOTCTX_CALLSUB   = 96;
   AOTCTX_STRLEFT   = 104;
   AOTCTX_STRRIGHT  = 112;
@@ -490,7 +494,7 @@ begin
     // primitive (copy/const-load/concat are managed assignments; len returns an int).
     ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
     // C5 residuals: byte-string substring/char/search primitives (W codepoint ops excluded).
-    ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr, ssaStrInstr,
+    ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrConcatCharAt, ssaStrChr, ssaStrInstr,
     // Str() of an int and Val(): dialect-independent leaf primitives (float Str() stays on
     // the helper - it needs the console-behavior object).
     ssaIntToString, ssaStrVal, ssaStrValInt,
@@ -632,6 +636,9 @@ begin
     // C5 residuals (byte-string ops only; the W codepoint family stays on the helper).
     ssaStrLeft, ssaStrRight:
       Result := IsStr(Ins.Dest) and IsStr(Ins.Src1) and IsInt(Ins.Src2);
+    // "acc + tab[k]": string dest, two string sources, and the index in the int bank.
+    ssaStrConcatCharAt: Result := IsStr(Ins.Dest) and IsStr(Ins.Src1) and
+                                  IsStr(Ins.Src2) and IsInt(Ins.Src3);
     ssaStrAscMid:       Result := IsInt(Ins.Dest) and IsStr(Ins.Src1) and
                                   IsInt(Ins.Src2) and IsInt(Ins.Src3);
     ssaStrMid:
@@ -667,7 +674,7 @@ begin
       Result := AotRecNative and (Ins.Src3.Kind = svkConstInt);
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
     ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
-    ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr, ssaStrInstr,
+    ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrConcatCharAt, ssaStrChr, ssaStrInstr,
     ssaIntToString, ssaStrVal, ssaStrValInt:
       Result := AotStringNativeOK(Ins);
   end;
@@ -1866,6 +1873,28 @@ var
     Lea(ABI_ARG0, RAX, LongWord(d) * 8);                  // arg0 = &StringRegs[dest]
     MovLoad(ABI_ARG1, RAX, LongWord(a) * 8);              // arg1 = StringRegs[a] (value)
     MovLoad(ABI_ARG2, RAX, LongWord(b) * 8);              // arg2 = StringRegs[b] (may clobber r8)
+    E.EmitBytes([$41, $FF, $D3]);                         // call r11
+    StrCallEpilogue;
+  end;
+
+  // "acc + MID$(tab, k, 1)" fused: AotStrConcatCharAt(&dst, accVal, tabVal, kValue).
+  // Same r11 staging as EmitStrConcat and for the same reason: arg2 is r8 on Win64, which IS the
+  // context register, so the primitive's address must be read out of the context BEFORE that
+  // argument overwrites it. The index comes from the INT bank through Immediate, like bcStrMid's
+  // length -- and it is loaded with the SPILLED accessor, because after SpillVolatiles the value
+  // lives in the bank, not in the machine register ILoadArg would have read.
+  procedure EmitStrConcatCharAt;
+  var d, a, t, kreg: Integer;
+  begin
+    d := SReg(Cur.Dest); a := SReg(Cur.Src1); t := SReg(Cur.Src2);
+    kreg := IReg(Cur.Src3); if not OK then Exit;
+    SpillVolatiles;
+    ILoadArgSpilled(ABI_ARG3, kreg);                      // arg3 = IntRegs[k], read from the bank
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);         // rax = string bank base
+    E.MemOp([$4D, $8B], R11, R8, AOTCTX_STRCONCATCHARAT); // r11 = primitive (before r8 is clobbered)
+    Lea(ABI_ARG0, RAX, LongWord(d) * 8);                  // arg0 = &StringRegs[dest]
+    MovLoad(ABI_ARG1, RAX, LongWord(a) * 8);              // arg1 = StringRegs[acc] (value)
+    MovLoad(ABI_ARG2, RAX, LongWord(t) * 8);              // arg2 = StringRegs[tab] (clobbers r8)
     E.EmitBytes([$41, $FF, $D3]);                         // call r11
     StrCallEpilogue;
   end;
@@ -3245,7 +3274,7 @@ var
           end;
           ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
           ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
-          ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr, ssaStrInstr,
+          ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrConcatCharAt, ssaStrChr, ssaStrInstr,
           ssaIntToString, ssaStrVal, ssaStrValInt:
           begin
             // C5: a native leaf call to a string primitive. String operands stay in the bank
@@ -3267,6 +3296,8 @@ var
                   begin CountVal(Ins.Src2); CountVal(Ins.Src3); end;   // start + length
                 ssaStrAscMid:
                   begin CountVal(Ins.Dest); CountVal(Ins.Src2); CountVal(Ins.Src3); end; // code + start + len
+                ssaStrConcatCharAt:
+                  CountVal(Ins.Src3);                              // the index (dest and both sources are strings)
                 ssaStrChr:
                   CountVal(Ins.Src1);                              // the char code
                 ssaStrInstr:
@@ -4237,6 +4268,7 @@ var
       ssaStrRight: EmitStrSlice(AOTCTX_STRRIGHT);
       ssaStrMid:   EmitStrMid;
       ssaStrAscMid: EmitStrAscMid;
+      ssaStrConcatCharAt: EmitStrConcatCharAt;
       ssaStrAsc:   EmitStrAsc;
       ssaStrChr:   EmitStrChr;
       ssaIntToString: EmitIntToStr;

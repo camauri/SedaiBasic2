@@ -494,6 +494,7 @@ begin
           try SSAProgram.RunStringTempFusion; except end;
           try SSAProgram.RunAscMidFusion; except end;
           try SSAProgram.RunStringTempFusion; except end;
+          try SSAProgram.RunConcatCharFusion; except end;
         end;
 
         // Register Allocation
