@@ -210,6 +210,43 @@ function Find-SedaiAudio {
     return @{ Enabled = $false; Path = $null; Reason = 'Not found (use -WithSedaiAudio=<path> to specify)' }
 }
 
+# What the CPU we are building FOR can actually execute.
+#
+# ⛔ This exists because the instruction-set flags used to be gated on whether AUDIO was enabled -
+# two things that have nothing to do with each other. The effect was that sbc, sbd and sbw (the
+# targets without audio) were built with -CpCOREAVX2 -CfAVX2 on a machine whose CPU has AVX but
+# NOT AVX2 and NOT FMA (an i7-3630QM, Ivy Bridge). Any AVX2 or FMA instruction FPC chose to emit -
+# and -OoFASTMATH encourages FMA - is an illegal instruction at run time on that CPU.
+#
+# ⚠️ Detection is of the HOST, so it is only meaningful when not cross-compiling; the caller gates
+# on $TargetCPU matching. Set SEDAI_CPUOPT=none to force the portable baseline (useful when the
+# binaries have to run on an older machine than the one that builds them), or =avx / =avx2 to force
+# a level explicitly.
+function Get-CpuOptLevel {
+    $forced = $env:SEDAI_CPUOPT
+    if ($forced) {
+        switch ($forced.ToLower()) {
+            'none' { return 'none' }
+            'avx'  { return 'avx' }
+            'avx2' { return 'avx2' }
+            default { Write-Host "  WARNING: SEDAI_CPUOPT='$forced' not understood, detecting instead" -ForegroundColor Yellow }
+        }
+    }
+    # System.Runtime.Intrinsics needs .NET Core (PowerShell 7+). Under Windows PowerShell 5.1 the
+    # type is absent, and then the honest answer is the SAFE one: assume nothing beyond the x86-64
+    # baseline rather than emit instructions the CPU may not have.
+    try {
+        $avx2 = [System.Runtime.Intrinsics.X86.Avx2]::IsSupported
+        $fma  = [System.Runtime.Intrinsics.X86.Fma]::IsSupported
+        $avx  = [System.Runtime.Intrinsics.X86.Avx]::IsSupported
+        if ($avx2 -and $fma) { return 'avx2' }
+        if ($avx) { return 'avx' }
+        return 'none'
+    } catch {
+        return 'none'
+    }
+}
+
 # Build a single target
 function Build-Target {
     param(
@@ -258,12 +295,24 @@ function Build-Target {
         # Release optimizations
         $opts += '-O1'
 
-        # CPU-specific optimizations (for x86_64)
-        # AVX2 disabled when audio is enabled (SDL2 audio API conflict)
+        # CPU-specific optimizations (x86_64 only), gated on what this CPU CAN ACTUALLY EXECUTE.
+        # Audio stays part of the condition for its own reason (SDL2 audio API conflict), but it is
+        # no longer what decides the instruction set - that was how sbc/sbd/sbw came to be built for
+        # AVX2 on a CPU without it. See Get-CpuOptLevel.
         if ($TargetCPU -eq 'x86_64' -and -not $WithAudio) {
-            $opts += '-CpCOREAVX2'
-            $opts += '-OpCOREAVX2'
-            $opts += '-CfAVX2'
+            switch ($script:CpuOptLevel) {
+                'avx2' {
+                    $opts += '-CpCOREAVX2'
+                    $opts += '-OpCOREAVX2'
+                    $opts += '-CfAVX2'
+                }
+                'avx' {
+                    $opts += '-CpCOREAVX'
+                    $opts += '-OpCOREAVX'
+                    $opts += '-CfAVX'
+                }
+                default { }   # portable x86-64 baseline (SSE2): nothing to add
+            }
         }
 
         # Additional optimizations
@@ -435,6 +484,15 @@ if ($SedaiAudioEnabled) {
     Write-Host "SedaiAudio: ENABLED" -ForegroundColor Green
 } else {
     Write-Host "SedaiAudio: disabled ($($audioResult.Reason))" -ForegroundColor Gray
+}
+
+# Decide the instruction set ONCE and say so: a binary built for a CPU feature the machine lacks
+# fails as an illegal instruction at run time, with nothing in the build output to explain it.
+$Script:CpuOptLevel = Get-CpuOptLevel
+switch ($Script:CpuOptLevel) {
+    'avx2'  { Write-Host "CPU opt:    AVX2 + FMA" -ForegroundColor Green }
+    'avx'   { Write-Host "CPU opt:    AVX (no AVX2/FMA on this CPU)" -ForegroundColor Green }
+    default { Write-Host "CPU opt:    baseline x86-64 (SSE2) - no AVX detected, or PowerShell 5.1" -ForegroundColor Gray }
 }
 Write-Host ""
 
