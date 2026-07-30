@@ -236,12 +236,89 @@ type
     procedure Reset;
   end;
 
+// Drain the buffered stdout (ours AND the RTL's). Any code that writes through System.Write/WriteLn
+// while a program's output may still be buffered MUST call this first, or its text jumps ahead of
+// text that was produced before it -- which is exactly what a runtime error message does.
+procedure TerminalOutFlush;
+
 implementation
 
 var
   // SB_CELLROT=0 restores the cell-by-cell scroll of the modelled screen. Same state either way --
   // it is there so the rewrite can be A/B'd on one binary, for output as well as for time.
   GCellRotate: Boolean = True;
+
+{ ============================================================================
+  Buffered stdout
+
+  FPC's Text layer costs about 4.4 us PER CALL, whatever its buffer size: writing the same megabyte
+  through Write() takes 73 ms, and through an own buffer plus one FileWrite per 64 KB, 1 ms. That
+  is 73x, and it is why PRINT dominated programs that write a lot (reverse-complement spent as much
+  time writing as computing). SetTextBuf does not help -- the cost is the layer, not the buffering.
+
+  ⚠️ The hazard is ORDERING, not speed: everything else in the program (banners, runtime errors,
+  --disasm dumps) writes through System.Output, which has its own buffer. Ours must therefore be
+  flushed at every point where output can be observed or interleaved:
+    - the buffer fills up
+    - a newline, WHEN stdout is a terminal (line buffering: a human must see the line now)
+    - Present, which the VM calls before anything blocking
+    - reading input, so a prompt without a newline appears first
+    - process exit, so nothing is lost on an abnormal end
+  SB_OUTBUF=0 falls back to System.Write for A/B and as an escape hatch.
+  ============================================================================ }
+var
+  GOutBuf: array[0..65535] of AnsiChar;
+  GOutLen: Integer = 0;
+  GOutBuffered: Boolean = True;   // False -> straight through System.Write, as before
+  GOutIsTerminal: Boolean = True; // line-buffer when a human is watching
+  GOutExitRegistered: Boolean = False;
+
+function StdoutIsTerminal: Boolean; forward;
+
+procedure TerminalOutFlush;
+// Public within the unit: drains our buffer AND the RTL's, so a caller that is about to write
+// through System.Output sees the two streams in the right order.
+begin
+  if GOutLen > 0 then
+  begin
+    FileWrite(StdOutputHandle, GOutBuf[0], GOutLen);
+    GOutLen := 0;
+  end;
+  Flush(System.Output);
+end;
+
+procedure OutExitFlush;
+begin
+  if GOutLen > 0 then
+  begin
+    FileWrite(StdOutputHandle, GOutBuf[0], GOutLen);
+    GOutLen := 0;
+  end;
+end;
+
+procedure OutWrite(const Text: string);
+var
+  L: Integer;
+begin
+  L := Length(Text);
+  if L = 0 then Exit;
+  if not GOutBuffered then
+  begin
+    System.Write(Text);
+    Exit;
+  end;
+  // Anything that cannot fit is written straight out: no point copying a megabyte through a 64 KB
+  // staging area.
+  if L >= SizeOf(GOutBuf) then
+  begin
+    OutExitFlush;
+    FileWrite(StdOutputHandle, Text[1], L);
+    Exit;
+  end;
+  if GOutLen + L > SizeOf(GOutBuf) then OutExitFlush;
+  Move(Text[1], GOutBuf[GOutLen], L);
+  Inc(GOutLen, L);
+end;
 
 {$IFDEF WINDOWS}
 var
@@ -270,6 +347,14 @@ begin
   inherited Create;
   // Qualified: this unit uses Windows, whose GetEnvironmentVariable is the 3-argument API call.
   GCellRotate := SysUtils.GetEnvironmentVariable('SB_CELLROT') <> '0';
+  GOutBuffered := SysUtils.GetEnvironmentVariable('SB_OUTBUF') <> '0';
+  GOutIsTerminal := StdoutIsTerminal;
+  if not GOutExitRegistered then
+  begin
+    // Whatever is still buffered must reach the stream even if the process ends abnormally.
+    AddExitProc(@OutExitFlush);
+    GOutExitRegistered := True;
+  end;
   FInitialized := False;
   FCursorX := 0;
   FCursorY := 0;
@@ -409,6 +494,7 @@ end;
 
 procedure TTerminalController.Shutdown;
 begin
+  TerminalOutFlush;   // nothing may stay buffered past the end of a run
   FInitialized := False;
 end;
 
@@ -419,14 +505,16 @@ end;
 
 procedure TTerminalController.Print(const Text: string; ClearBackground: Boolean);
 begin
-  System.Write(Text);
+  OutWrite(Text);
   PutCells(Text);
   Inc(FCursorX, Length(Text));
 end;
 
 procedure TTerminalController.PrintLn(const Text: string; ClearBackground: Boolean);
 begin
-  System.WriteLn(Text);
+  OutWrite(Text);
+  OutWrite(LineEnding);
+  if GOutIsTerminal then TerminalOutFlush;   // line buffering while a human is watching
   PutCells(Text);
   CellNextRow;
   FCursorX := 0;
@@ -435,7 +523,8 @@ end;
 
 procedure TTerminalController.NewLine;
 begin
-  System.WriteLn;
+  OutWrite(LineEnding);
+  if GOutIsTerminal then TerminalOutFlush;
   CellNextRow;
   FCursorX := 0;
   Inc(FCursorY);
@@ -467,11 +556,13 @@ begin
   // MODELLED screen is cleared either way -- that is what CSRLIN/POS and the cell grid read back.
   if StdoutIsTerminal then
   begin
+    // Through the same buffer as everything else, or the clear would overtake the text before it.
     {$IFDEF WINDOWS}
-    System.WriteLn;
+    OutWrite(LineEnding);
     {$ELSE}
-    System.Write(#27'[2J'#27'[H');  // ANSI clear + home
+    OutWrite(#27'[2J'#27'[H');  // ANSI clear + home
     {$ENDIF}
+    TerminalOutFlush;
   end;
   ClearView;    // CLS blanks the print area and homes the caret inside it, leaving the area itself set
   FCursorX := 0;
@@ -531,8 +622,9 @@ end;
 
 procedure TTerminalController.Present;
 begin
-  // Flush stdout so text appears before blocking operations (e.g. SOUND, PLAY)
-  Flush(System.Output);
+  // Flush stdout so text appears before blocking operations (e.g. SOUND, PLAY). Drains OUR buffer
+  // too: the VM calls this exactly where output has to be observable.
+  TerminalOutFlush;
 end;
 
 procedure TTerminalController.SetFullscreen(Enabled: Boolean);
@@ -1051,9 +1143,11 @@ begin
       IsValid := True;
       Input := '';
 
-      // Display prompt
+      // Display prompt. It has no newline, so the buffer MUST be drained before blocking on the
+      // read or the user would be asked a question they cannot see.
       if Prompt <> '' then
-        System.Write(Prompt);
+        OutWrite(Prompt);
+      TerminalOutFlush;
 
       // Simple blocking ReadLn
       System.ReadLn(Input);

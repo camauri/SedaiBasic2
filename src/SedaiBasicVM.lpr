@@ -1898,6 +1898,9 @@ begin
           // between optimized and --no-opt builds of the same program, so printing them by
           // default made every runtime-erroring program a false OPTDIFF. --verbose restores
           // the full dump (PC, failing instruction, surrounding bytecode).
+          // The program's own output may still be buffered: drain it FIRST, or this message
+          // lands ahead of text the program produced before failing.
+          TerminalOutFlush;
           Write('ERROR during VM execution');
           if OptVerbose then
             Write(' at PC=', VM.PC);
@@ -2175,6 +2178,7 @@ begin
             // Same report as the run-from-source handler: a program must report errors
             // identically whether launched from .bas or .basc — deterministic by default
             // (BASIC line + message), full PC/bytecode dump only with --verbose.
+            TerminalOutFlush;   // drain the program's buffered output before this message
             Write('ERROR during VM execution');
             if OptVerbose then
               Write(' at PC=', VM.PC);
