@@ -7673,14 +7673,14 @@ begin
       srtInt:
         if i = 0 then
           EmitInstruction(ssaInputInt, VarReg, PromptReg,
-                         MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+                         MakeSSAValue(svkNone), MakeSSAConstInt(-1))
         else
           EmitInstruction(ssaInputInt, VarReg, MakeSSAValue(svkNone),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       srtFloat:
         if i = 0 then
           EmitInstruction(ssaInputFloat, VarReg, PromptReg,
-                         MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+                         MakeSSAValue(svkNone), MakeSSAConstInt(-1))
         else
           EmitInstruction(ssaInputFloat, VarReg, MakeSSAValue(svkNone),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -7688,7 +7688,7 @@ begin
         begin
           if i = 0 then
             EmitInstruction(ssaInputString, VarReg, PromptReg,
-                           MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+                           MakeSSAValue(svkNone), MakeSSAConstInt(-1))
           else
             EmitInstruction(ssaInputString, VarReg, MakeSSAValue(svkNone),
                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));

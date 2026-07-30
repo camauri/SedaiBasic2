@@ -10603,7 +10603,7 @@ begin
         // Print initial prompt (from Src1 register if set) + "? "
         if Assigned(FOutputDevice) then
         begin
-          if (Instr.Src1 > 0) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+          if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
         end;
         repeat
@@ -10626,7 +10626,7 @@ begin
             FOutputDevice.Print('?REDO FROM START');
             FOutputDevice.NewLine;
             // Reprint prompt for retry
-            if (Instr.Src1 > 0) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+            if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
               FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
           end;
         until False;
@@ -10637,7 +10637,7 @@ begin
         // Print initial prompt (from Src1 register if set) + "? "
         if Assigned(FOutputDevice) then
         begin
-          if (Instr.Src1 > 0) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+          if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
         end;
         repeat
@@ -10662,7 +10662,7 @@ begin
               FOutputDevice.Print('?REDO FROM START');
               FOutputDevice.NewLine;
               // Reprint prompt for retry
-              if (Instr.Src1 > 0) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+              if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
                 FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
             end;
           end
@@ -10671,7 +10671,7 @@ begin
             FOutputDevice.Print('?REDO FROM START');
             FOutputDevice.NewLine;
             // Reprint prompt for retry
-            if (Instr.Src1 > 0) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+            if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
               FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
           end;
         until False;
@@ -10682,7 +10682,7 @@ begin
         // Print initial prompt (from Src1 register if set) + "? "
         if Assigned(FOutputDevice) then
         begin
-          if (Instr.Src1 > 0) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+          if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
         end;
         repeat
@@ -10705,7 +10705,7 @@ begin
             FOutputDevice.Print('?REDO FROM START');
             FOutputDevice.NewLine;
             // Reprint prompt for retry
-            if (Instr.Src1 > 0) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+            if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
               FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
           end;
         until False;
@@ -10716,7 +10716,7 @@ begin
         // Print prompt (from Src1 register if set) + "? "
         if Assigned(FOutputDevice) then
         begin
-          if (Instr.Src1 > 0) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+          if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
         end;
         Ctx.StringRegs[Instr.Dest] := FInputDevice.ReadLine('? ', False, False, False);

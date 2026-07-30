@@ -189,6 +189,23 @@ implementation
 uses SedaiDebug;
 {$ENDIF}
 
+var
+  // Default ON; REGREUSE_STR=0 keeps the string bank out of the register merge (see OpIsMergeSafe).
+  // -1 = not read yet.
+  //
+  // It went on only after the FB example sweep came back with its counts UNCHANGED (386/21/25/36).
+  // That is the net that decides this class: it bounced REGREUSE on its first attempt while corpus,
+  // AOT, JIT, combined and basc were all green. And it earned its keep immediately -- turning it on
+  // exposed a latent bug nothing else had reached (see m492_input_prompt_reg0).
+  GStrMerge: Integer = -1;
+
+function GStrMergeEnabled: Boolean;
+begin
+  if GStrMerge < 0 then
+    if GetEnvironmentVariable('REGREUSE_STR') = '0' then GStrMerge := 0 else GStrMerge := 1;
+  Result := GStrMerge = 1;
+end;
+
 type
   TRegInfoMap = specialize TDictionary<Int64, TVariableInfo>;
 
@@ -686,6 +703,24 @@ begin
     // PRINT reads its operand and writes nothing (verified against the derived read-Dest list).
     ssaPrint, ssaPrintLn, ssaPrintInt, ssaPrintIntLn:
       Result := True;
+    // === STRING BANK (REGREUSE_STR=1, default off) =====================================
+    // Leaving these out pinned EVERY string register, and with them the one merge the string
+    // benchmarks need: "acc = acc + x" lowers to "concat(new, old, x)" plus the copies that close
+    // the loop-carried PHI, so Dest and Src1 are different registers and the accumulator is REBUILT
+    // on every character instead of grown in place. Merging them is exactly what AppendString waits
+    // for -- and this analysis is the one place where it can be done SAFELY, because it asks whether
+    // the two interfere instead of substituting names the way the disabled copy coalescer did.
+    //
+    // Only the plainly-modelled ones, same rule as above: Dest written, Src read, no value travelling
+    // through a channel this liveness cannot see. ssaStrInstr is deliberately absent -- it carries an
+    // input in Dest (it is in the read-Dest list below).
+    ssaCopyString, ssaLoadConstString, ssaStrConcat,
+    ssaStrLen, ssaStrAsc, ssaStrAscMid, ssaStrChr,
+    ssaStrMid, ssaStrLeft, ssaStrRight,
+    ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
+    ssaArrayLoadIndString, ssaArrayStoreIndString,
+    ssaPrintString:
+      Result := GStrMergeEnabled;
   else
     Result := False;
   end;
