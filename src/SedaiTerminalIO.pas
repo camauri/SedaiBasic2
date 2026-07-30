@@ -61,6 +61,7 @@ type
     Ch: Char;
     Fg, Bg: Byte;   // palette indices
   end;
+  PTermCell = ^TTermCell;   // a row of the modelled screen, walked directly in PutCells
 
   { TTerminalController - Console output device (stdout) }
   { NOTE: Using TObject instead of TInterfacedObject because interfaces use CORBA mode (no refcount) }
@@ -237,6 +238,11 @@ type
 
 implementation
 
+var
+  // SB_CELLROT=0 restores the cell-by-cell scroll of the modelled screen. Same state either way --
+  // it is there so the rewrite can be A/B'd on one binary, for output as well as for time.
+  GCellRotate: Boolean = True;
+
 {$IFDEF WINDOWS}
 var
   GCtrlCPressed: Boolean = False;
@@ -262,6 +268,8 @@ end;
 constructor TTerminalController.Create;
 begin
   inherited Create;
+  // Qualified: this unit uses Windows, whose GetEnvironmentVariable is the 3-argument API call.
+  GCellRotate := SysUtils.GetEnvironmentVariable('SB_CELLROT') <> '0';
   FInitialized := False;
   FCursorX := 0;
   FCursorY := 0;
@@ -302,7 +310,31 @@ end;
 procedure TTerminalController.ScrollCellsUp;
 var
   R, C: Integer;
+  Recycled: array of TTermCell;
 begin
+  // A full-width print area is the normal case, and there the rows are separate dynamic arrays: the
+  // scroll is a ROTATION OF ROW REFERENCES, with the old top row recycled as the new bottom one.
+  // That is a handful of reference moves plus one row to blank, instead of copying every cell of the
+  // area -- and it leaves the model in exactly the same state, so nothing about the semantics moves.
+  // It matters because a program that writes a megabyte scrolls once per line: the copying version
+  // moved ~32 million cells over a run of reverse-complement.
+  if (FViewLeft = 0) and (FViewRight = FCols - 1) and GCellRotate then
+  begin
+    Recycled := FCells[FViewTop];
+    // Ascending order is what makes this a rotation: FCells[R + 1] is still the original row when it
+    // is read, because this loop has not reached it yet.
+    for R := FViewTop to FViewBottom - 1 do
+      FCells[R] := FCells[R + 1];
+    FCells[FViewBottom] := Recycled;
+    for C := 0 to FCols - 1 do
+    begin
+      FCells[FViewBottom][C].Ch := ' ';
+      FCells[FViewBottom][C].Fg := FFgIdx;
+      FCells[FViewBottom][C].Bg := FBgIdx;
+    end;
+    Exit;
+  end;
+  // A narrower area shares its rows with cells OUTSIDE it, which must not move: copy those cells.
   for R := FViewTop to FViewBottom - 1 do
     for C := FViewLeft to FViewRight do
       FCells[R][C] := FCells[R + 1][C];
@@ -324,24 +356,41 @@ begin
 end;
 
 procedure TTerminalController.PutCells(const Text: string);
+// The row is looked up ONCE and re-read only when the caret changes row, instead of walking
+// FCells[FCellY] for every character: with a dynamic array of dynamic arrays that indexing is a
+// pointer load plus a bounds check per cell, paid three times over for Ch/Fg/Bg.
 var
-  i: Integer;
+  i, N: Integer;
   Ch: Char;
+  Row: PTermCell;
+  Fg, Bg: Byte;
 begin
   if Length(FCells) = 0 then Exit;
-  for i := 1 to Length(Text) do
+  N := Length(Text);
+  if N = 0 then Exit;
+  Row := @FCells[FCellY][0];
+  Fg := FFgIdx;
+  Bg := FBgIdx;
+  for i := 1 to N do
   begin
     Ch := Text[i];
     if Ch = #13 then
       FCellX := FViewLeft
     else if Ch = #10 then
-      CellNextRow
+    begin
+      CellNextRow;
+      Row := @FCells[FCellY][0];
+    end
     else
     begin
-      if FCellX > FViewRight then CellNextRow;   // wrap at the print area's right edge
-      FCells[FCellY][FCellX].Ch := Ch;
-      FCells[FCellY][FCellX].Fg := FFgIdx;
-      FCells[FCellY][FCellX].Bg := FBgIdx;
+      if FCellX > FViewRight then          // wrap at the print area's right edge
+      begin
+        CellNextRow;
+        Row := @FCells[FCellY][0];
+      end;
+      Row[FCellX].Ch := Ch;
+      Row[FCellX].Fg := Fg;
+      Row[FCellX].Bg := Bg;
       Inc(FCellX);
     end;
   end;
