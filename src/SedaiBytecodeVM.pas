@@ -6235,6 +6235,35 @@ begin
     bcXferLoadInt:     Ctx.IntRegs[Instr.Dest] := Ctx.XferInt[Instr.Immediate];
     bcXferLoadFloat:   Ctx.FloatRegs[Instr.Dest] := Ctx.XferFloat[Instr.Immediate];
     bcXferLoadString:  Ctx.StringRegs[Instr.Dest] := Ctx.XferStr[Instr.Immediate];
+    // Threads, mutexes and condition variables (M5.4). These lived ONLY in RunTemplate's inline case,
+    // which is why they sat on AotHelperUnsafeOp's deny-list: with no handler here the AOT helper
+    // would have run them as a silent no-op, so a region touching one bailed outright. That cost the
+    // native path the MAIN of essentially every parallel program plus the WORKER of mandelbrot and
+    // spectral-norm - "survey: 0/2 regions eligible" and the whole program interpreted.
+    //
+    // Each one is the same single call the inline arm makes, and none of them carries call-site
+    // semantics (no PC games, no Ctx.Running check), so the two paths cannot drift in behaviour.
+    // Routing them through the generic helper is cheap in the way it was NOT cheap for a string
+    // primitive: these are OS-level operations, so a register flush around one is noise next to
+    // what the operation itself costs.
+    //
+    // ⚠️ UNDER SUSPICION: the machine froze on 30 Jul with this change in the tree, while running the
+    // three thread-heavy benchmarks. Nothing in the Windows logs, which is the signature of resource
+    // exhaustion rather than a fault. Never proved. Re-measure ONE program at a time, smallest size
+    // first, foreground, with a short timeout, checking for stray processes after each run.
+    bcThreadCreate:  Ctx.IntRegs[Instr.Dest] := SpawnWorker(Ctx.IntRegs[Instr.Src1], Ctx);
+    bcThreadWait:    JoinWorker(Ctx.IntRegs[Instr.Src1]);
+    bcThreadDetach:  DetachWorker(Ctx.IntRegs[Instr.Src1]);
+    bcThreadSelf:    Ctx.IntRegs[Instr.Dest] := GSelfHandle;
+    bcMutexCreate:   Ctx.IntRegs[Instr.Dest] := CreateMutex;
+    bcMutexLock:     LockMutex(Ctx.IntRegs[Instr.Src1]);
+    bcMutexUnlock:   UnlockMutex(Ctx.IntRegs[Instr.Src1]);
+    bcMutexDestroy:  DestroyMutex(Ctx.IntRegs[Instr.Src1]);
+    bcCondCreate:    Ctx.IntRegs[Instr.Dest] := CreateCond;
+    bcCondWait:      CondWaitOp(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);
+    bcCondSignal:    CondSignalOp(Ctx.IntRegs[Instr.Src1]);
+    bcCondBroadcast: CondBroadcastOp(Ctx.IntRegs[Instr.Src1]);
+    bcCondDestroy:   DestroyCond(Ctx.IntRegs[Instr.Src1]);
     // UDT/record heap (M3)
     bcRecordNew:
       // Immediate bit 48: allocate in the shared cross-thread region (e.g. a SHARED UDT scalar).

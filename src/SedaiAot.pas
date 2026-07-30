@@ -539,9 +539,11 @@ function AotHelperUnsafeOp(BcOp: Word): Boolean;
 begin
   case BcOp of
     // Group 0: no handler in ExecuteInstruction -> would silently do nothing.
-    bcThreadCreate, bcThreadDetach, bcThreadSelf, bcThreadWait,
-    bcMutexCreate, bcMutexDestroy, bcMutexLock, bcMutexUnlock,
-    bcCondCreate, bcCondDestroy, bcCondSignal, bcCondBroadcast, bcCondWait,
+    // (The thread/mutex/cond family USED to be here for that reason. ExecuteInstruction now handles
+    // all thirteen - the same single call each inline arm makes - so they are routable, and a region
+    // that touches one no longer bails. That was the MAIN of essentially every parallel program.
+    // Cheap to route, unlike a string primitive: these are OS-level operations, so the helper's
+    // register flush is noise next to the operation itself.)
     bcLoadProcAddr, bcLoadVar, bcStoreVar, bcStringToFloat, bcStringToInt,
     // Group 3: typed array accessors are handled only by the interpreter's inline case,
     // not by ExecuteArrayOp.
