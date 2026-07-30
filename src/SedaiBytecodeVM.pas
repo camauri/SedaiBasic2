@@ -152,6 +152,12 @@ type
     FSharedRecordCount: Integer;
     FSharedRecFreeList: array of Integer;  // DELETE: indices of freed shared records, reused by NEW
     FSharedRecFreeCount: Integer;
+    // DELETE also RETIRES the storage itself here instead of destroying it, so NEW can take it back
+    // without touching the heap: New + three SetLength + Dispose per node was the largest single cost
+    // in binary-trees (231 ns per New/Delete pair, measured). The INDEX free list above is a separate
+    // thing and stays: a freed handle must keep resolving to nil.
+    FSharedRecPool: array of PRecordStorage;
+    FSharedRecPoolCount: Integer;
     FSharedRecLock: TRTLCriticalSection;
     // Every pointer array this table ever OUTGREW, kept alive until the program is unloaded.
     // Growing used to be SetLength, which reallocates: a reader holding the old base could have it
@@ -197,6 +203,9 @@ type
     // or a deopt PC). Populated by RegisterAotFunc from the host after the bytecode passes.
     FAotEnabled: Boolean;
     FNativeFuncs: array of TExecMem;
+    // Per-PC: does an AOT region already cover this instruction? Only meaningful in the combined
+    // profile; empty when --aot is off.
+    FAotCovered: array of Boolean;
     // Per-procedure frame-clobber widths, indexed by procedure entry PC (built by
     // BuildProcFrameWidths in LoadProgram). Length 0 = not built -> program-wide width.
     // Each entry packs BOTH ends of the range the callee can touch, (width shl 32) or base, with -1
@@ -567,7 +576,7 @@ type
     property JitEnabled: Boolean read FJitEnabled write FJitEnabled;
     property AotEnabled: Boolean read FAotEnabled write FAotEnabled;
     // AOT: adopt a compiled function (ownership passes to the VM) under its entry PC.
-    procedure RegisterAotFunc(EntryPC: Integer; Mem: TObject);
+    procedure RegisterAotFunc(EntryPC: Integer; Mem: TObject; LastPC: Integer = -1);
     { Layout the native back ends need to reach a record field without a helper: the offset of the
       Records dynamic-array FIELD inside TExecutionContext, plus SizeOf(TRecordStorage) and the
       offsets of its IntData/FloatData fields. Only offsets travel, never an address - the emitted
@@ -659,6 +668,9 @@ procedure AppendChar(var D: AnsiString; C: AnsiChar); forward;
 var
   // -1 = not read yet, 0 = deterministic (default), 1 = follow the system locale.
   GDateLocale: Integer = -1;
+  // JIT_OVERAOT=1 lets the loop JIT compile loops the AOT already owns (see BuildJitLoops). Default
+  // off: the overlap costs a second compilation and buys nothing.
+  GJitOverAot: Boolean = False;
 
 procedure SetDateLocaleMode(Enabled: Boolean);
 begin
@@ -964,6 +976,7 @@ begin
   // Default ON. SHAREDREC_LOCK=1 puts the per-access lock back, so the two can be timed against each
   // other on ONE binary instead of two builds (see ab-needs-a-built-baseline).
   FSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
+  GJitOverAot := GetEnvironmentVariable('JIT_OVERAOT') = '1';
   InitCriticalSection(FSharedRecLock);
   InitCriticalSection(FRawHeapLock);
   FRawHeapTop := 0;
@@ -3282,15 +3295,22 @@ function TBytecodeVM.AllocSharedRecord(IntC, FloatC, StrC, TypeId: Integer): Int
 // growing. Used for arrays of UDT, whose handles live in the global FArrays and are read by any thread.
 var
   R: PRecordStorage;
-  Idx: Integer;
+  Idx, i: Integer;
 begin
-  New(R);
-  R^.TypeId := TypeId;
-  SetLength(R^.IntData, IntC);
-  SetLength(R^.FloatData, FloatC);
-  SetLength(R^.StringData, StrC);
+  R := nil;
   EnterCriticalSection(FSharedRecLock);
   try
+    // Take back a retired storage if there is one. Under the SAME lock that hands out the slot, so
+    // this costs no extra synchronisation; when the pool is empty we fall back to the heap.
+    if FSharedRecPoolCount > 0 then
+    begin
+      Dec(FSharedRecPoolCount);
+      R := FSharedRecPool[FSharedRecPoolCount];
+    end;
+    // ⛔ ONE path only, deliberately. The A/B gate this function briefly had was a SECOND copy of the
+    // body, and the copy drifted: with the gate off it measured 974 ms against the 325 ms of the code
+    // it was supposed to reproduce. A baseline lives in a worktree on the previous commit, not in a
+    // duplicated branch here.
     // Reuse a slot freed by DELETE if one is available, else append.
     if FSharedRecFreeCount > 0 then
     begin
@@ -3304,10 +3324,26 @@ begin
         GrowSharedRecords(Idx + 1);
       Inc(FSharedRecordCount);
     end;
+    if R = nil then New(R);
     FSharedRecords[Idx] := R;
   finally
     LeaveCriticalSection(FSharedRecLock);
   end;
+  // ⛔ Shaping and zeroing happen OUTSIDE the lock, on purpose: this benchmark runs four workers that
+  // all allocate, so the critical section is contended and every instruction inside it is paid by
+  // everyone. Doing this work inside cost the whole gain -- the single-threaded micro-benchmark
+  // improved 68% while binary-trees did not move at all. It is safe out here because the handle has
+  // not been handed back yet, so no other thread can resolve it.
+  R^.TypeId := TypeId;
+  // On a recycled record these are almost always no-ops (same shape as the record that was freed),
+  // and FPC returns immediately when the length already matches.
+  SetLength(R^.IntData, IntC);
+  SetLength(R^.FloatData, FloatC);
+  SetLength(R^.StringData, StrC);
+  // A recycled record must be indistinguishable from a fresh one: a brand-new SetLength zero-fills,
+  // so recycling has to zero explicitly. (Strings were already emptied when it was retired.)
+  for i := 0 to IntC - 1 do R^.IntData[i] := 0;
+  for i := 0 to FloatC - 1 do R^.FloatData[i] := 0;
   Result := SHARED_REC_FLAG or Int64(Idx);
 end;
 
@@ -3316,15 +3352,26 @@ procedure TBytecodeVM.FreeSharedRecord(Handle: Int64);
 // ignored — those records are reclaimed by frame unwinding. Double-free / use-after-free are the
 // programmer's responsibility (as in FreeBASIC).
 var
-  Idx: Integer;
+  Idx, i: Integer;
+  R: PRecordStorage;
 begin
   if (Handle and SHARED_REC_FLAG) = 0 then Exit;
   Idx := Handle and SHARED_REC_MASK;
   EnterCriticalSection(FSharedRecLock);
   try
     if (Idx < 0) or (Idx >= FSharedRecordCount) or (FSharedRecords[Idx] = nil) then Exit;
-    Dispose(FSharedRecords[Idx]);   // finalizes the record's managed fields (strings/arrays)
+    R := FSharedRecords[Idx];
+    // ⛔ The slot still becomes nil: reading a freed handle must keep giving a loud failure rather
+    // than somebody else's data. What is recycled is the STORAGE, which nothing can reach any more.
     FSharedRecords[Idx] := nil;
+    // Let go of the managed content (a retired record must hold nothing alive) but KEEP the arrays:
+    // their blocks are the point of the pool.
+    for i := 0 to High(R^.StringData) do
+      if R^.StringData[i] <> '' then R^.StringData[i] := '';
+    if FSharedRecPoolCount >= Length(FSharedRecPool) then
+      SetLength(FSharedRecPool, (FSharedRecPoolCount + 1) * 2);
+    FSharedRecPool[FSharedRecPoolCount] := R;
+    Inc(FSharedRecPoolCount);
     if FSharedRecFreeCount >= Length(FSharedRecFreeList) then
       SetLength(FSharedRecFreeList, (FSharedRecFreeCount + 1) * 2);
     FSharedRecFreeList[FSharedRecFreeCount] := Idx;
@@ -3388,6 +3435,11 @@ begin
   FSharedRecordCount := 0;
   SetLength(FSharedRecFreeList, 0);
   FSharedRecFreeCount := 0;
+  // Retired storages are not in the table any more, so they have to be released from the pool.
+  for i := 0 to FSharedRecPoolCount - 1 do
+    if FSharedRecPool[i] <> nil then Dispose(FSharedRecPool[i]);
+  SetLength(FSharedRecPool, 0);
+  FSharedRecPoolCount := 0;
   // The retired pointer arrays hold no records of their own (every live record was disposed through
   // the current table above) - they were kept alive only so a lock-free lookup could never read freed
   // memory. Nothing can be looking any more, so release them.
@@ -7589,6 +7641,20 @@ begin
   for hdr := 0 to n - 1 do
     if HeaderEnd[hdr] >= 0 then
     begin
+      // ⛔ Skip a loop the AOT has already compiled. In the combined profile the AOT owns whole
+      // procedures, and the loop JIT was recompiling the loops INSIDE them: the native AOT code runs
+      // regardless, so that work bought nothing and its compilation was pure cost -- fannkuch +21%
+      // and binary-trees +8,6% against --aot alone. The JIT keeps exactly what it is for: hot loops
+      // in code the AOT did NOT take. JIT_OVERAOT=1 restores the overlap for A/B.
+      if (Length(FAotCovered) > hdr) and FAotCovered[hdr] and not GJitOverAot then
+      begin
+        if GetEnvironmentVariable('JIT_DIAG') <> '' then
+          WriteLn(ErrOutput, Format('[JIT] loop PC %d..%d: SKIP (already compiled by the AOT)',
+                                    [hdr, HeaderEnd[hdr]]));
+        // ⛔ System.Continue: inside a VM method a bare Continue binds to TBytecodeVM.Continue -- the
+        // BASIC CONT command -- and the program dies with "?CAN'T CONTINUE ERROR" instead of looping.
+        System.Continue;
+      end;
       // Array/sqrt/div may only be compiled when their MODERN edge semantics match the native SSE forms
       // (no CLASSIC raise, no forced bounds-check).
       // Per-context state (Xfer banks, record heap) is reached through the EXECUTING context, passed
@@ -8445,10 +8511,21 @@ begin
   SharedRecOff := Integer(PtrUInt(@FSharedRecords) - PtrUInt(Pointer(Self)));
 end;
 
-procedure TBytecodeVM.RegisterAotFunc(EntryPC: Integer; Mem: TObject);
+procedure TBytecodeVM.RegisterAotFunc(EntryPC: Integer; Mem: TObject; LastPC: Integer);
 var
   i: Integer;
 begin
+  // Remember which PCs this region owns, so the loop JIT can leave them alone (see BuildJitLoops).
+  if (EntryPC >= 0) and (LastPC >= EntryPC) and (FProgram <> nil) then
+  begin
+    if Length(FAotCovered) <> FProgram.GetInstructionCount then
+    begin
+      SetLength(FAotCovered, 0);
+      SetLength(FAotCovered, FProgram.GetInstructionCount);
+    end;
+    for i := EntryPC to LastPC do
+      if i < Length(FAotCovered) then FAotCovered[i] := True;
+  end;
   if (FProgram = nil) or (Mem = nil) then
   begin
     Mem.Free;
