@@ -1872,7 +1872,8 @@ begin
                                          GetEnvironmentVariable('AOT_DIAG') = '1',
                                          AotSkipMainDefault(OptJit));  // engine arbitration, AOT_MAIN overrides
         for AotI := 0 to High(AotFuncList) do
-          VM.RegisterAotFunc(AotFuncList[AotI].EntryPC, AotFuncList[AotI].Mem);
+          VM.RegisterAotFunc(AotFuncList[AotI].EntryPC, AotFuncList[AotI].Mem,
+                             AotFuncList[AotI].LastPC);
         VM.AotEnabled := Length(AotFuncList) > 0;
       end;
 

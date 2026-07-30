@@ -154,6 +154,11 @@ type
 
   TAotFuncEntry = record
     EntryPC: Integer;
+    // Last bytecode PC this region covers. The loop JIT needs it: without knowing WHICH PCs the AOT
+    // already owns, it compiles the same loops a second time and the combined profile pays two
+    // compilations to run the AOT's code anyway -- measured as +21% on fannkuch and +8,6% on
+    // binary-trees against --aot alone.
+    LastPC: Integer;
     Mem: TExecMem;       // ownership passes to the caller (the VM frees it)
   end;
   TAotFuncs = array of TAotFuncEntry;
@@ -4719,7 +4724,7 @@ function AotCompileProgram(SSAProg: TSSAProgram; Prog: TBytecodeProgram;
                            TrueVal: Int64; AllowUnsafe, Diag, SkipMain: Boolean): TAotFuncs;
 var
   Regions: TAotRegions;
-  r, n: Integer;
+  r, n, o, LastMapped: Integer;
   Mem: TExecMem;
   Why: string;
 begin
@@ -4769,6 +4774,18 @@ begin
     if Mem <> nil then
     begin
       Result[n].EntryPC := Regions[r].EntryPC;
+      // The region's extent in final bytecode: walk its ordinals backwards to the last one that maps
+      // to a PC (the tail can be ordinals that emitted nothing). EntryPC alone if none does.
+      Result[n].LastPC := Regions[r].EntryPC;
+      for o := Regions[r].FirstOrdinal + Regions[r].InstrCount - 1 downto Regions[r].FirstOrdinal do
+      begin
+        LastMapped := Prog.GetSsaPc(o);
+        if LastMapped >= Result[n].LastPC then
+        begin
+          Result[n].LastPC := LastMapped;
+          Break;
+        end;
+      end;
       Result[n].Mem := Mem;
       Inc(n);
       if Diag then
