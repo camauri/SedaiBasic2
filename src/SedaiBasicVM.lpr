@@ -1478,6 +1478,13 @@ begin
           if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
             WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunConcatCharFusion: ', E.Message);
         end;
+        // Last of all: needs the final shape of the concatenations, including anything the fusions
+        // above rewrote.
+        try SSAProgram.RunConcatDeadSourceMark;
+        except on E: Exception do
+          if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+            WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunConcatDeadSourceMark: ', E.Message);
+        end;
       end;
 
       // REGISTER ALLOCATION - Allocate physical registers to virtual registers

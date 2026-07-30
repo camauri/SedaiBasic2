@@ -1177,8 +1177,17 @@ begin
 
   if Instr.OpCode = ssaArrayLoad then
   begin
-    // Src1 = array id (constant), Src2 = linear index. Invariant iff the array is not modified in the
-    // loop and the index is loop-invariant.
+    // Src1 = the array, Src2 = linear index. Invariant iff the array is not modified in the loop and
+    // the index is loop-invariant.
+    //
+    // ⛔ ONLY a constant array id, deliberately. Accepting svkArrayRef as well (the spelling a STRING
+    // array uses) would hoist the complement-table read out of reverse-complement's hot loop -- worth
+    // 2,8% -- but it HUNG spectral-norm: its workers spin on "Do While gDone < NW", gDone is a
+    // "Dim Shared" and therefore array-backed, and the value they are waiting for is written by
+    // ANOTHER THREAD. Hoisting that load out of the wait loop means the worker reads it once and
+    // waits forever. Loop-invariance here is invariance with respect to THIS loop; a shared array is
+    // not invariant just because this thread does not write it, and this pass has no notion of what
+    // the other threads do.
     if Instr.Src1.Kind <> svkConstInt then Exit;
     if IsArrayModifiedInLoop(Instr.Src1.ConstInt, Loop) then Exit;
     Result := OperandInvariantModern(Instr.Src2, Loop, ToHoist);

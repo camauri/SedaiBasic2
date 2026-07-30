@@ -619,6 +619,7 @@ type
     procedure RunPhiElimination;  // FINAL PASS: Convert PHI functions to copy instructions (BEFORE bytecode compilation)
     function RunStringTempFusion: Integer;  // write string results straight into their destination
     function RunConcatCharFusion: Integer;  // "acc + Mid(tab,k,1)" -> one instruction, no substring
+    function RunConcatDeadSourceMark: Integer;  // mark "s = s + x" whose left operand dies there
     function RunAscMidFusion: Integer;      // Asc(Mid(s,i,n)) without building the substring
     function RunGVN: Integer;  // PHASE 3 TIER 2: Run Global Value Numbering optimization (returns replacements count)
     function RunCSE: Integer;  // Common subexpression elimination (returns eliminated count)
@@ -1604,6 +1605,177 @@ begin
       Inc(i);
     end;
   end;
+end;
+
+function TSSAProgram.RunConcatDeadSourceMark: Integer;
+// Mark every StrConcat whose LEFT operand is dead immediately after it, so the VM can take that
+// operand's buffer over instead of building a new string.
+//
+// "outLine += Mid(...)" lowers to "acc_new = concat(acc_old, ch)" plus the copies that close the
+// loop-carried PHI, so Dest is never Src1 and the accumulator is REBUILT on every character:
+// quadratic within the line, plus one allocation per character. AppendString already grows a string
+// in place, but it can only fire when Dest = Src1 -- which needs the copies coalesced away, and that
+// is the class of pass that miscompiles here (see copycoal-miscompile).
+//
+// ⭐ This gets the same effect WITHOUT touching register assignment: if the old accumulator is dead
+// after the concatenation, the VM may steal its buffer (Dest := Src1; Src1 := ''), leaving that
+// buffer unshared and letting the append run in place. Nothing about which register holds what
+// changes, so the miscompile class the coalescer has cannot appear here.
+//
+// Liveness is the real thing, not a use count: STR[65]_4 in reverse-complement IS read again after
+// the loop, yet it is dead at the concatenation because every path back to the loop redefines it
+// first. A "used exactly once" test answers the wrong question and would refuse the one shape that
+// matters. So: classic backward fixpoint over the CFG, restricted to the string bank.
+//
+// The mark travels as Src3 = ConstInt(-1), which the bytecode compiler lowers into Immediate. An
+// unmarked instruction leaves Immediate at 0, so the VM's default is the safe, copying path
+// (absent-operand-lowers-to-r0: an absent operand reads as 0, and 0 must mean "no").
+var
+  b, i, k, PassNo, Key: Integer;
+  Blk: TSSABasicBlock;
+  Ins: TSSAInstruction;
+  Changed: Boolean;
+  MaxVer, VStride, NSlots: Integer;
+  LiveIn, LiveOut, Live: array of Boolean;    // per (register, version) slot
+  BlockLiveIn, BlockLiveOut: array of array of Boolean;
+
+  function KeyOf(const V: TSSAValue): Integer;
+  begin
+    if (V.Kind = svkRegister) and (V.RegType = srtString) and
+       (V.RegIndex >= 0) and (V.Version >= 0) and (V.Version <= MaxVer) then
+      Result := V.RegIndex * VStride + V.Version
+    else
+      Result := -1;
+  end;
+
+  // Every string operand this instruction READS. Dest counts as a read for the stores that carry
+  // their value there -- treating one of those as a pure write would call a live value dead.
+  procedure MarkReads(P: TSSAInstruction; var S: array of Boolean);
+  var q, K2: Integer;
+  begin
+    K2 := KeyOf(P.Src1); if (K2 >= 0) and (K2 <= High(S)) then S[K2] := True;
+    K2 := KeyOf(P.Src2); if (K2 >= 0) and (K2 <= High(S)) then S[K2] := True;
+    K2 := KeyOf(P.Src3); if (K2 >= 0) and (K2 <= High(S)) then S[K2] := True;
+    for q := 0 to High(P.PhiSources) do
+    begin
+      K2 := KeyOf(P.PhiSources[q].Value);
+      if (K2 >= 0) and (K2 <= High(S)) then S[K2] := True;
+    end;
+    if P.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString] then
+    begin
+      K2 := KeyOf(P.Dest); if (K2 >= 0) and (K2 <= High(S)) then S[K2] := True;
+    end;
+  end;
+
+begin
+  Result := 0;
+  // ⛔ DEFAULT OFF (STRDEADSRC=1 to enable), and the measurement says why. The mark is CORRECT -- it
+  // fires on 4 concatenations in reverse-complement -- but on its own it buys nothing, because the
+  // buffer it lets the VM steal is shared by THREE registers, not one: the copies that close the
+  // loop-carried PHI alias it, so the refcount is 3, the steal brings it to 2, and AppendString only
+  // grows in place at 1. It becomes useful the day those copies are coalesced away; until then it
+  // would only cost a liveness fixpoint at compile time.
+  if GetEnvironmentVariable('STRDEADSRC') <> '1' then Exit;
+
+  MaxVer := 0;
+  for b := 0 to Blocks.Count - 1 do
+  begin
+    Blk := TSSABasicBlock(Blocks[b]);
+    for i := 0 to Blk.Instructions.Count - 1 do
+    begin
+      Ins := TSSAInstruction(Blk.Instructions[i]);
+      if (Ins.Dest.Kind = svkRegister) and (Ins.Dest.Version > MaxVer) then MaxVer := Ins.Dest.Version;
+      if (Ins.Src1.Kind = svkRegister) and (Ins.Src1.Version > MaxVer) then MaxVer := Ins.Src1.Version;
+      if (Ins.Src2.Kind = svkRegister) and (Ins.Src2.Version > MaxVer) then MaxVer := Ins.Src2.Version;
+      if (Ins.Src3.Kind = svkRegister) and (Ins.Src3.Version > MaxVer) then MaxVer := Ins.Src3.Version;
+      for k := 0 to High(Ins.PhiSources) do
+        if (Ins.PhiSources[k].Value.Kind = svkRegister) and (Ins.PhiSources[k].Value.Version > MaxVer) then
+          MaxVer := Ins.PhiSources[k].Value.Version;
+    end;
+  end;
+  VStride := MaxVer + 1;
+  NSlots := (FNextRegister[srtString] + 1) * VStride;
+  if NSlots <= 0 then Exit;
+
+  SetLength(BlockLiveIn, Blocks.Count);
+  SetLength(BlockLiveOut, Blocks.Count);
+  for b := 0 to Blocks.Count - 1 do
+  begin
+    SetLength(BlockLiveIn[b], NSlots);
+    SetLength(BlockLiveOut[b], NSlots);
+  end;
+  SetLength(LiveIn, NSlots);
+  SetLength(LiveOut, NSlots);
+  SetLength(Live, NSlots);
+
+  // Backward fixpoint: LiveOut[b] = union of LiveIn[successors]; LiveIn[b] = reads before writes.
+  // ⚠️ A block whose successors are not all in this program (an unresolved jump) would need its
+  // LiveOut treated as "everything live"; here successors are always inside, and anything missing
+  // only ever makes the answer MORE conservative, never less.
+  PassNo := 0;
+  repeat
+    Changed := False;
+    Inc(PassNo);
+    for b := Blocks.Count - 1 downto 0 do
+    begin
+      Blk := TSSABasicBlock(Blocks[b]);
+      for i := 0 to NSlots - 1 do LiveOut[i] := False;
+      for k := 0 to Blk.Successors.Count - 1 do
+      begin
+        i := TSSABasicBlock(Blk.Successors[k]).BlockIndex;
+        if (i >= 0) and (i < Blocks.Count) then
+          for Key := 0 to NSlots - 1 do
+            if BlockLiveIn[i][Key] then LiveOut[Key] := True;
+      end;
+      for i := 0 to NSlots - 1 do LiveIn[i] := LiveOut[i];
+      // Walk the block backwards: a definition kills, a read revives.
+      for i := Blk.Instructions.Count - 1 downto 0 do
+      begin
+        Ins := TSSAInstruction(Blk.Instructions[i]);
+        Key := KeyOf(Ins.Dest);
+        if (Key >= 0) and (Key < NSlots) and
+           not (Ins.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString]) then
+          LiveIn[Key] := False;
+        MarkReads(Ins, LiveIn);
+      end;
+      for i := 0 to NSlots - 1 do
+      begin
+        if BlockLiveOut[b][i] <> LiveOut[i] then begin BlockLiveOut[b][i] := LiveOut[i]; Changed := True; end;
+        if BlockLiveIn[b][i] <> LiveIn[i] then begin BlockLiveIn[b][i] := LiveIn[i]; Changed := True; end;
+      end;
+    end;
+  until (not Changed) or (PassNo > 50);
+
+  // Second walk: at each StrConcat, is Src1 live AFTER it?
+  for b := 0 to Blocks.Count - 1 do
+  begin
+    Blk := TSSABasicBlock(Blocks[b]);
+    for i := 0 to NSlots - 1 do Live[i] := BlockLiveOut[b][i];
+    for i := Blk.Instructions.Count - 1 downto 0 do
+    begin
+      Ins := TSSAInstruction(Blk.Instructions[i]);
+      if (Ins.OpCode = ssaStrConcat) and (Ins.Src3.Kind = svkNone) then
+      begin
+        Key := KeyOf(Ins.Src1);
+        // Src1 dead after this point, and genuinely a different register from Dest and Src2 (stealing
+        // a buffer that Src2 also names would corrupt the right-hand operand mid-append).
+        if (Key >= 0) and (Key < NSlots) and (not Live[Key]) and
+           (KeyOf(Ins.Dest) <> Key) and (KeyOf(Ins.Src2) <> Key) then
+        begin
+          Ins.Src3 := MakeSSAConstInt(-1);
+          Inc(Result);
+        end;
+      end;
+      Key := KeyOf(Ins.Dest);
+      if (Key >= 0) and (Key < NSlots) and
+         not (Ins.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString]) then
+        Live[Key] := False;
+      MarkReads(Ins, Live);
+    end;
+  end;
+  if GetEnvironmentVariable('STRFUSE_DIAG') <> '' then
+    WriteLn(ErrOutput, Format('[DEADSRC] marked %d concatenations whose left operand dies there (of %d blocks, %d slots, %d fixpoint passes)',
+      [Result, Blocks.Count, NSlots, PassNo]));
 end;
 
 function TSSAProgram.RunConcatCharFusion: Integer;

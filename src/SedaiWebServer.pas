@@ -454,6 +454,7 @@ begin
           try SSAProgram.RunAscMidFusion; except end;
           try SSAProgram.RunStringTempFusion; except end;
           try SSAProgram.RunConcatCharFusion; except end;
+          try SSAProgram.RunConcatDeadSourceMark; except end;
         end;
         {$IFNDEF DISABLE_REG_ALLOC}
         RegAlloc := TLinearScanAllocator.Create(SSAProgram);

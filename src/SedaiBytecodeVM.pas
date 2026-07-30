@@ -7186,7 +7186,8 @@ var
   SubOp: Word;
   ElemVal: Double;   // scratch for bounds-guarded array element reads
   CharPos: Integer;  // bcStrConcatCharAt: the 1-based index into the table
-  TabStr: string;    // ...and the table itself
+  SrcLen: Integer;   // ...length of the accumulator being extended
+  CharVal: AnsiChar; // ...and the byte taken from the table
 begin
   // Superinstructions use sub-opcode (low byte) for dispatch
   // Full opcode is 0xC800 + SubOp (group 200)
@@ -7464,8 +7465,21 @@ begin
           // The shape this exists for: grow the accumulator in place, no allocation at all.
           AppendChar(Ctx.StringRegs[Instr.Dest], Ctx.StringRegs[Instr.Src2][CharPos])
         else
-          Ctx.StringRegs[Instr.Dest] :=
-            Ctx.StringRegs[Instr.Src1] + Ctx.StringRegs[Instr.Src2][CharPos];
+        begin
+          // ⛔ NOT "Src1 + Ctx.StringRegs[Src2][CharPos]": in FPC "string + char" converts the char
+          // into a temporary AnsiString first, so that form ALLOCATES -- which is the very cost this
+          // opcode exists to remove. Measured: the concatenating version made reverse-complement 9%
+          // slower under --aot and 24% interpreted, i.e. worse than the two instructions it replaces.
+          CharVal := Ctx.StringRegs[Instr.Src2][CharPos];
+          SrcLen := Length(Ctx.StringRegs[Instr.Src1]);
+          // See ConcatCharTo: release the shared buffer before resizing, or SetLength copies the old
+          // contents that the Move below is about to replace anyway.
+          Ctx.StringRegs[Instr.Dest] := '';
+          SetLength(Ctx.StringRegs[Instr.Dest], SrcLen + 1);
+          if SrcLen > 0 then
+            Move(Ctx.StringRegs[Instr.Src1][1], Ctx.StringRegs[Instr.Dest][1], SrcLen);
+          Ctx.StringRegs[Instr.Dest][SrcLen + 1] := CharVal;
+        end;
       end;
 
     // Array Swap (Int) - sub-opcode 250. Bounds-guarded: skip the swap if either index is out of range (MODERN); CLASSIC raises.
@@ -8340,6 +8354,25 @@ end;
 
   When the destination slot already holds the accumulator - which is the shape the fusion exists for,
   "outLine += Mid(...)" - the buffer grows in place and the append costs no allocation at all. }
+procedure ConcatCharTo(var D: AnsiString; const S: AnsiString; C: AnsiChar);
+// D := S + C without ever building a one-character string. "S + C" in FPC converts C into a
+// temporary AnsiString first, so it ALLOCATES -- and that allocation is exactly what this opcode
+// exists to avoid. Measured with the concatenating form: reverse-complement 9% slower under --aot,
+// 24% interpreted, i.e. worse than the two instructions the fusion replaces.
+var
+  L: SizeInt;
+begin
+  L := Length(S);
+  // ⛔ Drop the old buffer FIRST. SetLength on a string whose buffer is shared (refcount > 1, which
+  // is the normal state of a register that a CopyString has aliased) allocates AND copies the old
+  // contents -- contents we are about to overwrite completely. Releasing it first makes the new
+  // buffer unshared, so SetLength allocates without copying and only the Move below runs.
+  D := '';
+  SetLength(D, L + 1);
+  if L > 0 then Move(S[1], D[1], L);
+  D[L + 1] := C;
+end;
+
 procedure AotStrConcatCharAtModern(dstSlot, accVal, tabVal: Pointer; k: PtrInt); cdecl;
 // ⛔ Never assign the operands to local AnsiString variables: that is a managed assignment and costs
 // a reference count up and down per call, in a loop that runs once per character. Casting inside the
@@ -8354,7 +8387,7 @@ begin
   if Pointer(PAnsiString(dstSlot)^) = accVal then
     AppendChar(PAnsiString(dstSlot)^, AnsiString(tabVal)[k])
   else
-    PAnsiString(dstSlot)^ := AnsiString(accVal) + AnsiString(tabVal)[k];
+    ConcatCharTo(PAnsiString(dstSlot)^, AnsiString(accVal), AnsiString(tabVal)[k]);
 end;
 
 procedure AotStrConcatCharAtClassic(dstSlot, accVal, tabVal: Pointer; k: PtrInt); cdecl;
@@ -8368,7 +8401,7 @@ begin
   if Pointer(PAnsiString(dstSlot)^) = accVal then
     AppendChar(PAnsiString(dstSlot)^, AnsiString(tabVal)[k])
   else
-    PAnsiString(dstSlot)^ := AnsiString(accVal) + AnsiString(tabVal)[k];
+    ConcatCharTo(PAnsiString(dstSlot)^, AnsiString(accVal), AnsiString(tabVal)[k]);
 end;
 
 procedure AotStrChr(dstSlot: Pointer; code: PtrInt); cdecl;
@@ -8866,6 +8899,17 @@ begin
       // both unreachable and wrong.
       if (Instr.Dest = Instr.Src1) and (Instr.Dest <> Instr.Src2) then
         AppendString(Ctx.StringRegs[Instr.Dest], Ctx.StringRegs[Instr.Src2])
+      // Immediate = -1: the compiler proved the LEFT operand is dead right after this instruction
+      // (RunConcatDeadSourceMark). Then its buffer can be taken over instead of rebuilding the whole
+      // string: move it into Dest, drop the source's reference so the buffer becomes unshared, and
+      // append in place. This is what makes "s = s + x" linear even when Dest is a DIFFERENT register
+      // from Src1 -- the shape the loop-carried PHI copies always produce.
+      else if (Instr.Immediate = -1) and (Instr.Dest <> Instr.Src2) and (Instr.Src1 <> Instr.Src2) then
+      begin
+        Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Src1];
+        Ctx.StringRegs[Instr.Src1] := '';
+        AppendString(Ctx.StringRegs[Instr.Dest], Ctx.StringRegs[Instr.Src2]);
+      end
       else
         Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Src1] + Ctx.StringRegs[Instr.Src2];
     1: // bcStrLen
