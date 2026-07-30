@@ -405,9 +405,11 @@ begin
 
         // String temp fusion -- see TSSAProgram.RunStringTempFusion.
         if GetEnvironmentVariable('STRFUSE') <> '0' then
+        begin
           try SSAProgram.RunStringTempFusion; except end;
           try SSAProgram.RunAscMidFusion; except end;
           try SSAProgram.RunStringTempFusion; except end;
+        end;
 
         // Register Allocation
         {$IFNDEF DISABLE_REG_ALLOC}

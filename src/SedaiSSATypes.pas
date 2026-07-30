@@ -1588,8 +1588,11 @@ begin
                 Inc(Result);
               end;
             end;
+            // ⛔ NO explicit Free here: Instructions is a TFPGObjectList created with OwnsObjects,
+            // so Delete has already destroyed the instruction. Freeing it again raised an access
+            // violation that the caller's "except end" swallowed, killing the pass after its FIRST
+            // fusion -- which is why further Asc(Mid()) sites looked like they "resisted" fusion.
             Blk.Instructions.Delete(i);
-            Prod.Free;
             Continue;
           end;
         end;
@@ -1623,25 +1626,104 @@ function TSSAProgram.RunStringTempFusion: Integer;
 // two must be adjacent in the same block, so no control flow can reach one without the other.
 // Counting defs as well as uses matters because PHI elimination has already broken single
 // assignment for the variables it lowered.
+//
+// The census keys on (register, VERSION), not on the register alone. A loop accumulator lowers to
+// several versions of ONE register -- "STR[66]_2/_3/_4" for a single "line" -- so counting per
+// register made every accumulator look multi-defined and the fusion never fired on the one shape
+// that matters most. Version 0 means "unversioned", where per-version and per-register counting
+// coincide, so nothing changes for the registers that were already handled.
+//
+// Diagnostics: STRFUSE_DIAG=1 reports, per string producer, whether it fused and if not WHY.
+// The pass is silent by construction (it either rewrites or walks away), so without this the only
+// way to tell a fusion that never fires from one that fires and does not pay is the stopwatch --
+// which answers "how much", never "why".
 var
   b, i, k, k2, T, D: Integer;
-  Ok: Boolean;
-  Blk: TSSABasicBlock;
+  Ok, Diag, VersionedCensus: Boolean;
+  Blk, SBlk: TSSABasicBlock;
   Prod, Cp, Mid: TSSAInstruction;
   DefCount, UseCount: array of Integer;
+  NMultiDef, NMultiUse, NNoCopy, NBlocked, NFused, NXBlock: Integer;
+  MaxVer, VStride: Integer;
 
-  procedure Bump(var Arr: array of Integer; const V: TSSAValue);
+  // Census key: one slot per (string register, version) pair. STRFUSE_VER=0 collapses every version
+  // onto the register, which is exactly the old per-register census -- the A/B arm for this change,
+  // on ONE binary, since comparing against historical numbers is worthless on a loaded machine.
+  function KeyOf(const V: TSSAValue): Integer;
   begin
     if (V.Kind = svkRegister) and (V.RegType = srtString) and
-       (V.RegIndex >= 0) and (V.RegIndex <= High(Arr)) then
-      Inc(Arr[V.RegIndex]);
+       (V.RegIndex >= 0) and (V.Version >= 0) and (V.Version <= MaxVer) then
+    begin
+      if VersionedCensus then
+        Result := V.RegIndex * VStride + V.Version
+      else
+        Result := V.RegIndex * VStride;
+    end
+    else
+      Result := -1;
+  end;
+
+  procedure Bump(var Arr: array of Integer; const V: TSSAValue);
+  var
+    Key: Integer;
+  begin
+    Key := KeyOf(V);
+    if (Key >= 0) and (Key <= High(Arr)) then Inc(Arr[Key]);
+  end;
+
+  procedure Reject(const Reason: string; P: TSSAInstruction; Defs, Uses_: Integer);
+  begin
+    if not Diag then Exit;
+    WriteLn(ErrOutput, Format('[STRFUSE] %-10s %-22s dest=S%d defs=%d uses=%d',
+      [Reason, SSAOpCodeToString(P.OpCode), P.Dest.RegIndex, Defs, Uses_]));
   end;
 
 begin
   Result := 0;
-  SetLength(DefCount, FNextRegister[srtString] + 1);
-  SetLength(UseCount, FNextRegister[srtString] + 1);
+  Diag := GetEnvironmentVariable('STRFUSE_DIAG') <> '';
+  VersionedCensus := GetEnvironmentVariable('STRFUSE_VER') <> '0';
+  NMultiDef := 0; NMultiUse := 0; NNoCopy := 0; NBlocked := 0; NFused := 0; NXBlock := 0;
+
+  // Widest version in use, so the (register, version) census can be a flat array.
+  MaxVer := 0;
+  for b := 0 to Blocks.Count - 1 do
+  begin
+    Blk := TSSABasicBlock(Blocks[b]);
+    for i := 0 to Blk.Instructions.Count - 1 do
+    begin
+      Prod := TSSAInstruction(Blk.Instructions[i]);
+      if (Prod.Dest.Kind = svkRegister) and (Prod.Dest.RegType = srtString) and (Prod.Dest.Version > MaxVer) then MaxVer := Prod.Dest.Version;
+      if (Prod.Src1.Kind = svkRegister) and (Prod.Src1.RegType = srtString) and (Prod.Src1.Version > MaxVer) then MaxVer := Prod.Src1.Version;
+      if (Prod.Src2.Kind = svkRegister) and (Prod.Src2.RegType = srtString) and (Prod.Src2.Version > MaxVer) then MaxVer := Prod.Src2.Version;
+      if (Prod.Src3.Kind = svkRegister) and (Prod.Src3.RegType = srtString) and (Prod.Src3.Version > MaxVer) then MaxVer := Prod.Src3.Version;
+      for k := 0 to High(Prod.PhiSources) do
+        if (Prod.PhiSources[k].Value.Kind = svkRegister) and (Prod.PhiSources[k].Value.RegType = srtString) and
+           (Prod.PhiSources[k].Value.Version > MaxVer) then MaxVer := Prod.PhiSources[k].Value.Version;
+    end;
+  end;
+  VStride := MaxVer + 1;
+
+  SetLength(DefCount, (FNextRegister[srtString] + 1) * VStride);
+  SetLength(UseCount, (FNextRegister[srtString] + 1) * VStride);
   for i := 0 to High(DefCount) do begin DefCount[i] := 0; UseCount[i] := 0; end;
+
+  // STRFUSE_DIAG=2 dumps every block's string traffic, with the block label and the successor edges.
+  // The counts alone say a fusion did not fire; only the shape says what stands in the way.
+  if GetEnvironmentVariable('STRFUSE_DIAG') = '2' then
+    for b := 0 to Blocks.Count - 1 do
+    begin
+      Blk := TSSABasicBlock(Blocks[b]);
+      WriteLn(ErrOutput, Format('[STRFUSE] --- block %d "%s"  preds=%d succs=%d',
+        [b, Blk.LabelName, Blk.Predecessors.Count, Blk.Successors.Count]));
+      for i := 0 to Blk.Instructions.Count - 1 do
+      begin
+        Prod := TSSAInstruction(Blk.Instructions[i]);
+        if ((Prod.Dest.Kind = svkRegister) and (Prod.Dest.RegType = srtString)) or
+           ((Prod.Src1.Kind = svkRegister) and (Prod.Src1.RegType = srtString)) or
+           ((Prod.Src2.Kind = svkRegister) and (Prod.Src2.RegType = srtString)) then
+          WriteLn(ErrOutput, Format('[STRFUSE]     %3d: %s', [i, Prod.ToString]));
+      end;
+    end;
 
   // Census first: every definition and every use of every string register, program-wide.
   for b := 0 to Blocks.Count - 1 do
@@ -1670,13 +1752,29 @@ begin
     while i < Blk.Instructions.Count - 1 do
     begin
       Prod := TSSAInstruction(Blk.Instructions[i]);
+      T := -1;
       if (Prod.Dest.Kind = svkRegister) and (Prod.Dest.RegType = srtString) and
-         (Prod.Dest.RegIndex >= 0) and (Prod.Dest.RegIndex <= High(DefCount)) and
          (Prod.OpCode <> ssaCopyString) and
-         not (Prod.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString, ssaPhi]) and
-         (DefCount[Prod.Dest.RegIndex] = 1) and (UseCount[Prod.Dest.RegIndex] = 1) then
+         not (Prod.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString, ssaPhi]) then
+        T := KeyOf(Prod.Dest);
+      if (T >= 0) and (T <= High(DefCount)) and
+         ((DefCount[T] <> 1) or (UseCount[T] <> 1)) then
       begin
-        T := Prod.Dest.RegIndex;
+        // Not fusable, but worth counting: these two are the reasons the pass walks away most often.
+        if DefCount[T] <> 1 then
+        begin
+          Inc(NMultiDef);
+          Reject('multi-def', Prod, DefCount[T], UseCount[T]);
+        end
+        else
+        begin
+          Inc(NMultiUse);
+          Reject('multi-use', Prod, DefCount[T], UseCount[T]);
+        end;
+      end
+      else if (T >= 0) and (T <= High(DefCount)) and
+              (DefCount[T] = 1) and (UseCount[T] = 1) then
+      begin
         // Find the copy that consumes T. It does NOT have to be the next instruction: T has exactly
         // one definition and one use, so nothing between can read or write it, and a basic block has
         // no control flow inside it. Requiring adjacency was simply too strong -- reverse-complement
@@ -1686,8 +1784,7 @@ begin
         for D := i + 1 to Blk.Instructions.Count - 1 do
         begin
           Cp := TSSAInstruction(Blk.Instructions[D]);
-          if (Cp.OpCode = ssaCopyString) and (Cp.Src1.Kind = svkRegister) and
-             (Cp.Src1.RegType = srtString) and (Cp.Src1.RegIndex = T) then
+          if (Cp.OpCode = ssaCopyString) and (KeyOf(Cp.Src1) = T) then
           begin
             k := D;
             Break;
@@ -1697,31 +1794,78 @@ begin
         begin
           Cp := TSSAInstruction(Blk.Instructions[k]);
           if (Cp.Dest.Kind = svkRegister) and (Cp.Dest.RegType = srtString) and
-             (Cp.Dest.RegIndex >= 0) and (Cp.Dest.RegIndex <> T) then
+             (Cp.Dest.RegIndex >= 0) and (KeyOf(Cp.Dest) <> T) then
           begin
             D := Cp.Dest.RegIndex;
             // What DOES have to hold: nothing between may touch the DESTINATION. Writing D earlier
             // than the copy did would be observed by an intervening read of D, and would be undone
-            // by an intervening write to it.
+            // by an intervening write to it. The test is per REGISTER, not per version -- deliberately
+            // conservative, and it is exactly what protects the accumulator case below: a read of the
+            // OLD version between producer and copy blocks the fusion.
             Ok := True;
             for k2 := i + 1 to k - 1 do
             begin
               Mid := TSSAInstruction(Blk.Instructions[k2]);
               if TouchesStrReg(Mid, D) then begin Ok := False; Break; end;
             end;
+            // With a versioned census the destination can now be ANOTHER VERSION OF THE PRODUCER'S
+            // OWN SOURCE -- that is the accumulator, "s = s + x", and fusing it is what finally makes
+            // the VM's in-place append reachable (bcStrConcat with Dest = Src1). Allow that only for
+            // StrConcat, which has the in-place path: any other producer would be asked to write the
+            // register it is still reading, and a helper that stores before it loads would read back
+            // its own result.
+            if Ok and (Prod.OpCode <> ssaStrConcat) then
+              if ((Prod.Src1.Kind = svkRegister) and (Prod.Src1.RegType = srtString) and (Prod.Src1.RegIndex = D)) or
+                 ((Prod.Src2.Kind = svkRegister) and (Prod.Src2.RegType = srtString) and (Prod.Src2.RegIndex = D)) then
+                Ok := False;
             if Ok then
             begin
               Prod.Dest := Cp.Dest;
+              // ⛔ Delete already frees it (OwnsObjects list) -- see RunAscMidFusion above.
               Blk.Instructions.Delete(k);
-              Cp.Free;
               Inc(Result);
+              Inc(NFused);
+            end
+            else
+            begin
+              Inc(NBlocked);
+              Reject('blocked', Prod, 1, 1);
             end;
           end;
+        end
+        else
+        begin
+          Inc(NNoCopy);
+          // Price the single-block rule before relaxing it: the PHI copy that closes a loop-carried
+          // accumulator is emitted in the LATCH, not in the block that computes the value, so the
+          // shape "s = s + x" inside a For body is invisible to a search that stops at the block end.
+          // Counting -- not fusing -- the cases where the consumer sits in a successor that this block
+          // alone reaches says how much a cross-block rule would be worth.
+          if Diag and (Blk.Successors.Count = 1) then
+          begin
+            SBlk := TSSABasicBlock(Blk.Successors[0]);
+            if (SBlk <> Blk) and (SBlk.Predecessors.Count = 1) then
+              for k2 := 0 to SBlk.Instructions.Count - 1 do
+              begin
+                Mid := TSSAInstruction(SBlk.Instructions[k2]);
+                if (Mid.OpCode = ssaCopyString) and (Mid.Src1.Kind = svkRegister) and
+                   (Mid.Src1.RegType = srtString) and (Mid.Src1.RegIndex = T) then
+                begin
+                  Inc(NXBlock);
+                  Break;
+                end;
+              end;
+          end;
+          Reject('no-copy', Prod, 1, 1);
         end;
       end;
       Inc(i);
     end;
   end;
+
+  if Diag then
+    WriteLn(ErrOutput, Format('[STRFUSE] summary: fused=%d  rejected multi-def=%d multi-use=%d no-copy=%d blocked=%d  (of the no-copy, %d have their consumer in a single-pred successor)',
+      [NFused, NMultiDef, NMultiUse, NNoCopy, NBlocked, NXBlock]));
 end;
 
 procedure TSSAProgram.RunPhiElimination;

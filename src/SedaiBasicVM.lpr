@@ -1450,10 +1450,28 @@ begin
       // bytecode instead desynchronised the two and miscompiled Str() under --aot.
       // ⚠️ This program has its OWN SSA pipeline: there are nine such sites in the tree, and a pass
       // added to only some of them silently does nothing on the paths it missed.
+      // ⚠️ The three calls need the begin/end: without it the gate covers only the FIRST one and
+      // "STRFUSE=0" still fuses, which makes every A/B on this gate read a contaminated baseline.
       if GetEnvironmentVariable('STRFUSE') <> '0' then
-        try SSAProgram.RunStringTempFusion; except end;
-        try SSAProgram.RunAscMidFusion; except end;
-        try SSAProgram.RunStringTempFusion; except end;
+      begin
+        // ⚠️ "except end" swallows the pass's own defects: a fusion that aborts halfway looks exactly
+        // like one that had nothing to do. Under STRFUSE_DIAG the exception is reported.
+        try SSAProgram.RunStringTempFusion;
+        except on E: Exception do
+          if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+            WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunStringTempFusion: ', E.Message);
+        end;
+        try SSAProgram.RunAscMidFusion;
+        except on E: Exception do
+          if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+            WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunAscMidFusion: ', E.Message);
+        end;
+        try SSAProgram.RunStringTempFusion;
+        except on E: Exception do
+          if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+            WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunStringTempFusion (2nd): ', E.Message);
+        end;
+      end;
 
       // REGISTER ALLOCATION - Allocate physical registers to virtual registers
       // Uses Linear Scan algorithm (O(n log n) complexity)

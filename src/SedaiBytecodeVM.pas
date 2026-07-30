@@ -8012,9 +8012,22 @@ begin
     PAnsiString(dstSlot)^ := VM.FProgram.StringConstants[imm];
 end;
 
+procedure AppendString(var D: AnsiString; const S: AnsiString); forward;
+
 procedure AotStrConcat(dstSlot, aVal, bVal: Pointer); cdecl;
+// "s = s + x" arrives here with dest = src1 once the SSA fusion has removed the temporary copy, and
+// then growing the destination in place is the difference between linear and quadratic -- exactly as
+// in bcStrConcat. Without this arm the AOT kept rebuilding the whole accumulator on every append
+// while the interpreter had already stopped: the same source ran the fast shape only interpreted.
+//
+// The test is on the BUFFER, not on a register number the primitive cannot see: dest holds the very
+// string that was passed as the left operand. Sharing the buffer with the RIGHT operand ("s = s + s")
+// must stay on the plain concatenation, which allocates and therefore keeps the two apart.
 begin
-  PAnsiString(dstSlot)^ := AnsiString(aVal) + AnsiString(bVal);
+  if (Pointer(PAnsiString(dstSlot)^) = aVal) and (aVal <> bVal) then
+    AppendString(PAnsiString(dstSlot)^, AnsiString(bVal))
+  else
+    PAnsiString(dstSlot)^ := AnsiString(aVal) + AnsiString(bVal);
 end;
 
 function AotStrLen(sVal: Pointer): PtrInt; cdecl;

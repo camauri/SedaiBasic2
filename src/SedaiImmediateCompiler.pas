@@ -243,9 +243,11 @@ begin
       // THREE compile paths (CompileStatement, CompileFromAST, CompileProgram); adding a pass to one
       // of them and assuming "sb ran it" is how this one first appeared to do nothing at all.
       if GetEnvironmentVariable('STRFUSE') <> '0' then
+      begin
         try SSAProgram.RunStringTempFusion; except end;
         try SSAProgram.RunAscMidFusion; except end;
         try SSAProgram.RunStringTempFusion; except end;
+      end;
 
       // Register Allocation
       RegAlloc := TLinearScanAllocator.Create(SSAProgram);
@@ -348,9 +350,11 @@ begin
     // THREE compile paths (CompileStatement, CompileFromAST, CompileProgram); adding a pass to one
     // of them and assuming "sb ran it" is how this one first appeared to do nothing at all.
     if GetEnvironmentVariable('STRFUSE') <> '0' then
+    begin
       try SSAProgram.RunStringTempFusion; except end;
       try SSAProgram.RunAscMidFusion; except end;
       try SSAProgram.RunStringTempFusion; except end;
+    end;
 
     // Register Allocation
     RegAlloc := TLinearScanAllocator.Create(SSAProgram);
@@ -530,9 +534,11 @@ begin
       // the one "sb program.bas" actually takes: a pass added to only one of them silently does
       // nothing where it matters most.
       if GetEnvironmentVariable('STRFUSE') <> '0' then
+      begin
         try SSAProgram.RunStringTempFusion; except end;
         try SSAProgram.RunAscMidFusion; except end;
         try SSAProgram.RunStringTempFusion; except end;
+      end;
 
       // Register Allocation
       RegAlloc := TLinearScanAllocator.Create(SSAProgram);
