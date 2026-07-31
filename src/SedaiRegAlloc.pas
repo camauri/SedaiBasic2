@@ -761,6 +761,9 @@ function DestIsPureDef(Op: TSSAOpCode): Boolean;
 begin
   case Op of
     ssaArrayStore, ssaArrayStoreIndInt, ssaArrayStoreIndFloat, ssaArrayStoreIndString,
+    // ssaStrAppendMapped APPENDS to its Dest, so the incoming value is an input: treating Dest as a
+    // pure definition would let liveness end the accumulator that the instruction is about to grow.
+    ssaStrAppendMapped,
     ssaGetBinStr, ssaStrInstr, ssaPrintFile, ssaSetColor,
     ssaGraphicBox, ssaGraphicCircle, ssaGraphicDraw, ssaGraphicGShape, ssaGraphicPaint,
     ssaGraphicScale, ssaGraphicWindow, ssaGfxCircleEx, ssaGfxLineStyled,

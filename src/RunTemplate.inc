@@ -171,6 +171,10 @@ begin
       LocalAotCtx.StrConcatCharAt := @AotStrConcatCharAtModern
     else
       LocalAotCtx.StrConcatCharAt := @AotStrConcatCharAtClassic;
+    if Assigned(FProgram) and FProgram.ModernMode then
+      LocalAotCtx.StrAppendMapped := @AotStrAppendMappedModern
+    else
+      LocalAotCtx.StrAppendMapped := @AotStrAppendMappedClassic;
   end
   else
     AotFuncs := nil;
@@ -584,6 +588,12 @@ begin
         // work, and inlining bodies here is what made every program slower when the whole
         // superinstruction set was inline. One delegated instruction still replaces two.
         158: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+
+        // "acc += tab[Asc(MID$(s,i,1))+1]" fused whole - sub-opcode 159. Delegated for the same
+        // reason as 158. ⛔ THIS LINE is the one an opcode addition forgets: the arm in
+        // ExecuteSuperinstruction compiles fine on its own and is simply never reached, and the
+        // program dies at RUNTIME with "Unknown superinstruction sub-opcode".
+        159: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr); CurPC := Ctx.PC + 1; end;
 
       else
         raise Exception.CreateFmt('Unknown superinstruction sub-opcode %d (full opcode $%.4X) at CurPC=%d', [Op and $FF, Op, CurPC]);

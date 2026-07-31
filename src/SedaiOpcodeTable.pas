@@ -40,7 +40,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 527 {$IFDEF WEB_MODE} + 12 {$ENDIF};
+  OPCODE_LIST_COUNT = 528 {$IFDEF WEB_MODE} + 12 {$ENDIF};
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -129,7 +129,8 @@ const
     bcSubIntToBranchGt, bcMulAddFloat, bcMulSubFloat, bcMulAddToFloat, bcMulSubToFloat, bcArrayLoadAddFloat,
     bcArrayLoadSubFloat, bcArrayLoadDivAddFloat, bcSquareSumFloat, bcAddSquareFloat, bcMulMulFloat, bcAddSqrtFloat,
     bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ, bcArrayReverseRange, bcArrayShiftLeft, bcArraySwapInt, bcAddIntSelf,
-    bcSubIntSelf, bcArrayLoadIntTo, bcArrayCopyElement, bcArrayMoveElement, bcStrConcatCharAt
+    bcSubIntSelf, bcArrayLoadIntTo, bcArrayCopyElement, bcArrayMoveElement, bcStrConcatCharAt,
+    bcStrAppendMapped
     {$IFDEF WEB_MODE}
     , bcWebGetParam, bcWebPostParam, bcWebGetRaw, bcWebPostRaw, bcWebHtmlEncode, bcWebUrlEncode,
     bcWebMethod, bcWebPath, bcWebQuery, bcWebHeader, bcWebSetHeader, bcWebStatus

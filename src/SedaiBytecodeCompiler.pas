@@ -213,6 +213,7 @@ begin
     ssaStrAsc: Result := bcStrAsc;
     ssaStrAscMid: Result := bcStrAscMid;
     ssaStrConcatCharAt: Result := bcStrConcatCharAt;
+    ssaStrAppendMapped: Result := bcStrAppendMapped;
     ssaStrChr: Result := bcStrChr;
     ssaStrStr: Result := bcStrStr;
     ssaStrVal: Result := bcStrVal;

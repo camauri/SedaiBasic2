@@ -48,6 +48,7 @@ begin
     // === GROUP 1: String operations ===
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrChr, bcStrWChr,
     bcStrConcatCharAt,  // "acc + tab[k]" fused (superinstruction group) - string dest
+    bcStrAppendMapped,  // "acc += tab[Asc(s[i])+1]" fused - string dest (READ too: it appends)
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING codepoint substrings - string dest
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrSpace,  // B1.2: string dest
     bcCurDir, bcEnviron, bcExePath, bcCommand,  // CURDIR$ / ENVIRON$(name) / EXEPATH / COMMAND$(index) - string dest
@@ -112,6 +113,7 @@ begin
     // === GROUP 1: String operations ===
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrLen, bcStrLenW, bcStrAsc, bcStrAscMid, bcStrSAdd,
     bcStrConcatCharAt,  // "acc + tab[k]" fused: Src1 = the accumulator
+    bcStrAppendMapped,  // "acc += tab[Asc(s[i])+1]" fused: Src1 = the SOURCE string
     bcFileExists, bcFileLen, bcFileDateTime,  // FILEEXISTS/FILELEN/FILEDATETIME(path): Src1 = path string
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src1 = source string
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string
@@ -177,6 +179,7 @@ begin
     // === GROUP 1: String operations ===
     bcStrConcat,  // String concatenation (second operand)
     bcStrConcatCharAt,  // "acc + tab[k]" fused: Src2 = the table the byte is taken from
+    bcStrAppendMapped,  // "acc += tab[Asc(s[i])+1]" fused: Src2 = the mapping table
     bcStrInstr,   // INSTR(haystack, needle) - needle is Src2
     bcStrInstrRev, // INSTRREV(str, sub) - sub is Src2
     bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV - needle is Src2
@@ -213,7 +216,13 @@ begin
     bcArrayStoreString,  // Dest = value register (string) - READ, not written
     bcArrayStoreIndString,  // UDT array member store (string): Dest = value register - READ, not written
     // === GROUP 6: File I/O operations ===
-    bcPrintFile:         // Dest = data register (string) - READ, not written
+    bcPrintFile,         // Dest = data register (string) - READ, not written
+    // === Superinstruction group ===
+    // bcStrAppendMapped APPENDS to Dest, so the incoming accumulator is an INPUT as well as the
+    // result. Leaving it out here lets every liveness that consults this list believe the value
+    // arriving in Dest is dead, and the register carrying the accumulator gets reused: the reset
+    // "acc = ''" then lands on one register while the append keeps growing another.
+    bcStrAppendMapped:
       Result := True;
   else
     Result := False;

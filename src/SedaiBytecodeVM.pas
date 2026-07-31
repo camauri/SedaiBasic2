@@ -7482,6 +7482,33 @@ begin
         end;
       end;
 
+    // "acc += tab[Asc(MID$(s, i, 1)) + 1]" fused whole - sub-opcode 159.
+    159: // bcStrAppendMapped: Dest += Src2[Ord(Src1[Immediate]) + 1]
+      begin
+        // The three steps this replaces, in the same order and with the same dialect rules as the
+        // opcodes it fuses (bcStrAscMid, then the +1, then bcStrConcatCharAt): out of range at any
+        // step means "nothing to append", and the accumulator is left exactly as it was.
+        // ⛔ Read both strings IN PLACE. Assigning either to a local AnsiString is a managed
+        // assignment and costs a reference count up and down per CHARACTER - the mistake that made
+        // the first version of bcStrConcatCharAt slower than the instructions it replaced.
+        CharPos := Ctx.IntRegs[Instr.Immediate and $FFFF];
+        if (CharPos < 1) and Assigned(FProgram) and FProgram.ModernMode then
+          CharPos := 0                       // FB: a start below 1 is an empty string
+        else
+        begin
+          if CharPos < 1 then CharPos := 1;  // CLASSIC clamps
+          if CharPos > Length(Ctx.StringRegs[Instr.Src1]) then CharPos := 0;
+        end;
+        if CharPos > 0 then
+        begin
+          // The byte's CODE indexes the table, 1-based as everywhere in BASIC. A table too short
+          // for that code appends nothing rather than reading past its end.
+          SrcLen := Ord(Ctx.StringRegs[Instr.Src1][CharPos]) + 1;
+          if (SrcLen >= 1) and (SrcLen <= Length(Ctx.StringRegs[Instr.Src2])) then
+            AppendChar(Ctx.StringRegs[Instr.Dest], Ctx.StringRegs[Instr.Src2][SrcLen]);
+        end;
+      end;
+
     // Array Swap (Int) - sub-opcode 250. Bounds-guarded: skip the swap if either index is out of range (MODERN); CLASSIC raises.
     250: // bcArraySwapInt: swap arr[idx1] and arr[idx2]
       if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) and
@@ -8402,6 +8429,33 @@ begin
     AppendChar(PAnsiString(dstSlot)^, AnsiString(tabVal)[k])
   else
     ConcatCharTo(PAnsiString(dstSlot)^, AnsiString(accVal), AnsiString(tabVal)[k]);
+end;
+
+{ "acc += tab[Asc(MID$(s, i, 1)) + 1]" fused whole, the compiled counterpart of the
+  bcStrAppendMapped arm. Dialect-variant for the same reason as StrAscMid: what a start below 1
+  means. The accumulator always grows IN PLACE - that is the shape the opcode exists for. }
+procedure AotStrAppendMappedModern(dstSlot, srcVal, tabVal: Pointer; i: PtrInt); cdecl;
+// ⛔ Operands read in place, never through local AnsiString variables: a managed assignment costs a
+// reference count up and down on EVERY character. Same rule as AotStrConcatCharAt.
+var
+  code: PtrInt;
+begin
+  if i < 1 then Exit;                                   // FB: below 1 is an empty substring
+  if i > Length(AnsiString(srcVal)) then Exit;
+  code := Ord(AnsiString(srcVal)[i]) + 1;               // the byte's code, 1-based into the table
+  if (code < 1) or (code > Length(AnsiString(tabVal))) then Exit;
+  AppendChar(PAnsiString(dstSlot)^, AnsiString(tabVal)[code]);
+end;
+
+procedure AotStrAppendMappedClassic(dstSlot, srcVal, tabVal: Pointer; i: PtrInt); cdecl;
+var
+  code: PtrInt;
+begin
+  if i < 1 then i := 1;                                 // CLASSIC clamps the start
+  if i > Length(AnsiString(srcVal)) then Exit;
+  code := Ord(AnsiString(srcVal)[i]) + 1;
+  if (code < 1) or (code > Length(AnsiString(tabVal))) then Exit;
+  AppendChar(PAnsiString(dstSlot)^, AnsiString(tabVal)[code]);
 end;
 
 procedure AotStrChr(dstSlot: Pointer; code: PtrInt); cdecl;

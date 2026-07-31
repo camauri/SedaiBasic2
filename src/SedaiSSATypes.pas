@@ -169,6 +169,10 @@ type
     // "acc + Mid(tab, k, 1)" without building the one-character substring - see bcStrConcatCharAt.
     // Dest := Src1 + Src2[Src3]; when Dest IS Src1 the VM grows the accumulator in place.
     ssaStrConcatCharAt,
+    // "acc += tab[Asc(Mid(s, i, 1)) + 1]" as ONE instruction - see bcStrAppendMapped. It is the
+    // whole inner loop of reverse-complement: read the byte of Src1 at Src3, index Src2 with its
+    // code, append that byte to Dest. Dest is READ as well as written (the accumulator grows).
+    ssaStrAppendMapped,
     // FreeBASIC string functions (B1.2): single string arg -> string result.
     ssaStrLTrim, ssaStrRTrim, ssaStrTrim, ssaStrUCase, ssaStrLCase,
     ssaStrInstrRev,   // INSTRREV(s, sub) -> int (last occurrence)
@@ -628,6 +632,7 @@ type
     procedure RunPhiElimination;  // FINAL PASS: Convert PHI functions to copy instructions (BEFORE bytecode compilation)
     function RunStringTempFusion: Integer;  // write string results straight into their destination
     function RunConcatCharFusion: Integer;  // "acc + Mid(tab,k,1)" -> one instruction, no substring
+    function RunAppendMappedFusion: Integer; // "acc += tab[Asc(Mid(s,i,1))+1]" -> ONE instruction
     function RunConcatDeadSourceMark: Integer;  // mark "s = s + x" whose left operand dies there
     function RunAscMidFusion: Integer;      // Asc(Mid(s,i,n)) without building the substring
     function RunGVN: Integer;  // PHASE 3 TIER 2: Run Global Value Numbering optimization (returns replacements count)
@@ -1982,6 +1987,235 @@ begin
   end;
 end;
 
+function TSSAProgram.RunAppendMappedFusion: Integer;
+// Fuse the whole inner loop of reverse-complement into ONE instruction:
+//
+//   t1  = StrAscMid       s, i, 1          ' Asc(Mid(s, i, 1))
+//   t2  = AddInt          t1, 1            ' ...+1, the 1-based table index
+//   acc = StrConcatCharAt acc, tab, t2     ' acc += tab[t2]
+//   =>
+//   acc = StrAppendMapped acc, s, tab, i
+//
+// Three dispatches become one. Measured at ~25 ns each on this machine, which on reverse-complement
+// is 76 ns per character over a million characters - the single biggest item in that benchmark
+// (transform 76 ms of 171 ms total, with read 47 and write 16).
+//
+// ⚠️ Runs AFTER RunConcatCharFusion, which is what produces the ssaStrConcatCharAt this consumes,
+// and is therefore gated the same way (it follows the AOT - see the note in that pass).
+//
+// The conditions are about SAFETY, not about how often they fire:
+//   * t1 and t2 must each be defined once and used once, so removing their instructions removes
+//     nothing anybody else needs;
+//   * the AddInt must add exactly 1 (directly or through a register defined once by LoadConstInt 1);
+//   * the concatenation must already write into its own accumulator (Dest = Src1), because the
+//     fused opcode APPENDS to Dest - with a different destination it would drop the accumulator;
+//   * nothing between the three may write s, tab or i, since the fused instruction reads all three
+//     at the concatenation's position rather than at the Mid's.
+var
+  b, i, k, k2, VStride, MaxVer: Integer;
+  Blk: TSSABasicBlock;
+  Ins, Add, Asc: TSSAInstruction;
+  IntDefs, IntUses: array of Integer;   // (int reg, version) -> definitions / uses
+  IntConst: array of Int64;             // ...and the value when the single def is LoadConstInt
+  AscAt, AddAt: Integer;
+  Ok: Boolean;
+
+  function IntKey(const V: TSSAValue): Integer;
+  begin
+    if (V.Kind = svkRegister) and (V.RegType = srtInt) and
+       (V.RegIndex >= 0) and (V.Version >= 0) and (V.Version <= MaxVer) then
+      Result := V.RegIndex * VStride + V.Version
+    else
+      Result := -1;
+  end;
+
+  procedure BumpInt(var Arr: array of Integer; const V: TSSAValue);
+  var Key: Integer;
+  begin
+    Key := IntKey(V);
+    if (Key >= 0) and (Key <= High(Arr)) then Inc(Arr[Key]);
+  end;
+
+  function SingleDefSingleUse(const V: TSSAValue): Boolean;
+  var Key: Integer;
+  begin
+    Key := IntKey(V);
+    Result := (Key >= 0) and (Key <= High(IntDefs)) and (IntDefs[Key] = 1) and (IntUses[Key] = 1);
+  end;
+
+  // Is this operand the literal 1, directly or through a register defined exactly once by
+  // LoadConstInt 1? Same rule as IsLengthOne in RunConcatCharFusion.
+  function IsOne(const V: TSSAValue): Boolean;
+  var Key: Integer;
+  begin
+    if V.Kind = svkConstInt then Exit(V.ConstInt = 1);
+    Key := IntKey(V);
+    Result := (Key >= 0) and (Key <= High(IntDefs)) and (IntDefs[Key] = 1) and (IntConst[Key] = 1);
+  end;
+
+  // Find, within this block and before position Before, the instruction defining V.
+  function DefPosBefore(Blk: TSSABasicBlock; const V: TSSAValue; Before: Integer): Integer;
+  var j: Integer;
+      D: TSSAInstruction;
+  begin
+    Result := -1;
+    if IntKey(V) < 0 then Exit;
+    for j := Before - 1 downto 0 do
+    begin
+      D := TSSAInstruction(Blk.Instructions[j]);
+      if (D.Dest.Kind = svkRegister) and (D.Dest.RegType = srtInt) and
+         (D.Dest.RegIndex = V.RegIndex) and (D.Dest.Version = V.Version) then
+        Exit(j);
+    end;
+  end;
+
+  // Does anything in (From, To) write the register named by V?
+  function WrittenBetween(Blk: TSSABasicBlock; const V: TSSAValue; FromPos, ToPos: Integer): Boolean;
+  var j: Integer;
+  begin
+    Result := False;
+    if V.Kind <> svkRegister then Exit;
+    for j := FromPos + 1 to ToPos - 1 do
+      if WritesSSAReg(TSSAInstruction(Blk.Instructions[j]), V.RegType, V.RegIndex) then Exit(True);
+  end;
+
+begin
+  Result := 0;
+  // ⛔⛔ DEFAULT OFF - APPENDMAP=1 to enable. Everything around it is finished and verified; the
+  // fusion itself still miscompiles and must not ship on.
+  //
+  // Symptom, reproduced in 25 lines (job/tests/bas/bug_appendmapped_aot.bas): inside a PROCEDURE,
+  // resetting the accumulator ("o = ''") has no effect, so every emitted line contains all the
+  // previous ones. At MODULE level the same shape is correct.
+  //
+  // ⭐ What is already established, so nobody re-walks it:
+  //   * it is NOT the AOT. With the fusion forced on in the INTERPRETER (APPENDMAP=1 STRCHARFUSE=1,
+  //     no --aot) the output is wrong in exactly the same way, so the defect is in the BYTECODE
+  //     this pass produces. ⚠️ The first reading said "correct interpreted, wrong under --aot" and
+  //     that was an artefact: the fusion only fires when the AOT will run, so that comparison was
+  //     measuring whether the fusion happened at all, not the engine.
+  //   * it is NOT the register merge: REGREUSE=0 and REGREUSE_STR=0 are identically wrong.
+  //   * it is NOT the peephole, which only removes self-copies.
+  //   * two REAL defects found along the way are fixed and must stay fixed: the sub-opcode was
+  //     missing from the dispatch in RunTemplate.inc, and RunStringTempFusion treated this opcode
+  //     as a pure producer and redirected its Dest (see the exclusion there).
+  //
+  // ⛔⛔ WHY IT IS STILL OFF - it is STRUCTURAL, not a missing list entry.
+  //
+  // In SSA an instruction that grows an accumulator has to NAME it twice: ssaStrConcatCharAt does
+  // exactly that, with Dest = the new version and Src1 = the incoming one, which is why every
+  // liveness downstream can see the incoming value. This opcode needs FIVE values - accumulator
+  // out, accumulator in, source string, table, index - and there are FOUR operand fields. Putting
+  // the source string in Src1 leaves the incoming accumulator named by NO operand at all, so as
+  // far as PHI elimination, the allocator and the compactor are concerned that value does not
+  // exist: the copies that close the loop-carried PHI are dropped and the reset lands on a
+  // different register from the one the append grows. Teaching each list separately cannot fix
+  // this - the information is simply not in the instruction.
+  //
+  // 🎯 To finish it, the operands have to carry five values. The precedent in this tree is
+  // bcGfxImageConvertRow, which packs four register indexes into Immediate. Here the natural shape
+  // is Dest = accumulator out, Src1 = accumulator IN (like ssaStrConcatCharAt), Src2 = table, and
+  // Immediate packing the source-string register and the index register. That keeps the accumulator
+  // visible to every analysis, which is the whole point. ⚠️ Immediate is remapped by the register
+  // compactor, so a packed field needs its own entry there for BOTH halves and BOTH banks.
+  if GetEnvironmentVariable('APPENDMAP') <> '1' then Exit;
+  if GetEnvironmentVariable('STRCHARFUSE') = '0' then Exit;
+  if (GetEnvironmentVariable('STRCHARFUSE') <> '1') and (not GAotWillRun) then Exit;
+
+  MaxVer := 0;
+  for b := 0 to Blocks.Count - 1 do
+  begin
+    Blk := TSSABasicBlock(Blocks[b]);
+    for i := 0 to Blk.Instructions.Count - 1 do
+    begin
+      Ins := TSSAInstruction(Blk.Instructions[i]);
+      if (Ins.Dest.Kind = svkRegister) and (Ins.Dest.Version > MaxVer) then MaxVer := Ins.Dest.Version;
+      if (Ins.Src1.Kind = svkRegister) and (Ins.Src1.Version > MaxVer) then MaxVer := Ins.Src1.Version;
+      if (Ins.Src2.Kind = svkRegister) and (Ins.Src2.Version > MaxVer) then MaxVer := Ins.Src2.Version;
+      if (Ins.Src3.Kind = svkRegister) and (Ins.Src3.Version > MaxVer) then MaxVer := Ins.Src3.Version;
+      for k := 0 to High(Ins.PhiSources) do
+        if (Ins.PhiSources[k].Value.Kind = svkRegister) and (Ins.PhiSources[k].Value.Version > MaxVer) then
+          MaxVer := Ins.PhiSources[k].Value.Version;
+    end;
+  end;
+  VStride := MaxVer + 1;
+
+  SetLength(IntDefs, (FNextRegister[srtInt] + 1) * VStride);
+  SetLength(IntUses, Length(IntDefs));
+  SetLength(IntConst, Length(IntDefs));
+  for i := 0 to High(IntDefs) do begin IntDefs[i] := 0; IntUses[i] := 0; IntConst[i] := 0; end;
+
+  for b := 0 to Blocks.Count - 1 do
+  begin
+    Blk := TSSABasicBlock(Blocks[b]);
+    for i := 0 to Blk.Instructions.Count - 1 do
+    begin
+      Ins := TSSAInstruction(Blk.Instructions[i]);
+      BumpInt(IntUses, Ins.Src1);
+      BumpInt(IntUses, Ins.Src2);
+      BumpInt(IntUses, Ins.Src3);
+      for k := 0 to High(Ins.PhiSources) do
+        BumpInt(IntUses, Ins.PhiSources[k].Value);
+      k2 := IntKey(Ins.Dest);
+      if (k2 >= 0) and (k2 <= High(IntDefs)) then
+      begin
+        Inc(IntDefs[k2]);
+        if (Ins.OpCode = ssaLoadConstInt) and (Ins.Src1.Kind = svkConstInt) then
+          IntConst[k2] := Ins.Src1.ConstInt
+        else
+          IntConst[k2] := MaxInt;      // defined by something else: never equal to 1
+      end;
+    end;
+  end;
+
+  for b := 0 to Blocks.Count - 1 do
+  begin
+    Blk := TSSABasicBlock(Blocks[b]);
+    i := 0;
+    while i < Blk.Instructions.Count do
+    begin
+      Ins := TSSAInstruction(Blk.Instructions[i]);
+      // Anchor on the concatenation, and only the in-place shape.
+      if (Ins.OpCode <> ssaStrConcatCharAt) or
+         (Ins.Dest.Kind <> svkRegister) or (Ins.Src1.Kind <> svkRegister) or
+         (Ins.Dest.RegIndex <> Ins.Src1.RegIndex) or (Ins.Dest.RegType <> Ins.Src1.RegType) then
+      begin Inc(i); Continue; end;
+
+      AddAt := DefPosBefore(Blk, Ins.Src3, i);
+      if AddAt < 0 then begin Inc(i); Continue; end;
+      Add := TSSAInstruction(Blk.Instructions[AddAt]);
+      if (Add.OpCode <> ssaAddInt) or (not IsOne(Add.Src2)) or
+         (not SingleDefSingleUse(Add.Dest)) then begin Inc(i); Continue; end;
+
+      AscAt := DefPosBefore(Blk, Add.Src1, AddAt);
+      if AscAt < 0 then begin Inc(i); Continue; end;
+      Asc := TSSAInstruction(Blk.Instructions[AscAt]);
+      if (Asc.OpCode <> ssaStrAscMid) or (not SingleDefSingleUse(Asc.Dest)) or
+         (Asc.Src1.Kind <> svkRegister) or (Asc.Src1.RegType <> srtString) or
+         (not IsOne(Asc.Src3)) then begin Inc(i); Continue; end;
+
+      // Nothing in between may write what the fused instruction will read at the concatenation's
+      // position: the source string, the table, or the index.
+      Ok := not WrittenBetween(Blk, Asc.Src1, AscAt, i);
+      if Ok then Ok := not WrittenBetween(Blk, Asc.Src2, AscAt, i);
+      if Ok then Ok := not WrittenBetween(Blk, Ins.Src2, AscAt, i);
+      if not Ok then begin Inc(i); Continue; end;
+
+      // Rewrite in place, then drop the two producers - highest index first, so the lower one does
+      // not shift. ⛔ Delete FREES the object: Instructions owns them (see RunAscMidFusion).
+      Ins.OpCode := ssaStrAppendMapped;
+      Ins.Src1 := Asc.Src1;        // the source string
+      // Src2 already holds the table, Src3 becomes the index into the source string.
+      Ins.Src3 := Asc.Src2;
+      Blk.Instructions.Delete(AddAt);
+      Blk.Instructions.Delete(AscAt);
+      Inc(Result);
+      i := i - 1;                  // two removed before i, one instruction rewritten at i-2
+      if i < 0 then i := 0;
+    end;
+  end;
+end;
+
 function TSSAProgram.RunStringTempFusion: Integer;
 // Fuse "<string producer> T, ..." + "CopyString D, T" into "<string producer> D, ...".
 //
@@ -2133,8 +2367,14 @@ begin
     begin
       Prod := TSSAInstruction(Blk.Instructions[i]);
       T := -1;
+      // ⛔ ssaStrAppendMapped is NOT a producer: it APPENDS to its Dest, so the incoming value is an
+      // input. Redirecting its Dest to a copy's destination hands it a different accumulator, and
+      // the result is a silent miscompile - the reset of the accumulator lands on one register while
+      // the append keeps growing another, so every emitted line contains all the previous ones.
+      // (Costly to find: it only shows inside a PROCEDURE, and the INTERPRETER runs the same
+      // bytecode correctly, which sends you looking at the AOT emitter instead of at this list.)
       if (Prod.Dest.Kind = svkRegister) and (Prod.Dest.RegType = srtString) and
-         (Prod.OpCode <> ssaCopyString) and
+         (Prod.OpCode <> ssaCopyString) and (Prod.OpCode <> ssaStrAppendMapped) and
          not (Prod.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString, ssaPhi]) then
         T := KeyOf(Prod.Dest);
       if (T >= 0) and (T <= High(DefCount)) and

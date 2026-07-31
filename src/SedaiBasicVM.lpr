@@ -1478,6 +1478,13 @@ begin
           if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
             WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunConcatCharFusion: ', E.Message);
         end;
+        // ...and then the whole "acc += tab[Asc(Mid(s,i,1))+1]" into ONE instruction. It CONSUMES
+        // what the pass above produces, so it has to run after it.
+        try SSAProgram.RunAppendMappedFusion;
+        except on E: Exception do
+          if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+            WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunAppendMappedFusion: ', E.Message);
+        end;
         // Last of all: needs the final shape of the concatenations, including anything the fusions
         // above rewrote.
         try SSAProgram.RunConcatDeadSourceMark;

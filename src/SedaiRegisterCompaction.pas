@@ -1018,7 +1018,7 @@ begin
     // MID$(str, start, length) - start is Src2, length is in Immediate
     // bcStrConcatCharAt: same convention - Immediate is the INDEX register (int).
     if (OpCode = bcStrMid) or (OpCode = bcStrMidW) or (OpCode = bcStrAscMid) or
-       (OpCode = bcStrConcatCharAt) then
+       (OpCode = bcStrConcatCharAt) or (OpCode = bcStrAppendMapped) then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // bcDateSerial/bcTimeSerial: Immediate contains the 3rd arg (day/second) register index (int)
@@ -1652,7 +1652,7 @@ begin
     // MID$(str, start, length) - start is Src2, length is in Immediate
     // bcDateSerial/bcTimeSerial: Immediate contains the 3rd arg (day/second) register index (int)
     if (OpCode = bcStrMid) or (OpCode = bcStrMidW) or (OpCode = bcStrAscMid) or
-       (OpCode = bcStrConcatCharAt) or   // Immediate = the INDEX register (int)
+       (OpCode = bcStrConcatCharAt) or (OpCode = bcStrAppendMapped) or   // Immediate = the INDEX register (int)
        (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) or
        (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) or
        (OpCode = bcPutBinMem) or (OpCode = bcGetBinMem) or   // PUT/GET #n, , *p, n: byte-count register

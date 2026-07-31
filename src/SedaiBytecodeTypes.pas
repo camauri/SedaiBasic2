@@ -867,6 +867,15 @@ const
   // group already owns 256 dense slots, so filling a hole here moves no DENSE_*_BASE. Adding a
   // sub-opcode to the string group instead would shift every base after it.
   bcStrConcatCharAt   = bcGroupSuper + 158;
+  // "acc += tab[Asc(MID$(s, i, 1)) + 1]" fused whole: take the byte of s at i, use its code as a
+  // 1-based index into tab, append that byte to the accumulator. One instruction for what the
+  // reverse-complement inner loop spells as three (bcStrAscMid, an AddInt, bcStrConcatCharAt) -
+  // measured at ~25 ns each, i.e. 76 ns per character on a million characters.
+  // Dest=string accumulator (READ and written - it grows in place), Src1=string source,
+  // Src2=string table, Immediate=int register holding the 1-based index into Src1.
+  // Same group and same reason as the opcode above: a hole in the superinstruction block moves no
+  // DENSE_*_BASE.
+  bcStrAppendMapped   = bcGroupSuper + 159;
   bcArraySwapInt      = bcGroupSuper + 250;
   bcAddIntSelf        = bcGroupSuper + 251;
   bcSubIntSelf        = bcGroupSuper + 252;
@@ -2259,6 +2268,7 @@ begin
         156: Result := 'ArrayReverseRange';
         157: Result := 'ArrayShiftLeft';
         158: Result := 'StrConcatCharAt';
+        159: Result := 'StrAppendMapped';
         250: Result := 'ArraySwapInt';
         251: Result := 'AddIntSelf';
         252: Result := 'SubIntSelf';
