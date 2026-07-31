@@ -93,6 +93,15 @@ var
   // harness to compare optimized vs unoptimized output of the same program.
   GSSAOptimizationsEnabled: Boolean = True;
 
+  // Will this program actually be run through the AOT? Set from the command line before the SSA
+  // pipeline runs, so a pass can pick the shape that suits the engine that will execute it.
+  //
+  // Only RunConcatCharFusion reads it today, and it needs to: fusing "acc += Mid(tab,k,1)" into one
+  // opcode is worth -30% under the AOT and costs +5% interpreted, because interpreting it means a
+  // call into the superinstruction dispatcher. A pass that helps one engine and hurts the other
+  // should ask which one is coming rather than average the two.
+  GAotWillRun: Boolean = False;
+
 type
   TSSARegisterType = (srtInt, srtFloat, srtString);
 
@@ -1803,6 +1812,7 @@ var
   IntDefs: array of Integer;      // (int reg, version) -> count of definitions
   IntConst: array of Int64;       // ...and the value, when that single definition is LoadConstInt
   MaxVer, VStride: Integer;
+  ForceFuse: string;              // STRCHARFUSE: '1' forces on, '0' forces off, empty follows the AOT
 
   function StrKey(const V: TSSAValue): Integer;
   begin
@@ -1841,14 +1851,31 @@ var
 
 begin
   Result := 0;
-  // ⛔ DEFAULT OFF, and the measurement says why. Replacing "Mid(tab,k,1)" + "concat" with this
-  // single instruction is SLOWER (reverse-complement interp +23%, --aot +11%), because the premise
-  // was wrong: AssignSubstr already reuses the temporary's buffer, so the Mid it removes was not
-  // paying for an allocation -- while "string + char" introduces one. The fusion only wins once the
-  // destination IS the accumulator, and that needs the copy that closes the loop-carried PHI to be
-  // coalesced away, which is a separate (and riskier) piece of work. STRCHARFUSE=1 turns it on for
-  // whoever picks that up; until then the opcode stays unused rather than costing.
-  if GetEnvironmentVariable('STRCHARFUSE') <> '1' then Exit;
+  // ON WHEN THE AOT IS, off otherwise -- and the two measurements say exactly why.
+  //
+  // The first attempt at this fusion measured SLOWER and was left off, on the reading that
+  // "AssignSubstr already reuses the temporary's buffer, so the Mid we remove was not allocating".
+  // That reading was wrong in the shape that matters: in "acc += Mid(tab, k, 1)" the temporary is
+  // written by "StrMid Rt, Rt" -- destination and source are the SAME register, the table's own --
+  // so AssignSubstr cannot take its reuse path and falls back to Copy, allocating once per
+  // character. What actually kept the fusion from paying was that ssaStrConcatCharAt was missing
+  // from OpIsMergeSafe: every register it touched was pinned, so Dest never became Src1 and the
+  // opcode ran its allocating arm. With that fixed the accumulator grows in place.
+  //
+  // 📊 Interleaved A/B, one binary, quiet machine, output byte-identical, control (n-body) -3,3%:
+  //   reverse-complement --aot  321 -> 223 ms = -30,5%   (no overlap across three rounds)
+  //   reverse-complement interp 442 -> 466 ms = +5,4%    (best of five, no overlap either)
+  // The interpreter pays because the opcode lives in the superinstruction group and so costs a call
+  // into ExecuteSuperinstruction, which is more than the character it saves; the AOT calls its
+  // helper directly and keeps the whole gain. So the fusion follows the AOT rather than splitting
+  // the difference: a profile that would lose by it never sees it.
+  //
+  // STRCHARFUSE=1 forces it on regardless (that is how the interpreter number above was measured),
+  // STRCHARFUSE=0 forces it off. ⚠️ A .basc forfeits the AOT anyway, so compiling ahead of time
+  // leaves it out, which is the right default for a file that will run interpreted.
+  ForceFuse := GetEnvironmentVariable('STRCHARFUSE');
+  if ForceFuse = '0' then Exit;
+  if (ForceFuse <> '1') and (not GAotWillRun) then Exit;
   MaxVer := 0;
   for b := 0 to Blocks.Count - 1 do
   begin

@@ -716,6 +716,14 @@ begin
     // input in Dest (it is in the read-Dest list below).
     ssaCopyString, ssaLoadConstString, ssaStrConcat,
     ssaStrLen, ssaStrAsc, ssaStrAscMid, ssaStrChr,
+    // ssaStrConcatCharAt is modelled exactly like ssaStrConcat -- Dest written, Src1/Src2/Src3 read
+    // -- and it needs the merge for the same reason and more sharply: its whole point is to grow the
+    // accumulator in place, which only happens when Dest and Src1 end up as the same register. Left
+    // out, every register it touched was pinned, so the fusion produced Dest <> Src1 and fell back to
+    // the allocating path -- which is what made it measure SLOWER than the two instructions it
+    // replaces. The opcode only exists in programs the AOT will run (see RunConcatCharFusion), so
+    // this line is inert for everything else.
+    ssaStrConcatCharAt,
     ssaStrMid, ssaStrLeft, ssaStrRight,
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
     ssaArrayLoadIndString, ssaArrayStoreIndString,

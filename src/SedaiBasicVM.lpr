@@ -2401,7 +2401,12 @@ begin
       else if (Param = '--jit') then
         OptJit := True   // JIT: compile eligible hot loops to native code (J2/J3)
       else if (Param = '--aot') then
-        OptAot := True   // AOT (plan B): compile eligible whole SSA functions to native
+      begin
+        OptAot := True;  // AOT (plan B): compile eligible whole SSA functions to native
+        // Let the SSA pipeline know which engine is coming: RunConcatCharFusion emits a shape that
+        // pays under the AOT and costs when interpreted (see the note in that pass).
+        GAotWillRun := True;
+      end
       {$IFDEF JIT_PROFILE}
       else if (Param = '--jit-profile') or (Param = '--jitprofile') then
         OptJitProfile := True   // JIT J1: profile hot loops (back-edge counts) and dump them after the run
