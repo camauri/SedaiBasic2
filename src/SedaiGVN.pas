@@ -744,10 +744,23 @@ begin
 end;
 
 procedure TGVNPass.BuildProcEntryLabels;
-// Every label named as the target of an ssaCall/ssaCallSub. Those blocks are the entry points of
-// procedure bodies, and the edge that reaches them is a CALL, not a branch: the dominator tree says
-// the calling code dominates the body, but a call installs a new frame, so a value computed before
-// the call must not be reused inside it. TraverseDomTree raises the lookup floor there.
+// Every label named as the target of an ssaCall/ssaCallSub, AND every label whose address is taken
+// with ssaLoadProcAddr (@sub). Those blocks are the entry points of procedure bodies, and the edge
+// that reaches them is a CALL, not a branch: the dominator tree says the calling code dominates the
+// body, but a call installs a new frame, so a value computed before the call must not be reused
+// inside it. TraverseDomTree raises the lookup floor there.
+//
+// ⛔ @sub HAS to be in this list, and leaving it out was a silent miscompile. A procedure reached
+// only through a function pointer - the shape of ThreadCreate(@worker, k) - is never the target of
+// a call instruction, so it did not raise the floor, and the body happily reused a constant whose
+// canonical register had been loaded by the MODULE. That works for a call (same context, same
+// register banks) and is WRONG for a thread, which gets banks of its own: the worker read a
+// register that is zero in its context. "done += 1" was emitted as "AddInt R16, R17, R16" with R16
+// holding the literal 1 from the module - so the worker added ZERO, silently, and every count came
+// out wrong. See memory: recursive-shared-array-write-breaks-threads.
+//
+// ⚠️ The label of @sub is in Src1, not Dest (Dest holds the register receiving the address) - the
+// same asymmetry the bytecode compiler handles at "ssaLoadProcAddr ... AddJumpFixup(Src1)".
 var
   i, j: Integer;
   Block: TSSABasicBlock;
@@ -761,8 +774,11 @@ begin
     for j := 0 to Block.Instructions.Count - 1 do
     begin
       Instr := Block.Instructions[j];
-      if (Instr.OpCode <> ssaCallSub) and (Instr.OpCode <> ssaCall) then Continue;
-      Lbl := Instr.Dest.LabelName;
+      Lbl := '';
+      if (Instr.OpCode = ssaCallSub) or (Instr.OpCode = ssaCall) then
+        Lbl := Instr.Dest.LabelName
+      else if (Instr.OpCode = ssaLoadProcAddr) and (Instr.Src1.Kind = svkLabel) then
+        Lbl := Instr.Src1.LabelName;
       if (Lbl <> '') and (FProcEntryLabels.IndexOf(Lbl) < 0) then
         FProcEntryLabels.Add(Lbl);
     end;
