@@ -24,6 +24,7 @@ var
   // iteration after bcCallSub has done FramePush, so the native function needs no frame logic.
   AotOn: Boolean;
   AotFuncs: PExecMemA;     // @FNativeFuncs[0]
+  AotFromPC: Integer;      // entry PC of the AOT call in flight, to detect a no-progress return
   LocalAotCtx: TAotCtx;    // per-Run transfer-bank bases of the ACTIVE context (worker-safe)
   Instructions: PBytecodeInstruction;
   InstrCount: Integer;
@@ -218,9 +219,24 @@ begin
       // AotSettle resolves the C3 sentinels, out of line on purpose: this is the interpreter's
       // hot loop, and its speed is measurably sensitive to code layout - see
       // job/docs/PIANO_B1_AOT_DESIGN.md §5.7 - so it stays as small as it was.
+      AotFromPC := CurPC;
       CurPC := AotSettle(Ctx,
         TNativeFuncFn(TExecMem(AotFuncs[CurPC]).Ptr)(IntRegs, PInt64(FloatRegs), @LocalAotCtx));
-      System.Continue;
+      // A native function returns the PC where the INTERPRETER resumes, and for an exit instruction
+      // that is the exit's own PC: ExitTo(apc) on ssaEnd/ssaReturnSub/ssaStop hands the bcEnd or
+      // bcReturnSub back to be executed here (it has to be - that is where Running is cleared and
+      // FramePop happens). When the region's exit IS its entry, resuming there would re-enter the
+      // very function we just left, forever: a MAIN whose only instruction is End compiles to a
+      // one-instruction region at PC 0, and the program then spun at 100% CPU instead of exiting.
+      // Falling through executes that instruction interpreted, which is exactly what ExitTo asked
+      // for. The test costs one compare per native call, never per bytecode instruction.
+      // ⚠️ Same-PC means the native side made NO progress, so re-entering can never be right -
+      // this covers any future path that returns its own entry (an immediate deopt, say), not just
+      // the degenerate region that exposed it.
+      // ⚠️ "not Running" has to go through Continue too: AotSettle clears it on AOT_HELPER_HALT and
+      // parks the fault PC, which may well BE the entry. Falling through there would interpret one
+      // instruction after the run was already over; Continue exits via the loop's own condition.
+      if (CurPC <> AotFromPC) or (not Ctx.Running) then System.Continue;
     end;
 
     Instr := Instructions[CurPC];
