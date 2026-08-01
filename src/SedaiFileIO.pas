@@ -21,7 +21,9 @@ unit SedaiFileIO;
 interface
 
 uses
-  Classes, SysUtils, SedaiBytecodeVM;
+  Classes, SysUtils, SedaiBytecodeVM
+  // Only to ask whether stdin is a console: the buffered reader must not read ahead on a terminal.
+  {$IFDEF WINDOWS}, Windows{$ELSE}, termio{$ENDIF};
 
 type
   TVMFileHandler = class
@@ -35,6 +37,29 @@ type
     FDeviceKind: array[1..15] of Integer;
     FFileModes: array[1..15] of string;
     FRecordLens: array[1..15] of Integer;   // relative-file record length per handle (0 = not relative)
+
+    { ===== Buffered standard input =====
+
+      "Line Input #1" on a device handle used to go straight to System.ReadLn(System.Input), and FPC's
+      Text layer costs microseconds PER CALL - the same thing that made writing slow until stdout was
+      buffered. Measured on reverse-complement, 416 671 lines of 60 characters: 1.42 us per line, 590 ms
+      of a 1977 ms program, the single largest item in it.
+
+      So the bytes are pulled in blocks with FileRead and the lines are cut here. EOF is answered from
+      the buffer too, which removes a second Text-layer call per line.
+
+      ⛔ ONLY when stdin is REDIRECTED. On an interactive console the program and the user take turns,
+      and reading ahead would swallow input that a later prompt is supposed to see; there the old
+      per-line path stays. FInBufMode: 0 = not decided yet, 1 = buffered, 2 = pass through. }
+    FInBuf: array[0 .. 65535] of Byte;
+    FInLen: Integer;        // bytes currently in FInBuf
+    FInPos: Integer;        // next byte to consume
+    FInEof: Boolean;        // the OS said "no more"
+    FInBufMode: Integer;
+    function StdInBuffered: Boolean;
+    function StdInRefill: Boolean;              // returns False at end of input
+    function StdInReadLine(out Line: string): Boolean;
+    function StdInAtEof: Boolean;
   public
     destructor Destroy; override;
     procedure CloseAll;
@@ -46,6 +71,88 @@ type
   end;
 
 implementation
+
+{ ===== Buffered standard input - see the fields' comment for why =====
+
+  ⚠️ These use the RAW stdin handle, so they must never be mixed with System.ReadLn(System.Input) on
+  the same run: the Text layer keeps its own buffer and the two would each swallow part of the stream.
+  StdInBuffered decides ONCE, and every device read goes through one path or the other for good. }
+
+function TVMFileHandler.StdInBuffered: Boolean;
+{$IFDEF WINDOWS}
+const FILE_TYPE_CHAR = $0002;
+{$ENDIF}
+begin
+  if FInBufMode = 0 then
+  begin
+    FInBufMode := 2;                       // pass through unless proven redirected
+    {$IFDEF WINDOWS}
+    // A character device is the console: a program reading it is talking to a person, and reading
+    // ahead would take input meant for a later prompt.
+    if GetFileType(StdInputHandle) <> FILE_TYPE_CHAR then FInBufMode := 1;
+    {$ELSE}
+    if IsATTY(StdInputHandle) = 0 then FInBufMode := 1;
+    {$ENDIF}
+    if FInBufMode = 1 then begin FInLen := 0; FInPos := 0; FInEof := False; end;
+  end;
+  Result := FInBufMode = 1;
+end;
+
+function TVMFileHandler.StdInRefill: Boolean;
+// Pull the next block. Returns False only when the input is genuinely finished.
+var
+  N: LongInt;
+begin
+  if FInPos < FInLen then Exit(True);
+  if FInEof then Exit(False);
+  N := FileRead(StdInputHandle, FInBuf[0], SizeOf(FInBuf));
+  if N <= 0 then begin FInEof := True; FInLen := 0; FInPos := 0; Exit(False); end;
+  FInLen := N; FInPos := 0;
+  Result := True;
+end;
+
+function TVMFileHandler.StdInAtEof: Boolean;
+// EOF is answered from the buffer, which is the second Text-layer call per line that disappears.
+begin
+  Result := (not StdInRefill);
+end;
+
+function TVMFileHandler.StdInReadLine(out Line: string): Boolean;
+// One line, without its terminator. Handles LF and CRLF, and a last line with no terminator at all.
+// The line is assembled with Move out of the block, so a 60-character line costs no per-character work.
+var
+  Start, i, Chunk, OldLen: Integer;
+  Found: Boolean;
+begin
+  Line := '';
+  if not StdInRefill then Exit(False);
+  Found := False;
+  repeat
+    Start := FInPos;
+    i := FInPos;
+    while (i < FInLen) and (FInBuf[i] <> 10) do Inc(i);
+    Chunk := i - Start;
+    if Chunk > 0 then
+    begin
+      OldLen := Length(Line);
+      SetLength(Line, OldLen + Chunk);
+      Move(FInBuf[Start], Line[OldLen + 1], Chunk);
+    end;
+    if i < FInLen then
+    begin
+      FInPos := i + 1;                     // step over the LF
+      Found := True;
+    end
+    else
+    begin
+      FInPos := FInLen;                    // block exhausted: the line continues in the next one
+      if not StdInRefill then Found := True;   // no more input: what we have IS the last line
+    end;
+  until Found;
+  // A CRLF stream leaves the CR at the end of the line; BASIC must not see it.
+  if (Length(Line) > 0) and (Line[Length(Line)] = #13) then SetLength(Line, Length(Line) - 1);
+  Result := True;
+end;
 
 {$IFDEF WINDOWS}
 // Windows resolves a handful of legacy DOS names to DEVICES rather than files: opening 'LPT1:' or 'PRN'
@@ -253,11 +360,22 @@ begin
   begin
     if Command = 'EOF' then
     begin
-      if (FDeviceKind[Handle] = 1) and System.Eof(System.Input) then Data := '-1' else Data := '0';
+      if FDeviceKind[Handle] <> 1 then begin Data := '0'; Exit; end;
+      if StdInBuffered then
+      begin
+        if StdInAtEof then Data := '-1' else Data := '0';
+      end
+      else if System.Eof(System.Input) then Data := '-1' else Data := '0';
       Exit;
     end;
     if (Command = 'INPUT#') or (Command = 'LINEINPUT#') then
     begin
+      if StdInBuffered then
+      begin
+        if not StdInReadLine(Line) then begin Data := ''; ErrorCode := 62; Exit; end;
+        Data := Line;
+        Exit;
+      end;
       if System.Eof(System.Input) then begin Data := ''; ErrorCode := 62; Exit; end;
       System.ReadLn(System.Input, Line);
       Data := Line;
