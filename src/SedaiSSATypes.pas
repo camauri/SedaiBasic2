@@ -2201,44 +2201,33 @@ var
 
 begin
   Result := 0;
-  // ⛔⛔ DEFAULT OFF - APPENDMAP=1 to enable. Everything around it is finished and verified; the
-  // fusion itself still miscompiles and must not ship on.
+  // ⭐ DEFAULT ON. APPENDMAP=0 turns the fusion off, so the before/after can be timed on ONE binary.
   //
-  // Symptom, reproduced in 25 lines (job/tests/bas/bug_appendmapped_aot.bas): inside a PROCEDURE,
-  // resetting the accumulator ("o = ''") has no effect, so every emitted line contains all the
-  // previous ones. At MODULE level the same shape is correct.
+  // It shipped OFF for a long time because it MISCOMPILED, and the recorded reason was structural and
+  // wrong: "the fused instruction must name FIVE values - accumulator out, accumulator in, source
+  // string, table, index - and there are four operand fields, so the incoming accumulator is named by
+  // no operand, PHI elimination has nothing to rewrite, and the reset of the accumulator lands on a
+  // different register from the one the append grows". Every word of that is true - BEFORE register
+  // allocation.
   //
-  // ⭐ What is already established, so nobody re-walks it:
-  //   * it is NOT the AOT. With the fusion forced on in the INTERPRETER (APPENDMAP=1 STRCHARFUSE=1,
-  //     no --aot) the output is wrong in exactly the same way, so the defect is in the BYTECODE
-  //     this pass produces. ⚠️ The first reading said "correct interpreted, wrong under --aot" and
-  //     that was an artefact: the fusion only fires when the AOT will run, so that comparison was
-  //     measuring whether the fusion happened at all, not the engine.
-  //   * it is NOT the register merge: REGREUSE=0 and REGREUSE_STR=0 are identically wrong.
-  //   * it is NOT the peephole, which only removes self-copies.
-  //   * two REAL defects found along the way are fixed and must stay fixed: the sub-opcode was
-  //     missing from the dispatch in RunTemplate.inc, and RunStringTempFusion treated this opcode
-  //     as a pure producer and redirected its Dest (see the exclusion there).
+  // ⭐⭐⭐ The fix was not a fifth operand, or packing, or a new pass. It was WHEN this runs. The pass is
+  // now called AFTER register allocation (see SedaiBasicVM.lpr), where the registers are PHYSICAL: the
+  // incoming and outgoing accumulator ARE the same register, Dest names both, and the constraint
+  // simply does not exist. Nothing renames anything afterwards, and both consumers of the SSA - the
+  // bytecode compiler and the AOT, which compiles from SSA and has a native helper for this opcode -
+  // see the fused form.
   //
-  // ⛔⛔ WHY IT IS STILL OFF - it is STRUCTURAL, not a missing list entry.
+  // ⚠️ Two REAL defects found along the way are fixed and must stay fixed: the sub-opcode was missing
+  // from the dispatch in RunTemplate.inc, and RunStringTempFusion treated this opcode as a pure
+  // producer and redirected its Dest (see the exclusion there).
   //
-  // In SSA an instruction that grows an accumulator has to NAME it twice: ssaStrConcatCharAt does
-  // exactly that, with Dest = the new version and Src1 = the incoming one, which is why every
-  // liveness downstream can see the incoming value. This opcode needs FIVE values - accumulator
-  // out, accumulator in, source string, table, index - and there are FOUR operand fields. Putting
-  // the source string in Src1 leaves the incoming accumulator named by NO operand at all, so as
-  // far as PHI elimination, the allocator and the compactor are concerned that value does not
-  // exist: the copies that close the loop-carried PHI are dropped and the reset lands on a
-  // different register from the one the append grows. Teaching each list separately cannot fix
-  // this - the information is simply not in the instruction.
-  //
-  // 🎯 To finish it, the operands have to carry five values. The precedent in this tree is
-  // bcGfxImageConvertRow, which packs four register indexes into Immediate. Here the natural shape
-  // is Dest = accumulator out, Src1 = accumulator IN (like ssaStrConcatCharAt), Src2 = table, and
-  // Immediate packing the source-string register and the index register. That keeps the accumulator
-  // visible to every analysis, which is the whole point. ⚠️ Immediate is remapped by the register
-  // compactor, so a packed field needs its own entry there for BOTH halves and BOTH banks.
-  if GetEnvironmentVariable('APPENDMAP') <> '1' then Exit;
+  // ⛔ What licenses dropping the two producers is LIVENESS - see IntRegLiveAfter - and nothing
+  // weaker. Three cheaper guards were tried and all three were wrong in the same way: they asked
+  // "does anything else name this register?", and after allocation that question is answered by the
+  // ALLOCATOR, not by the program. It hands the same physical register to every site of this shape,
+  // so the two occurrences in reverse-complement vetoed each other. ⚠️ All three wrong guards fired
+  // correctly on a probe with a SINGLE site: a single-site probe does not show that a guard is usable.
+  if GetEnvironmentVariable('APPENDMAP') = '0' then Exit;
   if GetEnvironmentVariable('STRCHARFUSE') = '0' then Exit;
   if (GetEnvironmentVariable('STRCHARFUSE') <> '1') and (not GAotWillRun) then Exit;
 
