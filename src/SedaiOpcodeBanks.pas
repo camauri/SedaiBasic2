@@ -32,6 +32,20 @@ function ImmediateIsStringReg(OpCode: TBytecodeOp): Boolean;
 { Does this instruction READ string register Reg in any of its fields? }
 function ReadsStringReg(const Instr: TBytecodeInstruction; Reg: Integer): Boolean;
 
+{ Does this instruction read INT register Reg through its Immediate field?
+
+  Immediate is an Int64 that most opcodes use as a plain constant, and some use to carry one or more
+  16-bit REGISTER INDEXES. Telling the two apart needs the opcode: "LoadConstInt R9, 12" has
+  Immediate = 12 and reads no register at all, so a consumer that treated Immediate as a register
+  index unconditionally would see phantom uses everywhere.
+
+  ⚠️ The list below is the one the register compactor already relies on to remap these fields. If it
+  were incomplete the compactor would itself be broken - it would renumber a register whose use it
+  cannot see - so trusting it here is exactly as safe as register compaction already is. Keep the two
+  in step: an opcode that starts packing a register into Immediate must be added in BOTH places until
+  the compactor's own copies move here. }
+function ImmediateReadsIntReg(const Instr: TBytecodeInstruction; Reg: Integer): Boolean;
+
 implementation
 
 function DestIsStringReg(OpCode: TBytecodeOp): Boolean;
@@ -259,6 +273,46 @@ begin
          or (Src2IsStringReg(TBytecodeOp(Instr.OpCode)) and (Instr.Src2 = Reg))
          or (ImmediateIsStringReg(TBytecodeOp(Instr.OpCode)) and (Instr.Immediate = Reg))
          or (DestReadIsStringReg(TBytecodeOp(Instr.OpCode)) and (Instr.Dest = Reg));
+end;
+
+function ImmediateReadsIntReg(const Instr: TBytecodeInstruction; Reg: Integer): Boolean;
+// The opcodes below are exactly those the register compactor remaps int registers inside Immediate
+// for. Which BITS each one uses varies (16-bit halves for most, 12-bit fields for SETCOLOR and
+// GRAPHICBOX, the whole value for GRAPHICSETMODE), and rather than restate every layout - a second
+// copy that could drift from the compactor's - this tests EVERY position any of them uses.
+//
+// ⚠️ That deliberately OVER-reports: an unrelated field that happens to hold Reg's number answers
+// True. The only consumer is a fusion pass asking "is this int register read anywhere else?", where
+// a false yes costs a missed fusion and a false NO would cost a miscompile. Erring towards yes is
+// the safe direction, and it makes this immune to a layout being transcribed wrong.
+var
+  Imm: Int64;
+begin
+  Result := False;
+  case TBytecodeOp(Instr.OpCode) of
+    bcStrMid, bcStrMidW, bcStrAscMid, bcStrConcatCharAt, bcStrAppendMapped, bcStrMidAssign,
+    bcStrInstr, bcStrInstrAny,
+    bcDateSerial, bcTimeSerial,
+    bcRawMemCopy, bcRawMemMove, bcRawClear, bcPutBinMem, bcGetBinMem,
+    bcConScreen, bcSetmouse, bcSetColor,
+    bcCopyFile, bcRenameFile, bcShell,
+    bcSoundEnvelope, bcSoundFilter, bcSoundSound,
+    bcGfxPset, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled,
+    bcGfxCircle, bcGfxCircleEx, bcGfxGet, bcGfxPut, bcGfxView, bcGfxWindow,
+    bcGfxImageCreate, bcGfxImageConvertRow,
+    bcGraphicBox, bcGraphicRGBA, bcGraphicSetMode:
+      begin
+        Imm := Instr.Immediate;
+        if Imm < 0 then Exit;              // a negative Immediate is a flag, never a register index
+        Result := (Imm = Reg)                                  // GRAPHICSETMODE: the whole value
+               or ((Imm and $FFFF) = Reg) or (((Imm shr 16) and $FFFF) = Reg)
+               or (((Imm shr 32) and $FFFF) = Reg) or (((Imm shr 48) and $FFFF) = Reg)
+               or ((Imm and $FFF) = Reg) or (((Imm shr 12) and $FFF) = Reg)
+               or (((Imm shr 36) and $FFF) = Reg);
+      end;
+  else
+    Result := False;
+  end;
 end;
 
 end.

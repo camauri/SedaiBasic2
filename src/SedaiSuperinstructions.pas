@@ -60,7 +60,7 @@ unit SedaiSuperinstructions;
 interface
 
 uses
-  Classes, SysUtils, SedaiBytecodeTypes, SedaiNopCompaction;
+  Classes, SysUtils, SedaiBytecodeTypes, SedaiNopCompaction, SedaiOpcodeBanks;
 
 { Superinstruction opcodes are now defined in SedaiBytecodeTypes.pas }
 { All bcXxx constants are imported via the uses clause }
@@ -97,6 +97,12 @@ type
     function TryFuseArrayMoveElement(Index: Integer): Boolean;
     function TryFuseArrayReverseRange(Index: Integer): Boolean;
     function TryFuseArrayShiftLeft(Index: Integer): Boolean;
+
+    { "acc += tab[Asc(MID$(s, i, 1)) + 1]" - three instructions into one. Lives HERE and not in the
+      SSA passes for a structural reason, see the function's own comment. }
+    function TryFuseAppendMapped(Index: Integer): Boolean;
+    function IntRegIsConstOne(Reg: Word): Boolean;
+    function IntRegReadElsewhere(Reg: Word; A, B, C: Integer): Boolean;
 
     { Check if register is only used by the next instruction (temporary) }
     function IsTemporaryResult(Index: Integer; Reg: Word): Boolean;
@@ -182,6 +188,189 @@ begin
       end;
     end;
   end;
+end;
+
+function TSuperinstructionOptimizer.IntRegIsConstOne(Reg: Word): Boolean;
+// Does INT register Reg hold the literal 1 wherever it is read? True only when every write to it in
+// the WHOLE program is "LoadConstInt Reg, 1" - no control-flow reasoning needed, because then no
+// path can give it another value.
+//
+// ⚠️ "Every write" is judged conservatively: a Dest numbered Reg counts as a write unless the opcode
+// is known to write the STRING bank. Only the string classification is published (SedaiOpcodeBanks),
+// so a float Dest with that number is treated as an int write and answers False. Missed fusion, never
+// a wrong one.
+var
+  i, Writes: Integer;
+  Instr: TBytecodeInstruction;
+  Op: TBytecodeOp;
+begin
+  Result := False;
+  Writes := 0;
+  for i := 0 to FProgram.GetInstructionCount - 1 do
+  begin
+    Instr := FProgram.GetInstruction(i);
+    Op := TBytecodeOp(Instr.OpCode);
+    if (Instr.Dest = Reg) and (not DestIsStringReg(Op)) then
+    begin
+      if (Op <> bcLoadConstInt) or (Instr.Immediate <> 1) then Exit;
+      Inc(Writes);
+    end;
+  end;
+  Result := Writes > 0;
+end;
+
+function TSuperinstructionOptimizer.IntRegReadElsewhere(Reg: Word; A, B, C: Integer): Boolean;
+// Can INT register Reg be read by any instruction other than the three at A, B and C?
+//
+// This is what licenses REMOVING the two producers: if nothing else reads the temporary, nothing can
+// observe the value we stop computing, and that holds on every path - no liveness, no basic blocks,
+// no assumption about where control flow goes. The whole-program scan is O(n) per candidate and the
+// candidates are rare.
+//
+// ⛔ Deliberately NOT built on IsTemporaryResult: that helper compares register NUMBERS with no idea
+// of the bank, so a string R12 being defined makes it declare the int R12 dead - a false positive,
+// which is the direction that miscompiles. It also stops at the end of the basic block, which says
+// nothing about a successor that reads the value.
+var
+  i: Integer;
+  Instr: TBytecodeInstruction;
+  Op: TBytecodeOp;
+begin
+  Result := True;
+  for i := 0 to FProgram.GetInstructionCount - 1 do
+  begin
+    if (i = A) or (i = B) or (i = C) then Continue;
+    Instr := FProgram.GetInstruction(i);
+    Op := TBytecodeOp(Instr.OpCode);
+    // Any field holding this number counts as a read unless it is PROVABLY a string operand.
+    if (Instr.Src1 = Reg) and (not Src1IsStringReg(Op)) then Exit;
+    if (Instr.Src2 = Reg) and (not Src2IsStringReg(Op)) then Exit;
+    // A Dest can be read back as well as written (the accumulator opcodes do exactly that), and
+    // there is no published int equivalent of DestReadIsStringReg - so any non-string Dest with this
+    // number refuses. Over-strict: a later instruction that merely REDEFINES the register is
+    // harmless in principle and still blocks the fusion here.
+    if (Instr.Dest = Reg) and (not DestIsStringReg(Op)) then Exit;
+    if ImmediateReadsIntReg(Instr, Reg) then Exit;
+  end;
+  Result := False;
+end;
+
+function TSuperinstructionOptimizer.TryFuseAppendMapped(Index: Integer): Boolean;
+// "acc += tab[Asc(MID$(s, i, 1)) + 1]" - the whole inner loop of reverse-complement - as ONE
+// instruction:
+//
+//   StrAscMid        T, s, i, len=1        ' T = Asc(Mid(s, i, 1))
+//   AddInt           T, T, one             ' T = T + 1, the 1-based table index
+//   StrConcatCharAt  acc, acc, tab, [T]    ' acc += tab[T]
+//   =>
+//   StrAppendMapped  acc, s, tab, [i]
+//
+// ⛔⛔ MEASURED NEGATIVE (2026-08-01) - this is UNREACHABLE, behind DISABLE_SUPERINSTRUCTIONS, and it
+// is kept only so the result is not re-derived from scratch. It is CORRECT; it is simply worthless.
+//
+// The idea was sound as far as it went. In SSA the fused form has to name FIVE values - accumulator
+// out, accumulator in, source string, table, index - and a TSSAInstruction has four operand slots, so
+// with the source in Src1 the incoming accumulator is named by nothing, PHI elimination has nothing
+// to rewrite, and the reset of the accumulator lands on a different register from the one the append
+// grows. That is the miscompile that keeps the SSA version switched off. Down here, after register
+// allocation, the registers are PHYSICAL: incoming and outgoing accumulator ARE the same register and
+// Dest names both. Four fields, five values, no conflict - and it does produce correct output where
+// the SSA version produced wrong output.
+//
+// What it does NOT produce is speed, and the numbers say why (module-level probe,
+// job/tests/bench/apmap_ceiling.bas, 20 M characters per timed block, null floor 922 vs 922):
+//   interpreter   4800 -> 4847 ms   flat. Three dispatches into one is worth NOTHING on this VM,
+//                                   exactly as the 2026-07-18 strategy note says.
+//   --aot          922 -> 3708 ms   FOUR TIMES SLOWER.
+//
+// The -39.5% that motivated this work was never dispatch: it was the native helper AotStrAppendMapped
+// replacing three AOT helper calls. And the AOT compiles from SSA, not from bytecode - so a fusion
+// performed here is invisible to it and merely leaves the region running interpreted.
+//
+// 🎯 The payoff therefore lives in the AOT, and the place to fuse is SedaiAot's emission, which walks
+// SSA instructions and emits code directly: it can recognise the triple without ever building an SSA
+// instruction, so no operand slot, no PHI elimination and no allocator are involved. That is the route
+// to try next; this one is closed.
+var
+  A, B, C, Fused: TBytecodeInstruction;
+  T, LenReg, OneReg: Word;
+  Diag: Boolean;
+begin
+  Result := False;
+  if Index + 2 >= FProgram.GetInstructionCount then Exit;
+  A := FProgram.GetInstruction(Index);
+  B := FProgram.GetInstruction(Index + 1);
+  C := FProgram.GetInstruction(Index + 2);
+  if (TBytecodeOp(A.OpCode) <> bcStrAscMid) or
+     (TBytecodeOp(B.OpCode) <> bcAddInt) or
+     (TBytecodeOp(C.OpCode) <> bcStrConcatCharAt) then Exit;
+
+  // APPENDMAP_DIAG=1 says which guard refused a candidate. The pattern is rare and the guards are
+  // deliberately conservative, so "why did it not fire" is the question this pass gets asked.
+  Diag := GetEnvironmentVariable('APPENDMAP_DIAG') = '1';
+
+  // Jumping into the middle of the sequence would reach the fused instruction with the state the
+  // removed producers were supposed to have built.
+  if IsJumpTarget(Index + 1) or IsJumpTarget(Index + 2) then
+  begin
+    if Diag then WriteLn(ErrOutput, '[APPENDMAP] ', Index, ': jump target inside the sequence');
+    Exit;
+  end;
+
+  // The temporary must be produced by the Asc, incremented in place, and consumed by the append.
+  T := A.Dest;
+  if (B.Dest <> T) or (B.Src1 <> T) then
+  begin
+    if Diag then WriteLn(ErrOutput, '[APPENDMAP] ', Index, ': AddInt is not "T = T + k"');
+    Exit;
+  end;
+  if (C.Immediate and $FFFF) <> T then
+  begin
+    if Diag then WriteLn(ErrOutput, '[APPENDMAP] ', Index, ': the append does not index with T');
+    Exit;
+  end;
+
+  // Only the in-place accumulator shape: the fused opcode APPENDS to Dest, so a different
+  // destination would silently drop whatever the accumulator already held.
+  if C.Dest <> C.Src1 then
+  begin
+    if Diag then WriteLn(ErrOutput, '[APPENDMAP] ', Index, ': append is not in place (Dest <> Src1)');
+    Exit;
+  end;
+
+  // Both the substring length and the addend must be the literal 1 - that is the only case where
+  // "Asc of a one-character substring, plus one" is what the fused opcode computes.
+  LenReg := A.Immediate and $FFFF;
+  OneReg := B.Src2;
+  if not IntRegIsConstOne(LenReg) then
+  begin
+    if Diag then WriteLn(ErrOutput, '[APPENDMAP] ', Index, ': length register R', LenReg, ' is not the constant 1');
+    Exit;
+  end;
+  if not IntRegIsConstOne(OneReg) then
+  begin
+    if Diag then WriteLn(ErrOutput, '[APPENDMAP] ', Index, ': addend register R', OneReg, ' is not the constant 1');
+    Exit;
+  end;
+
+  // Nothing outside the three may read the temporary, or removing its producers changes what that
+  // reader sees.
+  if IntRegReadElsewhere(T, Index, Index + 1, Index + 2) then
+  begin
+    if Diag then WriteLn(ErrOutput, '[APPENDMAP] ', Index, ': temporary R', T, ' may be read elsewhere');
+    Exit;
+  end;
+
+  // Rewrite the append in place and drop the two producers. Src2 (the table) is already right.
+  Fused := C;
+  Fused.OpCode := bcStrAppendMapped;
+  Fused.Src1 := A.Src1;                  // the source string the byte is read from
+  Fused.Immediate := A.Src2;             // ...and the int register holding the position in it
+  FProgram.SetInstruction(Index + 2, Fused);
+  MakeNop(Index);
+  MakeNop(Index + 1);
+  Inc(FFusedCount);
+  Result := True;
 end;
 
 function TSuperinstructionOptimizer.IsTemporaryResult(Index: Integer; Reg: Word): Boolean;
@@ -2043,12 +2232,13 @@ var
   i, Pass: Integer;
   Changed: Boolean;
 begin
+  FFusedCount := 0;
+
   {$IFDEF DISABLE_SUPERINSTRUCTIONS}
   Result := 0;
   Exit;
   {$ENDIF}
 
-  FFusedCount := 0;
   Pass := 0;
 
   // Multiple passes until no more fusions possible
@@ -2087,6 +2277,19 @@ begin
           Changed := True;
         Inc(i);
         Continue;
+      end;
+
+      // "acc += tab[Asc(MID$(s,i,1))+1]": anchored on the ASC, which is a plain string-group opcode,
+      // but the third instruction of the pattern is a superinstruction - so this has to be tried
+      // before the blanket skip below.
+      if FProgram.GetInstruction(i).OpCode = bcStrAscMid then
+      begin
+        if TryFuseAppendMapped(i) then
+        begin
+          Changed := True;
+          Inc(i);
+          Continue;
+        end;
       end;
 
       // Skip other superinstructions (can't fuse already-fused instructions)
