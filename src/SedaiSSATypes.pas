@@ -2096,92 +2096,108 @@ var
       if WritesSSAReg(TSSAInstruction(Blk.Instructions[j]), V.RegType, V.RegIndex) then Exit(True);
   end;
 
-  // Can any READ of INT register RegIdx observe a value this pass is about to stop computing?
+  // Is INT register RegIdx LIVE immediately after position Pos of block B?
   //
-  // ⭐ This replaces the single-def/single-use test the pass used before it was moved AFTER register
-  // allocation. That test counted (register, VERSION) pairs - the right question in real SSA, the
-  // wrong one here: with physical registers "T = T + 1" DEFINES T twice, so it always answered no.
+  // ⭐ This is the whole licence for the fusion. Removing the two producers stops computing a value;
+  // that is unobservable exactly when no read can reach the point where it would have been produced -
+  // which is LIVENESS, and nothing weaker. Three cheaper rules were tried and all three were wrong,
+  // each instructively: after register allocation the SAME physical register is handed to every site
+  // of the same shape, so anything phrased as "nobody else mentions this register" is answered by the
+  // allocator rather than by the program, and refuses every real case while still firing on a
+  // single-site probe.
   //
-  // ⛔ And "nothing else in the program touches T" is too blunt, which cost a measurement to find out:
-  // the allocator gives the SAME physical temporary to every site with this shape, so in the real
-  // reverse-complement the two occurrences both use R21 and each vetoed the other. The fusion fired on
-  // a one-site probe and on nothing else.
+  // Standard backward dataflow for ONE register, to fixpoint over the CFG:
+  //   Use[b]     the block READS it before writing it (an upward-exposed use)
+  //   Def[b]     the block writes it somewhere (a basic block is linear, so that write kills)
+  //   LiveIn[b]  = Use[b] or (LiveOut[b] and not Def[b])
+  //   LiveOut[b] = OR of LiveIn over the successors
+  // "Live after Pos" is then: a read before any redefinition in the rest of THIS block, or - when the
+  // value simply falls out of the block - LiveOut of this block.
   //
-  // The question that is actually needed: every read of T must be immediately preceded by the
-  // definition that feeds it, INSIDE a triple of this same shape. Then no read can see a value from
-  // anywhere else - each triple redefines T before reading it - and every such triple is one this pass
-  // is fusing, so what it stops computing is never observed. Reads BEFORE a triple's Asc see an older
-  // value and do not matter; this only has to rule out a read that escapes the shape.
-  // Within one block, is RegIdx read after FromPos before anything redefines it? Those reads are the
-  // only ones that could observe the value the fusion stops computing - anything further out is
-  // covered by the "every block defines before it reads" rule above.
-  function IntRegReadAfter(RegIdx: Integer; B: TSSABasicBlock; FromPos: Integer): Boolean;
-  var q: Integer;
-      D: TSSAInstruction;
-      function IsR(const V: TSSAValue): Boolean; inline;
-      begin
-        Result := (V.Kind = svkRegister) and (V.RegType = srtInt) and (V.RegIndex = RegIdx);
-      end;
-  begin
-    Result := True;
-    for q := FromPos + 1 to B.Instructions.Count - 1 do
-    begin
-      D := TSSAInstruction(B.Instructions[q]);
-      if IsR(D.Src1) or IsR(D.Src2) or IsR(D.Src3) then Exit;
-      if IsR(D.Dest) then Break;    // redefined: everything after sees the new value
-    end;
-    Result := False;
-  end;
-
-  function IntRegReadOnlyInsideTriples(RegIdx: Integer): Boolean;
+  // ⚠️ Successor indices are resolved by IDENTITY against the Blocks list, not read from BlockIndex:
+  // that field is stamped once and blocks are removed by other passes, and a stale index here would
+  // answer "dead" for a live register - the direction that miscompiles. Anything unresolvable answers
+  // LIVE, so a doubt costs a missed fusion.
+  function IntRegLiveAfter(RegIdx: Integer; B: TSSABasicBlock; Pos: Integer): Boolean;
   var
-    bb, jj, kk: Integer;
+    UseB, DefB, LiveIn: array of Boolean;
+    SuccIdx: array of array of Integer;
+    bb, jj, ss, q, SelfIdx: Integer;
     B2: TSSABasicBlock;
-    I2, Prev: TSSAInstruction;
+    D: TSSAInstruction;
+    Changed, Seen, LiveOutB, NewIn: Boolean;
 
-    function IsT(const V: TSSAValue): Boolean; inline;
+    function IsR(const V: TSSAValue): Boolean;
     begin
       Result := (V.Kind = svkRegister) and (V.RegType = srtInt) and (V.RegIndex = RegIdx);
     end;
 
-    // The instruction whose definition of T actually reaches position Before, or nil when the value
-    // arrives from a predecessor block - which this pass will not reason about, so it refuses.
-    // ⚠️ Adjacency is NOT the test: the triple's three instructions are consecutive in the BYTECODE
-    // but not necessarily in the SSA list, and requiring jj-1 here made the fusion refuse the real
-    // reverse-complement while still firing on a one-site probe.
-    function NearestDefOfT(B: TSSABasicBlock; Before, R: Integer): TSSAInstruction;
-    var q: Integer;
-        D: TSSAInstruction;
+    function ReadsR(Ins2: TSSAInstruction): Boolean;
+    var k: Integer;
     begin
-      Result := nil;
-      for q := Before - 1 downto 0 do
-      begin
-        D := TSSAInstruction(B.Instructions[q]);
-        if (D.Dest.Kind = svkRegister) and (D.Dest.RegType = srtInt) and (D.Dest.RegIndex = R) then
-          Exit(D);
-      end;
+      Result := IsR(Ins2.Src1) or IsR(Ins2.Src2) or IsR(Ins2.Src3);
+      if not Result then
+        for k := 0 to High(Ins2.PhiSources) do
+          if IsR(Ins2.PhiSources[k].Value) then Exit(True);
+    end;
+
+    function IndexOfBlock(Blk2: TSSABasicBlock): Integer;
+    var k: Integer;
+    begin
+      Result := -1;
+      for k := 0 to Blocks.Count - 1 do
+        if TSSABasicBlock(Blocks[k]) = Blk2 then Exit(k);
     end;
 
   begin
-    Result := False;
+    // 1) The rest of THIS block settles it whenever it mentions the register at all.
+    for q := Pos + 1 to B.Instructions.Count - 1 do
+    begin
+      D := TSSAInstruction(B.Instructions[q]);
+      if ReadsR(D) then Exit(True);
+      if IsR(D.Dest) then Exit(False);      // redefined before any read: dead from here on
+    end;
+
+    // 2) It falls out of the block, so the answer is LiveOut - and that needs the fixpoint.
+    SetLength(UseB, Blocks.Count); SetLength(DefB, Blocks.Count); SetLength(LiveIn, Blocks.Count);
+    SetLength(SuccIdx, Blocks.Count);
     for bb := 0 to Blocks.Count - 1 do
     begin
       B2 := TSSABasicBlock(Blocks[bb]);
+      UseB[bb] := False; DefB[bb] := False; LiveIn[bb] := False;
+      Seen := False;
       for jj := 0 to B2.Instructions.Count - 1 do
       begin
-        I2 := TSSAInstruction(B2.Instructions[jj]);
-        // Src2 and the PHI sources are never part of the shape: a read there escapes it.
-        if IsT(I2.Src2) then Exit;
-        for kk := 0 to High(I2.PhiSources) do
-          if IsT(I2.PhiSources[kk].Value) then Exit;
-        // Any block must DEFINE T before it reads it: then no read anywhere consumes a value
-        // flowing in from a predecessor, and reasoning inside one block is enough.
-        if IsT(I2.Src1) or IsT(I2.Src2) or IsT(I2.Src3) then
-          if NearestDefOfT(B2, jj, RegIdx) = nil then Exit;
+        D := TSSAInstruction(B2.Instructions[jj]);
+        if (not Seen) and ReadsR(D) then begin UseB[bb] := True; Seen := True; end;
+        if IsR(D.Dest) then begin DefB[bb] := True; Seen := True; end;
       end;
+      SetLength(SuccIdx[bb], B2.Successors.Count);
+      for ss := 0 to B2.Successors.Count - 1 do
+        SuccIdx[bb][ss] := IndexOfBlock(TSSABasicBlock(B2.Successors[ss]));
     end;
+
+    repeat
+      Changed := False;
+      for bb := Blocks.Count - 1 downto 0 do
+      begin
+        LiveOutB := False;
+        for ss := 0 to High(SuccIdx[bb]) do
+          if (SuccIdx[bb][ss] < 0) or LiveIn[SuccIdx[bb][ss]] then
+          begin LiveOutB := True; Break; end;
+        NewIn := UseB[bb] or (LiveOutB and (not DefB[bb]));
+        if NewIn <> LiveIn[bb] then begin LiveIn[bb] := NewIn; Changed := True; end;
+      end;
+    until not Changed;
+
+    SelfIdx := IndexOfBlock(B);
     Result := True;
+    if SelfIdx < 0 then Exit;               // cannot place the block: answer LIVE, the safe direction
+    Result := False;
+    for ss := 0 to High(SuccIdx[SelfIdx]) do
+      if (SuccIdx[SelfIdx][ss] < 0) or LiveIn[SuccIdx[SelfIdx][ss]] then Exit(True);
   end;
+
 
 begin
   Result := 0;
@@ -2306,12 +2322,10 @@ begin
       if (Add.Dest.Kind <> svkRegister) or (Add.Dest.RegIndex <> Asc.Dest.RegIndex) or
          (Add.Src1.RegIndex <> Asc.Dest.RegIndex) then
         begin Say(i, 'the AddInt does not read and write the AscMid register'); Inc(i); Continue; end;
-      if not IntRegReadOnlyInsideTriples(Asc.Dest.RegIndex) then
-        begin Say(i, 'a block reads the int register without defining it first'); Inc(i); Continue; end;
-      // ...and, in THIS block, nothing may read it after the append before it is redefined: those are
-      // the only reads that could observe the value the fusion stops computing.
-      if IntRegReadAfter(Asc.Dest.RegIndex, Blk, i) then
-        begin Say(i, 'the int register is read again after the append'); Inc(i); Continue; end;
+      // The temporary must be DEAD after the append: that is what makes dropping the two producers
+      // unobservable, and nothing weaker will do (see IntRegLiveAfter).
+      if IntRegLiveAfter(Asc.Dest.RegIndex, Blk, i) then
+        begin Say(i, 'the int temporary is still live after the append'); Inc(i); Continue; end;
 
       // Nothing in between may write what the fused instruction will read at the concatenation's
       // position: the source string, the table, or the index.
