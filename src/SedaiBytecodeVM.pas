@@ -8477,10 +8477,15 @@ var
   T: AnsiString;
 begin
   GStrCapacity := False;
+  GAotStrHdrOK := False;
   T := 'abcdefgh';
   UniqueString(T);
   if StringRefCount(T) <> 1 then Exit;
   if PSizeInt(Pointer(T) - SizeOf(SizeInt))^ <> 8 then Exit;          // the length field is where we think
+  // The AOT's inline Asc(Mid()) reads that length field from emitted code and needs nothing else,
+  // so it is cleared for take-off HERE - a separate flag, on purpose: STRCAP=0 is the A/B switch
+  // for the capacity work below and must not silently disable the inline as a side effect.
+  GAotStrHdrOK := True;
   if MemSize(Pointer(T) - SB_ANSI_HDR) < PtrUInt(SB_ANSI_HDR + 9) then Exit;  // and the block covers it
   GStrCapacity := True;
 end;
@@ -8780,7 +8785,18 @@ end;
 
   ⚠️ An out-of-range index yields code 0, hence table index 1 - NOT "append nothing". See the
   interpreter arm: Asc of an empty substring is 0, the +1 makes it 1, and the concatenation then
-  appends the table's first byte. Exiting early instead diverges from the sequence being replaced. }
+  appends the table's first byte. Exiting early instead diverges from the sequence being replaced.
+
+  ⛔ NEGATIVE RESULT (1 Aug 2026, measured): do NOT inline this opcode into the AOT the way
+  bcStrAscMid was. The helper CALL is not what it costs. Priced on job/tests/bench/apmap_floor.bas
+  by cutting the body down in stages, 5 M characters, one binary:
+      spill + call + both byte reads .......  47 ms   (the part an inline would remove)
+      + StringRefCount ..................... +16 ms   3,2 ns/char
+      + StrSpareRoom (MemSize) ............. +15 ms   3,0 ns/char
+      + the write itself ................... +46 ms   9,2 ns/char
+  So ~60% of the fused loop is inside AppendChar, and it is spread evenly over asking whether the
+  buffer is shared, asking whether it has room, and writing - with no single culprit to remove.
+  Inlining the opcode would attack the one part that is already the cheapest. }
 procedure AotStrAppendMappedModern(dstSlot, srcVal, tabVal: Pointer; i: PtrInt); cdecl;
 // ⛔ Operands read in place, never through local AnsiString variables: a managed assignment costs a
 // reference count up and down on EVERY character. Same rule as AotStrConcatCharAt.

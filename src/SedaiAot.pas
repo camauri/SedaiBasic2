@@ -233,6 +233,16 @@ var
   GAotDynFloatState: Integer = -1;
   // AOT_LINSCAN=1 enables the interval allocator (B1b). -1 = env not yet read.
   GAotLinScanState: Integer = -1;
+  // Set by the VM's StrCapacityInit once it has CONFIRMED, on this runtime, that an AnsiString's
+  // length field really sits at [ptr - SizeOf(SizeInt)]. Emitted code that steps into the string
+  // header (the inline Asc(Mid()) fast path) is gated on it, so a future FPC with a different
+  // layout loses the optimisation instead of reading garbage as a length. Deliberately a SEPARATE
+  // flag from GStrCapacity: STRCAP=0 is the A/B switch for the capacity work and must not silently
+  // turn this off too.
+  GAotStrHdrOK: Boolean = False;
+  // ASCMIDINLINE=0 forces bcStrAscMid back to the pure helper call (the A/B on one binary).
+  // -1 = env not yet read.
+  GAotAscMidInlineState: Integer = -1;
   // Did the interval allocator actually run for the last region, and what did it place?
   AotDiagLinScanActive: Boolean = False;
   AotDiagLsPlacedInt: Integer = 0;
@@ -463,6 +473,18 @@ begin
     else GAotLinScanState := 1;
   end;
   Result := GAotLinScanState;
+end;
+
+function AotAscMidInline: Boolean;
+// Is the inline fast path for bcStrAscMid emitted? Needs BOTH the runtime-confirmed string header
+// layout and the gate left at its default (ASCMIDINLINE=0 is the A/B on one binary).
+begin
+  if GAotAscMidInlineState < 0 then
+  begin
+    if GetEnvironmentVariable('ASCMIDINLINE') = '0' then GAotAscMidInlineState := 0
+    else GAotAscMidInlineState := 1;
+  end;
+  Result := (GAotAscMidInlineState = 1) and GAotStrHdrOK;
 end;
 
 function AotSkipMainDefault(CombinedMode: Boolean): Boolean;
@@ -2024,11 +2046,50 @@ var
   // substring. Same argument discipline as EmitStrMid: the string operand is read from the bank
   // through rax, the primitive is fetched from the context BEFORE arg2 clobbers r8 on Win64, and
   // the pooled arg3 is written last.
+  //
+  // FAST PATH (AotAscMidInline). Reading ONE byte out of a string is three machine instructions -
+  // load the data pointer, check the bound, movzx the byte - and paying a spill-everything helper
+  // call for them was measured at 15,6 ns per character, 72% of reverse-complement's fused inner
+  // loop (job/tests/bench/xform_floor.bas: empty loop 0 ms, + Asc(Mid) 78 ms on 5 M characters).
+  // The inline covers the ONE shape that is dialect-blind: length exactly 1 with 1 <= start <=
+  // Len(s), where MODERN and CLASSIC both answer Ord(s[start]). EVERYTHING else - a length other
+  // than 1, a start outside the string, an empty (nil) buffer - falls through to the helper below,
+  // which keeps all the rules and stays the single place they are written.
+  //
+  // rax/rcx/rdx are safe scratch here: IntPool never hands them out, and the fast path runs BEFORE
+  // SpillVolatiles, while every pooled value is still where ILoad expects it. Both arms converge on
+  // "result in rax", so the pool state at the join is identical either way - the slow arm spills and
+  // reloads, the fast arm touches nothing pooled.
   procedure EmitStrAscMid;
   var d, s, st, ln: Integer;
+      pLen, pNil, pLo, pHi, pDone: Integer;
   begin
     d := IReg(Cur.Dest); s := SReg(Cur.Src1);
     st := IReg(Cur.Src2); ln := IReg(Cur.Src3); if not OK then Exit;
+    pDone := -1;
+    if AotAscMidInline then
+    begin
+      E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);        // rax = string bank base
+      E.MemOp([$48, $8B], RAX, RAX, LongWord(s) * 8);      // rax = StringRegs[src] (data pointer)
+      ILoad(RCX, st);                                      // rcx = start  (pre-spill: pool intact)
+      ILoad(RDX, ln);                                      // rdx = length
+      E.EmitBytes([$48, $83, $FA, $01]);                   // cmp rdx, 1
+      E.EmitBytes([$75, $00]); pLen := E.Len - 1;          // jne slow   (only length 1 is blind)
+      E.EmitBytes([$48, $85, $C0]);                        // test rax, rax
+      E.EmitBytes([$74, $00]); pNil := E.Len - 1;          // jz slow    (empty string -> 0)
+      E.EmitBytes([$48, $83, $F9, $01]);                   // cmp rcx, 1
+      E.EmitBytes([$7C, $00]); pLo := E.Len - 1;           // jl slow    (start < 1: dialects differ)
+      E.EmitBytes([$48, $3B, $48, $F8]);                   // cmp rcx, [rax-8]   (the length field)
+      E.EmitBytes([$7F, $00]); pHi := E.Len - 1;           // jg slow    (start > Len -> 0)
+      E.EmitBytes([$0F, $B6, $44, $08, $FF]);              // movzx eax, byte [rax+rcx-1]
+      // rel32, not a short jump: the helper sequence it skips is SpillVolatiles + call +
+      // StrCallEpilogue, which is comfortably past 127 bytes once the pool is full.
+      E.Emit8($E9); pDone := E.Len; E.Emit32(0);           // jmp done
+      E.PatchByte(pLen, Byte(E.Len - (pLen + 1)));
+      E.PatchByte(pNil, Byte(E.Len - (pNil + 1)));
+      E.PatchByte(pLo,  Byte(E.Len - (pLo + 1)));
+      E.PatchByte(pHi,  Byte(E.Len - (pHi + 1)));
+    end;
     SpillVolatiles;
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);         // rax = string bank base
     E.MemOp([$4D, $8B], R11, R8, AOTCTX_STRASCMID);       // r11 = primitive (last ctx read)
@@ -2040,6 +2101,7 @@ var
     ILoadArgSpilled(ABI_ARG3, ln);                        // arg3 = length
     E.EmitBytes([$41, $FF, $D3]);                         // call r11
     StrCallEpilogue;
+    if pDone >= 0 then E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));   // @done
     IStore(d, RAX);                                       // the code comes back in rax
   end;
 
