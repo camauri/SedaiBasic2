@@ -382,6 +382,11 @@ begin
   if GFileHandler = nil then GFileHandler := TVMFileHandler.Create;
   AVM.OnDiskFile := @GFileHandler.DiskFile;
   AVM.OnFileData := @GFileHandler.FileData;
+  // Numeric fast path for EOF/LOF/LOC/SEEK/FREEFILE. FILEQUERY=0 leaves it unwired, so the queries
+  // go back through the string protocol and the two can be compared - for equality and for time -
+  // on ONE binary.
+  if GetEnvironmentVariable('FILEQUERY') <> '0' then
+    AVM.OnFileQuery := @GFileHandler.FileQuery;
 end;
 
 { Keyword coverage self-check (--kw-check <list>).

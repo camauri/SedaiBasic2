@@ -76,6 +76,28 @@ type
                              Handle: Integer; var Data: string;
                              var ErrorCode: Integer) of object;
 
+  { Numeric fast path for the file QUERIES (EOF/FREEFILE/LOF/LOC/SEEK), the bcFileQuery arm.
+    Returns False when the handler has no numeric answer, and the caller falls back to the string
+    protocol above - so a handler that does not implement this keeps working unchanged.
+
+    ⚠️ Why it exists: asking "am I at end of file?" through TFileDataEvent costs TWO string
+    allocations and a parse. The command travels as a string and is matched by a chain of string
+    compares; the answer travels back as IntToStr(...) and is decoded with StrToIntDef(Trim(...)).
+    Measured at 242 ns per Eof() call, 101 ms on reverse-complement, which reads one line at a time
+    and asks before every one. }
+  TFileQueryEvent = function(Sender: TBytecodeVM; QueryCode, Handle: Integer;
+                             out Value: Int64; out ErrorCode: Integer): Boolean of object;
+
+const
+  { bcFileQuery.Immediate - the query codes the SSA builder emits (SedaiSSA ~6057). }
+  FQ_EOF      = 0;
+  FQ_FREEFILE = 1;
+  FQ_LOF      = 2;
+  FQ_LOC      = 3;
+  FQ_SEEK     = 4;
+
+type
+
   { Event poll callback for keeping UI responsive during VM execution }
   TEventPollCallback = function: Boolean of object;
 
@@ -377,6 +399,7 @@ type
     FOnDiskFile: TDiskFileEvent;
     // File data I/O callback (GET#, INPUT#, PRINT#, CMD)
     FOnFileData: TFileDataEvent;
+    FOnFileQuery: TFileQueryEvent;   // optional numeric fast path for bcFileQuery
     // Current CMD file handle (0 = screen, >0 = redirected to file)
     FCmdHandle: Integer;
     // Sprite manager (nil in CLI mode — sprite commands become no-ops)
@@ -651,6 +674,7 @@ type
     property OnFileCommand: TFileCommandEvent read FOnFileCommand write FOnFileCommand;
     property OnDiskFile: TDiskFileEvent read FOnDiskFile write FOnDiskFile;
     property OnFileData: TFileDataEvent read FOnFileData write FOnFileData;
+    property OnFileQuery: TFileQueryEvent read FOnFileQuery write FOnFileQuery;
     property CmdHandle: Integer read FCmdHandle;  // Current CMD output redirect handle
     {$IFDEF WEB_MODE}
     procedure SetWebContext(AContext: TObject);
@@ -12500,6 +12524,7 @@ var
   ErrorCode: Integer;
   HandleNum: Integer;
   HandleName, Filename, Mode, Data: string;
+  QVal: Int64;         // bcFileQuery numeric fast path result (unmanaged: costs nothing to declare)
   BinI: Int64;
   BinF: Double;
   BinS: Single;
@@ -12846,19 +12871,30 @@ begin
     16: // bcFileQuery - EOF/FREEFILE/LOF/LOC/SEEK(n) -> int (non-fatal; Src1=handle, Immediate=query code)
       begin
         HandleNum := Ctx.IntRegs[Instr.Src1];
-        case Instr.Immediate of
-          1: Mode := 'FREEFILE';
-          2: Mode := 'LOF';
-          3: Mode := 'LOC';
-          4: Mode := 'SEEK';
+        // Numeric fast path: the whole query answers in an Int64, with no string built, matched or
+        // parsed anywhere. QVal is an Int64 local - unmanaged, so unlike the AnsiString locals of
+        // this method it costs nothing to have. Falls back to the string protocol when the handler
+        // does not implement it (or declines a particular query).
+        if Assigned(FOnFileQuery) and FOnFileQuery(Self, Instr.Immediate, HandleNum, QVal, ErrorCode) then
+        begin
+          if Instr.Dest >= 0 then Ctx.IntRegs[Instr.Dest] := QVal;
+        end
         else
-          Mode := 'EOF';
+        begin
+          case Instr.Immediate of
+            1: Mode := 'FREEFILE';
+            2: Mode := 'LOF';
+            3: Mode := 'LOC';
+            4: Mode := 'SEEK';
+          else
+            Mode := 'EOF';
+          end;
+          Data := '';
+          if Assigned(FOnFileData) then
+            FOnFileData(Self, Mode, HandleNum, Data, ErrorCode);   // queries don't raise
+          if Instr.Dest >= 0 then
+            Ctx.IntRegs[Instr.Dest] := StrToIntDef(Trim(Data), 0);
         end;
-        Data := '';
-        if Assigned(FOnFileData) then
-          FOnFileData(Self, Mode, HandleNum, Data, ErrorCode);   // queries don't raise
-        if Instr.Dest >= 0 then
-          Ctx.IntRegs[Instr.Dest] := StrToIntDef(Trim(Data), 0);
       end;
 
     17: // bcSeekSet - SEEK #n, pos: set the 1-based file position

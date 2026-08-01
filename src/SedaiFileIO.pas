@@ -68,6 +68,11 @@ type
       const HandleName, Filename, Mode: string; var ErrorCode: Integer);
     procedure FileData(Sender: TBytecodeVM; const Command: string; Handle: Integer;
       var Data: string; var ErrorCode: Integer);
+    // Wire to VM.OnFileQuery. The numeric answer to EOF/FREEFILE/LOF/LOC/SEEK, and the SINGLE place
+    // those five are computed: the string arms of FileData delegate here rather than repeating the
+    // rules, so the two protocols cannot drift apart.
+    function FileQuery(Sender: TBytecodeVM; QueryCode, Handle: Integer;
+      out Value: Int64; out ErrorCode: Integer): Boolean;
   end;
 
 implementation
@@ -302,6 +307,60 @@ begin
   end;
 end;
 
+function TVMFileHandler.FileQuery(Sender: TBytecodeVM; QueryCode, Handle: Integer;
+  out Value: Int64; out ErrorCode: Integer): Boolean;
+// Every rule for the five queries lives HERE. FileData's string arms call into this function, so
+// there is one implementation and one place to change - a gate built by duplicating a body diverges
+// and then lies about it.
+var
+  i: Integer;
+  FS: TFileStream;
+begin
+  Result := True;
+  Value := 0;
+  ErrorCode := 0;
+
+  // FREEFILE: lowest unused handle 1..15 (0 if none). Does not need an open handle.
+  if QueryCode = FQ_FREEFILE then
+  begin
+    for i := 1 to 15 do
+      if not Assigned(FFileHandles[i]) then begin Value := i; Exit; end;
+    Exit;                                   // none free -> 0
+  end;
+
+  // A standard DEVICE handle (CONS/SCRN/ERR) has no stream behind it.
+  if (Handle >= 1) and (Handle <= 15) and (FDeviceKind[Handle] <> 0) then
+  begin
+    if QueryCode = FQ_EOF then
+    begin
+      if FDeviceKind[Handle] <> 1 then Exit;            // output device: never at EOF
+      if StdInBuffered then
+      begin
+        if StdInAtEof then Value := -1;
+      end
+      else if System.Eof(System.Input) then Value := -1;
+    end;
+    Exit;                                   // LOF/LOC/SEEK mean nothing on a device -> 0
+  end;
+
+  if (Handle < 1) or (Handle > 15) or (not Assigned(FFileHandles[Handle])) then
+  begin
+    ErrorCode := 64;                        // FILE NOT OPEN
+    if QueryCode = FQ_EOF then Value := -1; // EOF of a closed file = true
+    Exit;
+  end;
+
+  FS := FFileHandles[Handle];
+  case QueryCode of
+    FQ_EOF:  Value := -Ord(FS.Position >= FS.Size);  // FB: -1 (true) at/after end of file
+    FQ_LOF:  Value := FS.Size;
+    FQ_LOC:  Value := FS.Position;
+    FQ_SEEK: Value := FS.Position + 1;               // FB SEEK is 1-based
+  else
+    Result := False;                        // not a query we know: let the caller use the strings
+  end;
+end;
+
 procedure TVMFileHandler.FileData(Sender: TBytecodeVM; const Command: string; Handle: Integer;
   var Data: string; var ErrorCode: Integer);
 var
@@ -311,15 +370,16 @@ var
   FS: TFileStream;
   M: string;
   RetType, V: Integer;
+  QV: Int64;           // the numeric answer from FileQuery, before it is turned into a string
 begin
   ErrorCode := 0;
 
-  // FREEFILE: lowest unused handle 1..15 (0 if none). Does not need an open handle.
+  // The five QUERIES are computed by FileQuery, which is the single source of their rules; this arm
+  // only turns the number into the string this protocol carries.
   if Command = 'FREEFILE' then
   begin
-    Data := '0';
-    for i := 1 to 15 do
-      if not Assigned(FFileHandles[i]) then begin Data := IntToStr(i); Break; end;
+    FileQuery(Sender, FQ_FREEFILE, Handle, QV, ErrorCode);
+    Data := IntToStr(QV);
     Exit;
   end;
 
@@ -360,12 +420,8 @@ begin
   begin
     if Command = 'EOF' then
     begin
-      if FDeviceKind[Handle] <> 1 then begin Data := '0'; Exit; end;
-      if StdInBuffered then
-      begin
-        if StdInAtEof then Data := '-1' else Data := '0';
-      end
-      else if System.Eof(System.Input) then Data := '-1' else Data := '0';
+      FileQuery(Sender, FQ_EOF, Handle, QV, ErrorCode);
+      Data := IntToStr(QV);
       Exit;
     end;
     if (Command = 'INPUT#') or (Command = 'LINEINPUT#') then
@@ -414,15 +470,13 @@ begin
   end;
 
   if Command = 'EOF' then
-    // FreeBASIC EOF: -1 (true) at/after end of file, 0 otherwise.
-    Data := IntToStr(-Ord(FS.Position >= FS.Size))
+    begin FileQuery(Sender, FQ_EOF, Handle, QV, ErrorCode); Data := IntToStr(QV); end
   else if Command = 'LOF' then
-    Data := IntToStr(FS.Size)
+    begin FileQuery(Sender, FQ_LOF, Handle, QV, ErrorCode); Data := IntToStr(QV); end
   else if Command = 'LOC' then
-    Data := IntToStr(FS.Position)
+    begin FileQuery(Sender, FQ_LOC, Handle, QV, ErrorCode); Data := IntToStr(QV); end
   else if Command = 'SEEK' then
-    // SEEK(#n) query: current 1-based byte position (FreeBASIC SEEK is 1-based).
-    Data := IntToStr(FS.Position + 1)
+    begin FileQuery(Sender, FQ_SEEK, Handle, QV, ErrorCode); Data := IntToStr(QV); end
   else if Command = 'SEEKSET' then
   begin
     // SEEK #n, pos statement: set the 1-based position. "The position is given in RECORDS if the file
