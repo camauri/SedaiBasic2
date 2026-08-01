@@ -360,6 +360,10 @@ var
   // is also what ArrClassic is derived from - so the classifier, the prescan and the emitter all
   // read THIS, and cannot disagree about which instructions are native.
   GArrStrNative: Boolean = False;
+  GDivConstState: Integer = -1;    // C7 division by a constant: -1 unread, 0 off, 1 on
+  // Diagnostics: how many div/mod sites took the magic path and how many stayed on idiv, and why.
+  GDivConstHit: Integer = 0;
+  GDivConstMiss: Integer = 0;
 
 procedure AotSetRecordLayout(RecordsOff, RecSize, RecIntOff, RecFloatOff, SharedRecOff: Integer);
 begin
@@ -380,6 +384,63 @@ begin
     else GRecNativeState := 1;
   end;
   Result := (GRecNativeState = 1) and (GRecSize > 0);
+end;
+
+// C7: replace a division by a CONSTANT with a multiply-high and shifts, gated for the A/B.
+// AOT_DIVCONST=0 emits the historical idiv.
+function AotDivConstNative: Boolean;
+begin
+  if GDivConstState < 0 then
+  begin
+    if GetEnvironmentVariable('AOT_DIVCONST') = '0' then GDivConstState := 0
+    else GDivConstState := 1;
+  end;
+  Result := GDivConstState = 1;
+end;
+
+{ ⛔ NEGATIVO STRUTTURALE, misurato il 1 ago 2026: NON si puo' recuperare il divisore costante
+  QUI. Il primo tentativo di C7 fu un'analisi per-registro sull'intero programma ("un registro le cui
+  definizioni sono tutte la stessa costante vale quella costante"): sound, e inutile. Su pidigits ha
+  trovato 11 registri su 401 e ZERO siti di divisione, perche' dopo l'allocazione il numero di
+  registro non identifica piu' un valore -- quello che porta 1000000000 e' anche scritto da un
+  LoadConstInt 10, un ArrayLoad, due CopyInt e una SubInt altrove. La costante esiste solo PRIMA
+  dell'allocazione: la stampa TSSAProgram.AnnotateDivByConst sull'istruzione, e qui si legge
+  dall'Immediate. ⭐ La lezione: un'analisi che gira dopo che l'informazione e' stata cancellata non
+  e' conservativa, e' cieca -- e il cronometro non lo dice (il primo giro lesse -1%, cioe' rumore,
+  con zero siti trasformati; l'ha detto il CONTATORE). }
+
+{ Magic number for a SIGNED 64-bit division by d (|d| >= 2), Hacker's Delight figure 10-4.
+  Returns M and the post-shift s such that
+      q = floor_to_zero(n / d)
+  is computed as  t = mulhi(M, n); [t += n | t -= n]; t >>= s; q = t + (t >>> 63).
+  AddMarker/SubMarker say whether the corrective add or subtract is needed (M's sign disagreeing
+  with d's is exactly that case). }
+procedure AotMagicSigned(d: Int64; out M: Int64; out s: Integer; out NeedAdd, NeedSub: Boolean);
+var
+  p: Integer;
+  ad, anc, delta, q1, r1, q2, r2, t: QWord;
+  two63: QWord;
+begin
+  two63 := QWord(1) shl 63;
+  if d < 0 then ad := QWord(-d) else ad := QWord(d);
+  t := two63 + (QWord(d) shr 63);          // 2^63 + (d<0 ? 1 : 0)
+  anc := t - 1 - (t mod ad);               // |nc|
+  p := 63;
+  q1 := two63 div anc;        r1 := two63 - q1 * anc;
+  q2 := two63 div ad;         r2 := two63 - q2 * ad;
+  repeat
+    Inc(p);
+    q1 := 2 * q1;  r1 := 2 * r1;
+    if r1 >= anc then begin Inc(q1); Dec(r1, anc); end;
+    q2 := 2 * q2;  r2 := 2 * r2;
+    if r2 >= ad then begin Inc(q2); Dec(r2, ad); end;
+    delta := ad - r2;
+  until not ((q1 < delta) or ((q1 = delta) and (r1 = 0)));
+  M := Int64(q2 + 1);
+  if d < 0 then M := -M;
+  s := p - 64;
+  NeedAdd := (d > 0) and (M < 0);
+  NeedSub := (d < 0) and (M > 0);
 end;
 
 // C6: record ALLOCATION (New/Delete) and the block marks as native leaf calls instead of runtime
@@ -1630,10 +1691,60 @@ var
       E.Emit8($80 or ((Hd and 7) shl 3) or RSI); E.Emit32(LongWord(s1) * 8);   // cvt Hd, [rsi+off]
     end;
   end;
+  // C7: n \ C and n Mod C for a CONSTANT C, without idiv. The divisor's register is known to hold
+  // one value, stamped on the instruction by the SSA, so the sequence is the classic multiply-high:
+  //     t = mulhi(M, n);  [t += n | t -= n];  t >>= s;  q = t + (t >>> 63)
+  // and the remainder comes back as n - q*C. Measured worth on pidigits: two idiv per limb are 23,5
+  // of the 26,2 ns a limb costs, and the program walks 25 M limbs.
+  //
+  // Returns False when the constant is not one this path handles (0, ±1, or a magnitude that does
+  // not fit the imm32 of the remainder's multiply): the caller then emits the historical idiv,
+  // which also keeps the divide-by-zero and INT64_MIN/-1 traps exactly where they were.
+  function TryDivModConst(apc: Integer; WantRemainder: Boolean): Boolean;
+  var
+    d, M: Int64;
+    s: Integer;
+    NeedAdd, NeedSub: Boolean;
+  begin
+    Result := False;
+    if not AotDivConstNative then Exit;
+    if (apc < 0) or (Prog = nil) then Exit;
+    // The divisor is NOT recoverable from the register here: after allocation that number carries
+    // several values. It arrives stamped on the instruction by the SSA (AnnotateDivByConst).
+    d := Prog.GetInstruction(apc).Immediate;
+    if d = 0 then begin Inc(GDivConstMiss); Exit; end;                            // not annotated
+    if (d = 1) or (d = -1) then begin Inc(GDivConstMiss); Exit; end;              // identity / corner
+    if WantRemainder and ((d > High(LongInt)) or (d < Low(LongInt))) then
+      begin Inc(GDivConstMiss); Exit; end;                                        // imm32 for imul
+    Inc(GDivConstHit);
+    AotMagicSigned(d, M, s, NeedAdd, NeedSub);
+
+    ILoad(RCX, IReg(Cur.Src1));                   // rcx = n (kept: the remainder needs it)
+    MovImm64(RAX, M);
+    E.EmitBytes([$48, $F7, $E9]);                 // imul rcx        -> rdx:rax = M * n (signed)
+    MovRR(RAX, RDX);                              // rax = mulhi
+    if NeedAdd then E.EmitBytes([$48, $01, $C8])  // add rax, rcx
+    else if NeedSub then E.EmitBytes([$48, $29, $C8]);  // sub rax, rcx
+    if s > 0 then begin E.EmitBytes([$48, $C1, $F8]); E.Emit8(Byte(s)); end;   // sar rax, s
+    MovRR(RDX, RAX);
+    E.EmitBytes([$48, $C1, $EA, $3F]);            // shr rdx, 63     -> the sign bit
+    E.EmitBytes([$48, $01, $D0]);                 // add rax, rdx    -> rax = quotient
+    if WantRemainder then
+    begin
+      E.EmitBytes([$48, $69, $D0]); E.Emit32(LongWord(Int64(LongInt(d))));  // imul rdx, rax, d
+      E.EmitBytes([$48, $29, $D1]);               // sub rcx, rdx    -> rcx = n - q*d
+      IStore(IReg(Cur.Dest), RCX);
+    end
+    else
+      IStore(IReg(Cur.Dest), RAX);
+    Result := True;
+  end;
+
   // Signed div/mod with the interpreter's raise semantics via deopt (JIT J10 pattern).
   procedure DivModSigned(apc: Integer; WantRemainder: Boolean);
   var p1, p2: Integer;
   begin
+    if TryDivModConst(apc, WantRemainder) then Exit;
     ILoad(RAX, IReg(Cur.Src1));
     ILoad(RCX, IReg(Cur.Src2));
     E.EmitBytes([$48, $85, $C9]);                 // test rcx,rcx
@@ -5067,6 +5178,12 @@ begin
         // really live at once fits the machine pool at all.
         WriteLn(ErrOutput, Format('[AOT]   emitted bank traffic (loop-weighted): int=%d float=%d  code bytes=%d',
           [AotDiagMemAccI, AotDiagMemAccF, AotDiagCodeW]));
+        // C7: how many div/mod sites got the multiply-high and how many stayed on idiv. Without this
+        // the only evidence is the stopwatch, and a lowering that never fires reads exactly like one
+        // that fires and does not pay.
+        if (GDivConstHit > 0) or (GDivConstMiss > 0) then
+          WriteLn(ErrOutput, Format('[AOT]   div by constant: %d site(s) lowered to multiply-high, %d left on idiv',
+            [GDivConstHit, GDivConstMiss]));
         if AotDiagLsWhy = '' then
         begin
           WriteLn(ErrOutput, Format('[AOT]   intervals: webs int=%d float=%d (ranges=%d) maxOverlap int=%d float=%d edge-crossings=%d',

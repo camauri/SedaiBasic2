@@ -639,6 +639,10 @@ type
     function RunSubInlining: Integer;    // Unification: inline small leaf SUB/FUNCTIONs (IMMEDIATELY after SSA generation, before every other pass)
     function RunRangeAnalysis: Integer;  // B4: prove array accesses in-bounds, set BoundsSafe (AFTER DCE, BEFORE PHI elimination - needs the PHIs)
     procedure RunPhiElimination;  // FINAL PASS: Convert PHI functions to copy instructions (BEFORE bytecode compilation)
+    // C7: stamp the constant divisor of `x \ C` / `x Mod C` onto the instruction (Src3), while the
+    // register still identifies a value. Called from RunPhiElimination - the one point every
+    // pipeline crosses after constant propagation and before register allocation.
+    procedure AnnotateDivByConst;
     function RunStringTempFusion: Integer;  // write string results straight into their destination
     function RunConcatCharFusion: Integer;  // "acc + Mid(tab,k,1)" -> one instruction, no substring
     function RunAppendMappedFusion: Integer; // "acc += tab[Asc(Mid(s,i,1))+1]" -> ONE instruction
@@ -2625,12 +2629,130 @@ begin
     - Copies are inserted BEFORE the terminator (jump/branch)
     - Result: SSA program without PHI, ready for bytecode compilation }
 
+  AnnotateDivByConst;
+
   PhiElim := TPhiElimination.Create(Self);
   try
     PhiElim.Run;
   finally
     PhiElim.Free;
   end;
+end;
+
+procedure TSSAProgram.AnnotateDivByConst;
+{ C7: record the DIVISOR of `x \ C` and `x Mod C` on the instruction itself, in Src3.
+
+  Why here, and not later: the divisor reaches the back end as a REGISTER, and after register
+  allocation that register number no longer identifies a value - measured on pidigits, the number
+  carrying 1000000000 is also written by a LoadConstInt 10, an ArrayLoad, two CopyInt and a SubInt
+  elsewhere in the program. So a back-end analysis CANNOT recover the constant, however careful:
+  the information only exists before allocation. This runs at the head of PHI elimination because
+  that is the one point every pipeline crosses (sb, sbc, the REPL, the runner, the web server)
+  AFTER constant propagation has settled the value and BEFORE registers are allocated.
+
+  Sound rule: a register qualifies when EVERY definition of it is a LoadConstInt and they all agree
+  on the value. Whatever path reaches the use, the register holds that number.
+
+  The annotation is inert by itself - the bytecode compiler copies it into the instruction's
+  Immediate (unused by these two opcodes) and the interpreter ignores it. Only the AOT reads it, to
+  emit a multiply-high instead of idiv. }
+var
+  b, j, r, MaxReg, Round: Integer;
+  DefValTmp: Int64;
+  Ins: TSSAInstruction;
+  DefCount, ConstDefs: array of Integer;
+  DefVal: array of Int64;
+  Agree, Known: array of Boolean;
+  KnownVal: array of Int64;
+
+  procedure NoteDef(const V: TSSAValue; IsConst: Boolean; Val: Int64);
+  var q: Integer;
+  begin
+    if (V.Kind <> svkRegister) or (V.RegType <> srtInt) then Exit;
+    q := V.RegIndex;
+    if (q < 0) or (q > MaxReg) then Exit;
+    if DefCount[q] = 0 then begin DefVal[q] := Val; Agree[q] := True; end
+    else if (not IsConst) or (DefVal[q] <> Val) then Agree[q] := False;
+    Inc(DefCount[q]);
+    if IsConst then Inc(ConstDefs[q]);
+  end;
+
+  // A CopyInt from a register already proven constant defines a constant too. Following the chain
+  // is not a nicety: measured, a divisor that reaches the operand through one copy is exactly the
+  // shape that made this analysis find NOTHING on job/tests/bench/pidigits_prims.bas while finding
+  // every site on the CLBG program - the difference was one copy that propagation had not removed.
+  function ConstOfDef(const Ins: TSSAInstruction; out Val: Int64): Boolean;
+  var q: Integer;
+  begin
+    Val := 0;
+    if (Ins.OpCode = ssaLoadConstInt) and (Ins.Src1.Kind = svkConstInt) then
+    begin
+      Val := Ins.Src1.ConstInt;
+      Exit(True);
+    end;
+    Result := False;
+    if (Ins.OpCode = ssaCopyInt) and (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt) then
+    begin
+      q := Ins.Src1.RegIndex;
+      if (q >= 0) and (q <= MaxReg) and Known[q] then
+      begin
+        Val := KnownVal[q];
+        Result := True;
+      end;
+    end;
+  end;
+
+begin
+  MaxReg := 0;
+  for b := 0 to Blocks.Count - 1 do
+    for j := 0 to Blocks[b].Instructions.Count - 1 do
+    begin
+      Ins := Blocks[b].Instructions[j];
+      if (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = srtInt) and (Ins.Dest.RegIndex > MaxReg) then
+        MaxReg := Ins.Dest.RegIndex;
+    end;
+  if MaxReg = 0 then Exit;
+  SetLength(DefCount, MaxReg + 1);
+  SetLength(ConstDefs, MaxReg + 1);
+  SetLength(DefVal, MaxReg + 1);
+  SetLength(Agree, MaxReg + 1);
+  SetLength(Known, MaxReg + 1);
+  SetLength(KnownVal, MaxReg + 1);
+
+  // Three rounds: enough for a constant to travel through a couple of copies, and bounded so the
+  // pass cannot become a fixpoint that costs compile time on a program that gains nothing.
+  for Round := 1 to 3 do
+  begin
+    FillChar(DefCount[0], Length(DefCount) * SizeOf(Integer), 0);
+    FillChar(ConstDefs[0], Length(ConstDefs) * SizeOf(Integer), 0);
+    FillChar(Agree[0], Length(Agree) * SizeOf(Boolean), 0);
+    for b := 0 to Blocks.Count - 1 do
+      for j := 0 to Blocks[b].Instructions.Count - 1 do
+      begin
+        Ins := Blocks[b].Instructions[j];
+        if ConstOfDef(Ins, DefValTmp) then NoteDef(Ins.Dest, True, DefValTmp)
+        else NoteDef(Ins.Dest, False, 0);
+      end;
+    for r := 0 to MaxReg do
+    begin
+      Known[r] := (DefCount[r] > 0) and (ConstDefs[r] = DefCount[r]) and Agree[r];
+      if Known[r] then KnownVal[r] := DefVal[r];
+    end;
+  end;
+
+  for b := 0 to Blocks.Count - 1 do
+    for j := 0 to Blocks[b].Instructions.Count - 1 do
+    begin
+      Ins := Blocks[b].Instructions[j];
+      if (Ins.OpCode <> ssaDivInt) and (Ins.OpCode <> ssaModInt) then Continue;
+      if Ins.Src3.Kind <> svkNone then Continue;          // already carries something: leave it
+      if (Ins.Src2.Kind <> svkRegister) or (Ins.Src2.RegType <> srtInt) then Continue;
+      r := Ins.Src2.RegIndex;
+      if (r < 0) or (r > MaxReg) or (not Known[r]) then Continue;
+      // 0 would have to trap and ±1 is not worth a sequence; both stay on the hardware divide.
+      if (KnownVal[r] = 0) or (KnownVal[r] = 1) or (KnownVal[r] = -1) then Continue;
+      Ins.Src3 := MakeSSAConstInt(KnownVal[r]);
+    end;
 end;
 
 function TSSAProgram.RunGVN: Integer;

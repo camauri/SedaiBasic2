@@ -2063,6 +2063,12 @@ begin
     BCInstr.Src2 := Word(Instr.Src2.ConstInt);
     BCInstr.Immediate := Instr.Src3.ConstInt;
   end;
+  // C7: `x \ C` / `x Mod C` carry the constant divisor in Src3 (stamped by AnnotateDivByConst, the
+  // only place where the register still identifies a value). Immediate is free on these two opcodes
+  // - the interpreter ignores it - and the AOT reads it to emit a multiply-high instead of idiv.
+  // Same technique as the B4 bounds-safe flag riding Immediate on the array opcodes.
+  if ((Instr.OpCode = ssaDivInt) or (Instr.OpCode = ssaModInt)) and (Instr.Src3.Kind = svkConstInt) then
+    BCInstr.Immediate := Instr.Src3.ConstInt;
   // ssaRecordNewArray (M3.1): Src1 = array id (from svkArrayRef, already mapped above);
   // the packed slot counts are carried as a const in Src2 -> Immediate.
   if Instr.OpCode = ssaRecordNewArray then
