@@ -39,8 +39,26 @@
 .PARAMETER Runs
     Runs per arm; the reported time is the best of them. Default 1.
 
+.PARAMETER RefRuns
+    Runs per YARDSTICK arm (python, lua). Default: same as -Runs.
+
+    Why it is separate: the yardsticks are not what is under test, and at the standard CLBG sizes
+    they dominate the battery - measured on this machine, Python and Lua together are 3.6 hours of
+    a 8-hour run, against 1.7 hours for all four SedaiBasic2 profiles. Fewer runs there buys back
+    most of the day, and it errs in the honest direction: a yardstick measured fewer times tends to
+    read SLOWER, which flatters us, so the ratios it produces are a floor, not a boast.
+
 .PARAMETER Cooldown
     Seconds to idle between runs. Default: 0 with -Quick, 20 otherwise.
+
+.PARAMETER CoolTo
+    Adaptive cooldown: keep idling until the thermometer reads at most this many milliseconds,
+    instead of waiting a fixed time. The fixed -Cooldown is still the FLOOR (always waited), and
+    -CoolMax caps the extra waiting so a machine that never gets cold enough cannot stall the
+    battery. Off by default; a sensible value on this machine is ~150.
+
+.PARAMETER CoolMax
+    Upper bound in seconds on the extra waiting -CoolTo may add per run. Default 180.
 
 .PARAMETER Only
     Run only the named benchmarks (comma-separated).
@@ -69,7 +87,10 @@ param(
     [switch]$Help,
     [switch]$Quick,
     [int]$Runs = 1,
+    [int]$RefRuns = -1,        # -1 = same as $Runs
     [int]$Cooldown = -1,
+    [int]$CoolTo = 0,          # 0 = fixed cooldown only
+    [int]$CoolMax = 180,
     [string[]]$Only = @(),
     [string[]]$Runtime = @(),
     [string[]]$Profile = @(),
@@ -358,11 +379,42 @@ function Get-OutputSignature {
 }
 
 function Start-Cooldown {
+    # The fixed wait is the FLOOR. With -CoolTo the wait then continues until the machine is
+    # actually back to that speed, which is the thing a fixed pause only approximates: a laptop
+    # coming off a 14-minute k-nucleotide run is not as cool after 20 seconds as one coming off a
+    # 300 ms run, and averaging that difference into the table is how a benchmark starts measuring
+    # the order of its own rows. Bounded by -CoolMax so a hot room cannot stall the battery.
     param([int]$Seconds)
-    if ($Seconds -le 0) { return }
-    Write-Host ("      cooling down {0}s ..." -f $Seconds) -ForegroundColor DarkGray -NoNewline
-    Start-Sleep -Seconds $Seconds
-    Write-Host "`r                                        `r" -NoNewline
+    # One transient line, erased with exactly as many spaces as it took: a short blank string left
+    # the tail of a longer message on screen and the log became unreadable.
+    function Write-Transient([string]$Text, [int]$Sleep) {
+        Write-Host $Text -ForegroundColor DarkGray -NoNewline
+        Start-Sleep -Seconds $Sleep
+        Write-Host ("`r" + (' ' * $Text.Length) + "`r") -NoNewline
+    }
+    if ($Seconds -gt 0) {
+        Write-Transient ("      cooling down {0}s ..." -f $Seconds) $Seconds
+    }
+    if (($Script:CoolToMs -le 0) -or $NoThermometer -or ($Script:ThermoExe -eq $null)) { return }
+    if (-not (Test-Path $Script:ThermoExe)) { return }
+    # ONE line when it is over, not one per poll: the transient \r trick is invisible on a console
+    # and permanent in a redirected log, and a ten-hour battery is run redirected.
+    $waited = 0
+    $t = 0
+    while ($waited -lt $Script:CoolMaxSec) {
+        $t = Read-ThermometerFast
+        if ($t -le 0) { return }                       # no thermometer: nothing to wait for
+        if ($t -le $Script:CoolToMs) { Break }
+        $step = [Math]::Min(15, $Script:CoolMaxSec - $waited)
+        Write-Transient ("      cooling to {0} ms (now {1}) ..." -f $Script:CoolToMs, $t) $step
+        $waited += $step
+    }
+    if ($waited -le 0) { return }                      # already cold on the first look: say nothing
+    if ($t -le $Script:CoolToMs) {
+        Write-Host ("      cooled to {0} ms after {1}s extra" -f $t, $waited) -ForegroundColor DarkGray
+    } else {
+        Write-Host ("      still {0} ms after {1}s, target was {2} - measuring anyway" -f $t, $waited, $Script:CoolToMs) -ForegroundColor Yellow
+    }
 }
 
 function Read-Thermometer {
@@ -374,6 +426,15 @@ function Read-Thermometer {
         if ($r.Ms -lt $best) { $best = $r.Ms }
     }
     return [int]$best
+}
+
+function Read-ThermometerFast {
+    # ONE run, for the adaptive cooldown and the per-benchmark readings. Best-of-3 would triple a
+    # measurement taken dozens of times, and here the question is coarse ("is the machine back?"),
+    # not a number anyone quotes.
+    if (-not (Test-Path $ThermoExe)) { return 0 }
+    $r = Invoke-Timed -Exe $ThermoExe -OutFile (Join-Path $TempDir "thermo.out")
+    return [int]$r.Ms
 }
 
 # ============================================================================
@@ -458,12 +519,21 @@ function Invoke-Arm {
 }
 
 function Invoke-Benchmark {
-    param([hashtable]$Bench, [int]$RunCount, [int]$CooldownSeconds)
+    param([hashtable]$Bench, [int]$RunCount, [int]$RefRunCount, [int]$CooldownSeconds)
 
     $name = $Bench.Name
     Write-Host ""
     Write-Host "  $name" -ForegroundColor Cyan -NoNewline
     Write-Host ("  - {0}" -f $Bench.Desc) -ForegroundColor DarkGray
+
+    # The machine's speed AT THIS POINT of the battery. Two readings at the ends tell you the
+    # session drifted; they do not tell you WHERE, and on a run measured in hours that is the
+    # difference between discarding one row and discarding the table.
+    $thermoHere = 0
+    if (-not $NoThermometer) {
+        $thermoHere = Read-ThermometerFast
+        if ($thermoHere -gt 0) { Write-Line "thermometer here: $thermoHere ms" 'DarkGray' }
+    }
 
     # Resolve N (or the FASTA input) for this run.
     $stdinFile = $null
@@ -488,19 +558,23 @@ function Invoke-Benchmark {
         NLabel = $nLabel
         Desc   = $Bench.Desc
         Verify = $Bench.Verify
+        Thermo = $thermoHere
         Arms   = @{}
     }
 
     # --- reference runtimes -------------------------------------------------
+    # RefRunCount, not RunCount: the yardsticks are not under test, and at the standard sizes they
+    # are most of the battery. See the -RefRuns note in the header for why fewer runs there is the
+    # conservative choice rather than a shortcut.
     if ($Script:RunPython -and $Script:PythonExe -and $Bench.Py) {
         $result.Arms['python'] = Invoke-Arm -Label 'python' -Exe $Script:PythonExe `
             -Arguments (@((Join-Path $PyDir $Bench.Py)) + $sizeArgs) -StdinFile $stdinFile `
-            -OutFile (Join-Path $TempDir "$name.python.out") -RunCount $RunCount -CooldownSeconds $CooldownSeconds -IsReference
+            -OutFile (Join-Path $TempDir "$name.python.out") -RunCount $RefRunCount -CooldownSeconds $CooldownSeconds -IsReference
     }
     if ($Script:RunLua -and $Script:LuaExe -and $Bench.Lua) {
         $result.Arms['lua'] = Invoke-Arm -Label 'lua' -Exe $Script:LuaExe `
             -Arguments (@((Join-Path $LuaDir $Bench.Lua)) + $sizeArgs) -StdinFile $stdinFile `
-            -OutFile (Join-Path $TempDir "$name.lua.out") -RunCount $RunCount -CooldownSeconds $CooldownSeconds -IsReference
+            -OutFile (Join-Path $TempDir "$name.lua.out") -RunCount $RefRunCount -CooldownSeconds $CooldownSeconds -IsReference
     }
 
     # --- the expected output ------------------------------------------------
@@ -718,6 +792,18 @@ function Write-Report {
             [void]$md.AppendLine("> The machine changed speed during the session. These numbers are not comparable with other sessions.")
         }
         [void]$md.AppendLine()
+        # Per-benchmark readings. Two numbers at the ends say the session drifted; they cannot say
+        # WHERE, and on a battery measured in hours that is the difference between discarding one
+        # row and discarding the table.
+        $withThermo = @($Results | Where-Object { $_ -and $_.Thermo -gt 0 })
+        if ($withThermo.Count -gt 0) {
+            [void]$md.AppendLine("Reading taken before each benchmark, so a row can be judged against the machine it ran on:")
+            [void]$md.AppendLine()
+            [void]$md.AppendLine("| benchmark | thermometer |")
+            [void]$md.AppendLine("|---|---:|")
+            foreach ($r in $withThermo) { [void]$md.AppendLine("| $($r.Name) | $($r.Thermo) ms |") }
+            [void]$md.AppendLine()
+        }
     }
 
     [void]$md.AppendLine("## System")
@@ -862,6 +948,9 @@ if ($Only.Count -gt 0) {
 
 # A quick verification pass does not need a cooldown; a real measurement session does.
 $Script:ActualCooldown = if ($Cooldown -ge 0) { $Cooldown } elseif ($Quick) { 0 } else { 20 }
+$Script:ActualRefRuns  = if ($RefRuns -ge 1) { $RefRuns } else { $Runs }
+$Script:CoolToMs       = $CoolTo
+$Script:CoolMaxSec     = $CoolMax
 
 foreach ($d in @($TempDir, $ResultsDir)) {
     if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
@@ -877,7 +966,7 @@ $sys = Get-SystemInfo
 
 Write-Line "CPU:    $($sys.CPU)  ($($sys.CPUCores)c / $($sys.CPUThreads)t)"
 Write-Line "Size:   $(if ($Quick) { 'QUICK (reduced N)' } else { 'STANDARD (the CLBG values)' })"
-Write-Line "Runs:   best of $Runs, cooldown $($Script:ActualCooldown)s"
+Write-Line "Runs:   best of $Runs (yardsticks: best of $($Script:ActualRefRuns)), cooldown $($Script:ActualCooldown)s$(if ($CoolTo -gt 0) { " then until <= ${CoolTo}ms, max ${CoolMax}s" })"
 Write-Line "Python: $(if ($Script:PythonExe) { $Script:PythonExe } else { '(not found - Python arms and references unavailable)' })"
 Write-Line "Lua:    $(if ($Script:LuaExe) { $Script:LuaExe } else { '(not found - Lua arms and references unavailable)' })"
 if (-not (Test-Path $TempDir)) { [void](New-Item -ItemType Directory -Path $TempDir -Force) }
@@ -903,7 +992,7 @@ if (-not $NoThermometer) {
 
 $results = @()
 foreach ($b in $suite) {
-    $results += Invoke-Benchmark -Bench $b -RunCount $Runs -CooldownSeconds $Script:ActualCooldown
+    $results += Invoke-Benchmark -Bench $b -RunCount $Runs -RefRunCount $Script:ActualRefRuns -CooldownSeconds $Script:ActualCooldown
 }
 
 $thermoEnd = 0
