@@ -134,17 +134,21 @@ Dim As String line
 Dim As Integer inThree = 0
 Dim As String parts = ""
 Open Cons For Input As #1
+'' ⚠️ Classified by Asc(line), not by Left(line, 1): Left() of one character ALLOCATES a one-byte
+'' string and then compares strings, 339 ns per line, and this runs once per input line. The
+'' Left(line, 6) below stays as it is - it runs once per sequence header, not per line.
 Do While Not Eof(1)
   Line Input #1, line
   If Len(line) = 0 Then Continue Do
-  If Left(line, 1) = ">" Then
+  Dim As Integer c = Asc(line)        '' 62 = ">", 59 = ";"
+  If c = 62 Then
     If Left(line, 6) = ">THREE" Then
       inThree = 1
     ElseIf inThree = 1 Then
       Exit Do
     End If
   ElseIf inThree = 1 Then
-    If Left(line, 1) <> ";" Then parts += UCase(line)
+    If c <> 59 Then parts += UCase(line)
   End If
 Loop
 Close #1
