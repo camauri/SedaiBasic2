@@ -87,6 +87,14 @@ type
     // "acc += tab[Asc(s[i])+1]" fused whole. Dialect-variant for the same reason as the two above:
     // only the rule for a start below 1 differs.
     StrAppendMapped: Pointer; // offset 208: @AotStrAppendMapped{Modern|Classic} (dstSlot, srcVal, tabVal, i)
+    // C6 native RECORD family. Same shape and the same reason as the C5 string primitives: without
+    // them New/Delete/RecMark ran through AotExecOne, and EmitHelperCall's flush+reload of every
+    // allocated register around each one cost more than the allocation itself (measured: `--aot`
+    // 358 ns per New+Delete pair against the interpreter's 194).
+    RecNew: Pointer;       // offset 216: @AotRecordNew (VMSelf, CtxObj, packedCounts, imm) -> handle
+    RecFree: Pointer;      // offset 224: @AotRecordFree (VMSelf, handle)
+    RecMarkPush: Pointer;  // offset 232: @AotRecMarkPush (CtxObj)
+    RecMarkPop: Pointer;   // offset 240: @AotRecMarkPop (CtxObj)
   end;
   PAotCtx = ^TAotCtx;
 
@@ -109,6 +117,10 @@ const
   AOTCTX_STRASCMID   = 192;
   AOTCTX_STRCONCATCHARAT = 200;
   AOTCTX_STRAPPENDMAPPED = 208;
+  AOTCTX_RECNEW      = 216;
+  AOTCTX_RECFREE     = 224;
+  AOTCTX_RECMARKPUSH = 232;
+  AOTCTX_RECMARKPOP  = 240;
   AOTCTX_CALLSUB   = 96;
   AOTCTX_STRLEFT   = 104;
   AOTCTX_STRRIGHT  = 112;
@@ -340,6 +352,7 @@ var
   GRecFloatOff: Integer = 0;
   GSharedRecOff: Integer = 0;
   GRecNativeState: Integer = -1;   // -1 unread, 0 off, 1 on
+  GRecAllocState: Integer = -1;    // C6 New/Delete/RecMark as leaf calls: -1 unread, 0 off, 1 on
   GNoThreads: Boolean = False;     // program creates no thread: the shared region cannot grow under us
   // A STRING array element can be reached natively (through AotStrAssign) only when an
   // out-of-range index cannot RAISE: the helper would throw across a compiled frame that is not
@@ -367,6 +380,23 @@ begin
     else GRecNativeState := 1;
   end;
   Result := (GRecNativeState = 1) and (GRecSize > 0);
+end;
+
+// C6: record ALLOCATION (New/Delete) and the block marks as native leaf calls instead of runtime
+// helper calls. Gated on its own so the two arrangements are A/B-able on ONE binary:
+// AOT_RECALLOC=0 puts the whole family back on AotExecOne (the historical behaviour).
+//
+// ⚠️ Independent of AotRecNative: that one needs the record LAYOUT (field access reads
+// Records[h].IntData[slot] by address), these primitives do not - they call the same VM routines
+// the interpreter calls, so they work with or without a layout.
+function AotRecAllocNative: Boolean;
+begin
+  if GRecAllocState < 0 then
+  begin
+    if GetEnvironmentVariable('AOT_RECALLOC') = '0' then GRecAllocState := 0
+    else GRecAllocState := 1;
+  end;
+  Result := GRecAllocState = 1;
 end;
 
 // AOT_DYNF gate, read once. Tri-state: 0 = AUTO (default: enable per region only where the
@@ -539,6 +569,9 @@ begin
     // Record FIELD access: Ctx.Records[handle].{Int,Float}Data[slot]. Native only when the layout
     // was supplied (AotSetRecordLayout) - AotIsNative checks that. A shared-region handle deopts.
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordStoreInt, ssaRecordStoreFloat,
+    // C6: record ALLOCATION as a leaf call to the VM's own AllocRecord/FreeSharedRecord
+    // (AotIsNative checks the gate and the operand shape).
+    ssaRecordNew, ssaRecordFree,
     // B2: 1-D int/float array element access + dim-0 bound queries (string-element
     // arrays are rejected by the classifier/prescan; multi-dim access goes through
     // ssaArrayIdxPush/Resolve, which are not in the set, so those regions bail).
@@ -704,6 +737,13 @@ begin
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordStoreInt, ssaRecordStoreFloat:
       // Needs the record layout AND a constant slot: the slot is baked into the displacement.
       Result := AotRecNative and (Ins.Src3.Kind = svkConstInt);
+    // C6: New needs an int register for the handle it produces (the three operands are
+    // compile-time slot counts, read from the BYTECODE instruction at emit time); Delete needs
+    // the handle in an int register. Any other shape falls back to the helper.
+    ssaRecordNew:
+      Result := AotRecAllocNative and (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = srtInt);
+    ssaRecordFree:
+      Result := AotRecAllocNative and (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt);
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
     ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
     ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrConcatCharAt, ssaStrAppendMapped, ssaStrChr, ssaStrInstr,
@@ -1043,6 +1083,8 @@ var
   OK: Boolean;
   HasRecMark, HasDeopt: Boolean;
   RecMarkRoutable: Boolean;             // every recmark op can go through the helper (see below)
+  HasNativeRecAlloc: Boolean;           // C6: the region allocates/releases records natively
+  RecMarkNative: Boolean;               // C6: emit the marks as leaf calls (never elided)
   ArrClassic: Boolean;                  // array OOB raises (CLASSIC / --bounds-check) -> guard + deopt
   LivenessOK: Boolean;                  // C1: the liveness fixpoint converged
   PeakLiveInt, PeakLiveFloat: Integer;  // C1: peak simultaneously-live values per bank
@@ -1829,12 +1871,25 @@ var
   end;
   // After a native leaf call: restore the base regs the call may have clobbered (r8 ctx, rsi
   // FloatRegs), then the caller-saved allocated registers (rbx is callee-saved and survives).
+  //
+  // 🐛 ...AND the array cache, which is NOT covered by any of the above. ACacheReg draws straight
+  // from IntPool, and IntPool's first three entries (R9/R10/R11) are CALLER-SAVED on Win64: a
+  // cached array base living in one of them does not survive the call, and unlike an allocated VM
+  // register it has no bank slot to be spilled to and reloaded from - only ReloadArrayCache can
+  // rebuild it. EmitHelperCall and EmitCallSubNative have always called it; this epilogue did not,
+  // which left every C5 string leaf call able to corrupt a cached array base in a region that has
+  // both. It stayed invisible because it needs the cache to land in one of those three registers
+  // AND an array access after the call; the C6 record calls, which stage the primitive in r11
+  // explicitly, hit it immediately (an access violation on the second record allocation).
+  // Reloading is idempotent - the values are re-read from ctx.ArrDesc - and costs nothing in a
+  // region with no cache (NACache = 0 returns at once).
   procedure StrCallEpilogue;
   begin
     FrameLoad(R8, SlotCtxSave);
     if not RsiIsPool then FrameLoad(RSI, SlotFltSave);   // float-free region: rsi carries a VALUE
     ReloadVolatiles;
     ReloadResidentF; ReloadResidentI;
+    ReloadArrayCache;
   end;
 
   // C5: bcCmp*String lowered to a leaf call to AotStrCmp. Kind 0=Eq 1=Ne 2=Lt 3=Gt. The two
@@ -1949,6 +2004,62 @@ var
     Lea(ABI_ARG0, RAX, LongWord(d) * 8);                  // arg0 = &StringRegs[dest] (accumulator)
     MovLoad(ABI_ARG1, RAX, LongWord(s) * 8);              // arg1 = StringRegs[src] (value)
     MovLoad(ABI_ARG2, RAX, LongWord(t) * 8);              // arg2 = StringRegs[tab] (clobbers r8)
+    E.EmitBytes([$41, $FF, $D3]);                         // call r11
+    StrCallEpilogue;
+  end;
+
+  // C6: IntRegs[dest] := AotRecordNew(VMSelf, CtxObj, packedCounts, imm). The three slot counts
+  // are NOT registers - the bytecode compiler puts them in Src1/Src2/Immediate of the bytecode
+  // instruction - so they are baked as immediates here and the call takes no bank operand at all.
+  // Src1/Src2 pack into one argument because Win64 has four argument registers and New needs five
+  // values. Always completes natively (allocation cannot hand the invocation back) - no deopt.
+  procedure EmitRecordNew(apc: Integer);
+  var
+    d: Integer;
+    Bc: TBytecodeInstruction;
+    Counts: Int64;
+  begin
+    d := IReg(Cur.Dest); if not OK then Exit;
+    Bc := Prog.GetInstruction(apc);
+    Counts := Int64(LongWord(Bc.Src1)) or (Int64(LongWord(Bc.Src2)) shl 32);
+    SpillVolatiles;
+    // The primitive is staged in r11 (volatile, never an argument) BEFORE arg2 clobbers r8 on
+    // Win64 - r8 IS the context register, and the address lives inside it. Same lesson as C5.
+    E.MemOp([$4D, $8B], R11, R8, AOTCTX_RECNEW);          // r11 = primitive
+    E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);     // arg0 = VMSelf
+    E.MemOp([$49, $8B], ABI_ARG1, R8, AOTCTX_CTXOBJ);     // arg1 = CtxObj (the active context)
+    MovImm64(ABI_ARG2, Counts);                           // arg2 = intSlots | floatSlots<<32
+    MovImm64(ABI_ARG3, Bc.Immediate);                     // arg3 = strSlots | typeId<<32 | shared<<48
+    E.EmitBytes([$41, $FF, $D3]);                         // call r11
+    StrCallEpilogue;
+    IStore(d, RAX);                                       // rax = handle -> int Dest
+  end;
+
+  // C6: AotRecordFree(VMSelf, IntRegs[src]) - DELETE p. The handle is read with the SPILLED
+  // accessor: after SpillVolatiles a caller-saved allocated register lives in the bank, not in
+  // the machine register a plain load would read.
+  procedure EmitRecordFree;
+  var s: Integer;
+  begin
+    s := IReg(Cur.Src1); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$4D, $8B], R11, R8, AOTCTX_RECFREE);         // r11 = primitive (before any clobber)
+    E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);     // arg0 = VMSelf
+    ILoadArgSpilled(ABI_ARG1, s);                         // arg1 = the handle
+    E.EmitBytes([$41, $FF, $D3]);                         // call r11
+    StrCallEpilogue;
+  end;
+
+  // C6: the block record marks as leaf calls - AotRecMarkPush/Pop(CtxObj). Two context fields and
+  // a counter; the point is what they do NOT do compared with the helper route (no flush of the
+  // allocated registers, no interpreter dispatch, no reload, no PC comparison).
+  procedure EmitRecMarkNative(IsPush: Boolean);
+  var Off: Integer;
+  begin
+    if IsPush then Off := AOTCTX_RECMARKPUSH else Off := AOTCTX_RECMARKPOP;
+    SpillVolatiles;
+    E.MemOp([$4D, $8B], R11, R8, Off);                    // r11 = primitive
+    E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_CTXOBJ);     // arg0 = CtxObj
     E.EmitBytes([$41, $FF, $D3]);                         // call r11
     StrCallEpilogue;
   end;
@@ -3279,8 +3390,31 @@ var
             // reclamation is deferred to FramePop). With a deopt hazard they are routed
             // through the helper instead, so the mark stack stays balanced no matter where
             // the interpreter takes over - decided after the scan, when HasDeopt is final.
+            // C6: with the gate on they instead become a two-instruction leaf call, which is
+            // balanced by construction and costs a fraction of the helper round trip.
             HasRecMark := True;
             if not AotHelperRoutable(Prog, o) then RecMarkRoutable := False;
+          end;
+          // C6: record allocation as a leaf call. Like the string primitives it needs a
+          // call-ready frame but always completes natively - no deopt hazard. Only the int
+          // operands are counted: New's three "sources" are compile-time slot counts read from
+          // the bytecode instruction at emit time, not registers.
+          ssaRecordNew, ssaRecordFree:
+          begin
+            if not AotIsNative(SSAProg, Ins) then NoteHelperOp
+            else
+            begin
+              HasHelperCall := True;
+              HasNativeRecAlloc := True;
+              if Ins.OpCode = ssaRecordNew then
+              begin
+                CountVal(Ins.Dest);                   // the handle
+                if Prog.GetSsaPc(o) < 0 then
+                  Fail('no-pc-recnew');               // needs the bytecode Src1/Src2/Immediate
+              end
+              else
+                CountVal(Ins.Src1);                   // the handle to release
+            end;
           end;
           ssaJump: ;
           ssaJumpIfZero, ssaJumpIfNotZero: CountVal(Ins.Src1);
@@ -3426,11 +3560,18 @@ var
     // which also needs a call-ready frame. B3 made this the common case (every region whose
     // loop body contains a call carries marks AND a deopt hazard - the old hard bail here
     // would have kept MAIN uncompilable).
-    if HasRecMark and HasDeopt then
+    // C6: when the record family is native the marks become a leaf call - always emitted (never
+    // elided) as soon as the region allocates records natively, so reclamation stays exactly as
+    // eager as it is today. Before C6 such a region ALWAYS carried a helper (New itself was one),
+    // hence always a deopt hazard, hence marks that ran: eliding them here instead would defer
+    // every temporary to FramePop and change how much memory a hot allocating loop holds.
+    RecMarkNative := HasRecMark and AotRecAllocNative and (HasDeopt or HasNativeRecAlloc);
+    if HasRecMark and HasDeopt and not RecMarkNative then
     begin
       if not RecMarkRoutable then Fail('recmark-route');
       HasHelperCall := True;
     end;
+    if RecMarkNative then HasHelperCall := True;    // a leaf call still needs a call-ready frame
     // The region's last instruction must leave natively (no fall-through off the end).
     Blk := SSAProg.Blocks[Region.LastBlock];
     if Blk.Instructions.Count = 0 then Fail('empty-last-block')
@@ -4158,11 +4299,23 @@ var
       // strand the interpreter against an unbalanced mark stack. Same HasDeopt the prescan
       // saw - the two must agree.
       ssaRecMarkPush, ssaRecMarkPop:
-        if HasDeopt then
+        // C6 first: a leaf call, decided by the prescan (RecMarkNative). Otherwise the historical
+        // two-way choice - helper when a deopt could strand the interpreter against an unbalanced
+        // mark stack, elided when the whole invocation is native.
+        if RecMarkNative then
+          EmitRecMarkNative(Cur.OpCode = ssaRecMarkPush)
+        else if HasDeopt then
         begin
           apc := NeedPC; if not OK then Exit;
           EmitHelperCall(apc);
         end;
+
+      ssaRecordNew:
+      begin
+        apc := NeedPC; if not OK then Exit;   // the slot counts live in the bytecode instruction
+        EmitRecordNew(apc);
+      end;
+      ssaRecordFree: EmitRecordFree;
 
 
       ssaLoadConstInt:
@@ -4517,6 +4670,7 @@ begin
   ArrClassic := not AllowUnsafe;
   HasRecMark := False; HasDeopt := False; HasHelperCall := False; NHelperCalls := 0;
   RecMarkRoutable := True;
+  HasNativeRecAlloc := False; RecMarkNative := False;
   MaxIReg := -1; MaxFReg := -1; MaxArrId := -1;
   SetLength(IUse, 16); SetLength(FUse, 16); SetLength(AUse, 8);
   NFix := 0; NIAlloc := 0; NFAlloc := 0;

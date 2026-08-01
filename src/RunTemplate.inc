@@ -175,6 +175,11 @@ begin
       LocalAotCtx.StrAppendMapped := @AotStrAppendMappedModern
     else
       LocalAotCtx.StrAppendMapped := @AotStrAppendMappedClassic;
+    // C6: the record family. Dialect-blind (allocation has no dialect), so one flavor each.
+    LocalAotCtx.RecNew := @AotRecordNew;
+    LocalAotCtx.RecFree := @AotRecordFree;
+    LocalAotCtx.RecMarkPush := @AotRecMarkPush;
+    LocalAotCtx.RecMarkPop := @AotRecMarkPop;
   end
   else
     AotFuncs := nil;

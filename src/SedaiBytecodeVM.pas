@@ -8070,6 +8070,68 @@ begin
   end;
 end;
 
+{ ===== C6: the RECORD family as native leaf calls =====
+
+  These four are the record counterpart of the C5 string primitives, and they exist for the same
+  measured reason. Without a native lowering, New/Delete/RecMark went through AotExecOne, and
+  EmitHelperCall wraps EVERY such instruction in a full flush of the allocated registers plus a
+  full reload afterwards. binary-trees pays that five times per node (two mark pushes, the New,
+  the Delete, a mark pop), which is why `--aot` measured 358 ns per New+Delete pair against the
+  interpreter's 194: the AOT made calls 3x faster and gave it all back on the allocator.
+
+  Each is an EXACT transcription of its RunTemplate arm - the interpreter stays the definition of
+  the behaviour, this is only a cheaper way to reach it. None of them can hand the invocation back
+  to the interpreter, so the call sites carry no deopt hazard (unlike a helper call).
+
+  ⚠️ The counts travel PACKED because Win64 has four argument registers and New needs five values:
+  Src1/Src2 of the bytecode instruction are compile-time slot counts, not registers (see the
+  ssaRecordNew override in SedaiBytecodeCompiler), so the emitter bakes them as one immediate. }
+
+function AotRecordNew(VMSelf, CtxObj: Pointer; Counts, Imm: PtrInt): PtrInt; cdecl;
+// Counts = IntSlots or (FloatSlots shl 32); Imm is the bytecode Immediate verbatim:
+// string slots in bits 0..15, type id in bits 32..47, "allocate in the shared region" in bit 48.
+var
+  IntC, FloatC, StrC, TypeId: Integer;
+begin
+  IntC   := Integer(Counts and $FFFFFFFF);
+  FloatC := Integer((Counts shr 32) and $FFFFFFFF);
+  StrC   := Integer(Imm and $FFFF);
+  TypeId := Integer((Imm shr 32) and $FFFF);
+  if (Imm shr 48) and 1 <> 0 then
+    Result := PtrInt(TBytecodeVM(VMSelf).AllocSharedRecord(IntC, FloatC, StrC, TypeId))
+  else
+    Result := PtrInt(TBytecodeVM(VMSelf).AllocRecord(TExecutionContext(CtxObj), IntC, FloatC, StrC, TypeId));
+end;
+
+procedure AotRecordFree(VMSelf: Pointer; Handle: PtrInt); cdecl;
+begin
+  TBytecodeVM(VMSelf).FreeSharedRecord(Handle);
+end;
+
+procedure AotRecMarkPush(CtxObj: Pointer); cdecl;
+var
+  C: TExecutionContext;
+begin
+  C := TExecutionContext(CtxObj);
+  if C.BlockRecMarkTop >= Length(C.BlockRecMark) then
+    SetLength(C.BlockRecMark, C.BlockRecMarkTop + 256);
+  C.BlockRecMark[C.BlockRecMarkTop] := C.RecordCount;
+  Inc(C.BlockRecMarkTop);
+end;
+
+procedure AotRecMarkPop(CtxObj: Pointer); cdecl;
+var
+  C: TExecutionContext;
+begin
+  C := TExecutionContext(CtxObj);
+  if C.BlockRecMarkTop > 0 then
+  begin
+    Dec(C.BlockRecMarkTop);
+    if C.BlockRecMark[C.BlockRecMarkTop] < C.RecordCount then
+      C.RecordCount := C.BlockRecMark[C.BlockRecMarkTop];
+  end;
+end;
+
 const
   // B3: cap on native-to-native call nesting. Each level consumes real machine stack (the
   // callee's native frame plus this Pascal frame); the interpreter's call stack lives on the
