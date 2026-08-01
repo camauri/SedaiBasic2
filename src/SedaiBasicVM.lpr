@@ -1478,13 +1478,8 @@ begin
           if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
             WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunConcatCharFusion: ', E.Message);
         end;
-        // ...and then the whole "acc += tab[Asc(Mid(s,i,1))+1]" into ONE instruction. It CONSUMES
-        // what the pass above produces, so it has to run after it.
-        try SSAProgram.RunAppendMappedFusion;
-        except on E: Exception do
-          if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
-            WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunAppendMappedFusion: ', E.Message);
-        end;
+        // ⚠️ RunAppendMappedFusion is NOT here any more - it runs AFTER register allocation, see the
+        // call further down and the reason there.
         // Last of all: needs the final shape of the concatenations, including anything the fusions
         // above rewrote.
         try SSAProgram.RunConcatDeadSourceMark;
@@ -1528,6 +1523,29 @@ begin
       end;
       if OptStats then TimeRegAlloc := PassTimer.ElapsedMilliseconds;
       PassMark('Reg Alloc');
+
+      // "acc += tab[Asc(Mid(s,i,1))+1]" into ONE instruction - AFTER register allocation, on purpose.
+      //
+      // ⭐ This is the whole reason the fusion can exist at all. The fused instruction has to name FIVE
+      // values - accumulator out, accumulator in, source string, table, index - and a TSSAInstruction
+      // has four operand slots, so with the source in Src1 the incoming accumulator is named by no
+      // operand. Run BEFORE allocation, that is fatal: PHI elimination and the allocator cannot see
+      // the accumulator arriving, the copies closing the loop-carried PHI are dropped, and a reset of
+      // the accumulator lands on a different register from the one the append grows - the miscompile
+      // that kept this switched off (job/tests/bas/bug_appendmapped_aot.bas).
+      //
+      // Run HERE the problem does not arise: the registers are already PHYSICAL, so the incoming and
+      // outgoing accumulator ARE the same register and Dest names both. Nothing renames anything after
+      // this point, and both consumers of the SSA - the bytecode compiler and the AOT, which compiles
+      // from SSA and has a native helper for this opcode - see the fused form.
+      //
+      // ⚠️ It still CONSUMES what RunConcatCharFusion produces, and that pass runs before allocation.
+      // That is fine: allocation rewrites the operands of ssaStrConcatCharAt, it does not remove it.
+      try SSAProgram.RunAppendMappedFusion;
+      except on E: Exception do
+        if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+          WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunAppendMappedFusion: ', E.Message);
+      end;
       {$ELSE}
       {$IFDEF DEBUG_REGALLOC}
       if DebugRegAlloc then

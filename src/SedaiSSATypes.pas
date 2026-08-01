@@ -2078,6 +2078,14 @@ var
     end;
   end;
 
+  // STRFUSE_DIAG=1 says which guard refused a candidate. The guards are deliberately conservative and
+  // this pass runs post-allocation, where "why did it not fire" is the question it always gets.
+  procedure Say(Pos: Integer; const Why: string);
+  begin
+    if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+      WriteLn(ErrOutput, '[APPENDMAP] candidate at ', Pos, ': ', Why);
+  end;
+
   // Does anything in (From, To) write the register named by V?
   function WrittenBetween(Blk: TSSABasicBlock; const V: TSSAValue; FromPos, ToPos: Integer): Boolean;
   var j: Integer;
@@ -2086,6 +2094,93 @@ var
     if V.Kind <> svkRegister then Exit;
     for j := FromPos + 1 to ToPos - 1 do
       if WritesSSAReg(TSSAInstruction(Blk.Instructions[j]), V.RegType, V.RegIndex) then Exit(True);
+  end;
+
+  // Can any READ of INT register RegIdx observe a value this pass is about to stop computing?
+  //
+  // ⭐ This replaces the single-def/single-use test the pass used before it was moved AFTER register
+  // allocation. That test counted (register, VERSION) pairs - the right question in real SSA, the
+  // wrong one here: with physical registers "T = T + 1" DEFINES T twice, so it always answered no.
+  //
+  // ⛔ And "nothing else in the program touches T" is too blunt, which cost a measurement to find out:
+  // the allocator gives the SAME physical temporary to every site with this shape, so in the real
+  // reverse-complement the two occurrences both use R21 and each vetoed the other. The fusion fired on
+  // a one-site probe and on nothing else.
+  //
+  // The question that is actually needed: every read of T must be immediately preceded by the
+  // definition that feeds it, INSIDE a triple of this same shape. Then no read can see a value from
+  // anywhere else - each triple redefines T before reading it - and every such triple is one this pass
+  // is fusing, so what it stops computing is never observed. Reads BEFORE a triple's Asc see an older
+  // value and do not matter; this only has to rule out a read that escapes the shape.
+  // Within one block, is RegIdx read after FromPos before anything redefines it? Those reads are the
+  // only ones that could observe the value the fusion stops computing - anything further out is
+  // covered by the "every block defines before it reads" rule above.
+  function IntRegReadAfter(RegIdx: Integer; B: TSSABasicBlock; FromPos: Integer): Boolean;
+  var q: Integer;
+      D: TSSAInstruction;
+      function IsR(const V: TSSAValue): Boolean; inline;
+      begin
+        Result := (V.Kind = svkRegister) and (V.RegType = srtInt) and (V.RegIndex = RegIdx);
+      end;
+  begin
+    Result := True;
+    for q := FromPos + 1 to B.Instructions.Count - 1 do
+    begin
+      D := TSSAInstruction(B.Instructions[q]);
+      if IsR(D.Src1) or IsR(D.Src2) or IsR(D.Src3) then Exit;
+      if IsR(D.Dest) then Break;    // redefined: everything after sees the new value
+    end;
+    Result := False;
+  end;
+
+  function IntRegReadOnlyInsideTriples(RegIdx: Integer): Boolean;
+  var
+    bb, jj, kk: Integer;
+    B2: TSSABasicBlock;
+    I2, Prev: TSSAInstruction;
+
+    function IsT(const V: TSSAValue): Boolean; inline;
+    begin
+      Result := (V.Kind = svkRegister) and (V.RegType = srtInt) and (V.RegIndex = RegIdx);
+    end;
+
+    // The instruction whose definition of T actually reaches position Before, or nil when the value
+    // arrives from a predecessor block - which this pass will not reason about, so it refuses.
+    // ⚠️ Adjacency is NOT the test: the triple's three instructions are consecutive in the BYTECODE
+    // but not necessarily in the SSA list, and requiring jj-1 here made the fusion refuse the real
+    // reverse-complement while still firing on a one-site probe.
+    function NearestDefOfT(B: TSSABasicBlock; Before, R: Integer): TSSAInstruction;
+    var q: Integer;
+        D: TSSAInstruction;
+    begin
+      Result := nil;
+      for q := Before - 1 downto 0 do
+      begin
+        D := TSSAInstruction(B.Instructions[q]);
+        if (D.Dest.Kind = svkRegister) and (D.Dest.RegType = srtInt) and (D.Dest.RegIndex = R) then
+          Exit(D);
+      end;
+    end;
+
+  begin
+    Result := False;
+    for bb := 0 to Blocks.Count - 1 do
+    begin
+      B2 := TSSABasicBlock(Blocks[bb]);
+      for jj := 0 to B2.Instructions.Count - 1 do
+      begin
+        I2 := TSSAInstruction(B2.Instructions[jj]);
+        // Src2 and the PHI sources are never part of the shape: a read there escapes it.
+        if IsT(I2.Src2) then Exit;
+        for kk := 0 to High(I2.PhiSources) do
+          if IsT(I2.PhiSources[kk].Value) then Exit;
+        // Any block must DEFINE T before it reads it: then no read anywhere consumes a value
+        // flowing in from a predecessor, and reasoning inside one block is enough.
+        if IsT(I2.Src1) or IsT(I2.Src2) or IsT(I2.Src3) then
+          if NearestDefOfT(B2, jj, RegIdx) = nil then Exit;
+      end;
+    end;
+    Result := True;
   end;
 
 begin
@@ -2191,17 +2286,32 @@ begin
       begin Inc(i); Continue; end;
 
       AddAt := DefPosBefore(Blk, Ins.Src3, i);
-      if AddAt < 0 then begin Inc(i); Continue; end;
+      if AddAt < 0 then begin Say(i, 'no def of the index in this block'); Inc(i); Continue; end;
       Add := TSSAInstruction(Blk.Instructions[AddAt]);
-      if (Add.OpCode <> ssaAddInt) or (not IsOne(Add.Src2)) or
-         (not SingleDefSingleUse(Add.Dest)) then begin Inc(i); Continue; end;
+      if Add.OpCode <> ssaAddInt then begin Say(i, 'the index is not defined by AddInt'); Inc(i); Continue; end;
+      if not IsOne(Add.Src2) then begin Say(i, 'the AddInt addend is not the constant 1'); Inc(i); Continue; end;
 
       AscAt := DefPosBefore(Blk, Add.Src1, AddAt);
-      if AscAt < 0 then begin Inc(i); Continue; end;
+      if AscAt < 0 then begin Say(i, 'no def of the AddInt source in this block'); Inc(i); Continue; end;
       Asc := TSSAInstruction(Blk.Instructions[AscAt]);
-      if (Asc.OpCode <> ssaStrAscMid) or (not SingleDefSingleUse(Asc.Dest)) or
-         (Asc.Src1.Kind <> svkRegister) or (Asc.Src1.RegType <> srtString) or
-         (not IsOne(Asc.Src3)) then begin Inc(i); Continue; end;
+      if Asc.OpCode <> ssaStrAscMid then begin Say(i, 'the AddInt source is not StrAscMid'); Inc(i); Continue; end;
+      if (Asc.Src1.Kind <> svkRegister) or (Asc.Src1.RegType <> srtString) then
+        begin Say(i, 'the AscMid source is not a string register'); Inc(i); Continue; end;
+      if not IsOne(Asc.Src3) then begin Say(i, 'the AscMid length is not the constant 1'); Inc(i); Continue; end;
+
+      // Post-allocation the three must all name the SAME physical int register, and every read of it
+      // must sit inside a triple of this shape - that is what makes dropping the producers unobservable.
+      if (Asc.Dest.Kind <> svkRegister) or (Asc.Dest.RegType <> srtInt) then
+        begin Say(i, 'the AscMid destination is not an int register'); Inc(i); Continue; end;
+      if (Add.Dest.Kind <> svkRegister) or (Add.Dest.RegIndex <> Asc.Dest.RegIndex) or
+         (Add.Src1.RegIndex <> Asc.Dest.RegIndex) then
+        begin Say(i, 'the AddInt does not read and write the AscMid register'); Inc(i); Continue; end;
+      if not IntRegReadOnlyInsideTriples(Asc.Dest.RegIndex) then
+        begin Say(i, 'a block reads the int register without defining it first'); Inc(i); Continue; end;
+      // ...and, in THIS block, nothing may read it after the append before it is redefined: those are
+      // the only reads that could observe the value the fusion stops computing.
+      if IntRegReadAfter(Asc.Dest.RegIndex, Blk, i) then
+        begin Say(i, 'the int register is read again after the append'); Inc(i); Continue; end;
 
       // Nothing in between may write what the fused instruction will read at the concatenation's
       // position: the source string, the table, or the index.
