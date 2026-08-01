@@ -254,13 +254,22 @@ function Resolve-NativeLibs {
     # present under their MinGW names (libgmp-10.dll, libpcre2-8-0.dll), so find_library returns
     # None, CDLL(None) raises, and both benchmarks lost their yardstick to a naming convention.
     #
-    # So: find them wherever they are, stage a copy under the SPELLING ctypes wants, and put that
-    # directory on PATH. Verified self-sufficient - the staged copies load with nothing else of
-    # their origin on PATH. Nothing is added to the repository: .temp is scratch, which also keeps
-    # the licensing question of shipping GMP/PCRE2 binaries from arising at all.
+    # So: find them wherever they are, keep a copy under the SPELLING ctypes wants in the Python
+    # runtime directory next to the other runtimes, and put that directory on PATH. Verified
+    # self-sufficient - the copies load with nothing else of their origin on PATH.
+    #
+    # benchmarks\runtime\python is the durable home (the harness populates it on the first run and
+    # finds it there afterwards, so a machine is provisioned once). Nothing reaches the repository:
+    # .gitignore excludes *.dll and *.exe everywhere, which is why the Lua runtime beside it is not
+    # tracked either - each machine provides its own binaries.
+    #
+    # ⚠️ Lua's two missing pieces are MODULES (bn, rex_pcre2), not these libraries. When they turn
+    # up they go in benchmarks\runtime\lua: that directory is already first in Lua's package.cpath,
+    # so no PATH work is needed there - only rex_pcre2.dll's own dependency on pcre2-8.dll, which
+    # Windows resolves from the directory of the executable.
     #
     # Not found = the two columns stay n/a exactly as before. This only ever ADDS a yardstick.
-    $stage = Join-Path $TempDir 'native'
+    $stage = Join-Path $PSScriptRoot 'runtime\python'
     $wanted = @(
         @{ As = 'gmp.dll';      Names = @('gmp.dll', 'libgmp-10.dll') }
         @{ As = 'pcre2-8.dll';  Names = @('pcre2-8.dll', 'libpcre2-8-0.dll') }
