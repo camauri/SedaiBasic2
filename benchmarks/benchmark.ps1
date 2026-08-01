@@ -552,8 +552,21 @@ function Get-ArmLabel {
 function Get-BadArms {
     # The arms under test are the SedaiBasic2 ones; Python and Lua are yardsticks. A yardstick that
     # cannot run here, or that disagrees with the designated reference, is a fact about that runtime
-    # on this machine - Lua's mandelbrot opens stdout in text mode on Windows and mangles the binary
-    # PBM, for instance. It is reported, but it does not fail the benchmark, which verifies sb.
+    # on this machine. It is reported, but it does not fail the benchmark, which verifies sb.
+    #
+    # The standing example is Lua's mandelbrot, and the cause was pinned byte by byte (2026-08-01).
+    # TWO Windows text-mode artifacts, neither of them fixable from the .lua:
+    #   1. stdout is in TEXT mode, so every 0x0A of the binary PBM is written as 0x0D 0x0A - visible
+    #      from the header (`P4\r\n1000 1000\r\n`) and first hit in the body at byte 15966;
+    #   2. the CLBG implementation is the parallel one: the parent collects its children through
+    #      io.popen and reads THOSE pipes in text mode too, where 0x1A is the DOS end-of-file. The
+    #      body matches the reference exactly up to byte 44909 - which is precisely the first 0x1A
+    #      in the data - and then loses the rest: 103 430 bytes of real content against 125 013,
+    #      827 rows of 1000.
+    # Undoing (1) is possible, undoing (2) is not: the bytes are gone. And the script cannot avoid
+    # either - stdout's mode is fixed by the CRT at process start, and this Lua 5.4.2 build rejects
+    # io.popen(cmd, "rb") ("invalid mode"). So the output is not comparable on this platform; the
+    # TIME still is, which is why the table prints it with a marker instead of hiding it behind DIFF.
     param([hashtable]$Result)
     return @($Result.Arms.Keys | Where-Object {
         (-not $Result.Arms[$_].IsReference) -and ($Result.Arms[$_].Verdict -in @('DIFF','FAIL'))
@@ -597,7 +610,14 @@ function Show-ResultsTable {
             if (-not $arm)                   { $row += ("{0,11}" -f '-') }
             elseif ($arm.Verdict -eq 'N/A')  { $row += ("{0,11}" -f 'n/a') }
             elseif ($arm.Verdict -eq 'FAIL') { $row += ("{0,11}" -f 'FAIL') }
-            elseif ($arm.Verdict -eq 'DIFF') { $row += ("{0,11}" -f 'DIFF') }
+            # A YARDSTICK whose output the platform mangles still produced a valid TIME: print it
+            # with a marker rather than hiding it behind DIFF, or the row loses the only reference
+            # point it has (see Get-BadArms for the mandelbrot/Lua case, diagnosed byte by byte).
+            # An arm UNDER TEST that disagrees is a different thing entirely and stays DIFF.
+            elseif ($arm.Verdict -eq 'DIFF') {
+                if ($arm.IsReference) { $row += ("{0,11}" -f ((Format-Ms $arm.Ms) + '*')) }
+                else                  { $row += ("{0,11}" -f 'DIFF') }
+            }
             else                             { $row += ("{0,11}" -f (Format-Ms $arm.Ms)) }
         }
         $status = Get-BenchStatus $r
@@ -608,6 +628,7 @@ function Show-ResultsTable {
     Write-Host ""
     Write-Line "MATCH = every arm's output equals the reference   NO REF = nothing to compare against" 'DarkGray'
     Write-Line "CHECK = at least one arm disagreed or failed     n/a = that runtime cannot run it here" 'DarkGray'
+    Write-Line "*     = yardstick timed, but its output is not comparable on this platform (see the report)" 'DarkGray'
 }
 
 function Write-Report {
@@ -671,7 +692,10 @@ function Write-Report {
             if (-not $arm)                   { $row += " - |" }
             elseif ($arm.Verdict -eq 'N/A')  { $row += " n/a |" }
             elseif ($arm.Verdict -eq 'FAIL') { $row += " FAIL |" }
-            elseif ($arm.Verdict -eq 'DIFF') { $row += " DIFF |" }
+            elseif ($arm.Verdict -eq 'DIFF') {
+                if ($arm.IsReference) { $row += " " + ("{0:F0}" -f $arm.Ms) + "\* |" }   # timed, output not comparable
+                else                  { $row += " DIFF |" }
+            }
             else                             { $row += " " + ("{0:F0}" -f $arm.Ms) + " |" }
         }
         $row += " $(Get-BenchStatus $r) |"
@@ -722,7 +746,12 @@ function Write-Report {
             default  { "**check** - " + ((Get-BadArms $r | ForEach-Object { "$_ = $($r.Arms[$_].Verdict)" }) -join ', ') }
         }
         if ($na.Count -gt 0)  { $out += "; not runnable here: $($na -join ', ')" }
-        if ($odd.Count -gt 0) { $out += "; **$($odd -join ', ') disagrees with the reference** (a fact about that runtime, not about sb)" }
+        if ($odd.Count -gt 0) {
+            $out += "; **$($odd -join ', ') timed but its output is not comparable here** (marked \* in the table)"
+            if ($r.Name -eq 'mandelbrot') {
+                $out += " - Lua writes the binary PBM through a TEXT-mode stdout (0x0A becomes 0x0D 0x0A) and the parallel implementation reads its io.popen children in text mode too, where 0x1A is the DOS end-of-file: the body matches byte for byte up to the first 0x1A and then loses the rest. Not fixable from the script"
+            }
+        }
         [void]$md.AppendLine("| $($r.Name) | $ref | $out |")
     }
     [void]$md.AppendLine()
