@@ -398,16 +398,18 @@ begin
   Result := GDivConstState = 1;
 end;
 
-{ ⛔ NEGATIVO STRUTTURALE, misurato il 1 ago 2026: NON si puo' recuperare il divisore costante
-  QUI. Il primo tentativo di C7 fu un'analisi per-registro sull'intero programma ("un registro le cui
-  definizioni sono tutte la stessa costante vale quella costante"): sound, e inutile. Su pidigits ha
-  trovato 11 registri su 401 e ZERO siti di divisione, perche' dopo l'allocazione il numero di
-  registro non identifica piu' un valore -- quello che porta 1000000000 e' anche scritto da un
-  LoadConstInt 10, un ArrayLoad, due CopyInt e una SubInt altrove. La costante esiste solo PRIMA
-  dell'allocazione: la stampa TSSAProgram.AnnotateDivByConst sull'istruzione, e qui si legge
-  dall'Immediate. ⭐ La lezione: un'analisi che gira dopo che l'informazione e' stata cancellata non
-  e' conservativa, e' cieca -- e il cronometro non lo dice (il primo giro lesse -1%, cioe' rumore,
-  con zero siti trasformati; l'ha detto il CONTATORE). }
+{ ⛔ STRUCTURAL NEGATIVE, measured 2026-08-01: the constant divisor CANNOT be recovered HERE.
+  C7's first attempt was a whole-program per-register analysis ("a register whose definitions are
+  all the same constant holds that constant"): sound, and useless. On pidigits it found 11 registers
+  out of 401 and ZERO division sites, because after register allocation the register number no
+  longer identifies a value - the one carrying 1000000000 is also written by a LoadConstInt 10, an
+  ArrayLoad, two CopyInt and a SubInt elsewhere in the program. The constant only exists BEFORE
+  allocation: TSSAProgram.AnnotateDivByConst stamps it on the instruction and it is read back here
+  from the Immediate.
+  ⭐ The lesson: an analysis that runs after the information has been erased is not conservative,
+  it is BLIND - and the stopwatch does not say so. The first run measured -1%, i.e. noise, which is
+  exactly how a transformation that never fires reads; what told the truth was the COUNTER below
+  ("0 site(s) lowered"). }
 
 { Magic number for a SIGNED 64-bit division by d (|d| >= 2), Hacker's Delight figure 10-4.
   Returns M and the post-shift s such that
