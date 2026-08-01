@@ -247,6 +247,54 @@ function Resolve-Runtimes {
     }
 }
 
+function Resolve-NativeLibs {
+    # Two of the Python references are thin ctypes wrappers over a C library - pidigits over GMP,
+    # regex-redux over PCRE2 - and both resolve it with ctypes.util.find_library(), which on Windows
+    # searches PATH for a file named EXACTLY "gmp.dll" / "pcre2-8.dll". The libraries are commonly
+    # present under their MinGW names (libgmp-10.dll, libpcre2-8-0.dll), so find_library returns
+    # None, CDLL(None) raises, and both benchmarks lost their yardstick to a naming convention.
+    #
+    # So: find them wherever they are, stage a copy under the SPELLING ctypes wants, and put that
+    # directory on PATH. Verified self-sufficient - the staged copies load with nothing else of
+    # their origin on PATH. Nothing is added to the repository: .temp is scratch, which also keeps
+    # the licensing question of shipping GMP/PCRE2 binaries from arising at all.
+    #
+    # Not found = the two columns stay n/a exactly as before. This only ever ADDS a yardstick.
+    $stage = Join-Path $TempDir 'native'
+    $wanted = @(
+        @{ As = 'gmp.dll';      Names = @('gmp.dll', 'libgmp-10.dll') }
+        @{ As = 'pcre2-8.dll';  Names = @('pcre2-8.dll', 'libpcre2-8-0.dll') }
+    )
+    $dirs = @(
+        (Join-Path $env:ProgramFiles 'Git\mingw64\bin')
+        'C:\msys64\mingw64\bin'
+        'C:\msys64\ucrt64\bin'
+    ) + ($env:PATH -split ';')
+    $found = @()
+    foreach ($w in $wanted) {
+        $dst = Join-Path $stage $w.As
+        if (Test-Path $dst) { $found += $w.As; continue }
+        foreach ($d in $dirs) {
+            if ([string]::IsNullOrWhiteSpace($d) -or -not (Test-Path $d)) { continue }
+            $hit = $null
+            foreach ($n in $w.Names) {
+                $p = Join-Path $d $n
+                if (Test-Path $p) { $hit = $p; break }
+            }
+            if ($hit) {
+                if (-not (Test-Path $stage)) { [void](New-Item -ItemType Directory -Path $stage -Force) }
+                Copy-Item $hit $dst -Force
+                $found += $w.As
+                break
+            }
+        }
+    }
+    if ($found.Count -gt 0) {
+        $env:PATH = "$stage;$($env:PATH)"
+        Write-Line ("native libs for the ctypes references: {0}" -f ($found -join ', ')) 'DarkGray'
+    }
+}
+
 # ============================================================================
 #  EXECUTION
 # ============================================================================
@@ -823,6 +871,8 @@ Write-Line "Size:   $(if ($Quick) { 'QUICK (reduced N)' } else { 'STANDARD (the 
 Write-Line "Runs:   best of $Runs, cooldown $($Script:ActualCooldown)s"
 Write-Line "Python: $(if ($Script:PythonExe) { $Script:PythonExe } else { '(not found - Python arms and references unavailable)' })"
 Write-Line "Lua:    $(if ($Script:LuaExe) { $Script:LuaExe } else { '(not found - Lua arms and references unavailable)' })"
+if (-not (Test-Path $TempDir)) { [void](New-Item -ItemType Directory -Path $TempDir -Force) }
+Resolve-NativeLibs
 
 if (-not $Quick -and -not $Yes) {
     Write-Host ""
