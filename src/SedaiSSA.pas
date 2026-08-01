@@ -9657,6 +9657,7 @@ var
   TextReg, StartReg, SrcReg, SrcCapReg, MidSrcReg: TSSAValue;
   LenTextReg, AvailTmpReg, AvailReg, OneReg, StartM1Reg, PrefixReg: TSSAValue;
   LenMidReg, SuffixStartReg, SuffixReg, R1Reg, ResultReg: TSSAValue;
+  TgtVarReg: TSSAValue;
   TmpName: string;
   HasLen: Boolean;
   NoneV: TSSAValue;
@@ -9691,6 +9692,37 @@ begin
   end
   else
     SrcCapReg := SrcReg;
+
+  // ⭐ FAST PATH: the MID statement is a pure OVERWRITE -- Len(target) never changes -- so when the
+  // target is a plain register variable it is a bounded Move inside its own buffer. The rebuild below
+  // ("prefix + midsrc + suffix") produces the same bytes but copies the WHOLE string every time, which
+  // made filling a buffer character by character QUADRATIC.
+  //
+  // Only for a simple identifier that is NOT array-backed: a SHARED scalar or an array element lives in
+  // a global array, so its register is a temporary COPY and writing it would update nothing.
+  //
+  // ⚠️ It also FIXES fbc fidelity at the edges, verified against the local oracle: fbc leaves the string
+  // untouched for a start below 1 or past the end, while the rebuild PREPENDED there and grew the
+  // string ("Mid(t,0,2) = "xy"" gave [xyBCDEFGH] against fbc's [ABCDEFGH]).
+  if (TargetNode.NodeType = antIdentifier) and
+     (not IsSharedScalar(VarToStr(TargetNode.Value))) then
+  begin
+    // ⚠️ The variable's CANONICAL register (what an ordinary scalar assignment writes), NOT the value
+    // ProcessStringExpression returned: that one is a versioned USE, and emitting it as Dest gets a
+    // fresh temporary plus a copy back -- which is exactly the whole-string copy this exists to avoid.
+    // Verified on the disassembly: with the use-value it came out "Dest=2 Src1=0" followed by
+    // "CopyString R0, R2"; with the canonical register Dest and Src1 are the same register.
+    TgtVarReg := EnsureStringRegister(GetOrAllocateVariable(VarToStr(TargetNode.Value)));
+    if TgtVarReg.Kind = svkRegister then
+    begin
+      // Src1 is the USE that ProcessStringExpression resolved, Dest the DEFINITION: the accumulator
+      // shape ("acc = acc + x"), which is what lets the allocator coalesce the two into one register
+      // and makes the write in place. Passing the same value twice does NOT do that -- it is one
+      // version defining itself, and the renamer hands the definition a fresh register instead.
+      EmitInstruction(ssaStrMidAssign, TgtVarReg, TextReg, SrcCapReg, StartReg);
+      Exit;
+    end;
+  end;
 
   OneReg := NI; EmitInstruction(ssaLoadConstInt, OneReg, MakeSSAConstInt(1), NoneV, NoneV);
 

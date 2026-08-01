@@ -685,6 +685,13 @@ function TConsoleBehavior.FormatString(const S: string): string;
 var
   Prefix, Suffix: string;
 begin
+  // The spaces around a printed string are a COMMODORE trait; in the FreeBASIC dialect both flags are
+  // off and this is the identity. It was still written as "'' + S + ''", which is a concatenation:
+  // one allocation and a full copy of S on EVERY Print, paid by every MODERN program for a rule that
+  // does not apply to it.
+  if (not FStringSpaceBefore) and (not FStringSpaceAfter) then
+    Exit(S);
+
   Prefix := '';
   Suffix := '';
 

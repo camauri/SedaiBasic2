@@ -43,7 +43,7 @@ interface
 uses
   Classes, SysUtils, Math, Variants, StrUtils, DateUtils, RegExpr,
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
-  SedaiConsoleBehavior, SedaiDebugger, SedaiExecutorErrors,
+  SedaiConsoleBehavior, SedaiConsoleState, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue,
   SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiJit, SedaiAot
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
@@ -105,6 +105,34 @@ type
 
   { TRecordStorage moved to SedaiExecutionContext (M5.2b: the record heap is per-context). }
 
+  { A thread's private stock of free shared-region indices.
+
+    WHY. The region's free list used to be one global stack behind one global lock, and every New and
+    every Delete pushed or popped it. The lock was never the problem — giving it a spin count is worth
+    0.9% — the problem is that four threads writing the same few cache lines pay a coherence transfer
+    per write. Measured on binary-trees N=16: the same four worker threads burn 21.7 s of CPU spread
+    over the cores and 9.5 s pinned to ONE core, where coherence traffic cannot arise. Twelve seconds
+    of CPU were cache-line ping-pong, not work.
+
+    A thread takes indices from its own stack and reaches the region only when it runs dry (refill a
+    batch, or reserve a fresh block) or overflows (flush a batch back). Nothing else is shared.
+
+    ⚠️ SINGLE-THREADED PROGRAMS STAY BYTE-IDENTICAL, deliberately: with one thread there is one stack,
+    so it IS the global one — same LIFO order, same indices, same handles. Fresh blocks are pushed in
+    descending order so they pop ascending, exactly as appending one at a time did.
+
+    ⛔ For MULTI-threaded programs the slot a given thread gets does change, and that is admissible
+    only because it was never fixed to begin with: two workers allocating concurrently already raced
+    for the lock, so which one got index 0 varied run to run under the old design too. Verified, not
+    assumed — job/tests/bas/handle_order.bas prints the first handle each worker received, and the
+    pair flips between runs on the global-lock build. }
+  TRecCache = record
+    Count: Integer;
+    Owner: Int64;            // generation of the VM these indices belong to; 0 the cache if it differs
+    Idx: array[0 .. 1023] of Integer;
+  end;
+  PRecCache = ^TRecCache;
+
   { Bytecode VM - register-based virtual machine }
   TBytecodeVM = class
   private
@@ -152,12 +180,19 @@ type
     FSharedRecordCount: Integer;
     FSharedRecFreeList: array of Integer;  // DELETE: indices of freed shared records, reused by NEW
     FSharedRecFreeCount: Integer;
-    // DELETE also RETIRES the storage itself here instead of destroying it, so NEW can take it back
-    // without touching the heap: New + three SetLength + Dispose per node was the largest single cost
-    // in binary-trees (231 ns per New/Delete pair, measured). The INDEX free list above is a separate
-    // thing and stays: a freed handle must keep resolving to nil.
-    FSharedRecPool: array of PRecordStorage;
-    FSharedRecPoolCount: Integer;
+    // DELETE RETIRES the storage instead of destroying it, so NEW can take it back without touching
+    // the heap: New + three SetLength + Dispose per node was the largest single cost in binary-trees
+    // (231 ns per New/Delete pair, measured). The storage is parked HERE, at the record's own index,
+    // and stays there while the slot is free — FSharedRecords[i] goes nil (a freed handle must keep
+    // resolving to nil, loudly) while FSharedRecStore[i] keeps the block. Parking it by index rather
+    // than on a stack is what lets the free list be a plain list of INTEGERS, which in turn is what
+    // lets each thread hold its own (see TRecCache): a thread-local cache of pointers would have to
+    // be walked at teardown, one of integers does not.
+    FSharedRecStore: TSharedRecArray;
+    FVmGeneration: Int64;          // stamps a thread's TRecCache; see GVmGeneration
+    FProgReadsScreen: Boolean;     // program calls SCREEN(row, col)
+    FProgPeeks: Boolean;           // program PEEKs/POKEs -- only reaches the screen through a mapper
+    FRecBlockTake: Integer;        // how many fresh indices a cache reserves at once (grows to REC_CACHE_BATCH)
     FSharedRecLock: TRTLCriticalSection;
     // Every pointer array this table ever OUTGREW, kept alive until the program is unloaded.
     // Growing used to be SetLength, which reallocates: a reader holding the old base could have it
@@ -530,6 +565,10 @@ type
     function ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordStorage; inline;
     function RecPtrTarget(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage; inline;  // decode @obj.field pointer
     procedure CleanupSharedRecords;   // free the shared region (destructor)
+    procedure UpdateScreenModelGate;          // decide whether the modelled screen must be kept
+    procedure RecCacheAdopt(C: PRecCache);    // bind this thread's free-index cache to this VM
+    procedure RecCacheFlush(C: PRecCache);    // give a batch of free indices back to the region
+    procedure RecCacheRefill(C: PRecCache);   // restock a dry cache from the region
     procedure RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
     procedure DeepCopyArrayRecords(Ctx: TExecutionContext; DestArr, SrcArr: Int64; PackedCounts: Int64);  // value-copy array-of-UDT member
     procedure CheckFloatValid(Ctx: TExecutionContext; RegIndex: Integer; const OpName: string);
@@ -810,7 +849,22 @@ const
   SHARED_REC_FLAG = Int64(1) shl 62;
   SHARED_REC_MASK = SHARED_REC_FLAG - 1;
 
+  // Free indices held per thread before anything global is touched (see TRecCache). REC_CACHE_BATCH is
+  // how many move at a time when the cache does have to talk to the region, so the global list is
+  // touched once per BATCH allocations instead of once per allocation. CAP must match the Idx array.
+  REC_CACHE_CAP   = 1024;
+  REC_CACHE_BATCH = 512;
+
+var
+  // Monotonic VM counter. A cache is stamped with the generation of the VM whose indices it holds,
+  // NOT with the VM pointer: a destroyed VM can be replaced by a new one at the same address, and the
+  // cache would then hand that VM indices belonging to a region it never had.
+  GVmGeneration: Int64 = 0;
+
 threadvar
+  // This thread's free-index cache. Take its address ONCE per operation: every mention of a threadvar
+  // is a TLS lookup.
+  GRecCache: TRecCache;
   // M5.2: the execution context the current thread runs. nil on the main thread (which uses the VM's
   // FCtx); set by WorkerThreadEntry to the worker's own context before it enters the run loop. Read
   // once per Run (RunTemplate.inc) so the hot path stays register-direct — the point of M5.2a.
@@ -971,7 +1025,11 @@ begin
   SetLength(FCondVars, 0);
   InitCriticalSection(FCondTableLock);
   SetLength(FSharedRecords, 0);
+  SetLength(FSharedRecStore, 0);
   FSharedRecordCount := 0;
+  FRecBlockTake := 8;
+  Inc(GVmGeneration);
+  FVmGeneration := GVmGeneration;
   SetLength(FSharedRetired, 0);
   // Default ON. SHAREDREC_LOCK=1 puts the per-access lock back, so the two can be timed against each
   // other on ONE binary instead of two builds (see ab-needs-a-built-baseline).
@@ -3272,21 +3330,50 @@ procedure TBytecodeVM.GrowSharedRecords(NeedLen: Integer);
 // for a program allocating millions of records, paid once. Callers hold FSharedRecLock: only the
 // LOOKUP is lock-free, growth is still serialised.
 var
-  NewArr: TSharedRecArray;
+  NewArr, NewStore: TSharedRecArray;
   i, NewLen, n: Integer;
 begin
   NewLen := NeedLen * 2;
   if NewLen < 64 then NewLen := 64;
   SetLength(NewArr, NewLen);
+  SetLength(NewStore, NewLen);
+  // FSharedRecStore copies verbatim and cannot lose a write: it is only ever assigned under THIS lock,
+  // when a block of indices is reserved.
   for i := 0 to Length(FSharedRecords) - 1 do
-    NewArr[i] := FSharedRecords[i];
+    NewStore[i] := FSharedRecStore[i];
+  if not FHasWorkers then
+  begin
+    // One thread: nothing can be writing while we copy, so the live/free picture transfers exactly and
+    // a freed handle goes on resolving to nil for the whole run.
+    for i := 0 to Length(FSharedRecords) - 1 do
+      NewArr[i] := FSharedRecords[i];
+  end
+  else
+    // ⚠️ Several threads: FSharedRecords IS written outside the lock (that is the point — a publish
+    // that took the lock would put back the cache-line traffic this whole design removes), so a
+    // concurrent New's publish can land in the array we are copying FROM, after we have read that
+    // entry. Losing it would leave a LIVE handle resolving to nil: a crash on correct code.
+    //
+    // So the copy is biased towards LIVE — every index that has storage is carried over as live. A
+    // lost publish is then covered (the entry already holds the right storage, which for a given index
+    // never changes), and what degrades instead is the other direction: an index freed before this
+    // growth stops resolving to nil. That is the harmless one, and it is only ever a DIAGNOSTIC —
+    // with several threads it was already unreliable, since any of them may reallocate the slot
+    // between your Delete and your mistaken read. Single-threaded programs, where the guarantee is
+    // real, take the branch above and keep it.
+    for i := 0 to Length(FSharedRecords) - 1 do
+      NewArr[i] := FSharedRecStore[i];
   if Length(FSharedRecords) > 0 then
   begin
     n := Length(FSharedRetired);
-    SetLength(FSharedRetired, n + 1);
+    // Both tables are retired, for the same reason: a thread that popped an index from its own cache
+    // reads FSharedRecStore[Idx] without the lock, so the base it holds must stay live.
+    SetLength(FSharedRetired, n + 2);
     FSharedRetired[n] := FSharedRecords;   // keep the old block alive; never freed while loaded
+    FSharedRetired[n + 1] := FSharedRecStore;
   end;
   FSharedRecords := NewArr;
+  FSharedRecStore := NewStore;
 end;
 
 function TBytecodeVM.AllocSharedRecord(IntC, FloatC, StrC, TypeId: Integer): Int64;
@@ -3295,45 +3382,32 @@ function TBytecodeVM.AllocSharedRecord(IntC, FloatC, StrC, TypeId: Integer): Int
 // growing. Used for arrays of UDT, whose handles live in the global FArrays and are read by any thread.
 var
   R: PRecordStorage;
+  C: PRecCache;
   Idx, i: Integer;
 begin
-  R := nil;
-  EnterCriticalSection(FSharedRecLock);
-  try
-    // Take back a retired storage if there is one. Under the SAME lock that hands out the slot, so
-    // this costs no extra synchronisation; when the pool is empty we fall back to the heap.
-    if FSharedRecPoolCount > 0 then
-    begin
-      Dec(FSharedRecPoolCount);
-      R := FSharedRecPool[FSharedRecPoolCount];
-    end;
-    // ⛔ ONE path only, deliberately. The A/B gate this function briefly had was a SECOND copy of the
-    // body, and the copy drifted: with the gate off it measured 974 ms against the 325 ms of the code
-    // it was supposed to reproduce. A baseline lives in a worktree on the previous commit, not in a
-    // duplicated branch here.
-    // Reuse a slot freed by DELETE if one is available, else append.
-    if FSharedRecFreeCount > 0 then
-    begin
-      Dec(FSharedRecFreeCount);
-      Idx := FSharedRecFreeList[FSharedRecFreeCount];
-    end
-    else
-    begin
-      Idx := FSharedRecordCount;
-      if Idx >= Length(FSharedRecords) then
-        GrowSharedRecords(Idx + 1);
-      Inc(FSharedRecordCount);
-    end;
-    if R = nil then New(R);
-    FSharedRecords[Idx] := R;
-  finally
-    LeaveCriticalSection(FSharedRecLock);
+  // ⛔ ONE path only, deliberately. The A/B gate this function briefly had was a SECOND copy of the
+  // body, and the copy drifted: with the gate off it measured 974 ms against the 325 ms of the code it
+  // was supposed to reproduce. A baseline lives in a worktree on the previous commit, not in a
+  // duplicated branch here.
+  C := @GRecCache;
+  if C^.Owner <> FVmGeneration then RecCacheAdopt(C);
+  if C^.Count = 0 then
+    RecCacheRefill(C);          // the ONLY place a plain New touches the region: dry cache
+  Dec(C^.Count);
+  Idx := C^.Idx[C^.Count];
+  // Storage is parked at the index, so recovering it is a load, not a second shared stack to pop.
+  R := FSharedRecStore[Idx];
+  if R = nil then
+  begin
+    New(R);
+    FSharedRecStore[Idx] := R;
   end;
-  // ⛔ Shaping and zeroing happen OUTSIDE the lock, on purpose: this benchmark runs four workers that
-  // all allocate, so the critical section is contended and every instruction inside it is paid by
-  // everyone. Doing this work inside cost the whole gain -- the single-threaded micro-benchmark
-  // improved 68% while binary-trees did not move at all. It is safe out here because the handle has
-  // not been handed back yet, so no other thread can resolve it.
+  FSharedRecords[Idx] := R;
+  // ⛔ Shaping and zeroing are OUTSIDE any lock, on purpose: this benchmark runs four workers that all
+  // allocate, and every instruction under a shared lock is paid by everyone. Doing this work inside
+  // cost the whole gain -- the single-threaded micro-benchmark improved 68% while binary-trees did not
+  // move at all. It is safe here because the handle has not been handed back yet, so no other thread
+  // can resolve it.
   R^.TypeId := TypeId;
   // On a recycled record these are almost always no-ops (same shape as the record that was freed),
   // and FPC returns immediately when the length already matches.
@@ -3354,28 +3428,106 @@ procedure TBytecodeVM.FreeSharedRecord(Handle: Int64);
 var
   Idx, i: Integer;
   R: PRecordStorage;
+  C: PRecCache;
 begin
   if (Handle and SHARED_REC_FLAG) = 0 then Exit;
   Idx := Handle and SHARED_REC_MASK;
+  if (Idx < 0) or (Idx >= FSharedRecordCount) then Exit;
+  R := FSharedRecords[Idx];
+  if R = nil then Exit;                  // already freed, or never handed out: ignore, as FreeBASIC does
+  // ⛔ The slot still becomes nil: reading a freed handle must keep giving a loud failure rather than
+  // somebody else's data. What is recycled is the STORAGE, which stays parked at FSharedRecStore[Idx]
+  // where nothing can reach it through a handle.
+  FSharedRecords[Idx] := nil;
+  // Let go of the managed content (a parked record must hold nothing alive) but KEEP the arrays: their
+  // blocks are the point of the recycling.
+  for i := 0 to High(R^.StringData) do
+    if R^.StringData[i] <> '' then R^.StringData[i] := '';
+  C := @GRecCache;
+  if C^.Owner <> FVmGeneration then RecCacheAdopt(C);
+  if C^.Count >= REC_CACHE_CAP then
+    RecCacheFlush(C);                    // hand a batch back so another thread can have them
+  C^.Idx[C^.Count] := Idx;
+  Inc(C^.Count);
+end;
+
+procedure TBytecodeVM.RecCacheAdopt(C: PRecCache);
+// Bind this thread's cache to this VM. Indices held for a DIFFERENT VM are dropped rather than
+// returned: that VM is being torn down (or already is), and its region goes with it.
+begin
+  C^.Owner := FVmGeneration;
+  C^.Count := 0;
+end;
+
+procedure TBytecodeVM.RecCacheFlush(C: PRecCache);
+// Return REC_CACHE_BATCH indices from the bottom of this thread's cache to the region, so a thread
+// that frees far more than it allocates cannot starve the others. Bottom, not top, so the indices
+// this thread is actively cycling through stay local and hot.
+var
+  i: Integer;
+begin
   EnterCriticalSection(FSharedRecLock);
   try
-    if (Idx < 0) or (Idx >= FSharedRecordCount) or (FSharedRecords[Idx] = nil) then Exit;
-    R := FSharedRecords[Idx];
-    // ⛔ The slot still becomes nil: reading a freed handle must keep giving a loud failure rather
-    // than somebody else's data. What is recycled is the STORAGE, which nothing can reach any more.
-    FSharedRecords[Idx] := nil;
-    // Let go of the managed content (a retired record must hold nothing alive) but KEEP the arrays:
-    // their blocks are the point of the pool.
-    for i := 0 to High(R^.StringData) do
-      if R^.StringData[i] <> '' then R^.StringData[i] := '';
-    if FSharedRecPoolCount >= Length(FSharedRecPool) then
-      SetLength(FSharedRecPool, (FSharedRecPoolCount + 1) * 2);
-    FSharedRecPool[FSharedRecPoolCount] := R;
-    Inc(FSharedRecPoolCount);
-    if FSharedRecFreeCount >= Length(FSharedRecFreeList) then
-      SetLength(FSharedRecFreeList, (FSharedRecFreeCount + 1) * 2);
-    FSharedRecFreeList[FSharedRecFreeCount] := Idx;
-    Inc(FSharedRecFreeCount);
+    if FSharedRecFreeCount + REC_CACHE_BATCH > Length(FSharedRecFreeList) then
+      SetLength(FSharedRecFreeList, (FSharedRecFreeCount + REC_CACHE_BATCH) * 2);
+    for i := 0 to REC_CACHE_BATCH - 1 do
+      FSharedRecFreeList[FSharedRecFreeCount + i] := C^.Idx[i];
+    Inc(FSharedRecFreeCount, REC_CACHE_BATCH);
+  finally
+    LeaveCriticalSection(FSharedRecLock);
+  end;
+  for i := REC_CACHE_BATCH to C^.Count - 1 do
+    C^.Idx[i - REC_CACHE_BATCH] := C^.Idx[i];
+  Dec(C^.Count, REC_CACHE_BATCH);
+end;
+
+procedure TBytecodeVM.RecCacheRefill(C: PRecCache);
+// Restock an empty cache: first from indices other threads gave back, then — if there are none — by
+// reserving a fresh consecutive block of the region.
+//
+// ⚠️ Both branches preserve the order the old single global stack handed indices out in, which is what
+// keeps a single-threaded program byte-identical. Returned indices keep their LIFO order (the region's
+// top must still be the next one out); a fresh block is stored descending so that popping it yields
+// First, First+1, ... exactly as appending one index at a time did.
+var
+  i, Take, First: Integer;
+  R: PRecordStorage;
+begin
+  EnterCriticalSection(FSharedRecLock);
+  try
+    Take := FSharedRecFreeCount;
+    if Take > REC_CACHE_BATCH then Take := REC_CACHE_BATCH;
+    if Take > 0 then
+    begin
+      // The region's list is a LIFO: its top is the most recently returned index, and it must stay the
+      // first one handed out. Copying the top `Take` entries straight across preserves that.
+      for i := 0 to Take - 1 do
+        C^.Idx[i] := FSharedRecFreeList[FSharedRecFreeCount - Take + i];
+      Dec(FSharedRecFreeCount, Take);
+      C^.Count := Take;
+    end
+    else
+    begin
+      // Reserve a fresh consecutive block. It starts small so a program that allocates a handful of
+      // records does not pay for 512, and doubles up to the batch size for one that keeps going.
+      Take := FRecBlockTake;
+      if FRecBlockTake < REC_CACHE_BATCH then FRecBlockTake := FRecBlockTake * 2;
+      First := FSharedRecordCount;
+      if First + Take > Length(FSharedRecords) then
+        GrowSharedRecords(First + Take);
+      Inc(FSharedRecordCount, Take);
+      for i := 0 to Take - 1 do
+      begin
+        C^.Idx[i] := First + (Take - 1 - i);      // descending: pops give First, First+1, ...
+        // The storage is created HERE, under the lock, and parked at its index for good. That is what
+        // keeps FSharedRecStore free of lock-free writes, which is in turn what lets GrowSharedRecords
+        // copy it verbatim (see there). It costs one New per index over the program's life — the same
+        // number the old code paid, just taken a block at a time.
+        New(R);
+        FSharedRecStore[First + i] := R;
+      end;
+      C^.Count := Take;
+    end;
   finally
     LeaveCriticalSection(FSharedRecLock);
   end;
@@ -3429,17 +3581,16 @@ procedure TBytecodeVM.CleanupSharedRecords;
 var
   i: Integer;
 begin
+  // FSharedRecStore, not FSharedRecords: it holds the storage of every index ever used, whether the
+  // slot is currently live or parked. That is the whole point of parking by index — no record can be
+  // stranded in some thread's cache, because a thread's cache holds integers.
   for i := 0 to FSharedRecordCount - 1 do
-    if FSharedRecords[i] <> nil then Dispose(FSharedRecords[i]);
+    if FSharedRecStore[i] <> nil then Dispose(FSharedRecStore[i]);
   SetLength(FSharedRecords, 0);
+  SetLength(FSharedRecStore, 0);
   FSharedRecordCount := 0;
   SetLength(FSharedRecFreeList, 0);
   FSharedRecFreeCount := 0;
-  // Retired storages are not in the table any more, so they have to be released from the pool.
-  for i := 0 to FSharedRecPoolCount - 1 do
-    if FSharedRecPool[i] <> nil then Dispose(FSharedRecPool[i]);
-  SetLength(FSharedRecPool, 0);
-  FSharedRecPoolCount := 0;
   // The retired pointer arrays hold no records of their own (every live record was disposed through
   // the current table above) - they were kept alive only so a lock-free lookup could never read freed
   // memory. Nothing can be looking any more, so release them.
@@ -4146,6 +4297,7 @@ begin
       if FSharedRecordCount >= Length(FSharedRecords) then
         GrowSharedRecords(FSharedRecordCount + 1);
       FSharedRecords[FSharedRecordCount] := R;
+      FSharedRecStore[FSharedRecordCount] := R;
       Inc(FSharedRecordCount);
     end;
   finally
@@ -4715,6 +4867,29 @@ var
   MaxIntReg, MaxFloatReg, MaxStringReg: Integer;
 begin
   FProgram := Program_;
+
+  // Does anything in this program read the terminal's modelled screen back? Only SCREEN(row, col) and
+  // a PEEK/POKE of the C128 screen RAM can, and both are visible right here in the bytecode. When
+  // none of them is present the grid is write-only, and keeping it costs a per-character pass over
+  // every byte printed. Whole-program and decided once, like the AOT's GNoThreads.
+  //
+  // ⚠️ Conservative on purpose: PEEK and POKE count whatever address they carry, because the address
+  // is a runtime value and the screen is only part of what they can reach. Getting this wrong in the
+  // other direction would make SCREEN() return spaces, so the doubt goes to keeping the model.
+  FProgReadsScreen := False;
+  FProgPeeks := False;
+  if Assigned(FProgram) then
+    for i := 0 to FProgram.GetInstructionCount - 1 do
+    begin
+      // ⛔ NOT "OpCode in [...]": an opcode is TWO bytes (bcConScreen = $0414) and a Pascal set holds
+      // 0..255, so the membership test silently compares the low byte and matches nothing. It compiled
+      // clean and made this scan always answer "no observer" -- caught by m358_view_print.
+      if FProgram.GetInstruction(i).OpCode = bcConScreen then FProgReadsScreen := True
+      else if (FProgram.GetInstruction(i).OpCode = bcPeek) or
+              (FProgram.GetInstruction(i).OpCode = bcPoke) then FProgPeeks := True;
+      if FProgReadsScreen and FProgPeeks then Break;
+    end;
+  UpdateScreenModelGate;
 
   // AOT: functions compiled for a previous program are keyed by its PCs - drop them.
   // The host re-registers (RegisterAotFunc) after loading the new program.
@@ -5825,9 +6000,26 @@ begin
   Result := Format('%.2d, %s,00,00', [Code, UpperCase(Msg)]);
 end;
 
+procedure TBytecodeVM.UpdateScreenModelGate;
+// Must the terminal keep its modelled screen up to date? Only if something in THIS program can read
+// it back. Two things can:
+//
+//   SCREEN(row, col)        -- present in both dialects, so it counts on its own;
+//   PEEK/POKE of screen RAM -- CLASSIC C128 machinery, and it reaches the cells ONLY through an
+//                              IMemoryMapper. The headless CLI installs none (the mapper is created
+//                              by the windowed console and by sbv), so there PEEK returns 0 and POKE
+//                              is dropped: a MODERN program cannot observe the model through them,
+//                              and must not be made to pay for it.
+//
+// Called from LoadProgram and again from SetMemoryMapper, because either can arrive first.
+begin
+  GScreenModelObservable := FProgReadsScreen or (FProgPeeks and Assigned(FMemoryMapper));
+end;
+
 procedure TBytecodeVM.SetMemoryMapper(Mapper: IMemoryMapper);
 begin
   FMemoryMapper := Mapper;
+  UpdateScreenModelGate;   // a mapper arriving later can make PEEK/POKE observers after all
 end;
 
 procedure TBytecodeVM.SetSpriteManager(Manager: ISpriteManager);
@@ -7186,6 +7378,8 @@ var
   SubOp: Word;
   ElemVal: Double;   // scratch for bounds-guarded array element reads
   CharPos: Integer;  // bcStrConcatCharAt: the 1-based index into the table
+  CharVal2: Integer; // bcStrMidAssign: how many bytes actually get overwritten
+  MidRepl: AnsiString; // bcStrMidAssign: the replacement, held across a possible Dest/Src2 collision
   SrcLen: Integer;   // ...length of the accumulator being extended
   CharVal: AnsiChar; // ...and the byte taken from the table
 begin
@@ -7506,6 +7700,51 @@ begin
           SrcLen := Ord(Ctx.StringRegs[Instr.Src1][CharPos]) + 1;
           if (SrcLen >= 1) and (SrcLen <= Length(Ctx.StringRegs[Instr.Src2])) then
             AppendChar(Ctx.StringRegs[Instr.Dest], Ctx.StringRegs[Instr.Src2][SrcLen]);
+        end;
+      end;
+
+    // "MID$(t, start [, len]) = src" - sub-opcode 160.
+    160: // bcStrMidAssign: overwrite Length(Src2) bytes of Dest starting at Immediate, IN PLACE
+      begin
+        // The FreeBASIC MID STATEMENT never changes Len(t): it overwrites at most what fits. So for a
+        // start INSIDE the string this is a bounded Move into t's own buffer, and the old lowering --
+        // "Left(t, start-1) + Left(src, avail) + Mid(t, start+n)" -- was rebuilding the whole string
+        // to write a few bytes. Filling a buffer character by character was therefore quadratic.
+        //
+        // Src2 arrives ALREADY capped to the requested length (the ssaStrLeft the lowering emits), so
+        // the only clamp left is the room remaining in Dest.
+        // ⚠️ Dest, Src1 and Src2 can all be the same register once the allocator has had its say, and
+        // "Dest := Src1" would then destroy the replacement before it is read. Take a reference to it
+        // FIRST when they collide -- a managed assignment, so a reference count, not a copy.
+        if (Instr.Dest <> Instr.Src1) and (Instr.Dest = Instr.Src2) then
+        begin
+          MidRepl := Ctx.StringRegs[Instr.Src2];
+          Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Src1];
+        end
+        else
+        begin
+          if Instr.Dest <> Instr.Src1 then
+            Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Src1];
+          MidRepl := Ctx.StringRegs[Instr.Src2];
+        end;
+        CharPos := Ctx.IntRegs[Instr.Immediate and $FFFF];
+        SrcLen := Length(Ctx.StringRegs[Instr.Dest]);
+        // start past the end writes nothing (the rebuild produced the original string unchanged);
+        // start below 1 is outside the statement's definition and keeps the old general behaviour,
+        // which the lowering still emits for that case -- see EmitMidAssign.
+        if (CharPos >= 1) and (CharPos <= SrcLen) then
+        begin
+          CharVal2 := Length(MidRepl);
+          if CharVal2 > SrcLen - CharPos + 1 then CharVal2 := SrcLen - CharPos + 1;
+          if CharVal2 > 0 then
+          begin
+            // UniqueString, not SetLength: the length does not change, we only need the right to
+            // write. On the register that owns the buffer this is a no-op -- and THAT is where the
+            // linear behaviour comes from, so Dest and Src1 must be the same register (see the
+            // lowering, which emits the variable's canonical register for both).
+            UniqueString(Ctx.StringRegs[Instr.Dest]);
+            Move(MidRepl[1], Ctx.StringRegs[Instr.Dest][CharPos], CharVal2);
+          end;
         end;
       end;
 
@@ -8160,6 +8399,86 @@ end;
 
 procedure AppendString(var D: AnsiString; const S: AnsiString); forward;
 
+{ ===== Appending without calling the allocator on every byte =====
+
+  An in-place append still costs a heap call: SetLength on a unique AnsiString goes to ReallocMem,
+  and "acc += one character" therefore asks the allocator to regrow the block once PER CHARACTER.
+  Measured on the reverse-complement shape (1M characters, --aot): Asc(Mid(s,i,1)) 15 ns, Mid(tab,k,1)
+  48 ns, and the append alone 93 ns -- sixty per cent of the loop, for moving one byte.
+
+  What is missing is CAPACITY. An AnsiString carries a length but no notion of spare room, so nothing
+  can tell that the block already has space. The heap block usually does: MemSize reports what was
+  really handed out. So: when the block can already hold the new length, write the length field and
+  the terminator directly and skip the allocator entirely; when it cannot, grow with geometric slack
+  so the next appends find room.
+
+  ⚠️ This reaches into FPC's AnsiString header, so it is verified at startup rather than assumed:
+  StrCapacityInit builds a string, checks that the length field sits where TSbAnsiRec says and that
+  MemSize covers it, and leaves the fast path OFF unless both hold. A future FPC that changes the
+  layout loses the optimisation instead of corrupting memory. }
+type
+  // Mirrors the RTL's TAnsiRec. Only the SIZE is used, to step back from the data pointer.
+  TSbAnsiRec = record
+    CodePage: Word;
+    ElementSize: Word;
+    {$IFDEF CPU64}Dummy: DWord;{$ENDIF}
+    Ref: SizeInt;
+    Len: SizeInt;
+  end;
+
+const
+  SB_ANSI_HDR = SizeOf(TSbAnsiRec);
+
+var
+  GStrCapacity: Boolean = False;   // set by StrCapacityInit once the layout is confirmed
+
+function StrSpareRoom(const D: AnsiString): SizeInt; inline;
+// How many bytes the block behind D can hold beyond its current length. Negative-safe: returns 0
+// when anything looks unexpected, which sends the caller back to SetLength.
+var
+  Blk: Pointer;
+  Total: PtrUInt;
+begin
+  Blk := Pointer(D) - SB_ANSI_HDR;
+  Total := MemSize(Blk);
+  if Total <= PtrUInt(SB_ANSI_HDR + 1) then Exit(0);
+  Result := SizeInt(Total) - SB_ANSI_HDR - 1 - Length(D);   // -1 keeps room for the NUL terminator
+  if Result < 0 then Result := 0;
+end;
+
+procedure StrSetLenInPlace(var D: AnsiString; NewLen: SizeInt); inline;
+// Publish a new length for a block that already has the room. This is the part SetLength would do
+// after deciding it need not reallocate.
+begin
+  PSizeInt(Pointer(D) - SizeOf(SizeInt))^ := NewLen;
+  PByte(Pointer(D) + NewLen)^ := 0;
+end;
+
+procedure StrGrowWithSlack(var D: AnsiString; NewLen: SizeInt);
+// Reallocate to comfortably more than NewLen, then publish NewLen. The slack is what makes the next
+// appends free; without it every single one comes back here.
+var
+  Want: SizeInt;
+begin
+  Want := NewLen + (NewLen div 2) + 32;
+  SetLength(D, Want);
+  StrSetLenInPlace(D, NewLen);
+end;
+
+procedure StrCapacityInit;
+// Confirm the header layout on THIS runtime before letting anything above run. Cheap, once.
+var
+  T: AnsiString;
+begin
+  GStrCapacity := False;
+  T := 'abcdefgh';
+  UniqueString(T);
+  if StringRefCount(T) <> 1 then Exit;
+  if PSizeInt(Pointer(T) - SizeOf(SizeInt))^ <> 8 then Exit;          // the length field is where we think
+  if MemSize(Pointer(T) - SB_ANSI_HDR) < PtrUInt(SB_ANSI_HDR + 9) then Exit;  // and the block covers it
+  GStrCapacity := True;
+end;
+
 procedure AotStrConcat(dstSlot, aVal, bVal: Pointer); cdecl;
 // "s = s + x" arrives here with dest = src1 once the SSA fusion has removed the temporary copy, and
 // then growing the destination in place is the difference between linear and quadratic -- exactly as
@@ -8235,7 +8554,17 @@ begin
   OldLen := Length(D);
   if (OldLen > 0) and (StringRefCount(D) = 1) then
   begin
-    SetLength(D, OldLen + 1);
+    if GStrCapacity then
+    begin
+      // The block usually has room already, and then the whole append is: write the byte, publish
+      // the length. No allocator call at all -- which is the point, see StrSpareRoom.
+      if StrSpareRoom(D) >= 1 then
+        StrSetLenInPlace(D, OldLen + 1)
+      else
+        StrGrowWithSlack(D, OldLen + 1);
+    end
+    else
+      SetLength(D, OldLen + 1);
     D[OldLen + 1] := C;
   end
   else
@@ -8270,7 +8599,15 @@ begin
   end;
   if (Pointer(D) <> Pointer(S)) and (StringRefCount(D) = 1) then
   begin
-    SetLength(D, OldLen + AddLen);
+    if GStrCapacity then
+    begin
+      if StrSpareRoom(D) >= AddLen then
+        StrSetLenInPlace(D, OldLen + AddLen)
+      else
+        StrGrowWithSlack(D, OldLen + AddLen);
+    end
+    else
+      SetLength(D, OldLen + AddLen);
     Move(S[1], D[OldLen + 1], AddLen);
   end
   else
@@ -13494,6 +13831,10 @@ initialization
   if GetEnvironmentVariable('FRAME_FAST') = '0' then GFrameFast := 0;
   if GetEnvironmentVariable('AOT_FASTCALL') = '0' then GAotFastCall := 0;
   if GetEnvironmentVariable('FRAMEBASE_DIAG') = '1' then GFrameBaseDiag := 1;
+  // Confirm the AnsiString header layout once, before any append can take the capacity path.
+  // STRCAP=0 forces the old SetLength-per-append behaviour, so the two can be timed on ONE binary.
+  StrCapacityInit;
+  if GetEnvironmentVariable('STRCAP') = '0' then GStrCapacity := False;
 
 finalization
   AotCallProfReport;

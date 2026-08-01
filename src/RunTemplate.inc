@@ -595,6 +595,9 @@ begin
         // program dies at RUNTIME with "Unknown superinstruction sub-opcode".
         159: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr); CurPC := Ctx.PC + 1; end;
 
+        // "MID$(t, start [, len]) = src" in place - sub-opcode 160. Delegated for the same reason.
+        160: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+
       else
         raise Exception.CreateFmt('Unknown superinstruction sub-opcode %d (full opcode $%.4X) at CurPC=%d', [Op and $FF, Op, CurPC]);
       end;

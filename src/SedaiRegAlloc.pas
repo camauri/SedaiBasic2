@@ -724,6 +724,7 @@ begin
     // replaces. The opcode only exists in programs the AOT will run (see RunConcatCharFusion), so
     // this line is inert for everything else.
     ssaStrConcatCharAt,
+    ssaStrMidAssign,
     ssaStrMid, ssaStrLeft, ssaStrRight,
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
     ssaArrayLoadIndString, ssaArrayStoreIndString,

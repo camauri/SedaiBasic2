@@ -451,6 +451,9 @@ var
   Fg, Bg: Byte;
 begin
   if Length(FCells) = 0 then Exit;
+  // Nothing in this program can read the model back, so there is nothing to keep up to date. See
+  // GScreenModelObservable in SedaiConsoleState for who decides that and why it is worth deciding.
+  if not GScreenModelObservable then Exit;
   N := Length(Text);
   if N = 0 then Exit;
   Row := @FCells[FCellY][0];

@@ -876,6 +876,10 @@ const
   // Same group and same reason as the opcode above: a hole in the superinstruction block moves no
   // DENSE_*_BASE.
   bcStrAppendMapped   = bcGroupSuper + 159;
+  // "MID$(t, start [, len]) = src": overwrite t IN PLACE. Dest=string (t out), Src1=string (t in),
+  // Src2=string (the replacement, already capped to len), Immediate=int register holding start.
+  // Same group and same reason as the two above: a hole here moves no DENSE_*_BASE.
+  bcStrMidAssign      = bcGroupSuper + 160;
   bcArraySwapInt      = bcGroupSuper + 250;
   bcAddIntSelf        = bcGroupSuper + 251;
   bcSubIntSelf        = bcGroupSuper + 252;

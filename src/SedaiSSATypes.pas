@@ -173,6 +173,15 @@ type
     // whole inner loop of reverse-complement: read the byte of Src1 at Src3, index Src2 with its
     // code, append that byte to Dest. Dest is READ as well as written (the accumulator grows).
     ssaStrAppendMapped,
+    // "MID$(t, start [, len]) = src" as ONE instruction - see bcStrMidAssign. The FreeBASIC MID
+    // STATEMENT is a pure OVERWRITE: Len(t) never changes, so for a start inside the string it is a
+    // bounded Move into t's own buffer. It was lowered instead as
+    // "Left(t, start-1) + Left(src, avail) + Mid(t, start+n)", which REBUILDS the whole string on
+    // every assignment - filling a buffer character by character was quadratic.
+    // Dest = t out, Src1 = t in (same register in practice, so it is written in place), Src2 = the
+    // replacement ALREADY capped to len by the ssaStrLeft the lowering emits, Immediate = the int
+    // register holding start. Four values, exactly like ssaStrConcatCharAt - no packing needed.
+    ssaStrMidAssign,
     // FreeBASIC string functions (B1.2): single string arg -> string result.
     ssaStrLTrim, ssaStrRTrim, ssaStrTrim, ssaStrUCase, ssaStrLCase,
     ssaStrInstrRev,   // INSTRREV(s, sub) -> int (last occurrence)

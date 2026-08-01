@@ -61,6 +61,21 @@ procedure SetupConsoleUTF8;
 { Put the code pages back. Called automatically from this unit's finalization. }
 procedure RestoreConsoleCodePages;
 
+{ Does the running program need the terminal's MODELLED SCREEN kept up to date?
+
+  The CLI terminal maintains a grid of cells mirroring what was printed, character by character, on
+  every Print. Only two things can ever read it back: SCREEN(row, col) and a PEEK/POKE of the C128
+  screen RAM. The terminal itself does not -- what the user sees is the byte stream, not the model.
+
+  So for a program containing none of those, the whole grid is write-only and the per-character work
+  is pure waste. It is not a small waste: on fasta it is 11.9% of the run and on reverse-complement
+  7.8%, output byte-identical either way.
+
+  The VM clears this at load time after scanning the bytecode. Default True, so anything that does not
+  scan (a host embedding the console, the REPL) keeps the full model. }
+var
+  GScreenModelObservable: Boolean = True;
+
 implementation
 
 {$IFDEF WINDOWS}

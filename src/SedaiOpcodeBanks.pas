@@ -49,6 +49,7 @@ begin
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrChr, bcStrWChr,
     bcStrConcatCharAt,  // "acc + tab[k]" fused (superinstruction group) - string dest
     bcStrAppendMapped,  // "acc += tab[Asc(s[i])+1]" fused - string dest (READ too: it appends)
+    bcStrMidAssign,     // "Mid(t,start)=src" - string dest = t (READ too: it overwrites part of it)
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING codepoint substrings - string dest
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase, bcStrSpace,  // B1.2: string dest
     bcCurDir, bcEnviron, bcExePath, bcCommand,  // CURDIR$ / ENVIRON$(name) / EXEPATH / COMMAND$(index) - string dest
@@ -114,6 +115,7 @@ begin
     bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrLen, bcStrLenW, bcStrAsc, bcStrAscMid, bcStrSAdd,
     bcStrConcatCharAt,  // "acc + tab[k]" fused: Src1 = the accumulator
     bcStrAppendMapped,  // "acc += tab[Asc(s[i])+1]" fused: Src1 = the SOURCE string
+    bcStrMidAssign,     // "Mid(t,start)=src": Src1 = the incoming t
     bcFileExists, bcFileLen, bcFileDateTime,  // FILEEXISTS/FILELEN/FILEDATETIME(path): Src1 = path string
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src1 = source string
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string
@@ -180,6 +182,7 @@ begin
     bcStrConcat,  // String concatenation (second operand)
     bcStrConcatCharAt,  // "acc + tab[k]" fused: Src2 = the table the byte is taken from
     bcStrAppendMapped,  // "acc += tab[Asc(s[i])+1]" fused: Src2 = the mapping table
+    bcStrMidAssign,     // "Mid(t,start)=src": Src2 = the replacement text
     bcStrInstr,   // INSTR(haystack, needle) - needle is Src2
     bcStrInstrRev, // INSTRREV(str, sub) - sub is Src2
     bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV - needle is Src2
@@ -222,7 +225,9 @@ begin
     // result. Leaving it out here lets every liveness that consults this list believe the value
     // arriving in Dest is dead, and the register carrying the accumulator gets reused: the reset
     // "acc = ''" then lands on one register while the append keeps growing another.
-    bcStrAppendMapped:
+    // bcStrMidAssign overwrites PART of Dest, so the rest of the incoming value survives into the
+    // result: like the append above, Dest is an input as well as the destination.
+    bcStrAppendMapped, bcStrMidAssign:
       Result := True;
   else
     Result := False;
