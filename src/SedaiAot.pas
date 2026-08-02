@@ -271,6 +271,15 @@ var
   // How many compare/branch pairs the last compilation fused. Counting, not timing, is what says
   // whether a codegen rule ever fires - the lesson of the div-by-constant pass that was blind.
   AotDiagCmpFused: Integer = 0;
+  // D1 two-lane SSE2. AOT_VEC=1 enables it; the default is OFF while the recogniser is being
+  // proved against real programs. -1 = env not yet read.
+  GAotVecState: Integer = -1;
+  // How many loops the recogniser accepted in the last region, and - far more useful while the
+  // rule is young - why the FIRST candidate was turned down. A recogniser with no reason string
+  // is a recogniser you tune by guessing.
+  AotDiagVecLoops: Integer = 0;
+  AotDiagVecEmitted: Integer = 0;
+  AotDiagVecWhy: string = '';
   // Did the interval allocator actually run for the last region, and what did it place?
   AotDiagLinScanActive: Boolean = False;
   AotDiagLsPlacedInt: Integer = 0;
@@ -594,6 +603,19 @@ begin
     else GAotAscMidInlineState := 1;
   end;
   Result := (GAotAscMidInlineState = 1) and GAotStrHdrOK;
+end;
+
+function AotVecEnabled: Boolean;
+// D1: two-lane SSE2 for elementwise float loops. OFF by default - AOT_VEC=1 turns it on - because
+// this is a loop transformation, the class where a mistake is a silent wrong answer rather than a
+// crash, and the nets that decide are real programs.
+begin
+  if GAotVecState < 0 then
+  begin
+    if GetEnvironmentVariable('AOT_VEC') = '1' then GAotVecState := 1
+    else GAotVecState := 0;
+  end;
+  Result := GAotVecState = 1;
 end;
 
 function AotCmpFuse: Boolean;
@@ -1213,6 +1235,23 @@ type
     StoreEarly: Boolean;       // its last position is a terminator: write back BEFORE it, or the
                                // store lands after the branch and never runs
   end;
+  // D1: a counted loop the two-lane SSE2 path can execute. CondBlk holds the compare and the exit
+  // branch, BodyBlk the elementwise work; the scalar pair is emitted unchanged after the vector
+  // loop and serves as both the remainder loop and the fallback when a runtime guard fails.
+  TVecLoop = record
+    CondBlk, BodyBlk: Integer;      // absolute block indices
+    IvReg, LimitReg, StepReg: Integer;   // final int bank indices
+    LeRelation: Boolean;            // the exit test is <= (rather than <)
+    NLoad, NStore, NArith: Integer; // shape, for the diagnostics
+    Weight: Integer;                // loop weight of the body: what this is worth
+    // Final int reg -> the loop-invariant register its index is based on (index = base + iv), or
+    // -1 when the index IS the induction variable. Two accesses to the SAME array through
+    // DIFFERENT index registers are safe exactly when their bases hold the same value, which is a
+    // cmp and a jne in the preheader - see the runtime-guard note on the recogniser.
+    IdxBase: array of Integer;
+    UniformF: array of Integer;     // float regs holding a value that is the same in both lanes,
+    NUniform: Integer;              // so they are broadcast once before the loop
+  end;
   TLsEventList = array of array of Integer;   // linear position -> web ids
 var
   E: TX86Emitter;
@@ -1341,6 +1380,8 @@ var
   DumpHdr: TStringList;                 // the register legend, captured BEFORE the body: ILoc/FLoc
                                         // are mutated by the dynamic allocators as emission walks
   FuseDone: Boolean;                    // the compare just emitted absorbed the branch that follows
+  VecLoops: array of TVecLoop;          // D1: the loops the two-lane path recognised
+  NVecLoop: Integer;
 
   procedure Fail(const Why: string);
   begin
@@ -2650,6 +2691,29 @@ var
       AotSib(BaseReg);                             // mov rax <-> [base+rcx*8]
     end;
   end;
+  // 128-bit SIB form: <prefix> [REX] 0F <op> ModRM(reg=xmm, rm=100) SIB(scale 8, index, base).
+  // The scalar AotSib cannot be reused: its index is hard-wired to rcx and it has no REX.X, and a
+  // vector body wants the index where it already is. Base low-3 = 101 (rbp/r13) has no mod=00
+  // form, same trap as there.
+  procedure SseSib(const Op: array of Byte; XmmReg, BaseReg, IdxReg: Integer);
+  var i, rex: Integer; sib: Byte;
+  begin
+    i := 0;
+    while (i < Length(Op)) and ((Op[i] = $F2) or (Op[i] = $F3) or (Op[i] = $66)) do
+    begin E.Emit8(Op[i]); Inc(i); end;
+    rex := 0;
+    if XmmReg  >= 8 then rex := rex or $04;          // REX.R
+    if IdxReg  >= 8 then rex := rex or $02;          // REX.X
+    if BaseReg >= 8 then rex := rex or $01;          // REX.B
+    if rex <> 0 then E.Emit8($40 or rex);
+    while i < Length(Op) do begin E.Emit8(Op[i]); Inc(i); end;
+    sib := $C0 or ((IdxReg and 7) shl 3) or (BaseReg and 7);
+    if (BaseReg and 7) = 5 then
+    begin E.Emit8($40 or ((XmmReg and 7) shl 3) or 4); E.Emit8(sib); E.Emit8($00); end
+    else
+    begin E.Emit8(((XmmReg and 7) shl 3) or 4); E.Emit8(sib); end;
+  end;
+
   // Element load/store with the interpreter's dialect bounds semantics. Sequence:
   // rcx = index; rdx = desc table (ctx); rax = Count; unsigned cmp; then either the
   // CLASSIC guard (OOB -> deopt, interpreter raises) or the MODERN default path
@@ -2817,6 +2881,214 @@ var
 
   // LBOUND/UBOUND with a runtime dim: only dim 0 is native (LBound at +24; UBOUND =
   // LBound + Count - 1); any other dim (rank query, per-dim bounds) deopts (JIT J10).
+  { --- D1: emit the two-lane version of a recognised loop -------------------------------------
+    PREPENDED to the scalar loop, never replacing it. Layout:
+
+        <guards>            step must be 1; two accesses to one array must share a base
+        <broadcasts>        each uniform float gets its value in both lanes (unpcklpd h,h)
+      Vtop:
+        iv+1 <= limit ?     no -> fall into the scalar loop, which finishes the remainder
+        <packed body>       movupd / addpd / mulpd, same register assignment as the scalar body
+        iv += 2
+        jmp Vtop
+      (scalar cond block emitted here by the caller)
+
+    Every guard jumps to CondBlk, i.e. into the scalar loop, which is correct for ANY number of
+    remaining iterations including all of them. That is what makes this safe to be wrong about:
+    the worst outcome of a failed guard is the code we had yesterday.
+
+    The vector body reuses the scalar body's register homes. It writes 128 bits where the scalar
+    code writes 64, which is fine because the recogniser required every float it touches to die
+    inside the body - no later reader, and every scalar double op ignores the upper half anyway. }
+  function EmitVecLoop(const V: TVecLoop): Boolean;
+  const
+    PD_ADD: array[0..2] of Byte = ($66, $0F, $58);
+    PD_SUB: array[0..2] of Byte = ($66, $0F, $5C);
+    PD_MUL: array[0..2] of Byte = ($66, $0F, $59);
+    PD_DIV: array[0..2] of Byte = ($66, $0F, $5E);
+    PD_MOV: array[0..2] of Byte = ($66, $0F, $28);   // movapd
+  var
+    Bb: TSSABasicBlock;
+    Ins2: TSSAInstruction;
+    ii, jj, k2, hd, ha, hb, baseR, aid, idxr, VTop: Integer;
+    SavedCur: TSSAInstruction; SavedBlk: Integer;
+    AccArr, AccIdx, AccBase: array of Integer;   // one entry per array access, in body order
+    RunBase: array of Integer;                   // final int reg -> its base AT THIS POINT
+    AccStore: array of Boolean;
+    NAcc: Integer;
+    GuardA, GuardB: array of Integer;            // base-register pairs a guard must compare
+    NGuard: Integer;
+    Commutative: Boolean;
+
+    function FH(const Vv: TSSAValue): Integer;
+    begin Result := FLoc[Prog.AotRemapFloatReg(Vv.RegIndex)]; end;
+
+    procedure VecBase(ArrayId: Integer; out BaseReg: Integer);
+    var cb: Integer;
+    begin
+      cb := CachedBase(ArrayId);
+      if cb >= 0 then BaseReg := cb
+      else
+      begin
+        E.MemOp([$49, $8B], RDX, R8, 16);                             // rdx = ctx.ArrDesc
+        E.MemOp([$48, $8B], RDX, RDX, LongWord(ArrayId) * 32 + 8);    // rdx = desc[id].FloatData
+        BaseReg := RDX;
+      end;
+    end;
+
+    // dst := dst <op> src, in packed doubles, out of the homes the scalar body already uses.
+    procedure PdOp(const Op: array of Byte; d, a, b: Integer; Comm: Boolean);
+    begin
+      if d = a then SseRR(Op, d, b)
+      else if Comm and (d = b) then SseRR(Op, d, a)
+      else if d <> b then begin SseRR(PD_MOV, d, a); SseRR(Op, d, b); end
+      else
+      begin
+        // Non-commutative with dst aliasing the RIGHT operand: copying a into d would destroy b
+        // before the op reads it. xmm0 is scratch and never in the pool.
+        SseRR(PD_MOV, XMM0, a); SseRR(Op, XMM0, b); SseRR(PD_MOV, d, XMM0);
+      end;
+    end;
+
+  begin
+    Result := False;
+    Bb := SSAProg.Blocks[V.BodyBlk];
+
+    // Pass 1: the accesses, and whether every dependence between them can be GUARDED. Nothing is
+    // emitted yet - a bail after emitting would leave a half-built loop in the stream.
+    NAcc := 0; NGuard := 0;
+    SetLength(AccArr, Bb.Instructions.Count); SetLength(AccIdx, Bb.Instructions.Count);
+    SetLength(AccBase, Bb.Instructions.Count); SetLength(AccStore, Bb.Instructions.Count);
+    // ⚠️ The base of an index has to be read AT THE POINT OF USE, walking the body in order, not
+    // out of a table keyed by register. The REGREUSE merge deliberately gives one VM register to
+    // values with disjoint lifetimes, so the same register really does hold two different indices
+    // inside one body - and a table keeps only the last definition. Reading it that way compared
+    // the wrong two bases here, which cost nothing in correctness (a failed guard just runs the
+    // scalar loop) but silently turned the vector loop off. -1 = the index IS the induction
+    // variable, i.e. a base of zero.
+    SetLength(RunBase, MaxIReg + 1);
+    for k2 := 0 to MaxIReg do RunBase[k2] := -2;          // -2 = not an index (yet)
+    for ii := 0 to Bb.Instructions.Count - 1 do
+    begin
+      Ins2 := Bb.Instructions[ii];
+      if Ins2.OpCode = ssaAddInt then
+      begin
+        hd := Prog.AotRemapIntReg(Ins2.Dest.RegIndex);
+        ha := Prog.AotRemapIntReg(Ins2.Src1.RegIndex);
+        hb := Prog.AotRemapIntReg(Ins2.Src2.RegIndex);
+        if (hd >= 0) and (hd <= MaxIReg) and (hd <> V.IvReg) then
+        begin
+          if ha = V.IvReg then RunBase[hd] := hb
+          else if hb = V.IvReg then RunBase[hd] := ha
+          else RunBase[hd] := -2;
+        end;
+        System.Continue;
+      end;
+      if (Ins2.OpCode <> ssaArrayLoad) and (Ins2.OpCode <> ssaArrayStore) then System.Continue;
+      idxr := Prog.AotRemapIntReg(Ins2.Src2.RegIndex);
+      if (idxr < 0) or (idxr > MaxIReg) then Exit;
+      AccArr[NAcc] := Ins2.Src1.ArrayIndex;
+      AccIdx[NAcc] := idxr;
+      if idxr = V.IvReg then AccBase[NAcc] := -1 else AccBase[NAcc] := RunBase[idxr];
+      if AccBase[NAcc] = -2 then Exit;                    // no base to compare: give the loop up
+      AccStore[NAcc] := Ins2.OpCode = ssaArrayStore;
+      Inc(NAcc);
+    end;
+    SetLength(GuardA, NAcc * NAcc); SetLength(GuardB, NAcc * NAcc);
+    for ii := 0 to NAcc - 1 do
+      for jj := ii + 1 to NAcc - 1 do
+      begin
+        // DIFFERENT arrays cannot alias: an array here is a descriptor, not a pointer into a
+        // common heap, and that is the one piece of dependence analysis we get for free.
+        if AccArr[ii] <> AccArr[jj] then System.Continue;
+        if not (AccStore[ii] or AccStore[jj]) then System.Continue;   // read/read: no dependence
+        // Two accesses hit the same element exactly when their BASES are equal - the index
+        // register alone does not say so, since one register can carry two different indices in
+        // one body. Equal bases (including both being the bare IV) need no guard; two different
+        // invariant bases get a cmp; a bare IV against a based index cannot be compared that way.
+        if AccBase[ii] = AccBase[jj] then System.Continue;
+        if (AccBase[ii] < 0) or (AccBase[jj] < 0) then Exit;
+        GuardA[NGuard] := AccBase[ii]; GuardB[NGuard] := AccBase[jj]; Inc(NGuard);
+      end;
+
+    SavedCur := Cur; SavedBlk := CurBlkIdx;
+    CurBlkIdx := V.BodyBlk;
+    try
+      // --- guards ---------------------------------------------------------------------------
+      ILoad(RAX, V.StepReg);
+      E.EmitBytes([$48, $83, $F8, $01]);                    // cmp rax, 1
+      JccRel($85, V.CondBlk);                               // jne -> scalar loop
+      for k2 := 0 to NGuard - 1 do
+      begin
+        ILoad(RAX, GuardA[k2]);
+        IOp([$48, $3B], RAX, GuardB[k2]);                   // cmp rax, otherBase
+        JccRel($85, V.CondBlk);
+      end;
+      // --- broadcasts -----------------------------------------------------------------------
+      for k2 := 0 to V.NUniform - 1 do
+        SseRR([$66, $0F, $14], FLoc[V.UniformF[k2]], FLoc[V.UniformF[k2]]);   // unpcklpd h, h
+      // --- vector condition -----------------------------------------------------------------
+      VTop := E.Len;
+      ILoad(RAX, V.IvReg);
+      E.EmitBytes([$48, $83, $C0, $01]);                    // add rax, 1  (the second lane)
+      IOp([$48, $3B], RAX, V.LimitReg);                     // cmp rax, limit
+      if V.LeRelation then JccRel($8F, V.CondBlk)           // jg  -> fewer than two left
+      else JccRel($8D, V.CondBlk);                          // jge -> fewer than two left
+      // --- body -----------------------------------------------------------------------------
+      for ii := 0 to Bb.Instructions.Count - 1 do
+      begin
+        Ins2 := Bb.Instructions[ii];
+        Cur := Ins2;
+        case Ins2.OpCode of
+          ssaJump, ssaCopyInt: ;                            // back edge / the IV's self-copy
+          ssaAddInt:
+            // The index computations are per-lane-START values: identical to the scalar form.
+            // The induction step is not emitted here - the vector loop advances by two.
+            if Prog.AotRemapIntReg(Ins2.Dest.RegIndex) <> V.IvReg then IntBin([$48, $03], True);
+          ssaArrayLoad:
+          begin
+            aid := Ins2.Src1.ArrayIndex;
+            ILoad(RCX, Prog.AotRemapIntReg(Ins2.Src2.RegIndex));
+            VecBase(aid, baseR);
+            SseSib([$66, $0F, $10], FH(Ins2.Dest), baseR, RCX);        // movupd xmmD, [base+rcx*8]
+          end;
+          ssaArrayStore:
+          begin
+            aid := Ins2.Src1.ArrayIndex;
+            ILoad(RCX, Prog.AotRemapIntReg(Ins2.Src2.RegIndex));
+            VecBase(aid, baseR);
+            SseSib([$66, $0F, $11], FH(Ins2.Dest), baseR, RCX);        // movupd [base+rcx*8], xmmS
+          end;
+          ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat:
+          begin
+            hd := FH(Ins2.Dest); ha := FH(Ins2.Src1); hb := FH(Ins2.Src2);
+            Commutative := (Ins2.OpCode = ssaAddFloat) or (Ins2.OpCode = ssaMulFloat);
+            case Ins2.OpCode of
+              ssaAddFloat: PdOp(PD_ADD, hd, ha, hb, Commutative);
+              ssaSubFloat: PdOp(PD_SUB, hd, ha, hb, Commutative);
+              ssaMulFloat: PdOp(PD_MUL, hd, ha, hb, Commutative);
+            else           PdOp(PD_DIV, hd, ha, hb, Commutative);
+            end;
+          end;
+        else
+          // The recogniser accepted this body, so nothing else can be in it. If that ever stops
+          // being true the loop must not be emitted half-formed.
+          Fail('vec-op:' + OpName(Ins2.OpCode));
+          Exit;
+        end;
+      end;
+      // --- step by two and go round ----------------------------------------------------------
+      ILoad(RAX, V.IvReg);
+      E.EmitBytes([$48, $83, $C0, $02]);                    // add rax, 2
+      IStore(V.IvReg, RAX);
+      E.Emit8($E9); E.Emit32(LongWord(VTop - (E.Len + 4))); // jmp Vtop
+      Result := True;
+      Inc(AotDiagVecEmitted);
+    finally
+      Cur := SavedCur; CurBlkIdx := SavedBlk;
+    end;
+  end;
+
   procedure AotArrBound(apc, ArrayId: Integer; WantUpper: Boolean);
   var p1: Integer;
   begin
@@ -3889,6 +4161,286 @@ var
               (Ins.OpCode = ssaStop) or (Ins.OpCode = ssaJump)) then
         Fail('open-region-end');
     end;
+  end;
+
+  { --- D1: two-lane SSE2 vectorisation, the recogniser ----------------------------------------
+    What we are looking for is the shape a vector unit can execute without changing a single bit:
+    a counted loop whose body is ONE block of elementwise work - float array elements read at
+    base+iv, arithmetic on them and on loop-invariant scalars, results written back at base+iv.
+    A MAP, in other words. A REDUCTION (an accumulator carried across iterations) is deliberately
+    NOT accepted: two lanes would re-associate the additions and change the result, and
+    aot_validate compares against the interpreter byte for byte - correctly.
+
+    Everything this cannot PROVE it turns into a runtime guard instead of a bail, because the
+    scalar loop is still emitted right after and is a perfectly good fallback: the vector loop is
+    prepended, and if any guard fails it simply falls through into the loop that was always there.
+    That is what makes the step (a register, not an immediate: `For j = 0 To n` lowers its step to
+    a VM register) and the equality of two index bases affordable - a cmp and a jne each, once per
+    loop entry, against a scalar loop that then does the whole job. ------------------------------ }
+  procedure ScanVecLoops;
+  var
+    bi, nbk, ii, k2, q: Integer;
+    Cb, Bb: TSSABasicBlock;
+    Ins2: TSSAInstruction;
+    iv, lim, stp, dr, sa, sb2: Integer;
+    Bad: string;
+    IsIdx: array of Boolean;          // final int reg -> holds an index of the form invariant+iv
+    IdxB: array of Integer;           // ...and the invariant register it is based on
+    Wrote: array of Boolean;          // final int reg -> written inside the body (not invariant)
+    WroteF: array of Boolean;         // final float reg -> written inside the body
+    // "Per-lane": this float register currently holds a value DERIVED FROM THIS ITERATION - an
+    // array element read at base+iv, or arithmetic on such values. A float register the body
+    // writes but which is NOT per-lane at the point it is read is carried across the back edge,
+    // i.e. an accumulator, i.e. a reduction, i.e. not ours.
+    Lane: array of Boolean;
+    IvUpdated: Boolean;               // the induction step has been passed in this walk
+    nl, ns, na: Integer;
+
+    function RInt(const V: TSSAValue): Integer;
+    begin
+      if (V.Kind <> svkRegister) or (V.RegType <> srtInt) then Exit(-1);
+      Result := Prog.AotRemapIntReg(V.RegIndex);
+      if Result > MaxIReg then Result := -1;
+    end;
+    function RFlt(const V: TSSAValue): Integer;
+    begin
+      if (V.Kind <> svkRegister) or (V.RegType <> srtFloat) then Exit(-1);
+      Result := Prog.AotRemapFloatReg(V.RegIndex);
+      if Result > MaxFReg then Result := -1;
+    end;
+    // A float operand the vector body can consume: either a per-lane value produced EARLIER IN
+    // THIS ITERATION, or a loop-INVARIANT scalar (the same value in both lanes, which is why it
+    // has to be broadcast once before the loop). Anything else is read before this iteration
+    // defines it and therefore arrives from the previous one.
+    function FltOperandOK(const V: TSSAValue): Boolean;
+    var r2: Integer;
+    begin
+      r2 := RFlt(V);
+      Result := (r2 >= 0) and (Lane[r2] or not WroteF[r2]);
+    end;
+    function IsLane(const V: TSSAValue): Boolean;
+    var r2: Integer;
+    begin
+      r2 := RFlt(V);
+      Result := (r2 >= 0) and Lane[r2];
+    end;
+    // A unit-stride index: the induction variable itself, or invariant+iv. Either way it advances
+    // by exactly the step every iteration, so consecutive iterations touch consecutive elements -
+    // which is the whole precondition for loading two of them with one movupd.
+    function IdxOK(const V: TSSAValue): Boolean;
+    var r2: Integer;
+    begin
+      r2 := RInt(V);
+      Result := (r2 >= 0) and ((r2 = iv) or IsIdx[r2]);
+    end;
+
+  begin
+    NVecLoop := 0;
+    AotDiagVecWhy := '';
+    if not AotVecEnabled then Exit;
+    if not LivenessOK then begin AotDiagVecWhy := 'no-liveness'; Exit; end;
+    // The vector body reuses the SAME register assignment as the scalar body, just 128 bits wide.
+    // That only holds while the homes are static: the dynamic allocators move values between
+    // registers and the bank as emission walks, and the bank slot is 8 bytes, not 16.
+    if LsActive or DynFActive or DynIActive then
+    begin AotDiagVecWhy := 'dynamic-allocator-active'; Exit; end;
+    nbk := Region.LastBlock - Region.FirstBlock + 1;
+    SetLength(IsIdx, MaxIReg + 1);
+    SetLength(IdxB, MaxIReg + 1);
+    SetLength(Wrote, MaxIReg + 1);
+    SetLength(WroteF, MaxFReg + 1);
+    SetLength(Lane, MaxFReg + 1);
+    for bi := 0 to nbk - 2 do
+    begin
+      Cb := SSAProg.Blocks[Region.FirstBlock + bi];
+      Bb := SSAProg.Blocks[Region.FirstBlock + bi + 1];
+      // The condition block: exactly a compare on the induction variable and the branch out.
+      if Cb.Instructions.Count <> 2 then System.Continue;
+      Ins2 := Cb.Instructions[0];
+      if (Ins2.OpCode <> ssaCmpLeInt) and (Ins2.OpCode <> ssaCmpLtInt) then System.Continue;
+      iv := RInt(Ins2.Src1); lim := RInt(Ins2.Src2);
+      if (iv < 0) or (lim < 0) then System.Continue;
+      if Cb.Instructions[1].OpCode <> ssaJumpIfZero then System.Continue;
+      // The body: one block, falling out of the condition, jumping straight back to it.
+      if Bb.Instructions.Count < 4 then System.Continue;
+      Ins2 := Bb.Instructions[Bb.Instructions.Count - 1];
+      if Ins2.OpCode <> ssaJump then System.Continue;
+      if Ins2.Dest.Kind <> svkLabel then System.Continue;
+      if Ins2.Dest.LabelName <> Cb.LabelName then System.Continue;
+
+      for k2 := 0 to MaxIReg do begin IsIdx[k2] := False; IdxB[k2] := -1; Wrote[k2] := False; end;
+      for k2 := 0 to MaxFReg do begin WroteF[k2] := False; Lane[k2] := False; end;
+      IvUpdated := False;
+      // First pass: what does the body WRITE? Anything it does not write is loop-invariant, which
+      // is the only definition of invariance a single-block body needs.
+      for ii := 0 to Bb.Instructions.Count - 1 do
+      begin
+        Ins2 := Bb.Instructions[ii];
+        if Ins2.OpCode = ssaArrayStore then System.Continue;     // Dest is READ here, not written
+        q := RInt(Ins2.Dest); if q >= 0 then Wrote[q] := True;
+        q := RFlt(Ins2.Dest); if q >= 0 then WroteF[q] := True;
+      end;
+      if not Wrote[iv] then System.Continue;                     // the IV must advance in here
+      if Wrote[lim] then System.Continue;
+
+      Bad := ''; stp := -1; nl := 0; ns := 0; na := 0;
+      for ii := 0 to Bb.Instructions.Count - 1 do
+      begin
+        Ins2 := Bb.Instructions[ii];
+        case Ins2.OpCode of
+          ssaJump: ;                                             // the back edge, already checked
+          ssaAddInt:
+          begin
+            dr := RInt(Ins2.Dest); sa := RInt(Ins2.Src1); sb2 := RInt(Ins2.Src2);
+            if (dr < 0) or (sa < 0) or (sb2 < 0) then Bad := 'addint-operand'
+            else if dr = iv then
+            begin
+              // The induction step. It has to be THIS shape - iv := iv + something invariant -
+              // and the something is a register whose value we only learn at run time.
+              if (sa <> iv) or (sb2 = iv) or Wrote[sb2] then Bad := 'iv-update-shape'
+              else if stp >= 0 then Bad := 'two-iv-updates'
+              else begin stp := sb2; IvUpdated := True; end;
+            end
+            else if (sa = iv) and not Wrote[sb2] then begin IsIdx[dr] := True; IdxB[dr] := sb2; end
+            else if (sb2 = iv) and not Wrote[sa] then begin IsIdx[dr] := True; IdxB[dr] := sa; end
+            else Bad := 'int-add-not-index';
+          end;
+          ssaCopyInt:
+          begin
+            dr := RInt(Ins2.Dest); sa := RInt(Ins2.Src1);
+            if (dr < 0) or (dr <> sa) then Bad := 'copyint';     // only the IV's self-copy
+          end;
+          ssaArrayLoad:
+          begin
+            if (Ins2.Src1.Kind <> svkArrayRef) or (Ins2.Src1.ArrayIndex < 0) or
+               (Ins2.Src1.ArrayIndex >= SSAProg.GetArrayCount) then Bad := 'load-array-shape'
+            else if SSAProg.GetArray(Ins2.Src1.ArrayIndex).ElementType <> srtFloat then Bad := 'load-not-float'
+            else if not Ins2.BoundsSafe then Bad := 'load-not-bounds-safe'
+            else
+            begin
+              // After the induction step has been passed, the IV no longer names THIS iteration's
+              // element - so an access that reads it there is off by one lane, not vectorisable.
+              if not IdxOK(Ins2.Src2) then Bad := 'load-index-not-unit-stride'
+              else if IvUpdated then Bad := 'access-after-iv-update'
+              else
+              begin
+                dr := RFlt(Ins2.Dest);
+                if dr < 0 then Bad := 'load-dest' else begin Lane[dr] := True; Inc(nl); end;
+              end;
+            end;
+          end;
+          ssaArrayStore:
+          begin
+            if (Ins2.Src1.Kind <> svkArrayRef) or (Ins2.Src1.ArrayIndex < 0) or
+               (Ins2.Src1.ArrayIndex >= SSAProg.GetArrayCount) then Bad := 'store-array-shape'
+            else if SSAProg.GetArray(Ins2.Src1.ArrayIndex).ElementType <> srtFloat then Bad := 'store-not-float'
+            else if not Ins2.BoundsSafe then Bad := 'store-not-bounds-safe'
+            else
+            begin
+              if not IdxOK(Ins2.Src2) then Bad := 'store-index-not-unit-stride'
+              else if IvUpdated then Bad := 'access-after-iv-update'
+              else if not FltOperandOK(Ins2.Dest) then Bad := 'store-value';
+              Inc(ns);
+            end;
+          end;
+          ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat:
+          begin
+            dr := RFlt(Ins2.Dest);
+            // ⛔ A REDUCTION is an operand the body writes but has not yet produced in THIS
+            // iteration - it arrives from the previous one, so two lanes would re-associate the
+            // sums. That is what FltOperandOK rejects, and it is the rule that delimits this whole
+            // project: bit-exactness, checked by aot_validate against the interpreter.
+            // `dest = dest + x` where dest was LOADED here is NOT a reduction - it is in-place
+            // work on this iteration's own element, and every lane keeps its own copy.
+            if dr < 0 then Bad := 'float-dest'
+            else if not FltOperandOK(Ins2.Src1) then Bad := 'reduction-or-carried-src1'
+            else if not FltOperandOK(Ins2.Src2) then Bad := 'reduction-or-carried-src2'
+            else
+            begin
+              Lane[dr] := IsLane(Ins2.Src1) or IsLane(Ins2.Src2);
+              Inc(na);
+            end;
+          end;
+        else
+          Bad := 'op:' + OpName(Ins2.OpCode);
+        end;
+        if Bad <> '' then Break;
+      end;
+      if (Bad = '') and (stp < 0) then Bad := 'no-iv-update';
+      if (Bad = '') and (ns = 0) then Bad := 'no-store';
+      // Every value the body computes must DIE in the body: a float or an index that is live on
+      // the way out would have to hold what the LAST scalar iteration left, and the vector loop
+      // does not run the last iterations - the scalar tail does.
+      if Bad = '' then
+        for k2 := 0 to MaxFReg do
+          if WroteF[k2] and (k2 < Length(OutF[bi + 1])) and OutF[bi + 1][k2] then
+          begin Bad := 'float-live-out'; Break; end;
+      if Bad = '' then
+        for k2 := 0 to MaxIReg do
+          if Wrote[k2] and (k2 <> iv) and (k2 < Length(OutI[bi + 1])) and OutI[bi + 1][k2] then
+          begin Bad := 'index-live-out'; Break; end;
+      // Every float the body touches must live in an xmm register. A memory-homed one would have
+      // to spill 128 bits into an 8-byte bank slot - and there is nowhere to put the second lane.
+      if Bad = '' then
+        for ii := 0 to Bb.Instructions.Count - 1 do
+        begin
+          Ins2 := Bb.Instructions[ii];
+          dr := RFlt(Ins2.Dest);  if (dr >= 0) and (FLoc[dr] < 0) then Bad := 'float-no-home';
+          dr := RFlt(Ins2.Src1);  if (dr >= 0) and (FLoc[dr] < 0) then Bad := 'float-no-home';
+          dr := RFlt(Ins2.Src2);  if (dr >= 0) and (FLoc[dr] < 0) then Bad := 'float-no-home';
+          if Bad <> '' then Break;
+        end;
+
+      if Bad <> '' then
+      begin
+        // Every candidate's verdict, with its loop WEIGHT: the first rejection is nearly always an
+        // initialisation loop nobody cares about, and reporting only that one hides the answer to
+        // the question actually being asked - why is the HOT loop not vectorised?
+        if AotDiagVecWhy <> '' then AotDiagVecWhy := AotDiagVecWhy + ' ';
+        AotDiagVecWhy := AotDiagVecWhy +
+          Format('b%d(w=%d):%s', [Region.FirstBlock + bi + 1, BlockW[bi + 1], Bad]);
+        System.Continue;
+      end;
+      if NVecLoop = Length(VecLoops) then SetLength(VecLoops, NVecLoop + 4);
+      VecLoops[NVecLoop].CondBlk := Region.FirstBlock + bi;
+      VecLoops[NVecLoop].BodyBlk := Region.FirstBlock + bi + 1;
+      VecLoops[NVecLoop].IvReg := iv;
+      VecLoops[NVecLoop].LimitReg := lim;
+      VecLoops[NVecLoop].StepReg := stp;
+      VecLoops[NVecLoop].LeRelation := Cb.Instructions[0].OpCode = ssaCmpLeInt;
+      VecLoops[NVecLoop].NLoad := nl;
+      VecLoops[NVecLoop].NStore := ns;
+      VecLoops[NVecLoop].NArith := na;
+      VecLoops[NVecLoop].Weight := BlockW[bi + 1];
+      SetLength(VecLoops[NVecLoop].IdxBase, MaxIReg + 1);
+      for k2 := 0 to MaxIReg do VecLoops[NVecLoop].IdxBase[k2] := IdxB[k2];
+      // Uniform floats: read by the body, never written by it - the same value in both lanes, so
+      // one unpcklpd before the loop puts it there and the scalar tail still reads the low half.
+      VecLoops[NVecLoop].NUniform := 0;
+      SetLength(VecLoops[NVecLoop].UniformF, 0);
+      for ii := 0 to Bb.Instructions.Count - 1 do
+      begin
+        Ins2 := Bb.Instructions[ii];
+        for q := 0 to 2 do
+        begin
+          case q of
+            0: dr := RFlt(Ins2.Src1);
+            1: dr := RFlt(Ins2.Src2);
+          else  if Ins2.OpCode = ssaArrayStore then dr := RFlt(Ins2.Dest) else dr := -1;
+          end;
+          if (dr < 0) or WroteF[dr] then System.Continue;
+          sa := 0;
+          for k2 := 0 to VecLoops[NVecLoop].NUniform - 1 do
+            if VecLoops[NVecLoop].UniformF[k2] = dr then begin sa := 1; Break; end;
+          if sa = 1 then System.Continue;
+          SetLength(VecLoops[NVecLoop].UniformF, VecLoops[NVecLoop].NUniform + 1);
+          VecLoops[NVecLoop].UniformF[VecLoops[NVecLoop].NUniform] := dr;
+          Inc(VecLoops[NVecLoop].NUniform);
+        end;
+      end;
+      Inc(NVecLoop);
+    end;
+    AotDiagVecLoops := NVecLoop;
   end;
 
   procedure Allocate;
@@ -5046,6 +5598,7 @@ begin
   NNote := 0;
   FuseDone := False;
   AotDiagCmpFused := 0;
+  AotDiagVecEmitted := 0;
   BailWhy := '';
   OK := True;
   ArrClassic := not AllowUnsafe;
@@ -5093,6 +5646,9 @@ begin
   PlanLinScan;    // AOT_LINSCAN (B1b): may replace the static homes with a per-INTERVAL schedule
   PlanDynFloat;   // AOT_DYNF: may replace the static float homes with a within-block dynamic schedule
   PlanDynInt;     // AOT_DYNF (c): same for the integer GPR pool (minus the array-descriptor cache)
+  // AOT_VEC (D1) runs LAST of the planners: it needs the final register homes, because a vector
+  // body works in 128-bit registers and a memory-homed float has an 8-byte bank slot to go back to.
+  ScanVecLoops;
   AotDiagDynFActive := DynFActive;
   AotDiagDynIActive := DynIActive;
   AotDiagLinScanActive := LsActive;
@@ -5232,6 +5788,18 @@ begin
     for b := Region.FirstBlock to Region.LastBlock do
     begin
       Blk := SSAProg.Blocks[b];
+      // D1: the two-lane loop goes in BEFORE the scalar condition block takes its offset, so that
+      // falling into the loop enters the vector version while every JUMP to the loop's label -
+      // the back edge included - still lands on the scalar one. Skipping the vector loop is
+      // always correct; it only ever costs speed.
+      for k := 0 to NVecLoop - 1 do
+        if VecLoops[k].CondBlk = b then
+        begin
+          if DumpOn then DumpNote(Format('vector loop (2 lanes) for block %d', [VecLoops[k].BodyBlk]));
+          if not EmitVecLoop(VecLoops[k]) then
+            if not OK then Exit;
+          Break;
+        end;
       BlockOff[b] := E.Len;
       // The loop weight is the single most useful number on a block header here: it is what says
       // whether the bytes below run once or a million times.
@@ -5514,6 +6082,10 @@ begin
                                    AotDiagHelperCalls, AotDiagCmpFused]));
         if AotDiagHelperOps <> '' then
           WriteLn(ErrOutput, '[AOT]   helper ops: ' + AotDiagHelperOps);
+        if AotVecEnabled then
+          WriteLn(ErrOutput, Format('[AOT]   vector: loops=%d emitted=%d%s',
+                  [AotDiagVecLoops, AotDiagVecEmitted,
+                   BoolToStr(AotDiagVecWhy <> '', '  rejected: ' + AotDiagVecWhy, '')]));
         // Which register strategy this region got. "merge" and "dynf" are mutually exclusive by
         // arbitration in AUTO (they are antagonistic, never additive); "static" means the region
         // got the plain static homes, either because AUTO judged it latency-bound or because
