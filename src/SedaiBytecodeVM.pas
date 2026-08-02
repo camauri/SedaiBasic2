@@ -8928,6 +8928,12 @@ end;
   stays on the runtime helper: its handler needs the console-behavior object. }
 function ParseLeadingInt64(const S: string): Int64; forward;
 
+// REGEXREPL: 1 = build the replacement in one measured allocation (the default), 0 = the library's
+// own quadratic Replace. -1 = the environment has not been read yet. Read once, on the first
+// substitution of the run.
+var
+  GRegexReplLinear: Integer = -1;
+
 function RegexCountMatches(const S, Pattern: string): Int64;
 // REGEXCOUNT: how many NON-OVERLAPPING matches of Pattern are in S. Backed by FPC's own RegExpr, so a
 // program gets a real regex engine rather than something hand-rolled - the point of having it at all.
@@ -8962,8 +8968,30 @@ function RegexReplaceAll(const S, Pattern, Repl: string): string;
 // REGEXREPLACE: every match of Pattern in S replaced by Repl. The replacement is LITERAL text (no \1
 // group references): the substitutions this is built for are plain, and taking the text as-is means a
 // replacement containing a backslash cannot silently turn into something else.
+//
+// ⛔ This deliberately does NOT call TRegExpr.Replace, which is QUADRATIC. Its body is
+//
+//     Result := '';
+//     repeat  Result := Result + Copy(input, prev, matchPos - prev);
+//             Result := Result + replacement;  until not ExecNext;
+//     Result := Result + Copy(input, prev, MaxInt);
+//
+// - a growing AnsiString built by repeated concatenation, so with M matches and an output of N bytes
+// it copies O(M*N). On regex-redux two of the substitutions have ~70 000 matches per megabyte, which
+// is 140 000 concatenations each re-copying the whole accumulated result. Decomposed (probe:
+// job/tests/bench/regexredux_phases.bas), the nine REGEXCOUNT calls scale perfectly linearly - 376,
+// 736, 1502, 3004 ms across four doublings - while the replacements go 141, 312, 750, 2095: factors
+// of 2.21, 2.40 and 2.79, growing. They grow rather than jumping straight to 4x because at small
+// sizes the allocator can still extend the buffer in place; that accident stops working as the
+// string gets big, which is the same lesson as the append-in-place work.
+//
+// The matching is untouched - same engine, same expression object, same Exec/ExecNext walk, so the
+// same matches in the same order. What changes is that the OUTPUT is measured first and built once:
+// one allocation, then Move for each span. The match walk still runs exactly once.
 var
   R: TRegExpr;
+  MStart, MLen: array of Integer;
+  NM, i, OutLen, SrcPos, DstPos, SegLen, RL, SLen: Integer;
 begin
   Result := S;
   if Pattern = '' then Exit;
@@ -8972,7 +9000,60 @@ begin
     try
       R.ModifierS := False;      // as in RegexCountMatches: '.' stops at end of line
       R.Expression := Pattern;
-      Result := R.Replace(S, Repl, False);
+      // REGEXREPL=0 restores the library's own quadratic Replace. It is the A/B for this work on a
+      // single binary, and the differential the guard is run under: the two paths must agree on
+      // every output, byte for byte, or the rewrite has changed a semantics rather than a cost.
+      if GRegexReplLinear < 0 then
+        if GetEnvironmentVariable('REGEXREPL') = '0' then GRegexReplLinear := 0
+        else GRegexReplLinear := 1;
+      if GRegexReplLinear = 0 then
+      begin
+        Result := R.Replace(S, Repl, False);
+        Exit;
+      end;
+      NM := 0;
+      if R.Exec(S) then
+      begin
+        SetLength(MStart, 64);
+        SetLength(MLen, 64);
+        repeat
+          if NM = Length(MStart) then
+          begin
+            SetLength(MStart, NM * 2);
+            SetLength(MLen, NM * 2);
+          end;
+          MStart[NM] := R.MatchPos[0];
+          MLen[NM] := R.MatchLen[0];
+          Inc(NM);
+        until not R.ExecNext;
+      end;
+      if NM = 0 then Exit;                   // no match: Result is already S, and shares its buffer
+      SLen := Length(S);
+      RL := Length(Repl);
+      OutLen := SLen;
+      for i := 0 to NM - 1 do OutLen := OutLen - MLen[i] + RL;
+      // Not SetLength on Result while it still aliases S - that would force a copy of S first.
+      Result := '';
+      SetLength(Result, OutLen);
+      DstPos := 1;
+      SrcPos := 1;
+      for i := 0 to NM - 1 do
+      begin
+        SegLen := MStart[i] - SrcPos;        // the untouched span before this match
+        if SegLen > 0 then
+        begin
+          Move(S[SrcPos], Result[DstPos], SegLen);
+          Inc(DstPos, SegLen);
+        end;
+        if RL > 0 then
+        begin
+          Move(Repl[1], Result[DstPos], RL);
+          Inc(DstPos, RL);
+        end;
+        SrcPos := MStart[i] + MLen[i];
+      end;
+      SegLen := SLen - SrcPos + 1;           // the tail after the last match
+      if SegLen > 0 then Move(S[SrcPos], Result[DstPos], SegLen);
     except
       Result := S;
     end;
