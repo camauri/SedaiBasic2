@@ -4288,6 +4288,7 @@ var
     // i.e. an accumulator, i.e. a reduction, i.e. not ours.
     Lane: array of Boolean;
     IvUpdated: Boolean;               // the induction step has been passed in this walk
+    HasFp: Boolean;                   // the loop reads or writes a FLOAT array element
     nl, ns, na: Integer;
 
     function RInt(const V: TSSAValue): Integer;
@@ -4327,6 +4328,16 @@ var
       r2 := RInt(V);
       Result := (r2 >= 0) and ((r2 = iv) or IsIdx[r2]);
     end;
+    // A candidate turned down BEFORE the body walk. These used to be silent, which made
+    // "loops=0" with an empty reject list read as "there are no loops here" - the one thing it does
+    // not mean. Reported at a lower volume than the body reasons (block and reason only, no
+    // weight: the weight array is indexed by body block and these have not been paired yet).
+    procedure PreReject(AtBlk: Integer; const Why: string);
+    begin
+      if AotDiagVecWhy <> '' then AotDiagVecWhy := AotDiagVecWhy + ' ';
+      AotDiagVecWhy := AotDiagVecWhy + Format('b%d%s:%s',
+        [Region.FirstBlock + AtBlk, BoolToStr(HasFp, '(fp)', ''), Why]);
+    end;
 
   begin
     NVecLoop := 0;
@@ -4348,19 +4359,41 @@ var
     begin
       Cb := SSAProg.Blocks[Region.FirstBlock + bi];
       Bb := SSAProg.Blocks[Region.FirstBlock + bi + 1];
-      // The condition block: exactly a compare on the induction variable and the branch out.
-      if Cb.Instructions.Count <> 2 then System.Continue;
-      Ins2 := Cb.Instructions[0];
-      if (Ins2.OpCode <> ssaCmpLeInt) and (Ins2.OpCode <> ssaCmpLtInt) then System.Continue;
-      iv := RInt(Ins2.Src1); lim := RInt(Ins2.Src2);
-      if (iv < 0) or (lim < 0) then System.Continue;
-      if Cb.Instructions[1].OpCode <> ssaJumpIfZero then System.Continue;
-      // The body: one block, falling out of the condition, jumping straight back to it.
-      if Bb.Instructions.Count < 4 then System.Continue;
+      // FIRST the back edge, because that is what makes these two blocks a LOOP. Reporting the
+      // other conditions before it turned the diagnostic into noise: every consecutive pair of
+      // blocks in the region failed "the condition block has exactly two instructions", and
+      // twenty-six of those a program does not make a missed opportunity.
+      if Bb.Instructions.Count = 0 then System.Continue;
       Ins2 := Bb.Instructions[Bb.Instructions.Count - 1];
       if Ins2.OpCode <> ssaJump then System.Continue;
       if Ins2.Dest.Kind <> svkLabel then System.Continue;
       if Ins2.Dest.LabelName <> Cb.LabelName then System.Continue;
+      // From here on this IS a loop, so every rejection is a real answer to "why not this one?".
+      // ⭐ And mark whether it touches a float array at all. That single bit is what makes the
+      // rejection tally rankable: a loop with no float element access can never become a float map
+      // however far the recogniser is widened, so counting those in with the rest would inflate
+      // every "gap" and send the next session after nothing. Rejections carry ",fp" when the loop
+      // really does have the raw material.
+      HasFp := False;
+      for ii := 0 to Bb.Instructions.Count - 1 do
+      begin
+        Ins2 := Bb.Instructions[ii];
+        if ((Ins2.OpCode = ssaArrayLoad) or (Ins2.OpCode = ssaArrayStore)) and
+           (Ins2.Src1.Kind = svkArrayRef) and (Ins2.Src1.ArrayIndex >= 0) and
+           (Ins2.Src1.ArrayIndex < SSAProg.GetArrayCount) and
+           (SSAProg.GetArray(Ins2.Src1.ArrayIndex).ElementType = srtFloat) then
+        begin HasFp := True; Break; end;
+      end;
+      if Cb.Instructions.Count <> 2 then
+      begin PreReject(bi, 'cond-not-two-instructions'); System.Continue; end;
+      Ins2 := Cb.Instructions[0];
+      if (Ins2.OpCode <> ssaCmpLeInt) and (Ins2.OpCode <> ssaCmpLtInt) then
+      begin PreReject(bi, 'cond-not-a-counted-test'); System.Continue; end;
+      iv := RInt(Ins2.Src1); lim := RInt(Ins2.Src2);
+      if (iv < 0) or (lim < 0) then begin PreReject(bi, 'cond-operands'); System.Continue; end;
+      if Cb.Instructions[1].OpCode <> ssaJumpIfZero then
+      begin PreReject(bi, 'cond-not-jumpifzero'); System.Continue; end;
+      if Bb.Instructions.Count < 4 then begin PreReject(bi, 'body-too-small'); System.Continue; end;
 
       for k2 := 0 to MaxIReg do begin IsIdx[k2] := False; IdxB[k2] := -1; Wrote[k2] := False; end;
       for k2 := 0 to MaxFReg do begin WroteF[k2] := False; Lane[k2] := False; end;
@@ -4374,8 +4407,8 @@ var
         q := RInt(Ins2.Dest); if q >= 0 then Wrote[q] := True;
         q := RFlt(Ins2.Dest); if q >= 0 then WroteF[q] := True;
       end;
-      if not Wrote[iv] then System.Continue;                     // the IV must advance in here
-      if Wrote[lim] then System.Continue;
+      if not Wrote[iv] then begin PreReject(bi, 'iv-not-advanced-here'); System.Continue; end;
+      if Wrote[lim] then begin PreReject(bi, 'limit-not-invariant'); System.Continue; end;
 
       Bad := ''; stp := -1; nl := 0; ns := 0; na := 0;
       for ii := 0 to Bb.Instructions.Count - 1 do
@@ -4492,7 +4525,8 @@ var
         // the question actually being asked - why is the HOT loop not vectorised?
         if AotDiagVecWhy <> '' then AotDiagVecWhy := AotDiagVecWhy + ' ';
         AotDiagVecWhy := AotDiagVecWhy +
-          Format('b%d(w=%d):%s', [Region.FirstBlock + bi + 1, BlockW[bi + 1], Bad]);
+          Format('b%d(w=%d%s):%s',
+            [Region.FirstBlock + bi + 1, BlockW[bi + 1], BoolToStr(HasFp, ',fp', ''), Bad]);
         System.Continue;
       end;
       if NVecLoop = Length(VecLoops) then SetLength(VecLoops, NVecLoop + 4);
