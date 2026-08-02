@@ -262,6 +262,15 @@ var
   GAotDumpState: Integer = -1;
   GAotDumpDir: string = '';
   GAotDumpSeq: Integer = 0;
+  // AOT_ARRW: how much a cached array BASE is worth against a register home in the unified
+  // competition. MaxInt = env not yet read (0 is a legal value here, so -1 cannot be the sentinel).
+  GArrBaseWState: Integer = MaxInt;
+  // AOT_CMPFUSE=0 puts an integer compare and the branch that consumes it back on the historic
+  // nine-instruction sequence (the A/B on one binary). -1 = env not yet read.
+  GAotCmpFuseState: Integer = -1;
+  // How many compare/branch pairs the last compilation fused. Counting, not timing, is what says
+  // whether a codegen rule ever fires - the lesson of the div-by-constant pass that was blind.
+  AotDiagCmpFused: Integer = 0;
   // Did the interval allocator actually run for the last region, and what did it place?
   AotDiagLinScanActive: Boolean = False;
   AotDiagLsPlacedInt: Integer = 0;
@@ -585,6 +594,56 @@ begin
     else GAotAscMidInlineState := 1;
   end;
   Result := (GAotAscMidInlineState = 1) and GAotStrHdrOK;
+end;
+
+function AotCmpFuse: Boolean;
+// Emit an integer compare and the branch that is its only consumer as one `cmp` + `jcc`, instead of
+// materialising the boolean through setcc/movzx/neg and testing it back. AOT_CMPFUSE=0 restores the
+// historic sequence, which is the A/B baseline on a single binary.
+begin
+  if GAotCmpFuseState < 0 then
+  begin
+    if GetEnvironmentVariable('AOT_CMPFUSE') = '0' then GAotCmpFuseState := 0
+    else GAotCmpFuseState := 1;
+  end;
+  Result := GAotCmpFuseState = 1;
+end;
+
+function ArrBaseWeight: Integer;
+// What one loop-weighted array access is worth against one loop-weighted register mention in the
+// unified allocation competition (see Allocate). AOT_ARRW=<n>; the DEFAULT IS 1, the historic 1:1.
+//
+// ⛔ MEASURED AND REJECTED (2 Aug 2026) at the model-correct value 2 -- do not re-enable without a
+// new measurement, and do not "fix" the default back. The model is right: an uncached access emits
+// two DEPENDENT instructions to find the data pointer where a spilled register costs one, so a base
+// slot really is worth twice a register home, and AOT_DUMP confirms the allocator then does what it
+// should (matmul: arr2.data takes r12, the weakest winner r20 spills, the hot loop drops from 22 to
+// 20 instructions and from 3 memory accesses to 2).
+//
+// It buys NOTHING on the clock. Interleaved A/B on one binary, six runs per arm: matmul best 2689
+// -> 2674 (-0.6%), median 2712 -> 2705, against an OFF-arm spread of 2.3%. The null floor was
+// measured the honest way -- of nine probes, four (intpoly, cvtpoly, nbody, strops) compile
+// BYTE-IDENTICAL under both settings and still read 1-2% apart, so 1-2% IS the noise, and nothing
+// measured anywhere exceeded it.
+//
+// ⭐ What the negative TEACHES is worth more than the change: a loop running at ~3.6 IPC does not
+// get faster when you remove two of its twenty-two instructions. matmul's hot loop is not bound by
+// instruction COUNT (nor by memory: the same total work with an L3-resident working set is SLOWER,
+// 2957 ms against 2721 -- see job/tests/bench/matmul_l1.bas). It is bound by the dependency chain
+// through each element: load index, add, copy to rcx, load element, movaps, mulsd, addsd, movaps,
+// store. Cuts that shorten that CHAIN will pay; cuts that only shorten the list will not - which is
+// also the strongest argument for the vector unit, since four lanes traverse the chain once for
+// four elements.
+var s: string;
+begin
+  if GArrBaseWState = MaxInt then
+  begin
+    s := GetEnvironmentVariable('AOT_ARRW');
+    if s = '' then GArrBaseWState := 1
+    else GArrBaseWState := StrToIntDef(s, 1);
+    if GArrBaseWState < 1 then GArrBaseWState := 1;
+  end;
+  Result := GArrBaseWState;
 end;
 
 function AotDumpDir: string;
@@ -1229,6 +1288,11 @@ var
   CurOrd: Integer;                      // ordinal of Cur (indexes the SSA->PC map)
   CurBlkIdx: Integer;                   // absolute block index of Cur (set by the emit loop)
   CurIsBlockLast: Boolean;              // Cur is its block's last instruction (jump elision)
+  // One instruction of lookahead, published by the emit loop because the block object and the
+  // in-block index are declared after every nested routine and so are invisible here. Used by the
+  // compare/branch fusion, which needs to know what consumes the boolean it is about to build.
+  CurNext: TSSAInstruction;             // the instruction after Cur in the same block (nil if none)
+  CurNextIsLast: Boolean;               // ...and that instruction is the block's last
   LabelIdx: TStringList;                // region-local label -> block-list index
   HelperOps: TStringList;               // diagnostics: op name of every helper call emitted
 
@@ -1276,6 +1340,7 @@ var
   NNote: Integer;
   DumpHdr: TStringList;                 // the register legend, captured BEFORE the body: ILoc/FLoc
                                         // are mutated by the dynamic allocators as emission walks
+  FuseDone: Boolean;                    // the compare just emitted absorbed the branch that follows
 
   procedure Fail(const Why: string);
   begin
@@ -1648,8 +1713,69 @@ var
     begin E.EmitBytes([$48, $69, $C0]); E.Emit32(LongWord(TrueVal and $FFFFFFFF)); end;
     IStore(IReg(Cur.Dest), RAX);
   end;
-  procedure IntCmp(SetCC: Byte);
+  // Is this integer compare consumed by NOTHING but the branch right after it? Then its boolean
+  // never has to exist. Today the pair costs nine instructions - load, cmp, setcc, movzx, neg, store
+  // the boolean, load it back, test, jcc - where the machine has one addressing mode for the whole
+  // thing. It is the single largest item in a counted loop: seven of the twenty-nine instructions in
+  // matmul's innermost loop, and every For in every program pays it.
+  //
+  // The conditions are deliberately narrow, because what makes this safe is that NOTHING can run
+  // between the compare and the branch - not another instruction, and not an allocator event that
+  // emits code:
+  //   - the branch is the block's LAST instruction and the compare is immediately before it, so no
+  //     third instruction sits between them and the flags cannot be clobbered;
+  //   - the boolean is not live out of the block, so nobody downstream reads the value we skip
+  //     writing (its static home is loaded in the prologue and flushed in the epilogue, so leaving
+  //     it untouched round-trips the bank slot unchanged - which is the correct behaviour for a
+  //     value that is dead);
+  //   - the interval allocator is OFF, because its end-of-range events emit a write-back and would
+  //     store a register we deliberately never wrote. The within-block dynamic allocators emit no
+  //     code at their events, so they do not disqualify.
+  function CmpBranchFusible(out Nx: TSSAInstruction; out TargetBlk: Integer): Boolean;
+  var dr, rb: Integer;
   begin
+    Result := False; TargetBlk := -1; Nx := nil;
+    if not AotCmpFuse then Exit;
+    if LsActive then Exit;
+    if not LivenessOK then Exit;
+    if (CurNext = nil) or not CurNextIsLast then Exit;
+    Nx := CurNext;
+    if (Nx.OpCode <> ssaJumpIfZero) and (Nx.OpCode <> ssaJumpIfNotZero) then Exit;
+    if Nx.Dest.Kind <> svkLabel then Exit;
+    if (Cur.Dest.Kind <> svkRegister) or (Cur.Dest.RegType <> srtInt) then Exit;
+    if (Nx.Src1.Kind <> svkRegister) or (Nx.Src1.RegType <> srtInt) then Exit;
+    dr := Prog.AotRemapIntReg(Cur.Dest.RegIndex);
+    if (dr < 0) or (dr <> Prog.AotRemapIntReg(Nx.Src1.RegIndex)) then Exit;
+    rb := CurBlkIdx - Region.FirstBlock;
+    if (LiveNB = 0) or (rb < 0) or (rb >= LiveNB) then Exit;
+    if (dr >= Length(OutI[rb])) or OutI[rb][dr] then Exit;      // still read after the branch
+    TargetBlk := LabelIdx.IndexOf(Nx.Dest.LabelName);
+    if TargetBlk < 0 then Exit;
+    TargetBlk := PtrInt(LabelIdx.Objects[TargetBlk]);
+    Result := True;
+  end;
+
+  procedure IntCmp(SetCC: Byte);
+  var Nx: TSSAInstruction; tgt, n1, s1, s2: Integer; cc: Byte;
+  begin
+    if CmpBranchFusible(Nx, tgt) then
+    begin
+      s1 := IReg(Cur.Src1); s2 := IReg(Cur.Src2); if not OK then Exit;
+      // Compare straight out of the home register when there is one: the scratch round-trip through
+      // rax exists only for a memory-homed operand.
+      n1 := IAlloc(s1);
+      if n1 >= 0 then IOp([$48, $3B], n1, s2)
+      else begin ILoad(RAX, s1); IOp([$48, $3B], RAX, s2); end;
+      if not OK then Exit;
+      // set<cc> is 0F 9x and j<cc> is 0F 8x with the same low nibble; the low bit of that nibble is
+      // the condition's negation, and JumpIfZero branches when the compare is FALSE.
+      cc := SetCC - $10;
+      if Nx.OpCode = ssaJumpIfZero then cc := cc xor 1;
+      JccRel(cc, tgt);
+      FuseDone := True;                                 // the branch itself now emits nothing
+      Inc(AotDiagCmpFused);
+      Exit;
+    end;
     ILoad(RAX, IReg(Cur.Src1));
     IOp([$48, $3B], RAX, IReg(Cur.Src2));               // cmp rax, src2
     E.EmitBytes([$0F, SetCC, $C0]);                     // setcc al
@@ -3766,9 +3892,10 @@ var
   end;
 
   procedure Allocate;
-  var r, k, id, best, bestUse, bestKind: Integer;
+  var r, k, id, best, bestUse, bestKind, ArrW: Integer;
       Taken, TakenAB, TakenAC: array of Boolean;
   begin
+    ArrW := ArrBaseWeight;
     // GPRs r9..r15: UNIFIED candidate pool by use count (the JIT's J6f model) - VM int
     // registers (kind -1) compete with array descriptor slots (kind 0 = data base,
     // kind 1 = count; base preferred over count of the same array at equal frequency).
@@ -3783,11 +3910,22 @@ var
         begin best := r; bestUse := IUse[r]; bestKind := -1; end;
       for id := 0 to MaxArrId do
       begin
-        // For a BASE, AUse is exactly the dynamic reload count avoided by caching (one reload
-        // per access, loop-weighted). A COUNT competes only when some non-safe access will
-        // actually read it - an all-BoundsSafe array's count slot would be dead weight.
-        if (not TakenAB[id]) and (AUse[id] > bestUse) then
-        begin best := id; bestUse := AUse[id]; bestKind := 0; end;
+        // A BASE slot and a register home are NOT worth the same per use, and comparing their raw
+        // counts (which is what this did until 2026-08-02) systematically under-values the base.
+        // An uncached access emits TWO instructions to find the data pointer - `mov rdx,[r8+16]`
+        // for the descriptor table, then `mov rdx,[rdx+id*32+off]` for the field - and they are
+        // DEPENDENT, so they cost latency as well as issue slots. A spilled VM register costs one
+        // instruction per mention. Hence ARR_BASE_WEIGHT.
+        //
+        // It is an upper bound, not an identity: when the array's count is NOT cached and some
+        // access is non-safe, the descriptor-table load is emitted for the count anyway and caching
+        // the base only saves one. Exact for BoundsSafe accesses, which is the hot-loop case the
+        // slot exists for. AOT_ARRW=0 restores the historic 1:1 comparison (the A/B on one binary).
+        //
+        // A COUNT competes only when some non-safe access will actually read it - an all-BoundsSafe
+        // array's count slot would be dead weight - and it saves one load, so it stays at 1:1.
+        if (not TakenAB[id]) and (AUse[id] * ArrW > bestUse) then
+        begin best := id; bestUse := AUse[id] * ArrW; bestKind := 0; end;
         if (not TakenAC[id]) and (id <= High(ArrCountNeeded)) and ArrCountNeeded[id] and
            (AUse[id] > bestUse) then
         begin best := id; bestUse := AUse[id]; bestKind := 1; end;
@@ -4706,6 +4844,8 @@ var
 
       ssaJump, ssaJumpIfZero, ssaJumpIfNotZero:
       begin
+        // The compare before this one already emitted the whole thing as a single jcc.
+        if FuseDone then begin FuseDone := False; Exit; end;
         // Resolve the target through the region's OWN label->index map (built from the
         // actual list positions): TSSABasicBlock.BlockIndex is stamped at SSA construction
         // and goes stale when later passes (LICM pre-headers) insert blocks mid-list.
@@ -4896,12 +5036,16 @@ var
 var
   b, j, k, w, d, TargetOff: Integer;
   Blk: TSSABasicBlock;
+  RankI, RankA: array of Integer;       // AOT_DUMP: scratch copies of IUse/AUse for the loser
+                                        // ranking - the originals are still read by diagnostics
 begin
   Result := nil;
   LabelIdx := nil;
   DumpHdr := nil;
   DumpOn := AotDumpDir <> '';           // read ONCE: the emit loop must never touch the environment
   NNote := 0;
+  FuseDone := False;
+  AotDiagCmpFused := 0;
   BailWhy := '';
   OK := True;
   ArrClassic := not AllowUnsafe;
@@ -4984,6 +5128,36 @@ begin
         DumpHdr.Add('# cache arr' + IntToStr(ACacheId[k]) + '.data -> ' + GprName(ACacheReg[k]))
       else
         DumpHdr.Add('# cache arr' + IntToStr(ACacheId[k]) + '.count -> ' + GprName(ACacheReg[k]));
+    // Who LOST the competition, and by how much. Without this the legend says what the allocator
+    // did but not what it turned down, and every "why is this value in memory" question has to be
+    // answered by re-deriving the use counts by hand. The margin between the last winner and the
+    // first loser is the number that says whether the pool is the binding constraint.
+    SetLength(RankI, MaxIReg + 1);
+    for k := 0 to MaxIReg do if ILoc[k] < 0 then RankI[k] := IUse[k] else RankI[k] := 0;
+    SetLength(RankA, MaxArrId + 1);
+    for k := 0 to MaxArrId do
+      if (k < Length(AUse)) and (CachedBase(k) < 0) then RankA[k] := AUse[k] else RankA[k] := 0;
+    d := 0;
+    repeat
+      b := -1; w := 0; j := -1;                       // j: -1 = int reg, 0 = array base
+      for k := 0 to MaxIReg do
+        if RankI[k] > w then begin b := k; w := RankI[k]; j := -1; end;
+      for k := 0 to MaxArrId do
+        if RankA[k] > w then begin b := k; w := RankA[k]; j := 0; end;
+      if b < 0 then Break;
+      if j < 0 then
+      begin
+        DumpHdr.Add('# spilled int r' + IntToStr(b) + ' (uses=' + IntToStr(w) + ')');
+        RankI[b] := 0;
+      end
+      else
+      begin
+        DumpHdr.Add('# uncached arr' + IntToStr(b) + '.data (uses=' + IntToStr(w) +
+                    ', costs 2 dependent loads per access)');
+        RankA[b] := 0;
+      end;
+      Inc(d);
+    until d >= 12;
   end;
 
   E := TX86Emitter.Create;
@@ -5068,6 +5242,12 @@ begin
         Cur := Blk.Instructions[j];
         CurBlkIdx := b;
         CurIsBlockLast := j = Blk.Instructions.Count - 1;
+        if CurIsBlockLast then begin CurNext := nil; CurNextIsLast := False; end
+        else
+        begin
+          CurNext := Blk.Instructions[j + 1];
+          CurNextIsLast := j + 1 = Blk.Instructions.Count - 1;
+        end;
         // AOT_DYNF start event: the temp defined here becomes resident in its home BEFORE the
         // instruction is emitted, so its defining store writes that register.
         if DynFActive and (DynFHomeReg[DynPos] >= 0) then
@@ -5324,13 +5504,14 @@ begin
       if Diag then
       begin
         WriteLn(ErrOutput, Format('[AOT] compiled %-24s entryPC=%-6d liveness=%s peakLive int=%d float=%d ' +
-                                  'maxLive int=%d float=%d distinct int=%d float=%d helpers=%d',
+                                  'maxLive int=%d float=%d distinct int=%d float=%d helpers=%d ' +
+                                  'cmpfused=%d',
                                   [Regions[r].Name, Regions[r].EntryPC,
                                    BoolToStr(AotDiagLivenessOK, 'ok', 'NOT-CONVERGED'),
                                    AotDiagPeakLiveInt, AotDiagPeakLiveFloat,
                                    AotDiagMaxLiveInt, AotDiagMaxLiveFloat,
                                    AotDiagDistinctInt, AotDiagDistinctFloat,
-                                   AotDiagHelperCalls]));
+                                   AotDiagHelperCalls, AotDiagCmpFused]));
         if AotDiagHelperOps <> '' then
           WriteLn(ErrOutput, '[AOT]   helper ops: ' + AotDiagHelperOps);
         // Which register strategy this region got. "merge" and "dynf" are mutually exclusive by
