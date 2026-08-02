@@ -365,7 +365,7 @@ procedure AotSetRecordLayout(RecordsOff, RecSize, RecIntOff, RecFloatOff, Shared
 
 implementation
 
-uses TypInfo;
+uses TypInfo, Cpu;   // Cpu: AVXSupport, the RUNTIME feature check the AVX vector path is gated on
 
 // Record layout handed in by AotSetRecordLayout. Zero = "not supplied", which keeps every record op
 // on the helper. Compilation is single-threaded (the same reason the SSA name pool is), so unit
@@ -605,17 +605,30 @@ begin
   Result := (GAotAscMidInlineState = 1) and GAotStrHdrOK;
 end;
 
-function AotVecEnabled: Boolean;
-// D1: two-lane SSE2 for elementwise float loops. OFF by default - AOT_VEC=1 turns it on - because
-// this is a loop transformation, the class where a mistake is a silent wrong answer rather than a
-// crash, and the nets that decide are real programs.
+function AotVecLanes: Integer;
+// How wide the vector path runs. 0 = off, which is the DEFAULT: this is a loop transformation, the
+// class where a mistake is a silently wrong answer rather than a crash, and the nets that decide
+// are real programs.
+//   AOT_VEC=1 or =2  two lanes, SSE2 - the x86-64 baseline, always available
+//   AOT_VEC=4        four lanes, AVX - falls back to two where the CPU has no AVX
+// ⚠️ The AVX check is at RUN time, not build time: the emitted code runs on the machine executing
+// the program, and the AOT bakes instructions, not a compiler flag. AVXSupport comes from the RTL's
+// cpu unit, which does the CPUID and the XGETBV the OS-enabled-state check needs.
 begin
   if GAotVecState < 0 then
   begin
-    if GetEnvironmentVariable('AOT_VEC') = '1' then GAotVecState := 1
-    else GAotVecState := 0;
+    case GetEnvironmentVariable('AOT_VEC') of
+      '1', '2': GAotVecState := 2;
+      '4': if AVXSupport then GAotVecState := 4 else GAotVecState := 2;
+    else        GAotVecState := 0;
+    end;
   end;
-  Result := GAotVecState = 1;
+  Result := GAotVecState;
+end;
+
+function AotVecEnabled: Boolean;
+begin
+  Result := AotVecLanes > 0;
 end;
 
 function AotCmpFuse: Boolean;
@@ -2691,6 +2704,43 @@ var
       AotSib(BaseReg);                             // mov rax <-> [base+rcx*8]
     end;
   end;
+  { --- VEX encodings (AVX, four lanes) --------------------------------------------------------
+    Always the THREE-byte form (C4). The two-byte one cannot express REX.X or REX.B, and a vector
+    body indexes arrays through whatever registers the allocator handed out - r11 as a base and r12
+    as an index are entirely normal here. One byte more per instruction against a whole class of
+    encoding bug is not a trade worth thinking about.
+
+    Layout: C4 / ~R ~X ~B mmmmm / W ~vvvv L pp. mmmmm = 1 for the 0F map, 3 for 0F3A; pp = 1 for
+    the 66 prefix; L = 1 selects 256 bits. vvvv is the SECOND source - which is the real gift of
+    VEX here: `vaddpd d, a, b` is non-destructive, so the vector body never needs the register copy
+    the two-lane SSE path emits when the destination aliases neither operand. }
+  procedure VexPrefix(mm, ww, vvvv, L, pp, R, X, B: Integer);
+  begin
+    E.Emit8($C4);
+    E.Emit8(((1 - R) shl 7) or ((1 - X) shl 6) or ((1 - B) shl 5) or (mm and $1F));
+    E.Emit8((ww shl 7) or (((not vvvv) and $0F) shl 3) or (L shl 2) or pp);
+  end;
+  // <vex> <op> ModRM(mod=11, reg=Dst, rm=Rm): Dst := Vvvv <op> Rm, register to register.
+  procedure VexRR(Op: Byte; L, Dst, Vvvv, Rm: Integer);
+  begin
+    VexPrefix(1, 0, Vvvv, L, 1, Ord(Dst >= 8), 0, Ord(Rm >= 8));
+    E.Emit8(Op);
+    E.Emit8($C0 or ((Dst and 7) shl 3) or (Rm and 7));
+  end;
+  // <vex> <op> ModRM(reg=Dst, rm=100) SIB(scale 8, index, base) - the same addressing the scalar
+  // and two-lane paths use, so the index register arrives where it already is.
+  procedure VexSib(Op: Byte; L, Dst, BaseReg, IdxReg: Integer);
+  var sib: Byte;
+  begin
+    VexPrefix(1, 0, 0, L, 1, Ord(Dst >= 8), Ord(IdxReg >= 8), Ord(BaseReg >= 8));
+    E.Emit8(Op);
+    sib := $C0 or ((IdxReg and 7) shl 3) or (BaseReg and 7);
+    if (BaseReg and 7) = 5 then
+    begin E.Emit8($40 or ((Dst and 7) shl 3) or 4); E.Emit8(sib); E.Emit8($00); end
+    else
+    begin E.Emit8(((Dst and 7) shl 3) or 4); E.Emit8(sib); end;
+  end;
+
   // 128-bit SIB form: <prefix> [REX] 0F <op> ModRM(reg=xmm, rm=100) SIB(scale 8, index, base).
   // The scalar AotSib cannot be reused: its index is hard-wired to rcx and it has no REX.X, and a
   // vector body wants the index where it already is. Base low-3 = 101 (rbp/r13) has no mod=00
@@ -2915,6 +2965,7 @@ var
     AccArr, AccIdx, AccBase: array of Integer;   // one entry per array access, in body order
     RunBase: array of Integer;                   // final int reg -> its base AT THIS POINT
     AccStore: array of Boolean;
+    Lanes, ExitPatch: Integer;
     NAcc: Integer;
     GuardA, GuardB: array of Integer;            // base-register pairs a guard must compare
     NGuard: Integer;
@@ -2936,9 +2987,12 @@ var
       end;
     end;
 
-    // dst := dst <op> src, in packed doubles, out of the homes the scalar body already uses.
+    // d := a <op> b in packed doubles. At four lanes VEX is three-operand, so this is one
+    // instruction whatever the aliasing; at two, SSE is destructive and the general case costs a
+    // register copy first.
     procedure PdOp(const Op: array of Byte; d, a, b: Integer; Comm: Boolean);
     begin
+      if Lanes = 4 then begin VexRR(Op[2], 1, d, a, b); Exit; end;
       if d = a then SseRR(Op, d, b)
       else if Comm and (d = b) then SseRR(Op, d, a)
       else if d <> b then begin SseRR(PD_MOV, d, a); SseRR(Op, d, b); end
@@ -2950,8 +3004,36 @@ var
       end;
     end;
 
+    procedure VecLoad(dst, baseR, idxR: Integer);
+    begin
+      if Lanes = 4 then VexSib($10, 1, dst, baseR, idxR)          // vmovupd ymmD, [base+idx*8]
+      else SseSib([$66, $0F, $10], dst, baseR, idxR);             // movupd  xmmD, [base+idx*8]
+    end;
+    procedure VecStore(src, baseR, idxR: Integer);
+    begin
+      if Lanes = 4 then VexSib($11, 1, src, baseR, idxR)
+      else SseSib([$66, $0F, $11], src, baseR, idxR);
+    end;
+    // Put a loop-invariant scalar in EVERY lane. ⚠️ vbroadcastsd from a REGISTER is AVX2, and this
+    // CPU has AVX only - so the AVX1 route: duplicate into the low 128 bits, then insert that half
+    // into the high one. VEX.128 zeroes bits 128-255 first, which is exactly what makes the second
+    // step complete the job rather than leave stale lanes.
+    procedure VecBroadcast(h: Integer);
+    begin
+      if Lanes = 4 then
+      begin
+        VexRR($14, 0, h, h, h);                                   // vunpcklpd xmm h, h, h
+        VexPrefix(3, 0, h, 1, 1, Ord(h >= 8), 0, Ord(h >= 8));    // VEX.256.66.0F3A.W0
+        E.Emit8($18);                                             // vinsertf128
+        E.Emit8($C0 or ((h and 7) shl 3) or (h and 7));
+        E.Emit8($01);                                             // into the HIGH half
+      end
+      else SseRR([$66, $0F, $14], h, h);                          // unpcklpd xmm h, h
+    end;
+
   begin
     Result := False;
+    Lanes := AotVecLanes;
     Bb := SSAProg.Blocks[V.BodyBlk];
 
     // Pass 1: the accesses, and whether every dependence between them can be GUARDED. Nothing is
@@ -3025,15 +3107,20 @@ var
         JccRel($85, V.CondBlk);
       end;
       // --- broadcasts -----------------------------------------------------------------------
+      // ⚠️ AFTER the guards: a guard that jumps out must not have dirtied any ymm, or the path it
+      // takes would need a vzeroupper it does not have.
       for k2 := 0 to V.NUniform - 1 do
-        SseRR([$66, $0F, $14], FLoc[V.UniformF[k2]], FLoc[V.UniformF[k2]]);   // unpcklpd h, h
+        VecBroadcast(FLoc[V.UniformF[k2]]);
       // --- vector condition -----------------------------------------------------------------
       VTop := E.Len;
       ILoad(RAX, V.IvReg);
-      E.EmitBytes([$48, $83, $C0, $01]);                    // add rax, 1  (the second lane)
+      E.EmitBytes([$48, $83, $C0, Byte(Lanes - 1)]);        // add rax, lanes-1  (the LAST lane)
       IOp([$48, $3B], RAX, V.LimitReg);                     // cmp rax, limit
-      if V.LeRelation then JccRel($8F, V.CondBlk)           // jg  -> fewer than two left
-      else JccRel($8D, V.CondBlk);                          // jge -> fewer than two left
+      // Out through a trampoline rather than straight to the scalar loop: at four lanes the exit
+      // owes a vzeroupper, and this is the only path that has dirtied the upper halves.
+      E.Emit8($0F);
+      if V.LeRelation then E.Emit8($8F) else E.Emit8($8D);  // jg / jge -> not a full vector left
+      ExitPatch := E.Len; E.Emit32(0);
       // --- body -----------------------------------------------------------------------------
       for ii := 0 to Bb.Instructions.Count - 1 do
       begin
@@ -3050,14 +3137,14 @@ var
             aid := Ins2.Src1.ArrayIndex;
             ILoad(RCX, Prog.AotRemapIntReg(Ins2.Src2.RegIndex));
             VecBase(aid, baseR);
-            SseSib([$66, $0F, $10], FH(Ins2.Dest), baseR, RCX);        // movupd xmmD, [base+rcx*8]
+            VecLoad(FH(Ins2.Dest), baseR, RCX);
           end;
           ssaArrayStore:
           begin
             aid := Ins2.Src1.ArrayIndex;
             ILoad(RCX, Prog.AotRemapIntReg(Ins2.Src2.RegIndex));
             VecBase(aid, baseR);
-            SseSib([$66, $0F, $11], FH(Ins2.Dest), baseR, RCX);        // movupd [base+rcx*8], xmmS
+            VecStore(FH(Ins2.Dest), baseR, RCX);
           end;
           ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat:
           begin
@@ -3077,11 +3164,18 @@ var
           Exit;
         end;
       end;
-      // --- step by two and go round ----------------------------------------------------------
+      // --- step by one vector and go round ----------------------------------------------------
       ILoad(RAX, V.IvReg);
-      E.EmitBytes([$48, $83, $C0, $02]);                    // add rax, 2
+      E.EmitBytes([$48, $83, $C0, Byte(Lanes)]);            // add rax, lanes
       IStore(V.IvReg, RAX);
       E.Emit8($E9); E.Emit32(LongWord(VTop - (E.Len + 4))); // jmp Vtop
+      // --- the exit trampoline ----------------------------------------------------------------
+      E.Patch32(ExitPatch, LongWord(E.Len - (ExitPatch + 4)));
+      // ⚠️ Falling from 256-bit VEX code into the legacy-SSE scalar loop without this costs a
+      // ~70-cycle state transition on Sandy/Ivy Bridge, EVERY time - which would have eaten the
+      // whole win and looked like "AVX is not faster here". vzeroupper preserves the low 128 bits
+      // of every register, so the broadcast the scalar tail still reads survives it.
+      if Lanes = 4 then E.EmitBytes([$C5, $F8, $77]);       // vzeroupper
       Result := True;
       Inc(AotDiagVecEmitted);
     finally
@@ -5795,7 +5889,9 @@ begin
       for k := 0 to NVecLoop - 1 do
         if VecLoops[k].CondBlk = b then
         begin
-          if DumpOn then DumpNote(Format('vector loop (2 lanes) for block %d', [VecLoops[k].BodyBlk]));
+          if DumpOn then
+            DumpNote(Format('vector loop (%d lanes) for block %d',
+                            [AotVecLanes, VecLoops[k].BodyBlk]));
           if not EmitVecLoop(VecLoops[k]) then
             if not OK then Exit;
           Break;
@@ -6083,8 +6179,8 @@ begin
         if AotDiagHelperOps <> '' then
           WriteLn(ErrOutput, '[AOT]   helper ops: ' + AotDiagHelperOps);
         if AotVecEnabled then
-          WriteLn(ErrOutput, Format('[AOT]   vector: loops=%d emitted=%d%s',
-                  [AotDiagVecLoops, AotDiagVecEmitted,
+          WriteLn(ErrOutput, Format('[AOT]   vector: %d lanes, loops=%d emitted=%d%s',
+                  [AotVecLanes, AotDiagVecLoops, AotDiagVecEmitted,
                    BoolToStr(AotDiagVecWhy <> '', '  rejected: ' + AotDiagVecWhy, '')]));
         // Which register strategy this region got. "merge" and "dynf" are mutually exclusive by
         // arbitration in AUTO (they are antagonistic, never additive); "static" means the region
