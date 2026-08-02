@@ -21,12 +21,32 @@
 '' are always positive, so nothing else needs a sign.
 
 Const BASE = 1000000000        '' 10^9 - a limb product stays inside 64 bits for the small multipliers here
-Const LIMBS = 4096             '' ~36k decimal digits of headroom
+
+'' ⛔ LIMBS IS NOT A ROUND NUMBER PICKED FOR COMFORT - it is the size of the answer, and getting it
+'' wrong is SILENT. The spigot's denominator is the product of the odd numbers, about (2K)!! after K
+'' terms, and it takes ~3.29 terms per digit of pi. So the decimal width of den grows as
+''     digits(den) ~= K * log10(2K/e),  K ~= 3.29 * N
+'' which at N = 2890 is already ~36 500 decimal digits: exactly the 4096 limbs this program used to
+'' declare. Past that point mulSmall writes beyond the last limb and - in MODERN, where an
+'' out-of-range array store is DROPPED to keep memory safe - nothing is raised: the top limbs simply
+'' vanish and the digits quietly go wrong. The 2026-08-02 CLBG battery at the official N = 10000 is
+'' what found it, after nine sessions of green nets at N = 1000 saw nothing.
+''
+''     N = 10 000  ->  K ~= 32 900  ->  den ~= 144 000 decimal digits ~= 16 000 limbs
+''
+'' 24576 limbs = ~221 000 decimal digits, i.e. headroom to about N = 15 000. Cost: seven arrays of
+'' 24576 Int64 = 1.4 MB, which is nothing next to being wrong.
+Const LIMBS = 24576
 
 '' A bignum is (array, used-length). They live as shared arrays because BASIC has no by-value struct
 '' that would make the arithmetic readable.
 Dim Shared As LongInt acc(0 To LIMBS-1), den(0 To LIMBS-1), num(0 To LIMBS-1)
 Dim Shared As LongInt tmp(0 To LIMBS-1), tmp2(0 To LIMBS-1), tmp3(0 To LIMBS-1)
+'' divDigit's scratch, SHARED rather than local: a local array is allocated and zeroed on every call,
+'' measured at 4622 ns per call when it was 32 KB - and at 24576 limbs it would be 192 KB per call,
+'' for a function called once per digit. divDigit never recurses and this program is single
+'' threaded, so one shared buffer is safe.
+Dim Shared As LongInt probe(0 To LIMBS-1)
 Dim Shared As Integer accN, denN, numN, tmpN, tmp2N, tmp3N
 Dim Shared As Integer accSgn = 1     '' sign of acc; den and num are always positive
 
@@ -151,7 +171,6 @@ End Sub
 
 '' The digit q with den*q <= a < den*(q+1), for q in 0..9.
 Function divDigit( a() As LongInt, ByVal an As Integer, b() As LongInt, ByVal bn As Integer ) As Integer
-  Dim As LongInt probe(0 To LIMBS-1)
   Dim As Integer pn
   For q As Integer = 9 To 0 Step -1
     copyBig( probe(), pn, b(), bn )
@@ -189,6 +208,15 @@ Do While i < N
   mulSmall( acc(), accN, k2 )        '' k2 > 0, so the sign is unchanged
   mulSmall( den(), denN, k2 )
   mulSmall( num(), numN, k )
+
+  '' Fail LOUDLY if the bignums ever reach the end of their storage. Without this the failure mode
+  '' is the worst one there is: MODERN drops the out-of-range store, the top limbs disappear and the
+  '' program keeps printing confident, wrong digits (2026-08-02: correct to 2884 digits, then
+  '' degrading to 9999999999). One comparison per TERM - not per limb - so it costs nothing.
+  If denN >= LIMBS - 4 Then
+    Print "pidigits: LIMBS too small - den needs "; Str(denN); " limbs at digit "; Str(i)
+    End
+  End If
 
   '' num is positive, so a negative acc is always the smaller one.
   If accSgn < 0 Then Continue Do

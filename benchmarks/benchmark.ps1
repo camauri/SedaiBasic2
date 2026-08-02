@@ -507,7 +507,9 @@ function Invoke-Arm {
             break
         }
         if ($r.Ms -lt $best) { $best = $r.Ms }
-        Write-Host ("{0} ms" -f (Format-Ms $r.Ms)) -ForegroundColor DarkGray
+        # Format-Ms already carries the unit ("143,7s" past ten seconds, plain milliseconds below),
+        # so appending " ms" produced "143,7s ms" on every long run of the standard-size battery.
+        Write-Host ("{0}{1}" -f (Format-Ms $r.Ms), $(if ($r.Ms -lt 10000) { " ms" } else { "" })) -ForegroundColor DarkGray
     }
 
     # A COMPARISON runtime that cannot run the program here is not a benchmark failure: several CLBG
