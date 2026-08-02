@@ -41,7 +41,7 @@ unit SedaiBytecodeVM;
 interface
 
 uses
-  Classes, SysUtils, Math, Variants, StrUtils, DateUtils, RegExpr,
+  Classes, SysUtils, Math, Variants, StrUtils, DateUtils, RegExpr, SedaiRegexEngine,
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
   SedaiConsoleBehavior, SedaiConsoleState, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue,
@@ -8933,6 +8933,19 @@ function ParseLeadingInt64(const S: string): Int64; forward;
 // substitution of the run.
 var
   GRegexReplLinear: Integer = -1;
+  // REGEX_ENGINE=sedai selects our own automaton (SedaiRegexEngine) for the patterns it can
+  // compile, falling back to the library for the rest. Default OFF while the engine is being
+  // proved: this is a prototype whose FIRST job is to be measured against the thing it replaces,
+  // on the same binary and the same inputs.
+  GRegexOwnEngine: Integer = -1;
+
+function RegexUseOwnEngine: Boolean;
+begin
+  if GRegexOwnEngine < 0 then
+    if LowerCase(GetEnvironmentVariable('REGEX_ENGINE')) = 'sedai' then GRegexOwnEngine := 1
+    else GRegexOwnEngine := 0;
+  Result := GRegexOwnEngine = 1;
+end;
 
 function RegexCountMatches(const S, Pattern: string): Int64;
 // REGEXCOUNT: how many NON-OVERLAPPING matches of Pattern are in S. Backed by FPC's own RegExpr, so a
@@ -8941,9 +8954,24 @@ function RegexCountMatches(const S, Pattern: string): Int64;
 // around it treat bad input.
 var
   R: TRegExpr;
+  RX: TCompiledRegex;
+  RXOwned: Boolean;
 begin
   Result := 0;
   if (Pattern = '') or (S = '') then Exit;
+  if RegexUseOwnEngine then
+  begin
+    // Borrowed from the cache unless Owned: see AcquirePattern for why the
+    // cache never evicts and why that is what makes the borrow safe.
+    RX := AcquirePattern(Pattern, RXOwned);
+    if RX <> nil then
+    try
+      Exit(RegexEngineCount(RX, S));
+    finally
+      if RXOwned then RX.Free;
+    end;
+    // nil = a construct outside the regular subset; fall through to the library.
+  end;
   R := TRegExpr.Create;
   try
     try
@@ -8992,9 +9020,21 @@ var
   R: TRegExpr;
   MStart, MLen: array of Integer;
   NM, i, OutLen, SrcPos, DstPos, SegLen, RL, SLen: Integer;
+  RX: TCompiledRegex;
+  RXOwned: Boolean;
 begin
   Result := S;
   if Pattern = '' then Exit;
+  if RegexUseOwnEngine then
+  begin
+    RX := AcquirePattern(Pattern, RXOwned);
+    if RX <> nil then
+    try
+      Exit(RegexEngineReplace(RX, S, Repl));
+    finally
+      if RXOwned then RX.Free;
+    end;
+  end;
   R := TRegExpr.Create;
   try
     try
