@@ -255,6 +255,13 @@ var
   // ASCMIDINLINE=0 forces bcStrAscMid back to the pure helper call (the A/B on one binary).
   // -1 = env not yet read.
   GAotAscMidInlineState: Integer = -1;
+  // AOT_DUMP: write the emitted machine code of every compiled region to disk, together with the
+  // annotation map that says which SSA instruction each byte range came from. Purely observational
+  // - with the variable unset not one byte of the codegen path changes. -1 = env not yet read,
+  // GAotDumpDir empty = off. See AotDumpDir.
+  GAotDumpState: Integer = -1;
+  GAotDumpDir: string = '';
+  GAotDumpSeq: Integer = 0;
   // Did the interval allocator actually run for the last region, and what did it place?
   AotDiagLinScanActive: Boolean = False;
   AotDiagLsPlacedInt: Integer = 0;
@@ -578,6 +585,41 @@ begin
     else GAotAscMidInlineState := 1;
   end;
   Result := (GAotAscMidInlineState = 1) and GAotStrHdrOK;
+end;
+
+function AotDumpDir: string;
+// Where AOT_DUMP writes, or '' when it is off (the default, and then nothing at all is recorded).
+// AOT_DUMP=<path> picks the directory; AOT_DUMP=1 means job/aotdump. Every region compiled leaves
+// two files behind: <seq>_<region>.bin, the exact bytes handed to TExecMem, and <seq>_<region>.map,
+// which says what the emitter was doing at each offset - SSA ordinal, bytecode PC, op name - plus
+// the register legend. Reading a disassembly without that legend is guesswork: the machine register
+// numbers mean nothing until you know which VM bank slot each one is standing in for.
+begin
+  if GAotDumpState < 0 then
+  begin
+    GAotDumpDir := Trim(GetEnvironmentVariable('AOT_DUMP'));
+    if (GAotDumpDir = '1') or (LowerCase(GAotDumpDir) = 'yes') then
+      GAotDumpDir := 'job' + PathDelim + 'aotdump'
+    else if GAotDumpDir = '0' then
+      GAotDumpDir := '';
+    if (GAotDumpDir <> '') and not ForceDirectories(GAotDumpDir) then
+      GAotDumpDir := '';                     // undumpable path: stay silent rather than fail a run
+    GAotDumpState := Ord(GAotDumpDir <> '');
+  end;
+  Result := GAotDumpDir;
+end;
+
+function GprName(R: Integer): string;
+const
+  N: array[0..15] of string = ('rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi',
+                               'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15');
+begin
+  if (R >= 0) and (R <= 15) then Result := N[R] else Result := '?';
+end;
+
+function XmmName(R: Integer): string;
+begin
+  if (R >= 0) and (R <= 15) then Result := 'xmm' + IntToStr(R) else Result := '?';
 end;
 
 function AotSkipMainDefault(CombinedMode: Boolean): Boolean;
@@ -1223,11 +1265,36 @@ var
   LsActive: Boolean;
   LsTakeAt: TLsEventList;               // position -> web ids that take their machine home here
   LsFreeAt: TLsEventList;               // position -> web ids whose life ends here
+  // AOT_DUMP (observational only). DumpOn is read ONCE per region so the emit loop tests a boolean
+  // and never the environment; every recording site is guarded by it at the CALL, not inside Note,
+  // because the argument is a Format() that would otherwise be built on every instruction of every
+  // compilation. DumpAt/DumpTxt are a parallel array of (native offset, what the emitter was about
+  // to do), in emission order - which is already offset order.
+  DumpOn: Boolean;
+  DumpAt: array of Integer;
+  DumpTxt: array of string;
+  NNote: Integer;
+  DumpHdr: TStringList;                 // the register legend, captured BEFORE the body: ILoc/FLoc
+                                        // are mutated by the dynamic allocators as emission walks
 
   procedure Fail(const Why: string);
   begin
     if OK then BailWhy := Why;
     OK := False;
+  end;
+
+  // AOT_DUMP: remember that whatever is emitted from the CURRENT offset on is S. Never called
+  // unless DumpOn (the guard lives at the call site - see the declaration).
+  procedure DumpNote(const S: string);
+  begin
+    if NNote = Length(DumpAt) then
+    begin
+      SetLength(DumpAt, NNote * 2 + 64);
+      SetLength(DumpTxt, NNote * 2 + 64);
+    end;
+    DumpAt[NNote] := E.Len;
+    DumpTxt[NNote] := S;
+    Inc(NNote);
   end;
 
   // Mapped bytecode PC of the current instruction; Fail when the map has none.
@@ -4772,12 +4839,69 @@ var
     end;
   end;
 
+  // AOT_DUMP: leave the finished region on disk. Two files, because they answer two different
+  // questions and only one of them needs a disassembler: the .bin is exactly what TExecMem is about
+  // to copy into executable memory (feed it to `objdump -b binary -m i386:x86-64`), and the .map
+  // says what the emitter was doing at each offset. job/tests/tools/aot_disasm.ps1 merges them.
+  //
+  // Called after the jump fixups are patched, so the branch displacements on disk are the ones that
+  // will actually run - a dump taken before them shows every jump going to itself.
+  procedure WriteDump;
+  var
+    Base, nm: string;
+    i: Integer;
+    L: TStringList;
+    Fs: TFileStream;
+  begin
+    nm := '';
+    for i := 1 to Length(Region.Name) do
+      if Region.Name[i] in ['A'..'Z', 'a'..'z', '0'..'9', '_'] then nm := nm + Region.Name[i]
+      else nm := nm + '_';
+    if nm = '' then nm := 'region';
+    Base := IncludeTrailingPathDelimiter(AotDumpDir) + Format('%.3d_%s', [GAotDumpSeq, nm]);
+    Inc(GAotDumpSeq);
+    try
+      Fs := TFileStream.Create(Base + '.bin', fmCreate);
+      try
+        if E.Len > 0 then Fs.WriteBuffer(E.Bytes^, E.Len);
+      finally
+        Fs.Free;
+      end;
+      L := TStringList.Create;
+      try
+        L.Add('# region ' + Region.Name + '  bytes=' + IntToStr(E.Len));
+        L.Add('# blocks=' + IntToStr(Region.FirstBlock) + '..' + IntToStr(Region.LastBlock) +
+              ' ssa=' + IntToStr(Region.InstrCount) + ' entryPC=' + IntToStr(Region.EntryPC));
+        L.Add('# frame=' + IntToStr(FrameSize) + ' helperCalls=' + IntToStr(NHelperCalls) +
+              ' linscan=' + BoolToStr(LsActive, True) +
+              ' dynf=' + BoolToStr(DynFActive, True) +
+              ' dyni=' + BoolToStr(DynIActive, True) +
+              ' rsiPool=' + BoolToStr(RsiIsPool, True));
+        L.Add('# epilogue=' + IntToStr(EpiOff) + ' bareEpilogue=' + IntToStr(BareEpiOff));
+        L.AddStrings(DumpHdr);
+        for i := 0 to NNote - 1 do
+          L.Add(IntToStr(DumpAt[i]) + #9 + DumpTxt[i]);
+        L.SaveToFile(Base + '.map');
+      finally
+        L.Free;
+      end;
+    except
+      // A dump that cannot be written must never take the run down with it: this is a diagnostic,
+      // and the compiled code is already correct and complete at this point.
+      on E2: Exception do
+        WriteLn(ErrOutput, '[AOT_DUMP] ', Base, ': ', E2.Message);
+    end;
+  end;
+
 var
   b, j, k, w, d, TargetOff: Integer;
   Blk: TSSABasicBlock;
 begin
   Result := nil;
   LabelIdx := nil;
+  DumpHdr := nil;
+  DumpOn := AotDumpDir <> '';           // read ONCE: the emit loop must never touch the environment
+  NNote := 0;
   BailWhy := '';
   OK := True;
   ArrClassic := not AllowUnsafe;
@@ -4840,10 +4964,33 @@ begin
     if SSAProg.Blocks[k].LabelName <> '' then
       LabelIdx.AddObject(SSAProg.Blocks[k].LabelName, TObject(PtrInt(k)));
 
+  // AOT_DUMP register legend, captured HERE and not at write time: the dynamic allocators mutate
+  // ILoc/FLoc as emission walks, so by the end they describe the last instruction, not the region.
+  // rbx and rsi are the two bases the prologue installs; the pool assignments are what a
+  // disassembly cannot possibly tell you on its own.
+  if DumpOn then
+  begin
+    DumpHdr := TStringList.Create;
+    DumpHdr.Add('# base rbx=IntRegs  rsi=' + BoolToStr(RsiIsPool, 'pool', 'FloatRegs') +
+                '  scratch rax/rcx/rdx xmm0/xmm1');
+    for k := 0 to NIAlloc - 1 do
+      DumpHdr.Add('# home int r' + IntToStr(IAllocd[k]) + ' -> ' + GprName(ILoc[IAllocd[k]]) +
+                  ' (uses=' + IntToStr(IUse[IAllocd[k]]) + ')');
+    for k := 0 to NFAlloc - 1 do
+      DumpHdr.Add('# home float f' + IntToStr(FAllocd[k]) + ' -> ' + XmmName(FLoc[FAllocd[k]]) +
+                  ' (uses=' + IntToStr(FUse[FAllocd[k]]) + ')');
+    for k := 0 to NACache - 1 do
+      if ACacheKind[k] = 0 then
+        DumpHdr.Add('# cache arr' + IntToStr(ACacheId[k]) + '.data -> ' + GprName(ACacheReg[k]))
+      else
+        DumpHdr.Add('# cache arr' + IntToStr(ACacheId[k]) + '.count -> ' + GprName(ACacheReg[k]));
+  end;
+
   E := TX86Emitter.Create;
   try
     SetLength(BlockOff, SSAProg.Blocks.Count);
     for k := 0 to High(BlockOff) do BlockOff[k] := -1;
+    if DumpOn then DumpNote('prologue');
 
     // Frame layout. A region with no helper call stays a leaf and keeps exactly the frame it
     // has always had (nothing, or 16 bytes for xmm6/7) - the validated codegen must not move
@@ -4912,6 +5059,10 @@ begin
     begin
       Blk := SSAProg.Blocks[b];
       BlockOff[b] := E.Len;
+      // The loop weight is the single most useful number on a block header here: it is what says
+      // whether the bytes below run once or a million times.
+      if DumpOn then
+        DumpNote(Format('block %d %s w=%d', [b, Blk.LabelName, BlockW[b - Region.FirstBlock]]));
       for j := 0 to Blk.Instructions.Count - 1 do
       begin
         Cur := Blk.Instructions[j];
@@ -4923,11 +5074,15 @@ begin
         begin
           FLoc[DynFHomeReg[DynPos]] := DynFHomeXmm[DynPos];
           DynFCur[DynFHomeXmm[DynPos]] := DynFHomeReg[DynPos];
+          if DumpOn then
+            DumpNote(Format('~dynf f%d takes %s', [DynFHomeReg[DynPos], XmmName(DynFHomeXmm[DynPos])]));
         end;
         if DynIActive and (DynIHomeReg[DynPos] >= 0) then
         begin
           ILoc[DynIHomeReg[DynPos]] := DynIHomeGpr[DynPos];
           DynICur[DynIHomeGpr[DynPos]] := DynIHomeReg[DynPos];
+          if DumpOn then
+            DumpNote(Format('~dyni r%d takes %s', [DynIHomeReg[DynPos], GprName(DynIHomeGpr[DynPos])]));
         end;
         // B1b start events: every web starting here takes its machine home BEFORE the instruction,
         // so a defining store writes it. A web that opens on a USE - the region's entry live-ins,
@@ -4938,6 +5093,11 @@ begin
           for k := 0 to High(LsTakeAt[DynPos]) do
           begin
             w := LsTakeAt[DynPos][k];
+            if DumpOn then
+              DumpNote(Format('~web%d %s%d takes %s%s', [w,
+                       BoolToStr(LsWebs[w].Bank = 1, 'f', 'r'), LsWebs[w].Reg,
+                       BoolToStr(LsWebs[w].Bank = 1, XmmName(LsWebs[w].Home), GprName(LsWebs[w].Home)),
+                       BoolToStr(LsWebs[w].NeedsLoad, ' (load)', '')]));
             if LsWebs[w].Bank = 1 then
             begin
               FLoc[LsWebs[w].Reg] := LsWebs[w].Home;
@@ -4959,11 +5119,16 @@ begin
           begin
             w := LsFreeAt[DynPos][k];
             if not LsWebs[w].StoreEarly then System.Continue;
+            if DumpOn then
+              DumpNote(Format('~web%d %s%d writes back early', [w,
+                       BoolToStr(LsWebs[w].Bank = 1, 'f', 'r'), LsWebs[w].Reg]));
             if LsWebs[w].Bank = 1 then
               SseMem([$F2, $0F, $11], LsWebs[w].Home, RSI, LongWord(LsWebs[w].Reg) * 8)
             else
               StoreRegMem(LsWebs[w].Home, LongWord(LsWebs[w].Reg) * 8);
           end;
+        if DumpOn then
+          DumpNote(Format('#%d pc=%d %s', [CurOrd, Prog.GetSsaPc(CurOrd), OpName(Cur.OpCode)]));
         d := E.Len;
         EmitInstruction;
         if not OK then Exit;
@@ -5001,6 +5166,10 @@ begin
           for k := 0 to High(LsFreeAt[DynPos]) do
           begin
             w := LsFreeAt[DynPos][k];
+            if DumpOn then
+              DumpNote(Format('~web%d %s%d released%s', [w,
+                       BoolToStr(LsWebs[w].Bank = 1, 'f', 'r'), LsWebs[w].Reg,
+                       BoolToStr(LsWebs[w].HasDef and not LsWebs[w].StoreEarly, ' (store)', '')]));
             if LsWebs[w].Bank = 1 then
             begin
               if LsWebs[w].HasDef and not LsWebs[w].StoreEarly then
@@ -5023,12 +5192,14 @@ begin
 
     // Epilogue: rax already holds the exit PC; flush allocated regs and return.
     EpiOff := E.Len;
+    if DumpOn then DumpNote('epilogue (flush + teardown)');
     for k := 0 to NIAlloc - 1 do
       StoreRegMem(ILoc[IAllocd[k]], LongWord(IAllocd[k]) * 8);
     for k := 0 to NFAlloc - 1 do
       SseMem([$F2, $0F, $11], FLoc[FAllocd[k]], RSI, LongWord(FAllocd[k]) * 8);
     // B3 bare epilogue: same teardown, no flush (see the declaration comment).
     BareEpiOff := E.Len;
+    if DumpOn then DumpNote('bare epilogue (teardown only)');
     if FrameSize > 0 then
     begin
       w := 0;
@@ -5067,12 +5238,14 @@ begin
         while (k + j < HelperOps.Count) and (HelperOps[k + j] = HelperOps[k]) do Inc(j);
         if j > 1 then AotDiagHelperOps := AotDiagHelperOps + '*' + IntToStr(j);
       end;
+    if DumpOn then WriteDump;
     Result := TExecMem.Create(E);
     if Result.Ptr = nil then begin FreeAndNil(Result); Fail('exec-alloc'); end;
   finally
     E.Free;
     LabelIdx.Free;
     HelperOps.Free;
+    DumpHdr.Free;
     if (Result = nil) and (BailWhy = '') then BailWhy := 'unknown';
   end;
 end;
@@ -5100,6 +5273,9 @@ begin
   // Revisit only once allocation is fixed and the benchmark is traversal-bound again -- and measure
   // it then, because it buys cross-thread exposure in compiled code that nothing currently pays for.
   GNoThreads := True;
+  if AotDumpDir <> '' then
+    WriteLn(ErrOutput, '[AOT] AOT_DUMP: region dumps go to ', AotDumpDir,
+            ' (disassemble with job/tests/tools/aot_disasm.ps1)');
   for r := 0 to SSAProg.Blocks.Count - 1 do
   begin
     for n := 0 to SSAProg.Blocks[r].Instructions.Count - 1 do
