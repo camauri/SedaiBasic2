@@ -6178,6 +6178,22 @@ var
 begin
   Result := '';
   if Count <= 0 then Exit;
+  // ⚡ INPUT counts BYTES, so the whole request is one call. It used to walk the loop below asking
+  // the file layer for ONE BYTE at a time and doing `Result := Result + Data` per byte - the same
+  // shape as the 712 us-per-line file reader, and it made a block read of stdin pointless even
+  // where it worked at all. WINPUT still needs the loop: it counts CODEPOINTS, so it cannot know
+  // how many bytes to ask for until it has looked at them.
+  if (not Wide) and (Handle <> 0) then
+  begin
+    if not Assigned(FOnFileData) then
+      raise Exception.Create('INPUT: no file handler assigned');
+    Data := IntToStr(Count);          // GETN# carries the count in and the bytes out
+    ErrorCode := 0;
+    FOnFileData(Self, 'GETN#', Handle, Data, ErrorCode);
+    if ErrorCode <> 0 then
+      raise Exception.CreateFmt('INPUT error %d reading from file %d', [ErrorCode, Handle]);
+    Exit(Data);
+  end;
   Got := 0;
   while Got < Count do
   begin

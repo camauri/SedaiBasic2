@@ -75,6 +75,7 @@ type
     function StdInBuffered: Boolean;
     function StdInRefill: Boolean;              // returns False at end of input
     function StdInReadLine(out Line: string): Boolean;
+    function StdInReadBytes(Count: Integer; out Data: string): Boolean;
     function StdInAtEof: Boolean;
   public
     destructor Destroy; override;
@@ -200,6 +201,32 @@ begin
   // A CRLF stream leaves the CR at the end of the line; BASIC must not see it.
   if (Length(Line) > 0) and (Line[Length(Line)] = #13) then SetLength(Line, Length(Line) - 1);
   Result := True;
+end;
+
+function TVMFileHandler.StdInReadBytes(Count: Integer; out Data: string): Boolean;
+// Count bytes, RAW - no terminator handling, no CR stripping: this backs INPUT(n [, #f]), which
+// FreeBASIC defines as "reads a number of characters", not lines.
+//
+// It exists because the device branch of FileData used to drop GET# on the floor: INPUT(65536, #1)
+// on stdin returned an EMPTY STRING and no error, so a program that read its input in blocks - the
+// shape the reference implementations use, and the shape fbc is 4.4x faster with - silently read
+// nothing at all. Guardian: job/tests/bas/bug_input_block_device.bas.
+var
+  Take, OldLen: Integer;
+begin
+  Data := '';
+  if Count <= 0 then Exit(False);
+  while Length(Data) < Count do
+  begin
+    if not StdInRefill then Break;        // genuinely finished: a short read is not an error
+    Take := FInLen - FInPos;
+    if Take > Count - Length(Data) then Take := Count - Length(Data);
+    OldLen := Length(Data);
+    SetLength(Data, OldLen + Take);
+    Move(FInBuf[FInPos], Data[OldLen + 1], Take);   // out of the block in one Move, never per byte
+    Inc(FInPos, Take);
+  end;
+  Result := Data <> '';
 end;
 
 {$IFDEF WINDOWS}
@@ -435,6 +462,8 @@ var
   LStart, LSize: Int64;
   LGot, LIdx, LOld, LUsed: Integer;
   LTerm: Boolean;
+  LWant: Integer;      // INPUT(n [, #f]): bytes requested, carried in through Data
+  Ch2: Char;
 begin
   ErrorCode := 0;
 
@@ -507,6 +536,29 @@ begin
       else System.Write(System.Output, Data);
       Exit;
     end;
+    // INPUT(n [, #f]) on a DEVICE. These used to fall through to the Exit below and answer an empty
+    // string with no error, which made a block read of stdin return NOTHING - silently. See
+    // StdInReadBytes.
+    if (Command = 'GETN#') or (Command = 'GET#') then
+    begin
+      if FDeviceKind[Handle] <> 1 then begin Data := ''; Exit; end;   // output device: nothing to read
+      if Command = 'GET#' then LWant := 1 else LWant := StrToIntDef(Data, 0);
+      if StdInBuffered then
+      begin
+        if not StdInReadBytes(LWant, Data) then Data := '';
+        Exit;
+      end;
+      // Interactive console: no reading ahead (see the StdInBuffered comment), so one byte at a time.
+      Line := '';
+      while Length(Line) < LWant do
+      begin
+        if System.Eof(System.Input) then Break;
+        System.Read(System.Input, Ch2);
+        Line := Line + Ch2;
+      end;
+      Data := Line;
+      Exit;
+    end;
     if Command = 'DCLOSE' then begin FDeviceKind[Handle] := 0; FFileModes[Handle] := ''; Exit; end;
     Exit;   // LOF/LOC/SEEK and the record commands mean nothing on a device
   end;
@@ -557,6 +609,20 @@ begin
   else if Command = 'GET#' then
   begin
     if FS.Read(Ch, 1) > 0 then Data := Chr(Ch) else Data := '';
+  end
+  else if Command = 'GETN#' then
+  begin
+    // INPUT(n, #f): n bytes in ONE read. Data carries the count in, the bytes out. A short read at
+    // end of file is not an error, exactly as FreeBASIC does.
+    LWant := StrToIntDef(Data, 0);
+    Data := '';
+    if LWant > 0 then
+    begin
+      SetLength(Data, LWant);
+      LGot := FS.Read(Data[1], LWant);
+      if LGot < 0 then LGot := 0;
+      SetLength(Data, LGot);
+    end;
   end
   else if (Command = 'INPUT#') or (Command = 'LINEINPUT#') then
   begin
