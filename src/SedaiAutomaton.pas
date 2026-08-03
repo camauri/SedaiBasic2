@@ -37,6 +37,33 @@ type
   // any size costs the same as a single literal.
   TByteClass = array[0..31] of Byte;
 
+  { The VECTOR prefilter's table.
+
+    The scalar three-byte filter costs ~12 operations per input byte and, measured, is 82% of a
+    COUNT over DNA - the restarts it saves are only the other 18%. So the win left is in the SKIP
+    itself, and a skip is exactly the thing that goes sixteen bytes at a time.
+
+    ⭐ The design is NOT Hyperscan's Teddy, and deliberately. Teddy exists because a general literal
+    set is large and has to be hashed into buckets through pshufb nibble tables; our prefix sets are
+    TINY - "agggtaaa|tttaccct" has the two three-byte prefixes {agg, ttt} - and with few enough of
+    them a direct comparison is both simpler and EXACT:
+
+        for each prefix q:  pcmpeqb(chunk[p], q0) & pcmpeqb(chunk[p+1], q1) & pcmpeqb(chunk[p+2], q2)
+
+    That is ~15 operations per SIXTEEN bytes, it needs only SSE2 (no pshufb, no bucket assignment,
+    no nibble tables), and it admits exactly the 2 triples out of 64 that can really start a match
+    where the hashed filter admits 4%. Cost grows with the number of prefixes, so the count is capped
+    and anything wider stays on the scalar filter.
+
+    Each prefix byte is stored pre-SPLATTED across sixteen lanes, so the scan loop only ever does
+    aligned loads - there is no broadcast on the hot path. }
+  TVecPrefixFilter = record
+    N: Integer;                                    // prefixes in use, 1..VEC_MAX_PREFIX
+    // [prefix][byte position][lane]. 8 x 3 x 16 = 384 bytes, one cache line short of L1 trivia.
+    Splat: array[0..7, 0..2, 0..15] of Byte;
+  end;
+  PVecPrefixFilter = ^TVecPrefixFilter;
+
   TNfaKind = (
     nkClass,   // consume one byte if it is in Cls, then go to Next1
     nkSplit,   // consume nothing, go to BOTH Next1 and Next2
@@ -144,6 +171,11 @@ type
     // one is a single failed attempt.
     FTriple: array[0..8191] of Byte;
     FHasTriple: Boolean;
+    // The vector prefilter - see TVecPrefixFilter. Preferred over the hashed triple when the set of
+    // three-byte prefixes is small enough to compare directly, which for the benchmark patterns it
+    // is (two to four of them).
+    FVec: TVecPrefixFilter;
+    FHasVec: Boolean;
     // The two prefilters are built ON DEMAND, not by the constructor - see
     // BuildFilters. False means the scan cascade simply falls back to the
     // first-byte filter: slower, never wrong.
@@ -154,6 +186,7 @@ type
     procedure ComputeFirstBytes;
     procedure ComputePairFilter;
     procedure ComputeTripleFilter;
+    procedure ComputeVecFilter;
   public
     constructor Create(ABuilder: TNfaBuilder; ANfaStart: Integer);
     // Longest match ANCHORED at Start (0-based) in Data[0..Len-1]. Returns the
@@ -226,6 +259,9 @@ var
   // Turning them off answers which of those two a workload is - and it is only
   // ever a MEASUREMENT: without the filters the scan is slower, never wrong.
   GDfaSkipFilters: Boolean = False;
+  // REGEX_NOVEC=1: build the scalar filters but not the vector one, which is the A/B for the SSE2
+  // prefilter on a single binary. The scan falls back to the hashed triple - slower, never wrong.
+  GDfaSkipVec: Boolean = False;
   // How many transitions the subset construction has computed, and how many
   // DFAs have been built. Counters, not a stopwatch: a timer says a thing is
   // slow, a counter says WHAT it did too much of.
@@ -533,6 +569,10 @@ begin
   if GDfaSkipFilters then Exit;      // diagnostic A/B, REGEX_NOFILTER=1
   ComputePairFilter;
   ComputeTripleFilter;
+  // Last, because it is the one the scan prefers and it needs the transitions the other two have
+  // already forced into existence. REGEX_NOVEC=1 leaves it off, which is the A/B against the scalar
+  // filter on one binary.
+  if not GDfaSkipVec then ComputeVecFilter;
 end;
 
 procedure TDfa.EnsureFilters(SubjectLen: Integer);
@@ -712,6 +752,62 @@ begin
   FHasPair := (nset > 0) and (nset < 45000);
 end;
 
+{$IFDEF CPUX86_64}
+function VecScanPrefix(Data: PByte; From, LastP: Integer; F: PVecPrefixFilter): Integer; assembler; nostackframe;
+{ First position in Data[From..LastP] whose three-byte window matches one of F^'s prefixes, or -1.
+  Sixteen candidate positions per iteration.
+
+  ⚠️ It reads Data[p .. p+17] for a block starting at p, so the caller's LastP must leave two bytes
+  of slack: LastP <= Len-3. Positions past the last full block are the caller's to finish scalar.
+
+  Win64 registers: RCX = Data, EDX = From, R8D = LastP, R9 = F. Volatile only (RAX, RCX, RDX, R8-R11,
+  XMM0-5), so there is nothing to save and the frame can go. }
+asm
+    movslq  %edx, %rdx                  // p  = From
+    movslq  %r8d,  %r8                  // last position we may test
+    movl    (%r9), %r10d                // N = number of prefixes
+    addq    $4, %r9                     // -> Splat[0][0][0]
+.Lblock:
+    leaq    15(%rdx), %rax
+    cmpq    %r8, %rax
+    jg      .Lnone                      // fewer than 16 positions left: caller finishes it
+    movdqu  (%rcx,%rdx,1), %xmm0        // bytes at p
+    movdqu  1(%rcx,%rdx,1), %xmm1       // bytes at p+1
+    movdqu  2(%rcx,%rdx,1), %xmm2       // bytes at p+2
+    pxor    %xmm3, %xmm3                // accumulated "some prefix matches here"
+    xorl    %eax, %eax                  // prefix index
+    movq    %r9, %r11                   // -> this prefix's three splat vectors
+.Lpref:
+    movdqu  (%r11), %xmm4               // movdqU: Splat sits at offset 4 in the record, so it is
+    pcmpeqb %xmm0, %xmm4                // NOT 16-byte aligned and movdqa would fault. Same speed
+    movdqu  16(%r11), %xmm5             // here - the table is three cache lines and always hot.
+    pcmpeqb %xmm1, %xmm5
+    pand    %xmm5, %xmm4
+    movdqu  32(%r11), %xmm5
+    pcmpeqb %xmm2, %xmm5
+    pand    %xmm5, %xmm4
+    por     %xmm4, %xmm3
+    addq    $48, %r11
+    incl    %eax
+    cmpl    %r10d, %eax
+    jl      .Lpref
+    pmovmskb %xmm3, %eax
+    testl   %eax, %eax
+    jnz     .Lhit
+    addq    $16, %rdx
+    jmp     .Lblock
+.Lhit:
+    bsfl    %eax, %eax                  // first candidate lane in this block
+    addq    %rdx, %rax
+    cmpq    %r8, %rax
+    jg      .Lnone                      // it sat past the caller's last position
+    jmp     .Ldone
+.Lnone:
+    movq    $-1, %rax
+.Ldone:
+end;
+{$ENDIF}
+
 // The hash a triple is folded through. Must be cheap - it runs once per input
 // byte - and must spread the low bits, because for a 4-letter alphabet like DNA
 // that is all that varies.
@@ -767,6 +863,80 @@ begin
   FHasTriple := n > 0;
 end;
 
+procedure TDfa.ComputeVecFilter;
+// Enumerate the DISTINCT three-byte prefixes a match can begin with. Same walk as the triple filter,
+// but it collects the triples instead of hashing them - and gives up the moment there are more than
+// the vector loop can afford to compare, because the cost there is linear in the count.
+//
+// ⚠️ CORRECTNESS: this filter may only ever OVER-approximate. Every path that cannot enumerate the
+// full set - an accepting state within three bytes, a budget blown, too many prefixes - must leave
+// FHasVec False so the scan falls back, never trim the set and carry on.
+const
+  VEC_MAX_PREFIX = 8;    // beyond this the per-16-byte cost passes what the scalar filter costs
+  STATE_BUDGET = 4096;
+var
+  b0, b1, b2, s1, s2, t, i, j: Integer;
+  Tri: array[0..VEC_MAX_PREFIX - 1, 0..2] of Byte;
+  NT: Integer;
+  Dup: Boolean;
+begin
+  FHasVec := False;
+  if not FHasFirst then Exit;          // nothing to enumerate from
+  NT := 0;
+  for b0 := 0 to 255 do
+  begin
+    if not ClsHas(FFirstBytes, Byte(b0)) then Continue;
+    t := FTrans[FStart * 256 + b0];
+    if t < 0 then
+    begin
+      if FNDfa > STATE_BUDGET then Exit;
+      t := ComputeTrans(FStart, Byte(b0));
+    end;
+    if t = DFA_DEAD then Continue;
+    // A match that is already complete after one or two bytes has no three-byte prefix to test, so
+    // no filter of this shape can exist - exactly the case of the substitutions' "a[NSt]|BY".
+    if FAccept[t] then Exit;
+    s1 := t;
+    for b1 := 0 to 255 do
+    begin
+      t := FTrans[s1 * 256 + b1];
+      if t < 0 then
+      begin
+        if FNDfa > STATE_BUDGET then Exit;
+        t := ComputeTrans(s1, Byte(b1));
+      end;
+      if t = DFA_DEAD then Continue;
+      if FAccept[t] then Exit;
+      s2 := t;
+      for b2 := 0 to 255 do
+      begin
+        t := FTrans[s2 * 256 + b2];
+        if t < 0 then
+        begin
+          if FNDfa > STATE_BUDGET then Exit;
+          t := ComputeTrans(s2, Byte(b2));
+        end;
+        if t = DFA_DEAD then Continue;
+        Dup := False;
+        for i := 0 to NT - 1 do
+          if (Tri[i][0] = Byte(b0)) and (Tri[i][1] = Byte(b1)) and (Tri[i][2] = Byte(b2)) then
+          begin Dup := True; Break; end;
+        if Dup then Continue;
+        if NT >= VEC_MAX_PREFIX then Exit;      // too wide: stay on the scalar filter
+        Tri[NT][0] := Byte(b0); Tri[NT][1] := Byte(b1); Tri[NT][2] := Byte(b2);
+        Inc(NT);
+      end;
+    end;
+  end;
+  if NT = 0 then Exit;
+  // Pre-splat every byte across the sixteen lanes so the scan loop never broadcasts.
+  FVec.N := NT;
+  for i := 0 to NT - 1 do
+    for j := 0 to 2 do
+      FillChar(FVec.Splat[i][j][0], 16, Tri[i][j]);
+  FHasVec := True;
+end;
+
 function TDfa.Accepting(S: Integer): Boolean;
 begin
   Result := FAccept[S];
@@ -815,6 +985,20 @@ var
 begin
   Result := False;
   MStart := -1; MEnd := -1;
+  // ⛔ NEGATIVE, measured 2026-08-03: hoisting FTriple/FPair/FFirstBytes into local pointers here -
+  // the same treatment Tr and Acc get below - moves COUNT end to end by NOTHING (859 ms against
+  // 845-860 over 225 MB scanned). The field address was never the cost, and it would add three
+  // pointer set-ups per CALL, which the short-subject path pays for.
+  //
+  // ⛔⛔ AND THE MICRO-ARM THAT SEEMED TO SHOW A WIN CANNOT BE READ AT ALL. On one binary this scan
+  // is repeatable to better than 0.5% (266/266/266 ms). Across BUILDS of near-identical code it is
+  // not: the same DNA arm read 344, then 328 with the hoist, then 359 with the hoist taken back out
+  // again - a 9% swing from code LAYOUT, which is the same effect as the interpreter's dispatch
+  // alignment. Run-to-run stability is not build-to-build stability, and confusing the two is how a
+  // layout artefact gets committed as an optimisation.
+  // ⭐ The consequence for anyone working here: a change to this loop is only measurable if it
+  // clears ~10%. That rules out scalar tinkering and is an argument FOR a vector prefilter, whose
+  // prize is several times that - not an argument for trying harder with the same instructions.
   // Cached ONCE per call rather than per byte. ⚠️ FTrans is reallocated when the
   // lazy construction interns a new state, so Tr is re-fetched after every
   // ComputeTrans - which is the cold path and costs nothing once the DFA for
@@ -824,6 +1008,30 @@ begin
   p := From;
   while p <= Len do
   begin
+    if FHasVec then
+    begin
+      { The SSE2 prefilter: sixteen candidate positions per iteration, and EXACT - it admits only
+        the three-byte prefixes a match can really begin with, where the hashed filter admits about
+        4% of DNA.
+
+        ⭐ Prepended to the scalar loop rather than replacing it, the same shape that made the AOT's
+        vectoriser safe: the block scan handles whole sixteens, whatever it leaves - the last
+        seventeen bytes, or a position it hands back - is finished by the scalar filter below. The
+        worst case of a wrong guess is yesterday's code. }
+      {$IFDEF CPUX86_64}
+      if Len - 3 >= p then
+      begin
+        i := VecScanPrefix(Data, p, Len - 3, @FVec);
+        if i >= 0 then
+          p := i                         // a real candidate; the scalar filter will agree and stop
+        else
+          // Nothing in any FULL block. ⚠️ Advance only past what was actually TESTED - the block
+          // loop stops when fewer than sixteen positions remain, and skipping those would lose a
+          // match. This is the whole-blocks count, and the remainder is the scalar loop's.
+          p := p + ((Len - 3 - p + 1) div 16) * 16;
+      end;
+      {$ENDIF}
+    end;
     if FHasTriple then
     begin
       // Three bytes, hashed. Strictly instead of the pair test, never as well

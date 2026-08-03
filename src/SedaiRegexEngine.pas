@@ -835,6 +835,9 @@ initialization
   // the whole call cannot: the filters are eager work whose payer is the SCAN,
   // so a workload of short subjects is charged for something it never uses.
   GDfaSkipFilters := GetEnvironmentVariable('REGEX_NOFILTER') = '1';
+  // REGEX_NOVEC=1 keeps the scalar filters and drops the SSE2 one: the A/B for the vector prefilter
+  // on a single binary.
+  GDfaSkipVec := GetEnvironmentVariable('REGEX_NOVEC') = '1';
   GRegexDiag := GetEnvironmentVariable('REGEX_DIAG') = '1';
 
 finalization
