@@ -8933,17 +8933,26 @@ function ParseLeadingInt64(const S: string): Int64; forward;
 // substitution of the run.
 var
   GRegexReplLinear: Integer = -1;
-  // REGEX_ENGINE=sedai selects our own automaton (SedaiRegexEngine) for the patterns it can
-  // compile, falling back to the library for the rest. Default OFF while the engine is being
-  // proved: this is a prototype whose FIRST job is to be measured against the thing it replaces,
-  // on the same binary and the same inputs.
+  // Our own automaton (SedaiRegexEngine) handles the patterns it can compile and hands the rest to
+  // the library. ON by default since 2026-08-03; REGEX_ENGINE=tregexpr is the A/B that puts every
+  // call back on FPC's RegExpr.
+  //
+  // What earned the default, measured on one binary against the library it replaces: regex-redux on
+  // real input 4.8x faster and byte-identical; short subjects with a reused pattern 1.6-1.9x faster.
+  // The one shape where a DFA cannot win is a pattern built from data and used once - it pays the
+  // construction up front to be fast later, and there is no later - and that is now 1.37x rather
+  // than 14.7x, because past the cache cap AcquirePattern declines short subjects outright.
+  //
+  // ⚠️ The engine is leftmost-LONGEST where the library is leftmost-FIRST. CompilePattern refuses
+  // any pattern where that could show, so the fallback is a correctness boundary and not a
+  // convenience: see SedaiRegexEngine's header for the two sufficient conditions.
   GRegexOwnEngine: Integer = -1;
 
 function RegexUseOwnEngine: Boolean;
 begin
   if GRegexOwnEngine < 0 then
-    if LowerCase(GetEnvironmentVariable('REGEX_ENGINE')) = 'sedai' then GRegexOwnEngine := 1
-    else GRegexOwnEngine := 0;
+    if LowerCase(GetEnvironmentVariable('REGEX_ENGINE')) = 'tregexpr' then GRegexOwnEngine := 0
+    else GRegexOwnEngine := 1;
   Result := GRegexOwnEngine = 1;
 end;
 
