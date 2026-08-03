@@ -275,8 +275,6 @@ begin
 end;
 
 function ParseRepeat(var Q: TParser): TFrag;
-var
-  Greedy: Boolean;
 begin
   Result := ParseAtom(Q);
   if not Q.OK then Exit;
@@ -285,15 +283,26 @@ begin
     case Q.P^ of
       '*', '+', '?':
         begin
-          Greedy := True;
-          if (Q.P < Q.Last) and ((Q.P + 1)^ = '?') then Greedy := False;
+          // ⛔ A LAZY quantifier is a BACKTRACKER'S concept. It says which of several possible
+          // matches to PREFER, and a DFA has no preference to express: the subset construction
+          // explores every path at once and leftmost-LONGEST is simply what falls out. The builder
+          // takes a Greedy flag - it orders the split's two edges, which matters to a backtracker -
+          // and the DFA construction cannot honour it.
+          // 🐛 Accepting `*?` and then answering greedily is a SILENT WRONG ANSWER, and it was one:
+          //      RegexReplace("<a><b>", "<.+?>", "#")   is "##" everywhere else, and was "#" here
+          //      RegexCount("aaa", "a+?")               is 3 everywhere else, and was 1 here
+          // The semantic guard below never caught it because it inspects ALTERNATION branch lengths,
+          // and this is not an alternation. So the pattern is REFUSED and the Perl-compatible
+          // library takes it - the same treatment an ambiguous alternation already gets, and the
+          // reason the answers a program sees stay PCRE-compatible throughout.
+          // 🥅 job/tests/bas/bug_regex_lazy_quantifier.bas
+          if (Q.P < Q.Last) and ((Q.P + 1)^ = '?') then begin Fail(Q); Exit; end;
           case Q.P^ of
-            '*': Result := Q.B.Star(Result, Greedy);
-            '+': Result := Q.B.Plus(Result, Greedy);
-            '?': Result := Q.B.Optional(Result, Greedy);
+            '*': Result := Q.B.Star(Result, True);
+            '+': Result := Q.B.Plus(Result, True);
+            '?': Result := Q.B.Optional(Result, True);
           end;
           Inc(Q.P);
-          if not Greedy then Inc(Q.P);
         end;
       '{':
         begin

@@ -255,7 +255,7 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `SCRATCH` | ✓ | Delete file(s) with wildcard support |
 | `VERIFY` | ✓ | Verify saved file or program |
 
-## String Functions (12/12 - 100%)
+## String Functions (14/14 - 100%)
 
 | Function | Status | Description |
 |----------|--------|-------------|
@@ -274,6 +274,78 @@ BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.f
 | `SPC` | ✓ | Skip spaces on context output |
 | `STR$` | ✓ | Convert number to string |
 | `TAB` | ✓ | Move cursor forward string from the first column |
+| `REGEXCOUNT` | ✓ | `REGEXCOUNT(subject, pattern)` → count of non-overlapping matches (**SedaiBasic extension**, no FreeBASIC equivalent) |
+| `REGEXREPLACE` | ✓ | `REGEXREPLACE(subject, pattern, replacement)` → every match replaced (**SedaiBasic extension**, no FreeBASIC equivalent) |
+
+## Regular Expressions (SedaiBasic extension)
+
+`REGEXCOUNT` and `REGEXREPLACE` have **no FreeBASIC equivalent** — FreeBASIC ships no regular
+expression support at all. They are available in **both dialects**, CLASSIC and MODERN.
+
+```basic
+Print RegexCount("abcabc", "b")                  '' 2
+Print RegexReplace("a1b22c", "[0-9]+", "#")      '' a#b#c
+```
+
+The replacement is a **literal string**: there are no `$1` / `\1` back-substitutions, because
+capture groups are not extracted (see below). `REGEXREPLACE` replaces **every** match, so there is
+no "replace first only" form.
+
+### Supported syntax
+
+Perl/PCRE-style, and this is what the **language** accepts — see the note on engines below, which is
+about speed and not about meaning.
+
+| | |
+|---|---|
+| literals, `.` | `.` does not match a newline |
+| classes | `[abc]`, ranges `[a-z]`, negation `[^...]` |
+| class escapes | `\d` `\D` `\w` `\W` `\s` `\S` |
+| anchors | `^` `$`, and the word boundaries `\b` `\B` |
+| groups | `(...)`, non-capturing `(?:...)`, inline flags such as `(?i)` |
+| quantifiers | `*` `+` `?`, counted `{n}` `{n,}` `{n,m}`, and the lazy forms `*?` `+?` `??` |
+| alternation | `\|` |
+| backreferences | `\1` … `\9` |
+| escapes | `\n` `\r` `\t`, `\x41`, and `\.` `\*` `\|` … for the metacharacters |
+
+**Not supported**: POSIX bracket classes (`[[:alpha:]]`) and lookaround (`(?=...)`, `(?!...)`,
+`(?<=...)`). Both answer 0 matches rather than raising.
+
+⚠️ `REGEXREPLACE`'s replacement is a **literal string** even where the pattern has groups: there is
+no `$1` / `\1` back-substitution in the replacement, and every match is replaced (there is no
+"first only" form).
+
+### Two engines, one meaning
+
+SedaiBasic has its own regex engine and also carries the general-purpose library it started from.
+Which one runs is chosen per pattern, automatically, and **it never changes the answer** — it is a
+speed decision, so you can ignore this section unless you are chasing performance.
+
+The own engine is a DFA, which is linear in the input and cannot suffer catastrophic backtracking,
+but a DFA is naturally leftmost-**longest** (POSIX) where Perl and PCRE are leftmost-**first**. On
+`"ab"`, `a|ab` matches `a` under Perl rules and `ab` under POSIX rules. So the fast engine
+**refuses** every pattern where the two could disagree, and the library — which is Perl-compatible —
+answers it instead. Constructs a DFA cannot express at all are refused for the same reason:
+backreferences (not expressible by any finite automaton), lookaround, counted repetition, and the
+**lazy** quantifiers, which state a *preference* between possible matches that a DFA has no way to
+hold.
+
+The consequence worth remembering: results are **PCRE-compatible in every case**, and the fast path
+is taken only where it provably cannot change the answer.
+
+> This is not theoretical tidiness. Until 2026-08-03 the fast engine *accepted* `<.+?>` and answered
+> it **greedily**: `RegexReplace("<a><b>", "<.+?>", "#")` returned `#` where every other regex
+> implementation returns `##`. Refusing the pattern is what keeps the two engines interchangeable.
+
+⚠️ A pattern that can match the **empty string** also matches just past the last byte:
+`RegexCount("aaa", "a*")` is **2**, not 1 — one match for `"aaa"` and one empty match at the end.
+That is what PCRE does too.
+
+### Engine selection
+
+Compiled patterns are cached, so repeating the same pattern in a loop costs nothing after the first
+call. The engine is chosen automatically; `REGEX_ENGINE=tregexpr` in the environment forces the
+library for the whole program, which is the way to check whether a difference is the engine's fault.
 
 ## Memory Management (8/9 - 89%)
 
