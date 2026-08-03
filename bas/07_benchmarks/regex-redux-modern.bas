@@ -12,12 +12,19 @@
 '' Sequential: the replacements are applied one after another, each to the output of the last.
 
 Dim As String inp = ""
-Dim As String line
+Dim As String chunk
 
+'' Read in BLOCKS, the way every reference implementation does - the Python one is a single
+'' stdin.buffer.read(). The line-at-a-time loop this replaces cost 532 ms of a 2005 ms program (26%)
+'' and was reading the input one line at a time only because the port was written that way, not
+'' because the language needs it: FreeBASIC has Input(n [, #f]) (KeyPgInputnum) and so do we.
+'' Measured on the 50MB fasta: 532 ms -> 94, and the two shapes produce byte-identical input
+'' (same length, same checksum - job/tests/bench/read_lineloop.bas vs read_block.bas).
 Open Cons For Input As #1
 Do While Not Eof(1)
-  Line Input #1, line
-  inp += line + Chr(10)
+  chunk = Input(65536, #1)
+  If Len(chunk) = 0 Then Exit Do
+  inp += chunk
 Loop
 Close #1
 
