@@ -340,7 +340,7 @@ begin
         32: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] * FloatRegs[Instr.Src1]; Inc(CurPC); end; // bcMulFloatTo
         33: begin // bcDivFloatTo
           if Abs(FloatRegs[Instr.Src1]) < 1e-300 then
-            FloatRegs[Instr.Dest] := DivZeroFloat(FloatRegs[Instr.Dest])   // MODERN: IEEE Inf/NaN; CLASSIC: error
+            FloatRegs[Instr.Dest] := DivZeroFloat(FloatRegs[Instr.Dest], FloatRegs[Instr.Src1])   // MODERN: IEEE Inf/NaN; CLASSIC: error
           else
             FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] / FloatRegs[Instr.Src1];
           Inc(CurPC);
@@ -357,7 +357,7 @@ begin
         52: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end; // bcMulFloatConst
         53: begin // bcDivFloatConst
           if Abs(Double(Pointer(@Instr.Immediate)^)) < 1e-300 then
-            FloatRegs[Instr.Dest] := DivZeroFloat(FloatRegs[Instr.Src1])   // MODERN: IEEE Inf/NaN; CLASSIC: error
+            FloatRegs[Instr.Dest] := DivZeroFloat(FloatRegs[Instr.Src1], Double(Pointer(@Instr.Immediate)^))   // MODERN: IEEE Inf/NaN; CLASSIC: error
           else
             FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / Double(Pointer(@Instr.Immediate)^);
           Inc(CurPC);
@@ -454,7 +454,7 @@ begin
             LElemVal := 0.0;
           if Abs(FloatRegs[(Instr.Immediate shr 16) and $FFFF]) < 1e-300 then
             FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate and $FFFF] +
-              DivZeroFloat(LElemVal)   // MODERN: IEEE; CLASSIC: error
+              DivZeroFloat(LElemVal, FloatRegs[(Instr.Immediate shr 16) and $FFFF])   // MODERN: IEEE; CLASSIC: error
           else
             FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate and $FFFF] +
               LElemVal / FloatRegs[(Instr.Immediate shr 16) and $FFFF];
@@ -693,7 +693,7 @@ begin
         bcMulFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2]; Inc(CurPC); end;
         bcDivFloat: begin
           if FloatRegs[Instr.Src2] = 0.0 then
-            FloatRegs[Instr.Dest] := DivZeroFloat(FloatRegs[Instr.Src1])   // MODERN: IEEE Inf/NaN; CLASSIC: error
+            FloatRegs[Instr.Dest] := DivZeroFloat(FloatRegs[Instr.Src1], FloatRegs[Instr.Src2])   // MODERN: IEEE Inf/NaN; CLASSIC: error
           else
             FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / FloatRegs[Instr.Src2];
           Inc(CurPC);

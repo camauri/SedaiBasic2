@@ -484,7 +484,7 @@ type
     // Dialect-aware float division by (near-)zero. FreeBASIC (MODERN) follows IEEE-754: x/0 -> +/-Inf,
     // 0/0 -> NaN. Commodore BASIC (CLASSIC) raises ?DIVISION BY ZERO ERROR. Given the numerator, returns
     // the IEEE result in MODERN or raises EZeroDivide in CLASSIC. Used at every float-div-by-zero site.
-    function DivZeroFloat(Numerator: Double): Double;
+    function DivZeroFloat(Numerator, Denominator: Double): Double;
     // Dialect-aware square root. FreeBASIC (MODERN) Sqr maps to C sqrt: a negative argument yields NaN
     // (IEEE), it does not trap. Commodore v7 (CLASSIC) raises ?ILLEGAL QUANTITY. Shared by both run
     // loops so the two paths cannot diverge (opt == no-opt).
@@ -6364,7 +6364,7 @@ begin
           {$ENDIF}
         end
         else
-          Ctx.FloatRegs[Instr.Dest] := DivZeroFloat(Ctx.FloatRegs[Instr.Src1]);
+          Ctx.FloatRegs[Instr.Dest] := DivZeroFloat(Ctx.FloatRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2]);
       end;
     bcPowFloat: Ctx.FloatRegs[Instr.Dest] := Power(Ctx.FloatRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2]);
     bcNegFloat: Ctx.FloatRegs[Instr.Dest] := -Ctx.FloatRegs[Instr.Src1];
@@ -7471,7 +7471,7 @@ begin
       if Ctx.FloatRegs[Instr.Src1] <> 0.0 then
         Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Dest] / Ctx.FloatRegs[Instr.Src1]
       else
-        Ctx.FloatRegs[Instr.Dest] := DivZeroFloat(Ctx.FloatRegs[Instr.Dest]);
+        Ctx.FloatRegs[Instr.Dest] := DivZeroFloat(Ctx.FloatRegs[Instr.Dest], Ctx.FloatRegs[Instr.Src1]);
 
     // Fused constant arithmetic (Int) - sub-opcodes 40-42
     40: // bcAddIntConst: r[dest] = r[src1] + immediate
@@ -7492,7 +7492,7 @@ begin
       if Double(Pointer(@Instr.Immediate)^) <> 0.0 then
         Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Src1] / Double(Pointer(@Instr.Immediate)^)
       else
-        Ctx.FloatRegs[Instr.Dest] := DivZeroFloat(Ctx.FloatRegs[Instr.Src1]);
+        Ctx.FloatRegs[Instr.Dest] := DivZeroFloat(Ctx.FloatRegs[Instr.Src1], Double(Pointer(@Instr.Immediate)^));
 
     // Fused compare-zero-and-branch (Int) - sub-opcodes 60-61
     60: // bcBranchEqZeroInt
@@ -7578,7 +7578,7 @@ begin
           ElemVal := 0.0;
         if Abs(Ctx.FloatRegs[(Instr.Immediate shr 16) and $FFFF]) < 1e-300 then
           Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate and $FFFF] +
-            DivZeroFloat(ElemVal)   // MODERN: IEEE; CLASSIC: error
+            DivZeroFloat(ElemVal, Ctx.FloatRegs[(Instr.Immediate shr 16) and $FFFF])   // MODERN: IEEE; CLASSIC: error
         else
           Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate and $FFFF] +
             ElemVal / Ctx.FloatRegs[(Instr.Immediate shr 16) and $FFFF];
@@ -9353,7 +9353,7 @@ procedure TBytecodeVM.RunDebug;
 function ParseLeadingInt64(const S: string): Int64;
 var
   I, Len, Base, D: Integer;
-  Neg: Boolean;
+  Neg, Signed: Boolean;
   C: Char;
   U: QWord;
 begin
@@ -9362,13 +9362,19 @@ begin
   I := 1;
   while (I <= Len) and (S[I] = ' ') do Inc(I);  // skip leading whitespace
   Neg := False;
+  Signed := False;
   if (I <= Len) and ((S[I] = '+') or (S[I] = '-')) then
   begin
     Neg := (S[I] = '-');
+    Signed := True;
     Inc(I);
   end;
-  // FreeBASIC base prefixes: &H hex, &O octal, &B binary.
-  if (I < Len) and (S[I] = '&') then
+  // FreeBASIC base prefixes: &H hex, &O octal, &B binary - and ONLY when nothing precedes them.
+  // fbc does not accept a SIGN before a base prefix. VALINT("-&HFF") is 0, not -255: the '-' is
+  // consumed, the prefix is then not recognised, the decimal scan finds no digits, and negating zero
+  // leaves zero. Measured against fbc 1.10.1 for both signs and all three prefixes - see
+  // ParseLeadingFloat for the float form, where the same rule shows up as NEGATIVE zero.
+  if (not Signed) and (I < Len) and (S[I] = '&') then
   begin
     C := UpCase(S[I + 1]);
     Base := 0;
@@ -9425,28 +9431,27 @@ function ParseLeadingFloat(const S: string): Double;
 var
   I, J, K, Len, Code, DPos: Integer;
   T: string;
-  HasDigit, HasDot: Boolean;
+  HasDigit, HasDot, Neg: Boolean;
 begin
   Result := 0.0;
   Len := Length(S);
   I := 1;
   while (I <= Len) and (S[I] = ' ') do Inc(I);   // skip leading whitespace
-  // A base prefix (optionally signed) is an integer value; reuse ParseLeadingInt64.
-  J := I;
-  if (J <= Len) and ((S[J] = '+') or (S[J] = '-')) then Inc(J);
-  if (J <= Len) and (S[J] = '&') then
+  // A base prefix is an integer value - but ONLY when it is the first thing after the spaces.
+  // FreeBASIC does not accept a sign before one, so this deliberately looks BEFORE the sign scan.
+  if (I <= Len) and (S[I] = '&') then
   begin
-    // 🐛 KNOWN DIVERGENCE from fbc, measured 2026-08-03: FreeBASIC does NOT accept a sign before a
-    // base prefix. It reads the '-', finds no digits and answers -0 - negative zero, which is why it
-    // prints "-0" rather than "0" - where we answer -255 for VAL("-&HFF"). Pre-existing, not a
-    // regression from the VAL rewrite below. Matching it means returning -0.0, not 0.0.
-    // Guardian: job/tests/bas/bug_basestr_val.bas.
     Result := ParseLeadingInt64(Copy(S, I, Len - I + 1));
     Exit;
   end;
   // [sign] digits [. digits]
   J := I;
-  if (J <= Len) and ((S[J] = '+') or (S[J] = '-')) then Inc(J);
+  Neg := False;
+  if (J <= Len) and ((S[J] = '+') or (S[J] = '-')) then
+  begin
+    Neg := (S[J] = '-');
+    Inc(J);
+  end;
   HasDigit := False;
   HasDot := False;
   while J <= Len do
@@ -9455,7 +9460,20 @@ begin
     else if (S[J] = '.') and (not HasDot) then begin HasDot := True; Inc(J); end
     else Break;
   end;
-  if not HasDigit then Exit;
+  if not HasDigit then
+  begin
+    // ⚠️ NOT plain zero. fbc applies a minus it has already consumed even when nothing parseable
+    // follows, so every string that starts with '-' and then fails to be a number reads as NEGATIVE
+    // zero: "-x", "- 12" (fbc does not skip spaces after the sign), "--12", "-e5" and "-&HFF" all
+    // answer -0, which PRINTS as "-0" while comparing equal to zero.
+    // The single exception is a sign with NOTHING after it: VAL("-") is +0, because fbc never gets
+    // as far as looking for a digit. Both halves measured against fbc 1.10.1, not reasoned from the
+    // manual; guardian job/tests/bas/bug_basestr_val.bas.
+    // The sign bit is set through the bit pattern because a `-0.0` literal is a constant the
+    // compiler may fold straight back to +0.0, and the whole point here is the sign bit.
+    if Neg and (J <= Len) then PInt64(@Result)^ := Int64($8000000000000000);
+    Exit;
+  end;
   // Optional exponent: (e|E|d|D) [sign] digits — only consumed if at least one exponent digit follows.
   DPos := 0;
   if (J <= Len) and (UpCase(S[J]) in ['E', 'D']) then
@@ -13510,16 +13528,20 @@ begin
   end;
 end;
 
-function TBytecodeVM.DivZeroFloat(Numerator: Double): Double;
+function TBytecodeVM.DivZeroFloat(Numerator, Denominator: Double): Double;
 begin
   // MODERN (FreeBASIC) follows IEEE-754: a positive numerator over zero is +Inf, a negative one is -Inf,
   // and 0/0 is NaN. The result is built from Math-unit constants (a plain assignment, so it never triggers
   // the FP hardware trap that FPC leaves unmasked). CLASSIC (Commodore v7) raises ?DIVISION BY ZERO ERROR.
   if Assigned(FProgram) and FProgram.ModernMode then
   begin
-    if Numerator > 0.0 then Result := Infinity
-    else if Numerator < 0.0 then Result := NegInfinity
-    else Result := NaN;
+    if Numerator = 0.0 then Result := NaN
+    // IEEE gives the quotient the XOR of the two SIGN BITS, and a zero has one: 1/-0.0 is -Inf, not
+    // +Inf. `Denominator < 0` cannot see it - negative zero compares EQUAL to zero - so the bit is
+    // read directly. fbc agrees because it simply lets the hardware divide; this path exists only
+    // because CLASSIC has to raise instead.
+    else if (Numerator < 0.0) xor (PInt64(@Denominator)^ < 0) then Result := NegInfinity
+    else Result := Infinity;
   end
   else
     raise EZeroDivide.Create('Division by zero');

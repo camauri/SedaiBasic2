@@ -71,6 +71,7 @@ type
     FInBufMode: Integer;
     function CachedSize(Handle: Integer; FS: TFileStream): Int64;
     procedure InvalidateSize(Handle: Integer);
+    function RecordUnit(Handle: Integer): Int64;
     function StdInBuffered: Boolean;
     function StdInRefill: Boolean;              // returns False at end of input
     function StdInReadLine(out Line: string): Boolean;
@@ -108,6 +109,21 @@ end;
 procedure TVMFileHandler.InvalidateSize(Handle: Integer);
 begin
   if (Handle >= 1) and (Handle <= 15) then FSizeCache[Handle] := -1;
+end;
+
+// LOC counts in RECORDS, and what a record IS depends only on how the file was opened
+// (job/fb-manual/KeyPgLoc.html): the length given at Open for RANDOM, ONE byte for BINARY, and a
+// record length of 128 bytes ASSUMED for a text file - the classic BASIC convention. Confirmed
+// against fbc 1.10.1 on this machine rather than read off the manual: text position 4097 answers 32,
+// binary answers the byte count, and RANDOM Len=32 answers the record number.
+// Mode letters are the parser's own single letters ('R' 'W' 'A' 'B', 'L<n>' for random, plus a
+// trailing '<' for ACCESS READ), so testing for 'B' cannot collide with a filename.
+function TVMFileHandler.RecordUnit(Handle: Integer): Int64;
+begin
+  if (Handle < 1) or (Handle > 15) then Exit(1);
+  if FRecordLens[Handle] > 0 then Result := FRecordLens[Handle]
+  else if Pos('B', FFileModes[Handle]) > 0 then Result := 1
+  else Result := 128;
 end;
 
 function TVMFileHandler.StdInBuffered: Boolean;
@@ -383,15 +399,23 @@ begin
   case QueryCode of
     FQ_EOF:  Value := -Ord(FS.Position >= CachedSize(Handle, FS));  // FB: -1 (true) at/after end of file
     FQ_LOF:  Value := CachedSize(Handle, FS);
-    // 🐛 KNOWN DIVERGENCE from fbc, measured 2026-08-03 and NOT introduced by the block-reader work
-    // (the committed source says the same). On a TEXT-mode file fbc reports LOC in 128-byte RECORDS,
-    // the classic BASIC convention - byte 4097 reads as 32, byte 10001 as 78 - and its SEEK differs
-    // in step. We report bytes. Left alone deliberately: LOC means bytes for BINARY files and CLASSIC
-    // has its own rules, so this needs the spec in job/fb-manual/ read first rather than a quick
-    // division. job/tests/bas/bug_fileread_block.bas records our behaviour, so changing it will fail
-    // that guardian ON PURPOSE.
-    FQ_LOC:  Value := FS.Position;
-    FQ_SEEK: Value := FS.Position + 1;               // FB SEEK is 1-based
+    // LOC is a RECORD number, never a byte offset - see RecordUnit for what a record is in each mode.
+    // It is NOT "the last read/write" in any stateful sense despite the wording in the manual: fbc
+    // answers straight from the file position, so a bare SEEK with no I/O after it still moves LOC.
+    FQ_LOC:  Value := FS.Position div RecordUnit(Handle);
+    // SEEK is 1-based and counts records ONLY for RANDOM; bytes in every other mode
+    // (job/fb-manual/KeyPgSeekreturn.html, and fbc agrees - text and binary both answer Position+1).
+    // ⚠️ ONE fbc DIFFERENCE HERE IS DELIBERATE. On a text file terminated with bare LF, fbc's SEEK
+    // reports a number that is NOT the position - 10 after consuming 11 bytes - with the error
+    // shrinking to zero at EOF. It fails its own round trip: feed it back to the SEEK statement and
+    // fbc lands mid-line, reading "9" where it had just read "abcdefghij" (the measurement is
+    // job/tests/bench/seek_roundtrip.bas). That is an artefact of its buffered reader, not a
+    // semantic, and reproducing it would make SEEK unusable as a position. With CRLF, BINARY and
+    // RANDOM fbc is exact and so are we - locked down by job/tests/bas/bug_loc_seek_records.bas.
+    FQ_SEEK: if FRecordLens[Handle] > 0 then
+               Value := FS.Position div FRecordLens[Handle] + 1
+             else
+               Value := FS.Position + 1;
   else
     Result := False;                        // not a query we know: let the caller use the strings
   end;
