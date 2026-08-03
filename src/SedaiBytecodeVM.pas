@@ -8948,6 +8948,24 @@ var
   // convenience: see SedaiRegexEngine's header for the two sufficient conditions.
   GRegexOwnEngine: Integer = -1;
 
+  // ⛔ DIAGNOSTIC ONLY - REGEX_BISECT makes REGEXCOUNT return WRONG ANSWERS on purpose. It exists
+  // because a cache HIT on a 50-byte subject measures 1.49 us per call while the same function
+  // exiting at its guard measures 0.08, and neither the cache walk nor the pattern's complexity
+  // explains the difference. Timing a whole call cannot say which half it is in, so this cuts the
+  // path at two points and lets subtraction answer:
+  //   2 = return right after the engine check   -> dispatch + call + guard
+  //   1 = + AcquirePattern, but no scan         -> adds the cache lookup
+  //   0 = normal                                -> adds RegexEngineCount
+  // Never set outside a measurement.
+  GRegexBisect: Integer = -1;
+
+function RegexBisectLevel: Integer;
+begin
+  if GRegexBisect < 0 then
+    GRegexBisect := StrToIntDef(GetEnvironmentVariable('REGEX_BISECT'), 0);
+  Result := GRegexBisect;
+end;
+
 function RegexUseOwnEngine: Boolean;
 begin
   if GRegexOwnEngine < 0 then
@@ -8970,17 +8988,32 @@ begin
   if (Pattern = '') or (S = '') then Exit;
   if RegexUseOwnEngine then
   begin
+    if RegexBisectLevel = 2 then Exit;          // ⛔ diagnostic, see GRegexBisect
     // Borrowed from the cache unless Owned: see AcquirePattern for why the
     // cache never evicts and why that is what makes the borrow safe. Length(S)
     // lets it decline a bargain that would not pay off - see there.
     RX := AcquirePattern(Pattern, RXOwned, Length(S));
-    if RX <> nil then
-    try
-      Exit(RegexEngineCount(RX, S));
-    finally
-      if RXOwned then RX.Free;
+    if RegexBisectLevel = 1 then
+    begin
+      if RXOwned then RX.Free;                  // ⛔ diagnostic, see GRegexBisect
+      Exit;
     end;
-    // nil = a construct outside the regular subset; fall through to the library.
+    // ⚡ The BORROWED case takes no try/finally, and that is not a micro-tidy: FPC's try..finally on
+    // win64 installs a setjmp-style frame, which measured ~0.7 us per call here - half the cost of a
+    // cache hit, on a path whose actual work is a table walk. A borrowed pattern is owned by the
+    // cache and has nothing to free, so the frame was protecting a cleanup that does not exist.
+    // Only the owned case, which is the rare one, still needs it.
+    if RX <> nil then
+    begin
+      if not RXOwned then Exit(RegexEngineCount(RX, S));
+      try
+        Exit(RegexEngineCount(RX, S));
+      finally
+        RX.Free;
+      end;
+    end;
+    // nil = a construct outside the regular subset, or a per-call compile the subject was too short
+    // to justify; fall through to the library.
   end;
   R := TRegExpr.Create;
   try
@@ -9038,11 +9071,16 @@ begin
   if RegexUseOwnEngine then
   begin
     RX := AcquirePattern(Pattern, RXOwned, Length(S));
+    // No frame on the BORROWED path - the cache owns it and there is nothing to free. See the same
+    // spot in RegexCountMatches for why that is worth a branch: a try..finally frame measured ~0.7 us.
     if RX <> nil then
-    try
-      Exit(RegexEngineReplace(RX, S, Repl));
-    finally
-      if RXOwned then RX.Free;
+    begin
+      if not RXOwned then Exit(RegexEngineReplace(RX, S, Repl));
+      try
+        Exit(RegexEngineReplace(RX, S, Repl));
+      finally
+        RX.Free;
+      end;
     end;
   end;
   R := TRegExpr.Create;
