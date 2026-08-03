@@ -602,6 +602,7 @@ var
   GCacheFull: Boolean = False;
   GCacheOff: Integer = -1;   // -1 = the environment has not been read yet
   GRegexDiag: Boolean = False;
+  GRegexNoFastCopy: Boolean = False;   // REGEX_NOSLAB=1: the A/B arm, see RegexEngineReplace
 
 function PatHash(const S: string): Cardinal;
 var i: Integer;
@@ -756,12 +757,14 @@ end;
 
 function RegexEngineReplace(RX: TCompiledRegex; const S, Repl: string): string;
 var
-  D: PByte;
+  D, Dst, Src: PByte;
   Dfa: TDfa;
-  Len, p, ms, me, i, NM, OutLen, SrcPos, DstPos, SegLen, RL: Integer;
+  Len, p, ms, me, i, NM, OutLen, SrcPos, DstPos, SegLen, RL, DstLim, SrcLim: Integer;
   MStart, MEnd: array of Integer;
   A: TScanArgs;
   Nat: TNativeDfa;
+  RBuf: array[0..15] of Byte;
+  Matched: Int64;
 begin
   Result := S;
   Len := Length(S);
@@ -770,6 +773,7 @@ begin
   Dfa := RX.FDfa;
   Dfa.EnsureFilters(Len);            // see RegexEngineCount
   NM := 0;
+  Matched := 0;
   SetLength(MStart, 64);
   SetLength(MEnd, 64);
   p := 0;
@@ -793,35 +797,85 @@ begin
     end;
     MStart[NM] := ms;
     MEnd[NM] := me;
-    Inc(NM);
+    Inc(Matched, me - ms);           // the walk already has both ends in registers, so the
+    Inc(NM);                         // separate sizing loop was a whole extra pass over 28MB
     if me > ms then p := me else p := ms + 1;
   end;
   if NM = 0 then Exit;
-  // Same one-allocation assembly as the library wrapper: measure, then Move.
+  // One allocation of exactly the right size, then assemble into it.
   RL := Length(Repl);
-  OutLen := Len;
-  for i := 0 to NM - 1 do OutLen := OutLen - (MEnd[i] - MStart[i]) + RL;
+  OutLen := Len - Matched + Int64(NM) * RL;
   Result := '';
   SetLength(Result, OutLen);
-  DstPos := 1;
+  Src := D;                          // S still owns the buffer: D stayed valid across the two lines above
+  Dst := PByte(PChar(Result));
+  DstPos := 0;
   SrcPos := 0;
-  for i := 0 to NM - 1 do
+  if GRegexNoFastCopy then
   begin
-    SegLen := MStart[i] - SrcPos;
-    if SegLen > 0 then
+    for i := 0 to NM - 1 do          // the shape this replaced, kept as the A/B arm
     begin
-      Move(S[SrcPos + 1], Result[DstPos], SegLen);
-      Inc(DstPos, SegLen);
+      SegLen := MStart[i] - SrcPos;
+      if SegLen > 0 then
+      begin
+        Move((Src + SrcPos)^, (Dst + DstPos)^, SegLen);
+        Inc(DstPos, SegLen);
+      end;
+      if RL > 0 then
+      begin
+        Move(Repl[1], (Dst + DstPos)^, RL);
+        Inc(DstPos, RL);
+      end;
+      SrcPos := MEnd[i];
     end;
-    if RL > 0 then
+  end
+  else
+  begin
+    // ⭐ MEASURE THE GAP, NOT THE TOTAL. The five substitutions of regex-redux leave
+    // FOURTEEN bytes between matches on average (3,5M matches over 50MB), so this loop
+    // calls Move seven million times with a length Move spends most of its time DECIDING
+    // how to handle - 17 ns apiece, and almost none of it copying. Two QWord stores do any
+    // gap up to 16 bytes with no call and no branch.
+    // ⚠️ THE GUARD IS ROOM, NOT LENGTH. Over-WRITING the destination is harmless: writes
+    // are strictly sequential, so every byte past DstPos+SegLen belongs to a later write
+    // that will cover it. Over-READING the subject is NOT harmless (the page after it need
+    // not be mapped), so the last 16 bytes of either side take the general path.
+    FillChar(RBuf, SizeOf(RBuf), 0);
+    if (RL > 0) and (RL <= 16) then Move(Repl[1], RBuf[0], RL);
+    DstLim := OutLen - 16;
+    SrcLim := Len - 16;
+    for i := 0 to NM - 1 do
     begin
-      Move(Repl[1], Result[DstPos], RL);
-      Inc(DstPos, RL);
+      SegLen := MStart[i] - SrcPos;
+      if SegLen > 0 then
+      begin
+        if (SegLen <= 16) and (SrcPos <= SrcLim) and (DstPos <= DstLim) then
+        begin
+          PQWord(Dst + DstPos)^ := PQWord(Src + SrcPos)^;
+          PQWord(Dst + DstPos + 8)^ := PQWord(Src + SrcPos + 8)^;
+        end
+        else
+          Move((Src + SrcPos)^, (Dst + DstPos)^, SegLen);
+        Inc(DstPos, SegLen);
+      end;
+      if RL > 0 then
+      begin
+        // RBuf, not Repl: a 16-byte read off a three-byte string is the same fault, and a
+        // local array is the only place the over-read is guaranteed to land in our own frame.
+        if (RL <= 16) and (DstPos <= DstLim) then
+        begin
+          PQWord(Dst + DstPos)^ := PQWord(@RBuf[0])^;
+          PQWord(Dst + DstPos + 8)^ := PQWord(@RBuf[8])^;
+        end
+        else
+          Move(Repl[1], (Dst + DstPos)^, RL);
+        Inc(DstPos, RL);
+      end;
+      SrcPos := MEnd[i];
     end;
-    SrcPos := MEnd[i];
   end;
   SegLen := Len - SrcPos;
-  if SegLen > 0 then Move(S[SrcPos + 1], Result[DstPos], SegLen);
+  if SegLen > 0 then Move((Src + SrcPos)^, (Dst + DstPos)^, SegLen);
 end;
 
 var
@@ -838,6 +892,9 @@ initialization
   // REGEX_NOVEC=1 keeps the scalar filters and drops the SSE2 one: the A/B for the vector prefilter
   // on a single binary.
   GDfaSkipVec := GetEnvironmentVariable('REGEX_NOVEC') = '1';
+  // REGEX_NOSLAB=1 assembles the replacement one Move per segment, the way it was before the
+  // gaps were measured. Same binary, so the A/B is not a build-to-build reading.
+  GRegexNoFastCopy := GetEnvironmentVariable('REGEX_NOSLAB') = '1';
   GRegexDiag := GetEnvironmentVariable('REGEX_DIAG') = '1';
 
 finalization
