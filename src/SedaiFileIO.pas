@@ -38,6 +38,19 @@ type
     FFileModes: array[1..15] of string;
     FRecordLens: array[1..15] of Integer;   // relative-file record length per handle (0 = not relative)
 
+    { ===== Cached file size =====
+
+      TFileStream.Size is not a field, it is three seeks: remember where we are, seek to the end, seek
+      back. Measured on this machine that is 4.4 us, and Position is another 1.2 - so `FS.Position >=
+      FS.Size`, which is all EOF is, cost 5.6 us PER CALL. Every "Do While Not Eof(fh)" pays it once a
+      line, and the old INPUT#/LINEINPUT# loop paid it once a BYTE.
+
+      The size of an open file only changes when WE write to it, so it is cached per handle and
+      invalidated in the one place that writes. -1 = not known yet. ⚠️ This deliberately does not
+      model another process appending to a file we hold open; neither does FreeBASIC, and paying four
+      syscalls per character to find out is not a trade anyone asked for. }
+    FSizeCache: array[1..15] of Int64;
+
     { ===== Buffered standard input =====
 
       "Line Input #1" on a device handle used to go straight to System.ReadLn(System.Input), and FPC's
@@ -56,6 +69,8 @@ type
     FInPos: Integer;        // next byte to consume
     FInEof: Boolean;        // the OS said "no more"
     FInBufMode: Integer;
+    function CachedSize(Handle: Integer; FS: TFileStream): Int64;
+    procedure InvalidateSize(Handle: Integer);
     function StdInBuffered: Boolean;
     function StdInRefill: Boolean;              // returns False at end of input
     function StdInReadLine(out Line: string): Boolean;
@@ -82,6 +97,18 @@ implementation
   ⚠️ These use the RAW stdin handle, so they must never be mixed with System.ReadLn(System.Input) on
   the same run: the Text layer keeps its own buffer and the two would each swallow part of the stream.
   StdInBuffered decides ONCE, and every device read goes through one path or the other for good. }
+
+function TVMFileHandler.CachedSize(Handle: Integer; FS: TFileStream): Int64;
+begin
+  if (Handle < 1) or (Handle > 15) then Exit(FS.Size);
+  if FSizeCache[Handle] < 0 then FSizeCache[Handle] := FS.Size;
+  Result := FSizeCache[Handle];
+end;
+
+procedure TVMFileHandler.InvalidateSize(Handle: Integer);
+begin
+  if (Handle >= 1) and (Handle <= 15) then FSizeCache[Handle] := -1;
+end;
 
 function TVMFileHandler.StdInBuffered: Boolean;
 {$IFDEF WINDOWS}
@@ -256,6 +283,7 @@ begin
       if FileExists(Filename) then FileMode := fmOpenReadWrite else FileMode := fmCreate;
       try
         FFileHandles[Handle] := TFileStream.Create(Filename, FileMode);
+        InvalidateSize(Handle);
         FFileModes[Handle] := M;
         FRecordLens[Handle] := StrToIntDef(Copy(M, 2, Length(M) - 1), 1);
         if FRecordLens[Handle] < 1 then FRecordLens[Handle] := 1;
@@ -287,6 +315,7 @@ begin
       FileMode := fmOpenRead or fmShareDenyNone;
     try
       FFileHandles[Handle] := TFileStream.Create(Filename, FileMode);
+      InvalidateSize(Handle);
       FFileModes[Handle] := M;
       if Pos('A', M) > 0 then FFileHandles[Handle].Seek(0, soEnd);
     except
@@ -352,8 +381,15 @@ begin
 
   FS := FFileHandles[Handle];
   case QueryCode of
-    FQ_EOF:  Value := -Ord(FS.Position >= FS.Size);  // FB: -1 (true) at/after end of file
-    FQ_LOF:  Value := FS.Size;
+    FQ_EOF:  Value := -Ord(FS.Position >= CachedSize(Handle, FS));  // FB: -1 (true) at/after end of file
+    FQ_LOF:  Value := CachedSize(Handle, FS);
+    // 🐛 KNOWN DIVERGENCE from fbc, measured 2026-08-03 and NOT introduced by the block-reader work
+    // (the committed source says the same). On a TEXT-mode file fbc reports LOC in 128-byte RECORDS,
+    // the classic BASIC convention - byte 4097 reads as 32, byte 10001 as 78 - and its SEEK differs
+    // in step. We report bytes. Left alone deliberately: LOC means bytes for BINARY files and CLASSIC
+    // has its own rules, so this needs the spec in job/fb-manual/ read first rather than a quick
+    // division. job/tests/bas/bug_fileread_block.bas records our behaviour, so changing it will fail
+    // that guardian ON PURPOSE.
     FQ_LOC:  Value := FS.Position;
     FQ_SEEK: Value := FS.Position + 1;               // FB SEEK is 1-based
   else
@@ -371,6 +407,10 @@ var
   M: string;
   RetType, V: Integer;
   QV: Int64;           // the numeric answer from FileQuery, before it is turned into a string
+  LBuf: array[0..4095] of Byte;   // line reader, see INPUT#/LINEINPUT#
+  LStart, LSize: Int64;
+  LGot, LIdx, LOld, LUsed: Integer;
+  LTerm: Boolean;
 begin
   ErrorCode := 0;
 
@@ -461,7 +501,7 @@ begin
     // with zero bytes if beyond). After the call the position is at the (new) end. Status 0 = success.
     try
       FS.Size := FS.Position;
-      FS.Position := FS.Size;
+      FS.Position := CachedSize(Handle, FS);
       Data := '0';
     except
       ErrorCode := 63; Data := IntToStr(ErrorCode);   // could not set the file size
@@ -496,37 +536,80 @@ begin
   end
   else if (Command = 'INPUT#') or (Command = 'LINEINPUT#') then
   begin
-    if FS.Position >= FS.Size then begin ErrorCode := 62; Data := ''; Exit; end;
+    { Read a BLOCK, cut the line out of it, then put the stream back exactly where reading one byte
+      at a time would have left it.
+
+      The old loop cost, per CHARACTER: `FS.Position < FS.Size` (four seeks, measured 5.6 us), a
+      one-byte FS.Read, and `Line := Line + Chr(Ch)` (a reallocation). Measured on a 2000-line file of
+      79 columns that was 712 us PER LINE - 9 us per character, 1.4 seconds to read 158 KB.
+
+      ⛔ Deliberately NOT a persistent per-handle buffer. That would make the stream position stop
+      meaning the logical position, and SEEK/LOC/GET/PUT/RECORD all read it - the same aliasing trap
+      the buffered-stdin comment above warns about. Reading ahead and seeking back keeps every other
+      command looking at exactly what it looked at before, at the cost of one extra seek per line. }
+    LStart := FS.Position;
+    LSize := CachedSize(Handle, FS);
+    if LStart >= LSize then begin ErrorCode := 62; Data := ''; Exit; end;
     Line := '';
-    while FS.Position < FS.Size do
+    LUsed := 0;                          // bytes of the file consumed, terminator included
+    LTerm := False;
+    while not LTerm do
     begin
-      FS.Read(Ch, 1);
-      if Ch in [10, 13] then
+      FS.Position := LStart + LUsed;
+      LGot := FS.Read(LBuf, SizeOf(LBuf));
+      if LGot <= 0 then Break;           // the file ended without a terminator
+      LIdx := 0;
+      while LIdx < LGot do
       begin
-        if (Ch = 13) and (FS.Position < FS.Size) then
+        if (LBuf[LIdx] = 10) or (LBuf[LIdx] = 13) then Break;
+        // A comma separates fields for INPUT#, but is ordinary text for LINE INPUT#.
+        if (LBuf[LIdx] = Ord(',')) and (Command = 'INPUT#') then Break;
+        Inc(LIdx);
+      end;
+      if LIdx > 0 then                   // the data before the terminator, appended in one Move
+      begin
+        LOld := Length(Line);
+        SetLength(Line, LOld + LIdx);
+        Move(LBuf[0], Line[LOld + 1], LIdx);
+      end;
+      Inc(LUsed, LIdx);
+      if LIdx >= LGot then
+      begin
+        // No terminator in this block. Stop only if that was the end of the file.
+        if LStart + LUsed >= LSize then Break;
+        Continue;
+      end;
+      Ch := LBuf[LIdx];
+      Inc(LUsed);                        // the terminator is consumed, as the old loop consumed it
+      if Ch = 13 then
+      begin
+        // CRLF counts as ONE terminator; a lone CR does not swallow the byte after it.
+        if LIdx + 1 < LGot then
         begin
-          FS.Read(Ch, 1);
-          if Ch <> 10 then FS.Seek(-1, soCurrent);
+          if LBuf[LIdx + 1] = 10 then Inc(LUsed);
+        end
+        else if LStart + LUsed < LSize then
+        begin
+          // The LF, if there is one, fell just past this block.
+          FS.Position := LStart + LUsed;
+          if (FS.Read(Ch, 1) = 1) and (Ch = 10) then Inc(LUsed);
         end;
-        Break;
-      end
-      else if (Ch = Ord(',')) and (Command = 'INPUT#') then
-        Break   // comma is a field separator for INPUT#, but not for LINE INPUT#
-      else
-        Line := Line + Chr(Ch);
+      end;
+      LTerm := True;
     end;
+    FS.Position := LStart + LUsed;       // where the byte-at-a-time loop would have stopped
     Data := Line;
   end
   else if (Command = 'PRINT#') or (Command = 'CMD') or (Command = 'APPEND') or (Command = 'WRITE#') then
   begin
     if Length(Data) > 0 then
-      try FS.Write(Data[1], Length(Data)); except ErrorCode := 25; end;
+      try FS.Write(Data[1], Length(Data)); InvalidateSize(Handle); except ErrorCode := 25; end;
   end
   else if Command = 'PUTBIN' then
   begin
     // Binary PUT: Data already holds the raw bytes to write (serialised by the VM).
     if Length(Data) > 0 then
-      try FS.Write(Data[1], Length(Data)); except ErrorCode := 25; end;
+      try FS.Write(Data[1], Length(Data)); InvalidateSize(Handle); except ErrorCode := 25; end;
   end
   else if Command = 'GETBIN' then
   begin

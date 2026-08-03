@@ -9415,14 +9415,15 @@ begin
   if Digits <= 0 then Exit;
   if Length(Result) > Digits then
     Result := Copy(Result, Length(Result) - Digits + 1, Digits)
-  else
-    while Length(Result) < Digits do
-      Result := '0' + Result;
+  else if Length(Result) < Digits then
+    // One allocation. Prepending '0' in a loop reallocates and copies the whole string per zero,
+    // which for HEX$(1, 16) is fifteen of them.
+    Result := StringOfChar('0', Digits - Length(Result)) + Result;
 end;
 
 function ParseLeadingFloat(const S: string): Double;
 var
-  I, J, K, Len, Code: Integer;
+  I, J, K, Len, Code, DPos: Integer;
   T: string;
   HasDigit, HasDot: Boolean;
 begin
@@ -9435,6 +9436,11 @@ begin
   if (J <= Len) and ((S[J] = '+') or (S[J] = '-')) then Inc(J);
   if (J <= Len) and (S[J] = '&') then
   begin
+    // 🐛 KNOWN DIVERGENCE from fbc, measured 2026-08-03: FreeBASIC does NOT accept a sign before a
+    // base prefix. It reads the '-', finds no digits and answers -0 - negative zero, which is why it
+    // prints "-0" rather than "0" - where we answer -255 for VAL("-&HFF"). Pre-existing, not a
+    // regression from the VAL rewrite below. Matching it means returning -0.0, not 0.0.
+    // Guardian: job/tests/bas/bug_basestr_val.bas.
     Result := ParseLeadingInt64(Copy(S, I, Len - I + 1));
     Exit;
   end;
@@ -9451,23 +9457,41 @@ begin
   end;
   if not HasDigit then Exit;
   // Optional exponent: (e|E|d|D) [sign] digits — only consumed if at least one exponent digit follows.
+  DPos := 0;
   if (J <= Len) and (UpCase(S[J]) in ['E', 'D']) then
   begin
     K := J + 1;
     if (K <= Len) and ((S[K] = '+') or (S[K] = '-')) then Inc(K);
     if (K <= Len) and (S[K] >= '0') and (S[K] <= '9') then
     begin
+      // Remember WHERE the exponent marker is, relative to the slice taken below. It is the only
+      // place a 'd'/'D' can occur in a number we scanned ourselves, which is what lets the blanket
+      // StringReplace pass go away.
+      if (S[J] = 'd') or (S[J] = 'D') then DPos := J - I + 1;
       while (K <= Len) and (S[K] >= '0') and (S[K] <= '9') do Inc(K);
       J := K;
     end;
   end;
   T := Copy(S, I, J - I);
-  // A leading '.' (e.g. ".5" or "-.5") needs a '0' for Pascal's Val; and FB's 'D' exponent -> 'E'.
-  if (Length(T) >= 1) and (T[1] = '.') then T := '0' + T
+  // A leading '.' (e.g. ".5" or "-.5") needs a '0' for Pascal's Val. Either form inserts exactly one
+  // character ahead of any exponent marker, so DPos moves with it - and it is tied to the insertion
+  // itself rather than inferred afterwards from T[1], which cannot tell an inserted '0' from the one
+  // in "0.5e3".
+  if (Length(T) >= 1) and (T[1] = '.') then
+  begin
+    T := '0' + T;
+    if DPos > 0 then Inc(DPos);
+  end
   else if (Length(T) >= 2) and ((T[1] = '+') or (T[1] = '-')) and (T[2] = '.') then
+  begin
     T := T[1] + '0' + Copy(T, 2, Length(T));
-  T := StringReplace(T, 'd', 'e', [rfReplaceAll]);
-  T := StringReplace(T, 'D', 'E', [rfReplaceAll]);
+    if DPos > 0 then Inc(DPos);
+  end;
+  // FreeBASIC's 'D' exponent means what Pascal spells 'E'. This used to be two StringReplace passes
+  // over every VAL() ever evaluated - each allocating a fresh string and rescanning it - to fix a
+  // character that is almost never there. The scan above already located it, so this is one byte
+  // store on the rare call that needs it.
+  if (DPos > 0) and (DPos <= Length(T)) then T[DPos] := 'E';
   Val(T, Result, Code);
   if Code <> 0 then Result := 0.0;
 end;
@@ -9479,16 +9503,26 @@ const
   Digits: array[0..15] of Char = '0123456789ABCDEF';
 var
   U: QWord;
+  Buf: array[0..63] of Char;   // 64 bits in base 2 is the widest this can get
+  P, N: Integer;
 begin
   U := QWord(Value);
   if U = 0 then
     Exit('0');
-  Result := '';
+  // Digits come out least-significant first, so they are written BACKWARDS into a fixed buffer and
+  // copied once. The obvious version - Result := Digit + Result - reallocates and copies the whole
+  // accumulated string on every digit, which is the same shape as the quadratic REGEXREPLACE: fine
+  // at three digits, sixteen allocations for a 64-bit value in hex and sixty-four in binary.
+  P := SizeOf(Buf) div SizeOf(Char);
   while U > 0 do
   begin
-    Result := Digits[U mod QWord(Base)] + Result;
+    Dec(P);
+    Buf[P] := Digits[U mod QWord(Base)];
     U := U div QWord(Base);
   end;
+  N := (SizeOf(Buf) div SizeOf(Char)) - P;
+  SetLength(Result, N);
+  Move(Buf[P], Result[1], N * SizeOf(Char));
 end;
 
 // FreeBASIC WSTRING helpers. Wide strings are stored as UTF-8 bytes in the ordinary string bank; these
@@ -9941,11 +9975,13 @@ begin
       end;
     9: // bcStrHex - HEX$(n[, digits]) - full INT64 range. Src2 = digits width (0 = no leading zeros).
       begin
-        S := IntToHex(Ctx.IntRegs[Instr.Src1], 1);  // Minimum 1 digit
-        // IntToHex with digits=1 still pads, so trim leading zeros
-        while (Length(S) > 1) and (S[1] = '0') do
-          Delete(S, 1, 1);
-        Ctx.StringRegs[Instr.Dest] := FitBaseDigits(S, Ctx.IntRegs[Instr.Src2]);
+        // IntToHex on an Int64 pads to the TYPE's width - sixteen characters whatever the value - and
+        // the leading zeros used to come off one at a time, each Delete being a UniqueString plus a
+        // Move of the remainder. For a small number that is a dozen of them to produce three digits.
+        // IntToBaseStr emits exactly the digits there are, in one allocation, and is what OCT and BIN
+        // already use, so the three now share a single implementation of the same idea.
+        Ctx.StringRegs[Instr.Dest] :=
+          FitBaseDigits(IntToBaseStr(Ctx.IntRegs[Instr.Src1], 16), Ctx.IntRegs[Instr.Src2]);
       end;
     10: // bcStrInstr - INSTR([start,] haystack, needle)
       begin
