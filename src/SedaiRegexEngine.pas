@@ -730,6 +730,7 @@ begin
   // what keeps a SHARED automaton read-only here.
   Dfa.EnsureFilters(Len);
   p := 0;
+  Inc(GDfaBytes, Len);               // once per SCAN, see the counter comment in SedaiAutomaton
   // One call per MATCH, not one per candidate position: the position loop lives
   // inside FindNext. ⚠️ A pattern that can match the empty string also matches
   // just past the last byte - "a*" over "aaa" is two matches - which is why
@@ -772,6 +773,7 @@ begin
   D := PByte(PChar(S));
   Dfa := RX.FDfa;
   Dfa.EnsureFilters(Len);            // see RegexEngineCount
+  Inc(GDfaBytes, Len);               // once per SCAN, see the counter comment in SedaiAutomaton
   NM := 0;
   Matched := 0;
   SetLength(MStart, 64);
@@ -899,8 +901,30 @@ initialization
 
 finalization
   if GRegexDiag then
+  begin
     WriteLn(ErrOutput, 'regex: dfas=', GDfaBuilds, ' transitions=', GDfaTransBuilt,
             ' cached=', GCacheN, ' filters=', not GDfaSkipFilters);
+    // The fall-through rate: of every position offered to FindNext, how many survived the filters
+    // and started a DFA walk. That ratio - not a stopwatch - says whether a phase is filter-bound.
+    if GDfaBytes > 0 then
+      WriteLn(ErrOutput, '  bytes=', GDfaBytes, ' attempts=', GDfaAttempts,
+              ' (', (GDfaAttempts * 1000) div GDfaBytes, ' per mille)',
+              ' steps=', GDfaSteps,
+              ' steps/attempt=', (GDfaSteps * 100) div (GDfaAttempts + 1), '/100');
+    // Per pattern, the DFA STATE COUNT - because that is what decides whether a 16-state SIMD walk
+    // (Sheng-style: one pshufb per byte, the transition table addressed by the INPUT byte instead of
+    // by the state, so the load leaves the dependency chain) could replace the table walk for it.
+    // ⚠️ States BUILT, and the DFA is built lazily: this is what the scan actually reached, not the
+    // whole reachable automaton. After a full pass over real input the two coincide in practice, but
+    // a short subject will under-report. `DECLINED` = the pattern was refused and went to the library.
+    for i := 0 to GCacheN - 1 do
+      if GCacheVal[i] <> nil then
+        WriteLn(ErrOutput, '  states=', GCacheVal[i].FDfa.DfaStates:4,
+                ' vec=', GCacheVal[i].FDfa.VecPrefixLen:2, 'x', GCacheVal[i].FDfa.VecPrefixCount:2,
+                '   ', GCacheKey[i])
+      else
+        WriteLn(ErrOutput, '  DECLINED      ', GCacheKey[i]);
+  end;
   for i := 0 to GCacheN - 1 do GCacheVal[i].Free;
   DoneCriticalSection(GCacheLock);
 

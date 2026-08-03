@@ -59,15 +59,25 @@ type
     aligned loads - there is no broadcast on the hot path. }
   TVecPrefixFilter = record
     N: Integer;                                    // prefixes in use, 1..VEC_MAX_PREFIX
-    // How many BYTES of each prefix are compared: 1, 2 or 3. The builder takes the LONGEST it can
-    // enumerate inside the prefix cap, because every extra byte cuts the false positives that turn
-    // into restarts - but a pattern that can accept in two bytes has no third one to test, and one
-    // that can accept in one has only its first. Those are not corner cases: three of regex-redux's
-    // five substitutions are exactly that shape, and a filter fixed at three bytes excludes itself
-    // from all of them.
+    // How many BYTES of each prefix are compared: 1..VEC_MAX_DEPTH. The builder takes the longest it
+    // can enumerate, because every extra byte cuts the false positives - but a pattern that can
+    // accept in two bytes has no third one to test, and one that can accept in one has only its
+    // first. Those are not corner cases: three of regex-redux's five substitutions are exactly that
+    // shape ("a[NSt]|BY" completes in two, "<[^>]*>" starts on a single byte).
+    //
+    // ⭐ WHY IT IS NO LONGER THREE. A block filter's selectivity is not the candidate rate, it is
+    // the chance a WHOLE BLOCK is free of candidates. Measured 2026-08-03 on regex-redux's nine
+    // count patterns: 3.8% of positions survive the filters, and 1-(1-0.038)^16 = 46% - NEARLY HALF
+    // of all sixteen-byte blocks fell through to the scalar path, which is where 610 of COUNT's 720
+    // ms were going (the vector scan itself is 110). On a four-letter alphabet every extra prefix
+    // byte divides the candidate rate by four, so five bytes takes block survival to ~3%.
+    // ⚠️ And DEEPER IS NOT ALWAYS BETTER: these patterns still have only six distinct prefixes at
+    // depth eight, so the cap would allow it, but the per-block cost grows with L and would swallow
+    // the gain. Five is a cost choice - vector cost plus survival times downstream cost - not "as
+    // deep as the enumeration goes".
     L: Integer;
-    // [prefix][byte position][lane]. 8 x 3 x 16 = 384 bytes, one cache line short of L1 trivia.
-    Splat: array[0..7, 0..2, 0..15] of Byte;
+    // [prefix][byte position][lane]. 8 x 5 x 16 = 640 bytes: still nothing, still always in L1.
+    Splat: array[0..7, 0..4, 0..15] of Byte;
   end;
   PVecPrefixFilter = ^TVecPrefixFilter;
 
@@ -215,6 +225,11 @@ type
     property FirstBytes: TByteClass read FFirstBytes;
     property HasFirstBytes: Boolean read FHasFirst;
     property DfaStates: Integer read FNDfa;
+    // What depth the vector prefilter actually reached, and how many prefixes it kept. The DEPTH is
+    // the whole selectivity story - block survival is 1-(1-rate)^16, and the rate falls by the
+    // alphabet size per byte - so a pattern that stopped at 1 or 2 is one the filter barely helps.
+    function VecPrefixLen: Integer;
+    function VecPrefixCount: Integer;
     // --- for a code generator ---------------------------------------------
     // Native code cannot be lazy: every state and every transition has to exist
     // before a single byte is emitted. Materialise returns False when the DFA
@@ -269,6 +284,22 @@ var
   // REGEX_NOVEC=1: build the scalar filters but not the vector one, which is the A/B for the SSE2
   // prefilter on a single binary. The scan falls back to the hashed triple - slower, never wrong.
   GDfaSkipVec: Boolean = False;
+  // ⭐ COUNTERS, not a stopwatch. The question "is this phase filter-bound or DFA-bound" cannot be
+  // answered by timing, because both live in the same loop: it needs to know how many positions the
+  // filters ADMIT. GDfaBytes = positions offered, counted ONCE PER SCAN by the engine and never in
+  // FindNext: FindNext is re-entered after every match, so adding the REMAINING length per call
+  // makes the total grow with the SQUARE of the match count - it read 21 trillion for a 450 MB
+  // workload before that was caught. GDfaAttempts = the positions that survived every filter
+  // and started a DFA walk, GDfaSteps = transitions taken. attempts/bytes IS the fall-through rate,
+  // and it is the number the "deeper prefix" projection rests on. Reported under REGEX_DIAG.
+  // ⚠️ A build with these on is for COUNTING, not for timing, and they are behind
+  // {$DEFINE REGEX_COUNTERS} for exactly that reason: the step counter sits in the INNERMOST DFA
+  // loop and fires ~82M times on regex-redux - about 2% of the program, below the measurement floor
+  // but real work that a shipping binary has no reason to pay. Build with -dREGEX_COUNTERS to use
+  // them; the state counts and the fall-through denominator are free and stay on.
+  GDfaBytes: Int64 = 0;
+  GDfaAttempts: Int64 = 0;
+  GDfaSteps: Int64 = 0;
   // How many transitions the subset construction has computed, and how many
   // DFAs have been built. Counters, not a stopwatch: a timer says a thing is
   // slow, a counter says WHAT it did too much of.
@@ -761,11 +792,20 @@ end;
 
 {$IFDEF CPUX86_64}
 function VecScanPrefix(Data: PByte; From, LastP: Integer; F: PVecPrefixFilter): Integer; assembler; nostackframe;
-{ First position in Data[From..LastP] whose three-byte window matches one of F^'s prefixes, or -1.
-  Sixteen candidate positions per iteration.
+{ First position in Data[From..LastP] whose L-byte window matches one of F^'s prefixes, or -1.
+  Sixteen candidate positions per iteration, L up to VEC_MAX_DEPTH.
 
-  ⚠️ It reads Data[p .. p+17] for a block starting at p, so the caller's LastP must leave two bytes
-  of slack: LastP <= Len-3. Positions past the last full block are the caller's to finish scalar.
+  ⚠️ For a block starting at p it reads Data[p .. p+15+L-1], so the CALLER must pass
+  LastP <= Len-L. The bound test below guarantees p+15 <= LastP, which makes the deepest read
+  Len-1. Positions past the last full block are the caller's to finish scalar.
+
+  ⚠️⚠️ REGISTER BUDGET, and it is what decides the shape of this loop. Win64 leaves only XMM0-XMM5
+  volatile, and `nostackframe` means the non-volatile ones cannot be borrowed. Five chunk vectors
+  plus a per-prefix accumulator plus a scratch would be seven. So only chunks p and p+1 stay pinned
+  across the prefix loop; chunks p+2.. are re-loaded per prefix into xmm2. Those are L1 hits on a
+  line the block just touched, and the loop runs once per SIXTEEN bytes, not per byte.
+  ⛔ And the splat cannot be a memory operand to pcmpeqb: `Splat` sits at offset 8 in the record and
+  legacy SSE faults on an unaligned memory source. Hence movdqu into a register first.
 
   Win64 registers: RCX = Data, EDX = From, R8D = LastP, R9 = F. Volatile only (RAX, RCX, RDX, R8-R11,
   XMM0-5), so there is nothing to save and the frame can go. }
@@ -773,9 +813,9 @@ asm
     movslq  %edx, %rdx                  // p = From
     movslq  %r8d, %r8                   // last position we may test
     movl    (%r9), %r10d                // N = number of prefixes
-    movl    4(%r9), %r11d               // L = prefix bytes compared (1..3)
+    movl    4(%r9), %r11d               // L = prefix bytes compared (1..5)
     addq    $8, %r9                     // -> Splat[0][0][0], past N and L
-    imull   $48, %r10d, %r10d           // one prefix is 3 x 16 bytes of splat
+    imull   $80, %r10d, %r10d           // one prefix is 5 x 16 bytes of splat
     movslq  %r10d, %r10
     addq    %r9, %r10                   // r10 = end of the splat table; the loop walks to it
                                         // rather than counting, which keeps every register volatile
@@ -784,13 +824,10 @@ asm
     leaq    15(%rdx), %rax
     cmpq    %r8, %rax
     jg      .Lnone                      // fewer than 16 positions left: caller finishes it
-    // Always three loads: the caller guarantees two bytes of slack whatever L is, so this needs no
-    // branch and the unused chunks cost one L1 hit each.
-    movdqu  (%rcx,%rdx,1), %xmm0        // bytes at p
-    movdqu  1(%rcx,%rdx,1), %xmm1       // bytes at p+1
-    movdqu  2(%rcx,%rdx,1), %xmm2       // bytes at p+2
-    pxor    %xmm3, %xmm3                // accumulated "some prefix matches here"
-    movq    %r9, %rax                   // -> this prefix's three splat vectors
+    movdqu  (%rcx,%rdx,1), %xmm0        // bytes at p    - pinned: every prefix compares against it
+    movdqu  1(%rcx,%rdx,1), %xmm1       // bytes at p+1  - pinned for the same reason
+    pxor    %xmm3, %xmm3                // accumulated "some prefix matches somewhere in this block"
+    movq    %r9, %rax                   // -> this prefix's splat vectors
 .Lpref:
     movdqu  (%rax), %xmm4               // movdqU: Splat is not 16-byte aligned in the record, and
     pcmpeqb %xmm0, %xmm4                // movdqa would fault. Same speed for an always-hot table.
@@ -801,12 +838,25 @@ asm
     pand    %xmm5, %xmm4
     cmpl    $3, %r11d
     jl      .Lgot                       // L = 2
+    movdqu  2(%rcx,%rdx,1), %xmm2       // chunk p+2, re-loaded per prefix: see the register note
     movdqu  32(%rax), %xmm5
+    pcmpeqb %xmm2, %xmm5
+    pand    %xmm5, %xmm4
+    cmpl    $4, %r11d
+    jl      .Lgot                       // L = 3
+    movdqu  3(%rcx,%rdx,1), %xmm2
+    movdqu  48(%rax), %xmm5
+    pcmpeqb %xmm2, %xmm5
+    pand    %xmm5, %xmm4
+    cmpl    $5, %r11d
+    jl      .Lgot                       // L = 4
+    movdqu  4(%rcx,%rdx,1), %xmm2
+    movdqu  64(%rax), %xmm5
     pcmpeqb %xmm2, %xmm5
     pand    %xmm5, %xmm4
 .Lgot:
     por     %xmm4, %xmm3
-    addq    $48, %rax
+    addq    $80, %rax
     cmpq    %r10, %rax
     jb      .Lpref
     pmovmskb %xmm3, %eax
@@ -893,9 +943,24 @@ procedure TDfa.ComputeVecFilter;
 // level completely must keep the level BEFORE it, never a trimmed version of the one it gave up on.
 const
   VEC_MAX_PREFIX = 8;    // beyond this the per-16-byte cost passes what the scalar filter costs
+  // ⭐ DEPTH, and it is a COST choice, not "as deep as the enumeration allows". The block filter's
+  // real selectivity is the chance a whole sixteen-byte block is candidate-free, and at three bytes
+  // on DNA that was measured at 46% surviving - so 610 of COUNT's 720 ms were spent past the vector
+  // scan. Every extra byte divides the candidate rate by four on a four-letter alphabet, which takes
+  // survival to ~3% at five.
+  //
+  // ⛔ AND THE FIRST MODEL WAS WRONG IN A WAY WORTH KEEPING. It assumed the PREFIX COUNT stays put
+  // as depth grows. It does not: a character class multiplies it, so "agg[act]taaa|ttta[agt]cct"
+  // has 2 prefixes at three bytes and SIX at five. The candidate rate is N*4^-L, not 2*4^-L, and the
+  // per-block cost is N*L stages - both ends move. That is why the predicted 32% came out as 20%.
+  // 📊 Measured, COUNT phase over 450 MB: L=3 -> 720 ms · L=4 -> 486 · L=5 -> 406. The marginal gain
+  // is 234 then 80, so the curve has flattened and five is where it stops paying for itself. Six was
+  // NOT measured - it needs another compare stage in the assembly, and extrapolating the curve puts
+  // it at ~2% of the program, which does not buy a new seam.
+  VEC_MAX_DEPTH = 5;
   STATE_BUDGET = 4096;
 type
-  TPfx = array[0..2] of Byte;
+  TPfx = array[0..VEC_MAX_DEPTH - 1] of Byte;
 var
   Cur, Nxt: array[0..VEC_MAX_PREFIX - 1] of TPfx;
   CurSt, NxtSt: array[0..VEC_MAX_PREFIX - 1] of Integer;   // DFA state after each prefix
@@ -934,10 +999,10 @@ begin
   NBest := NCur; LBest := 1;
   for i := 0 to NCur - 1 do Best[i] := Cur[i];
 
-  // Levels 2 and 3, each extending every prefix of the level before it. The moment a level cannot be
-  // completed - an accepting state (nothing deeper is required for a match), the cap, the budget -
-  // the level before it is the answer.
-  for Depth := 2 to 3 do
+  // Each level extends every prefix of the level before it. The moment a level cannot be completed -
+  // an accepting state (nothing deeper is required for a match), the prefix cap, the state budget -
+  // the level BEFORE it is the answer, never a trimmed version of the one abandoned.
+  for Depth := 2 to VEC_MAX_DEPTH do
   begin
     NNxt := 0;
     Blocked := False;
@@ -968,10 +1033,21 @@ begin
   // Pre-splat every byte across the sixteen lanes so the scan loop never broadcasts.
   FVec.N := NBest;
   FVec.L := LBest;
-  for i := 0 to NBest - 1 do
-    for j := 0 to 2 do
+  FillChar(FVec.Splat, SizeOf(FVec.Splat), 0);   // the lanes past LBest are never compared, but a
+  for i := 0 to NBest - 1 do                     // zeroed table is one less thing to reason about
+    for j := 0 to LBest - 1 do
       FillChar(FVec.Splat[i][j][0], 16, Best[i][j]);
   FHasVec := True;
+end;
+
+function TDfa.VecPrefixLen: Integer;
+begin
+  if FHasVec then Result := FVec.L else Result := 0;
+end;
+
+function TDfa.VecPrefixCount: Integer;
+begin
+  if FHasVec then Result := FVec.N else Result := 0;
 end;
 
 function TDfa.Accepting(S: Integer): Boolean;
@@ -1019,6 +1095,9 @@ var
   Tr: PIntArr;
   Acc: PBoolArr;
   b: Byte;
+  {$IFDEF CPUX86_64}
+  vlast: Integer;                  // last position the vector filter may test: Len - prefix length
+  {$ENDIF}
 begin
   Result := False;
   MStart := -1; MEnd := -1;
@@ -1048,24 +1127,30 @@ begin
     if FHasVec then
     begin
       { The SSE2 prefilter: sixteen candidate positions per iteration, and EXACT - it admits only
-        the three-byte prefixes a match can really begin with, where the hashed filter admits about
-        4% of DNA.
+        the prefixes a match can really begin with, where the hashed filter admits about 4% of DNA.
 
         ⭐ Prepended to the scalar loop rather than replacing it, the same shape that made the AOT's
-        vectoriser safe: the block scan handles whole sixteens, whatever it leaves - the last
-        seventeen bytes, or a position it hands back - is finished by the scalar filter below. The
-        worst case of a wrong guess is yesterday's code. }
+        vectoriser safe: the block scan handles whole sixteens, whatever it leaves - the tail, or a
+        position it hands back - is finished by the scalar filter below. The worst case of a wrong
+        guess is yesterday's code.
+
+        ⚠️ THE LAST TESTABLE POSITION FOLLOWS THE PREFIX LENGTH, and this used to be the constant 3.
+        A prefix of L bytes at position q needs Data[q .. q+L-1], so the last q that can be tested is
+        Len-L; hand VecScanPrefix anything larger and it reads past the subject. This is the seam a
+        real bug lived in once already (advancing past positions the block loop never tested loses
+        matches SILENTLY, and only for certain lengths) - hence bug_regex_vecfilter.bas. }
       {$IFDEF CPUX86_64}
-      if Len - 3 >= p then
+      vlast := Len - FVec.L;             // last position whose whole prefix window is inside Data
+      if vlast >= p then
       begin
-        i := VecScanPrefix(Data, p, Len - 3, @FVec);
+        i := VecScanPrefix(Data, p, vlast, @FVec);
         if i >= 0 then
           p := i                         // a real candidate; the scalar filter will agree and stop
         else
           // Nothing in any FULL block. ⚠️ Advance only past what was actually TESTED - the block
           // loop stops when fewer than sixteen positions remain, and skipping those would lose a
           // match. This is the whole-blocks count, and the remainder is the scalar loop's.
-          p := p + ((Len - 3 - p + 1) div 16) * 16;
+          p := p + ((vlast - p + 1) div 16) * 16;
       end;
       {$ENDIF}
     end;
@@ -1122,8 +1207,10 @@ begin
     last := -1;
     if Acc^[st] then last := p;
     i := p;
+    {$IFDEF REGEX_COUNTERS} Inc(GDfaAttempts); {$ENDIF}
     while i < Len do
     begin
+      {$IFDEF REGEX_COUNTERS} Inc(GDfaSteps); {$ENDIF}
       t := Tr^[(st shl 8) or Data[i]];
       if t < 0 then
       begin
