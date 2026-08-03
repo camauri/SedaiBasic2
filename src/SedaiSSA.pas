@@ -1757,7 +1757,9 @@ var
   BareIntercept: Boolean;         // MODERN, and this bare name is NOT a name the program declared
   CastLeft, CastRight: Boolean;   // apply "Operator T.Cast() As String" to this binary operand?
   NumCast: Boolean;               // arithmetic op: apply a numeric Cast operator to a UDT operand
-  RecUDTIdx, RecSlotK: Integer;   // OFFSETOF: UDT index + field scan
+  RecUDTIdx, RecSlotK, RecFieldIdx: Integer;   // OFFSETOF: UDT index + field scan
+  RecLayoutOfs: TInt64Array;     // OFFSETOF: the type's C byte layout (UDTCLayout)
+  RecLayoutSize: Int64;
   FuncRetType: TSSARegisterType;  // M2: user FUNCTION return type
   MethodObjNode: TASTNode;        // M4.1: object of a method call
   DerefTarget: TASTNode;          // "*expr": the operand, with any parentheses stripped
@@ -5534,10 +5536,22 @@ begin
         end;
 
         // FreeBASIC OFFSETOF(typename, field): the byte offset of a field within a UDT, as a compile-time
-        // constant. Our storage is three separate typed banks (not a byte-flat layout), so a faithful FB
-        // offset is not well-defined; we return the field's declaration index * 8 — exact for the common
-        // all-64-bit UDT (and consistent with our uniform 8-byte slot model), an approximation for narrower
-        // fields (no FB packing/alignment is modelled). Not a declared array.
+        // constant. Not a declared array.
+        //
+        // ⛔ This used to answer the field's declaration index * 8, on the argument that our storage is
+        // three typed banks so a byte offset "is not well-defined". The argument was wrong twice over.
+        // The byte layout IS well-defined and was ALREADY COMPUTED: UDTCLayout lays a type out exactly
+        // as fbc does, and SIZEOF and PUT/GET had been reading it all along. Only OFFSETOF was left
+        // fabricating its own number - so on
+        //     Type R : a As UByte : b As Short : c As Long : d As Double : End Type
+        // SIZEOF(R) answered 16 and OFFSETOF(R, d) answered 24: a field starting past the end of its own
+        // type. ⭐ That contradiction is checkable WITHOUT an oracle, and is the assertion the guardian
+        // leads with (job/tests/bas/bug_udt_layout_offsetof.bas).
+        //
+        // ⚠️ Two shapes still fall back, and deliberately: a UNION (every member starts at 0, which is
+        // its C layout, and the fact that our storage cannot actually overlap them is the byte-storage
+        // work's problem, not this one), and a type UDTCLayout declines - a variable-length string, an
+        // array or a nested-record member, which hold a pointer in C rather than the data.
         if (UpperCase(ArrName) = 'OFFSETOF') and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount >= 2) and
            (Node.GetChild(1).GetChild(0).NodeType = antIdentifier) and
@@ -5548,10 +5562,18 @@ begin
           if RecUDTIdx >= 0 then
           begin
             ArrName2 := UpperCase(VarToStr(Node.GetChild(1).GetChild(1).Value));   // field name
+            RecFieldIdx := -1;
             for RecSlotK := 0 to High(FUDTs[RecUDTIdx].Fields) do
+              if FUDTs[RecUDTIdx].Fields[RecSlotK].Name = ArrName2 then
+              begin RecFieldIdx := RecSlotK; Break; end;
+            if RecFieldIdx >= 0 then
             begin
-              if FUDTs[RecUDTIdx].Fields[RecSlotK].Name = ArrName2 then Break;
-              ValCode := ValCode + 8;
+              if FUDTs[RecUDTIdx].IsUnion then
+                ValCode := 0                        // every member of a union begins at byte 0
+              else if UDTCLayout(RecUDTIdx, RecLayoutOfs, RecLayoutSize) then
+                ValCode := RecLayoutOfs[RecFieldIdx]
+              else
+                ValCode := RecFieldIdx * 8;         // shape we cannot image: the answer we used to give
             end;
           end;
           Result := MakeSSAConstInt(ValCode);
