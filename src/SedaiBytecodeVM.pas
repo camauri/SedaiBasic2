@@ -8962,8 +8962,9 @@ begin
   if RegexUseOwnEngine then
   begin
     // Borrowed from the cache unless Owned: see AcquirePattern for why the
-    // cache never evicts and why that is what makes the borrow safe.
-    RX := AcquirePattern(Pattern, RXOwned);
+    // cache never evicts and why that is what makes the borrow safe. Length(S)
+    // lets it decline a bargain that would not pay off - see there.
+    RX := AcquirePattern(Pattern, RXOwned, Length(S));
     if RX <> nil then
     try
       Exit(RegexEngineCount(RX, S));
@@ -9027,7 +9028,7 @@ begin
   if Pattern = '' then Exit;
   if RegexUseOwnEngine then
   begin
-    RX := AcquirePattern(Pattern, RXOwned);
+    RX := AcquirePattern(Pattern, RXOwned, Length(S));
     if RX <> nil then
     try
       Exit(RegexEngineReplace(RX, S, Repl));

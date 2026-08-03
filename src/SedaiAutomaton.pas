@@ -144,6 +144,10 @@ type
     // one is a single failed attempt.
     FTriple: array[0..8191] of Byte;
     FHasTriple: Boolean;
+    // The two prefilters are built ON DEMAND, not by the constructor - see
+    // BuildFilters. False means the scan cascade simply falls back to the
+    // first-byte filter: slower, never wrong.
+    FFiltersBuilt: Boolean;
     procedure ClosureAdd(S: Integer);
     function InternSet: Integer;
     function ComputeTrans(State: Integer; B: Byte): Integer;
@@ -177,6 +181,22 @@ type
     // exceeds MaxStates, which is the signal to stay interpreted rather than
     // spend unbounded time and memory compiling a pathological pattern.
     function Materialise(MaxStates: Integer): Boolean;
+    // Build the pair and triple prefilters. EAGER work whose payer is the SCAN:
+    // enumerating them computes ~500 subset transitions, which a megabyte-scale
+    // scan repays many times over (+97% and +40% when they went in) and a
+    // sixteen-byte subject never repays at all. So the constructor no longer
+    // does it and the two callers decide instead:
+    //   - a pattern going into the CACHE calls BuildFilters before it is
+    //     published, because a cached DFA is shared and must be read-only
+    //     while it is scanned, and because its cost is amortised over every
+    //     later use anyway;
+    //   - a per-call pattern leaves it to EnsureFilters, which pays only when
+    //     the subject is big enough to earn it back.
+    procedure BuildFilters;
+    // Build the filters only if this subject is worth them. Threshold measured:
+    // the enumeration costs ~47 us and the filters save ~7 ns per scanned byte,
+    // so it repays around 7 KB; 16 KB keeps a comfortable margin.
+    procedure EnsureFilters(SubjectLen: Integer);
     function Accepting(S: Integer): Boolean;
     function Transition(S: Integer; B: Byte): Integer;
     function StartState: Integer;
@@ -195,6 +215,22 @@ type
 
 const
   DFA_DEAD = 0;    // DFA state 0 is always the empty set: no match can follow
+
+var
+  // Diagnostic A/B, set from the outside (REGEX_NOFILTER=1 in SedaiRegexEngine).
+  // The two prefilters are built EAGERLY by the constructor and they are not
+  // cheap: ComputePairFilter walks first-byte x 256 and ComputeTripleFilter
+  // first-byte x 256 x 256, and every transition they miss computes an NFA
+  // closure. Amortised over a 50 MB scan that is the best money the engine
+  // spends; charged to a single short subject it is the whole compile cost.
+  // Turning them off answers which of those two a workload is - and it is only
+  // ever a MEASUREMENT: without the filters the scan is slower, never wrong.
+  GDfaSkipFilters: Boolean = False;
+  // How many transitions the subset construction has computed, and how many
+  // DFAs have been built. Counters, not a stopwatch: a timer says a thing is
+  // slow, a counter says WHAT it did too much of.
+  GDfaBuilds: Int64 = 0;
+  GDfaTransBuilt: Int64 = 0;
 
 // --- byte-class helpers ------------------------------------------------------
 procedure ClsClear(out C: TByteClass);
@@ -458,10 +494,17 @@ begin
   FMask := 1023;
   SetLength(FBucket, FMask + 1);
   for i := 0 to FMask do FBucket[i] := -1;
-  SetLength(FChain, 64);
-  SetLength(FSetOff, 64); SetLength(FSetLen, 64); SetLength(FAccept, 64);
-  SetLength(FSetData, 256);
-  SetLength(FTrans, 64 * 256);
+  // Room for EIGHT states, not 64. The transition table is 256 entries per
+  // state and every one of them has to be stamped -1 ("not computed yet"), so
+  // the old figure charged 16384 stores plus 64 KB of allocation to every DFA
+  // ever built - including the ones that end up with four states. Growth
+  // doubles and stamps only the new region (see InternSet), so a big automaton
+  // pays a handful of reallocations it can well afford, while a short-lived
+  // pattern stops paying for room it never uses.
+  SetLength(FChain, 8);
+  SetLength(FSetOff, 8); SetLength(FSetLen, 8); SetLength(FAccept, 8);
+  SetLength(FSetData, 64);
+  SetLength(FTrans, 8 * 256);
   for i := 0 to High(FTrans) do FTrans[i] := -1;
   FNDfa := 0;
 
@@ -476,9 +519,28 @@ begin
   ClosureAdd(FNfaStart);
   FStart := InternSet;
 
+  // The first-byte set stays eager: it is one pass over the start set, it is
+  // what makes the skip loop possible at all, and it is the input the other two
+  // filters refine.
   ComputeFirstBytes;
+  Inc(GDfaBuilds);
+end;
+
+procedure TDfa.BuildFilters;
+begin
+  if FFiltersBuilt then Exit;
+  FFiltersBuilt := True;             // set first: the work below is idempotent
+  if GDfaSkipFilters then Exit;      // diagnostic A/B, REGEX_NOFILTER=1
   ComputePairFilter;
   ComputeTripleFilter;
+end;
+
+procedure TDfa.EnsureFilters(SubjectLen: Integer);
+const
+  FILTER_MIN_SUBJECT = 16384;
+begin
+  if FFiltersBuilt then Exit;
+  if SubjectLen >= FILTER_MIN_SUBJECT then BuildFilters;
 end;
 
 procedure TDfa.ClosureAdd(S: Integer);
@@ -561,6 +623,7 @@ end;
 function TDfa.ComputeTrans(State: Integer; B: Byte): Integer;
 var i, s, off, len: Integer;
 begin
+  Inc(GDfaTransBuilt);
   Inc(FGen);
   FNList := 0;
   off := FSetOff[State];

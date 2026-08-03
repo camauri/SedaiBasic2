@@ -56,7 +56,14 @@ function CompilePattern(const Pattern: string): TCompiledRegex;
 // ⚠️ Compiling is cheap next to scanning a megabyte, and ruinous next to
 // scanning twenty bytes - a program calling RegexCount inside a loop over short
 // strings would rebuild the whole automaton every iteration. Hence the cache.
-function AcquirePattern(const Pattern: string; out Owned: Boolean): TCompiledRegex;
+//
+// SubjectLen is how many bytes this call is about to scan, and it is what lets
+// the engine DECLINE. Past the cache cap a pattern cannot be amortised, so on a
+// short subject the honest answer is nil: use the library. Without that the
+// engine was 14.7x slower than the thing it replaces on patterns built from
+// data, which is the one shape where a DFA can never win.
+function AcquirePattern(const Pattern: string; out Owned: Boolean;
+                        SubjectLen: Integer): TCompiledRegex;
 
 // Non-overlapping leftmost-longest matches of a compiled pattern in S.
 function RegexEngineCount(RX: TCompiledRegex; const S: string): Int64;
@@ -539,7 +546,15 @@ begin
     end;
     Entry := RX.FBuilder.Finish(F);
     RX.FDfa := TDfa.Create(RX.FBuilder, Entry);
-    if NativeWanted then RX.FNative := CompileDfaNative(RX.FDfa);
+    if NativeWanted then
+    begin
+      // Native code cannot be lazy about ANYTHING: it reads HasPairFilter at
+      // emit time and bakes the answer into the instruction stream, so the
+      // filters have to exist first or the emitted scan silently loses them.
+      // The A/B against the interpreted walk is only fair if both have it.
+      RX.FDfa.BuildFilters;
+      RX.FNative := CompileDfaNative(RX.FDfa);
+    end;
     Result := RX;
   except
     RX.Free;
@@ -570,6 +585,9 @@ end;
   ------------------------------------------------------------------------- }
 const
   CACHE_MAX = 64;
+  // Below this many bytes a pattern that CANNOT be cached is not worth
+  // compiling: see the GCacheFull branch below for the arithmetic.
+  OWNED_MIN_SUBJECT = 4096;
   // States a cached DFA may have. The table is 1 KB per state, so this is the
   // memory a single cached pattern is allowed to cost; a bigger automaton is
   // still usable, just not cacheable.
@@ -583,6 +601,7 @@ var
   GCacheN: Integer = 0;
   GCacheFull: Boolean = False;
   GCacheOff: Integer = -1;   // -1 = the environment has not been read yet
+  GRegexDiag: Boolean = False;
 
 function PatHash(const S: string): Cardinal;
 var i: Integer;
@@ -592,7 +611,8 @@ begin
     Result := (Result xor Byte(S[i])) * 16777619;
 end;
 
-function AcquirePattern(const Pattern: string; out Owned: Boolean): TCompiledRegex;
+function AcquirePattern(const Pattern: string; out Owned: Boolean;
+                        SubjectLen: Integer): TCompiledRegex;
 var
   h: Cardinal;
   i: Integer;
@@ -616,10 +636,23 @@ begin
         Exit(GCacheVal[i]);
     if GCacheFull then
     begin
-      // Past the cap: compile per call and hand ownership over. Correct, just
-      // not cached - and it keeps the eviction hazard from ever existing.
+      // Past the cap there is nothing to amortise over: this pattern is
+      // compiled for THIS call and thrown away. Whether that is a good deal
+      // depends entirely on the subject.
+      //
+      // Building a DFA costs ~38 us. Scanning with one saves ~50 ns per byte
+      // against the backtracker, so the trade repays somewhere under a
+      // kilobyte - above the threshold, compile; below it, DECLINE and let the
+      // library have it. A DFA pays up front to be fast later, and on a
+      // sixteen-byte subject there is no later: measured, that is where the
+      // engine was 14.7x SLOWER than the thing it replaces.
+      //
+      // ⚠️ nil is NOT cached here - the caller's cache-insert path is not
+      // reached on this branch - so declining is a decision about one call and
+      // never becomes a verdict about the pattern.
       LeaveCriticalSection(GCacheLock);
       try
+        if SubjectLen < OWNED_MIN_SUBJECT then Exit(nil);
         Owned := True;
         Exit(CompilePattern(Pattern));
       finally
@@ -635,10 +668,18 @@ begin
   RX := CompilePattern(Pattern);
   if (RX <> nil) and not RX.FDfa.Materialise(MATERIALISE_CAP) then
   begin
-    // Too big to publish read-only. Give it to the caller instead of racing.
+    // Too big to publish read-only. Give it to the caller instead of racing -
+    // and leave its filters unbuilt, so this per-call pattern is charged for
+    // them only if it actually scans enough to earn them back.
     Owned := True;
     Exit(RX);
   end;
+  // Everything a shared DFA will ever need must exist BEFORE it is published:
+  // once other threads can reach it, the invariant that keeps the hot path
+  // lock-free is that nobody writes to it. Building the filters here is also
+  // where they belong on cost grounds - a cached pattern is one that gets used
+  // again, so the enumeration is amortised over every later call.
+  if RX <> nil then RX.FDfa.BuildFilters;
 
   EnterCriticalSection(GCacheLock);
   try
@@ -677,6 +718,10 @@ begin
   if Len = 0 then Exit;
   D := PByte(PChar(S));
   Dfa := RX.FDfa;
+  // Now that the subject's size is known, decide whether this scan is worth the
+  // prefilters. A cached DFA already has them and this is a no-op - which is
+  // what keeps a SHARED automaton read-only here.
+  Dfa.EnsureFilters(Len);
   p := 0;
   // One call per MATCH, not one per candidate position: the position loop lives
   // inside FindNext. ⚠️ A pattern that can match the empty string also matches
@@ -717,6 +762,7 @@ begin
   if Len = 0 then Exit;
   D := PByte(PChar(S));
   Dfa := RX.FDfa;
+  Dfa.EnsureFilters(Len);            // see RegexEngineCount
   NM := 0;
   SetLength(MStart, 64);
   SetLength(MEnd, 64);
@@ -777,8 +823,18 @@ var
 
 initialization
   InitCriticalSection(GCacheLock);
+  // REGEX_NOFILTER=1 builds every DFA without its two prefilters, and
+  // REGEX_DIAG=1 reports what the construction actually did. Together they
+  // answer "what does a FRESH pattern spend its time on", which a stopwatch on
+  // the whole call cannot: the filters are eager work whose payer is the SCAN,
+  // so a workload of short subjects is charged for something it never uses.
+  GDfaSkipFilters := GetEnvironmentVariable('REGEX_NOFILTER') = '1';
+  GRegexDiag := GetEnvironmentVariable('REGEX_DIAG') = '1';
 
 finalization
+  if GRegexDiag then
+    WriteLn(ErrOutput, 'regex: dfas=', GDfaBuilds, ' transitions=', GDfaTransBuilt,
+            ' cached=', GCacheN, ' filters=', not GDfaSkipFilters);
   for i := 0 to GCacheN - 1 do GCacheVal[i].Free;
   DoneCriticalSection(GCacheLock);
 
