@@ -59,6 +59,13 @@ type
     aligned loads - there is no broadcast on the hot path. }
   TVecPrefixFilter = record
     N: Integer;                                    // prefixes in use, 1..VEC_MAX_PREFIX
+    // How many BYTES of each prefix are compared: 1, 2 or 3. The builder takes the LONGEST it can
+    // enumerate inside the prefix cap, because every extra byte cuts the false positives that turn
+    // into restarts - but a pattern that can accept in two bytes has no third one to test, and one
+    // that can accept in one has only its first. Those are not corner cases: three of regex-redux's
+    // five substitutions are exactly that shape, and a filter fixed at three bytes excludes itself
+    // from all of them.
+    L: Integer;
     // [prefix][byte position][lane]. 8 x 3 x 16 = 384 bytes, one cache line short of L1 trivia.
     Splat: array[0..7, 0..2, 0..15] of Byte;
   end;
@@ -763,34 +770,45 @@ function VecScanPrefix(Data: PByte; From, LastP: Integer; F: PVecPrefixFilter): 
   Win64 registers: RCX = Data, EDX = From, R8D = LastP, R9 = F. Volatile only (RAX, RCX, RDX, R8-R11,
   XMM0-5), so there is nothing to save and the frame can go. }
 asm
-    movslq  %edx, %rdx                  // p  = From
-    movslq  %r8d,  %r8                  // last position we may test
+    movslq  %edx, %rdx                  // p = From
+    movslq  %r8d, %r8                   // last position we may test
     movl    (%r9), %r10d                // N = number of prefixes
-    addq    $4, %r9                     // -> Splat[0][0][0]
+    movl    4(%r9), %r11d               // L = prefix bytes compared (1..3)
+    addq    $8, %r9                     // -> Splat[0][0][0], past N and L
+    imull   $48, %r10d, %r10d           // one prefix is 3 x 16 bytes of splat
+    movslq  %r10d, %r10
+    addq    %r9, %r10                   // r10 = end of the splat table; the loop walks to it
+                                        // rather than counting, which keeps every register volatile
+                                        // and spares the prologue a push
 .Lblock:
     leaq    15(%rdx), %rax
     cmpq    %r8, %rax
     jg      .Lnone                      // fewer than 16 positions left: caller finishes it
+    // Always three loads: the caller guarantees two bytes of slack whatever L is, so this needs no
+    // branch and the unused chunks cost one L1 hit each.
     movdqu  (%rcx,%rdx,1), %xmm0        // bytes at p
     movdqu  1(%rcx,%rdx,1), %xmm1       // bytes at p+1
     movdqu  2(%rcx,%rdx,1), %xmm2       // bytes at p+2
     pxor    %xmm3, %xmm3                // accumulated "some prefix matches here"
-    xorl    %eax, %eax                  // prefix index
-    movq    %r9, %r11                   // -> this prefix's three splat vectors
+    movq    %r9, %rax                   // -> this prefix's three splat vectors
 .Lpref:
-    movdqu  (%r11), %xmm4               // movdqU: Splat sits at offset 4 in the record, so it is
-    pcmpeqb %xmm0, %xmm4                // NOT 16-byte aligned and movdqa would fault. Same speed
-    movdqu  16(%r11), %xmm5             // here - the table is three cache lines and always hot.
+    movdqu  (%rax), %xmm4               // movdqU: Splat is not 16-byte aligned in the record, and
+    pcmpeqb %xmm0, %xmm4                // movdqa would fault. Same speed for an always-hot table.
+    cmpl    $2, %r11d
+    jl      .Lgot                       // L = 1: the first byte is the whole test
+    movdqu  16(%rax), %xmm5
     pcmpeqb %xmm1, %xmm5
     pand    %xmm5, %xmm4
-    movdqu  32(%r11), %xmm5
+    cmpl    $3, %r11d
+    jl      .Lgot                       // L = 2
+    movdqu  32(%rax), %xmm5
     pcmpeqb %xmm2, %xmm5
     pand    %xmm5, %xmm4
+.Lgot:
     por     %xmm4, %xmm3
-    addq    $48, %r11
-    incl    %eax
-    cmpl    %r10d, %eax
-    jl      .Lpref
+    addq    $48, %rax
+    cmpq    %r10, %rax
+    jb      .Lpref
     pmovmskb %xmm3, %eax
     testl   %eax, %eax
     jnz     .Lhit
@@ -864,76 +882,95 @@ begin
 end;
 
 procedure TDfa.ComputeVecFilter;
-// Enumerate the DISTINCT three-byte prefixes a match can begin with. Same walk as the triple filter,
-// but it collects the triples instead of hashing them - and gives up the moment there are more than
-// the vector loop can afford to compare, because the cost there is linear in the count.
+// Enumerate the DISTINCT byte prefixes a match can begin with, going as DEEP as the cap allows, and
+// keep the deepest level that fits. Depth is what cuts false positives - and therefore restarts -
+// but it is not always available: a pattern that can accept after one byte has no second byte to
+// test. Three of regex-redux's five substitutions are exactly that ("a[NSt]|BY" completes in two,
+// "<[^>]*>" starts on a single byte), so a filter fixed at three bytes excluded itself from the
+// phase that is now the program's largest.
 //
-// ⚠️ CORRECTNESS: this filter may only ever OVER-approximate. Every path that cannot enumerate the
-// full set - an accepting state within three bytes, a budget blown, too many prefixes - must leave
-// FHasVec False so the scan falls back, never trim the set and carry on.
+// ⚠️ CORRECTNESS: this filter may only ever OVER-approximate. Every path that cannot enumerate a
+// level completely must keep the level BEFORE it, never a trimmed version of the one it gave up on.
 const
   VEC_MAX_PREFIX = 8;    // beyond this the per-16-byte cost passes what the scalar filter costs
   STATE_BUDGET = 4096;
+type
+  TPfx = array[0..2] of Byte;
 var
-  b0, b1, b2, s1, s2, t, i, j: Integer;
-  Tri: array[0..VEC_MAX_PREFIX - 1, 0..2] of Byte;
-  NT: Integer;
-  Dup: Boolean;
-begin
-  FHasVec := False;
-  if not FHasFirst then Exit;          // nothing to enumerate from
-  NT := 0;
-  for b0 := 0 to 255 do
+  Cur, Nxt: array[0..VEC_MAX_PREFIX - 1] of TPfx;
+  CurSt, NxtSt: array[0..VEC_MAX_PREFIX - 1] of Integer;   // DFA state after each prefix
+  NCur, NNxt, Depth, i, j, b, t: Integer;
+  Best: array[0..VEC_MAX_PREFIX - 1] of TPfx;
+  NBest, LBest: Integer;
+  Blocked: Boolean;
+
+  function StepFrom(St, B: Integer): Integer;
   begin
-    if not ClsHas(FFirstBytes, Byte(b0)) then Continue;
-    t := FTrans[FStart * 256 + b0];
-    if t < 0 then
+    Result := FTrans[St * 256 + B];
+    if Result < 0 then
     begin
-      if FNDfa > STATE_BUDGET then Exit;
-      t := ComputeTrans(FStart, Byte(b0));
-    end;
-    if t = DFA_DEAD then Continue;
-    // A match that is already complete after one or two bytes has no three-byte prefix to test, so
-    // no filter of this shape can exist - exactly the case of the substitutions' "a[NSt]|BY".
-    if FAccept[t] then Exit;
-    s1 := t;
-    for b1 := 0 to 255 do
-    begin
-      t := FTrans[s1 * 256 + b1];
-      if t < 0 then
-      begin
-        if FNDfa > STATE_BUDGET then Exit;
-        t := ComputeTrans(s1, Byte(b1));
-      end;
-      if t = DFA_DEAD then Continue;
-      if FAccept[t] then Exit;
-      s2 := t;
-      for b2 := 0 to 255 do
-      begin
-        t := FTrans[s2 * 256 + b2];
-        if t < 0 then
-        begin
-          if FNDfa > STATE_BUDGET then Exit;
-          t := ComputeTrans(s2, Byte(b2));
-        end;
-        if t = DFA_DEAD then Continue;
-        Dup := False;
-        for i := 0 to NT - 1 do
-          if (Tri[i][0] = Byte(b0)) and (Tri[i][1] = Byte(b1)) and (Tri[i][2] = Byte(b2)) then
-          begin Dup := True; Break; end;
-        if Dup then Continue;
-        if NT >= VEC_MAX_PREFIX then Exit;      // too wide: stay on the scalar filter
-        Tri[NT][0] := Byte(b0); Tri[NT][1] := Byte(b1); Tri[NT][2] := Byte(b2);
-        Inc(NT);
-      end;
+      if FNDfa > STATE_BUDGET then Exit(-2);      // -2 = give up, distinct from DFA_DEAD
+      Result := ComputeTrans(St, Byte(B));
     end;
   end;
-  if NT = 0 then Exit;
+
+begin
+  FHasVec := False;
+  if not FHasFirst then Exit;
+  // Level 1: the bytes that can begin a match. If there are more than the cap, no level can fit -
+  // deeper levels only ever have MORE prefixes.
+  NCur := 0;
+  for b := 0 to 255 do
+  begin
+    if not ClsHas(FFirstBytes, Byte(b)) then Continue;
+    t := StepFrom(FStart, b);
+    if t = -2 then Exit;
+    if t = DFA_DEAD then Continue;
+    if NCur >= VEC_MAX_PREFIX then Exit;
+    Cur[NCur][0] := Byte(b); CurSt[NCur] := t;
+    Inc(NCur);
+  end;
+  if NCur = 0 then Exit;
+  NBest := NCur; LBest := 1;
+  for i := 0 to NCur - 1 do Best[i] := Cur[i];
+
+  // Levels 2 and 3, each extending every prefix of the level before it. The moment a level cannot be
+  // completed - an accepting state (nothing deeper is required for a match), the cap, the budget -
+  // the level before it is the answer.
+  for Depth := 2 to 3 do
+  begin
+    NNxt := 0;
+    Blocked := False;
+    for i := 0 to NCur - 1 do
+    begin
+      // A match may END here, so no deeper byte is required and no deeper filter is sound.
+      if FAccept[CurSt[i]] then begin Blocked := True; Break; end;
+      for b := 0 to 255 do
+      begin
+        t := StepFrom(CurSt[i], b);
+        if t = -2 then begin Blocked := True; Break; end;
+        if t = DFA_DEAD then Continue;
+        if NNxt >= VEC_MAX_PREFIX then begin Blocked := True; Break; end;
+        Nxt[NNxt] := Cur[i];
+        Nxt[NNxt][Depth - 1] := Byte(b);
+        NxtSt[NNxt] := t;
+        Inc(NNxt);
+      end;
+      if Blocked then Break;
+    end;
+    if Blocked or (NNxt = 0) then Break;
+    NCur := NNxt;
+    for i := 0 to NNxt - 1 do begin Cur[i] := Nxt[i]; CurSt[i] := NxtSt[i]; end;
+    NBest := NCur; LBest := Depth;
+    for i := 0 to NCur - 1 do Best[i] := Cur[i];
+  end;
+
   // Pre-splat every byte across the sixteen lanes so the scan loop never broadcasts.
-  FVec.N := NT;
-  for i := 0 to NT - 1 do
+  FVec.N := NBest;
+  FVec.L := LBest;
+  for i := 0 to NBest - 1 do
     for j := 0 to 2 do
-      FillChar(FVec.Splat[i][j][0], 16, Tri[i][j]);
+      FillChar(FVec.Splat[i][j][0], 16, Best[i][j]);
   FHasVec := True;
 end;
 
