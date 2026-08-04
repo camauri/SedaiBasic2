@@ -3338,6 +3338,46 @@ end;
   nothing of the sort, because the layout never packs two fields into the same byte. The one overlap
   that exists is a UNION, and there overwriting the neighbour IS the semantics being asked for. }
 
+{ FLOOR in the DOUBLE domain, which is what INT() means and what fbc computes.
+
+  🐛 This replaces Math.Floor, whose result type is an INTEGER: on this target that overflowed for
+  every |x| >= 2^31, so INT(1e15 + 0.5) answered -1530494976 instead of 1000000000000000 - silent
+  garbage, in a primitive that graphics and simulation code calls per pixel. It also lost the sign of
+  a negative zero, where fbc prints -0.
+  Found by NATIVISING the opcode: the AOT emits one roundsd and its answer disagreed with the
+  interpreter's, so the differential had to be settled against fbc - and the interpreter was the one
+  that was wrong. ⭐ Making a path faster made an old defect visible, which is the argument for
+  keeping two implementations that must agree.
+
+  System.Int truncates toward zero and STAYS a Double, so it is exact at any magnitude; one compare
+  turns truncation into floor, and -0.0 falls through untouched because -0.0 > -0.0 is false. }
+// FIX() is truncation TOWARD ZERO, the sibling of INT(). System.Int is exactly that and stays a
+// Double, so it is exact at any magnitude - unlike Trunc, whose result type is an Int64 and which is
+// the same shape of dependency that made INT() wrong past 2^31.
+//
+// ⚠️ THE SIGN RULE IS NOT THE SAME AS INT'S, and this is fbc's behaviour rather than a tidy one:
+//     Int(-0.0)  -> -0        Fix(-0.0)  ->  0
+//     Int(-0.5)  -> -1        Fix(-0.5)  -> -0
+// so FIX keeps the sign when it TRUNCATED something away, and not when the input was already zero.
+// Verified against fbc 1.10.1 line by line; the asymmetry is respected rather than smoothed over,
+// because the oracle is the specification here and a tidier rule would be a different language.
+function FixDouble(const X: Double): Double; inline;
+begin
+  Result := System.Int(X);
+  if (Result = 0) and (X <> 0) and (PInt64(@X)^ < 0) then Result := -Result;
+end;
+
+function FloorDouble(const X: Double): Double; inline;
+begin
+  Result := System.Int(X);
+  if Result > X then Result := Result - 1;
+  // ⚠️ NEGATIVE ZERO: fbc prints Int(-0.0) as -0, and so does roundsd, which is what the AOT emits.
+  // System.Int loses the sign here, so it is put back - otherwise WHICH ENGINE RAN would change the
+  // answer, and that is the one thing the two-implementation design is not allowed to do.
+  // Only reachable when the result is zero, so no ordinary value pays for the test.
+  if (Result = 0) and (PInt64(@X)^ < 0) then Result := -Result;
+end;
+
 function RecFieldInt(R: PRecordStorage; Enc: Int64): Int64; inline;
 var
   p: PByte;
@@ -6400,7 +6440,7 @@ begin
       else raise Exception.Create('Modulo by zero');
     bcModFloat:
       if Ctx.FloatRegs[Instr.Src2] <> 0.0 then
-        Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Src1] - Floor(Ctx.FloatRegs[Instr.Src1] / Ctx.FloatRegs[Instr.Src2]) * Ctx.FloatRegs[Instr.Src2]
+        Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Src1] - FloorDouble(Ctx.FloatRegs[Instr.Src1] / Ctx.FloatRegs[Instr.Src2]) * Ctx.FloatRegs[Instr.Src2]
       else raise Exception.Create('Float modulo by zero');
     bcNegInt: Ctx.IntRegs[Instr.Dest] := -Ctx.IntRegs[Instr.Src1];
     bcAddFloat:
@@ -10295,7 +10335,7 @@ begin
       else
         Ctx.FloatRegs[Instr.Dest] := 0;
     9: // bcMathInt
-      Ctx.FloatRegs[Instr.Dest] := Floor(Ctx.FloatRegs[Instr.Src1]);
+      Ctx.FloatRegs[Instr.Dest] := FloorDouble(Ctx.FloatRegs[Instr.Src1]);
     10: // bcMathRnd
       Ctx.FloatRegs[Instr.Dest] := Random;
     11: // bcMathLog10
@@ -10344,7 +10384,7 @@ begin
     17: // bcMathAtan2 - ATAN2(y, x) - Src1 = y, Src2 = x
       Ctx.FloatRegs[Instr.Dest] := ArcTan2(Ctx.FloatRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2]);
     18: // bcMathFix - FIX(x) - truncate toward zero
-      Ctx.FloatRegs[Instr.Dest] := Trunc(Ctx.FloatRegs[Instr.Src1]);
+      Ctx.FloatRegs[Instr.Dest] := FixDouble(Ctx.FloatRegs[Instr.Src1]);
     19: // bcMathFrac - FRAC(x) - fractional part (keeps sign)
       Ctx.FloatRegs[Instr.Dest] := Frac(Ctx.FloatRegs[Instr.Src1]);
     30: // bcMathSinh - SINH(x) - hyperbolic sine

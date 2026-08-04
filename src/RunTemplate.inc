@@ -701,7 +701,7 @@ begin
         bcModFloat: begin
           if FloatRegs[Instr.Src2] = 0.0 then
             raise EZeroDivide.Create('Float modulo by zero');
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] - Floor(FloatRegs[Instr.Src1] / FloatRegs[Instr.Src2]) * FloatRegs[Instr.Src2];
+          FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] - FloorDouble(FloatRegs[Instr.Src1] / FloatRegs[Instr.Src2]) * FloatRegs[Instr.Src2];
           Inc(CurPC);
         end;
         bcPowFloat: begin FloatRegs[Instr.Dest] := Power(FloatRegs[Instr.Src1], FloatRegs[Instr.Src2]); Inc(CurPC); end;
@@ -762,7 +762,7 @@ begin
           else FloatRegs[Instr.Dest] := 0;
           Inc(CurPC);
         end;
-        bcMathInt: begin FloatRegs[Instr.Dest] := Floor(FloatRegs[Instr.Src1]); Inc(CurPC); end;
+        bcMathInt: begin FloatRegs[Instr.Dest] := FloorDouble(FloatRegs[Instr.Src1]); Inc(CurPC); end;
         bcMathSqr: begin FloatRegs[Instr.Dest] := SqrtFloat(FloatRegs[Instr.Src1]); Inc(CurPC); end;
         bcMathSin: begin FloatRegs[Instr.Dest] := Sin(FloatRegs[Instr.Src1]); Inc(CurPC); end;
         bcMathCos: begin FloatRegs[Instr.Dest] := Cos(FloatRegs[Instr.Src1]); Inc(CurPC); end;

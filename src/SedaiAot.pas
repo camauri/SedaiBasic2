@@ -386,6 +386,7 @@ var
   // read THIS, and cannot disagree about which instructions are native.
   GArrStrNative: Boolean = False;
   GDivConstState: Integer = -1;    // C7 division by a constant: -1 unread, 0 off, 1 on
+  GMathIntState: Integer = -1;     // INT()/FLOOR as roundsd: -1 unread, 0 off, 1 on
   // Diagnostics: how many div/mod sites took the magic path and how many stayed on idiv, and why.
   GDivConstHit: Integer = 0;
   GDivConstMiss: Integer = 0;
@@ -397,6 +398,31 @@ begin
   GRecIntOff := RecIntOff;
   GRecFloatOff := RecFloatOff;
   GSharedRecOff := SharedRecOff;
+end;
+
+// INT()/FLOOR natively, which is ONE instruction - roundsd with rounding mode 1 - on any CPU that
+// has SSE4.1.
+//
+// ⚡ Why it is worth a gate of its own: of the math opcodes only ssaMathSqr was ever native, so
+// every INT() went through EmitHelperCall - flush the registers, re-enter the interpreter, reload.
+// Measured on job/tests/bench/advect_decompose.bas, which builds a fluid advection loop one
+// ingredient at a time: the two INT() calls were 383 ns of a 500 ns cell, and the traversal, the
+// backward trace, the clamps, the bilinear weights AND the four gathers together were the other 120.
+// A primitive nobody had priced, on the critical path of every float-to-integer conversion there is.
+//
+// ⚠️ The feature test is AVXSupport and not an SSE4.1 test, because the RTL's Cpu unit does not
+// expose one. AVX implies SSE4.1 on every CPU that has it, so this is CONSERVATIVE in the safe
+// direction: a machine with SSE4.1 but no AVX keeps the helper and loses nothing it had.
+// AOT_MATHINT=0 forces the helper back, which is the A/B on one binary.
+function AotMathIntNative: Boolean;
+begin
+  if GMathIntState < 0 then
+  begin
+    if GetEnvironmentVariable('AOT_MATHINT') = '0' then GMathIntState := 0
+    else if AVXSupport then GMathIntState := 1
+    else GMathIntState := 0;
+  end;
+  Result := GMathIntState = 1;
 end;
 
 // Native record field access, gated so the two arrangements are A/B-able on ONE binary:
@@ -760,7 +786,7 @@ begin
     ssaIntToString, ssaStrVal, ssaStrValInt,
     ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,
     ssaShl, ssaShr, ssaShrUInt,
-    ssaMathSqr,
+    ssaMathSqr, ssaMathInt,
     ssaLabel, ssaNop, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferStoreInt, ssaXferStoreFloat,
     ssaReturnSub, ssaEnd, ssaStop,
@@ -943,6 +969,8 @@ begin
       Result := AotRecAllocNative and (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = srtInt);
     ssaRecordFree:
       Result := AotRecAllocNative and (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt);
+    ssaMathInt:
+      Result := AotMathIntNative;
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
     ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
     ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrConcatCharAt, ssaStrAppendMapped, ssaStrChr, ssaStrInstr,
@@ -5483,6 +5511,16 @@ var
           FOp([$F2, $0F, $51], Hd, s1v)                // sqrtsd Hd, <src1>  (2-operand, in place)
         else
         begin FLoad(XMM0, s1v); E.EmitBytes([$F2, $0F, $51, $C0]); FStore(d, XMM0); end;
+      end;
+
+      // INT() is FLOOR, not truncation - Int(-1.5) is -2 - which is exactly roundsd's mode 1.
+      // Float in, float out, matching the interpreter (bcMathInt writes a FLOAT register).
+      ssaMathInt:
+      begin
+        d := FReg(Cur.Dest); s1v := FReg(Cur.Src1); if not OK then Exit;
+        FLoad(XMM0, s1v);
+        E.EmitBytes([$66, $0F, $3A, $0B, $C0, $01]);   // roundsd xmm0, xmm0, 1  (round toward -inf)
+        FStore(d, XMM0);
       end;
 
       ssaIntToFloat:
