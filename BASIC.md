@@ -299,8 +299,8 @@ about speed and not about meaning.
 | | |
 |---|---|
 | literals, `.` | `.` does not match a newline |
-| classes | `[abc]`, ranges `[a-z]`, negation `[^...]` |
-| class escapes | `\d` `\D` `\w` `\W` `\s` `\S` |
+| classes | `[abc]`, ranges `[a-z]`, negation `[^...]`, and a range with an **escaped endpoint** on either side (`[\ -~]`, `[\t-\r]`) |
+| class escapes | `\d` `\D` `\w` `\W` `\s` `\S` — these are **sets**, so they cannot bound a range (`[\d-x]` is an error in PCRE2 too) |
 | anchors | `^` `$`, and the word boundaries `\b` `\B` |
 | groups | `(...)`, non-capturing `(?:...)`, inline flags such as `(?i)` |
 | quantifiers | `*` `+` `?`, counted `{n}` `{n,}` `{n,m}`, and the lazy forms `*?` `+?` `??` |
@@ -311,15 +311,26 @@ about speed and not about meaning.
 **Not supported**: POSIX bracket classes (`[[:alpha:]]`) and lookaround (`(?=...)`, `(?!...)`,
 `(?<=...)`). Both answer 0 matches rather than raising.
 
+**Also answers 0**: a **lazy quantifier applied to something that can match the empty string** —
+`(a*)??`, `(a|)??`. The pattern is refused before the fallback library sees it, because that library
+writes outside its own loop stack on this shape and takes the whole program down with it.
+
 ⚠️ `REGEXREPLACE`'s replacement is a **literal string** even where the pattern has groups: there is
 no `$1` / `\1` back-substitution in the replacement, and every match is replaced (there is no
 "first only" form).
 
+⚠️ An **empty subject answers 0** for every pattern, where PCRE2 answers 1 for a pattern that can
+match nothing (`RegexCount("", "a*")` is 1 there). The reason is in the next section: the fallback
+library cannot match an empty subject at all, and one uniform answer is worth more than an answer
+that depends on which engine ran.
+
 ### Two engines, one meaning
 
 SedaiBasic has its own regex engine and also carries the general-purpose library it started from.
-Which one runs is chosen per pattern, automatically, and **it never changes the answer** — it is a
-speed decision, so you can ignore this section unless you are chasing performance.
+Which one runs is chosen per pattern, automatically, and the choice is **not allowed to change the
+answer** — that invariant is what the design rests on, and the two documented exceptions above (an
+empty subject, and a lazy quantifier over a nullable operand) exist precisely because they were the
+alternative to breaking it.
 
 The own engine is a DFA, which is linear in the input and cannot suffer catastrophic backtracking,
 but a DFA is naturally leftmost-**longest** (POSIX) where Perl and PCRE are leftmost-**first**. On
@@ -330,12 +341,26 @@ backreferences (not expressible by any finite automaton), lookaround, counted re
 **lazy** quantifiers, which state a *preference* between possible matches that a DFA has no way to
 hold.
 
-The consequence worth remembering: results are **PCRE-compatible in every case**, and the fast path
-is taken only where it provably cannot change the answer.
-
 > This is not theoretical tidiness. Until 2026-08-03 the fast engine *accepted* `<.+?>` and answered
 > it **greedily**: `RegexReplace("<a><b>", "<.+?>", "#")` returned `#` where every other regex
 > implementation returns `##`. Refusing the pattern is what keeps the two engines interchangeable.
+
+**How compatible, measured rather than claimed.** A differential harness
+(`job/tests/tools/regex_diff.py`) puts every answer next to PCRE2's, on 342 real patterns lifted from
+CPython's standard library and on generated ones:
+
+| | |
+|---|---|
+| patterns the fast engine takes | **46%** of real patterns |
+| its answers against PCRE2 | **identical**, 1200 real cases, 0 divergences |
+| answers on the constructs the **library** owns | **not** always PCRE2's — see below |
+
+⚠️ So an earlier edition of this page was wrong to say results are "PCRE-compatible in every case".
+That holds for the fast engine, and it is checked. It does **not** hold for everything the fallback
+answers: on lazy quantifiers and counted repetition, FPC's RegExpr and PCRE2 disagree often (roughly
+half of the generated cases that use them). Those constructs are Perl-compatible in spirit and not
+byte-compatible with PCRE2, and closing that gap means the fast engine growing to cover them — not a
+different fallback.
 
 ⚠️ A pattern that can match the **empty string** also matches just past the last byte:
 `RegexCount("aaa", "a*")` is **2**, not 1 — one match for `"aaa"` and one empty match at the end.

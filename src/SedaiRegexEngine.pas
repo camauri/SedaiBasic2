@@ -71,6 +71,24 @@ function RegexEngineCount(RX: TCompiledRegex; const S: string): Int64;
 // Every non-overlapping match replaced by Repl (literal text, no group refs).
 function RegexEngineReplace(RX: TCompiledRegex; const S, Repl: string): string;
 
+// ⛔ True when handing this pattern to FPC's RegExpr would KILL THE PROCESS.
+//
+// TRegExpr 0.987 writes outside its own loop stack on a LAZY quantifier whose operand can match the
+// empty string. "(a*)??" or "(a|)??" against any subject ends in an access violation (0xC0000005,
+// verified - not a stack overflow), because the non-greedy OP_LOOP arm decrements LoopStackIdx to
+// zero and then indexes LoopStack[0], and that array starts at 1. Nothing in our wrapper can catch
+// it: it is an out-of-bounds WRITE, so the run that does not crash has corrupted something instead.
+//
+// The compile-time guard that would have caught it is right there in the unit - "operand could be
+// empty" - and it is skipped for '?' alone (regexpr.pas: `and (op <> '?')`), which is precisely the
+// quantifier that is wrong.
+//
+// So the pattern is refused BEFORE the library sees it, and REGEXCOUNT answers 0 the way it does for
+// any pattern it cannot honour. A wrong answer is a poor outcome; a dead process is a worse one, and
+// this is the only lever we own until the pattern stops needing the library at all.
+// 🥅 job/tests/bas/bug_regex_lazy_nullable_crash.bas
+function PatternKillsLibrary(const Pattern: string): Boolean;
+
 implementation
 
 type
@@ -150,14 +168,43 @@ begin
   Result := True;
 end;
 
+// Exactly one byte in the class, and which one. `\ ` and `\-` are single bytes and may bound a
+// range; `\d` and `\w` are SETS and may not - PCRE2 rejects "[\d-x]" outright rather than guessing.
+function ClsSingleByte(const C: TByteClass; out B: Byte): Boolean;
+var
+  i, n: Integer;
+begin
+  n := 0;
+  B := 0;
+  for i := 0 to 255 do
+    if ClsHas(C, Byte(i)) then
+    begin
+      Inc(n);
+      if n > 1 then Exit(False);
+      B := Byte(i);
+    end;
+  Result := n = 1;
+end;
+
 // A bracketed class: [abc] [^abc] [a-z] with escapes inside.
+//
+// 🐛 An endpoint may be an ESCAPE on EITHER side, and until 2026-08-04 only the right side was
+// handled. An escape on the left took a `Continue` that skipped the range test entirely, so
+//
+//     [\ -~]     read as { ' ', '-', '~' }   instead of the printable range 0x20..0x7E
+//     [^\ -~]    matched almost every byte   instead of almost none
+//
+// - a SILENT wrong answer from the fast engine, which is the one class of defect the fallback design
+// cannot absorb. Found by the differential fuzzer against PCRE2 (job/tests/tools/regex_diff.py) on a
+// pattern taken from CPython's own standard library, not by reading this function.
+// 🥅 job/tests/bas/bug_regex_class_range.bas
 function ParseBracket(var Q: TParser; out C: TByteClass): Boolean;
 var
   Neg: Boolean;
   Lo, Hi: Byte;
   E: TByteClass;
   i: Integer;
-  First: Boolean;
+  First, LoIsByte: Boolean;
 begin
   Result := False;
   ClsClear(C);
@@ -167,20 +214,32 @@ begin
   while not AtEnd(Q) and ((Q.P^ <> ']') or First) do
   begin
     First := False;
+    // ---- the left-hand item: an escape (one byte, or a whole set) or a plain byte
     if Q.P^ = '\' then
     begin
       Inc(Q.P);
       if not ParseEscape(Q, E) then Exit;
-      for i := 0 to 31 do C[i] := C[i] or E[i];
-      Continue;
+      LoIsByte := ClsSingleByte(E, Lo);
+      if not LoIsByte then
+      begin
+        // A set escape contributes its members and cannot open a range. If a '-' follows and is not
+        // the closing literal, PCRE2 calls the whole class an error; refusing here hands the pattern
+        // to the library rather than inventing a meaning for it.
+        if (not AtEnd(Q)) and (Q.P^ = '-') and (Q.P < Q.Last) and ((Q.P + 1)^ <> ']') then Exit;
+        for i := 0 to 31 do C[i] := C[i] or E[i];
+        Continue;
+      end;
+    end
+    else
+    begin
+      if Q.P^ = '[' then
+        // [:alpha:] and friends. Not implemented; a literal '[' inside a class is
+        // legal too, so this is only refused when it opens a posix class.
+        if (Q.P < Q.Last) and ((Q.P + 1)^ = ':') then Exit;
+      Lo := Byte(Q.P^);
+      Inc(Q.P);
     end;
-    if Q.P^ = '[' then
-      // [:alpha:] and friends. Not implemented; a literal '[' inside a class is
-      // legal too, so this is only refused when it opens a posix class.
-      if (Q.P < Q.Last) and ((Q.P + 1)^ = ':') then Exit;
-    Lo := Byte(Q.P^);
-    Inc(Q.P);
-    // A range, unless the '-' is the last character before ']' (then literal).
+    // ---- a range, unless the '-' is the last character before ']' (then literal)
     if (not AtEnd(Q)) and (Q.P^ = '-') and (Q.P < Q.Last) and ((Q.P + 1)^ <> ']') then
     begin
       Inc(Q.P);
@@ -189,12 +248,8 @@ begin
       begin
         Inc(Q.P);
         if not ParseEscape(Q, E) then Exit;
-        // A range whose end is an escape class makes no sense; only single-byte
-        // escapes can close a range, so find the one bit if there is exactly one.
-        Hi := 0;
-        if not ClsHas(E, Hi) then
-          for i := 0 to 255 do
-            if ClsHas(E, Byte(i)) then begin Hi := Byte(i); Break; end;
+        // Same rule at this end: only a single-byte escape can close a range.
+        if not ClsSingleByte(E, Hi) then Exit;
       end
       else
       begin
@@ -490,6 +545,160 @@ begin
   Result := AltLen(Pattern, Idx, L) and (Idx > Length(Pattern));
 end;
 
+{ ------------- the crash guard on the FALLBACK library (see the interface) ----
+  A syntactic scan that answers one question: does the pattern apply a LAZY
+  quantifier to something that can match the empty string? That is the shape
+  TRegExpr indexes its loop stack out of bounds on.
+
+  Three properties are deliberate:
+   - TOTAL. It never fails and never raises; every branch advances or ends. It
+     runs on patterns this engine cannot itself parse, so "give up" is not an
+     option available to it.
+   - CONSERVATIVE in the safe direction. Where it cannot tell, it says nullable,
+     because a false alarm costs one pattern its answer and a miss costs the
+     process.
+   - NARROW. A pattern without a '?' anywhere never enters the scan, so the
+     ordinary case pays one Pos().
+  --------------------------------------------------------------------------- }
+type
+  TNulScan = record
+    S: string;
+    I: Integer;          // 1-based, like the string
+    Danger: Boolean;
+  end;
+
+function ScanAlt(var Z: TNulScan; Depth: Integer): Boolean; forward;
+
+// Returns: can this atom match the empty string?
+function ScanAtom(var Z: TNulScan; Depth: Integer): Boolean;
+begin
+  Result := False;
+  if Z.I > Length(Z.S) then Exit(True);          // nothing left: the empty string
+  case Z.S[Z.I] of
+    '(':
+      begin
+        Inc(Z.I);
+        if (Z.I <= Length(Z.S)) and (Z.S[Z.I] = '?') then
+        begin
+          // (?: (?i) (?P<n> (?= ... - step over whatever header this is. Getting the KIND of group
+          // wrong does not matter here; only what is inside it does.
+          Inc(Z.I);
+          while (Z.I <= Length(Z.S)) and (Z.S[Z.I] <> ':') and (Z.S[Z.I] <> ')')
+                and (Z.S[Z.I] <> '>') do Inc(Z.I);
+          if (Z.I <= Length(Z.S)) and (Z.S[Z.I] <> ')') then Inc(Z.I);
+        end;
+        if Depth > 32 then                        // absurd nesting: stop, and assume the worst
+        begin
+          Z.Danger := True;
+          Exit(True);
+        end;
+        Result := ScanAlt(Z, Depth + 1);
+        if (Z.I <= Length(Z.S)) and (Z.S[Z.I] = ')') then Inc(Z.I);
+      end;
+    '[':
+      begin
+        Inc(Z.I);
+        if (Z.I <= Length(Z.S)) and (Z.S[Z.I] = '^') then Inc(Z.I);
+        if (Z.I <= Length(Z.S)) and (Z.S[Z.I] = ']') then Inc(Z.I);   // ']' first is a literal
+        while (Z.I <= Length(Z.S)) and (Z.S[Z.I] <> ']') do
+        begin
+          if Z.S[Z.I] = '\' then Inc(Z.I);
+          Inc(Z.I);
+        end;
+        if Z.I <= Length(Z.S) then Inc(Z.I);
+      end;
+    '\':
+      begin
+        Inc(Z.I);
+        if Z.I <= Length(Z.S) then
+        begin
+          // the word and text boundaries are ZERO WIDTH, so they match empty
+          case Z.S[Z.I] of
+            'b', 'B', 'A', 'Z', 'z', 'G': Result := True;
+          end;
+          Inc(Z.I);
+        end;
+      end;
+    '^', '$':
+      begin
+        Inc(Z.I);
+        Result := True;                           // an anchor consumes nothing
+      end;
+  else
+    Inc(Z.I);
+  end;
+end;
+
+// One atom and its quantifiers. Sets Danger when a LAZY one is applied to something nullable.
+function ScanPiece(var Z: TNulScan; Depth: Integer): Boolean;
+var
+  Nul, MinZero, Lazy: Boolean;
+  j: Integer;
+begin
+  Nul := ScanAtom(Z, Depth);
+  while (Z.I <= Length(Z.S)) and (Z.S[Z.I] in ['*', '+', '?', '{']) do
+  begin
+    MinZero := False;
+    if Z.S[Z.I] = '{' then
+    begin
+      // A '{' not followed by a digit is a literal brace, not a quantifier.
+      j := Z.I + 1;
+      if (j > Length(Z.S)) or not (Z.S[j] in ['0'..'9']) then Break;
+      MinZero := Z.S[j] = '0';
+      while (j <= Length(Z.S)) and (Z.S[j] <> '}') do Inc(j);
+      Z.I := j;
+      if Z.I <= Length(Z.S) then Inc(Z.I);
+    end
+    else
+    begin
+      MinZero := Z.S[Z.I] <> '+';
+      Inc(Z.I);
+    end;
+    Lazy := (Z.I <= Length(Z.S)) and (Z.S[Z.I] = '?');
+    if Lazy then Inc(Z.I);
+    if Lazy and Nul then Z.Danger := True;
+    if MinZero then Nul := True;
+  end;
+  Result := Nul;
+end;
+
+function ScanConcat(var Z: TNulScan; Depth: Integer): Boolean;
+var
+  AllNul: Boolean;
+  Was: Integer;
+begin
+  AllNul := True;                                 // an empty branch matches the empty string
+  while (Z.I <= Length(Z.S)) and (Z.S[Z.I] <> '|') and (Z.S[Z.I] <> ')') do
+  begin
+    Was := Z.I;
+    if not ScanPiece(Z, Depth) then AllNul := False;
+    if Z.I <= Was then Inc(Z.I);                  // never stand still, whatever the input
+  end;
+  Result := AllNul;
+end;
+
+function ScanAlt(var Z: TNulScan; Depth: Integer): Boolean;
+begin
+  Result := ScanConcat(Z, Depth);
+  while (Z.I <= Length(Z.S)) and (Z.S[Z.I] = '|') do
+  begin
+    Inc(Z.I);
+    if ScanConcat(Z, Depth) then Result := True;  // one nullable branch is enough
+  end;
+end;
+
+function PatternKillsLibrary(const Pattern: string): Boolean;
+var
+  Z: TNulScan;
+begin
+  if Pos('?', Pattern) = 0 then Exit(False);      // no lazy form can exist without one
+  Z.S := Pattern;
+  Z.I := 1;
+  Z.Danger := False;
+  ScanAlt(Z, 0);
+  Result := Z.Danger;
+end;
+
 { ---------------- public ---------------- }
 
 destructor TCompiledRegex.Destroy;
@@ -731,6 +940,9 @@ var
 begin
   Result := 0;
   Len := Length(S);
+  // An empty subject answers 0 here to match the caller's rule - see RegexCountMatches in
+  // SedaiBytecodeVM: the fallback library cannot match an empty subject at all, so answering the
+  // PCRE2 way on this path alone would make the engine choice observable.
   if Len = 0 then Exit;
   D := PByte(PChar(S));
   Dfa := RX.FDfa;
@@ -778,7 +990,7 @@ var
 begin
   Result := S;
   Len := Length(S);
-  if Len = 0 then Exit;
+  if Len = 0 then Exit;              // see RegexEngineCount: uniform with the fallback library
   D := PByte(PChar(S));
   Dfa := RX.FDfa;
   Dfa.EnsureFilters(Len);            // see RegexEngineCount

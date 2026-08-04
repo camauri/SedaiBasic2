@@ -9001,6 +9001,13 @@ var
   RXOwned: Boolean;
 begin
   Result := 0;
+  // ⚠️ An empty SUBJECT answers 0, and that is a decision rather than an oversight. PCRE2 answers 1
+  // for "a*" against "" (the empty match at position zero), and our own engine can do the same - but
+  // FPC's RegExpr returns no match for ANY pattern on an empty subject, and it is the engine that
+  // answers every pattern the fast one declines. Letting the fast path be right here would make the
+  // ENGINE CHOICE VISIBLE, and "the choice never changes the answer" is the property this whole
+  // design rests on. One uniform answer beats one correct answer and one wrong one.
+  // 🥅 Recorded, with the divergence, in job/tests/bas/bug_regex_empty_subject.bas and BASIC.md.
   if (Pattern = '') or (S = '') then Exit;
   if RegexUseOwnEngine then
   begin
@@ -9031,6 +9038,8 @@ begin
     // nil = a construct outside the regular subset, or a per-call compile the subject was too short
     // to justify; fall through to the library.
   end;
+  // ⛔ Except where the library would take the process with it: see PatternKillsLibrary.
+  if PatternKillsLibrary(Pattern) then Exit;
   R := TRegExpr.Create;
   try
     try
@@ -9099,6 +9108,9 @@ begin
       end;
     end;
   end;
+  // ⛔ Same guard as RegexCountMatches: the library dies on a lazy quantifier over a nullable
+  // operand, so the subject comes back unchanged rather than not at all.
+  if PatternKillsLibrary(Pattern) then Exit;
   R := TRegExpr.Create;
   try
     try
