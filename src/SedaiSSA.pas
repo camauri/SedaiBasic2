@@ -3944,6 +3944,26 @@ begin
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
           EmitInstruction(ssaStrValInt, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          // ⭐ FOUR SPELLINGS, FOUR TYPES - and they used to collapse into one signed 64-bit value.
+          // FreeBASIC declares them Long / ULong / LongInt / ULongInt, so the two 32-bit forms have to
+          // be NARROWED at the call, not merely printed differently:
+          //     ValUInt("&HFFFFFFFFFFFFFFFF")   fbc 4294967295, we answered -1
+          //     Dim As ULongInt v = ValUInt(..)  fbc 4294967295, we answered 18446744073709551615
+          // The second is the one that shows narrowing is the real defect rather than print form: by
+          // the time the value reaches a correctly-typed variable the width is already lost.
+          // ⚠️ Measured, not assumed: of FIFTEEN ways to produce a value with no name - user functions
+          // with unsigned return types, expression temporaries, Cxxx conversions, comparisons, array
+          // elements - only these THREE diverged from fbc. The existing machinery already carries the
+          // type everywhere else; it was never put here. See job/docs/PIANO_TIPI.md step B.
+          if FuncName = 'VALINT' then ConvW := 5         // Long   : 32-bit signed
+          else if FuncName = 'VALUINT' then ConvW := 6   // ULong  : 32-bit unsigned
+          else ConvW := 0;                               // ValLng / ValULng: the full 64 bits
+          if ConvW <> 0 then
+          begin
+            NarrowReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaNarrowInt, NarrowReg, Result, MakeSSAValue(svkNone), MakeSSAConstInt(ConvW));
+            Result := NarrowReg;
+          end;
         end
         else if (FuncName = 'LBOUND') or (FuncName = 'UBOUND') then
         begin
@@ -27099,6 +27119,20 @@ begin
   // either -- FB drops it only for values whose TYPE is unsigned, which is exactly what changes here.
   if FModernMode then
     FVarPrintKind.AddObject('ASC', TObject(PtrInt(2)));
+  // The same treatment, and for the same reason, for the two UNSIGNED Val spellings. FreeBASIC types
+  // them ULong and ULongInt; we returned one signed 64-bit value for all four, so
+  // VALULNG("&HFFFFFFFFFFFFFFFF") printed -1 and VALUINT("&HFF") printed with a sign space fbc does
+  // not print. VALUINT is ULong, hence kind 3 - unsigned in PRINTED FORM only, because a narrow
+  // unsigned promotes to a SIGNED expression in FreeBASIC and must not reach the unsigned-64
+  // compare/divide/mod opcodes. VALULNG is genuinely unsigned-64, hence kind 2.
+  // ⛔ SEEDING THIS IN THE CONSTRUCTOR DOES NOT WORK, and cost a build to find out: the table is
+  // CLEARED a few lines above, right before RegisterRecordVars. Anything a builtin needs here has to
+  // be registered AFTER that clear - which is exactly why ASC sits where it does.
+  if FModernMode then
+  begin
+    FVarPrintKind.AddObject('VALUINT', TObject(PtrInt(3)));
+    FVarPrintKind.AddObject(kVALULNG, TObject(PtrInt(2)));
+  end;
   RegisterRecordVars(AST);
 
   // M6: collect DIM SHARED scalars and assign them dedicated transfer slots (runs after type
