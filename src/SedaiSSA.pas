@@ -83,6 +83,12 @@ type
                             // "Double Ptr" field, else ''): a raw byte-heap pointer, so "obj.field[i]" /
                             // "*obj.field" / "@obj.field[i]" index and deref onto the raw heap, SizeOf-scaled
     WidthCode: Integer;     // B1.5: narrow width code for a sub-64-bit/SINGLE field (0 = full width)
+    ByteOffset: Integer;    // A3: the field's offset in the record's LIVE byte image (UDTLiveLayout).
+                            // Computed for EVERY field of EVERY type, including the ones UDTCLayout
+                            // declines - see UDTLiveLayout for the rule and for why a fixed-length
+                            // string reserves its bytes here even while its characters still live in
+                            // the side vector.
+    ByteSize: Integer;      // how many bytes the field occupies at that offset
     StrCapacity: Integer;   // declared capacity of a fixed-length string field ("As String * 20" -> 20;
                             // 0 = variable-length). Storage stays variable-length (advisory), but the
                             // C BYTE LAYOUT of the type needs it: fbc gives such a field n+1 bytes.
@@ -111,7 +117,12 @@ type
   TUDTType = record
     Name: string;
     Fields: array of TUDTField;
-    NInt, NFloat, NStr: Integer;   // per-bank slot counts (for bcRecordNew)
+    // A3-i: a record is ONE byte image plus a string vector, so allocation needs two numbers where
+    // it needed three. NInt/NFloat are gone on purpose rather than left as aliases - they named a
+    // storage shape that no longer exists, and the compiler listing every use of them was the
+    // checklist this change was made against.
+    NStr: Integer;                 // string slots (fixed and variable strings still live outside)
+    LiveBytes: Integer;            // total size of the record's live byte image (ComputeUDTLiveLayout)
     Parent: string;                // M4.2: base type name (EXTENDS), or '' — single inheritance
     Node: TASTNode;                // the antTypeDecl (to fill fields on demand, parent-first)
     Filled: Boolean;               // M4.2: fields resolved (cycle-safe fill guard)
@@ -558,6 +569,7 @@ type
     function BinaryElemBytesOfWidthCode(W: Integer): Integer;           // width code (1..7) -> byte width
     procedure UDTFieldCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);   // one field's C size/alignment
     function UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;  // fbc's C layout of a UDT
+    procedure ComputeUDTLiveLayout(UDTIdx: Integer);   // A3: the LIVE byte image of a UDT, for every type
     function EmitBinFileBlock(IsGet: Boolean; const HandleReg: TSSAValue;
                               ValueNode, CountNode: TASTNode): Boolean;  // GET/PUT #n of a whole array / raw memory block
     function BuiltinFuncPtrOpId(const NameU: string): Integer;          // @Sin/@Cos/... math-builtin funcptr op id (0 if not a builtin)
@@ -7118,8 +7130,8 @@ begin
     end;
     ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaRecordNewBlock, ExprValue, EnsureIntRegister(CountReg),
-                    MakeSSAConstInt((Int64(FUDTs[UDTIdx].NInt) and $FFFF)
-                                    or ((Int64(FUDTs[UDTIdx].NFloat) and $FFFF) shl 16)
+                    MakeSSAConstInt((Int64(FUDTs[UDTIdx].LiveBytes) and $FFFF)
+                                    
                                     or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
                                     or ((Int64(UDTIdx) and $FFFF) shl 48)),
                     MakeSSAValue(svkNone));
@@ -8270,8 +8282,8 @@ begin
           // field instances are still per-thread; flat UDTs are fully cross-thread.)
           RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaRecordNew, RecHandleVal,
-                          MakeSSAConstInt(FUDTs[RecUDTIdx].NInt),
-                          MakeSSAConstInt(FUDTs[RecUDTIdx].NFloat),
+                          MakeSSAConstInt(FUDTs[RecUDTIdx].LiveBytes),
+                          MakeSSAConstInt(0),
                           MakeSSAConstInt(FUDTs[RecUDTIdx].NStr or (Int64(RecUDTIdx) shl 32) or (Int64(1) shl 48)));
           EmitRecordInit(RecHandleVal, RecUDTIdx);
           // An initializer that is NOT a constructor argument list is either an implicit conversion
@@ -8349,8 +8361,8 @@ begin
         // DIM'd with a different type in another scope (the global type table is first-declaration-wins).
         RecHandleVal := DeclareVariableTyped(UpperCase(ArrName), srtInt);
         EmitInstruction(ssaRecordNew, RecHandleVal,
-                        MakeSSAConstInt(FUDTs[RecUDTIdx].NInt),
-                        MakeSSAConstInt(FUDTs[RecUDTIdx].NFloat),
+                        MakeSSAConstInt(FUDTs[RecUDTIdx].LiveBytes),
+                        MakeSSAConstInt(0),
                         MakeSSAConstInt(FUDTs[RecUDTIdx].NStr or (Int64(RecUDTIdx) shl 32)));  // Imm: strCount | typeId<<32
         EmitRecordInit(RecHandleVal, RecUDTIdx);  // allocate any nested-UDT field instances
         // "DIM v AS T = <expr>" where expr is not itself a T (a scalar, or a different type) and T has a
@@ -8787,8 +8799,8 @@ begin
     // one record instance per element and store the handles (bcRecordNewArray).
     if RecArrUDTIdx >= 0 then
     begin
-      RecPacked := (Int64(FUDTs[RecArrUDTIdx].NInt) and $FFFF)
-                or ((Int64(FUDTs[RecArrUDTIdx].NFloat) and $FFFF) shl 16)
+      RecPacked := (Int64(FUDTs[RecArrUDTIdx].LiveBytes) and $FFFF)
+                
                 or ((Int64(FUDTs[RecArrUDTIdx].NStr) and $FFFF) shl 32)
                 or ((Int64(RecArrUDTIdx) and $FFFF) shl 48);   // typeId for stamping each element
       EmitInstruction(ssaRecordNewArray, MakeSSAValue(svkNone),
@@ -9075,8 +9087,8 @@ begin
       UdtIdx := FindUDT(ElemUdtName);
       if UdtIdx >= 0 then
       begin
-        RecPacked := (Int64(FUDTs[UdtIdx].NInt) and $FFFF)
-                  or ((Int64(FUDTs[UdtIdx].NFloat) and $FFFF) shl 16)
+        RecPacked := (Int64(FUDTs[UdtIdx].LiveBytes) and $FFFF)
+                  
                   or ((Int64(FUDTs[UdtIdx].NStr) and $FFFF) shl 32)
                   or ((Int64(UdtIdx) and $FFFF) shl 48);
         EmitInstruction(ssaRecordNewArray, MakeSSAValue(svkNone),
@@ -9160,8 +9172,8 @@ begin
     begin
       TmpRec := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaRecordNew, TmpRec,
-                      MakeSSAConstInt(FUDTs[SwapUDTIdx].NInt),
-                      MakeSSAConstInt(FUDTs[SwapUDTIdx].NFloat),
+                      MakeSSAConstInt(FUDTs[SwapUDTIdx].LiveBytes),
+                      MakeSSAConstInt(0),
                       MakeSSAConstInt(FUDTs[SwapUDTIdx].NStr or (Int64(SwapUDTIdx) shl 32)));
       EmitRecordInit(TmpRec, SwapUDTIdx);
       EmitRecordCopy(TmpRec, ValA, SwapUDTIdx);   // tmp = A
@@ -19200,7 +19212,7 @@ begin
   SetLength(FUDTs, n + 1);
   FUDTs[n].Name := 'OBJECT';
   SetLength(FUDTs[n].Fields, 0);
-  FUDTs[n].NInt := 0; FUDTs[n].NFloat := 0; FUDTs[n].NStr := 0;
+  FUDTs[n].LiveBytes := 0; FUDTs[n].NStr := 0;
   FUDTs[n].Parent := '';
   FUDTs[n].Node := nil;
   FUDTs[n].Filled := True;     // empty: nothing to fill
@@ -19237,7 +19249,7 @@ begin
       SetLength(FUDTs, n + 1);
       FUDTs[n].Name := Name;
       SetLength(FUDTs[n].Fields, 0);
-      FUDTs[n].NInt := 0; FUDTs[n].NFloat := 0; FUDTs[n].NStr := 0;
+      FUDTs[n].LiveBytes := 0; FUDTs[n].NStr := 0;
       FUDTs[n].Parent := UpperCase(Node.Attributes.Values['EXTENDS']);  // '' if none (M4.2)
       FUDTs[n].Node := Node;
       FUDTs[n].Filled := False;
@@ -19309,7 +19321,7 @@ begin
         SetLength(FUDTs[Idx].Fields, n + 1);
         FUDTs[Idx].Fields[n] := FUDTs[PIdx].Fields[j];
       end;
-      cInt := FUDTs[PIdx].NInt; cFloat := FUDTs[PIdx].NFloat; cStr := FUDTs[PIdx].NStr;
+      cInt := 0; cFloat := 0; cStr := FUDTs[PIdx].NStr;
     end;
   end;
 
@@ -19430,35 +19442,158 @@ begin
         FUDTs[Idx].Fields[n].WidthCode := TypeNameWidthCode(TypeName)  // B1.5: narrow field on store
       else
         FUDTs[Idx].Fields[n].WidthCode := 0;
-      if FUDTs[Idx].IsUnion then
-        // UNION: every member of a bank overlaps at slot 0 of that bank (faithful same-bank
-        // aliasing — write one member, read another of the same type back). The per-bank count
-        // is at most 1 slot. Cross-bank reinterpretation (int<->float bytes) is not modelled.
-        case Bank of
-          srtFloat:  begin FUDTs[Idx].Fields[n].Slot := 0; if cFloat < 1 then cFloat := 1; end;
-          srtString: begin FUDTs[Idx].Fields[n].Slot := 0; if cStr   < 1 then cStr   := 1; end;
-        else
-          begin FUDTs[Idx].Fields[n].Slot := 0; if cInt < 1 then cInt := 1; end;
+      // A3-i: only the STRING bank still hands out slots, because only strings still live in a
+      // slot array. A numeric field's Slot is stamped by ComputeUDTLiveLayout below, from the byte
+      // layout - which is also what finally makes a UNION overlap ACROSS banks: "b As UByte" and
+      // "d As Double" now share bytes because there is only one array of bytes to share.
+      if Bank = srtString then
+      begin
+        if FUDTs[Idx].IsUnion then
+        begin
+          FUDTs[Idx].Fields[n].Slot := 0;
+          if cStr < 1 then cStr := 1;
         end
-      else
-        case Bank of
-          srtFloat:  begin FUDTs[Idx].Fields[n].Slot := cFloat; Inc(cFloat); end;
-          srtString: begin FUDTs[Idx].Fields[n].Slot := cStr;   Inc(cStr);   end;
         else
-          begin FUDTs[Idx].Fields[n].Slot := cInt; Inc(cInt); end;
+        begin
+          FUDTs[Idx].Fields[n].Slot := cStr;
+          Inc(cStr);
         end;
+      end;
     end;
-  FUDTs[Idx].NInt := cInt; FUDTs[Idx].NFloat := cFloat; FUDTs[Idx].NStr := cStr;
+  FUDTs[Idx].NStr := cStr;
+  ComputeUDTLiveLayout(Idx);
+end;
+
+procedure TSSAGenerator.ComputeUDTLiveLayout(UDTIdx: Integer);
+{ A3 - the LIVE byte image of a record, and the one property that makes it worth having:
+  IT IS fbc's C LAYOUT, for EVERY type.
+
+  UDTCLayout already lays a type out exactly as fbc does, and PUT/GET/SIZEOF/OFFSETOF have been
+  reading it since A1. But it DECLINES a type with a variable-length string, an array member or a
+  nested record, because those hold a pointer in C rather than data and no faithful FILE image
+  exists for them. Live memory has no such problem: a pointer is a perfectly good thing to keep in
+  a buffer. So this runs the same rule with no early exit, and where UDTCLayout answers at all the
+  two agree by construction - which is asserted rather than assumed (UDT_DIAG=1).
+
+  ⭐ THE DECISION THAT MAKES A3-ii CHEAP LATER, and it is the whole reason to write it this way:
+  a fixed-length string field RESERVES ITS BYTES HERE, n+1 of them at fbc's offset, even though
+  under A3-i its characters still live in the side string vector. Promoting to A3-ii is then
+  "start writing the characters into bytes that were already there" - a change to the field's
+  ACCESSORS. Had the layout skipped those bytes instead, every later offset would move on
+  promotion, and that is not a local change, it is the same work twice.
+
+  A UNION overlaps every member at offset 0 and takes the size and alignment of its widest, which
+  is C's rule and what finally makes cross-bank type-punning expressible - "b As UByte" and
+  "d As Double" have never been able to alias, because they live in different slot arrays.
+
+  ⚠️ ONE PLACE THIS IS NOT fbc's IMAGE, stated so nobody discovers it as a surprise: a FIXED-SIZE
+  ARRAY member is 8 bytes here (the handle it already is) where fbc lays the elements out inline.
+  Those are exactly the types UDTCLayout declines, so nothing that exists today regresses - but a
+  record with an array member still cannot be PUT to a file byte-faithfully, and closing that is
+  its own piece of work. }
+var
+  i, n: Integer;
+  Sz, Al, MaxAl, Ofs: Int64;
+begin
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  n := Length(FUDTs[UDTIdx].Fields);
+  FUDTs[UDTIdx].LiveBytes := 0;
+  if n = 0 then Exit;
+  MaxAl := 1; Ofs := 0;
+  for i := 0 to n - 1 do
+  begin
+    UDTFieldCShape(UDTIdx, i, Sz, Al);
+    if (FUDTs[UDTIdx].FieldAlign > 0) and (Al > FUDTs[UDTIdx].FieldAlign) then
+      Al := FUDTs[UDTIdx].FieldAlign;
+    if Al < 1 then Al := 1;
+    if Sz < 1 then Sz := 8;              // a shape with no width of its own is a handle
+    if Al > MaxAl then MaxAl := Al;
+    if FUDTs[UDTIdx].IsUnion then
+    begin
+      // every member starts at zero; the type is as big as its widest member
+      FUDTs[UDTIdx].Fields[i].ByteOffset := 0;
+      if Sz > Ofs then Ofs := Sz;
+    end
+    else
+    begin
+      if (Ofs mod Al) <> 0 then Ofs := Ofs + (Al - (Ofs mod Al));
+      FUDTs[UDTIdx].Fields[i].ByteOffset := Ofs;
+      Ofs := Ofs + Sz;
+    end;
+    FUDTs[UDTIdx].Fields[i].ByteSize := Sz;
+    // ⭐ THE ENCODING TRAVELS IN Slot, and that is what kept this change to one place instead of
+    // fifty-six. Every site that emits a record field op already passes Field.Slot straight through
+    // to the instruction's Immediate; giving Slot the (offset, width) pair means none of them had to
+    // be found and edited, and none of them can be forgotten. The interpreter, the AOT and the
+    // disassembler decode the same two numbers at the other end.
+    //   bits 4..31 : byte offset (records up to 256 MB)
+    //   bits 0..3  : the B1.5 width code - 0 full, 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 7=single
+    // A STRING field keeps its plain slot index: its characters are still in the side vector.
+    if FUDTs[UDTIdx].Fields[i].Bank <> srtString then
+      FUDTs[UDTIdx].Fields[i].Slot :=
+        (FUDTs[UDTIdx].Fields[i].ByteOffset shl 4) or (FUDTs[UDTIdx].Fields[i].WidthCode and $F);
+  end;
+  if (Ofs mod MaxAl) <> 0 then Ofs := Ofs + (MaxAl - (Ofs mod MaxAl));
+  FUDTs[UDTIdx].LiveBytes := Ofs;
 end;
 
 procedure TSSAGenerator.FillUDTFields(Node: TASTNode);
 // Resolve all registered types' fields (parent-first via FillOneUDT). Node is unused now that
 // each type carries its decl node, but kept for the call shape.
+//
+// UDT_DIAG=1 then dumps every type's LIVE byte layout and CHECKS it against UDTCLayout wherever the
+// latter answers. That check is the point: the live image is supposed to be fbc's image, and an
+// invariant nobody evaluates is a comment. It is also how A1's defect would have been caught for
+// free - "no field may start beyond the end of its own type" flagged three records out of four with
+// no oracle at all, and nobody had written it down.
 var
-  i: Integer;
+  i, j: Integer;
+  Offs: TInt64Array;
+  Total: Int64;
+  Bad: Integer;
 begin
   for i := 0 to High(FUDTs) do
     FillOneUDT(i);
+  if GetEnvironmentVariable('UDT_DIAG') <> '1' then Exit;
+  Bad := 0;
+  for i := 0 to High(FUDTs) do
+  begin
+    WriteLn(ErrOutput, 'udt ', FUDTs[i].Name, ' live=', FUDTs[i].LiveBytes,
+            ' strslots=', FUDTs[i].NStr,
+            IfThen(FUDTs[i].IsUnion, ' UNION', ''));
+    for j := 0 to High(FUDTs[i].Fields) do
+      WriteLn(ErrOutput, '    +', FUDTs[i].Fields[j].ByteOffset:4,
+              ' size=', FUDTs[i].Fields[j].ByteSize:3,
+              ' bank=', Ord(FUDTs[i].Fields[j].Bank),
+              ' slot=', FUDTs[i].Fields[j].Slot:3, '  ', FUDTs[i].Fields[j].Name);
+    // The invariant, checked and not assumed: where a C image exists, it IS the live image.
+    if UDTCLayout(i, Offs, Total) then
+    begin
+      if Total <> FUDTs[i].LiveBytes then
+      begin
+        WriteLn(ErrOutput, '    !! SIZE DISAGREES with UDTCLayout: C=', Total,
+                ' live=', FUDTs[i].LiveBytes);
+        Inc(Bad);
+      end;
+      for j := 0 to High(FUDTs[i].Fields) do
+        if (j <= High(Offs)) and (Offs[j] <> FUDTs[i].Fields[j].ByteOffset) then
+        begin
+          WriteLn(ErrOutput, '    !! OFFSET DISAGREES on ', FUDTs[i].Fields[j].Name,
+                  ': C=', Offs[j], ' live=', FUDTs[i].Fields[j].ByteOffset);
+          Inc(Bad);
+        end;
+    end;
+    // And the oracle-free one, which is what found A1: a field cannot start past its own type.
+    for j := 0 to High(FUDTs[i].Fields) do
+      if FUDTs[i].Fields[j].ByteOffset + FUDTs[i].Fields[j].ByteSize > FUDTs[i].LiveBytes then
+      begin
+        WriteLn(ErrOutput, '    !! FIELD ESCAPES ITS TYPE: ', FUDTs[i].Fields[j].Name,
+                ' +', FUDTs[i].Fields[j].ByteOffset, '+', FUDTs[i].Fields[j].ByteSize,
+                ' > ', FUDTs[i].LiveBytes);
+        Inc(Bad);
+      end;
+  end;
+  WriteLn(ErrOutput, 'udt: ', Length(FUDTs), ' types, ', Bad, ' disagreements');
 end;
 
 function TSSAGenerator.ResolveMethodLabelArgs(const TypeName, MethNm: string; ArgsNode: TASTNode): string;
@@ -20391,8 +20526,8 @@ begin
       if NestedUDT < 0 then Continue;
       NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaRecordNew, NestedHandle,
-                      MakeSSAConstInt(FUDTs[NestedUDT].NInt),
-                      MakeSSAConstInt(FUDTs[NestedUDT].NFloat),
+                      MakeSSAConstInt(FUDTs[NestedUDT].LiveBytes),
+                      MakeSSAConstInt(0),
                       MakeSSAConstInt(FUDTs[NestedUDT].NStr or (Int64(NestedUDT) shl 32)));
       EmitRecordInit(NestedHandle, NestedUDT);   // deeper nesting
       EmitConstructorCall(NestedHandle, FUDTs[NestedUDT].Name);  // M4.4: construct the nested member
@@ -20429,8 +20564,8 @@ begin
         EmitInstruction(ssaRecordLoadInt, NestedHandle, HandleVal, MakeSSAValue(svkNone),
                         MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
         EmitInstruction(ssaRecordNewArrayInd, MakeSSAValue(svkNone), NestedHandle,
-                        MakeSSAConstInt((Int64(FUDTs[ElemUDT].NInt) and $FFFF)
-                                        or ((Int64(FUDTs[ElemUDT].NFloat) and $FFFF) shl 16)
+                        MakeSSAConstInt((Int64(FUDTs[ElemUDT].LiveBytes) and $FFFF)
+                                        
                                         or ((Int64(FUDTs[ElemUDT].NStr) and $FFFF) shl 32)
                                         or ((Int64(ElemUDT) and $FFFF) shl 48)),
                         MakeSSAValue(svkNone));
@@ -20791,7 +20926,7 @@ begin
   if UDTIdx < 0 then Exit;
   Handle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRecordNew, Handle,
-                  MakeSSAConstInt(FUDTs[UDTIdx].NInt), MakeSSAConstInt(FUDTs[UDTIdx].NFloat),
+                  MakeSSAConstInt(FUDTs[UDTIdx].LiveBytes), MakeSSAConstInt(0),
                   MakeSSAConstInt(FUDTs[UDTIdx].NStr or (Int64(UDTIdx) shl 32)));
   EmitRecordInit(Handle, UDTIdx);
   // Runs the matching constructor if the type declares one; a constructor-less type is aggregate-
@@ -22612,6 +22747,15 @@ begin
       // string / array / nested record falls back to the historic one-slot-per-field sum.
       if UDTCLayout(u, LayoutOffsets, LayoutSize) then
         Result := LayoutSize
+      else if FUDTs[u].LiveBytes > 0 then
+        // A3-i: where the C layout declines - a UNION, or a type holding an array, a nested record or
+        // a variable-length string - the LIVE layout still has an answer, and it is a far better one
+        // than the historic "eight bytes per field" sum. On a union of scalars it is now exactly
+        // fbc's: SizeOf of "Union: A As Integer, B As Integer, X As Double" is 8 where this used to
+        // say 24. It is still NOT fbc's number for a type with an array member, because the live
+        // image holds a handle there where fbc lays the elements out inline - see
+        // ComputeUDTLiveLayout, which says the same thing at more length.
+        Result := FUDTs[u].LiveBytes
       else
       begin
         Result := 0;
@@ -23516,7 +23660,7 @@ begin
     ProcessExpression(Node.GetChild(Node.ChildCount - 1), CountVal);
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRecordNew, Result,
-                  MakeSSAConstInt(FUDTs[UDTIdx].NInt), MakeSSAConstInt(FUDTs[UDTIdx].NFloat),
+                  MakeSSAConstInt(FUDTs[UDTIdx].LiveBytes), MakeSSAConstInt(0),
                   MakeSSAConstInt(FUDTs[UDTIdx].NStr or (Int64(UDTIdx) shl 32) or (Int64(1) shl 48)));
   EmitRecordInit(Result, UDTIdx);                 // allocate nested-UDT members
   if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antArgumentList) then
@@ -23826,8 +23970,8 @@ begin
         // Array-of-UDT member: copy element-wise into the destination's OWN element records (each element
         // gets an independent copy of the source element's contents), packing the element UDT slot counts.
         EmitInstruction(ssaArrayCopyRecords, MakeSSAValue(svkNone), DNest, SNest,
-                        MakeSSAConstInt((Int64(FUDTs[NestedUDT].NInt) and $FFFF)
-                                        or ((Int64(FUDTs[NestedUDT].NFloat) and $FFFF) shl 16)
+                        MakeSSAConstInt((Int64(FUDTs[NestedUDT].LiveBytes) and $FFFF)
+                                        
                                         or ((Int64(FUDTs[NestedUDT].NStr) and $FFFF) shl 32)
                                         or ((Int64(NestedUDT) and $FFFF) shl 48)))
       else
@@ -23990,7 +24134,7 @@ begin
     UDTIdx := FindUDT(RecType);
     RcHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaRecordNew, RcHandle,
-                    MakeSSAConstInt(FUDTs[UDTIdx].NInt), MakeSSAConstInt(FUDTs[UDTIdx].NFloat),
+                    MakeSSAConstInt(FUDTs[UDTIdx].LiveBytes), MakeSSAConstInt(0),
                     MakeSSAConstInt(FUDTs[UDTIdx].NStr or (Int64(UDTIdx) shl 32)));
     EmitRecordInit(RcHandle, UDTIdx);                 // allocate nested-UDT members (no ctor calls)
     StageCallArgs(Name, ArgsNode);                    // evaluate args first (inner calls finish)
@@ -24530,7 +24674,7 @@ begin
       UDTIdx := FindUDT(RetRecType);
       RcHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaRecordNew, RcHandle,
-                      MakeSSAConstInt(FUDTs[UDTIdx].NInt), MakeSSAConstInt(FUDTs[UDTIdx].NFloat),
+                      MakeSSAConstInt(FUDTs[UDTIdx].LiveBytes), MakeSSAConstInt(0),
                       MakeSSAConstInt(FUDTs[UDTIdx].NStr or (Int64(UDTIdx) shl 32)));
       EmitRecordInit(RcHandle, UDTIdx);
     end;
@@ -26007,7 +26151,7 @@ begin
           begin
             LcHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
             EmitInstruction(ssaRecordNew, LcHandle,
-                            MakeSSAConstInt(FUDTs[PUDT].NInt), MakeSSAConstInt(FUDTs[PUDT].NFloat),
+                            MakeSSAConstInt(FUDTs[PUDT].LiveBytes), MakeSSAConstInt(0),
                             MakeSSAConstInt(FUDTs[PUDT].NStr or (Int64(PUDT) shl 32)));
             EmitRecordInit(LcHandle, PUDT);
             EmitRecordCopy(LcHandle, ParamReg, PUDT);              // copy caller's record in

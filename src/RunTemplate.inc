@@ -940,10 +940,10 @@ begin
             // Immediate bit 48 (M5.2c refinement): allocate in the shared region (cross-thread, e.g. a
             // SHARED UDT scalar); otherwise in this thread's per-context heap. typeId is bits 32..47.
             if (Instr.Immediate shr 48) and 1 <> 0 then
-              Ctx.IntRegs[Instr.Dest] := AllocSharedRecord(Instr.Src1, Instr.Src2,
+              Ctx.IntRegs[Instr.Dest] := AllocSharedRecord(Instr.Src1,
                                       Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF)
             else
-              Ctx.IntRegs[Instr.Dest] := AllocRecord(Ctx, Instr.Src1, Instr.Src2,
+              Ctx.IntRegs[Instr.Dest] := AllocRecord(Ctx, Instr.Src1,
                                       Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
             Inc(CurPC);
           end;
@@ -960,21 +960,21 @@ begin
         bcRecordNewBlock:  // Callocate(n, SizeOf(T)) of a UDT: n consecutive shared records; Dest = first
           begin
             IntRegs[Instr.Dest] := AllocSharedRecordBlock(IntRegs[Instr.Src1],
-                                     Instr.Immediate and $FFFF, (Instr.Immediate shr 16) and $FFFF,
+                                     Instr.Immediate and $FFFF,
                                      (Instr.Immediate shr 32) and $FFFF, (Instr.Immediate shr 48) and $FFFF);
             Inc(CurPC);
           end;
         // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).
         bcRecordLoadInt:
-          begin Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.IntData[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr.Dest] := RecFieldInt(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate); Inc(CurPC); end;
         bcRecordLoadFloat:
-          begin Ctx.FloatRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.FloatData[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.FloatRegs[Instr.Dest] := RecFieldFloat(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate); Inc(CurPC); end;
         bcRecordLoadString:
           begin Ctx.StringRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate]; Inc(CurPC); end;
         bcRecordStoreInt:
-          begin ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.IntData[Instr.Immediate] := Ctx.IntRegs[Instr.Src2]; Inc(CurPC); end;
+          begin RecSetFieldInt(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate, Ctx.IntRegs[Instr.Src2]); Inc(CurPC); end;
         bcRecordStoreFloat:
-          begin ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.FloatData[Instr.Immediate] := Ctx.FloatRegs[Instr.Src2]; Inc(CurPC); end;
+          begin RecSetFieldFloat(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate, Ctx.FloatRegs[Instr.Src2]); Inc(CurPC); end;
         bcRecordStoreString:
           begin ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2]; Inc(CurPC); end;
         bcRecordTypeId:

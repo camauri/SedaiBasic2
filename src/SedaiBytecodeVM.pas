@@ -552,11 +552,11 @@ type
     procedure CondBroadcastOp(CondHandle: Int64);
     procedure DestroyCond(CondHandle: Int64);
     procedure CleanupConds;     // free any surviving condition variables (destructor)
-    function AllocRecord(Ctx: TExecutionContext; IntC, FloatC, StrC, TypeId: Integer): Integer;  // M3: new record instance -> handle
+    function AllocRecord(Ctx: TExecutionContext; ByteSize, StrC, TypeId: Integer): Integer;  // M3: new record instance -> handle
     // M5.2c: allocate in the shared region (cross-thread); ResolveRec routes a handle to its record.
     procedure GrowSharedRecords(NeedLen: Integer);
-    function AllocSharedRecord(IntC, FloatC, StrC, TypeId: Integer): Int64;
-    function AllocSharedRecordBlock(N, IntC, FloatC, StrC, TypeId: Integer): Int64;  // N consecutive shared records (Callocate block)
+    function AllocSharedRecord(ByteSize, StrC, TypeId: Integer): Int64;
+    function AllocSharedRecordBlock(N, ByteSize, StrC, TypeId: Integer): Int64;  // N consecutive shared records (Callocate block)
     procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
     // Resolve a tagged raw pointer to a real address in its region (byte heap or framebuffer), checking
     // that NeedBytes bytes fit. Every raw access goes through it.
@@ -3321,7 +3321,74 @@ begin
   end;
 end;
 
-function TBytecodeVM.AllocRecord(Ctx: TExecutionContext; IntC, FloatC, StrC, TypeId: Integer): Integer;
+{ A3-i: reading and writing a numeric field of a record's byte image.
+
+  A field arrives packed in the instruction's Immediate, the way SedaiSSA.ComputeUDTLiveLayout
+  stamped it into TUDTField.Slot:
+
+      bits 4..31 : the field's byte offset in the record image - fbc's offset
+      bits 0..3  : the B1.5 width code (0 = full width, 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 7=single)
+
+  so nothing here needs the type tables: the width travelled with the instruction. The full-width
+  case is tested first and separately, because it is the overwhelming majority of fields and this
+  is a two-digit-nanosecond operation where a jump table would show.
+
+  ⭐ A narrow STORE is one instruction of the right width, not a read-modify-write. That answers the
+  regression the plan predicted for narrow records ("a UByte needs load/mask/store"): it needs
+  nothing of the sort, because the layout never packs two fields into the same byte. The one overlap
+  that exists is a UNION, and there overwriting the neighbour IS the semantics being asked for. }
+
+function RecFieldInt(R: PRecordStorage; Enc: Int64): Int64; inline;
+var
+  p: PByte;
+begin
+  p := @R^.Bytes[Enc shr 4];
+  if (Enc and $F) = 0 then Exit(PInt64(p)^);
+  case Enc and $F of
+    1: Result := PShortInt(p)^;      // s8
+    2: Result := PByte(p)^;          // u8
+    3: Result := PSmallInt(p)^;      // s16
+    4: Result := PWord(p)^;          // u16
+    5: Result := PLongInt(p)^;       // s32
+    6: Result := PLongWord(p)^;      // u32
+  else Result := PInt64(p)^;
+  end;
+end;
+
+procedure RecSetFieldInt(R: PRecordStorage; Enc, Val: Int64); inline;
+var
+  p: PByte;
+begin
+  p := @R^.Bytes[Enc shr 4];
+  if (Enc and $F) = 0 then begin PInt64(p)^ := Val; Exit; end;
+  case Enc and $F of
+    1, 2: PByte(p)^ := Byte(Val);
+    3, 4: PWord(p)^ := Word(Val);
+    5, 6: PLongWord(p)^ := LongWord(Val);
+  else PInt64(p)^ := Val;
+  end;
+end;
+
+function RecFieldFloat(R: PRecordStorage; Enc: Int64): Double; inline;
+begin
+  // A SINGLE field is FOUR bytes now, where the slot array held it widened to a Double. What a
+  // program sees is unchanged - a store already rounded to single precision - but the BYTES are now
+  // the ones fbc writes, which is the whole point of the exercise.
+  if (Enc and $F) = 7 then
+    Result := PSingle(@R^.Bytes[Enc shr 4])^
+  else
+    Result := PDouble(@R^.Bytes[Enc shr 4])^;
+end;
+
+procedure RecSetFieldFloat(R: PRecordStorage; Enc: Int64; Val: Double); inline;
+begin
+  if (Enc and $F) = 7 then
+    PSingle(@R^.Bytes[Enc shr 4])^ := Val
+  else
+    PDouble(@R^.Bytes[Enc shr 4])^ := Val;
+end;
+
+function TBytecodeVM.AllocRecord(Ctx: TExecutionContext; ByteSize, StrC, TypeId: Integer): Integer;
 // Allocate a record instance (heap block of typed slot arrays) in Ctx's per-thread heap and
 // return its handle (an index into Ctx.Records).
 begin
@@ -3337,8 +3404,9 @@ begin
   if Ctx.RecordCount >= Length(Ctx.Records) then
     SetLength(Ctx.Records, (Ctx.RecordCount + 1) * 2);
   Ctx.Records[Ctx.RecordCount].TypeId := TypeId;
-  SetLength(Ctx.Records[Ctx.RecordCount].IntData, IntC);
-  SetLength(Ctx.Records[Ctx.RecordCount].FloatData, FloatC);
+  // A3-i: one byte image plus the string vector. SetLength zero-fills a fresh block, which is the
+  // initial state a record must have.
+  SetLength(Ctx.Records[Ctx.RecordCount].Bytes, ByteSize);
   SetLength(Ctx.Records[Ctx.RecordCount].StringData, StrC);
   Result := Ctx.RecordCount;
   Inc(Ctx.RecordCount);
@@ -3400,7 +3468,7 @@ begin
   FSharedRecStore := NewStore;
 end;
 
-function TBytecodeVM.AllocSharedRecord(IntC, FloatC, StrC, TypeId: Integer): Int64;
+function TBytecodeVM.AllocSharedRecord(ByteSize, StrC, TypeId: Integer): Int64;
 // M5.2c: allocate a record in the cross-thread shared region and return a SHARED_REC_FLAG-tagged
 // handle. Each record is its own heap block (stable pointer), so a handle survives the outer array
 // growing. Used for arrays of UDT, whose handles live in the global FArrays and are read by any thread.
@@ -3435,13 +3503,11 @@ begin
   R^.TypeId := TypeId;
   // On a recycled record these are almost always no-ops (same shape as the record that was freed),
   // and FPC returns immediately when the length already matches.
-  SetLength(R^.IntData, IntC);
-  SetLength(R^.FloatData, FloatC);
+  SetLength(R^.Bytes, ByteSize);
   SetLength(R^.StringData, StrC);
   // A recycled record must be indistinguishable from a fresh one: a brand-new SetLength zero-fills,
   // so recycling has to zero explicitly. (Strings were already emptied when it was retired.)
-  for i := 0 to IntC - 1 do R^.IntData[i] := 0;
-  for i := 0 to FloatC - 1 do R^.FloatData[i] := 0;
+  if ByteSize > 0 then FillChar(R^.Bytes[0], ByteSize, 0);
   Result := SHARED_REC_FLAG or Int64(Idx);
 end;
 
@@ -4281,13 +4347,14 @@ end;
 
 procedure TBytecodeVM.RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);
 // Eager-allocate one record instance per element of the (int handle) array and store the handles.
-// PackedCounts = intCount | floatCount<<16 | strCount<<32 | typeId<<48. M5.2c: array-of-UDT records go
-// in the shared region (the handle array FArrays[ArrayId] is global, so any thread can reach them).
+// PackedCounts = byteSize | 0<<16 | strCount<<32 | typeId<<48. A3-i: bits 16..31 used to hold the
+// float slot count and are now always zero - the numeric halves are one byte image, so allocation
+// needs a SIZE and a string count. M5.2c: array-of-UDT records go in the shared region (the handle
+// array FArrays[ArrayId] is global, so any thread can reach them).
 var
-  k, IntC, FloatC, StrC, TypeId: Integer;
+  k, ByteSize, StrC, TypeId: Integer;
 begin
-  IntC := PackedCounts and $FFFF;
-  FloatC := (PackedCounts shr 16) and $FFFF;
+  ByteSize := PackedCounts and $FFFF;
   StrC := (PackedCounts shr 32) and $FFFF;
   TypeId := (PackedCounts shr 48) and $FFFF;
   // Allocate a record only for elements that do not already have one. A valid array-of-UDT element
@@ -4296,10 +4363,10 @@ begin
   // only the freshly-grown slots are 0, so existing records are kept (no clobber / leak).
   for k := 0 to FArrays[ArrayId].TotalSize - 1 do
     if FArrays[ArrayId].IntData[k] = 0 then
-      FArrays[ArrayId].IntData[k] := AllocSharedRecord(IntC, FloatC, StrC, TypeId);
+      FArrays[ArrayId].IntData[k] := AllocSharedRecord(ByteSize, StrC, TypeId);
 end;
 
-function TBytecodeVM.AllocSharedRecordBlock(N, IntC, FloatC, StrC, TypeId: Integer): Int64;
+function TBytecodeVM.AllocSharedRecordBlock(N, ByteSize, StrC, TypeId: Integer): Int64;
 // Allocate N records at CONSECUTIVE shared-region indices (always append, never reuse a freed slot) and
 // return the first's SHARED_REC_FLAG handle. Because the indices are consecutive, "handle + i" (a plain
 // pointer add) yields the i-th record's handle — the basis for "p[i]" on a Callocate(n, SizeOf(T)) block.
@@ -4315,8 +4382,7 @@ begin
     begin
       New(R);
       R^.TypeId := TypeId;
-      SetLength(R^.IntData, IntC);
-      SetLength(R^.FloatData, FloatC);
+      SetLength(R^.Bytes, ByteSize);
       SetLength(R^.StringData, StrC);
       if FSharedRecordCount >= Length(FSharedRecords) then
         GrowSharedRecords(FSharedRecordCount + 1);
@@ -4338,12 +4404,11 @@ procedure TBytecodeVM.DeepCopyArrayRecords(Ctx: TExecutionContext; DestArr, SrcA
 // copied one level deep (Int/Float/StringData via Copy) — a nested UDT/array inside an element is copied
 // as its handle (shallow at that deeper level), matching the SSA EmitRecordCopy depth for arrays.
 var
-  IntC, FloatC, StrC, TypeId, k: Integer;
+  ByteSize, StrC, TypeId, k: Integer;
   SrcRec, DestRec: PRecordStorage;
 begin
   if (DestArr < 1) or (DestArr > High(FArrays)) or (SrcArr < 1) or (SrcArr > High(FArrays)) then Exit;
-  IntC := PackedCounts and $FFFF;
-  FloatC := (PackedCounts shr 16) and $FFFF;
+  ByteSize := PackedCounts and $FFFF;
   StrC := (PackedCounts shr 32) and $FFFF;
   TypeId := (PackedCounts shr 48) and $FFFF;
   // Match the destination's shape to the source. On a size change, release the dest's current element
@@ -4363,14 +4428,13 @@ begin
   for k := 0 to FArrays[SrcArr].TotalSize - 1 do
   begin
     if FArrays[DestArr].IntData[k] = 0 then
-      FArrays[DestArr].IntData[k] := AllocSharedRecord(IntC, FloatC, StrC, TypeId);
+      FArrays[DestArr].IntData[k] := AllocSharedRecord(ByteSize, StrC, TypeId);
     SrcRec := ResolveRec(Ctx, FArrays[SrcArr].IntData[k]);
     DestRec := ResolveRec(Ctx, FArrays[DestArr].IntData[k]);
     if (SrcRec <> nil) and (DestRec <> nil) then
     begin
       DestRec^.TypeId := SrcRec^.TypeId;
-      DestRec^.IntData := Copy(SrcRec^.IntData);
-      DestRec^.FloatData := Copy(SrcRec^.FloatData);
+      DestRec^.Bytes := Copy(SrcRec^.Bytes);
       DestRec^.StringData := Copy(SrcRec^.StringData);
     end;
   end;
@@ -6556,10 +6620,10 @@ begin
     bcRecordNew:
       // Immediate bit 48: allocate in the shared cross-thread region (e.g. a SHARED UDT scalar).
       if (Instr.Immediate shr 48) and 1 <> 0 then
-        Ctx.IntRegs[Instr.Dest] := AllocSharedRecord(Instr.Src1, Instr.Src2,
+        Ctx.IntRegs[Instr.Dest] := AllocSharedRecord(Instr.Src1,
                                           Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF)
       else
-        Ctx.IntRegs[Instr.Dest] := AllocRecord(Ctx, Instr.Src1, Instr.Src2,
+        Ctx.IntRegs[Instr.Dest] := AllocRecord(Ctx, Instr.Src1,
                                           Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
     bcRecordNewArray:
       RecordNewArrayInit(Ctx, Instr.Src1, Instr.Immediate);  // Src1=array id; Imm=packed slot counts
@@ -6568,16 +6632,16 @@ begin
       RecordNewArrayInit(Ctx, Ctx.IntRegs[Instr.Src1], Instr.Immediate);
     bcRecordNewBlock:  // Callocate(n, SizeOf(T)) of a UDT: n consecutive shared records; Dest = first handle
       Ctx.IntRegs[Instr.Dest] := AllocSharedRecordBlock(Ctx.IntRegs[Instr.Src1],
-                                   Instr.Immediate and $FFFF, (Instr.Immediate shr 16) and $FFFF,
+                                   Instr.Immediate and $FFFF,
                                    (Instr.Immediate shr 32) and $FFFF, (Instr.Immediate shr 48) and $FFFF);
     bcRecordFree:
       FreeSharedRecord(Ctx.IntRegs[Instr.Src1]);  // DELETE p: release the heap record (Src1=handle)
     // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).
-    bcRecordLoadInt:    Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.IntData[Instr.Immediate];
-    bcRecordLoadFloat:  Ctx.FloatRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.FloatData[Instr.Immediate];
+    bcRecordLoadInt:    Ctx.IntRegs[Instr.Dest] := RecFieldInt(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate);
+    bcRecordLoadFloat:  Ctx.FloatRegs[Instr.Dest] := RecFieldFloat(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate);
     bcRecordLoadString: Ctx.StringRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate];
-    bcRecordStoreInt:   ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.IntData[Instr.Immediate] := Ctx.IntRegs[Instr.Src2];
-    bcRecordStoreFloat: ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.FloatData[Instr.Immediate] := Ctx.FloatRegs[Instr.Src2];
+    bcRecordStoreInt:   RecSetFieldInt(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate, Ctx.IntRegs[Instr.Src2]);
+    bcRecordStoreFloat: RecSetFieldFloat(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate, Ctx.FloatRegs[Instr.Src2]);
     bcRecordStoreString:ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2];
     bcRecordTypeId:     Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.TypeId;
     // System commands
@@ -7942,8 +8006,11 @@ var
   RecSz, RIntOff, RFloatOff: Integer;
 begin
   RecSz := SizeOf(TRecordStorage);
-  RIntOff := Integer(PtrUInt(@RecTmp.IntData) - PtrUInt(@RecTmp));
-  RFloatOff := Integer(PtrUInt(@RecTmp.FloatData) - PtrUInt(@RecTmp));
+  // A3-i: ONE data pointer now, the byte image. Both offsets are handed the same field so the two
+  // emitters keep their existing signatures while the storage is one array - see GetRecordLayout,
+  // where the same thing is said at more length.
+  RIntOff := Integer(PtrUInt(@RecTmp.Bytes) - PtrUInt(@RecTmp));
+  RFloatOff := RIntOff;
   n := FProgram.GetInstructionCount;
   for i := 0 to High(FNativeLoops) do FNativeLoops[i].Free;
   SetLength(FNativeLoops, 0);
@@ -8104,19 +8171,19 @@ end;
   ssaRecordNew override in SedaiBytecodeCompiler), so the emitter bakes them as one immediate. }
 
 function AotRecordNew(VMSelf, CtxObj: Pointer; Counts, Imm: PtrInt): PtrInt; cdecl;
-// Counts = IntSlots or (FloatSlots shl 32); Imm is the bytecode Immediate verbatim:
-// string slots in bits 0..15, type id in bits 32..47, "allocate in the shared region" in bit 48.
+// Counts = byteSize (A3-i: the record's live image size, where this used to be two slot counts, the
+// second of which is now always zero). Imm is the bytecode Immediate verbatim: string slots in bits
+// 0..15, type id in bits 32..47, "allocate in the shared region" in bit 48.
 var
-  IntC, FloatC, StrC, TypeId: Integer;
+  ByteSize, StrC, TypeId: Integer;
 begin
-  IntC   := Integer(Counts and $FFFFFFFF);
-  FloatC := Integer((Counts shr 32) and $FFFFFFFF);
+  ByteSize := Integer(Counts and $FFFFFFFF);
   StrC   := Integer(Imm and $FFFF);
   TypeId := Integer((Imm shr 32) and $FFFF);
   if (Imm shr 48) and 1 <> 0 then
-    Result := PtrInt(TBytecodeVM(VMSelf).AllocSharedRecord(IntC, FloatC, StrC, TypeId))
+    Result := PtrInt(TBytecodeVM(VMSelf).AllocSharedRecord(ByteSize, StrC, TypeId))
   else
-    Result := PtrInt(TBytecodeVM(VMSelf).AllocRecord(TExecutionContext(CtxObj), IntC, FloatC, StrC, TypeId));
+    Result := PtrInt(TBytecodeVM(VMSelf).AllocRecord(TExecutionContext(CtxObj), ByteSize, StrC, TypeId));
 end;
 
 procedure AotRecordFree(VMSelf: Pointer; Handle: PtrInt); cdecl;
@@ -9239,8 +9306,11 @@ var
 begin
   RecordsOff  := Integer(PtrUInt(@FCtx.Records) - PtrUInt(Pointer(FCtx)));
   RecSize     := SizeOf(TRecordStorage);
-  RecIntOff   := Integer(PtrUInt(@RecTmp.IntData) - PtrUInt(@RecTmp));
-  RecFloatOff := Integer(PtrUInt(@RecTmp.FloatData) - PtrUInt(@RecTmp));
+  // A3-i: the numeric halves are one byte image, so both "bank" offsets name the same field. The
+  // emitters that read these still take two, and giving them one field twice is what lets the native
+  // record path be rewritten in its own step rather than in this one.
+  RecIntOff   := Integer(PtrUInt(@RecTmp.Bytes) - PtrUInt(@RecTmp));
+  RecFloatOff := RecIntOff;
   // The shared region is an array of POINTERS on the VM instance, reached through ctx.VMSelf. Every
   // record of an ARRAY OF UDT lives there (AllocSharedRecord), which is the common case in real
   // BASIC, so a native path that handled only the per-context heap would miss all of it.
@@ -10748,7 +10818,7 @@ begin
         if PtrAddr < 0 then
         begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
-          Ctx.IntRegs[Instr.Dest] := Rec^.IntData[RecSlot];
+          Ctx.IntRegs[Instr.Dest] := RecFieldInt(Rec, RecSlot);
         end
         else
         begin
@@ -10765,7 +10835,7 @@ begin
         if PtrAddr < 0 then
         begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
-          Ctx.FloatRegs[Instr.Dest] := Rec^.FloatData[RecSlot];
+          Ctx.FloatRegs[Instr.Dest] := RecFieldFloat(Rec, RecSlot);
         end
         else
         begin
@@ -10799,7 +10869,7 @@ begin
         if PtrAddr < 0 then
         begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
-          Rec^.IntData[RecSlot] := Ctx.IntRegs[Instr.Src2];
+          RecSetFieldInt(Rec, RecSlot, Ctx.IntRegs[Instr.Src2]);
         end
         else
         begin
@@ -10816,7 +10886,7 @@ begin
         if PtrAddr < 0 then
         begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
-          Rec^.FloatData[RecSlot] := Ctx.FloatRegs[Instr.Src2];
+          RecSetFieldFloat(Rec, RecSlot, Ctx.FloatRegs[Instr.Src2]);
         end
         else
         begin
@@ -11062,7 +11132,7 @@ begin
         PtrOffset := (Instr.Immediate shr 4) and $F;    // element type (0=int, 1=float, 2=string)
         if Assigned(Rec) then
         begin
-          PtrAddr := Rec^.IntData[RecSlot];
+          PtrAddr := RecFieldInt(Rec, RecSlot);
           if (PtrAddr < 1) or (PtrAddr > High(FArrays)) then
           begin
             if Length(FArrays) = 0 then SetLength(FArrays, 1);   // keep id 0 reserved as the "unallocated" sentinel
@@ -11073,7 +11143,7 @@ begin
             FArrays[PtrAddr].TotalSize := 0;
             SetLength(FArrays[PtrAddr].Dimensions, 0);
             SetLength(FArrays[PtrAddr].LowerBounds, 0);
-            Rec^.IntData[RecSlot] := PtrAddr;
+            RecSetFieldInt(Rec, RecSlot, PtrAddr);
           end;
           RedimArrayN(PtrAddr, FRedimPendingUBs, (Instr.Immediate and 1) <> 0, FRedimPendingLBs);
         end;

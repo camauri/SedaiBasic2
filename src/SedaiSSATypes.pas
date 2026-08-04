@@ -59,9 +59,16 @@ const
     (copied straight from the handle), and the field slot in the low RECPTR_SLOT_BITS bits. The six
     bcRef{Load,Store} ops test bit 63 to route to record storage vs FArrays. }
   RECPTR_TAG = Int64(1) shl 63;
-  RECPTR_SLOT_BITS = 16;
+  // A3-i widened this from 16. The low field is no longer a slot INDEX but the packed
+  // (byte offset shl 4 or width code) that ComputeUDTLiveLayout stamps into TUDTField.Slot, so 16
+  // bits would have capped a record at 4096 bytes - a "String * 4096" member reaches that alone.
+  // 24 bits allows a megabyte per record and still leaves 38 bits of handle index, which is more
+  // records than the address space holds.
+  RECPTR_SLOT_BITS = 24;
   RECPTR_SLOT_MASK = (Int64(1) shl RECPTR_SLOT_BITS) - 1;
-  RECPTR_INDEX_MASK = (Int64(1) shl 46) - 1;
+  // bits [RECPTR_SLOT_BITS..61] hold the index, so this must shrink by exactly what the low field
+  // grew: 62 - 24 = 38. Leaving it at 46 would let a large handle spill into the shared flag.
+  RECPTR_INDEX_MASK = (Int64(1) shl 38) - 1;
 
   { FreeBASIC raw memory (Allocate/CAST/...). A raw pointer is a byte OFFSET into the VM-internal byte
     heap (FRawHeap), tagged with RAWPTR_TAG (bit 62) so it is distinct from a managed FArrays pointer

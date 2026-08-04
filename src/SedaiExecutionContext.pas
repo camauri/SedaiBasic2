@@ -46,10 +46,22 @@ type
   { UDT/record instance storage (M3): a heap block of typed slot arrays, referenced by a
     handle (its index in the record heap). M5.2b: the heap is per-context (per-thread), so a
     thread's RAII frame-mark rollback reclaims only its own records, never another thread's. }
+  { A3-i: the numeric half of a record is ONE BYTE IMAGE, laid out exactly as fbc lays the type out
+    (SedaiSSA.ComputeUDTLiveLayout). It used to be two parallel slot arrays - IntData and FloatData -
+    one per register bank, which made a byte offset a thing that did not exist: OFFSETOF had to
+    fabricate one, a UNION could only ever overlap members of the SAME bank, and "b As UByte" over
+    "d As Double" could not alias at all because they lived in different arrays.
+
+    A field is now (offset, width, signedness) into Bytes. Narrow fields cost nothing extra on x86:
+    a one-byte store is a one-byte store, not the read-modify-write the plan feared.
+
+    ⚠️ STRINGS STILL LIVE OUTSIDE, in StringData, indexed by slot. That is what makes this A3-i
+    rather than A3-ii: a string is owned by the allocator and is not an inert byte. The layout DOES
+    reserve the bytes a fixed-length "String * n" field occupies in fbc's image, at fbc's offset, so
+    moving the characters in later is a change to that field's accessors and moves no other field. }
   TRecordStorage = record
     TypeId: Integer;          // M4.3: runtime UDT type id (for virtual dispatch); -1 if untyped
-    IntData: array of Int64;
-    FloatData: array of Double;
+    Bytes: array of Byte;     // the record's live C image: numeric fields at their true offsets
     StringData: array of string;
   end;
   PRecordStorage = ^TRecordStorage;   // M5.2c: stable pointer to a record (per-thread or shared region)

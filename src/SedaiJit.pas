@@ -659,8 +659,16 @@ var
   // (a dynamic array = a pointer) at its offset, then load/store [fieldptr + slot*8]. No handle/slot bounds
   // check, matching the interpreter (range checks off). HandleReg = Src1, ValDstReg = Dest/Src2, Slot = Imm.
   procedure RecAccess(apc, HandleReg, Slot, ValDstReg: Integer; IsFloat, IsStore: Boolean);
-  var p: Integer;
+  var p, Ofs, W: Integer;
   begin
+    // A3-i: Slot is no longer an index into a slot array. It carries the field's BYTE OFFSET in
+    // bits 4..31 and its width code in bits 0..3, and the record's numeric halves are one byte
+    // image - so both "bank" offsets name the same field and the access is [ptr + offset].
+    // The widths are emitted here rather than deopted: a deopt is NOT a local cost - measured on
+    // job/tests/bench/udt_floor.bas, sending narrow fields to the interpreter cost the arms that
+    // came AFTER them too, because leaving takes the whole compiled region with it.
+    W := Slot and $F;
+    Ofs := Slot shr 4;
     ILoad(RAX, HandleReg);                          // rax = handle
     E.EmitBytes([$48, $0F, $BA, $E0, 62]);          // bt rax, 62  (SHARED_REC_FLAG = 1 shl 62)
     E.EmitBytes([$73, $00]); p := E.Len - 1;        // jnc +over  (CF=0 -> not shared -> fast path)
@@ -676,24 +684,52 @@ var
       if IsFloat then
       begin
         FLoad(XMM0, ValDstReg);
-        E.EmitBytes([$F2, $0F, $11, $81]); E.Emit32(LongWord(Slot) * 8);   // movsd [rcx+slot*8], xmm0
+        if W = 7 then
+        begin
+          E.EmitBytes([$F2, $0F, $5A, $C0]);                               // cvtsd2ss xmm0, xmm0
+          E.EmitBytes([$F3, $0F, $11, $81]); E.Emit32(LongWord(Ofs));      // movss [rcx+ofs], xmm0
+        end
+        else
+        begin
+          E.EmitBytes([$F2, $0F, $11, $81]); E.Emit32(LongWord(Ofs));      // movsd [rcx+ofs], xmm0
+        end;
       end
       else
       begin
         ILoad(RAX, ValDstReg);
-        E.EmitBytes([$48, $89, $81]); E.Emit32(LongWord(Slot) * 8);        // mov [rcx+slot*8], rax
+        case W of
+          1, 2: begin E.EmitBytes([$88, $81]); E.Emit32(LongWord(Ofs)); end;        // mov [rcx+ofs], al
+          3, 4: begin E.EmitBytes([$66, $89, $81]); E.Emit32(LongWord(Ofs)); end;   // mov [rcx+ofs], ax
+          5, 6: begin E.EmitBytes([$89, $81]); E.Emit32(LongWord(Ofs)); end;        // mov [rcx+ofs], eax
+        else    begin E.EmitBytes([$48, $89, $81]); E.Emit32(LongWord(Ofs)); end;   // mov [rcx+ofs], rax
+        end;
       end;
     end
     else
     begin
       if IsFloat then
       begin
-        E.EmitBytes([$F2, $0F, $10, $81]); E.Emit32(LongWord(Slot) * 8);   // movsd xmm0, [rcx+slot*8]
+        if W = 7 then
+        begin
+          E.EmitBytes([$F3, $0F, $5A, $81]); E.Emit32(LongWord(Ofs));      // cvtss2sd xmm0, [rcx+ofs]
+        end
+        else
+        begin
+          E.EmitBytes([$F2, $0F, $10, $81]); E.Emit32(LongWord(Ofs));      // movsd xmm0, [rcx+ofs]
+        end;
         FStore(ValDstReg, XMM0);
       end
       else
       begin
-        E.EmitBytes([$48, $8B, $81]); E.Emit32(LongWord(Slot) * 8);        // mov rax, [rcx+slot*8]
+        case W of
+          1: begin E.EmitBytes([$48, $0F, $BE, $81]); E.Emit32(LongWord(Ofs)); end; // movsx rax, byte
+          2: begin E.EmitBytes([$48, $0F, $B6, $81]); E.Emit32(LongWord(Ofs)); end; // movzx rax, byte
+          3: begin E.EmitBytes([$48, $0F, $BF, $81]); E.Emit32(LongWord(Ofs)); end; // movsx rax, word
+          4: begin E.EmitBytes([$48, $0F, $B7, $81]); E.Emit32(LongWord(Ofs)); end; // movzx rax, word
+          5: begin E.EmitBytes([$48, $63, $81]); E.Emit32(LongWord(Ofs)); end;      // movsxd rax, dword
+          6: begin E.EmitBytes([$8B, $81]); E.Emit32(LongWord(Ofs)); end;           // mov eax, dword (zx)
+        else begin E.EmitBytes([$48, $8B, $81]); E.Emit32(LongWord(Ofs)); end;      // mov rax, qword
+        end;
         IStore(ValDstReg, RAX);
       end;
     end;

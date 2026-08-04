@@ -2865,8 +2865,19 @@ var
   //
   // HandleReg = Src1, value = Dest (load) or Src2 (store), Slot = Src3 const.
   procedure AotRecAccess(apc, HandleReg, Slot, ValReg: Integer; IsFloat, IsStore: Boolean);
-  var p, pJoin: Integer;
+  var p, pJoin, Ofs, W: Integer;
   begin
+    // A3-i: Slot carries the field's BYTE OFFSET in bits 4..31 and its width code in bits 0..3, and
+    // the numeric halves of a record are one byte image - so both "bank" offsets name the same field
+    // and the access is [ptr + offset] rather than [ptr + slot*8], at the field's own width.
+    //
+    // ⛔ The first version of this sent a NARROW field to the interpreter with ExitTo, on the theory
+    // that it was a rare case worth a deopt. The floor probe said otherwise, and said it loudly: an
+    // ExitTo abandons the WHOLE COMPILED REGION, not one instruction, so the first UByte access took
+    // every arm after it down with it - the pointer and array-element arms, whose fields are full
+    // width, fell from 1 ns to 43 and 66. A deopt is not a local cost. The widths are emitted here.
+    W := Slot and $F;
+    Ofs := Slot shr 4;
     ILoad(RAX, HandleReg);                          // rax = handle
     E.EmitBytes([$48, $0F, $BA, $E0, 62]);          // bt rax, 62   (SHARED_REC_FLAG = 1 shl 62)
     E.EmitBytes([$73, $00]); p := E.Len - 1;        // jnc +plain   (CF=0 -> per-context heap)
@@ -2906,24 +2917,57 @@ var
       if IsFloat then
       begin
         FLoad(XMM0, ValReg);
-        E.EmitBytes([$F2, $0F, $11, $81]); E.Emit32(LongWord(Slot) * 8);   // movsd [rcx+slot*8], xmm0
+        if W = 7 then
+        begin
+          E.EmitBytes([$F2, $0F, $5A, $C0]);                               // cvtsd2ss xmm0, xmm0
+          E.EmitBytes([$F3, $0F, $11, $81]); E.Emit32(LongWord(Ofs));      // movss [rcx+ofs], xmm0
+        end
+        else
+        begin
+          E.EmitBytes([$F2, $0F, $11, $81]); E.Emit32(LongWord(Ofs));      // movsd [rcx+ofs], xmm0
+        end;
       end
       else
       begin
         ILoad(RAX, ValReg);
-        E.EmitBytes([$48, $89, $81]); E.Emit32(LongWord(Slot) * 8);        // mov [rcx+slot*8], rax
+        // A narrow store is ONE move of the field's width - no read-modify-write, because the layout
+        // never packs two fields into the same byte. Truncation to the declared width is exactly what
+        // storing al/ax/eax does, which is also what the interpreter's RecSetFieldInt does.
+        case W of
+          1, 2: begin E.EmitBytes([$88, $81]); E.Emit32(LongWord(Ofs)); end;        // mov [rcx+ofs], al
+          3, 4: begin E.EmitBytes([$66, $89, $81]); E.Emit32(LongWord(Ofs)); end;   // mov [rcx+ofs], ax
+          5, 6: begin E.EmitBytes([$89, $81]); E.Emit32(LongWord(Ofs)); end;        // mov [rcx+ofs], eax
+        else    begin E.EmitBytes([$48, $89, $81]); E.Emit32(LongWord(Ofs)); end;   // mov [rcx+ofs], rax
+        end;
       end;
     end
     else
     begin
       if IsFloat then
       begin
-        E.EmitBytes([$F2, $0F, $10, $81]); E.Emit32(LongWord(Slot) * 8);   // movsd xmm0, [rcx+slot*8]
+        if W = 7 then
+        begin
+          E.EmitBytes([$F3, $0F, $5A, $81]); E.Emit32(LongWord(Ofs));      // cvtss2sd xmm0, [rcx+ofs]
+        end
+        else
+        begin
+          E.EmitBytes([$F2, $0F, $10, $81]); E.Emit32(LongWord(Ofs));      // movsd xmm0, [rcx+ofs]
+        end;
         FStore(ValReg, XMM0);
       end
       else
       begin
-        E.EmitBytes([$48, $8B, $81]); E.Emit32(LongWord(Slot) * 8);        // mov rax, [rcx+slot*8]
+        // Sign or zero extension is the field's DECLARED signedness, which is what the width code
+        // carries: the odd codes are signed, the even ones unsigned.
+        case W of
+          1: begin E.EmitBytes([$48, $0F, $BE, $81]); E.Emit32(LongWord(Ofs)); end; // movsx rax, byte
+          2: begin E.EmitBytes([$48, $0F, $B6, $81]); E.Emit32(LongWord(Ofs)); end; // movzx rax, byte
+          3: begin E.EmitBytes([$48, $0F, $BF, $81]); E.Emit32(LongWord(Ofs)); end; // movsx rax, word
+          4: begin E.EmitBytes([$48, $0F, $B7, $81]); E.Emit32(LongWord(Ofs)); end; // movzx rax, word
+          5: begin E.EmitBytes([$48, $63, $81]); E.Emit32(LongWord(Ofs)); end;      // movsxd rax, dword
+          6: begin E.EmitBytes([$8B, $81]); E.Emit32(LongWord(Ofs)); end;           // mov eax, dword (zx)
+        else begin E.EmitBytes([$48, $8B, $81]); E.Emit32(LongWord(Ofs)); end;      // mov rax, qword
+        end;
         IStore(ValReg, RAX);
       end;
     end;
