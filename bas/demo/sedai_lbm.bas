@@ -56,20 +56,36 @@
 '' ============================================================================
 
 Const LIVE_NX = 320 : Const LIVE_NY = 180 : Const LIVE_SCALE = 4   '' 1280x720 window
-Const REC_NX  = 640 : Const REC_NY  = 360 : Const REC_SCALE  = 2   '' 1280x720 in the file
+Const REC_NX  = 640 : Const REC_NY  = 360 : Const REC_SCALE  = 3   '' 1920x1080 in the file
 
 '' TAU is the relaxation time: viscosity = (TAU - 0.5) / 3. Lower means less
 '' viscous and sharper vortices, but 0.5 is the cliff. 0.53 keeps a margin while
 '' still shedding: it is the one number to try first if the wake looks too smooth.
-Const TAU    = 0.53
+'' 0.515, down from 0.53: viscosity is (TAU-0.5)/3, so this halves it and doubles
+'' the Reynolds number - more vortices, shed faster, and thinner shear layers.
+'' ⚠️ It is also half the distance to the 0.5 cliff. The NaN watchdog at the foot
+'' of the loop is the thing that says so instead of showing a black frame.
+Const TAU    = 0.515
 '' Relaxation of the DYE lattice. Diffusivity is (TAUC - 0.5)/3, so this close to
 '' 0.5 the dye barely diffuses at all and the spiral arms survive. Lower is
 '' sharper and, as always here, closer to the stability cliff.
 Const TAUC   = 0.51
+'' How fast the dye climbs inside a letter. Negative y is upward on screen.
+'' Gentler than the first try: a strong seep pushed dye across the wall faster
+'' than the flow could carry it away, which is what speckled the letter edges.
+Const SEEP   = 0.018
+'' The floor of the injected dye. A cell the fluid has never reached holds 0 and
+'' is BLACK; everything the flow has touched is at least this, hence lit.
+Const DYEMIN = 0.30
+'' Brightness level the wordmark is drawn at, out of 0..7.
+'' 4 of 7, not 2. At 2 the wordmark is 29% brightness against a fully saturated
+'' background, and reads as black however much colour has actually seeped into it -
+'' the filling was working, the level was wrong.
+Const LETTERLV = 4
 '' Inflow speed in lattice units. The lattice sound speed is 1/sqrt(3) = 0.577;
 '' staying under ~0.1 keeps the compressibility error invisible AND keeps the
 '' scheme far from its stability limit.
-Const INFLOW = 0.075
+Const INFLOW = 0.095
 Const FPS    = 30
 '' ⚠️ LBM STEPS ARE NOT VIDEO FRAMES, and confusing the two is what made the first
 '' version show nothing. At INFLOW = 0.075 the fluid advances 0.075 cells per
@@ -80,7 +96,13 @@ Const FPS    = 30
 '' L/(0.2*U) = 15/(0.2*0.075) ~= 1000 LBM steps, so ten steps per frame puts one
 '' shedding cycle in 100 frames - about ten cycles in a thirty-second video, which
 '' is what makes the wake read as a rhythm rather than a blur.
-Const NSTEPS = 10
+'' 30, up from 10. At 0.095 cells per step the fluid then advances 2.85 cells per
+'' frame and crosses the 640-cell frame in about seven seconds, instead of the
+'' twenty-two it took at ten - a video that spent two thirds of itself waiting for
+'' the colour to arrive.
+'' ⭐ Raising the SUBSTEPS rather than the inflow speed on purpose: speed is the
+'' parameter that walks toward the stability cliff, substeps are only compute.
+Const NSTEPS = 30
 '' How many seconds one colour theme lasts before crossfading into the next.
 Const THEME_SECS = 30.0
 '' Vorticity -> colour. Set from the field's real range rather than guessed: with
@@ -99,6 +121,8 @@ Dim Shared As Double g0(), g1(), g2(), g3(), g4(), g5(), g6(), g7(), g8()
 '' has costs two writes and saves thirty-six reads and four divides per cell.
 Dim Shared As Double vx(), vy()
 Dim Shared As Double GPhase
+'' the sweep angle of the inlet, advanced once per LBM step
+Dim Shared As Double GSweep
 '' The colour index per cell, computed in its OWN pass. Splitting colour from
 '' drawing is not tidiness: each loop then touches two or three arrays instead of
 '' five, and the AOT's array-base cache holds ONE - so a loop with many arrays in
@@ -130,8 +154,8 @@ Dim Shared As Double h0(), h1(), h2(), h3(), h4()
 Dim Shared As Double dye()
 Dim Shared As Integer cidx()
 Dim Shared As Integer solid()
-Dim Shared As Integer pal(0 To 511)
-Dim Shared As String pal3(0 To 511)
+Dim Shared As Integer pal(0 To 4095)
+Dim Shared As String pal3(0 To 4095)
 
 Declare Sub BuildMask()
 Declare Sub BuildPalette(tsec As Double)
@@ -140,9 +164,7 @@ Declare Sub Step1()
 
 '' ---------------------------------------------------------------- the word
 '' The OFFICIAL wordmark, converted once by job/tests/tools/logo2mask.py into a
-'' cell mask. The hand-cut 5x7 glyphs are the fallback so the demo still runs
-'' without the file - but the logo is the deliverable, and its real counters are
-'' where the flow squeezes through and makes the picture interesting.
+'' cell mask; the hand-cut 5x7 glyphs are the fallback if the file is missing.
 Sub BuildMask()
   Dim As Integer gi, gx, gy, cx, cy, x0, y0, sc, wdt, k, fh, mw, mh, row, cnt
   Dim As String ln, fn, g(0 To 4, 0 To 6)
@@ -221,13 +243,17 @@ End Sub
 '' ---------------------------------------------------------------- colour
 Sub BuildPalette(tsec As Double)
 Declare Sub BuildPalette(tsec As Double)
-  '' Eight stops, and only ONE of them is pale. The previous cycle gave silver a
-  '' fifth of the wheel and interpolated through it on both sides, so half the
-  '' picture sat near white and everything looked washed out. Silver is a flash
-  '' between two saturated golds now, which is what "gold, then silver, then
-  '' green, then blue" actually looks like when a fluid carries it.
-  Dim As Integer i, ci, cj, r, g, b
-  Dim As Double u, m
+  '' Eight stops of hue x eight levels of BRIGHTNESS, in one table of 4096.
+  ''
+  '' The brightness axis does two jobs at once:
+  ''   - level 0 is BLACK, which is what a cell the dye has never reached shows.
+  ''     That is what lets the video open on black and have the fluid arrive.
+  ''   - the wordmark is drawn a few levels down instead of divided by three. The
+  ''     division killed the SATURATION and turned everything muddy brown; scaling
+  ''     the whole triple keeps the hue and only removes light, which reads as the
+  ''     same scene in shadow.
+  Dim As Integer i, ci, cj, r, g, b, lv
+  Dim As Double u, m, f
   Dim As Integer kr(0 To 8), kg(0 To 8), kb(0 To 8)
   kr(0)=255 : kg(0)=190 : kb(0)= 55      '' gold
   kr(1)=255 : kg(1)=135 : kb(1)= 15      '' deep gold
@@ -238,18 +264,21 @@ Declare Sub BuildPalette(tsec As Double)
   kr(6)= 30 : kg(6)=105 : kb(6)=250      '' blue
   kr(7)=165 : kg(7)= 65 : kb(7)=250      '' violet
   kr(8)=255 : kg(8)=190 : kb(8)= 55      '' back to gold: the cycle closes
-  For i = 0 To 511
-    u = i / 512.0 * 8.0
-    ci = Int(u)
-    If ci > 7 Then ci = 7
-    cj = ci + 1
-    m = u - ci
-    m = m * m * (3.0 - 2.0 * m)
-    r = Int(kr(ci) * (1 - m) + kr(cj) * m)
-    g = Int(kg(ci) * (1 - m) + kg(cj) * m)
-    b = Int(kb(ci) * (1 - m) + kb(cj) * m)
-    pal(i) = RGB(r, g, b)
-    pal3(i) = Chr(r) + Chr(g) + Chr(b)
+  For lv = 0 To 7
+    f = lv / 7.0
+    For i = 0 To 511
+      u = i / 512.0 * 8.0
+      ci = Int(u)
+      If ci > 7 Then ci = 7
+      cj = ci + 1
+      m = u - ci
+      m = m * m * (3.0 - 2.0 * m)
+      r = Int((kr(ci) * (1 - m) + kr(cj) * m) * f)
+      g = Int((kg(ci) * (1 - m) + kg(cj) * m) * f)
+      b = Int((kb(ci) * (1 - m) + kb(cj) * m) * f)
+      pal(lv * 512 + i) = RGB(r, g, b)
+      pal3(lv * 512 + i) = Chr(r) + Chr(g) + Chr(b)
+    Next
   Next
 End Sub
 
@@ -269,14 +298,12 @@ Sub Init()
   '' screen is the work of a VORTEX. That is what makes the reference stills read.
   '' bands across the height, at rest: a uniform flow along x cannot change them,
   '' so everything that moves on screen is the work of a vortex
-  For j = 0 To NY - 1
-    For i = 0 To NX - 1
-      k = i + NX * j
-      dye(k) = j / (NY / 2.5)
-      c0(k) = dye(k) / 3.0
-      c1(k) = dye(k) / 6.0 : c2(k) = dye(k) / 6.0
-      c3(k) = dye(k) / 6.0 : c4(k) = dye(k) / 6.0
-    Next
+  '' ⭐ EMPTY. The video opens on black and the fluid carries the colour in from
+  '' the left - which is also why there is no long warm-up any more: the wake
+  '' forming IS the opening, instead of something that has to happen before the
+  '' first frame can be shown.
+  For k = 0 To SZ - 1
+    dye(k) = 0 : c0(k) = 0 : c1(k) = 0 : c2(k) = 0 : c3(k) = 0 : c4(k) = 0
   Next
   usq = 1.5 * INFLOW * INFLOW
   For k = 0 To SZ - 1
@@ -296,7 +323,7 @@ End Sub
 '' ---------------------------------------------------------------- one step
 Sub Step1()
   Dim As Integer i, j, k
-  Dim As Double rho, ux, uy, usq, cu, omega, W0, W1, W5, t
+  Dim As Double rho, ux, uy, usq, cu, cuy, vin, vinY, omega, W0, W1, W5, t
   W0 = 4.0 / 9.0 : W1 = 1.0 / 9.0 : W5 = 1.0 / 36.0
   omega = 1.0 / TAU
 
@@ -356,19 +383,29 @@ Sub Step1()
   '' ---- inlet on the left: equilibrium at the driving speed.
   '' ---- outlet on the right: copy the column before it (zero-gradient), so the
   ''      wake leaves instead of reflecting back into the picture.
-  usq = 1.5 * INFLOW * INFLOW
-  cu = 3.0 * INFLOW
+  '' ⭐ THE INLET SWEEPS. A jet that always enters straight settles into a periodic
+  '' wake and, after the flow has crossed once, the picture stops developing - more
+  '' seconds of the same thing. Tilting the incoming stream slowly up and down makes
+  '' it strike the wordmark at a changing angle, so new structures keep being made
+  '' for as long as the video runs, and the field never repeats.
+  '' The sweep is SLOW - a full cycle takes several seconds - so the motion stays
+  '' smooth and reads as a current changing its mind, not as a wobble.
+  vin = INFLOW * (0.86 + 0.14 * Sin(GSweep * 0.55))
+  vinY = INFLOW * 0.42 * Sin(GSweep)
+  usq = 1.5 * (vin * vin + vinY * vinY)
+  cu = 3.0 * vin
+  cuy = 3.0 * vinY
   For j = 1 To NY - 2
     k = NX * j
     g0(k) = W0 * (1.0 - usq)
     g1(k) = W1 * (1.0 + cu + 0.5 * cu * cu - usq)
     g3(k) = W1 * (1.0 - cu + 0.5 * cu * cu - usq)
-    g2(k) = W1 * (1.0 - usq)
-    g4(k) = W1 * (1.0 - usq)
-    g5(k) = W5 * (1.0 + cu + 0.5 * cu * cu - usq)
-    g8(k) = W5 * (1.0 + cu + 0.5 * cu * cu - usq)
-    g6(k) = W5 * (1.0 - cu + 0.5 * cu * cu - usq)
-    g7(k) = W5 * (1.0 - cu + 0.5 * cu * cu - usq)
+    g2(k) = W1 * (1.0 + cuy + 0.5 * cuy * cuy - usq)
+    g4(k) = W1 * (1.0 - cuy + 0.5 * cuy * cuy - usq)
+    g5(k) = W5 * (1.0 + (cu + cuy) + 0.5 * (cu + cuy) * (cu + cuy) - usq)
+    g8(k) = W5 * (1.0 + (cu - cuy) + 0.5 * (cu - cuy) * (cu - cuy) - usq)
+    g6(k) = W5 * (1.0 + (-cu + cuy) + 0.5 * (cu - cuy) * (cu - cuy) - usq)
+    g7(k) = W5 * (1.0 - (cu + cuy) + 0.5 * (cu + cuy) * (cu + cuy) - usq)
     k = (NX - 1) + NX * j
     g0(k) = g0(k - 1) : g1(k) = g1(k - 1) : g2(k) = g2(k - 1)
     g3(k) = g3(k - 1) : g4(k) = g4(k - 1) : g5(k) = g5(k - 1)
@@ -382,6 +419,8 @@ Sub Step1()
     f6(k) = g6(k) : f7(k) = g7(k) : f8(k) = g8(k)
   Next
 
+  GSweep = GSweep + 0.0016      '' a full sweep every ~4000 steps: several seconds
+
   '' ================= the DYE lattice, D2Q5 =================
   '' Advection-diffusion of a passive scalar. The equilibrium is LINEAR in the
   '' velocity - a scalar has no momentum of its own - and it rides the velocity
@@ -389,38 +428,59 @@ Sub Step1()
   '' ⚠️ Run EVERY substep, not once per frame: a vortex needs many small rotations
   '' to wind the dye into a spiral, and one big step per frame cuts the corners so
   '' the spiral never closes.
-  Dim As Double cc, om2, ceq
+  Dim As Double cc, om2, ceq, dvx, dvy
   om2 = 1.0 / TAUC
   For k = 0 To SZ - 1
+    cc = c0(k) + c1(k) + c2(k) + c3(k) + c4(k)
     If solid(k) = 0 Then
-      cc = c0(k) + c1(k) + c2(k) + c3(k) + c4(k)
-      ceq = cc / 3.0
-      c0(k) = c0(k) + om2 * (ceq - c0(k))
-      ceq = cc / 6.0
-      c1(k) = c1(k) + om2 * (ceq * (1.0 + 3.0 * vx(k)) - c1(k))
-      c2(k) = c2(k) + om2 * (ceq * (1.0 + 3.0 * vy(k)) - c2(k))
-      c3(k) = c3(k) + om2 * (ceq * (1.0 - 3.0 * vx(k)) - c3(k))
-      c4(k) = c4(k) + om2 * (ceq * (1.0 - 3.0 * vy(k)) - c4(k))
+      dvx = vx(k) : dvy = vy(k)
+    Else
+      '' inside a letter there is no flow to ride, so the dye is given a gentle
+      '' RISE of its own: the colour climbs into the wordmark from below, which is
+      '' what makes it look like it is being filled rather than painted.
+      dvx = 0.0 : dvy = -SEEP
     End If
+    ceq = cc / 3.0
+    c0(k) = c0(k) + om2 * (ceq - c0(k))
+    ceq = cc / 6.0
+    c1(k) = c1(k) + om2 * (ceq * (1.0 + 3.0 * dvx) - c1(k))
+    c2(k) = c2(k) + om2 * (ceq * (1.0 + 3.0 * dvy) - c2(k))
+    c3(k) = c3(k) + om2 * (ceq * (1.0 - 3.0 * dvx) - c3(k))
+    c4(k) = c4(k) + om2 * (ceq * (1.0 - 3.0 * dvy) - c4(k))
   Next
+  '' ⭐ THE LETTERS BLOCK THE FLOW BUT NOT THE DYE. The momentum lattice bounces
+  '' off them - that is what sheds the vortices - while the dye lattice streams
+  '' straight through, so colour seeps INTO the wordmark instead of stopping at
+  '' its edge. Physically it is a permeable membrane: it shapes the flow without
+  '' being a barrier to what the flow carries.
+  '' ⚠️ Without this the letters could never fill: the counters of e, d and a are
+  '' SEALED cavities, so no amount of flow can reach inside them. That is a fact
+  '' of the geometry, not a tuning problem, and a permeable dye is the only way
+  '' round it that keeps the vortices.
   For j = 1 To NY - 2
     For i = 1 To NX - 2
       k = i + NX * j
-      If solid(k) <> 0 Then
-        h0(k) = 0 : h1(k) = 0 : h2(k) = 0 : h3(k) = 0 : h4(k) = 0
-      Else
-        h0(k) = c0(k)
-        If solid(k - 1) = 0  Then h1(k) = c1(k - 1)  Else h1(k) = c3(k)
-        If solid(k - NX) = 0 Then h2(k) = c2(k - NX) Else h2(k) = c4(k)
-        If solid(k + 1) = 0  Then h3(k) = c3(k + 1)  Else h3(k) = c1(k)
-        If solid(k + NX) = 0 Then h4(k) = c4(k + NX) Else h4(k) = c2(k)
-      End If
+      h0(k) = c0(k)
+      h1(k) = c1(k - 1)
+      h3(k) = c3(k + 1)
+      '' 🐛🐛 THE WALLS STILL BOUNCE THE DYE BACK, even though the LETTERS do not.
+      '' Making the letters permeable removed the reflection EVERYWHERE, walls
+      '' included - and the wall rows are never written by this loop, so they stayed
+      '' at zero and row 1 pulled a zero in on every single step. A steady leak:
+      '' with bands filling the domain the field flattened to one value (the
+      '' "uniform field after 8000 steps" that went unexplained for hours), and with
+      '' the black opening it drained all the way to nothing by fifteen seconds.
+      '' Neither looked like a leak, which is why neither was diagnosed by looking.
+      '' ⭐ What found it was noticing the two failures were the SAME failure: a
+      '' field collapsing to a constant is what conservation loss looks like.
+      If j = 1 Then h2(k) = c4(k) Else h2(k) = c2(k - NX)
+      If j = NY - 2 Then h4(k) = c2(k) Else h4(k) = c4(k + NX)
     Next
   Next
   '' inlet holds the band profile plus the slow drift; outlet copies its neighbour
   For j = 1 To NY - 2
     k = NX * j
-    cc = j / (NY / 2.5) + GPhase
+    cc = DYEMIN + j / (NY / 2.5) + GPhase
     h0(k) = cc / 3.0
     h1(k) = cc / 6.0 : h2(k) = cc / 6.0 : h3(k) = cc / 6.0 : h4(k) = cc / 6.0
     k = (NX - 1) + NX * j
@@ -450,7 +510,8 @@ noRender = ValInt(Environ("DEMO_NORENDER"))
 Dim As Double tSolve, tDraw, tA, tB
 Dim As Integer ss, i0, j0
 Dim As Double dx, dy, sx, sy, phase
-Dim As Integer warm
+Dim As Integer warm, lvl, lv2
+Dim As Double chk, chk2
 
 ffmpegPath = Command(1)
 outFile = Command(2)
@@ -506,8 +567,20 @@ End If
 warm = ValInt(Environ("DEMO_WARM"))
 If warm > 0 Then
   Print "warm-up:"; warm; " LBM steps ..."
+  '' ⚠️ THE WATCHDOG HAS TO COVER THE WARM-UP TOO. It used to run only in the main
+  '' loop, so an instability during eight thousand warm-up steps went unseen and
+  '' the first frame came out uniform - a picture with nothing in it, and no
+  '' explanation. Checked every 500 steps, on the velocity AND on the dye.
   For ss = 1 To warm
     Step1()
+    If (ss Mod 500) = 0 Then
+      chk = f0(SZ \ 2 + NX \ 4) : chk2 = dye(SZ \ 2 + NX \ 4)
+      If (chk <> chk) Or (chk > 1000.0) Or (chk2 <> chk2) Then
+        Print "  UNSTABLE during warm-up at step"; ss
+        Print "  raise TAU (now "; TAU; ") or lower INFLOW (now "; INFLOW; ")"
+        Exit For
+      End If
+    End If
   Next
   Print "  done"
 End If
@@ -530,12 +603,18 @@ Do
   If recording = 1 Then frameBuf = ""
   If noRender = 1 Then GoTo SkipDraw
   '' pass 1: vorticity -> colour index. Two float arrays in, one int array out.
+  '' every cell, letters included: their level is what makes the word emerge
   For k = NX + 1 To SZ - NX - 2
-    '' the phase wraps HERE, at the lookup, never in the carried value
+    '' hue from the phase - which wraps HERE, at the lookup, never in the carried
+    '' value - and brightness from how much dye has arrived, so untouched fluid is
+    '' black and the picture fills in as the flow crosses it.
+    lvl = Int(dye(k) * (7.0 / DYEMIN))
+    If lvl > 7 Then lvl = 7
+    If lvl < 0 Then lvl = 0
     ci = Int((dye(k) - Int(dye(k))) * 512.0)
     If ci < 0 Then ci = 0
     If ci > 511 Then ci = 511
-    cidx(k) = ci
+    cidx(k) = lvl * 512 + ci
   Next
   '' pass 2: the picture.
   '' ⚠️ EVERY cell, border included. An earlier split ran 1..NX-2 and the recorded
@@ -555,7 +634,14 @@ Do
       For i = 0 To NX - 1
         k = i + NX * j
         If solid(k) <> 0 Then
-          row = row + BLACK3
+          '' ⭐ THE WORDMARK APPEARS GRADUALLY, and not by a fade laid over the top:
+          '' it is lit only as far as the dye that has actually seeped INTO it, up
+          '' to its own ceiling. A letter cell the colour has not reached yet is
+          '' level 0 - black, invisible against a black screen - and the word
+          '' emerges stroke by stroke as the flow fills it.
+          lv2 = cidx(k) \ 512
+          If lv2 > LETTERLV Then lv2 = LETTERLV
+          row = row + pal3((cidx(k) And 511) + lv2 * 512)
         Else
           row = row + pal3(cidx(k))
         End If
@@ -567,7 +653,9 @@ Do
       For i = 0 To NX - 1
         k = i + NX * j
         If solid(k) <> 0 Then
-          Line (i * SCALE, j * SCALE)-(i * SCALE + SCALE - 1, j * SCALE + SCALE - 1), 0, BF
+          lv2 = cidx(k) \ 512
+          If lv2 > LETTERLV Then lv2 = LETTERLV
+          Line (i * SCALE, j * SCALE)-(i * SCALE + SCALE - 1, j * SCALE + SCALE - 1), pal((cidx(k) And 511) + lv2 * 512), BF
         Else
           Line (i * SCALE, j * SCALE)-(i * SCALE + SCALE - 1, j * SCALE + SCALE - 1), pal(cidx(k)), BF
         End If
