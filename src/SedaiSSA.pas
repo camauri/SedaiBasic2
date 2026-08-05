@@ -12593,6 +12593,13 @@ begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 1) then Exit;
   for i := 0 to Node.ChildCount - 1 do
   begin
+    // An OMITTED destination ("ScreenInfo w, h, depth,,,,driver_name" - the manual's own example, and
+    // "ScreenInfo w,, d") means "do not report this field". The POSITION is still counted, because it is
+    // what selects the field, so only the assignment is skipped. The parser marks such a slot with a
+    // LITERAL, which is an exact signal here: a literal can never be an assignment target.
+    // (The nil test is belt-and-braces - the parser no longer builds one, and when it did, every AST
+    // pre-pass was one step from the access violation this cost.)
+    if (Node.GetChild(i) = nil) or (Node.GetChild(i).NodeType = antLiteral) then Continue;
     WhichLit := TASTNode.CreateWithValue(antLiteral, i, Node.Token);
     ArgList := TASTNode.Create(antArgumentList, Node.Token);
     ArgList.AddChild(WhichLit);

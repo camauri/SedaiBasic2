@@ -5533,11 +5533,25 @@ begin
   // FreeBASIC SCREENINFO w, h [, depth, bpp, pitch, rate] — writes the screen's info into the variables.
   if Result.NodeType = antScreenInfo then
   begin
-    Result.AddChild(ParseExpression);                            // w variable
+    // Any destination may be left out - "ScreenInfo w, h, depth,,,,driver_name" is the manual's own
+    // example - and the POSITION still counts, because it is what selects the field. A skipped slot used
+    // to reach the AST as a NIL child (ParseExpression returns nil on a bare comma) and every pre-pass
+    // that walks the tree was one step from an access violation; SSA generation took it.
+    // Unlike the graphics statements, the placeholder cannot be a value-carrying 0 - these arguments are
+    // DESTINATIONS and there is nothing to write into a 0. It is a literal all the same, because a
+    // literal can never BE a destination: that makes "is this slot omitted?" an exact test downstream,
+    // with no extra marker to keep in step.
+    if Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+      Result.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Token))
+    else
+      Result.AddChild(ParseExpression);                          // w variable
     while Context.Check(ttSeparParam) do
     begin
       Context.Advance;                                          // ','
-      Result.AddChild(ParseExpression);                         // next variable
+      if Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+        Result.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Token))
+      else
+        Result.AddChild(ParseExpression);                       // next variable
     end;
     DoNodeCreated(Result);
     Exit;
@@ -5584,7 +5598,16 @@ begin
   // [depth], [num_pages]; depth is ignored, num_pages drives page allocation.
   if Result.NodeType = antGfxScreen then
   begin
-    Result.AddChild(ParseExpression);                          // mode
+    // The FIRST argument may be omitted too ("Screen , 0, 1" - fblite's own console page-flip idiom,
+    // gfx/pcopy_cons.bas). The loop below already substitutes a 0 for a later empty slot; the first one
+    // went straight to ParseExpression, which returned NIL, and ProcessGfxScreen took an access
+    // violation on it. The same 0 is not just crash-free but CORRECT here: the VM already reads mode 0
+    // as "no graphics mode change" (it leaves WinW/WinH at 0 and skips SetupGfxScreen), which is exactly
+    // what FreeBASIC means by an omitted mode - keep the current one.
+    if Context.Check(ttSeparParam) then
+      Result.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Token))       // mode omitted
+    else
+      Result.AddChild(ParseExpression);                        // mode
     while Context.Check(ttSeparParam) do
     begin
       Context.Advance;                                         // ','
