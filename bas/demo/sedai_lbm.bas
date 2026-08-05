@@ -65,11 +65,25 @@ Const REC_NX  = 640 : Const REC_NY  = 360 : Const REC_SCALE  = 3   '' 1920x1080 
 '' the Reynolds number - more vortices, shed faster, and thinner shear layers.
 '' ⚠️ It is also half the distance to the 0.5 cliff. The NaN watchdog at the foot
 '' of the loop is the thing that says so instead of showing a black frame.
-Const TAU    = 0.515
+'' Back to 0.53 from 0.515. Raising TAUC alone did not stop the divergence, and
+'' the two runs blew up at the SAME frame with different dye settings - which says
+'' the dye was inheriting the failure, not causing it. The dye equilibrium is built
+'' from vx and vy, so one corner of the FLOW going bad explodes the colour
+'' instantly, and the colour is the only thing on screen.
+'' ⭐ The clue was the coincidence of the frame number, not the magnitude.
+Const TAU    = 0.53
 '' Relaxation of the DYE lattice. Diffusivity is (TAUC - 0.5)/3, so this close to
 '' 0.5 the dye barely diffuses at all and the spiral arms survive. Lower is
 '' sharper and, as always here, closer to the stability cliff.
-Const TAUC   = 0.51
+'' 0.56, up from 0.51. omega = 1/TAUC was 1.96 against a hard limit of 2, and a
+'' BGK lattice that close OVERSHOOTS on a sharp front - the sharpest one here being
+'' the opening itself, the boundary between black and colour. Measured: the dye
+'' went negative at frame 25 and kept going, -0.016 then -0.48, until it diverged
+'' outright at frame 275 (min -9.2e98). The video went black because a negative
+'' concentration reads as black.
+'' 0.56 gives omega = 1.79 and six times the diffusivity: filaments a little
+'' softer, and a scheme that stays inside its own limits.
+Const TAUC   = 0.56
 '' How fast the dye climbs inside a letter. Negative y is upward on screen.
 '' Gentler than the first try: a strong seep pushed dye across the wall faster
 '' than the flow could carry it away, which is what speckled the letter edges.
@@ -511,6 +525,7 @@ Dim As Double tSolve, tDraw, tA, tB
 Dim As Integer ss, i0, j0
 Dim As Double dx, dy, sx, sy, phase
 Dim As Integer warm, lvl, lv2
+Dim As Double dmin, dmax, umax
 Dim As Double chk, chk2
 
 ffmpegPath = Command(1)
@@ -672,11 +687,45 @@ Do
     key = InKey
   End If
 
-  '' ---- NaN watchdog: LBM can diverge, and a black screen would not say why.
-  If (fr Mod 60) = 0 Then
-    rho = f0(SZ \ 2 + NX \ 4)
-    If (rho <> rho) Or (rho > 1000.0) Then
-      Print "UNSTABLE at frame"; fr; " - raise TAU (now "; TAU; ") or lower INFLOW (now "; INFLOW; ")"
+  '' ---- DYE RANGE. A BGK lattice relaxed this close to omega = 2 can overshoot
+  '' into NEGATIVE concentration, and a negative dye reads as black - which is
+  '' exactly what a collapsing picture looks like from outside. Reported so the
+  '' cause is measured rather than guessed at.
+  If ValInt(Environ("DEMO_DYE")) = 1 And (fr Mod 25) = 0 Then
+    dmin = 1e30 : dmax = -1e30
+    For k = 0 To SZ - 1
+      If dye(k) < dmin Then dmin = dye(k)
+      If dye(k) > dmax Then dmax = dye(k)
+    Next
+    Print "  frame"; fr; "  dye min="; dmin; " max="; dmax
+  End If
+
+  '' ---- WATCHDOG. It used to sample ONE CELL every sixty frames, and missed a
+  '' divergence that had been building since frame 25 - a check that narrow is
+  '' theatre. It now scans the whole dye field, which is where the instability
+  '' shows up first, and reports the SIGN as well as the magnitude: a negative
+  '' concentration is not a rounding artefact, it is the scheme overshooting.
+  If (fr Mod 20) = 0 Then
+    dmin = 1e30 : dmax = -1e30
+    For k = 0 To SZ - 1
+      If dye(k) < dmin Then dmin = dye(k)
+      If dye(k) > dmax Then dmax = dye(k)
+    Next
+    '' scan the FLOW too, and say WHICH lattice went first: the dye inherits the
+    '' flow's failure, so reporting only the dye names the victim and not the cause
+    umax = 0
+    For k = 0 To SZ - 1
+      If Abs(vx(k)) > umax Then umax = Abs(vx(k))
+      If Abs(vy(k)) > umax Then umax = Abs(vy(k))
+    Next
+    If (umax <> umax) Or (umax > 0.6) Then
+      Print "UNSTABLE at frame"; fr; ": the FLOW lattice, max|u|="; umax
+      Print "  raise TAU (now "; TAU; ") or lower INFLOW (now "; INFLOW; ")"
+      Exit Do
+    End If
+    If (dmax <> dmax) Or (dmax > 1e6) Or (dmin < -1.0) Then
+      Print "UNSTABLE at frame"; fr; ": the DYE lattice, min="; dmin; " max="; dmax
+      Print "  raise TAUC (now "; TAUC; ")   [flow is fine: max|u|="; umax; "]"
       Exit Do
     End If
   End If
