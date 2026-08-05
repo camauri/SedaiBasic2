@@ -1939,13 +1939,45 @@ begin
       // offset / managed handle is reinterpreted, not changed — the receiving variable's declared type
       // drives the deref). A scalar target type converts the value to that bank.
       ArrName2 := UpperCase(VarToStr(Node.Value));
+      // "Cast(T, u)" where u is a UDT that declares "Operator Cast() As T" must go THROUGH that
+      // operator - it is the whole point of declaring one, and the manual's example prints the
+      // operator's own trace line to prove it ran.
+      // ⚠️ Every IMPLICIT conversion already did this ("Print u", "Dim As Integer k = u",
+      // "Dim As String s = u" were all correct); only the EXPLICIT spelling fell through to the value
+      // conversion below and answered 1 - the record handle, read as a number. The two helpers were
+      // already here and already used by the implicit paths; this reaches them from the one place that
+      // did not, rather than adding a second way to invoke a cast operator.
+      // (A pointer target is a reinterpretation, never a conversion, so it never consults the operator.)
+      if FModernMode and
+         ((Length(ArrName2) < 4) or (Copy(ArrName2, Length(ArrName2) - 3, 4) <> ' PTR')) then
+      begin
+        if (ArrName2 = 'STRING') and TryEmitUDTCastToString(Node.GetChild(0), Left) then
+        begin
+          Result := Left;
+          Exit;
+        end;
+        if (ArrName2 <> 'STRING') and TryEmitUDTCastToNumber(Node.GetChild(0), Left) then
+        begin
+          if (ArrName2 = 'DOUBLE') or (ArrName2 = 'SINGLE') then Result := EnsureFloatRegister(Left)
+          else Result := EnsureIntRegister(Left);
+          Exit;
+        end;
+      end;
       ProcessExpression(Node.GetChild(0), Left);
       if (Length(ArrName2) >= 4) and (Copy(ArrName2, Length(ArrName2) - 3, 4) = ' PTR') then
         Result := EnsureIntRegister(Left)                   // pointer cast: value passthrough
-      else if (ArrName2 = 'DOUBLE') or (ArrName2 = 'SINGLE') then
+      else if (ArrName2 = 'DOUBLE') then
         Result := EnsureFloatRegister(Left)
+      else if (ArrName2 = 'SINGLE') then
+        // SINGLE is a NARROWING too - round to single precision, as an assignment to a Single does.
+        Result := ApplyNarrowCode(TypeNameWidthCode(ArrName2), EnsureFloatRegister(Left))
       else
-        Result := EnsureIntRegister(Left);                  // scalar int conversion (truncates float)
+        // "Cast(Byte, &h0080)" is -128, not 128: casting to a narrow type WRAPS, exactly as CByte does
+        // and as a store into a Byte-typed variable does. Only this spelling was missing it - the CXxx
+        // functions and the assignment path both went through ApplyNarrowCode already, so a program got
+        // one answer from "CByte(x)" and another from "Cast(Byte, x)". Width code 0 (Integer, LongInt,
+        // an unknown name) leaves the value alone, which is what the line below used to do for everything.
+        Result := ApplyNarrowCode(TypeNameWidthCode(ArrName2), EnsureIntRegister(Left));
     end;
 
     antDeref:
@@ -18873,6 +18905,16 @@ begin
       end;
     antParentheses:
       if Node.ChildCount >= 1 then Result := PrintKindOfExpr(Node.GetChild(0));
+    antCast:
+      // "Cast(UByte, -1)" is 255 with NO leading sign space: the cast gives the value an UNSIGNED type,
+      // and FreeBASIC drops the sign column for unsigned types. Kind 3, not 2 - a narrow unsigned
+      // promotes to a SIGNED expression in FreeBASIC and must not reach the unsigned-64 compare/div/mod
+      // opcodes. Same rule, and the same width codes, as the UByte/UShort/ULong cases above.
+      if FModernMode then
+      begin
+        AwCode := TypeNameWidthCode(UpperCase(VarToStr(Node.Value)));
+        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
+      end;
     antLiteral:
       // FreeBASIC gives a DECIMAL integer literal the first type on the ladder Long -> ULong -> LongInt ->
       // ULongInt that holds it, so a literal in [2^31, 2^32-1] is a ULONG -- and an unsigned prints with NO
