@@ -533,6 +533,24 @@ begin
   end;
 end;
 
+function UnquotePPMessage(const S: string): string;
+// A "#print" message that is EXACTLY one string literal prints as its content: fbc shows
+//   #print "quoted"      -> quoted
+//   #print #arg          -> whatever arg expanded to, unquoted
+// and the second is the whole point of stringizing an argument to look at it. Anything else - a bare
+// word, a literal with something after it, an unterminated quote - is echoed verbatim, because then
+// the quotes are part of what the author wrote rather than a wrapper the expansion put on.
+// Escaped quotes inside are left alone: fbc does not process escapes here either.
+var
+  T: string;
+begin
+  Result := S;
+  T := Trim(S);
+  if (Length(T) >= 2) and (T[1] = '"') and (T[Length(T)] = '"') and
+     (Pos('"', Copy(T, 2, Length(T) - 2)) = 0) then
+    Result := Copy(T, 2, Length(T) - 2);
+end;
+
 // Parse a "#name rest" directive line: returns the lowercase directive name and the trimmed rest.
 procedure SplitDirective(const Line: string; out Name, Rest: string);
 var
@@ -1509,8 +1527,12 @@ var
             // #print msg — emit a compile-time diagnostic (macro-expanded) to stderr. The message is
             // the rest of the line VERBATIM, trailing blanks included: fbc echoes exactly what was
             // written, and "#print Release mode " really does end in a space.
-            WriteLn(StdErr, SubstituteMacros(TrimRight(DRest) +
-                            Copy(Raw, Length(TrimRight(Raw)) + 1, MaxInt), Defs, FnDefs, 0))
+            // ...but when what is left after expansion is a single STRING LITERAL, fbc prints its
+            // CONTENT, not the quotes. That is what makes "#print #arg" - the standard way to see what
+            // a macro argument expanded to - readable: stringizing adds the quotes, and #print takes
+            // them back off. We echoed them, so every such line differed from fbc by two characters.
+            WriteLn(StdErr, UnquotePPMessage(SubstituteMacros(TrimRight(DRest) +
+                            Copy(Raw, Length(TrimRight(Raw)) + 1, MaxInt), Defs, FnDefs, 0)))
           else if (DName = 'error') and Emitting then
             // #error msg — abort compilation with a macro-expanded diagnostic.
             raise EPreprocessorError.Create(Trim(SubstituteMacros(DRest, Defs, FnDefs, 0)))
