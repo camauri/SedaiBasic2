@@ -40,7 +40,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 529 {$IFDEF WEB_MODE} + 12 {$ENDIF};
+  OPCODE_LIST_COUNT = 530 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1: bcGfxDrawString
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -118,7 +118,7 @@ const
     bcGfxScreen, bcMultikey, bcGetmouse, bcMouseAxis, bcSetmouse, bcGetJoystick,
     bcJoyBtn, bcJoyAxis, bcStick, bcStrig, bcGfxDrawGML, bcGfxPointCoord,
     bcGfxCircleEx, bcGfxPaintBorder, bcGfxSetTarget, bcGfxLineStyled, bcGfxScreenPtr, bcScnClr,
-  bcGfxImageConvertRow, bcRegexCount, bcRegexReplace,
+  bcGfxImageConvertRow, bcGfxDrawString, bcRegexCount, bcRegexReplace,
     bcSoundVol, bcSoundSound, bcSoundEnvelope, bcSoundTempo, bcSoundPlay, bcSoundFilter,
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
     bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
@@ -155,15 +155,18 @@ const
   {$IFDEF WEB_MODE}
   // group 8 (web, subs 1..12) inserts a 13-slot block, shifting graphics/sound/super up by 13.
   DENSE_WEB_BASE      = 397;  // 395..407 (12 used, slot 0 a hole)
-  DENSE_GRAPHICS_BASE = 410;  // group 10 (65)          -> 408..472
-  DENSE_SOUND_BASE    = 475;  // group 11 (6)           -> 473..478
-  DENSE_SUPER_BASE    = 481;  // group 200 (256 slots)  -> 479..734
-  DENSE_TOTAL         = 737;  // N (with web)
+  // bcGfxDrawString made group 10 one wider (65 -> 66), which pushes SOUND, SUPER and TOTAL up by one
+  // in BOTH branches. Nothing checks these at compile time; `sb --verify-opcodes` is what says so, and
+  // it did - immediately, with "sound=463/462 super=469/468 N=725/724".
+  DENSE_GRAPHICS_BASE = 410;  // group 10 (66)          -> 408..473
+  DENSE_SOUND_BASE    = 476;  // group 11 (6)           -> 474..479
+  DENSE_SUPER_BASE    = 482;  // group 200 (256 slots)  -> 480..735
+  DENSE_TOTAL         = 738;  // N (with web)
   {$ELSE}
-  DENSE_GRAPHICS_BASE = 397;  // group 10 (65)          -> 395..459
-  DENSE_SOUND_BASE    = 462;  // group 11 (6)           -> 460..465
-  DENSE_SUPER_BASE    = 468;  // group 200 (256 slots)  -> 466..721 (58 used, 198 holes)
-  DENSE_TOTAL         = 724;  // N
+  DENSE_GRAPHICS_BASE = 397;  // group 10 (66)          -> 395..460
+  DENSE_SOUND_BASE    = 463;  // group 11 (6)           -> 461..466
+  DENSE_SUPER_BASE    = 469;  // group 200 (256 slots)  -> 467..722 (58 used, 198 holes)
+  DENSE_TOTAL         = 725;  // N
   {$ENDIF}
 
 var

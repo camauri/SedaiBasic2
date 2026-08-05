@@ -417,6 +417,7 @@ begin
     ssaGfxScreenRes: Result := bcGfxScreenRes;
     ssaGfxPset: Result := bcGfxPset;
     ssaGfxDrawGML: Result := bcGfxDrawGML;
+    ssaGfxDrawString: Result := bcGfxDrawString;
     ssaGfxPointCoord: Result := bcGfxPointCoord;
     ssaGfxPoint: Result := bcGfxPoint;
     ssaConScreen: Result := bcConScreen;
@@ -1545,6 +1546,28 @@ begin
       BCInstr.Immediate := BCInstr.Immediate or
         ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[3].Value.RegType,
           Instr.PhiSources[3].Value.RegIndex, Instr.PhiSources[3].Value.Version)) and $FFFF) shl 48);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // DRAW STRING: Src1 = the text (string reg), Src2 = x; Immediate packs y (PhiSources[0], bits 0-15)
+  // and the colour ([1], 16-31) - the same packing bcGfxCircleEx uses just above.
+  if Instr.OpCode = ssaGfxDrawString then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcGfxDrawString, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    BCInstr.Immediate := 0;
+    if (Length(Instr.PhiSources) >= 1) and (Instr.PhiSources[0].Value.Kind = svkRegister) then       // y
+      BCInstr.Immediate := BCInstr.Immediate or
+        (Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+          Instr.PhiSources[0].Value.RegIndex, Instr.PhiSources[0].Value.Version)) and $FFFF);
+    if (Length(Instr.PhiSources) >= 2) and (Instr.PhiSources[1].Value.Kind = svkRegister) then       // colour
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
+          Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FFFF) shl 16);
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;

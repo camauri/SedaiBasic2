@@ -639,7 +639,9 @@ begin
       DENSE_WEB_BASE + 0 .. DENSE_WEB_BASE + 12:
         begin Ctx.PC := CurPC; ExecuteWebOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
       {$ENDIF}
-      DENSE_GRAPHICS_BASE + 0 .. DENSE_GRAPHICS_BASE + 64:
+      // ⚠️ 65, not 64: bcGfxDrawString. This range has NO compile-time check of any kind - leave it too
+      // narrow and everything builds, then the program dies at run time with "Unknown/illegal opcode".
+      DENSE_GRAPHICS_BASE + 0 .. DENSE_GRAPHICS_BASE + 65:
         begin Ctx.PC := CurPC; ExecuteGraphicsOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
       DENSE_SOUND_BASE + 0 .. DENSE_SOUND_BASE + 5:
         begin Ctx.PC := CurPC; ExecuteSoundOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;

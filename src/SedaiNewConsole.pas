@@ -33,7 +33,7 @@ uses
   // (no static SDL2.dll import in headless sb); types/constants keep coming from the bindings.
   Classes, SysUtils, Variants, Math, SDL2, SDL2_ttf, SedaiSDL2Dyn, TypInfo,
   SedaiOutputInterface, SedaiGraphicsModes, SedaiGraphicsTypes,
-  SedaiGraphicsMemory, SedaiGraphicsPrimitives, SedaiGraphicsBackend,
+  SedaiGraphicsMemory, SedaiGraphicsPrimitives, SedaiGraphicsBackend, SedaiGfxFont,
   SedaiInputState,
   SedaiProgramMemory, SedaiAST, SedaiParserTypes,
   SedaiCommandRouter, SedaiCommandTypes,
@@ -329,6 +329,9 @@ type
     procedure GBFill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     procedure GBSetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);
     procedure GBBlit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);
+    procedure GBDrawText(Surface: TGfxSurface; X, Y: Integer; const S: string; FG, BG: TGfxColor; Opaque: Boolean);
+    procedure GBSetTextColors(FG, BG: TGfxColor);
+    procedure GBGetTextColors(out FG, BG: TGfxColor);
     procedure GBEnablePalette(Enable: Boolean);
     procedure GBSetPaletteColor(Index: TPaletteIndex; Color: TGfxColor);
     function  GBGetPaletteColor(Index: TPaletteIndex): TGfxColor;
@@ -355,6 +358,9 @@ type
     procedure IGraphicsBackend.Fill = GBFill;
     procedure IGraphicsBackend.SetClip = GBSetClip;
     procedure IGraphicsBackend.Blit = GBBlit;
+    procedure IGraphicsBackend.DrawText = GBDrawText;
+    procedure IGraphicsBackend.SetTextColors = GBSetTextColors;
+    procedure IGraphicsBackend.GetTextColors = GBGetTextColors;
     procedure IGraphicsBackend.EnablePalette = GBEnablePalette;
     procedure IGraphicsBackend.SetPaletteColor = GBSetPaletteColor;
     function  IGraphicsBackend.GetPaletteColor = GBGetPaletteColor;
@@ -839,6 +845,7 @@ type
     FConsoleOutputAdapter: TConsoleOutputAdapter;
     FRunning: Boolean;
     FCursorVisible: Boolean;
+    FGfxTextFG, FGfxTextBG: TGfxColor;   // COLOR fg,bg - what PRINT draws with in a graphics mode
     FCursorEnabled: Boolean;       // False = cursor suppressed (during VM execution)
     FLastCursorBlink: Cardinal;
     FInputHistory: array of string;
@@ -3886,6 +3893,45 @@ begin
   M := GBImageMem(Surface);
   if Assigned(M) then M.SetPixel(X, Y, Color)
   else SetPixel(X, Y, Color);   // screen (texture repainted by the render poll)
+end;
+
+procedure TVideoController.GBSetTextColors(FG, BG: TGfxColor);
+begin
+  FGfxTextFG := FG; FGfxTextBG := BG;
+end;
+
+procedure TVideoController.GBGetTextColors(out FG, BG: TGfxColor);
+begin
+  FG := FGfxTextFG; BG := FGfxTextBG;
+end;
+
+procedure TVideoController.GBDrawText(Surface: TGfxSurface; X, Y: Integer; const S: string;
+  FG, BG: TGfxColor; Opaque: Boolean);
+// The same 8x8 blitter as the software backend, and deliberately routed through GBSetPixel rather than
+// reimplemented: on sbv the screen is not a plain TGraphicsMemory (it is the surface the render poll
+// uploads), so writing the pixels through the one method that already knows the difference is what keeps
+// text and lines landing on the same surface.
+var
+  i, Col, Row: Integer;
+  G: TGfxGlyph;
+  Bits: Byte;
+  PenX: Integer;
+begin
+  PenX := X;
+  for i := 1 to Length(S) do
+  begin
+    G := GfxGlyph(Byte(S[i]));
+    for Row := 0 to GFX_FONT_H - 1 do
+    begin
+      Bits := G[Row];
+      for Col := 0 to GFX_FONT_W - 1 do
+        if (Bits and (1 shl (7 - Col))) <> 0 then
+          GBSetPixel(Surface, PenX + Col, Y + Row, FG)
+        else if Opaque then
+          GBSetPixel(Surface, PenX + Col, Y + Row, BG);
+    end;
+    Inc(PenX, GFX_FONT_W);
+  end;
 end;
 
 function TVideoController.GBSurfaceData(Surface: TGfxSurface; out Data: PByte; out SizeBytes: Integer): Boolean;

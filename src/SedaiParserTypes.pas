@@ -217,6 +217,7 @@ type
     antGfxPaint,          // PAINT (x, y) [, color] (FreeBASIC graphics, flood fill)
     antGfxLine,           // LINE (x1,y1)-(x2,y2) [,color] [,B|BF] (FreeBASIC graphics)
     antGfxCircle,         // CIRCLE (x, y), r [, color] (FreeBASIC graphics)
+    antGfxDrawString,     // DRAW STRING [img,] (x,y), text [,colour] (FreeBASIC; built-in 8x8 font)
     antPalette,           // PALETTE [GET] [index, r, g, b] (FreeBASIC; OP attribute = SET/GET/RESET)
     antGfxColor,          // COLOR [fg][,bg] (FreeBASIC graphics draw colour; HASFG/HASBG attributes)
     antImageDestroy,      // IMAGEDESTROY handle (FreeBASIC)

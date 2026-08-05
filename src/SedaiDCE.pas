@@ -377,7 +377,7 @@ begin
     ssaGraphicSetMode, ssaGraphicBox, ssaGraphicCircle, ssaGraphicDraw, ssaGraphicLocate,
     ssaGraphicColor, ssaSetColor, ssaGraphicWidth, ssaGraphicScale, ssaGraphicPaint, ssaGraphicWindow,
     ssaGraphicSShape, ssaGraphicGShape, ssaGraphicGList, ssaPLoad, ssaPSave, ssaPRst, ssaScnClr,
-    ssaGfxScreenRes, ssaGfxPset, ssaGfxPaint, ssaGfxPaintBorder, ssaGfxSetTarget, ssaGfxLine, ssaGfxLineStyled, ssaGfxCircle, ssaGfxCircleEx, ssaGfxDrawGML,
+    ssaGfxScreenRes, ssaGfxPset, ssaGfxPaint, ssaGfxPaintBorder, ssaGfxSetTarget, ssaGfxLine, ssaGfxLineStyled, ssaGfxCircle, ssaGfxCircleEx, ssaGfxDrawGML, ssaGfxDrawString,
     ssaGfxPalette, ssaGfxPaletteReset, ssaGfxColor,
     ssaGfxImageCreate, ssaGfxImageDestroy, ssaGfxGet, ssaGfxPut, ssaGfxImageConvertRow,
     ssaGfxScreenSet, ssaGfxPCopy, ssaGfxWindow, ssaGfxView, ssaGfxScreen,

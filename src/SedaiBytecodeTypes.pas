@@ -771,6 +771,15 @@ const
   //   Src1 = src address reg, Src2 = dst address reg
   //   Immediate[0-15] = src_bpp reg, [16-31] = dst_bpp reg, [32-47] = width reg, [48-63] = isrgb reg
   bcGfxImageConvertRow = bcGroupGraphics + 64;
+  // DRAW STRING [img,] (x,y), text [,colour] : blit text into the surface with the built-in 8x8 font.
+  //   Src1 = text (STRING reg), Src2 = x; Immediate[0-15] = y reg, [16-31] = colour reg
+  // ⚠️ y and colour are PACKED, not put in Src3, and that is not a stylistic choice: the register
+  // compactor has no Src3 classifier at all (zero references to Instr.Src3 in the whole unit), so a
+  // register parked there would never be marked used and never be remapped - it would survive every
+  // test that does not run compaction and break under the one that does. The Immediate packing is the
+  // mechanism the compactor already understands, and bcGfxCircleEx / bcGfxLineStyled already use it.
+  // The image target rides on the bcGfxSetTarget pair, so there is no surface operand.
+  bcGfxDrawString   = bcGroupGraphics + 65;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -2203,6 +2212,7 @@ begin
         61: Result := 'GfxSetTarget';
         62: Result := 'GfxLineStyled';
         64: Result := 'GfxImageConvertRow';
+        65: Result := 'GfxDrawString';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

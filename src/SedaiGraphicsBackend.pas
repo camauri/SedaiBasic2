@@ -35,7 +35,7 @@ interface
 
 uses
   Classes, SysUtils,
-  SedaiOutputInterface, SedaiGraphicsMemory, SedaiGraphicsPrimitives;
+  SedaiOutputInterface, SedaiGraphicsMemory, SedaiGraphicsPrimitives, SedaiGfxFont;
 
 type
   TGfxSurface = Integer;   // 0 = screen; >0 = image buffers (IMAGECREATE — deferred to phase 2/G3)
@@ -76,6 +76,20 @@ type
     procedure FillBorder(Surface: TGfxSurface; X, Y: Integer; Color, BorderColor: TGfxColor);  // boundary fill (PAINT ...,border)
     procedure SetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);  // VIEW clip rect
     procedure Blit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);  // accelerable; deferred to G3
+    // Text INTO the drawing surface, from the built-in 8x8 font (SedaiGfxFont). X,Y is the TOP-LEFT of
+    // the first cell, in pixels - not a text row/column - because that is what DRAW STRING means and
+    // what PRINT in a graphics mode has to be reduced to.
+    // Opaque = paint BG behind every cell (what PRINT does, so a line overwrites what it lands on);
+    // otherwise only the set bits are touched and the background shows through (what DRAW STRING does).
+    // CPU-everywhere, like SetPixel: it is a per-pixel operation on the surface that POINT must read
+    // back, so it may never live only on a GPU.
+    procedure DrawText(Surface: TGfxSurface; X, Y: Integer; const S: string; FG, BG: TGfxColor; Opaque: Boolean);
+    // The colours PRINT draws with inside a graphics mode ("COLOR fg, bg"). They live HERE, on the
+    // backend, because that is the one thing the VM and the text output device both hold: the VM owns
+    // the COLOR statement, the device owns PRINT, and under CORBA interfaces neither can be cast back
+    // to a class the other could talk to. A shared blackboard beats a new global.
+    procedure SetTextColors(FG, BG: TGfxColor);
+    procedure GetTextColors(out FG, BG: TGfxColor);
     // --- palette ---
     procedure EnablePalette(Enable: Boolean);
     procedure SetPaletteColor(Index: TPaletteIndex; Color: TGfxColor);
@@ -90,6 +104,7 @@ type
   private
     FScreen: TGraphicsMemory;
     FInGraphics: Boolean;
+    FTextFG, FTextBG: TGfxColor;   // COLOR fg,bg - what PRINT draws with in a graphics mode
     FImages: array of TGraphicsMemory;   // image surfaces; id = index+1, 0 = screen
     function ValidScreen: Boolean; inline;
     function MemoryOf(Surface: TGfxSurface): TGraphicsMemory;   // screen (0) or image (>0), nil if invalid
@@ -118,6 +133,9 @@ type
     procedure FillBorder(Surface: TGfxSurface; X, Y: Integer; Color, BorderColor: TGfxColor);
     procedure SetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);
     procedure Blit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);
+    procedure DrawText(Surface: TGfxSurface; X, Y: Integer; const S: string; FG, BG: TGfxColor; Opaque: Boolean);
+    procedure SetTextColors(FG, BG: TGfxColor);
+    procedure GetTextColors(out FG, BG: TGfxColor);
     procedure EnablePalette(Enable: Boolean);
     procedure SetPaletteColor(Index: TPaletteIndex; Color: TGfxColor);
     function  GetPaletteColor(Index: TPaletteIndex): TGfxColor;
@@ -284,6 +302,49 @@ var M: TGraphicsMemory;
 begin
   M := MemoryOf(Surface);
   if Assigned(M) then Result := M.GetPixel(X, Y) else Result := 0;
+end;
+
+procedure TSoftwareGraphicsBackend.SetTextColors(FG, BG: TGfxColor);
+begin
+  FTextFG := FG; FTextBG := BG;
+end;
+
+procedure TSoftwareGraphicsBackend.GetTextColors(out FG, BG: TGfxColor);
+begin
+  FG := FTextFG; BG := FTextBG;
+end;
+
+procedure TSoftwareGraphicsBackend.DrawText(Surface: TGfxSurface; X, Y: Integer; const S: string;
+  FG, BG: TGfxColor; Opaque: Boolean);
+// The whole of the font blitter: eight rows of eight bits, per character, straight onto the surface.
+// Built on SetPixel rather than on a row-blit into the memory buffer on purpose - SetPixel is where the
+// clipping rectangle (VIEW) and the bounds checks already live, so text is clipped by exactly the same
+// rule as a line, with no second implementation of that rule to keep in step.
+var
+  M: TGraphicsMemory;
+  i, Col, Row: Integer;
+  G: TGfxGlyph;
+  Bits: Byte;
+  PenX: Integer;
+begin
+  M := MemoryOf(Surface);
+  if not Assigned(M) then Exit;
+  PenX := X;
+  for i := 1 to Length(S) do
+  begin
+    G := GfxGlyph(Byte(S[i]));
+    for Row := 0 to GFX_FONT_H - 1 do
+    begin
+      Bits := G[Row];
+      for Col := 0 to GFX_FONT_W - 1 do
+        // MSB is the LEFTMOST pixel; see the note on the glyph form in SedaiGfxFont.
+        if (Bits and (1 shl (7 - Col))) <> 0 then
+          M.SetPixel(PenX + Col, Y + Row, FG)
+        else if Opaque then
+          M.SetPixel(PenX + Col, Y + Row, BG);
+    end;
+    Inc(PenX, GFX_FONT_W);
+  end;
 end;
 
 procedure TSoftwareGraphicsBackend.DrawLine(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; LineWidth: Integer);

@@ -596,12 +596,20 @@ begin
     // commands (GRAPHIC/BOX/CIRCLE/COLOR/SETCOLOR/PAINT...) render into the same surface the window
     // shows — not just the FreeBASIC graphics. Viewport-only (no text-on-graphics / sprites).
     if Assigned(GTermCtrl) then GTermCtrl.AttachGraphicsMemory(SW.ScreenMemory);
+    // ...and the backend itself, so PRINT inside a FreeBASIC graphics mode lands on that same surface.
+    if Assigned(GTermCtrl) then GTermCtrl.AttachGraphicsBackend(SW);
     GPresenter := TWindowPresenter.Create(SW, 'SedaiBasic');
     AVM.EventPollCallback := @GPresenter.Pump;   // present + pump events during execution
     Exit;
   end;
   {$ENDIF}
   AVM.UseSoftwareGraphics;
+  // The headless default path. In FreeBASIC a graphics mode has NO separate text plane - the console IS
+  // the framebuffer - so the text device has to be told which surface to mirror PRINT onto. Without
+  // this, every gfx example that only PRINTS left the screen blank, and nothing said so.
+  // Wired HERE, where both sides are concrete: an IOutputDevice cannot be cast back to its class under
+  // CORBA interfaces, which is why AttachGraphicsMemory above is done the same way.
+  if Assigned(GTermCtrl) then GTermCtrl.AttachGraphicsBackend(AVM.GraphicsBackend);
 end;
 
 // After the program ends: keep the window open until the user closes it, then tear it down.

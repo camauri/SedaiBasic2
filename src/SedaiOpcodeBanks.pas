@@ -141,6 +141,7 @@ begin
     bcLoad, bcSave, bcVerify, bcBload, bcBsave, bcCatalog,
     bcCopyFile, bcScratch, bcRenameFile, bcConcat, bcMkdir, bcChdir, bcRmdir, bcMoveFile,
     bcGfxDrawGML, // DRAW "..." - Src1 = GML string
+    bcGfxDrawString, // DRAW STRING (x,y),text - Src1 = the TEXT (string); x/y/colour are int regs
     bcStrFormat, // FORMAT(num, mask) - Src1 = mask string
     bcDirSearch, // DIR(spec, mask) - Src1 = the file spec (string; unused by the CONTINUE form)
 

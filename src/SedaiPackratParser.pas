@@ -5183,7 +5183,22 @@ begin
       Result := TASTNode.Create(antCircle, Token);
   end
   else if CmdName = 'DRAW' then
-    Result := TASTNode.Create(antDraw, Token)
+  begin
+    // "DRAW STRING ..." is a different statement from DRAW, not a variant of it: FreeBASIC's text blit
+    // versus Commodore's coordinate/TO form. Decided on the very next word, before either grammar runs.
+    // MODERN only - v7 has no DRAW STRING, and a CLASSIC program is entitled to a variable called
+    // STRING no more than a MODERN one is, but the dialect gate keeps the two decisions apart.
+    if FModernMode and Assigned(Context.PeekNext) and
+       (UpperCase(VarToStr(Context.PeekNext.Value)) = 'STRING') then
+    begin
+      Result := TASTNode.Create(antGfxDrawString, Token);
+      // Consume DRAW here; the shared Advance below this if-chain then consumes STRING, so both words
+      // are gone by the time the argument grammar runs. Two words, two advances - one of them borrowed.
+      Context.Advance;
+    end
+    else
+      Result := TASTNode.Create(antDraw, Token);
+  end
   else if CmdName = 'LOCATE' then
     Result := TASTNode.Create(antLocate, Token)
   else if CmdName = 'COLOR' then
@@ -5325,6 +5340,59 @@ begin
       end;
     end;
     if Assigned(TargetNode) then   // image draw target appended last (TARGETIDX = its child index)
+    begin
+      Result.Attributes.Values['TARGETIDX'] := IntToStr(Result.ChildCount);
+      Result.AddChild(TargetNode);
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
+  // FreeBASIC DRAW STRING [img,] [STEP] (x, y), text [, colour] : text drawn INTO the surface with the
+  // built-in 8x8 font. Nothing about it is the Commodore DRAW, which is a coordinate/TO form, so it is
+  // taken here before that grammar sees the line.
+  // ⚠️ Until now the word STRING after DRAW was simply not looked for: "Draw String img,(x,y),s" was a
+  // syntax error and "Draw String (x,y),s,c" was ACCEPTED AND DREW NOTHING - the framebuffer checksum
+  // was identical before and after. That silence is what produced an empty logo mask during the demo
+  // work, and what kept a tick in BASIC.md the statement had not earned.
+  if (Result.NodeType = antGfxDrawString) then
+  begin
+    // Image draw target: "Draw String img, (x,y), s". Same convention as PSET/CIRCLE - appended last,
+    // its index in TARGETIDX - so it rides on the existing SetTarget pair with nothing new to lower.
+    if (not Context.Check(ttDelimParOpen)) and (UpperCase(Context.CurrentToken.Value) <> kSTEP) then
+    begin
+      TargetNode := ParseExpression;                              // image handle
+      if Context.Check(ttSeparParam) then Context.Advance;        // ','
+    end;
+    if UpperCase(Context.CurrentToken.Value) = kSTEP then
+    begin
+      Result.Attributes.Values['STEP'] := '1';
+      Context.Advance;                                            // STEP
+    end;
+    if Context.Check(ttDelimParOpen) then Context.Advance;        // '('
+    Result.AddChild(ParseExpression);                             // x
+    if Context.Check(ttSeparParam) then Context.Advance;          // ','
+    Result.AddChild(ParseExpression);                             // y
+    if Context.Check(ttDelimParClose) then Context.Advance;       // ')'
+    if Context.Check(ttSeparParam) then Context.Advance;          // ','
+    Result.AddChild(ParseExpression);                             // the text
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;                                            // ','
+      Result.AddChild(ParseExpression);                           // colour
+    end;
+    // A trailing font argument ("...,, font") is accepted and ignored: we have ONE built-in font, and
+    // declining the line would be worse than drawing it in the only face we have.
+    while Context.Check(ttSeparParam) do
+    begin
+      Context.Advance;
+      if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+      begin
+        Param := ParseExpression;
+        if Assigned(Param) then Param.Free;
+      end;
+    end;
+    if Assigned(TargetNode) then
     begin
       Result.Attributes.Values['TARGETIDX'] := IntToStr(Result.ChildCount);
       Result.AddChild(TargetNode);

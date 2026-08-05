@@ -751,6 +751,7 @@ type
     procedure ProcessGfxPut(Node: TASTNode);         // PUT (x,y), src [, mode]
     procedure ProcessGfxPutCustom(Node: TASTNode);   // ...CUSTOM: a per-pixel loop calling a user function
     procedure ProcessImageConvertRow(Node: TASTNode); // IMAGECONVERTROW src,src_bpp,dst,dst_bpp,w[,isrgb]
+    procedure ProcessGfxDrawString(Node: TASTNode);  // DRAW STRING [img,](x,y),text[,colour]
     procedure ProcessScreenInfo(Node: TASTNode);     // SCREENINFO w, h [, depth, ...]
     procedure ProcessScreenSet(Node: TASTNode);      // SCREENSET work[,visible] / FLIP
     procedure ProcessPCopy(Node: TASTNode);          // PCOPY src,dst / SCREENCOPY
@@ -12581,6 +12582,53 @@ begin
 
   FCurrentBlock := FProgram.CreateBlock(OuterEnd); BOE := FCurrentBlock;
   BOC.AddSuccessor(BOE); BOE.AddPredecessor(BOC);
+end;
+
+procedure TSSAGenerator.ProcessGfxDrawString(Node: TASTNode);
+// DRAW STRING [img,] [STEP] (x,y), text [,colour] -> ssaGfxDrawString.
+//   Src1 = the text (string reg), Src2 = x; Immediate[0-15] = y reg, [16-31] = colour reg.
+// The leading image handle rides on the SetTarget pair every other draw statement already uses, so a
+// missing text or a missing colour is the only thing that needs deciding here.
+var
+  XVal, YVal, TVal, CVal: TSSAValue;
+  XReg, YReg, TReg, CReg: TSSAValue;
+  HadTarget: Boolean;
+  NArgs: Integer;
+  Instr: TSSAInstruction;
+begin
+  if FCurrentBlock = nil then Exit;
+  NArgs := EffChildCount(Node);        // excludes the image-target child appended last
+  if NArgs < 3 then Exit;              // x, y and the text are the minimum; anything less is not a draw
+
+  HadTarget := EmitDrawTargetBegin(Node);
+
+  ProcessExpression(Node.GetChild(0), XVal); XReg := EnsureIntRegister(XVal);
+  ProcessExpression(Node.GetChild(1), YVal); YReg := EnsureIntRegister(YVal);
+  ProcessExpression(Node.GetChild(2), TVal); TReg := EnsureStringRegister(TVal);
+
+  // An omitted colour means the current foreground, which is what colour -1 asks the backend for
+  // everywhere else in this family - not a literal 0, which would be a real (usually black) colour.
+  if NArgs >= 4 then
+  begin
+    ProcessExpression(Node.GetChild(3), CVal);
+    CReg := EnsureIntRegister(CVal);
+  end
+  else
+  begin
+    CReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, CReg, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // ⚠️ The extra register indices do NOT travel as a packed constant in Src3 - that was the first
+  // attempt and it silently lost y (the text drew at the right x and at row 0, because the VM read a
+  // zero Immediate as "register 0"). They travel as PHI SOURCES, and the BYTECODE COMPILER is what packs
+  // them into the Immediate; ssaGfxCircleEx and ssaGfxImageConvertRow do exactly this.
+  EmitInstruction(ssaGfxDrawString, MakeSSAValue(svkNone), TReg, XReg, MakeSSAValue(svkNone));
+  Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+  Instr.AddPhiSource(YReg, nil);    // -> Immediate[0-15]
+  Instr.AddPhiSource(CReg, nil);    // -> Immediate[16-31]
+
+  if HadTarget then EmitDrawTargetEnd;
 end;
 
 procedure TSSAGenerator.ProcessScreenInfo(Node: TASTNode);
@@ -26687,6 +26735,7 @@ begin
     antImageInfo: ProcessImageInfo(Node);
     antGfxGet: ProcessGfxGet(Node);
     antGfxPut: ProcessGfxPut(Node);
+    antGfxDrawString: ProcessGfxDrawString(Node);
     antScreenInfo: ProcessScreenInfo(Node);
     antScreenSet: ProcessScreenSet(Node);
     antPCopy: ProcessPCopy(Node);

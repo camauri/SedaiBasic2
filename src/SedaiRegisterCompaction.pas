@@ -648,6 +648,7 @@ begin
     bcGraphicWindow,  // Src2 = row1 register (int)
     bcGraphicCircle,  // Src2 = x register (int)
     bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled, bcGfxCircle, bcGfxCircleEx, bcGfxImageConvertRow,  // FreeBASIC graphics: Src2 = h / y / y1 (int)
+    bcGfxDrawString,  // DRAW STRING: Src2 = x (int); Src1 is the TEXT and is classified as a string
     bcGfxPalette,  // PALETTE set: Src2 = packed colour (int)
     bcGfxColor,  // COLOR: Src2 = background (int)
     bcGfxImageCreate,  // IMAGECREATE: Src2 = h (int)
@@ -1089,6 +1090,14 @@ begin
       MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);   // color
       MarkIntRegUsed((Instr.Immediate shr 32) and $FFFF);   // start°
       MarkIntRegUsed((Instr.Immediate shr 48) and $FFFF);   // end°
+    end;
+
+    // DRAW STRING: Immediate [0-15]=y, [16-31]=colour (int regs). Src1 (the text) is a string reg and
+    // Src2 (x) an int reg, both covered by the ordinary Src lists.
+    if OpCode = bcGfxDrawString then
+    begin
+      MarkIntRegUsed(Instr.Immediate and $FFFF);            // y
+      MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);   // colour
     end;
 
     // IMAGECONVERTROW: Immediate [0-15]=src_bpp, [16-31]=dst_bpp, [32-47]=width, [48-63]=isrgb (int regs).
@@ -1774,6 +1783,22 @@ begin
       OldReg := (Instr.Immediate shr 48) and $FFFF;         // end°
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
       NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 48);
+      if NewImm <> Instr.Immediate then
+      begin
+        Instr.Immediate := NewImm;
+        Modified := True;
+      end;
+    end;
+
+    // bcGfxDrawString: Immediate [0-15]=y, [16-31]=colour (int regs).
+    if OpCode = bcGfxDrawString then
+    begin
+      OldReg := Instr.Immediate and $FFFF;                   // y
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewReg and $FFFF;
+      OldReg := (Instr.Immediate shr 16) and $FFFF;          // colour
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := NewImm or ((Int64(NewReg) and $FFFF) shl 16);
       if NewImm <> Instr.Immediate then
       begin
         Instr.Immediate := NewImm;

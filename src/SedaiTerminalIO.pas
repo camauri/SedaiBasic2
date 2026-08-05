@@ -47,7 +47,7 @@ interface
 
 uses
   Classes, SysUtils, SedaiOutputInterface, SedaiGraphicsTypes,
-  SedaiGraphicsMemory, SedaiGraphicsPrimitives, SedaiConsoleState
+  SedaiGraphicsMemory, SedaiGraphicsPrimitives, SedaiConsoleState, SedaiGraphicsBackend
   {$IFDEF WINDOWS}
   , Windows
   {$ELSE}
@@ -70,6 +70,13 @@ type
     FInitialized: Boolean;
     FCursorX, FCursorY: Integer;
     FCols, FRows: Integer;
+    // The drawing surface, when there is one. In FreeBASIC a graphics mode has NO separate text plane:
+    // the console IS the framebuffer, so PRINT puts pixels on the same surface LINE and PSET draw on,
+    // and POINT reads them back. We modelled the two as separate things, which is why every gfx example
+    // that only printed came out with a blank screen - seven of them - and why nothing said so.
+    // Only a mirror: stdout still receives exactly what it always did, so this cannot change the output
+    // of a single existing program. It ADDS the pixels.
+    FGfx: IGraphicsBackend;
     // A model of the visible screen, so a program can read back what it printed: SCREEN(row, col) and
     // the C128 screen RAM at $0400 both go through GetCharAt/GetColorAt. Text still goes straight to
     // stdout -- this mirrors it, cell by cell, wrapping at the right margin and scrolling at the bottom.
@@ -99,10 +106,17 @@ type
     procedure ScrollCellsUp;
     procedure CellNextRow;
     procedure PutCells(const Text: string);
+    // PRINT into the drawing surface, at the caret, in 8x8 cells. Separate from PutCells on purpose:
+    // that one returns immediately when the screen model is not observable (it is maintained for
+    // whoever can read it back, and usually nobody can), and the framebuffer is always observable.
+    procedure MirrorTextToSurface(const Text: string);
   public
     constructor Create;
     // sb --window: attach the shared graphics surface so C128 graphics draw into the window.
     procedure AttachGraphicsMemory(Mem: TGraphicsMemory);
+    // The backend PRINT mirrors into while a graphics mode is open. Handed over by the VM, which is the
+    // only thing that holds both; nil is the ordinary text case and costs one test per Print.
+    procedure AttachGraphicsBackend(Backend: IGraphicsBackend);
 
     // IOutputDevice implementation
     function Initialize(const Title: string = ''; Width: Integer = 80; Height: Integer = 25): Boolean;
@@ -272,6 +286,11 @@ var
   GOutBuffered: Boolean = True;   // False -> straight through System.Write, as before
   GOutIsTerminal: Boolean = True; // line-buffer when a human is watching
   GOutExitRegistered: Boolean = False;
+  // GFXTEXT=0 restores the behaviour before 5 Aug 2026, where PRINT inside a graphics mode wrote to
+  // stdout and left the framebuffer untouched. Kept as an A/B, not as a preference: the manual is
+  // explicit that Draw String's advantage over Print is a TRANSPARENT background, which only means
+  // anything if Print has an opaque one - i.e. if Print draws. Default ON is the faithful behaviour.
+  GGfxTextMirror: Boolean = True;
 
 function StdoutIsTerminal: Boolean; forward;
 
@@ -349,6 +368,7 @@ begin
   GCellRotate := SysUtils.GetEnvironmentVariable('SB_CELLROT') <> '0';
   GOutBuffered := SysUtils.GetEnvironmentVariable('SB_OUTBUF') <> '0';
   GOutIsTerminal := StdoutIsTerminal;
+  GGfxTextMirror := SysUtils.GetEnvironmentVariable('GFXTEXT') <> '0';
   if not GOutExitRegistered then
   begin
     // Whatever is still buffered must reach the stream even if the process ends abnormally.
@@ -506,10 +526,35 @@ begin
   Result := FInitialized;
 end;
 
+procedure TTerminalController.AttachGraphicsBackend(Backend: IGraphicsBackend);
+begin
+  FGfx := Backend;
+end;
+
+procedure TTerminalController.MirrorTextToSurface(const Text: string);
+// PRINT into the framebuffer, at the CURRENT caret, in 8x8 cells. Called before the caret advances,
+// which is the whole reason it is a method here rather than anywhere else: the position a character
+// belongs at is the one the console model is about to leave behind.
+// Opaque, unlike DRAW STRING: PRINT paints its background, so a line overwrites what it lands on -
+// that is what makes a second PRINT over the same row legible instead of a mess of overlaid glyphs.
+var
+  FG, BG: TGfxColor;
+begin
+  if (Text = '') or (FGfx = nil) then Exit;
+  if not GGfxTextMirror then Exit;   // GFXTEXT=0 : the pre-2026-08-05 behaviour, for A/B
+  if not FGfx.InGraphics then Exit;
+  // ⚠️ NOT FFgIdx/FBgIdx. Those are the TEXT console's palette indices, a different pair from the ones
+  // "COLOR fg, bg" sets inside a graphics mode - reading them drew a perfectly formed letter in the
+  // wrong two colours, which is the sort of near-miss that looks like a font bug and is not one.
+  FGfx.GetTextColors(FG, BG);
+  FGfx.DrawText(GFX_SCREEN_SURFACE, FCursorX * 8, FCursorY * 8, Text, FG, BG, True);
+end;
+
 procedure TTerminalController.Print(const Text: string; ClearBackground: Boolean);
 begin
   OutWrite(Text);
   PutCells(Text);
+  MirrorTextToSurface(Text);
   Inc(FCursorX, Length(Text));
 end;
 
@@ -519,6 +564,7 @@ begin
   OutWrite(LineEnding);
   if GOutIsTerminal then TerminalOutFlush;   // line buffering while a human is watching
   PutCells(Text);
+  MirrorTextToSurface(Text);
   CellNextRow;
   FCursorX := 0;
   Inc(FCursorY);

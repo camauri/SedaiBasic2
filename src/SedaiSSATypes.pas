@@ -339,6 +339,11 @@ type
     ssaGfxScreenPtr,   // SCREENPTR: raw pointer to the working page's framebuffer
   ssaGfxImageConvertRow,  // IMAGECONVERTROW(src,src_bpp,dst,dst_bpp,width[,isrgb]): convert one pixel row
     ssaGfxDrawGML,     // DRAW "..." : FreeBASIC graphics-macro-language string (Src1 = string)
+    // DRAW STRING [img,] (x,y), text [,colour] : text INTO the drawing surface, from the built-in 8x8
+    // font. Src1 = the text (STRING reg), Src2 = x, Src3 = y, Immediate[0-15] = colour reg.
+    // The image target rides on the existing bcGfxSetTarget pair, exactly as "PSET img,(x,y)" does, so
+    // the leading image handle needs nothing of its own here.
+    ssaGfxDrawString,
     ssaGfxPointCoord,  // POINTCOORD(n): DRAW pen coordinate (Dest = result, Src1 = selector 0=x/1=y)
     ssaGfxPset,        // PSET (x,y),color
     ssaGfxPoint,       // POINT(x,y) -> color

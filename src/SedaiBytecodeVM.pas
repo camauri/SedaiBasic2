@@ -616,10 +616,12 @@ type
     procedure LoadProgram(Program_: TBytecodeProgram);
     procedure ClearProgram;  // Clear program reference (use before freeing the program externally)
     procedure SetOutputDevice(Device: IOutputDevice);
+    procedure AttachGraphicsToOutput;   // hand the graphics backend to a text device that can mirror
     // FreeBASIC graphics backend. OwnedObj (optional) is the concrete object the VM should free on
     // destruction (used for the software backend on sb; pass nil for the SDL2 device owned elsewhere).
     procedure SetGraphicsBackend(Backend: IGraphicsBackend; OwnedObj: TObject = nil);
     procedure UseSoftwareGraphics;  // attach a VM-owned headless software graphics backend (CLI / bare-metal)
+    function  GraphicsBackend: IGraphicsBackend;  // the attached backend (nil if none) - for wiring at the call site
     procedure SetInputDevice(Device: IInputDevice);
     // Command-line arguments passed to the BASIC program (for COMMAND$): Args are the arguments only
     // (arg 1, 2, ...), excluding the interpreter/script name. Empty by default.
@@ -723,6 +725,12 @@ procedure SetDateLocaleMode(Enabled: Boolean);
 function DateLocaleMode: Boolean;
 
 implementation
+
+uses
+  // Only for AttachGraphicsToOutput: the headless text device is the one that has to be TOLD about the
+  // drawing surface, because unlike sbv's controller it is not the graphics backend itself. In the
+  // implementation section so the interface of this unit stays free of it.
+  SedaiTerminalIO;
 
 // Declared here because ExecuteSuperinstruction (bcStrConcatCharAt) calls it well before its
 // definition further down, next to AppendString.
@@ -5961,6 +5969,7 @@ end;
 procedure TBytecodeVM.SetOutputDevice(Device: IOutputDevice);
 begin
   FOutputDevice := Device;
+  AttachGraphicsToOutput;   // order-independent: whichever of the two arrives second wires the pair
 end;
 
 procedure TBytecodeVM.SetGraphicsBackend(Backend: IGraphicsBackend; OwnedObj: TObject = nil);
@@ -5969,6 +5978,26 @@ begin
     FreeAndNil(FOwnedGraphics);
   FGraphics := Backend;
   FOwnedGraphics := OwnedObj;
+  // Hand it to the output device too, so PRINT inside a graphics mode lands on the same surface as
+  // LINE and PSET - which is what FreeBASIC does, and what we did not. The VM is the only thing that
+  // holds both, so this is where the two are introduced.
+  AttachGraphicsToOutput;
+end;
+
+procedure TBytecodeVM.AttachGraphicsToOutput;
+// ⛔ There is NO cast from IOutputDevice back to its class here, and the first attempt at one crashed
+// outright: under {$interfaces CORBA} an interface reference points at the interface's method table,
+// NOT at the object, so "TObject(FOutputDevice)" is a wild pointer and "is" walks it.
+// The wiring is done where both sides are known CONCRETELY instead - SedaiBasicVM.lpr already keeps a
+// typed GTermCtrl handle for exactly this reason (AttachGraphicsMemory under --window does the same).
+// Kept as a method so the intent has a name and one place to come back to.
+begin
+  // nothing to do here: see AttachGraphicsBackend at the call site in SedaiBasicVM.lpr
+end;
+
+function TBytecodeVM.GraphicsBackend: IGraphicsBackend;
+begin
+  Result := FGraphics;
 end;
 
 procedure TBytecodeVM.UseSoftwareGraphics;
@@ -12145,6 +12174,10 @@ begin
         begin FGfxForeColor := UInt32(Ctx.IntRegs[Instr.Src1]); FConColorFg := Ctx.IntRegs[Instr.Src1]; end;
         if (Instr.Immediate and 2) <> 0 then
         begin FGfxBackColor := UInt32(Ctx.IntRegs[Instr.Src2]); FConColorBg := Ctx.IntRegs[Instr.Src2]; end;
+        // Leave them on the backend as well: inside a graphics mode PRINT draws with these, and the
+        // text device reads them from there. It is the only place both can reach - see SetTextColors.
+        if Assigned(FGraphics) then
+          FGraphics.SetTextColors(UInt32(FConColorFg), UInt32(FConColorBg));
       end;
     35: // bcGfxForeColor - read the current colour. Immediate 0 = draw foreground, 1 = draw background
         //   (the omitted-colour defaults for PSET and PRESET); 2 = console foreground, 3 = console
@@ -12422,6 +12455,19 @@ begin
       end;
     57: // bcGfxDrawGML - DRAW "..." : interpret the FreeBASIC graphics macro language (Src1 = string).
       DrawGML(Ctx.StringRegs[Instr.Src1]);
+    65: // bcGfxDrawString - DRAW STRING [img,](x,y),text[,colour] : blit text with the built-in 8x8 font.
+        // Src1 = text (string reg), Src2 = x, Src3 = y, Immediate[0-15] = colour reg.
+        // Coordinates go through the same WINDOW mapping as every other draw op, so text lands where the
+        // program's own coordinate system puts it; the image target rides on the bcGfxSetTarget pair.
+        // NOT opaque: FreeBASIC's DRAW STRING leaves the background showing through, unlike PRINT.
+      if Assigned(FGraphics) then
+      begin
+        GetX1 := GfxMapX(Ctx.IntRegs[Instr.Src2]);
+        GetY1 := GfxMapY(Ctx.IntRegs[Instr.Immediate and $FFFF]);
+        GetSx := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];         // colour
+        FGraphics.DrawText(DrawSurface, GetX1, GetY1, Ctx.StringRegs[Instr.Src1],
+                           UInt32(GetSx), 0, False);
+      end;
     58: // bcGfxPointCoord - POINTCOORD(n): the DRAW pen coordinate (Src1 selector: 0 = x, 1 = y).
       if Ctx.IntRegs[Instr.Src1] = 1 then
         Ctx.IntRegs[Instr.Dest] := FDrawPenY
