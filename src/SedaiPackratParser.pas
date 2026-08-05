@@ -1496,6 +1496,27 @@ begin
  SavedToken := Token;   // default (member/array LHS branches don't set it; avoids nil on error)
  LhsIsExpr := False;
 
+  // FreeBASIC CLEAR dst, value, count : the memset, in its STATEMENT spelling. The parenthesised call
+  // form already worked - the whole lowering is in the SSA's CLEAR intercept - but CLEAR is not a
+  // keyword here (it is resolved by name), so "Clear *scrbuf, 0, scrsize" arrived as an identifier and
+  // died in the assignment grammar on the missing '='. Three examples hang on it: gfx/cls-memset,
+  // array/clear and proguide/dynamicmemory.
+  // Synthesised into exactly the node the call form builds, so there is one lowering, not two.
+  if FModernMode and Context.Check(ttIdentifier) and (UpperCase(VarToStr(Token.Value)) = kCLEAR) and
+     Assigned(Context.PeekNext) and
+     (Context.PeekNext.TokenType <> ttOpEq) and (Context.PeekNext.TokenType <> ttDelimParOpen) and
+     (Context.PeekNext.TokenType <> ttEndOfLine) and (Context.PeekNext.TokenType <> ttSeparStmt) then
+  begin
+    Context.Advance;                                   // CLEAR
+    // The shape a "name(args)" call has - antArrayAccess(identifier, argument-list) - NOT antFunctionCall,
+    // because that is the shape the SSA's raw-memory intercept already matches. One lowering, not two.
+    Result := TASTNode.Create(antArrayAccess, Token);
+    Result.AddChild(TASTNode.CreateWithValue(antIdentifier, kCLEAR, Token));
+    Result.AddChild(ParseArgumentList);
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
   // Parse left side - can be A or A(i) or special variable (TI$)
   if Context.Check(ttOpDot) then
   begin
@@ -5306,6 +5327,18 @@ begin
   Context.Advance;
   ParamCount := 0;
 
+  // "Cls()", "ScreenLock()", "ScreenUnlock()" - FreeBASIC lets a no-argument statement be written with
+  // empty parentheses, and gfx/screenlock.bas uses all three that way. Consumed here, once, for every
+  // graphics statement rather than in each branch below.
+  // Requires the ')' to follow the '(' IMMEDIATELY, so "PSET (x,y)" - which also opens with a
+  // parenthesis - is untouched.
+  if Context.Check(ttDelimParOpen) and Assigned(Context.PeekNext) and
+     (Context.PeekNext.TokenType = ttDelimParClose) then
+  begin
+    Context.Advance;                                             // '('
+    Context.Advance;                                             // ')'
+  end;
+
   // FreeBASIC PSET/PRESET (x, y) [, color] and PAINT (x, y) [, color]: the coordinate pair is
   // parenthesised, so parse it explicitly rather than via the generic comma-separated parameter loop below.
   if (CmdName = 'PSET') or (CmdName = 'PRESET') or (Result.NodeType = antGfxPaint) then
@@ -5379,7 +5412,14 @@ begin
     if Context.Check(ttSeparParam) then
     begin
       Context.Advance;                                            // ','
-      Result.AddChild(ParseExpression);                           // colour
+      // ⚠️ The colour may be LEFT OUT and a font given instead - "Draw String (x,y), s, , myFont" is
+      // the manual's own custom-font example. ParseExpression returns NIL on a bare comma, and this
+      // line went in without that guard: the same omitted-argument defect that had just been cleared
+      // out of the other eight graphics statements, written afresh into the ninth. An omitted colour
+      // means the current foreground, which is what the -1 default in ProcessGfxDrawString asks for -
+      // so the child is simply not added.
+      if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+        Result.AddChild(ParseExpression);                         // colour
     end;
     // A trailing font argument ("...,, font") is accepted and ignored: we have ONE built-in font, and
     // declining the line would be worse than drawing it in the only face we have.
@@ -5601,6 +5641,10 @@ begin
   // FreeBASIC SCREENINFO w, h [, depth, bpp, pitch, rate] — writes the screen's info into the variables.
   if Result.NodeType = antScreenInfo then
   begin
+    // FreeBASIC accepts the PARENTHESISED spelling too - gfx/cls-memset.bas writes
+    // "ScreenInfo( , scrhei, , , scrpitch )", omitted slots and all. Only the bare form was parsed, so
+    // that file died on the '(' before reaching anything it was meant to test.
+    if Context.Check(ttDelimParOpen) then Context.Advance;       // '('
     // Any destination may be left out - "ScreenInfo w, h, depth,,,,driver_name" is the manual's own
     // example - and the POSITION still counts, because it is what selects the field. A skipped slot used
     // to reach the AST as a NIL child (ParseExpression returns nil on a bare comma) and every pre-pass
@@ -5609,18 +5653,21 @@ begin
     // DESTINATIONS and there is nothing to write into a 0. It is a literal all the same, because a
     // literal can never BE a destination: that makes "is this slot omitted?" an exact test downstream,
     // with no extra marker to keep in step.
-    if Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+    if Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse,
+                         ttDelimParClose]) then
       Result.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Token))
     else
       Result.AddChild(ParseExpression);                          // w variable
     while Context.Check(ttSeparParam) do
     begin
       Context.Advance;                                          // ','
-      if Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+      if Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse,
+                           ttDelimParClose]) then
         Result.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Token))
       else
         Result.AddChild(ParseExpression);                       // next variable
     end;
+    if Context.Check(ttDelimParClose) then Context.Advance;     // ')' of the parenthesised spelling
     DoNodeCreated(Result);
     Exit;
   end;

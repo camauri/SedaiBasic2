@@ -481,6 +481,11 @@ const
   kSCREENUNLOCK = 'SCREENUNLOCK';  // FreeBASIC: end direct screen access (no-op)
   kSCREENSYNC   = 'SCREENSYNC';    // FreeBASIC: wait for vertical retrace (no-op headless)
   kWINDOWTITLE  = 'WINDOWTITLE';   // FreeBASIC: set the graphics window caption (accept-and-ignore v1)
+  // ⚠️ SCREENEVENT / SCREENGLPROC deliberately NOT registered as statement keywords. They are used as
+  // FUNCTIONS ("If ScreenEvent(@e) Then", "p = ScreenGLProc(name)"), so registering them as commands
+  // only moved the failure from SSA generation to the parser - a worse message for no gain. They want
+  // an expression-level intercept returning 0 (no window, no GL context), which is honest rather than
+  // a stub, and that is a piece of work of its own.
   kSCREENSET    = 'SCREENSET';     // FreeBASIC: select work/visible page (double buffering)
   kSCREENCOPY   = 'SCREENCOPY';    // FreeBASIC: copy one page onto another (defaults work->visible)
   kPCOPY        = 'PCOPY';         // FreeBASIC/QB: copy page src to page dst
