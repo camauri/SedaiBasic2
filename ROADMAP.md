@@ -2,6 +2,12 @@
 
 Future directions and project goals for SedaiBasic.
 
+> **In flight (6 Aug 2026): voxel-landscape demo, phase 1.** Public material. The plan, and the
+> measured budget it rests on, are in `job/docs/PIANO_DEMO_VOXEL.md`. The English in-source comments
+> are a primary deliverable, not documentation added at the end — that is what readers of the previous
+> demos singled out. Implemented from first principles: no existing voxel source is ported or adapted,
+> and every constant is chosen experimentally here.
+
 ---
 
 ## Tool Suite
