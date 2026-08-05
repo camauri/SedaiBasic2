@@ -2170,7 +2170,35 @@ begin
                       kTRAP,     // error trapping                  ("trap" = a handler / a snare)
                       kPLAY,     // play a music string
                       kTEMPO,    // set the PLAY tempo
-                      kSOUND],   // emit a tone                     ("sound" = an audio buffer / a flag)
+                      kSOUND,    // emit a tone                     ("sound" = an audio buffer / a flag)
+                      // The list above was curated by hand and had drifted, the way a hand-kept list does.
+                      // It was checked EXHAUSTIVELY instead of extended by guess: every one of our 494
+                      // keywords was declared as a variable ("Dim As Integer <name> = 5 : Print <name>")
+                      // and handed to fbc AND to us. 72 came back as names FreeBASIC accepts and we
+                      // refuse; 64 of those do not appear in the FB manual's own index at all. What
+                      // follows is the part of that answer with no room for argument: Commodore v7
+                      // commands with no FreeBASIC counterpart, each an ordinary English word an FB
+                      // program is entitled to use. "sprite" is how it surfaced - gfx/put-all.bas simply
+                      // writes "Dim As Any Ptr sprite", and we rejected the file.
+                      // ⚠️ Deliberately NOT here: SSHAPE / GSHAPE / SETCOLOR (MODERN programs of ours do
+                      // use them as statements - measured, not assumed), the PLOAD/PSAVE/PRST/GETCOLOR
+                      // palette extension, and the eight names fbc allows to be SHADOWED because they are
+                      // runtime FUNCTIONS rather than reserved words (NOW, STICK, STRIG, THREADSELF,
+                      // THREADDETACH, FILECOPY, FILEFLUSH, FILESETEOF) - that is a different mechanism and
+                      // wants a decision of its own, not a line in this list.
+                      kSPRITE, kSPRCOLOR, kSPRDEF, kSPRFORM,      // C128 sprite engine; FB draws with
+                      kSPRLOAD, kSPRSAV, kSPRSAVE, kSPRSIZE,      //   Put/Get on images instead
+                      kRSPRITE, kRSPCOLOR, kRSPPOS,               // ...and its query functions
+                      kDCLEAR, kDCLOSE, kDLOAD, kDOPEN,           // C128 disk commands ("dopen"/"dclose"
+                      kDSAVE, kDVERIFY, kDIRECTORY, kVERIFY,      //   are natural names for a file helper)
+                      kBOOT, kSYS, kUSR, kFAST, kSLOW,            // C128 system control ("fast", "boot")
+                      kTRON, kTROFF, kEDIT, kHELP, kGO_TO,        // C128 editor/debug ("edit", "help", "go")
+                      kBEGIN, kBEND,                              // C128 block form; FB has no BEGIN/BEND
+                      kRCLR, kRDOT, kRGR, kRWINDOW,               // C128 graphics queries
+                      kSCNCLR, kGRAPHIC, kHCLEAR, kHLOAD,         // C128 graphics/hi-res commands
+                      kHSAVE, kGLIST, kFRAME],                    // ..."frame" above all: a loop counter
+                                                                  //    in half the graphics code ever
+                                                                  //    written
                      kdClassicOnly);
 
   //WriteLn('DEBUG RegisterBasicKeywords: Completed registration of ', GetKeywordCount, ' keywords');
