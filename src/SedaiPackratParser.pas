@@ -146,6 +146,7 @@ type
     function SkipTypeQualifiersConst: Boolean;   // ...and report whether CONST was one of them
     function AtPointerSuffix: Boolean;   // FB: the current token is "PTR" (or its synonym "POINTER")
     function TryConstIntExpr(N: TASTNode; out V: Int64): Boolean;   // fold a constant integer expression
+    function TryConstDataExpr(N: TASTNode; out V: Variant): Boolean; // fold a MODERN DATA item (num/float/string)
     procedure SetOptions(AValue: TParserOptions);
 
     // Helper for error reporting
@@ -6110,8 +6111,13 @@ begin
     // The device is a bare WORD, not a string, so left to the expression parser it becomes an undeclared
     // variable - an empty filename, and an open that silently reads nothing. Turned into a literal the
     // runtime recognises instead.
-    if Context.Check(ttIdentifier) and
-       ((UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONS') or
+    // ⚠️ Matched on the WORD, not on ttIdentifier. "ERR" is also the keyword for the last error code
+    // (kERR), so it never arrived here as an identifier and this branch silently skipped it: the bare
+    // Err went to the expression parser, evaluated to the error code 0, and became the FILENAME. The
+    // program did not fail - it wrote its diagnostics into a file called "0" in the working directory,
+    // while BASIC.md ticked "OPEN ERR" as implemented. A word followed by FOR can only be the device
+    // form here; the error-code function is never followed by FOR.
+    if ((UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONS') or
         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'SCRN') or
         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'ERR')) and
        Assigned(Context.PeekNext) and (UpperCase(VarToStr(Context.PeekNext.Value)) = kFOR) then
@@ -7895,6 +7901,106 @@ begin
   end;
 end;
 
+function TPackratParser.TryConstDataExpr(N: TASTNode; out V: Variant): Boolean;
+// Fold a DATA item that FreeBASIC writes as an EXPRESSION. Its manual's own example for DATA is
+//   Data 3, 234, 435/4, 23+433, 87643, "Good" + "Bye!"
+// and the page says the items are "expressions that are evaluated at compile time" - we accepted only
+// literals, so the whole statement was a syntax error at the '/' and the example never ran.
+//
+// Wider than TryConstIntExpr on purpose, and kept separate from it: this one has to reach the FLOAT
+// quotient of 435/4 (108.75, not 108) and the STRING concatenation of "Good" + "Bye!", neither of which
+// a capacity expression may produce. It hands back the Variant the DATA pool already stores - string,
+// ordinal or float - so nothing downstream changes.
+//
+// MODERN only, at the call site: in Commodore BASIC a DATA item is RAW TEXT up to the comma. "435/4"
+// there is the string "435/4" (and reads as 435 into a numeric variable, VAL-style); folding it to
+// 108.75 would be bending v7 to FreeBASIC. See the dialect note in ParseDataStatement.
+var
+  A, B: Variant;
+  Op: string;
+  D: Double;
+  I: Int64;
+  FS: TFormatSettings;   // '.' is the source's decimal point, whatever the machine's locale says
+
+  function IsStr(const X: Variant): Boolean;
+  begin
+    Result := VarIsStr(X);
+  end;
+
+  // Numeric result narrowing: an exact integral value goes back as an ordinal so the DATA pool stores
+  // it as an integer (23+433 must be 456, not 456.0), anything else stays a float.
+  // ⚠️ The 32-bit bound is not cosmetic: ProcessData stores an ordinal item with
+  // MakeSSAConstInt(Integer(...)), which TRUNCATES. Before this folder existed a big literal reached the
+  // pool as its TEXT and survived; handing it back as an ordinal would silently mangle it. Outside the
+  // Int32 range it goes back as a Double, which holds every integer up to 2^53 exactly.
+  function Num(const X: Double): Variant;
+  begin
+    if (Frac(X) = 0) and (Abs(X) <= 2147483647) then Result := Int64(Round(X)) else Result := X;
+  end;
+
+begin
+  Result := False;
+  V := 0;
+  if N = nil then Exit;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  case N.NodeType of
+    antLiteral:
+      begin
+        if Assigned(N.Token) and (N.Token.TokenType = ttStringLiteral) then
+          begin V := VarToStr(N.Value); Exit(True); end;
+        if VarIsStr(N.Value) then
+        begin
+          // A numeric token whose value is still its TEXT (the lexer is lazy about it): read it as a
+          // number here, or "3" would fold as a string and "3+1" would concatenate to "31".
+          // Same Int32 bound as Num(), and for the same reason.
+          if TryStrToInt64(VarToStr(N.Value), I) then
+          begin
+            if (I >= -2147483648) and (I <= 2147483647) then V := I else V := Double(I);
+            Exit(True);
+          end;
+          if TryStrToFloat(VarToStr(N.Value), D, FS) then begin V := D; Exit(True); end;
+          V := VarToStr(N.Value); Exit(True);
+        end;
+        V := N.Value; Result := True;
+      end;
+    antParentheses:
+      if N.ChildCount >= 1 then Result := TryConstDataExpr(N.GetChild(0), V);
+    antUnaryOp:
+      if (N.ChildCount >= 1) and Assigned(N.Token) and (N.Token.TokenType = ttOpSub) then
+      begin
+        Result := TryConstDataExpr(N.GetChild(0), A);
+        if Result and not IsStr(A) then V := Num(-Double(A)) else Result := False;
+      end;
+    antBinaryOp:
+      if (N.ChildCount >= 2) and Assigned(N.Token) then
+      begin
+        if not TryConstDataExpr(N.GetChild(0), A) then Exit;
+        if not TryConstDataExpr(N.GetChild(1), B) then Exit;
+        Op := VarToStr(N.Value);
+        // '&' always concatenates; '+' concatenates when either side is a string.
+        if (N.Token.TokenType = ttOpConcat) or (Op = '&') or
+           ((N.Token.TokenType = ttOpAdd) and (IsStr(A) or IsStr(B))) then
+          begin V := VarToStr(A) + VarToStr(B); Exit(True); end;
+        if IsStr(A) or IsStr(B) then Exit;      // arithmetic on a string is not a constant DATA item
+        case N.Token.TokenType of
+          ttOpAdd:    begin V := Num(Double(A) + Double(B)); Result := True; end;
+          ttOpSub:    begin V := Num(Double(A) - Double(B)); Result := True; end;
+          ttOpMul:    begin V := Num(Double(A) * Double(B)); Result := True; end;
+          // '/' is FreeBASIC's FLOATING division even between two integers: 435/4 is 108.75. That is
+          // the whole reason this folder cannot be TryConstIntExpr with a wider return type.
+          ttOpDiv:    if Double(B) <> 0 then begin V := Num(Double(A) / Double(B)); Result := True; end;
+          ttOpIntDiv: if Double(B) <> 0 then begin V := Num(Trunc(Double(A) / Double(B))); Result := True; end;
+        else
+          if Op = '+' then begin V := Num(Double(A) + Double(B)); Result := True; end
+          else if Op = '-' then begin V := Num(Double(A) - Double(B)); Result := True; end
+          else if Op = '*' then begin V := Num(Double(A) * Double(B)); Result := True; end
+          else if (Op = '/') and (Double(B) <> 0) then begin V := Num(Double(A) / Double(B)); Result := True; end;
+        end;
+      end;
+  end;
+end;
+
 function TPackratParser.TryConstIntExpr(N: TASTNode; out V: Int64): Boolean;
 // Fold a constant integer expression made of literals, parentheses and + - * \ over them.
 //
@@ -9524,7 +9630,9 @@ end;
 function TPackratParser.ParseDataStatement: TASTNode;
 var
   Token: TLexerToken;
-  DataItem: TASTNode;
+  DataItem, ExprNode: TASTNode;
+  SavedIdx: Integer;
+  FoldedVal: Variant;
 begin
   Token := Context.CurrentToken;
 
@@ -9538,10 +9646,32 @@ begin
   Result := TASTNode.Create(antData, Token);
   Context.Advance; // Consume DATA
 
-  // Parse comma-separated list of data items (literals only - no expressions)
-  // Format: DATA 5,12,1,34,18 or DATA "hello","world" or DATA COMMODORE,128
+  // Parse comma-separated list of data items.
+  // CLASSIC: literals only - "DATA 5,12,1,34,18", "DATA "hello","world"", "DATA COMMODORE,128", where an
+  // unquoted word is a string. That is the v7 rule and it stays: in Commodore BASIC a DATA item is the raw
+  // text up to the comma, so "435/4" IS the three-character-plus string, not a quotient.
+  // MODERN: FreeBASIC's DATA takes "expressions that are evaluated at compile time" (its own manual page),
+  // which its own example uses - "Data 3, 234, 435/4, 23+433, 87643, "Good" + "Bye!"". Try to fold one
+  // first; only if that fails does the literal grammar below run, so every form that worked still works.
   while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
+    if FModernMode then
+    begin
+      SavedIdx := Context.CurrentIndex;
+      ExprNode := ParseExpression;
+      if Assigned(ExprNode) and TryConstDataExpr(ExprNode, FoldedVal) then
+      begin
+        DataItem := TASTNode.CreateWithValue(antLiteral, FoldedVal, Token);
+        Result.AddChild(DataItem);
+        ExprNode.Free;
+        if Context.Check(ttSeparParam) then begin Context.Advance; Continue; end
+        else Break;
+      end;
+      // Not a foldable expression (a bare word, say): put the stream back exactly where it was and let
+      // the literal grammar have it. Rewinding is what makes this addition unable to LOSE an item.
+      if Assigned(ExprNode) then ExprNode.Free;
+      Context.CurrentIndex := SavedIdx;
+    end;
     // Parse data item - can be number, string, or unquoted identifier (treated as string)
     if Context.Check(ttNumber) or Context.Check(ttInteger) or Context.Check(ttFloat) then
     begin
@@ -9656,10 +9786,21 @@ begin
   Result := TASTNode.Create(antRestore, Token);
   Context.Advance; // Consume RESTORE
 
-  // Optional line number: RESTORE or RESTORE 100
+  // Optional target: "RESTORE 100" (v7 line number) or "RESTORE label" (FreeBASIC). Both name the DATA
+  // item to start reading from again; the SSA resolves either to a POOL INDEX.
+  // The label form was not parsed at all: the word after RESTORE was left behind as a statement of its
+  // own - a bare identifier, which is silently ignored - and the RESTORE reset to the first item. So
+  // "Restore second" read block ONE and said nothing. Kept as an antIdentifier child so ProcessRestore
+  // can tell the two forms apart without re-reading the token.
   if Context.Check(ttNumber) or Context.Check(ttInteger) then
   begin
     LineNode := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
+    Result.AddChild(LineNode);
+    Context.Advance;
+  end
+  else if Context.Check(ttIdentifier) then
+  begin
+    LineNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
     Result.AddChild(LineNode);
     Context.Advance;
   end;

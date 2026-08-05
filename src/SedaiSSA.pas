@@ -291,6 +291,11 @@ type
     FVarWidthCode: TStringList;          // B1.5 phase 2: name (UPPER) -> narrow width code (Objects[]=PtrInt 1..7)
     FVarPrintKind: TStringList;          // B1.5 phase C: name (UPPER) -> 1=BOOLEAN, 2=unsigned-64 (print form)
     FArrayElemWidth: TStringList;        // B1.5: array name (UPPER) -> element narrow width code (1..7)
+    // RESTORE targets: label name / line number (UPPER) -> the DATA-pool INDEX at which the items after
+    // that mark begin. Filled by PreProcessData as the pool is built, so it is exact by construction
+    // rather than reconstructed later. FDataCount is that walk's running pool length.
+    FDataMarks: TStringList;
+    FDataCount: Integer;
     FUnsigned64Arrays: TStringList;      // array names (UPPER) whose element type is UInteger/ULongInt (unsigned-64)
     FSwapTempSeq: Integer;               // SWAP: unique counter for synthesized snapshot temp names
     FDefTypeBank: array['A'..'Z'] of Integer;  // DEFINT/DEFSTR...: initial letter -> bank (0/1/2), -1=unset
@@ -1080,6 +1085,9 @@ begin
   FVarPrintKind.CaseSensitive := False;
   FArrayElemWidth := TStringList.Create;
   FArrayElemWidth.CaseSensitive := False;
+  FDataMarks := TStringList.Create;
+  FDataMarks.CaseSensitive := False;
+  FDataCount := 0;
   FUnsigned64Arrays := TStringList.Create;
   FUnsigned64Arrays.CaseSensitive := False;
   FInDispatcher := False;
@@ -1155,6 +1163,7 @@ begin
   FVarWidthCode.Free;
   FVarPrintKind.Free;
   FArrayElemWidth.Free;
+  FDataMarks.Free;
   FUnsigned64Arrays.Free;
   FBlockHandledVars.Free;
   FCurrentTopLevelLabels.Free;
@@ -1632,6 +1641,14 @@ begin
   for i := 0 to Node.ChildCount - 1 do
   begin
     Child := Node.GetChild(i);
+    // Every LABEL and LINE NUMBER passed on the way is a possible RESTORE target, and what it names is
+    // the pool position reached SO FAR - so it has to be recorded here, in the same in-order walk that
+    // fills the pool, and before the DATA that follows it. Reconstructing it afterwards would mean
+    // re-deriving an order this walk already knows.
+    // First mark wins: a duplicate name is the earlier block, which is what both dialects mean.
+    if (Child.NodeType = antLabel) or (Child.NodeType = antLineNumber) then
+      if FDataMarks.IndexOfName(UpperCase(VarToStr(Child.Value))) < 0 then
+        FDataMarks.Add(UpperCase(VarToStr(Child.Value)) + '=' + IntToStr(FDataCount));
     // For container nodes (program, line numbers, statements), check their children for DATA
     if (Child.NodeType = antLineNumber) or (Child.NodeType = antProgram) or
        (Child.NodeType = antStatement) then
@@ -14505,6 +14522,7 @@ begin
     Child := Node.GetChild(i);
     if Child.NodeType = antLiteral then
     begin
+      Inc(FDataCount);   // running pool length: what a RESTORE mark seen later must point PAST
       // Determine type of data and emit appropriate ssaDataAdd
       if VarIsStr(Child.Value) then
       begin
@@ -14611,24 +14629,28 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessRestore(Node: TASTNode);
+// The operand this emits is a DATA-POOL INDEX, not a line number. It used to be the line number itself,
+// and the VM threw it away ("line-specific restore not implemented"), so EVERY form of RESTORE reset to
+// the first item: "RESTORE 100" in v7 and "Restore label" in FreeBASIC both silently read block one.
+// Resolving here is what makes the VM's side a single assignment - and the pool index is the only thing
+// the VM can act on, since by then the labels are gone.
 var
-  LineVal: TSSAValue;
+  Idx: Integer;
+  Key: string;
 begin
   if FCurrentBlock = nil then Exit;
 
+  Idx := 0;
   if Node.ChildCount > 0 then
   begin
-    // RESTORE with line number
-    LineVal := MakeSSAConstInt(Integer(Node.GetChild(0).Value));
-    EmitInstruction(ssaDataRestore, MakeSSAValue(svkNone), LineVal,
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-  end
-  else
-  begin
-    // RESTORE without line number - reset to beginning
-    EmitInstruction(ssaDataRestore, MakeSSAValue(svkNone), MakeSSAConstInt(0),
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Key := UpperCase(Trim(VarToStr(Node.GetChild(0).Value)));
+    Idx := StrToIntDef(FDataMarks.Values[Key], -1);
+    // An unknown target keeps the old behaviour (start of the pool) rather than failing the build: a
+    // RESTORE whose label names no DATA is legal and simply has nothing after it in v7.
+    if Idx < 0 then Idx := 0;
   end;
+  EmitInstruction(ssaDataRestore, MakeSSAValue(svkNone), MakeSSAConstInt(Idx),
+                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
 { Input commands implementation }
@@ -27277,6 +27299,20 @@ begin
     FVarPrintKind.AddObject('VALUINT', TObject(PtrInt(3)));
     FVarPrintKind.AddObject(kVALULNG, TObject(PtrInt(2)));
   end;
+  // The four byte/word extractors, same table and same reason. Their manual examples print the result
+  // straight, and every one of them came out a column wider than fbc's.
+  // ⚠️ The obvious reading -- "HiByte gives a BYTE, so it is a narrow unsigned, kind 3" -- is WRONG, and
+  // only asking fbc settled it: "HiByte(n) - 200" prints 18446744073709551587, not -29. They return a
+  // UINTEGER (64-bit unsigned here), exactly like ASC, so the unsignedness is CONTAGIOUS through
+  // arithmetic and the kind is 2, not 3. Kind 3 would have fixed the four examples and quietly left the
+  // arithmetic wrong -- the failure mode that a probe catches and a passing example does not.
+  if FModernMode then
+  begin
+    FVarPrintKind.AddObject(kHIBYTE, TObject(PtrInt(2)));
+    FVarPrintKind.AddObject(kLOBYTE, TObject(PtrInt(2)));
+    FVarPrintKind.AddObject(kHIWORD, TObject(PtrInt(2)));
+    FVarPrintKind.AddObject(kLOWORD, TObject(PtrInt(2)));
+  end;
   RegisterRecordVars(AST);
 
   // M6: collect DIM SHARED scalars and assign them dedicated transfer slots (runs after type
@@ -27377,6 +27413,11 @@ begin
   // PRE-PROCESS DATA STATEMENTS FIRST
   // In BASIC, DATA statements are collected before program execution,
   // so READ can access them regardless of their position in the source
+  // Both are per-PROGRAM state and the generator instance is reused (the REPL compiles into the same
+  // one), so they are cleared here rather than in the constructor - the same trap the print-kind table
+  // documents a few hundred lines below.
+  FDataMarks.Clear;
+  FDataCount := 0;
   PreProcessData(AST);
 
   // PRE-COLLECT SUB/FUNCTION DECLARATIONS so CALL sites can resolve parameter info even

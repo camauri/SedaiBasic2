@@ -13,8 +13,15 @@ entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, var
 build/platform directives, FFI, and the raw-allocator operators — `New`/`Delete Overload`,
 `Placement New` — which a managed record model cannot honour) — not runnable keywords for a portable
 bytecode VM. Of the
-**576 applicable** keywords, **566 (98%)** are implemented, and **5** are partial. See the
+**576 applicable** keywords, **562 (98%)** are implemented, and **5** are partial. See the
 [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
+
+> ⚠️ **This table is a hand-kept census and it drifts — in both directions.** Four ticks were withdrawn
+> on 5 Aug 2026 (`DRAW STRING`, `OPEN PIPE`, `OPEN COM`, `OPEN LPT`) after the FreeBASIC-examples sweep
+> stopped skipping the examples that prove them. The machine-checked inventory is
+> `job/tests/tools/kwcheck.ps1` (recognition) plus `job/tests/regress/sweep_fbexamples.sh` (behaviour
+> against fbc); where they disagree with this page, they are right. A tick here means "we believe it
+> works", not "something checked".
 
 ```
 [████████████████████████████████████████████████··] 97%
@@ -2277,11 +2284,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `FREEFILE` | ✓ | Lowest unused file number (1..15). Bare `FREEFILE` or `FREEFILE()`. |
 | `OPEN` | ✓ | `OPEN "f" FOR {INPUT\|OUTPUT\|APPEND\|BINARY\|RANDOM} AS [#]n` (FreeBASIC) and legacy `OPEN #n,"f",mode$`. Works headless (CLI) and in the console. |
-| `OPEN COM` | ✓ | Binds a file number to a communications port. |
+| `OPEN COM` | ✗ | Binds a file number to a communications port. **Not implemented**: the parser's device branch knows only `CONS`/`SCRN`/`ERR`, so `COM` is read as an ordinary word and its (empty) value becomes the filename; `IsReservedDeviceName` then refuses the string form outright. |
 | `OPEN CONS` | ✓ | Binds a file number to the standard input and output streams. |
 | `OPEN ERR` | ✓ | Binds a file number to the standard input and error streams. |
-| `OPEN LPT` | ✓ | Binds a file number to a printer device. |
-| `OPEN PIPE` | ✓ | Binds a file number to the input and output streams of a process. |
+| `OPEN LPT` | ✗ | Binds a file number to a printer device. **Not implemented**, same reason as `OPEN COM`. Deliberately never exercised by any net either: FreeBASIC's LPT support goes through the Windows print spooler, so running such an example queues a real job on a real printer. |
+| `OPEN PIPE` | ✗ | Binds a file number to the input and output streams of a process. **Not implemented**: the parser does not know `PIPE` at all, and the line is a syntax error. |
 | `OPEN SCRN` | ✓ | Binds a file number directly to the console. |
 | `CLOSE` | ✓ | Unbinds a file number from a file or device. |
 | `RESET` | ✓ | Unbinds all active file numbers (closes every open handle; alias of DCLEAR). |
@@ -2589,7 +2596,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `LINE (GRAPHICS)` | ✓ | `LINE [img,][STEP](x1,y1)-[STEP](x2,y2)[,color][,B\|BF]` draws a line (a leading image handle draws on that off-screen image), box outline (B) or filled box (BF) on the screen surface (via IGraphicsBackend; headless-testable + on-screen on sbv). Omitted start (`LINE -(x2,y2)`) draws from the current graphics point; `STEP` = relative coordinates (first STEP relative to the current point, second relative to the first point). Parenthesised form disambiguates from `LINE INPUT`. Line-style (dashed): a trailing 16-bit `style` mask (`LINE ...,color,[B|BF],style`) drawn MSB-first, repeating every 16 pixels. |
 | `CIRCLE` | ✓ | Plots circles and ellipses. C128 form (`CIRCLE source,x,y,...`) and FreeBASIC form (`CIRCLE [img,][STEP](x,y),r[,color]`, parenthesised (a leading image handle draws on that off-screen image) → routed through IGraphicsBackend, headless-testable + on-screen on sbv); `STEP` = centre relative to the current graphics point. Ellipse (aspect) and arcs (start/end angle) supported; the fill flag (F) and pie-slice for negative angles deferred. |
 | `DRAW` | ✓ | Draws in a sequence of commands on an image buffer or screen. |
-| `DRAW STRING` | ✓ | Writes text to an image buffer or screen. |
+| `DRAW STRING` | ✗ | Writes text to an image buffer or screen. **Not implemented**, and it fails in the worse of the two ways: only the Commodore `DRAW` is parsed, so `Draw String img,(x,y),text` is a syntax error while `Draw String (x,y),text,colour` is **accepted and draws nothing** — the framebuffer checksum is unchanged before and after. It produced an empty font mask in silence during the demo work. |
 | `PAINT` | ✓ | Flood fill. C128 form (`PAINT source,x,y`) and FreeBASIC form (`PAINT [img,][STEP](x,y),color[,border]`, parenthesised (a leading image handle fills that off-screen image) → routed through IGraphicsBackend, headless-testable). An optional border colour selects the boundary-fill form (fill up to the border colour); `STEP` = coordinate relative to the current graphics point. |
 
 #### Image Buffer Creation

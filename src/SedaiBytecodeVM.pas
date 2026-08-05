@@ -6362,6 +6362,40 @@ begin
   end;
 end;
 
+function DataItemToInt64(const V: Variant): Int64;
+// READ of a DATA item into an INTEGER variable. Its own function, not three lines inside
+// ExecuteInstruction: that routine is the dispatch loop and its SIZE is a measured cost
+// (see the notes on run-loop growth and dispatch alignment). bcDataReadInt is cold; a call is free here.
+//
+// Two things wrong with the "VarAsType(V, varInt64)" it replaces, and both were invisible until DATA
+// could hold a fractional value at all:
+//
+//  1. It CRASHED on one. A DATA item arrives from the parser as its TEXT, so "1.75" is a string, and
+//     FPC's string -> Int64 variant cast rejects a fractional string outright: "READ A%" with
+//     "DATA 1.75" died with EVariantError in CLASSIC. Pre-existing, and reproduced on the archived
+//     binary before blaming this change for it.
+//  2. It ROUNDED. fbc TRUNCATES toward zero here and only here: 435/4 reads as 108, 217.5 as 217,
+//     -435/4 as -108, while ORDINARY assignment rounds in fbc exactly as it does for us (a = 108.75
+//     gives 109 on both sides). Verified against fbc, one case per row, before changing anything.
+//     Truncation is also v7's rule for a "%" variable -- our own "A% = 1.75" already gives 1 -- so
+//     this needs no dialect gate: both dialects want the same answer.
+//
+// The integral cases stay EXACT on purpose. Routing everything through Double would lose precision
+// above 2^53, and a DATA item wide enough to notice is a plain integer, never a fraction.
+var
+  S: string;
+  I64: Int64;
+  FS: TFormatSettings;
+begin
+  if VarIsOrdinal(V) then Exit(VarAsType(V, varInt64));
+  if VarIsFloat(V) then Exit(Trunc(Double(V)));
+  S := Trim(VarToStr(V));
+  if TryStrToInt64(S, I64) then Exit(I64);
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';          // the SOURCE's decimal point, not the machine's locale
+  Result := Trunc(StrToFloatDef(S, 0.0, FS));
+end;
+
 procedure TBytecodeVM.ExecuteInstruction(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   Group: Word;
@@ -7080,8 +7114,9 @@ begin
         // Read next DATA value into int register
         if Ctx.DataIndex < Length(FDataPool) then
         begin
-          // Use VarAsType for proper Variant to Int64 conversion
-          Ctx.IntRegs[Instr.Dest] := VarAsType(FDataPool[Ctx.DataIndex], varInt64);
+          // fbc TRUNCATES a fractional DATA item here (unlike ordinary assignment, which rounds),
+          // and a fractional item used to crash the variant cast outright. See DataItemToInt64.
+          Ctx.IntRegs[Instr.Dest] := DataItemToInt64(FDataPool[Ctx.DataIndex]);
           Inc(Ctx.DataIndex);
         end
         else
@@ -7112,9 +7147,11 @@ begin
       end;
     bcDataRestore:
       begin
-        // Reset DATA pointer
-        // Immediate = line number (0 = beginning, ignored for now - line-specific restore not implemented)
-        Ctx.DataIndex := 0;
+        // Immediate = the DATA-POOL INDEX to resume from, already resolved from the line number or the
+        // label by ProcessRestore (0 = the beginning, which is what a bare RESTORE emits). It used to be
+        // the raw line number and was DISCARDED here, so "RESTORE 100" and "Restore label" both reset to
+        // the first item and answered from the wrong block without a word.
+        Ctx.DataIndex := Instr.Immediate;
       end;
     // Input commands
     bcGet:
