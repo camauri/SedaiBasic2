@@ -27,9 +27,38 @@
 ''  It walks one full camera circle, prints a frame-time report, and exits. There is no
 ''  user input on purpose: a fixed path makes two runs comparable.
 
-Const SCRW      = 320          '' 320x200 keeps a full-screen span cheap enough that the
-Const SCRH      = 200          ''   traversal, not the drawing, is what we are measuring.
-Const HORIZON   = 80           '' screen row of the eye line. Below centre, so more of the
+'' ---- THE TWO MODES -------------------------------------------------------------------
+'' VIDEO 0 : draw on screen, in real time. VIDEO 1 : write raw rgb24 frames to a file for
+'' ffmpeg, with no screen at all.
+''
+'' They are one renderer with two SINKS, not two programs, because the moment they became
+'' two files they would start to disagree about what they draw. What differs is a single
+'' routine, PaintSpan, and the resolution.
+''
+'' The resolutions are tied to the mode on purpose, because the two modes are gated on
+'' different things. Real time is gated on the FRAME: measured here, 640x480 costs 11 ms
+'' under the AOT - about 90 fps, with room to spare over 60 - while 1920x1080 costs 54 ms,
+'' which is watchable but not fluid. Offline is gated on the WHOLE RUN, and 600 frames at
+'' 54 ms is 33 seconds of rendering for 20 seconds of video: the frame time stops being a
+'' constraint the moment nobody is waiting for it.
+''
+''   fbc voxel_landscape.bas && ./voxel_landscape
+''   ffmpeg -f rawvideo -pix_fmt rgb24 -s 1920x1080 -r 30 -i frames.raw out.mp4
+''
+'' Measured, so the offline cost is not a surprise: a 1080p frame takes 107 ms to fill and
+'' write against 54 ms to draw on screen - the byte-at-a-time array writes cost about twice
+'' what Line does, which is the price of a format that cannot be got wrong. 600 frames is
+'' about a minute of rendering, and ⚠️ 3.7 GB of raw file: pipe it or delete it after.
+#define VIDEO 0
+
+#if VIDEO
+    Const SCRW  = 1920
+    Const SCRH  = 1080
+#else
+    Const SCRW  = 640          '' the crossover point, measured: at this size the traversal
+    Const SCRH  = 480          ''   and the span filling cost about the same (52% / 48%)
+#endif
+Const HORIZON   = SCRH * 2 \ 5 '' screen row of the eye line. Below centre, so more of the
                                ''   picture is ground than sky - the ground is the subject.
 Const MAPSZ     = 256          '' power of two so wrapping is an AND, not a modulo. Small
 Const MAPMASK   = MAPSZ - 1    ''   enough that world generation takes well under a second
@@ -42,8 +71,10 @@ Const ZFAR      = 220.0        '' where the world ends and the sky begins. Found
                                ''   the camera and raising it until no more detail appeared:
                                ''   past ~220 the terrain is under a pixel tall.
 Const ZSTEP     = 1.012        '' the step GROWTH factor - see the note in RenderFrame.
-Const VSCALE    = 150.0        '' vertical exaggeration. Empirical: 100 looked like a
-                               ''   pancake, 250 turned every slope into a cliff.
+Const VSCALE    = 0.75 * SCRH   '' vertical exaggeration, as a fraction of the screen height
+                               ''   so the framing does not change with the resolution.
+                               ''   Empirical at 200 rows: 100 looked like a pancake, 250
+                               ''   turned every slope into a cliff; 150 = 0.75 * 200.
 Const EYECLEAR     = 45.0         '' how far the eye rides ABOVE the ground under it. Not
                                ''   named CLEAR: that is a FreeBASIC keyword (the memset).
                                '' ⚠️ This replaced a fixed eye altitude, and the instrument
@@ -65,7 +96,21 @@ Const FRAMES    = 600          '' one full circle. The run ends here so it can b
 Const STATN     = 120          '' frame-time window the on-screen counter reports on.
 
 Dim Shared As UByte    hmap(MAPSZ * MAPSZ - 1)   '' altitude, 0..255
+'' The surface colour is kept BOTH ways, and the reason is portability, not convenience.
+'' RGB() packs its three channels into an integer whose BYTE ORDER is the compiler's business,
+'' not ours - so a raw file written from packed values would come out with red and blue
+'' swapped on one of the two targets and nobody would notice until the video was watched.
+'' The packed form feeds Line, which wants exactly what RGB() returns; the three byte arrays
+'' feed the raw file, where every byte's meaning is written down. 192 KB for the three at
+'' this map size, which buys a format that cannot be got wrong.
 Dim Shared As UInteger cmap(MAPSZ * MAPSZ - 1)   '' surface colour, precomputed with it
+Dim Shared As UByte    cmR(MAPSZ * MAPSZ - 1)
+Dim Shared As UByte    cmG(MAPSZ * MAPSZ - 1)
+Dim Shared As UByte    cmB(MAPSZ * MAPSZ - 1)
+#if VIDEO
+    '' One frame, rgb24, exactly the bytes ffmpeg is told to expect.
+    Dim Shared As UByte fbuf(SCRW * SCRH * 3 - 1)
+#endif
 Dim Shared As Integer  ybuf(SCRW - 1)            '' the occlusion state, one row per column
 
 '' Insertion sort, in place. Used by both the on-screen window and the end-of-run report, so
@@ -144,9 +189,32 @@ Sub BuildWorld()
             '' Phase 1 keeps the colour a plain function of altitude: dark green in the
             '' valleys through to pale grey on the tops. Banding with soft transitions is
             '' a phase 2 job; doing it here would hide whether the RENDERER is right.
+            cmR(y * MAPSZ + x) = 60 + h \ 3
+            cmG(y * MAPSZ + x) = 90 + h \ 2
+            cmB(y * MAPSZ + x) = 60 + h \ 4
             cmap(y * MAPSZ + x) = RGB(60 + h \ 3, 90 + h \ 2, 60 + h \ 4)
         Next
     Next
+End Sub
+
+'' The one routine that differs between the two modes. Everything above and below it - the
+'' world, the camera, the traversal, the y-buffer - is shared, which is the point: the video
+'' is of the same renderer, not of a second one that drifted.
+'' In VIDEO mode there is no Line and no screen to draw on; the span goes straight into the
+'' frame as bytes. That also makes the video build HEADLESS: it needs no display at all,
+'' which is how an offline render actually gets run.
+Sub PaintSpan(ByVal x As Integer, ByVal y0 As Integer, ByVal y1 As Integer, ByVal ci As Integer)
+#if VIDEO
+    Dim As Integer i, o
+    For i = y0 To y1
+        o = (i * SCRW + x) * 3
+        fbuf(o)     = cmR(ci)
+        fbuf(o + 1) = cmG(ci)
+        fbuf(o + 2) = cmB(ci)
+    Next
+#else
+    Line (x, y0)-(x, y1), cmap(ci)
+#endif
 End Sub
 
 '' -------------------------------------------------------------------------------------
@@ -168,9 +236,15 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
         ybuf(x) = SCRH                               '' nothing drawn yet: fill to the bottom
     Next
 
-    '' Sky first, as one filled rectangle. Cheaper than leaving the sky to the column
-    '' loop, and it means a column that hits nothing needs no special case.
+    '' Sky first, over the whole frame. Cheaper than leaving the sky to the column loop, and
+    '' it means a column that hits nothing needs no special case.
+#if VIDEO
+    For i = 0 To SCRW * SCRH * 3 - 1 Step 3
+        fbuf(i) = 120 : fbuf(i + 1) = 160 : fbuf(i + 2) = 210
+    Next
+#else
     Line (0, 0)-(SCRW - 1, SCRH - 1), RGB(120, 160, 210), BF
+#endif
 
     For x = 0 To SCRW - 1
         camc = (x / (SCRW / 2.0)) - 1.0
@@ -200,7 +274,7 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
                 '' One vertical span, drawn once. Measured on this machine: a full-height
                 '' Line is about thirteen times cheaper than the PSet calls that would
                 '' cover the same pixels, which is why the renderer thinks in spans.
-                Line (x, ytop)-(x, ybot), cmap(my * MAPSZ + mx)
+                PaintSpan(x, ytop, ybot, my * MAPSZ + mx)
                 ybuf(x) = ytop
                 '' The column is full to the top: no sample further out can ever be seen
                 '' through it. This early exit is what makes the cost sublinear in the
@@ -233,7 +307,13 @@ Dim As Integer f, i, j
 Dim As Double a, camx, camy, camh
 Dim As Double allft(FRAMES - 1)      '' every frame, for the report at the end
 
-ScreenRes SCRW, SCRH, 32
+#if VIDEO
+    '' No ScreenRes: the video build never draws on a screen, so it does not need one.
+    Dim As Integer fh = FreeFile
+    Open "frames.raw" For Binary Access Write As #fh
+#else
+    ScreenRes SCRW, SCRH, 32
+#endif
 BuildWorld()
 
 For f = 0 To FRAMES - 1
@@ -248,6 +328,11 @@ For f = 0 To FRAMES - 1
     '' The eye rides the ground rather than sitting at a fixed altitude - see EYECLEAR.
     camh = hmap((Int(camy) And MAPMASK) * MAPSZ + (Int(camx) And MAPMASK)) + EYECLEAR
 
+#if VIDEO
+    RenderFrame(camx, camy, a + 1.5707963267948966, camh)
+    Put #fh, , fbuf()                       '' one frame, rgb24, straight out
+    If (f Mod 60) = 0 Then Print "frame "; f; " / "; FRAMES
+#else
     ScreenLock
     RenderFrame(camx, camy, a + 1.5707963267948966, camh)   '' facing along the circle
     '' The counter is drawn AFTER the terrain, and that is not a style choice: PRINT
@@ -258,6 +343,7 @@ For f = 0 To FRAMES - 1
         Print Using "fps ###.# | med ####.# ms | worst ####.# ms"; fps; med; worst
     End If
     ScreenUnlock
+#endif
 
     t1 = Timer
     ms = (t1 - t0) * 1000.0
@@ -292,3 +378,9 @@ Print Using "median          : ####.### ms"; rep(n \ 2)
 Print Using "p99             : ####.### ms"; rep(Int(n * 0.99))
 Print Using "worst           : ####.### ms"; rep(n - 1)
 Print Using "p99 / median    : ##.###";    rep(Int(n * 0.99)) / rep(n \ 2)
+#if VIDEO
+    Close #fh
+    Print
+    Print "wrote frames.raw -- "; FRAMES; " frames, rgb24, "; SCRW; "x"; SCRH
+    Print "ffmpeg -f rawvideo -pix_fmt rgb24 -s "; SCRW; "x"; SCRH; " -r 30 -i frames.raw out.mp4"
+#endif
