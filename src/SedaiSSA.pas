@@ -13317,7 +13317,7 @@ end;
 procedure TSSAGenerator.ProcessLocate(Node: TASTNode);
 var
   TempReg: Integer;
-  XVal, YVal: TSSAValue;
+  XVal, YVal, CursorVal: TSSAValue;
   XReg, YReg: TSSAValue;
 begin
   // MODERN: every argument of LOCATE is optional and defaults to 0, which means "leave that coordinate
@@ -13329,9 +13329,13 @@ begin
     WriteLn(StdErr, 'LOCATE: requires x, y coordinates');
     Exit;
   end;
-
-  // Process X coordinate
-  ProcessExpression(Node.GetChild(0), XVal);
+  // Process X coordinate. The nil test is belt-and-braces: the parser no longer builds a nil child for
+  // an omitted argument (it emits a literal 0 - see the note there, where eight statements were dying
+  // on one), but this reads a child by index and a crash is too high a price for trusting that.
+  if Node.GetChild(0) = nil then
+    XVal := MakeSSAConstInt(0)
+  else
+    ProcessExpression(Node.GetChild(0), XVal);
   if XVal.Kind = svkConstInt then
   begin
     TempReg := FProgram.AllocRegister(srtInt);
@@ -13351,8 +13355,9 @@ begin
   else
     XReg := MakeSSAValue(svkNone);
 
-  // Process Y coordinate. Absent (MODERN "Locate 10") it is 0 = "keep the current column".
-  if Node.ChildCount >= 2 then
+  // Process Y coordinate. Absent (MODERN "Locate 10") OR omitted ("Locate 10,, 1") it is 0 = "keep the
+  // current column" - the same rule, and the nil placeholder is the omitted spelling of it.
+  if (Node.ChildCount >= 2) and (Node.GetChild(1) <> nil) then
     ProcessExpression(Node.GetChild(1), YVal)
   else
     YVal := MakeSSAConstInt(0);
@@ -13374,6 +13379,16 @@ begin
     YReg := YVal
   else
     YReg := MakeSSAValue(svkNone);
+
+  // FreeBASIC's third argument is the CURSOR VISIBILITY flag ("Locate row, col, cursor"). We do not
+  // model a visible text cursor headless, so there is nothing to set - but the argument still has to be
+  // CONSUMED. Left alone it reached the statement walker as an orphan and printed
+  // "[SSA] WARNING: Unhandled node type 0" for every such LOCATE. Pre-existing (it reproduces on the
+  // archived 6a14e23 binary with "Locate 3, 20, 1"); it only became easy to see once the omitted-argument
+  // crash stopped hiding it. Evaluated rather than skipped, so a call or an assignment inside the
+  // expression still happens.
+  if (Node.ChildCount >= 3) and (Node.GetChild(2) <> nil) then
+    ProcessExpression(Node.GetChild(2), CursorVal);
 
   // The two dialects mean different things by LOCATE, and each keeps its own.
   // CLASSIC (C128 v7): "LOCATE x, y" positions the bit-map PIXEL cursor.

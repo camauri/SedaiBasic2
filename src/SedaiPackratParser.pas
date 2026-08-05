@@ -5673,7 +5673,12 @@ begin
   else if CmdName = 'BOX' then
     MaxParams := 8
   else if CmdName = 'LOCATE' then
-    MaxParams := 2
+    // THREE, not two. FreeBASIC's form is "Locate [row][, [col][, [cursor]]]" and the third argument
+    // was never parsed: the parser stopped after two and left ", 1" in the token stream, where it became
+    // a STATEMENT of its own - an orphan the SSA walker met as "Unhandled node type 0" and warned about
+    // once per LOCATE. Pre-existing (reproduces on the archived 6a14e23 binary with "Locate 3, 20, 1");
+    // ProcessLocate now evaluates the flag and documents why there is nothing to set headless.
+    MaxParams := 3
   else if CmdName = 'DRAW' then
     MaxParams := 100  // DRAW can have many TO segments
   else if (CmdName = 'SCNCLR') or (CmdName = 'CLS') then
@@ -5711,11 +5716,11 @@ begin
   // Each segment (including TO keyword) is stored as children
   if CmdName = 'DRAW' then
   begin
-    // Parse optional color (can be omitted but comma must remain)
+    // Parse optional color (can be omitted but comma must remain).
+    // A literal 0, NOT a nil placeholder - see the note at the general omitted-parameter site below.
     if Context.Check(ttSeparParam) then
     begin
-      // Color omitted, add nil placeholder
-      Result.AddChild(nil);
+      Result.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Context.CurrentToken));
       Context.Advance;
     end
     else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
@@ -5768,11 +5773,22 @@ begin
     // Handle optional parameters: empty params (,,) add nil placeholder
     while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) and (ParamCount < MaxParams) do
     begin
-      // Check for empty parameter (comma without expression)
+      // An OMITTED parameter ("Circle , x, y, r", "Locate , 20", "GShape a$, , y") keeps its position
+      // so the ones after it still line up. That placeholder used to be a NIL CHILD, and not one of the
+      // handlers downstream expected it: every single one called ProcessExpression on it and took an
+      // ACCESS VIOLATION that killed the whole SSA generation. Eight of the eleven graphics statements
+      // died on their own documented syntax - Circle, SetColor, Paint, Window, SShape, GShape, Draw and
+      // Locate - and the one that surfaced it, threads/threadcall.bas, has nothing to do with threads:
+      // it writes "Locate , 20" to line up a column.
+      //
+      // A literal 0 instead. Nothing downstream ever DISTINGUISHED nil from 0 - it could not, it crashed
+      // first - so this cannot change a program that works today, and 0 is already what each of these
+      // commands means by an omitted argument: source page 0, colour 0, "keep the current coordinate"
+      // for LOCATE (the VM resolves that one). One fix where the placeholder is BORN, rather than the
+      // same guard repeated at thirty-odd call sites that would each have to remember it.
       if Context.Check(ttSeparParam) then
       begin
-        // Add nil placeholder for omitted parameter
-        Result.AddChild(nil);
+        Result.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Context.CurrentToken));
         Inc(ParamCount);
         Context.Advance;
         Continue;
