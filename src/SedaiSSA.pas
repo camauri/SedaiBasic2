@@ -355,6 +355,8 @@ type
     // Stage arguments into transfer slots and emit ssaCallSub (shared by CALL and FUNCTION).
     procedure EmitProcedureCall(const Name: string; ArgListNode: TASTNode);
     procedure StageCallArgs(const ParamOwnerName: string; ArgListNode: TASTNode);  // args -> xfer
+    procedure MarkRawPointerParam(ParamNode, ArgNode: TASTNode);   // raw-ness crosses the call here
+    procedure PropagateRawArgs(const CalleeName: string; ArgListNode: TASTNode);  // ...for a whole call
     function ProcIsVariadic(const NameU: string): Boolean;                        // declared "(..., ...)"
     function ProcDeclaredParamCount(const NameU: string): Integer;
     procedure EmitVarArgStage(const NameU: string; ArgListNode: TASTNode);        // stage the SURPLUS arguments
@@ -23311,8 +23313,51 @@ begin
     LhsU := UpperCase(VarToStr(Node.GetChild(0).Value));
     ConsiderRaw(LhsU, Node.GetChild(2));
   end;
+
+  // A CALL: raw-ness crosses into the callee's pointer PARAMETERS. It has to be
+  // decided HERE, in the fixpoint, and not while the call is lowered - a
+  // procedure's body may be lowered BEFORE the call that would have marked it
+  // (PlotPixel is declared before the DrawLine that calls it), and then its p[i]
+  // has already taken the managed path. That is not a loud failure: with
+  // optimizations on, SUB inlining hides it entirely, and the only tell was
+  // --no-opt drawing 422 pixels where the optimized build drew 430.
+  // The fixpoint is what makes it transitive: pass 1 marks DrawLine's pointer
+  // from the raw argument at the module level, pass 2 marks PlotPixel's from
+  // DrawLine's now-raw one.
+  if (Node.ChildCount >= 2) and (Node.GetChild(1) <> nil) and
+     (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) then
+  begin
+    if Node.GetChild(0).NodeType = antIdentifier then
+      PropagateRawArgs(VarToStr(Node.GetChild(0).Value), Node.GetChild(1));
+    PropagateRawArgs(VarToStr(Node.Value), Node.GetChild(1));
+  end
+  else if (Node.NodeType = antFunctionCall) and (Node.ChildCount >= 1) and
+          (Node.GetChild(0) <> nil) and
+          (Node.GetChild(0).NodeType in [antArgumentList, antExpressionList]) then
+    PropagateRawArgs(VarToStr(Node.Value), Node.GetChild(0));
+
   for i := 0 to Node.ChildCount - 1 do
     CollectRawPtrVars(Node.GetChild(i));
+end;
+
+procedure TSSAGenerator.PropagateRawArgs(const CalleeName: string; ArgListNode: TASTNode);
+// Mark the callee's pointer parameters raw wherever the matching ARGUMENT is raw.
+// See MarkRawPointerParam for why the argument, and not the pointee type, is the
+// thing that decides.
+var
+  Decl, ParamList: TASTNode;
+  i: Integer;
+begin
+  if (ArgListNode = nil) or (CalleeName = '') then Exit;
+  if not (FProcDecls.TryGetValue(UpperCase(CalleeName), Decl) and Assigned(Decl) and
+          (Decl.ChildCount >= 2)) then Exit;
+  ParamList := Decl.GetChild(1);
+  if ParamList = nil then Exit;
+  for i := 0 to ParamList.ChildCount - 1 do
+  begin
+    if i >= ArgListNode.ChildCount then Break;
+    MarkRawPointerParam(ParamList.GetChild(i), ArgListNode.GetChild(i));
+  end;
 end;
 
 function TSSAGenerator.IsRawReturnExpr(Node: TASTNode): Boolean;
@@ -25972,6 +26017,44 @@ begin
                   MakeSSAValue(svkNone), MakeSSAConstInt(1));
 end;
 
+procedure TSSAGenerator.MarkRawPointerParam(ParamNode, ArgNode: TASTNode);
+// A pointer PARAMETER is raw when the ARGUMENT passed to it is raw.
+//
+// What makes a pointer raw is not its type but where its VALUE came from -
+// Allocate/CAllocate/SCREENPTR give a byte offset, "@x" gives a managed packed
+// address - and a parameter is precisely the place that information was lost.
+// CollectRawPtrVars answers it for every DIM by scanning assignments; a
+// parameter has no assignment to scan, so the answer has to cross the call, and
+// this is the one point that sees both sides.
+//
+// It works here because procedure bodies are lowered AFTER the module body
+// (LowerDeferredProcedures), so the mark is already in place when the callee's
+// own p[i] is lowered. ⚠️ A call from one procedure to another lowered EARLIER
+// still misses; that degrades to the old behaviour, never to something wrong.
+//
+// ⛔ Deliberately narrow. Asking instead "is the pointee a non-record type"
+// looks equivalent and is not - a managed pointer to a scalar exists ("@x"), and
+// widening it that way broke ptr5_fieldptr, ptr6_subarg and two more.
+var
+  PT, Pointee, PN: string;
+begin
+  if (ParamNode = nil) or (ArgNode = nil) or (ParamNode.ChildCount < 1) then Exit;
+  PT := UpperCase(VarToStr(ParamNode.GetChild(0).Value));
+  if (Length(PT) < 5) or (Copy(PT, Length(PT) - 3, 4) <> ' PTR') then Exit;
+  Pointee := Trim(Copy(PT, 1, Length(PT) - 4));
+  // "T Ptr" with T a UDT stays a MANAGED record handle, and "T Ptr Ptr" is
+  // already raw by construction (IsRawPtr) - neither belongs here.
+  if (Pointee = '') or (FindUDT(Pointee) >= 0) or (Pos(' PTR', Pointee) > 0) then Exit;
+  if RawPtrExprName(ArgNode) = '' then Exit;      // the argument is not raw: nothing to carry over
+  PN := UpperCase(VarToStr(ParamNode.Value));
+  if PN = '' then Exit;
+  if FRawPtrVars.IndexOf(PN) < 0 then
+  begin
+    FRawPtrVars.Add(PN);
+    FRawCollectChanged := True;   // the fixpoint must run again: this can feed another call
+  end;
+end;
+
 procedure TSSAGenerator.StageCallArgs(const ParamOwnerName: string; ArgListNode: TASTNode);
 // Evaluate each argument, coerce to the parameter's type, and stage it into the matching transfer slot.
 // The parameter layout is taken from ParamOwnerName's declaration (so a virtual call stages per the base
@@ -26003,6 +26086,10 @@ begin
   SetLength(StageRTs, ParamList.ChildCount);
   SetLength(StageVals, ParamList.ChildCount);
   NStage := 0;
+
+  // Raw-pointer PROVENANCE crosses the call here, and nowhere else.
+  for i := 0 to NArgs - 1 do
+    MarkRawPointerParam(ParamList.GetChild(i), ArgListNode.GetChild(i));
 
   // Phase 1: evaluate every explicit argument (in source order, preserving side-effect order) into a
   // bank register, recording its target transfer slot.
