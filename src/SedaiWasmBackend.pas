@@ -94,6 +94,12 @@ type
     FStateLocal: LongWord;
     FResultTmp: array[TSSARegisterType] of LongWord;
     FSlotBase: array[TSSARegisterType] of LongWord;
+    FRawTmp: LongWord;            // i64: a raw pointer being decoded
+    FGfxP, FGfxN: LongWord;       // i32: the ScreenRes fill cursor and counter
+
+    // --- graphics -------------------------------------------------------
+    FUsesGfx: Boolean;
+    FScrW, FScrH: LongWord;       // WASM globals holding the screen geometry
 
     FBankBase: array[TSSARegisterType] of Integer;
     FFlatCount: Integer;
@@ -113,6 +119,7 @@ type
     FImportCount: LongWord;
     FWriteFunc, FPrintIntFunc, FPrintUIntFunc, FPrintNlFunc: LongWord;
     procedure ScanForPrint;
+    procedure EmitRawAddr(B: TWasmBuf);
     procedure EmitPrintHelpers;
     function EmitRegion(R: Integer): Boolean;
     function EmitInstr(B: TWasmBuf; Instr: TSSAInstruction; R: Integer): Boolean;
@@ -148,6 +155,19 @@ const
   CONST_SPACE  = 64;      // a literal ' '
   CONST_NL     = 65;      // a literal LF
 
+  { The two REGIONS a tagged raw pointer can name (SedaiSSATypes): region 0 is
+    the byte heap Allocate returns, region 1 the framebuffer SCREENPTR returns.
+    A pointer carries a byte OFFSET, never an address, so here each region is a
+    fixed base in linear memory and the offset is added to it. The framebuffer
+    starts on a page boundary so growing for it is exact. }
+  HEAP_BASE    = 1024;
+  FB_BASE      = 65536;
+  { The framebuffer's initial contents are not zero, and this is MEASURED, not
+    inferred: a fresh ScreenRes leaves every pixel at $FF000000 (ARGB black,
+    full alpha). Linear memory starts zeroed, so the fill has to be emitted or
+    the very first byte of every comparison would differ. }
+  FB_CLEAR     = -16777216;    // $FF000000 as a signed i32
+
 { ---------------- PRINT ----------------
 
   The host import is a BYTE SINK - write(ptr, len) - and nothing else. The
@@ -159,21 +179,44 @@ const
   measures byte for byte - the plan rules that out, and it is the whole reason
   the sink is this narrow. }
 
+procedure TWasmBackend.EmitRawAddr(B: TWasmBuf);
+{ Takes a tagged raw pointer (i64) off the stack and leaves the linear address
+  (i32) it names. The pointer carries a byte OFFSET in its low 61 bits and a
+  region selector in bit 61, so the address is offset + the region's base -
+  chosen with a select rather than a branch. }
+begin
+  B.LocalTee(FRawTmp);
+  B.I64Const(RAWPTR_OFS_MASK);
+  B.Op(wopI64And);
+  B.Op(wopI32WrapI64);
+  B.I32Const(FB_BASE);
+  B.I32Const(HEAP_BASE);
+  B.LocalGet(FRawTmp);
+  B.I64Const(RAWPTR_REGION_FB);
+  B.Op(wopI64And);
+  B.Op(wopI64Eqz);
+  B.Op(wopI32Eqz);          // 1 when the region bit is set -> the framebuffer
+  B.Op(wopSelect);
+  B.Op(wopI32Add);
+end;
+
 procedure TWasmBackend.ScanForPrint;
 var
   i, j: Integer;
   Blk: TSSABasicBlock;
 begin
   FUsesPrint := False;
+  FUsesGfx := False;
   for i := 0 to FProg.Blocks.Count - 1 do
   begin
     Blk := FProg.Blocks[i];
     for j := 0 to Blk.Instructions.Count - 1 do
-      if TSSAInstruction(Blk.Instructions[j]).OpCode in
-         [ssaPrintInt, ssaPrintIntLn, ssaPrintNewLine, ssaPrintUInt] then
-      begin
-        FUsesPrint := True;
-        Exit;
+      case TSSAInstruction(Blk.Instructions[j]).OpCode of
+        ssaPrintInt, ssaPrintIntLn, ssaPrintNewLine, ssaPrintUInt:
+          FUsesPrint := True;
+        ssaGfxScreenRes, ssaGfxScreenPtr, ssaGfxScreenInfo,
+        ssaRawLoadInt, ssaRawStoreInt:
+          FUsesGfx := True;
       end;
   end;
 end;
@@ -973,6 +1016,114 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
+    { ---- linear memory and SCREENPTR ---------------------------------- }
+
+    ssaGfxScreenRes:
+      begin
+        if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt > 1) then
+          Exit(Fail('SCREENRES with more than one page is not modelled yet'));
+        LoadReg(B, Instr.Src1); B.Op(wopI32WrapI64); B.GlobalSet(FScrW);
+        LoadReg(B, Instr.Src2); B.Op(wopI32WrapI64); B.GlobalSet(FScrH);
+
+        // grow linear memory to cover FB_BASE + w*h*4, if it does not already
+        B.GlobalGet(FScrW); B.GlobalGet(FScrH); B.Op(wopI32Mul);
+        B.I32Const(4); B.Op(wopI32Mul);
+        B.I32Const(FB_BASE + 65535); B.Op(wopI32Add);
+        B.I32Const(65536); B.Op(wopI32DivU);          // pages needed
+        B.LocalTee(FGfxN);
+        B.Op(wopMemorySize); B.U8(0);
+        B.Op(wopI32GtS);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(FGfxN);
+          B.Op(wopMemorySize); B.U8(0);
+          B.Op(wopI32Sub);
+          B.Op(wopMemoryGrow); B.U8(0);
+          B.Op(wopDrop);
+        B.EndOp;
+
+        // and fill it the way the interpreter does - NOT with zero
+        B.I32Const(FB_BASE); B.LocalSet(FGfxP);
+        B.GlobalGet(FScrW); B.GlobalGet(FScrH); B.Op(wopI32Mul); B.LocalSet(FGfxN);
+        B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+          B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(FGfxN); B.Op(wopI32Eqz); B.BrIf(1);
+            B.LocalGet(FGfxP); B.I32Const(FB_CLEAR); B.OpMem(wopI32Store, 2, 0);
+            B.LocalGet(FGfxP); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(FGfxP);
+            B.LocalGet(FGfxN); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(FGfxN);
+            B.Br(0);
+          B.EndOp;
+        B.EndOp;
+      end;
+
+    ssaGfxScreenPtr:
+      begin
+        // Offset 0 of the framebuffer region - but 0 when there is no screen,
+        // because FreeBASIC answers 0 rather than a pointer that fails later.
+        B.GlobalGet(FScrW);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I64Const(RAWPTR_TAG or RAWPTR_REGION_FB);
+          StoreReg(B, Instr.Dest);
+        B.Op(wopElse);
+          B.I64Const(0);
+          StoreReg(B, Instr.Dest);
+        B.EndOp;
+      end;
+
+    ssaGfxScreenInfo:
+      begin
+        // 0=width 1=height 2=depth(32) 3=bytes per pixel(4) 4=pitch(w*4), else 0
+        if Instr.Src3.Kind <> svkConstInt then
+          Exit(Fail('__SCRINFO with a non-constant selector'));
+        case Instr.Src3.ConstInt of
+          0: begin B.GlobalGet(FScrW); B.Op(wopI64ExtendI32S); end;
+          1: begin B.GlobalGet(FScrH); B.Op(wopI64ExtendI32S); end;
+          2: B.I64Const(32);
+          3: B.I64Const(4);
+          4: begin
+               B.GlobalGet(FScrW); B.I32Const(4); B.Op(wopI32Mul);
+               B.Op(wopI64ExtendI32S);
+             end;
+        else
+          B.I64Const(0);
+        end;
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaRawLoadInt:
+      begin
+        if Instr.Src3.Kind <> svkConstInt then
+          Exit(Fail('a raw load without a constant element type code'));
+        LoadReg(B, Instr.Src1);
+        EmitRawAddr(B);
+        // every width SIGN-extends, exactly as RawLoadInt does - a ULong Ptr
+        // deref comes back negative in the interpreter too, and the backend
+        // reproduces the interpreter rather than correcting it
+        case Instr.Src3.ConstInt of
+          RTC_I8:  B.OpMem(wopI64Load8S, 0, 0);
+          RTC_I16: B.OpMem(wopI64Load16S, 1, 0);
+          RTC_I32: B.OpMem(wopI64Load32S, 2, 0);
+        else
+          B.OpMem(wopI64Load, 3, 0);
+        end;
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaRawStoreInt:
+      begin
+        if Instr.Src3.Kind <> svkConstInt then
+          Exit(Fail('a raw store without a constant element type code'));
+        LoadReg(B, Instr.Src1);
+        EmitRawAddr(B);
+        LoadReg(B, Instr.Src2);
+        case Instr.Src3.ConstInt of
+          RTC_I8:  B.OpMem(wopI64Store8, 0, 0);
+          RTC_I16: B.OpMem(wopI64Store16, 1, 0);
+          RTC_I32: B.OpMem(wopI64Store32, 2, 0);
+        else
+          B.OpMem(wopI64Store, 3, 0);
+        end;
+      end;
+
     ssaNarrowInt:
       begin
         // Width codes are NarrowInt64's: 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32,
@@ -1174,11 +1325,16 @@ begin
   FResultTmp[srtInt] := LongWord(P + 1);
   FResultTmp[srtFloat] := LongWord(P + 2);
   FResultTmp[srtString] := LongWord(P + 3);
-  SetLength(Locals, 4);
+  FRawTmp := LongWord(P + 4);
+  FGfxP := LongWord(P + 5);
+  FGfxN := LongWord(P + 6);
+  SetLength(Locals, 7);
   Locals[0] := wvtI32;                       // dispatch state
   Locals[1] := wvtI64; Locals[2] := wvtF64; Locals[3] := wvtI32;
+  Locals[4] := wvtI64;                       // raw pointer being decoded
+  Locals[5] := wvtI32; Locals[6] := wvtI32;  // ScreenRes fill cursor + counter
   // one local per transfer slot this region mentions
-  k := P + 4;
+  k := P + 7;
   for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
   begin
     FSlotBase[RT] := LongWord(k);
@@ -1303,6 +1459,7 @@ end;
 function TWasmBackend.Compile: Boolean;
 var
   r: Integer;
+  Init: TWasmBuf;
 begin
   FError := '';
   if not BuildPartition then Exit(False);
@@ -1324,11 +1481,27 @@ begin
   if not BuildSignatures then Exit(False);
   if not DetectRecursion then Exit(False);
 
-  if FUsesPrint then
+  if FUsesPrint or FUsesGfx then
   begin
+    // One page to start with; ScreenRes grows it to cover the framebuffer. The
+    // memory is exported so a differential can read the framebuffer out without
+    // the program having to print it.
     FModule.DefineMemory(1, 0);
     FModule.DataSegment(CONST_SPACE, PByte(PAnsiChar(' '#10)), 2);
     FModule.ExportMemory('memory');
+  end;
+  if FUsesGfx then
+  begin
+    Init := TWasmBuf.Create;
+    try
+      Init.I32Const(0); FScrW := FModule.DefineGlobal(wvtI32, True, Init);
+      Init.Clear;
+      Init.I32Const(0); FScrH := FModule.DefineGlobal(wvtI32, True, Init);
+    finally
+      Init.Free;
+    end;
+    FModule.ExportGlobal('screen_w', FScrW);
+    FModule.ExportGlobal('screen_h', FScrH);
   end;
 
   // Functions have to be numbered before any of them is emitted, because a call
