@@ -261,6 +261,8 @@ type
     // zero-padded to its stride so a jagged multi-dim initializer stays row-aligned. Level = brace depth.
     procedure ParseArrayInitBraceGroup(InitList: TASTNode; const DimSizes: array of Integer; Level: Integer);
     function ConstDimSizes(DimsNode: TASTNode): TDimSizeArray;
+    // Optional "= { ... }" / "=> { ... }" array initializer on an already-built antArrayDecl.
+    procedure ParseOptionalArrayInit(Decl, Dimensions: TASTNode; const Tok: TLexerToken);
     function AtEndType: Boolean;
     procedure ConsumeEndType;
     // WITH obj / ... / END WITH : a leading '.field' resolves against obj. Parse-time desugar.
@@ -7766,7 +7768,7 @@ var
   VarName: TASTNode;
   Dimensions: TASTNode;
   Token, TypeTok: TLexerToken;
-  InitList, ValExpr, MemberNode: TASTNode;
+  MemberNode: TASTNode;
 begin
   Token := Context.CurrentToken;
 
@@ -7869,31 +7871,35 @@ begin
     end;
   end;
 
-  // FreeBASIC array initializer: "DIM arr(dims) AS type = { v0, v1, ... }" or "=> { ... }". Both '=' and
-  // '=>' are valid initializer signs (FB manual: plain '=' is the common form, '=>' avoids the declaration
-  // resembling an expression); "=>" is lexed as '=' then '>'. Parse the brace value list into an
-  // antArgumentList child (marked ARRAYINIT); the SSA stores each value into the corresponding element
-  // after allocating the array.
-  if Context.Check(ttOpEq) and Assigned(Context.PeekNext) and
-     ((Context.PeekNext.TokenType = ttOpGt) or (Context.PeekNext.TokenType = ttDelimBraceOpen)) then
-  begin
-    Context.Advance;                                  // =
-    if Context.Check(ttOpGt) then Context.Advance;    // optional '>' (=> form)
-    if Context.Check(ttDelimBraceOpen) then
-    begin
-      InitList := TASTNode.Create(antArgumentList, Token);
-      // flattens any nested {..} row-major, zero-padding short rows when the dimensions are all constant
-      SetLength(FInitLevelSizes, 0);
-      ParseArrayInitBraceGroup(InitList, ConstDimSizes(Dimensions), 0);
-      Result.Attributes.Values['ARRAYINIT'] := '1';
-      // Per-level item counts, so a "n TO ..." ellipsis dimension deduces its size from the matching
-      // brace-nesting level (level 0 = dim 0, level 1 = dim 1, ...) rather than the flat element total.
-      InitList.Attributes.Values['LEVELSIZES'] := JoinIntCsv(FInitLevelSizes);
-      Result.AddChild(InitList);                      // initializer values (antArgumentList)
-    end;
-  end;
+  ParseOptionalArrayInit(Result, Dimensions, Token);
 
   DoNodeCreated(Result);
+end;
+
+procedure TPackratParser.ParseOptionalArrayInit(Decl, Dimensions: TASTNode; const Tok: TLexerToken);
+// FreeBASIC array initializer: "DIM arr(dims) AS type = { v0, v1, ... }" or "=> { ... }". Both '=' and
+// '=>' are valid initializer signs (FB manual: plain '=' is the common form, '=>' avoids the declaration
+// resembling an expression); "=>" is lexed as '=' then '>'. Parse the brace value list into an
+// antArgumentList child (marked ARRAYINIT); the SSA stores each value into the corresponding element
+// after allocating the array. Shared by DIM/REDIM-style array declarations and STATIC arrays.
+var
+  InitList: TASTNode;
+begin
+  if not (Context.Check(ttOpEq) and Assigned(Context.PeekNext) and
+          ((Context.PeekNext.TokenType = ttOpGt) or (Context.PeekNext.TokenType = ttDelimBraceOpen))) then
+    Exit;
+  Context.Advance;                                  // =
+  if Context.Check(ttOpGt) then Context.Advance;    // optional '>' (=> form)
+  if not Context.Check(ttDelimBraceOpen) then Exit;
+  InitList := TASTNode.Create(antArgumentList, Tok);
+  // flattens any nested {..} row-major, zero-padding short rows when the dimensions are all constant
+  SetLength(FInitLevelSizes, 0);
+  ParseArrayInitBraceGroup(InitList, ConstDimSizes(Dimensions), 0);
+  Decl.Attributes.Values['ARRAYINIT'] := '1';
+  // Per-level item counts, so a "n TO ..." ellipsis dimension deduces its size from the matching
+  // brace-nesting level (level 0 = dim 0, level 1 = dim 1, ...) rather than the flat element total.
+  InitList.Attributes.Values['LEVELSIZES'] := JoinIntCsv(FInitLevelSizes);
+  Decl.AddChild(InitList);                          // initializer values (antArgumentList)
 end;
 
 function TPackratParser.ConstDimSizes(DimsNode: TASTNode): TDimSizeArray;
@@ -8946,8 +8952,36 @@ function TPackratParser.ParseStaticStatement: TASTNode;
 // SSA backs it with persistent storage and runs the initializer only once.
 var
   Token, NameTok, TypeTok: TLexerToken;
-  DeclNode, NameNode, TypeNd, Init: TASTNode;
+  DeclNode, NameNode, TypeNd, Init, Dims: TASTNode;
   StaticTypeName: string;
+
+  // "name(dims)" on a STATIC declaration: a procedure-local array with persistent storage. Returns the
+  // antDimensions node (nil when the name is not followed by '('), leaving the caller to attach it as
+  // child[1] — the DIM array shape (name, dimensions, type, [initializer]) that ProcessDim expects.
+  function ParseStaticDims: TASTNode;
+  begin
+    Result := nil;
+    if not Context.Check(ttDelimParOpen) then Exit;
+    Context.Advance;                                 // (
+    if Context.Check(ttDelimParClose) then
+    begin
+      Context.Advance;                               // ) -> "STATIC a()": empty, REDIM-sized later
+      Result := TASTNode.Create(antDimensions);
+      Exit;
+    end;
+    Result := ParseDimensionList;
+    if not Assigned(Result) then
+    begin
+      HandleError('Expected dimension list', Context.CurrentToken);
+      Exit;
+    end;
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" after dimension list', Context.CurrentToken);
+      FreeAndNil(Result);
+    end;
+  end;
+
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
@@ -8973,12 +9007,23 @@ begin
       Context.Advance;                               // name
       DeclNode := TASTNode.Create(antArrayDecl, NameTok);
       DeclNode.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
-      DeclNode.AddChild(TASTNode.CreateWithValue(antIdentifier, StaticTypeName, TypeTok));
-      if Context.Check(ttOpEq) then
+      Dims := ParseStaticDims;                       // "STATIC AS type a(dims)": array with static storage
+      if Assigned(Dims) then
       begin
-        Context.Advance;                             // =
-        Init := FExpressionParser.ParseExpression;
-        if Assigned(Init) then DeclNode.AddChild(Init);
+        DeclNode.AddChild(Dims);                     // child[1] = dimensions (array shape)
+        DeclNode.AddChild(TASTNode.CreateWithValue(antIdentifier, StaticTypeName, TypeTok));
+        if Dims.ChildCount = 0 then DeclNode.Attributes.Values['VARLEN'] := '1';
+        ParseOptionalArrayInit(DeclNode, Dims, NameTok);
+      end
+      else
+      begin
+        DeclNode.AddChild(TASTNode.CreateWithValue(antIdentifier, StaticTypeName, TypeTok));
+        if Context.Check(ttOpEq) then
+        begin
+          Context.Advance;                           // =
+          Init := FExpressionParser.ParseExpression;
+          if Assigned(Init) then DeclNode.AddChild(Init);
+        end;
       end;
       DeclNode.Attributes.Values['STATIC'] := '1';
       DoNodeCreated(DeclNode);
@@ -8998,9 +9043,11 @@ begin
     end;
     NameTok := Context.CurrentToken;
     Context.Advance;                                 // name
+    Dims := ParseStaticDims;                         // "STATIC a(dims) AS type": array with static storage
     if not Context.Check(ttAsType) then
     begin
       HandleError('STATIC requires a type: STATIC name AS type', Context.CurrentToken);
+      FreeAndNil(Dims);
       Break;
     end;
     Context.Advance;                                 // AS
@@ -9021,13 +9068,23 @@ begin
     NameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
     TypeNd := TASTNode.CreateWithValue(antIdentifier, StaticTypeName, TypeTok);
     DeclNode.AddChild(NameNode);
-    DeclNode.AddChild(TypeNd);                       // child[1] = type (typed scalar)
-    if Context.Check(ttOpEq) then
+    if Assigned(Dims) then
     begin
-      Context.Advance;                               // =
-      Init := FExpressionParser.ParseExpression;
-      if Assigned(Init) then
-        DeclNode.AddChild(Init);                     // child[2] = once-only initializer expression
+      DeclNode.AddChild(Dims);                       // child[1] = dimensions (array shape)
+      DeclNode.AddChild(TypeNd);                     // child[2] = element type
+      if Dims.ChildCount = 0 then DeclNode.Attributes.Values['VARLEN'] := '1';
+      ParseOptionalArrayInit(DeclNode, Dims, NameTok);
+    end
+    else
+    begin
+      DeclNode.AddChild(TypeNd);                     // child[1] = type (typed scalar)
+      if Context.Check(ttOpEq) then
+      begin
+        Context.Advance;                             // =
+        Init := FExpressionParser.ParseExpression;
+        if Assigned(Init) then
+          DeclNode.AddChild(Init);                   // child[2] = once-only initializer expression
+      end;
     end;
     DeclNode.Attributes.Values['STATIC'] := '1';
     DoNodeCreated(DeclNode);
