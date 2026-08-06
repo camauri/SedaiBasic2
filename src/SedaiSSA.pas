@@ -532,6 +532,10 @@ type
     function IndexOperatorLabel(Node: TASTNode; out ObjType: string): string;
     function TryEmitIndexOperator(Node: TASTNode; out Value: TSSAValue): Boolean;
     function ProcessIndexOperatorStore(VarNode, ExprNode: TASTNode): Boolean;
+    // "Cast(T, u) = expr" through a UDT's BYREF cast operator.
+    function ProcessCastOperatorStore(CastNode, ExprNode: TASTNode): Boolean;
+    // "u = expr" through a UDT's assignment operator ("Operator T.Let").
+    function ProcessLetOperatorStore(VarNode, ExprNode: TASTNode): Boolean;
     function EmitByrefRetDeref(const AddrVal: TSSAValue; const Lbl: string): TSSAValue;
     procedure EmitByrefRetStore(const AddrVal, Val: TSSAValue; const Lbl: string);
     function ByrefRetPointeeType(const Name: string): string;
@@ -6455,7 +6459,7 @@ procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
 // probes live in their own Try*/Process* frames below, so THIS frame — entered for every
 // assignment — keeps only the managed locals of the common scalar path.
 var
-  VarNode, ExprNode, SharedAssign: TASTNode;
+  VarNode, ExprNode, SharedAssign, CastNode: TASTNode;
   VarName: string;
   ExprValue, VarReg: TSSAValue;
   CopyOp: TSSAOpCode;
@@ -6470,6 +6474,40 @@ begin
 
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
+
+  // FreeBASIC "Cast(T, place) = expr". A cast on the LEFT is a REINTERPRETATION, never a conversion:
+  // fbc accepts it only when the storage is unchanged (Integer <-> UInteger yes; Integer <-> Double and
+  // Short <-> Integer are "error 24: Invalid data types"), so the store lands on the place underneath and
+  // the cast simply drops away here. We do not reject the storage-changing spellings — the declared type
+  // of an arbitrary lvalue is not reliably known at this point — and let the ordinary assignment convert;
+  // that is a compile-time difference from fbc, where what stood here before was SILENCE: an antCast
+  // lvalue matched none of the shapes below and fell out of the routine, so "Cast(Integer, x) = 78" left
+  // x untouched and said nothing. A UDT declaring "Operator Cast() BYREF As T" is the other spelling: the
+  // operator hands back a reference and the value is stored through it.
+  if VarNode.NodeType = antCast then
+  begin
+    if VarNode.ChildCount < 1 then Exit;
+    if ProcessCastOperatorStore(VarNode, ExprNode) then Exit;
+    // A UDT that could not be reached through an assignable cast operator must NOT fall through to the
+    // plain path: the store would land on the object itself (or, if the type also declares one, run its
+    // LET operator — a different operator answering for the one that was written). Say so instead.
+    if (ObjectTypeName(VarNode.GetChild(0)) <> '') and
+       (FindUDT(ObjectTypeName(VarNode.GetChild(0))) >= 0) then
+      raise Exception.CreateFmt('Cannot assign through CAST to %s: it needs an "Operator Cast() BYREF ' +
+                                'As <type>" returning a reference we can take the address of ' +
+                                '(a BYREF result over a record FIELD is not supported yet)',
+                                [ObjectTypeName(VarNode.GetChild(0))]);
+    // Drop the wrapper from the TREE, not just from this local: the store paths below are not all
+    // driven by VarNode — the plain array store re-reads the assignment's own child 0 — so an
+    // unwrapping that lived only in a variable would have fixed "Cast(Integer, x) = 7" and left
+    // "Cast(Integer, a(1)) = 7" silently doing nothing, which is the bug this is here to close.
+    CastNode := VarNode;
+    VarNode := CastNode.GetChild(0);
+    CastNode.Children.Extract(VarNode);    // detach the place (Extract does not free; Remove would)
+    Node.Children.Extract(CastNode);
+    Node.Children.Insert(0, VarNode);
+    CastNode.Free;                         // the wrapper alone: its child now belongs to the assignment
+  end;
 
   // A compound "obj op= rhs" on a UDT that overloads the SELF-operator: handled in its own frame.
   if TryCompoundSelfOp(Node, VarNode, ExprNode) then
@@ -6517,6 +6555,11 @@ begin
 
   if VarNode.NodeType <> antIdentifier then Exit;
   VarName := VarToStr(VarNode.Value);
+
+  // FreeBASIC "Operator T.Let": an assignment INTO a UDT instance from anything but its own type goes
+  // through the operator, if the type declares one. Checked before the scalar path below, which would
+  // otherwise overwrite the record handle with the raw value.
+  if ProcessLetOperatorStore(VarNode, ExprNode) then Exit;
 
   // SSAPROF: ticks spent in the lvalue-shape probes above (entry -> here).
   {$IFDEF DEBUG_SSAPROF}
@@ -17120,6 +17163,99 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.ProcessCastOperatorStore(CastNode, ExprNode: TASTNode): Boolean;
+// "Cast(T, u) = expr" where u is a UDT declaring "Operator Cast() BYREF As T": call the operator for the
+// reference it returns, then store the value through it — the same protocol ProcessIndexOperatorStore
+// uses for "v[i] = expr". A cast operator that returns BY VALUE hands back a copy, which is not
+// assignable (fbc rejects it too), so this answers False and emits nothing.
+var
+  ObjType, MethNm, Lbl: string;
+  Inner: TASTNode;
+  AddrVal, ExprValue: TSSAValue;
+begin
+  Result := False;
+  if (not FModernMode) or (CastNode = nil) or (CastNode.ChildCount < 1) then Exit;
+  Inner := CastNode.GetChild(0);
+  ObjType := ObjectTypeName(Inner);
+  if (ObjType = '') or (FindUDT(ObjType) < 0) then Exit;
+  // The cast label carries its return bank as a suffix, exactly as the read path expects it:
+  // '%' int, '#' float, '$' string (see PreCollectProcedures).
+  MethNm := 'OPERATORCAST%';
+  Lbl := ResolveMethodLabel(ObjType, MethNm);
+  if Lbl = '' then
+  begin
+    MethNm := 'OPERATORCAST#';
+    Lbl := ResolveMethodLabel(ObjType, MethNm);
+  end;
+  if Lbl = '' then
+  begin
+    MethNm := 'OPERATORCAST$';
+    Lbl := ResolveMethodLabel(ObjType, MethNm);
+  end;
+  if (Lbl = '') or not ByrefRetByAddress(Lbl) then Exit;
+  ProcessMethodCall(Inner, ObjType, MethNm, nil, AddrVal);
+  AddrVal := EnsureIntRegister(AddrVal);
+  ProcessExpression(ExprNode, ExprValue);
+  EmitByrefRetStore(AddrVal, ExprValue, Lbl);
+  Result := True;
+end;
+
+function TSSAGenerator.ProcessLetOperatorStore(VarNode, ExprNode: TASTNode): Boolean;
+// "u = expr" where u is an instance of a UDT declaring "Operator T.Let (rhs)": FreeBASIC routes the
+// assignment through that operator instead of copying. Without this the value was stored straight into
+// the variable that holds the RECORD HANDLE, so "u = 56" replaced the handle with 56 and the next
+// "u.I" dereferenced 56 as a record — an access violation whose cause was three lines earlier
+// (the FB manual's casting/opcast2 example died exactly there).
+// Whether the operator applies is decided by ITS DECLARED PARAMETER, not by comparing the two sides'
+// types: "Operator Let (ByRef rhs As UDT)" is the copy-assignment operator and MUST run on "b = a" —
+// it is how a type that owns a raw buffer avoids sharing it (examples/manual/operator/let) — while a
+// type whose only Let takes an Integer leaves "b = a" to the implicit record copy.
+// (A type declaring SEVERAL Let overloads shares one label, so only the last-declared one is reachable —
+// the same overload-by-parameter gap the CAST operator has, and a separate piece of work.)
+var
+  ObjType, Lbl, ParamType, RhsType: string;
+  TmpArgs, Decl, PList, P: TASTNode;
+  i: Integer;
+  Dummy: TSSAValue;
+begin
+  Result := False;
+  if (not FModernMode) or (VarNode = nil) or (ExprNode = nil) then Exit;
+  ObjType := ObjectTypeName(VarNode);
+  if (ObjType = '') or (FindUDT(ObjType) < 0) then Exit;
+  Lbl := ResolveMethodLabel(ObjType, 'OPERATORLET');
+  if Lbl = '' then Exit;
+  // The declared type of the operand the operator takes. Parameter 0 is the implicit THIS.
+  ParamType := '';
+  if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
+  begin
+    PList := Decl.GetChild(1);
+    if Assigned(PList) and (PList.NodeType = antParameterList) then
+      for i := 1 to PList.ChildCount - 1 do
+      begin
+        P := PList.GetChild(i);
+        if (P.ChildCount >= 1) and (P.GetChild(0).NodeType = antIdentifier) then
+          ParamType := UpperCase(VarToStr(P.GetChild(0).Value));
+        Break;
+      end;
+  end;
+  RhsType := UpperCase(ObjectTypeName(ExprNode));
+  if FindUDT(ParamType) >= 0 then
+  begin
+    // A UDT operand: only an expression of that very type reaches it.
+    if RhsType <> ParamType then Exit;
+  end
+  else if RhsType <> '' then
+    Exit;      // a builtin operand cannot take a record
+  TmpArgs := TASTNode.Create(antArgumentList, VarNode.Token);
+  try
+    TmpArgs.AddChild(ExprNode.Clone);        // ProcessMethodCall clones what it is given; keep the AST intact
+    ProcessMethodCall(VarNode, ObjType, 'OPERATORLET', TmpArgs, Dummy);
+  finally
+    TmpArgs.Free;
+  end;
+  Result := True;
+end;
+
 function TSSAGenerator.IndexOperatorLabel(Node: TASTNode; out ObjType: string): string;
 // The "Operator [] " of the type of Node's indexed object, or ''. Only the SQUARE-bracket spelling
 // qualifies: "v(i)" on a UDT is a call or an array element, "v[i]" is the index operator, and both
@@ -22390,6 +22526,7 @@ procedure TSSAGenerator.MarkAddressTaken(Node: TASTNode; Dict: TStringList; InPr
 var
   i, k: Integer;
   Decl: TASTNode;
+  ProcDict: TStringList;
   VNameU, VTypeU: string;
 begin
   if Node = nil then Exit;
@@ -22446,26 +22583,42 @@ begin
   // An @-taken PARAMETER (e.g. "@x" of "x As Single"): back it in a per-frame RAW byte slot too, so its
   // address is real and a pointer of a different bank can reinterpret its bytes (Rosetta signum type-puns a
   // Single's IEEE754 bits through an Integer Ptr). Params are not DIMs, so mark them here on the list.
+  // ⚠️ Judged on the @s taken INSIDE THIS PROCEDURE, not on the program-wide Dict: a parameter is a
+  // different variable from a module-level one that happens to share its name. With the global Dict, a
+  // "Sub S(ByVal v As Integer)" anywhere in the file was enough to mark itself ADDRPARAM because a
+  // MODULE "v" was @-taken - and, worse, to put V on the program-wide FAddrTakenScalars, after which the
+  // module's own "@v / *p = 5" resolved to a per-frame raw slot that does not exist at module scope and
+  // died with "Null or invalid raw pointer dereference". Seven lines reproduced it, with no pointers
+  // in the procedure at all.
   if Node.NodeType = antProcedureDecl then
-    for k := 0 to Node.ChildCount - 1 do
-      if Node.GetChild(k).NodeType = antParameterList then
-        for i := 0 to Node.GetChild(k).ChildCount - 1 do
-        begin
-          Decl := Node.GetChild(k).GetChild(i);
-          if (Decl.NodeType = antIdentifier) and (Decl.ChildCount >= 1) and
-             (Decl.GetChild(0).NodeType = antIdentifier) then
+  begin
+    ProcDict := TStringList.Create;
+    try
+      ProcDict.CaseSensitive := False;
+      CollectDimVarBanks(Node, ProcDict);       // the @-taken names of this procedure's own subtree
+      for k := 0 to Node.ChildCount - 1 do
+        if Node.GetChild(k).NodeType = antParameterList then
+          for i := 0 to Node.GetChild(k).ChildCount - 1 do
           begin
-            VNameU := UpperCase(VarToStr(Decl.Value));
-            VTypeU := UpperCase(VarToStr(Decl.GetChild(0).Value));
-            // Only a @-taken builtin SCALAR param (not a UDT, not a "T PTR", not a STRING -- raw bytes only).
-            if (Dict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeU) < 0) and
-               (Pos(' PTR', VTypeU) = 0) and (VTypeU <> 'STRING') then
+            Decl := Node.GetChild(k).GetChild(i);
+            if (Decl.NodeType = antIdentifier) and (Decl.ChildCount >= 1) and
+               (Decl.GetChild(0).NodeType = antIdentifier) then
             begin
-              Decl.Attributes.Values['ADDRPARAM'] := '1';
-              if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
+              VNameU := UpperCase(VarToStr(Decl.Value));
+              VTypeU := UpperCase(VarToStr(Decl.GetChild(0).Value));
+              // Only a @-taken builtin SCALAR param (not a UDT, not a "T PTR", not a STRING -- raw bytes only).
+              if (ProcDict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeU) < 0) and
+                 (Pos(' PTR', VTypeU) = 0) and (VTypeU <> 'STRING') then
+              begin
+                Decl.Attributes.Values['ADDRPARAM'] := '1';
+                if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
+              end;
             end;
           end;
-        end;
+    finally
+      ProcDict.Free;
+    end;
+  end;
   if Node.NodeType = antProcedureDecl then InProc := True;
   for i := 0 to Node.ChildCount - 1 do
     MarkAddressTaken(Node.GetChild(i), Dict, InProc);
