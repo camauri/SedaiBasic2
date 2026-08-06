@@ -55,6 +55,7 @@ uses
   SedaiPackratParser,
   // Bytecode
   SedaiSSATypes, SedaiSSA,
+  SedaiWasmEmitter, SedaiWasmControl, SedaiWasmBackend,
   SedaiBytecodeTypes, SedaiBytecodeCompiler,
   // Register Allocation
   SedaiRegAlloc,
@@ -126,10 +127,22 @@ begin
   WriteLn('  --quiet, -q     Suppress all output except errors');
   WriteLn;
   WriteLn('Examples:');
+  WriteLn('  --target wasm   Emit a WebAssembly module (.wasm) instead of bytecode');
+  WriteLn('                  An opcode the backend does not cover is REFUSED with a');
+  WriteLn('                  message: in the browser there is no interpreter to fall');
+  WriteLn('                  back into, so it must never emit code that runs and lies.');
+  WriteLn;
   WriteLn('  sbc program.bas                 Compile to ./program.basc');
+  WriteLn('  sbc program.bas --target wasm   Compile to ./program.wasm');
   WriteLn('  sbc program.bas out.basc        Compile to out.basc');
   WriteLn('  sbc program.bas -v              Compile with verbose output');
 end;
+
+{ --target wasm: stop after register allocation and hand the SSA to the WASM
+  backend instead of the bytecode compiler. Both consume the same program at the
+  same point in the pipeline (job/docs/PIANO_WASM.md sec.5-bis). }
+var
+  OptTargetWasm: Boolean = False;
 
 { Compile BASIC source to bytecode file }
 function CompileFile(const SourceFile, OutputFile: string; Verbose: Boolean): Boolean;
@@ -142,6 +155,7 @@ var
   SSAGen: TSSAGenerator;
   SSAProgram: TSSAProgram;
   Compiler: TBytecodeCompiler;
+  WasmBackend: TWasmBackend;
   BytecodeProgram: TBytecodeProgram;
   Serializer: TBytecodeSerializer;
   i, removed: Integer;
@@ -431,6 +445,28 @@ begin
         end;
         {$ENDIF}
 
+        // === WASM BACKEND (--target wasm) ===
+        if OptTargetWasm then
+        begin
+          WasmBackend := TWasmBackend.Create(SSAProgram, not HasLineNums);
+          try
+            if not WasmBackend.Compile then
+            begin
+              WriteLn('ERROR: WASM backend refused this program: ', WasmBackend.ErrorMessage);
+              Exit;
+            end;
+            WasmBackend.SaveToFile(OutputFile);
+            // The global count is printed, not buried: it is the number that says
+            // whether "shared register -> global" is still the right answer.
+            WriteLn(Format('WASM: %d function(s), %d shared register(s) promoted to globals',
+                           [WasmBackend.RegionCount, WasmBackend.GlobalCount]));
+            Result := True;
+          finally
+            WasmBackend.Free;
+          end;
+          Exit;
+        end;
+
         // === BYTECODE COMPILATION ===
         if Verbose then
           WriteLn('Compiling bytecode...');
@@ -586,6 +622,20 @@ begin
         OptVerbose := True
       else if (Param = '--quiet') or (Param = '-q') then
         OptQuiet := True
+      else if (Param = '--target=wasm') or (Param = '--target-wasm') then
+        OptTargetWasm := True
+      else if (Param = '--target') and (i < ParamCount) then
+      begin
+        if SameText(ParamStr(i + 1), 'wasm') then OptTargetWasm := True
+        else if not SameText(ParamStr(i + 1), 'bytecode') then
+        begin
+          WriteLn('ERROR: unknown target "', ParamStr(i + 1), '" (bytecode, wasm)');
+          ExitCode := 1;
+          Exit;
+        end;
+      end
+      else if SameText(Param, 'wasm') and (i > 1) and (ParamStr(i - 1) = '--target') then
+        // consumed by the branch above
       else if (Pos('-', Param) <> 1) then
       begin
         // Positional argument
@@ -607,7 +657,10 @@ begin
 
     // Determine output file
     if OutputFile = '' then
-      OutputFile := ChangeFileExt(ExtractFileName(SourceFile), '.basc');
+      if OptTargetWasm then
+        OutputFile := ChangeFileExt(ExtractFileName(SourceFile), '.wasm')
+      else
+        OutputFile := ChangeFileExt(ExtractFileName(SourceFile), '.basc');
 
     // Show banner if not quiet
     if not OptQuiet then
