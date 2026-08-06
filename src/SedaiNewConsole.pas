@@ -82,6 +82,10 @@ type
   private
     FWindow: PSDL_Window;
     FRenderer: PSDL_Renderer;
+    // COLOR fg,bg - what PRINT draws with inside a graphics mode. Declared HERE, in the class
+    // whose GBSetTextColors/GBGetTextColors use them: they were written into TSedaiNewConsole,
+    // which compiles only because nothing there referenced them - and sbv would not build at all.
+    FGfxTextFG, FGfxTextBG: TGfxColor;
     FCurrentMode: TGraphicMode;
     FModeInfo: TGraphicModeInfo;
     FViewportWidth: Integer;
@@ -845,7 +849,6 @@ type
     FConsoleOutputAdapter: TConsoleOutputAdapter;
     FRunning: Boolean;
     FCursorVisible: Boolean;
-    FGfxTextFG, FGfxTextBG: TGfxColor;   // COLOR fg,bg - what PRINT draws with in a graphics mode
     FCursorEnabled: Boolean;       // False = cursor suppressed (during VM execution)
     FLastCursorBlink: Cardinal;
     FInputHistory: array of string;

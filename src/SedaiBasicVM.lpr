@@ -600,6 +600,12 @@ begin
     if Assigned(GTermCtrl) then GTermCtrl.AttachGraphicsBackend(SW);
     GPresenter := TWindowPresenter.Create(SW, 'SedaiBasic');
     AVM.EventPollCallback := @GPresenter.Pump;   // present + pump events during execution
+    // ...but the dispatch loop only reaches that callback at blocking points, so a graphics
+    // program with no SLEEP in its loop would never present. Ask the VM for a wall-clock cadence
+    // from the graphics opcodes as well. 16 ms = about 60 presents a second. This property is
+    // deliberately left at 0 everywhere else (sbv, sbw, headless sb), which is what keeps this
+    // from interfering with SedaiVision's own rendering.
+    AVM.PresentCadenceMs := 16;
     Exit;
   end;
   {$ENDIF}

@@ -407,6 +407,9 @@ type
     // Event polling callback for UI responsiveness
     FEventPollCallback: TEventPollCallback;
     FEventPollInterval: Integer;
+    // Present cadence for a windowed run (0 = off, which is every target except `sb --window`)
+    FPresentCadenceMs: LongWord;
+    FLastPresentTick: QWord;
     // SPRDEF modal sprite editor callback (set by the SDL console; nil elsewhere)
     FSpriteEditorCallback: TSpriteEditorCallback;
     {$IFDEF ENABLE_INSTRUCTION_COUNTING}
@@ -463,6 +466,7 @@ type
     procedure ExecuteIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSpecialVarOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteGraphicsOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+    procedure MaybePresentCadence(Ctx: TExecutionContext);  // windowed runs only; see the body
     procedure ExecuteSoundOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSpriteOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteFileIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -702,6 +706,10 @@ type
     // Event polling callback (for deferred rendering during VM execution)
     property EventPollCallback: TEventPollCallback read FEventPollCallback write FEventPollCallback;
     property EventPollInterval: Integer read FEventPollInterval write FEventPollInterval;
+    // Minimum milliseconds between presents driven from the graphics opcodes. 0 disables the
+    // mechanism entirely, which is the default and what every target other than `sb --window`
+    // leaves it at, so nothing else changes behaviour or pays more than one integer compare.
+    property PresentCadenceMs: LongWord read FPresentCadenceMs write FPresentCadenceMs;
     // SPRDEF modal sprite editor callback (set by the SDL console; nil = no-op)
     property SpriteEditorCallback: TSpriteEditorCallback read FSpriteEditorCallback write FSpriteEditorCallback;
   end;
@@ -1115,6 +1123,8 @@ begin
   FCmdHandle := 0;
   // Initialize event polling (nil = disabled)
   FEventPollCallback := nil;
+  FPresentCadenceMs := 0;      // off unless a windowed front end asks for it
+  FLastPresentTick := 0;
   FSpriteEditorCallback := nil;
   FEventPollInterval := 10000;  // Poll every 10000 instructions by default
   // Initialize error state for EL, ER, ERR$
@@ -12533,6 +12543,52 @@ begin
   else
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
+
+  if FPresentCadenceMs > 0 then MaybePresentCadence(Ctx);
+end;
+
+// Present the framebuffer on a wall-clock cadence, driven from the graphics opcodes.
+//
+// Why it has to be here. The window presenter (`sb --window`) is driven by EventPollCallback, and
+// the dispatch loop only reaches that at BLOCKING points: SLEEP, GETKEY, waiting on a note. A
+// graphics program whose main loop is pure computation - draw the frame, compute the next one,
+// repeat, with no SLEEP anywhere - therefore never presents at all. The window comes up black and
+// stops answering events, and nothing in the program is wrong. FreeBASIC has a frame boundary for
+// exactly this, SCREENUNLOCK, and we accept it as a no-op, so there is no boundary to hang a
+// present on either.
+//
+// ExecuteGraphicsOp is the single entry point every graphics opcode passes through, so one call
+// here covers PSET, LINE, PAINT, blits, text-in-graphics and everything else - every program with
+// this shape, not just the one that found it.
+//
+// ⚠️ THE PRICE, stated plainly: without a frame boundary this can present a half-drawn frame, so a
+// slow frame shows a horizontal seam where the cadence caught it. It is a live-preview mechanism,
+// not a substitute for double buffering; the fix for the seam is to make SCREENUNLOCK a real
+// present, which needs an opcode.
+//
+// ⚠️ AND IT IS OFF BY DEFAULT, which matters more than it looks. sbv, sbw and headless sb never set
+// PresentCadenceMs - only the WITH_WINDOW path in SedaiBasicVM.lpr does - so for every other target
+// this whole mechanism costs one compare against a field per graphics opcode and changes nothing.
+// A present cadence added unconditionally would have fought with sbv's own rendering.
+procedure TBytecodeVM.MaybePresentCadence(Ctx: TExecutionContext);
+var
+  Tick: QWord;
+begin
+  // GetTickCount64 reads a shared page on Windows and a monotonic clock on Linux: cheap enough to
+  // call per LINE (a few thousand times a frame) without a counter in front of it, and a counter
+  // would break the case that needs this most - a program drawing five lines per frame.
+  Tick := GetTickCount64;
+  if Tick - FLastPresentTick < FPresentCadenceMs then Exit;
+  FLastPresentTick := Tick;
+
+  if Assigned(FEventPollCallback) then
+  begin
+    // The callback both presents and pumps events, and returns True when the window was closed.
+    if FEventPollCallback() then
+      Ctx.Running := False;
+  end
+  else
+    PresentFrame;
 end;
 
 {$IFDEF WITH_SEDAI_AUDIO}
