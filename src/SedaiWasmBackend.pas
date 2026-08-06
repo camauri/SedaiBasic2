@@ -108,6 +108,12 @@ type
     function ClassifyRegisters: Boolean;
     function BuildSignatures: Boolean;
     function DetectRecursion: Boolean;
+  private
+    FUsesPrint: Boolean;
+    FImportCount: LongWord;
+    FWriteFunc, FPrintIntFunc, FPrintNlFunc: LongWord;
+    procedure ScanForPrint;
+    procedure EmitPrintHelpers;
     function EmitRegion(R: Integer): Boolean;
     function EmitInstr(B: TWasmBuf; Instr: TSSAInstruction; R: Integer): Boolean;
     procedure LoadReg(B: TWasmBuf; const V: TSSAValue);
@@ -135,6 +141,128 @@ implementation
 
 const
   BankType: array[TSSARegisterType] of TWasmValType = (wvtI64, wvtF64, wvtI32);
+
+  { Linear memory layout for PRINT. Digits are built BACKWARDS from SCRATCH_END,
+    which is why the buffer is addressed from its end. }
+  SCRATCH_END  = 32;      // one past the last byte of the digit scratch
+  CONST_SPACE  = 64;      // a literal ' '
+  CONST_NL     = 65;      // a literal LF
+
+{ ---------------- PRINT ----------------
+
+  The host import is a BYTE SINK - write(ptr, len) - and nothing else. The
+  formatting is ours, emitted here, because BASIC's number spacing is a dialect
+  rule (TConsoleBehavior.FormatInt): a leading space stands in for the sign when
+  the value is non-negative, and Commodore adds a trailing space where FreeBASIC
+  does not. Handing an i64 to JS and letting it call String(n) would produce
+  output that differs from the native run in exactly the places this project
+  measures byte for byte - the plan rules that out, and it is the whole reason
+  the sink is this narrow. }
+
+procedure TWasmBackend.ScanForPrint;
+var
+  i, j: Integer;
+  Blk: TSSABasicBlock;
+begin
+  FUsesPrint := False;
+  for i := 0 to FProg.Blocks.Count - 1 do
+  begin
+    Blk := FProg.Blocks[i];
+    for j := 0 to Blk.Instructions.Count - 1 do
+      if TSSAInstruction(Blk.Instructions[j]).OpCode in
+         [ssaPrintInt, ssaPrintIntLn, ssaPrintNewLine] then
+      begin
+        FUsesPrint := True;
+        Exit;
+      end;
+  end;
+end;
+
+procedure TWasmBackend.EmitPrintHelpers;
+{ printInt(v: i64): format v the way TConsoleBehavior.FormatInt does, then hand
+  the bytes to the sink.
+
+    p := SCRATCH_END
+    neg := v < 0
+    u := neg ? 0 - v : v          (unsigned, so Low(Int64) works: its negation
+                                   wraps to the right magnitude)
+    if u = 0 then *--p := '0'
+    else while u <> 0 do *--p := '0' + u mod 10; u := u div 10
+    *--p := neg ? '-' : ' '
+    write(p, SCRATCH_END - p)
+    [CLASSIC only] write(CONST_SPACE, 1) }
+var
+  B: TWasmBuf;
+  TVoidI64, TVoid: LongWord;
+begin
+  TVoidI64 := FModule.TypeIndex([wvtI64], []);
+  TVoid := FModule.TypeIndex([], []);
+
+  B := TWasmBuf.Create;
+  try
+    // locals: 1 = p (i32), 2 = u (i64), 3 = neg (i32)
+    B.I32Const(SCRATCH_END); B.LocalSet(1);
+    B.LocalGet(0); B.I64Const(0); B.Op(wopI64LtS); B.LocalSet(3);
+
+    B.LocalGet(3);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I64Const(0); B.LocalGet(0); B.Op(wopI64Sub); B.LocalSet(2);
+    B.Op(wopElse);
+      B.LocalGet(0); B.LocalSet(2);
+    B.EndOp;
+
+    B.LocalGet(2); B.Op(wopI64Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(1); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(1);
+      B.LocalGet(1); B.I32Const(Ord('0')); B.OpMem(wopI32Store8, 0, 0);
+    B.Op(wopElse);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(2); B.Op(wopI64Eqz); B.BrIf(1);
+          B.LocalGet(1); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(1);
+          B.LocalGet(1);
+          B.LocalGet(2); B.I64Const(10); B.Op(wopI64RemU); B.Op(wopI32WrapI64);
+          B.I32Const(Ord('0')); B.Op(wopI32Add);
+          B.OpMem(wopI32Store8, 0, 0);
+          B.LocalGet(2); B.I64Const(10); B.Op(wopI64DivU); B.LocalSet(2);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+    B.EndOp;
+
+    // the one prefix character: '-' when negative, otherwise the space that
+    // stands in for the sign
+    B.LocalGet(1); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(1);
+    B.LocalGet(3);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(1); B.I32Const(Ord('-')); B.OpMem(wopI32Store8, 0, 0);
+    B.Op(wopElse);
+      B.LocalGet(1); B.I32Const(Ord(' ')); B.OpMem(wopI32Store8, 0, 0);
+    B.EndOp;
+
+    B.LocalGet(1);
+    B.I32Const(SCRATCH_END); B.LocalGet(1); B.Op(wopI32Sub);
+    B.Call(FWriteFunc);
+
+    if not FModern then
+    begin
+      // Commodore/MSX/QB put a space AFTER the number; FreeBASIC does not.
+      B.I32Const(CONST_SPACE); B.I32Const(1); B.Call(FWriteFunc);
+    end;
+
+    FModule.AddFunction(TVoidI64, [wvtI32, wvtI64, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  B := TWasmBuf.Create;
+  try
+    B.I32Const(CONST_NL); B.I32Const(1); B.Call(FWriteFunc);
+    FModule.AddFunction(TVoid, [], B);
+  finally
+    B.Free;
+  end;
+end;
 
 constructor TWasmBackend.Create(AProgram: TSSAProgram; AModern: Boolean);
 begin
@@ -743,6 +871,21 @@ begin
   Result := True;
   case Instr.OpCode of
     ssaLabel, ssaNop: ;                     // no code of their own
+    ssaPrintEnd: ;                          // resets C128 reverse mode; nothing to do here
+
+    ssaPrintInt:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FPrintIntFunc);
+      end;
+    ssaPrintIntLn:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FPrintIntFunc);
+        B.Call(FPrintNlFunc);
+      end;
+    ssaPrintNewLine:
+      B.Call(FPrintNlFunc);
 
     ssaPhi:
       Exit(Fail('a PHI survived into the backend: PHI elimination must run first'));
@@ -1059,19 +1202,41 @@ var
 begin
   FError := '';
   if not BuildPartition then Exit(False);
+
+  // Imports own the low indices, so they must be declared before the first
+  // DEFINITION - and ClassifyRegisters defines globals.
+  ScanForPrint;
+  FImportCount := 0;
+  if FUsesPrint then
+  begin
+    FWriteFunc := FModule.ImportFunc('env', 'write',
+                                     FModule.TypeIndex([wvtI32, wvtI32], []));
+    FImportCount := 1;
+  end;
+
   SetLength(FLocalIdx, FProg.Blocks.Count);   // sized by region below
   if not ClassifyRegisters then Exit(False);
   SetLength(FLocalIdx, FRegionCount);
   if not BuildSignatures then Exit(False);
   if not DetectRecursion then Exit(False);
 
+  if FUsesPrint then
+  begin
+    FModule.DefineMemory(1, 0);
+    FModule.DataSegment(CONST_SPACE, PByte(PAnsiChar(' '#10)), 2);
+    FModule.ExportMemory('memory');
+  end;
+
   // Functions have to be numbered before any of them is emitted, because a call
   // names its callee by index and a procedure may be called before it is built.
   for r := 0 to FRegionCount - 1 do
-    FFuncIdx[r] := LongWord(r);
+    FFuncIdx[r] := FImportCount + LongWord(r);
+  FPrintIntFunc := FImportCount + LongWord(FRegionCount);
+  FPrintNlFunc := FPrintIntFunc + 1;
 
   for r := 0 to FRegionCount - 1 do
     if not EmitRegion(r) then Exit(False);
+  if FUsesPrint then EmitPrintHelpers;
 
   FModule.ExportFunc('main', FFuncIdx[0]);
   for r := 1 to FRegionCount - 1 do
