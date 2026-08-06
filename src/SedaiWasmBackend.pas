@@ -162,11 +162,15 @@ const
     starts on a page boundary so growing for it is exact. }
   HEAP_BASE    = 1024;
   FB_BASE      = 65536;
-  { The framebuffer's initial contents are not zero, and this is MEASURED, not
-    inferred: a fresh ScreenRes leaves every pixel at $FF000000 (ARGB black,
-    full alpha). Linear memory starts zeroed, so the fill has to be emitted or
-    the very first byte of every comparison would differ. }
-  FB_CLEAR     = -16777216;    // $FF000000 as a signed i32
+  { The framebuffer's initial contents are not zero: a fresh ScreenRes fills
+    every pixel with $000000FF (ClearCurrentMode, SedaiGraphicsMemory), and
+    linear memory starts zeroed, so the fill has to be emitted or the very first
+    byte of every comparison would differ.
+    ⚠️ MEASURED TWICE. The first reading said $FF000000, because the probe
+    PRINTED before reading it back - and in graphics mode PRINT renders into the
+    framebuffer, so the probe was reading its own output. Any measurement of the
+    initial buffer has to happen before the first character is printed. }
+  FB_CLEAR     = 255;          // $000000FF
 
 { ---------------- PRINT ----------------
 

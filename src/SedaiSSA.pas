@@ -688,6 +688,7 @@ type
     procedure ProcessMidStatement(Node: TASTNode);
     function UDTFieldBankOf(MemberNode: TASTNode): TSSARegisterType;   // bank of the field a member access names
     function ParamPointeeType(const Name: string): string;   // pointee of a "<T> Ptr" PARAMETER of the current proc
+    function PointeeTypeOf(const PtrName: string): string;   // pointee of a raw pointer, DIM *or* PARAMETER
     function IsStringArgForBytePtrParam(ParamNode, ArgNode: TASTNode): Boolean;  // string arg -> byte-pointer param
     function EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
     procedure EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
@@ -17150,7 +17151,7 @@ begin
   end;
   if Node.GetChild(0).NodeType = antIdentifier then
   begin
-    Pointee := UpperCase(FPointerVars.Values[UpperCase(VarToStr(Node.GetChild(0).Value))]);
+    Pointee := UpperCase(PointeeTypeOf(VarToStr(Node.GetChild(0).Value)));
     if (Pointee = '') or (FindUDT(Pointee) >= 0) or (Pos(' PTR', Pointee) > 0) then Exit;
     Addr := EmitPointerIndexAddress(VarToStr(Node.GetChild(0).Value), Node.GetChild(1));
     Exit(True);
@@ -19034,7 +19035,7 @@ begin
         // out with a sign space fbc does not print.
         if (Result = 0) and FModernMode then
         begin
-          AwCode := TypeNameWidthCode(UpperCase(FPointerVars.Values[UpperCase(VarToStr(Node.GetChild(0).Value))]));
+          AwCode := TypeNameWidthCode(UpperCase(PointeeTypeOf(VarToStr(Node.GetChild(0).Value))));
           if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
         end;
       end;
@@ -22836,6 +22837,18 @@ begin
   if FCurrentProcPtrParams.IndexOfName(UpperCase(Name)) < 0 then Exit;
   Pointee := UpperCase(ManagedPtrPointee(Name));
   Result := (Length(Pointee) > 4) and (Copy(Pointee, Length(Pointee) - 3, 4) = ' PTR');
+  // ⛔ DO NOT widen this to "any non-UDT pointee". It looks right - the managed model
+  // pairs a "T Ptr" with a RECORD of type T, so a pointer to Ulong has no record to be
+  // a handle to - but a managed pointer to a SCALAR exists all the same: "@x" of a
+  // scalar variable is a PACKED ADDRESS, not a byte-heap offset. Tried, and it broke
+  // ptr5_fieldptr and ptr6_subarg (and two more) in run_regress.
+  //
+  // The pointee type cannot decide this: what separates the two families is where the
+  // VALUE came from - Allocate/SCREENPTR give a raw offset, "@var" gives a packed
+  // address - and a parameter is exactly the place that information was dropped. The
+  // two honest ways out are propagating rawness from the CALL SITES, or testing
+  // RAWPTR_TAG at run time and scaling accordingly. Both are real work; neither is a
+  // one-line predicate here.
 end;
 
 function TSSAGenerator.IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;
@@ -23008,10 +23021,23 @@ begin
   else Result := RTC_I64;   // INTEGER/LONGINT/UINTEGER/ULONGINT (our INTEGER is 64-bit)
 end;
 
+function TSSAGenerator.PointeeTypeOf(const PtrName: string): string;
+// The declared pointee of a raw pointer, whether it arrived as a DIM or as a
+// PARAMETER. FPointerVars only ever held DIMs - the comment on ParamPointeeType
+// says so - and the two lookups below never consulted the fallback, so a pointer
+// passed into a SUB had NO pointee: p[i] scaled by 1 instead of SizeOf(pointee)
+// and the dereference failed on an address that was off by a factor of four.
+// That is the whole reason drawing primitives could not be written as SUBs, and
+// SUBs are the only shape a primitive has.
+begin
+  Result := FPointerVars.Values[UpperCase(PtrName)];
+  if Result = '' then Result := ParamPointeeType(PtrName);
+end;
+
 function TSSAGenerator.RawTypeCodeOf(const PtrName: string): Integer;
 // Raw element type code for *p / p[i], from the pointer's declared pointee type.
 begin
-  Result := RawTypeCodeOfPointee(FPointerVars.Values[UpperCase(PtrName)]);
+  Result := RawTypeCodeOfPointee(PointeeTypeOf(PtrName));
 end;
 
 function TSSAGenerator.RawElemSizeOfPointee(const PointeeType: string): Int64;
@@ -23029,7 +23055,7 @@ end;
 function TSSAGenerator.RawElemSizeOf(const PtrName: string): Int64;
 // SizeOf(pointee) in bytes — scales raw pointer arithmetic and p[i] indexing.
 begin
-  Result := RawElemSizeOfPointee(FPointerVars.Values[UpperCase(PtrName)]);
+  Result := RawElemSizeOfPointee(PointeeTypeOf(PtrName));
 end;
 
 function TSSAGenerator.IsDeclaredVariable(const Name: string): Boolean;
