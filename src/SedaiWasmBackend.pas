@@ -111,7 +111,7 @@ type
   private
     FUsesPrint: Boolean;
     FImportCount: LongWord;
-    FWriteFunc, FPrintIntFunc, FPrintNlFunc: LongWord;
+    FWriteFunc, FPrintIntFunc, FPrintUIntFunc, FPrintNlFunc: LongWord;
     procedure ScanForPrint;
     procedure EmitPrintHelpers;
     function EmitRegion(R: Integer): Boolean;
@@ -170,7 +170,7 @@ begin
     Blk := FProg.Blocks[i];
     for j := 0 to Blk.Instructions.Count - 1 do
       if TSSAInstruction(Blk.Instructions[j]).OpCode in
-         [ssaPrintInt, ssaPrintIntLn, ssaPrintNewLine] then
+         [ssaPrintInt, ssaPrintIntLn, ssaPrintNewLine, ssaPrintUInt] then
       begin
         FUsesPrint := True;
         Exit;
@@ -247,6 +247,57 @@ begin
     if not FModern then
     begin
       // Commodore/MSX/QB put a space AFTER the number; FreeBASIC does not.
+      B.I32Const(CONST_SPACE); B.I32Const(1); B.Call(FWriteFunc);
+    end;
+
+    FModule.AddFunction(TVoidI64, [wvtI32, wvtI64, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { printUInt(v: i64): the SAME digits, but the affixes are NOT the same. The FB
+    manual's Print page, under "Differences from QB", says unsigned numbers are
+    printed without a space before them - so FreeBASIC gives an unsigned neither
+    the sign padding nor a trailing space, while Commodore gives it both.
+    TConsoleBehavior.FormatUInt is the spec; getting this wrong would print
+    something that looks right and is off by a space. }
+  B := TWasmBuf.Create;
+  try
+    B.I32Const(SCRATCH_END); B.LocalSet(1);
+    B.LocalGet(0); B.LocalSet(2);
+
+    B.LocalGet(2); B.Op(wopI64Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(1); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(1);
+      B.LocalGet(1); B.I32Const(Ord('0')); B.OpMem(wopI32Store8, 0, 0);
+    B.Op(wopElse);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(2); B.Op(wopI64Eqz); B.BrIf(1);
+          B.LocalGet(1); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(1);
+          B.LocalGet(1);
+          B.LocalGet(2); B.I64Const(10); B.Op(wopI64RemU); B.Op(wopI32WrapI64);
+          B.I32Const(Ord('0')); B.Op(wopI32Add);
+          B.OpMem(wopI32Store8, 0, 0);
+          B.LocalGet(2); B.I64Const(10); B.Op(wopI64DivU); B.LocalSet(2);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+    B.EndOp;
+
+    if not FModern then
+    begin
+      // Commodore keeps the leading space an unsigned would get as a positive
+      // number, and the trailing one. FreeBASIC gives it neither.
+      B.LocalGet(1); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(1);
+      B.LocalGet(1); B.I32Const(Ord(' ')); B.OpMem(wopI32Store8, 0, 0);
+    end;
+
+    B.LocalGet(1);
+    B.I32Const(SCRATCH_END); B.LocalGet(1); B.Op(wopI32Sub);
+    B.Call(FWriteFunc);
+    if not FModern then
+    begin
       B.I32Const(CONST_SPACE); B.I32Const(1); B.Call(FWriteFunc);
     end;
 
@@ -886,6 +937,59 @@ begin
       end;
     ssaPrintNewLine:
       B.Call(FPrintNlFunc);
+    ssaPrintUInt:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FPrintUIntFunc);
+      end;
+    { PRINT's semicolon separator. Every dialect preset in the tree sets
+      SemicolonAction to saNoSpace - all eight of them - so this emits nothing.
+      Written out rather than folded in with the other no-ops, because that is a
+      MEASURED fact about the presets and not an assumption about the language:
+      the property is writable, and if a preset ever asks for a space this is the
+      place that has to grow one. }
+    ssaPrintSemicolon: ;
+
+    ssaModFloat:
+      begin
+        // The VM raises "Float modulo by zero"; f64.div would quietly answer NaN
+        // and let the program carry on, which is the one thing the backend must
+        // never do. The trap is the loud equivalent of the interpreter stopping.
+        LoadReg(B, Instr.Src2);
+        B.F64Const(0);
+        B.Op(wopF64Eq);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.Op(wopUnreachable);
+        B.EndOp;
+        // x - floor(x / y) * y, exactly as the interpreter computes it
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        B.Op(wopF64Div);
+        B.Op(wopF64Floor);
+        LoadReg(B, Instr.Src2);
+        B.Op(wopF64Mul);
+        B.Op(wopF64Sub);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaNarrowInt:
+      begin
+        // Width codes are NarrowInt64's: 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32,
+        // anything else is the identity.
+        if Instr.Src3.Kind <> svkConstInt then
+          Exit(Fail('ssaNarrowInt without a constant width code'));
+        LoadReg(B, Instr.Src1);
+        case Instr.Src3.ConstInt of
+          1: B.Op(wopI64Extend8S);
+          2: begin B.I64Const($FF); B.Op(wopI64And); end;
+          3: B.Op(wopI64Extend16S);
+          4: begin B.I64Const($FFFF); B.Op(wopI64And); end;
+          5: B.Op(wopI64Extend32S);
+          6: begin B.I64Const($FFFFFFFF); B.Op(wopI64And); end;
+        end;
+        StoreReg(B, Instr.Dest);
+      end;
 
     ssaPhi:
       Exit(Fail('a PHI survived into the backend: PHI elimination must run first'));
@@ -1231,8 +1335,10 @@ begin
   // names its callee by index and a procedure may be called before it is built.
   for r := 0 to FRegionCount - 1 do
     FFuncIdx[r] := FImportCount + LongWord(r);
+  // The order here must match the order EmitPrintHelpers adds them in.
   FPrintIntFunc := FImportCount + LongWord(FRegionCount);
-  FPrintNlFunc := FPrintIntFunc + 1;
+  FPrintUIntFunc := FPrintIntFunc + 1;
+  FPrintNlFunc := FPrintIntFunc + 2;
 
   for r := 0 to FRegionCount - 1 do
     if not EmitRegion(r) then Exit(False);
