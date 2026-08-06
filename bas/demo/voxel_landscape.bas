@@ -586,6 +586,18 @@ End Sub
 ''  units as it crossed cell boundaries - about one crossing every one and a half frames on this
 ''  circle - and the whole frame jolted vertically. The terrain was smooth and the VIEW was not.
 ''
+''  ⛔ AND A SMOOTHSTEP ON THESE WEIGHTS IS A MISTAKE, WHICH IS WORTH SPELLING OUT BECAUSE THERE
+''  IS ONE TWENTY LINES AWAY IN ValueNoise THAT IS CORRECT. There, the lattice is a noise lattice
+''  and the values on it are arbitrary: making the interpolation flatten at each lattice point is
+''  exactly the shaping wanted, and it is what turns blocky value noise into rolling ground. Here
+''  the lattice is the MAP and the values on it are already the smooth landscape. Forcing the
+''  gradient to zero at every corner turns each cell into a small plateau with a ramp round its
+''  edge, and the ridge lines come out visibly RIPPLED at exactly cell frequency - traded a
+''  crease for a wobble. Smoothstep is a tool for SHAPING A LATTICE, not for interpolating data
+''  that already means something.
+''  The crease it was meant to fix is real, but it was fixed in the wrong place: what suffers
+''  from it is the camera, and the camera is damped where it is computed. See EYELAG.
+''
 ''  The offset of MAPSZ*4 before the mask is not decoration. The ray reaches negative world
 ''  coordinates - the camera circles the middle of the map and ZFAR is 220 cells - and Int()
 ''  truncates TOWARD ZERO, so at wx = -1.3 it returns -1 and the fractional part comes out as
@@ -597,18 +609,6 @@ Function HeightAt(ByVal wx As Double, ByVal wy As Double) As Double
     Dim As Integer x0 = Int(px) And MAPMASK, y0 = Int(py) And MAPMASK
     Dim As Integer x1 = (x0 + 1) And MAPMASK, y1 = (y0 + 1) And MAPMASK
     Dim As Double  tx = px - Int(px), ty = py - Int(py)
-
-    '' ⚠️ SMOOTHSTEP ON THE WEIGHTS, and this is not decoration - it fixes a defect that is
-    '' invisible in a still frame and impossible to miss in motion. Plain bilinear is CONTINUOUS
-    '' across a cell boundary but its SLOPE is not: the surface has a crease along every cell
-    '' edge. The camera rides this surface, and on this flight path it crosses a cell boundary
-    '' about every 1.2 frames, so the eye height changed GRADIENT twenty-six times a second and
-    '' the whole picture trembled - mountains wobbling like jelly, with nothing wrong in any one
-    '' frame. Replacing t with t*t*(3-2t) makes the weight's derivative zero at both ends of the
-    '' cell, so the slopes of neighbouring cells meet instead of meeting at an angle. Two
-    '' multiplies per axis, and the creases are gone from the terrain as well as from the ride.
-    tx = tx * tx * (3.0 - 2.0 * tx)
-    ty = ty * ty * (3.0 - 2.0 * ty)
 
     Return (hmap(y0 * MAPSZ + x0) * (1.0 - tx) + hmap(y0 * MAPSZ + x1) * tx) * (1.0 - ty) _
          + (hmap(y1 * MAPSZ + x0) * (1.0 - tx) + hmap(y1 * MAPSZ + x1) * tx) * ty
@@ -686,9 +686,6 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
             mx0 = Int(wx) And MAPMASK : mx1 = (mx0 + 1) And MAPMASK
             my0 = Int(wy) And MAPMASK : my1 = (my0 + 1) And MAPMASK
             tx  = wx - Int(wx)        : ty  = wy - Int(wy)
-            tx  = tx * tx * (3.0 - 2.0 * tx)   '' same smoothstep as HeightAt - see the note there.
-            ty  = ty * ty * (3.0 - 2.0 * ty)   '' The two MUST agree: the camera rides one surface
-                                               '' and the renderer draws the other.
             i00 = my0 * MAPSZ + mx0   : i10 = my0 * MAPSZ + mx1
             i01 = my1 * MAPSZ + mx0   : i11 = my1 * MAPSZ + mx1
             hgt = (hmap(i00) * (1.0 - tx) + hmap(i10) * tx) * (1.0 - ty) _
