@@ -151,6 +151,13 @@ begin
   inherited Create;
   FScreen := TGraphicsMemory.Create;
   FInGraphics := False;
+  // ⚠️ White on black, not zero. These had no initialiser, so PRINT inside a graphics mode drew
+  // black glyphs on an opaque black background: a solid black bar exactly as wide as the text and
+  // eight pixels tall, with the text invisible inside it. It reads as a rendering bug in the
+  // blitter rather than as an uninitialised colour pair, which is what makes it worth a comment.
+  // White on black is also what FreeBASIC starts a graphics screen with.
+  FTextFG := $FFFFFFFF;
+  FTextBG := $FF000000;
 end;
 
 destructor TSoftwareGraphicsBackend.Destroy;
@@ -198,6 +205,8 @@ begin
   if (W <= 0) or (H <= 0) then Exit(False);
   FScreen.AllocateBuffers(W, H, False, gmSDL2Dynamic);
   FScreen.ClearCurrentMode($000000FF);   // black, opaque
+  FTextFG := $FFFFFFFF;                  // SCREENRES resets the text pair, as FreeBASIC does
+  FTextBG := $FF000000;
   FInGraphics := True;
   Result := True;
 end;

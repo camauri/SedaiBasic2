@@ -189,7 +189,12 @@ begin
   if (W <= 0) or (H <= 0) or not Assigned(FRenderer) then Exit;
   if Assigned(FTexture) and (W = FTexW) and (H = FTexH) then Exit;
   if Assigned(FTexture) then SDL_DestroyTexture(FTexture);
-  FTexture := SDL_CreateTexture(FRenderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, W, H);
+  // ⚠️ ARGB, not ABGR. RGB(r,g,b) lowers to (A shl 24) or (R shl 16) or (G shl 8) or B, and a
+  // UInt32 in that layout sits in memory little-endian as B,G,R,A - which is exactly what SDL
+  // calls ARGB8888. Asking for ABGR8888 swaps red and blue, and the failure is quiet and
+  // plausible: a light blue sky comes out light brown and every colour is merely "a bit off",
+  // which reads as a palette choice rather than as a bug.
+  FTexture := SDL_CreateTexture(FRenderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, W, H);
   FTexW := W; FTexH := H;
   if Assigned(FWindow) then SDL_SetWindowSize(FWindow, W, H);
 end;
@@ -210,7 +215,7 @@ begin
       FClosed := True;
   end;
 
-  // Mirror the software framebuffer (ABGR) into the texture and present it.
+  // Mirror the software framebuffer (ARGB) into the texture and present it.
   if Assigned(FRenderer) and Assigned(FBackend) then
   begin
     Mem := FBackend.ScreenMemory;

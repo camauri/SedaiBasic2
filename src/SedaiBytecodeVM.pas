@@ -410,6 +410,7 @@ type
     // Present cadence for a windowed run (0 = off, which is every target except `sb --window`)
     FPresentCadenceMs: LongWord;
     FLastPresentTick: QWord;
+    FFrameBoundarySeen: Boolean;   // the program repaints the whole screen: use that, not the clock
     // SPRDEF modal sprite editor callback (set by the SDL console; nil elsewhere)
     FSpriteEditorCallback: TSpriteEditorCallback;
     {$IFDEF ENABLE_INSTRUCTION_COUNTING}
@@ -466,7 +467,8 @@ type
     procedure ExecuteIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSpecialVarOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteGraphicsOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
-    procedure MaybePresentCadence(Ctx: TExecutionContext);  // windowed runs only; see the body
+    procedure MaybePresentCadence(Ctx: TExecutionContext);   // windowed runs only; see the body
+    procedure PresentBeforeFullRepaint(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSoundOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSpriteOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteFileIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -1125,6 +1127,7 @@ begin
   FEventPollCallback := nil;
   FPresentCadenceMs := 0;      // off unless a windowed front end asks for it
   FLastPresentTick := 0;
+  FFrameBoundarySeen := False;
   FSpriteEditorCallback := nil;
   FEventPollInterval := 10000;  // Poll every 10000 instructions by default
   // Initialize error state for EL, ER, ERR$
@@ -11868,6 +11871,7 @@ var
   ScrData: PByte;      // SCREENPTR: working-page pixel bytes (existence check only)
   ScrSize: Integer;
 begin
+  if FPresentCadenceMs > 0 then PresentBeforeFullRepaint(Ctx, Instr);
   // M5.3: off the render-owner thread, defer to the queue instead of touching SDL. Dormant on
   // the single-threaded path (FHasWorkers = False short-circuits before any thread-id check).
   if FHasWorkers and not IsRenderOwner then
@@ -12570,10 +12574,56 @@ end;
 // PresentCadenceMs - only the WITH_WINDOW path in SedaiBasicVM.lpr does - so for every other target
 // this whole mechanism costs one compare against a field per graphics opcode and changes nothing.
 // A present cadence added unconditionally would have fought with sbv's own rendering.
+// A frame ends where the next one starts: at the moment the program is about to repaint the whole
+// screen. That is not a guess about intent, it is a fact about the buffer - everything currently in
+// it is about to be destroyed, so this instant is the last one at which it is a complete picture.
+//
+// This exists because the clock alone is not good enough. A time cadence fires wherever it happens
+// to land, which for a program that clears and redraws every frame means it regularly catches the
+// screen just after the clear and just before the landscape: the window then alternates between the
+// finished frame and a flat field of the clear colour, at the cadence rate. Which is to say it
+// FLICKERS, in the background colour, and looks far worse than the seam a mid-frame present was
+// expected to cost.
+//
+// Detected here: LINE with the BF flag whose corners cover the whole screen - the idiom every
+// FreeBASIC animation uses to clear. Once a program has shown it has a frame boundary, the clock is
+// switched off for good and presents happen only here, exactly once per frame, never mid-picture.
+// A program that never repaints the whole screen keeps the clock, which is right: it has no frames
+// to be caught between.
+procedure TBytecodeVM.PresentBeforeFullRepaint(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+var
+  X1, Y1, X2, Y2, W, H: Integer;
+begin
+  if Instr.OpCode <> bcGfxLine then Exit;
+  if ((Instr.Immediate shr 48) and $3) <> 2 then Exit;        // not BF: not a filled box
+  if not Assigned(FGraphics) then Exit;
+
+  W := FGraphics.SurfaceWidth(FGraphics.ScreenSurface);
+  H := FGraphics.SurfaceHeight(FGraphics.ScreenSurface);
+  if (W <= 0) or (H <= 0) then Exit;
+
+  X1 := GfxMapX(Ctx.IntRegs[Instr.Src1]);
+  Y1 := GfxMapY(Ctx.IntRegs[Instr.Src2]);
+  X2 := GfxMapX(Ctx.IntRegs[(Instr.Immediate) and $FFFF]);
+  Y2 := GfxMapY(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]);
+  if (X1 > 0) or (Y1 > 0) or (X2 < W - 1) or (Y2 < H - 1) then Exit;
+
+  // The picture standing in the buffer is finished. Show it, then let the clear happen.
+  FFrameBoundarySeen := True;
+  if Assigned(FEventPollCallback) then
+  begin
+    if FEventPollCallback() then Ctx.Running := False;
+  end
+  else
+    PresentFrame;
+end;
+
 procedure TBytecodeVM.MaybePresentCadence(Ctx: TExecutionContext);
 var
   Tick: QWord;
 begin
+  if FFrameBoundarySeen then Exit;   // the program has a real frame boundary; the clock would only
+                                     // catch it mid-picture and make it flicker
   // GetTickCount64 reads a shared page on Windows and a monotonic clock on Linux: cheap enough to
   // call per LINE (a few thousand times a frame) without a counter in front of it, and a counter
   // would break the case that needs this most - a program drawing five lines per frame.
