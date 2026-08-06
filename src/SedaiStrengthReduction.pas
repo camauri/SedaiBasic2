@@ -1319,6 +1319,44 @@ var
               (Val.RegType = IV.VarRegType);
   end;
 
+  { The block an instruction lives in, or nil. }
+  function BlockOfInstr(Instr: TSSAInstruction): TSSABasicBlock;
+  var
+    bi, ii: Integer;
+    B: TSSABasicBlock;
+  begin
+    Result := nil;
+    if Instr = nil then Exit;
+    for bi := 0 to FProgram.Blocks.Count - 1 do
+    begin
+      B := FProgram.Blocks[bi];
+      for ii := 0 to B.Instructions.Count - 1 do
+        if B.Instructions[ii] = Instr then Exit(B);
+    end;
+  end;
+
+  { Does A dominate B? Walks B's immediate-dominator chain (FDominatorMap). }
+  function BlockDominates(A, B: TSSABasicBlock): Boolean;
+  var
+    Cur: TSSABasicBlock;
+    Guard: Integer;
+    Nxt: Pointer;
+  begin
+    Result := False;
+    if (A = nil) or (B = nil) then Exit;
+    Cur := B;
+    Guard := 0;
+    while Assigned(Cur) and (Guard < 100000) do
+    begin
+      if Cur = A then Exit(True);
+      Nxt := FDominatorMap.Find(Format('%p', [Pointer(Cur)]));
+      if Nxt = nil then Break;
+      if TSSABasicBlock(Nxt) = Cur then Break;     // the entry block is its own idom
+      Cur := TSSABasicBlock(Nxt);
+      Inc(Guard);
+    end;
+  end;
+
   { Find pre-header block (predecessor of header that's not in the loop) }
   function FindPreHeader(Loop: TLoopInfoSR): TSSABasicBlock;
   var
@@ -1514,6 +1552,16 @@ begin
         // updated EARLIER in the SAME block as the multiply (e.g. a DO/LOOP body `N = N + 1` then
         // `J = N * 10`), the accumulator it builds is wrong (J reads 1,4 instead of 10,20). Detect
         // that case and skip — the multiply stays and computes correctly.
+        //
+        // ⚠️ "Earlier" is not "earlier in this block". The guard used to compare positions only
+        // within Block, so it missed the same unsoundness one branch away: a DO/LOOP that does
+        // `X = X + 1` in the body and then `D = D + 4 * X` inside an IF puts the multiply in a
+        // DIFFERENT block, the scan found no update, and the accumulator lagged one step behind X.
+        // The real question is whether the update runs before the multiply on every path, which is
+        // DOMINANCE — and it answers the FOR shape correctly too, because there the update sits in
+        // the latch, which does not dominate the body.
+        // Cost of getting it wrong: a midpoint-circle loop ran one iteration too many, silently
+        // (job/tests/bas/bug_optdiff_midpoint_loop.bas).
         IVUpdatePos := -1;
         for PosScan := 0 to Block.Instructions.Count - 1 do
           if Block.Instructions[PosScan] = IV.UpdateInstr then
@@ -1522,6 +1570,11 @@ begin
             Break;
           end;
         if (IVUpdatePos >= 0) and (IVUpdatePos < k) then
+        begin
+          Inc(k);
+          Continue;
+        end;
+        if (IVUpdatePos < 0) and BlockDominates(BlockOfInstr(IV.UpdateInstr), Block) then
         begin
           Inc(k);
           Continue;
