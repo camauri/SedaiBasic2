@@ -59,6 +59,18 @@ interface
 uses
   SysUtils, SedaiWasmEmitter;
 
+const
+  { The engine ceiling on br_table entries, and therefore on the number of CFG
+    blocks one dispatch region can hold. MEASURED, not read off a spec: 65520
+    validates, instantiates and computes the right answer (958 KB module);
+    65521 is refused with "invalid table count". Nesting depth is NOT the limit
+    - 50000 nested blocks are fine.
+    For scale, the largest program measured here (bas/demo/sedai_lbm.bas, 785
+    lines) has 300 blocks, so the headroom is over 200x. The guard exists
+    anyway: a limit has to be refused with a clear message, never discovered by
+    the browser. }
+  WASM_MAX_BR_TABLE_TARGETS = 65520;
+
 type
   EWasmControl = class(Exception);
 
@@ -119,6 +131,11 @@ begin
   inherited Create;
   if ABlockCount < 1 then
     raise EWasmControl.Create('a dispatch region needs at least one block');
+  if ABlockCount > WASM_MAX_BR_TABLE_TARGETS then
+    raise EWasmControl.CreateFmt(
+      'a dispatch region of %d blocks exceeds the engine ceiling of %d br_table ' +
+      'entries; the region has to be split before emission',
+      [ABlockCount, WASM_MAX_BR_TABLE_TARGETS]);
   FCount := ABlockCount;
   FStateLocal := AStateLocal;
   SetLength(FBodies, FCount);
