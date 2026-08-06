@@ -101,14 +101,14 @@ Const FRAMES    = 600          '' one full circle. The run ends here so it can b
 Const STATN     = 120          '' frame-time window the on-screen counter reports on.
 
 Dim Shared As UByte    hmap(MAPSZ * MAPSZ - 1)   '' altitude, 0..255
-'' The surface colour is kept BOTH ways, and the reason is portability, not convenience.
-'' RGB() packs its three channels into an integer whose BYTE ORDER is the compiler's business,
-'' not ours - so a raw file written from packed values would come out with red and blue
-'' swapped on one of the two targets and nobody would notice until the video was watched.
-'' The packed form feeds Line, which wants exactly what RGB() returns; the three byte arrays
-'' feed the raw file, where every byte's meaning is written down. 192 KB for the three at
-'' this map size, which buys a format that cannot be got wrong.
-Dim Shared As UInteger cmap(MAPSZ * MAPSZ - 1)   '' surface colour, precomputed with it
+'' The surface colour is stored as three separate byte planes, not as the packed integer that
+'' RGB() returns, and the reason is portability. RGB() packs its channels into an integer whose
+'' BYTE ORDER is the compiler's business, not ours - a raw file written from packed values comes
+'' out with red and blue swapped on one of the two targets, and nobody notices until the video
+'' is watched. A byte plane has a meaning that is written down; a packed integer does not.
+'' There WAS a fourth, packed array here, so that Line could be handed a colour with no work per
+'' span. Fog and bilinear colour both took that away - a span's colour is now computed rather
+'' than looked up - so the packed copy had no reader left, and 256 KB went with it.
 Dim Shared As UByte    cmR(MAPSZ * MAPSZ - 1)
 Dim Shared As UByte    cmG(MAPSZ * MAPSZ - 1)
 Dim Shared As UByte    cmB(MAPSZ * MAPSZ - 1)
@@ -347,7 +347,6 @@ Sub PaintWorld()
         cmR(c) = br
         cmG(c) = bg
         cmB(c) = bb
-        cmap(c) = RGB(br, bg, bb)
     Next
 End Sub
 
@@ -381,6 +380,21 @@ End Sub
 ''  haze has reached the middle distance and taken the snow cap and the shadow modelling with
 ''  it - the picture gets more atmosphere and less landscape. 2.0 keeps both.
 ''
+''  ⚠️ AND THAT ALONE IS NOT ENOUGH, WHICH ONLY THE MOVING PICTURE SHOWS. An exponential
+''  reaches full haze at infinity; we stop the world at ZFAR. At 2.0 the haze is 86% there,
+''  so ground arriving at the clip distance arrives at 14% contrast against the sky - faint,
+''  but not nothing. And ground that far away projects to within a pixel or two of the horizon
+''  line, so what the eye sees is not a mountain emerging from haze: it is a mountain GROWING
+''  UPWARDS OUT OF THE HORIZON as the camera advances. The landscape looks like it is being
+''  built rather than approached, and no still frame says a word about it.
+''
+''  The fix is to stop treating the clip plane as if it were infinity. Past CLIPFADE of the way
+''  out, the haze is closed the rest of the way to FULL with a smoothstep, so that whatever
+''  crosses ZFAR crosses it painted exactly the colour of the sky it comes out of. Nothing can
+''  pop into a picture it is already indistinguishable from. CLIPFADE = 0.55 because the ramp
+''  must be long enough to be invisible - shorter and the closing itself becomes a moving band
+''  of haze - and short enough to leave the middle distance the depth the exponential gives it.
+''
 ''  ⭐ And the colour fogged TOWARD is exactly the sky colour, not a grey. That is what makes
 ''  the horizon disappear rather than fade: at maximum distance the ground is painted the same
 ''  value as the pixels above it, so there is nothing left for the eye to find an edge in.
@@ -390,6 +404,7 @@ Const HORR      = 120
 Const HORG      = 160
 Const HORB      = 210
 Const FOGDENS   = 2.0
+Const CLIPFADE  = 0.55   '' fraction of ZFAR at which the haze starts closing to fully opaque
 Const FOGSTEPS  = 512    '' log(ZFAR/ZNEAR)/log(ZSTEP) is 453; 512 leaves room to retune ZSTEP.
 
 Dim Shared As Integer fogw(0 To FOGSTEPS - 1)   '' 0..256, the horizon colour's share
@@ -398,13 +413,56 @@ Sub BuildFog()
     Dim As Integer k
     Dim As Double  z = ZNEAR, f
     For k = 0 To FOGSTEPS - 1
-        f = z / ZFAR
-        If f > 1.0 Then f = 1.0
-        f = 1.0 - Exp(-FOGDENS * f * f)
+        Dim As Double u = z / ZFAR
+        If u > 1.0 Then u = 1.0
+        f = 1.0 - Exp(-FOGDENS * u * u)
+
+        '' close the remaining gap to full haze over the last stretch before the clip plane
+        Dim As Double c = (u - CLIPFADE) / (1.0 - CLIPFADE)
+        If c > 0.0 Then
+            If c > 1.0 Then c = 1.0
+            c = c * c * (3.0 - 2.0 * c)
+            f = f + (1.0 - f) * c
+        End If
+
         fogw(k) = Int(f * 256.0)
         z = z * ZSTEP
     Next
 End Sub
+
+'' -------------------------------------------------------------------------------------
+''  SAMPLING THE GROUND BETWEEN CELLS
+''
+''  THE PICTURE IS WHAT CAUGHT THIS, and it is worth stating plainly: reading the heightmap
+''  with Int() alone makes every map cell a FLAT PLATEAU with a vertical wall around it. On a
+''  256-cell map with the eye riding close to the ground, one cell covers tens of pixels near
+''  the camera, and the landscape comes out as a field of cubes. No timing and no counter says
+''  a word about it - it is only visible by looking at a frame.
+''
+''  The fix is to read the FOUR cells around the sample point and mix them by the fractional
+''  part of the position: bilinear interpolation. The heightmap stops being a staircase and
+''  becomes a surface, and nothing else in the renderer changes - the projection, the y-buffer
+''  and the occlusion test never knew the height came from a grid at all.
+''
+''  This function is also what the CAMERA rides on, and that mattered more than expected. With
+''  the eye height read from a single cell, the camera stepped up and down by whole altitude
+''  units as it crossed cell boundaries - about one crossing every one and a half frames on this
+''  circle - and the whole frame jolted vertically. The terrain was smooth and the VIEW was not.
+''
+''  The offset of MAPSZ*4 before the mask is not decoration. The ray reaches negative world
+''  coordinates - the camera circles the middle of the map and ZFAR is 220 cells - and Int()
+''  truncates TOWARD ZERO, so at wx = -1.3 it returns -1 and the fractional part comes out as
+''  -0.3. A negative weight makes the interpolation EXTRAPOLATE, and the terrain grows spikes
+''  along the line where the world coordinate crosses zero. Adding four map widths first costs
+''  one addition and makes the argument unconditionally positive, so that Int() IS floor.
+Function HeightAt(ByVal wx As Double, ByVal wy As Double) As Double
+    Dim As Double  px = wx + MAPSZ * 4.0, py = wy + MAPSZ * 4.0
+    Dim As Integer x0 = Int(px) And MAPMASK, y0 = Int(py) And MAPMASK
+    Dim As Integer x1 = (x0 + 1) And MAPMASK, y1 = (y0 + 1) And MAPMASK
+    Dim As Double  tx = px - Int(px), ty = py - Int(py)
+    Return (hmap(y0 * MAPSZ + x0) * (1.0 - tx) + hmap(y0 * MAPSZ + x1) * tx) * (1.0 - ty) _
+         + (hmap(y1 * MAPSZ + x0) * (1.0 - tx) + hmap(y1 * MAPSZ + x1) * tx) * ty
+End Function
 
 '' The one routine that differs between the two modes. Everything above and below it - the
 '' world, the camera, the traversal, the y-buffer - is shared, which is the point: the video
@@ -413,12 +471,12 @@ End Sub
 '' frame as bytes. That also makes the video build HEADLESS: it needs no display at all,
 '' which is how an offline render actually gets run.
 Sub PaintSpan(ByVal x As Integer, ByVal y0 As Integer, ByVal y1 As Integer, _
-              ByVal ci As Integer, ByVal fw As Integer)
-    '' The one blend, done once for the whole strip. Shifting by 8 rather than dividing keeps
+              ByVal cr As Integer, ByVal cg As Integer, ByVal cb As Integer, ByVal fw As Integer)
+    '' The one blend, done once for the whole strip. Dividing by 256 rather than by 255 keeps
     '' it in integers; the rounding error is under half a level and no eye has ever found it.
-    Dim As Integer r = cmR(ci) + ((HORR - cmR(ci)) * fw) \ 256
-    Dim As Integer g = cmG(ci) + ((HORG - cmG(ci)) * fw) \ 256
-    Dim As Integer b = cmB(ci) + ((HORB - cmB(ci)) * fw) \ 256
+    Dim As Integer r = cr + ((HORR - cr) * fw) \ 256
+    Dim As Integer g = cg + ((HORG - cg) * fw) \ 256
+    Dim As Integer b = cb + ((HORB - cb) * fw) \ 256
 #if VIDEO
     Dim As Integer i, o
     For i = y0 To y1
@@ -436,7 +494,9 @@ End Sub
 ''  THE RENDERER
 '' -------------------------------------------------------------------------------------
 Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double, ByVal camh As Double)
-    Dim As Integer x, i, mx, my, hgt, ytop, ybot, si
+    Dim As Integer x, i, ytop, ybot, si
+    Dim As Integer mx0, my0, mx1, my1, i00, i10, i01, i11, cr, cg, cb
+    Dim As Double  hgt, tx, ty
     Dim As Double dirx, diry, planex, planey, camc, rx, ry, z, wx, wy
 
     '' The camera basis. "plane" is the view direction turned 90 degrees and scaled by
@@ -468,11 +528,19 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
         z = ZNEAR
         si = 0
         Do While z < ZFAR
-            wx = camx + rx * z
-            wy = camy + ry * z
-            mx = Int(wx) And MAPMASK                 '' the map wraps, so the camera can
-            my = Int(wy) And MAPMASK                 ''   circle for ever without an edge
-            hgt = hmap(my * MAPSZ + mx)
+            '' The map wraps, so the camera can circle for ever without an edge. The four
+            '' corners and the two weights are worked out here rather than by calling HeightAt,
+            '' because the span colour below needs exactly the same four cells: a call would
+            '' hide the arithmetic and then make us do all of it a second time.
+            wx = camx + rx * z + MAPSZ * 4.0
+            wy = camy + ry * z + MAPSZ * 4.0
+            mx0 = Int(wx) And MAPMASK : mx1 = (mx0 + 1) And MAPMASK
+            my0 = Int(wy) And MAPMASK : my1 = (my0 + 1) And MAPMASK
+            tx  = wx - Int(wx)        : ty  = wy - Int(wy)
+            i00 = my0 * MAPSZ + mx0   : i10 = my0 * MAPSZ + mx1
+            i01 = my1 * MAPSZ + mx0   : i11 = my1 * MAPSZ + mx1
+            hgt = (hmap(i00) * (1.0 - tx) + hmap(i10) * tx) * (1.0 - ty) _
+                + (hmap(i01) * (1.0 - tx) + hmap(i11) * tx) * ty
 
             '' Project. Dividing by z is the whole of perspective: the same altitude
             '' difference covers fewer screen rows the further away it is.
@@ -490,7 +558,18 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
                 '' One vertical span, drawn once. Measured on this machine: a full-height
                 '' Line is about thirteen times cheaper than the PSet calls that would
                 '' cover the same pixels, which is why the renderer thinks in spans.
-                PaintSpan(x, ytop, ybot, my * MAPSZ + mx, fogw(si))
+                '' The colour is interpolated the same way as the height, but ONLY here -
+                '' inside the test, so it is paid for spans that are actually drawn and not for
+                '' the samples the occlusion test throws away. Without it the surface is smooth
+                '' and the paint on it is still a grid of squares, which reads as cubes just as
+                '' loudly as the terraces did.
+                cr = (cmR(i00) * (1.0 - tx) + cmR(i10) * tx) * (1.0 - ty) _
+                   + (cmR(i01) * (1.0 - tx) + cmR(i11) * tx) * ty
+                cg = (cmG(i00) * (1.0 - tx) + cmG(i10) * tx) * (1.0 - ty) _
+                   + (cmG(i01) * (1.0 - tx) + cmG(i11) * tx) * ty
+                cb = (cmB(i00) * (1.0 - tx) + cmB(i10) * tx) * (1.0 - ty) _
+                   + (cmB(i01) * (1.0 - tx) + cmB(i11) * tx) * ty
+                PaintSpan(x, ytop, ybot, cr, cg, cb, fogw(si))
                 ybuf(x) = ytop
                 '' The column is full to the top: no sample further out can ever be seen
                 '' through it. This early exit is what makes the cost sublinear in the
@@ -547,7 +626,7 @@ For f = 0 To FRAMES - 1
     camx = MAPSZ / 2.0 + Cos(a) * CAMR
     camy = MAPSZ / 2.0 + Sin(a) * CAMR
     '' The eye rides the ground rather than sitting at a fixed altitude - see EYECLEAR.
-    camh = hmap((Int(camy) And MAPMASK) * MAPSZ + (Int(camx) And MAPMASK)) + EYECLEAR
+    camh = HeightAt(camx, camy) + EYECLEAR
 
 #if VIDEO
     RenderFrame(camx, camy, a + 1.5707963267948966, camh)
