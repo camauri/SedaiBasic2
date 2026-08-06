@@ -292,57 +292,95 @@ End Sub
 ''  start point would be wrong, because the ray arrives carrying no history. The fix is to walk
 ''  TWICE round and only record the second lap; by then the ray height is whatever the terrain
 ''  actually dictates. Doubling a sub-millisecond pass is the cheapest correctness there is.
-Const LSLOPE    = 1.15   '''' height units the sun ray falls per cell step - i.e. the sun's elevation.
-                         '''' Found by looking: at 2.0 the sun is so high almost nothing is shadowed,
-                         '''' at 0.6 whole valleys go dark and the bands stop reading. 1.15 is a
-                         '''' late-afternoon sun - shadows long enough to model the ridges, short
-                         '''' enough that they stay attached to what casts them.
-Const AMBIENT   = 0.52   '''' how much light a fully shadowed cell still gets. Not zero: outdoors the
-                         '''' sky is a second light source, and a black shadow reads as a hole in the
-                         '''' ground rather than as shade.
-Const PENUMB    = 9.0    '''' height units over which shadow deepens to full. A hard edge betrays the
-                         '''' grid - the shadow boundary comes out staircased along the cell lattice.
-                         '''' Fading over a few units hides the lattice without softening the shape.
+Const LSLOPE    = 1.15   '' height units the sun ray falls per cell step - i.e. the sun's elevation.
+                         '' Found by looking: at 2.0 the sun is so high almost nothing is shadowed,
+                         '' at 0.6 whole valleys go dark and the bands stop reading. 1.15 is a
+                         '' late-afternoon sun - shadows long enough to model the ridges, short
+                         '' enough that they stay attached to what casts them.
+Const AMBIENT   = 0.42   '' how much light a cell gets with no sun at all - in shadow, or facing
+                         '' away. Not zero: outdoors the sky is a second light source, and a black
+                         '' shadow reads as a hole in the ground rather than as shade. Applied in
+                         '' PaintWorld, where the sun's two terms are combined, not in the sweep.
+Const PENUMB    = 9.0    '' height units over which shadow deepens to full. A hard edge betrays the
+                         '' grid - the shadow boundary comes out staircased along the cell lattice.
+                         '' Fading over a few units hides the lattice without softening the shape.
 
-Dim Shared As UByte lit(MAPSZ * MAPSZ - 1)   '''' 0..255, how much sun reaches each cell
+Dim Shared As UByte lit(MAPSZ * MAPSZ - 1)   '' 0..255, how much of the sun each cell sees
 
 Sub CastShadows()
     Dim As Integer d, k, x, y, c, h
     Dim As Double  ray, f, depth
     For d = 0 To MAPSZ - 1
-        '''' One diagonal per starting column. A (+1,+1) walk on a power-of-two torus closes
-        '''' after exactly MAPSZ steps, so MAPSZ diagonals cover every cell once and none twice.
+        '' One diagonal per starting column. A (+1,+1) walk on a power-of-two torus closes
+        '' after exactly MAPSZ steps, so MAPSZ diagonals cover every cell once and none twice.
         x = d : y = 0
-        ray = -1000.0                       '''' arbitrary: the priming lap overwrites it
+        ray = -1000.0                       '' arbitrary: the priming lap overwrites it
         For k = 0 To 2 * MAPSZ - 1
             c = y * MAPSZ + x
             h = hmap(c)
             ray -= LSLOPE
             If h >= ray Then
-                ray = h                     '''' lit, and from here on THIS is what casts
+                ray = h                     '' lit, and from here on THIS is what casts
                 f = 1.0
             Else
                 depth = ray - h
                 f = depth / PENUMB
                 If f > 1.0 Then f = 1.0
-                f = 1.0 - (1.0 - AMBIENT) * f
+                f = 1.0 - f                 '' 1 = sun reaches it, 0 = fully blocked
             End If
-            If k >= MAPSZ Then lit(c) = Int(f * 255.0)   '''' second lap only
+            If k >= MAPSZ Then lit(c) = Int(f * 255.0)   '' second lap only
             x = (x + 1) And MAPMASK
             y = (y + 1) And MAPMASK
         Next
     Next
 End Sub
 
-'''' Material and light meet here, and only here. Kept separate from BuildWorld because the
-'''' shadow sweep needs the COMPLETE heightmap: a cell's shade depends on ground the generator
-'''' has not reached yet when that cell's own height is written.
+'' Material and light meet here, and only here. Kept separate from BuildWorld because the
+'' shadow sweep needs the COMPLETE heightmap: a cell's shade depends on ground the generator
+'' has not reached yet when that cell's own height is written.
+'' -------------------------------------------------------------------------------------
+''  ⚠️ THE BANDS AND THE CAST SHADOWS TOGETHER ARE NOT ENOUGH, and the reason is worth having.
+''  Inside a band the colour is deliberately FLAT, and a cast shadow is very nearly binary: a
+''  cell either sees the sun or it does not. So over a lit hillside the ground has exactly ONE
+''  colour, and every visible variation is a boundary - a band edge or a shadow edge. The eye
+''  finds those boundaries and reads them as CONTOUR LINES. The picture is smooth and it looks
+''  banded, which is the opposite of the intent.
+''
+''  What is missing is the term that varies CONTINUOUSLY: how much a piece of ground is TILTED
+''  toward the sun. A slope facing the light is bright, one facing away is dim, and between
+''  them is every value - so the flat interior of a band stops being flat without the band
+''  itself being weakened.
+''
+''  The surface normal comes from a central difference of the heightmap. Central rather than
+''  forward because a forward difference measures the slope half a cell away from where it is
+''  used, which shifts the whole shading half a cell downhill and puts a bright fringe on one
+''  side of every ridge. The 2.0 in the z component is the two-cell baseline the central
+''  difference spans, not a tuning constant: get it wrong and the terrain reads as steeper or
+''  flatter than it is drawn.
+''
+''  Two terms, one sun: the cast shadow says whether the sun is VISIBLE from here, the diffuse
+''  term says how squarely it lands. They multiply. Ambient is added afterwards so that neither
+''  can drive a cell to black.
 Sub PaintWorld()
-    Dim As Integer c, br, bg, bb
-    Dim As Double  f
+    Dim As Integer c, x, y, br, bg, bb
+    Dim As Double  f, nx, ny, nz, ilen, dif
+    Dim As Double  lx = -1.0, ly = -1.0, lz = LSLOPE
+    ilen = 1.0 / Sqr(lx * lx + ly * ly + lz * lz)
+    lx *= ilen : ly *= ilen : lz *= ilen
+
     For c = 0 To MAPSZ * MAPSZ - 1
+        x = c And MAPMASK
+        y = c \ MAPSZ
         BandColour(hmap(c), br, bg, bb)
-        f = lit(c) / 255.0
+
+        nx = -(hmap(y * MAPSZ + ((x + 1) And MAPMASK)) - hmap(y * MAPSZ + ((x - 1) And MAPMASK)))
+        ny = -(hmap(((y + 1) And MAPMASK) * MAPSZ + x) - hmap(((y - 1) And MAPMASK) * MAPSZ + x))
+        nz = 2.0
+        ilen = 1.0 / Sqr(nx * nx + ny * ny + nz * nz)
+        dif = (nx * lx + ny * ly + nz * lz) * ilen
+        If dif < 0.0 Then dif = 0.0
+
+        f = AMBIENT + (1.0 - AMBIENT) * dif * (lit(c) / 255.0)
         br = Int(br * f) : bg = Int(bg * f) : bb = Int(bb * f)
         cmR(c) = br
         cmG(c) = bg
