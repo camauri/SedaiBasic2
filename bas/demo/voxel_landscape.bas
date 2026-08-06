@@ -117,12 +117,25 @@ Const EYECLEAR     = 45.0         '' how far the eye rides ABOVE the ground unde
                                '' Riding the terrain fixes both: near ridges now fill their
                                '' columns, columns exit early, and the eye can never be
                                '' inside a hill.
-Const CAMR      = 70.0         '' radius of the camera circle, in map cells.
+Const CAMR      = 100.0        '' radius of the camera circle, in map cells. Large, because the
+                               ''   radius and the lap time together ARE the turn rate, and the turn
+                               ''   rate is what a viewer feels - see the camera path below.
+Const EYELAG    = 0.06         '' how tightly the eye follows the ground under it, per frame.
 Const FRAMES    = 1800         '' 60 seconds at 30 fps. The run ends here so it can be measured.
-Const CAMR2     = 34.0         '' radius of the second circle - see the camera path below.
 Const STATN     = 120          '' frame-time window the on-screen counter reports on.
 
-Dim Shared As UByte    hmap(MAPSZ * MAPSZ - 1)   '' altitude, 0..255
+'' ⚠️ ALTITUDE IS A FLOAT, AND IT HAS TO BE. This was a UByte, which is the obvious choice for
+'' a heightmap and is what put the last of the blockiness in the picture. The terrain rises less
+'' than one whole unit per cell over any gentle slope, so rounding to integers turns those slopes
+'' into plateaus several cells wide separated by one-unit steps - and near the camera ONE UNIT OF
+'' ALTITUDE IS FOURTEEN PIXELS TALL (VSCALE/z with z at the near edge of the screen). Bilinear
+'' interpolation cannot put back a difference that was never stored.
+'' ⭐ The diagnosis came from an experiment that made things WORSE. Suspecting the cell size, the
+'' map was doubled to 512 with the horizontal and vertical scales doubled to match - and a fine
+'' quilted texture appeared over the whole landscape. Doubling VSCALE had doubled the height of
+'' one altitude unit on screen, which is the opposite of what a cell-size problem would do. The
+'' experiment that fails in an informative direction is worth more than the one that works.
+Dim Shared As Single   hmap(MAPSZ * MAPSZ - 1)   '' altitude, 0..255, fractional
 '' The surface colour is stored as three separate byte planes, not as the packed integer that
 '' RGB() returns, and the reason is portability. RGB() packs its channels into an integer whose
 '' BYTE ORDER is the compiler's business, not ours - a raw file written from packed values comes
@@ -236,7 +249,7 @@ Dim Shared As Integer sb(0 To NBANDS) = { 104, 158, 138,  58,  98, 255,   0 }
 '' ⚠️ These tables live at module level rather than as Static arrays inside the Sub because
 '' "Static a(0 To 5) As Integer = {...}" inside a procedure is accepted by fbc and REJECTED by
 '' this implementation - a real gap, logged, but not one to trip over in a demo.
-Sub BandColour(ByVal h As Integer, ByRef r As Integer, ByRef g As Integer, ByRef b As Integer)
+Sub BandColour(ByVal h As Double, ByRef r As Integer, ByRef g As Integer, ByRef b As Integer)
     Dim As Integer i = 0
     While i < NBANDS - 1 AndAlso h >= sh(i + 1)
         i += 1
@@ -263,7 +276,8 @@ Sub BandColour(ByVal h As Integer, ByRef r As Integer, ByRef g As Integer, ByRef
 End Sub
 
 Sub BuildWorld()
-    Dim As Integer x, y, h, br, bg, bb
+    Dim As Integer x, y, br, bg, bb
+    Dim As Double  h
     Dim As Double n, amp, total
     For y = 0 To MAPSZ - 1
         For x = 0 To MAPSZ - 1
@@ -277,9 +291,9 @@ Sub BuildWorld()
             n += ValueNoise(x, y, 16) * amp : total += amp : amp *= 0.5
             n += ValueNoise(x, y, 32) * amp : total += amp
             n = n / total                                  '' back to 0..1
-            h = Int(n * 255.0)
-            If h < 0 Then h = 0
-            If h > 255 Then h = 255
+            h = n * 255.0
+            If h < 0.0 Then h = 0.0
+            If h > 255.0 Then h = 255.0
             hmap(y * MAPSZ + x) = h
         Next
     Next
@@ -330,7 +344,8 @@ Const PENUMB    = 9.0    '' height units over which shadow deepens to full. A ha
 Dim Shared As UByte lit(MAPSZ * MAPSZ - 1)   '' 0..255, how much of the sun each cell sees
 
 Sub CastShadows()
-    Dim As Integer d, k, x, y, c, h
+    Dim As Integer d, k, x, y, c
+    Dim As Double  h
     Dim As Double  ray, f, depth
     For d = 0 To MAPSZ - 1
         '' One diagonal per starting column. A (+1,+1) walk on a power-of-two torus closes
@@ -727,7 +742,7 @@ Dim As Double srt(STATN - 1)         '' scratch for the median
 Dim As Integer fi = 0, fcount = 0
 Dim As Double t0, t1, ms, med, worst, fps
 Dim As Integer f, i, j
-Dim As Double a, th, vx, vy, head, camx, camy, camh
+Dim As Double a, head, ghgt, camx, camy, camh
 Dim As Double allft(FRAMES - 1)      '' every frame, for the report at the end
 
 #if VIDEO
@@ -749,32 +764,35 @@ For f = 0 To FRAMES - 1
     '' A closed circular path, the camera always facing along it. Closed because the run
     '' has to be repeatable: the same frame number always sees the same view, so two
     '' engines can be compared frame by frame and not just on an average.
-    '' THE CAMERA PATH. A single circle would be the obvious thing, and it was - but a circle
-    '' repeats every lap, and at 30 fps a minute of film is three laps of it. The eye recognises
-    '' the second one immediately and stops watching. So the path is a circle riding on a circle:
-    '' three fast laps while a second, slower one carries the centre around once. It closes after
-    '' exactly FRAMES frames - both terms complete whole turns - so the last frame joins the
-    '' first and the film can loop, but no part of it is a repeat of an earlier part.
-    '' CAMR2 = 34 against CAMR = 70: large enough that the ground under the camera is different
-    '' on each lap, small enough that the path never doubles back on itself, which looks like a
-    '' mistake rather than a flight.
-    th = f * 6.283185307179586 / FRAMES
-    a  = th * 3.0
-    camx = MAPSZ / 2.0 + Cos(a) * CAMR + Cos(th) * CAMR2
-    camy = MAPSZ / 2.0 + Sin(a) * CAMR + Sin(th) * CAMR2
+    '' THE CAMERA PATH, and this is the third one. The first was a plain circle in 20 seconds.
+    '' The second put a circle on a circle - three fast laps carried round by a slow one - to stop
+    '' a minute of film repeating itself. It did stop repeating, and it was unwatchable: the
+    '' interesting number is not the SHAPE of the path but the TURN RATE it implies, and three
+    '' laps in a minute is 18 degrees a second of continuous yaw. Nothing in the picture is wrong;
+    '' it is simply exhausting to look at. ⭐ A camera is judged in degrees per second and cells
+    '' per second, not in how clever its curve is.
+    ''
+    '' So: one circle, one lap, sixty seconds. 6 degrees a second of yaw and a constant speed -
+    '' 0.35 cells a frame, about ten a second, so the view opens rather than sweeps. It closes on
+    '' its own first frame exactly, and a large radius means the ground under it is never the same
+    '' ground twice, which is what the epicycle was for in the first place.
+    a = f * 6.283185307179586 / FRAMES
+    camx = MAPSZ / 2.0 + Cos(a) * CAMR
+    camy = MAPSZ / 2.0 + Sin(a) * CAMR
+    head = a + 1.5707963267948966          '' facing along the flight
 
-    '' Facing along the flight, which now has to be DERIVED rather than assumed: on a plain
-    '' circle the heading is the angle plus a right angle, but on this path it is the direction
-    '' of the velocity, and the two terms contribute to it in proportion to their angular speed -
-    '' hence the 3.0 on the first. Getting this wrong does not look wrong in a still frame; it
-    '' looks like the camera is drifting sideways, which is exactly the sort of thing that is
-    '' obvious in motion and invisible in a screenshot.
-    vx = -Sin(a) * CAMR * 3.0 - Sin(th) * CAMR2
-    vy =  Cos(a) * CAMR * 3.0 + Cos(th) * CAMR2
-    head = Atan2(vy, vx)
-
-    '' The eye rides the ground rather than sitting at a fixed altitude - see EYECLEAR.
-    camh = HeightAt(camx, camy) + EYECLEAR
+    '' The eye rides the ground rather than sitting at a fixed altitude - see EYECLEAR - but it
+    '' rides it on a SPRING, not glued to it. Following the terrain exactly means every hillock
+    '' the camera passes over becomes a vertical movement of the entire picture, and a viewer
+    '' reads that as the world moving rather than themselves. EYELAG = 0.06 means the eye closes
+    '' 6% of the gap each frame - a time constant of about half a second, long enough to ignore
+    '' single hills and short enough that it does not sail over a ridge and leave the ground.
+    '' ⛔ And it must not be allowed to lag INTO the ground on a steep climb, hence the floor:
+    '' a smooth ride is not worth flying through a mountain.
+    ghgt = HeightAt(camx, camy)
+    If f = 0 Then camh = ghgt + EYECLEAR
+    camh += (ghgt + EYECLEAR - camh) * EYELAG
+    If camh < ghgt + EYECLEAR * 0.5 Then camh = ghgt + EYECLEAR * 0.5
 
 #if VIDEO
     RenderFrame(camx, camy, head, camh)
