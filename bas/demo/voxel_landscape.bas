@@ -12,7 +12,7 @@
 ''
 ''  That property is enough to draw the whole scene with one integer per screen column.
 ''
-''  For each of the 320 screen columns we send a ray out across the map and walk it from
+''  For each screen column we send a ray out across the map and walk it from
 ''  the camera outwards. Each sample gives an altitude; we project it to a screen row and
 ''  paint the vertical span it REVEALS -- the part of that column not already covered by
 ''  something nearer. A single array, the y-buffer, remembers how far down each column has
@@ -45,10 +45,15 @@
 ''   fbc voxel_landscape.bas && ./voxel_landscape
 ''   ffmpeg -f rawvideo -pix_fmt rgb24 -s 1920x1080 -r 30 -i frames.raw out.mp4
 ''
-'' Measured, so the offline cost is not a surprise: a 1080p frame takes 107 ms to fill and
-'' write against 54 ms to draw on screen - the byte-at-a-time array writes cost about twice
-'' what Line does, which is the price of a format that cannot be got wrong. 600 frames is
-'' about a minute of rendering, and ⚠️ 3.7 GB of raw file: pipe it or delete it after.
+'' Measured, so the offline cost is not a surprise: a 1080p frame takes about 100 ms to fill
+'' and write against 54 ms to draw on screen - the byte-at-a-time array writes cost about twice
+'' what Line does, which is the price of a format that cannot be got wrong. A full 600-frame
+'' circle renders in a minute, and ⚠️ leaves 3.7 GB of raw file: pipe it or delete it after.
+''
+'' What the three enrichments below cost, measured A/B against the version without them:
+'' the colour bands and the sun shadows cost NOTHING per frame - both fold into a colormap
+'' that was already being built - and the fog costs about 1 ms of the 640x480 frame, which is
+'' the only part of the three that depends on where the camera is.
 #define VIDEO 0
 
 #if VIDEO
@@ -80,13 +85,13 @@ Const EYECLEAR     = 45.0         '' how far the eye rides ABOVE the ground unde
                                '' ⚠️ This replaced a fixed eye altitude, and the instrument
                                '' is what said so. With the camera pinned at 165 units the
                                '' step counter reported the SAME 144960 samples on almost
-                               '' every frame - 320 columns x 453 steps, i.e. every column
+                               '' every frame - one column x 453 steps for every column,
                                '' walking the full distance and the y-buffer's early exit
                                '' never firing once. The renderer was correct and the
                                '' occlusion property this file spends a page explaining was
                                '' doing nothing, because from that height no ridge ever
                                '' reached the top of the screen. Three frames were worse
-                               '' still: 320 samples and a blank picture, the camera having
+                               '' still: one sample per column and a blank picture, having
                                '' flown straight through a peak taller than it was.
                                '' Riding the terrain fixes both: near ridges now fill their
                                '' columns, columns exit early, and the eye can never be
@@ -167,8 +172,76 @@ Function ValueNoise(ByVal x As Double, ByVal y As Double, ByVal freq As Integer)
     Return (a + (b - a) * tx) + ((c + (d - c) * tx) - (a + (b - a) * tx)) * ty
 End Function
 
+'' -------------------------------------------------------------------------------------
+''  COLOUR BY ALTITUDE BAND  (phase 2, step 1)
+''
+''  Phase 1 painted a single green ramp, and looking at a rendered frame is what said it was
+''  wrong: the landscape read as one flat sheet of green with the shapes barely legible. Real
+''  ground changes MATERIAL with height, not just brightness - water, sand, grass, rock, snow -
+''  and it is the material boundaries that let the eye read a slope.
+''
+''  ⚠️ THE FIRST ATTEMPT AT THIS TABLE FAILED, AND THE REASON IS WORTH MORE THAN THE TABLE.
+''  The stops were spread over the nominal 0..255 of a UByte. The picture came back green and
+''  sand-coloured with no water, no rock and no snow, so instead of nudging colours I counted
+''  what the generator actually produces: altitudes run 27..211, and HALF the map lies between
+''  93 and 137 - a 44-unit window out of 256. Four octaves of noise averaged together pull hard
+''  toward the mean; the extremes need all four octaves to agree, which is rare. So a stop at
+''  200 was above the 95th percentile and one at 70 was below the 5th: two of five bands could
+''  not be reached by any point on the map. The stops below are placed on the MEASURED
+''  distribution, and that is the only way they could have been right.
+''
+''  Bands are FLAT with a narrow blended edge, not a ramp from stop to stop. A ramp is what
+''  phase 1 already was, only in more colours; a flat band is what makes a material read as a
+''  material. But a hard cut draws a contour line along every hillside at exactly the band
+''  height and the eye reads those lines as terraces that are not there - so each boundary is
+''  blended over ±BLENDW altitude units with a smoothstep. BLENDW = 5 because the narrowest
+''  band here (the shoreline) is 12 units wide: any wider and two blend windows would overlap
+''  and the shore would stop being a colour of its own.
+Const NBANDS    = 6
+Const BLENDW    = 5.0
+
+'' Lower edge of each band, plus a sentinel above the highest altitude. Percentiles of the
+'' generated map, for reference: p05=67  p25=93  p50=114  p75=137  p95=171, range 27..211.
+Dim Shared As Integer sh(0 To NBANDS) = {   0,  64,  76,  88, 155, 182, 999 }
+Dim Shared As Integer sr(0 To NBANDS) = {  22,  52, 200,  76, 110, 246,   0 }
+Dim Shared As Integer sg(0 To NBANDS) = {  52, 108, 190, 126, 108, 248,   0 }
+Dim Shared As Integer sb(0 To NBANDS) = { 104, 158, 138,  58,  98, 255,   0 }
+''                                       deep  sea  sand grass rock snow  (sentinel)
+
+'' ⭐ All of it happens ONCE, here, into the colormap. The renderer reads a colour it never
+'' computes - the same trade the whole demo is built on, and the reason the measured frame
+'' time does not move at all when this is switched on.
+'' ⚠️ These tables live at module level rather than as Static arrays inside the Sub because
+'' "Static a(0 To 5) As Integer = {...}" inside a procedure is accepted by fbc and REJECTED by
+'' this implementation - a real gap, logged, but not one to trip over in a demo.
+Sub BandColour(ByVal h As Integer, ByRef r As Integer, ByRef g As Integer, ByRef b As Integer)
+    Dim As Integer i = 0
+    While i < NBANDS - 1 AndAlso h >= sh(i + 1)
+        i += 1
+    Wend
+
+    '' Default is the flat band colour; only a point within BLENDW of a boundary mixes. Both
+    '' branches use the same formula - t runs 0 at (edge - BLENDW) to 1 at (edge + BLENDW),
+    '' so it is 0.5 exactly on the edge and the two sides of a boundary agree.
+    Dim As Integer lo = i, hi = i
+    Dim As Double  t = 0.0
+    If i < NBANDS - 1 AndAlso h > sh(i + 1) - BLENDW Then
+        lo = i     : hi = i + 1 : t = (h - (sh(i + 1) - BLENDW)) / (2.0 * BLENDW)
+    ElseIf i > 0 AndAlso h < sh(i) + BLENDW Then
+        lo = i - 1 : hi = i     : t = (h - (sh(i)     - BLENDW)) / (2.0 * BLENDW)
+    End If
+    If t < 0.0 Then t = 0.0
+    If t > 1.0 Then t = 1.0
+    t = t * t * (3.0 - 2.0 * t)     '' smoothstep: zero slope at both ends, so the blend has no
+                                    '' visible seam where it meets the flat part of the band
+
+    r = sr(lo) + (sr(hi) - sr(lo)) * t
+    g = sg(lo) + (sg(hi) - sg(lo)) * t
+    b = sb(lo) + (sb(hi) - sb(lo)) * t
+End Sub
+
 Sub BuildWorld()
-    Dim As Integer x, y, h
+    Dim As Integer x, y, h, br, bg, bb
     Dim As Double n, amp, total
     For y = 0 To MAPSZ - 1
         For x = 0 To MAPSZ - 1
@@ -186,14 +259,150 @@ Sub BuildWorld()
             If h < 0 Then h = 0
             If h > 255 Then h = 255
             hmap(y * MAPSZ + x) = h
-            '' Phase 1 keeps the colour a plain function of altitude: dark green in the
-            '' valleys through to pale grey on the tops. Banding with soft transitions is
-            '' a phase 2 job; doing it here would hide whether the RENDERER is right.
-            cmR(y * MAPSZ + x) = 60 + h \ 3
-            cmG(y * MAPSZ + x) = 90 + h \ 2
-            cmB(y * MAPSZ + x) = 60 + h \ 4
-            cmap(y * MAPSZ + x) = RGB(60 + h \ 3, 90 + h \ 2, 60 + h \ 4)
         Next
+    Next
+End Sub
+
+'' -------------------------------------------------------------------------------------
+''  SUN SHADOWS  (phase 2, step 2)
+''
+''  ⭐ THE TRADEOFF THE BRIEF ASKS TO BE EXPLICIT ABOUT: this could be done per frame or once.
+''  Per frame it is a shadow test for every sample the traversal touches - roughly 150 000 of
+''  them at 640x480 - and it would have to be redone every frame even though NOTHING MOVES:
+''  the sun is fixed and so is the ground, so the answer is the same on frame 1 and frame 600.
+''  Precomputing it costs one sweep of the map (2 x 65 536 steps, well under a millisecond) and
+''  ZERO bytes of extra storage, because the colormap is already indexed per CELL rather than
+''  per altitude - so the light simply multiplies into a colour that was going to be stored
+''  anyway. The renderer is not told that shadows exist. That is the whole trick, and it is the
+''  same trick as the colour bands: anything that depends only on WHERE a cell is, and not on
+''  where the camera is, belongs in the colormap.
+''  ⚠️ What it buys is also what it costs: the sun can never move. A day/night cycle would mean
+''  rebuilding the colormap, which at this map size is a few milliseconds - fine once a second,
+''  not fine once a frame.
+''
+''  The sweep itself: walk the map in the direction the LIGHT travels, carrying the height of
+''  the light ray. Each step the ray drops by LSLOPE. If the ground reaches the ray, this cell
+''  is lit and it becomes the new ray height - it is the thing casting from here on. If the
+''  ground is below the ray, something upwind is blocking the sun and the cell is in shadow.
+''  One pass over the map answers every cell, which is why this is a sweep and not a per-cell
+''  search: the expensive question ("what is between me and the sun?") is answered incrementally
+''  by the cell before me.
+''
+''  ⚠️ The map is a torus, so a sweep line has no beginning - and the first few cells of any
+''  start point would be wrong, because the ray arrives carrying no history. The fix is to walk
+''  TWICE round and only record the second lap; by then the ray height is whatever the terrain
+''  actually dictates. Doubling a sub-millisecond pass is the cheapest correctness there is.
+Const LSLOPE    = 1.15   '''' height units the sun ray falls per cell step - i.e. the sun's elevation.
+                         '''' Found by looking: at 2.0 the sun is so high almost nothing is shadowed,
+                         '''' at 0.6 whole valleys go dark and the bands stop reading. 1.15 is a
+                         '''' late-afternoon sun - shadows long enough to model the ridges, short
+                         '''' enough that they stay attached to what casts them.
+Const AMBIENT   = 0.52   '''' how much light a fully shadowed cell still gets. Not zero: outdoors the
+                         '''' sky is a second light source, and a black shadow reads as a hole in the
+                         '''' ground rather than as shade.
+Const PENUMB    = 9.0    '''' height units over which shadow deepens to full. A hard edge betrays the
+                         '''' grid - the shadow boundary comes out staircased along the cell lattice.
+                         '''' Fading over a few units hides the lattice without softening the shape.
+
+Dim Shared As UByte lit(MAPSZ * MAPSZ - 1)   '''' 0..255, how much sun reaches each cell
+
+Sub CastShadows()
+    Dim As Integer d, k, x, y, c, h
+    Dim As Double  ray, f, depth
+    For d = 0 To MAPSZ - 1
+        '''' One diagonal per starting column. A (+1,+1) walk on a power-of-two torus closes
+        '''' after exactly MAPSZ steps, so MAPSZ diagonals cover every cell once and none twice.
+        x = d : y = 0
+        ray = -1000.0                       '''' arbitrary: the priming lap overwrites it
+        For k = 0 To 2 * MAPSZ - 1
+            c = y * MAPSZ + x
+            h = hmap(c)
+            ray -= LSLOPE
+            If h >= ray Then
+                ray = h                     '''' lit, and from here on THIS is what casts
+                f = 1.0
+            Else
+                depth = ray - h
+                f = depth / PENUMB
+                If f > 1.0 Then f = 1.0
+                f = 1.0 - (1.0 - AMBIENT) * f
+            End If
+            If k >= MAPSZ Then lit(c) = Int(f * 255.0)   '''' second lap only
+            x = (x + 1) And MAPMASK
+            y = (y + 1) And MAPMASK
+        Next
+    Next
+End Sub
+
+'''' Material and light meet here, and only here. Kept separate from BuildWorld because the
+'''' shadow sweep needs the COMPLETE heightmap: a cell's shade depends on ground the generator
+'''' has not reached yet when that cell's own height is written.
+Sub PaintWorld()
+    Dim As Integer c, br, bg, bb
+    Dim As Double  f
+    For c = 0 To MAPSZ * MAPSZ - 1
+        BandColour(hmap(c), br, bg, bb)
+        f = lit(c) / 255.0
+        br = Int(br * f) : bg = Int(bg * f) : bb = Int(bb * f)
+        cmR(c) = br
+        cmG(c) = bg
+        cmB(c) = bb
+        cmap(c) = RGB(br, bg, bb)
+    Next
+End Sub
+
+'' -------------------------------------------------------------------------------------
+''  ATMOSPHERIC FOG  (phase 2, step 3)
+''
+''  ⚠️ This is the first thing in the demo that CANNOT go in the colormap, and it is worth
+''  saying why: the bands depend on where a cell is, the shadows depend on where a cell is and
+''  where the sun is - both fixed - but fog depends on how far the cell is FROM THE CAMERA, and
+''  the camera moves. It has to be paid per frame. So the question becomes how little can be
+''  paid, and the answer is in two parts.
+''
+''  First: the fog WEIGHT is precomputable after all. The traversal always starts at ZNEAR and
+''  always multiplies by ZSTEP, so the sequence of distances is byte-for-byte the same in every
+''  column of every frame - only how FAR along it a column gets varies. So the weight is a
+''  function of the STEP NUMBER, and a table of 512 entries answers it with no exp() at all in
+''  the hot loop. (An exponential per sample would be about 150 000 transcendental calls a
+''  frame at 640x480, which is the sort of thing that quietly costs more than the renderer.)
+''
+''  Second: it is applied PER SPAN, not per pixel - three integer multiply-adds for a strip
+''  that may be hundreds of pixels tall, and NOT ONE EXTRA PIXEL IS WRITTEN. Fog that darkens
+''  what is already being drawn is free in the only currency this renderer spends: the phase-1
+''  scaling law says drawing dominates at high resolution, and this adds no drawing.
+''
+''  The curve is exp(-density * (z/ZFAR)^2), not linear in distance. Linear fog has a visible
+''  onset - a plane at a fixed distance where the haze switches on - because its derivative
+''  jumps from zero. The squared exponential starts flat, so near ground is untouched, and it
+''  approaches full haze asymptotically, so the far ridges dissolve into the sky instead of
+''  ending against it. FOGDENS = 2.0 was chosen by rendering both and comparing: with no fog
+''  at all the far ridges finish against the sky as a hard cut-out silhouette, and at 3.0 the
+''  haze has reached the middle distance and taken the snow cap and the shadow modelling with
+''  it - the picture gets more atmosphere and less landscape. 2.0 keeps both.
+''
+''  ⭐ And the colour fogged TOWARD is exactly the sky colour, not a grey. That is what makes
+''  the horizon disappear rather than fade: at maximum distance the ground is painted the same
+''  value as the pixels above it, so there is nothing left for the eye to find an edge in.
+'' The sky, and therefore the colour everything fades into. Named once because the clear,
+'' the video clear and the fog must agree - if they drift, the horizon grows a seam.
+Const HORR      = 120
+Const HORG      = 160
+Const HORB      = 210
+Const FOGDENS   = 2.0
+Const FOGSTEPS  = 512    '' log(ZFAR/ZNEAR)/log(ZSTEP) is 453; 512 leaves room to retune ZSTEP.
+
+Dim Shared As Integer fogw(0 To FOGSTEPS - 1)   '' 0..256, the horizon colour's share
+
+Sub BuildFog()
+    Dim As Integer k
+    Dim As Double  z = ZNEAR, f
+    For k = 0 To FOGSTEPS - 1
+        f = z / ZFAR
+        If f > 1.0 Then f = 1.0
+        f = 1.0 - Exp(-FOGDENS * f * f)
+        fogw(k) = Int(f * 256.0)
+        z = z * ZSTEP
     Next
 End Sub
 
@@ -203,17 +412,23 @@ End Sub
 '' In VIDEO mode there is no Line and no screen to draw on; the span goes straight into the
 '' frame as bytes. That also makes the video build HEADLESS: it needs no display at all,
 '' which is how an offline render actually gets run.
-Sub PaintSpan(ByVal x As Integer, ByVal y0 As Integer, ByVal y1 As Integer, ByVal ci As Integer)
+Sub PaintSpan(ByVal x As Integer, ByVal y0 As Integer, ByVal y1 As Integer, _
+              ByVal ci As Integer, ByVal fw As Integer)
+    '' The one blend, done once for the whole strip. Shifting by 8 rather than dividing keeps
+    '' it in integers; the rounding error is under half a level and no eye has ever found it.
+    Dim As Integer r = cmR(ci) + ((HORR - cmR(ci)) * fw) \ 256
+    Dim As Integer g = cmG(ci) + ((HORG - cmG(ci)) * fw) \ 256
+    Dim As Integer b = cmB(ci) + ((HORB - cmB(ci)) * fw) \ 256
 #if VIDEO
     Dim As Integer i, o
     For i = y0 To y1
         o = (i * SCRW + x) * 3
-        fbuf(o)     = cmR(ci)
-        fbuf(o + 1) = cmG(ci)
-        fbuf(o + 2) = cmB(ci)
+        fbuf(o)     = r
+        fbuf(o + 1) = g
+        fbuf(o + 2) = b
     Next
 #else
-    Line (x, y0)-(x, y1), cmap(ci)
+    Line (x, y0)-(x, y1), RGB(r, g, b)
 #endif
 End Sub
 
@@ -221,7 +436,7 @@ End Sub
 ''  THE RENDERER
 '' -------------------------------------------------------------------------------------
 Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double, ByVal camh As Double)
-    Dim As Integer x, i, mx, my, hgt, ytop, ybot
+    Dim As Integer x, i, mx, my, hgt, ytop, ybot, si
     Dim As Double dirx, diry, planex, planey, camc, rx, ry, z, wx, wy
 
     '' The camera basis. "plane" is the view direction turned 90 degrees and scaled by
@@ -240,10 +455,10 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
     '' it means a column that hits nothing needs no special case.
 #if VIDEO
     For i = 0 To SCRW * SCRH * 3 - 1 Step 3
-        fbuf(i) = 120 : fbuf(i + 1) = 160 : fbuf(i + 2) = 210
+        fbuf(i) = HORR : fbuf(i + 1) = HORG : fbuf(i + 2) = HORB
     Next
 #else
-    Line (0, 0)-(SCRW - 1, SCRH - 1), RGB(120, 160, 210), BF
+    Line (0, 0)-(SCRW - 1, SCRH - 1), RGB(HORR, HORG, HORB), BF
 #endif
 
     For x = 0 To SCRW - 1
@@ -251,6 +466,7 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
         rx = dirx + planex * camc
         ry = diry + planey * camc
         z = ZNEAR
+        si = 0
         Do While z < ZFAR
             wx = camx + rx * z
             wy = camy + ry * z
@@ -274,7 +490,7 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
                 '' One vertical span, drawn once. Measured on this machine: a full-height
                 '' Line is about thirteen times cheaper than the PSet calls that would
                 '' cover the same pixels, which is why the renderer thinks in spans.
-                PaintSpan(x, ytop, ybot, my * MAPSZ + mx)
+                PaintSpan(x, ytop, ybot, my * MAPSZ + mx, fogw(si))
                 ybuf(x) = ytop
                 '' The column is full to the top: no sample further out can ever be seen
                 '' through it. This early exit is what makes the cost sublinear in the
@@ -292,7 +508,9 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
             '' 1.012 is empirical: below ~1.005 the extra samples cost time and change
             '' nothing visible, above ~1.02 the far ridges start to break up.
             z = z * ZSTEP
-        Loop
+            si += 1
+            If si >= FOGSTEPS Then si = FOGSTEPS - 1   '' cannot happen at ZSTEP=1.012; costs
+        Loop                                          '' one compare to stay true if it changes
     Next
 End Sub
 
@@ -315,6 +533,9 @@ Dim As Double allft(FRAMES - 1)      '' every frame, for the report at the end
     ScreenRes SCRW, SCRH, 32
 #endif
 BuildWorld()
+CastShadows()
+PaintWorld()
+BuildFog()
 
 For f = 0 To FRAMES - 1
     t0 = Timer
