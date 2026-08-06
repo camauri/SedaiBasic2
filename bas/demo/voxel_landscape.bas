@@ -70,12 +70,27 @@ Const MAPMASK   = MAPSZ - 1    ''   enough that world generation takes well unde
                                ''   interpreted; the camera circle never reveals the repeat.
 Const SEED      = 20260806     '' fixed: two runs must produce the same terrain, or the
                                ''   frame times below would not be comparable.
-Const ZNEAR     = 1.0          '' first sample distance. Closer than this the projection
-                               ''   divides by almost nothing and one sample fills the screen.
+Const ZNEAR     = 5.0          '' first sample distance. ⚠️ MEASURED, not guessed: an instrumented
+                               ''   run over the whole camera circle reported that the nearest
+                               ''   distance at which any column ever paints is 7.87, so starting
+                               ''   at 1 spent a third of the walk on ground that is always below
+                               ''   the bottom of the screen. 5.0 keeps a margin over the measured
+                               ''   minimum without paying for the part nothing can ever see.
 Const ZFAR      = 220.0        '' where the world ends and the sky begins. Found by walking
                                ''   the camera and raising it until no more detail appeared:
                                ''   past ~220 the terrain is under a pixel tall.
-Const ZSTEP     = 1.012        '' the step GROWTH factor - see the note in RenderFrame.
+Const ZSTEP     = 1.0 + 4.32 / SCRH   '' the step GROWTH factor where the picture is. ⚠️ TIED TO
+                               ''   THE RESOLUTION, because what must stay constant is the spacing
+                               ''   between samples in PIXELS, and that spacing is proportional to
+                               ''   VSCALE * (ZSTEP-1) - i.e. to SCRH. A step fine enough for 1080p
+                               ''   is three times finer than 640x480 needs, and the real-time mode
+                               ''   would be paying for detail its own pixels cannot hold. 4.32 =
+                               ''   0.004 * 1080, the value found by looking at 1080p; it comes out
+                               ''   1.009 at 640x480.
+Const ZSKIP     = 1.080        '' and the growth factor where it is not. Two regimes, because a
+                               ''   sample that lands below the bottom of the screen cannot
+                               ''   contribute to anything.
+Const FOGRES    = 4.0          '' fog table entries per unit of distance - see BuildFog.
 Const VSCALE    = 0.75 * SCRH   '' vertical exaggeration, as a fraction of the screen height
                                ''   so the framing does not change with the resolution.
                                ''   Empirical at 200 rows: 100 looked like a pancake, 250
@@ -97,7 +112,8 @@ Const EYECLEAR     = 45.0         '' how far the eye rides ABOVE the ground unde
                                '' columns, columns exit early, and the eye can never be
                                '' inside a hill.
 Const CAMR      = 70.0         '' radius of the camera circle, in map cells.
-Const FRAMES    = 600          '' one full circle. The run ends here so it can be measured.
+Const FRAMES    = 1800         '' 60 seconds at 30 fps. The run ends here so it can be measured.
+Const CAMR2     = 34.0         '' radius of the second circle - see the camera path below.
 Const STATN     = 120          '' frame-time window the on-screen counter reports on.
 
 Dim Shared As UByte    hmap(MAPSZ * MAPSZ - 1)   '' altitude, 0..255
@@ -397,12 +413,16 @@ End Sub
 ''  the camera moves. It has to be paid per frame. So the question becomes how little can be
 ''  paid, and the answer is in two parts.
 ''
-''  First: the fog WEIGHT is precomputable after all. The traversal always starts at ZNEAR and
-''  always multiplies by ZSTEP, so the sequence of distances is byte-for-byte the same in every
-''  column of every frame - only how FAR along it a column gets varies. So the weight is a
-''  function of the STEP NUMBER, and a table of 512 entries answers it with no exp() at all in
-''  the hot loop. (An exponential per sample would be about 150 000 transcendental calls a
-''  frame at 640x480, which is the sort of thing that quietly costs more than the renderer.)
+''  First: the fog WEIGHT is precomputable after all, because it depends on the distance and on
+''  nothing else. A table over DISTANCE, four entries per world unit, answers it with no exp() in
+''  the hot loop at all. (An exponential per sample would be about 150 000 transcendental calls a
+''  frame at 640x480 - the sort of thing that quietly costs more than the renderer.)
+''  ⚠️ It was originally indexed by STEP NUMBER, which was smaller and faster: the walk always
+''  started at ZNEAR and always multiplied by ZSTEP, so step k was at the same distance in every
+''  column of every frame. The two-regime stepping below broke that - how fast a column advances
+''  now depends on the ground under it - and this is the kind of coupling that does not announce
+''  itself: nothing fails to compile, the fog simply stops matching the distance. Indexing by the
+''  quantity the value actually depends on cannot come apart that way.
 ''
 ''  Second: it is applied PER SPAN, not per pixel - three integer multiply-adds for a strip
 ''  that may be hundreds of pixels tall, and NOT ONE EXTRA PIXEL IS WRITTEN. Fog that darkens
@@ -443,14 +463,15 @@ Const HORG      = 160
 Const HORB      = 210
 Const FOGDENS   = 2.0
 Const CLIPFADE  = 0.55   '' fraction of ZFAR at which the haze starts closing to fully opaque
-Const FOGSTEPS  = 512    '' log(ZFAR/ZNEAR)/log(ZSTEP) is 453; 512 leaves room to retune ZSTEP.
+Const FOGSTEPS  = Int(ZFAR * FOGRES) + 2
 
 Dim Shared As Integer fogw(0 To FOGSTEPS - 1)   '' 0..256, the horizon colour's share
 
 Sub BuildFog()
     Dim As Integer k
-    Dim As Double  z = ZNEAR, f
+    Dim As Double  z, f
     For k = 0 To FOGSTEPS - 1
+        z = k / FOGRES
         Dim As Double u = z / ZFAR
         If u > 1.0 Then u = 1.0
         f = 1.0 - Exp(-FOGDENS * u * u)
@@ -464,7 +485,6 @@ Sub BuildFog()
         End If
 
         fogw(k) = Int(f * 256.0)
-        z = z * ZSTEP
     Next
 End Sub
 
@@ -564,7 +584,6 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
         rx = dirx + planex * camc
         ry = diry + planey * camc
         z = ZNEAR
-        si = 0
         Do While z < ZFAR
             '' The map wraps, so the camera can circle for ever without an edge. The four
             '' corners and the two weights are worked out here rather than by calling HeightAt,
@@ -607,6 +626,7 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
                    + (cmG(i01) * (1.0 - tx) + cmG(i11) * tx) * ty
                 cb = (cmB(i00) * (1.0 - tx) + cmB(i10) * tx) * (1.0 - ty) _
                    + (cmB(i01) * (1.0 - tx) + cmB(i11) * tx) * ty
+                si = Int(z * FOGRES)
                 PaintSpan(x, ytop, ybot, cr, cg, cb, fogw(si))
                 ybuf(x) = ytop
                 '' The column is full to the top: no sample further out can ever be seen
@@ -615,19 +635,38 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
                 If ytop <= 0 Then Exit Do
             End If
 
-            '' STEP GROWTH. One screen column covers more world space the further we
-            '' look, because the rays diverge. A constant step therefore OVERSAMPLES near
-            '' the camera - many samples landing on the same pixel, all but one of them
-            '' wasted - and UNDERSAMPLES at the horizon, where consecutive samples skip
-            '' whole map cells and the ridges break into shimmering dotted lines that
-            '' crawl as the camera moves. Growing the step geometrically keeps the sample
-            '' spacing roughly constant in SCREEN space, which is where it matters.
-            '' 1.012 is empirical: below ~1.005 the extra samples cost time and change
-            '' nothing visible, above ~1.02 the far ridges start to break up.
-            z = z * ZSTEP
-            si += 1
-            If si >= FOGSTEPS Then si = FOGSTEPS - 1   '' cannot happen at ZSTEP=1.012; costs
-        Loop                                          '' one compare to stay true if it changes
+            '' STEP GROWTH, and ⚠️ THE COMMENT THAT USED TO BE HERE WAS WRONG - which is worth
+            '' keeping, because it was wrong for a reason that does not show up until something
+            '' else is fixed. It claimed a geometric step keeps the sample spacing roughly
+            '' constant in SCREEN space. Work it out: consecutive samples land
+            ''     dh * VSCALE * (1/z - 1/(z*ZSTEP))  =  dh * VSCALE * (ZSTEP-1) / (z*ZSTEP)
+            '' rows apart, which falls as 1/z. It is not constant at all - it is WIDEST NEAREST.
+            '' At the old settings that came to 7.7 rows at the bottom of a 1080p screen and 2.0
+            '' at the horizon: the near ground was the WORST-sampled part of the picture, and
+            '' nobody noticed while the terrain was still a staircase of flat cells, because the
+            '' staircase was coarser than the sampling. Smoothing the terrain made the sampling
+            '' the visible defect, and it read as horizontal banding across the near slopes.
+            ''
+            '' And measurement paid for the fix. Instrumenting the walk showed that of 453 steps,
+            '' the first 340 landed BELOW THE BOTTOM OF THE SCREEN - three quarters of the work,
+            '' on ground no pixel could ever show. So there are two regimes, and the test for
+            '' which one we are in is already computed: ytop.
+            ''   - the sample is off the bottom  ->  nothing between here and it can be seen
+            ''     either, since we are walking outwards and the ground can only rise INTO view.
+            ''     Take a big step (ZSKIP): the point is to leave this region, not to sample it.
+            ''   - the sample is on screen       ->  take a small one (ZSTEP), because this is
+            ''     where every row of the picture comes from.
+            '' Net: about 374 steps instead of 453 - FEWER - with the near-field spacing down
+            '' from 7.7 rows to 2.6. The walk got shorter and the picture got smoother, because
+            '' the samples moved from where they did nothing to where the picture is.
+            '' ⛔ ZSKIP is not free to raise: it is the one place this renderer can skip past
+            '' geometry. 1.08 was as high as it went before near ridges began to flicker.
+            If ytop >= SCRH Then
+                z = z * ZSKIP
+            Else
+                z = z * ZSTEP
+            End If
+        Loop
     Next
 End Sub
 
@@ -639,7 +678,7 @@ Dim As Double srt(STATN - 1)         '' scratch for the median
 Dim As Integer fi = 0, fcount = 0
 Dim As Double t0, t1, ms, med, worst, fps
 Dim As Integer f, i, j
-Dim As Double a, camx, camy, camh
+Dim As Double a, th, vx, vy, head, camx, camy, camh
 Dim As Double allft(FRAMES - 1)      '' every frame, for the report at the end
 
 #if VIDEO
@@ -660,19 +699,40 @@ For f = 0 To FRAMES - 1
     '' A closed circular path, the camera always facing along it. Closed because the run
     '' has to be repeatable: the same frame number always sees the same view, so two
     '' engines can be compared frame by frame and not just on an average.
-    a = f * 6.283185307179586 / FRAMES
-    camx = MAPSZ / 2.0 + Cos(a) * CAMR
-    camy = MAPSZ / 2.0 + Sin(a) * CAMR
+    '' THE CAMERA PATH. A single circle would be the obvious thing, and it was - but a circle
+    '' repeats every lap, and at 30 fps a minute of film is three laps of it. The eye recognises
+    '' the second one immediately and stops watching. So the path is a circle riding on a circle:
+    '' three fast laps while a second, slower one carries the centre around once. It closes after
+    '' exactly FRAMES frames - both terms complete whole turns - so the last frame joins the
+    '' first and the film can loop, but no part of it is a repeat of an earlier part.
+    '' CAMR2 = 34 against CAMR = 70: large enough that the ground under the camera is different
+    '' on each lap, small enough that the path never doubles back on itself, which looks like a
+    '' mistake rather than a flight.
+    th = f * 6.283185307179586 / FRAMES
+    a  = th * 3.0
+    camx = MAPSZ / 2.0 + Cos(a) * CAMR + Cos(th) * CAMR2
+    camy = MAPSZ / 2.0 + Sin(a) * CAMR + Sin(th) * CAMR2
+
+    '' Facing along the flight, which now has to be DERIVED rather than assumed: on a plain
+    '' circle the heading is the angle plus a right angle, but on this path it is the direction
+    '' of the velocity, and the two terms contribute to it in proportion to their angular speed -
+    '' hence the 3.0 on the first. Getting this wrong does not look wrong in a still frame; it
+    '' looks like the camera is drifting sideways, which is exactly the sort of thing that is
+    '' obvious in motion and invisible in a screenshot.
+    vx = -Sin(a) * CAMR * 3.0 - Sin(th) * CAMR2
+    vy =  Cos(a) * CAMR * 3.0 + Cos(th) * CAMR2
+    head = Atan2(vy, vx)
+
     '' The eye rides the ground rather than sitting at a fixed altitude - see EYECLEAR.
     camh = HeightAt(camx, camy) + EYECLEAR
 
 #if VIDEO
-    RenderFrame(camx, camy, a + 1.5707963267948966, camh)
+    RenderFrame(camx, camy, head, camh)
     Put #fh, , fbuf()                       '' one frame, rgb24, straight out
     If (f Mod 60) = 0 Then Print "frame "; f; " / "; FRAMES
 #else
     ScreenLock
-    RenderFrame(camx, camy, a + 1.5707963267948966, camh)   '' facing along the circle
+    RenderFrame(camx, camy, head, camh)   '' facing along the flight
     '' The counter is drawn AFTER the terrain, and that is not a style choice: PRINT
     '' inside a graphics mode paints its own background, so anything drawn under it is
     '' gone. Drawn first, it would be overwritten by the landscape instead.
