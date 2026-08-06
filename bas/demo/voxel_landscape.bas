@@ -79,17 +79,15 @@ Const ZNEAR     = 5.0          '' first sample distance. ⚠️ MEASURED, not gu
 Const ZFAR      = 220.0        '' where the world ends and the sky begins. Found by walking
                                ''   the camera and raising it until no more detail appeared:
                                ''   past ~220 the terrain is under a pixel tall.
-Const ZSTEP     = 1.0 + 4.32 / SCRH   '' the step GROWTH factor where the picture is. ⚠️ TIED TO
-                               ''   THE RESOLUTION, because what must stay constant is the spacing
-                               ''   between samples in PIXELS, and that spacing is proportional to
-                               ''   VSCALE * (ZSTEP-1) - i.e. to SCRH. A step fine enough for 1080p
-                               ''   is three times finer than 640x480 needs, and the real-time mode
-                               ''   would be paying for detail its own pixels cannot hold. 4.32 =
-                               ''   0.004 * 1080, the value found by looking at 1080p; it comes out
-                               ''   1.009 at 640x480.
-Const ZSKIP     = 1.080        '' and the growth factor where it is not. Two regimes, because a
-                               ''   sample that lands below the bottom of the screen cannot
-                               ''   contribute to anything.
+Const SPACING   = 1.5          '' rows between consecutive samples - see BuildSteps. The whole
+                               ''   step law is expressed in SCREEN ROWS, which is the unit the
+                               ''   defect it fixes was measured in.
+Const ZSKIP     = 1.080        '' growth factor for the approach, where nothing can be on screen.
+                               '' ⛔ Not free to raise: it is the one place this renderer can skip
+                               ''   past geometry. 1.08 was as high as it went before near ridges
+                               ''   began to flicker.
+Const ZTABMAX   = 1024         '' ceiling on the sample count; the table comes out at ~350 at
+                               ''   1080p and ~175 at 640x480.
 Const FOGRES    = 4.0          '' fog table entries per unit of distance - see BuildFog.
 Const VSCALE    = 0.75 * SCRH   '' vertical exaggeration, as a fraction of the screen height
                                ''   so the framing does not change with the resolution.
@@ -405,6 +403,62 @@ Sub PaintWorld()
 End Sub
 
 '' -------------------------------------------------------------------------------------
+''  WHERE TO SAMPLE, and this is the third answer to the question - the first two were wrong in
+''  ways worth keeping, because both were invisible until something else got fixed.
+''
+''  Attempt one was a geometric step, with a comment claiming it kept the sample spacing roughly
+''  constant in SCREEN space. Work it out: consecutive samples land
+''      dh * VSCALE * (1/z - 1/z') rows apart,
+''  which falls as 1/z. Not constant - WIDEST NEAREST. At the original settings that came to 7.7
+''  rows at the bottom of a 1080p screen against 2.0 at the horizon, so the near ground was the
+''  WORST-sampled part of the picture. Nobody noticed while the terrain was still a staircase of
+''  flat cells, because the staircase was coarser than the sampling. ⭐ AN EMPIRICAL CONSTANT
+''  FOUND IN THE PRESENCE OF A BIGGER DEFECT IS ONLY VALID WHILE THAT DEFECT IS THERE.
+''
+''  Attempt two took two regimes - big steps while the sample was off the bottom of the screen,
+''  small ones once it was on - and tested which regime it was in using ytop, which was already
+''  computed. The horizontal banding went. VERTICAL banding arrived: ytop depends on the ground
+''  under THAT COLUMN, so neighbouring columns left the coarse regime at distances up to 8% apart,
+''  and 8% of z near the bottom of the screen is many rows. ⭐ A PER-COLUMN DECISION MAKES A
+''  PER-COLUMN SEAM. The sampling has to be identical in every column, or the columns show.
+''
+''  So: build the distances ONCE, before any frame, and walk the same table in every column. And
+''  build it BACKWARDS - not by choosing distances and seeing where they land, but by choosing
+''  the rows and inverting the projection to get the distance:
+''      row = HORIZON + EYECLEAR * VSCALE / z   ->   z = EYECLEAR * VSCALE / (row - HORIZON)
+''  Step the row down by SPACING and the sample spacing on screen is SPACING BY CONSTRUCTION,
+''  everywhere, with no constant to tune and nothing to re-tune when the resolution changes.
+''  EYECLEAR is the reference height because it is the height difference to the ground directly
+''  under the camera - the common case, and the one that fills the bottom of the screen.
+''
+''  The approach in front of that is a different problem: below the distance where even the
+''  reference ground is off the bottom of the screen, nothing can be seen at all, and an
+''  instrumented run over the whole camera path confirmed that no column ever paints closer than
+''  z = 7.87. Those distances are covered geometrically and coarsely - the point is to leave the
+''  region, not to sample it. Of the original 453 steps, 340 were in exactly this dead zone.
+Dim Shared As Double  ztab(0 To ZTABMAX - 1)
+Dim Shared As Integer znum
+
+Sub BuildSteps()
+    Dim As Double z = ZNEAR, r
+    Dim As Double zon = EYECLEAR * VSCALE / (SCRH - 1 - HORIZON)   '' first distance on screen
+
+    znum = 0
+    Do While z < zon AndAlso znum < ZTABMAX
+        ztab(znum) = z : znum += 1
+        z = z * ZSKIP
+    Loop
+
+    r = SCRH - 1
+    Do While r > HORIZON AndAlso znum < ZTABMAX
+        z = EYECLEAR * VSCALE / (r - HORIZON)
+        If z >= ZFAR Then Exit Do
+        ztab(znum) = z : znum += 1
+        r -= SPACING
+    Loop
+End Sub
+
+'' -------------------------------------------------------------------------------------
 ''  ATMOSPHERIC FOG  (phase 2, step 3)
 ''
 ''  ⚠️ This is the first thing in the demo that CANNOT go in the colormap, and it is worth
@@ -468,6 +522,7 @@ Const FOGSTEPS  = Int(ZFAR * FOGRES) + 2
 Dim Shared As Integer fogw(0 To FOGSTEPS - 1)   '' 0..256, the horizon colour's share
 
 Sub BuildFog()
+BuildSteps()
     Dim As Integer k
     Dim As Double  z, f
     For k = 0 To FOGSTEPS - 1
@@ -552,7 +607,7 @@ End Sub
 ''  THE RENDERER
 '' -------------------------------------------------------------------------------------
 Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double, ByVal camh As Double)
-    Dim As Integer x, i, ytop, ybot, si
+    Dim As Integer x, i, k, ytop, ybot, si
     Dim As Integer mx0, my0, mx1, my1, i00, i10, i01, i11, cr, cg, cb
     Dim As Double  hgt, tx, ty
     Dim As Double dirx, diry, planex, planey, camc, rx, ry, z, wx, wy
@@ -583,8 +638,8 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
         camc = (x / (SCRW / 2.0)) - 1.0
         rx = dirx + planex * camc
         ry = diry + planey * camc
-        z = ZNEAR
-        Do While z < ZFAR
+        For k = 0 To znum - 1
+            z = ztab(k)
             '' The map wraps, so the camera can circle for ever without an edge. The four
             '' corners and the two weights are worked out here rather than by calling HeightAt,
             '' because the span colour below needs exactly the same four cells: a call would
@@ -632,41 +687,10 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
                 '' The column is full to the top: no sample further out can ever be seen
                 '' through it. This early exit is what makes the cost sublinear in the
                 '' view distance instead of proportional to it.
-                If ytop <= 0 Then Exit Do
+                If ytop <= 0 Then Exit For
             End If
 
-            '' STEP GROWTH, and ⚠️ THE COMMENT THAT USED TO BE HERE WAS WRONG - which is worth
-            '' keeping, because it was wrong for a reason that does not show up until something
-            '' else is fixed. It claimed a geometric step keeps the sample spacing roughly
-            '' constant in SCREEN space. Work it out: consecutive samples land
-            ''     dh * VSCALE * (1/z - 1/(z*ZSTEP))  =  dh * VSCALE * (ZSTEP-1) / (z*ZSTEP)
-            '' rows apart, which falls as 1/z. It is not constant at all - it is WIDEST NEAREST.
-            '' At the old settings that came to 7.7 rows at the bottom of a 1080p screen and 2.0
-            '' at the horizon: the near ground was the WORST-sampled part of the picture, and
-            '' nobody noticed while the terrain was still a staircase of flat cells, because the
-            '' staircase was coarser than the sampling. Smoothing the terrain made the sampling
-            '' the visible defect, and it read as horizontal banding across the near slopes.
-            ''
-            '' And measurement paid for the fix. Instrumenting the walk showed that of 453 steps,
-            '' the first 340 landed BELOW THE BOTTOM OF THE SCREEN - three quarters of the work,
-            '' on ground no pixel could ever show. So there are two regimes, and the test for
-            '' which one we are in is already computed: ytop.
-            ''   - the sample is off the bottom  ->  nothing between here and it can be seen
-            ''     either, since we are walking outwards and the ground can only rise INTO view.
-            ''     Take a big step (ZSKIP): the point is to leave this region, not to sample it.
-            ''   - the sample is on screen       ->  take a small one (ZSTEP), because this is
-            ''     where every row of the picture comes from.
-            '' Net: about 374 steps instead of 453 - FEWER - with the near-field spacing down
-            '' from 7.7 rows to 2.6. The walk got shorter and the picture got smoother, because
-            '' the samples moved from where they did nothing to where the picture is.
-            '' ⛔ ZSKIP is not free to raise: it is the one place this renderer can skip past
-            '' geometry. 1.08 was as high as it went before near ridges began to flicker.
-            If ytop >= SCRH Then
-                z = z * ZSKIP
-            Else
-                z = z * ZSTEP
-            End If
-        Loop
+        Next
     Next
 End Sub
 
@@ -692,6 +716,7 @@ BuildWorld()
 CastShadows()
 PaintWorld()
 BuildFog()
+BuildSteps()
 
 For f = 0 To FRAMES - 1
     t0 = Timer
