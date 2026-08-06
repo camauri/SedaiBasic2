@@ -82,10 +82,18 @@ Const ZFAR      = 220.0        '' where the world ends and the sky begins. Found
 Const SPACING   = 1.5          '' rows between consecutive samples - see BuildSteps. The whole
                                ''   step law is expressed in SCREEN ROWS, which is the unit the
                                ''   defect it fixes was measured in.
-Const ZSKIP     = 1.080        '' growth factor for the approach, where nothing can be on screen.
-                               '' ⛔ Not free to raise: it is the one place this renderer can skip
-                               ''   past geometry. 1.08 was as high as it went before near ridges
-                               ''   began to flicker.
+Const NEARROWS  = 5.0          '' row budget for the APPROACH, where the far rule does not apply.
+                               '' ⚠️ The approach was originally a flat 1.08 growth on the argument
+                               ''   that nothing there can be on screen. That is true only of ground
+                               ''   BELOW the eye. Terrain at or near eye level projects close to the
+                               ''   horizon at ANY distance, so it is on screen from the very first
+                               ''   sample - and 1.08 draws it in bands FORTY-EIGHT ROWS tall.
+                               ''   Worked out: for a geometric step the worst row jump anything on
+                               ''   screen can make is (SCRH-HORIZON) * (1 - 1/g), which does not
+                               ''   depend on the distance at all. So the approach is budgeted the
+                               ''   same way as the far region - in rows - and g follows from it.
+                               ''   5 rather than SPACING because this bounds the WORST case, which
+                               ''   is rare, where SPACING bounds the case that is always present.
 Const ZTABMAX   = 1024         '' ceiling on the sample count; the table comes out at ~350 at
                                ''   1080p and ~175 at 640x480.
 Const FOGRES    = 4.0          '' fog table entries per unit of distance - see BuildFog.
@@ -442,11 +450,12 @@ Dim Shared As Integer znum
 Sub BuildSteps()
     Dim As Double z = ZNEAR, r
     Dim As Double zon = EYECLEAR * VSCALE / (SCRH - 1 - HORIZON)   '' first distance on screen
+    Dim As Double g   = 1.0 / (1.0 - NEARROWS / (SCRH - HORIZON))  '' see NEARROWS
 
     znum = 0
     Do While z < zon AndAlso znum < ZTABMAX
         ztab(znum) = z : znum += 1
-        z = z * ZSKIP
+        z = z * g
     Loop
 
     r = SCRH - 1
@@ -573,6 +582,19 @@ Function HeightAt(ByVal wx As Double, ByVal wy As Double) As Double
     Dim As Integer x0 = Int(px) And MAPMASK, y0 = Int(py) And MAPMASK
     Dim As Integer x1 = (x0 + 1) And MAPMASK, y1 = (y0 + 1) And MAPMASK
     Dim As Double  tx = px - Int(px), ty = py - Int(py)
+
+    '' ⚠️ SMOOTHSTEP ON THE WEIGHTS, and this is not decoration - it fixes a defect that is
+    '' invisible in a still frame and impossible to miss in motion. Plain bilinear is CONTINUOUS
+    '' across a cell boundary but its SLOPE is not: the surface has a crease along every cell
+    '' edge. The camera rides this surface, and on this flight path it crosses a cell boundary
+    '' about every 1.2 frames, so the eye height changed GRADIENT twenty-six times a second and
+    '' the whole picture trembled - mountains wobbling like jelly, with nothing wrong in any one
+    '' frame. Replacing t with t*t*(3-2t) makes the weight's derivative zero at both ends of the
+    '' cell, so the slopes of neighbouring cells meet instead of meeting at an angle. Two
+    '' multiplies per axis, and the creases are gone from the terrain as well as from the ride.
+    tx = tx * tx * (3.0 - 2.0 * tx)
+    ty = ty * ty * (3.0 - 2.0 * ty)
+
     Return (hmap(y0 * MAPSZ + x0) * (1.0 - tx) + hmap(y0 * MAPSZ + x1) * tx) * (1.0 - ty) _
          + (hmap(y1 * MAPSZ + x0) * (1.0 - tx) + hmap(y1 * MAPSZ + x1) * tx) * ty
 End Function
@@ -649,6 +671,9 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
             mx0 = Int(wx) And MAPMASK : mx1 = (mx0 + 1) And MAPMASK
             my0 = Int(wy) And MAPMASK : my1 = (my0 + 1) And MAPMASK
             tx  = wx - Int(wx)        : ty  = wy - Int(wy)
+            tx  = tx * tx * (3.0 - 2.0 * tx)   '' same smoothstep as HeightAt - see the note there.
+            ty  = ty * ty * (3.0 - 2.0 * ty)   '' The two MUST agree: the camera rides one surface
+                                               '' and the renderer draws the other.
             i00 = my0 * MAPSZ + mx0   : i10 = my0 * MAPSZ + mx1
             i01 = my1 * MAPSZ + mx0   : i11 = my1 * MAPSZ + mx1
             hgt = (hmap(i00) * (1.0 - tx) + hmap(i10) * tx) * (1.0 - ty) _
