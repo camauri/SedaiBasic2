@@ -465,6 +465,8 @@ type
     // FreeBASIC pointers: record pointer-var pointee types and back every address-taken (@x) scalar
     // with a 1-element global array (reusing the SHARED-scalar machinery), so it has a stable address.
     procedure CollectAddressTakenVars(Node: TASTNode);
+    // "Dim As V v": a variable named exactly like a type that owns member procedures — rejected, as fbc does.
+    procedure CheckTypeNameShadowedByVar(Node: TASTNode);
     procedure GatherByrefRetFuncNames(Node: TASTNode; Names: TStringList);   // byref-ret funcs with a BYREF param
     procedure MarkByrefRetCallArgs(Node: TASTNode; Names, Dict: TStringList); // mark their call args address-taken
     procedure CollectDimVarBanks(Node: TASTNode; Dict: TStringList);
@@ -634,6 +636,9 @@ type
     function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
     function TryEmitUDTCastToNumber(Node: TASTNode; out Val: TSSAValue): Boolean;  // "Operator Cast() As Integer/Double" in arithmetic
     function HasUDTStringCast(Node: TASTNode): Boolean;  // would TryEmitUDTCastToString fire? (emits nothing)
+    // "Operator Cast() As <another UDT>": run it and hand back the RESULT's record handle.
+    function TryEmitUDTCastToUDT(Node: TASTNode; const SrcType, DstType: string; out Val: TSSAValue): Boolean;
+    function CastRetRecType(const Lbl: string): string;   // record type a CAST operator returns
     procedure ProcessStringExpression(Node: TASTNode; out Val: TSSAValue);  // evaluate where a STRING is expected
     procedure ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
                                 ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic: Boolean = False);
@@ -7503,13 +7508,21 @@ function TSSAGenerator.TryRecordCopyAssign(VarNode, ExprNode: TASTNode; const Va
 // The source may be a record var, array element or member access (ResolveRecordObject handles
 // those); a function-call source returning a UDT is covered later (return-by-value increment).
 var
-  LhsRecType, RhsRecType, DstRecType: string;
-  SrcRecHandle, VarReg: TSSAValue;
+  LhsRecType, RhsRecType, DstRecType, SrcTypeName: string;
+  SrcRecHandle, VarReg, ConvHandle: TSSAValue;
 begin
   Result := False;
   LhsRecType := VarRecordTypeName(VarName);
   if (LhsRecType <> '') and ResolveRecordObject(ExprNode, SrcRecHandle, RhsRecType) then
   begin
+    // A source of a DIFFERENT record type is a CONVERSION, not a copy: run the "Operator Cast() As
+    // <dest>" the source type declares, and copy from its result. The explicit spelling
+    // "Cast(D, s)" already went through the operator; the implicit one silently copied slot by slot.
+    SrcTypeName := RhsRecType;
+    if SrcTypeName = '' then SrcTypeName := ObjectTypeName(ExprNode);
+    if (SrcTypeName <> '') and (UpperCase(SrcTypeName) <> UpperCase(LhsRecType)) and
+       TryEmitUDTCastToUDT(ExprNode, SrcTypeName, LhsRecType, ConvHandle) then
+      SrcRecHandle := ConvHandle;
     // The destination's handle must be resolved exactly like the source's: a SHARED UDT keeps its
     // record handle in element 0 of its backing array, not in a plain register (which is why member
     // stores, PRINT and SWAP -- all of which go through ResolveRecordObject/ProcessExpression -- work
@@ -22677,6 +22690,47 @@ begin
     MarkByrefRetCallArgs(Node.GetChild(i), Names, Dict);
 end;
 
+procedure TSSAGenerator.CheckTypeNameShadowedByVar(Node: TASTNode);
+// "Dim As V v" where V is a declared type. BASIC is case-insensitive, so the variable and the type are
+// the SAME NAME, and from there on "V" means two things: fbc reports "Duplicated definition" — but only
+// when the type declares a member procedure, because that is what turns the type name into a SCOPE
+// ("V.method", "V.countID"). A data-only type tolerates the shadow, and fbc compiles it.
+// MODERN only: CLASSIC has no user-defined types.
+// (Accepting it is not permissiveness — it is keeping an ambiguity that something downstream then has to
+// resolve silently: fbc itself answers "Ambigious len(), referring to type V, instead of variable V".)
+var
+  i, k: Integer;
+  Decl, NameNode: TASTNode;
+  NameU: string;
+
+  function TypeNameIsAScope(const T: string): Boolean;
+  var j: Integer;
+  begin
+    Result := False;
+    for j := 0 to FProcedureNames.Count - 1 do
+      if Pos(T + '.', UpperCase(FProcedureNames[j])) = 1 then Exit(True);
+  end;
+
+begin
+  if (Node = nil) or (not FModernMode) then Exit;
+  if Node.NodeType = antDim then
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(k);
+      if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) then Continue;
+      NameNode := Decl.GetChild(0);
+      // A static member definition ("Dim As Integer V.countID") names a FIELD through the type and is
+      // not a variable at all — it arrives as a member access, not a bare identifier.
+      if NameNode.NodeType <> antIdentifier then Continue;
+      NameU := UpperCase(VarToStr(NameNode.Value));
+      if (FindUDT(NameU) >= 0) and TypeNameIsAScope(NameU) then
+        raise Exception.CreateFmt('Duplicated definition: "%s" is already the name of a TYPE that has ' +
+                                  'member procedures, and BASIC does not tell the two apart', [NameU]);
+    end;
+  for i := 0 to Node.ChildCount - 1 do
+    CheckTypeNameShadowedByVar(Node.GetChild(i));
+end;
+
 procedure TSSAGenerator.CollectAddressTakenVars(Node: TASTNode);
 // Runs BEFORE CollectSharedVars: marks @-taken declared scalars SHARED so they become array-backed
 // (addressable). Also records pointer-var pointee types in FPointerVars. In addition, arguments passed
@@ -24888,6 +24942,53 @@ begin
     ProcessMethodCall(Node, TypeName, 'OPERATORCAST#', nil, Val);
   end;
   Result := (Val.Kind <> svkNone);
+end;
+
+function TSSAGenerator.CastRetRecType(const Lbl: string): string;
+// The record type an OPERATOR CAST returns, given its final label. Looked up twice on purpose: the
+// pre-scan that records return types runs BEFORE PreCollectProcedures appends the return-bank suffix
+// ('%', '#', '$') to a cast's label, so its entry is keyed under the label WITHOUT the suffix. Asking
+// only for the final label answers '' for every cast — which is what made a UDT-returning cast look
+// like it had no return type at all. (Same shape as the note on CONSTRUCTOR labels in
+// PreCollectProcedures: re-encoding a label after the pre-scans keys their entries under a name
+// nobody looks up.)
+begin
+  Result := VarRecordTypeName(Lbl);
+  if (Result = '') and (Lbl <> '') then
+    Result := VarRecordTypeName(Copy(Lbl, 1, Length(Lbl) - 1));
+end;
+
+function TSSAGenerator.TryEmitUDTCastToUDT(Node: TASTNode; const SrcType, DstType: string;
+  out Val: TSSAValue): Boolean;
+// FreeBASIC "Operator S.Cast() As D", used where a D is expected and an S is given. Runs the operator
+// and yields the handle of the record it returns, so the caller copies from a real D. Without it the
+// memberwise copy read the SOURCE's slots through the DESTINATION's layout — which answers plausibly
+// whenever the two happen to line up and wrongly otherwise, and never runs the conversion the type
+// declared. The label carries the return BANK ('%' for a record handle), so the declared return type
+// is checked here: a type whose cast returns an Integer must not be dragged into a record copy.
+// ⚠️ The suffix of a UDT-returning cast is '#', not '%': CastReturnCode asks TypeNameToBank, which does
+// not know a record type name and falls back to the classic FLOAT default. Both are tried and the
+// DECLARED RETURN TYPE decides — going by the suffix alone looked up the wrong operator and found none.
+var
+  MethNm, Lbl: string;
+  i: Integer;
+begin
+  Result := False;
+  Val := MakeSSAValue(svkNone);
+  if (not FModernMode) or (Node = nil) then Exit;
+  if (FindUDT(SrcType) < 0) or (FindUDT(DstType) < 0) then Exit;
+  for i := 0 to 1 do
+  begin
+    if i = 0 then MethNm := 'OPERATORCAST#' else MethNm := 'OPERATORCAST%';
+    Lbl := ResolveMethodLabel(SrcType, MethNm);
+    if (Lbl <> '') and (UpperCase(CastRetRecType(Lbl)) = UpperCase(DstType)) then
+    begin
+      ProcessMethodCall(Node, SrcType, MethNm, nil, Val);
+      Result := (Val.Kind <> svkNone);
+      if Result then Val := EnsureIntRegister(Val);
+      Exit;
+    end;
+  end;
 end;
 
 function TSSAGenerator.HasUDTStringCast(Node: TASTNode): Boolean;
@@ -27694,6 +27795,13 @@ begin
   // Register array-parameter placeholder arrays now (procs are collected), BEFORE any module code or
   // body is lowered, so every call site's bind and every body's array access resolve the placeholder.
   RegisterArrayParams;
+
+  // BASIC is case-insensitive, so "Dim As V v" names the variable exactly like the type. fbc refuses it
+  // ("Duplicated definition") whenever the type declares a member procedure — because then the type name
+  // is also a SCOPE, the one "V.method" is written against — and tolerates it for a data-only type.
+  // Run here: the check asks whether any procedure label lives under "<TYPE>.", which PreCollectProcedures
+  // has just finished filling in.
+  CheckTypeNameShadowedByVar(AST);
 
   // V5e: reserve a frame-independent int slot for each destructor-bearing global, so an END inside a
   // SUB/FUNCTION can still destroy it (its module register is hidden under the active frame). Must run
