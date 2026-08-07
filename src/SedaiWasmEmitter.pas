@@ -152,6 +152,12 @@ const
   wopfcI32TruncSatF64S = 2;  wopfcI32TruncSatF64U = 3;
   wopfcI64TruncSatF32S = 4;  wopfcI64TruncSatF32U = 5;
   wopfcI64TruncSatF64S = 6;  wopfcI64TruncSatF64U = 7;
+  { Bulk memory, same prefix. memory.copy and memory.fill each carry their
+    memory index (or two of them) as trailing bytes.
+    ⚠️ They do NOT need the data-count section: that one is required only when a
+    DATA SEGMENT INDEX appears in the code (memory.init / data.drop), which
+    nothing here emits. }
+  wopfcMemoryCopy      = 10; wopfcMemoryFill      = 11;
 
 { ---- byte buffer ---------------------------------------------------------- }
 
@@ -203,6 +209,8 @@ type
     procedure BrIf(Depth: LongWord);
     procedure BrTable(const Targets: array of LongWord; Default: LongWord);
     procedure TruncSat(SubOpcode: LongWord);
+    procedure MemoryCopy;                 // dest, src, len already on the stack
+    procedure MemoryFill;                 // dest, byte, len already on the stack
     procedure EndOp;
 
     function Bytes: PByte;
@@ -464,6 +472,14 @@ end;
 
 procedure TWasmBuf.TruncSat(SubOpcode: LongWord);
 begin U8(wopPrefixFC); U32(SubOpcode); end;
+
+procedure TWasmBuf.MemoryCopy;
+// The two trailing zeroes are the destination and source memory indices; with a
+// single memory both are 0.
+begin U8(wopPrefixFC); U32(wopfcMemoryCopy); U8(0); U8(0); end;
+
+procedure TWasmBuf.MemoryFill;
+begin U8(wopPrefixFC); U32(wopfcMemoryFill); U8(0); end;
 
 procedure TWasmBuf.EndOp;
 begin U8(wopEnd); end;

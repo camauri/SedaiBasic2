@@ -100,6 +100,19 @@ type
     // --- graphics -------------------------------------------------------
     FUsesGfx: Boolean;
     FScrW, FScrH: LongWord;       // WASM globals holding the screen geometry
+    FFbBase: LongWord;            // WASM global: where SCREENRES put the framebuffer
+
+    // --- strings and the heap -------------------------------------------
+    FUsesStr: Boolean;            // the program has string values
+    FUsesHeap: Boolean;           // ... or graphics: either way it allocates
+    FHeapTop: LongWord;           // WASM global: the bump pointer
+    FHeapBase: LongWord;          // where the bump starts, after the literals
+    FConstId: array of Integer;   // pool ids of the literals, in layout order
+    FConstAddr: array of LongWord;
+    FConstBytes: AnsiString;      // the data segment, already laid out
+    FAllocFunc, FStrNewFunc, FStrCatFunc, FStrSubFunc, FStrCmpFunc,
+    FStrAscFunc, FStrChrFunc, FStrRightFunc, FStrMidFunc,
+    FPrintStrFunc: LongWord;
 
     FBankBase: array[TSSARegisterType] of Integer;
     FFlatCount: Integer;
@@ -119,8 +132,11 @@ type
     FImportCount: LongWord;
     FWriteFunc, FPrintIntFunc, FPrintUIntFunc, FPrintNlFunc: LongWord;
     procedure ScanForPrint;
+    function ConstAddrOf(const V: TSSAValue): LongWord;
     procedure EmitRawAddr(B: TWasmBuf);
     procedure EmitPrintHelpers;
+    procedure EmitHeapHelpers;
+    procedure EmitStringHelpers;
     function EmitRegion(R: Integer): Boolean;
     function EmitInstr(B: TWasmBuf; Instr: TSSAInstruction; R: Integer): Boolean;
     procedure LoadReg(B: TWasmBuf; const V: TSSAValue);
@@ -149,19 +165,34 @@ implementation
 const
   BankType: array[TSSARegisterType] of TWasmValType = (wvtI64, wvtF64, wvtI32);
 
-  { Linear memory layout for PRINT. Digits are built BACKWARDS from SCRATCH_END,
-    which is why the buffer is addressed from its end. }
-  SCRATCH_END  = 32;      // one past the last byte of the digit scratch
+  { ---- the linear memory map ----------------------------------------------
+
+    0 .. 3      the EMPTY STRING, and it costs nothing. A string handle is the
+                address of a [i32 len][bytes] header, linear memory starts
+                zeroed, and a fresh WASM local is 0 - so handle 0 reads as
+                length 0, which is exactly what an unassigned BASIC string is.
+                ⛔ Nothing may ever be written there.
+    4 .. 63     the PRINT digit scratch, built BACKWARDS from SCRATCH_END.
+    64, 65      a literal ' ' and a literal LF.
+    1024 ..     the string LITERALS, one [i32 len][bytes] header each, laid out
+                at compile time into one data segment.
+    FHeapBase   where the bump allocator starts - the first 4-aligned address
+                after the literals. }
+  EMPTY_STR    = 0;
+  SCRATCH_END  = 64;      // one past the last byte of the digit scratch
   CONST_SPACE  = 64;      // a literal ' '
   CONST_NL     = 65;      // a literal LF
+  STR_CONST_BASE = 1024;  // the first string literal
 
   { The two REGIONS a tagged raw pointer can name (SedaiSSATypes): region 0 is
     the byte heap Allocate returns, region 1 the framebuffer SCREENPTR returns.
-    A pointer carries a byte OFFSET, never an address, so here each region is a
-    fixed base in linear memory and the offset is added to it. The framebuffer
-    starts on a page boundary so growing for it is exact. }
-  HEAP_BASE    = 1024;
-  FB_BASE      = 65536;
+    A pointer carries a byte OFFSET, never an address, so each region has a base
+    and the offset is added to it. Region 0's base is FHeapBase; region 1's is a
+    GLOBAL, because the framebuffer is now bump-allocated by SCREENRES like
+    everything else. ⭐ That is what keeps strings and graphics from colliding:
+    a fixed FB_BASE right above the heap capped the heap at one page, and a
+    fixed base above a growing heap cannot exist when the framebuffer's size is
+    only known at run time. One allocator, one arena, no partition to get wrong. }
   { The framebuffer's initial contents are not zero: a fresh ScreenRes fills
     every pixel with $000000FF (ClearCurrentMode, SedaiGraphicsMemory), and
     linear memory starts zeroed, so the fill has to be emitted or the very first
@@ -193,8 +224,8 @@ begin
   B.I64Const(RAWPTR_OFS_MASK);
   B.Op(wopI64And);
   B.Op(wopI32WrapI64);
-  B.I32Const(FB_BASE);
-  B.I32Const(HEAP_BASE);
+  B.GlobalGet(FFbBase);
+  B.I32Const(LongInt(FHeapBase));
   B.LocalGet(FRawTmp);
   B.I64Const(RAWPTR_REGION_FB);
   B.Op(wopI64And);
@@ -205,24 +236,89 @@ begin
 end;
 
 procedure TWasmBackend.ScanForPrint;
+{ One pass that answers everything the module SHAPE depends on: does the program
+  print, does it draw, does it hold strings - and which literals it holds, which
+  have to be laid out before the first byte of code is emitted because their
+  addresses are immediates.
+  ⚠️ The order matters more than it looks: imports own the low function indices,
+  so what the module imports has to be known before anything is defined. }
 var
-  i, j: Integer;
+  i, j, k: Integer;
   Blk: TSSABasicBlock;
+  Ins: TSSAInstruction;
+  Addr: LongWord;
+  S: AnsiString;
+
+  procedure NoteConst(const V: TSSAValue);
+  var
+    m: Integer;
+  begin
+    if V.Kind <> svkConstString then Exit;
+    for m := 0 to High(FConstId) do
+      if FConstId[m] = V.ConstStringId then Exit;   // the pool already dedups
+    SetLength(FConstId, Length(FConstId) + 1);
+    FConstId[High(FConstId)] := V.ConstStringId;
+  end;
+
 begin
   FUsesPrint := False;
   FUsesGfx := False;
+  FUsesStr := False;
+  SetLength(FConstId, 0);
   for i := 0 to FProg.Blocks.Count - 1 do
   begin
     Blk := FProg.Blocks[i];
     for j := 0 to Blk.Instructions.Count - 1 do
-      case TSSAInstruction(Blk.Instructions[j]).OpCode of
+    begin
+      Ins := TSSAInstruction(Blk.Instructions[j]);
+      case Ins.OpCode of
         ssaPrintInt, ssaPrintIntLn, ssaPrintNewLine, ssaPrintUInt:
           FUsesPrint := True;
+        ssaPrintString, ssaPrintStringLn:
+          begin FUsesPrint := True; FUsesStr := True; end;
         ssaGfxScreenRes, ssaGfxScreenPtr, ssaGfxScreenInfo,
         ssaRawLoadInt, ssaRawStoreInt:
           FUsesGfx := True;
+        ssaLoadConstString, ssaStrConcat, ssaStrLen, ssaStrLeft, ssaStrRight,
+        ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr,
+        ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
+          FUsesStr := True;
       end;
+      NoteConst(Ins.Src1); NoteConst(Ins.Src2); NoteConst(Ins.Src3);
+    end;
   end;
+  FUsesHeap := FUsesStr or FUsesGfx;
+
+  // Lay the literals out: one [i32 len][bytes] header each, 4-aligned so a
+  // handle is always aligned the way an i32.load wants it.
+  FConstBytes := '';
+  SetLength(FConstAddr, Length(FConstId));
+  Addr := STR_CONST_BASE;
+  for k := 0 to High(FConstId) do
+  begin
+    FConstAddr[k] := Addr;
+    S := AnsiString(SSAPoolGet(FConstId[k]));
+    SetLength(FConstBytes, Length(FConstBytes) + 4 + Length(S));
+    PLongWord(@FConstBytes[Length(FConstBytes) - 3 - Length(S)])^ := LongWord(Length(S));
+    if Length(S) > 0 then
+      Move(S[1], FConstBytes[Length(FConstBytes) - Length(S) + 1], Length(S));
+    Inc(Addr, LongWord(4 + Length(S)));
+    while (Addr and 3) <> 0 do
+    begin
+      FConstBytes := FConstBytes + #0;
+      Inc(Addr);
+    end;
+  end;
+  FHeapBase := Addr;
+end;
+
+function TWasmBackend.ConstAddrOf(const V: TSSAValue): LongWord;
+var
+  k: Integer;
+begin
+  for k := 0 to High(FConstId) do
+    if FConstId[k] = V.ConstStringId then Exit(FConstAddr[k]);
+  Result := EMPTY_STR;      // unreachable: ScanForPrint saw every operand
 end;
 
 procedure TWasmBackend.EmitPrintHelpers;
@@ -359,6 +455,341 @@ begin
     FModule.AddFunction(TVoid, [], B);
   finally
     B.Free;
+  end;
+end;
+
+{ ---------------- the heap ----------------
+
+  A BUMP allocator and nothing more: one global cursor, round up to 4, grow the
+  memory when the cursor passes it. It never frees, and that is a stated v1
+  limit rather than an oversight - a loop that builds strings consumes memory
+  until the module hits the 4 GB ceiling. The alternative (a free list, or
+  reference counting on the string handles) is a real piece of runtime, and it
+  is worth writing only once there is a program that needs it. ⛔ What must NOT
+  happen meanwhile is emitting something that runs and lies: running out of
+  memory here is a trap, which is loud. }
+
+procedure TWasmBackend.EmitHeapHelpers;
+var
+  B: TWasmBuf;
+begin
+  B := TWasmBuf.Create;
+  try
+    // alloc(n: i32) -> i32.  locals: 1 = the block, 2 = pages wanted
+    B.GlobalGet(FHeapTop);
+    B.LocalTee(1);
+    B.LocalGet(0); B.Op(wopI32Add);
+    B.I32Const(3); B.Op(wopI32Add);
+    B.I32Const(-4); B.Op(wopI32And);
+    B.GlobalSet(FHeapTop);
+
+    B.GlobalGet(FHeapTop);
+    B.I32Const(65535); B.Op(wopI32Add);
+    B.I32Const(65536); B.Op(wopI32DivU);
+    B.LocalTee(2);
+    B.Op(wopMemorySize); B.U8(0);
+    B.Op(wopI32GtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(2);
+      B.Op(wopMemorySize); B.U8(0);
+      B.Op(wopI32Sub);
+      B.Op(wopMemoryGrow); B.U8(0);
+      B.Op(wopDrop);
+    B.EndOp;
+
+    B.LocalGet(1);
+    FModule.AddFunction(FModule.TypeIndex([wvtI32], [wvtI32]), [wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+end;
+
+{ ---------------- strings ----------------
+
+  A string VALUE is [i32 len][len bytes] in linear memory, and a string REGISTER
+  holds its address. Three consequences, and the whole design is in them:
+
+  1. ⭐ Handle 0 is the empty string for free. Linear memory starts zeroed and a
+     fresh WASM local is 0, so a BASIC string variable that was never assigned
+     reads as length 0 without a line of code. The four bytes at address 0 are
+     reserved for that and never written.
+  2. Strings are IMMUTABLE here: every operation allocates its result and
+     ssaCopyString copies the handle. That is sound only because nothing mutates
+     one in place - and two opcodes do (ssaStrAppendMapped grows its Dest,
+     ssaStrMidAssign overwrites inside its buffer). They stay REFUSED, and the
+     refusal names the reason. ⛔ Covering them by aliasing would produce a
+     module that runs and prints the wrong string, which is the one outcome this
+     backend may not have.
+  3. Every rule below is the interpreter's, read out of SedaiBytecodeVM rather
+     than reasoned about: LEFT's negative length, RIGHT's clamp, MID's two
+     dialect-dependent rules, ASC of an empty string. They are what the
+     differential compares. }
+
+procedure TWasmBackend.EmitStringHelpers;
+var
+  B: TWasmBuf;
+  TNewStr, TCat, TSub, TCmp, TAsc, TChr, TRight, TMid, TPrint: LongWord;
+begin
+  TNewStr := FModule.TypeIndex([wvtI32], [wvtI32]);
+  TCat    := FModule.TypeIndex([wvtI32, wvtI32], [wvtI32]);
+  TSub    := FModule.TypeIndex([wvtI32, wvtI64, wvtI64], [wvtI32]);
+  TCmp    := FModule.TypeIndex([wvtI32, wvtI32], [wvtI32]);
+  TAsc    := FModule.TypeIndex([wvtI32], [wvtI64]);
+  TChr    := FModule.TypeIndex([wvtI64], [wvtI32]);
+  TRight  := FModule.TypeIndex([wvtI32, wvtI64], [wvtI32]);
+  TMid    := FModule.TypeIndex([wvtI32, wvtI64, wvtI64], [wvtI32]);
+  TPrint  := FModule.TypeIndex([wvtI32], []);
+
+  { strNew(len: i32) -> i32: an uninitialised header of that length, or the
+    canonical empty string when the length is zero. }
+  B := TWasmBuf.Create;
+  try
+    B.LocalGet(0); B.Op(wopI32Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(EMPTY_STR); B.LocalSet(1);
+    B.Op(wopElse);
+      B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add);
+      B.Call(FAllocFunc);
+      B.LocalTee(1);
+      B.LocalGet(0);
+      B.OpMem(wopI32Store, 2, 0);
+    B.EndOp;
+    B.LocalGet(1);
+    FModule.AddFunction(TNewStr, [wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { strCat(a, b) -> a + b. A zero length copy is legal and cannot trap, so the
+    two copies need no guard. }
+  B := TWasmBuf.Create;
+  try
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(3);
+    B.LocalGet(1); B.OpMem(wopI32Load, 2, 0); B.LocalSet(4);
+    B.LocalGet(3); B.LocalGet(4); B.Op(wopI32Add);
+    B.Call(FStrNewFunc); B.LocalSet(2);
+
+    B.LocalGet(2); B.I32Const(4); B.Op(wopI32Add);
+    B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add);
+    B.LocalGet(3);
+    B.MemoryCopy;
+
+    B.LocalGet(2); B.I32Const(4); B.Op(wopI32Add); B.LocalGet(3); B.Op(wopI32Add);
+    B.LocalGet(1); B.I32Const(4); B.Op(wopI32Add);
+    B.LocalGet(4);
+    B.MemoryCopy;
+
+    B.LocalGet(2);
+    FModule.AddFunction(TCat, [wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { strSub(s, start, cnt) -> the substring, with AssignSubstr's clamping:
+    a count of zero or less is empty, a start below 1 is 1, and a count past the
+    end is cut to what is left.
+    ⚠️ The order differs from the Pascal on purpose. AssignSubstr asks
+    "Start + Cnt - 1 > Length(S)", which on 64-bit registers holding absurd
+    values can WRAP; asking "is start past the end" first makes every later
+    subtraction bounded. For every value a program can actually produce the two
+    agree - and for the ones it cannot, this one does not wrap into a false
+    answer. }
+  B := TWasmBuf.Create;
+  try
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32U); B.LocalSet(3);
+
+    B.LocalGet(1); B.I64Const(1); B.Op(wopI64LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I64Const(1); B.LocalSet(1);
+    B.EndOp;
+
+    B.LocalGet(2); B.I64Const(0); B.Op(wopI64LeS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(EMPTY_STR); B.Op(wopReturn);
+    B.EndOp;
+
+    B.LocalGet(1); B.LocalGet(3); B.Op(wopI64GtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(EMPTY_STR); B.Op(wopReturn);
+    B.EndOp;
+
+    // avail = len - start + 1, which is now in 1..len
+    B.LocalGet(3); B.LocalGet(1); B.Op(wopI64Sub); B.I64Const(1); B.Op(wopI64Add);
+    B.LocalSet(6);
+    B.LocalGet(2); B.LocalGet(6); B.Op(wopI64GtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(6); B.LocalSet(2);
+    B.EndOp;
+
+    B.LocalGet(2); B.Op(wopI32WrapI64); B.LocalSet(4);
+    B.LocalGet(4); B.Call(FStrNewFunc); B.LocalSet(5);
+    B.LocalGet(5); B.I32Const(4); B.Op(wopI32Add);
+    B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add);
+      B.LocalGet(1); B.Op(wopI32WrapI64); B.Op(wopI32Add);
+      B.I32Const(1); B.Op(wopI32Sub);
+    B.LocalGet(4);
+    B.MemoryCopy;
+    B.LocalGet(5);
+    FModule.AddFunction(TSub, [wvtI64, wvtI32, wvtI32, wvtI64], B);
+  finally
+    B.Free;
+  end;
+
+  { strCmp(a, b) -> -1 / 0 / 1. FPC compares AnsiStrings byte by byte as
+    UNSIGNED characters and settles a tie by length, and the four BASIC string
+    comparisons are built on that. }
+  B := TWasmBuf.Create;
+  try
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(2);
+    B.LocalGet(1); B.OpMem(wopI32Load, 2, 0); B.LocalSet(3);
+    B.LocalGet(2); B.LocalSet(4);
+    B.LocalGet(3); B.LocalGet(4); B.Op(wopI32LtU);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(3); B.LocalSet(4);
+    B.EndOp;
+    B.I32Const(0); B.LocalSet(5);
+
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(5); B.LocalGet(4); B.Op(wopI32GeU); B.BrIf(1);
+        B.LocalGet(0); B.LocalGet(5); B.Op(wopI32Add);
+          B.OpMem(wopI32Load8U, 0, 4); B.LocalSet(6);
+        B.LocalGet(1); B.LocalGet(5); B.Op(wopI32Add);
+          B.OpMem(wopI32Load8U, 0, 4); B.LocalSet(7);
+        B.LocalGet(6); B.LocalGet(7); B.Op(wopI32Ne);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(6); B.LocalGet(7); B.Op(wopI32LtU);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.I32Const(-1); B.Op(wopReturn);
+          B.Op(wopElse);
+            B.I32Const(1); B.Op(wopReturn);
+          B.EndOp;
+        B.EndOp;
+        B.LocalGet(5); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(5);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+
+    B.LocalGet(2); B.LocalGet(3); B.Op(wopI32Eq);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.Op(wopReturn);
+    B.EndOp;
+    B.LocalGet(2); B.LocalGet(3); B.Op(wopI32LtU);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(-1); B.Op(wopReturn);
+    B.EndOp;
+    B.I32Const(1);
+    FModule.AddFunction(TCmp, [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { strAsc(s) -> the first byte, and 0 for an empty string (bcStrAsc). }
+  B := TWasmBuf.Create;
+  try
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.Op(wopI32Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I64Const(0); B.Op(wopReturn);
+    B.EndOp;
+    B.LocalGet(0); B.OpMem(wopI32Load8U, 0, 4); B.Op(wopI64ExtendI32U);
+    FModule.AddFunction(TAsc, [], B);
+  finally
+    B.Free;
+  end;
+
+  { strChr(code) -> the one-character string; the code is taken AND $FF, as
+    AssignChar's caller does. }
+  B := TWasmBuf.Create;
+  try
+    B.I32Const(1); B.Call(FStrNewFunc); B.LocalTee(1);
+    B.LocalGet(0); B.Op(wopI32WrapI64); B.I32Const(255); B.Op(wopI32And);
+    B.OpMem(wopI32Store8, 0, 4);
+    B.LocalGet(1);
+    FModule.AddFunction(TChr, [wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { strRight(s, n): a negative n is 0, an n past the end is the whole string,
+    and the start follows from what is left (bcStrRight). }
+  B := TWasmBuf.Create;
+  try
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32U); B.LocalSet(2);
+    B.LocalGet(1); B.I64Const(0); B.Op(wopI64LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I64Const(0); B.LocalSet(1);
+    B.EndOp;
+    B.LocalGet(1); B.LocalGet(2); B.Op(wopI64GtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(2); B.LocalSet(1);
+    B.EndOp;
+    B.LocalGet(0);
+    B.LocalGet(2); B.LocalGet(1); B.Op(wopI64Sub); B.I64Const(1); B.Op(wopI64Add);
+    B.LocalGet(1);
+    B.Call(FStrSubFunc);
+    FModule.AddFunction(TRight, [wvtI64], B);
+  finally
+    B.Free;
+  end;
+
+  { strMid(s, start, cnt) - the one helper whose RULES DIFFER BY DIALECT, and
+    the difference is not cosmetic (bcStrMid):
+      FreeBASIC - a start below 1 yields an EMPTY string, and a NEGATIVE count
+                  means "all the rest";
+      Commodore - a start below 1 clamps to 1, and a negative count is 0.
+    Both were found by programs that got the wrong answer, so both are baked in
+    here at emit time rather than decided at run time. }
+  B := TWasmBuf.Create;
+  try
+    if FModern then
+    begin
+      B.LocalGet(1); B.I64Const(1); B.Op(wopI64LtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(EMPTY_STR); B.Op(wopReturn);
+      B.EndOp;
+      B.LocalGet(2); B.I64Const(0); B.Op(wopI64LtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32U);
+        B.LocalGet(1); B.Op(wopI64Sub); B.I64Const(1); B.Op(wopI64Add);
+        B.LocalSet(2);
+        B.LocalGet(2); B.I64Const(0); B.Op(wopI64LtS);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I64Const(0); B.LocalSet(2);
+        B.EndOp;
+      B.EndOp;
+    end
+    else
+    begin
+      B.LocalGet(1); B.I64Const(1); B.Op(wopI64LtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I64Const(1); B.LocalSet(1);
+      B.EndOp;
+      B.LocalGet(2); B.I64Const(0); B.Op(wopI64LtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I64Const(0); B.LocalSet(2);
+      B.EndOp;
+    end;
+    B.LocalGet(0); B.LocalGet(1); B.LocalGet(2);
+    B.Call(FStrSubFunc);
+    FModule.AddFunction(TMid, [], B);
+  finally
+    B.Free;
+  end;
+
+  { printStr(s): the bytes straight into the sink. No formatting - there is
+    none to do for a string, which is exactly why PRINT of a string is cheap
+    where PRINT of a number was a whole formatter. }
+  if FUsesPrint then
+  begin
+    B := TWasmBuf.Create;
+    try
+      B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add);
+      B.LocalGet(0); B.OpMem(wopI32Load, 2, 0);
+      B.Call(FWriteFunc);
+      FModule.AddFunction(TPrint, [], B);
+    finally
+      B.Free;
+    end;
   end;
 end;
 
@@ -997,6 +1428,135 @@ begin
       place that has to grow one. }
     ssaPrintSemicolon: ;
 
+    { ---- strings ------------------------------------------------------ }
+
+    ssaLoadConstString:
+      begin
+        if Instr.Src1.Kind <> svkConstString then
+          Exit(Fail('ssaLoadConstString without a string constant'));
+        B.I32Const(LongInt(ConstAddrOf(Instr.Src1)));
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaPrintString:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FPrintStrFunc);
+      end;
+    ssaPrintStringLn:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FPrintStrFunc);
+        B.Call(FPrintNlFunc);
+      end;
+
+    ssaStrLen:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.OpMem(wopI32Load, 2, 0);
+        B.Op(wopI64ExtendI32U);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaStrConcat:
+      begin
+        // The three-operand form is the fused "a + b + c"; it has no arm here
+        // yet, and a wrong answer is not on offer.
+        if Instr.Src3.Kind <> svkNone then
+          Exit(Fail('a three-operand ssaStrConcat is not covered yet'));
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        B.Call(FStrCatFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaStrLeft:
+      begin
+        // LEFT is MID from 1: a negative length falls out as empty through
+        // strSub's own "count <= 0" rule, exactly as bcStrLeft does.
+        LoadReg(B, Instr.Src1);
+        B.I64Const(1);
+        LoadReg(B, Instr.Src2);
+        B.Call(FStrSubFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+    ssaStrRight:
+      begin
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        B.Call(FStrRightFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+    ssaStrMid:
+      begin
+        if Instr.Src3.Kind <> svkRegister then
+          Exit(Fail('ssaStrMid without a length register'));
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        LoadReg(B, Instr.Src3);
+        B.Call(FStrMidFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaStrAsc:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FStrAscFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+    { ASC(MID$(s, start, len)) fused by the SSA into one instruction - and the
+      idiom is unavoidable, since "read character i" is written that way in
+      every BASIC program that walks a string.
+      ⭐ It is emitted as strMid followed by strAsc rather than as a fourth copy
+      of MID's dialect rules. The interpreter keeps a hand-written arm here and
+      its own comment warns that the two must not drift apart; composing them
+      makes drifting impossible. What that costs is the substring the fusion
+      exists to avoid - a real optimisation, and one that can only be made
+      later, on top of something known to be right. }
+    ssaStrAscMid:
+      begin
+        if Instr.Src3.Kind <> svkRegister then
+          Exit(Fail('ssaStrAscMid without a length register'));
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        LoadReg(B, Instr.Src3);
+        B.Call(FStrMidFunc);
+        B.Call(FStrAscFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+    ssaStrChr:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FStrChrFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
+      begin
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        B.Call(FStrCmpFunc);
+        case Instr.OpCode of
+          ssaCmpEqString: B.Op(wopI32Eqz);
+          ssaCmpNeString: begin B.I32Const(0); B.Op(wopI32Ne); end;
+          ssaCmpLtString: begin B.I32Const(0); B.Op(wopI32LtS); end;
+        else
+          begin B.I32Const(0); B.Op(wopI32GtS); end;
+        end;
+        BoolToBasic(B);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { ⛔ The two in-place string opcodes. They are not "not written yet": they
+      are incompatible with handles that alias, which is what ssaCopyString
+      makes. Covering them wants either a copy on write or a real ownership
+      model, and until then a refusal is the only honest answer. }
+    ssaStrAppendMapped, ssaStrMidAssign, ssaStrConcatCharAt:
+      Exit(Fail(Format('%s mutates a string in place, and in this backend a ' +
+                       'string handle can be shared by several registers - ' +
+                       'covering it needs copy-on-write first (line %d)',
+                       [OpName(Instr.OpCode), Instr.SourceLine])));
+
     ssaModFloat:
       begin
         // The VM raises "Float modulo by zero"; f64.div would quietly answer NaN
@@ -1029,24 +1589,17 @@ begin
         LoadReg(B, Instr.Src1); B.Op(wopI32WrapI64); B.GlobalSet(FScrW);
         LoadReg(B, Instr.Src2); B.Op(wopI32WrapI64); B.GlobalSet(FScrH);
 
-        // grow linear memory to cover FB_BASE + w*h*4, if it does not already
+        // The framebuffer comes out of the same bump allocator as everything
+        // else - which is what lets a program hold strings AND draw. A second
+        // SCREENRES allocates a second buffer and abandons the first: the
+        // allocator never frees, and the interpreter reallocates there too.
         B.GlobalGet(FScrW); B.GlobalGet(FScrH); B.Op(wopI32Mul);
         B.I32Const(4); B.Op(wopI32Mul);
-        B.I32Const(FB_BASE + 65535); B.Op(wopI32Add);
-        B.I32Const(65536); B.Op(wopI32DivU);          // pages needed
-        B.LocalTee(FGfxN);
-        B.Op(wopMemorySize); B.U8(0);
-        B.Op(wopI32GtS);
-        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
-          B.LocalGet(FGfxN);
-          B.Op(wopMemorySize); B.U8(0);
-          B.Op(wopI32Sub);
-          B.Op(wopMemoryGrow); B.U8(0);
-          B.Op(wopDrop);
-        B.EndOp;
+        B.Call(FAllocFunc);
+        B.GlobalSet(FFbBase);
 
         // and fill it the way the interpreter does - NOT with zero
-        B.I32Const(FB_BASE); B.LocalSet(FGfxP);
+        B.GlobalGet(FFbBase); B.LocalSet(FGfxP);
         B.GlobalGet(FScrW); B.GlobalGet(FScrH); B.Op(wopI32Mul); B.LocalSet(FGfxN);
         B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
           B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
@@ -1463,6 +2016,7 @@ end;
 function TWasmBackend.Compile: Boolean;
 var
   r: Integer;
+  Next: LongWord;
   Init: TWasmBuf;
 begin
   FError := '';
@@ -1485,41 +2039,87 @@ begin
   if not BuildSignatures then Exit(False);
   if not DetectRecursion then Exit(False);
 
-  if FUsesPrint or FUsesGfx then
+  if FUsesPrint or FUsesHeap then
   begin
-    // One page to start with; ScreenRes grows it to cover the framebuffer. The
+    // Enough pages to hold the literals; the allocator grows it from there. The
     // memory is exported so a differential can read the framebuffer out without
     // the program having to print it.
-    FModule.DefineMemory(1, 0);
+    FModule.DefineMemory((FHeapBase + 65535) div 65536, 0);
     FModule.DataSegment(CONST_SPACE, PByte(PAnsiChar(' '#10)), 2);
+    if Length(FConstBytes) > 0 then
+      FModule.DataSegment(STR_CONST_BASE, PByte(PAnsiChar(FConstBytes)),
+                          Length(FConstBytes));
     FModule.ExportMemory('memory');
   end;
-  if FUsesGfx then
-  begin
-    Init := TWasmBuf.Create;
-    try
+  Init := TWasmBuf.Create;
+  try
+    if FUsesHeap then
+    begin
+      Init.I32Const(LongInt(FHeapBase));
+      FHeapTop := FModule.DefineGlobal(wvtI32, True, Init);
+      Init.Clear;
+    end;
+    if FUsesGfx then
+    begin
       Init.I32Const(0); FScrW := FModule.DefineGlobal(wvtI32, True, Init);
       Init.Clear;
       Init.I32Const(0); FScrH := FModule.DefineGlobal(wvtI32, True, Init);
-    finally
-      Init.Free;
+      Init.Clear;
+      Init.I32Const(0); FFbBase := FModule.DefineGlobal(wvtI32, True, Init);
     end;
+  finally
+    Init.Free;
+  end;
+  if FUsesGfx then
+  begin
     FModule.ExportGlobal('screen_w', FScrW);
     FModule.ExportGlobal('screen_h', FScrH);
+    // ⭐ Where the framebuffer IS, rather than a constant the page has to know:
+    // it is bump-allocated now, so its address depends on what else the program
+    // holds. A viewer that hardcodes a base would read the wrong bytes the
+    // first time a program has both strings and graphics.
+    FModule.ExportGlobal('screen_ptr', FFbBase);
   end;
 
   // Functions have to be numbered before any of them is emitted, because a call
   // names its callee by index and a procedure may be called before it is built.
   for r := 0 to FRegionCount - 1 do
     FFuncIdx[r] := FImportCount + LongWord(r);
-  // The order here must match the order EmitPrintHelpers adds them in.
-  FPrintIntFunc := FImportCount + LongWord(FRegionCount);
-  FPrintUIntFunc := FPrintIntFunc + 1;
-  FPrintNlFunc := FPrintIntFunc + 2;
+  // ⛔ The order here must match the order the Emit*Helpers add them in, and
+  // nothing checks it: getting it wrong calls the wrong function with the right
+  // types, which validates.
+  Next := FImportCount + LongWord(FRegionCount);
+  if FUsesPrint then
+  begin
+    FPrintIntFunc := Next;
+    FPrintUIntFunc := Next + 1;
+    FPrintNlFunc := Next + 2;
+    Inc(Next, 3);
+  end;
+  if FUsesHeap then
+  begin
+    FAllocFunc := Next;
+    Inc(Next);
+  end;
+  if FUsesStr then
+  begin
+    FStrNewFunc   := Next;
+    FStrCatFunc   := Next + 1;
+    FStrSubFunc   := Next + 2;
+    FStrCmpFunc   := Next + 3;
+    FStrAscFunc   := Next + 4;
+    FStrChrFunc   := Next + 5;
+    FStrRightFunc := Next + 6;
+    FStrMidFunc   := Next + 7;
+    FPrintStrFunc := Next + 8;
+    Inc(Next, 9);
+  end;
 
   for r := 0 to FRegionCount - 1 do
     if not EmitRegion(r) then Exit(False);
   if FUsesPrint then EmitPrintHelpers;
+  if FUsesHeap then EmitHeapHelpers;
+  if FUsesStr then EmitStringHelpers;
 
   FModule.ExportFunc('main', FFuncIdx[0]);
   for r := 1 to FRegionCount - 1 do
