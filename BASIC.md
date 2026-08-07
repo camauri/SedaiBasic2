@@ -8,7 +8,9 @@
 [████████████████████████████████████████████████··] 96%
 ```
 
-**FreeBASIC keyword set — 566 / 645 implemented (88%)**. **69** of the unimplemented
+**FreeBASIC compatibility — 566 / 645 of FreeBASIC's keywords (88%)**. ⚠️ Read this as a
+*compatibility measure*, not a completion score: MODERN is SedaiBasic's own dialect, and this number
+says how much FreeBASIC code runs here unchanged — not how much of SedaiBasic exists. **69** of the unimplemented
 entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
 build/platform directives, FFI, and the raw-allocator operators — `New`/`Delete Overload`,
 `Placement New` — which a managed record model cannot honour) — not runnable keywords for a portable
@@ -25,8 +27,11 @@ bytecode VM. Of the
 > works", not "something checked".
 
 > 📌 Rows marked **SedaiBasic extension** (`REGEXCOUNT`, `OPTION DIGITS`, the `SPR*` sprite commands…)
-> are **ours, not FreeBASIC's**, and do not belong in the FreeBASIC totals above — counting them
-> there would inflate a compatibility figure with keywords the reference language does not have.
+> are full members of the MODERN dialect, and deliberately absent from the FreeBASIC totals above.
+> Not because they count for less — because that number answers a different question. It measures how
+> much FreeBASIC code runs here; a keyword FreeBASIC does not have cannot make more of it run. **The
+> language and the compatibility figure are two different things, and MODERN is bigger than the
+> figure.**
 
 ```
 [████████████████████████████████████████████████··] 97%
@@ -222,7 +227,8 @@ the count for both `Double` and `Single` — a `Single` simply runs out of true 
 ## Variable Scope
 
 The dialect is chosen at LOAD by content: a program that uses **line numbers is CLASSIC** (Commodore
-BASIC v7); otherwise it is **MODERN** (FreeBASIC-style, `-lang fb`). A `.fb`/`.fbas` extension forces MODERN.
+BASIC v7); otherwise it is **MODERN** (SedaiBasic's own dialect, FreeBASIC-compatible where the two
+overlap; `-lang fb`). A `.fb`/`.fbas` extension forces MODERN.
 
 - **CLASSIC**: every variable is global by name (v7 semantics) — unchanged.
 - **MODERN**: lexical scope. Only **explicit declarations** are scoped; implicit (never-`DIM`'d)
@@ -1430,8 +1436,13 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 # FreeBASIC Keyword Reference & Implementation Status
 
-> **Scope.** SedaiBasic is evolving toward a FreeBASIC-style language (see
-> `job/docs/SEDAIBASIC_EVOLUTION.md`). This section catalogues the **complete FreeBASIC keyword
+> **Scope.** This section is a **compatibility map against FreeBASIC**, not a to-do list for
+> SedaiBasic. MODERN is SedaiBasic's own dialect (see `job/docs/SEDAIBASIC_EVOLUTION.md`); FreeBASIC
+> is the reference it grew from and the yardstick its interoperability is measured against, which
+> matters because it means unmodified FreeBASIC programs run here. A -- below means "FreeBASIC code
+> using this will not run", not "SedaiBasic is missing something it owes anyone" -- and several
+> entries are marked N/A precisely because they are artefacts of being a native compiler rather than
+> features a language needs. It catalogues the **complete FreeBASIC keyword
 > set**, organized exactly as in the official FreeBASIC manual
 > ([DocToc](https://www.freebasic.net/wiki/DocToc)), together with SedaiBasic's current support.
 > Sourced from the FreeBASIC wiki (Language Documentation + Runtime Library Reference), June 2026.
@@ -1446,7 +1457,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (FreeBASIC keyword set):** **566 / 645 implemented (88%)**, plus 5 partial (~).
+> **Coverage (how much FreeBASIC runs here):** **566 / 645 (88%)**, plus 5 partial (~).
 > Of the 79 not-implemented, 69 are classified **N/A** (compiler-internal `__FB_*` defines, native
 > linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **566 / 576 ≈ 98% of the
 > applicable keywords**.

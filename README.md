@@ -32,10 +32,21 @@
 
 ## What is SedaiBasic2?
 
-SedaiBasic2 is a reimplementation of Commodore BASIC v7 built on a full optimizing compiler pipeline that targets a fast register-based bytecode virtual machine. It supports **two dialects** from the same engine:
+SedaiBasic2 began as a reimplementation of Commodore BASIC v7 and is now a language in its own right, built on a full optimizing compiler pipeline that targets a fast register-based bytecode virtual machine. It carries **two dialects** in the same engine, and they are not the same kind of thing:
 
-- **CLASSIC** — line-numbered Commodore BASIC v7 (**201 / 209** core commands, 96%).
-- **MODERN** — a FreeBASIC-style dialect with no line numbers (**~495 / 643** FreeBASIC keywords).
+- **CLASSIC** — line-numbered Commodore BASIC v7 (**201 / 209** core commands, 96%). Here the goal
+  really is fidelity: v7 is a fixed, finished language and matching it is the whole point.
+- **MODERN** — **SedaiBasic's own dialect**, line-number-free. It is broadly FreeBASIC-compatible and
+  that compatibility is measured (**566 / 645** of FreeBASIC's keywords, and 60+ unmodified Rosetta
+  Code programs run as-is), but it is a *property of the language, not its definition*: MODERN also
+  has commands FreeBASIC does not, and where FreeBASIC is demonstrably wrong it does not follow it.
+
+> **This project is not a FreeBASIC clone on a virtual machine.** FreeBASIC is the reference MODERN
+> grew from and the yardstick its compatibility is measured against — which is worth a great deal,
+> since it means real FreeBASIC code runs unchanged. But MODERN is ours: it gains keywords FreeBASIC
+> has never had, and it departs from FreeBASIC where the standards say FreeBASIC is mistaken (see
+> [numeric output](#numeric-output-follows-the-standard-not-the-reference) — a clone could not make
+> that choice).
 
 ### Language features
 
