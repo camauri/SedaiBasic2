@@ -24,6 +24,10 @@ bytecode VM. Of the
 > against fbc); where they disagree with this page, they are right. A tick here means "we believe it
 > works", not "something checked".
 
+> 📌 Rows marked **SedaiBasic extension** (`REGEXCOUNT`, `OPTION DIGITS`, the `SPR*` sprite commands…)
+> are **ours, not FreeBASIC's**, and do not belong in the FreeBASIC totals above — counting them
+> there would inflate a compatibility figure with keywords the reference language does not have.
+
 ```
 [████████████████████████████████████████████████··] 97%
 ```
@@ -152,6 +156,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `TYPE ... UNION ... END UNION` | ✓ | Anonymous union nested in a TYPE (v1: members flattened as non-overlapping fields) |
 | `type<T>(args)` / `T(args)` / `= (a,b,c)` | ✓ | Anonymous UDT temporary with an explicit type; aggregate/tuple initialisation of a constructor-less UDT, including array-of-UDT `{(a,b), (c,d)}` |
 | `OPTION BASE 1` | ✓ | Default lower bound for a bare-upper-bound array `DIM a(n)` → `a(1..n)` |
+| `OPTION DIGITS n\|EXACT` | ✓ | Significant digits `PRINT` shows for a float; `EXACT`/`ALL` = every digit the value has (**SedaiBasic extension**, no FreeBASIC equivalent — see [Numeric output](#numeric-output-and-option-digits-sedaibasic-extension)) |
 | `ENUM [name] AS <type>` | ✓ | ENUM with an explicit (advisory) underlying integer type |
 | `LPRINT` / `LPOS(n)` | ✓ | Line-printer output (routed to stdout) / head column (always 1 — no printer) |
 | `SETENVIRON` / `ENVIRON$` | ✓ | Set / read an environment variable (SETENVIRON sets a VM-internal override) |
@@ -165,6 +170,54 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `FUNCTION f() BYREF AS T` | ✓ | BYREF function results: return a reference to a SHARED/global scalar or a BYREF parameter (the `min(a,b)=0` idiom, int pointees), read + write through it (`f()=x`) |
 | `WSTRING` | ✓ | Unicode wide string (UTF-8 storage). `DIM s AS WSTRING [* n]`, params/return/UDT fields/arrays. `LEN`/`LEFT$`/`RIGHT$`/`MID$` index by codepoint; assignment/concat/PRINT shared with `STRING`. `WSTR(x)` converter. Fixed-length `* n` advisory (var-length storage) |
 | Date/time | ✓ | Date serial = Double (epoch 1899-12-30). `NOW`/`TIMER`/`DATE`/`TIME` (bare), `DATESERIAL`/`TIMESERIAL`, `DATEVALUE`/`TIMEVALUE`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`/`WEEKDAY`, `MONTHNAME`/`WEEKDAYNAME`, `ISDATE`, `DATEADD`/`DATEDIFF`/`DATEPART` (intervals `yyyy q m y d w ww h n s`), `SETDATE`/`SETTIME` (VM-internal clock offset). Field functions intercepted by name so `day`/`month`/`year`/`second`… stay usable as variables |
+
+## Numeric output and `OPTION DIGITS` (SedaiBasic extension)
+
+`PRINT` shows a `Double` with **16** significant digits and a `Single` with **7**, the same as
+FreeBASIC. Those digits are **correctly rounded** from the exact binary value, once, half-to-even, as
+required by **IEEE 754-2019 §5.12.2**.
+
+> ⚠️ **This is the one place where SedaiBasic deliberately disagrees with FreeBASIC.** fbc rounds
+> twice — the exact value to 17 digits, then those 17 to 16 — which differs from a single correct
+> rounding on **4.75%** of doubles. `Print 1e-283` is `9.999999999999999e-284` here and `1e-283` in
+> fbc; the exact value is `0.999999999999999946852…e-283`, whose 17th digit is a 4, so rounding down
+> is the correct answer. Measured over 20 706 bit patterns; no example in the FreeBASIC corpus is
+> affected. The reasoning is in `job/docs/PIANO_FLOAT_PRINT.md` — **read it before "fixing" a float
+> difference against fbc.**
+
+### `OPTION DIGITS n` / `OPTION DIGITS EXACT`
+
+Sets how many significant digits a float shows. Because the digits come from the exact value and are
+rounded once, the **count** is a display choice while the **rounding** is not: raising it shows *more
+of the same number*, never a differently-rounded one.
+
+```basic
+Print 0.1                        '  0.1                        (default, 16 digits)
+
+Option Digits 3     : Print 0.1  '  0.1
+Option Digits 17    : Print 0.1  '  0.10000000000000001        the round-trip form
+Option Digits Exact : Print 0.1  '  0.1000000000000000055511151231257827021181583404541015625
+```
+
+- **`n`** — any count from 1 up. Values above what a double can hold are capped, because past that
+  there is nothing left to show.
+- **`EXACT`** (or **`ALL`**) — every digit the value has.
+
+`EXACT` is not shorthand for "very many". A double's decimal expansion is **finite**: the value is
+`M × 2^E`, so for `E ≥ 0` it is an integer and for `E < 0` it is `M × 5^(-E) / 10^(-E)`, which
+terminates after exactly `-E` fractional digits. Nothing is truncated because there is nothing past
+the end:
+
+| value | significant digits it has |
+|---|---:|
+| `0.5` | 1 — prints `0.5` even at `EXACT` |
+| `0.1` | 55 |
+| largest finite double | 309 |
+| smallest subnormal (`2^-1074`) | **751**, the widest any double gets |
+
+**Scope and limits.** The directive is global to the program and applies to `PRINT`; it is read at
+compile time, and a precompiled `.basc` does not carry it (such a program uses the defaults). It sets
+the count for both `Double` and `Single` — a `Single` simply runs out of true digits sooner.
 
 ## Variable Scope
 
