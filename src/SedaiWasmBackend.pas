@@ -2043,11 +2043,22 @@ begin
             FResultBank[r] := Ord(RT)              // the callee writes its result
           else if Target >= 0 then
             Widen(Target, RT, Slot);               // staged for the call below
-          // A non-result store with no call after it in the same block means the
-          // staging was split from its call. Ignoring it is safe: the CALLEE's
-          // loads already fix the signature, and both sides read the same count -
-          // crediting it to this region instead would give the module itself
-          // parameters it does not have.
+          { A non-result store with no call after it IN THIS BLOCK. Two very
+            different things wear that shape, and the backend cannot yet tell
+            them apart:
+              - staging for a call that sits in ANOTHER block (PROC_GCD stages
+                its own recursive call this way, and it compiles correctly);
+              - BYREF COPY-OUT, the callee writing a parameter back for its
+                caller - which this backend DROPS, because one WASM function per
+                procedure means the slot locals are per function and the caller
+                never sees the write.
+            ⛔ MEASURED: refusing every such store to close the second case also
+            refuses the first, and print_calls.bas went from 38 identical lines
+            to a refusal. Block-local shape is not the question - whether a call
+            is REACHABLE from the store is - which is the same mistake as
+            guard-scope-was-one-block-not-dominance.
+            ⇒ Left as it was, and the two byref programs stay on the known-diff
+            list rather than being bought back with a false refusal. }
         end;
       end;
     end;
