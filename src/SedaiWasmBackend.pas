@@ -185,6 +185,10 @@ type
 
 const
   WASM_XFER_RESULT_SLOT = 255;   // mirrors SedaiSSA.XFER_RESULT_SLOT
+  { Mirrors SedaiSSA.SHARED_SLOT_BASE: at and above this the transfer bank stops
+    carrying arguments and starts carrying module-global SHARED scalars, the
+    by-value UDT result handle (254) and the result (255). }
+  WASM_SHARED_SLOT_BASE = 128;
 
 implementation
 
@@ -2002,6 +2006,25 @@ begin
       begin
         if not SlotOf(Instr, Slot) then
           Exit(Fail(Format('a transfer slot is not a constant in block "%s"', [Blk.LabelName])));
+        { ⛔ NOT EVERY TRANSFER SLOT IS A PARAMETER, and reading them all as one
+          is what made a destructor come out with 254 of them. The bank is
+          partitioned by CONVENTION (SedaiSSA): 0..N are real arguments, 128 and
+          up (SHARED_SLOT_BASE) are module-global SHARED scalars, 254 carries the
+          caller-allocated handle for a FUNCTION returning a UDT by value, and
+          255 is the result.
+          A high slot mapped as "parameter number 253" produced a signature with
+          253 phantom arguments and a module the engine REFUSED TO LOAD - which
+          is the one outcome this backend exists to prevent.
+          ⚠️ And the honest fix is not to renumber them: a SHARED slot must
+          SURVIVE a call, so it belongs in a WASM global, while a slot local is
+          per function - every procedure would get its own copy of a module
+          global and the program would quietly compute the wrong thing. Until
+          that is built, refuse and say which. }
+        if (Slot >= WASM_SHARED_SLOT_BASE) and (Slot <> WASM_XFER_RESULT_SLOT) then
+          Exit(Fail(Format('transfer slot %d is a module-global SHARED scalar or a ' +
+                           'by-value UDT result handle, not an argument; the WASM backend ' +
+                           'has no storage for one that survives a call yet (block "%s")',
+                           [Slot, Blk.LabelName])));
         NoteSlot(r, RT, Slot);      // this region needs a local for that slot
         if Instr.OpCode in [ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString] then
         begin
@@ -2062,6 +2085,14 @@ begin
     else
       SetLength(Res, 0);
     FTypeIdx[r] := FModule.TypeIndex(Params, Res);
+    { WASM_DIAG=1 prints the signature the backend DERIVED for each region. The
+      convention is read out of the transfer bank rather than declared, so when
+      a module fails to validate on a local type this is the first thing to
+      look at - and reading it settles in one line what guessing does not. }
+    if GetEnvironmentVariable('WASM_DIAG') = '1' then
+      WriteLn(ErrOutput, Format('WASMDIAG region %d "%s": params int=%d float=%d string=%d, result=%d',
+        [r, FRegionName[r], FParamCount[r][srtInt], FParamCount[r][srtFloat],
+         FParamCount[r][srtString], FResultBank[r]]));
   end;
   Result := True;
 end;
