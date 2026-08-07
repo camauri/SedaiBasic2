@@ -48,6 +48,8 @@ type
     Index: LongWord;
   end;
 
+  TSSAValueArray = array of TSSAValue;
+
   TWasmBackend = class
   private
     FProg: TSSAProgram;
@@ -114,6 +116,15 @@ type
     FStrAscFunc, FStrChrFunc, FStrRightFunc, FStrMidFunc,
     FPrintStrFunc: LongWord;
 
+    // --- arrays ---------------------------------------------------------
+    FUsesArr: Boolean;
+    FUsesRec: Boolean;              // the program builds UDT records
+    FArrDescOf: array of LongWord;   // array index -> its descriptor's address
+    FArrTmp: LongWord;               // i32 scratch: the running element product
+    FRecTmp: LongWord;               // i32 scratch: a record handle being addressed
+    FArrLoad, FArrStore: array[TSSARegisterType] of LongWord;
+    FArrLBoundFunc, FArrUBoundFunc: LongWord;
+
     FBankBase: array[TSSARegisterType] of Integer;
     FFlatCount: Integer;
     FUpExposed: array of array of Boolean;   // region -> flat register id
@@ -133,6 +144,8 @@ type
     FWriteFunc, FPrintIntFunc, FPrintUIntFunc, FPrintNlFunc: LongWord;
     procedure ScanForPrint;
     function ConstAddrOf(const V: TSSAValue): LongWord;
+    function ExtraOperands(Instr: TSSAInstruction): TSSAValueArray;
+    procedure EmitArrayHelpers;
     procedure EmitRawAddr(B: TWasmBuf);
     procedure EmitPrintHelpers;
     procedure EmitHeapHelpers;
@@ -264,6 +277,8 @@ begin
   FUsesPrint := False;
   FUsesGfx := False;
   FUsesStr := False;
+  FUsesArr := False;
+  FUsesRec := False;
   SetLength(FConstId, 0);
   for i := 0 to FProg.Blocks.Count - 1 do
   begin
@@ -283,11 +298,17 @@ begin
         ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr,
         ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
           FUsesStr := True;
+        ssaArrayDim, ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound:
+          FUsesArr := True;
+        ssaRecordNew:
+          FUsesRec := True;
+        ssaRecordLoadString, ssaRecordStoreString:
+          begin FUsesRec := True; FUsesStr := True; end;
       end;
       NoteConst(Ins.Src1); NoteConst(Ins.Src2); NoteConst(Ins.Src3);
     end;
   end;
-  FUsesHeap := FUsesStr or FUsesGfx;
+  FUsesHeap := FUsesStr or FUsesGfx or FUsesArr or FUsesRec;
 
   // Lay the literals out: one [i32 len][bytes] header each, 4-aligned so a
   // handle is always aligned the way an i32.load wants it.
@@ -309,7 +330,63 @@ begin
       Inc(Addr);
     end;
   end;
+
+  { The ARRAY DESCRIPTORS come next, one per declared array, and their addresses
+    are CONSTANTS - the array index is a compile-time number in every operand
+    that names one, so nothing has to be looked up at run time.
+      +0 base   the element block (0 before DIM)
+      +4 total  element count, which is also the bounds check
+      +8 dims   how many dimensions are allocated (0 before DIM)
+      +16.. (lb, size) per dimension
+    ⭐ Descriptors, not one global per array, because LBOUND/UBOUND take the
+    dimension in a REGISTER: the helper has to index the bounds at run time, and
+    a global cannot be indexed. }
+  SetLength(FArrDescOf, FProg.GetArrayCount);
+  if FUsesArr then
+    for k := 0 to FProg.GetArrayCount - 1 do
+    begin
+      FArrDescOf[k] := Addr;
+      Inc(Addr, LongWord(16 + 8 * FProg.GetArray(k).DimCount));
+      while (Addr and 3) <> 0 do Inc(Addr);
+    end;
   FHeapBase := Addr;
+end;
+
+function TWasmBackend.ExtraOperands(Instr: TSSAInstruction): TSSAValueArray;
+{ The operands an instruction READS without naming them in Src1..Src3.
+
+  ⛔ ssaArrayDim is the whole reason this exists. Its bounds do not travel in its
+  operand slots: they live in the program's ARRAY METADATA as bare register
+  NUMBERS, and the instruction carries them only as PhiSources so that DCE will
+  not delete the code that computes them. Every walk over operands is therefore
+  blind to them - and the failure is silent, because the array still allocates,
+  just with whatever happened to be in a local that was never given a value.
+  So there is one place that knows about them, and the three walks ask it. }
+var
+  Info: TSSAArrayInfo;
+  d: Integer;
+
+  procedure Add(RT: TSSARegisterType; Idx: Integer);
+  begin
+    if Idx < 0 then Exit;
+    SetLength(Result, Length(Result) + 1);
+    Result[High(Result)] := MakeSSARegister(RT, Idx);
+  end;
+
+begin
+  SetLength(Result, 0);
+  if Instr.OpCode <> ssaArrayDim then Exit;
+  if Instr.Src1.Kind <> svkArrayRef then Exit;
+  if (Instr.Src1.ArrayIndex < 0) or (Instr.Src1.ArrayIndex >= FProg.GetArrayCount) then Exit;
+  Info := FProg.GetArray(Instr.Src1.ArrayIndex);
+  for d := 0 to Info.DimCount - 1 do
+  begin
+    if (d <= High(Info.Dimensions)) and (Info.Dimensions[d] = 0) and
+       (d <= High(Info.DimRegisters)) then
+      Add(Info.DimRegTypes[d], Info.DimRegisters[d]);
+    if d <= High(Info.LowerBoundRegisters) then
+      Add(srtInt, Info.LowerBoundRegisters[d]);
+  end;
 end;
 
 function TWasmBackend.ConstAddrOf(const V: TSSAValue): LongWord;
@@ -793,6 +870,150 @@ begin
   end;
 end;
 
+{ ---------------- arrays ----------------
+
+  Elements live in one block from the same bump allocator, at a STRIDE OF 8 for
+  every bank - i64, f64 and a string handle all get eight bytes. The waste on the
+  string bank is four bytes an element and it buys one index computation instead
+  of three.
+
+  ⭐ Nothing zeroes a fresh array, and that is not an omission: the bump
+  allocator never reuses, linear memory starts zeroed, and memory.grow hands out
+  zeroed pages - so a block that has just been allocated IS zero, which is what
+  bcArrayDim writes into it explicitly. ⛔ The day the allocator learns to free,
+  this stops being true and DIM has to zero.
+
+  ⚠️ THE BOUNDS RULE IS DIALECT-DEPENDENT and it is not a detail:
+    FreeBASIC - no check. A read out of bounds yields the DEFAULT and a write is
+                DROPPED. (Real fbc would touch adjacent heap; the interpreter
+                chose memory safety, and this follows the interpreter.)
+    Commodore  - ?BAD SUBSCRIPT, an error that stops the program.
+  Here the CLASSIC arm traps, which is the loud equivalent of the interpreter
+  raising - the same choice ssaModFloat made for division by zero. }
+
+procedure TWasmBackend.EmitArrayHelpers;
+var
+  B: TWasmBuf;
+  RT: TSSARegisterType;
+  TLoad, TStore, TBound: LongWord;
+
+  procedure BoundsTest;
+  // leaves i32 "0 <= idx < total" on the stack; locals 0 = desc, 1 = idx
+  begin
+    B.LocalGet(1); B.I64Const(0); B.Op(wopI64GeS);
+    B.LocalGet(1);
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 4); B.Op(wopI64ExtendI32S);
+    B.Op(wopI64LtS);
+    B.Op(wopI32And);
+  end;
+
+  procedure ElemAddr;
+  // leaves base + idx*8; locals 0 = desc, 1 = idx
+  begin
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0);
+    B.LocalGet(1); B.Op(wopI32WrapI64); B.I32Const(8); B.Op(wopI32Mul);
+    B.Op(wopI32Add);
+  end;
+
+begin
+  for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
+  begin
+    TLoad := FModule.TypeIndex([wvtI32, wvtI64], [BankType[RT]]);
+    B := TWasmBuf.Create;
+    try
+      BoundsTest;
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        ElemAddr;
+        case RT of
+          srtFloat:  B.OpMem(wopF64Load, 3, 0);
+          srtString: B.OpMem(wopI32Load, 2, 0);
+        else
+          B.OpMem(wopI64Load, 3, 0);
+        end;
+        B.Op(wopReturn);
+      B.EndOp;
+      if FModern then
+        case RT of                       // FreeBASIC: the element type's default
+          srtFloat:  B.F64Const(0);
+          srtString: B.I32Const(EMPTY_STR);
+        else
+          B.I64Const(0);
+        end
+      else
+        B.Op(wopUnreachable);            // Commodore: ?BAD SUBSCRIPT
+      FArrLoad[RT] := FModule.AddFunction(TLoad, [], B);
+    finally
+      B.Free;
+    end;
+
+    TStore := FModule.TypeIndex([wvtI32, wvtI64, BankType[RT]], []);
+    B := TWasmBuf.Create;
+    try
+      BoundsTest;
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        ElemAddr;
+        B.LocalGet(2);
+        case RT of
+          srtFloat:  B.OpMem(wopF64Store, 3, 0);
+          srtString: B.OpMem(wopI32Store, 2, 0);
+        else
+          B.OpMem(wopI64Store, 3, 0);
+        end;
+      B.Op(wopElse);
+        if not FModern then B.Op(wopUnreachable);   // FreeBASIC drops it silently
+      B.EndOp;
+      FArrStore[RT] := FModule.AddFunction(TStore, [], B);
+    finally
+      B.Free;
+    end;
+  end;
+
+  TBound := FModule.TypeIndex([wvtI32, wvtI64], [wvtI64]);
+
+  { LBOUND(arr, d). ⭐ d BELOW ZERO is not an error: it is FreeBASIC's "how many
+    dimensions" query, written LBOUND(arr, 0), and the answer is always 1. }
+  B := TWasmBuf.Create;
+  try
+    B.LocalGet(1); B.I64Const(0); B.Op(wopI64LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I64Const(1); B.Op(wopReturn);
+    B.EndOp;
+    B.LocalGet(0);
+    B.LocalGet(1); B.Op(wopI32WrapI64); B.I32Const(8); B.Op(wopI32Mul);
+    B.Op(wopI32Add);
+    B.OpMem(wopI32Load, 2, 16);
+    B.Op(wopI64ExtendI32S);
+    FArrLBoundFunc := FModule.AddFunction(TBound, [], B);
+  finally
+    B.Free;
+  end;
+
+  { UBOUND(arr, d) = lb + size - 1, and the same query at d < 0 answers with the
+    number of ALLOCATED dimensions - 0 for a dynamic array not dimensioned yet,
+    which is also why UBOUND of one answers -1: lb 0 plus size 0 minus one. }
+  B := TWasmBuf.Create;
+  try
+    B.LocalGet(1); B.I64Const(0); B.Op(wopI64LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(0); B.OpMem(wopI32Load, 2, 8); B.Op(wopI64ExtendI32S);
+      B.Op(wopReturn);
+    B.EndOp;
+    B.LocalGet(0);
+    B.LocalGet(1); B.Op(wopI32WrapI64); B.I32Const(8); B.Op(wopI32Mul);
+    B.Op(wopI32Add);
+    B.LocalTee(2);
+    B.OpMem(wopI32Load, 2, 16);
+    B.LocalGet(2);
+    B.OpMem(wopI32Load, 2, 20);
+    B.Op(wopI32Add);
+    B.I32Const(1); B.Op(wopI32Sub);
+    B.Op(wopI64ExtendI32S);
+    FArrUBoundFunc := FModule.AddFunction(TBound, [wvtI32], B);
+  finally
+    B.Free;
+  end;
+end;
+
 constructor TWasmBackend.Create(AProgram: TSSAProgram; AModern: Boolean);
 begin
   inherited Create;
@@ -969,9 +1190,10 @@ procedure TWasmBackend.ComputeUpExposed;
   and a call's effect on the callee's registers is what the classification is
   deciding, not something to propagate through. }
 var
-  r, i, j, b, s, f, N, First, Last, Idx: Integer;
+  r, i, j, k, b, s, f, N, First, Last, Idx: Integer;
   Blk, Succ: TSSABasicBlock;
   Instr: TSSAInstruction;
+  Extras: TSSAValueArray;
   Gen, Kill, LiveIn, LiveOut: array of array of Boolean;
   Changed: Boolean;
 
@@ -1005,8 +1227,22 @@ begin
       MarkUse(Instr.Src1, i);
       MarkUse(Instr.Src2, i);
       MarkUse(Instr.Src3, i);
-      Idx := FlatId(Instr.Dest);
-      if Idx >= 0 then Kill[i][Idx] := True;
+      Extras := ExtraOperands(Instr);
+      for k := 0 to High(Extras) do MarkUse(Extras[k], i);
+      { ⛔ ssaArrayStore's Dest is the VALUE BEING STORED - a read, not a
+        definition (the VM writes IntData[idx] := IntRegs[Instr.Dest]). Killing
+        it here would say "this register is written before it is read", so a
+        value that really does cross into a procedure would be judged not
+        live-in, never promoted to a global, and read as whatever that region's
+        own local happened to hold. Silent, and only in programs with both an
+        array store and a shared register. }
+      if Instr.OpCode = ssaArrayStore then
+        MarkUse(Instr.Dest, i)
+      else
+      begin
+        Idx := FlatId(Instr.Dest);
+        if Idx >= 0 then Kill[i][Idx] := True;
+      end;
     end;
   end;
 
@@ -1068,10 +1304,11 @@ end;
 
 function TWasmBackend.ClassifyRegisters: Boolean;
 var
-  i, j, r: Integer;
+  i, j, k, r: Integer;
   RT: TSSARegisterType;
   Blk: TSSABasicBlock;
   Instr: TSSAInstruction;
+  Extras: TSSAValueArray;
   Init: TWasmBuf;
   Carried: Boolean;
 begin
@@ -1092,6 +1329,8 @@ begin
       NoteRegister(Instr.Src1, r);
       NoteRegister(Instr.Src2, r);
       NoteRegister(Instr.Src3, r);
+      Extras := ExtraOperands(Instr);
+      for k := 0 to High(Extras) do NoteRegister(Extras[k], r);
     end;
   end;
 
@@ -1121,6 +1360,9 @@ begin
       if FlatId(Instr.Src1) >= 0 then FRegionUses[r][FlatId(Instr.Src1)] := True;
       if FlatId(Instr.Src2) >= 0 then FRegionUses[r][FlatId(Instr.Src2)] := True;
       if FlatId(Instr.Src3) >= 0 then FRegionUses[r][FlatId(Instr.Src3)] := True;
+      Extras := ExtraOperands(Instr);
+      for k := 0 to High(Extras) do
+        if FlatId(Extras[k]) >= 0 then FRegionUses[r][FlatId(Extras[k])] := True;
     end;
   end;
 
@@ -1394,8 +1636,12 @@ function TWasmBackend.EmitInstr(B: TWasmBuf; Instr: TSSAInstruction; R: Integer)
   end;
 
 var
-  Slot: Integer;
+  Slot, d, Bytes, NStr, StrBase: Integer;
+  Enc: Int64;
+  Ofs: LongWord;
   RT: TSSARegisterType;
+  Info: TSSAArrayInfo;
+  Desc: LongWord;
 begin
   Result := True;
   case Instr.OpCode of
@@ -1557,6 +1803,245 @@ begin
                        'covering it needs copy-on-write first (line %d)',
                        [OpName(Instr.OpCode), Instr.SourceLine])));
 
+    { ---- UDT / records -------------------------------------------------
+
+      A record is a BYTE IMAGE with fbc's layout, not a bag of slots - that is
+      what makes SizeOf, OffsetOf and a union that aliases across banks come out
+      right, and it is why a field access carries an ENCODED offset rather than
+      an index. The encoding is the interpreter's (RecFieldInt): the byte offset
+      is Enc shr 4, and the low nibble is the width - 0 a full i64, 1..6 the
+      signed/unsigned 8/16/32 forms, 7 a SINGLE.
+
+      Strings cannot live in that image (a handle is not the value), so they sit
+      in their own area after it, and the header says where:
+        +0 typeId · +4 the byte offset of the string area · +8 the image }
+
+    ssaRecordNew:
+      begin
+        if (Instr.Src1.Kind <> svkConstInt) or (Instr.Src3.Kind <> svkConstInt) then
+          Exit(Fail('ssaRecordNew without its compile-time sizes'));
+        Bytes := Integer(Instr.Src1.ConstInt);
+        NStr := Integer(Instr.Src3.ConstInt and $FFFF);
+        StrBase := 8 + ((Bytes + 7) div 8) * 8;
+        B.I32Const(StrBase + 4 * NStr);
+        B.Call(FAllocFunc);
+        B.LocalTee(FRecTmp);
+        B.I32Const(Integer((Instr.Src3.ConstInt shr 32) and $FFFF));
+        B.OpMem(wopI32Store, 2, 0);                 // typeId
+        B.LocalGet(FRecTmp);
+        B.I32Const(StrBase);
+        B.OpMem(wopI32Store, 2, 4);                 // where the strings start
+        // the handle lives in an INT register, so it travels as an i64
+        B.LocalGet(FRecTmp);
+        B.Op(wopI64ExtendI32U);
+        StoreReg(B, Instr.Dest);
+        { ⭐ Nothing zeroes the image, for the same reason DIM does not zero an
+          array: bump-allocated memory has never been written, and linear memory
+          and every grown page start at zero. A string slot of 0 is the empty
+          string, which is what an unassigned one has to be. }
+      end;
+
+    ssaRecordTypeId:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.OpMem(wopI32Load, 2, 0);
+        B.Op(wopI64ExtendI32S);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { ⛔ DELETE is a NO-OP here and that is a stated consequence of the bump
+      allocator, not an oversight: nothing is ever freed. It differs from the
+      interpreter only for a program that uses a handle AFTER deleting it, which
+      is undefined there too - and it errs toward keeping memory alive rather
+      than reading something that has been handed to someone else. The same goes
+      for the block-scoped reclamation marks. }
+    ssaRecordFree, ssaRecMarkPush, ssaRecMarkPop: ;
+
+    ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordStoreInt, ssaRecordStoreFloat:
+      begin
+        if Instr.Src3.Kind <> svkConstInt then
+          Exit(Fail('a record field access without a constant field encoding'));
+        Enc := Instr.Src3.ConstInt;
+        LoadReg(B, Instr.Src1);                     // the handle
+        B.Op(wopI32WrapI64);
+        if OpIn(Instr.OpCode, [ssaRecordStoreInt, ssaRecordStoreFloat]) then
+          LoadReg(B, Instr.Src2);                   // the value
+        Ofs := LongWord(8 + (Enc shr 4));
+        case Instr.OpCode of
+          ssaRecordLoadInt:
+            case Enc and $F of
+              1: B.OpMem(wopI64Load8S, 0, Ofs);
+              2: B.OpMem(wopI64Load8U, 0, Ofs);
+              3: B.OpMem(wopI64Load16S, 0, Ofs);
+              4: B.OpMem(wopI64Load16U, 0, Ofs);
+              5: B.OpMem(wopI64Load32S, 0, Ofs);
+              6: B.OpMem(wopI64Load32U, 0, Ofs);
+            else
+              B.OpMem(wopI64Load, 0, Ofs);
+            end;
+          ssaRecordStoreInt:
+            case Enc and $F of
+              1, 2: B.OpMem(wopI64Store8, 0, Ofs);
+              3, 4: B.OpMem(wopI64Store16, 0, Ofs);
+              5, 6: B.OpMem(wopI64Store32, 0, Ofs);
+            else
+              B.OpMem(wopI64Store, 0, Ofs);
+            end;
+          ssaRecordLoadFloat:
+            if (Enc and $F) = 7 then
+            begin
+              B.OpMem(wopF32Load, 0, Ofs);          // a SINGLE really is 4 bytes
+              B.Op(wopF64PromoteF32);
+            end
+            else
+              B.OpMem(wopF64Load, 0, Ofs);
+        else
+          if (Enc and $F) = 7 then
+          begin
+            B.Op(wopF32DemoteF64);
+            B.OpMem(wopF32Store, 0, Ofs);
+          end
+          else
+            B.OpMem(wopF64Store, 0, Ofs);
+        end;
+        if OpIn(Instr.OpCode, [ssaRecordLoadInt, ssaRecordLoadFloat]) then
+          StoreReg(B, Instr.Dest);
+      end;
+
+    ssaRecordLoadString, ssaRecordStoreString:
+      begin
+        if Instr.Src3.Kind <> svkConstInt then
+          Exit(Fail('a record string field without a constant slot index'));
+        // addr = handle + strBase + 4*slot, and strBase is read from the header
+        // because the image's size is not known where the field is touched
+        LoadReg(B, Instr.Src1);
+        B.Op(wopI32WrapI64);
+        B.LocalTee(FRecTmp);
+        B.LocalGet(FRecTmp);
+        B.OpMem(wopI32Load, 2, 4);
+        B.Op(wopI32Add);
+        if Instr.OpCode = ssaRecordStoreString then
+        begin
+          LoadReg(B, Instr.Src2);
+          B.OpMem(wopI32Store, 2, LongWord(4 * Instr.Src3.ConstInt));
+        end
+        else
+        begin
+          B.OpMem(wopI32Load, 2, LongWord(4 * Instr.Src3.ConstInt));
+          StoreReg(B, Instr.Dest);
+        end;
+      end;
+
+    { ---- arrays ------------------------------------------------------- }
+
+    ssaArrayDim:
+      begin
+        if Instr.Src1.Kind <> svkArrayRef then
+          Exit(Fail('ssaArrayDim without an array reference'));
+        if (Instr.Src1.ArrayIndex < 0) or (Instr.Src1.ArrayIndex >= FProg.GetArrayCount) then
+          Exit(Fail('ssaArrayDim names an array that was never declared'));
+        Info := FProg.GetArray(Instr.Src1.ArrayIndex);
+        Desc := FArrDescOf[Instr.Src1.ArrayIndex];
+
+        B.I32Const(1); B.LocalSet(FArrTmp);
+        for d := 0 to Info.DimCount - 1 do
+        begin
+          // the lower bound: a RUNTIME register wins over the constant, which is
+          // how "Dim a(LBound(m) To UBound(m))" gets its bounds from another array
+          B.I32Const(LongInt(Desc + LongWord(16 + 8 * d)));
+          if (d <= High(Info.LowerBoundRegisters)) and (Info.LowerBoundRegisters[d] >= 0) then
+          begin
+            LoadReg(B, MakeSSARegister(srtInt, Info.LowerBoundRegisters[d]));
+            B.Op(wopI32WrapI64);
+          end
+          else if d <= High(Info.LowerBounds) then
+            B.I32Const(Info.LowerBounds[d])
+          else
+            B.I32Const(0);
+          B.OpMem(wopI32Store, 2, 0);
+
+          // the size: a constant dimension, or ub - lb + 1 from its register
+          B.I32Const(LongInt(Desc + LongWord(20 + 8 * d)));
+          if (d <= High(Info.Dimensions)) and (Info.Dimensions[d] <> 0) then
+            B.I32Const(Info.Dimensions[d])
+          else
+          begin
+            if (d > High(Info.DimRegisters)) or (Info.DimRegisters[d] < 0) then
+              Exit(Fail(Format('array "%s" has a variable dimension %d with no register',
+                               [Info.Name, d])));
+            LoadReg(B, MakeSSARegister(Info.DimRegTypes[d], Info.DimRegisters[d]));
+            case Info.DimRegTypes[d] of
+              srtInt:   B.Op(wopI32WrapI64);
+              srtFloat: B.TruncSat(wopfcI32TruncSatF64S);   // the VM truncates
+            else
+              Exit(Fail(Format('array "%s" takes dimension %d from a string register',
+                               [Info.Name, d])));
+            end;
+            B.I32Const(LongInt(Desc + LongWord(16 + 8 * d)));
+            B.OpMem(wopI32Load, 2, 0);
+            B.Op(wopI32Sub);
+            B.I32Const(1); B.Op(wopI32Add);
+          end;
+          B.OpMem(wopI32Store, 2, 0);
+
+          B.LocalGet(FArrTmp);
+          B.I32Const(LongInt(Desc + LongWord(20 + 8 * d)));
+          B.OpMem(wopI32Load, 2, 0);
+          B.Op(wopI32Mul);
+          B.LocalSet(FArrTmp);
+        end;
+
+        // An upper bound below the lower one gives a NEGATIVE count. Left alone
+        // it would hand the bump allocator a negative size and walk the cursor
+        // BACKWARDS over memory already handed out - so it is clamped, and the
+        // array comes out empty, which is what a zero TotalSize means anyway.
+        B.LocalGet(FArrTmp); B.I32Const(0); B.Op(wopI32LtS);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I32Const(0); B.LocalSet(FArrTmp);
+        B.EndOp;
+
+        B.I32Const(LongInt(Desc + 4)); B.LocalGet(FArrTmp); B.OpMem(wopI32Store, 2, 0);
+        B.I32Const(LongInt(Desc + 8)); B.I32Const(Info.DimCount); B.OpMem(wopI32Store, 2, 0);
+        B.I32Const(LongInt(Desc));
+        B.LocalGet(FArrTmp); B.I32Const(8); B.Op(wopI32Mul);
+        B.Call(FAllocFunc);
+        B.OpMem(wopI32Store, 2, 0);
+      end;
+
+    ssaArrayLoad:
+      begin
+        if Instr.Src1.Kind <> svkArrayRef then
+          Exit(Fail('ssaArrayLoad without an array reference'));
+        B.I32Const(LongInt(FArrDescOf[Instr.Src1.ArrayIndex]));
+        LoadReg(B, Instr.Src2);
+        B.Call(FArrLoad[Instr.Dest.RegType]);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { ⚠️ Dest is the VALUE here, not a destination - the array and the index are
+      in Src1 and Src2. It reads the way an assignment is written, not the way
+      the other opcodes are. }
+    ssaArrayStore:
+      begin
+        if Instr.Src1.Kind <> svkArrayRef then
+          Exit(Fail('ssaArrayStore without an array reference'));
+        B.I32Const(LongInt(FArrDescOf[Instr.Src1.ArrayIndex]));
+        LoadReg(B, Instr.Src2);
+        LoadReg(B, Instr.Dest);
+        B.Call(FArrStore[Instr.Dest.RegType]);
+      end;
+
+    ssaArrayLBound, ssaArrayUBound:
+      begin
+        if Instr.Src1.Kind <> svkArrayRef then
+          Exit(Fail('an array bound query without an array reference'));
+        B.I32Const(LongInt(FArrDescOf[Instr.Src1.ArrayIndex]));
+        LoadReg(B, Instr.Src2);
+        if Instr.OpCode = ssaArrayLBound then B.Call(FArrLBoundFunc)
+                                          else B.Call(FArrUBoundFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
     ssaModFloat:
       begin
         // The VM raises "Float modulo by zero"; f64.div would quietly answer NaN
@@ -1696,6 +2181,18 @@ begin
           5: B.Op(wopI64Extend32S);
           6: begin B.I64Const($FFFFFFFF); B.Op(wopI64And); end;
         end;
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { Round a Double to what a SINGLE can hold and keep it in the float bank -
+      which is exactly a demote followed by a promote. It is not a conversion to
+      another type: the value stays a Double that happens to have lost the bits
+      a Single cannot carry, and that lost precision is observable. }
+    ssaNarrowSingle:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Op(wopF32DemoteF64);
+        B.Op(wopF64PromoteF32);
         StoreReg(B, Instr.Dest);
       end;
 
@@ -1885,13 +2382,17 @@ begin
   FRawTmp := LongWord(P + 4);
   FGfxP := LongWord(P + 5);
   FGfxN := LongWord(P + 6);
-  SetLength(Locals, 7);
+  FArrTmp := LongWord(P + 7);
+  FRecTmp := LongWord(P + 8);
+  SetLength(Locals, 9);
   Locals[0] := wvtI32;                       // dispatch state
   Locals[1] := wvtI64; Locals[2] := wvtF64; Locals[3] := wvtI32;
   Locals[4] := wvtI64;                       // raw pointer being decoded
   Locals[5] := wvtI32; Locals[6] := wvtI32;  // ScreenRes fill cursor + counter
+  Locals[7] := wvtI32;                       // DIM's running element product
+  Locals[8] := wvtI32;                       // a record handle being addressed
   // one local per transfer slot this region mentions
-  k := P + 7;
+  k := P + 9;
   for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
   begin
     FSlotBase[RT] := LongWord(k);
@@ -2016,6 +2517,7 @@ end;
 function TWasmBackend.Compile: Boolean;
 var
   r: Integer;
+  RT: TSSARegisterType;
   Next: LongWord;
   Init: TWasmBuf;
 begin
@@ -2114,12 +2616,25 @@ begin
     FPrintStrFunc := Next + 8;
     Inc(Next, 9);
   end;
+  if FUsesArr then
+  begin
+    // load and store for each of the three banks, in bank order, then the two
+    // bound queries - the same order EmitArrayHelpers adds them in
+    for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
+    begin
+      FArrLoad[RT] := Next; FArrStore[RT] := Next + 1;
+      Inc(Next, 2);
+    end;
+    FArrLBoundFunc := Next; FArrUBoundFunc := Next + 1;
+    Inc(Next, 2);
+  end;
 
   for r := 0 to FRegionCount - 1 do
     if not EmitRegion(r) then Exit(False);
   if FUsesPrint then EmitPrintHelpers;
   if FUsesHeap then EmitHeapHelpers;
   if FUsesStr then EmitStringHelpers;
+  if FUsesArr then EmitArrayHelpers;
 
   FModule.ExportFunc('main', FFuncIdx[0]);
   for r := 1 to FRegionCount - 1 do
