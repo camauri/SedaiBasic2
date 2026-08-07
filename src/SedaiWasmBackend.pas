@@ -2522,6 +2522,22 @@ var
   Init: TWasmBuf;
 begin
   FError := '';
+  { ⛔ THE WASM TARGET IS MODERN-ONLY. A project rule, decided 7 Aug 2026, and it
+    belongs HERE rather than scattered over the opcodes: the dialect is known at
+    compile time, so the boundary can be one refusal that names itself instead of
+    a surprise somewhere inside a formatter.
+    ⭐ Some arms below still carry their Commodore branch (PRINT's trailing space,
+    MID$'s clamping, the ?BAD SUBSCRIPT trap). They are correct and now
+    UNREACHABLE, kept because they are the semantics, not a workaround - but
+    nothing exercises them any more, so do not read them as tested.
+    ⚠️ One consequence worth stating: ssaModFloat is reachable ONLY in Commodore
+    (in FreeBASIC, Mod is an integer operator), so its arm is dead code from here
+    on. The two CLASSIC guardians in job/tests/bas/wasm are deliberately left in
+    place: they must now be REFUSED, and the day one of them compiles, this rule
+    has been broken without anyone noticing. }
+  if not FModern then
+    Exit(Fail('the WASM target supports the FreeBASIC (MODERN) dialect only; ' +
+              'this program is Commodore BASIC'));
   if not BuildPartition then Exit(False);
 
   // Imports own the low indices, so they must be declared before the first
