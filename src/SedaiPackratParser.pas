@@ -7661,6 +7661,24 @@ begin
       begin
         FOptionDigits := StrToIntDef(Trim(Context.CurrentToken.Value), 0);
         Context.Advance;                               // consume the digit count
+      end
+      // ⭐ "OPTION DIGITS EXACT" (or ALL): every digit the value HAS.
+      // It is not "a very large number" - a double's decimal expansion is
+      // FINITE. The value is M x 2^E, so for E >= 0 it is an integer and for
+      // E < 0 it is M x 5^(-E) / 10^(-E), which terminates after exactly -E
+      // fractional digits. The widest any double gets is 751 significant digits
+      // (the smallest subnormal, 2^-1074), and the console behavior caps at 767,
+      // so asking for "all" cannot truncate anything: there is nothing past the
+      // end of a terminating expansion. MaxInt here says "as many as exist" and
+      // the cap turns it into that number, rather than making every program
+      // that wants the exact value hardcode 767.
+      else if Assigned(Context.CurrentToken) and
+              ((Context.CurrentToken.TokenType = ttIdentifier) or Assigned(Context.CurrentToken.KeywordInfo)) and
+              ((UpperCase(Context.CurrentToken.Value) = 'EXACT') or
+               (UpperCase(Context.CurrentToken.Value) = 'ALL')) then
+      begin
+        FOptionDigits := MaxInt;
+        Context.Advance;
       end;
     end
     // Every other OPTION is a compiler switch we accept and do not act on: DYNAMIC / STATIC (default

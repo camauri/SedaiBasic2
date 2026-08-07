@@ -80,12 +80,15 @@ once, the count is a display choice and the rounding is not — raising it shows
 number* rather than a differently-rounded one:
 
 ```basic
-Option Digits 17 : Print 0.1     '  0.10000000000000001   the round-trip form
-Option Digits 25 : Print 0.1     '  0.1000000000000000055511151   the exact binary value
+Option Digits 17    : Print 0.1  '  0.10000000000000001   the round-trip form
+Option Digits Exact : Print 0.1  '  0.1000000000000000055511151231257827021181583404541015625
 ```
 
-Past 17 those digits are the true ones, not padding: a double's exact expansion terminates, so
-`Print 0.5` at 25 digits is still `0.5`.
+`Exact` is not shorthand for "very many": a double's decimal expansion is **finite**. The value is
+`M × 2^E`, so for `E ≥ 0` it is an integer and for `E < 0` it is `M × 5^(-E) / 10^(-E)`, which
+terminates after exactly `-E` fractional digits. There is nothing past the end to truncate — the
+widest any double gets is 751 significant digits (the smallest subnormal), and `Print 0.5` at that
+setting is still `0.5`, because that is all the digits it has.
 
 ### Real-world FreeBASIC compatibility
 

@@ -270,8 +270,15 @@ implementation
 uses Math;
 
 const
-  { The widest exact expansion a double can have is M x 5^1074 = 767 digits, so
-    beyond this there is nothing left to show but zeros. }
+  { ⭐ NOT a truncation, and worth being precise about because it looks like one:
+    a double's decimal expansion is FINITE. The value is M x 2^E, so for E >= 0
+    it is an integer (at most 309 digits) and for E < 0 it is
+    M x 5^(-E) / 10^(-E), which TERMINATES after exactly -E fractional digits.
+    The widest case is the smallest subnormal, 2^-1074, whose exact value has
+    751 significant digits - MEASURED against the exact expansion, not assumed.
+    M x 5^1074 bounds it at 767, so at this setting every double prints its
+    mathematically exact value and asking for more cannot show anything: there is
+    nothing past the end of an expansion that ends. }
   MAX_FLOAT_DIGITS = 767;
 
 
