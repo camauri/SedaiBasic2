@@ -52,6 +52,33 @@ Source → Lexer → Parser (Packrat + Pratt) → AST → SSA IR
 
 The register-based VM uses three separate typed register banks (int / float / string) and 2-byte grouped opcodes. A differential regression net runs every corpus program (270+ tests) both optimized and with `--no-opt` and requires identical output, guarding the optimizer.
 
+### Numeric output follows the standard, not the reference
+
+Where FreeBASIC compatibility and **IEEE 754-2019** disagree, SedaiBasic2 follows the standard. This
+is a deliberate, measured departure and the only one of its kind.
+
+Printing a `Double` at 16 significant digits, FreeBASIC rounds **twice** — the exact value to 17
+digits, then those 17 to 16. §5.12.2 of IEEE 754-2019 asks for a conversion that is *correctly
+rounded*, i.e. rounded once, and the two disagree on **4.75% of doubles** (measured over 20 706 bit
+patterns). The textbook case is `1e-283`, whose nearest double is exactly
+`0.999999999999999946852…e-283`: the 17th digit is a 4, so the correctly rounded answer is
+`9.999999999999999e-284`, while rounding to 17 first turns `…946` into `…95` and carries it through
+sixteen nines to print `1e-283`.
+
+SedaiBasic2 prints `9.999999999999999e-284`. Its digits come from the **exact** binary value —
+a double is `M × 2^E`, so the decimal expansion is an integer built by repeated multiplication, with
+no floating point and no approximation anywhere — and are rounded once, half-to-even.
+
+Real programs are unaffected: the divergence needs the extreme exponents that random bit patterns
+produce, and the 558-program regression corpus did not move a single baseline. Details, measurements
+and the reasoning are in [`job/docs/PIANO_FLOAT_PRINT.md`](job/docs/PIANO_FLOAT_PRINT.md).
+
+The engine already carries the digit count as a setting (`FloatDigits` / `SingleDigits`, defaulting to
+the dialect's 16 and 7), and the digits are correctly rounded at *any* count — raising it shows more
+of the same number rather than a differently-rounded one, and 17 makes every distinct double print
+distinctly. **`OPTION DIGITS n` — the source-level way to set it — is designed and not yet wired**;
+until it is, the count is fixed at the defaults.
+
 ### Real-world FreeBASIC compatibility
 
 The MODERN dialect is exercised against real programs: [`bas/rosetta/`](bas/rosetta/README.md) collects 60+ **unmodified** FreeBASIC solutions from [Rosetta Code](https://rosettacode.org), each verified to run correctly (optimized output matching `--no-opt`, deterministic, non-interactive). They are third-party works included as a mere aggregation under their original GFDL 1.2 license — see the [attribution note](bas/rosetta/README.md).

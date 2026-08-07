@@ -122,6 +122,17 @@ type
 
     // Comportamento numeri
     FNumberFormat: TNumberFormat;
+    { How many significant digits PRINT shows for a float. 16 for a Double is
+      the DIALECT's display precision, and 7 for a Single is what hides its
+      representation error (a 24-bit mantissa is worth about 7.2 decimal
+      digits). ⭐ The digit COUNT is a display choice; the ROUNDING is not - at
+      every setting the digits are correctly rounded from the exact binary
+      value, so raising this shows more of the same number rather than a
+      differently-rounded one. 17 makes every distinct double print distinctly
+      (the round-trip guarantee); beyond that the expansion is exact and
+      terminates, so the extra digits are the true ones, not noise. }
+    FFloatDigits: Integer;
+    FSingleDigits: Integer;
     FNumberSpaceBefore: Boolean;      // Spazio prima dei numeri positivi
     FNumberSpaceAfter: Boolean;       // Spazio dopo i numeri
     FNumberSignSpace: Boolean;        // Spazio al posto del + per positivi
@@ -149,6 +160,11 @@ type
     // Caratteri speciali
     FNewLineChar: Char;               // Carattere newline (di solito #13)
     FCursorChar: Char;                // Carattere cursore (es. #219 blocco)
+
+    // ⚠️ I metodi vanno DOPO tutti i campi: in Pascal un campo non può seguire
+    // una dichiarazione di metodo nella stessa sezione di visibilità.
+    procedure SetFloatDigits(V: Integer);
+    procedure SetSingleDigits(V: Integer);
 
   public
     constructor Create;
@@ -203,6 +219,10 @@ type
 
     // Proprietà - Numeri
     property NumberFormat: TNumberFormat read FNumberFormat write FNumberFormat;
+    { "OPTION DIGITS n". Clamped to 1..MAX_FLOAT_DIGITS on the way in, because a
+      count of zero has no meaning and an unbounded one would only pad zeros. }
+    property FloatDigits: Integer read FFloatDigits write SetFloatDigits;
+    property SingleDigits: Integer read FSingleDigits write SetSingleDigits;
     property NumberSpaceBefore: Boolean read FNumberSpaceBefore write FNumberSpaceBefore;
     property NumberSpaceAfter: Boolean read FNumberSpaceAfter write FNumberSpaceAfter;
     property NumberSignSpace: Boolean read FNumberSignSpace write FNumberSignSpace;
@@ -248,6 +268,12 @@ type
 implementation
 
 uses Math;
+
+const
+  { The widest exact expansion a double can have is M x 5^1074 = 767 digits, so
+    beyond this there is nothing left to show but zeros. }
+  MAX_FLOAT_DIGITS = 767;
+
 
 function ExactRoundedDigits(Value: Double; SIGDIGITS: Integer; out Ex: Integer): string;
 { The first SIGDIGITS significant decimal digits of |Value|, CORRECTLY ROUNDED
@@ -415,6 +441,20 @@ begin
   end;
 end;
 
+procedure TConsoleBehavior.SetFloatDigits(V: Integer);
+begin
+  if V < 1 then V := 1;
+  if V > MAX_FLOAT_DIGITS then V := MAX_FLOAT_DIGITS;
+  FFloatDigits := V;
+end;
+
+procedure TConsoleBehavior.SetSingleDigits(V: Integer);
+begin
+  if V < 1 then V := 1;
+  if V > MAX_FLOAT_DIGITS then V := MAX_FLOAT_DIGITS;
+  FSingleDigits := V;
+end;
+
 function FormatDoubleFB(Value: Double; SIGDIGITS: Integer = 16): string;
 // FreeBASIC prints a DOUBLE with 16 significant digits -- "3.141592653589793", and it shows the 16th
 // digit even when it is representation noise ("0.9999999999999999", "44.99999999999999"). A SINGLE gets
@@ -482,6 +522,12 @@ begin
   // Default: comportamento Commodore 64
   FScreenCols := 40;
   FScreenRows := 25;
+
+  // The dialect's display precision. A preset may change the number FORMAT but
+  // never these: how many digits to show is a property of the language, not of
+  // the machine being emulated.
+  FFloatDigits := 16;
+  FSingleDigits := 7;
 
   FCommaAction := caTabZone;
   FCommaTabSize := 10;
@@ -708,10 +754,14 @@ begin
   // -9223372036854775808.
   else if FNumberFormat = nfFreeBASIC then
   begin
+    // The digit COUNT comes from the behavior ("OPTION DIGITS n"); the defaults
+    // are the dialect's - 16 for a Double, 7 for a Single, whose 24-bit mantissa
+    // is worth about 7.2 decimal digits. Whatever the count, the digits are
+    // correctly rounded from the exact value.
     if AsSingle then
-      NumStr := FormatDoubleFB(Value, 7)      // a SINGLE's mantissa is worth ~7 decimal digits
+      NumStr := FormatDoubleFB(Value, FSingleDigits)
     else
-      NumStr := FormatDoubleFB(Value);
+      NumStr := FormatDoubleFB(Value, FFloatDigits);
   end
   // Round() traps (or, under {$Q-}, silently yields Int64.Min) once the value is past 2^63, so the whole
   // number has to fit an Int64 to be printed as one. Beyond that, FloatToStr's exponential form.
