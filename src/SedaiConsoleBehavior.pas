@@ -249,115 +249,227 @@ implementation
 
 uses Math;
 
+function ExactRoundedDigits(Value: Double; SIGDIGITS: Integer; out Ex: Integer): string;
+{ The first SIGDIGITS significant decimal digits of |Value|, CORRECTLY ROUNDED
+  (round-half-even) from the EXACT binary value, plus the decimal exponent of the
+  leading digit. No floating point is used anywhere below.
+
+  ⭐ WHY THIS EXISTS, because the obvious way looked fine for years and was not.
+  The digits used to come from FPC's Str, which yields 17 of them, and the caller
+  then rounded those 17 down to 16. That is a DOUBLE ROUNDING, and it disagrees
+  with a single correct rounding on 4.75% of doubles - measured, not estimated:
+  the 17-digit intermediate lands on ...5 about a tenth of the time, and in half
+  of those the exact value was strictly below the halfway point, so the second
+  rounding pushes it the wrong way. The textbook case is 1e-283, whose exact
+  value is 0.999999999999999946852...e-283: the 17th digit is 4, so correct
+  rounding gives 9.999999999999999e-284, while rounding to 17 first turns ...946
+  into ...95 and then carries through sixteen nines to print "1e-283".
+  ⛔ fbc does the double rounding and is wrong there; IEEE 754-2019 §5.12.2 asks
+  for the correctly rounded conversion, and this project's VM is required to be
+  deterministic and precise. So we deliberately DIFFER FROM fbc on those values -
+  see job/docs/PIANO_FLOAT_PRINT.md before "fixing" a sweep DIFF back.
+  ⚠️ FPC's own Str was not even faithful to fbc: it mis-rounds one value in
+  20706 in a THIRD way, agreeing with neither.
+
+  THE METHOD. A double is M x 2^E with M a 53-bit integer, so
+      E >= 0 :  the value is the integer M x 2^E
+      E <  0 :  the value is M x 5^(-E) / 10^(-E)
+  Either way the exact decimal digits are those of an INTEGER built by repeated
+  multiplication - no division, no big-number division, no reciprocals. The
+  widest case is M x 5^1074, which is 767 digits. }
+const
+  MAXDIG = 1100;              // 767 is the true worst case; the slack is free
+  { The factors are applied in CHUNKS, not one at a time: a digit is at most 9,
+    so 9*5^13 plus the carry still fits an Int64 comfortably, and thirteen
+    multiplications collapse into one pass. 1074 passes over the buffer become
+    83, which is what keeps this off the profile of an ordinary PRINT. }
+  P5CHUNK = 13;
+  P2CHUNK = 30;
+var
+  Buf: array[0..MAXDIG - 1] of Byte;   // little-endian decimal digits
+  Len, FracDigits, i, k, Keep, First, D: Integer;
+  Bits, M, E, T, Carry, Mul: Int64;
+  RoundUp, AnyBelow: Boolean;
+
+  procedure MulBy(F: Int64);
+  var
+    j: Integer;
+  begin
+    Carry := 0;
+    for j := 0 to Len - 1 do
+    begin
+      T := Int64(Buf[j]) * F + Carry;
+      Buf[j] := Byte(T mod 10);
+      Carry := T div 10;
+    end;
+    while Carry > 0 do
+    begin
+      Buf[Len] := Byte(Carry mod 10);
+      Carry := Carry div 10;
+      Inc(Len);
+    end;
+  end;
+
+begin
+  Bits := PInt64(@Value)^;
+  M := Bits and $000FFFFFFFFFFFFF;
+  E := (Bits shr 52) and $7FF;
+  if E = 0 then
+    E := -1074                       // subnormal: no implicit leading bit
+  else
+  begin
+    M := M or (Int64(1) shl 52);
+    E := E - 1075;
+  end;
+  if M = 0 then
+  begin
+    Ex := 0;
+    Exit(StringOfChar('0', SIGDIGITS));
+  end;
+
+  Len := 0;
+  while M > 0 do
+  begin
+    Buf[Len] := Byte(M mod 10);
+    M := M div 10;
+    Inc(Len);
+  end;
+
+  if E >= 0 then
+  begin
+    FracDigits := 0;
+    i := Integer(E);
+    while i > 0 do
+    begin
+      k := i; if k > P2CHUNK then k := P2CHUNK;
+      Mul := 1; for D := 1 to k do Mul := Mul * 2;
+      MulBy(Mul);
+      Dec(i, k);
+    end;
+  end
+  else
+  begin
+    FracDigits := Integer(-E);
+    i := FracDigits;
+    while i > 0 do
+    begin
+      k := i; if k > P5CHUNK then k := P5CHUNK;
+      Mul := 1; for D := 1 to k do Mul := Mul * 5;
+      MulBy(Mul);
+      Dec(i, k);
+    end;
+  end;
+
+  // The value is Buf (as an integer) x 10^-FracDigits, and Buf's top digit is
+  // nonzero, so the leading significant digit sits at index Len-1.
+  Ex := (Len - 1) - FracDigits;
+
+  if Len <= SIGDIGITS then
+  begin
+    // Fewer exact digits than asked for: pad, and there is nothing to round.
+    SetLength(Result, SIGDIGITS);
+    for i := 1 to SIGDIGITS do
+      if i <= Len then Result[i] := Chr(Ord('0') + Buf[Len - i])
+                  else Result[i] := '0';
+    Exit;
+  end;
+
+  Keep := SIGDIGITS;
+  First := Len - Keep;                     // index of the first DROPPED digit
+  SetLength(Result, Keep);
+  for i := 1 to Keep do
+    Result[i] := Chr(Ord('0') + Buf[Len - i]);
+
+  // Round half to EVEN on the exact remainder - which is the whole point: the
+  // decision looks at EVERY dropped digit, not just the first one. Looking only
+  // at the first is what a double rounding does, and it is the 4.75%.
+  D := Buf[First - 1];                     // the first dropped digit
+  if D > 5 then
+    RoundUp := True
+  else if D < 5 then
+    RoundUp := False
+  else
+  begin
+    AnyBelow := False;
+    for i := 0 to First - 2 do
+      if Buf[i] <> 0 then begin AnyBelow := True; Break; end;
+    if AnyBelow then RoundUp := True
+                else RoundUp := Odd(Ord(Result[Keep]) - Ord('0'));   // exact tie
+  end;
+
+  if RoundUp then
+  begin
+    i := Keep;
+    while i >= 1 do
+    begin
+      if Result[i] < '9' then begin Inc(Result[i]); Break; end;
+      Result[i] := '0';
+      Dec(i);
+    end;
+    if i = 0 then
+    begin
+      // the carry ran off the front: 99..9 became 10..0, one decade up
+      Result := '1' + Copy(Result, 1, Keep - 1);
+      Inc(Ex);
+    end;
+  end;
+end;
+
 function FormatDoubleFB(Value: Double; SIGDIGITS: Integer = 16): string;
 // FreeBASIC prints a DOUBLE with 16 significant digits -- "3.141592653589793", and it shows the 16th
 // digit even when it is representation noise ("0.9999999999999999", "44.99999999999999"). A SINGLE gets
 // 7 (its 24-bit mantissa is worth about 7.2 decimal digits), which is what hides its representation
 // error: an accumulator holding 8.300000190734863 prints as "8.3", exactly as FreeBASIC shows it.
 //
-// FPC cannot produce 16: FloatToStr and FloatToStrF clamp a Double to 15 significant digits whatever
-// precision you ask for (ffGeneral with 16 or 17 both come back with 15, and 0.9999999999999999 comes
-// back as "1"). Str(V:0:N) does render the full expansion, so round at the decimal place that leaves
-// SIGDIGITS significant digits -- exactly what "%.<n>g" would print -- and reformat from THOSE digits.
+// The DIGITS now come from ExactRoundedDigits: the exact binary value, rounded ONCE, half to even, as
+// IEEE 754-2019 sec.5.12.2 asks for. They used to come from FPC's Str (17 digits) and be rounded again
+// to 16 here, which is a DOUBLE ROUNDING and disagrees with the correct answer on 4.75% of doubles.
+// ⛔ fbc double-rounds too, so this DELIBERATELY DIFFERS FROM fbc on those values. It is not a
+// regression and it is not to be "fixed" back -- read job/docs/PIANO_FLOAT_PRINT.md first.
 //
-// FreeBASIC chooses fixed vs exponential exactly as %g does, from the decimal exponent alone: it goes
-// exponential when the exponent is < -4 or >= SIGDIGITS, and writes the exponent with a sign and AT LEAST
-// THREE digits ("1e+016", "1e-005", "1e+300"). Both ends used to be wrong here: the small end fell back on
-// FPC's FloatToStr ("1E-10"), and the large end never even arrived -- FormatNumber short-circuits an
-// integral value through IntToStr(Round(Value)), which for anything past 2^63 OVERFLOWS, so every whole
-// double from 1e19 up printed as -9223372036854775808. "Print 1e20" produced garbage.
-//
-// The exponent is re-derived from the ROUNDED digits, not from the raw Log10: rounding can carry into a
-// new decade (9.999999999999999e15 rounds to 16 digits as 1e16 -- fbc prints "1e+016", not
-// "10000000000000000"), and that carry moves the value across the fixed/exponential boundary.
+// The fixed/exponential choice is still %g's, from the decimal exponent alone: exponential when the
+// exponent is < -4 or >= SIGDIGITS, with a signed exponent of AT LEAST THREE digits ("1e+016",
+// "1e-005", "1e+300"). The exponent comes from the ROUNDED digits, because a carry can move the value
+// into the next decade and across that boundary.
 var
-  Ex, Decimals, EPos, i: Integer;
-  S, Digits, Mant: string;
-  Neg, RoundUp: Boolean;
+  Digits, S: string;
+  Ex, i: Integer;
+  Neg: Boolean;
 begin
-  if Value = 0 then Exit('0');
+  if Value = 0 then Exit('0');          // -0 gets its sign back in FormatNumber
+  Neg := PInt64(@Value)^ < 0;
+  Digits := ExactRoundedDigits(Value, SIGDIGITS, Ex);
 
-  // The digits and the exponent both come from FPC's PLAIN Str, whose format is fixed and full-precision:
-  // "[-]d.dddddddddddddddd E{+|-}xxx" -- 17 significant digits (one more than we need, so the 16th rounds
-  // correctly) and an exponent already sign-padded to three places.
-  //
-  // Str(V:0:N) is NOT usable to get these: it renders fixed, and for a large enough value it gives up and
-  // falls back to scientific anyway ("Str(1e300:0:0)" = " 1.0E+300", losing all the digits). That silent
-  // width limit is why the first attempt at this printed "1.0E+3".
-  Str(Value, S);
-  S := Trim(S);
-  Neg := (S <> '') and (S[1] = '-');
-  if (S <> '') and (S[1] in ['+', '-']) then Delete(S, 1, 1);
-  // Negative zero: Str(-0.0) drops the sign, but FreeBASIC prints "-0" (the IEEE-754 sign bit is set).
-  // Take the sign from the raw bits so a type-punned -0.0 (Rosetta signum) shows its minus.
-  if (not Neg) and (PInt64(@Value)^ < 0) then Neg := True;
-  EPos := Pos('E', S);
-  if EPos = 0 then
-  begin
-    // Not the expected E-notation shape (e.g. 0.0): leave the digits to FloatToStr, but restore a negative
-    // zero's minus, which FloatToStr(-0.0) drops.
-    S := FloatToStr(Value);
-    if Neg and (S <> '') and (S[1] <> '-') then S := '-' + S;
-    Exit(S);
-  end;
-  Ex := StrToIntDef(Copy(S, EPos + 1, Length(S)), 0);
-  Digits := StringReplace(Copy(S, 1, EPos - 1), '.', '', [rfReplaceAll]);
-  if Digits = '' then Exit('0');
-
-  // Round the significant digits down to SIGDIGITS. A carry out of the leading digit ("99..9" -> "10..0")
-  // moves the value into the next decade -- and that can push it across the fixed/exponential boundary, so
-  // the exponent must be updated BEFORE the choice below (9.999999999999999e15 rounds to 16 digits as 1e16,
-  // which fbc prints "1e+016", not "10000000000000000").
-  if Length(Digits) > SIGDIGITS then
-  begin
-    RoundUp := Digits[SIGDIGITS + 1] >= '5';
-    SetLength(Digits, SIGDIGITS);
-    if RoundUp then
-    begin
-      i := SIGDIGITS;
-      while i >= 1 do
-      begin
-        if Digits[i] < '9' then begin Inc(Digits[i]); Break; end;
-        Digits[i] := '0';
-        Dec(i);
-      end;
-      if i = 0 then
-      begin
-        Digits := '1' + Copy(Digits, 1, SIGDIGITS - 1);
-        Inc(Ex);
-      end;
-    end;
-  end;
-
-  // FreeBASIC picks fixed vs exponential exactly as "%.<n>g" does, from the decimal exponent alone.
   if (Ex >= -4) and (Ex < SIGDIGITS) then
   begin
-    // Fixed. Re-render with Str at the decimal place that leaves SIGDIGITS significant digits, then drop
-    // the zeros it padded out with. (FloatToStr cannot be used: FPC clamps a Double to 15 significant
-    // digits there whatever precision is asked for, and FreeBASIC shows 16 -- "0.9999999999999999".)
-    Decimals := SIGDIGITS - 1 - Ex;
-    if Decimals < 0 then Decimals := 0;
-    Str(Value:0:Decimals, S);
-    S := Trim(S);
+    // FIXED. Place the point after digit Ex+1; a negative Ex means leading zeros.
+    if Ex >= 0 then
+    begin
+      S := Copy(Digits, 1, Ex + 1);
+      if Length(S) < Ex + 1 then S := S + StringOfChar('0', Ex + 1 - Length(S));
+      if Length(Digits) > Ex + 1 then
+        S := S + '.' + Copy(Digits, Ex + 2, Length(Digits) - Ex - 1);
+    end
+    else
+      S := '0.' + StringOfChar('0', -Ex - 1) + Digits;
     if Pos('.', S) > 0 then
     begin
       while (S <> '') and (S[Length(S)] = '0') do SetLength(S, Length(S) - 1);
       if (S <> '') and (S[Length(S)] = '.') then SetLength(S, Length(S) - 1);
     end;
-    // Restore a negative zero's minus (Str(-0.0:0:n) drops it): FreeBASIC prints "-0".
-    if Neg and (S <> '') and (S[1] <> '-') then S := '-' + S;
+    if S = '' then S := '0';
+    if Neg then S := '-' + S;
     Exit(S);
   end;
 
-  // Exponential, FreeBASIC style: "1e+016", "1.234568e+010", "5e-005", "1e+300".
-  while (Length(Digits) > 1) and (Digits[Length(Digits)] = '0') do
-    SetLength(Digits, Length(Digits) - 1);
-  Mant := Digits[1];
-  if Length(Digits) > 1 then Mant := Mant + '.' + Copy(Digits, 2, Length(Digits));
-  S := IntToStr(Abs(Ex));
-  while Length(S) < 3 do S := '0' + S;      // fbc pads the exponent to at least three digits
-  if Ex >= 0 then S := 'e+' + S else S := 'e-' + S;
-  Result := Mant + S;
+  // EXPONENTIAL, FreeBASIC style: "1e+016", "1.234568e+010", "5e-005", "1e+300".
+  i := Length(Digits);
+  while (i > 1) and (Digits[i] = '0') do Dec(i);
+  S := Copy(Digits, 1, 1);
+  if i > 1 then S := S + '.' + Copy(Digits, 2, i - 1);
+  Result := IntToStr(Abs(Ex));
+  while Length(Result) < 3 do Result := '0' + Result;      // at least three digits
+  if Ex >= 0 then Result := S + 'e+' + Result else Result := S + 'e-' + Result;
   if Neg then Result := '-' + Result;
 end;
 
