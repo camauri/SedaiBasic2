@@ -91,6 +91,12 @@ type
       spellings mean the same thing, and a real call just copies its parameters
       into them on entry. }
     FSlotCount: array of array[TSSARegisterType] of Integer;
+    { Argument slots a region writes BACK for its caller - BYREF copy-out. They
+      leave as extra RESULTS (multi-value), which is recursion-safe by
+      construction: a shared area in linear memory would be clobbered by the
+      callee's own nested calls, exactly what the VM avoids by saving the
+      transfer bank per frame. }
+    FOutSlot: array of array[TSSARegisterType] of array of Boolean;
 
     // --- emission state -------------------------------------------------
     FStateLocal: LongWord;
@@ -154,6 +160,8 @@ type
     procedure EmitArrayHelpers;
     procedure EmitFloatHelpers;
     procedure EmitFloatPrint;
+    procedure PushOutSlots(B: TWasmBuf; R: Integer);
+    procedure PopOutSlots(B: TWasmBuf; Callee: Integer);
     procedure EmitRawAddr(B: TWasmBuf);
     procedure EmitPrintHelpers;
     procedure EmitHeapHelpers;
@@ -1671,6 +1679,7 @@ begin
 
   SetLength(FParamCount, FRegionCount);
   SetLength(FSlotCount, FRegionCount);
+  SetLength(FOutSlot, FRegionCount);
   SetLength(FResultBank, FRegionCount);
   SetLength(FTypeIdx, FRegionCount);
   SetLength(FFuncIdx, FRegionCount);
@@ -2084,15 +2093,47 @@ begin
     after the call that produced it, so the owner is the last call SEEN, not the
     next one - the opposite direction from argument staging, which is why the
     two cannot share a walk. }
+  Target := -1;
+  TR := -1;
   for i := 0 to FProg.Blocks.Count - 1 do
   begin
     Blk := FProg.Blocks[i];
-    Target := -1;
+    { ⚠️ The window is the REGION, not the block. A call and the load that reads
+      its result - or its byref writeback - are routinely in DIFFERENT blocks,
+      because the SSA splits at the call; resetting per block saw neither, and
+      the byref detection below found nothing at all until this changed.
+      Resetting per REGION keeps the attribution inside one procedure, which is
+      as far as a call's effects reach here. }
+    if FRegionOf[i] <> TR then
+    begin
+      TR := FRegionOf[i];
+      Target := -1;
+    end;
     for j := 0 to Blk.Instructions.Count - 1 do
     begin
       Instr := TSSAInstruction(Blk.Instructions[j]);
       if (Instr.OpCode = ssaCallSub) and (Instr.Dest.Kind = svkLabel) then
         Target := FRegionOf[BlockOfLabel(Instr.Dest.LabelName)]
+      else if OpIn(Instr.OpCode, [ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString]) and
+              XferBank(Instr.OpCode, RT) and SlotOf(Instr, Slot) and
+              (Slot <> WASM_XFER_RESULT_SLOT) and (Target >= 0) then
+      begin
+        { ⭐ The CALLER re-reading an ARGUMENT slot after a call is BYREF
+          copy-out, and it is the only unambiguous witness of it. A store to an
+          argument slot inside a procedure cannot tell copy-out from the
+          procedure staging its OWN call - that ambiguity already produced one
+          wrong refusal - but a caller reading a slot back after a call is
+          exactly when the write becomes observable.
+          ⚠️ A false positive here is HARMLESS, which is what makes the criterion
+          usable: the callee's slot local is initialised from the parameter, so
+          a slot it never writes comes back unchanged and the caller stores the
+          same value it sent. }
+        while Length(FOutSlot[Target][RT]) <= Slot do
+          SetLength(FOutSlot[Target][RT], Length(FOutSlot[Target][RT]) + 1);
+        FOutSlot[Target][RT][Slot] := True;
+        NoteSlot(Target, RT, Slot);        // the callee needs a local for it
+        Widen(Target, RT, Slot);           // and it is a parameter, by definition
+      end
       else if OpIn(Instr.OpCode, [ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString]) and
               XferBank(Instr.OpCode, RT) and SlotOf(Instr, Slot) and
               (Slot = WASM_XFER_RESULT_SLOT) and (Target >= 0) then
@@ -2128,22 +2169,39 @@ begin
         FParamCount[0][RT] := 0;
       FResultBank[0] := -1;
     end;
+    { The results are the function's own value FIRST, then every argument slot it
+      copies back. The order is fixed and both sides walk it the same way: the
+      caller pops in reverse, so the result - pushed first, deepest - is the last
+      thing it stores, which is where the single-result code already put it. }
+    SetLength(Res, 0);
     if FResultBank[r] >= 0 then
     begin
       SetLength(Res, 1);
       Res[0] := BankType[TSSARegisterType(FResultBank[r])];
-    end
-    else
-      SetLength(Res, 0);
+    end;
+    if r <> 0 then
+      for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
+        for n := 0 to Length(FOutSlot[r][RT]) - 1 do
+          if FOutSlot[r][RT][n] then
+          begin
+            SetLength(Res, Length(Res) + 1);
+            Res[High(Res)] := BankType[RT];
+          end;
     FTypeIdx[r] := FModule.TypeIndex(Params, Res);
     { WASM_DIAG=1 prints the signature the backend DERIVED for each region. The
       convention is read out of the transfer bank rather than declared, so when
       a module fails to validate on a local type this is the first thing to
       look at - and reading it settles in one line what guessing does not. }
     if GetEnvironmentVariable('WASM_DIAG') = '1' then
+    begin
       WriteLn(ErrOutput, Format('WASMDIAG region %d "%s": params int=%d float=%d string=%d, result=%d',
         [r, FRegionName[r], FParamCount[r][srtInt], FParamCount[r][srtFloat],
          FParamCount[r][srtString], FResultBank[r]]));
+      for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
+        for n := 0 to Length(FOutSlot[r][RT]) - 1 do
+          if FOutSlot[r][RT][n] then
+            WriteLn(ErrOutput, Format('WASMDIAG    byref out: bank %d slot %d', [Ord(RT), n]));
+    end;
   end;
   Result := True;
 end;
@@ -3016,6 +3074,38 @@ begin
   end;
 end;
 
+
+procedure TWasmBackend.PushOutSlots(B: TWasmBuf; R: Integer);
+{ At a return: the function's own value is already on the stack, and every
+  argument slot it copies back follows, in ascending (bank, slot) order. }
+var
+  RT: TSSARegisterType;
+  n: Integer;
+begin
+  if R = 0 then Exit;
+  for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
+    for n := 0 to Length(FOutSlot[R][RT]) - 1 do
+      if FOutSlot[R][RT][n] then
+        B.LocalGet(FSlotBase[RT] + LongWord(n));
+end;
+
+procedure TWasmBackend.PopOutSlots(B: TWasmBuf; Callee: Integer);
+{ After a call: the results sit on the stack in declaration order, so the LAST
+  one is on top and they come off in reverse. Each lands in the CALLER's slot
+  local, which is what makes the callee's write visible - the whole point. }
+var
+  RT: TSSARegisterType;
+  n, bk: Integer;      // "b" would collide with the buffer: Pascal ignores case
+begin
+  for bk := Ord(High(TSSARegisterType)) downto 0 do
+  begin
+    RT := TSSARegisterType(bk);
+    for n := Length(FOutSlot[Callee][RT]) - 1 downto 0 do
+      if FOutSlot[Callee][RT][n] then
+        B.LocalSet(FSlotBase[RT] + LongWord(n));
+  end;
+end;
+
 function TWasmBackend.EmitRegion(R: Integer): Boolean;
 var
   D: TWasmDispatch;
@@ -3150,6 +3240,7 @@ begin
               CalleeRegion := FRegionOf[BlockOfLabel(Instr.Dest.LabelName)];
               PushArgs(CalleeRegion);
               B.Call(FFuncIdx[CalleeRegion]);
+              PopOutSlots(B, CalleeRegion);
               if FResultBank[CalleeRegion] >= 0 then
                 B.LocalSet(FResultTmp[TSSARegisterType(FResultBank[CalleeRegion])]);
             end;
@@ -3157,6 +3248,7 @@ begin
             begin
               if FResultBank[R] >= 0 then
                 B.LocalGet(FResultTmp[TSSARegisterType(FResultBank[R])]);
+              PushOutSlots(B, R);
               B.Op(wopReturn);
               Terminated := True;
             end;
@@ -3164,6 +3256,7 @@ begin
             begin
               if FResultBank[R] >= 0 then
                 B.LocalGet(FResultTmp[TSSARegisterType(FResultBank[R])]);
+              PushOutSlots(B, R);
               B.Op(wopReturn);
               Terminated := True;
             end;
@@ -3179,6 +3272,7 @@ begin
         begin
           if FResultBank[R] >= 0 then
             D.Body(i).LocalGet(FResultTmp[TSSARegisterType(FResultBank[R])]);
+          PushOutSlots(D.Body(i), R);
           D.Body(i).Op(wopReturn);
         end;
       end;
