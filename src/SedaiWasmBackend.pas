@@ -125,6 +125,11 @@ type
     FArrLoad, FArrStore: array[TSSARegisterType] of LongWord;
     FArrLBoundFunc, FArrUBoundFunc: LongWord;
 
+    // --- float printing -------------------------------------------------
+    FUsesFlt: Boolean;
+    FFltDigits: Integer;             // "OPTION DIGITS n"; 16 unless the source said otherwise
+    FFltMulFunc, FFltDecFunc, FFltPrintFunc: LongWord;
+
     FBankBase: array[TSSARegisterType] of Integer;
     FFlatCount: Integer;
     FUpExposed: array of array of Boolean;   // region -> flat register id
@@ -146,6 +151,8 @@ type
     function ConstAddrOf(const V: TSSAValue): LongWord;
     function ExtraOperands(Instr: TSSAInstruction): TSSAValueArray;
     procedure EmitArrayHelpers;
+    procedure EmitFloatHelpers;
+    procedure EmitFloatPrint;
     procedure EmitRawAddr(B: TWasmBuf);
     procedure EmitPrintHelpers;
     procedure EmitHeapHelpers;
@@ -168,6 +175,12 @@ type
     property GlobalCount: Integer read FGlobalCount;
     property RegionCount: Integer read FRegionCount;
     property Module: TWasmModule read FModule;
+    { "OPTION DIGITS n" from the source. The backend cannot see the directive
+      itself - it works on the SSA, which is past it - so the host hands it over.
+      ⛔ Without this the module would print a different number of digits than
+      the interpreter for the very same program, and the differential would be
+      right to call it a defect. }
+    property FloatDigits: Integer read FFltDigits write FFltDigits;
   end;
 
 const
@@ -195,7 +208,22 @@ const
   SCRATCH_END  = 64;      // one past the last byte of the digit scratch
   CONST_SPACE  = 64;      // a literal ' '
   CONST_NL     = 65;      // a literal LF
-  STR_CONST_BASE = 1024;  // the first string literal
+  { The specials, laid out right after ' ' and LF. FreeBASIC hands a NaN or an
+    infinity to the platform's C library, so its own spelling differs by
+    platform; these are MSVCRT's, which is what the native side prints on the
+    machine this is compared against. }
+  CONST_QNAN   = 66;      // '1.#QNAN'
+  CONST_IND    = 73;      // '-1.#IND'
+  CONST_INF    = 80;      // '1.#INF'
+  CONST_NINF   = 86;      // '-1.#INF'
+  { The float formatter's workspace. None of it is allocated: the sizes are
+    bounded by the type, not by the program. }
+  FLT_LEN      = 96;      // i32: how many digits FLT_DEC holds
+  FLT_FRAC     = 100;     // i32: how many of them are after the point
+  FLT_DIG      = 128;     // the kept, ROUNDED digits, most significant first
+  FLT_OUT      = 1024;    // the rendered text
+  FLT_DEC      = 2048;    // the EXACT digits, least significant first
+  STR_CONST_BASE = 4096;  // the first string literal
 
   { The two REGIONS a tagged raw pointer can name (SedaiSSATypes): region 0 is
     the byte heap Allocate returns, region 1 the framebuffer SCREENPTR returns.
@@ -278,6 +306,7 @@ begin
   FUsesGfx := False;
   FUsesStr := False;
   FUsesArr := False;
+  FUsesFlt := False;
   FUsesRec := False;
   SetLength(FConstId, 0);
   for i := 0 to FProg.Blocks.Count - 1 do
@@ -291,6 +320,8 @@ begin
           FUsesPrint := True;
         ssaPrintString, ssaPrintStringLn:
           begin FUsesPrint := True; FUsesStr := True; end;
+        ssaPrint, ssaPrintLn:
+          begin FUsesPrint := True; FUsesFlt := True; end;
         ssaGfxScreenRes, ssaGfxScreenPtr, ssaGfxScreenInfo,
         ssaRawLoadInt, ssaRawStoreInt:
           FUsesGfx := True;
@@ -1014,11 +1045,506 @@ begin
   end;
 end;
 
+{ ---------------- PRINT of a float ----------------
+
+  The same algorithm the interpreter runs, and it ports because of what that
+  algorithm is: the digits of a double come from its EXACT value, and the exact
+  value is an integer built by repeated multiplication. A double is M x 2^E, so
+  for E >= 0 it is the integer M x 2^E, and for E < 0 it is M x 5^(-E) / 10^(-E)
+  - either way, no division, no floating point, nothing that needs a wider type
+  than an i64.
+
+  ⛔ THAT IS THE ONLY REASON THIS EXISTS AT ALL. Reproducing what the native side
+  USED to print would have meant reproducing FPC's str_real: 543 lines that
+  generate digits in FLOATING POINT and reach 17 of them only by using 80-bit
+  Extended. WebAssembly has no 80-bit type, so that was not an expensive road,
+  it was a closed one. Fixing the interpreter to round correctly (IEEE 754-2019
+  sec.5.12.2) is what made a port possible - native and WebAssembly now agree by
+  construction rather than by luck. See job/docs/PIANO_FLOAT_PRINT.md. }
+
+procedure TWasmBackend.EmitFloatHelpers;
+var
+  B: TWasmBuf;
+  TMul, TDec, TPrint: LongWord;
+
+  procedure LoadLen;
+  begin B.I32Const(FLT_LEN); B.OpMem(wopI32Load, 2, 0); end;
+
+  procedure StoreLenFrom(Local: LongWord);
+  begin B.I32Const(FLT_LEN); B.LocalGet(Local); B.OpMem(wopI32Store, 2, 0); end;
+
+begin
+  { fltMul(f: i64): multiply the digit buffer by f, in place, growing it.
+    ⭐ f is applied in CHUNKS (5^13, 2^30) rather than one factor at a time: a
+    digit is at most 9, so 9*5^13 plus the carry still fits an i64, and 1074
+    passes over the buffer collapse into 83. }
+  TMul := FModule.TypeIndex([wvtI64], []);
+  B := TWasmBuf.Create;
+  try
+    // locals: 1 = i, 2 = len (i32); 3 = carry, 4 = t (i64)
+    LoadLen; B.LocalSet(2);
+    B.I64Const(0); B.LocalSet(3);
+    B.I32Const(0); B.LocalSet(1);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(1); B.LocalGet(2); B.Op(wopI32GeS); B.BrIf(1);
+        B.I32Const(FLT_DEC); B.LocalGet(1); B.Op(wopI32Add);
+        B.OpMem(wopI32Load8U, 0, 0); B.Op(wopI64ExtendI32U);
+        B.LocalGet(0); B.Op(wopI64Mul);
+        B.LocalGet(3); B.Op(wopI64Add);
+        B.LocalSet(4);
+        B.I32Const(FLT_DEC); B.LocalGet(1); B.Op(wopI32Add);
+        B.LocalGet(4); B.I64Const(10); B.Op(wopI64RemU); B.Op(wopI32WrapI64);
+        B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(4); B.I64Const(10); B.Op(wopI64DivU); B.LocalSet(3);
+        B.LocalGet(1); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(1);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    // the carry becomes new high digits
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(3); B.Op(wopI64Eqz); B.BrIf(1);
+        B.I32Const(FLT_DEC); B.LocalGet(2); B.Op(wopI32Add);
+        B.LocalGet(3); B.I64Const(10); B.Op(wopI64RemU); B.Op(wopI32WrapI64);
+        B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(3); B.I64Const(10); B.Op(wopI64DivU); B.LocalSet(3);
+        B.LocalGet(2); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(2);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    StoreLenFrom(2);
+    FFltMulFunc := FModule.AddFunction(TMul, [wvtI32, wvtI32, wvtI64, wvtI64], B);
+  finally
+    B.Free;
+  end;
+
+  { fltDec(v: f64): the EXACT decimal digits of |v| into FLT_DEC, least
+    significant first, with FLT_LEN and FLT_FRAC set. }
+  TDec := FModule.TypeIndex([wvtF64], []);
+  B := TWasmBuf.Create;
+  try
+    // locals: 1 = bits, 2 = M, 5 = mul (i64); 3 = E, 4 = k, 6 = i, 7 = c (i32)
+    B.LocalGet(0); B.Op(wopI64ReinterpretF64); B.LocalSet(1);
+    B.LocalGet(1); B.I64Const($000FFFFFFFFFFFFF); B.Op(wopI64And); B.LocalSet(2);
+    B.LocalGet(1); B.I64Const(52); B.Op(wopI64ShrU);
+      B.I64Const($7FF); B.Op(wopI64And); B.Op(wopI32WrapI64); B.LocalSet(3);
+    // a subnormal has no implicit leading bit, and its exponent is the fixed floor
+    B.LocalGet(3); B.Op(wopI32Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(-1074); B.LocalSet(3);
+    B.Op(wopElse);
+      B.LocalGet(2); B.I64Const(Int64(1) shl 52); B.Op(wopI64Or); B.LocalSet(2);
+      B.LocalGet(3); B.I32Const(1075); B.Op(wopI32Sub); B.LocalSet(3);
+    B.EndOp;
+
+    B.I32Const(FLT_LEN); B.I32Const(0); B.OpMem(wopI32Store, 2, 0);
+    B.I32Const(0); B.LocalSet(6);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(2); B.Op(wopI64Eqz); B.BrIf(1);
+        B.I32Const(FLT_DEC); B.LocalGet(6); B.Op(wopI32Add);
+        B.LocalGet(2); B.I64Const(10); B.Op(wopI64RemU); B.Op(wopI32WrapI64);
+        B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(2); B.I64Const(10); B.Op(wopI64DivU); B.LocalSet(2);
+        B.LocalGet(6); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(6);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    StoreLenFrom(6);
+
+    B.LocalGet(3); B.I32Const(0); B.Op(wopI32GeS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      // E >= 0: the value is the integer M * 2^E, so double it E times
+      B.I32Const(FLT_FRAC); B.I32Const(0); B.OpMem(wopI32Store, 2, 0);
+      B.LocalGet(3); B.LocalSet(6);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(6); B.I32Const(0); B.Op(wopI32LeS); B.BrIf(1);
+          B.LocalGet(6); B.LocalSet(4);
+          B.LocalGet(4); B.I32Const(30); B.Op(wopI32GtS);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.I32Const(30); B.LocalSet(4);
+          B.EndOp;
+          B.I64Const(1); B.LocalGet(4); B.Op(wopI64ExtendI32U); B.Op(wopI64Shl);
+          B.Call(FFltMulFunc);
+          B.LocalGet(6); B.LocalGet(4); B.Op(wopI32Sub); B.LocalSet(6);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+    B.Op(wopElse);
+      // E < 0: the value is M * 5^(-E) / 10^(-E) - so the digits are those of
+      // M * 5^(-E), and the point sits -E places from the right
+      B.I32Const(FLT_FRAC); B.I32Const(0); B.LocalGet(3); B.Op(wopI32Sub);
+        B.OpMem(wopI32Store, 2, 0);
+      B.I32Const(0); B.LocalGet(3); B.Op(wopI32Sub); B.LocalSet(6);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(6); B.I32Const(0); B.Op(wopI32LeS); B.BrIf(1);
+          B.LocalGet(6); B.LocalSet(4);
+          B.LocalGet(4); B.I32Const(13); B.Op(wopI32GtS);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.I32Const(13); B.LocalSet(4);
+          B.EndOp;
+          B.I64Const(1); B.LocalSet(5);
+          B.LocalGet(4); B.LocalSet(7);
+          B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+            B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+              B.LocalGet(7); B.I32Const(0); B.Op(wopI32LeS); B.BrIf(1);
+              B.LocalGet(5); B.I64Const(5); B.Op(wopI64Mul); B.LocalSet(5);
+              B.LocalGet(7); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(7);
+              B.Br(0);
+            B.EndOp;
+          B.EndOp;
+          B.LocalGet(5); B.Call(FFltMulFunc);
+          B.LocalGet(6); B.LocalGet(4); B.Op(wopI32Sub); B.LocalSet(6);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+    B.EndOp;
+    FFltDecFunc := FModule.AddFunction(TDec,
+      [wvtI64, wvtI64, wvtI32, wvtI32, wvtI64, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  EmitFloatPrint;
+end;
+
+
+procedure TWasmBackend.EmitFloatPrint;
+{ fltPrint(v: f64, sig: i32): TConsoleBehavior.FormatNumber for FreeBASIC, with
+  the digit count as an ARGUMENT so a Single (7), a Double (16) and any
+  "OPTION DIGITS n" all share one function.
+
+  Everything below mirrors the interpreter step for step, because that is what
+  the differential compares: a leading space stands in for the sign, nothing
+  trails, the specials are MSVCRT's spellings, negative zero prints "-0", and
+  the fixed/exponential choice is %g's - exponential when the decimal exponent
+  is below -4 or at least the digit count. }
+var
+  B: TWasmBuf;
+  TPrint: LongWord;
+
+  procedure Emit(Ch: Integer);        // *p++ = Ch
+  begin
+    B.LocalGet(8); B.I32Const(Ch); B.OpMem(wopI32Store8, 0, 0);
+    B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+  end;
+
+  procedure EmitDigitAt(IdxLocal: LongWord);   // *p++ = '0' + FLT_DIG[idx]
+  begin
+    B.LocalGet(8);
+    B.I32Const(FLT_DIG); B.LocalGet(IdxLocal); B.Op(wopI32Add);
+    B.OpMem(wopI32Load8U, 0, 0); B.I32Const(Ord('0')); B.Op(wopI32Add);
+    B.OpMem(wopI32Store8, 0, 0);
+    B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+  end;
+
+  procedure LastNonZeroFrom(LowLocal: Integer);
+  { local 9 := the highest index above `low` whose digit is non-zero, or `low`
+    itself. It is what strips the trailing zeros the padding leaves behind. }
+  begin
+    B.LocalGet(1); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(9);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(9);
+        if LowLocal < 0 then B.I32Const(0) else B.LocalGet(LongWord(LowLocal));
+        B.Op(wopI32LeS); B.BrIf(1);
+        B.I32Const(FLT_DIG); B.LocalGet(9); B.Op(wopI32Add);
+        B.OpMem(wopI32Load8U, 0, 0); B.BrIf(1);
+        B.LocalGet(9); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(9);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+  end;
+
+  procedure EmitRangeToK;
+  { for i := local 6 to local 9: emit digit i. }
+  begin
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(6); B.LocalGet(9); B.Op(wopI32GtS); B.BrIf(1);
+        EmitDigitAt(6);
+        B.LocalGet(6); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(6);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+  end;
+
+begin
+  TPrint := FModule.TypeIndex([wvtF64, wvtI32], []);
+  B := TWasmBuf.Create;
+  try
+    // 2 = bits(i64); 3 = neg, 4 = len, 5 = ex, 6 = i, 7 = j, 8 = p, 9 = k,
+    // 10 = roundup, 11 = d  (all i32)
+    B.LocalGet(0); B.Op(wopI64ReinterpretF64); B.LocalSet(2);
+    B.LocalGet(2); B.I64Const(0); B.Op(wopI64LtS); B.LocalSet(3);
+    B.I32Const(FLT_OUT); B.LocalSet(8);
+
+    { NaN and infinity never reach the digit machinery - the interpreter cannot
+      let them either, because Frac and FloatToStr trap on them. FreeBASIC hands
+      them to the platform's C library, so both sides print MSVCRT's spelling
+      rather than one of their own. }
+    B.LocalGet(2); B.I64Const(52); B.Op(wopI64ShrU);
+      B.I64Const($7FF); B.Op(wopI64And); B.I64Const($7FF); B.Op(wopI64Eq);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(3); B.Op(wopI32Eqz);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        Emit(Ord(' '));
+      B.EndOp;
+      B.LocalGet(2); B.I64Const($000FFFFFFFFFFFFF); B.Op(wopI64And); B.Op(wopI64Eqz);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(3);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I32Const(CONST_NINF); B.LocalSet(9); B.I32Const(7); B.LocalSet(11);
+        B.Op(wopElse);
+          B.I32Const(CONST_INF); B.LocalSet(9); B.I32Const(6); B.LocalSet(11);
+        B.EndOp;
+      B.Op(wopElse);
+        { The sign bit tells the two NaNs apart: SET is the "indefinite" an
+          invalid operation makes (0/0, Sqr of a negative), CLEAR the quiet NaN
+          the C library returns. }
+        B.LocalGet(3);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I32Const(CONST_IND); B.LocalSet(9); B.I32Const(7); B.LocalSet(11);
+        B.Op(wopElse);
+          B.I32Const(CONST_QNAN); B.LocalSet(9); B.I32Const(7); B.LocalSet(11);
+        B.EndOp;
+      B.EndOp;
+      B.LocalGet(8); B.LocalGet(9); B.LocalGet(11); B.MemoryCopy;
+      B.LocalGet(8); B.LocalGet(11); B.Op(wopI32Add); B.LocalSet(8);
+      B.I32Const(FLT_OUT);
+      B.LocalGet(8); B.I32Const(FLT_OUT); B.Op(wopI32Sub);
+      B.Call(FWriteFunc);
+      B.Op(wopReturn);
+    B.EndOp;
+
+    { Zero. -0.0 compares EQUAL to zero, so its sign can only come from the bit -
+      and FreeBASIC does print "-0". }
+    B.LocalGet(0); B.F64Const(0); B.Op(wopF64Eq);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(Ord('-')); B.I32Const(Ord(' ')); B.LocalGet(3); B.Op(wopSelect);
+      B.LocalSet(11);
+      B.LocalGet(8); B.LocalGet(11); B.OpMem(wopI32Store8, 0, 0);
+      B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+      Emit(Ord('0'));
+      B.I32Const(FLT_OUT);
+      B.LocalGet(8); B.I32Const(FLT_OUT); B.Op(wopI32Sub);
+      B.Call(FWriteFunc);
+      B.Op(wopReturn);
+    B.EndOp;
+
+    // the exact digits, and the decimal exponent of the leading one
+    B.LocalGet(0); B.Call(FFltDecFunc);
+    B.I32Const(FLT_LEN); B.OpMem(wopI32Load, 2, 0); B.LocalSet(4);
+    B.LocalGet(4); B.I32Const(1); B.Op(wopI32Sub);
+      B.I32Const(FLT_FRAC); B.OpMem(wopI32Load, 2, 0); B.Op(wopI32Sub); B.LocalSet(5);
+
+    // the top `sig` digits, most significant first, zero-padded when the exact
+    // expansion is shorter than asked for - which is not padding but the truth:
+    // a double's expansion terminates
+    B.I32Const(0); B.LocalSet(6);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(6); B.LocalGet(1); B.Op(wopI32GeS); B.BrIf(1);
+        B.LocalGet(6); B.LocalGet(4); B.Op(wopI32LtS);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I32Const(FLT_DEC); B.LocalGet(4); B.Op(wopI32Add);
+          B.I32Const(1); B.Op(wopI32Sub);
+          B.LocalGet(6); B.Op(wopI32Sub);
+          B.OpMem(wopI32Load8U, 0, 0); B.LocalSet(11);
+        B.Op(wopElse);
+          B.I32Const(0); B.LocalSet(11);
+        B.EndOp;
+        B.I32Const(FLT_DIG); B.LocalGet(6); B.Op(wopI32Add);
+        B.LocalGet(11); B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(6); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(6);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+
+    { ROUND, ONCE, half to even - and the decision looks at EVERY dropped digit,
+      not just the first. Looking only at the first is what a double rounding
+      does, and it disagrees with the correct answer on 4.75% of doubles. }
+    B.LocalGet(4); B.LocalGet(1); B.Op(wopI32GtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(FLT_DEC); B.LocalGet(4); B.Op(wopI32Add);
+      B.LocalGet(1); B.Op(wopI32Sub); B.I32Const(1); B.Op(wopI32Sub);
+      B.OpMem(wopI32Load8U, 0, 0); B.LocalSet(11);
+      B.I32Const(0); B.LocalSet(10);
+      B.LocalGet(11); B.I32Const(5); B.Op(wopI32GtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(1); B.LocalSet(10);
+      B.Op(wopElse);
+        B.LocalGet(11); B.I32Const(5); B.Op(wopI32Eq);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I32Const(0); B.LocalSet(7);
+          B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+            B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+              B.LocalGet(7);
+              B.LocalGet(4); B.LocalGet(1); B.Op(wopI32Sub);
+                B.I32Const(1); B.Op(wopI32Sub);
+              B.Op(wopI32GeS); B.BrIf(1);
+              B.I32Const(FLT_DEC); B.LocalGet(7); B.Op(wopI32Add);
+              B.OpMem(wopI32Load8U, 0, 0);
+              B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+                B.I32Const(1); B.LocalSet(10);
+                B.Br(2);
+              B.EndOp;
+              B.LocalGet(7); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(7);
+              B.Br(0);
+            B.EndOp;
+          B.EndOp;
+          // an EXACT tie, and only here: round to even
+          B.LocalGet(10); B.Op(wopI32Eqz);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.I32Const(FLT_DIG); B.LocalGet(1); B.Op(wopI32Add);
+            B.I32Const(1); B.Op(wopI32Sub);
+            B.OpMem(wopI32Load8U, 0, 0); B.I32Const(1); B.Op(wopI32And);
+            B.LocalSet(10);
+          B.EndOp;
+        B.EndOp;
+      B.EndOp;
+      B.LocalGet(10);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(1); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(6);
+        B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+          B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(6); B.I32Const(0); B.Op(wopI32LtS); B.BrIf(1);
+            B.I32Const(FLT_DIG); B.LocalGet(6); B.Op(wopI32Add);
+            B.OpMem(wopI32Load8U, 0, 0); B.LocalSet(11);
+            B.LocalGet(11); B.I32Const(9); B.Op(wopI32LtS);
+            B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+              B.I32Const(FLT_DIG); B.LocalGet(6); B.Op(wopI32Add);
+              B.LocalGet(11); B.I32Const(1); B.Op(wopI32Add);
+              B.OpMem(wopI32Store8, 0, 0);
+              B.Br(2);
+            B.EndOp;
+            B.I32Const(FLT_DIG); B.LocalGet(6); B.Op(wopI32Add);
+            B.I32Const(0); B.OpMem(wopI32Store8, 0, 0);
+            B.LocalGet(6); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(6);
+            B.Br(0);
+          B.EndOp;
+        B.EndOp;
+        // the carry ran off the front: 99..9 became 10..0, one decade up
+        B.LocalGet(6); B.I32Const(0); B.Op(wopI32LtS);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I32Const(FLT_DIG); B.I32Const(1); B.OpMem(wopI32Store8, 0, 0);
+          B.LocalGet(5); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(5);
+        B.EndOp;
+      B.EndOp;
+    B.EndOp;
+
+    // the sign: a leading space stands in for it when the value is not negative
+    B.LocalGet(3); B.Op(wopI32Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      Emit(Ord(' '));
+    B.Op(wopElse);
+      Emit(Ord('-'));
+    B.EndOp;
+
+    B.LocalGet(5); B.I32Const(-4); B.Op(wopI32GeS);
+    B.LocalGet(5); B.LocalGet(1); B.Op(wopI32LtS);
+    B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(5); B.I32Const(0); B.Op(wopI32GeS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        // ddd.ddd - the point sits after digit ex
+        B.I32Const(0); B.LocalSet(6);
+        B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+          B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(6); B.LocalGet(5); B.Op(wopI32GtS); B.BrIf(1);
+            EmitDigitAt(6);
+            B.LocalGet(6); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(6);
+            B.Br(0);
+          B.EndOp;
+        B.EndOp;
+        LastNonZeroFrom(5);
+        B.LocalGet(9); B.LocalGet(5); B.Op(wopI32GtS);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          Emit(Ord('.'));
+          B.LocalGet(5); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(6);
+          EmitRangeToK;
+        B.EndOp;
+      B.Op(wopElse);
+        // 0.000ddd - ex is negative, so -ex-1 zeros come first
+        Emit(Ord('0'));
+        Emit(Ord('.'));
+        B.I32Const(0); B.LocalSet(6);
+        B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+          B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(6);
+            B.I32Const(0); B.LocalGet(5); B.Op(wopI32Sub);
+              B.I32Const(1); B.Op(wopI32Sub);
+            B.Op(wopI32GeS); B.BrIf(1);
+            Emit(Ord('0'));
+            B.LocalGet(6); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(6);
+            B.Br(0);
+          B.EndOp;
+        B.EndOp;
+        LastNonZeroFrom(-1);
+        B.I32Const(0); B.LocalSet(6);
+        EmitRangeToK;
+      B.EndOp;
+    B.Op(wopElse);
+      // d.dddde+xxx, the exponent signed and three digits wide
+      LastNonZeroFrom(-1);
+      B.LocalGet(8);
+      B.I32Const(FLT_DIG); B.OpMem(wopI32Load8U, 0, 0);
+        B.I32Const(Ord('0')); B.Op(wopI32Add);
+      B.OpMem(wopI32Store8, 0, 0);
+      B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+      B.LocalGet(9); B.I32Const(0); B.Op(wopI32GtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        Emit(Ord('.'));
+        B.I32Const(1); B.LocalSet(6);
+        EmitRangeToK;
+      B.EndOp;
+      Emit(Ord('e'));
+      B.I32Const(Ord('+')); B.I32Const(Ord('-'));
+        B.LocalGet(5); B.I32Const(0); B.Op(wopI32GeS); B.Op(wopSelect);
+      B.LocalSet(11);
+      B.LocalGet(8); B.LocalGet(11); B.OpMem(wopI32Store8, 0, 0);
+      B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+      B.LocalGet(5); B.LocalSet(7);
+      B.LocalGet(7); B.I32Const(0); B.Op(wopI32LtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(0); B.LocalGet(7); B.Op(wopI32Sub); B.LocalSet(7);
+      B.EndOp;
+      B.LocalGet(8);
+      B.LocalGet(7); B.I32Const(100); B.Op(wopI32DivU);
+        B.I32Const(10); B.Op(wopI32RemU); B.I32Const(Ord('0')); B.Op(wopI32Add);
+      B.OpMem(wopI32Store8, 0, 0);
+      B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+      B.LocalGet(8);
+      B.LocalGet(7); B.I32Const(10); B.Op(wopI32DivU);
+        B.I32Const(10); B.Op(wopI32RemU); B.I32Const(Ord('0')); B.Op(wopI32Add);
+      B.OpMem(wopI32Store8, 0, 0);
+      B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+      B.LocalGet(8);
+      B.LocalGet(7); B.I32Const(10); B.Op(wopI32RemU);
+        B.I32Const(Ord('0')); B.Op(wopI32Add);
+      B.OpMem(wopI32Store8, 0, 0);
+      B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+    B.EndOp;
+
+    B.I32Const(FLT_OUT);
+    B.LocalGet(8); B.I32Const(FLT_OUT); B.Op(wopI32Sub);
+    B.Call(FWriteFunc);
+    FFltPrintFunc := FModule.AddFunction(TPrint,
+      [wvtI64, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+end;
+
 constructor TWasmBackend.Create(AProgram: TSSAProgram; AModern: Boolean);
 begin
   inherited Create;
   FProg := AProgram;
   FModern := AModern;
+  FFltDigits := 16;                  // the dialect default; the host may override
   FModule := TWasmModule.Create;
 end;
 
@@ -1661,6 +2187,20 @@ begin
       end;
     ssaPrintNewLine:
       B.Call(FPrintNlFunc);
+
+    { PRINT of a FLOAT. Src3 = 1 marks a SINGLE, which shows 7 significant
+      digits against a Double's 16 - the count is an argument, so one function
+      serves both and "OPTION DIGITS n" as well. }
+    ssaPrint, ssaPrintLn:
+      begin
+        LoadReg(B, Instr.Src1);
+        if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = 1) then
+          B.I32Const(7)
+        else
+          B.I32Const(FFltDigits);
+        B.Call(FFltPrintFunc);
+        if Instr.OpCode = ssaPrintLn then B.Call(FPrintNlFunc);
+      end;
     ssaPrintUInt:
       begin
         LoadReg(B, Instr.Src1);
@@ -2538,6 +3078,12 @@ begin
   if not FModern then
     Exit(Fail('the WASM target supports the FreeBASIC (MODERN) dialect only; ' +
               'this program is Commodore BASIC'));
+  { Clamp the digit count to what the workspace holds - and 767 is not an
+    arbitrary size: it bounds M x 5^1074, the widest exact expansion a double
+    has, so nothing is lost by capping there. "OPTION DIGITS EXACT" arrives as
+    MaxInt and becomes exactly this. }
+  if FFltDigits < 1 then FFltDigits := 1;
+  if FFltDigits > 767 then FFltDigits := 767;
   if not BuildPartition then Exit(False);
 
   // Imports own the low indices, so they must be declared before the first
@@ -2563,7 +3109,7 @@ begin
     // memory is exported so a differential can read the framebuffer out without
     // the program having to print it.
     FModule.DefineMemory((FHeapBase + 65535) div 65536, 0);
-    FModule.DataSegment(CONST_SPACE, PByte(PAnsiChar(' '#10)), 2);
+    FModule.DataSegment(CONST_SPACE, PByte(PAnsiChar(' '#10 + '1.#QNAN' + '-1.#IND' + '1.#INF' + '-1.#INF')), 29);
     if Length(FConstBytes) > 0 then
       FModule.DataSegment(STR_CONST_BASE, PByte(PAnsiChar(FConstBytes)),
                           Length(FConstBytes));
@@ -2645,12 +3191,21 @@ begin
     Inc(Next, 2);
   end;
 
+  if FUsesFlt then
+  begin
+    FFltMulFunc := Next;
+    FFltDecFunc := Next + 1;
+    FFltPrintFunc := Next + 2;
+    Inc(Next, 3);
+  end;
+
   for r := 0 to FRegionCount - 1 do
     if not EmitRegion(r) then Exit(False);
   if FUsesPrint then EmitPrintHelpers;
   if FUsesHeap then EmitHeapHelpers;
   if FUsesStr then EmitStringHelpers;
   if FUsesArr then EmitArrayHelpers;
+  if FUsesFlt then EmitFloatHelpers;
 
   FModule.ExportFunc('main', FFuncIdx[0]);
   for r := 1 to FRegionCount - 1 do

@@ -449,6 +449,12 @@ begin
         if OptTargetWasm then
         begin
           WasmBackend := TWasmBackend.Create(SSAProgram, not HasLineNums);
+          // "OPTION DIGITS n" reaches the backend the same way it reaches the
+          // VM. Without it the module would print a different number of digits
+          // than the interpreter for the very same source, and the differential
+          // would be right to call that a defect.
+          if ParserResult.OptionDigits > 0 then
+            WasmBackend.FloatDigits := ParserResult.OptionDigits;
           try
             if not WasmBackend.Compile then
             begin
