@@ -128,6 +128,7 @@ type
     // --- float printing -------------------------------------------------
     FUsesFlt: Boolean;
     FFltDigits: Integer;             // "OPTION DIGITS n"; 16 unless the source said otherwise
+    FQBLang: Boolean;                // the source declared -lang qb
     FFltMulFunc, FFltDecFunc, FFltPrintFunc: LongWord;
 
     FBankBase: array[TSSARegisterType] of Integer;
@@ -181,6 +182,12 @@ type
       the interpreter for the very same program, and the differential would be
       right to call it a defect. }
     property FloatDigits: Integer read FFltDigits write FFltDigits;
+    { The source declared -lang qb ('$lang: "qb"'). It changes PRINT spacing and
+      the backend cannot see the directive - the SSA is past it - so the host
+      hands it over, exactly like the digit count. ⭐ In QB an INTEGER gets a
+      trailing space and a FLOAT does not, which is why this cannot be folded
+      into "not Modern": Commodore gives BOTH the trailing space. }
+    property QBLang: Boolean read FQBLang write FQBLang;
   end;
 
 const
@@ -499,9 +506,13 @@ begin
     B.I32Const(SCRATCH_END); B.LocalGet(1); B.Op(wopI32Sub);
     B.Call(FWriteFunc);
 
-    if not FModern then
+    if (not FModern) or FQBLang then
     begin
-      // Commodore/MSX/QB put a space AFTER the number; FreeBASIC does not.
+      { Commodore and -lang qb put a space AFTER an integer; FreeBASIC does not.
+        ⚠️ QB is not "Commodore" though - it gives the trailing space ONLY to an
+        integer, while a Single or a Double keeps just the sign pad. That is why
+        this reads (not Modern) OR QBLang rather than folding the two, and why
+        the float printer below does NOT get the same test. }
       B.I32Const(CONST_SPACE); B.I32Const(1); B.Call(FWriteFunc);
     end;
 
@@ -1549,6 +1560,7 @@ begin
   FProg := AProgram;
   FModern := AModern;
   FFltDigits := 16;                  // the dialect default; the host may override
+  FQBLang := False;
   FModule := TWasmModule.Create;
 end;
 
@@ -2841,9 +2853,44 @@ begin
         B.Op(wopI64Xor);
         StoreReg(B, Instr.Dest);
       end;
+    { ⚠️ SHIFT COUNTS PAST THE WIDTH. WASM defines i64.shl/shr as taking the
+      count MODULO 64, and that is also what the hardware does - so v Shr 64 is
+      v there, and fbc agrees (while WARNING that the shift is out of range,
+      i.e. declaring the case out of contract).
+      ⛔ Our VM does NOT do that. ArithShr64/LogicalShr64 SATURATE: a count past
+      63 gives the sign (-1 or 0) for an arithmetic shift and 0 for a logical
+      one, deliberately, "to keep the result defined where the hardware shift
+      would not be". Since there is no standard mandating either and the
+      reference explicitly warns the case is out of range, OUR semantics are the
+      ones to reproduce - so the backend adds the guard the hardware lacks.
+      ⚠️ SHL is left as a plain i64.shl because the VM leaves it to FPC, which
+      masks: measured, v Shl 64 is v on both sides and on fbc. The asymmetry is
+      the interpreter's and is mirrored here rather than tidied away.
+      ⚠️ A count of zero or less returns the value untouched, which is the
+      helpers' first line and NOT what a masked shift would do. }
     ssaShl:     Bin(wopI64Shl);
-    ssaShr:     Bin(wopI64ShrS);
-    ssaShrUInt: Bin(wopI64ShrU);
+    ssaShr:
+      begin
+        LoadReg(B, Instr.Src1);                            // c <= 0: unchanged
+        LoadReg(B, Instr.Src1); B.I64Const(63); B.Op(wopI64ShrS);   // saturated sign
+        LoadReg(B, Instr.Src1); LoadReg(B, Instr.Src2); B.Op(wopI64ShrS);
+        LoadReg(B, Instr.Src2); B.I64Const(63); B.Op(wopI64GtS);
+        B.Op(wopSelect);                                   // count > 63 ? sign : shifted
+        LoadReg(B, Instr.Src2); B.I64Const(0); B.Op(wopI64LeS);
+        B.Op(wopSelect);
+        StoreReg(B, Instr.Dest);
+      end;
+    ssaShrUInt:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.I64Const(0);
+        LoadReg(B, Instr.Src1); LoadReg(B, Instr.Src2); B.Op(wopI64ShrU);
+        LoadReg(B, Instr.Src2); B.I64Const(63); B.Op(wopI64GtS);
+        B.Op(wopSelect);
+        LoadReg(B, Instr.Src2); B.I64Const(0); B.Op(wopI64LeS);
+        B.Op(wopSelect);
+        StoreReg(B, Instr.Dest);
+      end;
 
     ssaCmpEqInt: Cmp(wopI64Eq);
     ssaCmpNeInt: Cmp(wopI64Ne);

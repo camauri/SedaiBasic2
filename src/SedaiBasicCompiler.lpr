@@ -455,6 +455,8 @@ begin
           // would be right to call that a defect.
           if ParserResult.OptionDigits > 0 then
             WasmBackend.FloatDigits := ParserResult.OptionDigits;
+          // -lang qb changes PRINT spacing; same channel as the digit count.
+          WasmBackend.QBLang := QBLangDetected;
           try
             if not WasmBackend.Compile then
             begin
