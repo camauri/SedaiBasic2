@@ -484,6 +484,9 @@ begin
             // Record the source dialect so the VM can pick dialect-aware behaviour when
             // running the .basc (mirrors SSAGen.ModernMode above; persisted by the serializer).
             BytecodeProgram.ModernMode := not HasLineNums;
+            // "OPTION DIGITS n", same channel as the dialect above.
+            // ⚠️ NOT persisted by the serializer yet: a .basc loses it.
+            BytecodeProgram.OptionDigits := ParserResult.OptionDigits;
             // ERMN reports the module an error came from. fbc bakes the source PATH as passed on
             // its command line (native separators) into the executable - so do we (mirrors sb).
             {$IFDEF WINDOWS}

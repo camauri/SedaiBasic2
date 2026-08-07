@@ -74,6 +74,12 @@ type
     // stream (no line numbers => MODERN); mirrors the SSA's SourceHasLineNumbers gate.
     FModernMode: Boolean;
     FOptionBase: Integer;              // "OPTION BASE n": default lower bound for a bare-upper-bound array DIM (0 or 1)
+    { "OPTION DIGITS n": significant digits for a float in PRINT. 0 = the
+      directive was not used, so the dialect default stands. Unlike OPTION BASE
+      this one has no effect at PARSE time - it is read out by the caller and
+      handed to the runtime, because it changes how a value is SHOWN, not how
+      the program is built. }
+    FOptionDigits: Integer;
     // Constant capacity of the last "As String * n" TYPE-field type parsed (0 = none). Set by
     // ParseRecordFieldType, consumed when that field's node is built.
     FLastFieldFixedLen: Integer;
@@ -724,6 +730,7 @@ begin
     end;
     ApplyDialectProfile;   // install the dialect's statement handlers for this parse
     FOptionBase := 0;      // reset per parse; set by an "OPTION BASE 1" directive as it is encountered
+    FOptionDigits := 0;    // 0 = not specified: the dialect default (16 / 7) stands
 
     DoParsingStarted;
 
@@ -738,6 +745,9 @@ begin
 
     Result.TokensConsumed := Context.CurrentIndex;
     Result.ParsingTime := MilliSecondsBetween(Now, FStartTime);
+    // "OPTION DIGITS n" travels out on the RESULT: the parser is freed as soon
+    // as parsing ends, and this one configures the runtime rather than the tree.
+    Result.OptionDigits := FOptionDigits;
 
     // Copy errors to result
     if Context.HasErrors then
@@ -7633,6 +7643,24 @@ begin
       begin
         if Trim(Context.CurrentToken.Value) = '1' then FOptionBase := 1 else FOptionBase := 0;
         Context.Advance;                               // consume the base value
+      end;
+    end
+    // OPTION DIGITS n: how many significant digits PRINT shows for a float.
+    // ⭐ The COUNT is a display choice; the ROUNDING is not - the digits come
+    // from the exact binary value and are correctly rounded at every setting
+    // (IEEE 754-2019 sec.5.12.2), so raising this shows more of the same number
+    // rather than a differently-rounded one. 17 makes every distinct double
+    // print distinctly; beyond that the extra digits are the true ones, because
+    // a double's exact expansion terminates. See job/docs/PIANO_FLOAT_PRINT.md.
+    else if Assigned(Context.CurrentToken) and
+            ((Context.CurrentToken.TokenType = ttIdentifier) or Assigned(Context.CurrentToken.KeywordInfo)) and
+            (UpperCase(Context.CurrentToken.Value) = 'DIGITS') then
+    begin
+      Context.Advance;                                 // consume DIGITS
+      if Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttNumber) then
+      begin
+        FOptionDigits := StrToIntDef(Trim(Context.CurrentToken.Value), 0);
+        Context.Advance;                               // consume the digit count
       end;
     end
     // Every other OPTION is a compiler switch we accept and do not act on: DYNAMIC / STATIC (default

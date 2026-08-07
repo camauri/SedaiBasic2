@@ -5071,6 +5071,22 @@ begin
     FConsoleBehavior.ScreenCols := 80;
   end;
 
+  { "OPTION DIGITS n". Applied AFTER the dialect block above, and that order is
+    the point: the preset decides the number FORMAT (where the spaces go), the
+    option decides the PRECISION, and a program that asks for a precision must
+    not have it overwritten by a preset chosen for another reason.
+    ⭐ It sets both banks. Asking for n digits and getting 7 on a Single would be
+    the surprising reading - the request is about how much of the number to
+    show, and a Single simply runs out of true digits sooner (its exact
+    expansion terminates, so the rest come out as zeros and are stripped).
+    Whatever n is, the digits stay correctly rounded from the exact value:
+    the option moves the precision, never the standard. }
+  if Assigned(FConsoleBehavior) and Assigned(FProgram) and (FProgram.OptionDigits > 0) then
+  begin
+    FConsoleBehavior.FloatDigits := FProgram.OptionDigits;
+    FConsoleBehavior.SingleDigits := FProgram.OptionDigits;
+  end;
+
   // RESERVE the whole static array-id space up front. Static arrays have compile-time FArrays indices, but
   // a UDT array member gets its handle at RUNTIME by appending at Length(FArrays). Growing FArrays lazily
   // (only as each static array is DIM'd) let a member array claim an id still owed to a static one — most

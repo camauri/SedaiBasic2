@@ -1004,6 +1004,13 @@ type
     // Name of the source file this program was compiled from (ERMN). Set by the host.
     FModuleName: string;
     FQBLang: Boolean;      // source declared -lang qb ('#lang "qb"' / '$lang: "qb"): QB PRINT spacing
+    { "OPTION DIGITS n": how many significant digits a float shows in PRINT.
+      0 = the directive was absent, so the dialect default stands (16 for a
+      Double, 7 for a Single). It rides on the PROGRAM for the same reason
+      ModernMode does: the host reads it out of the parse and the VM applies it
+      before running. ⚠️ Not serialized into a .basc yet - a precompiled program
+      loses it and falls back to the default. }
+    FOptionDigits: Integer;
     // AOT support (plan B, PIANO_B1_AOT_DESIGN): SSA instruction ordinal (program order, counting
     // EVERY SSA instruction, labels/nops included) -> FINAL bytecode PC of the first instruction
     // emitted for it, or -1 when nothing was emitted or it was later removed by NOP compaction.
@@ -1028,6 +1035,7 @@ type
     property ModernMode: Boolean read FModernMode write FModernMode;
     property ModuleName: string read FModuleName write FModuleName;
     property QBLang: Boolean read FQBLang write FQBLang;
+    property OptionDigits: Integer read FOptionDigits write FOptionDigits;
     constructor Create;
     destructor Destroy; override;
     procedure AddInstruction(const Instr: TBytecodeInstruction);
@@ -1173,6 +1181,7 @@ begin
   FProcMapCount := 0;
   FModuleName := '';
   FQBLang := False;
+  FOptionDigits := 0;    // 0 = the dialect default stands
   FStringConstants := TStringList.Create;
   FStringConstants.CaseSensitive := True;  // IMPORTANT: "n" and "N" are different!
   FEntryPoint := 0;

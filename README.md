@@ -70,14 +70,22 @@ a double is `M × 2^E`, so the decimal expansion is an integer built by repeated
 no floating point and no approximation anywhere — and are rounded once, half-to-even.
 
 Real programs are unaffected: the divergence needs the extreme exponents that random bit patterns
-produce, and the 558-program regression corpus did not move a single baseline. Details, measurements
-and the reasoning are in [`job/docs/PIANO_FLOAT_PRINT.md`](job/docs/PIANO_FLOAT_PRINT.md).
+produce. The regression corpus did not move a single baseline, and the FreeBASIC example sweep
+returned exactly the counts it had before the change. Details, measurements and the reasoning are in
+[`job/docs/PIANO_FLOAT_PRINT.md`](job/docs/PIANO_FLOAT_PRINT.md).
 
-The engine already carries the digit count as a setting (`FloatDigits` / `SingleDigits`, defaulting to
-the dialect's 16 and 7), and the digits are correctly rounded at *any* count — raising it shows more
-of the same number rather than a differently-rounded one, and 17 makes every distinct double print
-distinctly. **`OPTION DIGITS n` — the source-level way to set it — is designed and not yet wired**;
-until it is, the count is fixed at the defaults.
+`OPTION DIGITS n` sets how many significant digits `PRINT` shows for a float (default: the dialect's
+16 for a `Double`, 7 for a `Single`). Because the digits come from the exact value and are rounded
+once, the count is a display choice and the rounding is not — raising it shows *more of the same
+number* rather than a differently-rounded one:
+
+```basic
+Option Digits 17 : Print 0.1     '  0.10000000000000001   the round-trip form
+Option Digits 25 : Print 0.1     '  0.1000000000000000055511151   the exact binary value
+```
+
+Past 17 those digits are the true ones, not padding: a double's exact expansion terminates, so
+`Print 0.5` at 25 digits is still `0.5`.
 
 ### Real-world FreeBASIC compatibility
 

@@ -1607,6 +1607,9 @@ begin
         // Record the source dialect on the program so the VM can pick dialect-aware behaviour
         // (e.g. filesystem error codes: FreeBASIC vs Commodore). Mirrors SSAGen.ModernMode above.
         BytecodeProgram.ModernMode := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
+        // "OPTION DIGITS n" rides out on the PARSE RESULT (the parser itself is
+        // long gone) and the VM applies it to the console behavior before running.
+        BytecodeProgram.OptionDigits := ParserResult.OptionDigits;
         // ERMN reports the module an error came from. fbc bakes the source PATH as passed on
         // its command line (native separators) into the executable and returns that - so do we
         // (an fbc-compiled erfn.bas prints the full compile-time path, verified live). Assert's
