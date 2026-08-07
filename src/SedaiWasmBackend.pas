@@ -2194,7 +2194,11 @@ begin
     ssaPrint, ssaPrintLn:
       begin
         LoadReg(B, Instr.Src1);
-        if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = 1) then
+        { A SINGLE shows 7 digits by DEFAULT, but "OPTION DIGITS n" overrides
+          both banks - which is what the interpreter does, and printing a Single
+          at 7 where the interpreter shows 25 is a divergence the sweep caught. }
+        if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = 1) and
+           (FFltDigits = 16) then
           B.I32Const(7)
         else
           B.I32Const(FFltDigits);
@@ -2384,6 +2388,7 @@ begin
     ssaRecordTypeId:
       begin
         LoadReg(B, Instr.Src1);
+        B.Op(wopI32WrapI64);        // the handle travels as i64; an address is i32
         B.OpMem(wopI32Load, 2, 0);
         B.Op(wopI64ExtendI32S);
         StoreReg(B, Instr.Dest);
@@ -2837,7 +2842,27 @@ begin
     ssaMathSqr: Un(wopF64Sqrt);
     ssaMathAbs: Un(wopF64Abs);
     ssaMathInt: Un(wopF64Floor);
-    ssaMathFix: Un(wopF64Trunc);
+    { ⭐ Fix(-0.0) is +0, not -0 - ASKED of fbc rather than reasoned about, and
+      sb agrees with it. The interpreter loses the sign because its Fix goes
+      through an integer; f64.trunc keeps it, so the sign has to be dropped
+      here. Adding +0.0 is exactly that rule and nothing else: IEEE says
+      (-0) + (+0) = +0, and x + 0 is x for every other value.
+      ⚠️ And the rule is NARROWER than it first looks - my first attempt got it
+      wrong by being too broad. FixDouble reads:
+          Result := Int(X);
+          if (Result = 0) and (X <> 0) and (sign bit of X) then Result := -Result
+      so Fix(-0.5) IS -0 (the sign is put back deliberately) while Fix(-0.0) is
+      +0, because "X <> 0" is false for a negative zero. ⇒ only a ZERO INPUT
+      needs its sign dropped; f64.trunc is already right everywhere else.
+      ⚠️ Int(-0.0) keeps the sign, so none of this applies to it. }
+    ssaMathFix:
+      begin
+        B.F64Const(0);
+        LoadReg(B, Instr.Src1); B.Op(wopF64Trunc);
+        LoadReg(B, Instr.Src1); B.F64Const(0); B.Op(wopF64Eq);
+        B.Op(wopSelect);
+        StoreReg(B, Instr.Dest);
+      end;
 
     ssaXferStoreInt, ssaXferStoreFloat, ssaXferStoreString:
       begin
