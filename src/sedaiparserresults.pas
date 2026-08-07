@@ -98,9 +98,18 @@ type
     FNodesCreated: Integer;
     FMaxRecursionDepth: Integer;
 
+    { "OPTION DIGITS n" seen while parsing; 0 when the directive was absent.
+      It rides on the RESULT rather than on the parser because the parser is
+      freed as soon as parsing ends, and this value is needed later - it
+      configures the RUNTIME (how many significant digits a float prints), not
+      the tree. }
+    FOptionDigits: Integer;
+
   public
     constructor Create;
     destructor Destroy; override;
+
+    property OptionDigits: Integer read FOptionDigits write FOptionDigits;
 
     // Error management (essential only)
     procedure AddError(Error: TParserError); overload;
@@ -254,6 +263,7 @@ begin
   FSourceFile := '';
   FNodesCreated := 0;
   FMaxRecursionDepth := 0;
+  FOptionDigits := 0;      // 0 = the directive was not used
 end;
 
 destructor TParsingResult.Destroy;
