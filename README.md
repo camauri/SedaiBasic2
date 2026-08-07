@@ -34,19 +34,22 @@
 
 SedaiBasic2 began as a reimplementation of Commodore BASIC v7 and is now a language in its own right, built on a full optimizing compiler pipeline that targets a fast register-based bytecode virtual machine. It carries **two dialects** in the same engine, and they are not the same kind of thing:
 
-- **CLASSIC** — line-numbered Commodore BASIC v7 (**201 / 209** core commands, 96%). Here the goal
-  really is fidelity: v7 is a fixed, finished language and matching it is the whole point.
-- **MODERN** — **SedaiBasic's own dialect**, line-number-free. It is broadly FreeBASIC-compatible and
-  that compatibility is measured (**566 / 645** of FreeBASIC's keywords, and 60+ unmodified Rosetta
-  Code programs run as-is), but it is a *property of the language, not its definition*: MODERN also
-  has commands FreeBASIC does not, and where FreeBASIC is demonstrably wrong it does not follow it.
+- **CLASSIC** — line-numbered, from Commodore BASIC v7 (**201 / 209** core commands, 96%). It keeps
+  v7's *language*, not v7's machine: this does not run on a C64/C128 and has none of its peripherals,
+  so the palette is 256 RGBA entries where v7 had sixteen fixed colours, sprites go to 256×256 and
+  full colour against the C128's fixed 24×21, there are twelve video modes plus a dynamic one, and
+  the audio is our own engine — in the reSID lineage, well past the chip it descends from.
+- **MODERN** — line-number-free, from FreeBASIC. Compatibility is measured (**566 / 645** of
+  FreeBASIC's keywords; 60+ unmodified Rosetta Code programs run as-is) and it is worth a great deal,
+  but it is a *property, not a definition*: MODERN has commands FreeBASIC does not, and departs from
+  it where FreeBASIC is demonstrably wrong.
 
-> **This project is not a FreeBASIC clone on a virtual machine.** FreeBASIC is the reference MODERN
-> grew from and the yardstick its compatibility is measured against — which is worth a great deal,
-> since it means real FreeBASIC code runs unchanged. But MODERN is ours: it gains keywords FreeBASIC
-> has never had, and it departs from FreeBASIC where the standards say FreeBASIC is mistaken (see
-> [numeric output](#numeric-output-follows-the-standard-not-the-reference) — a clone could not make
-> that choice).
+> **Neither dialect is a clone, and the two are not the same kind of thing.** CLASSIC keeps a
+> language and replaces the machine — necessarily, since the machine is gone. MODERN keeps a language
+> and extends it. Each has a reference it grew from, and a compatibility figure measures how much of
+> that reference's code runs here — never how complete the language is. The clearest illustration is
+> [numeric output](#numeric-output-follows-the-standard-not-the-reference): where FreeBASIC's float
+> rounding disagrees with IEEE 754-2019, we follow the standard. A clone could not make that choice.
 
 ### Language features
 
