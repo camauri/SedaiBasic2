@@ -2040,10 +2040,13 @@ begin
         NoteSlot(r, RT, Slot);      // this region needs a local for that slot
         if Instr.OpCode in [ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString] then
         begin
-          // a load of the RESULT slot belongs to the caller, a load of any other
-          // slot is the callee reading a parameter
-          if (Slot = WASM_XFER_RESULT_SLOT) and (Target >= 0) then
-            FResultBank[Target] := Ord(RT);
+          { ⛔ The RESULT load is NOT handled here, and that was a real defect:
+            this loop runs BACKWARDS so that a staged store finds the call that
+            FOLLOWS it - but a result load sits AFTER its call, so going
+            backwards it is seen BEFORE, and "Target" is some later call or
+            none. A virtual-dispatch thunk came out declared as returning
+            NOTHING, its caller stored nothing, and the program printed 0 for an
+            area of 50. The forward pass below owns this question. }
           // A non-result LOAD says nothing about this region's arity. SUB
           // inlining leaves the callee's loads behind in its caller, so reading
           // them as "my parameters" gave Hypot(Double, Double) an integer first
@@ -2073,6 +2076,31 @@ begin
             list rather than being bought back with a false refusal. }
         end;
       end;
+    end;
+  end;
+
+  { A SECOND pass, FORWARDS, for the one question the backward pass cannot
+    answer: which function a RESULT load belongs to. A result slot is loaded
+    after the call that produced it, so the owner is the last call SEEN, not the
+    next one - the opposite direction from argument staging, which is why the
+    two cannot share a walk. }
+  for i := 0 to FProg.Blocks.Count - 1 do
+  begin
+    Blk := FProg.Blocks[i];
+    Target := -1;
+    for j := 0 to Blk.Instructions.Count - 1 do
+    begin
+      Instr := TSSAInstruction(Blk.Instructions[j]);
+      if (Instr.OpCode = ssaCallSub) and (Instr.Dest.Kind = svkLabel) then
+        Target := FRegionOf[BlockOfLabel(Instr.Dest.LabelName)]
+      else if OpIn(Instr.OpCode, [ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString]) and
+              XferBank(Instr.OpCode, RT) and SlotOf(Instr, Slot) and
+              (Slot = WASM_XFER_RESULT_SLOT) and (Target >= 0) then
+        { The caller reads the result of the call it just made, so that call's
+          region returns this bank. It is the CALLER that knows - a forwarding
+          thunk never stores the result slot itself, so nothing inside it says
+          what it returns. }
+        FResultBank[Target] := Ord(RT);
     end;
   end;
 
