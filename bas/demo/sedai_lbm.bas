@@ -25,9 +25,17 @@
 ''  exact rather than approximate - which matters because the most-looked-at part
 ''  of this image is the boundary of a letter.
 ''
-''  Measured, same grid and same window: Stam 70.5 ms/frame, LBM 23.5 ms.
-''  The algorithm bought the resolution the physics needed. See
-''  job/docs/PIANO_DEMO.md for the full comparison and the frame budget.
+''  Measured on the PROBES, same grid and same window, ONE substep and no dye
+''  lattice: Stam 70.5 ms/frame, LBM 23.5 ms. The algorithm bought the resolution
+''  the physics needed, and that A/B still stands.
+''  ⛔ Those are NOT this program's frame times. It runs NSTEPS = 30 substeps and
+''  carries a second D2Q5 lattice for the dye, both added after that comparison.
+''  Re-measured 7 Aug 2026 on an i7-3630QM, --aot, headless: 320x180 416 ms/frame
+''  (356 solver + 59 draw), 640x360 into a 1920x1080 buffer 2199 ms/frame
+''  (1973 + 222). See job/docs/PIANO_DEMO.md for the traffic and bandwidth that
+''  explain them - and for why real time was never on offer here: one frame at
+''  640x360 moves 4.98 GB of memory, and 30 fps would want 149 GB/s against this
+''  machine's measured ceiling of 18.
 ''
 ''  ⚠️ The price: LBM is NOT unconditionally stable. If the relaxation time TAU
 ''  approaches 0.5, or the speed approaches the lattice sound speed, it diverges
@@ -45,7 +53,10 @@
 ''
 ''  ⭐ Recording drops the real-time constraint, so it uses a FINER grid than the
 ''  live mode can afford: the letters go from 9 to 19 cells of stroke and the
-''  wake becomes much sharper. A 30-second video takes about a minute to make.
+''  wake becomes much sharper.
+''  ⚠️ It is not a minute's work, and the note that said so predates NSTEPS = 30
+''  and the dye lattice: MEASURED 2.20 s per frame at 640x360, so 15 s of video
+''  takes about 16.5 minutes and 30 s about 33.
 ''
 ''  ⭐ And it costs almost nothing: the renderer draws one SOLID BOX per cell, so
 ''  writing frames at simulation resolution and letting ffmpeg upscale with
