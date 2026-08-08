@@ -133,6 +133,28 @@ type
     FUsesHalt: Boolean;
     FHaltFlag: LongWord;
 
+    { --- array parameters: BIND / BIND APPLY / UNBIND ---------------------
+      Passing an array aliases the callee's placeholder descriptor to the
+      caller's array for the duration of the call, and restores it after. The
+      interpreter keeps a LIFO save-stack for it; here the saved descriptor and
+      the snapshot live in WASM LOCALS instead.
+      ⭐ That is not a shortcut, it is the recursion answer: locals are
+      per-activation, so a recursive SUB taking an array (merge sort passing
+      a() and b() the other way round) gets a fresh save for free, with no
+      stack to size, no ceiling to trap on, and nothing to allocate.
+      The pairing is resolved at EMIT time - bind and unbind are emitted in the
+      order the SSA laid them down - so this stack holds compile-time
+      bookkeeping, not runtime state. }
+    FBindStack: array of record
+      ParamIdx, ArgIdx: Integer;
+      SavedLocal, SnapLocal: LongWord;   // first of Words consecutive i32 locals
+      Words: Integer;
+    end;
+    FBindTop: Integer;
+    FBindSeq: Integer;                   // which bind of this region is next
+    FBindLocal: array of LongWord;       // per bind, in emission order: saved base
+    FBindWords: array of Integer;
+
     // --- graphics -------------------------------------------------------
     FUsesGfx: Boolean;
     FScrW, FScrH: LongWord;       // WASM globals holding the screen geometry
@@ -380,7 +402,8 @@ begin
         ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr, ssaIntToString,
         ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
           FUsesStr := True;
-        ssaArrayDim, ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound:
+        ssaArrayDim, ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound,
+        ssaArrayBind, ssaArrayBindApply, ssaArrayUnbind:
           FUsesArr := True;
         ssaRecordNew:
           FUsesRec := True;
@@ -2495,6 +2518,7 @@ function TWasmBackend.EmitInstr(B: TWasmBuf; Instr: TSSAInstruction; R: Integer)
 
 var
   Slot, d, Bytes, NStr, StrBase: Integer;
+  n, k: Integer;                  // the array-bind bookkeeping
   Enc: Int64;
   Ofs: LongWord;
   RT: TSSARegisterType;
@@ -2913,6 +2937,115 @@ begin
         LoadReg(B, Instr.Src2);
         LoadReg(B, Instr.Dest);
         B.Call(FArrStore[Instr.Dest.RegType]);
+      end;
+
+    { ⭐ BINDING AN ARRAY PARAMETER IS A DESCRIPTOR SWAP, and nothing is copied:
+      the placeholder's descriptor is made to name the caller's data, so the
+      callee writes THROUGH it and the caller sees the writes - which is what
+      BYREF means. The saved descriptor and the snapshot go into LOCALS, so a
+      recursive procedure gets a fresh save per activation for free.
+      ⛔ Two phases, and the reason is real: a batch that SWAPS arrays
+      (merge sort calling proc(b(), a()) where arg and param slots coincide)
+      has to read every argument BEFORE any of them is overwritten. So bind
+      snapshots, and bindApply commits. }
+    ssaArrayBind:
+      begin
+        if (Instr.Src1.Kind <> svkArrayRef) or (Instr.Src3.Kind <> svkConstInt) then
+          Exit(Fail('ssaArrayBind without an array reference and a constant argument'));
+        d := Instr.Src1.ArrayIndex;
+        n := Integer(Instr.Src3.ConstInt);
+        if (n < 0) or (n >= FProg.GetArrayCount) then
+          Exit(Fail('ssaArrayBind names an argument array that was never declared'));
+        { ⛔ A descriptor is 16 + 8*dim bytes, so binding across DIFFERENT
+          dimension counts would copy the wrong number of words - reading past
+          one descriptor and writing past the other, which corrupts the array
+          that happens to sit next in memory. Refuse instead: it is decidable
+          right here, both indices being constants. }
+        if FProg.GetArray(d).DimCount <> FProg.GetArray(n).DimCount then
+          Exit(Fail(Format('array parameter "%s" has %d dimension(s) but the argument "%s" has %d',
+                           [FProg.GetArray(d).Name, FProg.GetArray(d).DimCount,
+                            FProg.GetArray(n).Name, FProg.GetArray(n).DimCount])));
+        if FBindSeq > High(FBindLocal) then
+          Exit(Fail('more array binds emitted than the pre-pass counted'));
+        SetLength(FBindStack, FBindTop + 1);
+        FBindStack[FBindTop].ParamIdx := d;
+        FBindStack[FBindTop].ArgIdx := n;
+        FBindStack[FBindTop].Words := FBindWords[FBindSeq];
+        FBindStack[FBindTop].SavedLocal := FBindLocal[FBindSeq];
+        FBindStack[FBindTop].SnapLocal := FBindLocal[FBindSeq] +
+                                          LongWord(FBindWords[FBindSeq]);
+        for k := 0 to FBindStack[FBindTop].Words - 1 do
+        begin
+          B.I32Const(LongInt(FArrDescOf[d] + LongWord(4 * k)));
+          B.OpMem(wopI32Load, 2, 0);
+          B.LocalSet(FBindStack[FBindTop].SavedLocal + LongWord(k));
+          B.I32Const(LongInt(FArrDescOf[n] + LongWord(4 * k)));
+          B.OpMem(wopI32Load, 2, 0);
+          B.LocalSet(FBindStack[FBindTop].SnapLocal + LongWord(k));
+        end;
+        Inc(FBindTop);
+        Inc(FBindSeq);
+      end;
+
+    ssaArrayBindApply:
+      begin
+        if Instr.Src3.Kind <> svkConstInt then
+          Exit(Fail('ssaArrayBindApply without a constant count'));
+        n := Integer(Instr.Src3.ConstInt);
+        if (n < 0) or (n > FBindTop) then
+          Exit(Fail('ssaArrayBindApply commits more binds than are pending'));
+        for d := FBindTop - n to FBindTop - 1 do
+          for k := 0 to FBindStack[d].Words - 1 do
+          begin
+            B.I32Const(LongInt(FArrDescOf[FBindStack[d].ParamIdx] + LongWord(4 * k)));
+            B.LocalGet(FBindStack[d].SnapLocal + LongWord(k));
+            B.OpMem(wopI32Store, 2, 0);
+          end;
+      end;
+
+    ssaArrayUnbind:
+      begin
+        if Instr.Src1.Kind <> svkArrayRef then
+          Exit(Fail('ssaArrayUnbind without an array reference'));
+        if FBindTop = 0 then
+          Exit(Fail('ssaArrayUnbind with no matching bind'));
+        Dec(FBindTop);
+        if FBindStack[FBindTop].ParamIdx <> Instr.Src1.ArrayIndex then
+          Exit(Fail('ssaArrayUnbind does not name the array the last bind took'));
+        d := FBindStack[FBindTop].ParamIdx;
+        n := FBindStack[FBindTop].ArgIdx;
+        { ⚠️ Copy the callee's descriptor BACK only when a REDIM reallocated the
+          storage - recognised by the base no longer being the one snapshotted.
+          Without a resize the caller already sees every write through the
+          shared data, and copying unconditionally is WRONG: in deep recursion
+          the argument slot may have been rebound at an outer level, and an
+          unconditional copy corrupts it. Exactly what the interpreter does.
+          ⛔ AND NOTHING EXERCISES IT YET: the only way to reallocate a bound
+          parameter is REDIM, and ssaArrayRedim is still refused - so this arm
+          is the interpreter's rule transcribed, not a tested one. Whoever
+          covers REDIM tests this at the same time. }
+        if n <> d then
+        begin
+          B.I32Const(LongInt(FArrDescOf[d]));
+          B.OpMem(wopI32Load, 2, 0);
+          B.LocalGet(FBindStack[FBindTop].SnapLocal);
+          B.Op(wopI32Ne);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            for k := 0 to FBindStack[FBindTop].Words - 1 do
+            begin
+              B.I32Const(LongInt(FArrDescOf[n] + LongWord(4 * k)));
+              B.I32Const(LongInt(FArrDescOf[d] + LongWord(4 * k)));
+              B.OpMem(wopI32Load, 2, 0);
+              B.OpMem(wopI32Store, 2, 0);
+            end;
+          B.EndOp;
+        end;
+        for k := 0 to FBindStack[FBindTop].Words - 1 do
+        begin
+          B.I32Const(LongInt(FArrDescOf[d] + LongWord(4 * k)));
+          B.LocalGet(FBindStack[FBindTop].SavedLocal + LongWord(k));
+          B.OpMem(wopI32Store, 2, 0);
+        end;
       end;
 
     ssaArrayLBound, ssaArrayUBound:
@@ -3377,6 +3510,37 @@ begin
       Inc(k);
     end;
   end;
+  { One save area and one snapshot per ssaArrayBind THIS REGION contains, sized
+    from the placeholder's own dimension count, laid out in the order the binds
+    are emitted. A pre-pass, because the local list has to be complete before
+    the first byte of the body is written. }
+  SetLength(FBindLocal, 0);
+  SetLength(FBindWords, 0);
+  for i := First to Last do
+  begin
+    Blk := FProg.Blocks[i];
+    for j := 0 to Blk.Instructions.Count - 1 do
+    begin
+      Instr := TSSAInstruction(Blk.Instructions[j]);
+      if Instr.OpCode <> ssaArrayBind then Continue;
+      if (Instr.Src1.Kind <> svkArrayRef) or (Instr.Src1.ArrayIndex < 0) or
+         (Instr.Src1.ArrayIndex >= FProg.GetArrayCount) then
+        Exit(Fail('ssaArrayBind without a valid array reference'));
+      N := (16 + 8 * FProg.GetArray(Instr.Src1.ArrayIndex).DimCount) div 4;
+      SetLength(FBindLocal, Length(FBindLocal) + 1);
+      SetLength(FBindWords, Length(FBindWords) + 1);
+      FBindLocal[High(FBindLocal)] := LongWord(k);
+      FBindWords[High(FBindWords)] := N;
+      for Target := 0 to 2 * N - 1 do          // saved, then snapshot
+      begin
+        SetLength(Locals, Length(Locals) + 1);
+        Locals[High(Locals)] := wvtI32;
+        Inc(k);
+      end;
+    end;
+  end;
+  N := Last - First + 1;                       // restored: the pre-pass reused it
+
   // Every register this region touches and that is not a global gets a local
   // HERE - a register two regions use for unrelated values needs its own local
   // in each, which is the whole point of not making it a global.
@@ -3394,6 +3558,9 @@ begin
       end;
     end;
   FCurRegion := R;
+  FBindTop := 0;
+  FBindSeq := 0;
+  SetLength(FBindStack, 0);
 
   D := TWasmDispatch.Create(N, FStateLocal);
   Body := TWasmBuf.Create;
