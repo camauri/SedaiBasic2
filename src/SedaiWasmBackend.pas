@@ -174,6 +174,9 @@ type
     FPrintStrFunc, FStrFromIntFunc: LongWord;
     FStrFillFunc, FStrCaseFunc, FStrInstrFunc: LongWord;
     FPuDigFunc, FPuFmtFunc: LongWord;   // PRINT USING: digits, then the field
+    FUsesGfxPrim: Boolean;              // the program DRAWS (LINE / PSET / POINT)
+    FGfxPsetFunc, FGfxLineFunc: LongWord;
+    FPenX, FPenY: LongWord;             // globals: the current graphics point
     FUsesPU: Boolean;              // the program has a PRINT USING
 
     // --- arrays ---------------------------------------------------------
@@ -230,10 +233,12 @@ type
     procedure EmitRawAddr(B: TWasmBuf);
     procedure EmitPrintHelpers;
     procedure EmitHeapHelpers;
+    procedure EmitGfxHelpers;
     procedure EmitStringHelpers;
     function EmitRegion(R: Integer): Boolean;
     function EmitInstr(B: TWasmBuf; Instr: TSSAInstruction; R: Integer): Boolean;
     procedure LoadReg(B: TWasmBuf; const V: TSSAValue);
+    function LoadInt32(B: TWasmBuf; const V: TSSAValue): Boolean;
     procedure StoreReg(B: TWasmBuf; const V: TSSAValue);
     procedure BoolToBasic(B: TWasmBuf);
     function OpName(Op: TSSAOpCode): string;
@@ -405,6 +410,7 @@ var
 begin
   FUsesPrint := False;
   FUsesPU := False;
+  FUsesGfxPrim := False;
   FUsesClock := False;
   FUsesTrig := False;
   FUsesGfx := False;
@@ -430,6 +436,8 @@ begin
         ssaRawLoadInt, ssaRawStoreInt, ssaRawLoadFloat, ssaRawStoreFloat,
         ssaRawClear, ssaRawMemCopy, ssaRawMemMove:
           FUsesGfx := True;
+        ssaGfxLine, ssaGfxPset, ssaGfxPoint:
+          begin FUsesGfx := True; FUsesGfxPrim := True; end;
         { ⚠️ Gfx here means "raw memory exists", not "the program draws": the
           raw pointer decoder needs the framebuffer base to select a region, and
           FUsesHeap is derived from this below - which is what actually gives
@@ -528,6 +536,19 @@ var
 
 begin
   SetLength(Result, 0);
+  { ⭐ The GRAPHICS statements use PhiSources as plain extra operand slots -
+    LINE puts y2, the colour and the shape flag there because Src1..Src3 are
+    already taken by x1, y1 and x2. They are real reads, so every walk has to
+    see them or the registers holding them look dead. }
+  if OpIn(Instr.OpCode, [ssaGfxLine, ssaGfxPset, ssaGfxPoint, ssaGraphicRGBA]) then
+  begin
+    for d := 0 to High(Instr.PhiSources) do
+    begin
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := Instr.PhiSources[d].Value;
+    end;
+    Exit;
+  end;
   if Instr.OpCode <> ssaArrayDim then Exit;
   if Instr.Src1.Kind <> svkArrayRef then Exit;
   if (Instr.Src1.ArrayIndex < 0) or (Instr.Src1.ArrayIndex >= FProg.GetArrayCount) then Exit;
@@ -759,6 +780,147 @@ end;
      dialect-dependent rules, ASC of an empty string. They are what the
      differential compares. }
 
+procedure TWasmBackend.EmitGfxHelpers;
+var
+  B: TWasmBuf;
+  TPset, TLine: LongWord;
+begin
+  TPset := FModule.TypeIndex([wvtI32, wvtI32, wvtI32], []);
+  TLine := FModule.TypeIndex([wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32], []);
+
+  { gfxPset(x, y, colour): one pixel, CLIPPED.
+    ⚠️ The colour goes into the framebuffer exactly as given - measured, not
+    assumed: "Line ..., &HFF3366CC" leaves FF3366CC in the word. There is no
+    palette lookup on this path and no channel swapping.
+    ⛔ Clipping is not politeness: linear memory has no guard page, so a pixel
+    off the right edge would silently land on the next ROW, and one off the
+    bottom would corrupt whatever the allocator handed out after the screen. }
+    B := TWasmBuf.Create;
+    try
+      B.LocalGet(0); B.I32Const(0); B.Op(wopI32GeS);
+      B.LocalGet(1); B.I32Const(0); B.Op(wopI32GeS); B.Op(wopI32And);
+      B.LocalGet(0); B.GlobalGet(FScrW); B.Op(wopI32LtS); B.Op(wopI32And);
+      B.LocalGet(1); B.GlobalGet(FScrH); B.Op(wopI32LtS); B.Op(wopI32And);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.GlobalGet(FFbBase);
+        B.LocalGet(1); B.GlobalGet(FScrW); B.Op(wopI32Mul);
+        B.LocalGet(0); B.Op(wopI32Add);
+        B.I32Const(4); B.Op(wopI32Mul);
+        B.Op(wopI32Add);
+        B.LocalGet(2);
+        B.OpMem(wopI32Store, 2, 0);
+      B.EndOp;
+      FModule.AddFunction(TPset, [], B);
+    finally
+      B.Free;
+    end;
+
+    { gfxLine(x1, y1, x2, y2, colour, flag): flag 0 = line, 1 = box outline,
+      2 = filled box. Bresenham, in the integer-only form the interpreter's
+      primitive uses - the same algorithm, so the same pixels.
+      ⭐ It draws THROUGH gfxPset, so clipping is decided in exactly one place;
+      a line running off-screen is then clipped per pixel rather than being
+      rejected whole, which is what the native side does. }
+    B := TWasmBuf.Create;
+    try
+      // locals: 6=dx 7=dy 8=sx 9=sy 10=err 11=e2 12=i
+      B.LocalGet(5); B.I32Const(2); B.Op(wopI32Eq);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        // filled box: scan rows between the two corners, in either order
+        B.LocalGet(1); B.LocalSet(6);
+        B.LocalGet(3); B.LocalSet(7);
+        B.LocalGet(6); B.LocalGet(7); B.Op(wopI32GtS);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(6); B.LocalSet(8);
+          B.LocalGet(7); B.LocalSet(6);
+          B.LocalGet(8); B.LocalSet(7);
+        B.EndOp;
+        B.LocalGet(0); B.LocalSet(8);
+        B.LocalGet(2); B.LocalSet(9);
+        B.LocalGet(8); B.LocalGet(9); B.Op(wopI32GtS);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(8); B.LocalSet(10);
+          B.LocalGet(9); B.LocalSet(8);
+          B.LocalGet(10); B.LocalSet(9);
+        B.EndOp;
+        B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+          B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(6); B.LocalGet(7); B.Op(wopI32GtS); B.BrIf(1);
+            B.LocalGet(8); B.LocalSet(12);
+            B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+              B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+                B.LocalGet(12); B.LocalGet(9); B.Op(wopI32GtS); B.BrIf(1);
+                B.LocalGet(12); B.LocalGet(6); B.LocalGet(4); B.Call(FGfxPsetFunc);
+                B.LocalGet(12); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(12);
+                B.Br(0);
+              B.EndOp;
+            B.EndOp;
+            B.LocalGet(6); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(6);
+            B.Br(0);
+          B.EndOp;
+        B.EndOp;
+        B.Op(wopReturn);
+      B.EndOp;
+
+      B.LocalGet(5); B.I32Const(1); B.Op(wopI32Eq);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        // box outline: four edges, drawn as four straight lines
+        B.LocalGet(0); B.LocalGet(1); B.LocalGet(2); B.LocalGet(1);
+          B.LocalGet(4); B.I32Const(0); B.Call(FGfxLineFunc);
+        B.LocalGet(0); B.LocalGet(3); B.LocalGet(2); B.LocalGet(3);
+          B.LocalGet(4); B.I32Const(0); B.Call(FGfxLineFunc);
+        B.LocalGet(0); B.LocalGet(1); B.LocalGet(0); B.LocalGet(3);
+          B.LocalGet(4); B.I32Const(0); B.Call(FGfxLineFunc);
+        B.LocalGet(2); B.LocalGet(1); B.LocalGet(2); B.LocalGet(3);
+          B.LocalGet(4); B.I32Const(0); B.Call(FGfxLineFunc);
+        B.Op(wopReturn);
+      B.EndOp;
+
+      // Bresenham
+      B.LocalGet(2); B.LocalGet(0); B.Op(wopI32Sub); B.LocalSet(6);
+      B.LocalGet(6); B.I32Const(0); B.Op(wopI32LtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(0); B.LocalGet(6); B.Op(wopI32Sub); B.LocalSet(6);
+        B.I32Const(-1); B.LocalSet(8);
+      B.Op(wopElse);
+        B.I32Const(1); B.LocalSet(8);
+      B.EndOp;
+      B.LocalGet(3); B.LocalGet(1); B.Op(wopI32Sub); B.LocalSet(7);
+      B.LocalGet(7); B.I32Const(0); B.Op(wopI32LtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(0); B.LocalGet(7); B.Op(wopI32Sub); B.LocalSet(7);
+        B.I32Const(-1); B.LocalSet(9);
+      B.Op(wopElse);
+        B.I32Const(1); B.LocalSet(9);
+      B.EndOp;
+      B.I32Const(0); B.LocalGet(7); B.Op(wopI32Sub); B.LocalSet(7);   // dy is negative
+      B.LocalGet(6); B.LocalGet(7); B.Op(wopI32Add); B.LocalSet(10);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(0); B.LocalGet(1); B.LocalGet(4); B.Call(FGfxPsetFunc);
+          B.LocalGet(0); B.LocalGet(2); B.Op(wopI32Eq);
+          B.LocalGet(1); B.LocalGet(3); B.Op(wopI32Eq); B.Op(wopI32And); B.BrIf(1);
+          B.LocalGet(10); B.I32Const(2); B.Op(wopI32Mul); B.LocalSet(11);
+          B.LocalGet(11); B.LocalGet(7); B.Op(wopI32GeS);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(10); B.LocalGet(7); B.Op(wopI32Add); B.LocalSet(10);
+            B.LocalGet(0); B.LocalGet(8); B.Op(wopI32Add); B.LocalSet(0);
+          B.EndOp;
+          B.LocalGet(11); B.LocalGet(6); B.Op(wopI32LeS);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(10); B.LocalGet(6); B.Op(wopI32Add); B.LocalSet(10);
+            B.LocalGet(1); B.LocalGet(9); B.Op(wopI32Add); B.LocalSet(1);
+          B.EndOp;
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+      FModule.AddFunction(TLine, [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32,
+                                  wvtI32, wvtI32], B);
+    finally
+      B.Free;
+    end;
+end;
+
 procedure TWasmBackend.EmitStringHelpers;
 var
   B: TWasmBuf;
@@ -780,6 +942,7 @@ begin
   TInstr  := FModule.TypeIndex([wvtI32, wvtI32, wvtI64], [wvtI64]);
   TPuDig  := FModule.TypeIndex([wvtF64, wvtI32, wvtI64, wvtI32], []);
   TPuFmt  := FModule.TypeIndex([wvtI32, wvtF64, wvtI32, wvtI64], [wvtI32]);
+
 
   { strNew(len: i32) -> i32: an uninitialised header of that length, or the
     canonical empty string when the length is zero. }
@@ -3328,6 +3491,32 @@ begin
                   else B.LocalGet(FLocalIdx[FCurRegion][f]);
 end;
 
+function TWasmBackend.LoadInt32(B: TWasmBuf; const V: TSSAValue): Boolean;
+{ An i32 from an operand that may be a REGISTER or an immediate CONSTANT.
+  ⛔ The graphics statements are where this matters: "Line (0,0)-(3,3)" leaves
+  its coordinates as constants, and LoadReg assumes a register - it read some
+  unrelated local, and the module failed to VALIDATE because that local had the
+  wrong type. Which is the good outcome: a local of the right type by accident
+  would have drawn somewhere else in silence. }
+begin
+  Result := True;
+  case V.Kind of
+    svkConstInt:
+      B.I32Const(LongInt(V.ConstInt));
+    svkRegister:
+      begin
+        LoadReg(B, V);
+        case V.RegType of
+          srtInt:    B.Op(wopI32WrapI64);
+          srtFloat:  B.TruncSat(wopfcI32TruncSatF64S);   // as the VM truncates
+          srtString: Exit(Fail('a graphics operand came from the string bank'));
+        end;
+      end;
+  else
+    Exit(Fail('a graphics operand is neither a register nor a constant'));
+  end;
+end;
+
 procedure TWasmBackend.StoreReg(B: TWasmBuf; const V: TSSAValue);
 var
   f: Integer;
@@ -3375,6 +3564,7 @@ function TWasmBackend.EmitInstr(B: TWasmBuf; Instr: TSSAInstruction; R: Integer)
 var
   Slot, d, Bytes, NStr, StrBase: Integer;
   n, k: Integer;                  // the array-bind bookkeeping
+  Extras: TSSAValueArray;         // operands past Src1..Src3 (graphics carries them there)
   Enc: Int64;
   Ofs: LongWord;
   RT: TSSARegisterType;
@@ -4483,6 +4673,104 @@ begin
       end;
 
     ssaMathSqr: Un(wopF64Sqrt);
+    { LINE (x1,y1)-(x2,y2), colour [,B|BF]. ⚠️ x2, the colour and the flag do
+      NOT travel in Src: they are PhiSources, which is how the SSA carries
+      operands past the three slots - so this reads them from ExtraOperands, and
+      a walk that only looked at Src1..Src3 would see a line with no colour.
+      Flag: 0 = line, 1 = box outline, 2 = filled box, +4 = "no start given",
+      which means the current graphics point. }
+    ssaGfxLine:
+      begin
+        Extras := ExtraOperands(Instr);
+        if Length(Extras) < 3 then
+          Exit(Fail('ssaGfxLine without its y2, colour and flag operands'));
+        if Extras[2].Kind <> svkConstInt then
+          Exit(Fail('ssaGfxLine without a constant shape flag'));
+        n := Integer(Extras[2].ConstInt);
+        if (n and 4) <> 0 then
+        begin
+          B.GlobalGet(FPenX);
+          B.GlobalGet(FPenY);
+        end
+        else
+        begin
+          if not LoadInt32(B, Instr.Src1) then Exit(False);
+          if not LoadInt32(B, Instr.Src2) then Exit(False);
+        end;
+        if not LoadInt32(B, Instr.Src3) then Exit(False);
+        if not LoadInt32(B, Extras[0]) then Exit(False);
+        if not LoadInt32(B, Extras[1]) then Exit(False);
+        B.I32Const(n and 3);
+        B.Call(FGfxLineFunc);
+        // the end point becomes the current graphics point
+        if not LoadInt32(B, Instr.Src3) then Exit(False);
+        B.GlobalSet(FPenX);
+        if not LoadInt32(B, Extras[0]) then Exit(False);
+        B.GlobalSet(FPenY);
+      end;
+
+    { RGBA(r,g,b,a) packs to A<<24 | R<<16 | G<<8 | B, which is the word the
+      framebuffer holds - measured: PSet with &HFF778899 leaves FF778899 there.
+      ⚠️ The alpha rides in PhiSources[0], the fourth argument having nowhere
+      else to go. }
+    ssaGraphicRGBA:
+      begin
+        Extras := ExtraOperands(Instr);
+        if Length(Extras) < 1 then
+          Exit(Fail('ssaGraphicRGBA without its alpha operand'));
+        LoadReg(B, Extras[0]);  B.I64Const($FF); B.Op(wopI64And);
+          B.I64Const(24); B.Op(wopI64Shl);
+        LoadReg(B, Instr.Src1); B.I64Const($FF); B.Op(wopI64And);
+          B.I64Const(16); B.Op(wopI64Shl); B.Op(wopI64Or);
+        LoadReg(B, Instr.Src2); B.I64Const($FF); B.Op(wopI64And);
+          B.I64Const(8); B.Op(wopI64Shl); B.Op(wopI64Or);
+        LoadReg(B, Instr.Src3); B.I64Const($FF); B.Op(wopI64And); B.Op(wopI64Or);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaGfxPset:
+      begin
+        Extras := ExtraOperands(Instr);
+        if not LoadInt32(B, Instr.Src1) then Exit(False);
+        B.LocalTee(FGfxP);
+        if not LoadInt32(B, Instr.Src2) then Exit(False);
+        B.LocalTee(FGfxN);
+        if Length(Extras) >= 1 then
+          begin if not LoadInt32(B, Extras[0]) then Exit(False); end
+        else
+          begin if not LoadInt32(B, Instr.Src3) then Exit(False); end;
+        B.Call(FGfxPsetFunc);
+        B.LocalGet(FGfxP); B.GlobalSet(FPenX);
+        B.LocalGet(FGfxN); B.GlobalSet(FPenY);
+      end;
+
+    { POINT(x, y) reads a pixel back. ⚠️ Out of bounds it answers -1, which is
+      what the interpreter does rather than trapping - a query is allowed to say
+      "nothing there". }
+    ssaGfxPoint:
+      begin
+        if not LoadInt32(B, Instr.Src1) then Exit(False);
+        B.LocalSet(FGfxP);
+        if not LoadInt32(B, Instr.Src2) then Exit(False);
+        B.LocalSet(FGfxN);
+        B.LocalGet(FGfxP); B.I32Const(0); B.Op(wopI32GeS);
+        B.LocalGet(FGfxN); B.I32Const(0); B.Op(wopI32GeS); B.Op(wopI32And);
+        B.LocalGet(FGfxP); B.GlobalGet(FScrW); B.Op(wopI32LtS); B.Op(wopI32And);
+        B.LocalGet(FGfxN); B.GlobalGet(FScrH); B.Op(wopI32LtS); B.Op(wopI32And);
+        B.BlockStart(wopIf, WASM_TYPE_I64);
+          B.GlobalGet(FFbBase);
+          B.LocalGet(FGfxN); B.GlobalGet(FScrW); B.Op(wopI32Mul);
+          B.LocalGet(FGfxP); B.Op(wopI32Add);
+          B.I32Const(4); B.Op(wopI32Mul);
+          B.Op(wopI32Add);
+          B.OpMem(wopI32Load, 2, 0);
+          B.Op(wopI64ExtendI32S);
+        B.Op(wopElse);
+          B.I64Const(-1);
+        B.EndOp;
+        StoreReg(B, Instr.Dest);
+      end;
+
     ssaMathAbs: Un(wopF64Abs);
 
     { ⚠️ ONE ULP AWAY FROM THE INTERPRETER, sometimes. WASM has no transcendental
@@ -4979,6 +5267,13 @@ begin
       Init.I32Const(0); FScrH := FModule.DefineGlobal(wvtI32, True, Init);
       Init.Clear;
       Init.I32Const(0); FFbBase := FModule.DefineGlobal(wvtI32, True, Init);
+      Init.Clear;
+      { The CURRENT GRAPHICS POINT, which "LINE -(x2,y2)" reads and every draw
+        updates. It is per PROGRAM, not per call, so it is a global - the same
+        question that decided the transfer slots. }
+      Init.I32Const(0); FPenX := FModule.DefineGlobal(wvtI32, True, Init);
+      Init.Clear;
+      Init.I32Const(0); FPenY := FModule.DefineGlobal(wvtI32, True, Init);
     end;
   finally
     Init.Free;
@@ -5047,6 +5342,7 @@ begin
       Inc(Next);
     end;
   end;
+
   if FUsesArr then
   begin
     // load and store for each of the three banks, in bank order, then the two
@@ -5067,6 +5363,20 @@ begin
     FFltPrintFunc := Next + 2;
     Inc(Next, 3);
   end;
+  { ⛔⛔ LAST, because EmitGfxHelpers runs last. Numbering these before the array
+    and float helpers - while emitting them after - made every call land two
+    functions early: an array store went to the float helper and the module
+    failed to validate on the argument types. ⭐ It failed LOUDLY only because
+    the signatures happened to differ; with matching types it would have drawn
+    into the wrong place in silence, which is what this whole ordering is for.
+    ⚠️ These also sit OUTSIDE the string block: a program can draw without ever
+    holding a string. }
+  if FUsesGfxPrim then
+  begin
+    FGfxPsetFunc := Next;
+    FGfxLineFunc := Next + 1;
+    Inc(Next, 2);
+  end;
 
   for r := 0 to FRegionCount - 1 do
     if not EmitRegion(r) then Exit(False);
@@ -5075,6 +5385,7 @@ begin
   if FUsesStr then EmitStringHelpers;
   if FUsesArr then EmitArrayHelpers;
   if FUsesFlt then EmitFloatHelpers;
+  if FUsesGfxPrim then EmitGfxHelpers;
 
   FModule.ExportFunc('main', FFuncIdx[0]);
   for r := 1 to FRegionCount - 1 do
